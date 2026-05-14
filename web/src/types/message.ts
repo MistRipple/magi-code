@@ -652,8 +652,6 @@ export interface Session {
   };
 }
 
-export type QueuedMessageMode = 'queue' | 'guide';
-
 export interface QueuedMessageImage {
   name: string;
   dataUrl: string;
@@ -668,7 +666,6 @@ export interface QueuedMessage {
   content: string;
   text?: string | null;
   createdAt: number;
-  mode?: QueuedMessageMode;
   skillName?: string | null;
   images?: QueuedMessageImage[];
 }

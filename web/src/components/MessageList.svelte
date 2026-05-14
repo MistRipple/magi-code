@@ -105,7 +105,35 @@
 
   const currentStreamingMessage = $derived.by(() => currentStreamingRenderItem?.message || null);
 
-  const streamingIndicatorRenderKey = $derived.by(() => currentStreamingRenderItem?.key || null);
+  // 计时器代表「整个 turn 还在跑」，锚到该 turn 内 displayOrder 最大的非 user_input render item，
+  // 槽位渲染在 .message-content 末尾，使指示器始终位于当前 turn 最下方一张卡片的底部。
+  // 反向遍历 activeRenderItems（已按 displayOrder 升序排列）找匹配 turnId 的第一项即为末尾项；
+  // 跳过 user_input 是因为 user 模板无 streaming-indicator 槽位，命中后会导致整 turn 无指示器。
+  const streamingIndicatorRenderKey = $derived.by(() => {
+    const streamingItem = currentStreamingRenderItem;
+    if (!streamingItem) {
+      return null;
+    }
+    const turnId = typeof streamingItem.message.metadata?.turnId === 'string'
+      ? streamingItem.message.metadata.turnId.trim()
+      : '';
+    if (!turnId) {
+      return streamingItem.key;
+    }
+    for (let i = activeRenderItems.length - 1; i >= 0; i -= 1) {
+      const item = activeRenderItems[i];
+      if (item.message.type === 'user_input') {
+        continue;
+      }
+      const itemTurnId = typeof item.message.metadata?.turnId === 'string'
+        ? item.message.metadata.turnId.trim()
+        : '';
+      if (itemTurnId === turnId) {
+        return item.key;
+      }
+    }
+    return streamingItem.key;
+  });
 
   const resolvedStreamingStartAt = $derived.by(() => {
     const message = currentStreamingMessage;

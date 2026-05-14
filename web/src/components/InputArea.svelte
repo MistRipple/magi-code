@@ -5,18 +5,16 @@
     addToast,
     getActiveInteractionType,
     getQueuedMessages,
-    markQueuedMessageAsGuide,
     messagesState,
+    removeQueuedMessage,
   } from '../stores/messages.svelte';
   import { getTaskGraphState, refreshTaskProjection } from '../stores/task-graph-store.svelte';
   import { RustDaemonClient } from '../shared/rust-daemon-client';
-  import { enhanceAgentPrompt, resolveAgentBaseUrl, submitSessionTurn } from '../web/agent-api';
+  import { enhanceAgentPrompt, resolveAgentBaseUrl } from '../web/agent-api';
   import { categoryLabel, listTaskTemplates, type ResolvedTemplate } from '../lib/task-templates';
   import Icon from './Icon.svelte';
-  import Modal from './Modal.svelte';
   import { generateId } from '../lib/utils';
   import { i18n } from '../stores/i18n.svelte';
-  import { isTaskProjectionAcceptingIntake } from '../lib/task-projection-state';
 
   interface SelectedImage {
     id: string;
@@ -37,8 +35,6 @@
   const MAX_IMAGES = 5;  // 最多支持 5 张图片
   const MAX_IMAGE_SIZE = 10 * 1024 * 1024;  // 单张图片最大 10MB
 
-  // Intake 路由状态
-  let intakeLoading = $state(false);
   let stopLoading = $state(false);
   let enhanceLoading = $state(false);
   let templatesOpen = $state(false);
@@ -58,31 +54,9 @@
     }));
   });
 
-  // P4-#17：单会话串行任务确认对话框
-  // 任务图运行时再次提交，先弹窗让用户选「补充指令 / 停止当前并新建 / 取消」，
-  // 避免 intake 分类器把潜在的"新任务"无声地塞回当前 task graph。
-  let showRunningTaskConfirm = $state(false);
-  let pendingSubmissionText = $state<string | null>(null);
-
   const currentSessionId = $derived(messagesState.currentSessionId);
   const taskGraph = $derived(getTaskGraphState(currentSessionId));
 
-  // 任务图运行中：将用户输入路由到 Intake API
-  const shouldUseIntake = $derived.by(() => {
-    const projection = taskGraph.projection;
-    return isTaskProjectionAcceptingIntake(projection, taskGraph.rootTaskId);
-  });
-  const defaultIntakeContextTaskId = $derived.by(() => {
-    const projection = taskGraph.projection;
-    if (!projection) return null;
-    const priorityStatuses = ['AwaitingApproval', 'Blocked', 'Repairing', 'Verifying', 'Running', 'Ready'];
-    for (const status of priorityStatuses) {
-      const task = projection.tasks.find((item) => item.kind !== 'Objective' && item.status === status);
-      if (task) return task.task_id;
-    }
-    return projection.root_task?.task_id ?? taskGraph.rootTaskId ?? null;
-  });
-  const intakeContextTaskId = $derived(defaultIntakeContextTaskId);
   const shouldPauseTaskGraphFromComposer = $derived.by(() => {
     const projection = taskGraph.projection;
     const sessionId = currentSessionId?.trim();
@@ -111,7 +85,7 @@
     return i18n.t('input.send');
   });
   const sendDisabled = $derived.by(() => (
-    sessionInputLocked || isInteractionBlocking || intakeLoading
+    sessionInputLocked || isInteractionBlocking
   ));
   // 按钮双态状态 - 使用 $derived 计算
   const hasContent = $derived.by(() => {
@@ -160,29 +134,13 @@
     return inputValue;
   }
 
-  function isNaturalContinueRequest(value: string | null): boolean {
-    if (!value) return false;
-    const text = value.trim().toLowerCase();
-    if (!text) return false;
-    return [
-      '继续',
-      '继续执行',
-      '继续任务',
-      '继续刚才的任务',
-      '继续刚刚的任务',
-      'resume',
-      'continue',
-    ].includes(text);
-  }
-
-  // 发送消息（支持图片附件）
-  // 运行中再次发送不会打断当前轮，而是按当前 session 的队列/引导模式串行提交。
+  // 发送消息（支持图片附件）。
+  // 空闲时直接执行；正在响应时自动进入排队，由 bridge 在当前轮结束后逐条提交。
   async function sendMessage() {
     const rawContent = resolveComposerRawContent();
     const normalizedContent = rawContent.trim();
-    // 允许只发送图片（无文字）或只发送文字。
     if ((!normalizedContent && selectedImages.length === 0) || isInteractionBlocking) return;
-    if ((isSending || shouldUseIntake) && selectedImages.length > 0) {
+    if (isSending && selectedImages.length > 0) {
       addToast('warning', i18n.t('input.noImageDuringExecution'));
       return;
     }
@@ -194,14 +152,6 @@
 
     if (submissionLength > MAX_INPUT_CHARS) {
       addToast('warning', i18n.t('input.inputTooLong', { length: submissionLength, max: MAX_INPUT_CHARS }));
-      return;
-    }
-
-    // 任务运行中默认走 Intake；继续意图必须交给 session turn 分类器恢复执行链。
-    if (shouldUseIntake && submissionText && !isNaturalContinueRequest(submissionText)) {
-      // P4-#17：弹窗让用户显式选择"补充指令 vs 停止并新建"，避免分类器隐式吞掉新任务意图。
-      pendingSubmissionText = submissionText;
-      showRunningTaskConfirm = true;
       return;
     }
 
@@ -218,74 +168,6 @@
       })),
     });
     clearComposerState();
-  }
-
-  // P4-#17：用户选择「作为补充指令加入当前任务」——走原有 intake 分类器路径。
-  async function confirmContinueAsFollowUp() {
-    const text = pendingSubmissionText;
-    showRunningTaskConfirm = false;
-    pendingSubmissionText = null;
-    if (!text) return;
-    await sendIntake(text);
-  }
-
-  // P4-#17：用户选择「停止当前任务并以此开始新任务」——pause 当前 root task 后以 executeTask 重新提交。
-  async function confirmStopAndStartNew() {
-    const text = pendingSubmissionText;
-    showRunningTaskConfirm = false;
-    pendingSubmissionText = null;
-    if (!text) return;
-    intakeLoading = true;
-    try {
-      const sessionId = currentSessionId?.trim();
-      const projection = taskGraph.projection;
-      const rootTaskId = projection?.root_task.task_id ?? taskGraph.rootTaskId;
-      if (sessionId && rootTaskId) {
-        const client = new RustDaemonClient(resolveAgentBaseUrl());
-        await client.pauseTask({ taskId: rootTaskId, sessionId });
-        await refreshTaskProjection(sessionId);
-      }
-      const requestId = generateId();
-      vscode.postMessage({
-        type: 'executeTask',
-        text,
-        requestId,
-        skillName: null,
-        images: selectedImages.map((img) => ({ name: img.name, dataUrl: img.dataUrl })),
-      });
-      clearComposerState();
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      addToast('error', i18n.t('input.runningTaskConfirm.stopFailed', { message: msg }));
-    } finally {
-      intakeLoading = false;
-    }
-  }
-
-  function dismissRunningTaskConfirm() {
-    showRunningTaskConfirm = false;
-    pendingSubmissionText = null;
-  }
-
-  async function sendIntake(message: string) {
-    if (intakeLoading) return;
-    intakeLoading = true;
-    try {
-      await submitSessionTurn({
-        text: message,
-        images: [],
-        supplementContext: true,
-        contextTaskId: intakeContextTaskId,
-      });
-      addToast('success', '补充上下文已接收');
-      await refreshTaskProjection(messagesState.currentSessionId);
-      clearComposerState();
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      addToast('error', `补充上下文失败: ${msg}`);
-    } finally {
-      intakeLoading = false;
-    }
   }
 
   function insertNewlineAtCursor() {
@@ -357,10 +239,33 @@
   function guideQueuedMessage(queuedMessageId: string) {
     const normalizedId = typeof queuedMessageId === 'string' ? queuedMessageId.trim() : '';
     if (!normalizedId) return;
-    markQueuedMessageAsGuide(normalizedId);
     vscode.postMessage({
       type: 'guideQueuedMessage',
       queuedMessageId: normalizedId,
+    });
+  }
+
+  function deleteQueuedMessage(queuedMessageId: string) {
+    const normalizedId = typeof queuedMessageId === 'string' ? queuedMessageId.trim() : '';
+    if (!normalizedId) return;
+    removeQueuedMessage(normalizedId);
+  }
+
+  // 修改：取出排队消息内容回填到输入框，并从队列移除；用户重新点击发送后会按当前会话状态再次进入排队。
+  function editQueuedMessage(queuedMessageId: string) {
+    const normalizedId = typeof queuedMessageId === 'string' ? queuedMessageId.trim() : '';
+    if (!normalizedId) return;
+    const target = messagesState.queuedMessages.find((message) => message.id === normalizedId);
+    if (!target) return;
+    const text = (target.text ?? target.content ?? '').toString();
+    removeQueuedMessage(normalizedId);
+    inputValue = text;
+    queueMicrotask(() => {
+      const el = inputTextareaEl;
+      if (!el) return;
+      el.focus();
+      const cursor = text.length;
+      try { el.setSelectionRange(cursor, cursor); } catch { /* ignore */ }
     });
   }
 
@@ -506,21 +411,36 @@
         {#each queuedMessages as queued, index (queued.id)}
           <div class="ia-queue-item">
             <span class="ia-queue-index">{index + 1}</span>
-            <span class="ia-queue-mode" class:guide={queued.mode === 'guide'}>
-              {queued.mode === 'guide' ? i18n.t('input.queue.modeGuide') : i18n.t('input.queue.modeQueue')}
-            </span>
             <div class="ia-queue-content" title={queued.content}>{queued.content}</div>
-            {#if queued.mode !== 'guide'}
+            <div class="ia-queue-actions">
               <button
                 type="button"
-                class="ia-queue-guide"
+                class="ia-queue-action"
                 onclick={() => guideQueuedMessage(queued.id)}
                 title={i18n.t('messageItem.guideQueuedTitle')}
+                aria-label={i18n.t('messageItem.guideQueued')}
               >
-                <Icon name="send" size={11} />
-                <span>{i18n.t('messageItem.guideQueued')}</span>
+                <Icon name="send" size={12} />
               </button>
-            {/if}
+              <button
+                type="button"
+                class="ia-queue-action"
+                onclick={() => editQueuedMessage(queued.id)}
+                title={i18n.t('input.queue.edit')}
+                aria-label={i18n.t('input.queue.edit')}
+              >
+                <Icon name="edit" size={12} />
+              </button>
+              <button
+                type="button"
+                class="ia-queue-action danger"
+                onclick={() => deleteQueuedMessage(queued.id)}
+                title={i18n.t('input.queue.delete')}
+                aria-label={i18n.t('input.queue.delete')}
+              >
+                <Icon name="trash" size={12} />
+              </button>
+            </div>
           </div>
         {/each}
       </div>
@@ -667,32 +587,6 @@
   </div>
 
 </div>
-
-{#if showRunningTaskConfirm}
-  <Modal
-    title={i18n.t('input.runningTaskConfirm.title')}
-    onClose={dismissRunningTaskConfirm}
-    size="md"
-    closeOnBackdrop={false}
-  >
-    <p class="ia-confirm-body">{i18n.t('input.runningTaskConfirm.body')}</p>
-    {#if pendingSubmissionText}
-      <div class="ia-confirm-preview">{pendingSubmissionText}</div>
-    {/if}
-
-    {#snippet footer()}
-      <button class="modal-btn secondary" onclick={dismissRunningTaskConfirm}>
-        {i18n.t('input.runningTaskConfirm.cancel')}
-      </button>
-      <button class="modal-btn secondary" onclick={confirmContinueAsFollowUp}>
-        {i18n.t('input.runningTaskConfirm.followUp')}
-      </button>
-      <button class="modal-btn danger" onclick={confirmStopAndStartNew}>
-        {i18n.t('input.runningTaskConfirm.stopAndStart')}
-      </button>
-    {/snippet}
-  </Modal>
-{/if}
 
 <style>
   /* ============================================
@@ -1029,7 +923,7 @@
 
   .ia-queue-item {
     display: grid;
-    grid-template-columns: auto auto minmax(0, 1fr) auto;
+    grid-template-columns: auto minmax(0, 1fr) auto;
     align-items: start;
     gap: 8px;
     padding: 6px 8px;
@@ -1037,28 +931,6 @@
     border: 1px solid color-mix(in srgb, var(--border-subtle) 70%, transparent);
     background: color-mix(in srgb, var(--surface-2) 40%, var(--surface-1));
     min-height: 32px;
-  }
-
-  .ia-queue-mode {
-    display: inline-flex;
-    align-items: center;
-    height: 17px;
-    margin-top: 1px;
-    padding: 0 6px;
-    border-radius: var(--radius-full);
-    border: 1px solid color-mix(in srgb, var(--primary) 28%, transparent);
-    background: color-mix(in srgb, var(--primary) 8%, transparent);
-    color: var(--primary);
-    font-size: 10px;
-    font-weight: var(--font-semibold);
-    line-height: 1;
-    white-space: nowrap;
-  }
-
-  .ia-queue-mode.guide {
-    border-color: color-mix(in srgb, var(--warning) 34%, transparent);
-    background: color-mix(in srgb, var(--warning) 10%, transparent);
-    color: var(--warning);
   }
 
   .ia-queue-index {
@@ -1089,63 +961,54 @@
     line-clamp: 2;
   }
 
-  .ia-queue-guide {
+  .ia-queue-actions {
     display: inline-flex;
     align-items: center;
     gap: 4px;
-    height: 22px;
     margin-top: 0;
-    padding: 0 7px;
-    border: 1px solid color-mix(in srgb, var(--primary) 35%, transparent);
-    border-radius: var(--radius-full);
-    background: color-mix(in srgb, var(--primary) 8%, transparent);
-    color: var(--primary);
-    font-size: 10px;
-    font-weight: var(--font-semibold);
-    line-height: 1;
-    cursor: pointer;
     opacity: 0;
     transform: translateX(3px);
-    transition: opacity 120ms ease, transform 120ms ease, background 120ms ease;
+    transition: opacity 120ms ease, transform 120ms ease;
   }
 
-  .ia-queue-item:hover .ia-queue-guide,
-  .ia-queue-item:focus-within .ia-queue-guide {
+  .ia-queue-item:hover .ia-queue-actions,
+  .ia-queue-item:focus-within .ia-queue-actions {
     opacity: 1;
     transform: translateX(0);
   }
 
-  .ia-queue-guide:hover {
+  .ia-queue-action {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 22px;
+    height: 22px;
+    padding: 0;
+    border: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+    border-radius: var(--radius-full);
+    background: color-mix(in srgb, var(--surface-1) 92%, transparent);
+    color: var(--foreground-muted);
+    cursor: pointer;
+    transition: background 120ms ease, color 120ms ease, border-color 120ms ease;
+  }
+
+  .ia-queue-action:hover {
     background: color-mix(in srgb, var(--primary) 14%, transparent);
+    border-color: color-mix(in srgb, var(--primary) 40%, transparent);
+    color: var(--primary);
+  }
+
+  .ia-queue-action.danger:hover {
+    background: color-mix(in srgb, var(--error) 14%, transparent);
+    border-color: color-mix(in srgb, var(--error) 45%, transparent);
+    color: var(--error);
   }
 
   @media (hover: none) {
-    .ia-queue-guide {
+    .ia-queue-actions {
       opacity: 1;
       transform: none;
     }
-  }
-
-  /* P4-#17：运行中任务确认对话框的输入预览块 */
-  .ia-confirm-body {
-    margin: 0 0 var(--space-3) 0;
-    color: var(--foreground);
-    font-size: var(--text-sm);
-    line-height: var(--leading-relaxed);
-  }
-
-  .ia-confirm-preview {
-    padding: var(--space-2) var(--space-3);
-    border-radius: var(--radius-sm);
-    border: 1px solid var(--border-subtle);
-    background: var(--surface-2);
-    color: var(--foreground-muted);
-    font-size: var(--text-xs);
-    line-height: 1.4;
-    white-space: pre-wrap;
-    word-break: break-word;
-    max-height: 120px;
-    overflow-y: auto;
   }
 
 </style>

@@ -381,9 +381,11 @@ function buildMessage(
 }
 
 function resolveArtifactId(turn: CanonicalTurn, item: CanonicalTurnItem): string {
-  if (item.kind === 'tool_call') {
-    return `turn:${turn.turnId}:${item.tool?.callId || item.itemId}`;
-  }
+  // P7：artifact 身份统一用 itemId，所有 item kind（含 tool_call）走同一路径。
+  // 历史上 tool_call 曾走 `callId || itemId` 双轨：first emit 时 item.tool 尚未填充会落 itemId，
+  // 后续 callId 出现又切到 callId，导致同一工具卡在流式过程中 artifactId 漂移、被 Svelte 当作
+  // 两个 entry 销毁重建，引起视觉位置错位。callId 仍保留在 block id 与 metadata.toolCallId
+  // 用于工具协议层匹配 tool_result，不再参与 artifact 身份。
   return `turn:${turn.turnId}:${item.itemId}`;
 }
 

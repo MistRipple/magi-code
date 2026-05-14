@@ -121,13 +121,13 @@ import { RustDaemonClient } from '../rust-daemon-client';
 import {
   dequeueQueuedMessage,
   enqueueQueuedMessage,
-  markQueuedMessageAsGuide,
   messagesState,
   allocateTurnOrderSeq,
   addPendingRequest,
   clearRequestBinding,
   createRequestBinding,
   markMessageActive,
+  removeQueuedMessage,
   setQueuedMessages,
   updateRequestBinding,
 } from '../../stores/messages.svelte';
@@ -2149,14 +2149,13 @@ function bridgeRuntimeIsBusy(): boolean {
   );
 }
 
-function enqueueFollowUpTurn(input: ExecuteTaskInput, normalizedText: string, mode: 'queue' | 'guide' = 'queue'): void {
+function enqueueFollowUpTurn(input: ExecuteTaskInput, normalizedText: string): void {
   const queued: QueuedMessage = {
     id: input.requestId || generateMessageId(),
     requestId: input.requestId,
     content: normalizedText || input.skillName || '后续消息',
     text: input.text ?? null,
     createdAt: Date.now(),
-    mode,
     skillName: input.skillName ?? null,
     images: input.images,
   };
@@ -2191,14 +2190,12 @@ async function drainQueuedTurns(reason: string): Promise<void> {
   queueDrainActive = true;
   let shouldScheduleNextDrain = true;
   try {
-    const submitted = next.mode === 'guide'
-      ? await submitQueuedGuidance(next)
-      : await executeTask({
-        text: next.text ?? next.content,
-        requestId: next.requestId || next.id,
-        skillName: next.skillName ?? null,
-        images: next.images ?? [],
-      });
+    const submitted = await executeTask({
+      text: next.text ?? next.content,
+      requestId: next.requestId || next.id,
+      skillName: next.skillName ?? null,
+      images: next.images ?? [],
+    });
     if (!submitted) {
       restoreQueuedTurnToFront(next);
       shouldScheduleNextDrain = false;
@@ -2211,11 +2208,29 @@ async function drainQueuedTurns(reason: string): Promise<void> {
   }
 }
 
-function guideQueuedTurn(queuedMessageId: string): void {
-  if (!markQueuedMessageAsGuide(queuedMessageId)) {
+let guideSubmissionActive = false;
+
+async function guideQueuedTurn(queuedMessageId: string): Promise<void> {
+  const normalizedId = typeof queuedMessageId === 'string' ? queuedMessageId.trim() : '';
+  if (!normalizedId || guideSubmissionActive) {
     return;
   }
-  scheduleQueuedTurnDrain('guide_queued_message');
+  const target = messagesState.queuedMessages.find((message) => (
+    message.id === normalizedId || message.requestId === normalizedId
+  ));
+  if (!target) {
+    return;
+  }
+  guideSubmissionActive = true;
+  removeQueuedMessage(target.id);
+  try {
+    const submitted = await submitQueuedGuidance(target);
+    if (!submitted) {
+      restoreQueuedTurnToFront(target);
+    }
+  } finally {
+    guideSubmissionActive = false;
+  }
 }
 
 function restoreQueuedTurnToFront(queued: QueuedMessage): void {
@@ -2300,7 +2315,6 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
     enqueueFollowUpTurn(
       { ...input, skillName, images },
       normalizedText,
-      'queue',
     );
     return true;
   }
@@ -3262,7 +3276,7 @@ export function createWebClientBridge(): ClientBridge {
           return;
         case 'guideQueuedMessage':
           if (typeof message.queuedMessageId === 'string' && message.queuedMessageId.trim()) {
-            guideQueuedTurn(message.queuedMessageId.trim());
+            void guideQueuedTurn(message.queuedMessageId.trim());
           }
           return;
         case 'interruptTask':

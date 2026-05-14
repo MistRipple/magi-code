@@ -7,9 +7,8 @@
   import Icon from './Icon.svelte';
   import RetryRuntimeIndicator from './RetryRuntimeIndicator.svelte';
   import ErrorDetailPopover from './ErrorDetailPopover.svelte';
-  import { vscode } from '../lib/vscode-bridge';
   import { i18n } from '../stores/i18n.svelte';
-  import { markQueuedMessageAsGuide, retryRuntimeState } from '../stores/messages.svelte';
+  import { retryRuntimeState } from '../stores/messages.svelte';
   import { getAgentColor } from '../lib/agent-colors';
   import { formatDuration, formatElapsed as formatElapsedMmSs } from '../lib/utils';
   import { isRuntimeInternalTool } from '../shared/tool-visibility';
@@ -58,29 +57,6 @@
   const placeholderState = $derived((message.metadata?.placeholderState || 'pending') as PlaceholderState);
   const sendingAnimation = $derived(Boolean(message.metadata?.sendingAnimation));
   const isSupplementary = $derived(Boolean(message.metadata?.isSupplementary));
-  const queuedExtra = $derived.by(() => {
-    const extra = message.metadata?.extra;
-    return extra && typeof extra === 'object' && !Array.isArray(extra)
-      ? extra as Record<string, unknown>
-      : null;
-  });
-  const isQueuedUserMessage = $derived.by(() => (
-    isUser
-    && queuedExtra?.queued === true
-    && queuedExtra?.queueMode !== 'guide'
-  ));
-  const queuedMessageId = $derived.by(() => {
-    const metadataQueuedId = typeof queuedExtra?.queuedMessageId === 'string'
-      ? queuedExtra.queuedMessageId.trim()
-      : '';
-    if (metadataQueuedId) {
-      return metadataQueuedId;
-    }
-    return typeof message.metadata?.requestId === 'string' && message.metadata.requestId.trim()
-      ? message.metadata.requestId.trim()
-      : '';
-  });
-  let guideRequested = $state(false);
 
   // 动态 agent 颜色：为消息左侧色带和流式动画提供颜色
   const agentColorStyle = $derived.by(() => {
@@ -278,19 +254,6 @@
     previewImageUrl = '';
   }
 
-  function guideQueuedMessage() {
-    if (!queuedMessageId || guideRequested) {
-      return;
-    }
-    markQueuedMessageAsGuide(queuedMessageId);
-    guideRequested = true;
-    vscode.postMessage({
-      type: 'guideQueuedMessage',
-      queuedMessageId,
-      localMessageId: message.id,
-    });
-  }
-
 </script>
 
 <!-- 系统通知消息：居中显示（必须有实际文本内容才渲染） -->
@@ -321,20 +284,6 @@
       <div class="user-content">
         <div class="user-plain-content">{message.content || ''}</div>
       </div>
-      {#if isQueuedUserMessage}
-        <div class="queued-user-actions" aria-label={i18n.t('messageItem.queuedActions')}>
-          <button
-            type="button"
-            class="queued-user-action guide"
-            onclick={guideQueuedMessage}
-            disabled={guideRequested}
-            title={i18n.t('messageItem.guideQueuedTitle')}
-          >
-            <Icon name="send" size={12} />
-            <span>{i18n.t('messageItem.guideQueued')}</span>
-          </button>
-        </div>
-      {/if}
     </div>
     <div class="user-time">
       {#if isSupplementary}<span class="supplementary-tag">{i18n.t('messageItem.supplementaryTag')}</span>{/if}
@@ -366,16 +315,6 @@
     {/if}
 
     <div class="message-content">
-      <!-- 顶部计时器槽位：占位与流式输出共享，永远位于消息顶部，不随首 token 漂移 -->
-      {#if isStreaming && showStreamingIndicator}
-        <div class="streaming-indicator-top">
-          <span class="streaming-dot"></span>
-          <span class="streaming-dot"></span>
-          <span class="streaming-dot"></span>
-          <span class="streaming-elapsed-time">{formatElapsed(streamingElapsedSeconds)}</span>
-        </div>
-      {/if}
-
       {#if !isPlaceholder}
         {#if isInteraction && interactionMeta?.prompt}
           <div class="interaction-inline">
@@ -417,6 +356,18 @@
         {#if retryRuntime}
           <RetryRuntimeIndicator runtime={retryRuntime} />
         {/if}
+      {/if}
+
+      <!-- 底部计时器槽位：父级 MessageList 把 showStreamingIndicator 锚到当前 turn 内
+           displayOrder 最大的非 user_input render item，使指示器始终落在 turn 最末尾卡片的底部；
+           不再叠加 isStreaming 判断，避免锚点 message 自身已完成时指示器消失。 -->
+      {#if showStreamingIndicator}
+        <div class="streaming-indicator-bottom">
+          <span class="streaming-dot"></span>
+          <span class="streaming-dot"></span>
+          <span class="streaming-dot"></span>
+          <span class="streaming-elapsed-time">{formatElapsed(streamingElapsedSeconds)}</span>
+        </div>
       {/if}
     </div>
   </div>
@@ -505,58 +456,6 @@
     overflow-wrap: anywhere;
   }
 
-  .queued-user-actions {
-    display: flex;
-    align-items: center;
-    gap: 4px;
-    opacity: 0;
-    transform: translateX(4px);
-    pointer-events: none;
-    transition: opacity 120ms ease, transform 120ms ease;
-  }
-
-  .message-item.user:hover .queued-user-actions,
-  .message-item.user:focus-within .queued-user-actions {
-    opacity: 1;
-    transform: translateX(0);
-    pointer-events: auto;
-  }
-
-  .queued-user-action {
-    display: inline-flex;
-    align-items: center;
-    gap: 5px;
-    height: 28px;
-    padding: 0 9px;
-    border: 1px solid color-mix(in srgb, var(--border) 78%, transparent);
-    border-radius: var(--radius-full);
-    background: color-mix(in srgb, var(--surface-1) 90%, transparent);
-    color: var(--foreground-muted);
-    font-size: var(--text-xs);
-    line-height: 1;
-    cursor: pointer;
-    box-shadow: var(--shadow-sm);
-    transition: color 120ms ease, border-color 120ms ease, background 120ms ease;
-  }
-
-  .queued-user-action:hover:not(:disabled) {
-    color: var(--primary);
-    border-color: color-mix(in srgb, var(--primary) 50%, transparent);
-    background: color-mix(in srgb, var(--primary) 10%, var(--surface-1));
-  }
-
-  .queued-user-action:disabled {
-    opacity: 0.55;
-    cursor: default;
-  }
-
-  @media (hover: none) {
-    .queued-user-actions {
-      opacity: 1;
-      transform: none;
-      pointer-events: auto;
-    }
-  }
   .user-time {
     font-size: var(--text-xs);
     color: var(--foreground-muted);
@@ -745,8 +644,8 @@
     margin-top: 0;
   }
 
-  /* 流式消息顶部加载指示器：占位/有内容共用同一槽位，永远位于消息顶部 */
-  .streaming-indicator-top,
+  /* 流式消息底部加载指示器：始终位于消息内容末尾，使整 turn 末尾卡片的底部承载计时器 */
+  .streaming-indicator-bottom,
   .message-runtime-footer {
     display: flex;
     align-items: center;
@@ -754,8 +653,8 @@
     padding: var(--space-2) 0;
   }
 
-  .streaming-indicator-top {
-    margin-bottom: var(--space-2);
+  .streaming-indicator-bottom {
+    margin-top: var(--space-2);
     padding: var(--space-1) 0;
   }
 

@@ -292,7 +292,6 @@ function normalizeQueuedMessageList(value: unknown): QueuedMessage[] {
       content: item.content,
       text: typeof item.text === 'string' ? item.text : null,
       createdAt: item.createdAt,
-      mode: item.mode === 'guide' ? 'guide' : 'queue',
       skillName: typeof item.skillName === 'string' && item.skillName.trim()
         ? item.skillName.trim()
         : null,
@@ -1583,33 +1582,6 @@ export function removeQueuedMessage(id: string) {
     return;
   }
   setQueuedMessages(messagesState.queuedMessages.filter((message) => message.id !== normalizedId));
-}
-
-function markQueuedUserEchoAsGuide(id: string): void {
-  void id;
-}
-
-export function markQueuedMessageAsGuide(id: string): boolean {
-  const normalizedId = typeof id === 'string' ? id.trim() : '';
-  if (!normalizedId) {
-    return false;
-  }
-  const index = messagesState.queuedMessages.findIndex((message) => (
-    message.id === normalizedId || message.requestId === normalizedId
-  ));
-  if (index < 0) {
-    return false;
-  }
-  const target = {
-    ...messagesState.queuedMessages[index],
-    mode: 'guide' as const,
-  };
-  setQueuedMessages([
-    target,
-    ...messagesState.queuedMessages.filter((_, itemIndex) => itemIndex !== index),
-  ]);
-  markQueuedUserEchoAsGuide(normalizedId);
-  return true;
 }
 
 // 处理状态操作
