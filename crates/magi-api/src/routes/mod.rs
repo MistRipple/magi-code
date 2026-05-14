@@ -2194,11 +2194,11 @@ mod tests {
             session_entry.execution_chain_ref.as_deref(),
         );
         assert!(
-            session_entry
+            !session_entry
                 .turn_items
                 .iter()
                 .any(|item| item.kind == "assistant_phase"),
-            "turn items should include assistant phase"
+            "P7：后端不再生成 phase 文本，turn items 不得包含 assistant_phase"
         );
         let expected_lane_count = session_entry
             .active_branches

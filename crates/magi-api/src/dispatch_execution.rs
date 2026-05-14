@@ -8,9 +8,7 @@ use magi_core::{
 };
 use magi_event_bus::{EventContext, task_events};
 use magi_orchestrator::{
-    ExecutionWritebackPlans,
-    task_store::TaskStore,
-    task_worker_catalog::compatible_task_role_for_kind,
+    ExecutionWritebackPlans, task_worker_catalog::compatible_task_role_for_kind,
 };
 use magi_session_store::{
     ActiveExecutionBranch, ActiveExecutionChain, ActiveExecutionDispatchContext,
@@ -348,35 +346,6 @@ pub(crate) fn run_dispatch_submission(
                 // P7：user_message 永远归属主线 orchestrator thread。
                 source_thread_id: orchestrator_thread_id.clone(),
             },
-            ActiveExecutionTurnItem {
-                item_id: format!("turn-item-phase-{}", accepted_at.0),
-                item_seq: 2,
-                lane_id: None,
-                lane_seq: None,
-                kind: "assistant_phase".to_string(),
-                status: "pending".to_string(),
-                source: "orchestrator".to_string(),
-                title: Some("任务理解".to_string()),
-                content: Some(
-                    "我先把这个目标拆成可执行步骤，随后分派给合适的执行者；结果回来后继续在主线里整合判断。"
-                        .to_string(),
-                ),
-                task_id: Some(act_task_id.clone()),
-                worker_id: Some(worker_id.clone()),
-                role_id: Some(role_for_task(&act_task_id)),
-                tool_call_id: None,
-                tool_name: None,
-                tool_status: None,
-                tool_arguments: None,
-                tool_result: None,
-                tool_error: None,
-                request_id: request_id.clone(),
-                user_message_id: user_message_id.clone(),
-                placeholder_message_id: placeholder_message_id.clone(),
-                timeline_entry_id: None,
-                // P7：orchestrator 的主线 phase item 归属 session 级 orchestrator thread。
-                source_thread_id: orchestrator_thread_id.clone(),
-            },
         ],
         worker_lanes: dispatch_lane_task_ids
             .iter()
@@ -424,7 +393,7 @@ pub(crate) fn run_dispatch_submission(
         let worker_thread_id = lane.thread_id.clone();
         current_turn.items.push(ActiveExecutionTurnItem {
             item_id: format!("turn-item-worker-spawned-{}-{}", accepted_at.0, index),
-            item_seq: index + 3,
+            item_seq: index + 2,
             lane_id: Some(lane_id),
             lane_seq: Some(index + 1),
             kind: "worker_spawned".to_string(),
@@ -446,37 +415,6 @@ pub(crate) fn run_dispatch_submission(
             placeholder_message_id: placeholder_message_id.clone(),
             timeline_entry_id: None,
             source_thread_id: worker_thread_id,
-        });
-    }
-    let lane_count = current_turn.worker_lanes.len();
-    if lane_count > 0 {
-        let orchestration_summary =
-            task_graph_mainline_summary(task_store, &obj_task_id, &current_turn.worker_lanes);
-        current_turn.items.push(ActiveExecutionTurnItem {
-            item_id: format!("turn-item-orchestrator-dispatch-{}", accepted_at.0),
-            item_seq: lane_count + 3,
-            lane_id: None,
-            lane_seq: None,
-            kind: "assistant_phase".to_string(),
-            status: "pending".to_string(),
-            source: "orchestrator".to_string(),
-            title: Some("任务分配".to_string()),
-            content: Some(orchestration_summary),
-            task_id: Some(act_task_id.clone()),
-            worker_id: None,
-            role_id: None,
-            tool_call_id: None,
-            tool_name: None,
-            tool_status: None,
-            tool_arguments: None,
-            tool_result: None,
-            tool_error: None,
-            request_id: request_id.clone(),
-            user_message_id: user_message_id.clone(),
-            placeholder_message_id: placeholder_message_id.clone(),
-            timeline_entry_id: None,
-            // P7：orchestrator 任务分配 phase item 归属主线 orchestrator thread。
-            source_thread_id: orchestrator_thread_id.clone(),
         });
     }
     current_turn.normalize();
@@ -509,35 +447,6 @@ pub(crate) fn run_dispatch_submission(
             current_turn: Some(current_turn),
         }),
     })
-}
-
-fn task_graph_mainline_summary(
-    task_store: &TaskStore,
-    root_task_id: &TaskId,
-    worker_lanes: &[ActiveExecutionTurnLane],
-) -> String {
-    let mut phase_count = 0usize;
-    let mut pending = task_store.get_children(root_task_id);
-
-    while let Some(task) = pending.pop() {
-        match task.kind {
-            TaskKind::Phase => phase_count += 1,
-            TaskKind::Objective | TaskKind::WorkPackage | TaskKind::Decision => {}
-            TaskKind::Action | TaskKind::Validation | TaskKind::Repair => {}
-        }
-        pending.extend(task_store.get_children(&task.task_id));
-    }
-
-    if phase_count > 0 {
-        return format!(
-            "已完成任务分派：上方卡片会按执行步骤展示负责人、目标和状态。接下来我会回收结果，继续在主线里整合判断并推进下一步。"
-        );
-    }
-
-    format!(
-        "已创建 {} 个执行步骤；上方卡片会展示负责人、目标和状态。接下来我会回收结果，继续在主线里整合判断并推进下一步。",
-        worker_lanes.len(),
-    )
 }
 
 #[cfg(test)]
@@ -2286,7 +2195,7 @@ mod tests {
     }
 
     #[test]
-    fn task_turn_keeps_normal_mainline_dialog_and_orchestrator_steps() {
+    fn task_turn_keeps_user_message_on_mainline_and_routes_workers_to_drawer() {
         let (state, _task_store) = build_test_state();
         let state =
             state.with_model_bridge_client(Arc::new(StaticDeepPlanModelBridgeClient));
@@ -2348,16 +2257,10 @@ mod tests {
             "深度任务主线必须像正常对话一样保留用户消息"
         );
         assert!(
-            visible_items.iter().any(|(kind, content)| {
-                *kind == "assistant_phase" && content.contains("拆成可执行步骤")
-            }),
-            "编排者开始拆解任务的行为必须作为主线普通文本"
-        );
-        assert!(
-            visible_items.iter().any(|(kind, content)| {
-                *kind == "assistant_phase" && content.contains("继续在主线里整合")
-            }),
-            "任务分配卡之后必须继续保留编排者自己的行为说明"
+            !visible_items
+                .iter()
+                .any(|(kind, _)| *kind == "assistant_phase"),
+            "P7：后端不再生成 phase 文本，主线不得出现 assistant_phase item"
         );
         assert!(
             turn.items.iter().any(|item| {

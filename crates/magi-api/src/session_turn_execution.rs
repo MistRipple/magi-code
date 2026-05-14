@@ -228,7 +228,6 @@ pub(crate) fn run_session_turn_execution(
             )
         })?;
 
-    append_phase_item(event_bus, session_store, &request, &orchestrator_thread_id);
     let mut messages = build_session_turn_messages(session_store, &request, &prompt);
     let mut final_content: Option<String> = None;
     let mut final_item_id: Option<String> = None;
@@ -855,37 +854,6 @@ fn retire_empty_assistant_placeholder(
     );
     apply_request_aliases(&mut item, request);
     if let Some(published) = upsert_session_turn_item(session_store, &request.session_id, item) {
-        publish_session_turn_item_event(
-            event_bus,
-            &request.session_id,
-            &request.workspace_id,
-            &published,
-        );
-    }
-}
-
-fn append_phase_item(
-    event_bus: &InMemoryEventBus,
-    session_store: &SessionStore,
-    request: &SessionTurnExecutionRequest,
-    orchestrator_thread_id: &magi_core::ThreadId,
-) {
-    let mut phase_item = session_turn_item(
-        "assistant_phase",
-        "running",
-        Some("理解请求".to_string()),
-        Some(if request.use_tools {
-            "正在理解请求并准备调用工具。".to_string()
-        } else {
-            "正在理解请求并生成回复。".to_string()
-        }),
-        None,
-        orchestrator_thread_id.clone(),
-    );
-    apply_request_aliases(&mut phase_item, request);
-    if let Some(published) =
-        append_session_turn_item(session_store, &request.session_id, phase_item)
-    {
         publish_session_turn_item_event(
             event_bus,
             &request.session_id,
