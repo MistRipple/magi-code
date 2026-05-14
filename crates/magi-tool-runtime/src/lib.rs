@@ -52,10 +52,19 @@ pub enum BuiltinToolName {
     DiagramRender,
     // ── 知识库 ──
     KnowledgeQuery,
+    // ── 协调器（Task System v2 L10 / L11，仅 coordinator_mode 角色可见）──
+    /// 派发新的子任务给一个具体角色。返回新建任务的 task_id；子任务完成后，
+    /// 其结果会通过 `SendMessage` 路由回父任务的 Mailbox。
+    AgentSpawn,
+    /// 在同一 mission 内向另一任务投递一条结构化消息（用于父子代理回执、
+    /// 子任务之间的协调指令等）。
+    SendMessage,
+    /// 终止指定任务及其所有 SpawnGraph 后代（级联停止）。
+    TaskStop,
 }
 
 impl BuiltinToolName {
-    pub const ALL: [Self; 21] = [
+    pub const ALL: [Self; 24] = [
         Self::FileRead,
         Self::FileWrite,
         Self::FilePatch,
@@ -77,6 +86,9 @@ impl BuiltinToolName {
         Self::WebFetch,
         Self::DiagramRender,
         Self::KnowledgeQuery,
+        Self::AgentSpawn,
+        Self::SendMessage,
+        Self::TaskStop,
     ];
 
     pub fn as_str(&self) -> &'static str {
@@ -102,6 +114,9 @@ impl BuiltinToolName {
             Self::WebFetch => "web_fetch",
             Self::DiagramRender => "diagram_render",
             Self::KnowledgeQuery => "knowledge_query",
+            Self::AgentSpawn => "agent_spawn",
+            Self::SendMessage => "send_message",
+            Self::TaskStop => "task_stop",
         }
     }
 
@@ -128,6 +143,9 @@ impl BuiltinToolName {
             "web_fetch" => Some(Self::WebFetch),
             "diagram_render" => Some(Self::DiagramRender),
             "knowledge_query" | "project_knowledge_query" => Some(Self::KnowledgeQuery),
+            "agent_spawn" | "agent" | "spawn_agent" => Some(Self::AgentSpawn),
+            "send_message" | "message_task" => Some(Self::SendMessage),
+            "task_stop" | "stop_task" | "cancel_task" => Some(Self::TaskStop),
             _ => None,
         }
     }
@@ -171,14 +189,16 @@ impl BuiltinToolName {
             | Self::WebSearch
             | Self::WebFetch
             | Self::DiagramRender
-            | Self::KnowledgeQuery => RiskLevel::Low,
+            | Self::KnowledgeQuery
+            | Self::SendMessage => RiskLevel::Low,
             Self::FileWrite
             | Self::FilePatch
             | Self::FileCopy
             | Self::FileMove
-            | Self::ProcessWrite => RiskLevel::Medium,
+            | Self::ProcessWrite
+            | Self::AgentSpawn => RiskLevel::Medium,
             Self::FileRemove | Self::ShellExec | Self::ProcessLaunch => RiskLevel::High,
-            Self::ProcessKill | Self::ProcessInspect => RiskLevel::Medium,
+            Self::ProcessKill | Self::ProcessInspect | Self::TaskStop => RiskLevel::Medium,
         }
     }
 
@@ -219,6 +239,15 @@ impl BuiltinToolName {
             }
             Self::KnowledgeQuery => {
                 "Query project knowledge base: search README, docs, and code documentation"
+            }
+            Self::AgentSpawn => {
+                "Dispatch a sub-task to a registered agent role (architect / integration-dev / reviewer / etc.). Returns the new task_id; the sub-agent's final result will be delivered back via send_message."
+            }
+            Self::SendMessage => {
+                "Deliver a structured message to another task in the same mission. Used by coordinators to forward results, follow-up directives, or sub-agent replies."
+            }
+            Self::TaskStop => {
+                "Terminate a task and cascade-stop all of its descendants in the SpawnGraph. Use only when the entire sub-tree has clearly deviated from the goal or the user has revoked the work."
             }
         }
     }
@@ -483,6 +512,43 @@ impl BuiltinToolName {
                     "category": { "type": "string", "description": "Knowledge category: all, readme, docs, code (default: all)" }
                 },
                 "required": ["query"]
+            }),
+            Self::AgentSpawn => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "role": { "type": "string", "description": "Registered agent role id, e.g. architect / integration-dev / reviewer / debugger" },
+                    "goal": { "type": "string", "description": "Concrete goal for the sub-task; the role-level system prompt will be combined with this goal" },
+                    "task_kind": {
+                        "type": "string",
+                        "enum": ["work_package", "action", "validation", "repair"],
+                        "description": "Task kind for the new sub-task. Defaults to action when omitted."
+                    },
+                    "context": { "type": "string", "description": "Optional context summary handed to the sub-agent (single string)." },
+                    "working_dir": { "type": "string", "description": "Optional absolute working directory; defaults to the parent task's workspace root" },
+                    "parallelism_group": { "type": "string", "description": "Optional parallelism group name; sub-agents in the same group are mutually exclusive on the same SpawnGraph branch" }
+                },
+                "required": ["role", "goal"]
+            }),
+            Self::SendMessage => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "target_task_id": { "type": "string", "description": "Recipient task id within the same mission" },
+                    "payload": { "type": "string", "description": "Message payload — free-form text or JSON-encoded structured data" },
+                    "kind": {
+                        "type": "string",
+                        "enum": ["reply", "directive", "status", "result"],
+                        "description": "Message kind hint for the recipient. Defaults to reply."
+                    }
+                },
+                "required": ["target_task_id", "payload"]
+            }),
+            Self::TaskStop => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "target_task_id": { "type": "string", "description": "Task to terminate; all descendants in the SpawnGraph are cascade-stopped" },
+                    "reason": { "type": "string", "description": "Short reason for the termination, surfaced in the cancelled task's evidence trail" }
+                },
+                "required": ["target_task_id"]
             }),
         }
     }
@@ -1304,7 +1370,7 @@ mod tests {
         path
     }
 
-    fn all_builtin_tools() -> [BuiltinToolName; 21] {
+    fn all_builtin_tools() -> [BuiltinToolName; 24] {
         BuiltinToolName::ALL
     }
 
@@ -3909,6 +3975,9 @@ mod tests {
                 "web_fetch",
                 "diagram_render",
                 "knowledge_query",
+                "agent_spawn",
+                "send_message",
+                "task_stop",
             ],
             "public builtin specs must remain the single canonical tool surface"
         );

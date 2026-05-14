@@ -1458,7 +1458,7 @@ mod tests {
         let builtin_tools = bootstrap["builtinTools"]
             .as_array()
             .expect("builtin tools should be an array");
-        assert_eq!(builtin_tools.len(), 16);
+        assert_eq!(builtin_tools.len(), 19);
         let builtin_names: Vec<_> = builtin_tools
             .iter()
             .map(|tool| tool["name"].as_str().expect("tool name"))
@@ -1482,6 +1482,9 @@ mod tests {
                 "web_fetch",
                 "diagram_render",
                 "knowledge_query",
+                "agent_spawn",
+                "send_message",
+                "task_stop",
             ],
             "bootstrap must expose one canonical public builtin surface in a stable order"
         );

@@ -441,6 +441,7 @@ mod tests {
                 state.session_store.clone(),
                 state.task_execution_registry().clone(),
                 runner_result_receiver.clone(),
+                state.spawn_graph.clone(),
             )
             .with_model_bridge_client(model_bridge_client)
             .with_context_runtime(context_runtime_for_dispatcher)

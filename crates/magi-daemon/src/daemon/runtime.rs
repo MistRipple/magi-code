@@ -594,6 +594,7 @@ impl DaemonRuntime {
             state.session_store.clone(),
             state.task_execution_registry().clone(),
             runner_result_receiver.clone(),
+            state.spawn_graph.clone(),
         );
         let llm_task_dispatcher = Arc::new(
             llm_task_dispatcher

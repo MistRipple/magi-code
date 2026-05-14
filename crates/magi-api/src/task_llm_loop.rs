@@ -65,6 +65,9 @@ pub(crate) struct TaskLlmLoopRequest<'a> {
     /// Task System v2 — AgentRole 注册表。task_turn_visibility 解析 role_id 时
     /// 必须走该注册表，不再依赖硬编码的 kind→role 默认 mapping。
     pub agent_role_registry: &'a magi_agent_role::AgentRoleRegistry,
+    /// Task System v2 — L5：父子任务拓扑图。S7 协调工具（agent_spawn / task_stop）
+    /// 在 execute_task_tool_call 中拦截时操作此结构。
+    pub spawn_graph: &'a std::sync::Mutex<magi_spawn_graph::SpawnGraph>,
     pub task: &'a magi_core::Task,
     pub task_id: &'a TaskId,
     pub lease_id: &'a LeaseId,
@@ -383,6 +386,7 @@ fn run_task_llm_loop_inner(
         conversation_registry: _,
         stream_fanout,
         agent_role_registry,
+        spawn_graph,
         task,
         task_id,
         lease_id,
@@ -727,6 +731,8 @@ fn run_task_llm_loop_inner(
             event_bus,
             tool_registry,
             skill_runtime,
+            task_store,
+            spawn_graph,
             task,
             session_id,
             workspace_id,
@@ -1668,6 +1674,8 @@ fn execute_task_tool_call_batch(
     event_bus: &InMemoryEventBus,
     tool_registry: Option<&ToolRegistry>,
     skill_runtime: Option<&magi_skill_runtime::SkillRuntime>,
+    task_store: &TaskStore,
+    spawn_graph: &std::sync::Mutex<magi_spawn_graph::SpawnGraph>,
     task: &magi_core::Task,
     session_id: &SessionId,
     workspace_id: &Option<WorkspaceId>,
@@ -1699,6 +1707,8 @@ fn execute_task_tool_call_batch(
                         event_bus,
                         tool_registry,
                         skill_runtime,
+                        task_store,
+                        spawn_graph,
                         task,
                         session_id,
                         workspace_id,
@@ -1723,6 +1733,8 @@ fn execute_task_tool_call_batch(
                                         event_bus,
                                         tool_registry,
                                         skill_runtime,
+                                        task_store,
+                                        spawn_graph,
                                         task,
                                         session_id,
                                         workspace_id,
@@ -1773,10 +1785,299 @@ fn execute_task_tool_call_batch(
         .collect()
 }
 
+/// S7-E：协调器三件套统一拦截入口。返回 (payload_json, status)，与
+/// `execute_task_tool_call` 的常规工具路径形状一致，便于上层把回执拼回 LLM 消息流。
+fn execute_coordinator_tool(
+    event_bus: &InMemoryEventBus,
+    task_store: &TaskStore,
+    spawn_graph: &std::sync::Mutex<magi_spawn_graph::SpawnGraph>,
+    task: &magi_core::Task,
+    session_id: &SessionId,
+    workspace_id: &Option<WorkspaceId>,
+    tool: magi_tool_runtime::BuiltinToolName,
+    tool_call: &ChatToolCall,
+) -> (String, ExecutionResultStatus) {
+    let parsed: serde_json::Value = match serde_json::from_str(&tool_call.function.arguments) {
+        Ok(value) => value,
+        Err(err) => {
+            return (
+                serde_json::json!({
+                    "tool": tool.as_str(),
+                    "status": "failed",
+                    "error": format!("协调器工具参数解析失败: {err}"),
+                })
+                .to_string(),
+                ExecutionResultStatus::Failed,
+            );
+        }
+    };
+
+    let publish_event = |kind: &str, payload: serde_json::Value| {
+        let _ = event_bus.publish(
+            EventEnvelope::domain(
+                EventId::new(format!("event-coordinator-{kind}-{}", UtcMillis::now().0)),
+                kind,
+                payload,
+            )
+            .with_context(EventContext {
+                workspace_id: workspace_id.clone(),
+                session_id: Some(session_id.clone()),
+                mission_id: Some(task.mission_id.clone()),
+                task_id: Some(task.task_id.clone()),
+                ..EventContext::default()
+            }),
+        );
+    };
+
+    match tool {
+        magi_tool_runtime::BuiltinToolName::AgentSpawn => {
+            let role = parsed
+                .get("role")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let goal = parsed
+                .get("goal")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if role.is_empty() || goal.is_empty() {
+                return (
+                    serde_json::json!({
+                        "tool": tool.as_str(),
+                        "status": "failed",
+                        "error": "agent_spawn 缺少必需字段 role 或 goal",
+                    })
+                    .to_string(),
+                    ExecutionResultStatus::Failed,
+                );
+            }
+            let task_kind = parsed
+                .get("task_kind")
+                .and_then(|v| v.as_str())
+                .and_then(|s| match s.to_ascii_lowercase().as_str() {
+                    "action" => Some(TaskKind::Action),
+                    "validation" => Some(TaskKind::Validation),
+                    "repair" => Some(TaskKind::Repair),
+                    "decision" => Some(TaskKind::Decision),
+                    "work_package" | "workpackage" => Some(TaskKind::WorkPackage),
+                    "phase" => Some(TaskKind::Phase),
+                    "objective" => Some(TaskKind::Objective),
+                    _ => None,
+                })
+                .unwrap_or(TaskKind::Action);
+            let now = UtcMillis::now();
+            let child_id = TaskId::new(format!(
+                "task-spawn-{}-{}",
+                task.task_id.as_str(),
+                now.0
+            ));
+            let child = magi_core::Task {
+                task_id: child_id.clone(),
+                mission_id: task.mission_id.clone(),
+                root_task_id: task.root_task_id.clone(),
+                parent_task_id: Some(task.task_id.clone()),
+                kind: task_kind,
+                title: format!("{role}: {goal}"),
+                goal: goal.clone(),
+                status: TaskStatus::Ready,
+                dependency_ids: Vec::new(),
+                required_children: Vec::new(),
+                policy_snapshot: task.policy_snapshot.clone(),
+                executor_binding: Some(magi_core::ExecutorBinding {
+                    target_role: role.clone(),
+                    capability_requirements: Vec::new(),
+                    parallelism_group: parsed
+                        .get("parallelism_group")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
+                    exclusive_scope: None,
+                    worker_selector: None,
+                }),
+                context_refs: Vec::new(),
+                knowledge_refs: Vec::new(),
+                workspace_scope: task.workspace_scope.clone(),
+                write_scope: task.write_scope.clone(),
+                input_refs: Vec::new(),
+                output_refs: Vec::new(),
+                evidence_refs: Vec::new(),
+                retry_count: 0,
+                repair_count: 0,
+                decision_payload: None,
+                variant: magi_core::TaskVariant::default(),
+                created_at: now,
+                updated_at: now,
+            };
+            task_store.insert_task(child);
+            // SpawnGraph 边：失败仅 warn（与 dispatch_execution::register_spawn_edge 一致策略）。
+            if let Ok(mut graph) = spawn_graph.lock() {
+                if let Err(err) = graph.add_edge(
+                    task.task_id.clone(),
+                    child_id.clone(),
+                    task_kind,
+                    std::time::SystemTime::now(),
+                ) {
+                    tracing::warn!(
+                        parent = %task.task_id.as_str(),
+                        child = %child_id.as_str(),
+                        error = %err,
+                        "agent_spawn SpawnGraph add_edge 失败，子任务已插入但拓扑边缺失",
+                    );
+                }
+            }
+            publish_event(
+                "task.coordinator.agent_spawn",
+                serde_json::json!({
+                    "parent_task_id": task.task_id.to_string(),
+                    "child_task_id": child_id.to_string(),
+                    "role": role,
+                    "goal": goal,
+                    "task_kind": format!("{:?}", task_kind),
+                }),
+            );
+            (
+                serde_json::json!({
+                    "tool": tool.as_str(),
+                    "status": "succeeded",
+                    "child_task_id": child_id.to_string(),
+                    "role": role,
+                })
+                .to_string(),
+                ExecutionResultStatus::Succeeded,
+            )
+        }
+        magi_tool_runtime::BuiltinToolName::SendMessage => {
+            let target = parsed
+                .get("target_task_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let payload = parsed.get("payload").cloned().unwrap_or(serde_json::Value::Null);
+            if target.is_empty() || payload.is_null() {
+                return (
+                    serde_json::json!({
+                        "tool": tool.as_str(),
+                        "status": "failed",
+                        "error": "send_message 缺少必需字段 target_task_id 或 payload",
+                    })
+                    .to_string(),
+                    ExecutionResultStatus::Failed,
+                );
+            }
+            let target_id = TaskId::new(target.clone());
+            if task_store.get_task(&target_id).is_none() {
+                return (
+                    serde_json::json!({
+                        "tool": tool.as_str(),
+                        "status": "failed",
+                        "error": format!("send_message 目标 task {target} 不存在"),
+                    })
+                    .to_string(),
+                    ExecutionResultStatus::Failed,
+                );
+            }
+            // S7 暂以事件总线作为跨 task 消息通道；后续 slice 接入 Mailbox 后再切换路由。
+            publish_event(
+                "task.coordinator.send_message",
+                serde_json::json!({
+                    "from_task_id": task.task_id.to_string(),
+                    "target_task_id": target,
+                    "kind": parsed.get("kind").and_then(|v| v.as_str()).unwrap_or("user"),
+                    "payload": payload,
+                }),
+            );
+            (
+                serde_json::json!({
+                    "tool": tool.as_str(),
+                    "status": "succeeded",
+                    "target_task_id": target,
+                })
+                .to_string(),
+                ExecutionResultStatus::Succeeded,
+            )
+        }
+        magi_tool_runtime::BuiltinToolName::TaskStop => {
+            let target = parsed
+                .get("target_task_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if target.is_empty() {
+                return (
+                    serde_json::json!({
+                        "tool": tool.as_str(),
+                        "status": "failed",
+                        "error": "task_stop 缺少必需字段 target_task_id",
+                    })
+                    .to_string(),
+                    ExecutionResultStatus::Failed,
+                );
+            }
+            let target_id = TaskId::new(target.clone());
+            if task_store.get_task(&target_id).is_none() {
+                return (
+                    serde_json::json!({
+                        "tool": tool.as_str(),
+                        "status": "failed",
+                        "error": format!("task_stop 目标 task {target} 不存在"),
+                    })
+                    .to_string(),
+                    ExecutionResultStatus::Failed,
+                );
+            }
+            let mut cancelled: Vec<String> = Vec::new();
+            // 先收集 open 子孙，再统一标记 cancel —— 锁内只做拓扑查询，避免持锁更新 store。
+            let descendants = match spawn_graph.lock() {
+                Ok(graph) => graph.open_descendants(&target_id),
+                Err(err) => {
+                    tracing::warn!(?err, "task_stop SpawnGraph mutex poisoned，仅取消目标任务");
+                    Vec::new()
+                }
+            };
+            for id in std::iter::once(target_id.clone()).chain(descendants.into_iter()) {
+                if task_store
+                    .update_status(&id, TaskStatus::Cancelled)
+                    .is_ok()
+                {
+                    cancelled.push(id.to_string());
+                    if let Ok(mut graph) = spawn_graph.lock() {
+                        let _ = graph.mark_closed(&id, std::time::SystemTime::now());
+                    }
+                }
+            }
+            publish_event(
+                "task.coordinator.task_stop",
+                serde_json::json!({
+                    "from_task_id": task.task_id.to_string(),
+                    "target_task_id": target,
+                    "cancelled_task_ids": cancelled,
+                    "reason": parsed.get("reason").and_then(|v| v.as_str()).unwrap_or(""),
+                }),
+            );
+            (
+                serde_json::json!({
+                    "tool": tool.as_str(),
+                    "status": "succeeded",
+                    "cancelled_task_ids": cancelled,
+                })
+                .to_string(),
+                ExecutionResultStatus::Succeeded,
+            )
+        }
+        _ => unreachable!("execute_coordinator_tool 只接收 3 个协调器变体"),
+    }
+}
+
 fn execute_task_tool_call(
     event_bus: &InMemoryEventBus,
     tool_registry: Option<&ToolRegistry>,
     skill_runtime: Option<&magi_skill_runtime::SkillRuntime>,
+    task_store: &TaskStore,
+    spawn_graph: &std::sync::Mutex<magi_spawn_graph::SpawnGraph>,
     task: &magi_core::Task,
     session_id: &SessionId,
     workspace_id: &Option<WorkspaceId>,
@@ -1784,6 +2085,30 @@ fn execute_task_tool_call(
     worker_id: Option<&magi_core::WorkerId>,
     tool_call: &ChatToolCall,
 ) -> (String, ExecutionResultStatus) {
+    // S7-E：协调器三件套（agent_spawn / send_message / task_stop）由 orchestration 层拦截，
+    // 不进 BuiltinTool::execute —— 它们需要 task_store / spawn_graph / event_bus 等上下文。
+    if let Some(canonical) =
+        magi_tool_runtime::BuiltinToolName::from_str(tool_call.function.name.as_str())
+    {
+        if matches!(
+            canonical,
+            magi_tool_runtime::BuiltinToolName::AgentSpawn
+                | magi_tool_runtime::BuiltinToolName::SendMessage
+                | magi_tool_runtime::BuiltinToolName::TaskStop
+        ) {
+            return execute_coordinator_tool(
+                event_bus,
+                task_store,
+                spawn_graph,
+                task,
+                session_id,
+                workspace_id,
+                canonical,
+                tool_call,
+            );
+        }
+    }
+
     let Some(registry) = tool_registry else {
         return (
             serde_json::json!({ "error": "tool registry not available" }).to_string(),
@@ -2286,6 +2611,8 @@ mod tests {
             Arc::new(InMemoryEventBus::new(8)),
         );
         let event_bus = InMemoryEventBus::new(8);
+        let task_store = TaskStore::new();
+        let spawn_graph = std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new());
         let task = make_task_loop_test_task("task-process-launch-rejected");
         let session_id = SessionId::new("session-process-launch-rejected");
         let workspace_id = Some(WorkspaceId::new("workspace-process-launch-rejected"));
@@ -2303,6 +2630,8 @@ mod tests {
             &event_bus,
             Some(&tool_registry),
             None,
+            &task_store,
+            &spawn_graph,
             &task,
             &session_id,
             &workspace_id,
@@ -2330,6 +2659,8 @@ mod tests {
             Arc::new(InMemoryEventBus::new(8)),
         );
         let event_bus = InMemoryEventBus::new(8);
+        let task_store = TaskStore::new();
+        let spawn_graph = std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new());
         let mut task = make_task_loop_test_task("task-readonly-write-policy");
         task.policy_snapshot = Some(magi_core::TaskPolicy {
             autonomy_level: "Autonomous".to_string(),
@@ -2364,6 +2695,8 @@ mod tests {
             &event_bus,
             Some(&tool_registry),
             None,
+            &task_store,
+            &spawn_graph,
             &task,
             &SessionId::new("session-readonly-write-policy"),
             &Some(WorkspaceId::new("workspace-readonly-write-policy")),
@@ -2385,6 +2718,8 @@ mod tests {
             Arc::new(InMemoryEventBus::new(8)),
         );
         let event_bus = InMemoryEventBus::new(8);
+        let task_store = TaskStore::new();
+        let spawn_graph = std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new());
         let mut task = make_task_loop_test_task("task-readonly-shell-policy");
         task.policy_snapshot = Some(magi_core::TaskPolicy {
             autonomy_level: "Autonomous".to_string(),
@@ -2415,6 +2750,8 @@ mod tests {
             &event_bus,
             Some(&tool_registry),
             None,
+            &task_store,
+            &spawn_graph,
             &task,
             &SessionId::new("session-readonly-shell-policy"),
             &Some(WorkspaceId::new("workspace-readonly-shell-policy")),
@@ -2434,6 +2771,8 @@ mod tests {
             Arc::new(InMemoryEventBus::new(8)),
         );
         let event_bus = InMemoryEventBus::new(8);
+        let task_store = TaskStore::new();
+        let spawn_graph = std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new());
         let mut task = make_task_loop_test_task("task-no-tool-policy");
         task.policy_snapshot = Some(magi_core::TaskPolicy {
             autonomy_level: "Autonomous".to_string(),
@@ -2464,6 +2803,8 @@ mod tests {
             &event_bus,
             Some(&tool_registry),
             None,
+            &task_store,
+            &spawn_graph,
             &task,
             &SessionId::new("session-no-tool-policy"),
             &Some(WorkspaceId::new("workspace-no-tool-policy")),
@@ -2779,6 +3120,7 @@ mod tests {
             conversation_registry: &ConversationRegistry::new(),
             stream_fanout: &StreamFanOut::new(),
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
+            spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
             task,
             task_id: &task.task_id,
             lease_id: &lease.lease_id,
@@ -2891,6 +3233,7 @@ mod tests {
             conversation_registry: &ConversationRegistry::new(),
             stream_fanout: &StreamFanOut::new(),
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
+            spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
             task: &task,
             task_id: &task.task_id,
             lease_id: &lease.lease_id,
@@ -3203,6 +3546,7 @@ mod tests {
             conversation_registry: &ConversationRegistry::new(),
             stream_fanout: &StreamFanOut::new(),
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
+            spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
             task: &task,
             task_id: &task.task_id,
             lease_id: &lease.lease_id,
@@ -3397,6 +3741,7 @@ mod tests {
             conversation_registry: &ConversationRegistry::new(),
             stream_fanout: &StreamFanOut::new(),
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
+            spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
             task: &task,
             task_id: &task.task_id,
             lease_id: &lease.lease_id,

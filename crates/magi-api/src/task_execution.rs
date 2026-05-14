@@ -25,9 +25,11 @@ use magi_context_runtime::{
     ContextBudget, ContextRuntime, ExecutionContextAssemblyRequest, ExecutionContextClues,
 };
 use magi_core::{
-    DomainError, EventId, ExecutionOwnership, LeaseId, SessionId, Task, TaskExecutionTarget,
-    TaskId, TaskKind, TaskStatus, UtcMillis, WorkerId, WorkspaceId,
+    ApprovalRequirement, DomainError, EventId, ExecutionOwnership, ExecutionResultStatus, LeaseId,
+    RiskLevel, SessionId, Task, TaskExecutionTarget, TaskId, TaskKind, TaskStatus, ToolCallId,
+    UtcMillis, WorkerId, WorkspaceId,
 };
+use magi_governance::ToolKind;
 use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
 use magi_knowledge_store::{KnowledgeKind, KnowledgeRecord, KnowledgeStore};
 use magi_orchestrator::{
@@ -37,7 +39,9 @@ use magi_orchestrator::{
 };
 use magi_conversation_runtime::{ConversationRegistry, StreamFanOut};
 use magi_session_store::{SessionStore, TimelineEntryKind, timeline_entry_visible_text};
-use magi_tool_runtime::ToolRegistry;
+use magi_tool_runtime::{
+    BuiltinToolName, ToolExecutionContext, ToolExecutionInput, ToolRegistry,
+};
 use magi_workspace::WorkspaceStore;
 use std::{
     collections::HashMap,
@@ -871,6 +875,9 @@ pub struct LlmTaskDispatcher {
     stream_fanout: Option<Arc<StreamFanOut>>,
     /// Task System v2：AgentRole 注册表（来自 ApiState，注入到 task_llm_loop）。
     agent_role_registry: Option<Arc<magi_agent_role::AgentRoleRegistry>>,
+    /// Task System v2 — L5：父子任务拓扑图。S7 协调器三件套（agent_spawn / send_message /
+    /// task_stop）需要在 task_llm_loop 中读写。设计为构造期必填，避免运行期再做空检查。
+    spawn_graph: Arc<std::sync::Mutex<magi_spawn_graph::SpawnGraph>>,
     /// 强制同步执行 dispatch，用于普通模式的同步 for 循环（设计 §1.3）。
     force_sync_dispatch: Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -896,6 +903,7 @@ impl LlmTaskDispatcher {
         session_store: Arc<SessionStore>,
         execution_registry: TaskExecutionRegistry,
         result_receiver: Arc<EventBasedResultReceiver>,
+        spawn_graph: Arc<std::sync::Mutex<magi_spawn_graph::SpawnGraph>>,
     ) -> Self {
         Self {
             event_bus,
@@ -915,6 +923,7 @@ impl LlmTaskDispatcher {
             conversation_registry: None,
             stream_fanout: None,
             agent_role_registry: None,
+            spawn_graph,
             force_sync_dispatch: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
@@ -1040,6 +1049,59 @@ impl LlmTaskDispatcher {
         });
     }
 
+    /// S7-D：LocalBash 变体直接走 ShellExec，绕过 LLM 循环 / agent role / prompt 组装。
+    /// 失败原因有两类：tool_registry 缺失（架构破坏，应 panic 一致行为）或
+    /// shell 退出非零（作为 TaskOutcome::Failed 上报，留 payload 给主线核查）。
+    fn execute_local_bash_variant(
+        &self,
+        task: &magi_core::Task,
+        session_id: &SessionId,
+        workspace_id: &Option<WorkspaceId>,
+        command: &str,
+        working_dir: Option<&str>,
+        worker_id: Option<&WorkerId>,
+    ) -> TaskOutcome {
+        let Some(registry) = self.tool_registry.as_ref() else {
+            return TaskOutcome::Failed {
+                error: format!(
+                    "LocalBash task {} 无法执行：ToolRegistry 未配置",
+                    task.task_id
+                ),
+            };
+        };
+        let mut payload = serde_json::json!({ "command": command });
+        if let Some(dir) = working_dir {
+            payload["working_dir"] = serde_json::Value::String(dir.to_string());
+        }
+        let input = ToolExecutionInput {
+            tool_call_id: ToolCallId::new(format!("local-bash-{}", task.task_id)),
+            tool_name: BuiltinToolName::ShellExec.as_str().to_string(),
+            tool_kind: ToolKind::Builtin,
+            input: payload.to_string(),
+            approval_requirement: ApprovalRequirement::None,
+            risk_level: RiskLevel::Medium,
+        };
+        let context = ToolExecutionContext {
+            worker_id: worker_id.cloned(),
+            task_id: Some(task.task_id.clone()),
+            session_id: Some(session_id.clone()),
+            workspace_id: workspace_id.clone(),
+            working_directory: working_dir.map(PathBuf::from),
+        };
+        let output = registry.execute_with_context(input, context);
+        match output.status {
+            ExecutionResultStatus::Succeeded => TaskOutcome::Completed {
+                output_refs: vec![output.payload],
+            },
+            other => TaskOutcome::Failed {
+                error: format!(
+                    "LocalBash task {} shell_exec 失败 (status={:?})：{}",
+                    task.task_id, other, output.payload
+                ),
+            },
+        }
+    }
+
     fn execute_dispatch_plan(
         &self,
         task: &magi_core::Task,
@@ -1065,6 +1127,28 @@ impl LlmTaskDispatcher {
         } else {
             Some(format!("timeline-streaming-{}", task.task_id))
         };
+        // S7-D：LocalBash 变体直接走 ShellExec，绕过 LLM 循环。
+        if let magi_core::TaskVariant::LocalBash {
+            command,
+            working_dir,
+        } = &task.variant
+        {
+            let outcome = self.execute_local_bash_variant(
+                task,
+                &session_id,
+                &workspace_id,
+                command,
+                working_dir.as_deref(),
+                Some(&worker_id),
+            );
+            if matches!(&outcome, TaskOutcome::Completed { .. }) {
+                self.session_store
+                    .bind_execution_ownership(session_id.clone(), ownership);
+                writebacks.apply(&self.pipeline.memory_store);
+            }
+            self.push_result(task_id, lease_id, outcome);
+            return;
+        }
         let (outcome, context_summary) = self.invoke_llm_with_tools(
             task,
             task_id,
@@ -1588,6 +1672,7 @@ impl LlmTaskDispatcher {
             conversation_registry: conversation_registry.as_ref(),
             stream_fanout: stream_fanout.as_ref(),
             agent_role_registry: agent_role_registry.as_ref(),
+            spawn_graph: self.spawn_graph.as_ref(),
             task,
             task_id,
             lease_id,
@@ -1826,6 +1911,7 @@ mod tests {
             Arc::new(SessionStore::new()),
             TaskExecutionRegistry::default(),
             Arc::new(EventBasedResultReceiver::new()),
+            Arc::new(std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new())),
         );
         if let Some(runtime) = context_runtime {
             dispatcher.with_context_runtime(runtime)
