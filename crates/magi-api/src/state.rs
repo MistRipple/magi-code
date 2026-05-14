@@ -18,7 +18,7 @@ use magi_bridge_client::{
     BridgeServerKind, BridgeTransport, JsonRpcBridgeServerProbeClient, McpServerConfig,
     ModelBridgeClient, StdioMcpBridgeClient,
 };
-use magi_conversation_runtime::ConversationRegistry;
+use magi_conversation_runtime::{ConversationRegistry, StreamFanOut};
 use magi_core::{SessionId, SessionLifecycleStatus, TaskId, TaskStatus, UtcMillis, WorkspaceId};
 use magi_event_bus::InMemoryEventBus;
 use magi_governance::GovernanceService;
@@ -608,6 +608,9 @@ pub struct ApiState {
     pub tunnel_manager: crate::tunnel::TunnelManager,
     pub snapshot_manager: Arc<SnapshotManager>,
     pub conversation_registry: Arc<ConversationRegistry>,
+    /// Task System v2：统一 StreamEvent 派生通道（模型 token / 工具事件 / 系统信号）。
+    /// 生产者：LLM IO + 工具 IO 段；订阅者：UI bridge / lane summary / projection 等。
+    pub stream_fanout: Arc<StreamFanOut>,
 }
 
 #[derive(Clone, Debug)]
@@ -721,6 +724,7 @@ impl ApiState {
             tunnel_manager: crate::tunnel::TunnelManager::new(38123),
             snapshot_manager: Arc::new(SnapshotManager::new()),
             conversation_registry: Arc::new(ConversationRegistry::new()),
+            stream_fanout: Arc::new(StreamFanOut::new()),
         }
     }
 

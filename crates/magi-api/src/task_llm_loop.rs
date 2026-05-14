@@ -22,7 +22,9 @@ use magi_bridge_client::{
     ModelInvocationRequest, ModelStreamingDelta, LOOPBACK_MODEL_PROVIDER,
     tool_concurrency::{ToolBatchKind, ToolConcurrencyInput, partition_tool_calls_with_inputs},
 };
-use magi_conversation_runtime::{ConversationRegistry, RoundOutcome, TurnDriver};
+use magi_conversation_runtime::{
+    ConversationRegistry, RoundOutcome, StreamEvent, StreamFanOut, TurnDriver,
+};
 use magi_core::{
     ApprovalRequirement, EventId, ExecutionResultStatus, LeaseId, RiskLevel, SessionId, TaskId,
     TaskKind, TaskStatus, ThreadId, ToolCallId, UtcMillis, WorkspaceId,
@@ -57,6 +59,9 @@ pub(crate) struct TaskLlmLoopRequest<'a> {
     /// Task System v2：Turn 状态机驱动。每次 LLM 调用都通过 advance_turn 驱动，
     /// 显式经过 Pending → Modeling → Done/Failed 不变式（同一 Conversation 不并发）。
     pub conversation_registry: &'a ConversationRegistry,
+    /// Task System v2 — 统一流派生通道。模型 token / 工具事件 / 系统信号在这里
+    /// 扇出给下游订阅者（writeback / projection / 未来 UI bridge）。
+    pub stream_fanout: &'a StreamFanOut,
     pub task: &'a magi_core::Task,
     pub task_id: &'a TaskId,
     pub lease_id: &'a LeaseId,
@@ -372,6 +377,7 @@ fn run_task_llm_loop_inner(
         skill_runtime,
         task_store,
         conversation_registry: _,
+        stream_fanout,
         task,
         task_id,
         lease_id,
@@ -531,12 +537,28 @@ fn run_task_llm_loop_inner(
                     &turn_visibility,
                     &delta.content,
                 );
+                // Task System v2 — 把模型 token delta 同步扇出到 StreamFanOut。
+                // 现存 publish_* 仍负责 session_store 写回与 event_bus 派发；fanout 是
+                // 增量观察通道，UI bridge / projection 后续 slice 切到此处订阅时，
+                // 上面两个 publish_* 内的 event_bus 分支会随之删除。
+                if !delta.content.is_empty() || !delta.thinking.is_empty() {
+                    stream_fanout.publish(StreamEvent::ModelDelta {
+                        session_id: session_id.clone(),
+                        content: delta.content.clone(),
+                        thinking: delta.thinking.clone(),
+                    });
+                }
             };
 
             match client.invoke_streaming(invocation_request, &on_delta) {
                 Ok(response) => response,
                 Err(error) => {
                     tracing::error!(task_id = %task.task_id, round = round, ?error, "LLM streaming invocation failed");
+                    stream_fanout.publish(StreamEvent::SystemSignal {
+                        session_id: session_id.clone(),
+                        code: "llm.invocation_failed".to_string(),
+                        detail: Some(format!("round {round}: {error:?}")),
+                    });
                     if task_lease_is_current(task_store, task_id, lease_id) {
                         append_task_error_turn_item(
                             event_bus,
@@ -687,6 +709,12 @@ fn run_task_llm_loop_inner(
                 "running",
                 &format!("正在调用 {}", tool_call.function.name),
             );
+            stream_fanout.publish(StreamEvent::ToolEvent {
+                session_id: session_id.clone(),
+                tool_call_id: ToolCallId::new(&tool_call.id),
+                phase: magi_conversation_runtime::ToolPhase::Started,
+                payload: tool_call.function.name.clone(),
+            });
         }
 
         let tool_results = execute_task_tool_call_batch(
@@ -736,6 +764,17 @@ fn run_task_llm_loop_inner(
                 },
                 &format!("{} {}", tool_call.function.name, outcome_label),
             );
+            let phase = if matches!(tool_status, ExecutionResultStatus::Succeeded) {
+                magi_conversation_runtime::ToolPhase::Succeeded
+            } else {
+                magi_conversation_runtime::ToolPhase::Failed
+            };
+            stream_fanout.publish(StreamEvent::ToolEvent {
+                session_id: session_id.clone(),
+                tool_call_id: ToolCallId::new(&tool_call.id),
+                phase,
+                payload: summarize_tool_result(&result),
+            });
             if !matches!(tool_status, ExecutionResultStatus::Succeeded) {
                 failed_tool_summaries.push(format!(
                     "{}: {}",
@@ -2747,6 +2786,7 @@ mod tests {
             skill_runtime: None,
             task_store: &task_store,
             conversation_registry: &ConversationRegistry::new(),
+            stream_fanout: &StreamFanOut::new(),
             task,
             task_id: &task.task_id,
             lease_id: &lease.lease_id,
@@ -2857,6 +2897,7 @@ mod tests {
             skill_runtime: None,
             task_store: &task_store,
             conversation_registry: &ConversationRegistry::new(),
+            stream_fanout: &StreamFanOut::new(),
             task: &task,
             task_id: &task.task_id,
             lease_id: &lease.lease_id,
@@ -3159,6 +3200,7 @@ mod tests {
             skill_runtime: None,
             task_store: &task_store,
             conversation_registry: &ConversationRegistry::new(),
+            stream_fanout: &StreamFanOut::new(),
             task: &task,
             task_id: &task.task_id,
             lease_id: &lease.lease_id,
@@ -3351,6 +3393,7 @@ mod tests {
             skill_runtime: None,
             task_store: &task_store,
             conversation_registry: &ConversationRegistry::new(),
+            stream_fanout: &StreamFanOut::new(),
             task: &task,
             task_id: &task.task_id,
             lease_id: &lease.lease_id,

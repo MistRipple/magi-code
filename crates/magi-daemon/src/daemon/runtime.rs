@@ -606,7 +606,8 @@ impl DaemonRuntime {
                 .with_tool_registry(tool_registry_for_dispatcher)
                 .with_skill_runtime(app_skill_runtime)
                 .with_snapshot_manager(state.snapshot_manager.clone())
-                .with_conversation_registry(state.conversation_registry.clone()),
+                .with_conversation_registry(state.conversation_registry.clone())
+                .with_stream_fanout(state.stream_fanout.clone()),
         );
         let session_turn_dispatcher = llm_task_dispatcher.clone();
         let runner_manager = RunnerManager::with_dispatcher_and_worker_catalog(

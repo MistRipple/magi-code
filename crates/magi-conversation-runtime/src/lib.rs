@@ -20,5 +20,5 @@ pub use conversation::{AdvanceTurnError, BeginTurnError, Conversation, TurnAdvan
 pub use driver::{RoundOutcome, TurnDriver};
 pub use mailbox::{MailboxItem, UserSignal};
 pub use registry::ConversationRegistry;
-pub use stream::{StreamEvent, StreamFanOut, ToolPhase};
+pub use stream::{StreamEvent, StreamFanOut, SubscriptionId, ToolPhase};
 pub use turn::{Turn, TurnState, TurnTransitionError};

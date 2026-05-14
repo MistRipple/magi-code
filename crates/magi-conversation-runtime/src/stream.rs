@@ -3,13 +3,21 @@
 //! 模型 token、工具事件、系统信号在 v1 各自走 callback：
 //! `task_llm_loop::publish_stream_delta` / `publish_task_thinking_delta` /
 //! `dispatch_execution` 中的 `_on_delta` 闭包。v2 把它们收口为同一个
-//! `StreamEvent` 派生源，下游（writeback / lane summary / projection）
-//! 各自订阅自己关心的子集。
+//! `StreamEvent` 派生源，下游（writeback / lane summary / projection /
+//! UI bridge）各自注册自己的回调订阅。
 //!
-//! S3 范围内仅定义类型与最小 fan-out 协议；v1 publish 路径仍是真实 IO 落点，
-//! 由后续 slice 把现有 callback 替换为往这里推。
+//! S3 范围：
+//! - 类型契约：`StreamEvent` + `ToolPhase`
+//! - 派生通道：callback-based `StreamFanOut`（同步扇出，不引入 tokio/mpsc）
+//! - v1 publish 段照原样保留状态写入（session_store 等），增量把 fanout 作为
+//!   observation 通道暴露出来，下游 UI bridge 后续 slice 切换到这里订阅
+//!   并删除 event_bus 上对应的 session_turn_item_event 分支
+//!
+//! 同步扇出选择：模型 IO 是单调度线程，发布回调直接在生产者线程跑；
+//! 不需要 mpsc receiver thread，也避免 std::sync::mpsc 在 fan-out 取消订阅
+//! 时的复杂性。后续慢消费者由订阅者自行决定是否 spawn 处理。
 
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::{Arc, Mutex};
 
 use magi_core::{SessionId, ToolCallId};
 use serde::{Deserialize, Serialize};
@@ -58,29 +66,83 @@ impl StreamEvent {
     }
 }
 
-/// 一个最小的 fan-out 派生通道：写端 publish 一份，读端按 SessionId 过滤。
-/// S3 范围内是单写多读的同步 channel——不引入 tokio broadcast 等运行时绑定。
-#[derive(Debug)]
+/// 同步 fan-out：每个订阅者是一个 `Fn(&StreamEvent)` 闭包，publish 时按
+/// 注册顺序在生产者线程依次回调。订阅者持有自己的状态（通常通过 `Arc<Mutex<_>>`
+/// 捕获）；不在 fanout 层做线程切换。
+///
+/// 订阅者通过 `subscribe` 拿到一个 `SubscriptionId`，可以稍后 `unsubscribe`。
+/// 在 LLM 调用 / 工具批 / Turn 期间临时挂入的订阅者用 RAII guard 自动撤销，
+/// 由调用方包装；fanout 本身不负责 guard 寿命。
 pub struct StreamFanOut {
-    senders: Vec<Sender<StreamEvent>>,
+    inner: Mutex<StreamFanOutInner>,
 }
+
+struct StreamFanOutInner {
+    next_id: u64,
+    subscribers: Vec<(SubscriptionId, Subscriber)>,
+}
+
+type Subscriber = Arc<dyn Fn(&StreamEvent) + Send + Sync>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SubscriptionId(u64);
 
 impl StreamFanOut {
     pub fn new() -> Self {
         Self {
-            senders: Vec::new(),
+            inner: Mutex::new(StreamFanOutInner {
+                next_id: 1,
+                subscribers: Vec::new(),
+            }),
         }
     }
 
-    pub fn subscribe(&mut self) -> Receiver<StreamEvent> {
-        let (tx, rx) = channel();
-        self.senders.push(tx);
-        rx
+    pub fn subscribe<F>(&self, callback: F) -> SubscriptionId
+    where
+        F: Fn(&StreamEvent) + Send + Sync + 'static,
+    {
+        let mut guard = self.inner.lock().expect("StreamFanOut mutex poisoned");
+        let id = SubscriptionId(guard.next_id);
+        guard.next_id += 1;
+        guard.subscribers.push((id, Arc::new(callback)));
+        id
     }
 
-    /// publish 失败的订阅者（receiver 已丢弃）会被静默忽略；S3 不引入背压。
-    pub fn publish(&mut self, event: StreamEvent) {
-        self.senders.retain(|sender| sender.send(event.clone()).is_ok());
+    pub fn unsubscribe(&self, id: SubscriptionId) -> bool {
+        let mut guard = self.inner.lock().expect("StreamFanOut mutex poisoned");
+        let before = guard.subscribers.len();
+        guard.subscribers.retain(|(existing, _)| *existing != id);
+        guard.subscribers.len() < before
+    }
+
+    pub fn publish(&self, event: StreamEvent) {
+        let subs: Vec<Subscriber> = {
+            let guard = self.inner.lock().expect("StreamFanOut mutex poisoned");
+            guard
+                .subscribers
+                .iter()
+                .map(|(_, callback)| Arc::clone(callback))
+                .collect()
+        };
+        for callback in subs {
+            callback(&event);
+        }
+    }
+
+    pub fn subscriber_count(&self) -> usize {
+        self.inner
+            .lock()
+            .expect("StreamFanOut mutex poisoned")
+            .subscribers
+            .len()
+    }
+}
+
+impl std::fmt::Debug for StreamFanOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamFanOut")
+            .field("subscribers", &self.subscriber_count())
+            .finish()
     }
 }
 
@@ -93,6 +155,7 @@ impl Default for StreamFanOut {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex as StdMutex;
 
     fn sample_delta(session: &str, text: &str) -> StreamEvent {
         StreamEvent::ModelDelta {
@@ -104,33 +167,51 @@ mod tests {
 
     #[test]
     fn single_subscriber_receives_in_order() {
-        let mut fan = StreamFanOut::new();
-        let rx = fan.subscribe();
+        let fan = StreamFanOut::new();
+        let log: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+        let log_clone = Arc::clone(&log);
+        fan.subscribe(move |evt| {
+            if let StreamEvent::ModelDelta { content, .. } = evt {
+                log_clone.lock().unwrap().push(content.clone());
+            }
+        });
         fan.publish(sample_delta("s", "a"));
         fan.publish(sample_delta("s", "b"));
-        let collected: Vec<_> = (0..2).map(|_| rx.recv().unwrap()).collect();
-        assert!(matches!(&collected[0], StreamEvent::ModelDelta { content, .. } if content == "a"));
-        assert!(matches!(&collected[1], StreamEvent::ModelDelta { content, .. } if content == "b"));
+        let collected = log.lock().unwrap().clone();
+        assert_eq!(collected, vec!["a".to_string(), "b".to_string()]);
     }
 
     #[test]
     fn multiple_subscribers_each_receive_full_stream() {
-        let mut fan = StreamFanOut::new();
-        let a = fan.subscribe();
-        let b = fan.subscribe();
+        let fan = StreamFanOut::new();
+        let a: Arc<StdMutex<usize>> = Arc::new(StdMutex::new(0));
+        let b: Arc<StdMutex<usize>> = Arc::new(StdMutex::new(0));
+        let a2 = Arc::clone(&a);
+        let b2 = Arc::clone(&b);
+        fan.subscribe(move |_| *a2.lock().unwrap() += 1);
+        fan.subscribe(move |_| *b2.lock().unwrap() += 1);
         fan.publish(sample_delta("s", "x"));
-        assert!(a.recv().is_ok());
-        assert!(b.recv().is_ok());
+        fan.publish(sample_delta("s", "y"));
+        assert_eq!(*a.lock().unwrap(), 2);
+        assert_eq!(*b.lock().unwrap(), 2);
     }
 
     #[test]
-    fn dropped_subscriber_is_cleaned_up_on_next_publish() {
-        let mut fan = StreamFanOut::new();
-        let _kept = fan.subscribe();
-        let drop_me = fan.subscribe();
-        drop(drop_me);
-        fan.publish(sample_delta("s", "x"));
-        assert_eq!(fan.senders.len(), 1);
+    fn unsubscribe_stops_callbacks() {
+        let fan = StreamFanOut::new();
+        let counter: Arc<StdMutex<usize>> = Arc::new(StdMutex::new(0));
+        let counter2 = Arc::clone(&counter);
+        let id = fan.subscribe(move |_| *counter2.lock().unwrap() += 1);
+        fan.publish(sample_delta("s", "first"));
+        assert!(fan.unsubscribe(id));
+        fan.publish(sample_delta("s", "second"));
+        assert_eq!(*counter.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn unsubscribe_unknown_returns_false() {
+        let fan = StreamFanOut::new();
+        assert!(!fan.unsubscribe(SubscriptionId(999)));
     }
 
     #[test]
