@@ -218,7 +218,7 @@ mod tests {
     use magi_core::{
         AbsolutePath, DecisionOption, DecisionTaskPayload, EventId, ExecutionOwnership,
         ExecutorBinding, LeaseId, MissionId, SessionId, Task, TaskId, TaskKind, TaskStatus,
-        UtcMillis, WorkerId, WorkspaceId,
+        ThreadId, UtcMillis, WorkerId, WorkspaceId,
     };
     use magi_event_bus::{EventEnvelope, InMemoryEventBus};
     use magi_governance::GovernanceService;
@@ -229,7 +229,8 @@ mod tests {
     use magi_session_store::{
         ActiveExecutionBranch, ActiveExecutionChain, ActiveExecutionDispatchContext,
         ActiveExecutionTurn, ActiveExecutionTurnItem, CanonicalTurnItemKind,
-        CanonicalTurnItemStatus, SessionStore, TimelineEntryKind,
+        CanonicalTurnItemStatus, ExecutionThread, ExecutionThreadStatus, SessionStore,
+        ThreadVisibility, TimelineEntryKind,
     };
     use magi_skill_runtime::SkillDispatchRuntime;
     use magi_tool_runtime::ToolRegistry;
@@ -1509,8 +1510,8 @@ mod tests {
                 .first()
                 .is_some_and(|item| item.kind == "user_message"
                     && item.content.as_deref() == Some(task_text)
-                    && !item.thread_visible),
-            "任务 turn 的用户消息只作为请求锚点，不应进入响应区渲染"
+                    && item.source == "user"),
+            "任务 turn 的用户消息只作为请求锚点（kind=user_message + source=user），由前端按 kind 决定不入响应区"
         );
     }
 
@@ -2217,19 +2218,26 @@ mod tests {
                 session_entry
                     .worker_lanes
                     .iter()
-                    .all(|lane| lane.role_id.as_deref().is_some_and(|role_id| {
+                    .all(|lane| {
+                        let role_id = lane.role_id.as_str();
                         !role_id.is_empty()
                             && !role_id.starts_with("task-")
                             && !role_id.starts_with("worker-")
                             && !role_id.starts_with("lane-")
-                    })),
+                    }),
                 "worker lane tabs must expose product role ids, not internal lane/task ids"
             );
             assert!(
                 session_entry
                     .turn_items
                     .iter()
-                    .filter(|item| item.worker_visible)
+                    .filter(|item| matches!(
+                        state.session_store.resolve_thread_visibility(
+                            &session_id,
+                            &ThreadId::new(item.source_thread_id.clone()),
+                        ),
+                        Some(ThreadVisibility::WorkerDrawer { .. })
+                    ))
                     .all(|item| item.role_id.as_deref().is_some_and(|role_id| {
                         !role_id.is_empty()
                             && !role_id.starts_with("task-")
@@ -2298,8 +2306,13 @@ mod tests {
             canonical_turn
                 .items
                 .iter()
-                .any(|item| item.visibility.worker_visible),
-            "deep task canonical turn must preserve worker-visible items for bootstrap"
+                .any(|item| matches!(
+                    state
+                        .session_store
+                        .resolve_thread_visibility(&session_id, &item.source_thread_id),
+                    Some(ThreadVisibility::WorkerDrawer { .. })
+                )),
+            "deep task canonical turn must preserve worker-drawer items for bootstrap"
         );
         let terminal_turn_event = state
             .event_bus
@@ -2454,6 +2467,25 @@ mod tests {
         let action_task_id = TaskId::new("task-turn-output-refs");
         let accepted_at = UtcMillis::now();
 
+        let (_mission_id, orchestrator_thread_id) = state
+            .session_store
+            .ensure_session_mission(&session_id, accepted_at, || mission_id.clone());
+        let worker_thread_id = ThreadId::new("thread-worker-turn-output-refs-reviewer");
+        state
+            .session_store
+            .register_thread(ExecutionThread {
+                thread_id: worker_thread_id.clone(),
+                session_id: session_id.clone(),
+                mission_id: mission_id.clone(),
+                role_id: "reviewer".to_string(),
+                worker_instance_id: WorkerId::new("task-worker-reviewer"),
+                status: ExecutionThreadStatus::Active,
+                created_at: accepted_at,
+                last_used_at: accepted_at,
+                handled_task_ids: vec![action_task_id.clone()],
+                message_history: Vec::new(),
+            });
+
         state
             .session_store
             .upsert_active_execution_chain(
@@ -2505,9 +2537,7 @@ mod tests {
                                 user_message_id: None,
                                 placeholder_message_id: None,
                                 timeline_entry_id: None,
-                                thread_visible: false,
-                                worker_visible: false,
-                            source_thread_id: None,
+                                source_thread_id: worker_thread_id.clone(),
                             },
                             ActiveExecutionTurnItem {
                                 item_id: "turn-item-assistant-final".to_string(),
@@ -2532,9 +2562,7 @@ mod tests {
                                 user_message_id: None,
                                 placeholder_message_id: None,
                                 timeline_entry_id: None,
-                                thread_visible: true,
-                                worker_visible: false,
-                            source_thread_id: None,
+                                source_thread_id: orchestrator_thread_id.clone(),
                             },
                         ],
                         worker_lanes: vec![magi_session_store::ActiveExecutionTurnLane {
@@ -2542,8 +2570,8 @@ mod tests {
                             lane_seq: 1,
                             task_id: action_task_id.clone(),
                             worker_id: WorkerId::new("task-worker-reviewer"),
-                            role_id: None,
-                            thread_id: None,
+                            role_id: "reviewer".to_string(),
+                            thread_id: worker_thread_id.clone(),
                             title: "评审最终总结".to_string(),
                             is_primary: false,
                         }],
@@ -2678,6 +2706,10 @@ mod tests {
         let action_task_id = TaskId::new("task-action-deep-primary-done");
         let accepted_at = UtcMillis::now();
 
+        let (_mission_id, orchestrator_thread_id) = state
+            .session_store
+            .ensure_session_mission(&session_id, accepted_at, || mission_id.clone());
+
         state
             .session_store
             .upsert_active_execution_chain(
@@ -2728,9 +2760,7 @@ mod tests {
                             user_message_id: None,
                             placeholder_message_id: None,
                             timeline_entry_id: None,
-                            thread_visible: true,
-                            worker_visible: false,
-                            source_thread_id: None,
+                            source_thread_id: orchestrator_thread_id.clone(),
                         }],
                         worker_lanes: vec![],
                     }),
@@ -2839,6 +2869,10 @@ mod tests {
         let action_task_id = TaskId::new("task-turn-no-assistant-final");
         let accepted_at = UtcMillis::now();
 
+        let (_mission_id, orchestrator_thread_id) = state
+            .session_store
+            .ensure_session_mission(&session_id, accepted_at, || mission_id.clone());
+
         state
             .session_store
             .upsert_active_execution_chain(
@@ -2889,9 +2923,7 @@ mod tests {
                             user_message_id: None,
                             placeholder_message_id: None,
                             timeline_entry_id: None,
-                            thread_visible: true,
-                            worker_visible: false,
-                            source_thread_id: None,
+                            source_thread_id: orchestrator_thread_id.clone(),
                         }],
                         worker_lanes: vec![],
                     }),
@@ -2975,6 +3007,10 @@ mod tests {
         let first_accepted_at = UtcMillis::now();
         let second_accepted_at = UtcMillis(first_accepted_at.0 + 1);
 
+        let (_mission_id, orchestrator_thread_id) = state
+            .session_store
+            .ensure_session_mission(&session_id, first_accepted_at, || mission_id.clone());
+
         state
             .session_store
             .upsert_active_execution_chain(
@@ -3025,9 +3061,7 @@ mod tests {
                             user_message_id: None,
                             placeholder_message_id: None,
                             timeline_entry_id: None,
-                            thread_visible: true,
-                            worker_visible: false,
-                            source_thread_id: None,
+                            source_thread_id: orchestrator_thread_id.clone(),
                         }],
                         worker_lanes: vec![],
                     }),
@@ -3248,7 +3282,8 @@ mod tests {
             "/api/session/turn",
             json!({
                 "sessionId": "session-route-loopback",
-                "text": "读取一个配置文件并总结",
+                "text": "分析并拆分：读取一个配置文件并总结",
+                "skillName": "refactor",
                 "images": [],
             }),
         )
@@ -6433,14 +6468,17 @@ mod tests {
             .session_store
             .create_session(session_id.clone(), "interrupt completed root")
             .expect("session should be creatable");
+        let (_mission_id, orchestrator_thread_id) = state
+            .session_store
+            .ensure_session_mission(&session_id, now, || mission_id.clone());
         let mut phase_item = session_turn_item(
             "assistant_phase",
             "pending",
             Some("任务状态".to_string()),
             Some("任务运行中".to_string()),
             Some("turn-item-interrupt-completed-root-phase".to_string()),
+            orchestrator_thread_id.clone(),
         );
-        phase_item.thread_visible = true;
         phase_item.task_id = Some(root_task_id.clone());
         state
             .session_store

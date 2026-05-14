@@ -169,6 +169,11 @@ async fn submit_session_turn(
                 .ok_or_else(|| ApiError::InvalidInput("继续会话需要明确的 session".to_string()))?;
             let prompt_text = request.trimmed_text();
             let accepted = continue_execution_chain(&state, &session_id, &[])?;
+            let (_, orchestrator_thread_id) = state.session_store.ensure_session_mission(
+                &session_id,
+                accepted_at,
+                || accepted.mission_id.clone(),
+            );
             let (entry_id, user_message_item_id) = match prompt_text.as_deref() {
                 Some(prompt_text) => {
                     let entry_id = format!("timeline-{}-{}", session_id, accepted_at.0);
@@ -180,7 +185,7 @@ async fn submit_session_turn(
                         request.user_message_id(),
                         request.placeholder_message_id(),
                         Some(accepted.action_task_id.clone()),
-                        true,
+                        orchestrator_thread_id.clone(),
                     );
                     let updated = state
                         .session_store
@@ -779,7 +784,7 @@ fn build_user_message_turn_item(
     user_message_id: Option<String>,
     placeholder_message_id: Option<String>,
     task_id: Option<magi_core::TaskId>,
-    thread_visible: bool,
+    source_thread_id: magi_core::ThreadId,
 ) -> (String, ActiveExecutionTurnItem) {
     let user_message_item_id = user_message_id
         .clone()
@@ -809,9 +814,8 @@ fn build_user_message_turn_item(
             user_message_id,
             placeholder_message_id,
             timeline_entry_id: Some(entry_id.to_string()),
-            thread_visible,
-            worker_visible: false,
-            source_thread_id: None,
+            // P7：user_message 由前端用户发起，归属到 orchestrator thread，走主线可见性。
+            source_thread_id,
         },
     )
 }
@@ -821,6 +825,7 @@ fn build_assistant_placeholder_turn_item(
     placeholder_message_id: Option<String>,
     request_id: Option<String>,
     user_message_id: Option<String>,
+    source_thread_id: magi_core::ThreadId,
 ) -> (String, ActiveExecutionTurnItem) {
     let placeholder_item_id = placeholder_message_id
         .unwrap_or_else(|| format!("turn-item-assistant-stream-{}-0", accepted_at.0));
@@ -849,9 +854,8 @@ fn build_assistant_placeholder_turn_item(
             user_message_id,
             placeholder_message_id: Some(placeholder_item_id.clone()),
             timeline_entry_id: None,
-            thread_visible: true,
-            worker_visible: false,
-            source_thread_id: None,
+            // P7：assistant_stream 占位项由 orchestrator 生成，归属主线。
+            source_thread_id,
         },
     )
 }
@@ -886,12 +890,19 @@ fn submit_regular_session_turn(
     let request_id = request.request_id();
     let user_message_id = request.user_message_id();
     let requested_placeholder_message_id = request.placeholder_message_id();
+    // P7：所有 turn item 必须携带 source_thread_id，由 ensure_session_mission 提供 orchestrator thread。
+    let (_mission_id, orchestrator_thread_id) = state.session_store.ensure_session_mission(
+        &session_id,
+        accepted_at,
+        || magi_core::MissionId::new(format!("mission-session-chat-{}", accepted_at.0)),
+    );
     let (assistant_placeholder_item_id, assistant_placeholder_item) =
         build_assistant_placeholder_turn_item(
             accepted_at,
             requested_placeholder_message_id,
             request_id.clone(),
             user_message_id.clone(),
+            orchestrator_thread_id.clone(),
         );
     let placeholder_message_id = Some(assistant_placeholder_item_id.clone());
     // 使用前端传入的 userMessageId 作为 canonical item_id，确保前端乐观节点与后端流式更新使用同一 ID
@@ -903,7 +914,7 @@ fn submit_regular_session_turn(
         user_message_id.clone(),
         placeholder_message_id.clone(),
         None,
-        true,
+        orchestrator_thread_id.clone(),
     );
     let turn_id = format!("turn-session-{}", accepted_at.0);
     let mut turn = ActiveExecutionTurn {
@@ -1541,6 +1552,11 @@ async fn continue_session(
         .collect::<Vec<_>>();
     let continued_at = UtcMillis::now();
     let accepted = continue_execution_chain(&state, &session_id, &requested_worker_ids)?;
+    let (_, orchestrator_thread_id) = state.session_store.ensure_session_mission(
+        &session_id,
+        continued_at,
+        || accepted.mission_id.clone(),
+    );
     if let Some(prompt_text) = prompt_text.as_deref() {
         let entry_id = format!("timeline-{}-{}", session_id, continued_at.0);
         let (_, user_message_item) = build_user_message_turn_item(
@@ -1551,7 +1567,7 @@ async fn continue_session(
             user_message_id,
             placeholder_message_id,
             Some(accepted.action_task_id.clone()),
-            true,
+            orchestrator_thread_id.clone(),
         );
         let updated = state
             .session_store

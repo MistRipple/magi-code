@@ -40,7 +40,6 @@ export function buildDispatchLaneCardData(
 ): WorkerTaskCardData {
   const description = normalizeCardText(lane.description);
   // P1 身份契约：worker 身份只认 jumpTarget.workerTabId（即 roleId）。
-  // lane.worker 保留为兼容字段，不再参与卡片身份。
   const workerTabId = normalizeCardText(lane.jumpTarget?.workerTabId);
   const worker = workerTabId;
   const title = normalizeCardText(lane.title)

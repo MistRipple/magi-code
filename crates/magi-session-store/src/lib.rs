@@ -13,6 +13,7 @@ pub use models::{
     SessionExecutionSidecarStoreState, SessionProjectionInput, SessionRecord,
     SessionRuntimeSidecar, SessionRuntimeSidecarExport, SessionSidecarFlushMetadata,
     SessionSidecarFlushReason, SessionStoreState, ThreadChatMessage, ThreadChatToolCall,
-    ThreadChatToolFunction, TimelineEntry, TimelineEntryKind, timeline_entry_visible_text,
+    ThreadChatToolFunction, ThreadVisibility, TimelineEntry, TimelineEntryKind,
+    timeline_entry_visible_text,
 };
-pub use store::SessionStore;
+pub use store::{ORCHESTRATOR_ROLE_ID, SessionStore};

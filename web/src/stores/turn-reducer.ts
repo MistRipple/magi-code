@@ -39,12 +39,7 @@ function cloneTurnItem(item: CanonicalTurnItem): CanonicalTurnItem {
     blocks: Array.isArray(item.blocks) ? [...item.blocks] : undefined,
     tool: item.tool ? { ...item.tool } : undefined,
     worker: item.worker ? { ...item.worker } : undefined,
-    visibility: {
-      ...item.visibility,
-      workerTabIds: Array.isArray(item.visibility.workerTabIds)
-        ? [...item.visibility.workerTabIds]
-        : undefined,
-    },
+    visibility: { ...item.visibility },
     metadata: item.metadata ? { ...item.metadata } : undefined,
   };
 }

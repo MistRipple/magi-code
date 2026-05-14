@@ -18,10 +18,7 @@ export type CanonicalTurnItemStatus = CanonicalTurnStatus;
 export type CanonicalTurnEventKind = 'turn_started' | 'turn_item_upsert' | 'turn_completed';
 
 export interface CanonicalTurnVisibility {
-  threadVisible: boolean;
-  workerVisible: boolean;
   renderable: boolean;
-  workerTabIds?: string[];
 }
 
 export interface CanonicalToolCall {
@@ -58,11 +55,11 @@ export interface CanonicalTurnItem {
   tool?: CanonicalToolCall;
   worker?: CanonicalWorkerRef;
   /**
-   * P6c：item 归属的 thread_id。orchestrator 主线 item 对应 session 级
+   * item 归属的 thread_id。orchestrator 主线 item 对应 session 级
    * orchestrator thread，worker sidechain item 对应各 worker thread。
-   * 可选以兼容 P6 迁移期的历史数据。
+   * 由后端 canonical projection 保证非空，是前端 thread/worker drawer 的唯一路由信号。
    */
-  sourceThreadId?: string;
+  sourceThreadId: string;
   visibility: CanonicalTurnVisibility;
   metadata?: Record<string, unknown>;
 }
@@ -143,19 +140,6 @@ function readBoolean(record: Record<string, unknown>, defaultValue: boolean, ...
   return defaultValue;
 }
 
-function readStringArray(record: Record<string, unknown>, ...keys: string[]): string[] | undefined {
-  for (const key of keys) {
-    const value = record[key];
-    if (Array.isArray(value)) {
-      const values = value
-        .filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
-        .map((item) => item.trim());
-      return values.length > 0 ? values : undefined;
-    }
-  }
-  return undefined;
-}
-
 function readStatus(value: string): CanonicalTurnStatus | undefined {
   return CANONICAL_TURN_STATUSES.includes(value as CanonicalTurnStatus)
     ? value as CanonicalTurnStatus
@@ -211,10 +195,7 @@ function normalizeCanonicalWorkerRef(value: unknown): CanonicalWorkerRef | undef
 function normalizeCanonicalVisibility(value: unknown): CanonicalTurnVisibility {
   const record = readRecord(value) || {};
   return {
-    threadVisible: readBoolean(record, true, 'threadVisible', 'thread_visible'),
-    workerVisible: readBoolean(record, false, 'workerVisible', 'worker_visible'),
     renderable: readBoolean(record, true, 'renderable'),
-    ...(readStringArray(record, 'workerTabIds', 'worker_tab_ids') ? { workerTabIds: readStringArray(record, 'workerTabIds', 'worker_tab_ids') } : {}),
   };
 }
 
@@ -232,7 +213,8 @@ export function normalizeCanonicalTurnItem(value: unknown): CanonicalTurnItem | 
   const itemSeq = readNumber(record, 'itemSeq', 'item_seq');
   const createdAt = readNumber(record, 'createdAt', 'created_at');
   const updatedAt = readNumber(record, 'updatedAt', 'updated_at') ?? createdAt;
-  if (!sessionId || !turnId || !itemId || !kind || !status || turnSeq === undefined || itemSeq === undefined || createdAt === undefined || updatedAt === undefined) {
+  const sourceThreadId = readString(record, 'sourceThreadId', 'source_thread_id');
+  if (!sessionId || !turnId || !itemId || !kind || !status || turnSeq === undefined || itemSeq === undefined || createdAt === undefined || updatedAt === undefined || !sourceThreadId) {
     return undefined;
   }
   const laneId = readString(record, 'laneId', 'lane_id') || undefined;
@@ -259,7 +241,7 @@ export function normalizeCanonicalTurnItem(value: unknown): CanonicalTurnItem | 
     ...(blocks ? { blocks } : {}),
     ...(normalizeCanonicalToolCall(record.tool) ? { tool: normalizeCanonicalToolCall(record.tool) } : {}),
     ...(normalizeCanonicalWorkerRef(record.worker) ? { worker: normalizeCanonicalWorkerRef(record.worker) } : {}),
-    ...(readString(record, 'sourceThreadId', 'source_thread_id') ? { sourceThreadId: readString(record, 'sourceThreadId', 'source_thread_id') } : {}),
+    sourceThreadId,
     visibility: normalizeCanonicalVisibility(record.visibility),
     ...(metadata ? { metadata } : {}),
   };

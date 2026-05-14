@@ -82,28 +82,39 @@ pub struct ActiveExecutionBranch {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-/// P6d 概念定位：`ActiveExecutionTurnLane` 是 Thread 在某个 turn 的"派发快照"——
+/// `ActiveExecutionTurnLane` 是 Thread 在某个 turn 的"派发快照"：
 /// thread 是跨 turn / 跨 task 的稳定身份（见 [`ExecutionThread`]），
-/// lane 是 thread 在当前 turn 中实际承担工作的视图记录。lane.thread_id 必须能回溯到
-/// 同一 mission 下注册过的 ExecutionThread；当 thread_id = None 时仅限 P6 迁移期
-/// 的历史数据，新写入路径都应设置该字段。
+/// lane 是 thread 在当前 turn 中实际承担工作的视图记录。`thread_id` 必须
+/// 能回溯到同一 mission 下注册过的 ExecutionThread。
 pub struct ActiveExecutionTurnLane {
     pub lane_id: String,
     pub lane_seq: usize,
     pub task_id: TaskId,
     pub worker_id: WorkerId,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub role_id: Option<String>,
-    /// P6a：lane 绑定到其隶属的 Thread。`None` 表示旧路径（P6 未完成迁移的 lane），
-    /// P6d 收口后会去掉 Option。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub thread_id: Option<ThreadId>,
+    /// lane 所属角色。必填：P7 收敛后 lane 必须由 role 驱动派发。
+    pub role_id: String,
+    /// lane 绑定到其隶属的 Thread（worker thread 或 orchestrator thread）。
+    pub thread_id: ThreadId,
     pub title: String,
     #[serde(default)]
     pub is_primary: bool,
 }
 
 pub const CANONICAL_TURN_SCHEMA_VERSION: &str = "canonical-turn.v1";
+
+/// `source_thread_id` 的可见性判定结果：
+/// - `Main`：对应 session 的 orchestrator thread，item 归属主线时间线
+/// - `WorkerDrawer`：对应某条 worker thread，item 归属该 worker 的 drawer
+///
+/// 由 `SessionStore::resolve_thread_visibility` 返回，是后端路由可见性的唯一出口。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ThreadVisibility {
+    Main,
+    WorkerDrawer {
+        role_id: String,
+        worker_id: WorkerId,
+    },
+}
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -204,24 +215,17 @@ pub enum CanonicalTurnEventKind {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct CanonicalTurnVisibility {
-    #[serde(default = "default_true")]
-    pub thread_visible: bool,
-    #[serde(default)]
-    pub worker_visible: bool,
+    /// 该 item 是否值得被 UI 投射为卡片。与 source_thread_id 正交：
+    /// renderable=false 的 item 仍然参与 canonical log（用于审计、撤销等），
+    /// 只是前端 projection 在渲染时跳过。主线 / drawer 路由一律交给
+    /// `source_thread_id` + thread_registry 判定，不再靠 visibility 决定归属。
     #[serde(default = "default_true")]
     pub renderable: bool,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub worker_tab_ids: Vec<String>,
 }
 
 impl Default for CanonicalTurnVisibility {
     fn default() -> Self {
-        Self {
-            thread_visible: true,
-            worker_visible: false,
-            renderable: true,
-            worker_tab_ids: Vec::new(),
-        }
+        Self { renderable: true }
     }
 }
 
@@ -279,10 +283,9 @@ pub struct CanonicalTurnItem {
     pub tool: Option<CanonicalToolCall>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worker: Option<CanonicalWorkerRef>,
-    /// P6c：item 归属的 thread_id。orchestrator 主线 item 为 session 级 orchestrator thread，
+    /// item 归属的 thread_id。orchestrator 主线 item 为 session 级 orchestrator thread，
     /// worker sidechain item 为对应 worker thread。前端 projection 用它作为单一路由键。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_thread_id: Option<ThreadId>,
+    pub source_thread_id: ThreadId,
     #[serde(default)]
     pub visibility: CanonicalTurnVisibility,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -452,14 +455,10 @@ pub struct ActiveExecutionTurnItem {
     pub placeholder_message_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeline_entry_id: Option<String>,
-    #[serde(default = "default_true")]
-    pub thread_visible: bool,
-    #[serde(default)]
-    pub worker_visible: bool,
-    /// P6c：item 归属的 thread。orchestrator 主线 item 为 session 级 orchestrator thread；
-    /// worker sidechain item 为对应 worker thread。为 None 仅限于 P6 迁移期的历史数据。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_thread_id: Option<ThreadId>,
+    /// item 归属的 thread。orchestrator 主线 item 为 session 级 orchestrator thread；
+    /// worker sidechain item 为对应 worker thread。单一路由键，前端按此 + thread 的
+    /// `role_id` 判定主线 / drawer 归属。
+    pub source_thread_id: ThreadId,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

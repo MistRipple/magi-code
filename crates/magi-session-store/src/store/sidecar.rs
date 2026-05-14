@@ -6,7 +6,7 @@ use crate::models::{
     CanonicalTurnStatus, CanonicalTurnVisibility, CanonicalWorkerRef, ExecutionThread,
     ExecutionThreadStatus, SessionExecutionSidecarStatus, SessionExecutionSidecarStoreState,
     SessionRuntimeSidecar, SessionSidecarFlushReason, SessionStoreState, ThreadChatMessage,
-    TimelineEntry, TimelineEntryKind,
+    ThreadVisibility, TimelineEntry, TimelineEntryKind,
 };
 use magi_core::{
     DomainError, DomainResult, ExecutionOwnership, LeaseId, MissionId, RecoveryResumeInput,
@@ -189,15 +189,6 @@ fn current_turn_item_to_canonical_worker(
     })
 }
 
-fn current_turn_item_worker_tab_ids(item: &ActiveExecutionTurnItem) -> Vec<String> {
-    item.role_id
-        .as_ref()
-        .map(|role_id| role_id.trim())
-        .filter(|role_id| !role_id.is_empty())
-        .map(|role_id| vec![role_id.to_string()])
-        .unwrap_or_default()
-}
-
 fn current_turn_item_metadata(item: &ActiveExecutionTurnItem) -> HashMap<String, Value> {
     let mut metadata = HashMap::new();
     if let Some(value) = item
@@ -261,7 +252,6 @@ fn current_turn_item_to_canonical_item(
             message: format!("canonical tool item {} missing tool payload", item.item_id),
         });
     }
-    let worker_tab_ids = current_turn_item_worker_tab_ids(item);
     Ok(CanonicalTurnItem {
         session_id: session_id.clone(),
         turn_id: turn.turn_id.clone(),
@@ -282,10 +272,7 @@ fn current_turn_item_to_canonical_item(
         worker: current_turn_item_to_canonical_worker(item),
         source_thread_id: item.source_thread_id.clone(),
         visibility: CanonicalTurnVisibility {
-            thread_visible: item.thread_visible,
-            worker_visible: item.worker_visible,
             renderable: current_turn_item_renderable(item, kind, status),
-            worker_tab_ids,
         },
         metadata: current_turn_item_metadata(item),
     })
@@ -910,6 +897,39 @@ impl SessionStore {
             message_history: Vec::new(),
         });
         (mission_id, thread_id)
+    }
+
+    /// 依据 `source_thread_id` 判定 item 的可见性目的地。返回值是"主线"还是
+    /// "worker drawer"，由 thread 的 `role_id` 决定：
+    /// - 该 thread 是 session 的 orchestrator thread → `Main`
+    /// - 其他 thread → `WorkerDrawer { role_id, worker_id }`
+    ///
+    /// 约束：传入的 `source_thread_id` 必须是本 session 已注册 thread；
+    /// 否则返回 `None`，调用方按"未知来源"处理（通常只出现在 P6 之前遗留的
+    /// canonical turn，新写入路径不会走到）。
+    pub fn resolve_thread_visibility(
+        &self,
+        session_id: &SessionId,
+        source_thread_id: &ThreadId,
+    ) -> Option<ThreadVisibility> {
+        let state = self
+            .state
+            .read()
+            .expect("session state read lock poisoned");
+        let thread = state
+            .thread_registry
+            .iter()
+            .find(|thread| {
+                &thread.session_id == session_id && &thread.thread_id == source_thread_id
+            })?;
+        if thread.role_id == ORCHESTRATOR_ROLE_ID {
+            Some(ThreadVisibility::Main)
+        } else {
+            Some(ThreadVisibility::WorkerDrawer {
+                role_id: thread.role_id.clone(),
+                worker_id: thread.worker_instance_id.clone(),
+            })
+        }
     }
 
     /// P6b：读取指定 thread 的累积对话历史，用于下一 task 启动时拼接为新 prompt 上文。

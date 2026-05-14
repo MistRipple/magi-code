@@ -112,8 +112,14 @@ fn build_session_turn_messages(
         .and_then(|sidecar| sidecar.current_turn)
         .filter(|turn| turn.turn_id == request.turn_id);
     let accepted_at = current_turn.as_ref().map(|turn| turn.accepted_at);
+    // 主线历史只取属于 orchestrator thread 的 item；非主线（worker drawer）item
+    // 不进入 LLM 上下文。session 一生一 mission，因此 thread 必存。
+    let orchestrator_thread_id = session_store
+        .orchestrator_thread_for_session(&request.session_id)
+        .map(|thread| thread.thread_id);
     let mut history = accepted_at
-        .map(|accepted_at| {
+        .zip(orchestrator_thread_id.as_ref())
+        .map(|(accepted_at, orchestrator_thread_id)| {
             session_store
                 .canonical_turns_for_session(&request.session_id)
                 .into_iter()
@@ -127,7 +133,9 @@ fn build_session_turn_messages(
                         CanonicalTurnItemKind::AssistantText => "assistant",
                         _ => return None,
                     };
-                    if item.visibility.thread_visible == false {
+                    if !item.visibility.renderable
+                        || &item.source_thread_id != orchestrator_thread_id
+                    {
                         return None;
                     }
                     let content = item.content?.trim().to_string();
@@ -209,7 +217,18 @@ pub(crate) fn run_session_turn_execution(
         return Ok(SessionTurnExecutionOutput::interrupted());
     }
 
-    append_phase_item(event_bus, session_store, &request);
+    // session 一生一 mission：session turn 执行必须在已注册的 orchestrator thread 上。
+    let orchestrator_thread_id = session_store
+        .orchestrator_thread_for_session(&request.session_id)
+        .map(|thread| thread.thread_id)
+        .ok_or_else(|| {
+            ApiError::internal_assembly(
+                "执行 session turn 失败",
+                "orchestrator thread 缺失：session 必须先经历 ensure_session_mission",
+            )
+        })?;
+
+    append_phase_item(event_bus, session_store, &request, &orchestrator_thread_id);
     let mut messages = build_session_turn_messages(session_store, &request, &prompt);
     let mut final_content: Option<String> = None;
     let mut final_item_id: Option<String> = None;
@@ -234,6 +253,7 @@ pub(crate) fn run_session_turn_execution(
                 messages: &mut messages,
                 completed_required_tool_names: &completed_required_tool_names,
                 round,
+                orchestrator_thread_id: &orchestrator_thread_id,
             },
             tool_registry,
             skill_runtime,
@@ -255,6 +275,7 @@ pub(crate) fn run_session_turn_execution(
                     request.placeholder_message_id.as_deref(),
                     &error_text,
                     main_timeline_entry_id.as_deref(),
+                    orchestrator_thread_id.clone(),
                 );
                 return Err(error);
             }
@@ -322,6 +343,7 @@ pub(crate) fn run_session_turn_execution(
             request.placeholder_message_id.as_deref(),
             failure_reason,
             main_timeline_entry_id.as_deref(),
+            orchestrator_thread_id.clone(),
         );
         return Err(ApiError::model_invocation_failed(
             "执行 session turn 失败",
@@ -338,6 +360,7 @@ pub(crate) fn run_session_turn_execution(
         &final_content,
         final_item_id.as_deref(),
         main_timeline_entry_id.as_deref(),
+        &orchestrator_thread_id,
     );
 
     Ok(SessionTurnExecutionOutput::completed(final_content))
@@ -356,6 +379,8 @@ struct SessionTurnRoundRuntime<'a> {
     messages: &'a mut Vec<ChatMessage>,
     completed_required_tool_names: &'a [String],
     round: usize,
+    /// session 主线 thread：该 turn 内所有 session_turn_item 的 source_thread_id。
+    orchestrator_thread_id: &'a magi_core::ThreadId,
 }
 
 struct SessionTurnRoundOutput {
@@ -444,6 +469,7 @@ fn stream_session_turn_round(
         messages,
         completed_required_tool_names,
         round,
+        orchestrator_thread_id,
     } = runtime;
 
     let stream_item_id = if round == 0 {
@@ -491,6 +517,7 @@ fn stream_session_turn_round(
                 Some("模型思考".to_string()),
                 Some(accumulated_thinking.to_string()),
                 Some(thinking_item_id.clone()),
+                orchestrator_thread_id.clone(),
             );
             apply_request_aliases(&mut item, request);
             if let Some(published) =
@@ -537,6 +564,7 @@ fn stream_session_turn_round(
             Some("生成回复".to_string()),
             Some(visible_content.clone()),
             Some(stream_item_id.clone()),
+            orchestrator_thread_id.clone(),
         );
         apply_request_aliases(&mut item, request);
         if let Some(published) = upsert_session_turn_item(session_store, &request.session_id, item)
@@ -619,6 +647,7 @@ fn stream_session_turn_round(
             Some("模型思考".to_string()),
             Some(thinking),
             Some(thinking_item_id.clone()),
+            orchestrator_thread_id.clone(),
         );
         apply_request_aliases(&mut thinking_item, request);
         if let Some(published) =
@@ -659,6 +688,7 @@ fn stream_session_turn_round(
             Some("生成回复".to_string()),
             Some(completed_stream_content.clone()),
             Some(stream_item_id.clone()),
+            orchestrator_thread_id.clone(),
         );
         apply_request_aliases(&mut stream_item, request);
         if let Some(published) =
@@ -677,7 +707,13 @@ fn stream_session_turn_round(
             .as_deref()
             .is_some_and(|placeholder_id| placeholder_id == stream_item_id)
     {
-        retire_empty_assistant_placeholder(event_bus, session_store, request, &stream_item_id);
+        retire_empty_assistant_placeholder(
+            event_bus,
+            session_store,
+            request,
+            &stream_item_id,
+            orchestrator_thread_id,
+        );
     }
 
     if request.use_tools && !parsed.tool_calls.is_empty() {
@@ -716,6 +752,7 @@ fn stream_session_turn_round(
             messages,
             snapshot_session,
             Some(execution_group_id),
+            orchestrator_thread_id,
             || request_turn_is_writable(session_store, request),
         );
         if !request_turn_is_writable(session_store, request) {
@@ -806,6 +843,7 @@ fn retire_empty_assistant_placeholder(
     session_store: &SessionStore,
     request: &SessionTurnExecutionRequest,
     item_id: &str,
+    orchestrator_thread_id: &magi_core::ThreadId,
 ) {
     let mut item = session_turn_item(
         "assistant_stream",
@@ -813,8 +851,8 @@ fn retire_empty_assistant_placeholder(
         Some("生成回复".to_string()),
         None,
         Some(item_id.to_string()),
+        orchestrator_thread_id.clone(),
     );
-    item.thread_visible = false;
     apply_request_aliases(&mut item, request);
     if let Some(published) = upsert_session_turn_item(session_store, &request.session_id, item) {
         publish_session_turn_item_event(
@@ -830,6 +868,7 @@ fn append_phase_item(
     event_bus: &InMemoryEventBus,
     session_store: &SessionStore,
     request: &SessionTurnExecutionRequest,
+    orchestrator_thread_id: &magi_core::ThreadId,
 ) {
     let mut phase_item = session_turn_item(
         "assistant_phase",
@@ -841,8 +880,8 @@ fn append_phase_item(
             "正在理解请求并生成回复。".to_string()
         }),
         None,
+        orchestrator_thread_id.clone(),
     );
-    phase_item.thread_visible = false;
     apply_request_aliases(&mut phase_item, request);
     if let Some(published) =
         append_session_turn_item(session_store, &request.session_id, phase_item)
@@ -876,6 +915,7 @@ fn append_final_item(
     final_content: &str,
     final_item_id: Option<&str>,
     timeline_entry_id: Option<&str>,
+    orchestrator_thread_id: &magi_core::ThreadId,
 ) {
     let has_requested_final_item_id = final_item_id.is_some();
     let mut final_item = session_turn_item(
@@ -884,6 +924,7 @@ fn append_final_item(
         Some("最终回复".to_string()),
         Some(final_content.to_string()),
         final_item_id.map(str::to_string),
+        orchestrator_thread_id.clone(),
     );
     if let Some(timeline_entry_id) = timeline_entry_id {
         final_item.timeline_entry_id = Some(timeline_entry_id.to_string());
@@ -929,8 +970,9 @@ mod tests {
     use magi_core::SessionLifecycleStatus;
     use magi_session_store::{
         ActiveExecutionTurn, CanonicalTurn, CanonicalTurnItem, CanonicalTurnItemKind,
-        CanonicalTurnItemStatus, CanonicalTurnStatus, CanonicalTurnVisibility, SessionRecord,
-        SessionStoreState, TimelineEntry, TimelineEntryKind,
+        CanonicalTurnItemStatus, CanonicalTurnStatus, CanonicalTurnVisibility, ExecutionThread,
+        ExecutionThreadStatus, ORCHESTRATOR_ROLE_ID, SessionRecord, SessionStoreState,
+        TimelineEntry, TimelineEntryKind,
     };
     use std::collections::HashMap;
 
@@ -1094,12 +1136,18 @@ mod tests {
         store
             .create_session(session_id.clone(), "placeholder reuse")
             .expect("session should be creatable");
+        let (_mission_id, orchestrator_thread_id) = store.ensure_session_mission(
+            &session_id,
+            ts(900),
+            || magi_core::MissionId::new("mission-placeholder-reuse"),
+        );
         let mut user_item = session_turn_item(
             "user_message",
             "completed",
             None,
             Some("请只回复一句话".to_string()),
             Some("user-placeholder-reuse".to_string()),
+            orchestrator_thread_id.clone(),
         );
         user_item.item_seq = 1;
         let mut placeholder_item = session_turn_item(
@@ -1108,6 +1156,7 @@ mod tests {
             Some("生成回复".to_string()),
             None,
             Some("assistant-placeholder-reuse".to_string()),
+            orchestrator_thread_id.clone(),
         );
         placeholder_item.item_seq = 2;
         store
@@ -1166,6 +1215,7 @@ mod tests {
                 completed_required_tool_names: &[],
                 snapshot_manager: None,
                 round: 0,
+                orchestrator_thread_id: &orchestrator_thread_id,
             },
             None,
             None,
@@ -1266,7 +1316,7 @@ mod tests {
                         blocks: Vec::new(),
                         tool: None,
                         worker: None,
-                        source_thread_id: None,
+                        source_thread_id: magi_core::ThreadId::new("thread-test-orchestrator"),
                         visibility: CanonicalTurnVisibility::default(),
                         metadata: HashMap::new(),
                     },
@@ -1288,7 +1338,7 @@ mod tests {
                         blocks: Vec::new(),
                         tool: None,
                         worker: None,
-                        source_thread_id: None,
+                        source_thread_id: magi_core::ThreadId::new("thread-test-orchestrator"),
                         visibility: CanonicalTurnVisibility::default(),
                         metadata: HashMap::new(),
                     },
@@ -1297,7 +1347,18 @@ mod tests {
             }],
             notifications: Vec::new(),
             execution_sidecar_store: Default::default(),
-            thread_registry: Vec::new(),
+            thread_registry: vec![ExecutionThread {
+                thread_id: magi_core::ThreadId::new("thread-test-orchestrator"),
+                session_id: session_id.clone(),
+                mission_id: magi_core::MissionId::new("mission-context-history"),
+                role_id: ORCHESTRATOR_ROLE_ID.to_string(),
+                worker_instance_id: magi_core::WorkerId::new("worker-orchestrator-test"),
+                status: ExecutionThreadStatus::Idle,
+                created_at: ts(900),
+                last_used_at: ts(1200),
+                handled_task_ids: Vec::new(),
+                message_history: Vec::new(),
+            }],
         });
         store
             .upsert_current_turn(
@@ -1411,6 +1472,11 @@ mod tests {
         store
             .create_session(session_id.clone(), "post tool final")
             .expect("session should be creatable");
+        let (_mission_id, orchestrator_thread_id) = store.ensure_session_mission(
+            &session_id,
+            ts(1000),
+            || magi_core::MissionId::new("mission-post-tool-final-item"),
+        );
         store
             .upsert_current_turn(
                 session_id.clone(),
@@ -1448,6 +1514,7 @@ mod tests {
             Some("生成回复".to_string()),
             Some("我先检查工具结果。".to_string()),
             Some("turn-item-assistant-stream-main".to_string()),
+            orchestrator_thread_id.clone(),
         );
         pre_tool_stream.timeline_entry_id = Some("turn-item-assistant-stream-main".to_string());
         append_session_turn_item(&store, &session_id, pre_tool_stream)
@@ -1458,6 +1525,7 @@ mod tests {
             Some("生成回复".to_string()),
             Some("工具结果显示可以继续。".to_string()),
             Some("turn-item-assistant-stream-post-tool".to_string()),
+            orchestrator_thread_id.clone(),
         );
         append_session_turn_item(&store, &session_id, post_tool_stream)
             .expect("post-tool stream item should be stored");
@@ -1469,6 +1537,7 @@ mod tests {
             "最终答案来自工具后轮次。",
             Some("turn-item-assistant-stream-post-tool"),
             Some("turn-item-assistant-stream-main"),
+            &orchestrator_thread_id,
         );
 
         let turn = store
@@ -1534,6 +1603,11 @@ mod tests {
         store
             .create_session(session_id.clone(), "terminal duration")
             .expect("session should be creatable");
+        let (_mission_id, orchestrator_thread_id) = store.ensure_session_mission(
+            &session_id,
+            ts(1000),
+            || magi_core::MissionId::new("mission-terminal-duration"),
+        );
         store
             .upsert_current_turn(
                 session_id.clone(),
@@ -1565,7 +1639,15 @@ mod tests {
             workspace_root_path: None,
         };
 
-        append_final_item(&event_bus, &store, &request, "最终回复", None, None);
+        append_final_item(
+            &event_bus,
+            &store,
+            &request,
+            "最终回复",
+            None,
+            None,
+            &orchestrator_thread_id,
+        );
 
         let terminal_event = event_bus
             .snapshot()

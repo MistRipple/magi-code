@@ -11,7 +11,7 @@ use magi_bridge_client::{
 };
 use magi_core::{
     ApprovalRequirement, EventId, ExecutionResultStatus, RiskLevel, SessionId, TaskId, TaskStatus,
-    ToolCallId, UtcMillis, WorkspaceId,
+    ThreadId, ToolCallId, UtcMillis, WorkspaceId,
 };
 use magi_event_bus::{
     EventContext, EventEnvelope, InMemoryEventBus, SessionRuntimeTurnItemSummaryEntry,
@@ -215,17 +215,6 @@ fn to_canonical_worker_ref(item: &ActiveExecutionTurnItem) -> Option<CanonicalWo
     })
 }
 
-fn canonical_worker_tab_ids(item: &ActiveExecutionTurnItem) -> Vec<String> {
-    // Tab 聚合键只看角色：一个角色 = 一个 worker tab。worker 实例信息仍然通过
-    // `CanonicalWorkerRef.workerId` 暴露，不应泄漏到 tab 维度。
-    item.role_id
-        .as_ref()
-        .map(|role_id| role_id.trim())
-        .filter(|role_id| !role_id.is_empty())
-        .map(|role_id| vec![role_id.to_string()])
-        .unwrap_or_default()
-}
-
 fn canonical_item_metadata(item: &ActiveExecutionTurnItem) -> HashMap<String, Value> {
     let mut metadata = HashMap::new();
     if let Some(value) = item
@@ -307,10 +296,7 @@ fn to_canonical_turn_item(
         worker: to_canonical_worker_ref(item),
         source_thread_id: item.source_thread_id.clone(),
         visibility: CanonicalTurnVisibility {
-            thread_visible: item.thread_visible,
-            worker_visible: item.worker_visible,
             renderable: canonical_item_renderable(item, kind, status),
-            worker_tab_ids: canonical_worker_tab_ids(item),
         },
         metadata: canonical_item_metadata(item),
     })
@@ -354,6 +340,7 @@ pub(crate) fn session_turn_item(
     title: Option<String>,
     content: Option<String>,
     item_id: Option<String>,
+    source_thread_id: ThreadId,
 ) -> ActiveExecutionTurnItem {
     ActiveExecutionTurnItem {
         item_id: item_id.unwrap_or_else(|| format!("turn-item-{}-{}", kind, UtcMillis::now().0)),
@@ -378,12 +365,7 @@ pub(crate) fn session_turn_item(
         user_message_id: None,
         placeholder_message_id: None,
         timeline_entry_id: None,
-        thread_visible: true,
-        worker_visible: false,
-        // P6c：factory 默认不带 thread_id。调用方（dispatch/worker/orchestrator 路径）
-        // 根据自身上下文填入 —— orchestrator 主线 item 填 session 级 orchestrator thread，
-        // worker sidechain item 填对应 worker thread（由 apply_task_*_visibility 赋值）。
-        source_thread_id: None,
+        source_thread_id,
     }
 }
 
@@ -493,6 +475,7 @@ pub(crate) fn append_session_turn_error_item(
     placeholder_message_id: Option<&str>,
     error_text: &str,
     _streaming_entry_id: Option<&str>,
+    source_thread_id: ThreadId,
 ) {
     let mut error_item = session_turn_item(
         "assistant_error",
@@ -500,6 +483,7 @@ pub(crate) fn append_session_turn_error_item(
         Some("回复生成失败".to_string()),
         Some(error_text.to_string()),
         Some(format!("turn-item-assistant-error-{}", UtcMillis::now().0)),
+        source_thread_id,
     );
     let error_item_id = error_item.item_id.clone();
     if let Some(task_id) = task_id {
@@ -597,26 +581,21 @@ fn to_turn_item_summary(
         user_message_id: item.user_message_id.clone(),
         placeholder_message_id: item.placeholder_message_id.clone(),
         timeline_entry_id: item.timeline_entry_id.clone(),
-        thread_visible: item.thread_visible,
-        worker_visible: item.worker_visible,
+        source_thread_id: item.source_thread_id.to_string(),
     }
 }
 
 fn to_turn_lane_summary(
     lane: &magi_session_store::ActiveExecutionTurnLane,
     status: &str,
-    task_store: Option<&TaskStore>,
+    _task_store: Option<&TaskStore>,
 ) -> SessionRuntimeTurnLaneSummaryEntry {
-    let role_id = lane
-        .role_id
-        .clone()
-        .or_else(|| task_role_id(task_store, &lane.task_id));
     SessionRuntimeTurnLaneSummaryEntry {
         lane_id: lane.lane_id.clone(),
         lane_seq: lane.lane_seq,
         task_id: lane.task_id.to_string(),
         worker_id: lane.worker_id.to_string(),
-        role_id,
+        role_id: lane.role_id.clone(),
         title: lane.title.clone(),
         status: status.to_string(),
         is_primary: lane.is_primary,
@@ -635,6 +614,7 @@ pub(crate) fn append_session_tool_call_items_batch(
     messages: &mut Vec<ChatMessage>,
     snapshot_session: Option<Arc<SnapshotSession>>,
     execution_group_id: Option<String>,
+    source_thread_id: &ThreadId,
     write_allowed: impl Fn() -> bool,
 ) -> bool {
     for tool_call in tool_calls {
@@ -647,6 +627,7 @@ pub(crate) fn append_session_tool_call_items_batch(
             Some(tool_call.function.name.clone()),
             Some(format!("正在调用工具：{}", tool_call.function.name)),
             Some(format!("turn-item-tool-{}", tool_call.id)),
+            source_thread_id.clone(),
         );
         started_item.source = "tool".to_string();
         started_item.tool_call_id = Some(tool_call.id.clone());
@@ -702,6 +683,7 @@ pub(crate) fn append_session_tool_call_items_batch(
             tool_call,
             &tool_result,
             tool_status,
+            source_thread_id,
         );
         messages.push(ChatMessage {
             role: "tool".to_string(),
@@ -751,6 +733,7 @@ fn upsert_session_tool_call_result_item(
     tool_call: &ChatToolCall,
     tool_result: &str,
     tool_status: ExecutionResultStatus,
+    source_thread_id: &ThreadId,
 ) {
     let status_label = tool_execution_status_label(tool_status);
     let mut result_item = session_turn_item(
@@ -759,6 +742,7 @@ fn upsert_session_tool_call_result_item(
         Some(tool_call.function.name.clone()),
         Some(summarize_tool_result(tool_result)),
         Some(format!("turn-item-tool-{}", tool_call.id)),
+        source_thread_id.clone(),
     );
     result_item.source = "tool".to_string();
     result_item.tool_call_id = Some(tool_call.id.clone());
@@ -960,11 +944,11 @@ fn execute_session_turn_tool_call(
 mod tests {
     use super::*;
     use magi_bridge_client::ChatToolFunction;
-    use magi_core::{ExecutorBinding, MissionId, Task, TaskKind, WorkerId};
+    use magi_core::{ExecutorBinding, MissionId, Task, TaskKind, ThreadId, WorkerId};
     use magi_governance::GovernanceService;
     use magi_session_store::{
         ActiveExecutionChain, ActiveExecutionDispatchContext, ActiveExecutionTurn,
-        ActiveExecutionTurnLane,
+        ActiveExecutionTurnLane, ExecutionThread, ExecutionThreadStatus,
     };
     use magi_skill_runtime::{SkillDefinition, SkillMetadata, SkillRegistry};
     use magi_tool_runtime::{BuiltinTool, BuiltinToolSpec};
@@ -1042,20 +1026,21 @@ mod tests {
 
     #[test]
     fn session_turn_item_uses_expected_defaults() {
+        let orchestrator_thread = magi_core::ThreadId::new("thread-test-orchestrator-defaults");
         let item = session_turn_item(
             "assistant_phase",
             "running",
             Some("理解请求".to_string()),
             Some("准备中".to_string()),
             None,
+            orchestrator_thread.clone(),
         );
 
         assert!(item.item_id.starts_with("turn-item-assistant_phase-"));
         assert_eq!(item.kind, "assistant_phase");
         assert_eq!(item.status, "running");
         assert_eq!(item.source, "orchestrator");
-        assert!(item.thread_visible);
-        assert!(!item.worker_visible);
+        assert_eq!(item.source_thread_id, orchestrator_thread);
     }
 
     #[test]
@@ -1249,6 +1234,7 @@ mod tests {
             &mut messages,
             None,
             None,
+            &ThreadId::new("thread-shell-batch"),
             || true,
         );
 
@@ -1381,6 +1367,24 @@ mod tests {
             .expect("session should be creatable");
 
         let now = UtcMillis::now();
+        let (_, orchestrator_thread_id) = session_store.ensure_session_mission(
+            &session_id,
+            now,
+            || MissionId::new("mission-worker-lane-authority"),
+        );
+        let worker_thread_id = ThreadId::new("thread-reviewer-worker-lane-authority");
+        session_store.register_thread(ExecutionThread {
+            thread_id: worker_thread_id.clone(),
+            session_id: session_id.clone(),
+            mission_id: MissionId::new("mission-worker-lane-authority"),
+            role_id: "reviewer".to_string(),
+            worker_instance_id: worker_id.clone(),
+            status: ExecutionThreadStatus::Active,
+            created_at: now,
+            last_used_at: now,
+            handled_task_ids: vec![task_id.clone()],
+            message_history: Vec::new(),
+        });
         task_store.insert_task(Task {
             task_id: task_id.clone(),
             mission_id: MissionId::new("mission-worker-lane-authority"),
@@ -1420,6 +1424,7 @@ mod tests {
             Some("权威任务状态".to_string()),
             Some("已创建执行步骤。".to_string()),
             Some("turn-item-worker-spawned-authority".to_string()),
+            worker_thread_id.clone(),
         );
         spawned_item.item_seq = 1;
         spawned_item.lane_id = Some(lane_id.clone());
@@ -1427,8 +1432,6 @@ mod tests {
         spawned_item.task_id = Some(task_id.clone());
         spawned_item.worker_id = Some(worker_id.clone());
         spawned_item.role_id = Some("reviewer".to_string());
-        spawned_item.thread_visible = false;
-        spawned_item.worker_visible = true;
 
         session_store
             .upsert_current_turn(
@@ -1445,8 +1448,8 @@ mod tests {
                         lane_seq: 1,
                         task_id: task_id.clone(),
                         worker_id,
-                        role_id: None,
-                        thread_id: None,
+                        role_id: "reviewer".to_string(),
+                        thread_id: worker_thread_id.clone(),
                         title: "权威任务状态".to_string(),
                         is_primary: true,
                     }],
@@ -1464,6 +1467,7 @@ mod tests {
                 Some("理解请求".to_string()),
                 Some("准备中".to_string()),
                 Some("turn-item-phase-authority".to_string()),
+                orchestrator_thread_id.clone(),
             ),
             Some(&task_store),
         )
@@ -1479,8 +1483,8 @@ mod tests {
             "worker_spawned 的 pending 只是生命周期事件，不能覆盖 TaskStore 中的执行状态"
         );
         assert_eq!(
-            lane.role_id.as_deref(),
-            Some("reviewer"),
+            lane.role_id.as_str(),
+            "reviewer",
             "worker lane role_id 应继续从 task executor binding 回填"
         );
     }
@@ -1495,6 +1499,8 @@ mod tests {
         session_store
             .create_session(session_id.clone(), "plain after task")
             .expect("session should be creatable");
+        let (_, orchestrator_thread_id) =
+            session_store.ensure_session_mission(&session_id, now, || mission_id.clone());
         session_store
             .upsert_active_execution_chain(
                 session_id.clone(),
@@ -1525,6 +1531,7 @@ mod tests {
             Some("最终回复".to_string()),
             Some("OK-普通流式".to_string()),
             Some("turn-item-plain-final".to_string()),
+            orchestrator_thread_id.clone(),
         );
         session_store
             .upsert_current_turn(

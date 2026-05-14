@@ -304,8 +304,9 @@ pub struct SessionRuntimeTurnItemSummaryEntry {
     pub user_message_id: Option<String>,
     pub placeholder_message_id: Option<String>,
     pub timeline_entry_id: Option<String>,
-    pub thread_visible: bool,
-    pub worker_visible: bool,
+    /// item 归属的 thread_id。前端按此 + thread_registry 的 role_id 判定
+    /// 主线 / worker drawer 归属。
+    pub source_thread_id: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -314,7 +315,7 @@ pub struct SessionRuntimeTurnLaneSummaryEntry {
     pub lane_seq: usize,
     pub task_id: String,
     pub worker_id: String,
-    pub role_id: Option<String>,
+    pub role_id: String,
     pub title: String,
     pub status: String,
     pub is_primary: bool,

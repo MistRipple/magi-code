@@ -5,7 +5,7 @@ use crate::{
 };
 use magi_core::{
     ExecutionOwnership, RecoveryResumeInput, SessionId, TaskExecutionTarget, TaskId, TaskStatus,
-    UtcMillis, WorkerId,
+    ThreadId, UtcMillis, WorkerId,
 };
 use magi_orchestrator::{ExecutionWritebackPlans, task_store::TaskStore};
 use magi_session_store::{ActiveExecutionBranch, ActiveExecutionChain};
@@ -170,6 +170,7 @@ pub(crate) fn finalize_terminal_worker_branches(
 fn rebuild_dispatch_plan_for_branch(
     chain: &ActiveExecutionChain,
     branch: &ActiveExecutionBranch,
+    orchestrator_thread_id: &ThreadId,
 ) -> TaskExecutionPlan {
     let ownership = ExecutionOwnership {
         session_id: Some(chain.session_id.clone()),
@@ -192,6 +193,17 @@ fn rebuild_dispatch_plan_for_branch(
     } else {
         ExecutionWritebackPlans::default()
     };
+    // 恢复链路的 thread_id 来源：
+    //  * sub task 在 current_turn.worker_lanes 中有 lane，直接复用 lane.thread_id；
+    //  * primary action 没有 lane，归属 session 级 orchestrator thread。
+    // orchestrator thread 由调用方在 resume 入口通过 ensure_session_mission 幂等保证。
+    let lane_thread_id = chain.current_turn.as_ref().and_then(|turn| {
+        turn.worker_lanes
+            .iter()
+            .find(|lane| lane.task_id == branch.task_id)
+            .map(|lane| lane.thread_id.clone())
+    });
+    let thread_id = lane_thread_id.unwrap_or_else(|| orchestrator_thread_id.clone());
     TaskExecutionPlan::Dispatch {
         target: TaskExecutionTarget {
             mission_id: chain.mission_id.clone(),
@@ -214,14 +226,7 @@ fn rebuild_dispatch_plan_for_branch(
                 .find(|lane| lane.task_id == branch.task_id)
                 .map(|lane| lane.lane_seq)
         }),
-        // P6b：恢复链路从 lane 身上找回已经 spawn 过的 thread_id，保证 resume 后的
-        // 新轮 LLM 能读到之前累积的对话历史。找不到时等同"旧路径"，不破坏兼容。
-        thread_id: chain.current_turn.as_ref().and_then(|turn| {
-            turn.worker_lanes
-                .iter()
-                .find(|lane| lane.task_id == branch.task_id)
-                .and_then(|lane| lane.thread_id.clone())
-        }),
+        thread_id,
         is_primary: branch.is_primary,
         session_id: chain.session_id.clone(),
         workspace_id: chain.workspace_id.clone(),
@@ -557,6 +562,15 @@ pub(crate) fn continue_execution_chain(
         .expect("branches_to_resume checked as non-empty");
     apply_chain_recovery_if_needed(state, session_id, &mut chain, primary_branch)?;
 
+    // resume 入口幂等地保证 orchestrator thread 存在：
+    //  * 已存在 → 直接复用 (同 session 同 mission 同 orchestrator thread 不变量)；
+    //  * 不存在 → 用 chain.mission_id spawn 新 thread，UI 主线归属即此 thread。
+    let (_, orchestrator_thread_id) = state.session_store.ensure_session_mission(
+        session_id,
+        chain.dispatch_context.accepted_at,
+        || chain.mission_id.clone(),
+    );
+
     let mut root_status = root_task.status;
     if matches!(root_status, TaskStatus::Completed) {
         task_store
@@ -572,7 +586,7 @@ pub(crate) fn continue_execution_chain(
     for branch in &branches_to_resume {
         state.task_execution_registry().insert(
             branch.task_id.clone(),
-            rebuild_dispatch_plan_for_branch(&chain, branch),
+            rebuild_dispatch_plan_for_branch(&chain, branch, &orchestrator_thread_id),
         );
         sync_branch_checkpoint_to_worker_runtime(state, branch);
     }

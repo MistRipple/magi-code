@@ -357,7 +357,6 @@ export interface WorkerLaneTaskItem {
 export interface DispatchGroupLane {
   laneId: string;
   laneVersion: number;
-  worker: string;
   title: string;
   description?: string;
   status: WorkerLaneStatus;
@@ -604,9 +603,16 @@ export interface TimelineProjectionArtifact {
   lifecycleKey?: string;
   dispatchWaveId?: string;
   laneId?: string;
+  /**
+   * P7.E：UI 路由的唯一信号。
+   *
+   * - `undefined` 表示 artifact 归属 orchestrator 主线（thread）；
+   * - 非空字符串表示 artifact 归属对应 `roleId` 的 worker drawer。
+   *
+   * 由 `CanonicalTurnItem.worker.roleId` 直接派生（'orchestrator' 视为主线），
+   * 不再保留 `threadVisible / workerTabs` 双轨缓存。
+   */
   worker?: AgentId;
-  threadVisible: boolean;
-  workerTabs: AgentId[];
   messageIds: string[];
   message: Message;
 }

@@ -51,9 +51,9 @@ pub enum TaskExecutionPlan {
         worker_id: WorkerId,
         lane_id: Option<String>,
         lane_seq: Option<usize>,
-        /// P6b：lane 绑定的 thread，由 dispatch_execution::ensure_thread_for_role 创建或命中。
-        /// 为空表示旧路径（无跨 task 记忆），P6d 收口后会强制存在。
-        thread_id: Option<magi_core::ThreadId>,
+        /// lane 绑定的 thread，由 dispatch_execution::ensure_thread_for_role 创建或命中，
+        /// 是 task_llm_loop 读取跨 task 历史消息的唯一路由键。
+        thread_id: magi_core::ThreadId,
         is_primary: bool,
         session_id: SessionId,
         workspace_id: Option<WorkspaceId>,
@@ -186,6 +186,15 @@ pub fn publish_task_status_turn_item_for_active_sessions(
             .worker_lanes
             .iter()
             .find(|lane| lane.task_id == task.task_id);
+        // task_status item 归属其对应的 thread：若存在 worker lane 则取 lane 的 thread,
+        // 否则落到 session 的 orchestrator thread（主线兜底）。
+        let source_thread_id = match lane {
+            Some(lane) => lane.thread_id.clone(),
+            None => match session_store.orchestrator_thread_for_session(&sidecar.session_id) {
+                Some(thread) => thread.thread_id,
+                None => continue,
+            },
+        };
         let item_id = format!("turn-item-task-status-{}-{}", turn.turn_id, task.task_id);
         let mut item = session_turn_item(
             "task_status",
@@ -193,6 +202,7 @@ pub fn publish_task_status_turn_item_for_active_sessions(
             Some(task.title.clone()),
             Some(format!("{}：{}", task.title, task_status_text(new_status))),
             Some(item_id),
+            source_thread_id,
         );
         item.source = "task".to_string();
         item.task_id = Some(task.task_id.clone());
@@ -201,12 +211,10 @@ pub fn publish_task_status_turn_item_for_active_sessions(
             .as_ref()
             .map(|binding| binding.target_role.clone())
             .filter(|role_id| !role_id.trim().is_empty());
-        item.thread_visible = false;
         if let Some(lane) = lane {
             item.lane_id = Some(lane.lane_id.clone());
             item.lane_seq = Some(lane.lane_seq);
             item.worker_id = Some(lane.worker_id.clone());
-            item.worker_visible = true;
         }
         if let Some(published) = append_session_turn_item_with_task_store(
             session_store,
@@ -275,12 +283,16 @@ fn format_dependency_task_context(dependency: &Task) -> String {
     )
 }
 
-fn latest_thread_visible_assistant_final(
+/// 主线 assistant_final 扫描：只认 `source_thread_id == orchestrator_thread_id` 的 item。
+fn latest_orchestrator_assistant_final(
     turn: &magi_session_store::ActiveExecutionTurn,
+    orchestrator_thread_id: &magi_core::ThreadId,
 ) -> Option<(String, String)> {
     turn.items
         .iter()
-        .filter(|item| item.kind == "assistant_final" && item.thread_visible)
+        .filter(|item| {
+            item.kind == "assistant_final" && &item.source_thread_id == orchestrator_thread_id
+        })
         .filter_map(|item| {
             let content = item.content.as_ref()?.trim();
             if content.is_empty() {
@@ -510,7 +522,11 @@ fn ensure_root_completion_final_item(
 ) -> Option<(String, String)> {
     let sidecar = state.session_store.runtime_sidecar(session_id)?;
     let turn = sidecar.current_turn.as_ref()?;
-    if let Some(response) = latest_thread_visible_assistant_final(turn) {
+    // session 一生一 mission：root completion 阶段必须存在 orchestrator thread。
+    let orchestrator_thread = state
+        .session_store
+        .orchestrator_thread_for_session(session_id)?;
+    if let Some(response) = latest_orchestrator_assistant_final(turn, &orchestrator_thread.thread_id) {
         return Some(response);
     }
 
@@ -521,11 +537,10 @@ fn ensure_root_completion_final_item(
         Some("任务完成".to_string()),
         Some(build_root_completion_summary(task_store, root_task)),
         Some(item_id),
+        orchestrator_thread.thread_id.clone(),
     );
     final_item.source = "orchestrator".to_string();
     final_item.task_id = Some(root_task.task_id.clone());
-    final_item.thread_visible = true;
-    final_item.worker_visible = false;
 
     if let Some(published) = append_session_turn_item_with_task_store(
         state.session_store.as_ref(),
@@ -541,7 +556,7 @@ fn ensure_root_completion_final_item(
         .runtime_sidecar(session_id)
         .and_then(|sidecar| sidecar.current_turn)
         .as_ref()
-        .and_then(latest_thread_visible_assistant_final)
+        .and_then(|turn| latest_orchestrator_assistant_final(turn, &orchestrator_thread.thread_id))
 }
 
 pub fn finalize_background_session_task_turn_if_root_completed(
@@ -572,13 +587,20 @@ pub fn finalize_background_session_task_turn_if_root_completed(
     let Some(turn) = sidecar.current_turn.as_ref() else {
         return false;
     };
-    let response = latest_thread_visible_assistant_final(turn).or_else(|| {
-        ensure_root_completion_final_item(state, session_id, &workspace_id, &root_task, task_store)
-    });
+    let Some(orchestrator_thread) = state
+        .session_store
+        .orchestrator_thread_for_session(session_id)
+    else {
+        return false;
+    };
+    let response =
+        latest_orchestrator_assistant_final(turn, &orchestrator_thread.thread_id).or_else(|| {
+            ensure_root_completion_final_item(state, session_id, &workspace_id, &root_task, task_store)
+        });
     let event_item_id = response
         .as_ref()
         .map(|(_, item_id)| item_id.clone())
-        .or_else(|| terminal_turn_event_anchor_item_id(turn));
+        .or_else(|| terminal_turn_event_anchor_item_id(turn, &orchestrator_thread.thread_id));
     let Some(event_item_id) = event_item_id else {
         return false;
     };
@@ -630,10 +652,11 @@ fn update_current_turn_completed_from_root(
 
 fn terminal_turn_event_anchor_item_id(
     turn: &magi_session_store::ActiveExecutionTurn,
+    orchestrator_thread_id: &magi_core::ThreadId,
 ) -> Option<String> {
     turn.items
         .iter()
-        .filter(|item| item.thread_visible)
+        .filter(|item| &item.source_thread_id == orchestrator_thread_id)
         .max_by_key(|item| item.item_seq)
         .or_else(|| turn.items.iter().max_by_key(|item| item.item_seq))
         .map(|item| item.item_id.clone())
@@ -684,12 +707,19 @@ pub fn finalize_background_session_task_turn_if_root_terminal(
     {
         return true;
     }
+    // session 一生一 mission：终态写 assistant_error 必须存在 orchestrator thread。
+    let Some(orchestrator_thread) = state
+        .session_store
+        .orchestrator_thread_for_session(session_id)
+    else {
+        return false;
+    };
     if sidecar.current_turn.as_ref().is_some_and(|turn| {
         turn.status == turn_status
-            && turn
-                .items
-                .iter()
-                .any(|item| item.kind == "assistant_error" && item.thread_visible)
+            && turn.items.iter().any(|item| {
+                item.kind == "assistant_error"
+                    && item.source_thread_id == orchestrator_thread.thread_id
+            })
     }) {
         return true;
     }
@@ -709,6 +739,7 @@ pub fn finalize_background_session_task_turn_if_root_terminal(
         Some("任务执行未完成".to_string()),
         Some(message.to_string()),
         Some(item_id.clone()),
+        orchestrator_thread.thread_id.clone(),
     );
     error_item.task_id = Some(root_task_id.clone());
     if let Some(published) = append_session_turn_item_with_task_store(
@@ -996,7 +1027,7 @@ impl LlmTaskDispatcher {
         worker_lane_id: Option<String>,
         worker_lane_seq: Option<usize>,
         worker_id: WorkerId,
-        thread_id: Option<magi_core::ThreadId>,
+        thread_id: magi_core::ThreadId,
         system_prompt: Option<String>,
     ) {
         // 仅在有 writebacks 时（即主 action task）才生成 streaming entry_id。
@@ -1019,7 +1050,7 @@ impl LlmTaskDispatcher {
             worker_lane_id.as_deref(),
             worker_lane_seq,
             Some(&worker_id),
-            thread_id.as_ref(),
+            &thread_id,
             system_prompt,
         );
         if matches!(&outcome, TaskOutcome::Completed { .. }) {
@@ -1463,7 +1494,7 @@ impl LlmTaskDispatcher {
         worker_lane_id: Option<&str>,
         worker_lane_seq: Option<usize>,
         worker_id: Option<&WorkerId>,
-        thread_id: Option<&magi_core::ThreadId>,
+        thread_id: &magi_core::ThreadId,
         system_prompt: Option<String>,
     ) -> (TaskOutcome, Option<ExecutionContextSummary>) {
         let Some(client) = self.resolve_model_client() else {
@@ -1482,6 +1513,18 @@ impl LlmTaskDispatcher {
         let (prompt, context_summary) = self.assemble_prompt(task, session_id, workspace_id);
         let prompt = self.apply_skill_prompt_injections(prompt, skill_name.as_deref());
         let workspace_root_path = self.resolve_workspace_root_path(workspace_id);
+
+        // P7：orchestrator_thread_id 为主线可见性锚点，分派到达时必然已 spawn；缺失即架构破坏。
+        let orchestrator_thread_id = self
+            .session_store
+            .orchestrator_thread_for_session(session_id)
+            .map(|thread| thread.thread_id)
+            .unwrap_or_else(|| {
+                panic!(
+                    "session {session_id} missing orchestrator thread when dispatching task {}",
+                    task.task_id
+                )
+            });
 
         let tools = if use_tools {
             let tool_defs = self.build_tool_definitions(Some(task));
@@ -1515,6 +1558,7 @@ impl LlmTaskDispatcher {
             worker_lane_seq,
             worker_id,
             thread_id,
+            orchestrator_thread_id: &orchestrator_thread_id,
             context_summary,
             system_prompt,
             workspace_root_path,
@@ -1688,11 +1732,12 @@ fn title_from_learning_content(content: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use magi_core::{MissionId, Task, TaskKind};
+    use magi_core::{MissionId, Task, TaskKind, ThreadId};
     use magi_governance::GovernanceService;
     use magi_orchestrator::task_store::TaskStore;
     use magi_session_store::{
         ActiveExecutionChain, ActiveExecutionDispatchContext, ActiveExecutionTurn,
+        ExecutionThread, ExecutionThreadStatus,
     };
     use magi_workspace::WorkspaceStore;
 
@@ -1929,6 +1974,8 @@ mod tests {
         session_store
             .create_session(session_id.clone(), "background finalizer idempotent")
             .expect("session should be creatable");
+        let (_, orchestrator_thread_id) =
+            session_store.ensure_session_mission(&session_id, now, || mission_id.clone());
         session_store
             .upsert_active_execution_chain(
                 session_id.clone(),
@@ -1958,6 +2005,7 @@ mod tests {
             Some("回复生成失败".to_string()),
             Some("model bridge unavailable".to_string()),
             Some("turn-item-existing-error".to_string()),
+            orchestrator_thread_id.clone(),
         );
         error_item.task_id = Some(root_task_id.clone());
         session_store
@@ -2051,6 +2099,21 @@ mod tests {
         session_store
             .create_session(session_id.clone(), "background finalizer worker only")
             .expect("session should be creatable");
+        let (_, orchestrator_thread_id) =
+            session_store.ensure_session_mission(&session_id, now, || mission_id.clone());
+        let worker_thread_id = ThreadId::new("thread-integration-dev-finalizer-worker-only");
+        session_store.register_thread(ExecutionThread {
+            thread_id: worker_thread_id.clone(),
+            session_id: session_id.clone(),
+            mission_id: mission_id.clone(),
+            role_id: "integration-dev".to_string(),
+            worker_instance_id: WorkerId::new("worker-finalizer-worker-only"),
+            status: ExecutionThreadStatus::Active,
+            created_at: now,
+            last_used_at: now,
+            handled_task_ids: vec![worker_task_id.clone()],
+            message_history: Vec::new(),
+        });
 
         let mut phase_item = session_turn_item(
             "assistant_phase",
@@ -2058,8 +2121,8 @@ mod tests {
             Some("任务状态".to_string()),
             Some("已接收请求，正在整理执行步骤。".to_string()),
             Some("turn-item-phase-worker-only".to_string()),
+            orchestrator_thread_id.clone(),
         );
-        phase_item.thread_visible = true;
         phase_item.task_id = Some(root_task_id.clone());
 
         let mut worker_final_item = session_turn_item(
@@ -2068,10 +2131,9 @@ mod tests {
             Some("worker 最终输出".to_string()),
             Some("worker 内部最终输出，不应漂移成主线回复。".to_string()),
             Some("turn-item-worker-final-only".to_string()),
+            worker_thread_id.clone(),
         );
         worker_final_item.item_seq = 2;
-        worker_final_item.thread_visible = false;
-        worker_final_item.worker_visible = true;
         worker_final_item.task_id = Some(worker_task_id.clone());
         worker_final_item.worker_id = Some(WorkerId::new("worker-finalizer-worker-only"));
 
@@ -2194,8 +2256,9 @@ mod tests {
             .iter()
             .find(|item| {
                 item.item_id == format!("turn-item-orchestrator-final-{root_task_id}")
-                    && item.thread_visible
-                    && !item.worker_visible
+                    && session_store
+                        .resolve_thread_visibility(&session_id, &item.source_thread_id)
+                        == Some(magi_session_store::ThreadVisibility::Main)
             })
             .expect("root 完成后必须追加编排者主线最终回复");
         let final_content = orchestrator_final.content.as_deref().unwrap_or_default();
@@ -2345,14 +2408,16 @@ mod tests {
         session_store
             .create_session(session_id.clone(), "terminal reconcile completed root")
             .expect("session should be creatable");
+        let (_, orchestrator_thread_id) =
+            session_store.ensure_session_mission(&session_id, now, || mission_id.clone());
         let mut phase_item = session_turn_item(
             "assistant_phase",
             "pending",
             Some("任务状态".to_string()),
             Some("任务运行中".to_string()),
             Some("turn-item-terminal-reconcile-phase".to_string()),
+            orchestrator_thread_id.clone(),
         );
-        phase_item.thread_visible = true;
         phase_item.task_id = Some(root_task_id.clone());
         session_store
             .upsert_active_execution_chain(
@@ -2452,14 +2517,16 @@ mod tests {
         session_store
             .create_session(session_id.clone(), "terminal cancelled wins")
             .expect("session should be creatable");
+        let (_, orchestrator_thread_id) =
+            session_store.ensure_session_mission(&session_id, now, || mission_id.clone());
         let mut phase_item = session_turn_item(
             "assistant_phase",
             "cancelled",
             Some("任务状态".to_string()),
             Some("任务已取消".to_string()),
             Some("turn-item-terminal-cancelled-phase".to_string()),
+            orchestrator_thread_id.clone(),
         );
-        phase_item.thread_visible = true;
         phase_item.task_id = Some(root_task_id.clone());
         session_store
             .upsert_active_execution_chain(

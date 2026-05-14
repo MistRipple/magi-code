@@ -165,8 +165,8 @@
   }
 
   function resolveFallbackLaneWorkerId(lane: DispatchGroupLane): string {
-    // P1 身份契约：只认 roleId（jumpTarget.workerTabId 是它的搬运）。lane.worker 仅保留为
-    // 兼容字段，不再参与身份决策——没有 roleId 的 lane 归到 orchestrator 兜底。
+    // P1 身份契约：只认 roleId（jumpTarget.workerTabId 是它的搬运）。
+    // 没有 roleId 的 lane 归到 orchestrator 兜底。
     return normalizeText(lane.jumpTarget?.workerTabId) || 'orchestrator';
   }
 

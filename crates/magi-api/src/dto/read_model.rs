@@ -182,8 +182,7 @@ fn merge_session_sidecars(
                         user_message_id: item.user_message_id.clone(),
                         placeholder_message_id: item.placeholder_message_id.clone(),
                         timeline_entry_id: item.timeline_entry_id.clone(),
-                        thread_visible: item.thread_visible,
-                        worker_visible: item.worker_visible,
+                        source_thread_id: item.source_thread_id.to_string(),
                     }
                 })
                 .collect();
@@ -191,16 +190,12 @@ fn merge_session_sidecars(
                 .worker_lanes
                 .iter()
                 .map(|lane| {
-                    let role_id = lane
-                        .role_id
-                        .clone()
-                        .or_else(|| task_role_id(task_store, &lane.task_id));
                     SessionRuntimeTurnLaneSummaryEntry {
                         lane_id: lane.lane_id.clone(),
                         lane_seq: lane.lane_seq,
                         task_id: lane.task_id.to_string(),
                         worker_id: lane.worker_id.to_string(),
-                        role_id,
+                        role_id: lane.role_id.clone(),
                         title: lane.title.clone(),
                         status: task_store
                             .and_then(|store| store.get_task(&lane.task_id))
@@ -1540,17 +1535,17 @@ mod tests {
                         user_message_id: None,
                         placeholder_message_id: None,
                         timeline_entry_id: None,
-                        thread_visible: true,
-                        worker_visible: false,
-                            source_thread_id: None,
+                        source_thread_id: magi_core::ThreadId::new("thread-test-orchestrator"),
                     }],
                     worker_lanes: vec![magi_session_store::ActiveExecutionTurnLane {
                         lane_id: "lane-branch".to_string(),
                         lane_seq: 1,
                         task_id: branch_task_id.clone(),
                         worker_id: worker_id.clone(),
-                        role_id: None,
-                        thread_id: None,
+                        // P7：lane.role_id 已是权威字段，构造方必须填入正确值；
+                        // DTO 不再从 task.executor_binding 回填。
+                        role_id: "reviewer".to_string(),
+                        thread_id: magi_core::ThreadId::new("thread-test-branch"),
                         title: "完成步骤".to_string(),
                         is_primary: false,
                     }],
@@ -1616,17 +1611,15 @@ mod tests {
                             user_message_id: None,
                             placeholder_message_id: None,
                             timeline_entry_id: None,
-                            thread_visible: true,
-                            worker_visible: false,
-                            source_thread_id: None,
+                            source_thread_id: magi_core::ThreadId::new("thread-test-orchestrator"),
                         }],
                         worker_lanes: vec![magi_session_store::ActiveExecutionTurnLane {
                             lane_id: "lane-branch".to_string(),
                             lane_seq: 1,
                             task_id: branch_task_id.clone(),
                             worker_id: worker_id.clone(),
-                            role_id: None,
-                            thread_id: None,
+                            role_id: "reviewer".to_string(),
+                            thread_id: magi_core::ThreadId::new("thread-test-branch"),
                             title: "完成步骤".to_string(),
                             is_primary: false,
                         }],
@@ -1655,8 +1648,8 @@ mod tests {
             "turn item role_id should be backfilled from task executor binding"
         );
         assert_eq!(
-            session.worker_lanes[0].role_id.as_deref(),
-            Some("reviewer"),
+            session.worker_lanes[0].role_id.as_str(),
+            "reviewer",
             "worker lane role_id should be backfilled from task executor binding"
         );
         let current_turn = session

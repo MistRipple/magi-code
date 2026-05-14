@@ -65,54 +65,104 @@ pub(crate) struct TaskLlmLoopRequest<'a> {
     pub worker_lane_id: Option<&'a str>,
     pub worker_lane_seq: Option<usize>,
     pub worker_id: Option<&'a magi_core::WorkerId>,
-    /// P6b：lane 绑定到的 thread。非空时 LLM 入口会 prepend 该 thread 历史、
-    /// 结束时把本轮消息 append 回 thread。为空则保留旧路径行为（无跨 task 记忆）。
-    pub thread_id: Option<&'a ThreadId>,
+    /// P7：lane 必须绑定到 thread。LLM 入口会 prepend 该 thread 的历史、
+    /// 结束时把本轮消息 append 回 thread。orchestrator task 走 session 的
+    /// orchestrator thread；worker task 走对应 role 的 worker thread。
+    pub thread_id: &'a ThreadId,
+    /// P7：本 session 的 orchestrator thread。Sidechain task 在主线 publish
+    /// `worker_status` 摘要 item 时把 source_thread_id 指向它，确保前端 projection
+    /// 把摘要归到主线时间线。当 task 自身就是 orchestrator task 时，与
+    /// `thread_id` 相等。
+    pub orchestrator_thread_id: &'a ThreadId,
     pub context_summary: Option<ExecutionContextSummary>,
     pub system_prompt: Option<String>,
     pub workspace_root_path: Option<PathBuf>,
 }
 
+/// 单一可见性枚举：item 的归属由 `source_thread_id` 决定，本枚举仅承担
+/// "把该 task 的 turn item 写到主线 thread 还是 worker drawer thread"的派发判断。
+/// - `Mainline`：item.source_thread_id = orchestrator thread，前端 projection
+///   会把它归到主线时间线。orchestrator 自身 turn 与"无独立 worker drawer 的子任务"
+///   都走这条路径。
+/// - `Sidechain`：item.source_thread_id = lane 绑定的 worker thread，归到对应
+///   role 的 drawer。primary worker sidechain（同一 turn 内主 dispatch 拉起的
+///   worker 任务）会同时在主线 publish `worker_status` 摘要 item（其 source_thread_id
+///   仍是 orchestrator）以填充 dispatch 卡 liveActivity。
 #[derive(Clone, Debug)]
-struct TaskTurnVisibility {
-    thread_visible: bool,
-    worker_visible: bool,
-    primary_worker_sidechain: bool,
-    role_id: Option<String>,
-    worker_id: Option<magi_core::WorkerId>,
-    lane_id: Option<String>,
-    lane_seq: Option<usize>,
-    /// P6c：worker 执行归属的 thread。所有 worker-visible 的 turn item 都带上此 id，
-    /// 让 canonical projection 可按 thread 路由。
-    thread_id: Option<ThreadId>,
+enum TaskTurnVisibility {
+    Mainline {
+        /// 主线 thread = session 的 orchestrator thread。所有 mainline item 写到这里。
+        thread_id: ThreadId,
+    },
+    Sidechain {
+        /// drawer thread = role 维度的 worker thread。所有 sidechain item 写到这里。
+        thread_id: ThreadId,
+        /// 主线常驻 thread，用于 `publish_worker_lane_summary` 等场景把摘要写回主线。
+        orchestrator_thread_id: ThreadId,
+        role_id: String,
+        worker_id: magi_core::WorkerId,
+        lane_id: String,
+        lane_seq: Option<usize>,
+        /// 当前 sidechain 是否同时为主线 dispatch 卡的 primary worker：是则需要
+        /// 在主线 publish 摘要 item；否则 drawer 里安静执行不污染主线。
+        has_mainline_summary: bool,
+    },
+}
+
+impl TaskTurnVisibility {
+    fn thread_id(&self) -> &ThreadId {
+        match self {
+            Self::Mainline { thread_id } => thread_id,
+            Self::Sidechain { thread_id, .. } => thread_id,
+        }
+    }
+
+    fn is_mainline(&self) -> bool {
+        matches!(self, Self::Mainline { .. })
+    }
+
+    /// worker 执行下发工具调用时需要传入 worker_id（影响 executor 分派）。
+    /// Mainline task 不绑定 worker。
+    fn worker_id(&self) -> Option<&magi_core::WorkerId> {
+        match self {
+            Self::Mainline { .. } => None,
+            Self::Sidechain { worker_id, .. } => Some(worker_id),
+        }
+    }
 }
 
 fn task_turn_visibility(
     task: &magi_core::Task,
-    thread_visible: bool,
     worker_lane_id: Option<&str>,
     worker_lane_seq: Option<usize>,
     worker_id: Option<&magi_core::WorkerId>,
-    thread_id: Option<&ThreadId>,
+    thread_id: &ThreadId,
+    orchestrator_thread_id: &ThreadId,
     primary_worker_sidechain: bool,
 ) -> TaskTurnVisibility {
-    let role_id = resolve_task_role(task)
-        .map(str::trim)
-        .filter(|role| !role.is_empty())
-        .map(ToOwned::to_owned);
     let lane_id = worker_lane_id
         .map(str::trim)
         .filter(|lane| !lane.is_empty())
         .map(ToOwned::to_owned);
-    TaskTurnVisibility {
-        thread_visible,
-        worker_visible: lane_id.is_some(),
-        primary_worker_sidechain,
-        role_id,
-        worker_id: worker_id.cloned(),
-        lane_id,
-        lane_seq: worker_lane_seq,
-        thread_id: thread_id.cloned(),
+    // 仅当存在 lane + worker_id 时该 task 才属于 worker drawer；否则保留 Mainline。
+    if let (Some(lane_id), Some(worker_id)) = (lane_id, worker_id) {
+        let role_id = resolve_task_role(task)
+            .map(str::trim)
+            .filter(|role| !role.is_empty())
+            .map(ToOwned::to_owned)
+            .expect("worker drawer task must carry resolvable role_id");
+        return TaskTurnVisibility::Sidechain {
+            thread_id: thread_id.clone(),
+            orchestrator_thread_id: orchestrator_thread_id.clone(),
+            role_id,
+            worker_id: worker_id.clone(),
+            lane_id,
+            lane_seq: worker_lane_seq,
+            has_mainline_summary: primary_worker_sidechain,
+        };
+    }
+    TaskTurnVisibility::Mainline {
+        thread_id: thread_id.clone(),
     }
 }
 
@@ -122,46 +172,41 @@ fn apply_task_turn_visibility(
     visibility: &TaskTurnVisibility,
 ) {
     item.task_id = Some(task.task_id.clone());
-    item.thread_visible = visibility.thread_visible;
-    item.worker_visible = visibility.worker_visible;
-    // P6c：worker 执行产生的 item 归属到该 task 的 thread（若 ensure 过），
-    // 让前端可以把"同一 worker thread 的所有 item"直接按 thread_id 路由。
-    if let Some(thread) = visibility.thread_id.as_ref() {
-        item.source_thread_id = Some(thread.clone());
-    }
-    if visibility.worker_visible {
-        item.lane_id = visibility.lane_id.clone();
-        item.lane_seq = visibility.lane_seq;
-        item.worker_id = visibility.worker_id.clone();
-        if let Some(role_id) = visibility.role_id.as_ref() {
+    match visibility {
+        TaskTurnVisibility::Mainline { thread_id } => {
+            item.source_thread_id = thread_id.clone();
+        }
+        TaskTurnVisibility::Sidechain {
+            thread_id,
+            role_id,
+            worker_id,
+            lane_id,
+            lane_seq,
+            ..
+        } => {
+            item.source_thread_id = thread_id.clone();
+            item.lane_id = Some(lane_id.clone());
+            item.lane_seq = *lane_seq;
+            item.worker_id = Some(worker_id.clone());
             item.role_id = Some(role_id.clone());
             item.source = role_id.clone();
-        } else if let Some(worker_id) = visibility.worker_id.as_ref() {
-            item.source = worker_id.to_string();
         }
     }
 }
 
+/// worker 执行细节（thinking / stream / tool / 失败原因等）一律写入 drawer：
+/// 即便上层 caller 误判为 Mainline，只要该 task 关联到 lane 即被强制视作 sidechain。
+/// 保证 drawer 永远拿到完整 transcript，主线只承载摘要。
 fn apply_task_worker_detail_visibility(
     item: &mut ActiveExecutionTurnItem,
     task: &magi_core::Task,
     visibility: &TaskTurnVisibility,
 ) {
     apply_task_turn_visibility(item, task, visibility);
-    if !visibility.primary_worker_sidechain {
-        return;
-    }
-    item.thread_visible = false;
-    item.worker_visible = true;
-    item.worker_id = visibility.worker_id.clone();
-    if let Some(role_id) = visibility.role_id.as_ref() {
-        item.role_id = Some(role_id.clone());
-        item.source = role_id.clone();
-    } else if let Some(worker_id) = visibility.worker_id.as_ref() {
-        item.source = worker_id.to_string();
-    }
 }
 
+/// final 回复的归属规则与执行细节一致：sidechain task 的 final 永远只归 worker drawer，
+/// 主线消费的是 `worker_status` 摘要 item（由 publish_worker_lane_summary 写入）。
 fn apply_task_final_visibility(
     item: &mut ActiveExecutionTurnItem,
     task_store: &TaskStore,
@@ -169,22 +214,6 @@ fn apply_task_final_visibility(
     visibility: &TaskTurnVisibility,
 ) {
     apply_task_turn_visibility(item, task, visibility);
-    // P2：primary worker sidechain 的 final 永远只归 worker drawer，主线消费的是
-    // `worker_status` 摘要 item（由 publish_worker_lane_summary 写入）。这保证
-    // drawer 任何时刻打开都有完整 transcript，主线也不会被 final 原文污染。
-    if visibility.primary_worker_sidechain {
-        item.thread_visible = false;
-        item.worker_visible = true;
-        item.worker_id = visibility.worker_id.clone();
-        item.lane_id = visibility.lane_id.clone();
-        item.lane_seq = visibility.lane_seq;
-        if let Some(role_id) = visibility.role_id.as_ref() {
-            item.role_id = Some(role_id.clone());
-            item.source = role_id.clone();
-        } else if let Some(worker_id) = visibility.worker_id.as_ref() {
-            item.source = worker_id.to_string();
-        }
-    }
     let _ = task_store;
 }
 
@@ -258,6 +287,7 @@ pub(crate) fn run_task_llm_loop(
         worker_lane_seq,
         worker_id,
         thread_id,
+        orchestrator_thread_id,
         context_summary,
         system_prompt,
         workspace_root_path,
@@ -285,9 +315,8 @@ pub(crate) fn run_task_llm_loop(
     // P6b：thread 累积历史 —— 系统提示后、本轮 user prompt 前。为防止 LLM 混淆"当前 task"
     // 与历史 task，我们在历史末尾、新 user prompt 前插入一条 system 边界标记，让模型明确
     // 接下来要专注于新的任务目标。
-    let thread_history_snapshot: Vec<ThreadChatMessage> = thread_id
-        .map(|id| session_store.thread_message_history(id))
-        .unwrap_or_default();
+    let thread_history_snapshot: Vec<ThreadChatMessage> =
+        session_store.thread_message_history(thread_id);
     if !thread_history_snapshot.is_empty() {
         for history_msg in &thread_history_snapshot {
             messages.push(thread_chat_message_to_chat_message(history_msg));
@@ -329,30 +358,27 @@ pub(crate) fn run_task_llm_loop(
         worker_id.is_some() && current_turn_has_worker_lanes(session_store, session_id);
     let turn_visibility = task_turn_visibility(
         task,
-        streaming_entry_id.is_some()
-            || task_is_thread_visible_turn_owner(session_store, session_id, task_id),
         worker_lane_id,
         worker_lane_seq,
         worker_id,
         thread_id,
+        orchestrator_thread_id,
         primary_worker_sidechain,
     );
 
     if let Some(final_content) = deterministic_task_final_content(task, task_store) {
-        if turn_visibility.thread_visible || turn_visibility.worker_visible {
-            append_task_final_turn_item(
-                event_bus,
-                session_store,
-                task_store,
-                task,
-                session_id,
-                workspace_id,
-                &final_content,
-                None,
-                streaming_entry_id,
-                &turn_visibility,
-            );
-        }
+        append_task_final_turn_item(
+            event_bus,
+            session_store,
+            task_store,
+            task,
+            session_id,
+            workspace_id,
+            &final_content,
+            None,
+            streaming_entry_id,
+            &turn_visibility,
+        );
         return (
             TaskOutcome::Completed {
                 output_refs: vec![final_content],
@@ -363,8 +389,6 @@ pub(crate) fn run_task_llm_loop(
 
     let tool_call_round_limit = tool_call_round_limit(&required_tool_chain);
     for round in 0..tool_call_round_limit {
-        let should_record_turn_artifacts =
-            turn_visibility.thread_visible || turn_visibility.worker_visible;
         let thinking_item_id = format!("turn-item-assistant-thinking-{task_id}-{round}");
         let stream_item_id = task_stream_item_id(task_id, round, streaming_entry_id);
         last_stream_item_id = Some(stream_item_id.clone());
@@ -384,21 +408,19 @@ pub(crate) fn run_task_llm_loop(
 
         let response = if streaming_entry_id.is_some() {
             let on_delta = |delta: &ModelStreamingDelta| {
-                if should_record_turn_artifacts {
-                    publish_task_thinking_delta(
-                        event_bus,
-                        session_store,
-                        task_store,
-                        task,
-                        session_id,
-                        workspace_id,
-                        &thinking_item_id,
-                        &last_thinking_len,
-                        &streamed_thinking,
-                        &turn_visibility,
-                        &delta.thinking,
-                    );
-                }
+                publish_task_thinking_delta(
+                    event_bus,
+                    session_store,
+                    task_store,
+                    task,
+                    session_id,
+                    workspace_id,
+                    &thinking_item_id,
+                    &last_thinking_len,
+                    &streamed_thinking,
+                    &turn_visibility,
+                    &delta.thinking,
+                );
                 publish_stream_delta(
                     event_bus,
                     session_store,
@@ -417,9 +439,7 @@ pub(crate) fn run_task_llm_loop(
                 Ok(response) => response,
                 Err(error) => {
                     tracing::error!(task_id = %task.task_id, round = round, ?error, "LLM streaming invocation failed");
-                    if should_record_turn_artifacts
-                        && task_lease_is_current(task_store, task_id, lease_id)
-                    {
+                    if task_lease_is_current(task_store, task_id, lease_id) {
                         append_task_error_turn_item(
                             event_bus,
                             session_store,
@@ -445,9 +465,7 @@ pub(crate) fn run_task_llm_loop(
                 Ok(response) => response,
                 Err(error) => {
                     tracing::error!(task_id = %task.task_id, round = round, ?error, "LLM invocation failed");
-                    if should_record_turn_artifacts
-                        && task_lease_is_current(task_store, task_id, lease_id)
-                    {
+                    if task_lease_is_current(task_store, task_id, lease_id) {
                         append_task_error_turn_item(
                             event_bus,
                             session_store,
@@ -471,32 +489,30 @@ pub(crate) fn run_task_llm_loop(
         };
 
         let parsed = response.parse_chat_payload();
-        if should_record_turn_artifacts {
-            let final_thinking = parsed
-                .thinking
-                .as_deref()
-                .map(str::trim)
-                .filter(|thinking| !thinking.is_empty())
-                .map(ToOwned::to_owned)
-                .or_else(|| {
-                    let thinking = streamed_thinking.borrow();
-                    let trimmed = thinking.trim();
-                    (!trimmed.is_empty()).then(|| trimmed.to_string())
-                });
-            if let Some(thinking) = final_thinking {
-                upsert_task_thinking_turn_item(
-                    event_bus,
-                    session_store,
-                    task_store,
-                    task,
-                    session_id,
-                    workspace_id,
-                    &thinking_item_id,
-                    &turn_visibility,
-                    "completed",
-                    &thinking,
-                );
-            }
+        let final_thinking = parsed
+            .thinking
+            .as_deref()
+            .map(str::trim)
+            .filter(|thinking| !thinking.is_empty())
+            .map(ToOwned::to_owned)
+            .or_else(|| {
+                let thinking = streamed_thinking.borrow();
+                let trimmed = thinking.trim();
+                (!trimmed.is_empty()).then(|| trimmed.to_string())
+            });
+        if let Some(thinking) = final_thinking {
+            upsert_task_thinking_turn_item(
+                event_bus,
+                session_store,
+                task_store,
+                task,
+                session_id,
+                workspace_id,
+                &thinking_item_id,
+                &turn_visibility,
+                "completed",
+                &thinking,
+            );
         }
         publish_model_usage_record(
             event_bus,
@@ -552,29 +568,27 @@ pub(crate) fn run_task_llm_loop(
         });
 
         for tool_call in &parsed.tool_calls {
-            if should_record_turn_artifacts {
-                append_task_tool_call_started_turn_item(
-                    event_bus,
-                    session_store,
-                    task_store,
-                    task,
-                    session_id,
-                    workspace_id,
-                    &turn_visibility,
-                    tool_call,
-                );
-                publish_worker_lane_summary(
-                    event_bus,
-                    session_store,
-                    task_store,
-                    task,
-                    session_id,
-                    workspace_id,
-                    &turn_visibility,
-                    "running",
-                    &format!("正在调用 {}", tool_call.function.name),
-                );
-            }
+            append_task_tool_call_started_turn_item(
+                event_bus,
+                session_store,
+                task_store,
+                task,
+                session_id,
+                workspace_id,
+                &turn_visibility,
+                tool_call,
+            );
+            publish_worker_lane_summary(
+                event_bus,
+                session_store,
+                task_store,
+                task,
+                session_id,
+                workspace_id,
+                &turn_visibility,
+                "running",
+                &format!("正在调用 {}", tool_call.function.name),
+            );
         }
 
         let tool_results = execute_task_tool_call_batch(
@@ -585,47 +599,45 @@ pub(crate) fn run_task_llm_loop(
             session_id,
             workspace_id,
             workspace_root_path.as_ref(),
-            turn_visibility.worker_id.as_ref(),
+            turn_visibility.worker_id(),
             &parsed.tool_calls,
         );
 
         for (tool_call, (result, tool_status)) in parsed.tool_calls.iter().zip(tool_results) {
-            if should_record_turn_artifacts {
-                upsert_task_tool_call_result_turn_item(
-                    event_bus,
-                    session_store,
-                    task_store,
-                    task,
-                    session_id,
-                    workspace_id,
-                    &turn_visibility,
-                    tool_call,
-                    &result,
-                    tool_status,
-                );
-                let outcome_label = match tool_status {
-                    ExecutionResultStatus::Succeeded => "完成",
-                    ExecutionResultStatus::Failed => "失败",
-                    ExecutionResultStatus::Rejected => "已拒绝",
-                    ExecutionResultStatus::NeedsApproval => "待审批",
-                    ExecutionResultStatus::Cancelled => "已取消",
-                };
-                publish_worker_lane_summary(
-                    event_bus,
-                    session_store,
-                    task_store,
-                    task,
-                    session_id,
-                    workspace_id,
-                    &turn_visibility,
-                    if matches!(tool_status, ExecutionResultStatus::Succeeded) {
-                        "running"
-                    } else {
-                        "blocked"
-                    },
-                    &format!("{} {}", tool_call.function.name, outcome_label),
-                );
-            }
+            upsert_task_tool_call_result_turn_item(
+                event_bus,
+                session_store,
+                task_store,
+                task,
+                session_id,
+                workspace_id,
+                &turn_visibility,
+                tool_call,
+                &result,
+                tool_status,
+            );
+            let outcome_label = match tool_status {
+                ExecutionResultStatus::Succeeded => "完成",
+                ExecutionResultStatus::Failed => "失败",
+                ExecutionResultStatus::Rejected => "已拒绝",
+                ExecutionResultStatus::NeedsApproval => "待审批",
+                ExecutionResultStatus::Cancelled => "已取消",
+            };
+            publish_worker_lane_summary(
+                event_bus,
+                session_store,
+                task_store,
+                task,
+                session_id,
+                workspace_id,
+                &turn_visibility,
+                if matches!(tool_status, ExecutionResultStatus::Succeeded) {
+                    "running"
+                } else {
+                    "blocked"
+                },
+                &format!("{} {}", tool_call.function.name, outcome_label),
+            );
             if !matches!(tool_status, ExecutionResultStatus::Succeeded) {
                 failed_tool_summaries.push(format!(
                     "{}: {}",
@@ -658,19 +670,17 @@ pub(crate) fn run_task_llm_loop(
         } else {
             "模型未返回可显示回复"
         };
-        if turn_visibility.thread_visible || turn_visibility.worker_visible {
-            append_task_error_turn_item(
-                event_bus,
-                session_store,
-                task_store,
-                task,
-                session_id,
-                workspace_id,
-                &turn_visibility,
-                failure_reason,
-                streaming_entry_id.or(last_stream_item_id.as_deref()),
-            );
-        }
+        append_task_error_turn_item(
+            event_bus,
+            session_store,
+            task_store,
+            task,
+            session_id,
+            workspace_id,
+            &turn_visibility,
+            failure_reason,
+            streaming_entry_id.or(last_stream_item_id.as_deref()),
+        );
         return (
             TaskOutcome::Failed {
                 error: failure_reason.to_string(),
@@ -681,19 +691,17 @@ pub(crate) fn run_task_llm_loop(
     final_content = normalize_model_visible_content(final_content);
     if final_content.trim().is_empty() {
         let failure_reason = "模型未返回可显示回复";
-        if turn_visibility.thread_visible || turn_visibility.worker_visible {
-            append_task_error_turn_item(
-                event_bus,
-                session_store,
-                task_store,
-                task,
-                session_id,
-                workspace_id,
-                &turn_visibility,
-                failure_reason,
-                streaming_entry_id.or(last_stream_item_id.as_deref()),
-            );
-        }
+        append_task_error_turn_item(
+            event_bus,
+            session_store,
+            task_store,
+            task,
+            session_id,
+            workspace_id,
+            &turn_visibility,
+            failure_reason,
+            streaming_entry_id.or(last_stream_item_id.as_deref()),
+        );
         return (
             TaskOutcome::Failed {
                 error: failure_reason.to_string(),
@@ -711,19 +719,17 @@ pub(crate) fn run_task_llm_loop(
     }
 
     if let Some(failure_reason) = task_tool_failure_reason(task.kind, &failed_tool_summaries) {
-        if turn_visibility.thread_visible || turn_visibility.worker_visible {
-            append_task_error_turn_item(
-                event_bus,
-                session_store,
-                task_store,
-                task,
-                session_id,
-                workspace_id,
-                &turn_visibility,
-                &failure_reason,
-                streaming_entry_id.or(last_stream_item_id.as_deref()),
-            );
-        }
+        append_task_error_turn_item(
+            event_bus,
+            session_store,
+            task_store,
+            task,
+            session_id,
+            workspace_id,
+            &turn_visibility,
+            &failure_reason,
+            streaming_entry_id.or(last_stream_item_id.as_deref()),
+        );
         return (
             TaskOutcome::Failed {
                 error: failure_reason,
@@ -734,19 +740,17 @@ pub(crate) fn run_task_llm_loop(
 
     if task.kind == TaskKind::Validation && validation_result_rejects_delivery(&final_content) {
         let failure_reason = compact_validation_failure(&final_content);
-        if turn_visibility.thread_visible || turn_visibility.worker_visible {
-            append_task_error_turn_item(
-                event_bus,
-                session_store,
-                task_store,
-                task,
-                session_id,
-                workspace_id,
-                &turn_visibility,
-                &failure_reason,
-                streaming_entry_id.or(last_stream_item_id.as_deref()),
-            );
-        }
+        append_task_error_turn_item(
+            event_bus,
+            session_store,
+            task_store,
+            task,
+            session_id,
+            workspace_id,
+            &turn_visibility,
+            &failure_reason,
+            streaming_entry_id.or(last_stream_item_id.as_deref()),
+        );
         return (
             TaskOutcome::Failed {
                 error: failure_reason,
@@ -755,51 +759,47 @@ pub(crate) fn run_task_llm_loop(
         );
     }
 
-    if turn_visibility.thread_visible || turn_visibility.worker_visible {
-        append_task_final_turn_item(
-            event_bus,
-            session_store,
-            task_store,
-            task,
-            session_id,
-            workspace_id,
-            &final_content,
-            last_stream_item_id.as_deref().or(streaming_entry_id),
-            streaming_entry_id,
-            &turn_visibility,
-        );
-        publish_worker_lane_summary(
-            event_bus,
-            session_store,
-            task_store,
-            task,
-            session_id,
-            workspace_id,
-            &turn_visibility,
-            "completed",
-            &summarize_final_for_lane(&final_content),
-        );
-    }
+    append_task_final_turn_item(
+        event_bus,
+        session_store,
+        task_store,
+        task,
+        session_id,
+        workspace_id,
+        &final_content,
+        last_stream_item_id.as_deref().or(streaming_entry_id),
+        streaming_entry_id,
+        &turn_visibility,
+    );
+    publish_worker_lane_summary(
+        event_bus,
+        session_store,
+        task_store,
+        task,
+        session_id,
+        workspace_id,
+        &turn_visibility,
+        "completed",
+        &summarize_final_for_lane(&final_content),
+    );
 
     // P6b：把本轮 LLM 对话追写进 thread 历史，供下一 task 作为上下文。
     // 过滤掉 system 消息（prompt、workspace 上下文、历史边界标记）——这些会在下一 task
     // 启动时由 run_task_llm_loop 自动重建；只沉淀真实对话（user / assistant / tool）。
     // 补写 assistant final：循环里只把 assistant 写进 messages 是在"还有下一轮"时发生，
     // 最终 final_content 作为收尾时没有入列，这里用 final_content 显式收口。
-    if let Some(thread) = thread_id {
-        let mut turn_messages: Vec<ThreadChatMessage> = messages
-            .iter()
-            .filter(|msg| msg.role != "system")
-            .map(chat_message_to_thread_chat_message)
-            .collect();
-        turn_messages.push(ThreadChatMessage {
-            role: "assistant".to_string(),
-            content: Some(final_content.clone()),
-            tool_calls: Vec::new(),
-            tool_call_id: None,
-        });
-        session_store.append_thread_messages(thread, turn_messages, UtcMillis::now());
-    }
+    let mut turn_messages: Vec<ThreadChatMessage> = messages
+        .iter()
+        .filter(|msg| msg.role != "system")
+        .map(chat_message_to_thread_chat_message)
+        .collect();
+    turn_messages.push(ThreadChatMessage {
+        role: "assistant".to_string(),
+        content: Some(final_content.clone()),
+        tool_calls: Vec::new(),
+        tool_call_id: None,
+    });
+    session_store.append_thread_messages(thread_id, turn_messages, UtcMillis::now());
 
     (
         TaskOutcome::Completed {
@@ -1281,7 +1281,7 @@ fn publish_stream_delta(
     if visible_text.trim().is_empty() {
         return;
     }
-    if let Some(timeline_entry_id) = timeline_entry_id.filter(|_| turn_visibility.thread_visible) {
+    if let Some(timeline_entry_id) = timeline_entry_id.filter(|_| turn_visibility.is_mainline()) {
         session_store.upsert_timeline_entry(
             session_id.clone(),
             timeline_entry_id,
@@ -1295,6 +1295,7 @@ fn publish_stream_delta(
         Some("生成回复".to_string()),
         Some(visible_text),
         Some(item_id.to_string()),
+        turn_visibility.thread_id().clone(),
     );
     // P2：子任务流式文本归 worker sidechain，主线靠 worker_lane_summary 呈现进度，
     // 不再让同一条流式内容同时污染主线与 drawer。
@@ -1378,36 +1379,42 @@ fn publish_worker_lane_summary(
     status: &str,
     summary: &str,
 ) {
-    if !turn_visibility.primary_worker_sidechain {
-        return;
-    }
-    let Some(lane_id) = turn_visibility.lane_id.as_ref() else {
+    let TaskTurnVisibility::Sidechain {
+        orchestrator_thread_id,
+        role_id,
+        worker_id,
+        lane_id,
+        lane_seq,
+        has_mainline_summary,
+        ..
+    } = turn_visibility
+    else {
         return;
     };
+    if !has_mainline_summary {
+        return;
+    }
     let trimmed = summary.trim();
     if trimmed.is_empty() {
         return;
     }
+    // 摘要归属主线 orchestrator thread：前端 projection 按 source_thread_id==
+    // orchestrator 把它投射到主线 dispatch 卡的 liveActivity。同时通过 role_id
+    // + lane_id 让主线知道它来自哪条 sidechain，便于点击"查看 drawer"。
     let mut item = session_turn_item(
         "worker_status",
         status,
         Some("执行进展".to_string()),
         Some(trimmed.to_string()),
         Some(format!("turn-item-worker-lane-summary-{lane_id}")),
+        orchestrator_thread_id.clone(),
     );
-    // 摘要本身归主线消费，但同时挂 worker_visible 让 drawer 也保留一份时间锚，
-    // 便于未来 P4 按 roleId 索引执行过程。
-    apply_task_turn_visibility(&mut item, task, turn_visibility);
-    item.thread_visible = true;
-    item.worker_visible = true;
-    item.lane_id = Some(lane_id.to_string());
-    item.lane_seq = turn_visibility.lane_seq;
-    if let Some(worker_id) = turn_visibility.worker_id.as_ref() {
-        item.worker_id = Some(worker_id.clone());
-    }
-    if let Some(role_id) = turn_visibility.role_id.as_ref() {
-        item.role_id = Some(role_id.clone());
-    }
+    item.task_id = Some(task.task_id.clone());
+    item.lane_id = Some(lane_id.clone());
+    item.lane_seq = *lane_seq;
+    item.worker_id = Some(worker_id.clone());
+    item.role_id = Some(role_id.clone());
+    item.source = role_id.clone();
     if let Some(published) =
         upsert_session_turn_item_with_task_store(session_store, session_id, item, Some(task_store))
     {
@@ -1437,6 +1444,7 @@ fn upsert_task_thinking_turn_item(
         Some("模型思考".to_string()),
         Some(trimmed.to_string()),
         Some(item_id.to_string()),
+        turn_visibility.thread_id().clone(),
     );
     apply_task_worker_detail_visibility(&mut item, task, turn_visibility);
     if let Some(published) =
@@ -1462,6 +1470,7 @@ fn append_task_tool_call_started_turn_item(
         Some(tool_call.function.name.clone()),
         Some(format!("正在调用工具：{}", tool_call.function.name)),
         Some(format!("turn-item-tool-{}", tool_call.id)),
+        turn_visibility.thread_id().clone(),
     );
     apply_task_worker_detail_visibility(&mut item, task, turn_visibility);
     item.tool_call_id = Some(tool_call.id.clone());
@@ -1494,6 +1503,7 @@ fn upsert_task_tool_call_result_turn_item(
         Some(tool_call.function.name.clone()),
         Some(summarize_tool_result(tool_result)),
         Some(format!("turn-item-tool-{}", tool_call.id)),
+        turn_visibility.thread_id().clone(),
     );
     apply_task_worker_detail_visibility(&mut item, task, turn_visibility);
     item.tool_call_id = Some(tool_call.id.clone());
@@ -1822,6 +1832,7 @@ fn append_task_final_turn_item(
         Some("最终回复".to_string()),
         Some(final_content.to_string()),
         final_item_id.map(str::to_string),
+        turn_visibility.thread_id().clone(),
     );
     apply_task_final_visibility(&mut final_item, task_store, task, turn_visibility);
     if let Some(timeline_entry_id) = timeline_entry_id {
@@ -1848,7 +1859,7 @@ fn append_task_final_turn_item(
     let root_task_completed = task_store
         .get_task(&task.root_task_id)
         .is_some_and(|root_task| root_task.status == TaskStatus::Completed);
-    if turn_visibility.thread_visible && root_task_completed {
+    if turn_visibility.is_mainline() && root_task_completed {
         let _ = session_store.update_current_turn_status(session_id, "completed");
         publish_current_session_turn_item_event(
             event_bus,
@@ -1878,6 +1889,7 @@ fn append_task_error_turn_item(
         Some("回复生成失败".to_string()),
         Some(error_text.to_string()),
         Some(format!("turn-item-assistant-error-{}", UtcMillis::now().0)),
+        turn_visibility.thread_id().clone(),
     );
     apply_task_turn_visibility(&mut error_item, task, turn_visibility);
     let error_item_id = error_item.item_id.clone();
@@ -1889,7 +1901,7 @@ fn append_task_error_turn_item(
     ) {
         publish_session_turn_item_event(event_bus, session_id, workspace_id, &published);
     }
-    if turn_visibility.thread_visible {
+    if turn_visibility.is_mainline() {
         let _ = session_store.update_current_turn_status(session_id, "failed");
         publish_current_session_turn_item_event(
             event_bus,
@@ -1929,23 +1941,6 @@ fn task_stream_item_id(task_id: &TaskId, round: usize, streaming_entry_id: Optio
             .unwrap_or_else(|| format!("turn-item-assistant-stream-{task_id}-{round}"));
     }
     format!("turn-item-assistant-stream-{task_id}-{round}")
-}
-
-fn task_is_thread_visible_turn_owner(
-    session_store: &SessionStore,
-    session_id: &SessionId,
-    task_id: &TaskId,
-) -> bool {
-    session_store
-        .runtime_sidecar(session_id)
-        .and_then(|sidecar| sidecar.current_turn)
-        .is_some_and(|turn| {
-            turn.items.iter().any(|item| {
-                item.task_id.as_ref() == Some(task_id)
-                    && item.thread_visible
-                    && item.kind == "assistant_phase"
-            })
-        })
 }
 
 fn current_turn_has_worker_lanes(session_store: &SessionStore, session_id: &SessionId) -> bool {
@@ -2632,6 +2627,19 @@ mod tests {
             .expect("lease should be granted");
         let usage_binding = crate::usage_recording::session_turn_model_usage_binding(true);
         let client = StaticTaskFinalModelBridgeClient { content };
+        let session_id = SessionId::new(format!("session-{}", task.task_id));
+        let workspace_id = Some(WorkspaceId::new(format!("workspace-{}", task.task_id)));
+        session_store
+            .create_session(session_id.clone(), "static task final fixture")
+            .expect("session should be creatable");
+        let now = UtcMillis::now();
+        let (_, orchestrator_thread_id) = session_store.ensure_session_mission(
+            &session_id,
+            now,
+            || task.mission_id.clone(),
+        );
+        // P7：mainline 场景 task 自身 thread = orchestrator thread。
+        let thread_id = orchestrator_thread_id.clone();
         let (outcome, _) = run_task_llm_loop(TaskLlmLoopRequest {
             client: &client,
             event_bus: &event_bus,
@@ -2643,8 +2651,8 @@ mod tests {
             task,
             task_id: &task.task_id,
             lease_id: &lease.lease_id,
-            session_id: &SessionId::new(format!("session-{}", task.task_id)),
-            workspace_id: &Some(WorkspaceId::new(format!("workspace-{}", task.task_id))),
+            session_id: &session_id,
+            workspace_id: &workspace_id,
             prompt: "请执行任务".to_string(),
             tools: None,
             usage_binding: &usage_binding,
@@ -2652,7 +2660,8 @@ mod tests {
             worker_lane_id: None,
             worker_lane_seq: None,
             worker_id: Some(&worker_id),
-            thread_id: None,
+            thread_id: &thread_id,
+            orchestrator_thread_id: &orchestrator_thread_id,
             context_summary: None,
             system_prompt: None,
             workspace_root_path: None,
@@ -2729,6 +2738,16 @@ mod tests {
         let client = TaskToolFailureThenFinalModelBridgeClient {
             invoke_count: AtomicUsize::new(0),
         };
+        session_store
+            .create_session(session_id.clone(), "task failed tool fixture")
+            .expect("session should be creatable");
+        let now = UtcMillis::now();
+        let (_, orchestrator_thread_id) = session_store.ensure_session_mission(
+            &session_id,
+            now,
+            || task.mission_id.clone(),
+        );
+        let thread_id = orchestrator_thread_id.clone();
 
         let (outcome, _) = run_task_llm_loop(TaskLlmLoopRequest {
             client: &client,
@@ -2750,7 +2769,8 @@ mod tests {
             worker_lane_id: None,
             worker_lane_seq: None,
             worker_id: Some(&worker_id),
-            thread_id: None,
+            thread_id: &thread_id,
+            orchestrator_thread_id: &orchestrator_thread_id,
             context_summary: None,
             system_prompt: None,
             workspace_root_path: None,
@@ -2792,33 +2812,56 @@ mod tests {
     #[test]
     fn task_turn_visibility_does_not_promote_primary_role_to_worker_lane() {
         let task = make_task_loop_test_task("task-primary-role-only");
+        let thread_id = ThreadId::new("thread-primary-role-only");
+        let orchestrator_thread_id = thread_id.clone();
 
-        let visibility = task_turn_visibility(&task, true, None, None, None, None, false);
+        let visibility = task_turn_visibility(
+            &task,
+            None,
+            None,
+            None,
+            &thread_id,
+            &orchestrator_thread_id,
+            false,
+        );
 
-        assert!(visibility.thread_visible);
-        assert!(!visibility.worker_visible);
-        assert_eq!(visibility.role_id.as_deref(), Some("integration-dev"));
-        assert!(visibility.lane_id.is_none());
-        assert!(visibility.lane_seq.is_none());
+        // 没有 lane_id + worker_id 配对 → 必须落在 Mainline 分支。
+        assert!(visibility.is_mainline());
+        assert_eq!(visibility.thread_id(), &thread_id);
+        assert!(visibility.worker_id().is_none());
     }
 
     #[test]
     fn primary_task_worker_details_move_to_sidechain() {
         let task = make_task_loop_test_task("task-primary-deep-sidechain");
         let worker_id = WorkerId::new("worker-primary-deep-sidechain");
-        let visibility = task_turn_visibility(&task, true, None, None, Some(&worker_id), None, true);
+        let lane_id = "lane-primary-deep-sidechain";
+        let worker_thread_id = ThreadId::new("thread-worker-primary-deep-sidechain");
+        let orchestrator_thread_id = ThreadId::new("thread-orch-primary-deep-sidechain");
+        let visibility = task_turn_visibility(
+            &task,
+            Some(lane_id),
+            Some(1),
+            Some(&worker_id),
+            &worker_thread_id,
+            &orchestrator_thread_id,
+            true,
+        );
         let mut tool_item = session_turn_item(
             "tool_call_started",
             "running",
             Some("shell_exec".to_string()),
             Some("正在调用工具：shell_exec".to_string()),
             Some("turn-item-primary-tool".to_string()),
+            orchestrator_thread_id.clone(),
         );
 
         apply_task_worker_detail_visibility(&mut tool_item, &task, &visibility);
 
-        assert!(!tool_item.thread_visible);
-        assert!(tool_item.worker_visible);
+        // sidechain item 的 source_thread_id 必须切换到 worker thread。
+        assert_eq!(tool_item.source_thread_id, worker_thread_id);
+        assert_ne!(tool_item.source_thread_id, orchestrator_thread_id);
+        assert_eq!(tool_item.lane_id.as_deref(), Some(lane_id));
         assert_eq!(tool_item.worker_id.as_ref(), Some(&worker_id));
         assert_eq!(tool_item.role_id.as_deref(), Some("integration-dev"));
         assert_eq!(tool_item.source, "integration-dev");
@@ -2829,13 +2872,14 @@ mod tests {
             Some("最终回复".to_string()),
             Some("worker 输出".to_string()),
             Some("turn-item-primary-final".to_string()),
+            orchestrator_thread_id.clone(),
         );
         let task_store = TaskStore::new();
         task_store.insert_task(task.clone());
         apply_task_final_visibility(&mut final_item, &task_store, &task, &visibility);
 
-        assert!(!final_item.thread_visible);
-        assert!(final_item.worker_visible);
+        assert_eq!(final_item.source_thread_id, worker_thread_id);
+        assert_ne!(final_item.source_thread_id, orchestrator_thread_id);
         assert_eq!(final_item.worker_id.as_ref(), Some(&worker_id));
         assert_eq!(final_item.role_id.as_deref(), Some("integration-dev"));
         assert_eq!(final_item.source, "integration-dev");
@@ -2845,13 +2889,16 @@ mod tests {
     fn task_turn_visibility_uses_authoritative_worker_lane_from_plan() {
         let task = make_task_loop_test_task("task-worker-lane-order");
         let worker_id = WorkerId::new("worker-worker-lane-order");
+        let lane_id = "lane-task-worker-lane-order";
+        let worker_thread_id = ThreadId::new("thread-worker-worker-lane-order");
+        let orchestrator_thread_id = ThreadId::new("thread-orch-worker-lane-order");
         let visibility = task_turn_visibility(
             &task,
-            false,
-            Some("lane-task-worker-lane-order"),
+            Some(lane_id),
             Some(3),
             Some(&worker_id),
-            None,
+            &worker_thread_id,
+            &orchestrator_thread_id,
             false,
         );
         let mut item = session_turn_item(
@@ -2860,13 +2907,14 @@ mod tests {
             Some("最终回复".to_string()),
             Some("worker 输出".to_string()),
             Some("turn-item-worker-final".to_string()),
+            orchestrator_thread_id.clone(),
         );
 
         apply_task_turn_visibility(&mut item, &task, &visibility);
 
-        assert!(!item.thread_visible);
-        assert!(item.worker_visible);
-        assert_eq!(item.lane_id.as_deref(), Some("lane-task-worker-lane-order"));
+        assert_eq!(item.source_thread_id, worker_thread_id);
+        assert_ne!(item.source_thread_id, orchestrator_thread_id);
+        assert_eq!(item.lane_id.as_deref(), Some(lane_id));
         assert_eq!(item.lane_seq, Some(3));
         assert_eq!(item.worker_id.as_ref(), Some(&worker_id));
         assert_eq!(item.role_id.as_deref(), Some("integration-dev"));
@@ -2907,13 +2955,17 @@ mod tests {
         task.root_task_id = root_task_id;
         task.status = TaskStatus::Completed;
         task_store.insert_task(task.clone());
+        // 该用例验证"root 未完成时不能提前收尾主线 turn"，因此 task 本身走 Mainline 路径：
+        // 不传 lane_id / worker_id，`task_turn_visibility` 会返回 Mainline，
+        // 后续 append_task_final_turn_item 的 `is_mainline()` 分支才会被覆盖到。
+        let orchestrator_thread_id = ThreadId::new("thread-orch-final-root-running");
         let visibility = task_turn_visibility(
             &task,
-            true,
             None,
             None,
-            Some(&WorkerId::new("worker-final-root-running")),
             None,
+            &orchestrator_thread_id,
+            &orchestrator_thread_id,
             false,
         );
 
@@ -2990,6 +3042,13 @@ mod tests {
             )
             .expect("lease should be granted");
         let usage_binding = crate::usage_recording::session_turn_model_usage_binding(true);
+        let now = UtcMillis::now();
+        let (_, orchestrator_thread_id) = session_store.ensure_session_mission(
+            &session_id,
+            now,
+            || task.mission_id.clone(),
+        );
+        let thread_id = orchestrator_thread_id.clone();
 
         let (outcome, _) = run_task_llm_loop(TaskLlmLoopRequest {
             client: &FailingTaskModelBridgeClient,
@@ -3011,7 +3070,8 @@ mod tests {
             worker_lane_id: None,
             worker_lane_seq: None,
             worker_id: None,
-            thread_id: None,
+            thread_id: &thread_id,
+            orchestrator_thread_id: &orchestrator_thread_id,
             context_summary: None,
             system_prompt: None,
             workspace_root_path: None,
@@ -3035,7 +3095,8 @@ mod tests {
             .iter()
             .find(|item| item.kind == "assistant_error")
             .expect("assistant_error should be appended");
-        assert!(error_item.thread_visible);
+        // Mainline 失败 item 的 source_thread_id 必须等于 orchestrator thread。
+        assert_eq!(error_item.source_thread_id, orchestrator_thread_id);
         assert_eq!(error_item.status, "failed");
         assert_eq!(error_item.task_id.as_ref(), Some(&task_id));
         assert!(
@@ -3107,6 +3168,25 @@ mod tests {
                 workspace_id.as_ref().map(ToString::to_string),
             )
             .expect("session should be creatable");
+        let task_store = TaskStore::new();
+        let task = make_task_loop_test_task(task_id.as_str());
+        task_store.insert_task(task.clone());
+        let now = UtcMillis::now();
+        let (_, orchestrator_thread_id) = session_store.ensure_session_mission(
+            &session_id,
+            now,
+            || task.mission_id.clone(),
+        );
+        // worker lane 必须绑定到独立的 worker thread —— 由角色维度 ensure。
+        let worker_thread_id = crate::dispatch_execution::ensure_thread_for_role(
+            &session_store,
+            &session_id,
+            &task.mission_id,
+            "integration-dev",
+            &worker_id,
+            &task_id,
+            now,
+        );
         session_store
             .upsert_current_turn(
                 session_id.clone(),
@@ -3122,8 +3202,8 @@ mod tests {
                         lane_seq: 2,
                         task_id: task_id.clone(),
                         worker_id: worker_id.clone(),
-                        role_id: Some("integration-dev".to_string()),
-                        thread_id: None,
+                        role_id: "integration-dev".to_string(),
+                        thread_id: worker_thread_id.clone(),
                         title: "验证 worker 工具并发".to_string(),
                         is_primary: false,
                     }],
@@ -3132,9 +3212,6 @@ mod tests {
             )
             .expect("turn should be creatable");
 
-        let task_store = TaskStore::new();
-        let task = make_task_loop_test_task(task_id.as_str());
-        task_store.insert_task(task.clone());
         let lease = task_store
             .grant_lease(
                 &task.task_id,
@@ -3184,7 +3261,8 @@ mod tests {
             worker_lane_id: Some(&lane_id),
             worker_lane_seq: Some(2),
             worker_id: Some(&worker_id),
-            thread_id: None,
+            thread_id: &worker_thread_id,
+            orchestrator_thread_id: &orchestrator_thread_id,
             context_summary: None,
             system_prompt: None,
             workspace_root_path: None,
@@ -3215,9 +3293,14 @@ mod tests {
         let turn = sidecar.current_turn.expect("turn should exist");
         assert!(
             turn.items.iter().all(|item| {
-                item.worker_visible
+                // Sidechain item 的 source_thread_id 必须切换到 worker thread；
+                // 主线摘要 (`worker_status`) 再次落回 orchestrator thread。
+                let routed_to_worker = item.source_thread_id == worker_thread_id
                     && item.lane_id.as_deref() == Some(lane_id.as_str())
-                    && item.lane_seq == Some(2)
+                    && item.lane_seq == Some(2);
+                let routed_to_main = item.source_thread_id == orchestrator_thread_id
+                    && item.kind == "worker_status";
+                routed_to_worker || routed_to_main
             }),
             "worker 输出必须沿用执行计划中的 lane 归属与顺序"
         );

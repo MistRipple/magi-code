@@ -163,8 +163,6 @@ interface RustSessionRuntimeTurnItemSummary {
   user_message_id?: string | null;
   placeholder_message_id?: string | null;
   timeline_entry_id?: string | null;
-  thread_visible?: boolean;
-  worker_visible?: boolean;
 }
 
 interface RustSessionRuntimeTurnLaneSummary {
@@ -172,7 +170,7 @@ interface RustSessionRuntimeTurnLaneSummary {
   lane_seq?: number;
   task_id?: string;
   worker_id?: string;
-  role_id?: string | null;
+  role_id?: string;
   title?: string;
   status?: string;
   is_primary?: boolean;

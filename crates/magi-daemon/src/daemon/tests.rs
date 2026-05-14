@@ -468,6 +468,11 @@ fn runtime_sidecar_flush_persists_canonical_turns_to_session_durable_state() {
             Some(workspace_id.to_string()),
         )
         .expect("workspace session should be creatable");
+    let (_mission_id, orchestrator_thread_id) = session_store.ensure_session_mission(
+        &session_id,
+        UtcMillis(5),
+        || MissionId::new("mission-flush-canonical"),
+    );
     session_store
         .upsert_current_turn(
             session_id.clone(),
@@ -503,9 +508,7 @@ fn runtime_sidecar_flush_persists_canonical_turns_to_session_durable_state() {
                         "assistant-placeholder-flush-canonical".to_string(),
                     ),
                     timeline_entry_id: None,
-                    thread_visible: true,
-                    worker_visible: false,
-            source_thread_id: None,
+                    source_thread_id: orchestrator_thread_id.clone(),
                 }],
                 worker_lanes: Vec::new(),
             },

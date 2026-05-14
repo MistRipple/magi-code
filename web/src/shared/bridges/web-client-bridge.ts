@@ -803,6 +803,7 @@ function emitLocalPendingCanonicalTurn(input: {
     return false;
   }
   const turnId = `turn-local-${input.requestId}`;
+  const sourceThreadId = `thread-orchestrator-${sessionId}`;
   const sharedMetadata = {
     requestId: input.requestId,
     userMessageId: input.userMessageId,
@@ -821,9 +822,8 @@ function emitLocalPendingCanonicalTurn(input: {
     updatedAt: input.createdAt,
     title: '生成回复',
     content: '',
+    sourceThreadId,
     visibility: {
-      threadVisible: true,
-      workerVisible: false,
       renderable: true,
     },
     metadata: sharedMetadata,
@@ -856,9 +856,8 @@ function emitLocalPendingCanonicalTurn(input: {
           status: 'completed',
           updatedAt: input.createdAt,
           content: input.text,
+          sourceThreadId,
           visibility: {
-            threadVisible: true,
-            workerVisible: false,
             renderable: true,
           },
           metadata: sharedMetadata,
@@ -887,6 +886,7 @@ function emitLocalPendingCanonicalTurnFailed(input: {
     return false;
   }
   const turnId = `turn-local-${input.requestId}`;
+  const sourceThreadId = `thread-orchestrator-${sessionId}`;
   const sharedMetadata = {
     requestId: input.requestId,
     userMessageId: input.userMessageId,
@@ -904,9 +904,8 @@ function emitLocalPendingCanonicalTurnFailed(input: {
     status: 'completed' as const,
     updatedAt: input.createdAt,
     content: input.text,
+    sourceThreadId,
     visibility: {
-      threadVisible: true,
-      workerVisible: false,
       renderable: true,
     },
     metadata: sharedMetadata,
@@ -923,9 +922,8 @@ function emitLocalPendingCanonicalTurnFailed(input: {
     updatedAt: input.failedAt,
     title: '发送失败',
     content: input.error,
+    sourceThreadId,
     visibility: {
-      threadVisible: true,
-      workerVisible: false,
       renderable: true,
     },
     metadata: sharedMetadata,

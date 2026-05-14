@@ -107,7 +107,6 @@ export function resolveWorkerSlotFromMessage(message: Message): string | null {
   }
   const worker = resolveTimelineWorkerId(
     message.metadata as Record<string, unknown> | undefined,
-    { fallbacks: [message.source] },
   );
   return worker;
 }
@@ -281,7 +280,6 @@ export function mapStandardBlocks(blocks: StandardContentBlock[]): ContentBlock[
             ? block.lanes.map((lane) => ({
                 laneId: lane.laneId,
                 laneVersion: lane.laneVersion,
-                worker: lane.worker,
                 title: lane.title,
                 description: lane.description,
                 status: lane.status,

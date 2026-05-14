@@ -49,8 +49,15 @@ function resolveWorkerTabAggregateId(item: CanonicalTurnItem): AgentId | undefin
   return normalizeCanonicalRoleId(item);
 }
 
+function isWorkerSidechainItem(item: CanonicalTurnItem): boolean {
+  // P7.E：item 是否归属 worker drawer 由 worker.roleId 单一信号决定。
+  // 归属 orchestrator thread 的 item 没有 roleId 或 roleId === 'orchestrator'。
+  const roleId = typeof item.worker?.roleId === 'string' ? item.worker.roleId.trim() : '';
+  return roleId.length > 0 && roleId !== 'orchestrator';
+}
+
 function resolveVisibleWorkerTabId(item: CanonicalTurnItem): AgentId | undefined {
-  return item.visibility.workerVisible ? resolveWorkerTabAggregateId(item) : undefined;
+  return isWorkerSidechainItem(item) ? resolveWorkerTabAggregateId(item) : undefined;
 }
 
 function resolveMessageSource(item: CanonicalTurnItem): Message['source'] {
@@ -214,7 +221,7 @@ function resolveMessageType(item: CanonicalTurnItem): Message['type'] {
     return 'tool_call';
   }
   if (item.kind === 'system_notice') {
-    return item.visibility.threadVisible ? 'text' : 'system-notice';
+    return isWorkerSidechainItem(item) ? 'system-notice' : 'text';
   }
   if (item.kind === 'assistant_text') {
     return 'text';
@@ -246,13 +253,6 @@ function shouldRenderItem(item: CanonicalTurnItem): boolean {
     return false;
   }
   if (
-    item.kind === 'system_notice'
-    && item.visibility.threadVisible === false
-    && item.visibility.workerVisible === false
-  ) {
-    return false;
-  }
-  if (
     item.kind === 'assistant_text'
     && isCanonicalTerminalStatus(item.status)
     && resolveItemContent(item).trim().length === 0
@@ -265,7 +265,7 @@ function shouldRenderItem(item: CanonicalTurnItem): boolean {
 function isTurnResponseDurationAnchorCandidate(item: CanonicalTurnItem): boolean {
   return item.kind !== 'user_message'
     && item.kind !== 'system_notice'
-    && item.visibility.threadVisible !== false
+    && !isWorkerSidechainItem(item)
     && shouldRenderItem(item);
 }
 
@@ -330,9 +330,9 @@ function buildMessage(
 ): Message {
   const content = resolveItemContent(item);
   const workerTabId = resolveVisibleWorkerTabId(item);
-  const isWorkerVisible = item.visibility.workerVisible === true;
-  const workerId = isWorkerVisible ? normalizeCanonicalWorkerId(item) : undefined;
-  const roleId = isWorkerVisible ? normalizeCanonicalRoleId(item) : undefined;
+  const isWorkerSidechain = isWorkerSidechainItem(item);
+  const workerId = isWorkerSidechain ? normalizeCanonicalWorkerId(item) : undefined;
+  const roleId = isWorkerSidechain ? normalizeCanonicalRoleId(item) : undefined;
   const blocks = buildMessageBlocks(item, content);
   const isStreaming = item.kind === 'assistant_text' && !isCanonicalTerminalStatus(item.status);
   const responseDurationMs = canShowTurnResponseDuration(turn, item)
@@ -368,9 +368,8 @@ function buildMessage(
       ...(workerId ? { workerId } : {}),
       ...(roleId ? { roleId } : {}),
       ...(workerTabId ? { workerTabId } : {}),
-      // P6d：把 canonical 层的 sourceThreadId 透传到消息 metadata，供后续多 thread 视图
-      // 使用（单 thread resume、thread tree、跨 worker 通信追踪等）。
-      // 现阶段 UI 路由仍沿用 threadVisible / workerTabIds，thread_id 仅作为增量身份信号。
+      // P7.E：UI 路由单一信号 —— worker.roleId 区分主线与 worker drawer，
+      // sourceThreadId 透传给后续多 thread 视图使用（resume、thread tree、跨 worker 追踪）。
       ...(item.sourceThreadId ? { sourceThreadId: item.sourceThreadId } : {}),
       taskId: item.worker?.taskId,
       toolCallId: item.tool?.callId,
@@ -398,7 +397,6 @@ function buildArtifact(
   }
   const artifactId = resolveArtifactId(turn, item);
   const workerTabId = resolveVisibleWorkerTabId(item);
-  const workerTabs = item.visibility.workerVisible && workerTabId ? [workerTabId] : [];
   return {
     artifactId,
     kind: item.kind === 'tool_call' ? 'tool' : 'message',
@@ -411,8 +409,6 @@ function buildArtifact(
     cardId: artifactId,
     laneId: item.laneId,
     worker: workerTabId,
-    threadVisible: item.visibility.threadVisible !== false,
-    workerTabs,
     messageIds: [artifactId, item.itemId],
     message: buildMessage(turn, item, artifactId, laneMetaById),
   };
@@ -467,7 +463,6 @@ function buildDispatchGroupArtifact(turn: CanonicalTurn): TimelineProjectionArti
     laneById.set(laneId, {
       laneId,
       laneVersion: item.itemSeq,
-      worker,
       title,
       description: item.content || title,
       status,
@@ -603,8 +598,6 @@ function buildDispatchGroupArtifact(turn: CanonicalTurn): TimelineProjectionArti
     timestamp: firstItem.createdAt,
     cardId: artifactId,
     dispatchWaveId: turn.turnId,
-    threadVisible: true,
-    workerTabs: [],
     messageIds: [artifactId, ...dispatchItems.map((item) => item.itemId)],
     message,
   };
@@ -620,22 +613,6 @@ function buildTurnProjectionArtifacts(turn: CanonicalTurn): Array<TimelineProjec
 
 function compareArtifacts(left: TimelineProjectionArtifact, right: TimelineProjectionArtifact): number {
   return left.displayOrder - right.displayOrder || left.artifactId.localeCompare(right.artifactId);
-}
-
-function mergeWorkerTabs(
-  left: AgentId[] | undefined,
-  right: AgentId[] | undefined,
-): AgentId[] {
-  const merged: AgentId[] = [];
-  const seen = new Set<string>();
-  for (const workerId of [...(left || []), ...(right || [])]) {
-    if (!workerId || seen.has(workerId)) {
-      continue;
-    }
-    seen.add(workerId);
-    merged.push(workerId);
-  }
-  return merged;
 }
 
 function mergeMessageIds(left: string[] | undefined, right: string[] | undefined): string[] {
@@ -675,8 +652,6 @@ function mergeDuplicateArtifact(
     cardId: first.cardId,
     laneId: first.laneId || latest.laneId,
     worker: first.worker || latest.worker,
-    threadVisible: first.threadVisible !== false || latest.threadVisible !== false,
-    workerTabs: mergeWorkerTabs(first.workerTabs, latest.workerTabs),
     messageIds: mergeMessageIds(first.messageIds, latest.messageIds),
     message: {
       ...latest.message,
@@ -722,17 +697,22 @@ export function buildCanonicalTimelineProjection(state: CanonicalTurnReducerStat
     .flatMap((turn) => buildTurnProjectionArtifacts(turn))
     .filter((artifact): artifact is TimelineProjectionArtifact => Boolean(artifact))
     .sort(compareArtifacts));
+  // P7.E：路由由 artifact.worker 单一信号决定。
+  // - artifact.worker 为空 → orchestrator 主线 thread；
+  // - artifact.worker 为非空字符串 → 对应 roleId 的 worker drawer。
   const threadRenderEntries = artifacts
-    .filter((artifact) => artifact.threadVisible !== false)
+    .filter((artifact) => !artifact.worker)
     .map(renderEntry);
   const workerRenderEntries: Record<string, TimelineProjectionRenderEntry[]> = {};
   for (const artifact of artifacts) {
-    for (const workerId of artifact.workerTabs) {
-      if (!workerRenderEntries[workerId]) {
-        workerRenderEntries[workerId] = [];
-      }
-      workerRenderEntries[workerId].push(renderEntry(artifact));
+    const workerId = artifact.worker;
+    if (!workerId) {
+      continue;
     }
+    if (!workerRenderEntries[workerId]) {
+      workerRenderEntries[workerId] = [];
+    }
+    workerRenderEntries[workerId].push(renderEntry(artifact));
   }
   return {
     schemaVersion: 'session-timeline-projection.v2',

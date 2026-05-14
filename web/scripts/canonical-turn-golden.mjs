@@ -61,43 +61,11 @@ function runGoldenReplay(reducer, projection, timelineRenderItems, contract) {
   assertSplitToolStartedAndResultCollapseIntoOneCard(reducer, projection);
   assertCancelledToolShowsTurnResponseDuration(reducer, projection);
   assertFailedToolWithoutAssistantShowsTurnResponseDuration(reducer, projection);
-  assertThreadVisibleRoleMetadataDoesNotBecomeWorkerBadge(reducer, projection);
   assertWorkerDispatchItemsCreateMainWorkerCard(reducer, projection, timelineRenderItems);
   assertSameRoleMultipleWorkerInstancesShareTab(reducer, projection);
   assertBootstrapProcessingStateFromRunningCanonicalTurn(contract);
   assertBootstrapProcessingStateIgnoresTerminalCanonicalTurn(contract);
   assertBootstrapCarriesPendingChanges(contract);
-}
-
-function assertThreadVisibleRoleMetadataDoesNotBecomeWorkerBadge(reducer, projection) {
-  const c = baseCase('thread-visible-role-metadata', 'session-golden-thread-role', 'turn-golden-thread-role', 9200);
-  const assistant = assistantText(c, 2, 'assistant-role-main', '这是主线最终回复。', 'completed');
-  assistant.worker = {
-    taskId: 'task-primary',
-    roleId: 'integration-dev',
-    title: '最终回复',
-  };
-  assistant.visibility = {
-    renderable: true,
-    threadVisible: true,
-    workerVisible: false,
-  };
-  const state = reducer.replaceCanonicalTurns(c.sessionId, [
-    turn(c, 'completed', [assistant], { completedAt: 9300, responseDurationMs: 100 }),
-  ]);
-  const projectionValue = projection.buildCanonicalTimelineProjection(state);
-  const artifact = findArtifactByTurnItemId(projectionValue, 'assistant-role-main');
-  assert.ok(artifact, 'thread-visible assistant artifact should exist');
-  assert.equal(
-    artifact.message.source,
-    'orchestrator',
-    'thread-visible primary task metadata must not render as a worker badge source',
-  );
-  assert.equal(
-    artifact.message.metadata?.roleId,
-    undefined,
-    'roleId should only be exposed as render source for worker-visible sidechain items',
-  );
 }
 
 function assertWorkerDispatchItemsCreateMainWorkerCard(reducer, projection, timelineRenderItems) {
@@ -106,8 +74,6 @@ function assertWorkerDispatchItemsCreateMainWorkerCard(reducer, projection, time
   orchestratorPhase.itemId = 'orchestrator-phase';
   orchestratorPhase.visibility = {
     renderable: true,
-    threadVisible: true,
-    workerVisible: false,
   };
   const userItem = user(c, 1, '请用任务系统完成一次验证。');
   const dispatchA = workerDispatch(c, 3, 'dispatch-a', 'lane-a', 'integration-dev', '实现验证', 'completed');
@@ -116,37 +82,26 @@ function assertWorkerDispatchItemsCreateMainWorkerCard(reducer, projection, time
   orchestratorDispatchSummary.itemId = 'orchestrator-dispatch-summary';
   orchestratorDispatchSummary.visibility = {
     renderable: true,
-    threadVisible: true,
-    workerVisible: false,
   };
   const workerTool = tool(c, 5, 'worker-tool-a', 'call-worker-a', 'printf worker', 'completed', { stdout: 'worker' });
   workerTool.laneId = 'lane-a';
   workerTool.worker = { taskId: 'task-a', workerId: 'worker-a', roleId: 'integration-dev', title: 'shell_exec' };
   workerTool.visibility = {
     renderable: true,
-    threadVisible: false,
-    workerVisible: true,
-    workerTabIds: ['integration-dev'],
   };
   const failedWorkerTool = tool(c, 6, 'worker-tool-failed', 'call-worker-failed', 'git status --short', 'failed', { stderr: 'fatal: not a git repository\n', exit_code: 128 });
   failedWorkerTool.laneId = 'lane-a';
   failedWorkerTool.worker = { taskId: 'task-a', workerId: 'worker-a', roleId: 'integration-dev', title: 'shell_exec' };
   failedWorkerTool.visibility = {
     renderable: true,
-    threadVisible: false,
-    workerVisible: true,
-    workerTabIds: ['integration-dev'],
   };
   const workerAssistant = assistantText(c, 7, 'worker-assistant-a', '已完成实现验证：工具调用结果已汇总，细节保留在 worker 详情中。', 'completed');
   workerAssistant.laneId = 'lane-a';
   workerAssistant.worker = { taskId: 'task-a', workerId: 'worker-a', roleId: 'integration-dev', title: '最终回复' };
   workerAssistant.visibility = {
     renderable: true,
-    threadVisible: false,
-    workerVisible: true,
-    workerTabIds: ['integration-dev'],
   };
-  // P2：后端写入 thread-visible 的 worker_status 摘要 item，作为 dispatch 卡 liveActivity / summary 数据源。
+  // P2：后端写入 worker_status 摘要 item，作为 dispatch 卡 liveActivity / summary 数据源。
   const workerLaneSummary = item(c, 10, 'worker-lane-summary-a', 'worker_status', 'completed', {
     laneId: 'lane-a',
     title: '执行进展',
@@ -154,17 +109,12 @@ function assertWorkerDispatchItemsCreateMainWorkerCard(reducer, projection, time
     worker: { taskId: 'task-a', workerId: 'worker-a', roleId: 'integration-dev', title: '执行进展' },
     visibility: {
       renderable: true,
-      threadVisible: true,
-      workerVisible: true,
-      workerTabIds: ['integration-dev'],
     },
   });
   const orchestratorFinal = assistantText(c, 9, 'orchestrator-final', '我这轮已经处理完：交付验收通过。\n\n详细步骤和工具记录已保留在任务卡里。', 'completed');
   orchestratorFinal.worker = { taskId: 'task-root', title: '任务完成' };
   orchestratorFinal.visibility = {
     renderable: true,
-    threadVisible: true,
-    workerVisible: false,
   };
   const state = reducer.replaceCanonicalTurns(c.sessionId, [
     turn(c, 'completed', [userItem, orchestratorPhase, dispatchA, dispatchB, workerTool, failedWorkerTool, workerAssistant, orchestratorDispatchSummary, orchestratorFinal, workerLaneSummary], { completedAt: 9500, responseDurationMs: 100 }),
@@ -217,10 +167,10 @@ function assertWorkerDispatchItemsCreateMainWorkerCard(reducer, projection, time
   const dispatchBlock = workerCard.message.blocks?.find((block) => block.type === 'dispatch_group');
   assert.ok(dispatchBlock, 'worker card should render through a dispatch_group block');
   assert.deepEqual(
-    dispatchBlock.lanes?.map((lane) => ({ title: lane.title, worker: lane.worker, status: lane.status })),
+    dispatchBlock.lanes?.map((lane) => ({ title: lane.title, workerTabId: lane.jumpTarget?.workerTabId, status: lane.status })),
     [
-      { title: '实现验证', worker: 'integration-dev', status: 'completed' },
-      { title: '代码评审', worker: 'reviewer', status: 'completed' },
+      { title: '实现验证', workerTabId: 'integration-dev', status: 'completed' },
+      { title: '代码评审', workerTabId: 'reviewer', status: 'completed' },
     ],
     'worker card lanes must keep dispatch order and use worker_dispatch as lane status authority',
   );
@@ -302,19 +252,19 @@ function assertSameRoleMultipleWorkerInstancesShareTab(reducer, projection) {
   const toolA = tool(c, 4, 'tool-a', 'call-a', 'printf A', 'completed', { stdout: 'A' });
   toolA.laneId = 'lane-a';
   toolA.worker = { taskId: 'task-a', workerId: 'worker-backend-1', roleId: 'backend-dev', title: 'shell_exec' };
-  toolA.visibility = { renderable: true, threadVisible: false, workerVisible: true, workerTabIds: ['backend-dev'] };
+  toolA.visibility = { renderable: true };
   const toolB = tool(c, 5, 'tool-b', 'call-b', 'printf B', 'completed', { stdout: 'B' });
   toolB.laneId = 'lane-b';
   toolB.worker = { taskId: 'task-b', workerId: 'worker-backend-2', roleId: 'backend-dev', title: 'shell_exec' };
-  toolB.visibility = { renderable: true, threadVisible: false, workerVisible: true, workerTabIds: ['backend-dev'] };
+  toolB.visibility = { renderable: true };
   const finalA = assistantText(c, 6, 'final-a', '任务 A 已完成', 'completed');
   finalA.laneId = 'lane-a';
   finalA.worker = { taskId: 'task-a', workerId: 'worker-backend-1', roleId: 'backend-dev', title: '最终回复' };
-  finalA.visibility = { renderable: true, threadVisible: false, workerVisible: true, workerTabIds: ['backend-dev'] };
+  finalA.visibility = { renderable: true };
   const finalB = assistantText(c, 7, 'final-b', '任务 B 已完成', 'completed');
   finalB.laneId = 'lane-b';
   finalB.worker = { taskId: 'task-b', workerId: 'worker-backend-2', roleId: 'backend-dev', title: '最终回复' };
-  finalB.visibility = { renderable: true, threadVisible: false, workerVisible: true, workerTabIds: ['backend-dev'] };
+  finalB.visibility = { renderable: true };
 
   const state = reducer.replaceCanonicalTurns(c.sessionId, [
     turn(c, 'completed', [userItem, dispatchA, dispatchB, toolA, toolB, finalA, finalB], { completedAt: 9700, responseDurationMs: 100 }),
@@ -970,6 +920,11 @@ function turn(c, status, items, overrides = {}) {
 }
 
 function item(c, itemSeq, itemId, kind, status, fields = {}) {
+  const worker = fields.worker;
+  const sourceThreadId = fields.sourceThreadId
+    || (worker && typeof worker.roleId === 'string' && worker.roleId && worker.roleId !== 'orchestrator'
+      ? `thread-${worker.roleId}`
+      : `thread-${c.sessionId}`);
   return {
     sessionId: c.sessionId,
     turnId: c.turnId,
@@ -980,10 +935,9 @@ function item(c, itemSeq, itemId, kind, status, fields = {}) {
     status,
     createdAt: c.turnSeq,
     updatedAt: c.turnSeq + itemSeq,
+    sourceThreadId,
     visibility: {
       renderable: true,
-      threadVisible: true,
-      workerVisible: false,
     },
     ...fields,
   };
@@ -998,9 +952,7 @@ function phase(c, itemSeq, content, status) {
     content,
     title: '理解请求',
     visibility: {
-      renderable: true,
-      threadVisible: false,
-      workerVisible: false,
+      renderable: false,
     },
   });
 }
@@ -1018,8 +970,6 @@ function hiddenAssistantPlaceholderText(c, itemSeq, itemId, status) {
     title: '生成回复',
     visibility: {
       renderable: false,
-      threadVisible: false,
-      workerVisible: false,
     },
   });
 }
@@ -1054,9 +1004,6 @@ function workerDispatch(c, itemSeq, itemId, laneId, roleId, title, status) {
     },
     visibility: {
       renderable: true,
-      threadVisible: false,
-      workerVisible: true,
-      workerTabIds: [roleId],
     },
   });
 }

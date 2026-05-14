@@ -33,7 +33,6 @@ import { vscode } from '../lib/vscode-bridge';
 import { ensureArray } from '../lib/utils';
 
 import { deriveWorkerRuntimeMap } from '../lib/worker-panel-state';
-import { normalizeWorkerSlot } from '../lib/message-classifier';
 import {
   buildTimelinePanelMessages,
 } from '../lib/timeline-render-items';
@@ -476,10 +475,8 @@ const messageProjection = $derived.by(() => {
   }
   const workerKeys = new Set<string>();
   for (const artifact of projection.artifacts || []) {
-    for (const workerId of artifact.workerTabs || []) {
-      if (typeof workerId === 'string' && workerId.trim()) {
-        workerKeys.add(workerId.trim());
-      }
+    if (artifact.worker) {
+      workerKeys.add(artifact.worker);
     }
   }
   for (const workerId of workerKeys) {
@@ -646,18 +643,6 @@ function normalizeSessionNotificationList(raw: unknown): Notification[] {
   return normalized;
 }
 
-function normalizeWorkerTabList(workerTabs: AgentId[] | undefined): AgentId[] {
-  if (!Array.isArray(workerTabs)) return [];
-  const next = new Set<AgentId>();
-  for (const worker of workerTabs) {
-    const normalizedWorker = normalizeWorkerSlot(worker);
-    if (normalizedWorker) {
-      next.add(normalizedWorker);
-    }
-  }
-  return Array.from(next);
-}
-
 function resolveTimelineCardId(message: Message): string | undefined {
   const rawCardId = typeof message.metadata?.cardId === 'string' ? message.metadata.cardId.trim() : '';
   return rawCardId || undefined;
@@ -666,7 +651,6 @@ function resolveTimelineCardId(message: Message): string | undefined {
 function resolveTimelineWorker(message: Message): AgentId | undefined {
   const worker = resolveTimelineWorkerId(
     resolveMessageMetadataRecord(message),
-    { fallbacks: [message.source] },
   );
   return worker || undefined;
 }
@@ -736,8 +720,8 @@ function buildDynamicWorkerRenderEntries(
 ): Record<string, TimelineProjectionRenderEntry[]> {
   const workerIds = new Set<string>();
   for (const artifact of artifacts) {
-    for (const workerId of ensureArray<AgentId>(artifact.workerTabs)) {
-      workerIds.add(workerId);
+    if (artifact.worker) {
+      workerIds.add(artifact.worker);
     }
   }
   const entries: Record<string, TimelineProjectionRenderEntry[]> = {};
@@ -756,8 +740,8 @@ function buildProjectionRenderEntriesFromArtifacts(
 
   for (const artifact of artifacts) {
     const artifactVisible = displayContext === 'thread'
-      ? artifact.threadVisible
-      : Boolean(worker && artifact.workerTabs.includes(worker));
+      ? !artifact.worker
+      : Boolean(worker && artifact.worker === worker);
     if (!artifactVisible) {
       continue;
     }
@@ -830,12 +814,10 @@ function canonicalizeTimelineProjection(
         dispatchWaveId: artifact.dispatchWaveId,
         laneId: artifact.laneId,
         worker: resolveTimelineWorker(message) || artifact.worker,
-        threadVisible: artifact.threadVisible !== false,
-      workerTabs: normalizeWorkerTabList(artifact.workerTabs),
-      messageIds: Array.from(new Set([
+        messageIds: Array.from(new Set([
           artifactMessageId,
           ...ensureArray<string>(artifact.messageIds),
-      ])),
+        ])),
         message: {
           ...message,
           id: artifactMessageId,

@@ -75,9 +75,7 @@ fn test_turn_item(item_id: &str, content: &str) -> ActiveExecutionTurnItem {
         user_message_id: None,
         placeholder_message_id: None,
         timeline_entry_id: None,
-        thread_visible: true,
-        worker_visible: false,
-            source_thread_id: None,
+        source_thread_id: ThreadId::new("thread-main-default"),
     }
 }
 
@@ -764,8 +762,7 @@ fn persisted_parts_restores_canonical_turn_log_from_sidecar_current_turn() {
     worker_item.task_id = Some(task_id.clone());
     worker_item.worker_id = Some(worker_id.clone());
     worker_item.role_id = Some("integration-engineer".to_string());
-    worker_item.thread_visible = false;
-    worker_item.worker_visible = true;
+    worker_item.source_thread_id = ThreadId::new("thread-worker-sidecar-canonical-restore");
     turn.items.push(worker_item);
 
     let durable_state = SessionDurableState {
@@ -820,8 +817,8 @@ fn persisted_parts_restores_canonical_turn_log_from_sidecar_current_turn() {
         crate::models::CanonicalTurnItemStatus::Blocked
     );
     assert_eq!(
-        restored_turn.items[1].visibility.worker_tab_ids,
-        vec!["integration-engineer".to_string()]
+        restored_turn.items[1].source_thread_id,
+        ThreadId::new("thread-worker-sidecar-canonical-restore")
     );
     assert_eq!(
         restored.durable_state().canonical_turns[0].turn_id,
