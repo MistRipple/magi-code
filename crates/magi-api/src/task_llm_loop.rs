@@ -1857,49 +1857,55 @@ fn task_policy_tool_rejection(
     requested_tool_name: &str,
     arguments: &str,
 ) -> Option<String> {
-    let policy = task.policy_snapshot.as_ref()?;
+    let policy_snapshot = task.policy_snapshot.as_ref()?;
     let canonical_tool_name = canonical_builtin_tool_name(requested_tool_name)
         .unwrap_or_else(|| requested_tool_name.trim().to_string());
-    if policy.command_mode.eq_ignore_ascii_case("no_tools") {
+    // no_tools 是 PermissionEngine 三维之外的全局开关，本层先单独拦截。
+    if policy_snapshot.command_mode.eq_ignore_ascii_case("no_tools") {
         return Some(task_policy_rejection_payload(
             &canonical_tool_name,
             format!("当前任务阶段不允许调用工具: {canonical_tool_name}"),
         ));
     }
-    if policy.denied_tools.iter().any(|tool| {
-        canonical_builtin_tool_name(tool).as_deref() == Some(canonical_tool_name.as_str())
-    }) {
-        return Some(task_policy_rejection_payload(
-            &canonical_tool_name,
-            format!("任务策略已拒绝工具: {canonical_tool_name}"),
-        ));
+    // PermissionEngine 比对工具名是按字面比对，因此把 policy 中的别名先 canonical 化。
+    let mut canonical_policy = magi_permissions::PermissionPolicy::from_core_policy(policy_snapshot);
+    canonical_policy.allowed_tools = policy_snapshot
+        .allowed_tools
+        .iter()
+        .map(|tool| canonical_builtin_tool_name(tool).unwrap_or_else(|| tool.trim().to_string()))
+        .collect();
+    canonical_policy.denied_tools = policy_snapshot
+        .denied_tools
+        .iter()
+        .map(|tool| canonical_builtin_tool_name(tool).unwrap_or_else(|| tool.trim().to_string()))
+        .collect();
+
+    let engine = magi_permissions::PermissionEngine::with_builtin_defaults();
+    let is_write_tool = BuiltinToolName::from_str(canonical_tool_name.as_str())
+        .is_some_and(|tool| tool.is_write_operation());
+
+    let tool_request = magi_permissions::PermissionRequest::ToolInvocation {
+        tool_name: canonical_tool_name.as_str(),
+        is_write_tool,
+    };
+    if let magi_permissions::Decision::Deny { reason } = engine.decide(
+        &tool_request,
+        &canonical_policy,
+        magi_permissions::PermissionMode::Default,
+    ) {
+        return Some(task_policy_rejection_payload(&canonical_tool_name, reason));
     }
-    if !policy.allowed_tools.is_empty()
-        && !policy.allowed_tools.iter().any(|tool| {
-            canonical_builtin_tool_name(tool).as_deref() == Some(canonical_tool_name.as_str())
-        })
-    {
-        return Some(task_policy_rejection_payload(
-            &canonical_tool_name,
-            format!("任务策略未授权工具: {canonical_tool_name}"),
-        ));
-    }
-    if policy.command_mode.eq_ignore_ascii_case("read_only") {
-        if BuiltinToolName::from_str(canonical_tool_name.as_str())
-            .is_some_and(|tool| tool.is_write_operation())
-        {
-            return Some(task_policy_rejection_payload(
-                &canonical_tool_name,
-                format!("只读任务不允许执行写入工具: {canonical_tool_name}"),
-            ));
-        }
-        if canonical_tool_name == BuiltinToolName::ShellExec.as_str()
-            && !shell_arguments_request_read_only(arguments)
-        {
-            return Some(task_policy_rejection_payload(
-                &canonical_tool_name,
-                "只读任务中的 shell_exec 必须显式声明 access_mode=read_only".to_string(),
-            ));
+    // shell_exec 在只读任务下需要 access_mode=read_only —— 走 ShellCommand 轴判定。
+    if canonical_tool_name == BuiltinToolName::ShellExec.as_str() {
+        let shell_request = magi_permissions::PermissionRequest::ShellCommand {
+            arguments_json: arguments,
+        };
+        if let magi_permissions::Decision::Deny { reason } = engine.decide(
+            &shell_request,
+            &canonical_policy,
+            magi_permissions::PermissionMode::Default,
+        ) {
+            return Some(task_policy_rejection_payload(&canonical_tool_name, reason));
         }
     }
     None
@@ -1907,28 +1913,6 @@ fn task_policy_tool_rejection(
 
 fn canonical_builtin_tool_name(tool_name: &str) -> Option<String> {
     BuiltinToolName::from_str(tool_name.trim()).map(|tool| tool.as_str().to_string())
-}
-
-fn shell_arguments_request_read_only(arguments: &str) -> bool {
-    serde_json::from_str::<serde_json::Value>(arguments)
-        .ok()
-        .and_then(|value| {
-            value
-                .as_object()
-                .and_then(|object| {
-                    object
-                        .get("access_mode")
-                        .or_else(|| object.get("write_mode"))
-                })
-                .and_then(serde_json::Value::as_str)
-                .map(|mode| {
-                    matches!(
-                        mode.trim().to_ascii_lowercase().as_str(),
-                        "read" | "read_only" | "readonly"
-                    )
-                })
-        })
-        .unwrap_or(false)
 }
 
 fn task_policy_rejection_payload(tool_name: &str, error: String) -> String {

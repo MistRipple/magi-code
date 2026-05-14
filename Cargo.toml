@@ -21,6 +21,7 @@ members = [
   "crates/magi-usage-authority",
   "crates/magi-agent",
   "crates/magi-agent-role",
+  "crates/magi-permissions",
   "crates/magi-snapshot",
 ]
 

@@ -1,22 +1,13 @@
+use magi_permissions::PermissionEngine;
+use once_cell::sync::Lazy;
 use std::collections::{HashMap, HashSet};
 
 const FAILED_WRITE_CACHE_TTL_MS: u64 = 600_000;
 const SUCCESS_WRITE_CACHE_TTL_MS: u64 = 600_000;
 const READ_ONLY_DEDUP_TTL_MS: u64 = 600_000;
 
-fn read_only_tool_names() -> HashSet<&'static str> {
-    [
-        "file_view",
-        "code_search_regex",
-        "web_search",
-        "web_fetch",
-        "diagram_render",
-        "code_search_semantic",
-        "project_knowledge_query",
-    ]
-    .into_iter()
-    .collect()
-}
+/// 通过 PermissionEngine 的内置只读工具表共用一份判定，避免本地再维护副本。
+static PERMISSION_ENGINE: Lazy<PermissionEngine> = Lazy::new(PermissionEngine::with_builtin_defaults);
 
 fn write_dedup_tool_names() -> HashSet<&'static str> {
     [
@@ -93,7 +84,7 @@ impl WorkerDuplicateGuard {
     }
 
     pub fn is_read_only_tool(&self, name: &str) -> bool {
-        read_only_tool_names().contains(name)
+        PERMISSION_ENGINE.is_read_only_tool(name)
     }
 
     pub fn is_write_dedup_tool(&self, name: &str) -> bool {
