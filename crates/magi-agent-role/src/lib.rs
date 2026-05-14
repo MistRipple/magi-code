@@ -43,6 +43,11 @@ pub enum AgentRoleError {
 
 /// 单个 role 的定义。与 v1 `WorkerInfo` 的 prompt + supported_kinds 字段语义对齐，
 /// 同时把 `parallelism_limit` 一并外置到配置。
+///
+/// `coordinator_mode = true` 表示该角色采用 Prompt-as-Code 协调器模式：
+/// LLM 通过 `Agent` / `SendMessage` / `TaskStop` 三个内置工具发起子代理派发与
+/// 跨任务消息传递，整个 orchestration 由 prompt 驱动，而不是 Code-as-Coordinator
+/// 在外层硬编码状态机。架构详见 docs/task-system-v2/01-architecture.md L10。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentRole {
     #[serde(default)]
@@ -52,6 +57,8 @@ pub struct AgentRole {
     pub supported_kinds: Vec<TaskKindLabel>,
     #[serde(default)]
     pub parallelism_limit: Option<u32>,
+    #[serde(default)]
+    pub coordinator_mode: bool,
 }
 
 /// 用字符串标签序列化 TaskKind，便于人手写 JSON。
@@ -159,6 +166,12 @@ impl AgentRoleRegistry {
     pub fn role_ids(&self) -> Vec<String> {
         self.roles.keys().cloned().collect()
     }
+
+    /// 返回首个 `coordinator_mode = true` 的角色。多个协调器角色并存时仍然有效——
+    /// 调用方按 role_id 显式选用；本方法仅用于在没有显式选择时拿到默认协调器。
+    pub fn default_coordinator(&self) -> Option<&AgentRole> {
+        self.roles.values().find(|role| role.coordinator_mode)
+    }
 }
 
 fn user_role_dir() -> Option<PathBuf> {
@@ -264,6 +277,27 @@ mod tests {
     fn role_supports_task_kind_handles_missing_role() {
         let reg = AgentRoleRegistry::empty();
         assert!(!reg.role_supports_task_kind("missing", TaskKind::Action));
+    }
+
+    #[test]
+    fn builtin_set_contains_coordinator_with_coordinator_mode() {
+        let reg = AgentRoleRegistry::from_map(builtin_roles_map());
+        let role = reg.get("coordinator").expect("coordinator role exists");
+        assert!(role.coordinator_mode, "coordinator role must enable coordinator_mode");
+        let default = reg.default_coordinator().expect("default_coordinator resolves");
+        assert_eq!(default.id, "coordinator");
+    }
+
+    #[test]
+    fn non_coordinator_roles_have_coordinator_mode_false_by_default() {
+        let reg = AgentRoleRegistry::from_map(builtin_roles_map());
+        for id in ["architect", "integration-dev", "reviewer", "debugger"] {
+            let role = reg.get(id).expect("builtin role exists");
+            assert!(
+                !role.coordinator_mode,
+                "{id} should NOT default to coordinator_mode",
+            );
+        }
     }
 
     #[test]

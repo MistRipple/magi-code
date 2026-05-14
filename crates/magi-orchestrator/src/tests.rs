@@ -68,6 +68,7 @@ fn seed_action_tasks(
         retry_count: 0,
         repair_count: 0,
         decision_payload: None,
+        variant: magi_core::TaskVariant::default(),
         created_at: now,
         updated_at: now,
     });
@@ -95,6 +96,7 @@ fn seed_action_tasks(
             retry_count: 0,
             repair_count: 0,
             decision_payload: None,
+            variant: magi_core::TaskVariant::default(),
             created_at: now,
             updated_at: now,
         });
@@ -143,6 +145,7 @@ fn seed_task_hierarchy(
         retry_count: 0,
         repair_count: 0,
         decision_payload: None,
+        variant: magi_core::TaskVariant::default(),
         created_at: now,
         updated_at: now,
     });
@@ -174,6 +177,7 @@ fn seed_task_hierarchy(
             retry_count: 0,
             repair_count: 0,
             decision_payload: None,
+            variant: magi_core::TaskVariant::default(),
             created_at: now,
             updated_at: now,
         });

@@ -136,6 +136,7 @@ fn task_serialization_roundtrip() {
         retry_count: 0,
         repair_count: 0,
         decision_payload: None,
+        variant: TaskVariant::default(),
         created_at: UtcMillis(1000),
         updated_at: UtcMillis(2000),
     };
@@ -149,6 +150,22 @@ fn task_serialization_roundtrip() {
     assert_eq!(deserialized.dependency_ids.len(), 1);
     assert!(deserialized.policy_snapshot.is_some());
     assert!(deserialized.executor_binding.is_some());
+    assert!(deserialized.variant.is_local_agent());
+}
+
+#[test]
+fn task_variant_local_bash_serialization_roundtrip() {
+    let variant = TaskVariant::LocalBash {
+        command: "echo hi".to_string(),
+        working_dir: Some("/tmp".to_string()),
+    };
+    let json = serde_json::to_string(&variant).expect("序列化失败");
+    let parsed: TaskVariant = serde_json::from_str(&json).expect("反序列化失败");
+    assert!(parsed.is_local_bash());
+
+    let legacy = "{\"kind\":\"local_agent\"}";
+    let parsed_legacy: TaskVariant = serde_json::from_str(legacy).expect("反序列化失败");
+    assert!(parsed_legacy.is_local_agent());
 }
 
 #[test]

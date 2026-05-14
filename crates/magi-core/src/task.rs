@@ -89,6 +89,40 @@ pub struct TaskPolicy {
 }
 
 // ---------------------------------------------------------------------------
+// TaskVariant (L11 TaskPolymorphism)
+// ---------------------------------------------------------------------------
+
+/// Task System v2 L11：任务变体。
+///
+/// 设计文档 01-architecture.md §2.3 列举了 7 个变体，S7 只完整实现两个：
+/// - `LocalAgent`：本进程内启动的子 Conversation，沿用 task_llm_loop 全功能执行（默认值）。
+/// - `LocalBash`：异步 shell 任务，跳过 LLM 循环，由 dispatch_execution 直接执行 shell。
+///
+/// 其余 5 个变体（local_workflow / remote_agent / monitor_mcp / in_process_teammate /
+/// dream）在后续 slice 引入；新增枚举值时旧持久化数据自动落到 `LocalAgent`（serde 默认）。
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TaskVariant {
+    #[default]
+    LocalAgent,
+    LocalBash {
+        command: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        working_dir: Option<String>,
+    },
+}
+
+impl TaskVariant {
+    pub fn is_local_bash(&self) -> bool {
+        matches!(self, Self::LocalBash { .. })
+    }
+
+    pub fn is_local_agent(&self) -> bool {
+        matches!(self, Self::LocalAgent)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Task
 // ---------------------------------------------------------------------------
 
@@ -117,6 +151,9 @@ pub struct Task {
     pub repair_count: u32,
     /// Payload for Decision tasks (design 12).
     pub decision_payload: Option<DecisionTaskPayload>,
+    /// Task System v2 — L11：执行变体；缺省 LocalAgent，兼容旧持久化数据。
+    #[serde(default)]
+    pub variant: TaskVariant,
     pub created_at: UtcMillis,
     pub updated_at: UtcMillis,
 }

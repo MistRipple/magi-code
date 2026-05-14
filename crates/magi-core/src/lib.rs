@@ -22,6 +22,6 @@ pub use status::{
 pub use task::{
     AssignmentLease, DecisionOption, DecisionTaskPayload, ExecutorBinding, LeaseStatus,
     PolicyDispatchDecision, ProgressSummary, Task, TaskKind, TaskPolicy, TaskProjection,
-    TaskStatus, WorkPackageSummary,
+    TaskStatus, TaskVariant, WorkPackageSummary,
 };
 pub use value_objects::{AbsolutePath, UtcMillis, WorkspaceRootPath, WorktreeRootPath};

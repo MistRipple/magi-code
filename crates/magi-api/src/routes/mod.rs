@@ -1713,6 +1713,7 @@ mod tests {
                 retry_count: 0,
                 repair_count: 0,
                 decision_payload: None,
+                variant: magi_core::TaskVariant::default(),
                 created_at: accepted_at,
                 updated_at: accepted_at,
             });
@@ -1828,6 +1829,7 @@ mod tests {
                 retry_count: 0,
                 repair_count: 0,
                 decision_payload: None,
+                variant: magi_core::TaskVariant::default(),
                 created_at: accepted_at,
                 updated_at: accepted_at,
             });
@@ -2619,6 +2621,7 @@ mod tests {
                 retry_count: 0,
                 repair_count: 0,
                 decision_payload: None,
+                variant: magi_core::TaskVariant::default(),
                 created_at: accepted_at,
                 updated_at: accepted_at,
             });
@@ -2799,6 +2802,7 @@ mod tests {
             retry_count: 0,
             repair_count: 0,
             decision_payload: None,
+            variant: magi_core::TaskVariant::default(),
             created_at: accepted_at,
             updated_at: accepted_at,
         });
@@ -2825,6 +2829,7 @@ mod tests {
             retry_count: 0,
             repair_count: 0,
             decision_payload: None,
+            variant: magi_core::TaskVariant::default(),
             created_at: accepted_at,
             updated_at: accepted_at,
         });
@@ -2964,6 +2969,7 @@ mod tests {
                 retry_count: 0,
                 repair_count: 0,
                 decision_payload: None,
+                variant: magi_core::TaskVariant::default(),
                 created_at: accepted_at,
                 updated_at: accepted_at,
             });
@@ -3110,6 +3116,7 @@ mod tests {
                 retry_count: 0,
                 repair_count: 0,
                 decision_payload: None,
+                variant: magi_core::TaskVariant::default(),
                 created_at: first_accepted_at,
                 updated_at: first_accepted_at,
             });
@@ -6546,6 +6553,7 @@ mod tests {
                 retry_count: 0,
                 repair_count: 0,
                 decision_payload: None,
+                variant: magi_core::TaskVariant::default(),
                 created_at: now,
                 updated_at: now,
             });
@@ -6719,6 +6727,7 @@ mod tests {
                 retry_count: 0,
                 repair_count: 0,
                 decision_payload,
+                variant: magi_core::TaskVariant::default(),
                 created_at: now,
                 updated_at: now,
             });

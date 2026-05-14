@@ -1638,6 +1638,7 @@ mod tests {
             retry_count: 0,
             repair_count: 0,
             decision_payload: None,
+            variant: magi_core::TaskVariant::default(),
             created_at: now,
             updated_at: now,
         }

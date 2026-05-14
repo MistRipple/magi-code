@@ -261,6 +261,7 @@ mod tests {
             retry_count: 0,
             repair_count: 0,
             decision_payload: None,
+            variant: magi_core::TaskVariant::default(),
             created_at: magi_core::UtcMillis::now(),
             updated_at: magi_core::UtcMillis::now(),
         };
@@ -300,6 +301,7 @@ mod tests {
             retry_count: 0,
             repair_count: 0,
             decision_payload: None,
+            variant: magi_core::TaskVariant::default(),
             created_at: magi_core::UtcMillis::now(),
             updated_at: magi_core::UtcMillis::now(),
         };

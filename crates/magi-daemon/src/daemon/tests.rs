@@ -883,6 +883,7 @@ async fn daemon_runtime_recovery_preflight_executes_and_followup_router_dispatch
         retry_count: 0,
         repair_count: 0,
         decision_payload: None,
+        variant: magi_core::TaskVariant::default(),
         created_at: now,
         updated_at: now,
     });
@@ -909,6 +910,7 @@ async fn daemon_runtime_recovery_preflight_executes_and_followup_router_dispatch
         retry_count: 0,
         repair_count: 0,
         decision_payload: None,
+        variant: magi_core::TaskVariant::default(),
         created_at: now,
         updated_at: now,
     });
@@ -2640,6 +2642,7 @@ async fn session_continue_survives_runtime_restart_with_same_chain_and_worker_br
             retry_count: 0,
             repair_count: 0,
             decision_payload: None,
+            variant: magi_core::TaskVariant::default(),
             created_at: now,
             updated_at: now,
         });
@@ -2683,6 +2686,7 @@ async fn session_continue_survives_runtime_restart_with_same_chain_and_worker_br
         retry_count: 0,
         repair_count: 0,
         decision_payload: None,
+        variant: magi_core::TaskVariant::default(),
         created_at: now,
         updated_at: now,
     });

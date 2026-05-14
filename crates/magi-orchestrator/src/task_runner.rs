@@ -906,6 +906,7 @@ impl TaskRunner {
                                 retry_count: 0,
                                 repair_count: 0,
                                 decision_payload: None,
+                                variant: magi_core::TaskVariant::default(),
                                 created_at: UtcMillis::now(),
                                 updated_at: UtcMillis::now(),
                             };
@@ -1147,6 +1148,7 @@ impl TaskRunner {
             retry_count: 0,
             repair_count: 0,
             decision_payload: None,
+            variant: magi_core::TaskVariant::default(),
             created_at: UtcMillis::now(),
             updated_at: UtcMillis::now(),
         };
@@ -1510,6 +1512,7 @@ impl TaskRunner {
             retry_count: 0,
             repair_count: 0,
             decision_payload: Some(payload),
+            variant: magi_core::TaskVariant::default(),
             created_at: UtcMillis::now(),
             updated_at: UtcMillis::now(),
         };
@@ -1749,6 +1752,7 @@ mod tests {
             retry_count: 0,
             repair_count: 0,
             decision_payload: None,
+            variant: magi_core::TaskVariant::default(),
             created_at: UtcMillis::now(),
             updated_at: UtcMillis::now(),
         }
@@ -3620,6 +3624,7 @@ mod tests {
             retry_count: 0,
             repair_count: 1,
             decision_payload: None,
+            variant: magi_core::TaskVariant::default(),
             created_at: UtcMillis::now(),
             updated_at: UtcMillis::now(),
         };
@@ -3648,6 +3653,7 @@ mod tests {
             retry_count: 0,
             repair_count: 0,
             decision_payload: None,
+            variant: magi_core::TaskVariant::default(),
             created_at: UtcMillis::now(),
             updated_at: UtcMillis::now(),
         };
