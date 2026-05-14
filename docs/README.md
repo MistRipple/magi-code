@@ -8,8 +8,13 @@
   - 从 `/Users/xie/code/magi/docs/rust-backend-rewrite` 复制而来
   - 作为当前 Rust 后端重构、协议冻结与切换治理的本地架构基线
 
-- `task-orchestration-upgrade/`
-  - 统一 Task 编排升级指导文档集与阅读入口
+- `task-system-v2/`
+  - 任务系统 v2 设计文档（当前基线）
+  - 覆盖 A/B/C 三档任务、Runtime/Orchestration/Long-Mission 三层架构、9 Step 迁移路径
+
+- `task-orchestration-upgrade/`（已废弃）
+  - v1 Task 编排升级文档，已被 `task-system-v2/` 取代
+  - v2 落地完成后整体删除
 
 ## 当前项目状态
 

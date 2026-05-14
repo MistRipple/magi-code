@@ -1,6 +1,16 @@
-# Task Orchestration Upgrade Docs
+# Task Orchestration Upgrade Docs（已废弃）
 
 更新时间：2026-04-16
+废弃时间：2026-05-14
+取代者：[`../task-system-v2/`](../task-system-v2/)
+
+本目录承载的 Mission + Task Graph + Worker Binding 三元模型已被 v2 取代。v2 重新分层为 Runtime / Orchestration / Long-Mission 三层，支持 A/B/C 三档任务长度。
+
+**保留本目录仅供历史参考**，v2 落地完成后整体删除。新设计、新落地一律以 `task-system-v2/` 为准。
+
+---
+
+以下为原文档内容，仅供参考：
 
 本目录承载 Magi 后续统一 Task 编排升级的完整指导文档，作为后续设计、实现、迁移与评审的统一入口。
 
