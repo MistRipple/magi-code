@@ -10,12 +10,14 @@
 //!   v1 `run_task_llm_loop` 暂作"一轮 IO 引擎"被 v2 调度）
 
 mod conversation;
+mod driver;
 mod mailbox;
 mod registry;
 mod stream;
 mod turn;
 
-pub use conversation::{BeginTurnError, Conversation, TurnAdvanceError};
+pub use conversation::{AdvanceTurnError, BeginTurnError, Conversation, TurnAdvanceError};
+pub use driver::{RoundOutcome, TurnDriver};
 pub use mailbox::{MailboxItem, UserSignal};
 pub use registry::ConversationRegistry;
 pub use stream::{StreamEvent, StreamFanOut, ToolPhase};
