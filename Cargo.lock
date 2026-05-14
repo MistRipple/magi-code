@@ -957,6 +957,7 @@ dependencies = [
  "magi-session-store",
  "magi-skill-runtime",
  "magi-snapshot",
+ "magi-spawn-graph",
  "magi-tool-runtime",
  "magi-usage-authority",
  "magi-worker-runtime",
@@ -1161,6 +1162,15 @@ dependencies = [
  "tokio",
  "tracing",
  "zstd",
+]
+
+[[package]]
+name = "magi-spawn-graph"
+version = "0.1.0"
+dependencies = [
+ "magi-core",
+ "serde",
+ "thiserror",
 ]
 
 [[package]]

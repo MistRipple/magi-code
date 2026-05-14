@@ -16,6 +16,7 @@ magi-core = { path = "../magi-core" }
 magi-agent-role = { path = "../magi-agent-role" }
 magi-bridge-client = { path = "../magi-bridge-client" }
 magi-permissions = { path = "../magi-permissions" }
+magi-spawn-graph = { path = "../magi-spawn-graph" }
 magi-context-runtime = { path = "../magi-context-runtime" }
 magi-conversation-runtime = { path = "../magi-conversation-runtime" }
 magi-event-bus = { path = "../magi-event-bus" }

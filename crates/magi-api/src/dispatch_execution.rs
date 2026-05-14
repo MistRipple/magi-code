@@ -15,7 +15,9 @@ use magi_session_store::{
     ActiveExecutionTurn, ActiveExecutionTurnItem, ActiveExecutionTurnLane, ExecutionThread,
     ExecutionThreadStatus, SessionStore,
 };
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::SystemTime;
 
 #[cfg(test)]
 use crate::dto::SessionTurnRequestDto;
@@ -555,7 +557,41 @@ fn build_task_graph(
         now,
         &plan,
         &state.agent_role_registry,
+        state.spawn_graph.as_ref(),
     )
+}
+
+/// Task System v2 — L5：把刚 insert 的子任务挂到 SpawnGraph。
+/// 容错策略：图层只是父子关系镜像，不参与正确性判定；遇到 EdgeAlreadyExists（重入路径）
+/// 或 limits 超限（极端栈深），降级为 warn 日志，不阻塞 task 派发。
+fn register_spawn_edge(
+    spawn_graph: &Mutex<magi_spawn_graph::SpawnGraph>,
+    parent: TaskId,
+    child: TaskId,
+    kind: TaskKind,
+) {
+    let mut graph = match spawn_graph.lock() {
+        Ok(guard) => guard,
+        Err(err) => {
+            tracing::warn!(?err, "SpawnGraph mutex poisoned, skip register_spawn_edge");
+            return;
+        }
+    };
+    if let Err(err) = graph.add_edge(parent.clone(), child.clone(), kind, SystemTime::now()) {
+        match err {
+            magi_spawn_graph::SpawnGraphError::EdgeAlreadyExists { .. } => {
+                // 重入路径（同一 dispatch 被重放）属于幂等场景，无需提示。
+            }
+            other => {
+                tracing::warn!(
+                    parent = %parent.as_str(),
+                    child = %child.as_str(),
+                    error = %other,
+                    "SpawnGraph add_edge 失败，已忽略并继续派发"
+                );
+            }
+        }
+    }
 }
 
 fn insert_task_graph(
@@ -568,6 +604,7 @@ fn insert_task_graph(
     now: &UtcMillis,
     plan: &TaskGraphPlan,
     agent_role_registry: &magi_agent_role::AgentRoleRegistry,
+    spawn_graph: &Mutex<magi_spawn_graph::SpawnGraph>,
 ) -> Result<TaskGraphBuildResult, ApiError> {
     let task_policy = Some(build_task_policy());
     let mut total_task_count = 1usize;
@@ -594,6 +631,12 @@ fn insert_task_graph(
             None,
             task_policy.clone(),
         ));
+        register_spawn_edge(
+            spawn_graph,
+            root_task_id.clone(),
+            phase_id.clone(),
+            TaskKind::Phase,
+        );
         total_task_count += 1;
 
         let mut action_ids_by_title = std::collections::HashMap::<String, TaskId>::new();
@@ -618,6 +661,12 @@ fn insert_task_graph(
                 None,
                 task_policy.clone(),
             ));
+            register_spawn_edge(
+                spawn_graph,
+                phase_id.clone(),
+                package_id.clone(),
+                TaskKind::WorkPackage,
+            );
             total_task_count += 1;
 
             let mut current_package_action_ids = Vec::new();
@@ -686,6 +735,12 @@ fn insert_task_graph(
                     action_plan.write_scope.as_deref(),
                     task_policy.clone(),
                 ));
+                register_spawn_edge(
+                    spawn_graph,
+                    package_id.clone(),
+                    action_id.clone(),
+                    TaskKind::Action,
+                );
                 total_task_count += 1;
                 current_package_action_ids.push(action_id.clone());
                 current_package_dependency_specs
@@ -749,6 +804,12 @@ fn insert_task_graph(
             None,
             task_policy.clone(),
         ));
+        register_spawn_edge(
+            spawn_graph,
+            phase_id.clone(),
+            validation_id.clone(),
+            TaskKind::Validation,
+        );
         for action_id in &phase_action_ids {
             task_store
                 .add_dependency(&validation_id, action_id)
@@ -905,6 +966,7 @@ pub(crate) fn replan_task_graph(
         &build_seed,
         &plan,
         &state.agent_role_registry,
+        state.spawn_graph.as_ref(),
     )?;
 
     let mut cancelled_task_ids = Vec::new();

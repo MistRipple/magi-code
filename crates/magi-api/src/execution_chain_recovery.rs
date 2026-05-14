@@ -239,9 +239,12 @@ fn rebuild_dispatch_plan_for_branch(
 
 fn release_resumed_branch_path(
     task_store: &TaskStore,
+    spawn_graph: &std::sync::Mutex<magi_spawn_graph::SpawnGraph>,
     chain: &ActiveExecutionChain,
     branch: &ActiveExecutionBranch,
 ) -> Result<(), ApiError> {
+    // Task System v2 — L5：父子链查询从散落的 `task.parent_task_id` 收敛到 SpawnGraph。
+    // task 数据本身（mission/root/status）仍由 task_store 提供，避免 SpawnGraph 承担状态字段。
     let mut current_task_id = Some(branch.task_id.clone());
     while let Some(task_id) = current_task_id {
         if task_id == chain.root_task_id {
@@ -256,7 +259,14 @@ fn release_resumed_branch_path(
                 format!("branch 路径任务不属于当前执行链: {}", task_id),
             ));
         }
-        current_task_id = task.parent_task_id.clone();
+        current_task_id = {
+            let graph = spawn_graph
+                .lock()
+                .map_err(|error| {
+                    ApiError::internal_assembly("继续会话失败", format!("SpawnGraph 锁中毒: {error}"))
+                })?;
+            graph.parent_of(&task_id).cloned()
+        };
         if task.status == TaskStatus::Blocked {
             task_store
                 .update_status(&task_id, TaskStatus::Ready)
@@ -626,7 +636,7 @@ pub(crate) fn continue_execution_chain(
         }
     }
     for branch in &branches_to_resume {
-        release_resumed_branch_path(task_store, &chain, branch)?;
+        release_resumed_branch_path(task_store, state.spawn_graph.as_ref(), &chain, branch)?;
     }
 
     // 深度模式：恢复任务状态后需要重新启动后台 runner，避免退化为同步执行
