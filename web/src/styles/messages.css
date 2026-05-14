@@ -89,26 +89,10 @@
   }
 }
 
-/* ========== 占位消息 → 真实消息过渡 ========== */
-
-.message-item.assistant.was-placeholder {
-  animation: placeholderToReal 0.4s ease-out;
-}
-
-@keyframes placeholderToReal {
-  0% {
-    opacity: 0.8;
-  }
-  100% {
-    opacity: 1;
-  }
-}
-
 /* ========== 减少动画偏好 ========== */
 
 @media (prefers-reduced-motion: reduce) {
-  .message-item.user.sending .user-content,
-  .message-item.assistant.was-placeholder {
+  .message-item.user.sending .user-content {
     animation: none;
   }
 }

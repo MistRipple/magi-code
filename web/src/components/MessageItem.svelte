@@ -56,7 +56,6 @@
   // 占位消息相关派生状态
   const isPlaceholder = $derived(Boolean(message.metadata?.isPlaceholder));
   const placeholderState = $derived((message.metadata?.placeholderState || 'pending') as PlaceholderState);
-  const wasPlaceholder = $derived(Boolean(message.metadata?.wasPlaceholder));
   const sendingAnimation = $derived(Boolean(message.metadata?.sendingAnimation));
   const isSupplementary = $derived(Boolean(message.metadata?.isSupplementary));
   const queuedExtra = $derived.by(() => {
@@ -352,7 +351,6 @@
     class:plain-shell={!usesCardShell}
     class:streaming={isStreaming}
     class:placeholder={isPlaceholder}
-    class:was-placeholder={wasPlaceholder}
     class:no-visible-content={!hasVisibleContent && !isNativeSource}
     data-message-id={message.id}
     data-source={message.source}
@@ -360,26 +358,25 @@
     data-placeholder-state={isPlaceholder ? placeholderState : undefined}
     style={agentColorStyle}
   >
-    <!-- 非主角色：在内容前显示来源标识 -->
-    {#if !isNativeSource && !isPlaceholder}
+    <!-- 非主角色：来源标识固定渲染，占位/有内容共用同一节点，避免首 token 漂移 -->
+    {#if !isNativeSource}
       <div class="inline-source-tag">
         <ExecutorBadge worker={badgeWorker} label={workerBadgeLabel} size="sm" />
       </div>
     {/if}
 
     <div class="message-content">
-      {#if isPlaceholder}
-        <div class="placeholder-content">
-          {#if isStreaming && showStreamingIndicator}
-            <div class="streaming-indicator-bottom">
-              <span class="streaming-dot"></span>
-              <span class="streaming-dot"></span>
-              <span class="streaming-dot"></span>
-              <span class="streaming-elapsed-time">{formatElapsed(streamingElapsedSeconds)}</span>
-            </div>
-          {/if}
+      <!-- 顶部计时器槽位：占位与流式输出共享，永远位于消息顶部，不随首 token 漂移 -->
+      {#if isStreaming && showStreamingIndicator}
+        <div class="streaming-indicator-top">
+          <span class="streaming-dot"></span>
+          <span class="streaming-dot"></span>
+          <span class="streaming-dot"></span>
+          <span class="streaming-elapsed-time">{formatElapsed(streamingElapsedSeconds)}</span>
         </div>
-      {:else}
+      {/if}
+
+      {#if !isPlaceholder}
         {#if isInteraction && interactionMeta?.prompt}
           <div class="interaction-inline">
             <Icon name="sparkles" size={14} />
@@ -409,30 +406,17 @@
           <MarkdownContent content={message.content} {isStreaming} />
         {/if}
 
-        {#if (isStreaming && showStreamingIndicator) || showResponseDuration}
-          <div
-            class="message-runtime-footer"
-            class:streaming={isStreaming && showStreamingIndicator}
-            class:completed={showResponseDuration && !(isStreaming && showStreamingIndicator)}
-            class:has-content={hasVisibleContent}
-          >
-            {#if isStreaming && showStreamingIndicator}
-              <span class="streaming-dot"></span>
-              <span class="streaming-dot"></span>
-              <span class="streaming-dot"></span>
-              <span class="streaming-elapsed-time">{formatElapsed(streamingElapsedSeconds)}</span>
-            {:else if showResponseDuration}
-              <span class="message-runtime-text">
-                {i18n.t('messageItem.responseDurationLabel')} {formatDurationMs(responseDurationMs ?? 0)}
-              </span>
-            {/if}
+        {#if showResponseDuration}
+          <div class="message-runtime-footer completed" class:has-content={hasVisibleContent}>
+            <span class="message-runtime-text">
+              {i18n.t('messageItem.responseDurationLabel')} {formatDurationMs(responseDurationMs ?? 0)}
+            </span>
           </div>
         {/if}
 
         {#if retryRuntime}
           <RetryRuntimeIndicator runtime={retryRuntime} />
         {/if}
-
       {/if}
     </div>
   </div>
@@ -760,32 +744,19 @@
   .message-content > :global(:first-child) {
     margin-top: 0;
   }
-  /* 移除流式消息的渐变遮罩，避免干扰视觉 */
 
-  /* 占位→真实消息过渡动画 */
-  .message-item.assistant.was-placeholder {
-    animation: contentFadeIn 0.15s ease-out;
-  }
-
-  @keyframes contentFadeIn {
-    from {
-      opacity: 0.7;
-    }
-    to {
-      opacity: 1;
-    }
-  }
-
-
-
-  /* 流式消息底部加载指示器：统一的三个点动画 */
-  .streaming-indicator-bottom,
+  /* 流式消息顶部加载指示器：占位/有内容共用同一槽位，永远位于消息顶部 */
+  .streaming-indicator-top,
   .message-runtime-footer {
     display: flex;
     align-items: center;
     gap: 6px;
     padding: var(--space-2) 0;
-    margin-top: var(--space-3);
+  }
+
+  .streaming-indicator-top {
+    margin-bottom: var(--space-2);
+    padding: var(--space-1) 0;
   }
 
   .message-runtime-footer {
@@ -840,18 +811,6 @@
   /* ===== 占位消息样式：只保留裸态流式指示器，不给整条消息套卡片 ===== */
   .message-item.assistant.placeholder {
     border-left: none;
-  }
-
-  .placeholder-content {
-    display: flex;
-    align-items: center;
-    padding: var(--space-1) 0;
-  }
-
-  /* 占位消息的加载指示器：居左显示，无上边距 */
-  .placeholder-content .streaming-indicator-bottom {
-    margin-top: 0;
-    padding: var(--space-2) 0;
   }
 
   /* ===== 用户消息图片缩略图 ===== */
