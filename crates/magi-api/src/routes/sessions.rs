@@ -167,7 +167,14 @@ async fn submit_session_turn(
                         .map(|session| session.session_id)
                 })
                 .ok_or_else(|| ApiError::InvalidInput("继续会话需要明确的 session".to_string()))?;
-            let prompt_text = request.trimmed_text();
+            // S1：user 信号经 Conversation Mailbox 入栈，下游一律读 signal.* 不再读 request.*
+            let signal = super::ingest_user_input_to_conversation(
+                &state,
+                &session_id,
+                &request,
+                accepted_at,
+            );
+            let prompt_text = signal.text.clone();
             let accepted = continue_execution_chain(&state, &session_id, &[])?;
             let (_, orchestrator_thread_id) = state.session_store.ensure_session_mission(
                 &session_id,
@@ -181,9 +188,9 @@ async fn submit_session_turn(
                         accepted_at,
                         prompt_text,
                         &entry_id,
-                        request.request_id(),
-                        request.user_message_id(),
-                        request.placeholder_message_id(),
+                        signal.request_id.clone(),
+                        signal.user_message_id.clone(),
+                        signal.placeholder_message_id.clone(),
                         Some(accepted.action_task_id.clone()),
                         orchestrator_thread_id.clone(),
                     );
@@ -258,10 +265,14 @@ fn submit_supplement_context_turn(
     request: &SessionTurnRequestDto,
     accepted_at: UtcMillis,
 ) -> Result<SessionTurnResponseDto, ApiError> {
-    let message = request
-        .trimmed_text()
-        .ok_or_else(|| ApiError::InvalidInput("补充上下文消息不能为空".to_string()))?;
     let session_id = parse_session_id(request.session_id.as_deref())?;
+    // S1：user 信号经 Conversation Mailbox 入栈，下游一律读 signal.* 不再读 request.*
+    let signal =
+        super::ingest_user_input_to_conversation(state, &session_id, request, accepted_at);
+    let message = signal
+        .text
+        .clone()
+        .ok_or_else(|| ApiError::InvalidInput("补充上下文消息不能为空".to_string()))?;
     let store = state
         .task_store()
         .ok_or_else(|| ApiError::internal_assembly("supplement context", "task_store 未配置"))?;
@@ -866,9 +877,10 @@ fn submit_regular_session_turn(
     accepted_at: UtcMillis,
     decision: SessionTurnIntentDecision,
 ) -> Result<SessionTurnResponseDto, ApiError> {
-    let trimmed_text = request.trimmed_text();
-    let message = request.timeline_message(trimmed_text.as_deref());
-    let title_seed = trimmed_text.as_deref().unwrap_or("新会话");
+    let message = request.timeline_message(request.trimmed_text().as_deref());
+    let title_seed = request
+        .trimmed_text()
+        .unwrap_or_else(|| "新会话".to_string());
     let requested_workspace_path = request.requested_workspace_path();
     let requested_workspace_id = state.resolve_workspace_id_from_request(
         request
@@ -880,16 +892,19 @@ fn submit_regular_session_turn(
         &state,
         request.requested_session_id(),
         requested_workspace_id,
-        title_seed,
+        &title_seed,
         accepted_at,
     )?;
+    // S1：user 信号经 Conversation Mailbox 入栈，下游一律读 signal.* 不再读 request.*
+    let signal =
+        super::ingest_user_input_to_conversation(&state, &session_id, &request, accepted_at);
     let workspace_root_path = state
         .workspace_root_path(&workspace_id)
         .map(|path| path.display().to_string());
     let entry_id = format!("timeline-{}-{}", session_id, accepted_at.0);
-    let request_id = request.request_id();
-    let user_message_id = request.user_message_id();
-    let requested_placeholder_message_id = request.placeholder_message_id();
+    let request_id = signal.request_id.clone();
+    let user_message_id = signal.user_message_id.clone();
+    let requested_placeholder_message_id = signal.placeholder_message_id.clone();
     // P7：所有 turn item 必须携带 source_thread_id，由 ensure_session_mission 提供 orchestrator thread。
     let (_mission_id, orchestrator_thread_id) = state.session_store.ensure_session_mission(
         &session_id,

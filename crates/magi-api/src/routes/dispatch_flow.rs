@@ -4,7 +4,7 @@ use magi_session_store::ActiveExecutionTurn;
 use serde_json::json;
 
 use super::{
-    monotonic_accepted_at, new_session_id,
+    conversation_bridge::ingest_user_input_to_conversation, monotonic_accepted_at, new_session_id,
     session_scope::{resolve_session_workspace_binding, session_workspace_id},
 };
 use crate::{
@@ -75,6 +75,7 @@ fn execute_dispatch_submission(
         &mission_title,
         accepted_at,
     )?;
+    let signal = ingest_user_input_to_conversation(state, &session_id, request, accepted_at);
     let user_timeline_entry_id = format!("timeline-{}-{}", session_id, accepted_at.0);
     let action_task_title = format_action_task_title(&mission_title);
 
@@ -91,9 +92,9 @@ fn execute_dispatch_submission(
         execution_goal,
         skill_name,
         target_role,
-        request_id: request.request_id(),
-        user_message_id: request.user_message_id(),
-        placeholder_message_id: request.placeholder_message_id(),
+        request_id: signal.request_id.clone(),
+        user_message_id: signal.user_message_id.clone(),
+        placeholder_message_id: signal.placeholder_message_id.clone(),
     };
     let accepted = submit_dispatch_submission(state, dispatch)?;
     publish_session_user_message_event(

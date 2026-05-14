@@ -15,6 +15,7 @@ members = [
   "crates/magi-knowledge-store",
   "crates/magi-memory-store",
   "crates/magi-context-runtime",
+  "crates/magi-conversation-runtime",
   "crates/magi-skill-runtime",
   "crates/magi-bridge-client",
   "crates/magi-usage-authority",

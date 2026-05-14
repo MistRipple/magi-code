@@ -15,6 +15,7 @@ reqwest.workspace = true
 magi-core = { path = "../magi-core" }
 magi-bridge-client = { path = "../magi-bridge-client" }
 magi-context-runtime = { path = "../magi-context-runtime" }
+magi-conversation-runtime = { path = "../magi-conversation-runtime" }
 magi-event-bus = { path = "../magi-event-bus" }
 magi-governance = { path = "../magi-governance" }
 magi-knowledge-store = { path = "../magi-knowledge-store" }

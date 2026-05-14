@@ -933,6 +933,7 @@ dependencies = [
  "futures-util",
  "magi-bridge-client",
  "magi-context-runtime",
+ "magi-conversation-runtime",
  "magi-core",
  "magi-event-bus",
  "magi-governance",
@@ -977,6 +978,14 @@ dependencies = [
  "magi-session-store",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "magi-conversation-runtime"
+version = "0.1.0"
+dependencies = [
+ "magi-core",
+ "serde",
 ]
 
 [[package]]

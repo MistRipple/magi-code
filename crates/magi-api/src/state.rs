@@ -18,6 +18,7 @@ use magi_bridge_client::{
     BridgeServerKind, BridgeTransport, JsonRpcBridgeServerProbeClient, McpServerConfig,
     ModelBridgeClient, StdioMcpBridgeClient,
 };
+use magi_conversation_runtime::ConversationRegistry;
 use magi_core::{SessionId, SessionLifecycleStatus, TaskId, TaskStatus, UtcMillis, WorkspaceId};
 use magi_event_bus::InMemoryEventBus;
 use magi_governance::GovernanceService;
@@ -606,6 +607,7 @@ pub struct ApiState {
     pub skill_runtime: Option<Arc<magi_skill_runtime::SkillRuntime>>,
     pub tunnel_manager: crate::tunnel::TunnelManager,
     pub snapshot_manager: Arc<SnapshotManager>,
+    pub conversation_registry: Arc<ConversationRegistry>,
 }
 
 #[derive(Clone, Debug)]
@@ -718,6 +720,7 @@ impl ApiState {
             skill_runtime: None,
             tunnel_manager: crate::tunnel::TunnelManager::new(38123),
             snapshot_manager: Arc::new(SnapshotManager::new()),
+            conversation_registry: Arc::new(ConversationRegistry::new()),
         }
     }
 

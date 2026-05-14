@@ -1,4 +1,5 @@
 mod changes_files_tunnel;
+mod conversation_bridge;
 mod dispatch_flow;
 mod knowledge;
 mod mcp_skills_repos;
@@ -46,6 +47,7 @@ use crate::{
     state::ApiState,
 };
 
+use conversation_bridge::ingest_user_input_to_conversation;
 use dispatch_flow::{
     accept_session_task_submission, append_dispatch_assistant_message,
     finalize_session_task_dispatch, resolve_dispatch_session,
