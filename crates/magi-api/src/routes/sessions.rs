@@ -1057,7 +1057,10 @@ fn spawn_regular_session_turn_execution(
             }
         };
 
-        match dispatcher.execute_session_turn(execution_request) {
+        super::begin_session_turn(&state, &session_id);
+        let outcome = dispatcher.execute_session_turn(execution_request);
+        super::finalize_session_turn(&state, &session_id, outcome.is_ok());
+        match outcome {
             Ok(output) => {
                 if let Err(error) = state.persist_session_durable_state() {
                     tracing::error!(

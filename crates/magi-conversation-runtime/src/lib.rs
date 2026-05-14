@@ -1,15 +1,20 @@
-//! Task System v2 - Conversation Runtime（Slice S1 起手）
+//! Task System v2 - Conversation Runtime
 //!
 //! 提供 Mailbox 作为 user 信号进入任务系统的**单一通道**，
-//! 以及 Conversation 骨架将 SessionId 与其 Mailbox 绑定。
+//! Conversation 绑定 SessionId、Mailbox 与当前 Turn 槽位，
+//! Turn 状态机刻画"一轮 user → assistant"的推进契约。
 //!
-//! S1 仅覆盖"user 信号入栈姿势"。Turn 状态机、模型 IO、工具 IO
-//! 等下游执行仍由 v1 task_llm_loop / dispatcher 承担，由 S2 起后续 slice 替换。
+//! 已交付 slice：
+//! - S1：Mailbox + Conversation 骨架（user 信号入栈姿势）
+//! - S2：Turn 状态机 + 单 Conversation 不并发不变式（v2 拥有 Turn lifecycle，
+//!   v1 `run_task_llm_loop` 暂作"一轮 IO 引擎"被 v2 调度）
 
 mod conversation;
 mod mailbox;
 mod registry;
+mod turn;
 
-pub use conversation::Conversation;
+pub use conversation::{BeginTurnError, Conversation, TurnAdvanceError};
 pub use mailbox::{MailboxItem, UserSignal};
 pub use registry::ConversationRegistry;
+pub use turn::{Turn, TurnState, TurnTransitionError};

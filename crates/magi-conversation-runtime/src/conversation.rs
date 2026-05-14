@@ -1,27 +1,44 @@
 use magi_core::SessionId;
 
 use crate::mailbox::{Mailbox, MailboxItem, UserSignal};
+use crate::turn::{Turn, TurnState, TurnTransitionError};
 
-/// 一个 Conversation 绑定一个 SessionId 与其 Mailbox。
+/// 一个 Conversation 绑定一个 SessionId 与其 Mailbox + 当前 Turn 槽位。
 ///
-/// S1 中 Conversation 是骨架——仅承载"信号入栈通道"，不持有 Turn 状态、不持有
-/// 模型 client、不直接 spawn 执行。下游执行仍由 routes 层调用 v1 dispatcher 完成。
-///
-/// 后续 slice：
-/// - S2 引入 Turn 状态机与 advance_turn 主循环
-/// - S3 接管模型 token / 工具事件流的派生订阅
-/// - S6 引入 SpawnGraph 父子 Conversation 关系
+/// S2 起 Conversation 持有"当前 Turn"槽位，并强制"同 Conversation 不并发"：
+/// 在已有未终态 Turn 时 `begin_turn` 会返回错误。
 #[derive(Debug)]
 pub struct Conversation {
     session_id: SessionId,
     mailbox: Mailbox,
+    /// 当前 Turn 槽位。终态后归 None。S2 范围内仅 v2 advance_turn 入口写。
+    current_turn: Option<Turn>,
 }
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum BeginTurnError {
+    /// 已存在未结束的 Turn——违反"单 Conversation 不并发 Turn"不变式。
+    TurnAlreadyActive(TurnState),
+}
+
+impl std::fmt::Display for BeginTurnError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TurnAlreadyActive(state) => {
+                write!(f, "conversation already has an active turn in state {state}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for BeginTurnError {}
 
 impl Conversation {
     pub fn new(session_id: SessionId) -> Self {
         Self {
             session_id,
             mailbox: Mailbox::new(),
+            current_turn: None,
         }
     }
 
@@ -39,7 +56,71 @@ impl Conversation {
     pub fn drain_user_signals(&mut self) -> Vec<UserSignal> {
         self.mailbox.drain_user_signals()
     }
+
+    /// 开启一个新的 Turn——违反"同 Conversation 不并发"不变式时返回错误。
+    pub fn begin_turn(&mut self) -> Result<(), BeginTurnError> {
+        if let Some(turn) = &self.current_turn {
+            if !turn.is_terminal() {
+                return Err(BeginTurnError::TurnAlreadyActive(turn.state()));
+            }
+        }
+        self.current_turn = Some(Turn::new());
+        Ok(())
+    }
+
+    pub fn current_turn_state(&self) -> Option<TurnState> {
+        self.current_turn.as_ref().map(Turn::state)
+    }
+
+    /// 改变当前 Turn 状态——必须在 `begin_turn` 之后。S2 范围内仅由 v1 adapter
+    /// 在每个状态切点上回调。
+    pub fn advance_current_turn<F>(&mut self, op: F) -> Result<(), TurnAdvanceError>
+    where
+        F: FnOnce(&mut Turn) -> Result<(), TurnTransitionError>,
+    {
+        let turn = self
+            .current_turn
+            .as_mut()
+            .ok_or(TurnAdvanceError::NoActiveTurn)?;
+        op(turn).map_err(TurnAdvanceError::Transition)
+    }
+
+    /// 终结当前 Turn——回收槽位让下一轮可以开始。要求 Turn 已在终态。
+    pub fn end_turn(&mut self) -> Result<TurnState, TurnAdvanceError> {
+        let turn = self
+            .current_turn
+            .take()
+            .ok_or(TurnAdvanceError::NoActiveTurn)?;
+        if !turn.is_terminal() {
+            // 回填以保留状态，避免悄悄丢失活跃 Turn
+            let state = turn.state();
+            self.current_turn = Some(turn);
+            return Err(TurnAdvanceError::TurnNotTerminal(state));
+        }
+        Ok(turn.state())
+    }
 }
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum TurnAdvanceError {
+    NoActiveTurn,
+    TurnNotTerminal(TurnState),
+    Transition(TurnTransitionError),
+}
+
+impl std::fmt::Display for TurnAdvanceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoActiveTurn => f.write_str("no active turn"),
+            Self::TurnNotTerminal(state) => {
+                write!(f, "cannot end turn in non-terminal state {state}")
+            }
+            Self::Transition(err) => err.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for TurnAdvanceError {}
 
 #[cfg(test)]
 mod tests {
@@ -77,5 +158,46 @@ mod tests {
         assert_eq!(first.len(), 1);
         let second = conv.drain_user_signals();
         assert!(second.is_empty());
+    }
+
+    #[test]
+    fn begin_turn_then_end_turn_releases_slot() {
+        let mut conv = Conversation::new(SessionId::new("s"));
+        conv.begin_turn().unwrap();
+        conv.advance_current_turn(|turn| turn.enter_modeling())
+            .unwrap();
+        conv.advance_current_turn(|turn| turn.finish_done()).unwrap();
+        assert_eq!(conv.end_turn().unwrap(), TurnState::Done);
+        // 下一轮可以正常开始
+        conv.begin_turn().unwrap();
+    }
+
+    #[test]
+    fn begin_turn_rejects_when_already_active() {
+        let mut conv = Conversation::new(SessionId::new("s"));
+        conv.begin_turn().unwrap();
+        let err = conv.begin_turn().unwrap_err();
+        assert_eq!(err, BeginTurnError::TurnAlreadyActive(TurnState::Pending));
+    }
+
+    #[test]
+    fn end_turn_rejects_when_non_terminal() {
+        let mut conv = Conversation::new(SessionId::new("s"));
+        conv.begin_turn().unwrap();
+        conv.advance_current_turn(|turn| turn.enter_modeling())
+            .unwrap();
+        let err = conv.end_turn().unwrap_err();
+        assert_eq!(err, TurnAdvanceError::TurnNotTerminal(TurnState::Modeling));
+        // 槽位仍占着
+        assert_eq!(conv.current_turn_state(), Some(TurnState::Modeling));
+    }
+
+    #[test]
+    fn advance_without_begin_errors() {
+        let mut conv = Conversation::new(SessionId::new("s"));
+        let err = conv
+            .advance_current_turn(|turn| turn.enter_modeling())
+            .unwrap_err();
+        assert_eq!(err, TurnAdvanceError::NoActiveTurn);
     }
 }

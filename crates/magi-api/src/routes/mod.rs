@@ -47,7 +47,9 @@ use crate::{
     state::ApiState,
 };
 
-use conversation_bridge::ingest_user_input_to_conversation;
+use conversation_bridge::{
+    begin_session_turn, finalize_session_turn, ingest_user_input_to_conversation,
+};
 use dispatch_flow::{
     accept_session_task_submission, append_dispatch_assistant_message,
     finalize_session_task_dispatch, resolve_dispatch_session,
