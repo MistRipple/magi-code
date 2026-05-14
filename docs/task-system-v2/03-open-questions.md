@@ -3,7 +3,7 @@
 更新时间：2026-05-14
 状态：设计稿
 
-本文档记录 v2 设计中**尚未确定**的部分，以及落地过程中需要持续监控的风险。每项都标注了"延后决策"还是"必须 Step X 前定"。
+本文档记录 v2 设计中**尚未确定**的部分，以及落地过程中需要持续监控的风险。每项都标注了"延后决策"还是"必须 Slice X 前定"——Slice 编号见 `02-migration-plan.md::Slice 候选清单`。
 
 ## 1. 模型作为 Coordinator 是一次押注
 
@@ -17,7 +17,7 @@
 - 是否在 Coordinator Conversation 中**强制锁定模型版本**（不允许该 Conversation 中途换模型）
 - 弱模型 fallback 时是否**自动降级到非 Coordinator 模式**
 
-**决策时点**：Step 5 上线前。
+**决策时点**：S7（CoordinatorPrompt + Task trait）落地前。
 
 ## 2. Mailbox 没有 pull 机制
 
@@ -32,7 +32,7 @@
 
 **当前倾向**：A + C 组合。但保留 B 的可能性。
 
-**决策时点**：Step 5 上线后观察实际行为，最晚 Step 9 前定。
+**决策时点**：S7 落地后观察实际行为，最晚 S11~S15（Tier 4 第一波）前定。
 
 ## 3. KnowledgeGraph 查询接口未定
 
@@ -49,7 +49,7 @@
 - 先做结构化（symbol_map、decision_log、risk_register 都是表）
 - 向量索引作为可选 Layer，trait 化，先内置 BM25，后插 faiss/qdrant
 
-**决策时点**：Step 9。
+**决策时点**：S11~S15（Tier 4 第一波）落地前。
 
 ## 4. ValidationRunner 的增量 vs 全量
 
@@ -62,7 +62,7 @@
 
 **当前倾向**：C。
 
-**决策时点**：Step 9。
+**决策时点**：S11~S15（Tier 4 第一波）落地前。
 
 ## 5. 并发未明确
 
@@ -77,7 +77,7 @@
 
 **未决**：上述三问。
 
-**决策时点**：Step 8。
+**决策时点**：S7（CoordinatorPrompt）落地后、S11~S15 前。
 
 ## 6. 编排失败的 fallback 未定
 
@@ -90,7 +90,7 @@
 
 **当前倾向**：A + B，不做 C。
 
-**决策时点**：Step 9。
+**决策时点**：S11~S15（Tier 4 第一波）落地前。
 
 ## 7. Multi-Mission 隔离
 
@@ -105,7 +105,7 @@
 - ProjectMemory（L14）跨 Mission 共享还是隔离？
 - Permission 是 magi 全局还是 Mission 范围？
 
-**决策时点**：Step 8。
+**决策时点**：S7（CoordinatorPrompt）落地后、S11~S15 前。
 
 ## 8. HumanCheckpoint UI 形态
 
@@ -116,7 +116,7 @@
 - 是否支持远程批准（移动设备）？
 - "暂停"和"等待用户"在 UI 上的视觉区别？
 
-**决策时点**：Step 9 + 前端配套设计。
+**决策时点**：S16~S17（Checkpoint/HumanCheckpoint）落地前 + 前端配套设计。
 
 ## 9. Checkpoint diff/merge 语义
 
@@ -131,7 +131,7 @@
 
 **当前倾向**：A 先上线，B/C 看用户反馈再加。
 
-**决策时点**：Step 9 之后的迭代。
+**决策时点**：S16~S17 落地之后的迭代。
 
 ## 10. 模型成本预算
 
@@ -142,7 +142,7 @@
 - 超预算行为：暂停 / 降级 / 通知用户？
 - 子代理 token 是否纳入 parent 预算？
 
-**决策时点**：Step 8。
+**决策时点**：S7（CoordinatorPrompt）落地后、S11~S15 前。
 
 ## 风险总结
 
@@ -160,7 +160,8 @@
 
 ## 决策时点汇总
 
-- **Step 5 前需定**：模型版本锁定（#1）
-- **Step 8 前需定**：并发上限（#5）、Multi-Mission 隔离（#7）、Token 预算（#10）
-- **Step 9 前需定**：KG 查询接口（#3）、Validation 策略（#4）、编排 fallback（#6）、Checkpoint diff（#9）
-- **Step 9 后迭代**：Mailbox pull（#2）、HumanCheckpoint UI 细节（#8）
+- **S7（CoordinatorPrompt）前需定**：模型版本锁定（#1）
+- **S7 后、S11~S15 前需定**：并发上限（#5）、Multi-Mission 隔离（#7）、Token 预算（#10）
+- **S11~S15（Tier 4 第一波）前需定**：KG 查询接口（#3）、Validation 策略（#4）、编排 fallback（#6）
+- **S16~S17（Checkpoint）前需定**：Checkpoint diff（#9）、HumanCheckpoint UI 形态（#8）
+- **整体落地后迭代**：Mailbox pull（#2）

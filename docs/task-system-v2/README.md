@@ -21,7 +21,7 @@ v2 不是 v1 的增量补丁，是把任务系统重新分层：
 ## 阅读顺序
 
 1. [`01-architecture.md`](./01-architecture.md) — 整体架构、4 Tier × 21 Layer、任务分档、核心模型 ER 与关键时序
-2. [`02-migration-plan.md`](./02-migration-plan.md) — **单次彻底切换**路径（分支隔离 + Cutover Day），不留新旧双轨
+2. [`02-migration-plan.md`](./02-migration-plan.md) — **主干 Slice 热换**路径（每 commit 单实现，18 个 slice 顺序落地）
 3. [`03-open-questions.md`](./03-open-questions.md) — 未决问题与风险评估
 
 ## 与现有文档关系
@@ -39,4 +39,4 @@ v2 不是 v1 的增量补丁，是把任务系统重新分层：
 - **运行时输入通道一等公民**：Mailbox 是 v2 与 v1 最大的结构差异，所有外部信号（用户输入、子代理结果、决策回执、引导）统一从 Mailbox 入栈
 - **协调由 Prompt 完成，不由代码**：claude-code 的 Coordinator 不是一个特殊模式，而是给主代理喂一份特定 system prompt，所有协调动作转化为常规工具调用
 - **C 档不污染 A 档**：Charter / Plan / Workspace / KG 仅在 C 档激活，A 档代码路径里看不见它们
-- **单次彻底切换，不留双轨**：v2 在隔离分支上完整开发，Cutover Day 一次性合并 + 整批删除老代码。主干永远是单实现：切换前 100% v1、切换后 100% v2，中间没有混合状态
+- **主干 Slice 热换，每 commit 单实现**：v2 不开长分支，按 slice 在 main 上推进。每个 commit = 同时写新 v2 实现 + 删除被换 v1 + 切换调用点。主干上**每个 commit 落地后**，被该 slice 覆盖的职责只有 v2 一份实现，绝不允许 v1+v2 并存的中间态
