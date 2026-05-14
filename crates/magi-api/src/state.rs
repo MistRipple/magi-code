@@ -1445,30 +1445,15 @@ fn normalize_user_rules_config_value(mut value: serde_json::Value) -> serde_json
 }
 
 fn builtin_safeguard_rules() -> Vec<serde_json::Value> {
-    let rules: &[(&str, &str)] = &[
-        ("git push --force", "git_history"),
-        ("git push -f", "git_history"),
-        ("git rebase", "git_history"),
-        ("git reset --hard", "git_history"),
-        ("git commit --amend", "git_history"),
-        ("git checkout --", "git_discard"),
-        ("git restore", "git_discard"),
-        ("git clean", "git_discard"),
-        ("git stash drop", "git_discard"),
-        ("npm publish", "package_publish"),
-        ("cargo publish", "package_publish"),
-        ("yarn publish", "package_publish"),
-        ("pip upload", "package_publish"),
-        ("rm -rf", "bulk_delete"),
-        ("rimraf", "bulk_delete"),
-    ];
-    rules
-        .iter()
-        .map(|(pattern, category)| {
+    // 单一事实源：magi-safety-gate::builtin_rules() 持有内置危险模式集合。
+    // 这里只做"规则结构 → settings JSON 形态"的转换，便于前端读取与编辑。
+    magi_safety_gate::builtin_rules()
+        .into_iter()
+        .map(|rule| {
             serde_json::json!({
-                "pattern": pattern,
-                "enabled": true,
-                "category": category,
+                "pattern": rule.pattern,
+                "enabled": rule.enabled,
+                "category": rule.category.as_str(),
             })
         })
         .collect()

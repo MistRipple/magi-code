@@ -954,6 +954,7 @@ dependencies = [
  "magi-memory-store",
  "magi-orchestrator",
  "magi-permissions",
+ "magi-safety-gate",
  "magi-session-store",
  "magi-skill-runtime",
  "magi-snapshot",
@@ -1124,6 +1125,14 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+]
+
+[[package]]
+name = "magi-safety-gate"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

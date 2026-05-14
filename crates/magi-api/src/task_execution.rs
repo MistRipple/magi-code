@@ -1493,35 +1493,43 @@ impl LlmTaskDispatcher {
     }
 
     fn resolve_safeguard_prompt(&self) -> Option<String> {
-        let store = self.settings_store.as_ref()?;
-        let raw = store.get_section("safeguardConfig");
-        let rules = raw
-            .get("rules")
-            .and_then(|value| value.as_array())
-            .cloned()
-            .unwrap_or_default();
-        let patterns = rules
+        // S8：单一事实源 —— 危险模式集合从 SafetyGate 派生，确保 prompt 文案与
+        // 运行期 enforcement 共用同一份规则。
+        let gate = self.build_safety_gate()?;
+        let patterns = gate
+            .rules()
             .iter()
-            .filter(|rule| {
-                rule.get("enabled")
-                    .and_then(|value| value.as_bool())
-                    .unwrap_or(true)
-            })
-            .filter_map(|rule| rule.get("pattern").and_then(|value| value.as_str()))
-            .map(str::trim)
+            .filter(|rule| rule.enabled)
+            .map(|rule| rule.pattern.trim())
             .filter(|pattern| !pattern.is_empty())
             .collect::<Vec<_>>();
         if patterns.is_empty() {
             return None;
         }
         Some(format!(
-            "执行 shell / git / 文件写操作前，如果命中以下危险模式，必须先向用户确认，不得直接执行：\n{}",
+            "执行 shell / git / 文件写操作前，如果命中以下危险模式，必须先向用户确认，不得直接执行（违规调用会被 SafetyGate 在运行期直接拦截）：\n{}",
             patterns
                 .iter()
                 .map(|pattern| format!("- {}", pattern))
                 .collect::<Vec<_>>()
                 .join("\n")
         ))
+    }
+
+    /// S8：依据当前 settings 快照构造 SafetyGate。
+    /// 调用者每次进入 LLM 轮次循环前都构造一次；引擎本身无状态，可在该轮次内共享。
+    pub(crate) fn build_safety_gate(&self) -> Option<magi_safety_gate::SafetyGate> {
+        let store = self.settings_store.as_ref()?;
+        let raw = store.get_section("safeguardConfig");
+        let rules = raw
+            .get("rules")
+            .map(magi_safety_gate::rules_from_settings_value)
+            .unwrap_or_default();
+        if rules.is_empty() {
+            None
+        } else {
+            Some(magi_safety_gate::SafetyGate::new(rules))
+        }
     }
 
     fn resolve_model_client(&self) -> Option<Arc<dyn ModelBridgeClient>> {
@@ -1661,6 +1669,7 @@ impl LlmTaskDispatcher {
             .agent_role_registry
             .as_ref()
             .expect("LlmTaskDispatcher 缺少 AgentRoleRegistry，无法解析 task→role");
+        let safety_gate = self.build_safety_gate();
         crate::task_llm_loop::run_task_llm_loop(crate::task_llm_loop::TaskLlmLoopRequest {
             client: client.as_ref(),
             event_bus: self.event_bus.as_ref(),
@@ -1673,6 +1682,7 @@ impl LlmTaskDispatcher {
             stream_fanout: stream_fanout.as_ref(),
             agent_role_registry: agent_role_registry.as_ref(),
             spawn_graph: self.spawn_graph.as_ref(),
+            safety_gate: safety_gate.as_ref(),
             task,
             task_id,
             lease_id,

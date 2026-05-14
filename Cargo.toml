@@ -22,6 +22,7 @@ members = [
   "crates/magi-agent",
   "crates/magi-agent-role",
   "crates/magi-permissions",
+  "crates/magi-safety-gate",
   "crates/magi-spawn-graph",
   "crates/magi-snapshot",
 ]

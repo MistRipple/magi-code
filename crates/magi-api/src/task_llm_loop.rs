@@ -68,6 +68,10 @@ pub(crate) struct TaskLlmLoopRequest<'a> {
     /// Task System v2 — L5：父子任务拓扑图。S7 协调工具（agent_spawn / task_stop）
     /// 在 execute_task_tool_call 中拦截时操作此结构。
     pub spawn_graph: &'a std::sync::Mutex<magi_spawn_graph::SpawnGraph>,
+    /// Task System v2 — L12：本次轮次的 SafetyGate 快照。`None` 表示当前没有
+    /// 启用任何危险模式规则（既无内置也无用户自定义），此时拦截器走 pass-through。
+    /// 在 execute_task_tool_call 中工具调用执行前做语义判定。
+    pub safety_gate: Option<&'a magi_safety_gate::SafetyGate>,
     pub task: &'a magi_core::Task,
     pub task_id: &'a TaskId,
     pub lease_id: &'a LeaseId,
@@ -387,6 +391,7 @@ fn run_task_llm_loop_inner(
         stream_fanout,
         agent_role_registry,
         spawn_graph,
+        safety_gate,
         task,
         task_id,
         lease_id,
@@ -733,6 +738,7 @@ fn run_task_llm_loop_inner(
             skill_runtime,
             task_store,
             spawn_graph,
+            safety_gate,
             task,
             session_id,
             workspace_id,
@@ -1676,6 +1682,7 @@ fn execute_task_tool_call_batch(
     skill_runtime: Option<&magi_skill_runtime::SkillRuntime>,
     task_store: &TaskStore,
     spawn_graph: &std::sync::Mutex<magi_spawn_graph::SpawnGraph>,
+    safety_gate: Option<&magi_safety_gate::SafetyGate>,
     task: &magi_core::Task,
     session_id: &SessionId,
     workspace_id: &Option<WorkspaceId>,
@@ -1709,6 +1716,7 @@ fn execute_task_tool_call_batch(
                         skill_runtime,
                         task_store,
                         spawn_graph,
+                        safety_gate,
                         task,
                         session_id,
                         workspace_id,
@@ -1735,6 +1743,7 @@ fn execute_task_tool_call_batch(
                                         skill_runtime,
                                         task_store,
                                         spawn_graph,
+                                        safety_gate,
                                         task,
                                         session_id,
                                         workspace_id,
@@ -2078,6 +2087,7 @@ fn execute_task_tool_call(
     skill_runtime: Option<&magi_skill_runtime::SkillRuntime>,
     task_store: &TaskStore,
     spawn_graph: &std::sync::Mutex<magi_spawn_graph::SpawnGraph>,
+    safety_gate: Option<&magi_safety_gate::SafetyGate>,
     task: &magi_core::Task,
     session_id: &SessionId,
     workspace_id: &Option<WorkspaceId>,
@@ -2153,6 +2163,16 @@ fn execute_task_tool_call(
         &tool_call.function.arguments,
     ) {
         return (rejection, ExecutionResultStatus::Rejected);
+    }
+
+    // S8：SafetyGate 语义判定。Permission 通过后仍可能命中"高危子串"（如
+    // `git push --force` / `rm -rf`），此处对 arguments 内容直接做匹配。
+    if let Some(gate) = safety_gate {
+        if let Some(rejection) =
+            safety_gate_rejection(gate, &tool_call.function.name, &tool_call.function.arguments)
+        {
+            return (rejection, ExecutionResultStatus::Rejected);
+        }
     }
 
     let output = registry.execute_with_policy(
@@ -2247,6 +2267,39 @@ fn task_policy_rejection_payload(tool_name: &str, error: String) -> String {
         "error": error,
     })
     .to_string()
+}
+
+/// S8：把 SafetyGate 的 Block / RequireApproval 判定折叠成"Rejected payload"。
+/// 当前 task_llm_loop 没有交互审批通道（governance 走自己的回路），所以
+/// RequireApproval 在本层暂时与 Block 同语义——拒绝执行并把原因回灌给模型，
+/// 由模型决定是否换更精确的命令或转向人审通道。
+fn safety_gate_rejection(
+    gate: &magi_safety_gate::SafetyGate,
+    tool_name: &str,
+    arguments: &str,
+) -> Option<String> {
+    let canonical_tool_name = canonical_builtin_tool_name(tool_name)
+        .unwrap_or_else(|| tool_name.trim().to_string());
+    match gate.evaluate(&canonical_tool_name, arguments) {
+        magi_safety_gate::SafetyDecision::Allow => None,
+        magi_safety_gate::SafetyDecision::Block {
+            category, pattern, reason,
+        }
+        | magi_safety_gate::SafetyDecision::RequireApproval {
+            category, pattern, reason,
+        } => Some(
+            serde_json::json!({
+                "tool": canonical_tool_name,
+                "status": "rejected",
+                "error": reason,
+                "safety_gate": {
+                    "category": category.as_str(),
+                    "pattern": pattern,
+                },
+            })
+            .to_string(),
+        ),
+    }
 }
 
 fn tool_call_record(tool_call: &ChatToolCall, result: &str) -> serde_json::Value {
@@ -2632,6 +2685,7 @@ mod tests {
             None,
             &task_store,
             &spawn_graph,
+            None,
             &task,
             &session_id,
             &workspace_id,
@@ -2697,6 +2751,7 @@ mod tests {
             None,
             &task_store,
             &spawn_graph,
+            None,
             &task,
             &SessionId::new("session-readonly-write-policy"),
             &Some(WorkspaceId::new("workspace-readonly-write-policy")),
@@ -2752,6 +2807,7 @@ mod tests {
             None,
             &task_store,
             &spawn_graph,
+            None,
             &task,
             &SessionId::new("session-readonly-shell-policy"),
             &Some(WorkspaceId::new("workspace-readonly-shell-policy")),
@@ -2805,6 +2861,7 @@ mod tests {
             None,
             &task_store,
             &spawn_graph,
+            None,
             &task,
             &SessionId::new("session-no-tool-policy"),
             &Some(WorkspaceId::new("workspace-no-tool-policy")),
@@ -2815,6 +2872,92 @@ mod tests {
 
         assert_eq!(status, ExecutionResultStatus::Rejected);
         assert!(payload.contains("不允许调用工具"));
+    }
+
+    #[test]
+    fn execute_task_tool_call_blocks_shell_force_push_via_safety_gate() {
+        // S8：即使 PermissionEngine 放行了 shell_exec（policy 没显式拒绝），
+        // SafetyGate 仍要拦截 `git push --force` 这类高危子串。
+        let tool_registry = ToolRegistry::new(
+            Arc::new(GovernanceService::default()),
+            Arc::new(InMemoryEventBus::new(8)),
+        );
+        let event_bus = InMemoryEventBus::new(8);
+        let task_store = TaskStore::new();
+        let spawn_graph = std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new());
+        let gate = magi_safety_gate::SafetyGate::with_builtin_defaults();
+        let task = make_task_loop_test_task("task-safety-gate-force-push");
+        let call = ChatToolCall {
+            id: "tool-call-safety-gate-force-push".to_string(),
+            kind: "function".to_string(),
+            function: ChatToolFunction {
+                name: "shell_exec".to_string(),
+                arguments: serde_json::json!({ "command": "git push --force origin main" })
+                    .to_string(),
+            },
+        };
+
+        let (payload, status) = execute_task_tool_call(
+            &event_bus,
+            Some(&tool_registry),
+            None,
+            &task_store,
+            &spawn_graph,
+            Some(&gate),
+            &task,
+            &SessionId::new("session-safety-gate"),
+            &Some(WorkspaceId::new("workspace-safety-gate")),
+            None,
+            Some(&WorkerId::new("worker-safety-gate")),
+            &call,
+        );
+
+        assert_eq!(status, ExecutionResultStatus::Rejected);
+        let parsed: serde_json::Value = serde_json::from_str(&payload).expect("payload json");
+        assert_eq!(parsed["tool"], "shell_exec");
+        assert_eq!(parsed["status"], "rejected");
+        assert_eq!(parsed["safety_gate"]["category"], "git_history");
+        assert_eq!(parsed["safety_gate"]["pattern"], "git push --force");
+    }
+
+    #[test]
+    fn execute_task_tool_call_passes_safe_shell_when_gate_present() {
+        // SafetyGate 仅拦截命中的高危子串，普通 shell 命令应顺利通过。
+        let tool_registry = ToolRegistry::new(
+            Arc::new(GovernanceService::default()),
+            Arc::new(InMemoryEventBus::new(8)),
+        );
+        let event_bus = InMemoryEventBus::new(8);
+        let task_store = TaskStore::new();
+        let spawn_graph = std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new());
+        let gate = magi_safety_gate::SafetyGate::with_builtin_defaults();
+        let task = make_task_loop_test_task("task-safety-gate-safe-shell");
+        let call = ChatToolCall {
+            id: "tool-call-safety-gate-safe-shell".to_string(),
+            kind: "function".to_string(),
+            function: ChatToolFunction {
+                name: "shell_exec".to_string(),
+                arguments: serde_json::json!({ "command": "ls -la /tmp" }).to_string(),
+            },
+        };
+
+        let (_payload, status) = execute_task_tool_call(
+            &event_bus,
+            Some(&tool_registry),
+            None,
+            &task_store,
+            &spawn_graph,
+            Some(&gate),
+            &task,
+            &SessionId::new("session-safety-gate-safe"),
+            &Some(WorkspaceId::new("workspace-safety-gate-safe")),
+            None,
+            Some(&WorkerId::new("worker-safety-gate-safe")),
+            &call,
+        );
+        // 不强求 status 是 Succeeded —— tool registry 在测试环境下可能因沙箱无法
+        // 真实执行 ls，但至少不能是 SafetyGate 触发的 Rejected。
+        assert_ne!(status, ExecutionResultStatus::Rejected);
     }
 
     #[test]
@@ -3121,6 +3264,7 @@ mod tests {
             stream_fanout: &StreamFanOut::new(),
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
             spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
+            safety_gate: None,
             task,
             task_id: &task.task_id,
             lease_id: &lease.lease_id,
@@ -3234,6 +3378,7 @@ mod tests {
             stream_fanout: &StreamFanOut::new(),
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
             spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
+            safety_gate: None,
             task: &task,
             task_id: &task.task_id,
             lease_id: &lease.lease_id,
@@ -3547,6 +3692,7 @@ mod tests {
             stream_fanout: &StreamFanOut::new(),
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
             spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
+            safety_gate: None,
             task: &task,
             task_id: &task.task_id,
             lease_id: &lease.lease_id,
@@ -3742,6 +3888,7 @@ mod tests {
             stream_fanout: &StreamFanOut::new(),
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
             spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
+            safety_gate: None,
             task: &task,
             task_id: &task.task_id,
             lease_id: &lease.lease_id,
