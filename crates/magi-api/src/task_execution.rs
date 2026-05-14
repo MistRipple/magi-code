@@ -35,6 +35,7 @@ use magi_orchestrator::{
     task_runner::{EventBasedResultReceiver, TaskDispatcher, TaskOutcome, TaskResult, WorkerInfo},
     task_store::TaskStore,
 };
+use magi_conversation_runtime::ConversationRegistry;
 use magi_session_store::{SessionStore, TimelineEntryKind, timeline_entry_visible_text};
 use magi_tool_runtime::ToolRegistry;
 use magi_workspace::WorkspaceStore;
@@ -864,6 +865,8 @@ pub struct LlmTaskDispatcher {
     tool_registry: Option<ToolRegistry>,
     skill_runtime: Option<Arc<magi_skill_runtime::SkillRuntime>>,
     snapshot_manager: Option<Arc<magi_snapshot::SnapshotManager>>,
+    /// Task System v2：Conversation 注册中心，承载 Turn 状态机与单 Conversation 不并发不变式。
+    conversation_registry: Option<Arc<ConversationRegistry>>,
     /// 强制同步执行 dispatch，用于普通模式的同步 for 循环（设计 §1.3）。
     force_sync_dispatch: Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -905,6 +908,7 @@ impl LlmTaskDispatcher {
             tool_registry: None,
             skill_runtime: None,
             snapshot_manager: None,
+            conversation_registry: None,
             force_sync_dispatch: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
@@ -967,6 +971,11 @@ impl LlmTaskDispatcher {
 
     pub fn with_snapshot_manager(mut self, manager: Arc<magi_snapshot::SnapshotManager>) -> Self {
         self.snapshot_manager = Some(manager);
+        self
+    }
+
+    pub fn with_conversation_registry(mut self, registry: Arc<ConversationRegistry>) -> Self {
+        self.conversation_registry = Some(registry);
         self
     }
 
@@ -1537,6 +1546,10 @@ impl LlmTaskDispatcher {
             None
         };
 
+        let conversation_registry = self
+            .conversation_registry
+            .as_ref()
+            .expect("LlmTaskDispatcher 缺少 ConversationRegistry，无法走 Task System v2 Turn 状态机");
         crate::task_llm_loop::run_task_llm_loop(crate::task_llm_loop::TaskLlmLoopRequest {
             client: client.as_ref(),
             event_bus: self.event_bus.as_ref(),
@@ -1545,6 +1558,7 @@ impl LlmTaskDispatcher {
             tool_registry: self.tool_registry.as_ref(),
             skill_runtime: self.skill_runtime.as_deref(),
             task_store: self.pipeline.execution_runtime.task_store(),
+            conversation_registry: conversation_registry.as_ref(),
             task,
             task_id,
             lease_id,

@@ -22,6 +22,7 @@ use magi_bridge_client::{
     ModelInvocationRequest, ModelStreamingDelta, LOOPBACK_MODEL_PROVIDER,
     tool_concurrency::{ToolBatchKind, ToolConcurrencyInput, partition_tool_calls_with_inputs},
 };
+use magi_conversation_runtime::{ConversationRegistry, RoundOutcome, TurnDriver};
 use magi_core::{
     ApprovalRequirement, EventId, ExecutionResultStatus, LeaseId, RiskLevel, SessionId, TaskId,
     TaskKind, TaskStatus, ThreadId, ToolCallId, UtcMillis, WorkspaceId,
@@ -53,6 +54,9 @@ pub(crate) struct TaskLlmLoopRequest<'a> {
     pub tool_registry: Option<&'a ToolRegistry>,
     pub skill_runtime: Option<&'a magi_skill_runtime::SkillRuntime>,
     pub task_store: &'a TaskStore,
+    /// Task System v2：Turn 状态机驱动。每次 LLM 调用都通过 advance_turn 驱动，
+    /// 显式经过 Pending → Modeling → Done/Failed 不变式（同一 Conversation 不并发）。
+    pub conversation_registry: &'a ConversationRegistry,
     pub task: &'a magi_core::Task,
     pub task_id: &'a TaskId,
     pub lease_id: &'a LeaseId,
@@ -266,6 +270,99 @@ fn chat_message_to_thread_chat_message(message: &ChatMessage) -> ThreadChatMessa
 pub(crate) fn run_task_llm_loop(
     request: TaskLlmLoopRequest<'_>,
 ) -> (TaskOutcome, Option<ExecutionContextSummary>) {
+    // Task System v2 切入：经由 ConversationRegistry 拿到本 session 的 Conversation，
+    // 用 advance_turn 驱动 Turn 状态机；模型 IO + 工具 IO 段折叠到 driver 内部一次性执行。
+    let registry = request.conversation_registry;
+    let conv_handle = registry.conversation_for(request.session_id);
+    let driver = TaskLlmTurnDriver::new(request);
+    let mut conversation = conv_handle
+        .lock()
+        .expect("Conversation mutex poisoned in task_llm_loop");
+    match conversation.advance_turn(driver) {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            tracing::error!(?err, "task_llm_loop advance_turn 失败");
+            (
+                TaskOutcome::Failed {
+                    error: format!("Conversation::advance_turn 失败: {err}"),
+                },
+                None,
+            )
+        }
+    }
+}
+
+/// Task System v2 — 把 v1 一次完整的 LLM IO + 工具 IO 段折叠成一个 round 的 driver。
+///
+/// 当前 slice S2 范围内 driver 的 round_limit = 1：driver 内部仍保留 v1 多轮工具调用
+/// for 循环（围绕 `messages` 累积器）。下一 slice（S3 StreamFanOut）把模型 / 工具 / 系统
+/// 三路 callback 切到统一通道时，会自然把每个 LLM 调用拆成独立 round，driver 就能进入
+/// 真正的"每 round 一次模型调用 + 工具批"形态。Conversation::advance_turn 已经提供了
+/// 多 round 骨架，driver 只要后续拆 execute_round 即可。
+struct TaskLlmTurnDriver<'a> {
+    request: Option<TaskLlmLoopRequest<'a>>,
+    /// execute_round 跑完后把 outcome 存到这里，finalize_success 再交付出去。
+    captured: Option<(TaskOutcome, Option<ExecutionContextSummary>)>,
+}
+
+impl<'a> TaskLlmTurnDriver<'a> {
+    fn new(request: TaskLlmLoopRequest<'a>) -> Self {
+        Self {
+            request: Some(request),
+            captured: None,
+        }
+    }
+}
+
+impl<'a> TurnDriver for TaskLlmTurnDriver<'a> {
+    type Outcome = (TaskOutcome, Option<ExecutionContextSummary>);
+
+    fn round_limit(&self) -> usize {
+        1
+    }
+
+    fn execute_round(&mut self, _round: usize) -> RoundOutcome {
+        let request = self
+            .request
+            .take()
+            .expect("TaskLlmTurnDriver::execute_round 重入");
+        let outcome = run_task_llm_loop_inner(request);
+        let is_failure = matches!(outcome.0, TaskOutcome::Failed { .. });
+        self.captured = Some(outcome);
+        if is_failure {
+            // Turn 状态机记账：失败也通过 finalize_round_failure 路径出。
+            RoundOutcome::Failed("task_llm_loop_inner returned Failed".to_string())
+        } else {
+            RoundOutcome::Done
+        }
+    }
+
+    fn finalize_success(self) -> Self::Outcome {
+        self.captured
+            .expect("TaskLlmTurnDriver::finalize_success 没有捕获到 outcome")
+    }
+
+    fn finalize_round_failure(self, _reason: String) -> Self::Outcome {
+        self.captured
+            .expect("TaskLlmTurnDriver::finalize_round_failure 没有捕获到 outcome")
+    }
+
+    fn finalize_exhausted(self) -> Self::Outcome {
+        // round_limit = 1 时不会触发 exhausted，但保留兜底返回。
+        (
+            TaskOutcome::Failed {
+                error: "task_llm_loop driver 在 round_limit 内未产出 outcome".to_string(),
+            },
+            None,
+        )
+    }
+}
+
+/// v1 一轮 LLM IO + 工具 IO 全段——driver 内部唯一调用点。
+/// S2 阶段保持单调用入口，下一 slice 在此基础上拆 per-round 边界。
+fn run_task_llm_loop_inner(
+    request: TaskLlmLoopRequest<'_>,
+) -> (TaskOutcome, Option<ExecutionContextSummary>) {
     let TaskLlmLoopRequest {
         client,
         event_bus,
@@ -274,6 +371,7 @@ pub(crate) fn run_task_llm_loop(
         tool_registry,
         skill_runtime,
         task_store,
+        conversation_registry: _,
         task,
         task_id,
         lease_id,
@@ -2648,6 +2746,7 @@ mod tests {
             tool_registry: None,
             skill_runtime: None,
             task_store: &task_store,
+            conversation_registry: &ConversationRegistry::new(),
             task,
             task_id: &task.task_id,
             lease_id: &lease.lease_id,
@@ -2757,6 +2856,7 @@ mod tests {
             tool_registry: None,
             skill_runtime: None,
             task_store: &task_store,
+            conversation_registry: &ConversationRegistry::new(),
             task: &task,
             task_id: &task.task_id,
             lease_id: &lease.lease_id,
@@ -3058,6 +3158,7 @@ mod tests {
             tool_registry: None,
             skill_runtime: None,
             task_store: &task_store,
+            conversation_registry: &ConversationRegistry::new(),
             task: &task,
             task_id: &task.task_id,
             lease_id: &lease.lease_id,
@@ -3249,6 +3350,7 @@ mod tests {
             tool_registry: Some(&tool_registry),
             skill_runtime: None,
             task_store: &task_store,
+            conversation_registry: &ConversationRegistry::new(),
             task: &task,
             task_id: &task.task_id,
             lease_id: &lease.lease_id,
