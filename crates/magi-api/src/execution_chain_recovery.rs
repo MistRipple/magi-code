@@ -1,23 +1,31 @@
+//! Task System v2 — M10/M11：继续会话恢复路径已下沉到 conversation-runtime。
+//!
+//! magi-api 仅保留 `continue_execution_chain` 这层"装配薄壳" —— 因为它强依赖
+//! `TaskExecutionPlan`（task_execution.rs）+ `RunnerStartError`（state.rs）+
+//! `TaskExecutionRegistry` / `RunnerManager` 等 ApiState 拥有的资源。所有可纯化
+//! 的判定 / 校验 / writebacks 落盘 / branch checkpoint 同步 / 子树解封逻辑都已
+//! 迁到 `magi_conversation_runtime::execution_chain_recovery`。
+//!
+//! 待 M16/M17 解除 magi-api 对 task plan 的所有权后，本文件可整体并入
+//! `Conversation::resume_for_continue` 并被删除。
+
 use crate::{
     errors::ApiError,
     state::{ApiState, RunnerStartError},
     task_execution::TaskExecutionPlan,
 };
+use magi_conversation_runtime::execution_chain_recovery::{
+    apply_chain_recovery_if_needed, release_resumed_branch_path,
+    sync_branch_checkpoint_to_worker_runtime,
+};
 use magi_core::{
-    ExecutionOwnership, RecoveryResumeInput, SessionId, TaskExecutionTarget, TaskStatus, ThreadId,
-    UtcMillis, WorkerId,
+    ExecutionOwnership, SessionId, TaskExecutionTarget, TaskStatus, ThreadId, WorkerId,
 };
-use magi_orchestrator::{ExecutionWritebackPlans, task_store::TaskStore};
+use magi_orchestrator::ExecutionWritebackPlans;
 use magi_session_store::{ActiveExecutionBranch, ActiveExecutionChain};
-use magi_worker_runtime::{
-    WorkerCheckpointResumeMode, WorkerExecutionBindingLifecycle, WorkerExecutionCheckpointCursor,
-    WorkerStage,
-};
-use magi_workspace::RecoveryStatus;
 
-// M10：上半数据载体 + 终态判定下沉到 conversation-runtime。pub(crate) 重导出，
-// 让本文件残留的 M11 路径（continue_execution_chain 等）与外部 routes 继续按
-// 原名引用；签名为 v2 风格（显式 stores + Result<_, String>）。
+// 上半的纯数据载体与判定函数仍按原名 re-export，避免 routes/sessions.rs /
+// routes/tasks_interaction.rs 等外部调用点改 import。
 pub(crate) use magi_conversation_runtime::execution_chain_recovery::{
     SessionContinueAccepted, active_execution_branch_is_continue_recoverable,
     finalize_terminal_worker_branches, task_status_is_terminal,
@@ -91,219 +99,6 @@ fn rebuild_dispatch_plan_for_branch(
         use_tools: branch.use_tools,
         skill_name: branch.skill_name.clone(),
     }
-}
-
-fn release_resumed_branch_path(
-    task_store: &TaskStore,
-    spawn_graph: &std::sync::Mutex<magi_spawn_graph::SpawnGraph>,
-    chain: &ActiveExecutionChain,
-    branch: &ActiveExecutionBranch,
-) -> Result<(), ApiError> {
-    // Task System v2 — L5：父子链查询从散落的 `task.parent_task_id` 收敛到 SpawnGraph。
-    // task 数据本身（mission/root/status）仍由 task_store 提供，避免 SpawnGraph 承担状态字段。
-    let mut current_task_id = Some(branch.task_id.clone());
-    while let Some(task_id) = current_task_id {
-        if task_id == chain.root_task_id {
-            break;
-        }
-        let task = task_store
-            .get_task(&task_id)
-            .ok_or_else(|| ApiError::not_found("继续 branch 任务不存在", task_id.as_str()))?;
-        if task.mission_id != chain.mission_id || task.root_task_id != chain.root_task_id {
-            return Err(ApiError::internal_assembly(
-                "继续会话失败",
-                format!("branch 路径任务不属于当前执行链: {}", task_id),
-            ));
-        }
-        current_task_id = {
-            let graph = spawn_graph
-                .lock()
-                .map_err(|error| {
-                    ApiError::internal_assembly("继续会话失败", format!("SpawnGraph 锁中毒: {error}"))
-                })?;
-            graph.parent_of(&task_id).cloned()
-        };
-        if task.status == TaskStatus::Blocked {
-            task_store
-                .update_status(&task_id, TaskStatus::Ready)
-                .map_err(|error| ApiError::internal_assembly("继续会话失败", error))?;
-        }
-    }
-    Ok(())
-}
-
-fn parse_branch_worker_stage(value: &str) -> WorkerStage {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "review" => WorkerStage::Review,
-        "verify" => WorkerStage::Verify,
-        "repair" => WorkerStage::Repair,
-        "finish" | "finished" => WorkerStage::Finish,
-        _ => WorkerStage::Execute,
-    }
-}
-
-fn parse_branch_resume_mode(value: Option<&str>) -> WorkerCheckpointResumeMode {
-    match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
-        Some("step-checkpoint") => WorkerCheckpointResumeMode::StepCheckpoint,
-        _ => WorkerCheckpointResumeMode::StageRestart,
-    }
-}
-
-fn parse_branch_binding_lifecycle(value: Option<&str>) -> Option<WorkerExecutionBindingLifecycle> {
-    match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
-        Some("bound") => Some(WorkerExecutionBindingLifecycle::Bound),
-        Some("released") => Some(WorkerExecutionBindingLifecycle::Released),
-        Some("none") => Some(WorkerExecutionBindingLifecycle::None),
-        Some("requested") => Some(WorkerExecutionBindingLifecycle::Requested),
-        Some(_) => Some(WorkerExecutionBindingLifecycle::Requested),
-        None => None,
-    }
-}
-
-fn branch_checkpoint_cursor(
-    branch: &ActiveExecutionBranch,
-) -> Option<WorkerExecutionCheckpointCursor> {
-    branch
-        .checkpoint_stage
-        .as_deref()
-        .map(|checkpoint_stage| WorkerExecutionCheckpointCursor {
-            checkpoint_stage: parse_branch_worker_stage(checkpoint_stage),
-            next_step_index: branch.next_step_index.unwrap_or(0),
-            checkpoint_at: branch.checkpoint_at.unwrap_or_else(UtcMillis::now),
-            resume_mode: parse_branch_resume_mode(branch.resume_mode.as_deref()),
-            resume_token: branch.resume_token.clone(),
-        })
-}
-
-fn sync_branch_checkpoint_to_worker_runtime(state: &ApiState, branch: &ActiveExecutionBranch) {
-    let Some(pipeline) = state.execution_pipeline() else {
-        return;
-    };
-    pipeline
-        .execution_runtime
-        .worker_runtime()
-        .record_branch_checkpoint(
-            &branch.task_id,
-            &branch.worker_id,
-            parse_branch_worker_stage(&branch.stage),
-            branch.lease_id.as_ref().map(ToString::to_string),
-            branch.execution_intent_ref.clone(),
-            parse_branch_binding_lifecycle(branch.binding_lifecycle.as_deref()),
-            branch_checkpoint_cursor(branch),
-        );
-}
-
-fn validate_recovery_status(state: &ApiState, recovery_id: &str) -> Result<(), ApiError> {
-    let export = state
-        .workspace_registry
-        .recovery_sidecar_export(recovery_id)
-        .ok_or_else(|| ApiError::recovery_not_found(recovery_id))?;
-    match export.current_status {
-        RecoveryStatus::Ready => Ok(()),
-        RecoveryStatus::Prepared => Err(ApiError::InvalidInput(format!(
-            "继续检查点 {} 当前状态为 prepared，必须先进入 ready 才能继续会话",
-            recovery_id
-        ))),
-        RecoveryStatus::Consumed => Err(ApiError::InvalidInput(format!(
-            "继续检查点 {} 已被消费，不能再次继续会话",
-            recovery_id
-        ))),
-    }
-}
-
-fn map_recovery_input_error(recovery_id: &str, error: magi_core::DomainError) -> ApiError {
-    match error {
-        magi_core::DomainError::NotFound { .. } => ApiError::recovery_not_found(recovery_id),
-        magi_core::DomainError::InvalidState { message }
-        | magi_core::DomainError::Validation { message } => ApiError::InvalidInput(message),
-        magi_core::DomainError::AlreadyExists { entity } => ApiError::internal_assembly(
-            "继续会话失败",
-            format!("recovery 输入构建遇到重复实体: {entity}"),
-        ),
-    }
-}
-
-fn validate_recovery_input_matches_chain(
-    chain: &ActiveExecutionChain,
-    input: &RecoveryResumeInput,
-) -> Result<(), ApiError> {
-    if input.ownership.session_id.as_ref() != Some(&chain.session_id) {
-        return Err(ApiError::InvalidInput(format!(
-            "恢复入口 {} 不属于当前会话 {}",
-            input.recovery_id, chain.session_id
-        )));
-    }
-    if input.ownership.mission_id.as_ref() != Some(&chain.mission_id) {
-        return Err(ApiError::InvalidInput(format!(
-            "恢复入口 {} 不属于当前执行链 mission {}",
-            input.recovery_id, chain.mission_id
-        )));
-    }
-    if input.ownership.workspace_id != chain.workspace_id {
-        return Err(ApiError::InvalidInput(format!(
-            "恢复入口 {} 的工作区与当前执行链不一致",
-            input.recovery_id
-        )));
-    }
-    if input.ownership.execution_chain_ref.as_deref() != Some(chain.execution_chain_ref.as_str()) {
-        return Err(ApiError::InvalidInput(format!(
-            "恢复入口 {} 的 execution_chain_ref 与当前执行链不一致",
-            input.recovery_id
-        )));
-    }
-    Ok(())
-}
-
-fn apply_chain_recovery_if_needed(
-    state: &ApiState,
-    session_id: &SessionId,
-    chain: &mut ActiveExecutionChain,
-    primary_branch: &ActiveExecutionBranch,
-) -> Result<(), ApiError> {
-    let Some(recovery_id) = chain.recovery_ref.clone() else {
-        return Ok(());
-    };
-    validate_recovery_status(state, &recovery_id)?;
-    let input = state
-        .workspace_registry
-        .build_recovery_resume_input(&recovery_id)
-        .map_err(|error| map_recovery_input_error(&recovery_id, error))?;
-    validate_recovery_input_matches_chain(chain, &input)?;
-
-    state
-        .session_store
-        .apply_recovery_resume_input(session_id.clone(), input.clone())
-        .map_err(|error| ApiError::internal_assembly("继续会话失败", error))?;
-
-    let writebacks = ExecutionWritebackPlans::from_continue_checkpoint_input(&input);
-    if !writebacks.is_empty() {
-        let pipeline = state.execution_pipeline().ok_or_else(|| {
-            ApiError::internal_assembly("继续会话失败", "execution pipeline 未配置")
-        })?;
-        writebacks.apply(&pipeline.memory_store);
-    }
-
-    state
-        .workspace_registry
-        .consume_recovery_with_ownership(
-            &input.recovery_id,
-            ExecutionOwnership {
-                session_id: Some(chain.session_id.clone()),
-                workspace_id: chain.workspace_id.clone(),
-                mission_id: Some(chain.mission_id.clone()),
-                task_id: Some(primary_branch.task_id.clone()),
-                worker_id: Some(primary_branch.worker_id.clone()),
-                execution_chain_ref: Some(chain.execution_chain_ref.clone()),
-            },
-        )
-        .map_err(|error| ApiError::internal_assembly("继续会话失败", error))?;
-
-    state
-        .session_store
-        .attach_recovery_ref(session_id, None)
-        .map_err(|error| ApiError::internal_assembly("继续会话失败", error))?;
-    chain.recovery_ref = None;
-    Ok(())
 }
 
 pub(crate) fn continue_execution_chain(
@@ -440,7 +235,35 @@ pub(crate) fn continue_execution_chain(
         .or_else(|| branches_to_resume.iter().find(|branch| branch.is_primary))
         .or_else(|| branches_to_resume.first())
         .expect("branches_to_resume checked as non-empty");
-    apply_chain_recovery_if_needed(state, session_id, &mut chain, primary_branch)?;
+    let memory_store = state
+        .execution_pipeline()
+        .map(|pipeline| &pipeline.memory_store);
+    apply_chain_recovery_if_needed(
+        &state.session_store,
+        &state.workspace_registry,
+        memory_store,
+        session_id,
+        &mut chain,
+        primary_branch,
+    )
+    .map_err(|error| {
+        let message = error.into_message();
+        // 与原实现保持一致：NotFound 与 InvalidStatus 走 InvalidInput / NotFound 分类。
+        if message.starts_with("recovery 不存在") {
+            ApiError::recovery_not_found(
+                message
+                    .strip_prefix("recovery 不存在: ")
+                    .unwrap_or(message.as_str()),
+            )
+        } else if message.contains("继续检查点")
+            || message.contains("恢复入口")
+            || message.contains("workspace 不一致")
+        {
+            ApiError::InvalidInput(message)
+        } else {
+            ApiError::internal_assembly("继续会话失败", message)
+        }
+    })?;
 
     // resume 入口幂等地保证 orchestrator thread 存在：
     //  * 已存在 → 直接复用 (同 session 同 mission 同 orchestrator thread 不变量)；
@@ -468,7 +291,9 @@ pub(crate) fn continue_execution_chain(
             branch.task_id.clone(),
             rebuild_dispatch_plan_for_branch(&chain, branch, &orchestrator_thread_id),
         );
-        sync_branch_checkpoint_to_worker_runtime(state, branch);
+        if let Some(worker_runtime) = worker_runtime_handle {
+            sync_branch_checkpoint_to_worker_runtime(worker_runtime, branch);
+        }
     }
 
     state
@@ -506,7 +331,8 @@ pub(crate) fn continue_execution_chain(
         }
     }
     for branch in &branches_to_resume {
-        release_resumed_branch_path(task_store, state.spawn_graph.as_ref(), &chain, branch)?;
+        release_resumed_branch_path(task_store, state.spawn_graph.as_ref(), &chain, branch)
+            .map_err(|msg| ApiError::internal_assembly("继续会话失败", msg))?;
     }
 
     // 深度模式：恢复任务状态后需要重新启动后台 runner，避免退化为同步执行

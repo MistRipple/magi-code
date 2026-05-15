@@ -17,6 +17,7 @@ magi-mission-charter = { path = "../magi-mission-charter" }
 magi-mission-workspace = { path = "../magi-mission-workspace" }
 magi-plan = { path = "../magi-plan" }
 magi-knowledge-graph = { path = "../magi-knowledge-graph" }
+magi-memory-store = { path = "../magi-memory-store" }
 magi-validation-runner = { path = "../magi-validation-runner" }
 magi-checkpoint = { path = "../magi-checkpoint" }
 magi-human-checkpoint = { path = "../magi-human-checkpoint" }
