@@ -1,9 +1,9 @@
 //! Task System v2 - Task helper functions (visibility / validation / required-tool-chain)
 //!
-//! P7：从 magi-api task_llm_loop.rs 平移过来的纯函数与小型可见性枚举，
-//! 由 conversation-runtime 统一承载，magi-api 通过 re-export 调用。
-//! 本模块严格遵守"无写回依赖"原则——任何需要 session_turn_writeback
-//! 的 publish/upsert helper 不在本模块，留待 M06 与 writeback 一同迁入 v2。
+//! P7：从旧版 API 任务调度层平移过来的纯函数与小型可见性枚举，
+//! 由 conversation-runtime 统一承载。
+//! 本模块严格遵守"无写回依赖"原则——任何需要 session writeback
+//! 的 publish/upsert helper 都不放在本模块。
 
 use magi_bridge_client::{ChatToolChoice, ChatToolDefinition};
 use magi_core::{Task, TaskKind, ThreadId, WorkerId};

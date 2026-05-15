@@ -1,10 +1,9 @@
 //! Task System v2 — M15：session-thread 复用入口从
-//! magi-api/dispatch_execution.rs 下沉到 conversation-runtime。
+//! 旧版 API 派发路径下沉到 conversation-runtime。
 //!
 //! `ensure_thread_for_role` 不再依赖 `&ApiState`，改为接收显式
-//! `&SessionStore`。dispatch_execution.rs 通过 `pub use` 重导出，
-//! 调用点保持不变；待 M16/M17 解除 magi-api 对 TaskExecutionPlan
-//! 的所有权后，dispatch_execution.rs 可整体删除。
+//! `&SessionStore`。上层曾通过 API 壳层重导出调用；待相关装配职责彻底下沉后，
+//! 这层适配即可删除。
 
 use magi_core::{MissionId, SessionId, TaskId, ThreadId, UtcMillis, WorkerId};
 use magi_session_store::{ExecutionThread, ExecutionThreadStatus, SessionStore};

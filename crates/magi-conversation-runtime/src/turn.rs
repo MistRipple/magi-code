@@ -12,9 +12,8 @@
 //!                          Done | Failed
 //! ```
 //!
-//! S2 范围内 v2 只持有"状态推进契约"。`Modeling` / `ToolCalling` 的 IO 仍由
-//! v1 `run_task_llm_loop` 整体承担——S3+ 会把那段 round 循环逐步剥到这里。
-//! 命中"状态推进段"的 v1 删除标记由 commit 滚动登记。
+//! v2 由 Conversation 持有"状态推进契约"，`Modeling` / `ToolCalling` 的 IO
+//! 通过 `TurnDriver` 注入；状态机本身不依赖具体任务执行实现。
 
 use std::fmt;
 

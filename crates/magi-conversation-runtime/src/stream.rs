@@ -1,17 +1,12 @@
 //! Task System v2 - 统一流派生通道（Slice S3）。
 //!
-//! 模型 token、工具事件、系统信号在 v1 各自走 callback：
-//! `task_llm_loop::publish_stream_delta` / `publish_task_thinking_delta` /
-//! `dispatch_execution` 中的 `_on_delta` 闭包。v2 把它们收口为同一个
-//! `StreamEvent` 派生源，下游（writeback / lane summary / projection /
-//! UI bridge）各自注册自己的回调订阅。
+//! 模型 token、工具事件、系统信号统一收口为同一个 `StreamEvent` 派生源，
+//! 下游（writeback / lane summary / projection / UI bridge）各自注册回调订阅。
 //!
 //! S3 范围：
 //! - 类型契约：`StreamEvent` + `ToolPhase`
 //! - 派生通道：callback-based `StreamFanOut`（同步扇出，不引入 tokio/mpsc）
-//! - v1 publish 段照原样保留状态写入（session_store 等），增量把 fanout 作为
-//!   observation 通道暴露出来，下游 UI bridge 后续 slice 切换到这里订阅
-//!   并删除 event_bus 上对应的 session_turn_item_event 分支
+//! - 状态写入仍由各业务路径负责，fanout 只作为 observation 通道暴露给下游
 //!
 //! 同步扇出选择：模型 IO 是单调度线程，发布回调直接在生产者线程跑；
 //! 不需要 mpsc receiver thread，也避免 std::sync::mpsc 在 fan-out 取消订阅
@@ -26,8 +21,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum StreamEvent {
-    /// LLM 输出 token delta。`thinking` 与 `content` 是 v1 ModelStreamingDelta
-    /// 的两个独立通道；前端 thinking 摘要和正文渲染走不同的 reducer。
+    /// LLM 输出 token delta。`thinking` 与 `content` 是模型流里的两个独立通道；
+    /// 前端 thinking 摘要和正文渲染走不同的 reducer。
     ModelDelta {
         session_id: SessionId,
         content: String,

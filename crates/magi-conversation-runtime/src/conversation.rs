@@ -26,7 +26,10 @@ impl std::fmt::Display for BeginTurnError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::TurnAlreadyActive(state) => {
-                write!(f, "conversation already has an active turn in state {state}")
+                write!(
+                    f,
+                    "conversation already has an active turn in state {state}"
+                )
             }
         }
     }
@@ -73,7 +76,7 @@ impl Conversation {
         self.current_turn.as_ref().map(Turn::state)
     }
 
-    /// 改变当前 Turn 状态——必须在 `begin_turn` 之后。S2 范围内仅由 v1 adapter
+    /// 改变当前 Turn 状态——必须在 `begin_turn` 之后。S2 范围内仅由上层适配器
     /// 在每个状态切点上回调。
     pub fn advance_current_turn<F>(&mut self, op: F) -> Result<(), TurnAdvanceError>
     where
@@ -104,7 +107,7 @@ impl Conversation {
     /// 跑完一个完整 Turn：持有 for-round 循环骨架与状态机推进，
     /// 把每一轮内部的"拼请求 / 调模型 / 工具执行 / 写 turn item"全部交给 driver。
     ///
-    /// 这是 Tier 1 取代 v1 `task_llm_loop::run_task_llm_loop` 中
+    /// 这是 Tier 1 取代旧式单体调度中的
     /// `for round in 0..tool_call_round_limit` 段的唯一入口。Conversation 自己
     /// 调 `begin_turn` / `enter_modeling` / `enter_tool_calling` / `finish_done` /
     /// `finish_failed` / `end_turn`，业务侧拿不到中间状态。
@@ -157,7 +160,7 @@ impl Conversation {
             }
         }
 
-        // round_limit 耗尽——driver 自决最终 Outcome 形态（v1 把这归到失败）。
+        // round_limit 耗尽——driver 自决最终 Outcome 形态（旧实现通常把这归到失败）。
         self.advance_current_turn(|turn| turn.finish_failed())
             .map_err(AdvanceTurnError::Advance)?;
         self.end_turn().map_err(AdvanceTurnError::Advance)?;
@@ -250,7 +253,8 @@ mod tests {
         conv.begin_turn().unwrap();
         conv.advance_current_turn(|turn| turn.enter_modeling())
             .unwrap();
-        conv.advance_current_turn(|turn| turn.finish_done()).unwrap();
+        conv.advance_current_turn(|turn| turn.finish_done())
+            .unwrap();
         assert_eq!(conv.end_turn().unwrap(), TurnState::Done);
         // 下一轮可以正常开始
         conv.begin_turn().unwrap();
@@ -391,8 +395,7 @@ mod tests {
     #[test]
     fn advance_turn_deterministic_shortcut_skips_modeling() {
         let mut conv = Conversation::new(SessionId::new("s"));
-        let driver =
-            FakeDriver::new(vec![RoundOutcome::Done]).with_deterministic("instant");
+        let driver = FakeDriver::new(vec![RoundOutcome::Done]).with_deterministic("instant");
         let outcome = conv.advance_turn(driver).unwrap();
         assert_eq!(outcome, "instant");
         // 槽位归零

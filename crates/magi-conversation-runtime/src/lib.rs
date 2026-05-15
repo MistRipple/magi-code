@@ -7,7 +7,7 @@
 //! 已交付 slice：
 //! - S1：Mailbox + Conversation 骨架（user 信号入栈姿势）
 //! - S2：Turn 状态机 + 单 Conversation 不并发不变式（v2 拥有 Turn lifecycle，
-//!   v1 `run_task_llm_loop` 暂作"一轮 IO 引擎"被 v2 调度）
+//!   旧式单体调度逻辑已下沉为 runtime 内部 driver）
 
 #![recursion_limit = "256"]
 

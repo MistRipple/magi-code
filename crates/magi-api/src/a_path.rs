@@ -1,13 +1,13 @@
 //! Task System v2 — A 档（单代理 / codex 式一次对话一个 task）同步驱动入口。
 //!
-//! v1 中 A 档的"同步推任务图直至完成"分散在 `task_execution.rs::drive_task_graph`
-//! 中，被 `drive_dispatch_submission` 与 `routes::sessions::finalize_continue_session`
+//! 旧版 A 档的"同步推任务图直至完成"分散在调度层中，被
+//! `drive_dispatch_submission` 与 `routes::sessions::finalize_continue_session`
 //! 两个入口分别调用。M01 把这层逻辑收口到本模块的 `drive_a_path`：
 //!
 //! - **唯一入口**：所有 A 档"用户消息已 dispatch → 同步驱动到 done"路径都从此处进入；
 //! - **背景判定外部完成**：`background_allowed=false` 的判定保留在调用方完成（routes
 //!   层 + task_dispatch 层各自有不同的"否则分支"），本函数不再二次判断；
-//! - **同步窗口固定 32 轮**：与 v1 行为对齐，避免在 M01 引入语义偏移。
+//! - **同步窗口固定 32 轮**：与既有行为对齐，避免在 M01 引入语义偏移。
 //!
 //! 后续 slice（M17b）会进一步把 `drive_a_path` 私化到 `magi-conversation-runtime`，
 //! 让 A 档与 v2 Conversation::advance_turn 衔接。
@@ -19,7 +19,7 @@ use magi_core::{TaskId, TaskStatus};
 /// A 档同步驱动的产出。
 #[derive(Debug)]
 pub struct APathDriveResult {
-    /// 是否真正进入过 run cycle（false 仅在循环 0 次直接退出时，本字段当前与 v1 行为一致）。
+    /// 是否真正进入过 run cycle（false 仅在循环 0 次直接退出时，本字段与既有行为一致）。
     pub runner_started: bool,
 }
 

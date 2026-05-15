@@ -1,4 +1,4 @@
-//! Task System v2 — M12：任务图构建器从 magi-api/dispatch_execution.rs 下沉到
+//! Task System v2 — M12：任务图构建器从旧版 API 派发层下沉到
 //! conversation-runtime。
 //!
 //! 本模块承担"派发数据模型 + 任务图落盘 + 任务图校验 + 派发清理"等纯函数 /
@@ -360,9 +360,7 @@ pub fn insert_task_graph(
                     TaskKind::Action,
                     Some(action_role_candidate.as_str()),
                 )
-                .ok_or_else(|| {
-                    format!("无法为 action {} 解析可执行角色", action_plan.title)
-                })?;
+                .ok_or_else(|| format!("无法为 action {} 解析可执行角色", action_plan.title))?;
 
                 task_store.insert_task(make_dispatch_task(
                     action_id.clone(),

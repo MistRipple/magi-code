@@ -1,6 +1,6 @@
 //! Task System v2 — tool batch / coordinator / single 工具执行入口。
 //!
-//! 从 v1 `magi-api::task_llm_loop` 迁入：
+//! 从旧版 API 任务调度层迁入：
 //! - `execute_task_tool_call_batch`：按 concurrency 分组并发或串行调度本轮工具。
 //! - `execute_task_tool_call`：单工具入口，按 BuiltinToolName 走 coordinator/写工具/policy/
 //!   safety gate/tool registry 各分支。
@@ -254,11 +254,7 @@ fn execute_coordinator_tool(
                 })
                 .unwrap_or(TaskKind::Action);
             let now = UtcMillis::now();
-            let child_id = TaskId::new(format!(
-                "task-spawn-{}-{}",
-                task.task_id.as_str(),
-                now.0
-            ));
+            let child_id = TaskId::new(format!("task-spawn-{}-{}", task.task_id.as_str(), now.0));
             let child = magi_core::Task {
                 task_id: child_id.clone(),
                 mission_id: task.mission_id.clone(),
@@ -295,7 +291,7 @@ fn execute_coordinator_tool(
                 updated_at: now,
             };
             task_store.insert_task(child);
-            // SpawnGraph 边：失败仅 warn（与 dispatch_execution::register_spawn_edge 一致策略）。
+            // SpawnGraph 边：失败仅 warn（与旧版边注册策略一致）。
             if let Ok(mut graph) = spawn_graph.lock() {
                 if let Err(err) = graph.add_edge(
                     task.task_id.clone(),
@@ -339,7 +335,10 @@ fn execute_coordinator_tool(
                 .unwrap_or("")
                 .trim()
                 .to_string();
-            let payload = parsed.get("payload").cloned().unwrap_or(serde_json::Value::Null);
+            let payload = parsed
+                .get("payload")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
             if target.is_empty() || payload.is_null() {
                 return (
                     serde_json::json!({
@@ -423,10 +422,7 @@ fn execute_coordinator_tool(
                 }
             };
             for id in std::iter::once(target_id.clone()).chain(descendants.into_iter()) {
-                if task_store
-                    .update_status(&id, TaskStatus::Cancelled)
-                    .is_ok()
-                {
+                if task_store.update_status(&id, TaskStatus::Cancelled).is_ok() {
                     cancelled.push(id.to_string());
                     if let Ok(mut graph) = spawn_graph.lock() {
                         let _ = graph.mark_closed(&id, std::time::SystemTime::now());
@@ -527,7 +523,10 @@ fn execute_task_tool_call(
                 &tool_call.function.arguments,
             );
         }
-        if matches!(canonical, magi_tool_runtime::BuiltinToolName::MissionCharterWrite) {
+        if matches!(
+            canonical,
+            magi_tool_runtime::BuiltinToolName::MissionCharterWrite
+        ) {
             return magi_mission_charter::execute_mission_charter_write_tool(
                 event_bus,
                 mission_charter,
@@ -562,7 +561,10 @@ fn execute_task_tool_call(
             );
         }
         // S15：ValidationRecord 同样在此层拦截，因为它要操作 mission 维度的 ValidationStore。
-        if matches!(canonical, magi_tool_runtime::BuiltinToolName::ValidationRecord) {
+        if matches!(
+            canonical,
+            magi_tool_runtime::BuiltinToolName::ValidationRecord
+        ) {
             return magi_validation_runner::execute_validation_record_tool(
                 event_bus,
                 validation_runner,
@@ -652,9 +654,11 @@ fn execute_task_tool_call(
     // S8：SafetyGate 语义判定。Permission 通过后仍可能命中"高危子串"（如
     // `git push --force` / `rm -rf`），此处对 arguments 内容直接做匹配。
     if let Some(gate) = safety_gate {
-        if let Some(rejection) =
-            safety_gate_rejection(gate, &tool_call.function.name, &tool_call.function.arguments)
-        {
+        if let Some(rejection) = safety_gate_rejection(
+            gate,
+            &tool_call.function.name,
+            &tool_call.function.arguments,
+        ) {
             return (rejection, ExecutionResultStatus::Rejected);
         }
     }
@@ -690,14 +694,18 @@ fn task_policy_tool_rejection(
     let canonical_tool_name = canonical_builtin_tool_name(requested_tool_name)
         .unwrap_or_else(|| requested_tool_name.trim().to_string());
     // no_tools 是 PermissionEngine 三维之外的全局开关，本层先单独拦截。
-    if policy_snapshot.command_mode.eq_ignore_ascii_case("no_tools") {
+    if policy_snapshot
+        .command_mode
+        .eq_ignore_ascii_case("no_tools")
+    {
         return Some(task_policy_rejection_payload(
             &canonical_tool_name,
             format!("当前任务阶段不允许调用工具: {canonical_tool_name}"),
         ));
     }
     // PermissionEngine 比对工具名是按字面比对，因此把 policy 中的别名先 canonical 化。
-    let mut canonical_policy = magi_permissions::PermissionPolicy::from_core_policy(policy_snapshot);
+    let mut canonical_policy =
+        magi_permissions::PermissionPolicy::from_core_policy(policy_snapshot);
     canonical_policy.allowed_tools = policy_snapshot
         .allowed_tools
         .iter()
@@ -762,15 +770,19 @@ fn safety_gate_rejection(
     tool_name: &str,
     arguments: &str,
 ) -> Option<String> {
-    let canonical_tool_name = canonical_builtin_tool_name(tool_name)
-        .unwrap_or_else(|| tool_name.trim().to_string());
+    let canonical_tool_name =
+        canonical_builtin_tool_name(tool_name).unwrap_or_else(|| tool_name.trim().to_string());
     match gate.evaluate(&canonical_tool_name, arguments) {
         magi_safety_gate::SafetyDecision::Allow => None,
         magi_safety_gate::SafetyDecision::Block {
-            category, pattern, reason,
+            category,
+            pattern,
+            reason,
         }
         | magi_safety_gate::SafetyDecision::RequireApproval {
-            category, pattern, reason,
+            category,
+            pattern,
+            reason,
         } => Some(
             serde_json::json!({
                 "tool": canonical_tool_name,

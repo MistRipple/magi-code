@@ -1,22 +1,11 @@
-use crate::{
-    prompt_utils::{
-        normalize_model_stream_preview_content, normalize_model_visible_content,
-        workspace_context_system_prompt,
-    },
-    settings_store::SettingsStore,
-    usage_recording::{ModelUsageBinding, publish_model_usage_record},
-};
 use crate::session_writeback::{
     append_session_turn_item_with_task_store, publish_current_session_turn_item_event,
     publish_session_turn_item_event, session_turn_item, upsert_session_turn_item_with_task_store,
 };
+use crate::task_runner_bridge::TaskOutcome;
 use crate::tool_result_utils::{
     infer_tool_call_status, summarize_tool_result, tool_execution_status_label,
     turn_item_status_for_tool_result,
-};
-use magi_bridge_client::{
-    ChatMessage, ChatToolCall, ChatToolDefinition, ModelBridgeClient,
-    ModelInvocationRequest, ModelStreamingDelta, LOOPBACK_MODEL_PROVIDER,
 };
 use crate::{
     ConversationRegistry, RoundOutcome, StreamEvent, StreamFanOut, TaskTurnVisibility, TurnDriver,
@@ -27,13 +16,24 @@ use crate::{
     required_tool_chain_recovery_prompt, task_required_tool_chain, task_tool_failure_reason,
     task_turn_visibility, tool_call_round_limit, validation_result_rejects_delivery,
 };
+use crate::{
+    prompt_utils::{
+        normalize_model_stream_preview_content, normalize_model_visible_content,
+        workspace_context_system_prompt,
+    },
+    settings_store::SettingsStore,
+    usage_recording::{ModelUsageBinding, publish_model_usage_record},
+};
+use magi_bridge_client::{
+    ChatMessage, ChatToolCall, ChatToolDefinition, LOOPBACK_MODEL_PROVIDER, ModelBridgeClient,
+    ModelInvocationRequest, ModelStreamingDelta,
+};
 use magi_core::{
     EventId, ExecutionResultStatus, LeaseId, SessionId, TaskId, TaskKind, TaskStatus, ThreadId,
     ToolCallId, UtcMillis, WorkspaceId,
 };
 use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
 use magi_orchestrator::{ExecutionContextSummary, task_store::TaskStore};
-use crate::task_runner_bridge::TaskOutcome;
 use magi_session_store::{
     SessionStore, ThreadChatMessage, ThreadChatToolCall, ThreadChatToolFunction, TimelineEntryKind,
 };
@@ -203,13 +203,11 @@ pub fn run_task_llm_loop(
     }
 }
 
-/// Task System v2 — 把 v1 一次完整的 LLM IO + 工具 IO 段折叠成一个 round 的 driver。
+/// Task System v2 — 把一次完整的 LLM IO + 工具 IO 段封装成 TurnDriver round。
 ///
-/// 当前 slice S2 范围内 driver 的 round_limit = 1：driver 内部仍保留 v1 多轮工具调用
-/// for 循环（围绕 `messages` 累积器）。下一 slice（S3 StreamFanOut）把模型 / 工具 / 系统
-/// 三路 callback 切到统一通道时，会自然把每个 LLM 调用拆成独立 round，driver 就能进入
-/// 真正的"每 round 一次模型调用 + 工具批"形态。Conversation::advance_turn 已经提供了
-/// 多 round 骨架，driver 只要后续拆 execute_round 即可。
+/// 当前 driver 的 round_limit = 1：内部仍保留多轮工具调用 for 循环（围绕
+/// `messages` 累积器）。Conversation::advance_turn 已经提供多 round 骨架，后续可在
+/// 这里继续拆出"每 round 一次模型调用 + 工具批"的更细边界。
 struct TaskLlmTurnDriver<'a> {
     request: Option<TaskLlmLoopRequest<'a>>,
     /// execute_round 跑完后把 outcome 存到这里，finalize_success 再交付出去。
@@ -269,8 +267,8 @@ impl<'a> TurnDriver for TaskLlmTurnDriver<'a> {
     }
 }
 
-/// v1 一轮 LLM IO + 工具 IO 全段——driver 内部唯一调用点。
-/// S2 阶段保持单调用入口，下一 slice 在此基础上拆 per-round 边界。
+/// 一轮 LLM IO + 工具 IO 全段——driver 内部唯一调用点。
+/// 当前保持单调用入口，后续可在此基础上拆 per-round 边界。
 fn run_task_llm_loop_inner(
     request: TaskLlmLoopRequest<'_>,
 ) -> (TaskOutcome, Option<ExecutionContextSummary>) {
@@ -1165,7 +1163,6 @@ fn summarize_final_for_lane(final_content: &str) -> String {
     truncated
 }
 
-
 /// 发送一条 thread-visible 的 `worker_status` 摘要 item，作为主线 dispatch 卡的
 /// liveActivity 数据源。前端 projection 已将 `worker_status` 从消息渲染列表过滤
 /// （[turn-projection.ts:241](web/src/stores/turn-projection.ts:241)），它只参与
@@ -1968,11 +1965,8 @@ mod tests {
             .create_session(session_id.clone(), "static task final fixture")
             .expect("session should be creatable");
         let now = UtcMillis::now();
-        let (_, orchestrator_thread_id) = session_store.ensure_session_mission(
-            &session_id,
-            now,
-            || task.mission_id.clone(),
-        );
+        let (_, orchestrator_thread_id) =
+            session_store.ensure_session_mission(&session_id, now, || task.mission_id.clone());
         // P7：mainline 场景 task 自身 thread = orchestrator thread。
         let thread_id = orchestrator_thread_id.clone();
         let (outcome, _) = run_task_llm_loop(TaskLlmLoopRequest {
@@ -2091,11 +2085,8 @@ mod tests {
             .create_session(session_id.clone(), "task failed tool fixture")
             .expect("session should be creatable");
         let now = UtcMillis::now();
-        let (_, orchestrator_thread_id) = session_store.ensure_session_mission(
-            &session_id,
-            now,
-            || task.mission_id.clone(),
-        );
+        let (_, orchestrator_thread_id) =
+            session_store.ensure_session_mission(&session_id, now, || task.mission_id.clone());
         let thread_id = orchestrator_thread_id.clone();
 
         let (outcome, _) = run_task_llm_loop(TaskLlmLoopRequest {
@@ -2414,11 +2405,8 @@ mod tests {
             .expect("lease should be granted");
         let usage_binding = crate::usage_recording::session_turn_model_usage_binding(true);
         let now = UtcMillis::now();
-        let (_, orchestrator_thread_id) = session_store.ensure_session_mission(
-            &session_id,
-            now,
-            || task.mission_id.clone(),
-        );
+        let (_, orchestrator_thread_id) =
+            session_store.ensure_session_mission(&session_id, now, || task.mission_id.clone());
         let thread_id = orchestrator_thread_id.clone();
 
         let (outcome, _) = run_task_llm_loop(TaskLlmLoopRequest {
@@ -2557,19 +2545,14 @@ mod tests {
         let task = make_task_loop_test_task(task_id.as_str());
         task_store.insert_task(task.clone());
         let now = UtcMillis::now();
-        let (_, orchestrator_thread_id) = session_store.ensure_session_mission(
-            &session_id,
-            now,
-            || task.mission_id.clone(),
-        );
+        let (_, orchestrator_thread_id) =
+            session_store.ensure_session_mission(&session_id, now, || task.mission_id.clone());
         // worker lane 必须绑定到独立的 worker thread —— 由角色维度 ensure。
-        // M09：本测试以前调用 magi-api::dispatch_execution::ensure_thread_for_role，
-        // 文件下沉到 v2 后该 helper 暂未迁移，先将其等价逻辑就地展开（仅测试夹具用）。
+        // worker thread 复用逻辑在生产代码里由 session_thread helper 承担；
+        // 这里直接展开等价逻辑，避免测试夹具跨模块依赖 API 适配层。
         let worker_thread_id = {
             let role_id = "integration-dev";
-            if let Some(existing) =
-                session_store.find_idle_thread_for_role(&session_id, role_id)
-            {
+            if let Some(existing) = session_store.find_idle_thread_for_role(&session_id, role_id) {
                 session_store.activate_thread(&existing.thread_id, &task_id, now);
                 existing.thread_id
             } else {
@@ -2715,8 +2698,8 @@ mod tests {
                 let routed_to_worker = item.source_thread_id == worker_thread_id
                     && item.lane_id.as_deref() == Some(lane_id.as_str())
                     && item.lane_seq == Some(2);
-                let routed_to_main = item.source_thread_id == orchestrator_thread_id
-                    && item.kind == "worker_status";
+                let routed_to_main =
+                    item.source_thread_id == orchestrator_thread_id && item.kind == "worker_status";
                 routed_to_worker || routed_to_main
             }),
             "worker 输出必须沿用执行计划中的 lane 归属与顺序"

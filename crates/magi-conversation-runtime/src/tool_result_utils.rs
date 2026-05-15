@@ -1,8 +1,7 @@
 //! Task System v2 — 工具调用结果的状态/摘要标准化。
 //!
-//! P7：从 magi-api 平移到 conversation-runtime，让 v2 内部的 writeback / round
-//! 实现可以直接访问；magi-api 留下 pub use 重导出壳，保证迁移阶段 v1 调用点
-//! 仍可编译（M07 在切完 import 后删壳）。
+//! 从 API 层平移到 conversation-runtime，让 runtime 内部的 writeback / round
+//! 实现可以直接访问。
 
 use magi_core::ExecutionResultStatus;
 

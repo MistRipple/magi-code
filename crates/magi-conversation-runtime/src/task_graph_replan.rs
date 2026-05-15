@@ -1,5 +1,5 @@
-//! Task System v2 — M14：任务图重规划入口从 magi-api/dispatch_execution.rs 下沉
-//! 到 conversation-runtime。
+//! Task System v2 — M14：任务图重规划入口从旧版 API 派发层下沉到
+//! conversation-runtime。
 //!
 //! `replan_task_graph` 与 `ensure_session_active_execution_chain` 都不再持有
 //! `&ApiState`，改为接收显式 stores / registries / event bus / model bridge client
@@ -8,8 +8,8 @@
 
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use magi_agent_role::AgentRoleRegistry;
 use magi_bridge_client::ModelBridgeClient;
@@ -109,9 +109,7 @@ pub fn replan_task_graph(
             .saturating_add(REPLAN_GRAPH_COUNTER.fetch_add(1, Ordering::Relaxed)),
     );
     let plan = decompose_mission(model_bridge_client, workspace_root_path, Some(prompt_text))
-        .ok_or_else(|| {
-            TaskGraphReplanError::Internal("无法生成结构化任务计划".to_string())
-        })?;
+        .ok_or_else(|| TaskGraphReplanError::Internal("无法生成结构化任务计划".to_string()))?;
     if !task_phase_count_is_valid(plan.phases.len()) {
         return Err(TaskGraphReplanError::Internal(format!(
             "任务图需要 {TASK_MIN_PHASES} 到 {TASK_MAX_PHASES} 个 phase"

@@ -1,4 +1,4 @@
-//! Task System v2 — M13：任务分解管线从 magi-api/dispatch_execution.rs 下沉到
+//! Task System v2 — M13：任务分解管线从旧版 API 派发层下沉到
 //! conversation-runtime。
 //!
 //! 函数 `decompose_mission` 接收显式的 `ModelBridgeClient` 与 `workspace_root_path`，
@@ -29,8 +29,7 @@ pub fn task_plan_tool() -> ChatToolDefinition {
         kind: "function".to_string(),
         function: ChatToolFunctionDefinition {
             name: TASK_PLAN_TOOL_NAME.to_string(),
-            description: "创建严格结构化的任务图计划，供 Task Graph 构建器直接消费。"
-                .to_string(),
+            description: "创建严格结构化的任务图计划，供 Task Graph 构建器直接消费。".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "additionalProperties": false,

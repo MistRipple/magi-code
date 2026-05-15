@@ -6,9 +6,8 @@
 //! S1：4 个 user-input 入口经 `ingest_user_input_to_conversation` 推 Mailbox + drain。
 //! S2：执行路径外层经 `begin_session_turn` / `finalize_session_turn` 维护 Turn 生命周期。
 //!
-//! Turn 生命周期当前仍是"软不变式"——v1 worker 派发尚未隔离到子 Conversation
-//! （计划 S6），出现 `TurnAlreadyActive` 时降级为警告而非中断，避免误伤现有并发路径。
-//! S6 后回硬。
+//! Turn 生命周期当前仍是"软不变式"——深度任务 worker 派发仍可能并发触发子路径，
+//! 出现 `TurnAlreadyActive` 时降级为警告而非中断，避免误伤现有并发路径。
 
 use magi_conversation_runtime::{BeginTurnError, TurnAdvanceError, TurnState, UserSignal};
 use magi_core::{SessionId, UtcMillis};
@@ -57,14 +56,14 @@ pub(super) fn begin_session_turn(state: &ApiState, session_id: &SessionId) {
 
 /// 把 Turn 推进到给定终态并回收槽位。当前实现接受"未开始即 finalize"的边界
 /// 情况（warning），同样是为兼容尚未完整接入的 worker 派发路径。
-pub(super) fn finalize_session_turn(
-    state: &ApiState,
-    session_id: &SessionId,
-    success: bool,
-) {
+pub(super) fn finalize_session_turn(state: &ApiState, session_id: &SessionId, success: bool) {
     let conv = state.conversation_registry.conversation_for(session_id);
     let mut guard = conv.lock().expect("conversation turn lock poisoned");
-    let target = if success { TurnState::Done } else { TurnState::Failed };
+    let target = if success {
+        TurnState::Done
+    } else {
+        TurnState::Failed
+    };
     let transition = guard.advance_current_turn(|turn| {
         if success {
             turn.finish_done()
