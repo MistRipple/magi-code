@@ -9,11 +9,14 @@
 //! - S2：Turn 状态机 + 单 Conversation 不并发不变式（v2 拥有 Turn lifecycle，
 //!   v1 `run_task_llm_loop` 暂作"一轮 IO 引擎"被 v2 调度）
 
+#![recursion_limit = "256"]
+
 mod builtin_tool_schema;
 mod conversation;
 mod driver;
 pub mod execution_chain_recovery;
 mod mailbox;
+pub mod mission_decomposition;
 pub mod model_config;
 pub mod prompt_utils;
 mod registry;
