@@ -22,6 +22,8 @@ magi-human-checkpoint = { path = "../magi-human-checkpoint" }
 magi-governance = { path = "../magi-governance" }
 magi-skill-runtime = { path = "../magi-skill-runtime" }
 magi-permissions = { path = "../magi-permissions" }
+magi-session-store = { path = "../magi-session-store" }
+magi-agent-role = { path = "../magi-agent-role" }
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true

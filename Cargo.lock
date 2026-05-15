@@ -1024,6 +1024,7 @@ dependencies = [
 name = "magi-conversation-runtime"
 version = "0.1.0"
 dependencies = [
+ "magi-agent-role",
  "magi-bridge-client",
  "magi-checkpoint",
  "magi-core",
@@ -1037,6 +1038,7 @@ dependencies = [
  "magi-plan",
  "magi-project-memory",
  "magi-safety-gate",
+ "magi-session-store",
  "magi-skill-runtime",
  "magi-spawn-graph",
  "magi-todo-ledger",
