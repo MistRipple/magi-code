@@ -22,6 +22,7 @@ pub mod settings_store;
 mod skill_apply_tool;
 mod stream;
 pub mod task_helpers;
+pub mod task_llm_loop;
 pub mod tool_batch;
 pub mod tool_result_utils;
 mod turn;

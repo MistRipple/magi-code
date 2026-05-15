@@ -1033,6 +1033,7 @@ dependencies = [
  "magi-human-checkpoint",
  "magi-knowledge-graph",
  "magi-mission-charter",
+ "magi-mission-workspace",
  "magi-orchestrator",
  "magi-permissions",
  "magi-plan",
