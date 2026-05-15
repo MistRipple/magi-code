@@ -1040,6 +1040,7 @@ dependencies = [
  "magi-safety-gate",
  "magi-session-store",
  "magi-skill-runtime",
+ "magi-snapshot",
  "magi-spawn-graph",
  "magi-todo-ledger",
  "magi-tool-runtime",

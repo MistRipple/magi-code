@@ -14,10 +14,12 @@ mod conversation;
 mod driver;
 mod mailbox;
 mod registry;
+pub mod session_writeback;
 mod skill_apply_tool;
 mod stream;
 pub mod task_helpers;
 pub mod tool_batch;
+pub mod tool_result_utils;
 mod turn;
 
 pub use builtin_tool_schema::{internal_builtin_tool_rejection_payload, public_builtin_tool_definitions};
