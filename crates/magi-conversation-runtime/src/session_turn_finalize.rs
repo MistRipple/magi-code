@@ -127,11 +127,7 @@ pub fn publish_task_status_turn_item_for_active_sessions(
         );
         item.source = "task".to_string();
         item.task_id = Some(task.task_id.clone());
-        item.role_id = task
-            .executor_binding
-            .as_ref()
-            .map(|binding| binding.target_role.clone())
-            .filter(|role_id| !role_id.trim().is_empty());
+        item.role_id = task.executor_binding_target_role().map(str::to_string);
         if let Some(lane) = lane {
             item.lane_id = Some(lane.lane_id.clone());
             item.lane_seq = Some(lane.lane_seq);

@@ -267,9 +267,7 @@ fn merge_session_sidecars(
 fn task_role_id(task_store: Option<&TaskStore>, task_id: &TaskId) -> Option<String> {
     task_store
         .and_then(|store| store.get_task(task_id))
-        .and_then(|task| task.executor_binding.map(|binding| binding.target_role))
-        .map(|role| role.trim().to_string())
-        .filter(|role| !role.is_empty())
+        .and_then(|task| task.executor_binding_target_role().map(str::to_string))
 }
 
 fn session_branch_summary(
@@ -1474,13 +1472,13 @@ mod tests {
             dependency_ids: Vec::new(),
             required_children: Vec::new(),
             policy_snapshot: None,
-            executor_binding: Some(magi_core::ExecutorBinding {
-                target_role: "reviewer".to_string(),
-                capability_requirements: Vec::new(),
-                parallelism_group: None,
-                exclusive_scope: None,
-                worker_selector: None,
-            }),
+            executor_binding: Some(serde_json::json!({
+                "target_role": "reviewer",
+                "capability_requirements": [],
+                "parallelism_group": null,
+                "exclusive_scope": null,
+                "worker_selector": null,
+            })),
             context_refs: Vec::new(),
             knowledge_refs: Vec::new(),
             workspace_scope: None,

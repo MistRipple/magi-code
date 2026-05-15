@@ -5,18 +5,15 @@
 //! EventBased* / WorkerExecutionDispatcher 等执行桥类型；TaskRunner 本体只依赖这些
 //! trait 与 TaskStore，因此可先迁到 v2 runtime，后续 M19 再拆剩余桥层。
 
-use magi_agent_role::AgentRoleRegistry;
-use magi_core::{
-    DecisionOption, DecisionTaskPayload, EventId, PolicyDispatchDecision, Task, TaskId, TaskKind,
-    TaskStatus, UtcMillis,
-};
-use magi_event_bus::{EventEnvelope, InMemoryEventBus};
 use crate::task_runner_bridge::{
     NoOpDispatcher, NoOpResultReceiver, RunCycleOutcome, TaskDispatcher, TaskOutcome,
     TaskResultReceiver,
 };
 #[cfg(test)]
 use crate::task_runner_bridge::{EventBasedResultReceiver, TaskResult, WorkerExecutionDispatcher};
+use magi_agent_role::AgentRoleRegistry;
+use magi_core::{EventId, Task, TaskId, TaskKind, TaskStatus, UtcMillis};
+use magi_event_bus::{EventEnvelope, InMemoryEventBus};
 use magi_orchestrator::task_store::TaskStore;
 use magi_orchestrator::task_worker_catalog::{WorkerInfo, resolve_task_role};
 use std::collections::HashSet;
@@ -24,6 +21,21 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 const DEFAULT_LEASE_DURATION_MS: u64 = 60_000;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DispatchPolicyOutcome {
+    Allow,
+    Reject(String),
+    NeedsApproval(String),
+}
+
+fn decision_payload_text(payload: &serde_json::Value, key: &str) -> String {
+    payload
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
 
 /// The task runner implements the main scheduling loop for the Task Graph
 /// orchestration system. Each call to `run_cycle` performs one iteration:
@@ -199,20 +211,18 @@ impl TaskRunner {
                 }
             }
 
-            // Exclusive scope conflict check via executor_binding.
-            if let Some(ref binding) = task.executor_binding {
-                if let Some(ref exc_scope) = binding.exclusive_scope {
-                    if self.has_running_exclusive_scope(root_task_id, exc_scope, &task.task_id) {
-                        unmatched_ids.push(task.task_id.clone());
-                        continue;
-                    }
+            // Exclusive scope conflict check via executor_binding JSON metadata.
+            if let Some(exc_scope) = task.executor_binding_exclusive_scope() {
+                if self.has_running_exclusive_scope(root_task_id, exc_scope, &task.task_id) {
+                    unmatched_ids.push(task.task_id.clone());
+                    continue;
                 }
-                // Parallelism group conflict: same group cannot run concurrently (design 5.3).
-                if let Some(ref group) = binding.parallelism_group {
-                    if running_parallelism_groups.contains(group) {
-                        unmatched_ids.push(task.task_id.clone());
-                        continue;
-                    }
+            }
+            // Parallelism group conflict: same group cannot run concurrently (design 5.3).
+            if let Some(group) = task.executor_binding_parallelism_group() {
+                if running_parallelism_groups.contains(group) {
+                    unmatched_ids.push(task.task_id.clone());
+                    continue;
                 }
             }
 
@@ -225,40 +235,28 @@ impl TaskRunner {
             {
                 let policy = task.policy_snapshot.as_ref().unwrap();
                 match self.check_policy_allows_dispatch(policy, task) {
-                    PolicyDispatchDecision::Allow => {}
-                    PolicyDispatchDecision::Reject(_) => {
+                    DispatchPolicyOutcome::Allow => {}
+                    DispatchPolicyOutcome::Reject(_) => {
                         unmatched_ids.push(task.task_id.clone());
                         continue;
                     }
-                    PolicyDispatchDecision::NeedsApproval(ref reason) => {
+                    DispatchPolicyOutcome::NeedsApproval(ref reason) => {
                         // 交互模式下等待用户确认：创建 Decision Task 阻塞当前任务。
                         if let Some(parent_id) = &task.parent_task_id {
-                            let payload = magi_core::DecisionTaskPayload {
-                                decision_context: reason.clone(),
-                                blocked_reason: format!("任务 {} 等待继续执行确认", task.title),
-                                target_task_id: Some(task.task_id.clone()),
-                                options: vec![
-                                    magi_core::DecisionOption {
-                                        option_id: "continue".to_string(),
-                                        label: "继续执行".to_string(),
-                                        description: "继续执行后续任务".to_string(),
-                                    },
-                                    magi_core::DecisionOption {
-                                        option_id: "skip".to_string(),
-                                        label: "跳过此任务".to_string(),
-                                        description: "跳过此任务继续后续流程".to_string(),
-                                    },
-                                    magi_core::DecisionOption {
-                                        option_id: "cancel".to_string(),
-                                        label: "取消整个任务".to_string(),
-                                        description: "取消整个任务树".to_string(),
-                                    },
+                            let payload = serde_json::json!({
+                                "decision_context": reason,
+                                "blocked_reason": format!("任务 {} 等待继续执行确认", task.title),
+                                "target_task_id": task.task_id.to_string(),
+                                "options": [
+                                    {"option_id": "continue", "label": "继续执行", "description": "继续执行后续任务"},
+                                    {"option_id": "skip", "label": "跳过此任务", "description": "跳过此任务继续后续流程"},
+                                    {"option_id": "cancel", "label": "取消整个任务", "description": "取消整个任务树"}
                                 ],
-                                risk_notes: vec!["交互模式要求用户确认每一步".to_string()],
-                                recommended_option: Some("continue".to_string()),
-                                required_user_input: true,
-                                decision_evidence: None,
-                            };
+                                "risk_notes": ["交互模式要求用户确认每一步"],
+                                "recommended_option": "continue",
+                                "required_user_input": true,
+                                "decision_evidence": null
+                            });
                             let _ = self.escalate_to_decision(parent_id, payload);
                         }
                         unmatched_ids.push(task.task_id.clone());
@@ -340,10 +338,8 @@ impl TaskRunner {
                     if let Some(ref scope) = task.write_scope {
                         running_write_scopes.push(scope.clone());
                     }
-                    if let Some(ref binding) = task.executor_binding {
-                        if let Some(ref group) = binding.parallelism_group {
-                            running_parallelism_groups.insert(group.clone());
-                        }
+                    if let Some(group) = task.executor_binding_parallelism_group() {
+                        running_parallelism_groups.insert(group.to_string());
                     }
                 }
                 // If grant_lease returns None the task already has an active
@@ -636,33 +632,20 @@ impl TaskRunner {
         let Some(parent_id) = &task.parent_task_id else {
             return Ok(());
         };
-        let payload = DecisionTaskPayload {
-            decision_context: format!("验证任务 {} 缺少交付证据", task.title),
-            blocked_reason: "深度模式验证任务完成时未产出 output_refs，无法确认交付质量"
-                .to_string(),
-            target_task_id: Some(task.task_id.clone()),
-            options: vec![
-                DecisionOption {
-                    option_id: "provide_evidence".to_string(),
-                    label: "补充证据".to_string(),
-                    description: "补充验证证据后继续推进".to_string(),
-                },
-                DecisionOption {
-                    option_id: "rerun_validation".to_string(),
-                    label: "重新验证".to_string(),
-                    description: "重新执行验证任务以生成证据".to_string(),
-                },
-                DecisionOption {
-                    option_id: "abort".to_string(),
-                    label: "中止".to_string(),
-                    description: "中止当前任务链".to_string(),
-                },
+        let payload = serde_json::json!({
+            "decision_context": format!("验证任务 {} 缺少交付证据", task.title),
+            "blocked_reason": "深度模式验证任务完成时未产出 output_refs，无法确认交付质量",
+            "target_task_id": task.task_id.to_string(),
+            "options": [
+                {"option_id": "provide_evidence", "label": "补充证据", "description": "补充验证证据后继续推进"},
+                {"option_id": "rerun_validation", "label": "重新验证", "description": "重新执行验证任务以生成证据"},
+                {"option_id": "abort", "label": "中止", "description": "中止当前任务链"}
             ],
-            risk_notes: vec!["缺少验证证据会导致深度模式交付不可审计".to_string()],
-            recommended_option: Some("rerun_validation".to_string()),
-            required_user_input: true,
-            decision_evidence: None,
-        };
+            "risk_notes": ["缺少验证证据会导致深度模式交付不可审计"],
+            "recommended_option": "rerun_validation",
+            "required_user_input": true,
+            "decision_evidence": null
+        });
         self.escalate_to_decision(parent_id, payload).map(|_| ())
     }
 
@@ -752,35 +735,23 @@ impl TaskRunner {
                     .map(|label| format!("触发风险：{label}"))
             })
             .collect();
-        let payload = DecisionTaskPayload {
-            decision_context: format!("{} 执行失败，需要选择后续处理方式", task.title),
-            blocked_reason: format!(
+        let payload = serde_json::json!({
+            "decision_context": format!("{} 执行失败，需要选择后续处理方式", task.title),
+            "blocked_reason": format!(
                 "失败原因：{}",
                 Self::summarize_escalation_conditions(&conditions)
             ),
-            target_task_id: Some(task.task_id.clone()),
-            options: vec![
-                DecisionOption {
-                    option_id: "retry".to_string(),
-                    label: "重试".to_string(),
-                    description: "重新执行失败的任务".to_string(),
-                },
-                DecisionOption {
-                    option_id: "skip".to_string(),
-                    label: "跳过".to_string(),
-                    description: "跳过此任务继续后续流程".to_string(),
-                },
-                DecisionOption {
-                    option_id: "abort".to_string(),
-                    label: "中止".to_string(),
-                    description: "中止整个任务树".to_string(),
-                },
+            "target_task_id": task.task_id.to_string(),
+            "options": [
+                {"option_id": "retry", "label": "重试", "description": "重新执行失败的任务"},
+                {"option_id": "skip", "label": "跳过", "description": "跳过此任务继续后续流程"},
+                {"option_id": "abort", "label": "中止", "description": "中止整个任务树"}
             ],
-            risk_notes,
-            recommended_option: Some("retry".to_string()),
-            required_user_input: true,
-            decision_evidence: None,
-        };
+            "risk_notes": risk_notes,
+            "recommended_option": "retry",
+            "required_user_input": true,
+            "decision_evidence": null
+        });
         let _ = self.escalate_to_decision(parent_id, payload);
     }
 
@@ -938,10 +909,7 @@ impl TaskRunner {
                 }
                 self.store.get_task(&id).is_some_and(|t| {
                     t.status == TaskStatus::Running
-                        && t.executor_binding
-                            .as_ref()
-                            .and_then(|b| b.exclusive_scope.as_deref())
-                            == Some(scope)
+                        && t.executor_binding_exclusive_scope() == Some(scope)
                 })
             })
     }
@@ -953,9 +921,7 @@ impl TaskRunner {
             .filter_map(|id| {
                 self.store.get_task(&id).and_then(|t| {
                     if t.status == TaskStatus::Running {
-                        t.executor_binding
-                            .as_ref()
-                            .and_then(|b| b.parallelism_group.clone())
+                        t.executor_binding_parallelism_group().map(ToOwned::to_owned)
                     } else {
                         None
                     }
@@ -969,10 +935,10 @@ impl TaskRunner {
         &self,
         policy: &magi_core::TaskPolicy,
         task: &Task,
-    ) -> PolicyDispatchDecision {
+    ) -> DispatchPolicyOutcome {
         // Manual  autonomy_level: 完全禁止自动派发。
         if policy.autonomy_level.eq_ignore_ascii_case("manual") {
-            return PolicyDispatchDecision::Reject(
+            return DispatchPolicyOutcome::Reject(
                 "autonomy_level 为 Manual，不允许自动派发".to_string(),
             );
         }
@@ -980,7 +946,7 @@ impl TaskRunner {
         // DecisionOnly: 只允许 Action/Validation/Repair 自动派发，
         // 但需要检查同级前序 Action 是否需要交互确认。
         if policy.approval_mode.eq_ignore_ascii_case("decisiononly") {
-            return PolicyDispatchDecision::Allow;
+            return DispatchPolicyOutcome::Allow;
         }
 
         // Interactive: Action 完成后下一个同级 Action 需要用户确认。
@@ -1007,14 +973,14 @@ impl TaskRunner {
                     )
                 });
                 if has_recent_completed_sibling {
-                    return PolicyDispatchDecision::NeedsApproval(
+                    return DispatchPolicyOutcome::NeedsApproval(
                         "交互模式：等待用户确认继续".to_string(),
                     );
                 }
             }
         }
 
-        PolicyDispatchDecision::Allow
+        DispatchPolicyOutcome::Allow
     }
 
     // ------------------------------------------------------------------
@@ -1026,7 +992,7 @@ impl TaskRunner {
     pub fn escalate_to_decision(
         &self,
         parent_task_id: &TaskId,
-        payload: magi_core::DecisionTaskPayload,
+        payload: serde_json::Value,
     ) -> Result<TaskId, String> {
         let parent = self
             .store
@@ -1038,11 +1004,15 @@ impl TaskRunner {
             parent_task_id,
             UtcMillis::now().0
         ));
-        let event_context = payload.decision_context.clone();
+        let event_context = decision_payload_text(&payload, "decision_context");
+        let blocked_reason = decision_payload_text(&payload, "blocked_reason");
         let event_options: Vec<String> = payload
-            .options
-            .iter()
-            .map(|o| o.option_id.clone())
+            .get("options")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|option| option.get("option_id").and_then(serde_json::Value::as_str))
+            .map(ToOwned::to_owned)
             .collect();
         let decision_task = Task {
             task_id: decision_id.clone(),
@@ -1050,8 +1020,8 @@ impl TaskRunner {
             root_task_id: parent.root_task_id.clone(),
             parent_task_id: Some(parent_task_id.clone()),
             kind: TaskKind::Decision,
-            title: Self::build_decision_task_title(&payload.decision_context),
-            goal: payload.blocked_reason.clone(),
+            title: Self::build_decision_task_title(&event_context),
+            goal: blocked_reason,
             status: TaskStatus::AwaitingApproval,
             dependency_ids: Vec::new(),
             required_children: Vec::new(),
@@ -1272,9 +1242,10 @@ fn scopes_conflict(a: &str, b: &str) -> bool {
 mod tests {
     use super::*;
     use magi_core::{
-        AssignmentLease, LeaseId, LeaseStatus, MissionId, Task, TaskId, TaskKind, TaskPolicy,
-        TaskResultKind, TaskStatus, TerminationReason, UtcMillis, VerificationStatus, WorkerId,
+        LeaseId, MissionId, Task, TaskId, TaskKind, TaskPolicy, TaskResultKind, TaskStatus,
+        TerminationReason, UtcMillis, VerificationStatus, WorkerId,
     };
+    use magi_orchestrator::task_store::{TaskLease, TaskLeaseState};
     use magi_worker_runtime::{WorkerExecutionIntentStep, WorkerRuntime};
 
     fn make_task(
@@ -1491,7 +1462,7 @@ mod tests {
 
         // Insert an already-expired lease.
         let now = UtcMillis::now();
-        let expired_lease = AssignmentLease {
+        let expired_lease = TaskLease {
             lease_id: LeaseId::new("lease-expired"),
             task_id: TaskId::new("act-1"),
             root_task_id: TaskId::new("obj-1"),
@@ -1500,7 +1471,7 @@ mod tests {
             granted_at: UtcMillis(now.0.saturating_sub(120_000)),
             expires_at: UtcMillis(now.0.saturating_sub(60_000)),
             heartbeat_at: UtcMillis(now.0.saturating_sub(120_000)),
-            lease_status: LeaseStatus::Active,
+            lease_status: TaskLeaseState::Active,
         };
         store.insert_lease(expired_lease);
 
@@ -2051,7 +2022,7 @@ mod tests {
             &self,
             task: &Task,
             worker: &WorkerInfo,
-            lease: &AssignmentLease,
+            lease: &TaskLease,
         ) -> Result<(), String> {
             self.dispatches.lock().unwrap().push((
                 task.task_id.to_string(),
@@ -2175,7 +2146,7 @@ mod tests {
 
         // Insert a lease for the running task.
         let now = UtcMillis::now();
-        let lease = AssignmentLease {
+        let lease = TaskLease {
             lease_id: LeaseId::new("lease-act-1"),
             task_id: TaskId::new("act-1"),
             root_task_id: TaskId::new("obj-1"),
@@ -2184,7 +2155,7 @@ mod tests {
             granted_at: now,
             expires_at: UtcMillis(now.0 + 120_000),
             heartbeat_at: now,
-            lease_status: LeaseStatus::Active,
+            lease_status: TaskLeaseState::Active,
         };
         store.insert_lease(lease);
 
@@ -2239,7 +2210,7 @@ mod tests {
         store.insert_task(act);
 
         let now = UtcMillis::now();
-        let lease = AssignmentLease {
+        let lease = TaskLease {
             lease_id: LeaseId::new("lease-act-1"),
             task_id: TaskId::new("act-1"),
             root_task_id: TaskId::new("obj-1"),
@@ -2248,7 +2219,7 @@ mod tests {
             granted_at: now,
             expires_at: UtcMillis(now.0 + 120_000),
             heartbeat_at: now,
-            lease_status: LeaseStatus::Active,
+            lease_status: TaskLeaseState::Active,
         };
         store.insert_lease(lease);
         assert!(
@@ -2314,7 +2285,7 @@ mod tests {
         store.insert_task(act);
 
         let now = UtcMillis::now();
-        let lease = AssignmentLease {
+        let lease = TaskLease {
             lease_id: LeaseId::new("lease-act-1"),
             task_id: TaskId::new("act-1"),
             root_task_id: TaskId::new("obj-1"),
@@ -2323,7 +2294,7 @@ mod tests {
             granted_at: now,
             expires_at: UtcMillis(now.0 + 120_000),
             heartbeat_at: now,
-            lease_status: LeaseStatus::Active,
+            lease_status: TaskLeaseState::Active,
         };
         store.insert_lease(lease);
 
@@ -2363,7 +2334,7 @@ mod tests {
             &self,
             _task: &Task,
             _worker: &WorkerInfo,
-            _lease: &AssignmentLease,
+            _lease: &TaskLease,
         ) -> Result<(), String> {
             Err("worker unavailable".to_string())
         }
@@ -2515,13 +2486,13 @@ mod tests {
             TaskKind::Action,
             TaskStatus::Ready,
         );
-        act1.executor_binding = Some(magi_core::ExecutorBinding {
-            target_role: "integration-dev".to_string(),
-            capability_requirements: Vec::new(),
-            parallelism_group: None,
-            exclusive_scope: Some("deploy-prod".to_string()),
-            worker_selector: None,
-        });
+        act1.executor_binding = Some(serde_json::json!({
+            "target_role": "integration-dev",
+            "capability_requirements": [],
+            "parallelism_group": null,
+            "exclusive_scope": "deploy-prod",
+            "worker_selector": null,
+        }));
         let mut act2 = make_task(
             "act-2",
             "m-1",
@@ -2530,13 +2501,13 @@ mod tests {
             TaskKind::Action,
             TaskStatus::Ready,
         );
-        act2.executor_binding = Some(magi_core::ExecutorBinding {
-            target_role: "integration-dev".to_string(),
-            capability_requirements: Vec::new(),
-            parallelism_group: None,
-            exclusive_scope: Some("deploy-prod".to_string()),
-            worker_selector: None,
-        });
+        act2.executor_binding = Some(serde_json::json!({
+            "target_role": "integration-dev",
+            "capability_requirements": [],
+            "parallelism_group": null,
+            "exclusive_scope": "deploy-prod",
+            "worker_selector": null,
+        }));
 
         store.insert_task(root);
         store.insert_task(act1);
@@ -2690,7 +2661,7 @@ mod tests {
         store.insert_task(act);
 
         let now = UtcMillis::now();
-        let lease = AssignmentLease {
+        let lease = TaskLease {
             lease_id: LeaseId::new("lease-act-1"),
             task_id: TaskId::new("act-1"),
             root_task_id: TaskId::new("obj-1"),
@@ -2699,7 +2670,7 @@ mod tests {
             granted_at: now,
             expires_at: UtcMillis(now.0 + 120_000),
             heartbeat_at: now,
-            lease_status: LeaseStatus::Active,
+            lease_status: TaskLeaseState::Active,
         };
         store.insert_lease(lease);
 
@@ -2779,7 +2750,7 @@ mod tests {
         store.insert_task(act);
 
         let now = UtcMillis::now();
-        let lease = AssignmentLease {
+        let lease = TaskLease {
             lease_id: LeaseId::new("lease-act-1"),
             task_id: TaskId::new("act-1"),
             root_task_id: TaskId::new("obj-1"),
@@ -2788,7 +2759,7 @@ mod tests {
             granted_at: now,
             expires_at: UtcMillis(now.0 + 120_000),
             heartbeat_at: now,
-            lease_status: LeaseStatus::Active,
+            lease_status: TaskLeaseState::Active,
         };
         store.insert_lease(lease);
 
@@ -3702,20 +3673,16 @@ mod tests {
         )
         .with_event_bus(Arc::clone(&event_bus));
 
-        let payload = magi_core::DecisionTaskPayload {
-            decision_context: "测试决策".to_string(),
-            blocked_reason: "需要确认".to_string(),
-            target_task_id: None,
-            options: vec![magi_core::DecisionOption {
-                option_id: "yes".to_string(),
-                label: "是".to_string(),
-                description: "确认".to_string(),
-            }],
-            risk_notes: vec![],
-            recommended_option: Some("yes".to_string()),
-            required_user_input: true,
-            decision_evidence: None,
-        };
+        let payload = serde_json::json!({
+            "decision_context": "测试决策",
+            "blocked_reason": "需要确认",
+            "target_task_id": null,
+            "options": [{"option_id": "yes", "label": "是", "description": "确认"}],
+            "risk_notes": [],
+            "recommended_option": "yes",
+            "required_user_input": true,
+            "decision_evidence": null
+        });
 
         let decision_id = runner
             .escalate_to_decision(&TaskId::new("parent-1"), payload)

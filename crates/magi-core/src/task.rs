@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{LeaseId, MissionId, TaskId, WorkerId};
+use crate::ids::{MissionId, TaskId};
 use crate::value_objects::UtcMillis;
 
 // ---------------------------------------------------------------------------
@@ -37,33 +37,6 @@ pub enum TaskStatus {
     Failed,
     Cancelled,
     Skipped,
-}
-
-// ---------------------------------------------------------------------------
-// ExecutorBinding
-// ---------------------------------------------------------------------------
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ExecutorBinding {
-    pub target_role: String,
-    pub capability_requirements: Vec<String>,
-    pub parallelism_group: Option<String>,
-    pub exclusive_scope: Option<String>,
-    pub worker_selector: Option<String>,
-}
-
-// ---------------------------------------------------------------------------
-// PolicyDispatchDecision
-// ---------------------------------------------------------------------------
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum PolicyDispatchDecision {
-    /// 允许派发。
-    Allow,
-    /// 拒绝派发，附带原因。
-    Reject(String),
-    /// 需要审批，创建 Decision Task。
-    NeedsApproval(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -139,7 +112,9 @@ pub struct Task {
     pub dependency_ids: Vec<TaskId>,
     pub required_children: Vec<TaskId>,
     pub policy_snapshot: Option<TaskPolicy>,
-    pub executor_binding: Option<ExecutorBinding>,
+    /// Executor routing metadata stored as JSON to keep v2 runtime-specific
+    /// binding shapes out of magi-core.
+    pub executor_binding: Option<serde_json::Value>,
     pub context_refs: Vec<String>,
     pub knowledge_refs: Vec<String>,
     pub workspace_scope: Option<String>,
@@ -149,8 +124,9 @@ pub struct Task {
     pub evidence_refs: Vec<String>,
     pub retry_count: u32,
     pub repair_count: u32,
-    /// Payload for Decision tasks (design 12).
-    pub decision_payload: Option<DecisionTaskPayload>,
+    /// Payload for Decision tasks (design 12), stored as JSON because the
+    /// decision lifecycle belongs to the v2 task runner rather than core.
+    pub decision_payload: Option<serde_json::Value>,
     /// Task System v2 — L11：执行变体；缺省 LocalAgent，兼容旧持久化数据。
     #[serde(default)]
     pub variant: TaskVariant,
@@ -158,52 +134,27 @@ pub struct Task {
     pub updated_at: UtcMillis,
 }
 
-// ---------------------------------------------------------------------------
-// AssignmentLease
-// ---------------------------------------------------------------------------
+impl Task {
+    fn executor_binding_str(&self, key: &str) -> Option<&str> {
+        self.executor_binding
+            .as_ref()
+            .and_then(|binding| binding.get(key))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct AssignmentLease {
-    pub lease_id: LeaseId,
-    pub task_id: TaskId,
-    pub root_task_id: TaskId,
-    pub worker_id: WorkerId,
-    pub role: String,
-    pub granted_at: UtcMillis,
-    pub expires_at: UtcMillis,
-    pub heartbeat_at: UtcMillis,
-    pub lease_status: LeaseStatus,
-}
+    pub fn executor_binding_target_role(&self) -> Option<&str> {
+        self.executor_binding_str("target_role")
+    }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum LeaseStatus {
-    Active,
-    Completed,
-    Expired,
-    Revoked,
-}
+    pub fn executor_binding_parallelism_group(&self) -> Option<&str> {
+        self.executor_binding_str("parallelism_group")
+    }
 
-// ---------------------------------------------------------------------------
-// DecisionTaskPayload
-// ---------------------------------------------------------------------------
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct DecisionTaskPayload {
-    pub decision_context: String,
-    pub blocked_reason: String,
-    pub target_task_id: Option<TaskId>,
-    pub options: Vec<DecisionOption>,
-    pub risk_notes: Vec<String>,
-    pub recommended_option: Option<String>,
-    pub required_user_input: bool,
-    pub decision_evidence: Option<serde_json::Value>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct DecisionOption {
-    pub option_id: String,
-    pub label: String,
-    pub description: String,
+    pub fn executor_binding_exclusive_scope(&self) -> Option<&str> {
+        self.executor_binding_str("exclusive_scope")
+    }
 }
 
 // ---------------------------------------------------------------------------

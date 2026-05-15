@@ -20,8 +20,7 @@ pub use status::{
     VerificationStatus, WorkerLifecycleStatus, WorkspaceLifecycleStatus,
 };
 pub use task::{
-    AssignmentLease, DecisionOption, DecisionTaskPayload, ExecutorBinding, LeaseStatus,
-    PolicyDispatchDecision, ProgressSummary, Task, TaskKind, TaskPolicy, TaskProjection,
-    TaskStatus, TaskVariant, WorkPackageSummary,
+    ProgressSummary, Task, TaskKind, TaskPolicy, TaskProjection, TaskStatus, TaskVariant,
+    WorkPackageSummary,
 };
 pub use value_objects::{AbsolutePath, UtcMillis, WorkspaceRootPath, WorktreeRootPath};

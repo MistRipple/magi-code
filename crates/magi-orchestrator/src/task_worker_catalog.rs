@@ -31,9 +31,8 @@ pub fn default_task_role_for_kind(kind: TaskKind) -> Option<&'static str> {
 }
 
 pub fn resolve_task_role<'a>(task: &'a Task, registry: &AgentRoleRegistry) -> Option<&'a str> {
-    if let Some(binding) = task.executor_binding.as_ref() {
-        let role = binding.target_role.trim();
-        if !role.is_empty() && registry.role_supports_task_kind(role, task.kind) {
+    if let Some(role) = task.executor_binding_target_role() {
+        if registry.role_supports_task_kind(role, task.kind) {
             return Some(role);
         }
     }
@@ -298,13 +297,13 @@ mod tests {
             dependency_ids: Vec::new(),
             required_children: Vec::new(),
             policy_snapshot: None,
-            executor_binding: Some(magi_core::ExecutorBinding {
-                target_role: "test-engineer".to_string(),
-                capability_requirements: Vec::new(),
-                parallelism_group: None,
-                exclusive_scope: None,
-                worker_selector: None,
-            }),
+            executor_binding: Some(serde_json::json!({
+                "target_role": "test-engineer",
+                "capability_requirements": [],
+                "parallelism_group": null,
+                "exclusive_scope": null,
+                "worker_selector": null,
+            })),
             context_refs: Vec::new(),
             knowledge_refs: Vec::new(),
             workspace_scope: None,

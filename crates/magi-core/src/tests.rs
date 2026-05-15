@@ -48,7 +48,7 @@ fn path_value_objects_provide_consistent_accessors() {
 // ---------------------------------------------------------------------------
 
 use crate::task::*;
-use crate::{LeaseId, MissionId, TaskId, UtcMillis, WorkerId};
+use crate::{LeaseId, MissionId, TaskId, UtcMillis};
 
 #[test]
 fn task_kind_serialization_roundtrip() {
@@ -119,13 +119,13 @@ fn task_serialization_roundtrip() {
             background_allowed: false,
             escalation_conditions: vec!["high_risk".to_string()],
         }),
-        executor_binding: Some(ExecutorBinding {
-            target_role: "developer".to_string(),
-            capability_requirements: vec!["rust".to_string()],
-            parallelism_group: Some("group-a".to_string()),
-            exclusive_scope: None,
-            worker_selector: None,
-        }),
+        executor_binding: Some(serde_json::json!({
+            "target_role": "developer",
+            "capability_requirements": ["rust"],
+            "parallelism_group": "group-a",
+            "exclusive_scope": null,
+            "worker_selector": null,
+        })),
         context_refs: vec!["ctx-1".to_string()],
         knowledge_refs: Vec::new(),
         workspace_scope: Some("/workspace".to_string()),
@@ -169,71 +169,27 @@ fn task_variant_local_bash_serialization_roundtrip() {
 }
 
 #[test]
-fn lease_status_serialization_roundtrip() {
-    let statuses = vec![
-        LeaseStatus::Active,
-        LeaseStatus::Completed,
-        LeaseStatus::Expired,
-        LeaseStatus::Revoked,
-    ];
-    for status in &statuses {
-        let json = serde_json::to_string(status).expect("序列化失败");
-        let deserialized: LeaseStatus = serde_json::from_str(&json).expect("反序列化失败");
-        assert_eq!(*status, deserialized);
-    }
-}
-
-#[test]
-fn assignment_lease_serialization_roundtrip() {
-    let lease = AssignmentLease {
-        lease_id: LeaseId::new("lease-1"),
-        task_id: TaskId::new("task-1"),
-        root_task_id: TaskId::new("task-1"),
-        worker_id: WorkerId::new("worker-1"),
-        role: "executor".to_string(),
-        granted_at: UtcMillis(1000),
-        expires_at: UtcMillis(61000),
-        heartbeat_at: UtcMillis(1000),
-        lease_status: LeaseStatus::Active,
-    };
-
-    let json = serde_json::to_string(&lease).expect("序列化失败");
-    let deserialized: AssignmentLease = serde_json::from_str(&json).expect("反序列化失败");
-
-    assert_eq!(deserialized.lease_id.to_string(), "lease-1");
-    assert_eq!(deserialized.lease_status, LeaseStatus::Active);
-}
-
-#[test]
-fn decision_option_and_payload_serialization() {
-    let payload = DecisionTaskPayload {
-        decision_context: "需要选择实现方案".to_string(),
-        blocked_reason: "存在多个可行方案".to_string(),
-        target_task_id: Some(TaskId::new("target-1")),
-        options: vec![
-            DecisionOption {
-                option_id: "opt-1".to_string(),
-                label: "方案 A".to_string(),
-                description: "使用内存存储".to_string(),
-            },
-            DecisionOption {
-                option_id: "opt-2".to_string(),
-                label: "方案 B".to_string(),
-                description: "使用数据库存储".to_string(),
-            },
+fn task_json_decision_payload_serialization() {
+    let payload = serde_json::json!({
+        "decision_context": "需要选择实现方案",
+        "blocked_reason": "存在多个可行方案",
+        "target_task_id": "target-1",
+        "options": [
+            {"option_id": "opt-1", "label": "方案 A", "description": "使用内存存储"},
+            {"option_id": "opt-2", "label": "方案 B", "description": "使用数据库存储"}
         ],
-        risk_notes: vec!["方案 A 不支持持久化".to_string()],
-        recommended_option: Some("opt-2".to_string()),
-        required_user_input: true,
-        decision_evidence: Some(serde_json::json!({"analysis": "detailed"})),
-    };
+        "risk_notes": ["方案 A 不支持持久化"],
+        "recommended_option": "opt-2",
+        "required_user_input": true,
+        "decision_evidence": {"analysis": "detailed"}
+    });
 
     let json = serde_json::to_string(&payload).expect("序列化失败");
-    let deserialized: DecisionTaskPayload = serde_json::from_str(&json).expect("反序列化失败");
+    let deserialized: serde_json::Value = serde_json::from_str(&json).expect("反序列化失败");
 
-    assert_eq!(deserialized.options.len(), 2);
-    assert_eq!(deserialized.recommended_option, Some("opt-2".to_string()));
-    assert!(deserialized.required_user_input);
+    assert_eq!(deserialized["options"].as_array().unwrap().len(), 2);
+    assert_eq!(deserialized["recommended_option"], "opt-2");
+    assert_eq!(deserialized["required_user_input"], true);
 }
 
 #[test]

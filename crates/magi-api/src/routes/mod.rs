@@ -220,9 +220,8 @@ mod tests {
     };
     use magi_context_runtime::{ContextBudget, ContextRuntime};
     use magi_core::{
-        AbsolutePath, DecisionOption, DecisionTaskPayload, EventId, ExecutionOwnership,
-        ExecutorBinding, LeaseId, MissionId, SessionId, Task, TaskId, TaskKind, TaskStatus,
-        ThreadId, UtcMillis, WorkerId, WorkspaceId,
+        AbsolutePath, EventId, ExecutionOwnership, LeaseId, MissionId, SessionId, Task, TaskId,
+        TaskKind, TaskStatus, ThreadId, UtcMillis, WorkerId, WorkspaceId,
     };
     use magi_event_bus::{EventEnvelope, InMemoryEventBus};
     use magi_governance::GovernanceService;
@@ -2607,13 +2606,13 @@ mod tests {
                 dependency_ids: vec![],
                 required_children: vec![],
                 policy_snapshot: None,
-                executor_binding: Some(ExecutorBinding {
-                    target_role: "reviewer".to_string(),
-                    capability_requirements: vec![],
-                    parallelism_group: None,
-                    exclusive_scope: None,
-                    worker_selector: None,
-                }),
+                executor_binding: Some(serde_json::json!({
+                    "target_role": "reviewer",
+                    "capability_requirements": [],
+                    "parallelism_group": null,
+                    "exclusive_scope": null,
+                    "worker_selector": null,
+                })),
                 context_refs: vec![],
                 knowledge_refs: vec![],
                 workspace_scope: None,
@@ -6701,7 +6700,7 @@ mod tests {
         parent_task_id: Option<&str>,
         kind: TaskKind,
         status: TaskStatus,
-        decision_payload: Option<DecisionTaskPayload>,
+        decision_payload: Option<serde_json::Value>,
     ) {
         let now = UtcMillis::now();
         state
@@ -6938,27 +6937,19 @@ mod tests {
             Some("task-decision-root"),
             TaskKind::Decision,
             TaskStatus::AwaitingApproval,
-            Some(DecisionTaskPayload {
-                decision_context: "任务失败后需要选择处理方式".to_string(),
-                blocked_reason: "等待用户选择失败任务处理方式".to_string(),
-                target_task_id: Some(TaskId::new("task-decision-root")),
-                options: vec![
-                    DecisionOption {
-                        option_id: "retry".to_string(),
-                        label: "重试".to_string(),
-                        description: "重新执行失败任务".to_string(),
-                    },
-                    DecisionOption {
-                        option_id: "abort".to_string(),
-                        label: "中止".to_string(),
-                        description: "中止当前任务链".to_string(),
-                    },
+            Some(serde_json::json!({
+                "decision_context": "任务失败后需要选择处理方式",
+                "blocked_reason": "等待用户选择失败任务处理方式",
+                "target_task_id": "task-decision-root",
+                "options": [
+                    {"option_id": "retry", "label": "重试", "description": "重新执行失败任务"},
+                    {"option_id": "abort", "label": "中止", "description": "中止当前任务链"}
                 ],
-                risk_notes: Vec::new(),
-                recommended_option: Some("retry".to_string()),
-                required_user_input: true,
-                decision_evidence: None,
-            }),
+                "risk_notes": [],
+                "recommended_option": "retry",
+                "required_user_input": true,
+                "decision_evidence": null
+            })),
         );
         bind_test_session_mission(
             &state,

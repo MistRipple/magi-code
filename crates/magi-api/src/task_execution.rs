@@ -1228,7 +1228,7 @@ impl LlmTaskDispatcher {
         &self,
         task: &magi_core::Task,
         worker: &WorkerInfo,
-        lease: &magi_core::AssignmentLease,
+        lease: &magi_orchestrator::task_store::TaskLease,
     ) -> Result<(), String> {
         let Some(plan) = self.execution_registry.remove(&task.task_id) else {
             let error = format!(
@@ -2287,7 +2287,7 @@ impl TaskDispatcher for LlmTaskDispatcher {
         &self,
         task: &magi_core::Task,
         worker: &WorkerInfo,
-        lease: &magi_core::AssignmentLease,
+        lease: &magi_orchestrator::task_store::TaskLease,
     ) -> Result<(), String> {
         // 普通模式的同步 for 循环要求 dispatch 同步完成，直接走 inner。
         if self

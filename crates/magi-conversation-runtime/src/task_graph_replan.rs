@@ -136,12 +136,7 @@ pub fn replan_task_graph(
         .collect::<Vec<_>>();
 
     let target_role = context_task
-        .and_then(|task| {
-            task.executor_binding
-                .as_ref()
-                .map(|binding| binding.target_role.trim().to_string())
-        })
-        .filter(|role| !role.is_empty())
+        .and_then(|task| task.executor_binding_target_role().map(str::to_string))
         .unwrap_or_else(|| infer_dispatch_task_role(Some(prompt_text)).to_string());
 
     let primary_action_task_id =

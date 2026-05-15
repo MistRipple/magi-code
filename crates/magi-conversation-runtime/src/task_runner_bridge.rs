@@ -5,8 +5,9 @@
 //! worker 目录仍不依赖 conversation-runtime；本模块持有调度 trait、结果接收器、
 //! event-based dispatcher 与 WorkerRuntime dispatcher。
 
-use magi_core::{AssignmentLease, EventId, LeaseId, Task, TaskId, TaskResultKind, UtcMillis};
+use magi_core::{EventId, LeaseId, Task, TaskId, TaskResultKind, UtcMillis};
 use magi_event_bus::{EventEnvelope, InMemoryEventBus};
+use magi_orchestrator::task_store::TaskLease;
 use magi_orchestrator::task_worker_catalog::WorkerInfo;
 use magi_skill_runtime::SkillDispatchRuntime;
 use magi_tool_runtime::ToolRegistry;
@@ -44,7 +45,7 @@ pub trait TaskDispatcher: Send + Sync {
         &self,
         task: &Task,
         worker: &WorkerInfo,
-        lease: &AssignmentLease,
+        lease: &TaskLease,
     ) -> Result<(), String>;
 }
 
@@ -96,7 +97,7 @@ impl TaskDispatcher for NoOpDispatcher {
         &self,
         _task: &Task,
         _worker: &WorkerInfo,
-        _lease: &AssignmentLease,
+        _lease: &TaskLease,
     ) -> Result<(), String> {
         Ok(())
     }
@@ -213,7 +214,7 @@ impl TaskDispatcher for EventBasedTaskDispatcher {
         &self,
         task: &Task,
         worker: &WorkerInfo,
-        lease: &AssignmentLease,
+        lease: &TaskLease,
     ) -> Result<(), String> {
         let event = EventEnvelope::domain(
             EventId::new(format!("event-task-dispatched-{}", UtcMillis::now().0)),
@@ -396,7 +397,7 @@ impl TaskDispatcher for WorkerExecutionDispatcher {
         &self,
         task: &Task,
         worker: &WorkerInfo,
-        lease: &AssignmentLease,
+        lease: &TaskLease,
     ) -> Result<(), String> {
         let intent = self.build_intent_from_task(task, worker);
         self.worker_runtime.register_execution_intent(intent);

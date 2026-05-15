@@ -10,9 +10,7 @@
 //! 共用，因此一并下沉到这里，避免 M12/M13 之间反复挪动。
 
 use magi_agent_role::AgentRoleRegistry;
-use magi_core::{
-    ExecutorBinding, MissionId, Task, TaskId, TaskKind, TaskPolicy, TaskStatus, UtcMillis,
-};
+use magi_core::{MissionId, Task, TaskId, TaskKind, TaskPolicy, TaskStatus, UtcMillis};
 use magi_orchestrator::task_store::TaskStore;
 use magi_orchestrator::task_worker_catalog::compatible_task_role_for_kind;
 use magi_session_store::ActiveExecutionChain;
@@ -177,12 +175,14 @@ pub fn make_dispatch_task(
         dependency_ids: Vec::new(),
         required_children: Vec::new(),
         policy_snapshot,
-        executor_binding: target_role.map(|role| ExecutorBinding {
-            target_role: role.to_string(),
-            capability_requirements: Vec::new(),
-            parallelism_group: None,
-            exclusive_scope: None,
-            worker_selector: None,
+        executor_binding: target_role.map(|role| {
+            serde_json::json!({
+                "target_role": role,
+                "capability_requirements": [],
+                "parallelism_group": null,
+                "exclusive_scope": null,
+                "worker_selector": null,
+            })
         }),
         context_refs: Vec::new(),
         knowledge_refs: Vec::new(),

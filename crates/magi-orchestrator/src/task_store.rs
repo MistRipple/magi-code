@@ -1,6 +1,6 @@
 use magi_core::{
-    AssignmentLease, DomainError, DomainResult, LeaseId, LeaseStatus, MissionId, ProgressSummary,
-    Task, TaskId, TaskKind, TaskPolicy, TaskProjection, TaskStatus, UtcMillis, WorkerId,
+    DomainError, DomainResult, LeaseId, MissionId, ProgressSummary, Task, TaskId, TaskKind,
+    TaskPolicy, TaskProjection, TaskStatus, UtcMillis, WorkerId,
 };
 use magi_worker_runtime::WorkerRuntimeDurableSnapshot;
 use serde::{Deserialize, Serialize};
@@ -11,6 +11,27 @@ use std::sync::{Mutex, RwLock};
 
 static LEASE_COUNTER: AtomicU64 = AtomicU64::new(1);
 static CHECKPOINT_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TaskLease {
+    pub lease_id: LeaseId,
+    pub task_id: TaskId,
+    pub root_task_id: TaskId,
+    pub worker_id: WorkerId,
+    pub role: String,
+    pub granted_at: UtcMillis,
+    pub expires_at: UtcMillis,
+    pub heartbeat_at: UtcMillis,
+    pub lease_status: TaskLeaseState,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TaskLeaseState {
+    Active,
+    Completed,
+    Expired,
+    Revoked,
+}
 
 /// Callback invoked after a successful `update_status` call.
 ///
@@ -32,7 +53,7 @@ pub struct TaskContextEntry {
 /// 任务图的内存存储，维护任务、租约及其索引。
 pub struct TaskStore {
     tasks: RwLock<HashMap<TaskId, Task>>,
-    leases: RwLock<HashMap<LeaseId, AssignmentLease>>,
+    leases: RwLock<HashMap<LeaseId, TaskLease>>,
     context_entries: RwLock<HashMap<String, TaskContextEntry>>,
     /// 索引: mission_id -> task_ids
     mission_index: RwLock<HashMap<MissionId, Vec<TaskId>>>,
@@ -494,14 +515,19 @@ impl TaskStore {
             .decision_payload
             .as_ref()
             .ok_or_else(|| format!("decision {decision_task_id} missing decision payload"))?;
-        if payload.options.is_empty() {
+        let options = payload
+            .get("options")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| format!("decision {decision_task_id} has no options"))?;
+        if options.is_empty() {
             return Err(format!("decision {decision_task_id} has no options"));
         }
-        if !payload
-            .options
-            .iter()
-            .any(|option| option.option_id == chosen_option)
-        {
+        if !options.iter().any(|option| {
+            option
+                .get("option_id")
+                .and_then(serde_json::Value::as_str)
+                == Some(chosen_option)
+        }) {
             return Err(format!(
                 "option {chosen_option} is not valid for decision {decision_task_id}"
             ));
@@ -519,24 +545,25 @@ impl TaskStore {
         }
         self.update_status(decision_task_id, TaskStatus::Completed)
             .map_err(|e| format!("failed to complete decision: {e}"))?;
+        let target_task_id = payload
+            .get("target_task_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(TaskId::new);
 
         match chosen_option {
             "abort" | "cancel" => {
                 self.cancel_open_subtree(&decision.root_task_id, Some(decision_task_id))?;
             }
             "skip" => {
-                if let Some(target_task_id) = payload.target_task_id.as_ref() {
+                if let Some(target_task_id) = target_task_id.as_ref() {
                     self.skip_open_subtree(target_task_id, Some(decision_task_id))?;
                 } else if let Some(ref parent_id) = decision.parent_task_id {
                     self.skip_open_subtree(parent_id, Some(decision_task_id))?;
                 }
             }
             _ => {
-                self.release_decision_gate(
-                    &decision,
-                    decision_task_id,
-                    payload.target_task_id.as_ref(),
-                )?;
+                self.release_decision_gate(&decision, decision_task_id, target_task_id.as_ref())?;
             }
         }
         Ok(())
@@ -819,8 +846,8 @@ impl TaskStore {
             // Revoke any active leases for this task
             if let Ok(mut leases) = self.leases.write() {
                 for lease in leases.values_mut() {
-                    if lease.task_id == *task_id && lease.lease_status == LeaseStatus::Active {
-                        lease.lease_status = LeaseStatus::Revoked;
+                    if lease.task_id == *task_id && lease.lease_status == TaskLeaseState::Active {
+                        lease.lease_status = TaskLeaseState::Revoked;
                     }
                 }
             }
@@ -1182,8 +1209,8 @@ impl TaskStore {
                 if let Some(ref payload) = task.decision_payload {
                     key_decisions.push(serde_json::json!({
                         "task_id": task.task_id.to_string(),
-                        "context": payload.decision_context,
-                        "blocked_reason": payload.blocked_reason,
+                        "context": payload.get("decision_context").and_then(serde_json::Value::as_str),
+                        "blocked_reason": payload.get("blocked_reason").and_then(serde_json::Value::as_str),
                         "chosen_option": task.output_refs.first(),
                     }));
                 }
@@ -1224,7 +1251,7 @@ impl TaskStore {
     }
 
     /// 创建执行租约。
-    pub fn insert_lease(&self, lease: AssignmentLease) {
+    pub fn insert_lease(&self, lease: TaskLease) {
         let lease_id = lease.lease_id.clone();
         self.leases
             .write()
@@ -1233,12 +1260,12 @@ impl TaskStore {
     }
 
     /// 获取指定任务的活跃租约。
-    pub fn get_active_lease(&self, task_id: &TaskId) -> Option<AssignmentLease> {
+    pub fn get_active_lease(&self, task_id: &TaskId) -> Option<TaskLease> {
         self.leases
             .read()
             .expect("leases read lock poisoned")
             .values()
-            .find(|lease| lease.task_id == *task_id && lease.lease_status == LeaseStatus::Active)
+            .find(|lease| lease.task_id == *task_id && lease.lease_status == TaskLeaseState::Active)
             .cloned()
     }
 
@@ -1250,13 +1277,13 @@ impl TaskStore {
         worker_id: &WorkerId,
         role: &str,
         duration_ms: u64,
-    ) -> Option<AssignmentLease> {
+    ) -> Option<TaskLease> {
         let mut leases = self.leases.write().expect("leases write lock poisoned");
 
         // Check if task already has an active lease
         let has_active = leases
             .values()
-            .any(|l| l.task_id == *task_id && l.lease_status == LeaseStatus::Active);
+            .any(|l| l.task_id == *task_id && l.lease_status == TaskLeaseState::Active);
         if has_active {
             return None;
         }
@@ -1265,7 +1292,7 @@ impl TaskStore {
         let counter = LEASE_COUNTER.fetch_add(1, Ordering::Relaxed);
         let lease_id = LeaseId::new(format!("lease-{}-{}", now.0, counter));
 
-        let lease = AssignmentLease {
+        let lease = TaskLease {
             lease_id: lease_id.clone(),
             task_id: task_id.clone(),
             root_task_id: root_task_id.clone(),
@@ -1274,7 +1301,7 @@ impl TaskStore {
             granted_at: now,
             expires_at: UtcMillis(now.0 + duration_ms),
             heartbeat_at: now,
-            lease_status: LeaseStatus::Active,
+            lease_status: TaskLeaseState::Active,
         };
 
         leases.insert(lease_id, lease.clone());
@@ -1285,8 +1312,8 @@ impl TaskStore {
     pub fn complete_lease(&self, task_id: &TaskId, lease_id: &LeaseId) -> bool {
         let mut leases = self.leases.write().expect("leases write lock poisoned");
         if let Some(lease) = leases.get_mut(lease_id) {
-            if lease.task_id == *task_id && lease.lease_status == LeaseStatus::Active {
-                lease.lease_status = LeaseStatus::Completed;
+            if lease.task_id == *task_id && lease.lease_status == TaskLeaseState::Active {
+                lease.lease_status = TaskLeaseState::Completed;
                 return true;
             }
         }
@@ -1297,8 +1324,8 @@ impl TaskStore {
     pub fn revoke_lease(&self, task_id: &TaskId, lease_id: &LeaseId) -> bool {
         let mut leases = self.leases.write().expect("leases write lock poisoned");
         if let Some(lease) = leases.get_mut(lease_id) {
-            if lease.task_id == *task_id && lease.lease_status == LeaseStatus::Active {
-                lease.lease_status = LeaseStatus::Revoked;
+            if lease.task_id == *task_id && lease.lease_status == TaskLeaseState::Active {
+                lease.lease_status = TaskLeaseState::Revoked;
                 return true;
             }
         }
@@ -1309,7 +1336,7 @@ impl TaskStore {
     pub fn heartbeat_lease(&self, task_id: &TaskId, lease_id: &LeaseId) -> bool {
         let mut leases = self.leases.write().expect("leases write lock poisoned");
         if let Some(lease) = leases.get_mut(lease_id) {
-            if lease.task_id == *task_id && lease.lease_status == LeaseStatus::Active {
+            if lease.task_id == *task_id && lease.lease_status == TaskLeaseState::Active {
                 lease.heartbeat_at = UtcMillis::now();
                 return true;
             }
@@ -1325,7 +1352,7 @@ impl TaskStore {
         leases
             .values()
             .filter(|l| {
-                l.lease_status == LeaseStatus::Active
+                l.lease_status == TaskLeaseState::Active
                     && l.expires_at < now
                     && l.root_task_id == *root_task_id
             })
@@ -1340,7 +1367,7 @@ impl TaskStore {
         leases
             .values()
             .filter(|l| {
-                l.lease_status == LeaseStatus::Active
+                l.lease_status == TaskLeaseState::Active
                     && l.expires_at >= now
                     && l.root_task_id == *root_task_id
             })
@@ -1355,7 +1382,7 @@ impl TaskStore {
         let leases = self.leases.read().expect("leases read lock poisoned");
         leases
             .values()
-            .filter(|l| l.lease_status == LeaseStatus::Active && l.expires_at >= now)
+            .filter(|l| l.lease_status == TaskLeaseState::Active && l.expires_at >= now)
             .map(|l| (l.task_id.clone(), l.lease_id.clone()))
             .collect()
     }
@@ -1431,11 +1458,11 @@ impl TaskStore {
     }
 
     /// 获取指定 worker 的所有活跃租约。
-    pub fn get_leases_by_worker(&self, worker_id: &WorkerId) -> Vec<AssignmentLease> {
+    pub fn get_leases_by_worker(&self, worker_id: &WorkerId) -> Vec<TaskLease> {
         let leases = self.leases.read().expect("leases read lock poisoned");
         leases
             .values()
-            .filter(|l| l.worker_id == *worker_id && l.lease_status == LeaseStatus::Active)
+            .filter(|l| l.worker_id == *worker_id && l.lease_status == TaskLeaseState::Active)
             .cloned()
             .collect()
     }
@@ -1454,7 +1481,7 @@ impl TaskStore {
             .expect("context_entries read lock poisoned");
         serde_json::json!({
             "tasks": tasks.values().cloned().collect::<Vec<Task>>(),
-            "leases": leases.values().cloned().collect::<Vec<AssignmentLease>>(),
+            "leases": leases.values().cloned().collect::<Vec<TaskLease>>(),
             "contextEntries": context_entries.values().cloned().collect::<Vec<TaskContextEntry>>(),
         })
     }
@@ -1469,7 +1496,7 @@ impl TaskStore {
             .get("tasks")
             .and_then(|v| serde_json::from_value(v.clone()).ok())
             .unwrap_or_default();
-        let leases: Vec<AssignmentLease> = data
+        let leases: Vec<TaskLease> = data
             .get("leases")
             .and_then(|v| serde_json::from_value(v.clone()).ok())
             .unwrap_or_default();
@@ -1713,10 +1740,8 @@ fn is_valid_parent_child_kind(parent: TaskKind, child: TaskKind) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use magi_core::{
-        AssignmentLease, DecisionOption, DecisionTaskPayload, LeaseId, LeaseStatus, MissionId,
-        Task, TaskId, TaskKind, TaskStatus, UtcMillis, WorkerId,
-    };
+    use super::{TaskLease, TaskLeaseState};
+    use magi_core::{LeaseId, MissionId, Task, TaskId, TaskKind, TaskStatus, UtcMillis, WorkerId};
     use std::sync::{Arc, Mutex};
 
     fn make_task(
@@ -1754,6 +1779,26 @@ mod tests {
             created_at: UtcMillis::now(),
             updated_at: UtcMillis::now(),
         }
+    }
+
+    fn make_decision_payload(
+        decision_context: &str,
+        blocked_reason: &str,
+        target_task_id: Option<&str>,
+        option_id: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "decision_context": decision_context,
+            "blocked_reason": blocked_reason,
+            "target_task_id": target_task_id,
+            "options": [
+                {"option_id": option_id, "label": "重试", "description": "重新执行"}
+            ],
+            "risk_notes": [],
+            "recommended_option": option_id,
+            "required_user_input": true,
+            "decision_evidence": null
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -2430,7 +2475,7 @@ mod tests {
         store.insert_task(task);
 
         let now = UtcMillis::now();
-        let lease = AssignmentLease {
+        let lease = TaskLease {
             lease_id: LeaseId::new("lease-1"),
             task_id: TaskId::new("t-1"),
             root_task_id: TaskId::new("t-1"),
@@ -2439,7 +2484,7 @@ mod tests {
             granted_at: now,
             expires_at: UtcMillis(now.0 + 60_000),
             heartbeat_at: now,
-            lease_status: LeaseStatus::Active,
+            lease_status: TaskLeaseState::Active,
         };
 
         store.insert_lease(lease);
@@ -2450,7 +2495,7 @@ mod tests {
         let active = active.unwrap();
         assert_eq!(active.lease_id.to_string(), "lease-1");
         assert_eq!(active.worker_id.to_string(), "worker-1");
-        assert_eq!(active.lease_status, LeaseStatus::Active);
+        assert_eq!(active.lease_status, TaskLeaseState::Active);
 
         // No active lease for another task
         assert!(store.get_active_lease(&TaskId::new("t-2")).is_none());
@@ -2636,20 +2681,12 @@ mod tests {
             TaskStatus::AwaitingApproval,
         );
         let mut decision = decision;
-        decision.decision_payload = Some(DecisionTaskPayload {
-            decision_context: "选择修复路径".to_string(),
-            blocked_reason: "需要用户确认".to_string(),
-            target_task_id: Some(TaskId::new("parent-1")),
-            options: vec![DecisionOption {
-                option_id: "retry".to_string(),
-                label: "重试".to_string(),
-                description: "重新执行".to_string(),
-            }],
-            risk_notes: vec![],
-            recommended_option: Some("retry".to_string()),
-            required_user_input: true,
-            decision_evidence: None,
-        });
+        decision.decision_payload = Some(make_decision_payload(
+            "选择修复路径",
+            "需要用户确认",
+            Some("parent-1"),
+            "retry",
+        ));
 
         store.insert_task(make_task(
             "root-1",
@@ -2729,7 +2766,7 @@ mod tests {
         assert_eq!(lease.task_id.to_string(), "t-1");
         assert_eq!(lease.worker_id.to_string(), "worker-1");
         assert_eq!(lease.role, "executor");
-        assert_eq!(lease.lease_status, LeaseStatus::Active);
+        assert_eq!(lease.lease_status, TaskLeaseState::Active);
         assert!(lease.expires_at.0 > lease.granted_at.0);
         assert_eq!(lease.heartbeat_at, lease.granted_at);
     }
@@ -2942,7 +2979,7 @@ mod tests {
 
         // Insert a lease that is already expired (expires_at in the past)
         let now = UtcMillis::now();
-        let expired_lease = AssignmentLease {
+        let expired_lease = TaskLease {
             lease_id: LeaseId::new("lease-expired"),
             task_id: TaskId::new("t-1"),
             root_task_id: TaskId::new("t-1"),
@@ -2951,7 +2988,7 @@ mod tests {
             granted_at: UtcMillis(now.0.saturating_sub(120_000)),
             expires_at: UtcMillis(now.0.saturating_sub(60_000)), // expired 60s ago
             heartbeat_at: UtcMillis(now.0.saturating_sub(120_000)),
-            lease_status: LeaseStatus::Active,
+            lease_status: TaskLeaseState::Active,
         };
         store.insert_lease(expired_lease);
 
@@ -3521,7 +3558,7 @@ mod tests {
                 60_000,
             )
             .expect("running task should receive active lease");
-        assert_eq!(lease.lease_status, LeaseStatus::Active);
+        assert_eq!(lease.lease_status, TaskLeaseState::Active);
 
         let (revoked_leases, blocked_tasks) = store
             .reconcile_volatile_runtime_after_restore(&WorkerRuntimeDurableSnapshot::default());
@@ -3716,20 +3753,12 @@ mod tests {
             TaskKind::Decision,
             TaskStatus::AwaitingApproval,
         );
-        decision.decision_payload = Some(DecisionTaskPayload {
-            decision_context: "需要中止".to_string(),
-            blocked_reason: "任务失败".to_string(),
-            target_task_id: Some(TaskId::new("action-1")),
-            options: vec![DecisionOption {
-                option_id: "abort".to_string(),
-                label: "中止".to_string(),
-                description: "中止整个任务树".to_string(),
-            }],
-            risk_notes: vec![],
-            recommended_option: Some("abort".to_string()),
-            required_user_input: true,
-            decision_evidence: None,
-        });
+        decision.decision_payload = Some(make_decision_payload(
+            "需要中止",
+            "任务失败",
+            Some("action-1"),
+            "abort",
+        ));
         store.insert_task(decision);
 
         store
@@ -3798,20 +3827,12 @@ mod tests {
             TaskKind::Decision,
             TaskStatus::AwaitingApproval,
         );
-        decision.decision_payload = Some(DecisionTaskPayload {
-            decision_context: "跳过失败动作".to_string(),
-            blocked_reason: "action-1 可跳过".to_string(),
-            target_task_id: Some(TaskId::new("action-1")),
-            options: vec![DecisionOption {
-                option_id: "skip".to_string(),
-                label: "跳过".to_string(),
-                description: "跳过此任务".to_string(),
-            }],
-            risk_notes: vec![],
-            recommended_option: Some("skip".to_string()),
-            required_user_input: true,
-            decision_evidence: None,
-        });
+        decision.decision_payload = Some(make_decision_payload(
+            "跳过失败动作",
+            "action-1 可跳过",
+            Some("action-1"),
+            "skip",
+        ));
         store.insert_task(decision);
 
         store
@@ -3866,20 +3887,12 @@ mod tests {
             TaskKind::Decision,
             TaskStatus::AwaitingApproval,
         );
-        decision.decision_payload = Some(DecisionTaskPayload {
-            decision_context: "选择方案".to_string(),
-            blocked_reason: "需要确认".to_string(),
-            target_task_id: None,
-            options: vec![DecisionOption {
-                option_id: "continue".to_string(),
-                label: "继续".to_string(),
-                description: "继续执行".to_string(),
-            }],
-            risk_notes: vec![],
-            recommended_option: Some("continue".to_string()),
-            required_user_input: true,
-            decision_evidence: None,
-        });
+        decision.decision_payload = Some(make_decision_payload(
+            "选择方案",
+            "需要确认",
+            None,
+            "continue",
+        ));
         store.insert_task(decision);
 
         let mut downstream = make_task(
@@ -4079,20 +4092,12 @@ mod tests {
             TaskKind::Decision,
             TaskStatus::Completed,
         );
-        decision.decision_payload = Some(magi_core::DecisionTaskPayload {
-            decision_context: "是否引入第三方库".to_string(),
-            blocked_reason: "需要确认依赖方案".to_string(),
-            target_task_id: None,
-            options: vec![magi_core::DecisionOption {
-                option_id: "use-oauth".to_string(),
-                label: "使用 OAuth".to_string(),
-                description: "集成 OAuth 登录".to_string(),
-            }],
-            risk_notes: vec![],
-            recommended_option: Some("use-oauth".to_string()),
-            required_user_input: true,
-            decision_evidence: None,
-        });
+        decision.decision_payload = Some(make_decision_payload(
+            "是否引入第三方库",
+            "需要确认依赖方案",
+            None,
+            "use-oauth",
+        ));
         decision.output_refs = vec!["use-oauth".to_string()];
         store.insert_task(decision);
 

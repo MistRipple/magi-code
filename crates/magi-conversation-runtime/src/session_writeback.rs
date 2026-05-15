@@ -506,9 +506,7 @@ pub fn append_session_turn_error_item(
 fn task_role_id(task_store: Option<&TaskStore>, task_id: &TaskId) -> Option<String> {
     task_store
         .and_then(|store| store.get_task(task_id))
-        .and_then(|task| task.executor_binding)
-        .map(|binding| binding.target_role)
-        .filter(|role_id| !role_id.trim().is_empty())
+        .and_then(|task| task.executor_binding_target_role().map(str::to_string))
 }
 
 fn task_status_label(status: &TaskStatus) -> &'static str {
@@ -943,7 +941,7 @@ fn execute_session_turn_tool_call(
 mod tests {
     use super::*;
     use magi_bridge_client::ChatToolFunction;
-    use magi_core::{ExecutorBinding, MissionId, Task, TaskKind, ThreadId, WorkerId};
+    use magi_core::{MissionId, Task, TaskKind, ThreadId, WorkerId};
     use magi_governance::GovernanceService;
     use magi_session_store::{
         ActiveExecutionChain, ActiveExecutionDispatchContext, ActiveExecutionTurn,
@@ -1396,13 +1394,13 @@ mod tests {
             dependency_ids: Vec::new(),
             required_children: Vec::new(),
             policy_snapshot: None,
-            executor_binding: Some(ExecutorBinding {
-                target_role: "reviewer".to_string(),
-                capability_requirements: Vec::new(),
-                parallelism_group: None,
-                exclusive_scope: None,
-                worker_selector: None,
-            }),
+            executor_binding: Some(serde_json::json!({
+                "target_role": "reviewer",
+                "capability_requirements": [],
+                "parallelism_group": null,
+                "exclusive_scope": null,
+                "worker_selector": null,
+            })),
             context_refs: Vec::new(),
             knowledge_refs: Vec::new(),
             workspace_scope: None,

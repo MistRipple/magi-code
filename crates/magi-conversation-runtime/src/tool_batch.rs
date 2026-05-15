@@ -271,16 +271,15 @@ fn execute_coordinator_tool(
                 dependency_ids: Vec::new(),
                 required_children: Vec::new(),
                 policy_snapshot: task.policy_snapshot.clone(),
-                executor_binding: Some(magi_core::ExecutorBinding {
-                    target_role: role.clone(),
-                    capability_requirements: Vec::new(),
-                    parallelism_group: parsed
+                executor_binding: Some(serde_json::json!({
+                    "target_role": role,
+                    "capability_requirements": [],
+                    "parallelism_group": parsed
                         .get("parallelism_group")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_string),
-                    exclusive_scope: None,
-                    worker_selector: None,
-                }),
+                        .and_then(|v| v.as_str()),
+                    "exclusive_scope": null,
+                    "worker_selector": null,
+                })),
                 context_refs: Vec::new(),
                 knowledge_refs: Vec::new(),
                 workspace_scope: task.workspace_scope.clone(),

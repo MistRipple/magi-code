@@ -185,9 +185,7 @@ pub(crate) fn run_dispatch_submission(
         state
             .task_store()
             .and_then(|store| store.get_task(task_id))
-            .and_then(|task| task.executor_binding.map(|binding| binding.target_role))
-            .map(|role| role.trim().to_string())
-            .filter(|role| !role.is_empty())
+            .and_then(|task| task.executor_binding_target_role().map(str::to_string))
             .unwrap_or_else(|| {
                 panic!("task {task_id} must declare executor_binding.target_role before dispatch")
             })
@@ -659,10 +657,8 @@ fn update_session_execution_branches(
         // P7：role_id 为架构不变量，缺失即分派契约破裂；直接 panic 暴露上游错误，
         // 不再提供 fallback 走 resolve_task_role。
         let role_id: String = task
-            .executor_binding
-            .as_ref()
-            .map(|binding| binding.target_role.trim().to_string())
-            .filter(|role| !role.is_empty())
+            .executor_binding_target_role()
+            .map(str::to_string)
             .unwrap_or_else(|| {
                 panic!(
                     "task {} must declare executor_binding.target_role before append_branches",
@@ -1721,9 +1717,9 @@ mod tests {
             .filter_map(|task_id| task_store.get_task(&task_id))
             .filter(|task| task.kind == TaskKind::Action)
             .map(|task| {
-                task.executor_binding
+                task.executor_binding_target_role()
                     .expect("action task should have executor binding")
-                    .target_role
+                    .to_string()
             })
             .collect::<Vec<_>>();
 
