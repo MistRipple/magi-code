@@ -8,9 +8,7 @@ use crate::{
     prompt_utils::prepend_session_instructions,
     session_turn_execution::{SessionTurnExecutionRuntime, run_session_turn_execution},
     settings_store::SettingsStore,
-    dispatch_execution::{
-        TaskGraphSubmission, cleanup_task_tree, run_dispatch_submission,
-    },
+    dispatch_execution::run_dispatch_submission,
     state::{ApiState, ExecutionPipeline},
     usage_recording::{ModelUsageBinding, model_usage_binding_for_worker},
 };
@@ -22,8 +20,8 @@ use magi_context_runtime::{
     ContextBudget, ContextRuntime, ExecutionContextAssemblyRequest, ExecutionContextClues,
 };
 use magi_core::{
-    ApprovalRequirement, DomainError, EventId, ExecutionOwnership, ExecutionResultStatus, LeaseId,
-    RiskLevel, SessionId, TaskId, TaskKind, ToolCallId, UtcMillis, WorkerId, WorkspaceId,
+    ApprovalRequirement, EventId, ExecutionOwnership, ExecutionResultStatus, LeaseId, RiskLevel,
+    SessionId, TaskId, TaskKind, ToolCallId, UtcMillis, WorkerId, WorkspaceId,
 };
 use magi_governance::ToolKind;
 use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
@@ -53,6 +51,10 @@ pub use magi_conversation_runtime::task_execution_registry::{
 // conversation-runtime，通过 `pub use` 重导出保持外部 import 路径不变。
 pub use magi_conversation_runtime::dispatch_submission::{
     DispatchSubmissionAccepted, DispatchSubmissionRequest,
+};
+use magi_conversation_runtime::dispatch_submission::{
+    DispatchSubmissionAcceptError, accept_dispatch_submission,
+    ensure_dispatch_submission_acceptance_available,
 };
 
 // M17a2：finalize / reconcile 系列与其辅助 helpers 已下沉到 conversation-runtime。
@@ -2331,57 +2333,27 @@ fn submit_task_submission(
     state: &ApiState,
     request: DispatchSubmissionRequest,
 ) -> Result<DispatchSubmissionAccepted, ApiError> {
-    state
-        .session_store
-        .ensure_current_turn_acceptance_available(&request.session_id)
-        .map_err(map_dispatch_store_error)?;
+    ensure_dispatch_submission_acceptance_available(state.session_store.as_ref(), &request)
+        .map_err(map_dispatch_submission_accept_error)?;
     let graph = run_dispatch_submission(state, &request)?;
-    if let Some(active_execution_chain) = graph.active_execution_chain.clone() {
-        let accept_result = state
-            .session_store
-            .accept_active_execution_chain_with_timeline_entry(
-                request.session_id.clone(),
-                request.entry_id.clone(),
-                TimelineEntryKind::UserMessage,
-                request.timeline_message.clone(),
-                request.accepted_at,
-                active_execution_chain,
-            );
-        if let Err(error) = accept_result {
-            cleanup_rejected_dispatch(state, &graph);
-            return Err(map_dispatch_store_error(error));
-        }
-    }
-
-    Ok(DispatchSubmissionAccepted {
-        session_id: request.session_id,
-        entry_id: request.entry_id,
-        accepted_at: request.accepted_at,
-        created_session: request.created_session,
-        root_task_id: graph.root_task_id,
-        action_task_id: graph.action_task_id,
-        runner_started: false,
-    })
+    accept_dispatch_submission(
+        state.session_store.as_ref(),
+        state.task_store(),
+        state.task_execution_registry(),
+        request,
+        graph,
+    )
+    .map_err(map_dispatch_submission_accept_error)
 }
 
-fn cleanup_rejected_dispatch(state: &ApiState, graph: &TaskGraphSubmission) {
-    if let Some(chain) = graph.active_execution_chain.as_ref() {
-        let registry = state.task_execution_registry();
-        for branch in &chain.branches {
-            let _ = registry.remove(&branch.task_id);
-        }
-    }
-    if let Some(task_store) = state.task_store() {
-        cleanup_task_tree(task_store, &graph.root_task_id);
-    }
-}
-
-fn map_dispatch_store_error(error: DomainError) -> ApiError {
+fn map_dispatch_submission_accept_error(error: DispatchSubmissionAcceptError) -> ApiError {
     match error {
-        DomainError::InvalidState { message } if message.contains("active current_turn") => {
+        DispatchSubmissionAcceptError::Conflict { message } => {
             ApiError::conflict("任务派发失败", &message)
         }
-        other => ApiError::internal_assembly("任务派发失败", other),
+        DispatchSubmissionAcceptError::Internal { message } => {
+            ApiError::internal_assembly("任务派发失败", message)
+        }
     }
 }
 
