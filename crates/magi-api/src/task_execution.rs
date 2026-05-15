@@ -1,12 +1,11 @@
 use crate::RunnerStartError;
-pub use crate::session_turn_execution::{
+pub use magi_conversation_runtime::session_turn_execution::{
     BUSINESS_MODEL_PROVIDER, SessionTurnExecutionOutput, SessionTurnExecutionRequest,
 };
 use crate::{
     errors::ApiError,
     model_config::NormalizedModelConfig,
     prompt_utils::prepend_session_instructions,
-    session_turn_execution::{SessionTurnExecutionRuntime, run_session_turn_execution},
     settings_store::SettingsStore,
     dispatch_execution::run_dispatch_submission,
     state::{ApiState, ExecutionPipeline},
@@ -14,6 +13,7 @@ use crate::{
 };
 use magi_conversation_runtime::{
     SKILL_APPLY_TOOL_NAME, public_builtin_tool_definitions, skill_apply_tool_definition,
+    session_turn_execution::{SessionTurnExecutionRuntime, run_session_turn_execution},
 };
 use magi_bridge_client::{ChatToolDefinition, ModelBridgeClient};
 use magi_context_runtime::{
@@ -1179,7 +1179,8 @@ impl LlmTaskDispatcher {
                 }
             }
         });
-        crate::task_llm_loop::run_task_llm_loop(crate::task_llm_loop::TaskLlmLoopRequest {
+        magi_conversation_runtime::task_llm_loop::run_task_llm_loop(
+            magi_conversation_runtime::task_llm_loop::TaskLlmLoopRequest {
             client: client.as_ref(),
             event_bus: self.event_bus.as_ref(),
             session_store: self.session_store.as_ref(),

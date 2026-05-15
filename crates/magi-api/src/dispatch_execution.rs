@@ -1,430 +1,59 @@
-use magi_core::{
-    ExecutionOwnership, MissionId, SessionId, Task, TaskExecutionTarget, TaskId, TaskKind,
-    TaskStatus, UtcMillis, WorkerId, WorkspaceId,
-};
-use magi_event_bus::{EventContext, task_events};
-use magi_orchestrator::ExecutionWritebackPlans;
-use magi_session_store::{
-    ActiveExecutionBranch, ActiveExecutionChain, ActiveExecutionDispatchContext,
-    ActiveExecutionTurn, ActiveExecutionTurnItem, ActiveExecutionTurnLane,
-};
+use magi_core::{SessionId, Task, TaskId, WorkspaceId};
+#[cfg(test)]
+use magi_core::{TaskKind, TaskStatus, UtcMillis};
 #[cfg(test)]
 use crate::dto::SessionTurnRequestDto;
 use crate::{
     errors::ApiError,
     state::ApiState,
-    task_execution::{DispatchSubmissionRequest, TaskExecutionPlan},
+    task_execution::DispatchSubmissionRequest,
 };
 
 // M12/M13/M14：任务图构建器、任务分解管线、任务图重规划入口与派发数据载体已
 // 迁移到 magi-conversation-runtime；保留内部 re-export 让 dispatch_execution / 测试
 // 代码以原名继续调用。
-pub(crate) use magi_conversation_runtime::mission_decomposition::decompose_mission;
 #[cfg(test)]
 pub(crate) use magi_conversation_runtime::mission_decomposition::{
     TASK_PLAN_TOOL_NAME, parse_decomposition_response,
 };
-pub(crate) use magi_conversation_runtime::task_graph_builder::{
-    TASK_MAX_PHASES, TASK_MIN_PHASES, TaskGraphBuildResult, TaskGraphSubmission, build_task_policy,
-    cleanup_task_tree, infer_dispatch_task_role, insert_task_graph, make_dispatch_task,
-    task_phase_count_is_valid,
-};
+use magi_conversation_runtime::task_graph_builder::TaskGraphSubmission;
+#[cfg(test)]
+use magi_conversation_runtime::task_graph_builder::{build_task_policy, make_dispatch_task};
 pub(crate) use magi_conversation_runtime::task_graph_replan::{
     TaskGraphReplanError, TaskGraphReplanResult,
 };
-pub(crate) use magi_conversation_runtime::session_thread::ensure_thread_for_role;
-
-#[derive(Clone, Debug)]
-struct SessionExecutionBranchSpec {
-    task_id: TaskId,
-    is_primary: bool,
-}
-
 pub(crate) fn run_dispatch_submission(
     state: &ApiState,
     request: &DispatchSubmissionRequest,
 ) -> Result<TaskGraphSubmission, ApiError> {
     let _ = state.execution_pipeline().ok_or_else(|| {
-        ApiError::internal_assembly(
-            "任务派发失败",
-            "execution pipeline 未配置",
-        )
+        ApiError::internal_assembly("任务派发失败", "execution pipeline 未配置")
     })?;
-    let task_store = state.task_store().ok_or_else(|| {
-        ApiError::internal_assembly("任务派发失败", "task_store 未配置")
-    })?;
+    let task_store = state
+        .task_store()
+        .ok_or_else(|| ApiError::internal_assembly("任务派发失败", "task_store 未配置"))?;
+    let workspace_root_path = state.workspace_root_path(&request.workspace_id);
 
-    let accepted_at = request.accepted_at;
-    let session_id = &request.session_id;
-    let entry_id = request.entry_id.as_str();
-    let trimmed_text = request.trimmed_text.as_deref();
-    let execution_goal = request
-        .execution_goal
-        .as_deref()
-        .map(str::trim)
-        .filter(|goal| !goal.is_empty());
-    let execution_goal = execution_goal.ok_or_else(|| {
-        ApiError::InvalidInput("任务派发必须提供非空 execution_goal".to_string())
-    })?;
-
-    let now = UtcMillis::now();
-    // mission 前移：session 的 orchestrator thread 和 mission 绑定共享 session 生命周期。
-    // 首次调用 `ensure_session_mission` 时创建 mission + spawn orchestrator thread，
-    // 后续所有入口（dispatch / 纯聊天 / 补充上下文）都复用同一 mission_id。
-    let (mission_id, orchestrator_thread_id) = state.session_store.ensure_session_mission(
-        session_id,
-        now,
-        || MissionId::new(format!("mission-session-action-{}", accepted_at.0)),
-    );
-    let worker_id = WorkerId::new(format!("worker-session-action-{}", accepted_at.0));
-
-    let obj_task_id = TaskId::new(format!("task-obj-{}", accepted_at.0));
-    let act_task_id = TaskId::new(format!("task-act-{}", accepted_at.0));
-
-    let task_goal_text = execution_goal.to_string();
-    let objective = make_dispatch_task(
-        obj_task_id.clone(),
-        mission_id.clone(),
-        obj_task_id.clone(),
-        None,
-        TaskKind::Objective,
-        request.mission_title.clone(),
-        task_goal_text.clone(),
-        TaskStatus::Running,
-        now,
-        Some("architect"),
-        None,
-        Some(build_task_policy()),
-    );
-    task_store.insert_task(objective);
-
-    let task_graph = match build_task_graph(
-        state,
-        &mission_id,
-        &obj_task_id,
-        &act_task_id,
-        accepted_at,
-        request
-            .target_role
-            .as_deref()
-            .unwrap_or_else(|| infer_dispatch_task_role(request.skill_name.as_deref())),
-        execution_goal,
-        &request.workspace_id,
-        &now,
-    ) {
-        Ok(graph) => graph,
-        Err(err) => {
-            cleanup_task_tree(task_store, &obj_task_id);
-            return Err(err);
-        }
-    };
-    let total_task_count = task_graph.total_task_count;
-    let dispatch_task_ids = task_graph.dispatch_task_ids;
-
-    let event = task_events::task_graph_created_event(
-        mission_id.as_str(),
-        obj_task_id.as_str(),
-        total_task_count,
-    )
-    .with_context(EventContext {
-        mission_id: Some(mission_id.clone()),
-        task_id: Some(obj_task_id.clone()),
-        ..EventContext::default()
-    });
-    let _ = state.event_bus.publish(event);
-
-    let workspace_id = request.workspace_id.clone();
-    let execution_chain_ref = Some(format!("session-action-chain-{}", accepted_at.0));
-    let ownership = ExecutionOwnership {
-        session_id: Some(session_id.clone()),
-        workspace_id: workspace_id.clone(),
-        mission_id: Some(mission_id.clone()),
-        task_id: Some(act_task_id.clone()),
-        worker_id: Some(worker_id.clone()),
-        execution_chain_ref: execution_chain_ref.clone(),
-        ..ExecutionOwnership::default()
-    };
-    state.task_execution_registry().insert(
-        act_task_id.clone(),
-        TaskExecutionPlan::Dispatch {
-            target: TaskExecutionTarget {
-                mission_id: mission_id.clone(),
-                root_task_id: obj_task_id.clone(),
-                task_id: act_task_id.clone(),
-                requested_worker_id: Some(worker_id.clone()),
-                recovery_id: None,
-                execution_chain_ref: execution_chain_ref.clone(),
-            },
-            worker_id: worker_id.clone(),
-            lane_id: None,
-            lane_seq: None,
-            // P7：orchestrator 主动作任务归属 session 的 orchestrator thread，
-            // 与 `ActiveExecutionTurn.items` 主线 phase item 同源。
-            thread_id: orchestrator_thread_id.clone(),
-            is_primary: true,
-            session_id: session_id.clone(),
-            workspace_id: workspace_id.clone(),
-            ownership: ownership.clone(),
-            writebacks: ExecutionWritebackPlans::from_session_action_input(
-                magi_orchestrator::DispatchMemoryExtractionInput {
-                    accepted_at,
-                    session_id: session_id,
-                    timeline_entry_id: entry_id,
-                    text: trimmed_text,
-                    skill_name: request.skill_name.as_deref(),
-                },
-            ),
-            use_tools: true,
-            skill_name: request.skill_name.clone(),
+    magi_conversation_runtime::dispatch_submission::run_dispatch_submission(
+        &magi_conversation_runtime::dispatch_submission::DispatchSubmissionRuntime {
+            session_store: state.session_store.as_ref(),
+            task_store,
+            execution_registry: state.task_execution_registry(),
+            event_bus: &state.event_bus,
+            agent_role_registry: &state.agent_role_registry,
+            spawn_graph: state.spawn_graph.as_ref(),
+            model_bridge_client: state.model_bridge_client(),
+            workspace_root_path: workspace_root_path.as_deref(),
         },
-    );
-
-    // P7：role 解析必须成功。任何 sub task 若未绑定 executor_binding.target_role，
-    // 属于 task graph 构造阶段的缺陷——直接 panic 暴露，而不是在下游静默掉 thread。
-    let role_for_task = |task_id: &TaskId| -> String {
-        state
-            .task_store()
-            .and_then(|store| store.get_task(task_id))
-            .and_then(|task| task.executor_binding_target_role().map(str::to_string))
-            .unwrap_or_else(|| {
-                panic!("task {task_id} must declare executor_binding.target_role before dispatch")
-            })
-    };
-
-    for sub_task_id in &dispatch_task_ids {
-        let sub_ownership = ExecutionOwnership {
-            session_id: Some(request.session_id.clone()),
-            workspace_id: workspace_id.clone(),
-            mission_id: Some(mission_id.clone()),
-            task_id: Some(TaskId::new(sub_task_id.as_str())),
-            worker_id: Some(worker_id.clone()),
-            execution_chain_ref: execution_chain_ref.clone(),
-            ..ExecutionOwnership::default()
-        };
-        // P7：plan 注册前 ensure 对应 role 的 thread，让 plan 直接持有稳定的 thread_id。
-        // 下方 worker_lanes 构造时同样命中 `find_idle_thread_for_role` 复用同一条 thread。
-        let sub_task_role_id = role_for_task(sub_task_id);
-        let sub_thread_id = ensure_thread_for_role(
-            &state.session_store,
-            &request.session_id,
-            &mission_id,
-            &sub_task_role_id,
-            &worker_id,
-            sub_task_id,
-            now,
-        );
-        state.task_execution_registry().insert(
-            sub_task_id.clone(),
-            TaskExecutionPlan::Dispatch {
-                target: TaskExecutionTarget {
-                    mission_id: mission_id.clone(),
-                    root_task_id: obj_task_id.clone(),
-                    task_id: TaskId::new(sub_task_id.as_str()),
-                    requested_worker_id: Some(worker_id.clone()),
-                    recovery_id: None,
-                    execution_chain_ref: execution_chain_ref.clone(),
-                },
-                worker_id: worker_id.clone(),
-                lane_id: Some(format!("lane-{}", sub_task_id)),
-                lane_seq: Some(
-                    dispatch_task_ids
-                        .iter()
-                        .position(|candidate| candidate == sub_task_id)
-                        .unwrap_or(0)
-                        + 1,
-                ),
-                // P6b：plan 注册前已 ensure thread，此处直接嵌入供 dispatch_inner 取用，
-                // 保证 task_llm_loop 能读取该 thread 的历史 messages。
-                thread_id: sub_thread_id.clone(),
-                is_primary: false,
-                session_id: request.session_id.clone(),
-                workspace_id: workspace_id.clone(),
-                ownership: sub_ownership,
-                writebacks: ExecutionWritebackPlans::default(),
-                use_tools: true,
-                skill_name: request.skill_name.clone(),
-            },
-        );
-    }
-
-    let mut branches = vec![ActiveExecutionBranch {
-        task_id: act_task_id.clone(),
-        worker_id: worker_id.clone(),
-        stage: "execute".to_string(),
-        lease_id: None,
-        execution_intent_ref: None,
-        binding_lifecycle: None,
-        checkpoint_stage: Some("execute".to_string()),
-        next_step_index: Some(0),
-        checkpoint_at: Some(now),
-        resume_mode: Some("stage-restart".to_string()),
-        resume_token: None,
-        use_tools: true,
-        skill_name: request.skill_name.clone(),
-        is_primary: true,
-    }];
-    for sub_task_id in &dispatch_task_ids {
-        branches.push(ActiveExecutionBranch {
-            task_id: sub_task_id.clone(),
-            worker_id: worker_id.clone(),
-            stage: "execute".to_string(),
-            lease_id: None,
-            execution_intent_ref: None,
-            binding_lifecycle: None,
-            checkpoint_stage: Some("execute".to_string()),
-            next_step_index: Some(0),
-            checkpoint_at: Some(now),
-            resume_mode: Some("stage-restart".to_string()),
-            resume_token: None,
-            use_tools: true,
-            skill_name: request.skill_name.clone(),
-            is_primary: false,
-        });
-    }
-    let request_id = request.request_id.clone();
-    let user_message_id = request.user_message_id.clone();
-    let placeholder_message_id = request.placeholder_message_id.clone();
-    let user_message_item_id = user_message_id
-        .clone()
-        .unwrap_or_else(|| format!("turn-item-user-{}", accepted_at.0));
-    // P7：worker_lanes 严格表征"工人 sidechain"。pure-chat（无子任务）下无 lane、
-    // 无 worker_spawned item、无任务分配 phase；orchestrator 的回复直接在主线 thread 上。
-    let dispatch_lane_task_ids = dispatch_task_ids.clone();
-    // orchestrator_thread_id 已由开头 ensure_session_mission 返回，直接复用。
-    let mut current_turn = ActiveExecutionTurn {
-        turn_id: format!("turn-session-action-{}", accepted_at.0),
-        turn_seq: accepted_at.0,
-        accepted_at,
-        status: "accepted".to_string(),
-        completed_at: None,
-        user_message: trimmed_text.map(str::to_string),
-        items: vec![
-            ActiveExecutionTurnItem {
-                item_id: user_message_item_id,
-                item_seq: 1,
-                lane_id: None,
-                lane_seq: None,
-                kind: "user_message".to_string(),
-                status: "completed".to_string(),
-                source: "user".to_string(),
-                title: None,
-                content: trimmed_text.map(str::to_string),
-                task_id: Some(act_task_id.clone()),
-                worker_id: None,
-                role_id: None,
-                tool_call_id: None,
-                tool_name: None,
-                tool_status: None,
-                tool_arguments: None,
-                tool_result: None,
-                tool_error: None,
-                request_id: request_id.clone(),
-                user_message_id: user_message_id.clone(),
-                placeholder_message_id: placeholder_message_id.clone(),
-                timeline_entry_id: Some(entry_id.to_string()),
-                // P7：user_message 永远归属主线 orchestrator thread。
-                source_thread_id: orchestrator_thread_id.clone(),
-            },
-        ],
-        worker_lanes: dispatch_lane_task_ids
-            .iter()
-            .enumerate()
-            .map(|(index, sub_task_id)| {
-                // P7：每条 worker lane 必有 role + thread。role_for_task 已在闭包中
-                // 强制非空；thread 借助 ensure_thread_for_role 复用 / spawn。
-                let role_id = role_for_task(sub_task_id);
-                let thread_id = ensure_thread_for_role(
-                    &state.session_store,
-                    &request.session_id,
-                    &mission_id,
-                    &role_id,
-                    &worker_id,
-                    sub_task_id,
-                    now,
-                );
-                ActiveExecutionTurnLane {
-                    lane_id: format!("lane-{}", sub_task_id),
-                    lane_seq: index + 1,
-                    task_id: sub_task_id.clone(),
-                    worker_id: worker_id.clone(),
-                    role_id,
-                    thread_id,
-                    title: state
-                        .task_store()
-                        .and_then(|store| store.get_task(sub_task_id))
-                        .map(|task| task.title)
-                        .unwrap_or_else(|| sub_task_id.to_string()),
-                    is_primary: false,
-                }
-            })
-            .collect(),
-    };
-    for (index, sub_task_id) in dispatch_lane_task_ids.iter().enumerate() {
-        let lane_id = format!("lane-{}", sub_task_id);
-        let lane = current_turn
-            .worker_lanes
-            .iter()
-            .find(|lane| lane.task_id == *sub_task_id)
-            .expect("worker_lane just constructed for sub_task_id");
-        let lane_title = lane.title.clone();
-        // P7：worker_spawned item 归属到该 worker 自身 thread（在 worker_lanes 构造时
-        // 已 ensure），drawer 打开时能作为该 worker sidechain 的起点事件被检索到。
-        let worker_thread_id = lane.thread_id.clone();
-        current_turn.items.push(ActiveExecutionTurnItem {
-            item_id: format!("turn-item-worker-spawned-{}-{}", accepted_at.0, index),
-            item_seq: index + 2,
-            lane_id: Some(lane_id),
-            lane_seq: Some(index + 1),
-            kind: "worker_spawned".to_string(),
-            status: "pending".to_string(),
-            source: worker_id.to_string(),
-            title: Some(lane_title.clone()),
-            content: Some(format!("已为 {} 创建执行步骤。", lane_title)),
-            task_id: Some(sub_task_id.clone()),
-            worker_id: Some(worker_id.clone()),
-            role_id: Some(role_for_task(sub_task_id)),
-            tool_call_id: None,
-            tool_name: None,
-            tool_status: None,
-            tool_arguments: None,
-            tool_result: None,
-            tool_error: None,
-            request_id: request_id.clone(),
-            user_message_id: user_message_id.clone(),
-            placeholder_message_id: placeholder_message_id.clone(),
-            timeline_entry_id: None,
-            source_thread_id: worker_thread_id,
-        });
-    }
-    current_turn.normalize();
-    Ok(TaskGraphSubmission {
-        root_task_id: obj_task_id.clone(),
-        action_task_id: act_task_id.clone(),
-        active_execution_chain: Some(ActiveExecutionChain {
-            session_id: request.session_id.clone(),
-            mission_id,
-            root_task_id: obj_task_id,
-            execution_chain_ref: execution_chain_ref
-                .expect("dispatch execution chain ref should exist"),
-            workspace_id,
-            active_branch_task_ids: branches
-                .iter()
-                .map(|branch| branch.task_id.clone())
-                .collect(),
-            active_worker_bindings: branches
-                .iter()
-                .map(|branch| branch.worker_id.clone())
-                .collect(),
-            branches,
-            recovery_ref: None,
-            dispatch_context: ActiveExecutionDispatchContext {
-                accepted_at,
-                entry_id: entry_id.to_string(),
-                trimmed_text: trimmed_text.map(str::to_string),
-                skill_name: request.skill_name.clone(),
-            },
-            current_turn: Some(current_turn),
-        }),
+        request,
+    )
+    .map_err(|err| match err {
+        magi_conversation_runtime::dispatch_submission::DispatchSubmissionRunError::InvalidInput(msg) => {
+            ApiError::InvalidInput(msg)
+        }
+        magi_conversation_runtime::dispatch_submission::DispatchSubmissionRunError::Internal(msg) => {
+            ApiError::internal_assembly("任务派发失败", msg)
+        }
     })
 }
 
@@ -462,62 +91,6 @@ pub(crate) fn run_session_action(
     )
 }
 
-fn build_task_graph(
-    state: &ApiState,
-    mission_id: &MissionId,
-    root_task_id: &TaskId,
-    primary_action_task_id: &TaskId,
-    accepted_at: UtcMillis,
-    target_role: &str,
-    prompt: &str,
-    workspace_id: &Option<WorkspaceId>,
-    now: &UtcMillis,
-) -> Result<TaskGraphBuildResult, ApiError> {
-    let prompt_text = prompt.trim();
-    if prompt_text.is_empty() {
-        return Err(ApiError::internal_assembly(
-            "构建任务图失败",
-            "prompt 为空",
-        ));
-    }
-    let _ = now;
-    let workspace_root_path = state.workspace_root_path(workspace_id);
-    let plan = decompose_mission(
-        state.model_bridge_client(),
-        workspace_root_path.as_deref(),
-        Some(prompt_text),
-    )
-    .ok_or_else(|| {
-        ApiError::internal_assembly("构建任务图失败", "无法生成结构化任务计划")
-    })?;
-    if !task_phase_count_is_valid(plan.phases.len()) {
-        return Err(ApiError::internal_assembly(
-            "构建任务图失败",
-            format!("任务图需要 {TASK_MIN_PHASES} 到 {TASK_MAX_PHASES} 个 phase"),
-        ));
-    }
-
-    let task_store = state
-        .task_store()
-        .ok_or_else(|| ApiError::internal_assembly("构建任务图失败", "task_store 未配置"))?;
-    insert_task_graph(
-        task_store,
-        mission_id,
-        root_task_id,
-        primary_action_task_id,
-        accepted_at,
-        target_role,
-        now,
-        &plan,
-        &state.agent_role_registry,
-        state.spawn_graph.as_ref(),
-    )
-    .map_err(|msg| ApiError::internal_assembly("构建任务图失败", msg))
-}
-
-/// M14：任务图重规划入口。任务图重规划本体已下沉到
-/// `magi_conversation_runtime::task_graph_replan::replan_task_graph`，这里只做
-/// ApiState → 显式参数的薄壳桥接 + `TaskGraphReplanError` → `ApiError` 错误分类。
 pub(crate) fn replan_task_graph(
     state: &ApiState,
     root_task_id: &TaskId,
@@ -550,7 +123,6 @@ pub(crate) fn replan_task_graph(
     })
 }
 
-/// M14：会话活跃执行链校验。本体下沉到 v2，magi-api 仅做错误分类。
 pub(crate) fn ensure_session_active_execution_chain(
     state: &ApiState,
     session_id: &SessionId,
@@ -573,255 +145,26 @@ pub(crate) fn replace_replanned_task_execution_branches(
     primary_action_task_id: &TaskId,
     leaf_action_task_ids: &[TaskId],
 ) -> Result<(), ApiError> {
-    let mut branch_specs = Vec::with_capacity(leaf_action_task_ids.len() + 1);
-    branch_specs.push(SessionExecutionBranchSpec {
-        task_id: primary_action_task_id.clone(),
-        is_primary: true,
-    });
-    branch_specs.extend(leaf_action_task_ids.iter().cloned().map(|task_id| {
-        SessionExecutionBranchSpec {
-            task_id,
-            is_primary: false,
+    magi_conversation_runtime::dispatch_submission::replace_replanned_task_execution_branches(
+        &state.session_store,
+        state
+            .task_store()
+            .ok_or_else(|| ApiError::internal_assembly("注册任务执行分支失败", "task_store 未配置"))?,
+        state.task_execution_registry(),
+        session_id,
+        primary_action_task_id,
+        leaf_action_task_ids,
+    )
+    .map_err(|err| match err {
+        magi_conversation_runtime::dispatch_submission::DispatchSubmissionRunError::InvalidInput(msg) => {
+            ApiError::InvalidInput(msg)
         }
-    }));
-    update_session_execution_branches(state, session_id, &branch_specs)
+        magi_conversation_runtime::dispatch_submission::DispatchSubmissionRunError::Internal(msg) => {
+            ApiError::internal_assembly("注册任务执行分支失败", msg)
+        }
+    })
 }
 
-fn update_session_execution_branches(
-    state: &ApiState,
-    session_id: &SessionId,
-    branch_specs: &[SessionExecutionBranchSpec],
-) -> Result<(), ApiError> {
-    if branch_specs.is_empty() {
-        return Ok(());
-    }
-    let task_store = state
-        .task_store()
-        .ok_or_else(|| ApiError::internal_assembly("注册任务执行分支失败", "task_store 未配置"))?;
-    let mut active_chain = state
-        .session_store
-        .runtime_sidecar(session_id)
-        .and_then(|sidecar| sidecar.active_execution_chain)
-        .ok_or_else(|| ApiError::InvalidInput("当前会话没有可注册任务的活跃执行链".to_string()))?;
-    if active_chain.session_id != *session_id {
-        return Err(ApiError::InvalidInput(
-            "活跃执行链不属于当前会话".to_string(),
-        ));
-    }
-
-    let worker_id = active_chain
-        .branches
-        .first()
-        .map(|branch| branch.worker_id.clone())
-        .or_else(|| active_chain.active_worker_bindings.first().cloned())
-        .unwrap_or_else(|| {
-            WorkerId::new(format!(
-                "worker-session-action-{}",
-                active_chain.dispatch_context.accepted_at.0
-            ))
-        });
-    let workspace_id = active_chain.workspace_id.clone();
-    let mission_id = active_chain.mission_id.clone();
-    let root_task_id = active_chain.root_task_id.clone();
-    let execution_chain_ref = active_chain.execution_chain_ref.clone();
-    let skill_name = active_chain.dispatch_context.skill_name.clone();
-    let now = UtcMillis::now();
-
-    let existing_task_ids = active_chain
-        .branches
-        .iter()
-        .map(|branch| branch.task_id.clone())
-        .collect::<std::collections::HashSet<_>>();
-    let new_task_ids = branch_specs
-        .iter()
-        .map(|spec| spec.task_id.clone())
-        .collect::<std::collections::HashSet<_>>();
-    for task_id in existing_task_ids.difference(&new_task_ids) {
-        let _ = state.task_execution_registry().remove(task_id);
-    }
-
-    let mut appended_lane_count = 0usize;
-    let mut new_branches = Vec::with_capacity(branch_specs.len());
-    let mut new_lanes = Vec::new();
-
-    for spec in branch_specs {
-        let task = task_store
-            .get_task(&spec.task_id)
-            .ok_or_else(|| ApiError::InvalidInput(format!("待注册任务不存在: {}", spec.task_id)))?;
-        if task.mission_id != mission_id || task.root_task_id != root_task_id {
-            return Err(ApiError::InvalidInput(format!(
-                "任务 {} 不属于当前执行链",
-                spec.task_id
-            )));
-        }
-        // P7：role_id 为架构不变量，缺失即分派契约破裂；直接 panic 暴露上游错误，
-        // 不再提供 fallback 走 resolve_task_role。
-        let role_id: String = task
-            .executor_binding_target_role()
-            .map(str::to_string)
-            .unwrap_or_else(|| {
-                panic!(
-                    "task {} must declare executor_binding.target_role before append_branches",
-                    spec.task_id
-                )
-            });
-        let lane_seq = if spec.is_primary {
-            None
-        } else {
-            let seq = appended_lane_count + 1;
-            appended_lane_count += 1;
-            Some(seq)
-        };
-        let lane_id = lane_seq.map(|_| format!("lane-{}", spec.task_id));
-        let ownership = ExecutionOwnership {
-            session_id: Some(session_id.clone()),
-            workspace_id: workspace_id.clone(),
-            mission_id: Some(mission_id.clone()),
-            task_id: Some(spec.task_id.clone()),
-            worker_id: Some(worker_id.clone()),
-            execution_chain_ref: Some(execution_chain_ref.clone()),
-            ..ExecutionOwnership::default()
-        };
-        // P6b：注册 plan 之前 ensure thread，下方 new_lanes 构造时命中同一条复用即可，
-        // 保证 plan 与 lane 两侧 thread_id 一致，避免同 task 出现两条错位 thread。
-        let thread_id_for_plan = ensure_thread_for_role(
-            &state.session_store,
-            session_id,
-            &mission_id,
-            role_id.as_str(),
-            &worker_id,
-            &spec.task_id,
-            now,
-        );
-        state.task_execution_registry().insert(
-            spec.task_id.clone(),
-            TaskExecutionPlan::Dispatch {
-                target: TaskExecutionTarget {
-                    mission_id: mission_id.clone(),
-                    root_task_id: root_task_id.clone(),
-                    task_id: spec.task_id.clone(),
-                    requested_worker_id: Some(worker_id.clone()),
-                    recovery_id: None,
-                    execution_chain_ref: Some(execution_chain_ref.clone()),
-                },
-                worker_id: worker_id.clone(),
-                lane_id: lane_id.clone(),
-                lane_seq,
-                // P6b：plan 与 lane 同步持有 thread_id，保证执行时能读取持久化历史。
-                thread_id: thread_id_for_plan.clone(),
-                is_primary: spec.is_primary,
-                session_id: session_id.clone(),
-                workspace_id: workspace_id.clone(),
-                ownership,
-                writebacks: ExecutionWritebackPlans::default(),
-                use_tools: true,
-                skill_name: skill_name.clone(),
-            },
-        );
-        new_branches.push(ActiveExecutionBranch {
-            task_id: spec.task_id.clone(),
-            worker_id: worker_id.clone(),
-            stage: "execute".to_string(),
-            lease_id: None,
-            execution_intent_ref: None,
-            binding_lifecycle: None,
-            checkpoint_stage: Some("execute".to_string()),
-            next_step_index: Some(0),
-            checkpoint_at: Some(now),
-            resume_mode: Some("stage-restart".to_string()),
-            resume_token: None,
-            use_tools: true,
-            skill_name: skill_name.clone(),
-            is_primary: spec.is_primary,
-        });
-        if let (Some(lane_id), Some(lane_seq)) = (lane_id, lane_seq) {
-            // P6b：直接复用 plan 注册时已 ensure 的 thread_id，避免二次 ensure_thread_for_role
-            // 造成 handled_task_ids 重复追加。
-            new_lanes.push(ActiveExecutionTurnLane {
-                lane_id,
-                lane_seq,
-                task_id: spec.task_id.clone(),
-                worker_id: worker_id.clone(),
-                role_id,
-                thread_id: thread_id_for_plan.clone(),
-                title: task.title,
-                is_primary: false,
-            });
-        }
-    }
-
-    active_chain.branches = new_branches.clone();
-    active_chain.active_branch_task_ids = active_chain
-        .branches
-        .iter()
-        .map(|branch| branch.task_id.clone())
-        .collect();
-    active_chain.active_worker_bindings = active_chain
-        .branches
-        .iter()
-        .map(|branch| branch.worker_id.clone())
-        .collect();
-
-    if let Some(turn) = active_chain.current_turn.as_mut() {
-        turn.worker_lanes = new_lanes.clone();
-        turn.items.retain(|item| {
-            item.kind != "worker_spawned"
-                || item
-                    .task_id
-                    .as_ref()
-                    .is_some_and(|task_id| new_task_ids.contains(task_id))
-        });
-        let mut next_item_seq = turn
-            .items
-            .iter()
-            .map(|item| item.item_seq)
-            .max()
-            .unwrap_or(0)
-            .saturating_add(1);
-        for lane in &new_lanes {
-            let already_has_spawned = turn.items.iter().any(|item| {
-                item.kind == "worker_spawned" && item.task_id.as_ref() == Some(&lane.task_id)
-            });
-            if already_has_spawned {
-                continue;
-            }
-            turn.items.push(ActiveExecutionTurnItem {
-                item_id: format!("turn-item-worker-spawned-{}-{}", now.0, lane.lane_seq),
-                item_seq: next_item_seq,
-                lane_id: Some(lane.lane_id.clone()),
-                lane_seq: Some(lane.lane_seq),
-                kind: "worker_spawned".to_string(),
-                status: "pending".to_string(),
-                source: lane.worker_id.to_string(),
-                title: Some(lane.title.clone()),
-                content: Some(format!("已为 {} 创建执行步骤。", lane.title)),
-                task_id: Some(lane.task_id.clone()),
-                worker_id: Some(lane.worker_id.clone()),
-                role_id: Some(lane.role_id.clone()),
-                tool_call_id: None,
-                tool_name: None,
-                tool_status: None,
-                tool_arguments: None,
-                tool_result: None,
-                tool_error: None,
-                request_id: None,
-                user_message_id: None,
-                placeholder_message_id: None,
-                timeline_entry_id: None,
-                // P6c：append_branches 时的 worker_spawned item 归属到 lane 自身 worker thread。
-                source_thread_id: lane.thread_id.clone(),
-            });
-            next_item_seq = next_item_seq.saturating_add(1);
-        }
-        turn.normalize();
-    }
-    active_chain.normalize();
-    state
-        .session_store
-        .upsert_active_execution_chain(session_id.clone(), active_chain)
-        .map_err(|error| ApiError::internal_assembly("注册任务执行分支失败", error))?;
-    Ok(())
-}
 
 
 
