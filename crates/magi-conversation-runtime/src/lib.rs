@@ -12,6 +12,7 @@
 mod builtin_tool_schema;
 mod conversation;
 mod driver;
+pub mod execution_chain_recovery;
 mod mailbox;
 pub mod model_config;
 pub mod prompt_utils;

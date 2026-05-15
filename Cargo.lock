@@ -1047,6 +1047,8 @@ dependencies = [
  "magi-tool-runtime",
  "magi-usage-authority",
  "magi-validation-runner",
+ "magi-worker-runtime",
+ "magi-workspace",
  "serde",
  "serde_json",
  "tracing",

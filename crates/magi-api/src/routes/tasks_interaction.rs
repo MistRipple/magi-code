@@ -89,7 +89,16 @@ async fn interrupt_task(
             &format!("timeline-streaming-{}", subtree_task_id),
         );
     }
-    finalize_terminal_worker_branches(&state, &session_id)?;
+    let worker_runtime_handle = state
+        .execution_pipeline()
+        .map(|pipeline| pipeline.execution_runtime.worker_runtime());
+    finalize_terminal_worker_branches(
+        &state.session_store,
+        state.task_store(),
+        worker_runtime_handle,
+        &session_id,
+    )
+    .map_err(|msg| ApiError::internal_assembly("收敛 worker 终态失败", msg))?;
     let _ = state
         .session_store
         .update_current_turn_status(&session_id, "blocked");

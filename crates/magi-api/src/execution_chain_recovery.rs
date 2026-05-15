@@ -4,8 +4,8 @@ use crate::{
     task_execution::TaskExecutionPlan,
 };
 use magi_core::{
-    ExecutionOwnership, RecoveryResumeInput, SessionId, TaskExecutionTarget, TaskId, TaskStatus,
-    ThreadId, UtcMillis, WorkerId,
+    ExecutionOwnership, RecoveryResumeInput, SessionId, TaskExecutionTarget, TaskStatus, ThreadId,
+    UtcMillis, WorkerId,
 };
 use magi_orchestrator::{ExecutionWritebackPlans, task_store::TaskStore};
 use magi_session_store::{ActiveExecutionBranch, ActiveExecutionChain};
@@ -15,157 +15,13 @@ use magi_worker_runtime::{
 };
 use magi_workspace::RecoveryStatus;
 
-#[derive(Clone, Debug)]
-pub struct SessionContinueAccepted {
-    pub session_id: SessionId,
-    pub mission_id: magi_core::MissionId,
-    pub root_task_id: TaskId,
-    pub action_task_id: TaskId,
-    pub execution_chain_ref: String,
-    pub resumed_branch_count: usize,
-    pub runner_started: bool,
-}
-
-fn task_status_is_terminal(status: &TaskStatus) -> bool {
-    matches!(status, TaskStatus::Completed | TaskStatus::Cancelled)
-}
-
-fn task_status_is_continue_recoverable(status: &TaskStatus) -> bool {
-    matches!(status, TaskStatus::Blocked)
-}
-
-fn task_status_needs_terminal_branch_finalization(status: &TaskStatus) -> bool {
-    matches!(
-        status,
-        TaskStatus::Blocked
-            | TaskStatus::Ready
-            | TaskStatus::Running
-            | TaskStatus::Verifying
-            | TaskStatus::Repairing
-    )
-}
-
-fn branch_stage_is_terminal(stage: &str) -> bool {
-    matches!(
-        stage.trim().to_ascii_lowercase().as_str(),
-        "finish" | "finished"
-    )
-}
-
-fn branch_runtime_snapshot_is_terminal(state: &ApiState, branch: &ActiveExecutionBranch) -> bool {
-    state
-        .execution_pipeline()
-        .and_then(|pipeline| {
-            pipeline
-                .execution_runtime
-                .worker_runtime()
-                .branch_snapshot_for_task(&branch.task_id)
-        })
-        .is_some_and(|snapshot| {
-            snapshot.worker_id == branch.worker_id && matches!(snapshot.stage, WorkerStage::Finish)
-        })
-}
-
-fn branch_is_terminal_for_recovery(state: &ApiState, branch: &ActiveExecutionBranch) -> bool {
-    branch_stage_is_terminal(&branch.stage) || branch_runtime_snapshot_is_terminal(state, branch)
-}
-
-pub(crate) fn active_execution_branch_is_continue_recoverable(
-    state: &ApiState,
-    chain: &ActiveExecutionChain,
-    branch: &ActiveExecutionBranch,
-) -> bool {
-    if branch_is_terminal_for_recovery(state, branch) {
-        return false;
-    }
-    let Some(task_store) = state.task_store() else {
-        return false;
-    };
-    let Some(task) = task_store.get_task(&branch.task_id) else {
-        return false;
-    };
-    task.mission_id == chain.mission_id
-        && task.root_task_id == chain.root_task_id
-        && task_status_is_continue_recoverable(&task.status)
-}
-
-fn terminal_status_for_branch(
-    state: &ApiState,
-    branch: &ActiveExecutionBranch,
-) -> Option<TaskStatus> {
-    let reports = state
-        .execution_pipeline()?
-        .execution_runtime
-        .worker_runtime()
-        .reports();
-    reports
-        .iter()
-        .rev()
-        .find(|report| {
-            report.worker_id == branch.worker_id
-                && report.task_id == branch.task_id
-                && report.stage == magi_worker_runtime::WorkerStage::Finish
-        })
-        .map(|report| match report.termination_reason {
-            Some(magi_core::TerminationReason::Failed) => TaskStatus::Failed,
-            Some(magi_core::TerminationReason::Cancelled) => TaskStatus::Cancelled,
-            Some(magi_core::TerminationReason::Blocked) => TaskStatus::Blocked,
-            Some(magi_core::TerminationReason::Completed) | None => TaskStatus::Completed,
-        })
-        .or_else(|| {
-            branch_runtime_snapshot_is_terminal(state, branch).then_some(TaskStatus::Completed)
-        })
-}
-
-fn runtime_terminal_evidence_ref(branch: &ActiveExecutionBranch) -> String {
-    format!(
-        "evidence://worker-runtime/{}/finish?worker={}",
-        branch.task_id, branch.worker_id
-    )
-}
-
-pub(crate) fn finalize_terminal_worker_branches(
-    state: &ApiState,
-    session_id: &SessionId,
-) -> Result<usize, ApiError> {
-    let Some(chain) = state
-        .session_store
-        .runtime_sidecar(session_id)
-        .and_then(|sidecar| sidecar.active_execution_chain)
-    else {
-        return Ok(0);
-    };
-    let task_store = state
-        .task_store()
-        .ok_or_else(|| ApiError::internal_assembly("收敛 worker 终态失败", "task_store 未配置"))?;
-    let mut finalized_count = 0usize;
-    for branch in chain
-        .branches
-        .iter()
-        .filter(|branch| branch_is_terminal_for_recovery(state, branch))
-    {
-        let Some(task) = task_store.get_task(&branch.task_id) else {
-            continue;
-        };
-        if !task_status_needs_terminal_branch_finalization(&task.status) {
-            continue;
-        }
-        let terminal_status =
-            terminal_status_for_branch(state, branch).unwrap_or(TaskStatus::Completed);
-        if matches!(terminal_status, TaskStatus::Blocked) {
-            continue;
-        }
-        if matches!(terminal_status, TaskStatus::Completed) && task.evidence_refs.is_empty() {
-            task_store
-                .set_evidence_refs(&branch.task_id, vec![runtime_terminal_evidence_ref(branch)]);
-        }
-        task_store
-            .update_status(&branch.task_id, terminal_status)
-            .map_err(|error| ApiError::internal_assembly("收敛 worker 终态失败", error))?;
-        finalized_count += 1;
-    }
-    Ok(finalized_count)
-}
+// M10：上半数据载体 + 终态判定下沉到 conversation-runtime。pub(crate) 重导出，
+// 让本文件残留的 M11 路径（continue_execution_chain 等）与外部 routes 继续按
+// 原名引用；签名为 v2 风格（显式 stores + Result<_, String>）。
+pub(crate) use magi_conversation_runtime::execution_chain_recovery::{
+    SessionContinueAccepted, active_execution_branch_is_continue_recoverable,
+    finalize_terminal_worker_branches, task_status_is_terminal,
+};
 
 fn rebuild_dispatch_plan_for_branch(
     chain: &ActiveExecutionChain,
@@ -501,14 +357,28 @@ pub(crate) fn continue_execution_chain(
             ),
         ));
     }
-    finalize_terminal_worker_branches(state, session_id)?;
+    let worker_runtime_handle = state
+        .execution_pipeline()
+        .map(|pipeline| pipeline.execution_runtime.worker_runtime());
+    finalize_terminal_worker_branches(
+        &state.session_store,
+        state.task_store(),
+        worker_runtime_handle,
+        session_id,
+    )
+    .map_err(|msg| ApiError::internal_assembly("收敛 worker 终态失败", msg))?;
 
     let resumable_branches = chain
         .branches
         .iter()
         .filter_map(|branch| {
-            active_execution_branch_is_continue_recoverable(state, &chain, branch)
-                .then(|| branch.clone())
+            active_execution_branch_is_continue_recoverable(
+                worker_runtime_handle,
+                state.task_store(),
+                &chain,
+                branch,
+            )
+            .then(|| branch.clone())
         })
         .collect::<Vec<_>>();
     if resumable_branches.is_empty() {

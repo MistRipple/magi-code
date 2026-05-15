@@ -415,10 +415,17 @@ fn session_has_recoverable_chain(state: &ApiState, session_id: &SessionId) -> bo
     let Some(chain) = state.session_store.active_execution_chain(session_id) else {
         return false;
     };
-    chain
-        .branches
-        .iter()
-        .any(|branch| active_execution_branch_is_continue_recoverable(state, &chain, branch))
+    let worker_runtime_handle = state
+        .execution_pipeline()
+        .map(|pipeline| pipeline.execution_runtime.worker_runtime());
+    chain.branches.iter().any(|branch| {
+        active_execution_branch_is_continue_recoverable(
+            worker_runtime_handle,
+            state.task_store(),
+            &chain,
+            branch,
+        )
+    })
 }
 
 fn build_session_turn_classifier_prompt(
