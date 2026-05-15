@@ -1,13 +1,8 @@
-//! Task System v2 — M10/M11：继续会话恢复路径已下沉到 conversation-runtime。
+//! 继续会话 API 适配层。
 //!
-//! magi-api 仅保留 `continue_execution_chain` 这层"装配薄壳" —— 因为它强依赖
-//! `TaskExecutionPlan` + `RunnerStartError`（state.rs）+
-//! `TaskExecutionRegistry` / `RunnerManager` 等 ApiState 拥有的资源。所有可纯化
-//! 的判定 / 校验 / writebacks 落盘 / branch checkpoint 同步 / 子树解封逻辑都已
-//! 迁到 `magi_conversation_runtime::execution_chain_recovery`。
-//!
-//! 待 M16/M17 解除 magi-api 对 task plan 的所有权后，本文件可整体并入
-//! `Conversation::resume_for_continue` 并被删除。
+//! 纯判定、校验、writeback 落盘、branch checkpoint 同步和子树解封逻辑已下沉到
+//! `magi_conversation_runtime::execution_chain_recovery`；本模块只负责把 `ApiState`
+//! 持有的 runner、task store 与 execution registry 装配给 runtime 恢复流程。
 
 use crate::{
     errors::ApiError,
@@ -26,8 +21,7 @@ use magi_core::{
 use magi_orchestrator::ExecutionWritebackPlans;
 use magi_session_store::{ActiveExecutionBranch, ActiveExecutionChain};
 
-// 上半的纯数据载体与判定函数仍按原名 re-export，避免 routes/sessions.rs /
-// routes/tasks_interaction.rs 等外部调用点改 import。
+// 对 routes/sessions.rs 暴露继续会话所需的 runtime 数据载体与判定函数。
 pub(crate) use magi_conversation_runtime::execution_chain_recovery::{
     SessionContinueAccepted, active_execution_branch_is_continue_recoverable,
     finalize_terminal_worker_branches, task_status_is_terminal,

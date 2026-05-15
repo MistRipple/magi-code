@@ -5,9 +5,8 @@ use serde::Deserialize;
 use serde_json::json;
 
 use super::session_scope::parse_session_id;
-use crate::{
-    errors::ApiError, execution_chain_recovery::finalize_terminal_worker_branches, state::ApiState,
-};
+use crate::{errors::ApiError, state::ApiState};
+use magi_conversation_runtime::execution_chain_recovery::finalize_terminal_worker_branches;
 
 pub fn routes() -> Router<ApiState> {
     Router::new().route("/task/interrupt", post(interrupt_task))

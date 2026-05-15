@@ -35,7 +35,7 @@ use crate::{
         SessionTurnResponseDto, SessionTurnRouteDto,
     },
     errors::ApiError,
-    execution_chain_recovery::{
+    session_continue::{
         SessionContinueAccepted, active_execution_branch_is_continue_recoverable,
         continue_execution_chain,
     },
