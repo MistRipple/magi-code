@@ -5,10 +5,6 @@ use super::{
     maintenance::{RuntimeMaintenance, RuntimeMaintenanceConfig},
     persistence::{RuntimeSidecarPersistence, StateRepository},
 };
-use magi_api::task_execution::{
-    EventBasedResultReceiver, LlmTaskDispatcher, TaskOutcome, TaskResult,
-    publish_task_status_turn_item_for_active_sessions,
-};
 use magi_api::{
     ApiState, DirectHttpModelProbeConfig, RunnerManager, RuntimeStatePersistence, SettingsStore,
     build_router,
@@ -19,6 +15,11 @@ use magi_bridge_client::{
     JsonRpcStdioTransport, StdioMcpBridgeClient,
 };
 use magi_context_runtime::{ContextBudget, ContextRuntime};
+use magi_conversation_runtime::{
+    session_turn_finalize::publish_task_status_turn_item_for_active_sessions,
+    task_execution_dispatcher::LlmTaskDispatcher,
+    task_runner_bridge::{EventBasedResultReceiver, TaskOutcome, TaskResult},
+};
 use magi_core::{EventId, ExecutionOwnership, LeaseId, TaskStatus, UtcMillis};
 use magi_event_bus::{EventEnvelope, InMemoryEventBus};
 use magi_governance::GovernanceService;
@@ -574,7 +575,7 @@ impl DaemonRuntime {
         .with_execution_pipeline(orchestrator, execution_runtime, memory_store);
 
         state = state.with_task_store(Arc::clone(&task_store));
-        if magi_api::task_execution::reconcile_terminal_session_task_turns(&state) > 0 {
+        if magi_api::task_turn_finalize::reconcile_terminal_session_task_turns(&state) > 0 {
             let _ = state.persist_session_durable_state();
         }
         let state_for_task_workers = state.clone();
@@ -623,7 +624,7 @@ impl DaemonRuntime {
             let Some(session_id) = session_id else {
                 return;
             };
-            if magi_api::task_execution::finalize_background_session_task_turn_if_root_terminal(
+            if magi_api::task_turn_finalize::finalize_background_session_task_turn_if_root_terminal(
                 &state_for_runner_terminal,
                 &session_id,
                 &root_task_id,
@@ -736,11 +737,7 @@ impl DaemonRuntime {
         if let Err(error) = event_bus.refresh_audit_usage_ledger_persistence() {
             warn!(error = %error, "审计/用量账本初始刷新失败，后续事件仍会继续运行");
         }
-        publish_ledger_status_event(
-            event_bus,
-            "system-ledger-ready",
-            "system.ledger.ready",
-        );
+        publish_ledger_status_event(event_bus, "system-ledger-ready", "system.ledger.ready");
         Ok(())
     }
 
@@ -963,8 +960,8 @@ mod tests {
         let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root.clone());
         let workspace_root = config.bootstrap_workspace_root.clone();
 
-        let runtime = DaemonRuntime::restore(&config)
-            .expect("runtime restore should bootstrap empty state");
+        let runtime =
+            DaemonRuntime::restore(&config).expect("runtime restore should bootstrap empty state");
 
         assert!(runtime.session_store.current_session().is_some());
         assert_eq!(runtime.workspace_store.snapshots().len(), 1);
@@ -1383,8 +1380,8 @@ mod tests {
     async fn router_session_action_auto_extraction_is_consumed_on_followup_dispatch() {
         let state_root = temp_state_root("router-session-action");
         let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
-        let runtime = DaemonRuntime::restore(&config)
-            .expect("runtime restore should bootstrap empty state");
+        let runtime =
+            DaemonRuntime::restore(&config).expect("runtime restore should bootstrap empty state");
         let (app, state) = runtime.router_with_state_for_tests("daemon-test".to_string());
         let active_workspace_id = state
             .workspace_registry
@@ -1440,12 +1437,9 @@ mod tests {
                 .len(),
             0
         );
-        let first_projection = wait_for_task_projection_completed(
-            app.clone(),
-            first_root_task_id,
-            "test-session-001",
-        )
-        .await;
+        let first_projection =
+            wait_for_task_projection_completed(app.clone(), first_root_task_id, "test-session-001")
+                .await;
         assert_completed_two_task_projection(&first_projection);
 
         let (status, second_body) = post_json(
@@ -1483,8 +1477,7 @@ mod tests {
             json!([expected_extraction_id])
         );
         let second_projection =
-            wait_for_task_projection_completed(app, second_root_task_id, "test-session-001")
-                .await;
+            wait_for_task_projection_completed(app, second_root_task_id, "test-session-001").await;
         assert_completed_two_task_projection(&second_projection);
     }
 
@@ -1492,8 +1485,8 @@ mod tests {
     async fn router_regular_session_turn_uses_daemon_session_turn_dispatcher() {
         let state_root = temp_state_root("router-regular-session-turn");
         let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
-        let runtime = DaemonRuntime::restore(&config)
-            .expect("runtime restore should bootstrap empty state");
+        let runtime =
+            DaemonRuntime::restore(&config).expect("runtime restore should bootstrap empty state");
         let (app, state) = runtime.router_with_state_for_tests("daemon-test".to_string());
         let active_workspace_id = state
             .workspace_registry
@@ -1569,8 +1562,8 @@ mod tests {
     async fn router_recovery_resume_writeback_is_consumed_on_followup_dispatch() {
         let state_root = temp_state_root("router-recovery-resume");
         let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
-        let runtime = DaemonRuntime::restore(&config)
-            .expect("runtime restore should bootstrap empty state");
+        let runtime =
+            DaemonRuntime::restore(&config).expect("runtime restore should bootstrap empty state");
         let (app, state) = runtime.router_with_state_for_tests("daemon-test".to_string());
         let active_workspace_id = state
             .workspace_registry
@@ -1729,8 +1722,8 @@ mod tests {
 
         let state_root = temp_state_root("router-bridge-services");
         let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
-        let runtime = DaemonRuntime::restore(&config)
-            .expect("runtime restore should bootstrap empty state");
+        let runtime =
+            DaemonRuntime::restore(&config).expect("runtime restore should bootstrap empty state");
         let app = runtime.router("daemon-test".to_string());
 
         let snapshot = get_json(app, "/bridges/services").await;
@@ -1776,10 +1769,7 @@ mod tests {
 
     #[tokio::test]
     async fn daemon_router_bridge_preflight_executes_loopback_model_and_mcp_smokes() {
-        for binary_name in [
-            "model_bridge_loopback",
-            "mcp_bridge_loopback",
-        ] {
+        for binary_name in ["model_bridge_loopback", "mcp_bridge_loopback"] {
             let path = test_bridge_binary_path(binary_name);
             assert!(
                 path.exists(),
@@ -1790,8 +1780,8 @@ mod tests {
 
         let state_root = temp_state_root("router-bridge-preflight");
         let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
-        let runtime = DaemonRuntime::restore(&config)
-            .expect("runtime restore should bootstrap empty state");
+        let runtime =
+            DaemonRuntime::restore(&config).expect("runtime restore should bootstrap empty state");
         let app = runtime.router("daemon-test".to_string());
         let services_snapshot = get_json(app.clone(), "/bridges/services").await;
 
@@ -1881,8 +1871,8 @@ mod tests {
 
         let state_root = temp_state_root("router-bridge-cutover");
         let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
-        let runtime = DaemonRuntime::restore(&config)
-            .expect("runtime restore should bootstrap empty state");
+        let runtime =
+            DaemonRuntime::restore(&config).expect("runtime restore should bootstrap empty state");
         let app = runtime.router("daemon-test".to_string());
         let services_snapshot = get_json(app.clone(), "/bridges/services").await;
         let snapshot = get_json(app, "/bridges/cutover-smoke").await;
@@ -2145,8 +2135,8 @@ mod tests {
 
         let state_root = temp_state_root("router-bridge-cutover-env");
         let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
-        let runtime = DaemonRuntime::restore(&config)
-            .expect("runtime restore should bootstrap empty state");
+        let runtime =
+            DaemonRuntime::restore(&config).expect("runtime restore should bootstrap empty state");
         let (app, _) = runtime.router_with_bridge_env_for_tests(
             "daemon-test".to_string(),
             &[
@@ -2257,8 +2247,8 @@ mod tests {
 
         let state_root = temp_state_root("router-bridge-cutover-env-failure");
         let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
-        let runtime = DaemonRuntime::restore(&config)
-            .expect("runtime restore should bootstrap empty state");
+        let runtime =
+            DaemonRuntime::restore(&config).expect("runtime restore should bootstrap empty state");
         let (app, _) = runtime.router_with_bridge_env_for_tests(
             "daemon-test".to_string(),
             &[
@@ -2376,8 +2366,8 @@ mod tests {
 
         let state_root = temp_state_root("router-bridge-cutover-env-degraded-provider");
         let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
-        let runtime = DaemonRuntime::restore(&config)
-            .expect("runtime restore should bootstrap empty state");
+        let runtime =
+            DaemonRuntime::restore(&config).expect("runtime restore should bootstrap empty state");
         let (app, _) = runtime.router_with_bridge_env_for_tests(
             "daemon-test".to_string(),
             &[
@@ -2488,8 +2478,8 @@ mod tests {
 
         let state_root = temp_state_root("router-bridge-cutover-env-invalid-response");
         let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
-        let runtime = DaemonRuntime::restore(&config)
-            .expect("runtime restore should bootstrap empty state");
+        let runtime =
+            DaemonRuntime::restore(&config).expect("runtime restore should bootstrap empty state");
         let (app, _) = runtime.router_with_bridge_env_for_tests(
             "daemon-test".to_string(),
             &[
@@ -2617,8 +2607,8 @@ mod tests {
 
         let state_root = temp_state_root("router-bridge-cutover-env-fallback-only");
         let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
-        let runtime = DaemonRuntime::restore(&config)
-            .expect("runtime restore should bootstrap empty state");
+        let runtime =
+            DaemonRuntime::restore(&config).expect("runtime restore should bootstrap empty state");
         let (app, _) = runtime.router_with_bridge_env_for_tests(
             "daemon-test".to_string(),
             &[
@@ -2741,8 +2731,8 @@ mod tests {
 
         let state_root = temp_state_root("router-bridge-cutover-env-unavailable");
         let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
-        let runtime = DaemonRuntime::restore(&config)
-            .expect("runtime restore should bootstrap empty state");
+        let runtime =
+            DaemonRuntime::restore(&config).expect("runtime restore should bootstrap empty state");
         let (app, _) = runtime.router_with_bridge_env_for_tests(
             "daemon-test".to_string(),
             &[
@@ -2857,8 +2847,8 @@ mod tests {
 
         let state_root = temp_state_root("router-bridge-cutover-env-transport-failure");
         let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
-        let runtime = DaemonRuntime::restore(&config)
-            .expect("runtime restore should bootstrap empty state");
+        let runtime =
+            DaemonRuntime::restore(&config).expect("runtime restore should bootstrap empty state");
         let (app, _) = runtime.router_with_bridge_env_for_tests(
             "daemon-test".to_string(),
             &[
@@ -2953,8 +2943,8 @@ mod tests {
     async fn daemon_router_bridge_routes_do_not_touch_execution_state() {
         let state_root = temp_state_root("router-bridge-guard");
         let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
-        let runtime = DaemonRuntime::restore(&config)
-            .expect("runtime restore should bootstrap empty state");
+        let runtime =
+            DaemonRuntime::restore(&config).expect("runtime restore should bootstrap empty state");
         let (app, state) = runtime.router_with_state_for_tests("daemon-test".to_string());
 
         let before_runtime_read_model = serde_json::to_value(state.runtime_read_model_dto())
@@ -3012,8 +3002,8 @@ mod tests {
 
         let state_root = temp_state_root("router-bootstrap-bridges");
         let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
-        let runtime = DaemonRuntime::restore(&config)
-            .expect("runtime restore should bootstrap empty state");
+        let runtime =
+            DaemonRuntime::restore(&config).expect("runtime restore should bootstrap empty state");
         let app = runtime.router("daemon-test".to_string());
 
         let bootstrap = get_json(app.clone(), "/bootstrap").await;

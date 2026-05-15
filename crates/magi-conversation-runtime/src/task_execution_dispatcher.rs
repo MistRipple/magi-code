@@ -1,19 +1,25 @@
-use crate::RunnerStartError;
-pub use magi_conversation_runtime::session_turn_execution::{
-    BUSINESS_MODEL_PROVIDER, SessionTurnExecutionOutput, SessionTurnExecutionRequest,
-};
+//! Task System v2 — LLM task dispatcher runtime.
+//!
+//! Owns the production task dispatch implementation for session turns and task LLM loops.
+
 use crate::{
-    errors::ApiError,
+    ConversationRegistry, SKILL_APPLY_TOOL_NAME, StreamFanOut,
     model_config::NormalizedModelConfig,
     prompt_utils::prepend_session_instructions,
+    public_builtin_tool_definitions,
+    session_turn_execution::{
+        SessionTurnExecutionOutput, SessionTurnExecutionRequest, SessionTurnExecutionRuntime,
+        run_session_turn_execution,
+    },
+    session_turn_finalize::{
+        compact_task_context_text, format_dependency_task_context, format_task_ref_list,
+    },
     settings_store::SettingsStore,
-    dispatch_execution::run_dispatch_submission,
-    state::{ApiState, ExecutionPipeline},
+    skill_apply_tool_definition,
+    task_execution_registry::{TaskExecutionPlan, TaskExecutionRegistry},
+    task_llm_loop::{self, TaskLlmLoopRequest},
+    task_runner_bridge::{EventBasedResultReceiver, TaskDispatcher, TaskOutcome, TaskResult},
     usage_recording::{ModelUsageBinding, model_usage_binding_for_worker},
-};
-use magi_conversation_runtime::{
-    SKILL_APPLY_TOOL_NAME, public_builtin_tool_definitions, skill_apply_tool_definition,
-    session_turn_execution::{SessionTurnExecutionRuntime, run_session_turn_execution},
 };
 use magi_bridge_client::{ChatToolDefinition, ModelBridgeClient};
 use magi_context_runtime::{
@@ -23,94 +29,25 @@ use magi_core::{
     ApprovalRequirement, EventId, ExecutionOwnership, ExecutionResultStatus, LeaseId, RiskLevel,
     SessionId, TaskId, TaskKind, ToolCallId, UtcMillis, WorkerId, WorkspaceId,
 };
-use magi_governance::ToolKind;
 use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
+use magi_governance::ToolKind;
 use magi_knowledge_store::{KnowledgeKind, KnowledgeRecord, KnowledgeStore};
-use magi_conversation_runtime::{ConversationRegistry, StreamFanOut};
-pub use magi_conversation_runtime::task_runner_bridge::{
-    EventBasedResultReceiver, TaskDispatcher, TaskOutcome, TaskResult,
-};
+use magi_memory_store::MemoryStore;
 use magi_orchestrator::{
-    ExecutionContextSummary, ExecutionWritebackPlans, task_worker_catalog::WorkerInfo,
+    ExecutionContextSummary, ExecutionWritebackPlans, OrchestratedExecutionRuntime,
+    OrchestratorService, task_worker_catalog::WorkerInfo,
 };
 use magi_session_store::{SessionStore, TimelineEntryKind, timeline_entry_visible_text};
-use magi_tool_runtime::{
-    BuiltinToolName, ToolExecutionContext, ToolExecutionInput, ToolRegistry,
-};
+use magi_tool_runtime::{BuiltinToolName, ToolExecutionContext, ToolExecutionInput, ToolRegistry};
 use magi_workspace::WorkspaceStore;
-use std::{
-    path::PathBuf,
-    sync::Arc,
-};
+use std::{path::PathBuf, sync::Arc};
 
-// M16：TaskExecutionPlan / TaskExecutionRegistry 已下沉到 conversation-runtime；
-// 这里通过 `pub use` 重导出，避免改动外部 import 路径。
-pub use magi_conversation_runtime::task_execution_registry::{
-    TaskExecutionPlan, TaskExecutionRegistry,
-};
-
-// M17a：DispatchSubmissionRequest / DispatchSubmissionAccepted DTO 已下沉到
-// conversation-runtime，通过 `pub use` 重导出保持外部 import 路径不变。
-pub use magi_conversation_runtime::dispatch_submission::{
-    DispatchSubmissionAccepted, DispatchSubmissionRequest,
-};
-use magi_conversation_runtime::dispatch_submission::{
-    DispatchSubmissionAcceptError, accept_dispatch_submission,
-    ensure_dispatch_submission_acceptance_available,
-};
-
-// M17a2：finalize / reconcile 系列与其辅助 helpers 已下沉到 conversation-runtime。
-// 这里通过 `pub use` 重导出保持外部 import 路径不变；带 `&ApiState` 的入口在下方以
-// 薄壳形式从 state 中取 (session_store, event_bus, task_store) 后转发到 v2。
-pub use magi_conversation_runtime::session_turn_finalize::{
-    build_root_completion_summary, compact_root_completion_summary, compact_task_context_text,
-    completion_summary_rank, current_turn_status_accepts_task_status_item,
-    current_turn_status_is_completed, current_turn_status_is_terminal,
-    format_dependency_task_context, format_root_completion_summary, format_task_ref_list,
-    latest_orchestrator_assistant_final, normalize_root_completion_output,
-    publish_task_status_turn_item_for_active_sessions, root_completion_outputs,
-    runner_status_for_terminal_task, task_status_text, terminal_turn_event_anchor_item_id,
-    turn_item_status_for_task_status,
-};
-
-pub fn finalize_background_session_task_turn_if_root_completed(
-    state: &ApiState,
-    session_id: &SessionId,
-    root_task_id: &TaskId,
-) -> bool {
-    magi_conversation_runtime::session_turn_finalize::finalize_background_session_task_turn_if_root_completed(
-        state.session_store.as_ref(),
-        &state.event_bus,
-        state.task_store(),
-        session_id,
-        root_task_id,
-    )
+#[derive(Clone)]
+pub struct ExecutionPipeline {
+    pub orchestrator: OrchestratorService,
+    pub execution_runtime: OrchestratedExecutionRuntime,
+    pub memory_store: MemoryStore,
 }
-
-pub fn finalize_background_session_task_turn_if_root_terminal(
-    state: &ApiState,
-    session_id: &SessionId,
-    root_task_id: &TaskId,
-    runner_status: &str,
-) -> bool {
-    magi_conversation_runtime::session_turn_finalize::finalize_background_session_task_turn_if_root_terminal(
-        state.session_store.as_ref(),
-        &state.event_bus,
-        state.task_store(),
-        session_id,
-        root_task_id,
-        runner_status,
-    )
-}
-
-pub fn reconcile_terminal_session_task_turns(state: &ApiState) -> usize {
-    magi_conversation_runtime::session_turn_finalize::reconcile_terminal_session_task_turns(
-        state.session_store.as_ref(),
-        &state.event_bus,
-        state.task_store(),
-    )
-}
-
 
 #[derive(Clone)]
 pub struct LlmTaskDispatcher {
@@ -122,7 +59,7 @@ pub struct LlmTaskDispatcher {
     model_bridge_client: Option<Arc<dyn ModelBridgeClient>>,
     knowledge_store: Option<Arc<KnowledgeStore>>,
     knowledge_persist_callback: Option<Arc<dyn Fn() + Send + Sync>>,
-    settings_store: Option<Arc<crate::settings_store::SettingsStore>>,
+    settings_store: Option<Arc<SettingsStore>>,
     context_runtime: Option<Arc<ContextRuntime>>,
     workspace_registry: Option<Arc<WorkspaceStore>>,
     tool_registry: Option<ToolRegistry>,
@@ -226,9 +163,7 @@ impl LlmTaskDispatcher {
             mission_workspace_registry: Arc::new(
                 magi_mission_workspace::MissionWorkspaceRegistry::new(),
             ),
-            knowledge_graph_registry: Arc::new(
-                magi_knowledge_graph::KnowledgeGraphRegistry::new(),
-            ),
+            knowledge_graph_registry: Arc::new(magi_knowledge_graph::KnowledgeGraphRegistry::new()),
             validation_runner_registry: Arc::new(
                 magi_validation_runner::ValidationRunnerRegistry::new(),
             ),
@@ -271,7 +206,7 @@ impl LlmTaskDispatcher {
         self
     }
 
-    pub fn with_settings_store(mut self, store: Arc<crate::settings_store::SettingsStore>) -> Self {
+    pub fn with_settings_store(mut self, store: Arc<SettingsStore>) -> Self {
         self.settings_store = Some(store);
         self
     }
@@ -351,9 +286,7 @@ impl LlmTaskDispatcher {
         self
     }
 
-    pub fn mission_charter_registry(
-        &self,
-    ) -> Arc<magi_mission_charter::MissionCharterRegistry> {
+    pub fn mission_charter_registry(&self) -> Arc<magi_mission_charter::MissionCharterRegistry> {
         self.mission_charter_registry.clone()
     }
 
@@ -388,9 +321,7 @@ impl LlmTaskDispatcher {
         self
     }
 
-    pub fn knowledge_graph_registry(
-        &self,
-    ) -> Arc<magi_knowledge_graph::KnowledgeGraphRegistry> {
+    pub fn knowledge_graph_registry(&self) -> Arc<magi_knowledge_graph::KnowledgeGraphRegistry> {
         self.knowledge_graph_registry.clone()
     }
 
@@ -428,9 +359,7 @@ impl LlmTaskDispatcher {
         self
     }
 
-    pub fn human_checkpoint_registry(
-        &self,
-    ) -> Arc<magi_human_checkpoint::HumanCheckpointRegistry> {
+    pub fn human_checkpoint_registry(&self) -> Arc<magi_human_checkpoint::HumanCheckpointRegistry> {
         self.human_checkpoint_registry.clone()
     }
 
@@ -990,12 +919,9 @@ impl LlmTaskDispatcher {
     pub fn execute_session_turn(
         &self,
         request: SessionTurnExecutionRequest,
-    ) -> Result<SessionTurnExecutionOutput, ApiError> {
+    ) -> Result<SessionTurnExecutionOutput, String> {
         let Some(client) = self.resolve_model_client() else {
-            return Err(ApiError::internal_assembly(
-                "执行 session turn 失败",
-                "model bridge client 未配置",
-            ));
+            return Err("model bridge client 未配置".to_string());
         };
 
         let prompt = self.apply_skill_prompt_injections(
@@ -1025,7 +951,7 @@ impl LlmTaskDispatcher {
             prompt,
             tools,
         })
-        .map_err(|msg| ApiError::model_invocation_failed("执行 session turn 失败", msg))
+        .map_err(|msg| msg)
     }
 
     fn invoke_llm_with_tools(
@@ -1085,10 +1011,9 @@ impl LlmTaskDispatcher {
             None
         };
 
-        let conversation_registry = self
-            .conversation_registry
-            .as_ref()
-            .expect("LlmTaskDispatcher 缺少 ConversationRegistry，无法走 Task System v2 Turn 状态机");
+        let conversation_registry = self.conversation_registry.as_ref().expect(
+            "LlmTaskDispatcher 缺少 ConversationRegistry，无法走 Task System v2 Turn 状态机",
+        );
         let stream_fanout = self
             .stream_fanout
             .as_ref()
@@ -1179,8 +1104,7 @@ impl LlmTaskDispatcher {
                 }
             }
         });
-        magi_conversation_runtime::task_llm_loop::run_task_llm_loop(
-            magi_conversation_runtime::task_llm_loop::TaskLlmLoopRequest {
+        task_llm_loop::run_task_llm_loop(TaskLlmLoopRequest {
             client: client.as_ref(),
             event_bus: self.event_bus.as_ref(),
             session_store: self.session_store.as_ref(),
@@ -1386,903 +1310,6 @@ fn title_from_learning_content(content: &str) -> String {
     title
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use magi_conversation_runtime::session_writeback::session_turn_item;
-    use magi_core::{MissionId, Task, TaskKind, TaskStatus, ThreadId};
-    use magi_governance::GovernanceService;
-    use magi_orchestrator::task_store::TaskStore;
-    use magi_session_store::{
-        ActiveExecutionChain, ActiveExecutionDispatchContext, ActiveExecutionTurn,
-        ExecutionThread, ExecutionThreadStatus,
-    };
-    use magi_workspace::WorkspaceStore;
-
-    fn learning_record(id: &str, workspace_id: Option<&str>, content: &str) -> KnowledgeRecord {
-        KnowledgeRecord {
-            knowledge_id: id.to_string(),
-            kind: KnowledgeKind::Learning,
-            title: content.to_string(),
-            content: content.to_string(),
-            tags: Vec::new(),
-            workspace_id: workspace_id.map(WorkspaceId::new),
-            source_ref: None,
-            updated_at: UtcMillis::now(),
-        }
-    }
-
-    fn task_execution_dispatcher_for_prompt_tests(
-        task_store: Arc<TaskStore>,
-        context_runtime: Option<Arc<ContextRuntime>>,
-    ) -> LlmTaskDispatcher {
-        let event_bus = Arc::new(InMemoryEventBus::new(64));
-        let governance = Arc::new(GovernanceService::default());
-        let orchestrator = magi_orchestrator::OrchestratorService::new(Arc::clone(&event_bus));
-        let mut tool_registry = ToolRegistry::new(Arc::clone(&governance), Arc::clone(&event_bus));
-        tool_registry.register_default_builtins();
-        let execution_runtime = orchestrator
-            .execution_runtime(
-                magi_worker_runtime::WorkerRuntime::new_compare(Arc::clone(&event_bus)),
-                tool_registry.clone(),
-                magi_skill_runtime::SkillDispatchRuntime::new(
-                    tool_registry,
-                    magi_bridge_client::BridgeDispatchRuntime::new(),
-                ),
-            )
-            .with_task_store(task_store);
-        let dispatcher = LlmTaskDispatcher::new(
-            event_bus,
-            ExecutionPipeline {
-                orchestrator,
-                execution_runtime,
-                memory_store: magi_memory_store::MemoryStore::new(),
-            },
-            Arc::new(SessionStore::new()),
-            TaskExecutionRegistry::default(),
-            Arc::new(EventBasedResultReceiver::new()),
-            Arc::new(std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new())),
-        );
-        if let Some(runtime) = context_runtime {
-            dispatcher.with_context_runtime(runtime)
-        } else {
-            dispatcher
-        }
-    }
-
-    fn prompt_test_task(
-        task_id: &str,
-        kind: TaskKind,
-        title: &str,
-        goal: &str,
-        status: TaskStatus,
-    ) -> Task {
-        let now = UtcMillis::now();
-        Task {
-            task_id: TaskId::new(task_id),
-            mission_id: MissionId::new("mission-prompt-context"),
-            root_task_id: TaskId::new("root-prompt-context"),
-            parent_task_id: None,
-            kind,
-            title: title.to_string(),
-            goal: goal.to_string(),
-            status,
-            dependency_ids: Vec::new(),
-            required_children: Vec::new(),
-            policy_snapshot: None,
-            executor_binding: None,
-            context_refs: Vec::new(),
-            knowledge_refs: Vec::new(),
-            workspace_scope: Some("/Users/xie/code/TEST".to_string()),
-            write_scope: None,
-            input_refs: Vec::new(),
-            output_refs: Vec::new(),
-            evidence_refs: Vec::new(),
-            retry_count: 0,
-            repair_count: 0,
-            decision_payload: None,
-            variant: magi_core::TaskVariant::default(),
-            created_at: now,
-            updated_at: now,
-        }
-    }
-
-    #[test]
-    fn validation_prompt_includes_dependency_outputs_without_context_runtime() {
-        let task_store = Arc::new(TaskStore::new());
-        let mut action = prompt_test_task(
-            "action-current-delivery",
-            TaskKind::Action,
-            "执行只读检查",
-            "检查 /Users/xie/code/TEST 当前项目结构",
-            TaskStatus::Completed,
-        );
-        action.output_refs =
-            vec!["当前任务输出：/Users/xie/code/TEST 已完成只读检查，未修改文件。".to_string()];
-        action.evidence_refs =
-            vec!["evidence://task/action-current-delivery/output/0?ref=readonly-check".to_string()];
-        task_store.insert_task(action);
-
-        let mut validation = prompt_test_task(
-            "validation-current-delivery",
-            TaskKind::Validation,
-            "验证交付",
-            "验证 /Users/xie/code/TEST 的只读任务交付结果",
-            TaskStatus::Ready,
-        );
-        validation.dependency_ids = vec![TaskId::new("action-current-delivery")];
-        task_store.insert_task(validation.clone());
-
-        let dispatcher = task_execution_dispatcher_for_prompt_tests(task_store, None);
-        let (prompt, context_summary) = dispatcher.assemble_prompt(
-            &validation,
-            &SessionId::new("session-prompt-context"),
-            &Some(WorkspaceId::new("workspace-prompt-context")),
-        );
-
-        assert!(context_summary.is_none());
-        assert!(prompt.contains("[validation-rule]"));
-        assert!(prompt.contains("当前任务输出：/Users/xie/code/TEST 已完成只读检查"));
-        assert!(prompt.contains("evidence://task/action-current-delivery/output/0"));
-        assert!(prompt.contains("--- Task ---\n验证交付"));
-    }
-
-    #[test]
-    fn validation_prompt_keeps_dependency_outputs_before_external_context() {
-        let task_store = Arc::new(TaskStore::new());
-        let mut action = prompt_test_task(
-            "action-current-priority",
-            TaskKind::Action,
-            "执行当前项目检查",
-            "检查 /Users/xie/code/TEST 当前项目",
-            TaskStatus::Completed,
-        );
-        action.output_refs = vec!["当前项目事实：TEST 工作区检查已完成。".to_string()];
-        task_store.insert_task(action);
-
-        let mut validation = prompt_test_task(
-            "validation-current-priority",
-            TaskKind::Validation,
-            "验证交付",
-            "验证 /Users/xie/code/TEST 的只读任务交付结果",
-            TaskStatus::Ready,
-        );
-        validation.dependency_ids = vec![TaskId::new("action-current-priority")];
-        task_store.insert_task(validation.clone());
-
-        let knowledge_store = KnowledgeStore::new();
-        knowledge_store.upsert(KnowledgeRecord {
-            knowledge_id: "knowledge-old-autosave".to_string(),
-            kind: KnowledgeKind::Learning,
-            title: "验证交付".to_string(),
-            content: "自动保存规则旧上下文：这不是当前 TEST 工作区任务。".to_string(),
-            tags: Vec::new(),
-            workspace_id: Some(WorkspaceId::new("workspace-prompt-context")),
-            source_ref: None,
-            updated_at: UtcMillis::now(),
-        });
-        let context_runtime = Arc::new(ContextRuntime::new(
-            knowledge_store,
-            magi_memory_store::MemoryStore::new(),
-        ));
-        let dispatcher =
-            task_execution_dispatcher_for_prompt_tests(task_store, Some(context_runtime));
-        let (prompt, context_summary) = dispatcher.assemble_prompt(
-            &validation,
-            &SessionId::new("session-prompt-context"),
-            &Some(WorkspaceId::new("workspace-prompt-context")),
-        );
-
-        assert!(context_summary.is_some());
-        let dependency_index = prompt
-            .find("[dependency-task]")
-            .expect("dependency output should be present");
-        let task_index = prompt
-            .find("--- Task ---")
-            .expect("task section should exist");
-        assert!(
-            dependency_index < task_index,
-            "当前依赖输出必须在任务正文之前进入 prompt"
-        );
-        if let Some(knowledge_index) = prompt.find("[knowledge]") {
-            assert!(
-                dependency_index < knowledge_index,
-                "当前依赖输出必须排在 knowledge/memory 之前"
-            );
-        }
-    }
-
-    #[test]
-    fn learning_duplicate_detection_is_workspace_scoped() {
-        let content = "最佳实践：同一条经验可以在不同 workspace 分别沉淀";
-        let existing = vec![learning_record(
-            "learning-workspace-a",
-            Some("workspace-a"),
-            content,
-        )];
-
-        assert!(knowledge_duplicate(
-            &existing,
-            KnowledgeKind::Learning,
-            Some(&WorkspaceId::new("workspace-a")),
-            content,
-        ));
-        assert!(!knowledge_duplicate(
-            &existing,
-            KnowledgeKind::Learning,
-            Some(&WorkspaceId::new("workspace-b")),
-            content,
-        ));
-        assert!(!knowledge_duplicate(
-            &existing,
-            KnowledgeKind::Learning,
-            None,
-            content,
-        ));
-    }
-
-    #[test]
-    fn failed_background_finalizer_does_not_duplicate_existing_error_item() {
-        let event_bus = Arc::new(InMemoryEventBus::new(16));
-        let session_store = Arc::new(SessionStore::new());
-        let task_store = Arc::new(TaskStore::new());
-        let session_id = SessionId::new("session-background-finalizer-idempotent");
-        let mission_id = MissionId::new("mission-background-finalizer-idempotent");
-        let root_task_id = TaskId::new("task-background-finalizer-idempotent");
-        let now = UtcMillis::now();
-
-        session_store
-            .create_session(session_id.clone(), "background finalizer idempotent")
-            .expect("session should be creatable");
-        let (_, orchestrator_thread_id) =
-            session_store.ensure_session_mission(&session_id, now, || mission_id.clone());
-        session_store
-            .upsert_active_execution_chain(
-                session_id.clone(),
-                ActiveExecutionChain {
-                    session_id: session_id.clone(),
-                    mission_id: mission_id.clone(),
-                    root_task_id: root_task_id.clone(),
-                    execution_chain_ref: "chain-background-finalizer-idempotent".to_string(),
-                    workspace_id: None,
-                    active_branch_task_ids: Vec::new(),
-                    active_worker_bindings: Vec::new(),
-                    branches: Vec::new(),
-                    recovery_ref: None,
-                    dispatch_context: ActiveExecutionDispatchContext {
-                        accepted_at: now,
-                        entry_id: "timeline-background-finalizer-idempotent".to_string(),
-                        trimmed_text: Some("执行后台任务".to_string()),
-                        skill_name: None,
-                    },
-                    current_turn: None,
-                },
-            )
-            .expect("active chain should be stored");
-        let mut error_item = session_turn_item(
-            "assistant_error",
-            "failed",
-            Some("回复生成失败".to_string()),
-            Some("model bridge unavailable".to_string()),
-            Some("turn-item-existing-error".to_string()),
-            orchestrator_thread_id.clone(),
-        );
-        error_item.task_id = Some(root_task_id.clone());
-        session_store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: "turn-background-finalizer-idempotent".to_string(),
-                    turn_seq: 1,
-                    accepted_at: now,
-                    completed_at: Some(UtcMillis(now.0 + 42)),
-                    status: "failed".to_string(),
-                    user_message: Some("执行后台任务".to_string()),
-                    items: vec![error_item],
-                    worker_lanes: Vec::new(),
-                },
-            )
-            .expect("failed current turn should be stored");
-        task_store.insert_task(Task {
-            task_id: root_task_id.clone(),
-            mission_id,
-            root_task_id: root_task_id.clone(),
-            parent_task_id: None,
-            kind: TaskKind::Objective,
-            title: "后台任务".to_string(),
-            goal: "验证终态观察幂等".to_string(),
-            status: TaskStatus::Failed,
-            dependency_ids: Vec::new(),
-            required_children: Vec::new(),
-            policy_snapshot: None,
-            executor_binding: None,
-            context_refs: Vec::new(),
-            knowledge_refs: Vec::new(),
-            workspace_scope: None,
-            write_scope: None,
-            input_refs: Vec::new(),
-            output_refs: Vec::new(),
-            evidence_refs: Vec::new(),
-            retry_count: 0,
-            repair_count: 0,
-            decision_payload: None,
-            variant: magi_core::TaskVariant::default(),
-            created_at: now,
-            updated_at: now,
-        });
-        let state = ApiState::new(
-            "test",
-            Arc::clone(&event_bus),
-            Arc::clone(&session_store),
-            Arc::new(WorkspaceStore::new()),
-            Arc::new(GovernanceService::default()),
-        )
-        .with_task_store(Arc::clone(&task_store));
-
-        assert!(finalize_background_session_task_turn_if_root_terminal(
-            &state,
-            &session_id,
-            &root_task_id,
-            "error",
-        ));
-
-        let turn = session_store
-            .runtime_sidecar(&session_id)
-            .and_then(|sidecar| sidecar.current_turn)
-            .expect("failed turn should remain inspectable");
-        let error_items = turn
-            .items
-            .iter()
-            .filter(|item| item.kind == "assistant_error")
-            .collect::<Vec<_>>();
-        assert_eq!(error_items.len(), 1);
-        assert_eq!(
-            error_items[0].content.as_deref(),
-            Some("model bridge unavailable")
-        );
-        assert!(
-            event_bus.snapshot().recent_events.is_empty(),
-            "已有具体错误时 finalizer 不应再发布泛化失败卡"
-        );
-    }
-
-    #[test]
-    fn completed_background_finalizer_appends_orchestrator_final_without_leaking_worker_final() {
-        let event_bus = Arc::new(InMemoryEventBus::new(16));
-        let session_store = Arc::new(SessionStore::new());
-        let task_store = Arc::new(TaskStore::new());
-        let session_id = SessionId::new("session-background-finalizer-worker-only");
-        let mission_id = MissionId::new("mission-background-finalizer-worker-only");
-        let root_task_id = TaskId::new("task-background-finalizer-worker-only-root");
-        let worker_task_id = TaskId::new("task-background-finalizer-worker-only-action");
-        let now = UtcMillis::now();
-
-        session_store
-            .create_session(session_id.clone(), "background finalizer worker only")
-            .expect("session should be creatable");
-        let (_, orchestrator_thread_id) =
-            session_store.ensure_session_mission(&session_id, now, || mission_id.clone());
-        let worker_thread_id = ThreadId::new("thread-integration-dev-finalizer-worker-only");
-        session_store.register_thread(ExecutionThread {
-            thread_id: worker_thread_id.clone(),
-            session_id: session_id.clone(),
-            mission_id: mission_id.clone(),
-            role_id: "integration-dev".to_string(),
-            worker_instance_id: WorkerId::new("worker-finalizer-worker-only"),
-            status: ExecutionThreadStatus::Active,
-            created_at: now,
-            last_used_at: now,
-            handled_task_ids: vec![worker_task_id.clone()],
-            message_history: Vec::new(),
-        });
-
-        let mut phase_item = session_turn_item(
-            "assistant_phase",
-            "pending",
-            Some("任务状态".to_string()),
-            Some("已接收请求，正在整理执行步骤。".to_string()),
-            Some("turn-item-phase-worker-only".to_string()),
-            orchestrator_thread_id.clone(),
-        );
-        phase_item.task_id = Some(root_task_id.clone());
-
-        let mut worker_final_item = session_turn_item(
-            "assistant_final",
-            "completed",
-            Some("worker 最终输出".to_string()),
-            Some("worker 内部最终输出，不应漂移成主线回复。".to_string()),
-            Some("turn-item-worker-final-only".to_string()),
-            worker_thread_id.clone(),
-        );
-        worker_final_item.item_seq = 2;
-        worker_final_item.task_id = Some(worker_task_id.clone());
-        worker_final_item.worker_id = Some(WorkerId::new("worker-finalizer-worker-only"));
-
-        session_store
-            .upsert_active_execution_chain(
-                session_id.clone(),
-                ActiveExecutionChain {
-                    session_id: session_id.clone(),
-                    mission_id: mission_id.clone(),
-                    root_task_id: root_task_id.clone(),
-                    execution_chain_ref: "chain-background-finalizer-worker-only".to_string(),
-                    workspace_id: None,
-                    active_branch_task_ids: vec![worker_task_id.clone()],
-                    active_worker_bindings: Vec::new(),
-                    branches: Vec::new(),
-                    recovery_ref: None,
-                    dispatch_context: ActiveExecutionDispatchContext {
-                        accepted_at: now,
-                        entry_id: "timeline-background-finalizer-worker-only".to_string(),
-                        trimmed_text: Some("执行深度任务".to_string()),
-                        skill_name: None,
-                    },
-                    current_turn: Some(ActiveExecutionTurn {
-                        turn_id: "turn-background-finalizer-worker-only".to_string(),
-                        turn_seq: 1,
-                        accepted_at: now,
-                        completed_at: None,
-                        status: "accepted".to_string(),
-                        user_message: Some("执行深度任务".to_string()),
-                        items: vec![phase_item, worker_final_item],
-                        worker_lanes: Vec::new(),
-                    }),
-                },
-            )
-            .expect("active chain should be stored");
-
-        task_store.insert_task(Task {
-            task_id: root_task_id.clone(),
-            mission_id: mission_id.clone(),
-            root_task_id: root_task_id.clone(),
-            parent_task_id: None,
-            kind: TaskKind::Objective,
-            title: "后台深度任务".to_string(),
-            goal: "验证 worker-only final 不阻塞 turn 终态".to_string(),
-            status: TaskStatus::Completed,
-            dependency_ids: Vec::new(),
-            required_children: vec![worker_task_id.clone()],
-            policy_snapshot: None,
-            executor_binding: None,
-            context_refs: Vec::new(),
-            knowledge_refs: Vec::new(),
-            workspace_scope: None,
-            write_scope: None,
-            input_refs: Vec::new(),
-            output_refs: Vec::new(),
-            evidence_refs: Vec::new(),
-            retry_count: 0,
-            repair_count: 0,
-            decision_payload: None,
-            variant: magi_core::TaskVariant::default(),
-            created_at: now,
-            updated_at: now,
-        });
-        task_store.insert_task(Task {
-            task_id: worker_task_id.clone(),
-            mission_id,
-            root_task_id: root_task_id.clone(),
-            parent_task_id: Some(root_task_id.clone()),
-            kind: TaskKind::Validation,
-            title: "交付验证".to_string(),
-            goal: "验证 worker 交付结果".to_string(),
-            status: TaskStatus::Completed,
-            dependency_ids: Vec::new(),
-            required_children: Vec::new(),
-            policy_snapshot: None,
-            executor_binding: None,
-            context_refs: Vec::new(),
-            knowledge_refs: Vec::new(),
-            workspace_scope: None,
-            write_scope: None,
-            input_refs: Vec::new(),
-            output_refs: vec!["交付验收通过：orchestrator-final-marker".to_string()],
-            evidence_refs: Vec::new(),
-            retry_count: 0,
-            repair_count: 0,
-            decision_payload: None,
-            variant: magi_core::TaskVariant::default(),
-            created_at: now,
-            updated_at: UtcMillis(now.0 + 1),
-        });
-        let state = ApiState::new(
-            "test",
-            Arc::clone(&event_bus),
-            Arc::clone(&session_store),
-            Arc::new(WorkspaceStore::new()),
-            Arc::new(GovernanceService::default()),
-        )
-        .with_task_store(Arc::clone(&task_store));
-
-        assert!(finalize_background_session_task_turn_if_root_terminal(
-            &state,
-            &session_id,
-            &root_task_id,
-            "completed",
-        ));
-
-        let turn = session_store
-            .runtime_sidecar(&session_id)
-            .and_then(|sidecar| sidecar.current_turn)
-            .expect("turn should remain inspectable");
-        assert_eq!(turn.status, "completed");
-        assert!(turn.completed_at.is_some());
-        assert!(
-            turn.items
-                .iter()
-                .find(|item| item.item_id == "turn-item-phase-worker-only")
-                .is_some_and(|item| item.status == "completed"),
-            "主线任务卡应原位收尾"
-        );
-        let orchestrator_final = turn
-            .items
-            .iter()
-            .find(|item| {
-                item.item_id == format!("turn-item-orchestrator-final-{root_task_id}")
-                    && session_store
-                        .resolve_thread_visibility(&session_id, &item.source_thread_id)
-                        == Some(magi_session_store::ThreadVisibility::Main)
-            })
-            .expect("root 完成后必须追加编排者主线最终回复");
-        let final_content = orchestrator_final.content.as_deref().unwrap_or_default();
-        assert!(
-            final_content.contains("已完成")
-                && final_content.contains("orchestrator-final-marker"),
-            "编排者最终回复应像正常对话一样收口任务交付摘要"
-        );
-        assert!(
-            !final_content.contains("worker 内部最终输出"),
-            "worker-only final 不能直接漂移为主线最终回复"
-        );
-        assert!(
-            event_bus
-                .snapshot()
-                .recent_events
-                .iter()
-                .any(|event| event.event_type == "session.turn.item"
-                    && event.payload["current_turn"]["status"].as_str() == Some("completed")
-                    && event.payload["current_turn"]["response_duration_ms"].is_number()),
-            "终态事件必须携带 completed current_turn 和总耗时"
-        );
-        assert!(
-            event_bus
-                .snapshot()
-                .recent_events
-                .iter()
-                .any(|event| event.event_type == "message.created"
-                    && event.payload["content"]
-                        .as_str()
-                        .is_some_and(|content| content.contains("orchestrator-final-marker"))),
-            "legacy message 事件只能来自编排者最终回复，不能来自 worker-only final"
-        );
-    }
-
-    #[test]
-    fn root_completion_summary_reads_like_conversation_for_multiple_outputs() {
-        let outputs = [
-            "验证通过：已完成第一段任务。\n\n修改的文件列表：无\n关键代码片段：无",
-            "通过。 当前交付已基于执行产出完成验证，且未重复执行工具；已完成第二段任务。",
-            r#"{"blocks":[{"content":"shell_exec: 命令执行成功: printf SHOULD_STAY_IN_TOOL_CARD","type":"tool_call"},{"content":"两个验证命令均已成功执行，输出符合预期。","type":"text"}]}"#,
-            "目标：规划文本\n边界：只规划\n验收标准：不要进入最终回复",
-            "修改的文件列表： - 无 关键验证结果： - 内部验证细节。 最终结论： - 已完成第三段任务。",
-            "关键验证结果： - `printf A` 成功。一句自然语言总结：两个验证都已完成。",
-        ]
-        .into_iter()
-        .filter_map(normalize_root_completion_output)
-        .collect::<Vec<_>>();
-
-        let summary = format_root_completion_summary(&outputs);
-
-        assert!(summary.contains("已完成，关键结果是："));
-        assert!(summary.contains("- 已验证：已完成第一段任务。"));
-        assert!(summary.contains("- 已完成第二段任务。"));
-        assert!(summary.contains("- 两个验证命令均已成功执行，输出符合预期。"));
-        assert!(summary.contains("- 已完成第三段任务。"));
-        assert!(summary.contains("- 两个验证都已完成。"));
-        assert!(summary.contains("详细步骤和工具记录已保留在任务卡里"));
-        assert!(!summary.contains("SHOULD_STAY_IN_TOOL_CARD"));
-        assert!(!summary.contains("内部验证细节"));
-        assert!(!summary.contains("printf A"));
-        assert!(!summary.contains("当前交付已基于执行产出完成验证"));
-        assert!(!summary.contains("规划文本"));
-        assert!(!summary.contains("修改的文件列表"));
-        assert!(!summary.contains("关键代码片段"));
-    }
-
-    #[test]
-    fn root_completion_outputs_prefers_latest_delivery_stage_over_intermediate_execution() {
-        let task_store = TaskStore::new();
-        let mission_id = MissionId::new("mission-root-summary-latest-delivery");
-        let root_task_id = TaskId::new("task-root-summary-latest-delivery");
-        let now = UtcMillis::now();
-        let root_task = Task {
-            task_id: root_task_id.clone(),
-            mission_id: mission_id.clone(),
-            root_task_id: root_task_id.clone(),
-            parent_task_id: None,
-            kind: TaskKind::Objective,
-            title: "多端验证".to_string(),
-            goal: "验证多端任务主线最终收口".to_string(),
-            status: TaskStatus::Completed,
-            dependency_ids: Vec::new(),
-            required_children: Vec::new(),
-            policy_snapshot: None,
-            executor_binding: None,
-            context_refs: Vec::new(),
-            knowledge_refs: Vec::new(),
-            workspace_scope: None,
-            write_scope: None,
-            input_refs: Vec::new(),
-            output_refs: Vec::new(),
-            evidence_refs: Vec::new(),
-            retry_count: 0,
-            repair_count: 0,
-            decision_payload: None,
-            variant: magi_core::TaskVariant::default(),
-            created_at: now,
-            updated_at: now,
-        };
-        task_store.insert_task(root_task.clone());
-
-        let mut execution = root_task.clone();
-        execution.task_id = TaskId::new("task-root-summary-execution");
-        execution.parent_task_id = Some(root_task_id.clone());
-        execution.kind = TaskKind::Action;
-        execution.title = "执行验证".to_string();
-        execution.output_refs = vec![
-            "已完成多端稳定性只读验证：\n- 前端端点：`FRONTEND_MARKER`\n- 后端端点：`BACKEND_MARKER`"
-                .to_string(),
-        ];
-        execution.updated_at = UtcMillis(now.0 + 1);
-        task_store.insert_task(execution);
-
-        let mut delivery = root_task.clone();
-        delivery.task_id = TaskId::new("task-root-summary-delivery");
-        delivery.parent_task_id = Some(root_task_id.clone());
-        delivery.kind = TaskKind::Action;
-        delivery.title = "交付总结".to_string();
-        delivery.output_refs = vec![
-            "验证已完成，交付如下：\n- 前端端点：已成功执行只读命令，输出 `FRONTEND_MARKER`\n- 后端端点：已成功执行只读命令，输出 `BACKEND_MARKER`\n主线汇总：两个端点都已完成只读验证。"
-                .to_string(),
-        ];
-        delivery.updated_at = UtcMillis(now.0 + 2);
-        task_store.insert_task(delivery);
-
-        let outputs = root_completion_outputs(&task_store, &root_task);
-        let summary = format_root_completion_summary(&outputs);
-
-        assert_eq!(outputs.len(), 1);
-        assert!(summary.contains("两个端点都已完成只读验证"));
-        assert!(summary.contains("FRONTEND_MARKER"));
-        assert!(!summary.contains("已完成多端稳定性只读验证"));
-        assert!(!summary.contains("验证已完成，交付如下"));
-        assert!(!summary.contains("主线汇总"));
-    }
-
-    #[test]
-    fn terminal_reconcile_closes_nonterminal_turn_from_completed_root_task() {
-        let event_bus = Arc::new(InMemoryEventBus::new(16));
-        let session_store = Arc::new(SessionStore::new());
-        let task_store = Arc::new(TaskStore::new());
-        let session_id = SessionId::new("session-terminal-reconcile-completed-root");
-        let mission_id = MissionId::new("mission-terminal-reconcile-completed-root");
-        let root_task_id = TaskId::new("task-terminal-reconcile-completed-root");
-        let now = UtcMillis::now();
-
-        session_store
-            .create_session(session_id.clone(), "terminal reconcile completed root")
-            .expect("session should be creatable");
-        let (_, orchestrator_thread_id) =
-            session_store.ensure_session_mission(&session_id, now, || mission_id.clone());
-        let mut phase_item = session_turn_item(
-            "assistant_phase",
-            "pending",
-            Some("任务状态".to_string()),
-            Some("任务运行中".to_string()),
-            Some("turn-item-terminal-reconcile-phase".to_string()),
-            orchestrator_thread_id.clone(),
-        );
-        phase_item.task_id = Some(root_task_id.clone());
-        session_store
-            .upsert_active_execution_chain(
-                session_id.clone(),
-                ActiveExecutionChain {
-                    session_id: session_id.clone(),
-                    mission_id: mission_id.clone(),
-                    root_task_id: root_task_id.clone(),
-                    execution_chain_ref: "chain-terminal-reconcile-completed-root".to_string(),
-                    workspace_id: None,
-                    active_branch_task_ids: vec![root_task_id.clone()],
-                    active_worker_bindings: Vec::new(),
-                    branches: Vec::new(),
-                    recovery_ref: None,
-                    dispatch_context: ActiveExecutionDispatchContext {
-                        accepted_at: now,
-                        entry_id: "timeline-terminal-reconcile-completed-root".to_string(),
-                        trimmed_text: Some("执行任务".to_string()),
-                        skill_name: None,
-                    },
-                    current_turn: Some(ActiveExecutionTurn {
-                        turn_id: "turn-terminal-reconcile-completed-root".to_string(),
-                        turn_seq: 1,
-                        accepted_at: now,
-                        completed_at: None,
-                        status: "accepted".to_string(),
-                        user_message: Some("执行任务".to_string()),
-                        items: vec![phase_item],
-                        worker_lanes: Vec::new(),
-                    }),
-                },
-            )
-            .expect("active chain should be stored");
-        task_store.insert_task(Task {
-            task_id: root_task_id.clone(),
-            mission_id,
-            root_task_id: root_task_id.clone(),
-            parent_task_id: None,
-            kind: TaskKind::Objective,
-            title: "已完成 root".to_string(),
-            goal: "验证启动恢复收敛".to_string(),
-            status: TaskStatus::Completed,
-            dependency_ids: Vec::new(),
-            required_children: Vec::new(),
-            policy_snapshot: None,
-            executor_binding: None,
-            context_refs: Vec::new(),
-            knowledge_refs: Vec::new(),
-            workspace_scope: None,
-            write_scope: None,
-            input_refs: Vec::new(),
-            output_refs: Vec::new(),
-            evidence_refs: Vec::new(),
-            retry_count: 0,
-            repair_count: 0,
-            decision_payload: None,
-            variant: magi_core::TaskVariant::default(),
-            created_at: now,
-            updated_at: now,
-        });
-        let state = ApiState::new(
-            "test",
-            Arc::clone(&event_bus),
-            Arc::clone(&session_store),
-            Arc::new(WorkspaceStore::new()),
-            Arc::new(GovernanceService::default()),
-        )
-        .with_task_store(Arc::clone(&task_store));
-
-        assert_eq!(reconcile_terminal_session_task_turns(&state), 1);
-        let turn = session_store
-            .runtime_sidecar(&session_id)
-            .and_then(|sidecar| sidecar.current_turn)
-            .expect("turn should remain inspectable");
-        assert_eq!(turn.status, "completed");
-        assert!(turn.completed_at.is_some());
-        assert!(
-            event_bus
-                .snapshot()
-                .recent_events
-                .iter()
-                .any(|event| event.event_type == "session.turn.item"
-                    && event.payload["current_turn"]["status"].as_str() == Some("completed")),
-            "reconcile 应发布 canonical terminal turn 事件"
-        );
-    }
-
-    #[test]
-    fn terminal_finalizer_does_not_rewrite_cancelled_turn_to_failed() {
-        let event_bus = Arc::new(InMemoryEventBus::new(16));
-        let session_store = Arc::new(SessionStore::new());
-        let task_store = Arc::new(TaskStore::new());
-        let session_id = SessionId::new("session-terminal-cancelled-wins");
-        let mission_id = MissionId::new("mission-terminal-cancelled-wins");
-        let root_task_id = TaskId::new("task-terminal-cancelled-wins");
-        let now = UtcMillis::now();
-
-        session_store
-            .create_session(session_id.clone(), "terminal cancelled wins")
-            .expect("session should be creatable");
-        let (_, orchestrator_thread_id) =
-            session_store.ensure_session_mission(&session_id, now, || mission_id.clone());
-        let mut phase_item = session_turn_item(
-            "assistant_phase",
-            "cancelled",
-            Some("任务状态".to_string()),
-            Some("任务已取消".to_string()),
-            Some("turn-item-terminal-cancelled-phase".to_string()),
-            orchestrator_thread_id.clone(),
-        );
-        phase_item.task_id = Some(root_task_id.clone());
-        session_store
-            .upsert_active_execution_chain(
-                session_id.clone(),
-                ActiveExecutionChain {
-                    session_id: session_id.clone(),
-                    mission_id: mission_id.clone(),
-                    root_task_id: root_task_id.clone(),
-                    execution_chain_ref: "chain-terminal-cancelled-wins".to_string(),
-                    workspace_id: None,
-                    active_branch_task_ids: vec![root_task_id.clone()],
-                    active_worker_bindings: Vec::new(),
-                    branches: Vec::new(),
-                    recovery_ref: None,
-                    dispatch_context: ActiveExecutionDispatchContext {
-                        accepted_at: now,
-                        entry_id: "timeline-terminal-cancelled-wins".to_string(),
-                        trimmed_text: Some("执行任务".to_string()),
-                        skill_name: None,
-                    },
-                    current_turn: Some(ActiveExecutionTurn {
-                        turn_id: "turn-terminal-cancelled-wins".to_string(),
-                        turn_seq: 1,
-                        accepted_at: now,
-                        completed_at: Some(now),
-                        status: "cancelled".to_string(),
-                        user_message: Some("执行任务".to_string()),
-                        items: vec![phase_item],
-                        worker_lanes: Vec::new(),
-                    }),
-                },
-            )
-            .expect("active chain should be stored");
-        task_store.insert_task(Task {
-            task_id: root_task_id.clone(),
-            mission_id,
-            root_task_id: root_task_id.clone(),
-            parent_task_id: None,
-            kind: TaskKind::Objective,
-            title: "失败 root".to_string(),
-            goal: "验证迟到失败不会覆盖取消".to_string(),
-            status: TaskStatus::Failed,
-            dependency_ids: Vec::new(),
-            required_children: Vec::new(),
-            policy_snapshot: None,
-            executor_binding: None,
-            context_refs: Vec::new(),
-            knowledge_refs: Vec::new(),
-            workspace_scope: None,
-            write_scope: None,
-            input_refs: Vec::new(),
-            output_refs: Vec::new(),
-            evidence_refs: Vec::new(),
-            retry_count: 0,
-            repair_count: 0,
-            decision_payload: None,
-            variant: magi_core::TaskVariant::default(),
-            created_at: now,
-            updated_at: now,
-        });
-        let state = ApiState::new(
-            "test",
-            Arc::clone(&event_bus),
-            Arc::clone(&session_store),
-            Arc::new(WorkspaceStore::new()),
-            Arc::new(GovernanceService::default()),
-        )
-        .with_task_store(Arc::clone(&task_store));
-
-        assert!(finalize_background_session_task_turn_if_root_terminal(
-            &state,
-            &session_id,
-            &root_task_id,
-            "error",
-        ));
-        let turn = session_store
-            .runtime_sidecar(&session_id)
-            .and_then(|sidecar| sidecar.current_turn)
-            .expect("turn should remain inspectable");
-        assert_eq!(turn.status, "cancelled");
-        assert!(
-            event_bus
-                .snapshot()
-                .recent_events
-                .iter()
-                .all(|event| event.event_type != "session.turn.item"),
-            "迟到失败不应发布 canonical failed 事件覆盖已取消 turn"
-        );
-    }
-}
-
 impl TaskDispatcher for LlmTaskDispatcher {
     fn dispatch(
         &self,
@@ -2329,86 +1356,5 @@ impl TaskDispatcher for LlmTaskDispatcher {
             // 不在 tokio 运行时中（例如同步测试环境），直接同步执行。
             self.dispatch_inner(&task, &worker, &lease)
         }
-    }
-}
-
-fn submit_task_submission(
-    state: &ApiState,
-    request: DispatchSubmissionRequest,
-) -> Result<DispatchSubmissionAccepted, ApiError> {
-    ensure_dispatch_submission_acceptance_available(state.session_store.as_ref(), &request)
-        .map_err(map_dispatch_submission_accept_error)?;
-    let graph = run_dispatch_submission(state, &request)?;
-    accept_dispatch_submission(
-        state.session_store.as_ref(),
-        state.task_store(),
-        state.task_execution_registry(),
-        request,
-        graph,
-    )
-    .map_err(map_dispatch_submission_accept_error)
-}
-
-fn map_dispatch_submission_accept_error(error: DispatchSubmissionAcceptError) -> ApiError {
-    match error {
-        DispatchSubmissionAcceptError::Conflict { message } => {
-            ApiError::conflict("任务派发失败", &message)
-        }
-        DispatchSubmissionAcceptError::Internal { message } => {
-            ApiError::internal_assembly("任务派发失败", message)
-        }
-    }
-}
-
-pub fn submit_dispatch_submission(
-    state: &ApiState,
-    request: DispatchSubmissionRequest,
-) -> Result<DispatchSubmissionAccepted, ApiError> {
-    submit_task_submission(state, request)
-}
-
-pub fn drive_dispatch_submission(
-    state: &ApiState,
-    accepted: &mut DispatchSubmissionAccepted,
-) -> Result<(), ApiError> {
-    let manager = state.runner_manager().ok_or_else(|| {
-        ApiError::internal_assembly("任务派发失败", "runner_manager 未配置")
-    })?;
-    let task_store = state.task_store().ok_or_else(|| {
-        ApiError::internal_assembly("任务派发失败", "task_store 未配置")
-    })?;
-
-    let root_task = task_store.get_task(&accepted.root_task_id).ok_or_else(|| {
-        ApiError::internal_assembly("任务派发失败", "root task 不存在")
-    })?;
-    let background_allowed = root_task
-        .policy_snapshot
-        .as_ref()
-        .map(|policy| policy.background_allowed)
-        .unwrap_or(false);
-
-    if background_allowed {
-        match manager.start(
-            accepted.root_task_id.as_str(),
-            Some(accepted.session_id.clone()),
-        ) {
-            Ok(_) | Err(RunnerStartError::AlreadyRunning) => {
-                accepted.runner_started = true;
-                Ok(())
-            }
-            Err(RunnerStartError::NotFound) => Err(ApiError::internal_assembly(
-                "任务派发失败",
-                "root task 不存在",
-            )),
-        }
-    } else {
-        let execution = crate::a_path::drive_a_path(
-            state,
-            &accepted.root_task_id,
-            &accepted.action_task_id,
-            "任务派发失败",
-        )?;
-        accepted.runner_started = execution.runner_started;
-        Ok(())
     }
 }

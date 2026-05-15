@@ -4,17 +4,18 @@ use magi_session_store::ActiveExecutionTurn;
 use serde_json::json;
 
 use super::{
-    conversation_bridge::ingest_user_input_to_conversation, monotonic_accepted_at, new_session_id,
+    conversation_bridge::ingest_user_input_to_conversation,
+    monotonic_accepted_at, new_session_id,
     session_scope::{resolve_session_workspace_binding, session_workspace_id},
 };
 use crate::{
-    dto::SessionTurnRequestDto,
-    errors::ApiError,
-    state::ApiState,
-    task_execution::{
+    dispatch_execution::{
         DispatchSubmissionAccepted, DispatchSubmissionRequest, drive_dispatch_submission,
         submit_dispatch_submission,
     },
+    dto::SessionTurnRequestDto,
+    errors::ApiError,
+    state::ApiState,
 };
 use magi_conversation_runtime::session_writeback::publish_current_session_turn_item_event;
 
@@ -279,7 +280,7 @@ pub(super) fn append_dispatch_assistant_message(
     state: &ApiState,
     accepted: &DispatchSubmissionAccepted,
 ) {
-    if crate::task_execution::finalize_background_session_task_turn_if_root_completed(
+    if crate::task_turn_finalize::finalize_background_session_task_turn_if_root_completed(
         state,
         &accepted.session_id,
         &accepted.root_task_id,

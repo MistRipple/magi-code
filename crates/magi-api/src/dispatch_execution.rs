@@ -1,13 +1,16 @@
+#[cfg(test)]
+use crate::dto::SessionTurnRequestDto;
+use crate::{RunnerStartError, errors::ApiError, state::ApiState};
+use magi_conversation_runtime::dispatch_submission::{
+    DispatchSubmissionAcceptError, accept_dispatch_submission,
+    ensure_dispatch_submission_acceptance_available,
+};
+pub(crate) use magi_conversation_runtime::dispatch_submission::{
+    DispatchSubmissionAccepted, DispatchSubmissionRequest,
+};
 use magi_core::{SessionId, Task, TaskId, WorkspaceId};
 #[cfg(test)]
 use magi_core::{TaskKind, TaskStatus, UtcMillis};
-#[cfg(test)]
-use crate::dto::SessionTurnRequestDto;
-use crate::{
-    errors::ApiError,
-    state::ApiState,
-    task_execution::DispatchSubmissionRequest,
-};
 
 // M12/M13/M14：任务图构建器、任务分解管线、任务图重规划入口与派发数据载体已
 // 迁移到 magi-conversation-runtime；保留内部 re-export 让 dispatch_execution / 测试
@@ -26,9 +29,9 @@ pub(crate) fn run_dispatch_submission(
     state: &ApiState,
     request: &DispatchSubmissionRequest,
 ) -> Result<TaskGraphSubmission, ApiError> {
-    let _ = state.execution_pipeline().ok_or_else(|| {
-        ApiError::internal_assembly("任务派发失败", "execution pipeline 未配置")
-    })?;
+    let _ = state
+        .execution_pipeline()
+        .ok_or_else(|| ApiError::internal_assembly("任务派发失败", "execution pipeline 未配置"))?;
     let task_store = state
         .task_store()
         .ok_or_else(|| ApiError::internal_assembly("任务派发失败", "task_store 未配置"))?;
@@ -55,6 +58,87 @@ pub(crate) fn run_dispatch_submission(
             ApiError::internal_assembly("任务派发失败", msg)
         }
     })
+}
+
+fn submit_task_submission(
+    state: &ApiState,
+    request: DispatchSubmissionRequest,
+) -> Result<DispatchSubmissionAccepted, ApiError> {
+    ensure_dispatch_submission_acceptance_available(state.session_store.as_ref(), &request)
+        .map_err(map_dispatch_submission_accept_error)?;
+    let graph = run_dispatch_submission(state, &request)?;
+    accept_dispatch_submission(
+        state.session_store.as_ref(),
+        state.task_store(),
+        state.task_execution_registry(),
+        request,
+        graph,
+    )
+    .map_err(map_dispatch_submission_accept_error)
+}
+
+fn map_dispatch_submission_accept_error(error: DispatchSubmissionAcceptError) -> ApiError {
+    match error {
+        DispatchSubmissionAcceptError::Conflict { message } => {
+            ApiError::conflict("任务派发失败", &message)
+        }
+        DispatchSubmissionAcceptError::Internal { message } => {
+            ApiError::internal_assembly("任务派发失败", message)
+        }
+    }
+}
+
+pub(crate) fn submit_dispatch_submission(
+    state: &ApiState,
+    request: DispatchSubmissionRequest,
+) -> Result<DispatchSubmissionAccepted, ApiError> {
+    submit_task_submission(state, request)
+}
+
+pub(crate) fn drive_dispatch_submission(
+    state: &ApiState,
+    accepted: &mut DispatchSubmissionAccepted,
+) -> Result<(), ApiError> {
+    let manager = state
+        .runner_manager()
+        .ok_or_else(|| ApiError::internal_assembly("任务派发失败", "runner_manager 未配置"))?;
+    let task_store = state
+        .task_store()
+        .ok_or_else(|| ApiError::internal_assembly("任务派发失败", "task_store 未配置"))?;
+
+    let root_task = task_store
+        .get_task(&accepted.root_task_id)
+        .ok_or_else(|| ApiError::internal_assembly("任务派发失败", "root task 不存在"))?;
+    let background_allowed = root_task
+        .policy_snapshot
+        .as_ref()
+        .map(|policy| policy.background_allowed)
+        .unwrap_or(false);
+
+    if background_allowed {
+        match manager.start(
+            accepted.root_task_id.as_str(),
+            Some(accepted.session_id.clone()),
+        ) {
+            Ok(_) | Err(RunnerStartError::AlreadyRunning) => {
+                accepted.runner_started = true;
+                Ok(())
+            }
+            Err(RunnerStartError::NotFound) => Err(ApiError::internal_assembly(
+                "任务派发失败",
+                "root task 不存在",
+            )),
+        }
+    } else {
+        let execution = crate::a_path::drive_a_path(
+            state,
+            &accepted.root_task_id,
+            &accepted.action_task_id,
+            "任务派发失败",
+        )?;
+        accepted.runner_started = execution.runner_started;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -117,9 +201,7 @@ pub(crate) fn replan_task_graph(
     )
     .map_err(|err| match err {
         TaskGraphReplanError::InvalidInput(msg) => ApiError::InvalidInput(msg),
-        TaskGraphReplanError::Internal(msg) => {
-            ApiError::internal_assembly("重规划任务图失败", msg)
-        }
+        TaskGraphReplanError::Internal(msg) => ApiError::internal_assembly("重规划任务图失败", msg),
     })
 }
 
@@ -164,9 +246,6 @@ pub(crate) fn replace_replanned_task_execution_branches(
         }
     })
 }
-
-
-
 
 #[cfg(test)]
 mod tests {
@@ -627,8 +706,7 @@ mod tests {
     #[test]
     fn task_turn_keeps_user_message_on_mainline_and_routes_workers_to_drawer() {
         let (state, _task_store) = build_test_state();
-        let state =
-            state.with_model_bridge_client(Arc::new(StaticDeepPlanModelBridgeClient));
+        let state = state.with_model_bridge_client(Arc::new(StaticDeepPlanModelBridgeClient));
         let session_id = SessionId::new("session-deep-mainline-dialog");
         state
             .session_store
@@ -752,8 +830,7 @@ mod tests {
     #[test]
     fn task_registers_validation_execution_plans() {
         let (state, task_store) = build_test_state();
-        let state =
-            state.with_model_bridge_client(Arc::new(StaticDeepPlanModelBridgeClient));
+        let state = state.with_model_bridge_client(Arc::new(StaticDeepPlanModelBridgeClient));
         let session_id = SessionId::new("session-deep-validation-plans");
         state
             .session_store
@@ -807,8 +884,7 @@ mod tests {
     #[test]
     fn task_policies_are_unified_across_all_nodes() {
         let (state, task_store) = build_test_state();
-        let state =
-            state.with_model_bridge_client(Arc::new(StaticDeepPlanModelBridgeClient));
+        let state = state.with_model_bridge_client(Arc::new(StaticDeepPlanModelBridgeClient));
         let session_id = SessionId::new("session-task-unified-policy");
         state
             .session_store
@@ -845,10 +921,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         let unified = build_task_policy();
-        for task in tasks
-            .iter()
-            .filter(|task| task.kind != TaskKind::Objective)
-        {
+        for task in tasks.iter().filter(|task| task.kind != TaskKind::Objective) {
             let policy = task
                 .policy_snapshot
                 .as_ref()
@@ -922,9 +995,8 @@ mod tests {
     #[test]
     fn task_graph_supports_sequential_execution_batches() {
         let (state, task_store) = build_test_state();
-        let state = state.with_model_bridge_client(Arc::new(
-            SequentialBatchDeepPlanModelBridgeClient,
-        ));
+        let state =
+            state.with_model_bridge_client(Arc::new(SequentialBatchDeepPlanModelBridgeClient));
         let session_id = SessionId::new("session-deep-sequential-batches");
         state
             .session_store
@@ -1022,9 +1094,8 @@ mod tests {
     #[test]
     fn task_action_roles_stay_runnable_when_goal_mentions_test_path() {
         let (state, task_store) = build_test_state();
-        let state = state.with_model_bridge_client(Arc::new(
-            PathSensitiveDeepPlanModelBridgeClient,
-        ));
+        let state =
+            state.with_model_bridge_client(Arc::new(PathSensitiveDeepPlanModelBridgeClient));
         let session_id = SessionId::new("session-deep-action-role-compat");
         state
             .session_store
@@ -1081,11 +1152,9 @@ mod tests {
     fn task_planner_receives_workspace_root_context() {
         let (state, _task_store) = build_test_state();
         let captured_prompt = Arc::new(Mutex::new(None));
-        let state = state.with_model_bridge_client(Arc::new(
-            RecordingDeepPlanModelBridgeClient {
-                prompt: Arc::clone(&captured_prompt),
-            },
-        ));
+        let state = state.with_model_bridge_client(Arc::new(RecordingDeepPlanModelBridgeClient {
+            prompt: Arc::clone(&captured_prompt),
+        }));
         let workspace_id = WorkspaceId::new("workspace-deep-current-project");
         state
             .workspace_registry

@@ -196,16 +196,14 @@ async fn stream_events(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dispatch_execution::{
+        DispatchSubmissionAccepted, drive_dispatch_submission, submit_dispatch_submission,
+    };
     use crate::dto::{
         BridgeProbeErrorDto, BridgeServiceSnapshotDto, BridgeServicesSnapshotDto,
         BridgeSnapshotProvider,
     };
-    use magi_conversation_runtime::session_writeback::session_turn_item;
     use crate::state::{RunnerManager, RunnerStartError};
-    use crate::task_execution::{
-        DispatchSubmissionAccepted, LlmTaskDispatcher, drive_dispatch_submission,
-        submit_dispatch_submission,
-    };
     use axum::{
         body::{Body, to_bytes},
         http::{Request, StatusCode},
@@ -214,11 +212,16 @@ mod tests {
         BridgeErrorLayer, BridgeResponse, BridgeServerHandshake, BridgeServerHealth,
         BridgeServerKind, BridgeServerServiceCatalog, BridgeTransport, BridgeTransportError,
         BridgeTransportRequest, BridgeTransportResponse, LOCAL_BRIDGE_DESCRIBE_SERVICES_METHOD,
-        LOCAL_BRIDGE_HANDSHAKE_METHOD, LOCAL_BRIDGE_HEALTH_METHOD, McpManagerListServersResponse,
-        ModelBridgeClient, ModelInvocationRequest, ModelStreamingDelta, LOOPBACK_MCP_SERVER_NAME,
-        LOOPBACK_MCP_TOOL_NAME, LOOPBACK_MODEL_PROVIDER,
+        LOCAL_BRIDGE_HANDSHAKE_METHOD, LOCAL_BRIDGE_HEALTH_METHOD, LOOPBACK_MCP_SERVER_NAME,
+        LOOPBACK_MCP_TOOL_NAME, LOOPBACK_MODEL_PROVIDER, McpManagerListServersResponse,
+        ModelBridgeClient, ModelInvocationRequest, ModelStreamingDelta,
     };
     use magi_context_runtime::{ContextBudget, ContextRuntime};
+    use magi_conversation_runtime::session_writeback::session_turn_item;
+    use magi_conversation_runtime::task_execution_dispatcher::LlmTaskDispatcher;
+    use magi_conversation_runtime::task_runner_bridge::{
+        EventBasedResultReceiver, TaskOutcome, TaskResult,
+    };
     use magi_core::{
         AbsolutePath, EventId, ExecutionOwnership, LeaseId, MissionId, SessionId, Task, TaskId,
         TaskKind, TaskStatus, ThreadId, UtcMillis, WorkerId, WorkspaceId,
@@ -227,9 +230,6 @@ mod tests {
     use magi_governance::GovernanceService;
     use magi_knowledge_store::KnowledgeStore;
     use magi_memory_store::MemoryStore;
-    use magi_conversation_runtime::task_runner_bridge::{
-        EventBasedResultReceiver, TaskOutcome, TaskResult,
-    };
     use magi_orchestrator::{ExecutionContextConfig, OrchestratorService, task_store::TaskStore};
     use magi_session_store::{
         ActiveExecutionBranch, ActiveExecutionChain, ActiveExecutionDispatchContext,
@@ -368,7 +368,7 @@ mod tests {
         let session_store_for_status = session_store.clone();
         let task_store = Arc::new(TaskStore::with_status_change_callback(Box::new(
             move |task_id, _old_status, new_status, task| {
-                crate::task_execution::publish_task_status_turn_item_for_active_sessions(
+                magi_conversation_runtime::session_turn_finalize::publish_task_status_turn_item_for_active_sessions(
                     event_bus_for_status.as_ref(),
                     session_store_for_status.as_ref(),
                     None,
@@ -462,7 +462,7 @@ mod tests {
             let Some(session_id) = session_id else {
                 return;
             };
-            crate::task_execution::finalize_background_session_task_turn_if_root_terminal(
+            crate::task_turn_finalize::finalize_background_session_task_turn_if_root_terminal(
                 &state_for_runner_terminal,
                 &session_id,
                 &root_task_id,
@@ -500,7 +500,11 @@ mod tests {
         path
     }
 
-    async fn start_snapshot_for_session(state: &ApiState, session_id: &str, root: &std::path::Path) {
+    async fn start_snapshot_for_session(
+        state: &ApiState,
+        session_id: &str,
+        root: &std::path::Path,
+    ) {
         state
             .snapshot_manager
             .start_session(session_id.to_string(), root.to_path_buf())
@@ -1995,7 +1999,11 @@ mod tests {
             !first_children.is_empty(),
             "Objective should have at least one Phase child"
         );
-        assert!(first_children.iter().all(|child| matches!(child.status, TaskStatus::Completed)));
+        assert!(
+            first_children
+                .iter()
+                .all(|child| matches!(child.status, TaskStatus::Completed))
+        );
 
         let first_verification = state
             .execution_pipeline()
@@ -2096,7 +2104,11 @@ mod tests {
             !second_children.is_empty(),
             "Objective should have at least one Phase child"
         );
-        assert!(second_children.iter().all(|child| matches!(child.status, TaskStatus::Completed)));
+        assert!(
+            second_children
+                .iter()
+                .all(|child| matches!(child.status, TaskStatus::Completed))
+        );
         let verification = state
             .execution_pipeline()
             .expect("execution pipeline should exist")
@@ -2226,16 +2238,13 @@ mod tests {
                 "worker lane status should be populated from task store"
             );
             assert!(
-                session_entry
-                    .worker_lanes
-                    .iter()
-                    .all(|lane| {
-                        let role_id = lane.role_id.as_str();
-                        !role_id.is_empty()
-                            && !role_id.starts_with("task-")
-                            && !role_id.starts_with("worker-")
-                            && !role_id.starts_with("lane-")
-                    }),
+                session_entry.worker_lanes.iter().all(|lane| {
+                    let role_id = lane.role_id.as_str();
+                    !role_id.is_empty()
+                        && !role_id.starts_with("task-")
+                        && !role_id.starts_with("worker-")
+                        && !role_id.starts_with("lane-")
+                }),
                 "worker lane tabs must expose product role ids, not internal lane/task ids"
             );
             assert!(
@@ -2314,15 +2323,12 @@ mod tests {
             .find(|turn| turn.status == magi_session_store::CanonicalTurnStatus::Completed)
             .expect("completed deep turn should be stored as canonical turn");
         assert!(
-            canonical_turn
-                .items
-                .iter()
-                .any(|item| matches!(
-                    state
-                        .session_store
-                        .resolve_thread_visibility(&session_id, &item.source_thread_id),
-                    Some(ThreadVisibility::WorkerDrawer { .. })
-                )),
+            canonical_turn.items.iter().any(|item| matches!(
+                state
+                    .session_store
+                    .resolve_thread_visibility(&session_id, &item.source_thread_id),
+                Some(ThreadVisibility::WorkerDrawer { .. })
+            )),
             "deep task canonical turn must preserve worker-drawer items for bootstrap"
         );
         let terminal_turn_event = state
@@ -2478,24 +2484,23 @@ mod tests {
         let action_task_id = TaskId::new("task-turn-output-refs");
         let accepted_at = UtcMillis::now();
 
-        let (_mission_id, orchestrator_thread_id) = state
-            .session_store
-            .ensure_session_mission(&session_id, accepted_at, || mission_id.clone());
+        let (_mission_id, orchestrator_thread_id) =
+            state
+                .session_store
+                .ensure_session_mission(&session_id, accepted_at, || mission_id.clone());
         let worker_thread_id = ThreadId::new("thread-worker-turn-output-refs-reviewer");
-        state
-            .session_store
-            .register_thread(ExecutionThread {
-                thread_id: worker_thread_id.clone(),
-                session_id: session_id.clone(),
-                mission_id: mission_id.clone(),
-                role_id: "reviewer".to_string(),
-                worker_instance_id: WorkerId::new("task-worker-reviewer"),
-                status: ExecutionThreadStatus::Active,
-                created_at: accepted_at,
-                last_used_at: accepted_at,
-                handled_task_ids: vec![action_task_id.clone()],
-                message_history: Vec::new(),
-            });
+        state.session_store.register_thread(ExecutionThread {
+            thread_id: worker_thread_id.clone(),
+            session_id: session_id.clone(),
+            mission_id: mission_id.clone(),
+            role_id: "reviewer".to_string(),
+            worker_instance_id: WorkerId::new("task-worker-reviewer"),
+            status: ExecutionThreadStatus::Active,
+            created_at: accepted_at,
+            last_used_at: accepted_at,
+            handled_task_ids: vec![action_task_id.clone()],
+            message_history: Vec::new(),
+        });
 
         state
             .session_store
@@ -2718,9 +2723,10 @@ mod tests {
         let action_task_id = TaskId::new("task-action-deep-primary-done");
         let accepted_at = UtcMillis::now();
 
-        let (_mission_id, orchestrator_thread_id) = state
-            .session_store
-            .ensure_session_mission(&session_id, accepted_at, || mission_id.clone());
+        let (_mission_id, orchestrator_thread_id) =
+            state
+                .session_store
+                .ensure_session_mission(&session_id, accepted_at, || mission_id.clone());
 
         state
             .session_store
@@ -2883,9 +2889,10 @@ mod tests {
         let action_task_id = TaskId::new("task-turn-no-assistant-final");
         let accepted_at = UtcMillis::now();
 
-        let (_mission_id, orchestrator_thread_id) = state
-            .session_store
-            .ensure_session_mission(&session_id, accepted_at, || mission_id.clone());
+        let (_mission_id, orchestrator_thread_id) =
+            state
+                .session_store
+                .ensure_session_mission(&session_id, accepted_at, || mission_id.clone());
 
         state
             .session_store
@@ -3022,9 +3029,10 @@ mod tests {
         let first_accepted_at = UtcMillis::now();
         let second_accepted_at = UtcMillis(first_accepted_at.0 + 1);
 
-        let (_mission_id, orchestrator_thread_id) = state
-            .session_store
-            .ensure_session_mission(&session_id, first_accepted_at, || mission_id.clone());
+        let (_mission_id, orchestrator_thread_id) =
+            state
+                .session_store
+                .ensure_session_mission(&session_id, first_accepted_at, || mission_id.clone());
 
         state
             .session_store
@@ -3277,16 +3285,14 @@ mod tests {
     #[tokio::test]
     async fn session_action_tool_and_llm_events_remain_bound_to_owning_session_after_switch() {
         let switched_session_id = SessionId::new("session-route-loopback-other");
-        let state = build_execution_state_with_factory(
-            WorkerRuntime::new_compare,
-            |session_store| {
+        let state =
+            build_execution_state_with_factory(WorkerRuntime::new_compare, |session_store| {
                 Arc::new(SessionSwitchingToolModelBridgeClient {
                     session_store,
                     switch_to: switched_session_id.clone(),
                     invoke_count: AtomicUsize::new(0),
                 })
-            },
-        );
+            });
         state
             .session_store
             .create_session(switched_session_id.clone(), "Other Session")
@@ -5336,7 +5342,10 @@ mod tests {
                 ),
                 (
                     LOCAL_BRIDGE_DESCRIBE_SERVICES_METHOD.to_string(),
-                    FakeTransportOutcome::Payload(catalog(BridgeServerKind::Model, "loopback-model")),
+                    FakeTransportOutcome::Payload(catalog(
+                        BridgeServerKind::Model,
+                        "loopback-model",
+                    )),
                 ),
             ]))),
         ));
@@ -6484,9 +6493,10 @@ mod tests {
             .session_store
             .create_session(session_id.clone(), "interrupt completed root")
             .expect("session should be creatable");
-        let (_mission_id, orchestrator_thread_id) = state
-            .session_store
-            .ensure_session_mission(&session_id, now, || mission_id.clone());
+        let (_mission_id, orchestrator_thread_id) =
+            state
+                .session_store
+                .ensure_session_mission(&session_id, now, || mission_id.clone());
         let mut phase_item = session_turn_item(
             "assistant_phase",
             "pending",
@@ -6601,7 +6611,7 @@ mod tests {
         let accepted_at = UtcMillis::now();
         let mut accepted = submit_dispatch_submission(
             &state,
-            crate::task_execution::DispatchSubmissionRequest {
+            crate::dispatch_execution::DispatchSubmissionRequest {
                 accepted_at,
                 session_id: session_id.clone(),
                 workspace_id: None,

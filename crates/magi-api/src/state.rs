@@ -13,13 +13,14 @@ use crate::routes::settings::{
 };
 use crate::settings_store::SettingsStore;
 use crate::skill_loader;
-use crate::task_execution::{LlmTaskDispatcher, TaskExecutionRegistry};
 use magi_bridge_client::{
     BridgeServerKind, BridgeTransport, JsonRpcBridgeServerProbeClient, McpServerConfig,
     ModelBridgeClient, StdioMcpBridgeClient,
 };
 use magi_conversation_runtime::{
     ConversationRegistry, StreamFanOut,
+    task_execution_dispatcher::{ExecutionPipeline, LlmTaskDispatcher},
+    task_execution_registry::TaskExecutionRegistry,
     task_runner_bridge::{
         EventBasedResultReceiver, EventBasedTaskDispatcher, RunCycleOutcome, TaskDispatcher,
         TaskResultReceiver, WorkerExecutionDispatcher,
@@ -575,15 +576,6 @@ pub struct RunnerStatusSnapshot {
 }
 
 #[derive(Clone)]
-pub struct ExecutionPipeline {
-    pub orchestrator: OrchestratorService,
-    pub execution_runtime: OrchestratedExecutionRuntime,
-    pub memory_store: MemoryStore,
-}
-
-impl ExecutionPipeline {}
-
-#[derive(Clone)]
 pub struct ApiState {
     pub service_info: ServiceInfo,
     runtime_epoch: String,
@@ -778,7 +770,10 @@ impl ApiState {
     }
 
     pub fn task_worker_catalog(&self) -> Vec<WorkerInfo> {
-        build_worker_catalog_for_roles(&self.agent_role_registry, enabled_registry_agent_roles(self))
+        build_worker_catalog_for_roles(
+            &self.agent_role_registry,
+            enabled_registry_agent_roles(self),
+        )
     }
 
     pub fn with_bridge_probe(

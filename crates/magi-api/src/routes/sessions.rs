@@ -4,17 +4,20 @@ use axum::{
     routing::{get, post},
 };
 use magi_bridge_client::{
-    ChatToolChoice, ChatToolDefinition, ChatToolFunctionDefinition, ModelInvocationRequest,
-    LOOPBACK_MODEL_PROVIDER,
+    ChatToolChoice, ChatToolDefinition, ChatToolFunctionDefinition, LOOPBACK_MODEL_PROVIDER,
+    ModelInvocationRequest,
 };
+use magi_conversation_runtime::session_turn_execution::SessionTurnExecutionRequest;
+use magi_conversation_runtime::session_writeback::publish_current_session_turn_item_event;
 use magi_core::TaskStatus;
-use magi_core::{DomainError, EventId, MissionId, SessionId, Task, TaskId, UtcMillis, WorkerId, WorkspaceId};
+use magi_core::{
+    DomainError, EventId, MissionId, SessionId, Task, TaskId, UtcMillis, WorkerId, WorkspaceId,
+};
 use magi_event_bus::{EventContext, EventEnvelope};
 use magi_session_store::{
     ActiveExecutionTurn, ActiveExecutionTurnItem, CANONICAL_TURN_SCHEMA_VERSION, CanonicalTurn,
     NotificationRecord, SessionRecord, TimelineEntryKind,
 };
-use magi_conversation_runtime::session_writeback::publish_current_session_turn_item_event;
 use magi_tool_runtime::BuiltinToolName;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -26,6 +29,7 @@ use super::session_scope::{
     require_session_record_in_workspace, session_workspace_id,
 };
 use crate::{
+    dispatch_execution::DispatchSubmissionAccepted,
     dto::{
         BootstrapDto, SessionNotificationsResponseDto, SessionTurnRequestDto,
         SessionTurnResponseDto, SessionTurnRouteDto,
@@ -36,10 +40,7 @@ use crate::{
         continue_execution_chain,
     },
     state::ApiState,
-    task_execution::{
-        SessionTurnExecutionRequest,
-        finalize_background_session_task_turn_if_root_terminal,
-    },
+    task_turn_finalize::finalize_background_session_task_turn_if_root_terminal,
 };
 
 pub fn routes() -> Router<ApiState> {
@@ -176,11 +177,12 @@ async fn submit_session_turn(
             );
             let prompt_text = signal.text.clone();
             let accepted = continue_execution_chain(&state, &session_id, &[])?;
-            let (_, orchestrator_thread_id) = state.session_store.ensure_session_mission(
-                &session_id,
-                accepted_at,
-                || accepted.mission_id.clone(),
-            );
+            let (_, orchestrator_thread_id) =
+                state
+                    .session_store
+                    .ensure_session_mission(&session_id, accepted_at, || {
+                        accepted.mission_id.clone()
+                    });
             let (entry_id, user_message_item_id) = match prompt_text.as_deref() {
                 Some(prompt_text) => {
                     let entry_id = format!("timeline-{}-{}", session_id, accepted_at.0);
@@ -267,8 +269,7 @@ fn submit_supplement_context_turn(
 ) -> Result<SessionTurnResponseDto, ApiError> {
     let session_id = parse_session_id(request.session_id.as_deref())?;
     // S1：user 信号经 Conversation Mailbox 入栈，下游一律读 signal.* 不再读 request.*
-    let signal =
-        super::ingest_user_input_to_conversation(state, &session_id, request, accepted_at);
+    let signal = super::ingest_user_input_to_conversation(state, &session_id, request, accepted_at);
     let message = signal
         .text
         .clone()
@@ -290,8 +291,12 @@ fn submit_supplement_context_turn(
         .into_iter()
         .find(|task| task.parent_task_id.is_none())
         .ok_or_else(|| ApiError::InvalidInput("当前 Mission 没有根任务".to_string()))?;
-    let context_task =
-        resolve_supplement_context_task(store, &mission_id, &root_task, request.context_task_id.as_deref())?;
+    let context_task = resolve_supplement_context_task(
+        store,
+        &mission_id,
+        &root_task,
+        request.context_task_id.as_deref(),
+    )?;
     let context_task_id = context_task.task_id.clone();
 
     let context_ref = format!(
@@ -347,9 +352,7 @@ fn resolve_supplement_context_task(
         .get_task(&task_id)
         .ok_or_else(|| ApiError::InvalidInput(format!("上下文任务不存在: {raw}")))?;
     if task.mission_id != *mission_id {
-        return Err(ApiError::InvalidInput(format!(
-            "任务 {raw} 不属于当前会话"
-        )));
+        return Err(ApiError::InvalidInput(format!("任务 {raw} 不属于当前会话")));
     }
     Ok(task)
 }
@@ -913,11 +916,12 @@ fn submit_regular_session_turn(
     let user_message_id = signal.user_message_id.clone();
     let requested_placeholder_message_id = signal.placeholder_message_id.clone();
     // P7：所有 turn item 必须携带 source_thread_id，由 ensure_session_mission 提供 orchestrator thread。
-    let (_mission_id, orchestrator_thread_id) = state.session_store.ensure_session_mission(
-        &session_id,
-        accepted_at,
-        || magi_core::MissionId::new(format!("mission-session-chat-{}", accepted_at.0)),
-    );
+    let (_mission_id, orchestrator_thread_id) =
+        state
+            .session_store
+            .ensure_session_mission(&session_id, accepted_at, || {
+                magi_core::MissionId::new(format!("mission-session-chat-{}", accepted_at.0))
+            });
     let (assistant_placeholder_item_id, assistant_placeholder_item) =
         build_assistant_placeholder_turn_item(
             accepted_at,
@@ -1122,7 +1126,7 @@ fn spawn_regular_session_turn_execution(
                         json!({
                             "session_id": session_id.to_string(),
                             "route": route,
-                            "error": error.message().to_string(),
+                            "error": error,
                         }),
                     )
                     .with_context(EventContext {
@@ -1577,11 +1581,10 @@ async fn continue_session(
         .collect::<Vec<_>>();
     let continued_at = UtcMillis::now();
     let accepted = continue_execution_chain(&state, &session_id, &requested_worker_ids)?;
-    let (_, orchestrator_thread_id) = state.session_store.ensure_session_mission(
-        &session_id,
-        continued_at,
-        || accepted.mission_id.clone(),
-    );
+    let (_, orchestrator_thread_id) =
+        state
+            .session_store
+            .ensure_session_mission(&session_id, continued_at, || accepted.mission_id.clone());
     if let Some(prompt_text) = prompt_text.as_deref() {
         let entry_id = format!("timeline-{}-{}", session_id, continued_at.0);
         let (_, user_message_item) = build_user_message_turn_item(
@@ -1700,7 +1703,7 @@ fn finalize_continue_session(
 
     super::append_dispatch_assistant_message(
         &state,
-        &crate::task_execution::DispatchSubmissionAccepted {
+        &DispatchSubmissionAccepted {
             session_id: accepted.session_id.clone(),
             entry_id: format!("timeline-{}-{}", accepted.session_id, continued_at.0),
             accepted_at: continued_at,

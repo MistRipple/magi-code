@@ -1,7 +1,7 @@
 //! Task System v2 — M10/M11：继续会话恢复路径已下沉到 conversation-runtime。
 //!
 //! magi-api 仅保留 `continue_execution_chain` 这层"装配薄壳" —— 因为它强依赖
-//! `TaskExecutionPlan`（task_execution.rs）+ `RunnerStartError`（state.rs）+
+//! `TaskExecutionPlan` + `RunnerStartError`（state.rs）+
 //! `TaskExecutionRegistry` / `RunnerManager` 等 ApiState 拥有的资源。所有可纯化
 //! 的判定 / 校验 / writebacks 落盘 / branch checkpoint 同步 / 子树解封逻辑都已
 //! 迁到 `magi_conversation_runtime::execution_chain_recovery`。
@@ -12,11 +12,13 @@
 use crate::{
     errors::ApiError,
     state::{ApiState, RunnerStartError},
-    task_execution::TaskExecutionPlan,
 };
-use magi_conversation_runtime::execution_chain_recovery::{
-    apply_chain_recovery_if_needed, release_resumed_branch_path,
-    sync_branch_checkpoint_to_worker_runtime,
+use magi_conversation_runtime::{
+    execution_chain_recovery::{
+        apply_chain_recovery_if_needed, release_resumed_branch_path,
+        sync_branch_checkpoint_to_worker_runtime,
+    },
+    task_execution_registry::TaskExecutionPlan,
 };
 use magi_core::{
     ExecutionOwnership, SessionId, TaskExecutionTarget, TaskStatus, ThreadId, WorkerId,

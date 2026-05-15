@@ -13,6 +13,7 @@
 
 mod builtin_tool_schema;
 mod conversation;
+pub mod dispatch_submission;
 mod driver;
 pub mod execution_chain_recovery;
 mod mailbox;
@@ -20,27 +21,29 @@ pub mod mission_decomposition;
 pub mod model_config;
 pub mod prompt_utils;
 mod registry;
-pub mod dispatch_submission;
 pub mod session_thread;
-pub mod task_execution_registry;
 pub mod session_turn_execution;
 pub mod session_turn_finalize;
 pub mod session_writeback;
 pub mod settings_store;
-pub mod task_graph_builder;
-pub mod task_graph_replan;
-pub mod task_runner_bridge;
-pub mod task_runner_v2;
 mod skill_apply_tool;
 mod stream;
+pub mod task_execution_dispatcher;
+pub mod task_execution_registry;
+pub mod task_graph_builder;
+pub mod task_graph_replan;
 pub mod task_helpers;
 pub mod task_llm_loop;
+pub mod task_runner_bridge;
+pub mod task_runner_v2;
 pub mod tool_batch;
 pub mod tool_result_utils;
 mod turn;
 pub mod usage_recording;
 
-pub use builtin_tool_schema::{internal_builtin_tool_rejection_payload, public_builtin_tool_definitions};
+pub use builtin_tool_schema::{
+    internal_builtin_tool_rejection_payload, public_builtin_tool_definitions,
+};
 pub use conversation::{AdvanceTurnError, BeginTurnError, Conversation, TurnAdvanceError};
 pub use driver::{RoundOutcome, TurnDriver};
 pub use mailbox::{MailboxItem, UserSignal};
@@ -50,14 +53,13 @@ pub use skill_apply_tool::{
 };
 pub use stream::{StreamEvent, StreamFanOut, SubscriptionId, ToolPhase};
 pub use task_helpers::{
-    BASE_TOOL_CALL_ROUNDS, MAX_TOOL_CALL_ROUNDS, TaskTurnVisibility,
-    apply_task_final_visibility, apply_task_turn_visibility, apply_task_worker_detail_visibility,
-    canonical_tool_call_name, collect_dependency_output_validation_facts,
-    compact_validation_failure, deterministic_execution_tool_validation_content,
-    deterministic_planning_content, deterministic_planning_validation_content,
-    deterministic_task_final_content, extract_task_goal, forced_task_tool_choice_for_round,
-    is_execution_tool_validation, is_planning_no_tool_action, is_planning_text_validation,
-    is_tool_reference_boundary, public_builtin_tool_reference_aliases,
+    BASE_TOOL_CALL_ROUNDS, MAX_TOOL_CALL_ROUNDS, TaskTurnVisibility, apply_task_final_visibility,
+    apply_task_turn_visibility, apply_task_worker_detail_visibility, canonical_tool_call_name,
+    collect_dependency_output_validation_facts, compact_validation_failure,
+    deterministic_execution_tool_validation_content, deterministic_planning_content,
+    deterministic_planning_validation_content, deterministic_task_final_content, extract_task_goal,
+    forced_task_tool_choice_for_round, is_execution_tool_validation, is_planning_no_tool_action,
+    is_planning_text_validation, is_tool_reference_boundary, public_builtin_tool_reference_aliases,
     record_completed_required_tools, required_tool_chain_is_complete,
     required_tool_chain_recovery_prompt, task_required_tool_chain, task_tool_failure_reason,
     task_turn_visibility, tool_call_round_limit, tool_reference_position,

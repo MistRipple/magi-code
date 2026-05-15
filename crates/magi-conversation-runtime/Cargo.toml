@@ -6,10 +6,13 @@ edition.workspace = true
 [dependencies]
 magi-core = { path = "../magi-core" }
 magi-bridge-client = { path = "../magi-bridge-client" }
+magi-context-runtime = { path = "../magi-context-runtime" }
 magi-event-bus = { path = "../magi-event-bus" }
+magi-knowledge-store = { path = "../magi-knowledge-store" }
 magi-tool-runtime = { path = "../magi-tool-runtime" }
 magi-orchestrator = { path = "../magi-orchestrator" }
 magi-spawn-graph = { path = "../magi-spawn-graph" }
+tokio.workspace = true
 magi-safety-gate = { path = "../magi-safety-gate" }
 magi-todo-ledger = { path = "../magi-todo-ledger" }
 magi-project-memory = { path = "../magi-project-memory" }
