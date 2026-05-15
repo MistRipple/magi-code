@@ -26,11 +26,13 @@ use magi_core::{
 use magi_governance::ToolKind;
 use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
 use magi_knowledge_store::{KnowledgeKind, KnowledgeRecord, KnowledgeStore};
-use magi_orchestrator::{
-    ExecutionContextSummary, ExecutionWritebackPlans,
-    task_runner::{EventBasedResultReceiver, TaskDispatcher, TaskOutcome, TaskResult, WorkerInfo},
-};
 use magi_conversation_runtime::{ConversationRegistry, StreamFanOut};
+pub use magi_conversation_runtime::task_runner_bridge::{
+    EventBasedResultReceiver, TaskDispatcher, TaskOutcome, TaskResult,
+};
+use magi_orchestrator::{
+    ExecutionContextSummary, ExecutionWritebackPlans, task_worker_catalog::WorkerInfo,
+};
 use magi_session_store::{SessionStore, TimelineEntryKind, timeline_entry_visible_text};
 use magi_tool_runtime::{
     BuiltinToolName, ToolExecutionContext, ToolExecutionInput, ToolRegistry,

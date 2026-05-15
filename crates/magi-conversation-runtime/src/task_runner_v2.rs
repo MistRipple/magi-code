@@ -11,16 +11,14 @@ use magi_core::{
     TaskStatus, UtcMillis,
 };
 use magi_event_bus::{EventEnvelope, InMemoryEventBus};
-use magi_orchestrator::task_runner::{
+use crate::task_runner_bridge::{
     NoOpDispatcher, NoOpResultReceiver, RunCycleOutcome, TaskDispatcher, TaskOutcome,
-    TaskResultReceiver, WorkerInfo,
+    TaskResultReceiver,
 };
 #[cfg(test)]
-use magi_orchestrator::task_runner::{
-    EventBasedResultReceiver, TaskResult, WorkerExecutionDispatcher,
-};
+use crate::task_runner_bridge::{EventBasedResultReceiver, TaskResult, WorkerExecutionDispatcher};
 use magi_orchestrator::task_store::TaskStore;
-use magi_orchestrator::task_worker_catalog::resolve_task_role;
+use magi_orchestrator::task_worker_catalog::{WorkerInfo, resolve_task_role};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;

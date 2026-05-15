@@ -7,7 +7,6 @@ mod execution_writeback;
 #[cfg(test)]
 pub(crate) mod plan_ledger;
 pub mod risk_policy;
-pub mod task_runner;
 pub mod task_store;
 pub mod task_worker_catalog;
 pub mod turn_diff_tracker;

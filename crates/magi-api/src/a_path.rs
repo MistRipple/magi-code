@@ -13,6 +13,7 @@
 //! 让 A 档与 v2 Conversation::advance_turn 衔接。
 
 use crate::{errors::ApiError, state::ApiState};
+use magi_conversation_runtime::task_runner_bridge::RunCycleOutcome;
 use magi_core::{TaskId, TaskStatus};
 
 /// A 档同步驱动的产出。
@@ -56,9 +57,9 @@ pub fn drive_a_path(
                 .run_single_cycle(root_task_id.as_str())
                 .map_err(|error| ApiError::internal_assembly(failure_title, error))?;
             match outcome {
-                magi_orchestrator::task_runner::RunCycleOutcome::Continue => continue,
-                magi_orchestrator::task_runner::RunCycleOutcome::AllComplete => break,
-                magi_orchestrator::task_runner::RunCycleOutcome::Blocked(task_ids) => {
+                RunCycleOutcome::Continue => continue,
+                RunCycleOutcome::AllComplete => break,
+                RunCycleOutcome::Blocked(task_ids) => {
                     if task_store
                         .get_task(action_task_id)
                         .is_some_and(|task| task.status == TaskStatus::Blocked)
@@ -70,7 +71,7 @@ pub fn drive_a_path(
                         format!("task runner blocked: {:?}", task_ids),
                     ));
                 }
-                magi_orchestrator::task_runner::RunCycleOutcome::Error(error) => {
+                RunCycleOutcome::Error(error) => {
                     return Err(ApiError::internal_assembly(failure_title, error));
                 }
             }

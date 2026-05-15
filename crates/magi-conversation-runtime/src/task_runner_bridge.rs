@@ -1,7 +1,13 @@
-use magi_core::{
-    AssignmentLease, EventId, LeaseId, Task, TaskId, TaskKind, TaskResultKind, UtcMillis, WorkerId,
-};
+//! Task System v2 — M19：TaskRunner 执行桥层从 magi-orchestrator 下沉到
+//! conversation-runtime。
+//!
+//! WorkerInfo 已收敛到 magi_orchestrator::task_worker_catalog，保证 orchestrator 的
+//! worker 目录仍不依赖 conversation-runtime；本模块持有调度 trait、结果接收器、
+//! event-based dispatcher 与 WorkerRuntime dispatcher。
+
+use magi_core::{AssignmentLease, EventId, LeaseId, Task, TaskId, TaskResultKind, UtcMillis};
 use magi_event_bus::{EventEnvelope, InMemoryEventBus};
+use magi_orchestrator::task_worker_catalog::WorkerInfo;
 use magi_skill_runtime::SkillDispatchRuntime;
 use magi_tool_runtime::ToolRegistry;
 use magi_worker_runtime::{
@@ -10,21 +16,6 @@ use magi_worker_runtime::{
 };
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
-
-/// Describes a worker's capabilities for task matching.
-#[derive(Clone, Debug)]
-pub struct WorkerInfo {
-    pub worker_id: WorkerId,
-    /// The role this worker can fulfil (e.g. "integration-dev", "reviewer", "debugger").
-    pub role: String,
-    /// Task kinds this worker is capable of handling.
-    pub supported_kinds: Vec<TaskKind>,
-    /// Maximum number of concurrent tasks this worker can handle (design 5.4).
-    /// None means unlimited.
-    pub parallelism_limit: Option<u32>,
-    /// Role-specific system prompt template injected at LLM invocation (design 8.1).
-    pub system_prompt_template: Option<String>,
-}
 
 /// The outcome of a single `run_cycle` iteration.
 #[derive(Clone, Debug, PartialEq, Eq)]

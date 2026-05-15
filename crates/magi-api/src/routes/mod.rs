@@ -228,7 +228,9 @@ mod tests {
     use magi_governance::GovernanceService;
     use magi_knowledge_store::KnowledgeStore;
     use magi_memory_store::MemoryStore;
-    use magi_orchestrator::task_runner::{EventBasedResultReceiver, TaskOutcome, TaskResult};
+    use magi_conversation_runtime::task_runner_bridge::{
+        EventBasedResultReceiver, TaskOutcome, TaskResult,
+    };
     use magi_orchestrator::{ExecutionContextConfig, OrchestratorService, task_store::TaskStore};
     use magi_session_store::{
         ActiveExecutionBranch, ActiveExecutionChain, ActiveExecutionDispatchContext,

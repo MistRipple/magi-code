@@ -6,7 +6,7 @@
 use crate::{model_config::NormalizedModelConfig, settings_store::SettingsStore};
 use magi_core::{EventId, SessionId, UtcMillis, WorkspaceId};
 use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
-use magi_orchestrator::task_runner::WorkerInfo;
+use magi_orchestrator::task_worker_catalog::WorkerInfo;
 use magi_session_store::SessionStore;
 use magi_usage_authority::{
     ExecutionBindingIdentity, LlmConfig, UsageCallIdentity, UsageCallRecordInput, UsageCallStatus,

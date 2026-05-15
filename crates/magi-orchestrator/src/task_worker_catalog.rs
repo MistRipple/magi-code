@@ -1,6 +1,20 @@
-use crate::task_runner::WorkerInfo;
 use magi_agent_role::AgentRoleRegistry;
 use magi_core::{Task, TaskKind, WorkerId};
+
+/// Describes a worker's capabilities for task matching.
+#[derive(Clone, Debug)]
+pub struct WorkerInfo {
+    pub worker_id: WorkerId,
+    /// The role this worker can fulfil (e.g. "integration-dev", "reviewer", "debugger").
+    pub role: String,
+    /// Task kinds this worker is capable of handling.
+    pub supported_kinds: Vec<TaskKind>,
+    /// Maximum number of concurrent tasks this worker can handle (design 5.4).
+    /// None means unlimited.
+    pub parallelism_limit: Option<u32>,
+    /// Role-specific system prompt template injected at LLM invocation (design 8.1).
+    pub system_prompt_template: Option<String>,
+}
 use std::collections::HashMap;
 use std::sync::RwLock;
 

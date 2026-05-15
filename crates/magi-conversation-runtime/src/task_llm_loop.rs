@@ -32,9 +32,8 @@ use magi_core::{
     ToolCallId, UtcMillis, WorkspaceId,
 };
 use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
-use magi_orchestrator::{
-    ExecutionContextSummary, task_runner::TaskOutcome, task_store::TaskStore,
-};
+use magi_orchestrator::{ExecutionContextSummary, task_store::TaskStore};
+use crate::task_runner_bridge::TaskOutcome;
 use magi_session_store::{
     SessionStore, ThreadChatMessage, ThreadChatToolCall, ThreadChatToolFunction, TimelineEntryKind,
 };

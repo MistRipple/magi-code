@@ -18,7 +18,14 @@ use magi_bridge_client::{
     BridgeServerKind, BridgeTransport, JsonRpcBridgeServerProbeClient, McpServerConfig,
     ModelBridgeClient, StdioMcpBridgeClient,
 };
-use magi_conversation_runtime::{ConversationRegistry, StreamFanOut, task_runner_v2::TaskRunner};
+use magi_conversation_runtime::{
+    ConversationRegistry, StreamFanOut,
+    task_runner_bridge::{
+        EventBasedResultReceiver, EventBasedTaskDispatcher, RunCycleOutcome, TaskDispatcher,
+        TaskResultReceiver, WorkerExecutionDispatcher,
+    },
+    task_runner_v2::TaskRunner,
+};
 use magi_core::{SessionId, SessionLifecycleStatus, TaskId, TaskStatus, UtcMillis, WorkspaceId};
 use magi_event_bus::InMemoryEventBus;
 use magi_governance::GovernanceService;
@@ -26,12 +33,8 @@ use magi_knowledge_store::KnowledgeStore;
 use magi_memory_store::MemoryStore;
 use magi_orchestrator::{
     OrchestratedExecutionRuntime, OrchestratorService,
-    task_runner::{
-        EventBasedResultReceiver, EventBasedTaskDispatcher, RunCycleOutcome, TaskDispatcher,
-        TaskResultReceiver, WorkerExecutionDispatcher, WorkerInfo,
-    },
     task_store::TaskStore,
-    task_worker_catalog::build_worker_catalog_for_roles,
+    task_worker_catalog::{WorkerInfo, build_worker_catalog_for_roles},
 };
 use magi_session_store::{SessionLifecycleObserver, SessionRecord, SessionStore};
 use magi_snapshot::{SnapshotManager, SnapshotSession};
