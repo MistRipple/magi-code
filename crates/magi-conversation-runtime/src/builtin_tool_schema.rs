@@ -17,7 +17,7 @@ fn public_builtin_tool_definition(name: &str) -> Option<ChatToolDefinition> {
     })
 }
 
-pub(crate) fn public_builtin_tool_definitions(registry: &ToolRegistry) -> Vec<ChatToolDefinition> {
+pub fn public_builtin_tool_definitions(registry: &ToolRegistry) -> Vec<ChatToolDefinition> {
     registry
         .public_builtin_specs()
         .into_iter()
@@ -25,7 +25,7 @@ pub(crate) fn public_builtin_tool_definitions(registry: &ToolRegistry) -> Vec<Ch
         .collect()
 }
 
-pub(crate) fn internal_builtin_tool_rejection_payload(name: &str) -> Option<String> {
+pub fn internal_builtin_tool_rejection_payload(name: &str) -> Option<String> {
     if !is_internal_builtin_tool_surface(name) {
         return None;
     }

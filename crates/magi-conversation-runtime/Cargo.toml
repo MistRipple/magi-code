@@ -5,4 +5,23 @@ edition.workspace = true
 
 [dependencies]
 magi-core = { path = "../magi-core" }
+magi-bridge-client = { path = "../magi-bridge-client" }
+magi-event-bus = { path = "../magi-event-bus" }
+magi-tool-runtime = { path = "../magi-tool-runtime" }
+magi-orchestrator = { path = "../magi-orchestrator" }
+magi-spawn-graph = { path = "../magi-spawn-graph" }
+magi-safety-gate = { path = "../magi-safety-gate" }
+magi-todo-ledger = { path = "../magi-todo-ledger" }
+magi-project-memory = { path = "../magi-project-memory" }
+magi-mission-charter = { path = "../magi-mission-charter" }
+magi-plan = { path = "../magi-plan" }
+magi-knowledge-graph = { path = "../magi-knowledge-graph" }
+magi-validation-runner = { path = "../magi-validation-runner" }
+magi-checkpoint = { path = "../magi-checkpoint" }
+magi-human-checkpoint = { path = "../magi-human-checkpoint" }
+magi-governance = { path = "../magi-governance" }
+magi-skill-runtime = { path = "../magi-skill-runtime" }
+magi-permissions = { path = "../magi-permissions" }
 serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true

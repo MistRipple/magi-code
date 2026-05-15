@@ -2,12 +2,12 @@ use magi_bridge_client::{ChatToolDefinition, ChatToolFunctionDefinition};
 use magi_core::ExecutionResultStatus;
 use magi_skill_runtime::SkillRuntime;
 
-pub(crate) const SKILL_APPLY_TOOL_NAME: &str = "skill_apply";
+pub const SKILL_APPLY_TOOL_NAME: &str = "skill_apply";
 
 const SKILL_APPLY_TOOL_DESCRIPTION: &str =
     "Load and apply a named skill for specialized task execution";
 
-pub(crate) fn skill_apply_tool_definition() -> ChatToolDefinition {
+pub fn skill_apply_tool_definition() -> ChatToolDefinition {
     ChatToolDefinition {
         kind: "function".to_string(),
         function: ChatToolFunctionDefinition {
@@ -31,7 +31,7 @@ pub(crate) fn skill_apply_tool_definition() -> ChatToolDefinition {
     }
 }
 
-pub(crate) fn execute_skill_apply_from_runtime(
+pub fn execute_skill_apply_from_runtime(
     arguments: &str,
     skill_runtime: Option<&SkillRuntime>,
 ) -> (String, ExecutionResultStatus) {

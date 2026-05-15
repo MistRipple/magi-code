@@ -3,7 +3,6 @@ pub use crate::session_turn_execution::{
     BUSINESS_MODEL_PROVIDER, SessionTurnExecutionOutput, SessionTurnExecutionRequest,
 };
 use crate::{
-    builtin_tool_schema::public_builtin_tool_definitions,
     errors::ApiError,
     model_config::NormalizedModelConfig,
     prompt_utils::prepend_session_instructions,
@@ -16,9 +15,11 @@ use crate::{
     dispatch_execution::{
         TaskGraphSubmission, cleanup_task_tree, run_dispatch_submission,
     },
-    skill_apply_tool::{SKILL_APPLY_TOOL_NAME, skill_apply_tool_definition},
     state::{ApiState, ExecutionPipeline},
     usage_recording::{ModelUsageBinding, model_usage_binding_for_worker},
+};
+use magi_conversation_runtime::{
+    SKILL_APPLY_TOOL_NAME, public_builtin_tool_definitions, skill_apply_tool_definition,
 };
 use magi_bridge_client::{ChatToolDefinition, ModelBridgeClient};
 use magi_context_runtime::{

@@ -1024,8 +1024,27 @@ dependencies = [
 name = "magi-conversation-runtime"
 version = "0.1.0"
 dependencies = [
+ "magi-bridge-client",
+ "magi-checkpoint",
  "magi-core",
+ "magi-event-bus",
+ "magi-governance",
+ "magi-human-checkpoint",
+ "magi-knowledge-graph",
+ "magi-mission-charter",
+ "magi-orchestrator",
+ "magi-permissions",
+ "magi-plan",
+ "magi-project-memory",
+ "magi-safety-gate",
+ "magi-skill-runtime",
+ "magi-spawn-graph",
+ "magi-todo-ledger",
+ "magi-tool-runtime",
+ "magi-validation-runner",
  "serde",
+ "serde_json",
+ "tracing",
 ]
 
 [[package]]

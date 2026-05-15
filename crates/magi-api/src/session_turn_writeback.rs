@@ -1,9 +1,8 @@
-use crate::{
-    builtin_tool_schema::internal_builtin_tool_rejection_payload,
-    skill_apply_tool::{SKILL_APPLY_TOOL_NAME, execute_skill_apply_from_runtime},
-    tool_result_utils::{
-        summarize_tool_result, tool_execution_status_label, turn_item_status_for_tool_result,
-    },
+use crate::tool_result_utils::{
+    summarize_tool_result, tool_execution_status_label, turn_item_status_for_tool_result,
+};
+use magi_conversation_runtime::{
+    SKILL_APPLY_TOOL_NAME, execute_skill_apply_from_runtime, internal_builtin_tool_rejection_payload,
 };
 use magi_bridge_client::{
     ChatMessage, ChatToolCall,

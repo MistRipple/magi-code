@@ -1,7 +1,6 @@
 #![recursion_limit = "256"]
 
 mod a_path;
-mod builtin_tool_schema;
 mod change_projection;
 mod dto;
 mod errors;
@@ -14,7 +13,6 @@ mod session_turn_writeback;
 pub mod settings_store;
 mod snapshot_lifecycle;
 mod dispatch_execution;
-mod skill_apply_tool;
 pub mod skill_loader;
 mod sse;
 mod state;
