@@ -196,14 +196,14 @@ async fn stream_events(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dispatch_execution::{
-        DispatchSubmissionAccepted, drive_dispatch_submission, submit_dispatch_submission,
-    };
     use crate::dto::{
         BridgeProbeErrorDto, BridgeServiceSnapshotDto, BridgeServicesSnapshotDto,
         BridgeSnapshotProvider,
     };
     use crate::state::{RunnerManager, RunnerStartError};
+    use crate::task_dispatch::{
+        DispatchSubmissionAccepted, drive_dispatch_submission, submit_dispatch_submission,
+    };
     use axum::{
         body::{Body, to_bytes},
         http::{Request, StatusCode},
@@ -6611,7 +6611,7 @@ mod tests {
         let accepted_at = UtcMillis::now();
         let mut accepted = submit_dispatch_submission(
             &state,
-            crate::dispatch_execution::DispatchSubmissionRequest {
+            crate::task_dispatch::DispatchSubmissionRequest {
                 accepted_at,
                 session_id: session_id.clone(),
                 workspace_id: None,

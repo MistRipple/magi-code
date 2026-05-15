@@ -29,7 +29,6 @@ use super::session_scope::{
     require_session_record_in_workspace, session_workspace_id,
 };
 use crate::{
-    dispatch_execution::DispatchSubmissionAccepted,
     dto::{
         BootstrapDto, SessionNotificationsResponseDto, SessionTurnRequestDto,
         SessionTurnResponseDto, SessionTurnRouteDto,
@@ -40,6 +39,7 @@ use crate::{
         continue_execution_chain,
     },
     state::ApiState,
+    task_dispatch::DispatchSubmissionAccepted,
     task_turn_finalize::finalize_background_session_task_turn_if_root_terminal,
 };
 

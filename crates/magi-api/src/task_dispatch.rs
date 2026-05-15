@@ -12,9 +12,8 @@ use magi_core::{SessionId, Task, TaskId, WorkspaceId};
 #[cfg(test)]
 use magi_core::{TaskKind, TaskStatus, UtcMillis};
 
-// M12/M13/M14：任务图构建器、任务分解管线、任务图重规划入口与派发数据载体已
-// 迁移到 magi-conversation-runtime；保留内部 re-export 让 dispatch_execution / 测试
-// 代码以原名继续调用。
+// 任务图构建器、任务分解管线、任务图重规划入口与派发数据载体已迁移到
+// magi-conversation-runtime；这里仅保留 API 状态装配与测试辅助 re-export。
 #[cfg(test)]
 pub(crate) use magi_conversation_runtime::mission_decomposition::{
     TASK_PLAN_TOOL_NAME, parse_decomposition_response,
@@ -634,7 +633,7 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_execution_goal_does_not_rewrite_turn_user_message() {
+    fn task_dispatch_goal_does_not_rewrite_turn_user_message() {
         let (state, task_store) = build_test_state();
         let session_id = SessionId::new("session-execution-goal-split");
         state

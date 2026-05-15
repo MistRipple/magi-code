@@ -9,13 +9,13 @@ use super::{
     session_scope::{resolve_session_workspace_binding, session_workspace_id},
 };
 use crate::{
-    dispatch_execution::{
-        DispatchSubmissionAccepted, DispatchSubmissionRequest, drive_dispatch_submission,
-        submit_dispatch_submission,
-    },
     dto::SessionTurnRequestDto,
     errors::ApiError,
     state::ApiState,
+    task_dispatch::{
+        DispatchSubmissionAccepted, DispatchSubmissionRequest, drive_dispatch_submission,
+        submit_dispatch_submission,
+    },
 };
 use magi_conversation_runtime::session_writeback::publish_current_session_turn_item_event;
 

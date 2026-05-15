@@ -9,11 +9,11 @@ use serde::Deserialize;
 use super::session_scope::{parse_session_id, session_workspace_id};
 use crate::{
     errors::ApiError,
-    dispatch_execution::{
+    state::ApiState,
+    task_dispatch::{
         ensure_session_active_execution_chain, replace_replanned_task_execution_branches,
         replan_task_graph,
     },
-    state::ApiState,
 };
 
 pub fn routes() -> Router<ApiState> {

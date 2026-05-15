@@ -609,7 +609,7 @@ pub struct ApiState {
     /// Task System v2：AgentRole 注册表（替代 task_worker_catalog 硬编码 prompt）。
     /// 加载策略：`~/.magi/roles/*.json` 优先，回落到 crate 内置 builtin 集。
     pub agent_role_registry: Arc<magi_agent_role::AgentRoleRegistry>,
-    /// Task System v2 — L5：父子任务关系图，作为 dispatch_execution 中
+    /// Task System v2 — L5：父子任务关系图，作为 task_dispatch 中
     /// "parent_task_id 散落查询"的统一上层。同一进程共享。
     pub spawn_graph: Arc<Mutex<magi_spawn_graph::SpawnGraph>>,
 }

@@ -6,7 +6,7 @@
 //!
 //! - **唯一入口**：所有 A 档"用户消息已 dispatch → 同步驱动到 done"路径都从此处进入；
 //! - **背景判定外部完成**：`background_allowed=false` 的判定保留在调用方完成（routes
-//!   层 + dispatch_execution 层各自有不同的"否则分支"），本函数不再二次判断；
+//!   层 + task_dispatch 层各自有不同的"否则分支"），本函数不再二次判断；
 //! - **同步窗口固定 32 轮**：与 v1 行为对齐，避免在 M01 引入语义偏移。
 //!
 //! 后续 slice（M17b）会进一步把 `drive_a_path` 私化到 `magi-conversation-runtime`，

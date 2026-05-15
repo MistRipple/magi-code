@@ -2,7 +2,6 @@
 
 mod a_path;
 mod change_projection;
-mod dispatch_execution;
 mod dto;
 mod errors;
 mod model_config;
@@ -13,6 +12,7 @@ pub mod skill_loader;
 mod snapshot_lifecycle;
 mod sse;
 mod state;
+mod task_dispatch;
 pub mod task_turn_finalize;
 pub mod tunnel;
 
