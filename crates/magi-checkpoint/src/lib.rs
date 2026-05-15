@@ -564,6 +564,133 @@ fn workspace_slug(workspace_root: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Orchestration tool entry：checkpoint_create
+// ---------------------------------------------------------------------------
+
+/// S16：`checkpoint_create` 工具实现。append-only 写入 mission 维度的
+/// `checkpoints.md`，并通过 `task.checkpoint.appended` 域事件广播给观察者。
+/// 入参与 `&magi_core::Task` 解耦，仅依赖 `task_id`/`mission_id`，
+/// 为后续删除 `magi-core::Task` 做准备。
+pub fn execute_checkpoint_create_tool(
+    event_bus: &magi_event_bus::InMemoryEventBus,
+    store: Option<&CheckpointStore>,
+    session_id: &magi_core::SessionId,
+    workspace_id: Option<&magi_core::WorkspaceId>,
+    task_id: &magi_core::TaskId,
+    mission_id: &magi_core::MissionId,
+    arguments: &str,
+) -> (String, magi_core::ExecutionResultStatus) {
+    use magi_core::{EventId, ExecutionResultStatus, UtcMillis};
+    use magi_event_bus::{EventContext, EventEnvelope};
+
+    let Some(store) = store else {
+        return (
+            serde_json::json!({
+                "tool": "checkpoint_create",
+                "status": "failed",
+                "error": "当前 task 未绑定 workspace，无法定位 mission checkpoint store",
+            })
+            .to_string(),
+            ExecutionResultStatus::Failed,
+        );
+    };
+    let args_value: serde_json::Value = match serde_json::from_str(arguments) {
+        Ok(v) => v,
+        Err(err) => {
+            return (
+                serde_json::json!({
+                    "tool": "checkpoint_create",
+                    "status": "failed",
+                    "error": format!("arguments 非合法 JSON：{err}"),
+                })
+                .to_string(),
+                ExecutionResultStatus::Failed,
+            );
+        }
+    };
+    let args = match parse_checkpoint_create_arguments(&args_value) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            return (
+                serde_json::json!({
+                    "tool": "checkpoint_create",
+                    "status": "failed",
+                    "error": err.to_string(),
+                })
+                .to_string(),
+                ExecutionResultStatus::Failed,
+            );
+        }
+    };
+    let now = UtcMillis::now();
+    let mut log = match store.load(mission_id) {
+        Ok(Some(existing)) => existing,
+        Ok(None) => CheckpointLog::new(mission_id.clone(), now),
+        Err(err) => {
+            return (
+                serde_json::json!({
+                    "tool": "checkpoint_create",
+                    "status": "failed",
+                    "error": err.to_string(),
+                })
+                .to_string(),
+                ExecutionResultStatus::Failed,
+            );
+        }
+    };
+    let kind = args.kind;
+    let label_snapshot = args.label.clone();
+    let sequence = append_checkpoint(&mut log, args, now);
+    if let Err(err) = store.save(&log) {
+        return (
+            serde_json::json!({
+                "tool": "checkpoint_create",
+                "status": "failed",
+                "error": err.to_string(),
+            })
+            .to_string(),
+            ExecutionResultStatus::Failed,
+        );
+    }
+    let payload = serde_json::json!({
+        "tool": "checkpoint_create",
+        "status": "succeeded",
+        "mission_id": log.mission_id.to_string(),
+        "sequence": sequence,
+        "kind": kind.as_str(),
+        "label": label_snapshot,
+        "checkpoint_count": log.checkpoints.len(),
+    });
+    let _ = event_bus.publish(
+        EventEnvelope::domain(
+            EventId::new(format!(
+                "event-checkpoint-appended-{}",
+                UtcMillis::now().0
+            )),
+            "task.checkpoint.appended",
+            serde_json::json!({
+                "task_id": task_id.to_string(),
+                "mission_id": log.mission_id.to_string(),
+                "session_id": session_id.to_string(),
+                "workspace_id": workspace_id.map(ToString::to_string),
+                "sequence": sequence,
+                "kind": kind.as_str(),
+                "label": label_snapshot,
+                "checkpoint_count": log.checkpoints.len(),
+            }),
+        )
+        .with_context(EventContext {
+            workspace_id: workspace_id.cloned(),
+            session_id: Some(session_id.clone()),
+            mission_id: Some(mission_id.clone()),
+            task_id: Some(task_id.clone()),
+            ..EventContext::default()
+        }),
+    );
+    (payload.to_string(), ExecutionResultStatus::Succeeded)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

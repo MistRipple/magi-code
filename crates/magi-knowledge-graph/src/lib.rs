@@ -529,6 +529,127 @@ fn workspace_slug(workspace_root: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Tool entry：`kg_write` 工具执行体
+// ---------------------------------------------------------------------------
+
+/// S14 工具下沉：`kg_write` 完整执行体收口在本 crate。`store: None` 表示当前
+/// task 未绑定 workspace，直接失败。
+pub fn execute_kg_write_tool(
+    event_bus: &magi_event_bus::InMemoryEventBus,
+    store: Option<&KnowledgeGraphStore>,
+    session_id: &magi_core::SessionId,
+    workspace_id: Option<&magi_core::WorkspaceId>,
+    task_id: &magi_core::TaskId,
+    mission_id: &magi_core::MissionId,
+    arguments: &str,
+) -> (String, magi_core::ExecutionResultStatus) {
+    use magi_core::{EventId, ExecutionResultStatus, UtcMillis};
+    use magi_event_bus::{EventContext, EventEnvelope};
+    let Some(store) = store else {
+        return (
+            serde_json::json!({
+                "tool": "kg_write",
+                "status": "failed",
+                "error": "当前 task 未绑定 workspace，无法定位 mission knowledge graph",
+            })
+            .to_string(),
+            ExecutionResultStatus::Failed,
+        );
+    };
+    let args_value: serde_json::Value = match serde_json::from_str(arguments) {
+        Ok(v) => v,
+        Err(err) => {
+            return (
+                serde_json::json!({
+                    "tool": "kg_write",
+                    "status": "failed",
+                    "error": format!("arguments 非合法 JSON：{err}"),
+                })
+                .to_string(),
+                ExecutionResultStatus::Failed,
+            );
+        }
+    };
+    let args = match parse_kg_write_arguments(&args_value) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            return (
+                serde_json::json!({
+                    "tool": "kg_write",
+                    "status": "failed",
+                    "error": err.to_string(),
+                })
+                .to_string(),
+                ExecutionResultStatus::Failed,
+            );
+        }
+    };
+    let now = UtcMillis::now();
+    let mut graph = match store.load(mission_id) {
+        Ok(Some(existing)) => existing,
+        Ok(None) => KnowledgeGraph::new(mission_id.clone(), now),
+        Err(err) => {
+            return (
+                serde_json::json!({
+                    "tool": "kg_write",
+                    "status": "failed",
+                    "error": err.to_string(),
+                })
+                .to_string(),
+                ExecutionResultStatus::Failed,
+            );
+        }
+    };
+    let kind = args.kind;
+    let fact_id = args.id.clone();
+    let changed = apply_kg_update(&mut graph, args, now);
+    if let Err(err) = store.save(&graph) {
+        return (
+            serde_json::json!({
+                "tool": "kg_write",
+                "status": "failed",
+                "error": err.to_string(),
+            })
+            .to_string(),
+            ExecutionResultStatus::Failed,
+        );
+    }
+    let payload = serde_json::json!({
+        "tool": "kg_write",
+        "status": "succeeded",
+        "mission_id": graph.mission_id.to_string(),
+        "kind": kind.as_str(),
+        "id": fact_id.clone(),
+        "fact_count": graph.facts.len(),
+        "changed": changed,
+    });
+    let _ = event_bus.publish(
+        EventEnvelope::domain(
+            EventId::new(format!("event-kg-updated-{}", UtcMillis::now().0)),
+            "task.kg.updated",
+            serde_json::json!({
+                "task_id": task_id.to_string(),
+                "mission_id": graph.mission_id.to_string(),
+                "session_id": session_id.to_string(),
+                "workspace_id": workspace_id.map(ToString::to_string),
+                "kind": kind.as_str(),
+                "id": fact_id,
+                "changed": changed,
+                "fact_count": graph.facts.len(),
+            }),
+        )
+        .with_context(EventContext {
+            workspace_id: workspace_id.cloned(),
+            session_id: Some(session_id.clone()),
+            mission_id: Some(mission_id.clone()),
+            task_id: Some(task_id.clone()),
+            ..EventContext::default()
+        }),
+    );
+    (payload.to_string(), ExecutionResultStatus::Succeeded)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

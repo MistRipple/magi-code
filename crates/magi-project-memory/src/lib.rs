@@ -574,6 +574,135 @@ fn parse_entry(file_stem: &str, raw: &str) -> Result<MemoryEntry, ProjectMemoryE
 }
 
 // ---------------------------------------------------------------------------
+// Tool entry：`memory_write` 工具执行体
+// ---------------------------------------------------------------------------
+
+/// S10 工具下沉：把 `memory_write` 完整执行体收口在本 crate，task_llm_loop
+/// 不再持有该业务。`store: Option<...>` 仍由调用方按 workspace 绑定决定是否注入；
+/// 未绑定 workspace 时直接失败，避免静默丢弃记忆请求。
+pub fn execute_memory_write_tool(
+    event_bus: &magi_event_bus::InMemoryEventBus,
+    store: Option<&ProjectMemoryStore>,
+    session_id: &magi_core::SessionId,
+    workspace_id: Option<&magi_core::WorkspaceId>,
+    task_id: &magi_core::TaskId,
+    mission_id: &magi_core::MissionId,
+    arguments: &str,
+) -> (String, magi_core::ExecutionResultStatus) {
+    use magi_core::{EventId, ExecutionResultStatus, UtcMillis};
+    use magi_event_bus::{EventContext, EventEnvelope};
+    let Some(store) = store else {
+        return (
+            serde_json::json!({
+                "tool": "memory_write",
+                "status": "failed",
+                "error": "当前 task 未绑定 workspace，无法定位项目记忆目录",
+            })
+            .to_string(),
+            ExecutionResultStatus::Failed,
+        );
+    };
+    let parsed = match parse_memory_write_arguments(arguments) {
+        Ok(action) => action,
+        Err(err) => {
+            return (
+                serde_json::json!({
+                    "tool": "memory_write",
+                    "status": "failed",
+                    "error": err.to_string(),
+                })
+                .to_string(),
+                ExecutionResultStatus::Failed,
+            );
+        }
+    };
+    let (event_kind, payload, status) = match parsed {
+        MemoryWriteAction::Save(entry) => {
+            let file_stem = entry.file_stem.clone();
+            match store.save_entry(&entry) {
+                Ok(()) => (
+                    "save",
+                    serde_json::json!({
+                        "tool": "memory_write",
+                        "status": "succeeded",
+                        "action": "save",
+                        "file_stem": file_stem,
+                        "kind": entry.kind.as_str(),
+                    }),
+                    ExecutionResultStatus::Succeeded,
+                ),
+                Err(err) => (
+                    "save",
+                    serde_json::json!({
+                        "tool": "memory_write",
+                        "status": "failed",
+                        "action": "save",
+                        "file_stem": file_stem,
+                        "error": err.to_string(),
+                    }),
+                    ExecutionResultStatus::Failed,
+                ),
+            }
+        }
+        MemoryWriteAction::Delete { file_stem } => match store.delete_entry(&file_stem) {
+            Ok(true) => (
+                "delete",
+                serde_json::json!({
+                    "tool": "memory_write",
+                    "status": "succeeded",
+                    "action": "delete",
+                    "file_stem": file_stem,
+                }),
+                ExecutionResultStatus::Succeeded,
+            ),
+            Ok(false) => (
+                "delete",
+                serde_json::json!({
+                    "tool": "memory_write",
+                    "status": "succeeded",
+                    "action": "delete",
+                    "file_stem": file_stem,
+                    "note": "entry 不存在，已视为幂等删除",
+                }),
+                ExecutionResultStatus::Succeeded,
+            ),
+            Err(err) => (
+                "delete",
+                serde_json::json!({
+                    "tool": "memory_write",
+                    "status": "failed",
+                    "action": "delete",
+                    "file_stem": file_stem,
+                    "error": err.to_string(),
+                }),
+                ExecutionResultStatus::Failed,
+            ),
+        },
+    };
+    let _ = event_bus.publish(
+        EventEnvelope::domain(
+            EventId::new(format!("event-project-memory-updated-{}", UtcMillis::now().0)),
+            "task.project_memory.updated",
+            serde_json::json!({
+                "task_id": task_id.to_string(),
+                "session_id": session_id.to_string(),
+                "workspace_id": workspace_id.map(ToString::to_string),
+                "action": event_kind,
+                "result": payload,
+            }),
+        )
+        .with_context(EventContext {
+            workspace_id: workspace_id.cloned(),
+            session_id: Some(session_id.clone()),
+            mission_id: Some(mission_id.clone()),
+            task_id: Some(task_id.clone()),
+            ..EventContext::default()
+        }),
+    );
+    (payload.to_string(), status)
+}
+
+// ---------------------------------------------------------------------------
 // tests
 // ---------------------------------------------------------------------------
 

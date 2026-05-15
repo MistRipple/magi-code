@@ -525,6 +525,138 @@ fn dirs_home() -> Result<PathBuf, MissionCharterError> {
 }
 
 // ---------------------------------------------------------------------------
+// Tool entry：`mission_charter_write` 工具执行体
+// ---------------------------------------------------------------------------
+
+/// S11 工具下沉：把 `mission_charter_write` 完整执行体收口在本 crate。
+/// `store: None` 表示当前 task 未绑定 workspace，直接失败。首次写入必须同时
+/// 提供 title + goal，否则拒绝（避免半成品契约落盘）。
+pub fn execute_mission_charter_write_tool(
+    event_bus: &magi_event_bus::InMemoryEventBus,
+    store: Option<&MissionCharterStore>,
+    session_id: &magi_core::SessionId,
+    workspace_id: Option<&magi_core::WorkspaceId>,
+    task_id: &magi_core::TaskId,
+    mission_id: &magi_core::MissionId,
+    arguments: &str,
+) -> (String, magi_core::ExecutionResultStatus) {
+    use magi_core::{EventId, ExecutionResultStatus, UtcMillis};
+    use magi_event_bus::{EventContext, EventEnvelope};
+    let Some(store) = store else {
+        return (
+            serde_json::json!({
+                "tool": "mission_charter_write",
+                "status": "failed",
+                "error": "当前 task 未绑定 workspace，无法定位 mission charter 目录",
+            })
+            .to_string(),
+            ExecutionResultStatus::Failed,
+        );
+    };
+    let args_value: serde_json::Value = match serde_json::from_str(arguments) {
+        Ok(v) => v,
+        Err(err) => {
+            return (
+                serde_json::json!({
+                    "tool": "mission_charter_write",
+                    "status": "failed",
+                    "error": format!("arguments 非合法 JSON：{err}"),
+                })
+                .to_string(),
+                ExecutionResultStatus::Failed,
+            );
+        }
+    };
+    let args = match parse_mission_charter_write_arguments(&args_value) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            return (
+                serde_json::json!({
+                    "tool": "mission_charter_write",
+                    "status": "failed",
+                    "error": err.to_string(),
+                })
+                .to_string(),
+                ExecutionResultStatus::Failed,
+            );
+        }
+    };
+    let now = UtcMillis::now();
+    let mut charter = match store.load(mission_id) {
+        Ok(Some(existing)) => existing,
+        Ok(None) => {
+            let (Some(title), Some(goal)) = (args.title.clone(), args.goal.clone()) else {
+                return (
+                    serde_json::json!({
+                        "tool": "mission_charter_write",
+                        "status": "failed",
+                        "error": "首次创建 charter 必须同时提供 title 与 goal",
+                    })
+                    .to_string(),
+                    ExecutionResultStatus::Failed,
+                );
+            };
+            MissionCharter::new(mission_id.clone(), title, goal, now)
+        }
+        Err(err) => {
+            return (
+                serde_json::json!({
+                    "tool": "mission_charter_write",
+                    "status": "failed",
+                    "error": err.to_string(),
+                })
+                .to_string(),
+                ExecutionResultStatus::Failed,
+            );
+        }
+    };
+    let changed = apply_charter_update(&mut charter, args, now);
+    if let Err(err) = store.save(&charter) {
+        return (
+            serde_json::json!({
+                "tool": "mission_charter_write",
+                "status": "failed",
+                "error": err.to_string(),
+            })
+            .to_string(),
+            ExecutionResultStatus::Failed,
+        );
+    }
+    let payload = serde_json::json!({
+        "tool": "mission_charter_write",
+        "status": "succeeded",
+        "mission_id": charter.mission_id.to_string(),
+        "title": charter.title,
+        "changed": changed,
+    });
+    let _ = event_bus.publish(
+        EventEnvelope::domain(
+            EventId::new(format!(
+                "event-mission-charter-updated-{}",
+                UtcMillis::now().0
+            )),
+            "task.mission_charter.updated",
+            serde_json::json!({
+                "task_id": task_id.to_string(),
+                "mission_id": charter.mission_id.to_string(),
+                "session_id": session_id.to_string(),
+                "workspace_id": workspace_id.map(ToString::to_string),
+                "changed": changed,
+                "title": charter.title,
+            }),
+        )
+        .with_context(EventContext {
+            workspace_id: workspace_id.cloned(),
+            session_id: Some(session_id.clone()),
+            mission_id: Some(mission_id.clone()),
+            task_id: Some(task_id.clone()),
+            ..EventContext::default()
+        }),
+    );
+    (payload.to_string(), ExecutionResultStatus::Succeeded)
+}
+
+// ---------------------------------------------------------------------------
 // tests
 // ---------------------------------------------------------------------------
 

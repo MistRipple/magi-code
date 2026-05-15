@@ -269,6 +269,74 @@ pub enum TodoWriteError {
 }
 
 // ---------------------------------------------------------------------------
+// Tool entry：`todo_write` 工具执行体
+// ---------------------------------------------------------------------------
+
+/// S9 工具下沉：把 `todo_write` 的完整执行体收口在本 crate，task_llm_loop
+/// 不再持有这段业务（参考 02-migration-plan.md S9 合规自检"v2 新增：TodoLedger
+/// trait + 实现"，由 crate 自身承担实现）。
+///
+/// 入参与 `&magi_core::Task` 解耦：只透传 `task_id` / `mission_id`，避免 v1
+/// Task 类型在 v2 crate 内泄漏，为后续删除 magi-core/task.rs 让路。
+pub fn execute_todo_write_tool(
+    event_bus: &magi_event_bus::InMemoryEventBus,
+    ledger: &TodoLedger,
+    session_id: &SessionId,
+    workspace_id: Option<&magi_core::WorkspaceId>,
+    task_id: &magi_core::TaskId,
+    mission_id: &magi_core::MissionId,
+    arguments: &str,
+) -> (String, magi_core::ExecutionResultStatus) {
+    use magi_core::{EventId, ExecutionResultStatus, UtcMillis};
+    use magi_event_bus::{EventContext, EventEnvelope};
+    match parse_todo_write_arguments(arguments) {
+        Ok(items) => {
+            let stored = ledger.replace(items);
+            let snapshot_payload = serde_json::to_value(&stored).unwrap_or(serde_json::Value::Null);
+            let _ = event_bus.publish(
+                EventEnvelope::domain(
+                    EventId::new(format!("event-todo-ledger-updated-{}", UtcMillis::now().0)),
+                    "task.todo_ledger.updated",
+                    serde_json::json!({
+                        "task_id": task_id.to_string(),
+                        "session_id": session_id.to_string(),
+                        "workspace_id": workspace_id.map(ToString::to_string),
+                        "count": stored.len(),
+                        "todos": snapshot_payload,
+                    }),
+                )
+                .with_context(EventContext {
+                    workspace_id: workspace_id.cloned(),
+                    session_id: Some(session_id.clone()),
+                    mission_id: Some(mission_id.clone()),
+                    task_id: Some(task_id.clone()),
+                    ..EventContext::default()
+                }),
+            );
+            (
+                serde_json::json!({
+                    "tool": "todo_write",
+                    "status": "succeeded",
+                    "count": stored.len(),
+                    "todos": stored,
+                })
+                .to_string(),
+                ExecutionResultStatus::Succeeded,
+            )
+        }
+        Err(err) => (
+            serde_json::json!({
+                "tool": "todo_write",
+                "status": "failed",
+                "error": err.to_string(),
+            })
+            .to_string(),
+            ExecutionResultStatus::Failed,
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

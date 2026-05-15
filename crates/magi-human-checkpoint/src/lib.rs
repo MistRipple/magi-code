@@ -615,6 +615,140 @@ fn workspace_slug(workspace_root: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Orchestration tool entry：human_checkpoint_request
+// ---------------------------------------------------------------------------
+
+/// S17：`human_checkpoint_request` 工具实现。append-only 写入 mission 维度的
+/// `human_checkpoints.md`，状态为 Pending；resolve 由 operator 侧另起 API 调用。
+/// 入参与 `&magi_core::Task` 解耦，仅依赖 `task_id`/`mission_id`，
+/// 为后续删除 `magi-core::Task` 做准备。
+pub fn execute_human_checkpoint_request_tool(
+    event_bus: &magi_event_bus::InMemoryEventBus,
+    store: Option<&HumanCheckpointStore>,
+    session_id: &magi_core::SessionId,
+    workspace_id: Option<&magi_core::WorkspaceId>,
+    task_id: &magi_core::TaskId,
+    mission_id: &magi_core::MissionId,
+    arguments: &str,
+) -> (String, magi_core::ExecutionResultStatus) {
+    use magi_core::{EventId, ExecutionResultStatus, UtcMillis};
+    use magi_event_bus::{EventContext, EventEnvelope};
+
+    let Some(store) = store else {
+        return (
+            serde_json::json!({
+                "tool": "human_checkpoint_request",
+                "status": "failed",
+                "error": "当前 task 未绑定 workspace，无法定位 mission human_checkpoint store",
+            })
+            .to_string(),
+            ExecutionResultStatus::Failed,
+        );
+    };
+    let args_value: serde_json::Value = match serde_json::from_str(arguments) {
+        Ok(v) => v,
+        Err(err) => {
+            return (
+                serde_json::json!({
+                    "tool": "human_checkpoint_request",
+                    "status": "failed",
+                    "error": format!("arguments 非合法 JSON：{err}"),
+                })
+                .to_string(),
+                ExecutionResultStatus::Failed,
+            );
+        }
+    };
+    let args = match parse_human_checkpoint_request_arguments(&args_value) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            return (
+                serde_json::json!({
+                    "tool": "human_checkpoint_request",
+                    "status": "failed",
+                    "error": err.to_string(),
+                })
+                .to_string(),
+                ExecutionResultStatus::Failed,
+            );
+        }
+    };
+    let now = UtcMillis::now();
+    let mut log = match store.load(mission_id) {
+        Ok(Some(existing)) => existing,
+        Ok(None) => HumanCheckpointLog::new(mission_id.clone(), now),
+        Err(err) => {
+            return (
+                serde_json::json!({
+                    "tool": "human_checkpoint_request",
+                    "status": "failed",
+                    "error": err.to_string(),
+                })
+                .to_string(),
+                ExecutionResultStatus::Failed,
+            );
+        }
+    };
+    let plan_step_id_snapshot = args.plan_step_id.clone();
+    let prompt_snapshot = args.prompt_to_human.clone();
+    let label_snapshot = args.label.clone();
+    let sequence = append_human_checkpoint_request(&mut log, args, now);
+    if let Err(err) = store.save(&log) {
+        return (
+            serde_json::json!({
+                "tool": "human_checkpoint_request",
+                "status": "failed",
+                "error": err.to_string(),
+            })
+            .to_string(),
+            ExecutionResultStatus::Failed,
+        );
+    }
+    let pending_count = log
+        .entries
+        .iter()
+        .filter(|c| c.status.is_pending())
+        .count();
+    let payload = serde_json::json!({
+        "tool": "human_checkpoint_request",
+        "status": "succeeded",
+        "mission_id": log.mission_id.to_string(),
+        "sequence": sequence,
+        "plan_step_id": plan_step_id_snapshot,
+        "label": label_snapshot,
+        "pending_count": pending_count,
+    });
+    let _ = event_bus.publish(
+        EventEnvelope::domain(
+            EventId::new(format!(
+                "event-human-checkpoint-requested-{}",
+                UtcMillis::now().0
+            )),
+            "task.human_checkpoint.requested",
+            serde_json::json!({
+                "task_id": task_id.to_string(),
+                "mission_id": log.mission_id.to_string(),
+                "session_id": session_id.to_string(),
+                "workspace_id": workspace_id.map(ToString::to_string),
+                "sequence": sequence,
+                "plan_step_id": plan_step_id_snapshot,
+                "prompt_to_human": prompt_snapshot,
+                "label": label_snapshot,
+                "pending_count": pending_count,
+            }),
+        )
+        .with_context(EventContext {
+            workspace_id: workspace_id.cloned(),
+            session_id: Some(session_id.clone()),
+            mission_id: Some(mission_id.clone()),
+            task_id: Some(task_id.clone()),
+            ..EventContext::default()
+        }),
+    );
+    (payload.to_string(), ExecutionResultStatus::Succeeded)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

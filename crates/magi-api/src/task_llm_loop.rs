@@ -2310,898 +2310,6 @@ fn execute_coordinator_tool(
     }
 }
 
-/// S9：`todo_write` 工具拦截器。整体替换当前 session 的 TodoLedger，并把新快照
-/// 同步到事件总线，UI / 测试可以观察。
-fn execute_todo_write_tool(
-    event_bus: &InMemoryEventBus,
-    todo_ledger: &magi_todo_ledger::TodoLedger,
-    task: &magi_core::Task,
-    session_id: &SessionId,
-    workspace_id: &Option<WorkspaceId>,
-    tool_call: &ChatToolCall,
-) -> (String, ExecutionResultStatus) {
-    match magi_todo_ledger::parse_todo_write_arguments(&tool_call.function.arguments) {
-        Ok(items) => {
-            let stored = todo_ledger.replace(items);
-            let snapshot_payload = serde_json::to_value(&stored).unwrap_or(serde_json::Value::Null);
-            let _ = event_bus.publish(
-                EventEnvelope::domain(
-                    EventId::new(format!("event-todo-ledger-updated-{}", UtcMillis::now().0)),
-                    "task.todo_ledger.updated",
-                    serde_json::json!({
-                        "task_id": task.task_id.to_string(),
-                        "session_id": session_id.to_string(),
-                        "workspace_id": workspace_id.as_ref().map(ToString::to_string),
-                        "count": stored.len(),
-                        "todos": snapshot_payload,
-                    }),
-                )
-                .with_context(EventContext {
-                    workspace_id: workspace_id.clone(),
-                    session_id: Some(session_id.clone()),
-                    mission_id: Some(task.mission_id.clone()),
-                    task_id: Some(task.task_id.clone()),
-                    ..EventContext::default()
-                }),
-            );
-            (
-                serde_json::json!({
-                    "tool": "todo_write",
-                    "status": "succeeded",
-                    "count": stored.len(),
-                    "todos": stored,
-                })
-                .to_string(),
-                ExecutionResultStatus::Succeeded,
-            )
-        }
-        Err(err) => (
-            serde_json::json!({
-                "tool": "todo_write",
-                "status": "failed",
-                "error": err.to_string(),
-            })
-            .to_string(),
-            ExecutionResultStatus::Failed,
-        ),
-    }
-}
-
-/// S10：`memory_write` 工具拦截器。把保存/删除请求落地到 workspace 的
-/// `~/.magi/projects/{slug}/memory/` 目录，同时把变更事件发到 bus 供 UI 订阅。
-/// 当前 task 未绑定 workspace 时直接失败，避免静默丢弃记忆请求。
-fn execute_memory_write_tool(
-    event_bus: &InMemoryEventBus,
-    project_memory: Option<&magi_project_memory::ProjectMemoryStore>,
-    task: &magi_core::Task,
-    session_id: &SessionId,
-    workspace_id: &Option<WorkspaceId>,
-    tool_call: &ChatToolCall,
-) -> (String, ExecutionResultStatus) {
-    let Some(store) = project_memory else {
-        return (
-            serde_json::json!({
-                "tool": "memory_write",
-                "status": "failed",
-                "error": "当前 task 未绑定 workspace，无法定位项目记忆目录",
-            })
-            .to_string(),
-            ExecutionResultStatus::Failed,
-        );
-    };
-    let parsed = match magi_project_memory::parse_memory_write_arguments(
-        &tool_call.function.arguments,
-    ) {
-        Ok(action) => action,
-        Err(err) => {
-            return (
-                serde_json::json!({
-                    "tool": "memory_write",
-                    "status": "failed",
-                    "error": err.to_string(),
-                })
-                .to_string(),
-                ExecutionResultStatus::Failed,
-            );
-        }
-    };
-    let (event_kind, payload, status) = match parsed {
-        magi_project_memory::MemoryWriteAction::Save(entry) => {
-            let file_stem = entry.file_stem.clone();
-            match store.save_entry(&entry) {
-                Ok(()) => (
-                    "save",
-                    serde_json::json!({
-                        "tool": "memory_write",
-                        "status": "succeeded",
-                        "action": "save",
-                        "file_stem": file_stem,
-                        "kind": entry.kind.as_str(),
-                    }),
-                    ExecutionResultStatus::Succeeded,
-                ),
-                Err(err) => (
-                    "save",
-                    serde_json::json!({
-                        "tool": "memory_write",
-                        "status": "failed",
-                        "action": "save",
-                        "file_stem": file_stem,
-                        "error": err.to_string(),
-                    }),
-                    ExecutionResultStatus::Failed,
-                ),
-            }
-        }
-        magi_project_memory::MemoryWriteAction::Delete { file_stem } => {
-            match store.delete_entry(&file_stem) {
-                Ok(true) => (
-                    "delete",
-                    serde_json::json!({
-                        "tool": "memory_write",
-                        "status": "succeeded",
-                        "action": "delete",
-                        "file_stem": file_stem,
-                    }),
-                    ExecutionResultStatus::Succeeded,
-                ),
-                Ok(false) => (
-                    "delete",
-                    serde_json::json!({
-                        "tool": "memory_write",
-                        "status": "succeeded",
-                        "action": "delete",
-                        "file_stem": file_stem,
-                        "note": "entry 不存在，已视为幂等删除",
-                    }),
-                    ExecutionResultStatus::Succeeded,
-                ),
-                Err(err) => (
-                    "delete",
-                    serde_json::json!({
-                        "tool": "memory_write",
-                        "status": "failed",
-                        "action": "delete",
-                        "file_stem": file_stem,
-                        "error": err.to_string(),
-                    }),
-                    ExecutionResultStatus::Failed,
-                ),
-            }
-        }
-    };
-    let _ = event_bus.publish(
-        EventEnvelope::domain(
-            EventId::new(format!("event-project-memory-updated-{}", UtcMillis::now().0)),
-            "task.project_memory.updated",
-            serde_json::json!({
-                "task_id": task.task_id.to_string(),
-                "session_id": session_id.to_string(),
-                "workspace_id": workspace_id.as_ref().map(ToString::to_string),
-                "action": event_kind,
-                "result": payload,
-            }),
-        )
-        .with_context(EventContext {
-            workspace_id: workspace_id.clone(),
-            session_id: Some(session_id.clone()),
-            mission_id: Some(task.mission_id.clone()),
-            task_id: Some(task.task_id.clone()),
-            ..EventContext::default()
-        }),
-    );
-    (payload.to_string(), status)
-}
-
-fn execute_mission_charter_write_tool(
-    event_bus: &InMemoryEventBus,
-    mission_charter: Option<&magi_mission_charter::MissionCharterStore>,
-    task: &magi_core::Task,
-    session_id: &SessionId,
-    workspace_id: &Option<WorkspaceId>,
-    tool_call: &ChatToolCall,
-) -> (String, ExecutionResultStatus) {
-    let Some(store) = mission_charter else {
-        return (
-            serde_json::json!({
-                "tool": "mission_charter_write",
-                "status": "failed",
-                "error": "当前 task 未绑定 workspace，无法定位 mission charter 目录",
-            })
-            .to_string(),
-            ExecutionResultStatus::Failed,
-        );
-    };
-    let args_value: serde_json::Value = match serde_json::from_str(&tool_call.function.arguments) {
-        Ok(v) => v,
-        Err(err) => {
-            return (
-                serde_json::json!({
-                    "tool": "mission_charter_write",
-                    "status": "failed",
-                    "error": format!("arguments 非合法 JSON：{err}"),
-                })
-                .to_string(),
-                ExecutionResultStatus::Failed,
-            );
-        }
-    };
-    let args = match magi_mission_charter::parse_mission_charter_write_arguments(&args_value) {
-        Ok(parsed) => parsed,
-        Err(err) => {
-            return (
-                serde_json::json!({
-                    "tool": "mission_charter_write",
-                    "status": "failed",
-                    "error": err.to_string(),
-                })
-                .to_string(),
-                ExecutionResultStatus::Failed,
-            );
-        }
-    };
-    let now = magi_core::UtcMillis::now();
-    let mut charter = match store.load(&task.mission_id) {
-        Ok(Some(existing)) => existing,
-        Ok(None) => {
-            // 首次写入需要 title + goal 才能构造合法 charter；缺一即拒，避免半成品契约落盘。
-            let (Some(title), Some(goal)) = (args.title.clone(), args.goal.clone()) else {
-                return (
-                    serde_json::json!({
-                        "tool": "mission_charter_write",
-                        "status": "failed",
-                        "error": "首次创建 charter 必须同时提供 title 与 goal",
-                    })
-                    .to_string(),
-                    ExecutionResultStatus::Failed,
-                );
-            };
-            magi_mission_charter::MissionCharter::new(task.mission_id.clone(), title, goal, now)
-        }
-        Err(err) => {
-            return (
-                serde_json::json!({
-                    "tool": "mission_charter_write",
-                    "status": "failed",
-                    "error": err.to_string(),
-                })
-                .to_string(),
-                ExecutionResultStatus::Failed,
-            );
-        }
-    };
-    let changed = magi_mission_charter::apply_charter_update(&mut charter, args, now);
-    if let Err(err) = store.save(&charter) {
-        return (
-            serde_json::json!({
-                "tool": "mission_charter_write",
-                "status": "failed",
-                "error": err.to_string(),
-            })
-            .to_string(),
-            ExecutionResultStatus::Failed,
-        );
-    }
-    let payload = serde_json::json!({
-        "tool": "mission_charter_write",
-        "status": "succeeded",
-        "mission_id": charter.mission_id.to_string(),
-        "title": charter.title,
-        "changed": changed,
-    });
-    let _ = event_bus.publish(
-        EventEnvelope::domain(
-            EventId::new(format!(
-                "event-mission-charter-updated-{}",
-                UtcMillis::now().0
-            )),
-            "task.mission_charter.updated",
-            serde_json::json!({
-                "task_id": task.task_id.to_string(),
-                "mission_id": charter.mission_id.to_string(),
-                "session_id": session_id.to_string(),
-                "workspace_id": workspace_id.as_ref().map(ToString::to_string),
-                "changed": changed,
-                "title": charter.title,
-            }),
-        )
-        .with_context(EventContext {
-            workspace_id: workspace_id.clone(),
-            session_id: Some(session_id.clone()),
-            mission_id: Some(task.mission_id.clone()),
-            task_id: Some(task.task_id.clone()),
-            ..EventContext::default()
-        }),
-    );
-    (payload.to_string(), ExecutionResultStatus::Succeeded)
-}
-
-fn execute_plan_write_tool(
-    event_bus: &InMemoryEventBus,
-    plan: Option<&magi_plan::PlanStore>,
-    task: &magi_core::Task,
-    session_id: &SessionId,
-    workspace_id: &Option<WorkspaceId>,
-    tool_call: &ChatToolCall,
-) -> (String, ExecutionResultStatus) {
-    let Some(store) = plan else {
-        return (
-            serde_json::json!({
-                "tool": "plan_write",
-                "status": "failed",
-                "error": "当前 task 未绑定 workspace，无法定位 mission plan 目录",
-            })
-            .to_string(),
-            ExecutionResultStatus::Failed,
-        );
-    };
-    let args_value: serde_json::Value = match serde_json::from_str(&tool_call.function.arguments) {
-        Ok(v) => v,
-        Err(err) => {
-            return (
-                serde_json::json!({
-                    "tool": "plan_write",
-                    "status": "failed",
-                    "error": format!("arguments 非合法 JSON：{err}"),
-                })
-                .to_string(),
-                ExecutionResultStatus::Failed,
-            );
-        }
-    };
-    let args = match magi_plan::parse_plan_write_arguments(&args_value) {
-        Ok(parsed) => parsed,
-        Err(err) => {
-            return (
-                serde_json::json!({
-                    "tool": "plan_write",
-                    "status": "failed",
-                    "error": err.to_string(),
-                })
-                .to_string(),
-                ExecutionResultStatus::Failed,
-            );
-        }
-    };
-    let now = magi_core::UtcMillis::now();
-    let mut plan_doc = match store.load(&task.mission_id) {
-        Ok(Some(existing)) => existing,
-        Ok(None) => magi_plan::Plan::new(task.mission_id.clone(), now),
-        Err(err) => {
-            return (
-                serde_json::json!({
-                    "tool": "plan_write",
-                    "status": "failed",
-                    "error": err.to_string(),
-                })
-                .to_string(),
-                ExecutionResultStatus::Failed,
-            );
-        }
-    };
-    let changed = magi_plan::apply_plan_update(&mut plan_doc, args, now);
-    if let Err(err) = store.save(&plan_doc) {
-        return (
-            serde_json::json!({
-                "tool": "plan_write",
-                "status": "failed",
-                "error": err.to_string(),
-            })
-            .to_string(),
-            ExecutionResultStatus::Failed,
-        );
-    }
-    let payload = serde_json::json!({
-        "tool": "plan_write",
-        "status": "succeeded",
-        "mission_id": plan_doc.mission_id.to_string(),
-        "step_count": plan_doc.steps.len(),
-        "changed": changed,
-    });
-    let _ = event_bus.publish(
-        EventEnvelope::domain(
-            EventId::new(format!("event-plan-updated-{}", UtcMillis::now().0)),
-            "task.plan.updated",
-            serde_json::json!({
-                "task_id": task.task_id.to_string(),
-                "mission_id": plan_doc.mission_id.to_string(),
-                "session_id": session_id.to_string(),
-                "workspace_id": workspace_id.as_ref().map(ToString::to_string),
-                "changed": changed,
-                "step_count": plan_doc.steps.len(),
-            }),
-        )
-        .with_context(EventContext {
-            workspace_id: workspace_id.clone(),
-            session_id: Some(session_id.clone()),
-            mission_id: Some(task.mission_id.clone()),
-            task_id: Some(task.task_id.clone()),
-            ..EventContext::default()
-        }),
-    );
-    (payload.to_string(), ExecutionResultStatus::Succeeded)
-}
-
-fn execute_kg_write_tool(
-    event_bus: &InMemoryEventBus,
-    knowledge_graph: Option<&magi_knowledge_graph::KnowledgeGraphStore>,
-    task: &magi_core::Task,
-    session_id: &SessionId,
-    workspace_id: &Option<WorkspaceId>,
-    tool_call: &ChatToolCall,
-) -> (String, ExecutionResultStatus) {
-    let Some(store) = knowledge_graph else {
-        return (
-            serde_json::json!({
-                "tool": "kg_write",
-                "status": "failed",
-                "error": "当前 task 未绑定 workspace，无法定位 mission knowledge graph",
-            })
-            .to_string(),
-            ExecutionResultStatus::Failed,
-        );
-    };
-    let args_value: serde_json::Value = match serde_json::from_str(&tool_call.function.arguments) {
-        Ok(v) => v,
-        Err(err) => {
-            return (
-                serde_json::json!({
-                    "tool": "kg_write",
-                    "status": "failed",
-                    "error": format!("arguments 非合法 JSON：{err}"),
-                })
-                .to_string(),
-                ExecutionResultStatus::Failed,
-            );
-        }
-    };
-    let args = match magi_knowledge_graph::parse_kg_write_arguments(&args_value) {
-        Ok(parsed) => parsed,
-        Err(err) => {
-            return (
-                serde_json::json!({
-                    "tool": "kg_write",
-                    "status": "failed",
-                    "error": err.to_string(),
-                })
-                .to_string(),
-                ExecutionResultStatus::Failed,
-            );
-        }
-    };
-    let now = magi_core::UtcMillis::now();
-    let mut graph = match store.load(&task.mission_id) {
-        Ok(Some(existing)) => existing,
-        Ok(None) => magi_knowledge_graph::KnowledgeGraph::new(task.mission_id.clone(), now),
-        Err(err) => {
-            return (
-                serde_json::json!({
-                    "tool": "kg_write",
-                    "status": "failed",
-                    "error": err.to_string(),
-                })
-                .to_string(),
-                ExecutionResultStatus::Failed,
-            );
-        }
-    };
-    let kind = args.kind;
-    let fact_id = args.id.clone();
-    let changed = magi_knowledge_graph::apply_kg_update(&mut graph, args, now);
-    if let Err(err) = store.save(&graph) {
-        return (
-            serde_json::json!({
-                "tool": "kg_write",
-                "status": "failed",
-                "error": err.to_string(),
-            })
-            .to_string(),
-            ExecutionResultStatus::Failed,
-        );
-    }
-    let payload = serde_json::json!({
-        "tool": "kg_write",
-        "status": "succeeded",
-        "mission_id": graph.mission_id.to_string(),
-        "kind": kind.as_str(),
-        "id": fact_id.clone(),
-        "fact_count": graph.facts.len(),
-        "changed": changed,
-    });
-    let _ = event_bus.publish(
-        EventEnvelope::domain(
-            EventId::new(format!("event-kg-updated-{}", UtcMillis::now().0)),
-            "task.kg.updated",
-            serde_json::json!({
-                "task_id": task.task_id.to_string(),
-                "mission_id": graph.mission_id.to_string(),
-                "session_id": session_id.to_string(),
-                "workspace_id": workspace_id.as_ref().map(ToString::to_string),
-                "kind": kind.as_str(),
-                "id": fact_id,
-                "changed": changed,
-                "fact_count": graph.facts.len(),
-            }),
-        )
-        .with_context(EventContext {
-            workspace_id: workspace_id.clone(),
-            session_id: Some(session_id.clone()),
-            mission_id: Some(task.mission_id.clone()),
-            task_id: Some(task.task_id.clone()),
-            ..EventContext::default()
-        }),
-    );
-    (payload.to_string(), ExecutionResultStatus::Succeeded)
-}
-
-/// S15：`validation_record` 工具实现。把一次验证（test_suite / type_check /
-/// integration_smoke / benchmark）的 pass/fail/skipped 结果写入 mission 维度的
-/// `validation.md`。`(plan_step_id, kind)` 唯一，重复写入按 upsert 处理并 bump version。
-fn execute_validation_record_tool(
-    event_bus: &InMemoryEventBus,
-    validation_runner: Option<&magi_validation_runner::ValidationStore>,
-    task: &magi_core::Task,
-    session_id: &SessionId,
-    workspace_id: &Option<WorkspaceId>,
-    tool_call: &ChatToolCall,
-) -> (String, ExecutionResultStatus) {
-    let Some(store) = validation_runner else {
-        return (
-            serde_json::json!({
-                "tool": "validation_record",
-                "status": "failed",
-                "error": "当前 task 未绑定 workspace，无法定位 mission validation runner",
-            })
-            .to_string(),
-            ExecutionResultStatus::Failed,
-        );
-    };
-    let args_value: serde_json::Value = match serde_json::from_str(&tool_call.function.arguments) {
-        Ok(v) => v,
-        Err(err) => {
-            return (
-                serde_json::json!({
-                    "tool": "validation_record",
-                    "status": "failed",
-                    "error": format!("arguments 非合法 JSON：{err}"),
-                })
-                .to_string(),
-                ExecutionResultStatus::Failed,
-            );
-        }
-    };
-    let args = match magi_validation_runner::parse_validation_record_arguments(&args_value) {
-        Ok(parsed) => parsed,
-        Err(err) => {
-            return (
-                serde_json::json!({
-                    "tool": "validation_record",
-                    "status": "failed",
-                    "error": err.to_string(),
-                })
-                .to_string(),
-                ExecutionResultStatus::Failed,
-            );
-        }
-    };
-    let now = magi_core::UtcMillis::now();
-    let mut report = match store.load(&task.mission_id) {
-        Ok(Some(existing)) => existing,
-        Ok(None) => magi_validation_runner::ValidationReport::new(task.mission_id.clone(), now),
-        Err(err) => {
-            return (
-                serde_json::json!({
-                    "tool": "validation_record",
-                    "status": "failed",
-                    "error": err.to_string(),
-                })
-                .to_string(),
-                ExecutionResultStatus::Failed,
-            );
-        }
-    };
-    let plan_step_id = args.plan_step_id.clone();
-    let kind = args.kind;
-    let outcome = args.outcome;
-    let changed = magi_validation_runner::apply_validation_record(&mut report, args, now);
-    if let Err(err) = store.save(&report) {
-        return (
-            serde_json::json!({
-                "tool": "validation_record",
-                "status": "failed",
-                "error": err.to_string(),
-            })
-            .to_string(),
-            ExecutionResultStatus::Failed,
-        );
-    }
-    let step_passing = report.step_is_passing(&plan_step_id);
-    let payload = serde_json::json!({
-        "tool": "validation_record",
-        "status": "succeeded",
-        "mission_id": report.mission_id.to_string(),
-        "plan_step_id": plan_step_id,
-        "kind": kind.as_str(),
-        "outcome": outcome.as_str(),
-        "record_count": report.records.len(),
-        "changed": changed,
-        "step_is_passing": step_passing,
-    });
-    let _ = event_bus.publish(
-        EventEnvelope::domain(
-            EventId::new(format!(
-                "event-validation-updated-{}",
-                UtcMillis::now().0
-            )),
-            "task.validation.updated",
-            serde_json::json!({
-                "task_id": task.task_id.to_string(),
-                "mission_id": report.mission_id.to_string(),
-                "session_id": session_id.to_string(),
-                "workspace_id": workspace_id.as_ref().map(ToString::to_string),
-                "plan_step_id": plan_step_id,
-                "kind": kind.as_str(),
-                "outcome": outcome.as_str(),
-                "changed": changed,
-                "step_is_passing": step_passing,
-                "record_count": report.records.len(),
-            }),
-        )
-        .with_context(EventContext {
-            workspace_id: workspace_id.clone(),
-            session_id: Some(session_id.clone()),
-            mission_id: Some(task.mission_id.clone()),
-            task_id: Some(task.task_id.clone()),
-            ..EventContext::default()
-        }),
-    );
-    (payload.to_string(), ExecutionResultStatus::Succeeded)
-}
-
-/// S16：`checkpoint_create` 工具实现。把一次 mission 级检查点（process_restart /
-/// context_compaction / phase_transition / manual）append 到 mission 维度的
-/// `checkpoints.md`。语义为 append-only：sequence 单调递增，不允许修改或删除历史记录。
-fn execute_checkpoint_create_tool(
-    event_bus: &InMemoryEventBus,
-    checkpoint: Option<&magi_checkpoint::CheckpointStore>,
-    task: &magi_core::Task,
-    session_id: &SessionId,
-    workspace_id: &Option<WorkspaceId>,
-    tool_call: &ChatToolCall,
-) -> (String, ExecutionResultStatus) {
-    let Some(store) = checkpoint else {
-        return (
-            serde_json::json!({
-                "tool": "checkpoint_create",
-                "status": "failed",
-                "error": "当前 task 未绑定 workspace，无法定位 mission checkpoint store",
-            })
-            .to_string(),
-            ExecutionResultStatus::Failed,
-        );
-    };
-    let args_value: serde_json::Value = match serde_json::from_str(&tool_call.function.arguments) {
-        Ok(v) => v,
-        Err(err) => {
-            return (
-                serde_json::json!({
-                    "tool": "checkpoint_create",
-                    "status": "failed",
-                    "error": format!("arguments 非合法 JSON：{err}"),
-                })
-                .to_string(),
-                ExecutionResultStatus::Failed,
-            );
-        }
-    };
-    let args = match magi_checkpoint::parse_checkpoint_create_arguments(&args_value) {
-        Ok(parsed) => parsed,
-        Err(err) => {
-            return (
-                serde_json::json!({
-                    "tool": "checkpoint_create",
-                    "status": "failed",
-                    "error": err.to_string(),
-                })
-                .to_string(),
-                ExecutionResultStatus::Failed,
-            );
-        }
-    };
-    let now = magi_core::UtcMillis::now();
-    let mut log = match store.load(&task.mission_id) {
-        Ok(Some(existing)) => existing,
-        Ok(None) => magi_checkpoint::CheckpointLog::new(task.mission_id.clone(), now),
-        Err(err) => {
-            return (
-                serde_json::json!({
-                    "tool": "checkpoint_create",
-                    "status": "failed",
-                    "error": err.to_string(),
-                })
-                .to_string(),
-                ExecutionResultStatus::Failed,
-            );
-        }
-    };
-    let kind = args.kind;
-    let label_snapshot = args.label.clone();
-    let sequence = magi_checkpoint::append_checkpoint(&mut log, args, now);
-    if let Err(err) = store.save(&log) {
-        return (
-            serde_json::json!({
-                "tool": "checkpoint_create",
-                "status": "failed",
-                "error": err.to_string(),
-            })
-            .to_string(),
-            ExecutionResultStatus::Failed,
-        );
-    }
-    let payload = serde_json::json!({
-        "tool": "checkpoint_create",
-        "status": "succeeded",
-        "mission_id": log.mission_id.to_string(),
-        "sequence": sequence,
-        "kind": kind.as_str(),
-        "label": label_snapshot,
-        "checkpoint_count": log.checkpoints.len(),
-    });
-    let _ = event_bus.publish(
-        EventEnvelope::domain(
-            EventId::new(format!(
-                "event-checkpoint-appended-{}",
-                UtcMillis::now().0
-            )),
-            "task.checkpoint.appended",
-            serde_json::json!({
-                "task_id": task.task_id.to_string(),
-                "mission_id": log.mission_id.to_string(),
-                "session_id": session_id.to_string(),
-                "workspace_id": workspace_id.as_ref().map(ToString::to_string),
-                "sequence": sequence,
-                "kind": kind.as_str(),
-                "label": label_snapshot,
-                "checkpoint_count": log.checkpoints.len(),
-            }),
-        )
-        .with_context(EventContext {
-            workspace_id: workspace_id.clone(),
-            session_id: Some(session_id.clone()),
-            mission_id: Some(task.mission_id.clone()),
-            task_id: Some(task.task_id.clone()),
-            ..EventContext::default()
-        }),
-    );
-    (payload.to_string(), ExecutionResultStatus::Succeeded)
-}
-
-/// S17：`human_checkpoint_request` 工具实现。把 orchestrator 申请的人工审核点写入
-/// mission 维度的 `human_checkpoints.md`，记录为 Pending 状态；resolve 由 operator
-/// 侧另起 API 调用，不在本工具流程内。pending 项在 prompt 注入时会强制 Coordinator
-/// 停止派发新工作，直到 operator approve / reject。
-fn execute_human_checkpoint_request_tool(
-    event_bus: &InMemoryEventBus,
-    human_checkpoint: Option<&magi_human_checkpoint::HumanCheckpointStore>,
-    task: &magi_core::Task,
-    session_id: &SessionId,
-    workspace_id: &Option<WorkspaceId>,
-    tool_call: &ChatToolCall,
-) -> (String, ExecutionResultStatus) {
-    let Some(store) = human_checkpoint else {
-        return (
-            serde_json::json!({
-                "tool": "human_checkpoint_request",
-                "status": "failed",
-                "error": "当前 task 未绑定 workspace，无法定位 mission human_checkpoint store",
-            })
-            .to_string(),
-            ExecutionResultStatus::Failed,
-        );
-    };
-    let args_value: serde_json::Value = match serde_json::from_str(&tool_call.function.arguments) {
-        Ok(v) => v,
-        Err(err) => {
-            return (
-                serde_json::json!({
-                    "tool": "human_checkpoint_request",
-                    "status": "failed",
-                    "error": format!("arguments 非合法 JSON：{err}"),
-                })
-                .to_string(),
-                ExecutionResultStatus::Failed,
-            );
-        }
-    };
-    let args = match magi_human_checkpoint::parse_human_checkpoint_request_arguments(&args_value) {
-        Ok(parsed) => parsed,
-        Err(err) => {
-            return (
-                serde_json::json!({
-                    "tool": "human_checkpoint_request",
-                    "status": "failed",
-                    "error": err.to_string(),
-                })
-                .to_string(),
-                ExecutionResultStatus::Failed,
-            );
-        }
-    };
-    let now = magi_core::UtcMillis::now();
-    let mut log = match store.load(&task.mission_id) {
-        Ok(Some(existing)) => existing,
-        Ok(None) => magi_human_checkpoint::HumanCheckpointLog::new(task.mission_id.clone(), now),
-        Err(err) => {
-            return (
-                serde_json::json!({
-                    "tool": "human_checkpoint_request",
-                    "status": "failed",
-                    "error": err.to_string(),
-                })
-                .to_string(),
-                ExecutionResultStatus::Failed,
-            );
-        }
-    };
-    let plan_step_id_snapshot = args.plan_step_id.clone();
-    let prompt_snapshot = args.prompt_to_human.clone();
-    let label_snapshot = args.label.clone();
-    let sequence = magi_human_checkpoint::append_human_checkpoint_request(&mut log, args, now);
-    if let Err(err) = store.save(&log) {
-        return (
-            serde_json::json!({
-                "tool": "human_checkpoint_request",
-                "status": "failed",
-                "error": err.to_string(),
-            })
-            .to_string(),
-            ExecutionResultStatus::Failed,
-        );
-    }
-    let pending_count = log
-        .entries
-        .iter()
-        .filter(|c| c.status.is_pending())
-        .count();
-    let payload = serde_json::json!({
-        "tool": "human_checkpoint_request",
-        "status": "succeeded",
-        "mission_id": log.mission_id.to_string(),
-        "sequence": sequence,
-        "plan_step_id": plan_step_id_snapshot,
-        "label": label_snapshot,
-        "pending_count": pending_count,
-    });
-    let _ = event_bus.publish(
-        EventEnvelope::domain(
-            EventId::new(format!(
-                "event-human-checkpoint-requested-{}",
-                UtcMillis::now().0
-            )),
-            "task.human_checkpoint.requested",
-            serde_json::json!({
-                "task_id": task.task_id.to_string(),
-                "mission_id": log.mission_id.to_string(),
-                "session_id": session_id.to_string(),
-                "workspace_id": workspace_id.as_ref().map(ToString::to_string),
-                "sequence": sequence,
-                "plan_step_id": plan_step_id_snapshot,
-                "prompt_to_human": prompt_snapshot,
-                "label": label_snapshot,
-                "pending_count": pending_count,
-            }),
-        )
-        .with_context(EventContext {
-            workspace_id: workspace_id.clone(),
-            session_id: Some(session_id.clone()),
-            mission_id: Some(task.mission_id.clone()),
-            task_id: Some(task.task_id.clone()),
-            ..EventContext::default()
-        }),
-    );
-    (payload.to_string(), ExecutionResultStatus::Succeeded)
-}
-
 fn execute_task_tool_call(
     event_bus: &InMemoryEventBus,
     tool_registry: Option<&ToolRegistry>,
@@ -3251,76 +2359,83 @@ fn execute_task_tool_call(
             );
         }
         if matches!(canonical, magi_tool_runtime::BuiltinToolName::TodoWrite) {
-            return execute_todo_write_tool(
+            return magi_todo_ledger::execute_todo_write_tool(
                 event_bus,
                 todo_ledger,
-                task,
                 session_id,
-                workspace_id,
-                tool_call,
+                workspace_id.as_ref(),
+                &task.task_id,
+                &task.mission_id,
+                &tool_call.function.arguments,
             );
         }
         if matches!(canonical, magi_tool_runtime::BuiltinToolName::MemoryWrite) {
-            return execute_memory_write_tool(
+            return magi_project_memory::execute_memory_write_tool(
                 event_bus,
                 project_memory,
-                task,
                 session_id,
-                workspace_id,
-                tool_call,
+                workspace_id.as_ref(),
+                &task.task_id,
+                &task.mission_id,
+                &tool_call.function.arguments,
             );
         }
         if matches!(canonical, magi_tool_runtime::BuiltinToolName::MissionCharterWrite) {
-            return execute_mission_charter_write_tool(
+            return magi_mission_charter::execute_mission_charter_write_tool(
                 event_bus,
                 mission_charter,
-                task,
                 session_id,
-                workspace_id,
-                tool_call,
+                workspace_id.as_ref(),
+                &task.task_id,
+                &task.mission_id,
+                &tool_call.function.arguments,
             );
         }
         if matches!(canonical, magi_tool_runtime::BuiltinToolName::PlanWrite) {
-            return execute_plan_write_tool(
+            return magi_plan::execute_plan_write_tool(
                 event_bus,
                 plan,
-                task,
                 session_id,
-                workspace_id,
-                tool_call,
+                workspace_id.as_ref(),
+                &task.task_id,
+                &task.mission_id,
+                &tool_call.function.arguments,
             );
         }
         // S14：KgWrite 同样在此层拦截，因为它要操作 mission 维度的 KnowledgeGraphStore。
         if matches!(canonical, magi_tool_runtime::BuiltinToolName::KgWrite) {
-            return execute_kg_write_tool(
+            return magi_knowledge_graph::execute_kg_write_tool(
                 event_bus,
                 knowledge_graph,
-                task,
                 session_id,
-                workspace_id,
-                tool_call,
+                workspace_id.as_ref(),
+                &task.task_id,
+                &task.mission_id,
+                &tool_call.function.arguments,
             );
         }
         // S15：ValidationRecord 同样在此层拦截，因为它要操作 mission 维度的 ValidationStore。
         if matches!(canonical, magi_tool_runtime::BuiltinToolName::ValidationRecord) {
-            return execute_validation_record_tool(
+            return magi_validation_runner::execute_validation_record_tool(
                 event_bus,
                 validation_runner,
-                task,
                 session_id,
-                workspace_id,
-                tool_call,
+                workspace_id.as_ref(),
+                &task.task_id,
+                &task.mission_id,
+                &tool_call.function.arguments,
             );
         }
         // S16：Checkpoint 同样在此层拦截，因为它要操作 mission 维度的 CheckpointStore。
         if matches!(canonical, magi_tool_runtime::BuiltinToolName::Checkpoint) {
-            return execute_checkpoint_create_tool(
+            return magi_checkpoint::execute_checkpoint_create_tool(
                 event_bus,
                 checkpoint,
-                task,
                 session_id,
-                workspace_id,
-                tool_call,
+                workspace_id.as_ref(),
+                &task.task_id,
+                &task.mission_id,
+                &tool_call.function.arguments,
             );
         }
         // S17：HumanCheckpointRequest 同样在此层拦截，因为它要操作 mission 维度的
@@ -3329,13 +2444,14 @@ fn execute_task_tool_call(
             canonical,
             magi_tool_runtime::BuiltinToolName::HumanCheckpointRequest
         ) {
-            return execute_human_checkpoint_request_tool(
+            return magi_human_checkpoint::execute_human_checkpoint_request_tool(
                 event_bus,
                 human_checkpoint,
-                task,
                 session_id,
-                workspace_id,
-                tool_call,
+                workspace_id.as_ref(),
+                &task.task_id,
+                &task.mission_id,
+                &tool_call.function.arguments,
             );
         }
     }

@@ -1000,6 +1000,7 @@ name = "magi-checkpoint"
 version = "0.1.0"
 dependencies = [
  "magi-core",
+ "magi-event-bus",
  "serde",
  "serde_json",
  "tempfile",
@@ -1101,6 +1102,7 @@ name = "magi-human-checkpoint"
 version = "0.1.0"
 dependencies = [
  "magi-core",
+ "magi-event-bus",
  "serde",
  "serde_json",
  "tempfile",
@@ -1113,6 +1115,7 @@ name = "magi-knowledge-graph"
 version = "0.1.0"
 dependencies = [
  "magi-core",
+ "magi-event-bus",
  "serde",
  "serde_json",
  "tempfile",
@@ -1144,6 +1147,7 @@ name = "magi-mission-charter"
 version = "0.1.0"
 dependencies = [
  "magi-core",
+ "magi-event-bus",
  "serde",
  "serde_json",
  "tempfile",
@@ -1202,6 +1206,7 @@ name = "magi-plan"
 version = "0.1.0"
 dependencies = [
  "magi-core",
+ "magi-event-bus",
  "serde",
  "serde_json",
  "tempfile",
@@ -1215,6 +1220,7 @@ version = "0.1.0"
 dependencies = [
  "dirs",
  "magi-core",
+ "magi-event-bus",
  "serde",
  "serde_json",
  "tempfile",
@@ -1282,6 +1288,7 @@ name = "magi-todo-ledger"
 version = "0.1.0"
 dependencies = [
  "magi-core",
+ "magi-event-bus",
  "serde",
  "serde_json",
  "thiserror",
@@ -1317,6 +1324,7 @@ name = "magi-validation-runner"
 version = "0.1.0"
 dependencies = [
  "magi-core",
+ "magi-event-bus",
  "serde",
  "serde_json",
  "tempfile",

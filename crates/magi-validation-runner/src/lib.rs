@@ -555,6 +555,133 @@ fn workspace_slug(workspace_root: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Tool entry：`validation_record` 工具执行体
+// ---------------------------------------------------------------------------
+
+/// S15 工具下沉：`validation_record` 完整执行体收口在本 crate。`(plan_step_id, kind)`
+/// 唯一，重复写入按 upsert 处理并 bump version。
+pub fn execute_validation_record_tool(
+    event_bus: &magi_event_bus::InMemoryEventBus,
+    store: Option<&ValidationStore>,
+    session_id: &magi_core::SessionId,
+    workspace_id: Option<&magi_core::WorkspaceId>,
+    task_id: &magi_core::TaskId,
+    mission_id: &magi_core::MissionId,
+    arguments: &str,
+) -> (String, magi_core::ExecutionResultStatus) {
+    use magi_core::{EventId, ExecutionResultStatus, UtcMillis};
+    use magi_event_bus::{EventContext, EventEnvelope};
+    let Some(store) = store else {
+        return (
+            serde_json::json!({
+                "tool": "validation_record",
+                "status": "failed",
+                "error": "当前 task 未绑定 workspace，无法定位 mission validation runner",
+            })
+            .to_string(),
+            ExecutionResultStatus::Failed,
+        );
+    };
+    let args_value: serde_json::Value = match serde_json::from_str(arguments) {
+        Ok(v) => v,
+        Err(err) => {
+            return (
+                serde_json::json!({
+                    "tool": "validation_record",
+                    "status": "failed",
+                    "error": format!("arguments 非合法 JSON：{err}"),
+                })
+                .to_string(),
+                ExecutionResultStatus::Failed,
+            );
+        }
+    };
+    let args = match parse_validation_record_arguments(&args_value) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            return (
+                serde_json::json!({
+                    "tool": "validation_record",
+                    "status": "failed",
+                    "error": err.to_string(),
+                })
+                .to_string(),
+                ExecutionResultStatus::Failed,
+            );
+        }
+    };
+    let now = UtcMillis::now();
+    let mut report = match store.load(mission_id) {
+        Ok(Some(existing)) => existing,
+        Ok(None) => ValidationReport::new(mission_id.clone(), now),
+        Err(err) => {
+            return (
+                serde_json::json!({
+                    "tool": "validation_record",
+                    "status": "failed",
+                    "error": err.to_string(),
+                })
+                .to_string(),
+                ExecutionResultStatus::Failed,
+            );
+        }
+    };
+    let plan_step_id = args.plan_step_id.clone();
+    let kind = args.kind;
+    let outcome = args.outcome;
+    let changed = apply_validation_record(&mut report, args, now);
+    if let Err(err) = store.save(&report) {
+        return (
+            serde_json::json!({
+                "tool": "validation_record",
+                "status": "failed",
+                "error": err.to_string(),
+            })
+            .to_string(),
+            ExecutionResultStatus::Failed,
+        );
+    }
+    let step_passing = report.step_is_passing(&plan_step_id);
+    let payload = serde_json::json!({
+        "tool": "validation_record",
+        "status": "succeeded",
+        "mission_id": report.mission_id.to_string(),
+        "plan_step_id": plan_step_id,
+        "kind": kind.as_str(),
+        "outcome": outcome.as_str(),
+        "record_count": report.records.len(),
+        "changed": changed,
+        "step_is_passing": step_passing,
+    });
+    let _ = event_bus.publish(
+        EventEnvelope::domain(
+            EventId::new(format!("event-validation-updated-{}", UtcMillis::now().0)),
+            "task.validation.updated",
+            serde_json::json!({
+                "task_id": task_id.to_string(),
+                "mission_id": report.mission_id.to_string(),
+                "session_id": session_id.to_string(),
+                "workspace_id": workspace_id.map(ToString::to_string),
+                "plan_step_id": plan_step_id,
+                "kind": kind.as_str(),
+                "outcome": outcome.as_str(),
+                "changed": changed,
+                "step_is_passing": step_passing,
+                "record_count": report.records.len(),
+            }),
+        )
+        .with_context(EventContext {
+            workspace_id: workspace_id.cloned(),
+            session_id: Some(session_id.clone()),
+            mission_id: Some(mission_id.clone()),
+            task_id: Some(task_id.clone()),
+            ..EventContext::default()
+        }),
+    );
+    (payload.to_string(), ExecutionResultStatus::Succeeded)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
