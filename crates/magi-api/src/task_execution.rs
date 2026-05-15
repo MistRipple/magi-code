@@ -1763,6 +1763,7 @@ impl LlmTaskDispatcher {
             prompt,
             tools,
         })
+        .map_err(|msg| ApiError::model_invocation_failed("执行 session turn 失败", msg))
     }
 
     fn invoke_llm_with_tools(
