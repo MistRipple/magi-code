@@ -71,9 +71,11 @@ fn parse_fetch_models_config(
     request: FetchModelsRequest,
 ) -> Result<(NormalizedModelConfig, String), ApiError> {
     let config = NormalizedModelConfig::from_settings_value(&request.config, "openai");
-    config.require_base_url()?;
-    config.require_api_key()?;
-    config.require_openai_models_listable()?;
+    config.require_base_url().map_err(ApiError::InvalidInput)?;
+    config.require_api_key().map_err(ApiError::InvalidInput)?;
+    config
+        .require_openai_models_listable()
+        .map_err(ApiError::InvalidInput)?;
     Ok((config, request.target))
 }
 
@@ -123,9 +125,13 @@ fn parse_model_ids(payload: &Value) -> Vec<String> {
 fn parse_connection_probe_config(request: Value) -> Result<NormalizedModelConfig, ApiError> {
     let config = unwrap_settings_section_request(&request);
     let normalized = NormalizedModelConfig::from_settings_value(&config, "openai");
-    normalized.require_base_url()?;
-    normalized.require_api_key()?;
-    normalized.require_model()?;
+    normalized
+        .require_base_url()
+        .map_err(ApiError::InvalidInput)?;
+    normalized
+        .require_api_key()
+        .map_err(ApiError::InvalidInput)?;
+    normalized.require_model().map_err(ApiError::InvalidInput)?;
     Ok(normalized)
 }
 
@@ -139,14 +145,18 @@ async fn execute_connection_probe(
     let provider_key = config.provider_key();
     let (url, body) = match provider_key.as_str() {
         "openai" => {
-            let auth_value =
-                HeaderValue::from_str(&format!("Bearer {}", config.require_api_key()?))
-                    .map_err(|_| ApiError::InvalidInput("apiKey 包含非法字符".to_string()))?;
+            let api_key = config.require_api_key().map_err(ApiError::InvalidInput)?;
+            let auth_value = HeaderValue::from_str(&format!("Bearer {}", api_key))
+                .map_err(|_| ApiError::InvalidInput("apiKey 包含非法字符".to_string()))?;
             headers.insert(AUTHORIZATION, auth_value);
-            (config.openai_probe_url()?, config.openai_probe_body()?)
+            (
+                config.openai_probe_url().map_err(ApiError::InvalidInput)?,
+                config.openai_probe_body().map_err(ApiError::InvalidInput)?,
+            )
         }
         "anthropic" => {
-            let api_key = HeaderValue::from_str(config.require_api_key()?)
+            let api_key_str = config.require_api_key().map_err(ApiError::InvalidInput)?;
+            let api_key = HeaderValue::from_str(api_key_str)
                 .map_err(|_| ApiError::InvalidInput("apiKey 包含非法字符".to_string()))?;
             headers.insert(HeaderName::from_static("x-api-key"), api_key);
             headers.insert(
@@ -154,8 +164,12 @@ async fn execute_connection_probe(
                 HeaderValue::from_static("2023-06-01"),
             );
             (
-                config.anthropic_probe_url()?,
-                config.anthropic_probe_body()?,
+                config
+                    .anthropic_probe_url()
+                    .map_err(ApiError::InvalidInput)?,
+                config
+                    .anthropic_probe_body()
+                    .map_err(ApiError::InvalidInput)?,
             )
         }
         _ => {
@@ -1114,12 +1128,13 @@ async fn fetch_models(
     Json(request): Json<FetchModelsRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let (config, target) = parse_fetch_models_config(request)?;
-    let url = config.openai_models_url()?;
+    let url = config.openai_models_url().map_err(ApiError::InvalidInput)?;
     let now = UtcMillis::now();
     let mut headers = HeaderMap::new();
     headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    let auth_value = HeaderValue::from_str(&format!("Bearer {}", config.require_api_key()?))
+    let api_key = config.require_api_key().map_err(ApiError::InvalidInput)?;
+    let auth_value = HeaderValue::from_str(&format!("Bearer {}", api_key))
         .map_err(|_| ApiError::InvalidInput("apiKey 包含非法字符".to_string()))?;
     headers.insert(AUTHORIZATION, auth_value);
 

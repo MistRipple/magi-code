@@ -25,6 +25,7 @@ magi-permissions = { path = "../magi-permissions" }
 magi-session-store = { path = "../magi-session-store" }
 magi-agent-role = { path = "../magi-agent-role" }
 magi-snapshot = { path = "../magi-snapshot" }
+magi-usage-authority = { path = "../magi-usage-authority" }
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true

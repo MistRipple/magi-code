@@ -1,0 +1,553 @@
+//! Task System v2 — M04b：从 `magi-api::model_config` 下沉。
+//!
+//! 错误返回值改为 `Result<_, String>`，magi-api 调用方
+//! 用 `.map_err(ApiError::InvalidInput)` 桥接到 `ApiError`。
+//! 这样 v2 不需要反向依赖 magi-api。
+
+use magi_bridge_client::{HttpModelBridgeClient, HttpModelBridgeProtocol};
+use magi_usage_authority::{LlmConfig, OpenAiProtocol, ReasoningEffort, UrlMode};
+use serde_json::{Value, json};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModelUrlMode {
+    Standard,
+    Full,
+    Proxy,
+}
+
+impl ModelUrlMode {
+    fn from_label(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "full" => Self::Full,
+            "proxy" => Self::Proxy,
+            _ => Self::Standard,
+        }
+    }
+
+    fn to_usage_url_mode(self) -> UrlMode {
+        match self {
+            Self::Full => UrlMode::Full,
+            Self::Proxy => UrlMode::Proxy,
+            Self::Standard => UrlMode::Default,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModelOpenAiProtocol {
+    Responses,
+    Chat,
+}
+
+impl ModelOpenAiProtocol {
+    fn from_label(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "responses" => Some(Self::Responses),
+            "chat" => Some(Self::Chat),
+            _ => None,
+        }
+    }
+
+    fn to_usage_protocol(self) -> OpenAiProtocol {
+        match self {
+            Self::Responses => OpenAiProtocol::Responses,
+            Self::Chat => OpenAiProtocol::Chat,
+        }
+    }
+
+    fn to_http_protocol(self) -> HttpModelBridgeProtocol {
+        match self {
+            Self::Responses => HttpModelBridgeProtocol::Responses,
+            Self::Chat => HttpModelBridgeProtocol::ChatCompletions,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModelReasoningEffort {
+    Low,
+    Medium,
+    High,
+    Xhigh,
+}
+
+impl ModelReasoningEffort {
+    fn from_label(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "low" => Some(Self::Low),
+            "medium" => Some(Self::Medium),
+            "high" => Some(Self::High),
+            "xhigh" => Some(Self::Xhigh),
+            _ => None,
+        }
+    }
+
+    fn to_usage_reasoning_effort(self) -> ReasoningEffort {
+        match self {
+            Self::Low => ReasoningEffort::Low,
+            Self::Medium => ReasoningEffort::Medium,
+            Self::High => ReasoningEffort::High,
+            Self::Xhigh => ReasoningEffort::Xhigh,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NormalizedModelConfig {
+    provider: String,
+    base_url: Option<String>,
+    api_key: Option<String>,
+    model: Option<String>,
+    url_mode: ModelUrlMode,
+    openai_protocol: Option<ModelOpenAiProtocol>,
+    protocol_endpoint: Option<String>,
+    reasoning_effort: Option<ModelReasoningEffort>,
+    enable_thinking: Option<bool>,
+}
+
+impl NormalizedModelConfig {
+    pub fn from_settings_value(value: &Value, default_provider: &str) -> Self {
+        let provider =
+            string_field(value, "provider").unwrap_or_else(|| default_provider.trim().to_string());
+        let url_mode_label =
+            string_field(value, "urlMode").unwrap_or_else(|| "standard".to_string());
+        Self {
+            provider,
+            base_url: string_field(value, "baseUrl"),
+            api_key: string_field(value, "apiKey"),
+            model: string_field(value, "model"),
+            url_mode: ModelUrlMode::from_label(&url_mode_label),
+            openai_protocol: value
+                .get("openaiProtocol")
+                .and_then(Value::as_str)
+                .and_then(ModelOpenAiProtocol::from_label),
+            protocol_endpoint: string_field(value, "protocolEndpoint"),
+            reasoning_effort: value
+                .get("reasoningEffort")
+                .and_then(Value::as_str)
+                .and_then(ModelReasoningEffort::from_label),
+            enable_thinking: value
+                .get("enableThinking")
+                .and_then(Value::as_bool)
+                .or_else(|| value.get("thinking").and_then(Value::as_bool)),
+        }
+    }
+
+    pub fn provider(&self) -> &str {
+        &self.provider
+    }
+
+    pub fn provider_key(&self) -> String {
+        self.provider.trim().to_ascii_lowercase()
+    }
+
+    pub fn require_base_url(&self) -> Result<&str, String> {
+        self.base_url
+            .as_deref()
+            .ok_or_else(|| "模型配置缺少 baseUrl".to_string())
+    }
+
+    pub fn require_api_key(&self) -> Result<&str, String> {
+        self.api_key
+            .as_deref()
+            .ok_or_else(|| "模型配置缺少 apiKey".to_string())
+    }
+
+    pub fn require_model(&self) -> Result<&str, String> {
+        self.model
+            .as_deref()
+            .ok_or_else(|| "模型配置缺少 model".to_string())
+    }
+
+    pub fn to_http_model_client(&self, default_model: &str) -> Option<HttpModelBridgeClient> {
+        let base_url = self.http_client_base_url()?;
+        let model = self
+            .model
+            .clone()
+            .unwrap_or_else(|| default_model.to_string());
+        Some(HttpModelBridgeClient::new_with_protocol(
+            base_url,
+            self.api_key.clone(),
+            model,
+            self.execution_http_protocol(),
+        ))
+    }
+
+    pub fn to_usage_llm_config(&self) -> Option<LlmConfig> {
+        Some(LlmConfig {
+            provider: self.provider.clone(),
+            model: self.model.clone()?,
+            base_url: self.base_url.clone()?,
+            api_key: self.api_key.clone(),
+            url_mode: self.url_mode.to_usage_url_mode(),
+            openai_protocol: self
+                .openai_protocol
+                .map(ModelOpenAiProtocol::to_usage_protocol),
+            reasoning_effort: self
+                .reasoning_effort
+                .map(ModelReasoningEffort::to_usage_reasoning_effort),
+            enable_thinking: self.enable_thinking,
+        })
+    }
+
+    pub fn openai_models_url(&self) -> Result<String, String> {
+        self.require_openai_models_listable()?;
+        let normalized = self.normalized_http_base_url()?;
+        if normalized.ends_with("/models") {
+            return Ok(normalized);
+        }
+        if normalized.ends_with("/v1") || normalized.ends_with("/v3") {
+            return Ok(format!("{normalized}/models"));
+        }
+        Ok(format!("{normalized}/v1/models"))
+    }
+
+    pub fn require_openai_models_listable(&self) -> Result<(), String> {
+        if !self.uses_openai_compatible_provider() {
+            return Err("当前 provider 不支持自动获取模型列表，请手动填写模型名".to_string());
+        }
+        if matches!(self.url_mode, ModelUrlMode::Full) {
+            return Err("完整路径模式下不支持自动获取模型列表，请手动填写模型名".to_string());
+        }
+        if is_openai_execution_endpoint(self.normalized_http_base_url()?.as_str()) {
+            return Err(
+                "当前 Base URL 是对话执行端点，请改为服务根地址或 /v1 后再获取模型列表"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    fn uses_openai_compatible_provider(&self) -> bool {
+        matches!(
+            self.provider_key().as_str(),
+            "openai" | "openai-compatible" | "openai_compatible"
+        )
+    }
+
+    pub fn openai_probe_url(&self) -> Result<String, String> {
+        let normalized = self.normalized_http_base_url()?;
+        if matches!(self.url_mode, ModelUrlMode::Full) {
+            if let Some(endpoint) = self.protocol_endpoint.as_deref() {
+                return Ok(format!("{normalized}{endpoint}"));
+            }
+            return Ok(normalized);
+        }
+        let suffix = if self.effective_openai_protocol() == ModelOpenAiProtocol::Chat {
+            "/v1/chat/completions"
+        } else {
+            "/v1/responses"
+        };
+        Ok(format!("{normalized}{suffix}"))
+    }
+
+    pub fn openai_probe_body(&self) -> Result<Value, String> {
+        let model = self.require_model()?;
+        if self.effective_openai_protocol() == ModelOpenAiProtocol::Chat {
+            Ok(json!({
+                "model": model,
+                "messages": [{
+                    "role": "user",
+                    "content": "ping"
+                }],
+                "max_tokens": 1,
+                "stream": false,
+            }))
+        } else {
+            Ok(json!({
+                "model": model,
+                "input": "ping",
+                "max_output_tokens": 1,
+            }))
+        }
+    }
+
+    pub fn anthropic_probe_url(&self) -> Result<String, String> {
+        let normalized = self.normalized_http_base_url()?;
+        if matches!(self.url_mode, ModelUrlMode::Full) {
+            if let Some(endpoint) = self.protocol_endpoint.as_deref() {
+                return Ok(format!("{normalized}{endpoint}"));
+            }
+            return Ok(normalized);
+        }
+        if normalized.ends_with("/messages") {
+            return Ok(normalized);
+        }
+        if normalized.ends_with("/v1") {
+            return Ok(format!("{normalized}/messages"));
+        }
+        Ok(format!("{normalized}/v1/messages"))
+    }
+
+    pub fn anthropic_probe_body(&self) -> Result<Value, String> {
+        Ok(json!({
+            "model": self.require_model()?,
+            "messages": [{
+                "role": "user",
+                "content": "ping"
+            }],
+            "max_tokens": 1,
+            "stream": false,
+        }))
+    }
+
+    fn normalized_http_base_url(&self) -> Result<String, String> {
+        let normalized = self.require_base_url()?.trim().trim_end_matches('/');
+        if normalized.is_empty() {
+            return Err("模型配置缺少有效的 baseUrl".to_string());
+        }
+        if !normalized.starts_with("http://") && !normalized.starts_with("https://") {
+            return Err("baseUrl 必须以 http:// 或 https:// 开头".to_string());
+        }
+        Ok(normalized.to_string())
+    }
+
+    fn effective_openai_protocol(&self) -> ModelOpenAiProtocol {
+        self.openai_protocol
+            .unwrap_or(ModelOpenAiProtocol::Responses)
+    }
+
+    fn execution_openai_protocol(&self) -> ModelOpenAiProtocol {
+        if self.provider_key() == "openai" {
+            self.effective_openai_protocol()
+        } else {
+            self.openai_protocol.unwrap_or(ModelOpenAiProtocol::Chat)
+        }
+    }
+
+    fn execution_http_protocol(&self) -> HttpModelBridgeProtocol {
+        if self.provider_key() == "anthropic" {
+            return HttpModelBridgeProtocol::AnthropicMessages;
+        }
+        self.execution_openai_protocol().to_http_protocol()
+    }
+
+    fn http_client_base_url(&self) -> Option<String> {
+        let base_url = self.base_url.as_deref()?.trim().trim_end_matches('/');
+        if matches!(self.url_mode, ModelUrlMode::Full)
+            && let Some(endpoint) = self.protocol_endpoint.as_deref()
+        {
+            return Some(format!("{base_url}{endpoint}"));
+        }
+        Some(base_url.to_string())
+    }
+}
+
+fn string_field(value: &Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+pub fn normalize_executable_model_provider(provider: Option<&str>) -> String {
+    match provider
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("anthropic") => "anthropic".to_string(),
+        Some("openai-compatible" | "openai_compatible") => "openai-compatible".to_string(),
+        Some("openai") => "openai".to_string(),
+        _ => "openai".to_string(),
+    }
+}
+
+fn is_openai_execution_endpoint(value: &str) -> bool {
+    let normalized = value
+        .split(['?', '#'])
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .trim_end_matches('/')
+        .to_ascii_lowercase();
+    normalized.ends_with("/chat/completions")
+        || normalized.ends_with("/responses")
+        || normalized.ends_with("/messages")
+        || matches!(
+            normalized.as_str(),
+            "chat/completions" | "responses" | "messages"
+        )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalized_model_config_preserves_openai_fetch_models_contract() {
+        let config = NormalizedModelConfig::from_settings_value(
+            &json!({
+                "provider": "openai",
+                "baseUrl": "http://127.0.0.1:8320/",
+                "apiKey": "test-key",
+                "urlMode": "standard"
+            }),
+            "openai",
+        );
+
+        assert_eq!(config.provider(), "openai");
+        assert_eq!(
+            config.require_base_url().expect("baseUrl"),
+            "http://127.0.0.1:8320/"
+        );
+        assert_eq!(config.require_api_key().expect("apiKey"), "test-key");
+        config
+            .require_openai_models_listable()
+            .expect("standard url mode can list models");
+        assert_eq!(
+            config.openai_models_url().expect("models url"),
+            "http://127.0.0.1:8320/v1/models"
+        );
+    }
+
+    #[test]
+    fn normalized_model_config_rejects_non_openai_model_list_provider() {
+        let config = NormalizedModelConfig::from_settings_value(
+            &json!({
+                "provider": "anthropic",
+                "baseUrl": "https://api.anthropic.com",
+                "apiKey": "test-key",
+                "urlMode": "standard"
+            }),
+            "openai",
+        );
+
+        let error = config
+            .require_openai_models_listable()
+            .expect_err("anthropic provider does not expose OpenAI-compatible /models");
+        assert!(error.contains("当前 provider 不支持自动获取模型列表"));
+    }
+
+    #[test]
+    fn normalized_model_config_rejects_full_mode_models_url() {
+        let config = NormalizedModelConfig::from_settings_value(
+            &json!({
+                "baseUrl": "http://127.0.0.1:8320/v1/chat/completions",
+                "apiKey": "test-key",
+                "urlMode": "full"
+            }),
+            "openai",
+        );
+
+        let error = config
+            .openai_models_url()
+            .expect_err("full path has no canonical models endpoint");
+        assert!(error.contains("完整路径模式下不支持自动获取模型列表"));
+    }
+
+    #[test]
+    fn normalize_executable_model_provider_preserves_anthropic() {
+        assert_eq!(
+            normalize_executable_model_provider(Some(" anthropic ")),
+            "anthropic"
+        );
+    }
+
+    #[test]
+    fn normalized_model_config_builds_anthropic_probe_contract() {
+        let config = NormalizedModelConfig::from_settings_value(
+            &json!({
+                "provider": "anthropic",
+                "baseUrl": "https://api.anthropic.com",
+                "apiKey": "test-key",
+                "model": "claude-sonnet-test",
+                "urlMode": "standard"
+            }),
+            "openai",
+        );
+
+        assert_eq!(
+            config.anthropic_probe_url().expect("probe url"),
+            "https://api.anthropic.com/v1/messages"
+        );
+        assert_eq!(
+            config.anthropic_probe_body().expect("probe body"),
+            json!({
+                "model": "claude-sonnet-test",
+                "messages": [{
+                    "role": "user",
+                    "content": "ping"
+                }],
+                "max_tokens": 1,
+                "stream": false
+            })
+        );
+    }
+
+    #[test]
+    fn normalized_model_config_builds_anthropic_execution_protocol() {
+        let config = NormalizedModelConfig::from_settings_value(
+            &json!({
+                "provider": "anthropic",
+                "baseUrl": "https://api.anthropic.com",
+                "apiKey": "test-key",
+                "model": "claude-sonnet-test",
+                "urlMode": "standard"
+            }),
+            "openai",
+        );
+
+        assert_eq!(
+            config.execution_http_protocol(),
+            HttpModelBridgeProtocol::AnthropicMessages
+        );
+    }
+
+    #[test]
+    fn normalized_model_config_rejects_standard_execution_endpoint_models_url() {
+        let config = NormalizedModelConfig::from_settings_value(
+            &json!({
+                "provider": "openai",
+                "baseUrl": "http://127.0.0.1:8320/v1/chat/completions",
+                "apiKey": "test-key",
+                "urlMode": "standard"
+            }),
+            "openai",
+        );
+
+        let error = config
+            .openai_models_url()
+            .expect_err("standard mode should still reject execution endpoints");
+        assert!(error.contains("当前 Base URL 是对话执行端点"));
+    }
+
+    #[test]
+    fn normalized_model_config_builds_usage_config_without_defaulting_protocol() {
+        let config = NormalizedModelConfig::from_settings_value(
+            &json!({
+                "provider": "openai-compatible",
+                "baseUrl": "https://example.test",
+                "model": "gpt-test",
+                "urlMode": "standard"
+            }),
+            "openai",
+        );
+
+        let usage = config.to_usage_llm_config().expect("usage config");
+        assert_eq!(usage.provider, "openai-compatible");
+        assert_eq!(usage.model, "gpt-test");
+        assert_eq!(usage.url_mode, UrlMode::Default);
+        assert_eq!(usage.openai_protocol, None);
+    }
+
+    #[test]
+    fn normalized_model_config_preserves_explicit_chat_protocol_for_usage() {
+        let config = NormalizedModelConfig::from_settings_value(
+            &json!({
+                "provider": "openai",
+                "baseUrl": "https://example.test",
+                "model": "gpt-test",
+                "urlMode": "standard",
+                "openaiProtocol": "chat"
+            }),
+            "openai",
+        );
+
+        let usage = config.to_usage_llm_config().expect("usage config");
+        assert_eq!(usage.openai_protocol, Some(OpenAiProtocol::Chat));
+    }
+}

@@ -13,6 +13,7 @@ mod builtin_tool_schema;
 mod conversation;
 mod driver;
 mod mailbox;
+pub mod model_config;
 pub mod prompt_utils;
 mod registry;
 pub mod session_writeback;
@@ -23,6 +24,7 @@ pub mod task_helpers;
 pub mod tool_batch;
 pub mod tool_result_utils;
 mod turn;
+pub mod usage_recording;
 
 pub use builtin_tool_schema::{internal_builtin_tool_rejection_payload, public_builtin_tool_definitions};
 pub use conversation::{AdvanceTurnError, BeginTurnError, Conversation, TurnAdvanceError};
