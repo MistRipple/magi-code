@@ -55,35 +55,11 @@ pub use magi_conversation_runtime::task_execution_registry::{
     TaskExecutionPlan, TaskExecutionRegistry,
 };
 
-#[derive(Clone, Debug)]
-pub struct DispatchSubmissionRequest {
-    pub accepted_at: UtcMillis,
-    pub session_id: SessionId,
-    pub workspace_id: Option<WorkspaceId>,
-    pub entry_id: String,
-    pub timeline_message: String,
-    pub created_session: bool,
-    pub mission_title: String,
-    pub task_title: String,
-    pub trimmed_text: Option<String>,
-    pub execution_goal: Option<String>,
-    pub skill_name: Option<String>,
-    pub target_role: Option<String>,
-    pub request_id: Option<String>,
-    pub user_message_id: Option<String>,
-    pub placeholder_message_id: Option<String>,
-}
-
-#[derive(Clone, Debug)]
-pub struct DispatchSubmissionAccepted {
-    pub session_id: SessionId,
-    pub entry_id: String,
-    pub accepted_at: UtcMillis,
-    pub created_session: bool,
-    pub root_task_id: TaskId,
-    pub action_task_id: TaskId,
-    pub runner_started: bool,
-}
+// M17a：DispatchSubmissionRequest / DispatchSubmissionAccepted DTO 已下沉到
+// conversation-runtime，通过 `pub use` 重导出保持外部 import 路径不变。
+pub use magi_conversation_runtime::dispatch_submission::{
+    DispatchSubmissionAccepted, DispatchSubmissionRequest,
+};
 
 fn turn_item_status_for_task_status(status: TaskStatus) -> &'static str {
     match status {

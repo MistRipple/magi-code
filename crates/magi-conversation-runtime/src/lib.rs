@@ -20,6 +20,7 @@ pub mod mission_decomposition;
 pub mod model_config;
 pub mod prompt_utils;
 mod registry;
+pub mod dispatch_submission;
 pub mod session_thread;
 pub mod task_execution_registry;
 pub mod session_turn_execution;
