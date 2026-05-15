@@ -353,7 +353,10 @@ mod tests {
     #[test]
     fn relative_path_strips_root() {
         let root = Path::new("/a/b");
-        assert_eq!(relative_path(root, Path::new("/a/b/c/d.txt")).unwrap(), "c/d.txt");
+        assert_eq!(
+            relative_path(root, Path::new("/a/b/c/d.txt")).unwrap(),
+            "c/d.txt"
+        );
     }
 
     #[test]
@@ -364,6 +367,10 @@ mod tests {
         std::fs::write(dir.path().join("real.txt"), "hi").unwrap();
         let paths = walk_workspace(dir.path(), false).unwrap();
         assert!(paths.iter().any(|p| p.ends_with("real.txt")));
-        assert!(paths.iter().all(|p| !p.to_string_lossy().contains("node_modules")));
+        assert!(
+            paths
+                .iter()
+                .all(|p| !p.to_string_lossy().contains("node_modules"))
+        );
     }
 }

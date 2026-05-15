@@ -1,10 +1,9 @@
 use magi_bridge_client::{
     BridgeServerKind, BridgeTransport, BridgeTransportError, BridgeTransportRequest,
     JsonRpcBridgeServerProbeClient, JsonRpcMcpBridgeClient, JsonRpcMcpManagerClient,
-    JsonRpcStdioTransport, McpBridgeClient, McpManagerLifecycleEventKind,
-    McpManagerServerHealthUpdateRequest, McpManagerServerRegistrationRequest,
-    McpManagerServerSelectionRequest, McpToolCallRequest, LOOPBACK_MCP_SERVER_NAME,
-    LOOPBACK_MCP_TOOL_NAME,
+    JsonRpcStdioTransport, LOOPBACK_MCP_SERVER_NAME, LOOPBACK_MCP_TOOL_NAME, McpBridgeClient,
+    McpManagerLifecycleEventKind, McpManagerServerHealthUpdateRequest,
+    McpManagerServerRegistrationRequest, McpManagerServerSelectionRequest, McpToolCallRequest,
 };
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -359,7 +358,10 @@ fn mcp_loopback_exposes_shared_handshake_and_health() {
             .capabilities
             .contains(&"tool:echo.describe".to_string())
     );
-    assert_eq!(catalog.services[2].service_name, "loopback-mcp-observability");
+    assert_eq!(
+        catalog.services[2].service_name,
+        "loopback-mcp-observability"
+    );
     assert_eq!(
         catalog.services[2]
             .implementation_source
@@ -829,7 +831,10 @@ fn mcp_client_blank_selection_rejects_unavailable_enabled_server() {
             "MAGI_MCP_MANAGER_DISABLED_SERVERS",
             "loopback-mcp-observability",
         ),
-        ("MAGI_MCP_MANAGER_SERVER_HEALTHS", "loopback-mcp=unavailable"),
+        (
+            "MAGI_MCP_MANAGER_SERVER_HEALTHS",
+            "loopback-mcp=unavailable",
+        ),
     ]);
     let error = transport
         .call(BridgeTransportRequest {
@@ -895,7 +900,10 @@ fn mcp_client_explicit_call_rejects_unavailable_server_even_when_enabled() {
             "MAGI_MCP_MANAGER_DISABLED_SERVERS",
             "loopback-mcp-observability",
         ),
-        ("MAGI_MCP_MANAGER_SERVER_HEALTHS", "loopback-mcp=unavailable"),
+        (
+            "MAGI_MCP_MANAGER_SERVER_HEALTHS",
+            "loopback-mcp=unavailable",
+        ),
     ]);
     let error = transport
         .call(BridgeTransportRequest {

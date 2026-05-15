@@ -1,8 +1,9 @@
 use magi_bridge_client::{
     BridgeClientError, BridgeResponse, BridgeServerKind, BridgeTransport,
     JsonRpcBridgeServerProbeClient, JsonRpcMcpBridgeClient, JsonRpcMcpManagerClient,
-    JsonRpcModelBridgeClient, McpBridgeClient, McpToolCallRequest, ModelBridgeClient,
-    ModelInvocationRequest, LOOPBACK_MCP_SERVER_NAME, LOOPBACK_MCP_TOOL_NAME, LOOPBACK_MODEL_PROVIDER,
+    JsonRpcModelBridgeClient, LOOPBACK_MCP_SERVER_NAME, LOOPBACK_MCP_TOOL_NAME,
+    LOOPBACK_MODEL_PROVIDER, McpBridgeClient, McpToolCallRequest, ModelBridgeClient,
+    ModelInvocationRequest,
 };
 use std::sync::Arc;
 

@@ -523,10 +523,7 @@ impl TaskStore {
             return Err(format!("decision {decision_task_id} has no options"));
         }
         if !options.iter().any(|option| {
-            option
-                .get("option_id")
-                .and_then(serde_json::Value::as_str)
-                == Some(chosen_option)
+            option.get("option_id").and_then(serde_json::Value::as_str) == Some(chosen_option)
         }) {
             return Err(format!(
                 "option {chosen_option} is not valid for decision {decision_task_id}"

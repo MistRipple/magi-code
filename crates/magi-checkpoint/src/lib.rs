@@ -190,10 +190,7 @@ impl CheckpointStore {
         self.root.join(mission_id.as_str()).join("checkpoints.md")
     }
 
-    pub fn load(
-        &self,
-        mission_id: &MissionId,
-    ) -> Result<Option<CheckpointLog>, CheckpointError> {
+    pub fn load(&self, mission_id: &MissionId) -> Result<Option<CheckpointLog>, CheckpointError> {
         let path = self.log_path(mission_id);
         let raw = match fs::read_to_string(&path) {
             Ok(s) => s,
@@ -356,13 +353,14 @@ pub fn parse_checkpoint_create_arguments(
         .ok_or_else(|| CheckpointError::InvalidRecord {
             reason: "arguments 必须为对象".to_string(),
         })?;
-    let kind_raw = obj
-        .get("kind")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| CheckpointError::InvalidRecord {
-            reason: "缺少 kind 字段（process_restart/context_compaction/phase_transition/manual）"
-                .to_string(),
-        })?;
+    let kind_raw =
+        obj.get("kind")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| CheckpointError::InvalidRecord {
+                reason:
+                    "缺少 kind 字段（process_restart/context_compaction/phase_transition/manual）"
+                        .to_string(),
+            })?;
     let kind = CheckpointKind::from_str_lenient(kind_raw).ok_or_else(|| {
         CheckpointError::InvalidRecord {
             reason: format!("kind 非法：{kind_raw}"),
@@ -663,10 +661,7 @@ pub fn execute_checkpoint_create_tool(
     });
     let _ = event_bus.publish(
         EventEnvelope::domain(
-            EventId::new(format!(
-                "event-checkpoint-appended-{}",
-                UtcMillis::now().0
-            )),
+            EventId::new(format!("event-checkpoint-appended-{}", UtcMillis::now().0)),
             "task.checkpoint.appended",
             serde_json::json!({
                 "task_id": task_id.to_string(),
@@ -748,10 +743,8 @@ mod tests {
             .expect_err("缺 kind 必须报错");
         assert!(matches!(err, CheckpointError::InvalidRecord { .. }));
 
-        let err = parse_checkpoint_create_arguments(
-            &serde_json::json!({"kind": "wrong"}),
-        )
-        .expect_err("非法 kind 必须报错");
+        let err = parse_checkpoint_create_arguments(&serde_json::json!({"kind": "wrong"}))
+            .expect_err("非法 kind 必须报错");
         assert!(matches!(err, CheckpointError::InvalidRecord { .. }));
 
         let ok = parse_checkpoint_create_arguments(&serde_json::json!({
@@ -826,10 +819,7 @@ mod tests {
             UtcMillis(20),
         );
         store.save(&log).expect("save");
-        let reloaded = store
-            .load(&mission())
-            .expect("load")
-            .expect("log saved");
+        let reloaded = store.load(&mission()).expect("load").expect("log saved");
         assert_eq!(reloaded, log);
     }
 

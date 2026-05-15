@@ -25,8 +25,8 @@ mod loop_controller;
 mod reporting;
 mod runtime_queries;
 pub use executor::{
-    DeterministicWorkerExecutor, WorkerExecutor, WorkerExecutionProgress,
-    WorkerExecutionTrace, WorkerExecutorFailureDetail, WorkerExecutorKind, WorkerExecutorProbe,
+    DeterministicWorkerExecutor, WorkerExecutionProgress, WorkerExecutionTrace, WorkerExecutor,
+    WorkerExecutorFailureDetail, WorkerExecutorKind, WorkerExecutorProbe,
 };
 pub use executor_observation::{WorkerExecutorObservation, WorkerExecutorObservationStatus};
 pub use local_process_executor::{

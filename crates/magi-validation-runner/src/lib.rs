@@ -371,24 +371,23 @@ pub fn parse_validation_record_arguments(
             reason: "plan_step_id 不能为空".to_string(),
         });
     }
-    let kind_raw = obj
-        .get("kind")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| ValidationError::InvalidRecord {
-            reason: "缺少 kind 字段（test_suite/type_check/integration_smoke/benchmark）"
-                .to_string(),
-        })?;
+    let kind_raw =
+        obj.get("kind")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ValidationError::InvalidRecord {
+                reason: "缺少 kind 字段（test_suite/type_check/integration_smoke/benchmark）"
+                    .to_string(),
+            })?;
     let kind = ValidationKind::from_str_lenient(kind_raw).ok_or_else(|| {
         ValidationError::InvalidRecord {
             reason: format!("kind 非法：{kind_raw}"),
         }
     })?;
-    let outcome_raw = obj
-        .get("outcome")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| ValidationError::InvalidRecord {
+    let outcome_raw = obj.get("outcome").and_then(|v| v.as_str()).ok_or_else(|| {
+        ValidationError::InvalidRecord {
             reason: "缺少 outcome 字段（pass/fail/skipped）".to_string(),
-        })?;
+        }
+    })?;
     let outcome = ValidationOutcome::from_str_lenient(outcome_raw).ok_or_else(|| {
         ValidationError::InvalidRecord {
             reason: format!("outcome 非法：{outcome_raw}"),
@@ -764,11 +763,7 @@ mod tests {
                 UtcMillis(1),
             );
         }
-        assert_eq!(
-            report.records.len(),
-            4,
-            "同 step 下不同 kind 必须独立存在"
-        );
+        assert_eq!(report.records.len(), 4, "同 step 下不同 kind 必须独立存在");
     }
 
     #[test]
@@ -863,10 +858,8 @@ mod tests {
     #[test]
     fn render_and_parse_round_trip() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let ws_root =
-            WorkspaceRootPath::new(tmp.path().to_string_lossy().to_string());
-        let store = ValidationStore::open_with_home(tmp.path(), &ws_root)
-            .expect("open store");
+        let ws_root = WorkspaceRootPath::new(tmp.path().to_string_lossy().to_string());
+        let store = ValidationStore::open_with_home(tmp.path(), &ws_root).expect("open store");
         let mut report = ValidationReport::new(mission(), UtcMillis(1));
         apply_validation_record(
             &mut report,
@@ -901,13 +894,14 @@ mod tests {
     #[test]
     fn render_for_prompt_groups_by_step_and_returns_none_when_empty() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let ws_root =
-            WorkspaceRootPath::new(tmp.path().to_string_lossy().to_string());
-        let store = ValidationStore::open_with_home(tmp.path(), &ws_root)
-            .expect("open store");
+        let ws_root = WorkspaceRootPath::new(tmp.path().to_string_lossy().to_string());
+        let store = ValidationStore::open_with_home(tmp.path(), &ws_root).expect("open store");
 
         assert!(
-            store.render_for_prompt(&mission()).expect("render").is_none(),
+            store
+                .render_for_prompt(&mission())
+                .expect("render")
+                .is_none(),
             "空 mission 必须返回 None"
         );
 

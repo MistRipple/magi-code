@@ -5,20 +5,20 @@
 //! EventBased* / WorkerExecutionDispatcher 等执行桥类型；TaskRunner 本体只依赖这些
 //! trait 与 TaskStore，因此可先迁到 v2 runtime，后续 M19 再拆剩余桥层。
 
+#[cfg(test)]
+use crate::task_runner_bridge::{EventBasedResultReceiver, TaskResult, WorkerExecutionDispatcher};
 use crate::task_runner_bridge::{
     NoOpDispatcher, NoOpResultReceiver, RunCycleOutcome, TaskDispatcher, TaskOutcome,
     TaskResultReceiver,
 };
-#[cfg(test)]
-use crate::task_runner_bridge::{EventBasedResultReceiver, TaskResult, WorkerExecutionDispatcher};
 use magi_agent_role::AgentRoleRegistry;
 use magi_core::{EventId, Task, TaskId, TaskKind, TaskStatus, UtcMillis};
 use magi_event_bus::{EventEnvelope, InMemoryEventBus};
 use magi_orchestrator::task_store::TaskStore;
 use magi_orchestrator::task_worker_catalog::{WorkerInfo, resolve_task_role};
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const DEFAULT_LEASE_DURATION_MS: u64 = 60_000;
 
@@ -921,7 +921,8 @@ impl TaskRunner {
             .filter_map(|id| {
                 self.store.get_task(&id).and_then(|t| {
                     if t.status == TaskStatus::Running {
-                        t.executor_binding_parallelism_group().map(ToOwned::to_owned)
+                        t.executor_binding_parallelism_group()
+                            .map(ToOwned::to_owned)
                     } else {
                         None
                     }

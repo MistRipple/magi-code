@@ -174,10 +174,7 @@ impl PlanStore {
         fs::write(&path, rendered).map_err(|source| PlanError::Io { path, source })
     }
 
-    pub fn render_for_prompt(
-        &self,
-        mission_id: &MissionId,
-    ) -> Result<Option<String>, PlanError> {
+    pub fn render_for_prompt(&self, mission_id: &MissionId) -> Result<Option<String>, PlanError> {
         let Some(plan) = self.load(mission_id)? else {
             return Ok(None);
         };
@@ -292,12 +289,15 @@ pub fn parse_plan_write_arguments(raw: &serde_json::Value) -> Result<PlanWriteAr
     let steps_value = obj.get("steps").ok_or_else(|| PlanError::InvalidPlan {
         reason: "缺少 steps 字段".to_string(),
     })?;
-    let arr = steps_value.as_array().ok_or_else(|| PlanError::InvalidPlan {
-        reason: "steps 必须为数组".to_string(),
-    })?;
+    let arr = steps_value
+        .as_array()
+        .ok_or_else(|| PlanError::InvalidPlan {
+            reason: "steps 必须为数组".to_string(),
+        })?;
     if arr.is_empty() {
         return Err(PlanError::InvalidPlan {
-            reason: "steps 至少需要一项；若想清空 plan 请改用 plan_clear 工具（暂未实现）".to_string(),
+            reason: "steps 至少需要一项；若想清空 plan 请改用 plan_clear 工具（暂未实现）"
+                .to_string(),
         });
     }
     let mut steps = Vec::with_capacity(arr.len());
@@ -332,9 +332,11 @@ pub fn parse_plan_write_arguments(raw: &serde_json::Value) -> Result<PlanWriteAr
             });
         }
         let status = match step_obj.get("status").and_then(|v| v.as_str()) {
-            Some(s) => PlanStepStatus::from_str_lenient(s).ok_or_else(|| PlanError::InvalidPlan {
-                reason: format!("steps[{idx}].status 非法：{s}"),
-            })?,
+            Some(s) => {
+                PlanStepStatus::from_str_lenient(s).ok_or_else(|| PlanError::InvalidPlan {
+                    reason: format!("steps[{idx}].status 非法：{s}"),
+                })?
+            }
             None => PlanStepStatus::Pending,
         };
         let depends_on = match step_obj.get("depends_on") {
@@ -352,7 +354,7 @@ pub fn parse_plan_write_arguments(raw: &serde_json::Value) -> Result<PlanWriteAr
             Some(_) => {
                 return Err(PlanError::InvalidPlan {
                     reason: format!("steps[{idx}].depends_on 必须为字符串数组"),
-                })
+                });
             }
         };
         let notes = step_obj
@@ -369,8 +371,7 @@ pub fn parse_plan_write_arguments(raw: &serde_json::Value) -> Result<PlanWriteAr
     }
 
     // 校验 depends_on 全部指向 plan 内部已知 id（依赖图必须封闭）。
-    let known_ids: std::collections::HashSet<&str> =
-        steps.iter().map(|s| s.id.as_str()).collect();
+    let known_ids: std::collections::HashSet<&str> = steps.iter().map(|s| s.id.as_str()).collect();
     for step in &steps {
         for dep in &step.depends_on {
             if !known_ids.contains(dep.as_str()) {
@@ -470,11 +471,9 @@ fn parse_plan(raw: &str) -> Result<Plan, PlanError> {
         if line.is_empty() {
             continue;
         }
-        let (key, value) = line
-            .split_once(':')
-            .ok_or_else(|| PlanError::InvalidPlan {
-                reason: format!("frontmatter 行非法：{line}"),
-            })?;
+        let (key, value) = line.split_once(':').ok_or_else(|| PlanError::InvalidPlan {
+            reason: format!("frontmatter 行非法：{line}"),
+        })?;
         let value = value.trim();
         match key.trim() {
             "mission_id" => mission_id = Some(MissionId::new(value.to_string())),
@@ -864,12 +863,22 @@ mod tests {
         let ws = WorkspaceRootPath::new("/tmp/ws-plan-empty".to_string());
         let store = PlanStore::open_with_home(tmp.path(), &ws).expect("open");
         // 未落盘
-        assert!(store.render_for_prompt(&mission()).expect("render").is_none());
+        assert!(
+            store
+                .render_for_prompt(&mission())
+                .expect("render")
+                .is_none()
+        );
         // 空 steps
         store
             .save(&Plan::new(mission(), UtcMillis(0)))
             .expect("save");
-        assert!(store.render_for_prompt(&mission()).expect("render").is_none());
+        assert!(
+            store
+                .render_for_prompt(&mission())
+                .expect("render")
+                .is_none()
+        );
     }
 
     #[test]
@@ -890,7 +899,10 @@ mod tests {
             updated_at: UtcMillis(0),
         };
         store.save(&plan).expect("save");
-        let rendered = store.render_for_prompt(&mission()).expect("render").expect("present");
+        let rendered = store
+            .render_for_prompt(&mission())
+            .expect("render")
+            .expect("present");
         assert!(rendered.contains("# Mission Plan"));
         assert!(rendered.contains("s1"));
         assert!(rendered.contains("(completed)"));

@@ -188,7 +188,10 @@ pub(crate) fn collect_session_pending_changes(
     let Some(bound_workspace_id) = bound_workspace_id else {
         return Ok(Vec::new());
     };
-    if state.workspace_root_path(&Some(bound_workspace_id)).is_none() {
+    if state
+        .workspace_root_path(&Some(bound_workspace_id))
+        .is_none()
+    {
         return Ok(Vec::new());
     }
     let scope = resolve_session_change_scope(state, session_id, workspace_id, None)?;
@@ -423,7 +426,10 @@ mod tests {
         let sid = SessionId::new(session_id);
         state
             .workspace_registry
-            .register(ws.clone(), AbsolutePath::new(root.to_string_lossy().to_string()))
+            .register(
+                ws.clone(),
+                AbsolutePath::new(root.to_string_lossy().to_string()),
+            )
             .expect("workspace should register");
         state
             .session_store
@@ -504,9 +510,18 @@ mod tests {
             .iter()
             .map(|c| (c.file_path.clone(), c.clone()))
             .collect();
-        assert_eq!(by_path.get("alpha.txt").map(|c| c.r#type.as_str()), Some("modify"));
-        assert_eq!(by_path.get("gamma.txt").map(|c| c.r#type.as_str()), Some("add"));
-        assert_eq!(by_path.get("beta.txt").map(|c| c.r#type.as_str()), Some("delete"));
+        assert_eq!(
+            by_path.get("alpha.txt").map(|c| c.r#type.as_str()),
+            Some("modify")
+        );
+        assert_eq!(
+            by_path.get("gamma.txt").map(|c| c.r#type.as_str()),
+            Some("add")
+        );
+        assert_eq!(
+            by_path.get("beta.txt").map(|c| c.r#type.as_str()),
+            Some("delete")
+        );
 
         // execution_group_id 来自 mission_id。
         for change in &changes {

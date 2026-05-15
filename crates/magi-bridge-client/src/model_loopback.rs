@@ -1,5 +1,5 @@
 use crate::{
-    BridgeResponse, ModelInvocationRequest, LOOPBACK_MODEL_PROVIDER,
+    BridgeResponse, LOOPBACK_MODEL_PROVIDER, ModelInvocationRequest,
     local_process_protocol::{
         BridgeServerKind, BridgeServerServiceCatalog, BridgeServerServiceDescriptor,
         LOCAL_BRIDGE_PROTOCOL_VERSION, LocalProcessBridgeRequest, LocalProcessBridgeRpcError,

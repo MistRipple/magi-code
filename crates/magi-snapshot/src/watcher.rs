@@ -39,8 +39,8 @@ impl FsWatcher {
         let (raw_tx, mut raw_rx) = mpsc::unbounded_channel::<RawEvent>();
         let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
 
-        let mut watcher = notify::recommended_watcher(move |res: notify::Result<Event>| {
-            match res {
+        let mut watcher =
+            notify::recommended_watcher(move |res: notify::Result<Event>| match res {
                 Ok(ev) => {
                     if let Some(raw) = classify(&ev) {
                         for path in ev.paths {
@@ -55,9 +55,8 @@ impl FsWatcher {
                 Err(err) => {
                     tracing::warn!(error = %err, "notify watcher delivered error");
                 }
-            }
-        })
-        .map_err(|e| SnapshotError::Watcher(e.to_string()))?;
+            })
+            .map_err(|e| SnapshotError::Watcher(e.to_string()))?;
 
         watcher
             .watch(&root, RecursiveMode::Recursive)

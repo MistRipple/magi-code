@@ -24,7 +24,9 @@ use magi_tool_runtime::ToolRegistry;
 use std::io::{Read, Write};
 use std::sync::Arc;
 
-pub fn execute_intent_with_loopback_drivers(intent: &WorkerExecutionIntent) -> WorkerExecutionTrace {
+pub fn execute_intent_with_loopback_drivers(
+    intent: &WorkerExecutionIntent,
+) -> WorkerExecutionTrace {
     let event_bus = Arc::new(InMemoryEventBus::new(64));
     let governance = Arc::new(GovernanceService::default());
     let mut tool_registry = ToolRegistry::new(governance, event_bus);
@@ -539,7 +541,8 @@ pub fn run_local_worker_executor_stdio() -> Result<(), String> {
                     .as_ref()
                     .map(|cursor| cursor.next_step_index)
                     .unwrap_or(0);
-                let executed = execute_intent_step_with_loopback_drivers(&execute.intent, step_index);
+                let executed =
+                    execute_intent_step_with_loopback_drivers(&execute.intent, step_index);
                 let (trace, checkpoint_cursor, completed) = match executed {
                     Ok(result) => result,
                     Err(error) => {

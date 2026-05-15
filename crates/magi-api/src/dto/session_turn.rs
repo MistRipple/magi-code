@@ -172,11 +172,7 @@ impl SessionTurnResponseDto {
         }
     }
 
-    pub fn with_supplement_context(
-        mut self,
-        context_ref: String,
-        context_task_id: String,
-    ) -> Self {
+    pub fn with_supplement_context(mut self, context_ref: String, context_task_id: String) -> Self {
         self.context_ref = Some(context_ref);
         self.context_task_id = Some(context_task_id);
         self

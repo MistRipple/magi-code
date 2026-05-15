@@ -18,10 +18,7 @@ async fn baseline_scan_records_existing_files() {
     fs::write(root.join("b.md"), "world").unwrap();
 
     let mgr = SnapshotManager::new();
-    let session = mgr
-        .start_session("s1".into(), root.clone())
-        .await
-        .unwrap();
+    let session = mgr.start_session("s1".into(), root.clone()).await.unwrap();
 
     let pending = session.pending_changes().unwrap();
     assert!(pending.is_empty(), "fresh baseline should have no pending");
@@ -34,10 +31,7 @@ async fn external_write_is_captured() {
     fs::write(root.join("foo.txt"), "before").unwrap();
 
     let mgr = SnapshotManager::new();
-    let session = mgr
-        .start_session("s2".into(), root.clone())
-        .await
-        .unwrap();
+    let session = mgr.start_session("s2".into(), root.clone()).await.unwrap();
 
     fs::write(root.join("foo.txt"), "after").unwrap();
     session.reconcile().unwrap();
@@ -61,10 +55,7 @@ async fn new_file_creation_records_added() {
     let root = dir.path().to_path_buf();
 
     let mgr = SnapshotManager::new();
-    let session = mgr
-        .start_session("s3".into(), root.clone())
-        .await
-        .unwrap();
+    let session = mgr.start_session("s3".into(), root.clone()).await.unwrap();
 
     fs::write(root.join("new.txt"), "shiny").unwrap();
     session.reconcile().unwrap();
@@ -85,10 +76,7 @@ async fn deletion_records_deleted() {
     fs::write(root.join("dead.txt"), "rip").unwrap();
 
     let mgr = SnapshotManager::new();
-    let session = mgr
-        .start_session("s4".into(), root.clone())
-        .await
-        .unwrap();
+    let session = mgr.start_session("s4".into(), root.clone()).await.unwrap();
 
     fs::remove_file(root.join("dead.txt")).unwrap();
     session.reconcile().unwrap();
@@ -186,10 +174,7 @@ async fn approve_advances_baseline() {
     fs::write(root.join("x.txt"), "v1").unwrap();
 
     let mgr = SnapshotManager::new();
-    let session = mgr
-        .start_session("s5".into(), root.clone())
-        .await
-        .unwrap();
+    let session = mgr.start_session("s5".into(), root.clone()).await.unwrap();
 
     fs::write(root.join("x.txt"), "v2").unwrap();
     session.reconcile().unwrap();
@@ -214,10 +199,7 @@ async fn revert_restores_baseline_content() {
     fs::write(root.join("y.txt"), "original").unwrap();
 
     let mgr = SnapshotManager::new();
-    let session = mgr
-        .start_session("s6".into(), root.clone())
-        .await
-        .unwrap();
+    let session = mgr.start_session("s6".into(), root.clone()).await.unwrap();
 
     fs::write(root.join("y.txt"), "edited").unwrap();
     session.reconcile().unwrap();
@@ -235,10 +217,7 @@ async fn revert_added_file_removes_it() {
     let root = dir.path().to_path_buf();
 
     let mgr = SnapshotManager::new();
-    let session = mgr
-        .start_session("s7".into(), root.clone())
-        .await
-        .unwrap();
+    let session = mgr.start_session("s7".into(), root.clone()).await.unwrap();
 
     fs::write(root.join("brand_new.txt"), "added").unwrap();
     session.reconcile().unwrap();
@@ -256,10 +235,7 @@ async fn binary_file_does_not_inline_content() {
     fs::write(root.join("img.png"), [0u8; 16]).unwrap();
 
     let mgr = SnapshotManager::new();
-    let session = mgr
-        .start_session("s8".into(), root.clone())
-        .await
-        .unwrap();
+    let session = mgr.start_session("s8".into(), root.clone()).await.unwrap();
 
     let mut bin: Vec<u8> = vec![0u8; 16];
     bin.extend_from_slice(&[1, 2, 3, 4, 5]);
@@ -285,10 +261,7 @@ async fn symlink_recorded_with_target_only() {
     fs::write(root.join("real.txt"), "data").unwrap();
 
     let mgr = SnapshotManager::new();
-    let session = mgr
-        .start_session("s9".into(), root.clone())
-        .await
-        .unwrap();
+    let session = mgr.start_session("s9".into(), root.clone()).await.unwrap();
 
     std::os::unix::fs::symlink(root.join("real.txt"), root.join("link.txt")).unwrap();
     session.reconcile().unwrap();
@@ -311,10 +284,7 @@ async fn tool_hook_attribution_is_recorded() {
     fs::write(root.join("z.txt"), "v1").unwrap();
 
     let mgr = SnapshotManager::new();
-    let session = mgr
-        .start_session("s10".into(), root.clone())
-        .await
-        .unwrap();
+    let session = mgr.start_session("s10".into(), root.clone()).await.unwrap();
 
     let ctx = ToolHookCtx {
         tool_call_id: "call-42".into(),
@@ -341,10 +311,7 @@ async fn approve_idempotent() {
     fs::write(root.join("a.txt"), "v1").unwrap();
 
     let mgr = SnapshotManager::new();
-    let session = mgr
-        .start_session("s11".into(), root.clone())
-        .await
-        .unwrap();
+    let session = mgr.start_session("s11".into(), root.clone()).await.unwrap();
 
     fs::write(root.join("a.txt"), "v2").unwrap();
     session.reconcile().unwrap();
@@ -364,10 +331,7 @@ async fn drop_session_cleans_disk_state() {
     let canon = std::fs::canonicalize(&root).unwrap();
 
     let mgr = SnapshotManager::new();
-    let _session = mgr
-        .start_session("s12".into(), root.clone())
-        .await
-        .unwrap();
+    let _session = mgr.start_session("s12".into(), root.clone()).await.unwrap();
 
     let session_dir = canon.join(".magi/snapshots/index/s12");
     assert!(session_dir.exists());
@@ -383,10 +347,7 @@ async fn reconcile_catches_missed_events() {
     fs::write(root.join("init.txt"), "init").unwrap();
 
     let mgr = SnapshotManager::new();
-    let session = mgr
-        .start_session("s13".into(), root.clone())
-        .await
-        .unwrap();
+    let session = mgr.start_session("s13".into(), root.clone()).await.unwrap();
 
     // 关闭 watcher 模拟漏事件场景。
     session.archive().await;

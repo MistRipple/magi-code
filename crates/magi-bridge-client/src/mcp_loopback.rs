@@ -1,11 +1,10 @@
 use crate::{
-    BridgeResponse, McpManagerDescribeServerResponse,
-    McpManagerLifecycleEvent as McpLifecycleEvent,
+    BridgeResponse, LOOPBACK_MCP_SERVER_NAME, LOOPBACK_MCP_TOOL_NAME,
+    McpManagerDescribeServerResponse, McpManagerLifecycleEvent as McpLifecycleEvent,
     McpManagerLifecycleEventKind as McpLifecycleEventKind, McpManagerListServersResponse,
     McpManagerServerHealthUpdateRequest, McpManagerServerLifecycleState as McpServerLifecycleState,
     McpManagerServerOperationResponse, McpManagerServerRegistrationRequest,
-    McpManagerServerSelectionRequest, McpToolCallRequest, LOOPBACK_MCP_SERVER_NAME,
-    LOOPBACK_MCP_TOOL_NAME,
+    McpManagerServerSelectionRequest, McpToolCallRequest,
     local_process_protocol::{
         BridgeServerCommandCapabilityProfile, BridgeServerContextResolutionBoundary,
         BridgeServerKind, BridgeServerServiceCatalog, BridgeServerServiceDescriptor,

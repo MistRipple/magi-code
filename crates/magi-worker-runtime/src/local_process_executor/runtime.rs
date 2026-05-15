@@ -9,8 +9,8 @@ use super::types::{
     WorkerExecutionLeaseState, WorkerExecutionProcessLifecycle, WorkerExecutorFailure,
 };
 use crate::{
-    WorkerExecutor, WorkerExecutionFinalReport, WorkerExecutionIntent,
-    WorkerExecutionStepKind, WorkerExecutionTrace, WorkerExecutorKind, WorkerExecutorProbe,
+    WorkerExecutionFinalReport, WorkerExecutionIntent, WorkerExecutionStepKind,
+    WorkerExecutionTrace, WorkerExecutor, WorkerExecutorKind, WorkerExecutorProbe,
     WorkerExecutorRequest, WorkerStage,
 };
 use magi_core::{TaskResultKind, TerminationReason, UtcMillis, VerificationStatus};

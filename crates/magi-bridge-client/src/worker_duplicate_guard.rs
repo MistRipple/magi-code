@@ -7,7 +7,8 @@ const SUCCESS_WRITE_CACHE_TTL_MS: u64 = 600_000;
 const READ_ONLY_DEDUP_TTL_MS: u64 = 600_000;
 
 /// 通过 PermissionEngine 的内置只读工具表共用一份判定，避免本地再维护副本。
-static PERMISSION_ENGINE: Lazy<PermissionEngine> = Lazy::new(PermissionEngine::with_builtin_defaults);
+static PERMISSION_ENGINE: Lazy<PermissionEngine> =
+    Lazy::new(PermissionEngine::with_builtin_defaults);
 
 fn write_dedup_tool_names() -> HashSet<&'static str> {
     [

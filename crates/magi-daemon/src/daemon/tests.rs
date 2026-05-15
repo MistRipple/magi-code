@@ -2,12 +2,10 @@ use super::{
     config::DaemonConfig,
     events::ledger_status_payload,
     maintenance::{
-        RuntimeMaintenanceStepOutcome, RuntimeMaintenance, RuntimeMaintenanceConfig,
-        RuntimeMaintenancePolicy, session_sidecar_flush_due, workspace_sidecar_flush_due,
+        RuntimeMaintenance, RuntimeMaintenanceConfig, RuntimeMaintenancePolicy,
+        RuntimeMaintenanceStepOutcome, session_sidecar_flush_due, workspace_sidecar_flush_due,
     },
-    persistence::{
-        RuntimeSidecarFlushReport, RuntimeSidecarPersistence, StateRepository,
-    },
+    persistence::{RuntimeSidecarFlushReport, RuntimeSidecarPersistence, StateRepository},
     runtime::DaemonRuntime,
     types::{DaemonMaintenanceMode, DaemonMaintenancePolicyProfile},
 };
@@ -468,11 +466,10 @@ fn runtime_sidecar_flush_persists_canonical_turns_to_session_durable_state() {
             Some(workspace_id.to_string()),
         )
         .expect("workspace session should be creatable");
-    let (_mission_id, orchestrator_thread_id) = session_store.ensure_session_mission(
-        &session_id,
-        UtcMillis(5),
-        || MissionId::new("mission-flush-canonical"),
-    );
+    let (_mission_id, orchestrator_thread_id) =
+        session_store.ensure_session_mission(&session_id, UtcMillis(5), || {
+            MissionId::new("mission-flush-canonical")
+        });
     session_store
         .upsert_current_turn(
             session_id.clone(),
@@ -762,8 +759,8 @@ async fn daemon_runtime_recovery_preflight_executes_and_followup_router_dispatch
  {
     let state_root = temp_state_root("router-recovery-preflight");
     let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
-    let runtime = DaemonRuntime::restore(&config)
-        .expect("runtime restore should bootstrap empty state");
+    let runtime =
+        DaemonRuntime::restore(&config).expect("runtime restore should bootstrap empty state");
     let (app, state) = runtime.router_with_state_for_tests("daemon-test".to_string());
     let pipeline = state
         .execution_pipeline()
@@ -1048,8 +1045,8 @@ async fn daemon_runtime_recovery_preflight_executes_and_followup_router_dispatch
 async fn daemon_bootstrap_exports_session_action_context_summary_after_followup_dispatch() {
     let state_root = temp_state_root("router-bootstrap-context-summary");
     let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
-    let runtime = DaemonRuntime::restore(&config)
-        .expect("runtime restore should bootstrap empty state");
+    let runtime =
+        DaemonRuntime::restore(&config).expect("runtime restore should bootstrap empty state");
     let (app, state) = runtime.router_with_state_for_tests("daemon-test".to_string());
     let session_id = SessionId::new("test-session-bootstrap");
     let active_workspace_id = state
@@ -1155,8 +1152,8 @@ async fn daemon_bootstrap_exports_session_action_context_summary_after_followup_
 async fn daemon_bootstrap_exports_recovery_context_after_resume_and_followup_dispatch() {
     let state_root = temp_state_root("router-bootstrap-recovery-context");
     let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
-    let runtime = DaemonRuntime::restore(&config)
-        .expect("runtime restore should bootstrap empty state");
+    let runtime =
+        DaemonRuntime::restore(&config).expect("runtime restore should bootstrap empty state");
     let (app, state) = runtime.router_with_state_for_tests("daemon-test".to_string());
     let session_id = magi_core::SessionId::new("test-session-bootstrap-recovery");
     let active_workspace_id = state
@@ -2272,8 +2269,8 @@ fn graceful_shutdown_marks_runtime_status_complete_after_final_tick() {
 async fn session_action_happy_path_creates_tasks_and_records_timeline_messages() {
     let state_root = temp_state_root("e2e-session-action-messages");
     let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
-    let runtime = DaemonRuntime::restore(&config)
-        .expect("runtime restore should bootstrap empty state");
+    let runtime =
+        DaemonRuntime::restore(&config).expect("runtime restore should bootstrap empty state");
     let (app, _state) = runtime.router_with_state_for_tests("daemon-test".to_string());
 
     let (status, body) = post_json(
@@ -3077,8 +3074,8 @@ async fn unbound_session_continue_survives_runtime_restart() {
     drop(state);
     drop(runtime);
 
-    let restarted_runtime = DaemonRuntime::restore(&config)
-        .expect("restart should recover unbound session state");
+    let restarted_runtime =
+        DaemonRuntime::restore(&config).expect("restart should recover unbound session state");
     let (restarted_app, restarted_state) =
         restarted_runtime.router_with_state_for_tests("daemon-test".to_string());
 
@@ -3127,8 +3124,8 @@ async fn unbound_session_continue_survives_runtime_restart() {
 async fn session_action_publishes_domain_event_on_event_bus() {
     let state_root = temp_state_root("e2e-session-action-events");
     let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
-    let runtime = DaemonRuntime::restore(&config)
-        .expect("runtime restore should bootstrap empty state");
+    let runtime =
+        DaemonRuntime::restore(&config).expect("runtime restore should bootstrap empty state");
     let (app, state) = runtime.router_with_state_for_tests("daemon-test".to_string());
     let active_workspace_id = state
         .workspace_registry
@@ -3190,8 +3187,8 @@ async fn session_action_publishes_domain_event_on_event_bus() {
 async fn sequential_session_actions_share_session_and_accumulate_messages() {
     let state_root = temp_state_root("e2e-sequential-actions");
     let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
-    let runtime = DaemonRuntime::restore(&config)
-        .expect("runtime restore should bootstrap empty state");
+    let runtime =
+        DaemonRuntime::restore(&config).expect("runtime restore should bootstrap empty state");
     let (app, _state) = runtime.router_with_state_for_tests("daemon-test".to_string());
 
     let (status, first_body) = post_json(

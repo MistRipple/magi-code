@@ -16,8 +16,7 @@ use magi_core::WorkspaceRootPath;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
-    fs,
-    io,
+    fs, io,
     path::{Path, PathBuf},
     sync::{Arc, RwLock},
 };
@@ -121,10 +120,7 @@ impl ProjectMemoryStore {
         workspace_root: &WorkspaceRootPath,
     ) -> Result<Self, ProjectMemoryError> {
         let slug = workspace_slug(workspace_root.as_str());
-        let root = magi_home
-            .join("projects")
-            .join(slug)
-            .join("memory");
+        let root = magi_home.join("projects").join(slug).join("memory");
         fs::create_dir_all(&root).map_err(|source| ProjectMemoryError::Io {
             path: root.clone(),
             source,
@@ -316,9 +312,8 @@ impl ProjectMemoryRegistry {
     /// 解析 magi home（`~/.magi`）；解析失败时回退到 `$TMPDIR/magi-project-memory`
     /// 以保证 dispatcher 在 CI / 沙箱环境下仍可构造。生产环境总是命中 `~/.magi`。
     pub fn new() -> Self {
-        let magi_home = magi_home_dir().unwrap_or_else(|_| {
-            std::env::temp_dir().join("magi-project-memory")
-        });
+        let magi_home =
+            magi_home_dir().unwrap_or_else(|_| std::env::temp_dir().join("magi-project-memory"));
         Self {
             inner: RwLock::new(HashMap::new()),
             magi_home,
@@ -681,7 +676,10 @@ pub fn execute_memory_write_tool(
     };
     let _ = event_bus.publish(
         EventEnvelope::domain(
-            EventId::new(format!("event-project-memory-updated-{}", UtcMillis::now().0)),
+            EventId::new(format!(
+                "event-project-memory-updated-{}",
+                UtcMillis::now().0
+            )),
             "task.project_memory.updated",
             serde_json::json!({
                 "task_id": task_id.to_string(),

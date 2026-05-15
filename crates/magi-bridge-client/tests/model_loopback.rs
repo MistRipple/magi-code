@@ -1,7 +1,7 @@
 use magi_bridge_client::{
     BridgeServerKind, BridgeTransport, BridgeTransportError, BridgeTransportRequest,
     JsonRpcBridgeServerProbeClient, JsonRpcModelBridgeClient, JsonRpcStdioTransport,
-    ModelBridgeClient, ModelInvocationRequest, LOOPBACK_MODEL_PROVIDER,
+    LOOPBACK_MODEL_PROVIDER, ModelBridgeClient, ModelInvocationRequest,
 };
 use serde_json::{Value, json};
 use std::{

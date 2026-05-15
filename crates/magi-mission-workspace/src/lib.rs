@@ -116,7 +116,10 @@ impl MissionWorkspaceStore {
         out.push_str("# Mission Workspace\n\n");
         out.push_str(&format!("- mission_id: {}\n", ws.mission_id.as_str()));
         out.push_str(&format!("- workspace_root: {}\n", ws.root.display()));
-        out.push_str(&format!("- artifacts_dir: {}\n", ws.artifacts_dir.display()));
+        out.push_str(&format!(
+            "- artifacts_dir: {}\n",
+            ws.artifacts_dir.display()
+        ));
         out.push_str(&format!("- logs_dir: {}\n", ws.logs_dir.display()));
         out.push_str(&format!("- memory_path: {}\n\n", ws.memory_path.display()));
         out.push_str(
@@ -207,8 +210,8 @@ mod tests {
     fn ensure_creates_workspace_skeleton() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let ws_root = make_workspace_root(tmp.path());
-        let store = MissionWorkspaceStore::open_with_home(tmp.path(), &ws_root)
-            .expect("open store");
+        let store =
+            MissionWorkspaceStore::open_with_home(tmp.path(), &ws_root).expect("open store");
         let mission_id = MissionId::new("mission-abc".to_string());
 
         let ws = store.ensure(&mission_id).expect("ensure ok");
@@ -223,8 +226,8 @@ mod tests {
     fn ensure_is_idempotent() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let ws_root = make_workspace_root(tmp.path());
-        let store = MissionWorkspaceStore::open_with_home(tmp.path(), &ws_root)
-            .expect("open store");
+        let store =
+            MissionWorkspaceStore::open_with_home(tmp.path(), &ws_root).expect("open store");
         let mission_id = MissionId::new("mission-idem".to_string());
 
         store.ensure(&mission_id).expect("first ensure");
@@ -235,8 +238,8 @@ mod tests {
     fn locate_does_not_create_dirs() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let ws_root = make_workspace_root(tmp.path());
-        let store = MissionWorkspaceStore::open_with_home(tmp.path(), &ws_root)
-            .expect("open store");
+        let store =
+            MissionWorkspaceStore::open_with_home(tmp.path(), &ws_root).expect("open store");
         let mission_id = MissionId::new("mission-locate".to_string());
 
         let ws = store.locate(&mission_id);
@@ -247,8 +250,8 @@ mod tests {
     fn render_for_prompt_includes_workspace_paths() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let ws_root = make_workspace_root(tmp.path());
-        let store = MissionWorkspaceStore::open_with_home(tmp.path(), &ws_root)
-            .expect("open store");
+        let store =
+            MissionWorkspaceStore::open_with_home(tmp.path(), &ws_root).expect("open store");
         let mission_id = MissionId::new("mission-prompt".to_string());
 
         let rendered = store.render_for_prompt(&mission_id).expect("render");

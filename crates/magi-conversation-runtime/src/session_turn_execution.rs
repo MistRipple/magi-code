@@ -730,8 +730,8 @@ fn stream_session_turn_round(
             tool_calls: parsed.tool_calls.clone(),
             tool_call_id: None,
         });
-        let snapshot_session = snapshot_manager
-            .and_then(|mgr| mgr.get_session(request.session_id.as_str()));
+        let snapshot_session =
+            snapshot_manager.and_then(|mgr| mgr.get_session(request.session_id.as_str()));
         let execution_group_id = session_store
             .execution_ownership(&request.session_id)
             .and_then(|ownership| ownership.mission_id)
@@ -1089,11 +1089,10 @@ mod tests {
         store
             .create_session(session_id.clone(), "placeholder reuse")
             .expect("session should be creatable");
-        let (_mission_id, orchestrator_thread_id) = store.ensure_session_mission(
-            &session_id,
-            ts(900),
-            || magi_core::MissionId::new("mission-placeholder-reuse"),
-        );
+        let (_mission_id, orchestrator_thread_id) =
+            store.ensure_session_mission(&session_id, ts(900), || {
+                magi_core::MissionId::new("mission-placeholder-reuse")
+            });
         let mut user_item = session_turn_item(
             "user_message",
             "completed",
@@ -1425,11 +1424,10 @@ mod tests {
         store
             .create_session(session_id.clone(), "post tool final")
             .expect("session should be creatable");
-        let (_mission_id, orchestrator_thread_id) = store.ensure_session_mission(
-            &session_id,
-            ts(1000),
-            || magi_core::MissionId::new("mission-post-tool-final-item"),
-        );
+        let (_mission_id, orchestrator_thread_id) =
+            store.ensure_session_mission(&session_id, ts(1000), || {
+                magi_core::MissionId::new("mission-post-tool-final-item")
+            });
         store
             .upsert_current_turn(
                 session_id.clone(),
@@ -1556,11 +1554,10 @@ mod tests {
         store
             .create_session(session_id.clone(), "terminal duration")
             .expect("session should be creatable");
-        let (_mission_id, orchestrator_thread_id) = store.ensure_session_mission(
-            &session_id,
-            ts(1000),
-            || magi_core::MissionId::new("mission-terminal-duration"),
-        );
+        let (_mission_id, orchestrator_thread_id) =
+            store.ensure_session_mission(&session_id, ts(1000), || {
+                magi_core::MissionId::new("mission-terminal-duration")
+            });
         store
             .upsert_current_turn(
                 session_id.clone(),

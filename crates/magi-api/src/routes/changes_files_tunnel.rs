@@ -46,10 +46,7 @@ async fn require_snapshot_session(
     session_id: &SessionId,
 ) -> Result<Arc<SnapshotSession>, ApiError> {
     state.snapshot_session(session_id).ok_or_else(|| {
-        ApiError::InvalidInput(format!(
-            "会话 {} 的快照账本尚未就绪",
-            session_id.as_str()
-        ))
+        ApiError::InvalidInput(format!("会话 {} 的快照账本尚未就绪", session_id.as_str()))
     })
 }
 
@@ -677,7 +674,10 @@ mod tests {
         let sid = SessionId::new(session_id);
         state
             .workspace_registry
-            .register(ws.clone(), AbsolutePath::new(root.to_string_lossy().as_ref()))
+            .register(
+                ws.clone(),
+                AbsolutePath::new(root.to_string_lossy().as_ref()),
+            )
             .expect("workspace should register");
         state
             .session_store
@@ -704,8 +704,8 @@ mod tests {
     #[tokio::test]
     async fn lan_access_uses_current_daemon_port() {
         let root = unique_temp_dir("magi-changes-route-lan-access");
-        let state = build_state_with_workspace_root(&root, "workspace-lan-access")
-            .with_tunnel_port(39219);
+        let state =
+            build_state_with_workspace_root(&root, "workspace-lan-access").with_tunnel_port(39219);
 
         let response = routes()
             .with_state(state)

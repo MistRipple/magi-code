@@ -2,7 +2,8 @@ use crate::tool_result_utils::{
     summarize_tool_result, tool_execution_status_label, turn_item_status_for_tool_result,
 };
 use crate::{
-    SKILL_APPLY_TOOL_NAME, execute_skill_apply_from_runtime, internal_builtin_tool_rejection_payload,
+    SKILL_APPLY_TOOL_NAME, execute_skill_apply_from_runtime,
+    internal_builtin_tool_rejection_payload,
 };
 use magi_bridge_client::{
     ChatMessage, ChatToolCall,
@@ -1364,11 +1365,10 @@ mod tests {
             .expect("session should be creatable");
 
         let now = UtcMillis::now();
-        let (_, orchestrator_thread_id) = session_store.ensure_session_mission(
-            &session_id,
-            now,
-            || MissionId::new("mission-worker-lane-authority"),
-        );
+        let (_, orchestrator_thread_id) =
+            session_store.ensure_session_mission(&session_id, now, || {
+                MissionId::new("mission-worker-lane-authority")
+            });
         let worker_thread_id = ThreadId::new("thread-reviewer-worker-lane-authority");
         session_store.register_thread(ExecutionThread {
             thread_id: worker_thread_id.clone(),

@@ -20,7 +20,10 @@ pub fn routes() -> Router<ApiState> {
     Router::new()
         .route("/knowledge", get(get_project_knowledge))
         .route("/knowledge/clear", post(clear_knowledge))
-        .route("/knowledge/items", get(list_knowledge_items).post(add_knowledge_item))
+        .route(
+            "/knowledge/items",
+            get(list_knowledge_items).post(add_knowledge_item),
+        )
         .route("/knowledge/items/search", get(search_knowledge_items))
         .route("/knowledge/items/update", post(update_knowledge_item))
         .route("/knowledge/items/delete", post(delete_knowledge_item))
@@ -401,9 +404,7 @@ async fn add_knowledge_item(
             ("learning", title, content, source_ref)
         }
         KnowledgeKind::CodeIndex => {
-            return Err(ApiError::InvalidInput(
-                "kind 不支持 codeIndex".to_string(),
-            ));
+            return Err(ApiError::InvalidInput("kind 不支持 codeIndex".to_string()));
         }
     };
     let record = KnowledgeRecord {
@@ -446,10 +447,7 @@ async fn update_knowledge_item(
         .get(&request.knowledge_id)
         .ok_or_else(|| ApiError::not_found("知识记录不存在", &request.knowledge_id))?;
     if existing.workspace_id.as_ref() != Some(&workspace_id) {
-        return Err(ApiError::not_found(
-            "知识记录不存在",
-            &request.knowledge_id,
-        ));
+        return Err(ApiError::not_found("知识记录不存在", &request.knowledge_id));
     }
     if existing.kind == KnowledgeKind::CodeIndex {
         return Err(ApiError::InvalidInput(

@@ -234,11 +234,11 @@ impl HumanCheckpointStore {
     }
 
     /// 是否有任何 pending 条目。若有，调用方需把 mission 对外状态设为 `awaiting_human`。
-    pub fn has_pending(
-        &self,
-        mission_id: &MissionId,
-    ) -> Result<bool, HumanCheckpointError> {
-        Ok(self.load(mission_id)?.map(|l| l.has_pending()).unwrap_or(false))
+    pub fn has_pending(&self, mission_id: &MissionId) -> Result<bool, HumanCheckpointError> {
+        Ok(self
+            .load(mission_id)?
+            .map(|l| l.has_pending())
+            .unwrap_or(false))
     }
 
     /// 运维端 resolve：把指定 sequence 的 pending 条目改为 approved 或 rejected。
@@ -526,16 +526,17 @@ fn render_log(log: &HumanCheckpointLog) -> String {
 }
 
 fn parse_log(raw: &str) -> Result<HumanCheckpointLog, HumanCheckpointError> {
-    let body_start = raw
-        .strip_prefix("---\n")
-        .ok_or_else(|| HumanCheckpointError::InvalidRecord {
-            reason: "缺少 frontmatter 起始 ---".to_string(),
-        })?;
-    let (front, body) = body_start
-        .split_once("\n---\n")
-        .ok_or_else(|| HumanCheckpointError::InvalidRecord {
-            reason: "缺少 frontmatter 结束 ---".to_string(),
-        })?;
+    let body_start =
+        raw.strip_prefix("---\n")
+            .ok_or_else(|| HumanCheckpointError::InvalidRecord {
+                reason: "缺少 frontmatter 起始 ---".to_string(),
+            })?;
+    let (front, body) =
+        body_start
+            .split_once("\n---\n")
+            .ok_or_else(|| HumanCheckpointError::InvalidRecord {
+                reason: "缺少 frontmatter 结束 ---".to_string(),
+            })?;
     let mut mission_id: Option<MissionId> = None;
     let mut created_at: Option<u64> = None;
     let mut updated_at: Option<u64> = None;
@@ -551,18 +552,24 @@ fn parse_log(raw: &str) -> Result<HumanCheckpointLog, HumanCheckpointError> {
         match key.trim() {
             "mission_id" => mission_id = Some(MissionId::new(value.to_string())),
             "created_at" => {
-                created_at = Some(value.parse().map_err(|_| {
-                    HumanCheckpointError::InvalidRecord {
-                        reason: format!("created_at 解析失败：{value}"),
-                    }
-                })?)
+                created_at =
+                    Some(
+                        value
+                            .parse()
+                            .map_err(|_| HumanCheckpointError::InvalidRecord {
+                                reason: format!("created_at 解析失败：{value}"),
+                            })?,
+                    )
             }
             "updated_at" => {
-                updated_at = Some(value.parse().map_err(|_| {
-                    HumanCheckpointError::InvalidRecord {
-                        reason: format!("updated_at 解析失败：{value}"),
-                    }
-                })?)
+                updated_at =
+                    Some(
+                        value
+                            .parse()
+                            .map_err(|_| HumanCheckpointError::InvalidRecord {
+                                reason: format!("updated_at 解析失败：{value}"),
+                            })?,
+                    )
             }
             _ => {}
         }
@@ -579,11 +586,10 @@ fn parse_log(raw: &str) -> Result<HumanCheckpointLog, HumanCheckpointError> {
         if trimmed.is_empty() || trimmed.starts_with("##") {
             continue;
         }
-        let entry: HumanCheckpoint = serde_json::from_str(trimmed).map_err(|err| {
-            HumanCheckpointError::InvalidRecord {
+        let entry: HumanCheckpoint =
+            serde_json::from_str(trimmed).map_err(|err| HumanCheckpointError::InvalidRecord {
                 reason: format!("human_checkpoint 行解析失败：{err} ({trimmed})"),
-            }
-        })?;
+            })?;
         entries.push(entry);
     }
     Ok(HumanCheckpointLog {
@@ -704,11 +710,7 @@ pub fn execute_human_checkpoint_request_tool(
             ExecutionResultStatus::Failed,
         );
     }
-    let pending_count = log
-        .entries
-        .iter()
-        .filter(|c| c.status.is_pending())
-        .count();
+    let pending_count = log.entries.iter().filter(|c| c.status.is_pending()).count();
     let payload = serde_json::json!({
         "tool": "human_checkpoint_request",
         "status": "succeeded",
@@ -838,7 +840,12 @@ mod tests {
         let ws_root = WorkspaceRootPath::new(tmp.path().to_string_lossy().to_string());
         let store = HumanCheckpointStore::open_with_home(tmp.path(), &ws_root).expect("open");
         // 空 log 返回 None。
-        assert!(store.render_for_prompt(&mission()).expect("render").is_none());
+        assert!(
+            store
+                .render_for_prompt(&mission())
+                .expect("render")
+                .is_none()
+        );
 
         let mut log = HumanCheckpointLog::new(mission(), UtcMillis(0));
         for i in 0..3 {

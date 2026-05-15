@@ -129,7 +129,10 @@ impl TodoLedger {
             return None;
         }
         let mut lines = Vec::with_capacity(snapshot.len() + 2);
-        lines.push("当前 TodoLedger（本 session 内的任务分解，请优先推进 in_progress 与 pending 项）：".to_string());
+        lines.push(
+            "当前 TodoLedger（本 session 内的任务分解，请优先推进 in_progress 与 pending 项）："
+                .to_string(),
+        );
         for (idx, item) in snapshot.iter().enumerate() {
             lines.push(format!(
                 "{}. {} {}",
@@ -138,9 +141,7 @@ impl TodoLedger {
                 item.content,
             ));
         }
-        lines.push(
-            "如需更新分解或推进状态，请调用 `todo_write` 工具整体覆盖列表。".to_string(),
-        );
+        lines.push("如需更新分解或推进状态，请调用 `todo_write` 工具整体覆盖列表。".to_string());
         Some(lines.join("\n"))
     }
 }
@@ -218,9 +219,7 @@ pub fn parse_todo_write_arguments(arguments_json: &str) -> Result<Vec<TodoItem>,
     let todos = value
         .get("todos")
         .ok_or(TodoWriteError::MissingTodosField)?;
-    let array = todos
-        .as_array()
-        .ok_or(TodoWriteError::TodosNotArray)?;
+    let array = todos.as_array().ok_or(TodoWriteError::TodosNotArray)?;
     let mut items = Vec::with_capacity(array.len());
     for entry in array {
         let object = match entry.as_object() {

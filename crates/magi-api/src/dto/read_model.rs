@@ -189,20 +189,18 @@ fn merge_session_sidecars(
             entry.worker_lanes = turn
                 .worker_lanes
                 .iter()
-                .map(|lane| {
-                    SessionRuntimeTurnLaneSummaryEntry {
-                        lane_id: lane.lane_id.clone(),
-                        lane_seq: lane.lane_seq,
-                        task_id: lane.task_id.to_string(),
-                        worker_id: lane.worker_id.to_string(),
-                        role_id: lane.role_id.clone(),
-                        title: lane.title.clone(),
-                        status: task_store
-                            .and_then(|store| store.get_task(&lane.task_id))
-                            .map(|task| task_status_label(&task.status))
-                            .unwrap_or_else(|| "unknown".to_string()),
-                        is_primary: lane.is_primary,
-                    }
+                .map(|lane| SessionRuntimeTurnLaneSummaryEntry {
+                    lane_id: lane.lane_id.clone(),
+                    lane_seq: lane.lane_seq,
+                    task_id: lane.task_id.to_string(),
+                    worker_id: lane.worker_id.to_string(),
+                    role_id: lane.role_id.clone(),
+                    title: lane.title.clone(),
+                    status: task_store
+                        .and_then(|store| store.get_task(&lane.task_id))
+                        .map(|task| task_status_label(&task.status))
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    is_primary: lane.is_primary,
                 })
                 .collect();
         }

@@ -8,8 +8,8 @@ use magi_bridge_client::{
     BridgeServerServiceCatalog, BridgeServerServiceDescriptor, BridgeTransport,
     BridgeTransportError, BridgeTransportRequest, BridgeTransportResponse,
     LOCAL_BRIDGE_DESCRIBE_SERVICES_METHOD, LOCAL_BRIDGE_HANDSHAKE_METHOD,
-    LOCAL_BRIDGE_HEALTH_METHOD, McpManagerListServersResponse, LOOPBACK_MCP_SERVER_NAME,
-    LOOPBACK_MCP_TOOL_NAME, LOOPBACK_MODEL_PROVIDER,
+    LOCAL_BRIDGE_HEALTH_METHOD, LOOPBACK_MCP_SERVER_NAME, LOOPBACK_MCP_TOOL_NAME,
+    LOOPBACK_MODEL_PROVIDER, McpManagerListServersResponse,
 };
 use serde_json::{Value, json};
 use std::{
@@ -348,7 +348,10 @@ fn preflight_snapshot_provider_executes_real_smoke_checks_from_transports() {
 
     let snapshot = provider.preflight_snapshot();
     assert_eq!(snapshot.services.len(), 2);
-    assert_eq!(snapshot.services[0].checks[0].target, LOOPBACK_MODEL_PROVIDER);
+    assert_eq!(
+        snapshot.services[0].checks[0].target,
+        LOOPBACK_MODEL_PROVIDER
+    );
     assert!(snapshot.services[0].checks[0].ok);
     assert_eq!(snapshot.services[1].checks[0].check_name, "list_servers");
     assert!(snapshot.services[1].checks[0].ok);

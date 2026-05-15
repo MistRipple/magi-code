@@ -183,7 +183,8 @@ impl SafetyGate {
         if tool_name.trim() != "shell_exec" {
             return SafetyDecision::Allow;
         }
-        let command = extract_shell_command(arguments_json).unwrap_or_else(|| arguments_json.to_string());
+        let command =
+            extract_shell_command(arguments_json).unwrap_or_else(|| arguments_json.to_string());
         self.evaluate_text(&command)
     }
 
@@ -220,12 +221,7 @@ impl SafetyGate {
 pub fn rules_from_settings_value(value: &serde_json::Value) -> Vec<SafetyRule> {
     value
         .as_array()
-        .map(|array| {
-            array
-                .iter()
-                .filter_map(rule_from_json)
-                .collect::<Vec<_>>()
-        })
+        .map(|array| array.iter().filter_map(rule_from_json).collect::<Vec<_>>())
         .unwrap_or_default()
 }
 
@@ -351,7 +347,8 @@ mod tests {
     #[test]
     fn custom_category_requires_approval_instead_of_block() {
         let gate = SafetyGate::new(vec![SafetyRule::new("aws s3 rm", SafetyCategory::Custom)]);
-        let args = serde_json::json!({ "command": "aws s3 rm s3://bucket --recursive" }).to_string();
+        let args =
+            serde_json::json!({ "command": "aws s3 rm s3://bucket --recursive" }).to_string();
         match gate.evaluate("shell_exec", &args) {
             SafetyDecision::RequireApproval { category, .. } => {
                 assert_eq!(category, SafetyCategory::Custom);

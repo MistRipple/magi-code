@@ -4,9 +4,7 @@ use crate::change_log::ChangeLog;
 use crate::error::{SnapshotError, SnapshotResult};
 use crate::scan::{read_file_meta, read_large_text_summary, walk_workspace};
 use crate::tool_hook::{ToolHook, ToolHookCtx};
-use crate::types::{
-    ChangeEvent, ChangeKind, ContentKind, FileMeta, PendingChange, SourceKind,
-};
+use crate::types::{ChangeEvent, ChangeKind, ContentKind, FileMeta, PendingChange, SourceKind};
 use crate::watcher::{DebouncedEvent, DebouncedKind, FsWatcher};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -58,8 +56,7 @@ impl SnapshotSession {
             .map_err(|e| SnapshotError::io(&workspace_root, e))?;
 
         let session_dir = snapshots_root.join("index").join(&session_id);
-        std::fs::create_dir_all(&session_dir)
-            .map_err(|e| SnapshotError::io(&session_dir, e))?;
+        std::fs::create_dir_all(&session_dir).map_err(|e| SnapshotError::io(&session_dir, e))?;
 
         let baseline = BaselineIndex::load(&baseline_path(&session_dir))?;
         let refs = RefsIndex::load(&refs_path(&session_dir))?;
@@ -80,7 +77,11 @@ impl SnapshotSession {
         });
 
         // baseline 不存在时（首次启动），后台扫描并填充。
-        let needs_initial_scan = session.baseline.read().expect("baseline poisoned").is_empty();
+        let needs_initial_scan = session
+            .baseline
+            .read()
+            .expect("baseline poisoned")
+            .is_empty();
         if needs_initial_scan {
             session.run_initial_scan(respect_gitignore)?;
         } else {
@@ -162,8 +163,7 @@ impl SnapshotSession {
 
     fn replay_events_into_current(&self) -> SnapshotResult<()> {
         let baseline = self.baseline.read().expect("baseline poisoned");
-        let mut current: HashMap<String, FileMeta> =
-            baseline.entries.clone().into_iter().collect();
+        let mut current: HashMap<String, FileMeta> = baseline.entries.clone().into_iter().collect();
         drop(baseline);
 
         let events = self.events.read_all()?;
@@ -246,10 +246,7 @@ impl SnapshotSession {
             event_id: new_event_id(),
             timestamp_ms: now_ms(),
             change_kind,
-            source: ctx
-                .as_ref()
-                .map(|_| SourceKind::Tool)
-                .unwrap_or(source),
+            source: ctx.as_ref().map(|_| SourceKind::Tool).unwrap_or(source),
             tool_call_id: ctx.as_ref().map(|c| c.tool_call_id.clone()),
             worker_id: ctx.as_ref().and_then(|c| c.worker_id.clone()),
             execution_group_id: ctx.as_ref().and_then(|c| c.execution_group_id.clone()),
@@ -279,19 +276,12 @@ impl SnapshotSession {
             Ok(r) => r.to_string_lossy().replace('\\', "/"),
             Err(_) => return Ok(()),
         };
-        let before = self
-            .current
-            .write()
-            .expect("current poisoned")
-            .remove(&rel);
+        let before = self.current.write().expect("current poisoned").remove(&rel);
         let event = ChangeEvent {
             event_id: new_event_id(),
             timestamp_ms: now_ms(),
             change_kind: ChangeKind::Deleted,
-            source: ctx
-                .as_ref()
-                .map(|_| SourceKind::Tool)
-                .unwrap_or(source),
+            source: ctx.as_ref().map(|_| SourceKind::Tool).unwrap_or(source),
             tool_call_id: ctx.as_ref().map(|c| c.tool_call_id.clone()),
             worker_id: ctx.as_ref().and_then(|c| c.worker_id.clone()),
             execution_group_id: ctx.as_ref().and_then(|c| c.execution_group_id.clone()),
@@ -317,7 +307,11 @@ impl SnapshotSession {
                 Err(_) => continue,
             };
             seen.insert(rel.clone());
-            self.record_upsert(&abs, SourceKind::External, self.active_tool_context_for_path(&abs))?;
+            self.record_upsert(
+                &abs,
+                SourceKind::External,
+                self.active_tool_context_for_path(&abs),
+            )?;
         }
 
         // 处理删除：当前集合 vs seen 集合
@@ -331,7 +325,11 @@ impl SnapshotSession {
         for k in known_paths {
             if !seen.contains(&k) {
                 let abs = self.workspace_root.join(&k);
-                self.record_removal(&abs, SourceKind::External, self.active_tool_context_for_path(&abs))?;
+                self.record_removal(
+                    &abs,
+                    SourceKind::External,
+                    self.active_tool_context_for_path(&abs),
+                )?;
             }
         }
         Ok(())
@@ -559,7 +557,9 @@ impl SnapshotSession {
                     }
                     ContentKind::Symlink => {
                         let target = meta.symlink.as_ref().ok_or_else(|| {
-                            SnapshotError::Internal(format!("baseline symlink target missing for {p}"))
+                            SnapshotError::Internal(format!(
+                                "baseline symlink target missing for {p}"
+                            ))
                         })?;
                         if let Some(parent) = abs.parent() {
                             std::fs::create_dir_all(parent)
@@ -613,11 +613,12 @@ impl SnapshotSession {
             .collect();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut out: Vec<String> = Vec::with_capacity(paths.len());
-        let push = |p: String, seen: &mut std::collections::HashSet<String>, out: &mut Vec<String>| {
-            if seen.insert(p.clone()) {
-                out.push(p);
-            }
-        };
+        let push =
+            |p: String, seen: &mut std::collections::HashSet<String>, out: &mut Vec<String>| {
+                if seen.insert(p.clone()) {
+                    out.push(p);
+                }
+            };
 
         for p in paths {
             push(p.clone(), &mut seen, &mut out);
@@ -631,7 +632,6 @@ impl SnapshotSession {
         }
         Ok(out)
     }
-
 }
 
 impl ToolHook for SnapshotSession {

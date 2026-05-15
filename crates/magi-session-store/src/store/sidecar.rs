@@ -1,5 +1,5 @@
-use super::SessionStore;
 use super::ORCHESTRATOR_ROLE_ID;
+use super::SessionStore;
 use crate::models::{
     ActiveExecutionChain, ActiveExecutionTurn, ActiveExecutionTurnItem, CanonicalToolCall,
     CanonicalTurn, CanonicalTurnItem, CanonicalTurnItemKind, CanonicalTurnItemStatus,
@@ -738,10 +738,7 @@ impl SessionStore {
         session_id: &SessionId,
         role_id: &str,
     ) -> Option<ExecutionThread> {
-        let state = self
-            .state
-            .read()
-            .expect("session state read lock poisoned");
+        let state = self.state.read().expect("session state read lock poisoned");
         state
             .thread_registry
             .iter()
@@ -811,9 +808,7 @@ impl SessionStore {
             .write()
             .expect("session state write lock poisoned");
         for thread in state.thread_registry.iter_mut() {
-            if &thread.session_id == session_id
-                && thread.status != ExecutionThreadStatus::Retired
-            {
+            if &thread.session_id == session_id && thread.status != ExecutionThreadStatus::Retired {
                 thread.status = ExecutionThreadStatus::Retired;
                 thread.last_used_at = now;
             }
@@ -822,10 +817,7 @@ impl SessionStore {
 
     /// 只读快照：用于测试与调试。
     pub fn thread_registry_snapshot(&self, session_id: &SessionId) -> Vec<ExecutionThread> {
-        let state = self
-            .state
-            .read()
-            .expect("session state read lock poisoned");
+        let state = self.state.read().expect("session state read lock poisoned");
         state
             .thread_registry
             .iter()
@@ -839,11 +831,11 @@ impl SessionStore {
     /// 该 thread 由 `ensure_session_mission` 在 session 首次接收 user 输入时
     /// spawn，与 session 共享生命周期。所有归属主线的 item 都以此 thread_id
     /// 作为 `source_thread_id` 锚点。
-    pub fn orchestrator_thread_for_session(&self, session_id: &SessionId) -> Option<ExecutionThread> {
-        let state = self
-            .state
-            .read()
-            .expect("session state read lock poisoned");
+    pub fn orchestrator_thread_for_session(
+        &self,
+        session_id: &SessionId,
+    ) -> Option<ExecutionThread> {
+        let state = self.state.read().expect("session state read lock poisoned");
         state
             .thread_registry
             .iter()
@@ -912,16 +904,10 @@ impl SessionStore {
         session_id: &SessionId,
         source_thread_id: &ThreadId,
     ) -> Option<ThreadVisibility> {
-        let state = self
-            .state
-            .read()
-            .expect("session state read lock poisoned");
-        let thread = state
-            .thread_registry
-            .iter()
-            .find(|thread| {
-                &thread.session_id == session_id && &thread.thread_id == source_thread_id
-            })?;
+        let state = self.state.read().expect("session state read lock poisoned");
+        let thread = state.thread_registry.iter().find(|thread| {
+            &thread.session_id == session_id && &thread.thread_id == source_thread_id
+        })?;
         if thread.role_id == ORCHESTRATOR_ROLE_ID {
             Some(ThreadVisibility::Main)
         } else {
@@ -934,10 +920,7 @@ impl SessionStore {
 
     /// P6b：读取指定 thread 的累积对话历史，用于下一 task 启动时拼接为新 prompt 上文。
     pub fn thread_message_history(&self, thread_id: &ThreadId) -> Vec<ThreadChatMessage> {
-        let state = self
-            .state
-            .read()
-            .expect("session state read lock poisoned");
+        let state = self.state.read().expect("session state read lock poisoned");
         state
             .thread_registry
             .iter()

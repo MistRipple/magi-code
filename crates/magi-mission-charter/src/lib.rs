@@ -60,7 +60,12 @@ pub struct MissionCharter {
 }
 
 impl MissionCharter {
-    pub fn new(mission_id: MissionId, title: impl Into<String>, goal: impl Into<String>, now: UtcMillis) -> Self {
+    pub fn new(
+        mission_id: MissionId,
+        title: impl Into<String>,
+        goal: impl Into<String>,
+        now: UtcMillis,
+    ) -> Self {
         Self {
             mission_id,
             title: title.into(),
@@ -125,7 +130,10 @@ impl MissionCharterStore {
         self.root.join(mission_id.as_str()).join("charter.md")
     }
 
-    pub fn load(&self, mission_id: &MissionId) -> Result<Option<MissionCharter>, MissionCharterError> {
+    pub fn load(
+        &self,
+        mission_id: &MissionId,
+    ) -> Result<Option<MissionCharter>, MissionCharterError> {
         let path = self.charter_path(mission_id);
         let raw = match fs::read_to_string(&path) {
             Ok(s) => s,
@@ -200,9 +208,8 @@ impl MissionCharterRegistry {
     /// 不可失败：home 解析失败时回退到 `$TMPDIR/magi-mission-charter`，
     /// 保证 dispatcher 构造不被 IO 状态阻塞。
     pub fn new() -> Self {
-        let home = dirs_home().unwrap_or_else(|_| {
-            std::env::temp_dir().join("magi-mission-charter")
-        });
+        let home =
+            dirs_home().unwrap_or_else(|_| std::env::temp_dir().join("magi-mission-charter"));
         Self {
             inner: RwLock::new(HashMap::new()),
             home,
@@ -221,7 +228,13 @@ impl MissionCharterRegistry {
         workspace_root: &WorkspaceRootPath,
     ) -> Result<Arc<MissionCharterStore>, MissionCharterError> {
         let key = workspace_root.as_str().to_string();
-        if let Some(found) = self.inner.read().expect("registry read lock").get(&key).cloned() {
+        if let Some(found) = self
+            .inner
+            .read()
+            .expect("registry read lock")
+            .get(&key)
+            .cloned()
+        {
             return Ok(found);
         }
         let store = MissionCharterStore::open_with_home(&self.home, workspace_root)?;
@@ -257,9 +270,11 @@ pub struct MissionCharterWriteArgs {
 pub fn parse_mission_charter_write_arguments(
     raw: &serde_json::Value,
 ) -> Result<MissionCharterWriteArgs, MissionCharterError> {
-    let obj = raw.as_object().ok_or_else(|| MissionCharterError::InvalidCharter {
-        reason: "arguments 必须为对象".to_string(),
-    })?;
+    let obj = raw
+        .as_object()
+        .ok_or_else(|| MissionCharterError::InvalidCharter {
+            reason: "arguments 必须为对象".to_string(),
+        })?;
     let title = obj
         .get("title")
         .and_then(|v| v.as_str())
@@ -278,7 +293,8 @@ pub fn parse_mission_charter_write_arguments(
         && stakeholders.is_none()
     {
         return Err(MissionCharterError::InvalidCharter {
-            reason: "至少需要提供 title/goal/success_criteria/constraints/stakeholders 中一个字段".to_string(),
+            reason: "至少需要提供 title/goal/success_criteria/constraints/stakeholders 中一个字段"
+                .to_string(),
         });
     }
     Ok(MissionCharterWriteArgs {
@@ -299,14 +315,18 @@ fn parse_string_list(
     if value.is_null() {
         return Ok(None);
     }
-    let arr = value.as_array().ok_or_else(|| MissionCharterError::InvalidCharter {
-        reason: "字段必须为字符串数组".to_string(),
-    })?;
+    let arr = value
+        .as_array()
+        .ok_or_else(|| MissionCharterError::InvalidCharter {
+            reason: "字段必须为字符串数组".to_string(),
+        })?;
     let mut out = Vec::with_capacity(arr.len());
     for item in arr {
-        let s = item.as_str().ok_or_else(|| MissionCharterError::InvalidCharter {
-            reason: "数组项必须为字符串".to_string(),
-        })?;
+        let s = item
+            .as_str()
+            .ok_or_else(|| MissionCharterError::InvalidCharter {
+                reason: "数组项必须为字符串".to_string(),
+            })?;
         out.push(s.to_string());
     }
     Ok(Some(out))
@@ -401,9 +421,10 @@ fn render_charter(charter: &MissionCharter) -> String {
 }
 
 fn parse_charter(raw: &str) -> Result<MissionCharter, MissionCharterError> {
-    let (front, body) = split_frontmatter(raw).ok_or_else(|| MissionCharterError::InvalidCharter {
-        reason: "缺少 frontmatter".to_string(),
-    })?;
+    let (front, body) =
+        split_frontmatter(raw).ok_or_else(|| MissionCharterError::InvalidCharter {
+            reason: "缺少 frontmatter".to_string(),
+        })?;
     let mut mission_id: Option<String> = None;
     let mut title: Option<String> = None;
     let mut created_at: Option<u64> = None;
@@ -691,7 +712,10 @@ mod tests {
             updated_at: UtcMillis(1_700_000_000_000),
         };
         store.save(&charter).expect("save");
-        let loaded = store.load(&charter.mission_id).expect("load").expect("present");
+        let loaded = store
+            .load(&charter.mission_id)
+            .expect("load")
+            .expect("present");
         assert_eq!(loaded, charter);
     }
 
@@ -699,7 +723,12 @@ mod tests {
     fn load_returns_none_when_missing() {
         let (home, ws) = tmp_workspace();
         let store = MissionCharterStore::open_with_home(home.path(), &ws).expect("open");
-        assert!(store.load(&MissionId::new("missing")).expect("load").is_none());
+        assert!(
+            store
+                .load(&MissionId::new("missing"))
+                .expect("load")
+                .is_none()
+        );
     }
 
     #[test]
@@ -747,7 +776,10 @@ mod tests {
         .expect("parse");
         assert_eq!(args.title.as_deref(), Some("new"));
         assert!(args.goal.is_none());
-        assert_eq!(args.success_criteria.as_deref().unwrap(), &["a".to_string(), "b".to_string()]);
+        assert_eq!(
+            args.success_criteria.as_deref().unwrap(),
+            &["a".to_string(), "b".to_string()]
+        );
     }
 
     #[test]

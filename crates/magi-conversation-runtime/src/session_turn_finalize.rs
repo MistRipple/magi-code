@@ -414,9 +414,7 @@ pub fn format_root_completion_summary(outputs: &[String]) -> String {
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
-            format!(
-                "已完成，关键结果是：\n\n{bullets}\n\n详细步骤和工具记录已保留在任务卡里。"
-            )
+            format!("已完成，关键结果是：\n\n{bullets}\n\n详细步骤和工具记录已保留在任务卡里。")
         }
     }
 }

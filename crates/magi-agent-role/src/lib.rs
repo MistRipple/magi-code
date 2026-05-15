@@ -283,8 +283,13 @@ mod tests {
     fn builtin_set_contains_coordinator_with_coordinator_mode() {
         let reg = AgentRoleRegistry::from_map(builtin_roles_map());
         let role = reg.get("coordinator").expect("coordinator role exists");
-        assert!(role.coordinator_mode, "coordinator role must enable coordinator_mode");
-        let default = reg.default_coordinator().expect("default_coordinator resolves");
+        assert!(
+            role.coordinator_mode,
+            "coordinator role must enable coordinator_mode"
+        );
+        let default = reg
+            .default_coordinator()
+            .expect("default_coordinator resolves");
         assert_eq!(default.id, "coordinator");
     }
 

@@ -44,7 +44,8 @@ impl SessionLifecycleObserver for SnapshotLifecycleObserver {
         let Some(root) = self.workspace_root_for(workspace_id) else {
             warn!(
                 ?session_id,
-                workspace_id, "snapshot lifecycle: workspace_id 未在 WorkspaceStore 注册，跳过快照启动"
+                workspace_id,
+                "snapshot lifecycle: workspace_id 未在 WorkspaceStore 注册，跳过快照启动"
             );
             return;
         };

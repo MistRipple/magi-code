@@ -215,9 +215,10 @@ impl PermissionEngine {
                 tool_name,
                 is_write_tool,
             } => self.decide_tool(tool_name, *is_write_tool, policy, mode),
-            PermissionRequest::PathAccess { absolute_path, kind } => {
-                self.decide_path(absolute_path, *kind, policy, mode)
-            }
+            PermissionRequest::PathAccess {
+                absolute_path,
+                kind,
+            } => self.decide_path(absolute_path, *kind, policy, mode),
             PermissionRequest::ShellCommand { arguments_json } => {
                 self.decide_shell_command(arguments_json, policy, mode)
             }
@@ -309,8 +310,7 @@ impl PermissionEngine {
         let is_read_only = Self::shell_arguments_request_read_only(arguments_json);
         if policy.is_read_only_command_mode() && !is_read_only {
             return Decision::Deny {
-                reason:
-                    "只读任务中的 shell_exec 必须显式声明 access_mode=read_only".to_string(),
+                reason: "只读任务中的 shell_exec 必须显式声明 access_mode=read_only".to_string(),
             };
         }
         match mode {
@@ -372,12 +372,7 @@ const BUILTIN_READ_ONLY_TOOLS: &[&str] = &[
 
 /// 编辑类写入工具：acceptEdits 模式下自动放行的子集，shell 等其他写入工具
 /// 不在此列。
-const BUILTIN_EDIT_TOOLS: &[&str] = &[
-    "file_create",
-    "file_edit",
-    "file_insert",
-    "file_remove",
-];
+const BUILTIN_EDIT_TOOLS: &[&str] = &["file_create", "file_edit", "file_insert", "file_remove"];
 
 #[cfg(test)]
 mod tests {

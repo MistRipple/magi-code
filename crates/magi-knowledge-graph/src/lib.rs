@@ -90,9 +90,7 @@ impl KnowledgeGraph {
     }
 
     pub fn find_mut(&mut self, kind: KnowledgeKind, id: &str) -> Option<&mut KnowledgeFact> {
-        self.facts
-            .iter_mut()
-            .find(|f| f.kind == kind && f.id == id)
+        self.facts.iter_mut().find(|f| f.kind == kind && f.id == id)
     }
 }
 
@@ -253,12 +251,7 @@ impl KnowledgeGraphRegistry {
         workspace_root: &WorkspaceRootPath,
     ) -> Result<Arc<KnowledgeGraphStore>, KnowledgeGraphError> {
         let key = workspace_root.as_str().to_string();
-        if let Some(store) = self
-            .inner
-            .read()
-            .expect("kg registry poisoned")
-            .get(&key)
-        {
+        if let Some(store) = self.inner.read().expect("kg registry poisoned").get(&key) {
             return Ok(store.clone());
         }
         let store = match KnowledgeGraphStore::open(workspace_root) {
@@ -299,12 +292,11 @@ pub fn parse_kg_write_arguments(
         .ok_or_else(|| KnowledgeGraphError::InvalidKnowledge {
             reason: "arguments 必须为对象".to_string(),
         })?;
-    let kind_raw = obj
-        .get("kind")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| KnowledgeGraphError::InvalidKnowledge {
+    let kind_raw = obj.get("kind").and_then(|v| v.as_str()).ok_or_else(|| {
+        KnowledgeGraphError::InvalidKnowledge {
             reason: "缺少 kind 字段（symbol/decision/risk）".to_string(),
-        })?;
+        }
+    })?;
     let kind = KnowledgeKind::from_str_lenient(kind_raw).ok_or_else(|| {
         KnowledgeGraphError::InvalidKnowledge {
             reason: format!("kind 非法：{kind_raw}"),
@@ -346,11 +338,11 @@ pub fn parse_kg_write_arguments(
         Some(serde_json::Value::Array(items)) => {
             let mut out = Vec::with_capacity(items.len());
             for (idx, item) in items.iter().enumerate() {
-                let s = item.as_str().ok_or_else(|| {
-                    KnowledgeGraphError::InvalidKnowledge {
+                let s = item
+                    .as_str()
+                    .ok_or_else(|| KnowledgeGraphError::InvalidKnowledge {
                         reason: format!("tags[{idx}] 必须为字符串"),
-                    }
-                })?;
+                    })?;
                 out.push(s.to_string());
             }
             out
@@ -439,16 +431,17 @@ fn render_graph(graph: &KnowledgeGraph) -> String {
 }
 
 fn parse_graph(raw: &str) -> Result<KnowledgeGraph, KnowledgeGraphError> {
-    let body_start = raw
-        .strip_prefix("---\n")
-        .ok_or_else(|| KnowledgeGraphError::InvalidKnowledge {
-            reason: "缺少 frontmatter 起始 ---".to_string(),
-        })?;
-    let (front, body) = body_start
-        .split_once("\n---\n")
-        .ok_or_else(|| KnowledgeGraphError::InvalidKnowledge {
-            reason: "缺少 frontmatter 结束 ---".to_string(),
-        })?;
+    let body_start =
+        raw.strip_prefix("---\n")
+            .ok_or_else(|| KnowledgeGraphError::InvalidKnowledge {
+                reason: "缺少 frontmatter 起始 ---".to_string(),
+            })?;
+    let (front, body) =
+        body_start
+            .split_once("\n---\n")
+            .ok_or_else(|| KnowledgeGraphError::InvalidKnowledge {
+                reason: "缺少 frontmatter 结束 ---".to_string(),
+            })?;
     let mut mission_id: Option<MissionId> = None;
     let mut created_at: Option<u64> = None;
     let mut updated_at: Option<u64> = None;
@@ -464,18 +457,24 @@ fn parse_graph(raw: &str) -> Result<KnowledgeGraph, KnowledgeGraphError> {
         match key.trim() {
             "mission_id" => mission_id = Some(MissionId::new(value.to_string())),
             "created_at" => {
-                created_at = Some(value.parse().map_err(|_| {
-                    KnowledgeGraphError::InvalidKnowledge {
-                        reason: format!("created_at 解析失败：{value}"),
-                    }
-                })?)
+                created_at =
+                    Some(
+                        value
+                            .parse()
+                            .map_err(|_| KnowledgeGraphError::InvalidKnowledge {
+                                reason: format!("created_at 解析失败：{value}"),
+                            })?,
+                    )
             }
             "updated_at" => {
-                updated_at = Some(value.parse().map_err(|_| {
-                    KnowledgeGraphError::InvalidKnowledge {
-                        reason: format!("updated_at 解析失败：{value}"),
-                    }
-                })?)
+                updated_at =
+                    Some(
+                        value
+                            .parse()
+                            .map_err(|_| KnowledgeGraphError::InvalidKnowledge {
+                                reason: format!("updated_at 解析失败：{value}"),
+                            })?,
+                    )
             }
             _ => {}
         }
@@ -492,11 +491,10 @@ fn parse_graph(raw: &str) -> Result<KnowledgeGraph, KnowledgeGraphError> {
         if trimmed.is_empty() || trimmed.starts_with("##") {
             continue;
         }
-        let fact: KnowledgeFact = serde_json::from_str(trimmed).map_err(|err| {
-            KnowledgeGraphError::InvalidKnowledge {
+        let fact: KnowledgeFact =
+            serde_json::from_str(trimmed).map_err(|err| KnowledgeGraphError::InvalidKnowledge {
                 reason: format!("fact 行解析失败：{err} ({trimmed})"),
-            }
-        })?;
+            })?;
         facts.push(fact);
     }
 
@@ -748,8 +746,10 @@ mod tests {
             .expect_err("缺 id 必须报错");
         assert!(matches!(err, KnowledgeGraphError::InvalidKnowledge { .. }));
 
-        let err = parse_kg_write_arguments(&serde_json::json!({"kind": "wrong", "id": "x", "content": "y"}))
-            .expect_err("非法 kind 必须报错");
+        let err = parse_kg_write_arguments(
+            &serde_json::json!({"kind": "wrong", "id": "x", "content": "y"}),
+        )
+        .expect_err("非法 kind 必须报错");
         assert!(matches!(err, KnowledgeGraphError::InvalidKnowledge { .. }));
 
         let ok = parse_kg_write_arguments(&serde_json::json!({
@@ -769,8 +769,7 @@ mod tests {
     fn render_and_parse_round_trip() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let ws_root = make_workspace_root(tmp.path());
-        let store = KnowledgeGraphStore::open_with_home(tmp.path(), &ws_root)
-            .expect("open store");
+        let store = KnowledgeGraphStore::open_with_home(tmp.path(), &ws_root).expect("open store");
         let mid = mission();
         let mut graph = KnowledgeGraph::new(mid.clone(), UtcMillis(1000));
         apply_kg_update(
@@ -790,7 +789,10 @@ mod tests {
         let loaded = store.load(&mid).expect("load").expect("must exist");
         assert_eq!(loaded.facts.len(), 1);
         assert_eq!(loaded.facts[0].id, "UserService");
-        assert_eq!(loaded.facts[0].reference.as_deref(), Some("src/user_service.rs"));
+        assert_eq!(
+            loaded.facts[0].reference.as_deref(),
+            Some("src/user_service.rs")
+        );
         assert_eq!(loaded.mission_id, mid);
         assert_eq!(loaded.created_at.0, 1000);
         assert_eq!(loaded.updated_at.0, 1100);
@@ -800,8 +802,7 @@ mod tests {
     fn render_for_prompt_groups_by_kind_and_skips_tombstones() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let ws_root = make_workspace_root(tmp.path());
-        let store = KnowledgeGraphStore::open_with_home(tmp.path(), &ws_root)
-            .expect("open store");
+        let store = KnowledgeGraphStore::open_with_home(tmp.path(), &ws_root).expect("open store");
         let mid = mission();
         let mut graph = KnowledgeGraph::new(mid.clone(), UtcMillis(0));
         apply_kg_update(
@@ -846,8 +847,7 @@ mod tests {
     fn render_for_prompt_empty_returns_none() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let ws_root = make_workspace_root(tmp.path());
-        let store = KnowledgeGraphStore::open_with_home(tmp.path(), &ws_root)
-            .expect("open store");
+        let store = KnowledgeGraphStore::open_with_home(tmp.path(), &ws_root).expect("open store");
         let mid = mission();
         let rendered = store.render_for_prompt(&mid).expect("render");
         assert!(rendered.is_none(), "未建立 KG 时不应注入空段");

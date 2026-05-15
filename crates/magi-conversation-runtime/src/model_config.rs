@@ -211,8 +211,7 @@ impl NormalizedModelConfig {
         }
         if is_openai_execution_endpoint(self.normalized_http_base_url()?.as_str()) {
             return Err(
-                "当前 Base URL 是对话执行端点，请改为服务根地址或 /v1 后再获取模型列表"
-                    .to_string(),
+                "当前 Base URL 是对话执行端点，请改为服务根地址或 /v1 后再获取模型列表".to_string(),
             );
         }
         Ok(())

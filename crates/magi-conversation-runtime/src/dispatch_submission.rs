@@ -18,10 +18,13 @@ use magi_core::{
     TaskStatus, UtcMillis, WorkerId, WorkspaceId,
 };
 use magi_event_bus::{EventContext, InMemoryEventBus, task_events};
-use magi_orchestrator::{DispatchMemoryExtractionInput, ExecutionWritebackPlans, task_store::TaskStore};
+use magi_orchestrator::{
+    DispatchMemoryExtractionInput, ExecutionWritebackPlans, task_store::TaskStore,
+};
 use magi_session_store::{
-    ActiveExecutionBranch, ActiveExecutionChain, ActiveExecutionDispatchContext, ActiveExecutionTurn,
-    ActiveExecutionTurnItem, ActiveExecutionTurnLane, SessionStore, TimelineEntryKind,
+    ActiveExecutionBranch, ActiveExecutionChain, ActiveExecutionDispatchContext,
+    ActiveExecutionTurn, ActiveExecutionTurnItem, ActiveExecutionTurnLane, SessionStore,
+    TimelineEntryKind,
 };
 use magi_spawn_graph::SpawnGraph;
 
@@ -173,9 +176,10 @@ fn build_task_graph(
         obj_task_id,
         act_task_id,
         accepted_at,
-        request.target_role.as_deref().unwrap_or_else(|| {
-            infer_dispatch_task_role(request.skill_name.as_deref())
-        }),
+        request
+            .target_role
+            .as_deref()
+            .unwrap_or_else(|| infer_dispatch_task_role(request.skill_name.as_deref())),
         now,
         &plan,
         runtime.agent_role_registry,
@@ -188,7 +192,9 @@ pub fn run_dispatch_submission(
     runtime: &DispatchSubmissionRuntime<'_>,
     request: &DispatchSubmissionRequest,
 ) -> Result<TaskGraphSubmission, DispatchSubmissionRunError> {
-    let _ = runtime.session_store.ensure_current_turn_acceptance_available(&request.session_id)
+    let _ = runtime
+        .session_store
+        .ensure_current_turn_acceptance_available(&request.session_id)
         .map_err(DispatchSubmissionAcceptError::from_store_error)
         .map_err(|err| match err {
             DispatchSubmissionAcceptError::Conflict { message }
@@ -213,11 +219,12 @@ pub fn run_dispatch_submission(
         })?;
 
     let now = UtcMillis::now();
-    let (mission_id, orchestrator_thread_id) = runtime.session_store.ensure_session_mission(
-        session_id,
-        now,
-        || MissionId::new(format!("mission-session-action-{}", accepted_at.0)),
-    );
+    let (mission_id, orchestrator_thread_id) =
+        runtime
+            .session_store
+            .ensure_session_mission(session_id, now, || {
+                MissionId::new(format!("mission-session-action-{}", accepted_at.0))
+            });
     let worker_id = WorkerId::new(format!("worker-session-action-{}", accepted_at.0));
 
     let obj_task_id = TaskId::new(format!("task-obj-{}", accepted_at.0));
@@ -425,33 +432,31 @@ pub fn run_dispatch_submission(
         status: "accepted".to_string(),
         completed_at: None,
         user_message: trimmed_text.map(str::to_string),
-        items: vec![
-            ActiveExecutionTurnItem {
-                item_id: user_message_item_id,
-                item_seq: 1,
-                lane_id: None,
-                lane_seq: None,
-                kind: "user_message".to_string(),
-                status: "completed".to_string(),
-                source: "user".to_string(),
-                title: None,
-                content: trimmed_text.map(str::to_string),
-                task_id: Some(act_task_id.clone()),
-                worker_id: None,
-                role_id: None,
-                tool_call_id: None,
-                tool_name: None,
-                tool_status: None,
-                tool_arguments: None,
-                tool_result: None,
-                tool_error: None,
-                request_id: request_id.clone(),
-                user_message_id: user_message_id.clone(),
-                placeholder_message_id: placeholder_message_id.clone(),
-                timeline_entry_id: Some(entry_id.to_string()),
-                source_thread_id: orchestrator_thread_id.clone(),
-            },
-        ],
+        items: vec![ActiveExecutionTurnItem {
+            item_id: user_message_item_id,
+            item_seq: 1,
+            lane_id: None,
+            lane_seq: None,
+            kind: "user_message".to_string(),
+            status: "completed".to_string(),
+            source: "user".to_string(),
+            title: None,
+            content: trimmed_text.map(str::to_string),
+            task_id: Some(act_task_id.clone()),
+            worker_id: None,
+            role_id: None,
+            tool_call_id: None,
+            tool_name: None,
+            tool_status: None,
+            tool_arguments: None,
+            tool_result: None,
+            tool_error: None,
+            request_id: request_id.clone(),
+            user_message_id: user_message_id.clone(),
+            placeholder_message_id: placeholder_message_id.clone(),
+            timeline_entry_id: Some(entry_id.to_string()),
+            source_thread_id: orchestrator_thread_id.clone(),
+        }],
         worker_lanes: dispatch_lane_task_ids
             .iter()
             .enumerate()
@@ -526,10 +531,17 @@ pub fn run_dispatch_submission(
             session_id: request.session_id.clone(),
             mission_id,
             root_task_id: obj_task_id,
-            execution_chain_ref: execution_chain_ref.expect("dispatch execution chain ref should exist"),
+            execution_chain_ref: execution_chain_ref
+                .expect("dispatch execution chain ref should exist"),
             workspace_id,
-            active_branch_task_ids: branches.iter().map(|branch| branch.task_id.clone()).collect(),
-            active_worker_bindings: branches.iter().map(|branch| branch.worker_id.clone()).collect(),
+            active_branch_task_ids: branches
+                .iter()
+                .map(|branch| branch.task_id.clone())
+                .collect(),
+            active_worker_bindings: branches
+                .iter()
+                .map(|branch| branch.worker_id.clone())
+                .collect(),
             branches,
             recovery_ref: None,
             dispatch_context: ActiveExecutionDispatchContext {
@@ -638,10 +650,7 @@ fn update_session_execution_branches(
 
     for spec in branch_specs {
         let task = task_store.get_task(&spec.task_id).ok_or_else(|| {
-            DispatchSubmissionRunError::InvalidInput(format!(
-                "待注册任务不存在: {}",
-                spec.task_id
-            ))
+            DispatchSubmissionRunError::InvalidInput(format!("待注册任务不存在: {}", spec.task_id))
         })?;
         if task.mission_id != mission_id || task.root_task_id != root_task_id {
             return Err(DispatchSubmissionRunError::InvalidInput(format!(

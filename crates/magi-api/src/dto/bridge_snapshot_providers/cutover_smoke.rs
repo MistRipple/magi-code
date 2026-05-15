@@ -1,9 +1,9 @@
 use magi_bridge_client::{
     BridgeClientError, BridgeResponse, BridgeServerKind, BridgeServerServiceCatalog,
     BridgeTransport, HttpModelBridgeClient, JsonRpcBridgeServerProbeClient, JsonRpcMcpBridgeClient,
-    JsonRpcMcpManagerClient, JsonRpcModelBridgeClient, McpBridgeClient,
+    JsonRpcMcpManagerClient, JsonRpcModelBridgeClient, LOOPBACK_MODEL_PROVIDER, McpBridgeClient,
     McpManagerServerSelectionRequest, McpToolCallRequest, ModelBridgeClient,
-    ModelInvocationRequest, LOOPBACK_MODEL_PROVIDER,
+    ModelInvocationRequest,
 };
 use serde_json::Value;
 use std::sync::Arc;

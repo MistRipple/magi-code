@@ -76,11 +76,8 @@ impl BlobStore {
             content.to_vec()
         };
 
-        let tmp = target.with_file_name(format!(
-            "{TEMP_PREFIX}-{}-{}",
-            std::process::id(),
-            now_ns()
-        ));
+        let tmp =
+            target.with_file_name(format!("{TEMP_PREFIX}-{}-{}", std::process::id(), now_ns()));
 
         {
             let mut f = OpenOptions::new()
@@ -88,7 +85,8 @@ impl BlobStore {
                 .create_new(true)
                 .open(&tmp)
                 .map_err(|e| SnapshotError::io(&tmp, e))?;
-            f.write_all(&payload).map_err(|e| SnapshotError::io(&tmp, e))?;
+            f.write_all(&payload)
+                .map_err(|e| SnapshotError::io(&tmp, e))?;
             f.sync_all().map_err(|e| SnapshotError::io(&tmp, e))?;
         }
 
@@ -104,7 +102,8 @@ impl BlobStore {
             _ => SnapshotError::io(&path, e),
         })?;
         let mut buf = Vec::new();
-        f.read_to_end(&mut buf).map_err(|e| SnapshotError::io(&path, e))?;
+        f.read_to_end(&mut buf)
+            .map_err(|e| SnapshotError::io(&path, e))?;
         if compressed {
             zstd::stream::decode_all(buf.as_slice())
                 .map_err(|e| SnapshotError::Internal(format!("zstd decode failed: {e}")))
@@ -172,18 +171,15 @@ pub(crate) fn write_atomic(path: &Path, payload: &[u8]) -> SnapshotResult<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| SnapshotError::io(parent, e))?;
     }
-    let tmp = path.with_file_name(format!(
-        "{TEMP_PREFIX}-{}-{}",
-        std::process::id(),
-        now_ns()
-    ));
+    let tmp = path.with_file_name(format!("{TEMP_PREFIX}-{}-{}", std::process::id(), now_ns()));
     {
         let mut f = OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&tmp)
             .map_err(|e| SnapshotError::io(&tmp, e))?;
-        f.write_all(payload).map_err(|e| SnapshotError::io(&tmp, e))?;
+        f.write_all(payload)
+            .map_err(|e| SnapshotError::io(&tmp, e))?;
         f.sync_all().map_err(|e| SnapshotError::io(&tmp, e))?;
     }
     fs::rename(&tmp, path).map_err(|e| SnapshotError::io(path, e))?;

@@ -51,11 +51,10 @@ pub use types::{
     BridgeResponse, BridgeTransport, BridgeTransportError, BridgeTransportRequest,
     BridgeTransportResponse, ChatCompletionPayload, ChatMessage, ChatToolCall, ChatToolChoice,
     ChatToolChoiceFunction, ChatToolDefinition, ChatToolFunction, ChatToolFunctionDefinition,
-    McpBridgeClient,
+    LOOPBACK_MCP_SERVER_NAME, LOOPBACK_MCP_TOOL_NAME, LOOPBACK_MODEL_PROVIDER, McpBridgeClient,
     McpManagerDescribeServerResponse, McpManagerLifecycleEvent, McpManagerLifecycleEventKind,
     McpManagerListServersResponse, McpManagerServerHealthUpdateRequest,
     McpManagerServerLifecycleState, McpManagerServerOperationResponse,
     McpManagerServerRegistrationRequest, McpManagerServerSelectionRequest, McpToolCallRequest,
-    ModelBridgeClient, ModelInvocationRequest, ModelStreamingDelta, LOOPBACK_MCP_SERVER_NAME,
-    LOOPBACK_MCP_TOOL_NAME, LOOPBACK_MODEL_PROVIDER,
+    ModelBridgeClient, ModelInvocationRequest, ModelStreamingDelta,
 };

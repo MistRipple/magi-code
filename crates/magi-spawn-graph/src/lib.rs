@@ -176,21 +176,14 @@ impl SpawnGraph {
             created_at: now,
             closed_at: None,
         };
-        self.children
-            .entry(parent)
-            .or_default()
-            .push(child.clone());
+        self.children.entry(parent).or_default().push(child.clone());
         self.edges.insert(child, edge);
         Ok(())
     }
 
     /// 子任务完成（成功 / 失败 / 取消）时由 caller 调用。重复关闭不报错，
     /// 便于 caller 在不知道当前状态的情况下幂等调用。
-    pub fn mark_closed(
-        &mut self,
-        child: &TaskId,
-        now: SystemTime,
-    ) -> Result<(), SpawnGraphError> {
+    pub fn mark_closed(&mut self, child: &TaskId, now: SystemTime) -> Result<(), SpawnGraphError> {
         let edge = self
             .edges
             .get_mut(child)

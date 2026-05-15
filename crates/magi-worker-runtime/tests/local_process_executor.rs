@@ -14,13 +14,13 @@ use magi_tool_runtime::ToolExecutionPolicy;
 use magi_worker_runtime::{
     LocalProcessExecutorDescriptor, LocalProcessExecutorHealth, LocalProcessExecutorHealthStatus,
     LocalProcessExecutorProcessModel, LocalProcessProbeResponse, LocalProcessProtocolResponse,
-    LocalProcessProtocolResponseKind, LocalProcessWorkerExecutor, WorkerExecutor,
-    WorkerCheckpointResumeMode, WorkerExecutionBindingLifecycle, WorkerExecutionBindingScope,
-    WorkerExecutionCheckpointCursor, WorkerExecutionFinalReport, WorkerExecutionIntent,
-    WorkerExecutionIntentStep, WorkerExecutionLeaseState, WorkerExecutionMode,
-    WorkerExecutionParallelismScope, WorkerExecutionProcessLifecycle, WorkerExecutionProfile,
-    WorkerExecutionReusePolicy, WorkerExecutionStepKind, WorkerExecutorFailureLayer,
-    WorkerLoopAction, WorkerLoopOutcomeKind, WorkerRuntime, WorkerStage,
+    LocalProcessProtocolResponseKind, LocalProcessWorkerExecutor, WorkerCheckpointResumeMode,
+    WorkerExecutionBindingLifecycle, WorkerExecutionBindingScope, WorkerExecutionCheckpointCursor,
+    WorkerExecutionFinalReport, WorkerExecutionIntent, WorkerExecutionIntentStep,
+    WorkerExecutionLeaseState, WorkerExecutionMode, WorkerExecutionParallelismScope,
+    WorkerExecutionProcessLifecycle, WorkerExecutionProfile, WorkerExecutionReusePolicy,
+    WorkerExecutionStepKind, WorkerExecutor, WorkerExecutorFailureLayer, WorkerLoopAction,
+    WorkerLoopOutcomeKind, WorkerRuntime, WorkerStage,
 };
 
 fn worker_id(value: &str) -> WorkerId {
@@ -238,10 +238,7 @@ fn local_process_executor_probe_reports_capability_and_health() {
     let executor = LocalProcessWorkerExecutor::cargo_loopback();
     let probe = executor.probe().expect("probe should succeed");
     assert_eq!(probe.executor_id, "local-process-worker-executor");
-    assert_eq!(
-        probe.executor_version,
-        "worker-local-process-executor-v2"
-    );
+    assert_eq!(probe.executor_version, "worker-local-process-executor-v2");
     assert_eq!(
         probe.executor_kind,
         magi_worker_runtime::WorkerExecutorKind::LocalProcess
@@ -316,10 +313,7 @@ fn local_process_executor_exposes_identity_and_step_capability_override() {
 
     let probe = executor.probe().expect("probe should succeed");
     assert_eq!(probe.executor_id, "local-process-test");
-    assert_eq!(
-        probe.executor_version,
-        "worker-local-process-test-v9"
-    );
+    assert_eq!(probe.executor_version, "worker-local-process-test-v9");
     assert_eq!(
         probe.capability.supported_step_kinds,
         vec![WorkerExecutionStepKind::FinalReport]

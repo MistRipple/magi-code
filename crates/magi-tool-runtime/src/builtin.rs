@@ -121,7 +121,9 @@ impl BuiltinTool for NormalizedBuiltinTool {
             | BuiltinToolName::KgWrite
             | BuiltinToolName::ValidationRecord
             | BuiltinToolName::Checkpoint
-            | BuiltinToolName::HumanCheckpointRequest => execute_orchestration_only(self.name, input),
+            | BuiltinToolName::HumanCheckpointRequest => {
+                execute_orchestration_only(self.name, input)
+            }
         }
     }
 

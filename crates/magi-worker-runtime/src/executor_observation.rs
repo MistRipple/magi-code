@@ -1,11 +1,10 @@
 use crate::{
     DeterministicWorkerExecutor, EventCategory, EventContext, LocalProcessExecutorHealthStatus,
-    LocalProcessExecutorProcessModel, WorkerExecutor, WorkerExecutionBindingLifecycle,
-    WorkerExecutionBindingScope, WorkerExecutionIntent, WorkerExecutionLeaseState,
-    WorkerExecutionMode, WorkerExecutionParallelismScope, WorkerExecutionProcessLifecycle,
-    WorkerExecutionReusePolicy, WorkerExecutionStepKind, WorkerExecutorFailure,
-    WorkerExecutorFailureLayer, WorkerExecutorKind, WorkerExecutorProbe, WorkerExecutorRequest,
-    WorkerRuntime, WorkerStage,
+    LocalProcessExecutorProcessModel, WorkerExecutionBindingLifecycle, WorkerExecutionBindingScope,
+    WorkerExecutionIntent, WorkerExecutionLeaseState, WorkerExecutionMode,
+    WorkerExecutionParallelismScope, WorkerExecutionProcessLifecycle, WorkerExecutionReusePolicy,
+    WorkerExecutionStepKind, WorkerExecutor, WorkerExecutorFailure, WorkerExecutorFailureLayer,
+    WorkerExecutorKind, WorkerExecutorProbe, WorkerExecutorRequest, WorkerRuntime, WorkerStage,
 };
 use magi_core::{TaskId, UtcMillis, WorkerId};
 use serde::{Deserialize, Serialize};

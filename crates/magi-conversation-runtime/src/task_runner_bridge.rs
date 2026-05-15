@@ -41,12 +41,7 @@ pub enum RunCycleOutcome {
 /// are responsible for triggering the actual execution pipeline.  The Runner
 /// calls `dispatch` after granting a lease and marking the task as Running.
 pub trait TaskDispatcher: Send + Sync {
-    fn dispatch(
-        &self,
-        task: &Task,
-        worker: &WorkerInfo,
-        lease: &TaskLease,
-    ) -> Result<(), String>;
+    fn dispatch(&self, task: &Task, worker: &WorkerInfo, lease: &TaskLease) -> Result<(), String>;
 }
 
 // ---------------------------------------------------------------------------
@@ -210,12 +205,7 @@ impl EventBasedTaskDispatcher {
 }
 
 impl TaskDispatcher for EventBasedTaskDispatcher {
-    fn dispatch(
-        &self,
-        task: &Task,
-        worker: &WorkerInfo,
-        lease: &TaskLease,
-    ) -> Result<(), String> {
+    fn dispatch(&self, task: &Task, worker: &WorkerInfo, lease: &TaskLease) -> Result<(), String> {
         let event = EventEnvelope::domain(
             EventId::new(format!("event-task-dispatched-{}", UtcMillis::now().0)),
             TASK_DISPATCHED,
@@ -285,7 +275,11 @@ impl WorkerExecutionDispatcher {
         self
     }
 
-    pub fn build_intent_from_task(&self, task: &Task, worker: &WorkerInfo) -> WorkerExecutionIntent {
+    pub fn build_intent_from_task(
+        &self,
+        task: &Task,
+        worker: &WorkerInfo,
+    ) -> WorkerExecutionIntent {
         let prefix = format!("{}-{}", task.mission_id, task.task_id);
         let mut steps: Vec<WorkerExecutionIntentStep> = Vec::new();
 
@@ -393,12 +387,7 @@ impl WorkerExecutionDispatcher {
 }
 
 impl TaskDispatcher for WorkerExecutionDispatcher {
-    fn dispatch(
-        &self,
-        task: &Task,
-        worker: &WorkerInfo,
-        lease: &TaskLease,
-    ) -> Result<(), String> {
+    fn dispatch(&self, task: &Task, worker: &WorkerInfo, lease: &TaskLease) -> Result<(), String> {
         let intent = self.build_intent_from_task(task, worker);
         self.worker_runtime.register_execution_intent(intent);
 
@@ -453,4 +442,3 @@ impl TaskDispatcher for WorkerExecutionDispatcher {
         Ok(())
     }
 }
-

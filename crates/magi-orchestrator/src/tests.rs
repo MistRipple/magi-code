@@ -10,10 +10,9 @@ use magi_skill_runtime::{SkillDispatchRoute, SkillDispatchRuntime};
 use magi_tool_runtime::{ToolExecutionSummary, ToolRegistry};
 use magi_worker_runtime::{
     LocalProcessExecutorCapability, LocalProcessExecutorHealth, LocalProcessExecutorHealthStatus,
-    LocalProcessWorkerExecutor, WorkerExecutor, SkillDispatchSummary,
-    WorkerExecutionFinalReport, WorkerExecutionStepKind, WorkerExecutionTrace,
-    WorkerExecutorFailure, WorkerExecutorKind, WorkerExecutorProbe, WorkerRuntime,
-    WorkerSkillDispatchObservation,
+    LocalProcessWorkerExecutor, SkillDispatchSummary, WorkerExecutionFinalReport,
+    WorkerExecutionStepKind, WorkerExecutionTrace, WorkerExecutor, WorkerExecutorFailure,
+    WorkerExecutorKind, WorkerExecutorProbe, WorkerRuntime, WorkerSkillDispatchObservation,
 };
 use std::sync::{Arc, Mutex};
 
