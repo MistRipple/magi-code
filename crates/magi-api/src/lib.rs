@@ -1,5 +1,6 @@
 #![recursion_limit = "256"]
 
+mod a_path;
 mod builtin_tool_schema;
 mod change_projection;
 mod dto;

@@ -69,10 +69,6 @@ pub enum TaskExecutionPlan {
     },
 }
 
-pub struct TaskGraphDriveResult {
-    pub runner_started: bool,
-}
-
 #[derive(Clone, Debug)]
 pub struct DispatchSubmissionRequest {
     pub accepted_at: UtcMillis,
@@ -3170,7 +3166,7 @@ pub fn drive_dispatch_submission(
             )),
         }
     } else {
-        let execution = drive_task_graph(
+        let execution = crate::a_path::drive_a_path(
             state,
             &accepted.root_task_id,
             &accepted.action_task_id,
@@ -3179,76 +3175,4 @@ pub fn drive_dispatch_submission(
         accepted.runner_started = execution.runner_started;
         Ok(())
     }
-}
-
-pub fn drive_task_graph(
-    state: &ApiState,
-    root_task_id: &TaskId,
-    action_task_id: &TaskId,
-    failure_title: &'static str,
-) -> Result<TaskGraphDriveResult, ApiError> {
-    // 普通模式使用同步 for 循环，要求 dispatch 同步完成，否则结果来不及被收集。
-    if let Some(dispatcher) = state.session_turn_dispatcher() {
-        dispatcher.set_force_sync_dispatch(true);
-    }
-
-    let result = (|| {
-        let manager = state
-            .runner_manager()
-            .ok_or_else(|| ApiError::internal_assembly(failure_title, "runner_manager 未配置"))?;
-        let task_store = state
-            .task_store()
-            .ok_or_else(|| ApiError::internal_assembly(failure_title, "task_store 未配置"))?;
-
-        let mut executed = false;
-        for _ in 0..32 {
-            executed = true;
-            let outcome = manager
-                .run_single_cycle(root_task_id.as_str())
-                .map_err(|error| ApiError::internal_assembly(failure_title, error))?;
-            match outcome {
-                magi_orchestrator::task_runner::RunCycleOutcome::Continue => continue,
-                magi_orchestrator::task_runner::RunCycleOutcome::AllComplete => break,
-                magi_orchestrator::task_runner::RunCycleOutcome::Blocked(task_ids) => {
-                    if task_store
-                        .get_task(action_task_id)
-                        .is_some_and(|task| task.status == TaskStatus::Blocked)
-                    {
-                        break;
-                    }
-                    return Err(ApiError::internal_assembly(
-                        failure_title,
-                        format!("task runner blocked: {:?}", task_ids),
-                    ));
-                }
-                magi_orchestrator::task_runner::RunCycleOutcome::Error(error) => {
-                    return Err(ApiError::internal_assembly(failure_title, error));
-                }
-            }
-        }
-
-        let action_status = task_store
-            .get_task(action_task_id)
-            .ok_or_else(|| ApiError::internal_assembly(failure_title, "action task 不存在"))?
-            .status;
-        if action_status != TaskStatus::Completed
-            && action_status != TaskStatus::Failed
-            && action_status != TaskStatus::Blocked
-        {
-            return Err(ApiError::internal_assembly(
-                failure_title,
-                format!("同步任务未在窗口内完成: {:?}", action_status),
-            ));
-        }
-
-        Ok(TaskGraphDriveResult {
-            runner_started: executed,
-        })
-    })();
-
-    if let Some(dispatcher) = state.session_turn_dispatcher() {
-        dispatcher.set_force_sync_dispatch(false);
-    }
-
-    result
 }

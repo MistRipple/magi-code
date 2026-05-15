@@ -37,7 +37,7 @@ use crate::{
     session_turn_writeback::publish_current_session_turn_item_event,
     state::ApiState,
     task_execution::{
-        SessionTurnExecutionRequest, drive_task_graph,
+        SessionTurnExecutionRequest,
         finalize_background_session_task_turn_if_root_terminal,
     },
 };
@@ -1669,7 +1669,7 @@ fn finalize_continue_session(
     // 深度模式：后台 runner 已在 continue_execution_chain 中重新启动，
     // 此处不再调用同步 drive，避免与后台 runner 竞争
     if !background_allowed {
-        if let Err(error) = drive_task_graph(
+        if let Err(error) = crate::a_path::drive_a_path(
             &state,
             &accepted.root_task_id,
             &accepted.action_task_id,
