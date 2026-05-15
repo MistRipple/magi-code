@@ -133,6 +133,9 @@ impl Conversation {
                 self.advance_current_turn(|turn| turn.enter_modeling())
                     .map_err(AdvanceTurnError::Advance)?;
             }
+            // before_round hook：driver 在新一轮模型调用前沉淀上一轮 ToolCalling
+            // 的副作用（例如把 tool_messages 推入下轮请求构造）。
+            driver.before_round(round);
             match driver.execute_round(round) {
                 RoundOutcome::Continue => {
                     // driver 已经执行完工具批；状态推到 ToolCalling，下一轮开头再回 Modeling。

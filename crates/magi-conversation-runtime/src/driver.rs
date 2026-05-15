@@ -45,6 +45,18 @@ pub trait TurnDriver {
         None
     }
 
+    /// 每一轮 `execute_round` 调用前的钩子。
+    ///
+    /// 用于 driver 在进入新一轮模型调用前完成上一轮 ToolCalling 阶段的副作用
+    /// 沉淀（把 tool_messages 推入下一轮请求 / 重置中间累加器 / 触发副作用 fence）。
+    /// 默认空实现，driver 仅在需要 N-轮跨轮状态衔接时覆写。
+    ///
+    /// 调用顺序：
+    /// - round=0：在 `enter_modeling` 后、`execute_round(0)` 前一次性调用
+    /// - round>0：在 `enter_modeling`（从 ToolCalling 回 Modeling）后、
+    ///   `execute_round(round)` 前调用
+    fn before_round(&mut self, _round: usize) {}
+
     /// 执行第 `round` 轮：拼请求 → 调模型 → parse → 工具调用 → 写 turn item 等。
     /// 返回 RoundOutcome 指示循环下一步。
     fn execute_round(&mut self, round: usize) -> RoundOutcome;
