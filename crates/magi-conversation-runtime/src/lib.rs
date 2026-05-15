@@ -21,6 +21,7 @@ pub mod model_config;
 pub mod prompt_utils;
 mod registry;
 pub mod session_thread;
+pub mod task_execution_registry;
 pub mod session_turn_execution;
 pub mod session_writeback;
 pub mod settings_store;

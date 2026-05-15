@@ -27,7 +27,7 @@ use magi_context_runtime::{
 };
 use magi_core::{
     ApprovalRequirement, DomainError, EventId, ExecutionOwnership, ExecutionResultStatus, LeaseId,
-    RiskLevel, SessionId, Task, TaskExecutionTarget, TaskId, TaskKind, TaskStatus, ToolCallId,
+    RiskLevel, SessionId, Task, TaskId, TaskKind, TaskStatus, ToolCallId,
     UtcMillis, WorkerId, WorkspaceId,
 };
 use magi_governance::ToolKind;
@@ -45,30 +45,15 @@ use magi_tool_runtime::{
 };
 use magi_workspace::WorkspaceStore;
 use std::{
-    collections::HashMap,
     path::PathBuf,
-    sync::{Arc, RwLock},
+    sync::Arc,
 };
 
-#[derive(Clone, Debug)]
-pub enum TaskExecutionPlan {
-    Dispatch {
-        target: TaskExecutionTarget,
-        worker_id: WorkerId,
-        lane_id: Option<String>,
-        lane_seq: Option<usize>,
-        /// lane 绑定的 thread，由 dispatch_execution::ensure_thread_for_role 创建或命中，
-        /// 是 task_llm_loop 读取跨 task 历史消息的唯一路由键。
-        thread_id: magi_core::ThreadId,
-        is_primary: bool,
-        session_id: SessionId,
-        workspace_id: Option<WorkspaceId>,
-        ownership: ExecutionOwnership,
-        writebacks: ExecutionWritebackPlans,
-        use_tools: bool,
-        skill_name: Option<String>,
-    },
-}
+// M16：TaskExecutionPlan / TaskExecutionRegistry 已下沉到 conversation-runtime；
+// 这里通过 `pub use` 重导出，避免改动外部 import 路径。
+pub use magi_conversation_runtime::task_execution_registry::{
+    TaskExecutionPlan, TaskExecutionRegistry,
+};
 
 #[derive(Clone, Debug)]
 pub struct DispatchSubmissionRequest {
@@ -826,27 +811,6 @@ fn runner_status_for_terminal_task(status: TaskStatus) -> Option<&'static str> {
         TaskStatus::Blocked => Some("blocked"),
         TaskStatus::Cancelled => Some("cancelled"),
         _ => None,
-    }
-}
-
-#[derive(Clone, Default)]
-pub struct TaskExecutionRegistry {
-    plans: Arc<RwLock<HashMap<TaskId, TaskExecutionPlan>>>,
-}
-
-impl TaskExecutionRegistry {
-    pub fn insert(&self, task_id: TaskId, plan: TaskExecutionPlan) {
-        self.plans
-            .write()
-            .expect("task execution registry write lock poisoned")
-            .insert(task_id, plan);
-    }
-
-    pub fn remove(&self, task_id: &TaskId) -> Option<TaskExecutionPlan> {
-        self.plans
-            .write()
-            .expect("task execution registry write lock poisoned")
-            .remove(task_id)
     }
 }
 
