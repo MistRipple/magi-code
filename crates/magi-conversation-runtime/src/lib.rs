@@ -24,6 +24,7 @@ pub mod dispatch_submission;
 pub mod session_thread;
 pub mod task_execution_registry;
 pub mod session_turn_execution;
+pub mod session_turn_finalize;
 pub mod session_writeback;
 pub mod settings_store;
 pub mod task_graph_builder;
