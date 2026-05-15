@@ -1,0 +1,10 @@
+[package]
+name = "magi-todo-ledger"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+magi-core = { path = "../magi-core" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

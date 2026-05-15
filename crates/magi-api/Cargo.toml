@@ -18,6 +18,15 @@ magi-bridge-client = { path = "../magi-bridge-client" }
 magi-permissions = { path = "../magi-permissions" }
 magi-safety-gate = { path = "../magi-safety-gate" }
 magi-spawn-graph = { path = "../magi-spawn-graph" }
+magi-todo-ledger = { path = "../magi-todo-ledger" }
+magi-project-memory = { path = "../magi-project-memory" }
+magi-mission-charter = { path = "../magi-mission-charter" }
+magi-mission-workspace = { path = "../magi-mission-workspace" }
+magi-knowledge-graph = { path = "../magi-knowledge-graph" }
+magi-validation-runner = { path = "../magi-validation-runner" }
+magi-checkpoint = { path = "../magi-checkpoint" }
+magi-human-checkpoint = { path = "../magi-human-checkpoint" }
+magi-plan = { path = "../magi-plan" }
 magi-context-runtime = { path = "../magi-context-runtime" }
 magi-conversation-runtime = { path = "../magi-conversation-runtime" }
 magi-event-bus = { path = "../magi-event-bus" }
@@ -37,3 +46,4 @@ dirs = "6"
 [dev-dependencies]
 tower = { version = "0.5.3", features = ["util"] }
 magi-skill-runtime = { path = "../magi-skill-runtime" }
+tempfile = "3"

@@ -843,7 +843,7 @@ fn worker_runtime_records_active_lease_for_persistent_session_binding() {
     );
     assert_eq!(
         observation.executor_lease_id.as_deref(),
-        Some("local-process-worker-executor-session-persistent-lease-lease-1")
+        Some("local-process-worker-executor-session-session-persistent-lease-lease-1")
     );
 }
 

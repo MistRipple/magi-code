@@ -2,7 +2,7 @@
 
 更新时间：2026-05-14
 状态：设计稿（落地基线）
-取代：[`../task-orchestration-upgrade/`](../task-orchestration-upgrade/) 中 Mission/Task/Worker 三元结构
+取代：v1（Mission/Task/Worker 三元结构）已整体移除
 
 ## 为什么有 v2
 
@@ -29,7 +29,6 @@ v2 不是 v1 的增量补丁，是把任务系统重新分层：
 | 文档 | 关系 |
 |------|------|
 | [`rust-backend-rewrite/`](../rust-backend-rewrite/) | 协议冻结与契约边界仍然有效，v2 在其之上重排任务运行时 |
-| [`task-orchestration-upgrade/`](../task-orchestration-upgrade/) | v1，**已废弃**，v2 完成后整体移除 |
 | [`canonical-turn-log-refactor-plan.md`](../canonical-turn-log-refactor-plan.md) | Turn 日志重构与 v2 的 L2 Turn 层强相关，v2 落地前先完成此重构 |
 | [`p7-compliance-collapse.md`](../p7-compliance-collapse.md) | P7 单信号契约是 v2 的前置条件，必须先收敛完成 |
 

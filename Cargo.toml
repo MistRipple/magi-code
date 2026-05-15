@@ -24,6 +24,15 @@ members = [
   "crates/magi-permissions",
   "crates/magi-safety-gate",
   "crates/magi-spawn-graph",
+  "crates/magi-todo-ledger",
+  "crates/magi-project-memory",
+  "crates/magi-mission-charter",
+  "crates/magi-mission-workspace",
+  "crates/magi-knowledge-graph",
+  "crates/magi-validation-runner",
+  "crates/magi-checkpoint",
+  "crates/magi-human-checkpoint",
+  "crates/magi-plan",
   "crates/magi-snapshot",
 ]
 

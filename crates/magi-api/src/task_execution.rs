@@ -878,6 +878,42 @@ pub struct LlmTaskDispatcher {
     /// Task System v2 — L5：父子任务拓扑图。S7 协调器三件套（agent_spawn / send_message /
     /// task_stop）需要在 task_llm_loop 中读写。设计为构造期必填，避免运行期再做空检查。
     spawn_graph: Arc<std::sync::Mutex<magi_spawn_graph::SpawnGraph>>,
+    /// Task System v2 — L13：session 维度的 TodoLedger 索引。S9 中模型通过
+    /// `todo_write` 工具往这里写分解 + 进度；下一轮 Turn 起始时把快照注入 system prompt。
+    todo_ledger_registry: Arc<magi_todo_ledger::TodoLedgerRegistry>,
+    /// Task System v2 — L14：workspace 维度的 ProjectMemory 索引。S10 中模型通过
+    /// `memory_write` 工具新增/删除项目记忆条目；每次 Turn 起始把 MEMORY.md 视图注入
+    /// system prompt，跨 conversation 复用。
+    project_memory_registry: Arc<magi_project_memory::ProjectMemoryRegistry>,
+    /// Task System v2 — Tier 4 / L11：workspace 维度的 MissionCharter 索引。S11 中模型
+    /// 通过 `mission_charter_write` 工具增量更新 mission 宪章；每次 Turn 起始把当前
+    /// mission 的 charter 注入 system prompt，跨 conversation 锚定目标契约。
+    mission_charter_registry: Arc<magi_mission_charter::MissionCharterRegistry>,
+    /// Task System v2 — Tier 4 / L12：workspace 维度的 Plan 索引。S12 中模型通过
+    /// `plan_write` 工具整体替换 mission.plan.steps；每次 Turn 起始把当前 plan
+    /// 注入 system prompt，长链路推进时保留计划上下文。
+    plan_registry: Arc<magi_plan::PlanRegistry>,
+    /// Task System v2 — Tier 4 / L13：workspace 维度的 MissionWorkspace 索引。S13
+    /// 中每个 Mission 拥有独占的 artifacts/logs/memory 目录骨架；Turn 起始时把目录
+    /// 路径注入 system prompt，让 agent 把产物落在 mission 内而不是无主目录。
+    mission_workspace_registry: Arc<magi_mission_workspace::MissionWorkspaceRegistry>,
+    /// Task System v2 — Tier 4 / L18：workspace 维度的 KnowledgeGraph 索引。S14
+    /// 中每个 Mission 累积"已知事实"（symbols / decisions / risks）；Turn 起始时把
+    /// live facts 注入 system prompt，避免长 mission 中模型重新讨论已经达成的结论。
+    knowledge_graph_registry: Arc<magi_knowledge_graph::KnowledgeGraphRegistry>,
+    /// Task System v2 — Tier 4 / L19：workspace 维度的 ValidationRunner 索引。S15
+    /// 中每个 Mission 在 Plan 节点上挂载验证记录（test_suite / type_check /
+    /// integration_smoke / benchmark）；Coordinator 判定 Plan 节点完成的硬门槛
+    /// 是：至少 1 条 Pass，且当前无 Fail。
+    validation_runner_registry: Arc<magi_validation_runner::ValidationRunnerRegistry>,
+    /// Task System v2 — Tier 4 / L20：workspace 维度的 Checkpoint 索引。S16 中每个
+    /// Mission 维护一份 append-only 的检查点日志（process_restart / context_compaction
+    /// / phase_transition / manual），让事后能定位到“恢复到 Tn”所需要的最小语义快照。
+    checkpoint_registry: Arc<magi_checkpoint::CheckpointRegistry>,
+    /// Task System v2 — Tier 4 / L21：workspace 维度的 HumanCheckpoint 索引。S17 中
+    /// orchestrator 通过 human_checkpoint_request 申请人工审核点，mission 会进入
+    /// awaiting_human 状态，operator 审批前 Coordinator 不再派发新工作。
+    human_checkpoint_registry: Arc<magi_human_checkpoint::HumanCheckpointRegistry>,
     /// 强制同步执行 dispatch，用于普通模式的同步 for 循环（设计 §1.3）。
     force_sync_dispatch: Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -924,6 +960,23 @@ impl LlmTaskDispatcher {
             stream_fanout: None,
             agent_role_registry: None,
             spawn_graph,
+            todo_ledger_registry: Arc::new(magi_todo_ledger::TodoLedgerRegistry::new()),
+            project_memory_registry: Arc::new(magi_project_memory::ProjectMemoryRegistry::new()),
+            mission_charter_registry: Arc::new(magi_mission_charter::MissionCharterRegistry::new()),
+            plan_registry: Arc::new(magi_plan::PlanRegistry::new()),
+            mission_workspace_registry: Arc::new(
+                magi_mission_workspace::MissionWorkspaceRegistry::new(),
+            ),
+            knowledge_graph_registry: Arc::new(
+                magi_knowledge_graph::KnowledgeGraphRegistry::new(),
+            ),
+            validation_runner_registry: Arc::new(
+                magi_validation_runner::ValidationRunnerRegistry::new(),
+            ),
+            checkpoint_registry: Arc::new(magi_checkpoint::CheckpointRegistry::new()),
+            human_checkpoint_registry: Arc::new(
+                magi_human_checkpoint::HumanCheckpointRegistry::new(),
+            ),
             force_sync_dispatch: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
@@ -1005,6 +1058,121 @@ impl LlmTaskDispatcher {
     ) -> Self {
         self.agent_role_registry = Some(registry);
         self
+    }
+
+    pub fn with_todo_ledger_registry(
+        mut self,
+        registry: Arc<magi_todo_ledger::TodoLedgerRegistry>,
+    ) -> Self {
+        self.todo_ledger_registry = registry;
+        self
+    }
+
+    pub fn todo_ledger_registry(&self) -> Arc<magi_todo_ledger::TodoLedgerRegistry> {
+        self.todo_ledger_registry.clone()
+    }
+
+    pub fn with_project_memory_registry(
+        mut self,
+        registry: Arc<magi_project_memory::ProjectMemoryRegistry>,
+    ) -> Self {
+        self.project_memory_registry = registry;
+        self
+    }
+
+    pub fn project_memory_registry(&self) -> Arc<magi_project_memory::ProjectMemoryRegistry> {
+        self.project_memory_registry.clone()
+    }
+
+    pub fn with_mission_charter_registry(
+        mut self,
+        registry: Arc<magi_mission_charter::MissionCharterRegistry>,
+    ) -> Self {
+        self.mission_charter_registry = registry;
+        self
+    }
+
+    pub fn mission_charter_registry(
+        &self,
+    ) -> Arc<magi_mission_charter::MissionCharterRegistry> {
+        self.mission_charter_registry.clone()
+    }
+
+    pub fn with_plan_registry(mut self, registry: Arc<magi_plan::PlanRegistry>) -> Self {
+        self.plan_registry = registry;
+        self
+    }
+
+    pub fn plan_registry(&self) -> Arc<magi_plan::PlanRegistry> {
+        self.plan_registry.clone()
+    }
+
+    pub fn with_mission_workspace_registry(
+        mut self,
+        registry: Arc<magi_mission_workspace::MissionWorkspaceRegistry>,
+    ) -> Self {
+        self.mission_workspace_registry = registry;
+        self
+    }
+
+    pub fn mission_workspace_registry(
+        &self,
+    ) -> Arc<magi_mission_workspace::MissionWorkspaceRegistry> {
+        self.mission_workspace_registry.clone()
+    }
+
+    pub fn with_knowledge_graph_registry(
+        mut self,
+        registry: Arc<magi_knowledge_graph::KnowledgeGraphRegistry>,
+    ) -> Self {
+        self.knowledge_graph_registry = registry;
+        self
+    }
+
+    pub fn knowledge_graph_registry(
+        &self,
+    ) -> Arc<magi_knowledge_graph::KnowledgeGraphRegistry> {
+        self.knowledge_graph_registry.clone()
+    }
+
+    pub fn with_validation_runner_registry(
+        mut self,
+        registry: Arc<magi_validation_runner::ValidationRunnerRegistry>,
+    ) -> Self {
+        self.validation_runner_registry = registry;
+        self
+    }
+
+    pub fn validation_runner_registry(
+        &self,
+    ) -> Arc<magi_validation_runner::ValidationRunnerRegistry> {
+        self.validation_runner_registry.clone()
+    }
+
+    pub fn with_checkpoint_registry(
+        mut self,
+        registry: Arc<magi_checkpoint::CheckpointRegistry>,
+    ) -> Self {
+        self.checkpoint_registry = registry;
+        self
+    }
+
+    pub fn checkpoint_registry(&self) -> Arc<magi_checkpoint::CheckpointRegistry> {
+        self.checkpoint_registry.clone()
+    }
+
+    pub fn with_human_checkpoint_registry(
+        mut self,
+        registry: Arc<magi_human_checkpoint::HumanCheckpointRegistry>,
+    ) -> Self {
+        self.human_checkpoint_registry = registry;
+        self
+    }
+
+    pub fn human_checkpoint_registry(
+        &self,
+    ) -> Arc<magi_human_checkpoint::HumanCheckpointRegistry> {
+        self.human_checkpoint_registry.clone()
     }
 
     fn publish_task_dispatched_event(
@@ -1670,6 +1838,87 @@ impl LlmTaskDispatcher {
             .as_ref()
             .expect("LlmTaskDispatcher 缺少 AgentRoleRegistry，无法解析 task→role");
         let safety_gate = self.build_safety_gate();
+        let todo_ledger = self.todo_ledger_registry.get_or_create(session_id);
+        let project_memory = workspace_root_path.as_ref().and_then(|path| {
+            let workspace_root = magi_core::WorkspaceRootPath::new(path.to_string_lossy());
+            match self.project_memory_registry.get_or_open(&workspace_root) {
+                Ok(store) => Some(store),
+                Err(err) => {
+                    tracing::warn!(error = %err, workspace_root = %path.display(), "ProjectMemory: 打开失败，本次 Turn 不注入项目记忆");
+                    None
+                }
+            }
+        });
+        let mission_charter = workspace_root_path.as_ref().and_then(|path| {
+            let workspace_root = magi_core::WorkspaceRootPath::new(path.to_string_lossy());
+            match self.mission_charter_registry.get_or_open(&workspace_root) {
+                Ok(store) => Some(store),
+                Err(err) => {
+                    tracing::warn!(error = %err, workspace_root = %path.display(), "MissionCharter: 打开失败，本次 Turn 不注入 mission 宪章");
+                    None
+                }
+            }
+        });
+        let plan = workspace_root_path.as_ref().and_then(|path| {
+            let workspace_root = magi_core::WorkspaceRootPath::new(path.to_string_lossy());
+            match self.plan_registry.get_or_open(&workspace_root) {
+                Ok(store) => Some(store),
+                Err(err) => {
+                    tracing::warn!(error = %err, workspace_root = %path.display(), "Plan: 打开失败，本次 Turn 不注入 mission 计划");
+                    None
+                }
+            }
+        });
+        let mission_workspace = workspace_root_path.as_ref().and_then(|path| {
+            let workspace_root = magi_core::WorkspaceRootPath::new(path.to_string_lossy());
+            match self.mission_workspace_registry.get_or_open(&workspace_root) {
+                Ok(store) => Some(store),
+                Err(err) => {
+                    tracing::warn!(error = %err, workspace_root = %path.display(), "MissionWorkspace: 打开失败，本次 Turn 不注入工作目录视图");
+                    None
+                }
+            }
+        });
+        let knowledge_graph = workspace_root_path.as_ref().and_then(|path| {
+            let workspace_root = magi_core::WorkspaceRootPath::new(path.to_string_lossy());
+            match self.knowledge_graph_registry.get_or_open(&workspace_root) {
+                Ok(store) => Some(store),
+                Err(err) => {
+                    tracing::warn!(error = %err, workspace_root = %path.display(), "KnowledgeGraph: 打开失败，本次 Turn 不注入 mission KG");
+                    None
+                }
+            }
+        });
+        let validation_runner = workspace_root_path.as_ref().and_then(|path| {
+            let workspace_root = magi_core::WorkspaceRootPath::new(path.to_string_lossy());
+            match self.validation_runner_registry.get_or_open(&workspace_root) {
+                Ok(store) => Some(store),
+                Err(err) => {
+                    tracing::warn!(error = %err, workspace_root = %path.display(), "ValidationRunner: 打开失败，本次 Turn 不注入验证结果");
+                    None
+                }
+            }
+        });
+        let checkpoint = workspace_root_path.as_ref().and_then(|path| {
+            let workspace_root = magi_core::WorkspaceRootPath::new(path.to_string_lossy());
+            match self.checkpoint_registry.get_or_open(&workspace_root) {
+                Ok(store) => Some(store),
+                Err(err) => {
+                    tracing::warn!(error = %err, workspace_root = %path.display(), "Checkpoint: 打开失败，本次 Turn 不注入检查点日志");
+                    None
+                }
+            }
+        });
+        let human_checkpoint = workspace_root_path.as_ref().and_then(|path| {
+            let workspace_root = magi_core::WorkspaceRootPath::new(path.to_string_lossy());
+            match self.human_checkpoint_registry.get_or_open(&workspace_root) {
+                Ok(store) => Some(store),
+                Err(err) => {
+                    tracing::warn!(error = %err, workspace_root = %path.display(), "HumanCheckpoint: 打开失败，本次 Turn 不注入人工审核点");
+                    None
+                }
+            }
+        });
         crate::task_llm_loop::run_task_llm_loop(crate::task_llm_loop::TaskLlmLoopRequest {
             client: client.as_ref(),
             event_bus: self.event_bus.as_ref(),
@@ -1683,6 +1932,15 @@ impl LlmTaskDispatcher {
             agent_role_registry: agent_role_registry.as_ref(),
             spawn_graph: self.spawn_graph.as_ref(),
             safety_gate: safety_gate.as_ref(),
+            todo_ledger: todo_ledger.as_ref(),
+            project_memory: project_memory.as_deref(),
+            mission_charter: mission_charter.as_deref(),
+            plan: plan.as_deref(),
+            mission_workspace: mission_workspace.as_deref(),
+            knowledge_graph: knowledge_graph.as_deref(),
+            validation_runner: validation_runner.as_deref(),
+            checkpoint: checkpoint.as_deref(),
+            human_checkpoint: human_checkpoint.as_deref(),
             task,
             task_id,
             lease_id,

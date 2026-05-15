@@ -945,27 +945,37 @@ dependencies = [
  "futures-util",
  "magi-agent-role",
  "magi-bridge-client",
+ "magi-checkpoint",
  "magi-context-runtime",
  "magi-conversation-runtime",
  "magi-core",
  "magi-event-bus",
  "magi-governance",
+ "magi-human-checkpoint",
+ "magi-knowledge-graph",
  "magi-knowledge-store",
  "magi-memory-store",
+ "magi-mission-charter",
+ "magi-mission-workspace",
  "magi-orchestrator",
  "magi-permissions",
+ "magi-plan",
+ "magi-project-memory",
  "magi-safety-gate",
  "magi-session-store",
  "magi-skill-runtime",
  "magi-snapshot",
  "magi-spawn-graph",
+ "magi-todo-ledger",
  "magi-tool-runtime",
  "magi-usage-authority",
+ "magi-validation-runner",
  "magi-worker-runtime",
  "magi-workspace",
  "reqwest",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tokio-stream",
  "tower",
@@ -983,6 +993,18 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+]
+
+[[package]]
+name = "magi-checkpoint"
+version = "0.1.0"
+dependencies = [
+ "magi-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tracing",
 ]
 
 [[package]]
@@ -1075,6 +1097,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "magi-human-checkpoint"
+version = "0.1.0"
+dependencies = [
+ "magi-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
+name = "magi-knowledge-graph"
+version = "0.1.0"
+dependencies = [
+ "magi-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
 name = "magi-knowledge-store"
 version = "0.1.0"
 dependencies = [
@@ -1091,6 +1137,30 @@ version = "0.1.0"
 dependencies = [
  "magi-core",
  "serde",
+]
+
+[[package]]
+name = "magi-mission-charter"
+version = "0.1.0"
+dependencies = [
+ "magi-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
+name = "magi-mission-workspace"
+version = "0.1.0"
+dependencies = [
+ "magi-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tracing",
 ]
 
 [[package]]
@@ -1125,6 +1195,31 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+]
+
+[[package]]
+name = "magi-plan"
+version = "0.1.0"
+dependencies = [
+ "magi-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
+name = "magi-project-memory"
+version = "0.1.0"
+dependencies = [
+ "dirs",
+ "magi-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tracing",
 ]
 
 [[package]]
@@ -1183,6 +1278,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "magi-todo-ledger"
+version = "0.1.0"
+dependencies = [
+ "magi-core",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "magi-tool-runtime"
 version = "0.1.0"
 dependencies = [
@@ -1205,6 +1310,18 @@ dependencies = [
  "serde_json",
  "sha2",
  "url",
+]
+
+[[package]]
+name = "magi-validation-runner"
+version = "0.1.0"
+dependencies = [
+ "magi-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tracing",
 ]
 
 [[package]]

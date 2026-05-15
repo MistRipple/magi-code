@@ -12,10 +12,6 @@
   - 任务系统 v2 设计文档（当前基线）
   - 覆盖 A/B/C 三档任务、Runtime/Orchestration/Long-Mission 三层架构、9 Step 迁移路径
 
-- `task-orchestration-upgrade/`（已废弃）
-  - v1 Task 编排升级文档，已被 `task-system-v2/` 取代
-  - v2 落地完成后整体删除
-
 ## 当前项目状态
 
 `magi-rust-rewrite` 当前不是独立新产品线，也不是只做最小后端验证的临时仓。

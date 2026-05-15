@@ -61,10 +61,58 @@ pub enum BuiltinToolName {
     SendMessage,
     /// 终止指定任务及其所有 SpawnGraph 后代（级联停止）。
     TaskStop,
+    // ── In-session 思维锚点（Task System v2 L13）──
+    /// 写入本 session 的 TodoLedger。整体替换列表语义（参考 claude-code 的 TodoWrite）。
+    /// 由 orchestration 层拦截，不进入 ToolRegistry。
+    TodoWrite,
+    // ── 跨 session 项目记忆（Task System v2 L14）──
+    /// 写入或删除当前 workspace 的 ProjectMemory entry。物理存储在
+    /// `~/.magi/projects/{slug}/memory/`，跨 conversation 自动加载到 system prompt。
+    /// 由 orchestration 层拦截，不进入 ToolRegistry。
+    MemoryWrite,
+    // ── Mission 宪章（Task System v2 Tier 4 / L11）──
+    /// 增量写入当前 mission 的 charter（title / goal / success_criteria /
+    /// constraints / stakeholders）。物理存储在
+    /// `~/.magi/projects/{slug}/missions/{mission_id}/charter.md`。
+    /// 由 orchestration 层拦截，不进入 ToolRegistry。
+    MissionCharterWrite,
+    // ── Mission 执行计划（Task System v2 Tier 4 / L12）──
+    /// 整体替换当前 mission 的 plan.steps（id / content / status / depends_on / notes）。
+    /// 物理存储在 `~/.magi/projects/{slug}/missions/{mission_id}/plan.md`，
+    /// 每次 Turn 起始把当前 plan 自动注入 orchestrator system prompt。
+    /// 由 orchestration 层拦截，不进入 ToolRegistry。
+    PlanWrite,
+    // ── Mission KnowledgeGraph（Task System v2 Tier 4 / L18）──
+    /// 按 (kind, id) upsert 当前 mission 的 KnowledgeGraph 事实（symbol / decision / risk）。
+    /// 物理存储在 `~/.magi/projects/{slug}/missions/{mission_id}/knowledge.md`，
+    /// 每次 Turn 起始把当前 KG 自动注入 orchestrator system prompt。
+    /// 由 orchestration 层拦截，不进入 ToolRegistry。
+    KgWrite,
+    // ── Mission ValidationRunner（Task System v2 Tier 4 / L19）──
+    /// 把单条验证结果（test_suite / type_check / integration_smoke / benchmark）按
+    /// (plan_step_id, kind) upsert 进当前 mission 的 ValidationReport。
+    /// 物理存储在 `~/.magi/projects/{slug}/missions/{mission_id}/validation.md`，
+    /// 每次 Turn 起始把当前 Validation 现状自动注入 orchestrator system prompt。
+    /// 由 orchestration 层拦截，不进入 ToolRegistry。
+    ValidationRecord,
+    // ── Mission Checkpoint（Task System v2 Tier 4 / L20）──
+    /// Append-only 写入一条 mission 级检查点（process_restart / context_compaction /
+    /// phase_transition / manual），用于事后恢复 mission 状态。
+    /// 物理存储在 `~/.magi/projects/{slug}/missions/{mission_id}/checkpoints.md`，
+    /// 每次 Turn 起始把最新若干检查点自动注入 orchestrator system prompt。
+    /// 由 orchestration 层拦截，不进入 ToolRegistry。
+    Checkpoint,
+    // ── Mission HumanCheckpoint（Task System v2 Tier 4 / L21）──
+    /// 由 orchestrator 申请的人工审核点，在 operator 给出 approve / reject 之前
+    /// mission 会进入 awaiting_human 状态。
+    /// 物理存储在 `~/.magi/projects/{slug}/missions/{mission_id}/human_checkpoints.md`，
+    /// 每次 Turn 起始把当前待解决与最近若干已解决记录注入 orchestrator system prompt。
+    /// 由 orchestration 层拦截，不进入 ToolRegistry。
+    HumanCheckpointRequest,
 }
 
 impl BuiltinToolName {
-    pub const ALL: [Self; 24] = [
+    pub const ALL: [Self; 32] = [
         Self::FileRead,
         Self::FileWrite,
         Self::FilePatch,
@@ -89,6 +137,14 @@ impl BuiltinToolName {
         Self::AgentSpawn,
         Self::SendMessage,
         Self::TaskStop,
+        Self::TodoWrite,
+        Self::MemoryWrite,
+        Self::MissionCharterWrite,
+        Self::PlanWrite,
+        Self::KgWrite,
+        Self::ValidationRecord,
+        Self::Checkpoint,
+        Self::HumanCheckpointRequest,
     ];
 
     pub fn as_str(&self) -> &'static str {
@@ -117,6 +173,14 @@ impl BuiltinToolName {
             Self::AgentSpawn => "agent_spawn",
             Self::SendMessage => "send_message",
             Self::TaskStop => "task_stop",
+            Self::TodoWrite => "todo_write",
+            Self::MemoryWrite => "memory_write",
+            Self::MissionCharterWrite => "mission_charter_write",
+            Self::PlanWrite => "plan_write",
+            Self::KgWrite => "kg_write",
+            Self::ValidationRecord => "validation_record",
+            Self::Checkpoint => "checkpoint_create",
+            Self::HumanCheckpointRequest => "human_checkpoint_request",
         }
     }
 
@@ -146,6 +210,22 @@ impl BuiltinToolName {
             "agent_spawn" | "agent" | "spawn_agent" => Some(Self::AgentSpawn),
             "send_message" | "message_task" => Some(Self::SendMessage),
             "task_stop" | "stop_task" | "cancel_task" => Some(Self::TaskStop),
+            "todo_write" | "todowrite" | "todo" => Some(Self::TodoWrite),
+            "memory_write" | "memorywrite" | "memory" => Some(Self::MemoryWrite),
+            "mission_charter_write" | "missioncharterwrite" | "mission_charter" => {
+                Some(Self::MissionCharterWrite)
+            }
+            "plan_write" | "planwrite" | "plan" => Some(Self::PlanWrite),
+            "kg_write" | "kgwrite" | "knowledge_write" | "knowledge_graph_write" => {
+                Some(Self::KgWrite)
+            }
+            "validation_record" | "validationrecord" | "validation_write" | "validation" => {
+                Some(Self::ValidationRecord)
+            }
+            "checkpoint_create" | "checkpoint" | "snapshot" => Some(Self::Checkpoint),
+            "human_checkpoint_request" | "human_checkpoint" | "human_review" => {
+                Some(Self::HumanCheckpointRequest)
+            }
             _ => None,
         }
     }
@@ -190,7 +270,15 @@ impl BuiltinToolName {
             | Self::WebFetch
             | Self::DiagramRender
             | Self::KnowledgeQuery
-            | Self::SendMessage => RiskLevel::Low,
+            | Self::SendMessage
+            | Self::TodoWrite
+            | Self::MemoryWrite
+            | Self::MissionCharterWrite
+            | Self::PlanWrite
+            | Self::KgWrite
+            | Self::ValidationRecord
+            | Self::Checkpoint
+            | Self::HumanCheckpointRequest => RiskLevel::Low,
             Self::FileWrite
             | Self::FilePatch
             | Self::FileCopy
@@ -248,6 +336,30 @@ impl BuiltinToolName {
             }
             Self::TaskStop => {
                 "Terminate a task and cascade-stop all of its descendants in the SpawnGraph. Use only when the entire sub-tree has clearly deviated from the goal or the user has revoked the work."
+            }
+            Self::TodoWrite => {
+                "Replace the current session's TodoLedger with the given list (claude-code TodoWrite semantics). Use to break a long task into steps and track progress; the ledger snapshot is auto-injected into subsequent Turns. Each call overwrites the entire list."
+            }
+            Self::MemoryWrite => {
+                "Persist or remove a ProjectMemory entry for the current workspace. Memory files live under ~/.magi/projects/<slug>/memory/ and are auto-loaded into the system prompt on every new conversation. Use `action: save` to upsert (overwrites the file with the same file_stem) and `action: delete` to remove an entry. Memory kinds: user / feedback / project / reference."
+            }
+            Self::MissionCharterWrite => {
+                "Incrementally update the current mission's charter (title / goal / success_criteria / constraints / stakeholders). The charter persists in ~/.magi/projects/<slug>/missions/<mission_id>/charter.md and is auto-injected into orchestrator prompts. Provide at least one field; omitted fields stay unchanged."
+            }
+            Self::PlanWrite => {
+                "Replace the current mission's execution plan with a complete list of steps. Each step has: id (stable identifier), content (one-line description), status (pending/in_progress/completed/cancelled), depends_on (optional list of step ids), notes (optional). The plan persists in ~/.magi/projects/<slug>/missions/<mission_id>/plan.md and is auto-injected into orchestrator prompts. Use this to draft, evolve, and track multi-step execution strategy for the mission. Each call overwrites the entire step list — provide all steps you want to keep."
+            }
+            Self::KgWrite => {
+                "Upsert one fact into the mission's KnowledgeGraph. Kinds: 'symbol' (code/module index — what classes/interfaces have been migrated, what they own), 'decision' (architecture or trade-off rationale, e.g. why SQLAlchemy over Tortoise), 'risk' (hazards or watch-outs surfaced during execution). Same (kind, id) overwrites the previous fact and bumps its version; set 'tombstoned': true to retire a fact without losing history. KG persists in ~/.magi/projects/<slug>/missions/<mission_id>/knowledge.md and is auto-injected into orchestrator prompts."
+            }
+            Self::ValidationRecord => {
+                "Record one validation result against a Plan step. Kinds: 'test_suite' (unit / integration test runs), 'type_check' (tsc / mypy / cargo check), 'integration_smoke' (cross-process or end-to-end smoke), 'benchmark' (perf / load). Outcomes: 'pass' / 'fail' / 'skipped'. Use this immediately after running a validation command — Coordinator gates a Plan step's completion on having at least one Pass and no unresolved Fail. Same (plan_step_id, kind) overwrites and bumps version. Validation results persist in ~/.magi/projects/<slug>/missions/<mission_id>/validation.md and are auto-injected into orchestrator prompts."
+            }
+            Self::Checkpoint => {
+                "Append one Checkpoint record for the current mission. Kinds: 'process_restart' (record state right before/after a daemon restart), 'context_compaction' (the conversation just got summarized; preserve a recovery pointer), 'phase_transition' (a major plan phase just completed/started), 'manual' (operator-triggered safety net). Checkpoints are append-only; each entry captures a snapshot of plan_version / kg_fact_count / workspace_commit / open conversations so a future Turn can reason about how to recover. Persisted in ~/.magi/projects/<slug>/missions/<mission_id>/checkpoints.md; the latest few entries are auto-injected into orchestrator prompts."
+            }
+            Self::HumanCheckpointRequest => {
+                "Request a human review checkpoint and pause autonomous progress until the operator approves or rejects it. Use this at high-stakes boundaries: irreversible operations, ambiguous trade-offs, large deletions, production deploys, anything requiring human judgement. Required fields: plan_step_id (the Plan step that triggered the request) and prompt_to_human (the question or decision the operator must resolve). Optional: label (short headline) and context (free-form supplementary info). After requesting, do NOT dispatch new work on this mission; resume only after the request is resolved. Persisted in ~/.magi/projects/<slug>/missions/<mission_id>/human_checkpoints.md; pending + recently resolved entries are auto-injected into orchestrator prompts."
             }
         }
     }
@@ -549,6 +661,259 @@ impl BuiltinToolName {
                     "reason": { "type": "string", "description": "Short reason for the termination, surfaced in the cancelled task's evidence trail" }
                 },
                 "required": ["target_task_id"]
+            }),
+            Self::TodoWrite => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "todos": {
+                        "type": "array",
+                        "description": "New full list of todos. Replaces the current ledger in its entirety.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "content": {
+                                    "type": "string",
+                                    "description": "Imperative description of the step, e.g. 'Run tests'"
+                                },
+                                "activeForm": {
+                                    "type": "string",
+                                    "description": "Present-continuous form shown while the step is in_progress, e.g. 'Running tests'"
+                                },
+                                "status": {
+                                    "type": "string",
+                                    "enum": ["pending", "in_progress", "completed"],
+                                    "description": "Step status. At most one item should be in_progress at a time."
+                                }
+                            },
+                            "required": ["content", "activeForm", "status"]
+                        }
+                    }
+                },
+                "required": ["todos"]
+            }),
+            Self::MemoryWrite => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["save", "delete"],
+                        "description": "save: upsert a memory entry; delete: remove an existing entry by file_stem."
+                    },
+                    "file_stem": {
+                        "type": "string",
+                        "description": "File name without extension. Only [A-Za-z0-9_-] are allowed. Reserved name MEMORY is rejected."
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Short human title used in the MEMORY.md index. Required when action=save."
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "One-line hook describing what this memory is about; shown in the index. Required when action=save."
+                    },
+                    "kind": {
+                        "type": "string",
+                        "enum": ["user", "feedback", "project", "reference"],
+                        "description": "Memory category. Required when action=save."
+                    },
+                    "body": {
+                        "type": "string",
+                        "description": "Full markdown body of the memory file. Required when action=save."
+                    }
+                },
+                "required": ["action", "file_stem"]
+            }),
+            Self::MissionCharterWrite => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "title": {
+                        "type": "string",
+                        "description": "Short headline describing what the mission delivers."
+                    },
+                    "goal": {
+                        "type": "string",
+                        "description": "Full statement of the user's intent and the outcome the mission is committing to."
+                    },
+                    "success_criteria": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Verifiable bullets defining when the mission counts as done."
+                    },
+                    "constraints": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Hard constraints (scope / tech / time / policy) that bound the mission."
+                    },
+                    "stakeholders": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "People or roles whose interests must be honored."
+                    }
+                }
+            }),
+            Self::PlanWrite => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "steps": {
+                        "type": "array",
+                        "description": "Full ordered list of plan steps. Each call replaces the existing plan.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": {
+                                    "type": "string",
+                                    "description": "Stable identifier (e.g. 's1', 'audit-deps'). Used by depends_on."
+                                },
+                                "content": {
+                                    "type": "string",
+                                    "description": "One-line description of what this step achieves."
+                                },
+                                "status": {
+                                    "type": "string",
+                                    "enum": ["pending", "in_progress", "completed", "cancelled"],
+                                    "description": "Step status; defaults to 'pending' if omitted."
+                                },
+                                "depends_on": {
+                                    "type": "array",
+                                    "items": { "type": "string" },
+                                    "description": "Optional list of step ids this step depends on. All ids must exist in steps."
+                                },
+                                "notes": {
+                                    "type": "string",
+                                    "description": "Optional rationale or scratch note for this step."
+                                }
+                            },
+                            "required": ["id", "content"]
+                        }
+                    }
+                },
+                "required": ["steps"]
+            }),
+            Self::KgWrite => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "kind": {
+                        "type": "string",
+                        "enum": ["symbol", "decision", "risk"],
+                        "description": "Fact bucket. 'symbol' for code/module facts, 'decision' for ADR-style choices, 'risk' for hazards or constraints to watch."
+                    },
+                    "id": {
+                        "type": "string",
+                        "description": "Stable id within the bucket. Re-using the same (kind, id) overwrites the previous fact and bumps its version."
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Statement of the fact in one to a few sentences."
+                    },
+                    "reference": {
+                        "type": "string",
+                        "description": "Optional pointer: file path, URL, ADR id — wherever the fact came from."
+                    },
+                    "tags": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional free-form tags to help future search/filter."
+                    },
+                    "tombstoned": {
+                        "type": "boolean",
+                        "description": "Set to true to retire this fact. Tombstoned facts stay on disk but are hidden from prompt injection."
+                    }
+                },
+                "required": ["kind", "id", "content"]
+            }),
+            Self::ValidationRecord => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "plan_step_id": {
+                        "type": "string",
+                        "description": "Id of the Plan step this validation covers. Must match a step in the current mission's plan.md."
+                    },
+                    "kind": {
+                        "type": "string",
+                        "enum": ["test_suite", "type_check", "integration_smoke", "benchmark"],
+                        "description": "Validation category: unit/integration tests, static type checking, end-to-end smoke, or performance benchmark."
+                    },
+                    "outcome": {
+                        "type": "string",
+                        "enum": ["pass", "fail", "skipped"],
+                        "description": "Result of the validation run. A Plan step is only considered complete when it has at least one Pass and no unresolved Fail."
+                    },
+                    "command": {
+                        "type": "string",
+                        "description": "Optional command line that produced this outcome (e.g. 'cargo test -p magi-api'). Lets the next reader reproduce."
+                    },
+                    "evidence": {
+                        "type": "string",
+                        "description": "Optional short summary of the run (count of passing tests, failing assertion, perf number) — keep it diff-friendly."
+                    }
+                },
+                "required": ["plan_step_id", "kind", "outcome"]
+            }),
+            Self::Checkpoint => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "kind": {
+                        "type": "string",
+                        "enum": ["process_restart", "context_compaction", "phase_transition", "manual"],
+                        "description": "Checkpoint category. process_restart = daemon restart boundary; context_compaction = conversation just got summarized; phase_transition = a Plan phase boundary; manual = operator-triggered."
+                    },
+                    "label": {
+                        "type": "string",
+                        "description": "Short human-readable label so a future reader can pick the right checkpoint at a glance."
+                    },
+                    "plan_version": {
+                        "type": "integer",
+                        "description": "Optional plan version number captured at this checkpoint (lets recovery diff against the current plan)."
+                    },
+                    "kg_fact_count": {
+                        "type": "integer",
+                        "description": "Optional count of mission KG facts at this checkpoint."
+                    },
+                    "workspace_commit": {
+                        "type": "string",
+                        "description": "Optional workspace VCS commit/ref captured at this checkpoint."
+                    },
+                    "open_conversations": {
+                        "type": "array",
+                        "description": "Optional list of conversation pointers (id + last turn cursor + pending mailbox size) to help future recovery resume mid-flight conversations.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "conversation_id": { "type": "string" },
+                                "turn_cursor": { "type": "integer" },
+                                "pending_mailbox": { "type": "integer" }
+                            },
+                            "required": ["conversation_id"]
+                        }
+                    },
+                    "notes": {
+                        "type": "string",
+                        "description": "Optional free-form notes (e.g. why this checkpoint, what to watch out for when restoring)."
+                    }
+                },
+                "required": ["kind"]
+            }),
+            Self::HumanCheckpointRequest => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "plan_step_id": {
+                        "type": "string",
+                        "description": "Identifier of the Plan step that triggered the request (must match an existing plan step id)."
+                    },
+                    "prompt_to_human": {
+                        "type": "string",
+                        "description": "The question or decision the operator needs to resolve. Be specific: state options, trade-offs, and what 'approve' versus 'reject' means in context."
+                    },
+                    "label": {
+                        "type": "string",
+                        "description": "Optional short headline shown alongside the pending request in the operator dashboard."
+                    },
+                    "context": {
+                        "type": "string",
+                        "description": "Optional free-form supplementary context (links, snippets, prior decisions) the operator may need to make a call."
+                    }
+                },
+                "required": ["plan_step_id", "prompt_to_human"]
             }),
         }
     }
@@ -1370,7 +1735,7 @@ mod tests {
         path
     }
 
-    fn all_builtin_tools() -> [BuiltinToolName; 24] {
+    fn all_builtin_tools() -> [BuiltinToolName; 32] {
         BuiltinToolName::ALL
     }
 
@@ -3978,6 +4343,14 @@ mod tests {
                 "agent_spawn",
                 "send_message",
                 "task_stop",
+                "todo_write",
+                "memory_write",
+                "mission_charter_write",
+                "plan_write",
+                "kg_write",
+                "validation_record",
+                "checkpoint_create",
+                "human_checkpoint_request",
             ],
             "public builtin specs must remain the single canonical tool surface"
         );

@@ -72,6 +72,38 @@ pub(crate) struct TaskLlmLoopRequest<'a> {
     /// 启用任何危险模式规则（既无内置也无用户自定义），此时拦截器走 pass-through。
     /// 在 execute_task_tool_call 中工具调用执行前做语义判定。
     pub safety_gate: Option<&'a magi_safety_gate::SafetyGate>,
+    /// Task System v2 — L13：当前 session 的 TodoLedger。模型通过 `todo_write`
+    /// 工具往里写分解 + 进度；本 Turn 起始时把快照渲染成 system prompt 注入。
+    pub todo_ledger: &'a magi_todo_ledger::TodoLedger,
+    /// Task System v2 — L14：当前 workspace 的 ProjectMemory。`None` 表示当前 task
+    /// 不绑定 workspace（极少数 orchestration-only 场景），此时不注入 prompt、
+    /// 也不允许 `memory_write` 工具调用成功。
+    pub project_memory: Option<&'a magi_project_memory::ProjectMemoryStore>,
+    /// Task System v2 — Tier 4 / L11：当前 workspace 的 MissionCharter 索引。`None` 表示
+    /// 当前 task 不绑定 workspace（极少数 orchestration-only 场景），此时不注入 prompt、
+    /// 也不允许 `mission_charter_write` 工具调用成功。
+    pub mission_charter: Option<&'a magi_mission_charter::MissionCharterStore>,
+    /// Task System v2 — Tier 4 / L12：当前 workspace 的 Plan 索引。`None` 表示当前 task
+    /// 不绑定 workspace；此时不注入 prompt，也不允许 `plan_write` 工具调用成功。
+    pub plan: Option<&'a magi_plan::PlanStore>,
+    /// Task System v2 — Tier 4 / L13：当前 workspace 的 MissionWorkspace 索引。`None`
+    /// 表示当前 task 不绑定 workspace；此时不注入工作目录视图。
+    pub mission_workspace: Option<&'a magi_mission_workspace::MissionWorkspaceStore>,
+    /// Task System v2 — Tier 4 / L18：当前 workspace 的 KnowledgeGraph 索引。`None`
+    /// 表示当前 task 不绑定 workspace；此时不注入 KG 视图，也不允许 `kg_write` 工具落盘。
+    pub knowledge_graph: Option<&'a magi_knowledge_graph::KnowledgeGraphStore>,
+    /// Task System v2 — Tier 4 / L19：当前 workspace 的 ValidationRunner 索引。`None`
+    /// 表示当前 task 不绑定 workspace；此时不注入验证摘要，也不允许 `validation_record`
+    /// 工具落盘。Coordinator 凭这里的 Pass/Fail 判定 Plan 节点是否真完成。
+    pub validation_runner: Option<&'a magi_validation_runner::ValidationStore>,
+    /// Task System v2 — Tier 4 / L20：当前 workspace 的 Checkpoint 索引。`None`
+    /// 表示当前 task 不绑定 workspace；此时不注入最近检查点列表，也不允许
+    /// `checkpoint_create` 工具落盘。append-only 语义，仅追加不修改。
+    pub checkpoint: Option<&'a magi_checkpoint::CheckpointStore>,
+    /// Task System v2 — Tier 4 / L21：当前 workspace 的 HumanCheckpoint 索引。`None`
+    /// 表示当前 task 不绑定 workspace；此时不注入人工审核点摘要，也不允许
+    /// `human_checkpoint_request` 工具落盘。pending 状态会强制 Coordinator 停止派发新工作。
+    pub human_checkpoint: Option<&'a magi_human_checkpoint::HumanCheckpointStore>,
     pub task: &'a magi_core::Task,
     pub task_id: &'a TaskId,
     pub lease_id: &'a LeaseId,
@@ -392,6 +424,15 @@ fn run_task_llm_loop_inner(
         agent_role_registry,
         spawn_graph,
         safety_gate,
+        todo_ledger,
+        project_memory,
+        mission_charter,
+        plan,
+        mission_workspace,
+        knowledge_graph,
+        validation_runner,
+        checkpoint,
+        human_checkpoint,
         task,
         task_id,
         lease_id,
@@ -429,6 +470,162 @@ fn run_task_llm_loop_inner(
             tool_calls: Vec::new(),
             tool_call_id: None,
         });
+    }
+    // S9：TodoLedger 快照注入。本 session 模型在之前轮次写过 todo_write 时，
+    // 这里把当前列表渲染进 system prompt，让本轮 Turn 起点自动看到分解 + 进度。
+    if let Some(rendered) = todo_ledger.render_for_prompt() {
+        messages.push(ChatMessage {
+            role: "system".to_string(),
+            content: Some(rendered),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        });
+    }
+    // S10：ProjectMemory 索引注入。把 `~/.magi/projects/{slug}/memory/MEMORY.md`
+    // 视图渲染进 system prompt，跨 conversation 复用同一项目的长期记忆。
+    if let Some(store) = project_memory {
+        match store.render_for_prompt() {
+            Ok(Some(rendered)) => {
+                messages.push(ChatMessage {
+                    role: "system".to_string(),
+                    content: Some(rendered),
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                });
+            }
+            Ok(None) => {}
+            Err(err) => {
+                tracing::warn!(error = %err, "ProjectMemory: 渲染 prompt 失败，本轮跳过");
+            }
+        }
+    }
+    // S11：MissionCharter 注入。当前 mission 的"宪章"（goal / 成功标准 / 约束）作为长效
+    // 锚点，长对话或多 Turn 时让 orchestrator 不会偏离最初承诺。
+    if let Some(store) = mission_charter {
+        match store.render_for_prompt(&task.mission_id) {
+            Ok(Some(rendered)) => {
+                messages.push(ChatMessage {
+                    role: "system".to_string(),
+                    content: Some(rendered),
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                });
+            }
+            Ok(None) => {}
+            Err(err) => {
+                tracing::warn!(error = %err, "MissionCharter: 渲染 prompt 失败，本轮跳过");
+            }
+        }
+    }
+    // S12：Plan 注入。当前 mission 的执行计划（steps + 状态 + 依赖）让 orchestrator
+    // 在多 Turn 推进时持续看到"下一步是什么、上一步是否做完"，避免漂移。
+    if let Some(store) = plan {
+        match store.render_for_prompt(&task.mission_id) {
+            Ok(Some(rendered)) => {
+                messages.push(ChatMessage {
+                    role: "system".to_string(),
+                    content: Some(rendered),
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                });
+            }
+            Ok(None) => {}
+            Err(err) => {
+                tracing::warn!(error = %err, "Plan: 渲染 prompt 失败，本轮跳过");
+            }
+        }
+    }
+    // S13：Mission Workspace 注入。告知 agent 当前 mission 独占的 artifacts/logs/memory
+    // 目录，引导其把产物落在 mission 内，避免散落到用户主目录或随机临时目录。
+    if let Some(store) = mission_workspace {
+        match store.render_for_prompt(&task.mission_id) {
+            Ok(rendered) => {
+                messages.push(ChatMessage {
+                    role: "system".to_string(),
+                    content: Some(rendered),
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                });
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "MissionWorkspace: 渲染 prompt 失败，本轮跳过");
+            }
+        }
+    }
+    // S14：KnowledgeGraph 注入。把 mission 已经累积的 symbols / decisions / risks 摊在
+    // 系统提示里，避免长 mission 跨多个 Conversation 时模型重新讨论已经达成的结论。
+    if let Some(store) = knowledge_graph {
+        match store.render_for_prompt(&task.mission_id) {
+            Ok(Some(rendered)) => {
+                messages.push(ChatMessage {
+                    role: "system".to_string(),
+                    content: Some(rendered),
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                });
+            }
+            Ok(None) => {}
+            Err(err) => {
+                tracing::warn!(error = %err, "KnowledgeGraph: 渲染 prompt 失败，本轮跳过");
+            }
+        }
+    }
+    // S15：ValidationRunner 注入。把 mission 当前的 Plan 节点验证结果（test_suite /
+    // type_check / integration_smoke / benchmark 的 pass/fail/skipped）摊在系统提示里，
+    // 让模型在判断"Plan 节点是否真完成"时直接看到验证证据，而不是凭印象口头声明。
+    if let Some(store) = validation_runner {
+        match store.render_for_prompt(&task.mission_id) {
+            Ok(Some(rendered)) => {
+                messages.push(ChatMessage {
+                    role: "system".to_string(),
+                    content: Some(rendered),
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                });
+            }
+            Ok(None) => {}
+            Err(err) => {
+                tracing::warn!(error = %err, "ValidationRunner: 渲染 prompt 失败，本轮跳过");
+            }
+        }
+    }
+    // S16：Checkpoint 注入。把当前 mission 最近若干检查点摊在系统提示里，让模型在跨进程
+    // 重启 / context 压缩 / phase 切换之后能定位"上次落到哪一步"，决定是否需要从某个
+    // checkpoint 重新拉起 mission。
+    if let Some(store) = checkpoint {
+        match store.render_for_prompt(&task.mission_id) {
+            Ok(Some(rendered)) => {
+                messages.push(ChatMessage {
+                    role: "system".to_string(),
+                    content: Some(rendered),
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                });
+            }
+            Ok(None) => {}
+            Err(err) => {
+                tracing::warn!(error = %err, "Checkpoint: 渲染 prompt 失败，本轮跳过");
+            }
+        }
+    }
+    // S17：HumanCheckpoint 注入。把当前 mission 待解决的人工审核点与最近若干已解决项摊
+    // 在系统提示里。pending 项要求 Coordinator 停止派发新工作，直到 operator 给出
+    // approve / reject；resolved 项作为审计上下文供模型回顾。
+    if let Some(store) = human_checkpoint {
+        match store.render_for_prompt(&task.mission_id) {
+            Ok(Some(rendered)) => {
+                messages.push(ChatMessage {
+                    role: "system".to_string(),
+                    content: Some(rendered),
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                });
+            }
+            Ok(None) => {}
+            Err(err) => {
+                tracing::warn!(error = %err, "HumanCheckpoint: 渲染 prompt 失败，本轮跳过");
+            }
+        }
     }
     // P6b：thread 累积历史 —— 系统提示后、本轮 user prompt 前。为防止 LLM 混淆"当前 task"
     // 与历史 task，我们在历史末尾、新 user prompt 前插入一条 system 边界标记，让模型明确
@@ -739,6 +936,14 @@ fn run_task_llm_loop_inner(
             task_store,
             spawn_graph,
             safety_gate,
+            todo_ledger,
+            project_memory,
+            mission_charter,
+            plan,
+            knowledge_graph,
+            validation_runner,
+            checkpoint,
+            human_checkpoint,
             task,
             session_id,
             workspace_id,
@@ -1683,6 +1888,14 @@ fn execute_task_tool_call_batch(
     task_store: &TaskStore,
     spawn_graph: &std::sync::Mutex<magi_spawn_graph::SpawnGraph>,
     safety_gate: Option<&magi_safety_gate::SafetyGate>,
+    todo_ledger: &magi_todo_ledger::TodoLedger,
+    project_memory: Option<&magi_project_memory::ProjectMemoryStore>,
+    mission_charter: Option<&magi_mission_charter::MissionCharterStore>,
+    plan: Option<&magi_plan::PlanStore>,
+    knowledge_graph: Option<&magi_knowledge_graph::KnowledgeGraphStore>,
+    validation_runner: Option<&magi_validation_runner::ValidationStore>,
+    checkpoint: Option<&magi_checkpoint::CheckpointStore>,
+    human_checkpoint: Option<&magi_human_checkpoint::HumanCheckpointStore>,
     task: &magi_core::Task,
     session_id: &SessionId,
     workspace_id: &Option<WorkspaceId>,
@@ -1717,6 +1930,14 @@ fn execute_task_tool_call_batch(
                         task_store,
                         spawn_graph,
                         safety_gate,
+                        todo_ledger,
+                        project_memory,
+                        mission_charter,
+                        plan,
+                        knowledge_graph,
+                        validation_runner,
+                        checkpoint,
+                        human_checkpoint,
                         task,
                         session_id,
                         workspace_id,
@@ -1744,6 +1965,14 @@ fn execute_task_tool_call_batch(
                                         task_store,
                                         spawn_graph,
                                         safety_gate,
+                                        todo_ledger,
+                                        project_memory,
+                                        mission_charter,
+                                        plan,
+                                        knowledge_graph,
+                                        validation_runner,
+                                        checkpoint,
+                                        human_checkpoint,
                                         task,
                                         session_id,
                                         workspace_id,
@@ -2081,6 +2310,898 @@ fn execute_coordinator_tool(
     }
 }
 
+/// S9：`todo_write` 工具拦截器。整体替换当前 session 的 TodoLedger，并把新快照
+/// 同步到事件总线，UI / 测试可以观察。
+fn execute_todo_write_tool(
+    event_bus: &InMemoryEventBus,
+    todo_ledger: &magi_todo_ledger::TodoLedger,
+    task: &magi_core::Task,
+    session_id: &SessionId,
+    workspace_id: &Option<WorkspaceId>,
+    tool_call: &ChatToolCall,
+) -> (String, ExecutionResultStatus) {
+    match magi_todo_ledger::parse_todo_write_arguments(&tool_call.function.arguments) {
+        Ok(items) => {
+            let stored = todo_ledger.replace(items);
+            let snapshot_payload = serde_json::to_value(&stored).unwrap_or(serde_json::Value::Null);
+            let _ = event_bus.publish(
+                EventEnvelope::domain(
+                    EventId::new(format!("event-todo-ledger-updated-{}", UtcMillis::now().0)),
+                    "task.todo_ledger.updated",
+                    serde_json::json!({
+                        "task_id": task.task_id.to_string(),
+                        "session_id": session_id.to_string(),
+                        "workspace_id": workspace_id.as_ref().map(ToString::to_string),
+                        "count": stored.len(),
+                        "todos": snapshot_payload,
+                    }),
+                )
+                .with_context(EventContext {
+                    workspace_id: workspace_id.clone(),
+                    session_id: Some(session_id.clone()),
+                    mission_id: Some(task.mission_id.clone()),
+                    task_id: Some(task.task_id.clone()),
+                    ..EventContext::default()
+                }),
+            );
+            (
+                serde_json::json!({
+                    "tool": "todo_write",
+                    "status": "succeeded",
+                    "count": stored.len(),
+                    "todos": stored,
+                })
+                .to_string(),
+                ExecutionResultStatus::Succeeded,
+            )
+        }
+        Err(err) => (
+            serde_json::json!({
+                "tool": "todo_write",
+                "status": "failed",
+                "error": err.to_string(),
+            })
+            .to_string(),
+            ExecutionResultStatus::Failed,
+        ),
+    }
+}
+
+/// S10：`memory_write` 工具拦截器。把保存/删除请求落地到 workspace 的
+/// `~/.magi/projects/{slug}/memory/` 目录，同时把变更事件发到 bus 供 UI 订阅。
+/// 当前 task 未绑定 workspace 时直接失败，避免静默丢弃记忆请求。
+fn execute_memory_write_tool(
+    event_bus: &InMemoryEventBus,
+    project_memory: Option<&magi_project_memory::ProjectMemoryStore>,
+    task: &magi_core::Task,
+    session_id: &SessionId,
+    workspace_id: &Option<WorkspaceId>,
+    tool_call: &ChatToolCall,
+) -> (String, ExecutionResultStatus) {
+    let Some(store) = project_memory else {
+        return (
+            serde_json::json!({
+                "tool": "memory_write",
+                "status": "failed",
+                "error": "当前 task 未绑定 workspace，无法定位项目记忆目录",
+            })
+            .to_string(),
+            ExecutionResultStatus::Failed,
+        );
+    };
+    let parsed = match magi_project_memory::parse_memory_write_arguments(
+        &tool_call.function.arguments,
+    ) {
+        Ok(action) => action,
+        Err(err) => {
+            return (
+                serde_json::json!({
+                    "tool": "memory_write",
+                    "status": "failed",
+                    "error": err.to_string(),
+                })
+                .to_string(),
+                ExecutionResultStatus::Failed,
+            );
+        }
+    };
+    let (event_kind, payload, status) = match parsed {
+        magi_project_memory::MemoryWriteAction::Save(entry) => {
+            let file_stem = entry.file_stem.clone();
+            match store.save_entry(&entry) {
+                Ok(()) => (
+                    "save",
+                    serde_json::json!({
+                        "tool": "memory_write",
+                        "status": "succeeded",
+                        "action": "save",
+                        "file_stem": file_stem,
+                        "kind": entry.kind.as_str(),
+                    }),
+                    ExecutionResultStatus::Succeeded,
+                ),
+                Err(err) => (
+                    "save",
+                    serde_json::json!({
+                        "tool": "memory_write",
+                        "status": "failed",
+                        "action": "save",
+                        "file_stem": file_stem,
+                        "error": err.to_string(),
+                    }),
+                    ExecutionResultStatus::Failed,
+                ),
+            }
+        }
+        magi_project_memory::MemoryWriteAction::Delete { file_stem } => {
+            match store.delete_entry(&file_stem) {
+                Ok(true) => (
+                    "delete",
+                    serde_json::json!({
+                        "tool": "memory_write",
+                        "status": "succeeded",
+                        "action": "delete",
+                        "file_stem": file_stem,
+                    }),
+                    ExecutionResultStatus::Succeeded,
+                ),
+                Ok(false) => (
+                    "delete",
+                    serde_json::json!({
+                        "tool": "memory_write",
+                        "status": "succeeded",
+                        "action": "delete",
+                        "file_stem": file_stem,
+                        "note": "entry 不存在，已视为幂等删除",
+                    }),
+                    ExecutionResultStatus::Succeeded,
+                ),
+                Err(err) => (
+                    "delete",
+                    serde_json::json!({
+                        "tool": "memory_write",
+                        "status": "failed",
+                        "action": "delete",
+                        "file_stem": file_stem,
+                        "error": err.to_string(),
+                    }),
+                    ExecutionResultStatus::Failed,
+                ),
+            }
+        }
+    };
+    let _ = event_bus.publish(
+        EventEnvelope::domain(
+            EventId::new(format!("event-project-memory-updated-{}", UtcMillis::now().0)),
+            "task.project_memory.updated",
+            serde_json::json!({
+                "task_id": task.task_id.to_string(),
+                "session_id": session_id.to_string(),
+                "workspace_id": workspace_id.as_ref().map(ToString::to_string),
+                "action": event_kind,
+                "result": payload,
+            }),
+        )
+        .with_context(EventContext {
+            workspace_id: workspace_id.clone(),
+            session_id: Some(session_id.clone()),
+            mission_id: Some(task.mission_id.clone()),
+            task_id: Some(task.task_id.clone()),
+            ..EventContext::default()
+        }),
+    );
+    (payload.to_string(), status)
+}
+
+fn execute_mission_charter_write_tool(
+    event_bus: &InMemoryEventBus,
+    mission_charter: Option<&magi_mission_charter::MissionCharterStore>,
+    task: &magi_core::Task,
+    session_id: &SessionId,
+    workspace_id: &Option<WorkspaceId>,
+    tool_call: &ChatToolCall,
+) -> (String, ExecutionResultStatus) {
+    let Some(store) = mission_charter else {
+        return (
+            serde_json::json!({
+                "tool": "mission_charter_write",
+                "status": "failed",
+                "error": "当前 task 未绑定 workspace，无法定位 mission charter 目录",
+            })
+            .to_string(),
+            ExecutionResultStatus::Failed,
+        );
+    };
+    let args_value: serde_json::Value = match serde_json::from_str(&tool_call.function.arguments) {
+        Ok(v) => v,
+        Err(err) => {
+            return (
+                serde_json::json!({
+                    "tool": "mission_charter_write",
+                    "status": "failed",
+                    "error": format!("arguments 非合法 JSON：{err}"),
+                })
+                .to_string(),
+                ExecutionResultStatus::Failed,
+            );
+        }
+    };
+    let args = match magi_mission_charter::parse_mission_charter_write_arguments(&args_value) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            return (
+                serde_json::json!({
+                    "tool": "mission_charter_write",
+                    "status": "failed",
+                    "error": err.to_string(),
+                })
+                .to_string(),
+                ExecutionResultStatus::Failed,
+            );
+        }
+    };
+    let now = magi_core::UtcMillis::now();
+    let mut charter = match store.load(&task.mission_id) {
+        Ok(Some(existing)) => existing,
+        Ok(None) => {
+            // 首次写入需要 title + goal 才能构造合法 charter；缺一即拒，避免半成品契约落盘。
+            let (Some(title), Some(goal)) = (args.title.clone(), args.goal.clone()) else {
+                return (
+                    serde_json::json!({
+                        "tool": "mission_charter_write",
+                        "status": "failed",
+                        "error": "首次创建 charter 必须同时提供 title 与 goal",
+                    })
+                    .to_string(),
+                    ExecutionResultStatus::Failed,
+                );
+            };
+            magi_mission_charter::MissionCharter::new(task.mission_id.clone(), title, goal, now)
+        }
+        Err(err) => {
+            return (
+                serde_json::json!({
+                    "tool": "mission_charter_write",
+                    "status": "failed",
+                    "error": err.to_string(),
+                })
+                .to_string(),
+                ExecutionResultStatus::Failed,
+            );
+        }
+    };
+    let changed = magi_mission_charter::apply_charter_update(&mut charter, args, now);
+    if let Err(err) = store.save(&charter) {
+        return (
+            serde_json::json!({
+                "tool": "mission_charter_write",
+                "status": "failed",
+                "error": err.to_string(),
+            })
+            .to_string(),
+            ExecutionResultStatus::Failed,
+        );
+    }
+    let payload = serde_json::json!({
+        "tool": "mission_charter_write",
+        "status": "succeeded",
+        "mission_id": charter.mission_id.to_string(),
+        "title": charter.title,
+        "changed": changed,
+    });
+    let _ = event_bus.publish(
+        EventEnvelope::domain(
+            EventId::new(format!(
+                "event-mission-charter-updated-{}",
+                UtcMillis::now().0
+            )),
+            "task.mission_charter.updated",
+            serde_json::json!({
+                "task_id": task.task_id.to_string(),
+                "mission_id": charter.mission_id.to_string(),
+                "session_id": session_id.to_string(),
+                "workspace_id": workspace_id.as_ref().map(ToString::to_string),
+                "changed": changed,
+                "title": charter.title,
+            }),
+        )
+        .with_context(EventContext {
+            workspace_id: workspace_id.clone(),
+            session_id: Some(session_id.clone()),
+            mission_id: Some(task.mission_id.clone()),
+            task_id: Some(task.task_id.clone()),
+            ..EventContext::default()
+        }),
+    );
+    (payload.to_string(), ExecutionResultStatus::Succeeded)
+}
+
+fn execute_plan_write_tool(
+    event_bus: &InMemoryEventBus,
+    plan: Option<&magi_plan::PlanStore>,
+    task: &magi_core::Task,
+    session_id: &SessionId,
+    workspace_id: &Option<WorkspaceId>,
+    tool_call: &ChatToolCall,
+) -> (String, ExecutionResultStatus) {
+    let Some(store) = plan else {
+        return (
+            serde_json::json!({
+                "tool": "plan_write",
+                "status": "failed",
+                "error": "当前 task 未绑定 workspace，无法定位 mission plan 目录",
+            })
+            .to_string(),
+            ExecutionResultStatus::Failed,
+        );
+    };
+    let args_value: serde_json::Value = match serde_json::from_str(&tool_call.function.arguments) {
+        Ok(v) => v,
+        Err(err) => {
+            return (
+                serde_json::json!({
+                    "tool": "plan_write",
+                    "status": "failed",
+                    "error": format!("arguments 非合法 JSON：{err}"),
+                })
+                .to_string(),
+                ExecutionResultStatus::Failed,
+            );
+        }
+    };
+    let args = match magi_plan::parse_plan_write_arguments(&args_value) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            return (
+                serde_json::json!({
+                    "tool": "plan_write",
+                    "status": "failed",
+                    "error": err.to_string(),
+                })
+                .to_string(),
+                ExecutionResultStatus::Failed,
+            );
+        }
+    };
+    let now = magi_core::UtcMillis::now();
+    let mut plan_doc = match store.load(&task.mission_id) {
+        Ok(Some(existing)) => existing,
+        Ok(None) => magi_plan::Plan::new(task.mission_id.clone(), now),
+        Err(err) => {
+            return (
+                serde_json::json!({
+                    "tool": "plan_write",
+                    "status": "failed",
+                    "error": err.to_string(),
+                })
+                .to_string(),
+                ExecutionResultStatus::Failed,
+            );
+        }
+    };
+    let changed = magi_plan::apply_plan_update(&mut plan_doc, args, now);
+    if let Err(err) = store.save(&plan_doc) {
+        return (
+            serde_json::json!({
+                "tool": "plan_write",
+                "status": "failed",
+                "error": err.to_string(),
+            })
+            .to_string(),
+            ExecutionResultStatus::Failed,
+        );
+    }
+    let payload = serde_json::json!({
+        "tool": "plan_write",
+        "status": "succeeded",
+        "mission_id": plan_doc.mission_id.to_string(),
+        "step_count": plan_doc.steps.len(),
+        "changed": changed,
+    });
+    let _ = event_bus.publish(
+        EventEnvelope::domain(
+            EventId::new(format!("event-plan-updated-{}", UtcMillis::now().0)),
+            "task.plan.updated",
+            serde_json::json!({
+                "task_id": task.task_id.to_string(),
+                "mission_id": plan_doc.mission_id.to_string(),
+                "session_id": session_id.to_string(),
+                "workspace_id": workspace_id.as_ref().map(ToString::to_string),
+                "changed": changed,
+                "step_count": plan_doc.steps.len(),
+            }),
+        )
+        .with_context(EventContext {
+            workspace_id: workspace_id.clone(),
+            session_id: Some(session_id.clone()),
+            mission_id: Some(task.mission_id.clone()),
+            task_id: Some(task.task_id.clone()),
+            ..EventContext::default()
+        }),
+    );
+    (payload.to_string(), ExecutionResultStatus::Succeeded)
+}
+
+fn execute_kg_write_tool(
+    event_bus: &InMemoryEventBus,
+    knowledge_graph: Option<&magi_knowledge_graph::KnowledgeGraphStore>,
+    task: &magi_core::Task,
+    session_id: &SessionId,
+    workspace_id: &Option<WorkspaceId>,
+    tool_call: &ChatToolCall,
+) -> (String, ExecutionResultStatus) {
+    let Some(store) = knowledge_graph else {
+        return (
+            serde_json::json!({
+                "tool": "kg_write",
+                "status": "failed",
+                "error": "当前 task 未绑定 workspace，无法定位 mission knowledge graph",
+            })
+            .to_string(),
+            ExecutionResultStatus::Failed,
+        );
+    };
+    let args_value: serde_json::Value = match serde_json::from_str(&tool_call.function.arguments) {
+        Ok(v) => v,
+        Err(err) => {
+            return (
+                serde_json::json!({
+                    "tool": "kg_write",
+                    "status": "failed",
+                    "error": format!("arguments 非合法 JSON：{err}"),
+                })
+                .to_string(),
+                ExecutionResultStatus::Failed,
+            );
+        }
+    };
+    let args = match magi_knowledge_graph::parse_kg_write_arguments(&args_value) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            return (
+                serde_json::json!({
+                    "tool": "kg_write",
+                    "status": "failed",
+                    "error": err.to_string(),
+                })
+                .to_string(),
+                ExecutionResultStatus::Failed,
+            );
+        }
+    };
+    let now = magi_core::UtcMillis::now();
+    let mut graph = match store.load(&task.mission_id) {
+        Ok(Some(existing)) => existing,
+        Ok(None) => magi_knowledge_graph::KnowledgeGraph::new(task.mission_id.clone(), now),
+        Err(err) => {
+            return (
+                serde_json::json!({
+                    "tool": "kg_write",
+                    "status": "failed",
+                    "error": err.to_string(),
+                })
+                .to_string(),
+                ExecutionResultStatus::Failed,
+            );
+        }
+    };
+    let kind = args.kind;
+    let fact_id = args.id.clone();
+    let changed = magi_knowledge_graph::apply_kg_update(&mut graph, args, now);
+    if let Err(err) = store.save(&graph) {
+        return (
+            serde_json::json!({
+                "tool": "kg_write",
+                "status": "failed",
+                "error": err.to_string(),
+            })
+            .to_string(),
+            ExecutionResultStatus::Failed,
+        );
+    }
+    let payload = serde_json::json!({
+        "tool": "kg_write",
+        "status": "succeeded",
+        "mission_id": graph.mission_id.to_string(),
+        "kind": kind.as_str(),
+        "id": fact_id.clone(),
+        "fact_count": graph.facts.len(),
+        "changed": changed,
+    });
+    let _ = event_bus.publish(
+        EventEnvelope::domain(
+            EventId::new(format!("event-kg-updated-{}", UtcMillis::now().0)),
+            "task.kg.updated",
+            serde_json::json!({
+                "task_id": task.task_id.to_string(),
+                "mission_id": graph.mission_id.to_string(),
+                "session_id": session_id.to_string(),
+                "workspace_id": workspace_id.as_ref().map(ToString::to_string),
+                "kind": kind.as_str(),
+                "id": fact_id,
+                "changed": changed,
+                "fact_count": graph.facts.len(),
+            }),
+        )
+        .with_context(EventContext {
+            workspace_id: workspace_id.clone(),
+            session_id: Some(session_id.clone()),
+            mission_id: Some(task.mission_id.clone()),
+            task_id: Some(task.task_id.clone()),
+            ..EventContext::default()
+        }),
+    );
+    (payload.to_string(), ExecutionResultStatus::Succeeded)
+}
+
+/// S15：`validation_record` 工具实现。把一次验证（test_suite / type_check /
+/// integration_smoke / benchmark）的 pass/fail/skipped 结果写入 mission 维度的
+/// `validation.md`。`(plan_step_id, kind)` 唯一，重复写入按 upsert 处理并 bump version。
+fn execute_validation_record_tool(
+    event_bus: &InMemoryEventBus,
+    validation_runner: Option<&magi_validation_runner::ValidationStore>,
+    task: &magi_core::Task,
+    session_id: &SessionId,
+    workspace_id: &Option<WorkspaceId>,
+    tool_call: &ChatToolCall,
+) -> (String, ExecutionResultStatus) {
+    let Some(store) = validation_runner else {
+        return (
+            serde_json::json!({
+                "tool": "validation_record",
+                "status": "failed",
+                "error": "当前 task 未绑定 workspace，无法定位 mission validation runner",
+            })
+            .to_string(),
+            ExecutionResultStatus::Failed,
+        );
+    };
+    let args_value: serde_json::Value = match serde_json::from_str(&tool_call.function.arguments) {
+        Ok(v) => v,
+        Err(err) => {
+            return (
+                serde_json::json!({
+                    "tool": "validation_record",
+                    "status": "failed",
+                    "error": format!("arguments 非合法 JSON：{err}"),
+                })
+                .to_string(),
+                ExecutionResultStatus::Failed,
+            );
+        }
+    };
+    let args = match magi_validation_runner::parse_validation_record_arguments(&args_value) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            return (
+                serde_json::json!({
+                    "tool": "validation_record",
+                    "status": "failed",
+                    "error": err.to_string(),
+                })
+                .to_string(),
+                ExecutionResultStatus::Failed,
+            );
+        }
+    };
+    let now = magi_core::UtcMillis::now();
+    let mut report = match store.load(&task.mission_id) {
+        Ok(Some(existing)) => existing,
+        Ok(None) => magi_validation_runner::ValidationReport::new(task.mission_id.clone(), now),
+        Err(err) => {
+            return (
+                serde_json::json!({
+                    "tool": "validation_record",
+                    "status": "failed",
+                    "error": err.to_string(),
+                })
+                .to_string(),
+                ExecutionResultStatus::Failed,
+            );
+        }
+    };
+    let plan_step_id = args.plan_step_id.clone();
+    let kind = args.kind;
+    let outcome = args.outcome;
+    let changed = magi_validation_runner::apply_validation_record(&mut report, args, now);
+    if let Err(err) = store.save(&report) {
+        return (
+            serde_json::json!({
+                "tool": "validation_record",
+                "status": "failed",
+                "error": err.to_string(),
+            })
+            .to_string(),
+            ExecutionResultStatus::Failed,
+        );
+    }
+    let step_passing = report.step_is_passing(&plan_step_id);
+    let payload = serde_json::json!({
+        "tool": "validation_record",
+        "status": "succeeded",
+        "mission_id": report.mission_id.to_string(),
+        "plan_step_id": plan_step_id,
+        "kind": kind.as_str(),
+        "outcome": outcome.as_str(),
+        "record_count": report.records.len(),
+        "changed": changed,
+        "step_is_passing": step_passing,
+    });
+    let _ = event_bus.publish(
+        EventEnvelope::domain(
+            EventId::new(format!(
+                "event-validation-updated-{}",
+                UtcMillis::now().0
+            )),
+            "task.validation.updated",
+            serde_json::json!({
+                "task_id": task.task_id.to_string(),
+                "mission_id": report.mission_id.to_string(),
+                "session_id": session_id.to_string(),
+                "workspace_id": workspace_id.as_ref().map(ToString::to_string),
+                "plan_step_id": plan_step_id,
+                "kind": kind.as_str(),
+                "outcome": outcome.as_str(),
+                "changed": changed,
+                "step_is_passing": step_passing,
+                "record_count": report.records.len(),
+            }),
+        )
+        .with_context(EventContext {
+            workspace_id: workspace_id.clone(),
+            session_id: Some(session_id.clone()),
+            mission_id: Some(task.mission_id.clone()),
+            task_id: Some(task.task_id.clone()),
+            ..EventContext::default()
+        }),
+    );
+    (payload.to_string(), ExecutionResultStatus::Succeeded)
+}
+
+/// S16：`checkpoint_create` 工具实现。把一次 mission 级检查点（process_restart /
+/// context_compaction / phase_transition / manual）append 到 mission 维度的
+/// `checkpoints.md`。语义为 append-only：sequence 单调递增，不允许修改或删除历史记录。
+fn execute_checkpoint_create_tool(
+    event_bus: &InMemoryEventBus,
+    checkpoint: Option<&magi_checkpoint::CheckpointStore>,
+    task: &magi_core::Task,
+    session_id: &SessionId,
+    workspace_id: &Option<WorkspaceId>,
+    tool_call: &ChatToolCall,
+) -> (String, ExecutionResultStatus) {
+    let Some(store) = checkpoint else {
+        return (
+            serde_json::json!({
+                "tool": "checkpoint_create",
+                "status": "failed",
+                "error": "当前 task 未绑定 workspace，无法定位 mission checkpoint store",
+            })
+            .to_string(),
+            ExecutionResultStatus::Failed,
+        );
+    };
+    let args_value: serde_json::Value = match serde_json::from_str(&tool_call.function.arguments) {
+        Ok(v) => v,
+        Err(err) => {
+            return (
+                serde_json::json!({
+                    "tool": "checkpoint_create",
+                    "status": "failed",
+                    "error": format!("arguments 非合法 JSON：{err}"),
+                })
+                .to_string(),
+                ExecutionResultStatus::Failed,
+            );
+        }
+    };
+    let args = match magi_checkpoint::parse_checkpoint_create_arguments(&args_value) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            return (
+                serde_json::json!({
+                    "tool": "checkpoint_create",
+                    "status": "failed",
+                    "error": err.to_string(),
+                })
+                .to_string(),
+                ExecutionResultStatus::Failed,
+            );
+        }
+    };
+    let now = magi_core::UtcMillis::now();
+    let mut log = match store.load(&task.mission_id) {
+        Ok(Some(existing)) => existing,
+        Ok(None) => magi_checkpoint::CheckpointLog::new(task.mission_id.clone(), now),
+        Err(err) => {
+            return (
+                serde_json::json!({
+                    "tool": "checkpoint_create",
+                    "status": "failed",
+                    "error": err.to_string(),
+                })
+                .to_string(),
+                ExecutionResultStatus::Failed,
+            );
+        }
+    };
+    let kind = args.kind;
+    let label_snapshot = args.label.clone();
+    let sequence = magi_checkpoint::append_checkpoint(&mut log, args, now);
+    if let Err(err) = store.save(&log) {
+        return (
+            serde_json::json!({
+                "tool": "checkpoint_create",
+                "status": "failed",
+                "error": err.to_string(),
+            })
+            .to_string(),
+            ExecutionResultStatus::Failed,
+        );
+    }
+    let payload = serde_json::json!({
+        "tool": "checkpoint_create",
+        "status": "succeeded",
+        "mission_id": log.mission_id.to_string(),
+        "sequence": sequence,
+        "kind": kind.as_str(),
+        "label": label_snapshot,
+        "checkpoint_count": log.checkpoints.len(),
+    });
+    let _ = event_bus.publish(
+        EventEnvelope::domain(
+            EventId::new(format!(
+                "event-checkpoint-appended-{}",
+                UtcMillis::now().0
+            )),
+            "task.checkpoint.appended",
+            serde_json::json!({
+                "task_id": task.task_id.to_string(),
+                "mission_id": log.mission_id.to_string(),
+                "session_id": session_id.to_string(),
+                "workspace_id": workspace_id.as_ref().map(ToString::to_string),
+                "sequence": sequence,
+                "kind": kind.as_str(),
+                "label": label_snapshot,
+                "checkpoint_count": log.checkpoints.len(),
+            }),
+        )
+        .with_context(EventContext {
+            workspace_id: workspace_id.clone(),
+            session_id: Some(session_id.clone()),
+            mission_id: Some(task.mission_id.clone()),
+            task_id: Some(task.task_id.clone()),
+            ..EventContext::default()
+        }),
+    );
+    (payload.to_string(), ExecutionResultStatus::Succeeded)
+}
+
+/// S17：`human_checkpoint_request` 工具实现。把 orchestrator 申请的人工审核点写入
+/// mission 维度的 `human_checkpoints.md`，记录为 Pending 状态；resolve 由 operator
+/// 侧另起 API 调用，不在本工具流程内。pending 项在 prompt 注入时会强制 Coordinator
+/// 停止派发新工作，直到 operator approve / reject。
+fn execute_human_checkpoint_request_tool(
+    event_bus: &InMemoryEventBus,
+    human_checkpoint: Option<&magi_human_checkpoint::HumanCheckpointStore>,
+    task: &magi_core::Task,
+    session_id: &SessionId,
+    workspace_id: &Option<WorkspaceId>,
+    tool_call: &ChatToolCall,
+) -> (String, ExecutionResultStatus) {
+    let Some(store) = human_checkpoint else {
+        return (
+            serde_json::json!({
+                "tool": "human_checkpoint_request",
+                "status": "failed",
+                "error": "当前 task 未绑定 workspace，无法定位 mission human_checkpoint store",
+            })
+            .to_string(),
+            ExecutionResultStatus::Failed,
+        );
+    };
+    let args_value: serde_json::Value = match serde_json::from_str(&tool_call.function.arguments) {
+        Ok(v) => v,
+        Err(err) => {
+            return (
+                serde_json::json!({
+                    "tool": "human_checkpoint_request",
+                    "status": "failed",
+                    "error": format!("arguments 非合法 JSON：{err}"),
+                })
+                .to_string(),
+                ExecutionResultStatus::Failed,
+            );
+        }
+    };
+    let args = match magi_human_checkpoint::parse_human_checkpoint_request_arguments(&args_value) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            return (
+                serde_json::json!({
+                    "tool": "human_checkpoint_request",
+                    "status": "failed",
+                    "error": err.to_string(),
+                })
+                .to_string(),
+                ExecutionResultStatus::Failed,
+            );
+        }
+    };
+    let now = magi_core::UtcMillis::now();
+    let mut log = match store.load(&task.mission_id) {
+        Ok(Some(existing)) => existing,
+        Ok(None) => magi_human_checkpoint::HumanCheckpointLog::new(task.mission_id.clone(), now),
+        Err(err) => {
+            return (
+                serde_json::json!({
+                    "tool": "human_checkpoint_request",
+                    "status": "failed",
+                    "error": err.to_string(),
+                })
+                .to_string(),
+                ExecutionResultStatus::Failed,
+            );
+        }
+    };
+    let plan_step_id_snapshot = args.plan_step_id.clone();
+    let prompt_snapshot = args.prompt_to_human.clone();
+    let label_snapshot = args.label.clone();
+    let sequence = magi_human_checkpoint::append_human_checkpoint_request(&mut log, args, now);
+    if let Err(err) = store.save(&log) {
+        return (
+            serde_json::json!({
+                "tool": "human_checkpoint_request",
+                "status": "failed",
+                "error": err.to_string(),
+            })
+            .to_string(),
+            ExecutionResultStatus::Failed,
+        );
+    }
+    let pending_count = log
+        .entries
+        .iter()
+        .filter(|c| c.status.is_pending())
+        .count();
+    let payload = serde_json::json!({
+        "tool": "human_checkpoint_request",
+        "status": "succeeded",
+        "mission_id": log.mission_id.to_string(),
+        "sequence": sequence,
+        "plan_step_id": plan_step_id_snapshot,
+        "label": label_snapshot,
+        "pending_count": pending_count,
+    });
+    let _ = event_bus.publish(
+        EventEnvelope::domain(
+            EventId::new(format!(
+                "event-human-checkpoint-requested-{}",
+                UtcMillis::now().0
+            )),
+            "task.human_checkpoint.requested",
+            serde_json::json!({
+                "task_id": task.task_id.to_string(),
+                "mission_id": log.mission_id.to_string(),
+                "session_id": session_id.to_string(),
+                "workspace_id": workspace_id.as_ref().map(ToString::to_string),
+                "sequence": sequence,
+                "plan_step_id": plan_step_id_snapshot,
+                "prompt_to_human": prompt_snapshot,
+                "label": label_snapshot,
+                "pending_count": pending_count,
+            }),
+        )
+        .with_context(EventContext {
+            workspace_id: workspace_id.clone(),
+            session_id: Some(session_id.clone()),
+            mission_id: Some(task.mission_id.clone()),
+            task_id: Some(task.task_id.clone()),
+            ..EventContext::default()
+        }),
+    );
+    (payload.to_string(), ExecutionResultStatus::Succeeded)
+}
+
 fn execute_task_tool_call(
     event_bus: &InMemoryEventBus,
     tool_registry: Option<&ToolRegistry>,
@@ -2088,6 +3209,14 @@ fn execute_task_tool_call(
     task_store: &TaskStore,
     spawn_graph: &std::sync::Mutex<magi_spawn_graph::SpawnGraph>,
     safety_gate: Option<&magi_safety_gate::SafetyGate>,
+    todo_ledger: &magi_todo_ledger::TodoLedger,
+    project_memory: Option<&magi_project_memory::ProjectMemoryStore>,
+    mission_charter: Option<&magi_mission_charter::MissionCharterStore>,
+    plan: Option<&magi_plan::PlanStore>,
+    knowledge_graph: Option<&magi_knowledge_graph::KnowledgeGraphStore>,
+    validation_runner: Option<&magi_validation_runner::ValidationStore>,
+    checkpoint: Option<&magi_checkpoint::CheckpointStore>,
+    human_checkpoint: Option<&magi_human_checkpoint::HumanCheckpointStore>,
     task: &magi_core::Task,
     session_id: &SessionId,
     workspace_id: &Option<WorkspaceId>,
@@ -2097,6 +3226,10 @@ fn execute_task_tool_call(
 ) -> (String, ExecutionResultStatus) {
     // S7-E：协调器三件套（agent_spawn / send_message / task_stop）由 orchestration 层拦截，
     // 不进 BuiltinTool::execute —— 它们需要 task_store / spawn_graph / event_bus 等上下文。
+    // S9：TodoWrite 同样在此层拦截，因为它要操作 session 维度的 TodoLedger。
+    // S10：MemoryWrite 同样在此层拦截，因为它要操作 workspace 维度的 ProjectMemoryStore。
+    // S11：MissionCharterWrite 同样在此层拦截，因为它要操作 mission 维度的 MissionCharterStore。
+    // S12：PlanWrite 同样在此层拦截，因为它要操作 mission 维度的 PlanStore。
     if let Some(canonical) =
         magi_tool_runtime::BuiltinToolName::from_str(tool_call.function.name.as_str())
     {
@@ -2114,6 +3247,94 @@ fn execute_task_tool_call(
                 session_id,
                 workspace_id,
                 canonical,
+                tool_call,
+            );
+        }
+        if matches!(canonical, magi_tool_runtime::BuiltinToolName::TodoWrite) {
+            return execute_todo_write_tool(
+                event_bus,
+                todo_ledger,
+                task,
+                session_id,
+                workspace_id,
+                tool_call,
+            );
+        }
+        if matches!(canonical, magi_tool_runtime::BuiltinToolName::MemoryWrite) {
+            return execute_memory_write_tool(
+                event_bus,
+                project_memory,
+                task,
+                session_id,
+                workspace_id,
+                tool_call,
+            );
+        }
+        if matches!(canonical, magi_tool_runtime::BuiltinToolName::MissionCharterWrite) {
+            return execute_mission_charter_write_tool(
+                event_bus,
+                mission_charter,
+                task,
+                session_id,
+                workspace_id,
+                tool_call,
+            );
+        }
+        if matches!(canonical, magi_tool_runtime::BuiltinToolName::PlanWrite) {
+            return execute_plan_write_tool(
+                event_bus,
+                plan,
+                task,
+                session_id,
+                workspace_id,
+                tool_call,
+            );
+        }
+        // S14：KgWrite 同样在此层拦截，因为它要操作 mission 维度的 KnowledgeGraphStore。
+        if matches!(canonical, magi_tool_runtime::BuiltinToolName::KgWrite) {
+            return execute_kg_write_tool(
+                event_bus,
+                knowledge_graph,
+                task,
+                session_id,
+                workspace_id,
+                tool_call,
+            );
+        }
+        // S15：ValidationRecord 同样在此层拦截，因为它要操作 mission 维度的 ValidationStore。
+        if matches!(canonical, magi_tool_runtime::BuiltinToolName::ValidationRecord) {
+            return execute_validation_record_tool(
+                event_bus,
+                validation_runner,
+                task,
+                session_id,
+                workspace_id,
+                tool_call,
+            );
+        }
+        // S16：Checkpoint 同样在此层拦截，因为它要操作 mission 维度的 CheckpointStore。
+        if matches!(canonical, magi_tool_runtime::BuiltinToolName::Checkpoint) {
+            return execute_checkpoint_create_tool(
+                event_bus,
+                checkpoint,
+                task,
+                session_id,
+                workspace_id,
+                tool_call,
+            );
+        }
+        // S17：HumanCheckpointRequest 同样在此层拦截，因为它要操作 mission 维度的
+        // HumanCheckpointStore，并触发 awaiting_human 状态。
+        if matches!(
+            canonical,
+            magi_tool_runtime::BuiltinToolName::HumanCheckpointRequest
+        ) {
+            return execute_human_checkpoint_request_tool(
+                event_bus,
+                human_checkpoint,
+                task,
+                session_id,
+                workspace_id,
                 tool_call,
             );
         }
@@ -2686,6 +3907,14 @@ mod tests {
             &task_store,
             &spawn_graph,
             None,
+            &magi_todo_ledger::TodoLedger::new(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
             &task,
             &session_id,
             &workspace_id,
@@ -2752,6 +3981,14 @@ mod tests {
             &task_store,
             &spawn_graph,
             None,
+            &magi_todo_ledger::TodoLedger::new(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
             &task,
             &SessionId::new("session-readonly-write-policy"),
             &Some(WorkspaceId::new("workspace-readonly-write-policy")),
@@ -2808,6 +4045,14 @@ mod tests {
             &task_store,
             &spawn_graph,
             None,
+            &magi_todo_ledger::TodoLedger::new(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
             &task,
             &SessionId::new("session-readonly-shell-policy"),
             &Some(WorkspaceId::new("workspace-readonly-shell-policy")),
@@ -2862,6 +4107,14 @@ mod tests {
             &task_store,
             &spawn_graph,
             None,
+            &magi_todo_ledger::TodoLedger::new(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
             &task,
             &SessionId::new("session-no-tool-policy"),
             &Some(WorkspaceId::new("workspace-no-tool-policy")),
@@ -2904,6 +4157,14 @@ mod tests {
             &task_store,
             &spawn_graph,
             Some(&gate),
+            &magi_todo_ledger::TodoLedger::new(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
             &task,
             &SessionId::new("session-safety-gate"),
             &Some(WorkspaceId::new("workspace-safety-gate")),
@@ -2948,6 +4209,14 @@ mod tests {
             &task_store,
             &spawn_graph,
             Some(&gate),
+            &magi_todo_ledger::TodoLedger::new(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
             &task,
             &SessionId::new("session-safety-gate-safe"),
             &Some(WorkspaceId::new("workspace-safety-gate-safe")),
@@ -2958,6 +4227,1526 @@ mod tests {
         // 不强求 status 是 Succeeded —— tool registry 在测试环境下可能因沙箱无法
         // 真实执行 ls，但至少不能是 SafetyGate 触发的 Rejected。
         assert_ne!(status, ExecutionResultStatus::Rejected);
+    }
+
+    #[test]
+    fn todo_write_tool_replaces_session_ledger_and_emits_event() {
+        // S9：模型调用 `todo_write` 时，orchestration 层应直接写到 session 的
+        // TodoLedger（不进入 ToolRegistry），并发 `task.todo_ledger.updated` 事件。
+        let tool_registry = ToolRegistry::new(
+            Arc::new(GovernanceService::default()),
+            Arc::new(InMemoryEventBus::new(8)),
+        );
+        let event_bus = InMemoryEventBus::new(8);
+        let task_store = TaskStore::new();
+        let spawn_graph = std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new());
+        let ledger = magi_todo_ledger::TodoLedger::new();
+        let task = make_task_loop_test_task("task-todo-write");
+
+        // 第一次写入：两项 todo。
+        let first_call = ChatToolCall {
+            id: "tool-call-todo-write-first".to_string(),
+            kind: "function".to_string(),
+            function: ChatToolFunction {
+                name: "todo_write".to_string(),
+                arguments: serde_json::json!({
+                    "todos": [
+                        { "content": "拆 S9", "activeForm": "正在拆 S9", "status": "in_progress" },
+                        { "content": "跑测试", "activeForm": "正在跑测试", "status": "pending" },
+                    ]
+                })
+                .to_string(),
+            },
+        };
+        let (payload, status) = execute_task_tool_call(
+            &event_bus,
+            Some(&tool_registry),
+            None,
+            &task_store,
+            &spawn_graph,
+            None,
+            &ledger,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &task,
+            &SessionId::new("session-todo-write"),
+            &Some(WorkspaceId::new("workspace-todo-write")),
+            None,
+            Some(&WorkerId::new("worker-todo-write")),
+            &first_call,
+        );
+        assert_eq!(status, ExecutionResultStatus::Succeeded);
+        let parsed: serde_json::Value = serde_json::from_str(&payload).expect("payload json");
+        assert_eq!(parsed["tool"], "todo_write");
+        assert_eq!(parsed["count"], 2);
+        assert_eq!(ledger.snapshot().len(), 2);
+        assert_eq!(ledger.snapshot()[0].content, "拆 S9");
+
+        // 第二次写入：单项 → 整体替换语义验证。
+        let second_call = ChatToolCall {
+            id: "tool-call-todo-write-second".to_string(),
+            kind: "function".to_string(),
+            function: ChatToolFunction {
+                name: "todo_write".to_string(),
+                arguments: serde_json::json!({
+                    "todos": [
+                        { "content": "提交代码", "activeForm": "正在提交", "status": "pending" }
+                    ]
+                })
+                .to_string(),
+            },
+        };
+        let (_, status2) = execute_task_tool_call(
+            &event_bus,
+            Some(&tool_registry),
+            None,
+            &task_store,
+            &spawn_graph,
+            None,
+            &ledger,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &task,
+            &SessionId::new("session-todo-write"),
+            &Some(WorkspaceId::new("workspace-todo-write")),
+            None,
+            Some(&WorkerId::new("worker-todo-write")),
+            &second_call,
+        );
+        assert_eq!(status2, ExecutionResultStatus::Succeeded);
+        let snapshot = ledger.snapshot();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].content, "提交代码");
+    }
+
+    #[test]
+    fn todo_write_tool_reports_failure_on_malformed_arguments() {
+        let tool_registry = ToolRegistry::new(
+            Arc::new(GovernanceService::default()),
+            Arc::new(InMemoryEventBus::new(8)),
+        );
+        let event_bus = InMemoryEventBus::new(8);
+        let task_store = TaskStore::new();
+        let spawn_graph = std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new());
+        let ledger = magi_todo_ledger::TodoLedger::new();
+        let task = make_task_loop_test_task("task-todo-write-bad");
+        let call = ChatToolCall {
+            id: "tool-call-todo-write-bad".to_string(),
+            kind: "function".to_string(),
+            function: ChatToolFunction {
+                name: "todo_write".to_string(),
+                arguments: serde_json::json!({ "items": [] }).to_string(),
+            },
+        };
+        let (payload, status) = execute_task_tool_call(
+            &event_bus,
+            Some(&tool_registry),
+            None,
+            &task_store,
+            &spawn_graph,
+            None,
+            &ledger,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &task,
+            &SessionId::new("session-todo-write-bad"),
+            &Some(WorkspaceId::new("workspace-todo-write-bad")),
+            None,
+            Some(&WorkerId::new("worker-todo-write-bad")),
+            &call,
+        );
+        assert_eq!(status, ExecutionResultStatus::Failed);
+        let parsed: serde_json::Value = serde_json::from_str(&payload).expect("payload json");
+        assert_eq!(parsed["status"], "failed");
+        assert!(
+            parsed["error"].as_str().unwrap().contains("todos"),
+            "error 应说明缺少 todos 字段，实际：{}",
+            parsed["error"]
+        );
+        assert!(ledger.is_empty(), "失败时不能改写 ledger");
+    }
+
+    #[test]
+    fn memory_write_tool_saves_entry_via_project_memory_store() {
+        // S10：模型调用 `memory_write { action: save, ... }` 时，orchestration 层应直接写到
+        // workspace 对应的 ProjectMemoryStore，并发 `task.project_memory.updated` 事件。
+        let tool_registry = ToolRegistry::new(
+            Arc::new(GovernanceService::default()),
+            Arc::new(InMemoryEventBus::new(8)),
+        );
+        let event_bus = InMemoryEventBus::new(8);
+        let task_store = TaskStore::new();
+        let spawn_graph = std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let workspace_root =
+            magi_core::WorkspaceRootPath::new(tmp.path().to_string_lossy().to_string());
+        let store = magi_project_memory::ProjectMemoryStore::open_with_home(
+            tmp.path(),
+            &workspace_root,
+        )
+        .expect("open project memory store");
+        let task = make_task_loop_test_task("task-memory-write-save");
+
+        let call = ChatToolCall {
+            id: "tool-call-memory-write-save".to_string(),
+            kind: "function".to_string(),
+            function: ChatToolFunction {
+                name: "memory_write".to_string(),
+                arguments: serde_json::json!({
+                    "action": "save",
+                    "file_stem": "feedback_test",
+                    "name": "测试反馈",
+                    "description": "测试用",
+                    "kind": "feedback",
+                    "body": "规则：测试别 mock。\n**Why:** 历史上 mock 掩盖了 prod 问题。\n**How to apply:** 集成测试一律连真实依赖。"
+                })
+                .to_string(),
+            },
+        };
+
+        let (payload, status) = execute_task_tool_call(
+            &event_bus,
+            Some(&tool_registry),
+            None,
+            &task_store,
+            &spawn_graph,
+            None,
+            &magi_todo_ledger::TodoLedger::new(),
+            Some(&store),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &task,
+            &SessionId::new("session-memory-write-save"),
+            &Some(WorkspaceId::new("workspace-memory-write-save")),
+            None,
+            Some(&WorkerId::new("worker-memory-write-save")),
+            &call,
+        );
+
+        assert_eq!(status, ExecutionResultStatus::Succeeded);
+        let parsed: serde_json::Value = serde_json::from_str(&payload).expect("payload json");
+        assert_eq!(parsed["tool"], "memory_write");
+        assert_eq!(parsed["action"], "save");
+        assert_eq!(parsed["file_stem"], "feedback_test");
+        let entries = store.list_entries().expect("list entries");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].file_stem, "feedback_test");
+        assert_eq!(entries[0].kind, magi_project_memory::MemoryKind::Feedback);
+    }
+
+    #[test]
+    fn memory_write_tool_deletes_entry_via_project_memory_store() {
+        // S10：模型调用 `memory_write { action: delete, file_stem }` 时应删除对应记忆条目。
+        let tool_registry = ToolRegistry::new(
+            Arc::new(GovernanceService::default()),
+            Arc::new(InMemoryEventBus::new(8)),
+        );
+        let event_bus = InMemoryEventBus::new(8);
+        let task_store = TaskStore::new();
+        let spawn_graph = std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let workspace_root =
+            magi_core::WorkspaceRootPath::new(tmp.path().to_string_lossy().to_string());
+        let store = magi_project_memory::ProjectMemoryStore::open_with_home(
+            tmp.path(),
+            &workspace_root,
+        )
+        .expect("open project memory store");
+        store
+            .save_entry(&magi_project_memory::MemoryEntry {
+                file_stem: "user_role".to_string(),
+                name: "用户角色".to_string(),
+                description: "用户角色概述".to_string(),
+                kind: magi_project_memory::MemoryKind::User,
+                body: "资深 Rust 工程师".to_string(),
+            })
+            .expect("save user entry");
+
+        let task = make_task_loop_test_task("task-memory-write-delete");
+        let call = ChatToolCall {
+            id: "tool-call-memory-write-delete".to_string(),
+            kind: "function".to_string(),
+            function: ChatToolFunction {
+                name: "memory_write".to_string(),
+                arguments: serde_json::json!({
+                    "action": "delete",
+                    "file_stem": "user_role"
+                })
+                .to_string(),
+            },
+        };
+
+        let (payload, status) = execute_task_tool_call(
+            &event_bus,
+            Some(&tool_registry),
+            None,
+            &task_store,
+            &spawn_graph,
+            None,
+            &magi_todo_ledger::TodoLedger::new(),
+            Some(&store),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &task,
+            &SessionId::new("session-memory-write-delete"),
+            &Some(WorkspaceId::new("workspace-memory-write-delete")),
+            None,
+            Some(&WorkerId::new("worker-memory-write-delete")),
+            &call,
+        );
+
+        assert_eq!(status, ExecutionResultStatus::Succeeded);
+        let parsed: serde_json::Value = serde_json::from_str(&payload).expect("payload json");
+        assert_eq!(parsed["action"], "delete");
+        assert_eq!(parsed["file_stem"], "user_role");
+        assert!(
+            store.list_entries().expect("list").is_empty(),
+            "删除后应无遗留条目"
+        );
+    }
+
+    #[test]
+    fn memory_write_tool_fails_without_project_memory_store() {
+        // S10：当 workspace 无法解析时（project_memory = None），memory_write 必须返回失败，
+        // 不能静默吞掉用户意图。
+        let tool_registry = ToolRegistry::new(
+            Arc::new(GovernanceService::default()),
+            Arc::new(InMemoryEventBus::new(8)),
+        );
+        let event_bus = InMemoryEventBus::new(8);
+        let task_store = TaskStore::new();
+        let spawn_graph = std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new());
+        let task = make_task_loop_test_task("task-memory-write-no-store");
+        let call = ChatToolCall {
+            id: "tool-call-memory-write-no-store".to_string(),
+            kind: "function".to_string(),
+            function: ChatToolFunction {
+                name: "memory_write".to_string(),
+                arguments: serde_json::json!({
+                    "action": "save",
+                    "file_stem": "user_role",
+                    "name": "x",
+                    "description": "y",
+                    "kind": "user",
+                    "body": "z"
+                })
+                .to_string(),
+            },
+        };
+
+        let (payload, status) = execute_task_tool_call(
+            &event_bus,
+            Some(&tool_registry),
+            None,
+            &task_store,
+            &spawn_graph,
+            None,
+            &magi_todo_ledger::TodoLedger::new(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &task,
+            &SessionId::new("session-memory-write-no-store"),
+            &Some(WorkspaceId::new("workspace-memory-write-no-store")),
+            None,
+            Some(&WorkerId::new("worker-memory-write-no-store")),
+            &call,
+        );
+
+        assert_eq!(status, ExecutionResultStatus::Failed);
+        let parsed: serde_json::Value = serde_json::from_str(&payload).expect("payload json");
+        assert_eq!(parsed["status"], "failed");
+        assert!(
+            parsed["error"]
+                .as_str()
+                .unwrap()
+                .contains("workspace"),
+            "error 应说明 workspace 未绑定，实际：{}",
+            parsed["error"]
+        );
+    }
+
+    #[test]
+    fn mission_charter_write_tool_creates_charter_on_first_write() {
+        // S11：首次调用 mission_charter_write 时需同时提供 title 与 goal，
+        // 否则拒绝；提供后落 charter.md，并发 task.mission_charter.updated。
+        let tool_registry = ToolRegistry::new(
+            Arc::new(GovernanceService::default()),
+            Arc::new(InMemoryEventBus::new(8)),
+        );
+        let event_bus = InMemoryEventBus::new(8);
+        let task_store = TaskStore::new();
+        let spawn_graph = std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let workspace_root =
+            magi_core::WorkspaceRootPath::new(tmp.path().to_string_lossy().to_string());
+        let store = magi_mission_charter::MissionCharterStore::open_with_home(
+            tmp.path(),
+            &workspace_root,
+        )
+        .expect("open mission charter store");
+        let task = make_task_loop_test_task("task-mission-charter-create");
+        let call = ChatToolCall {
+            id: "tool-call-mission-charter-create".to_string(),
+            kind: "function".to_string(),
+            function: ChatToolFunction {
+                name: "mission_charter_write".to_string(),
+                arguments: serde_json::json!({
+                    "title": "迁移 v2 18-slice",
+                    "goal": "把 Task System v1 全量切到 v2，所有 v1 残留代码清退",
+                    "success_criteria": [
+                        "全量 cargo build + test 通过",
+                        "S1-S18 复盘清单逐条勾选"
+                    ],
+                    "constraints": ["禁止双轨"],
+                    "stakeholders": ["coordinator", "operator"]
+                })
+                .to_string(),
+            },
+        };
+
+        let (payload, status) = execute_task_tool_call(
+            &event_bus,
+            Some(&tool_registry),
+            None,
+            &task_store,
+            &spawn_graph,
+            None,
+            &magi_todo_ledger::TodoLedger::new(),
+            None,
+            Some(&store),
+            None,
+            None,
+            None,
+            None,
+            None,
+            &task,
+            &SessionId::new("session-mission-charter-create"),
+            &Some(WorkspaceId::new("workspace-mission-charter-create")),
+            None,
+            Some(&WorkerId::new("worker-mission-charter-create")),
+            &call,
+        );
+
+        assert_eq!(status, ExecutionResultStatus::Succeeded);
+        let parsed: serde_json::Value = serde_json::from_str(&payload).expect("payload json");
+        assert_eq!(parsed["tool"], "mission_charter_write");
+        assert_eq!(parsed["status"], "succeeded");
+        assert_eq!(parsed["title"], "迁移 v2 18-slice");
+        let charter = store
+            .load(&task.mission_id)
+            .expect("load")
+            .expect("charter saved");
+        assert_eq!(charter.title, "迁移 v2 18-slice");
+        assert_eq!(charter.success_criteria.len(), 2);
+        assert_eq!(charter.constraints, vec!["禁止双轨".to_string()]);
+    }
+
+    #[test]
+    fn mission_charter_write_tool_rejects_first_write_without_title_and_goal() {
+        // S11：首次写入若只给 success_criteria/constraints/stakeholders 而没有 title/goal，
+        // 必须拒绝以避免落下半成品 charter。
+        let tool_registry = ToolRegistry::new(
+            Arc::new(GovernanceService::default()),
+            Arc::new(InMemoryEventBus::new(8)),
+        );
+        let event_bus = InMemoryEventBus::new(8);
+        let task_store = TaskStore::new();
+        let spawn_graph = std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let workspace_root =
+            magi_core::WorkspaceRootPath::new(tmp.path().to_string_lossy().to_string());
+        let store = magi_mission_charter::MissionCharterStore::open_with_home(
+            tmp.path(),
+            &workspace_root,
+        )
+        .expect("open mission charter store");
+        let task = make_task_loop_test_task("task-mission-charter-incomplete");
+        let call = ChatToolCall {
+            id: "tool-call-mission-charter-incomplete".to_string(),
+            kind: "function".to_string(),
+            function: ChatToolFunction {
+                name: "mission_charter_write".to_string(),
+                arguments: serde_json::json!({
+                    "constraints": ["仅给约束不给 title/goal"],
+                })
+                .to_string(),
+            },
+        };
+        let (payload, status) = execute_task_tool_call(
+            &event_bus,
+            Some(&tool_registry),
+            None,
+            &task_store,
+            &spawn_graph,
+            None,
+            &magi_todo_ledger::TodoLedger::new(),
+            None,
+            Some(&store),
+            None,
+            None,
+            None,
+            None,
+            None,
+            &task,
+            &SessionId::new("session-mission-charter-incomplete"),
+            &Some(WorkspaceId::new("workspace-mission-charter-incomplete")),
+            None,
+            Some(&WorkerId::new("worker-mission-charter-incomplete")),
+            &call,
+        );
+        assert_eq!(status, ExecutionResultStatus::Failed);
+        let parsed: serde_json::Value = serde_json::from_str(&payload).expect("payload json");
+        assert!(
+            parsed["error"].as_str().unwrap().contains("title"),
+            "error 必须显式告知缺 title/goal，实际：{}",
+            parsed["error"]
+        );
+        assert!(
+            store.load(&task.mission_id).expect("load").is_none(),
+            "拒绝路径下不能产生 charter 文件"
+        );
+    }
+
+    #[test]
+    fn mission_charter_write_tool_fails_without_store() {
+        // S11：workspace 未绑定（mission_charter = None）时，工具必须返回失败。
+        let tool_registry = ToolRegistry::new(
+            Arc::new(GovernanceService::default()),
+            Arc::new(InMemoryEventBus::new(8)),
+        );
+        let event_bus = InMemoryEventBus::new(8);
+        let task_store = TaskStore::new();
+        let spawn_graph = std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new());
+        let task = make_task_loop_test_task("task-mission-charter-no-store");
+        let call = ChatToolCall {
+            id: "tool-call-mission-charter-no-store".to_string(),
+            kind: "function".to_string(),
+            function: ChatToolFunction {
+                name: "mission_charter_write".to_string(),
+                arguments: serde_json::json!({
+                    "title": "x",
+                    "goal": "y"
+                })
+                .to_string(),
+            },
+        };
+        let (payload, status) = execute_task_tool_call(
+            &event_bus,
+            Some(&tool_registry),
+            None,
+            &task_store,
+            &spawn_graph,
+            None,
+            &magi_todo_ledger::TodoLedger::new(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &task,
+            &SessionId::new("session-mission-charter-no-store"),
+            &Some(WorkspaceId::new("workspace-mission-charter-no-store")),
+            None,
+            Some(&WorkerId::new("worker-mission-charter-no-store")),
+            &call,
+        );
+        assert_eq!(status, ExecutionResultStatus::Failed);
+        let parsed: serde_json::Value = serde_json::from_str(&payload).expect("payload json");
+        assert!(
+            parsed["error"].as_str().unwrap().contains("workspace"),
+            "error 应说明 workspace 未绑定，实际：{}",
+            parsed["error"]
+        );
+    }
+
+    #[test]
+    fn plan_write_tool_creates_plan_on_first_write() {
+        // S12：首次调用 plan_write 时落盘 plan.md，并发 task.plan.updated 事件。
+        let tool_registry = ToolRegistry::new(
+            Arc::new(GovernanceService::default()),
+            Arc::new(InMemoryEventBus::new(8)),
+        );
+        let event_bus = InMemoryEventBus::new(8);
+        let task_store = TaskStore::new();
+        let spawn_graph = std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let workspace_root =
+            magi_core::WorkspaceRootPath::new(tmp.path().to_string_lossy().to_string());
+        let store = magi_plan::PlanStore::open_with_home(tmp.path(), &workspace_root)
+            .expect("open plan store");
+        let task = make_task_loop_test_task("task-plan-create");
+        let call = ChatToolCall {
+            id: "tool-call-plan-create".to_string(),
+            kind: "function".to_string(),
+            function: ChatToolFunction {
+                name: "plan_write".to_string(),
+                arguments: serde_json::json!({
+                    "steps": [
+                        {"id": "s1", "content": "拉取 schema", "status": "in_progress"},
+                        {"id": "s2", "content": "回归测试", "depends_on": ["s1"]}
+                    ]
+                })
+                .to_string(),
+            },
+        };
+
+        let (payload, status) = execute_task_tool_call(
+            &event_bus,
+            Some(&tool_registry),
+            None,
+            &task_store,
+            &spawn_graph,
+            None,
+            &magi_todo_ledger::TodoLedger::new(),
+            None,
+            None,
+            Some(&store),
+            None,
+            None,
+            None,
+            None,
+            &task,
+            &SessionId::new("session-plan-create"),
+            &Some(WorkspaceId::new("workspace-plan-create")),
+            None,
+            Some(&WorkerId::new("worker-plan-create")),
+            &call,
+        );
+
+        assert_eq!(status, ExecutionResultStatus::Succeeded);
+        let parsed: serde_json::Value = serde_json::from_str(&payload).expect("payload json");
+        assert_eq!(parsed["tool"], "plan_write");
+        assert_eq!(parsed["status"], "succeeded");
+        assert_eq!(parsed["step_count"], 2);
+        let plan_doc = store
+            .load(&task.mission_id)
+            .expect("load")
+            .expect("plan saved");
+        assert_eq!(plan_doc.steps.len(), 2);
+        assert_eq!(plan_doc.steps[0].id, "s1");
+        assert_eq!(plan_doc.steps[1].depends_on, vec!["s1".to_string()]);
+    }
+
+    #[test]
+    fn plan_write_tool_rejects_malformed_dependencies() {
+        // S12：依赖图必须闭合且不可自指；这里给出未声明的依赖 id，要求工具拒绝。
+        let tool_registry = ToolRegistry::new(
+            Arc::new(GovernanceService::default()),
+            Arc::new(InMemoryEventBus::new(8)),
+        );
+        let event_bus = InMemoryEventBus::new(8);
+        let task_store = TaskStore::new();
+        let spawn_graph = std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let workspace_root =
+            magi_core::WorkspaceRootPath::new(tmp.path().to_string_lossy().to_string());
+        let store = magi_plan::PlanStore::open_with_home(tmp.path(), &workspace_root)
+            .expect("open plan store");
+        let task = make_task_loop_test_task("task-plan-bad-deps");
+        let call = ChatToolCall {
+            id: "tool-call-plan-bad-deps".to_string(),
+            kind: "function".to_string(),
+            function: ChatToolFunction {
+                name: "plan_write".to_string(),
+                arguments: serde_json::json!({
+                    "steps": [
+                        {"id": "s1", "content": "步骤一", "depends_on": ["s99"]}
+                    ]
+                })
+                .to_string(),
+            },
+        };
+        let (payload, status) = execute_task_tool_call(
+            &event_bus,
+            Some(&tool_registry),
+            None,
+            &task_store,
+            &spawn_graph,
+            None,
+            &magi_todo_ledger::TodoLedger::new(),
+            None,
+            None,
+            Some(&store),
+            None,
+            None,
+            None,
+            None,
+            &task,
+            &SessionId::new("session-plan-bad-deps"),
+            &Some(WorkspaceId::new("workspace-plan-bad-deps")),
+            None,
+            Some(&WorkerId::new("worker-plan-bad-deps")),
+            &call,
+        );
+        assert_eq!(status, ExecutionResultStatus::Failed);
+        let parsed: serde_json::Value = serde_json::from_str(&payload).expect("payload json");
+        assert!(
+            parsed["error"].as_str().unwrap().len() > 0,
+            "拒绝路径必须给出错误描述"
+        );
+        assert!(
+            store.load(&task.mission_id).expect("load").is_none(),
+            "拒绝路径下不能产生 plan 文件"
+        );
+    }
+
+    #[test]
+    fn plan_write_tool_fails_without_store() {
+        // S12：workspace 未绑定（plan = None）时，工具必须返回失败。
+        let tool_registry = ToolRegistry::new(
+            Arc::new(GovernanceService::default()),
+            Arc::new(InMemoryEventBus::new(8)),
+        );
+        let event_bus = InMemoryEventBus::new(8);
+        let task_store = TaskStore::new();
+        let spawn_graph = std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new());
+        let task = make_task_loop_test_task("task-plan-no-store");
+        let call = ChatToolCall {
+            id: "tool-call-plan-no-store".to_string(),
+            kind: "function".to_string(),
+            function: ChatToolFunction {
+                name: "plan_write".to_string(),
+                arguments: serde_json::json!({
+                    "steps": [
+                        {"id": "s1", "content": "x"}
+                    ]
+                })
+                .to_string(),
+            },
+        };
+        let (payload, status) = execute_task_tool_call(
+            &event_bus,
+            Some(&tool_registry),
+            None,
+            &task_store,
+            &spawn_graph,
+            None,
+            &magi_todo_ledger::TodoLedger::new(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &task,
+            &SessionId::new("session-plan-no-store"),
+            &Some(WorkspaceId::new("workspace-plan-no-store")),
+            None,
+            Some(&WorkerId::new("worker-plan-no-store")),
+            &call,
+        );
+        assert_eq!(status, ExecutionResultStatus::Failed);
+        let parsed: serde_json::Value = serde_json::from_str(&payload).expect("payload json");
+        assert!(
+            parsed["error"].as_str().unwrap().contains("workspace"),
+            "error 应说明 workspace 未绑定，实际：{}",
+            parsed["error"]
+        );
+    }
+
+    #[test]
+    fn kg_write_tool_creates_fact_on_first_write() {
+        // S14：首次调用 kg_write 时落盘 knowledge.md，并发 task.kg.updated 事件。
+        let tool_registry = ToolRegistry::new(
+            Arc::new(GovernanceService::default()),
+            Arc::new(InMemoryEventBus::new(8)),
+        );
+        let event_bus = InMemoryEventBus::new(8);
+        let task_store = TaskStore::new();
+        let spawn_graph = std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let workspace_root =
+            magi_core::WorkspaceRootPath::new(tmp.path().to_string_lossy().to_string());
+        let store =
+            magi_knowledge_graph::KnowledgeGraphStore::open_with_home(tmp.path(), &workspace_root)
+                .expect("open kg store");
+        let task = make_task_loop_test_task("task-kg-create");
+        let call = ChatToolCall {
+            id: "tool-call-kg-create".to_string(),
+            kind: "function".to_string(),
+            function: ChatToolFunction {
+                name: "kg_write".to_string(),
+                arguments: serde_json::json!({
+                    "kind": "decision",
+                    "id": "adopt-pubsub",
+                    "content": "采用基于消息总线的 pub/sub 通信",
+                    "reference": "docs/decision/comms.md",
+                    "tags": ["arch", "comms"],
+                })
+                .to_string(),
+            },
+        };
+
+        let (payload, status) = execute_task_tool_call(
+            &event_bus,
+            Some(&tool_registry),
+            None,
+            &task_store,
+            &spawn_graph,
+            None,
+            &magi_todo_ledger::TodoLedger::new(),
+            None,
+            None,
+            None,
+            Some(&store),
+            None,
+            None,
+            None,
+            &task,
+            &SessionId::new("session-kg-create"),
+            &Some(WorkspaceId::new("workspace-kg-create")),
+            None,
+            Some(&WorkerId::new("worker-kg-create")),
+            &call,
+        );
+
+        assert_eq!(status, ExecutionResultStatus::Succeeded);
+        let parsed: serde_json::Value = serde_json::from_str(&payload).expect("payload json");
+        assert_eq!(parsed["tool"], "kg_write");
+        assert_eq!(parsed["status"], "succeeded");
+        assert_eq!(parsed["kind"], "decision");
+        assert_eq!(parsed["id"], "adopt-pubsub");
+        assert_eq!(parsed["fact_count"], 1);
+        assert_eq!(parsed["changed"], true);
+        let graph = store
+            .load(&task.mission_id)
+            .expect("load")
+            .expect("graph saved");
+        assert_eq!(graph.facts.len(), 1);
+        assert_eq!(graph.facts[0].id, "adopt-pubsub");
+        assert_eq!(graph.facts[0].version, 1);
+    }
+
+    #[test]
+    fn kg_write_tool_rejects_malformed_args() {
+        // S14：缺少必填字段（content）时工具必须拒绝。
+        let tool_registry = ToolRegistry::new(
+            Arc::new(GovernanceService::default()),
+            Arc::new(InMemoryEventBus::new(8)),
+        );
+        let event_bus = InMemoryEventBus::new(8);
+        let task_store = TaskStore::new();
+        let spawn_graph = std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let workspace_root =
+            magi_core::WorkspaceRootPath::new(tmp.path().to_string_lossy().to_string());
+        let store =
+            magi_knowledge_graph::KnowledgeGraphStore::open_with_home(tmp.path(), &workspace_root)
+                .expect("open kg store");
+        let task = make_task_loop_test_task("task-kg-bad-args");
+        let call = ChatToolCall {
+            id: "tool-call-kg-bad-args".to_string(),
+            kind: "function".to_string(),
+            function: ChatToolFunction {
+                name: "kg_write".to_string(),
+                arguments: serde_json::json!({
+                    "kind": "symbol",
+                    "id": "no-content"
+                })
+                .to_string(),
+            },
+        };
+        let (payload, status) = execute_task_tool_call(
+            &event_bus,
+            Some(&tool_registry),
+            None,
+            &task_store,
+            &spawn_graph,
+            None,
+            &magi_todo_ledger::TodoLedger::new(),
+            None,
+            None,
+            None,
+            Some(&store),
+            None,
+            None,
+            None,
+            &task,
+            &SessionId::new("session-kg-bad-args"),
+            &Some(WorkspaceId::new("workspace-kg-bad-args")),
+            None,
+            Some(&WorkerId::new("worker-kg-bad-args")),
+            &call,
+        );
+        assert_eq!(status, ExecutionResultStatus::Failed);
+        let parsed: serde_json::Value = serde_json::from_str(&payload).expect("payload json");
+        assert!(
+            parsed["error"].as_str().unwrap().len() > 0,
+            "拒绝路径必须给出错误描述"
+        );
+        assert!(
+            store.load(&task.mission_id).expect("load").is_none(),
+            "拒绝路径下不能产生 knowledge graph 文件"
+        );
+    }
+
+    #[test]
+    fn kg_write_tool_fails_without_store() {
+        // S14：workspace 未绑定（knowledge_graph = None）时工具必须返回失败。
+        let tool_registry = ToolRegistry::new(
+            Arc::new(GovernanceService::default()),
+            Arc::new(InMemoryEventBus::new(8)),
+        );
+        let event_bus = InMemoryEventBus::new(8);
+        let task_store = TaskStore::new();
+        let spawn_graph = std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new());
+        let task = make_task_loop_test_task("task-kg-no-store");
+        let call = ChatToolCall {
+            id: "tool-call-kg-no-store".to_string(),
+            kind: "function".to_string(),
+            function: ChatToolFunction {
+                name: "kg_write".to_string(),
+                arguments: serde_json::json!({
+                    "kind": "risk",
+                    "id": "r1",
+                    "content": "x"
+                })
+                .to_string(),
+            },
+        };
+        let (payload, status) = execute_task_tool_call(
+            &event_bus,
+            Some(&tool_registry),
+            None,
+            &task_store,
+            &spawn_graph,
+            None,
+            &magi_todo_ledger::TodoLedger::new(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &task,
+            &SessionId::new("session-kg-no-store"),
+            &Some(WorkspaceId::new("workspace-kg-no-store")),
+            None,
+            Some(&WorkerId::new("worker-kg-no-store")),
+            &call,
+        );
+        assert_eq!(status, ExecutionResultStatus::Failed);
+        let parsed: serde_json::Value = serde_json::from_str(&payload).expect("payload json");
+        assert!(
+            parsed["error"].as_str().unwrap().contains("workspace"),
+            "error 应说明 workspace 未绑定，实际：{}",
+            parsed["error"]
+        );
+    }
+
+    #[test]
+    fn validation_record_tool_creates_record_on_first_write() {
+        // S15：首次调用 validation_record 时落盘 validation.md，并发 task.validation.updated 事件。
+        let tool_registry = ToolRegistry::new(
+            Arc::new(GovernanceService::default()),
+            Arc::new(InMemoryEventBus::new(8)),
+        );
+        let event_bus = InMemoryEventBus::new(8);
+        let task_store = TaskStore::new();
+        let spawn_graph = std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let workspace_root =
+            magi_core::WorkspaceRootPath::new(tmp.path().to_string_lossy().to_string());
+        let store = magi_validation_runner::ValidationStore::open_with_home(
+            tmp.path(),
+            &workspace_root,
+        )
+        .expect("open validation store");
+        let task = make_task_loop_test_task("task-validation-create");
+        let call = ChatToolCall {
+            id: "tool-call-validation-create".to_string(),
+            kind: "function".to_string(),
+            function: ChatToolFunction {
+                name: "validation_record".to_string(),
+                arguments: serde_json::json!({
+                    "plan_step_id": "s1",
+                    "kind": "test_suite",
+                    "outcome": "pass",
+                    "command": "cargo test -p magi-api",
+                    "evidence": "305 passed; 0 failed",
+                })
+                .to_string(),
+            },
+        };
+
+        let (payload, status) = execute_task_tool_call(
+            &event_bus,
+            Some(&tool_registry),
+            None,
+            &task_store,
+            &spawn_graph,
+            None,
+            &magi_todo_ledger::TodoLedger::new(),
+            None,
+            None,
+            None,
+            None,
+            Some(&store),
+            None,
+            None,
+            &task,
+            &SessionId::new("session-validation-create"),
+            &Some(WorkspaceId::new("workspace-validation-create")),
+            None,
+            Some(&WorkerId::new("worker-validation-create")),
+            &call,
+        );
+
+        assert_eq!(status, ExecutionResultStatus::Succeeded);
+        let parsed: serde_json::Value = serde_json::from_str(&payload).expect("payload json");
+        assert_eq!(parsed["tool"], "validation_record");
+        assert_eq!(parsed["status"], "succeeded");
+        assert_eq!(parsed["plan_step_id"], "s1");
+        assert_eq!(parsed["kind"], "test_suite");
+        assert_eq!(parsed["outcome"], "pass");
+        assert_eq!(parsed["record_count"], 1);
+        assert_eq!(parsed["changed"], true);
+        assert_eq!(parsed["step_is_passing"], true);
+        let report = store
+            .load(&task.mission_id)
+            .expect("load")
+            .expect("report saved");
+        assert_eq!(report.records.len(), 1);
+        assert_eq!(report.records[0].plan_step_id, "s1");
+        assert_eq!(report.records[0].version, 1);
+    }
+
+    #[test]
+    fn validation_record_tool_rejects_malformed_args() {
+        // S15：缺少必填字段（plan_step_id）时工具必须拒绝。
+        let tool_registry = ToolRegistry::new(
+            Arc::new(GovernanceService::default()),
+            Arc::new(InMemoryEventBus::new(8)),
+        );
+        let event_bus = InMemoryEventBus::new(8);
+        let task_store = TaskStore::new();
+        let spawn_graph = std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let workspace_root =
+            magi_core::WorkspaceRootPath::new(tmp.path().to_string_lossy().to_string());
+        let store = magi_validation_runner::ValidationStore::open_with_home(
+            tmp.path(),
+            &workspace_root,
+        )
+        .expect("open validation store");
+        let task = make_task_loop_test_task("task-validation-bad-args");
+        let call = ChatToolCall {
+            id: "tool-call-validation-bad-args".to_string(),
+            kind: "function".to_string(),
+            function: ChatToolFunction {
+                name: "validation_record".to_string(),
+                arguments: serde_json::json!({
+                    "kind": "type_check",
+                    "outcome": "pass"
+                })
+                .to_string(),
+            },
+        };
+        let (payload, status) = execute_task_tool_call(
+            &event_bus,
+            Some(&tool_registry),
+            None,
+            &task_store,
+            &spawn_graph,
+            None,
+            &magi_todo_ledger::TodoLedger::new(),
+            None,
+            None,
+            None,
+            None,
+            Some(&store),
+            None,
+            None,
+            &task,
+            &SessionId::new("session-validation-bad-args"),
+            &Some(WorkspaceId::new("workspace-validation-bad-args")),
+            None,
+            Some(&WorkerId::new("worker-validation-bad-args")),
+            &call,
+        );
+        assert_eq!(status, ExecutionResultStatus::Failed);
+        let parsed: serde_json::Value = serde_json::from_str(&payload).expect("payload json");
+        assert!(
+            parsed["error"].as_str().unwrap().len() > 0,
+            "拒绝路径必须给出错误描述"
+        );
+        assert!(
+            store.load(&task.mission_id).expect("load").is_none(),
+            "拒绝路径下不能产生 validation 文件"
+        );
+    }
+
+    #[test]
+    fn validation_record_tool_fails_without_store() {
+        // S15：workspace 未绑定（validation_runner = None）时工具必须返回失败。
+        let tool_registry = ToolRegistry::new(
+            Arc::new(GovernanceService::default()),
+            Arc::new(InMemoryEventBus::new(8)),
+        );
+        let event_bus = InMemoryEventBus::new(8);
+        let task_store = TaskStore::new();
+        let spawn_graph = std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new());
+        let task = make_task_loop_test_task("task-validation-no-store");
+        let call = ChatToolCall {
+            id: "tool-call-validation-no-store".to_string(),
+            kind: "function".to_string(),
+            function: ChatToolFunction {
+                name: "validation_record".to_string(),
+                arguments: serde_json::json!({
+                    "plan_step_id": "s2",
+                    "kind": "benchmark",
+                    "outcome": "skipped"
+                })
+                .to_string(),
+            },
+        };
+        let (payload, status) = execute_task_tool_call(
+            &event_bus,
+            Some(&tool_registry),
+            None,
+            &task_store,
+            &spawn_graph,
+            None,
+            &magi_todo_ledger::TodoLedger::new(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &task,
+            &SessionId::new("session-validation-no-store"),
+            &Some(WorkspaceId::new("workspace-validation-no-store")),
+            None,
+            Some(&WorkerId::new("worker-validation-no-store")),
+            &call,
+        );
+        assert_eq!(status, ExecutionResultStatus::Failed);
+        let parsed: serde_json::Value = serde_json::from_str(&payload).expect("payload json");
+        assert!(
+            parsed["error"].as_str().unwrap().contains("workspace"),
+            "error 应说明 workspace 未绑定，实际：{}",
+            parsed["error"]
+        );
+    }
+
+    #[test]
+    fn checkpoint_create_tool_appends_record_on_first_write() {
+        // S16：首次调用 checkpoint_create 时落盘 checkpoints.md，sequence 从 1 开始，发 task.checkpoint.appended。
+        let tool_registry = ToolRegistry::new(
+            Arc::new(GovernanceService::default()),
+            Arc::new(InMemoryEventBus::new(8)),
+        );
+        let event_bus = InMemoryEventBus::new(8);
+        let task_store = TaskStore::new();
+        let spawn_graph = std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let workspace_root =
+            magi_core::WorkspaceRootPath::new(tmp.path().to_string_lossy().to_string());
+        let store = magi_checkpoint::CheckpointStore::open_with_home(
+            tmp.path(),
+            &workspace_root,
+        )
+        .expect("open checkpoint store");
+        let task = make_task_loop_test_task("task-checkpoint-create");
+        let call = ChatToolCall {
+            id: "tool-call-checkpoint-create".to_string(),
+            kind: "function".to_string(),
+            function: ChatToolFunction {
+                name: "checkpoint_create".to_string(),
+                arguments: serde_json::json!({
+                    "kind": "phase_transition",
+                    "label": "Plan v3 完成 setup 阶段",
+                    "plan_version": 3,
+                    "kg_fact_count": 12,
+                    "workspace_commit": "abc123",
+                    "notes": "进入 wiring 阶段前的快照",
+                })
+                .to_string(),
+            },
+        };
+
+        let (payload, status) = execute_task_tool_call(
+            &event_bus,
+            Some(&tool_registry),
+            None,
+            &task_store,
+            &spawn_graph,
+            None,
+            &magi_todo_ledger::TodoLedger::new(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&store),
+            None,
+            &task,
+            &SessionId::new("session-checkpoint-create"),
+            &Some(WorkspaceId::new("workspace-checkpoint-create")),
+            None,
+            Some(&WorkerId::new("worker-checkpoint-create")),
+            &call,
+        );
+
+        assert_eq!(status, ExecutionResultStatus::Succeeded);
+        let parsed: serde_json::Value = serde_json::from_str(&payload).expect("payload json");
+        assert_eq!(parsed["tool"], "checkpoint_create");
+        assert_eq!(parsed["status"], "succeeded");
+        assert_eq!(parsed["sequence"], 1);
+        assert_eq!(parsed["kind"], "phase_transition");
+        assert_eq!(parsed["checkpoint_count"], 1);
+        let log = store
+            .load(&task.mission_id)
+            .expect("load")
+            .expect("log saved");
+        assert_eq!(log.checkpoints.len(), 1);
+        assert_eq!(log.checkpoints[0].sequence, 1);
+        assert_eq!(
+            log.checkpoints[0].kind,
+            magi_checkpoint::CheckpointKind::PhaseTransition
+        );
+    }
+
+    #[test]
+    fn checkpoint_create_tool_rejects_malformed_args() {
+        // S16：缺少 kind 字段时工具必须拒绝，并且 checkpoints.md 不能落盘。
+        let tool_registry = ToolRegistry::new(
+            Arc::new(GovernanceService::default()),
+            Arc::new(InMemoryEventBus::new(8)),
+        );
+        let event_bus = InMemoryEventBus::new(8);
+        let task_store = TaskStore::new();
+        let spawn_graph = std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let workspace_root =
+            magi_core::WorkspaceRootPath::new(tmp.path().to_string_lossy().to_string());
+        let store = magi_checkpoint::CheckpointStore::open_with_home(
+            tmp.path(),
+            &workspace_root,
+        )
+        .expect("open checkpoint store");
+        let task = make_task_loop_test_task("task-checkpoint-bad-args");
+        let call = ChatToolCall {
+            id: "tool-call-checkpoint-bad-args".to_string(),
+            kind: "function".to_string(),
+            function: ChatToolFunction {
+                name: "checkpoint_create".to_string(),
+                arguments: serde_json::json!({
+                    "label": "missing kind"
+                })
+                .to_string(),
+            },
+        };
+        let (payload, status) = execute_task_tool_call(
+            &event_bus,
+            Some(&tool_registry),
+            None,
+            &task_store,
+            &spawn_graph,
+            None,
+            &magi_todo_ledger::TodoLedger::new(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&store),
+            None,
+            &task,
+            &SessionId::new("session-checkpoint-bad-args"),
+            &Some(WorkspaceId::new("workspace-checkpoint-bad-args")),
+            None,
+            Some(&WorkerId::new("worker-checkpoint-bad-args")),
+            &call,
+        );
+        assert_eq!(status, ExecutionResultStatus::Failed);
+        let parsed: serde_json::Value = serde_json::from_str(&payload).expect("payload json");
+        assert!(
+            parsed["error"].as_str().unwrap().len() > 0,
+            "拒绝路径必须给出错误描述"
+        );
+        assert!(
+            store.load(&task.mission_id).expect("load").is_none(),
+            "拒绝路径下不能产生 checkpoint 文件"
+        );
+    }
+
+    #[test]
+    fn checkpoint_create_tool_fails_without_store() {
+        // S16：workspace 未绑定（checkpoint = None）时工具必须返回失败。
+        let tool_registry = ToolRegistry::new(
+            Arc::new(GovernanceService::default()),
+            Arc::new(InMemoryEventBus::new(8)),
+        );
+        let event_bus = InMemoryEventBus::new(8);
+        let task_store = TaskStore::new();
+        let spawn_graph = std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new());
+        let task = make_task_loop_test_task("task-checkpoint-no-store");
+        let call = ChatToolCall {
+            id: "tool-call-checkpoint-no-store".to_string(),
+            kind: "function".to_string(),
+            function: ChatToolFunction {
+                name: "checkpoint_create".to_string(),
+                arguments: serde_json::json!({
+                    "kind": "manual"
+                })
+                .to_string(),
+            },
+        };
+        let (payload, status) = execute_task_tool_call(
+            &event_bus,
+            Some(&tool_registry),
+            None,
+            &task_store,
+            &spawn_graph,
+            None,
+            &magi_todo_ledger::TodoLedger::new(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &task,
+            &SessionId::new("session-checkpoint-no-store"),
+            &Some(WorkspaceId::new("workspace-checkpoint-no-store")),
+            None,
+            Some(&WorkerId::new("worker-checkpoint-no-store")),
+            &call,
+        );
+        assert_eq!(status, ExecutionResultStatus::Failed);
+        let parsed: serde_json::Value = serde_json::from_str(&payload).expect("payload json");
+        assert!(
+            parsed["error"].as_str().unwrap().contains("workspace"),
+            "error 应说明 workspace 未绑定，实际：{}",
+            parsed["error"]
+        );
+    }
+
+    #[test]
+    fn human_checkpoint_request_tool_creates_pending_entry() {
+        // S17：首次调用 human_checkpoint_request 时落盘 human_checkpoints.md，状态 Pending，发 task.human_checkpoint.requested。
+        let tool_registry = ToolRegistry::new(
+            Arc::new(GovernanceService::default()),
+            Arc::new(InMemoryEventBus::new(8)),
+        );
+        let event_bus = InMemoryEventBus::new(8);
+        let task_store = TaskStore::new();
+        let spawn_graph = std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let workspace_root =
+            magi_core::WorkspaceRootPath::new(tmp.path().to_string_lossy().to_string());
+        let store = magi_human_checkpoint::HumanCheckpointStore::open_with_home(
+            tmp.path(),
+            &workspace_root,
+        )
+        .expect("open human_checkpoint store");
+        let task = make_task_loop_test_task("task-human-checkpoint");
+        let call = ChatToolCall {
+            id: "tool-call-human-checkpoint".to_string(),
+            kind: "function".to_string(),
+            function: ChatToolFunction {
+                name: "human_checkpoint_request".to_string(),
+                arguments: serde_json::json!({
+                    "plan_step_id": "step-deploy-prod",
+                    "prompt_to_human": "本次发布会影响生产，是否继续？",
+                    "label": "生产部署前的人工复核",
+                    "context": "diff 摘要：xxx",
+                })
+                .to_string(),
+            },
+        };
+
+        let (payload, status) = execute_task_tool_call(
+            &event_bus,
+            Some(&tool_registry),
+            None,
+            &task_store,
+            &spawn_graph,
+            None,
+            &magi_todo_ledger::TodoLedger::new(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&store),
+            &task,
+            &SessionId::new("session-human-checkpoint"),
+            &Some(WorkspaceId::new("workspace-human-checkpoint")),
+            None,
+            Some(&WorkerId::new("worker-human-checkpoint")),
+            &call,
+        );
+
+        assert_eq!(status, ExecutionResultStatus::Succeeded);
+        let parsed: serde_json::Value = serde_json::from_str(&payload).expect("payload json");
+        assert_eq!(parsed["tool"], "human_checkpoint_request");
+        assert_eq!(parsed["status"], "succeeded");
+        assert_eq!(parsed["sequence"], 1);
+        assert_eq!(parsed["plan_step_id"], "step-deploy-prod");
+        assert_eq!(parsed["pending_count"], 1);
+        let log = store
+            .load(&task.mission_id)
+            .expect("load")
+            .expect("log saved");
+        assert_eq!(log.entries.len(), 1);
+        assert_eq!(log.entries[0].sequence, 1);
+        assert!(log.entries[0].status.is_pending());
+    }
+
+    #[test]
+    fn human_checkpoint_request_tool_rejects_malformed_args() {
+        // S17：缺少必填字段时工具必须拒绝，并且 human_checkpoints.md 不能落盘。
+        let tool_registry = ToolRegistry::new(
+            Arc::new(GovernanceService::default()),
+            Arc::new(InMemoryEventBus::new(8)),
+        );
+        let event_bus = InMemoryEventBus::new(8);
+        let task_store = TaskStore::new();
+        let spawn_graph = std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let workspace_root =
+            magi_core::WorkspaceRootPath::new(tmp.path().to_string_lossy().to_string());
+        let store = magi_human_checkpoint::HumanCheckpointStore::open_with_home(
+            tmp.path(),
+            &workspace_root,
+        )
+        .expect("open human_checkpoint store");
+        let task = make_task_loop_test_task("task-human-checkpoint-bad-args");
+        let call = ChatToolCall {
+            id: "tool-call-human-checkpoint-bad-args".to_string(),
+            kind: "function".to_string(),
+            function: ChatToolFunction {
+                name: "human_checkpoint_request".to_string(),
+                arguments: serde_json::json!({
+                    "label": "missing required fields"
+                })
+                .to_string(),
+            },
+        };
+        let (payload, status) = execute_task_tool_call(
+            &event_bus,
+            Some(&tool_registry),
+            None,
+            &task_store,
+            &spawn_graph,
+            None,
+            &magi_todo_ledger::TodoLedger::new(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&store),
+            &task,
+            &SessionId::new("session-human-checkpoint-bad-args"),
+            &Some(WorkspaceId::new("workspace-human-checkpoint-bad-args")),
+            None,
+            Some(&WorkerId::new("worker-human-checkpoint-bad-args")),
+            &call,
+        );
+        assert_eq!(status, ExecutionResultStatus::Failed);
+        let parsed: serde_json::Value = serde_json::from_str(&payload).expect("payload json");
+        assert!(
+            parsed["error"].as_str().unwrap().len() > 0,
+            "拒绝路径必须给出错误描述"
+        );
+        assert!(
+            store.load(&task.mission_id).expect("load").is_none(),
+            "拒绝路径下不能产生 human_checkpoints.md"
+        );
+    }
+
+    #[test]
+    fn human_checkpoint_request_tool_fails_without_store() {
+        // S17：workspace 未绑定（human_checkpoint = None）时工具必须返回失败。
+        let tool_registry = ToolRegistry::new(
+            Arc::new(GovernanceService::default()),
+            Arc::new(InMemoryEventBus::new(8)),
+        );
+        let event_bus = InMemoryEventBus::new(8);
+        let task_store = TaskStore::new();
+        let spawn_graph = std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new());
+        let task = make_task_loop_test_task("task-human-checkpoint-no-store");
+        let call = ChatToolCall {
+            id: "tool-call-human-checkpoint-no-store".to_string(),
+            kind: "function".to_string(),
+            function: ChatToolFunction {
+                name: "human_checkpoint_request".to_string(),
+                arguments: serde_json::json!({
+                    "plan_step_id": "step-x",
+                    "prompt_to_human": "需要操作员确认"
+                })
+                .to_string(),
+            },
+        };
+        let (payload, status) = execute_task_tool_call(
+            &event_bus,
+            Some(&tool_registry),
+            None,
+            &task_store,
+            &spawn_graph,
+            None,
+            &magi_todo_ledger::TodoLedger::new(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &task,
+            &SessionId::new("session-human-checkpoint-no-store"),
+            &Some(WorkspaceId::new("workspace-human-checkpoint-no-store")),
+            None,
+            Some(&WorkerId::new("worker-human-checkpoint-no-store")),
+            &call,
+        );
+        assert_eq!(status, ExecutionResultStatus::Failed);
+        let parsed: serde_json::Value = serde_json::from_str(&payload).expect("payload json");
+        assert!(
+            parsed["error"].as_str().unwrap().contains("workspace"),
+            "error 应说明 workspace 未绑定，实际：{}",
+            parsed["error"]
+        );
     }
 
     #[test]
@@ -3265,6 +6054,15 @@ mod tests {
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
             spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
             safety_gate: None,
+            todo_ledger: &magi_todo_ledger::TodoLedger::new(),
+            project_memory: None,
+            mission_charter: None,
+            plan: None,
+            mission_workspace: None,
+            knowledge_graph: None,
+            validation_runner: None,
+            checkpoint: None,
+            human_checkpoint: None,
             task,
             task_id: &task.task_id,
             lease_id: &lease.lease_id,
@@ -3379,6 +6177,15 @@ mod tests {
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
             spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
             safety_gate: None,
+            todo_ledger: &magi_todo_ledger::TodoLedger::new(),
+            project_memory: None,
+            mission_charter: None,
+            plan: None,
+            mission_workspace: None,
+            knowledge_graph: None,
+            validation_runner: None,
+            checkpoint: None,
+            human_checkpoint: None,
             task: &task,
             task_id: &task.task_id,
             lease_id: &lease.lease_id,
@@ -3693,6 +6500,15 @@ mod tests {
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
             spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
             safety_gate: None,
+            todo_ledger: &magi_todo_ledger::TodoLedger::new(),
+            project_memory: None,
+            mission_charter: None,
+            plan: None,
+            mission_workspace: None,
+            knowledge_graph: None,
+            validation_runner: None,
+            checkpoint: None,
+            human_checkpoint: None,
             task: &task,
             task_id: &task.task_id,
             lease_id: &lease.lease_id,
@@ -3889,6 +6705,15 @@ mod tests {
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
             spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
             safety_gate: None,
+            todo_ledger: &magi_todo_ledger::TodoLedger::new(),
+            project_memory: None,
+            mission_charter: None,
+            plan: None,
+            mission_workspace: None,
+            knowledge_graph: None,
+            validation_runner: None,
+            checkpoint: None,
+            human_checkpoint: None,
             task: &task,
             task_id: &task.task_id,
             lease_id: &lease.lease_id,

@@ -113,7 +113,15 @@ impl BuiltinTool for NormalizedBuiltinTool {
             BuiltinToolName::KnowledgeQuery => execute_knowledge_query(input),
             BuiltinToolName::AgentSpawn
             | BuiltinToolName::SendMessage
-            | BuiltinToolName::TaskStop => execute_orchestration_only(self.name, input),
+            | BuiltinToolName::TaskStop
+            | BuiltinToolName::TodoWrite
+            | BuiltinToolName::MemoryWrite
+            | BuiltinToolName::MissionCharterWrite
+            | BuiltinToolName::PlanWrite
+            | BuiltinToolName::KgWrite
+            | BuiltinToolName::ValidationRecord
+            | BuiltinToolName::Checkpoint
+            | BuiltinToolName::HumanCheckpointRequest => execute_orchestration_only(self.name, input),
         }
     }
 
