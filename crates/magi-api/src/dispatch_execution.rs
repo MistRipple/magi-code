@@ -9,8 +9,6 @@ use magi_session_store::{
     ActiveExecutionTurn, ActiveExecutionTurnItem, ActiveExecutionTurnLane, ExecutionThread,
     ExecutionThreadStatus, SessionStore,
 };
-use std::sync::atomic::{AtomicU64, Ordering};
-
 #[cfg(test)]
 use crate::dto::SessionTurnRequestDto;
 use crate::{
@@ -19,9 +17,9 @@ use crate::{
     task_execution::{DispatchSubmissionRequest, TaskExecutionPlan},
 };
 
-// M12/M13：任务图构建器、任务分解管线与派发数据载体已迁移到
-// magi-conversation-runtime；保留内部 re-export 让 dispatch_execution / 测试代码以
-// 原名继续调用。
+// M12/M13/M14：任务图构建器、任务分解管线、任务图重规划入口与派发数据载体已
+// 迁移到 magi-conversation-runtime；保留内部 re-export 让 dispatch_execution / 测试
+// 代码以原名继续调用。
 pub(crate) use magi_conversation_runtime::mission_decomposition::decompose_mission;
 #[cfg(test)]
 pub(crate) use magi_conversation_runtime::mission_decomposition::{
@@ -32,17 +30,9 @@ pub(crate) use magi_conversation_runtime::task_graph_builder::{
     cleanup_task_tree, infer_dispatch_task_role, insert_task_graph, make_dispatch_task,
     task_phase_count_is_valid,
 };
-
-static REPLAN_GRAPH_COUNTER: AtomicU64 = AtomicU64::new(1);
-
-#[derive(Clone, Debug)]
-pub(crate) struct TaskGraphReplanResult {
-    pub cancelled_task_ids: Vec<TaskId>,
-    pub primary_action_task_id: TaskId,
-    pub leaf_action_task_ids: Vec<TaskId>,
-    pub validation_task_ids: Vec<TaskId>,
-    pub dispatch_task_ids: Vec<TaskId>,
-}
+pub(crate) use magi_conversation_runtime::task_graph_replan::{
+    TaskGraphReplanError, TaskGraphReplanResult,
+};
 
 #[derive(Clone, Debug)]
 struct SessionExecutionBranchSpec {
@@ -527,7 +517,9 @@ fn build_task_graph(
     .map_err(|msg| ApiError::internal_assembly("构建任务图失败", msg))
 }
 
-
+/// M14：任务图重规划入口。任务图重规划本体已下沉到
+/// `magi_conversation_runtime::task_graph_replan::replan_task_graph`，这里只做
+/// ApiState → 显式参数的薄壳桥接 + `TaskGraphReplanError` → `ApiError` 错误分类。
 pub(crate) fn replan_task_graph(
     state: &ApiState,
     root_task_id: &TaskId,
@@ -539,165 +531,42 @@ pub(crate) fn replan_task_graph(
     let task_store = state
         .task_store()
         .ok_or_else(|| ApiError::internal_assembly("重规划任务图失败", "task_store 未配置"))?;
-    let root_task = task_store
-        .get_task(root_task_id)
-        .ok_or_else(|| ApiError::internal_assembly("重规划任务图失败", "root task 不存在"))?;
-    if root_task.kind != TaskKind::Objective {
-        return Err(ApiError::internal_assembly(
-            "重规划任务图失败",
-            "root 必须是 Objective",
-        ));
-    }
-    if !root_task
-        .policy_snapshot
-        .as_ref()
-        .is_some_and(|policy| policy.background_allowed)
-    {
-        return Err(ApiError::InvalidInput(
-            "当前任务不存在任务图，不能重规划".to_string(),
-        ));
-    }
-
-    let prompt_text = prompt.trim();
-    if prompt_text.is_empty() {
-        return Err(ApiError::internal_assembly(
-            "重规划任务图失败",
-            "prompt 为空",
-        ));
-    }
-
-    let build_seed_base = UtcMillis::now();
-    let build_seed = UtcMillis(
-        build_seed_base
-            .0
-            .saturating_add(REPLAN_GRAPH_COUNTER.fetch_add(1, Ordering::Relaxed)),
-    );
-    let _ = build_seed;
     let workspace_root_path = state.workspace_root_path(workspace_id);
-    let plan = decompose_mission(
-        state.model_bridge_client(),
-        workspace_root_path.as_deref(),
-        Some(prompt_text),
-    )
-    .ok_or_else(
-        || ApiError::internal_assembly("重规划任务图失败", "无法生成结构化任务计划"),
-    )?;
-    if !task_phase_count_is_valid(plan.phases.len()) {
-        return Err(ApiError::internal_assembly(
-            "重规划任务图失败",
-            format!("任务图需要 {TASK_MIN_PHASES} 到 {TASK_MAX_PHASES} 个 phase"),
-        ));
-    }
-
-    let replan_cancel_candidates = task_store
-        .collect_subtree_ids(root_task_id)
-        .into_iter()
-        .filter(|task_id| task_id != root_task_id)
-        .filter(|task_id| {
-            task_store.get_task(task_id).is_some_and(|task| {
-                !matches!(
-                    task.status,
-                    TaskStatus::Completed
-                        | TaskStatus::Failed
-                        | TaskStatus::Cancelled
-                        | TaskStatus::Skipped
-                )
-            })
-        })
-        .collect::<Vec<_>>();
-
-    let target_role = context_task
-        .and_then(|task| {
-            task.executor_binding
-                .as_ref()
-                .map(|binding| binding.target_role.trim().to_string())
-        })
-        .filter(|role| !role.is_empty())
-        .unwrap_or_else(|| infer_dispatch_task_role(Some(prompt_text)).to_string());
-
-    let primary_action_task_id =
-        TaskId::new(format!("task-act-replan-{}-{}", root_task_id, build_seed.0));
-    let build = insert_task_graph(
+    magi_conversation_runtime::task_graph_replan::replan_task_graph(
         task_store,
-        &root_task.mission_id,
-        root_task_id,
-        &primary_action_task_id,
-        build_seed,
-        &target_role,
-        &build_seed,
-        &plan,
         &state.agent_role_registry,
         state.spawn_graph.as_ref(),
-    )
-    .map_err(|msg| ApiError::internal_assembly("重新规划任务图失败", msg))?;
-
-    let mut cancelled_task_ids = Vec::new();
-    for task_id in &replan_cancel_candidates {
-        if let Some(task) = task_store.get_task(task_id) {
-            if matches!(
-                task.status,
-                TaskStatus::Completed
-                    | TaskStatus::Failed
-                    | TaskStatus::Cancelled
-                    | TaskStatus::Skipped
-            ) {
-                continue;
-            }
-            task_store
-                .update_status(task_id, TaskStatus::Cancelled)
-                .map_err(|err| {
-                    ApiError::internal_assembly("重规划任务图失败", err.to_string())
-                })?;
-            if let Some(lease) = task_store.get_active_lease(task_id) {
-                task_store.revoke_lease(task_id, &lease.lease_id);
-            }
-            cancelled_task_ids.push(task_id.clone());
-        }
-    }
-
-    if root_task.status != TaskStatus::Running {
-        task_store
-            .update_status(root_task_id, TaskStatus::Running)
-            .map_err(|err| ApiError::internal_assembly("重规划任务图失败", err.to_string()))?;
-    }
-
-    let event = task_events::task_graph_replanned_event(
-        root_task.mission_id.as_str(),
-        root_task_id.as_str(),
-        build.total_task_count,
+        &state.event_bus,
+        state.model_bridge_client(),
+        workspace_root_path.as_deref(),
+        root_task_id,
+        prompt,
+        context_task,
         reason,
     )
-    .with_context(EventContext {
-        mission_id: Some(root_task.mission_id.clone()),
-        task_id: Some(root_task_id.clone()),
-        ..EventContext::default()
-    });
-    let _ = state.event_bus.publish(event);
-
-    Ok(TaskGraphReplanResult {
-        cancelled_task_ids,
-        primary_action_task_id,
-        leaf_action_task_ids: build.leaf_action_task_ids,
-        validation_task_ids: build.validation_task_ids,
-        dispatch_task_ids: build.dispatch_task_ids,
+    .map_err(|err| match err {
+        TaskGraphReplanError::InvalidInput(msg) => ApiError::InvalidInput(msg),
+        TaskGraphReplanError::Internal(msg) => {
+            ApiError::internal_assembly("重规划任务图失败", msg)
+        }
     })
 }
 
+/// M14：会话活跃执行链校验。本体下沉到 v2，magi-api 仅做错误分类。
 pub(crate) fn ensure_session_active_execution_chain(
     state: &ApiState,
     session_id: &SessionId,
 ) -> Result<(), ApiError> {
-    let has_active_chain = state
-        .session_store
-        .runtime_sidecar(session_id)
-        .and_then(|sidecar| sidecar.active_execution_chain)
-        .is_some();
-    if has_active_chain {
-        return Ok(());
-    }
-    Err(ApiError::InvalidInput(
-        "当前会话没有可注册任务的活跃执行链".to_string(),
-    ))
+    magi_conversation_runtime::task_graph_replan::ensure_session_active_execution_chain(
+        &state.session_store,
+        session_id,
+    )
+    .map_err(|err| match err {
+        TaskGraphReplanError::InvalidInput(msg) => ApiError::InvalidInput(msg),
+        TaskGraphReplanError::Internal(msg) => {
+            ApiError::internal_assembly("活跃执行链校验失败", msg)
+        }
+    })
 }
 
 pub(crate) fn replace_replanned_task_execution_branches(

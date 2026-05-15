@@ -24,6 +24,7 @@ pub mod session_turn_execution;
 pub mod session_writeback;
 pub mod settings_store;
 pub mod task_graph_builder;
+pub mod task_graph_replan;
 mod skill_apply_tool;
 mod stream;
 pub mod task_helpers;
