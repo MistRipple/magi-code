@@ -200,7 +200,7 @@ mod tests {
         BridgeProbeErrorDto, BridgeServiceSnapshotDto, BridgeServicesSnapshotDto,
         BridgeSnapshotProvider,
     };
-    use crate::session_turn_writeback::session_turn_item;
+    use magi_conversation_runtime::session_writeback::session_turn_item;
     use crate::state::{RunnerManager, RunnerStartError};
     use crate::task_execution::{
         DispatchSubmissionAccepted, LlmTaskDispatcher, drive_dispatch_submission,

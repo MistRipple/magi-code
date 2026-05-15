@@ -3,17 +3,16 @@ use crate::{
         normalize_model_stream_preview_content, normalize_model_visible_content,
         workspace_context_system_prompt,
     },
-    session_turn_writeback::{
-        append_session_turn_item_with_task_store, publish_current_session_turn_item_event,
-        publish_session_turn_item_event, session_turn_item,
-        upsert_session_turn_item_with_task_store,
-    },
     settings_store::SettingsStore,
-    tool_result_utils::{
-        infer_tool_call_status, summarize_tool_result, tool_execution_status_label,
-        turn_item_status_for_tool_result,
-    },
     usage_recording::{ModelUsageBinding, publish_model_usage_record},
+};
+use magi_conversation_runtime::session_writeback::{
+    append_session_turn_item_with_task_store, publish_current_session_turn_item_event,
+    publish_session_turn_item_event, session_turn_item, upsert_session_turn_item_with_task_store,
+};
+use magi_conversation_runtime::tool_result_utils::{
+    infer_tool_call_status, summarize_tool_result, tool_execution_status_label,
+    turn_item_status_for_tool_result,
 };
 use magi_bridge_client::{
     ChatMessage, ChatToolCall, ChatToolDefinition, ModelBridgeClient,

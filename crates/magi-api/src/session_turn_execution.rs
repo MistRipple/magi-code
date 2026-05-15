@@ -4,15 +4,15 @@ use crate::{
         normalize_model_stream_preview_content, normalize_model_visible_content,
         workspace_context_system_prompt,
     },
-    session_turn_writeback::{
-        append_session_tool_call_items_batch, append_session_turn_error_item,
-        append_session_turn_item, publish_current_session_turn_item_event,
-        publish_session_turn_item_event, session_turn_item, upsert_session_turn_item,
-    },
     settings_store::SettingsStore,
     usage_recording::{
         ModelUsageBinding, publish_model_usage_record, session_turn_model_usage_binding,
     },
+};
+use magi_conversation_runtime::session_writeback::{
+    append_session_tool_call_items_batch, append_session_turn_error_item, append_session_turn_item,
+    publish_current_session_turn_item_event, publish_session_turn_item_event, session_turn_item,
+    upsert_session_turn_item,
 };
 use magi_bridge_client::{
     ChatMessage, ChatToolChoice, ChatToolDefinition, ModelBridgeClient, ModelInvocationRequest,

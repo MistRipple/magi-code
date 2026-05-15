@@ -14,6 +14,7 @@ use magi_session_store::{
     ActiveExecutionTurn, ActiveExecutionTurnItem, CANONICAL_TURN_SCHEMA_VERSION, CanonicalTurn,
     NotificationRecord, SessionRecord, TimelineEntryKind,
 };
+use magi_conversation_runtime::session_writeback::publish_current_session_turn_item_event;
 use magi_tool_runtime::BuiltinToolName;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -34,7 +35,6 @@ use crate::{
         SessionContinueAccepted, active_execution_branch_is_continue_recoverable,
         continue_execution_chain,
     },
-    session_turn_writeback::publish_current_session_turn_item_event,
     state::ApiState,
     task_execution::{
         SessionTurnExecutionRequest,

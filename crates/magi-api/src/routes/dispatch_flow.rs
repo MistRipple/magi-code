@@ -10,13 +10,13 @@ use super::{
 use crate::{
     dto::SessionTurnRequestDto,
     errors::ApiError,
-    session_turn_writeback::publish_current_session_turn_item_event,
     state::ApiState,
     task_execution::{
         DispatchSubmissionAccepted, DispatchSubmissionRequest, drive_dispatch_submission,
         submit_dispatch_submission,
     },
 };
+use magi_conversation_runtime::session_writeback::publish_current_session_turn_item_event;
 
 pub(super) fn accept_session_task_submission(
     state: &ApiState,

@@ -9,7 +9,6 @@ mod model_config;
 mod prompt_utils;
 mod routes;
 mod session_turn_execution;
-mod session_turn_writeback;
 pub mod settings_store;
 mod snapshot_lifecycle;
 mod dispatch_execution;
@@ -18,7 +17,6 @@ mod sse;
 mod state;
 pub mod task_execution;
 mod task_llm_loop;
-mod tool_result_utils;
 pub mod tunnel;
 mod usage_recording;
 
