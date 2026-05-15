@@ -648,6 +648,7 @@ function mergeDuplicateArtifact(
 
   return {
     ...latest,
+    artifactId: first.artifactId,
     displayOrder: Math.min(first.displayOrder, latest.displayOrder),
     cardStreamSeq: Math.min(first.cardStreamSeq, latest.cardStreamSeq),
     timestamp: Math.min(first.timestamp, latest.timestamp),
@@ -669,18 +670,31 @@ function mergeDuplicateArtifact(
   };
 }
 
+function resolveArtifactCollapseKey(artifact: TimelineProjectionArtifact): string {
+  const metadata = artifact.message.metadata || {};
+  const toolCallId = typeof metadata.toolCallId === 'string' ? metadata.toolCallId.trim() : '';
+  const turnId = typeof metadata.turnId === 'string' ? metadata.turnId.trim() : '';
+  if (artifact.kind === 'tool' && toolCallId && turnId) {
+    // artifactId 仍以 itemId 为稳定 UI 身份，避免流式过程中 first emit 无 tool 时发生身份漂移；
+    // collapse key 只用于同一 turn 内 tool started/result 分裂 item 的投影归并。
+    return `turn:${turnId}:tool-call:${toolCallId}`;
+  }
+  return artifact.artifactId;
+}
+
 function collapseArtifactsByStableCard(
   artifacts: TimelineProjectionArtifact[],
 ): TimelineProjectionArtifact[] {
-  const artifactById = new Map<string, TimelineProjectionArtifact>();
+  const artifactByCollapseKey = new Map<string, TimelineProjectionArtifact>();
   for (const artifact of artifacts) {
-    const existing = artifactById.get(artifact.artifactId);
-    artifactById.set(
-      artifact.artifactId,
+    const collapseKey = resolveArtifactCollapseKey(artifact);
+    const existing = artifactByCollapseKey.get(collapseKey);
+    artifactByCollapseKey.set(
+      collapseKey,
       existing ? mergeDuplicateArtifact(existing, artifact) : artifact,
     );
   }
-  return Array.from(artifactById.values()).sort(compareArtifacts);
+  return Array.from(artifactByCollapseKey.values()).sort(compareArtifacts);
 }
 
 function renderEntry(artifact: TimelineProjectionArtifact): TimelineProjectionRenderEntry {
