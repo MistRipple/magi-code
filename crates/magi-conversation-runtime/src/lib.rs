@@ -20,6 +20,7 @@ mod registry;
 pub mod session_turn_execution;
 pub mod session_writeback;
 pub mod settings_store;
+pub mod task_graph_builder;
 mod skill_apply_tool;
 mod stream;
 pub mod task_helpers;
