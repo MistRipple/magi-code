@@ -1,167 +1,262 @@
-# Task System v2 未决问题与风险
+# Task System v2 风险与验收标准
 
-更新时间：2026-05-14
-状态：设计稿
+更新时间：2026-05-17
+状态：单方案风险清单（已收敛）
 
-本文档记录 v2 设计中**尚未确定**的部分，以及落地过程中需要持续监控的风险。每项都标注了"延后决策"还是"必须 Slice X 前定"——Slice 编号见 `02-migration-plan.md::Slice 候选清单`。
+架构已经确定：简单任务走 SessionTurn，中等任务走 ExecutionChain + TaskGraph，复杂任务走 Mission + Long-Mission 闸门。运行时不变式（含 Plan completion gate 与 MissionCharter draft/frozen 生命周期）已全部落地。
 
-## 1. 模型作为 Coordinator 是一次押注
+## 1. 已定规则
 
-**问题**：Coordinator 协调能力完全依赖模型自己读 CoordinatorPrompt 并按 prompt 行事。如果模型质量回退（API 切到弱模型、context 压缩损失指令记忆），Coordinator 行为会退化。
+### 1.1 Mailbox
 
-**已知 mitigation**：
-- claude-code 实际运行验证了这条路径在 Claude Sonnet 4+ 上稳定可用
-- Coordinator prompt 用 prompt cache，命中后语义稳定
+Mailbox 保持 push 模型。外部信号进入 mailbox，Conversation 只在 Turn 边界 drain。
 
-**未决**：
-- 是否在 Coordinator Conversation 中**强制锁定模型版本**（不允许该 Conversation 中途换模型）
-- 弱模型 fallback 时是否**自动降级到非 Coordinator 模式**
+规则：
 
-**决策时点**：S7（CoordinatorPrompt + Task trait）落地前。
+- 不提供模型主动 peek/pull mailbox 的工具。
+- worker 想接收更新，由 parent/coordinator 使用 `send_message`。
+- mailbox 项不得插入正在进行的模型 round。
 
-## 2. Mailbox 没有 pull 机制
+风险：
 
-**问题**：Mailbox 是 push 模型——外部信号入栈、Conversation 在 Turn 边界 drain。Conversation **不能主动询问** Mailbox "有没有人要回复我"。
+- 长跑 worker 只能在下一次 Turn 看到更新。
 
-这在 C 档可能成为问题：长跑的 worker 想知道是否有更新指令，目前只能等到自己的下一个 Turn 才知道。
+验收：
 
-**候选方案**：
-- A) 保持现状，依赖 Turn 边界轮询（与 codex 一致）
-- B) 引入 `mailbox.peek()` 工具，让模型主动查看（但破坏 Turn 边界的确定性）
-- C) Coordinator 主动 `SendMessage` 取代 worker pull（语义更清晰）
+- `send_message` 能投递到目标 task mailbox。
+- 下一次 task turn 能看到该 runtime signal。
 
-**当前倾向**：A + C 组合。但保留 B 的可能性。
+### 1.2 Coordinator
 
-**决策时点**：S7 落地后观察实际行为，最晚 S11~S15（Tier 4 第一波）前定。
+Coordinator 使用 Prompt-as-Code 协调，但 runtime 执行边界必须硬约束。
 
-## 3. KnowledgeGraph 查询接口未定
+规则：
 
-**问题**：L18 KG 在设计中是"带版本的事实表"，但查询接口形态没确定：
-- SQL-like？（结构化查询）
-- 自然语言 + RAG？（向量检索）
-- 两者并存？
+- Coordinator 可以调用 `agent_spawn / send_message / task_stop`。
+- Coordinator 不能绕过 tool visibility、permissions、SafetyGate、HumanCheckpoint、Validation gate。
+- 弱模型不允许自动降级成“无约束 coordinator”；如果无法满足 coordinator 能力，应拒绝或退回 single-worker task。
 
-每种选择有不同的代价：
-- SQL 严格但模型可能不会用
-- RAG 模型友好但召回不稳定
+风险：
 
-**已知 mitigation**：
-- 先做结构化（symbol_map、decision_log、risk_register 都是表）
-- 向量索引作为可选 Layer，trait 化，先内置 BM25，后插 faiss/qdrant
+- 模型理解 coordinator prompt 失败，导致拆解差或重复 spawn。
 
-**决策时点**：S11~S15（Tier 4 第一波）落地前。
+验收：
 
-## 4. ValidationRunner 的增量 vs 全量
+- SpawnGraph 深度和扇出限制生效。
+- 工具不可见时调用被 rejected。
+- HumanCheckpoint pending 时 spawn 被 rejected。
 
-**问题**：C 档每次 Plan 节点完成都跑 Validation。Java→Python 重构跑完整测试套件可能 10+ 分钟。每节点都跑会拖慢整个 Mission。
+### 1.3 Validation
 
-**候选方案**：
-- A) 跑全量（最稳但最慢）
-- B) 节点声明影响范围，按范围跑（快但漏检概率高）
-- C) 阶段末跑全量、节点内跑相关子集（折中）
+Validation 是完成判定的一部分，不是完成后的附加日志。
 
-**当前倾向**：C。
+规则：
 
-**决策时点**：S11~S15（Tier 4 第一波）落地前。
+- 交付型 Plan step 进入 completed 前必须有 pass 记录。
+- fail 未消解时不能 completed。
+- skipped 必须有原因，且不能用于关键交付 step。
 
-## 5. 并发未明确
+风险：
 
-**问题**：B 档明确允许多 Conversation 并发（Coordinator spawn 多 worker）。但：
-- 同一 Mission 下能否并行多个 Plan 节点？
-- 跨 Mission 能否并发？
-- 单 magi 实例的 Conversation 上限？
+- 验证命令过慢，拖慢复杂 Mission。
 
-**已知边界**：
-- 一个 Conversation 内不能并发 Turn（不变式）
-- SpawnGraph 限制最大深度（默认 3）
+验收：
 
-**未决**：上述三问。
+- Plan completion gate 有自动测试。
+- validation report 能渲染进 long mission prompt。
 
-**决策时点**：S7（CoordinatorPrompt）落地后、S11~S15 前。
+落地状态：
 
-## 6. 编排失败的 fallback 未定
+- `magi-plan::apply_plan_update` 强制要求新置 completed 的 step 必须满足
+  `ValidationReport.step_is_passing`，否则返回
+  `PlanError::ValidationEvidenceMissing`。已覆盖单元测试。
 
-**问题**：如果 Coordinator 自身崩溃（模型胡说八道、提示词 jailbreak），整个 Mission 进度可能损坏。
+### 1.4 Checkpoint
 
-**候选方案**：
-- A) 自动 Checkpoint，崩溃后回滚到最近 Checkpoint
-- B) HumanCheckpoint 兜底——任何"看起来不对"的状态触发人审
-- C) 双 Coordinator 互审（一个跑、一个 review，造价高）
+Checkpoint 服务恢复，不只是展示摘要。
 
-**当前倾向**：A + B，不做 C。
+规则：
 
-**决策时点**：S11~S15（Tier 4 第一波）落地前。
+- checkpoint 必须记录恢复当前 Mission 所需的最小恢复集。
+- 恢复集不完整时必须显式失败。
+- checkpoint 不负责回滚用户文件；workspace 指针只用于定位和校验。
 
-## 7. Multi-Mission 隔离
+风险：
 
-**问题**：一台机器同时跑多个 C 档 Mission（Mission α 重构 Java→Python，Mission β 写新功能），如何隔离？
+- 只保存摘要会导致“看似恢复，实际丢失 active chain 或 mailbox”。
 
-**已知边界**：
-- Workspace 独立（不同 git worktree）
-- KG 独立
-- MEMORY.md 独立
+验收：
 
-**未决**：
-- ProjectMemory（L14）跨 Mission 共享还是隔离？
-- Permission 是 magi 全局还是 Mission 范围？
+- 进程重启后能恢复 active execution chain。
+- child result 仍能路由到 parent mailbox。
 
-**决策时点**：S7（CoordinatorPrompt）落地后、S11~S15 前。
+落地状态：
 
-## 8. HumanCheckpoint UI 形态
+- `magi-checkpoint::Checkpoint::recovery_set_status` 把恢复集校验写进类型层：
+  `ProcessRestart / ContextCompaction / PhaseTransition` 三种恢复 kind 必须携带
+  非空 `workspace_commit`，且 `open_conversations` 每一项都至少有一条
+  `recovery_ref` 或 `execution_chain_ref` 指针。
+- `append_checkpoint` 返回 `Result<u32, CheckpointError>`，恢复集不完整时直接
+  以 `CheckpointError::IncompleteRecoverySet { kind, reason }` 拒绝落盘，避免
+  "看似已 checkpoint，实际无法恢复"。
+- `parse_checkpoint_create_arguments` 与 `magi-tool-runtime` 暴露给模型的
+  `checkpoint_create` schema 同步收敛到 `session_id` + `recovery_ref` +
+  `execution_chain_ref`，强制模型在工具层提供恢复指针。
+- **读端聚合恢复入口**：新增 `magi-mission` crate 提供 `MissionAggregate` /
+  `resume_mission` / `enumerate_resumable_missions`，把 7 个 Tier 4 store 的
+  load 收口到单一聚合根。`resume_mission` 缺 Charter / Plan / CheckpointLog
+  即拒绝；最近 Checkpoint 通过 `recovery_set_status` 校验，缺料返回
+  `MissionResumeError::LatestCheckpointIncomplete { reason }`——与写端
+  `IncompleteRecoverySet` 共用同一个 `MissingRecoverySetReason` 枚举，**读端拒
+  绝条件 = 写端拒绝条件**，单源契约。
+- **写读契约对称性**：`magi-mission` 的集成测试 `contract_round_trip.rs` 走真
+  实写端 `append_checkpoint` 落盘 → 走真实读端 `resume_mission` 读回，断言
+  recovery 指针 round-trip 无损；并对称测试写端 / 读端在 workspace_commit
+  缺失、conversation pointer 缺失两种破口下都拒绝。把 `CheckpointLog::latest`
+  从孤儿 API 升级为 `resume_mission` 的关键依赖。
+- 配套收敛：把 8 个 store crate（7 个 Tier 4 + magi-project-memory）各自重复实现的
+  `workspace_slug` 收敛到 `magi-core::paths::workspace_slug` / `mission_dir` /
+  `missions_root` / `project_memory_root`，消除"同一函数并存多种实现"的违规。
+  统一实现采用 char-by-char 处理：`/` 和 `\` 都视作分隔符替换为 `-`，非
+  `[a-zA-Z0-9-_.]` 字符替换为 `_`，覆盖 Windows 路径与特殊字符。这是聚合恢复
+  能可靠扫描 missions 目录、且与 project-memory 共享 `<magi_home>/projects/<slug>/`
+  前缀对齐的前置。
+- 单测覆盖：完整恢复集顺序追加、recovery kind 缺 workspace_commit 拒绝、
+  conversation 缺指针拒绝、空 `open_conversations` 在 commit 存在时允许、
+  parse 校验 session_id 必填与指针互斥规则、序列化往返保留指针；
+  `magi-mission` 12 个单测覆盖聚合根的 happy/sad path + 枚举扫描；4 个
+  集成测试覆盖 §1.4 写读契约对称。
+- 范围说明：Phase A 收口契约层（写端 ✅ / 读端 ✅ / 写读对称 ✅）。**Phase B**
+  已落地（daemon bootstrap 自动恢复）：`magi-daemon::daemon::mission_recovery::
+  recover_missions_at_bootstrap` 在 `DaemonRuntime::restore` 内被调用，扫描每个
+  workspace 下 `<state_root>/projects/<slug>/missions/`，对每个 mission 执行
+  `enumerate_resumable_missions` → `resume_mission`，把 `head_checkpoint.
+  open_conversations[i].recovery_ref` 通过 `attach_recovery_ref` 回灌到对应
+  `SessionRuntimeSidecar`（不存在则 warn 跳过，不伪造），并发布
+  `mission.resumed.from_recovery` 事件携带 `EventContext { workspace_id, session_id,
+  mission_id }` 与 payload `{ recovery_id, execution_chain_ref, checkpoint_sequence,
+  workspace_commit, source: "daemon_bootstrap" }`。下一次 conversation turn 走
+  `apply_chain_recovery_if_needed` 时即可消费该 recovery_ref 完成 active chain
+  回放——读端契约 → 运行期消费的闭环。daemon 单测覆盖：空 home / 完整 sidecar
+  存在 → 事件发布 + recovery_ref 回灌 / sidecar 缺失 → 事件发布但不伪造 sidecar /
+  workspace 无 missions 目录静默跳过。
 
-**问题**：Mission 命中 HumanCheckpoint 时，用户在哪里、看到什么、怎么回复？
+### 1.5 HumanCheckpoint
 
-**当前空白**：
-- CLI / Web UI / 桌面通知，哪些组合？
-- 是否支持远程批准（移动设备）？
-- "暂停"和"等待用户"在 UI 上的视觉区别？
+HumanCheckpoint pending 是 runtime 级阻塞。
 
-**决策时点**：S16~S17（Checkpoint/HumanCheckpoint）落地前 + 前端配套设计。
+规则：
 
-## 9. Checkpoint diff/merge 语义
+- pending 时禁止新的 agent_spawn。
+- pending 时禁止 long mission 派发新的副作用工作。
+- resolve 只能从 pending 到 approved/rejected 一次。
 
-**问题**：两个 Checkpoint 之间的 KG / Plan 差异如何表达？用户能否在 UI 看到"两小时前到现在 KG 长了什么"？
+风险：
 
-**当前空白**：仅设计了 Checkpoint 是快照，没设计 diff。
+- 如果只写 prompt，不做 runtime 拦截，模型可以误继续执行。
 
-**候选方案**：
-- A) 不做 diff，仅做 "回滚到 Checkpoint X" 操作
-- B) 做 KG 三向 diff（base / current / target）
-- C) Plan 节点级 diff，KG 不 diff
+验收：
 
-**当前倾向**：A 先上线，B/C 看用户反馈再加。
+- pending 状态下 coordinator spawn 被 rejected。
+- approved 后任务可继续。
+- rejected 后 coordinator 必须回到 Plan 调整。
 
-**决策时点**：S16~S17 落地之后的迭代。
+### 1.6 MissionCharter
 
-## 10. 模型成本预算
+Charter 是复杂任务契约，有生命周期。
 
-**未在设计中讨论但重要**：C 档 Mission 长跑数日意味着大量 token 消耗。
+规则：
 
-**当前空白**：
-- 每个 Mission 是否有 token 预算上限？
-- 超预算行为：暂停 / 降级 / 通知用户？
-- 子代理 token 是否纳入 parent 预算？
+- `draft` 阶段允许澄清和补充。
+- `frozen` 后直接修改被拒绝。
+- `frozen` 后修改必须绑定 HumanCheckpoint approval；每次修改消费一个严格递增的
+  `approval_sequence`，避免单次 approval 反复授权。
 
-**决策时点**：S7（CoordinatorPrompt）落地后、S11~S15 前。
+风险：
 
-## 风险总结
+- 没有生命周期会在”不可改”和”需要澄清”之间摇摆。
 
-按严重性排序的设计风险：
+验收：
 
-| # | 风险 | 严重性 | 监控信号 |
-|---|------|--------|----------|
-| 1 | 模型 Coordinator 退化 | 高 | A/B test 同 prompt 不同模型成功率 |
-| 6 | 编排失败无 fallback | 高 | 跑出 demo Mission 后人工注入故障观察恢复 |
-| 4 | Validation 拖慢 Mission | 中 | demo Mission 端到端用时统计 |
-| 9 | Checkpoint diff 缺失 | 中 | 用户反馈"想看进度变化"的频次 |
-| 10 | Token 预算溢出 | 中 | demo Mission 实际 token 消耗 |
-| 2 | Mailbox pull 缺失 | 低 | worker 主动询问场景的实际频次 |
-| 8 | HumanCheckpoint UI 不完整 | 低 | UI 配套 PR 进度 |
+- draft 更新、freeze、frozen 拒绝、审批后修改都有测试。
 
-## 决策时点汇总
+落地状态：
 
-- **S7（CoordinatorPrompt）前需定**：模型版本锁定（#1）
-- **S7 后、S11~S15 前需定**：并发上限（#5）、Multi-Mission 隔离（#7）、Token 预算（#10）
-- **S11~S15（Tier 4 第一波）前需定**：KG 查询接口（#3）、Validation 策略（#4）、编排 fallback（#6）
-- **S16~S17（Checkpoint）前需定**：Checkpoint diff（#9）、HumanCheckpoint UI 形态（#8）
-- **整体落地后迭代**：Mailbox pull（#2）
+- `MissionCharter` 增加 `state: CharterState` + `last_approval_sequence` 字段，
+  frontmatter 兼容历史 charter.md（缺省默认为 draft）。
+- `mission_charter_write` 工具支持 `freeze` 与 `approval_sequence` 入参；frozen
+  写入路径在 `execute_mission_charter_write_tool` 内对 HumanCheckpointStore 做
+  status==Approved 校验，再交给 `apply_charter_update` 做序号递增校验。
+- 测试覆盖 draft 更新 / freeze 转换 / frozen 直接修改拒绝 / 引用未批准条目拒绝 /
+  审批后修改成功 / 同序号复用拒绝 / 历史 charter 读取为 Draft。
+
+## 2. 实现风险
+
+| 风险 | 严重性 | 处理方式 |
+|------|--------|----------|
+| HumanCheckpoint 只靠 prompt | 高 | ✅ P2 runtime 硬阻塞已落地 |
+| Plan completed 无验证证据 | 高 | ✅ P3 Validation gate 已落地（`apply_plan_update`） |
+| Checkpoint 无法恢复 active chain | 高 | ✅ §1.4 端到端落地：写端 `IncompleteRecoverySet` 拒绝写入 + 读端 `magi-mission::resume_mission` 拒绝消费缺料 + daemon bootstrap 自动扫描回灌 recovery_ref 并发布 `mission.resumed.from_recovery` |
+| Long Mission 激活条件被执行策略字段污染 | 中 | 已收敛为 `TaskTier::LongMission` 显式业务 tier |
+| TaskKind 看似支持但 executor 不完整 | 中 | P7 标注成熟度并拒绝 unsupported |
+| Coordinator 过度 spawn | 中 | SpawnGraph 深度/扇出 + role visibility |
+| 简单任务被过度任务化 | 中 | classifier 和 route 规则持续验证 |
+| MissionCharter frozen 后无运行时拦截 | 中 | ✅ §1.6 已落地：CharterState + approval_sequence 递增 |
+
+## 3. 端到端验收场景
+
+### 3.1 简单任务
+
+输入：解释一段代码或运行一次只读工具。
+
+预期：
+
+- route 为 `chat` 或 `execute`。
+- 不创建 TaskGraph。
+- 不创建 Mission。
+- session timeline 有清晰结果和必要工具证据。
+
+### 3.2 中等 single-worker task
+
+输入：修复一个明确 bug 并运行相关验证。
+
+预期：
+
+- route 为 `task`。
+- 创建 root task 和 execution chain。
+- 不启用 Long-Mission 层。
+- root task 完成时有输出摘要和验证记录。
+
+### 3.3 中等 coordinated task
+
+输入：处理多个独立 review comments 或调研多个方案后落地。
+
+预期：
+
+- root task 使用 coordinator role。
+- coordinator spawn 子 task。
+- child result 进入 parent mailbox。
+- parent 汇总后完成。
+- SpawnGraph open edge 关闭。
+
+### 3.4 复杂 Mission
+
+输入：跨多阶段重构或迁移。
+
+预期：
+
+- 创建或恢复 Mission。
+- 有 Charter、Plan、Workspace、KG、Validation、Checkpoint、HumanCheckpoint。
+- Plan step 完成受 Validation gate 约束。
+- pending HumanCheckpoint 阻止新派发。
+- 进程重启后可以从 checkpoint 恢复。
+
+## 4. 完成标准
+
+v2 达标必须同时满足：
+
+- 简单任务路径保持轻量。
+- 中等任务路径具备可观察执行链、子任务回执和验证。
+- 复杂任务路径具备目标契约、计划、事实、验证、人审和恢复。
+- 文档、代码、UI projection 对同一业务对象使用同一语义。
+- 不保留并列设计方案或双实现路径。

@@ -143,12 +143,11 @@ pub(crate) fn build_runtime_snapshot_from_projection(
         total_assignments,
         total_tasks: projection.progress_summary.total_tasks as usize,
         completed_tasks: projection.progress_summary.settled_tasks as usize,
-        failed_tasks: (projection.progress_summary.failed_tasks
-            + projection.progress_summary.blocked_tasks) as usize,
+        failed_tasks: projection.progress_summary.failed_tasks as usize,
     }
 }
 
-pub(crate) fn build_execution_overview_from_task_graph(
+pub(crate) fn build_execution_overview_from_task_projection(
     task_store: &TaskStore,
     root_task_id: &TaskId,
     _mission_id: &MissionId,

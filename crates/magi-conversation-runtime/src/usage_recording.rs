@@ -1,7 +1,7 @@
-//! Task System v2 — M04b：从 `magi-api::usage_recording` 下沉。
+//! Task System v2 — usage recording helpers。
 //!
 //! 复用 v2 内部的 `model_config::NormalizedModelConfig` 与
-//! `settings_store::SettingsStore`。magi-api 通过 `pub(crate) use` 壳引用。
+//! `settings_store::SettingsStore`。
 
 use crate::{model_config::NormalizedModelConfig, settings_store::SettingsStore};
 use magi_core::{EventId, SessionId, UtcMillis, WorkspaceId};

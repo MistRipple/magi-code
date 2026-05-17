@@ -2352,7 +2352,7 @@ mod tests {
     }
 
     #[test]
-    fn mission_execution_overview_context_refs_survive_followup_overview_without_context() {
+    fn mission_execution_overview_survives_followup_overview_without_context() {
         let mission_context = EventContext {
             mission_id: Some(MissionId::new("mission-1")),
             ..EventContext::default()

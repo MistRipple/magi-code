@@ -1074,6 +1074,7 @@ dependencies = [
  "axum",
  "magi-api",
  "magi-bridge-client",
+ "magi-checkpoint",
  "magi-context-runtime",
  "magi-conversation-runtime",
  "magi-core",
@@ -1081,7 +1082,10 @@ dependencies = [
  "magi-governance",
  "magi-knowledge-store",
  "magi-memory-store",
+ "magi-mission",
+ "magi-mission-charter",
  "magi-orchestrator",
+ "magi-plan",
  "magi-session-store",
  "magi-skill-runtime",
  "magi-tool-runtime",
@@ -1090,6 +1094,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "tokio",
  "tower",
@@ -1174,11 +1179,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "magi-mission"
+version = "0.1.0"
+dependencies = [
+ "magi-checkpoint",
+ "magi-core",
+ "magi-human-checkpoint",
+ "magi-knowledge-graph",
+ "magi-mission-charter",
+ "magi-mission-workspace",
+ "magi-plan",
+ "magi-validation-runner",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "magi-mission-charter"
 version = "0.1.0"
 dependencies = [
  "magi-core",
  "magi-event-bus",
+ "magi-human-checkpoint",
  "serde",
  "serde_json",
  "tempfile",
@@ -1238,6 +1260,7 @@ version = "0.1.0"
 dependencies = [
  "magi-core",
  "magi-event-bus",
+ "magi-validation-runner",
  "serde",
  "serde_json",
  "tempfile",

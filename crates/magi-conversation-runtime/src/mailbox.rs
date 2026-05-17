@@ -14,17 +14,56 @@ pub struct UserSignal {
     pub accepted_at: UtcMillis,
 }
 
-/// Mailbox 内的信号变体。S1 仅 User 一类；后续 slice 会扩展 ToolResult、ChildFinal、
-/// SystemSignal 等运行时信号。
+/// Mailbox 信号作者。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", content = "id", rename_all = "snake_case")]
+pub enum MailboxAuthor {
+    User,
+    Agent(String),
+    System,
+    Parent(String),
+    Child(String),
+}
+
+/// Mailbox 信号类型。与 v2 架构文档的 Message / Decision / Interrupt /
+/// AgentResult / Followup 五类保持一致。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MailboxKind {
+    Message,
+    Decision,
+    Interrupt,
+    AgentResult,
+    Followup,
+}
+
+/// 非用户输入类运行时信号。所有跨任务/父子代理/系统调度输入都以该结构进入
+/// Conversation Mailbox，在下一次 Turn 边界被一次性 drain。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeSignal {
+    pub author: MailboxAuthor,
+    pub kind: MailboxKind,
+    pub trigger_turn: bool,
+    pub payload: serde_json::Value,
+    pub enqueued_at: UtcMillis,
+}
+
+/// Mailbox 内的信号变体。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum MailboxItem {
     User(UserSignal),
+    Runtime(RuntimeSignal),
 }
 
 impl MailboxItem {
     pub fn user(signal: UserSignal) -> Self {
         Self::User(signal)
+    }
+
+    pub fn runtime(signal: RuntimeSignal) -> Self {
+        Self::Runtime(signal)
     }
 }
 
@@ -44,8 +83,7 @@ impl Mailbox {
         self.items.push_back(item);
     }
 
-    /// 取出全部 user 信号。S1 中 Mailbox 仅 User 变体；
-    /// 该方法在 S2+ 引入其他变体时仍保持类型精确。
+    /// 取出全部 user 信号，并保留非 user 运行时信号等待 Turn 边界消费。
     pub fn drain_user_signals(&mut self) -> Vec<UserSignal> {
         let mut signals = Vec::with_capacity(self.items.len());
         let remainder: VecDeque<MailboxItem> = self
@@ -56,10 +94,16 @@ impl Mailbox {
                     signals.push(signal);
                     None
                 }
+                other => Some(other),
             })
             .collect();
         self.items = remainder;
         signals
+    }
+
+    /// Turn 边界唯一消费入口：按 FIFO 取出全部待处理信号。
+    pub fn drain_all(&mut self) -> Vec<MailboxItem> {
+        self.items.drain(..).collect()
     }
 }
 
@@ -96,5 +140,25 @@ mod tests {
     fn drain_on_empty_returns_empty() {
         let mut mailbox = Mailbox::new();
         assert!(mailbox.drain_user_signals().is_empty());
+    }
+
+    #[test]
+    fn drain_user_signals_preserves_runtime_items() {
+        let mut mailbox = Mailbox::new();
+        mailbox.push(MailboxItem::runtime(RuntimeSignal {
+            author: MailboxAuthor::Parent("task-parent".to_string()),
+            kind: MailboxKind::Message,
+            trigger_turn: true,
+            payload: serde_json::json!({"text": "继续执行"}),
+            enqueued_at: UtcMillis(10),
+        }));
+        mailbox.push(MailboxItem::user(sample_signal("user")));
+
+        let users = mailbox.drain_user_signals();
+        assert_eq!(users.len(), 1);
+        assert_eq!(users[0].text.as_deref(), Some("user"));
+        let pending = mailbox.drain_all();
+        assert!(matches!(pending.as_slice(), [MailboxItem::Runtime(_)]));
+        assert!(mailbox.drain_all().is_empty());
     }
 }

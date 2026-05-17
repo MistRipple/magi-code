@@ -3,40 +3,44 @@ use serde::{Deserialize, Serialize};
 use crate::ids::{MissionId, TaskId};
 use crate::value_objects::UtcMillis;
 
-// ---------------------------------------------------------------------------
-// TaskKind
-// ---------------------------------------------------------------------------
-
+/// Task System v2 L11：任务运行变体。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TaskKind {
-    // Plan nodes (can appear in initial graph)
-    Objective,
-    Phase,
-    WorkPackage,
-    Action,
-    Validation,
-    // Runtime nodes (only created during execution)
-    Repair,
-    Decision,
+    LocalAgent,
+    LocalBash,
+    LocalWorkflow,
+    RemoteAgent,
+    MonitorMcp,
+    InProcessTeammate,
+    Dream,
 }
 
-// ---------------------------------------------------------------------------
-// TaskStatus
-// ---------------------------------------------------------------------------
-
+/// Task System v2 L11：任务生命周期，固定为 5 态。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
-    Draft,
-    Ready,
+    Pending,
     Running,
-    Blocked,
-    AwaitingApproval,
-    Verifying,
-    Repairing,
     Completed,
     Failed,
-    Cancelled,
-    Skipped,
+    Killed,
+}
+
+/// Task System v2：任务复杂度分层。
+///
+/// 简单任务不进入 Task，因此这里仅表达进入任务系统后的两类路径：
+/// - `ExecutionChain`：中等任务，启用任务链与可选 coordinator；
+/// - `LongMission`：复杂任务，额外启用 Mission/Plan/Validation/Checkpoint/HumanCheckpoint。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskTier {
+    ExecutionChain,
+    LongMission,
+}
+
+fn default_task_tier() -> TaskTier {
+    TaskTier::ExecutionChain
 }
 
 // ---------------------------------------------------------------------------
@@ -54,45 +58,25 @@ pub struct TaskPolicy {
     pub network_mode: String,
     pub command_mode: String,
     pub retry_limit: u32,
-    pub repair_limit: u32,
     pub validation_profile: Option<String>,
     pub checkpoint_mode: String,
+    #[serde(default = "default_task_tier")]
+    pub task_tier: TaskTier,
     pub background_allowed: bool,
     pub escalation_conditions: Vec<String>,
 }
 
-// ---------------------------------------------------------------------------
-// TaskVariant (L11 TaskPolymorphism)
-// ---------------------------------------------------------------------------
-
-/// Task System v2 L11：任务变体。
-///
-/// 设计文档 01-architecture.md §2.3 列举了 7 个变体，S7 只完整实现两个：
-/// - `LocalAgent`：本进程内启动的子 Conversation，沿用 task_llm_loop 全功能执行（默认值）。
-/// - `LocalBash`：异步 shell 任务，跳过 LLM 循环，由 dispatch_execution 直接执行 shell。
-///
-/// 其余 5 个变体（local_workflow / remote_agent / monitor_mcp / in_process_teammate /
-/// dream）在后续 slice 引入；新增枚举值时旧持久化数据自动落到 `LocalAgent`（serde 默认）。
+/// Task System v2 L11：变体负载。
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum TaskVariant {
+pub enum TaskRuntimePayload {
     #[default]
-    LocalAgent,
+    None,
     LocalBash {
         command: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         working_dir: Option<String>,
     },
-}
-
-impl TaskVariant {
-    pub fn is_local_bash(&self) -> bool {
-        matches!(self, Self::LocalBash { .. })
-    }
-
-    pub fn is_local_agent(&self) -> bool {
-        matches!(self, Self::LocalAgent)
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -115,7 +99,6 @@ pub struct Task {
     /// Executor routing metadata stored as JSON to keep v2 runtime-specific
     /// binding shapes out of magi-core.
     pub executor_binding: Option<serde_json::Value>,
-    pub context_refs: Vec<String>,
     pub knowledge_refs: Vec<String>,
     pub workspace_scope: Option<String>,
     pub write_scope: Option<String>,
@@ -123,13 +106,9 @@ pub struct Task {
     pub output_refs: Vec<String>,
     pub evidence_refs: Vec<String>,
     pub retry_count: u32,
-    pub repair_count: u32,
-    /// Payload for Decision tasks (design 12), stored as JSON because the
-    /// decision lifecycle belongs to the v2 task runner rather than core.
-    pub decision_payload: Option<serde_json::Value>,
-    /// Task System v2 — L11：执行变体；缺省 LocalAgent，兼容旧持久化数据。
+    /// Task System v2 — L11：运行变体的专用负载。
     #[serde(default)]
-    pub variant: TaskVariant,
+    pub runtime_payload: TaskRuntimePayload,
     pub created_at: UtcMillis,
     pub updated_at: UtcMillis,
 }
@@ -165,36 +144,29 @@ impl Task {
 pub struct TaskProjection {
     pub root_task: Task,
     pub tasks: Vec<Task>,
-    pub current_phase: Option<String>,
     pub running_tasks: Vec<TaskId>,
-    pub blocked_tasks: Vec<TaskId>,
-    pub pending_decisions: Vec<TaskId>,
-    pub workpackage_summaries: Vec<WorkPackageSummary>,
-    pub validation_summary: Option<String>,
+    pub pending_tasks: Vec<TaskId>,
+    pub completed_tasks: Vec<TaskId>,
+    pub failed_tasks: Vec<TaskId>,
+    pub killed_tasks: Vec<TaskId>,
     pub progress_summary: ProgressSummary,
     pub aggregate_status: TaskStatus,
     pub display_status: String,
     pub execution_mode: String,
     pub runner_status: String,
+    #[serde(default)]
+    pub has_recoverable_chain: bool,
+    #[serde(default)]
+    pub recoverable_branch_count: usize,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ProgressSummary {
     pub total_tasks: u32,
-    pub completed_tasks: u32,
-    pub settled_tasks: u32,
-    pub failed_tasks: u32,
+    pub pending_tasks: u32,
     pub running_tasks: u32,
-    pub blocked_tasks: u32,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct WorkPackageSummary {
-    pub task_id: String,
-    pub title: String,
-    pub aggregate_status: TaskStatus,
-    pub display_status: String,
-    pub progress_ratio: f32,
-    pub recent_evidence: Vec<String>,
-    pub recent_issues: Vec<String>,
+    pub completed_tasks: u32,
+    pub failed_tasks: u32,
+    pub killed_tasks: u32,
+    pub settled_tasks: u32,
 }

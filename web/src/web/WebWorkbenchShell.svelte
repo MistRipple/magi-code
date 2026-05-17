@@ -82,10 +82,7 @@
 
   const INTERNAL_SESSION_NAME_PATTERNS = [
     /^auto-deep-followup-\d+$/i,
-    /^replan-gate-ask-\d+$/i,
-    /^auto-repair-\d+$/i,
     /^auto-governance-resume-\d+$/i,
-    /^followup-blocked-\d+$/i,
     /^real-dispatch-regression-\d+$/i,
   ];
   const SIDEBAR_WIDTH_STORAGE_KEY = 'magi-sidebar-width';

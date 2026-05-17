@@ -5,9 +5,8 @@
 //! - SafetyGate 是**语义判定**：同样是 `shell_exec`，但参数里出现
 //!   `git push --force-with-lease` / `rm -rf /` 这种高危子串，需要单独拦下来。
 //!
-//! v1 中这套"危险命令模式"只是塞进系统 prompt（见 `resolve_safeguard_prompt`），
-//! 模型可能照样执行；S8 把它升格为运行期拦截器：在工具调用真正落到
-//! `ToolRegistry::execute_with_policy` 之前，先过 SafetyGate。
+//! SafetyGate 是运行期拦截器：在工具调用真正落到
+//! `ToolRegistry::execute_with_policy` 之前，先执行高危命令语义判定。
 //!
 //! 设计要点：
 //! - 引擎本身无可变状态；规则以快照形式注入。
@@ -165,8 +164,7 @@ impl SafetyGate {
         Self { rules }
     }
 
-    /// 内置默认规则集 —— v1 中散落在 `builtin_safeguard_rules()` 的硬编码模式，
-    /// 收敛到这一处。任何调用方都应基于此再合并用户自定义规则。
+    /// 内置默认规则集。任何调用方都应基于此再合并用户自定义规则。
     pub fn with_builtin_defaults() -> Self {
         Self::new(builtin_rules())
     }
@@ -256,8 +254,8 @@ fn extract_shell_command(arguments_json: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// v1 `builtin_safeguard_rules()` 的语义复制：保留同一份内置危险模式集合，
-/// 后续只在本 crate 维护。state.rs 的 seed_default_safeguard_rules 改为从此读取。
+/// 内置危险模式集合，后续只在本 crate 维护。
+/// state.rs 的 seed_default_safeguard_rules 从此读取。
 pub fn builtin_rules() -> Vec<SafetyRule> {
     use SafetyCategory::*;
     let raw: &[(&str, SafetyCategory)] = &[
@@ -380,9 +378,9 @@ mod tests {
     }
 
     #[test]
-    fn builtin_rules_cover_v1_patterns() {
+    fn builtin_rules_cover_default_patterns() {
         let rules = builtin_rules();
-        // 与 v1 builtin_safeguard_rules 行为对齐：保持 15 条内置规则。
+        // 默认规则集保持 15 条内置规则。
         assert_eq!(rules.len(), 15);
         assert!(rules.iter().all(|r| r.enabled));
         assert!(rules.iter().any(|r| r.pattern == "rm -rf"));

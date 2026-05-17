@@ -110,12 +110,12 @@ import {
 } from '../protocol/canonical-turn';
 import type { SseConnection } from '../transport';
 import {
-  activateTaskGraphSession,
+  activateTaskProjectionSession,
   fetchTaskProjection,
   startAutoRefresh as startTaskAutoRefresh,
-  getTaskGraphState,
-  clearTaskGraph,
-} from '../../stores/task-graph-store.svelte';
+  getTaskProjectionState,
+  clearTaskProjection,
+} from '../../stores/task-projection-store.svelte';
 import { sanitizeSvgContent } from '../svg-sanitizer';
 import { RustDaemonClient } from '../rust-daemon-client';
 import {
@@ -127,7 +127,6 @@ import {
   clearRequestBinding,
   createRequestBinding,
   markMessageActive,
-  removeQueuedMessage,
   setQueuedMessages,
   updateRequestBinding,
 } from '../../stores/messages.svelte';
@@ -454,6 +453,20 @@ function extractBootstrapTaskTrackingHints(payload: BootstrapPayload, rawPayload
   const activity = asBridgeRecord(overview?.activity);
   const sessionTaskIds = normalizeBridgeStringArray(activeRuntimeSession?.active_task_ids);
   const sessionMissionIds = new Set(normalizeBridgeStringArray(activeRuntimeSession?.active_execution_group_ids));
+  const runtimeSessionStatus = trimBridgeString(activeRuntimeSession?.current_status)
+    || trimBridgeString(activeRuntimeSession?.currentStatus);
+  if (
+    activeRuntimeSession
+    && !rootTaskId
+    && sessionTaskIds.length === 0
+    && sessionMissionIds.size === 0
+    && runtimeSessionStatus === 'detached'
+  ) {
+    return {
+      rootTaskId: '',
+      activeTaskIds: [],
+    };
+  }
   for (const taskId of sessionTaskIds) {
     const missionId = trimBridgeString(runtimeTaskMap.get(taskId)?.mission_id);
     if (missionId) {
@@ -1092,11 +1105,11 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
   }
 
   // Notify listeners about task-domain SSE events so lightweight stores
-  // (e.g. task-graph-store) can react without waiting for a full bootstrap refresh.
-  const isTaskGraphRelevantEvent = eventType.startsWith('task.')
+  // (e.g. task-projection-store) can react without waiting for a full bootstrap refresh.
+  const isTaskProjectionRelevantEvent = eventType.startsWith('task.')
     || eventType.startsWith('mission.')
     || eventType.startsWith('assignment.');
-  if (isTaskGraphRelevantEvent) {
+  if (isTaskProjectionRelevantEvent) {
     emitMessage({ type: 'rustTaskEvent', eventType, payload: event.payload ?? {} } as ClientBridgeMessage);
 
     if (eventType === 'task.status.changed' && event.payload) {
@@ -1350,7 +1363,7 @@ function clearWorkspaceSessionBinding(workspaceId: string, workspacePath: string
   currentWorkspacePath = normalizedWorkspacePath;
   currentSessionId = '';
   clearCurrentInterruptTaskId();
-  clearTaskGraph();
+  clearTaskProjection();
   if (queueDrainTimer) {
     clearTimeout(queueDrainTimer);
     queueDrainTimer = null;
@@ -1396,7 +1409,7 @@ function clearPersistedWorkspaceBinding(): void {
   currentWorkspacePath = '';
   currentSessionId = '';
   clearCurrentInterruptTaskId();
-  clearTaskGraph();
+  clearTaskProjection();
   persistStoredBrowserWorkspaceBinding({
     workspaceId: '',
     workspacePath: '',
@@ -1632,14 +1645,14 @@ async function dispatchBootstrap(
     currentRuntimeEpoch = incomingEpoch;
   }
   persistWorkspaceBinding(payload.workspace.workspaceId, payload.workspace.rootPath, payload.sessionId);
-  activateTaskGraphSession(payload.sessionId);
+  activateTaskProjectionSession(payload.sessionId);
   const taskTrackingHints = extractBootstrapTaskTrackingHints(payload, options.rawPayload);
   if (previousSessionId && payload.sessionId && previousSessionId !== payload.sessionId) {
     clearCurrentInterruptTaskId();
   }
   reconcileCurrentInterruptTaskId(taskTrackingHints.activeTaskIds);
   if (!taskTrackingHints.rootTaskId && taskTrackingHints.activeTaskIds.length === 0) {
-    clearTaskGraph(payload.sessionId);
+    clearTaskProjection(payload.sessionId);
   }
   emitDataMessage('sessionBootstrapLoaded', {
     ...payload,
@@ -1846,14 +1859,14 @@ async function dispatchSessionSnapshot(
     workspacePath: options.workspacePath,
   });
   persistWorkspaceBinding(payload.workspace.workspaceId, payload.workspace.rootPath, payload.sessionId);
-  activateTaskGraphSession(payload.sessionId);
+  activateTaskProjectionSession(payload.sessionId);
   const taskTrackingHints = extractBootstrapTaskTrackingHints(payload, rawPayload);
   if (previousSessionId && payload.sessionId && previousSessionId !== payload.sessionId) {
     clearCurrentInterruptTaskId();
   }
   reconcileCurrentInterruptTaskId(taskTrackingHints.activeTaskIds);
   if (!taskTrackingHints.rootTaskId && taskTrackingHints.activeTaskIds.length === 0) {
-    clearTaskGraph(payload.sessionId);
+    clearTaskProjection(payload.sessionId);
   }
   emitDataMessage('sessionBootstrapLoaded', {
     ...payload,
@@ -1928,7 +1941,7 @@ async function createSessionInternal(): Promise<string> {
   if (!sessionId) {
     throw new Error('create session failed: missing session id');
   }
-  activateTaskGraphSession(sessionId);
+  activateTaskProjectionSession(sessionId);
   await loadLatestSessionSnapshot(sessionId, {
     workspaceId: targetWorkspaceId,
     workspacePath: targetWorkspacePath,
@@ -1962,7 +1975,7 @@ async function switchSession(
   const targetWorkspacePath = typeof options.workspacePath === 'string' && options.workspacePath.trim()
     ? options.workspacePath.trim()
     : currentWorkspacePath;
-  activateTaskGraphSession(sessionId);
+  activateTaskProjectionSession(sessionId);
   const response = await getTransport().request(agentUrl('/api/session/switch'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -2042,16 +2055,16 @@ async function ensureFreshLiveBridge(reason: string): Promise<void> {
 // ─── Task tracking helpers ────────────────────────────────────────────
 
 /**
- * Initialize task-graph-store tracking for a root task ID.
+ * Initialize task-projection-store tracking for a root task ID.
  * Fetches the initial projection and starts auto-refresh + SSE subscription.
  * Defensive: logs warnings on failure but never breaks the caller.
  */
 function initTaskTracking(sessionId: string, rootTaskId: string): void {
   console.info('[web-client-bridge] Initializing task tracking for session/root task:', { sessionId, rootTaskId });
-  activateTaskGraphSession(sessionId);
-  const currentState = getTaskGraphState(sessionId);
+  activateTaskProjectionSession(sessionId);
+  const currentState = getTaskProjectionState(sessionId);
   if (currentState.rootTaskId && currentState.rootTaskId !== rootTaskId) {
-    clearTaskGraph(sessionId);
+    clearTaskProjection(sessionId);
   }
   fetchTaskProjection(sessionId, rootTaskId)
     .then(() => {
@@ -2075,7 +2088,7 @@ export async function autoConnectTaskTracking(
   if (!sessionId || sessionId !== currentSessionId) {
     return;
   }
-  const currentState = getTaskGraphState(sessionId);
+  const currentState = getTaskProjectionState(sessionId);
   if (preferredRootTaskId) {
     if (currentState.rootTaskId === preferredRootTaskId) {
       return;
@@ -2208,31 +2221,6 @@ async function drainQueuedTurns(reason: string): Promise<void> {
   }
 }
 
-let guideSubmissionActive = false;
-
-async function guideQueuedTurn(queuedMessageId: string): Promise<void> {
-  const normalizedId = typeof queuedMessageId === 'string' ? queuedMessageId.trim() : '';
-  if (!normalizedId || guideSubmissionActive) {
-    return;
-  }
-  const target = messagesState.queuedMessages.find((message) => (
-    message.id === normalizedId || message.requestId === normalizedId
-  ));
-  if (!target) {
-    return;
-  }
-  guideSubmissionActive = true;
-  removeQueuedMessage(target.id);
-  try {
-    const submitted = await submitQueuedGuidance(target);
-    if (!submitted) {
-      restoreQueuedTurnToFront(target);
-    }
-  } finally {
-    guideSubmissionActive = false;
-  }
-}
-
 function restoreQueuedTurnToFront(queued: QueuedMessage): void {
   const exists = messagesState.queuedMessages.some((message) => (
     message.id === queued.id || (queued.requestId && message.requestId === queued.requestId)
@@ -2241,57 +2229,6 @@ function restoreQueuedTurnToFront(queued: QueuedMessage): void {
     return;
   }
   setQueuedMessages([queued, ...messagesState.queuedMessages]);
-}
-
-function isMissingActiveTaskChainError(error: unknown): boolean {
-  if (!(error instanceof AgentApiError)) {
-    return false;
-  }
-  return error.status === 400 && error.message.includes('活跃任务链');
-}
-
-async function submitQueuedGuidance(next: QueuedMessage): Promise<boolean> {
-  const text = (next.text ?? next.content).trim();
-  const images = next.images ?? [];
-  const hasExecutablePayload = Boolean(text) || images.length > 0 || Boolean(next.skillName?.trim());
-  if (!hasExecutablePayload) {
-    return false;
-  }
-  if (images.length > 0 || next.skillName?.trim()) {
-    return executeTask({
-      text: next.text ?? next.content,
-      requestId: next.requestId || next.id,
-      skillName: next.skillName ?? null,
-      images,
-    });
-  }
-
-  try {
-    await ensureFreshLiveBridge('queued_guidance_preflight');
-    await submitSessionTurn({
-      text,
-      images: [],
-      supplementContext: true,
-    }, {
-      workspaceId: currentWorkspaceId,
-      workspacePath: currentWorkspacePath,
-      sessionId: currentSessionId,
-    });
-    emitBridgeSuccessToast('补充上下文', '已写入当前任务上下文', { displayMode: 'notification_center' });
-    return true;
-  } catch (error) {
-    if (isMissingActiveTaskChainError(error)) {
-      return executeTask({
-        text: next.text ?? next.content,
-        requestId: next.requestId || next.id,
-        skillName: next.skillName ?? null,
-        images,
-      });
-    }
-    console.error('[web-client-bridge] 提交排队引导失败:', error);
-    emitBridgeErrorToast('补充上下文', error);
-    return false;
-  }
 }
 
 async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
@@ -2453,7 +2390,8 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
   }
 }
 
-async function interruptTask(trigger: 'user_pause' | 'pause_task' = 'user_pause'): Promise<void> {
+async function interruptTask(): Promise<void> {
+  const trigger = 'user_interrupt';
   const taskId = currentInterruptTaskId;
   const sessionId = currentSessionId.trim();
   clearActiveTurnInFlight();
@@ -3274,19 +3212,11 @@ export function createWebClientBridge(): ClientBridge {
             });
           }
           return;
-        case 'guideQueuedMessage':
-          if (typeof message.queuedMessageId === 'string' && message.queuedMessageId.trim()) {
-            void guideQueuedTurn(message.queuedMessageId.trim());
-          }
-          return;
         case 'interruptTask':
-          void interruptTask('user_pause');
+          void interruptTask();
           return;
         case 'continueTask':
           void continueSessionExecution();
-          return;
-        case 'pauseTask':
-          void interruptTask('pause_task');
           return;
         case 'startTask':
           if (typeof message.taskId === 'string' && message.taskId.trim()) {

@@ -226,28 +226,28 @@ mod tests {
             ApiError::InternalAssemblyError(message) => {
                 assert_eq!(message, "创建会话失败: boom");
             }
-            other => panic!("unexpected internal variant: {:?}", other),
+            other => panic!("unexpected internal runtime_payload: {:?}", other),
         }
 
         match publish {
             ApiError::EventPublishFailed(message) => {
                 assert_eq!(message, "事件发布失败: down");
             }
-            other => panic!("unexpected publish variant: {:?}", other),
+            other => panic!("unexpected publish runtime_payload: {:?}", other),
         }
 
         match model {
             ApiError::ModelInvocationFailed(message) => {
                 assert_eq!(message, "模型调用失败: down");
             }
-            other => panic!("unexpected model variant: {:?}", other),
+            other => panic!("unexpected model runtime_payload: {:?}", other),
         }
 
         match recovery {
             ApiError::RecoveryNotFound(message) => {
                 assert_eq!(message, "恢复入口不存在: recovery-1");
             }
-            other => panic!("unexpected recovery variant: {:?}", other),
+            other => panic!("unexpected recovery runtime_payload: {:?}", other),
         }
     }
 }

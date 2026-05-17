@@ -46,7 +46,7 @@ fn seed_action_tasks(
         mission_id: mission_id.clone(),
         root_task_id: root_task_id.clone(),
         parent_task_id: None,
-        kind: TaskKind::Objective,
+        kind: TaskKind::LocalAgent,
         title: mission_title.to_string(),
         goal: mission_title.to_string(),
         status: TaskStatus::Running,
@@ -57,7 +57,6 @@ fn seed_action_tasks(
             .collect(),
         policy_snapshot: None,
         executor_binding: None,
-        context_refs: Vec::new(),
         knowledge_refs: Vec::new(),
         workspace_scope: None,
         write_scope: None,
@@ -65,9 +64,7 @@ fn seed_action_tasks(
         output_refs: Vec::new(),
         evidence_refs: Vec::new(),
         retry_count: 0,
-        repair_count: 0,
-        decision_payload: None,
-        variant: magi_core::TaskVariant::default(),
+        runtime_payload: magi_core::TaskRuntimePayload::default(),
         created_at: now,
         updated_at: now,
     });
@@ -77,7 +74,7 @@ fn seed_action_tasks(
             mission_id: mission_id.clone(),
             root_task_id: root_task_id.clone(),
             parent_task_id: Some(root_task_id.clone()),
-            kind: TaskKind::Action,
+            kind: TaskKind::LocalAgent,
             title: (*title).to_string(),
             goal: (*title).to_string(),
             status: status.clone(),
@@ -85,7 +82,6 @@ fn seed_action_tasks(
             required_children: Vec::new(),
             policy_snapshot: None,
             executor_binding: None,
-            context_refs: Vec::new(),
             knowledge_refs: Vec::new(),
             workspace_scope: None,
             write_scope: None,
@@ -93,9 +89,7 @@ fn seed_action_tasks(
             output_refs: Vec::new(),
             evidence_refs: Vec::new(),
             retry_count: 0,
-            repair_count: 0,
-            decision_payload: None,
-            variant: magi_core::TaskVariant::default(),
+            runtime_payload: magi_core::TaskRuntimePayload::default(),
             created_at: now,
             updated_at: now,
         });
@@ -126,7 +120,7 @@ fn seed_task_hierarchy(
         mission_id: mission_id.clone(),
         root_task_id: root_task_id.clone(),
         parent_task_id: None,
-        kind: TaskKind::Objective,
+        kind: TaskKind::LocalAgent,
         title: mission_title.to_string(),
         goal: mission_title.to_string(),
         status: root_status,
@@ -134,7 +128,6 @@ fn seed_task_hierarchy(
         required_children: child_map.get(&root_task_id).cloned().unwrap_or_default(),
         policy_snapshot: None,
         executor_binding: None,
-        context_refs: Vec::new(),
         knowledge_refs: Vec::new(),
         workspace_scope: None,
         write_scope: None,
@@ -142,9 +135,7 @@ fn seed_task_hierarchy(
         output_refs: Vec::new(),
         evidence_refs: Vec::new(),
         retry_count: 0,
-        repair_count: 0,
-        decision_payload: None,
-        variant: magi_core::TaskVariant::default(),
+        runtime_payload: magi_core::TaskRuntimePayload::default(),
         created_at: now,
         updated_at: now,
     });
@@ -158,7 +149,7 @@ fn seed_task_hierarchy(
             mission_id: mission_id.clone(),
             root_task_id: root_task_id.clone(),
             parent_task_id: Some(parent.clone()),
-            kind: TaskKind::Action,
+            kind: TaskKind::LocalAgent,
             title: (*title).to_string(),
             goal: (*title).to_string(),
             status: *status,
@@ -166,7 +157,6 @@ fn seed_task_hierarchy(
             required_children: child_map.get(task_id).cloned().unwrap_or_default(),
             policy_snapshot: None,
             executor_binding: None,
-            context_refs: Vec::new(),
             knowledge_refs: Vec::new(),
             workspace_scope: None,
             write_scope: None,
@@ -174,9 +164,7 @@ fn seed_task_hierarchy(
             output_refs: Vec::new(),
             evidence_refs: Vec::new(),
             retry_count: 0,
-            repair_count: 0,
-            decision_payload: None,
-            variant: magi_core::TaskVariant::default(),
+            runtime_payload: magi_core::TaskRuntimePayload::default(),
             created_at: now,
             updated_at: now,
         });
@@ -185,7 +173,7 @@ fn seed_task_hierarchy(
     root_task_id
 }
 
-fn build_task_graph_overview(
+fn build_task_projection_overview(
     service: &OrchestratorService,
     task_store: &TaskStore,
     mission_id: &MissionId,
@@ -197,7 +185,7 @@ fn build_task_graph_overview(
     context_summary: Option<ExecutionContextSummary>,
 ) -> ExecutionOverview {
     service
-        .build_execution_overview_from_task_graph(
+        .build_execution_overview_from_task_projection(
             task_store,
             &TaskExecutionTarget {
                 mission_id: mission_id.clone(),
@@ -213,7 +201,7 @@ fn build_task_graph_overview(
             governance_observations,
             context_summary,
         )
-        .expect("task graph overview should be built")
+        .expect("task projection overview should be built")
 }
 
 fn direct_execution_target(mission_id: &MissionId, task_id: &TaskId) -> TaskExecutionTarget {
@@ -302,7 +290,7 @@ fn execution_overview_exports_context_consumption_into_runtime_read_model() {
         &task_store,
         &mission_id,
         "mission",
-        &[(task_id.clone(), "task", TaskStatus::Ready)],
+        &[(task_id.clone(), "task", TaskStatus::Pending)],
     );
 
     let knowledge_store = magi_knowledge_store::KnowledgeStore::new();
@@ -406,7 +394,7 @@ fn execution_overview_exports_context_consumption_into_runtime_read_model() {
     );
     let context_summary = ExecutionContextSummary::from_context_assembly(&context_result);
 
-    let overview = build_task_graph_overview(
+    let overview = build_task_projection_overview(
         &service,
         &task_store,
         &mission_id,
@@ -497,7 +485,7 @@ fn execution_overview_exports_context_consumption_into_runtime_read_model() {
 }
 
 #[test]
-fn task_graph_aggregates_governance_summaries_by_layer() {
+fn task_projection_aggregates_governance_summaries_by_layer() {
     let event_bus = Arc::new(InMemoryEventBus::new(16));
     let service = OrchestratorService::new(event_bus);
     let task_store = TaskStore::new();
@@ -573,7 +561,7 @@ fn task_graph_aggregates_governance_summaries_by_layer() {
         ),
     ];
 
-    let overview = build_task_graph_overview(
+    let overview = build_task_projection_overview(
         &service,
         &task_store,
         &mission_id,
@@ -676,7 +664,7 @@ fn execution_runtime_can_run_dispatch_through_worker_loop() {
         &task_store,
         &mission_id,
         "mission",
-        &[(task_id.clone(), "task", TaskStatus::Ready)],
+        &[(task_id.clone(), "task", TaskStatus::Pending)],
     );
 
     let result = execution_runtime
@@ -811,7 +799,7 @@ fn execution_runtime_automatically_assembles_context_summary_when_configured() {
         &task_store,
         &mission_id,
         "Mission parser refresh",
-        &[(task_id.clone(), "Fix manifest parser", TaskStatus::Ready)],
+        &[(task_id.clone(), "Fix manifest parser", TaskStatus::Pending)],
     );
 
     let result = execution_runtime
@@ -892,7 +880,7 @@ fn execution_runtime_execute_dispatch_then_runs_hook_only_after_success() {
         &task_store,
         &mission_id,
         "mission",
-        &[(task_id.clone(), "task", TaskStatus::Ready)],
+        &[(task_id.clone(), "task", TaskStatus::Pending)],
     );
 
     let hook_log = Arc::new(Mutex::new(Vec::<String>::new()));
@@ -950,7 +938,7 @@ fn execution_runtime_execute_dispatch_with_writebacks_persists_memory_extraction
         &task_store,
         &mission_id,
         "mission",
-        &[(task_id.clone(), "task", TaskStatus::Ready)],
+        &[(task_id.clone(), "task", TaskStatus::Pending)],
     );
 
     let writebacks = ExecutionWritebackPlans::from_optional_memory_extraction(Some(
@@ -1016,7 +1004,7 @@ fn execution_runtime_can_run_dispatch_through_local_process_executor() {
         &task_store,
         &mission_id,
         "mission",
-        &[(task_id.clone(), "task", TaskStatus::Ready)],
+        &[(task_id.clone(), "task", TaskStatus::Pending)],
     );
 
     let result = execution_runtime
@@ -1135,7 +1123,7 @@ fn execution_runtime_rejects_unhealthy_local_process_executor_before_execute() {
         &task_store,
         &mission_id,
         "mission",
-        &[(task_id.clone(), "task", TaskStatus::Ready)],
+        &[(task_id.clone(), "task", TaskStatus::Pending)],
     );
 
     let error = execution_runtime
@@ -1182,7 +1170,7 @@ fn execution_runtime_execute_dispatch_then_skips_hook_on_failure() {
         &task_store,
         &mission_id,
         "mission",
-        &[(task_id.clone(), "task", TaskStatus::Ready)],
+        &[(task_id.clone(), "task", TaskStatus::Pending)],
     );
 
     let hook_calls = Arc::new(Mutex::new(0usize));
@@ -1240,7 +1228,7 @@ fn execution_runtime_execute_dispatch_with_writebacks_skips_writeback_on_failure
         &task_store,
         &mission_id,
         "mission",
-        &[(task_id.clone(), "task", TaskStatus::Ready)],
+        &[(task_id.clone(), "task", TaskStatus::Pending)],
     );
 
     let writebacks = ExecutionWritebackPlans::from_optional_memory_extraction(Some(
@@ -1312,7 +1300,7 @@ fn execution_runtime_rejects_local_process_executor_missing_step_capability_befo
         &task_store,
         &mission_id,
         "mission",
-        &[(task_id.clone(), "task", TaskStatus::Ready)],
+        &[(task_id.clone(), "task", TaskStatus::Pending)],
     );
 
     let error = execution_runtime
@@ -1362,7 +1350,7 @@ fn execution_runtime_rejects_local_process_executor_affinity_mismatch_before_exe
         &task_store,
         &mission_id,
         "mission",
-        &[(task_id.clone(), "task", TaskStatus::Ready)],
+        &[(task_id.clone(), "task", TaskStatus::Pending)],
     );
 
     let error = execution_runtime
@@ -1438,7 +1426,7 @@ fn multi_task_execution_with_mixed_outcomes_aggregates_in_overview() {
         ),
     ];
 
-    let overview = build_task_graph_overview(
+    let overview = build_task_projection_overview(
         &service,
         &task_store,
         &mission_id,

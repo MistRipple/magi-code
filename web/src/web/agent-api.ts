@@ -256,7 +256,7 @@ export interface AgentSessionTurnResult {
   acceptedAt: number;
   createdSession: boolean;
   route: 'chat' | 'execute' | 'task' | 'continue' | 'supplement_context';
-  /** Root task ID when the backend created a task graph for this action. */
+  /** Root task ID when the backend created a task projection for this action. */
   rootTaskId?: string | null;
   /** 当前轮次实际执行的 action task ID。 */
   actionTaskId?: string | null;
@@ -267,10 +267,10 @@ export interface AgentSessionTurnResult {
   canonicalEventKind?: string | null;
   canonicalTurn?: CanonicalTurn | null;
   canonicalItem?: CanonicalTurnItem | null;
-  /** 仅在 supplement_context 路由下返回：本次写入的上下文引用 ID。 */
-  contextRef?: string | null;
-  /** 仅在 supplement_context 路由下返回：被写入的上下文任务 ID。 */
-  contextTaskId?: string | null;
+  /** 仅在 supplement_context 路由下返回：本次入栈的 mailbox signal ID。 */
+  signalRef?: string | null;
+  /** 仅在 supplement_context 路由下返回：被投递的任务 ID。 */
+  targetTaskId?: string | null;
 }
 
 export class AgentApiError extends Error {
@@ -986,7 +986,7 @@ export async function submitSessionTurn(
     userMessageId?: string | null;
     placeholderMessageId?: string | null;
     supplementContext?: boolean;
-    contextTaskId?: string | null;
+    targetTaskId?: string | null;
   },
   bindingOverride?: Partial<AgentBindingContext>,
 ): Promise<AgentSessionTurnResult> {
@@ -1010,7 +1010,7 @@ export async function submitSessionTurn(
         userMessageId: payload.userMessageId ?? null,
         placeholderMessageId: payload.placeholderMessageId ?? null,
         supplementContext: payload.supplementContext === true,
-        contextTaskId: payload.contextTaskId ?? null,
+        targetTaskId: payload.targetTaskId ?? null,
         images: payload.images.map((image) => ({
           name: image.name,
           dataUrl: image.dataUrl,
@@ -1032,8 +1032,8 @@ export async function submitSessionTurn(
       canonicalEventKind?: string | null;
       canonicalTurn?: CanonicalTurn | null;
       canonicalItem?: CanonicalTurnItem | null;
-      contextRef?: string | null;
-      contextTaskId?: string | null;
+      signalRef?: string | null;
+      targetTaskId?: string | null;
     }>(response, 'submit session turn');
     return {
       sessionId: raw.sessionId,
@@ -1060,9 +1060,9 @@ export async function submitSessionTurn(
         : null,
       canonicalTurn: raw.canonicalTurn ?? null,
       canonicalItem: raw.canonicalItem ?? null,
-      contextRef: typeof raw.contextRef === 'string' && raw.contextRef.trim() ? raw.contextRef.trim() : null,
-      contextTaskId: typeof raw.contextTaskId === 'string' && raw.contextTaskId.trim()
-        ? raw.contextTaskId.trim()
+      signalRef: typeof raw.signalRef === 'string' && raw.signalRef.trim() ? raw.signalRef.trim() : null,
+      targetTaskId: typeof raw.targetTaskId === 'string' && raw.targetTaskId.trim()
+        ? raw.targetTaskId.trim()
         : null,
     };
   } catch (error) {

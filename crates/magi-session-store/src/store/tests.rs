@@ -1607,6 +1607,79 @@ fn clear_ownership_after_resume_resets_to_recovery_linked_or_detached() {
 }
 
 #[test]
+fn archive_active_execution_chain_detaches_task_panel_without_deleting_history() {
+    let store = SessionStore::new();
+    let session_id = SessionId::new("session-archive-chain");
+    let workspace_id = WorkspaceId::new("workspace-archive-chain");
+    let mission_id = MissionId::new("mission-archive-chain");
+    let root_task_id = TaskId::new("task-root-archive-chain");
+    let execution_chain_ref = "chain-archive-chain".to_string();
+
+    store
+        .create_session(session_id.clone(), "Archive Chain")
+        .expect("session should be creatable");
+    store
+        .upsert_active_execution_chain(
+            session_id.clone(),
+            ActiveExecutionChain {
+                session_id: session_id.clone(),
+                mission_id: mission_id.clone(),
+                root_task_id: root_task_id.clone(),
+                execution_chain_ref: execution_chain_ref.clone(),
+                workspace_id: Some(workspace_id.clone()),
+                active_branch_task_ids: vec![root_task_id.clone()],
+                active_worker_bindings: vec![WorkerId::new("worker-archive-chain")],
+                branches: vec![ActiveExecutionBranch {
+                    task_id: root_task_id.clone(),
+                    worker_id: WorkerId::new("worker-archive-chain"),
+                    stage: "execute".to_string(),
+                    lease_id: None,
+                    execution_intent_ref: None,
+                    binding_lifecycle: None,
+                    checkpoint_stage: None,
+                    next_step_index: None,
+                    checkpoint_at: None,
+                    resume_mode: None,
+                    resume_token: None,
+                    use_tools: true,
+                    skill_name: None,
+                    is_primary: true,
+                }],
+                recovery_ref: Some("recovery-archive-chain".to_string()),
+                dispatch_context: ActiveExecutionDispatchContext {
+                    accepted_at: UtcMillis::now(),
+                    entry_id: "timeline-archive-chain".to_string(),
+                    trimmed_text: Some("archive chain".to_string()),
+                    skill_name: None,
+                },
+                current_turn: Some(test_turn("turn-archive-chain", "completed", 42)),
+            },
+        )
+        .expect("active execution chain should upsert");
+
+    store
+        .archive_active_execution_chain(&session_id, &root_task_id)
+        .expect("archive should succeed");
+
+    let sidecar = store
+        .runtime_sidecar(&session_id)
+        .expect("sidecar should remain as the session fact source");
+    assert_eq!(sidecar.status, SessionExecutionSidecarStatus::Detached);
+    assert!(sidecar.active_execution_chain.is_none());
+    assert!(sidecar.ownership.mission_id.is_none());
+    assert!(sidecar.ownership.task_id.is_none());
+    assert!(sidecar.ownership.worker_id.is_none());
+    assert!(sidecar.ownership.execution_chain_ref.is_none());
+    assert_eq!(sidecar.ownership.session_id.as_ref(), Some(&session_id));
+    assert_eq!(sidecar.ownership.workspace_id.as_ref(), Some(&workspace_id));
+    assert!(sidecar.current_turn.is_some());
+    assert_eq!(
+        store.execution_sidecar_flush_metadata().last_dirty_reason,
+        Some(SessionSidecarFlushReason::ArchiveActiveExecutionChain)
+    );
+}
+
+#[test]
 fn recovery_resume_rejects_mismatched_recovery_id() {
     let store = SessionStore::new();
     let session_id = SessionId::new("session-mismatch-recovery");
@@ -2068,15 +2141,15 @@ fn sample_thread(
 }
 
 #[test]
-fn thread_registry_spawn_and_idle_reuse() {
+fn thread_registry_activation_tracks_task_ids_without_reuse_lookup() {
     let store = SessionStore::new();
-    let session_id = SessionId::new("session-thread-reuse");
-    let mission_id = MissionId::new("mission-thread-reuse");
+    let session_id = SessionId::new("session-thread-activation");
+    let mission_id = MissionId::new("mission-thread-activation");
     let now = UtcMillis(1_000);
+    let thread_id = ThreadId::new("thread-backend-1");
 
-    // 注册一条 backend-dev 的 idle thread
     store.register_thread(sample_thread(
-        "thread-backend-1",
+        thread_id.as_str(),
         &session_id,
         &mission_id,
         "backend-dev",
@@ -2084,32 +2157,13 @@ fn thread_registry_spawn_and_idle_reuse() {
         ExecutionThreadStatus::Idle,
     ));
 
-    // 查找 idle thread 必须命中
-    let found = store
-        .find_idle_thread_for_role(&session_id, "backend-dev")
-        .expect("idle backend-dev thread should be found");
-    assert_eq!(found.thread_id.as_str(), "thread-backend-1");
-
-    // 激活 thread 后，状态变为 Active，再查 idle 应该找不到
     let task_a = TaskId::new("task-a");
-    store.activate_thread(&found.thread_id, &task_a, UtcMillis(2_000));
-    assert!(
-        store
-            .find_idle_thread_for_role(&session_id, "backend-dev")
-            .is_none(),
-        "active thread 不应再出现在 idle 查询结果中"
-    );
+    store.activate_thread(&thread_id, &task_a, UtcMillis(2_000));
+    store.mark_thread_idle(&thread_id, UtcMillis(3_000));
 
-    // 标记 idle 后应可复用
-    store.mark_thread_idle(&found.thread_id, UtcMillis(3_000));
-    let reused = store
-        .find_idle_thread_for_role(&session_id, "backend-dev")
-        .expect("idled thread should be reusable");
-    assert_eq!(reused.thread_id.as_str(), "thread-backend-1");
-
-    // handled_task_ids 必须累积
     let snapshot = store.thread_registry_snapshot(&session_id);
     assert_eq!(snapshot.len(), 1);
+    assert_eq!(snapshot[0].status, ExecutionThreadStatus::Idle);
     assert_eq!(
         snapshot[0].handled_task_ids,
         vec![task_a],
@@ -2118,7 +2172,7 @@ fn thread_registry_spawn_and_idle_reuse() {
 }
 
 #[test]
-fn thread_registry_is_scoped_per_session_and_role() {
+fn thread_registry_snapshot_is_scoped_per_session() {
     let store = SessionStore::new();
     let session_a = SessionId::new("session-a");
     let session_b = SessionId::new("session-b");
@@ -2142,24 +2196,13 @@ fn thread_registry_is_scoped_per_session_and_role() {
         ExecutionThreadStatus::Idle,
     ));
 
-    // session 隔离：session-a 不应看到 session-b 的 thread
-    let a_idle = store.find_idle_thread_for_role(&session_a, "backend-dev");
-    assert_eq!(
-        a_idle.map(|t| t.thread_id.as_str().to_string()),
-        Some("thread-a-backend".to_string())
-    );
-    let b_idle = store.find_idle_thread_for_role(&session_b, "backend-dev");
-    assert_eq!(
-        b_idle.map(|t| t.thread_id.as_str().to_string()),
-        Some("thread-b-backend".to_string())
-    );
+    let a_threads = store.thread_registry_snapshot(&session_a);
+    assert_eq!(a_threads.len(), 1);
+    assert_eq!(a_threads[0].thread_id.as_str(), "thread-a-backend");
 
-    // role 隔离：frontend-dev 不存在，查询返回 None
-    assert!(
-        store
-            .find_idle_thread_for_role(&session_a, "frontend-dev")
-            .is_none()
-    );
+    let b_threads = store.thread_registry_snapshot(&session_b);
+    assert_eq!(b_threads.len(), 1);
+    assert_eq!(b_threads[0].thread_id.as_str(), "thread-b-backend");
 }
 
 #[test]
@@ -2199,9 +2242,8 @@ fn thread_registry_retires_on_session_retirement() {
     }
 
     assert!(
-        store
-            .find_idle_thread_for_role(&session_id, "reviewer")
-            .is_none(),
-        "retired thread 不应被 idle 查询命中"
+        snapshot
+            .iter()
+            .all(|thread| thread.status == ExecutionThreadStatus::Retired)
     );
 }

@@ -37,10 +37,10 @@ export interface SessionTurnRequestDto {
   requestId?: string | null;
   userMessageId?: string | null;
   placeholderMessageId?: string | null;
-  /** 当为 true 时，本次 turn 直接作为补充上下文写入当前任务，不进入分类器。 */
+  /** 当为 true 时，本次输入直接作为运行时 followup 信号投递到目标任务 Mailbox，不进入分类器。 */
   supplementContext?: boolean;
-  /** 当 supplementContext 为 true 时，可选指定写入哪个上下文任务。 */
-  contextTaskId?: string | null;
+  /** 当 supplementContext 为 true 时，可选指定投递到哪个任务。 */
+  targetTaskId?: string | null;
 }
 
 export interface SessionTurnResponseDto {
@@ -50,21 +50,42 @@ export interface SessionTurnResponseDto {
   acceptedAt: number;
   createdSession: boolean;
   route: SessionTurnRouteDto;
-  /** Root task ID when the backend created a task graph for this action. */
+  /** Root task ID when the backend created a task projection for this action. */
   rootTaskId?: string | null;
   /** 当前轮次实际执行的 action task ID。 */
   actionTaskId?: string | null;
   executionChainRef?: string | null;
   /** 后端生成的用户消息 turnItemId，前端应使用此 ID 创建 canonical 节点 */
   userMessageItemId?: string | null;
-  /** 仅在 supplement_context 路由下返回：本次写入的上下文引用 ID。 */
-  contextRef?: string | null;
-  /** 仅在 supplement_context 路由下返回：被写入的上下文任务 ID。 */
-  contextTaskId?: string | null;
+  /** 仅在 supplement_context 路由下返回：本次入栈的 mailbox signal ID。 */
+  signalRef?: string | null;
+  /** 仅在 supplement_context 路由下返回：被投递的任务 ID。 */
+  targetTaskId?: string | null;
 }
 
 export interface TaskInterruptResponseDto {
   interrupted: boolean;
+  eventId: string;
+  requestedAt: number;
+}
+
+export interface TaskRestartResponseDto {
+  restarted: boolean;
+  sessionId: string;
+  entryId: string;
+  eventId: string;
+  acceptedAt: number;
+  createdSession: boolean;
+  rootTaskId: string;
+  actionTaskId: string;
+  executionChainRef?: string | null;
+  requestedAt: number;
+}
+
+export interface TaskArchiveResponseDto {
+  archived: boolean;
+  sessionId: string;
+  rootTaskId: string;
   eventId: string;
   requestedAt: number;
 }
@@ -1162,29 +1183,23 @@ export interface MessagesResponseDto {
   beforeCursor?: string | null;
 }
 
-// ─── Task Graph types (magi-core::task) ─────────────────────────────
+// ─── Task Projection types (magi-core::task) ────────────────────────
 
 export type TaskKind =
-  | 'Objective'
-  | 'Phase'
-  | 'WorkPackage'
-  | 'Action'
-  | 'Validation'
-  | 'Repair'
-  | 'Decision';
+  | 'local_agent'
+  | 'local_bash'
+  | 'local_workflow'
+  | 'remote_agent'
+  | 'monitor_mcp'
+  | 'in_process_teammate'
+  | 'dream';
 
 export type TaskStatus =
-  | 'Draft'
-  | 'Ready'
-  | 'Running'
-  | 'Blocked'
-  | 'AwaitingApproval'
-  | 'Verifying'
-  | 'Repairing'
-  | 'Completed'
-  | 'Failed'
-  | 'Cancelled'
-  | 'Skipped';
+  | 'pending'
+  | 'running'
+  | 'completed'
+  | 'failed'
+  | 'killed';
 
 export interface ExecutorBindingDto {
   target_role: string;
@@ -1204,28 +1219,11 @@ export interface TaskPolicyDto {
   network_mode: string;
   command_mode: string;
   retry_limit: number;
-  repair_limit: number;
   validation_profile?: string | null;
   checkpoint_mode: string;
+  task_tier: 'execution_chain' | 'long_mission';
   background_allowed: boolean;
   escalation_conditions: string[];
-}
-
-export interface DecisionOptionDto {
-  option_id: string;
-  label: string;
-  description: string;
-}
-
-export interface DecisionTaskPayloadDto {
-  decision_context: string;
-  blocked_reason: string;
-  target_task_id?: string | null;
-  options: DecisionOptionDto[];
-  risk_notes: string[];
-  recommended_option?: string | null;
-  required_user_input: boolean;
-  decision_evidence?: unknown;
 }
 
 export interface TaskDto {
@@ -1241,7 +1239,6 @@ export interface TaskDto {
   required_children: string[];
   policy_snapshot?: TaskPolicyDto | null;
   executor_binding?: ExecutorBindingDto | null;
-  context_refs: string[];
   knowledge_refs: string[];
   workspace_scope?: string | null;
   write_scope?: string | null;
@@ -1249,45 +1246,53 @@ export interface TaskDto {
   output_refs: string[];
   evidence_refs: string[];
   retry_count: number;
-  repair_count: number;
-  decision_payload?: DecisionTaskPayloadDto | null;
   created_at: number;
   updated_at: number;
 }
 
 export interface ProgressSummaryDto {
   total_tasks: number;
-  completed_tasks: number;
-  settled_tasks: number;
-  failed_tasks: number;
+  pending_tasks: number;
   running_tasks: number;
-  blocked_tasks: number;
+  completed_tasks: number;
+  failed_tasks: number;
+  killed_tasks: number;
+  settled_tasks: number;
 }
 
-export interface WorkPackageSummaryDto {
-  task_id: string;
-  title: string;
-  aggregate_status: TaskStatus;
-  display_status: string;
-  progress_ratio: number;
-  recent_evidence: string[];
-  recent_issues: string[];
-}
+export type TaskExecutionModeDto = 'session_turn' | 'execution_chain' | 'long_mission';
 
 export interface TaskProjectionDto {
   root_task: TaskDto;
   tasks: TaskDto[];
-  current_phase?: string | null;
   running_tasks: string[];
-  blocked_tasks: string[];
-  pending_decisions: string[];
-  workpackage_summaries: WorkPackageSummaryDto[];
-  validation_summary?: string | null;
+  pending_tasks: string[];
+  completed_tasks: string[];
+  failed_tasks: string[];
+  killed_tasks: string[];
   progress_summary: ProgressSummaryDto;
   aggregate_status: TaskStatus;
   display_status: string;
-  execution_mode: 'normal' | 'deep';
-  runner_status: 'idle' | 'running' | 'blocked' | 'completed' | 'error';
+  execution_mode: TaskExecutionModeDto;
+  runner_status: 'pending' | 'idle' | 'running' | 'completed' | 'error' | 'killed';
+  has_recoverable_chain: boolean;
+  recoverable_branch_count: number;
+}
+
+export interface SessionTaskHistoryItemDto {
+  rootTask: TaskDto;
+  runnerStatus: 'pending' | 'idle' | 'running' | 'completed' | 'error' | 'killed';
+  displayStatus: string;
+  executionMode: TaskExecutionModeDto;
+  active: boolean;
+  archived: boolean;
+  restartable: boolean;
+  updatedAt: number;
+}
+
+export interface SessionTaskHistoryResponseDto {
+  sessionId: string;
+  items: SessionTaskHistoryItemDto[];
 }
 
 export interface DeliveryPackageProgressDto {
@@ -1295,60 +1300,34 @@ export interface DeliveryPackageProgressDto {
   completed: number;
   failed: number;
   running: number;
-  blocked: number;
+  pending: number;
+  killed: number;
 }
 
-export interface DeliveryPackageValidationResultDto {
+export interface DeliveryPackageVerificationResultDto {
   task_id: string;
   title: string;
   result: string;
   evidence: string[];
 }
 
-export interface DeliveryPackageRepairRecordDto {
+export interface DeliveryPackageExecutionRecordDto {
   task_id: string;
   title: string;
   goal: string;
   evidence: string[];
 }
 
-export interface DeliveryPackageKeyDecisionDto {
-  task_id: string;
-  context: string;
-  blocked_reason: string;
-  chosen_option?: string | null;
-}
-
 export interface DeliveryPackageDto {
   goal: string;
   scope?: string | null;
-  execution_mode: 'normal' | 'deep';
+  execution_mode: TaskExecutionModeDto;
   aggregate_status: string;
-  current_phase?: string | null;
   progress: DeliveryPackageProgressDto;
   file_changes: string[];
   evidence_list: string[];
-  validation_results: DeliveryPackageValidationResultDto[];
-  repair_records: DeliveryPackageRepairRecordDto[];
-  key_decisions: DeliveryPackageKeyDecisionDto[];
+  verification_results: DeliveryPackageVerificationResultDto[];
+  execution_records: DeliveryPackageExecutionRecordDto[];
   remaining_risks: string[];
   completed_task_count: number;
 }
-
-export interface ResolveTaskDecisionRequestDto {
-  chosenOption: string;
-  evidence?: unknown;
-}
-
-export interface ResolveTaskDecisionResponseDto {
-  taskId: string;
-  resolved: boolean;
-  chosenOption: string;
-}
-
-export interface TaskReplanResponseDto {
-  rootTaskId: string;
-  replan: boolean;
-  cancelledTaskIds: string[];
-}
-

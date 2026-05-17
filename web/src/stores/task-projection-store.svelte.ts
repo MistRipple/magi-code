@@ -1,8 +1,8 @@
 /**
- * Task Graph Store - 以 session 为边界缓存 Task Projection。
+ * Task Projection Store - 以 session 为边界缓存 Task Projection。
  *
  * 设计约束：
- * - 任务图轮询、SSE 刷新都必须绑定当前会话 session
+ * - 任务投影轮询、SSE 刷新都必须绑定当前会话 session
  * - 不再保留全局唯一 rootTaskId / projection
  * - workspace 仍然共用同一条事件流，但刷新按 session-keyed 状态执行
  */
@@ -15,7 +15,7 @@ import { RustDaemonClient } from '../shared/rust-daemon-client';
 import { resolveAgentBaseUrl } from '../web/agent-api';
 import { onBridgeMessage } from '../shared/bridges/bridge-runtime';
 
-export interface TaskGraphState {
+export interface TaskProjectionState {
   projection: TaskProjectionDto | null;
   loading: boolean;
   error: string | null;
@@ -23,12 +23,12 @@ export interface TaskGraphState {
   selectedTaskId: string | null;
 }
 
-interface InternalSessionTaskGraphState extends TaskGraphState {
+interface InternalSessionTaskProjectionState extends TaskProjectionState {
   fetchGeneration: number;
   refreshAfterLoad: boolean;
 }
 
-const EMPTY_TASK_GRAPH_STATE: TaskGraphState = {
+const EMPTY_TASK_PROJECTION_STATE: TaskProjectionState = {
   projection: null,
   loading: false,
   error: null,
@@ -38,12 +38,13 @@ const EMPTY_TASK_GRAPH_STATE: TaskGraphState = {
 const SSE_DEBOUNCE_MS = 300;
 const SETTLE_REFRESH_DELAY_MS = 1500;
 
-let sessionStates = $state<Record<string, InternalSessionTaskGraphState>>({});
-let activeTaskGraphSessionId = '';
+let sessionStates = $state<Record<string, InternalSessionTaskProjectionState>>({});
+let activeTaskProjectionSessionId = '';
 let refreshTimer: ReturnType<typeof setInterval> | null = null;
 let settleRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 let sseUnsubscribe: (() => void) | null = null;
 let sseDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+const retiredSessionRootIds = new Set<string>();
 
 function normalizeSessionKey(sessionId: string | null | undefined): string {
   return typeof sessionId === 'string' ? sessionId.trim() : '';
@@ -53,7 +54,11 @@ function createClient(): RustDaemonClient {
   return new RustDaemonClient(resolveAgentBaseUrl());
 }
 
-function createEmptyInternalState(): InternalSessionTaskGraphState {
+function sessionRootKey(sessionId: string, rootTaskId: string): string {
+  return `${sessionId}\u0000${rootTaskId}`;
+}
+
+function createEmptyInternalState(): InternalSessionTaskProjectionState {
   return {
     projection: null,
     loading: false,
@@ -65,7 +70,7 @@ function createEmptyInternalState(): InternalSessionTaskGraphState {
   };
 }
 
-function ensureSessionState(sessionId: string): InternalSessionTaskGraphState {
+function ensureSessionState(sessionId: string): InternalSessionTaskProjectionState {
   if (!sessionStates[sessionId]) {
     sessionStates = {
       ...sessionStates,
@@ -75,12 +80,12 @@ function ensureSessionState(sessionId: string): InternalSessionTaskGraphState {
   return sessionStates[sessionId];
 }
 
-function readSessionState(sessionId: string): InternalSessionTaskGraphState | null {
+function readSessionState(sessionId: string): InternalSessionTaskProjectionState | null {
   return sessionStates[sessionId] ?? null;
 }
 
 function trackedSessionIds(): string[] {
-  const activeSessionId = normalizeSessionKey(activeTaskGraphSessionId);
+  const activeSessionId = normalizeSessionKey(activeTaskProjectionSessionId);
   const activeState = activeSessionId ? sessionStates[activeSessionId] : undefined;
   return activeState?.rootTaskId ? [activeSessionId] : [];
 }
@@ -90,16 +95,16 @@ async function refreshTrackedSessions(): Promise<void> {
   await Promise.all(sessions.map((sessionId) => refreshTaskProjection(sessionId)));
 }
 
-export function getTaskGraphState(sessionId: string | null | undefined): TaskGraphState {
+export function getTaskProjectionState(sessionId: string | null | undefined): TaskProjectionState {
   const normalizedSessionId = normalizeSessionKey(sessionId);
   if (!normalizedSessionId) {
-    return EMPTY_TASK_GRAPH_STATE;
+    return EMPTY_TASK_PROJECTION_STATE;
   }
   // 直接返回 sessionStates 中的引用，使 Svelte 响应性系统能追踪字段变化。
-  return readSessionState(normalizedSessionId) ?? EMPTY_TASK_GRAPH_STATE;
+  return readSessionState(normalizedSessionId) ?? EMPTY_TASK_PROJECTION_STATE;
 }
 
-export function ensureTaskGraphState(sessionId: string | null | undefined): void {
+export function ensureTaskProjectionState(sessionId: string | null | undefined): void {
   const normalizedSessionId = normalizeSessionKey(sessionId);
   if (!normalizedSessionId) {
     return;
@@ -107,17 +112,17 @@ export function ensureTaskGraphState(sessionId: string | null | undefined): void
   ensureSessionState(normalizedSessionId);
 }
 
-export function activateTaskGraphSession(sessionId: string | null | undefined): void {
+export function activateTaskProjectionSession(sessionId: string | null | undefined): void {
   const normalizedSessionId = normalizeSessionKey(sessionId);
   if (!normalizedSessionId) {
-    activeTaskGraphSessionId = '';
+    activeTaskProjectionSessionId = '';
     stopAutoRefresh();
     return;
   }
-  if (activeTaskGraphSessionId === normalizedSessionId) {
+  if (activeTaskProjectionSessionId === normalizedSessionId) {
     return;
   }
-  activeTaskGraphSessionId = normalizedSessionId;
+  activeTaskProjectionSessionId = normalizedSessionId;
   if (trackedSessionIds().length === 0) {
     stopAutoRefresh();
   } else {
@@ -131,6 +136,9 @@ export async function fetchTaskProjection(
 ): Promise<void> {
   const normalizedSessionId = normalizeSessionKey(sessionId);
   if (!normalizedSessionId) {
+    return;
+  }
+  if (retiredSessionRootIds.has(sessionRootKey(normalizedSessionId, rootTaskId))) {
     return;
   }
   const state = ensureSessionState(normalizedSessionId);
@@ -158,7 +166,7 @@ export async function fetchTaskProjection(
     latestState.error = null;
     if (latestState.selectedTaskId) {
       const selectedTask = projection.tasks.find((task) => task.task_id === latestState.selectedTaskId);
-      if (!selectedTask || selectedTask.status === 'Cancelled') {
+      if (!selectedTask || selectedTask.status === 'killed') {
         latestState.selectedTaskId = null;
       }
     }
@@ -197,7 +205,7 @@ export async function refreshTaskProjection(sessionId: string | null | undefined
   if (!normalizedSessionId) {
     return;
   }
-  if (activeTaskGraphSessionId !== normalizedSessionId) {
+  if (activeTaskProjectionSessionId !== normalizedSessionId) {
     return;
   }
   const state = ensureSessionState(normalizedSessionId);
@@ -274,16 +282,22 @@ export function stopAutoRefresh(): void {
   disconnectFromSSE();
 }
 
-export function clearTaskGraph(sessionId?: string | null): void {
+export function clearTaskProjection(sessionId?: string | null, retiredRootTaskId?: string | null): void {
   const normalizedSessionId = normalizeSessionKey(sessionId);
   if (!normalizedSessionId) {
     sessionStates = {};
-    activeTaskGraphSessionId = '';
+    activeTaskProjectionSessionId = '';
     stopAutoRefresh();
     return;
   }
-  if (activeTaskGraphSessionId === normalizedSessionId) {
-    activeTaskGraphSessionId = '';
+  const normalizedRetiredRootTaskId = typeof retiredRootTaskId === 'string'
+    ? retiredRootTaskId.trim()
+    : '';
+  if (normalizedRetiredRootTaskId) {
+    retiredSessionRootIds.add(sessionRootKey(normalizedSessionId, normalizedRetiredRootTaskId));
+  }
+  if (activeTaskProjectionSessionId === normalizedSessionId) {
+    activeTaskProjectionSessionId = '';
   }
   if (!sessionStates[normalizedSessionId]) {
     if (trackedSessionIds().length === 0) {
@@ -299,7 +313,7 @@ export function clearTaskGraph(sessionId?: string | null): void {
   }
 }
 
-export function selectTaskGraphTask(
+export function selectTaskProjectionTask(
   sessionId: string | null | undefined,
   taskId: string | null | undefined,
 ): void {
@@ -313,18 +327,5 @@ export function selectTaskGraphTask(
 }
 
 export function getTaskStatusModifier(status: TaskStatus): string {
-  switch (status) {
-    case 'Ready': return 'ready';
-    case 'Running': return 'running';
-    case 'Completed': return 'completed';
-    case 'Failed': return 'failed';
-    case 'Blocked': return 'blocked';
-    case 'Cancelled': return 'cancelled';
-    case 'Skipped': return 'skipped';
-    case 'Draft': return 'draft';
-    case 'AwaitingApproval': return 'awaiting-approval';
-    case 'Verifying': return 'verifying';
-    case 'Repairing': return 'repairing';
-    default: return 'unknown';
-  }
+  return status;
 }

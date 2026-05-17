@@ -130,8 +130,7 @@ impl KnowledgeGraphStore {
         magi_home: &Path,
         workspace_root: &WorkspaceRootPath,
     ) -> Result<Self, KnowledgeGraphError> {
-        let slug = workspace_slug(workspace_root.as_str());
-        let root = magi_home.join("projects").join(slug).join("missions");
+        let root = magi_core::paths::missions_root(magi_home, workspace_root);
         fs::create_dir_all(&root).map_err(|source| KnowledgeGraphError::Io {
             path: root.clone(),
             source,
@@ -515,15 +514,6 @@ fn dirs_home() -> Result<PathBuf, KnowledgeGraphError> {
         .map(PathBuf::from)
         .ok_or(KnowledgeGraphError::HomeDirUnavailable)?;
     Ok(base.join(".magi"))
-}
-
-fn workspace_slug(workspace_root: &str) -> String {
-    let trimmed = workspace_root.trim_start_matches('/').trim_end_matches('/');
-    if trimmed.is_empty() {
-        "root".to_string()
-    } else {
-        format!("-{}", trimmed.replace('/', "-"))
-    }
 }
 
 // ---------------------------------------------------------------------------

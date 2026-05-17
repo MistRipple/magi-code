@@ -1,7 +1,6 @@
 //! Task System v2 — 工具调用结果的状态/摘要标准化。
 //!
-//! 从 API 层平移到 conversation-runtime，让 runtime 内部的 writeback / round
-//! 实现可以直接访问。
+//! runtime 内部的 writeback / round 实现直接访问这些纯函数。
 
 use magi_core::ExecutionResultStatus;
 

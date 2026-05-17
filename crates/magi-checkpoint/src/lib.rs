@@ -18,7 +18,7 @@
 //! 单 mission 单文档，frontmatter 描述元信息，body 用 JSON-lines 记录每个 Checkpoint。
 //! 这样既可 grep / diff，又能 round-trip 无损——与同 Tier 的 ValidationReport / KG 同构。
 
-use magi_core::{MissionId, UtcMillis, WorkspaceRootPath};
+use magi_core::{MissionId, SessionId, UtcMillis, WorkspaceRootPath};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -66,22 +66,62 @@ impl CheckpointKind {
             _ => None,
         }
     }
+
+    /// 是否要求携带"最小恢复集"。`Manual` 是纯标签型快照，不强制；其它三种都是
+    /// 跨进程或跨上下文边界，必须把恢复路径写明，否则未来根本无法 resume。
+    /// 详见 docs/task-system-v2/03-open-questions.md §1.4。
+    pub fn requires_recovery_set(self) -> bool {
+        matches!(
+            self,
+            Self::ProcessRestart | Self::ContextCompaction | Self::PhaseTransition
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
 // ConversationCheckpoint / Checkpoint
 // ---------------------------------------------------------------------------
 
-/// 单个 Conversation 在 Checkpoint 时刻的游标。模型不需要看到内部结构，仅作恢复指针。
+/// 单个 Conversation 在 Checkpoint 时刻的恢复指针。模型只需要看到 session_id /
+/// recovery_ref 这两个真正用于"重启时找回 active chain"的字段。
+///
+/// `recovery_ref` 与 `execution_chain_ref` 至少要存在一个——否则进程重启后
+/// 没有任何线索能定位到 SessionRuntimeSidecar，符合 §1.4「恢复集不完整时必须显式失败」。
+/// `turn_cursor` 仅用于巡检（最后一个完成的 Turn 序号），不是恢复必需。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConversationCheckpoint {
-    pub conversation_id: String,
+    /// 被快照的 Session（= Conversation 标识）。
+    pub session_id: SessionId,
+    /// 指向 WorkspaceStore 中那条可 resume 的 recovery_id（来自 SessionRuntimeSidecar）。
+    /// 在 §1.4 中是"child result 仍能路由到 parent mailbox"的回放入口。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_ref: Option<String>,
+    /// 指向 ActiveExecutionChain 的 execution_chain_ref；与 recovery_ref 至少存其一。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_chain_ref: Option<String>,
     /// 最后一个完成的 Turn 序号（None 表示尚未起任何 Turn）。
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_cursor: Option<u64>,
-    /// 尚未消费的 mailbox 条目数；细节由各自 store 持有，这里只记数便于巡检。
+    /// 截至快照时尚未消费的 mailbox 条目数；用于巡检和事件审计，不参与恢复主流程。
     #[serde(default)]
     pub pending_mailbox: u32,
+}
+
+impl ConversationCheckpoint {
+    /// 该条 conversation 是否携带了至少一个可定位 SessionRuntimeSidecar 的指针。
+    pub fn has_recovery_pointer(&self) -> bool {
+        let has_recovery = self
+            .recovery_ref
+            .as_deref()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
+        let has_chain = self
+            .execution_chain_ref
+            .as_deref()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
+        has_recovery || has_chain
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -91,24 +131,84 @@ pub struct Checkpoint {
     pub mission_id: MissionId,
     pub kind: CheckpointKind,
     pub created_at: UtcMillis,
-    /// 可选的人类可读标签（"完成 UserService 迁移"）。
-    #[serde(default)]
+    /// 可选的人类可读标签（"完成 UserService 迁移"）。仅展示，不参与恢复。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
-    /// 指向 PlanStore 的当前 plan 版本号；None 表示快照时 Plan 尚未落盘。
-    #[serde(default)]
+    /// 指向 PlanStore 的当前 plan 版本号。属于「最小恢复集」，对于
+    /// `ProcessRestart / ContextCompaction / PhaseTransition` 必填。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_version: Option<u32>,
     /// 指向 KnowledgeGraphStore 的当前 fact_count（轻量指针，不复制全图）。
-    #[serde(default)]
+    /// 当前作为审计指标保留，未列入强制恢复集。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kg_fact_count: Option<u32>,
-    /// 工作目录 git commit SHA。None 表示未受 git 跟踪。
-    #[serde(default)]
+    /// 工作目录 git commit SHA。属于「最小恢复集」：恢复时需要把工作树
+    /// 重新固定到这个 commit 才能保证后续 Plan step 引用的文件路径一致。
+    /// `Manual` kind 不强制；其它三种 kind 必须非空。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_commit: Option<String>,
-    /// 此 Checkpoint 时活跃的 Conversation 游标列表。
+    /// 此 Checkpoint 时活跃的 Conversation 游标列表。空列表表示"快照时无活跃
+    /// execution chain"——对恢复相关 kind 仍是合法的（mission 可能正卡在
+    /// HumanCheckpoint 上），但任何**存在**的 conversation 都必须携带至少一个
+    /// recovery_ref / execution_chain_ref 指针，否则视为恢复集不完整。
     #[serde(default)]
     pub open_conversations: Vec<ConversationCheckpoint>,
     /// 自由文本备注（限制 1024 字符以内由调用方约束）。
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
+}
+
+impl Checkpoint {
+    /// 按 §1.4 规则校验"最小恢复集"完整性。返回 `Ok(())` 表示该 Checkpoint
+    /// 真正具备 resume 能力；返回 `Err(reason)` 时调用方应拒绝落盘。
+    ///
+    /// 规则：
+    /// - `Manual` kind 不要求恢复集，恒返回 `Ok(())`。
+    /// - 其它 kind：
+    ///   - `workspace_commit` 必须非空（恢复时需要把工作树固定到这个 commit）。
+    ///   - 任何**存在**的 `open_conversations` 元素必须携带 `recovery_ref` 或
+    ///     `execution_chain_ref` 至少其一；空 `open_conversations` 视为"快照时
+    ///     mission 无活跃 chain"，合法。
+    pub fn recovery_set_status(&self) -> Result<(), MissingRecoverySetReason> {
+        if !self.kind.requires_recovery_set() {
+            return Ok(());
+        }
+        match self.workspace_commit.as_deref().map(str::trim) {
+            Some(s) if !s.is_empty() => {}
+            _ => return Err(MissingRecoverySetReason::WorkspaceCommitMissing),
+        }
+        for conv in &self.open_conversations {
+            if !conv.has_recovery_pointer() {
+                return Err(MissingRecoverySetReason::ConversationPointerMissing {
+                    session_id: conv.session_id.as_str().to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// 描述「最小恢复集」缺哪一块——错误信息要可以直接交给上游展示，不依赖外部上下文。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MissingRecoverySetReason {
+    /// 没有 workspace_commit 指针；恢复时无法固定工作树状态。
+    WorkspaceCommitMissing,
+    /// 某条 open_conversations 既没有 recovery_ref 也没有 execution_chain_ref。
+    ConversationPointerMissing { session_id: String },
+}
+
+impl std::fmt::Display for MissingRecoverySetReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WorkspaceCommitMissing => {
+                write!(f, "workspace_commit 缺失，跨进程恢复无法定位工作树状态")
+            }
+            Self::ConversationPointerMissing { session_id } => write!(
+                f,
+                "open_conversations[session_id={session_id}] 缺少 recovery_ref / execution_chain_ref，恢复时无法定位 sidecar"
+            ),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -151,6 +251,15 @@ pub enum CheckpointError {
     HomeDirUnavailable,
     #[error("checkpoint 数据缺失或非法：{reason}")]
     InvalidRecord { reason: String },
+    /// §1.4「恢复集不完整时必须显式失败」：试图把恢复关键 kind
+    /// （process_restart / context_compaction / phase_transition）的 checkpoint
+    /// 落盘，但 workspace_commit / 每条 open_conversation 的 recovery_ref|chain_ref
+    /// 至少缺一项。决不静默吞掉，否则未来恢复时会跑到一个"无法 resume"的死点。
+    #[error("checkpoint 恢复集不完整 (kind={kind}): {reason}")]
+    IncompleteRecoverySet {
+        kind: &'static str,
+        reason: MissingRecoverySetReason,
+    },
     #[error("checkpoint IO 失败 (path={path}): {source}")]
     Io {
         path: PathBuf,
@@ -177,8 +286,7 @@ impl CheckpointStore {
         magi_home: &Path,
         workspace_root: &WorkspaceRootPath,
     ) -> Result<Self, CheckpointError> {
-        let slug = workspace_slug(workspace_root.as_str());
-        let root = magi_home.join("projects").join(slug).join("missions");
+        let root = magi_core::paths::missions_root(magi_home, workspace_root);
         fs::create_dir_all(&root).map_err(|source| CheckpointError::Io {
             path: root.clone(),
             source,
@@ -398,13 +506,13 @@ pub fn parse_checkpoint_create_arguments(
                 .ok_or_else(|| CheckpointError::InvalidRecord {
                     reason: "open_conversations 元素必须为对象".to_string(),
                 })?;
-            let conversation_id = conv_obj
-                .get("conversation_id")
+            let session_id = conv_obj
+                .get("session_id")
                 .and_then(|v| v.as_str())
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| CheckpointError::InvalidRecord {
-                    reason: "open_conversations[].conversation_id 缺失或为空".to_string(),
+                    reason: "open_conversations[].session_id 缺失或为空".to_string(),
                 })?;
             let turn_cursor = conv_obj.get("turn_cursor").and_then(|v| v.as_u64());
             let pending_mailbox = conv_obj
@@ -412,8 +520,20 @@ pub fn parse_checkpoint_create_arguments(
                 .and_then(|v| v.as_u64())
                 .map(|v| u32::try_from(v).unwrap_or(u32::MAX))
                 .unwrap_or(0);
+            let recovery_ref = conv_obj
+                .get("recovery_ref")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let execution_chain_ref = conv_obj
+                .get("execution_chain_ref")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
             open_conversations.push(ConversationCheckpoint {
-                conversation_id,
+                session_id: SessionId::new(session_id),
+                recovery_ref,
+                execution_chain_ref,
                 turn_cursor,
                 pending_mailbox,
             });
@@ -431,14 +551,20 @@ pub fn parse_checkpoint_create_arguments(
     })
 }
 
-/// 把一次 Checkpoint 创建参数 append 到 log；序号自动递增。返回新建的 Checkpoint 序号。
+/// 把一次 Checkpoint 创建参数 append 到 log；序号自动递增。
+///
+/// 在 append 之前会先按 §1.4 校验「最小恢复集」：对于
+/// `process_restart / context_compaction / phase_transition` 这三种跨边界 kind，
+/// `workspace_commit` 必须非空，任何 `open_conversations` 元素必须携带 `recovery_ref`
+/// 或 `execution_chain_ref` 至少其一；否则直接返回 `IncompleteRecoverySet`，**不会**
+/// 把不完整记录写进 log。`Manual` kind 不受此约束。
 pub fn append_checkpoint(
     log: &mut CheckpointLog,
     args: CheckpointCreateArgs,
     now: UtcMillis,
-) -> u32 {
+) -> Result<u32, CheckpointError> {
     let sequence = log.next_sequence();
-    log.checkpoints.push(Checkpoint {
+    let candidate = Checkpoint {
         sequence,
         mission_id: log.mission_id.clone(),
         kind: args.kind,
@@ -449,9 +575,16 @@ pub fn append_checkpoint(
         workspace_commit: args.workspace_commit,
         open_conversations: args.open_conversations,
         notes: args.notes,
-    });
+    };
+    if let Err(reason) = candidate.recovery_set_status() {
+        return Err(CheckpointError::IncompleteRecoverySet {
+            kind: candidate.kind.as_str(),
+            reason,
+        });
+    }
+    log.checkpoints.push(candidate);
     log.updated_at = now;
-    sequence
+    Ok(sequence)
 }
 
 // ---------------------------------------------------------------------------
@@ -552,15 +685,6 @@ fn dirs_home() -> Result<PathBuf, CheckpointError> {
     Ok(base.join(".magi"))
 }
 
-fn workspace_slug(workspace_root: &str) -> String {
-    let trimmed = workspace_root.trim_start_matches('/').trim_end_matches('/');
-    if trimmed.is_empty() {
-        "root".to_string()
-    } else {
-        format!("-{}", trimmed.replace('/', "-"))
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Orchestration tool entry：checkpoint_create
 // ---------------------------------------------------------------------------
@@ -638,7 +762,31 @@ pub fn execute_checkpoint_create_tool(
     };
     let kind = args.kind;
     let label_snapshot = args.label.clone();
-    let sequence = append_checkpoint(&mut log, args, now);
+    let sequence = match append_checkpoint(&mut log, args, now) {
+        Ok(seq) => seq,
+        Err(err @ CheckpointError::IncompleteRecoverySet { .. }) => {
+            return (
+                serde_json::json!({
+                    "tool": "checkpoint_create",
+                    "status": "failed",
+                    "error": err.to_string(),
+                })
+                .to_string(),
+                ExecutionResultStatus::Failed,
+            );
+        }
+        Err(err) => {
+            return (
+                serde_json::json!({
+                    "tool": "checkpoint_create",
+                    "status": "failed",
+                    "error": err.to_string(),
+                })
+                .to_string(),
+                ExecutionResultStatus::Failed,
+            );
+        }
+    };
     if let Err(err) = store.save(&log) {
         return (
             serde_json::json!({
@@ -697,22 +845,33 @@ mod tests {
         MissionId::new("mission-checkpoint-test".to_string())
     }
 
+    fn full_recovery_args(kind: CheckpointKind) -> CheckpointCreateArgs {
+        CheckpointCreateArgs {
+            kind,
+            label: Some("phase 1 done".to_string()),
+            plan_version: Some(1),
+            kg_fact_count: Some(3),
+            workspace_commit: Some("abc123".to_string()),
+            open_conversations: vec![ConversationCheckpoint {
+                session_id: SessionId::new("session-A"),
+                recovery_ref: Some("rec-A".to_string()),
+                execution_chain_ref: Some("chain-A".to_string()),
+                turn_cursor: Some(7),
+                pending_mailbox: 2,
+            }],
+            notes: None,
+        }
+    }
+
     #[test]
-    fn append_assigns_monotonic_sequence() {
+    fn append_assigns_monotonic_sequence_when_recovery_set_complete() {
         let mut log = CheckpointLog::new(mission(), UtcMillis(1000));
         let s1 = append_checkpoint(
             &mut log,
-            CheckpointCreateArgs {
-                kind: CheckpointKind::PhaseTransition,
-                label: Some("phase 1 done".to_string()),
-                plan_version: Some(1),
-                kg_fact_count: Some(3),
-                workspace_commit: Some("abc123".to_string()),
-                open_conversations: Vec::new(),
-                notes: None,
-            },
+            full_recovery_args(CheckpointKind::PhaseTransition),
             UtcMillis(1100),
-        );
+        )
+        .expect("完整恢复集应通过");
         let s2 = append_checkpoint(
             &mut log,
             CheckpointCreateArgs {
@@ -722,14 +881,18 @@ mod tests {
                 kg_fact_count: Some(5),
                 workspace_commit: None,
                 open_conversations: vec![ConversationCheckpoint {
-                    conversation_id: "conv-x".to_string(),
+                    // Manual kind 不强制 recovery_ref/execution_chain_ref。
+                    session_id: SessionId::new("conv-x"),
+                    recovery_ref: None,
+                    execution_chain_ref: None,
                     turn_cursor: Some(7),
                     pending_mailbox: 2,
                 }],
                 notes: Some("backup".to_string()),
             },
             UtcMillis(1200),
-        );
+        )
+        .expect("Manual kind 无恢复集约束");
         assert_eq!(s1, 1);
         assert_eq!(s2, 2);
         assert_eq!(log.checkpoints.len(), 2);
@@ -738,7 +901,88 @@ mod tests {
     }
 
     #[test]
-    fn parse_args_validates_required_fields() {
+    fn append_rejects_recovery_kind_without_workspace_commit() {
+        let mut log = CheckpointLog::new(mission(), UtcMillis(0));
+        let err = append_checkpoint(
+            &mut log,
+            CheckpointCreateArgs {
+                kind: CheckpointKind::ProcessRestart,
+                label: None,
+                plan_version: None,
+                kg_fact_count: None,
+                workspace_commit: None, // 这里缺失，必然失败
+                open_conversations: Vec::new(),
+                notes: None,
+            },
+            UtcMillis(1),
+        )
+        .expect_err("workspace_commit 缺失必须显式失败");
+        match err {
+            CheckpointError::IncompleteRecoverySet { kind, reason } => {
+                assert_eq!(kind, "process_restart");
+                assert_eq!(reason, MissingRecoverySetReason::WorkspaceCommitMissing);
+            }
+            other => panic!("意外错误：{other}"),
+        }
+        assert!(log.checkpoints.is_empty(), "失败时不得污染 log");
+    }
+
+    #[test]
+    fn append_rejects_conversation_without_recovery_pointer() {
+        let mut log = CheckpointLog::new(mission(), UtcMillis(0));
+        let err = append_checkpoint(
+            &mut log,
+            CheckpointCreateArgs {
+                kind: CheckpointKind::ContextCompaction,
+                label: None,
+                plan_version: Some(3),
+                kg_fact_count: None,
+                workspace_commit: Some("commit".to_string()),
+                open_conversations: vec![ConversationCheckpoint {
+                    session_id: SessionId::new("s1"),
+                    recovery_ref: None,
+                    execution_chain_ref: None,
+                    turn_cursor: None,
+                    pending_mailbox: 0,
+                }],
+                notes: None,
+            },
+            UtcMillis(1),
+        )
+        .expect_err("缺 recovery_ref + execution_chain_ref 必须显式失败");
+        match err {
+            CheckpointError::IncompleteRecoverySet {
+                reason: MissingRecoverySetReason::ConversationPointerMissing { session_id },
+                ..
+            } => assert_eq!(session_id, "s1"),
+            other => panic!("意外错误：{other}"),
+        }
+        assert!(log.checkpoints.is_empty());
+    }
+
+    #[test]
+    fn append_recovery_kind_with_empty_conversations_is_allowed_when_commit_present() {
+        let mut log = CheckpointLog::new(mission(), UtcMillis(0));
+        // mission 可能正卡在 HumanCheckpoint 上：没有活跃 chain，但需要快照工作树状态。
+        let seq = append_checkpoint(
+            &mut log,
+            CheckpointCreateArgs {
+                kind: CheckpointKind::PhaseTransition,
+                label: None,
+                plan_version: Some(1),
+                kg_fact_count: None,
+                workspace_commit: Some("sha".to_string()),
+                open_conversations: Vec::new(),
+                notes: None,
+            },
+            UtcMillis(1),
+        )
+        .expect("空 open_conversations 仅在有 workspace_commit 时合法");
+        assert_eq!(seq, 1);
+    }
+
+    #[test]
+    fn parse_args_validates_required_fields_and_pointers() {
         let err = parse_checkpoint_create_arguments(&serde_json::json!({}))
             .expect_err("缺 kind 必须报错");
         assert!(matches!(err, CheckpointError::InvalidRecord { .. }));
@@ -754,7 +998,9 @@ mod tests {
             "kg_fact_count": 12,
             "workspace_commit": "deadbeef",
             "open_conversations": [{
-                "conversation_id": "conv-A",
+                "session_id": "session-A",
+                "recovery_ref": "rec-X",
+                "execution_chain_ref": "chain-Y",
                 "turn_cursor": 9,
                 "pending_mailbox": 1
             }],
@@ -767,23 +1013,28 @@ mod tests {
         assert_eq!(ok.kg_fact_count, Some(12));
         assert_eq!(ok.workspace_commit.as_deref(), Some("deadbeef"));
         assert_eq!(ok.open_conversations.len(), 1);
-        assert_eq!(ok.open_conversations[0].conversation_id, "conv-A");
+        assert_eq!(ok.open_conversations[0].session_id.as_str(), "session-A");
+        assert_eq!(ok.open_conversations[0].recovery_ref.as_deref(), Some("rec-X"));
+        assert_eq!(
+            ok.open_conversations[0].execution_chain_ref.as_deref(),
+            Some("chain-Y")
+        );
         assert_eq!(ok.open_conversations[0].turn_cursor, Some(9));
         assert_eq!(ok.notes.as_deref(), Some("saved before resume"));
     }
 
     #[test]
-    fn parse_args_rejects_open_conversation_without_id() {
+    fn parse_args_rejects_open_conversation_without_session_id() {
         let err = parse_checkpoint_create_arguments(&serde_json::json!({
             "kind": "manual",
             "open_conversations": [{"turn_cursor": 1}]
         }))
-        .expect_err("缺 conversation_id 必须报错");
+        .expect_err("缺 session_id 必须报错");
         assert!(matches!(err, CheckpointError::InvalidRecord { .. }));
     }
 
     #[test]
-    fn render_and_parse_round_trip() {
+    fn render_and_parse_round_trip_preserves_pointers() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let ws_root = WorkspaceRootPath::new(tmp.path().to_string_lossy().to_string());
         let store = CheckpointStore::open_with_home(tmp.path(), &ws_root).expect("open store");
@@ -797,14 +1048,17 @@ mod tests {
                 kg_fact_count: Some(3),
                 workspace_commit: Some("abc123".to_string()),
                 open_conversations: vec![ConversationCheckpoint {
-                    conversation_id: "conv-1".to_string(),
+                    session_id: SessionId::new("conv-1"),
+                    recovery_ref: Some("rec-1".to_string()),
+                    execution_chain_ref: None,
                     turn_cursor: Some(5),
                     pending_mailbox: 0,
                 }],
                 notes: None,
             },
             UtcMillis(10),
-        );
+        )
+        .expect("append 1");
         append_checkpoint(
             &mut log,
             CheckpointCreateArgs {
@@ -812,15 +1066,19 @@ mod tests {
                 label: None,
                 plan_version: Some(1),
                 kg_fact_count: Some(5),
-                workspace_commit: None,
+                workspace_commit: Some("def456".to_string()),
                 open_conversations: Vec::new(),
                 notes: Some("compaction before turn 100".to_string()),
             },
             UtcMillis(20),
-        );
+        )
+        .expect("append 2");
         store.save(&log).expect("save");
         let reloaded = store.load(&mission()).expect("load").expect("log saved");
         assert_eq!(reloaded, log);
+        let conv0 = &reloaded.checkpoints[0].open_conversations[0];
+        assert_eq!(conv0.session_id.as_str(), "conv-1");
+        assert_eq!(conv0.recovery_ref.as_deref(), Some("rec-1"));
     }
 
     #[test]
@@ -838,6 +1096,7 @@ mod tests {
 
         let mut log = CheckpointLog::new(mission(), UtcMillis(0));
         for i in 0..8 {
+            // 使用 Manual kind 避免恢复集校验对纯展示场景造成干扰。
             append_checkpoint(
                 &mut log,
                 CheckpointCreateArgs {
@@ -850,7 +1109,8 @@ mod tests {
                     notes: None,
                 },
                 UtcMillis(i as u64 * 10 + 1),
-            );
+            )
+            .expect("Manual append 不受恢复集约束");
         }
         store.save(&log).expect("save");
         let rendered = store

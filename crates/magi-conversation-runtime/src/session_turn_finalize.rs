@@ -1,9 +1,7 @@
-//! Task System v2 — M17a2：session turn 终态收尾 (finalize / reconcile) 从
-//! magi-api/task_execution.rs 下沉到 conversation-runtime。
+//! Task System v2 — session turn 终态收尾 (finalize / reconcile)。
 //!
-//! 公开 API 全部使用显式依赖参数（`&SessionStore`、`&InMemoryEventBus`、
-//! `Option<&TaskStore>`），不再耦合 ApiState。magi-api 侧保留薄壳从 `ApiState`
-//! 中取这三项后转发，外部 import 路径通过 `pub use` 重导出维持不变。
+//! 公开 API 使用显式依赖参数（`&SessionStore`、`&InMemoryEventBus`、`Option<&TaskStore>`），
+//! 不再耦合 ApiState。magi-api 侧保留薄壳转发。
 
 use magi_core::{
     EventId, SessionId, Task, TaskId, TaskKind, TaskStatus, ThreadId, UtcMillis, WorkspaceId,
@@ -23,32 +21,21 @@ const ROOT_COMPLETION_SUMMARY_MAX_CHARS: usize = 2400;
 
 pub fn turn_item_status_for_task_status(status: TaskStatus) -> &'static str {
     match status {
-        TaskStatus::Draft => "pending",
-        TaskStatus::Ready
-        | TaskStatus::Running
-        | TaskStatus::AwaitingApproval
-        | TaskStatus::Blocked
-        | TaskStatus::Verifying
-        | TaskStatus::Repairing => "running",
+        TaskStatus::Pending => "pending",
+        TaskStatus::Running => "running",
         TaskStatus::Completed => "completed",
         TaskStatus::Failed => "failed",
-        TaskStatus::Cancelled | TaskStatus::Skipped => "cancelled",
+        TaskStatus::Killed => "killed",
     }
 }
 
 pub fn task_status_text(status: TaskStatus) -> &'static str {
     match status {
-        TaskStatus::Draft => "draft",
-        TaskStatus::Ready => "ready",
+        TaskStatus::Pending => "pending",
         TaskStatus::Running => "running",
-        TaskStatus::AwaitingApproval => "awaiting_approval",
-        TaskStatus::Blocked => "blocked",
-        TaskStatus::Verifying => "verifying",
-        TaskStatus::Repairing => "repairing",
         TaskStatus::Completed => "completed",
         TaskStatus::Failed => "failed",
-        TaskStatus::Cancelled => "cancelled",
-        TaskStatus::Skipped => "skipped",
+        TaskStatus::Killed => "killed",
     }
 }
 
@@ -232,12 +219,12 @@ pub fn compact_root_completion_summary(text: &str) -> String {
 
 pub fn completion_summary_rank(task: &Task) -> u8 {
     match task.kind {
-        TaskKind::Action => 5,
-        TaskKind::Repair => 4,
-        TaskKind::WorkPackage | TaskKind::Phase => 3,
-        TaskKind::Validation => 2,
-        TaskKind::Objective => 1,
-        TaskKind::Decision => 0,
+        TaskKind::LocalAgent => 5,
+        TaskKind::LocalWorkflow => 4,
+        TaskKind::LocalBash => 3,
+        TaskKind::RemoteAgent => 2,
+        TaskKind::MonitorMcp | TaskKind::InProcessTeammate => 1,
+        TaskKind::Dream => 0,
     }
 }
 
@@ -604,12 +591,10 @@ pub fn finalize_background_session_task_turn_if_root_terminal(
     };
     let (turn_status, message) = match root_task.status {
         TaskStatus::Failed => ("failed", "任务执行失败，未生成最终回复。"),
-        TaskStatus::Blocked => ("blocked", "任务执行需要处理，等待进一步操作。"),
-        TaskStatus::Cancelled => ("cancelled", "任务执行已取消。"),
+        TaskStatus::Killed => ("killed", "任务执行已终止。"),
         _ if runner_status == "error" => ("failed", "任务执行异常，未生成最终回复。"),
-        _ if runner_status == "blocked" => ("blocked", "任务执行需要处理，等待进一步操作。"),
-        _ if runner_status == "stopped" || runner_status == "cancelled" => {
-            ("cancelled", "任务执行已取消。")
+        _ if runner_status == "stopped" || runner_status == "killed" => {
+            ("killed", "任务执行已终止。")
         }
         _ => return false,
     };
@@ -746,8 +731,7 @@ pub fn runner_status_for_terminal_task(status: TaskStatus) -> Option<&'static st
     match status {
         TaskStatus::Completed => Some("completed"),
         TaskStatus::Failed => Some("error"),
-        TaskStatus::Blocked => Some("blocked"),
-        TaskStatus::Cancelled => Some("cancelled"),
+        TaskStatus::Killed => Some("killed"),
         _ => None,
     }
 }

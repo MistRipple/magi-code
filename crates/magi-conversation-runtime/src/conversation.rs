@@ -1,7 +1,7 @@
 use magi_core::SessionId;
 
 use crate::driver::{RoundOutcome, TurnDriver};
-use crate::mailbox::{Mailbox, MailboxItem, UserSignal};
+use crate::mailbox::{Mailbox, MailboxItem, RuntimeSignal, UserSignal};
 use crate::turn::{Turn, TurnState, TurnTransitionError};
 
 /// 一个 Conversation 绑定一个 SessionId 与其 Mailbox + 当前 Turn 槽位。
@@ -56,9 +56,20 @@ impl Conversation {
         self.mailbox.push(MailboxItem::user(signal));
     }
 
+    /// 推入运行时信号。父子代理回执、Coordinator 指令、系统 followup 等都通过
+    /// Mailbox 进入下一次 Turn，而不是绕到事件总线里当作隐式业务通道。
+    pub fn ingest_runtime_signal(&mut self, signal: RuntimeSignal) {
+        self.mailbox.push(MailboxItem::runtime(signal));
+    }
+
     /// 取出并消费 mailbox 中累积的 user 信号。
     pub fn drain_user_signals(&mut self) -> Vec<UserSignal> {
         self.mailbox.drain_user_signals()
+    }
+
+    /// Turn 边界的完整消费入口。driver 会把这批待处理信号注入下一轮 prompt。
+    pub fn drain_mailbox_items(&mut self) -> Vec<MailboxItem> {
+        self.mailbox.drain_all()
     }
 
     /// 开启一个新的 Turn——违反"同 Conversation 不并发"不变式时返回错误。
@@ -116,6 +127,7 @@ impl Conversation {
         D: TurnDriver,
     {
         self.begin_turn().map_err(AdvanceTurnError::Begin)?;
+        driver.accept_mailbox_items(self.drain_mailbox_items());
 
         if let Some(outcome) = driver.deterministic_shortcut() {
             // deterministic 路径：不进入 modeling，直接 done。
@@ -414,5 +426,56 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn advance_turn_passes_mailbox_items_to_driver() {
+        struct CapturingDriver {
+            captured_len: usize,
+        }
+
+        impl crate::driver::TurnDriver for CapturingDriver {
+            type Outcome = usize;
+
+            fn round_limit(&self) -> usize {
+                1
+            }
+
+            fn accept_mailbox_items(&mut self, items: Vec<MailboxItem>) {
+                self.captured_len = items.len();
+            }
+
+            fn execute_round(&mut self, _round: usize) -> RoundOutcome {
+                RoundOutcome::Done
+            }
+
+            fn finalize_success(self) -> Self::Outcome {
+                self.captured_len
+            }
+
+            fn finalize_round_failure(self, _reason: String) -> Self::Outcome {
+                self.captured_len
+            }
+
+            fn finalize_exhausted(self) -> Self::Outcome {
+                self.captured_len
+            }
+        }
+
+        let mut conv = Conversation::new(SessionId::new("s-mailbox"));
+        conv.ingest_user_signal(sample_signal("hello"));
+        conv.ingest_runtime_signal(RuntimeSignal {
+            author: crate::mailbox::MailboxAuthor::System,
+            kind: crate::mailbox::MailboxKind::Followup,
+            trigger_turn: true,
+            payload: serde_json::json!({"note": "wake"}),
+            enqueued_at: UtcMillis(2),
+        });
+
+        let outcome = conv
+            .advance_turn(CapturingDriver { captured_len: 0 })
+            .unwrap();
+        assert_eq!(outcome, 2);
+        assert!(conv.drain_mailbox_items().is_empty());
     }
 }

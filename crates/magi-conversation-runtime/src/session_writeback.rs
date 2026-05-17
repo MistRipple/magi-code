@@ -512,17 +512,11 @@ fn task_role_id(task_store: Option<&TaskStore>, task_id: &TaskId) -> Option<Stri
 
 fn task_status_label(status: &TaskStatus) -> &'static str {
     match status {
-        TaskStatus::Draft => "draft",
-        TaskStatus::Ready => "ready",
+        TaskStatus::Pending => "pending",
         TaskStatus::Running => "running",
-        TaskStatus::AwaitingApproval => "awaiting_approval",
         TaskStatus::Completed => "completed",
         TaskStatus::Failed => "failed",
-        TaskStatus::Cancelled => "cancelled",
-        TaskStatus::Blocked => "blocked",
-        TaskStatus::Verifying => "verifying",
-        TaskStatus::Repairing => "repairing",
-        TaskStatus::Skipped => "skipped",
+        TaskStatus::Killed => "killed",
     }
 }
 
@@ -695,7 +689,7 @@ pub fn append_session_tool_call_items_batch(
 
 /// 从 tool_call 参数推断可能被改写的路径，供 SnapshotSession 的 after_tool 强制拍后态。
 /// 覆盖 canonical 文件工具（file_write / file_patch / file_remove / file_mkdir）和 shell 工具（changed_paths）。
-/// 无法可靠推断时返回空 Vec，由 ChangeLog 的全树对账兜底。
+/// 无法可靠推断时返回空 Vec，由 ChangeLog 的全树对账补齐。
 fn derive_declared_paths(tool_call: &ChatToolCall) -> Vec<PathBuf> {
     let Ok(arguments) = serde_json::from_str::<Value>(&tool_call.function.arguments) else {
         return Vec::new();
@@ -1387,7 +1381,7 @@ mod tests {
             mission_id: MissionId::new("mission-worker-lane-authority"),
             root_task_id: task_id.clone(),
             parent_task_id: None,
-            kind: TaskKind::Action,
+            kind: TaskKind::LocalAgent,
             title: "权威任务状态".to_string(),
             goal: "验证 worker lane 状态来源".to_string(),
             status: TaskStatus::Running,
@@ -1401,7 +1395,6 @@ mod tests {
                 "exclusive_scope": null,
                 "worker_selector": null,
             })),
-            context_refs: Vec::new(),
             knowledge_refs: Vec::new(),
             workspace_scope: None,
             write_scope: None,
@@ -1409,9 +1402,7 @@ mod tests {
             output_refs: Vec::new(),
             evidence_refs: Vec::new(),
             retry_count: 0,
-            repair_count: 0,
-            decision_payload: None,
-            variant: magi_core::TaskVariant::default(),
+            runtime_payload: magi_core::TaskRuntimePayload::default(),
             created_at: now,
             updated_at: now,
         });

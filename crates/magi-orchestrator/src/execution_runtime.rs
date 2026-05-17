@@ -300,7 +300,7 @@ impl OrchestratedExecutionRuntime {
             self.build_context_summary_for_dispatch(&target, &session_id, &workspace_id);
         let overview = self
             .service
-            .build_execution_overview_from_task_graph(
+            .build_execution_overview_from_task_projection(
                 &self.task_store,
                 &target,
                 self.worker_runtime.summary(),
@@ -345,8 +345,8 @@ impl OrchestratedExecutionRuntime {
         let next_status = match report.termination_reason {
             Some(magi_core::TerminationReason::Completed) => TaskStatus::Completed,
             Some(magi_core::TerminationReason::Failed) => TaskStatus::Failed,
-            Some(magi_core::TerminationReason::Blocked) => TaskStatus::Blocked,
-            Some(magi_core::TerminationReason::Cancelled) => TaskStatus::Cancelled,
+            Some(magi_core::TerminationReason::Blocked) => TaskStatus::Failed,
+            Some(magi_core::TerminationReason::Cancelled) => TaskStatus::Killed,
             None => match report.stage {
                 WorkerStage::Execute
                 | WorkerStage::Review

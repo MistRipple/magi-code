@@ -1,23 +1,18 @@
 //! Task System v2 - Conversation Runtime
 //!
-//! 提供 Mailbox 作为 user 信号进入任务系统的**单一通道**，
+//! 提供 Mailbox 作为 user 信号进入任务系统的单一通道，
 //! Conversation 绑定 SessionId、Mailbox 与当前 Turn 槽位，
-//! Turn 状态机刻画"一轮 user → assistant"的推进契约。
-//!
-//! 已交付 slice：
-//! - S1：Mailbox + Conversation 骨架（user 信号入栈姿势）
-//! - S2：Turn 状态机 + 单 Conversation 不并发不变式（v2 拥有 Turn lifecycle，
-//!   旧式单体调度逻辑已下沉为 runtime 内部 driver）
+//! Turn 状态机刻画一轮 user → assistant 的推进契约。
 
 #![recursion_limit = "256"]
 
 mod builtin_tool_schema;
 mod conversation;
+pub mod conversation_loop;
 pub mod dispatch_submission;
 mod driver;
 pub mod execution_chain_recovery;
 mod mailbox;
-pub mod mission_decomposition;
 pub mod model_config;
 pub mod prompt_utils;
 mod registry;
@@ -30,10 +25,7 @@ mod skill_apply_tool;
 mod stream;
 pub mod task_execution_dispatcher;
 pub mod task_execution_registry;
-pub mod task_graph_builder;
-pub mod task_graph_replan;
 pub mod task_helpers;
-pub mod task_llm_loop;
 pub mod task_runner_bridge;
 pub mod task_runner_v2;
 pub mod tool_batch;
@@ -46,7 +38,7 @@ pub use builtin_tool_schema::{
 };
 pub use conversation::{AdvanceTurnError, BeginTurnError, Conversation, TurnAdvanceError};
 pub use driver::{RoundOutcome, TurnDriver};
-pub use mailbox::{MailboxItem, UserSignal};
+pub use mailbox::{MailboxAuthor, MailboxItem, MailboxKind, RuntimeSignal, UserSignal};
 pub use registry::ConversationRegistry;
 pub use skill_apply_tool::{
     SKILL_APPLY_TOOL_NAME, execute_skill_apply_from_runtime, skill_apply_tool_definition,

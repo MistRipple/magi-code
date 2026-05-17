@@ -30,14 +30,14 @@ pub struct SessionTurnRequestDto {
     pub user_message_id: Option<String>,
     #[serde(alias = "placeholder_message_id")]
     pub placeholder_message_id: Option<String>,
-    /// 当为 true 时，本次 turn 直接作为补充上下文写入当前任务，
+    /// 当为 true 时，本次输入直接作为运行时 followup 信号投递到目标任务 Mailbox，
     /// 不进入分类器，也不创建新任务。
     #[serde(default, alias = "supplement_context")]
     pub supplement_context: bool,
-    /// 当 `supplement_context` 为 true 时，可选指定写入哪个上下文任务；
-    /// 缺省回退到当前 mission 的 root task。
-    #[serde(default, alias = "context_task_id")]
-    pub context_task_id: Option<String>,
+    /// 当 `supplement_context` 为 true 时，可选指定投递到哪个任务；
+    /// 缺省投递到当前 mission 的 root task。
+    #[serde(default, alias = "target_task_id")]
+    pub target_task_id: Option<String>,
 }
 
 impl SessionTurnRequestDto {
@@ -131,12 +131,12 @@ pub struct SessionTurnResponseDto {
     pub canonical_turn: Option<CanonicalTurn>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub canonical_item: Option<CanonicalTurnItem>,
-    /// 仅在 supplement_context 路由下返回：本次写入的上下文引用 ID。
+    /// 仅在 supplement_context 路由下返回：本次入栈的 mailbox signal ID。
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub context_ref: Option<String>,
-    /// 仅在 supplement_context 路由下返回：被写入的上下文任务 ID。
+    pub signal_ref: Option<String>,
+    /// 仅在 supplement_context 路由下返回：被投递的任务 ID。
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub context_task_id: Option<String>,
+    pub target_task_id: Option<String>,
 }
 
 impl SessionTurnResponseDto {
@@ -167,14 +167,14 @@ impl SessionTurnResponseDto {
             canonical_event_kind: None,
             canonical_turn: None,
             canonical_item: None,
-            context_ref: None,
-            context_task_id: None,
+            signal_ref: None,
+            target_task_id: None,
         }
     }
 
-    pub fn with_supplement_context(mut self, context_ref: String, context_task_id: String) -> Self {
-        self.context_ref = Some(context_ref);
-        self.context_task_id = Some(context_task_id);
+    pub fn with_supplement_signal(mut self, signal_ref: String, target_task_id: String) -> Self {
+        self.signal_ref = Some(signal_ref);
+        self.target_task_id = Some(target_task_id);
         self
     }
 
@@ -227,7 +227,7 @@ mod tests {
             user_message_id: None,
             placeholder_message_id: None,
             supplement_context: false,
-            context_task_id: None,
+            target_task_id: None,
         };
 
         assert_eq!(

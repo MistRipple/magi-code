@@ -1606,7 +1606,7 @@ export function setAppState(nextState: AppState | null) {
   }
 }
 
-// setMissionPlan removed — old Mission/Assignment incremental handlers superseded by Task Graph.
+// setMissionPlan removed — old Mission/Assignment incremental handlers superseded by Task Projection.
 
 // 防回抬冷却期（ms）：forced idle 后的短暂窗口内，拒绝任何来源的 processing=true
 const ANTI_LIFT_BACK_COOLDOWN_MS = 2000;

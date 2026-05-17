@@ -1,7 +1,7 @@
-//! Task System v2 — Tier 4 / L12 Plan：mission 的"执行计划"工件。
+//! Task System v2 — Tier 4 / L16 Plan：mission 的"执行计划"工件。
 //!
-//! Charter（L11）回答"为什么做、做到什么程度算完"；
-//! Plan（L12）回答"怎么走，每一步是什么状态"；
+//! Charter（L15）回答"为什么做、做到什么程度算完"；
+//! Plan（L16）回答"怎么走，每一步是什么状态"；
 //! TodoLedger（L13）回答"当前 session 内还要做哪些手头杂事"。
 //!
 //! 三者层级不同，互不重叠：
@@ -119,6 +119,13 @@ pub enum PlanError {
         #[source]
         source: io::Error,
     },
+    /// 不变式 7：step 标记为 completed 但 ValidationReport 没有对应 step 的 pass 记录。
+    /// 让模型必须先 `validation_record` 登记证据，再回头改 plan，避免“嘴说做完”。
+    #[error(
+        "step {step_id} 标记为 completed 但 validation report 没有 pass 记录；\
+        请先用 validation_record 工具登记验证证据后再标记完成"
+    )]
+    ValidationEvidenceMissing { step_id: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -139,8 +146,7 @@ impl PlanStore {
         magi_home: &Path,
         workspace_root: &WorkspaceRootPath,
     ) -> Result<Self, PlanError> {
-        let slug = workspace_slug(workspace_root.as_str());
-        let root = magi_home.join("projects").join(slug).join("missions");
+        let root = magi_core::paths::missions_root(magi_home, workspace_root);
         fs::create_dir_all(&root).map_err(|source| PlanError::Io {
             path: root.clone(),
             source,
@@ -394,7 +400,49 @@ pub fn parse_plan_write_arguments(raw: &serde_json::Value) -> Result<PlanWriteAr
 }
 
 /// 用 `plan_write` 入参整体替换 plan.steps。返回是否真正发生变化。
-pub fn apply_plan_update(plan: &mut Plan, args: PlanWriteArgs, now: UtcMillis) -> bool {
+///
+/// 不变式 7（"Plan completion 需要证据"）的运行时关口在此实现：
+/// - 当某个 step 在新版本里被首次标记为 `Completed`（旧版本不是 Completed）时，
+///   必须存在 `ValidationReport.step_is_passing(step.id) == true`，否则整笔
+///   plan 写入被拒绝，并返回 `PlanError::ValidationEvidenceMissing`。
+/// - 旧版本已经是 Completed 的步骤即使 `validation_report` 缺失也允许沿用，
+///   避免一次写入失败导致后续无法编辑同 plan 的其他字段。
+/// - `validation_report = None` 表示当前 mission 还没有任何验证记录，
+///   等同于"所有 step 都未通过验证"——所以本轮 plan_write 不能新增 Completed。
+pub fn apply_plan_update(
+    plan: &mut Plan,
+    args: PlanWriteArgs,
+    now: UtcMillis,
+    validation_report: Option<&magi_validation_runner::ValidationReport>,
+) -> Result<bool, PlanError> {
+    // 旧版本快照：用于判断"newly Completed"。
+    let prior_status: HashMap<String, PlanStepStatus> = plan
+        .steps
+        .iter()
+        .map(|s| (s.id.clone(), s.status))
+        .collect();
+
+    for step in &args.steps {
+        if step.status != PlanStepStatus::Completed {
+            continue;
+        }
+        let was_completed = matches!(
+            prior_status.get(&step.id),
+            Some(PlanStepStatus::Completed)
+        );
+        if was_completed {
+            continue;
+        }
+        let passing = validation_report
+            .map(|report| report.step_is_passing(&step.id))
+            .unwrap_or(false);
+        if !passing {
+            return Err(PlanError::ValidationEvidenceMissing {
+                step_id: step.id.clone(),
+            });
+        }
+    }
+
     let new_steps: Vec<PlanStep> = args
         .steps
         .into_iter()
@@ -407,11 +455,11 @@ pub fn apply_plan_update(plan: &mut Plan, args: PlanWriteArgs, now: UtcMillis) -
         })
         .collect();
     if plan.steps == new_steps {
-        return false;
+        return Ok(false);
     }
     plan.steps = new_steps;
     plan.updated_at = now;
-    true
+    Ok(true)
 }
 
 // ---------------------------------------------------------------------------
@@ -574,25 +622,20 @@ fn dirs_home() -> Result<PathBuf, PlanError> {
     Ok(base.join(".magi"))
 }
 
-fn workspace_slug(workspace_root: &str) -> String {
-    // 与 magi-project-memory / magi-mission-charter 共用 slug 策略：绝对路径 `/` → `-`。
-    let trimmed = workspace_root.trim_start_matches('/').trim_end_matches('/');
-    if trimmed.is_empty() {
-        "root".to_string()
-    } else {
-        format!("-{}", trimmed.replace('/', "-"))
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Tool entry：`plan_write` 工具执行体
 // ---------------------------------------------------------------------------
 
 /// S12 工具下沉：`plan_write` 完整执行体收口在本 crate。`store: None` 表示当前
 /// task 未绑定 workspace，直接失败。空 plan 自动创建后再 apply 更新。
+///
+/// 不变式 7 关口：`validation_store` 用于加载同 mission 的 `ValidationReport`，
+/// 任何把 step 首次标为 completed 的写入都要满足 `step_is_passing`，否则失败。
+/// `validation_store = None` 与 `store = None` 同样代表运行环境缺位，直接失败。
 pub fn execute_plan_write_tool(
     event_bus: &magi_event_bus::InMemoryEventBus,
     store: Option<&PlanStore>,
+    validation_store: Option<&magi_validation_runner::ValidationStore>,
     session_id: &magi_core::SessionId,
     workspace_id: Option<&magi_core::WorkspaceId>,
     task_id: &magi_core::TaskId,
@@ -607,6 +650,17 @@ pub fn execute_plan_write_tool(
                 "tool": "plan_write",
                 "status": "failed",
                 "error": "当前 task 未绑定 workspace，无法定位 mission plan 目录",
+            })
+            .to_string(),
+            ExecutionResultStatus::Failed,
+        );
+    };
+    let Some(validation_store) = validation_store else {
+        return (
+            serde_json::json!({
+                "tool": "plan_write",
+                "status": "failed",
+                "error": "当前 task 未绑定 workspace，无法定位 mission validation runner",
             })
             .to_string(),
             ExecutionResultStatus::Failed,
@@ -656,7 +710,47 @@ pub fn execute_plan_write_tool(
             );
         }
     };
-    let changed = apply_plan_update(&mut plan_doc, args, now);
+    let validation_report = match validation_store.load(mission_id) {
+        Ok(report) => report,
+        Err(err) => {
+            return (
+                serde_json::json!({
+                    "tool": "plan_write",
+                    "status": "failed",
+                    "error": format!("加载 validation report 失败：{err}"),
+                })
+                .to_string(),
+                ExecutionResultStatus::Failed,
+            );
+        }
+    };
+    let changed = match apply_plan_update(&mut plan_doc, args, now, validation_report.as_ref()) {
+        Ok(changed) => changed,
+        Err(err @ PlanError::ValidationEvidenceMissing { .. }) => {
+            // 这是不变式 7 的"软失败"——给模型清晰反馈，让它先去补 validation_record。
+            return (
+                serde_json::json!({
+                    "tool": "plan_write",
+                    "status": "failed",
+                    "error": err.to_string(),
+                    "hint": "先用 validation_record 工具登记 outcome=pass 后，再用 plan_write 把对应 step 标为 completed",
+                })
+                .to_string(),
+                ExecutionResultStatus::Failed,
+            );
+        }
+        Err(err) => {
+            return (
+                serde_json::json!({
+                    "tool": "plan_write",
+                    "status": "failed",
+                    "error": err.to_string(),
+                })
+                .to_string(),
+                ExecutionResultStatus::Failed,
+            );
+        }
+    };
     if let Err(err) = store.save(&plan_doc) {
         return (
             serde_json::json!({
@@ -827,7 +921,8 @@ mod tests {
             ]
         }))
         .expect("parse");
-        let changed = apply_plan_update(&mut plan, args, UtcMillis(200));
+        let changed = apply_plan_update(&mut plan, args, UtcMillis(200), None)
+            .expect("非 completed 转换不应走 validation 关口");
         assert!(changed);
         assert_eq!(plan.updated_at.0, 200);
         assert_eq!(plan.steps.len(), 1);
@@ -852,9 +947,108 @@ mod tests {
             "steps": [{ "id": "s1", "content": "x", "status": "pending" }]
         }))
         .expect("parse");
-        let changed = apply_plan_update(&mut plan, args, UtcMillis(200));
+        let changed = apply_plan_update(&mut plan, args, UtcMillis(200), None)
+            .expect("nop 路径不应触发 validation 关口");
         assert!(!changed);
         assert_eq!(plan.updated_at.0, 100);
+    }
+
+    #[test]
+    fn apply_plan_update_rejects_newly_completed_without_validation_evidence() {
+        use magi_validation_runner::ValidationReport;
+        let mut plan = Plan::new(mission(), UtcMillis(100));
+        let args = parse_plan_write_arguments(&serde_json::json!({
+            "steps": [{ "id": "s1", "content": "x", "status": "completed" }]
+        }))
+        .expect("parse");
+        // 没有 validation report：等同于无证据，必须拒绝把 s1 直接标 completed。
+        let err = apply_plan_update(&mut plan, args, UtcMillis(200), None)
+            .expect_err("缺证据必须拒写");
+        match err {
+            PlanError::ValidationEvidenceMissing { step_id } => assert_eq!(step_id, "s1"),
+            other => panic!("expected ValidationEvidenceMissing, got {other:?}"),
+        }
+        // plan 不应被修改。
+        assert!(plan.steps.is_empty());
+        assert_eq!(plan.updated_at.0, 100);
+
+        // 提供一份 report，但 s1 只有 fail 记录 → 仍要拒。
+        let mut report = ValidationReport::new(mission(), UtcMillis(150));
+        magi_validation_runner::apply_validation_record(
+            &mut report,
+            magi_validation_runner::ValidationRecordArgs {
+                plan_step_id: "s1".to_string(),
+                kind: magi_validation_runner::ValidationKind::TestSuite,
+                outcome: magi_validation_runner::ValidationOutcome::Fail,
+                command: None,
+                evidence: Some("regression".to_string()),
+            },
+            UtcMillis(160),
+        );
+        let args = parse_plan_write_arguments(&serde_json::json!({
+            "steps": [{ "id": "s1", "content": "x", "status": "completed" }]
+        }))
+        .expect("parse");
+        let err = apply_plan_update(&mut plan, args, UtcMillis(200), Some(&report))
+            .expect_err("仅 fail 记录不构成证据");
+        assert!(matches!(err, PlanError::ValidationEvidenceMissing { .. }));
+    }
+
+    #[test]
+    fn apply_plan_update_accepts_completion_with_passing_validation() {
+        use magi_validation_runner::ValidationReport;
+        let mut plan = Plan::new(mission(), UtcMillis(100));
+        let mut report = ValidationReport::new(mission(), UtcMillis(150));
+        magi_validation_runner::apply_validation_record(
+            &mut report,
+            magi_validation_runner::ValidationRecordArgs {
+                plan_step_id: "s1".to_string(),
+                kind: magi_validation_runner::ValidationKind::TestSuite,
+                outcome: magi_validation_runner::ValidationOutcome::Pass,
+                command: Some("cargo test".to_string()),
+                evidence: Some("16 passed".to_string()),
+            },
+            UtcMillis(160),
+        );
+        let args = parse_plan_write_arguments(&serde_json::json!({
+            "steps": [{ "id": "s1", "content": "x", "status": "completed" }]
+        }))
+        .expect("parse");
+        let changed = apply_plan_update(&mut plan, args, UtcMillis(200), Some(&report))
+            .expect("有 pass 记录必须放行");
+        assert!(changed);
+        assert_eq!(plan.steps[0].status, PlanStepStatus::Completed);
+    }
+
+    #[test]
+    fn apply_plan_update_allows_keeping_existing_completed_without_revalidation() {
+        // 已经处于 completed 的 step 在后续 plan_write 里继续保持 completed，
+        // 不需要重新读 validation——避免一次写入失败连带封死整张 plan。
+        let mut plan = Plan {
+            mission_id: mission(),
+            steps: vec![PlanStep {
+                id: "s1".to_string(),
+                content: "x".to_string(),
+                status: PlanStepStatus::Completed,
+                depends_on: Vec::new(),
+                notes: None,
+            }],
+            created_at: UtcMillis(100),
+            updated_at: UtcMillis(100),
+        };
+        let args = parse_plan_write_arguments(&serde_json::json!({
+            "steps": [
+                { "id": "s1", "content": "x", "status": "completed" },
+                { "id": "s2", "content": "y", "status": "in_progress" }
+            ]
+        }))
+        .expect("parse");
+        let changed = apply_plan_update(&mut plan, args, UtcMillis(200), None)
+            .expect("沿用既有 completed 不应触发 validation 关口");
+        assert!(changed);
+        assert_eq!(plan.steps.len(), 2);
+        assert_eq!(plan.steps[0].status, PlanStepStatus::Completed);
+        assert_eq!(plan.steps[1].status, PlanStepStatus::InProgress);
     }
 
     #[test]

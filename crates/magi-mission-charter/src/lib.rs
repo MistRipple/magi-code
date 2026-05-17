@@ -1,4 +1,4 @@
-//! Task System v2 — Tier 4 / L11 MissionCharter：mission 的"宪章"契约。
+//! Task System v2 — Tier 4 / L15 MissionCharter：mission 的"宪章"契约。
 //!
 //! 每个 Mission 在 `ensure_session_mission` 首次创建时同步落一份 charter，
 //! 把"为什么做、做到什么程度算完、有什么硬约束"沉淀为可读 markdown 文件，
@@ -47,6 +47,33 @@ use thiserror::Error;
 // MissionCharter
 // ---------------------------------------------------------------------------
 
+/// Charter 生命周期状态。
+///
+/// `Draft`：澄清阶段，可以自由更新。`Frozen`：契约已固化，所有写入必须绑定一条
+/// 已 Approved 的 HumanCheckpoint，对应 §1.6 / 02-migration-plan.md P4 验收条件。
+///
+/// 持久化时 frontmatter 的 `state` 字段必须显式存在，缺失直接报错——不提供"缺省
+/// 视为 Draft"的回退路径，避免把数据格式问题降级成静默行为。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CharterState {
+    Draft,
+    Frozen,
+}
+
+impl CharterState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CharterState::Draft => "draft",
+            CharterState::Frozen => "frozen",
+        }
+    }
+
+    pub fn is_frozen(self) -> bool {
+        matches!(self, CharterState::Frozen)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MissionCharter {
     pub mission_id: MissionId,
@@ -57,6 +84,12 @@ pub struct MissionCharter {
     pub stakeholders: Vec<String>,
     pub created_at: UtcMillis,
     pub updated_at: UtcMillis,
+    /// 生命周期状态。frontmatter 必须显式提供 `state` 字段；持久化层不接受缺省回退。
+    pub state: CharterState,
+    /// 最近一次被消费过的 HumanCheckpoint 序号；用于强制 frozen 阶段每次修改
+    /// 都必须引用一条新的 approval，杜绝同一 approval 反复授权多次修改。
+    /// `None` 表示尚未消费任何 approval，是 Draft 与刚被 freeze 后的合法初始状态。
+    pub last_approval_sequence: Option<u32>,
 }
 
 impl MissionCharter {
@@ -75,6 +108,8 @@ impl MissionCharter {
             stakeholders: Vec::new(),
             created_at: now,
             updated_at: now,
+            state: CharterState::Draft,
+            last_approval_sequence: None,
         }
     }
 }
@@ -89,6 +124,9 @@ pub enum MissionCharterError {
     HomeDirUnavailable,
     #[error("charter 数据缺失或非法：{reason}")]
     InvalidCharter { reason: String },
+    /// frozen 后写入未绑定 approval 或 approval 不可用。
+    #[error("charter 已 frozen，禁止直接修改：{reason}")]
+    FrozenRejected { reason: String },
     #[error("charter IO 失败 (path={path}): {source}")]
     Io {
         path: PathBuf,
@@ -117,8 +155,7 @@ impl MissionCharterStore {
         magi_home: &Path,
         workspace_root: &WorkspaceRootPath,
     ) -> Result<Self, MissionCharterError> {
-        let slug = workspace_slug(workspace_root.as_str());
-        let root = magi_home.join("projects").join(slug).join("missions");
+        let root = magi_core::paths::missions_root(magi_home, workspace_root);
         fs::create_dir_all(&root).map_err(|source| MissionCharterError::Io {
             path: root.clone(),
             source,
@@ -166,7 +203,14 @@ impl MissionCharterStore {
         let mut out = String::new();
         out.push_str("# Mission Charter\n\n");
         out.push_str(&format!("- mission_id: {}\n", charter.mission_id.as_str()));
-        out.push_str(&format!("- title: {}\n\n", charter.title));
+        out.push_str(&format!("- title: {}\n", charter.title));
+        out.push_str(&format!("- state: {}\n", charter.state.as_str()));
+        if charter.state.is_frozen() {
+            out.push_str(
+                "  > charter 已 frozen：任何字段修改必须先经 HumanCheckpoint 审批，再以 approval_sequence 引用。\n",
+            );
+        }
+        out.push('\n');
         out.push_str("## Goal\n");
         out.push_str(charter.goal.trim());
         out.push_str("\n\n");
@@ -265,6 +309,12 @@ pub struct MissionCharterWriteArgs {
     pub success_criteria: Option<Vec<String>>,
     pub constraints: Option<Vec<String>>,
     pub stakeholders: Option<Vec<String>>,
+    /// `true` 表示在本次写入应用完成后把 charter 状态由 Draft 切到 Frozen。
+    /// 已经 Frozen 的 charter 上传 `freeze=true` 视为幂等（保持 frozen）。
+    pub freeze: Option<bool>,
+    /// frozen 阶段必填：引用一条已 Approved 的 HumanCheckpoint 序号。
+    /// 必须严格 > `charter.last_approval_sequence`，保证一次 approval 只授权一次修改。
+    pub approval_sequence: Option<u32>,
 }
 
 pub fn parse_mission_charter_write_arguments(
@@ -286,14 +336,34 @@ pub fn parse_mission_charter_write_arguments(
     let success_criteria = parse_string_list(obj.get("success_criteria"))?;
     let constraints = parse_string_list(obj.get("constraints"))?;
     let stakeholders = parse_string_list(obj.get("stakeholders"))?;
-    if title.is_none()
-        && goal.is_none()
-        && success_criteria.is_none()
-        && constraints.is_none()
-        && stakeholders.is_none()
-    {
+    let freeze = obj.get("freeze").and_then(|v| v.as_bool());
+    let approval_sequence = match obj.get("approval_sequence") {
+        None => None,
+        Some(v) if v.is_null() => None,
+        Some(v) => {
+            let n = v
+                .as_u64()
+                .ok_or_else(|| MissionCharterError::InvalidCharter {
+                    reason: "approval_sequence 必须为非负整数".to_string(),
+                })?;
+            if n == 0 || n > u32::MAX as u64 {
+                return Err(MissionCharterError::InvalidCharter {
+                    reason: format!("approval_sequence 超出范围：{n}"),
+                });
+            }
+            Some(n as u32)
+        }
+    };
+    let has_content_field = title.is_some()
+        || goal.is_some()
+        || success_criteria.is_some()
+        || constraints.is_some()
+        || stakeholders.is_some();
+    let has_freeze_request = matches!(freeze, Some(true));
+    if !has_content_field && !has_freeze_request {
         return Err(MissionCharterError::InvalidCharter {
-            reason: "至少需要提供 title/goal/success_criteria/constraints/stakeholders 中一个字段"
+            reason: "至少需要提供 title/goal/success_criteria/constraints/stakeholders/freeze \
+                     中一个字段"
                 .to_string(),
         });
     }
@@ -303,6 +373,8 @@ pub fn parse_mission_charter_write_arguments(
         success_criteria,
         constraints,
         stakeholders,
+        freeze,
+        approval_sequence,
     })
 }
 
@@ -333,11 +405,48 @@ fn parse_string_list(
 }
 
 /// 把入参应用到已有 charter 上（增量更新）。返回是否实际产生了变更。
+///
+/// 不变式：
+/// - frozen charter 收到任何**内容**字段（title/goal/success_criteria/constraints/stakeholders）
+///   时必须同时携带 `approval_sequence`，且必须严格大于 `charter.last_approval_sequence`。
+/// - frozen charter 上的 `freeze=true` 为幂等无操作。
+/// - draft charter 上的 `freeze=true` 在内容更新（如有）之后转换为 frozen。
+///
+/// 注意：`approval_sequence` 是否真的指向一条已 Approved 的 HumanCheckpoint 由调用方
+/// （`execute_mission_charter_write_tool`）在调用本函数之前完成核实——本函数只承担
+/// charter 自身一致性（序号递增、frozen 强制约束）。
 pub fn apply_charter_update(
     charter: &mut MissionCharter,
     args: MissionCharterWriteArgs,
     now: UtcMillis,
-) -> bool {
+) -> Result<bool, MissionCharterError> {
+    let want_content_update = args.title.is_some()
+        || args.goal.is_some()
+        || args.success_criteria.is_some()
+        || args.constraints.is_some()
+        || args.stakeholders.is_some();
+
+    if charter.state.is_frozen() && want_content_update {
+        let approval =
+            args.approval_sequence
+                .ok_or_else(|| MissionCharterError::FrozenRejected {
+                    reason:
+                        "frozen charter 修改必须提供 approval_sequence 引用已 Approved 的 \
+                         HumanCheckpoint"
+                            .to_string(),
+                })?;
+        if let Some(prev) = charter.last_approval_sequence {
+            if approval <= prev {
+                return Err(MissionCharterError::FrozenRejected {
+                    reason: format!(
+                        "approval_sequence={approval} 必须严格大于已消费的 last_approval_sequence={prev}"
+                    ),
+                });
+            }
+        }
+        charter.last_approval_sequence = Some(approval);
+    }
+
     let mut changed = false;
     if let Some(title) = args.title {
         if charter.title != title {
@@ -369,10 +478,14 @@ pub fn apply_charter_update(
             changed = true;
         }
     }
+    if matches!(args.freeze, Some(true)) && charter.state != CharterState::Frozen {
+        charter.state = CharterState::Frozen;
+        changed = true;
+    }
     if changed {
         charter.updated_at = now;
     }
-    changed
+    Ok(changed)
 }
 
 // ---------------------------------------------------------------------------
@@ -386,6 +499,10 @@ fn render_charter(charter: &MissionCharter) -> String {
     out.push_str(&format!("title: {}\n", charter.title));
     out.push_str(&format!("created_at: {}\n", charter.created_at.0));
     out.push_str(&format!("updated_at: {}\n", charter.updated_at.0));
+    out.push_str(&format!("state: {}\n", charter.state.as_str()));
+    if let Some(seq) = charter.last_approval_sequence {
+        out.push_str(&format!("last_approval_sequence: {seq}\n"));
+    }
     out.push_str("---\n\n");
     out.push_str("## Goal\n");
     out.push_str(charter.goal.trim());
@@ -429,6 +546,8 @@ fn parse_charter(raw: &str) -> Result<MissionCharter, MissionCharterError> {
     let mut title: Option<String> = None;
     let mut created_at: Option<u64> = None;
     let mut updated_at: Option<u64> = None;
+    let mut state: Option<CharterState> = None;
+    let mut last_approval_sequence: Option<u32> = None;
     for line in front.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -444,6 +563,25 @@ fn parse_charter(raw: &str) -> Result<MissionCharter, MissionCharterError> {
             "title" => title = Some(value),
             "created_at" => created_at = value.parse::<u64>().ok(),
             "updated_at" => updated_at = value.parse::<u64>().ok(),
+            "state" => {
+                state = Some(match value.as_str() {
+                    "draft" => CharterState::Draft,
+                    "frozen" => CharterState::Frozen,
+                    other => {
+                        return Err(MissionCharterError::InvalidCharter {
+                            reason: format!("frontmatter state 取值非法：{other}"),
+                        });
+                    }
+                });
+            }
+            "last_approval_sequence" => {
+                last_approval_sequence =
+                    Some(value.parse::<u32>().map_err(|_| {
+                        MissionCharterError::InvalidCharter {
+                            reason: format!("last_approval_sequence 解析失败：{value}"),
+                        }
+                    })?);
+            }
             _ => {}
         }
     }
@@ -457,6 +595,11 @@ fn parse_charter(raw: &str) -> Result<MissionCharter, MissionCharterError> {
         reason: "frontmatter 缺少 created_at".to_string(),
     })?;
     let updated_at = updated_at.unwrap_or(created_at);
+    // state 是 charter 生命周期的根字段，不允许"缺省回退"——缺失即报错，迫使写入方
+    // 显式声明 Draft/Frozen，避免静默把陈旧或异常数据当作 Draft 接收。
+    let state = state.ok_or_else(|| MissionCharterError::InvalidCharter {
+        reason: "frontmatter 缺少 state（必填：draft|frozen）".to_string(),
+    })?;
     let sections = parse_sections(body);
     let goal = sections.get("Goal").cloned().unwrap_or_default();
     let success_criteria = sections
@@ -480,6 +623,8 @@ fn parse_charter(raw: &str) -> Result<MissionCharter, MissionCharterError> {
         stakeholders,
         created_at: UtcMillis(created_at),
         updated_at: UtcMillis(updated_at),
+        state,
+        last_approval_sequence,
     })
 }
 
@@ -534,10 +679,6 @@ fn parse_bullets(section: &str) -> Vec<String> {
 // 工具
 // ---------------------------------------------------------------------------
 
-fn workspace_slug(absolute_path: &str) -> String {
-    absolute_path.replace('/', "-")
-}
-
 fn dirs_home() -> Result<PathBuf, MissionCharterError> {
     let home = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
@@ -552,9 +693,16 @@ fn dirs_home() -> Result<PathBuf, MissionCharterError> {
 /// S11 工具下沉：把 `mission_charter_write` 完整执行体收口在本 crate。
 /// `store: None` 表示当前 task 未绑定 workspace，直接失败。首次写入必须同时
 /// 提供 title + goal，否则拒绝（避免半成品契约落盘）。
+///
+/// frozen 阶段规则（参见 docs/task-system-v2/03-open-questions.md §1.6）：
+/// - charter 已 frozen 且本次入参带有任意内容字段（title/goal/success_criteria/...）
+///   时，必须同时提供 `approval_sequence`；该序号必须指向一条 status==Approved 且
+///   严格大于 `charter.last_approval_sequence` 的 HumanCheckpoint。
+/// - 仅传 `freeze: true` 的幂等请求在 frozen 状态下视为无操作。
 pub fn execute_mission_charter_write_tool(
     event_bus: &magi_event_bus::InMemoryEventBus,
     store: Option<&MissionCharterStore>,
+    human_checkpoint_store: Option<&magi_human_checkpoint::HumanCheckpointStore>,
     session_id: &magi_core::SessionId,
     workspace_id: Option<&magi_core::WorkspaceId>,
     task_id: &magi_core::TaskId,
@@ -631,7 +779,122 @@ pub fn execute_mission_charter_write_tool(
             );
         }
     };
-    let changed = apply_charter_update(&mut charter, args, now);
+
+    // frozen 阶段且本次涉及内容修改时，必须先确认 approval_sequence 指向一条
+    // Approved 的 HumanCheckpoint（apply_charter_update 内部只做序号递增的自洽检查）。
+    let want_content_update = args.title.is_some()
+        || args.goal.is_some()
+        || args.success_criteria.is_some()
+        || args.constraints.is_some()
+        || args.stakeholders.is_some();
+    if charter.state.is_frozen() && want_content_update {
+        let Some(approval_sequence) = args.approval_sequence else {
+            return (
+                serde_json::json!({
+                    "tool": "mission_charter_write",
+                    "status": "failed",
+                    "error": "charter 已 frozen，修改必须提供 approval_sequence 引用 \
+                              已 Approved 的 HumanCheckpoint",
+                })
+                .to_string(),
+                ExecutionResultStatus::Failed,
+            );
+        };
+        let Some(hc_store) = human_checkpoint_store else {
+            return (
+                serde_json::json!({
+                    "tool": "mission_charter_write",
+                    "status": "failed",
+                    "error": "frozen charter 修改需要 HumanCheckpoint store，但运行时未提供",
+                })
+                .to_string(),
+                ExecutionResultStatus::Failed,
+            );
+        };
+        let log = match hc_store.load(mission_id) {
+            Ok(Some(log)) => log,
+            Ok(None) => {
+                return (
+                    serde_json::json!({
+                        "tool": "mission_charter_write",
+                        "status": "failed",
+                        "error": format!(
+                            "approval_sequence={approval_sequence} 不存在：mission 没有 \
+                             HumanCheckpoint 记录"
+                        ),
+                    })
+                    .to_string(),
+                    ExecutionResultStatus::Failed,
+                );
+            }
+            Err(err) => {
+                return (
+                    serde_json::json!({
+                        "tool": "mission_charter_write",
+                        "status": "failed",
+                        "error": format!("加载 HumanCheckpoint 失败：{err}"),
+                    })
+                    .to_string(),
+                    ExecutionResultStatus::Failed,
+                );
+            }
+        };
+        let Some(entry) = log.entries.iter().find(|e| e.sequence == approval_sequence)
+        else {
+            return (
+                serde_json::json!({
+                    "tool": "mission_charter_write",
+                    "status": "failed",
+                    "error": format!("approval_sequence={approval_sequence} 不存在"),
+                })
+                .to_string(),
+                ExecutionResultStatus::Failed,
+            );
+        };
+        if !matches!(
+            entry.status,
+            magi_human_checkpoint::HumanCheckpointStatus::Approved
+        ) {
+            return (
+                serde_json::json!({
+                    "tool": "mission_charter_write",
+                    "status": "failed",
+                    "error": format!(
+                        "approval_sequence={approval_sequence} 当前状态为 {}，必须为 approved",
+                        entry.status.as_str()
+                    ),
+                })
+                .to_string(),
+                ExecutionResultStatus::Failed,
+            );
+        }
+    }
+
+    let changed = match apply_charter_update(&mut charter, args, now) {
+        Ok(changed) => changed,
+        Err(err @ MissionCharterError::FrozenRejected { .. }) => {
+            return (
+                serde_json::json!({
+                    "tool": "mission_charter_write",
+                    "status": "failed",
+                    "error": err.to_string(),
+                })
+                .to_string(),
+                ExecutionResultStatus::Failed,
+            );
+        }
+        Err(err) => {
+            return (
+                serde_json::json!({
+                    "tool": "mission_charter_write",
+                    "status": "failed",
+                    "error": err.to_string(),
+                })
+                .to_string(),
+                ExecutionResultStatus::Failed,
+            );
+        }
+    };
     if let Err(err) = store.save(&charter) {
         return (
             serde_json::json!({
@@ -648,6 +911,8 @@ pub fn execute_mission_charter_write_tool(
         "status": "succeeded",
         "mission_id": charter.mission_id.to_string(),
         "title": charter.title,
+        "state": charter.state.as_str(),
+        "last_approval_sequence": charter.last_approval_sequence,
         "changed": changed,
     });
     let _ = event_bus.publish(
@@ -664,6 +929,8 @@ pub fn execute_mission_charter_write_tool(
                 "workspace_id": workspace_id.map(ToString::to_string),
                 "changed": changed,
                 "title": charter.title,
+                "state": charter.state.as_str(),
+                "last_approval_sequence": charter.last_approval_sequence,
             }),
         )
         .with_context(EventContext {
@@ -693,23 +960,20 @@ mod tests {
     }
 
     #[test]
-    fn workspace_slug_replaces_slash_with_dash() {
-        assert_eq!(workspace_slug("/Users/x/proj"), "-Users-x-proj");
-    }
-
-    #[test]
     fn save_then_load_round_trips_all_fields() {
         let (home, ws) = tmp_workspace();
         let store = MissionCharterStore::open_with_home(home.path(), &ws).expect("open");
         let charter = MissionCharter {
             mission_id: MissionId::new("mission-1"),
             title: "迁移 Task System v2".to_string(),
-            goal: "把 v1 状态推进彻底替换为 v2 4-Tier 21-Layer".to_string(),
+            goal: "收敛 Task System v2 4-Tier 21-Layer 完成态".to_string(),
             success_criteria: vec!["S1-S18 全部完成".to_string(), "cargo test 通过".to_string()],
-            constraints: vec!["不保留 v1 兼容路径".to_string()],
+            constraints: vec!["不保留旧任务系统兼容路径".to_string()],
             stakeholders: vec!["用户（架构师）".to_string()],
             created_at: UtcMillis(1_700_000_000_000),
             updated_at: UtcMillis(1_700_000_000_000),
+            state: CharterState::Draft,
+            last_approval_sequence: None,
         };
         store.save(&charter).expect("save");
         let loaded = store
@@ -744,6 +1008,8 @@ mod tests {
             stakeholders: Vec::new(),
             created_at: UtcMillis(0),
             updated_at: UtcMillis(0),
+            state: CharterState::Draft,
+            last_approval_sequence: None,
         };
         store.save(&charter).expect("save");
         let rendered = store
@@ -796,11 +1062,15 @@ mod tests {
             success_criteria: None,
             constraints: None,
             stakeholders: None,
+            freeze: None,
+            approval_sequence: None,
         };
-        let changed = apply_charter_update(&mut charter, args, UtcMillis(200));
+        let changed = apply_charter_update(&mut charter, args, UtcMillis(200))
+            .expect("draft apply 不应失败");
         assert!(changed);
         assert_eq!(charter.title, "new");
         assert_eq!(charter.updated_at.0, 200);
+        assert_eq!(charter.state, CharterState::Draft);
     }
 
     #[test]
@@ -817,10 +1087,387 @@ mod tests {
             success_criteria: None,
             constraints: None,
             stakeholders: None,
+            freeze: None,
+            approval_sequence: None,
         };
-        let changed = apply_charter_update(&mut charter, args, UtcMillis(200));
+        let changed = apply_charter_update(&mut charter, args, UtcMillis(200))
+            .expect("no-op apply 不应失败");
         assert!(!changed);
         assert_eq!(charter.updated_at.0, 100);
+    }
+
+    // ---- §1.6 生命周期不变式 --------------------------------------------
+
+    #[test]
+    fn apply_charter_update_freeze_transitions_draft_to_frozen() {
+        let mut charter = MissionCharter::new(
+            MissionId::new("m"),
+            "t".to_string(),
+            "g".to_string(),
+            UtcMillis(0),
+        );
+        let args = MissionCharterWriteArgs {
+            title: None,
+            goal: None,
+            success_criteria: Some(vec!["criterion".to_string()]),
+            constraints: None,
+            stakeholders: None,
+            freeze: Some(true),
+            approval_sequence: None,
+        };
+        let changed = apply_charter_update(&mut charter, args, UtcMillis(10)).expect("freeze ok");
+        assert!(changed);
+        assert_eq!(charter.state, CharterState::Frozen);
+        assert!(charter.last_approval_sequence.is_none());
+    }
+
+    #[test]
+    fn apply_charter_update_frozen_content_rejects_without_approval() {
+        let mut charter = MissionCharter::new(
+            MissionId::new("m"),
+            "t".to_string(),
+            "g".to_string(),
+            UtcMillis(0),
+        );
+        charter.state = CharterState::Frozen;
+        let args = MissionCharterWriteArgs {
+            title: Some("new".to_string()),
+            goal: None,
+            success_criteria: None,
+            constraints: None,
+            stakeholders: None,
+            freeze: None,
+            approval_sequence: None,
+        };
+        let err = apply_charter_update(&mut charter, args, UtcMillis(10))
+            .expect_err("frozen 状态修改应被拒");
+        assert!(matches!(err, MissionCharterError::FrozenRejected { .. }));
+        assert_eq!(charter.title, "t", "拒绝后原值保留");
+    }
+
+    #[test]
+    fn apply_charter_update_frozen_requires_strictly_increasing_approval() {
+        let mut charter = MissionCharter::new(
+            MissionId::new("m"),
+            "t".to_string(),
+            "g".to_string(),
+            UtcMillis(0),
+        );
+        charter.state = CharterState::Frozen;
+        charter.last_approval_sequence = Some(5);
+        // 同序号必须被拒绝
+        let same = apply_charter_update(
+            &mut charter,
+            MissionCharterWriteArgs {
+                title: Some("new".to_string()),
+                goal: None,
+                success_criteria: None,
+                constraints: None,
+                stakeholders: None,
+                freeze: None,
+                approval_sequence: Some(5),
+            },
+            UtcMillis(10),
+        )
+        .expect_err("approval 不递增必须被拒");
+        assert!(matches!(same, MissionCharterError::FrozenRejected { .. }));
+        // 严格递增可通过
+        let changed = apply_charter_update(
+            &mut charter,
+            MissionCharterWriteArgs {
+                title: Some("new".to_string()),
+                goal: None,
+                success_criteria: None,
+                constraints: None,
+                stakeholders: None,
+                freeze: None,
+                approval_sequence: Some(6),
+            },
+            UtcMillis(20),
+        )
+        .expect("递增 approval 应放行");
+        assert!(changed);
+        assert_eq!(charter.last_approval_sequence, Some(6));
+        assert_eq!(charter.title, "new");
+        assert_eq!(charter.state, CharterState::Frozen, "修改后仍保持 frozen");
+    }
+
+    #[test]
+    fn apply_charter_update_frozen_idempotent_freeze_is_noop() {
+        let mut charter = MissionCharter::new(
+            MissionId::new("m"),
+            "t".to_string(),
+            "g".to_string(),
+            UtcMillis(0),
+        );
+        charter.state = CharterState::Frozen;
+        // 仅 freeze=true 且无内容变更：视为幂等 no-op，不需要 approval。
+        let changed = apply_charter_update(
+            &mut charter,
+            MissionCharterWriteArgs {
+                title: None,
+                goal: None,
+                success_criteria: None,
+                constraints: None,
+                stakeholders: None,
+                freeze: Some(true),
+                approval_sequence: None,
+            },
+            UtcMillis(10),
+        )
+        .expect("frozen 上幂等 freeze 不应报错");
+        assert!(!changed);
+        assert_eq!(charter.updated_at.0, 0);
+    }
+
+    #[test]
+    fn parse_mission_charter_write_accepts_freeze_only() {
+        let args = parse_mission_charter_write_arguments(&serde_json::json!({
+            "freeze": true,
+        }))
+        .expect("仅 freeze=true 应当合法");
+        assert_eq!(args.freeze, Some(true));
+        assert!(args.title.is_none());
+    }
+
+    #[test]
+    fn parse_mission_charter_write_rejects_invalid_approval_sequence() {
+        let err = parse_mission_charter_write_arguments(&serde_json::json!({
+            "title": "x",
+            "approval_sequence": 0,
+        }))
+        .expect_err("approval_sequence=0 必须报错");
+        assert!(matches!(err, MissionCharterError::InvalidCharter { .. }));
+    }
+
+    #[test]
+    fn save_then_load_round_trips_lifecycle_fields() {
+        let (home, ws) = tmp_workspace();
+        let store = MissionCharterStore::open_with_home(home.path(), &ws).expect("open");
+        let charter = MissionCharter {
+            mission_id: MissionId::new("mf"),
+            title: "frozen-title".to_string(),
+            goal: "g".to_string(),
+            success_criteria: vec!["c1".to_string()],
+            constraints: Vec::new(),
+            stakeholders: Vec::new(),
+            created_at: UtcMillis(1),
+            updated_at: UtcMillis(2),
+            state: CharterState::Frozen,
+            last_approval_sequence: Some(7),
+        };
+        store.save(&charter).expect("save");
+        let loaded = store.load(&charter.mission_id).expect("load").expect("present");
+        assert_eq!(loaded.state, CharterState::Frozen);
+        assert_eq!(loaded.last_approval_sequence, Some(7));
+    }
+
+    #[test]
+    fn parse_charter_rejects_missing_state() {
+        let (home, ws) = tmp_workspace();
+        let store = MissionCharterStore::open_with_home(home.path(), &ws).expect("open");
+        let mission_id = MissionId::new("legacy");
+        let path = store.charter_path(&mission_id);
+        std::fs::create_dir_all(path.parent().unwrap()).expect("mkdir");
+        // frontmatter 不带 state：必须直接报 InvalidCharter，禁止"静默回退 Draft"。
+        let raw = "---\nmission_id: legacy\ntitle: t\ncreated_at: 1\nupdated_at: 1\n---\n\n## Goal\ng\n\n";
+        std::fs::write(&path, raw).expect("write");
+        let err = store.load(&mission_id).expect_err("缺 state 必须报错");
+        assert!(
+            matches!(err, MissionCharterError::InvalidCharter { ref reason } if reason.contains("state")),
+            "期望 InvalidCharter 且 reason 提及 state，实际：{err}"
+        );
+    }
+
+    #[test]
+    fn render_for_prompt_marks_frozen_state() {
+        let (home, ws) = tmp_workspace();
+        let store = MissionCharterStore::open_with_home(home.path(), &ws).expect("open");
+        let charter = MissionCharter {
+            mission_id: MissionId::new("m"),
+            title: "T".to_string(),
+            goal: "G".to_string(),
+            success_criteria: Vec::new(),
+            constraints: Vec::new(),
+            stakeholders: Vec::new(),
+            created_at: UtcMillis(0),
+            updated_at: UtcMillis(0),
+            state: CharterState::Frozen,
+            last_approval_sequence: Some(3),
+        };
+        store.save(&charter).expect("save");
+        let rendered = store
+            .render_for_prompt(&charter.mission_id)
+            .expect("render")
+            .expect("present");
+        assert!(rendered.contains("state: frozen"));
+        assert!(rendered.contains("HumanCheckpoint 审批"));
+    }
+
+    // ---- execute_mission_charter_write_tool 端到端 ----------------------
+
+    fn make_hc_log(
+        hc_store: &magi_human_checkpoint::HumanCheckpointStore,
+        mission: &MissionId,
+        approved_seq: u32,
+    ) {
+        let mut log = magi_human_checkpoint::HumanCheckpointLog::new(mission.clone(), UtcMillis(0));
+        for i in 1..=approved_seq {
+            magi_human_checkpoint::append_human_checkpoint_request(
+                &mut log,
+                magi_human_checkpoint::HumanCheckpointRequestArgs {
+                    plan_step_id: format!("s{i}"),
+                    prompt_to_human: format!("review {i}"),
+                    label: Some(format!("lbl-{i}")),
+                    context: None,
+                },
+                UtcMillis(i as u64),
+            );
+        }
+        hc_store.save(&log).expect("save log");
+        hc_store
+            .resolve_request(
+                mission,
+                approved_seq,
+                magi_human_checkpoint::HumanCheckpointDecision::Approve,
+                "ops".to_string(),
+                None,
+                UtcMillis(1_000 + approved_seq as u64),
+            )
+            .expect("approve");
+    }
+
+    #[test]
+    fn execute_tool_end_to_end_lifecycle() {
+        use magi_core::{ExecutionResultStatus, SessionId, TaskId, WorkspaceId};
+        let home = tempfile::tempdir().expect("tempdir");
+        let ws_root = WorkspaceRootPath::new(home.path().to_string_lossy().to_string());
+        let charter_store =
+            MissionCharterStore::open_with_home(home.path(), &ws_root).expect("open");
+        let hc_store =
+            magi_human_checkpoint::HumanCheckpointStore::open_with_home(home.path(), &ws_root)
+                .expect("open hc");
+        let bus = magi_event_bus::InMemoryEventBus::new(64);
+        let session_id = SessionId::new("session-1");
+        let task_id = TaskId::new("task-1");
+        let mission_id = MissionId::new("mission-end2end");
+        let workspace_id = WorkspaceId::new("ws-1");
+
+        // 1) draft 阶段创建 + 增量更新（无 approval）。
+        let (out, status) = execute_mission_charter_write_tool(
+            &bus,
+            Some(&charter_store),
+            Some(&hc_store),
+            &session_id,
+            Some(&workspace_id),
+            &task_id,
+            &mission_id,
+            r#"{"title":"T","goal":"G"}"#,
+        );
+        assert_eq!(status, ExecutionResultStatus::Succeeded, "draft 创建应通过：{out}");
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["state"], "draft");
+
+        // 2) draft 阶段 freeze=true 转为 frozen。
+        let (out, status) = execute_mission_charter_write_tool(
+            &bus,
+            Some(&charter_store),
+            Some(&hc_store),
+            &session_id,
+            Some(&workspace_id),
+            &task_id,
+            &mission_id,
+            r#"{"freeze":true}"#,
+        );
+        assert_eq!(status, ExecutionResultStatus::Succeeded);
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["state"], "frozen");
+
+        // 3) frozen 后直接修改（无 approval_sequence）必须失败。
+        let (out, status) = execute_mission_charter_write_tool(
+            &bus,
+            Some(&charter_store),
+            Some(&hc_store),
+            &session_id,
+            Some(&workspace_id),
+            &task_id,
+            &mission_id,
+            r#"{"title":"NEW"}"#,
+        );
+        assert_eq!(status, ExecutionResultStatus::Failed);
+        assert!(out.contains("frozen"), "拒绝原因应说明 frozen：{out}");
+
+        // 4) 引用未 approved 的序号必须失败。
+        // 先 append 一条 pending（不 resolve）。
+        let mut log = magi_human_checkpoint::HumanCheckpointLog::new(mission_id.clone(), UtcMillis(0));
+        magi_human_checkpoint::append_human_checkpoint_request(
+            &mut log,
+            magi_human_checkpoint::HumanCheckpointRequestArgs {
+                plan_step_id: "s1".to_string(),
+                prompt_to_human: "review".to_string(),
+                label: Some("lbl".to_string()),
+                context: None,
+            },
+            UtcMillis(1),
+        );
+        hc_store.save(&log).expect("save log");
+        let (out, status) = execute_mission_charter_write_tool(
+            &bus,
+            Some(&charter_store),
+            Some(&hc_store),
+            &session_id,
+            Some(&workspace_id),
+            &task_id,
+            &mission_id,
+            r#"{"title":"NEW","approval_sequence":1}"#,
+        );
+        assert_eq!(status, ExecutionResultStatus::Failed);
+        assert!(out.contains("approved"), "拒绝原因应提示状态非 approved：{out}");
+
+        // 5) 把 #1 resolve approved，再写入应通过。
+        hc_store
+            .resolve_request(
+                &mission_id,
+                1,
+                magi_human_checkpoint::HumanCheckpointDecision::Approve,
+                "ops".to_string(),
+                None,
+                UtcMillis(500),
+            )
+            .expect("approve");
+        let (out, status) = execute_mission_charter_write_tool(
+            &bus,
+            Some(&charter_store),
+            Some(&hc_store),
+            &session_id,
+            Some(&workspace_id),
+            &task_id,
+            &mission_id,
+            r#"{"title":"NEW","approval_sequence":1}"#,
+        );
+        assert_eq!(status, ExecutionResultStatus::Succeeded, "已批准 approval 应放行：{out}");
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["state"], "frozen");
+        assert_eq!(parsed["last_approval_sequence"], 1);
+
+        // 6) 重复使用同一个 approval_sequence 必须被拒。
+        let (out, status) = execute_mission_charter_write_tool(
+            &bus,
+            Some(&charter_store),
+            Some(&hc_store),
+            &session_id,
+            Some(&workspace_id),
+            &task_id,
+            &mission_id,
+            r#"{"title":"NEWER","approval_sequence":1}"#,
+        );
+        assert_eq!(status, ExecutionResultStatus::Failed);
+        assert!(
+            out.contains("last_approval_sequence") || out.contains("严格大于"),
+            "拒绝原因应说明序号不递增：{out}"
+        );
+        // 防止 unused：保留 make_hc_log 作为便捷构造器（在更复杂的扩展测试时使用）。
+        let _ = make_hc_log;
     }
 
     #[test]

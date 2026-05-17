@@ -1,8 +1,6 @@
-//! Task System v2 — M04b：从 `magi-api::model_config` 下沉。
+//! Task System v2 — model config helpers。
 //!
-//! 错误返回值改为 `Result<_, String>`，magi-api 调用方
-//! 用 `.map_err(ApiError::InvalidInput)` 桥接到 `ApiError`。
-//! 这样 v2 不需要反向依赖 magi-api。
+//! 错误返回值使用 `Result<_, String>`，由上层调用方桥接到自己的错误类型。
 
 use magi_bridge_client::{HttpModelBridgeClient, HttpModelBridgeProtocol};
 use magi_usage_authority::{LlmConfig, OpenAiProtocol, ReasoningEffort, UrlMode};

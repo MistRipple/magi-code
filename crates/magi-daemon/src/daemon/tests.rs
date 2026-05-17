@@ -109,7 +109,7 @@ async fn get_json(app: axum::Router, path: &str) -> Value {
 async fn get_task_projection(app: axum::Router, root_task_id: &str, session_id: &str) -> Value {
     get_json(
         app,
-        &format!("/api/tasks/graph/{root_task_id}?sessionId={session_id}"),
+        &format!("/api/tasks/projection/{root_task_id}?sessionId={session_id}"),
     )
     .await
 }
@@ -128,9 +128,10 @@ async fn wait_for_task_projection_completed(
         let completed_tasks = projection["progress_summary"]["completed_tasks"]
             .as_u64()
             .unwrap_or(0);
-        if total_tasks >= 2
+        // V2 single-worker dispatch: ExecutionChain 只挂一个 root task；coordinator 才会再 spawn 子任务。
+        if total_tasks >= 1
             && completed_tasks == total_tasks
-            && projection["root_task"]["status"] == "Completed"
+            && projection["root_task"]["status"] == "completed"
         {
             return projection;
         }
@@ -175,9 +176,10 @@ fn assert_completed_two_task_projection(projection: &Value) {
     let completed_tasks = projection["progress_summary"]["completed_tasks"]
         .as_u64()
         .expect("completed_tasks should serialize as integer");
+    // V2 ExecutionChain：单 worker 任务只产出 1 个 root task；coordinator 才会扩展为多任务。
     assert!(
-        total_tasks >= 2,
-        "task projection should include at least root + action"
+        total_tasks >= 1,
+        "task projection should include the root task"
     );
     assert_eq!(
         completed_tasks, total_tasks,
@@ -185,7 +187,7 @@ fn assert_completed_two_task_projection(projection: &Value) {
         projection["progress_summary"], projection["root_task"]["status"], projection["tasks"]
     );
     assert_eq!(projection["progress_summary"]["failed_tasks"], 0);
-    assert_eq!(projection["root_task"]["status"], "Completed");
+    assert_eq!(projection["root_task"]["status"], "completed");
 }
 
 #[test]
@@ -862,7 +864,7 @@ async fn daemon_runtime_recovery_preflight_executes_and_followup_router_dispatch
         mission_id: mission_id.clone(),
         root_task_id: root_task_id.clone(),
         parent_task_id: None,
-        kind: TaskKind::Objective,
+        kind: TaskKind::LocalAgent,
         title: "recovery mission".to_string(),
         goal: "recovery mission".to_string(),
         status: TaskStatus::Running,
@@ -870,7 +872,6 @@ async fn daemon_runtime_recovery_preflight_executes_and_followup_router_dispatch
         required_children: vec![task_id.clone()],
         policy_snapshot: None,
         executor_binding: None,
-        context_refs: Vec::new(),
         knowledge_refs: Vec::new(),
         workspace_scope: None,
         write_scope: None,
@@ -878,9 +879,7 @@ async fn daemon_runtime_recovery_preflight_executes_and_followup_router_dispatch
         output_refs: Vec::new(),
         evidence_refs: Vec::new(),
         retry_count: 0,
-        repair_count: 0,
-        decision_payload: None,
-        variant: magi_core::TaskVariant::default(),
+        runtime_payload: magi_core::TaskRuntimePayload::default(),
         created_at: now,
         updated_at: now,
     });
@@ -889,15 +888,14 @@ async fn daemon_runtime_recovery_preflight_executes_and_followup_router_dispatch
         mission_id: mission_id.clone(),
         root_task_id: root_task_id,
         parent_task_id: Some(TaskId::new("task-root-router-recovery")),
-        kind: TaskKind::Action,
+        kind: TaskKind::LocalAgent,
         title: "recovery task".to_string(),
         goal: "recovery task".to_string(),
-        status: TaskStatus::Blocked,
+        status: TaskStatus::Failed,
         dependency_ids: Vec::new(),
         required_children: Vec::new(),
         policy_snapshot: None,
         executor_binding: None,
-        context_refs: Vec::new(),
         knowledge_refs: Vec::new(),
         workspace_scope: None,
         write_scope: None,
@@ -905,9 +903,7 @@ async fn daemon_runtime_recovery_preflight_executes_and_followup_router_dispatch
         output_refs: Vec::new(),
         evidence_refs: Vec::new(),
         retry_count: 0,
-        repair_count: 0,
-        decision_payload: None,
-        variant: magi_core::TaskVariant::default(),
+        runtime_payload: magi_core::TaskRuntimePayload::default(),
         created_at: now,
         updated_at: now,
     });
@@ -1209,7 +1205,7 @@ async fn daemon_bootstrap_exports_recovery_context_after_resume_and_followup_dis
     state
         .task_store()
         .expect("task store should be configured")
-        .update_status(&recovery_task_id, TaskStatus::Blocked)
+        .update_status(&recovery_task_id, TaskStatus::Failed)
         .expect("seed task should become recoverable");
     let snapshot = state.workspace_registry.append_execution_snapshot(
         workspace_id.clone(),
@@ -2599,7 +2595,7 @@ async fn session_continue_survives_runtime_restart_with_same_chain_and_worker_br
     let task_store = state.task_store().expect("task store should be configured");
 
     task_store
-        .update_status(&primary_branch.task_id, TaskStatus::Blocked)
+        .update_status(&primary_branch.task_id, TaskStatus::Failed)
         .expect("primary branch should become recoverable");
 
     let now = UtcMillis::now();
@@ -2621,15 +2617,14 @@ async fn session_continue_survives_runtime_restart_with_same_chain_and_worker_br
             mission_id: mission_id.clone(),
             root_task_id: root_task_id.clone(),
             parent_task_id: Some(primary_branch.task_id.clone()),
-            kind: TaskKind::Action,
+            kind: TaskKind::LocalAgent,
             title: format!("restart branch {task_id}"),
             goal: format!("resume branch {task_id}"),
-            status: TaskStatus::Blocked,
+            status: TaskStatus::Failed,
             dependency_ids: Vec::new(),
             required_children: Vec::new(),
             policy_snapshot: None,
             executor_binding: None,
-            context_refs: Vec::new(),
             knowledge_refs: Vec::new(),
             workspace_scope: None,
             write_scope: None,
@@ -2637,9 +2632,7 @@ async fn session_continue_survives_runtime_restart_with_same_chain_and_worker_br
             output_refs: Vec::new(),
             evidence_refs: Vec::new(),
             retry_count: 0,
-            repair_count: 0,
-            decision_payload: None,
-            variant: magi_core::TaskVariant::default(),
+            runtime_payload: magi_core::TaskRuntimePayload::default(),
             created_at: now,
             updated_at: now,
         });
@@ -2665,7 +2658,7 @@ async fn session_continue_survives_runtime_restart_with_same_chain_and_worker_br
         mission_id: mission_id.clone(),
         root_task_id: root_task_id.clone(),
         parent_task_id: Some(primary_branch.task_id.clone()),
-        kind: TaskKind::Action,
+        kind: TaskKind::LocalAgent,
         title: "restart branch completed".to_string(),
         goal: "completed branch should stay terminal".to_string(),
         status: TaskStatus::Completed,
@@ -2673,7 +2666,6 @@ async fn session_continue_survives_runtime_restart_with_same_chain_and_worker_br
         required_children: Vec::new(),
         policy_snapshot: None,
         executor_binding: None,
-        context_refs: Vec::new(),
         knowledge_refs: Vec::new(),
         workspace_scope: None,
         write_scope: None,
@@ -2681,9 +2673,7 @@ async fn session_continue_survives_runtime_restart_with_same_chain_and_worker_br
         output_refs: Vec::new(),
         evidence_refs: Vec::new(),
         retry_count: 0,
-        repair_count: 0,
-        decision_payload: None,
-        variant: magi_core::TaskVariant::default(),
+        runtime_payload: magi_core::TaskRuntimePayload::default(),
         created_at: now,
         updated_at: now,
     });
@@ -2721,11 +2711,7 @@ async fn session_continue_survives_runtime_restart_with_same_chain_and_worker_br
             task_store.get_task(&branch.task_id).is_some_and(|task| {
                 matches!(
                     task.status,
-                    TaskStatus::Blocked
-                        | TaskStatus::Ready
-                        | TaskStatus::Running
-                        | TaskStatus::Verifying
-                        | TaskStatus::Repairing
+                    TaskStatus::Failed | TaskStatus::Pending | TaskStatus::Running
                 )
             })
         })
@@ -2832,7 +2818,7 @@ async fn session_continue_survives_runtime_restart_with_same_chain_and_worker_br
     assert_eq!(
         active_branches
             .iter()
-            .filter(|entry| entry["status"] == "blocked")
+            .filter(|entry| entry["status"] == "failed")
             .count(),
         expected_resumable_branch_count
     );
@@ -3029,11 +3015,11 @@ async fn unbound_session_continue_survives_runtime_restart() {
     let task_store = state.task_store().expect("task store should be configured");
 
     task_store
-        .update_status(&root_task_id, TaskStatus::Blocked)
+        .update_status(&root_task_id, TaskStatus::Failed)
         .expect("root task should become blocked");
     for branch in &chain.branches {
         task_store
-            .update_status(&branch.task_id, TaskStatus::Blocked)
+            .update_status(&branch.task_id, TaskStatus::Failed)
             .expect("branch task should become blocked");
     }
 

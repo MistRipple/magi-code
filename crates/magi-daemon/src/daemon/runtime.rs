@@ -3,6 +3,7 @@ use super::{
     config::{DaemonConfig, DaemonError},
     events::publish_ledger_status_event,
     maintenance::{RuntimeMaintenance, RuntimeMaintenanceConfig},
+    mission_recovery,
     persistence::{RuntimeSidecarPersistence, StateRepository},
 };
 use magi_api::{
@@ -18,9 +19,14 @@ use magi_context_runtime::{ContextBudget, ContextRuntime};
 use magi_conversation_runtime::{
     session_turn_finalize::publish_task_status_turn_item_for_active_sessions,
     task_execution_dispatcher::LlmTaskDispatcher,
-    task_runner_bridge::{EventBasedResultReceiver, TaskOutcome, TaskResult},
+    task_execution_registry::TaskExecutionPlan,
+    task_runner_bridge::{
+        EventBasedResultReceiver, TaskDispatchGateDecision, TaskOutcome, TaskResult,
+    },
 };
-use magi_core::{EventId, ExecutionOwnership, LeaseId, TaskStatus, UtcMillis};
+use magi_core::{
+    EventId, ExecutionOwnership, LeaseId, TaskStatus, TaskTier, UtcMillis, WorkspaceRootPath,
+};
 use magi_event_bus::{EventEnvelope, InMemoryEventBus};
 use magi_governance::GovernanceService;
 use magi_knowledge_store::{
@@ -142,7 +148,7 @@ impl magi_bridge_client::ModelBridgeClient for StaticTestModelBridgeClient {
         if let Some(payload) = classifier_payload_for_prompt(&request.prompt) {
             return Ok(magi_bridge_client::BridgeResponse { ok: true, payload });
         }
-        if request.prompt.contains("任务图规划器") {
+        if request.prompt.contains("任务投影规划器") {
             return Ok(magi_bridge_client::BridgeResponse {
                 ok: true,
                 payload: serde_json::json!({
@@ -223,10 +229,25 @@ fn classifier_payload_for_prompt(prompt: &str) -> Option<String> {
     } else {
         "chat"
     };
+    let task_tier = if route == "task"
+        && (user_text.contains("复杂任务")
+            || user_text.contains("深度任务")
+            || user_text.contains("长期任务")
+            || user_text.contains("跨多轮")
+            || user_text.contains("多阶段")
+            || user_text.contains("可恢复")
+            || user_text.contains("人审")
+            || user_text.contains("审计"))
+    {
+        "long_mission"
+    } else {
+        "execution_chain"
+    };
     let arguments = serde_json::json!({
         "route": route,
         "taskTitle": (route == "task").then_some("模型判定任务"),
         "executionGoal": (route == "task").then_some(user_text.trim_matches('"')),
+        "taskTier": task_tier,
         "requiredWorkers": [],
         "toolIntent": null,
         "confidence": (route == "task").then_some(0.95),
@@ -313,6 +334,15 @@ impl DaemonRuntime {
             &session_store,
             &workspace_store,
         )?;
+        // Task System v2 §1.4 Phase B：bootstrap 完成后扫描所有 workspace 的可恢复
+        // Mission，把 Checkpoint 里的 recovery_ref 回灌到对应 session sidecar，并发布
+        // `mission.resumed.from_recovery` 事件。单个 mission 失败不影响其它恢复。
+        mission_recovery::recover_missions_at_bootstrap(
+            &config.state_root,
+            &session_store,
+            &workspace_store,
+            &event_bus,
+        );
 
         // 引导阶段：代码索引与 workspace 绑定，避免多个工作区共用同一份上下文摘要。
         let active_workspace = workspace_store.active_workspace_id().and_then(|ws_id| {
@@ -495,12 +525,12 @@ impl DaemonRuntime {
                         push_terminal_task_result(&receiver, task_id, new_status);
                     },
                 ));
-                let (revoked_leases, blocked_tasks) = restored
+                let (revoked_leases, failed_tasks) = restored
                     .reconcile_volatile_runtime_after_restore(&worker_runtime.durable_snapshot());
-                if revoked_leases > 0 || blocked_tasks > 0 {
+                if revoked_leases > 0 || failed_tasks > 0 {
                     warn!(
                         revoked_leases,
-                        blocked_tasks,
+                        failed_tasks,
                         "检测到 checkpoint 中残留的易失执行态，已统一收口为可恢复状态"
                     );
                 }
@@ -613,11 +643,73 @@ impl DaemonRuntime {
                 .with_agent_role_registry(state.agent_role_registry.clone()),
         );
         let session_turn_dispatcher = llm_task_dispatcher.clone();
+        let human_checkpoint_registry_for_dispatch_gate =
+            llm_task_dispatcher.human_checkpoint_registry();
+        let workspace_registry_for_dispatch_gate = state.workspace_registry.clone();
+        let task_execution_registry_for_dispatch_gate = state.task_execution_registry().clone();
         let runner_manager = RunnerManager::with_dispatcher_and_worker_catalog(
             Arc::clone(&task_store),
             Arc::new(move || state_for_task_workers.task_worker_catalog()),
             llm_task_dispatcher,
             runner_result_receiver,
+        )
+        .with_dispatch_gate(Arc::new(move |task| {
+            if !task
+                .policy_snapshot
+                .as_ref()
+                .is_some_and(|policy| policy.task_tier == TaskTier::LongMission)
+            {
+                return Ok(TaskDispatchGateDecision::Allow);
+            }
+            let workspace_id = match task_execution_registry_for_dispatch_gate.get(&task.task_id) {
+                Some(TaskExecutionPlan::Dispatch {
+                    workspace_id: Some(workspace_id),
+                    ..
+                }) => workspace_id,
+                Some(TaskExecutionPlan::Dispatch {
+                    workspace_id: None, ..
+                }) => {
+                    return Err(format!(
+                        "long mission task {} 缺少 workspace_id，无法检查 HumanCheckpoint",
+                        task.task_id
+                    ));
+                }
+                None => {
+                    return Err(format!(
+                        "long mission task {} 缺少执行计划，无法检查 HumanCheckpoint",
+                        task.task_id
+                    ));
+                }
+            };
+            let workspace_root = workspace_registry_for_dispatch_gate
+                .workspaces()
+                .into_iter()
+                .find(|workspace| workspace.workspace_id == workspace_id)
+                .map(|workspace| WorkspaceRootPath::new(workspace.root_path.as_str()))
+                .ok_or_else(|| {
+                    format!(
+                        "workspace {} 不存在，无法检查 HumanCheckpoint",
+                        workspace_id
+                    )
+                })?;
+            let store = human_checkpoint_registry_for_dispatch_gate
+                .get_or_open(&workspace_root)
+                .map_err(|error| format!("打开 HumanCheckpointStore 失败: {error}"))?;
+            if store
+                .has_pending(&task.mission_id)
+                .map_err(|error| format!("读取 HumanCheckpoint pending 状态失败: {error}"))?
+            {
+                return Ok(TaskDispatchGateDecision::Blocked(format!(
+                    "mission {} 存在 pending HumanCheckpoint，operator resolve 前禁止派发新任务",
+                    task.mission_id
+                )));
+            }
+            Ok(TaskDispatchGateDecision::Allow)
+        }))
+        .with_child_result_route(
+            state.session_store.clone(),
+            state.conversation_registry.clone(),
+            state.spawn_graph.clone(),
         )
         .with_checkpoint_path(task_store_checkpoint_path)
         .with_terminal_observer(move |root_task_id, session_id, status| {
@@ -1161,7 +1253,7 @@ mod tests {
     async fn get_task_projection(app: axum::Router, root_task_id: &str, session_id: &str) -> Value {
         get_json(
             app,
-            &format!("/api/tasks/graph/{root_task_id}?sessionId={session_id}"),
+            &format!("/api/tasks/projection/{root_task_id}?sessionId={session_id}"),
         )
         .await
     }
@@ -1180,9 +1272,9 @@ mod tests {
             let completed_tasks = projection["progress_summary"]["completed_tasks"]
                 .as_u64()
                 .unwrap_or(0);
-            if total_tasks >= 2
+            if total_tasks >= 1
                 && completed_tasks == total_tasks
-                && projection["root_task"]["status"] == "Completed"
+                && projection["root_task"]["status"] == "completed"
             {
                 return projection;
             }
@@ -1227,13 +1319,14 @@ mod tests {
         let completed_tasks = projection["progress_summary"]["completed_tasks"]
             .as_u64()
             .expect("completed_tasks should serialize as integer");
+        // V2 ExecutionChain：单 worker 任务只产出 1 个 root task；coordinator 才会扩展为多任务。
         assert!(
-            total_tasks >= 2,
-            "task projection should include at least root + action"
+            total_tasks >= 1,
+            "task projection should include the root task"
         );
         assert_eq!(completed_tasks, total_tasks);
         assert_eq!(projection["progress_summary"]["failed_tasks"], 0);
-        assert_eq!(projection["root_task"]["status"], "Completed");
+        assert_eq!(projection["root_task"]["status"], "completed");
     }
 
     fn service_entries_by_kind(snapshot: &Value) -> BTreeMap<String, &Value> {
@@ -1543,7 +1636,7 @@ mod tests {
                         .as_array()
                         .expect("tasks should be an array")
                         .is_empty(),
-                    "regular chat turn must not create task graph"
+                    "regular chat turn must not create task projection"
                 );
                 break;
             }
@@ -1621,7 +1714,7 @@ mod tests {
         state
             .task_store()
             .expect("task store should be configured")
-            .update_status(&recovery_task_id, TaskStatus::Blocked)
+            .update_status(&recovery_task_id, TaskStatus::Failed)
             .expect("seed task should become recoverable");
         runtime
             .session_store

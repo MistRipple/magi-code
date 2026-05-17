@@ -1,14 +1,8 @@
-//! Task System v2 — M10/M11：执行链"继续会话"恢复路径下沉到 conversation-runtime。
+//! Task System v2 — 执行链"继续会话"恢复路径。
 //!
 //! 本文件承担数据载体（[`SessionContinueAccepted`]）+ 纯/弱状态判定 + recovery
 //! 校验 / 校对 / 应用 / writeback 落盘 / branch checkpoint 同步 / 子树解封等
-//! "继续会话"的 v2 实现细节。仅 `continue_execution_chain` 自身（强依赖
-//! magi-api 的 `TaskExecutionPlan` + `RunnerStartError`）暂留 magi-api，待
-//! M16/M17 解除 magi-api 对 task plan 的所有权后整体下沉成
-//! `Conversation::resume_for_continue`。
-//!
-//! 错误类型统一为 `String` —— 由 magi-api 调用点做 `.map_err(...)` 桥接到
-//! `ApiError`。函数签名走"显式 stores"，避免依赖 magi-api 的 `ApiState`。
+//! "继续会话"的 v2 实现细节。错误类型统一为 `String`，函数签名走显式 stores。
 
 use magi_core::{
     ExecutionOwnership, RecoveryResumeInput, SessionId, TaskStatus, TerminationReason, UtcMillis,
@@ -35,21 +29,17 @@ pub struct SessionContinueAccepted {
 }
 
 pub fn task_status_is_terminal(status: &TaskStatus) -> bool {
-    matches!(status, TaskStatus::Completed | TaskStatus::Cancelled)
+    matches!(status, TaskStatus::Completed | TaskStatus::Killed)
 }
 
 fn task_status_is_continue_recoverable(status: &TaskStatus) -> bool {
-    matches!(status, TaskStatus::Blocked)
+    matches!(status, TaskStatus::Failed)
 }
 
 fn task_status_needs_terminal_branch_finalization(status: &TaskStatus) -> bool {
     matches!(
         status,
-        TaskStatus::Blocked
-            | TaskStatus::Ready
-            | TaskStatus::Running
-            | TaskStatus::Verifying
-            | TaskStatus::Repairing
+        TaskStatus::Failed | TaskStatus::Pending | TaskStatus::Running
     )
 }
 
@@ -115,8 +105,8 @@ fn terminal_status_for_branch(
         })
         .map(|report| match report.termination_reason {
             Some(TerminationReason::Failed) => TaskStatus::Failed,
-            Some(TerminationReason::Cancelled) => TaskStatus::Cancelled,
-            Some(TerminationReason::Blocked) => TaskStatus::Blocked,
+            Some(TerminationReason::Cancelled) => TaskStatus::Killed,
+            Some(TerminationReason::Blocked) => TaskStatus::Failed,
             Some(TerminationReason::Completed) | None => TaskStatus::Completed,
         })
         .or_else(|| {
@@ -165,7 +155,7 @@ pub fn finalize_terminal_worker_branches(
         }
         let terminal_status =
             terminal_status_for_branch(worker_runtime, branch).unwrap_or(TaskStatus::Completed);
-        if matches!(terminal_status, TaskStatus::Blocked) {
+        if matches!(terminal_status, TaskStatus::Failed) {
             continue;
         }
         if matches!(terminal_status, TaskStatus::Completed) && task.evidence_refs.is_empty() {
@@ -180,7 +170,7 @@ pub fn finalize_terminal_worker_branches(
     Ok(finalized_count)
 }
 
-/// 沿 SpawnGraph 上溯，把恢复 branch 与其祖先链上的 Blocked 任务恢复为 Ready。
+/// 沿 SpawnGraph 上溯，把恢复 branch 与其祖先链上的可恢复 Failed 任务恢复为 Pending。
 pub fn release_resumed_branch_path(
     task_store: &TaskStore,
     spawn_graph: &std::sync::Mutex<SpawnGraph>,
@@ -204,9 +194,9 @@ pub fn release_resumed_branch_path(
                 .map_err(|error| format!("SpawnGraph 锁中毒: {error}"))?;
             graph.parent_of(&task_id).cloned()
         };
-        if task.status == TaskStatus::Blocked {
+        if task.status == TaskStatus::Failed {
             task_store
-                .update_status(&task_id, TaskStatus::Ready)
+                .update_status(&task_id, TaskStatus::Pending)
                 .map_err(|error| error.to_string())?;
         }
     }

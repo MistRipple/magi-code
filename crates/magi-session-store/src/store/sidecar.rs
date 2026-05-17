@@ -732,24 +732,6 @@ impl SessionStore {
     // P6a Thread registry（Y 方案）
     // ---------------------------------------------------------------------
 
-    /// 查找 session 下指定 role 且处于 `Idle` 的 thread。命中时可被下一 task 复用。
-    pub fn find_idle_thread_for_role(
-        &self,
-        session_id: &SessionId,
-        role_id: &str,
-    ) -> Option<ExecutionThread> {
-        let state = self.state.read().expect("session state read lock poisoned");
-        state
-            .thread_registry
-            .iter()
-            .find(|thread| {
-                &thread.session_id == session_id
-                    && thread.role_id == role_id
-                    && thread.status == ExecutionThreadStatus::Idle
-            })
-            .cloned()
-    }
-
     /// 注册新 thread；调用方保证 `thread_id` 唯一。
     pub fn register_thread(&self, thread: ExecutionThread) {
         let mut state = self
@@ -785,7 +767,7 @@ impl SessionStore {
         }
     }
 
-    /// 将 thread 标记为 `Idle`（task 完成后回收待复用）。
+    /// 将 thread 标记为 `Idle`（task 完成后的终态标记，不参与新 task 复用）。
     pub fn mark_thread_idle(&self, thread_id: &ThreadId, now: UtcMillis) {
         let mut state = self
             .state
@@ -853,7 +835,7 @@ impl SessionStore {
     ///    → 使用该 mission_id，并 spawn orchestrator thread
     /// 3. 否则调用 `mission_id_factory` 生成新 mission_id 并 spawn orchestrator thread
     ///
-    /// 此方法是 session 进入"任意工作态"（聊天 / 任务派发 / 补充上下文）的唯一入口，
+    /// 此方法是 session 进入"任意工作态"（聊天 / 任务派发 / 运行时 followup）的唯一入口，
     /// 保证"同 session 同 mission 同 orchestrator thread"的不变量。
     pub fn ensure_session_mission(
         &self,
@@ -918,7 +900,8 @@ impl SessionStore {
         }
     }
 
-    /// P6b：读取指定 thread 的累积对话历史，用于下一 task 启动时拼接为新 prompt 上文。
+    /// P6b：读取指定 thread 内部的对话记录。worker thread 为单 task 独占，
+    /// 因此这里不会把同 role 的历史 task 注入新 task。
     pub fn thread_message_history(&self, thread_id: &ThreadId) -> Vec<ThreadChatMessage> {
         let state = self.state.read().expect("session state read lock poisoned");
         state
@@ -929,7 +912,7 @@ impl SessionStore {
             .unwrap_or_default()
     }
 
-    /// P6b：将本轮 task 的 LLM 对话追加到 thread 历史。由 task_llm_loop 在 final 后调用。
+    /// P6b：将本轮 task 的 LLM 对话追加到当前 thread 的审计 / 恢复记录。
     pub fn append_thread_messages(
         &self,
         thread_id: &ThreadId,
@@ -1955,6 +1938,54 @@ impl SessionStore {
                 updated_at: UtcMillis::now(),
             },
             SessionSidecarFlushReason::ClearExecutionOwnership,
+        );
+        Ok(())
+    }
+
+    pub fn archive_active_execution_chain(
+        &self,
+        session_id: &SessionId,
+        root_task_id: &TaskId,
+    ) -> DomainResult<()> {
+        let existing = self
+            .runtime_sidecar(session_id)
+            .ok_or(DomainError::NotFound {
+                entity: "session_runtime_sidecar",
+            })?;
+        let chain =
+            existing
+                .active_execution_chain
+                .as_ref()
+                .ok_or_else(|| DomainError::InvalidState {
+                    message: "当前会话没有活跃执行链".to_string(),
+                })?;
+        if &chain.root_task_id != root_task_id {
+            return Err(DomainError::InvalidState {
+                message: format!(
+                    "归档任务与当前执行链不一致: {} != {}",
+                    root_task_id, chain.root_task_id
+                ),
+            });
+        }
+        let ownership = ExecutionOwnership {
+            session_id: Some(session_id.clone()),
+            workspace_id: chain
+                .workspace_id
+                .clone()
+                .or(existing.ownership.workspace_id),
+            ..ExecutionOwnership::default()
+        };
+        self.upsert_runtime_sidecar_with_reason(
+            SessionRuntimeSidecar {
+                session_id: session_id.clone(),
+                ownership,
+                recovery_id: None,
+                current_turn: existing.current_turn,
+                active_execution_chain: None,
+                status: SessionExecutionSidecarStatus::Detached,
+                updated_at: UtcMillis::now(),
+            },
+            SessionSidecarFlushReason::ArchiveActiveExecutionChain,
         );
         Ok(())
     }

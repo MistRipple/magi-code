@@ -1,20 +1,80 @@
 //! Task System v2 - Task helper functions (visibility / validation / required-tool-chain)
 //!
-//! P7：从旧版 API 任务调度层平移过来的纯函数与小型可见性枚举，
-//! 由 conversation-runtime 统一承载。
+//! conversation-runtime 统一承载 task 可见性、验证判定与 required-tool-chain 纯函数。
 //! 本模块严格遵守"无写回依赖"原则——任何需要 session writeback
 //! 的 publish/upsert helper 都不放在本模块。
 
 use magi_bridge_client::{ChatToolChoice, ChatToolDefinition};
-use magi_core::{Task, TaskKind, ThreadId, WorkerId};
+use magi_core::{Task, TaskKind, TaskTier, ThreadId, WorkerId};
+use magi_orchestrator::task_worker_catalog::default_task_role_for_kind;
 use magi_orchestrator::{task_store::TaskStore, task_worker_catalog::resolve_task_role};
 use magi_session_store::ActiveExecutionTurnItem;
 use magi_tool_runtime::BuiltinToolName;
 
-/// task_llm_loop / session_turn 默认工具调用轮数上限：避免一次任务被模型反复 fanout。
+/// conversation_loop / session_turn 默认工具调用轮数上限：避免一次任务被模型反复 fanout。
 pub const BASE_TOOL_CALL_ROUNDS: usize = 16;
 /// 强制工具链 + base 上限交叠时的硬天花板，防止失控放大。
 pub const MAX_TOOL_CALL_ROUNDS: usize = 32;
+
+pub(crate) fn is_orchestration_builtin_tool(tool: BuiltinToolName) -> bool {
+    matches!(
+        tool,
+        BuiltinToolName::AgentSpawn
+            | BuiltinToolName::SendMessage
+            | BuiltinToolName::TaskStop
+            | BuiltinToolName::TodoWrite
+            | BuiltinToolName::MemoryWrite
+    )
+}
+
+pub(crate) fn is_long_mission_builtin_tool(tool: BuiltinToolName) -> bool {
+    matches!(
+        tool,
+        BuiltinToolName::MissionCharterWrite
+            | BuiltinToolName::PlanWrite
+            | BuiltinToolName::KgWrite
+            | BuiltinToolName::ValidationRecord
+            | BuiltinToolName::Checkpoint
+            | BuiltinToolName::HumanCheckpointRequest
+    )
+}
+
+pub(crate) fn task_role_id(task: Option<&Task>) -> Option<&str> {
+    let task = task?;
+    task.executor_binding_target_role()
+        .or_else(|| default_task_role_for_kind(task.kind))
+}
+
+pub(crate) fn task_is_coordinator(
+    task: Option<&Task>,
+    registry: Option<&magi_agent_role::AgentRoleRegistry>,
+) -> bool {
+    let Some(registry) = registry else {
+        return false;
+    };
+    task_role_id(task)
+        .and_then(|role_id| registry.get(role_id))
+        .is_some_and(|role| role.coordinator_mode)
+}
+
+pub(crate) fn task_is_long_mission(task: Option<&Task>) -> bool {
+    task.and_then(|task| task.policy_snapshot.as_ref())
+        .is_some_and(|policy| policy.task_tier == TaskTier::LongMission)
+}
+
+pub(crate) fn task_can_see_builtin_tool(
+    task: Option<&Task>,
+    registry: Option<&magi_agent_role::AgentRoleRegistry>,
+    tool: BuiltinToolName,
+) -> bool {
+    if is_long_mission_builtin_tool(tool) {
+        return task_is_coordinator(task, registry) && task_is_long_mission(task);
+    }
+    if is_orchestration_builtin_tool(tool) {
+        return task_is_coordinator(task, registry);
+    }
+    true
+}
 
 /// 单一可见性枚举：item 的归属由 `source_thread_id` 决定，本枚举仅承担
 /// "把该 task 的 turn item 写到主线 thread 还是 worker drawer thread"的派发判断。
@@ -158,7 +218,8 @@ pub fn task_tool_failure_reason(
     task_kind: TaskKind,
     failed_tool_summaries: &[String],
 ) -> Option<String> {
-    if task_kind == TaskKind::Validation || failed_tool_summaries.is_empty() {
+    let _ = task_kind;
+    if failed_tool_summaries.is_empty() {
         return None;
     }
     let compact = failed_tool_summaries
@@ -227,7 +288,7 @@ pub fn deterministic_task_final_content(task: &Task, task_store: &TaskStore) -> 
 }
 
 pub fn is_planning_no_tool_action(task: &Task) -> bool {
-    task.kind == TaskKind::Action
+    task.kind == TaskKind::LocalAgent
         && task.title.contains("梳理目标")
         && task
             .policy_snapshot
@@ -244,7 +305,7 @@ pub fn deterministic_planning_content(task: &Task) -> String {
 }
 
 pub fn is_planning_text_validation(task: &Task) -> bool {
-    task.kind == TaskKind::Validation && task.goal.contains("只验证规划文本完整性")
+    task.kind == TaskKind::LocalAgent && task.goal.contains("只验证规划文本完整性")
 }
 
 pub fn deterministic_planning_validation_content(
@@ -267,7 +328,7 @@ pub fn deterministic_planning_validation_content(
 }
 
 pub fn is_execution_tool_validation(task: &Task) -> bool {
-    task.kind == TaskKind::Validation && task.goal.contains("实际执行和工具结果")
+    task.kind == TaskKind::LocalAgent && task.goal.contains("实际执行和工具结果")
 }
 
 pub fn deterministic_execution_tool_validation_content(
@@ -412,7 +473,7 @@ pub fn extract_task_goal(value: &str) -> Option<String> {
 }
 
 pub fn task_required_tool_chain(task: &Task) -> Vec<String> {
-    if task.kind != TaskKind::Action {
+    if task.kind != TaskKind::LocalAgent {
         return Vec::new();
     }
     if task
@@ -436,11 +497,72 @@ pub fn task_required_tool_chain(task: &Task) -> Vec<String> {
             matches.push((canonical_name, position));
         }
     }
+    for (canonical_name, position) in semantic_required_tool_references(&normalized) {
+        if let Some((_, existing_position)) =
+            matches.iter_mut().find(|(name, _)| *name == canonical_name)
+        {
+            *existing_position = (*existing_position).min(position);
+        } else {
+            matches.push((canonical_name, position));
+        }
+    }
     matches.sort_by_key(|(_, position)| *position);
     matches
         .into_iter()
         .map(|(tool_name, _)| tool_name.to_string())
         .collect()
+}
+
+fn semantic_required_tool_references(text: &str) -> Vec<(&'static str, usize)> {
+    let mut matches = Vec::new();
+    push_first_semantic_match(
+        &mut matches,
+        "file_write",
+        text,
+        &[
+            "创建文件",
+            "新建文件",
+            "写入文件",
+            "写文件",
+            "生成文件",
+            "保存到",
+            "文件内容必须包含",
+            "create file",
+            "create a file",
+            "write file",
+            "write a file",
+            "file content must contain",
+        ],
+    );
+    push_first_semantic_match(
+        &mut matches,
+        "file_read",
+        text,
+        &[
+            "读取该文件",
+            "读取文件",
+            "读回文件",
+            "验证内容",
+            "校验内容",
+            "read the file",
+            "read file",
+            "verify content",
+            "validate content",
+        ],
+    );
+    matches
+}
+
+fn push_first_semantic_match(
+    matches: &mut Vec<(&'static str, usize)>,
+    tool_name: &'static str,
+    text: &str,
+    phrases: &[&str],
+) {
+    let Some(position) = phrases.iter().filter_map(|phrase| text.find(phrase)).min() else {
+        return;
+    };
+    matches.push((tool_name, position));
 }
 
 pub fn public_builtin_tool_reference_aliases() -> Vec<(&'static str, &'static str)> {

@@ -2,19 +2,21 @@ use crate::session_writeback::{
     append_session_turn_item_with_task_store, publish_current_session_turn_item_event,
     publish_session_turn_item_event, session_turn_item, upsert_session_turn_item_with_task_store,
 };
+use crate::task_execution_registry::TaskExecutionRegistry;
 use crate::task_runner_bridge::TaskOutcome;
 use crate::tool_result_utils::{
     infer_tool_call_status, summarize_tool_result, tool_execution_status_label,
     turn_item_status_for_tool_result,
 };
 use crate::{
-    ConversationRegistry, RoundOutcome, StreamEvent, StreamFanOut, TaskTurnVisibility, TurnDriver,
-    apply_task_final_visibility, apply_task_turn_visibility, apply_task_worker_detail_visibility,
-    canonical_tool_call_name, compact_validation_failure, deterministic_task_final_content,
-    execute_task_tool_call_batch, forced_task_tool_choice_for_round,
-    record_completed_required_tools, required_tool_chain_is_complete,
-    required_tool_chain_recovery_prompt, task_required_tool_chain, task_tool_failure_reason,
-    task_turn_visibility, tool_call_round_limit, validation_result_rejects_delivery,
+    ConversationRegistry, MailboxAuthor, MailboxItem, MailboxKind, RoundOutcome, StreamEvent,
+    StreamFanOut, TaskTurnVisibility, TurnDriver, apply_task_final_visibility,
+    apply_task_turn_visibility, apply_task_worker_detail_visibility, canonical_tool_call_name,
+    compact_validation_failure, deterministic_task_final_content, execute_task_tool_call_batch,
+    forced_task_tool_choice_for_round, record_completed_required_tools,
+    required_tool_chain_is_complete, required_tool_chain_recovery_prompt, task_required_tool_chain,
+    task_tool_failure_reason, task_turn_visibility, tool_call_round_limit,
+    validation_result_rejects_delivery,
 };
 use crate::{
     prompt_utils::{
@@ -29,7 +31,7 @@ use magi_bridge_client::{
     ModelInvocationRequest, ModelStreamingDelta,
 };
 use magi_core::{
-    EventId, ExecutionResultStatus, LeaseId, SessionId, TaskId, TaskKind, TaskStatus, ThreadId,
+    EventId, ExecutionResultStatus, LeaseId, SessionId, Task, TaskId, TaskStatus, ThreadId,
     ToolCallId, UtcMillis, WorkspaceId,
 };
 use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
@@ -41,7 +43,7 @@ use magi_tool_runtime::ToolRegistry;
 use magi_usage_authority::UsageCallStatus;
 use std::{path::PathBuf, sync::Arc};
 
-pub struct TaskLlmLoopRequest<'a> {
+pub struct ConversationLoopRequest<'a> {
     pub client: &'a dyn ModelBridgeClient,
     pub event_bus: &'a InMemoryEventBus,
     pub session_store: &'a SessionStore,
@@ -49,6 +51,7 @@ pub struct TaskLlmLoopRequest<'a> {
     pub tool_registry: Option<&'a ToolRegistry>,
     pub skill_runtime: Option<&'a magi_skill_runtime::SkillRuntime>,
     pub task_store: &'a TaskStore,
+    pub execution_registry: &'a TaskExecutionRegistry,
     /// Task System v2：Turn 状态机驱动。每次 LLM 调用都通过 advance_turn 驱动，
     /// 显式经过 Pending → Modeling → Done/Failed 不变式（同一 Conversation 不并发）。
     pub conversation_registry: &'a ConversationRegistry,
@@ -72,14 +75,14 @@ pub struct TaskLlmLoopRequest<'a> {
     /// 不绑定 workspace（极少数 orchestration-only 场景），此时不注入 prompt、
     /// 也不允许 `memory_write` 工具调用成功。
     pub project_memory: Option<&'a magi_project_memory::ProjectMemoryStore>,
-    /// Task System v2 — Tier 4 / L11：当前 workspace 的 MissionCharter 索引。`None` 表示
+    /// Task System v2 — Tier 4 / L15：当前 workspace 的 MissionCharter 索引。`None` 表示
     /// 当前 task 不绑定 workspace（极少数 orchestration-only 场景），此时不注入 prompt、
     /// 也不允许 `mission_charter_write` 工具调用成功。
     pub mission_charter: Option<&'a magi_mission_charter::MissionCharterStore>,
-    /// Task System v2 — Tier 4 / L12：当前 workspace 的 Plan 索引。`None` 表示当前 task
+    /// Task System v2 — Tier 4 / L16：当前 workspace 的 Plan 索引。`None` 表示当前 task
     /// 不绑定 workspace；此时不注入 prompt，也不允许 `plan_write` 工具调用成功。
     pub plan: Option<&'a magi_plan::PlanStore>,
-    /// Task System v2 — Tier 4 / L13：当前 workspace 的 MissionWorkspace 索引。`None`
+    /// Task System v2 — Tier 4 / L17：当前 workspace 的 MissionWorkspace 索引。`None`
     /// 表示当前 task 不绑定 workspace；此时不注入工作目录视图。
     pub mission_workspace: Option<&'a magi_mission_workspace::MissionWorkspaceStore>,
     /// Task System v2 — Tier 4 / L18：当前 workspace 的 KnowledgeGraph 索引。`None`
@@ -94,8 +97,9 @@ pub struct TaskLlmLoopRequest<'a> {
     /// `checkpoint_create` 工具落盘。append-only 语义，仅追加不修改。
     pub checkpoint: Option<&'a magi_checkpoint::CheckpointStore>,
     /// Task System v2 — Tier 4 / L21：当前 workspace 的 HumanCheckpoint 索引。`None`
-    /// 表示当前 task 不绑定 workspace；此时不注入人工审核点摘要，也不允许
-    /// `human_checkpoint_request` 工具落盘。pending 状态会强制 Coordinator 停止派发新工作。
+    /// 表示当前 task 不绑定 workspace 或长任务 store 打开失败；此时不注入人工审核点摘要，
+    /// 也不允许 `human_checkpoint_request` 工具落盘。长任务缺少 store 时，agent_spawn
+    /// 会在工具层失败，避免绕过 pending 检查。
     pub human_checkpoint: Option<&'a magi_human_checkpoint::HumanCheckpointStore>,
     pub task: &'a magi_core::Task,
     pub task_id: &'a TaskId,
@@ -156,8 +160,7 @@ fn thread_chat_message_to_chat_message(message: &ThreadChatMessage) -> ChatMessa
 }
 
 /// P6b：把本轮新产生的 bridge-client 消息（含 system prompt 之外的所有条目）
-/// 压缩为 thread 持久化格式。系统边界提示 / 历史回放 / 工作区提示等重复上下文
-/// 不再次写入 —— 它们在下一 task 时会由 run_task_llm_loop 自动重新构造。
+/// 压缩为 thread 持久化格式。系统提示 / 工作区提示等重复上下文不再次写入。
 fn chat_message_to_thread_chat_message(message: &ChatMessage) -> ThreadChatMessage {
     ThreadChatMessage {
         role: message.role.clone(),
@@ -178,21 +181,21 @@ fn chat_message_to_thread_chat_message(message: &ChatMessage) -> ThreadChatMessa
     }
 }
 
-pub fn run_task_llm_loop(
-    request: TaskLlmLoopRequest<'_>,
+pub fn run_conversation_loop(
+    request: ConversationLoopRequest<'_>,
 ) -> (TaskOutcome, Option<ExecutionContextSummary>) {
     // Task System v2 切入：经由 ConversationRegistry 拿到本 session 的 Conversation，
     // 用 advance_turn 驱动 Turn 状态机；模型 IO + 工具 IO 段折叠到 driver 内部一次性执行。
     let registry = request.conversation_registry;
-    let conv_handle = registry.conversation_for(request.session_id);
-    let driver = TaskLlmTurnDriver::new(request);
+    let conv_handle = registry.conversation_for_task(request.session_id, request.task_id);
+    let driver = ConversationTurnDriver::new(request);
     let mut conversation = conv_handle
         .lock()
-        .expect("Conversation mutex poisoned in task_llm_loop");
+        .expect("Conversation mutex poisoned in conversation_loop");
     match conversation.advance_turn(driver) {
         Ok(outcome) => outcome,
         Err(err) => {
-            tracing::error!(?err, "task_llm_loop advance_turn 失败");
+            tracing::error!(?err, "conversation_loop advance_turn 失败");
             (
                 TaskOutcome::Failed {
                     error: format!("Conversation::advance_turn 失败: {err}"),
@@ -206,41 +209,48 @@ pub fn run_task_llm_loop(
 /// Task System v2 — 把一次完整的 LLM IO + 工具 IO 段封装成 TurnDriver round。
 ///
 /// 当前 driver 的 round_limit = 1：内部仍保留多轮工具调用 for 循环（围绕
-/// `messages` 累积器）。Conversation::advance_turn 已经提供多 round 骨架，后续可在
-/// 这里继续拆出"每 round 一次模型调用 + 工具批"的更细边界。
-struct TaskLlmTurnDriver<'a> {
-    request: Option<TaskLlmLoopRequest<'a>>,
+/// `messages` 累积器）。Conversation::advance_turn 提供外层 Turn 状态机，本 driver
+/// 承担当前 conversation loop 的模型 IO 与工具 IO。
+struct ConversationTurnDriver<'a> {
+    request: Option<ConversationLoopRequest<'a>>,
+    pending_mailbox_items: Vec<MailboxItem>,
     /// execute_round 跑完后把 outcome 存到这里，finalize_success 再交付出去。
     captured: Option<(TaskOutcome, Option<ExecutionContextSummary>)>,
 }
 
-impl<'a> TaskLlmTurnDriver<'a> {
-    fn new(request: TaskLlmLoopRequest<'a>) -> Self {
+impl<'a> ConversationTurnDriver<'a> {
+    fn new(request: ConversationLoopRequest<'a>) -> Self {
         Self {
             request: Some(request),
+            pending_mailbox_items: Vec::new(),
             captured: None,
         }
     }
 }
 
-impl<'a> TurnDriver for TaskLlmTurnDriver<'a> {
+impl<'a> TurnDriver for ConversationTurnDriver<'a> {
     type Outcome = (TaskOutcome, Option<ExecutionContextSummary>);
 
     fn round_limit(&self) -> usize {
         1
     }
 
+    fn accept_mailbox_items(&mut self, items: Vec<MailboxItem>) {
+        self.pending_mailbox_items = items;
+    }
+
     fn execute_round(&mut self, _round: usize) -> RoundOutcome {
         let request = self
             .request
             .take()
-            .expect("TaskLlmTurnDriver::execute_round 重入");
-        let outcome = run_task_llm_loop_inner(request);
+            .expect("ConversationTurnDriver::execute_round 重入");
+        let pending_mailbox_items = std::mem::take(&mut self.pending_mailbox_items);
+        let outcome = run_conversation_loop_inner(request, pending_mailbox_items);
         let is_failure = matches!(outcome.0, TaskOutcome::Failed { .. });
         self.captured = Some(outcome);
         if is_failure {
             // Turn 状态机记账：失败也通过 finalize_round_failure 路径出。
-            RoundOutcome::Failed("task_llm_loop_inner returned Failed".to_string())
+            RoundOutcome::Failed("conversation_loop_inner returned Failed".to_string())
         } else {
             RoundOutcome::Done
         }
@@ -248,19 +258,18 @@ impl<'a> TurnDriver for TaskLlmTurnDriver<'a> {
 
     fn finalize_success(self) -> Self::Outcome {
         self.captured
-            .expect("TaskLlmTurnDriver::finalize_success 没有捕获到 outcome")
+            .expect("ConversationTurnDriver::finalize_success 没有捕获到 outcome")
     }
 
     fn finalize_round_failure(self, _reason: String) -> Self::Outcome {
         self.captured
-            .expect("TaskLlmTurnDriver::finalize_round_failure 没有捕获到 outcome")
+            .expect("ConversationTurnDriver::finalize_round_failure 没有捕获到 outcome")
     }
 
     fn finalize_exhausted(self) -> Self::Outcome {
-        // round_limit = 1 时不会触发 exhausted，但保留兜底返回。
         (
             TaskOutcome::Failed {
-                error: "task_llm_loop driver 在 round_limit 内未产出 outcome".to_string(),
+                error: "conversation_loop driver 在 round_limit 内未产出 outcome".to_string(),
             },
             None,
         )
@@ -268,11 +277,11 @@ impl<'a> TurnDriver for TaskLlmTurnDriver<'a> {
 }
 
 /// 一轮 LLM IO + 工具 IO 全段——driver 内部唯一调用点。
-/// 当前保持单调用入口，后续可在此基础上拆 per-round 边界。
-fn run_task_llm_loop_inner(
-    request: TaskLlmLoopRequest<'_>,
+fn run_conversation_loop_inner(
+    request: ConversationLoopRequest<'_>,
+    pending_mailbox_items: Vec<MailboxItem>,
 ) -> (TaskOutcome, Option<ExecutionContextSummary>) {
-    let TaskLlmLoopRequest {
+    let ConversationLoopRequest {
         client,
         event_bus,
         session_store,
@@ -280,7 +289,8 @@ fn run_task_llm_loop_inner(
         tool_registry,
         skill_runtime,
         task_store,
-        conversation_registry: _,
+        execution_registry,
+        conversation_registry,
         stream_fanout,
         agent_role_registry,
         spawn_graph,
@@ -470,8 +480,7 @@ fn run_task_llm_loop_inner(
         }
     }
     // S17：HumanCheckpoint 注入。把当前 mission 待解决的人工审核点与最近若干已解决项摊
-    // 在系统提示里。pending 项要求 Coordinator 停止派发新工作，直到 operator 给出
-    // approve / reject；resolved 项作为审计上下文供模型回顾。
+    // 在系统提示里；真正的 pending 硬约束由 agent_spawn 拦截与 TaskRunner gate 执行。
     if let Some(store) = human_checkpoint {
         match store.render_for_prompt(&task.mission_id) {
             Ok(Some(rendered)) => {
@@ -488,9 +497,16 @@ fn run_task_llm_loop_inner(
             }
         }
     }
-    // P6b：thread 累积历史 —— 系统提示后、本轮 user prompt 前。为防止 LLM 混淆"当前 task"
-    // 与历史 task，我们在历史末尾、新 user prompt 前插入一条 system 边界标记，让模型明确
-    // 接下来要专注于新的任务目标。
+    if let Some(rendered) = render_mailbox_items_for_prompt(&pending_mailbox_items) {
+        messages.push(ChatMessage {
+            role: "system".to_string(),
+            content: Some(rendered),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        });
+    }
+    // P6b：只读取当前 thread 内部已经持久化的运行时输入 / 恢复记录。worker thread
+    // 为单 task 独占，因此这里不能出现同 role 的历史 task 对话。
     let thread_history_snapshot: Vec<ThreadChatMessage> =
         session_store.thread_message_history(thread_id);
     if !thread_history_snapshot.is_empty() {
@@ -500,7 +516,7 @@ fn run_task_llm_loop_inner(
         messages.push(ChatMessage {
             role: "system".to_string(),
             content: Some(
-                "以上是你在本 mission 中处理过的历史任务对话，仅供上下文参考。下面是一个新的任务，请聚焦新任务目标独立执行。"
+                "以上是当前 thread 在本 task 启动前已有的运行时输入或恢复记录。下面的用户消息是本次执行的当前任务事实，必须以当前任务为准。"
                     .to_string(),
             ),
             tool_calls: Vec::new(),
@@ -610,10 +626,8 @@ fn run_task_llm_loop_inner(
                     &turn_visibility,
                     &delta.content,
                 );
-                // Task System v2 — 把模型 token delta 同步扇出到 StreamFanOut。
-                // 现存 publish_* 仍负责 session_store 写回与 event_bus 派发；fanout 是
-                // 增量观察通道，UI bridge / projection 后续 slice 切到此处订阅时，
-                // 上面两个 publish_* 内的 event_bus 分支会随之删除。
+                // Task System v2 — 把模型 token delta 同步扇出到 StreamFanOut；
+                // publish_* 负责当前 session_store 写回与 event_bus 派发。
                 if !delta.content.is_empty() || !delta.thinking.is_empty() {
                     stream_fanout.publish(StreamEvent::ModelDelta {
                         session_id: session_id.clone(),
@@ -793,8 +807,12 @@ fn run_task_llm_loop_inner(
         let tool_results = execute_task_tool_call_batch(
             event_bus,
             tool_registry,
+            agent_role_registry,
             skill_runtime,
             task_store,
+            session_store,
+            execution_registry,
+            conversation_registry,
             spawn_graph,
             safety_gate,
             todo_ledger,
@@ -813,6 +831,8 @@ fn run_task_llm_loop_inner(
             &parsed.tool_calls,
         );
 
+        let mut completed_tool_names_this_round = Vec::new();
+        let mut content_requirement_failures = Vec::new();
         for (tool_call, (result, tool_status)) in parsed.tool_calls.iter().zip(tool_results) {
             upsert_task_tool_call_result_turn_item(
                 event_bus,
@@ -866,6 +886,19 @@ fn run_task_llm_loop_inner(
                     summarize_tool_result(&result)
                 ));
             }
+            let canonical_tool_name = canonical_tool_call_name(&tool_call.function.name);
+            if matches!(tool_status, ExecutionResultStatus::Succeeded) {
+                if let Some(failure) = validate_task_content_requirements(
+                    task,
+                    &canonical_tool_name,
+                    tool_call,
+                    &result,
+                ) {
+                    content_requirement_failures.push(failure);
+                } else {
+                    completed_tool_names_this_round.push(canonical_tool_name);
+                }
+            }
             tool_call_records.push(tool_call_record(tool_call, &result));
             messages.push(ChatMessage {
                 role: "tool".to_string(),
@@ -877,11 +910,42 @@ fn run_task_llm_loop_inner(
         record_completed_required_tools(
             &mut completed_required_tool_names,
             &required_tool_chain,
-            &parsed
-                .tool_calls
-                .iter()
-                .map(|tool_call| canonical_tool_call_name(&tool_call.function.name))
-                .collect::<Vec<_>>(),
+            &completed_tool_names_this_round,
+        );
+        if !content_requirement_failures.is_empty() {
+            messages.push(ChatMessage {
+                role: "user".to_string(),
+                content: Some(format!(
+                    "上一轮工具调用没有满足当前任务的硬性内容要求：{}。请基于当前任务原文重新调用下一个缺失工具，必须逐字保留文件名、marker 和每一行要求。",
+                    content_requirement_failures.join("；")
+                )),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+            });
+        }
+    }
+
+    if !required_tool_chain_is_complete(&required_tool_chain, &completed_required_tool_names) {
+        let failure_reason = required_tool_chain_recovery_prompt(
+            &required_tool_chain,
+            &completed_required_tool_names,
+        );
+        append_task_error_turn_item(
+            event_bus,
+            session_store,
+            task_store,
+            task,
+            session_id,
+            workspace_id,
+            &turn_visibility,
+            &failure_reason,
+            streaming_entry_id.or(last_stream_item_id.as_deref()),
+        );
+        return (
+            TaskOutcome::Failed {
+                error: failure_reason,
+            },
+            context_summary,
         );
     }
 
@@ -959,7 +1023,7 @@ fn run_task_llm_loop_inner(
         );
     }
 
-    if task.kind == TaskKind::Validation && validation_result_rejects_delivery(&final_content) {
+    if task_has_validation_gate(task) && validation_result_rejects_delivery(&final_content) {
         let failure_reason = compact_validation_failure(&final_content);
         append_task_error_turn_item(
             event_bus,
@@ -1004,9 +1068,9 @@ fn run_task_llm_loop_inner(
         &summarize_final_for_lane(&final_content),
     );
 
-    // P6b：把本轮 LLM 对话追写进 thread 历史，供下一 task 作为上下文。
-    // 过滤掉 system 消息（prompt、workspace 上下文、历史边界标记）——这些会在下一 task
-    // 启动时由 run_task_llm_loop 自动重建；只沉淀真实对话（user / assistant / tool）。
+    // P6b：把本轮 LLM 对话追写进当前 thread 的审计 / 恢复记录。
+    // 过滤掉 system 消息（prompt、workspace 上下文、边界标记），只沉淀真实对话
+    //（user / assistant / tool）。
     // 补写 assistant final：循环里只把 assistant 写进 messages 是在"还有下一轮"时发生，
     // 最终 final_content 作为收尾时没有入列，这里用 final_content 显式收口。
     let mut turn_messages: Vec<ThreadChatMessage> = messages
@@ -1028,6 +1092,145 @@ fn run_task_llm_loop_inner(
         },
         context_summary,
     )
+}
+
+fn render_mailbox_items_for_prompt(items: &[MailboxItem]) -> Option<String> {
+    if items.is_empty() {
+        return None;
+    }
+    let mut rendered = String::from(
+        "[mailbox]\n以下是本 Conversation 在上一轮 Turn 之后收到的运行时输入；必须把它们当作当前 Turn 的直接输入处理。\n",
+    );
+    for (index, item) in items.iter().enumerate() {
+        match item {
+            MailboxItem::User(signal) => {
+                rendered.push_str(&format!(
+                    "\n- item: {}\n  author: user\n  kind: message\n  trigger_turn: true\n  payload: {}\n",
+                    index + 1,
+                    signal.text.as_deref().unwrap_or("")
+                ));
+            }
+            MailboxItem::Runtime(signal) => {
+                rendered.push_str(&format!(
+                    "\n- item: {}\n  author: {}\n  kind: {}\n  trigger_turn: {}\n  payload: {}\n",
+                    index + 1,
+                    mailbox_author_label(&signal.author),
+                    mailbox_kind_label(signal.kind),
+                    signal.trigger_turn,
+                    signal.payload
+                ));
+            }
+        }
+    }
+    Some(rendered)
+}
+
+fn validate_task_content_requirements(
+    task: &Task,
+    tool_name: &str,
+    tool_call: &ChatToolCall,
+    tool_result: &str,
+) -> Option<String> {
+    let required_literals = task_required_content_literals(task);
+    if required_literals.is_empty() {
+        return None;
+    }
+    let observed_content = match tool_name {
+        "file_write" => tool_call_content_argument(tool_call),
+        "file_read" => tool_result_content_field(tool_result),
+        _ => return None,
+    };
+    let missing = required_literals
+        .iter()
+        .filter(|literal| {
+            observed_content
+                .as_deref()
+                .is_none_or(|content| !content.contains(literal.as_str()))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        None
+    } else {
+        Some(format!("{tool_name} 内容缺少 {}", missing.join(", ")))
+    }
+}
+
+fn task_required_content_literals(task: &Task) -> Vec<String> {
+    if task.kind != magi_core::TaskKind::LocalAgent {
+        return Vec::new();
+    }
+    let goal = task.goal.trim();
+    let Some((_, after_anchor)) = goal
+        .split_once("文件内容必须包含")
+        .or_else(|| goal.split_once("content must contain"))
+        .or_else(|| goal.split_once("must contain"))
+    else {
+        return Vec::new();
+    };
+    let requirement = after_anchor
+        .split(['。', '\n'])
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .trim_start_matches(['：', ':'])
+        .trim_start_matches("三行")
+        .trim_start_matches(['：', ':'])
+        .trim();
+    requirement
+        .split(['、', '；', ';'])
+        .map(|part| part.trim().trim_matches(['，', ',', '。', '.']))
+        .filter(|part| part.contains(':'))
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn tool_call_content_argument(tool_call: &ChatToolCall) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(&tool_call.function.arguments)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned)
+        })
+}
+
+fn tool_result_content_field(tool_result: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(tool_result)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned)
+        })
+}
+
+fn task_has_validation_gate(task: &Task) -> bool {
+    task.policy_snapshot
+        .as_ref()
+        .is_some_and(|policy| policy.validation_profile.is_some())
+}
+
+fn mailbox_author_label(author: &MailboxAuthor) -> String {
+    match author {
+        MailboxAuthor::User => "user".to_string(),
+        MailboxAuthor::Agent(id) => format!("agent:{id}"),
+        MailboxAuthor::System => "system".to_string(),
+        MailboxAuthor::Parent(id) => format!("parent:{id}"),
+        MailboxAuthor::Child(id) => format!("child:{id}"),
+    }
+}
+
+fn mailbox_kind_label(kind: MailboxKind) -> &'static str {
+    match kind {
+        MailboxKind::Message => "message",
+        MailboxKind::Decision => "decision",
+        MailboxKind::Interrupt => "interrupt",
+        MailboxKind::AgentResult => "agent_result",
+        MailboxKind::Followup => "followup",
+    }
 }
 
 fn task_event_context(
@@ -1481,7 +1684,7 @@ mod tests {
     use super::*;
     use magi_bridge_client::{BridgeClientError, BridgeErrorLayer, BridgeResponse};
     use magi_core::{
-        ApprovalRequirement, MissionId, RiskLevel, Task, TaskKind, TaskStatus, WorkerId,
+        ApprovalRequirement, MissionId, RiskLevel, Task, TaskKind, TaskStatus, TaskTier, WorkerId,
     };
     use magi_governance::GovernanceService;
     use magi_session_store::{
@@ -1696,9 +1899,9 @@ mod tests {
             network_mode: "full".to_string(),
             command_mode: "full".to_string(),
             retry_limit: 1,
-            repair_limit: 1,
             validation_profile: Some("required".to_string()),
             checkpoint_mode: "task_or_phase".to_string(),
+            task_tier: TaskTier::LongMission,
             background_allowed: true,
             escalation_conditions: Vec::new(),
         });
@@ -1718,6 +1921,81 @@ mod tests {
         assert!(
             task_required_tool_chain(&task).is_empty(),
             "只读阶段即使复述用户目标，也不能强制执行写工具链"
+        );
+    }
+
+    #[test]
+    fn local_agent_infers_file_write_and_read_from_concrete_file_goal() {
+        let mut task = make_task_loop_test_task("task-required-tool-chain-natural-language");
+        task.goal = "请在当前工作区创建文件 v2-task-system-e2e.md，文件内容必须包含 marker: V2_TASK_E2E。创建后读取该文件验证内容。"
+            .to_string();
+        task.policy_snapshot = Some(magi_core::TaskPolicy {
+            autonomy_level: "Autonomous".to_string(),
+            approval_mode: "DecisionOnly".to_string(),
+            allowed_tools: Vec::new(),
+            denied_tools: Vec::new(),
+            allowed_paths: Vec::new(),
+            denied_paths: Vec::new(),
+            network_mode: "full".to_string(),
+            command_mode: "full".to_string(),
+            retry_limit: 1,
+            validation_profile: Some("required".to_string()),
+            checkpoint_mode: "task_or_phase".to_string(),
+            task_tier: TaskTier::LongMission,
+            background_allowed: true,
+            escalation_conditions: Vec::new(),
+        });
+
+        assert_eq!(
+            task_required_tool_chain(&task),
+            vec!["file_write".to_string(), "file_read".to_string()]
+        );
+    }
+
+    #[test]
+    fn content_requirement_validation_rejects_marker_typos() {
+        let mut task = make_task_loop_test_task("task-content-requirement");
+        task.goal = "请创建文件 demo.md，文件内容必须包含三行：title: v2 task concrete progress、marker: V2_TASK_E2E_123、status: completed。创建后读取该文件验证内容。"
+            .to_string();
+        let bad_write = ChatToolCall {
+            id: "call-bad-write".to_string(),
+            kind: "function".to_string(),
+            function: magi_bridge_client::ChatToolFunction {
+                name: "file_write".to_string(),
+                arguments: serde_json::json!({
+                    "path": "/tmp/demo.md",
+                    "content": "title: v2 task concrete progress\nmarker: V2_TASK_EE_123\nstatus: completed\n"
+                })
+                .to_string(),
+            },
+        };
+        let good_write = ChatToolCall {
+            id: "call-good-write".to_string(),
+            kind: "function".to_string(),
+            function: magi_bridge_client::ChatToolFunction {
+                name: "file_write".to_string(),
+                arguments: serde_json::json!({
+                    "path": "/tmp/demo.md",
+                    "content": "title: v2 task concrete progress\nmarker: V2_TASK_E2E_123\nstatus: completed\n"
+                })
+                .to_string(),
+            },
+        };
+
+        assert_eq!(
+            task_required_content_literals(&task),
+            vec![
+                "title: v2 task concrete progress".to_string(),
+                "marker: V2_TASK_E2E_123".to_string(),
+                "status: completed".to_string()
+            ]
+        );
+        assert!(
+            validate_task_content_requirements(&task, "file_write", &bad_write, "{}")
+                .is_some_and(|failure| failure.contains("marker: V2_TASK_E2E_123"))
+        );
+        assert!(
+            validate_task_content_requirements(&task, "file_write", &good_write, "{}").is_none()
         );
     }
 
@@ -1761,9 +2039,9 @@ mod tests {
             network_mode: "full".to_string(),
             command_mode: "no_tools".to_string(),
             retry_limit: 1,
-            repair_limit: 1,
             validation_profile: Some("required".to_string()),
             checkpoint_mode: "task_or_phase".to_string(),
+            task_tier: TaskTier::LongMission,
             background_allowed: true,
             escalation_conditions: Vec::new(),
         });
@@ -1777,7 +2055,7 @@ mod tests {
         planning.output_refs = vec![planning_content];
         task_store.insert_task(planning);
         let mut validation = make_task_loop_test_task("task-planning-validation-deterministic");
-        validation.kind = TaskKind::Validation;
+        validation.kind = TaskKind::LocalAgent;
         validation.title = "规划 验证".to_string();
         validation.goal =
             "验证 规划 阶段产出是否包含目标、边界、执行计划和验收标准；只验证规划文本完整性"
@@ -1818,7 +2096,7 @@ mod tests {
         task_store.insert_task(action);
 
         let mut validation = make_task_loop_test_task("task-execution-validation");
-        validation.kind = TaskKind::Validation;
+        validation.kind = TaskKind::LocalAgent;
         validation.title = "执行 验证".to_string();
         validation.goal = "验证 执行 阶段是否按用户目标完成实际执行和工具结果。".to_string();
         validation.dependency_ids = vec![TaskId::new("task-execution-output")];
@@ -1918,15 +2196,14 @@ mod tests {
             mission_id: MissionId::new("mission-task-loop"),
             root_task_id: TaskId::new(task_id),
             parent_task_id: None,
-            kind: TaskKind::Action,
+            kind: TaskKind::LocalAgent,
             title: "验证 worker 工具并发".to_string(),
-            goal: "同一轮只读 shell 工具需要并发执行，并保持消息顺序".to_string(),
+            goal: "确认 worker 在同一轮内可以并发完成只读操作并保持消息顺序".to_string(),
             status: TaskStatus::Running,
             dependency_ids: Vec::new(),
             required_children: Vec::new(),
             policy_snapshot: None,
             executor_binding: None,
-            context_refs: Vec::new(),
             knowledge_refs: Vec::new(),
             workspace_scope: None,
             write_scope: None,
@@ -1934,9 +2211,7 @@ mod tests {
             output_refs: Vec::new(),
             evidence_refs: Vec::new(),
             retry_count: 0,
-            repair_count: 0,
-            decision_payload: None,
-            variant: magi_core::TaskVariant::default(),
+            runtime_payload: magi_core::TaskRuntimePayload::default(),
             created_at: UtcMillis::now(),
             updated_at: UtcMillis::now(),
         }
@@ -1969,7 +2244,7 @@ mod tests {
             session_store.ensure_session_mission(&session_id, now, || task.mission_id.clone());
         // P7：mainline 场景 task 自身 thread = orchestrator thread。
         let thread_id = orchestrator_thread_id.clone();
-        let (outcome, _) = run_task_llm_loop(TaskLlmLoopRequest {
+        let (outcome, _) = run_conversation_loop(ConversationLoopRequest {
             client: &client,
             event_bus: &event_bus,
             session_store: &session_store,
@@ -1977,6 +2252,7 @@ mod tests {
             tool_registry: None,
             skill_runtime: None,
             task_store: &task_store,
+            execution_registry: &TaskExecutionRegistry::default(),
             conversation_registry: &ConversationRegistry::new(),
             stream_fanout: &StreamFanOut::new(),
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
@@ -2015,7 +2291,23 @@ mod tests {
     #[test]
     fn validation_task_negative_final_marks_task_failed() {
         let mut task = make_task_loop_test_task("task-validation-negative-final");
-        task.kind = TaskKind::Validation;
+        task.kind = TaskKind::LocalAgent;
+        task.policy_snapshot = Some(magi_core::TaskPolicy {
+            autonomy_level: "Autonomous".to_string(),
+            approval_mode: "DecisionOnly".to_string(),
+            allowed_tools: Vec::new(),
+            denied_tools: Vec::new(),
+            allowed_paths: Vec::new(),
+            denied_paths: Vec::new(),
+            network_mode: "full".to_string(),
+            command_mode: "full".to_string(),
+            retry_limit: 1,
+            validation_profile: Some("required".to_string()),
+            checkpoint_mode: "turn".to_string(),
+            task_tier: TaskTier::ExecutionChain,
+            background_allowed: false,
+            escalation_conditions: Vec::new(),
+        });
 
         let outcome = run_static_task_final(&task, "不通过。\n\n原因：缺少文件写入证据。");
 
@@ -2089,7 +2381,7 @@ mod tests {
             session_store.ensure_session_mission(&session_id, now, || task.mission_id.clone());
         let thread_id = orchestrator_thread_id.clone();
 
-        let (outcome, _) = run_task_llm_loop(TaskLlmLoopRequest {
+        let (outcome, _) = run_conversation_loop(ConversationLoopRequest {
             client: &client,
             event_bus: &event_bus,
             session_store: &session_store,
@@ -2097,6 +2389,7 @@ mod tests {
             tool_registry: None,
             skill_runtime: None,
             task_store: &task_store,
+            execution_registry: &TaskExecutionRegistry::default(),
             conversation_registry: &ConversationRegistry::new(),
             stream_fanout: &StreamFanOut::new(),
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
@@ -2308,7 +2601,7 @@ mod tests {
         let root_task_id = TaskId::new("task-root-final-root-running");
         let task_id = TaskId::new("task-action-final-root-running");
         let mut root_task = make_task_loop_test_task(root_task_id.as_str());
-        root_task.kind = TaskKind::Objective;
+        root_task.kind = TaskKind::LocalAgent;
         root_task.status = TaskStatus::Running;
         task_store.insert_task(root_task);
         let mut task = make_task_loop_test_task(task_id.as_str());
@@ -2360,7 +2653,7 @@ mod tests {
     }
 
     #[test]
-    fn task_llm_loop_model_failure_writes_failed_turn_item_and_canonical_turn() {
+    fn conversation_loop_model_failure_writes_failed_turn_item_and_canonical_turn() {
         let session_store = SessionStore::new();
         let event_bus = InMemoryEventBus::new(64);
         let session_id = SessionId::new("session-task-model-failure");
@@ -2409,7 +2702,7 @@ mod tests {
             session_store.ensure_session_mission(&session_id, now, || task.mission_id.clone());
         let thread_id = orchestrator_thread_id.clone();
 
-        let (outcome, _) = run_task_llm_loop(TaskLlmLoopRequest {
+        let (outcome, _) = run_conversation_loop(ConversationLoopRequest {
             client: &FailingTaskModelBridgeClient,
             event_bus: &event_bus,
             session_store: &session_store,
@@ -2417,6 +2710,7 @@ mod tests {
             tool_registry: None,
             skill_runtime: None,
             task_store: &task_store,
+            execution_registry: &TaskExecutionRegistry::default(),
             conversation_registry: &ConversationRegistry::new(),
             stream_fanout: &StreamFanOut::new(),
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
@@ -2502,7 +2796,7 @@ mod tests {
                 .timeline_for_session(&session_id)
                 .iter()
                 .all(|entry| entry.entry_id != streaming_entry_id),
-            "失败终态不能再写回 legacy completed snapshot"
+            "失败终态不能写回 completed snapshot"
         );
 
         let terminal_error_event = event_bus
@@ -2526,7 +2820,7 @@ mod tests {
     }
 
     #[test]
-    fn task_llm_loop_read_only_shell_tools_execute_concurrently_and_preserve_order() {
+    fn conversation_loop_read_only_shell_tools_execute_concurrently_and_preserve_order() {
         let session_store = SessionStore::new();
         let event_bus = InMemoryEventBus::new(64);
         let session_id = SessionId::new("session-task-tool-batch");
@@ -2547,31 +2841,29 @@ mod tests {
         let now = UtcMillis::now();
         let (_, orchestrator_thread_id) =
             session_store.ensure_session_mission(&session_id, now, || task.mission_id.clone());
-        // worker lane 必须绑定到独立的 worker thread —— 由角色维度 ensure。
-        // worker thread 复用逻辑在生产代码里由 session_thread helper 承担；
-        // 这里直接展开等价逻辑，避免测试夹具跨模块依赖 API 适配层。
+        // worker lane 必须绑定到本 task 独占的 worker thread；历史 thread 只做审计，
+        // 不能复用为新的执行上下文。
         let worker_thread_id = {
             let role_id = "integration-dev";
-            if let Some(existing) = session_store.find_idle_thread_for_role(&session_id, role_id) {
-                session_store.activate_thread(&existing.thread_id, &task_id, now);
-                existing.thread_id
-            } else {
-                let new_thread = ExecutionThread {
-                    thread_id: ThreadId::new(format!("thread-{role_id}-{}", now.0)),
-                    session_id: session_id.clone(),
-                    mission_id: task.mission_id.clone(),
-                    role_id: role_id.to_string(),
-                    worker_instance_id: worker_id.clone(),
-                    status: ExecutionThreadStatus::Active,
-                    created_at: now,
-                    last_used_at: now,
-                    handled_task_ids: vec![task_id.clone()],
-                    message_history: Vec::new(),
-                };
-                let thread_id = new_thread.thread_id.clone();
-                session_store.register_thread(new_thread);
-                thread_id
-            }
+            let new_thread = ExecutionThread {
+                thread_id: ThreadId::new(format!(
+                    "thread-{role_id}-{}-{}",
+                    task_id.as_str(),
+                    now.0
+                )),
+                session_id: session_id.clone(),
+                mission_id: task.mission_id.clone(),
+                role_id: role_id.to_string(),
+                worker_instance_id: worker_id.clone(),
+                status: ExecutionThreadStatus::Active,
+                created_at: now,
+                last_used_at: now,
+                handled_task_ids: vec![task_id.clone()],
+                message_history: Vec::new(),
+            };
+            let thread_id = new_thread.thread_id.clone();
+            session_store.register_thread(new_thread);
+            thread_id
         };
         session_store
             .upsert_current_turn(
@@ -2627,7 +2919,7 @@ mod tests {
         };
         let usage_binding = crate::usage_recording::session_turn_model_usage_binding(true);
 
-        let (outcome, _) = run_task_llm_loop(TaskLlmLoopRequest {
+        let (outcome, _) = run_conversation_loop(ConversationLoopRequest {
             client: &client,
             event_bus: &event_bus,
             session_store: &session_store,
@@ -2635,6 +2927,7 @@ mod tests {
             tool_registry: Some(&tool_registry),
             skill_runtime: None,
             task_store: &task_store,
+            execution_registry: &TaskExecutionRegistry::default(),
             conversation_registry: &ConversationRegistry::new(),
             stream_fanout: &StreamFanOut::new(),
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),

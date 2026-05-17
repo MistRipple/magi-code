@@ -1,0 +1,21 @@
+[package]
+name = "magi-mission"
+version.workspace = true
+edition.workspace = true
+
+# Task System v2 §1.4 读端契约：Mission 聚合恢复入口。
+# 调用方向：magi-mission → 7 个 Tier 4 store；7 个 store **不可反向依赖** magi-mission
+# （避免循环；store 是底层契约，aggregate 是上层视图）。
+[dependencies]
+magi-core = { path = "../magi-core" }
+magi-mission-charter = { path = "../magi-mission-charter" }
+magi-plan = { path = "../magi-plan" }
+magi-knowledge-graph = { path = "../magi-knowledge-graph" }
+magi-validation-runner = { path = "../magi-validation-runner" }
+magi-mission-workspace = { path = "../magi-mission-workspace" }
+magi-checkpoint = { path = "../magi-checkpoint" }
+magi-human-checkpoint = { path = "../magi-human-checkpoint" }
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

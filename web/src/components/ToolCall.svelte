@@ -489,8 +489,8 @@
     if (matches(
       'orchestrator',
       'worker_dispatch delegation',
-      'orchestrator cannot execute tools in deep mode',
-      '深度模式下编排者不可直接执行',
+      'orchestrator cannot execute tools in long mission',
+      'Long Mission 下编排者不可直接执行',
       '请通过 worker_dispatch 委派给 worker',
     )) {
       return {

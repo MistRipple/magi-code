@@ -1,6 +1,7 @@
 pub mod errors;
 pub mod execution;
 pub mod ids;
+pub mod paths;
 pub mod status;
 pub mod task;
 pub mod value_objects;
@@ -20,7 +21,7 @@ pub use status::{
     VerificationStatus, WorkerLifecycleStatus, WorkspaceLifecycleStatus,
 };
 pub use task::{
-    ProgressSummary, Task, TaskKind, TaskPolicy, TaskProjection, TaskStatus, TaskVariant,
-    WorkPackageSummary,
+    ProgressSummary, Task, TaskKind, TaskPolicy, TaskProjection, TaskRuntimePayload, TaskStatus,
+    TaskTier,
 };
 pub use value_objects::{AbsolutePath, UtcMillis, WorkspaceRootPath, WorktreeRootPath};

@@ -1,8 +1,8 @@
 //! Task System v2 — L7 Permissions：三维（工具 / 目录 / 命令）× 五模式
 //! （default / acceptAll / acceptEdits / plan / bypassPermissions）权限引擎。
 //!
-//! 目标：把 v1 散落在多处的 read-only 判定、工具白名单 if-else、shell 命令
-//! 写入识别、Task.policy 中的 allow/deny 列表统一收敛到一个 `PermissionEngine`，
+//! 目标：把 read-only 判定、工具白名单、shell 命令写入识别、Task.policy
+//! 中的 allow/deny 列表统一收敛到一个 `PermissionEngine`，
 //! 让 Conversation/Task 在调用工具或访问路径前都经过同一份判定。
 //!
 //! 设计要点：
@@ -94,7 +94,7 @@ pub enum PermissionRequest<'a> {
         kind: PathAccessKind,
     },
     /// shell 命令分类：caller 把 shell_exec 的 `arguments` 原文传进来，由引擎
-    /// 推断这是不是只读命令（与 v1 `shell_arguments_request_read_only` 等价）。
+    /// 推断这是不是只读命令。
     ShellCommand { arguments_json: &'a str },
 }
 
@@ -174,7 +174,7 @@ pub struct PermissionEngine {
 }
 
 impl PermissionEngine {
-    /// 默认构造：注入 v1 中分散在多处的"已知只读"工具名 + "已知编辑"工具名。
+    /// 默认构造：注入内置的"已知只读"工具名 + "已知编辑"工具名。
     /// 这两份名单是 magi 内置工具语义的客观分类，可被 caller 通过 builder 扩展。
     pub fn with_builtin_defaults() -> Self {
         Self {
@@ -324,8 +324,7 @@ impl PermissionEngine {
         }
     }
 
-    /// v1 `shell_arguments_request_read_only` 的语义复制：检查 arguments JSON
-    /// 顶层是否有 `access_mode` / `write_mode` 字段且取值在只读集合里。
+    /// 检查 arguments JSON 顶层是否有 `access_mode` / `write_mode` 字段且取值在只读集合里。
     pub fn shell_arguments_request_read_only(arguments_json: &str) -> bool {
         serde_json::from_str::<serde_json::Value>(arguments_json)
             .ok()
@@ -348,7 +347,7 @@ impl PermissionEngine {
             .unwrap_or(false)
     }
 
-    /// v1 worker_duplicate_guard 复用入口：caller 直接拿 list 用于 dedup 逻辑。
+    /// caller 直接拿 list 用于 dedup 逻辑。
     pub fn read_only_tool_names(&self) -> Vec<&'static str> {
         self.read_only_tools.iter().copied().collect()
     }
@@ -358,8 +357,7 @@ fn path_is_within(target: &Path, root: &Path) -> bool {
     target.starts_with(root)
 }
 
-/// 与 v1 worker_duplicate_guard::read_only_tool_names 完全一致，确保切换后
-/// 现有 dedup 行为不变。
+/// 内置只读工具名，供权限判定与 dedup 逻辑共享。
 const BUILTIN_READ_ONLY_TOOLS: &[&str] = &[
     "file_view",
     "code_search_regex",

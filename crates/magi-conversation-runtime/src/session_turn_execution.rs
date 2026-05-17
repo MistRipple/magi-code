@@ -1,4 +1,4 @@
-//! Task System v2 — session turn execution（M04c：下沉自 magi-api）
+//! Task System v2 — session turn execution
 //!
 //! 错误返回值改为 `Result<_, String>`，调用方在 magi-api 边界用
 //! `.map_err(|msg| ApiError::model_invocation_failed("执行 session turn 失败", msg))`

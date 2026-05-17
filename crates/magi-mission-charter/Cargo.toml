@@ -6,6 +6,9 @@ edition.workspace = true
 [dependencies]
 magi-core = { path = "../magi-core" }
 magi-event-bus = { path = "../magi-event-bus" }
+# Charter frozen 后修改必须绑定一条 Approved HumanCheckpoint（不变式：MissionCharter
+# 生命周期 §1.6 / §3.1 Option B）。Charter → HumanCheckpoint 单向依赖。
+magi-human-checkpoint = { path = "../magi-human-checkpoint" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

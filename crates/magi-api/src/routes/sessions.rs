@@ -9,14 +9,18 @@ use magi_bridge_client::{
 };
 use magi_conversation_runtime::session_turn_execution::SessionTurnExecutionRequest;
 use magi_conversation_runtime::session_writeback::publish_current_session_turn_item_event;
+use magi_conversation_runtime::{
+    MailboxAuthor, MailboxKind, RuntimeSignal, task_execution_registry::TaskExecutionPlan,
+};
 use magi_core::TaskStatus;
 use magi_core::{
-    DomainError, EventId, MissionId, SessionId, Task, TaskId, UtcMillis, WorkerId, WorkspaceId,
+    DomainError, EventId, MissionId, SessionId, Task, TaskId, TaskTier, UtcMillis, WorkerId,
+    WorkspaceId,
 };
 use magi_event_bus::{EventContext, EventEnvelope};
 use magi_session_store::{
     ActiveExecutionTurn, ActiveExecutionTurnItem, CANONICAL_TURN_SCHEMA_VERSION, CanonicalTurn,
-    NotificationRecord, SessionRecord, TimelineEntryKind,
+    NotificationRecord, SessionRecord, ThreadChatMessage, TimelineEntryKind,
 };
 use magi_tool_runtime::BuiltinToolName;
 use serde::{Deserialize, Serialize};
@@ -133,6 +137,7 @@ async fn submit_session_turn(
                 &request,
                 decision.task_title.clone(),
                 decision.execution_goal.clone(),
+                decision.task_tier,
             )?;
             super::finalize_session_task_dispatch(state.clone(), accepted.clone());
             let execution_chain_ref = state
@@ -250,6 +255,7 @@ struct SessionTurnIntentDecision {
     route: SessionTurnRouteDto,
     task_title: Option<String>,
     execution_goal: Option<String>,
+    task_tier: TaskTier,
     required_workers: Vec<String>,
     tool_intent: Option<String>,
     forced_tool_name: Option<String>,
@@ -260,7 +266,7 @@ struct SessionTurnIntentDecision {
     task_evidence: Vec<String>,
 }
 
-static SUPPLEMENT_CONTEXT_COUNTER: AtomicU64 = AtomicU64::new(1);
+static SUPPLEMENT_SIGNAL_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 fn submit_supplement_context_turn(
     state: &ApiState,
@@ -273,7 +279,7 @@ fn submit_supplement_context_turn(
     let message = signal
         .text
         .clone()
-        .ok_or_else(|| ApiError::InvalidInput("补充上下文消息不能为空".to_string()))?;
+        .ok_or_else(|| ApiError::InvalidInput("运行时 followup 消息不能为空".to_string()))?;
     let store = state
         .task_store()
         .ok_or_else(|| ApiError::internal_assembly("supplement context", "task_store 未配置"))?;
@@ -284,35 +290,72 @@ fn submit_supplement_context_turn(
         .ok_or_else(|| ApiError::session_not_found(session_id.as_str()))?;
     let mission_id = ownership
         .mission_id
-        .ok_or_else(|| ApiError::InvalidInput("当前会话没有活跃任务链".to_string()))?;
+        .ok_or_else(|| ApiError::InvalidInput("当前会话没有活跃任务".to_string()))?;
 
     let root_task = store
         .get_tasks_by_mission(&mission_id)
         .into_iter()
         .find(|task| task.parent_task_id.is_none())
         .ok_or_else(|| ApiError::InvalidInput("当前 Mission 没有根任务".to_string()))?;
-    let context_task = resolve_supplement_context_task(
+    let target_task = resolve_supplement_target_task(
         store,
         &mission_id,
         &root_task,
-        request.context_task_id.as_deref(),
+        request.target_task_id.as_deref(),
     )?;
-    let context_task_id = context_task.task_id.clone();
+    let target_task_id = target_task.task_id.clone();
 
-    let context_ref = format!(
-        "intake-context-{}-{}",
+    let mailbox_signal_ref = format!(
+        "mailbox-signal-{}-{}",
         UtcMillis::now().0,
-        SUPPLEMENT_CONTEXT_COUNTER.fetch_add(1, Ordering::SeqCst)
+        SUPPLEMENT_SIGNAL_COUNTER.fetch_add(1, Ordering::SeqCst)
     );
-    store
-        .append_context_entry(&context_task_id, context_ref.clone(), message.clone())
-        .map_err(|error| ApiError::internal_assembly("补充上下文失败", error.to_string()))?;
+    let thread_id = match state.task_execution_registry().get(&target_task_id) {
+        Some(TaskExecutionPlan::Dispatch { thread_id, .. }) => Some(thread_id),
+        None if target_task_id == root_task.task_id => state
+            .session_store
+            .orchestrator_thread_for_session(&session_id)
+            .map(|thread| thread.thread_id),
+        None => None,
+    }
+    .ok_or_else(|| {
+        ApiError::InvalidInput(format!(
+            "任务 {} 尚未注册执行 thread，无法投递运行时输入",
+            target_task_id
+        ))
+    })?;
+
+    let signal_payload = json!({
+        "signal_ref": mailbox_signal_ref,
+        "text": message,
+        "target_task_id": target_task_id.to_string(),
+    });
+    state
+        .conversation_registry
+        .conversation_for_task(&session_id, &target_task_id)
+        .lock()
+        .expect("target task Conversation mutex poisoned")
+        .ingest_runtime_signal(RuntimeSignal {
+            author: MailboxAuthor::User,
+            kind: MailboxKind::Followup,
+            trigger_turn: true,
+            payload: signal_payload.clone(),
+            enqueued_at: accepted_at,
+        });
+    state.session_store.append_thread_messages(
+        &thread_id,
+        vec![ThreadChatMessage {
+            role: "system".to_string(),
+            content: Some(format!(
+                "[mailbox]\nauthor=user\nkind=followup\npayload={}",
+                signal_payload
+            )),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        }],
+        accepted_at,
+    );
     let entry_id = format!("timeline-{}-{}", session_id, accepted_at.0);
-    state.session_store.append_timeline_entry(
-        session_id.clone(),
-        TimelineEntryKind::UserMessage,
-        format!("[补充上下文] {}", message),
-    );
     state.persist_session_durable_state()?;
 
     let event_id = EventId::new(format!(
@@ -332,16 +375,16 @@ fn submit_supplement_context_turn(
         None,
         None,
     )
-    .with_supplement_context(context_ref, context_task_id.to_string()))
+    .with_supplement_signal(mailbox_signal_ref, target_task_id.to_string()))
 }
 
-fn resolve_supplement_context_task(
+fn resolve_supplement_target_task(
     store: &magi_orchestrator::task_store::TaskStore,
     mission_id: &MissionId,
     root_task: &Task,
-    context_task_id: Option<&str>,
+    target_task_id: Option<&str>,
 ) -> Result<Task, ApiError> {
-    let Some(raw) = context_task_id
+    let Some(raw) = target_task_id
         .map(str::trim)
         .filter(|value| !value.is_empty())
     else {
@@ -350,7 +393,7 @@ fn resolve_supplement_context_task(
     let task_id = TaskId::new(raw);
     let task = store
         .get_task(&task_id)
-        .ok_or_else(|| ApiError::InvalidInput(format!("上下文任务不存在: {raw}")))?;
+        .ok_or_else(|| ApiError::InvalidInput(format!("目标任务不存在: {raw}")))?;
     if task.mission_id != *mission_id {
         return Err(ApiError::InvalidInput(format!("任务 {raw} 不属于当前会话")));
     }
@@ -446,10 +489,11 @@ fn build_session_turn_classifier_prompt(
         "Session Turn 编排分类器\n\
          请只调用 classify_session_turn 工具，输出本轮 route。\n\
          route 只能是 chat、execute、task、continue。\n\
-         普通问答使用 chat；需要工具但不创建任务图使用 execute；需要产品级任务编排使用 task；用户要求继续且存在可恢复链时使用 continue。\n\
+         普通问答使用 chat；需要工具但不创建任务投影使用 execute；需要产品级任务编排使用 task；用户要求继续且存在可恢复链时使用 continue。\n\
          明确要求画、绘制、生成或渲染流程图、关系图、架构图、时序图、Mermaid、DOT、Graphviz 等可视化图表时必须选择 execute，toolIntent 必须要求直接调用 diagram_render，不允许在 chat 中让用户自己调用工具。\n\
-         如果选择 task，必须给出 confidence、reasonCode、routeReason 和至少 1 条 taskEvidence；只有明确需要多步骤结构化执行、实现/修复/重构、深度任务或多 worker 协作时才选择 task。\n\
-         普通问答、状态追问、简单解释和寒暄必须选择 chat，不能只因为措辞模糊就创建任务图。\n\
+         如果选择 task，必须给出 confidence、reasonCode、routeReason、taskTier 和至少 1 条 taskEvidence；只有明确需要多步骤结构化执行、实现/修复/重构、长期复杂任务或多 worker 协作时才选择 task。\n\
+         taskTier 只能是 execution_chain 或 long_mission。中等任务、多步骤实现、修复、调研、验证、多 worker 协作选择 execution_chain；跨多轮、多阶段、可中断恢复、长期事实沉淀、人审、计划审计或强验收闭环的复杂 Mission 选择 long_mission。\n\
+         普通问答、状态追问、简单解释和寒暄必须选择 chat，不能只因为措辞模糊就创建任务投影。\n\
          userText={user_text}\n\
          skillName=\"{skill_name}\"\n\
          imageCount={}\n\
@@ -468,7 +512,7 @@ fn session_turn_classifier_tool() -> ChatToolDefinition {
             parameters: json!({
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["route", "confidence", "reasonCode", "routeReason", "taskEvidence"],
+                "required": ["route", "confidence", "reasonCode", "routeReason", "taskTier", "taskEvidence"],
                 "properties": {
                     "route": {
                         "type": "string",
@@ -495,6 +539,10 @@ fn session_turn_classifier_tool() -> ChatToolDefinition {
                         ]
                     },
                     "routeReason": { "type": ["string", "null"] },
+                    "taskTier": {
+                        "type": "string",
+                        "enum": ["execution_chain", "long_mission"]
+                    },
                     "taskEvidence": {
                         "type": "array",
                         "items": { "type": "string" }
@@ -576,10 +624,20 @@ fn session_turn_decision_from_value(
             ));
         }
     };
+    let task_tier = match value.get("taskTier").and_then(|value| value.as_str()) {
+        Some("long_mission") => TaskTier::LongMission,
+        Some("execution_chain") | None => TaskTier::ExecutionChain,
+        Some(other) => {
+            return Err(ApiError::InvalidInput(format!(
+                "Session Turn 分类器返回未知 taskTier: {other}"
+            )));
+        }
+    };
     Ok(SessionTurnIntentDecision {
         route,
         task_title: optional_trimmed_string(&value, "taskTitle"),
         execution_goal: optional_trimmed_string(&value, "executionGoal"),
+        task_tier,
         required_workers: value
             .get("requiredWorkers")
             .and_then(|value| value.as_array())
@@ -624,12 +682,43 @@ fn normalize_session_turn_decision(
     mut decision: SessionTurnIntentDecision,
     request: &SessionTurnRequestDto,
 ) -> SessionTurnIntentDecision {
+    if !matches!(decision.route, SessionTurnRouteDto::Continue)
+        && session_turn_requests_explicit_task_or_worker_mode(request)
+    {
+        let task_text = request
+            .trimmed_text()
+            .unwrap_or_else(|| request.timeline_message(None));
+        decision.route = SessionTurnRouteDto::Task;
+        decision.task_tier = if session_turn_requests_explicit_long_mission(request) {
+            TaskTier::LongMission
+        } else {
+            TaskTier::ExecutionChain
+        };
+        decision.task_title = decision
+            .task_title
+            .take()
+            .or_else(|| Some(request.mission_title(Some(&task_text))));
+        decision.execution_goal = Some(task_text.clone());
+        decision.tool_intent = None;
+        decision.forced_tool_name = None;
+        decision.required_tool_chain.clear();
+        decision.confidence = decision.confidence.max(0.95);
+        decision.reason_code = Some("explicit_task_request".to_string());
+        decision.route_reason =
+            Some("用户明确要求任务化执行，必须创建任务投影并由任务执行链处理。".to_string());
+        if decision.task_evidence.is_empty() {
+            decision
+                .task_evidence
+                .push("显式复杂任务/worker 编排请求".to_string());
+        }
+    }
     if matches!(decision.route, SessionTurnRouteDto::Task)
         && !session_turn_task_route_has_creation_evidence(&decision)
     {
         decision.route = SessionTurnRouteDto::Chat;
         decision.task_title = None;
         decision.execution_goal = None;
+        decision.task_tier = TaskTier::ExecutionChain;
         decision.required_workers.clear();
         decision.tool_intent = None;
         decision.required_tool_chain.clear();
@@ -644,6 +733,7 @@ fn normalize_session_turn_decision(
                 decision.route = SessionTurnRouteDto::Execute;
                 decision.task_title = None;
                 decision.execution_goal = None;
+                decision.task_tier = TaskTier::ExecutionChain;
                 decision.required_workers.clear();
                 if decision.forced_tool_name.as_deref() != Some(tool_name) {
                     decision.tool_intent = Some(explicit_builtin_tool_intent(tool_name));
@@ -660,6 +750,7 @@ fn normalize_session_turn_decision(
                 decision.route = SessionTurnRouteDto::Execute;
                 decision.task_title = None;
                 decision.execution_goal = None;
+                decision.task_tier = TaskTier::ExecutionChain;
                 decision.required_workers.clear();
                 decision.tool_intent = Some(multi_builtin_tool_intent(&tool_names));
                 decision.forced_tool_name = None;
@@ -676,6 +767,43 @@ fn normalize_session_turn_decision(
         }
     }
     decision
+}
+
+fn session_turn_requests_explicit_long_mission(request: &SessionTurnRequestDto) -> bool {
+    let Some(text) = request.trimmed_text() else {
+        return false;
+    };
+    let normalized = text.to_ascii_lowercase();
+    normalized.contains("复杂任务模式")
+        || normalized.contains("复杂任务")
+        || normalized.contains("深度任务")
+        || normalized.contains("long mission")
+        || normalized.contains("长期任务")
+        || normalized.contains("跨多轮")
+        || normalized.contains("多阶段")
+        || normalized.contains("可恢复")
+        || normalized.contains("人审")
+        || normalized.contains("审计")
+}
+
+fn session_turn_requests_explicit_task_or_worker_mode(request: &SessionTurnRequestDto) -> bool {
+    let Some(text) = request.trimmed_text() else {
+        return false;
+    };
+    let normalized = text.to_ascii_lowercase();
+    normalized.contains("复杂任务模式")
+        || normalized.contains("复杂任务")
+        || normalized.contains("深度任务")
+        || normalized.contains("任务模式完成")
+        || normalized.contains("以任务模式")
+        || normalized.contains("分派一个 worker")
+        || normalized.contains("分配一个 worker")
+        || normalized.contains("派发一个 worker")
+        || normalized.contains("worker 必须")
+        || normalized.contains("worker 调用")
+        || normalized.contains("worker 执行")
+        || normalized.contains("子代理")
+        || normalized.contains("子任务")
 }
 
 enum RequestedBuiltinTools {
@@ -1068,7 +1196,18 @@ fn spawn_regular_session_turn_execution(
             }
         };
 
-        super::begin_session_turn(&state, &session_id);
+        if let Err(error) = super::begin_session_turn(&state, &session_id) {
+            tracing::error!(
+                session_id = %session_id,
+                ?error,
+                "regular session turn background execution rejected: active turn already exists"
+            );
+            let _ = state
+                .session_store
+                .update_current_turn_status(&session_id, "failed");
+            let _ = state.persist_session_durable_state();
+            return;
+        }
         let outcome = dispatcher.execute_session_turn(execution_request);
         super::finalize_session_turn(&state, &session_id, outcome.is_ok());
         match outcome {
@@ -1521,8 +1660,7 @@ fn finalize_terminal_root_before_interrupt(
     let runner_status = match root_task.status {
         TaskStatus::Completed => "completed",
         TaskStatus::Failed => "error",
-        TaskStatus::Blocked => "blocked",
-        TaskStatus::Cancelled => "cancelled",
+        TaskStatus::Killed => "killed",
         _ => return false,
     };
     finalize_background_session_task_turn_if_root_terminal(
@@ -1669,16 +1807,16 @@ fn finalize_continue_session(
         return;
     };
 
-    let background_allowed = task_store
+    let is_long_mission = task_store
         .get_task(&accepted.root_task_id)
         .and_then(|root| root.policy_snapshot)
-        .map(|policy| policy.background_allowed)
+        .map(|policy| policy.task_tier == TaskTier::LongMission)
         .unwrap_or(false);
 
-    // 普通模式：同步 drive task graph（后台 runner 未启动）
-    // 深度模式：后台 runner 已在 continue_execution_chain 中重新启动，
+    // 中等任务：同步 drive task projection（后台 runner 未启动）
+    // Long Mission：后台 runner 已在 continue_execution_chain 中重新启动，
     // 此处不再调用同步 drive，避免与后台 runner 竞争
-    if !background_allowed {
+    if !is_long_mission {
         if let Err(error) = crate::a_path::drive_a_path(
             &state,
             &accepted.root_task_id,
@@ -1687,7 +1825,7 @@ fn finalize_continue_session(
         ) {
             let interrupted = task_store
                 .get_task(&accepted.action_task_id)
-                .is_some_and(|task| task.status == TaskStatus::Blocked);
+                .is_some_and(|task| task.status == TaskStatus::Failed);
             if !interrupted {
                 tracing::error!(
                     session_id = %accepted.session_id,
@@ -2190,9 +2328,13 @@ mod tests {
         body::{Body, to_bytes},
         http::{Request, StatusCode},
     };
-    use magi_core::{AbsolutePath, ExecutionOwnership, UtcMillis, WorkspaceId};
+    use magi_core::{
+        AbsolutePath, ExecutionOwnership, MissionId, Task, TaskId, TaskKind, TaskRuntimePayload,
+        TaskStatus, UtcMillis, WorkspaceId,
+    };
     use magi_event_bus::InMemoryEventBus;
     use magi_governance::GovernanceService;
+    use magi_orchestrator::task_store::TaskStore;
     use magi_session_store::SessionStore;
     use magi_workspace::WorkspaceStore;
     use std::{fs, sync::Arc};
@@ -2257,7 +2399,36 @@ mod tests {
             user_message_id: None,
             placeholder_message_id: None,
             supplement_context: false,
-            context_task_id: None,
+            target_task_id: None,
+        }
+    }
+
+    fn test_root_task(task_id: &str, mission_id: &str) -> Task {
+        let now = UtcMillis::now();
+        let task_id = TaskId::new(task_id);
+        Task {
+            task_id: task_id.clone(),
+            mission_id: MissionId::new(mission_id),
+            root_task_id: task_id,
+            parent_task_id: None,
+            kind: TaskKind::LocalAgent,
+            title: "root task".to_string(),
+            goal: "run root task".to_string(),
+            status: TaskStatus::Running,
+            dependency_ids: Vec::new(),
+            required_children: Vec::new(),
+            policy_snapshot: None,
+            executor_binding: None,
+            knowledge_refs: Vec::new(),
+            workspace_scope: None,
+            write_scope: None,
+            input_refs: Vec::new(),
+            output_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            retry_count: 0,
+            runtime_payload: TaskRuntimePayload::default(),
+            created_at: now,
+            updated_at: now,
         }
     }
 
@@ -2266,6 +2437,7 @@ mod tests {
             route: SessionTurnRouteDto::Chat,
             task_title: None,
             execution_goal: None,
+            task_tier: TaskTier::ExecutionChain,
             required_workers: Vec::new(),
             tool_intent: None,
             forced_tool_name: None,
@@ -2278,11 +2450,92 @@ mod tests {
     }
 
     #[test]
+    fn supplement_context_turn_enqueues_followup_mailbox_signal() {
+        let task_store = Arc::new(TaskStore::new());
+        let state = test_state().with_task_store(task_store.clone());
+        let session_id = SessionId::new("session-supplement-mailbox");
+        let mission_id = MissionId::new("mission-supplement-mailbox");
+        let root_task = test_root_task("task-root-supplement", mission_id.as_str());
+        task_store.insert_task(root_task.clone());
+        state
+            .session_store
+            .create_session(session_id.clone(), "Supplement Mailbox")
+            .expect("session should be creatable");
+        state.session_store.bind_execution_ownership(
+            session_id.clone(),
+            ExecutionOwnership {
+                session_id: Some(session_id.clone()),
+                mission_id: Some(mission_id.clone()),
+                task_id: Some(root_task.task_id.clone()),
+                execution_chain_ref: Some("chain-supplement-mailbox".to_string()),
+                ..ExecutionOwnership::default()
+            },
+        );
+        let (_, orchestrator_thread_id) =
+            state
+                .session_store
+                .ensure_session_mission(&session_id, UtcMillis::now(), || mission_id.clone());
+
+        let mut request = session_turn_request("请优先处理这个 followup");
+        request.session_id = Some(session_id.to_string());
+        request.supplement_context = true;
+        let response = submit_supplement_context_turn(&state, &request, UtcMillis::now())
+            .expect("supplement should enqueue mailbox signal");
+
+        assert_eq!(response.route, SessionTurnRouteDto::SupplementContext);
+        assert!(
+            response
+                .signal_ref
+                .as_deref()
+                .is_some_and(|id| id.starts_with("mailbox-signal-"))
+        );
+        assert_eq!(
+            response.target_task_id.as_deref(),
+            Some(root_task.task_id.as_str())
+        );
+
+        let pending = state
+            .conversation_registry
+            .conversation_for_task(&session_id, &root_task.task_id)
+            .lock()
+            .expect("task conversation lock")
+            .drain_mailbox_items();
+        assert_eq!(pending.len(), 1);
+        match &pending[0] {
+            magi_conversation_runtime::MailboxItem::Runtime(signal) => {
+                assert_eq!(signal.author, MailboxAuthor::User);
+                assert_eq!(signal.kind, MailboxKind::Followup);
+                assert!(signal.trigger_turn);
+                assert_eq!(
+                    signal.payload["text"].as_str(),
+                    Some("请优先处理这个 followup")
+                );
+            }
+            magi_conversation_runtime::MailboxItem::User(_) => {
+                panic!("supplement must enqueue a runtime followup signal")
+            }
+        }
+
+        let history = state
+            .session_store
+            .thread_message_history(&orchestrator_thread_id);
+        assert_eq!(history.len(), 1);
+        assert!(
+            history[0]
+                .content
+                .as_deref()
+                .unwrap_or_default()
+                .contains("kind=followup")
+        );
+    }
+
+    #[test]
     fn keeps_plain_diagram_explanation_as_chat() {
         let request = session_turn_request("解释一下流程图是什么");
         let decision = normalize_session_turn_decision(classifier_chat_decision(), &request);
 
         assert!(matches!(decision.route, SessionTurnRouteDto::Chat));
+        assert_eq!(decision.task_tier, TaskTier::ExecutionChain);
         assert!(decision.forced_tool_name.is_none());
     }
 
@@ -2335,6 +2588,54 @@ mod tests {
 
         assert!(matches!(decision.route, SessionTurnRouteDto::Execute));
         assert_eq!(decision.forced_tool_name.as_deref(), Some("shell_exec"));
+    }
+
+    #[test]
+    fn explicit_complex_worker_request_is_task_even_when_shell_tool_is_named() {
+        let request = session_turn_request(
+            "请以复杂任务模式完成，worker 必须调用 shell_exec 执行 printf ok，最后总结。",
+        );
+        let decision = normalize_session_turn_decision(classifier_chat_decision(), &request);
+
+        assert!(matches!(decision.route, SessionTurnRouteDto::Task));
+        assert!(decision.forced_tool_name.is_none());
+        assert!(decision.required_tool_chain.is_empty());
+        assert_eq!(
+            decision.reason_code.as_deref(),
+            Some("explicit_task_request")
+        );
+        assert_eq!(decision.task_tier, TaskTier::LongMission);
+        assert!(decision.execution_goal.is_some());
+        assert!(!decision.task_evidence.is_empty());
+    }
+
+    #[test]
+    fn explicit_worker_request_uses_execution_chain_without_long_mission() {
+        let request =
+            session_turn_request("请分派一个 worker 修复这个明确问题，完成后汇总验证结果。");
+        let decision = normalize_session_turn_decision(classifier_chat_decision(), &request);
+
+        assert!(matches!(decision.route, SessionTurnRouteDto::Task));
+        assert_eq!(decision.task_tier, TaskTier::ExecutionChain);
+    }
+
+    #[test]
+    fn explicit_complex_worker_request_preserves_raw_user_goal_as_execution_goal() {
+        let raw_goal = "【V2具体任务推进验收】请以复杂任务模式完成，必须由 worker 在当前工作区创建文件 v2-task-system-e2e.md，文件内容必须包含三行：title: v2 task concrete progress、marker: V2_TASK_E2E、status: completed。创建后 worker 必须读取该文件验证内容。";
+        let request = session_turn_request(raw_goal);
+        let mut classifier_decision = classifier_chat_decision();
+        classifier_decision.route = SessionTurnRouteDto::Task;
+        classifier_decision.task_title = Some("创建并验证 v2-task-system-e2e.md".to_string());
+        classifier_decision.execution_goal = Some("创建并验证 v2-task-system-e2e.md".to_string());
+        classifier_decision
+            .task_evidence
+            .push("classifier saw a task".to_string());
+
+        let decision = normalize_session_turn_decision(classifier_decision, &request);
+
+        assert!(matches!(decision.route, SessionTurnRouteDto::Task));
+        assert_eq!(decision.task_tier, TaskTier::LongMission);
+        assert_eq!(decision.execution_goal.as_deref(), Some(raw_goal));
     }
 
     #[test]
@@ -2428,13 +2729,14 @@ mod tests {
                 user_message_id: Some("user-canonical-first-frame".to_string()),
                 placeholder_message_id: Some("assistant-canonical-first-frame".to_string()),
                 supplement_context: false,
-                context_task_id: None,
+                target_task_id: None,
             },
             accepted_at,
             SessionTurnIntentDecision {
                 route: SessionTurnRouteDto::Chat,
                 task_title: None,
                 execution_goal: None,
+                task_tier: TaskTier::ExecutionChain,
                 required_workers: Vec::new(),
                 tool_intent: None,
                 forced_tool_name: None,
@@ -2483,6 +2785,115 @@ mod tests {
         assert_eq!(
             accepted_event.payload["canonical_item"]["itemId"],
             "assistant-canonical-first-frame"
+        );
+    }
+
+    /// §3.1 端到端验收：simple task 路径（chat 路由）
+    ///
+    /// 闸门属性：chat 路由进入 `submit_regular_session_turn` 后，
+    /// - 不在 TaskStore 创建任何 Task；
+    /// - 不在 session sidecar 写入 `execution_chain_ref`；
+    /// - session timeline 仍由现有 canonical turn 测试覆盖 user_message + assistant 占位。
+    ///
+    /// 任何在 chat 路径上私自落入 TaskStore / 绑定 execution chain 的代码改动
+    /// 都会让本测试失败——这是 §3.1 "不创建 TaskGraph、不创建 Mission" 的可观察行为闸门。
+    #[tokio::test]
+    async fn simple_chat_route_does_not_create_task_or_execution_chain() {
+        let task_store = Arc::new(TaskStore::new());
+        let state = test_state().with_task_store(task_store.clone());
+        let request = SessionTurnRequestDto {
+            session_id: None,
+            workspace_id: None,
+            workspace_path: None,
+            text: Some("解释一下流程图的概念".to_string()),
+            skill_name: None,
+            images: Vec::new(),
+            request_id: Some("request-simple-chat".to_string()),
+            user_message_id: Some("user-simple-chat".to_string()),
+            placeholder_message_id: Some("assistant-simple-chat".to_string()),
+            supplement_context: false,
+            target_task_id: None,
+        };
+        let accepted_at = UtcMillis(1_700_000_000_000);
+        let response = submit_regular_session_turn(
+            state.clone(),
+            request,
+            accepted_at,
+            classifier_chat_decision(),
+        )
+        .expect("chat route should accept");
+
+        assert!(matches!(response.route, SessionTurnRouteDto::Chat));
+        let session_id = SessionId::new(&response.session_id);
+        let orchestrator_thread = state
+            .session_store
+            .orchestrator_thread_for_session(&session_id)
+            .expect("orchestrator thread should be registered");
+        let tasks = task_store.get_tasks_by_mission(&orchestrator_thread.mission_id);
+        assert!(
+            tasks.is_empty(),
+            "chat 路由不应在 TaskStore 中创建任务: {tasks:?}"
+        );
+        let sidecar = state
+            .session_store
+            .runtime_sidecar(&session_id)
+            .expect("sidecar should exist");
+        assert!(
+            sidecar.ownership.execution_chain_ref.is_none(),
+            "chat 路由不应绑定 execution_chain_ref: {:?}",
+            sidecar.ownership.execution_chain_ref,
+        );
+    }
+
+    /// §3.1 端到端验收：simple task 路径（execute 路由强制工具）
+    ///
+    /// 与 chat 路由共用 `submit_regular_session_turn`，因此同样的"不入 TaskStore /
+    /// 不绑定 execution chain"闸门必须成立——execute 路由的语义是"在主线程内调用
+    /// 一次工具"，而不是创建任务投影。
+    #[tokio::test]
+    async fn simple_execute_route_does_not_create_task_or_execution_chain() {
+        let task_store = Arc::new(TaskStore::new());
+        let state = test_state().with_task_store(task_store.clone());
+        let request = SessionTurnRequestDto {
+            session_id: None,
+            workspace_id: None,
+            workspace_path: None,
+            text: Some("请调用 file_mkdir 工具创建目录".to_string()),
+            skill_name: None,
+            images: Vec::new(),
+            request_id: Some("request-simple-execute".to_string()),
+            user_message_id: Some("user-simple-execute".to_string()),
+            placeholder_message_id: Some("assistant-simple-execute".to_string()),
+            supplement_context: false,
+            target_task_id: None,
+        };
+        let accepted_at = UtcMillis(1_700_000_001_000);
+        let mut decision = classifier_chat_decision();
+        decision.route = SessionTurnRouteDto::Execute;
+        decision.forced_tool_name = Some("file_mkdir".to_string());
+        decision.tool_intent = Some("显式调用 file_mkdir".to_string());
+        let response = submit_regular_session_turn(state.clone(), request, accepted_at, decision)
+            .expect("execute route should accept");
+
+        assert!(matches!(response.route, SessionTurnRouteDto::Execute));
+        let session_id = SessionId::new(&response.session_id);
+        let orchestrator_thread = state
+            .session_store
+            .orchestrator_thread_for_session(&session_id)
+            .expect("orchestrator thread should be registered");
+        let tasks = task_store.get_tasks_by_mission(&orchestrator_thread.mission_id);
+        assert!(
+            tasks.is_empty(),
+            "execute 路由不应在 TaskStore 中创建任务: {tasks:?}"
+        );
+        let sidecar = state
+            .session_store
+            .runtime_sidecar(&session_id)
+            .expect("sidecar should exist");
+        assert!(
+            sidecar.ownership.execution_chain_ref.is_none(),
+            "execute 路由不应绑定 execution_chain_ref: {:?}",
+            sidecar.ownership.execution_chain_ref,
         );
     }
 

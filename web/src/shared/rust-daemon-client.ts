@@ -40,8 +40,6 @@ import type {
   RemoveWorkspaceRequestDto,
   RemoveWorkspaceResponseDto,
   RemovedResponseDto,
-  ResolveTaskDecisionRequestDto,
-  ResolveTaskDecisionResponseDto,
   RepositoriesResponseDto,
   RepositoryIdRequestDto,
   RepositoryRefreshResponseDto,
@@ -58,6 +56,7 @@ import type {
   SessionContinueResponseDto,
   SessionCloseRequestDto,
   SessionDeleteRequestDto,
+  SessionTaskHistoryResponseDto,
   SessionInterruptRequestDto,
   SessionInterruptResponseDto,
   SessionNotificationsResponseDto,
@@ -71,10 +70,11 @@ import type {
   SkillsConfigSaveResponseDto,
   SkillsLibraryResponseDto,
   SkillUpdateResponseDto,
+  TaskArchiveResponseDto,
   TaskDto,
   TaskInterruptResponseDto,
   TaskProjectionDto,
-  TaskReplanResponseDto,
+  TaskRestartResponseDto,
   UpdatedResponseDto,
   VersionHandshakeDto,
   WorkspaceListResponseDto,
@@ -163,10 +163,16 @@ export class RustDaemonClient {
     return this.postJson<TaskInterruptResponseDto>('/api/task/interrupt', request);
   }
 
-  public async pauseTask(
-    request: { taskId: string; sessionId?: string | null },
-  ): Promise<TaskInterruptResponseDto> {
-    return this.interruptTask(request);
+  public async restartTask(
+    request: unknown,
+  ): Promise<TaskRestartResponseDto> {
+    return this.postJson<TaskRestartResponseDto>('/api/task/restart', request);
+  }
+
+  public async archiveTask(
+    request: unknown,
+  ): Promise<TaskArchiveResponseDto> {
+    return this.postJson<TaskArchiveResponseDto>('/api/task/archive', request);
   }
 
   // ─── Session management ───────────────────────────────────────────
@@ -533,13 +539,21 @@ export class RustDaemonClient {
     return this.postJson<EnhancePromptResponseDto>('/api/prompt/enhance', request);
   }
 
-  // ─── Task Graph ────────────────────────────────────────────────────
+  // ─── Task Projection ───────────────────────────────────────────────
 
   public async getTaskProjection(rootTaskId: string, sessionId: string): Promise<TaskProjectionDto> {
     const query = new URLSearchParams();
     query.set('sessionId', sessionId);
     return this.getJson<TaskProjectionDto>(
-      `/api/tasks/graph/${encodeURIComponent(rootTaskId)}?${query.toString()}`,
+      `/api/tasks/projection/${encodeURIComponent(rootTaskId)}?${query.toString()}`,
+    );
+  }
+
+  public async getSessionTaskHistory(sessionId: string): Promise<SessionTaskHistoryResponseDto> {
+    const query = new URLSearchParams();
+    query.set('sessionId', sessionId);
+    return this.getJson<SessionTaskHistoryResponseDto>(
+      `/api/tasks/session-history?${query.toString()}`,
     );
   }
 
@@ -556,28 +570,6 @@ export class RustDaemonClient {
     query.set('sessionId', sessionId);
     return this.getJson<DeliveryPackageDto>(
       `/api/tasks/${encodeURIComponent(rootTaskId)}/delivery-package?${query.toString()}`,
-    );
-  }
-
-  public async replanTaskGraph(rootTaskId: string, sessionId: string): Promise<TaskReplanResponseDto> {
-    const query = new URLSearchParams();
-    query.set('sessionId', sessionId);
-    return this.postJson<TaskReplanResponseDto>(
-      `/api/tasks/${encodeURIComponent(rootTaskId)}/replan?${query.toString()}`,
-      {},
-    );
-  }
-
-  public async resolveTaskDecision(
-    taskId: string,
-    sessionId: string,
-    request: ResolveTaskDecisionRequestDto,
-  ): Promise<ResolveTaskDecisionResponseDto> {
-    const query = new URLSearchParams();
-    query.set('sessionId', sessionId);
-    return this.postJson<ResolveTaskDecisionResponseDto>(
-      `/api/tasks/${encodeURIComponent(taskId)}/decision?${query.toString()}`,
-      request,
     );
   }
 

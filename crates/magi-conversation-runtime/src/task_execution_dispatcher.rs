@@ -1,9 +1,10 @@
-//! Task System v2 — LLM task dispatcher runtime.
+//! Task System v2 — conversation dispatcher runtime.
 //!
-//! Owns the production task dispatch implementation for session turns and task LLM loops.
+//! Owns the production task dispatch implementation for session turns and conversation loops.
 
 use crate::{
     ConversationRegistry, SKILL_APPLY_TOOL_NAME, StreamFanOut,
+    conversation_loop::{self, ConversationLoopRequest},
     model_config::NormalizedModelConfig,
     prompt_utils::prepend_session_instructions,
     public_builtin_tool_definitions,
@@ -11,13 +12,11 @@ use crate::{
         SessionTurnExecutionOutput, SessionTurnExecutionRequest, SessionTurnExecutionRuntime,
         run_session_turn_execution,
     },
-    session_turn_finalize::{
-        compact_task_context_text, format_dependency_task_context, format_task_ref_list,
-    },
+    session_turn_finalize::{format_dependency_task_context, format_task_ref_list},
     settings_store::SettingsStore,
     skill_apply_tool_definition,
     task_execution_registry::{TaskExecutionPlan, TaskExecutionRegistry},
-    task_llm_loop::{self, TaskLlmLoopRequest},
+    task_helpers::{task_can_see_builtin_tool, task_is_coordinator, task_is_long_mission},
     task_runner_bridge::{EventBasedResultReceiver, TaskDispatcher, TaskOutcome, TaskResult},
     usage_recording::{ModelUsageBinding, model_usage_binding_for_worker},
 };
@@ -69,10 +68,10 @@ pub struct LlmTaskDispatcher {
     conversation_registry: Option<Arc<ConversationRegistry>>,
     /// Task System v2：统一 StreamEvent 派生通道。
     stream_fanout: Option<Arc<StreamFanOut>>,
-    /// Task System v2：AgentRole 注册表（来自 ApiState，注入到 task_llm_loop）。
+    /// Task System v2：AgentRole 注册表（来自 ApiState，注入到 conversation_loop）。
     agent_role_registry: Option<Arc<magi_agent_role::AgentRoleRegistry>>,
     /// Task System v2 — L5：父子任务拓扑图。S7 协调器三件套（agent_spawn / send_message /
-    /// task_stop）需要在 task_llm_loop 中读写。设计为构造期必填，避免运行期再做空检查。
+    /// task_stop）需要在 conversation_loop 中读写。设计为构造期必填，避免运行期再做空检查。
     spawn_graph: Arc<std::sync::Mutex<magi_spawn_graph::SpawnGraph>>,
     /// Task System v2 — L13：session 维度的 TodoLedger 索引。S9 中模型通过
     /// `todo_write` 工具往这里写分解 + 进度；下一轮 Turn 起始时把快照注入 system prompt。
@@ -81,15 +80,15 @@ pub struct LlmTaskDispatcher {
     /// `memory_write` 工具新增/删除项目记忆条目；每次 Turn 起始把 MEMORY.md 视图注入
     /// system prompt，跨 conversation 复用。
     project_memory_registry: Arc<magi_project_memory::ProjectMemoryRegistry>,
-    /// Task System v2 — Tier 4 / L11：workspace 维度的 MissionCharter 索引。S11 中模型
+    /// Task System v2 — Tier 4 / L15：workspace 维度的 MissionCharter 索引。S11 中模型
     /// 通过 `mission_charter_write` 工具增量更新 mission 宪章；每次 Turn 起始把当前
     /// mission 的 charter 注入 system prompt，跨 conversation 锚定目标契约。
     mission_charter_registry: Arc<magi_mission_charter::MissionCharterRegistry>,
-    /// Task System v2 — Tier 4 / L12：workspace 维度的 Plan 索引。S12 中模型通过
+    /// Task System v2 — Tier 4 / L16：workspace 维度的 Plan 索引。S12 中模型通过
     /// `plan_write` 工具整体替换 mission.plan.steps；每次 Turn 起始把当前 plan
     /// 注入 system prompt，长链路推进时保留计划上下文。
     plan_registry: Arc<magi_plan::PlanRegistry>,
-    /// Task System v2 — Tier 4 / L13：workspace 维度的 MissionWorkspace 索引。S13
+    /// Task System v2 — Tier 4 / L17：workspace 维度的 MissionWorkspace 索引。S13
     /// 中每个 Mission 拥有独占的 artifacts/logs/memory 目录骨架；Turn 起始时把目录
     /// 路径注入 system prompt，让 agent 把产物落在 mission 内而不是无主目录。
     mission_workspace_registry: Arc<magi_mission_workspace::MissionWorkspaceRegistry>,
@@ -107,16 +106,16 @@ pub struct LlmTaskDispatcher {
     /// / phase_transition / manual），让事后能定位到“恢复到 Tn”所需要的最小语义快照。
     checkpoint_registry: Arc<magi_checkpoint::CheckpointRegistry>,
     /// Task System v2 — Tier 4 / L21：workspace 维度的 HumanCheckpoint 索引。S17 中
-    /// orchestrator 通过 human_checkpoint_request 申请人工审核点，mission 会进入
-    /// awaiting_human 状态，operator 审批前 Coordinator 不再派发新工作。
+    /// orchestrator 通过 human_checkpoint_request 申请人工审核点；pending 存在时
+    /// runtime 会拒绝 agent_spawn 并暂停新的 leaf dispatch。
     human_checkpoint_registry: Arc<magi_human_checkpoint::HumanCheckpointRegistry>,
-    /// 强制同步执行 dispatch，用于普通模式的同步 for 循环（设计 §1.3）。
+    /// 强制同步执行 dispatch，用于 ExecutionChain 同步 for 循环（设计 §1.3）。
     force_sync_dispatch: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 pub fn resolve_configured_model_client(
     settings_store: Option<&Arc<SettingsStore>>,
-    fallback: Option<Arc<dyn ModelBridgeClient>>,
+    default_client: Option<Arc<dyn ModelBridgeClient>>,
 ) -> Option<Arc<dyn ModelBridgeClient>> {
     if let Some(store) = settings_store {
         let config = store.get_section("auxiliary");
@@ -125,7 +124,7 @@ pub fn resolve_configured_model_client(
             return Some(Arc::new(client));
         }
     }
-    fallback
+    default_client
 }
 
 impl LlmTaskDispatcher {
@@ -484,10 +483,10 @@ impl LlmTaskDispatcher {
             Some(format!("timeline-streaming-{}", task.task_id))
         };
         // S7-D：LocalBash 变体直接走 ShellExec，绕过 LLM 循环。
-        if let magi_core::TaskVariant::LocalBash {
+        if let magi_core::TaskRuntimePayload::LocalBash {
             command,
             working_dir,
-        } = &task.variant
+        } = &task.runtime_payload
         {
             let outcome = self.execute_local_bash_variant(
                 task,
@@ -655,6 +654,11 @@ impl LlmTaskDispatcher {
         };
         let mut definitions = public_builtin_tool_definitions(&registry)
             .into_iter()
+            .filter(|definition| {
+                BuiltinToolName::from_str(definition.function.name.as_str()).is_some_and(|tool| {
+                    task_can_see_builtin_tool(task, self.agent_role_registry.as_deref(), tool)
+                })
+            })
             .filter(|definition| definition.function.name != SKILL_APPLY_TOOL_NAME)
             .collect::<Vec<_>>();
         if self.skill_runtime.is_some() {
@@ -698,7 +702,7 @@ impl LlmTaskDispatcher {
                 parts.push(format!("[dependency] id={dependency_id} status=missing"));
             }
         }
-        if parts.is_empty() && task.kind != TaskKind::Validation {
+        if parts.is_empty() && task.kind != TaskKind::LocalAgent {
             return parts;
         }
         parts.insert(
@@ -706,7 +710,7 @@ impl LlmTaskDispatcher {
             "[current-task-rule] 当前任务标题、目标、input_refs、依赖任务输出和 task-context 是本次执行的主事实；knowledge/memory 只能补充，不能改写当前任务目标。目标中的路径、工具名、命令、标记字符串以及“必须/要求”条款必须逐项执行或明确说明无法执行的真实原因，不能替换成历史任务或泛化检查。"
                 .to_string(),
         );
-        if task.kind == TaskKind::Validation {
+        if task.kind == TaskKind::LocalAgent {
             parts.insert(
                 1,
                 "[validation-rule] 只验证本任务 dependency/input 指向的当前执行产出；不得把历史经验、知识库记录或其他会话目标当成本次交付对象。"
@@ -773,16 +777,10 @@ impl LlmTaskDispatcher {
                 max_file_summaries: 2,
             },
         });
-        let task_context_entries = self
-            .pipeline
-            .execution_runtime
-            .task_store()
-            .context_entries_for_refs(&task.context_refs);
         let has_context = !result.selected_knowledge.is_empty()
             || !result.selected_memory.is_empty()
             || !result.selected_shared_context.is_empty()
-            || !task_fact_context_parts.is_empty()
-            || !task_context_entries.is_empty();
+            || !task_fact_context_parts.is_empty();
 
         let context_summary = ExecutionContextSummary::from_context_assembly(&result);
 
@@ -798,13 +796,6 @@ impl LlmTaskDispatcher {
         }
         let mut ctx_parts: Vec<String> = Vec::new();
         ctx_parts.extend(task_fact_context_parts);
-        for entry in &task_context_entries {
-            ctx_parts.push(format!(
-                "[task-context] {}: {}",
-                entry.context_ref,
-                compact_task_context_text(&entry.content)
-            ));
-        }
         for item in &result.selected_knowledge {
             ctx_parts.push(format!("[knowledge] {}: {}", item.title, item.excerpt));
         }
@@ -875,12 +866,17 @@ impl LlmTaskDispatcher {
     /// S8：依据当前 settings 快照构造 SafetyGate。
     /// 调用者每次进入 LLM 轮次循环前都构造一次；引擎本身无状态，可在该轮次内共享。
     pub(crate) fn build_safety_gate(&self) -> Option<magi_safety_gate::SafetyGate> {
-        let store = self.settings_store.as_ref()?;
-        let raw = store.get_section("safeguardConfig");
-        let rules = raw
-            .get("rules")
-            .map(magi_safety_gate::rules_from_settings_value)
-            .unwrap_or_default();
+        let mut rules = magi_safety_gate::builtin_rules();
+        if let Some(store) = self.settings_store.as_ref() {
+            let raw = store.get_section("safeguardConfig");
+            rules.extend(
+                raw.get("rules")
+                    .map(magi_safety_gate::rules_from_settings_value)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|rule| rule.category == magi_safety_gate::SafetyCategory::Custom),
+            );
+        }
         if rules.is_empty() {
             None
         } else {
@@ -1024,87 +1020,122 @@ impl LlmTaskDispatcher {
             .expect("LlmTaskDispatcher 缺少 AgentRoleRegistry，无法解析 task→role");
         let safety_gate = self.build_safety_gate();
         let todo_ledger = self.todo_ledger_registry.get_or_create(session_id);
-        let project_memory = workspace_root_path.as_ref().and_then(|path| {
-            let workspace_root = magi_core::WorkspaceRootPath::new(path.to_string_lossy());
-            match self.project_memory_registry.get_or_open(&workspace_root) {
-                Ok(store) => Some(store),
-                Err(err) => {
-                    tracing::warn!(error = %err, workspace_root = %path.display(), "ProjectMemory: 打开失败，本次 Turn 不注入项目记忆");
-                    None
+        let orchestration_enabled =
+            task_is_coordinator(Some(task), Some(agent_role_registry.as_ref()));
+        let long_mission_enabled = orchestration_enabled && task_is_long_mission(Some(task));
+        let project_memory = if orchestration_enabled {
+            workspace_root_path.as_ref().and_then(|path| {
+                let workspace_root = magi_core::WorkspaceRootPath::new(path.to_string_lossy());
+                match self.project_memory_registry.get_or_open(&workspace_root) {
+                    Ok(store) => Some(store),
+                    Err(err) => {
+                        tracing::warn!(error = %err, workspace_root = %path.display(), "ProjectMemory: 打开失败，本次 Turn 不注入项目记忆");
+                        None
+                    }
                 }
-            }
-        });
-        let mission_charter = workspace_root_path.as_ref().and_then(|path| {
-            let workspace_root = magi_core::WorkspaceRootPath::new(path.to_string_lossy());
-            match self.mission_charter_registry.get_or_open(&workspace_root) {
-                Ok(store) => Some(store),
-                Err(err) => {
-                    tracing::warn!(error = %err, workspace_root = %path.display(), "MissionCharter: 打开失败，本次 Turn 不注入 mission 宪章");
-                    None
+            })
+        } else {
+            None
+        };
+        let mission_charter = if long_mission_enabled {
+            workspace_root_path.as_ref().and_then(|path| {
+                let workspace_root = magi_core::WorkspaceRootPath::new(path.to_string_lossy());
+                match self.mission_charter_registry.get_or_open(&workspace_root) {
+                    Ok(store) => Some(store),
+                    Err(err) => {
+                        tracing::warn!(error = %err, workspace_root = %path.display(), "MissionCharter: 打开失败，本次 Turn 不注入 mission 宪章");
+                        None
+                    }
                 }
-            }
-        });
-        let plan = workspace_root_path.as_ref().and_then(|path| {
-            let workspace_root = magi_core::WorkspaceRootPath::new(path.to_string_lossy());
-            match self.plan_registry.get_or_open(&workspace_root) {
-                Ok(store) => Some(store),
-                Err(err) => {
-                    tracing::warn!(error = %err, workspace_root = %path.display(), "Plan: 打开失败，本次 Turn 不注入 mission 计划");
-                    None
+            })
+        } else {
+            None
+        };
+        let plan = if long_mission_enabled {
+            workspace_root_path.as_ref().and_then(|path| {
+                let workspace_root = magi_core::WorkspaceRootPath::new(path.to_string_lossy());
+                match self.plan_registry.get_or_open(&workspace_root) {
+                    Ok(store) => Some(store),
+                    Err(err) => {
+                        tracing::warn!(error = %err, workspace_root = %path.display(), "Plan: 打开失败，本次 Turn 不注入 mission 计划");
+                        None
+                    }
                 }
-            }
-        });
-        let mission_workspace = workspace_root_path.as_ref().and_then(|path| {
-            let workspace_root = magi_core::WorkspaceRootPath::new(path.to_string_lossy());
-            match self.mission_workspace_registry.get_or_open(&workspace_root) {
-                Ok(store) => Some(store),
-                Err(err) => {
-                    tracing::warn!(error = %err, workspace_root = %path.display(), "MissionWorkspace: 打开失败，本次 Turn 不注入工作目录视图");
-                    None
+            })
+        } else {
+            None
+        };
+        let mission_workspace = if long_mission_enabled {
+            workspace_root_path.as_ref().and_then(|path| {
+                let workspace_root = magi_core::WorkspaceRootPath::new(path.to_string_lossy());
+                match self.mission_workspace_registry.get_or_open(&workspace_root) {
+                    Ok(store) => Some(store),
+                    Err(err) => {
+                        tracing::warn!(error = %err, workspace_root = %path.display(), "MissionWorkspace: 打开失败，本次 Turn 不注入工作目录视图");
+                        None
+                    }
                 }
-            }
-        });
-        let knowledge_graph = workspace_root_path.as_ref().and_then(|path| {
-            let workspace_root = magi_core::WorkspaceRootPath::new(path.to_string_lossy());
-            match self.knowledge_graph_registry.get_or_open(&workspace_root) {
-                Ok(store) => Some(store),
-                Err(err) => {
-                    tracing::warn!(error = %err, workspace_root = %path.display(), "KnowledgeGraph: 打开失败，本次 Turn 不注入 mission KG");
-                    None
+            })
+        } else {
+            None
+        };
+        let knowledge_graph = if long_mission_enabled {
+            workspace_root_path.as_ref().and_then(|path| {
+                let workspace_root = magi_core::WorkspaceRootPath::new(path.to_string_lossy());
+                match self.knowledge_graph_registry.get_or_open(&workspace_root) {
+                    Ok(store) => Some(store),
+                    Err(err) => {
+                        tracing::warn!(error = %err, workspace_root = %path.display(), "KnowledgeGraph: 打开失败，本次 Turn 不注入 mission KG");
+                        None
+                    }
                 }
-            }
-        });
-        let validation_runner = workspace_root_path.as_ref().and_then(|path| {
-            let workspace_root = magi_core::WorkspaceRootPath::new(path.to_string_lossy());
-            match self.validation_runner_registry.get_or_open(&workspace_root) {
-                Ok(store) => Some(store),
-                Err(err) => {
-                    tracing::warn!(error = %err, workspace_root = %path.display(), "ValidationRunner: 打开失败，本次 Turn 不注入验证结果");
-                    None
+            })
+        } else {
+            None
+        };
+        let validation_runner = if long_mission_enabled {
+            workspace_root_path.as_ref().and_then(|path| {
+                let workspace_root = magi_core::WorkspaceRootPath::new(path.to_string_lossy());
+                match self.validation_runner_registry.get_or_open(&workspace_root) {
+                    Ok(store) => Some(store),
+                    Err(err) => {
+                        tracing::warn!(error = %err, workspace_root = %path.display(), "ValidationRunner: 打开失败，本次 Turn 不注入验证结果");
+                        None
+                    }
                 }
-            }
-        });
-        let checkpoint = workspace_root_path.as_ref().and_then(|path| {
-            let workspace_root = magi_core::WorkspaceRootPath::new(path.to_string_lossy());
-            match self.checkpoint_registry.get_or_open(&workspace_root) {
-                Ok(store) => Some(store),
-                Err(err) => {
-                    tracing::warn!(error = %err, workspace_root = %path.display(), "Checkpoint: 打开失败，本次 Turn 不注入检查点日志");
-                    None
+            })
+        } else {
+            None
+        };
+        let checkpoint = if long_mission_enabled {
+            workspace_root_path.as_ref().and_then(|path| {
+                let workspace_root = magi_core::WorkspaceRootPath::new(path.to_string_lossy());
+                match self.checkpoint_registry.get_or_open(&workspace_root) {
+                    Ok(store) => Some(store),
+                    Err(err) => {
+                        tracing::warn!(error = %err, workspace_root = %path.display(), "Checkpoint: 打开失败，本次 Turn 不注入检查点日志");
+                        None
+                    }
                 }
-            }
-        });
-        let human_checkpoint = workspace_root_path.as_ref().and_then(|path| {
-            let workspace_root = magi_core::WorkspaceRootPath::new(path.to_string_lossy());
-            match self.human_checkpoint_registry.get_or_open(&workspace_root) {
-                Ok(store) => Some(store),
-                Err(err) => {
-                    tracing::warn!(error = %err, workspace_root = %path.display(), "HumanCheckpoint: 打开失败，本次 Turn 不注入人工审核点");
-                    None
+            })
+        } else {
+            None
+        };
+        let human_checkpoint = if long_mission_enabled {
+            workspace_root_path.as_ref().and_then(|path| {
+                let workspace_root = magi_core::WorkspaceRootPath::new(path.to_string_lossy());
+                match self.human_checkpoint_registry.get_or_open(&workspace_root) {
+                    Ok(store) => Some(store),
+                    Err(err) => {
+                        tracing::warn!(error = %err, workspace_root = %path.display(), "HumanCheckpoint: 打开失败，本次 Turn 不注入审核摘要；长任务继续派发会被 runtime 拦截");
+                        None
+                    }
                 }
-            }
-        });
-        task_llm_loop::run_task_llm_loop(TaskLlmLoopRequest {
+            })
+        } else {
+            None
+        };
+        conversation_loop::run_conversation_loop(ConversationLoopRequest {
             client: client.as_ref(),
             event_bus: self.event_bus.as_ref(),
             session_store: self.session_store.as_ref(),
@@ -1112,6 +1143,7 @@ impl LlmTaskDispatcher {
             tool_registry: self.tool_registry.as_ref(),
             skill_runtime: self.skill_runtime.as_deref(),
             task_store: self.pipeline.execution_runtime.task_store(),
+            execution_registry: &self.execution_registry,
             conversation_registry: conversation_registry.as_ref(),
             stream_fanout: stream_fanout.as_ref(),
             agent_role_registry: agent_role_registry.as_ref(),
@@ -1155,7 +1187,7 @@ impl LlmTaskDispatcher {
         worker: &WorkerInfo,
         lease: &magi_orchestrator::task_store::TaskLease,
     ) -> Result<(), String> {
-        let Some(plan) = self.execution_registry.remove(&task.task_id) else {
+        let Some(plan) = self.execution_registry.get(&task.task_id) else {
             let error = format!(
                 "任务 {} 缺少结构化执行计划，已拒绝无计划执行路径",
                 task.task_id
@@ -1310,6 +1342,107 @@ fn title_from_learning_content(content: &str) -> String {
     title
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use magi_core::{MissionId, Task, TaskPolicy, TaskRuntimePayload, TaskTier};
+
+    fn task_with_role(role: &str, task_tier: TaskTier) -> Task {
+        let now = UtcMillis(1_000);
+        let background_allowed = task_tier == TaskTier::LongMission;
+        Task {
+            task_id: TaskId::new(format!("task-{role}")),
+            mission_id: MissionId::new("mission-tool-scope"),
+            root_task_id: TaskId::new("task-root"),
+            parent_task_id: None,
+            kind: TaskKind::LocalAgent,
+            title: format!("task {role}"),
+            goal: format!("run as {role}"),
+            status: magi_core::TaskStatus::Pending,
+            dependency_ids: Vec::new(),
+            required_children: Vec::new(),
+            policy_snapshot: Some(TaskPolicy {
+                autonomy_level: "Autonomous".to_string(),
+                approval_mode: "DecisionOnly".to_string(),
+                allowed_tools: Vec::new(),
+                denied_tools: Vec::new(),
+                allowed_paths: Vec::new(),
+                denied_paths: Vec::new(),
+                network_mode: "full".to_string(),
+                command_mode: "full".to_string(),
+                retry_limit: 1,
+                validation_profile: None,
+                checkpoint_mode: "turn".to_string(),
+                task_tier,
+                background_allowed,
+                escalation_conditions: Vec::new(),
+            }),
+            executor_binding: Some(serde_json::json!({
+                "target_role": role,
+            })),
+            knowledge_refs: Vec::new(),
+            workspace_scope: None,
+            write_scope: None,
+            input_refs: Vec::new(),
+            output_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            retry_count: 0,
+            runtime_payload: TaskRuntimePayload::default(),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn tool_visibility_is_filtered_by_role_and_task_tier() {
+        let registry = magi_agent_role::AgentRoleRegistry::load_default();
+        let worker_task = task_with_role("integration-dev", TaskTier::ExecutionChain);
+        let coordinator_task = task_with_role("coordinator", TaskTier::ExecutionChain);
+        let long_mission_task = task_with_role("coordinator", TaskTier::LongMission);
+
+        assert!(!task_can_see_builtin_tool(
+            Some(&worker_task),
+            Some(&registry),
+            BuiltinToolName::AgentSpawn
+        ));
+        assert!(!task_can_see_builtin_tool(
+            Some(&worker_task),
+            Some(&registry),
+            BuiltinToolName::PlanWrite
+        ));
+        assert!(task_can_see_builtin_tool(
+            Some(&coordinator_task),
+            Some(&registry),
+            BuiltinToolName::AgentSpawn
+        ));
+        assert!(task_can_see_builtin_tool(
+            Some(&coordinator_task),
+            Some(&registry),
+            BuiltinToolName::MemoryWrite
+        ));
+        assert!(!task_can_see_builtin_tool(
+            Some(&coordinator_task),
+            Some(&registry),
+            BuiltinToolName::PlanWrite
+        ));
+        assert!(task_can_see_builtin_tool(
+            Some(&long_mission_task),
+            Some(&registry),
+            BuiltinToolName::PlanWrite
+        ));
+        assert!(task_can_see_builtin_tool(
+            Some(&long_mission_task),
+            Some(&registry),
+            BuiltinToolName::HumanCheckpointRequest
+        ));
+        assert!(!task_can_see_builtin_tool(
+            None,
+            Some(&registry),
+            BuiltinToolName::AgentSpawn
+        ));
+    }
+}
+
 impl TaskDispatcher for LlmTaskDispatcher {
     fn dispatch(
         &self,
@@ -1317,7 +1450,7 @@ impl TaskDispatcher for LlmTaskDispatcher {
         worker: &WorkerInfo,
         lease: &magi_orchestrator::task_store::TaskLease,
     ) -> Result<(), String> {
-        // 普通模式的同步 for 循环要求 dispatch 同步完成，直接走 inner。
+        // ExecutionChain 的同步 for 循环要求 dispatch 同步完成，直接走 inner。
         if self
             .force_sync_dispatch
             .load(std::sync::atomic::Ordering::SeqCst)

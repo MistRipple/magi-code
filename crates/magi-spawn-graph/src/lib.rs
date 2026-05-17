@@ -1,13 +1,12 @@
 //! Task System v2 — L5 SpawnGraph：父代理 spawn 子代理的拓扑图。
 //!
-//! 设计目标：把 v1 散落在 `dispatch_execution.rs` 里"靠 Task.parent_task_id 串
-//! 父子、靠 worker_spawned item 记录派发"的胶水代码收敛到一份正式数据结构。
+//! 设计目标：把父子关系、派发记录与回执路由收敛到一份正式数据结构。
 //!
 //! ## 概念模型
 //!
 //! - **节点（node）**：以 `TaskId` 作为唯一标识；一个 Task 在运行期对应一个
-//!   Conversation 实例（v1 的 `parent_task_id` 已经按 Task 粒度记录），SpawnGraph
-//!   不引入新的 id，避免再起一套 ConversationId/AssignmentId 的映射表。
+//!   Conversation 实例。SpawnGraph 不引入新的 id，避免再起一套
+//!   ConversationId/AssignmentId 的映射表。
 //! - **边（edge）**：父 spawn 子的有向关系，附带 `TaskKind`、状态（`Open`/`Closed`）、
 //!   创建/关闭时间戳。一条边 = 一次 spawn 行为。
 //! - **回执路由**：子节点完成（status=Closed）后通过 `mark_closed` 标记；上层
@@ -299,7 +298,7 @@ mod tests {
     fn add_edge_records_parent_and_child() {
         let mut graph = SpawnGraph::new();
         graph
-            .add_edge(tid("a"), tid("b"), TaskKind::Action, now())
+            .add_edge(tid("a"), tid("b"), TaskKind::LocalAgent, now())
             .unwrap();
         assert_eq!(graph.parent_of(&tid("b")), Some(&tid("a")));
         assert_eq!(graph.children_of(&tid("a")), &[tid("b")]);
@@ -309,10 +308,10 @@ mod tests {
     fn double_spawn_same_child_rejected() {
         let mut graph = SpawnGraph::new();
         graph
-            .add_edge(tid("a"), tid("b"), TaskKind::Action, now())
+            .add_edge(tid("a"), tid("b"), TaskKind::LocalAgent, now())
             .unwrap();
         let err = graph
-            .add_edge(tid("a"), tid("b"), TaskKind::Action, now())
+            .add_edge(tid("a"), tid("b"), TaskKind::LocalAgent, now())
             .unwrap_err();
         assert!(matches!(err, SpawnGraphError::EdgeAlreadyExists { .. }));
     }
@@ -321,13 +320,13 @@ mod tests {
     fn cycle_detected() {
         let mut graph = SpawnGraph::new();
         graph
-            .add_edge(tid("a"), tid("b"), TaskKind::Action, now())
+            .add_edge(tid("a"), tid("b"), TaskKind::LocalAgent, now())
             .unwrap();
         graph
-            .add_edge(tid("b"), tid("c"), TaskKind::Action, now())
+            .add_edge(tid("b"), tid("c"), TaskKind::LocalAgent, now())
             .unwrap();
         let err = graph
-            .add_edge(tid("c"), tid("a"), TaskKind::Action, now())
+            .add_edge(tid("c"), tid("a"), TaskKind::LocalAgent, now())
             .unwrap_err();
         assert!(matches!(err, SpawnGraphError::WouldFormCycle { .. }));
     }
@@ -340,13 +339,13 @@ mod tests {
         };
         let mut graph = SpawnGraph::with_limits(limits);
         graph
-            .add_edge(tid("a"), tid("b"), TaskKind::Action, now())
+            .add_edge(tid("a"), tid("b"), TaskKind::LocalAgent, now())
             .unwrap();
         graph
-            .add_edge(tid("b"), tid("c"), TaskKind::Action, now())
+            .add_edge(tid("b"), tid("c"), TaskKind::LocalAgent, now())
             .unwrap();
         let err = graph
-            .add_edge(tid("c"), tid("d"), TaskKind::Action, now())
+            .add_edge(tid("c"), tid("d"), TaskKind::LocalAgent, now())
             .unwrap_err();
         assert!(matches!(err, SpawnGraphError::MaxDepthExceeded { .. }));
     }
@@ -359,19 +358,19 @@ mod tests {
         };
         let mut graph = SpawnGraph::with_limits(limits);
         graph
-            .add_edge(tid("p"), tid("c1"), TaskKind::Action, now())
+            .add_edge(tid("p"), tid("c1"), TaskKind::LocalAgent, now())
             .unwrap();
         graph
-            .add_edge(tid("p"), tid("c2"), TaskKind::Action, now())
+            .add_edge(tid("p"), tid("c2"), TaskKind::LocalAgent, now())
             .unwrap();
         let err = graph
-            .add_edge(tid("p"), tid("c3"), TaskKind::Action, now())
+            .add_edge(tid("p"), tid("c3"), TaskKind::LocalAgent, now())
             .unwrap_err();
         assert!(matches!(err, SpawnGraphError::MaxFanoutExceeded { .. }));
         // 关闭一个 open child 后扇出再次允许新增。
         graph.mark_closed(&tid("c1"), now()).unwrap();
         graph
-            .add_edge(tid("p"), tid("c3"), TaskKind::Action, now())
+            .add_edge(tid("p"), tid("c3"), TaskKind::LocalAgent, now())
             .unwrap();
     }
 
@@ -379,7 +378,7 @@ mod tests {
     fn mark_closed_records_timestamp_idempotent() {
         let mut graph = SpawnGraph::new();
         graph
-            .add_edge(tid("a"), tid("b"), TaskKind::Action, now())
+            .add_edge(tid("a"), tid("b"), TaskKind::LocalAgent, now())
             .unwrap();
         graph.mark_closed(&tid("b"), now()).unwrap();
         assert_eq!(
@@ -394,13 +393,13 @@ mod tests {
     fn open_descendants_skips_closed_subtrees() {
         let mut graph = SpawnGraph::new();
         graph
-            .add_edge(tid("root"), tid("a"), TaskKind::Action, now())
+            .add_edge(tid("root"), tid("a"), TaskKind::LocalAgent, now())
             .unwrap();
         graph
-            .add_edge(tid("root"), tid("b"), TaskKind::Action, now())
+            .add_edge(tid("root"), tid("b"), TaskKind::LocalAgent, now())
             .unwrap();
         graph
-            .add_edge(tid("a"), tid("a1"), TaskKind::Action, now())
+            .add_edge(tid("a"), tid("a1"), TaskKind::LocalAgent, now())
             .unwrap();
         graph.mark_closed(&tid("a"), now()).unwrap();
         // a 关闭后只剩 b、a1 还是 open（a1 边自身还是 Open）。
@@ -413,10 +412,10 @@ mod tests {
     fn ancestors_reports_chain() {
         let mut graph = SpawnGraph::new();
         graph
-            .add_edge(tid("a"), tid("b"), TaskKind::Action, now())
+            .add_edge(tid("a"), tid("b"), TaskKind::LocalAgent, now())
             .unwrap();
         graph
-            .add_edge(tid("b"), tid("c"), TaskKind::Action, now())
+            .add_edge(tid("b"), tid("c"), TaskKind::LocalAgent, now())
             .unwrap();
         assert_eq!(graph.ancestors(&tid("c")), vec![tid("b"), tid("a")]);
         assert!(graph.ancestors(&tid("a")).is_empty());

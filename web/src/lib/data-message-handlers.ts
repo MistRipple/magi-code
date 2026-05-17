@@ -466,7 +466,7 @@ export function handleUnifiedData(standard: StandardMessage) {
       break;
 
     // missionPlanned / assignmentPlanned / assignmentStarted / assignmentCompleted
-    // handlers removed — old Mission/Assignment model superseded by Task Graph.
+    // handlers removed — old Mission/Assignment model superseded by Task Projection.
 
     case 'settingsBootstrapLoaded':
       handleSettingsBootstrapLoaded(asMessage(payload));
@@ -984,7 +984,7 @@ function handleClarificationRequest(_message: ClientBridgeMessage) {
 
 // handleMissionPlanned, handleAssignmentPlanned, handleAssignmentStarted,
 // handleAssignmentCompleted, updateAssignmentPlan — removed.
-// Old Mission/Assignment incremental handlers superseded by Task Graph model.
+// Old Mission/Assignment incremental handlers superseded by Task Projection model.
 
 /**
  * 处理 Worker 状态更新消息

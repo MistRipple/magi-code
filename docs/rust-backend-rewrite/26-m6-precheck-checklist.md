@@ -134,7 +134,7 @@
 - C-1 TS 契约层全量冻结已完成：`support/frontend-contract` 新增约 80 个 DTO 与约 70 个 client 方法，覆盖所有 Rust 后端路由（task/interaction/chain/sessions/workspaces/settings/knowledge/MCP/changes），前端不再需要手写缺失 DTO
 - B-3 env-backed provider smoke 路径已确认完整：`magi-daemon` 已有 6+1 条 env-backed provider/MCP 回归测试，新增 transport failure 场景
 - B-2 repo-level smoke 已扩展 `--check-api-reads` 覆盖 5 条前端常用读取路由
-- Task Graph 基础设施已落地（TaskStore/task_events/Task Graph API）
+- Task Projection 基础设施已落地（TaskStore/task_events/Task Projection API）
 - HttpModelBridgeClient 已创建，支持直连 OpenAI-compatible 端点
 - 当前测试总数：420（workspace 全量），`svelte-check` 0 error / 0 warning，TS check/build 全部通过
 - 本轮未完成项仍然明确保留：

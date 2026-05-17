@@ -16,7 +16,7 @@ use magi_conversation_runtime::{
     task_execution_registry::TaskExecutionPlan,
 };
 use magi_core::{
-    ExecutionOwnership, SessionId, TaskExecutionTarget, TaskStatus, ThreadId, WorkerId,
+    ExecutionOwnership, SessionId, TaskExecutionTarget, TaskStatus, TaskTier, ThreadId, WorkerId,
 };
 use magi_orchestrator::ExecutionWritebackPlans;
 use magi_session_store::{ActiveExecutionBranch, ActiveExecutionChain};
@@ -273,9 +273,9 @@ pub(crate) fn continue_execution_chain(
     let mut root_status = root_task.status;
     if matches!(root_status, TaskStatus::Completed) {
         task_store
-            .update_status(&chain.root_task_id, TaskStatus::Blocked)
+            .update_status(&chain.root_task_id, TaskStatus::Failed)
             .map_err(|error| ApiError::internal_assembly("继续会话失败", error))?;
-        root_status = TaskStatus::Blocked;
+        root_status = TaskStatus::Failed;
     } else if task_status_is_terminal(&root_status) {
         return Err(ApiError::InvalidInput(
             "当前会话执行链已结束，不能继续".to_string(),
@@ -311,10 +311,10 @@ pub(crate) fn continue_execution_chain(
         .runner_manager()
         .ok_or_else(|| ApiError::internal_assembly("继续会话失败", "runner_manager 未配置"))?;
     match root_status {
-        TaskStatus::Blocked if requested_worker_ids.is_empty() => manager
+        TaskStatus::Failed if requested_worker_ids.is_empty() => manager
             .resume_tree(chain.root_task_id.as_str())
             .map_err(|error| ApiError::internal_assembly("继续会话失败", error))?,
-        TaskStatus::Blocked => {
+        TaskStatus::Failed => {
             task_store
                 .update_status(&chain.root_task_id, TaskStatus::Running)
                 .map_err(|error| ApiError::internal_assembly("继续会话失败", error))?;
@@ -331,13 +331,13 @@ pub(crate) fn continue_execution_chain(
             .map_err(|msg| ApiError::internal_assembly("继续会话失败", msg))?;
     }
 
-    // 深度模式：恢复任务状态后需要重新启动后台 runner，避免退化为同步执行
-    let background_allowed = root_task
+    // Long Mission：恢复任务状态后需要重新启动后台 runner，避免退化为同步执行
+    let is_long_mission = root_task
         .policy_snapshot
         .as_ref()
-        .map(|policy| policy.background_allowed)
+        .map(|policy| policy.task_tier == TaskTier::LongMission)
         .unwrap_or(false);
-    if background_allowed {
+    if is_long_mission {
         match manager.start(chain.root_task_id.as_str(), Some(session_id.clone())) {
             Ok(_) | Err(RunnerStartError::AlreadyRunning) => {}
             Err(RunnerStartError::NotFound) => {

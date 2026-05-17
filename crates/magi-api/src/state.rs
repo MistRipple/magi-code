@@ -22,8 +22,8 @@ use magi_conversation_runtime::{
     task_execution_dispatcher::{ExecutionPipeline, LlmTaskDispatcher},
     task_execution_registry::TaskExecutionRegistry,
     task_runner_bridge::{
-        EventBasedResultReceiver, EventBasedTaskDispatcher, RunCycleOutcome, TaskDispatcher,
-        TaskResultReceiver, WorkerExecutionDispatcher,
+        EventBasedResultReceiver, RunCycleOutcome, TaskDispatchGate, TaskDispatcher,
+        TaskResultReceiver,
     },
     task_runner_v2::TaskRunner,
 };
@@ -53,11 +53,11 @@ use std::sync::{
 pub struct RunnerHandle {
     /// Whether the runner has been signalled to stop.
     pub cancel: Arc<AtomicBool>,
-    /// 后台 runner 循环是否仍未退出，用于避免暂停/停止中的任务链被重复启动。
+    /// 后台 runner 循环是否仍未退出，用于避免已中断任务被重复启动。
     pub active: Arc<AtomicBool>,
     /// Number of cycles executed so far.
     pub cycle_count: Arc<AtomicU64>,
-    /// 当前 runner 展示状态："running"、"blocked"、"stopped"、"completed"、"error"。
+    /// 当前 runner 展示状态："running"、"killed"、"completed"、"error"。
     pub status: Arc<Mutex<String>>,
     /// Last error message, if any.
     pub last_error: Arc<Mutex<Option<String>>>,
@@ -72,81 +72,30 @@ pub struct RunnerManager {
     task_store: Arc<TaskStore>,
     worker_catalog: Arc<dyn Fn() -> Vec<WorkerInfo> + Send + Sync>,
     dispatcher: Option<Arc<dyn TaskDispatcher>>,
-    event_bus: Option<Arc<InMemoryEventBus>>,
+    dispatch_gate: Option<Arc<TaskDispatchGate>>,
+    child_result_route: Option<RunnerChildResultRoute>,
     /// Shared result receiver that collects task completion/failure results
     /// pushed from the TaskStore's status-change callback.
     result_receiver: Arc<EventBasedResultReceiver>,
     /// Optional path for periodic task-store checkpoints.
     checkpoint_path: Option<PathBuf>,
-    /// Maps a session to the root task IDs whose runners should be cancelled
+    /// Maps a session to the root task IDs whose runners should be killed
     /// when the session is closed (design 1.5: Session-Runner linkage).
     session_runner_index: Arc<Mutex<HashMap<SessionId, Vec<String>>>>,
     terminal_observer: Option<RunnerTerminalObserver>,
+}
+
+#[derive(Clone)]
+struct RunnerChildResultRoute {
+    session_store: Arc<SessionStore>,
+    conversation_registry: Arc<ConversationRegistry>,
+    spawn_graph: Arc<Mutex<magi_spawn_graph::SpawnGraph>>,
 }
 
 /// Number of runner cycles between periodic checkpoints.
 const CHECKPOINT_INTERVAL_CYCLES: u64 = 5;
 
 impl RunnerManager {
-    pub fn new(task_store: Arc<TaskStore>, workers: Vec<WorkerInfo>) -> Self {
-        let worker_catalog = Arc::new(move || workers.clone());
-        Self::with_worker_catalog(task_store, worker_catalog)
-    }
-
-    pub fn with_worker_catalog(
-        task_store: Arc<TaskStore>,
-        worker_catalog: Arc<dyn Fn() -> Vec<WorkerInfo> + Send + Sync>,
-    ) -> Self {
-        Self {
-            runners: Arc::new(Mutex::new(HashMap::new())),
-            task_store,
-            worker_catalog,
-            dispatcher: None,
-            event_bus: None,
-            result_receiver: Arc::new(EventBasedResultReceiver::new()),
-            checkpoint_path: None,
-            session_runner_index: Arc::new(Mutex::new(HashMap::new())),
-            terminal_observer: None,
-        }
-    }
-
-    /// Create a RunnerManager wired to a real event bus so that dispatched
-    /// tasks publish `task.dispatched` domain events and the TaskStore
-    /// publishes `task.status.changed` events.
-    pub fn with_event_bus(
-        task_store: Arc<TaskStore>,
-        workers: Vec<WorkerInfo>,
-        event_bus: Arc<InMemoryEventBus>,
-        result_receiver: Arc<EventBasedResultReceiver>,
-    ) -> Self {
-        let worker_catalog = Arc::new(move || workers.clone());
-        Self::with_event_bus_and_worker_catalog(
-            task_store,
-            worker_catalog,
-            event_bus,
-            result_receiver,
-        )
-    }
-
-    pub fn with_event_bus_and_worker_catalog(
-        task_store: Arc<TaskStore>,
-        worker_catalog: Arc<dyn Fn() -> Vec<WorkerInfo> + Send + Sync>,
-        event_bus: Arc<InMemoryEventBus>,
-        result_receiver: Arc<EventBasedResultReceiver>,
-    ) -> Self {
-        Self {
-            runners: Arc::new(Mutex::new(HashMap::new())),
-            task_store,
-            worker_catalog,
-            dispatcher: None,
-            event_bus: Some(event_bus),
-            result_receiver,
-            checkpoint_path: None,
-            session_runner_index: Arc::new(Mutex::new(HashMap::new())),
-            terminal_observer: None,
-        }
-    }
-
     pub fn with_dispatcher_and_worker_catalog(
         task_store: Arc<TaskStore>,
         worker_catalog: Arc<dyn Fn() -> Vec<WorkerInfo> + Send + Sync>,
@@ -158,32 +107,8 @@ impl RunnerManager {
             task_store,
             worker_catalog,
             dispatcher: Some(dispatcher),
-            event_bus: None,
-            result_receiver,
-            checkpoint_path: None,
-            session_runner_index: Arc::new(Mutex::new(HashMap::new())),
-            terminal_observer: None,
-        }
-    }
-
-    pub fn with_worker_execution(
-        task_store: Arc<TaskStore>,
-        worker_catalog: Arc<dyn Fn() -> Vec<WorkerInfo> + Send + Sync>,
-        worker_runtime: magi_worker_runtime::WorkerRuntime,
-        event_bus: Option<Arc<InMemoryEventBus>>,
-    ) -> Self {
-        let result_receiver = Arc::new(EventBasedResultReceiver::new());
-        let mut dispatcher =
-            WorkerExecutionDispatcher::new(worker_runtime, Arc::clone(&result_receiver));
-        if let Some(ref bus) = event_bus {
-            dispatcher = dispatcher.with_event_bus(Arc::clone(bus));
-        }
-        Self {
-            runners: Arc::new(Mutex::new(HashMap::new())),
-            task_store,
-            worker_catalog,
-            dispatcher: Some(Arc::new(dispatcher)),
-            event_bus,
+            dispatch_gate: None,
+            child_result_route: None,
             result_receiver,
             checkpoint_path: None,
             session_runner_index: Arc::new(Mutex::new(HashMap::new())),
@@ -195,30 +120,49 @@ impl RunnerManager {
         (self.worker_catalog)()
     }
 
-    fn build_task_runner(&self) -> TaskRunner {
+    pub fn with_child_result_route(
+        mut self,
+        session_store: Arc<SessionStore>,
+        conversation_registry: Arc<ConversationRegistry>,
+        spawn_graph: Arc<Mutex<magi_spawn_graph::SpawnGraph>>,
+    ) -> Self {
+        self.child_result_route = Some(RunnerChildResultRoute {
+            session_store,
+            conversation_registry,
+            spawn_graph,
+        });
+        self
+    }
+
+    pub fn with_dispatch_gate(mut self, gate: Arc<TaskDispatchGate>) -> Self {
+        self.dispatch_gate = Some(gate);
+        self
+    }
+
+    fn build_task_runner(&self, session_id: Option<SessionId>) -> TaskRunner {
         let workers = self.resolved_workers();
-        let runner = if let Some(ref dispatcher) = self.dispatcher {
-            TaskRunner::with_dispatcher(
-                Arc::clone(&self.task_store),
-                workers,
-                Arc::clone(dispatcher),
-                Arc::clone(&self.result_receiver) as Arc<dyn TaskResultReceiver>,
-            )
-        } else if let Some(ref event_bus) = self.event_bus {
-            TaskRunner::with_dispatcher(
-                Arc::clone(&self.task_store),
-                workers,
-                Arc::new(EventBasedTaskDispatcher::new(Arc::clone(event_bus))),
-                Arc::clone(&self.result_receiver) as Arc<dyn TaskResultReceiver>,
-            )
-        } else {
-            TaskRunner::new(Arc::clone(&self.task_store), workers)
-        };
-        if let Some(ref event_bus) = self.event_bus {
-            runner.with_event_bus(Arc::clone(event_bus))
-        } else {
-            runner
+        let dispatcher = self
+            .dispatcher
+            .as_ref()
+            .expect("RunnerManager 缺少 v2 LLM dispatcher");
+        let mut runner = TaskRunner::with_dispatcher(
+            Arc::clone(&self.task_store),
+            workers,
+            Arc::clone(dispatcher),
+            Arc::clone(&self.result_receiver) as Arc<dyn TaskResultReceiver>,
+        );
+        if let Some(gate) = &self.dispatch_gate {
+            runner = runner.with_dispatch_gate(Arc::clone(gate));
         }
+        if let (Some(route), Some(session_id)) = (&self.child_result_route, session_id) {
+            runner = runner.with_child_result_route(
+                session_id,
+                Arc::clone(&route.session_store),
+                Arc::clone(&route.conversation_registry),
+                Arc::clone(&route.spawn_graph),
+            );
+        }
+        runner
     }
 
     /// Set the file path used for periodic task-store checkpoints.
@@ -281,7 +225,7 @@ impl RunnerManager {
         }
 
         // Spawn the background loop.
-        let task_runner = self.build_task_runner();
+        let task_runner = self.build_task_runner(observer_session_id.clone());
         let root_id = tid;
         let bg_handle = Arc::clone(&handle);
         let bg_active = Arc::clone(&handle.active);
@@ -289,12 +233,12 @@ impl RunnerManager {
         let bg_checkpoint_path = self.checkpoint_path.clone();
         let terminal_observer = self.terminal_observer.clone();
         tokio::spawn(async move {
-            let mut blocked_streak = 0u32;
-            let max_blocked_streak = 20u32;
+            let mut stalled_streak = 0u32;
+            let max_stalled_streak = 20u32;
             loop {
                 if bg_handle.cancel.load(Ordering::Relaxed) {
                     let mut status = bg_handle.status.lock().expect("status lock should hold");
-                    *status = "stopped".to_string();
+                    *status = "killed".to_string();
                     bg_active.store(false, Ordering::Relaxed);
                     break;
                 }
@@ -325,7 +269,19 @@ impl RunnerManager {
 
                 match outcome {
                     RunCycleOutcome::Continue => {
-                        blocked_streak = 0;
+                        stalled_streak = 0;
+                        {
+                            let mut status =
+                                bg_handle.status.lock().expect("status lock should hold");
+                            if status.as_str() == "blocked" {
+                                *status = "running".to_string();
+                                let mut last_error = bg_handle
+                                    .last_error
+                                    .lock()
+                                    .expect("last_error lock should hold");
+                                *last_error = None;
+                            }
+                        }
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     }
                     RunCycleOutcome::AllComplete => {
@@ -344,18 +300,18 @@ impl RunnerManager {
                         }
                         break;
                     }
-                    RunCycleOutcome::Blocked(blocked_ids) => {
-                        blocked_streak += 1;
-                        let should_finalize_blocked = blocked_streak >= max_blocked_streak
-                            || blocked_outcome_is_stable_waiting_state(
+                    RunCycleOutcome::Stalled(stalled_ids) => {
+                        stalled_streak += 1;
+                        let should_finalize_stalled = stalled_streak >= max_stalled_streak
+                            || stalled_outcome_is_terminally_unrunnable(
                                 &bg_task_store,
-                                &blocked_ids,
+                                &stalled_ids,
                             );
-                        if should_finalize_blocked {
+                        if should_finalize_stalled {
                             let runner_status = match task_runner
-                                .finalize_blocked_outcome(&root_id, &blocked_ids)
+                                .finalize_stalled_outcome(&root_id, &stalled_ids)
                             {
-                                Ok(_) => "blocked",
+                                Ok(_) => "error",
                                 Err(err) => {
                                     let mut last_error = bg_handle
                                         .last_error
@@ -381,8 +337,24 @@ impl RunnerManager {
                             }
                             break;
                         }
-                        let backoff_ms = 200u64.saturating_mul(blocked_streak as u64).min(2_000);
+                        let backoff_ms = 200u64.saturating_mul(stalled_streak as u64).min(2_000);
                         tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                    }
+                    RunCycleOutcome::Blocked { reason, .. } => {
+                        stalled_streak = 0;
+                        {
+                            let mut status =
+                                bg_handle.status.lock().expect("status lock should hold");
+                            *status = "blocked".to_string();
+                        }
+                        {
+                            let mut last_error = bg_handle
+                                .last_error
+                                .lock()
+                                .expect("last_error lock should hold");
+                            *last_error = Some(reason);
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                     }
                     RunCycleOutcome::Error(err) => {
                         if let Some(ref path) = bg_checkpoint_path {
@@ -421,12 +393,12 @@ impl RunnerManager {
             return Err(RunnerStopError::NotRunning);
         }
         handle.cancel.store(true, Ordering::Relaxed);
-        *status = "stopped".to_string();
+        *status = "killed".to_string();
         Ok(())
     }
 
     /// Bind a session to a root task so that when the session closes the
-    /// runner is automatically cancelled (design 1.5).
+    /// runner is automatically killed.
     pub fn bind_session(&self, session_id: SessionId, root_task_id: &str) {
         let mut index = self
             .session_runner_index
@@ -477,49 +449,34 @@ impl RunnerManager {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn set_status_for_test(&self, root_task_id: &str, status: &str) {
-        let handle = Arc::new(RunnerHandle {
-            cancel: Arc::new(AtomicBool::new(false)),
-            active: Arc::new(AtomicBool::new(status == "running")),
-            cycle_count: Arc::new(AtomicU64::new(0)),
-            status: Arc::new(Mutex::new(status.to_string())),
-            last_error: Arc::new(Mutex::new(None)),
-        });
-        self.runners
-            .lock()
-            .expect("runners lock should hold")
-            .insert(root_task_id.to_string(), handle);
-    }
-
     /// Run a single cycle synchronously (for testing / manual trigger).
     pub fn run_single_cycle(&self, root_task_id: &str) -> Result<RunCycleOutcome, String> {
         let tid = TaskId::new(root_task_id);
         self.task_store
             .get_task(&tid)
             .ok_or_else(|| format!("任务不存在: {}", root_task_id))?;
-        let task_runner = self.build_task_runner();
+        let task_runner = self.build_task_runner(None);
         Ok(task_runner.run_cycle(&tid))
     }
 
-    pub fn pause_tree(&self, root_task_id: &str) -> Result<(), String> {
+    pub fn kill_tree(&self, root_task_id: &str) -> Result<(), String> {
         let tid = TaskId::new(root_task_id);
         self.task_store
             .get_task(&tid)
             .ok_or_else(|| format!("任务不存在: {}", root_task_id))?;
-        self.build_task_runner().pause_task(&tid)?;
-        self.set_runner_status_if_present(root_task_id, "blocked");
+        self.build_task_runner(None).kill_tree(&tid)?;
+        self.set_runner_status_if_present(root_task_id, "killed");
         Ok(())
     }
 
-    pub fn pause_task(&self, task_id: &str) -> Result<(), String> {
+    pub fn kill_task(&self, task_id: &str) -> Result<(), String> {
         let tid = TaskId::new(task_id);
         let task = self
             .task_store
             .get_task(&tid)
             .ok_or_else(|| format!("任务不存在: {}", task_id))?;
-        self.build_task_runner().pause_task(&tid)?;
-        self.set_runner_status_if_present(task.root_task_id.as_str(), "blocked");
+        self.build_task_runner(None).kill_task(&tid)?;
+        self.set_runner_status_if_present(task.root_task_id.as_str(), "killed");
         Ok(())
     }
 
@@ -528,7 +485,7 @@ impl RunnerManager {
         self.task_store
             .get_task(&tid)
             .ok_or_else(|| format!("任务不存在: {}", root_task_id))?;
-        self.build_task_runner().resume_task(&tid)
+        self.build_task_runner(None).resume_task(&tid)
     }
 
     fn set_runner_status_if_present(&self, root_task_id: &str, status: &str) {
@@ -541,17 +498,14 @@ impl RunnerManager {
     }
 }
 
-fn blocked_outcome_is_stable_waiting_state(
+fn stalled_outcome_is_terminally_unrunnable(
     task_store: &TaskStore,
-    blocked_task_ids: &[TaskId],
+    stalled_task_ids: &[TaskId],
 ) -> bool {
-    blocked_task_ids.iter().any(|task_id| {
-        task_store.get_task(task_id).is_some_and(|task| {
-            matches!(
-                task.status,
-                TaskStatus::AwaitingApproval | TaskStatus::Blocked
-            )
-        })
+    stalled_task_ids.iter().any(|task_id| {
+        task_store
+            .get_task(task_id)
+            .is_some_and(|task| matches!(task.status, TaskStatus::Failed | TaskStatus::Killed))
     })
 }
 
@@ -1603,7 +1557,7 @@ mod tests {
             mission_id: MissionId::new("mission-stable-waiting-state"),
             root_task_id: TaskId::new("task-root-stable-waiting-state"),
             parent_task_id: None,
-            kind: TaskKind::Decision,
+            kind: TaskKind::LocalAgent,
             title: "等待确认".to_string(),
             goal: "等待用户确认后继续".to_string(),
             status,
@@ -1611,7 +1565,6 @@ mod tests {
             required_children: Vec::new(),
             policy_snapshot: None,
             executor_binding: None,
-            context_refs: Vec::new(),
             knowledge_refs: Vec::new(),
             workspace_scope: None,
             write_scope: None,
@@ -1619,38 +1572,33 @@ mod tests {
             output_refs: Vec::new(),
             evidence_refs: Vec::new(),
             retry_count: 0,
-            repair_count: 0,
-            decision_payload: None,
-            variant: magi_core::TaskVariant::default(),
+            runtime_payload: magi_core::TaskRuntimePayload::default(),
             created_at: now,
             updated_at: now,
         }
     }
 
     #[test]
-    fn blocked_outcome_with_awaiting_decision_is_stable_waiting_state() {
+    fn stalled_outcome_with_failed_task_is_terminally_unrunnable() {
         let store = TaskStore::new();
-        let decision_id = TaskId::new("task-decision-awaiting");
-        store.insert_task(task_with_status(
-            decision_id.as_str(),
-            TaskStatus::AwaitingApproval,
-        ));
+        let failed_id = TaskId::new("task-failed");
+        store.insert_task(task_with_status(failed_id.as_str(), TaskStatus::Failed));
 
-        assert!(blocked_outcome_is_stable_waiting_state(
+        assert!(stalled_outcome_is_terminally_unrunnable(
             &store,
-            &[decision_id]
+            &[failed_id]
         ));
     }
 
     #[test]
-    fn blocked_outcome_with_ready_task_still_uses_debounce() {
+    fn stalled_outcome_with_pending_task_still_uses_debounce() {
         let store = TaskStore::new();
-        let ready_id = TaskId::new("task-ready-unmatched");
-        store.insert_task(task_with_status(ready_id.as_str(), TaskStatus::Ready));
+        let pending_id = TaskId::new("task-pending-unmatched");
+        store.insert_task(task_with_status(pending_id.as_str(), TaskStatus::Pending));
 
-        assert!(!blocked_outcome_is_stable_waiting_state(
+        assert!(!stalled_outcome_is_terminally_unrunnable(
             &store,
-            &[ready_id]
+            &[pending_id]
         ));
     }
 }

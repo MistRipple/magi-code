@@ -356,7 +356,7 @@ impl OrchestratorService {
         intent.executor_request(WorkerStage::Execute, request_source.to_string())
     }
 
-    pub(crate) fn build_execution_overview_from_task_graph(
+    pub(crate) fn build_execution_overview_from_task_projection(
         &self,
         task_store: &task_store::TaskStore,
         target: &TaskExecutionTarget,
@@ -366,7 +366,7 @@ impl OrchestratorService {
         governance_observations: &[WorkerGovernanceObservation],
         context_summary: Option<ExecutionContextSummary>,
     ) -> Option<ExecutionOverview> {
-        let overview = execution_overview::build_execution_overview_from_task_graph(
+        let overview = execution_overview::build_execution_overview_from_task_projection(
             task_store,
             &target.root_task_id,
             &target.mission_id,

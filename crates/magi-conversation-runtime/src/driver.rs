@@ -12,6 +12,8 @@
 //! - 旧式单体调度中的 `for round in 0..limit` 在 driver 内塌缩为
 //!   `TurnDriver::execute_round` 实现
 
+use crate::MailboxItem;
+
 /// 一轮 round 的产出——指示 advance_turn 下一步动作。
 #[derive(Debug)]
 pub enum RoundOutcome {
@@ -44,6 +46,10 @@ pub trait TurnDriver {
         None
     }
 
+    /// Turn 边界 drain 出来的 Mailbox 输入。默认空实现，具体 driver 可选择把
+    /// 这些信号注入 prompt、写入日志，或按业务语义转换为下一轮输入。
+    fn accept_mailbox_items(&mut self, _items: Vec<MailboxItem>) {}
+
     /// 每一轮 `execute_round` 调用前的钩子。
     ///
     /// 用于 driver 在进入新一轮模型调用前完成上一轮 ToolCalling 阶段的副作用
@@ -61,8 +67,8 @@ pub trait TurnDriver {
     fn execute_round(&mut self, round: usize) -> RoundOutcome;
 
     /// 循环正常以 `RoundOutcome::Done` 结束后，driver 自己决定最终是 Completed
-    /// 还是其他形态（例如 "final_content 空 / lease 失效 / 工具失败兜底
-    /// / validation 拒绝" 后置判定，全部落在这里）。
+    /// 还是其他形态（例如 "final_content 空 / lease 失效 / 工具失败 /
+    /// validation 拒绝" 后置判定，全部落在这里）。
     fn finalize_success(self) -> Self::Outcome;
 
     /// 某一轮 `execute_round` 返回 `Failed(reason)` 时构造的 outcome。

@@ -601,6 +601,7 @@ pub enum SessionSidecarFlushReason {
     UpdateCurrentTurnStatus,
     AttachRecoveryRef,
     ClearExecutionOwnership,
+    ArchiveActiveExecutionChain,
     DeleteSession,
 }
 
@@ -752,8 +753,8 @@ pub struct SessionStoreState {
     pub notifications: Vec<NotificationRecord>,
     #[serde(default, flatten)]
     pub execution_sidecar_store: SessionExecutionSidecarStoreState,
-    /// P6 Thread 原语注册表：按 session 聚合 `ExecutionThread`，支持同 role 跨 task
-    /// 复用。不进入 durable snapshot（P6a 仅运行时维护；P6b 引入持久化后再迁移）。
+    /// P6 Thread 原语注册表：按 session 聚合 `ExecutionThread`。orchestrator thread
+    /// 随 session 常驻；worker thread 绑定单个 task 执行，不跨 task 复用。
     #[serde(skip, default)]
     pub thread_registry: Vec<ExecutionThread>,
 }
@@ -975,7 +976,7 @@ pub struct SessionProjectionInput {
 /// Thread 的生命周期状态。
 ///
 /// - `Active`：当前正在处理某个 task（有 in-flight lease）。
-/// - `Idle`：上一个 task 已完成，context 保留，可被下一 task 复用。
+/// - `Idle`：该 thread 当前无 in-flight lease；worker thread 到达终态后保留为审计事实。
 /// - `Retired`：mission 结束或显式回收，不再可被复用；保留为只读历史。
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -985,11 +986,10 @@ pub enum ExecutionThreadStatus {
     Retired,
 }
 
-/// Thread 实体：承载"同 mission + 同 role = 同一条 thread"的产品语义。
+/// Thread 实体：承载 task 执行归属与 UI 可见性锚点。
 ///
-/// 一个 Thread 绑定到具体的 worker 实例（`worker_instance_id`），跨多个 task
-/// 累积上下文（`message_history`）。Thread 在 mission 生命周期内可被派发多次；
-/// mission 结束后整体进入 `Retired`，不跨 mission 复用。
+/// orchestrator thread 绑定 session 主线；worker thread 绑定单次 task + worker 实例，
+/// 不按 role 复用。这样当前 task 的执行事实不会被历史 tool-call 上下文污染。
 ///
 /// `mission_id` 为必填。Session 首次接收 user 输入时通过 `ensure_session_mission`
 /// 创建该 session 的常驻 mission，并同时 spawn `role_id = ORCHESTRATOR_ROLE_ID`
@@ -1005,12 +1005,11 @@ pub struct ExecutionThread {
     pub status: ExecutionThreadStatus,
     pub created_at: UtcMillis,
     pub last_used_at: UtcMillis,
-    /// 该 thread 处理过的 task 序列，用于调试 / UI 呈现时间线。
+    /// 该 thread 处理过的 task 序列，用于调试 / UI 呈现时间线；worker thread 通常只有一个。
     #[serde(default)]
     pub handled_task_ids: Vec<TaskId>,
-    /// 跨 task 累积的 LLM 对话历史。存 user/assistant/tool 消息的串行记录，
-    /// 下一 task 启动时会把这段历史作为上文前置到新一轮 prompt 中，形成 Codex 式的
-    /// "同 role 持续性对话"。mission 结束时随 thread 一起 Retired，不跨 mission 复用。
+    /// thread 内部的 LLM 对话审计 / 恢复记录。它只属于当前 thread，不能作为同 role
+    /// 下一 task 的执行上下文。
     #[serde(default)]
     pub message_history: Vec<ThreadChatMessage>,
 }

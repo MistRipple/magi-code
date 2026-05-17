@@ -1,4 +1,4 @@
-use magi_core::{EventId, SessionId, TaskStatus, UtcMillis, WorkspaceId};
+use magi_core::{EventId, SessionId, TaskStatus, TaskTier, UtcMillis, WorkspaceId};
 use magi_event_bus::{EventContext, EventEnvelope};
 use magi_session_store::ActiveExecutionTurn;
 use serde_json::json;
@@ -24,6 +24,7 @@ pub(super) fn accept_session_task_submission(
     request: &SessionTurnRequestDto,
     task_title: Option<String>,
     execution_goal: Option<String>,
+    task_tier: TaskTier,
 ) -> Result<(DispatchSubmissionAccepted, EventId), ApiError> {
     let trimmed_text = request.trimmed_text();
     let message = request.timeline_message(trimmed_text.as_deref());
@@ -50,6 +51,7 @@ pub(super) fn accept_session_task_submission(
         message,
         trimmed_text,
         execution_goal,
+        task_tier,
         request.skill_name.clone(),
         None,
         request,
@@ -64,6 +66,7 @@ fn execute_dispatch_submission(
     message: String,
     trimmed_text: Option<String>,
     execution_goal: Option<String>,
+    task_tier: TaskTier,
     skill_name: Option<String>,
     target_role: Option<String>,
     request: &SessionTurnRequestDto,
@@ -91,6 +94,7 @@ fn execute_dispatch_submission(
         task_title: action_task_title,
         trimmed_text,
         execution_goal,
+        task_tier,
         skill_name,
         target_role,
         request_id: signal.request_id.clone(),

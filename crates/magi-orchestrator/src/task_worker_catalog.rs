@@ -18,15 +18,16 @@ pub struct WorkerInfo {
 use std::collections::HashMap;
 use std::sync::RwLock;
 
-/// Task System v2：role / prompt 不再硬编码在本文件，全部经 `AgentRoleRegistry`
-/// 解析；本模块只保留 kind ↔ 默认 role 的路由策略以及动态目录的注册/查询。
+/// Task System v2：role / prompt 经 `AgentRoleRegistry` 解析；本模块只保留动态目录查询。
 pub fn default_task_role_for_kind(kind: TaskKind) -> Option<&'static str> {
     match kind {
-        TaskKind::Objective | TaskKind::Phase => Some("architect"),
-        TaskKind::WorkPackage | TaskKind::Action => Some("integration-dev"),
-        TaskKind::Validation => Some("reviewer"),
-        TaskKind::Repair => Some("debugger"),
-        TaskKind::Decision => None,
+        TaskKind::LocalAgent => Some("integration-dev"),
+        TaskKind::LocalBash => Some("devops-engineer"),
+        TaskKind::LocalWorkflow => Some("integration-dev"),
+        TaskKind::RemoteAgent => Some("integration-dev"),
+        TaskKind::MonitorMcp => Some("integration-dev"),
+        TaskKind::InProcessTeammate => Some("integration-dev"),
+        TaskKind::Dream => Some("architect"),
     }
 }
 
@@ -45,19 +46,6 @@ pub fn supported_kinds_for_role(registry: &AgentRoleRegistry, role: &str) -> Vec
 
 pub fn role_supports_task_kind(registry: &AgentRoleRegistry, role: &str, kind: TaskKind) -> bool {
     registry.role_supports_task_kind(role, kind)
-}
-
-pub fn compatible_task_role_for_kind(
-    registry: &AgentRoleRegistry,
-    kind: TaskKind,
-    candidate: Option<&str>,
-) -> Option<String> {
-    if let Some(role) = candidate.map(str::trim).filter(|role| !role.is_empty()) {
-        if registry.role_supports_task_kind(role, kind) {
-            return Some(role.to_string());
-        }
-    }
-    default_task_role_for_kind(kind).map(ToOwned::to_owned)
 }
 
 pub fn build_worker_info_for_role(
@@ -226,7 +214,7 @@ mod tests {
         let worker = WorkerInfo {
             worker_id: WorkerId::new("custom-1"),
             role: "ml-engineer".to_string(),
-            supported_kinds: vec![TaskKind::Action],
+            supported_kinds: vec![TaskKind::LocalAgent],
             parallelism_limit: Some(2),
             system_prompt_template: None,
         };
@@ -256,15 +244,14 @@ mod tests {
             mission_id: magi_core::MissionId::new("m-1"),
             root_task_id: magi_core::TaskId::new("t-1"),
             parent_task_id: None,
-            kind: TaskKind::Action,
+            kind: TaskKind::LocalAgent,
             title: "test".to_string(),
             goal: "test".to_string(),
-            status: magi_core::TaskStatus::Ready,
+            status: magi_core::TaskStatus::Pending,
             dependency_ids: Vec::new(),
             required_children: Vec::new(),
             policy_snapshot: None,
             executor_binding: None,
-            context_refs: Vec::new(),
             knowledge_refs: Vec::new(),
             workspace_scope: None,
             write_scope: None,
@@ -272,9 +259,7 @@ mod tests {
             output_refs: Vec::new(),
             evidence_refs: Vec::new(),
             retry_count: 0,
-            repair_count: 0,
-            decision_payload: None,
-            variant: magi_core::TaskVariant::default(),
+            runtime_payload: magi_core::TaskRuntimePayload::default(),
             created_at: magi_core::UtcMillis::now(),
             updated_at: magi_core::UtcMillis::now(),
         };
@@ -283,17 +268,17 @@ mod tests {
     }
 
     #[test]
-    fn resolve_task_role_falls_back_when_bound_role_cannot_execute_kind() {
+    fn resolve_task_role_uses_bound_role_when_it_supports_kind() {
         let reg = registry();
         let task = Task {
             task_id: magi_core::TaskId::new("t-1"),
             mission_id: magi_core::MissionId::new("m-1"),
             root_task_id: magi_core::TaskId::new("t-1"),
             parent_task_id: None,
-            kind: TaskKind::Action,
+            kind: TaskKind::LocalAgent,
             title: "check TEST workspace".to_string(),
             goal: "inspect /Users/xie/code/TEST".to_string(),
-            status: magi_core::TaskStatus::Ready,
+            status: magi_core::TaskStatus::Pending,
             dependency_ids: Vec::new(),
             required_children: Vec::new(),
             policy_snapshot: None,
@@ -304,7 +289,6 @@ mod tests {
                 "exclusive_scope": null,
                 "worker_selector": null,
             })),
-            context_refs: Vec::new(),
             knowledge_refs: Vec::new(),
             workspace_scope: None,
             write_scope: None,
@@ -312,14 +296,12 @@ mod tests {
             output_refs: Vec::new(),
             evidence_refs: Vec::new(),
             retry_count: 0,
-            repair_count: 0,
-            decision_payload: None,
-            variant: magi_core::TaskVariant::default(),
+            runtime_payload: magi_core::TaskRuntimePayload::default(),
             created_at: magi_core::UtcMillis::now(),
             updated_at: magi_core::UtcMillis::now(),
         };
 
-        assert_eq!(resolve_task_role(&task, &reg), Some("integration-dev"));
+        assert_eq!(resolve_task_role(&task, &reg), Some("test-engineer"));
     }
 
     #[test]
@@ -328,7 +310,7 @@ mod tests {
         catalog.register_custom(
             WorkerId::new("gpu-worker-1"),
             "ml-engineer".to_string(),
-            vec![TaskKind::Action, TaskKind::Validation],
+            vec![TaskKind::LocalAgent, TaskKind::LocalAgent],
             Some(4),
             Some("GPU 加速机器学习工程师提示词".to_string()),
         );

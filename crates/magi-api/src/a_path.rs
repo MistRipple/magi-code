@@ -1,16 +1,7 @@
 //! Task System v2 — A 档（单代理 / codex 式一次对话一个 task）同步驱动入口。
 //!
-//! 旧版 A 档的"同步推任务图直至完成"分散在调度层中，被
-//! `drive_dispatch_submission` 与 `routes::sessions::finalize_continue_session`
-//! 两个入口分别调用。M01 把这层逻辑收口到本模块的 `drive_a_path`：
-//!
-//! - **唯一入口**：所有 A 档"用户消息已 dispatch → 同步驱动到 done"路径都从此处进入；
-//! - **背景判定外部完成**：`background_allowed=false` 的判定保留在调用方完成（routes
-//!   层 + task_dispatch 层各自有不同的"否则分支"），本函数不再二次判断；
-//! - **同步窗口固定 32 轮**：与既有行为对齐，避免在 M01 引入语义偏移。
-//!
-//! 后续 slice（M17b）会进一步把 `drive_a_path` 私化到 `magi-conversation-runtime`，
-//! 让 A 档与 v2 Conversation::advance_turn 衔接。
+//! 所有 A 档"用户消息已 dispatch → 同步驱动到 done"路径都从本模块进入；
+//! 中等任务的同步推进判定保留在调用方完成。本函数只负责同步推进。
 
 use crate::{errors::ApiError, state::ApiState};
 use magi_conversation_runtime::task_runner_bridge::RunCycleOutcome;
@@ -37,7 +28,7 @@ pub fn drive_a_path(
     action_task_id: &TaskId,
     failure_title: &'static str,
 ) -> Result<APathDriveResult, ApiError> {
-    // 普通模式使用同步 for 循环，要求 dispatch 同步完成，否则结果来不及被收集。
+    // ExecutionChain 使用同步 for 循环，要求 dispatch 同步完成，否则结果来不及被收集。
     if let Some(dispatcher) = state.session_turn_dispatcher() {
         dispatcher.set_force_sync_dispatch(true);
     }
@@ -59,16 +50,22 @@ pub fn drive_a_path(
             match outcome {
                 RunCycleOutcome::Continue => continue,
                 RunCycleOutcome::AllComplete => break,
-                RunCycleOutcome::Blocked(task_ids) => {
+                RunCycleOutcome::Blocked { task_ids, reason } => {
+                    return Err(ApiError::internal_assembly(
+                        failure_title,
+                        format!("task runner blocked: {:?}: {reason}", task_ids),
+                    ));
+                }
+                RunCycleOutcome::Stalled(task_ids) => {
                     if task_store
                         .get_task(action_task_id)
-                        .is_some_and(|task| task.status == TaskStatus::Blocked)
+                        .is_some_and(|task| task.status == TaskStatus::Failed)
                     {
                         break;
                     }
                     return Err(ApiError::internal_assembly(
                         failure_title,
-                        format!("task runner blocked: {:?}", task_ids),
+                        format!("task runner stalled: {:?}", task_ids),
                     ));
                 }
                 RunCycleOutcome::Error(error) => {
@@ -81,10 +78,7 @@ pub fn drive_a_path(
             .get_task(action_task_id)
             .ok_or_else(|| ApiError::internal_assembly(failure_title, "action task 不存在"))?
             .status;
-        if action_status != TaskStatus::Completed
-            && action_status != TaskStatus::Failed
-            && action_status != TaskStatus::Blocked
-        {
+        if action_status != TaskStatus::Completed && action_status != TaskStatus::Failed {
             return Err(ApiError::internal_assembly(
                 failure_title,
                 format!("同步任务未在窗口内完成: {:?}", action_status),

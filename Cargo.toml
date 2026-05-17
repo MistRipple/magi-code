@@ -33,6 +33,7 @@ members = [
   "crates/magi-checkpoint",
   "crates/magi-human-checkpoint",
   "crates/magi-plan",
+  "crates/magi-mission",
   "crates/magi-snapshot",
 ]
 

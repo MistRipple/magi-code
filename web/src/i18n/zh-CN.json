@@ -370,8 +370,6 @@
   "messageItem.placeholder.processing": "处理中...",
   "messageItem.supplementaryTag": "补充指令",
   "messageItem.copyTitle": "复制内容",
-  "messageItem.guideQueued": "立即引导",
-  "messageItem.guideQueuedTitle": "立即作为当前任务的补充上下文发送",
   "errorDetail.title": "完整错误内容",
   "errorDetail.more": "更多",
   "errorDetail.copy": "复制错误",

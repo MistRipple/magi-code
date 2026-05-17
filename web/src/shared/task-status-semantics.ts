@@ -11,8 +11,6 @@ export type TaskRuntimeStatus =
   | 'skipped'
   | 'cancelled';
 
-export type TaskProjectionStatus = TaskRuntimeStatus | 'blocked' | 'ready';
-
 export type TaskExecutionBlocker = 'dependencies' | 'contracts' | 'approval';
 export type ApprovalStatus = 'pending' | 'approved' | 'rejected';
 
@@ -173,10 +171,6 @@ export function deriveDisplayTaskStatusFromSemanticStatuses(
   statuses: Iterable<TaskSemanticStatus | null | undefined>,
 ): TaskSemanticDisplayStatus | null {
   return mapTaskSemanticStatusToDisplayStatus(deriveDominantTaskSemanticStatus(statuses));
-}
-
-export function mapTaskProjectionStatusToSemanticStatus(status: TaskProjectionStatus): TaskSemanticStatus {
-  return resolveTaskSemanticStatus({ status }) || 'pending';
 }
 
 export function isTaskSemanticRunningStatus(status: TaskSemanticStatus | null | undefined): boolean {

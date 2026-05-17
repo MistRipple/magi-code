@@ -11,7 +11,7 @@ const SESSION_SECTION_PREFIX: &str = "__session__:";
 #[derive(Debug)]
 pub struct SettingsStore {
     sections: RwLock<HashMap<String, Value>>,
-    /// 持久化文件路径，为 None 时仅内存模式（兼容已有测试）
+    /// 持久化文件路径，为 None 时仅内存模式。
     persistence_path: Option<PathBuf>,
 }
 

@@ -294,17 +294,11 @@ fn session_branch_summary(
 
 fn task_status_label(status: &TaskStatus) -> String {
     match status {
-        TaskStatus::Draft => "draft",
-        TaskStatus::Ready => "ready",
+        TaskStatus::Pending => "pending",
         TaskStatus::Running => "running",
-        TaskStatus::AwaitingApproval => "awaiting_approval",
         TaskStatus::Completed => "completed",
         TaskStatus::Failed => "failed",
-        TaskStatus::Cancelled => "cancelled",
-        TaskStatus::Blocked => "blocked",
-        TaskStatus::Verifying => "verifying",
-        TaskStatus::Repairing => "repairing",
-        TaskStatus::Skipped => "skipped",
+        TaskStatus::Killed => "killed",
     }
     .to_string()
 }
@@ -317,14 +311,15 @@ fn branch_stage_is_terminal(stage: &str) -> bool {
 }
 
 fn branch_is_recoverable(branch: &SessionRuntimeBranchSummaryEntry) -> bool {
-    matches!(branch.status.as_str(), "blocked") && !branch_stage_is_terminal(&branch.stage)
+    // 与 `magi_conversation_runtime::execution_chain_recovery::active_execution_branch_is_continue_recoverable`
+    // 保持一致：UI 看到的可恢复语义必须等价于 `/api/session/continue` 实际接受的语义，
+    // 避免出现 UI 提示"无可恢复"但 API 仍能继续的两套实现。
+    // V2 中只有 `Failed` 且 stage 非 finish 的 branch 才是"可继续"。
+    matches!(branch.status.as_str(), "failed") && !branch_stage_is_terminal(&branch.stage)
 }
 
 fn session_root_task_is_terminal(status: Option<&str>) -> bool {
-    matches!(
-        status,
-        Some("completed" | "failed" | "cancelled" | "skipped")
-    )
+    matches!(status, Some("completed" | "failed" | "killed"))
 }
 
 fn clear_session_runtime_live_ids(entry: &mut SessionRuntimeSummaryEntry) {
@@ -597,7 +592,7 @@ fn merge_task_store_projection(
 fn task_status_is_terminal(status: &TaskStatus) -> bool {
     matches!(
         status,
-        TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled | TaskStatus::Skipped
+        TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Killed
     )
 }
 
@@ -678,7 +673,7 @@ mod tests {
         let mission_id = magi_core::MissionId::new("mission-projection-authority");
         let root_task_id = TaskId::new("task-root-projection");
         let running_task_id = TaskId::new("task-running-projection");
-        let ready_task_id = TaskId::new("task-ready-projection");
+        let pending_task_id = TaskId::new("task-pending-projection");
         let completed_task_id = TaskId::new("task-completed-projection");
         let now = UtcMillis::now();
         for (task_id, parent_task_id, status) in [
@@ -689,9 +684,9 @@ mod tests {
                 TaskStatus::Running,
             ),
             (
-                &ready_task_id,
+                &pending_task_id,
                 Some(root_task_id.clone()),
-                TaskStatus::Ready,
+                TaskStatus::Pending,
             ),
             (
                 &completed_task_id,
@@ -705,9 +700,9 @@ mod tests {
                 root_task_id: root_task_id.clone(),
                 parent_task_id,
                 kind: if task_id == &root_task_id {
-                    magi_core::TaskKind::Objective
+                    magi_core::TaskKind::LocalAgent
                 } else {
-                    magi_core::TaskKind::Action
+                    magi_core::TaskKind::LocalAgent
                 },
                 title: task_id.to_string(),
                 goal: task_id.to_string(),
@@ -716,7 +711,6 @@ mod tests {
                 required_children: Vec::new(),
                 policy_snapshot: None,
                 executor_binding: None,
-                context_refs: Vec::new(),
                 knowledge_refs: Vec::new(),
                 workspace_scope: None,
                 write_scope: None,
@@ -724,9 +718,7 @@ mod tests {
                 output_refs: Vec::new(),
                 evidence_refs: Vec::new(),
                 retry_count: 0,
-                repair_count: 0,
-                decision_payload: None,
-                variant: magi_core::TaskVariant::default(),
+                runtime_payload: magi_core::TaskRuntimePayload::default(),
                 created_at: now,
                 updated_at: now,
             });
@@ -795,7 +787,7 @@ mod tests {
             .expect("TaskStore projection should create execution group entry");
         assert_eq!(group.current_status.as_deref(), Some("running"));
         assert!(group.active_task_ids.contains(&root_task_id.to_string()));
-        assert!(group.active_task_ids.contains(&ready_task_id.to_string()));
+        assert!(group.active_task_ids.contains(&pending_task_id.to_string()));
         assert!(group.active_task_ids.contains(&running_task_id.to_string()));
         assert!(
             !group
@@ -810,8 +802,11 @@ mod tests {
             .map(|entry| (entry.task_id.as_str(), entry.current_status.as_deref()))
             .collect::<std::collections::HashMap<_, _>>();
         assert_eq!(
-            task_statuses.get(ready_task_id.as_str()).copied().flatten(),
-            Some("ready")
+            task_statuses
+                .get(pending_task_id.as_str())
+                .copied()
+                .flatten(),
+            Some("pending")
         );
         assert_eq!(
             task_statuses
@@ -823,7 +818,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_read_model_only_counts_blocked_branches_as_recoverable() {
+    fn runtime_read_model_only_counts_failed_non_terminal_branches_as_recoverable() {
         let task_store = TaskStore::new();
         let mission_id = magi_core::MissionId::new("mission-recoverable-1");
         let root_task_id = magi_core::TaskId::new("task-root-recoverable-1");
@@ -833,15 +828,14 @@ mod tests {
             mission_id: mission_id.clone(),
             root_task_id: root_task_id.clone(),
             parent_task_id: None,
-            kind: magi_core::TaskKind::Objective,
+            kind: magi_core::TaskKind::LocalAgent,
             title: "root".to_string(),
             goal: "root".to_string(),
-            status: TaskStatus::Blocked,
+            status: TaskStatus::Failed,
             dependency_ids: Vec::new(),
             required_children: Vec::new(),
             policy_snapshot: None,
             executor_binding: None,
-            context_refs: Vec::new(),
             knowledge_refs: Vec::new(),
             workspace_scope: None,
             write_scope: None,
@@ -849,25 +843,23 @@ mod tests {
             output_refs: Vec::new(),
             evidence_refs: Vec::new(),
             retry_count: 0,
-            repair_count: 0,
-            decision_payload: None,
-            variant: magi_core::TaskVariant::default(),
+            runtime_payload: magi_core::TaskRuntimePayload::default(),
             created_at: UtcMillis::now(),
             updated_at: UtcMillis::now(),
         });
         for (task_id, status) in [
-            ("task-branch-blocked", TaskStatus::Blocked),
-            ("task-branch-ready", TaskStatus::Ready),
+            ("task-branch-failed", TaskStatus::Failed),
+            ("task-branch-pending", TaskStatus::Pending),
             ("task-branch-running", TaskStatus::Running),
             ("task-branch-completed", TaskStatus::Completed),
-            ("task-branch-finished-blocked", TaskStatus::Blocked),
+            ("task-branch-finished-failed", TaskStatus::Failed),
         ] {
             task_store.insert_task(magi_core::Task {
                 task_id: magi_core::TaskId::new(task_id),
                 mission_id: mission_id.clone(),
                 root_task_id: root_task_id.clone(),
                 parent_task_id: Some(root_task_id.clone()),
-                kind: magi_core::TaskKind::Action,
+                kind: magi_core::TaskKind::LocalAgent,
                 title: task_id.to_string(),
                 goal: task_id.to_string(),
                 status,
@@ -875,7 +867,6 @@ mod tests {
                 required_children: Vec::new(),
                 policy_snapshot: None,
                 executor_binding: None,
-                context_refs: Vec::new(),
                 knowledge_refs: Vec::new(),
                 workspace_scope: None,
                 write_scope: None,
@@ -883,9 +874,7 @@ mod tests {
                 output_refs: Vec::new(),
                 evidence_refs: Vec::new(),
                 retry_count: 0,
-                repair_count: 0,
-                decision_payload: None,
-                variant: magi_core::TaskVariant::default(),
+                runtime_payload: magi_core::TaskRuntimePayload::default(),
                 created_at: UtcMillis::now(),
                 updated_at: UtcMillis::now(),
             });
@@ -914,17 +903,17 @@ mod tests {
                     execution_chain_ref: "chain-recoverable-1".to_string(),
                     workspace_id: None,
                     active_branch_task_ids: vec![
-                        magi_core::TaskId::new("task-branch-blocked"),
-                        magi_core::TaskId::new("task-branch-ready"),
+                        magi_core::TaskId::new("task-branch-failed"),
+                        magi_core::TaskId::new("task-branch-pending"),
                         magi_core::TaskId::new("task-branch-running"),
                         magi_core::TaskId::new("task-branch-completed"),
-                        magi_core::TaskId::new("task-branch-finished-blocked"),
+                        magi_core::TaskId::new("task-branch-finished-failed"),
                     ],
                     active_worker_bindings: vec![magi_core::WorkerId::new("worker-recoverable-1")],
                     recovery_ref: None,
                     branches: vec![
                         magi_session_store::ActiveExecutionBranch {
-                            task_id: magi_core::TaskId::new("task-branch-blocked"),
+                            task_id: magi_core::TaskId::new("task-branch-failed"),
                             worker_id: magi_core::WorkerId::new("worker-recoverable-1"),
                             stage: "execute".to_string(),
                             lease_id: None,
@@ -940,7 +929,7 @@ mod tests {
                             is_primary: true,
                         },
                         magi_session_store::ActiveExecutionBranch {
-                            task_id: magi_core::TaskId::new("task-branch-ready"),
+                            task_id: magi_core::TaskId::new("task-branch-pending"),
                             worker_id: magi_core::WorkerId::new("worker-recoverable-1"),
                             stage: "execute".to_string(),
                             lease_id: None,
@@ -988,7 +977,7 @@ mod tests {
                             is_primary: false,
                         },
                         magi_session_store::ActiveExecutionBranch {
-                            task_id: magi_core::TaskId::new("task-branch-finished-blocked"),
+                            task_id: magi_core::TaskId::new("task-branch-finished-failed"),
                             worker_id: magi_core::WorkerId::new("worker-recoverable-1"),
                             stage: "finish".to_string(),
                             lease_id: None,
@@ -1279,7 +1268,7 @@ mod tests {
             mission_id: mission_id.clone(),
             root_task_id: root_task_id.clone(),
             parent_task_id: None,
-            kind: magi_core::TaskKind::Objective,
+            kind: magi_core::TaskKind::LocalAgent,
             title: "current root".to_string(),
             goal: "current root".to_string(),
             status: TaskStatus::Completed,
@@ -1287,7 +1276,6 @@ mod tests {
             required_children: Vec::new(),
             policy_snapshot: None,
             executor_binding: None,
-            context_refs: Vec::new(),
             knowledge_refs: Vec::new(),
             workspace_scope: None,
             write_scope: None,
@@ -1295,9 +1283,7 @@ mod tests {
             output_refs: Vec::new(),
             evidence_refs: Vec::new(),
             retry_count: 0,
-            repair_count: 0,
-            decision_payload: None,
-            variant: magi_core::TaskVariant::default(),
+            runtime_payload: magi_core::TaskRuntimePayload::default(),
             created_at: root_created_at,
             updated_at: UtcMillis::now(),
         });
@@ -1306,7 +1292,7 @@ mod tests {
             mission_id: mission_id.clone(),
             root_task_id: root_task_id.clone(),
             parent_task_id: Some(root_task_id.clone()),
-            kind: magi_core::TaskKind::Action,
+            kind: magi_core::TaskKind::LocalAgent,
             title: "current branch".to_string(),
             goal: "current branch".to_string(),
             status: TaskStatus::Completed,
@@ -1314,7 +1300,6 @@ mod tests {
             required_children: Vec::new(),
             policy_snapshot: None,
             executor_binding: None,
-            context_refs: Vec::new(),
             knowledge_refs: Vec::new(),
             workspace_scope: None,
             write_scope: None,
@@ -1322,9 +1307,7 @@ mod tests {
             output_refs: Vec::new(),
             evidence_refs: Vec::new(),
             retry_count: 0,
-            repair_count: 0,
-            decision_payload: None,
-            variant: magi_core::TaskVariant::default(),
+            runtime_payload: magi_core::TaskRuntimePayload::default(),
             created_at: branch_created_at,
             updated_at: UtcMillis::now(),
         });
@@ -1338,7 +1321,7 @@ mod tests {
             current_status: Some("failed".to_string()),
             mission_id: Some("mission-stale".to_string()),
             root_task_id: Some("task-root-stale".to_string()),
-            root_task_status: Some("blocked".to_string()),
+            root_task_status: Some("failed".to_string()),
             execution_chain_ref: Some("chain-stale".to_string()),
             recovery_ref: Some("recovery-stale".to_string()),
             ..SessionRuntimeSummaryEntry::default()
@@ -1436,7 +1419,7 @@ mod tests {
             mission_id: mission_id.clone(),
             root_task_id: root_task_id.clone(),
             parent_task_id: None,
-            kind: magi_core::TaskKind::Objective,
+            kind: magi_core::TaskKind::LocalAgent,
             title: "completed root".to_string(),
             goal: "completed root".to_string(),
             status: TaskStatus::Completed,
@@ -1444,7 +1427,6 @@ mod tests {
             required_children: Vec::new(),
             policy_snapshot: None,
             executor_binding: None,
-            context_refs: Vec::new(),
             knowledge_refs: Vec::new(),
             workspace_scope: None,
             write_scope: None,
@@ -1452,9 +1434,7 @@ mod tests {
             output_refs: Vec::new(),
             evidence_refs: Vec::new(),
             retry_count: 0,
-            repair_count: 0,
-            decision_payload: None,
-            variant: magi_core::TaskVariant::default(),
+            runtime_payload: magi_core::TaskRuntimePayload::default(),
             created_at: accepted_at,
             updated_at: accepted_at,
         });
@@ -1463,7 +1443,7 @@ mod tests {
             mission_id: mission_id.clone(),
             root_task_id: root_task_id.clone(),
             parent_task_id: Some(root_task_id.clone()),
-            kind: magi_core::TaskKind::Action,
+            kind: magi_core::TaskKind::LocalAgent,
             title: "completed branch".to_string(),
             goal: "completed branch".to_string(),
             status: TaskStatus::Completed,
@@ -1477,7 +1457,6 @@ mod tests {
                 "exclusive_scope": null,
                 "worker_selector": null,
             })),
-            context_refs: Vec::new(),
             knowledge_refs: Vec::new(),
             workspace_scope: None,
             write_scope: None,
@@ -1485,9 +1464,7 @@ mod tests {
             output_refs: Vec::new(),
             evidence_refs: Vec::new(),
             retry_count: 0,
-            repair_count: 0,
-            decision_payload: None,
-            variant: magi_core::TaskVariant::default(),
+            runtime_payload: magi_core::TaskRuntimePayload::default(),
             created_at: accepted_at,
             updated_at: accepted_at,
         });

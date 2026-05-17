@@ -3,21 +3,18 @@ use magi_core::{EventId, UtcMillis};
 use serde_json::json;
 
 // ---------------------------------------------------------------------------
-// Task graph lifecycle
+// Task submission lifecycle
 // ---------------------------------------------------------------------------
-pub const TASK_GRAPH_CREATED: &str = "task.graph.created";
-pub const TASK_GRAPH_REPLANNED: &str = "task.graph.replanned";
+pub const TASK_SUBMISSION_CREATED: &str = "task.submission.created";
 
 // ---------------------------------------------------------------------------
 // Task status transitions
 // ---------------------------------------------------------------------------
 pub const TASK_STATUS_CHANGED: &str = "task.status.changed";
-pub const TASK_READY: &str = "task.ready";
-pub const TASK_STARTED: &str = "task.started";
+pub const TASK_RUNNING: &str = "task.running";
 pub const TASK_COMPLETED: &str = "task.completed";
 pub const TASK_FAILED: &str = "task.failed";
-pub const TASK_BLOCKED: &str = "task.blocked";
-pub const TASK_CANCELLED: &str = "task.cancelled";
+pub const TASK_KILLED: &str = "task.killed";
 
 // ---------------------------------------------------------------------------
 // Lease lifecycle
@@ -26,12 +23,6 @@ pub const LEASE_GRANTED: &str = "task.lease.granted";
 pub const LEASE_COMPLETED: &str = "task.lease.completed";
 pub const LEASE_EXPIRED: &str = "task.lease.expired";
 pub const LEASE_REVOKED: &str = "task.lease.revoked";
-
-// ---------------------------------------------------------------------------
-// Decision lifecycle
-// ---------------------------------------------------------------------------
-pub const DECISION_CREATED: &str = "task.decision.created";
-pub const DECISION_RESOLVED: &str = "task.decision.resolved";
 
 // ---------------------------------------------------------------------------
 // Checkpoint
@@ -64,38 +55,22 @@ pub fn task_status_changed_event(
     )
 }
 
-/// Create a domain event for a newly created task graph.
-pub fn task_graph_created_event(
+/// Create a domain event for a newly created task submission.
+pub fn task_submission_created_event(
     mission_id: &str,
     root_task_id: &str,
     task_count: usize,
 ) -> EventEnvelope {
     EventEnvelope::domain(
-        EventId::new(format!("event-task-graph-created-{}", UtcMillis::now().0)),
-        TASK_GRAPH_CREATED,
+        EventId::new(format!(
+            "event-task-submission-created-{}",
+            UtcMillis::now().0
+        )),
+        TASK_SUBMISSION_CREATED,
         json!({
             "mission_id": mission_id,
             "root_task_id": root_task_id,
             "task_count": task_count,
-        }),
-    )
-}
-
-/// Create a domain event for a task graph replan.
-pub fn task_graph_replanned_event(
-    mission_id: &str,
-    root_task_id: &str,
-    task_count: usize,
-    reason: &str,
-) -> EventEnvelope {
-    EventEnvelope::domain(
-        EventId::new(format!("event-task-graph-replanned-{}", UtcMillis::now().0)),
-        TASK_GRAPH_REPLANNED,
-        json!({
-            "mission_id": mission_id,
-            "root_task_id": root_task_id,
-            "task_count": task_count,
-            "reason": reason,
         }),
     )
 }
@@ -164,48 +139,6 @@ pub fn lease_revoked_event(
     )
 }
 
-/// Create a domain event when a decision is created.
-pub fn decision_created_event(
-    decision_id: &str,
-    task_id: &str,
-    decision_type: &str,
-    description: &str,
-) -> EventEnvelope {
-    EventEnvelope::domain(
-        EventId::new(format!(
-            "event-task-decision-created-{}",
-            UtcMillis::now().0
-        )),
-        DECISION_CREATED,
-        json!({
-            "decision_id": decision_id,
-            "task_id": task_id,
-            "decision_type": decision_type,
-            "description": description,
-        }),
-    )
-}
-
-/// Create a domain event when a decision is resolved.
-pub fn decision_resolved_event(
-    decision_id: &str,
-    task_id: &str,
-    resolution: &str,
-) -> EventEnvelope {
-    EventEnvelope::domain(
-        EventId::new(format!(
-            "event-task-decision-resolved-{}",
-            UtcMillis::now().0
-        )),
-        DECISION_RESOLVED,
-        json!({
-            "decision_id": decision_id,
-            "task_id": task_id,
-            "resolution": resolution,
-        }),
-    )
-}
-
 /// Create a domain event when a checkpoint is saved.
 pub fn checkpoint_saved_event(
     checkpoint_id: &str,
@@ -254,7 +187,7 @@ mod tests {
     #[test]
     fn task_status_changed_event_creates_valid_envelope() {
         let event =
-            task_status_changed_event("task-001", "mission-001", "ready", "started", "execution");
+            task_status_changed_event("task-001", "mission-001", "pending", "running", "execution");
         assert_eq!(event.event_type, TASK_STATUS_CHANGED);
         assert_eq!(event.category, EventCategory::Domain);
         assert!(
@@ -265,42 +198,25 @@ mod tests {
         );
         assert_eq!(event.payload["task_id"], "task-001");
         assert_eq!(event.payload["mission_id"], "mission-001");
-        assert_eq!(event.payload["old_status"], "ready");
-        assert_eq!(event.payload["new_status"], "started");
+        assert_eq!(event.payload["old_status"], "pending");
+        assert_eq!(event.payload["new_status"], "running");
         assert_eq!(event.payload["kind"], "execution");
     }
 
     #[test]
-    fn task_graph_created_event_creates_valid_envelope() {
-        let event = task_graph_created_event("mission-001", "root-001", 5);
-        assert_eq!(event.event_type, TASK_GRAPH_CREATED);
+    fn task_submission_created_event_creates_valid_envelope() {
+        let event = task_submission_created_event("mission-001", "root-001", 5);
+        assert_eq!(event.event_type, TASK_SUBMISSION_CREATED);
         assert_eq!(event.category, EventCategory::Domain);
         assert!(
             event
                 .event_id
                 .as_str()
-                .starts_with("event-task-graph-created-")
+                .starts_with("event-task-submission-created-")
         );
         assert_eq!(event.payload["mission_id"], "mission-001");
         assert_eq!(event.payload["root_task_id"], "root-001");
         assert_eq!(event.payload["task_count"], 5);
-    }
-
-    #[test]
-    fn task_graph_replanned_event_creates_valid_envelope() {
-        let event = task_graph_replanned_event("mission-002", "root-002", 8, "scope changed");
-        assert_eq!(event.event_type, TASK_GRAPH_REPLANNED);
-        assert_eq!(event.category, EventCategory::Domain);
-        assert!(
-            event
-                .event_id
-                .as_str()
-                .starts_with("event-task-graph-replanned-")
-        );
-        assert_eq!(event.payload["mission_id"], "mission-002");
-        assert_eq!(event.payload["root_task_id"], "root-002");
-        assert_eq!(event.payload["task_count"], 8);
-        assert_eq!(event.payload["reason"], "scope changed");
     }
 
     #[test]
@@ -352,28 +268,6 @@ mod tests {
     }
 
     #[test]
-    fn decision_created_event_creates_valid_envelope() {
-        let event =
-            decision_created_event("decision-001", "task-001", "approval", "needs human review");
-        assert_eq!(event.event_type, DECISION_CREATED);
-        assert_eq!(event.category, EventCategory::Domain);
-        assert_eq!(event.payload["decision_id"], "decision-001");
-        assert_eq!(event.payload["task_id"], "task-001");
-        assert_eq!(event.payload["decision_type"], "approval");
-        assert_eq!(event.payload["description"], "needs human review");
-    }
-
-    #[test]
-    fn decision_resolved_event_creates_valid_envelope() {
-        let event = decision_resolved_event("decision-001", "task-001", "approved");
-        assert_eq!(event.event_type, DECISION_RESOLVED);
-        assert_eq!(event.category, EventCategory::Domain);
-        assert_eq!(event.payload["decision_id"], "decision-001");
-        assert_eq!(event.payload["task_id"], "task-001");
-        assert_eq!(event.payload["resolution"], "approved");
-    }
-
-    #[test]
     fn checkpoint_saved_event_creates_valid_envelope() {
         let event = checkpoint_saved_event("cp-001", "task-001", "mission-001");
         assert_eq!(event.event_type, CHECKPOINT_SAVED);
@@ -399,10 +293,9 @@ mod tests {
         let _receiver = bus.subscribe();
 
         let events = vec![
-            task_status_changed_event("task-001", "mission-001", "ready", "started", "execution"),
-            task_graph_created_event("mission-001", "root-001", 3),
+            task_status_changed_event("task-001", "mission-001", "pending", "running", "execution"),
+            task_submission_created_event("mission-001", "root-001", 3),
             lease_granted_event("lease-001", "task-001", "worker-001", "executor"),
-            decision_created_event("decision-001", "task-001", "approval", "review needed"),
             checkpoint_saved_event("cp-001", "task-001", "mission-001"),
         ];
 
@@ -416,30 +309,27 @@ mod tests {
         let snapshot = bus.snapshot();
         assert_eq!(snapshot.recent_events.len(), events.len());
         assert_eq!(snapshot.recent_events[0].event_type, TASK_STATUS_CHANGED);
-        assert_eq!(snapshot.recent_events[1].event_type, TASK_GRAPH_CREATED);
+        assert_eq!(
+            snapshot.recent_events[1].event_type,
+            TASK_SUBMISSION_CREATED
+        );
         assert_eq!(snapshot.recent_events[2].event_type, LEASE_GRANTED);
-        assert_eq!(snapshot.recent_events[3].event_type, DECISION_CREATED);
-        assert_eq!(snapshot.recent_events[4].event_type, CHECKPOINT_SAVED);
+        assert_eq!(snapshot.recent_events[3].event_type, CHECKPOINT_SAVED);
     }
 
     #[test]
     fn all_event_type_constants_follow_naming_convention() {
         let all_types = [
-            TASK_GRAPH_CREATED,
-            TASK_GRAPH_REPLANNED,
+            TASK_SUBMISSION_CREATED,
             TASK_STATUS_CHANGED,
-            TASK_READY,
-            TASK_STARTED,
+            TASK_RUNNING,
             TASK_COMPLETED,
             TASK_FAILED,
-            TASK_BLOCKED,
-            TASK_CANCELLED,
+            TASK_KILLED,
             LEASE_GRANTED,
             LEASE_COMPLETED,
             LEASE_EXPIRED,
             LEASE_REVOKED,
-            DECISION_CREATED,
-            DECISION_RESOLVED,
             CHECKPOINT_SAVED,
             CHECKPOINT_RESTORED,
         ];

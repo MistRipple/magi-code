@@ -182,23 +182,23 @@
 
 - `D-3.1`：全量回归通过 — cargo test 全通过、svelte-check 0 errors、vite build 成功
 - `B-2.1`：`support/frontend-contract` 现已新增 `--check-api-reads / MAGI_CHECK_API_READS` 与 `npm run smoke:api-reads`，覆盖 `settings/bootstrap / workspaces / workspace-sessions / bridges-services / bridges-preflight` 五条前端常用读取路由
-- `A-2.3`：`shadow_execution.rs` 的 `run_shadow_session_action` 现已在 Mission/Assignment/Todo 创建后同步创建 Objective + Action Task Graph 节点，并在 dispatch 完成后根据结果更新 Task 状态（Completed/Failed），发布 `task.graph.created` 与 `task.status.changed` 事件
-- `C-3.10`：`support/frontend-contract` 现已新增 Task Graph 相关 DTO（TaskDto/TaskProjectionDto/WorkPackageSummaryDto 等 12 个接口）与 `RustDaemonClient` 的 6 个 task graph 方法（getTaskProjection/getTask/getTasksByMission/createTask/updateTaskStatus/getTaskLease）
+- `A-2.3`：`shadow_execution.rs` 的 `run_shadow_session_action` 现已在 Mission/Assignment/Todo 创建后同步创建 Objective + Action 任务投影节点，并在 dispatch 完成后根据结果更新 Task 状态（Completed/Failed），发布任务状态事件
+- `C-3.10`：`support/frontend-contract` 现已新增 Task Projection 相关 DTO 与 `RustDaemonClient` 的任务投影读取方法
 - `B-3.3`：`magi-bridge-client` 现已新增 `HttpModelBridgeClient`，可绕过 JSON-RPC subprocess loopback 直接对 OpenAI-compatible 端点发 HTTP 请求；`magi-daemon` 已在 `MAGI_OPENAI_COMPAT_BASE_URL` 存在时自动启用直连模式
 - `D-3.1`：全量回归 420 tests，0 failures；svelte-check 0 errors；frontend-contract check+build 通过
 - `C-4.1`：契约层收敛 — `support/frontend-contract` 的 DTO 类型（~80 接口）与 `RustDaemonClient`（~70 方法）已合并进 `web/src/shared/rust-backend-types.ts` 与 `web/src/shared/rust-daemon-client.ts`，成为唯一 TS 类型真相源；CI smoke 脚本独立为 `ci-smoke/`（根目录）；`support/frontend-contract` 目录已删除
-- `A-2.4`：`shadow_execution.rs` 的 `run_shadow_recovery_resume` 现已在 pipeline 执行后同步创建 Objective + Action Task Graph 节点（`task-obj-recovery-{recovery_id}` / `task-act-recovery-{recovery_id}`），并根据执行结果更新 Task 状态，发布事件
+- `A-2.4`：`shadow_execution.rs` 的 `run_shadow_recovery_resume` 现已在 pipeline 执行后同步创建 Objective + Action 任务投影节点（`task-obj-recovery-{recovery_id}` / `task-act-recovery-{recovery_id}`），并根据执行结果更新 Task 状态，发布事件
 - `A-3.2`：`magi-orchestrator` TaskStore 现已补齐 Worker lease 协议：`grant_lease / complete_lease / revoke_lease / heartbeat_lease / collect_expired_leases / get_leases_by_worker` 六个方法 + 7 个测试
 - `B-3.4`：`magi-daemon` cutover-smoke 现已在 `HttpModelBridgeClient` 启用时补充直连 provider 诊断项，transport 失败稳定归类为 `model_provider_transport_failed`
 - `D-3.2`：全量回归 428 tests，0 failures；svelte-check 0 errors；ci-smoke check+build 通过
 - `A-3.3`：`magi-orchestrator` 现已新增 `task_runner.rs`，实现 Runner 主循环：expired lease 回收 → parent 状态传播 → runnable leaves 计算 → worker 匹配 → grant lease → dispatch；10 个新测试，全部 56 个 orchestrator 测试通过
-- `C-5.1`：`web/src/stores/task-graph-store.svelte.ts` 新增 Task Graph Store，通过 `RustDaemonClient.getTaskProjection` 拉取 Task Projection 数据，支持 auto-refresh 与 lease 追踪
+- `C-5.1`：`web/src/stores/task-projection-store.svelte.ts` 新增 Task Projection Store，通过 `RustDaemonClient.getTaskProjection` 拉取 Task Projection 数据，支持 auto-refresh 与 lease 追踪
 - `C-5.2`：`TasksPanel.svelte` 现已集成 Task Projection 视图：任务树渲染、task kind/status 视觉指示、running lease 倒计时、workpackage 摘要卡片，同时保留旧 Todo 视图作为 fallback
 - `B-3.5`：`magi-bridge-client` 现已新增 `StdioMcpBridgeClient`（`mcp_client.rs`），支持通过 stdio 连接真实 MCP server，完成 MCP 生命周期（initialize → tools/list → tools/call）；`magi-daemon` 通过 `MAGI_MCP_SERVER_COMMAND` 环境变量启用，否则回退 loopback；7 个新测试，82 个 bridge client 测试全部通过
 - `C-4.2`：`agent-api.ts` 类型迁移 — 3 个 notification 相关类型已替换为 `rust-backend-types.ts` 规范类型（`SessionNotificationItemDto / SessionNotificationSnapshotDto / SessionNotificationsResponseDto`），其余 ~20 个类型因字段差异保留本地定义并附文档说明
 - `D-3.3`：全量回归 449 tests，0 failures；svelte-check 0 errors 0 warnings；vite build 通过
 - `C-5.3`：`RustDaemonClient` 现已接入统一传输层 `getTransport()`，支持 VSCode HostProxy 模式；所有 `fetch()` 调用与 `EventSource` 已替换为 `AgentTransport` 接口
-- `C-5.4`：`task-graph-store` 现已通过 `onBridgeMessage` 订阅集中式 SSE 事件流，task domain 事件（`task.graph.created / task.status.changed`）触发 300ms 防抖刷新，轮询仍作为兜底
+- `C-5.4`：`task-projection-store` 现已通过 `onBridgeMessage` 订阅集中式 SSE 事件流，task domain 状态事件触发 300ms 防抖刷新，轮询仍作为兜底
 - `A-3.4`：`TaskRunner` 现已补齐 `TaskDispatcher` trait + `TaskResultReceiver` trait + `TaskOutcome` 枚举，支持真实 Worker 执行回调；`run_cycle` 新增 Step 0（apply results）与 Step 5 dispatch 回调；`NoOpDispatcher / NoOpResultReceiver` 保持向后兼容；4 个新测试（dispatch 回调、Completed/Failed 结果应用、dispatch 错误传播）
 - `A-3.5`：`magi-api` 新增 Runner 调度 API：`POST /tasks/runner/start`、`POST /tasks/runner/stop`、`GET /tasks/runner/status/{root_task_id}`、`POST /tasks/runner/cycle`；`RunnerManager` 管理活跃 Runner 实例；daemon 已注入 `TaskStore + RunnerManager`；前端 `rust-backend-types.ts` 补 7 个 DTO，`RustDaemonClient` 补 4 个 client 方法
 - `D-3.4`：全量回归 453 tests，0 failures；svelte-check 0 errors 0 warnings；vite build 通过
@@ -206,7 +206,7 @@
 - `A-3.7`：TaskStore 新增 `remove_task` 与 `clear_all` 方法；新增 `StatusChangeCallback` + `with_status_change_callback` 构造器，状态变更时自动发布 `task.status.changed` 事件
 - `A-3.8`：`EventBasedTaskDispatcher` 实现 `TaskDispatcher` trait，通过事件总线发布 `task.dispatched` 事件；`RunnerManager` 升级为 `with_event_bus` 构造器，start/run_single_cycle 使用真实 dispatcher；daemon runtime 完成注入
 - `C-5.5`：`TasksPanel` 全切 Projection 视图为默认、旧 Todo 视图降为 fallback；新增 Runner 控制栏（Start/Stop/Status/CycleCount）；新增 Decision Task 审批按钮（Approve/Reject）；补齐全量 CSS 样式
-- `C-5.6`：端到端数据流完成：`executeTask` 返回 rootTaskId 并自动初始化 task-graph-store 追踪；bootstrap 时自动重连活跃任务追踪；SSE `task.status.changed` 事件推送 toast 通知（Completed/Failed）；`DataMessageType` 新增 `taskStatusChanged`
+- `C-5.6`：端到端数据流完成：`executeTask` 返回 rootTaskId 并自动初始化 task-projection-store 追踪；bootstrap 时自动重连活跃任务追踪；SSE `task.status.changed` 事件推送 toast 通知（Completed/Failed）；`DataMessageType` 新增 `taskStatusChanged`
 - `D-3.5`：全量回归 453 tests，0 failures；svelte-check 0 errors 0 warnings；vite build 通过
 
 ### E. Todo 模型完全清除（Phase 6 完结）

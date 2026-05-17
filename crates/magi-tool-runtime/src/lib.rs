@@ -70,13 +70,13 @@ pub enum BuiltinToolName {
     /// `~/.magi/projects/{slug}/memory/`，跨 conversation 自动加载到 system prompt。
     /// 由 orchestration 层拦截，不进入 ToolRegistry。
     MemoryWrite,
-    // ── Mission 宪章（Task System v2 Tier 4 / L11）──
+    // ── Mission 宪章（Task System v2 Tier 4 / L15）──
     /// 增量写入当前 mission 的 charter（title / goal / success_criteria /
     /// constraints / stakeholders）。物理存储在
     /// `~/.magi/projects/{slug}/missions/{mission_id}/charter.md`。
     /// 由 orchestration 层拦截，不进入 ToolRegistry。
     MissionCharterWrite,
-    // ── Mission 执行计划（Task System v2 Tier 4 / L12）──
+    // ── Mission 执行计划（Task System v2 Tier 4 / L16）──
     /// 整体替换当前 mission 的 plan.steps（id / content / status / depends_on / notes）。
     /// 物理存储在 `~/.magi/projects/{slug}/missions/{mission_id}/plan.md`，
     /// 每次 Turn 起始把当前 plan 自动注入 orchestrator system prompt。
@@ -851,11 +851,12 @@ impl BuiltinToolName {
             }),
             Self::Checkpoint => serde_json::json!({
                 "type": "object",
+                "description": "Append a Mission checkpoint record. Recovery kinds (process_restart / context_compaction / phase_transition) MUST carry a non-empty workspace_commit and every entry in open_conversations MUST point at recovery_ref or execution_chain_ref — incomplete recovery sets are rejected.",
                 "properties": {
                     "kind": {
                         "type": "string",
                         "enum": ["process_restart", "context_compaction", "phase_transition", "manual"],
-                        "description": "Checkpoint category. process_restart = daemon restart boundary; context_compaction = conversation just got summarized; phase_transition = a Plan phase boundary; manual = operator-triggered."
+                        "description": "Checkpoint category. process_restart = daemon restart boundary; context_compaction = conversation just got summarized; phase_transition = a Plan phase boundary; manual = operator-triggered (only manual may skip the recovery set)."
                     },
                     "label": {
                         "type": "string",
@@ -871,19 +872,36 @@ impl BuiltinToolName {
                     },
                     "workspace_commit": {
                         "type": "string",
-                        "description": "Optional workspace VCS commit/ref captured at this checkpoint."
+                        "description": "Workspace VCS commit/ref captured at this checkpoint. REQUIRED for recovery kinds; only optional when kind=manual."
                     },
                     "open_conversations": {
                         "type": "array",
-                        "description": "Optional list of conversation pointers (id + last turn cursor + pending mailbox size) to help future recovery resume mid-flight conversations.",
+                        "description": "List of session recovery pointers. Each entry MUST carry session_id plus either recovery_ref or execution_chain_ref so the runtime can rebuild the active execution chain / mailbox after restart.",
                         "items": {
                             "type": "object",
                             "properties": {
-                                "conversation_id": { "type": "string" },
-                                "turn_cursor": { "type": "integer" },
-                                "pending_mailbox": { "type": "integer" }
+                                "session_id": {
+                                    "type": "string",
+                                    "description": "Session identifier whose execution chain needs to be recoverable."
+                                },
+                                "recovery_ref": {
+                                    "type": "string",
+                                    "description": "Pointer into the session-store recovery sidecar (Conversation/Mailbox snapshot). At least one of recovery_ref or execution_chain_ref must be present."
+                                },
+                                "execution_chain_ref": {
+                                    "type": "string",
+                                    "description": "Pointer into the active ExecutionChain log so child results can be re-routed to the parent mailbox after recovery."
+                                },
+                                "turn_cursor": {
+                                    "type": "integer",
+                                    "description": "Optional last applied turn cursor — used to detect drift between checkpoint and recovery sidecar."
+                                },
+                                "pending_mailbox": {
+                                    "type": "integer",
+                                    "description": "Optional count of mailbox items still pending — helps the operator decide whether resume is safe."
+                                }
                             },
-                            "required": ["conversation_id"]
+                            "required": ["session_id"]
                         }
                     },
                     "notes": {

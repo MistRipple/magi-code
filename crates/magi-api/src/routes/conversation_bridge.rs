@@ -6,8 +6,8 @@
 //! S1：4 个 user-input 入口经 `ingest_user_input_to_conversation` 推 Mailbox + drain。
 //! S2：执行路径外层经 `begin_session_turn` / `finalize_session_turn` 维护 Turn 生命周期。
 //!
-//! Turn 生命周期当前仍是"软不变式"——深度任务 worker 派发仍可能并发触发子路径，
-//! 出现 `TurnAlreadyActive` 时降级为警告而非中断，避免误伤现有并发路径。
+//! Turn 生命周期是 session 级 Conversation 的硬不变式：同一 Conversation 不允许
+//! 并发 Turn。task/worker 执行使用 task 级 Conversation，不再占用 session 级槽位。
 
 use magi_conversation_runtime::{BeginTurnError, TurnAdvanceError, TurnState, UserSignal};
 use magi_core::{SessionId, UtcMillis};
@@ -40,22 +40,18 @@ pub(super) fn ingest_user_input_to_conversation(
         .expect("user signal just ingested but drain returned empty")
 }
 
-/// 在外层执行入口处尝试开启 Turn。若发现已有未结束 Turn（worker 并发等场景），
-/// 当前以 warning 记录但不阻断——S6 引入子 Conversation 后回硬为强制错误。
-pub(super) fn begin_session_turn(state: &ApiState, session_id: &SessionId) {
+/// 在外层执行入口处开启 Turn。若发现已有未结束 Turn，调用方必须停止本次执行。
+pub(super) fn begin_session_turn(
+    state: &ApiState,
+    session_id: &SessionId,
+) -> Result<(), BeginTurnError> {
     let conv = state.conversation_registry.conversation_for(session_id);
     let mut guard = conv.lock().expect("conversation turn lock poisoned");
-    if let Err(BeginTurnError::TurnAlreadyActive(active)) = guard.begin_turn() {
-        tracing::warn!(
-            %session_id,
-            ?active,
-            "begin_session_turn observed concurrent active turn (will be hardened in S6)"
-        );
-    }
+    guard.begin_turn()
 }
 
 /// 把 Turn 推进到给定终态并回收槽位。当前实现接受"未开始即 finalize"的边界
-/// 情况（warning），同样是为兼容尚未完整接入的 worker 派发路径。
+/// 情况并记录 warning；新写入路径应先成功 begin 再 finalize。
 pub(super) fn finalize_session_turn(state: &ApiState, session_id: &SessionId, success: bool) {
     let conv = state.conversation_registry.conversation_for(session_id);
     let mut guard = conv.lock().expect("conversation turn lock poisoned");
@@ -81,7 +77,7 @@ pub(super) fn finalize_session_turn(state: &ApiState, session_id: &SessionId, su
             tracing::warn!(
                 %session_id,
                 target = %target,
-                "finalize_session_turn called without active turn (will be hardened in S6)"
+                "finalize_session_turn called without active turn"
             );
         }
         Err(other) => {

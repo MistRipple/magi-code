@@ -1,8 +1,6 @@
 //! Task System v2 — AgentRole（角色定义 + 注册表 + 文件加载）。
 //!
-//! 替代 v1 `task_worker_catalog::build_worker_info_for_role` 中的硬编码 prompt
-//! 分支：role 定义从 `~/.magi/roles/*.json` 加载，找不到文件时回落到 crate 内置
-//! 默认集（与原 v1 prompt 对齐，确保现有 worker 调用语义不变）。
+//! role 定义从 `~/.magi/roles/*.json` 加载，找不到文件时使用 crate 内置默认集。
 //!
 //! 设计目标：
 //! - 一份 role 定义对应一个 JSON 文件，文件名（除 `.json`）即 role id。
@@ -41,8 +39,7 @@ pub enum AgentRoleError {
     InvalidId { path: PathBuf, file_stem: String },
 }
 
-/// 单个 role 的定义。与 v1 `WorkerInfo` 的 prompt + supported_kinds 字段语义对齐，
-/// 同时把 `parallelism_limit` 一并外置到配置。
+/// 单个 role 的定义。
 ///
 /// `coordinator_mode = true` 表示该角色采用 Prompt-as-Code 协调器模式：
 /// LLM 通过 `Agent` / `SendMessage` / `TaskStop` 三个内置工具发起子代理派发与
@@ -66,25 +63,25 @@ pub struct AgentRole {
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskKindLabel {
-    Objective,
-    Phase,
-    WorkPackage,
-    Action,
-    Validation,
-    Repair,
-    Decision,
+    LocalAgent,
+    LocalBash,
+    LocalWorkflow,
+    RemoteAgent,
+    MonitorMcp,
+    InProcessTeammate,
+    Dream,
 }
 
 impl TaskKindLabel {
     pub fn to_task_kind(self) -> TaskKind {
         match self {
-            Self::Objective => TaskKind::Objective,
-            Self::Phase => TaskKind::Phase,
-            Self::WorkPackage => TaskKind::WorkPackage,
-            Self::Action => TaskKind::Action,
-            Self::Validation => TaskKind::Validation,
-            Self::Repair => TaskKind::Repair,
-            Self::Decision => TaskKind::Decision,
+            Self::LocalAgent => TaskKind::LocalAgent,
+            Self::LocalBash => TaskKind::LocalBash,
+            Self::LocalWorkflow => TaskKind::LocalWorkflow,
+            Self::RemoteAgent => TaskKind::RemoteAgent,
+            Self::MonitorMcp => TaskKind::MonitorMcp,
+            Self::InProcessTeammate => TaskKind::InProcessTeammate,
+            Self::Dream => TaskKind::Dream,
         }
     }
 }
@@ -226,8 +223,7 @@ fn load_file(path: &Path) -> Result<AgentRole, AgentRoleError> {
     Ok(role)
 }
 
-/// builtin 默认角色集 —— 与 v1 task_worker_catalog 一致，保证现有调用语义不变。
-/// 用户在 `~/.magi/roles/<id>.json` 提供同名文件即可覆盖。
+/// builtin 默认角色集。用户在 `~/.magi/roles/<id>.json` 提供同名文件即可覆盖。
 fn builtin_roles_map() -> HashMap<String, AgentRole> {
     let raw = include_str!("../assets/builtin-roles.json");
     let parsed: BuiltinRolesFile =
@@ -268,15 +264,15 @@ mod tests {
         let reg = AgentRoleRegistry::from_map(builtin_roles_map());
         let role = reg.get("architect").expect("architect role exists");
         let kinds = role.supported_task_kinds();
-        assert!(kinds.contains(&TaskKind::Objective));
-        assert!(kinds.contains(&TaskKind::Phase));
-        assert!(kinds.contains(&TaskKind::WorkPackage));
+        assert!(kinds.contains(&TaskKind::LocalAgent));
+        assert!(kinds.contains(&TaskKind::LocalAgent));
+        assert!(kinds.contains(&TaskKind::LocalAgent));
     }
 
     #[test]
     fn role_supports_task_kind_handles_missing_role() {
         let reg = AgentRoleRegistry::empty();
-        assert!(!reg.role_supports_task_kind("missing", TaskKind::Action));
+        assert!(!reg.role_supports_task_kind("missing", TaskKind::LocalAgent));
     }
 
     #[test]
@@ -311,7 +307,7 @@ mod tests {
         let path = dir.join("ml-engineer.json");
         fs::write(
             &path,
-            r#"{"id":"ml-engineer","system_prompt":"你是机器学习工程师","supported_kinds":["action","validation"],"parallelism_limit":2}"#,
+            r#"{"id":"ml-engineer","system_prompt":"你是机器学习工程师","supported_kinds":["local_agent","local_bash"],"parallelism_limit":2}"#,
         )
         .unwrap();
         let role = load_file(&path).unwrap();

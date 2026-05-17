@@ -3,8 +3,8 @@
 //! 架构定义（参见 docs/task-system-v2/01-architecture.md L21）：
 //! 当 Coordinator 走到一个高风险节点（例如发布前的最终审阅、与外部系统的不可回滚操作、
 //! 涉及金钱/权限/合规的决策）时，可调 `human_checkpoint_request` 工具落一条
-//! **pending** 的 HumanCheckpoint。一旦有任何 pending 记录，mission 的对外状态变为
-//! `awaiting_human`，Coordinator 必须停止派发新 Worker；待运维通过 REST 接口对该条目
+//! **pending** 的 HumanCheckpoint。一旦有任何 pending 记录，runtime 必须拒绝
+//! `agent_spawn` 并阻止 TaskRunner 派发新 leaf；待运维通过 REST 接口对该条目
 //! resolve（approved / rejected）后，mission 才能继续推进。
 //!
 //! 本 crate 只承担"记录 + 渲染 + 查询 + 操作端 resolve"职责：
@@ -36,7 +36,7 @@ use thiserror::Error;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HumanCheckpointStatus {
-    /// 请求已记录，等待人审。mission 状态会被外推为 `awaiting_human`。
+    /// 请求已记录，等待人审；运行时据此暂停新的 agent_spawn / dispatch。
     Pending,
     /// 运维已批准，Coordinator 可继续推进。
     Approved,
@@ -193,8 +193,7 @@ impl HumanCheckpointStore {
         magi_home: &Path,
         workspace_root: &WorkspaceRootPath,
     ) -> Result<Self, HumanCheckpointError> {
-        let slug = workspace_slug(workspace_root.as_str());
-        let root = magi_home.join("projects").join(slug).join("missions");
+        let root = magi_core::paths::missions_root(magi_home, workspace_root);
         fs::create_dir_all(&root).map_err(|source| HumanCheckpointError::Io {
             path: root.clone(),
             source,
@@ -233,7 +232,7 @@ impl HumanCheckpointStore {
         fs::write(&path, rendered).map_err(|source| HumanCheckpointError::Io { path, source })
     }
 
-    /// 是否有任何 pending 条目。若有，调用方需把 mission 对外状态设为 `awaiting_human`。
+    /// 是否有任何 pending 条目。若有，调用方必须阻止新的 agent_spawn / dispatch。
     pub fn has_pending(&self, mission_id: &MissionId) -> Result<bool, HumanCheckpointError> {
         Ok(self
             .load(mission_id)?
@@ -609,15 +608,6 @@ fn dirs_home() -> Result<PathBuf, HumanCheckpointError> {
         .map(PathBuf::from)
         .ok_or(HumanCheckpointError::HomeDirUnavailable)?;
     Ok(base.join(".magi"))
-}
-
-fn workspace_slug(workspace_root: &str) -> String {
-    let trimmed = workspace_root.trim_start_matches('/').trim_end_matches('/');
-    if trimmed.is_empty() {
-        "root".to_string()
-    } else {
-        format!("-{}", trimmed.replace('/', "-"))
-    }
 }
 
 // ---------------------------------------------------------------------------

@@ -174,7 +174,7 @@
 - `support/frontend-contract` TS 契约层全量冻结：新增约 80 个 DTO 接口与约 70 个 `RustDaemonClient` 方法，覆盖所有 Rust 后端路由（task lifecycle、interaction、chain、sessions、workspaces、settings、knowledge、MCP/skills/repos、changes/files/tunnel），C-1 终点定义已满足
 - `magi-daemon` env-backed provider transport failure 回归已补：当端点不可达时稳定报 `model_provider_transport_failed`，B-3 终点定义已满足
 - `support/frontend-contract` 新增 `--check-api-reads` smoke 覆盖 5 条前端常用读取路由（settings/bootstrap、workspaces、workspace-sessions、bridges-services、bridges-preflight），B-2 终点定义已满足
-- Task 编排升级 Phase 1-2 完成：TaskStore、task_events（17 事件类型）、Task Graph API（6 端点）已落地，`session/action` 已挂接 Task Graph
+- Task 编排升级 Phase 1-2 完成：TaskStore、task_events 与 Task Projection API 已落地，`session/action` 已挂接任务投影
 - Phase 5 直连模式：`HttpModelBridgeClient` 已创建（10 tests），daemon runtime 已支持 env-backed 直连
 - 本轮仍未完成的切换前事项：
   - extraction 自动回写虽然已下沉到 runtime 公共层，且 `/task/execute` 也已接入，但新的真实调用方是否全部切到该接缝仍需后续 daemon / bridge / TS 接线继续验证

@@ -119,8 +119,7 @@ impl ProjectMemoryStore {
         magi_home: &Path,
         workspace_root: &WorkspaceRootPath,
     ) -> Result<Self, ProjectMemoryError> {
-        let slug = workspace_slug(workspace_root.as_str());
-        let root = magi_home.join("projects").join(slug).join("memory");
+        let root = magi_core::paths::project_memory_root(magi_home, workspace_root);
         fs::create_dir_all(&root).map_err(|source| ProjectMemoryError::Io {
             path: root.clone(),
             source,
@@ -469,23 +468,6 @@ fn magi_home_dir() -> Result<PathBuf, ProjectMemoryError> {
         .ok_or(ProjectMemoryError::HomeDirUnavailable)
 }
 
-fn workspace_slug(absolute_path: &str) -> String {
-    let mut slug = String::with_capacity(absolute_path.len());
-    for ch in absolute_path.chars() {
-        if ch == '/' || ch == '\\' {
-            slug.push('-');
-        } else if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
-            slug.push(ch);
-        } else {
-            slug.push('_');
-        }
-    }
-    if slug.is_empty() {
-        slug.push('_');
-    }
-    slug
-}
-
 fn validate_file_stem(stem: &str) -> Result<(), ProjectMemoryError> {
     if stem.is_empty() {
         return Err(ProjectMemoryError::InvalidFileStem(stem.to_string()));
@@ -572,7 +554,7 @@ fn parse_entry(file_stem: &str, raw: &str) -> Result<MemoryEntry, ProjectMemoryE
 // Tool entry：`memory_write` 工具执行体
 // ---------------------------------------------------------------------------
 
-/// S10 工具下沉：把 `memory_write` 完整执行体收口在本 crate，task_llm_loop
+/// S10 工具下沉：把 `memory_write` 完整执行体收口在本 crate，conversation_loop
 /// 不再持有该业务。`store: Option<...>` 仍由调用方按 workspace 绑定决定是否注入；
 /// 未绑定 workspace 时直接失败，避免静默丢弃记忆请求。
 pub fn execute_memory_write_tool(
@@ -712,16 +694,6 @@ mod tests {
     fn store(home: &TempDir, ws: &str) -> ProjectMemoryStore {
         ProjectMemoryStore::open_with_home(home.path(), &WorkspaceRootPath::new(ws))
             .expect("open store")
-    }
-
-    #[test]
-    fn workspace_slug_replaces_separators() {
-        assert_eq!(
-            workspace_slug("/Users/foo/code/proj"),
-            "-Users-foo-code-proj"
-        );
-        assert_eq!(workspace_slug("C:\\proj"), "C_-proj");
-        assert_eq!(workspace_slug(""), "_");
     }
 
     #[test]

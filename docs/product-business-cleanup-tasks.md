@@ -115,9 +115,9 @@
   1. 协议层 / DTO / 内部派发字段全删（`SessionTurnRequestDto`、`DispatchSubmissionRequest`、`ActiveExecutionDispatchContext`、`DispatchMemoryExtractionInput` 等无残留）。
   2. 持久化层（execution_writeback、session-store sidecar、workspace-store recovery）字段全删；旧持久化文件中遗留的 `deepTask` 键由 serde 默认忽略策略自然吸收，无需迁移脚本。
   3. 设置 bootstrap 的独立 `deepTask` 链路（`runtime_settings_from_snapshot` / `runtime.rs`）全删；`runtimeSettings` 只剩 `locale`。
-  4. Loopback stub（`model_loopback.rs`、`StaticTestModelBridgeClient`、`StaticModelBridgeClient`）改用 `任务图规划器` 前缀触发深图 stub；所有 fixture prompt 与 fixture 字段同步清扫。
+  4. Loopback stub（`model_loopback.rs`、`StaticTestModelBridgeClient`、`StaticModelBridgeClient`）改用 `任务投影规划器` 前缀触发深度规划 stub；所有 fixture prompt 与 fixture 字段同步清扫。
   5. **统一 task policy（autonomous_kind=Autonomous / retry_budget=1 / repair_budget=1 / validation_required=None）替代原 `build_deep_readonly_policy` / `build_deep_no_tool_policy` / `build_deep_action_policy` / `build_policy_for_mode` 四套**——所有 Phase / WorkPackage / Action / Repair / Decision / Validation 节点共享同一 policy。`TASK_MIN_PHASES` 由 3 降为 1，让 LLM 自行决定结构深度。
-  6. 重命名退场：`DEEP_TASK_PLAN_TOOL_NAME → TASK_PLAN_TOOL_NAME`、`create_deep_task_plan → create_task_plan`、`DeepTaskGraphPlan/PhasePlan/...` 去 `Deep` 前缀、`build/replan/insert/validate_deep_task_graph → *_task_graph`、`extract_deep_task_goal → extract_task_goal`、`loopback_deep_task_goal → loopback_task_goal`。
+  6. 重命名退场：`DEEP_TASK_PLAN_TOOL_NAME → TASK_PLAN_TOOL_NAME`、`create_deep_task_plan → create_task_plan`、深度规划类型去 `Deep` 前缀、深度规划构建/重排/插入/校验 helper 统一改为任务投影命名、`extract_deep_task_goal → extract_task_goal`、`loopback_deep_task_goal → loopback_task_goal`。
 
 ### #5 「团队模式」语言收回
 - **状态**：✅
@@ -144,7 +144,7 @@
 - **代码证据**：`magi-core/src/task.rs::TaskKind`（7 种）+ `TasksPanel.svelte::taskTreeRows`（全暴露）
 - **执行结果**：
   1. `web/src/lib/task-labels.ts` 新增 `USER_VISIBLE_TASK_KINDS = ['Action', 'Validation', 'Decision']` 常量与 `isUserVisibleTaskKind(kind)` 守卫；命名按 P1-#7 后续约定避免硬编码字符串。
-  2. `TasksPanel.svelte` 主视图新增"执行步骤"section（task-step-list），渲染扁平的用户可见任务（`activeProjectionTasks` 过滤后按 `created_at` 排序），点击行可在 `task-graph-store` 选中节点；列表为空时不渲染（避免空 section）。
+  2. `TasksPanel.svelte` 主视图新增"执行步骤"section（task-step-list），渲染扁平的用户可见任务（`activeProjectionTasks` 过滤后按 `created_at` 排序），点击行可在 `task-projection-store` 选中节点；列表为空时不渲染（避免空 section）。
   3. `Phase / WorkPackage / Repair / Objective` 等结构性节点继续保留在已存在的 `<details class="task-details-disclosure">` 技术明细折叠区，主视图不再以"任务树+全部 7 类"作为默认呈现。
   4. 顺手清理 P1-#4 残留：`buildDeliveryPackageSummary` 的 `模式：${pkg.execution_mode === 'deep' ? '深度模式' : '普通模式'}` 行删除（deep_task 已退场，不再有"深度/普通"模式概念；`execution_mode` 字段后端清理留待 backend 后续 PR）。
   5. 新增样式（task-step-list / task-step-row / task-step-content / task-step-status）按现有 token 体系着色，hover/selected 状态与 attention section 视觉一致。
@@ -308,7 +308,7 @@
 - **状态**：✅
 - **完成时间**：2026-05-09
 - **任务**：消除"后端定义、前端不渲染"的死代码。
-- **建议**：**选实现**——前端补 `DecisionCard.svelte`，渲染 `decision_payload.options`，调用 `/api/tasks/{id}/decision` 提交用户选择。给一个 demo 触发路径（如"网络写权限"触发 Decision）。Decision 是产品差异化关键能力，删了就没自治叙事。
+- **建议**：**选实现**——前端补 `DecisionCard.svelte`，渲染决策选项，调用任务决策提交接口记录用户选择。给一个 demo 触发路径（如"网络写权限"触发 Decision）。Decision 是产品差异化关键能力，删了就没自治叙事。
 - **执行结果**：审查代码后确认 doc 前提（"前端不渲染"）与现状脱节，**功能已完整闭环**，无需再写代码：
   - **后端 3 条真实生产 escalate 路径**：
     - `crates/magi-orchestrator/src/task_runner.rs:670` —— policy snapshot 判 `NeedsApproval` 时自动创建 Decision Task（选项：继续执行 / 中止整个任务）
@@ -351,7 +351,7 @@
   - `InputArea.svelte::sendMessage` 检测到 `shouldUseIntake`（已有运行中任务）且非"自然续传"指令时，改为弹出 Modal 三选一：
     - 取消（dismiss）
     - 作为补充指令（continue as follow-up，沿用原 intake 路径）
-    - 停止当前并新建任务（pauseTask + executeTask 重新走 task 路由）
+    - 停止当前并新建任务（interruptTask + executeTask 重新走 task 路由）
   - 新增 i18n（zh-CN / en-US）`input.runningTaskConfirm.{title,body,cancel,followUp,stopAndStart,stopFailed}` 共 6 键
   - 复用现有 `Modal.svelte` 组件（与 Header 删除/切换确认对话框一致风格）
   - 后端 `RunnerManager.session_runner_index` 容器结构未动；产品语义靠前端门控收敛

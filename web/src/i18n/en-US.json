@@ -370,8 +370,6 @@
   "messageItem.placeholder.processing": "Processing...",
   "messageItem.supplementaryTag": "Supplementary",
   "messageItem.copyTitle": "Copy Content",
-  "messageItem.guideQueued": "Send as guidance",
-  "messageItem.guideQueuedTitle": "Send immediately as supplement context for the current task",
   "errorDetail.title": "Full Error",
   "errorDetail.more": "More",
   "errorDetail.copy": "Copy Error",

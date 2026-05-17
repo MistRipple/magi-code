@@ -8,7 +8,7 @@
     messagesState,
     removeQueuedMessage,
   } from '../stores/messages.svelte';
-  import { getTaskGraphState, refreshTaskProjection } from '../stores/task-graph-store.svelte';
+  import { getTaskProjectionState, refreshTaskProjection } from '../stores/task-projection-store.svelte';
   import { RustDaemonClient } from '../shared/rust-daemon-client';
   import { enhanceAgentPrompt, resolveAgentBaseUrl } from '../web/agent-api';
   import { categoryLabel, listTaskTemplates, type ResolvedTemplate } from '../lib/task-templates';
@@ -55,12 +55,12 @@
   });
 
   const currentSessionId = $derived(messagesState.currentSessionId);
-  const taskGraph = $derived(getTaskGraphState(currentSessionId));
+  const taskProjection = $derived(getTaskProjectionState(currentSessionId));
 
-  const shouldPauseTaskGraphFromComposer = $derived.by(() => {
-    const projection = taskGraph.projection;
+  const shouldInterruptTaskProjectionFromComposer = $derived.by(() => {
+    const projection = taskProjection.projection;
     const sessionId = currentSessionId?.trim();
-    const rootTaskId = projection?.root_task.task_id ?? taskGraph.rootTaskId;
+    const rootTaskId = projection?.root_task.task_id ?? taskProjection.rootTaskId;
     if (!projection || !sessionId || !rootTaskId) return false;
     return projection.runner_status === 'running';
   });
@@ -210,18 +210,18 @@
     }
   }
 
-  // 任务图运行时，输入框停止入口与任务面板共用同一条可恢复停止链路。
+  // 任务投影运行时，输入框停止入口与任务面板共用同一条可恢复中断链路。
   async function stopTask() {
     if (stopLoading) return;
     stopLoading = true;
     try {
-      if (shouldPauseTaskGraphFromComposer) {
-        const projection = taskGraph.projection;
+      if (shouldInterruptTaskProjectionFromComposer) {
+        const projection = taskProjection.projection;
         const sessionId = currentSessionId?.trim();
-        const rootTaskId = projection?.root_task.task_id ?? taskGraph.rootTaskId;
+        const rootTaskId = projection?.root_task.task_id ?? taskProjection.rootTaskId;
         if (sessionId && rootTaskId) {
           const client = new RustDaemonClient(resolveAgentBaseUrl());
-          await client.pauseTask({ taskId: rootTaskId, sessionId });
+          await client.interruptTask({ taskId: rootTaskId, sessionId });
           await refreshTaskProjection(sessionId);
           addToast('info', '任务已停止，进度已保存');
         }
@@ -234,15 +234,6 @@
     } finally {
       stopLoading = false;
     }
-  }
-
-  function guideQueuedMessage(queuedMessageId: string) {
-    const normalizedId = typeof queuedMessageId === 'string' ? queuedMessageId.trim() : '';
-    if (!normalizedId) return;
-    vscode.postMessage({
-      type: 'guideQueuedMessage',
-      queuedMessageId: normalizedId,
-    });
   }
 
   function deleteQueuedMessage(queuedMessageId: string) {
@@ -416,15 +407,6 @@
               <button
                 type="button"
                 class="ia-queue-action"
-                onclick={() => guideQueuedMessage(queued.id)}
-                title={i18n.t('messageItem.guideQueuedTitle')}
-                aria-label={i18n.t('messageItem.guideQueued')}
-              >
-                <Icon name="send" size={12} />
-              </button>
-              <button
-                type="button"
-                class="ia-queue-action"
                 onclick={() => editQueuedMessage(queued.id)}
                 title={i18n.t('input.queue.edit')}
                 aria-label={i18n.t('input.queue.edit')}
@@ -557,7 +539,7 @@
             data-testid="input-stop-button"
             onclick={stopTask}
             disabled={stopLoading}
-            title={shouldPauseTaskGraphFromComposer ? '停止当前任务，保留进度' : i18n.t('input.stop')}
+            title={shouldInterruptTaskProjectionFromComposer ? '停止当前任务，保留进度' : i18n.t('input.stop')}
           >
             <Icon name={stopLoading ? 'loader' : 'stop'} size={14} class={stopLoading ? 'spinning' : ''} />
           </button>

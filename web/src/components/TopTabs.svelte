@@ -1,7 +1,7 @@
 <script lang="ts">
   import { i18n } from '../stores/i18n.svelte';
   import { getState } from '../stores/messages.svelte';
-  import { getTaskGraphState } from '../stores/task-graph-store.svelte';
+  import { getTaskProjectionState } from '../stores/task-projection-store.svelte';
   import { ensureArray } from '../lib/utils';
 
   interface Props {
@@ -13,21 +13,18 @@
 
   const appState = getState();
   const currentSessionId = $derived(appState.currentSessionId);
-  const taskGraph = $derived(getTaskGraphState(currentSessionId));
+  const taskProjection = $derived(getTaskProjectionState(currentSessionId));
 
   // 任务和变更的徽章数量
   const tasksBadge = $derived.by(() => {
-    const projection = taskGraph.projection;
+    const projection = taskProjection.projection;
     return projection?.progress_summary?.total_tasks ?? 0;
   });
-  // 需要用户处理的任务（pending decisions + blocked），优先级高于总数显示
+  // 失败任务优先级高于总数显示。
   const attentionCount = $derived.by(() => {
-    const projection = taskGraph.projection;
+    const projection = taskProjection.projection;
     if (!projection) return 0;
-    const ids = new Set<string>([
-      ...(projection.pending_decisions ?? []),
-      ...(projection.blocked_tasks ?? []),
-    ]);
+    const ids = new Set<string>(projection.failed_tasks ?? []);
     return ids.size;
   });
   const editsBadge = $derived(ensureArray(appState.edits).length);
