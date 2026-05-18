@@ -167,7 +167,13 @@ fn build_task_policy(task_tier: TaskTier) -> magi_core::TaskPolicy {
     }
 }
 
-fn infer_dispatch_task_role(skill_name: Option<&str>) -> &'static str {
+fn infer_dispatch_task_role(skill_name: Option<&str>, task_tier: TaskTier) -> &'static str {
+    // LongMission 必须由 coordinator role 承接：Charter/Plan/Checkpoint 等 long-mission
+    // 工具的可见性 gate 同时要求 coordinator_mode + tier=LongMission，二者必须共生。
+    // 不在此处强制 = tool gate 必然否决 = 必失败。从源头收敛到单一正确路径。
+    if matches!(task_tier, TaskTier::LongMission) {
+        return "coordinator";
+    }
     let Some(skill_name) = skill_name.map(str::trim).filter(|value| !value.is_empty()) else {
         return "integration-dev";
     };
@@ -283,13 +289,27 @@ pub fn run_dispatch_submission(
     let target_role = request
         .target_role
         .as_deref()
-        .unwrap_or_else(|| infer_dispatch_task_role(request.skill_name.as_deref()));
+        .unwrap_or_else(|| infer_dispatch_task_role(request.skill_name.as_deref(), request.task_tier));
     if !runtime
         .agent_role_registry
         .role_supports_task_kind(target_role, TaskKind::LocalAgent)
     {
         return Err(DispatchSubmissionRunError::InvalidInput(format!(
             "role {target_role} 不支持 local_agent 任务"
+        )));
+    }
+    // LongMission 与 coordinator role 必须共生：long-mission 工具可见性 gate
+    // (`task_can_see_builtin_tool`) 同时要求 tier=LongMission + coordinator_mode。
+    // 显式传入非 coordinator role 又指定 LongMission 是契约自相矛盾，必须从源头拒绝，
+    // 而不是放行后让模型在运行期看不到工具再失败。
+    if matches!(request.task_tier, TaskTier::LongMission)
+        && !runtime
+            .agent_role_registry
+            .get(target_role)
+            .is_some_and(|role| role.coordinator_mode)
+    {
+        return Err(DispatchSubmissionRunError::InvalidInput(format!(
+            "LongMission 必须由 coordinator_mode role 承接，但显式指定了 role {target_role}"
         )));
     }
     let task = make_dispatch_task(
@@ -733,7 +753,7 @@ mod tests {
             ),
             task_tier: TaskTier::LongMission,
             skill_name: None,
-            target_role: Some("integration-dev".to_string()),
+            target_role: Some("coordinator".to_string()),
             request_id: None,
             user_message_id: None,
             placeholder_message_id: None,
@@ -799,6 +819,81 @@ mod tests {
         assert!(
             chain.current_turn.is_some(),
             "ActiveExecutionChain 必须带 current_turn，作为 mission 首轮的 lane 入口",
+        );
+
+        // §3.4 子契约：dispatch 必须把 LongMission 行动任务交给 coordinator role 承接，
+        // 否则 long-mission 工具可见性 gate 会屏蔽 Charter/Plan/Checkpoint 工具。
+        let executor_role = action_task
+            .executor_binding_target_role()
+            .expect("LongMission action task 必须写入 executor_binding.target_role");
+        let executor_role_entry = agent_role_registry
+            .get(executor_role)
+            .expect("LongMission action task 的 target_role 必须能在 registry 中查到");
+        assert!(
+            executor_role_entry.coordinator_mode,
+            "§3.4：LongMission action task 必须由 coordinator_mode role 承接\
+             （long-mission 工具可见性 gate 同时要求 tier=LongMission + coordinator_mode），\
+             实际 role={executor_role}",
+        );
+    }
+
+    /// §3.4 反证：显式把 LongMission action task 指定给非 coordinator role 是契约
+    /// 自相矛盾——`task_can_see_builtin_tool` 必然否决 Charter/Plan/Checkpoint，
+    /// runner 必失败。从源头拒绝，不放行错误配置。
+    #[test]
+    fn long_mission_dispatch_rejects_non_coordinator_target_role() {
+        let session_store = SessionStore::new();
+        let task_store = TaskStore::new();
+        let execution_registry = TaskExecutionRegistry::default();
+        let event_bus = InMemoryEventBus::new(16);
+        let agent_role_registry = AgentRoleRegistry::load_default();
+        let spawn_graph = Mutex::new(SpawnGraph::new());
+        let session_id = SessionId::new("session-long-mission-bad-role");
+
+        session_store
+            .create_session(session_id.clone(), "long mission bad role")
+            .expect("session should be creatable");
+
+        let request = DispatchSubmissionRequest {
+            accepted_at: UtcMillis(5_000),
+            session_id,
+            workspace_id: Some(WorkspaceId::new("workspace-long-mission-bad-role")),
+            entry_id: "timeline-long-mission-bad-role".to_string(),
+            timeline_message: "复杂任务模式：跨多阶段重构".to_string(),
+            created_session: false,
+            mission_title: "重构 mission".to_string(),
+            task_title: "重构 mission".to_string(),
+            trimmed_text: Some("复杂任务模式：跨多阶段重构".to_string()),
+            execution_goal: Some("跨多阶段重构".to_string()),
+            task_tier: TaskTier::LongMission,
+            skill_name: None,
+            target_role: Some("integration-dev".to_string()),
+            request_id: None,
+            user_message_id: None,
+            placeholder_message_id: None,
+        };
+        let runtime = DispatchSubmissionRuntime {
+            session_store: &session_store,
+            task_store: &task_store,
+            execution_registry: &execution_registry,
+            event_bus: &event_bus,
+            agent_role_registry: &agent_role_registry,
+            spawn_graph: &spawn_graph,
+            model_bridge_client: None,
+            workspace_root_path: None,
+        };
+
+        let err = run_dispatch_submission(&runtime, &request);
+        let message = match err {
+            Err(DispatchSubmissionRunError::InvalidInput(msg)) => msg,
+            Ok(_) => panic!(
+                "非 coordinator role 配 LongMission tier 必须被 dispatch 拒绝，但放行了"
+            ),
+            Err(other) => panic!("期待 InvalidInput，实际 {other:?}"),
+        };
+        assert!(
+            message.contains("LongMission") && message.contains("coordinator_mode"),
+            "错误消息必须明确指向 LongMission + coordinator_mode 契约：{message}",
         );
     }
 }
