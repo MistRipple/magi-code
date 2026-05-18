@@ -1,14 +1,27 @@
-use magi_core::{TaskId, TaskStatus};
+use magi_core::{MissionLifecyclePhase, TaskId, TaskStatus};
 use magi_event_bus::{
-    AuditUsageLedgerStatus, ExecutionGroupRuntimeSummaryEntry, RecoveryActivityStage,
-    RecoveryDiagnosticSummaryEntry, RuntimeLedgerSummary, RuntimeReadModelInput,
-    SessionRuntimeBranchSummaryEntry, SessionRuntimeSummaryEntry,
+    AuditUsageLedgerStatus, ExecutionGroupRuntimeSummaryEntry, MissionMetricsSummary,
+    RecoveryActivityStage, RecoveryDiagnosticSummaryEntry, RuntimeLedgerSummary,
+    RuntimeReadModelInput, SessionRuntimeBranchSummaryEntry, SessionRuntimeSummaryEntry,
     SessionRuntimeTurnItemSummaryEntry, SessionRuntimeTurnLaneSummaryEntry,
     SessionRuntimeTurnSummaryEntry, WorkspaceRuntimeSummaryEntry,
 };
+use magi_mission_metrics::MissionMetrics;
 use magi_orchestrator::task_store::TaskStore;
 use magi_session_store::{SessionExecutionSidecarStatus, SessionRuntimeSidecarExport};
 use magi_workspace::{RecoveryStatus, WorkspaceRecoverySidecarExport};
+
+/// Mission §1.4 聚合根派生属性的快照,用于从 `AppState` 收集后注入读模型 DTO。
+///
+/// 反孤儿:`MissionAggregate::lifecycle_phase()` / `metrics()` 在 Phase A
+/// 落地后必须有真实消费方,本结构就是 read-model 的入口。`mission_id` 用
+/// 字符串形式与已有 `ExecutionGroupRuntimeSummaryEntry::mission_id` 对齐。
+#[derive(Clone, Debug)]
+pub struct MissionAggregateExport {
+    pub mission_id: String,
+    pub lifecycle_phase: MissionLifecyclePhase,
+    pub metrics: Option<MissionMetrics>,
+}
 
 pub type RuntimeReadModelDto = RuntimeReadModelInput;
 pub type AuditUsageLedgerDto = RuntimeLedgerSummary;
@@ -19,10 +32,12 @@ pub fn runtime_read_model_dto(
     workspace_sidecar_exports: &[WorkspaceRecoverySidecarExport],
     audit_usage_ledger: AuditUsageLedgerDto,
     task_store: Option<&TaskStore>,
+    mission_aggregate_exports: &[MissionAggregateExport],
 ) -> RuntimeReadModelDto {
     let mut runtime_read_model = runtime_read_model;
     merge_session_sidecars(&mut runtime_read_model, session_sidecar_exports, task_store);
     merge_workspace_sidecars(&mut runtime_read_model, workspace_sidecar_exports);
+    merge_mission_aggregates(&mut runtime_read_model, mission_aggregate_exports);
     runtime_read_model.meta.ledger = audit_usage_ledger;
     runtime_read_model
 }
@@ -481,6 +496,50 @@ fn merge_workspace_sidecars(
     }
 }
 
+fn merge_mission_aggregates(
+    runtime_read_model: &mut RuntimeReadModelInput,
+    exports: &[MissionAggregateExport],
+) {
+    for export in exports {
+        let entry = runtime_read_model
+            .details
+            .execution_groups
+            .iter_mut()
+            .find(|entry| entry.mission_id == export.mission_id);
+        let entry = match entry {
+            Some(entry) => entry,
+            None => {
+                runtime_read_model.details.execution_groups.push(
+                    ExecutionGroupRuntimeSummaryEntry {
+                        mission_id: export.mission_id.clone(),
+                        ..ExecutionGroupRuntimeSummaryEntry::default()
+                    },
+                );
+                runtime_read_model
+                    .details
+                    .execution_groups
+                    .last_mut()
+                    .expect("execution group entry inserted above")
+            }
+        };
+        entry.lifecycle_phase = Some(export.lifecycle_phase.as_str().to_string());
+        entry.metrics = export.metrics.as_ref().map(metrics_to_summary);
+    }
+}
+
+fn metrics_to_summary(metrics: &MissionMetrics) -> MissionMetricsSummary {
+    MissionMetricsSummary {
+        turn_count: metrics.turn_count,
+        total_prompt_tokens: metrics.total_prompt_tokens,
+        total_completion_tokens: metrics.total_completion_tokens,
+        total_tokens: metrics.total_tokens,
+        wall_clock_millis: metrics.wall_clock_millis,
+        first_turn_started_at: metrics.first_turn_started_at,
+        last_turn_finished_at: metrics.last_turn_finished_at,
+        last_lifecycle_phase: metrics.last_lifecycle_phase.map(|p| p.as_str().to_string()),
+    }
+}
+
 fn recovery_stage_from_status(status: &RecoveryStatus) -> RecoveryActivityStage {
     match status {
         RecoveryStatus::Prepared => RecoveryActivityStage::ResumeCommandCreated,
@@ -644,6 +703,7 @@ mod tests {
                 last_persist_error: None,
             }),
             None,
+            &[],
         );
 
         assert_eq!(runtime_read_model.details.sessions.len(), 1);
@@ -777,6 +837,7 @@ mod tests {
             &[],
             ledger_dto(AuditUsageLedgerStatus::default()),
             Some(&task_store),
+            &[],
         );
 
         let group = runtime_read_model
@@ -1005,6 +1066,7 @@ mod tests {
             &[],
             ledger_dto(AuditUsageLedgerStatus::default()),
             Some(&task_store),
+            &[],
         );
 
         let session = &runtime_read_model.details.sessions[0];
@@ -1033,6 +1095,7 @@ mod tests {
             &[],
             audit_usage_ledger.clone(),
             None,
+            &[],
         );
 
         assert_eq!(
@@ -1084,6 +1147,7 @@ mod tests {
             ],
             ledger_dto(AuditUsageLedgerStatus::default()),
             None,
+            &[],
         );
 
         assert_eq!(
@@ -1144,6 +1208,7 @@ mod tests {
             }],
             ledger_dto(AuditUsageLedgerStatus::default()),
             None,
+            &[],
         );
 
         assert_eq!(runtime_read_model.recovery.summaries.len(), 1);
@@ -1202,6 +1267,7 @@ mod tests {
             }],
             ledger_dto(AuditUsageLedgerStatus::default()),
             None,
+            &[],
         );
 
         assert_eq!(runtime_read_model.recovery.summaries.len(), 1);
@@ -1242,6 +1308,7 @@ mod tests {
             &[],
             ledger_dto(AuditUsageLedgerStatus::default()),
             None,
+            &[],
         );
 
         assert_eq!(runtime_read_model.details.sessions.len(), 1);
@@ -1381,6 +1448,7 @@ mod tests {
             &[],
             ledger_dto(AuditUsageLedgerStatus::default()),
             Some(&task_store),
+            &[],
         );
 
         let session = runtime_read_model
@@ -1609,6 +1677,7 @@ mod tests {
             &[],
             ledger_dto(AuditUsageLedgerStatus::default()),
             Some(&task_store),
+            &[],
         );
 
         let session = runtime_read_model
@@ -1641,5 +1710,105 @@ mod tests {
         assert_eq!(session.root_task_status.as_deref(), Some("completed"));
         assert!(!session.has_recoverable_chain);
         assert_eq!(session.recoverable_branch_count, 0);
+    }
+
+    #[test]
+    fn merge_mission_aggregates_patches_existing_entry_and_inserts_missing_one() {
+        // 场景:dispatch projection 已经为 M-task 建好 entry(带 active task);
+        // 而 M-charter 只有 charter,task projection 还没派发,merger 需要 find-or-insert。
+        let mut input = RuntimeReadModelInput::default();
+        input
+            .details
+            .execution_groups
+            .push(ExecutionGroupRuntimeSummaryEntry {
+                mission_id: "M-task".to_string(),
+                event_count: 7,
+                active_task_ids: vec!["task-1".to_string()],
+                ..ExecutionGroupRuntimeSummaryEntry::default()
+            });
+
+        let exports = vec![
+            MissionAggregateExport {
+                mission_id: "M-task".to_string(),
+                lifecycle_phase: MissionLifecyclePhase::Executing,
+                metrics: Some(MissionMetrics {
+                    schema_version: 1,
+                    mission_id: magi_core::MissionId::new("M-task"),
+                    turn_count: 3,
+                    total_prompt_tokens: 120,
+                    total_completion_tokens: 45,
+                    total_tokens: 165,
+                    first_turn_started_at: Some(UtcMillis(1_000)),
+                    last_turn_finished_at: Some(UtcMillis(2_500)),
+                    wall_clock_millis: 1_500,
+                    last_lifecycle_phase: Some(MissionLifecyclePhase::Executing),
+                }),
+            },
+            MissionAggregateExport {
+                mission_id: "M-charter".to_string(),
+                lifecycle_phase: MissionLifecyclePhase::PlanReady,
+                metrics: None,
+            },
+        ];
+
+        merge_mission_aggregates(&mut input, &exports);
+
+        assert_eq!(input.details.execution_groups.len(), 2);
+        let task_entry = input
+            .details
+            .execution_groups
+            .iter()
+            .find(|e| e.mission_id == "M-task")
+            .expect("M-task entry must remain");
+        assert_eq!(task_entry.event_count, 7, "已有字段必须保留");
+        assert_eq!(task_entry.active_task_ids, vec!["task-1".to_string()]);
+        assert_eq!(task_entry.lifecycle_phase.as_deref(), Some("executing"));
+        let metrics = task_entry.metrics.as_ref().expect("metrics must be set");
+        assert_eq!(metrics.turn_count, 3);
+        assert_eq!(metrics.total_tokens, 165);
+        assert_eq!(metrics.wall_clock_millis, 1_500);
+        assert_eq!(metrics.last_lifecycle_phase.as_deref(), Some("executing"));
+
+        let charter_entry = input
+            .details
+            .execution_groups
+            .iter()
+            .find(|e| e.mission_id == "M-charter")
+            .expect("M-charter entry must be inserted");
+        assert_eq!(charter_entry.lifecycle_phase.as_deref(), Some("plan_ready"));
+        assert!(charter_entry.metrics.is_none());
+        assert_eq!(
+            charter_entry.event_count, 0,
+            "新插入条目应使用默认零值,不污染计数"
+        );
+    }
+
+    #[test]
+    fn merge_mission_aggregates_overwrites_previous_lifecycle_phase() {
+        // 守护:同一 mission 二次 export(例如轮询读 model)应覆盖上一次 lifecycle。
+        let mut input = RuntimeReadModelInput::default();
+        input
+            .details
+            .execution_groups
+            .push(ExecutionGroupRuntimeSummaryEntry {
+                mission_id: "M-evolving".to_string(),
+                lifecycle_phase: Some("plan_ready".to_string()),
+                ..ExecutionGroupRuntimeSummaryEntry::default()
+            });
+
+        merge_mission_aggregates(
+            &mut input,
+            &[MissionAggregateExport {
+                mission_id: "M-evolving".to_string(),
+                lifecycle_phase: MissionLifecyclePhase::AllStepsCompleted,
+                metrics: None,
+            }],
+        );
+
+        let entry = &input.details.execution_groups[0];
+        assert_eq!(
+            entry.lifecycle_phase.as_deref(),
+            Some("all_steps_completed")
+        );
     }
 }

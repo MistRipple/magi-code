@@ -12,7 +12,7 @@ pub use ledger::{
 };
 pub use read_model::{
     AssignmentRuntimeSummaryEntry, DispatchRuntimeSummary, EventCategoryCounts,
-    ExecutionGroupRuntimeSummaryEntry, RUNTIME_READ_MODEL_CONTRACT_SECTIONS,
+    ExecutionGroupRuntimeSummaryEntry, MissionMetricsSummary, RUNTIME_READ_MODEL_CONTRACT_SECTIONS,
     RUNTIME_READ_MODEL_CONTRACT_VERSION, RUNTIME_READ_MODEL_ORDERING_STRATEGY,
     RUNTIME_READ_MODEL_REQUIRED_VALIDATION_REFS, RUNTIME_READ_MODEL_SECTION_ORDERING_RULES,
     RecoveryActivityEntry, RecoveryActivityStage, RecoveryDiagnosticSummaryEntry,

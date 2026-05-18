@@ -150,6 +150,30 @@ pub struct ExecutionGroupRuntimeSummaryEntry {
     pub context_provenance_linked_memory_count: usize,
     pub latest_event_type: Option<String>,
     pub current_status: Option<String>,
+    /// Mission 当前生命周期阶段（snake_case，源自 `MissionLifecyclePhase::as_str()`）。
+    /// 仅当 `MissionAggregate::lifecycle_phase()` 派生成功时填充；charter-draft 等
+    /// 未通过恢复集校验的 mission 会被读端 warn-and-skip，此字段保持 `None`。
+    pub lifecycle_phase: Option<String>,
+    /// Mission 维度累计 metrics 快照（turn / token / wall-clock）。
+    /// 第一次 `record_turn` 之前为 `None`；前端可据此区分"尚未派发"与"已派发但零开销"。
+    pub metrics: Option<MissionMetricsSummary>,
+}
+
+/// `MissionMetrics` 在读模型 DTO 上的轻量镜像。
+///
+/// 注意此结构**居住在 magi-event-bus**：它是 read-model 的字段，不能反向依赖
+/// `magi-mission-metrics`。`magi-api` 的 merger 负责 `MissionMetrics →
+/// MissionMetricsSummary` 的字段拷贝。
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionMetricsSummary {
+    pub turn_count: u64,
+    pub total_prompt_tokens: u64,
+    pub total_completion_tokens: u64,
+    pub total_tokens: u64,
+    pub wall_clock_millis: u64,
+    pub first_turn_started_at: Option<UtcMillis>,
+    pub last_turn_finished_at: Option<UtcMillis>,
+    pub last_lifecycle_phase: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]

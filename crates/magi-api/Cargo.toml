@@ -21,6 +21,7 @@ magi-spawn-graph = { path = "../magi-spawn-graph" }
 magi-todo-ledger = { path = "../magi-todo-ledger" }
 magi-project-memory = { path = "../magi-project-memory" }
 magi-mission-charter = { path = "../magi-mission-charter" }
+magi-mission-metrics = { path = "../magi-mission-metrics" }
 magi-mission-workspace = { path = "../magi-mission-workspace" }
 magi-knowledge-graph = { path = "../magi-knowledge-graph" }
 magi-validation-runner = { path = "../magi-validation-runner" }
@@ -33,6 +34,7 @@ magi-event-bus = { path = "../magi-event-bus" }
 magi-governance = { path = "../magi-governance" }
 magi-knowledge-store = { path = "../magi-knowledge-store" }
 magi-memory-store = { path = "../magi-memory-store" }
+magi-mission = { path = "../magi-mission" }
 magi-orchestrator = { path = "../magi-orchestrator" }
 magi-session-store = { path = "../magi-session-store" }
 magi-snapshot = { path = "../magi-snapshot" }

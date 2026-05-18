@@ -2,7 +2,7 @@ use crate::{
     change_projection::PendingChangeDto,
     dto::{
         AuditUsageLedgerDto, BridgePreflightSnapshotDto, BridgeServicesSnapshotDto,
-        RuntimeReadModelDto, ServiceInfo, runtime_read_model_dto,
+        MissionAggregateExport, RuntimeReadModelDto, ServiceInfo, runtime_read_model_dto,
     },
     errors::ApiError,
     state::ApiState,
@@ -85,6 +85,7 @@ impl BootstrapDto {
             state.bridge_services_dto(),
             state.bridge_preflight_dto(),
             state.task_store(),
+            state.collect_mission_aggregate_exports(),
         );
         if let Some(current_session) = dto.current_session.as_ref() {
             dto.pending_changes = crate::change_projection::collect_session_pending_changes(
@@ -111,6 +112,7 @@ impl BootstrapDto {
         bridge_services: BridgeServicesSnapshotDto,
         bridge_preflight: BridgePreflightSnapshotDto,
         task_store: Option<&magi_orchestrator::task_store::TaskStore>,
+        mission_aggregate_exports: Vec<MissionAggregateExport>,
     ) -> Self {
         let current_session =
             session_projection
@@ -129,6 +131,7 @@ impl BootstrapDto {
             &workspace_sidecar_exports,
             audit_usage_ledger.clone(),
             task_store,
+            &mission_aggregate_exports,
         );
 
         Self {
@@ -316,6 +319,7 @@ mod tests {
             BridgeServicesSnapshotDto::default(),
             BridgePreflightSnapshotDto::default(),
             None,
+            Vec::new(),
         );
 
         assert_eq!(bootstrap.runtime_read_model.details.sessions.len(), 1);
@@ -359,6 +363,7 @@ mod tests {
             BridgeServicesSnapshotDto::default(),
             BridgePreflightSnapshotDto::default(),
             None,
+            Vec::new(),
         );
 
         assert_eq!(
@@ -403,6 +408,7 @@ mod tests {
             BridgeServicesSnapshotDto::default(),
             BridgePreflightSnapshotDto::default(),
             None,
+            Vec::new(),
         );
 
         assert_eq!(
@@ -455,6 +461,7 @@ mod tests {
             BridgeServicesSnapshotDto::default(),
             BridgePreflightSnapshotDto::default(),
             None,
+            Vec::new(),
         );
 
         assert_eq!(
@@ -505,6 +512,7 @@ mod tests {
             BridgeServicesSnapshotDto::default(),
             BridgePreflightSnapshotDto::default(),
             None,
+            Vec::new(),
         );
 
         assert_eq!(bootstrap.audit_usage_ledger.next_sequence, 12);

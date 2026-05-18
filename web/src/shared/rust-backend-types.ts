@@ -482,6 +482,17 @@ export interface RuntimeOverviewDto {
   diagnostics: RuntimeDiagnosticSummaryDto;
 }
 
+export interface MissionMetricsSummaryDto {
+  turn_count: number;
+  total_prompt_tokens: number;
+  total_completion_tokens: number;
+  total_tokens: number;
+  wall_clock_millis: number;
+  first_turn_started_at?: number | null;
+  last_turn_finished_at?: number | null;
+  last_lifecycle_phase?: string | null;
+}
+
 export interface ExecutionGroupRuntimeSummaryDto {
   mission_id: string;
   event_count: number;
@@ -494,6 +505,8 @@ export interface ExecutionGroupRuntimeSummaryDto {
   active_task_ids: string[];
   latest_event_type?: string | null;
   current_status?: string | null;
+  lifecycle_phase?: string | null;
+  metrics?: MissionMetricsSummaryDto | null;
 }
 
 export interface TaskRuntimeSummaryDto {

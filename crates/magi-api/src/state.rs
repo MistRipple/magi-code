@@ -2,8 +2,8 @@ use crate::dto::{
     AuditUsageLedgerDto, BootstrapDto, BridgeCutoverSmokeProvider, BridgeCutoverSmokeSnapshotDto,
     BridgeCutoverSmokeSnapshotProvider, BridgePreflightProvider, BridgePreflightSnapshotDto,
     BridgePreflightSnapshotProvider, BridgeProbeSnapshotProvider, BridgeServicesSnapshotDto,
-    BridgeSnapshotProvider, DirectHttpModelProbeConfig, HealthDto, RuntimeReadModelDto,
-    ServiceInfo, VersionHandshakeDto, runtime_read_model_dto,
+    BridgeSnapshotProvider, DirectHttpModelProbeConfig, HealthDto, MissionAggregateExport,
+    RuntimeReadModelDto, ServiceInfo, VersionHandshakeDto, runtime_read_model_dto,
 };
 use crate::errors::ApiError;
 use crate::model_config::normalize_executable_model_provider;
@@ -27,11 +27,15 @@ use magi_conversation_runtime::{
     },
     task_runner_v2::TaskRunner,
 };
-use magi_core::{SessionId, SessionLifecycleStatus, TaskId, TaskStatus, UtcMillis, WorkspaceId};
+use magi_core::{
+    SessionId, SessionLifecycleStatus, TaskId, TaskStatus, UtcMillis, WorkspaceId,
+    WorkspaceRootPath,
+};
 use magi_event_bus::InMemoryEventBus;
 use magi_governance::GovernanceService;
 use magi_knowledge_store::KnowledgeStore;
 use magi_memory_store::MemoryStore;
+use magi_mission::{enumerate_resumable_missions, resume_mission};
 use magi_orchestrator::{
     OrchestratedExecutionRuntime, OrchestratorService,
     task_store::TaskStore,
@@ -927,13 +931,78 @@ impl ApiState {
     }
 
     pub fn runtime_read_model_dto(&self) -> RuntimeReadModelDto {
+        let mission_aggregate_exports = self.collect_mission_aggregate_exports();
         runtime_read_model_dto(
             self.event_bus.runtime_read_model_input(),
             &self.session_store.execution_sidecar_exports(),
             &self.workspace_registry.recovery_sidecar_exports(),
             self.audit_usage_ledger_dto(),
             self.task_store(),
+            &mission_aggregate_exports,
         )
+    }
+
+    /// 跨 workspace 枚举所有可恢复 mission,组装派生属性导出。
+    ///
+    /// 反孤儿:`MissionAggregate::lifecycle_phase()` / `metrics()` 在 Phase A
+    /// 落地后必须有真实消费方,本函数是 read-model 路径上的入口。
+    ///
+    /// 单点失败容错:任一 mission resume 失败(charter-draft、checkpoint 缺失等)
+    /// `warn-and-skip` 而非整体 503;debug 级日志避免污染 ops 视图。
+    pub(crate) fn collect_mission_aggregate_exports(&self) -> Vec<MissionAggregateExport> {
+        let Some(magi_home) = self
+            .runtime_persistence
+            .as_ref()
+            .and_then(|p| p.state_root().map(|r| r.to_path_buf()))
+        else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for workspace in self.workspace_registry.workspaces() {
+            let workspace_root = WorkspaceRootPath::from(workspace.root_path.as_str());
+            let mids = match enumerate_resumable_missions(&workspace_root, &magi_home) {
+                Ok(v) => v,
+                Err(err) => {
+                    tracing::warn!(
+                        workspace = %workspace.root_path.as_str(),
+                        error = %err,
+                        "enumerate_resumable_missions 失败,跳过此 workspace"
+                    );
+                    continue;
+                }
+            };
+            for mid in mids {
+                let aggregate = match resume_mission(&mid, &workspace_root, &magi_home) {
+                    Ok(a) => a,
+                    Err(err) => {
+                        tracing::debug!(
+                            mission_id = %mid.as_str(),
+                            error = %err,
+                            "resume_mission 跳过(charter-draft 等预期错误)"
+                        );
+                        continue;
+                    }
+                };
+                let lifecycle_phase = match aggregate.lifecycle_phase() {
+                    Ok(p) => p,
+                    Err(err) => {
+                        tracing::debug!(
+                            mission_id = %mid.as_str(),
+                            error = %err,
+                            "lifecycle_phase 计算失败,跳过"
+                        );
+                        continue;
+                    }
+                };
+                let metrics = aggregate.metrics().ok().flatten();
+                out.push(MissionAggregateExport {
+                    mission_id: mid.as_str().to_string(),
+                    lifecycle_phase,
+                    metrics,
+                });
+            }
+        }
+        out
     }
 
     pub fn audit_usage_ledger_dto(&self) -> AuditUsageLedgerDto {
