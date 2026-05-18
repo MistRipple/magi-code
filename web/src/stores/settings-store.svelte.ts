@@ -1017,18 +1017,18 @@ function createSettingsStore(props: { onClose?: () => void }) {
   }
 
   function getStatsDisplayKeys(): string[] {
+    // 仅展示真正“配置过”的模型：两个核心位永远在；worker 引擎需 enabled 且具备可用配置。
+    // 这样 stats tab 不会被 registry 里未启用 / 未填模型的引擎噪声污染。
     const keys = new Set<string>();
-    for (const key of Object.keys(modelStatuses)) {
-      keys.add(key);
+    keys.add("orchestrator");
+    keys.add("auxiliary");
+    for (const [workerId, config] of Object.entries(workerConfigs)) {
+      if (!workerId.trim()) continue;
+      if (config?.enabled === false) continue;
+      if (!hasUsableModelConfig(config)) continue;
+      keys.add(workerId);
     }
-    for (const item of executionStats) {
-      if (item.role === "orchestrator" || item.role === "auxiliary") {
-        keys.add(item.role);
-      } else {
-        keys.add(item.templateId || item.engineId);
-      }
-    }
-    return Array.from(keys).filter((key) => key.trim().length > 0);
+    return Array.from(keys);
   }
 
   function recomputeTokenStatsSummary() {
