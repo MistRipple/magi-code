@@ -1151,6 +1151,10 @@ fn submit_regular_session_turn(
         decision.required_workers,
     );
 
+    if created_session {
+        spawn_new_session_title_refinement(&state, &session_id, &message, &title_seed);
+    }
+
     Ok(SessionTurnResponseDto::new(
         session_id,
         entry_id,
@@ -1168,6 +1172,38 @@ fn submit_regular_session_turn(
         accepted_canonical_turn,
         accepted_canonical_item,
     ))
+}
+
+/// 新建会话时，把首条用户消息丢给辅助模型异步精修一个更易读的会话标题。
+///
+/// 辅助模型未配置或调用失败时静默跳过，placeholder 标题保留不变。
+fn spawn_new_session_title_refinement(
+    state: &ApiState,
+    session_id: &SessionId,
+    first_message: &str,
+    placeholder_title: &str,
+) {
+    let Some(client) = crate::session_title::build_auxiliary_model_client(&state.settings_store)
+    else {
+        tracing::debug!(
+            session_id = %session_id,
+            "辅助模型未配置，跳过会话标题精修"
+        );
+        return;
+    };
+    let session_store = state.session_store.clone();
+    let session_id = session_id.clone();
+    let first_message = first_message.to_string();
+    let placeholder_title = placeholder_title.to_string();
+    tokio::task::spawn_blocking(move || {
+        crate::session_title::refine_new_session_title(
+            client,
+            session_store,
+            session_id,
+            first_message,
+            placeholder_title,
+        );
+    });
 }
 
 fn spawn_regular_session_turn_execution(

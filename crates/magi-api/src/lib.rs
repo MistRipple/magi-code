@@ -7,6 +7,7 @@ mod errors;
 mod model_config;
 mod routes;
 pub(crate) mod session_continue;
+pub mod session_title;
 pub mod settings_store;
 pub mod skill_loader;
 mod snapshot_lifecycle;
