@@ -1,4 +1,4 @@
-use super::{SessionStore, with_session_message_count};
+use super::{SessionStore, cmp_sessions_newest_first, with_session_message_count};
 use crate::models::{
     ActiveExecutionChain, NotificationRecord, SessionDurableState,
     SessionExecutionSidecarStoreState, SessionProjectionInput, SessionRecord,
@@ -20,9 +20,7 @@ impl SessionStore {
 
     pub fn projection_input(&self) -> SessionProjectionInput {
         let mut state = self.export_state();
-        state
-            .sessions
-            .sort_by(|left, right| left.session_id.as_str().cmp(right.session_id.as_str()));
+        state.sessions.sort_by(cmp_sessions_newest_first);
         state.timeline.sort_by(|left, right| {
             left.occurred_at
                 .0
@@ -94,7 +92,7 @@ impl SessionStore {
     pub fn sessions(&self) -> Vec<SessionRecord> {
         let state = self.state.read().expect("session state read lock poisoned");
         let mut sessions = state.sessions.clone();
-        sessions.sort_by(|left, right| left.session_id.as_str().cmp(right.session_id.as_str()));
+        sessions.sort_by(cmp_sessions_newest_first);
         sessions
             .into_iter()
             .map(|session| with_session_message_count(session, &state.timeline))

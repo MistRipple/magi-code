@@ -80,6 +80,21 @@ fn with_session_message_count(
     session
 }
 
+/// 会话列表统一按"更新时间倒序"排序：最近活跃的会话排在最前。
+/// updated_at 相同则回退到 created_at 倒序，最后才用 session_id 倒序作为
+/// 稳定的 tie-breaker，保证测试期确定性。
+pub(crate) fn cmp_sessions_newest_first(
+    left: &SessionRecord,
+    right: &SessionRecord,
+) -> std::cmp::Ordering {
+    right
+        .updated_at
+        .0
+        .cmp(&left.updated_at.0)
+        .then_with(|| right.created_at.0.cmp(&left.created_at.0))
+        .then_with(|| right.session_id.as_str().cmp(left.session_id.as_str()))
+}
+
 impl Default for SessionStore {
     fn default() -> Self {
         Self {
@@ -195,16 +210,18 @@ impl SessionStore {
         Ok(session)
     }
 
-    /// 按 workspace_id 过滤返回会话列表
+    /// 按 workspace_id 过滤返回会话列表，按更新时间倒序排序（最近活跃在前）。
     pub fn sessions_for_workspace(&self, workspace_id: &str) -> Vec<SessionRecord> {
         let state = self.state.read().expect("session state read lock poisoned");
-        state
+        let mut sessions: Vec<SessionRecord> = state
             .sessions
             .iter()
             .filter(|s| s.workspace_id.as_deref() == Some(workspace_id))
             .cloned()
             .map(|session| with_session_message_count(session, &state.timeline))
-            .collect()
+            .collect();
+        sessions.sort_by(cmp_sessions_newest_first);
+        sessions
     }
 
     pub fn rename_session(

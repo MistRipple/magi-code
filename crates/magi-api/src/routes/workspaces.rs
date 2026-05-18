@@ -218,7 +218,7 @@ async fn workspace_sessions(
         .map(str::trim)
         .filter(|value| !value.is_empty());
 
-    let mut scoped_sessions = state
+    let scoped_sessions = state
         .session_records_for_workspace(workspace_id)
         .iter()
         .map(|session| WorkspaceSessionDto {
@@ -230,13 +230,6 @@ async fn workspace_sessions(
             message_count: session.message_count.unwrap_or(0),
         })
         .collect::<Vec<_>>();
-    scoped_sessions.sort_by(|left, right| {
-        right
-            .updated_at
-            .cmp(&left.updated_at)
-            .then_with(|| right.created_at.cmp(&left.created_at))
-            .then_with(|| right.session_id.cmp(&left.session_id))
-    });
 
     let requested_session_id = query
         .session_id
