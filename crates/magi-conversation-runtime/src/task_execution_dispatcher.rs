@@ -9,8 +9,8 @@ use crate::{
     prompt_utils::prepend_session_instructions,
     public_builtin_tool_definitions,
     session_turn_execution::{
-        SessionTurnExecutionOutput, SessionTurnExecutionRequest, SessionTurnExecutionRuntime,
-        run_session_turn_execution,
+        BUSINESS_MODEL_PROVIDER, SessionTurnExecutionOutput, SessionTurnExecutionRequest,
+        SessionTurnExecutionRuntime, run_session_turn_execution,
     },
     session_turn_finalize::{format_dependency_task_context, format_task_ref_list},
     settings_store::SettingsStore,
@@ -20,7 +20,7 @@ use crate::{
     task_runner_bridge::{EventBasedResultReceiver, TaskDispatcher, TaskOutcome, TaskResult},
     usage_recording::{ModelUsageBinding, model_usage_binding_for_worker},
 };
-use magi_bridge_client::{ChatToolDefinition, ModelBridgeClient};
+use magi_bridge_client::{ChatToolDefinition, ModelBridgeClient, ModelInvocationRequest};
 use magi_context_runtime::{
     ContextBudget, ContextRuntime, ExecutionContextAssemblyRequest, ExecutionContextClues,
 };
@@ -32,7 +32,9 @@ use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
 use magi_governance::ToolKind;
 use magi_knowledge_store::{KnowledgeKind, KnowledgeRecord, KnowledgeStore};
 use magi_lifecycle_notice::LifecycleNoticeRegistry;
-use magi_memory_store::MemoryStore;
+use magi_memory_store::{
+    ExtractedMemory, MemoryExtractionApplyRequest, MemoryLayer, MemoryStore,
+};
 use magi_mission_metrics::MissionMetricsRegistry;
 use magi_orchestrator::{
     ExecutionContextSummary, ExecutionWritebackPlans, OrchestratedExecutionRuntime,
@@ -574,6 +576,7 @@ impl LlmTaskDispatcher {
             writebacks.apply(&self.pipeline.memory_store);
             if should_extract_knowledge {
                 self.extract_and_persist_knowledge(&session_id, &workspace_id, &outcome);
+                self.extract_and_persist_session_memory(&session_id);
             }
             self.publish_execution_overview(task, &session_id, &workspace_id, context_summary);
         }
@@ -613,7 +616,16 @@ impl LlmTaskDispatcher {
             .join("\n\n");
         let output_text = output_refs.join("\n\n");
         let extraction_text = format!("{timeline_text}\n\n{output_text}");
-        let learnings = extract_learning_candidates(&extraction_text);
+        let Some(client) = self
+            .settings_store
+            .as_ref()
+            .and_then(|store| build_auxiliary_model_client(store))
+        else {
+            return;
+        };
+        let Some(learnings) = extract_learnings_via_auxiliary(client, &extraction_text) else {
+            return;
+        };
         if learnings.is_empty() {
             return;
         }
@@ -651,6 +663,109 @@ impl LlmTaskDispatcher {
                 callback();
             }
         }
+    }
+
+    /// 走辅助模型把当前会话压缩成 5 类结构化记忆（currentWork / decisions /
+    /// importantContext / pendingIssues / nextSteps）。
+    ///
+    /// 调用时机：与 `extract_and_persist_knowledge` 并列，主 action task 完成且
+    /// `writebacks` 非空时触发。配合水位线（自上一次会话记忆抽取以来累计 token
+    /// 超过 `SESSION_MEMORY_WATERLINE_TOKENS`）才真正调用 LLM，避免每轮都跑。
+    ///
+    /// 辅助模型未配置、调用失败、JSON 解析异常一律静默跳过（`tracing::debug!`），
+    /// 不做任何"退回到 marker 写回"之类的兜底 —— 与现有辅助模型路径同语义。
+    fn extract_and_persist_session_memory(&self, session_id: &SessionId) {
+        let Some(client) = self
+            .settings_store
+            .as_ref()
+            .and_then(|store| build_auxiliary_model_client(store))
+        else {
+            return;
+        };
+
+        let timeline = self.session_store.timeline_for_session(session_id);
+        let last_extraction_at = self
+            .pipeline
+            .memory_store
+            .extraction_results_for_session(session_id)
+            .into_iter()
+            .filter(|record| {
+                record
+                    .source_ref
+                    .as_deref()
+                    .is_some_and(|s| s.starts_with(SESSION_MEMORY_SOURCE_PREFIX))
+            })
+            .map(|record| record.created_at)
+            .last();
+
+        let excerpt_entries: Vec<_> = timeline
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry.kind,
+                    TimelineEntryKind::UserMessage | TimelineEntryKind::AssistantMessage
+                )
+            })
+            .filter(|entry| match last_extraction_at {
+                Some(ts) => entry.occurred_at.0 > ts.0,
+                None => true,
+            })
+            .collect();
+
+        let excerpt_text = excerpt_entries
+            .iter()
+            .filter_map(|entry| {
+                let text = timeline_entry_visible_text(&entry.message)?;
+                let prefix = match entry.kind {
+                    TimelineEntryKind::UserMessage => "用户",
+                    TimelineEntryKind::AssistantMessage => "助手",
+                    _ => "其他",
+                };
+                Some(format!("[{prefix}] {text}"))
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+
+        if excerpt_text.is_empty() {
+            return;
+        }
+        if magi_bridge_client::micro_compaction::estimate_token_count(&excerpt_text)
+            < SESSION_MEMORY_WATERLINE_TOKENS
+        {
+            return;
+        }
+
+        let Some(slices) = extract_session_memory_via_auxiliary(client, &excerpt_text) else {
+            return;
+        };
+        if slices.is_empty() {
+            return;
+        }
+
+        let now = UtcMillis::now();
+        let extraction_id = format!("extract-session-memory-{}-{}", session_id.as_str(), now.0);
+        let source_ref = format!("{SESSION_MEMORY_SOURCE_PREFIX}{}/{}", session_id.as_str(), now.0);
+        let memories = slices
+            .into_iter()
+            .enumerate()
+            .map(|(index, slice)| ExtractedMemory {
+                memory_id: format!("mem-session-memory-{}-{}-{index}", session_id.as_str(), now.0),
+                layer: MemoryLayer::Recent,
+                content: format!("[{}] {}", slice.category, slice.content),
+                created_at: now,
+            })
+            .collect::<Vec<_>>();
+
+        self.pipeline
+            .memory_store
+            .apply_extraction(MemoryExtractionApplyRequest {
+                extraction_id,
+                session_id: session_id.clone(),
+                source_ref: Some(source_ref),
+                summary: "辅助模型会话记忆抽取".to_string(),
+                memories,
+                created_at: now,
+            });
     }
 
     fn publish_execution_overview(
@@ -1330,54 +1445,179 @@ struct LearningCandidate {
     tags: Vec<String>,
 }
 
-fn extract_learning_candidates(text: &str) -> Vec<LearningCandidate> {
-    let markers = [
-        "经验",
-        "教训",
-        "结论",
-        "注意",
-        "建议",
-        "最佳实践",
-        "踩坑",
-        "坑点",
-        "要点",
-        "important",
-        "note",
-        "lesson",
-        "tip",
-        "best practice",
-    ];
-    let mut candidates = Vec::new();
-    for raw in text.lines() {
-        let line = raw
-            .trim()
-            .trim_start_matches(['-', '*', '•', '1', '2', '3', '4', '5', '.', ' '])
-            .trim();
-        if line.chars().count() < 12 || line.chars().count() > 600 {
-            continue;
+/// 会话记忆水位线（粗略 token 估算）。自上一次抽取以来新增 timeline 文本
+/// 估算 token 数超过该阈值才会触发新一轮辅助模型调用。
+const SESSION_MEMORY_WATERLINE_TOKENS: u64 = 3_000;
+const SESSION_MEMORY_SOURCE_PREFIX: &str = "session-memory://";
+
+/// 与 TS 版 `session-memory-extraction-service` 5 段契约对齐的结构化记忆切片。
+struct SessionMemorySlice {
+    category: &'static str,
+    content: String,
+}
+
+/// 利用辅助模型从会话片段中识别"经验/结论/教训"。
+///
+/// 与 `session_title::refine_new_session_title` 保持同一套约定：
+/// - 辅助模型未配置时调用方应在外层短路（缺失则不会进入本函数）。
+/// - 模型返回失败、`ok=false`、payload 非 JSON 等异常一律 `tracing::debug!`，
+///   返回 `None` 让上层跳过本轮抽取，不做任何降级到 marker 路径的回退。
+fn extract_learnings_via_auxiliary(
+    client: Arc<dyn ModelBridgeClient>,
+    text: &str,
+) -> Option<Vec<LearningCandidate>> {
+    let prompt = build_knowledge_extraction_prompt(text);
+    let request = ModelInvocationRequest {
+        provider: BUSINESS_MODEL_PROVIDER.to_string(),
+        prompt,
+        messages: None,
+        tools: None,
+        tool_choice: None,
+    };
+    let response = match client.invoke(request) {
+        Ok(resp) if resp.ok => resp,
+        Ok(resp) => {
+            tracing::debug!(payload = %resp.payload, "辅助模型 ok=false，跳过知识抽取");
+            return None;
         }
-        let lower = line.to_lowercase();
-        if !markers
-            .iter()
-            .any(|marker| lower.contains(&marker.to_lowercase()))
-        {
-            continue;
+        Err(err) => {
+            tracing::debug!(error = %err, "辅助模型调用失败，跳过知识抽取");
+            return None;
         }
-        if candidates.iter().any(|candidate: &LearningCandidate| {
-            normalized_text(&candidate.content) == normalized_text(line)
-        }) {
-            continue;
-        }
-        candidates.push(LearningCandidate {
-            content: line.to_string(),
-            context: None,
-            tags: vec!["auto".to_string(), "learning".to_string()],
-        });
-        if candidates.len() >= 5 {
-            break;
-        }
+    };
+    let payload = response.parse_chat_payload();
+    let raw = payload.content?;
+    parse_learning_candidates(&raw)
+}
+
+fn build_knowledge_extraction_prompt(text: &str) -> String {
+    format!(
+        "请从下面的会话片段中提取最多 5 条可复用的“经验/结论/教训”。\n\n\
+         输出要求：\n\
+         - 严格 JSON 数组，每项形如 {{\"content\": \"...\", \"tags\": [\"...\"]}}\n\
+         - content 必须是完整成句的一句话陈述，10-200 字之间\n\
+         - 不要复述具体的任务上下文，只保留有跨场景复用价值的结论\n\
+         - 没有可提取的内容时直接输出 []\n\
+         - 不要任何 markdown、代码块包装、解释性前后缀\n\n\
+         会话片段：\n{text}"
+    )
+}
+
+fn parse_learning_candidates(raw: &str) -> Option<Vec<LearningCandidate>> {
+    #[derive(serde::Deserialize)]
+    struct Wire {
+        content: String,
+        #[serde(default)]
+        tags: Vec<String>,
     }
-    candidates
+    let trimmed = raw.trim();
+    let list: Vec<Wire> = serde_json::from_str(trimmed).ok()?;
+    let mut out = Vec::new();
+    for item in list.into_iter().take(5) {
+        let cnt = item.content.chars().count();
+        if !(10..=600).contains(&cnt) {
+            continue;
+        }
+        let mut tags = item.tags;
+        tags.push("auto".to_string());
+        tags.push("learning".to_string());
+        out.push(LearningCandidate {
+            content: item.content,
+            context: None,
+            tags,
+        });
+    }
+    if out.is_empty() { None } else { Some(out) }
+}
+
+/// 调用辅助模型生成 5 类会话记忆切片。
+///
+/// 调用约定与 `extract_learnings_via_auxiliary` 一致：失败 / `ok=false` /
+/// JSON 解析异常一律 `tracing::debug!` 后返回 `None`。调用方需先确保辅助模型
+/// 已配置（外层使用 `build_auxiliary_model_client` 短路）。
+fn extract_session_memory_via_auxiliary(
+    client: Arc<dyn ModelBridgeClient>,
+    text: &str,
+) -> Option<Vec<SessionMemorySlice>> {
+    let prompt = build_session_memory_prompt(text);
+    let request = ModelInvocationRequest {
+        provider: BUSINESS_MODEL_PROVIDER.to_string(),
+        prompt,
+        messages: None,
+        tools: None,
+        tool_choice: None,
+    };
+    let response = match client.invoke(request) {
+        Ok(resp) if resp.ok => resp,
+        Ok(resp) => {
+            tracing::debug!(payload = %resp.payload, "辅助模型 ok=false，跳过会话记忆抽取");
+            return None;
+        }
+        Err(err) => {
+            tracing::debug!(error = %err, "辅助模型调用失败，跳过会话记忆抽取");
+            return None;
+        }
+    };
+    let payload = response.parse_chat_payload();
+    let raw = payload.content?;
+    parse_session_memory_slices(&raw)
+}
+
+fn build_session_memory_prompt(text: &str) -> String {
+    format!(
+        "请把下面这段会话压缩成 5 类结构化记忆，便于在后续轮次复用。\n\n\
+         输出要求：\n\
+         - 严格 JSON 对象，键固定为：currentWork、decisions、importantContext、pendingIssues、nextSteps\n\
+         - 每个键的值是一句完整中文陈述，30-300 字之间；没有可写内容时填空字符串\n\
+         - currentWork：当前正在做的事 / 当前焦点\n\
+         - decisions：本段已确定的关键决策或结论\n\
+         - importantContext：影响后续判断的重要背景（约束、偏好、外部事实）\n\
+         - pendingIssues：尚未解决或仍存疑的问题\n\
+         - nextSteps：下一步明确动作\n\
+         - 不要复述完整对话，提炼能跨轮使用的信号即可\n\
+         - 不要任何 markdown、代码块包装、解释性前后缀\n\n\
+         会话片段：\n{text}"
+    )
+}
+
+fn parse_session_memory_slices(raw: &str) -> Option<Vec<SessionMemorySlice>> {
+    #[derive(serde::Deserialize)]
+    struct Wire {
+        #[serde(default, rename = "currentWork")]
+        current_work: String,
+        #[serde(default)]
+        decisions: String,
+        #[serde(default, rename = "importantContext")]
+        important_context: String,
+        #[serde(default, rename = "pendingIssues")]
+        pending_issues: String,
+        #[serde(default, rename = "nextSteps")]
+        next_steps: String,
+    }
+    let wire: Wire = serde_json::from_str(raw.trim()).ok()?;
+    let candidates: [(&'static str, String); 5] = [
+        ("currentWork", wire.current_work),
+        ("decisions", wire.decisions),
+        ("importantContext", wire.important_context),
+        ("pendingIssues", wire.pending_issues),
+        ("nextSteps", wire.next_steps),
+    ];
+    let mut out = Vec::with_capacity(5);
+    for (category, content) in candidates {
+        let trimmed = content.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let len = trimmed.chars().count();
+        if !(10..=600).contains(&len) {
+            continue;
+        }
+        out.push(SessionMemorySlice {
+            category,
+            content: trimmed.to_string(),
+        });
+    }
+    if out.is_empty() { None } else { Some(out) }
 }
 
 fn normalized_text(text: &str) -> String {
@@ -1510,6 +1750,107 @@ mod tests {
             Some(&registry),
             BuiltinToolName::AgentSpawn
         ));
+    }
+
+    #[test]
+    fn parse_learning_candidates_accepts_well_formed_array() {
+        let raw = r#"[
+            {"content": "在 magi 中辅助模型必须配置 base_url 才会启用", "tags": ["config"]},
+            {"content": "extract_learnings_via_auxiliary 失败时直接跳过，不退化", "tags": []}
+        ]"#;
+        let result = parse_learning_candidates(raw).expect("应解析成功");
+        assert_eq!(result.len(), 2);
+        assert!(result[0].tags.iter().any(|t| t == "auto"));
+        assert!(result[0].tags.iter().any(|t| t == "learning"));
+    }
+
+    #[test]
+    fn parse_learning_candidates_drops_out_of_range_content() {
+        let raw = r#"[
+            {"content": "太短", "tags": []},
+            {"content": "在 magi 中辅助模型必须配置 base_url 才会启用", "tags": []}
+        ]"#;
+        let result = parse_learning_candidates(raw).expect("仍有一项命中");
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn parse_learning_candidates_returns_none_when_all_filtered() {
+        let raw = r#"[{"content": "短", "tags": []}]"#;
+        assert!(parse_learning_candidates(raw).is_none());
+    }
+
+    #[test]
+    fn parse_learning_candidates_rejects_non_json_payload() {
+        let raw = "这不是 JSON，模型胡乱输出";
+        assert!(parse_learning_candidates(raw).is_none());
+    }
+
+    #[test]
+    fn parse_learning_candidates_caps_at_five_items() {
+        let mut parts = Vec::new();
+        for i in 0..8 {
+            parts.push(format!(
+                r#"{{"content": "条目编号 {i}：这是一条长度足够的占位内容用于通过过滤", "tags": []}}"#
+            ));
+        }
+        let raw = format!("[{}]", parts.join(","));
+        let result = parse_learning_candidates(&raw).expect("应解析成功");
+        assert_eq!(result.len(), 5);
+    }
+
+    #[test]
+    fn parse_session_memory_slices_accepts_full_object() {
+        let raw = r#"{
+            "currentWork": "正在收敛辅助模型介入路径，把会话记忆抽取并入主流程",
+            "decisions": "决定复用现有 MemoryStore.apply_extraction 落库，不新增 schema",
+            "importantContext": "用户强调 cn-engineering-standard，不允许并行实现或兜底",
+            "pendingIssues": "Prompt 增强和配置错位修复尚未启动，会在后续两步中处理",
+            "nextSteps": "先跑 cargo check 验证，再切入 B 步骤的 Prompt 增强路径"
+        }"#;
+        let result = parse_session_memory_slices(raw).expect("应解析成功");
+        let categories: Vec<&str> = result.iter().map(|s| s.category).collect();
+        assert_eq!(
+            categories,
+            vec![
+                "currentWork",
+                "decisions",
+                "importantContext",
+                "pendingIssues",
+                "nextSteps"
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_session_memory_slices_skips_empty_or_short_categories() {
+        let raw = r#"{
+            "currentWork": "正在调试会话记忆水位线触发的核心条件，避免每轮都跑",
+            "decisions": "",
+            "importantContext": "短",
+            "pendingIssues": "保留与 TS 版 5 段契约一致，便于未来跨端共用提示词",
+            "nextSteps": ""
+        }"#;
+        let result = parse_session_memory_slices(raw).expect("仍有命中");
+        let categories: Vec<&str> = result.iter().map(|s| s.category).collect();
+        assert_eq!(categories, vec!["currentWork", "pendingIssues"]);
+    }
+
+    #[test]
+    fn parse_session_memory_slices_rejects_non_json_payload() {
+        assert!(parse_session_memory_slices("not json at all").is_none());
+    }
+
+    #[test]
+    fn parse_session_memory_slices_returns_none_when_all_filtered() {
+        let raw = r#"{
+            "currentWork": "",
+            "decisions": "短",
+            "importantContext": "",
+            "pendingIssues": "",
+            "nextSteps": ""
+        }"#;
+        assert!(parse_session_memory_slices(raw).is_none());
     }
 }
 

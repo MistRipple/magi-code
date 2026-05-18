@@ -59,13 +59,13 @@ impl UnavailableBusinessModelBridgeClient {
     }
 
     fn error(&self) -> magi_bridge_client::BridgeClientError {
+        let _ = &self.state_root; // 保留 state_root 字段以便后续扩展定位提示。
         magi_bridge_client::BridgeClientError::CallFailed {
             layer: magi_bridge_client::BridgeErrorLayer::RemoteBusiness,
             code: Some(-32004),
-            message: format!(
-                "业务模型桥未配置:请在环境变量 MAGI_OPENAI_COMPAT_BASE_URL 或 {}/settings.json 的 auxiliary 段配置 baseUrl",
-                self.state_root.display()
-            ),
+            message:
+                "业务模型桥未配置：请通过环境变量 MAGI_OPENAI_COMPAT_BASE_URL / MAGI_OPENAI_COMPAT_API_KEY / MAGI_OPENAI_COMPAT_MODEL 配置业务模型；settings.json 的 auxiliary 段仅用于辅助模型（标题精修 / 知识抽取 / 会话记忆 / Prompt 增强）。"
+                    .to_string(),
         }
     }
 }
@@ -90,19 +90,16 @@ impl magi_bridge_client::ModelBridgeClient for UnavailableBusinessModelBridgeCli
 #[derive(Clone)]
 struct SettingsBackedBusinessModelBridgeClient {
     state_root: PathBuf,
-    settings_store: Arc<SettingsStore>,
     bridge_env: Vec<(String, String)>,
 }
 
 impl SettingsBackedBusinessModelBridgeClient {
     fn new(
         state_root: PathBuf,
-        settings_store: Arc<SettingsStore>,
         bridge_env: &[(&str, &str)],
     ) -> Self {
         Self {
             state_root,
-            settings_store,
             bridge_env: bridge_env
                 .iter()
                 .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
@@ -116,7 +113,7 @@ impl SettingsBackedBusinessModelBridgeClient {
             .iter()
             .map(|(key, value)| (key.as_str(), value.as_str()))
             .collect::<Vec<_>>();
-        DaemonRuntime::try_build_http_model_client(&bridge_env, self.settings_store.as_ref())
+        DaemonRuntime::try_build_http_model_client(&bridge_env)
             .map(|(client, _)| client)
             .ok_or_else(|| {
                 UnavailableBusinessModelBridgeClient::new(self.state_root.clone()).error()
@@ -448,13 +445,14 @@ impl DaemonRuntime {
         }
 
         // 业务模型桥用于会话正文生成和任务执行；任务规划/分类另走本地 loopback-model。
-        // 业务模型配置来源优先级: bridge_env override → 进程 env → settings.json auxiliary 段。
-        // settings 是运行时可编辑的产品配置，业务调用必须按次读取，避免保存后仍使用启动快照。
+        // 业务模型配置来源仅两类：bridge_env override（测试） → 进程 env（MAGI_OPENAI_COMPAT_*）。
+        // 不再读 settings.json 的 auxiliary 段 —— aux 段是辅助模型专用配置（会话标题、
+        // 知识抽取、会话记忆、Prompt 增强），两条路径不复用同一份字段以杜绝配置错位。
         // 测试场景下允许通过 model_bridge_override 注入业务模型 stub。
         let direct_http_probe_result = if model_bridge_override.is_some() {
             None
         } else {
-            Self::try_build_http_model_client(bridge_env, settings_store.as_ref())
+            Self::try_build_http_model_client(bridge_env)
         };
         let direct_http_probe_config = direct_http_probe_result
             .as_ref()
@@ -472,7 +470,6 @@ impl DaemonRuntime {
                     if direct_http_probe_result.is_some() {
                         Arc::new(SettingsBackedBusinessModelBridgeClient::new(
                             self.state_root.clone(),
-                            settings_store.clone(),
                             bridge_env,
                         ))
                     } else {
@@ -913,27 +910,19 @@ impl DaemonRuntime {
 
     /// Build an `HttpModelBridgeClient` from configuration.
     ///
-    /// 配置来源优先级:
-    /// 1. `bridge_env` overrides (测试场景)
-    /// 2. 进程级 env (`MAGI_OPENAI_COMPAT_*`)
-    /// 3. `settings.json` 的 `auxiliary` 段(生产配置)
+    /// 业务模型配置来源（仅这两类，按优先级）：
+    /// 1. `bridge_env` overrides（测试场景注入）
+    /// 2. 进程级 env（`MAGI_OPENAI_COMPAT_*`）
     ///
-    /// 任一字段(baseUrl/apiKey/model/protocol)按上述顺序解析,允许跨源混合。
+    /// **不再回退**读 `settings.json` 的 `auxiliary` 段 —— aux 段是辅助模型专用配置，
+    /// 业务模型与辅助模型混读同一份字段会造成"改 aux 设置静默切换业务模型"的
+    /// 配置错位。业务模型未配置时返回 `None`，调用方应据此走 unavailable-client 提示。
     ///
     /// Returns the client together with a [`DirectHttpModelProbeConfig`] that
     /// the cutover-smoke provider can use for its own independent probe.
     fn try_build_http_model_client(
         bridge_env: &[(&str, &str)],
-        settings_store: &SettingsStore,
     ) -> Option<(HttpModelBridgeClient, DirectHttpModelProbeConfig)> {
-        let auxiliary = settings_store.get_section("auxiliary");
-        let aux_string = |field: &str| -> Option<String> {
-            auxiliary
-                .get(field)
-                .and_then(|v| v.as_str())
-                .map(|v| v.trim().to_string())
-                .filter(|v| !v.is_empty())
-        };
         let find_env = |key: &str| -> Option<String> {
             bridge_env
                 .iter()
@@ -948,15 +937,10 @@ impl DaemonRuntime {
                 })
         };
 
-        let base_url = find_env("MAGI_OPENAI_COMPAT_BASE_URL").or_else(|| aux_string("baseUrl"))?;
-        let api_key = find_env("MAGI_OPENAI_COMPAT_API_KEY").or_else(|| aux_string("apiKey"));
-        let model = find_env("MAGI_OPENAI_COMPAT_MODEL")
-            .or_else(|| aux_string("model"))
-            .unwrap_or_else(|| "gpt-4".to_string());
-        let protocol = match find_env("MAGI_OPENAI_COMPAT_PROTOCOL")
-            .or_else(|| aux_string("openaiProtocol"))
-            .as_deref()
-        {
+        let base_url = find_env("MAGI_OPENAI_COMPAT_BASE_URL")?;
+        let api_key = find_env("MAGI_OPENAI_COMPAT_API_KEY");
+        let model = find_env("MAGI_OPENAI_COMPAT_MODEL").unwrap_or_else(|| "gpt-4".to_string());
+        let protocol = match find_env("MAGI_OPENAI_COMPAT_PROTOCOL").as_deref() {
             Some("responses") => HttpModelBridgeProtocol::Responses,
             _ => HttpModelBridgeProtocol::ChatCompletions,
         };
@@ -1190,74 +1174,6 @@ mod tests {
                 .expect("response body should read"),
         )
         .expect("response should be valid json")
-    }
-
-    #[tokio::test]
-    async fn business_model_client_reads_latest_auxiliary_settings_per_call() {
-        let (base_url, receiver, handle) = spawn_http_stub_multi(
-            200,
-            json!({
-                "choices": [{
-                    "message": {
-                        "content": "hello from updated settings"
-                    }
-                }]
-            }),
-            1,
-        );
-
-        let state_root = temp_state_root("business-model-live-settings");
-        fs::write(
-            state_root.join("settings.json"),
-            json!({
-                "auxiliary": {
-                    "baseUrl": base_url,
-                    "apiKey": "test-key",
-                    "model": "stale-model",
-                    "provider": "openai",
-                    "openaiProtocol": "chat",
-                    "urlMode": "standard"
-                }
-            })
-            .to_string(),
-        )
-        .expect("settings should write");
-        let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
-        let runtime =
-            DaemonRuntime::restore(&config).expect("runtime restore should load settings");
-        let (_app, state) =
-            runtime.router_with_bridge_env_for_tests("daemon-test".to_string(), &[]);
-
-        state.settings_store.set_section(
-            "auxiliary",
-            json!({
-                "baseUrl": base_url,
-                "apiKey": "test-key",
-                "model": "fresh-model",
-                "provider": "openai",
-                "openaiProtocol": "chat",
-                "urlMode": "standard"
-            }),
-        );
-        let response = state
-            .model_bridge_client()
-            .expect("business model client should be configured")
-            .invoke(magi_bridge_client::ModelInvocationRequest {
-                provider: "openai-compatible".to_string(),
-                prompt: "hello".to_string(),
-                messages: None,
-                tools: None,
-                tool_choice: None,
-            })
-            .expect("updated settings-backed model call should succeed");
-
-        assert!(response.payload.contains("hello from updated settings"));
-        let request = receiver
-            .recv_timeout(Duration::from_secs(5))
-            .expect("http stub should receive request");
-        handle.join().expect("http stub should join");
-        let body: Value = serde_json::from_str(&request.body).expect("request body should be json");
-        assert_eq!(body["model"], "fresh-model");
     }
 
     async fn get_task_projection(app: axum::Router, root_task_id: &str, session_id: &str) -> Value {

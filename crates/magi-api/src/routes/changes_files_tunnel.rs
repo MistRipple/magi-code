@@ -7,7 +7,9 @@ use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use magi_bridge_client::{LOOPBACK_MODEL_PROVIDER, ModelInvocationRequest};
+use magi_bridge_client::ModelInvocationRequest;
+use magi_conversation_runtime::session_turn_execution::BUSINESS_MODEL_PROVIDER;
+use magi_conversation_runtime::task_execution_dispatcher::build_auxiliary_model_client;
 use magi_core::SessionId;
 use magi_snapshot::SnapshotSession;
 
@@ -571,14 +573,14 @@ async fn enhance_prompt(
     State(state): State<ApiState>,
     Json(request): Json<EnhancePromptRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let Some(client) = state.model_bridge_client() else {
+    let Some(client) = build_auxiliary_model_client(&state.settings_store) else {
         return Err(ApiError::InvalidInput(
-            "当前未配置可用模型，无法增强提示词".to_string(),
+            "辅助模型未配置，无法增强提示词；请在设置中配置 auxiliary 模型".to_string(),
         ));
     };
 
     let invocation = ModelInvocationRequest {
-        provider: LOOPBACK_MODEL_PROVIDER.to_string(),
+        provider: BUSINESS_MODEL_PROVIDER.to_string(),
         prompt: format!(
             "请优化以下用户 prompt，使其更清晰、具体、可执行。只输出优化后的 prompt，不要添加额外解释。\n\n原始 prompt:\n{}",
             request.prompt
@@ -588,13 +590,30 @@ async fn enhance_prompt(
         tool_choice: None,
     };
 
-    match client.invoke(invocation) {
-        Ok(response) if response.ok => Ok(Json(serde_json::json!({
-            "enhancedPrompt": response.payload.trim(),
-        }))),
-        Ok(response) => Err(ApiError::InvalidInput(response.payload.trim().to_string())),
-        Err(error) => Err(ApiError::InvalidInput(format!("增强提示词失败: {error}"))),
-    }
+    let response = match client.invoke(invocation) {
+        Ok(resp) if resp.ok => resp,
+        Ok(resp) => {
+            return Err(ApiError::InvalidInput(format!(
+                "辅助模型返回失败: {}",
+                resp.payload.trim()
+            )));
+        }
+        Err(error) => {
+            return Err(ApiError::InvalidInput(format!("辅助模型调用失败: {error}")));
+        }
+    };
+
+    let payload = response.parse_chat_payload();
+    let Some(content) = payload.content.map(|c| c.trim().to_string()).filter(|c| !c.is_empty())
+    else {
+        return Err(ApiError::InvalidInput(
+            "辅助模型返回内容为空".to_string(),
+        ));
+    };
+
+    Ok(Json(serde_json::json!({
+        "enhancedPrompt": content,
+    })))
 }
 
 #[cfg(test)]

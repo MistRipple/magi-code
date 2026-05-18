@@ -1,5 +1,4 @@
 mod budgeting;
-pub mod context_auxiliary;
 mod execution_context;
 pub mod layered_memory_store;
 pub mod memory_document;
