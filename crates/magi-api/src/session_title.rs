@@ -1,7 +1,8 @@
 //! 新会话标题精修：利用辅助模型对会话首条消息进行理解后生成标题。
 //!
 //! 设计目标
-//! - 复用现有 `auxiliary` 配置：构建客户端走 `NormalizedModelConfig::to_http_model_client`，
+//! - 复用现有 `auxiliary` 配置：客户端构造统一走
+//!   [`magi_conversation_runtime::task_execution_dispatcher::build_auxiliary_model_client`]，
 //!   未配置辅助模型时静默跳过，绝不退化到业务模型，避免在标题这种低价值任务上消耗主模型配额。
 //! - 单一写入点：标题改名通过 `session_store.rename_session`，沿用既有 timeline / lifecycle 通路。
 //! - 安全栅栏：异步精修期间若用户已手动改名 / charter 写入了标题，会留下与 placeholder 不一致的
@@ -11,37 +12,14 @@
 use std::sync::Arc;
 
 use magi_bridge_client::{ModelBridgeClient, ModelInvocationRequest};
-use magi_conversation_runtime::model_config::NormalizedModelConfig;
 use magi_conversation_runtime::session_turn_execution::BUSINESS_MODEL_PROVIDER;
 use magi_core::SessionId;
 use magi_session_store::SessionStore;
 
-use crate::settings_store::SettingsStore;
-
-/// 辅助模型 provider section key（settings 中的归一化字段名）。
-const AUXILIARY_SECTION: &str = "auxiliary";
-/// `NormalizedModelConfig::from_settings_value` 在 settings 未指定 provider 时使用的默认值。
-const DEFAULT_NORMALIZED_PROVIDER: &str = "openai";
-/// `NormalizedModelConfig::to_http_model_client` 在 settings 未指定 model 时使用的兜底模型名。
-const DEFAULT_TITLE_MODEL: &str = "gpt-4";
 /// 辅助模型返回内容若超过该字符数则视为越权输出（多半是直接把整段消息回吐），直接丢弃。
 const TITLE_MAX_CHARS: usize = 40;
 /// 用户首条消息字符数若不超过该阈值，本身已经足够当占位标题，不再发起精修。
 const SKIP_REFINE_MIN_CHARS: usize = 4;
-
-/// 从 settings 中按 `auxiliary` 段构建辅助模型客户端。
-///
-/// 未配置（缺 base_url 或缺 api_key）时返回 `None`，调用方应据此跳过精修。
-pub fn build_auxiliary_model_client(
-    settings_store: &Arc<SettingsStore>,
-) -> Option<Arc<dyn ModelBridgeClient>> {
-    let config = settings_store.get_section(AUXILIARY_SECTION);
-    let normalized =
-        NormalizedModelConfig::from_settings_value(&config, DEFAULT_NORMALIZED_PROVIDER);
-    normalized
-        .to_http_model_client(DEFAULT_TITLE_MODEL)
-        .map(|client| Arc::new(client) as Arc<dyn ModelBridgeClient>)
-}
 
 /// 同步执行一次会话标题精修。
 ///

@@ -1183,7 +1183,10 @@ fn spawn_new_session_title_refinement(
     first_message: &str,
     placeholder_title: &str,
 ) {
-    let Some(client) = crate::session_title::build_auxiliary_model_client(&state.settings_store)
+    let Some(client) =
+        magi_conversation_runtime::task_execution_dispatcher::build_auxiliary_model_client(
+            &state.settings_store,
+        )
     else {
         tracing::debug!(
             session_id = %session_id,

@@ -129,13 +129,26 @@ pub fn resolve_configured_model_client(
     default_client: Option<Arc<dyn ModelBridgeClient>>,
 ) -> Option<Arc<dyn ModelBridgeClient>> {
     if let Some(store) = settings_store {
-        let config = store.get_section("auxiliary");
-        let normalized = NormalizedModelConfig::from_settings_value(&config, "openai");
-        if let Some(client) = normalized.to_http_model_client("gpt-4") {
-            return Some(Arc::new(client));
+        if let Some(client) = build_auxiliary_model_client(store) {
+            return Some(client);
         }
     }
     default_client
+}
+
+/// 按 `auxiliary` 配置段构造 HTTP 模型客户端的统一入口。
+///
+/// 未配置（缺 base_url 或缺 api_key）时返回 `None`，调用方应据此决定回退策略。
+/// 业务派发走 [`resolve_configured_model_client`]（缺失时退回默认 client），
+/// 会话标题精修等"低价值"任务则直接消费该返回值，缺失则静默跳过。
+pub fn build_auxiliary_model_client(
+    settings_store: &Arc<SettingsStore>,
+) -> Option<Arc<dyn ModelBridgeClient>> {
+    let config = settings_store.get_section("auxiliary");
+    let normalized = NormalizedModelConfig::from_settings_value(&config, "openai");
+    normalized
+        .to_http_model_client("gpt-4")
+        .map(|client| Arc::new(client) as Arc<dyn ModelBridgeClient>)
 }
 
 impl LlmTaskDispatcher {
