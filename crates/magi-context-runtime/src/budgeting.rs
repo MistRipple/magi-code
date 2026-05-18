@@ -115,21 +115,24 @@ fn select_memory(
     mut memory_query: MemoryQuery,
 ) -> (Vec<MemoryRecord>, Option<TruncationRecord>) {
     memory_query.limit = budget.max_memory.min(memory_query.limit);
-    let all_memory = runtime.memory_store.query(&MemoryQuery {
+    // memory_store.query 默认按 created_at ASC 排序——直接 take(N) 会拿到最旧的记忆，
+    // 与"会话记忆越近越重要"的产品语义相反。这里改为：从全量里拿最新 N 条，
+    // 再按时间正序投放，最终 prompt 内的记忆按"旧→新"展开，符合 LLM 阅读直觉。
+    let mut all_memory = runtime.memory_store.query(&MemoryQuery {
         limit: usize::MAX,
         ..memory_query.clone()
     });
     let all_memory_count = all_memory.len();
-    let selected_memory = all_memory
-        .into_iter()
-        .take(memory_query.limit)
-        .collect::<Vec<_>>();
+    if all_memory_count > memory_query.limit {
+        let drop_count = all_memory_count - memory_query.limit;
+        all_memory.drain(..drop_count);
+    }
     let memory_truncation = (all_memory_count > memory_query.limit).then_some(TruncationRecord {
         part: "memory".to_string(),
         original_count: all_memory_count,
-        retained_count: selected_memory.len(),
+        retained_count: all_memory.len(),
     });
-    (selected_memory, memory_truncation)
+    (all_memory, memory_truncation)
 }
 
 fn select_limited<T>(

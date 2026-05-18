@@ -561,19 +561,23 @@ impl DaemonRuntime {
             }
         };
         self.reconcile_stale_session_task_chains(task_store.as_ref());
+        // 单一事实源：dispatch summary（execution_runtime）与 prompt 注入（LlmTaskDispatcher）
+        // 使用同一份 ContextBudget。max_memory ≥ 一批 session-memory 的 slice 数（=5），
+        // 否则辅助模型提取的 5 条 slice 会被预算切断、只投放前两条进 prompt。
+        let context_budget = ContextBudget {
+            max_turns: 8,
+            max_knowledge: 6,
+            max_memory: 8,
+            max_shared_items: 4,
+            max_file_summaries: 4,
+        };
         let execution_runtime = orchestrator
             .execution_runtime(worker_runtime.clone(), tool_registry, skill_runtime)
             .with_task_store(Arc::clone(&task_store))
             .with_context_runtime(
                 context_runtime,
                 ExecutionContextConfig {
-                    budget: ContextBudget {
-                        max_turns: 8,
-                        max_knowledge: 6,
-                        max_memory: 6,
-                        max_shared_items: 4,
-                        max_file_summaries: 4,
-                    },
+                    budget: context_budget.clone(),
                     project_key: None,
                 },
             );
@@ -639,6 +643,7 @@ impl DaemonRuntime {
                 .with_knowledge_persist_callback(knowledge_persist_callback)
                 .with_settings_store(state.settings_store.clone())
                 .with_context_runtime(context_runtime_for_dispatcher)
+                .with_context_budget(context_budget.clone())
                 .with_workspace_registry(state.workspace_registry.clone())
                 .with_tool_registry(tool_registry_for_dispatcher)
                 .with_skill_runtime(app_skill_runtime)

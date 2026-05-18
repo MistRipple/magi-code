@@ -1315,9 +1315,9 @@ mod tests {
             },
         );
 
-        // 2 durable records exist, budget allows 1 → truncated
+        // 2 durable records exist, budget allows 1 → truncated；按"最新优先"语义保留较新的一条
         assert_eq!(result.selected_memory.len(), 1);
-        assert_eq!(result.selected_memory[0].memory_id, "mem-durable-1");
+        assert_eq!(result.selected_memory[0].memory_id, "mem-durable-2");
         assert_eq!(
             result.selected_memory[0].layer,
             magi_memory_store::MemoryLayer::Durable

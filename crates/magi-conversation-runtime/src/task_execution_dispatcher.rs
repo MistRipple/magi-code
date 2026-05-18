@@ -64,6 +64,10 @@ pub struct LlmTaskDispatcher {
     knowledge_persist_callback: Option<Arc<dyn Fn() + Send + Sync>>,
     settings_store: Option<Arc<SettingsStore>>,
     context_runtime: Option<Arc<ContextRuntime>>,
+    /// 由 daemon bootstrap 注入的上下文预算，决定每轮 Turn 装配 prompt 时记忆 / 知识 /
+    /// shared context 各最多取多少条。未注入时退回 [`fallback_context_budget`]，便于
+    /// 在测试和最小依赖场景下仍可工作；生产环境 daemon 必须显式注入以保持单一事实源。
+    context_budget: Option<ContextBudget>,
     workspace_registry: Option<Arc<WorkspaceStore>>,
     tool_registry: Option<ToolRegistry>,
     skill_runtime: Option<Arc<magi_skill_runtime::SkillRuntime>>,
@@ -153,6 +157,20 @@ pub fn build_auxiliary_model_client(
         .map(|client| Arc::new(client) as Arc<dyn ModelBridgeClient>)
 }
 
+/// daemon 未注入 [`ContextBudget`] 时的兜底预算。
+///
+/// `max_memory` 必须 ≥ 一批 session-memory 的 slice 数（当前 5），否则会出现
+/// "辅助模型提取了 5 条会话记忆，预算却只放 2 条进 prompt"的设计错位。
+fn fallback_context_budget() -> ContextBudget {
+    ContextBudget {
+        max_turns: 8,
+        max_knowledge: 6,
+        max_memory: 8,
+        max_shared_items: 4,
+        max_file_summaries: 4,
+    }
+}
+
 impl LlmTaskDispatcher {
     pub fn new(
         event_bus: Arc<InMemoryEventBus>,
@@ -173,6 +191,7 @@ impl LlmTaskDispatcher {
             knowledge_persist_callback: None,
             settings_store: None,
             context_runtime: None,
+            context_budget: None,
             workspace_registry: None,
             tool_registry: None,
             skill_runtime: None,
@@ -240,6 +259,13 @@ impl LlmTaskDispatcher {
 
     pub fn with_context_runtime(mut self, runtime: Arc<ContextRuntime>) -> Self {
         self.context_runtime = Some(runtime);
+        self
+    }
+
+    /// 注入 daemon 配置的 [`ContextBudget`]。dispatch summary 与 prompt 注入两条路径必须
+    /// 使用同一份预算，避免"UI 看到 6 条候选、实际只投放 2 条"这类分裂。
+    pub fn with_context_budget(mut self, budget: ContextBudget) -> Self {
+        self.context_budget = Some(budget);
         self
     }
 
@@ -934,13 +960,10 @@ impl LlmTaskDispatcher {
                 assignment: None,
                 task: Some(task.goal.clone()),
             },
-            budget: ContextBudget {
-                max_turns: 3,
-                max_knowledge: 3,
-                max_memory: 2,
-                max_shared_items: 1,
-                max_file_summaries: 2,
-            },
+            budget: self
+                .context_budget
+                .clone()
+                .unwrap_or_else(fallback_context_budget),
         });
         let has_context = !result.selected_knowledge.is_empty()
             || !result.selected_memory.is_empty()
