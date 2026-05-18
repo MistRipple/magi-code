@@ -1034,8 +1034,10 @@ dependencies = [
  "magi-human-checkpoint",
  "magi-knowledge-graph",
  "magi-knowledge-store",
+ "magi-lifecycle-notice",
  "magi-memory-store",
  "magi-mission-charter",
+ "magi-mission-metrics",
  "magi-mission-workspace",
  "magi-orchestrator",
  "magi-permissions",
@@ -1081,9 +1083,11 @@ dependencies = [
  "magi-event-bus",
  "magi-governance",
  "magi-knowledge-store",
+ "magi-lifecycle-notice",
  "magi-memory-store",
  "magi-mission",
  "magi-mission-charter",
+ "magi-mission-metrics",
  "magi-orchestrator",
  "magi-plan",
  "magi-session-store",
@@ -1171,6 +1175,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "magi-lifecycle-notice"
+version = "0.1.0"
+dependencies = [
+ "magi-core",
+ "magi-event-bus",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "magi-memory-store"
 version = "0.1.0"
 dependencies = [
@@ -1187,6 +1204,7 @@ dependencies = [
  "magi-human-checkpoint",
  "magi-knowledge-graph",
  "magi-mission-charter",
+ "magi-mission-metrics",
  "magi-mission-workspace",
  "magi-plan",
  "magi-validation-runner",
@@ -1206,6 +1224,17 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tracing",
+]
+
+[[package]]
+name = "magi-mission-metrics"
+version = "0.1.0"
+dependencies = [
+ "magi-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]

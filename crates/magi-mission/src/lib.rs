@@ -18,12 +18,13 @@
 use std::path::{Path, PathBuf};
 
 use magi_checkpoint::{Checkpoint, CheckpointLog, CheckpointStore, MissingRecoverySetReason};
-use magi_core::{MissionId, WorkspaceRootPath};
+use magi_core::{MissionId, MissionLifecyclePhase, WorkspaceRootPath};
 use magi_human_checkpoint::{HumanCheckpointLog, HumanCheckpointStore};
 use magi_knowledge_graph::{KnowledgeGraph, KnowledgeGraphStore};
 use magi_mission_charter::{MissionCharter, MissionCharterStore};
+use magi_mission_metrics::{MissionMetrics, MissionMetricsError, MissionMetricsStore};
 use magi_mission_workspace::{MissionWorkspace, MissionWorkspaceStore};
-use magi_plan::{Plan, PlanStore};
+use magi_plan::{Plan, PlanStepStatus, PlanStore};
 use magi_validation_runner::{ValidationReport, ValidationStore};
 use thiserror::Error;
 
@@ -36,6 +37,7 @@ pub enum StoreKind {
     Workspace,
     Checkpoint,
     HumanCheckpoint,
+    Metrics,
 }
 
 impl std::fmt::Display for StoreKind {
@@ -48,6 +50,7 @@ impl std::fmt::Display for StoreKind {
             Self::Workspace => "workspace",
             Self::Checkpoint => "checkpoint",
             Self::HumanCheckpoint => "human_checkpoint",
+            Self::Metrics => "metrics",
         };
         f.write_str(s)
     }
@@ -87,6 +90,13 @@ impl MissionResumeError {
     {
         Self::StoreError {
             which,
+            source: Box::new(err),
+        }
+    }
+
+    fn from_metrics(err: MissionMetricsError) -> Self {
+        Self::StoreError {
+            which: StoreKind::Metrics,
             source: Box::new(err),
         }
     }
@@ -181,6 +191,62 @@ impl MissionAggregate {
         let store = MissionWorkspaceStore::open_with_home(&self.magi_home, &self.workspace_root)
             .map_err(|e| MissionResumeError::from_store(StoreKind::Workspace, e))?;
         Ok(store.locate(&self.mission_id))
+    }
+
+    /// mission 累计 metrics（turn 数 / token / wall-clock）。
+    /// 第一次记账前文件不存在，返回 `Ok(None)`，由调用方决定如何展示。
+    pub fn metrics(&self) -> Result<Option<MissionMetrics>, MissionResumeError> {
+        let store = MissionMetricsStore::open_with_home(&self.magi_home, &self.workspace_root)
+            .map_err(MissionResumeError::from_metrics)?;
+        store
+            .load(&self.mission_id)
+            .map_err(MissionResumeError::from_metrics)
+    }
+
+    /// 派生当前 mission 所处的生命周期阶段。
+    ///
+    /// 仅基于已加载/可懒加载的状态推导，不写盘：
+    /// - charter 未冻结 → `CharterDraft`
+    /// - 有 Pending 人审 → `AwaitingHumanCheckpoint`
+    /// - plan.steps 为空 → `PlanReady`
+    /// - 全部步骤为 Completed/Cancelled → `AllStepsCompleted`
+    /// - 至少有一个 InProgress 或部分 Completed → `Executing`
+    /// - 否则（全 Pending/混合 Pending+Cancelled）→ `PlanReady`
+    ///
+    /// 优先级：CharterDraft > AwaitingHumanCheckpoint > AllStepsCompleted > Executing > PlanReady。
+    pub fn lifecycle_phase(&self) -> Result<MissionLifecyclePhase, MissionResumeError> {
+        if !self.charter_head.state.is_frozen() {
+            return Ok(MissionLifecyclePhase::CharterDraft);
+        }
+        if let Some(log) = self.human_checkpoint_log()? {
+            if log.has_pending() {
+                return Ok(MissionLifecyclePhase::AwaitingHumanCheckpoint);
+            }
+        }
+        let steps = &self.plan_head.steps;
+        if steps.is_empty() {
+            return Ok(MissionLifecyclePhase::PlanReady);
+        }
+        let all_done = steps.iter().all(|s| {
+            matches!(
+                s.status,
+                PlanStepStatus::Completed | PlanStepStatus::Cancelled
+            )
+        });
+        if all_done {
+            return Ok(MissionLifecyclePhase::AllStepsCompleted);
+        }
+        let any_started = steps.iter().any(|s| {
+            matches!(
+                s.status,
+                PlanStepStatus::InProgress | PlanStepStatus::Completed
+            )
+        });
+        if any_started {
+            Ok(MissionLifecyclePhase::Executing)
+        } else {
+            Ok(MissionLifecyclePhase::PlanReady)
+        }
     }
 }
 

@@ -127,12 +127,92 @@ pub enum MissionCharterError {
     /// frozen 后写入未绑定 approval 或 approval 不可用。
     #[error("charter 已 frozen，禁止直接修改：{reason}")]
     FrozenRejected { reason: String },
+    #[error("charter goal 长度非法：trim 后 {actual} 字符，必须 ∈ [{min}, {max}]")]
+    GoalLengthOutOfRange {
+        actual: usize,
+        min: usize,
+        max: usize,
+    },
+    #[error("frozen charter 至少需要 1 条 success_criteria")]
+    SuccessCriteriaEmpty,
+    #[error("success_criteria[{index}] 长度非法：trim 后 {actual} 字符，必须 ∈ [{min}, {max}]")]
+    SuccessCriterionLengthOutOfRange {
+        index: usize,
+        actual: usize,
+        min: usize,
+        max: usize,
+    },
+    #[error("constraints[{index}] 长度非法：trim 后 {actual} 字符，必须 ∈ [{min}, {max}]")]
+    ConstraintLengthOutOfRange {
+        index: usize,
+        actual: usize,
+        min: usize,
+        max: usize,
+    },
     #[error("charter IO 失败 (path={path}): {source}")]
     Io {
         path: PathBuf,
         #[source]
         source: io::Error,
     },
+}
+
+/// charter 内容字段的长度上下界（trim 后按 Unicode `char` 计数）。
+///
+/// 设计原则：
+/// - 单一校验关口 [`validate_charter`]，所有 mutation 入口先 apply 再 validate；
+/// - 上下界写成模块级常量，便于 doc/test 引用，避免硬编码散落多处；
+/// - frozen 阶段对 success_criteria 做"非空"硬约束（draft 阶段允许逐步补齐）。
+pub const CHARTER_GOAL_MIN_LEN: usize = 10;
+pub const CHARTER_GOAL_MAX_LEN: usize = 4096;
+pub const CHARTER_ITEM_MIN_LEN: usize = 3;
+pub const CHARTER_ITEM_MAX_LEN: usize = 512;
+
+/// 在所有 mutation 入口的最后调用：把 charter 的合法性约束收敛在此一处。
+///
+/// 调用顺序：[`apply_charter_update`] 完成字段写入与 frozen/approval 自洽检查后，
+/// 紧接着调用本函数；任何不通过的写入都不应到达 [`MissionCharterStore::save`]。
+///
+/// 不变式：
+/// - `goal.trim().chars().count() ∈ [GOAL_MIN_LEN, GOAL_MAX_LEN]`；
+/// - 当 `state == Frozen` 时，`success_criteria.len() ≥ 1`；
+/// - `success_criteria[i].trim().chars().count() ∈ [ITEM_MIN_LEN, ITEM_MAX_LEN]`；
+/// - `constraints[i].trim().chars().count() ∈ [ITEM_MIN_LEN, ITEM_MAX_LEN]`。
+pub fn validate_charter(charter: &MissionCharter) -> Result<(), MissionCharterError> {
+    let goal_len = charter.goal.trim().chars().count();
+    if goal_len < CHARTER_GOAL_MIN_LEN || goal_len > CHARTER_GOAL_MAX_LEN {
+        return Err(MissionCharterError::GoalLengthOutOfRange {
+            actual: goal_len,
+            min: CHARTER_GOAL_MIN_LEN,
+            max: CHARTER_GOAL_MAX_LEN,
+        });
+    }
+    if charter.state.is_frozen() && charter.success_criteria.is_empty() {
+        return Err(MissionCharterError::SuccessCriteriaEmpty);
+    }
+    for (index, item) in charter.success_criteria.iter().enumerate() {
+        let len = item.trim().chars().count();
+        if len < CHARTER_ITEM_MIN_LEN || len > CHARTER_ITEM_MAX_LEN {
+            return Err(MissionCharterError::SuccessCriterionLengthOutOfRange {
+                index,
+                actual: len,
+                min: CHARTER_ITEM_MIN_LEN,
+                max: CHARTER_ITEM_MAX_LEN,
+            });
+        }
+    }
+    for (index, item) in charter.constraints.iter().enumerate() {
+        let len = item.trim().chars().count();
+        if len < CHARTER_ITEM_MIN_LEN || len > CHARTER_ITEM_MAX_LEN {
+            return Err(MissionCharterError::ConstraintLengthOutOfRange {
+                index,
+                actual: len,
+                min: CHARTER_ITEM_MIN_LEN,
+                max: CHARTER_ITEM_MAX_LEN,
+            });
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -180,7 +260,11 @@ impl MissionCharterStore {
         parse_charter(&raw).map(Some)
     }
 
+    /// 写入 charter 前先经 [`validate_charter`] 校验：作为持久化关口，
+    /// 任何来源的非法 charter 都不允许落盘——即便上游绕过 [`apply_charter_update`]
+    /// 直接构造 [`MissionCharter::new`] 也无法写出违例内容。
     pub fn save(&self, charter: &MissionCharter) -> Result<(), MissionCharterError> {
+        validate_charter(charter)?;
         let path = self.charter_path(&charter.mission_id);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|source| MissionCharterError::Io {
@@ -426,16 +510,19 @@ pub fn apply_charter_update(
         || args.constraints.is_some()
         || args.stakeholders.is_some();
 
-    if charter.state.is_frozen() && want_content_update {
+    // 在快照 `next` 上完成所有变更（含 approval_sequence 推进），
+    // validate 通过后再 commit 回 charter；任何校验失败都不能在原 charter 上留下"半改"。
+    let mut next = charter.clone();
+
+    if next.state.is_frozen() && want_content_update {
         let approval =
             args.approval_sequence
                 .ok_or_else(|| MissionCharterError::FrozenRejected {
-                    reason:
-                        "frozen charter 修改必须提供 approval_sequence 引用已 Approved 的 \
+                    reason: "frozen charter 修改必须提供 approval_sequence 引用已 Approved 的 \
                          HumanCheckpoint"
-                            .to_string(),
+                        .to_string(),
                 })?;
-        if let Some(prev) = charter.last_approval_sequence {
+        if let Some(prev) = next.last_approval_sequence {
             if approval <= prev {
                 return Err(MissionCharterError::FrozenRejected {
                     reason: format!(
@@ -444,47 +531,49 @@ pub fn apply_charter_update(
                 });
             }
         }
-        charter.last_approval_sequence = Some(approval);
+        next.last_approval_sequence = Some(approval);
     }
 
     let mut changed = false;
     if let Some(title) = args.title {
-        if charter.title != title {
-            charter.title = title;
+        if next.title != title {
+            next.title = title;
             changed = true;
         }
     }
     if let Some(goal) = args.goal {
-        if charter.goal != goal {
-            charter.goal = goal;
+        if next.goal != goal {
+            next.goal = goal;
             changed = true;
         }
     }
     if let Some(success) = args.success_criteria {
-        if charter.success_criteria != success {
-            charter.success_criteria = success;
+        if next.success_criteria != success {
+            next.success_criteria = success;
             changed = true;
         }
     }
     if let Some(constraints) = args.constraints {
-        if charter.constraints != constraints {
-            charter.constraints = constraints;
+        if next.constraints != constraints {
+            next.constraints = constraints;
             changed = true;
         }
     }
     if let Some(stakeholders) = args.stakeholders {
-        if charter.stakeholders != stakeholders {
-            charter.stakeholders = stakeholders;
+        if next.stakeholders != stakeholders {
+            next.stakeholders = stakeholders;
             changed = true;
         }
     }
-    if matches!(args.freeze, Some(true)) && charter.state != CharterState::Frozen {
-        charter.state = CharterState::Frozen;
+    if matches!(args.freeze, Some(true)) && next.state != CharterState::Frozen {
+        next.state = CharterState::Frozen;
         changed = true;
     }
     if changed {
-        charter.updated_at = now;
+        next.updated_at = now;
     }
+    validate_charter(&next)?;
+    *charter = next;
     Ok(changed)
 }
 
@@ -575,12 +664,11 @@ fn parse_charter(raw: &str) -> Result<MissionCharter, MissionCharterError> {
                 });
             }
             "last_approval_sequence" => {
-                last_approval_sequence =
-                    Some(value.parse::<u32>().map_err(|_| {
-                        MissionCharterError::InvalidCharter {
-                            reason: format!("last_approval_sequence 解析失败：{value}"),
-                        }
-                    })?);
+                last_approval_sequence = Some(value.parse::<u32>().map_err(|_| {
+                    MissionCharterError::InvalidCharter {
+                        reason: format!("last_approval_sequence 解析失败：{value}"),
+                    }
+                })?);
             }
             _ => {}
         }
@@ -839,8 +927,7 @@ pub fn execute_mission_charter_write_tool(
                 );
             }
         };
-        let Some(entry) = log.entries.iter().find(|e| e.sequence == approval_sequence)
-        else {
+        let Some(entry) = log.entries.iter().find(|e| e.sequence == approval_sequence) else {
             return (
                 serde_json::json!({
                     "tool": "mission_charter_write",
@@ -1002,9 +1089,9 @@ mod tests {
         let charter = MissionCharter {
             mission_id: MissionId::new("m"),
             title: "T".to_string(),
-            goal: "G".to_string(),
+            goal: "render charter draft prompt section".to_string(),
             success_criteria: Vec::new(),
-            constraints: vec!["C1".to_string()],
+            constraints: vec!["constraint-one".to_string()],
             stakeholders: Vec::new(),
             created_at: UtcMillis(0),
             updated_at: UtcMillis(0),
@@ -1053,7 +1140,7 @@ mod tests {
         let mut charter = MissionCharter::new(
             MissionId::new("m"),
             "old".to_string(),
-            "g".to_string(),
+            "实施 Task System v2 §1.4 验收闭环".to_string(),
             UtcMillis(100),
         );
         let args = MissionCharterWriteArgs {
@@ -1065,8 +1152,8 @@ mod tests {
             freeze: None,
             approval_sequence: None,
         };
-        let changed = apply_charter_update(&mut charter, args, UtcMillis(200))
-            .expect("draft apply 不应失败");
+        let changed =
+            apply_charter_update(&mut charter, args, UtcMillis(200)).expect("draft apply 不应失败");
         assert!(changed);
         assert_eq!(charter.title, "new");
         assert_eq!(charter.updated_at.0, 200);
@@ -1078,7 +1165,7 @@ mod tests {
         let mut charter = MissionCharter::new(
             MissionId::new("m"),
             "same".to_string(),
-            "g".to_string(),
+            "实施 Task System v2 §1.4 验收闭环".to_string(),
             UtcMillis(100),
         );
         let args = MissionCharterWriteArgs {
@@ -1090,8 +1177,8 @@ mod tests {
             freeze: None,
             approval_sequence: None,
         };
-        let changed = apply_charter_update(&mut charter, args, UtcMillis(200))
-            .expect("no-op apply 不应失败");
+        let changed =
+            apply_charter_update(&mut charter, args, UtcMillis(200)).expect("no-op apply 不应失败");
         assert!(!changed);
         assert_eq!(charter.updated_at.0, 100);
     }
@@ -1103,7 +1190,7 @@ mod tests {
         let mut charter = MissionCharter::new(
             MissionId::new("m"),
             "t".to_string(),
-            "g".to_string(),
+            "实施 Task System v2 §1.4 验收闭环".to_string(),
             UtcMillis(0),
         );
         let args = MissionCharterWriteArgs {
@@ -1126,10 +1213,11 @@ mod tests {
         let mut charter = MissionCharter::new(
             MissionId::new("m"),
             "t".to_string(),
-            "g".to_string(),
+            "实施 Task System v2 §1.4 验收闭环".to_string(),
             UtcMillis(0),
         );
         charter.state = CharterState::Frozen;
+        charter.success_criteria = vec!["criterion".to_string()];
         let args = MissionCharterWriteArgs {
             title: Some("new".to_string()),
             goal: None,
@@ -1150,10 +1238,11 @@ mod tests {
         let mut charter = MissionCharter::new(
             MissionId::new("m"),
             "t".to_string(),
-            "g".to_string(),
+            "实施 Task System v2 §1.4 验收闭环".to_string(),
             UtcMillis(0),
         );
         charter.state = CharterState::Frozen;
+        charter.success_criteria = vec!["criterion".to_string()];
         charter.last_approval_sequence = Some(5);
         // 同序号必须被拒绝
         let same = apply_charter_update(
@@ -1171,6 +1260,11 @@ mod tests {
         )
         .expect_err("approval 不递增必须被拒");
         assert!(matches!(same, MissionCharterError::FrozenRejected { .. }));
+        assert_eq!(
+            charter.last_approval_sequence,
+            Some(5),
+            "被拒绝后 approval 不应推进"
+        );
         // 严格递增可通过
         let changed = apply_charter_update(
             &mut charter,
@@ -1197,10 +1291,11 @@ mod tests {
         let mut charter = MissionCharter::new(
             MissionId::new("m"),
             "t".to_string(),
-            "g".to_string(),
+            "实施 Task System v2 §1.4 验收闭环".to_string(),
             UtcMillis(0),
         );
         charter.state = CharterState::Frozen;
+        charter.success_criteria = vec!["criterion".to_string()];
         // 仅 freeze=true 且无内容变更：视为幂等 no-op，不需要 approval。
         let changed = apply_charter_update(
             &mut charter,
@@ -1247,8 +1342,8 @@ mod tests {
         let charter = MissionCharter {
             mission_id: MissionId::new("mf"),
             title: "frozen-title".to_string(),
-            goal: "g".to_string(),
-            success_criteria: vec!["c1".to_string()],
+            goal: "deliver the frozen lifecycle round-trip".to_string(),
+            success_criteria: vec!["criterion".to_string()],
             constraints: Vec::new(),
             stakeholders: Vec::new(),
             created_at: UtcMillis(1),
@@ -1257,7 +1352,10 @@ mod tests {
             last_approval_sequence: Some(7),
         };
         store.save(&charter).expect("save");
-        let loaded = store.load(&charter.mission_id).expect("load").expect("present");
+        let loaded = store
+            .load(&charter.mission_id)
+            .expect("load")
+            .expect("present");
         assert_eq!(loaded.state, CharterState::Frozen);
         assert_eq!(loaded.last_approval_sequence, Some(7));
     }
@@ -1286,8 +1384,8 @@ mod tests {
         let charter = MissionCharter {
             mission_id: MissionId::new("m"),
             title: "T".to_string(),
-            goal: "G".to_string(),
-            success_criteria: Vec::new(),
+            goal: "freeze the charter prompt for rendering".to_string(),
+            success_criteria: vec!["criterion".to_string()],
             constraints: Vec::new(),
             stakeholders: Vec::new(),
             created_at: UtcMillis(0),
@@ -1325,8 +1423,10 @@ mod tests {
             );
         }
         hc_store.save(&log).expect("save log");
+        let bus = magi_event_bus::InMemoryEventBus::new(16);
         hc_store
             .resolve_request(
+                &bus,
                 mission,
                 approved_seq,
                 magi_human_checkpoint::HumanCheckpointDecision::Approve,
@@ -1362,13 +1462,18 @@ mod tests {
             Some(&workspace_id),
             &task_id,
             &mission_id,
-            r#"{"title":"T","goal":"G"}"#,
+            r#"{"title":"T","goal":"实施 Task System v2 §1.4 验收闭环"}"#,
         );
-        assert_eq!(status, ExecutionResultStatus::Succeeded, "draft 创建应通过：{out}");
+        assert_eq!(
+            status,
+            ExecutionResultStatus::Succeeded,
+            "draft 创建应通过：{out}"
+        );
         let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(parsed["state"], "draft");
 
-        // 2) draft 阶段 freeze=true 转为 frozen。
+        // 2) draft 阶段 freeze=true 转为 frozen（必须同时提供 success_criteria，
+        //    满足 frozen 不变式 success_criteria.len() ≥ 1）。
         let (out, status) = execute_mission_charter_write_tool(
             &bus,
             Some(&charter_store),
@@ -1377,7 +1482,7 @@ mod tests {
             Some(&workspace_id),
             &task_id,
             &mission_id,
-            r#"{"freeze":true}"#,
+            r#"{"freeze":true,"success_criteria":["端到端测试通过"]}"#,
         );
         assert_eq!(status, ExecutionResultStatus::Succeeded);
         let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -1399,7 +1504,8 @@ mod tests {
 
         // 4) 引用未 approved 的序号必须失败。
         // 先 append 一条 pending（不 resolve）。
-        let mut log = magi_human_checkpoint::HumanCheckpointLog::new(mission_id.clone(), UtcMillis(0));
+        let mut log =
+            magi_human_checkpoint::HumanCheckpointLog::new(mission_id.clone(), UtcMillis(0));
         magi_human_checkpoint::append_human_checkpoint_request(
             &mut log,
             magi_human_checkpoint::HumanCheckpointRequestArgs {
@@ -1422,11 +1528,15 @@ mod tests {
             r#"{"title":"NEW","approval_sequence":1}"#,
         );
         assert_eq!(status, ExecutionResultStatus::Failed);
-        assert!(out.contains("approved"), "拒绝原因应提示状态非 approved：{out}");
+        assert!(
+            out.contains("approved"),
+            "拒绝原因应提示状态非 approved：{out}"
+        );
 
         // 5) 把 #1 resolve approved，再写入应通过。
         hc_store
             .resolve_request(
+                &bus,
                 &mission_id,
                 1,
                 magi_human_checkpoint::HumanCheckpointDecision::Approve,
@@ -1445,7 +1555,11 @@ mod tests {
             &mission_id,
             r#"{"title":"NEW","approval_sequence":1}"#,
         );
-        assert_eq!(status, ExecutionResultStatus::Succeeded, "已批准 approval 应放行：{out}");
+        assert_eq!(
+            status,
+            ExecutionResultStatus::Succeeded,
+            "已批准 approval 应放行：{out}"
+        );
         let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(parsed["state"], "frozen");
         assert_eq!(parsed["last_approval_sequence"], 1);
@@ -1478,5 +1592,128 @@ mod tests {
         let a = registry.get_or_open(&ws).expect("open");
         let b = registry.get_or_open(&ws).expect("open again");
         assert!(Arc::ptr_eq(&a, &b));
+    }
+
+    // ---- validate_charter 关口 -----------------------------------------
+
+    fn valid_draft(mission_id: &str) -> MissionCharter {
+        MissionCharter::new(
+            MissionId::new(mission_id),
+            "title".to_string(),
+            "实施 Task System v2 §1.4 验收闭环".to_string(),
+            UtcMillis(0),
+        )
+    }
+
+    #[test]
+    fn validate_charter_rejects_too_short_goal() {
+        let mut charter = valid_draft("v1");
+        charter.goal = "短目标".to_string();
+        let err = validate_charter(&charter).expect_err("过短 goal 必须被拒");
+        assert!(matches!(
+            err,
+            MissionCharterError::GoalLengthOutOfRange {
+                actual: 3,
+                min: 10,
+                max: 4096
+            }
+        ));
+    }
+
+    #[test]
+    fn validate_charter_rejects_too_long_goal() {
+        let mut charter = valid_draft("v2");
+        charter.goal = "a".repeat(CHARTER_GOAL_MAX_LEN + 1);
+        let err = validate_charter(&charter).expect_err("超长 goal 必须被拒");
+        assert!(matches!(
+            err,
+            MissionCharterError::GoalLengthOutOfRange { actual, .. }
+                if actual == CHARTER_GOAL_MAX_LEN + 1
+        ));
+    }
+
+    #[test]
+    fn validate_charter_rejects_frozen_without_success_criteria() {
+        let mut charter = valid_draft("v3");
+        charter.state = CharterState::Frozen;
+        // success_criteria 留空：frozen 状态下必须 ≥1，否则拒绝。
+        let err = validate_charter(&charter).expect_err("frozen 缺 criteria 必须被拒");
+        assert!(matches!(err, MissionCharterError::SuccessCriteriaEmpty));
+    }
+
+    #[test]
+    fn validate_charter_rejects_too_short_success_criterion() {
+        let mut charter = valid_draft("v4");
+        charter.success_criteria = vec!["ok".to_string()];
+        let err = validate_charter(&charter).expect_err("过短 criterion 必须被拒");
+        assert!(matches!(
+            err,
+            MissionCharterError::SuccessCriterionLengthOutOfRange {
+                index: 0,
+                actual: 2,
+                min: 3,
+                max: 512,
+            }
+        ));
+    }
+
+    #[test]
+    fn validate_charter_rejects_too_short_constraint() {
+        let mut charter = valid_draft("v5");
+        charter.constraints = vec!["合法约束".to_string(), "x".to_string()];
+        let err = validate_charter(&charter).expect_err("过短 constraint 必须被拒");
+        assert!(matches!(
+            err,
+            MissionCharterError::ConstraintLengthOutOfRange {
+                index: 1,
+                actual: 1,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn validate_charter_allows_unicode_goal_at_min_boundary() {
+        let mut charter = valid_draft("v6");
+        // 10 个汉字 = 10 个 char，恰好命中下界。
+        charter.goal = "一二三四五六七八九十".to_string();
+        validate_charter(&charter).expect("边界值合法");
+    }
+
+    #[test]
+    fn apply_charter_update_rolls_back_state_on_validation_failure() {
+        let mut charter = valid_draft("rb");
+        charter.state = CharterState::Frozen;
+        charter.success_criteria = vec!["criterion".to_string()];
+        charter.last_approval_sequence = Some(2);
+        // 通过 approval 检查，但 success_criteria 写入会让某条非法：
+        let err = apply_charter_update(
+            &mut charter,
+            MissionCharterWriteArgs {
+                title: None,
+                goal: None,
+                success_criteria: Some(vec!["ok".to_string()]),
+                constraints: None,
+                stakeholders: None,
+                freeze: None,
+                approval_sequence: Some(3),
+            },
+            UtcMillis(1),
+        )
+        .expect_err("过短 criterion 必须被拒");
+        assert!(matches!(
+            err,
+            MissionCharterError::SuccessCriterionLengthOutOfRange { .. }
+        ));
+        assert_eq!(
+            charter.last_approval_sequence,
+            Some(2),
+            "校验失败时 approval 不能在原 charter 上推进"
+        );
+        assert_eq!(
+            charter.success_criteria,
+            vec!["criterion".to_string()],
+            "校验失败时 success_criteria 不能在原 charter 上落入新值"
+        );
     }
 }

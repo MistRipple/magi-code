@@ -286,10 +286,9 @@ pub fn run_dispatch_submission(
     let act_task_id = TaskId::new(format!("task-local-agent-{}", accepted_at.0));
 
     let task_goal_text = execution_goal.to_string();
-    let target_role = request
-        .target_role
-        .as_deref()
-        .unwrap_or_else(|| infer_dispatch_task_role(request.skill_name.as_deref(), request.task_tier));
+    let target_role = request.target_role.as_deref().unwrap_or_else(|| {
+        infer_dispatch_task_role(request.skill_name.as_deref(), request.task_tier)
+    });
     if !runtime
         .agent_role_registry
         .role_supports_task_kind(target_role, TaskKind::LocalAgent)
@@ -647,9 +646,7 @@ mod tests {
             mission_title: "修复 bug + 验证".to_string(),
             task_title: "修复 bug + 验证".to_string(),
             trimmed_text: Some("修复明确 bug 并跑相关验证".to_string()),
-            execution_goal: Some(
-                "定位并修复 bug、再跑相关验证命令".to_string(),
-            ),
+            execution_goal: Some("定位并修复 bug、再跑相关验证命令".to_string()),
             task_tier: TaskTier::ExecutionChain,
             skill_name: None,
             target_role: Some("integration-dev".to_string()),
@@ -748,9 +745,7 @@ mod tests {
             mission_title: "复杂重构 mission".to_string(),
             task_title: "复杂重构 mission".to_string(),
             trimmed_text: Some("跨多阶段重构：拆模块、迁数据、灰度切换".to_string()),
-            execution_goal: Some(
-                "完成跨多阶段重构并保留每阶段可恢复的 checkpoint".to_string(),
-            ),
+            execution_goal: Some("完成跨多阶段重构并保留每阶段可恢复的 checkpoint".to_string()),
             task_tier: TaskTier::LongMission,
             skill_name: None,
             target_role: Some("coordinator".to_string()),
@@ -886,9 +881,9 @@ mod tests {
         let err = run_dispatch_submission(&runtime, &request);
         let message = match err {
             Err(DispatchSubmissionRunError::InvalidInput(msg)) => msg,
-            Ok(_) => panic!(
-                "非 coordinator role 配 LongMission tier 必须被 dispatch 拒绝，但放行了"
-            ),
+            Ok(_) => {
+                panic!("非 coordinator role 配 LongMission tier 必须被 dispatch 拒绝，但放行了")
+            }
             Err(other) => panic!("期待 InvalidInput，实际 {other:?}"),
         };
         assert!(

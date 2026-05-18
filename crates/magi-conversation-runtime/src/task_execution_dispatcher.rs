@@ -25,13 +25,15 @@ use magi_context_runtime::{
     ContextBudget, ContextRuntime, ExecutionContextAssemblyRequest, ExecutionContextClues,
 };
 use magi_core::{
-    ApprovalRequirement, EventId, ExecutionOwnership, ExecutionResultStatus, LeaseId, RiskLevel,
-    SessionId, TaskId, TaskKind, ToolCallId, UtcMillis, WorkerId, WorkspaceId,
+    ApprovalRequirement, EventId, ExecutionOwnership, ExecutionResultStatus, LeaseId, MissionId,
+    RiskLevel, SessionId, TaskId, TaskKind, ToolCallId, UtcMillis, WorkerId, WorkspaceId,
 };
 use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
 use magi_governance::ToolKind;
 use magi_knowledge_store::{KnowledgeKind, KnowledgeRecord, KnowledgeStore};
+use magi_lifecycle_notice::LifecycleNoticeRegistry;
 use magi_memory_store::MemoryStore;
+use magi_mission_metrics::MissionMetricsRegistry;
 use magi_orchestrator::{
     ExecutionContextSummary, ExecutionWritebackPlans, OrchestratedExecutionRuntime,
     OrchestratorService, task_worker_catalog::WorkerInfo,
@@ -111,6 +113,15 @@ pub struct LlmTaskDispatcher {
     human_checkpoint_registry: Arc<magi_human_checkpoint::HumanCheckpointRegistry>,
     /// 强制同步执行 dispatch，用于 ExecutionChain 同步 for 循环（设计 §1.3）。
     force_sync_dispatch: Arc<std::sync::atomic::AtomicUsize>,
+    /// codex goal 桥：mission 生命周期通知（recovery / 人审 resolve / plan step
+    /// 完成）按 mission 维度排队，dispatcher 在装配 prompt 时 `pending_notice`
+    /// 拉一段，注入"--- 生命周期通知 ---"段。可选——daemon bootstrap
+    /// 没接线时为 None，行为退回到不注入。
+    lifecycle_notices: Option<Arc<LifecycleNoticeRegistry>>,
+    /// codex goal 桥：mission 维度记账 registry。dispatch 时按 workspace 拿对应
+    /// store，conversation_loop 中每轮 LLM 调用后调用一次 `record_mission_turn`
+    /// 累加 token / 时间。daemon bootstrap 未注入时为 `None`，行为退回到不记账。
+    mission_metrics_registry: Arc<MissionMetricsRegistry>,
 }
 
 pub fn resolve_configured_model_client(
@@ -171,6 +182,8 @@ impl LlmTaskDispatcher {
                 magi_human_checkpoint::HumanCheckpointRegistry::new(),
             ),
             force_sync_dispatch: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            lifecycle_notices: None,
+            mission_metrics_registry: Arc::new(MissionMetricsRegistry::new()),
         }
     }
 
@@ -243,6 +256,27 @@ impl LlmTaskDispatcher {
     pub fn with_stream_fanout(mut self, fanout: Arc<StreamFanOut>) -> Self {
         self.stream_fanout = Some(fanout);
         self
+    }
+
+    pub fn with_lifecycle_notices(mut self, registry: Arc<LifecycleNoticeRegistry>) -> Self {
+        self.lifecycle_notices = Some(registry);
+        self
+    }
+
+    pub fn with_mission_metrics_registry(mut self, registry: Arc<MissionMetricsRegistry>) -> Self {
+        self.mission_metrics_registry = registry;
+        self
+    }
+
+    pub fn mission_metrics_registry(&self) -> Arc<MissionMetricsRegistry> {
+        self.mission_metrics_registry.clone()
+    }
+
+    /// 给定 mission，取一段当前应注入下轮 prompt 的"生命周期通知"。无注册表 / 无通知时返回 None。
+    fn lifecycle_notice_for_mission(&self, mission_id: &MissionId) -> Option<String> {
+        self.lifecycle_notices
+            .as_ref()
+            .and_then(|reg| reg.pending_notice(mission_id))
     }
 
     pub fn with_agent_role_registry(
@@ -733,6 +767,7 @@ impl LlmTaskDispatcher {
         };
         let user_rules_prefix = self.resolve_user_rules_prompt();
         let safeguard_prefix = self.resolve_safeguard_prompt();
+        let lifecycle_notice = self.lifecycle_notice_for_mission(&task.mission_id);
         let task_fact_context_parts = self.task_fact_context_parts(task);
 
         let Some(ref ctx_runtime) = self.context_runtime else {
@@ -741,6 +776,7 @@ impl LlmTaskDispatcher {
                     prepend_session_instructions(
                         user_rules_prefix.as_deref(),
                         safeguard_prefix.as_deref(),
+                        lifecycle_notice.as_deref(),
                         &base_prompt,
                     ),
                     None,
@@ -751,6 +787,7 @@ impl LlmTaskDispatcher {
                 prepend_session_instructions(
                     user_rules_prefix.as_deref(),
                     safeguard_prefix.as_deref(),
+                    lifecycle_notice.as_deref(),
                     &format!("--- Context ---\n{ctx_text}\n--- Task ---\n{base_prompt}"),
                 ),
                 None,
@@ -789,6 +826,7 @@ impl LlmTaskDispatcher {
                 prepend_session_instructions(
                     user_rules_prefix.as_deref(),
                     safeguard_prefix.as_deref(),
+                    lifecycle_notice.as_deref(),
                     &base_prompt,
                 ),
                 Some(context_summary),
@@ -810,6 +848,7 @@ impl LlmTaskDispatcher {
             prepend_session_instructions(
                 user_rules_prefix.as_deref(),
                 safeguard_prefix.as_deref(),
+                lifecycle_notice.as_deref(),
                 &format!("--- Context ---\n{ctx_text}\n--- Task ---\n{base_prompt}"),
             ),
             Some(context_summary),
@@ -924,6 +963,7 @@ impl LlmTaskDispatcher {
             prepend_session_instructions(
                 self.resolve_user_rules_prompt().as_deref(),
                 self.resolve_safeguard_prompt().as_deref(),
+                None,
                 &request.prompt,
             ),
             request.skill_name.as_deref(),
@@ -1135,6 +1175,22 @@ impl LlmTaskDispatcher {
         } else {
             None
         };
+        let mission_metrics = if let Some(path) = workspace_root_path.as_ref() {
+            let workspace_root = magi_core::WorkspaceRootPath::new(path.to_string_lossy());
+            match self.mission_metrics_registry.get_or_open(&workspace_root) {
+                Ok(store) => Some(store),
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        workspace_root = %path.display(),
+                        "MissionMetrics: 打开失败，本次 Turn 不写记账（accounting 失败不阻断主流程）"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
         conversation_loop::run_conversation_loop(ConversationLoopRequest {
             client: client.as_ref(),
             event_bus: self.event_bus.as_ref(),
@@ -1158,6 +1214,7 @@ impl LlmTaskDispatcher {
             validation_runner: validation_runner.as_deref(),
             checkpoint: checkpoint.as_deref(),
             human_checkpoint: human_checkpoint.as_deref(),
+            mission_metrics: mission_metrics.as_ref(),
             task,
             task_id,
             lease_id,

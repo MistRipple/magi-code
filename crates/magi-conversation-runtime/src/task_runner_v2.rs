@@ -666,9 +666,9 @@ mod tests {
     /// 二者共享单一 SpawnGraph instance 不是巧合而是契约。
     #[test]
     fn coordinator_agent_spawn_to_child_result_round_trip() {
-        use crate::tool_batch::execute_task_tool_call_batch;
         use crate::task_execution_registry::TaskExecutionRegistry;
         use crate::task_runner_bridge::TaskOutcome;
+        use crate::tool_batch::execute_task_tool_call_batch;
         use magi_bridge_client::{ChatToolCall, ChatToolFunction};
         use magi_core::{
             ExecutionResultStatus, MissionId, TaskRuntimePayload, WorkerId, WorkspaceId,

@@ -195,14 +195,18 @@ fn publish_mission_resumed_event(
         "workspace_commit": workspace_commit,
         "source": "daemon_bootstrap",
     });
-    let envelope = EventEnvelope::domain(event_id, "mission.resumed.from_recovery", payload)
-        .with_context(EventContext {
-            workspace_id: Some(workspace_id.clone()),
-            session_id: Some(session_id.clone()),
-            mission_id: Some(mission_id.clone()),
-            assignment_id: None,
-            task_id: None,
-        });
+    let envelope = EventEnvelope::domain(
+        event_id,
+        magi_event_bus::task_events::MISSION_RESUMED_FROM_RECOVERY,
+        payload,
+    )
+    .with_context(EventContext {
+        workspace_id: Some(workspace_id.clone()),
+        session_id: Some(session_id.clone()),
+        mission_id: Some(mission_id.clone()),
+        assignment_id: None,
+        task_id: None,
+    });
     if let Err(err) = event_bus.publish(envelope) {
         warn!(
             workspace_id = %workspace_id,
@@ -233,7 +237,7 @@ mod tests {
             .save(&MissionCharter::new(
                 mid.clone(),
                 "test mission",
-                "ship it",
+                "ship the mission recovery fixture",
                 UtcMillis::now(),
             ))
             .unwrap();
@@ -311,7 +315,7 @@ mod tests {
         let resumed: Vec<_> = snapshot
             .recent_events
             .iter()
-            .filter(|e| e.event_type == "mission.resumed.from_recovery")
+            .filter(|e| e.event_type == magi_event_bus::task_events::MISSION_RESUMED_FROM_RECOVERY)
             .collect();
         assert!(resumed.is_empty());
     }
@@ -346,7 +350,7 @@ mod tests {
         let resumed: Vec<_> = snapshot
             .recent_events
             .iter()
-            .filter(|e| e.event_type == "mission.resumed.from_recovery")
+            .filter(|e| e.event_type == magi_event_bus::task_events::MISSION_RESUMED_FROM_RECOVERY)
             .collect();
         assert_eq!(resumed.len(), 1);
         let ev = resumed[0];
@@ -404,7 +408,7 @@ mod tests {
         let resumed: Vec<_> = snapshot
             .recent_events
             .iter()
-            .filter(|e| e.event_type == "mission.resumed.from_recovery")
+            .filter(|e| e.event_type == magi_event_bus::task_events::MISSION_RESUMED_FROM_RECOVERY)
             .collect();
         assert_eq!(resumed.len(), 1);
     }
@@ -424,7 +428,7 @@ mod tests {
             snapshot
                 .recent_events
                 .iter()
-                .all(|e| e.event_type != "mission.resumed.from_recovery")
+                .all(|e| e.event_type != magi_event_bus::task_events::MISSION_RESUMED_FROM_RECOVERY)
         );
     }
 }

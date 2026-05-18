@@ -1014,7 +1014,10 @@ mod tests {
         assert_eq!(ok.workspace_commit.as_deref(), Some("deadbeef"));
         assert_eq!(ok.open_conversations.len(), 1);
         assert_eq!(ok.open_conversations[0].session_id.as_str(), "session-A");
-        assert_eq!(ok.open_conversations[0].recovery_ref.as_deref(), Some("rec-X"));
+        assert_eq!(
+            ok.open_conversations[0].recovery_ref.as_deref(),
+            Some("rec-X")
+        );
         assert_eq!(
             ok.open_conversations[0].execution_chain_ref.as_deref(),
             Some("chain-Y")

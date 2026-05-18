@@ -24,7 +24,7 @@ use crate::{
         workspace_context_system_prompt,
     },
     settings_store::SettingsStore,
-    usage_recording::{ModelUsageBinding, publish_model_usage_record},
+    usage_recording::{ModelUsageBinding, publish_model_usage_record, record_mission_turn},
 };
 use magi_bridge_client::{
     ChatMessage, ChatToolCall, ChatToolDefinition, LOOPBACK_MODEL_PROVIDER, ModelBridgeClient,
@@ -101,6 +101,11 @@ pub struct ConversationLoopRequest<'a> {
     /// 也不允许 `human_checkpoint_request` 工具落盘。长任务缺少 store 时，agent_spawn
     /// 会在工具层失败，避免绕过 pending 检查。
     pub human_checkpoint: Option<&'a magi_human_checkpoint::HumanCheckpointStore>,
+    /// codex goal 桥：mission 维度记账 sidecar 句柄。`None` 表示当前 task 未绑定
+    /// workspace 或 dispatcher 未注入 metrics（旧路径回退），此时不做记账写入。
+    /// 设计上每轮 LLM 调用后调用一次 `record_mission_turn`，与 `publish_model_usage_record`
+    /// 并列收口；失败仅 warn，不阻断主轮次。
+    pub mission_metrics: Option<&'a Arc<magi_mission_metrics::MissionMetricsStore>>,
     pub task: &'a magi_core::Task,
     pub task_id: &'a TaskId,
     pub lease_id: &'a LeaseId,
@@ -304,6 +309,7 @@ fn run_conversation_loop_inner(
         validation_runner,
         checkpoint,
         human_checkpoint,
+        mission_metrics,
         task,
         task_id,
         lease_id,
@@ -587,6 +593,7 @@ fn run_conversation_loop_inner(
         last_stream_item_id = Some(stream_item_id.clone());
         let streamed_thinking = std::cell::RefCell::new(String::new());
         let last_thinking_len = std::cell::Cell::new(0usize);
+        let round_started_at = UtcMillis::now();
         let invocation_request = ModelInvocationRequest {
             provider: LOOPBACK_MODEL_PROVIDER.to_string(),
             prompt: prompt.clone(),
@@ -734,6 +741,16 @@ fn run_conversation_loop_inner(
             Some(lease_id.to_string()),
             None,
         );
+        if let Some(metrics_store) = mission_metrics {
+            record_mission_turn(
+                metrics_store.as_ref(),
+                &task.mission_id,
+                parsed.usage.as_ref(),
+                round_started_at,
+                UtcMillis::now(),
+                None,
+            );
+        }
 
         if let Some(ref content) = parsed.content {
             final_content = content.clone();
@@ -2267,6 +2284,7 @@ mod tests {
             validation_runner: None,
             checkpoint: None,
             human_checkpoint: None,
+            mission_metrics: None,
             task,
             task_id: &task.task_id,
             lease_id: &lease.lease_id,
@@ -2404,6 +2422,7 @@ mod tests {
             validation_runner: None,
             checkpoint: None,
             human_checkpoint: None,
+            mission_metrics: None,
             task: &task,
             task_id: &task.task_id,
             lease_id: &lease.lease_id,
@@ -2725,6 +2744,7 @@ mod tests {
             validation_runner: None,
             checkpoint: None,
             human_checkpoint: None,
+            mission_metrics: None,
             task: &task,
             task_id: &task.task_id,
             lease_id: &lease.lease_id,
@@ -2942,6 +2962,7 @@ mod tests {
             validation_runner: None,
             checkpoint: None,
             human_checkpoint: None,
+            mission_metrics: None,
             task: &task,
             task_id: &task.task_id,
             lease_id: &lease.lease_id,

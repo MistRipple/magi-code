@@ -29,7 +29,7 @@ fn seed_charter_and_plan(home: &std::path::Path, workspace: &WorkspaceRootPath, 
         .save(&MissionCharter::new(
             mid.clone(),
             "demo",
-            "ship it",
+            "deliver the contract round-trip mission",
             UtcMillis::now(),
         ))
         .unwrap();

@@ -15,6 +15,7 @@ magi-validation-runner = { path = "../magi-validation-runner" }
 magi-mission-workspace = { path = "../magi-mission-workspace" }
 magi-checkpoint = { path = "../magi-checkpoint" }
 magi-human-checkpoint = { path = "../magi-human-checkpoint" }
+magi-mission-metrics = { path = "../magi-mission-metrics" }
 thiserror.workspace = true
 
 [dev-dependencies]

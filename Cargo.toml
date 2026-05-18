@@ -34,6 +34,8 @@ members = [
   "crates/magi-human-checkpoint",
   "crates/magi-plan",
   "crates/magi-mission",
+  "crates/magi-mission-metrics",
+  "crates/magi-lifecycle-notice",
   "crates/magi-snapshot",
 ]
 

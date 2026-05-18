@@ -17,8 +17,9 @@ pub use ids::{
 };
 pub use status::{
     ApprovalRequirement, AssignmentLifecycleStatus, DispatchReason, ExecutionResultStatus,
-    MissionLifecycleStatus, RiskLevel, SessionLifecycleStatus, TaskResultKind, TerminationReason,
-    VerificationStatus, WorkerLifecycleStatus, WorkspaceLifecycleStatus,
+    MissionLifecyclePhase, MissionLifecycleStatus, RiskLevel, SessionLifecycleStatus,
+    TaskResultKind, TerminationReason, VerificationStatus, WorkerLifecycleStatus,
+    WorkspaceLifecycleStatus,
 };
 pub use task::{
     ProgressSummary, Task, TaskKind, TaskPolicy, TaskProjection, TaskRuntimePayload, TaskStatus,

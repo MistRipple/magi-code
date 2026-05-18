@@ -242,8 +242,12 @@ impl HumanCheckpointStore {
 
     /// 运维端 resolve：把指定 sequence 的 pending 条目改为 approved 或 rejected。
     /// 已经 resolve 的条目不允许再次 resolve（审计链不可改写）。
+    ///
+    /// `event_bus` 用于在 resolve 成功后发布 `mission.human_checkpoint.resolved.*`
+    /// 事件，供 lifecycle-notice 订阅器拼出下一轮 prompt 的"生命周期通知"段。
     pub fn resolve_request(
         &self,
+        event_bus: &magi_event_bus::InMemoryEventBus,
         mission_id: &MissionId,
         sequence: u32,
         decision: HumanCheckpointDecision,
@@ -269,13 +273,27 @@ impl HumanCheckpointStore {
         entry.status = outcome;
         entry.decision = Some(HumanCheckpointDecisionRecord {
             at: now,
-            by: decided_by,
+            by: decided_by.clone(),
             notes,
             outcome,
         });
         log.updated_at = now;
         let resolved = entry.clone();
         self.save(&log)?;
+        let outcome_str = outcome.as_str();
+        let envelope = magi_event_bus::task_events::mission_human_checkpoint_resolved_event(
+            mission_id.as_str(),
+            sequence,
+            outcome_str,
+            &resolved.plan_step_id,
+            &decided_by,
+            resolved.label.as_deref(),
+        )
+        .with_context(magi_event_bus::EventContext {
+            mission_id: Some(mission_id.clone()),
+            ..magi_event_bus::EventContext::default()
+        });
+        let _ = event_bus.publish(envelope);
         Ok(resolved)
     }
 
@@ -757,6 +775,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let ws_root = WorkspaceRootPath::new(tmp.path().to_string_lossy().to_string());
         let store = HumanCheckpointStore::open_with_home(tmp.path(), &ws_root).expect("open");
+        let bus = magi_event_bus::InMemoryEventBus::new(16);
         let mut log = HumanCheckpointLog::new(mission(), UtcMillis(0));
         let seq = append_human_checkpoint_request(
             &mut log,
@@ -773,6 +792,7 @@ mod tests {
         assert!(store.has_pending(&mission()).expect("has_pending"));
         let resolved = store
             .resolve_request(
+                &bus,
                 &mission(),
                 1,
                 HumanCheckpointDecision::Approve,
@@ -790,6 +810,7 @@ mod tests {
         // 再次 resolve 必须报错。
         let err = store
             .resolve_request(
+                &bus,
                 &mission(),
                 1,
                 HumanCheckpointDecision::Reject,
@@ -799,6 +820,19 @@ mod tests {
             )
             .expect_err("已 resolve 不能再 resolve");
         assert!(matches!(err, HumanCheckpointError::AlreadyResolved { .. }));
+
+        // resolve 成功的事件已发布到 event bus。
+        let snapshot = bus.snapshot();
+        let resolved_events: Vec<_> = snapshot
+            .recent_events
+            .iter()
+            .filter(|e| {
+                e.event_type == magi_event_bus::task_events::MISSION_HUMAN_CHECKPOINT_APPROVED
+            })
+            .collect();
+        assert_eq!(resolved_events.len(), 1);
+        assert_eq!(resolved_events[0].payload["sequence"], 1);
+        assert_eq!(resolved_events[0].payload["plan_step_id"], "s5");
     }
 
     #[test]
@@ -852,8 +886,10 @@ mod tests {
         }
         store.save(&log).expect("save");
         // resolve 第一条。
+        let bus = magi_event_bus::InMemoryEventBus::new(16);
         store
             .resolve_request(
+                &bus,
                 &mission(),
                 1,
                 HumanCheckpointDecision::Approve,

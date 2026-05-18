@@ -3,6 +3,7 @@ use magi_bridge_client::assignment_dispatch::{strip_dispatch_preview_text, strip
 pub fn prepend_session_instructions(
     user_rules: Option<&str>,
     safeguard_rules: Option<&str>,
+    lifecycle_notice: Option<&str>,
     prompt: &str,
 ) -> String {
     let mut sections = Vec::new();
@@ -14,6 +15,12 @@ pub fn prepend_session_instructions(
         .filter(|rules| !rules.is_empty())
     {
         sections.push(format!("--- 安全防护 ---\n{rules}"));
+    }
+    if let Some(notice) = lifecycle_notice
+        .map(str::trim)
+        .filter(|notice| !notice.is_empty())
+    {
+        sections.push(format!("--- 生命周期通知 ---\n{notice}"));
     }
     if sections.is_empty() {
         return prompt.to_string();
@@ -55,7 +62,7 @@ mod tests {
     #[test]
     fn prepend_session_instructions_keeps_plain_prompt_when_rules_empty() {
         assert_eq!(
-            prepend_session_instructions(Some("  "), None, "执行任务"),
+            prepend_session_instructions(Some("  "), None, None, "执行任务"),
             "执行任务"
         );
     }
@@ -63,11 +70,36 @@ mod tests {
     #[test]
     fn prepend_session_instructions_adds_user_and_safeguard_rules() {
         let prompt =
-            prepend_session_instructions(Some("保持稳定"), Some("禁止危险操作"), "执行任务");
+            prepend_session_instructions(Some("保持稳定"), Some("禁止危险操作"), None, "执行任务");
 
         assert!(prompt.contains("--- 用户规则 ---\n保持稳定"));
         assert!(prompt.contains("--- 安全防护 ---\n禁止危险操作"));
         assert!(prompt.ends_with("执行任务"));
+    }
+
+    #[test]
+    fn prepend_session_instructions_appends_lifecycle_notice_in_order() {
+        let prompt = prepend_session_instructions(
+            Some("用户规则文本"),
+            Some("安全文本"),
+            Some("Mission M-1 已恢复"),
+            "执行任务",
+        );
+
+        let user_pos = prompt.find("--- 用户规则 ---").expect("用户规则段存在");
+        let safe_pos = prompt.find("--- 安全防护 ---").expect("安全段存在");
+        let life_pos = prompt
+            .find("--- 生命周期通知 ---")
+            .expect("生命周期通知段存在");
+        assert!(user_pos < safe_pos);
+        assert!(safe_pos < life_pos);
+        assert!(prompt.ends_with("执行任务"));
+    }
+
+    #[test]
+    fn prepend_session_instructions_ignores_empty_lifecycle_notice() {
+        let prompt = prepend_session_instructions(Some("u"), None, Some("   "), "执行任务");
+        assert!(!prompt.contains("--- 生命周期通知 ---"));
     }
 
     #[test]

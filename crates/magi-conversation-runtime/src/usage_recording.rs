@@ -4,8 +4,9 @@
 //! `settings_store::SettingsStore`。
 
 use crate::{model_config::NormalizedModelConfig, settings_store::SettingsStore};
-use magi_core::{EventId, SessionId, UtcMillis, WorkspaceId};
+use magi_core::{EventId, MissionId, MissionLifecyclePhase, SessionId, UtcMillis, WorkspaceId};
 use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
+use magi_mission_metrics::{MissionMetricsStore, TurnUsage};
 use magi_orchestrator::task_worker_catalog::WorkerInfo;
 use magi_session_store::SessionStore;
 use magi_usage_authority::{
@@ -147,6 +148,36 @@ fn current_turn_id(session_store: &SessionStore, session_id: &SessionId) -> Opti
         .runtime_sidecar(session_id)
         .and_then(|sidecar| sidecar.current_turn)
         .map(|turn| turn.turn_id)
+}
+
+/// Mission 维度记账（与 `publish_model_usage_record` 并列的单一写点）。
+///
+/// 在 conversation_loop 中每一轮 LLM 调用结束后调用一次，把本轮 token / 时间窗口
+/// 累加到 mission-scoped `metrics.md` sidecar。设计上：
+/// - 与 `publish_model_usage_record` 共享 `usage_tokens_from_payload`，保证 token 口径一致；
+/// - 写入失败仅 `warn!`，不阻断主轮次（accounting 出错绝不影响对话）；
+/// - phase 由调用方按需传入，缺省 `None` 表示尚未判定。
+pub fn record_mission_turn(
+    store: &MissionMetricsStore,
+    mission_id: &MissionId,
+    usage: Option<&serde_json::Value>,
+    started_at: UtcMillis,
+    finished_at: UtcMillis,
+    phase: Option<MissionLifecyclePhase>,
+) {
+    let Some(tokens) = usage_tokens_from_payload(usage) else {
+        return;
+    };
+    let turn_usage = TurnUsage {
+        prompt_tokens: tokens.input_tokens,
+        completion_tokens: tokens.output_tokens,
+        started_at,
+        finished_at,
+        phase,
+    };
+    if let Err(error) = store.record_turn(mission_id, turn_usage) {
+        tracing::warn!(?error, mission_id = %mission_id, "mission metrics 写入失败，已跳过本轮记账");
+    }
 }
 
 fn usage_model_config_for_binding(

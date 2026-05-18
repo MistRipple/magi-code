@@ -399,7 +399,15 @@ pub fn parse_plan_write_arguments(raw: &serde_json::Value) -> Result<PlanWriteAr
     Ok(PlanWriteArgs { steps })
 }
 
-/// 用 `plan_write` 入参整体替换 plan.steps。返回是否真正发生变化。
+/// `apply_plan_update` 的返回值，把"是否变化"与"新近完成的 step 列表"一并返出。
+/// 后者用于 `execute_plan_write_tool` 发布 `mission.plan_step.completed` 事件。
+#[derive(Debug, Default)]
+pub struct PlanUpdateOutcome {
+    pub changed: bool,
+    pub newly_completed_steps: Vec<PlanStep>,
+}
+
+/// 用 `plan_write` 入参整体替换 plan.steps。返回 `PlanUpdateOutcome`。
 ///
 /// 不变式 7（"Plan completion 需要证据"）的运行时关口在此实现：
 /// - 当某个 step 在新版本里被首次标记为 `Completed`（旧版本不是 Completed）时，
@@ -414,7 +422,7 @@ pub fn apply_plan_update(
     args: PlanWriteArgs,
     now: UtcMillis,
     validation_report: Option<&magi_validation_runner::ValidationReport>,
-) -> Result<bool, PlanError> {
+) -> Result<PlanUpdateOutcome, PlanError> {
     // 旧版本快照：用于判断"newly Completed"。
     let prior_status: HashMap<String, PlanStepStatus> = plan
         .steps
@@ -422,14 +430,12 @@ pub fn apply_plan_update(
         .map(|s| (s.id.clone(), s.status))
         .collect();
 
+    let mut newly_completed_ids: Vec<String> = Vec::new();
     for step in &args.steps {
         if step.status != PlanStepStatus::Completed {
             continue;
         }
-        let was_completed = matches!(
-            prior_status.get(&step.id),
-            Some(PlanStepStatus::Completed)
-        );
+        let was_completed = matches!(prior_status.get(&step.id), Some(PlanStepStatus::Completed));
         if was_completed {
             continue;
         }
@@ -441,6 +447,7 @@ pub fn apply_plan_update(
                 step_id: step.id.clone(),
             });
         }
+        newly_completed_ids.push(step.id.clone());
     }
 
     let new_steps: Vec<PlanStep> = args
@@ -455,11 +462,22 @@ pub fn apply_plan_update(
         })
         .collect();
     if plan.steps == new_steps {
-        return Ok(false);
+        return Ok(PlanUpdateOutcome {
+            changed: false,
+            newly_completed_steps: Vec::new(),
+        });
     }
     plan.steps = new_steps;
     plan.updated_at = now;
-    Ok(true)
+
+    let newly_completed_steps: Vec<PlanStep> = newly_completed_ids
+        .iter()
+        .filter_map(|id| plan.steps.iter().find(|s| &s.id == id).cloned())
+        .collect();
+    Ok(PlanUpdateOutcome {
+        changed: true,
+        newly_completed_steps,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -724,8 +742,8 @@ pub fn execute_plan_write_tool(
             );
         }
     };
-    let changed = match apply_plan_update(&mut plan_doc, args, now, validation_report.as_ref()) {
-        Ok(changed) => changed,
+    let outcome = match apply_plan_update(&mut plan_doc, args, now, validation_report.as_ref()) {
+        Ok(outcome) => outcome,
         Err(err @ PlanError::ValidationEvidenceMissing { .. }) => {
             // 这是不变式 7 的"软失败"——给模型清晰反馈，让它先去补 validation_record。
             return (
@@ -762,12 +780,18 @@ pub fn execute_plan_write_tool(
             ExecutionResultStatus::Failed,
         );
     }
+    let total_steps = plan_doc.steps.len();
+    let completed_steps = plan_doc
+        .steps
+        .iter()
+        .filter(|s| s.status == PlanStepStatus::Completed)
+        .count();
     let payload = serde_json::json!({
         "tool": "plan_write",
         "status": "succeeded",
         "mission_id": plan_doc.mission_id.to_string(),
-        "step_count": plan_doc.steps.len(),
-        "changed": changed,
+        "step_count": total_steps,
+        "changed": outcome.changed,
     });
     let _ = event_bus.publish(
         EventEnvelope::domain(
@@ -778,8 +802,8 @@ pub fn execute_plan_write_tool(
                 "mission_id": plan_doc.mission_id.to_string(),
                 "session_id": session_id.to_string(),
                 "workspace_id": workspace_id.map(ToString::to_string),
-                "changed": changed,
-                "step_count": plan_doc.steps.len(),
+                "changed": outcome.changed,
+                "step_count": total_steps,
             }),
         )
         .with_context(EventContext {
@@ -790,6 +814,25 @@ pub fn execute_plan_write_tool(
             ..EventContext::default()
         }),
     );
+    // 为每个本轮首次进入 completed 的 step 发布 mission.plan_step.completed,
+    // 让 lifecycle-notice 订阅器据此摆出下轮 prompt 的"生命周期通知"段。
+    for step in &outcome.newly_completed_steps {
+        let envelope = magi_event_bus::task_events::mission_plan_step_completed_event(
+            plan_doc.mission_id.as_str(),
+            &step.id,
+            &step.content,
+            total_steps,
+            completed_steps,
+        )
+        .with_context(EventContext {
+            workspace_id: workspace_id.cloned(),
+            session_id: Some(session_id.clone()),
+            mission_id: Some(mission_id.clone()),
+            task_id: Some(task_id.clone()),
+            ..EventContext::default()
+        });
+        let _ = event_bus.publish(envelope);
+    }
     (payload.to_string(), ExecutionResultStatus::Succeeded)
 }
 
@@ -921,9 +964,10 @@ mod tests {
             ]
         }))
         .expect("parse");
-        let changed = apply_plan_update(&mut plan, args, UtcMillis(200), None)
+        let outcome = apply_plan_update(&mut plan, args, UtcMillis(200), None)
             .expect("非 completed 转换不应走 validation 关口");
-        assert!(changed);
+        assert!(outcome.changed);
+        assert!(outcome.newly_completed_steps.is_empty());
         assert_eq!(plan.updated_at.0, 200);
         assert_eq!(plan.steps.len(), 1);
         assert_eq!(plan.steps[0].status, PlanStepStatus::InProgress);
@@ -947,9 +991,10 @@ mod tests {
             "steps": [{ "id": "s1", "content": "x", "status": "pending" }]
         }))
         .expect("parse");
-        let changed = apply_plan_update(&mut plan, args, UtcMillis(200), None)
+        let outcome = apply_plan_update(&mut plan, args, UtcMillis(200), None)
             .expect("nop 路径不应触发 validation 关口");
-        assert!(!changed);
+        assert!(!outcome.changed);
+        assert!(outcome.newly_completed_steps.is_empty());
         assert_eq!(plan.updated_at.0, 100);
     }
 
@@ -962,8 +1007,8 @@ mod tests {
         }))
         .expect("parse");
         // 没有 validation report：等同于无证据，必须拒绝把 s1 直接标 completed。
-        let err = apply_plan_update(&mut plan, args, UtcMillis(200), None)
-            .expect_err("缺证据必须拒写");
+        let err =
+            apply_plan_update(&mut plan, args, UtcMillis(200), None).expect_err("缺证据必须拒写");
         match err {
             PlanError::ValidationEvidenceMissing { step_id } => assert_eq!(step_id, "s1"),
             other => panic!("expected ValidationEvidenceMissing, got {other:?}"),
@@ -1014,9 +1059,11 @@ mod tests {
             "steps": [{ "id": "s1", "content": "x", "status": "completed" }]
         }))
         .expect("parse");
-        let changed = apply_plan_update(&mut plan, args, UtcMillis(200), Some(&report))
+        let outcome = apply_plan_update(&mut plan, args, UtcMillis(200), Some(&report))
             .expect("有 pass 记录必须放行");
-        assert!(changed);
+        assert!(outcome.changed);
+        assert_eq!(outcome.newly_completed_steps.len(), 1);
+        assert_eq!(outcome.newly_completed_steps[0].id, "s1");
         assert_eq!(plan.steps[0].status, PlanStepStatus::Completed);
     }
 
@@ -1043,9 +1090,11 @@ mod tests {
             ]
         }))
         .expect("parse");
-        let changed = apply_plan_update(&mut plan, args, UtcMillis(200), None)
+        let outcome = apply_plan_update(&mut plan, args, UtcMillis(200), None)
             .expect("沿用既有 completed 不应触发 validation 关口");
-        assert!(changed);
+        assert!(outcome.changed);
+        // s1 之前就是 completed，不属于"本次新转 completed"。
+        assert!(outcome.newly_completed_steps.is_empty());
         assert_eq!(plan.steps.len(), 2);
         assert_eq!(plan.steps[0].status, PlanStepStatus::Completed);
         assert_eq!(plan.steps[1].status, PlanStepStatus::InProgress);

@@ -4,9 +4,11 @@ use magi_checkpoint::{
     Checkpoint, CheckpointKind, CheckpointLog, CheckpointStore, ConversationCheckpoint,
 };
 use magi_core::{MissionId, SessionId, UtcMillis, WorkspaceRootPath};
-use magi_human_checkpoint::HumanCheckpointStore;
+use magi_human_checkpoint::{
+    HumanCheckpoint, HumanCheckpointLog, HumanCheckpointStatus, HumanCheckpointStore,
+};
 use magi_knowledge_graph::KnowledgeGraphStore;
-use magi_mission_charter::{MissionCharter, MissionCharterStore};
+use magi_mission_charter::{CharterState, MissionCharter, MissionCharterStore};
 use magi_plan::{Plan, PlanStep, PlanStepStatus, PlanStore};
 use magi_validation_runner::ValidationStore;
 use tempfile::TempDir;
@@ -277,4 +279,164 @@ fn enumerate_resumable_missions_returns_empty_when_root_absent() {
     // 不写任何 mission，missions root 目录不会被创建
     let ids = enumerate_resumable_missions(h.workspace(), h.home()).unwrap();
     assert!(ids.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// lifecycle_phase 派生
+// ---------------------------------------------------------------------------
+
+impl Harness {
+    fn write_charter_frozen(&self, mission_id: &MissionId) {
+        let store = MissionCharterStore::open_with_home(self.home(), self.workspace()).unwrap();
+        let mut charter =
+            MissionCharter::new(mission_id.clone(), "demo", "deliver test", UtcMillis::now());
+        charter.success_criteria = vec!["criterion".to_string()];
+        charter.state = CharterState::Frozen;
+        store.save(&charter).unwrap();
+    }
+
+    fn write_plan_with_steps(&self, mission_id: &MissionId, statuses: &[PlanStepStatus]) {
+        let store = PlanStore::open_with_home(self.home(), self.workspace()).unwrap();
+        let mut plan = Plan::new(mission_id.clone(), UtcMillis::now());
+        for (idx, status) in statuses.iter().enumerate() {
+            plan.steps.push(PlanStep {
+                id: format!("s{}", idx + 1),
+                content: format!("step {}", idx + 1),
+                status: *status,
+                depends_on: vec![],
+                notes: None,
+            });
+        }
+        store.save(&plan).unwrap();
+    }
+
+    fn write_empty_plan(&self, mission_id: &MissionId) {
+        let store = PlanStore::open_with_home(self.home(), self.workspace()).unwrap();
+        let plan = Plan::new(mission_id.clone(), UtcMillis::now());
+        store.save(&plan).unwrap();
+    }
+
+    fn write_pending_human_checkpoint(&self, mission_id: &MissionId) {
+        let store = HumanCheckpointStore::open_with_home(self.home(), self.workspace()).unwrap();
+        let now = UtcMillis::now();
+        let mut log = HumanCheckpointLog::new(mission_id.clone(), now);
+        log.entries.push(HumanCheckpoint {
+            sequence: 1,
+            mission_id: mission_id.clone(),
+            status: HumanCheckpointStatus::Pending,
+            created_at: now,
+            plan_step_id: "s1".to_string(),
+            prompt_to_human: "need approval".to_string(),
+            label: None,
+            context: None,
+            decision: None,
+        });
+        store.save(&log).unwrap();
+    }
+}
+
+#[test]
+fn lifecycle_phase_returns_charter_draft_when_charter_not_frozen() {
+    let h = Harness::new();
+    let mid = MissionId::new("M-phase-draft");
+    h.write_charter(&mid); // 默认 Draft
+    h.write_plan(&mid);
+    h.write_checkpoint_log(&mid, vec![h.make_complete_checkpoint(&mid)]);
+    let agg = resume_mission(&mid, h.workspace(), h.home()).unwrap();
+
+    assert_eq!(
+        agg.lifecycle_phase().unwrap(),
+        MissionLifecyclePhase::CharterDraft
+    );
+}
+
+#[test]
+fn lifecycle_phase_returns_awaiting_human_checkpoint_even_when_executing() {
+    let h = Harness::new();
+    let mid = MissionId::new("M-phase-hc");
+    h.write_charter_frozen(&mid);
+    // plan 已 InProgress——人审优先级更高
+    h.write_plan_with_steps(&mid, &[PlanStepStatus::InProgress]);
+    h.write_pending_human_checkpoint(&mid);
+    h.write_checkpoint_log(&mid, vec![h.make_complete_checkpoint(&mid)]);
+    let agg = resume_mission(&mid, h.workspace(), h.home()).unwrap();
+
+    assert_eq!(
+        agg.lifecycle_phase().unwrap(),
+        MissionLifecyclePhase::AwaitingHumanCheckpoint
+    );
+}
+
+#[test]
+fn lifecycle_phase_returns_plan_ready_when_all_steps_pending() {
+    let h = Harness::new();
+    let mid = MissionId::new("M-phase-ready");
+    h.write_charter_frozen(&mid);
+    h.write_plan_with_steps(&mid, &[PlanStepStatus::Pending, PlanStepStatus::Pending]);
+    h.write_checkpoint_log(&mid, vec![h.make_complete_checkpoint(&mid)]);
+    let agg = resume_mission(&mid, h.workspace(), h.home()).unwrap();
+
+    assert_eq!(
+        agg.lifecycle_phase().unwrap(),
+        MissionLifecyclePhase::PlanReady
+    );
+}
+
+#[test]
+fn lifecycle_phase_returns_plan_ready_when_steps_empty() {
+    let h = Harness::new();
+    let mid = MissionId::new("M-phase-empty");
+    h.write_charter_frozen(&mid);
+    h.write_empty_plan(&mid);
+    h.write_checkpoint_log(&mid, vec![h.make_complete_checkpoint(&mid)]);
+    let agg = resume_mission(&mid, h.workspace(), h.home()).unwrap();
+
+    assert_eq!(
+        agg.lifecycle_phase().unwrap(),
+        MissionLifecyclePhase::PlanReady
+    );
+}
+
+#[test]
+fn lifecycle_phase_returns_executing_when_any_step_in_progress() {
+    let h = Harness::new();
+    let mid = MissionId::new("M-phase-exec");
+    h.write_charter_frozen(&mid);
+    h.write_plan_with_steps(
+        &mid,
+        &[
+            PlanStepStatus::Completed,
+            PlanStepStatus::InProgress,
+            PlanStepStatus::Pending,
+        ],
+    );
+    h.write_checkpoint_log(&mid, vec![h.make_complete_checkpoint(&mid)]);
+    let agg = resume_mission(&mid, h.workspace(), h.home()).unwrap();
+
+    assert_eq!(
+        agg.lifecycle_phase().unwrap(),
+        MissionLifecyclePhase::Executing
+    );
+}
+
+#[test]
+fn lifecycle_phase_returns_all_steps_completed_when_all_done_or_cancelled() {
+    let h = Harness::new();
+    let mid = MissionId::new("M-phase-done");
+    h.write_charter_frozen(&mid);
+    h.write_plan_with_steps(
+        &mid,
+        &[
+            PlanStepStatus::Completed,
+            PlanStepStatus::Cancelled,
+            PlanStepStatus::Completed,
+        ],
+    );
+    h.write_checkpoint_log(&mid, vec![h.make_complete_checkpoint(&mid)]);
+    let agg = resume_mission(&mid, h.workspace(), h.home()).unwrap();
+
+    assert_eq!(
+        agg.lifecycle_phase().unwrap(),
+        MissionLifecyclePhase::AllStepsCompleted
+    );
 }

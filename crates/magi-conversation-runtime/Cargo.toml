@@ -24,6 +24,8 @@ magi-memory-store = { path = "../magi-memory-store" }
 magi-validation-runner = { path = "../magi-validation-runner" }
 magi-checkpoint = { path = "../magi-checkpoint" }
 magi-human-checkpoint = { path = "../magi-human-checkpoint" }
+magi-lifecycle-notice = { path = "../magi-lifecycle-notice" }
+magi-mission-metrics = { path = "../magi-mission-metrics" }
 magi-governance = { path = "../magi-governance" }
 magi-skill-runtime = { path = "../magi-skill-runtime" }
 magi-permissions = { path = "../magi-permissions" }

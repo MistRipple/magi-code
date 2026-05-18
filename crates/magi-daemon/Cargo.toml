@@ -20,8 +20,10 @@ magi-conversation-runtime = { path = "../magi-conversation-runtime" }
 magi-event-bus = { path = "../magi-event-bus" }
 magi-governance = { path = "../magi-governance" }
 magi-knowledge-store = { path = "../magi-knowledge-store" }
+magi-lifecycle-notice = { path = "../magi-lifecycle-notice" }
 magi-memory-store = { path = "../magi-memory-store" }
 magi-mission = { path = "../magi-mission" }
+magi-mission-metrics = { path = "../magi-mission-metrics" }
 magi-orchestrator = { path = "../magi-orchestrator" }
 magi-session-store = { path = "../magi-session-store" }
 magi-skill-runtime = { path = "../magi-skill-runtime" }
