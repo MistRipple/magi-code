@@ -3,7 +3,7 @@
 //! Owns the production task dispatch implementation for session turns and conversation loops.
 
 use crate::{
-    ConversationRegistry, SKILL_APPLY_TOOL_NAME, StreamFanOut,
+    ConversationRegistry, SKILL_APPLY_TOOL_NAME,
     conversation_loop::{self, ConversationLoopRequest},
     model_config::NormalizedModelConfig,
     prompt_utils::prepend_session_instructions,
@@ -74,8 +74,6 @@ pub struct LlmTaskDispatcher {
     snapshot_manager: Option<Arc<magi_snapshot::SnapshotManager>>,
     /// Task System v2：Conversation 注册中心，承载 Turn 状态机与单 Conversation 不并发不变式。
     conversation_registry: Option<Arc<ConversationRegistry>>,
-    /// Task System v2：统一 StreamEvent 派生通道。
-    stream_fanout: Option<Arc<StreamFanOut>>,
     /// Task System v2：AgentRole 注册表（来自 ApiState，注入到 conversation_loop）。
     agent_role_registry: Option<Arc<magi_agent_role::AgentRoleRegistry>>,
     /// Task System v2 — L5：父子任务拓扑图。S7 协调器三件套（agent_spawn / send_message /
@@ -197,7 +195,6 @@ impl LlmTaskDispatcher {
             skill_runtime: None,
             snapshot_manager: None,
             conversation_registry: None,
-            stream_fanout: None,
             agent_role_registry: None,
             spawn_graph,
             todo_ledger_registry: Arc::new(magi_todo_ledger::TodoLedgerRegistry::new()),
@@ -291,11 +288,6 @@ impl LlmTaskDispatcher {
 
     pub fn with_conversation_registry(mut self, registry: Arc<ConversationRegistry>) -> Self {
         self.conversation_registry = Some(registry);
-        self
-    }
-
-    pub fn with_stream_fanout(mut self, fanout: Arc<StreamFanOut>) -> Self {
-        self.stream_fanout = Some(fanout);
         self
     }
 
@@ -1201,10 +1193,6 @@ impl LlmTaskDispatcher {
         let conversation_registry = self.conversation_registry.as_ref().expect(
             "LlmTaskDispatcher 缺少 ConversationRegistry，无法走 Task System v2 Turn 状态机",
         );
-        let stream_fanout = self
-            .stream_fanout
-            .as_ref()
-            .expect("LlmTaskDispatcher 缺少 StreamFanOut，无法发布 v2 流派生事件");
         let agent_role_registry = self
             .agent_role_registry
             .as_ref()
@@ -1352,7 +1340,6 @@ impl LlmTaskDispatcher {
             task_store: self.pipeline.execution_runtime.task_store(),
             execution_registry: &self.execution_registry,
             conversation_registry: conversation_registry.as_ref(),
-            stream_fanout: stream_fanout.as_ref(),
             agent_role_registry: agent_role_registry.as_ref(),
             spawn_graph: self.spawn_graph.as_ref(),
             safety_gate: safety_gate.as_ref(),

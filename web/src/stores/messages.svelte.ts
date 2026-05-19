@@ -1031,6 +1031,9 @@ export function applyAuthoritativeProcessingState(input: AppState['processingSta
   const snapshot = normalizeProcessingStateSnapshot(input);
   const hasLocalPendingRequest = messagesState.pendingRequests.size > 0;
   if (!snapshot) {
+    // 后端未给出权威 processingState：把 backend 信号清零，但保留本地乐观 pending。
+    // 不再从 orchestratorRuntimeState/canonical projection 推断 isProcessing，
+    // 单一事实源 = backend 权威订阅 + 本地 pendingRequests。
     messagesState.backendProcessing = false;
     if (hasLocalPendingRequest) {
       updateProcessingState();
@@ -1038,9 +1041,7 @@ export function applyAuthoritativeProcessingState(input: AppState['processingSta
     }
     messagesState.pendingRequests = new Set();
     messagesState.activeMessageIds = new Set();
-    if (!runtimeStateIndicatesProcessing() && !canonicalProjectionIndicatesProcessing()) {
-      sealAllStreamingMessages();
-    }
+    sealAllStreamingMessages();
     updateProcessingState();
     return;
   }
@@ -1065,11 +1066,10 @@ export function applyAuthoritativeProcessingState(input: AppState['processingSta
   const activeMessageIds = snapshot.isProcessing
     ? messagesState.activeMessageIds
     : new Set<string>();
-  const nextIsProcessing = snapshot.isProcessing
-    || runtimeStateIndicatesProcessing()
-    || canonicalProjectionIndicatesProcessing()
-    || activeMessageIds.size > 0
-    || pendingRequestIds.size > 0;
+  // 单一事实源：后端权威 isProcessing + 本地乐观 pendingRequests。
+  // 不再叠加 runtimeState / canonical projection 推断，避免多路 OR 信号让陈旧状态
+  // 把发送按钮卡在"响应中"。
+  const nextIsProcessing = snapshot.isProcessing || pendingRequestIds.size > 0;
 
   messagesState.backendProcessing = snapshot.isProcessing;
   messagesState.pendingRequests = pendingRequestIds;
@@ -1612,11 +1612,6 @@ export function setAppState(nextState: AppState | null) {
 const ANTI_LIFT_BACK_COOLDOWN_MS = 2000;
 
 // Worker 执行状态操作
-function runtimeStateIndicatesProcessing(): boolean {
-  const status = messagesState.orchestratorRuntimeState?.status;
-  return status === 'running' || status === 'waiting' || status === 'paused';
-}
-
 function runtimeStateIsTerminal(runtimeState: OrchestratorRuntimeState | null): boolean {
   const status = runtimeState?.status;
   return status === 'idle'
@@ -1626,34 +1621,11 @@ function runtimeStateIsTerminal(runtimeState: OrchestratorRuntimeState | null): 
     || status === 'cancelled';
 }
 
-function canonicalProjectionIndicatesProcessing(): boolean {
-  const artifacts = messagesState.canonicalTimelineProjection?.artifacts;
-  if (!Array.isArray(artifacts) || artifacts.length === 0) {
-    return false;
-  }
-  return artifacts.some((artifact) => {
-    const metadata = artifact.message?.metadata;
-    if (metadata?.canonical !== true) {
-      return false;
-    }
-    const turnStatus = typeof metadata.turnStatus === 'string'
-      ? metadata.turnStatus.trim()
-      : '';
-    const status = typeof metadata.turnItemStatus === 'string'
-      ? metadata.turnItemStatus.trim()
-      : '';
-    if (turnStatus) {
-      return turnStatus === 'pending' || turnStatus === 'running';
-    }
-    return status === 'pending' || status === 'running';
-  });
-}
-
 function updateProcessingState() {
+  // 单一事实源：后端权威 backendProcessing + 本地乐观 pendingRequests。
+  // 不再叠加 orchestratorRuntimeState / canonical projection / activeMessageIds，
+  // 这些都是同一份后端事实的衍生订阅，多路 OR 会让陈旧状态把按钮卡死。
   const nextIsProcessing = messagesState.backendProcessing
-    || runtimeStateIndicatesProcessing()
-    || canonicalProjectionIndicatesProcessing()
-    || messagesState.activeMessageIds.size > 0
     || messagesState.pendingRequests.size > 0;
 
   // 防回抬保护：forced idle 冷却期内，拒绝从 false 被抬回 true
@@ -1677,13 +1649,9 @@ function timelineHasStreamingMessage(): boolean {
 }
 
 export function hasActiveLocalTimelineTurn(): boolean {
-  return messagesState.isProcessing
-    || messagesState.backendProcessing
-    || runtimeStateIndicatesProcessing()
-    || canonicalProjectionIndicatesProcessing()
-    || messagesState.pendingRequests.size > 0
-    || messagesState.activeMessageIds.size > 0
-    || timelineHasStreamingMessage();
+  // 是否存在尚未结束的本地轮次：等价于 isProcessing 或 timeline 中仍有流式消息。
+  // isProcessing 已经覆盖 backendProcessing + pendingRequests 单一事实源。
+  return messagesState.isProcessing || timelineHasStreamingMessage();
 }
 
 export function markMessageActive(id: string) {
@@ -1692,7 +1660,6 @@ export function markMessageActive(id: string) {
     const next = new Set(messagesState.activeMessageIds);
     next.add(id);
     messagesState.activeMessageIds = next;
-    updateProcessingState();
   }
 }
 
@@ -1702,7 +1669,6 @@ export function markMessageComplete(id: string) {
     const next = new Set(messagesState.activeMessageIds);
     next.delete(id);
     messagesState.activeMessageIds = next;
-    updateProcessingState();
   }
   clearRetryRuntime(id);
 }
@@ -1723,13 +1689,7 @@ export function clearPendingRequest(id: string) {
     const next = new Set(messagesState.pendingRequests);
     next.delete(id);
     messagesState.pendingRequests = next;
-    if (
-      next.size === 0
-      && !messagesState.backendProcessing
-      && !runtimeStateIndicatesProcessing()
-      && messagesState.activeMessageIds.size === 0
-      && !timelineHasStreamingMessage()
-    ) {
+    if (next.size === 0 && !messagesState.backendProcessing && !timelineHasStreamingMessage()) {
       sealAllStreamingMessages();
     }
     updateProcessingState();
@@ -1737,16 +1697,8 @@ export function clearPendingRequest(id: string) {
 }
 
 export function settleProcessingAfterResponseCompletion() {
-  if (
-    messagesState.backendProcessing
-    || canonicalProjectionIndicatesProcessing()
-    || messagesState.pendingRequests.size > 0
-    || messagesState.activeMessageIds.size > 0
-  ) {
-    return;
-  }
-  if (runtimeStateIndicatesProcessing()) {
-    updateProcessingState();
+  // 后端权威发出"已结束"信号时尝试落 idle：只看单一事实源。
+  if (messagesState.backendProcessing || messagesState.pendingRequests.size > 0) {
     return;
   }
   messagesState.lastForcedIdleAt = Date.now();
@@ -1754,10 +1706,7 @@ export function settleProcessingAfterResponseCompletion() {
 }
 
 export function settleAuthoritativeIdleState() {
-  if (canonicalProjectionIndicatesProcessing()) {
-    updateProcessingState();
-    return;
-  }
+  // 后端权威 idle：直接把单一事实源以及衍生状态全部清零。
   messagesState.backendProcessing = false;
   messagesState.pendingRequests = new Set();
   messagesState.activeMessageIds = new Set();

@@ -17,7 +17,9 @@ use magi_bridge_client::{
 };
 use magi_context_runtime::{ContextBudget, ContextRuntime};
 use magi_conversation_runtime::{
-    session_turn_finalize::publish_task_status_turn_item_for_active_sessions,
+    session_turn_finalize::{
+        current_turn_status_is_terminal, publish_task_status_turn_item_for_active_sessions,
+    },
     task_execution_dispatcher::LlmTaskDispatcher,
     task_execution_registry::TaskExecutionPlan,
     task_runner_bridge::{
@@ -25,7 +27,8 @@ use magi_conversation_runtime::{
     },
 };
 use magi_core::{
-    EventId, ExecutionOwnership, LeaseId, TaskStatus, TaskTier, UtcMillis, WorkspaceRootPath,
+    EventId, ExecutionOwnership, LeaseId, SessionId, TaskStatus, TaskTier, UtcMillis,
+    WorkspaceRootPath,
 };
 use magi_event_bus::{EventEnvelope, InMemoryEventBus};
 use magi_governance::GovernanceService;
@@ -649,7 +652,6 @@ impl DaemonRuntime {
                 .with_skill_runtime(app_skill_runtime)
                 .with_snapshot_manager(state.snapshot_manager.clone())
                 .with_conversation_registry(state.conversation_registry.clone())
-                .with_stream_fanout(state.stream_fanout.clone())
                 .with_agent_role_registry(state.agent_role_registry.clone())
                 .with_lifecycle_notices(lifecycle_notice_registry)
                 .with_mission_metrics_registry(mission_metrics_registry),
@@ -772,11 +774,31 @@ impl DaemonRuntime {
             .collect::<Vec<_>>();
 
         if stale_sidecars.is_empty() {
+            // 即便没有 stale chain，也要扫一遍 chain 缺失但 current_turn 非终态的 sidecar，
+            // 防止 daemon 重启后这些孤立轮次让前端误判会话仍在执行。
+            self.cancel_orphan_non_terminal_current_turns();
             return;
         }
 
         let stale_count = stale_sidecars.len();
         for mut sidecar in stale_sidecars {
+            // 在切断 chain 前，先把仍处于非终态的 current_turn 收敛为 cancelled，
+            // 否则 reconcile_terminal_session_task_turns 会因 chain 已为 None 而跳过它，
+            // 留下永远停在 "running" 的孤立 canonical turn。
+            let session_id = sidecar.session_id.clone();
+            if sidecar
+                .current_turn
+                .as_ref()
+                .is_some_and(|turn| !current_turn_status_is_terminal(&turn.status))
+                && let Err(error) = self.session_store.cancel_current_turn(&session_id)
+            {
+                warn!(
+                    ?error,
+                    %session_id,
+                    "取消失效 session chain 的 current_turn 失败"
+                );
+            }
+
             sidecar.active_execution_chain = None;
             sidecar.ownership = ExecutionOwnership::default();
             sidecar.status = if sidecar.recovery_id.is_some() {
@@ -785,8 +807,16 @@ impl DaemonRuntime {
                 SessionExecutionSidecarStatus::Detached
             };
             sidecar.updated_at = UtcMillis::now();
+            // current_turn 已经被 cancel_current_turn 覆盖到最新状态，这里重新读取
+            // 一次，避免 upsert 时把刚 cancel 掉的 turn 又抬回非终态。
+            if let Some(latest) = self.session_store.runtime_sidecar(&session_id) {
+                sidecar.current_turn = latest.current_turn;
+            }
             self.session_store.upsert_runtime_sidecar(sidecar);
         }
+
+        // chain 已经清理完，再统一处理 chain 缺失但 current_turn 仍非终态的 sidecar。
+        self.cancel_orphan_non_terminal_current_turns();
 
         let repository = StateRepository::new(self.state_root.clone());
         let persistence = RuntimeSidecarPersistence::new(
@@ -801,6 +831,47 @@ impl DaemonRuntime {
         warn!(
             stale_count,
             "已清理指向缺失 root task 的 session task chain"
+        );
+    }
+
+    /// daemon 重启后兜底清理：任何 sidecar 若失去 active_execution_chain 但
+    /// current_turn 仍处于非终态，说明上次进程崩溃时这条轮次没被收敛掉。
+    /// 这里统一标记为 cancelled，让 canonical 投影回归终态，避免前端订阅到
+    /// "假在跑"的会话状态。
+    fn cancel_orphan_non_terminal_current_turns(&self) {
+        let orphan_sessions: Vec<SessionId> = self
+            .session_store
+            .runtime_sidecars()
+            .into_iter()
+            .filter_map(|sidecar| {
+                if sidecar.active_execution_chain.is_some() {
+                    return None;
+                }
+                let turn = sidecar.current_turn.as_ref()?;
+                if current_turn_status_is_terminal(&turn.status) {
+                    return None;
+                }
+                Some(sidecar.session_id.clone())
+            })
+            .collect();
+
+        if orphan_sessions.is_empty() {
+            return;
+        }
+
+        let orphan_count = orphan_sessions.len();
+        for session_id in orphan_sessions {
+            if let Err(error) = self.session_store.cancel_current_turn(&session_id) {
+                warn!(
+                    ?error,
+                    %session_id,
+                    "取消孤立非终态 current_turn 失败"
+                );
+            }
+        }
+        warn!(
+            orphan_count,
+            "已清理 daemon 重启遗留的孤立非终态 current_turn"
         );
     }
 

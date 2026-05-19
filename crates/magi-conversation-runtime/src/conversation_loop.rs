@@ -9,8 +9,8 @@ use crate::tool_result_utils::{
     turn_item_status_for_tool_result,
 };
 use crate::{
-    ConversationRegistry, MailboxAuthor, MailboxItem, MailboxKind, RoundOutcome, StreamEvent,
-    StreamFanOut, TaskTurnVisibility, TurnDriver, apply_task_final_visibility,
+    ConversationRegistry, MailboxAuthor, MailboxItem, MailboxKind, RoundOutcome,
+    TaskTurnVisibility, TurnDriver, apply_task_final_visibility,
     apply_task_turn_visibility, apply_task_worker_detail_visibility, canonical_tool_call_name,
     compact_validation_failure, deterministic_task_final_content, execute_task_tool_call_batch,
     forced_task_tool_choice_for_round, record_completed_required_tools,
@@ -32,7 +32,7 @@ use magi_bridge_client::{
 };
 use magi_core::{
     EventId, ExecutionResultStatus, LeaseId, SessionId, Task, TaskId, TaskStatus, ThreadId,
-    ToolCallId, UtcMillis, WorkspaceId,
+    UtcMillis, WorkspaceId,
 };
 use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
 use magi_orchestrator::{ExecutionContextSummary, task_store::TaskStore};
@@ -55,9 +55,6 @@ pub struct ConversationLoopRequest<'a> {
     /// Task System v2：Turn 状态机驱动。每次 LLM 调用都通过 advance_turn 驱动，
     /// 显式经过 Pending → Modeling → Done/Failed 不变式（同一 Conversation 不并发）。
     pub conversation_registry: &'a ConversationRegistry,
-    /// Task System v2 — 统一流派生通道。模型 token / 工具事件 / 系统信号在这里
-    /// 扇出给下游订阅者（writeback / projection / 未来 UI bridge）。
-    pub stream_fanout: &'a StreamFanOut,
     /// Task System v2 — AgentRole 注册表。task_turn_visibility 解析 role_id 时
     /// 必须走该注册表，不再依赖硬编码的 kind→role 默认 mapping。
     pub agent_role_registry: &'a magi_agent_role::AgentRoleRegistry,
@@ -296,7 +293,6 @@ fn run_conversation_loop_inner(
         task_store,
         execution_registry,
         conversation_registry,
-        stream_fanout,
         agent_role_registry,
         spawn_graph,
         safety_gate,
@@ -633,26 +629,12 @@ fn run_conversation_loop_inner(
                     &turn_visibility,
                     &delta.content,
                 );
-                // Task System v2 — 把模型 token delta 同步扇出到 StreamFanOut；
-                // publish_* 负责当前 session_store 写回与 event_bus 派发。
-                if !delta.content.is_empty() || !delta.thinking.is_empty() {
-                    stream_fanout.publish(StreamEvent::ModelDelta {
-                        session_id: session_id.clone(),
-                        content: delta.content.clone(),
-                        thinking: delta.thinking.clone(),
-                    });
-                }
             };
 
             match client.invoke_streaming(invocation_request, &on_delta) {
                 Ok(response) => response,
                 Err(error) => {
                     tracing::error!(task_id = %task.task_id, round = round, ?error, "LLM streaming invocation failed");
-                    stream_fanout.publish(StreamEvent::SystemSignal {
-                        session_id: session_id.clone(),
-                        code: "llm.invocation_failed".to_string(),
-                        detail: Some(format!("round {round}: {error:?}")),
-                    });
                     if task_lease_is_current(task_store, task_id, lease_id) {
                         append_task_error_turn_item(
                             event_bus,
@@ -813,12 +795,6 @@ fn run_conversation_loop_inner(
                 "running",
                 &format!("正在调用 {}", tool_call.function.name),
             );
-            stream_fanout.publish(StreamEvent::ToolEvent {
-                session_id: session_id.clone(),
-                tool_call_id: ToolCallId::new(&tool_call.id),
-                phase: crate::ToolPhase::Started,
-                payload: tool_call.function.name.clone(),
-            });
         }
 
         let tool_results = execute_task_tool_call_batch(
@@ -885,17 +861,6 @@ fn run_conversation_loop_inner(
                 },
                 &format!("{} {}", tool_call.function.name, outcome_label),
             );
-            let phase = if matches!(tool_status, ExecutionResultStatus::Succeeded) {
-                crate::ToolPhase::Succeeded
-            } else {
-                crate::ToolPhase::Failed
-            };
-            stream_fanout.publish(StreamEvent::ToolEvent {
-                session_id: session_id.clone(),
-                tool_call_id: ToolCallId::new(&tool_call.id),
-                phase,
-                payload: summarize_tool_result(&result),
-            });
             if !matches!(tool_status, ExecutionResultStatus::Succeeded) {
                 failed_tool_summaries.push(format!(
                     "{}: {}",
@@ -2271,7 +2236,6 @@ mod tests {
             task_store: &task_store,
             execution_registry: &TaskExecutionRegistry::default(),
             conversation_registry: &ConversationRegistry::new(),
-            stream_fanout: &StreamFanOut::new(),
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
             spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
             safety_gate: None,
@@ -2409,7 +2373,6 @@ mod tests {
             task_store: &task_store,
             execution_registry: &TaskExecutionRegistry::default(),
             conversation_registry: &ConversationRegistry::new(),
-            stream_fanout: &StreamFanOut::new(),
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
             spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
             safety_gate: None,
@@ -2731,7 +2694,6 @@ mod tests {
             task_store: &task_store,
             execution_registry: &TaskExecutionRegistry::default(),
             conversation_registry: &ConversationRegistry::new(),
-            stream_fanout: &StreamFanOut::new(),
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
             spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
             safety_gate: None,
@@ -2949,7 +2911,6 @@ mod tests {
             task_store: &task_store,
             execution_registry: &TaskExecutionRegistry::default(),
             conversation_registry: &ConversationRegistry::new(),
-            stream_fanout: &StreamFanOut::new(),
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
             spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
             safety_gate: None,

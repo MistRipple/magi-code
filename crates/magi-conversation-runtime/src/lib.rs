@@ -22,7 +22,6 @@ pub mod session_turn_finalize;
 pub mod session_writeback;
 pub mod settings_store;
 mod skill_apply_tool;
-mod stream;
 pub mod task_execution_dispatcher;
 pub mod task_execution_registry;
 pub mod task_helpers;
@@ -43,7 +42,6 @@ pub use registry::ConversationRegistry;
 pub use skill_apply_tool::{
     SKILL_APPLY_TOOL_NAME, execute_skill_apply_from_runtime, skill_apply_tool_definition,
 };
-pub use stream::{StreamEvent, StreamFanOut, SubscriptionId, ToolPhase};
 pub use task_helpers::{
     BASE_TOOL_CALL_ROUNDS, MAX_TOOL_CALL_ROUNDS, TaskTurnVisibility, apply_task_final_visibility,
     apply_task_turn_visibility, apply_task_worker_detail_visibility, canonical_tool_call_name,

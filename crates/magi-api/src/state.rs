@@ -18,7 +18,7 @@ use magi_bridge_client::{
     ModelBridgeClient, StdioMcpBridgeClient,
 };
 use magi_conversation_runtime::{
-    ConversationRegistry, StreamFanOut,
+    ConversationRegistry,
     task_execution_dispatcher::{ExecutionPipeline, LlmTaskDispatcher},
     task_execution_registry::TaskExecutionRegistry,
     task_runner_bridge::{
@@ -561,9 +561,6 @@ pub struct ApiState {
     pub tunnel_manager: crate::tunnel::TunnelManager,
     pub snapshot_manager: Arc<SnapshotManager>,
     pub conversation_registry: Arc<ConversationRegistry>,
-    /// Task System v2：统一 StreamEvent 派生通道（模型 token / 工具事件 / 系统信号）。
-    /// 生产者：LLM IO + 工具 IO 段；订阅者：UI bridge / lane summary / projection 等。
-    pub stream_fanout: Arc<StreamFanOut>,
     /// Task System v2：AgentRole 注册表（替代 task_worker_catalog 硬编码 prompt）。
     /// 加载策略：`~/.magi/roles/*.json` 优先，回落到 crate 内置 builtin 集。
     pub agent_role_registry: Arc<magi_agent_role::AgentRoleRegistry>,
@@ -683,7 +680,6 @@ impl ApiState {
             tunnel_manager: crate::tunnel::TunnelManager::new(38123),
             snapshot_manager: Arc::new(SnapshotManager::new()),
             conversation_registry: Arc::new(ConversationRegistry::new()),
-            stream_fanout: Arc::new(StreamFanOut::new()),
             agent_role_registry: Arc::new(magi_agent_role::AgentRoleRegistry::load_default()),
             spawn_graph: Arc::new(Mutex::new(magi_spawn_graph::SpawnGraph::new())),
         }
