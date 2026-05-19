@@ -282,7 +282,9 @@
     {/if}
     <div class="user-row">
       <div class="user-content">
-        <div class="user-plain-content">{message.content || ''}</div>
+        <div class="user-plain-content">
+          <MarkdownContent content={message.content || ''} isStreaming={false} />
+        </div>
       </div>
     </div>
     <div class="user-time">
@@ -454,6 +456,22 @@
   .user-plain-content {
     white-space: pre-wrap;
     overflow-wrap: anywhere;
+  }
+
+  /* 用户气泡是固定蓝底，markdown 内部所有文本/标记/代码块都强制白色，
+     不随主题变化——避免浅色模式下文字与蓝底对比度过低。 */
+  .user-content :global(.markdown-content),
+  .user-content :global(.markdown-content *) {
+    color: inherit;
+  }
+  .user-content :global(.markdown-content code),
+  .user-content :global(.markdown-content pre) {
+    background: rgba(255, 255, 255, 0.18);
+    color: inherit;
+  }
+  .user-content :global(.markdown-content a) {
+    color: inherit;
+    text-decoration: underline;
   }
 
   .user-time {
