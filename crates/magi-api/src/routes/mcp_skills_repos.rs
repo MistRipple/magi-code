@@ -1,10 +1,11 @@
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{Query, State},
     routing::{get, post},
 };
 use magi_bridge_client::{McpServerConfig, StdioMcpBridgeClient};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::{errors::ApiError, skill_loader, state::ApiState};
@@ -27,6 +28,10 @@ pub fn routes() -> Router<ApiState> {
         .route("/settings/skills/library", get(list_skills))
         .route("/settings/skills/install", post(install_skill))
         .route("/settings/skills/install-local", post(install_local_skill))
+        .route(
+            "/settings/skills/instruction-preview",
+            get(get_instruction_skill_preview),
+        )
         .route(
             "/settings/skills/scan-local",
             post(scan_local_skill_directory),
@@ -1209,6 +1214,41 @@ async fn download_github_skill(
     }
 
     Ok(())
+}
+
+async fn get_instruction_skill_preview(
+    State(state): State<ApiState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let skill_id = params
+        .get("skillId")
+        .or_else(|| params.get("skillName"))
+        .or_else(|| params.get("name"))
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::InvalidInput("skillId 不能为空".to_string()))?;
+
+    let instruction_skills = load_instruction_skills(&state);
+    let matched = instruction_skills
+        .iter()
+        .find(|item| instruction_skill_matches(item, skill_id))
+        .ok_or_else(|| ApiError::not_found("技能未安装", skill_id))?;
+
+    let directory_path = matched
+        .get("directoryPath")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::InvalidInput(format!("技能缺少 directoryPath: {skill_id}")))?;
+
+    let dir = PathBuf::from(directory_path);
+    let instruction = skill_loader::read_skill_instruction(&dir);
+    let preview: String = instruction.chars().take(200).collect();
+
+    Ok(Json(serde_json::json!({
+        "skillId": skill_id,
+        "preview": preview,
+    })))
 }
 
 #[cfg(test)]

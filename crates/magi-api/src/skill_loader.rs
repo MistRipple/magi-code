@@ -9,7 +9,7 @@ const SKILLS_CONFIG_SECTION: &str = "skillsConfig";
 const TOP_LEVEL_CUSTOM_TOOLS_SECTION: &str = "customTools";
 const TOP_LEVEL_INSTRUCTION_SKILLS_SECTION: &str = "skills";
 
-fn read_skill_instruction(dir_path: &Path) -> String {
+pub fn read_skill_instruction(dir_path: &Path) -> String {
     for filename in ["prompt.md", "SKILL.md", "README.md"] {
         let path = dir_path.join(filename);
         if path.exists() {
