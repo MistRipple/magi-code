@@ -15,70 +15,72 @@
 {#if plan}
   <div class="plan-card" data-status={plan.riskLevel ?? 'default'}>
     <div class="plan-header">
-      <div class="plan-title">
+      <span class="plan-title">
         <Icon name="note" size={14} />
         <span>{i18n.t('planCard.title')}</span>
-      </div>
+      </span>
       <button class="toggle-btn" onclick={() => (isExpanded = !isExpanded)}>
         <Icon name={isExpanded ? 'chevron-up' : 'chevron-down'} size={14} />
       </button>
     </div>
 
-    <div class="plan-goal">{plan.goal}</div>
+    <div class="plan-body">
+      <div class="plan-goal">{plan.goal}</div>
 
-    {#if plan.analysis}
-      <div class="plan-section">
-        <div class="section-title">{i18n.t('planCard.analysis')}</div>
-        <div class="section-body">{plan.analysis}</div>
-      </div>
-    {/if}
+      {#if plan.analysis}
+        <div class="plan-section">
+          <div class="section-title">{i18n.t('planCard.analysis')}</div>
+          <div class="section-body">{plan.analysis}</div>
+        </div>
+      {/if}
 
-    {#if plan.constraints && plan.constraints.length > 0}
-      <div class="plan-section">
-        <div class="section-title">{i18n.t('planCard.constraints')}</div>
-        <ul>
-          {#each plan.constraints as item}
-            <li>{item}</li>
-          {/each}
-        </ul>
-      </div>
-    {/if}
+      {#if plan.constraints && plan.constraints.length > 0}
+        <div class="plan-section">
+          <div class="section-title">{i18n.t('planCard.constraints')}</div>
+          <ul>
+            {#each plan.constraints as item}
+              <li>{item}</li>
+            {/each}
+          </ul>
+        </div>
+      {/if}
 
-    {#if plan.acceptanceCriteria && plan.acceptanceCriteria.length > 0}
-      <div class="plan-section">
-        <div class="section-title">{i18n.t('planCard.acceptanceCriteria')}</div>
-        <ul>
-          {#each plan.acceptanceCriteria as item}
-            <li>{item}</li>
-          {/each}
-        </ul>
-      </div>
-    {/if}
+      {#if plan.acceptanceCriteria && plan.acceptanceCriteria.length > 0}
+        <div class="plan-section">
+          <div class="section-title">{i18n.t('planCard.acceptanceCriteria')}</div>
+          <ul>
+            {#each plan.acceptanceCriteria as item}
+              <li>{item}</li>
+            {/each}
+          </ul>
+        </div>
+      {/if}
 
-    {#if plan.riskLevel}
-      <div class="plan-section">
-        <div class="section-title">{i18n.t('planCard.riskLevel')}</div>
-        <div class="risk-badge {plan.riskLevel}">{plan.riskLevel}</div>
-      </div>
-    {/if}
+      {#if plan.riskLevel}
+        <div class="plan-section">
+          <div class="section-title">{i18n.t('planCard.riskLevel')}</div>
+          <div class="risk-badge {plan.riskLevel}">{plan.riskLevel}</div>
+        </div>
+      {/if}
 
-    {#if plan.riskFactors && plan.riskFactors.length > 0}
-      <div class="plan-section">
-        <div class="section-title">{i18n.t('planCard.riskFactors')}</div>
-        <ul>
-          {#each plan.riskFactors as item}
-            <li>{item}</li>
-          {/each}
-        </ul>
-      </div>
-    {/if}
+      {#if plan.riskFactors && plan.riskFactors.length > 0}
+        <div class="plan-section">
+          <div class="section-title">{i18n.t('planCard.riskFactors')}</div>
+          <ul>
+            {#each plan.riskFactors as item}
+              <li>{item}</li>
+            {/each}
+          </ul>
+        </div>
+      {/if}
 
-    {#if plan.rawJson && isExpanded}
-      <div class="plan-raw">
-        <div class="section-title">{i18n.t('planCard.rawData')}</div>
-        <pre><code>{plan.rawJson}</code></pre>
-      </div>
-    {/if}
+      {#if plan.rawJson && isExpanded}
+        <div class="plan-raw">
+          <div class="section-title">{i18n.t('planCard.rawData')}</div>
+          <pre><code>{plan.rawJson}</code></pre>
+        </div>
+      {/if}
+    </div>
   </div>
 {/if}
 
