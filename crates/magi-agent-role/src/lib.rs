@@ -2,8 +2,12 @@
 //!
 //! role 定义以 markdown 文件承载，每个文件等价于一个 role：
 //! - 头部用 `---` 包围的 YAML 风格 front-matter，承载 `id` / `supported_kinds` /
-//!   `parallelism_limit` / `coordinator_mode` 四个元数据字段。
+//!   `parallelism_limit` / `coordinator_mode` / `version` 五个元数据字段。
 //! - body 即 system_prompt 正文，可以是多行中文/英文/Markdown，原样塞入 LLM。
+//!
+//! `version` 是 schema 演进锚点：当 markdown 格式发生破坏性变化（如新增必填
+//! key 或重命名既有 key），loader 可凭此字段在不解析 body 的前提下识别旧
+//! 文件并触发迁移。当前内置集与默认值均为 `1`。
 //!
 //! 加载顺序：
 //! 1. crate 内置 builtin 集（编译期 `include_str!` 嵌入，12 个角色一一对应一个 .md）
@@ -55,6 +59,14 @@ pub struct AgentRole {
     pub parallelism_limit: Option<u32>,
     #[serde(default)]
     pub coordinator_mode: bool,
+    /// Schema 演进锚点。当 markdown front-matter 出现破坏性变化时，loader 可凭
+    /// 此字段识别版本并触发迁移。默认值 = 1，对应当前 schema。
+    #[serde(default = "default_role_version")]
+    pub version: u32,
+}
+
+fn default_role_version() -> u32 {
+    1
 }
 
 /// 用字符串标签序列化 TaskKind，便于人手写 markdown front-matter。
@@ -308,10 +320,11 @@ const BUILTIN_ROLE_SOURCES: &[(&str, &str)] = &[
 /// - `supported_kinds: [a, b]`（中括号 + 逗号分隔，元素是 snake_case 标签）
 /// - `parallelism_limit: <u32>`
 /// - `coordinator_mode: true|false`
+/// - `version: <u32>`（缺省 = 1）
 ///
 /// 选择"手写 mini parser"而不是引 serde_yaml 的理由：
-/// 1. front-matter 字段集合是封闭已知的 4 个 key，没有递归结构；
-/// 2. 引一个完整 YAML 解析器（serde_yaml 链路依赖 unmaintained 警告）只为这 4 个
+/// 1. front-matter 字段集合是封闭已知的 5 个 key，没有递归结构；
+/// 2. 引一个完整 YAML 解析器（serde_yaml 链路依赖 unmaintained 警告）只为这 5 个
 ///    字段，体积/编译时间不划算；
 /// 3. 解析逻辑就放在本 crate 里，错误信息能直接指出"第几行哪个 key 错了"。
 fn parse_role_markdown(raw: &str) -> Result<AgentRole, String> {
@@ -330,6 +343,7 @@ fn parse_role_markdown(raw: &str) -> Result<AgentRole, String> {
     let mut supported_kinds: Vec<TaskKindLabel> = Vec::new();
     let mut parallelism_limit: Option<u32> = None;
     let mut coordinator_mode = false;
+    let mut version: u32 = default_role_version();
 
     for (lineno, line) in header.lines().enumerate() {
         let trimmed = line.trim();
@@ -362,6 +376,11 @@ fn parse_role_markdown(raw: &str) -> Result<AgentRole, String> {
                     ));
                 }
             },
+            "version" => {
+                version = value
+                    .parse()
+                    .map_err(|err| format!("第 {} 行 version 不是整数: {err}", lineno + 1))?;
+            }
             other => {
                 return Err(format!("第 {} 行未识别字段 `{other}`", lineno + 1));
             }
@@ -379,6 +398,7 @@ fn parse_role_markdown(raw: &str) -> Result<AgentRole, String> {
         supported_kinds,
         parallelism_limit,
         coordinator_mode,
+        version,
     })
 }
 
@@ -522,13 +542,44 @@ mod tests {
 
     #[test]
     fn parse_role_markdown_handles_all_fields() {
-        let raw = "---\nid: ml-engineer\nsupported_kinds: [local_agent, local_bash]\nparallelism_limit: 2\ncoordinator_mode: false\n---\n你是机器学习工程师\n";
+        let raw = "---\nid: ml-engineer\nsupported_kinds: [local_agent, local_bash]\nparallelism_limit: 2\ncoordinator_mode: false\nversion: 1\n---\n你是机器学习工程师\n";
         let role = parse_role_markdown(raw).expect("解析成功");
         assert_eq!(role.id, "ml-engineer");
         assert_eq!(role.system_prompt, "你是机器学习工程师");
         assert_eq!(role.parallelism_limit, Some(2));
         assert_eq!(role.supported_task_kinds().len(), 2);
         assert!(!role.coordinator_mode);
+        assert_eq!(role.version, 1);
+    }
+
+    #[test]
+    fn parse_role_markdown_defaults_version_to_one() {
+        // 缺省 version 字段时回落到 1，保证既有 builtin 文件不需要全量加 version 也可解析。
+        let raw = "---\nid: legacy\nsupported_kinds: [local_agent]\n---\n你是 legacy\n";
+        let role = parse_role_markdown(raw).expect("解析成功");
+        assert_eq!(role.version, 1);
+    }
+
+    #[test]
+    fn parse_role_markdown_rejects_non_integer_version() {
+        let err = parse_role_markdown(
+            "---\nid: foo\nsupported_kinds: [local_agent]\nversion: v1\n---\n你是 foo\n",
+        )
+        .expect_err("version 非整数应失败");
+        assert!(err.contains("version"), "{err}");
+    }
+
+    #[test]
+    fn builtin_roles_all_at_version_one() {
+        // 守护内置集与代码默认版本同步——schema 升版时必须同步改这里。
+        let reg = AgentRoleRegistry::from_map(builtin_roles_map());
+        for role in reg.all() {
+            assert_eq!(
+                role.version, 1,
+                "builtin role {} version 应为 1，实际 {}",
+                role.id, role.version
+            );
+        }
     }
 
     #[test]
