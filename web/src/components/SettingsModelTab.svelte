@@ -3,6 +3,8 @@
     resolveModelConfigTabStatus,
   } from '../shared/model-governance';
   import { resolveAgentIndicatorVariant } from '../lib/agent-status-indicator';
+  import type { AgentBinding } from '../shared/types/registry-types';
+  import type { RoleTemplate } from '../shared/types/role-templates';
   import { i18n } from '../stores/i18n.svelte';
   import Icon from './Icon.svelte';
   import ModelConfigForm from './ModelConfigForm.svelte';
@@ -22,11 +24,12 @@
     modelDropdownOpen,
     dropdownPosition,
     modelLists,
+    roleTemplates,
+    registryAgents,
     getBaseUrlPlaceholder,
     shouldRecommendStandardUrlMode,
-    getOpenAiProtocolValue,
-    setOpenAiProtocolValue,
     openModelDropdown,
+    closeModelDropdown,
     fetchModelList,
     selectModel,
     saveModelConfig,
@@ -34,7 +37,6 @@
     getStatusClass,
     getStatusText,
     getWorkerDisplayName,
-    handleWorkerEnabledToggle,
     getAgentColor,
     deleteEngine,
     openAddEngineDialog
@@ -53,23 +55,43 @@
     modelDropdownOpen: Record<string, boolean>;
     dropdownPosition: any;
     modelLists: Record<string, string[]>;
-    getBaseUrlPlaceholder: (provider: string) => string;
-    shouldRecommendStandardUrlMode: (provider: any, baseUrl: string) => boolean;
-    getOpenAiProtocolValue: (config: any) => 'responses' | 'chat';
-    setOpenAiProtocolValue: (config: any, value: unknown) => void;
+    roleTemplates: RoleTemplate[];
+    registryAgents: AgentBinding[];
+    getBaseUrlPlaceholder: () => string;
+    shouldRecommendStandardUrlMode: (baseUrl: string) => boolean;
     openModelDropdown: (type: string, target: HTMLElement) => void;
+    closeModelDropdown: (key: string) => void;
     fetchModelList: (type: 'orch' | 'comp' | 'worker') => void;
-    selectModel: (type: 'orch' | 'comp' | 'worker', model: string) => void;
+    selectModel: (type: string, model: string) => void;
     saveModelConfig: (type: 'orch' | 'comp' | 'worker') => void;
     testModelConnection: (type: 'orch' | 'comp' | 'worker') => void;
     getStatusClass: (status: string) => string;
     getStatusText: (status: string) => string;
     getWorkerDisplayName: (workerId: string) => string;
-    handleWorkerEnabledToggle: (workerId: string, enabled: boolean) => void;
     getAgentColor: (templateId: string, colorToken?: string) => any;
     deleteEngine: (engineId: string) => void;
     openAddEngineDialog: () => void;
   }>();
+
+  // 角色 displayName 解析（带 i18n fallback）
+  function resolveTemplateDisplayName(templateId: string): string {
+    const tmpl = roleTemplates.find((t: RoleTemplate) => t.templateId === templateId);
+    if (!tmpl) return templateId;
+    const key = tmpl.i18n?.displayNameKey || `roleTemplate.${tmpl.templateId}.displayName`;
+    const translated = i18n.t(key);
+    return translated !== key ? translated : tmpl.displayName;
+  }
+
+  // 反向 lookup：每个引擎服务于哪些角色
+  const inheritedConsumers = $derived(
+    registryAgents.filter((a: AgentBinding) => a.enabled !== false && a.modelSource !== 'engine')
+  );
+
+  function consumersOf(engineId: string): AgentBinding[] {
+    return registryAgents.filter(
+      (a: AgentBinding) => a.enabled !== false && a.modelSource === 'engine' && a.engineId === engineId,
+    );
+  }
 
   // --- Worker tabs 滚动状态检测 ---
   let workerTabsWrapperEl: HTMLElement | undefined = $state();
@@ -110,8 +132,8 @@
             onclick={() => (modelConfigTab = 'orch')}
           >
             <span
-              class="model-status-dot {getStatusClass(resolveModelConfigTabStatus('orch', modelStatuses, workerConfigs))}"
-              title={getStatusText(resolveModelConfigTabStatus('orch', modelStatuses, workerConfigs))}
+              class="model-status-dot {getStatusClass(resolveModelConfigTabStatus('orch', modelStatuses))}"
+              title={getStatusText(resolveModelConfigTabStatus('orch', modelStatuses))}
             ></span>
             {i18n.t('settings.model.orchestratorModel')}
           </button>
@@ -121,8 +143,8 @@
             onclick={() => (modelConfigTab = 'comp')}
           >
             <span
-              class="model-status-dot {getStatusClass(resolveModelConfigTabStatus('comp', modelStatuses, workerConfigs))}"
-              title={getStatusText(resolveModelConfigTabStatus('comp', modelStatuses, workerConfigs))}
+              class="model-status-dot {getStatusClass(resolveModelConfigTabStatus('comp', modelStatuses))}"
+              title={getStatusText(resolveModelConfigTabStatus('comp', modelStatuses))}
             ></span>
             {i18n.t('settings.model.auxiliaryModel')}
           </button>
@@ -144,9 +166,8 @@
             {modelLists}
             {getBaseUrlPlaceholder}
             {shouldRecommendStandardUrlMode}
-            {getOpenAiProtocolValue}
-            {setOpenAiProtocolValue}
             {openModelDropdown}
+            {closeModelDropdown}
             {fetchModelList}
             {selectModel}
             {saveModelConfig}
@@ -168,9 +189,8 @@
             {modelLists}
             {getBaseUrlPlaceholder}
             {shouldRecommendStandardUrlMode}
-            {getOpenAiProtocolValue}
-            {setOpenAiProtocolValue}
             {openModelDropdown}
+            {closeModelDropdown}
             {fetchModelList}
             {selectModel}
             {saveModelConfig}
@@ -192,7 +212,7 @@
       >
         <div class="worker-model-tabs" onscroll={updateScrollState}>
           {#each workerModelTabs as workerTab (workerTab)}
-            {@const workerStatus = resolveModelConfigTabStatus(workerTab, modelStatuses, workerConfigs)}
+            {@const workerStatus = resolveModelConfigTabStatus(workerTab, modelStatuses)}
             {@const workerIndicatorVariant = resolveAgentIndicatorVariant(workerStatus)}
             {@const workerColor = getAgentColor(workerTab)}
             <button
@@ -244,7 +264,6 @@
           bind:config={workerConfigs[workerModelTab]}
           bind:keyVisible
           showAdvancedOptions={true}
-          showEnabledToggle={true}
           description={null}
           {saveStatus}
           {testStatus}
@@ -254,14 +273,12 @@
           {modelLists}
           {getBaseUrlPlaceholder}
           {shouldRecommendStandardUrlMode}
-          {getOpenAiProtocolValue}
-          {setOpenAiProtocolValue}
           {openModelDropdown}
+          {closeModelDropdown}
           {fetchModelList}
           {selectModel}
           {saveModelConfig}
           {testModelConnection}
-          {handleWorkerEnabledToggle}
         />
       {:else}
         <div class="llm-config-empty">
@@ -271,6 +288,103 @@
           </div>
         </div>
       {/if}
+    </div>
+
+    <div class="settings-section engine-usage-section">
+      <div class="settings-section-header">
+        <div class="settings-section-title">{i18n.t('settings.model.engineUsageTitle')}</div>
+        <div class="settings-section-subtitle">{i18n.t('settings.model.engineUsageSubtitle')}</div>
+      </div>
+
+      <div class="engine-usage-list">
+        <div class="engine-usage-row engine-usage-row--system">
+          <div class="engine-label">
+            <span
+              class="model-status-dot {getStatusClass(resolveModelConfigTabStatus('orch', modelStatuses))}"
+              title={getStatusText(resolveModelConfigTabStatus('orch', modelStatuses))}
+            ></span>
+            <div class="engine-label-text">
+              <span class="engine-name">{i18n.t('settings.model.orchestratorModel')}</span>
+              {#if orchConfig?.model}
+                <span class="engine-model-tag">{orchConfig.model}</span>
+              {/if}
+            </div>
+          </div>
+          <div class="engine-consumers">
+            {#if inheritedConsumers.length > 0}
+              {#each inheritedConsumers as agent (agent.templateId)}
+                {@const color = getAgentColor(agent.templateId)}
+                <span
+                  class="consumer-chip"
+                  style="background: {color.muted}; color: {color.color}"
+                >{resolveTemplateDisplayName(agent.templateId)}</span>
+              {/each}
+            {:else}
+              <span class="engine-empty">{i18n.t('settings.model.engineNoConsumer')}</span>
+            {/if}
+          </div>
+        </div>
+
+        <div class="engine-usage-row engine-usage-row--system">
+          <div class="engine-label">
+            <span
+              class="model-status-dot {getStatusClass(resolveModelConfigTabStatus('comp', modelStatuses))}"
+              title={getStatusText(resolveModelConfigTabStatus('comp', modelStatuses))}
+            ></span>
+            <div class="engine-label-text">
+              <span class="engine-name">{i18n.t('settings.model.auxiliaryModel')}</span>
+              {#if compConfig?.model}
+                <span class="engine-model-tag">{compConfig.model}</span>
+              {/if}
+            </div>
+          </div>
+          <div class="engine-consumers">
+            <span class="engine-system-note">{i18n.t('settings.model.auxiliarySystemUsage')}</span>
+          </div>
+        </div>
+
+        {#if workerModelTabs.length > 0}
+          <div class="engine-usage-divider"></div>
+          {#each workerModelTabs as workerId (workerId)}
+            {@const consumers = consumersOf(workerId)}
+            {@const workerStatus = resolveModelConfigTabStatus(workerId, modelStatuses)}
+            {@const indicatorVariant = resolveAgentIndicatorVariant(workerStatus)}
+            {@const workerColor = getAgentColor(workerId)}
+            <div class="engine-usage-row">
+              <div class="engine-label">
+                <span
+                  class="worker-dot"
+                  class:brand={indicatorVariant === 'brand'}
+                  class:disabled={indicatorVariant === 'disabled'}
+                  class:warning={indicatorVariant === 'warning'}
+                  class:error={indicatorVariant === 'error'}
+                  style="--worker-brand-color: {workerColor.color}"
+                  title={getStatusText(workerStatus)}
+                ></span>
+                <div class="engine-label-text">
+                  <span class="engine-name">{getWorkerDisplayName(workerId)}</span>
+                  {#if workerConfigs[workerId]?.model}
+                    <span class="engine-model-tag">{workerConfigs[workerId].model}</span>
+                  {/if}
+                </div>
+              </div>
+              <div class="engine-consumers">
+                {#if consumers.length > 0}
+                  {#each consumers as agent (agent.templateId)}
+                    {@const color = getAgentColor(agent.templateId)}
+                    <span
+                      class="consumer-chip"
+                      style="background: {color.muted}; color: {color.color}"
+                    >{resolveTemplateDisplayName(agent.templateId)}</span>
+                  {/each}
+                {:else}
+                  <span class="engine-empty">{i18n.t('settings.model.engineIdle')}</span>
+                {/if}
+              </div>
+            </div>
+          {/each}
+        {/if}
+      </div>
     </div>
   </div>
 </div>
@@ -491,6 +605,120 @@
     }
     .worker-tab-delete {
       opacity: 1;
+    }
+  }
+
+  /* ===== 引擎用途概览 ===== */
+  .engine-usage-section {
+    margin-top: var(--space-4);
+  }
+  .engine-usage-section .settings-section-header {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    justify-content: flex-start;
+    gap: 4px;
+    margin-bottom: var(--space-3);
+  }
+  .settings-section-subtitle {
+    font-size: var(--text-xs);
+    color: var(--foreground-muted);
+    line-height: 1.5;
+  }
+  .engine-usage-list {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md, 10px);
+    padding: var(--space-3) var(--space-4);
+  }
+  .engine-usage-row {
+    display: grid;
+    grid-template-columns: minmax(0, 220px) minmax(0, 1fr);
+    gap: var(--space-3);
+    align-items: flex-start;
+    padding: 6px 0;
+  }
+  .engine-usage-row + .engine-usage-row {
+    border-top: 1px dashed var(--border);
+    padding-top: var(--space-2);
+  }
+  .engine-usage-divider {
+    height: 1px;
+    background: var(--border);
+    margin: 4px 0;
+    opacity: 0.7;
+  }
+  .engine-usage-divider + .engine-usage-row {
+    border-top: none;
+    padding-top: 0;
+  }
+  .engine-label {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    min-width: 0;
+    padding-top: 2px;
+  }
+  .engine-label-text {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    min-width: 0;
+    flex: 1;
+  }
+  .engine-name {
+    font-size: var(--text-sm);
+    font-weight: var(--font-medium);
+    color: var(--foreground);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .engine-model-tag {
+    font-size: var(--text-xs);
+    color: var(--foreground-muted);
+    background: var(--surface-3);
+    padding: 1px 6px;
+    border-radius: var(--radius-sm);
+    font-family: var(--font-mono, ui-monospace, SFMono-Regular, monospace);
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    align-self: flex-start;
+  }
+  .engine-consumers {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    align-items: center;
+    min-width: 0;
+  }
+  .consumer-chip {
+    display: inline-flex;
+    align-items: center;
+    height: 22px;
+    padding: 0 10px;
+    border-radius: var(--radius-full);
+    font-size: var(--text-xs);
+    font-weight: var(--font-medium);
+    white-space: nowrap;
+    line-height: 1;
+  }
+  .engine-empty,
+  .engine-system-note {
+    font-size: var(--text-xs);
+    color: var(--foreground-subtle, var(--foreground-muted));
+    font-style: italic;
+  }
+
+  @container settings-model (max-width: 640px) {
+    .engine-usage-row {
+      grid-template-columns: 1fr;
+      gap: var(--space-2);
     }
   }
 </style>

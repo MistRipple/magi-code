@@ -604,11 +604,12 @@ async fn enhance_prompt(
     };
 
     let payload = response.parse_chat_payload();
-    let Some(content) = payload.content.map(|c| c.trim().to_string()).filter(|c| !c.is_empty())
+    let Some(content) = payload
+        .content
+        .map(|c| c.trim().to_string())
+        .filter(|c| !c.is_empty())
     else {
-        return Err(ApiError::InvalidInput(
-            "辅助模型返回内容为空".to_string(),
-        ));
+        return Err(ApiError::InvalidInput("辅助模型返回内容为空".to_string()));
     };
 
     Ok(Json(serde_json::json!({

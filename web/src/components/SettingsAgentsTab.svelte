@@ -10,7 +10,6 @@
     roleTemplates,
     registryAgents,
     registryEngines,
-    workerConfigs,
     getAgentColor,
     getWorkerDisplayName,
     updateRoleEnabled,
@@ -19,14 +18,13 @@
     roleTemplates: RoleTemplate[];
     registryAgents: AgentBinding[];
     registryEngines: ModelEngine[];
-    workerConfigs: Record<string, { enabled?: boolean }>;
     getAgentColor: (templateId: string, colorToken?: string) => any;
     getWorkerDisplayName: (workerId: string) => string;
     updateRoleEnabled: (templateId: string, enabled: boolean) => void;
     updateRoleEngine: (templateId: string, engineId: string) => void;
   }>();
 
-  const selectableEngines = $derived(resolveSelectableRegistryEngines(registryEngines, workerConfigs));
+  const selectableEngines = $derived(resolveSelectableRegistryEngines(registryEngines));
 
   function resolveLocalizedTemplateDisplayName(tmpl: RoleTemplate, locale: string): string {
     void locale;
@@ -50,7 +48,7 @@
       {@const agent = registryAgents.find((a: AgentBinding) => a.templateId === tmpl.templateId)}
       {@const isActive = agent ? agent.enabled !== false : true}
       {@const isExplicitEngine = agent?.modelSource === 'engine'}
-      {@const isOperational = agent ? isAgentBindingOperational(agent, registryEngines, workerConfigs) : true}
+      {@const isOperational = agent ? isAgentBindingOperational(agent, registryEngines) : true}
       {@const selectValue = isExplicitEngine ? agent.engineId : ''}
       {@const agentColorPair = getAgentColor(tmpl.templateId, tmpl.defaultUI?.colorToken)}
       {@const displayName = resolveLocalizedTemplateDisplayName(tmpl, locale)}

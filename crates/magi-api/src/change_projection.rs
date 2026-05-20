@@ -194,6 +194,12 @@ pub(crate) fn collect_session_pending_changes(
     {
         return Ok(Vec::new());
     }
+    // 快照账本启动是异步的（SnapshotLifecycleObserver::on_session_created 通过
+    // tokio::spawn 触发 start_session）。在 bootstrap 等只读路径上，若账本尚未就绪，
+    // 等价于"当前没有 pending changes"，直接返回空列表，避免与异步生命周期形成竞态。
+    if state.snapshot_session(session_id).is_none() {
+        return Ok(Vec::new());
+    }
     let scope = resolve_session_change_scope(state, session_id, workspace_id, None)?;
     project_changes_from_snapshot(state, &scope)
 }
@@ -463,7 +469,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn collect_pending_changes_errors_when_snapshot_not_started() {
+    async fn collect_pending_changes_returns_empty_when_snapshot_not_started() {
+        // SnapshotLifecycleObserver 是 tokio::spawn 启动的，bootstrap 等只读路径
+        // 可能在快照账本就绪之前就来取 pending changes。语义上等价于"暂无变更"，
+        // 而不是直接 400，避免与异步生命周期形成竞态。
         let state = build_state();
         let root = unique_temp_dir("magi-change-projection-no-snapshot");
         let (_, sid) = register_workspace_and_session(
@@ -473,9 +482,9 @@ mod tests {
             &root,
             None,
         );
-        let err = collect_session_pending_changes(&state, &sid, Some("ws-no-snapshot"))
-            .expect_err("workspace session without snapshot ledger should fail explicitly");
-        assert!(format!("{err:?}").contains("快照账本尚未就绪"));
+        let changes = collect_session_pending_changes(&state, &sid, Some("ws-no-snapshot"))
+            .expect("snapshot not yet started should be treated as empty");
+        assert!(changes.is_empty());
     }
 
     #[tokio::test]

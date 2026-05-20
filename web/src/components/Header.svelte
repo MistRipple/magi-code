@@ -10,6 +10,16 @@
   import { i18n } from '../stores/i18n.svelte';
   import { buildSessionMarkdownExport, downloadMarkdown } from '../lib/session-export';
   import { getWebSidebarContext } from '../web/sidebar-context';
+  import {
+    rightPaneState,
+    getRightPaneState,
+    toggleRightPane,
+  } from '../stores/right-pane.svelte';
+
+  // 右侧面板：折叠/展开切换按钮作为常驻入口——空 tab 时点击也可展开为空态 RightPane，
+  // 由 store 自身的 activeSessionId 决定能否操作（无 session 时 toggleRightPane 是 no-op）
+  const currentRightPane = $derived(getRightPaneState(rightPaneState.activeSessionId));
+  const showRightPaneToggle = $derived(Boolean(rightPaneState.activeSessionId));
 
   import type { Snippet } from 'svelte';
   interface Props {
@@ -64,7 +74,7 @@
   const newSessionDisabled = $derived(isCurrentSessionEmpty || messagesState.sessionHydrating);
   const newSessionTitle = $derived(
     messagesState.sessionHydrating
-      ? '正在创建新会话'
+      ? '正在打开新会话面板'
       : (isCurrentSessionEmpty ? i18n.t('header.currentSessionEmpty') : i18n.t('header.newSession'))
   );
   // 切换下拉菜单
@@ -135,7 +145,7 @@
 
   // 新建会话
   function newSession() {
-    addToast('info', '正在创建新会话...', undefined, {
+    addToast('info', '正在打开新会话面板...', undefined, {
       category: 'feedback',
       source: 'session-management',
       persistToCenter: false,
@@ -309,6 +319,18 @@
       <LanAccessPanel visible={showLanPanel} onClose={() => { showLanPanel = false; }} />
     </div>
     <NotificationCenter />
+    {#if showRightPaneToggle}
+      <button
+        class="btn-icon btn-icon--sm"
+        class:active={!currentRightPane.collapsed}
+        onclick={() => toggleRightPane(rightPaneState.activeSessionId)}
+        title={currentRightPane.collapsed ? i18n.t('rightPane.expand') : i18n.t('rightPane.collapse')}
+        aria-label={currentRightPane.collapsed ? i18n.t('rightPane.expand') : i18n.t('rightPane.collapse')}
+        aria-expanded={!currentRightPane.collapsed}
+      >
+        <Icon name="sidebar-toggle" size={14} />
+      </button>
+    {/if}
     <button class="btn-icon btn-icon--sm" onclick={openSettings} title={i18n.t('header.settings')}>
       <Icon name="settings" size={14} />
     </button>

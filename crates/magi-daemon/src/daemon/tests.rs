@@ -77,13 +77,14 @@ async fn post_json(app: axum::Router, path: &str, body: Value) -> (StatusCode, V
         .await
         .expect("router should respond");
     let status = response.status();
-    let body = serde_json::from_slice(
-        &to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("response body should read"),
-    )
-    .expect("response should be valid json");
-    (status, body)
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("response body should read");
+    let parsed: Value = serde_json::from_slice(&bytes).unwrap_or_else(|err| {
+        let snippet = String::from_utf8_lossy(&bytes);
+        panic!("post_json({path}) status={status} failed to parse: {err}; body: {snippet}");
+    });
+    (status, parsed)
 }
 
 async fn get_json(app: axum::Router, path: &str) -> Value {
@@ -97,13 +98,15 @@ async fn get_json(app: axum::Router, path: &str) -> Value {
         )
         .await
         .expect("router should respond");
-    assert_eq!(response.status(), StatusCode::OK);
-    serde_json::from_slice(
-        &to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("response body should read"),
-    )
-    .expect("response should be valid json")
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("response body should read");
+    if status != StatusCode::OK {
+        let snippet = String::from_utf8_lossy(&bytes);
+        panic!("get_json({path}) returned {status}: {snippet}");
+    }
+    serde_json::from_slice(&bytes).expect("response should be valid json")
 }
 
 async fn get_task_projection(app: axum::Router, root_task_id: &str, session_id: &str) -> Value {
@@ -2276,6 +2279,7 @@ async fn session_action_happy_path_creates_tasks_and_records_timeline_messages()
             "text": "Hello integration test",
             "skill_name": "code",
             "images": [],
+            "workspace_id": "test-workspace-001",
         }),
     )
     .await;
@@ -2288,9 +2292,9 @@ async fn session_action_happy_path_creates_tasks_and_records_timeline_messages()
     assert!(body["rootTaskId"].is_string());
 
     let session_id = body["sessionId"].as_str().unwrap();
-    assert_eq!(
-        session_id, "test-session-001",
-        "should use bootstrapped session"
+    assert!(
+        !session_id.is_empty(),
+        "session action should return a generated session id"
     );
     let accepted_at = body["acceptedAt"]
         .as_u64()
@@ -2370,6 +2374,7 @@ async fn session_action_messages_survive_runtime_restart_and_preserve_message_co
             "text": "Restart persistence verification",
             "skill_name": "code",
             "images": [],
+            "workspace_id": "test-workspace-001",
         }),
     )
     .await;
@@ -2976,19 +2981,7 @@ async fn unbound_session_continue_survives_runtime_restart() {
         .expect("first runtime restore should bootstrap empty state");
     let (app, state) = runtime.router_with_state_for_tests("daemon-test".to_string());
 
-    let (new_session_status, new_session_body) =
-        post_json(app.clone(), "/api/session/new", json!({})).await;
-    assert_eq!(
-        new_session_status,
-        StatusCode::OK,
-        "new session should succeed: {new_session_body:?}"
-    );
-    let session_id_text = new_session_body["sessionId"]
-        .as_str()
-        .expect("sessionId should serialize as string")
-        .to_string();
-    let session_id = SessionId::new(session_id_text.clone());
-
+    // 不预先创建 session：直接发 turn，让 dispatch 自己开新 unbound session（不绑 workspace）。
     let (action_status, action_body) = post_json(
         app.clone(),
         "/api/session/turn",
@@ -3004,6 +2997,11 @@ async fn unbound_session_continue_survives_runtime_restart() {
         StatusCode::OK,
         "session action on unbound session should succeed: {action_body:?}"
     );
+    let session_id_text = action_body["sessionId"]
+        .as_str()
+        .expect("sessionId should serialize as string")
+        .to_string();
+    let session_id = SessionId::new(session_id_text.clone());
 
     let chain = state
         .session_store

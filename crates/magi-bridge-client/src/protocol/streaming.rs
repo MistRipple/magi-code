@@ -64,135 +64,10 @@ impl SseLineParser {
 pub fn parse_stream_event(family: ProviderFamily, event: &SseEvent) -> Vec<LlmStreamChunk> {
     match family {
         ProviderFamily::OpenAiChat => parse_openai_stream_data(&event.data),
-        ProviderFamily::OpenAiResponses => parse_openai_responses_stream_event(event),
         ProviderFamily::Anthropic => {
             parse_anthropic_stream_event(event.event_type.as_deref(), &event.data)
         }
         ProviderFamily::Gemini => parse_openai_stream_data(&event.data),
-    }
-}
-
-fn parse_openai_responses_stream_event(event: &SseEvent) -> Vec<LlmStreamChunk> {
-    if event.data.trim() == "[DONE]" {
-        return Vec::new();
-    }
-
-    let Ok(envelope) = serde_json::from_str::<Value>(&event.data) else {
-        return Vec::new();
-    };
-    let event_type = event
-        .event_type
-        .as_deref()
-        .or_else(|| envelope.get("type").and_then(Value::as_str))
-        .unwrap_or_default();
-
-    match event_type {
-        "response.output_text.delta" => envelope
-            .get("delta")
-            .and_then(Value::as_str)
-            .filter(|delta| !delta.is_empty())
-            .map(|delta| {
-                vec![LlmStreamChunk {
-                    kind: LlmStreamChunkType::ContentDelta,
-                    content: Some(delta.to_string()),
-                    tool_call: None,
-                    thinking: None,
-                    usage: None,
-                    stop_reason: None,
-                }]
-            })
-            .unwrap_or_default(),
-        "response.reasoning_text.delta" | "response.reasoning_summary_text.delta" => envelope
-            .get("delta")
-            .and_then(Value::as_str)
-            .filter(|delta| !delta.is_empty())
-            .map(|delta| {
-                vec![LlmStreamChunk {
-                    kind: LlmStreamChunkType::Thinking,
-                    content: None,
-                    tool_call: None,
-                    thinking: Some(delta.to_string()),
-                    usage: None,
-                    stop_reason: None,
-                }]
-            })
-            .unwrap_or_default(),
-        "response.output_item.added" => {
-            let Some(item) = envelope.get("item") else {
-                return Vec::new();
-            };
-            if item.get("type").and_then(Value::as_str) != Some("function_call") {
-                return Vec::new();
-            }
-            let id = item
-                .get("call_id")
-                .or_else(|| item.get("id"))
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned);
-            let name = item
-                .get("name")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned);
-            vec![LlmStreamChunk {
-                kind: LlmStreamChunkType::ToolCallStart,
-                content: None,
-                tool_call: Some(PartialToolCall {
-                    id,
-                    name,
-                    arguments: None,
-                    index: None,
-                }),
-                thinking: None,
-                usage: None,
-                stop_reason: None,
-            }]
-        }
-        "response.function_call_arguments.delta" => envelope
-            .get("delta")
-            .and_then(Value::as_str)
-            .map(|delta| {
-                vec![LlmStreamChunk {
-                    kind: LlmStreamChunkType::ToolCallDelta,
-                    content: None,
-                    tool_call: Some(PartialToolCall {
-                        id: None,
-                        name: None,
-                        arguments: Some(Value::String(delta.to_string())),
-                        index: None,
-                    }),
-                    thinking: None,
-                    usage: None,
-                    stop_reason: None,
-                }]
-            })
-            .unwrap_or_default(),
-        "response.completed" => {
-            let response = envelope.get("response").unwrap_or(&envelope);
-            let mut chunks = Vec::new();
-            if let Some(usage) = response.get("usage") {
-                chunks.push(LlmStreamChunk {
-                    kind: LlmStreamChunkType::Usage,
-                    content: None,
-                    tool_call: None,
-                    thinking: None,
-                    usage: Some(parse_openai_responses_usage_value(usage)),
-                    stop_reason: None,
-                });
-            }
-            chunks.push(LlmStreamChunk {
-                kind: LlmStreamChunkType::ContentEnd,
-                content: None,
-                tool_call: None,
-                thinking: None,
-                usage: None,
-                stop_reason: response
-                    .get("status")
-                    .and_then(Value::as_str)
-                    .map(ToOwned::to_owned),
-            });
-            chunks
-        }
-        _ => Vec::new(),
     }
 }
 
@@ -237,7 +112,10 @@ fn parse_openai_stream_data(data: &str) -> Vec<LlmStreamChunk> {
             }
         }
 
-        if let Some(reasoning) = delta["reasoning_content"].as_str() {
+        if let Some(reasoning) = delta["reasoning_content"]
+            .as_str()
+            .or_else(|| delta["reasoning"].as_str())
+        {
             if !reasoning.is_empty() {
                 chunks.push(LlmStreamChunk {
                     kind: LlmStreamChunkType::Thinking,
@@ -444,17 +322,6 @@ fn parse_openai_usage_value(usage: &Value) -> LlmUsage {
     LlmUsage {
         input_tokens: usage["prompt_tokens"].as_u64().unwrap_or(0),
         output_tokens: usage["completion_tokens"].as_u64().unwrap_or(0),
-        cache_read_tokens,
-        cache_write_tokens: None,
-        cache_read_included_in_input: cache_read_tokens.is_some(),
-    }
-}
-
-fn parse_openai_responses_usage_value(usage: &Value) -> LlmUsage {
-    let cache_read_tokens = usage["input_tokens_details"]["cached_tokens"].as_u64();
-    LlmUsage {
-        input_tokens: usage["input_tokens"].as_u64().unwrap_or(0),
-        output_tokens: usage["output_tokens"].as_u64().unwrap_or(0),
         cache_read_tokens,
         cache_write_tokens: None,
         cache_read_included_in_input: cache_read_tokens.is_some(),
@@ -707,63 +574,6 @@ mod tests {
         let u = usage_chunk.unwrap().usage.as_ref().unwrap();
         assert_eq!(u.input_tokens, 100);
         assert_eq!(u.output_tokens, 50);
-    }
-
-    #[test]
-    fn openai_responses_stream_parses_text_and_usage() {
-        let delta = SseEvent {
-            event_type: Some("response.output_text.delta".to_string()),
-            data: r#"{"type":"response.output_text.delta","delta":"hello"}"#.to_string(),
-        };
-        let chunks = parse_stream_event(ProviderFamily::OpenAiResponses, &delta);
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].kind, LlmStreamChunkType::ContentDelta);
-        assert_eq!(chunks[0].content.as_deref(), Some("hello"));
-
-        let completed = SseEvent {
-            event_type: Some("response.completed".to_string()),
-            data: r#"{"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":7,"output_tokens":4,"input_tokens_details":{"cached_tokens":2}}}}"#.to_string(),
-        };
-        let chunks = parse_stream_event(ProviderFamily::OpenAiResponses, &completed);
-        assert_eq!(chunks.len(), 2);
-        assert_eq!(chunks[0].kind, LlmStreamChunkType::Usage);
-        assert_eq!(chunks[0].usage.as_ref().unwrap().input_tokens, 7);
-        assert_eq!(chunks[0].usage.as_ref().unwrap().output_tokens, 4);
-        assert_eq!(chunks[0].usage.as_ref().unwrap().cache_read_tokens, Some(2));
-        assert_eq!(chunks[1].kind, LlmStreamChunkType::ContentEnd);
-        assert_eq!(chunks[1].stop_reason.as_deref(), Some("completed"));
-    }
-
-    #[test]
-    fn openai_responses_stream_parses_function_call() {
-        let added = SseEvent {
-            event_type: Some("response.output_item.added".to_string()),
-            data: r#"{"type":"response.output_item.added","item":{"type":"function_call","call_id":"call_1","name":"do_work"}}"#.to_string(),
-        };
-        let chunks = parse_stream_event(ProviderFamily::OpenAiResponses, &added);
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].kind, LlmStreamChunkType::ToolCallStart);
-        assert_eq!(
-            chunks[0].tool_call.as_ref().unwrap().id.as_deref(),
-            Some("call_1")
-        );
-        assert_eq!(
-            chunks[0].tool_call.as_ref().unwrap().name.as_deref(),
-            Some("do_work")
-        );
-
-        let args = SseEvent {
-            event_type: Some("response.function_call_arguments.delta".to_string()),
-            data: r#"{"type":"response.function_call_arguments.delta","delta":"{\"ok\":true}"}"#
-                .to_string(),
-        };
-        let chunks = parse_stream_event(ProviderFamily::OpenAiResponses, &args);
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].kind, LlmStreamChunkType::ToolCallDelta);
-        assert_eq!(
-            chunks[0].tool_call.as_ref().unwrap().arguments.as_ref(),
-            Some(&Value::String("{\"ok\":true}".to_string()))
-        );
     }
 
     #[test]

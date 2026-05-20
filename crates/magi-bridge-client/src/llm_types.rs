@@ -1,3 +1,4 @@
+use magi_usage_authority::ReasoningEffort;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -158,6 +159,10 @@ pub struct LlmMessageParams {
     pub stream_hard_timeout_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_policy: Option<RetryPolicy>,
+    /// 推理强度配置：必须透传到协议层（OpenAI Chat 走顶层 `reasoning_effort`，
+    /// Anthropic Messages 走 `thinking.budget_tokens` 映射）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffort>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

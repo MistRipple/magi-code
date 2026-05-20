@@ -174,7 +174,6 @@ pub fn rebuild_session_snapshot_from_events(
                 resolved_model: model_id.resolved_model.clone(),
                 base_url_fingerprint: model_id.base_url_fingerprint.clone(),
                 reasoning_effort: model_id.reasoning_effort,
-                enable_thinking: model_id.enable_thinking,
                 totals: model_totals,
             },
         );

@@ -6,25 +6,6 @@
  */
 
 import type { AgentBinding, ModelEngine } from './types/registry-types';
-import type { RoleTemplate } from './types/role-templates';
-
-export interface ModelEngineLLM {
-  enabled?: boolean;
-  [key: string]: unknown;
-}
-
-export interface ModelEngineLike {
-  llm?: ModelEngineLLM;
-}
-
-export interface WorkerConfigLike {
-  enabled?: boolean;
-}
-
-export interface RoleUsageSummary {
-  templateId: string;
-  displayName: string;
-}
 
 export interface ModelStatusLike {
   status?: string;
@@ -32,12 +13,9 @@ export interface ModelStatusLike {
 
 export type ModelListFetchBlockReason =
   | 'full_url_mode'
-  | 'endpoint_base_url'
-  | 'missing_base_url_or_api_key'
-  | 'unsupported_provider';
+  | 'missing_base_url_or_api_key';
 
 export interface ModelListFetchConfigLike {
-  provider?: unknown;
   baseUrl?: unknown;
   apiKey?: unknown;
   urlMode?: unknown;
@@ -45,14 +23,6 @@ export interface ModelListFetchConfigLike {
 
 function trimmedConfigString(value: unknown): string {
   return typeof value === 'string' ? value.trim() : '';
-}
-
-function isOpenAiExecutionEndpoint(value: string): boolean {
-  const withoutQuery = value.split(/[?#]/, 1)[0]?.trim().replace(/\/+$/, '').toLowerCase() || '';
-  if (!withoutQuery) {
-    return false;
-  }
-  return /(^|\/)(chat\/completions|responses|messages)$/.test(withoutQuery);
 }
 
 export function resolveModelListFetchBlockReason(
@@ -67,17 +37,8 @@ export function resolveModelListFetchBlockReason(
     return 'full_url_mode';
   }
 
-  const provider = trimmedConfigString(config.provider).toLowerCase();
-  if (provider && provider !== 'openai' && provider !== 'openai-compatible' && provider !== 'openai_compatible') {
-    return 'unsupported_provider';
-  }
-
-  const baseUrl = trimmedConfigString(config.baseUrl);
-  if (!baseUrl || !trimmedConfigString(config.apiKey)) {
+  if (!trimmedConfigString(config.baseUrl) || !trimmedConfigString(config.apiKey)) {
     return 'missing_base_url_or_api_key';
-  }
-  if (isOpenAiExecutionEndpoint(baseUrl)) {
-    return 'endpoint_base_url';
   }
 
   return null;
@@ -89,68 +50,29 @@ export function canFetchModelList(
   return resolveModelListFetchBlockReason(config) === null;
 }
 
-export function isRegistryEngineEnabled(engine: Pick<ModelEngineLike, 'llm'> | null | undefined): boolean {
-  if (!engine?.llm || typeof engine.llm !== 'object') {
-    return false;
-  }
-  return engine.llm.enabled !== false;
-}
-
-export function isEngineEnabled(
+/**
+ * 引擎是否存在于 Registry —— 用作角色绑定的可选性判定。
+ *
+ * 历史上这里还要校验 `llm.enabled !== false`，但启用开关已经收敛到「角色应用决定是否使用」，
+ * 这里只判断引擎是否在配置列表里。
+ */
+export function isEngineRegistered(
   engineId: string,
   registryEngines: ReadonlyArray<ModelEngine>,
-  workerConfigs: Readonly<Record<string, WorkerConfigLike>> = {},
 ): boolean {
-  if (!engineId) {
-    return false;
-  }
-
-  const localConfig = workerConfigs[engineId];
-  if (localConfig && typeof localConfig === 'object') {
-    return localConfig.enabled !== false;
-  }
-
-  const engine = registryEngines.find((item) => item.id === engineId);
-  return isRegistryEngineEnabled(engine);
+  if (!engineId) return false;
+  return registryEngines.some((engine) => engine.id === engineId);
 }
 
 export function resolveSelectableRegistryEngines(
   registryEngines: ReadonlyArray<ModelEngine>,
-  workerConfigs: Readonly<Record<string, WorkerConfigLike>> = {},
 ): ModelEngine[] {
-  return registryEngines.filter((engine) => isEngineEnabled(engine.id, registryEngines, workerConfigs));
-}
-
-export function resolveEnabledRoleUsagesForEngine(
-  engineId: string,
-  registryAgents: ReadonlyArray<AgentBinding>,
-  roleTemplates: ReadonlyArray<RoleTemplate>,
-): RoleUsageSummary[] {
-  if (!engineId) {
-    return [];
-  }
-
-  const templateMap = new Map(roleTemplates.map((template) => [template.templateId, template]));
-  return registryAgents
-    .filter(
-      (agent) =>
-        agent.enabled !== false
-        && agent.modelSource === 'engine'
-        && agent.engineId === engineId,
-    )
-    .map((agent) => ({
-      templateId: agent.templateId,
-      displayName: (() => {
-        const template = templateMap.get(agent.templateId);
-        return template ? template.displayName : agent.templateId;
-      })(),
-    }));
+  return [...registryEngines];
 }
 
 export function isAgentBindingOperational(
   agent: Pick<AgentBinding, 'enabled' | 'modelSource' | 'engineId'>,
   registryEngines: ReadonlyArray<ModelEngine>,
-  workerConfigs: Readonly<Record<string, WorkerConfigLike>> = {},
 ): boolean {
   if (agent.enabled === false) {
     return false;
@@ -158,13 +80,12 @@ export function isAgentBindingOperational(
   if (agent.modelSource !== 'engine') {
     return true;
   }
-  return isEngineEnabled(agent.engineId, registryEngines, workerConfigs);
+  return isEngineRegistered(agent.engineId, registryEngines);
 }
 
 export function resolveModelConfigTabStatus(
   target: 'orch' | 'comp' | string,
   modelStatuses: Readonly<Record<string, ModelStatusLike>>,
-  workerConfigs: Readonly<Record<string, WorkerConfigLike>> = {},
 ): string {
   if (target === 'orch') {
     return modelStatuses.orchestrator?.status || 'not_configured';
@@ -172,10 +93,5 @@ export function resolveModelConfigTabStatus(
   if (target === 'comp') {
     return modelStatuses.auxiliary?.status || 'not_configured';
   }
-
-  if (workerConfigs[target] && workerConfigs[target].enabled === false) {
-    return 'disabled';
-  }
-
   return modelStatuses[target]?.status || 'not_configured';
 }

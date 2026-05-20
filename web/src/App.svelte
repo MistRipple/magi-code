@@ -7,10 +7,10 @@
   import EditsPanel from './components/EditsPanel.svelte';
   import KnowledgePanel from './components/KnowledgePanel.svelte';
   import SettingsPanel from './components/SettingsPanel.svelte';
-  import WorkerDetailDrawer from './components/WorkerDetailDrawer.svelte';
   import ToastContainer from './components/ToastContainer.svelte';
   import Icon from './components/Icon.svelte';
   import { setCurrentTopTab, messagesState } from './stores/messages.svelte';
+  import { activateRightPaneSession } from './stores/right-pane.svelte';
   import { i18n } from './stores/i18n.svelte';
   import {
     AGENT_CONNECTION_EVENT,
@@ -72,6 +72,11 @@
     }
   });
 
+  // 切换会话时同步 RightPane 上下文；空 sessionId 也要清掉，避免显示别的会话残留
+  $effect(() => {
+    activateRightPaneSession(messagesState.currentSessionId);
+  });
+
 </script>
 
 <div class="app-container">
@@ -80,7 +85,7 @@
     <TopTabs activeTopTab={currentTopTab} onTabChange={handleTabChange} />
   </Header>
 
-  <!-- Tab 内容区域：主对话面板常驻以保留输入草稿，其余非主线面板仅在激活时挂载 -->
+  <!-- Tab 内容区域：常驻 ThreadPanel + 按需挂载的其他 top-tab -->
   <div class="tab-content-wrapper">
     {#if isBootstrapping}
       <!-- 启动连接等待层：后端 bootstrap 数据尚未就绪 -->
@@ -126,8 +131,6 @@
   {#if settingsOpen}
     <SettingsPanel onClose={closeSettings} />
   {/if}
-  <!-- Worker 详情 Drawer（覆盖层，由 dispatch card 行点击触发） -->
-  <WorkerDetailDrawer />
   <!-- Toast 通知容器 -->
   <ToastContainer />
 </div>

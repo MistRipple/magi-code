@@ -170,12 +170,12 @@ import { getAgentColor } from '../lib/agent-colors';
         />
       {:else if store.activeTab === 'model'}
         <!-- 模型配置 Tab -->
-        <SettingsModelTab bind:modelConfigTab={store.modelConfigTab} orchConfig={store.orchConfig} compConfig={store.compConfig} workerConfigs={store.workerConfigs} workerModelTabs={store.workerModelTabs} bind:workerModelTab={store.workerModelTab} modelStatuses={store.modelStatuses} saveStatus={store.saveStatus} testStatus={store.testStatus} fetchingModels={store.fetchingModels} bind:keyVisible={store.keyVisible} modelDropdownOpen={store.modelDropdownOpen} dropdownPosition={store.dropdownPosition} modelLists={store.modelLists} getBaseUrlPlaceholder={store.getBaseUrlPlaceholder} shouldRecommendStandardUrlMode={store.shouldRecommendStandardUrlMode} getOpenAiProtocolValue={store.getOpenAiProtocolValue} setOpenAiProtocolValue={store.setOpenAiProtocolValue} openModelDropdown={store.openModelDropdown} fetchModelList={store.fetchModelList} selectModel={store.selectModel} saveModelConfig={store.saveModelConfig} testModelConnection={store.testModelConnection} getStatusClass={store.getStatusClass} getStatusText={store.getStatusText} getWorkerDisplayName={store.getWorkerDisplayName} handleWorkerEnabledToggle={store.handleWorkerEnabledToggle}
+        <SettingsModelTab bind:modelConfigTab={store.modelConfigTab} orchConfig={store.orchConfig} compConfig={store.compConfig} workerConfigs={store.workerConfigs} workerModelTabs={store.workerModelTabs} bind:workerModelTab={store.workerModelTab} modelStatuses={store.modelStatuses} saveStatus={store.saveStatus} testStatus={store.testStatus} fetchingModels={store.fetchingModels} bind:keyVisible={store.keyVisible} modelDropdownOpen={store.modelDropdownOpen} dropdownPosition={store.dropdownPosition} modelLists={store.modelLists} roleTemplates={store.roleTemplates} registryAgents={store.registryAgents} getBaseUrlPlaceholder={store.getBaseUrlPlaceholder} shouldRecommendStandardUrlMode={store.shouldRecommendStandardUrlMode} openModelDropdown={store.openModelDropdown} closeModelDropdown={store.closeModelDropdown} fetchModelList={store.fetchModelList} selectModel={store.selectModel} saveModelConfig={store.saveModelConfig} testModelConnection={store.testModelConnection} getStatusClass={store.getStatusClass} getStatusText={store.getStatusText} getWorkerDisplayName={store.getWorkerDisplayName}
           {getAgentColor} deleteEngine={store.deleteEngine} openAddEngineDialog={store.openAddEngineDialog}
         />
       {:else if store.activeTab === 'agents'}
         <!-- 角色管理 Tab -->
-        <SettingsAgentsTab roleTemplates={store.roleTemplates} registryAgents={store.registryAgents} registryEngines={store.registryEngines} workerConfigs={store.workerConfigs}
+        <SettingsAgentsTab roleTemplates={store.roleTemplates} registryAgents={store.registryAgents} registryEngines={store.registryEngines}
           {getAgentColor} getWorkerDisplayName={store.getWorkerDisplayName} updateRoleEnabled={store.updateRoleEnabled} updateRoleEngine={store.updateRoleEngine}
         />
       {:else if store.activeTab === 'rules'}
@@ -459,12 +459,8 @@ import { getAgentColor } from '../lib/agent-colors';
   >
     <p style="margin: 0; color: var(--foreground);">{store.confirmDialogMessage}</p>
     {#snippet footer()}
-      {#if store.confirmDialogMode === 'info'}
-        <button class="settings-btn" onclick={store.handleConfirmNo}>{i18n.t('settings.confirmDialog.confirm')}</button>
-      {:else}
-        <button class="settings-btn secondary" onclick={store.handleConfirmNo}>{i18n.t('settings.confirmDialog.cancel')}</button>
-        <button class="settings-btn" onclick={store.handleConfirmYes}>{i18n.t('settings.confirmDialog.confirm')}</button>
-      {/if}
+      <button class="settings-btn secondary" onclick={store.handleConfirmNo}>{i18n.t('settings.confirmDialog.cancel')}</button>
+      <button class="settings-btn" onclick={store.handleConfirmYes}>{i18n.t('settings.confirmDialog.confirm')}</button>
     {/snippet}
   </Modal>
 {/if}

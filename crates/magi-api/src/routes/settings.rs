@@ -3,6 +3,7 @@ use axum::{
     extract::{Query, State},
     routing::{get, post},
 };
+use magi_bridge_client::HttpModelBridgeProtocol;
 use magi_core::UtcMillis;
 use magi_usage_authority::{
     SessionSummary, UsageAuthority, UsageCallRecordInput, UsageModelSnapshot, UsageTotals,
@@ -14,7 +15,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::{
     errors::ApiError,
-    model_config::{NormalizedModelConfig, normalize_executable_model_provider},
+    model_config::NormalizedModelConfig,
     state::ApiState,
 };
 
@@ -74,7 +75,7 @@ fn parse_fetch_models_config(
     config.require_base_url().map_err(ApiError::InvalidInput)?;
     config.require_api_key().map_err(ApiError::InvalidInput)?;
     config
-        .require_openai_models_listable()
+        .require_models_listable()
         .map_err(ApiError::InvalidInput)?;
     Ok((config, request.target))
 }
@@ -138,47 +139,27 @@ fn parse_connection_probe_config(request: Value) -> Result<NormalizedModelConfig
 async fn execute_connection_probe(
     config: &NormalizedModelConfig,
 ) -> Result<(u16, Value), ApiError> {
+    // 探针不再维护双轨 body builder：直接借用 HttpModelBridgeClient::build_probe_request
+    // 作为唯一事实源，保证 reasoning_effort、Anthropic thinking 等字段与生产链路完全一致。
+    let client = config
+        .to_http_model_client("__probe__")
+        .ok_or_else(|| ApiError::InvalidInput("模型配置缺少 baseUrl".to_string()))?;
+    let (url, body, extra_headers) = client.build_probe_request().map_err(|error| {
+        ApiError::InvalidInput(format!("构造连接测试请求失败: {error}"))
+    })?;
+
     let mut headers = HeaderMap::new();
     headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-
-    let provider_key = config.provider_key();
-    let (url, body) = match provider_key.as_str() {
-        "openai" => {
-            let api_key = config.require_api_key().map_err(ApiError::InvalidInput)?;
-            let auth_value = HeaderValue::from_str(&format!("Bearer {}", api_key))
-                .map_err(|_| ApiError::InvalidInput("apiKey 包含非法字符".to_string()))?;
-            headers.insert(AUTHORIZATION, auth_value);
-            (
-                config.openai_probe_url().map_err(ApiError::InvalidInput)?,
-                config.openai_probe_body().map_err(ApiError::InvalidInput)?,
-            )
-        }
-        "anthropic" => {
-            let api_key_str = config.require_api_key().map_err(ApiError::InvalidInput)?;
-            let api_key = HeaderValue::from_str(api_key_str)
-                .map_err(|_| ApiError::InvalidInput("apiKey 包含非法字符".to_string()))?;
-            headers.insert(HeaderName::from_static("x-api-key"), api_key);
-            headers.insert(
-                HeaderName::from_static("anthropic-version"),
-                HeaderValue::from_static("2023-06-01"),
-            );
-            (
-                config
-                    .anthropic_probe_url()
-                    .map_err(ApiError::InvalidInput)?,
-                config
-                    .anthropic_probe_body()
-                    .map_err(ApiError::InvalidInput)?,
-            )
-        }
-        _ => {
-            return Err(ApiError::InvalidInput(format!(
-                "暂不支持 {} 提供方的真实连接测试",
-                config.provider()
-            )));
-        }
-    };
+    for (name, value) in extra_headers {
+        let header_name = HeaderName::try_from(name.as_str()).map_err(|_| {
+            ApiError::InvalidInput(format!("探针请求包含非法 header 名: {name}"))
+        })?;
+        let header_value = HeaderValue::from_str(&value).map_err(|_| {
+            ApiError::InvalidInput(format!("探针请求包含非法 header 值: {name}"))
+        })?;
+        headers.insert(header_name, header_value);
+    }
 
     let response = reqwest::Client::new()
         .post(url)
@@ -500,29 +481,6 @@ fn default_agent_binding(template_id: &str, order: usize) -> Value {
     })
 }
 
-fn normalize_llm_config(raw_llm: Option<&Value>) -> Value {
-    let mut llm = raw_llm
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    let provider = normalize_executable_model_provider(llm.get("provider").and_then(Value::as_str));
-    llm.insert("provider".to_string(), Value::String(provider));
-    Value::Object(llm)
-}
-
-fn normalize_model_config_payload(mut value: Value) -> Value {
-    if let Some(object) = value.as_object_mut()
-        && (object.contains_key("baseUrl")
-            || object.contains_key("model")
-            || object.contains_key("provider"))
-    {
-        let provider =
-            normalize_executable_model_provider(object.get("provider").and_then(Value::as_str));
-        object.insert("provider".to_string(), Value::String(provider));
-    }
-    value
-}
-
 fn normalize_engine_entry(entry: &Value) -> Option<Value> {
     let raw = entry.get("engine").unwrap_or(entry);
     let engine_id = raw
@@ -544,7 +502,12 @@ fn normalize_engine_entry(entry: &Value) -> Option<Value> {
                 .to_string(),
         ),
     );
-    normalized.insert("llm".to_string(), normalize_llm_config(raw.get("llm")));
+    normalized.insert(
+        "llm".to_string(),
+        raw.get("llm")
+            .cloned()
+            .unwrap_or_else(|| Value::Object(Map::new())),
+    );
     if let Some(runtime) = raw.get("runtime").cloned() {
         normalized.insert("runtime".to_string(), runtime);
     }
@@ -585,10 +548,7 @@ fn normalize_worker_model_config_entries(raw_workers: &Value) -> HashMap<String,
         if worker_id.is_empty() {
             continue;
         }
-        normalized.insert(
-            worker_id.to_string(),
-            normalize_model_config_payload(worker_config.clone()),
-        );
+        normalized.insert(worker_id.to_string(), worker_config.clone());
     }
     normalized
 }
@@ -861,17 +821,14 @@ async fn save_worker_config(
             .as_object()
             .cloned()
             .unwrap_or_default();
-        workers.insert(
-            worker_id.to_string(),
-            normalize_model_config_payload(worker_config.clone()),
-        );
+        workers.insert(worker_id.to_string(), worker_config.clone());
         state
             .settings_store
             .set_section("workers", serde_json::Value::Object(workers));
     } else {
         state.settings_store.set_section(
             "workers",
-            normalize_model_config_payload(scoped_settings_section_request(&request)),
+            scoped_settings_section_request(&request),
         );
     }
     Ok(Json(serde_json::json!({ "saved": true })))
@@ -902,7 +859,7 @@ async fn save_orchestrator_config(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     state.settings_store.set_section(
         "orchestrator",
-        normalize_model_config_payload(scoped_settings_section_request(&request)),
+        scoped_settings_section_request(&request),
     );
     Ok(Json(serde_json::json!({ "saved": true })))
 }
@@ -920,7 +877,7 @@ async fn save_auxiliary_config(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     state.settings_store.set_section(
         "auxiliary",
-        normalize_model_config_payload(scoped_settings_section_request(&request)),
+        scoped_settings_section_request(&request),
     );
     Ok(Json(serde_json::json!({ "saved": true })))
 }
@@ -1128,15 +1085,30 @@ async fn fetch_models(
     Json(request): Json<FetchModelsRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let (config, target) = parse_fetch_models_config(request)?;
-    let url = config.openai_models_url().map_err(ApiError::InvalidInput)?;
+    let url = config.models_list_url().map_err(ApiError::InvalidInput)?;
     let now = UtcMillis::now();
+    let api_key = config.require_api_key().map_err(ApiError::InvalidInput)?;
     let mut headers = HeaderMap::new();
     headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    let api_key = config.require_api_key().map_err(ApiError::InvalidInput)?;
-    let auth_value = HeaderValue::from_str(&format!("Bearer {}", api_key))
-        .map_err(|_| ApiError::InvalidInput("apiKey 包含非法字符".to_string()))?;
-    headers.insert(AUTHORIZATION, auth_value);
+    // 认证 header 按推断协议选：OpenAI 兼容端点用 Bearer，Anthropic 兼容端点用 x-api-key + anthropic-version。
+    // /v1/models 路径在两边都是合法端点，只有 header 是认证语义的分歧点。
+    match config.inferred_protocol() {
+        HttpModelBridgeProtocol::ChatCompletions => {
+            let auth_value = HeaderValue::from_str(&format!("Bearer {}", api_key))
+                .map_err(|_| ApiError::InvalidInput("apiKey 包含非法字符".to_string()))?;
+            headers.insert(AUTHORIZATION, auth_value);
+        }
+        HttpModelBridgeProtocol::AnthropicMessages => {
+            let key_value = HeaderValue::from_str(&api_key)
+                .map_err(|_| ApiError::InvalidInput("apiKey 包含非法字符".to_string()))?;
+            headers.insert(HeaderName::from_static("x-api-key"), key_value);
+            headers.insert(
+                HeaderName::from_static("anthropic-version"),
+                HeaderValue::from_static("2023-06-01"),
+            );
+        }
+    }
 
     let response = reqwest::Client::new()
         .get(url)
@@ -1281,7 +1253,6 @@ fn usage_model_item_json(model: UsageModelSnapshot) -> serde_json::Value {
         "resolvedModel": model.resolved_model,
         "baseUrlFingerprint": model.base_url_fingerprint,
         "reasoningEffort": model.reasoning_effort,
-        "enableThinking": model.enable_thinking,
         "totals": usage_totals_json(&model.totals),
     })
 }
@@ -1687,18 +1658,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn normalize_model_config_payload_preserves_anthropic_provider() {
-        let normalized = normalize_model_config_payload(json!({
-            "provider": "anthropic",
-            "baseUrl": "https://api.anthropic.com",
-            "model": "claude-sonnet-test",
-            "urlMode": "standard"
-        }));
-
-        assert_eq!(normalized["provider"], json!("anthropic"));
-    }
-
     #[tokio::test]
     async fn settings_bootstrap_filters_mcp_servers_without_id() {
         let state = test_state();
@@ -1780,32 +1739,30 @@ mod tests {
     }
 
     #[test]
-    fn fetch_models_config_rejects_non_openai_provider() {
-        let error = parse_fetch_models_config(FetchModelsRequest {
+    fn fetch_models_config_allows_anthropic_compatible_provider() {
+        // /v1/models 在 Anthropic 端点同样合法，只要不是 Full 路径就放行。
+        let (config, target) = parse_fetch_models_config(FetchModelsRequest {
             config: serde_json::json!({
-                "provider": "anthropic",
                 "baseUrl": "https://api.anthropic.com",
                 "apiKey": "test-key",
                 "urlMode": "standard"
             }),
             target: "orch".to_string(),
         })
-        .expect_err("non OpenAI-compatible provider should not reuse OpenAI /models");
+        .expect("anthropic-style base url should also be listable");
 
-        match error {
-            ApiError::InvalidInput(message) => {
-                assert!(message.contains("当前 provider 不支持自动获取模型列表"));
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
+        assert_eq!(
+            config.models_list_url().expect("models url"),
+            "https://api.anthropic.com/v1/models"
+        );
+        assert_eq!(target, "orch");
     }
 
     #[test]
     fn fetch_models_config_allows_openai_compatible_provider() {
         let (config, target) = parse_fetch_models_config(FetchModelsRequest {
             config: serde_json::json!({
-                "provider": "openai",
-                "baseUrl": "http://127.0.0.1:8320/",
+                "baseUrl": "http://127.0.0.1:8320/v1",
                 "apiKey": "test-key",
                 "urlMode": "standard"
             }),
@@ -1816,11 +1773,11 @@ mod tests {
         assert_eq!(config.provider(), "openai");
         assert_eq!(
             config.require_base_url().expect("baseUrl"),
-            "http://127.0.0.1:8320/"
+            "http://127.0.0.1:8320/v1"
         );
         assert_eq!(config.require_api_key().expect("apiKey"), "test-key");
         config
-            .require_openai_models_listable()
+            .require_models_listable()
             .expect("standard url mode can list models");
         assert_eq!(target, "orch");
     }
@@ -1829,7 +1786,6 @@ mod tests {
     fn fetch_models_config_rejects_full_url_mode() {
         let error = parse_fetch_models_config(FetchModelsRequest {
             config: serde_json::json!({
-                "provider": "openai",
                 "baseUrl": "http://127.0.0.1:8320/v1/chat/completions",
                 "apiKey": "test-key",
                 "urlMode": "full"
@@ -1843,27 +1799,6 @@ mod tests {
                 assert!(message.contains("完整路径模式下不支持自动获取模型列表"));
             }
             other => panic!("expected invalid input, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn fetch_models_config_rejects_standard_execution_endpoint() {
-        let error = parse_fetch_models_config(FetchModelsRequest {
-            config: serde_json::json!({
-                "provider": "openai",
-                "baseUrl": "http://127.0.0.1:8320/v1/chat/completions",
-                "apiKey": "test-key",
-                "urlMode": "standard"
-            }),
-            target: "orch".to_string(),
-        })
-        .expect_err("standard mode should reject execution endpoints for /models");
-
-        match error {
-            ApiError::InvalidInput(message) => {
-                assert!(message.contains("当前 Base URL 是对话执行端点"));
-            }
-            other => panic!("unexpected error: {other:?}"),
         }
     }
 
@@ -1908,9 +1843,8 @@ mod tests {
             "modelConfig": {
                 "provider": "openai",
                 "model": "gpt-4.1",
-                "baseUrl": "https://api.openai.com",
-                "urlMode": "default",
-                "openaiProtocol": "responses"
+                "baseUrl": "https://api.openai.com/v1",
+                "urlMode": "default"
             },
             "callIdentity": {
                 "callId": "call-1",

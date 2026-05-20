@@ -8,6 +8,7 @@ use crate::types::{
     BridgeClientError, BridgeErrorLayer, BridgeResponse, ModelBridgeClient, ModelInvocationRequest,
     ModelStreamingDelta,
 };
+use magi_usage_authority::ReasoningEffort;
 use serde::Deserialize;
 use serde_json::json;
 use std::env;
@@ -17,12 +18,10 @@ const OPENAI_BASE_URL_ENV: &str = "MAGI_OPENAI_COMPAT_BASE_URL";
 const OPENAI_API_KEY_ENV: &str = "MAGI_OPENAI_COMPAT_API_KEY";
 const OPENAI_MODEL_ENV: &str = "MAGI_OPENAI_COMPAT_MODEL";
 const OPENAI_CHAT_COMPLETIONS_PATH: &str = "/v1/chat/completions";
-const OPENAI_RESPONSES_PATH: &str = "/v1/responses";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HttpModelBridgeProtocol {
     ChatCompletions,
-    Responses,
     AnthropicMessages,
 }
 
@@ -34,6 +33,9 @@ pub struct HttpModelBridgeClient {
     api_key: Option<String>,
     model: String,
     protocol: HttpModelBridgeProtocol,
+    /// 推理强度配置：构造期注入；调用时透传到协议层 request body。
+    /// `None` 表示未配置（保留协议默认行为）。
+    reasoning_effort: Option<ReasoningEffort>,
 }
 
 struct HttpModelRequest {
@@ -53,27 +55,35 @@ impl HttpModelBridgeClient {
         Some(Self::new(base_url, api_key, model))
     }
 
-    /// Create with explicit configuration.
+    /// Create with explicit configuration (Chat Completions protocol, no reasoning effort).
     pub fn new(base_url: String, api_key: Option<String>, model: String) -> Self {
         Self::new_with_protocol(
             base_url,
             api_key,
             model,
             HttpModelBridgeProtocol::ChatCompletions,
+            None,
         )
     }
 
+    /// Create with explicit protocol and reasoning effort.
+    ///
+    /// `reasoning_effort = Some(_)` 时，无论模型是否原生支持，都会显式注入到协议层：
+    /// - Chat Completions：写入顶层 `reasoning_effort` 字段。
+    /// - Anthropic Messages：映射成 `thinking.budget_tokens` 并强制启用 thinking。
     pub fn new_with_protocol(
         base_url: String,
         api_key: Option<String>,
         model: String,
         protocol: HttpModelBridgeProtocol,
+        reasoning_effort: Option<ReasoningEffort>,
     ) -> Self {
         Self {
             base_url,
             api_key,
             model,
             protocol,
+            reasoning_effort,
         }
     }
 
@@ -101,14 +111,13 @@ impl HttpModelBridgeClient {
     fn provider_family(&self) -> ProviderFamily {
         match self.protocol {
             HttpModelBridgeProtocol::ChatCompletions => ProviderFamily::OpenAiChat,
-            HttpModelBridgeProtocol::Responses => ProviderFamily::OpenAiResponses,
             HttpModelBridgeProtocol::AnthropicMessages => ProviderFamily::Anthropic,
         }
     }
 
     fn request_headers(&self) -> Vec<(String, String)> {
         match self.protocol {
-            HttpModelBridgeProtocol::ChatCompletions | HttpModelBridgeProtocol::Responses => self
+            HttpModelBridgeProtocol::ChatCompletions => self
                 .api_key
                 .as_ref()
                 .map(|key| vec![("Authorization".to_string(), format!("Bearer {key}"))])
@@ -134,16 +143,14 @@ impl HttpModelBridgeClient {
                 body["stream"] = json!(stream);
                 (url, body)
             }
-            HttpModelBridgeProtocol::Responses => {
-                let url = self.openai_request_url(OPENAI_RESPONSES_PATH)?;
-                let mut body = self.build_responses_request_body(request);
-                body["stream"] = json!(stream);
-                (url, body)
-            }
             HttpModelBridgeProtocol::AnthropicMessages => {
                 let mut adapted = AnthropicMessagesAdapter
                     .build_request(
-                        &llm_message_params_from_invocation(request, stream),
+                        &llm_message_params_from_invocation(
+                            request,
+                            stream,
+                            self.reasoning_effort,
+                        ),
                         &self.model,
                     )
                     .map_err(|reason| BridgeClientError::CallFailed {
@@ -172,6 +179,25 @@ impl HttpModelBridgeClient {
             .body
     }
 
+    /// 构造一次「最小可用」探针请求（用于连接测试）。
+    ///
+    /// 与生产链路共用 [`build_http_request`](Self::build_http_request)：
+    /// - reasoning_effort、协议路由、认证头、Anthropic thinking 等约束完全一致；
+    /// - 探针 body 与真实推理 body 走同一份字段集，永远不会因双轨实现漂移。
+    pub fn build_probe_request(
+        &self,
+    ) -> Result<(String, serde_json::Value, Vec<(String, String)>), BridgeClientError> {
+        let request = ModelInvocationRequest {
+            provider: "probe".to_string(),
+            prompt: "ping".to_string(),
+            messages: None,
+            tools: None,
+            tool_choice: None,
+        };
+        let http_request = self.build_http_request(&request, false)?;
+        Ok((http_request.url, http_request.body, http_request.headers))
+    }
+
     /// Build the JSON body for a chat completions request.
     fn build_chat_request_body(&self, request: &ModelInvocationRequest) -> serde_json::Value {
         let messages = if let Some(ref msgs) = request.messages {
@@ -194,26 +220,8 @@ impl HttpModelBridgeClient {
                     .unwrap_or_else(|| json!("auto"));
             }
         }
-        body
-    }
-
-    /// Build the JSON body for an OpenAI Responses API request.
-    fn build_responses_request_body(&self, request: &ModelInvocationRequest) -> serde_json::Value {
-        let input = responses_input_items(request);
-        let mut body = json!({
-            "model": self.model,
-            "input": input,
-            "stream": false,
-        });
-        if let Some(ref tools) = request.tools {
-            if !tools.is_empty() {
-                body["tools"] = json!(responses_tool_definitions(tools));
-                body["tool_choice"] = request
-                    .tool_choice
-                    .as_ref()
-                    .map(responses_tool_choice)
-                    .unwrap_or_else(|| json!("auto"));
-            }
+        if let Some(effort) = self.reasoning_effort {
+            body["reasoning_effort"] = json!(reasoning_effort_label(effort));
         }
         body
     }
@@ -453,92 +461,6 @@ fn streaming_http_io(
     Ok((status, payload))
 }
 
-fn responses_input_items(request: &ModelInvocationRequest) -> Vec<serde_json::Value> {
-    if let Some(messages) = request.messages.as_ref() {
-        return messages
-            .iter()
-            .flat_map(responses_input_items_from_chat_message)
-            .collect();
-    }
-
-    vec![json!({
-        "role": "user",
-        "content": request.prompt,
-    })]
-}
-
-fn responses_input_items_from_chat_message(
-    message: &crate::types::ChatMessage,
-) -> Vec<serde_json::Value> {
-    if let Some(tool_call_id) = message.tool_call_id.as_ref() {
-        return vec![json!({
-            "type": "function_call_output",
-            "call_id": tool_call_id,
-            "output": message.content.as_deref().unwrap_or_default(),
-        })];
-    }
-
-    let mut items = Vec::new();
-    if let Some(content) = message
-        .content
-        .as_ref()
-        .filter(|content| !content.is_empty())
-    {
-        items.push(json!({
-            "role": responses_message_role(&message.role),
-            "content": content,
-        }));
-    }
-
-    for tool_call in &message.tool_calls {
-        items.push(json!({
-            "type": "function_call",
-            "call_id": tool_call.id,
-            "name": tool_call.function.name,
-            "arguments": tool_call.function.arguments,
-        }));
-    }
-
-    if items.is_empty() {
-        items.push(json!({
-            "role": responses_message_role(&message.role),
-            "content": "",
-        }));
-    }
-    items
-}
-
-fn responses_message_role(role: &str) -> &str {
-    if role == "system" { "developer" } else { role }
-}
-
-fn responses_tool_definitions(
-    tools: &[crate::types::ChatToolDefinition],
-) -> Vec<serde_json::Value> {
-    tools
-        .iter()
-        .map(|tool| {
-            json!({
-                "type": "function",
-                "name": tool.function.name,
-                "description": tool.function.description,
-                "parameters": tool.function.parameters,
-            })
-        })
-        .collect()
-}
-
-fn responses_tool_choice(tool_choice: &crate::types::ChatToolChoice) -> serde_json::Value {
-    if tool_choice.kind == "function" {
-        json!({
-            "type": "function",
-            "name": tool_choice.function.name,
-        })
-    } else {
-        json!("auto")
-    }
-}
-
 impl ModelBridgeClient for HttpModelBridgeClient {
     fn invoke(&self, request: ModelInvocationRequest) -> Result<BridgeResponse, BridgeClientError> {
         if request.prompt.trim().is_empty() && request.messages.is_none() {
@@ -654,24 +576,6 @@ impl HttpModelBridgeClient {
                     })?;
 
                 select_openai_bridge_payload(envelope.choices, envelope.usage).map_err(|reason| {
-                    BridgeClientError::CallFailed {
-                        layer: BridgeErrorLayer::RemoteBusiness,
-                        code: Some(-32007),
-                        message: format!("provider response invalid: {reason}"),
-                    }
-                })
-            }
-            HttpModelBridgeProtocol::Responses => {
-                let envelope: serde_json::Value = serde_json::from_str(response_body).map_err(
-                    |error| BridgeClientError::CallFailed {
-                        layer: BridgeErrorLayer::RemoteBusiness,
-                        code: Some(-32007),
-                        message: format!(
-                            "provider response invalid: decode responses payload failed: {error}"
-                        ),
-                    },
-                )?;
-                select_openai_responses_bridge_payload(&envelope).map_err(|reason| {
                     BridgeClientError::CallFailed {
                         layer: BridgeErrorLayer::RemoteBusiness,
                         code: Some(-32007),
@@ -920,11 +824,6 @@ fn build_openai_chat_completions_url(base_url: &str) -> Result<String, String> {
 }
 
 #[cfg(test)]
-fn build_openai_responses_url(base_url: &str) -> Result<String, String> {
-    build_protocol_endpoint_url(base_url, OPENAI_RESPONSES_PATH)
-}
-
-#[cfg(test)]
 fn build_anthropic_messages_url_for_test(base_url: &str) -> Result<String, String> {
     let request = AnthropicMessagesAdapter
         .build_request(
@@ -943,6 +842,7 @@ fn build_anthropic_messages_url_for_test(base_url: &str) -> Result<String, Strin
                 stream_idle_timeout_ms: None,
                 stream_hard_timeout_ms: None,
                 retry_policy: None,
+                reasoning_effort: None,
             },
             "claude-test",
         )
@@ -980,6 +880,7 @@ fn build_protocol_endpoint_url(base_url: &str, endpoint_path: &str) -> Result<St
 fn llm_message_params_from_invocation(
     request: &ModelInvocationRequest,
     stream: bool,
+    reasoning_effort: Option<ReasoningEffort>,
 ) -> LlmMessageParams {
     let messages = request
         .messages
@@ -1014,6 +915,22 @@ fn llm_message_params_from_invocation(
         stream_idle_timeout_ms: None,
         stream_hard_timeout_ms: None,
         retry_policy: None,
+        reasoning_effort,
+    }
+}
+
+/// 将 `ReasoningEffort` 序列化为下游 Chat Completions API 接受的字符串字面量。
+///
+/// 四档粒度（`low | medium | high | xhigh`）原样透传，由下游模型/网关自行解释。
+/// magi 不在这里做向下兼容降级——把"极高"偷偷映射成"high"会让用户看见的等级
+/// 与真实生效等级永久错位（见 Task #59 回归）。Anthropic Messages 协议不消费
+/// 该字符串，只读 `params.reasoning_effort` 枚举映射 budget tokens。
+fn reasoning_effort_label(effort: ReasoningEffort) -> &'static str {
+    match effort {
+        ReasoningEffort::Low => "low",
+        ReasoningEffort::Medium => "medium",
+        ReasoningEffort::High => "high",
+        ReasoningEffort::Xhigh => "xhigh",
     }
 }
 
@@ -1086,120 +1003,6 @@ fn tool_definition_from_chat_tool(tool: &crate::types::ChatToolDefinition) -> To
                         .collect::<Vec<_>>()
                 }),
         },
-    }
-}
-
-fn select_openai_responses_bridge_payload(envelope: &serde_json::Value) -> Result<String, String> {
-    let output = envelope
-        .get("output")
-        .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| "missing output array".to_string())?;
-
-    let mut text_parts = Vec::new();
-    let mut tool_calls = Vec::new();
-    for item in output {
-        match item.get("type").and_then(serde_json::Value::as_str) {
-            Some("message") => collect_responses_message_text(item, &mut text_parts),
-            Some("function_call") => {
-                if let Some(tool_call) = responses_function_call_item(item) {
-                    tool_calls.push(tool_call);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    OpenAiCompatibleSuccessPayload {
-        content: if text_parts.is_empty() {
-            None
-        } else {
-            Some(text_parts.join(""))
-        },
-        reasoning_content: {
-            let reasoning = collect_responses_reasoning_text(output);
-            (!reasoning.trim().is_empty()).then_some(reasoning)
-        },
-        finish_reason: envelope
-            .get("status")
-            .and_then(serde_json::Value::as_str)
-            .map(ToOwned::to_owned),
-        usage: envelope
-            .get("usage")
-            .map(responses_usage_to_openai_compatible),
-        tool_calls,
-    }
-    .into_bridge_payload()
-}
-
-fn collect_responses_reasoning_text(output: &[serde_json::Value]) -> String {
-    let mut parts = Vec::new();
-    for item in output {
-        if item.get("type").and_then(serde_json::Value::as_str) != Some("reasoning") {
-            continue;
-        }
-        if let Some(text) = item.get("text").and_then(serde_json::Value::as_str) {
-            parts.push(text.to_string());
-        }
-        if let Some(summary) = item.get("summary").and_then(serde_json::Value::as_array) {
-            for block in summary {
-                if let Some(text) = block.get("text").and_then(serde_json::Value::as_str) {
-                    parts.push(text.to_string());
-                }
-            }
-        }
-    }
-    parts.join("")
-}
-
-fn collect_responses_message_text(item: &serde_json::Value, text_parts: &mut Vec<String>) {
-    let Some(content) = item.get("content").and_then(serde_json::Value::as_array) else {
-        return;
-    };
-    for block in content {
-        let block_type = block.get("type").and_then(serde_json::Value::as_str);
-        if matches!(block_type, Some("output_text" | "text")) {
-            if let Some(text) = block.get("text").and_then(serde_json::Value::as_str) {
-                text_parts.push(text.to_string());
-            }
-        }
-    }
-}
-
-fn responses_function_call_item(item: &serde_json::Value) -> Option<OpenAiCompatibleToolCall> {
-    Some(OpenAiCompatibleToolCall {
-        id: item
-            .get("call_id")
-            .or_else(|| item.get("id"))
-            .and_then(serde_json::Value::as_str)
-            .map(ToOwned::to_owned),
-        kind: Some("function".to_string()),
-        function: OpenAiCompatibleToolFunction {
-            name: item
-                .get("name")
-                .and_then(serde_json::Value::as_str)?
-                .to_string(),
-            arguments: match item.get("arguments") {
-                Some(serde_json::Value::String(value)) => value.clone(),
-                Some(value) => value.to_string(),
-                None => "{}".to_string(),
-            },
-        },
-    })
-}
-
-fn responses_usage_to_openai_compatible(usage: &serde_json::Value) -> OpenAiCompatibleUsage {
-    OpenAiCompatibleUsage {
-        prompt_tokens: usage
-            .get("input_tokens")
-            .and_then(serde_json::Value::as_u64),
-        completion_tokens: usage
-            .get("output_tokens")
-            .and_then(serde_json::Value::as_u64),
-        total_tokens: usage
-            .get("total_tokens")
-            .and_then(serde_json::Value::as_u64),
-        prompt_tokens_details: usage.get("input_tokens_details").cloned(),
-        completion_tokens_details: usage.get("output_tokens_details").cloned(),
     }
 }
 
@@ -1377,53 +1180,13 @@ mod tests {
     }
 
     #[test]
-    fn build_responses_request_body_uses_responses_contract() {
-        let client = HttpModelBridgeClient::new_with_protocol(
-            "https://api.example.com/v1".to_string(),
-            Some("test-key".to_string()),
-            "gpt-4.1".to_string(),
-            HttpModelBridgeProtocol::Responses,
-        );
-
-        let body = client.build_request_body(&ModelInvocationRequest {
-            provider: "openai".to_string(),
-            prompt: "classify".to_string(),
-            messages: None,
-            tools: Some(vec![crate::types::ChatToolDefinition {
-                kind: "function".to_string(),
-                function: crate::types::ChatToolFunctionDefinition {
-                    name: "classify_session_turn".to_string(),
-                    description: "分类当前会话 turn".to_string(),
-                    parameters: serde_json::json!({
-                        "type": "object",
-                        "properties": {
-                            "route": { "type": "string" }
-                        },
-                        "required": ["route"]
-                    }),
-                },
-            }]),
-            tool_choice: Some(crate::types::ChatToolChoice::force_function(
-                "classify_session_turn",
-            )),
-        });
-
-        assert_eq!(body["model"], "gpt-4.1");
-        assert_eq!(body["input"][0]["role"], "user");
-        assert_eq!(body["input"][0]["content"], "classify");
-        assert_eq!(body["tools"][0]["type"], "function");
-        assert_eq!(body["tools"][0]["name"], "classify_session_turn");
-        assert_eq!(body["tool_choice"]["type"], "function");
-        assert_eq!(body["tool_choice"]["name"], "classify_session_turn");
-    }
-
-    #[test]
     fn build_anthropic_request_body_uses_messages_contract() {
         let client = HttpModelBridgeClient::new_with_protocol(
             "https://api.anthropic.com".to_string(),
             Some("sk-ant-test".to_string()),
             "claude-sonnet-test".to_string(),
             HttpModelBridgeProtocol::AnthropicMessages,
+            None,
         );
 
         let body = client.build_request_body(&ModelInvocationRequest {
@@ -1469,6 +1232,179 @@ mod tests {
         assert_eq!(body["tool_choice"]["type"], "tool");
         assert_eq!(body["tool_choice"]["name"], "shell_exec");
         assert_eq!(body["stream"], false);
+    }
+
+    #[test]
+    fn chat_completions_injects_reasoning_effort_when_configured() {
+        let cases = [
+            (ReasoningEffort::Low, "low"),
+            (ReasoningEffort::Medium, "medium"),
+            (ReasoningEffort::High, "high"),
+            (ReasoningEffort::Xhigh, "xhigh"),
+        ];
+        for (effort, expected) in cases {
+            let client = HttpModelBridgeClient::new_with_protocol(
+                "https://api.example.com/v1".to_string(),
+                Some("test-key".to_string()),
+                "gpt-test".to_string(),
+                HttpModelBridgeProtocol::ChatCompletions,
+                Some(effort),
+            );
+            let body = client.build_request_body(&ModelInvocationRequest {
+                provider: "openai".to_string(),
+                prompt: "ping".to_string(),
+                messages: None,
+                tools: None,
+                tool_choice: None,
+            });
+            assert_eq!(
+                body["reasoning_effort"], expected,
+                "effort {:?} should serialize to `{}`",
+                effort, expected
+            );
+        }
+    }
+
+    #[test]
+    fn chat_completions_omits_reasoning_effort_when_unset() {
+        let client = HttpModelBridgeClient::new(
+            "https://api.example.com/v1".to_string(),
+            Some("test-key".to_string()),
+            "gpt-test".to_string(),
+        );
+        let body = client.build_request_body(&ModelInvocationRequest {
+            provider: "openai".to_string(),
+            prompt: "ping".to_string(),
+            messages: None,
+            tools: None,
+            tool_choice: None,
+        });
+        assert!(
+            body.get("reasoning_effort").is_none(),
+            "未配置推理级别时不得写入 reasoning_effort 字段"
+        );
+    }
+
+    #[test]
+    fn anthropic_request_maps_reasoning_effort_to_budget_tokens() {
+        let cases = [
+            (ReasoningEffort::Low, 1024u32),
+            (ReasoningEffort::Medium, 4096u32),
+            (ReasoningEffort::High, 16384u32),
+            (ReasoningEffort::Xhigh, 32768u32),
+        ];
+        for (effort, expected_budget) in cases {
+            let client = HttpModelBridgeClient::new_with_protocol(
+                "https://api.anthropic.com".to_string(),
+                Some("sk-ant-test".to_string()),
+                // 选用不在 extended thinking 能力清单中的模型名，确保启用完全由配置驱动
+                "claude-non-thinking-test".to_string(),
+                HttpModelBridgeProtocol::AnthropicMessages,
+                Some(effort),
+            );
+            let body = client.build_request_body(&ModelInvocationRequest {
+                provider: "anthropic".to_string(),
+                prompt: "ping".to_string(),
+                messages: None,
+                tools: None,
+                tool_choice: None,
+            });
+            assert_eq!(
+                body["thinking"]["type"], "enabled",
+                "effort {:?} 必须强制启用 thinking",
+                effort
+            );
+            assert_eq!(
+                body["thinking"]["budget_tokens"], expected_budget,
+                "effort {:?} 应映射到 budget_tokens={}",
+                effort, expected_budget
+            );
+            assert_eq!(
+                body["temperature"], 1,
+                "Anthropic 在 thinking 启用时 temperature 必须为 1"
+            );
+            let max_tokens = body["max_tokens"].as_u64().expect("max_tokens 必须为整数");
+            assert!(
+                max_tokens > expected_budget as u64,
+                "max_tokens={} 必须严格大于 budget_tokens={}",
+                max_tokens,
+                expected_budget
+            );
+        }
+    }
+
+    #[test]
+    fn probe_request_inherits_reasoning_effort_for_chat_completions() {
+        let client = HttpModelBridgeClient::new_with_protocol(
+            "https://api.example.com/v1".to_string(),
+            Some("test-key".to_string()),
+            "gpt-test".to_string(),
+            HttpModelBridgeProtocol::ChatCompletions,
+            Some(ReasoningEffort::Xhigh),
+        );
+        let (url, body, headers) = client
+            .build_probe_request()
+            .expect("probe request should build");
+
+        assert_eq!(url, "https://api.example.com/v1/chat/completions");
+        assert_eq!(body["model"], "gpt-test");
+        assert_eq!(body["messages"][0]["content"], "ping");
+        assert_eq!(
+            body["reasoning_effort"], "xhigh",
+            "OpenAI 探针必须原样透传 reasoning_effort（Xhigh → xhigh，不再降级到 high）"
+        );
+        assert!(headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("Authorization") && value == "Bearer test-key"
+        }));
+    }
+
+    #[test]
+    fn probe_request_inherits_thinking_budget_for_anthropic() {
+        let client = HttpModelBridgeClient::new_with_protocol(
+            "https://api.anthropic.com".to_string(),
+            Some("sk-ant-test".to_string()),
+            "claude-test".to_string(),
+            HttpModelBridgeProtocol::AnthropicMessages,
+            Some(ReasoningEffort::Xhigh),
+        );
+        let (url, body, headers) = client
+            .build_probe_request()
+            .expect("probe request should build");
+
+        assert_eq!(url, "https://api.anthropic.com/v1/messages");
+        assert_eq!(body["model"], "claude-test");
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["thinking"]["budget_tokens"], 32768);
+        assert_eq!(body["temperature"], 1);
+        let max_tokens = body["max_tokens"]
+            .as_u64()
+            .expect("Anthropic 探针 max_tokens 必须为整数");
+        assert!(
+            max_tokens > 32768,
+            "max_tokens={max_tokens} 必须严格大于 budget_tokens=32768"
+        );
+        assert!(headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("x-api-key") && value == "sk-ant-test"
+        }));
+        assert!(headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("anthropic-version") && value == "2023-06-01"
+        }));
+    }
+
+    #[test]
+    fn probe_request_omits_reasoning_effort_when_unset() {
+        let client = HttpModelBridgeClient::new(
+            "https://api.example.com/v1".to_string(),
+            Some("test-key".to_string()),
+            "gpt-test".to_string(),
+        );
+        let (_, body, _) = client
+            .build_probe_request()
+            .expect("probe request should build");
+        assert!(
+            body.get("reasoning_effort").is_none(),
+            "未配置推理级别时探针不得写入 reasoning_effort"
+        );
     }
 
     #[test]
@@ -1553,22 +1489,6 @@ mod tests {
         assert_eq!(
             client4.chat_completions_url().unwrap(),
             "http://example.com:8320/v1/chat/completions"
-        );
-    }
-
-    #[test]
-    fn responses_url_builds_correctly() {
-        assert_eq!(
-            build_openai_responses_url("https://api.example.com/v1").unwrap(),
-            "https://api.example.com/v1/responses"
-        );
-        assert_eq!(
-            build_openai_responses_url("https://api.example.com/v1/responses").unwrap(),
-            "https://api.example.com/v1/responses"
-        );
-        assert_eq!(
-            build_openai_responses_url("http://example.com:8320/").unwrap(),
-            "http://example.com:8320/v1/responses"
         );
     }
 
@@ -1807,69 +1727,6 @@ mod tests {
     }
 
     #[test]
-    fn invoke_against_mock_server_uses_responses_protocol_when_configured() {
-        let server = spawn_mock_server(
-            200,
-            serde_json::json!({
-                "status": "completed",
-                "usage": {
-                    "input_tokens": 7,
-                    "output_tokens": 4,
-                    "total_tokens": 11,
-                    "input_tokens_details": {
-                        "cached_tokens": 2
-                    }
-                },
-                "output": [{
-                    "type": "message",
-                    "content": [{
-                        "type": "output_text",
-                        "text": "responses reply"
-                    }]
-                }]
-            }),
-        );
-
-        let client = HttpModelBridgeClient::new_with_protocol(
-            server.address.clone(),
-            Some("sk-test".to_string()),
-            "gpt-4.1".to_string(),
-            HttpModelBridgeProtocol::Responses,
-        );
-
-        let response = client
-            .invoke(ModelInvocationRequest {
-                provider: "openai".to_string(),
-                prompt: "hello".to_string(),
-                messages: None,
-                tools: None,
-                tool_choice: None,
-            })
-            .expect("invoke should succeed");
-
-        assert!(response.ok);
-        let payload: serde_json::Value =
-            serde_json::from_str(&response.payload).expect("payload should be json");
-        assert_eq!(payload["content"], "responses reply");
-        assert_eq!(payload["usage"]["prompt_tokens"], 7);
-        assert_eq!(payload["usage"]["completion_tokens"], 4);
-        assert_eq!(
-            payload["usage"]["prompt_tokens_details"]["cached_tokens"],
-            2
-        );
-
-        let recorded = server
-            .request_receiver
-            .recv_timeout(Duration::from_secs(5))
-            .expect("mock server should receive request");
-        assert_eq!(recorded.path, "/v1/responses");
-        let body: serde_json::Value =
-            serde_json::from_str(&recorded.body).expect("body should be json");
-        assert_eq!(body["input"][0]["content"], "hello");
-        assert_eq!(body["stream"], false);
-    }
-
-    #[test]
     fn invoke_against_mock_server_uses_anthropic_messages_protocol_when_configured() {
         let server = spawn_mock_server(
             200,
@@ -1895,6 +1752,7 @@ mod tests {
             Some("sk-ant-test".to_string()),
             "claude-sonnet-test".to_string(),
             HttpModelBridgeProtocol::AnthropicMessages,
+            None,
         );
 
         let response = client

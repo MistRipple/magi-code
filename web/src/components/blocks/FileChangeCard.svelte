@@ -5,6 +5,8 @@
   import FileSpan from '../FileSpan.svelte';
   import type { IconName } from '../../lib/icons';
   import { i18n } from '../../stores/i18n.svelte';
+  import { openCodeTab } from '../../stores/right-pane.svelte';
+  import { messagesState } from '../../stores/messages.svelte';
 
   interface Props {
     block: ContentBlock;
@@ -146,6 +148,17 @@
       default: return i18n.t('edits.kind.text');
     }
   }
+
+  /**
+   * 把当前 file change 推到右侧 RightPane 的 code tab。
+   * 优先带上 diff（unified 文本）；二进制/特殊类型且无 diff 时仅传 filepath，让 RightPane 显示空态。
+   */
+  function previewInRightPane(filepath: string) {
+    if (!filepath) return;
+    openCodeTab(messagesState.currentSessionId, filepath, {
+      diff: change?.diff ?? null,
+    });
+  }
 </script>
 
 {#if change}
@@ -164,7 +177,7 @@
         {#if change.changeType === 'rename' && change.oldPath}
           <span class="rename-path" title={displayPath}>{displayPath}</span>
         {:else}
-          <FileSpan filepath={change.filePath} showIcon={false} clickable={false} />
+          <FileSpan filepath={change.filePath} showIcon={false} clickable={true} onClick={previewInRightPane} />
         {/if}
       </span>
 

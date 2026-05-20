@@ -84,7 +84,7 @@
     return projection.runner_status === 'running';
   });
   const sessionInputLocked = $derived.by(() => (
-    messagesState.sessionHydrating || !currentSessionId?.trim()
+    messagesState.sessionHydrating
   ));
 
   // 发送/停止态只认 store 内已经收敛好的 isProcessing：
@@ -856,6 +856,7 @@
       class:is-empty={!inputValue}
       contenteditable={!(sessionInputLocked || isInteractionBlocking)}
       role="textbox"
+      tabindex={sessionInputLocked || isInteractionBlocking ? -1 : 0}
       aria-multiline="true"
       aria-disabled={sessionInputLocked || isInteractionBlocking}
       data-placeholder={selectedSkill

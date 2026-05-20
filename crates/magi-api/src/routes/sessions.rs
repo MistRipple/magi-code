@@ -49,7 +49,6 @@ use crate::{
 
 pub fn routes() -> Router<ApiState> {
     Router::new()
-        .route("/session/new", post(create_session))
         .route("/session/turn", post(submit_session_turn))
         .route("/session/interrupt", post(interrupt_session_turn))
         .route("/session/continue", post(continue_session))
@@ -83,38 +82,6 @@ impl DeleteSessionRequest {
     fn requested_workspace_id(&self) -> Option<&str> {
         trimmed_non_empty(self.workspace_id.as_deref())
     }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct CreateSessionRequest {
-    workspace_id: Option<String>,
-    workspace_path: Option<String>,
-}
-
-async fn create_session(
-    State(state): State<ApiState>,
-    Json(request): Json<CreateSessionRequest>,
-) -> Result<Json<SessionSelectionResponseDto>, ApiError> {
-    let session_id = super::new_session_id();
-    let workspace_id = state
-        .resolve_workspace_id_from_request(
-            request
-                .workspace_id
-                .filter(|s| !s.is_empty())
-                .map(WorkspaceId::new),
-            request.workspace_path.as_deref(),
-        )
-        .map(|workspace_id| workspace_id.to_string());
-    let created_session = state
-        .session_store
-        .create_session_for_workspace(session_id, "新会话", workspace_id)
-        .map_err(|e| ApiError::internal_assembly("创建会话失败", e))?;
-    state.persist_session_durable_state()?;
-    Ok(Json(SessionSelectionResponseDto {
-        session_id: created_session.session_id.to_string(),
-        current_session: Some(created_session),
-    }))
 }
 
 async fn submit_session_turn(
@@ -1016,9 +983,7 @@ fn submit_regular_session_turn(
     decision: SessionTurnIntentDecision,
 ) -> Result<SessionTurnResponseDto, ApiError> {
     let message = request.timeline_message(request.trimmed_text().as_deref());
-    let title_seed = request
-        .trimmed_text()
-        .unwrap_or_else(|| "新会话".to_string());
+    let placeholder_title = crate::session_title::NEW_SESSION_PLACEHOLDER_TITLE;
     let requested_workspace_path = request.requested_workspace_path();
     let requested_workspace_id = state.resolve_workspace_id_from_request(
         request
@@ -1030,7 +995,7 @@ fn submit_regular_session_turn(
         &state,
         request.requested_session_id(),
         requested_workspace_id,
-        &title_seed,
+        placeholder_title,
         accepted_at,
     )?;
     // S1：user 信号经 Conversation Mailbox 入栈，下游一律读 signal.* 不再读 request.*
@@ -1152,7 +1117,12 @@ fn submit_regular_session_turn(
     );
 
     if created_session {
-        spawn_new_session_title_refinement(&state, &session_id, &message, &title_seed);
+        crate::session_title::spawn_new_session_title_refinement(
+            &state,
+            &session_id,
+            &message,
+            placeholder_title,
+        );
     }
 
     Ok(SessionTurnResponseDto::new(
@@ -1172,41 +1142,6 @@ fn submit_regular_session_turn(
         accepted_canonical_turn,
         accepted_canonical_item,
     ))
-}
-
-/// 新建会话时，把首条用户消息丢给辅助模型异步精修一个更易读的会话标题。
-///
-/// 辅助模型未配置或调用失败时静默跳过，placeholder 标题保留不变。
-fn spawn_new_session_title_refinement(
-    state: &ApiState,
-    session_id: &SessionId,
-    first_message: &str,
-    placeholder_title: &str,
-) {
-    let Some(client) =
-        magi_conversation_runtime::task_execution_dispatcher::build_auxiliary_model_client(
-            &state.settings_store,
-        )
-    else {
-        tracing::debug!(
-            session_id = %session_id,
-            "辅助模型未配置，跳过会话标题精修"
-        );
-        return;
-    };
-    let session_store = state.session_store.clone();
-    let session_id = session_id.clone();
-    let first_message = first_message.to_string();
-    let placeholder_title = placeholder_title.to_string();
-    tokio::task::spawn_blocking(move || {
-        crate::session_title::refine_new_session_title(
-            client,
-            session_store,
-            session_id,
-            first_message,
-            placeholder_title,
-        );
-    });
 }
 
 fn spawn_regular_session_turn_execution(
@@ -2966,6 +2901,14 @@ mod tests {
                 Some("workspace-b".to_string()),
             )
             .expect("session should create");
+        // bootstrap 现在按"会话是否有用户消息"过滤——给每个测试会话补一条用户消息让它可见
+        for id in [&deleted_session_id, &sibling_session_id, &foreign_session_id] {
+            state.session_store.append_timeline_entry(
+                id.clone(),
+                TimelineEntryKind::UserMessage,
+                "hello",
+            );
+        }
 
         let (status, body) = post_json(
             state,
@@ -2985,7 +2928,13 @@ mod tests {
             .map(|session| session["sessionId"].as_str().unwrap_or_default())
             .collect::<Vec<_>>();
         assert_eq!(session_ids, vec![sibling_session_id.as_str()]);
-        assert_eq!(body["currentSession"], serde_json::Value::Null);
+        // 删除当前展示的会话后，bootstrap 自动选中同 workspace 内最近一条可见会话作为 current
+        assert_eq!(
+            body["currentSession"]["sessionId"]
+                .as_str()
+                .unwrap_or_default(),
+            sibling_session_id.as_str()
+        );
     }
 
     #[tokio::test]
@@ -3143,6 +3092,12 @@ mod tests {
                 Some("workspace-b".to_string()),
             )
             .expect("session should create");
+        // bootstrap 现在按"会话是否有用户消息"过滤——补一条用户消息让 selected_session_id 在响应中可见
+        state.session_store.append_timeline_entry(
+            selected_session_id.clone(),
+            TimelineEntryKind::UserMessage,
+            "hello",
+        );
         state
             .snapshot_manager
             .start_session(selected_session_id.as_str().to_string(), selected_root)

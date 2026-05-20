@@ -6,7 +6,6 @@ use crate::dto::{
     RuntimeReadModelDto, ServiceInfo, VersionHandshakeDto, runtime_read_model_dto,
 };
 use crate::errors::ApiError;
-use crate::model_config::normalize_executable_model_provider;
 use crate::routes::settings::{
     builtin_role_templates, enabled_registry_agent_roles, load_registry_engines,
     resolve_registry_agents,
@@ -68,6 +67,10 @@ pub struct RunnerHandle {
 }
 
 type RunnerTerminalObserver = Arc<dyn Fn(TaskId, Option<SessionId>, String) + Send + Sync>;
+
+pub(crate) fn session_has_user_content(session: &SessionRecord) -> bool {
+    session.message_count.unwrap_or(0) > 0
+}
 
 /// Manages active Runner instances keyed by root_task_id.
 #[derive(Clone)]
@@ -830,7 +833,13 @@ impl ApiState {
                     .iter()
                     .any(|session| session.session_id == **session_id)
             })
-            .cloned();
+            .cloned()
+            .or_else(|| {
+                projection
+                    .sessions
+                    .first()
+                    .map(|session| session.session_id.clone())
+            });
         projection.current_session_id = selected_session_id.clone();
         if let Some(session_id) = selected_session_id.as_ref() {
             projection
@@ -858,11 +867,17 @@ impl ApiState {
             .map(str::trim)
             .filter(|value| !value.is_empty())
         else {
-            return self.session_store.sessions();
+            return self
+                .session_store
+                .sessions()
+                .into_iter()
+                .filter(session_has_user_content)
+                .collect();
         };
         self.session_store
             .sessions()
             .into_iter()
+            .filter(session_has_user_content)
             .filter(|session| {
                 self.session_workspace_id(session)
                     .as_ref()
@@ -1326,46 +1341,14 @@ fn normalize_settings_snapshot_sections(snapshot: &mut HashMap<String, serde_jso
     ] {
         if let Some(value) = snapshot.get_mut(key) {
             normalize_wrapped_section_value(value);
-            normalize_model_provider_in_section(value);
         }
     }
     skill_loader::normalize_skills_config_sections(snapshot);
     seed_user_rules_config(snapshot);
     normalize_workers_section(snapshot);
-    if let Some(value) = snapshot.get_mut("workers") {
-        normalize_worker_model_providers(value);
-    }
-    if let Some(value) = snapshot.get_mut("workerConfigs") {
-        normalize_worker_model_providers(value);
-    }
     normalize_mcp_servers_section(snapshot);
     seed_default_safeguard_rules(snapshot);
     alias_snapshot_keys(snapshot);
-}
-
-fn normalize_model_provider_in_section(value: &mut serde_json::Value) {
-    let Some(object) = value.as_object_mut() else {
-        return;
-    };
-    if object.contains_key("baseUrl")
-        || object.contains_key("model")
-        || object.contains_key("provider")
-    {
-        let provider = normalize_executable_model_provider(
-            object.get("provider").and_then(serde_json::Value::as_str),
-        );
-        object.insert("provider".to_string(), serde_json::Value::String(provider));
-    }
-}
-
-fn normalize_worker_model_providers(value: &mut serde_json::Value) {
-    let Some(workers) = value.as_object_mut() else {
-        return;
-    };
-    for worker in workers.values_mut() {
-        normalize_wrapped_section_value(worker);
-        normalize_model_provider_in_section(worker);
-    }
 }
 
 fn alias_snapshot_keys(snapshot: &mut HashMap<String, serde_json::Value>) {
@@ -1613,7 +1596,8 @@ pub(crate) fn build_mcp_config_from_entry(entry: &serde_json::Value) -> Option<M
 #[cfg(test)]
 mod tests {
     use super::*;
-    use magi_core::{MissionId, Task, TaskKind};
+    use magi_core::{AbsolutePath, MissionId, Task, TaskKind};
+    use std::time::Duration;
 
     fn task_with_status(task_id: &str, status: TaskStatus) -> Task {
         let now = UtcMillis::now();
@@ -1665,5 +1649,96 @@ mod tests {
             &store,
             &[pending_id]
         ));
+    }
+
+    #[tokio::test]
+    async fn bootstrap_workspace_session_selects_latest_visible_history() {
+        let event_bus = Arc::new(InMemoryEventBus::new(32));
+        let session_store = Arc::new(SessionStore::default());
+        let workspace_store = Arc::new(WorkspaceStore::default());
+        let governance = Arc::new(GovernanceService::default());
+        let workspace_root = std::env::temp_dir().join(format!(
+            "magi-api-bootstrap-default-history-{}",
+            UtcMillis::now().0
+        ));
+        std::fs::create_dir_all(&workspace_root).expect("workspace root should create");
+        let state = ApiState::new(
+            "magi-test",
+            event_bus,
+            session_store.clone(),
+            workspace_store.clone(),
+            governance,
+        );
+        let workspace_id = WorkspaceId::new("workspace-bootstrap-default-history");
+        workspace_store
+            .register(
+                workspace_id.clone(),
+                AbsolutePath::new(workspace_root.to_string_lossy().as_ref()),
+            )
+            .expect("workspace should register");
+        session_store
+            .create_session_for_workspace(
+                SessionId::new("session-empty-bootstrap-history"),
+                "空白会话",
+                Some(workspace_id.to_string()),
+            )
+            .expect("empty session should create");
+
+        let older_session_id = SessionId::new("session-bootstrap-older");
+        session_store
+            .create_session_for_workspace(
+                older_session_id.clone(),
+                "较早历史",
+                Some(workspace_id.to_string()),
+            )
+            .expect("older session should create");
+        session_store.append_timeline_entry(
+            older_session_id,
+            magi_session_store::TimelineEntryKind::UserMessage,
+            "较早消息",
+        );
+        std::thread::sleep(Duration::from_millis(2));
+
+        let newer_session_id = SessionId::new("session-bootstrap-newer");
+        session_store
+            .create_session_for_workspace(
+                newer_session_id.clone(),
+                "较新历史",
+                Some(workspace_id.to_string()),
+            )
+            .expect("newer session should create");
+        session_store.append_timeline_entry(
+            newer_session_id.clone(),
+            magi_session_store::TimelineEntryKind::UserMessage,
+            "较新消息",
+        );
+        state
+            .snapshot_manager
+            .start_session(
+                newer_session_id.as_str().to_string(),
+                workspace_root.clone(),
+            )
+            .await
+            .expect("selected session snapshot should start");
+
+        let bootstrap = state
+            .bootstrap_dto_for_workspace_session(Some(workspace_id.as_str()), None)
+            .expect("bootstrap should build");
+
+        assert_eq!(
+            bootstrap
+                .current_session
+                .as_ref()
+                .map(|session| session.session_id.clone()),
+            Some(newer_session_id)
+        );
+        assert_eq!(bootstrap.sessions.len(), 2);
+        assert!(
+            bootstrap
+                .sessions
+                .iter()
+                .all(|session| session.message_count.unwrap_or(0) > 0)
+        );
+        let _ = std::fs::remove_dir_all(workspace_root);
     }
 }

@@ -67,7 +67,9 @@ impl UnavailableBusinessModelBridgeClient {
             layer: magi_bridge_client::BridgeErrorLayer::RemoteBusiness,
             code: Some(-32004),
             message:
-                "业务模型桥未配置：请通过环境变量 MAGI_OPENAI_COMPAT_BASE_URL / MAGI_OPENAI_COMPAT_API_KEY / MAGI_OPENAI_COMPAT_MODEL 配置业务模型；settings.json 的 auxiliary 段仅用于辅助模型（标题精修 / 知识抽取 / 会话记忆 / Prompt 增强）。"
+                "业务模型桥未配置：请在设置面板「模型 · 主对话/编排模型」中填入 baseUrl / apiKey / model，\
+                 或退回到环境变量 MAGI_OPENAI_COMPAT_BASE_URL / MAGI_OPENAI_COMPAT_API_KEY / MAGI_OPENAI_COMPAT_MODEL 作为兜底。\
+                 settings.json 的 auxiliary 段仅用于辅助模型（会话标题精修 / 知识抽取 / 会话记忆 / Prompt 增强），不参与业务派发。"
                     .to_string(),
         }
     }
@@ -97,10 +99,7 @@ struct SettingsBackedBusinessModelBridgeClient {
 }
 
 impl SettingsBackedBusinessModelBridgeClient {
-    fn new(
-        state_root: PathBuf,
-        bridge_env: &[(&str, &str)],
-    ) -> Self {
+    fn new(state_root: PathBuf, bridge_env: &[(&str, &str)]) -> Self {
         Self {
             state_root,
             bridge_env: bridge_env
@@ -448,10 +447,17 @@ impl DaemonRuntime {
         }
 
         // 业务模型桥用于会话正文生成和任务执行；任务规划/分类另走本地 loopback-model。
-        // 业务模型配置来源仅两类：bridge_env override（测试） → 进程 env（MAGI_OPENAI_COMPAT_*）。
-        // 不再读 settings.json 的 auxiliary 段 —— aux 段是辅助模型专用配置（会话标题、
-        // 知识抽取、会话记忆、Prompt 增强），两条路径不复用同一份字段以杜绝配置错位。
-        // 测试场景下允许通过 model_bridge_override 注入业务模型 stub。
+        //
+        // 单一事实源（按优先级，由 task_execution_dispatcher::resolve_configured_model_client 串联）：
+        //   1. 测试场景 model_bridge_override 注入的 stub
+        //   2. settings.json 的 `orchestrator` 段（前端「主对话/编排模型」表单写入位置，
+        //      携带 reasoningEffort / urlMode 全套字段，是业务模型的权威入口）
+        //   3. 此处 daemon bootstrap 注入的 env 兜底 client（MAGI_OPENAI_COMPAT_*）
+        //      —— 仅在 settings.json 未配置 orchestrator 段时生效，
+        //      用于开发/测试不带 UI 也能跑通的场景。
+        //
+        // settings.json 的 `auxiliary` 段不参与业务派发，只服务于会话标题、知识抽取、
+        // 会话记忆、Prompt 增强等辅助任务（task_execution_dispatcher::build_auxiliary_model_client）。
         let direct_http_probe_result = if model_bridge_override.is_some() {
             None
         } else {
@@ -1016,10 +1022,7 @@ impl DaemonRuntime {
         let base_url = find_env("MAGI_OPENAI_COMPAT_BASE_URL")?;
         let api_key = find_env("MAGI_OPENAI_COMPAT_API_KEY");
         let model = find_env("MAGI_OPENAI_COMPAT_MODEL").unwrap_or_else(|| "gpt-4".to_string());
-        let protocol = match find_env("MAGI_OPENAI_COMPAT_PROTOCOL").as_deref() {
-            Some("responses") => HttpModelBridgeProtocol::Responses,
-            _ => HttpModelBridgeProtocol::ChatCompletions,
-        };
+        let protocol = HttpModelBridgeProtocol::ChatCompletions;
 
         let probe_config = DirectHttpModelProbeConfig {
             base_url: base_url.clone(),
@@ -1027,7 +1030,7 @@ impl DaemonRuntime {
             model: model.clone(),
         };
         Some((
-            HttpModelBridgeClient::new_with_protocol(base_url, api_key, model, protocol),
+            HttpModelBridgeClient::new_with_protocol(base_url, api_key, model, protocol, None),
             probe_config,
         ))
     }
@@ -1802,11 +1805,7 @@ mod tests {
 
     #[tokio::test]
     async fn daemon_router_bridge_services_exports_loopback_model_host_and_mcp_catalogs() {
-        for binary_name in [
-            "host_bridge_loopback",
-            "model_bridge_loopback",
-            "mcp_bridge_loopback",
-        ] {
+        for binary_name in ["model_bridge_loopback", "mcp_bridge_loopback"] {
             let path = test_bridge_binary_path(binary_name);
             assert!(
                 path.exists(),
@@ -1951,11 +1950,7 @@ mod tests {
 
     #[tokio::test]
     async fn daemon_router_bridge_cutover_smoke_exports_contract_snapshots() {
-        for binary_name in [
-            "host_bridge_loopback",
-            "model_bridge_loopback",
-            "mcp_bridge_loopback",
-        ] {
+        for binary_name in ["model_bridge_loopback", "mcp_bridge_loopback"] {
             let path = test_bridge_binary_path(binary_name);
             assert!(
                 path.exists(),
@@ -2204,11 +2199,7 @@ mod tests {
 
     #[tokio::test]
     async fn daemon_router_bridge_cutover_smoke_reflects_env_backed_provider_and_mcp_routes() {
-        for binary_name in [
-            "host_bridge_loopback",
-            "model_bridge_loopback",
-            "mcp_bridge_loopback",
-        ] {
+        for binary_name in ["model_bridge_loopback", "mcp_bridge_loopback"] {
             let path = test_bridge_binary_path(binary_name);
             assert!(
                 path.exists(),
@@ -2316,11 +2307,7 @@ mod tests {
     #[tokio::test]
     async fn daemon_router_bridge_cutover_smoke_surfaces_env_backed_provider_failure_with_ready_mcp_route()
      {
-        for binary_name in [
-            "host_bridge_loopback",
-            "model_bridge_loopback",
-            "mcp_bridge_loopback",
-        ] {
+        for binary_name in ["model_bridge_loopback", "mcp_bridge_loopback"] {
             let path = test_bridge_binary_path(binary_name);
             assert!(
                 path.exists(),
@@ -2446,11 +2433,7 @@ mod tests {
     #[tokio::test]
     async fn daemon_router_bridge_cutover_smoke_surfaces_cataloged_degraded_provider_with_ready_mcp_route()
      {
-        for binary_name in [
-            "host_bridge_loopback",
-            "model_bridge_loopback",
-            "mcp_bridge_loopback",
-        ] {
+        for binary_name in ["model_bridge_loopback", "mcp_bridge_loopback"] {
             let path = test_bridge_binary_path(binary_name);
             assert!(
                 path.exists(),
@@ -2549,11 +2532,7 @@ mod tests {
     #[tokio::test]
     async fn daemon_router_bridge_cutover_smoke_surfaces_env_backed_provider_invalid_response_with_ready_mcp_route()
      {
-        for binary_name in [
-            "host_bridge_loopback",
-            "model_bridge_loopback",
-            "mcp_bridge_loopback",
-        ] {
+        for binary_name in ["model_bridge_loopback", "mcp_bridge_loopback"] {
             let path = test_bridge_binary_path(binary_name);
             assert!(
                 path.exists(),
@@ -2676,11 +2655,7 @@ mod tests {
 
     #[tokio::test]
     async fn daemon_router_bridge_cutover_smoke_surfaces_env_backed_mcp_fallback_only_route() {
-        for binary_name in [
-            "host_bridge_loopback",
-            "model_bridge_loopback",
-            "mcp_bridge_loopback",
-        ] {
+        for binary_name in ["model_bridge_loopback", "mcp_bridge_loopback"] {
             let path = test_bridge_binary_path(binary_name);
             assert!(
                 path.exists(),
@@ -2800,11 +2775,7 @@ mod tests {
 
     #[tokio::test]
     async fn daemon_router_bridge_cutover_smoke_surfaces_env_backed_mcp_unavailable_route() {
-        for binary_name in [
-            "host_bridge_loopback",
-            "model_bridge_loopback",
-            "mcp_bridge_loopback",
-        ] {
+        for binary_name in ["model_bridge_loopback", "mcp_bridge_loopback"] {
             let path = test_bridge_binary_path(binary_name);
             assert!(
                 path.exists(),
@@ -2917,11 +2888,7 @@ mod tests {
     #[tokio::test]
     async fn daemon_router_bridge_cutover_smoke_surfaces_env_backed_provider_transport_failure_with_ready_mcp_route()
      {
-        for binary_name in [
-            "host_bridge_loopback",
-            "model_bridge_loopback",
-            "mcp_bridge_loopback",
-        ] {
+        for binary_name in ["model_bridge_loopback", "mcp_bridge_loopback"] {
             let path = test_bridge_binary_path(binary_name);
             assert!(
                 path.exists(),
@@ -3082,11 +3049,7 @@ mod tests {
 
     #[tokio::test]
     async fn daemon_bootstrap_exports_bridge_services_and_preflight_snapshots() {
-        for binary_name in [
-            "host_bridge_loopback",
-            "model_bridge_loopback",
-            "mcp_bridge_loopback",
-        ] {
+        for binary_name in ["model_bridge_loopback", "mcp_bridge_loopback"] {
             let path = test_bridge_binary_path(binary_name);
             assert!(
                 path.exists(),

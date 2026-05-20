@@ -7,7 +7,6 @@ import { aggregateUsageStatsForDisplay } from "../lib/usage-stats-aggregation";
 import { i18n } from "./i18n.svelte";
 import { addToast } from "../stores/messages.svelte";
 import {
-  AgentApiError,
   type AgentSettingsBootstrapSnapshot,
   addAgentMcpServer,
   addAgentRepository,
@@ -52,14 +51,10 @@ import type { ModelStatus, ModelStatusMap } from "../types/message";
 import { setEnabledAgents, getState } from "../stores/messages.svelte";
 import type { EnabledAgent } from "../stores/messages.svelte";
 import {
-  isEngineEnabled,
   resolveModelListFetchBlockReason,
-  resolveEnabledRoleUsagesForEngine,
 } from "../shared/model-governance";
 
 export type UrlMode = "standard" | "full";
-export type ProviderName = "openai" | "anthropic";
-export type OpenAiProtocol = "responses" | "chat";
 export type ReasoningEffort = "low" | "medium" | "high" | "xhigh";
 
 export interface BaseModelFormConfig {
@@ -67,32 +62,22 @@ export interface BaseModelFormConfig {
   urlMode: UrlMode;
   apiKey: string;
   model: string;
-  provider: ProviderName;
-  openaiProtocol?: OpenAiProtocol;
-  protocolEndpoint: string;
 }
 
 export interface InteractiveModelFormConfig extends BaseModelFormConfig {
-  thinking: boolean;
   reasoningEffort: ReasoningEffort;
 }
 
-export interface WorkerModelFormConfig extends InteractiveModelFormConfig {
-  enabled: boolean;
-}
+export interface WorkerModelFormConfig extends InteractiveModelFormConfig {}
 
 type BaseModelConfigPayload = Record<string, unknown> & {
   baseUrl: string;
   urlMode: UrlMode;
   apiKey: string;
   model: string;
-  provider: ProviderName;
-  protocolEndpoint: string;
-  openaiProtocol?: OpenAiProtocol;
 };
 
 type InteractiveModelConfigPayload = BaseModelConfigPayload & {
-  enableThinking: boolean;
   reasoningEffort: ReasoningEffort;
 };
 
@@ -277,47 +262,35 @@ function createSettingsStore(props: { onClose?: () => void }) {
   let workerModelTab = $state<string>("");
 
   function createInteractiveConfig(
-    provider: ProviderName,
     overrides: Partial<InteractiveModelFormConfig> = {},
   ): InteractiveModelFormConfig {
-    const config: InteractiveModelFormConfig = {
+    return {
       baseUrl: "",
       urlMode: "standard",
       apiKey: "",
       model: "",
-      provider,
-      protocolEndpoint: "",
-      thinking: false,
       reasoningEffort: "medium",
       ...overrides,
     };
-    normalizeFormOpenAiProtocol(config);
-    return config;
   }
 
   function createAuxiliaryConfig(
     overrides: Partial<BaseModelFormConfig> = {},
   ): BaseModelFormConfig {
-    const config: BaseModelFormConfig = {
+    return {
       baseUrl: "",
       urlMode: "standard",
       apiKey: "",
       model: "",
-      provider: "openai",
-      protocolEndpoint: "",
       ...overrides,
     };
-    normalizeFormOpenAiProtocol(config);
-    return config;
   }
 
   function createWorkerConfig(
-    provider: ProviderName,
     overrides: Partial<WorkerModelFormConfig> = {},
   ): WorkerModelFormConfig {
     return {
-      ...createInteractiveConfig(provider),
-      enabled: true,
+      ...createInteractiveConfig(),
       ...overrides,
     };
   }
@@ -326,58 +299,15 @@ function createSettingsStore(props: { onClose?: () => void }) {
     return value === "full" ? "full" : "standard";
   }
 
-  function normalizeOpenAiProtocol(value: unknown): OpenAiProtocol | undefined {
-    return value === "chat" || value === "responses" ? value : undefined;
-  }
-
-  function normalizeProviderName(value: unknown): ProviderName {
-    if (typeof value === "string" && value.trim().toLowerCase() === "anthropic") {
-      return "anthropic";
-    }
-    return "openai";
-  }
-
-  function getOpenAiProtocolValue(
-    config: Partial<BaseModelFormConfig> | undefined,
-  ): OpenAiProtocol {
-    return normalizeOpenAiProtocol(config?.openaiProtocol) || "responses";
-  }
-
-  function setOpenAiProtocolValue(
-    config: BaseModelFormConfig | undefined,
-    value: unknown,
-  ): void {
-    if (!config) {
-      return;
-    }
-    const normalized = normalizeOpenAiProtocol(value);
-    if (normalized === "chat") {
-      config.openaiProtocol = "chat";
-      return;
-    }
-    delete config.openaiProtocol;
-  }
-
-  function normalizeFormOpenAiProtocol(config: BaseModelFormConfig): void {
-    setOpenAiProtocolValue(config, config.openaiProtocol);
-  }
-
   function buildBaseModelConfigPayload(
     config: BaseModelFormConfig,
   ): BaseModelConfigPayload {
-    const payload: BaseModelConfigPayload = {
+    return {
       baseUrl: config.baseUrl,
       urlMode: config.urlMode,
       apiKey: config.apiKey,
       model: config.model,
-      provider: config.provider,
-      protocolEndpoint: config.protocolEndpoint,
     };
-    const protocol = normalizeOpenAiProtocol(config.openaiProtocol);
-    if (config.provider === "openai" && protocol === "chat") {
-      payload.openaiProtocol = protocol;
-    }
-    return payload;
   }
 
   function buildInteractiveModelConfigPayload(
@@ -385,7 +315,6 @@ function createSettingsStore(props: { onClose?: () => void }) {
   ): InteractiveModelConfigPayload {
     return {
       ...buildBaseModelConfigPayload(config),
-      enableThinking: config.thinking,
       reasoningEffort: config.reasoningEffort,
     };
   }
@@ -395,15 +324,11 @@ function createSettingsStore(props: { onClose?: () => void }) {
   ): WorkerModelConfigPayload {
     return {
       ...buildInteractiveModelConfigPayload(config),
-      enabled: config.enabled,
     };
   }
 
-  function getBaseUrlPlaceholder(provider: string): string {
-    if (provider === "anthropic") {
-      return "https://api.anthropic.com";
-    }
-    return "https://api.openai.com";
+  function getBaseUrlPlaceholder(): string {
+    return "https://api.openai.com/v1";
   }
 
   function normalizeBaseUrlForHint(baseUrl: string): string {
@@ -412,20 +337,15 @@ function createSettingsStore(props: { onClose?: () => void }) {
       : "";
   }
 
-  function shouldRecommendStandardUrlMode(
-    provider: ProviderName,
-    baseUrl: string,
-  ): boolean {
-    if (provider !== "openai") {
-      return false;
-    }
+  function shouldRecommendStandardUrlMode(baseUrl: string): boolean {
     const normalized = normalizeBaseUrlForHint(baseUrl);
     if (!normalized) {
       return false;
     }
-
+    // 这些 baseUrl 是“标准兼容形”端点：以 /v1 结尾且按 OpenAI 兼容协议派生，
+    // 因此推荐使用 standard 模式而非 full（避免把整条 URL 原样透传）。
     return (
-      normalized === "https://api.openai.com" ||
+      normalized === "https://api.openai.com/v1" ||
       normalized === "https://api.lkeap.cloud.tencent.com/coding/v3"
     );
   }
@@ -481,6 +401,12 @@ function createSettingsStore(props: { onClose?: () => void }) {
     if (changed) modelDropdownOpen = { ...modelDropdownOpen };
   }
 
+  function closeModelDropdown(key: string) {
+    if (!modelDropdownOpen[key]) return;
+    modelDropdownOpen[key] = false;
+    modelDropdownOpen = { ...modelDropdownOpen };
+  }
+
   function buildModelListSignature(config: Partial<BaseModelFormConfig> | undefined): string {
     if (!config) {
       return "";
@@ -488,10 +414,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
     return JSON.stringify({
       baseUrl: typeof config.baseUrl === "string" ? config.baseUrl.trim() : "",
       apiKey: typeof config.apiKey === "string" ? config.apiKey.trim() : "",
-      provider: config.provider || "",
       urlMode: config.urlMode || "standard",
-      openaiProtocol: getOpenAiProtocolValue(config),
-      protocolEndpoint: config.protocolEndpoint || "",
     });
   }
 
@@ -579,7 +502,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
 
   // 模型配置表单
   let orchConfig = $state<InteractiveModelFormConfig>(
-    createInteractiveConfig("openai"),
+    createInteractiveConfig(),
   );
   let compConfig = $state<BaseModelFormConfig>(createAuxiliaryConfig());
   let workerConfigs = $state<Record<string, WorkerModelFormConfig>>({});
@@ -625,7 +548,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
   $effect(() => {
     for (const w of workerModelTabs) {
       if (!workerConfigs[w]) {
-        workerConfigs[w] = createWorkerConfig("openai");
+        workerConfigs[w] = createWorkerConfig();
       }
     }
   });
@@ -705,23 +628,13 @@ function createSettingsStore(props: { onClose?: () => void }) {
   let showConfirmDialog = $state(false);
   let confirmDialogTitle = $state("");
   let confirmDialogMessage = $state("");
-  let confirmDialogMode = $state<"confirm" | "info">("confirm");
   let confirmDialogAction: (() => void) | null = $state(null);
 
   // 显示确认对话框
   function showConfirm(title: string, message: string, action: () => void) {
-    confirmDialogMode = "confirm";
     confirmDialogTitle = title;
     confirmDialogMessage = message;
     confirmDialogAction = action;
-    showConfirmDialog = true;
-  }
-
-  function showInfo(title: string, message: string) {
-    confirmDialogMode = "info";
-    confirmDialogTitle = title;
-    confirmDialogMessage = message;
-    confirmDialogAction = null;
     showConfirmDialog = true;
   }
 
@@ -731,14 +644,12 @@ function createSettingsStore(props: { onClose?: () => void }) {
       confirmDialogAction();
     }
     showConfirmDialog = false;
-    confirmDialogMode = "confirm";
     confirmDialogAction = null;
   }
 
   // 取消操作
   function handleConfirmNo() {
     showConfirmDialog = false;
-    confirmDialogMode = "confirm";
     confirmDialogAction = null;
   }
 
@@ -890,13 +801,6 @@ function createSettingsStore(props: { onClose?: () => void }) {
         next[workerId] = incomingWorker;
         continue;
       }
-      if (config?.enabled === false) {
-        next[workerId] = {
-          status: "disabled",
-          model: config.model?.trim() || undefined,
-        };
-        continue;
-      }
       next[workerId] = {
         status: hasUsableModelConfig(config) ? "configured" : "not_configured",
         model: config?.model?.trim() || undefined,
@@ -907,12 +811,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
       if (!next[engineId]) {
         const config = workerConfigs[engineId];
         next[engineId] = {
-          status:
-            config?.enabled === false
-              ? "disabled"
-              : hasUsableModelConfig(config)
-                ? "configured"
-                : "not_configured",
+          status: hasUsableModelConfig(config) ? "configured" : "not_configured",
           model: config?.model?.trim() || undefined,
         };
       }
@@ -949,16 +848,6 @@ function createSettingsStore(props: { onClose?: () => void }) {
           ? orchConfig
           : compConfig;
     const model = config?.model?.trim() || undefined;
-
-    if (
-      target === "worker"
-      && (config as WorkerModelFormConfig | undefined)?.enabled === false
-    ) {
-      return {
-        key: statusKey,
-        value: { status: "disabled", model },
-      };
-    }
 
     if (!hasUsableModelConfig(config)) {
       return {
@@ -1017,14 +906,13 @@ function createSettingsStore(props: { onClose?: () => void }) {
   }
 
   function getStatsDisplayKeys(): string[] {
-    // 仅展示真正“配置过”的模型：两个核心位永远在；worker 引擎需 enabled 且具备可用配置。
-    // 这样 stats tab 不会被 registry 里未启用 / 未填模型的引擎噪声污染。
+    // 仅展示真正"配置过"的模型：两个核心位永远在；worker 引擎需具备可用配置。
+    // 这样 stats tab 不会被 registry 里未填模型的引擎噪声污染。
     const keys = new Set<string>();
     keys.add("orchestrator");
     keys.add("auxiliary");
     for (const [workerId, config] of Object.entries(workerConfigs)) {
       if (!workerId.trim()) continue;
-      if (config?.enabled === false) continue;
       if (!hasUsableModelConfig(config)) continue;
       keys.add(workerId);
     }
@@ -1180,47 +1068,6 @@ function createSettingsStore(props: { onClose?: () => void }) {
     setEnabledAgents(agents);
   }
 
-  function getEnabledRoleUsagesForEngine(engineId: string) {
-    return resolveEnabledRoleUsagesForEngine(
-      engineId,
-      registryAgents,
-      roleTemplates,
-    );
-  }
-
-  function buildEngineDisableBlockedMessage(engineId: string): string {
-    const roles = getEnabledRoleUsagesForEngine(engineId).map(
-      (usage) => usage.displayName,
-    );
-    if (roles.length === 0) {
-      return "";
-    }
-    return i18n.t("settings.model.disableBlockedMessage", {
-      roles: roles.join("、"),
-    });
-  }
-
-  function handleWorkerEnabledToggle(engineId: string, enabled: boolean) {
-    const currentConfig = workerConfigs[engineId];
-    if (!currentConfig) {
-      return;
-    }
-    if (enabled) {
-      currentConfig.enabled = true;
-      workerConfigs = { ...workerConfigs };
-      return;
-    }
-
-    const blockingMessage = buildEngineDisableBlockedMessage(engineId);
-    if (blockingMessage) {
-      showInfo(i18n.t("settings.model.disableBlockedTitle"), blockingMessage);
-      return;
-    }
-
-    currentConfig.enabled = false;
-    workerConfigs = { ...workerConfigs };
-  }
-
   // ============================================
   // 引擎管理操作
   // ============================================
@@ -1236,9 +1083,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
           .replace(/^-|-$/g, "") || `engine-${Date.now()}`;
       // 为新引擎创建默认配置并加入 workerConfigs（前端暂存，不调后端）
       if (!workerConfigs[engineId]) {
-        workerConfigs[engineId] = createWorkerConfig("openai", {
-          enabled: true,
-        });
+        workerConfigs[engineId] = createWorkerConfig();
       }
       // 将新引擎注入 modelStatuses，确保 workerModelTabs 立即可见
       appState.modelStatus = {
@@ -1323,13 +1168,6 @@ function createSettingsStore(props: { onClose?: () => void }) {
   async function updateRoleEngine(templateId: string, engineId: string) {
     const existing = registryAgents.find((a) => a.templateId === templateId);
     if (!existing) return;
-    if (engineId && !isEngineEnabled(engineId, registryEngines, workerConfigs)) {
-      showInfo(
-        i18n.t("settings.agents.bindEngine"),
-        i18n.t("settings.agents.disabledEngineBlocked"),
-      );
-      return;
-    }
     const updated: AgentBinding = {
       ...existing,
       modelSource: engineId ? "engine" : "orchestrator",
@@ -1345,9 +1183,6 @@ function createSettingsStore(props: { onClose?: () => void }) {
     } catch (e) {
       console.error("[SettingsPanel] 更新角色引擎失败:", e);
       notifySettingsError("更新角色绑定", e);
-      if (e instanceof AgentApiError && e.status === 409) {
-        showInfo(i18n.t("settings.agents.bindEngine"), e.message);
-      }
     }
   }
 
@@ -1575,11 +1410,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
       notifySettingsInfo(
         blockReason === "full_url_mode"
           ? i18n.t("config.toast.modelListUnsupportedInFullMode")
-          : blockReason === "endpoint_base_url"
-            ? i18n.t("config.toast.modelListEndpointBaseUrl")
-          : blockReason === "unsupported_provider"
-            ? i18n.t("config.toast.modelListUnsupportedProvider")
-            : i18n.t("config.toast.fillBaseUrlFirst"),
+          : i18n.t("config.toast.fillBaseUrlFirst"),
       );
       return;
     }
@@ -1663,19 +1494,6 @@ function createSettingsStore(props: { onClose?: () => void }) {
       if (target === "worker") {
         const workerKey = key;
         const wc = workerConfigs[workerKey];
-        const blockingMessage =
-          wc.enabled === false
-            ? buildEngineDisableBlockedMessage(workerKey)
-            : "";
-        if (blockingMessage) {
-          showInfo(
-            i18n.t("settings.model.disableBlockedTitle"),
-            blockingMessage,
-          );
-          saveStatus[key] = "idle";
-          saveStatus = { ...saveStatus };
-          return;
-        }
         // 如果是未保存的新引擎，先持久化到 Registry + LLM Config
         if (unsavedEngines.has(workerKey)) {
           const displayName = engineDisplayNames.get(workerKey) || workerKey;
@@ -1705,13 +1523,8 @@ function createSettingsStore(props: { onClose?: () => void }) {
       resetSaveStatus(key);
     } catch (e) {
       console.error("[SettingsPanel] 保存模型配置失败:", e);
-      if (e instanceof AgentApiError && e.status === 409) {
-        showInfo(i18n.t("settings.model.disableBlockedTitle"), e.message);
-        saveStatus[key] = "idle";
-      } else {
-        saveStatus[key] = "error";
-        notifySettingsError("保存模型配置", e);
-      }
+      saveStatus[key] = "error";
+      notifySettingsError("保存模型配置", e);
       saveStatus = { ...saveStatus };
       resetSaveStatus(key);
     }
@@ -2372,21 +2185,17 @@ function createSettingsStore(props: { onClose?: () => void }) {
     if (!configs) {
       return;
     }
-    // 以后端返回的 workerConfigs 为准重建，保留未保存引擎的前端暂存
+    // 以后端返回的 workerConfigs 为准重建，保留未保存引擎的前端暂存。
+    // 注意：legacy 配置中的 provider / openaiProtocol / protocolEndpoint
+    // 字段不再参与协议派生（后端已统一由 baseUrl 推断），此处直接忽略。
     const next: Record<string, any> = {};
     for (const [worker, config] of Object.entries(configs)) {
       if (config) {
-        const provider = normalizeProviderName(config.provider);
-        next[worker] = createWorkerConfig(provider, {
+        next[worker] = createWorkerConfig({
           baseUrl: config.baseUrl || "",
           urlMode: normalizeUrlMode(config.urlMode),
           apiKey: config.apiKey || "",
           model: config.model || "",
-          provider,
-          openaiProtocol: normalizeOpenAiProtocol(config.openaiProtocol),
-          protocolEndpoint: config.protocolEndpoint || "",
-          enabled: config.enabled !== false,
-          thinking: config.enableThinking === true,
           reasoningEffort: config.reasoningEffort || "medium",
         });
       }
@@ -2404,16 +2213,12 @@ function createSettingsStore(props: { onClose?: () => void }) {
     if (!config) {
       return;
     }
-    const provider = normalizeProviderName(config.provider);
-    orchConfig = createInteractiveConfig(provider, {
+    // legacy provider/openaiProtocol/protocolEndpoint 字段静默忽略
+    orchConfig = createInteractiveConfig({
       baseUrl: config.baseUrl || "",
       urlMode: normalizeUrlMode(config.urlMode),
       apiKey: config.apiKey || "",
       model: config.model || "",
-      provider,
-      openaiProtocol: normalizeOpenAiProtocol(config.openaiProtocol),
-      protocolEndpoint: config.protocolEndpoint || "",
-      thinking: config.enableThinking === true,
       reasoningEffort: config.reasoningEffort || "medium",
     });
   }
@@ -2422,15 +2227,12 @@ function createSettingsStore(props: { onClose?: () => void }) {
     if (!config) {
       return;
     }
-    const provider = normalizeProviderName(config.provider);
+    // legacy provider/openaiProtocol/protocolEndpoint 字段静默忽略
     compConfig = createAuxiliaryConfig({
       baseUrl: config.baseUrl || "",
       urlMode: normalizeUrlMode(config.urlMode),
       apiKey: config.apiKey || "",
       model: config.model || "",
-      provider,
-      openaiProtocol: normalizeOpenAiProtocol(config.openaiProtocol),
-      protocolEndpoint: config.protocolEndpoint || "",
     });
   }
 
@@ -2874,9 +2676,6 @@ function createSettingsStore(props: { onClose?: () => void }) {
     get confirmDialogMessage() {
       return confirmDialogMessage;
     },
-    get confirmDialogMode() {
-      return confirmDialogMode;
-    },
     get statusTexts() {
       return statusTexts;
     },
@@ -2888,16 +2687,14 @@ function createSettingsStore(props: { onClose?: () => void }) {
     },
     getBaseUrlPlaceholder,
     shouldRecommendStandardUrlMode,
-    getOpenAiProtocolValue,
-    setOpenAiProtocolValue,
     openModelDropdown,
     closeAllModelDropdowns,
+    closeModelDropdown,
     handleConfirmYes,
     handleConfirmNo,
     getStatusClass,
     getStatusText,
     getWorkerStats,
-    handleWorkerEnabledToggle,
     openAddEngineDialog,
     deleteEngine,
     updateRoleEnabled,

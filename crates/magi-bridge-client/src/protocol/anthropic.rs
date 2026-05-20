@@ -1,10 +1,36 @@
 use serde_json::{Value, json};
 
 use super::adapter::{AdaptedRequest, AdaptedResponse, ProviderAdapter, ProviderFamily};
+use super::capability::supports_extended_thinking;
 use super::utils::{
     convert_messages_to_anthropic, parse_anthropic_usage, serialize_anthropic_tool_definitions,
 };
 use crate::llm_types::{LlmMessageParams, ToolCall};
+use magi_usage_authority::ReasoningEffort;
+
+/// Anthropic Extended Thinking 默认预算（tokens）。
+///
+/// 仅在调用方未显式指定 `reasoning_effort` 时使用。Anthropic 要求 `max_tokens > budget_tokens`。
+/// 这里取一个中等值，足够大多数推理场景，同时保证 `max_tokens.unwrap_or(4096)` 仍有可用余量。
+const DEFAULT_THINKING_BUDGET_TOKENS: u32 = 4096;
+/// 启用 thinking 时 `max_tokens` 的最低值（必须严格大于 budget）。
+const MIN_MAX_TOKENS_WITH_THINKING: u32 = 8192;
+
+/// 将 `ReasoningEffort` 映射为 Anthropic `thinking.budget_tokens` 数值。
+///
+/// 上限对齐官方文档「thinking budget」可用区间：
+/// - Low: 1024 — 轻量推理；
+/// - Medium: 4096 — 与默认值一致；
+/// - High: 16384 — 复杂任务；
+/// - Xhigh: 32768 — 极限推理预算。
+fn reasoning_effort_budget_tokens(effort: ReasoningEffort) -> u32 {
+    match effort {
+        ReasoningEffort::Low => 1024,
+        ReasoningEffort::Medium => 4096,
+        ReasoningEffort::High => 16384,
+        ReasoningEffort::Xhigh => 32768,
+    }
+}
 
 pub struct AnthropicMessagesAdapter;
 
@@ -37,18 +63,49 @@ impl ProviderAdapter for AnthropicMessagesAdapter {
         let non_system_owned: Vec<_> = non_system.into_iter().cloned().collect();
         let messages = convert_messages_to_anthropic(&non_system_owned);
 
+        // 触发 thinking 的两条路径：
+        //   1) 调用方显式配置了 `reasoning_effort`（用户在 UI 显式选了等级，必须强制启用）；
+        //   2) 模型能力声明支持 extended thinking（fallback 默认开关）。
+        // 这里采用 OR 语义：只要任一条件成立就启用 thinking，确保配置永远生效。
+        let configured_effort = params.reasoning_effort;
+        let thinking_enabled = configured_effort.is_some() || supports_extended_thinking(model);
+
+        let budget_tokens = configured_effort
+            .map(reasoning_effort_budget_tokens)
+            .unwrap_or(DEFAULT_THINKING_BUDGET_TOKENS);
+
+        let min_max_tokens_with_thinking = budget_tokens.saturating_add(4096);
+
+        let max_tokens = if thinking_enabled {
+            params
+                .max_tokens
+                .unwrap_or(min_max_tokens_with_thinking.max(MIN_MAX_TOKENS_WITH_THINKING))
+                .max(min_max_tokens_with_thinking.max(MIN_MAX_TOKENS_WITH_THINKING))
+        } else {
+            params.max_tokens.unwrap_or(4096)
+        };
+
         let mut body = json!({
             "model": model,
             "messages": messages,
-            "max_tokens": params.max_tokens.unwrap_or(4096),
+            "max_tokens": max_tokens,
         });
 
         if !system_text.is_empty() {
             body["system"] = json!(system_text);
         }
-        if let Some(temperature) = params.temperature {
+
+        if thinking_enabled {
+            body["thinking"] = json!({
+                "type": "enabled",
+                "budget_tokens": budget_tokens,
+            });
+            // Anthropic 约束：thinking 启用时 temperature 必须 = 1。
+            body["temperature"] = json!(1);
+        } else if let Some(temperature) = params.temperature {
             body["temperature"] = json!(temperature);
         }
+
         if let Some(ref tools) = params.tools {
             if !tools.is_empty() {
                 body["tools"] = json!(serialize_anthropic_tool_definitions(tools));

@@ -138,7 +138,6 @@ let bridgeListenerRegistered = false;
 let currentWorkspaceId = '';
 let currentWorkspacePath = '';
 let currentSessionId = '';
-let sessionCreationInFlight: Promise<string> | null = null;
 let currentInterruptTaskId = '';
 let currentRuntimeEpoch = '';
 let cachedSettingsBootstrap: SettingsBootstrapPayload | null = null;
@@ -1104,6 +1103,13 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
     refreshBootstrapAfterTerminalTurn(terminalReason);
   }
 
+  if (eventType === 'session.title.updated') {
+    void fetchBootstrap({ forceFresh: true }).catch((error) => {
+      reportExpectedRecoveryFailure('会话标题刷新', '[web-client-bridge] 会话标题更新后刷新失败:', error);
+      scheduleRecovery('session_title_updated_refresh', error, true);
+    });
+  }
+
   // Notify listeners about task-domain SSE events so lightweight stores
   // (e.g. task-projection-store) can react without waiting for a full bootstrap refresh.
   const isTaskProjectionRelevantEvent = eventType.startsWith('task.')
@@ -1695,11 +1701,6 @@ async function fetchBootstrap(
   }
   const doFetch = async (): Promise<void> => {
     const { workspaceId, workspacePath, sessionId } = resolveWorkspaceQuery();
-    if ((workspaceId || workspacePath) && !sessionId) {
-      clearWorkspaceSessionBinding(workspaceId, workspacePath);
-      await createSession();
-      return;
-    }
     const query = new URLSearchParams();
     if (workspaceId) {
       query.set('workspaceId', workspaceId);
@@ -1918,53 +1919,6 @@ async function loadLatestSessionSnapshot(
   });
 }
 
-async function createSessionInternal(): Promise<string> {
-  const targetWorkspaceId = currentWorkspaceId;
-  const targetWorkspacePath = currentWorkspacePath;
-  dispatchWorkspaceSessionCleared(targetWorkspaceId, targetWorkspacePath);
-  const response = await getTransport().request(agentUrl('/api/session/new'), {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      workspaceId: targetWorkspaceId,
-      workspacePath: targetWorkspacePath,
-    }),
-  });
-  if (!response.ok) {
-    throw new Error(`create session failed: ${response.status}`);
-  }
-  const rawPayload = await response.json() as Record<string, unknown>;
-  const createdSessionId = typeof rawPayload.sessionId === 'string' ? rawPayload.sessionId.trim() : '';
-  const sessionId = createdSessionId
-    ? createdSessionId
-    : '';
-  if (!sessionId) {
-    throw new Error('create session failed: missing session id');
-  }
-  activateTaskProjectionSession(sessionId);
-  await loadLatestSessionSnapshot(sessionId, {
-    workspaceId: targetWorkspaceId,
-    workspacePath: targetWorkspacePath,
-  });
-  emitBridgeSuccessToast('新建会话', '新会话已创建', { displayMode: 'notification_center' });
-  return sessionId;
-}
-
-async function createSession(): Promise<string> {
-  if (sessionCreationInFlight) {
-    return sessionCreationInFlight;
-  }
-  const creation = createSessionInternal();
-  sessionCreationInFlight = creation;
-  try {
-    return await creation;
-  } finally {
-    if (sessionCreationInFlight === creation) {
-      sessionCreationInFlight = null;
-    }
-  }
-}
-
 async function switchSession(
   sessionId: string,
   options: { workspaceId?: string; workspacePath?: string } = {},
@@ -2024,9 +1978,21 @@ async function saveCurrentSession(): Promise<void> {
 
 async function ensureFreshLiveBridge(reason: string): Promise<void> {
   hydrateCanonicalWorkspaceBinding();
-  const hasBinding = Boolean(currentWorkspaceId || currentWorkspacePath || currentSessionId);
+  const hasWorkspaceBinding = Boolean(currentWorkspaceId || currentWorkspacePath);
+  const hasBinding = Boolean(hasWorkspaceBinding || currentSessionId);
   if (!hasBinding) {
     await restoreBridgeState(reason, true);
+    return;
+  }
+  if (hasWorkspaceBinding && !currentSessionId) {
+    const query = new URLSearchParams();
+    if (currentWorkspaceId) query.set('workspaceId', currentWorkspaceId);
+    if (currentWorkspacePath) query.set('workspacePath', currentWorkspacePath);
+    const expectedKey = query.toString();
+    await ensureEventStream({
+      forceReconnect: activeEventStreamKey !== expectedKey,
+      waitUntilOpen: true,
+    });
     return;
   }
   if (
@@ -2254,16 +2220,6 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
       normalizedText,
     );
     return true;
-  }
-
-  if (sessionCreationInFlight) {
-    try {
-      await sessionCreationInFlight;
-    } catch (error) {
-      console.error('[web-client-bridge] 发送前等待新会话创建失败:', error);
-      emitBridgeErrorToast('新建会话', error);
-      return false;
-    }
   }
 
   const requestId = input.requestId || generateMessageId();
@@ -2746,11 +2702,7 @@ async function fetchModelList(config: Record<string, unknown>, target: string): 
       '获取模型列表',
       blockReason === 'full_url_mode'
         ? '完整路径模式下不支持自动获取模型列表，请手动填写模型名'
-        : blockReason === 'endpoint_base_url'
-          ? '当前 Base URL 是对话执行端点，请改为服务根地址或 /v1 后再获取模型列表'
-        : blockReason === 'unsupported_provider'
-          ? '当前 provider 不支持自动获取模型列表，请手动填写模型名'
-          : '请先填写 Base URL 和 API Key',
+        : '请先填写 Base URL 和 API Key',
     );
     return;
   }
@@ -2935,14 +2887,7 @@ export function createWebClientBridge(): ClientBridge {
           const workspaceId = typeof message.workspaceId === 'string' ? message.workspaceId : '';
           const workspacePath = typeof message.workspacePath === 'string' ? message.workspacePath : '';
           const sessionId = typeof message.sessionId === 'string' ? message.sessionId.trim() : '';
-          if (!sessionId) {
-            clearWorkspaceSessionBinding(workspaceId, workspacePath);
-            void createSession().catch((error) => {
-              logBridgeOperationFailure('新建会话', '[web-client-bridge] 新建工作区会话失败:', error);
-            });
-          } else {
-            persistWorkspaceBinding(workspaceId, workspacePath, sessionId);
-          }
+          persistWorkspaceBinding(workspaceId, workspacePath, sessionId);
           return;
         }
         case 'webviewReady':
@@ -3131,9 +3076,8 @@ export function createWebClientBridge(): ClientBridge {
           });
           return;
         case 'newSession':
-          void createSession().catch((error) => {
-            logBridgeOperationFailure('新建会话', '[web-client-bridge] 新建会话失败:', error);
-          });
+          dispatchWorkspaceSessionCleared(currentWorkspaceId, currentWorkspacePath);
+          emitBridgeSuccessToast('新建会话', '已切换到新会话面板', { displayMode: 'notification_center' });
           return;
         case 'saveCurrentSession':
           void saveCurrentSession().catch((error) => {

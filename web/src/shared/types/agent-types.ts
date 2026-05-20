@@ -30,11 +30,6 @@ export type SystemAgentId = 'orchestrator' | 'auxiliary';
 export type AnyAgentId = SystemAgentId | AgentId;
 
 /**
- * LLM 提供商
- */
-export type LLMProvider = 'openai' | 'anthropic';
-
-/**
  * 模型自治能力等级
  */
 export type ModelAutonomyCapability = 'C0' | 'C1' | 'C2' | 'C3';
@@ -56,16 +51,17 @@ export interface TokenUsage {
 
 /**
  * LLM 基础配置
+ *
+ * 注意：协议类型不再由配置字段决定，统一由 baseUrl 推断：
+ *   - urlMode=standard 且 baseUrl 以 `/v1` 结尾 → OpenAI Chat Completions
+ *   - urlMode=full 且 baseUrl 以 `/v1/messages` 结尾 → Anthropic Messages
+ *   - 其他场景 → Anthropic Messages
  */
 export interface LLMConfig {
   baseUrl: string;
   urlMode: UrlMode;
   apiKey: string;
   model: string;
-  provider: LLMProvider;
-  openaiProtocol?: 'responses' | 'chat';
-  enabled: boolean;
-  enableThinking?: boolean;
   reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh';
   autonomyCapability?: ModelAutonomyCapability;
   [key: string]: unknown;

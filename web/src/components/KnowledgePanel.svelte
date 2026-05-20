@@ -6,7 +6,8 @@
   import { ensureArray } from '../lib/utils';
   import Icon from './Icon.svelte';
   import { i18n } from '../stores/i18n.svelte';
-  import { getState } from '../stores/messages.svelte';
+  import { getState, messagesState } from '../stores/messages.svelte';
+  import { openCodeTab } from '../stores/right-pane.svelte';
   import {
     addAgentKnowledgeItem,
     clearAgentProjectKnowledge,
@@ -163,6 +164,16 @@
     expandedFaqId = null;
     expandedLearningId = null;
     closeEditor();
+  }
+
+  /**
+   * 知识库入口文件点击 → 推到右侧 RightPane 的 code tab。
+   * 这里只携带 filepath；RightPane 会异步拉取文件源码进行渲染，
+   * 文件为空时显示空态 + "在编辑器中打开" 按钮。
+   */
+  function previewEntryPoint(filepath: string) {
+    if (!filepath) return;
+    openCodeTab(messagesState.currentSessionId, filepath);
   }
 
   function splitTags(value: string): string[] {
@@ -750,10 +761,15 @@
             </h4>
             <div class="kp-entry-list">
               {#each normalizedCodeIndex.entryPoints as entry}
-                <div class="kp-entry-item">
+                <button
+                  type="button"
+                  class="kp-entry-item kp-entry-item--clickable"
+                  onclick={() => previewEntryPoint(entry)}
+                  title={i18n.t('rightPane.previewFile', { path: entry })}
+                >
                   <Icon name="file-text" size={12} />
                   <span>{entry}</span>
-                </div>
+                </button>
               {/each}
             </div>
           </div>
@@ -1387,6 +1403,23 @@
     background: var(--surface-1);
     border-radius: var(--radius-sm);
     font-family: var(--font-mono);
+  }
+
+  /* 入口文件可点击变体：复用 .kp-entry-item 视觉，叠加 button reset + hover 反馈 */
+  .kp-entry-item--clickable {
+    width: 100%;
+    border: none;
+    text-align: left;
+    cursor: pointer;
+    transition: background var(--transition-fast), color var(--transition-fast);
+  }
+  .kp-entry-item--clickable:hover {
+    background: var(--surface-hover);
+    color: var(--foreground);
+  }
+  .kp-entry-item--clickable:focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: 2px;
   }
 
   /* 概览预览条目 */

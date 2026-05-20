@@ -242,6 +242,11 @@ async fn workspace_sessions(
                 .iter()
                 .any(|session| session.session_id == *session_id)
         })
+        .or_else(|| {
+            scoped_sessions
+                .first()
+                .map(|session| session.session_id.as_str())
+        })
         .unwrap_or_default()
         .to_string();
 
@@ -482,6 +487,11 @@ mod tests {
                 Some(workspace_id.to_string()),
             )
             .expect("session should create");
+        state.session_store.append_timeline_entry(
+            session_id.clone(),
+            TimelineEntryKind::UserMessage,
+            "真实用户消息",
+        );
 
         let response = routes()
             .with_state(state)
@@ -615,6 +625,11 @@ mod tests {
                 Some(workspace_id.to_string()),
             )
             .expect("older session should create");
+        state.session_store.append_timeline_entry(
+            older_session_id.clone(),
+            TimelineEntryKind::UserMessage,
+            "较早会话用户消息",
+        );
         tokio::time::sleep(Duration::from_millis(2)).await;
 
         let newer_session_id = SessionId::new("session-newer");
@@ -664,30 +679,98 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn workspace_sessions_does_not_select_first_session_without_explicit_session() {
+    async fn workspace_sessions_selects_latest_visible_session_without_explicit_session() {
         let state = test_state();
-        let workspace_id = WorkspaceId::new("workspace-no-auto-select");
+        let workspace_id = WorkspaceId::new("workspace-default-latest");
         state
             .workspace_registry
             .register(
                 workspace_id.clone(),
-                AbsolutePath::new("/tmp/magi-workspace-no-auto-select"),
+                AbsolutePath::new("/tmp/magi-workspace-default-latest"),
             )
             .expect("workspace should register");
+        let older_session_id = SessionId::new("session-default-older");
         state
             .session_store
             .create_session_for_workspace(
-                SessionId::new("session-no-auto-select"),
-                "不应自动选中",
+                older_session_id.clone(),
+                "较早历史",
                 Some(workspace_id.to_string()),
             )
             .expect("session should create");
+        state.session_store.append_timeline_entry(
+            older_session_id,
+            TimelineEntryKind::UserMessage,
+            "较早消息",
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        let newer_session_id = SessionId::new("session-default-newer");
+        state
+            .session_store
+            .create_session_for_workspace(
+                newer_session_id.clone(),
+                "较新历史",
+                Some(workspace_id.to_string()),
+            )
+            .expect("session should create");
+        state.session_store.append_timeline_entry(
+            newer_session_id,
+            TimelineEntryKind::UserMessage,
+            "较新消息",
+        );
 
         let response = routes()
             .with_state(state)
             .oneshot(
                 Request::builder()
-                    .uri("/workspaces/sessions?workspaceId=workspace-no-auto-select")
+                    .uri("/workspaces/sessions?workspaceId=workspace-default-latest")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should read");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&body).expect("payload should deserialize");
+        assert_eq!(payload["sessionId"], "session-default-newer");
+        assert_eq!(
+            payload["sessions"]
+                .as_array()
+                .expect("sessions should be an array")
+                .len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_sessions_hides_empty_sessions_from_history() {
+        let state = test_state();
+        let workspace_id = WorkspaceId::new("workspace-empty-session-history");
+        state
+            .workspace_registry
+            .register(
+                workspace_id.clone(),
+                AbsolutePath::new("/tmp/magi-workspace-empty-session-history"),
+            )
+            .expect("workspace should register");
+        state
+            .session_store
+            .create_session_for_workspace(
+                SessionId::new("session-empty-history"),
+                "空白会话",
+                Some(workspace_id.to_string()),
+            )
+            .expect("empty session should create");
+
+        let response = routes()
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/workspaces/sessions?workspaceId=workspace-empty-session-history")
                     .body(Body::empty())
                     .expect("request should build"),
             )
@@ -701,12 +784,11 @@ mod tests {
         let payload: serde_json::Value =
             serde_json::from_slice(&body).expect("payload should deserialize");
         assert_eq!(payload["sessionId"], "");
-        assert_eq!(
+        assert!(
             payload["sessions"]
                 .as_array()
                 .expect("sessions should be an array")
-                .len(),
-            1
+                .is_empty()
         );
     }
 }

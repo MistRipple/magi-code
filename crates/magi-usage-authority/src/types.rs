@@ -37,13 +37,6 @@ pub enum UrlMode {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum OpenAiProtocol {
-    Responses,
-    Chat,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum ReasoningEffort {
     Low,
     Medium,
@@ -61,14 +54,10 @@ pub struct ModelResolutionIdentity {
     pub base_url_fingerprint: String,
     pub url_mode: UrlMode,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub openai_protocol: Option<OpenAiProtocol>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub account_fingerprint: Option<String>,
     pub binding_revision: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffort>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub enable_thinking: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effective_context_modifiers: Option<Vec<String>>,
     pub model_identity_key: String,
@@ -216,8 +205,6 @@ pub struct UsageModelSnapshot {
     pub base_url_fingerprint: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffort>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub enable_thinking: Option<bool>,
     pub totals: UsageTotals,
 }
 
@@ -309,11 +296,7 @@ pub struct LlmConfig {
     pub api_key: Option<String>,
     pub url_mode: UrlMode,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub openai_protocol: Option<OpenAiProtocol>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffort>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub enable_thinking: Option<bool>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

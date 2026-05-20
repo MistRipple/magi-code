@@ -13,13 +13,90 @@ use std::sync::Arc;
 
 use magi_bridge_client::{ModelBridgeClient, ModelInvocationRequest};
 use magi_conversation_runtime::session_turn_execution::BUSINESS_MODEL_PROVIDER;
-use magi_core::SessionId;
+use magi_core::{EventId, SessionId, UtcMillis};
+use magi_event_bus::{EventContext, EventEnvelope};
 use magi_session_store::SessionStore;
+use serde_json::json;
 
+use crate::state::ApiState;
+
+pub(crate) const NEW_SESSION_PLACEHOLDER_TITLE: &str = "新会话";
 /// 辅助模型返回内容若超过该字符数则视为越权输出（多半是直接把整段消息回吐），直接丢弃。
 const TITLE_MAX_CHARS: usize = 40;
-/// 用户首条消息字符数若不超过该阈值，本身已经足够当占位标题，不再发起精修。
-const SKIP_REFINE_MIN_CHARS: usize = 4;
+
+/// 新建会话时，把首条用户消息丢给辅助模型异步生成一个更易读的会话标题。
+///
+/// 辅助模型未配置或调用失败时静默跳过，placeholder 标题保留不变。
+pub(crate) fn spawn_new_session_title_refinement(
+    state: &ApiState,
+    session_id: &SessionId,
+    first_message: &str,
+    placeholder_title: &str,
+) {
+    let Some(client) =
+        magi_conversation_runtime::task_execution_dispatcher::build_auxiliary_model_client(
+            &state.settings_store,
+        )
+    else {
+        tracing::debug!(
+            session_id = %session_id,
+            "辅助模型未配置，跳过会话标题精修"
+        );
+        return;
+    };
+    let state = state.clone();
+    let session_id = session_id.clone();
+    let first_message = first_message.to_string();
+    let placeholder_title = placeholder_title.to_string();
+    tokio::task::spawn_blocking(move || {
+        let refined_title = refine_new_session_title(
+            client,
+            state.session_store.clone(),
+            session_id.clone(),
+            first_message,
+            placeholder_title,
+        );
+        if let Some(title) = refined_title {
+            if let Err(error) = state.persist_session_durable_state() {
+                tracing::warn!(
+                    session_id = %session_id,
+                    ?error,
+                    "辅助模型会话标题持久化失败"
+                );
+            }
+            let workspace_id = state
+                .session_store
+                .session(&session_id)
+                .and_then(|session| state.session_workspace_id(&session));
+            let event_id = EventId::new(format!(
+                "event-session-title-updated-{}-{}",
+                session_id,
+                UtcMillis::now().0
+            ));
+            let event = EventEnvelope::domain(
+                event_id,
+                "session.title.updated",
+                json!({
+                    "session_id": session_id.to_string(),
+                    "workspace_id": workspace_id.as_ref().map(ToString::to_string),
+                    "title": title,
+                }),
+            )
+            .with_context(EventContext {
+                session_id: Some(session_id.clone()),
+                workspace_id,
+                ..EventContext::default()
+            });
+            if let Err(error) = state.event_bus.publish(event) {
+                tracing::warn!(
+                    session_id = %session_id,
+                    ?error,
+                    "辅助模型会话标题更新事件发布失败"
+                );
+            }
+        }
+    });
+}
 
 /// 同步执行一次会话标题精修。
 ///
@@ -31,11 +108,8 @@ pub fn refine_new_session_title(
     session_id: SessionId,
     first_message: String,
     placeholder_title: String,
-) {
+) -> Option<String> {
     let trimmed = first_message.trim();
-    if trimmed.chars().count() <= SKIP_REFINE_MIN_CHARS {
-        return;
-    }
     let prompt = build_title_prompt(trimmed);
     let request = ModelInvocationRequest {
         provider: BUSINESS_MODEL_PROVIDER.to_string(),
@@ -52,7 +126,7 @@ pub fn refine_new_session_title(
                 payload = %resp.payload,
                 "辅助模型返回 ok=false，跳过会话标题精修"
             );
-            return;
+            return None;
         }
         Err(err) => {
             tracing::debug!(
@@ -60,12 +134,12 @@ pub fn refine_new_session_title(
                 error = %err,
                 "辅助模型调用失败，跳过会话标题精修"
             );
-            return;
+            return None;
         }
     };
     let payload = response.parse_chat_payload();
     let Some(raw) = payload.content else {
-        return;
+        return None;
     };
     let Some(title) = normalize_title(&raw) else {
         tracing::debug!(
@@ -73,7 +147,7 @@ pub fn refine_new_session_title(
             raw = %raw,
             "辅助模型返回的标题不合规，跳过会话标题精修"
         );
-        return;
+        return None;
     };
     match session_store
         .session(&session_id)
@@ -86,22 +160,26 @@ pub fn refine_new_session_title(
                 current = %other,
                 "会话标题已被改动，跳过辅助模型精修"
             );
-            return;
+            return None;
         }
         None => {
             tracing::debug!(
                 session_id = %session_id,
                 "会话已不存在，跳过辅助模型精修"
             );
-            return;
+            return None;
         }
     }
-    if let Err(err) = session_store.rename_session(&session_id, title) {
-        tracing::warn!(
-            session_id = %session_id,
-            ?err,
-            "会话标题写回失败"
-        );
+    match session_store.rename_session(&session_id, title.clone()) {
+        Ok(_) => Some(title),
+        Err(err) => {
+            tracing::warn!(
+                session_id = %session_id,
+                ?err,
+                "会话标题写回失败"
+            );
+            None
+        }
     }
 }
 
@@ -238,7 +316,7 @@ mod tests {
         let session_id = seed_session(&store, placeholder);
         let client = StubAuxiliaryClient::ok_with_content("“重构 Mission 模型 ”");
 
-        refine_new_session_title(
+        let refined_title = refine_new_session_title(
             client,
             store.clone(),
             session_id.clone(),
@@ -247,6 +325,7 @@ mod tests {
         );
 
         let record = store.session(&session_id).expect("session exists");
+        assert_eq!(refined_title.as_deref(), Some("重构 Mission 模型"));
         assert_eq!(record.title, "重构 Mission 模型");
     }
 
@@ -260,7 +339,7 @@ mod tests {
             .expect("rename");
         let client = StubAuxiliaryClient::ok_with_content("辅助模型生成标题");
 
-        refine_new_session_title(
+        let refined_title = refine_new_session_title(
             client,
             store.clone(),
             session_id.clone(),
@@ -269,6 +348,7 @@ mod tests {
         );
 
         let record = store.session(&session_id).expect("session exists");
+        assert!(refined_title.is_none());
         assert_eq!(record.title, "用户手改的标题");
     }
 
@@ -279,7 +359,7 @@ mod tests {
         let session_id = seed_session(&store, placeholder);
         let client = StubAuxiliaryClient::err();
 
-        refine_new_session_title(
+        let refined_title = refine_new_session_title(
             client,
             store.clone(),
             session_id.clone(),
@@ -288,17 +368,18 @@ mod tests {
         );
 
         let record = store.session(&session_id).expect("session exists");
+        assert!(refined_title.is_none());
         assert_eq!(record.title, placeholder);
     }
 
     #[test]
-    fn refine_new_session_title_skips_too_short_messages() {
+    fn refine_new_session_title_uses_auxiliary_for_short_messages() {
         let store = Arc::new(SessionStore::new());
         let placeholder = "短消息";
         let session_id = seed_session(&store, placeholder);
-        let client = StubAuxiliaryClient::ok_with_content("不应被使用");
+        let client = StubAuxiliaryClient::ok_with_content("日常问候");
 
-        refine_new_session_title(
+        let refined_title = refine_new_session_title(
             client,
             store.clone(),
             session_id.clone(),
@@ -307,6 +388,7 @@ mod tests {
         );
 
         let record = store.session(&session_id).expect("session exists");
-        assert_eq!(record.title, placeholder);
+        assert_eq!(refined_title.as_deref(), Some("日常问候"));
+        assert_eq!(record.title, "日常问候");
     }
 }

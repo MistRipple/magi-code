@@ -15,9 +15,7 @@ fn make_llm_config() -> LlmConfig {
         base_url: "https://api.anthropic.com/v1".to_string(),
         api_key: Some("sk-test-key-12345".to_string()),
         url_mode: UrlMode::Default,
-        openai_protocol: None,
         reasoning_effort: None,
-        enable_thinking: None,
     }
 }
 
@@ -134,27 +132,6 @@ fn test_build_model_resolution_identity() {
     assert!(!identity.model_identity_key.is_empty());
     assert!(!identity.base_url_fingerprint.is_empty());
     assert!(identity.account_fingerprint.is_some());
-    assert!(identity.openai_protocol.is_none());
-}
-
-#[test]
-fn test_openai_model_identity_does_not_default_protocol() {
-    let config = LlmConfig {
-        provider: "openai".to_string(),
-        model: "gpt-4.1".to_string(),
-        base_url: "https://api.openai.com".to_string(),
-        api_key: Some("sk-test-key-12345".to_string()),
-        url_mode: UrlMode::Default,
-        openai_protocol: None,
-        reasoning_effort: None,
-        enable_thinking: None,
-    };
-    let binding =
-        build_execution_binding_identity("tmpl-1", "engine-1", 1, UsageSourceRole::Worker);
-
-    let identity = build_model_resolution_identity(&config, &binding, None, None);
-
-    assert!(identity.openai_protocol.is_none());
 }
 
 #[test]

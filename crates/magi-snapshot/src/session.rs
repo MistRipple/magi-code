@@ -765,24 +765,94 @@ fn now_ns_xor() -> u128 {
         .unwrap_or(0)
 }
 
+/// 生成 unified diff 文本。
+///
+/// 约束：输出必须符合 unified diff 标准——文件头 `--- a/path` / `+++ b/path`
+/// 之后必须有 `@@ -a,b +c,d @@` hunk header，否则前端按标准格式解析时会丢弃所有 +/- 行。
+///
+/// 实现说明：当前用"按行索引一一对齐"的简化算法（非最优 LCS），
+/// 整个文件作为单一 hunk 输出。语义最优性可在后续单独优化（引入 similar crate 等），
+/// 此处目标是保证**格式合法**——hunk header 必须存在，行数必须与 body 一致。
 fn unified_diff_text(path: &str, old: &str, new: &str) -> String {
     let old_lines: Vec<&str> = old.lines().collect();
     let new_lines: Vec<&str> = new.lines().collect();
-    let mut output = Vec::with_capacity(old_lines.len() + new_lines.len() + 2);
-    output.push(format!("--- a/{path}"));
-    output.push(format!("+++ b/{path}"));
+
+    let mut body: Vec<String> = Vec::with_capacity(old_lines.len() + new_lines.len());
     let max_len = old_lines.len().max(new_lines.len());
     for i in 0..max_len {
         match (old_lines.get(i), new_lines.get(i)) {
-            (Some(o), Some(n)) if o == n => output.push(format!(" {o}")),
+            (Some(o), Some(n)) if o == n => body.push(format!(" {o}")),
             (Some(o), Some(n)) => {
-                output.push(format!("-{o}"));
-                output.push(format!("+{n}"));
+                body.push(format!("-{o}"));
+                body.push(format!("+{n}"));
             }
-            (Some(o), None) => output.push(format!("-{o}")),
-            (None, Some(n)) => output.push(format!("+{n}")),
+            (Some(o), None) => body.push(format!("-{o}")),
+            (None, Some(n)) => body.push(format!("+{n}")),
             (None, None) => {}
         }
     }
+
+    // hunk header：unified diff 标准要求行数为 0 时起始行也为 0
+    let (old_start, old_count) = if old_lines.is_empty() {
+        (0, 0)
+    } else {
+        (1, old_lines.len())
+    };
+    let (new_start, new_count) = if new_lines.is_empty() {
+        (0, 0)
+    } else {
+        (1, new_lines.len())
+    };
+
+    let mut output: Vec<String> = Vec::with_capacity(body.len() + 3);
+    output.push(format!("--- a/{path}"));
+    output.push(format!("+++ b/{path}"));
+    output.push(format!(
+        "@@ -{old_start},{old_count} +{new_start},{new_count} @@"
+    ));
+    output.extend(body);
     output.join("\n")
+}
+
+#[cfg(test)]
+mod unified_diff_text_tests {
+    use super::unified_diff_text;
+
+    /// 契约：输出必须包含 `@@ ... @@` hunk header；前端 RightPane 解析器
+    /// 依赖此 header 才会创建 hunk，否则所有 +/- 行被静默丢弃。
+    #[test]
+    fn add_file_emits_hunk_header_and_plus_lines() {
+        let out = unified_diff_text("foo.txt", "", "a\nb\n");
+        assert!(out.contains("--- a/foo.txt"));
+        assert!(out.contains("+++ b/foo.txt"));
+        assert!(
+            out.contains("@@ -0,0 +1,2 @@"),
+            "missing hunk header in:\n{out}"
+        );
+        assert!(out.contains("+a"));
+        assert!(out.contains("+b"));
+    }
+
+    #[test]
+    fn delete_file_emits_hunk_header_and_minus_lines() {
+        let out = unified_diff_text("foo.txt", "x\ny\n", "");
+        assert!(
+            out.contains("@@ -1,2 +0,0 @@"),
+            "missing hunk header in:\n{out}"
+        );
+        assert!(out.contains("-x"));
+        assert!(out.contains("-y"));
+    }
+
+    #[test]
+    fn modify_file_emits_hunk_header_with_both_sides() {
+        let out = unified_diff_text("foo.txt", "a\nb\n", "a\nc\n");
+        assert!(
+            out.contains("@@ -1,2 +1,2 @@"),
+            "missing hunk header in:\n{out}"
+        );
+        assert!(out.contains(" a"));
+        assert!(out.contains("-b"));
+        assert!(out.contains("+c"));
+    }
 }

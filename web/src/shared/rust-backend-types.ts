@@ -1002,7 +1002,6 @@ export interface SessionStatsModelDto {
   resolvedModel: string;
   baseUrlFingerprint: string;
   reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | null;
-  enableThinking?: boolean | null;
   totals: SessionStatsTotalsDto;
 }
 

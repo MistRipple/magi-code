@@ -7,7 +7,6 @@ use crate::llm_types::{LlmMessageParams, LlmResponse, LlmUsage};
 #[serde(rename_all = "snake_case")]
 pub enum ProviderFamily {
     OpenAiChat,
-    OpenAiResponses,
     Anthropic,
     Gemini,
 }
@@ -17,8 +16,6 @@ impl ProviderFamily {
         let lower = provider.to_ascii_lowercase();
         if lower.contains("anthropic") || lower.contains("claude") {
             Self::Anthropic
-        } else if lower.contains("responses") {
-            Self::OpenAiResponses
         } else if lower.contains("gemini") || lower.contains("google") {
             Self::Gemini
         } else {

@@ -1,0 +1,559 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>Magi · Worker Panel · 方向 A · Dashboard Dock</title>
+<style>
+  :root {
+    --bg: #11161d;
+    --bg-elev: #161c25;
+    --fg: #e5e7eb;
+    --fg-muted: #98a2b3;
+    --fg-faint: #6b7280;
+    --border: #273142;
+    --border-soft: rgba(255,255,255,0.06);
+    --surface-1: rgba(255,255,255,0.02);
+    --surface-2: rgba(255,255,255,0.04);
+    --surface-3: rgba(255,255,255,0.06);
+    --surface-hover: rgba(255,255,255,0.08);
+    --primary: #2563eb;
+    --primary-soft: rgba(37,99,235,0.14);
+    --c-orchestrator: #8b5cf6;
+    --c-claude: #d97706;
+    --c-codex: #10a37f;
+    --c-gemini: #4285f4;
+    --c-running: #3b82f6;
+    --c-failed: #ef4444;
+    --c-success: #10b981;
+    --c-queued: #6b7280;
+    --font: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    --font-mono: 'SFMono-Regular','Cascadia Code',Consolas,monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: #0a0d12; color: var(--fg); font-family: var(--font); font-size: 13px; line-height: 1.5; }
+  body { min-height: 100vh; padding: 24px; }
+
+  /* ============ 顶部说明栏 ============ */
+  .doc-header { max-width: 1600px; margin: 0 auto 20px; }
+  .doc-header h1 { font-size: 16px; font-weight: 600; margin: 0 0 6px; letter-spacing: 0.2px; }
+  .doc-header p { margin: 0; color: var(--fg-muted); font-size: 12px; }
+  .doc-header .pill { display: inline-block; padding: 2px 8px; background: var(--primary-soft); color: #93c5fd; border-radius: 4px; font-size: 11px; margin-right: 6px; font-family: var(--font-mono); }
+
+  .vp-switcher { display: flex; gap: 6px; margin-top: 14px; }
+  .vp-switcher button {
+    background: var(--surface-2); color: var(--fg); border: 1px solid var(--border);
+    padding: 6px 14px; border-radius: 6px; font-size: 12px; cursor: pointer; font-family: var(--font);
+    transition: background 120ms;
+  }
+  .vp-switcher button:hover { background: var(--surface-hover); }
+  .vp-switcher button.active { background: var(--primary); border-color: var(--primary); color: #fff; }
+
+  /* ============ Viewport 容器 ============ */
+  .viewport {
+    margin: 0 auto;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    overflow: hidden;
+    container-type: inline-size;
+    transition: width 280ms cubic-bezier(0.4, 0, 0.2, 1);
+    box-shadow: 0 24px 80px rgba(0,0,0,0.6);
+  }
+  .viewport[data-vp="wide"] { width: 1400px; height: 880px; }
+  .viewport[data-vp="mid"]  { width: 880px;  height: 760px; }
+  .viewport[data-vp="narrow"] { width: 420px; height: 760px; }
+
+  /* ============ App Shell ============ */
+  .app { display: grid; grid-template-rows: auto 1fr; height: 100%; }
+
+  /* 顶部 TopBar */
+  .topbar {
+    display: flex; align-items: center; gap: 12px;
+    padding: 10px 16px;
+    background: var(--bg-elev);
+    border-bottom: 1px solid var(--border);
+    height: 44px;
+  }
+  .topbar .brand { font-weight: 600; font-size: 13px; letter-spacing: 0.5px; color: var(--fg); margin-right: 8px; }
+  .topbar .tabs { display: flex; gap: 4px; flex: 1; min-width: 0; }
+  .topbar .tab {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 5px 10px; border-radius: 6px;
+    background: transparent; color: var(--fg-muted);
+    font-size: 12px; max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    cursor: default;
+  }
+  .topbar .tab.active { background: var(--surface-2); color: var(--fg); }
+  .topbar .tab .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--c-running); animation: pulse 1.6s infinite; flex-shrink: 0; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
+  .topbar .right { display: flex; align-items: center; gap: 8px; }
+  .topbar .icon-btn { width: 28px; height: 28px; display: inline-flex; align-items: center; justify-content: center; border-radius: 5px; color: var(--fg-muted); cursor: pointer; }
+  .topbar .icon-btn:hover { background: var(--surface-hover); color: var(--fg); }
+  .dock-toggle { display: inline-flex; align-items: center; gap: 6px; padding: 5px 10px; border-radius: 5px; background: var(--surface-1); border: 1px solid var(--border-soft); font-size: 11px; color: var(--fg-muted); cursor: pointer; }
+  .dock-toggle .num { color: var(--fg); font-weight: 600; }
+
+  /* Main 区域：宽屏左右分栏，中/窄屏单列 */
+  .main {
+    display: grid;
+    grid-template-columns: 1fr 360px;
+    min-height: 0;
+  }
+  @container (max-width: 1023px) {
+    .main { grid-template-columns: 1fr; }
+    .dock { display: none; }
+    .dock-mobile { display: flex !important; }
+  }
+
+  /* 主区（消息流 + 输入框） */
+  .pane {
+    display: grid; grid-template-rows: 1fr auto;
+    min-height: 0;
+    border-right: 1px solid var(--border-soft);
+  }
+  @container (max-width: 1023px) {
+    .pane { border-right: none; }
+  }
+
+  .messages {
+    overflow-y: auto;
+    padding: 32px 48px 16px;
+  }
+  @container (max-width: 1023px) {
+    .messages { padding: 24px 24px 12px; }
+  }
+  @container (max-width: 640px) {
+    .messages { padding: 18px 14px 10px; }
+  }
+
+  .msg { margin: 0 0 22px; max-width: 760px; }
+  .msg-user { display: flex; justify-content: flex-end; }
+  .msg-user .bubble {
+    background: var(--primary); color: #fff; border-radius: 12px 12px 4px 12px;
+    padding: 10px 14px; font-size: 13px; max-width: 560px;
+    box-shadow: 0 1px 0 rgba(255,255,255,0.06) inset;
+  }
+  .msg-assistant { display: flex; flex-direction: column; gap: 10px; }
+  .msg-assistant .text {
+    color: var(--fg); font-size: 13px; line-height: 1.65; padding: 2px 0;
+  }
+  .msg-assistant .text strong { color: var(--fg); font-weight: 600; }
+  .msg-assistant .text code { font-family: var(--font-mono); background: var(--surface-2); padding: 1px 5px; border-radius: 3px; font-size: 12px; color: #fbbf24; }
+
+  /* DispatchGroup 内联卡片 */
+  .dispatch-card {
+    background: var(--surface-1);
+    border: 1px solid var(--border-soft);
+    border-left: 3px solid var(--c-orchestrator);
+    border-radius: 8px;
+    padding: 12px 14px;
+    max-width: 640px;
+    animation: flash-in 0.6s cubic-bezier(0.4,0,0.2,1);
+  }
+  @keyframes flash-in {
+    0% { background: rgba(139,92,246,0.18); }
+    100% { background: var(--surface-1); }
+  }
+  .dispatch-card .header {
+    display: flex; align-items: center; gap: 8px; margin-bottom: 10px;
+    font-size: 11px; color: var(--fg-muted); text-transform: uppercase; letter-spacing: 0.6px;
+  }
+  .dispatch-card .header .label { color: var(--c-orchestrator); font-weight: 600; }
+  .worker-row {
+    display: grid; grid-template-columns: auto 1fr auto; gap: 10px; align-items: center;
+    padding: 8px 4px; font-size: 12px;
+    border-top: 1px solid var(--border-soft);
+    cursor: pointer;
+  }
+  .worker-row:first-of-type { border-top: none; }
+  .worker-row:hover { background: var(--surface-1); border-radius: 4px; }
+  .worker-row .agent-tag {
+    display: inline-flex; align-items: center; gap: 5px;
+    padding: 2px 7px; border-radius: 4px;
+    font-size: 10px; font-weight: 600; letter-spacing: 0.3px;
+    font-family: var(--font-mono);
+  }
+  .agent-codex { background: rgba(16,163,127,0.15); color: var(--c-codex); }
+  .agent-claude { background: rgba(217,119,6,0.15); color: var(--c-claude); }
+  .agent-gemini { background: rgba(66,133,244,0.15); color: var(--c-gemini); }
+  .worker-row .name { color: var(--fg); font-weight: 500; font-family: var(--font-mono); font-size: 12px; }
+  .worker-row .desc { color: var(--fg-muted); font-size: 11px; margin-top: 2px; }
+  .worker-row .status { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; color: var(--fg-muted); white-space: nowrap; }
+  .worker-row .status .indicator { width: 8px; height: 8px; border-radius: 50%; }
+  .worker-row.running .indicator { background: var(--c-running); animation: pulse 1.6s infinite; }
+  .worker-row.queued .indicator { background: var(--c-queued); }
+  .worker-row.failed .indicator { background: var(--c-failed); }
+  .worker-row.success .indicator { background: var(--c-success); }
+  .worker-row.failed { background: rgba(239,68,68,0.04); }
+  .worker-row.failed .status { color: var(--c-failed); }
+
+  /* InputArea */
+  .input-area {
+    padding: 12px 24px 20px;
+    border-top: 1px solid var(--border-soft);
+    background: var(--bg);
+  }
+  @container (max-width: 640px) {
+    .input-area { padding: 10px 14px 14px; }
+  }
+  .input-box {
+    display: flex; gap: 10px; align-items: flex-end;
+    background: var(--surface-1); border: 1px solid var(--border);
+    border-radius: 10px; padding: 10px 12px;
+  }
+  .input-box .field {
+    flex: 1; color: var(--fg-muted); font-size: 13px; min-height: 28px;
+    display: flex; align-items: center;
+  }
+  .input-box .send {
+    width: 32px; height: 32px; border-radius: 6px; background: var(--primary); color: #fff;
+    display: inline-flex; align-items: center; justify-content: center; cursor: pointer; font-size: 14px;
+  }
+
+  /* ============================================== */
+  /*                 Dashboard Dock                 */
+  /* ============================================== */
+  .dock {
+    background: var(--bg-elev);
+    border-left: 1px solid var(--border);
+    display: grid; grid-template-rows: auto auto 1fr;
+    min-height: 0;
+  }
+  .dock-header {
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border-soft);
+    display: flex; align-items: center; justify-content: space-between;
+  }
+  .dock-header .title { font-size: 12px; font-weight: 600; color: var(--fg); letter-spacing: 0.4px; }
+  .dock-header .actions { display: flex; gap: 4px; }
+  .dock-header .actions .ic { width: 24px; height: 24px; border-radius: 4px; display: inline-flex; align-items: center; justify-content: center; color: var(--fg-muted); cursor: pointer; font-size: 13px; }
+  .dock-header .actions .ic:hover { background: var(--surface-hover); color: var(--fg); }
+
+  .dock-summary {
+    padding: 14px 16px 12px;
+    border-bottom: 1px solid var(--border-soft);
+  }
+  .dock-summary .counts { display: flex; gap: 14px; font-size: 11px; color: var(--fg-muted); margin-bottom: 10px; }
+  .dock-summary .counts strong { color: var(--fg); font-weight: 600; font-size: 13px; margin-right: 2px; font-family: var(--font-mono); }
+  .dock-summary .counts .running strong { color: var(--c-running); }
+  .dock-summary .counts .failed strong { color: var(--c-failed); }
+  .dock-summary .counts .success strong { color: var(--c-success); }
+  .progress {
+    height: 4px; background: var(--surface-2); border-radius: 3px; overflow: hidden; position: relative;
+  }
+  .progress .bar { height: 100%; background: linear-gradient(90deg, var(--primary), var(--c-orchestrator)); width: 65%; border-radius: 3px; }
+  .dock-summary .alert {
+    margin-top: 10px; padding: 8px 10px; border-radius: 6px;
+    background: rgba(239,68,68,0.10); border: 1px solid rgba(239,68,68,0.20);
+    color: #fca5a5; font-size: 11px; display: flex; align-items: center; gap: 8px;
+  }
+  .dock-summary .alert .icon { width: 14px; height: 14px; flex-shrink: 0; }
+
+  .dock-tabs {
+    display: flex; gap: 2px; padding: 0 12px;
+    border-bottom: 1px solid var(--border-soft);
+  }
+  .dock-tab {
+    padding: 8px 10px; font-size: 11px; color: var(--fg-muted);
+    border-bottom: 2px solid transparent; cursor: pointer;
+    text-transform: uppercase; letter-spacing: 0.5px;
+    display: inline-flex; align-items: center; gap: 5px;
+  }
+  .dock-tab.active { color: var(--fg); border-bottom-color: var(--primary); }
+  .dock-tab .badge {
+    background: var(--surface-3); color: var(--fg-muted); font-size: 10px; padding: 1px 5px; border-radius: 999px; font-weight: 600; font-family: var(--font-mono);
+  }
+  .dock-tab.active .badge { background: var(--primary); color: #fff; }
+  .dock-tab .badge.fail { background: rgba(239,68,68,0.18); color: var(--c-failed); }
+
+  .dock-body { overflow-y: auto; padding: 8px 12px 16px; }
+  .dock-worker {
+    padding: 10px 10px 10px 12px;
+    margin-bottom: 4px;
+    border-radius: 6px;
+    border-left: 2px solid transparent;
+    cursor: pointer;
+    transition: background 100ms;
+  }
+  .dock-worker:hover { background: var(--surface-1); }
+  .dock-worker.running { border-left-color: var(--c-running); }
+  .dock-worker.queued { border-left-color: var(--c-queued); }
+  .dock-worker.failed { border-left-color: var(--c-failed); background: rgba(239,68,68,0.05); }
+  .dock-worker .row1 { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 4px; }
+  .dock-worker .row1 .name { font-family: var(--font-mono); font-size: 12px; font-weight: 500; color: var(--fg); }
+  .dock-worker .row1 .time { font-size: 10px; color: var(--fg-faint); font-family: var(--font-mono); }
+  .dock-worker .step { font-size: 11px; color: var(--fg-muted); font-family: var(--font-mono); padding-left: 16px; position: relative; }
+  .dock-worker .step::before { content: '└'; position: absolute; left: 4px; color: var(--fg-faint); }
+  .dock-worker.failed .step { color: var(--c-failed); }
+  .dock-worker .meta { display: flex; align-items: center; gap: 6px; margin-top: 4px; }
+  .dock-worker .meta .agent-tag { font-size: 9px; padding: 1px 5px; }
+
+  /* dock-mobile：中/窄屏的覆盖浮层版本 */
+  .dock-mobile {
+    display: none;
+    position: absolute;
+    top: 44px; right: 0; bottom: 0;
+    width: min(360px, 100%);
+    background: var(--bg-elev);
+    border-left: 1px solid var(--border);
+    flex-direction: column;
+    box-shadow: -20px 0 40px rgba(0,0,0,0.5);
+    z-index: 40;
+    transform: translateX(0);
+  }
+  /* 在中/窄屏，dock-mobile 默认隐藏，由按钮切换 */
+  @container (max-width: 1023px) {
+    .dock-mobile.hidden { transform: translateX(100%); }
+    .dock-mobile { transition: transform 220ms cubic-bezier(0.4,0,0.2,1); }
+  }
+  @container (max-width: 640px) {
+    .dock-mobile { width: 100%; }
+  }
+
+  /* 滚动条 */
+  ::-webkit-scrollbar { width: 8px; height: 8px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--surface-3); border-radius: 4px; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--surface-hover); }
+</style>
+</head>
+<body>
+
+<div class="doc-header">
+  <h1>方向 A · Dashboard Dock</h1>
+  <p>
+    <span class="pill">zIndex 4/6/24</span>
+    <span class="pill">右侧 360px 常驻面板</span>
+    宽屏：右侧 Dock 永久承载 workers/tasks/logs；中/窄屏：Dock 滑入覆盖，浮层与宽屏共用同一组件。WorkerDetailDrawer 取消，单 worker 详情走 Dock 内栈式视图。
+  </p>
+  <div class="vp-switcher">
+    <button class="active" data-vp="wide">Wide ≥1024</button>
+    <button data-vp="mid">Mid 640–1024</button>
+    <button data-vp="narrow">Narrow ≤640</button>
+  </div>
+</div>
+
+<div class="viewport" data-vp="wide" id="vp">
+  <div class="app">
+    <!-- TopBar -->
+    <div class="topbar">
+      <div class="brand">⬢ MAGI</div>
+      <div class="tabs">
+        <div class="tab active"><span class="dot"></span>清理 StreamFanOut 死代码</div>
+        <div class="tab">isProcessing 收敛验证</div>
+        <div class="tab">辅助模型路径补全</div>
+      </div>
+      <div class="right">
+        <div class="icon-btn" title="设置">⚙</div>
+        <div class="dock-toggle" id="dockToggle" title="Toggle Dock">
+          <span class="num">3</span><span style="color:var(--c-running)">●</span><span style="color:var(--c-failed)">⚠1</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Main -->
+    <div class="main">
+      <!-- 主区 -->
+      <div class="pane">
+        <div class="messages">
+          <div class="msg msg-user">
+            <div class="bubble">帮我把 magi-conversation-runtime 里所有 StreamFanOut 的引用清理掉，event_bus 才是唯一流派生路径。</div>
+          </div>
+
+          <div class="msg msg-assistant">
+            <div class="text">我先扫一遍 <code>StreamFanOut</code> 的引用面，再分发 worker 并行处理。预计涉及 6 个文件：<code>lib.rs</code> / <code>conversation_loop.rs</code> / <code>task_execution_dispatcher.rs</code> / <code>api/state.rs</code> / <code>daemon/runtime.rs</code> + stream.rs 整文件删除。</div>
+
+            <div class="dispatch-card">
+              <div class="header">
+                <span class="label">◆ DISPATCH</span>
+                <span>orchestrator · 4 workers</span>
+                <span style="margin-left:auto; color: var(--fg-faint);">just now</span>
+              </div>
+
+              <div class="worker-row running">
+                <span class="agent-tag agent-codex">codex</span>
+                <div>
+                  <div class="name">search-impl</div>
+                  <div class="desc">list_files crates/magi-conversation-runtime · 12 hits</div>
+                </div>
+                <div class="status"><span class="indicator"></span>running 2.1s</div>
+              </div>
+
+              <div class="worker-row running">
+                <span class="agent-tag agent-claude">claude</span>
+                <div>
+                  <div class="name">refactor-core</div>
+                  <div class="desc">edit src/stream.rs → src/lib.rs · 3/5 files</div>
+                </div>
+                <div class="status"><span class="indicator"></span>running 8.3s</div>
+              </div>
+
+              <div class="worker-row queued">
+                <span class="agent-tag agent-claude">claude</span>
+                <div>
+                  <div class="name">verify-tests</div>
+                  <div class="desc">cargo check --workspace</div>
+                </div>
+                <div class="status"><span class="indicator"></span>queued</div>
+              </div>
+
+              <div class="worker-row failed">
+                <span class="agent-tag agent-gemini">gemini</span>
+                <div>
+                  <div class="name">parse-args</div>
+                  <div class="desc">⚠ Tool execution timeout after 30s</div>
+                </div>
+                <div class="status"><span class="indicator"></span>failed</div>
+              </div>
+            </div>
+
+            <div class="text" style="color: var(--fg-muted); font-size: 12px;">
+              <code>parse-args</code> 已失败,但其结果不阻塞主任务,继续等待 refactor-core 完成…
+            </div>
+          </div>
+        </div>
+
+        <!-- InputArea -->
+        <div class="input-area">
+          <div class="input-box">
+            <div class="field">询问 Magi · 输入 / 唤起技能...</div>
+            <div class="send">▲</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 右侧 Dock（宽屏常驻） -->
+      <div class="dock">
+        <div class="dock-header">
+          <div class="title">WORKER DOCK</div>
+          <div class="actions">
+            <div class="ic" title="新窗口">⤢</div>
+            <div class="ic" title="折叠">‹</div>
+          </div>
+        </div>
+
+        <div class="dock-summary">
+          <div class="counts">
+            <span class="running"><strong>3</strong>running</span>
+            <span class="success"><strong>5</strong>done</span>
+            <span class="failed"><strong>1</strong>failed</span>
+          </div>
+          <div class="progress"><div class="bar"></div></div>
+          <div class="alert">
+            <svg class="icon" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M8.485 2.495c.673-1.167 2.357-1.167 3.03 0l6.28 10.875c.673 1.167-.17 2.625-1.516 2.625H3.72c-1.347 0-2.189-1.458-1.515-2.625L8.485 2.495zM10 6a.75.75 0 01.75.75v3.5a.75.75 0 01-1.5 0v-3.5A.75.75 0 0110 6zm0 9a1 1 0 100-2 1 1 0 000 2z" clip-rule="evenodd"/></svg>
+            <span><strong style="color:#fca5a5;">parse-args</strong> failed · Tool timeout</span>
+          </div>
+        </div>
+
+        <div class="dock-tabs">
+          <div class="dock-tab active">Workers <span class="badge">4</span></div>
+          <div class="dock-tab">Tasks <span class="badge">7</span></div>
+          <div class="dock-tab">Logs <span class="badge fail">1</span></div>
+        </div>
+
+        <div class="dock-body">
+          <div class="dock-worker running">
+            <div class="row1"><div class="name">search-impl</div><div class="time">2.1s</div></div>
+            <div class="step">list_files · 12 matches</div>
+            <div class="meta"><span class="agent-tag agent-codex">codex</span></div>
+          </div>
+          <div class="dock-worker running">
+            <div class="row1"><div class="name">refactor-core</div><div class="time">8.3s</div></div>
+            <div class="step">edit src/stream.rs (3/5)</div>
+            <div class="meta"><span class="agent-tag agent-claude">claude</span></div>
+          </div>
+          <div class="dock-worker queued">
+            <div class="row1"><div class="name">verify-tests</div><div class="time">—</div></div>
+            <div class="step">queued · waiting refactor-core</div>
+            <div class="meta"><span class="agent-tag agent-claude">claude</span></div>
+          </div>
+          <div class="dock-worker failed">
+            <div class="row1"><div class="name">parse-args</div><div class="time">30.0s</div></div>
+            <div class="step">⚠ Tool execution timeout</div>
+            <div class="meta"><span class="agent-tag agent-gemini">gemini</span></div>
+          </div>
+          <div style="margin-top: 12px; padding: 8px; font-size: 11px; color: var(--fg-faint); text-transform: uppercase; letter-spacing: 0.4px;">
+            EARLIER · 5
+          </div>
+          <div class="dock-worker" style="border-left-color: var(--c-success); opacity: 0.65;">
+            <div class="row1"><div class="name">audit-imports</div><div class="time">3.4s</div></div>
+            <div class="step">✓ 完成 · 4 files scanned</div>
+            <div class="meta"><span class="agent-tag agent-codex">codex</span></div>
+          </div>
+          <div class="dock-worker" style="border-left-color: var(--c-success); opacity: 0.65;">
+            <div class="row1"><div class="name">cleanup-tests</div><div class="time">1.8s</div></div>
+            <div class="step">✓ 完成 · 4 test files</div>
+            <div class="meta"><span class="agent-tag agent-claude">claude</span></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 中/窄屏覆盖 Dock(默认隐藏) -->
+      <div class="dock-mobile hidden" id="dockMobile">
+        <div class="dock-header">
+          <div class="title">WORKER DOCK</div>
+          <div class="actions">
+            <div class="ic" title="关闭" id="dockMobileClose">×</div>
+          </div>
+        </div>
+        <div class="dock-summary">
+          <div class="counts">
+            <span class="running"><strong>3</strong>running</span>
+            <span class="success"><strong>5</strong>done</span>
+            <span class="failed"><strong>1</strong>failed</span>
+          </div>
+          <div class="progress"><div class="bar"></div></div>
+          <div class="alert">
+            <svg class="icon" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M8.485 2.495c.673-1.167 2.357-1.167 3.03 0l6.28 10.875c.673 1.167-.17 2.625-1.516 2.625H3.72c-1.347 0-2.189-1.458-1.515-2.625L8.485 2.495zM10 6a.75.75 0 01.75.75v3.5a.75.75 0 01-1.5 0v-3.5A.75.75 0 0110 6zm0 9a1 1 0 100-2 1 1 0 000 2z" clip-rule="evenodd"/></svg>
+            <span><strong style="color:#fca5a5;">parse-args</strong> failed</span>
+          </div>
+        </div>
+        <div class="dock-tabs">
+          <div class="dock-tab active">Workers <span class="badge">4</span></div>
+          <div class="dock-tab">Tasks <span class="badge">7</span></div>
+          <div class="dock-tab">Logs <span class="badge fail">1</span></div>
+        </div>
+        <div class="dock-body" style="flex: 1; overflow-y: auto;">
+          <div class="dock-worker running">
+            <div class="row1"><div class="name">search-impl</div><div class="time">2.1s</div></div>
+            <div class="step">list_files · 12 matches</div>
+          </div>
+          <div class="dock-worker running">
+            <div class="row1"><div class="name">refactor-core</div><div class="time">8.3s</div></div>
+            <div class="step">edit src/stream.rs (3/5)</div>
+          </div>
+          <div class="dock-worker failed">
+            <div class="row1"><div class="name">parse-args</div><div class="time">30.0s</div></div>
+            <div class="step">⚠ Tool execution timeout</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+  const vp = document.getElementById('vp');
+  const buttons = document.querySelectorAll('.vp-switcher button');
+  const dockMobile = document.getElementById('dockMobile');
+  const dockToggle = document.getElementById('dockToggle');
+  const dockMobileClose = document.getElementById('dockMobileClose');
+
+  buttons.forEach(btn => {
+    btn.addEventListener('click', () => {
+      buttons.forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      vp.dataset.vp = btn.dataset.vp;
+      dockMobile.classList.add('hidden');
+    });
+  });
+
+  dockToggle.addEventListener('click', () => {
+    if (vp.dataset.vp !== 'wide') {
+      dockMobile.classList.toggle('hidden');
+    }
+  });
+  dockMobileClose.addEventListener('click', () => dockMobile.classList.add('hidden'));
+</script>
+
+</body>
+</html>

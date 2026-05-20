@@ -1,8 +1,6 @@
 <script lang="ts">
-  import { resolveModelListFetchBlockReason } from '../shared/model-governance';
   import { i18n } from '../stores/i18n.svelte';
   import Icon from './Icon.svelte';
-  import Toggle from './Toggle.svelte';
 
   type FormType = 'orch' | 'comp' | 'worker';
 
@@ -12,7 +10,6 @@
     config = $bindable(),
     keyVisible = $bindable(),
     showAdvancedOptions = true,
-    showEnabledToggle = false,
     description = null,
     saveStatus,
     testStatus,
@@ -22,21 +19,18 @@
     modelLists,
     getBaseUrlPlaceholder,
     shouldRecommendStandardUrlMode,
-    getOpenAiProtocolValue,
-    setOpenAiProtocolValue,
     openModelDropdown,
+    closeModelDropdown,
     fetchModelList,
     selectModel,
     saveModelConfig,
-    testModelConnection,
-    handleWorkerEnabledToggle
+    testModelConnection
   } = $props<{
     formType: FormType;
     statusKey: string;
     config: any;
     keyVisible: Record<string, boolean>;
     showAdvancedOptions?: boolean;
-    showEnabledToggle?: boolean;
     description?: string | null;
     saveStatus: Record<string, string>;
     testStatus: Record<string, string>;
@@ -44,16 +38,14 @@
     modelDropdownOpen: Record<string, boolean>;
     dropdownPosition: any;
     modelLists: Record<string, string[]>;
-    getBaseUrlPlaceholder: (provider: string) => string;
-    shouldRecommendStandardUrlMode: (provider: any, baseUrl: string) => boolean;
-    getOpenAiProtocolValue: (config: any) => 'responses' | 'chat';
-    setOpenAiProtocolValue: (config: any, value: unknown) => void;
+    getBaseUrlPlaceholder: () => string;
+    shouldRecommendStandardUrlMode: (baseUrl: string) => boolean;
     openModelDropdown: (type: string, target: HTMLElement) => void;
+    closeModelDropdown: (key: string) => void;
     fetchModelList: (type: FormType) => void;
-    selectModel: (type: FormType, model: string) => void;
+    selectModel: (type: string, model: string) => void;
     saveModelConfig: (type: FormType) => void;
     testModelConnection: (type: FormType) => void;
-    handleWorkerEnabledToggle?: (workerId: string, enabled: boolean) => void;
   }>();
 
   const keyVisibleKey = $derived(formType);
@@ -93,6 +85,26 @@
     userHasEdited = true;
   }
 
+  // --- 下拉外部点击关闭 ---
+  // 模型下拉用 position: fixed 渲染到 .model-combobox 之外的 stacking context，
+  // 这里用两个 ref 锁定边界：只有点击落在 combobox 或 dropdown 内才视为内部交互，
+  // 其余 pointerdown 一律关闭本表单的下拉。
+  let comboboxEl: HTMLDivElement | undefined = $state();
+  let dropdownEl: HTMLDivElement | undefined = $state();
+
+  $effect(() => {
+    if (!modelDropdownOpen[statusKey]) return;
+    function handlePointerDown(event: PointerEvent) {
+      const target = event.target as Node | null;
+      if (!target) return;
+      if (comboboxEl?.contains(target)) return;
+      if (dropdownEl?.contains(target)) return;
+      closeModelDropdown(statusKey);
+    }
+    window.addEventListener('pointerdown', handlePointerDown, true);
+    return () => window.removeEventListener('pointerdown', handlePointerDown, true);
+  });
+
   const currentSaveStatus = $derived(saveStatus[statusKey]);
   const currentTestStatus = $derived(testStatus[statusKey]);
   const isSaving = $derived(currentSaveStatus === 'saving');
@@ -112,27 +124,9 @@
     }
   }
 
-  function modelListActionDisabled(): boolean {
-    const hasModels = Array.isArray(modelLists[statusKey]) && modelLists[statusKey].length > 0;
-    return Boolean(fetchingModels[statusKey] || (!hasModels && resolveModelListFetchBlockReason(config)));
-  }
-
   function modelListActionTitle(): string {
     if (Array.isArray(modelLists[statusKey]) && modelLists[statusKey].length > 0) {
       return i18n.t('settings.model.openModelList');
-    }
-    const blockReason = resolveModelListFetchBlockReason(config);
-    if (blockReason === 'full_url_mode') {
-      return i18n.t('config.toast.modelListUnsupportedInFullMode');
-    }
-    if (blockReason === 'endpoint_base_url') {
-      return i18n.t('config.toast.modelListEndpointBaseUrl');
-    }
-    if (blockReason === 'unsupported_provider') {
-      return i18n.t('config.toast.modelListUnsupportedProvider');
-    }
-    if (blockReason === 'missing_base_url_or_api_key') {
-      return i18n.t('config.toast.fillBaseUrlFirst');
     }
     return i18n.t('settings.model.fetchModelList');
   }
@@ -142,7 +136,6 @@
 <div class="llm-config-form" oninput={markUserEdited} onchange={markUserEdited}>
   <div
     class="llm-config-field-row url-mode-row"
-    class:worker-url-mode-row={showEnabledToggle}
   >
     <div class="llm-config-field">
       <label class="llm-config-label">{i18n.t('settings.model.field.baseUrl')}</label>
@@ -150,7 +143,7 @@
         type="text"
         class="llm-config-input"
         bind:value={config.baseUrl}
-        placeholder={getBaseUrlPlaceholder(config.provider)}
+        placeholder={getBaseUrlPlaceholder()}
       />
     </div>
     <div class="llm-config-field llm-config-field--compact">
@@ -173,54 +166,41 @@
           {i18n.t('settings.model.urlMode.full')}
         </button>
       </div>
-      {#if shouldRecommendStandardUrlMode(config.provider, config.baseUrl)}
+      {#if shouldRecommendStandardUrlMode(config.baseUrl)}
         <div class="llm-config-hint">
           {i18n.t('settings.model.urlMode.standardRecommended')}
         </div>
       {/if}
     </div>
-    {#if showEnabledToggle && handleWorkerEnabledToggle}
-      <div class="llm-config-field llm-config-field--toggle">
-        <label class="llm-config-label">{i18n.t('settings.model.enable')}</label>
-        <div class="llm-toggle-control">
-          <Toggle
-            size="small"
-            checked={config.enabled}
-            onchange={() => handleWorkerEnabledToggle(statusKey, !config.enabled)}
-          />
-        </div>
-      </div>
-    {/if}
-  </div>
-
-  <div class="llm-config-field">
-    <label class="llm-config-label">{i18n.t('settings.model.field.apiKey')}</label>
-    <div class="api-key-wrapper">
-      <input
-        type={keyVisible[keyVisibleKey] ? 'text' : 'password'}
-        class="llm-config-input api-key-input"
-        bind:value={config.apiKey}
-        placeholder="sk-ant-..."
-      />
-      <button
-        type="button"
-        class="api-key-toggle"
-        onclick={() => (keyVisible[keyVisibleKey] = !keyVisible[keyVisibleKey])}
-        title={keyVisible[keyVisibleKey] ? i18n.t('input.hideKey') : i18n.t('input.showKey')}
-      >
-        <Icon name={keyVisible[keyVisibleKey] ? 'eye-slash' : 'eye'} size={14} />
-      </button>
-    </div>
   </div>
 
   <div
-    class="llm-config-field-row"
-    class:has-thinking={showAdvancedOptions}
-    class:has-level={showAdvancedOptions && config.provider === 'openai'}
+    class="llm-config-field-row credentials-row"
+    class:has-level={showAdvancedOptions}
   >
     <div class="llm-config-field">
+      <label class="llm-config-label">{i18n.t('settings.model.field.apiKey')}</label>
+      <div class="api-key-wrapper">
+        <input
+          type={keyVisible[keyVisibleKey] ? 'text' : 'password'}
+          class="llm-config-input api-key-input"
+          bind:value={config.apiKey}
+          placeholder="sk-ant-..."
+        />
+        <button
+          type="button"
+          class="api-key-toggle"
+          onclick={() => (keyVisible[keyVisibleKey] = !keyVisible[keyVisibleKey])}
+          title={keyVisible[keyVisibleKey] ? i18n.t('input.hideKey') : i18n.t('input.showKey')}
+        >
+          <Icon name={keyVisible[keyVisibleKey] ? 'eye-slash' : 'eye'} size={14} />
+        </button>
+      </div>
+    </div>
+
+    <div class="llm-config-field">
       <label class="llm-config-label">{i18n.t('settings.model.field.model')}</label>
-      <div class="model-combobox">
+      <div class="model-combobox" bind:this={comboboxEl}>
         <input
           type="text"
           class="llm-config-input"
@@ -229,25 +209,23 @@
             if ((modelLists[statusKey]?.length ?? 0) > 0) openModelDropdown(statusKey, e.currentTarget);
           }}
         />
-        {#if !config.model}
-          <button
-            class="model-fetch-btn"
-            onclick={handleModelListAction}
-            disabled={modelListActionDisabled()}
-            aria-label={modelListActionTitle()}
-            title={modelListActionTitle()}
-          >
-            {#if fetchingModels[statusKey]}
-              <Icon name="refresh" size={12} />
-            {:else if (modelLists[statusKey]?.length ?? 0) > 0}
-              <Icon name="chevron-down" size={12} />
-            {:else}
-              <Icon name="download" size={12} />
-            {/if}
-          </button>
-        {/if}
+        <button
+          class="model-fetch-btn"
+          onclick={handleModelListAction}
+          aria-label={modelListActionTitle()}
+          title={modelListActionTitle()}
+        >
+          {#if fetchingModels[statusKey]}
+            <Icon name="refresh" size={12} />
+          {:else if (modelLists[statusKey]?.length ?? 0) > 0}
+            <Icon name="chevron-down" size={12} />
+          {:else}
+            <Icon name="download" size={12} />
+          {/if}
+        </button>
         {#if modelDropdownOpen[statusKey] && (modelLists[statusKey]?.length ?? 0) > 0}
           <div
+            bind:this={dropdownEl}
             class="model-dropdown"
             style="top: {dropdownPosition.top}px; left: {dropdownPosition.left}px; width: {dropdownPosition.width}px;"
           >
@@ -255,7 +233,7 @@
               <button
                 class="model-dropdown-item"
                 class:selected={config.model === m}
-                onclick={() => { selectModel(formType, m); markUserEdited(); }}
+                onclick={() => { selectModel(statusKey, m); markUserEdited(); }}
               >
                 {m}
               </button>
@@ -265,61 +243,15 @@
       </div>
     </div>
 
-    <div class="llm-config-field">
-      <label class="llm-config-label">{i18n.t('settings.model.field.provider')}</label>
-      <select class="llm-config-select" bind:value={config.provider}>
-        <option value="openai">{i18n.t('settings.model.provider.openai')}</option>
-        <option value="anthropic">{i18n.t('settings.model.provider.anthropic')}</option>
-      </select>
-    </div>
-
-    {#if config.provider === 'openai'}
-      <div class="llm-config-field">
-        <label class="llm-config-label">{i18n.t('settings.model.field.protocol')}</label>
-        <select
-          class="llm-config-select"
-          value={getOpenAiProtocolValue(config)}
-          onchange={(event) => setOpenAiProtocolValue(config, (event.currentTarget as HTMLSelectElement).value)}
-        >
-          <option value="responses">{i18n.t('settings.model.protocol.responses')}</option>
-          <option value="chat">{i18n.t('settings.model.protocol.chat')}</option>
-        </select>
-      </div>
-      {#if config.urlMode === 'full'}
-        <div class="llm-config-field">
-          <label class="llm-config-label">{i18n.t('settings.model.field.protocolEndpoint')}</label>
-          <input
-            type="text"
-            class="llm-config-input"
-            bind:value={config.protocolEndpoint}
-            placeholder="/v1/chat/completions"
-          />
-        </div>
-      {/if}
-      {#if showAdvancedOptions}
-        <div class="llm-config-field">
-          <label class="llm-config-label">{i18n.t('settings.model.field.level')}</label>
-          <select class="llm-config-select" bind:value={config.reasoningEffort}>
-            <option value="low">{i18n.t('settings.model.reasoning.low')}</option>
-            <option value="medium">{i18n.t('settings.model.reasoning.medium')}</option>
-            <option value="high">{i18n.t('settings.model.reasoning.high')}</option>
-            <option value="xhigh">{i18n.t('settings.model.reasoning.xhigh')}</option>
-          </select>
-        </div>
-      {/if}
-    {/if}
-
     {#if showAdvancedOptions}
-      <div class="llm-config-field llm-config-field--toggle">
-        <label class="llm-config-label">{i18n.t('settings.model.field.thinking')}</label>
-        <div class="llm-toggle-control">
-          <Toggle
-            size="small"
-            checked={config.thinking}
-            title={config.thinking ? i18n.t('settings.model.disableThinking') : i18n.t('settings.model.enableThinking')}
-            onchange={() => (config.thinking = !config.thinking)}
-          />
-        </div>
+      <div class="llm-config-field">
+        <label class="llm-config-label">{i18n.t('settings.model.field.level')}</label>
+        <select class="llm-config-select" bind:value={config.reasoningEffort}>
+          <option value="low">{i18n.t('settings.model.reasoning.low')}</option>
+          <option value="medium">{i18n.t('settings.model.reasoning.medium')}</option>
+          <option value="high">{i18n.t('settings.model.reasoning.high')}</option>
+          <option value="xhigh">{i18n.t('settings.model.reasoning.xhigh')}</option>
+        </select>
       </div>
     {/if}
   </div>
@@ -400,34 +332,19 @@
     gap: var(--space-2);
   }
 
-  .llm-config-field--toggle {
-    width: var(--model-toggle-column-width, 100px);
-    min-width: var(--model-toggle-column-width, 100px);
-  }
-
-  .llm-toggle-control {
-    height: 28px;
-    display: flex;
-    align-items: center;
-  }
-
   .llm-config-field-row {
     display: grid;
-    grid-template-columns: 1fr 96px;
+    grid-template-columns: 1fr;
     gap: var(--space-3);
   }
-  .llm-config-field-row.has-thinking {
-    grid-template-columns: 1fr 96px var(--model-toggle-column-width, 100px);
+  .llm-config-field-row.credentials-row {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   }
-  .llm-config-field-row.has-thinking.has-level {
-    grid-template-columns: 1fr 96px 88px 88px var(--model-toggle-column-width, 100px);
+  .llm-config-field-row.credentials-row.has-level {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 96px;
   }
   .llm-config-field-row.url-mode-row {
     grid-template-columns: minmax(0, 1fr) 180px;
-    align-items: end;
-  }
-  .llm-config-field-row.worker-url-mode-row {
-    grid-template-columns: minmax(0, 1fr) 180px var(--model-toggle-column-width, 100px);
     align-items: end;
   }
 
@@ -558,13 +475,9 @@
     cursor: pointer;
     transition: all var(--transition-fast);
   }
-  .model-fetch-btn:hover:not(:disabled) {
+  .model-fetch-btn:hover {
     background: var(--secondary);
     color: var(--foreground);
-  }
-  .model-fetch-btn:disabled {
-    opacity: 0.4;
-    cursor: not-allowed;
   }
 
   .model-dropdown {
@@ -662,10 +575,9 @@
       align-items: stretch;
     }
     .llm-config-field-row,
-    .llm-config-field-row.has-thinking,
-    .llm-config-field-row.has-thinking.has-level,
-    .llm-config-field-row.url-mode-row,
-    .llm-config-field-row.worker-url-mode-row {
+    .llm-config-field-row.credentials-row,
+    .llm-config-field-row.credentials-row.has-level,
+    .llm-config-field-row.url-mode-row {
       grid-template-columns: 1fr;
     }
   }
@@ -691,10 +603,9 @@
       align-items: stretch;
     }
     .llm-config-field-row,
-    .llm-config-field-row.has-thinking,
-    .llm-config-field-row.has-thinking.has-level,
-    .llm-config-field-row.url-mode-row,
-    .llm-config-field-row.worker-url-mode-row {
+    .llm-config-field-row.credentials-row,
+    .llm-config-field-row.credentials-row.has-level,
+    .llm-config-field-row.url-mode-row {
       grid-template-columns: 1fr;
     }
   }

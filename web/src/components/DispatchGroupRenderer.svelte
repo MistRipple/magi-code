@@ -11,7 +11,7 @@
     getEnabledAgents,
     messagesState,
   } from '../stores/messages.svelte';
-  import { openWorkerDetailDrawer } from '../stores/worker-detail-drawer.svelte';
+  import { openAgentTab } from '../stores/right-pane.svelte';
   import { i18n } from '../stores/i18n.svelte';
   import Icon from './Icon.svelte';
 
@@ -382,7 +382,10 @@
     if (readOnly || !row.focusTarget) {
       return;
     }
-    openWorkerDetailDrawer(row.focusTarget.workerTabId);
+    // 触发右侧多 Tab 面板：以 currentSessionId 为边界、workerTabId 为去重 key
+    openAgentTab(messagesState.currentSessionId, row.focusTarget.workerTabId, {
+      label: row.workerDisplayLabel,
+    });
   }
 
   function rowAriaLabel(row: LaneRow): string {

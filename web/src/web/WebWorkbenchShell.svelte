@@ -10,7 +10,7 @@
   import { getClientBridge } from '../shared/bridges/bridge-runtime';
   import { i18n } from '../stores/i18n.svelte';
   import type { EditContentKind, Session } from '../types/message';
-  import FilePreviewPanel from './FilePreviewPanel.svelte';
+  import RightPane from './RightPane.svelte';
   import ProjectFileTree from './ProjectFileTree.svelte';
   import WebFolderPicker from './WebFolderPicker.svelte';
   import {
@@ -21,7 +21,6 @@
   } from './theme';
   import {
     AGENT_CONNECTION_EVENT,
-    getAgentFilePreview,
     getWorkspaceSessions,
     listAgentWorkspaces,
     registerAgentWorkspace,
@@ -36,9 +35,12 @@
     readStoredBrowserWorkspaceBinding,
   } from '../shared/bridges/browser-workspace-binding';
   import {
-    isKnownBinaryFile,
-    isWordFile,
-  } from '../lib/file-preview-utils';
+    rightPaneState,
+    getRightPaneState,
+    openCodeTab,
+    setRightPaneCollapsed,
+    type CodeTabPayload,
+  } from '../stores/right-pane.svelte';
 
   let loading = $state(true);
   let loadError = $state('');
@@ -63,16 +65,6 @@
   let webThemePreference = $state<WebThemePreference>('system');
   let webThemeMode = $state<WebThemeMode>('dark');
   let sidebarMode = $state<'projects' | 'files'>('projects');
-  let previewFilePath = $state<string | null>(null);
-  let previewContent = $state<string | null>(null);
-  let previewContentKind = $state<EditContentKind>('text');
-  let previewFileSize = $state<number | undefined>(undefined);
-  let previewMime = $state<string | undefined>(undefined);
-  let previewSymlinkTarget = $state<string | undefined>(undefined);
-  let previewHeadSummary = $state<string | undefined>(undefined);
-  let previewTailSummary = $state<string | undefined>(undefined);
-  let previewLoading = $state(false);
-  let previewError = $state('');
   let sidebarWidth = $state<number | null>(null);
   let isSidebarResizing = $state(false);
   let sidebarCollapsed = $state(false);
@@ -88,12 +80,12 @@
   const SIDEBAR_WIDTH_STORAGE_KEY = 'magi-sidebar-width';
   const SIDEBAR_COLLAPSED_STORAGE_KEY = 'magi-sidebar-collapsed';
   const PREVIEW_PANEL_WIDTH_STORAGE_KEY = 'magi-preview-panel-width';
-  const DEFAULT_SIDEBAR_WIDTH = 280;
+  const DEFAULT_SIDEBAR_WIDTH = 320;
   const COMPACT_SIDEBAR_WIDTH = 240;
   const MIN_SIDEBAR_WIDTH = 220;
   const MAX_SIDEBAR_WIDTH = 520;
   const MIN_PREVIEW_PANEL_WIDTH = 320;
-  const DEFAULT_PREVIEW_PANEL_WIDTH = 480;
+  const DEFAULT_PREVIEW_PANEL_WIDTH = 320;
   const MAX_PREVIEW_PANEL_WIDTH = 900;
   const SHELL_PADDING = 8;
   const MIN_CONTENT_WIDTH = 620;
@@ -117,8 +109,20 @@
 
   const sidebarIsDrawer = $derived(isMobileViewport);
   const sidebarHidden = $derived(!sidebarIsDrawer && sidebarCollapsed);
+
+  /** 当前 session 的右栏多 tab 状态；由 right-pane store 派生 */
+  const activeRightPaneState = $derived(getRightPaneState(rightPaneState.activeSessionId));
+  /** 右侧面板是否在 DOM 中：仅看 collapsed——空 tab 时也可展开，由 RightPane 自带空态承接 */
+  const rightPaneVisible = $derived(!activeRightPaneState.collapsed);
+  /** 项目文件树高亮：active code tab 的 filepath */
+  const activeCodeTabFilePath = $derived.by<string>(() => {
+    if (!activeRightPaneState.activeTabId) return '';
+    const tab = activeRightPaneState.openTabs.find((t) => t.id === activeRightPaneState.activeTabId);
+    if (!tab || tab.kind !== 'code') return '';
+    return (tab.payload as CodeTabPayload).filepath;
+  });
   const previewIsOverlay = $derived(
-    !!previewFilePath && viewportWidth > 0 && viewportWidth <= VIEWPORT_PREVIEW_OVERLAY_BREAKPOINT
+    rightPaneVisible && viewportWidth > 0 && viewportWidth <= VIEWPORT_PREVIEW_OVERLAY_BREAKPOINT,
   );
 
   $effect(() => {
@@ -168,10 +172,6 @@
     if (!belongsToSelectedWorkspace) {
       return;
     }
-    if (urlExplicitlyClearsWorkspaceSession(selectedWorkspaceId, selectedWorkspace?.rootPath || '')) {
-      return;
-    }
-
     currentSessionId = bootstrapSessionId;
     if (pendingSessionSwitchId === bootstrapSessionId) {
       if (pendingSessionSwitchTimer) {
@@ -311,17 +311,6 @@
     }
   }
 
-  function urlExplicitlyClearsWorkspaceSession(workspaceId: string, workspacePath: string): boolean {
-    if (typeof window === 'undefined') {
-      return false;
-    }
-    const currentUrl = new URL(window.location.href);
-    const queryWorkspaceId = currentUrl.searchParams.get('workspaceId')?.trim() || '';
-    const queryWorkspacePath = currentUrl.searchParams.get('workspacePath')?.trim() || '';
-    const querySessionId = currentUrl.searchParams.get('sessionId')?.trim() || '';
-    return !querySessionId && (queryWorkspaceId === workspaceId || queryWorkspacePath === workspacePath);
-  }
-
   function resolveWorkspacePreferredSessionId(
     workspaceId: string,
     workspacePath: string,
@@ -389,7 +378,12 @@
 
     const requestedSessionId = preferredSessionId.trim();
     const currentAnchoredSessionId = typeof currentSessionId === 'string' ? currentSessionId.trim() : '';
-    const candidateSessionIds = [requestedSessionId, currentAnchoredSessionId].filter((value, index, arr) => (
+    const backendSelectedSessionId = typeof snapshot.sessionId === 'string' ? snapshot.sessionId.trim() : '';
+    const candidateSessionIds = [
+      requestedSessionId,
+      currentAnchoredSessionId,
+      backendSelectedSessionId,
+    ].filter((value, index, arr) => (
       value.length > 0 && arr.indexOf(value) === index
     ));
     const preservedSessionId = candidateSessionIds.find((sessionId) => (
@@ -558,19 +552,6 @@
     window.addEventListener('pointerup', handlePointerUp);
   }
 
-  function closeFilePreview(): void {
-    previewFilePath = null;
-    previewContent = null;
-    previewContentKind = 'text';
-    previewFileSize = undefined;
-    previewMime = undefined;
-    previewSymlinkTarget = undefined;
-    previewHeadSummary = undefined;
-    previewTailSummary = undefined;
-    previewLoading = false;
-    previewError = '';
-  }
-
   function resolvePreviewFilePath(filePath: string): string {
     const trimmedPath = filePath.trim();
     if (!trimmedPath) {
@@ -583,7 +564,12 @@
     return workspaceRoot ? `${workspaceRoot.replace(/[\\/]+$/, '')}/${trimmedPath.replace(/^[\\/]+/, '')}` : trimmedPath;
   }
 
-  async function handleFileSelect(
+  /**
+   * 把文件推到右栏的 code tab。
+   * - 文件元信息（contentKind / size / mime / symlinkTarget / head|tailSummary）通过 store 透传给 RightPane
+   * - 内容拉取在 RightPane 内部按 filepath 触发，shell 不再持有单文件状态
+   */
+  function handleFileSelect(
     filePath: string,
     metadata: {
       contentKind?: EditContentKind;
@@ -593,42 +579,23 @@
       headSummary?: string;
       tailSummary?: string;
     } = {},
-  ): Promise<void> {
+  ): void {
     const resolvedFilePath = resolvePreviewFilePath(filePath);
     if (!resolvedFilePath) {
       return;
     }
-    previewFilePath = resolvedFilePath;
-    previewContent = null;
-    previewContentKind = metadata.contentKind ?? 'text';
-    previewFileSize = metadata.size;
-    previewMime = metadata.mime;
-    previewSymlinkTarget = metadata.symlinkTarget;
-    previewHeadSummary = metadata.headSummary;
-    previewTailSummary = metadata.tailSummary;
-    previewError = '';
-
-    if (
-      isWordFile(resolvedFilePath)
-      || isKnownBinaryFile(resolvedFilePath)
-      || previewContentKind === 'binary'
-      || previewContentKind === 'large_text'
-      || previewContentKind === 'symlink'
-      || previewContentKind === 'special'
-    ) {
-      previewLoading = false;
+    const sessionId = rightPaneState.activeSessionId || currentSessionId || '';
+    if (!sessionId) {
       return;
     }
-
-    previewLoading = true;
-    try {
-      const payload = await getAgentFilePreview(resolvedFilePath, { includeSession: false });
-      previewContent = payload.content || '';
-    } catch (error) {
-      previewError = error instanceof Error ? error.message : String(error);
-    } finally {
-      previewLoading = false;
-    }
+    openCodeTab(sessionId, resolvedFilePath, {
+      contentKind: metadata.contentKind,
+      size: metadata.size,
+      mime: metadata.mime,
+      symlinkTarget: metadata.symlinkTarget,
+      headSummary: metadata.headSummary,
+      tailSummary: metadata.tailSummary,
+    });
   }
 
   async function refreshWorkspaceSessions(workspaceId: string, preferredSessionId = ''): Promise<string> {
@@ -944,7 +911,13 @@
   }
 
   function toggleSidebar(): void {
-    sidebarOpen = !sidebarOpen;
+    const nextOpen = !sidebarOpen;
+    sidebarOpen = nextOpen;
+    // 窄屏 drawer 模式下打开 sidebar 抽屉时，自动折叠右侧 overlay（z=900）
+    // 避免抽屉（z=800）被 overlay 遮住，造成用户操作无入口
+    if (nextOpen && sidebarIsDrawer && rightPaneVisible) {
+      setRightPaneCollapsed(rightPaneState.activeSessionId, true);
+    }
   }
 
   // 顶部 Header 的 sidebar 切换按钮：drawer 模式下控制抽屉开合，桌面模式下控制折叠/展开。
@@ -1034,7 +1007,7 @@
       const filepath = detail?.filepath;
       if (typeof filepath === 'string') {
         event.preventDefault();
-        void handleFileSelect(filepath, {
+        handleFileSelect(filepath, {
           contentKind: detail?.contentKind,
           size: detail?.size,
           mime: detail?.mime,
@@ -1091,7 +1064,7 @@
   class:web-workbench-shell--sidebar-open={sidebarIsDrawer && sidebarOpen}
   class:web-workbench-shell--sidebar-hidden={sidebarHidden}
   class:web-workbench-shell--preview-overlay={previewIsOverlay}
-  class:web-workbench-shell--has-preview={!!previewFilePath}
+  class:web-workbench-shell--has-preview={rightPaneVisible}
   class:web-workbench-shell--resizing={isSidebarResizing || isPreviewPanelResizing}
   class:web-workbench-shell--sidebar-resizing={isSidebarResizing}
   class:web-workbench-shell--preview-resizing={isPreviewPanelResizing}
@@ -1267,8 +1240,8 @@
           workspaceId={selectedWorkspaceId}
           title={selectedWorkspace?.name || i18n.t('web.projectFiles')}
           titlePath={selectedWorkspace?.rootPath || ''}
-          selectedFilePath={previewFilePath}
-          onFileSelect={(path) => void handleFileSelect(path)}
+          selectedFilePath={activeCodeTabFilePath}
+          onFileSelect={(path) => handleFileSelect(path)}
         />
       </section>
     {/if}
@@ -1315,13 +1288,13 @@
     {/if}
     <div
       class="workbench-body"
-      class:workbench-body--with-preview={!!previewFilePath && !previewIsOverlay}
-      class:workbench-body--overlay-preview={!!previewFilePath && previewIsOverlay}
+      class:workbench-body--with-preview={rightPaneVisible && !previewIsOverlay}
+      class:workbench-body--overlay-preview={rightPaneVisible && previewIsOverlay}
     >
       <div class="workbench-app-pane">
         <App />
       </div>
-      {#if previewFilePath}
+      {#if rightPaneVisible}
         {#if !previewIsOverlay}
           <div
             class="preview-resize-handle"
@@ -1332,20 +1305,7 @@
             ondblclick={resetPreviewPanelWidth}
           ></div>
         {/if}
-        <FilePreviewPanel
-          filePath={previewFilePath}
-          workspaceRoot={selectedWorkspace?.rootPath || ''}
-          content={previewContent}
-          loading={previewLoading}
-          error={previewError}
-          contentKind={previewContentKind}
-          size={previewFileSize}
-          mime={previewMime}
-          symlinkTarget={previewSymlinkTarget}
-          headSummary={previewHeadSummary}
-          tailSummary={previewTailSummary}
-          onClose={closeFilePreview}
-        />
+        <RightPane workspaceRoot={selectedWorkspace?.rootPath || ''} />
       {/if}
     </div>
   </main>
@@ -1412,7 +1372,7 @@
 <style>
   .web-workbench-shell {
     display: grid;
-    grid-template-columns: var(--sidebar-width, 280px) minmax(0, 1fr);
+    grid-template-columns: var(--sidebar-width, 320px) minmax(0, 1fr);
     gap: 8px;
     height: 100vh;
     width: 100vw;
@@ -1436,7 +1396,7 @@
     padding: var(--space-4);
     border-radius: var(--radius-lg);
     border: 1px solid var(--border);
-    background: var(--surface-1);
+    background: var(--background);
     overflow: visible;
   }
 
@@ -2037,7 +1997,7 @@
   }
 
   .workbench-body--with-preview {
-    grid-template-columns: minmax(620px, 1fr) 8px minmax(320px, var(--preview-panel-width, 400px));
+    grid-template-columns: minmax(620px, 1fr) 8px minmax(320px, var(--preview-panel-width, 320px));
   }
 
   .workbench-app-pane {
@@ -2101,12 +2061,6 @@
     user-select: none;
   }
 
-  .workbench-body :global(.file-preview-panel) {
-    border-radius: var(--radius-lg);
-    border: 1px solid var(--border);
-    overflow: hidden;
-  }
-
   /* 抽屉模式：sidebar 离开网格，悬浮覆盖 */
   .web-workbench-shell--sidebar-drawer {
     grid-template-columns: minmax(0, 1fr);
@@ -2149,8 +2103,8 @@
     display: none;
   }
 
-  /* 预览覆盖模式：preview 浮在主区上方 */
-  .web-workbench-shell--preview-overlay :global(.file-preview-panel) {
+  /* 预览覆盖模式：right-pane 浮在主区上方，占满 workbench-body */
+  .web-workbench-shell--preview-overlay :global(.right-pane) {
     position: absolute;
     inset: 0;
     z-index: var(--z-overlay-preview);
@@ -2158,6 +2112,7 @@
     border: none;
     border-left: 1px solid var(--border);
     background: var(--background);
+    box-shadow: var(--shadow-lg);
   }
 
   .mobile-toolbar {

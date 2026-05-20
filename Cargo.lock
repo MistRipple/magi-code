@@ -989,6 +989,7 @@ name = "magi-bridge-client"
 version = "0.1.0"
 dependencies = [
  "magi-permissions",
+ "magi-usage-authority",
  "once_cell",
  "regex",
  "reqwest",

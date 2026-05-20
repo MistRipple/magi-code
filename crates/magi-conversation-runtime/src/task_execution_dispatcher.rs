@@ -32,9 +32,7 @@ use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
 use magi_governance::ToolKind;
 use magi_knowledge_store::{KnowledgeKind, KnowledgeRecord, KnowledgeStore};
 use magi_lifecycle_notice::LifecycleNoticeRegistry;
-use magi_memory_store::{
-    ExtractedMemory, MemoryExtractionApplyRequest, MemoryLayer, MemoryStore,
-};
+use magi_memory_store::{ExtractedMemory, MemoryExtractionApplyRequest, MemoryLayer, MemoryStore};
 use magi_mission_metrics::MissionMetricsRegistry;
 use magi_orchestrator::{
     ExecutionContextSummary, ExecutionWritebackPlans, OrchestratedExecutionRuntime,
@@ -128,23 +126,53 @@ pub struct LlmTaskDispatcher {
     mission_metrics_registry: Arc<MissionMetricsRegistry>,
 }
 
+/// 业务派发模型客户端的统一入口。
+///
+/// 单一事实源：优先读 settings.json 的 `orchestrator` 段（前端「主对话/编排模型」
+/// 表单写入位置，携带 `reasoningEffort` 字段）。该段未配置（缺 base_url）时退回
+/// daemon 启动期注入的 `default_client`（基于 `MAGI_OPENAI_COMPAT_*` env 的兜底实现），
+/// 保证开发/测试场景下无需 UI 也能连得通。
+///
+/// 历史上这里读的是 `auxiliary` 段，但 auxiliary 表单没有 `reasoningEffort`
+/// 字段，导致用户在 UI 上设置「思考强度」永远不会被业务模型读到。auxiliary
+/// 段现在只服务于会话标题精修、知识抽取等辅助任务，由 [`build_auxiliary_model_client`]
+/// 独立消费。
 pub fn resolve_configured_model_client(
     settings_store: Option<&Arc<SettingsStore>>,
     default_client: Option<Arc<dyn ModelBridgeClient>>,
 ) -> Option<Arc<dyn ModelBridgeClient>> {
     if let Some(store) = settings_store {
-        if let Some(client) = build_auxiliary_model_client(store) {
+        if let Some(client) = build_orchestrator_model_client(store) {
             return Some(client);
         }
     }
     default_client
 }
 
-/// 按 `auxiliary` 配置段构造 HTTP 模型客户端的统一入口。
+/// 按 `orchestrator` 配置段构造业务模型客户端。
 ///
-/// 未配置（缺 base_url 或缺 api_key）时返回 `None`，调用方应据此决定回退策略。
-/// 业务派发走 [`resolve_configured_model_client`]（缺失时退回默认 client），
-/// 会话标题精修等"低价值"任务则直接消费该返回值，缺失则静默跳过。
+/// `orchestrator` 段对应前端「主对话/编排模型」表单（[`InteractiveModelFormConfig`]），
+/// 包含 `baseUrl` / `apiKey` / `model` / `urlMode` / `reasoningEffort` 全套字段，
+/// 是业务派发的唯一权威入口。未配置（缺 base_url 或缺 api_key）时返回 `None`，
+/// 调用方据此回退到 daemon 默认 client。
+pub fn build_orchestrator_model_client(
+    settings_store: &Arc<SettingsStore>,
+) -> Option<Arc<dyn ModelBridgeClient>> {
+    let config = settings_store.get_section("orchestrator");
+    let normalized = NormalizedModelConfig::from_settings_value(&config, "openai");
+    normalized
+        .to_http_model_client("gpt-4")
+        .map(|client| Arc::new(client) as Arc<dyn ModelBridgeClient>)
+}
+
+/// 按 `auxiliary` 配置段构造辅助模型客户端。
+///
+/// `auxiliary` 段只服务于会话标题精修、知识抽取、会话记忆、Prompt 增强等
+/// "低价值/低延迟敏感"任务；它不参与业务派发的模型选择（业务侧走
+/// [`resolve_configured_model_client`] → [`build_orchestrator_model_client`]）。
+///
+/// 未配置（缺 base_url 或缺 api_key）时返回 `None`，调用方应直接跳过该次辅助调用，
+/// 不做任何兜底（与"辅助模型未配置则静默跳过"的既有语义一致）。
 pub fn build_auxiliary_model_client(
     settings_store: &Arc<SettingsStore>,
 ) -> Option<Arc<dyn ModelBridgeClient>> {
@@ -762,12 +790,20 @@ impl LlmTaskDispatcher {
 
         let now = UtcMillis::now();
         let extraction_id = format!("extract-session-memory-{}-{}", session_id.as_str(), now.0);
-        let source_ref = format!("{SESSION_MEMORY_SOURCE_PREFIX}{}/{}", session_id.as_str(), now.0);
+        let source_ref = format!(
+            "{SESSION_MEMORY_SOURCE_PREFIX}{}/{}",
+            session_id.as_str(),
+            now.0
+        );
         let memories = slices
             .into_iter()
             .enumerate()
             .map(|(index, slice)| ExtractedMemory {
-                memory_id: format!("mem-session-memory-{}-{}-{index}", session_id.as_str(), now.0),
+                memory_id: format!(
+                    "mem-session-memory-{}-{}-{index}",
+                    session_id.as_str(),
+                    now.0
+                ),
                 layer: MemoryLayer::Recent,
                 content: format!("[{}] {}", slice.category, slice.content),
                 created_at: now,
@@ -1861,6 +1897,80 @@ mod tests {
             "nextSteps": ""
         }"#;
         assert!(parse_session_memory_slices(raw).is_none());
+    }
+
+    /// 回归测试：用户在前端「主对话/编排模型」面板设置 reasoningEffort 后，
+    /// resolve_configured_model_client 必须返回 orchestrator 段构造的 client，
+    /// 而不是默默退回 default_client（旧 bug：读 auxiliary 段，导致 reasoningEffort 丢失）。
+    #[test]
+    fn resolve_configured_model_client_reads_orchestrator_segment() {
+        use crate::settings_store::SettingsStore;
+
+        let store = Arc::new(SettingsStore::new());
+        store.set_section(
+            "orchestrator",
+            serde_json::json!({
+                "baseUrl": "https://api.example.com/v1",
+                "apiKey": "sk-orch",
+                "model": "gpt-5.5",
+                "urlMode": "standard",
+                "reasoningEffort": "xhigh",
+            }),
+        );
+
+        let resolved = resolve_configured_model_client(Some(&store), None);
+        assert!(
+            resolved.is_some(),
+            "orchestrator 段已配置时必须返回业务模型 client"
+        );
+    }
+
+    /// 回归测试：orchestrator 段未配置时，resolve 应该如实回退到 default_client，
+    /// 不应该误读 auxiliary 段去补位（两个段语义完全不同）。
+    #[test]
+    fn resolve_configured_model_client_falls_back_when_orchestrator_unset() {
+        use crate::settings_store::SettingsStore;
+
+        let store = Arc::new(SettingsStore::new());
+        // 仅配置 auxiliary，模拟"只填了辅助模型"的部署
+        store.set_section(
+            "auxiliary",
+            serde_json::json!({
+                "baseUrl": "https://api.example.com/v1",
+                "apiKey": "sk-aux",
+                "model": "gpt-4o-mini",
+                "urlMode": "standard",
+            }),
+        );
+
+        let resolved = resolve_configured_model_client(Some(&store), None);
+        assert!(
+            resolved.is_none(),
+            "orchestrator 段未配置 + 无 default_client 时应返回 None，\
+             绝不能用 auxiliary 段补位（auxiliary 没有 reasoningEffort 字段）"
+        );
+    }
+
+    /// 回归测试：auxiliary 段独立可用，serve 辅助任务（会话标题精修 / 知识抽取 / 等等）。
+    /// 与业务派发路径解耦。
+    #[test]
+    fn build_auxiliary_model_client_reads_auxiliary_segment() {
+        use crate::settings_store::SettingsStore;
+
+        let store = Arc::new(SettingsStore::new());
+        store.set_section(
+            "auxiliary",
+            serde_json::json!({
+                "baseUrl": "https://api.example.com/v1",
+                "apiKey": "sk-aux",
+                "model": "gpt-4o-mini",
+                "urlMode": "standard",
+            }),
+        );
+
+        assert!(build_auxiliary_model_client(&store).is_some());
+        // 业务路径不应该被辅助配置干扰
+        assert!(build_orchestrator_model_client(&store).is_none());
     }
 }
 

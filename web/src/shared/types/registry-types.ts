@@ -97,16 +97,3 @@ export interface AgentRegistryConfig {
   engines: ModelEngine[];
   agents: AgentBinding[];
 }
-
-// ============================================================================
-// 工具函数
-// ============================================================================
-
-export function deriveNormalizerFamily(
-  provider: string,
-  _openaiProtocol?: string,
-): NormalizerFamily {
-  if (provider === 'anthropic') return 'anthropic';
-  if (provider === 'google') return 'google';
-  return 'openai';
-}

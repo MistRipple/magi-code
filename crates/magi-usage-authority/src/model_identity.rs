@@ -1,8 +1,6 @@
 use sha2::{Digest, Sha256};
 
-use crate::types::{
-    ExecutionBindingIdentity, LlmConfig, ModelResolutionIdentity, OpenAiProtocol, UrlMode,
-};
+use crate::types::{ExecutionBindingIdentity, LlmConfig, ModelResolutionIdentity, UrlMode};
 
 fn sha256_hex(input: &str) -> String {
     let mut hasher = Sha256::new();
@@ -61,27 +59,15 @@ pub fn build_model_resolution_identity(
     }
     .to_string();
     let account_fingerprint = fingerprint_secret(model_config.api_key.as_deref());
-    let openai_protocol = if model_config.provider == "openai" {
-        model_config.openai_protocol
-    } else {
-        None
-    };
     let url_mode_str = match model_config.url_mode {
         UrlMode::Full => "full",
         UrlMode::Proxy => "proxy",
         UrlMode::Default => "default",
     };
-    let openai_proto_str = openai_protocol
-        .map(|p| match p {
-            OpenAiProtocol::Responses => "responses",
-            OpenAiProtocol::Chat => "chat",
-        })
-        .unwrap_or("");
     let identity_parts = [
         model_config.provider.as_str(),
         &canonical_base_url,
         url_mode_str,
-        openai_proto_str,
         account_fingerprint.as_deref().unwrap_or(""),
         &resolved,
         &execution_binding.binding_revision.to_string(),
@@ -99,11 +85,9 @@ pub fn build_model_resolution_identity(
         canonical_base_url,
         base_url_fingerprint,
         url_mode: model_config.url_mode,
-        openai_protocol,
         account_fingerprint,
         binding_revision: execution_binding.binding_revision,
         reasoning_effort: model_config.reasoning_effort,
-        enable_thinking: model_config.enable_thinking,
         effective_context_modifiers: ecm,
         model_identity_key,
     }

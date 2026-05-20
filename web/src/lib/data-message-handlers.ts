@@ -386,7 +386,7 @@ export function handleUnifiedData(standard: StandardMessage) {
 
     case 'workspaceSessionCleared':
       batchWebviewStatePersistence(() => {
-        messagesState.sessionHydrating = true;
+        messagesState.sessionHydrating = false;
         const hasPendingLocalTurn = messagesState.pendingRequests.size > 0;
         if (!hasPendingLocalTurn) {
           clearAllMessages({
@@ -773,7 +773,44 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
     : null;
   const canonicalTurns = (message as Record<string, unknown>).canonicalTurns;
 
-  if (!sessionId || !state) {
+  if (!state) {
+    return;
+  }
+  if (!sessionId) {
+    const snapshot = message as ClientBridgeMessage & SessionBootstrapSnapshot;
+    const sessions = ensureArray(snapshot.sessions) as Session[];
+    const hasPendingLocalTurn = messagesState.pendingRequests.size > 0;
+    batchWebviewStatePersistence(() => {
+      messagesState.sessionHydrating = false;
+      if (!hasPendingLocalTurn) {
+        clearAllMessages({
+          persist: false,
+          resetTimelineView: true,
+          resetPanelState: true,
+          skipAntiLiftBack: true,
+        });
+        clearAllRequestBindings();
+        clearPendingInteractions();
+        clearProcessingState({ skipAntiLiftBack: true });
+        clearCanonicalSessionTurns();
+        messagesState.canonicalTimelineProjection = null;
+        setQueuedMessages([]);
+      }
+      updateSessions(sessions);
+      setCurrentSessionId(null);
+      messagesState.currentWorkspaceId = workspaceId || messagesState.currentWorkspaceId;
+      messagesState.currentWorkspacePath = workspacePath;
+      setSessionHistoryState(null, { workspaceId });
+      setAppState({
+        ...state,
+        sessions,
+        currentSession: undefined,
+        currentSessionId: '',
+        isProcessing: false,
+        processingState: null,
+      });
+      setOrchestratorRuntimeState(null);
+    });
     return;
   }
 

@@ -1191,7 +1191,8 @@ pre code {
 
 /* ============================================
    hljs 语法高亮 token 颜色
-   适配 VS Code 暗色/亮色主题
+   - 默认（深色）：VS Code Dark+ 风格高对比
+   - 浅色主题：GitHub Light 风格高对比，避免淡蓝/淡黄在白底上糊掉
    ============================================ */
 .hljs-keyword,
 .hljs-selector-tag,
@@ -1254,12 +1255,117 @@ pre code {
   color: var(--error, #ef4444);
 }
 
-.hljs-emphasis {
+.hljs-emphasis { font-style: italic; }
+.hljs-strong { font-weight: bold; }
+
+/* ---------- 浅色主题覆盖：GitHub Light palette ---------- */
+:root.theme-light .hljs-keyword,
+:root.theme-light .hljs-selector-tag,
+:root.theme-light .hljs-built_in,
+:root.theme-light .hljs-type,
+body.theme-light .hljs-keyword,
+body.theme-light .hljs-selector-tag,
+body.theme-light .hljs-built_in,
+body.theme-light .hljs-type,
+body.vscode-light .hljs-keyword,
+body.vscode-light .hljs-selector-tag,
+body.vscode-light .hljs-built_in,
+body.vscode-light .hljs-type {
+  color: #d73a49;
+}
+
+:root.theme-light .hljs-string,
+:root.theme-light .hljs-template-variable,
+:root.theme-light .hljs-addition,
+body.theme-light .hljs-string,
+body.theme-light .hljs-template-variable,
+body.theme-light .hljs-addition,
+body.vscode-light .hljs-string,
+body.vscode-light .hljs-template-variable,
+body.vscode-light .hljs-addition {
+  color: #032f62;
+}
+
+:root.theme-light .hljs-comment,
+:root.theme-light .hljs-quote,
+body.theme-light .hljs-comment,
+body.theme-light .hljs-quote,
+body.vscode-light .hljs-comment,
+body.vscode-light .hljs-quote {
+  color: #6a737d;
   font-style: italic;
 }
 
-.hljs-strong {
-  font-weight: bold;
+:root.theme-light .hljs-number,
+:root.theme-light .hljs-literal,
+:root.theme-light .hljs-variable.constant_,
+body.theme-light .hljs-number,
+body.theme-light .hljs-literal,
+body.theme-light .hljs-variable.constant_,
+body.vscode-light .hljs-number,
+body.vscode-light .hljs-literal,
+body.vscode-light .hljs-variable.constant_ {
+  color: #005cc5;
+}
+
+:root.theme-light .hljs-title,
+:root.theme-light .hljs-title.class_,
+:root.theme-light .hljs-title.function_,
+body.theme-light .hljs-title,
+body.theme-light .hljs-title.class_,
+body.theme-light .hljs-title.function_,
+body.vscode-light .hljs-title,
+body.vscode-light .hljs-title.class_,
+body.vscode-light .hljs-title.function_ {
+  color: #6f42c1;
+}
+
+:root.theme-light .hljs-attr,
+:root.theme-light .hljs-attribute,
+body.theme-light .hljs-attr,
+body.theme-light .hljs-attribute,
+body.vscode-light .hljs-attr,
+body.vscode-light .hljs-attribute {
+  color: #005cc5;
+}
+
+:root.theme-light .hljs-regexp,
+:root.theme-light .hljs-link,
+body.theme-light .hljs-regexp,
+body.theme-light .hljs-link,
+body.vscode-light .hljs-regexp,
+body.vscode-light .hljs-link {
+  color: #032f62;
+}
+
+:root.theme-light .hljs-meta,
+:root.theme-light .hljs-meta .hljs-keyword,
+body.theme-light .hljs-meta,
+body.theme-light .hljs-meta .hljs-keyword,
+body.vscode-light .hljs-meta,
+body.vscode-light .hljs-meta .hljs-keyword {
+  color: #6f42c1;
+}
+
+:root.theme-light .hljs-tag,
+:root.theme-light .hljs-name,
+:root.theme-light .hljs-selector-class,
+:root.theme-light .hljs-selector-id,
+body.theme-light .hljs-tag,
+body.theme-light .hljs-name,
+body.theme-light .hljs-selector-class,
+body.theme-light .hljs-selector-id,
+body.vscode-light .hljs-tag,
+body.vscode-light .hljs-name,
+body.vscode-light .hljs-selector-class,
+body.vscode-light .hljs-selector-id {
+  color: #22863a;
+}
+
+:root.theme-light .hljs-params,
+body.theme-light .hljs-params,
+body.vscode-light .hljs-params {
+  color: #24292e;
 }
 
 /* Modal 移动端适配 */
