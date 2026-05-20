@@ -184,30 +184,12 @@
     margin: var(--spacing-sm) 0;
     overflow: hidden;
     background: var(--code-bg);
-
-    /* 🔧 头部高度 */
-    --header-height: 36px;
   }
 
-  .code-block::before {
-    content: '';
-    position: absolute;
-    left: 0;
-    top: 0;
-    bottom: 0;
-    width: 3px;
-    background: var(--info);
-    pointer-events: none;
-    transition: background var(--transition-fast);
-  }
-
+  /* header 高度/padding/字号/accent 条/chevron 等共享规范见 styles/tool-card.css；
+     CodeBlock 特有：header 底部有分隔线 + 独立 header 背景色 */
   .code-header {
-    display: flex;
-    align-items: center;
     justify-content: space-between;
-    height: var(--header-height);
-    /* 让出 3px 给 ::before accent 条，保持与 tool-card 一致 */
-    padding: 0 var(--spacing-sm) 0 calc(var(--spacing-sm) + 3px);
     background: var(--code-header-bg);
     border-bottom: 1px solid var(--code-border);
     user-select: none;
@@ -216,7 +198,7 @@
   .header-left {
     display: flex;
     align-items: center;
-    gap: var(--spacing-sm);
+    gap: var(--space-3);
     flex: 1;
     height: 100%;
     background: transparent;
@@ -229,29 +211,6 @@
     outline: none;
   }
 
-  .header-left:hover .chevron {
-    color: var(--foreground);
-  }
-
-  /* 折叠图标 */
-  .chevron {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    width: 16px;
-    height: 16px;
-    transition: transform var(--transition-fast);
-    color: var(--foreground-muted);
-  }
-
-  .code-block.collapsed .chevron {
-    transform: rotate(0deg);
-  }
-
-  .code-block:not(.collapsed) .chevron {
-    transform: rotate(90deg);
-  }
-
   .code-icon {
     display: flex;
     align-items: center;
@@ -262,18 +221,14 @@
     display: flex;
     align-items: center;
     gap: 8px;
-    font-size: var(--font-size-xs);
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
   }
 
-  /* 与 tool-card 的 .tool-name 对齐：中性 foreground + 500 字重，不再用 --primary 抢戏；
-     uppercase 保留作为代码语言标签的语义区分 */
+  /* lang-name 字号字重与 .tool-name 共享见 styles/tool-card.css；
+     仅保留 uppercase 作为代码语言标签的语义区分 */
   .lang-name {
-    font-weight: 500;
-    font-size: var(--text-sm, 13px);
-    color: var(--foreground);
     text-transform: uppercase;
     letter-spacing: 0.04em;
   }
@@ -281,6 +236,7 @@
   .filepath {
     opacity: 0.6;
     font-family: var(--font-mono);
+    font-size: var(--text-xs);
   }
 
   .streaming-badge {
