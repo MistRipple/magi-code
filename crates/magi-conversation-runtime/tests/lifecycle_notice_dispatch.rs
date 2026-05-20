@@ -85,8 +85,8 @@ async fn resumed_event_injects_then_drains_then_plan_step_overrides() {
     let first_prompt =
         dispatcher_prompt_composition(&registry, &mid, "执行任务:推进 Mission M-codex-bridge");
     assert!(
-        first_prompt.contains("--- 生命周期通知 ---"),
-        "首轮 prompt 应包含生命周期通知段,实际:\n{first_prompt}"
+        first_prompt.contains("<system-reminder>"),
+        "首轮 prompt 应包含 system-reminder 包裹的生命周期通知,实际:\n{first_prompt}"
     );
     assert!(
         first_prompt.contains("ckpt-7"),
@@ -105,8 +105,8 @@ async fn resumed_event_injects_then_drains_then_plan_step_overrides() {
         "第二轮 prompt 不应再次注入 mission_resumed(已 drain),实际:\n{second_prompt}"
     );
     assert!(
-        !second_prompt.contains("--- 生命周期通知 ---"),
-        "第二轮 prompt 全 slot 空,不应出现生命周期通知段,实际:\n{second_prompt}"
+        !second_prompt.contains("<system-reminder>"),
+        "第二轮 prompt 全 slot 空,不应出现 system-reminder 块,实际:\n{second_prompt}"
     );
 
     // 4) 发两次 `mission.plan_step.completed`,后者覆盖前者。
@@ -134,8 +134,8 @@ async fn resumed_event_injects_then_drains_then_plan_step_overrides() {
     let third_prompt =
         dispatcher_prompt_composition(&registry, &mid, "执行任务:推进 Mission M-codex-bridge");
     assert!(
-        third_prompt.contains("--- 生命周期通知 ---"),
-        "plan_step 通知应触发生命周期段,实际:\n{third_prompt}"
+        third_prompt.contains("<system-reminder>"),
+        "plan_step 通知应触发 system-reminder 包裹,实际:\n{third_prompt}"
     );
     assert!(
         third_prompt.contains("s2") && third_prompt.contains("落地核心逻辑"),
@@ -153,8 +153,8 @@ async fn resumed_event_injects_then_drains_then_plan_step_overrides() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn registry_without_events_yields_no_lifecycle_section() {
-    // 守护:registry 全空时,dispatcher 装配的 prompt 不应出现生命周期段。
-    // 防御性回归:防止后续把"--- 生命周期通知 ---"误嵌成静态前缀。
+    // 守护:registry 全空时,dispatcher 装配的 prompt 不应出现 system-reminder 块。
+    // 防御性回归:防止后续把 system-reminder 误嵌成静态前缀。
     let bus = Arc::new(InMemoryEventBus::new(8));
     let registry = Arc::new(LifecycleNoticeRegistry::new());
     let subscriber_handle = tokio::spawn(run_subscriber(registry.clone(), bus.clone()));

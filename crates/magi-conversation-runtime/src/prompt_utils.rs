@@ -1,16 +1,23 @@
 use magi_bridge_client::assignment_dispatch::{strip_dispatch_preview_text, strip_dispatch_text};
 
+use crate::prompt_reminder::wrap_in_system_reminder;
+
 /// 17 段 system prompt 装配中，文本级小节之间的固定分隔串。
 ///
-/// 用于 [`prepend_session_instructions`] 把 user_rules / safeguard / lifecycle
-/// 等小节用空行隔开拼到同一条 system message 里。消息级（按 `ChatMessage`
-/// 切分）的分段不使用此常量。
+/// 用于 [`prepend_session_instructions`] 把 user_rules / safeguard / 临时
+/// reminder 等小节用空行隔开拼到同一条 system message 里。消息级（按
+/// `ChatMessage` 切分）的分段不使用此常量。
 pub const SEGMENT_SEP: &str = "\n\n";
 
-/// 段头模板：`--- <title> ---`。统一所有 inline 小节标题，方便检索与调整文案。
+/// 段头模板：`--- <title> ---`。
+///
+/// 仅适用于"长期不变、应当参与缓存"的小节（用户规则 / 安全防护）。临时
+/// 通知（生命周期、子代理回执等）不再走段头形态，统一改用
+/// `<system-reminder>` 包装（见 [`crate::prompt_reminder`]）——让模型把
+/// 长期规则与一次性提醒在语义上分离，也为 Phase 3.2 缓存边界重排留出
+/// 物理区隔。
 pub const SEGMENT_HEADER_USER_RULES: &str = "--- 用户规则 ---";
 pub const SEGMENT_HEADER_SAFEGUARD: &str = "--- 安全防护 ---";
-pub const SEGMENT_HEADER_LIFECYCLE: &str = "--- 生命周期通知 ---";
 
 pub fn prepend_session_instructions(
     user_rules: Option<&str>,
@@ -32,7 +39,9 @@ pub fn prepend_session_instructions(
         .map(str::trim)
         .filter(|notice| !notice.is_empty())
     {
-        sections.push(format!("{SEGMENT_HEADER_LIFECYCLE}\n{notice}"));
+        // 生命周期通知按 `<system-reminder>` 风格注入：标记其为一次性补充
+        // 上下文，与上面长期规则的段头形态显式区分。
+        sections.push(wrap_in_system_reminder(notice));
     }
     if sections.is_empty() {
         return prompt.to_string();
@@ -104,18 +113,21 @@ mod tests {
 
         let user_pos = prompt.find("--- 用户规则 ---").expect("用户规则段存在");
         let safe_pos = prompt.find("--- 安全防护 ---").expect("安全段存在");
-        let life_pos = prompt
-            .find("--- 生命周期通知 ---")
-            .expect("生命周期通知段存在");
+        // 生命周期通知改用 <system-reminder> 包装而非段头，与长期规则在语义上区分
+        let reminder_pos = prompt
+            .find("<system-reminder>")
+            .expect("生命周期通知应被 system-reminder 包裹");
         assert!(user_pos < safe_pos);
-        assert!(safe_pos < life_pos);
+        assert!(safe_pos < reminder_pos);
+        assert!(prompt.contains("Mission M-1 已恢复"));
+        assert!(prompt.contains("</system-reminder>"));
         assert!(prompt.ends_with("执行任务"));
     }
 
     #[test]
     fn prepend_session_instructions_ignores_empty_lifecycle_notice() {
         let prompt = prepend_session_instructions(Some("u"), None, Some("   "), "执行任务");
-        assert!(!prompt.contains("--- 生命周期通知 ---"));
+        assert!(!prompt.contains("<system-reminder>"));
     }
 
     #[test]

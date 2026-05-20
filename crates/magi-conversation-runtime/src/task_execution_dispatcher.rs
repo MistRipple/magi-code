@@ -117,8 +117,8 @@ pub struct LlmTaskDispatcher {
     force_sync_dispatch: Arc<std::sync::atomic::AtomicUsize>,
     /// codex goal 桥：mission 生命周期通知（recovery / 人审 resolve / plan step
     /// 完成）按 mission 维度排队，dispatcher 在装配 prompt 时 `pending_notice`
-    /// 拉一段，注入"--- 生命周期通知 ---"段。可选——daemon bootstrap
-    /// 没接线时为 None，行为退回到不注入。
+    /// 拉一段，由 `prepend_session_instructions` 用 `<system-reminder>` 包装注入。
+    /// 可选——daemon bootstrap 没接线时为 None，行为退回到不注入。
     lifecycle_notices: Option<Arc<LifecycleNoticeRegistry>>,
     /// codex goal 桥：mission 维度记账 registry。dispatch 时按 workspace 拿对应
     /// store，conversation_loop 中每轮 LLM 调用后调用一次 `record_mission_turn`

@@ -8,7 +8,8 @@ expression: prompt
 --- 安全防护 ---
 禁止执行破坏性命令
 
---- 生命周期通知 ---
+<system-reminder>
 Mission M-1 已恢复
+</system-reminder>
 
 执行当前任务

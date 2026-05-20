@@ -333,7 +333,7 @@ fn run_conversation_loop_inner(
     //   S4: task_fact_context（task 已知事实，由 task_execution_dispatcher 抽取）
     //   S5: skill prompt injections（apply_skill_prompt_injections）
     //   S6: 用户规则（settings.userRules）
-    //   S7: 生命周期通知（mission resume notice 等）
+    //   S7: 生命周期通知（mission resume notice 等，统一裹 `<system-reminder>` 标签）
     //   S8: SafetyGate 派生的危险模式列表（resolve_safeguard_prompt）
     // 这 8 段已经在 `system_prompt` 文本里串好；下方按消息级独立 push 的为 S9-S17 + 运行时锚点。
     if let Some(system) = system_prompt {

@@ -14,6 +14,7 @@ mod driver;
 pub mod execution_chain_recovery;
 mod mailbox;
 pub mod model_config;
+pub mod prompt_reminder;
 pub mod prompt_utils;
 mod registry;
 pub mod session_thread;
