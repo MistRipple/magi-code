@@ -1,0 +1,8 @@
+---
+source: crates/magi-conversation-runtime/tests/prompt_layout_snapshots.rs
+expression: prompt
+---
+--- 生命周期通知 ---
+Mission M-1 已恢复
+
+执行当前任务

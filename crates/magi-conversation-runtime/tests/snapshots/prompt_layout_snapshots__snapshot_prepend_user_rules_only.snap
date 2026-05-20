@@ -1,0 +1,8 @@
+---
+source: crates/magi-conversation-runtime/tests/prompt_layout_snapshots.rs
+expression: prompt
+---
+--- 用户规则 ---
+保持中文回复
+
+执行当前任务

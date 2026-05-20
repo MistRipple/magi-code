@@ -1,0 +1,8 @@
+---
+source: crates/magi-conversation-runtime/tests/prompt_layout_snapshots.rs
+expression: prompt
+---
+--- 安全防护 ---
+禁止读取 .env 文件
+
+执行当前任务

@@ -1,0 +1,19 @@
+---
+source: crates/magi-bridge-client/tests/round_policy_snapshots.rs
+expression: prompt
+---
+[System] 当前执行进入失败终态。请输出结构化失败结论。
+- 必需任务: 4
+- 已终态必需任务: 3
+- 失败必需任务: 2
+- 要求：说明失败根因、已完成部分、未完成部分、下一步修复建议。
+输出末尾必须追加控制块：
+[[EXECUTION_OUTCOME]]
+{"status":"running|completed|failed","next_steps":["..."]}
+[[/EXECUTION_OUTCOME]]
+- 本轮禁止省略上述控制块；失败后若仍需继续修复，请使用 status=failed 并写出 next_steps。
+
+- 示例 ✅: "失败根因：上游 API 协议变更导致 token 校验失败；已完成：身份证读取；未完成：登录流；修复建议：升级 sdk 到 v2.1" + status=failed, next_steps=["升级 sdk", "补回归测试"]
+- 示例 ❌: 只说"失败了，请重试" — 缺少根因与修复建议
+- 示例 ❌: status=completed — 失败终态禁止用 completed
+- 示例 ❌: 在失败结论里又派发新任务 JSON — 失败收尾轮也禁止派发，请只写 next_steps
