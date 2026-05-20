@@ -9,6 +9,14 @@ use crate::llm_types::{
 pub struct SseLineParser {
     buffer: String,
     current_event_type: Option<String>,
+    /// 已收到的 `data:` 行，等待空行 terminator 触发提交。
+    ///
+    /// 必须是结构体字段而非 `feed()` 局部变量——上游 chunked transfer
+    /// 经常把 `event: foo\n` / `data: bar\n` / `\n` 拆成多个 HTTP chunk，
+    /// reqwest 解码后每次 `read()` 可能只返回一条 `data:` 行（不带 terminator）。
+    /// 若 data_lines 局部化，跨 `feed()` 调用就会被丢弃，所有 text_delta
+    /// 都会被静默吞掉，最终 final_content 为空。
+    pending_data_lines: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -25,7 +33,6 @@ impl SseLineParser {
     pub fn feed(&mut self, chunk: &str) -> Vec<SseEvent> {
         self.buffer.push_str(chunk);
         let mut events = Vec::new();
-        let mut data_lines: Vec<String> = Vec::new();
 
         while let Some(newline_pos) = self.buffer.find('\n') {
             let line = self.buffer[..newline_pos]
@@ -34,12 +41,12 @@ impl SseLineParser {
             self.buffer = self.buffer[newline_pos + 1..].to_string();
 
             if line.is_empty() {
-                if !data_lines.is_empty() {
+                if !self.pending_data_lines.is_empty() {
                     events.push(SseEvent {
                         event_type: self.current_event_type.take(),
-                        data: data_lines.join("\n"),
+                        data: self.pending_data_lines.join("\n"),
                     });
-                    data_lines.clear();
+                    self.pending_data_lines.clear();
                 }
                 continue;
             }
@@ -48,7 +55,7 @@ impl SseLineParser {
                 .strip_prefix("data: ")
                 .or_else(|| line.strip_prefix("data:"))
             {
-                data_lines.push(value.to_string());
+                self.pending_data_lines.push(value.to_string());
             } else if let Some(value) = line
                 .strip_prefix("event: ")
                 .or_else(|| line.strip_prefix("event:"))
@@ -519,6 +526,32 @@ mod tests {
         let e2 = parser.feed(":1}\n\n");
         assert_eq!(e2.len(), 1);
         assert_eq!(e2[0].data, "{\"part\":1}");
+    }
+
+    /// 回归测试：上游 chunked transfer 经常把 `event: foo\n` / `data: bar\n` / `\n`
+    /// 拆成多个 HTTP chunk，reqwest 解码后每次 `read()` 可能恰好按行返回。
+    /// 历史上 `data_lines` 是 `feed()` 局部变量，会跨调用丢失，导致所有 text_delta
+    /// 被静默吞掉，final_content 为空。本测试锁定字段化行为不再回退。
+    #[test]
+    fn sse_parser_preserves_pending_data_across_feeds_when_terminator_arrives_later() {
+        let mut parser = SseLineParser::new();
+
+        // chunk 1 只含 event 行（无 \n\n terminator）
+        let e1 = parser.feed("event: content_block_delta\n");
+        assert!(e1.is_empty());
+
+        // chunk 2 只含 data 行（仍无 terminator）
+        let e2 = parser.feed("data: {\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}\n");
+        assert!(e2.is_empty());
+
+        // chunk 3 才送来空行 terminator —— 此时必须能拼出完整事件
+        let e3 = parser.feed("\n");
+        assert_eq!(e3.len(), 1, "terminator 单独到达时事件应当被发出");
+        assert_eq!(e3[0].event_type.as_deref(), Some("content_block_delta"));
+        assert_eq!(
+            e3[0].data,
+            "{\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}"
+        );
     }
 
     #[test]
