@@ -1,21 +1,70 @@
 /* ============================================
-   工具卡片共享视觉规范
+   格式卡片 header 共享视觉规范（single source of truth）
    ----------------------------------------------
-   覆盖 ToolCall / TerminalSessionCard / FileChangeCard 三种共用 .tool-call
-   类名的组件。Svelte 的 scoped CSS 隔离每个组件的私有样式，但状态色条、
-   chevron 弱化等纯视觉规范属于跨组件统一接口，必须落在全局样式中。
+   覆盖以下使用同一 header 设计语言的组件：
+     - ToolCall.svelte       (.tool-header / .file-mutation-header)
+     - TerminalSessionCard   (.tool-header)
+     - FileChangeCard        (.tool-header)
+     - CodeBlock             (.code-header)
+     - ThinkingBlock         (.thinking-header)
+     - PlanCard              (.plan-header)
+
+   Svelte scoped CSS 隔离每个组件的私有样式，跨组件统一的尺寸/字体/padding/
+   chevron 等"接口级"规范必须落在全局样式中，组件内不允许重复定义同名属性，
+   避免漂移。背景色（surface）是唯一允许各组件保留差异化的点。
    ============================================ */
 
-/* 左侧 3px 状态色条
-   accent 条仅出现在 header 行，header 自身承担位置定位（已留出 padding-left）
-   状态信息与 header 元数据同源，不延伸到 content 区，避免视觉抢戏 */
+/* ---------- 1. header 容器尺寸/布局 ---------- */
 .tool-header,
-.file-mutation-header {
+.file-mutation-header,
+.code-header,
+.thinking-header,
+.plan-header {
   position: relative;
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  width: 100%;
+  min-height: 36px;
+  /* padding-left 让出 3px 给 ::before accent 条 */
+  padding: var(--space-2) var(--space-4) var(--space-2) calc(var(--space-4) + 3px);
+  background: transparent;
+  border: none;
+  text-align: left;
+  cursor: pointer;
+  transition: background var(--transition-fast);
+  box-sizing: border-box;
 }
 
+.tool-header:hover,
+.code-header:hover,
+.thinking-header:hover,
+.plan-header:hover {
+  background: var(--surface-hover);
+}
+
+/* file-mutation-header 默认无 hover（不可展开），但需要保持等高 */
+.file-mutation-header {
+  cursor: default;
+}
+
+/* ---------- 2. header 标题字体规范 ---------- */
+.tool-name,
+.lang-name,
+.thinking-title,
+.plan-title {
+  font-weight: 500;
+  font-size: var(--text-sm);
+  color: var(--foreground);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+/* ---------- 3. accent 条（::before 3px 状态色） ---------- */
 .tool-header::before,
-.file-mutation-header::before {
+.file-mutation-header::before,
+.code-header::before,
+.thinking-header::before {
   content: '';
   position: absolute;
   left: 0;
@@ -27,40 +76,68 @@
   transition: background var(--transition-fast);
 }
 
-/* 按状态切换 accent 色——data-status 与 statusInfo.class 同源（pending/running/success/error） */
+/* 3.1 工具卡：data-status 驱动 */
 .tool-call[data-status='pending'] .tool-header::before,
-.tool-call[data-status='pending'] .file-mutation-header::before {
-  background: var(--warning);
-}
+.tool-call[data-status='pending'] .file-mutation-header::before { background: var(--warning); }
 
 .tool-call[data-status='running'] .tool-header::before,
-.tool-call[data-status='running'] .file-mutation-header::before {
+.tool-call[data-status='running'] .file-mutation-header::before { background: var(--info); }
+
+.tool-call[data-status='success'] .tool-header::before,
+.tool-call[data-status='success'] .file-mutation-header::before { background: var(--success); }
+
+.tool-call[data-status='error'] .tool-header::before,
+.tool-call[data-status='error'] .file-mutation-header::before { background: var(--error); }
+
+/* 3.2 代码卡：固定 info 蓝 */
+.code-block .code-header::before {
   background: var(--info);
 }
 
-.tool-call[data-status='success'] .tool-header::before,
-.tool-call[data-status='success'] .file-mutation-header::before {
-  background: var(--success);
+/* 3.3 思考卡：紫色 brand */
+.thinking-block .thinking-header::before {
+  background: #a855f7;
 }
 
-.tool-call[data-status='error'] .tool-header::before,
-.tool-call[data-status='error'] .file-mutation-header::before {
-  background: var(--error);
-}
-
-/* file-mutation 紧凑模式（FileMutationBlock）无边框无背景，不渲染 accent 条 */
+/* 3.4 file-mutation 紧凑模式：无 accent 条 */
 .tool-call.file-mutation .file-mutation-header::before {
   display: none;
 }
 
-/* chevron 弱化：默认半透明，hover header 或展开态恢复满 opacity
-   accent 条已承担状态高亮，chevron 是次要可供性，不再喧宾夺主 */
-.tool-call .chevron {
+/* PlanCard 的 accent 条在 .plan-card::before（整卡左侧条），不在 header；
+   .plan-header 不渲染 ::before，由 PlanCard.svelte 内部处理 */
+.plan-card .plan-header::before {
+  display: none;
+}
+
+/* ---------- 4. chevron 弱化 ---------- */
+.tool-call .chevron,
+.code-block .chevron,
+.thinking-block .chevron,
+.plan-card .chevron {
+  display: flex;
+  color: var(--foreground-muted);
   opacity: 0.5;
   transition: transform var(--transition-fast), opacity var(--transition-fast);
 }
 
 .tool-call .tool-header:hover .chevron,
-.tool-call:not(.collapsed) .chevron {
+.tool-call:not(.collapsed) .chevron,
+.code-block .code-header:hover .chevron,
+.code-block:not(.collapsed) .chevron,
+.thinking-block .thinking-header:hover .chevron,
+.thinking-block:not(.collapsed) .chevron {
   opacity: 1;
+}
+
+.tool-call.collapsed .chevron,
+.code-block.collapsed .chevron,
+.thinking-block.collapsed .chevron {
+  transform: rotate(0deg);
+}
+
+.tool-call:not(.collapsed) .chevron,
+.code-block:not(.collapsed) .chevron,
+.thinking-block:not(.collapsed) .chevron {
+  transform: rotate(90deg);
 }
