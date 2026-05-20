@@ -6,13 +6,13 @@
 
   // Props
   interface Props {
-    thinking: Array<string | { content: string }>;
+    content: string;
     isStreaming?: boolean;
     initialExpanded?: boolean;
   }
 
   let {
-    thinking,
+    content,
     isStreaming = false,
     initialExpanded
   }: Props = $props();
@@ -20,13 +20,7 @@
   // 折叠状态只由初始配置决定；流式输出期间也允许用户手动展开/折叠
   let collapsed = $state(untrack(() => !(initialExpanded ?? false)));
 
-  // 提取思考内容
-  const thinkingContent = $derived(
-    thinking
-      .map(t => typeof t === 'string' ? t : t.content)
-      .join('\n\n')
-      .trim()
-  );
+  const thinkingContent = $derived((content ?? '').trim());
 
   // 单一标题文案：流式时显示「思考中...」，完成后显示「思考已完成」。
   // 之前并存「固定标题 + 内容摘要」两层，信息冗余且摘要在长思考输出里读起来割裂，
@@ -57,8 +51,6 @@
     </span>
 
     <span class="thinking-title">{title}</span>
-
-    <span class="thinking-badge">{i18n.t('thinkingBlock.badge', { count: thinking.length })}</span>
   </button>
 
   {#if !collapsed}
@@ -103,16 +95,6 @@
     text-overflow: ellipsis;
   }
 
-  .thinking-badge {
-    font-size: var(--text-xs);
-    padding: 2px 8px;
-    background: rgba(139, 92, 246, 0.2);
-    color: #a78bfa;
-    border-radius: var(--radius-full);
-    white-space: nowrap;
-    font-weight: 500;
-  }
-
   .thinking-content {
     padding: var(--space-3);
     border-top: 1px solid var(--border);
@@ -135,17 +117,8 @@
   }
 
   /* 流式动画 */
-  .streaming .thinking-badge {
-    animation: pulse 1.5s ease-in-out infinite;
-  }
-
   .streaming .thinking-icon {
     animation: spin 2s linear infinite;
-  }
-
-  @keyframes pulse {
-    0%, 100% { opacity: 1; }
-    50% { opacity: 0.5; }
   }
 
   @keyframes spin {

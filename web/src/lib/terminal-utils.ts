@@ -1,10 +1,9 @@
 import type { TerminalOperation } from '../types/message';
 
 /** 需要渲染为终端会话卡片的工具集合 */
-export const TERMINAL_TOOLS = new Set(['shell']);
+export const TERMINAL_TOOLS = new Set<string>(['shell_exec']);
 const TERMINAL_TOOL_ALIASES: Record<string, TerminalOperation> = {
-  shell: 'shell',
-  shell_exec: 'shell',
+  shell_exec: 'shell_exec',
 };
 
 export interface LeadingJsonMatch {
@@ -67,12 +66,8 @@ function extractLeadingJsonFromOffset(text: string, startIndex: number): Leading
 
 export function normalizeTerminalToolName(name?: string): string {
   const normalized = name?.trim();
-  if (!normalized) return 'shell';
+  if (!normalized) return 'shell_exec';
   return TERMINAL_TOOL_ALIASES[normalized] ?? normalized;
-}
-
-export function getTerminalToolDisplayName(name?: string): string {
-  return normalizeTerminalToolName(name);
 }
 
 export function normalizeTerminalOperation(name: string): TerminalOperation | null {

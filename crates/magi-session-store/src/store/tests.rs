@@ -957,7 +957,7 @@ fn upsert_current_turn_item_rejects_canonical_immutable_field_conflict() {
     conflicting_item.kind = "tool_call_started".to_string();
     conflicting_item.status = "running".to_string();
     conflicting_item.tool_call_id = Some("tool-conflict".to_string());
-    conflicting_item.tool_name = Some("shell".to_string());
+    conflicting_item.tool_name = Some("shell_exec".to_string());
     let result = store.upsert_current_turn_item(&session_id, conflicting_item);
 
     assert!(matches!(

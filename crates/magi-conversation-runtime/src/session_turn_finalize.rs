@@ -221,7 +221,6 @@ pub fn completion_summary_rank(task: &Task) -> u8 {
     match task.kind {
         TaskKind::LocalAgent => 5,
         TaskKind::LocalWorkflow => 4,
-        TaskKind::LocalBash => 3,
         TaskKind::RemoteAgent => 2,
         TaskKind::MonitorMcp | TaskKind::InProcessTeammate => 1,
         TaskKind::Dream => 0,

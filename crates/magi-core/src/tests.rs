@@ -54,7 +54,6 @@ use crate::{LeaseId, MissionId, TaskId, UtcMillis};
 fn task_kind_serialization_roundtrip() {
     let kinds = vec![
         TaskKind::LocalAgent,
-        TaskKind::LocalBash,
         TaskKind::LocalWorkflow,
         TaskKind::RemoteAgent,
         TaskKind::MonitorMcp,
@@ -148,15 +147,7 @@ fn task_serialization_roundtrip() {
 }
 
 #[test]
-fn task_runtime_payload_local_bash_serialization_roundtrip() {
-    let payload = TaskRuntimePayload::LocalBash {
-        command: "echo hi".to_string(),
-        working_dir: Some("/tmp".to_string()),
-    };
-    let json = serde_json::to_string(&payload).expect("序列化失败");
-    let parsed: TaskRuntimePayload = serde_json::from_str(&json).expect("反序列化失败");
-    assert!(matches!(parsed, TaskRuntimePayload::LocalBash { .. }));
-
+fn task_runtime_payload_none_serialization_roundtrip() {
     let none_payload = "{\"kind\":\"none\"}";
     let parsed_none: TaskRuntimePayload = serde_json::from_str(none_payload).expect("反序列化失败");
     assert!(matches!(parsed_none, TaskRuntimePayload::None));

@@ -822,7 +822,6 @@ fn public_builtin_tool_reference_aliases() -> Vec<(&'static str, &'static str)> 
         ("file_insert", "file_patch"),
         ("code_search_regex", "search_text"),
         ("code_search_semantic", "search_semantic"),
-        ("shell", "shell_exec"),
         ("project_knowledge_query", "knowledge_query"),
     ]);
     aliases
@@ -936,46 +935,6 @@ fn build_user_message_turn_item(
     )
 }
 
-fn build_assistant_placeholder_turn_item(
-    accepted_at: UtcMillis,
-    placeholder_message_id: Option<String>,
-    request_id: Option<String>,
-    user_message_id: Option<String>,
-    source_thread_id: magi_core::ThreadId,
-) -> (String, ActiveExecutionTurnItem) {
-    let placeholder_item_id = placeholder_message_id
-        .unwrap_or_else(|| format!("turn-item-assistant-stream-{}-0", accepted_at.0));
-    (
-        placeholder_item_id.clone(),
-        ActiveExecutionTurnItem {
-            item_id: placeholder_item_id.clone(),
-            item_seq: 2,
-            lane_id: None,
-            lane_seq: None,
-            kind: "assistant_stream".to_string(),
-            status: "running".to_string(),
-            source: "orchestrator".to_string(),
-            title: Some("生成回复".to_string()),
-            content: None,
-            task_id: None,
-            worker_id: None,
-            role_id: None,
-            tool_call_id: None,
-            tool_name: None,
-            tool_status: None,
-            tool_arguments: None,
-            tool_result: None,
-            tool_error: None,
-            request_id,
-            user_message_id,
-            placeholder_message_id: Some(placeholder_item_id.clone()),
-            timeline_entry_id: None,
-            // P7：assistant_stream 占位项由 orchestrator 生成，归属主线。
-            source_thread_id,
-        },
-    )
-}
-
 fn submit_regular_session_turn(
     state: ApiState,
     request: SessionTurnRequestDto,
@@ -1015,14 +974,15 @@ fn submit_regular_session_turn(
             .ensure_session_mission(&session_id, accepted_at, || {
                 magi_core::MissionId::new(format!("mission-session-chat-{}", accepted_at.0))
             });
-    let (assistant_placeholder_item_id, assistant_placeholder_item) =
-        build_assistant_placeholder_turn_item(
-            accepted_at,
-            requested_placeholder_message_id,
-            request_id.clone(),
-            user_message_id.clone(),
-            orchestrator_thread_id.clone(),
-        );
+    // P7：placeholder_message_id 不再作为 turn item 在 accept 阶段预占 item_seq。
+    // 历史方案曾把 assistant_stream placeholder 以 item_seq=2 写入 turn.items，
+    // 这样首轮 thinking 走 max(item_seq)+1 后存储顺序变成 text(2) → thinking(3)，
+    // 与 Anthropic 协议输出顺序（thinking → text）倒挂，迫使前端 projection 层做
+    // peer-matching 补丁。现在只把 id 字符串传给 runtime：首个 text delta upsert
+    // 时自然走 max+1，存储顺序天然匹配协议顺序，projection 层也不再需要补偿逻辑。
+    let assistant_placeholder_item_id = requested_placeholder_message_id
+        .clone()
+        .unwrap_or_else(|| format!("turn-item-assistant-stream-{}-0", accepted_at.0));
     let placeholder_message_id = Some(assistant_placeholder_item_id.clone());
     // 使用前端传入的 userMessageId 作为 canonical item_id，确保前端乐观节点与后端流式更新使用同一 ID
     let (user_message_item_id, user_message_item) = build_user_message_turn_item(
@@ -1043,7 +1003,7 @@ fn submit_regular_session_turn(
         status: "running".to_string(),
         completed_at: None,
         user_message: Some(message.clone()),
-        items: vec![user_message_item, assistant_placeholder_item],
+        items: vec![user_message_item],
         worker_lanes: Vec::new(),
     };
     turn.normalize();
@@ -2557,11 +2517,11 @@ mod tests {
 
     #[test]
     fn normalizes_public_builtin_alias_to_canonical_tool() {
-        let request = session_turn_request("请调用 shell 工具执行 printf ok");
+        let request = session_turn_request("请调用 file_view 工具查看 /tmp/a.txt");
         let decision = normalize_session_turn_decision(classifier_chat_decision(), &request);
 
         assert!(matches!(decision.route, SessionTurnRouteDto::Execute));
-        assert_eq!(decision.forced_tool_name.as_deref(), Some("shell_exec"));
+        assert_eq!(decision.forced_tool_name.as_deref(), Some("file_read"));
     }
 
     #[test]
@@ -2686,8 +2646,16 @@ mod tests {
         );
     }
 
+    /// §P7：accept 阶段不再为 assistant 预占 turn item，避免 thinking → text
+    /// 在 Anthropic 协议顺序下被错误抢到更小的 `item_seq`，导致 presentationSeq
+    /// 与协议顺序倒挂、流式计时器跳到消息上方。
+    ///
+    /// 新契约：
+    /// - canonical_turn.items 在 accept 时只包含 user_message（不再预先 push 占位）
+    /// - placeholder_message_id 仍透传给下游（用于首帧 upsert 时复用 item_id）
+    /// - canonical_item 此时为空，前端 normalize 兼容
     #[tokio::test]
-    async fn regular_session_turn_accepts_with_canonical_running_assistant_placeholder() {
+    async fn regular_session_turn_accept_does_not_pre_reserve_assistant_placeholder_item() {
         let state = test_state();
         let accepted_at = UtcMillis(1777000000000);
         let response = submit_regular_session_turn(
@@ -2741,24 +2709,14 @@ mod tests {
         let items = accepted_event.payload["canonical_turn"]["items"]
             .as_array()
             .expect("canonical turn items should be present");
-        assert_eq!(items.len(), 2);
+        // accept 阶段 turn 内只有 user_message；assistant item 由首帧 upsert 创建。
+        assert_eq!(items.len(), 1, "accept 阶段不应预占 assistant item");
         assert_eq!(items[0]["itemId"], "user-canonical-first-frame");
         assert_eq!(items[0]["kind"], "user_message");
-        assert_eq!(items[1]["itemId"], "assistant-canonical-first-frame");
-        assert_eq!(items[1]["kind"], "assistant_text");
-        assert_eq!(items[1]["status"], "running");
-        assert_eq!(items[1]["visibility"]["renderable"], true);
-        assert_eq!(
-            items[1]["metadata"]["requestId"],
-            "request-canonical-first-frame"
-        );
-        assert_eq!(
-            items[1]["metadata"]["placeholderMessageId"],
-            "assistant-canonical-first-frame"
-        );
-        assert_eq!(
-            accepted_event.payload["canonical_item"]["itemId"],
-            "assistant-canonical-first-frame"
+        // canonical_item 此时找不到（item 尚未创建），载荷为 null。
+        assert!(
+            accepted_event.payload["canonical_item"].is_null(),
+            "canonical_item 在 accept 阶段应为空，等待首帧创建"
         );
     }
 
@@ -2902,7 +2860,11 @@ mod tests {
             )
             .expect("session should create");
         // bootstrap 现在按"会话是否有用户消息"过滤——给每个测试会话补一条用户消息让它可见
-        for id in [&deleted_session_id, &sibling_session_id, &foreign_session_id] {
+        for id in [
+            &deleted_session_id,
+            &sibling_session_id,
+            &foreign_session_id,
+        ] {
             state.session_store.append_timeline_entry(
                 id.clone(),
                 TimelineEntryKind::UserMessage,

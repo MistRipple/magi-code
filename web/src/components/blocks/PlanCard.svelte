@@ -13,7 +13,7 @@
 </script>
 
 {#if plan}
-  <div class="plan-card" data-status={plan.riskLevel ?? 'default'}>
+  <div class="plan-card">
     <div class="plan-header">
       <span class="plan-title">
         <Icon name="note" size={14} />
@@ -85,57 +85,33 @@
 {/if}
 
 <style>
-  /* 与 tool-card 风格统一：左 3px 状态色条 + 中性卡身
-     accent 色由 riskLevel 驱动（low=success / medium=warning / high=error），
-     无 riskLevel 时降级为 info（informational 默认态） */
+  /* 中性卡身，无左侧 accent 条；padding 由 plan-header（全局 SSoT）和 plan-body 各自管理 */
   .plan-card {
-    position: relative;
     background: var(--surface-1);
     border: 1px solid var(--border);
     border-radius: var(--radius-md);
-    /* padding-left 让出 3px 给 ::before accent 条 */
-    padding: var(--space-4) var(--space-4) var(--space-4) calc(var(--space-4) + 3px);
     margin: var(--space-2) 0;
   }
 
-  .plan-card::before {
-    content: '';
-    position: absolute;
-    left: 0;
-    top: 0;
-    bottom: 0;
-    width: 3px;
-    background: var(--info);
-    pointer-events: none;
-    transition: background var(--transition-fast);
-  }
-
-  .plan-card[data-status='low']::before { background: var(--success); }
-  .plan-card[data-status='medium']::before { background: var(--warning); }
-  .plan-card[data-status='high']::before { background: var(--error); }
-
-  .plan-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    margin-bottom: var(--space-3);
-  }
+  /* plan-header 的 display/align/gap/padding/min-height/font 由全局 SSoT
+     (styles/tool-card.css) 提供，组件层不再重复声明，确保与其他卡片 header 一致 */
 
   .plan-title {
     display: flex;
     align-items: center;
     gap: var(--space-2);
-    font-weight: 600;
-    color: var(--foreground);
   }
 
   .toggle-btn {
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    width: 26px;
-    height: 26px;
-    border-radius: 6px;
+    /* 22×22 icon-only 按钮：14px icon + 4px×2 padding；
+       配合 header min-height: 36px（来自全局 SSoT），不会撑大 header 高度 */
+    width: 22px;
+    height: 22px;
+    padding: 0;
+    border-radius: 4px;
     border: 1px solid var(--border);
     background: var(--surface-2);
     color: var(--foreground-muted);
@@ -145,6 +121,11 @@
   .toggle-btn:hover {
     color: var(--foreground);
     border-color: var(--primary);
+  }
+
+  /* plan-body：承载所有 header 以下内容的 padding */
+  .plan-body {
+    padding: var(--space-2) var(--space-4) var(--space-4);
   }
 
   .plan-goal {

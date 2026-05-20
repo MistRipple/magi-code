@@ -759,7 +759,7 @@ fn derive_declared_paths(tool_call: &ChatToolCall) -> Vec<PathBuf> {
                 paths.push(PathBuf::from(path));
             }
         }
-        "shell_exec" | "shell" => {
+        "shell_exec" => {
             if let Some(list) = arguments.get("changed_paths").and_then(Value::as_array) {
                 for item in list {
                     if let Some(p) = item.as_str() {
@@ -1255,8 +1255,6 @@ mod tests {
             "shell_exec",
             Arc::clone(&probe),
         )));
-        tool_registry
-            .register_builtin(Arc::new(ProbeBuiltinTool::new("shell", Arc::clone(&probe))));
 
         let tool_calls = vec![
             ChatToolCall {
@@ -1275,7 +1273,7 @@ mod tests {
                 id: "tool-call-shell-b".to_string(),
                 kind: "function".to_string(),
                 function: ChatToolFunction {
-                    name: "shell".to_string(),
+                    name: "shell_exec".to_string(),
                     arguments: serde_json::json!({
                         "command": "printf b",
                         "access_mode": "read_only"

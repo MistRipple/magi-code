@@ -580,7 +580,6 @@ pub fn public_builtin_tool_reference_aliases() -> Vec<(&'static str, &'static st
         ("file_insert", "file_patch"),
         ("code_search_regex", "search_text"),
         ("code_search_semantic", "search_semantic"),
-        ("shell", "shell_exec"),
         ("project_knowledge_query", "knowledge_query"),
     ]);
     aliases

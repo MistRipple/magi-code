@@ -399,8 +399,8 @@ function assertAcceptedFirstFrameRunning(reducer, projection) {
   assert.deepEqual(
     projectionSignature(projection.buildCanonicalTimelineProjection(firstFrame)),
     [
-      signatureMessage('message', 'user_message', 1, '请只回复一句 first frame ok。'),
-      signatureMessageWithStatus('message', 'assistant_text', 2, '', 'running'),
+      signatureMessage('message', 'user_message', 1000, '请只回复一句 first frame ok。'),
+      signatureMessageWithStatus('message', 'assistant_text', 2000, '', 'running'),
     ],
     'accepted first frame should render an empty running assistant in canonical projection',
   );
@@ -446,8 +446,8 @@ function assertLocalPendingTurnIsReplacedByAcceptedCanonicalTurn(reducer, projec
   assert.deepEqual(
     projectionSignature(projection.buildCanonicalTimelineProjection(state)),
     [
-      signatureMessage('message', 'user_message', 1, localUser.content),
-      signatureMessageWithStatus('message', 'assistant_text', 2, '', 'running'),
+      signatureMessage('message', 'user_message', 1000, localUser.content),
+      signatureMessageWithStatus('message', 'assistant_text', 2000, '', 'running'),
     ],
     'local pending canonical turn should render before backend accepted',
   );
@@ -462,8 +462,8 @@ function assertLocalPendingTurnIsReplacedByAcceptedCanonicalTurn(reducer, projec
   assert.deepEqual(
     projectionSignature(projection.buildCanonicalTimelineProjection(result.state)),
     [
-      signatureMessage('message', 'user_message', 1, acceptedUser.content),
-      signatureMessageWithStatus('message', 'assistant_text', 2, '', 'running'),
+      signatureMessage('message', 'user_message', 1000, acceptedUser.content),
+      signatureMessageWithStatus('message', 'assistant_text', 2000, '', 'running'),
     ],
     'accepted canonical turn should keep the same visible timeline shape',
   );
@@ -517,13 +517,16 @@ function assertSplitToolStartedAndResultCollapseIntoOneCard(reducer, projection)
       responseDurationMs: 100,
     }),
   ]);
+  // ordered=[user(1), firstToolRunning(2), secondTool(3), firstToolCompleted(99), assistant(100)]
+  // → presentationSeq 1/2/3/4/5；first/second tool collapse 后 stableItemSeq 取首
+  // artifact 的呈现序：first tool → 2000，second tool → 3000，assistant → 5000。
   assert.deepEqual(
     projectionSignature(projection.buildCanonicalTimelineProjection(state)),
     [
-      signatureMessage('message', 'user_message', 1, userItem.content),
-      signatureTool(2, 'shell_exec', 'success'),
-      signatureTool(3, 'shell_exec', 'success'),
-      signatureMessage('message', 'assistant_text', 100, assistant.content),
+      signatureMessage('message', 'user_message', 1000, userItem.content),
+      signatureTool(2000, 'shell_exec', 'success'),
+      signatureTool(3000, 'shell_exec', 'success'),
+      signatureMessage('message', 'assistant_text', 5000, assistant.content),
     ],
     'split tool started/result items should render as one stable card in invocation order',
   );
@@ -717,9 +720,10 @@ function ordinaryChatCase() {
     event(c, 3, 'turn_item_upsert', { turn: turn(c, 'running', [assistantText(c, 3, 'assistant-final', 'normal', 'running')]), item: assistantText(c, 3, 'assistant-final', 'normal', 'running') }),
     event(c, 4, 'turn_completed', { turn: turn(c, 'completed', [userItem, phaseItem, assistant], { completedAt: 1100, responseDurationMs: 100 }) }),
   ];
+  // ordered=[user, phase, assistant] → presentationSeq 1/2/3 → itemSeq ×1000
   c.expected = [
-    signatureMessage('message', 'user_message', 1, userItem.content),
-    signatureMessage('message', 'assistant_text', 3, assistant.content),
+    signatureMessage('message', 'user_message', 1000, userItem.content),
+    signatureMessage('message', 'assistant_text', 3000, assistant.content),
   ];
   return c;
 }
@@ -736,8 +740,8 @@ function acceptedFirstFrameCase() {
     event(c, 3, 'turn_completed', { turn: turn(c, 'completed', [userItem, assistantCompleted], { completedAt: 1600, responseDurationMs: 100 }) }),
   ];
   c.expected = [
-    signatureMessage('message', 'user_message', 1, userItem.content),
-    signatureMessage('message', 'assistant_text', 2, assistantCompleted.content),
+    signatureMessage('message', 'user_message', 1000, userItem.content),
+    signatureMessage('message', 'assistant_text', 2000, assistantCompleted.content),
   ];
   return c;
 }
@@ -756,10 +760,11 @@ function singleToolCase() {
     event(c, 4, 'turn_item_upsert', { turn: turn(c, 'running', [toolCompleted]), item: toolCompleted }),
     event(c, 5, 'turn_completed', { turn: turn(c, 'completed', [userItem, phaseItem, toolCompleted, assistant], { completedAt: 2100, responseDurationMs: 100 }) }),
   ];
+  // ordered=[user, phase, tool, assistant] → presentationSeq 1/2/3/4 → ×1000
   c.expected = [
-    signatureMessage('message', 'user_message', 1, userItem.content),
-    signatureTool(3, 'shell_exec', 'success'),
-    signatureMessage('message', 'assistant_text', 4, assistant.content),
+    signatureMessage('message', 'user_message', 1000, userItem.content),
+    signatureTool(3000, 'shell_exec', 'success'),
+    signatureMessage('message', 'assistant_text', 4000, assistant.content),
   ];
   return c;
 }
@@ -778,10 +783,11 @@ function toolFirstCase() {
     event(c, 3, 'turn_item_upsert', { turn: turn(c, 'running', [toolCompleted]), item: toolCompleted }),
     event(c, 4, 'turn_completed', { turn: turn(c, 'completed', [userItem, retiredPlaceholder, toolCompleted, assistant], { completedAt: 1900, responseDurationMs: 100 }) }),
   ];
+  // ordered=[user, retiredPlaceholder, tool, assistant] → presentationSeq 1/2/3/4 → ×1000
   c.expected = [
-    signatureMessage('message', 'user_message', 1, userItem.content),
-    signatureTool(3, 'shell_exec', 'success'),
-    signatureMessage('message', 'assistant_text', 4, assistant.content),
+    signatureMessage('message', 'user_message', 1000, userItem.content),
+    signatureTool(3000, 'shell_exec', 'success'),
+    signatureMessage('message', 'assistant_text', 4000, assistant.content),
   ];
   return c;
 }
@@ -808,12 +814,13 @@ function multiToolOutOfOrderCase() {
     event(c, 8, 'turn_item_upsert', { turn: turn(c, 'running', [pwdCompleted]), item: pwdCompleted }),
     event(c, 9, 'turn_completed', { turn: turn(c, 'completed', [userItem, phaseItem, pwdCompleted, whoamiCompleted, dateCompleted, assistant], { completedAt: 3100, responseDurationMs: 100 }) }),
   ];
+  // ordered=[user, phase, pwd, whoami, date, assistant] → 1/2/3/4/5/6 → ×1000
   c.expected = [
-    signatureMessage('message', 'user_message', 1, userItem.content),
-    signatureTool(3, 'shell_exec', 'success'),
-    signatureTool(4, 'shell_exec', 'success'),
-    signatureTool(5, 'shell_exec', 'success'),
-    signatureMessage('message', 'assistant_text', 6, assistant.content),
+    signatureMessage('message', 'user_message', 1000, userItem.content),
+    signatureTool(3000, 'shell_exec', 'success'),
+    signatureTool(4000, 'shell_exec', 'success'),
+    signatureTool(5000, 'shell_exec', 'success'),
+    signatureMessage('message', 'assistant_text', 6000, assistant.content),
   ];
   return c;
 }
@@ -830,10 +837,11 @@ function failedToolCase() {
     event(c, 3, 'turn_item_upsert', { turn: turn(c, 'running', [failed]), item: failed }),
     event(c, 4, 'turn_completed', { turn: turn(c, 'completed', [userItem, phaseItem, failed, assistant], { completedAt: 4100, responseDurationMs: 100 }) }),
   ];
+  // ordered=[user, phase, failed, assistant] → 1/2/3/4 → ×1000
   c.expected = [
-    signatureMessage('message', 'user_message', 1, userItem.content),
-    signatureTool(3, 'shell_exec', 'error'),
-    signatureMessage('message', 'assistant_text', 4, assistant.content),
+    signatureMessage('message', 'user_message', 1000, userItem.content),
+    signatureTool(3000, 'shell_exec', 'error'),
+    signatureMessage('message', 'assistant_text', 4000, assistant.content),
   ];
   return c;
 }
@@ -849,9 +857,10 @@ function cancelledToolCase() {
     event(c, 2, 'turn_item_upsert', { turn: turn(c, 'running', [running]), item: running }),
     event(c, 3, 'turn_completed', { turn: turn(c, 'cancelled', [userItem, phaseItem, cancelled], { completedAt: 5100, responseDurationMs: 100 }) }),
   ];
+  // ordered=[user, phase, cancelled] → 1/2/3 → ×1000
   c.expected = [
-    signatureMessage('message', 'user_message', 1, userItem.content),
-    signatureTool(3, 'shell_exec', 'error', false),
+    signatureMessage('message', 'user_message', 1000, userItem.content),
+    signatureTool(3000, 'shell_exec', 'error', false),
   ];
   return c;
 }
@@ -866,8 +875,9 @@ function terminalEmptyAssistantCase() {
     event(c, 1, 'turn_started', { turn: turn(c, 'running', [userItem, assistantPending]), item: assistantPending }),
     event(c, 2, 'turn_completed', { turn: turn(c, 'completed', [userItem, assistantEmptyCompleted], { completedAt: 6100, responseDurationMs: 100 }) }),
   ];
+  // ordered=[user, assistantEmptyCompleted]; empty assistant 不可见 → 仅 user(1) → ×1000
   c.expected = [
-    signatureMessage('message', 'user_message', 1, userItem.content),
+    signatureMessage('message', 'user_message', 1000, userItem.content),
   ];
   return c;
 }
@@ -884,9 +894,10 @@ function localFailureCase() {
     event(c, 1, 'turn_started', { turn: turn(c, 'running', [userItem, assistantPending]), item: assistantPending }),
     event(c, 2, 'turn_completed', { turn: turn(c, 'failed', [userItem, assistantFailed], { completedAt: 7100, responseDurationMs: 100 }) }),
   ];
+  // ordered=[user, assistantFailed] → 1/2 → ×1000
   c.expected = [
-    signatureMessage('message', 'user_message', 1, userItem.content),
-    signatureMessage('message', 'assistant_text', 2, '发送消息失败'),
+    signatureMessage('message', 'user_message', 1000, userItem.content),
+    signatureMessage('message', 'assistant_text', 2000, '发送消息失败'),
   ];
   return c;
 }

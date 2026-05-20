@@ -22,7 +22,6 @@ use std::sync::RwLock;
 pub fn default_task_role_for_kind(kind: TaskKind) -> Option<&'static str> {
     match kind {
         TaskKind::LocalAgent => Some("integration-dev"),
-        TaskKind::LocalBash => Some("devops-engineer"),
         TaskKind::LocalWorkflow => Some("integration-dev"),
         TaskKind::RemoteAgent => Some("integration-dev"),
         TaskKind::MonitorMcp => Some("integration-dev"),

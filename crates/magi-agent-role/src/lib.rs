@@ -75,7 +75,6 @@ fn default_role_version() -> u32 {
 #[serde(rename_all = "snake_case")]
 pub enum TaskKindLabel {
     LocalAgent,
-    LocalBash,
     LocalWorkflow,
     RemoteAgent,
     MonitorMcp,
@@ -87,7 +86,6 @@ impl TaskKindLabel {
     pub fn to_task_kind(self) -> TaskKind {
         match self {
             Self::LocalAgent => TaskKind::LocalAgent,
-            Self::LocalBash => TaskKind::LocalBash,
             Self::LocalWorkflow => TaskKind::LocalWorkflow,
             Self::RemoteAgent => TaskKind::RemoteAgent,
             Self::MonitorMcp => TaskKind::MonitorMcp,
@@ -99,7 +97,6 @@ impl TaskKindLabel {
     fn parse(label: &str) -> Option<Self> {
         match label {
             "local_agent" => Some(Self::LocalAgent),
-            "local_bash" => Some(Self::LocalBash),
             "local_workflow" => Some(Self::LocalWorkflow),
             "remote_agent" => Some(Self::RemoteAgent),
             "monitor_mcp" => Some(Self::MonitorMcp),
@@ -334,8 +331,8 @@ fn parse_role_markdown(raw: &str) -> Result<AgentRole, String> {
         .strip_prefix("---\n")
         .or_else(|| trimmed.strip_prefix("---\r\n"))
         .ok_or_else(|| "缺少起始 `---` 行".to_string())?;
-    let close_idx = find_close_delimiter(after_open)
-        .ok_or_else(|| "缺少结束 `---` 行".to_string())?;
+    let close_idx =
+        find_close_delimiter(after_open).ok_or_else(|| "缺少结束 `---` 行".to_string())?;
     let header = &after_open[..close_idx.start];
     let body = after_open[close_idx.end..].trim_start_matches(['\n', '\r']);
 
@@ -361,9 +358,9 @@ fn parse_role_markdown(raw: &str) -> Result<AgentRole, String> {
                 supported_kinds = parse_kind_list(value, lineno + 1)?;
             }
             "parallelism_limit" => {
-                let n: u32 = value
-                    .parse()
-                    .map_err(|err| format!("第 {} 行 parallelism_limit 不是整数: {err}", lineno + 1))?;
+                let n: u32 = value.parse().map_err(|err| {
+                    format!("第 {} 行 parallelism_limit 不是整数: {err}", lineno + 1)
+                })?;
                 parallelism_limit = Some(n);
             }
             "coordinator_mode" => match value {
@@ -542,7 +539,7 @@ mod tests {
 
     #[test]
     fn parse_role_markdown_handles_all_fields() {
-        let raw = "---\nid: ml-engineer\nsupported_kinds: [local_agent, local_bash]\nparallelism_limit: 2\ncoordinator_mode: false\nversion: 1\n---\n你是机器学习工程师\n";
+        let raw = "---\nid: ml-engineer\nsupported_kinds: [local_agent, local_workflow]\nparallelism_limit: 2\ncoordinator_mode: false\nversion: 1\n---\n你是机器学习工程师\n";
         let role = parse_role_markdown(raw).expect("解析成功");
         assert_eq!(role.id, "ml-engineer");
         assert_eq!(role.system_prompt, "你是机器学习工程师");
@@ -590,8 +587,7 @@ mod tests {
 
     #[test]
     fn parse_role_markdown_rejects_unclosed_front_matter() {
-        let err = parse_role_markdown("---\nid: foo\n你是 X\n")
-            .expect_err("缺尾部 --- 应失败");
+        let err = parse_role_markdown("---\nid: foo\n你是 X\n").expect_err("缺尾部 --- 应失败");
         assert!(err.contains("结束"), "{err}");
     }
 
@@ -603,10 +599,9 @@ mod tests {
 
     #[test]
     fn parse_role_markdown_rejects_unknown_kind() {
-        let err = parse_role_markdown(
-            "---\nid: foo\nsupported_kinds: [magic_thing]\n---\n你是 foo\n",
-        )
-        .expect_err("未识别 kind 应失败");
+        let err =
+            parse_role_markdown("---\nid: foo\nsupported_kinds: [magic_thing]\n---\n你是 foo\n")
+                .expect_err("未识别 kind 应失败");
         assert!(err.contains("magic_thing"), "{err}");
     }
 
@@ -616,7 +611,7 @@ mod tests {
         let path = dir.join("ml-engineer.md");
         fs::write(
             &path,
-            "---\nid: ml-engineer\nsupported_kinds: [local_agent, local_bash]\nparallelism_limit: 2\n---\n你是机器学习工程师\n",
+            "---\nid: ml-engineer\nsupported_kinds: [local_agent, local_workflow]\nparallelism_limit: 2\n---\n你是机器学习工程师\n",
         )
         .unwrap();
         let role = load_file(&path).unwrap();
@@ -629,8 +624,11 @@ mod tests {
     fn load_file_infers_id_from_filename() {
         let dir = tempdir();
         let path = dir.join("custom.md");
-        fs::write(&path, "---\nid: \"\"\nsupported_kinds: [local_agent]\n---\n你是 custom\n")
-            .unwrap();
+        fs::write(
+            &path,
+            "---\nid: \"\"\nsupported_kinds: [local_agent]\n---\n你是 custom\n",
+        )
+        .unwrap();
         let role = load_file(&path).unwrap();
         assert_eq!(role.id, "custom");
     }

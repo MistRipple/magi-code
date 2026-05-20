@@ -291,7 +291,7 @@ export interface ToolCall {
   endTime?: number;
 }
 
-export type TerminalOperation = 'shell';
+export type TerminalOperation = 'shell_exec';
 
 export interface TerminalSessionBlock {
   terminalId: number;

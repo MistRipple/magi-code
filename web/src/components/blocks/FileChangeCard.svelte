@@ -162,7 +162,7 @@
 </script>
 
 {#if change}
-  <div class="tool-call" class:collapsed data-status="success">
+  <div class="tool-call" class:collapsed>
     <button class="tool-header" onclick={toggle}>
       <span class="chevron">
         <Icon name="chevron-right" size={12} />

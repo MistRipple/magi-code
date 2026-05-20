@@ -8,7 +8,6 @@ use crate::value_objects::UtcMillis;
 #[serde(rename_all = "snake_case")]
 pub enum TaskKind {
     LocalAgent,
-    LocalBash,
     LocalWorkflow,
     RemoteAgent,
     MonitorMcp,
@@ -72,11 +71,6 @@ pub struct TaskPolicy {
 pub enum TaskRuntimePayload {
     #[default]
     None,
-    LocalBash {
-        command: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        working_dir: Option<String>,
-    },
 }
 
 // ---------------------------------------------------------------------------

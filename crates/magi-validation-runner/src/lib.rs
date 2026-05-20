@@ -2,7 +2,7 @@
 //!
 //! 架构定义（参见 docs/task-system-v2/01-architecture.md L19）：
 //! 验证子系统覆盖 **测试套件 / 类型检查 / 集成 smoke / 性能基准** 四类信号。Runner 是
-//! 一个 `Task`（L11，TaskKind::LocalBash），由 Coordinator 调度；每次 Plan 节点完成
+//! 一个验证任务由 Coordinator 调度；每次 Plan 节点完成
 //! 触发 Runner，结果写回 Plan 节点。**没有 Runner 通过的 Plan 节点不算完成**——
 //! 避免"模型说做完了"的认知偏差。
 //!

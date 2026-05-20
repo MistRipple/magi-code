@@ -1853,7 +1853,7 @@ mod tests {
                             "id": "task-tool-shell-b",
                             "type": "function",
                             "function": {
-                                "name": "shell",
+                                "name": "shell_exec",
                                 "arguments": serde_json::json!({
                                     "command": "printf b",
                                     "access_mode": "read_only"
@@ -3021,10 +3021,6 @@ mod tests {
         );
         tool_registry.register_builtin(Arc::new(ProbeTaskBuiltinTool::new(
             "shell_exec",
-            Arc::clone(&probe),
-        )));
-        tool_registry.register_builtin(Arc::new(ProbeTaskBuiltinTool::new(
-            "shell",
             Arc::clone(&probe),
         )));
         let client = TaskToolBatchModelBridgeClient {

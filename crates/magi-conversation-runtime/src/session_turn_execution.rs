@@ -490,6 +490,7 @@ fn stream_session_turn_round(
         UtcMillis::now().0,
         round
     );
+
     let streamed_content = std::cell::RefCell::new(String::new());
     let streamed_thinking = std::cell::RefCell::new(String::new());
     let streamed_visible_content = std::cell::RefCell::new(String::new());
@@ -707,20 +708,11 @@ fn stream_session_turn_round(
                 &published,
             );
         }
-    } else if round == 0
-        && request
-            .placeholder_message_id
-            .as_deref()
-            .is_some_and(|placeholder_id| placeholder_id == stream_item_id)
-    {
-        retire_empty_assistant_placeholder(
-            event_bus,
-            session_store,
-            request,
-            &stream_item_id,
-            orchestrator_thread_id,
-        );
     }
+    // 历史上这里还有一个 `else if round == 0 && placeholder_id == stream_item_id` 分支，
+    // 用于把 accept 阶段预占的空 placeholder 显式 retire 成 completed。现在 sessions.rs
+    // 不再预占 placeholder（只在首个 text delta 时按 max+1 自然分配 item_seq），无 item
+    // 需要 retire——空回复直接在 canonical turn 里留白即可。
 
     if request.use_tools && !parsed.tool_calls.is_empty() {
         if !request_turn_is_writable(session_store, request) {
@@ -842,32 +834,6 @@ fn forced_tool_choice_for_round(
         })
         .unwrap_or(false);
     tool_is_available.then(|| ChatToolChoice::force_function(forced_tool_name))
-}
-
-fn retire_empty_assistant_placeholder(
-    event_bus: &InMemoryEventBus,
-    session_store: &SessionStore,
-    request: &SessionTurnExecutionRequest,
-    item_id: &str,
-    orchestrator_thread_id: &magi_core::ThreadId,
-) {
-    let mut item = session_turn_item(
-        "assistant_stream",
-        "completed",
-        Some("生成回复".to_string()),
-        None,
-        Some(item_id.to_string()),
-        orchestrator_thread_id.clone(),
-    );
-    apply_request_aliases(&mut item, request);
-    if let Some(published) = upsert_session_turn_item(session_store, &request.session_id, item) {
-        publish_session_turn_item_event(
-            event_bus,
-            &request.session_id,
-            &request.workspace_id,
-            &published,
-        );
-    }
 }
 
 fn append_final_item(
@@ -1093,6 +1059,9 @@ mod tests {
 
     #[test]
     fn stream_session_turn_round_reuses_accepted_assistant_placeholder() {
+        // 验证流式首段 assistant text 用 request.placeholder_message_id 作为 item_id。
+        // 历史方案曾在 accept 阶段把 placeholder 以 item_seq=2 预占进 turn.items，
+        // 现在不再预占——首个 text delta 走 upsert，按 max(item_seq)+1=2 自然创建。
         let session_id = SessionId::new("session-placeholder-reuse");
         let store = SessionStore::new();
         store
@@ -1111,15 +1080,6 @@ mod tests {
             orchestrator_thread_id.clone(),
         );
         user_item.item_seq = 1;
-        let mut placeholder_item = session_turn_item(
-            "assistant_stream",
-            "running",
-            Some("生成回复".to_string()),
-            None,
-            Some("assistant-placeholder-reuse".to_string()),
-            orchestrator_thread_id.clone(),
-        );
-        placeholder_item.item_seq = 2;
         store
             .upsert_current_turn(
                 session_id.clone(),
@@ -1130,7 +1090,7 @@ mod tests {
                     completed_at: None,
                     status: "running".to_string(),
                     user_message: Some("请只回复一句话".to_string()),
-                    items: vec![user_item, placeholder_item],
+                    items: vec![user_item],
                     worker_lanes: Vec::new(),
                 },
             )
@@ -1186,7 +1146,7 @@ mod tests {
         assert_eq!(
             output.final_item_id.as_deref(),
             Some("assistant-placeholder-reuse"),
-            "第一段 assistant 文本必须复用 accepted 阶段的 placeholder item"
+            "首段 assistant 文本必须以 request.placeholder_message_id 作为 item_id"
         );
         let canonical_turn = store
             .canonical_turns_for_session(&session_id)
@@ -1201,10 +1161,16 @@ mod tests {
         assert_eq!(
             assistant_items.len(),
             1,
-            "流式正文不能在 placeholder 之外新增第二条 assistant item"
+            "流式正文不能新增第二条 assistant item"
         );
         assert_eq!(assistant_items[0].item_id, "assistant-placeholder-reuse");
-        assert_eq!(assistant_items[0].item_seq, 2);
+        // accept 阶段只写 user_message(seq=1)；流式正文是首个新 item，拿到 max+1=2。
+        // 同 round 内的 thinking 即便后到（非增量 reasoning provider 在 post-streaming
+        // 才补 item），由 projection 层按 kind 重排为 thinking → text，不依赖 item_seq。
+        assert_eq!(
+            assistant_items[0].item_seq, 2,
+            "stream text 是首个 assistant item，应分到 item_seq=2（user=1, text=2）"
+        );
         assert_eq!(
             assistant_items[0].status,
             CanonicalTurnItemStatus::Completed

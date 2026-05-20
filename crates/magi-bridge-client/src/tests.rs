@@ -548,7 +548,6 @@ fn pending_terminal_synthesis_finalizes_on_max() {
 fn tool_concurrency_read_only_safe() {
     assert!(crate::tool_concurrency::is_concurrency_safe("file_view"));
     assert!(crate::tool_concurrency::is_concurrency_safe("web_search"));
-    assert!(!crate::tool_concurrency::is_concurrency_safe("shell"));
     assert!(!crate::tool_concurrency::is_concurrency_safe("shell_exec"));
     assert!(!crate::tool_concurrency::is_concurrency_safe(
         "process_launch"
@@ -569,7 +568,7 @@ fn tool_concurrency_partition_mixed() {
         "file_view",
         "file_edit",
         "code_search_regex",
-        "shell",
+        "shell_exec",
     ];
     let batches = crate::tool_concurrency::partition_tool_calls(&tools);
     assert_eq!(batches.len(), 4);
@@ -605,7 +604,7 @@ fn tool_concurrency_partitions_read_only_shells_concurrently() {
             arguments: Some(&shell_a),
         },
         crate::tool_concurrency::ToolConcurrencyInput {
-            tool_name: "shell",
+            tool_name: "shell_exec",
             arguments: Some(&shell_b),
         },
     ];
@@ -667,7 +666,7 @@ fn shell_tool_calls_execute_concurrently_and_preserve_order() {
         },
         ToolCall {
             id: "call-shell-b".to_string(),
-            name: "shell".to_string(),
+            name: "shell_exec".to_string(),
             arguments: json!({ "command": "printf b", "access_mode": "read_only" }),
             argument_parse_error: None,
             raw_arguments: None,
@@ -791,7 +790,7 @@ fn micro_compaction_preserves_recent() {
                 tool_use_id: "t1".into(),
                 content: "x".repeat(500),
                 is_error: false,
-                tool_name: Some("shell".into()),
+                tool_name: Some("shell_exec".into()),
                 status: Some("success".into()),
             }]),
         },
@@ -811,7 +810,7 @@ fn micro_compaction_preserves_recent() {
                 tool_use_id: "t3".into(),
                 content: "z".repeat(500),
                 is_error: false,
-                tool_name: Some("shell".into()),
+                tool_name: Some("shell_exec".into()),
                 status: None,
             }]),
         },

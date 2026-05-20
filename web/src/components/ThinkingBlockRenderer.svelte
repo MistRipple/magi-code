@@ -17,7 +17,7 @@
 </script>
 
 <ThinkingBlock
-  thinking={[{ content: thinkingContent }]}
+  content={thinkingContent}
   isStreaming={shouldShowStreamingState}
   initialExpanded={shouldShowStreamingState}
 />

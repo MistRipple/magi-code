@@ -287,7 +287,6 @@
     const executorName = getTaskExecutorDisplayName(task);
     if (executorName) return executorName;
     switch (task.kind) {
-      case 'local_bash': return '本地';
       case 'local_workflow': return '流程';
       case 'remote_agent': return '远程';
       case 'monitor_mcp': return 'MCP';

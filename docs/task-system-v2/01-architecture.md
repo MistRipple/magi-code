@@ -257,7 +257,6 @@ Task 变体用于调度不同执行器：
 ```rust
 pub enum TaskKind {
     LocalAgent,
-    LocalBash,
     LocalWorkflow,
     RemoteAgent,
     MonitorMcp,
@@ -266,7 +265,7 @@ pub enum TaskKind {
 }
 ```
 
-实现成熟度必须在代码和文档中标明。当前主线以 `LocalAgent` 和 `LocalBash` 为可运行核心，其它变体按同一接口逐步补 executor。
+实现成熟度必须在代码和文档中标明。当前主线以 `LocalAgent` 为可运行核心；shell 命令不是独立 TaskKind，统一作为 `shell_exec` 工具能力在 LocalAgent / Coordinator 受权限约束调用。其它变体按同一接口逐步补 executor。
 
 **SafetyGate**
 

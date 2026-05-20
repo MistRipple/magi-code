@@ -1,7 +1,7 @@
 <script lang="ts">
   import { untrack } from 'svelte';
   import Icon from './Icon.svelte';
-  import { getTerminalToolDisplayName, parseLeadingJson } from '../lib/terminal-utils';
+  import { parseLeadingJson } from '../lib/terminal-utils';
   import { i18n } from '../stores/i18n.svelte';
   import type { ToolCall, TerminalSessionBlock } from '../types/message';
 
@@ -235,7 +235,7 @@
     }
   });
   const titleText = $derived(i18n.t('terminalSession.title', { id: terminalId ?? '-' }));
-  const toolNameLabel = $derived(getTerminalToolDisplayName(toolCall?.name));
+  const toolNameLabel = $derived(i18n.t('toolCall.displayName.shell'));
   const toolSummary = $derived(displayCommand?.trim() || '');
 
   const isExpandable = $derived(Boolean(

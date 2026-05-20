@@ -195,7 +195,7 @@ impl BuiltinToolName {
             "file_move" => Some(Self::FileMove),
             "search_text" | "code_search_regex" => Some(Self::SearchText),
             "search_semantic" | "code_search_semantic" => Some(Self::SearchSemantic),
-            "shell_exec" | "shell" => Some(Self::ShellExec),
+            "shell_exec" => Some(Self::ShellExec),
             "process_launch" => Some(Self::ProcessLaunch),
             "process_read" => Some(Self::ProcessRead),
             "process_write" => Some(Self::ProcessWrite),
@@ -345,9 +345,7 @@ impl BuiltinToolName {
             Self::FileCopy => "把文件或目录复制到新位置",
             Self::FileMove => "移动或重命名文件 / 目录",
             Self::SearchText => "在指定目录下按文本模式搜索（grep 风格）",
-            Self::SearchSemantic => {
-                "语义代码检索：基于自然语言描述定位相关代码"
-            }
+            Self::SearchSemantic => "语义代码检索：基于自然语言描述定位相关代码",
             Self::ShellExec => {
                 "执行一条 shell 命令并返回 stdout / stderr。\n\n\
                 # 何时用\n\
@@ -377,9 +375,7 @@ impl BuiltinToolName {
             Self::DiagramRender => {
                 "渲染图表：支持 Mermaid、DOT、结构化 graph 节点/边、结构化 flow 节点/边"
             }
-            Self::KnowledgeQuery => {
-                "查询项目知识库：检索 README、文档与代码文档"
-            }
+            Self::KnowledgeQuery => "查询项目知识库：检索 README、文档与代码文档",
             Self::AgentSpawn => {
                 "向已注册的子 agent 角色派发一个子任务（architect / integration-dev / reviewer 等）。返回新的 task_id；子 agent 的最终结果会通过 send_message 回流。\n\n\
                 # 何时用\n\
@@ -2343,34 +2339,6 @@ mod tests {
     }
 
     #[test]
-    fn registry_executes_builtin_aliases_via_canonical_name() {
-        let governance = Arc::new(GovernanceService::default());
-        let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(16));
-        let mut tool_registry = ToolRegistry::new(governance, event_bus);
-        tool_registry.register_default_builtins();
-
-        let output = tool_registry.execute_with_policy(
-            ToolExecutionInput {
-                tool_call_id: ToolCallId::new("tool-call-shell-alias"),
-                tool_name: "shell".to_string(),
-                tool_kind: ToolKind::Builtin,
-                input: "printf alias-ok".to_string(),
-                approval_requirement: ApprovalRequirement::None,
-                risk_level: RiskLevel::Low,
-            },
-            ToolExecutionContext::default(),
-            &ToolExecutionPolicy::default(),
-        );
-        let payload: Value = serde_json::from_str(&output.payload).expect("payload should parse");
-
-        assert_eq!(output.status, ExecutionResultStatus::Succeeded);
-        assert_eq!(payload["tool"], "shell_exec");
-        assert_eq!(payload["stdout"], "alias-ok");
-        let invocations = tool_registry.invocations();
-        assert_eq!(invocations[0].tool_name, "shell_exec");
-    }
-
-    #[test]
     fn builtins_use_context_working_directory_for_relative_inputs() {
         let root = unique_temp_dir("magi-tool-context-cwd");
         fs::write(root.join("marker.txt"), "workspace-marker").expect("write marker");
@@ -3984,7 +3952,6 @@ mod tests {
             ("file_remove", BuiltinToolName::FileRemove),
             ("code_search_regex", BuiltinToolName::SearchText),
             ("code_search_semantic", BuiltinToolName::SearchSemantic),
-            ("shell", BuiltinToolName::ShellExec),
             ("web_search", BuiltinToolName::WebSearch),
             ("web_fetch", BuiltinToolName::WebFetch),
             ("project_knowledge_query", BuiltinToolName::KnowledgeQuery),

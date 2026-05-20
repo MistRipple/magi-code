@@ -160,7 +160,7 @@ v2 只保留一个设计主线：
 工作：
 
 - 标注每个 TaskKind 的实现状态。
-- `LocalAgent` 和 `LocalBash` 作为当前可运行核心。
+- `LocalAgent` 作为当前可运行核心；shell 命令通过 `shell_exec` 工具执行，不再保留独立命令任务变体。
 - 其它变体在 executor 未完成前保持不可调度或明确 rejected。
 - 避免接口看起来支持但运行时悄悄退化成普通 local agent。
 

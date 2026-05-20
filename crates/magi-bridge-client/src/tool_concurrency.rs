@@ -40,7 +40,7 @@ pub fn is_concurrency_safe_call(input: &ToolConcurrencyInput<'_>) -> bool {
 }
 
 fn is_shell_like_tool(tool_name: &str) -> bool {
-    matches!(tool_name, "shell" | "shell_exec")
+    tool_name == "shell_exec"
 }
 
 fn read_access_mode(arguments: &serde_json::Value) -> Option<String> {

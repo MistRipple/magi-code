@@ -12,7 +12,7 @@ static PERMISSION_ENGINE: Lazy<PermissionEngine> =
 
 fn write_dedup_tool_names() -> HashSet<&'static str> {
     [
-        "shell",
+        "shell_exec",
         "file_create",
         "file_edit",
         "file_insert",
@@ -274,7 +274,7 @@ impl WorkerDuplicateGuard {
         }
         if self.is_file_mutation_tool(&tool.name) {
             self.failed_write_cache
-                .retain(|k, _| !k.starts_with("shell:"));
+                .retain(|k, _| !k.starts_with("shell_exec:"));
         }
         if let Some(file_path) = self.extract_write_target_path(tool) {
             self.failed_write_cache
@@ -297,7 +297,7 @@ impl WorkerDuplicateGuard {
     }
 
     fn build_write_operation_key(&self, tool: &ToolCallInfo) -> String {
-        if tool.name == "shell" {
+        if tool.name == "shell_exec" {
             let cmd = tool
                 .arguments
                 .get("command")
@@ -310,7 +310,7 @@ impl WorkerDuplicateGuard {
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .trim();
-            return format!("shell:{}:{}", cmd, cwd);
+            return format!("shell_exec:{}:{}", cmd, cwd);
         }
         self.build_content_aware_write_key(tool)
     }

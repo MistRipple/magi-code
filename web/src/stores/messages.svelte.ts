@@ -1724,7 +1724,11 @@ export function clearProcessingState(options?: {
   messagesState.backendProcessing = false;
   messagesState.activeMessageIds = new Set();
   messagesState.pendingRequests = new Set();
-  messagesState.orchestratorRuntimeState = null;
+  // 不再在此清 orchestratorRuntimeState：
+  // 该函数被「轮次正常结束」事件（processingStateChanged forced idle / canonical 终态）调用，
+  // 那时 runtimeState 仍持有「completed / failed / cancelled」的终态语义，需要继续在
+  // 顶部状态栏展示，避免出现「面板瞬间消失再被下一个 runtimeState 事件重新挂载」的跳动。
+  // runtimeState 的清理生命周期由专属路径负责（session/workspace 切换 + bootstrap 恢复）。
   clearAllRetryRuntime();
   if (options?.skipAntiLiftBack) {
     // 会话切换：清除防回抬标记，允许新会话的权威状态正常写入

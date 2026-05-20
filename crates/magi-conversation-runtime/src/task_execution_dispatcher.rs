@@ -25,11 +25,10 @@ use magi_context_runtime::{
     ContextBudget, ContextRuntime, ExecutionContextAssemblyRequest, ExecutionContextClues,
 };
 use magi_core::{
-    ApprovalRequirement, EventId, ExecutionOwnership, ExecutionResultStatus, LeaseId, MissionId,
-    RiskLevel, SessionId, TaskId, TaskKind, ToolCallId, UtcMillis, WorkerId, WorkspaceId,
+    EventId, ExecutionOwnership, LeaseId, MissionId, SessionId, TaskId, TaskKind, UtcMillis,
+    WorkerId, WorkspaceId,
 };
 use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
-use magi_governance::ToolKind;
 use magi_knowledge_store::{KnowledgeKind, KnowledgeRecord, KnowledgeStore};
 use magi_lifecycle_notice::LifecycleNoticeRegistry;
 use magi_memory_store::{ExtractedMemory, MemoryExtractionApplyRequest, MemoryLayer, MemoryStore};
@@ -39,7 +38,7 @@ use magi_orchestrator::{
     OrchestratorService, task_worker_catalog::WorkerInfo,
 };
 use magi_session_store::{SessionStore, TimelineEntryKind, timeline_entry_visible_text};
-use magi_tool_runtime::{BuiltinToolName, ToolExecutionContext, ToolExecutionInput, ToolRegistry};
+use magi_tool_runtime::{BuiltinToolName, ToolRegistry};
 use magi_workspace::WorkspaceStore;
 use std::{path::PathBuf, sync::Arc};
 
@@ -499,59 +498,6 @@ impl LlmTaskDispatcher {
         });
     }
 
-    /// S7-D：LocalBash 变体直接走 ShellExec，绕过 LLM 循环 / agent role / prompt 组装。
-    /// 失败原因有两类：tool_registry 缺失（架构破坏，应 panic 一致行为）或
-    /// shell 退出非零（作为 TaskOutcome::Failed 上报，留 payload 给主线核查）。
-    fn execute_local_bash_variant(
-        &self,
-        task: &magi_core::Task,
-        session_id: &SessionId,
-        workspace_id: &Option<WorkspaceId>,
-        command: &str,
-        working_dir: Option<&str>,
-        worker_id: Option<&WorkerId>,
-    ) -> TaskOutcome {
-        let Some(registry) = self.tool_registry.as_ref() else {
-            return TaskOutcome::Failed {
-                error: format!(
-                    "LocalBash task {} 无法执行：ToolRegistry 未配置",
-                    task.task_id
-                ),
-            };
-        };
-        let mut payload = serde_json::json!({ "command": command });
-        if let Some(dir) = working_dir {
-            payload["working_dir"] = serde_json::Value::String(dir.to_string());
-        }
-        let input = ToolExecutionInput {
-            tool_call_id: ToolCallId::new(format!("local-bash-{}", task.task_id)),
-            tool_name: BuiltinToolName::ShellExec.as_str().to_string(),
-            tool_kind: ToolKind::Builtin,
-            input: payload.to_string(),
-            approval_requirement: ApprovalRequirement::None,
-            risk_level: RiskLevel::Medium,
-        };
-        let context = ToolExecutionContext {
-            worker_id: worker_id.cloned(),
-            task_id: Some(task.task_id.clone()),
-            session_id: Some(session_id.clone()),
-            workspace_id: workspace_id.clone(),
-            working_directory: working_dir.map(PathBuf::from),
-        };
-        let output = registry.execute_with_context(input, context);
-        match output.status {
-            ExecutionResultStatus::Succeeded => TaskOutcome::Completed {
-                output_refs: vec![output.payload],
-            },
-            other => TaskOutcome::Failed {
-                error: format!(
-                    "LocalBash task {} shell_exec 失败 (status={:?})：{}",
-                    task.task_id, other, output.payload
-                ),
-            },
-        }
-    }
-
     fn execute_dispatch_plan(
         &self,
         task: &magi_core::Task,
@@ -577,28 +523,6 @@ impl LlmTaskDispatcher {
         } else {
             Some(format!("timeline-streaming-{}", task.task_id))
         };
-        // S7-D：LocalBash 变体直接走 ShellExec，绕过 LLM 循环。
-        if let magi_core::TaskRuntimePayload::LocalBash {
-            command,
-            working_dir,
-        } = &task.runtime_payload
-        {
-            let outcome = self.execute_local_bash_variant(
-                task,
-                &session_id,
-                &workspace_id,
-                command,
-                working_dir.as_deref(),
-                Some(&worker_id),
-            );
-            if matches!(&outcome, TaskOutcome::Completed { .. }) {
-                self.session_store
-                    .bind_execution_ownership(session_id.clone(), ownership);
-                writebacks.apply(&self.pipeline.memory_store);
-            }
-            self.push_result(task_id, lease_id, outcome);
-            return;
-        }
         let (outcome, context_summary) = self.invoke_llm_with_tools(
             task,
             task_id,

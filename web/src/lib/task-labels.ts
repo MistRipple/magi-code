@@ -8,7 +8,7 @@ function compactChineseSpacing(text: string): string {
 
 function stripInternalTaskIds(text: string): string {
   return text.replace(
-    /\b(?:task|mission|worker|local|agent|bash)-[a-z0-9]+(?:-[a-z0-9]+)*\b/gi,
+    /\b(?:task|mission|worker|agent)-[a-z0-9]+(?:-[a-z0-9]+)*\b/gi,
     '相关任务',
   );
 }
@@ -40,7 +40,6 @@ export function getTaskDisplayText(text: string | null | undefined): string {
 export function getTaskKindLabel(kind: TaskKind): string {
   switch (kind) {
     case 'local_agent': return '代理任务';
-    case 'local_bash': return '本地命令';
     case 'local_workflow': return '本地流程';
     case 'remote_agent': return '远程代理';
     case 'monitor_mcp': return 'MCP 监控';
@@ -52,7 +51,6 @@ export function getTaskKindLabel(kind: TaskKind): string {
 
 export const USER_VISIBLE_TASK_KINDS: readonly TaskKind[] = [
   'local_agent',
-  'local_bash',
   'local_workflow',
   'remote_agent',
   'monitor_mcp',

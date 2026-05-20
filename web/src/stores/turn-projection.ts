@@ -29,6 +29,28 @@ interface LaneActivitySnapshot {
   itemSeq: number;
 }
 
+/**
+ * 单个 turn 的「呈现层」预计算结果。
+ *
+ * 设计目的：把所有「按呈现序读取」的需求收敛到这一个数据结构，消除散落在
+ * projection 各处的 `presentationMap.get(...) ?? item.itemSeq` 兜底——
+ * fallback 到 itemSeq 正是 Task #96 暴露的 bug：存储序 (itemSeq) 对非增量
+ * 推理 provider 来说和呈现序相反，任一处兜底都会把"总耗时"锚点等顺序敏感
+ * 计算静默落回到错误的存储序。
+ *
+ * 强约束：`presentationSeq` 必定 cover 本 turn 的所有 item，缺失即编程错误
+ * （buildTurnPresentation 漏处理某个 kind），由 `requirePresentationSeq`
+ * 抛出运行时硬错误，而不是静默回退。
+ */
+interface TurnPresentation {
+  /** 按呈现序排好的完整 item 数组——所有需要顺序遍历的下游消费者直接读这个。 */
+  readonly orderedItems: readonly CanonicalTurnItem[];
+  /** itemId → 1-based 呈现序号。downstream `presentationSeq * 1000` 写入 metadata.itemSeq。 */
+  readonly presentationSeq: ReadonlyMap<string, number>;
+  /** 预计算的「总耗时」锚点 itemId；turn 未终态或无 responseDurationMs 时为 undefined。 */
+  readonly responseDurationAnchorItemId: string | undefined;
+}
+
 function normalizeSessionId(value: string | null | undefined): string {
   return typeof value === 'string' ? value.trim() : '';
 }
@@ -269,7 +291,22 @@ function isTurnResponseDurationAnchorCandidate(item: CanonicalTurnItem): boolean
     && shouldRenderItem(item);
 }
 
-function findTurnResponseDurationAnchor(turn: CanonicalTurn): CanonicalTurnItem | undefined {
+function canShowTurnResponseDuration(
+  presentation: TurnPresentation,
+  item: CanonicalTurnItem,
+): boolean {
+  // 锚点由 buildTurnPresentation 一次性沿 orderedItems 反向扫描预计算，
+  // 这里只做单等比较——无运行时 sort、无 fallback。
+  return presentation.responseDurationAnchorItemId === item.itemId;
+}
+
+function resolveDispatchGroupResponseDurationMs(
+  turn: CanonicalTurn,
+  presentation: TurnPresentation,
+): number | undefined {
+  // 锚点不存在表示无可用 item 承载 footer（例如整 turn 只有 worker_dispatch），
+  // 此时把 responseDurationMs 挂到 dispatch group artifact 上兜底；锚点存在
+  // 则交给那个 item 自己渲染 footer，dispatch group 不重复显示。
   if (
     !isCanonicalTerminalStatus(turn.status)
     || typeof turn.responseDurationMs !== 'number'
@@ -278,27 +315,7 @@ function findTurnResponseDurationAnchor(turn: CanonicalTurn): CanonicalTurnItem 
   ) {
     return undefined;
   }
-  return turn.items
-    .filter(isTurnResponseDurationAnchorCandidate)
-    .sort((left, right) => left.itemSeq - right.itemSeq || left.itemId.localeCompare(right.itemId))
-    .at(-1);
-}
-
-function canShowTurnResponseDuration(turn: CanonicalTurn, item: CanonicalTurnItem): boolean {
-  const anchor = findTurnResponseDurationAnchor(turn);
-  return anchor?.itemId === item.itemId;
-}
-
-function resolveDispatchGroupResponseDurationMs(turn: CanonicalTurn): number | undefined {
-  if (
-    !isCanonicalTerminalStatus(turn.status)
-    || typeof turn.responseDurationMs !== 'number'
-    || !Number.isFinite(turn.responseDurationMs)
-    || turn.responseDurationMs < 0
-  ) {
-    return undefined;
-  }
-  return findTurnResponseDurationAnchor(turn) ? undefined : turn.responseDurationMs;
+  return presentation.responseDurationAnchorItemId ? undefined : turn.responseDurationMs;
 }
 
 function collectLaneProjectionMeta(turn: CanonicalTurn): Map<string, LaneProjectionMeta> {
@@ -327,7 +344,7 @@ function buildMessage(
   item: CanonicalTurnItem,
   artifactId: string,
   laneMetaById: Map<string, LaneProjectionMeta>,
-  presentationSeq: number,
+  presentation: TurnPresentation,
 ): Message {
   const content = resolveItemContent(item);
   const workerTabId = resolveVisibleWorkerTabId(item);
@@ -343,11 +360,12 @@ function buildMessage(
   const isStreaming =
     (item.kind === 'assistant_text' || item.kind === 'assistant_thinking') &&
     !isCanonicalTerminalStatus(item.status);
-  const responseDurationMs = canShowTurnResponseDuration(turn, item)
+  const responseDurationMs = canShowTurnResponseDuration(presentation, item)
     ? turn.responseDurationMs
     : undefined;
   const laneId = typeof item.laneId === 'string' ? item.laneId.trim() : '';
   const laneMeta = laneId ? laneMetaById.get(laneId) : undefined;
+  const presentationSeq = requirePresentationSeq(presentation, item);
   return {
     id: artifactId,
     role: resolveMessageRole(item),
@@ -366,10 +384,10 @@ function buildMessage(
       turnItemId: item.itemId,
       turnItemKind: item.kind,
       turnItemStatus: item.status,
-      // 这里写入的是「呈现序号」(presentationSeq)，已经被 computePresentationSeq
-      // 调整过——thinking 项会被排到对应 assistant_text 之前。原始存储序号
-      // (`item.itemSeq`，审计字段) 通过 canonicalItemSeq 单独保留。
-      itemSeq: presentationSeq,
+      // 这里写入的是「呈现序号」(presentationSeq * 1000)，已经被 buildTurnPresentation
+      // 按 protocol 语义重排——thinking 项会被排到对应 assistant_text 之前。
+      // 原始存储序号 (`item.itemSeq`，审计字段) 通过 canonicalItemSeq 单独保留。
+      itemSeq: presentationSeq * 1000,
       canonicalItemSeq: item.itemSeq,
       blockSeq: item.itemSeq,
       laneId: item.laneId,
@@ -402,61 +420,127 @@ function resolveArtifactId(turn: CanonicalTurn, item: CanonicalTurnItem): string
 }
 
 /**
- * 计算 item 在 UI 时间线中的「呈现序号」（presentationSeq）。
+ * 取 item 在本 turn 中的「呈现序号」(1-based)；缺失即编程错误，抛运行时硬错误。
  *
- * 背景：存储层 `item.itemSeq` 表示「创建顺序」——后端 `submit_regular_session_turn` 在接受
- * turn 时已预先把 assistant placeholder 占住 item_seq=2（见 sessions.rs
- * `build_assistant_placeholder_turn_item`）。当流式 thinking delta 到达，
- * `upsert_current_turn_item` 走 `max(item_seq)+1` 给它 seq=3。所以存储层 thinking 的
- * item_seq 永远大于对应的 assistant_text。这是合理的（item_seq 是不可变审计字段，
- * 见 validate_current_turn_item_update 禁止改 item_seq），但 UI 想呈现的是
- * Anthropic 协议输出顺序——thinking 在 text 之前。
+ * 不做兜底（之前的 `?? item.itemSeq` 兜底是 Task #96 的真凶——存储序对非
+ * 增量推理 provider 来说是反序的，静默回退会让"总耗时"锚点等顺序敏感计算
+ * 落到错误位置且没有可见信号）。新增 item kind 时如果 buildTurnPresentation
+ * 漏处理，这里会立即崩溃，迫使作者补全 kind-aware 重排逻辑。
  *
- * 这两个职责本就分离：存储层审计 vs 呈现层 UX。Projection 层在这里把呈现顺序一次性
- * 收敛——thinking 找到同 turn 内最近一个 item_seq 比自己小的 assistant_text，把自己排到
- * 锚点之前（`peer.itemSeq * 1000 - 1`）。
- *
- * 基础公式 `item.itemSeq * 1000` 给每个 item 槽位留 1000 unit 微调空间。结果整数化以兼容
- * messages.svelte.ts 对 itemSeq 的 `Math.floor` 规范化。
- *
- * 该 seq 同时写入 `metadata.itemSeq` 与 `displayOrder`，让两者保持一致——前者参与
- * compareTimelineSemanticOrder 的第二关排序（决定实际渲染顺序），后者是兜底键。
+ * 返回 1-based index；`× 1000` 由调用方显式表达——给每个槽位留 1000 unit
+ * 微调空间，整数化以兼容 messages.svelte.ts 对 itemSeq 的 `Math.floor` 规范化。
  */
-function computePresentationSeq(turn: CanonicalTurn, item: CanonicalTurnItem): number {
-  const baseSeq = item.itemSeq * 1000;
-  if (item.kind !== 'assistant_thinking') {
-    return baseSeq;
+function requirePresentationSeq(presentation: TurnPresentation, item: CanonicalTurnItem): number {
+  const index = presentation.presentationSeq.get(item.itemId);
+  if (index === undefined) {
+    throw new Error(
+      `turn-projection: item ${item.itemId} (kind=${item.kind}) missing from TurnPresentation; `
+      + `buildTurnPresentation 漏处理某个 item kind`,
+    );
   }
-  let peer: CanonicalTurnItem | null = null;
-  for (const candidate of turn.items) {
-    if (candidate.itemId === item.itemId) continue;
-    if (candidate.kind !== 'assistant_text') continue;
-    if (candidate.itemSeq >= item.itemSeq) continue;
-    if (peer === null || candidate.itemSeq > peer.itemSeq) {
-      peer = candidate;
+  return index;
+}
+
+/**
+ * 构造单个 turn 的「呈现层」预计算结果，承担 projection 所有顺序敏感需求。
+ *
+ * **根因背景**：后端存储里的 `item_seq` 由 `upsert_current_turn_item` 按
+ * `max(items.item_seq)+1` 分配——这是「首次 upsert 到达顺序」，不是「协议语义顺序」。
+ * 对 Anthropic（thinking_delta → text_delta），到达顺序天然等于协议顺序；
+ * 但对部分 OpenAI 兼容 provider（DeepSeek、Qwen 某些版本），`reasoning_content`
+ * 不增量流式推送，整段在最终消息里给出，runtime 只能在 post-streaming 阶段
+ * 才补上 thinking item，拿到比 text item 更大的 `item_seq`——此时若把
+ * `item_seq` 当展示序直接乘 1000，thinking 卡片就排到回答卡片之后。
+ *
+ * **真正的根因**是「`item_seq` 同时承担存储分配序与展示顺序」这一 conflation。
+ * 修复方式：在 projection 层用 kind 语义重排，剥离两者：
+ *   - 存储层 `item_seq` 仍然是单调到达序（保留审计、status 不变性）；
+ *   - 展示序由本函数按协议语义重新计算——同一 round 内 `thinking` 永远先于
+ *     `text`，`tool_call` / `worker_dispatch` / `user_message` 等作为 round
+ *     边界保持原位（它们的 `item_seq` 已经能正确反映 round 顺序）。
+ *
+ * 算法：按 `item_seq` 升序遍历 turn.items；
+ *   - 累积 `assistant_thinking` / `assistant_text` 到 round buffer；
+ *   - 碰到其它 kind 视为 round 边界——先 flush（thinking 排前、text 排后）
+ *     再追加边界 item 自身；
+ *   - 遍历结束后 flush 末尾残留 buffer。
+ *
+ * 同时一次性沿 orderedItems 反向扫描预计算 responseDurationAnchorItemId，
+ * 避免后续每次询问 anchor 都重新 sort + filter；也彻底脱离 itemSeq——
+ * 锚点选择只依赖呈现序，不存在 fallback 路径。
+ *
+ * 单一 round 内同 kind 多 item 间保持原 `item_seq` 顺序，确保增量 thinking /
+ * 多段 text 的稳定性。
+ */
+function buildTurnPresentation(turn: CanonicalTurn): TurnPresentation {
+  const sorted = turn.items
+    .slice()
+    .sort((left, right) =>
+      left.itemSeq - right.itemSeq || left.itemId.localeCompare(right.itemId),
+    );
+
+  const ordered: CanonicalTurnItem[] = [];
+  let thinkingBuffer: CanonicalTurnItem[] = [];
+  let textBuffer: CanonicalTurnItem[] = [];
+
+  const flush = (): void => {
+    ordered.push(...thinkingBuffer, ...textBuffer);
+    thinkingBuffer = [];
+    textBuffer = [];
+  };
+
+  for (const item of sorted) {
+    if (item.kind === 'assistant_thinking') {
+      thinkingBuffer.push(item);
+    } else if (item.kind === 'assistant_text') {
+      textBuffer.push(item);
+    } else {
+      flush();
+      ordered.push(item);
     }
   }
-  if (peer) {
-    return peer.itemSeq * 1000 - 1;
+  flush();
+
+  const presentationSeq = new Map<string, number>();
+  ordered.forEach((item, index) => {
+    presentationSeq.set(item.itemId, index + 1);
+  });
+
+  let responseDurationAnchorItemId: string | undefined;
+  if (
+    isCanonicalTerminalStatus(turn.status)
+    && typeof turn.responseDurationMs === 'number'
+    && Number.isFinite(turn.responseDurationMs)
+    && turn.responseDurationMs >= 0
+  ) {
+    for (let i = ordered.length - 1; i >= 0; i -= 1) {
+      const candidate = ordered[i]!;
+      if (isTurnResponseDurationAnchorCandidate(candidate)) {
+        responseDurationAnchorItemId = candidate.itemId;
+        break;
+      }
+    }
   }
-  return baseSeq;
+
+  return { orderedItems: ordered, presentationSeq, responseDurationAnchorItemId };
 }
 
 function buildArtifact(
   turn: CanonicalTurn,
   item: CanonicalTurnItem,
   laneMetaById: Map<string, LaneProjectionMeta>,
+  presentation: TurnPresentation,
 ): TimelineProjectionArtifact | null {
   if (!shouldRenderItem(item)) {
     return null;
   }
   const artifactId = resolveArtifactId(turn, item);
   const workerTabId = resolveVisibleWorkerTabId(item);
-  const presentationSeq = computePresentationSeq(turn, item);
+  const presentationSeq = requirePresentationSeq(presentation, item);
   return {
     artifactId,
     kind: item.kind === 'tool_call' ? 'tool' : 'message',
-    displayOrder: turn.turnSeq * 1_000_000 + presentationSeq,
+    displayOrder: turn.turnSeq * 1_000_000 + presentationSeq * 1000,
     artifactVersion: item.itemVersion,
     anchorEventSeq: 0,
     latestEventSeq: 0,
@@ -466,7 +550,7 @@ function buildArtifact(
     laneId: item.laneId,
     worker: workerTabId,
     messageIds: [artifactId, item.itemId],
-    message: buildMessage(turn, item, artifactId, laneMetaById, presentationSeq),
+    message: buildMessage(turn, item, artifactId, laneMetaById, presentation),
   };
 }
 
@@ -497,7 +581,10 @@ function mergeLaneStatus(current: WorkerLaneStatus, next: WorkerLaneStatus): Wor
   return 'completed';
 }
 
-function buildDispatchGroupArtifact(turn: CanonicalTurn): TimelineProjectionArtifact | null {
+function buildDispatchGroupArtifact(
+  turn: CanonicalTurn,
+  presentation: TurnPresentation,
+): TimelineProjectionArtifact | null {
   const dispatchItems = turn.items
     .filter((item) => item.kind === 'worker_dispatch' && typeof item.laneId === 'string' && item.laneId.trim())
     .sort((left, right) => left.itemSeq - right.itemSeq || left.itemId.localeCompare(right.itemId));
@@ -603,9 +690,12 @@ function buildDispatchGroupArtifact(turn: CanonicalTurn): TimelineProjectionArti
     (status, lane) => mergeLaneStatus(status, lane.status),
     'completed',
   );
-  const firstItem = dispatchItems[0];
+  const firstItem = dispatchItems[0]!;
   const artifactId = `turn:${turn.turnId}:worker-dispatch-group`;
-  const responseDurationMs = resolveDispatchGroupResponseDurationMs(turn);
+  const responseDurationMs = resolveDispatchGroupResponseDurationMs(turn, presentation);
+  // worker_dispatch 在 buildTurnPresentation 里作为 round 边界保留原顺序，
+  // 必定在 presentation.presentationSeq 中，requirePresentationSeq 不会抛。
+  const firstItemPresentationSeq = requirePresentationSeq(presentation, firstItem);
   const dispatchBlockId = `dispatch-group:${turn.turnId}`;
   const block: ContentBlock = {
     id: dispatchBlockId,
@@ -634,10 +724,10 @@ function buildDispatchGroupArtifact(turn: CanonicalTurn): TimelineProjectionArti
       turnItemId: artifactId,
       turnItemKind: 'worker_dispatch',
       turnItemStatus: groupStatus,
-      // dispatch group 的 itemSeq 同样按 presentationSeq 量级（×1000）保持与
-      // buildMessage 写入值对齐，让 compareTimelineSemanticOrder 在跨 artifact 排序时
-      // 数量级一致。worker_dispatch 没有 thinking 那样的呈现倒挂问题，所以直接乘。
-      itemSeq: firstItem.itemSeq * 1000,
+      // dispatch group 的 itemSeq 取首 dispatch item 的展示序（×1000），与
+      // buildMessage 写入值对齐，让 compareTimelineSemanticOrder 在跨 artifact
+      // 排序时数量级一致。
+      itemSeq: firstItemPresentationSeq * 1000,
       canonicalItemSeq: firstItem.itemSeq,
       blockSeq: firstItem.itemSeq,
       cardStreamSeq: firstItem.itemSeq,
@@ -650,7 +740,7 @@ function buildDispatchGroupArtifact(turn: CanonicalTurn): TimelineProjectionArti
   return {
     artifactId,
     kind: 'message',
-    displayOrder: turn.turnSeq * 1_000_000 + firstItem.itemSeq * 1000,
+    displayOrder: turn.turnSeq * 1_000_000 + firstItemPresentationSeq * 1000,
     artifactVersion: Math.max(...Array.from(laneVersionById.values())),
     anchorEventSeq: 0,
     latestEventSeq: 0,
@@ -665,9 +755,13 @@ function buildDispatchGroupArtifact(turn: CanonicalTurn): TimelineProjectionArti
 
 function buildTurnProjectionArtifacts(turn: CanonicalTurn): Array<TimelineProjectionArtifact | null> {
   const laneMetaById = collectLaneProjectionMeta(turn);
+  const presentation = buildTurnPresentation(turn);
   return [
-    buildDispatchGroupArtifact(turn),
-    ...turn.items.map((item) => buildArtifact(turn, item, laneMetaById)),
+    buildDispatchGroupArtifact(turn, presentation),
+    // 遍历 presentation.orderedItems（已按呈现序排好），不再用 turn.items 原顺序——
+    // 虽然下游 collapseArtifactsByStableCard 仍会按 displayOrder 总排序，但用
+    // orderedItems 让数据流意图更显式：呈现序在这里就已经固定。
+    ...presentation.orderedItems.map((item) => buildArtifact(turn, item, laneMetaById, presentation)),
   ];
 }
 
