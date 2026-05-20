@@ -126,6 +126,17 @@ fn child_index_from_tasks(tasks: &HashMap<TaskId, Task>) -> HashMap<TaskId, Vec<
                 .push(task.task_id.clone());
         }
     }
+    // 子任务列表必须按 (created_at, task_id) 排序，消除 HashMap 迭代序带来的非确定性。
+    // 下游 collect_subtree_ids / get_children 等 BFS / 投影逻辑都依赖这一确定顺序。
+    for child_ids in children.values_mut() {
+        child_ids.sort_by(|a, b| {
+            let ord = tasks
+                .get(a)
+                .map(|t| t.created_at)
+                .cmp(&tasks.get(b).map(|t| t.created_at));
+            ord.then_with(|| a.as_str().cmp(b.as_str()))
+        });
+    }
     children
 }
 
@@ -412,11 +423,19 @@ impl TaskStore {
     /// 获取某个父任务的所有子任务。
     pub fn get_children(&self, parent_id: &TaskId) -> Vec<Task> {
         let tasks = self.tasks.read().expect("tasks read lock poisoned");
-        tasks
+        let mut children: Vec<Task> = tasks
             .values()
             .filter(|task| task.parent_task_id.as_ref() == Some(parent_id))
             .cloned()
-            .collect()
+            .collect();
+        // HashMap::values 顺序非确定，统一按 (created_at, task_id) 排序，
+        // 保证调用方拿到的子任务序列稳定。
+        children.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.task_id.as_str().cmp(b.task_id.as_str()))
+        });
+        children
     }
 
     pub fn has_validation_dependent(&self, task_id: &TaskId) -> bool {
