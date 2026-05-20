@@ -1,5 +1,17 @@
 use magi_bridge_client::assignment_dispatch::{strip_dispatch_preview_text, strip_dispatch_text};
 
+/// 17 段 system prompt 装配中，文本级小节之间的固定分隔串。
+///
+/// 用于 [`prepend_session_instructions`] 把 user_rules / safeguard / lifecycle
+/// 等小节用空行隔开拼到同一条 system message 里。消息级（按 `ChatMessage`
+/// 切分）的分段不使用此常量。
+pub const SEGMENT_SEP: &str = "\n\n";
+
+/// 段头模板：`--- <title> ---`。统一所有 inline 小节标题，方便检索与调整文案。
+pub const SEGMENT_HEADER_USER_RULES: &str = "--- 用户规则 ---";
+pub const SEGMENT_HEADER_SAFEGUARD: &str = "--- 安全防护 ---";
+pub const SEGMENT_HEADER_LIFECYCLE: &str = "--- 生命周期通知 ---";
+
 pub fn prepend_session_instructions(
     user_rules: Option<&str>,
     safeguard_rules: Option<&str>,
@@ -8,30 +20,34 @@ pub fn prepend_session_instructions(
 ) -> String {
     let mut sections = Vec::new();
     if let Some(rules) = user_rules.map(str::trim).filter(|rules| !rules.is_empty()) {
-        sections.push(format!("--- 用户规则 ---\n{rules}"));
+        sections.push(format!("{SEGMENT_HEADER_USER_RULES}\n{rules}"));
     }
     if let Some(rules) = safeguard_rules
         .map(str::trim)
         .filter(|rules| !rules.is_empty())
     {
-        sections.push(format!("--- 安全防护 ---\n{rules}"));
+        sections.push(format!("{SEGMENT_HEADER_SAFEGUARD}\n{rules}"));
     }
     if let Some(notice) = lifecycle_notice
         .map(str::trim)
         .filter(|notice| !notice.is_empty())
     {
-        sections.push(format!("--- 生命周期通知 ---\n{notice}"));
+        sections.push(format!("{SEGMENT_HEADER_LIFECYCLE}\n{notice}"));
     }
     if sections.is_empty() {
         return prompt.to_string();
     }
-    format!("{}\n\n{}", sections.join("\n\n"), prompt)
+    format!("{}{SEGMENT_SEP}{}", sections.join(SEGMENT_SEP), prompt)
 }
 
+/// 工作区上下文 system prompt 模板。运行时只替换 `{{root_path}}`。
+const TPL_WORKSPACE_CONTEXT: &str = include_str!("../templates/workspace_context.md");
+
 pub fn workspace_context_system_prompt(root_path: &str) -> String {
-    format!(
-        "当前工作区根目录是 `{root_path}`。当用户、任务或 worker 提到“当前项目”、“当前工程”、“当前仓库”、“本项目”或 current project/repo/codebase 时，默认指这个工作区。需要分析当前项目时，必须优先使用可用工具读取该工作区的目录、README、配置和关键源码，不要要求用户手动粘贴项目结构。工具未显式传 cwd/root/path 的相对路径均应按该工作区根目录理解。不要假设工作区一定是 Git 仓库；执行 `git status`、`git diff` 等 Git 状态命令前，必须先用只读、受保护的条件命令确认 Git worktree，例如 `git -C <root> rev-parse --is-inside-work-tree >/dev/null 2>&1` 只能出现在 if 条件中，非 Git 目录应输出 `NOT_GIT_WORKTREE` 并保持 shell 命令成功。只读 shell 探测必须显式传 `access_mode=read_only`。如果工作区不是 Git 仓库，应明确说明 Git 状态不可用，不要继续重复 Git 状态命令，也不要把 Git 不可用等同于已完成文件变更检测。"
-    )
+    TPL_WORKSPACE_CONTEXT
+        .replace("{{root_path}}", root_path)
+        .trim_end()
+        .to_string()
 }
 
 pub fn normalize_model_visible_content(content: String) -> String {

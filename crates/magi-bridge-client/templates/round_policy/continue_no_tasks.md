@@ -1,0 +1,11 @@
+[System] 当前没有结构化的必需任务。
+- 如果你已完成用户请求，请在输出末尾追加控制块：
+{{outcome_start}}
+{"status":"completed","next_steps":[]}
+{{outcome_end}}
+- 如果还需继续工作，请先输出结构化 Assignment Dispatch JSON 建立任务轨道。
+
+- 示例 ✅: 已完成 → 简短结论 + 上述控制块（status=completed, next_steps=[]）
+- 示例 ✅: 还需继续 → 立即输出 {"mission_title":"...","tasks":[{...}]} 建立轨道
+- 示例 ❌: "我已经完成了，告诉我下一步" — 缺少控制块，下一轮会被强制重写
+- 示例 ❌: 继续调用工具但既不派发也不收尾 — 视为无效推进

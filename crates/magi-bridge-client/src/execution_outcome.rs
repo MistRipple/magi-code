@@ -1,7 +1,7 @@
 use serde::Deserialize;
 
-const EXECUTION_OUTCOME_START: &str = "[[EXECUTION_OUTCOME]]";
-const EXECUTION_OUTCOME_END: &str = "[[/EXECUTION_OUTCOME]]";
+pub(crate) const EXECUTION_OUTCOME_START: &str = "[[EXECUTION_OUTCOME]]";
+pub(crate) const EXECUTION_OUTCOME_END: &str = "[[/EXECUTION_OUTCOME]]";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ExecutionOutcomeStatus {

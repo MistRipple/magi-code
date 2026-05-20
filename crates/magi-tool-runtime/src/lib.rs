@@ -301,65 +301,65 @@ impl BuiltinToolName {
 
     pub fn description(&self) -> &'static str {
         match self {
-            Self::FileRead => "Read the contents of a file at a given path",
-            Self::FileWrite => "Create or overwrite a file with the given content",
-            Self::FilePatch => "Apply targeted text replacements to a file (find-and-replace)",
-            Self::FileRemove => "Delete a file or directory",
-            Self::FileMkdir => "Create a directory (including parent directories)",
-            Self::FileCopy => "Copy a file or directory to a new location",
-            Self::FileMove => "Move or rename a file or directory",
-            Self::SearchText => "Search for text patterns in files within a directory",
+            Self::FileRead => "读取指定路径文件的内容",
+            Self::FileWrite => "创建或覆盖一个文件并写入指定内容",
+            Self::FilePatch => "对文件进行精确文本替换（find-and-replace 风格的局部修改）",
+            Self::FileRemove => "删除一个文件或目录",
+            Self::FileMkdir => "创建一个目录（包含父目录）",
+            Self::FileCopy => "把文件或目录复制到新位置",
+            Self::FileMove => "移动或重命名文件 / 目录",
+            Self::SearchText => "在指定目录下按文本模式搜索（grep 风格）",
             Self::SearchSemantic => {
-                "Semantic code search: find code by natural language description"
+                "语义代码检索：基于自然语言描述定位相关代码"
             }
-            Self::ShellExec => "Execute a shell command and return stdout/stderr",
-            Self::ProcessLaunch => "Launch a background process in the current session/workspace",
-            Self::ProcessRead => "Read stdout/stderr from a managed background process",
-            Self::ProcessWrite => "Write input to a managed background process",
-            Self::ProcessKill => "Stop a managed background process",
-            Self::ProcessList => "List managed background processes in the current context",
-            Self::ProcessInspect => "Inspect running processes by PID or name",
-            Self::DiffPreview => "Generate a unified diff between two text inputs",
-            Self::WebSearch => "Search the web using DuckDuckGo and return results",
-            Self::WebFetch => "Fetch content from a URL and convert HTML to markdown",
+            Self::ShellExec => "执行一条 shell 命令并返回 stdout / stderr",
+            Self::ProcessLaunch => "在当前会话 / 工作区启动一个后台进程",
+            Self::ProcessRead => "读取受管后台进程的 stdout / stderr",
+            Self::ProcessWrite => "向受管后台进程的 stdin 写入数据",
+            Self::ProcessKill => "终止一个受管后台进程",
+            Self::ProcessList => "列出当前上下文里的受管后台进程",
+            Self::ProcessInspect => "按 PID 或名字查询正在运行的系统进程",
+            Self::DiffPreview => "对两段文本生成 unified diff 预览",
+            Self::WebSearch => "通过 DuckDuckGo 搜索网络并返回结果",
+            Self::WebFetch => "抓取一个 URL 的内容并将 HTML 转为 markdown",
             Self::DiagramRender => {
-                "Render diagrams from Mermaid, DOT, structured graph nodes/edges, or structured flow nodes/edges"
+                "渲染图表：支持 Mermaid、DOT、结构化 graph 节点/边、结构化 flow 节点/边"
             }
             Self::KnowledgeQuery => {
-                "Query project knowledge base: search README, docs, and code documentation"
+                "查询项目知识库：检索 README、文档与代码文档"
             }
             Self::AgentSpawn => {
-                "Dispatch a sub-task to a registered agent role (architect / integration-dev / reviewer / etc.). Returns the new task_id; the sub-agent's final result will be delivered back via send_message."
+                "向已注册的子 agent 角色派发一个子任务（architect / integration-dev / reviewer 等）。返回新的 task_id；子 agent 的最终结果会通过 send_message 回流。"
             }
             Self::SendMessage => {
-                "Deliver a structured message to another task in the same mission. Used by coordinators to forward results, follow-up directives, or sub-agent replies."
+                "向同一 mission 中的另一个任务投递结构化消息。Coordinator 用它转发结果、下达后续指令或回传子 agent 的回复。"
             }
             Self::TaskStop => {
-                "Terminate a task and cascade-stop all of its descendants in the SpawnGraph. Use only when the entire sub-tree has clearly deviated from the goal or the user has revoked the work."
+                "终止一个任务并在 SpawnGraph 上级联停止它的所有后代。仅在整个子树已明显偏离目标，或用户主动撤回工作时使用。"
             }
             Self::TodoWrite => {
-                "Replace the current session's TodoLedger with the given list (claude-code TodoWrite semantics). Use to break a long task into steps and track progress; the ledger snapshot is auto-injected into subsequent Turns. Each call overwrites the entire list."
+                "用给定列表整体替换当前会话的 TodoLedger（沿用 claude-code TodoWrite 语义）。用于把长任务拆分成步骤并跟踪进度；ledger 快照会自动注入到后续 Turn。每次调用整体覆盖。"
             }
             Self::MemoryWrite => {
-                "Persist or remove a ProjectMemory entry for the current workspace. Memory files live under ~/.magi/projects/<slug>/memory/ and are auto-loaded into the system prompt on every new conversation. Use `action: save` to upsert (overwrites the file with the same file_stem) and `action: delete` to remove an entry. Memory kinds: user / feedback / project / reference."
+                "对当前工作区的 ProjectMemory 条目进行写入或删除。Memory 文件存于 ~/.magi/projects/<slug>/memory/，每次新会话开始时自动加载到系统提示。使用 action: save 进行 upsert（覆盖同 file_stem 的文件），action: delete 删除条目。Memory 类别：user / feedback / project / reference。"
             }
             Self::MissionCharterWrite => {
-                "Incrementally update the current mission's charter (title / goal / success_criteria / constraints / stakeholders). The charter persists in ~/.magi/projects/<slug>/missions/<mission_id>/charter.md and is auto-injected into orchestrator prompts. Provide at least one field; omitted fields stay unchanged."
+                "增量更新当前 mission 的章程（title / goal / success_criteria / constraints / stakeholders）。章程持久化在 ~/.magi/projects/<slug>/missions/<mission_id>/charter.md，会自动注入到 orchestrator 的提示词。至少提供一个字段；未提供的字段保持不变。"
             }
             Self::PlanWrite => {
-                "Replace the current mission's execution plan with a complete list of steps. Each step has: id (stable identifier), content (one-line description), status (pending/in_progress/completed/cancelled), depends_on (optional list of step ids), notes (optional). The plan persists in ~/.magi/projects/<slug>/missions/<mission_id>/plan.md and is auto-injected into orchestrator prompts. Use this to draft, evolve, and track multi-step execution strategy for the mission. Each call overwrites the entire step list — provide all steps you want to keep."
+                "用一份完整的步骤列表替换当前 mission 的执行计划。每个 step 包含：id（稳定标识）、content（一行描述）、status（pending / in_progress / completed / cancelled）、depends_on（可选的依赖 step id 列表）、notes（可选）。计划持久化在 ~/.magi/projects/<slug>/missions/<mission_id>/plan.md 并自动注入 orchestrator 提示词。用于起草、演进、跟踪 mission 的多步策略。每次调用整体覆盖——请把想保留的全部 step 都传进来。"
             }
             Self::KgWrite => {
-                "Upsert one fact into the mission's KnowledgeGraph. Kinds: 'symbol' (code/module index — what classes/interfaces have been migrated, what they own), 'decision' (architecture or trade-off rationale, e.g. why SQLAlchemy over Tortoise), 'risk' (hazards or watch-outs surfaced during execution). Same (kind, id) overwrites the previous fact and bumps its version; set 'tombstoned': true to retire a fact without losing history. KG persists in ~/.magi/projects/<slug>/missions/<mission_id>/knowledge.md and is auto-injected into orchestrator prompts."
+                "向 mission 的 KnowledgeGraph 写入一条事实。Kind：'symbol'（代码 / 模块索引——哪些类与接口已经迁移、各自负责什么）、'decision'（架构或权衡决策，例如为什么选 SQLAlchemy 而非 Tortoise）、'risk'（执行中发现的隐患或注意点）。同一 (kind, id) 会覆盖旧事实并提升版本；设 'tombstoned': true 可在保留历史的前提下退役一条事实。KG 持久化在 ~/.magi/projects/<slug>/missions/<mission_id>/knowledge.md 并自动注入 orchestrator 提示词。"
             }
             Self::ValidationRecord => {
-                "Record one validation result against a Plan step. Kinds: 'test_suite' (unit / integration test runs), 'type_check' (tsc / mypy / cargo check), 'integration_smoke' (cross-process or end-to-end smoke), 'benchmark' (perf / load). Outcomes: 'pass' / 'fail' / 'skipped'. Use this immediately after running a validation command — Coordinator gates a Plan step's completion on having at least one Pass and no unresolved Fail. Same (plan_step_id, kind) overwrites and bumps version. Validation results persist in ~/.magi/projects/<slug>/missions/<mission_id>/validation.md and are auto-injected into orchestrator prompts."
+                "为某个 Plan step 记录一次验证结果。Kind：'test_suite'（单元 / 集成测试）、'type_check'（tsc / mypy / cargo check）、'integration_smoke'（跨进程或端到端冒烟）、'benchmark'（性能 / 负载）。Outcome：'pass' / 'fail' / 'skipped'。一次验证命令跑完后立即调用——Coordinator 要求每个 Plan step 至少有一次 Pass 且无未解决的 Fail 才能算完成。同一 (plan_step_id, kind) 会覆盖并提升版本。验证结果持久化在 ~/.magi/projects/<slug>/missions/<mission_id>/validation.md 并自动注入 orchestrator 提示词。"
             }
             Self::Checkpoint => {
-                "Append one Checkpoint record for the current mission. Kinds: 'process_restart' (record state right before/after a daemon restart), 'context_compaction' (the conversation just got summarized; preserve a recovery pointer), 'phase_transition' (a major plan phase just completed/started), 'manual' (operator-triggered safety net). Checkpoints are append-only; each entry captures a snapshot of plan_version / kg_fact_count / workspace_commit / open conversations so a future Turn can reason about how to recover. Persisted in ~/.magi/projects/<slug>/missions/<mission_id>/checkpoints.md; the latest few entries are auto-injected into orchestrator prompts."
+                "为当前 mission 追加一条 Checkpoint 记录。Kind：'process_restart'（daemon 重启前后的状态记录）、'context_compaction'（对话刚被压缩，保留恢复指针）、'phase_transition'（一个主要 plan 阶段刚结束 / 开始）、'manual'（运维主动触发的安全网）。Checkpoint 仅追加；每条记录抓取一份 plan_version / kg_fact_count / workspace_commit / open conversations 的快照，未来某轮可以基于它推断如何恢复。持久化在 ~/.magi/projects/<slug>/missions/<mission_id>/checkpoints.md；最近几条会自动注入 orchestrator 提示词。"
             }
             Self::HumanCheckpointRequest => {
-                "Request a human review checkpoint and pause autonomous progress until the operator approves or rejects it. Use this at high-stakes boundaries: irreversible operations, ambiguous trade-offs, large deletions, production deploys, anything requiring human judgement. Required fields: plan_step_id (the Plan step that triggered the request) and prompt_to_human (the question or decision the operator must resolve). Optional: label (short headline) and context (free-form supplementary info). After requesting, do NOT dispatch new work on this mission; resume only after the request is resolved. Persisted in ~/.magi/projects/<slug>/missions/<mission_id>/human_checkpoints.md; pending + recently resolved entries are auto-injected into orchestrator prompts."
+                "请求人工评审 checkpoint，并在运维批准或拒绝前暂停自主推进。用于高风险边界：不可逆操作、含糊的权衡、大规模删除、生产部署、任何需要人工判断的环节。必填：plan_step_id（触发请求的 Plan step）与 prompt_to_human（请运维处理的问题或决策）。可选：label（短标题）与 context（自由格式补充信息）。请求后不要再对该 mission 派发新工作；解决后再恢复。持久化在 ~/.magi/projects/<slug>/missions/<mission_id>/human_checkpoints.md；待处理 + 最近已处理条目会自动注入 orchestrator 提示词。"
             }
         }
     }
@@ -369,30 +369,30 @@ impl BuiltinToolName {
             Self::FileRead => serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "Absolute path to the file to read" },
-                    "max_bytes": { "type": "integer", "description": "Maximum number of bytes to read from a file preview" }
+                    "path": { "type": "string", "description": "要读取文件的绝对路径" },
+                    "max_bytes": { "type": "integer", "description": "文件预览最多读取的字节数" }
                 },
                 "required": ["path"]
             }),
             Self::FileWrite => serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "Absolute path to the file to write" },
-                    "content": { "type": "string", "description": "Content to write to the file" },
-                    "overwrite": { "type": "boolean", "description": "Whether to overwrite existing file (default: true)" },
-                    "create_dirs": { "type": "boolean", "description": "Whether to create parent directories (default: true)" }
+                    "path": { "type": "string", "description": "要写入文件的绝对路径" },
+                    "content": { "type": "string", "description": "要写入的文件内容" },
+                    "overwrite": { "type": "boolean", "description": "是否覆盖已存在的文件（默认：true）" },
+                    "create_dirs": { "type": "boolean", "description": "是否创建父目录（默认：true）" }
                 },
                 "required": ["path", "content"]
             }),
             Self::FilePatch => serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "Absolute path to the file to patch" },
-                    "old_string": { "type": "string", "description": "Text to find (must match exactly once)" },
-                    "new_string": { "type": "string", "description": "Replacement text" },
+                    "path": { "type": "string", "description": "要修改文件的绝对路径" },
+                    "old_string": { "type": "string", "description": "要查找的原文本（必须在文件中精确匹配一次）" },
+                    "new_string": { "type": "string", "description": "替换后的文本" },
                     "patches": {
                         "type": "array",
-                        "description": "Array of patches to apply (alternative to old_string/new_string)",
+                        "description": "批量补丁数组（与 old_string / new_string 二选一）",
                         "items": {
                             "type": "object",
                             "properties": {
@@ -408,103 +408,103 @@ impl BuiltinToolName {
             Self::FileRemove => serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "Absolute path to the file or directory to delete" },
-                    "recursive": { "type": "boolean", "description": "Whether to recursively delete directories (default: false)" }
+                    "path": { "type": "string", "description": "要删除文件或目录的绝对路径" },
+                    "recursive": { "type": "boolean", "description": "是否递归删除目录（默认：false）" }
                 },
                 "required": ["path"]
             }),
             Self::FileMkdir => serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "Absolute path of the directory to create" }
+                    "path": { "type": "string", "description": "要创建目录的绝对路径" }
                 },
                 "required": ["path"]
             }),
             Self::FileCopy => serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "source": { "type": "string", "description": "Absolute path of the source file or directory" },
-                    "destination": { "type": "string", "description": "Absolute path of the destination" },
-                    "overwrite": { "type": "boolean", "description": "Whether to overwrite if destination exists (default: false)" }
+                    "source": { "type": "string", "description": "源文件或目录的绝对路径" },
+                    "destination": { "type": "string", "description": "目标位置的绝对路径" },
+                    "overwrite": { "type": "boolean", "description": "目标存在时是否覆盖（默认：false）" }
                 },
                 "required": ["source", "destination"]
             }),
             Self::FileMove => serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "source": { "type": "string", "description": "Absolute path of the source file or directory" },
-                    "destination": { "type": "string", "description": "Absolute path of the destination" },
-                    "overwrite": { "type": "boolean", "description": "Whether to overwrite if destination exists (default: false)" }
+                    "source": { "type": "string", "description": "源文件或目录的绝对路径" },
+                    "destination": { "type": "string", "description": "目标位置的绝对路径" },
+                    "overwrite": { "type": "boolean", "description": "目标存在时是否覆盖（默认：false）" }
                 },
                 "required": ["source", "destination"]
             }),
             Self::SearchText => serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "root": { "type": "string", "description": "Root directory to search in" },
-                    "query": { "type": "string", "description": "Text pattern to search for" },
-                    "limit": { "type": "integer", "description": "Maximum number of results" },
-                    "case_sensitive": { "type": "boolean", "description": "Whether the search is case sensitive" },
-                    "include_hidden": { "type": "boolean", "description": "Whether hidden files and directories are included" }
+                    "root": { "type": "string", "description": "搜索根目录" },
+                    "query": { "type": "string", "description": "要搜索的文本模式" },
+                    "limit": { "type": "integer", "description": "最大结果数" },
+                    "case_sensitive": { "type": "boolean", "description": "是否区分大小写" },
+                    "include_hidden": { "type": "boolean", "description": "是否包含隐藏文件与目录" }
                 },
                 "required": ["root", "query"]
             }),
             Self::SearchSemantic => serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "query": { "type": "string", "description": "Natural language description of the code to find" },
-                    "root": { "type": "string", "description": "Root directory to search in" },
-                    "limit": { "type": "integer", "description": "Maximum number of results (default: 10)" }
+                    "query": { "type": "string", "description": "目标代码的自然语言描述" },
+                    "root": { "type": "string", "description": "搜索根目录" },
+                    "limit": { "type": "integer", "description": "最大结果数（默认：10）" }
                 },
                 "required": ["query"]
             }),
             Self::ShellExec => serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "command": { "type": "string", "description": "Shell command to execute" },
-                    "cwd": { "type": "string", "description": "Working directory" },
-                    "shell": { "type": "string", "description": "Shell binary to use" },
-                    "timeout_ms": { "type": "integer", "description": "Execution timeout in milliseconds" },
+                    "command": { "type": "string", "description": "要执行的 shell 命令" },
+                    "cwd": { "type": "string", "description": "工作目录" },
+                    "shell": { "type": "string", "description": "使用的 shell 程序" },
+                    "timeout_ms": { "type": "integer", "description": "执行超时（毫秒）" },
                     "access_mode": {
                         "type": "string",
-                        "description": "Declare whether the command is read_only, maybe_write, or explicit_write. Use read_only for inspections such as ls, cat, grep, git status, git diff, and tests that do not modify files.",
+                        "description": "声明命令访问模式：read_only / maybe_write / explicit_write。ls、cat、grep、git status、git diff、不会改文件的测试等只读探查请用 read_only。",
                         "enum": ["read_only", "maybe_write", "explicit_write"]
                     },
-                    "background": { "type": "boolean", "description": "Launch in the background instead of waiting for completion" }
+                    "background": { "type": "boolean", "description": "在后台启动而不阻塞等待完成" }
                 },
                 "required": ["command"]
             }),
             Self::ProcessLaunch => serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "command": { "type": "string", "description": "Shell command to launch in the background" },
-                    "cwd": { "type": "string", "description": "Working directory" },
-                    "shell": { "type": "string", "description": "Shell binary to use" }
+                    "command": { "type": "string", "description": "在后台启动的 shell 命令" },
+                    "cwd": { "type": "string", "description": "工作目录" },
+                    "shell": { "type": "string", "description": "使用的 shell 程序" }
                 },
                 "required": ["command"]
             }),
             Self::ProcessRead => serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "terminal_id": { "type": "integer", "description": "Managed terminal/process ID" },
-                    "max_bytes": { "type": "integer", "description": "Maximum number of bytes to preview from stdout/stderr" }
+                    "terminal_id": { "type": "integer", "description": "受管终端 / 进程 ID" },
+                    "max_bytes": { "type": "integer", "description": "stdout / stderr 预览最多读取的字节数" }
                 },
                 "required": ["terminal_id"]
             }),
             Self::ProcessWrite => serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "terminal_id": { "type": "integer", "description": "Managed terminal/process ID" },
-                    "input": { "type": "string", "description": "Text to write to the process stdin" },
-                    "content": { "type": "string", "description": "Alias for input" },
-                    "text": { "type": "string", "description": "Alias for input" }
+                    "terminal_id": { "type": "integer", "description": "受管终端 / 进程 ID" },
+                    "input": { "type": "string", "description": "要写入进程 stdin 的文本" },
+                    "content": { "type": "string", "description": "input 的别名" },
+                    "text": { "type": "string", "description": "input 的别名" }
                 },
                 "required": ["terminal_id"]
             }),
             Self::ProcessKill => serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "terminal_id": { "type": "integer", "description": "Managed terminal/process ID" }
+                    "terminal_id": { "type": "integer", "description": "受管终端 / 进程 ID" }
                 },
                 "required": ["terminal_id"]
             }),
@@ -515,42 +515,42 @@ impl BuiltinToolName {
             Self::ProcessInspect => serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "pid": { "type": "integer", "description": "Process ID to inspect" },
-                    "query": { "type": "string", "description": "Process name or search query" },
-                    "name": { "type": "string", "description": "Alias for query" },
-                    "pattern": { "type": "string", "description": "Alias for query" },
-                    "limit": { "type": "integer", "description": "Maximum number of matches" }
+                    "pid": { "type": "integer", "description": "要检查的进程 ID" },
+                    "query": { "type": "string", "description": "进程名或搜索关键词" },
+                    "name": { "type": "string", "description": "query 的别名" },
+                    "pattern": { "type": "string", "description": "query 的别名" },
+                    "limit": { "type": "integer", "description": "最大匹配条数" }
                 }
             }),
             Self::DiffPreview => serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "before": { "type": "string", "description": "Original text" },
-                    "after": { "type": "string", "description": "Modified text" },
-                    "before_path": { "type": "string", "description": "Path to the original file" },
-                    "after_path": { "type": "string", "description": "Path to the updated file" },
-                    "before_label": { "type": "string", "description": "Label for the original side" },
-                    "after_label": { "type": "string", "description": "Label for the updated side" },
-                    "left": { "type": "string", "description": "Alias for before" },
-                    "right": { "type": "string", "description": "Alias for after" },
-                    "left_path": { "type": "string", "description": "Alias for before_path" },
-                    "right_path": { "type": "string", "description": "Alias for after_path" },
-                    "left_label": { "type": "string", "description": "Alias for before_label" },
-                    "right_label": { "type": "string", "description": "Alias for after_label" }
+                    "before": { "type": "string", "description": "原始文本" },
+                    "after": { "type": "string", "description": "修改后文本" },
+                    "before_path": { "type": "string", "description": "原始文件路径" },
+                    "after_path": { "type": "string", "description": "更新后文件路径" },
+                    "before_label": { "type": "string", "description": "原始侧的标签" },
+                    "after_label": { "type": "string", "description": "更新侧的标签" },
+                    "left": { "type": "string", "description": "before 的别名" },
+                    "right": { "type": "string", "description": "after 的别名" },
+                    "left_path": { "type": "string", "description": "before_path 的别名" },
+                    "right_path": { "type": "string", "description": "after_path 的别名" },
+                    "left_label": { "type": "string", "description": "before_label 的别名" },
+                    "right_label": { "type": "string", "description": "after_label 的别名" }
                 }
             }),
             Self::WebSearch => serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "query": { "type": "string", "description": "Search query keywords" }
+                    "query": { "type": "string", "description": "搜索关键词" }
                 },
                 "required": ["query"]
             }),
             Self::WebFetch => serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "url": { "type": "string", "description": "URL to fetch content from" },
-                    "prompt": { "type": "string", "description": "Optional prompt or extraction hint for the fetched page" }
+                    "url": { "type": "string", "description": "要抓取内容的 URL" },
+                    "prompt": { "type": "string", "description": "可选的抓取提示词或抽取指令" }
                 },
                 "required": ["url"]
             }),
@@ -560,22 +560,22 @@ impl BuiltinToolName {
                     "kind": {
                         "type": "string",
                         "enum": ["mermaid", "dot", "graph", "flow"],
-                        "description": "Diagram input kind. Use flow for mind maps, hierarchical structures, steps, and process/node flow diagrams. Use graph for relationship/network diagrams. Use mermaid only for Mermaid-specific syntax such as sequence, state, gantt, pie, class, ER, timeline, quadrant, requirement, C4, sankey, xychart, or block diagrams; do not use Mermaid mindmap. Use dot for DOT syntax."
+                        "description": "图表输入类型。flow 用于思维导图、层级结构、步骤和流程节点图；graph 用于关系/网络图；mermaid 仅用于 Mermaid 特定语法（sequence/state/gantt/pie/class/ER/timeline/quadrant/requirement/C4/sankey/xychart/block 等），不要使用 Mermaid mindmap；dot 用于 DOT 语法。"
                     },
-                    "source": { "type": "string", "description": "Diagram source for mermaid or dot kinds. Mermaid mindmap is not supported on the product surface; represent mind maps with kind=flow or kind=graph and graph.nodes/edges." },
+                    "source": { "type": "string", "description": "mermaid 或 dot 类型的图表源码。产品侧不支持 Mermaid mindmap；思维导图请用 kind=flow 或 kind=graph，配合 graph.nodes/edges 表达。" },
                     "graph": {
                         "type": "object",
-                        "description": "Structured graph payload for graph or flow kinds. For mind maps, put the central topic as the first/root node and connect child topics with explicit edges.",
+                        "description": "graph 或 flow 类型使用的结构化图数据。思维导图请把中心主题作为第一个/根节点，并用显式 edges 连接子主题。",
                         "properties": {
                             "nodes": {
                                 "type": "array",
-                                "description": "Nodes with id, label, and optional group/data fields",
+                                "description": "节点列表，每个节点包含 id、label，及可选的 group/data 字段",
                                 "items": {
                                     "type": "object",
                                     "properties": {
-                                        "id": { "type": "string", "description": "Stable node id" },
-                                        "label": { "type": "string", "description": "Human-readable node label" },
-                                        "group": { "type": "string", "description": "Optional node group" },
+                                        "id": { "type": "string", "description": "稳定的节点 id" },
+                                        "label": { "type": "string", "description": "可读的节点标签" },
+                                        "group": { "type": "string", "description": "可选的节点分组" },
                                         "position": {
                                             "type": "object",
                                             "properties": {
@@ -583,22 +583,22 @@ impl BuiltinToolName {
                                                 "y": { "type": "number" }
                                             }
                                         },
-                                        "data": { "type": "object", "description": "Optional renderer-specific node metadata" }
+                                        "data": { "type": "object", "description": "可选的渲染器节点元数据" }
                                     },
                                     "required": ["id"]
                                 }
                             },
                             "edges": {
                                 "type": "array",
-                                "description": "Edges with source, target, and optional label/data fields",
+                                "description": "边列表，每条边包含 source、target，及可选的 label/data 字段",
                                 "items": {
                                     "type": "object",
                                     "properties": {
-                                        "id": { "type": "string", "description": "Optional stable edge id" },
-                                        "source": { "type": "string", "description": "Source node id" },
-                                        "target": { "type": "string", "description": "Target node id" },
-                                        "label": { "type": "string", "description": "Human-readable edge label" },
-                                        "data": { "type": "object", "description": "Optional renderer-specific edge metadata" }
+                                        "id": { "type": "string", "description": "可选的稳定边 id" },
+                                        "source": { "type": "string", "description": "起点节点 id" },
+                                        "target": { "type": "string", "description": "终点节点 id" },
+                                        "label": { "type": "string", "description": "可读的边标签" },
+                                        "data": { "type": "object", "description": "可选的渲染器边元数据" }
                                     },
                                     "required": ["source", "target"]
                                 }
@@ -606,50 +606,50 @@ impl BuiltinToolName {
                         },
                         "required": ["nodes", "edges"]
                     },
-                    "title": { "type": "string", "description": "Optional diagram title" },
+                    "title": { "type": "string", "description": "可选的图表标题" },
                     "layout": {
                         "type": "string",
                         "enum": ["auto", "dagre", "elk", "tidy-tree", "cose", "force", "fcose", "cose-bilkent", "grid", "circle", "preset"],
-                        "description": "Preferred layout. auto lets the renderer pick a sensible layout for the kind."
+                        "description": "偏好布局。auto 让渲染器根据 kind 自行决定合适的布局。"
                     },
-                    "interactive": { "type": "boolean", "description": "Whether the renderer should enable pan, zoom, and node interaction when supported" },
-                    "theme": { "type": "string", "description": "Diagram theme hint" }
+                    "interactive": { "type": "boolean", "description": "渲染器是否启用平移、缩放和节点交互（若支持）" },
+                    "theme": { "type": "string", "description": "图表主题提示" }
                 },
                 "required": ["kind"]
             }),
             Self::KnowledgeQuery => serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "query": { "type": "string", "description": "Natural language query to search project documentation" },
-                    "category": { "type": "string", "description": "Knowledge category: all, readme, docs, code (default: all)" }
+                    "query": { "type": "string", "description": "用于检索项目文档的自然语言问题" },
+                    "category": { "type": "string", "description": "知识分类：all、readme、docs、code（默认 all）" }
                 },
                 "required": ["query"]
             }),
             Self::AgentSpawn => serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "role": { "type": "string", "description": "Registered agent role id, e.g. architect / integration-dev / reviewer / debugger" },
-                    "goal": { "type": "string", "description": "Concrete goal for the sub-task; the role-level system prompt will be combined with this goal" },
+                    "role": { "type": "string", "description": "已注册的 agent 角色 id，如 architect / integration-dev / reviewer / debugger" },
+                    "goal": { "type": "string", "description": "子任务的具体目标；角色级 system prompt 会与该目标合并使用" },
                     "task_kind": {
                         "type": "string",
                         "enum": ["work_package", "action", "validation", "repair"],
-                        "description": "Task kind for the new sub-task. Defaults to action when omitted."
+                        "description": "新建子任务的类型。省略时默认 action。"
                     },
-                    "context": { "type": "string", "description": "Optional context summary handed to the sub-agent (single string)." },
-                    "working_dir": { "type": "string", "description": "Optional absolute working directory; defaults to the parent task's workspace root" },
-                    "parallelism_group": { "type": "string", "description": "Optional parallelism group name; sub-agents in the same group are mutually exclusive on the same SpawnGraph branch" }
+                    "context": { "type": "string", "description": "可选的上下文摘要，传递给子 agent（单一字符串）。" },
+                    "working_dir": { "type": "string", "description": "可选的绝对工作目录；默认沿用父任务的 workspace 根目录" },
+                    "parallelism_group": { "type": "string", "description": "可选的并行组名；同一 SpawnGraph 分支下相同组名的子 agent 互斥执行" }
                 },
                 "required": ["role", "goal"]
             }),
             Self::SendMessage => serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "target_task_id": { "type": "string", "description": "Recipient task id within the same mission" },
-                    "payload": { "type": "string", "description": "Message payload — free-form text or JSON-encoded structured data" },
+                    "target_task_id": { "type": "string", "description": "同一 mission 内的接收方任务 id" },
+                    "payload": { "type": "string", "description": "消息载荷——自由文本或 JSON 编码的结构化数据" },
                     "kind": {
                         "type": "string",
                         "enum": ["reply", "directive", "status", "result"],
-                        "description": "Message kind hint for the recipient. Defaults to reply."
+                        "description": "给接收方的消息类型提示。默认 reply。"
                     }
                 },
                 "required": ["target_task_id", "payload"]
@@ -657,8 +657,8 @@ impl BuiltinToolName {
             Self::TaskStop => serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "target_task_id": { "type": "string", "description": "Task to terminate; all descendants in the SpawnGraph are cascade-stopped" },
-                    "reason": { "type": "string", "description": "Short reason for the termination, surfaced in the cancelled task's evidence trail" }
+                    "target_task_id": { "type": "string", "description": "要终止的任务 id；SpawnGraph 中的所有后代任务级联停止" },
+                    "reason": { "type": "string", "description": "终止原因简述，会出现在被取消任务的证据链路中" }
                 },
                 "required": ["target_task_id"]
             }),
@@ -667,22 +667,22 @@ impl BuiltinToolName {
                 "properties": {
                     "todos": {
                         "type": "array",
-                        "description": "New full list of todos. Replaces the current ledger in its entirety.",
+                        "description": "新的完整 todo 列表。每次调用整表覆盖当前账本。",
                         "items": {
                             "type": "object",
                             "properties": {
                                 "content": {
                                     "type": "string",
-                                    "description": "Imperative description of the step, e.g. 'Run tests'"
+                                    "description": "祈使句描述的步骤，例如 'Run tests'"
                                 },
                                 "activeForm": {
                                     "type": "string",
-                                    "description": "Present-continuous form shown while the step is in_progress, e.g. 'Running tests'"
+                                    "description": "in_progress 状态下展示的进行时形式，例如 'Running tests'"
                                 },
                                 "status": {
                                     "type": "string",
                                     "enum": ["pending", "in_progress", "completed"],
-                                    "description": "Step status. At most one item should be in_progress at a time."
+                                    "description": "步骤状态。同时只允许有一个步骤处于 in_progress。"
                                 }
                             },
                             "required": ["content", "activeForm", "status"]
@@ -697,28 +697,28 @@ impl BuiltinToolName {
                     "action": {
                         "type": "string",
                         "enum": ["save", "delete"],
-                        "description": "save: upsert a memory entry; delete: remove an existing entry by file_stem."
+                        "description": "save: 新增或更新一条记忆；delete: 按 file_stem 删除已有记忆。"
                     },
                     "file_stem": {
                         "type": "string",
-                        "description": "File name without extension. Only [A-Za-z0-9_-] are allowed. Reserved name MEMORY is rejected."
+                        "description": "不含扩展名的文件名，只允许 [A-Za-z0-9_-]。保留名 MEMORY 会被拒绝。"
                     },
                     "name": {
                         "type": "string",
-                        "description": "Short human title used in the MEMORY.md index. Required when action=save."
+                        "description": "用于 MEMORY.md 索引的简短标题。action=save 时必填。"
                     },
                     "description": {
                         "type": "string",
-                        "description": "One-line hook describing what this memory is about; shown in the index. Required when action=save."
+                        "description": "用于索引的一行式描述，说明这条记忆是关于什么的。action=save 时必填。"
                     },
                     "kind": {
                         "type": "string",
                         "enum": ["user", "feedback", "project", "reference"],
-                        "description": "Memory category. Required when action=save."
+                        "description": "记忆分类。action=save 时必填。"
                     },
                     "body": {
                         "type": "string",
-                        "description": "Full markdown body of the memory file. Required when action=save."
+                        "description": "完整的 markdown 正文。action=save 时必填。"
                     }
                 },
                 "required": ["action", "file_stem"]
@@ -728,26 +728,26 @@ impl BuiltinToolName {
                 "properties": {
                     "title": {
                         "type": "string",
-                        "description": "Short headline describing what the mission delivers."
+                        "description": "描述本 mission 交付什么的简短标题。"
                     },
                     "goal": {
                         "type": "string",
-                        "description": "Full statement of the user's intent and the outcome the mission is committing to."
+                        "description": "完整阐述用户意图，以及 mission 承诺达成的结果。"
                     },
                     "success_criteria": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Verifiable bullets defining when the mission counts as done."
+                        "description": "可验证的条目，定义 mission 何时算完成。"
                     },
                     "constraints": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Hard constraints (scope / tech / time / policy) that bound the mission."
+                        "description": "限定 mission 边界的硬约束（范围 / 技术 / 时间 / 策略）。"
                     },
                     "stakeholders": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "People or roles whose interests must be honored."
+                        "description": "需要被尊重的相关人或角色。"
                     }
                 }
             }),
@@ -756,31 +756,31 @@ impl BuiltinToolName {
                 "properties": {
                     "steps": {
                         "type": "array",
-                        "description": "Full ordered list of plan steps. Each call replaces the existing plan.",
+                        "description": "完整有序的计划步骤列表。每次调用整表替换现有计划。",
                         "items": {
                             "type": "object",
                             "properties": {
                                 "id": {
                                     "type": "string",
-                                    "description": "Stable identifier (e.g. 's1', 'audit-deps'). Used by depends_on."
+                                    "description": "稳定标识符（如 's1'、'audit-deps'）。供 depends_on 引用。"
                                 },
                                 "content": {
                                     "type": "string",
-                                    "description": "One-line description of what this step achieves."
+                                    "description": "本步骤目标的一行描述。"
                                 },
                                 "status": {
                                     "type": "string",
                                     "enum": ["pending", "in_progress", "completed", "cancelled"],
-                                    "description": "Step status; defaults to 'pending' if omitted."
+                                    "description": "步骤状态；省略时默认 'pending'。"
                                 },
                                 "depends_on": {
                                     "type": "array",
                                     "items": { "type": "string" },
-                                    "description": "Optional list of step ids this step depends on. All ids must exist in steps."
+                                    "description": "可选的依赖步骤 id 列表，所有 id 必须在 steps 中存在。"
                                 },
                                 "notes": {
                                     "type": "string",
-                                    "description": "Optional rationale or scratch note for this step."
+                                    "description": "本步骤的可选理由或备注。"
                                 }
                             },
                             "required": ["id", "content"]
@@ -795,28 +795,28 @@ impl BuiltinToolName {
                     "kind": {
                         "type": "string",
                         "enum": ["symbol", "decision", "risk"],
-                        "description": "Fact bucket. 'symbol' for code/module facts, 'decision' for ADR-style choices, 'risk' for hazards or constraints to watch."
+                        "description": "事实分类。'symbol' 用于代码/模块事实；'decision' 用于 ADR 风格的决策；'risk' 用于需要关注的隐患或约束。"
                     },
                     "id": {
                         "type": "string",
-                        "description": "Stable id within the bucket. Re-using the same (kind, id) overwrites the previous fact and bumps its version."
+                        "description": "分类内的稳定 id。复用同一 (kind, id) 会覆盖旧事实并提升版本号。"
                     },
                     "content": {
                         "type": "string",
-                        "description": "Statement of the fact in one to a few sentences."
+                        "description": "用一至几句话陈述该事实。"
                     },
                     "reference": {
                         "type": "string",
-                        "description": "Optional pointer: file path, URL, ADR id — wherever the fact came from."
+                        "description": "可选指针：文件路径、URL、ADR id 等事实来源。"
                     },
                     "tags": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Optional free-form tags to help future search/filter."
+                        "description": "可选的自由标签，便于后续检索/过滤。"
                     },
                     "tombstoned": {
                         "type": "boolean",
-                        "description": "Set to true to retire this fact. Tombstoned facts stay on disk but are hidden from prompt injection."
+                        "description": "置为 true 表示废弃。被废弃的事实仍保留在磁盘上，但不再注入 prompt。"
                     }
                 },
                 "required": ["kind", "id", "content"]
@@ -826,79 +826,79 @@ impl BuiltinToolName {
                 "properties": {
                     "plan_step_id": {
                         "type": "string",
-                        "description": "Id of the Plan step this validation covers. Must match a step in the current mission's plan.md."
+                        "description": "本次验证覆盖的 Plan 步骤 id，必须匹配当前 mission plan.md 中的某个步骤。"
                     },
                     "kind": {
                         "type": "string",
                         "enum": ["test_suite", "type_check", "integration_smoke", "benchmark"],
-                        "description": "Validation category: unit/integration tests, static type checking, end-to-end smoke, or performance benchmark."
+                        "description": "验证类型：单元/集成测试、静态类型检查、端到端冒烟、性能基准。"
                     },
                     "outcome": {
                         "type": "string",
                         "enum": ["pass", "fail", "skipped"],
-                        "description": "Result of the validation run. A Plan step is only considered complete when it has at least one Pass and no unresolved Fail."
+                        "description": "验证结果。一个 Plan 步骤至少有一次 pass 且没有未解决的 fail 时才算完成。"
                     },
                     "command": {
                         "type": "string",
-                        "description": "Optional command line that produced this outcome (e.g. 'cargo test -p magi-api'). Lets the next reader reproduce."
+                        "description": "可选：产生本次结果的命令行（如 'cargo test -p magi-api'），便于后续复现。"
                     },
                     "evidence": {
                         "type": "string",
-                        "description": "Optional short summary of the run (count of passing tests, failing assertion, perf number) — keep it diff-friendly."
+                        "description": "可选：本次运行的简短摘要（通过用例数、失败断言、性能数值等）——保持 diff 友好。"
                     }
                 },
                 "required": ["plan_step_id", "kind", "outcome"]
             }),
             Self::Checkpoint => serde_json::json!({
                 "type": "object",
-                "description": "Append a Mission checkpoint record. Recovery kinds (process_restart / context_compaction / phase_transition) MUST carry a non-empty workspace_commit and every entry in open_conversations MUST point at recovery_ref or execution_chain_ref — incomplete recovery sets are rejected.",
+                "description": "追加一条 Mission 检查点记录。恢复类型（process_restart / context_compaction / phase_transition）必须携带非空的 workspace_commit，且 open_conversations 中的每一项都必须指向 recovery_ref 或 execution_chain_ref ——不完整的恢复集会被拒绝。",
                 "properties": {
                     "kind": {
                         "type": "string",
                         "enum": ["process_restart", "context_compaction", "phase_transition", "manual"],
-                        "description": "Checkpoint category. process_restart = daemon restart boundary; context_compaction = conversation just got summarized; phase_transition = a Plan phase boundary; manual = operator-triggered (only manual may skip the recovery set)."
+                        "description": "检查点分类。process_restart = daemon 重启边界；context_compaction = 会话刚被压缩；phase_transition = 一个 Plan 阶段边界；manual = 操作者触发（只有 manual 允许跳过恢复集）。"
                     },
                     "label": {
                         "type": "string",
-                        "description": "Short human-readable label so a future reader can pick the right checkpoint at a glance."
+                        "description": "简短可读的标签，方便后续读者快速挑选正确的检查点。"
                     },
                     "plan_version": {
                         "type": "integer",
-                        "description": "Optional plan version number captured at this checkpoint (lets recovery diff against the current plan)."
+                        "description": "可选：本检查点捕获的 plan 版本号（恢复时可与当前 plan diff）。"
                     },
                     "kg_fact_count": {
                         "type": "integer",
-                        "description": "Optional count of mission KG facts at this checkpoint."
+                        "description": "可选：本检查点处 mission KG 事实总数。"
                     },
                     "workspace_commit": {
                         "type": "string",
-                        "description": "Workspace VCS commit/ref captured at this checkpoint. REQUIRED for recovery kinds; only optional when kind=manual."
+                        "description": "本检查点捕获的 workspace VCS commit / ref。恢复类型必填；仅 kind=manual 时可选。"
                     },
                     "open_conversations": {
                         "type": "array",
-                        "description": "List of session recovery pointers. Each entry MUST carry session_id plus either recovery_ref or execution_chain_ref so the runtime can rebuild the active execution chain / mailbox after restart.",
+                        "description": "session 恢复指针列表。每项必须包含 session_id 以及 recovery_ref / execution_chain_ref 至少其一，使运行时能在重启后重建活跃 ExecutionChain / mailbox。",
                         "items": {
                             "type": "object",
                             "properties": {
                                 "session_id": {
                                     "type": "string",
-                                    "description": "Session identifier whose execution chain needs to be recoverable."
+                                    "description": "需要可恢复 ExecutionChain 的会话标识。"
                                 },
                                 "recovery_ref": {
                                     "type": "string",
-                                    "description": "Pointer into the session-store recovery sidecar (Conversation/Mailbox snapshot). At least one of recovery_ref or execution_chain_ref must be present."
+                                    "description": "指向 session-store 恢复 sidecar（Conversation/Mailbox 快照）的指针。recovery_ref 与 execution_chain_ref 至少存在其一。"
                                 },
                                 "execution_chain_ref": {
                                     "type": "string",
-                                    "description": "Pointer into the active ExecutionChain log so child results can be re-routed to the parent mailbox after recovery."
+                                    "description": "指向活跃 ExecutionChain 日志的指针，便于恢复后将子任务结果重新路由回父 mailbox。"
                                 },
                                 "turn_cursor": {
                                     "type": "integer",
-                                    "description": "Optional last applied turn cursor — used to detect drift between checkpoint and recovery sidecar."
+                                    "description": "可选：最后应用的轮次游标——用于检测 checkpoint 与恢复 sidecar 之间的漂移。"
                                 },
                                 "pending_mailbox": {
                                     "type": "integer",
-                                    "description": "Optional count of mailbox items still pending — helps the operator decide whether resume is safe."
+                                    "description": "可选：仍未处理的 mailbox 条目数——帮助操作者判断恢复是否安全。"
                                 }
                             },
                             "required": ["session_id"]
@@ -906,7 +906,7 @@ impl BuiltinToolName {
                     },
                     "notes": {
                         "type": "string",
-                        "description": "Optional free-form notes (e.g. why this checkpoint, what to watch out for when restoring)."
+                        "description": "可选的自由备注（例如为何记录此检查点、恢复时需注意什么）。"
                     }
                 },
                 "required": ["kind"]
@@ -916,19 +916,19 @@ impl BuiltinToolName {
                 "properties": {
                     "plan_step_id": {
                         "type": "string",
-                        "description": "Identifier of the Plan step that triggered the request (must match an existing plan step id)."
+                        "description": "触发本请求的 Plan 步骤标识（必须匹配已有的 plan 步骤 id）。"
                     },
                     "prompt_to_human": {
                         "type": "string",
-                        "description": "The question or decision the operator needs to resolve. Be specific: state options, trade-offs, and what 'approve' versus 'reject' means in context."
+                        "description": "需要操作者解决的问题或决策。请明确：可选项、权衡、以及当前语境下 'approve' 与 'reject' 各自意味着什么。"
                     },
                     "label": {
                         "type": "string",
-                        "description": "Optional short headline shown alongside the pending request in the operator dashboard."
+                        "description": "可选的短标题，与待决请求一起展示在操作者面板上。"
                     },
                     "context": {
                         "type": "string",
-                        "description": "Optional free-form supplementary context (links, snippets, prior decisions) the operator may need to make a call."
+                        "description": "可选的自由补充上下文（链接、片段、前置决策等），供操作者参考。"
                     }
                 },
                 "required": ["plan_step_id", "prompt_to_human"]
@@ -3976,10 +3976,10 @@ mod tests {
             .as_str()
             .unwrap_or_default();
 
-        assert!(kind_description.contains("mind maps"));
-        assert!(kind_description.contains("do not use Mermaid mindmap"));
-        assert!(source_description.contains("Mermaid mindmap is not supported"));
-        assert!(graph_description.contains("central topic"));
+        assert!(kind_description.contains("思维导图"));
+        assert!(kind_description.contains("不要使用 Mermaid mindmap"));
+        assert!(source_description.contains("不支持 Mermaid mindmap"));
+        assert!(graph_description.contains("中心主题"));
     }
 
     #[test]
