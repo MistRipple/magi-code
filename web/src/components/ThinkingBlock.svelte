@@ -84,32 +84,13 @@
     box-shadow: 0 0 0 1px rgba(168, 85, 247, 0.2);
   }
 
-  .thinking-header {
-    display: flex;
-    align-items: center;
-    gap: var(--space-3);
-    width: 100%;
-    padding: var(--space-2) var(--space-4);
-    background: transparent;
-    border: none;
-    text-align: left;
-    cursor: pointer;
-    transition: background var(--transition-fast);
-  }
-
+  /* header 高度/padding/字号/accent 条/chevron 等共享规范见 styles/tool-card.css；
+     ThinkingBlock 特有：hover 用紫色 brand 而非通用 surface-hover */
   .thinking-header:hover {
     background: rgba(139, 92, 246, 0.1);
   }
 
-  .chevron {
-    display: flex;
-    transition: transform var(--transition-fast);
-    color: var(--foreground-muted);
-  }
-
-  .collapsed .chevron { transform: rotate(0deg); }
-  .thinking-block:not(.collapsed) .chevron { transform: rotate(90deg); }
-
+  /* icon 保留紫色 brand 作为思考类型识别色（accent 条已用同色，形成视觉呼应） */
   .thinking-icon {
     display: flex;
     color: #a855f7;
@@ -118,10 +99,6 @@
   .thinking-title {
     flex: 1;
     min-width: 0;
-    font-weight: 500;
-    font-size: var(--text-sm);
-    color: var(--foreground);
-    white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
   }
