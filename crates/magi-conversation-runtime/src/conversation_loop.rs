@@ -326,16 +326,49 @@ fn run_conversation_loop_inner(
     } = request;
 
     let mut messages = Vec::new();
-    // === Segment 1-8 · 由上游 task_execution_dispatcher::assemble_prompt 预拼装 ===
-    //   S1: 角色 / agent role 系统提示（system_prompt 参数本身）
-    //   S2: 用户基础 task goal / title 包装
-    //   S3: 上下文摘要（knowledge / memory / shared_context — 通过 context_runtime）
-    //   S4: task_fact_context（task 已知事实，由 task_execution_dispatcher 抽取）
-    //   S5: skill prompt injections（apply_skill_prompt_injections）
-    //   S6: 用户规则（settings.userRules）
-    //   S7: 生命周期通知（mission resume notice 等，统一裹 `<system-reminder>` 标签）
-    //   S8: SafetyGate 派生的危险模式列表（resolve_safeguard_prompt）
-    // 这 8 段已经在 `system_prompt` 文本里串好；下方按消息级独立 push 的为 S9-S17 + 运行时锚点。
+    // ===================================================================
+    // 17 段 prompt 装配 · 缓存边界 (Phase 3.2)
+    // -------------------------------------------------------------------
+    // S-ID 是逻辑标识（外部 dispatcher / docs 交叉引用稳定），下方
+    // **emission order 按 LLM prompt 缓存友好度重排**：STATIC → SEMI-STATIC
+    // → DYNAMIC。任何一段 DYNAMIC 内容变化都会让其下方所有消息的缓存键失
+    // 效，因此越静态的段越往前推。修改本块时务必保持这个分层不变。
+    //
+    //   Tier A · STATIC      —— 同一角色 / workspace / mission 多轮内不变
+    //     S1   角色 / agent role 系统提示  (assemble_prompt 上游产出)
+    //     S8b  Workspace 根目录上下文
+    //     S13  Mission Workspace 路径
+    //
+    //   Tier B · SEMI-STATIC —— 同一 mission 跨轮通常稳定，偶有更新
+    //     S10  ProjectMemory 索引
+    //     S11  MissionCharter
+    //
+    //   Tier C · DYNAMIC     —— 每轮都可能变化
+    //     S9   TodoLedger 快照
+    //     S12  Plan
+    //     S14  KnowledgeGraph
+    //     S15  ValidationRunner
+    //     S16  Checkpoint
+    //     S17  HumanCheckpoint
+    //     Mailbox 待处理消息
+    //     Thread 历史 (append-only — 前缀稳定，append 不破前缀缓存)
+    //     本轮 user 输入 (S2-S8 由 assemble_prompt 预拼装)
+    //
+    // S1-S8 由上游 task_execution_dispatcher::assemble_prompt 串到
+    // `system_prompt` / `prompt` 两个参数里：
+    //   S1 → system_prompt (本函数 system 消息首条)
+    //   S2 base task goal / title
+    //   S3 上下文摘要 (knowledge / memory / shared_context)
+    //   S4 task_fact_context
+    //   S5 skill prompt injections (apply_skill_prompt_injections)
+    //   S6 用户规则 (settings.userRules)
+    //   S7 生命周期通知 (`<system-reminder>` 包装)
+    //   S8 SafetyGate 危险模式
+    //  S2-S8 进 `prompt` 用户消息，位于运行时尾部。
+    // ===================================================================
+
+    // -------- Tier A · STATIC --------
+    // [CACHE: STATIC] S1 · 角色 / agent role 系统提示。
     if let Some(system) = system_prompt {
         messages.push(ChatMessage {
             role: "system".to_string(),
@@ -344,7 +377,7 @@ fn run_conversation_loop_inner(
             tool_call_id: None,
         });
     }
-    // === Segment 8b · Workspace 根目录上下文 ===
+    // [CACHE: STATIC] S8b · Workspace 根目录上下文。
     // 引导模型把"当前项目 / current repo"等措辞默认对齐到该 workspace；
     // 并强制 Git 状态命令前必须先做 NOT_GIT_WORKTREE 探测。
     if let Some(root_path) = workspace_root_path.as_ref() {
@@ -357,20 +390,30 @@ fn run_conversation_loop_inner(
             tool_call_id: None,
         });
     }
-    // === Segment 9 · TodoLedger 快照 ===
-    // 本 session 模型在之前轮次写过 todo_write 时，这里把当前列表渲染进 system prompt，
-    // 让本轮 Turn 起点自动看到分解 + 进度。
-    if let Some(rendered) = todo_ledger.render_for_prompt() {
-        messages.push(ChatMessage {
-            role: "system".to_string(),
-            content: Some(rendered),
-            tool_calls: Vec::new(),
-            tool_call_id: None,
-        });
+    // [CACHE: STATIC] S13 · Mission Workspace 路径。
+    // 告知 agent 当前 mission 独占的 artifacts/logs/memory 目录，
+    // 引导其把产物落在 mission 内，避免散落到用户主目录或随机临时目录。
+    // 路径自 mission 创建后不变，因此前移到 STATIC 层。
+    if let Some(store) = mission_workspace {
+        match store.render_for_prompt(&task.mission_id) {
+            Ok(rendered) => {
+                messages.push(ChatMessage {
+                    role: "system".to_string(),
+                    content: Some(rendered),
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                });
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "MissionWorkspace: 渲染 prompt 失败，本轮跳过");
+            }
+        }
     }
-    // === Segment 10 · ProjectMemory 索引 ===
+
+    // -------- Tier B · SEMI-STATIC --------
+    // [CACHE: SEMI-STATIC] S10 · ProjectMemory 索引。
     // 把 `~/.magi/projects/{slug}/memory/MEMORY.md` 视图渲染进 system prompt，
-    // 跨 conversation 复用同一项目的长期记忆。
+    // 跨 conversation 复用同一项目的长期记忆。仅在 memory_write 后变化。
     if let Some(store) = project_memory {
         match store.render_for_prompt() {
             Ok(Some(rendered)) => {
@@ -387,9 +430,10 @@ fn run_conversation_loop_inner(
             }
         }
     }
-    // === Segment 11 · MissionCharter ===
+    // [CACHE: SEMI-STATIC] S11 · MissionCharter。
     // 当前 mission 的"宪章"（goal / 成功标准 / 约束）作为长效锚点，
-    // 长对话或多 Turn 时让 orchestrator 不会偏离最初承诺。
+    // 长对话或多 Turn 时让 orchestrator 不会偏离最初承诺。mission 创建时
+    // 锚定，仅在显式编辑后变化。
     if let Some(store) = mission_charter {
         match store.render_for_prompt(&task.mission_id) {
             Ok(Some(rendered)) => {
@@ -406,9 +450,23 @@ fn run_conversation_loop_inner(
             }
         }
     }
-    // === Segment 12 · Plan ===
+
+    // -------- Tier C · DYNAMIC --------
+    // [CACHE: DYNAMIC] S9 · TodoLedger 快照。
+    // 本 session 模型在之前轮次写过 todo_write 时，这里把当前列表渲染进 system prompt，
+    // 让本轮 Turn 起点自动看到分解 + 进度。每轮 todo_write 后变化。
+    if let Some(rendered) = todo_ledger.render_for_prompt() {
+        messages.push(ChatMessage {
+            role: "system".to_string(),
+            content: Some(rendered),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        });
+    }
+    // [CACHE: DYNAMIC] S12 · Plan。
     // 当前 mission 的执行计划（steps + 状态 + 依赖）让 orchestrator 在多 Turn
-    // 推进时持续看到"下一步是什么、上一步是否做完"，避免漂移。
+    // 推进时持续看到"下一步是什么、上一步是否做完"，避免漂移。Plan step 状态
+    // 切换会触发变化。
     if let Some(store) = plan {
         match store.render_for_prompt(&task.mission_id) {
             Ok(Some(rendered)) => {
@@ -425,25 +483,7 @@ fn run_conversation_loop_inner(
             }
         }
     }
-    // === Segment 13 · Mission Workspace ===
-    // 告知 agent 当前 mission 独占的 artifacts/logs/memory 目录，
-    // 引导其把产物落在 mission 内，避免散落到用户主目录或随机临时目录。
-    if let Some(store) = mission_workspace {
-        match store.render_for_prompt(&task.mission_id) {
-            Ok(rendered) => {
-                messages.push(ChatMessage {
-                    role: "system".to_string(),
-                    content: Some(rendered),
-                    tool_calls: Vec::new(),
-                    tool_call_id: None,
-                });
-            }
-            Err(err) => {
-                tracing::warn!(error = %err, "MissionWorkspace: 渲染 prompt 失败，本轮跳过");
-            }
-        }
-    }
-    // === Segment 14 · KnowledgeGraph ===
+    // [CACHE: DYNAMIC] S14 · KnowledgeGraph。
     // 把 mission 已经累积的 symbols / decisions / risks 摊在系统提示里，
     // 避免长 mission 跨多个 Conversation 时模型重新讨论已经达成的结论。
     if let Some(store) = knowledge_graph {
@@ -462,7 +502,7 @@ fn run_conversation_loop_inner(
             }
         }
     }
-    // === Segment 15 · ValidationRunner ===
+    // [CACHE: DYNAMIC] S15 · ValidationRunner。
     // 把 mission 当前的 Plan 节点验证结果（test_suite / type_check /
     // integration_smoke / benchmark 的 pass/fail/skipped）摊在系统提示里，
     // 让模型在判断"Plan 节点是否真完成"时直接看到验证证据，而不是凭印象口头声明。
@@ -482,7 +522,7 @@ fn run_conversation_loop_inner(
             }
         }
     }
-    // === Segment 16 · Checkpoint ===
+    // [CACHE: DYNAMIC] S16 · Checkpoint。
     // 把当前 mission 最近若干检查点摊在系统提示里，让模型在跨进程重启 /
     // context 压缩 / phase 切换之后能定位"上次落到哪一步"，决定是否需要从某个
     // checkpoint 重新拉起 mission。
@@ -502,7 +542,7 @@ fn run_conversation_loop_inner(
             }
         }
     }
-    // === Segment 17 · HumanCheckpoint ===
+    // [CACHE: DYNAMIC] S17 · HumanCheckpoint。
     // 把当前 mission 待解决的人工审核点与最近若干已解决项摊在系统提示里；
     // 真正的 pending 硬约束由 agent_spawn 拦截与 TaskRunner gate 执行。
     if let Some(store) = human_checkpoint {
@@ -521,7 +561,7 @@ fn run_conversation_loop_inner(
             }
         }
     }
-    // === Runtime tail · Mailbox 待处理消息 ===
+    // [CACHE: DYNAMIC] Runtime tail · Mailbox 待处理消息。
     // 来自 send_message 的跨 task 投递；按 Conversation 层渲染。
     if let Some(rendered) = render_mailbox_items_for_prompt(&pending_mailbox_items) {
         messages.push(ChatMessage {
@@ -531,9 +571,10 @@ fn run_conversation_loop_inner(
             tool_call_id: None,
         });
     }
-    // === Runtime tail · Thread 历史 ===
+    // [CACHE: APPEND-ONLY] Runtime tail · Thread 历史。
     // P6b：只读取当前 thread 内部已经持久化的运行时输入 / 恢复记录。worker thread
-    // 为单 task 独占，因此这里不能出现同 role 的历史 task 对话。
+    // 为单 task 独占，因此这里不能出现同 role 的历史 task 对话。append-only 语义
+    // 让前缀对缓存稳定；新一轮 append 不破坏先前缀缓存命中。
     let thread_history_snapshot: Vec<ThreadChatMessage> =
         session_store.thread_message_history(thread_id);
     if !thread_history_snapshot.is_empty() {
@@ -550,7 +591,9 @@ fn run_conversation_loop_inner(
             tool_call_id: None,
         });
     }
-    // === Runtime tail · 本轮 user 输入 ===
+    // [CACHE: DYNAMIC] Runtime tail · 本轮 user 输入。
+    // 含 assemble_prompt 预拼装的 S2-S8（base task + 上下文 + skill 注入 +
+    // 用户规则 + lifecycle reminder + safeguard），每轮都重新生成。
     messages.push(ChatMessage {
         role: "user".to_string(),
         content: Some(prompt.clone()),
