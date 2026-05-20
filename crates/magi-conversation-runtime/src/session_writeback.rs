@@ -45,6 +45,31 @@ pub struct PublishedSessionTurnItem {
     pub canonical_item: Option<CanonicalTurnItem>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionTurnStreamUpdate {
+    pub delta: String,
+    pub content_length: usize,
+    pub reset: bool,
+}
+
+pub fn session_turn_stream_update(
+    previous_content: &str,
+    current_content: &str,
+) -> Option<SessionTurnStreamUpdate> {
+    if previous_content == current_content {
+        return None;
+    }
+    let (delta, reset) = current_content
+        .strip_prefix(previous_content)
+        .map(|delta| (delta.to_string(), false))
+        .unwrap_or_else(|| (current_content.to_string(), true));
+    Some(SessionTurnStreamUpdate {
+        delta,
+        content_length: current_content.chars().count(),
+        reset,
+    })
+}
+
 fn published_session_turn_item_from_sidecar(
     sidecar: SessionRuntimeSidecar,
     item_id: &str,
@@ -419,24 +444,55 @@ pub fn publish_session_turn_item_event(
     workspace_id: &Option<WorkspaceId>,
     published: &PublishedSessionTurnItem,
 ) {
+    publish_session_turn_item_event_with_stream_update(
+        event_bus,
+        session_id,
+        workspace_id,
+        published,
+        None,
+    );
+}
+
+pub fn publish_session_turn_item_event_with_stream_update(
+    event_bus: &InMemoryEventBus,
+    session_id: &SessionId,
+    workspace_id: &Option<WorkspaceId>,
+    published: &PublishedSessionTurnItem,
+    stream_update: Option<&SessionTurnStreamUpdate>,
+) {
+    let mut payload = serde_json::json!({
+        "session_id": session_id.to_string(),
+        "workspace_id": workspace_id.as_ref().map(ToString::to_string),
+        "turn_id": published.turn_id,
+        "turn_seq": published.turn_seq,
+        "item": published.item,
+        "current_turn": published.current_turn,
+        "turn_items": published.turn_items,
+        "worker_lanes": published.worker_lanes,
+        "canonical_schema_version": CANONICAL_TURN_SCHEMA_VERSION,
+        "canonical_event_kind": canonical_event_kind(published.canonical_turn.as_ref()),
+        "canonical_turn": published.canonical_turn,
+        "canonical_item": published.canonical_item,
+    });
+    if let Some(stream_update) = stream_update
+        && let Some(object) = payload.as_object_mut()
+    {
+        object.insert(
+            "stream_delta".to_string(),
+            Value::String(stream_update.delta.clone()),
+        );
+        object.insert(
+            "stream_content_length".to_string(),
+            Value::from(stream_update.content_length as u64),
+        );
+        object.insert("stream_reset".to_string(), Value::Bool(stream_update.reset));
+    }
+
     let _ = event_bus.publish(
         EventEnvelope::domain(
             EventId::new(format!("event-session-turn-item-{}", UtcMillis::now().0)),
             "session.turn.item",
-            serde_json::json!({
-                "session_id": session_id.to_string(),
-                "workspace_id": workspace_id.as_ref().map(ToString::to_string),
-                "turn_id": published.turn_id,
-                "turn_seq": published.turn_seq,
-                "item": published.item,
-                "current_turn": published.current_turn,
-                "turn_items": published.turn_items,
-                "worker_lanes": published.worker_lanes,
-                "canonical_schema_version": CANONICAL_TURN_SCHEMA_VERSION,
-                "canonical_event_kind": canonical_event_kind(published.canonical_turn.as_ref()),
-                "canonical_turn": published.canonical_turn,
-                "canonical_item": published.canonical_item,
-            }),
+            payload,
         )
         .with_context(EventContext {
             workspace_id: workspace_id.clone(),
@@ -957,6 +1013,22 @@ mod tests {
         active: AtomicUsize,
         max_active: AtomicUsize,
         delay: Duration,
+    }
+
+    #[test]
+    fn stream_update_reports_append_delta_and_reset() {
+        let appended =
+            session_turn_stream_update("你好", "你好，世界").expect("append update should exist");
+        assert_eq!(appended.delta, "，世界");
+        assert_eq!(appended.content_length, 5);
+        assert!(!appended.reset);
+
+        let reset = session_turn_stream_update("旧内容", "新内容").expect("reset should exist");
+        assert_eq!(reset.delta, "新内容");
+        assert_eq!(reset.content_length, 3);
+        assert!(reset.reset);
+
+        assert!(session_turn_stream_update("same", "same").is_none());
     }
 
     impl ConcurrentToolProbe {

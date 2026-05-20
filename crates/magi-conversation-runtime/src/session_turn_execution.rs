@@ -12,7 +12,8 @@ use crate::{
     session_writeback::{
         append_session_tool_call_items_batch, append_session_turn_error_item,
         append_session_turn_item, publish_current_session_turn_item_event,
-        publish_session_turn_item_event, session_turn_item, upsert_session_turn_item,
+        publish_session_turn_item_event, publish_session_turn_item_event_with_stream_update,
+        session_turn_item, session_turn_stream_update, upsert_session_turn_item,
     },
     settings_store::SettingsStore,
     usage_recording::{
@@ -502,6 +503,10 @@ fn stream_session_turn_round(
         }
         let accumulated_thinking = delta.thinking.as_str();
         if accumulated_thinking.len() > last_thinking_len.get() {
+            let stream_update = {
+                let previous = streamed_thinking.borrow();
+                session_turn_stream_update(&previous, accumulated_thinking)
+            };
             last_thinking_len.set(accumulated_thinking.len());
             {
                 let mut thinking = streamed_thinking.borrow_mut();
@@ -520,11 +525,12 @@ fn stream_session_turn_round(
             if let Some(published) =
                 upsert_session_turn_item(session_store, &request.session_id, item)
             {
-                publish_session_turn_item_event(
+                publish_session_turn_item_event_with_stream_update(
                     event_bus,
                     &request.session_id,
                     &request.workspace_id,
                     &published,
+                    stream_update.as_ref(),
                 );
             }
         }
@@ -541,12 +547,14 @@ fn stream_session_turn_round(
             content.push_str(accumulated);
         }
         let visible_content = normalize_model_stream_preview_content(accumulated);
-        {
+        let stream_update = {
             let current_visible = streamed_visible_content.borrow();
-            if *current_visible == visible_content {
+            let update = session_turn_stream_update(&current_visible, &visible_content);
+            if update.is_none() {
                 return;
             }
-        }
+            update
+        };
         {
             let mut current_visible = streamed_visible_content.borrow_mut();
             current_visible.clear();
@@ -566,11 +574,12 @@ fn stream_session_turn_round(
         apply_request_aliases(&mut item, request);
         if let Some(published) = upsert_session_turn_item(session_store, &request.session_id, item)
         {
-            publish_session_turn_item_event(
+            publish_session_turn_item_event_with_stream_update(
                 event_bus,
                 &request.session_id,
                 &request.workspace_id,
                 &published,
+                stream_update.as_ref(),
             );
         }
     };

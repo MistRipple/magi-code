@@ -13,7 +13,7 @@
 </script>
 
 {#if plan}
-  <div class="plan-card">
+  <div class="plan-card" data-status={plan.riskLevel ?? 'default'}>
     <div class="plan-header">
       <div class="plan-title">
         <Icon name="note" size={14} />
@@ -83,13 +83,34 @@
 {/if}
 
 <style>
+  /* 与 tool-card 风格统一：左 3px 状态色条 + 中性卡身
+     accent 色由 riskLevel 驱动（low=success / medium=warning / high=error），
+     无 riskLevel 时降级为 info（informational 默认态） */
   .plan-card {
+    position: relative;
     background: var(--surface-1);
     border: 1px solid var(--border);
-    border-radius: var(--radius-lg);
-    padding: var(--space-4);
+    border-radius: var(--radius-md);
+    /* padding-left 让出 3px 给 ::before accent 条 */
+    padding: var(--space-4) var(--space-4) var(--space-4) calc(var(--space-4) + 3px);
     margin: var(--space-2) 0;
   }
+
+  .plan-card::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    top: 0;
+    bottom: 0;
+    width: 3px;
+    background: var(--info);
+    pointer-events: none;
+    transition: background var(--transition-fast);
+  }
+
+  .plan-card[data-status='low']::before { background: var(--success); }
+  .plan-card[data-status='medium']::before { background: var(--warning); }
+  .plan-card[data-status='high']::before { background: var(--error); }
 
   .plan-header {
     display: flex;

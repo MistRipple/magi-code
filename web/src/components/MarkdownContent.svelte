@@ -1,10 +1,6 @@
 <script lang="ts">
-  import { setContext } from 'svelte';
-  import SvelteMarkdown from '@humanspeak/svelte-markdown';
-  import { preprocessMarkdown } from '../lib/markdown-utils';
-  import MdCodeBlock from './renderers/MdCodeBlock.svelte';
-  import MdLink from './renderers/MdLink.svelte';
-  import MdImage from './renderers/MdImage.svelte';
+  import { preprocessMarkdown, splitStreamingMarkdown } from '../lib/markdown-utils';
+  import MarkdownRenderer from './MarkdownRenderer.svelte';
 
   // Props — 对外接口保持不变
   interface Props {
@@ -13,40 +9,37 @@
   }
   let { content, isStreaming = false }: Props = $props();
 
-  // 通过 context 向子 renderer 组件传递 isStreaming 状态
-  // 使用 getter 确保子组件总能获取最新值
-  setContext('markdown-streaming', { get isStreaming() { return isStreaming; } });
-
-  // 预处理后的 Markdown 源文本：$derived 同步派生，上游推多快就渲染多快。
-  //
-  // 历史：曾按消息长度阶梯降频（>5000 字 150ms / 2000 字 100ms / 500 字 50ms /
-  // 短消息 16ms）以规避 marked AST 全量重解析的"O(N²) 算力黑洞"。但该方案让
-  // 流式内容呈现为"块状蹦字"（最差 6.7fps），用户感知就是打字机。
-  // 现代浏览器 + 新版 svelte-markdown + marked 解析 5000 字开销已降至个位数 ms，
-  // 不再需要节流；如果未来真的复现长消息卡顿，应该上 Web Worker 或增量 parse，
-  // 而不是把延迟丢回用户视野。
-  const processedSource = $derived(preprocessMarkdown(content || '', isStreaming));
-
-  // 自定义 renderer：覆盖代码块、链接、图片
-  const renderers = {
-    code: MdCodeBlock,
-    link: MdLink,
-    image: MdImage,
-  };
-
-  // marked 选项
-  const options = {
-    breaks: true,
-    gfm: true,
-  };
+  const markdownParts = $derived.by(() => {
+    const source = content || '';
+    if (!isStreaming) {
+      return {
+        isSplit: false,
+        completed: preprocessMarkdown(source, false),
+        stable: '',
+        volatile: '',
+      };
+    }
+    const parts = splitStreamingMarkdown(source);
+    return {
+      isSplit: true,
+      completed: '',
+      stable: preprocessMarkdown(parts.stable, false),
+      volatile: preprocessMarkdown(parts.volatile, true),
+    };
+  });
 </script>
 
 <div class="markdown-content">
-  <SvelteMarkdown
-    source={processedSource}
-    {renderers}
-    {options}
-  />
+  {#if markdownParts.isSplit}
+    {#if markdownParts.stable}
+      <MarkdownRenderer source={markdownParts.stable} isStreaming={false} />
+    {/if}
+    {#if markdownParts.volatile}
+      <MarkdownRenderer source={markdownParts.volatile} isStreaming={true} />
+    {/if}
+  {:else}
+    <MarkdownRenderer source={markdownParts.completed} isStreaming={false} />
+  {/if}
 </div>
 
 <style>
@@ -153,4 +146,3 @@
     border-radius: var(--radius-sm);
   }
 </style>
-

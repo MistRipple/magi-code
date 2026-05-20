@@ -327,6 +327,7 @@ function buildMessage(
   item: CanonicalTurnItem,
   artifactId: string,
   laneMetaById: Map<string, LaneProjectionMeta>,
+  presentationSeq: number,
 ): Message {
   const content = resolveItemContent(item);
   const workerTabId = resolveVisibleWorkerTabId(item);
@@ -334,7 +335,14 @@ function buildMessage(
   const workerId = isWorkerSidechain ? normalizeCanonicalWorkerId(item) : undefined;
   const roleId = isWorkerSidechain ? normalizeCanonicalRoleId(item) : undefined;
   const blocks = buildMessageBlocks(item, content);
-  const isStreaming = item.kind === 'assistant_text' && !isCanonicalTerminalStatus(item.status);
+  // 流式态对 assistant 的 text 与 thinking 都成立：
+  //   - assistant_text：边推 token 边渲染正文；
+  //   - assistant_thinking：边推 thinking delta 边在卡片头亮起"思考中..."。
+  // 旧实现只覆盖 assistant_text，导致 ThinkingBlock 流式标题永远不触发——
+  // ThinkingBlockRenderer 拿到 isStreaming=false，shouldShowStreamingState 恒为 false。
+  const isStreaming =
+    (item.kind === 'assistant_text' || item.kind === 'assistant_thinking') &&
+    !isCanonicalTerminalStatus(item.status);
   const responseDurationMs = canShowTurnResponseDuration(turn, item)
     ? turn.responseDurationMs
     : undefined;
@@ -358,7 +366,11 @@ function buildMessage(
       turnItemId: item.itemId,
       turnItemKind: item.kind,
       turnItemStatus: item.status,
-      itemSeq: item.itemSeq,
+      // 这里写入的是「呈现序号」(presentationSeq)，已经被 computePresentationSeq
+      // 调整过——thinking 项会被排到对应 assistant_text 之前。原始存储序号
+      // (`item.itemSeq`，审计字段) 通过 canonicalItemSeq 单独保留。
+      itemSeq: presentationSeq,
+      canonicalItemSeq: item.itemSeq,
       blockSeq: item.itemSeq,
       laneId: item.laneId,
       laneSeq: item.laneSeq,
@@ -389,6 +401,47 @@ function resolveArtifactId(turn: CanonicalTurn, item: CanonicalTurnItem): string
   return `turn:${turn.turnId}:${item.itemId}`;
 }
 
+/**
+ * 计算 item 在 UI 时间线中的「呈现序号」（presentationSeq）。
+ *
+ * 背景：存储层 `item.itemSeq` 表示「创建顺序」——后端 `submit_regular_session_turn` 在接受
+ * turn 时已预先把 assistant placeholder 占住 item_seq=2（见 sessions.rs
+ * `build_assistant_placeholder_turn_item`）。当流式 thinking delta 到达，
+ * `upsert_current_turn_item` 走 `max(item_seq)+1` 给它 seq=3。所以存储层 thinking 的
+ * item_seq 永远大于对应的 assistant_text。这是合理的（item_seq 是不可变审计字段，
+ * 见 validate_current_turn_item_update 禁止改 item_seq），但 UI 想呈现的是
+ * Anthropic 协议输出顺序——thinking 在 text 之前。
+ *
+ * 这两个职责本就分离：存储层审计 vs 呈现层 UX。Projection 层在这里把呈现顺序一次性
+ * 收敛——thinking 找到同 turn 内最近一个 item_seq 比自己小的 assistant_text，把自己排到
+ * 锚点之前（`peer.itemSeq * 1000 - 1`）。
+ *
+ * 基础公式 `item.itemSeq * 1000` 给每个 item 槽位留 1000 unit 微调空间。结果整数化以兼容
+ * messages.svelte.ts 对 itemSeq 的 `Math.floor` 规范化。
+ *
+ * 该 seq 同时写入 `metadata.itemSeq` 与 `displayOrder`，让两者保持一致——前者参与
+ * compareTimelineSemanticOrder 的第二关排序（决定实际渲染顺序），后者是兜底键。
+ */
+function computePresentationSeq(turn: CanonicalTurn, item: CanonicalTurnItem): number {
+  const baseSeq = item.itemSeq * 1000;
+  if (item.kind !== 'assistant_thinking') {
+    return baseSeq;
+  }
+  let peer: CanonicalTurnItem | null = null;
+  for (const candidate of turn.items) {
+    if (candidate.itemId === item.itemId) continue;
+    if (candidate.kind !== 'assistant_text') continue;
+    if (candidate.itemSeq >= item.itemSeq) continue;
+    if (peer === null || candidate.itemSeq > peer.itemSeq) {
+      peer = candidate;
+    }
+  }
+  if (peer) {
+    return peer.itemSeq * 1000 - 1;
+  }
+  return baseSeq;
+}
+
 function buildArtifact(
   turn: CanonicalTurn,
   item: CanonicalTurnItem,
@@ -399,10 +452,11 @@ function buildArtifact(
   }
   const artifactId = resolveArtifactId(turn, item);
   const workerTabId = resolveVisibleWorkerTabId(item);
+  const presentationSeq = computePresentationSeq(turn, item);
   return {
     artifactId,
     kind: item.kind === 'tool_call' ? 'tool' : 'message',
-    displayOrder: turn.turnSeq * 1000 + item.itemSeq,
+    displayOrder: turn.turnSeq * 1_000_000 + presentationSeq,
     artifactVersion: item.itemVersion,
     anchorEventSeq: 0,
     latestEventSeq: 0,
@@ -412,7 +466,7 @@ function buildArtifact(
     laneId: item.laneId,
     worker: workerTabId,
     messageIds: [artifactId, item.itemId],
-    message: buildMessage(turn, item, artifactId, laneMetaById),
+    message: buildMessage(turn, item, artifactId, laneMetaById, presentationSeq),
   };
 }
 
@@ -580,7 +634,11 @@ function buildDispatchGroupArtifact(turn: CanonicalTurn): TimelineProjectionArti
       turnItemId: artifactId,
       turnItemKind: 'worker_dispatch',
       turnItemStatus: groupStatus,
-      itemSeq: firstItem.itemSeq,
+      // dispatch group 的 itemSeq 同样按 presentationSeq 量级（×1000）保持与
+      // buildMessage 写入值对齐，让 compareTimelineSemanticOrder 在跨 artifact 排序时
+      // 数量级一致。worker_dispatch 没有 thinking 那样的呈现倒挂问题，所以直接乘。
+      itemSeq: firstItem.itemSeq * 1000,
+      canonicalItemSeq: firstItem.itemSeq,
       blockSeq: firstItem.itemSeq,
       cardStreamSeq: firstItem.itemSeq,
       dispatchWaveId: turn.turnId,
@@ -592,7 +650,7 @@ function buildDispatchGroupArtifact(turn: CanonicalTurn): TimelineProjectionArti
   return {
     artifactId,
     kind: 'message',
-    displayOrder: turn.turnSeq * 1000 + firstItem.itemSeq,
+    displayOrder: turn.turnSeq * 1_000_000 + firstItem.itemSeq * 1000,
     artifactVersion: Math.max(...Array.from(laneVersionById.values())),
     anchorEventSeq: 0,
     latestEventSeq: 0,

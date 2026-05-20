@@ -1,6 +1,8 @@
 use crate::session_writeback::{
-    append_session_turn_item_with_task_store, publish_current_session_turn_item_event,
-    publish_session_turn_item_event, session_turn_item, upsert_session_turn_item_with_task_store,
+    SessionTurnStreamUpdate, append_session_turn_item_with_task_store,
+    publish_current_session_turn_item_event, publish_session_turn_item_event,
+    publish_session_turn_item_event_with_stream_update, session_turn_item,
+    session_turn_stream_update, upsert_session_turn_item_with_task_store,
 };
 use crate::task_execution_registry::TaskExecutionRegistry;
 use crate::task_runner_bridge::TaskOutcome;
@@ -674,6 +676,7 @@ fn run_conversation_loop_inner(
         let stream_item_id = task_stream_item_id(task_id, round, streaming_entry_id);
         last_stream_item_id = Some(stream_item_id.clone());
         let streamed_thinking = std::cell::RefCell::new(String::new());
+        let streamed_visible_content = std::cell::RefCell::new(String::new());
         let last_thinking_len = std::cell::Cell::new(0usize);
         let round_started_at = UtcMillis::now();
         let invocation_request = ModelInvocationRequest {
@@ -713,6 +716,7 @@ fn run_conversation_loop_inner(
                     &stream_item_id,
                     (round == 0).then_some(stream_item_id.as_str()),
                     &turn_visibility,
+                    &streamed_visible_content,
                     &delta.content,
                 );
             };
@@ -794,6 +798,7 @@ fn run_conversation_loop_inner(
                 &turn_visibility,
                 "completed",
                 &thinking,
+                None,
             );
         }
         publish_model_usage_record(
@@ -1349,11 +1354,25 @@ fn publish_stream_delta(
     item_id: &str,
     timeline_entry_id: Option<&str>,
     turn_visibility: &TaskTurnVisibility,
+    streamed_visible_content: &std::cell::RefCell<String>,
     accumulated_text: &str,
 ) {
     let visible_text = normalize_model_stream_preview_content(accumulated_text);
     if visible_text.trim().is_empty() {
         return;
+    }
+    let stream_update = {
+        let previous = streamed_visible_content.borrow();
+        let update = session_turn_stream_update(&previous, &visible_text);
+        if update.is_none() {
+            return;
+        }
+        update
+    };
+    {
+        let mut previous = streamed_visible_content.borrow_mut();
+        previous.clear();
+        previous.push_str(&visible_text);
     }
     if let Some(timeline_entry_id) = timeline_entry_id.filter(|_| turn_visibility.is_mainline()) {
         session_store.upsert_timeline_entry(
@@ -1377,7 +1396,13 @@ fn publish_stream_delta(
     if let Some(published) =
         upsert_session_turn_item_with_task_store(session_store, session_id, item, Some(task_store))
     {
-        publish_session_turn_item_event(event_bus, session_id, workspace_id, &published);
+        publish_session_turn_item_event_with_stream_update(
+            event_bus,
+            session_id,
+            workspace_id,
+            &published,
+            stream_update.as_ref(),
+        );
     }
 }
 
@@ -1397,6 +1422,18 @@ fn publish_task_thinking_delta(
     if accumulated_thinking.len() <= last_sent_len.get() {
         return;
     }
+    let trimmed = accumulated_thinking.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let stream_update = {
+        let previous = streamed_thinking.borrow();
+        let update = session_turn_stream_update(previous.trim(), trimmed);
+        if update.is_none() {
+            return;
+        }
+        update
+    };
     last_sent_len.set(accumulated_thinking.len());
     {
         let mut thinking = streamed_thinking.borrow_mut();
@@ -1413,7 +1450,8 @@ fn publish_task_thinking_delta(
         item_id,
         turn_visibility,
         "running",
-        accumulated_thinking,
+        trimmed,
+        stream_update.as_ref(),
     );
 }
 
@@ -1506,6 +1544,7 @@ fn upsert_task_thinking_turn_item(
     turn_visibility: &TaskTurnVisibility,
     status: &str,
     thinking: &str,
+    stream_update: Option<&SessionTurnStreamUpdate>,
 ) {
     let trimmed = thinking.trim();
     if trimmed.is_empty() {
@@ -1523,7 +1562,13 @@ fn upsert_task_thinking_turn_item(
     if let Some(published) =
         upsert_session_turn_item_with_task_store(session_store, session_id, item, Some(task_store))
     {
-        publish_session_turn_item_event(event_bus, session_id, workspace_id, &published);
+        publish_session_turn_item_event_with_stream_update(
+            event_bus,
+            session_id,
+            workspace_id,
+            &published,
+            stream_update,
+        );
     }
 }
 

@@ -88,6 +88,13 @@ export interface CanonicalTurnEvent {
   occurredAt: number;
   turn?: CanonicalTurn;
   item?: CanonicalTurnItem;
+  stream?: CanonicalTurnStreamUpdate;
+}
+
+export interface CanonicalTurnStreamUpdate {
+  delta: string;
+  contentLength: number;
+  reset: boolean;
 }
 
 const CANONICAL_TURN_STATUSES: CanonicalTurnStatus[] = ['pending', 'running', 'completed', 'blocked', 'failed', 'cancelled'];
@@ -118,6 +125,16 @@ function readString(record: Record<string, unknown>, ...keys: string[]): string 
     }
   }
   return '';
+}
+
+function readRawString(record: Record<string, unknown>, ...keys: string[]): string | undefined {
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === 'string') {
+      return value;
+    }
+  }
+  return undefined;
 }
 
 function readNumber(record: Record<string, unknown>, ...keys: string[]): number | undefined {
@@ -196,6 +213,21 @@ function normalizeCanonicalVisibility(value: unknown): CanonicalTurnVisibility {
   const record = readRecord(value) || {};
   return {
     renderable: readBoolean(record, true, 'renderable'),
+  };
+}
+
+function normalizeCanonicalTurnStreamUpdate(
+  record: Record<string, unknown>,
+): CanonicalTurnStreamUpdate | undefined {
+  const delta = readRawString(record, 'streamDelta', 'stream_delta');
+  const contentLength = readNumber(record, 'streamContentLength', 'stream_content_length');
+  if (delta === undefined || contentLength === undefined) {
+    return undefined;
+  }
+  return {
+    delta,
+    contentLength,
+    reset: readBoolean(record, false, 'streamReset', 'stream_reset'),
   };
 }
 
@@ -304,6 +336,7 @@ export function parseCanonicalTurnEventPayload(
   if (!kind || !sessionId || !turnId || turnSeq === undefined) {
     return undefined;
   }
+  const stream = normalizeCanonicalTurnStreamUpdate(record);
   return {
     schemaVersion: CANONICAL_TURN_SCHEMA_VERSION,
     eventId: options.eventId || readString(record, 'eventId', 'event_id') || `${sessionId}:${turnId}:${options.eventSeq ?? 0}`,
@@ -319,6 +352,7 @@ export function parseCanonicalTurnEventPayload(
       : (readNumber(record, 'occurredAt', 'occurred_at') ?? Date.now()),
     ...(turn ? { turn } : {}),
     ...(item ? { item } : {}),
+    ...(stream ? { stream } : {}),
   };
 }
 

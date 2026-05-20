@@ -46,6 +46,90 @@ export function preprocessMarkdown(content: string, isStreaming: boolean): strin
   return processed;
 }
 
+export interface StreamingMarkdownParts {
+  stable: string;
+  volatile: string;
+}
+
+export function splitStreamingMarkdown(content: string): StreamingMarkdownParts {
+  if (!content) {
+    return { stable: '', volatile: '' };
+  }
+  const boundary = findLastStableStreamingBoundary(content);
+  if (boundary <= 0) {
+    return { stable: '', volatile: content };
+  }
+  if (boundary >= content.length) {
+    return { stable: content, volatile: '' };
+  }
+  return {
+    stable: content.slice(0, boundary),
+    volatile: content.slice(boundary),
+  };
+}
+
+function findLastStableStreamingBoundary(content: string): number {
+  let lastBoundary = 0;
+  let offset = 0;
+  let inFence = false;
+  let fenceMarker = '';
+  let fenceLength = 0;
+  const lines = content.match(/[^\n]*(?:\n|$)/g) ?? [];
+
+  for (const line of lines) {
+    if (!line) {
+      continue;
+    }
+    const nextOffset = offset + line.length;
+    const hasLineEnding = line.endsWith('\n');
+    const lineText = hasLineEnding ? line.slice(0, -1) : line;
+    const fenceMatch = lineText.match(/^ {0,3}(`{3,}|~{3,})/);
+    let closedFence = false;
+
+    if (fenceMatch) {
+      const markerToken = fenceMatch[1];
+      const markerChar = markerToken[0];
+      const markerLength = Math.max(3, markerToken.length);
+      if (!inFence) {
+        const rest = lineText.slice(fenceMatch[0].length);
+        const hasInlineClosingFence = new RegExp(`${markerChar}{${markerLength},}`).test(rest);
+        if (!hasInlineClosingFence) {
+          inFence = true;
+          fenceMarker = markerChar;
+          fenceLength = markerLength;
+        }
+      } else if (
+        fenceMarker === markerChar
+        && markerLength >= fenceLength
+      ) {
+        inFence = false;
+        fenceMarker = '';
+        fenceLength = 0;
+        closedFence = true;
+      }
+    }
+
+    if (
+      hasLineEnding
+      && !inFence
+      && (
+        lineText.trim() === ''
+        || closedFence
+        || isAtxHeadingLine(lineText)
+      )
+    ) {
+      lastBoundary = nextOffset;
+    }
+    offset = nextOffset;
+  }
+
+  return lastBoundary;
+}
+
+function isAtxHeadingLine(line: string): boolean {
+  return /^ {0,3}#{1,6}(?:\s+|$)/.test(line.trimEnd());
+}
+
 function removeTrailingEmptyFence(input: string): string {
   const lines = input.split('\n');
   let lastContentLineIndex = lines.length - 1;

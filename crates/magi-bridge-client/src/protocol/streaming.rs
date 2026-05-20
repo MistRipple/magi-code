@@ -347,8 +347,8 @@ fn parse_anthropic_usage_value(usage: &Value) -> LlmUsage {
 
 #[derive(Clone, Debug, Default)]
 pub struct StreamAccumulator {
-    content_parts: Vec<String>,
-    thinking_parts: Vec<String>,
+    content: String,
+    thinking: String,
     active_tool_calls: Vec<ActiveToolCall>,
     usage: LlmUsage,
     stop_reason: Option<String>,
@@ -370,7 +370,7 @@ impl StreamAccumulator {
         match chunk.kind {
             LlmStreamChunkType::ContentStart | LlmStreamChunkType::ContentDelta => {
                 if let Some(ref text) = chunk.content {
-                    self.content_parts.push(text.clone());
+                    self.content.push_str(text);
                 }
             }
             LlmStreamChunkType::ContentEnd => {
@@ -418,7 +418,7 @@ impl StreamAccumulator {
             LlmStreamChunkType::ToolCallEnd => {}
             LlmStreamChunkType::Thinking => {
                 if let Some(ref text) = chunk.thinking {
-                    self.thinking_parts.push(text.clone());
+                    self.thinking.push_str(text);
                 }
             }
             LlmStreamChunkType::Usage => {
@@ -468,11 +468,8 @@ impl StreamAccumulator {
         });
 
         AdaptedResponse {
-            content: self.content_parts.join(""),
-            thinking: {
-                let thinking = self.thinking_parts.join("");
-                (!thinking.trim().is_empty()).then_some(thinking)
-            },
+            content: self.content,
+            thinking: (!self.thinking.trim().is_empty()).then_some(self.thinking),
             tool_calls,
             usage: self.usage,
             stop_reason,
@@ -481,11 +478,11 @@ impl StreamAccumulator {
     }
 
     pub fn accumulated_content(&self) -> String {
-        self.content_parts.join("")
+        self.content.clone()
     }
 
     pub fn accumulated_thinking(&self) -> String {
-        self.thinking_parts.join("")
+        self.thinking.clone()
     }
 
     pub fn pending_tool_call_count(&self) -> usize {

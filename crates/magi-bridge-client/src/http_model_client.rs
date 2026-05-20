@@ -146,11 +146,7 @@ impl HttpModelBridgeClient {
             HttpModelBridgeProtocol::AnthropicMessages => {
                 let mut adapted = AnthropicMessagesAdapter
                     .build_request(
-                        &llm_message_params_from_invocation(
-                            request,
-                            stream,
-                            self.reasoning_effort,
-                        ),
+                        &llm_message_params_from_invocation(request, stream, self.reasoning_effort),
                         &self.model,
                     )
                     .map_err(|reason| BridgeClientError::CallFailed {
@@ -207,8 +203,7 @@ impl HttpModelBridgeClient {
             let filtered: Vec<&crate::types::ChatMessage> = msgs
                 .iter()
                 .filter(|m| {
-                    m.content.as_deref()
-                        != Some(crate::cache_boundary::PROMPT_CACHE_BOUNDARY)
+                    m.content.as_deref() != Some(crate::cache_boundary::PROMPT_CACHE_BOUNDARY)
                 })
                 .collect();
             serde_json::to_value(&filtered).unwrap_or_else(|_| json!([]))
@@ -406,7 +401,7 @@ fn streaming_http_io(
     let mut last_content_delta_len = 0usize;
     let mut last_thinking_delta_len = 0usize;
 
-    loop {
+    'stream_read: loop {
         let bytes_read =
             response
                 .read(&mut chunk_buf)
@@ -430,35 +425,33 @@ fn streaming_http_io(
             continue;
         }
 
-        let sse_events = sse_parser.feed(&valid_str);
-
-        for sse_event in &sse_events {
+        for sse_event in sse_parser.feed(&valid_str) {
             // 检测 [DONE] 标记
             if sse_event.data.trim() == "[DONE]" {
                 continue;
             }
 
-            let llm_chunks = parse_stream_event(provider_family, sse_event);
+            let llm_chunks = parse_stream_event(provider_family, &sse_event);
             accumulator.apply_all(&llm_chunks);
-        }
 
-        // 当正文或上游 thinking 有增长时通过 channel 发送完整快照。
-        let accumulated_content = accumulator.accumulated_content();
-        let accumulated_thinking = accumulator.accumulated_thinking();
-        if accumulated_content.len() > last_content_delta_len
-            || accumulated_thinking.len() > last_thinking_delta_len
-        {
-            last_content_delta_len = accumulated_content.len();
-            last_thinking_delta_len = accumulated_thinking.len();
-            // 若 receiver 已断开（调用方提前退出），静默忽略
-            if tx
-                .send(StreamMessage::Chunk(ModelStreamingDelta {
-                    content: accumulated_content,
-                    thinking: accumulated_thinking,
-                }))
-                .is_err()
+            // 当正文或上游 thinking 有增长时按 SSE 事件粒度发送完整快照。
+            let accumulated_content = accumulator.accumulated_content();
+            let accumulated_thinking = accumulator.accumulated_thinking();
+            if accumulated_content.len() > last_content_delta_len
+                || accumulated_thinking.len() > last_thinking_delta_len
             {
-                break;
+                last_content_delta_len = accumulated_content.len();
+                last_thinking_delta_len = accumulated_thinking.len();
+                // 若 receiver 已断开（调用方提前退出），静默忽略。
+                if tx
+                    .send(StreamMessage::Chunk(ModelStreamingDelta {
+                        content: accumulated_content,
+                        thinking: accumulated_thinking,
+                    }))
+                    .is_err()
+                {
+                    break 'stream_read;
+                }
             }
         }
     }
@@ -1192,8 +1185,14 @@ mod tests {
             tool_choice: None,
         });
 
-        let messages = body["messages"].as_array().expect("messages should be array");
-        assert_eq!(messages.len(), 3, "boundary marker message should be stripped");
+        let messages = body["messages"]
+            .as_array()
+            .expect("messages should be array");
+        assert_eq!(
+            messages.len(),
+            3,
+            "boundary marker message should be stripped"
+        );
         assert_eq!(messages[0]["content"], "static prompt");
         assert_eq!(messages[1]["content"], "dynamic prompt");
         assert_eq!(messages[2]["content"], "hi");
@@ -1593,6 +1592,14 @@ mod tests {
     }
 
     fn spawn_mock_server(status: u16, response_body: serde_json::Value) -> MockHttpServer {
+        spawn_mock_server_with_response_text(status, "application/json", response_body.to_string())
+    }
+
+    fn spawn_mock_server_with_response_text(
+        status: u16,
+        content_type: &'static str,
+        response_text: String,
+    ) -> MockHttpServer {
         let listener = TcpListener::bind("127.0.0.1:0").expect("mock server should bind");
         let address = listener.local_addr().expect("address should exist");
         let (sender, receiver) = mpsc::channel();
@@ -1666,9 +1673,8 @@ mod tests {
                 anthropic_version,
             });
 
-            let response_text = response_body.to_string();
             let response = format!(
-                "HTTP/1.1 {status} {}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response_text}",
+                "HTTP/1.1 {status} {}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response_text}",
                 status_reason(status),
                 response_text.len()
             );
@@ -1744,6 +1750,55 @@ mod tests {
         assert_eq!(body["messages"][0]["role"], "user");
         assert_eq!(body["messages"][0]["content"], "hello");
         assert_eq!(body["stream"], false);
+    }
+
+    #[test]
+    fn streaming_emits_delta_for_each_sse_event_in_one_http_read() {
+        let server = spawn_mock_server_with_response_text(
+            200,
+            "text/event-stream",
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\n",
+                "data: [DONE]\n\n",
+            )
+            .to_string(),
+        );
+
+        let client = HttpModelBridgeClient::new(
+            server.address.clone(),
+            Some("sk-test-key".to_string()),
+            "gpt-4.1-mini".to_string(),
+        );
+        let deltas = std::cell::RefCell::new(Vec::new());
+
+        let response = client
+            .invoke_streaming(
+                ModelInvocationRequest {
+                    provider: "openai-compatible".to_string(),
+                    prompt: "hello".to_string(),
+                    messages: None,
+                    tools: None,
+                    tool_choice: None,
+                },
+                &|delta| deltas.borrow_mut().push(delta.content.clone()),
+            )
+            .expect("streaming invoke should succeed against mock server");
+
+        assert!(response.ok);
+        assert_eq!(
+            deltas.into_inner(),
+            vec!["Hel".to_string(), "Hello".to_string()],
+            "同一次 HTTP read 中的多个 SSE event 必须逐事件发布，不能被 4096 字节 buffer 合批"
+        );
+
+        let recorded = server
+            .request_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("mock server should receive request");
+        let body: serde_json::Value =
+            serde_json::from_str(&recorded.body).expect("body should be json");
+        assert_eq!(body["stream"], true);
     }
 
     #[test]

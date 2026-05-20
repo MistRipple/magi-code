@@ -28,17 +28,14 @@
       .trim()
   );
 
-  // 生成摘要
-  const summary = $derived.by(() => {
-    if (!thinkingContent) return i18n.t('thinkingBlock.defaultSummary');
-    if (!isStreaming) return i18n.t('thinkingBlock.completedSummary');
-    const plain = thinkingContent
-      .replace(/[#*_`~\[\]()]/g, '')
-      .replace(/\s+/g, ' ')
-      .trim();
-    const firstSentence = plain.split(/[。！？.!?]/)[0];
-    return firstSentence.length <= 50 ? firstSentence : plain.substring(0, 50) + '...';
-  });
+  // 单一标题文案：流式时显示「思考中...」，完成后显示「思考已完成」。
+  // 之前并存「固定标题 + 内容摘要」两层，信息冗余且摘要在长思考输出里读起来割裂，
+  // 现在按状态收敛到一行——读者只关心"还在思考 / 已经思考完"两种状态。
+  const title = $derived(
+    isStreaming
+      ? i18n.t('thinkingBlock.streamingTitle')
+      : i18n.t('thinkingBlock.completedTitle'),
+  );
 
   function toggle() {
     collapsed = !collapsed;
@@ -59,10 +56,7 @@
       <Icon name="clock" size={14} />
     </span>
 
-    <span class="thinking-title">
-      <span class="title-text">{i18n.t('thinkingBlock.title')}</span>
-      <span class="thinking-summary">{summary}</span>
-    </span>
+    <span class="thinking-title">{title}</span>
 
     <span class="thinking-badge">{i18n.t('thinkingBlock.badge', { count: thinking.length })}</span>
   </button>
@@ -123,22 +117,10 @@
 
   .thinking-title {
     flex: 1;
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
-    overflow: hidden;
     min-width: 0;
-  }
-
-  .title-text {
     font-weight: 500;
     font-size: var(--text-sm);
     color: var(--foreground);
-  }
-
-  .thinking-summary {
-    font-size: var(--text-xs);
-    color: var(--foreground-muted);
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;

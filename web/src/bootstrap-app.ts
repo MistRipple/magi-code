@@ -2,6 +2,7 @@ import { mount, type Component } from 'svelte';
 import App from './App.svelte';
 import './styles/global.css';
 import './styles/messages.css';
+import './styles/tool-card.css';
 import { initMessageHandler, primeEventSeqTracking } from './lib/message-handler';
 import { getState, initializeState, setCurrentSessionId } from './stores/messages.svelte';
 import { i18n } from './stores/i18n.svelte';

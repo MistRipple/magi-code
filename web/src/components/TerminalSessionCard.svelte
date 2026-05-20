@@ -418,7 +418,8 @@
     align-items: center;
     gap: var(--space-3);
     width: 100%;
-    padding: var(--space-2) var(--space-4);
+    /* padding-left 让出 3px 给 accent 状态色条（见 styles/tool-card.css） */
+    padding: var(--space-2) var(--space-4) var(--space-2) calc(var(--space-4) + 3px);
     background: transparent;
     border: none;
     text-align: left;
@@ -452,9 +453,10 @@
     transform: rotate(90deg);
   }
 
+  /* tool-icon 中性化：accent 条承担状态色，图标用 muted 避免三层颜色冲突 */
   .tool-icon {
     display: flex;
-    color: var(--info);
+    color: var(--foreground-muted);
   }
 
   .tool-title {
