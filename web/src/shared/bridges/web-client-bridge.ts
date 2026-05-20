@@ -1951,7 +1951,11 @@ async function switchSession(
 
 async function deleteSession(sessionId: string): Promise<void> {
   const payload = await deleteAgentSession(sessionId);
-  await dispatchBootstrap(normalizeBootstrapResponse(payload, { sessionId }), { rawPayload: payload });
+  // 不传 sessionId 提示——它指向已被删除的会话，归一化器会用它去新列表 find()
+  // 找不到然后把 currentSessionId 错误地清空。让 bootstrap 自带的 currentSession 当真值：
+  // 删的是当前会话 → 后端 currentSession 为空，前端也清空；
+  // 删的不是当前会话 → 后端 currentSession 仍是原会话，前端继续保持激活。
+  await dispatchBootstrap(normalizeBootstrapResponse(payload), { rawPayload: payload });
   emitBridgeSuccessToast('删除会话', '会话已删除');
 }
 
@@ -1963,7 +1967,8 @@ async function renameSession(sessionId: string, name: string): Promise<void> {
 
 async function closeSession(sessionId: string): Promise<void> {
   const payload = await closeAgentSession(sessionId);
-  await dispatchBootstrap(normalizeBootstrapResponse(payload, { sessionId }), { rawPayload: payload });
+  // 同 deleteSession：关闭后该会话不再出现在列表里，hint 会让归一化器误清空 currentSessionId
+  await dispatchBootstrap(normalizeBootstrapResponse(payload), { rawPayload: payload });
   emitBridgeSuccessToast('关闭会话', '会话已关闭');
 }
 

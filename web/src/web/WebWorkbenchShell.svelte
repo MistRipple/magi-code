@@ -42,6 +42,12 @@
     type CodeTabPayload,
   } from '../stores/right-pane.svelte';
 
+  // 这两个 storage key 必须先于下方 `$state` 初始化器声明——它们被
+  // readInitialExpandedWorkspaces / readInitialSidebarMode 在 $state 初始化时读取，
+  // 普通的 const 受 TDZ 约束，定义在文件下方会触发 ReferenceError。
+  const SIDEBAR_EXPANDED_WORKSPACES_KEY = 'magi-sidebar-expanded-workspaces';
+  const SIDEBAR_MODE_KEY = 'magi-sidebar-mode';
+
   let loading = $state(true);
   let loadError = $state('');
   let agentBaseUrl = $state('');
@@ -51,7 +57,7 @@
   let pendingSessionSwitchId = $state<string | null>(null);
   let sessionsByWorkspace = $state<Record<string, Session[]>>({});
   let loadingWorkspaceIds = $state<Record<string, boolean>>({});
-  let expandedWorkspaceIds = $state<Record<string, boolean>>({});
+  let expandedWorkspaceIds = $state<Record<string, boolean>>(readInitialExpandedWorkspaces());
   let isMobileViewport = $state(false);
   let viewportWidth = $state(typeof window !== 'undefined' ? window.innerWidth : 1440);
   let sidebarOpen = $state(false);
@@ -64,7 +70,7 @@
   let pendingDeleteSession = $state<{ workspace: AgentWorkspaceSummary; session: Session } | null>(null);
   let webThemePreference = $state<WebThemePreference>('system');
   let webThemeMode = $state<WebThemeMode>('dark');
-  let sidebarMode = $state<'projects' | 'files'>('projects');
+  let sidebarMode = $state<'projects' | 'files'>(readInitialSidebarMode());
   let sidebarWidth = $state<number | null>(null);
   let isSidebarResizing = $state(false);
   let sidebarCollapsed = $state(false);
@@ -125,6 +131,9 @@
     rightPaneVisible && viewportWidth > 0 && viewportWidth <= VIEWPORT_PREVIEW_OVERLAY_BREAKPOINT,
   );
 
+  // 列表同步 effect：把 messagesState.sessions 投影到 sessionsByWorkspace[workspaceId]。
+  // 与"激活指针同步"正交——删除当前会话时 currentSessionId 会被后端清空，但列表本身的
+  // 增删（删除/新建/改名）必须独立地落到 sessionsByWorkspace 上，否则左侧列表不刷新。
   $effect(() => {
     const authoritativeWorkspaceId = typeof messagesState.currentWorkspaceId === 'string'
       ? messagesState.currentWorkspaceId.trim()
@@ -132,16 +141,7 @@
     if (!authoritativeWorkspaceId) {
       return;
     }
-
-    const bootstrapSessionId = typeof messagesState.currentSessionId === 'string'
-      ? messagesState.currentSessionId.trim()
-      : '';
-    if (!bootstrapSessionId) {
-      return;
-    }
-
     const currentSessions = Array.isArray(messagesState.sessions) ? messagesState.sessions : [];
-
     const existingSessions = sessionsByWorkspace[authoritativeWorkspaceId] ?? [];
     const sessionsChanged = existingSessions.length !== currentSessions.length
       || existingSessions.some((session, index) => {
@@ -152,21 +152,50 @@
           || session.updatedAt !== next.updatedAt
           || session.messageCount !== next.messageCount;
       });
-
     if (sessionsChanged) {
       sessionsByWorkspace = {
         ...sessionsByWorkspace,
         [authoritativeWorkspaceId]: currentSessions,
       };
     }
+  });
 
+  // 激活会话指针同步 effect：把 bootstrap 的 currentSessionId 镜像到本地 currentSessionId。
+  // bootstrap 是真值——非空就切过去；空也要镜像为空（删除/关闭/新建当前会话都会让它清空），
+  // 否则本地 currentSessionId 和 URL 残留指向已删除的会话。
+  $effect(() => {
+    const authoritativeWorkspaceId = typeof messagesState.currentWorkspaceId === 'string'
+      ? messagesState.currentWorkspaceId.trim()
+      : '';
+    if (!authoritativeWorkspaceId) {
+      return;
+    }
     if (selectedWorkspaceId !== authoritativeWorkspaceId) {
       return;
     }
-
+    const bootstrapSessionId = typeof messagesState.currentSessionId === 'string'
+      ? messagesState.currentSessionId.trim()
+      : '';
     if (bootstrapSessionId === currentSessionId) {
       return;
     }
+    const workspace = workspaces.find((item) => item.workspaceId === selectedWorkspaceId) ?? null;
+
+    if (!bootstrapSessionId) {
+      // bootstrap 清空（删除/关闭/新建当前会话）→ 同步清空本地指针 + URL 参数
+      currentSessionId = '';
+      if (pendingSessionSwitchTimer) {
+        clearTimeout(pendingSessionSwitchTimer);
+        pendingSessionSwitchTimer = null;
+      }
+      pendingSessionSwitchId = null;
+      if (workspace) {
+        syncBrowserSessionBinding(workspace.workspaceId, workspace.rootPath, null);
+      }
+      return;
+    }
+
+    // 非空：必须存在于当前工作区列表里，避免把别工作区的会话错激活到本地视图
     const belongsToSelectedWorkspace = (sessionsByWorkspace[selectedWorkspaceId] ?? [])
       .some((session) => session.id === bootstrapSessionId);
     if (!belongsToSelectedWorkspace) {
@@ -180,7 +209,6 @@
       }
       pendingSessionSwitchId = null;
     }
-    const workspace = workspaces.find((item) => item.workspaceId === selectedWorkspaceId) ?? null;
     if (workspace) {
       syncBrowserSessionBinding(workspace.workspaceId, workspace.rootPath, bootstrapSessionId);
     }
@@ -481,6 +509,66 @@
       window.localStorage.removeItem(SIDEBAR_COLLAPSED_STORAGE_KEY);
     }
   }
+
+  // ============================================================================
+  // 左侧 sidebar 展开列表 / 模式 持久化
+  // - 用同步 reader 函数作为 $state 初始值；函数声明在 JS 里是 hoist 的，可以放在引用点之后。
+  // - 用 $effect 自动持久化：deep reactive proxy 任何字段变化都会触发；避免在每个 mutation
+  //   末尾手写 persist 调用，新增 mutation 也不会漏。
+  function readInitialExpandedWorkspaces(): Record<string, boolean> {
+    if (typeof window === 'undefined') return {};
+    try {
+      const raw = window.localStorage.getItem(SIDEBAR_EXPANDED_WORKSPACES_KEY);
+      if (!raw) return {};
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== 'object') return {};
+      // 防御性 sanitize：保证只保留 boolean 值，过滤掉非法/老格式
+      const result: Record<string, boolean> = {};
+      for (const [key, value] of Object.entries(parsed)) {
+        if (typeof key === 'string' && typeof value === 'boolean') {
+          result[key] = value;
+        }
+      }
+      return result;
+    } catch {
+      return {};
+    }
+  }
+
+  function persistExpandedWorkspaces(): void {
+    if (typeof window === 'undefined') return;
+    try {
+      window.localStorage.setItem(
+        SIDEBAR_EXPANDED_WORKSPACES_KEY,
+        JSON.stringify(expandedWorkspaceIds),
+      );
+    } catch {
+      // QuotaExceededError 等 → 静默忽略
+    }
+  }
+
+  function readInitialSidebarMode(): 'projects' | 'files' {
+    if (typeof window === 'undefined') return 'projects';
+    const stored = window.localStorage.getItem(SIDEBAR_MODE_KEY);
+    return stored === 'files' ? 'files' : 'projects';
+  }
+
+  function persistSidebarMode(): void {
+    if (typeof window === 'undefined') return;
+    try {
+      window.localStorage.setItem(SIDEBAR_MODE_KEY, sidebarMode);
+    } catch {
+      // 静默忽略
+    }
+  }
+
+  // 自动持久化挂载点；$state proxy 是深度 reactive 的，任何变化都会重新触发 persist。
+  $effect(() => {
+    persistExpandedWorkspaces();
+  });
+  $effect(() => {
+    persistSidebarMode();
+  });
 
   function toggleSidebarCollapsed(): void {
     sidebarCollapsed = !sidebarCollapsed;

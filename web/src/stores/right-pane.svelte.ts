@@ -76,10 +76,117 @@ const EMPTY_SESSION_STATE: SessionPaneState = {
   collapsed: true,
 };
 
+/** localStorage 持久化 key，带 schema 版本号方便后续演化 */
+const STORAGE_KEY = 'magi-right-pane-state.v1';
+/** 持久化 session 总数硬上限：超过后按 lastActivatedAt 倒序保留最近 N 个，防止长期使用膨胀 */
+const MAX_PERSISTED_SESSIONS = 50;
+
+interface PersistedShape {
+  version: 1;
+  activeSessionId: string;
+  perSession: Record<string, SessionPaneState>;
+}
+
+/**
+ * 序列化前裁剪 code tab payload —— content / diff / headSummary / tailSummary
+ * 单条可达 100KB+，恢复后由 RightPane.svelte 的 fetchedContents $effect 重新拉取，
+ * 不需要进 localStorage。元数据（filepath / contentKind / size / mime / symlinkTarget / language）
+ * 全部保留，刷新后能立即识别 tab kind 与文件信息。
+ */
+function sanitizeTabForPersist(tab: RightPaneTab): RightPaneTab {
+  if (tab.kind !== 'code') return tab;
+  const payload = tab.payload as CodeTabPayload;
+  const slim: CodeTabPayload = {
+    filepath: payload.filepath,
+    language: payload.language ?? null,
+    contentKind: payload.contentKind,
+    size: payload.size,
+    mime: payload.mime,
+    symlinkTarget: payload.symlinkTarget,
+    // 显式丢弃：content / diff / headSummary / tailSummary
+  };
+  return { ...tab, payload: slim };
+}
+
+/** 从 localStorage 恢复 perSession + activeSessionId；解析/版本不符则静默回退到空状态 */
+function loadPersisted(): void {
+  if (typeof window === 'undefined') return;
+  try {
+    const raw = window.localStorage.getItem(STORAGE_KEY);
+    if (!raw) return;
+    const parsed = JSON.parse(raw) as PersistedShape;
+    if (!parsed || parsed.version !== 1) return;
+    const recovered: Record<string, SessionPaneState> = {};
+    for (const [sid, state] of Object.entries(parsed.perSession ?? {})) {
+      if (!state || !Array.isArray(state.openTabs)) continue;
+      recovered[sid] = {
+        openTabs: state.openTabs,
+        activeTabId: typeof state.activeTabId === 'string' ? state.activeTabId : null,
+        collapsed: Boolean(state.collapsed),
+      };
+    }
+    rightPaneState.perSession = recovered;
+    rightPaneState.activeSessionId =
+      typeof parsed.activeSessionId === 'string' ? parsed.activeSessionId : '';
+  } catch {
+    // 解析失败 → 维持空状态，不影响应用启动
+  }
+}
+
+/** 把当前 perSession 序列化写入 localStorage；mutation 末尾同步调用 */
+function persistState(): void {
+  if (typeof window === 'undefined') return;
+  try {
+    const entries = Object.entries(rightPaneState.perSession);
+    let kept: [string, SessionPaneState][] = entries;
+    if (entries.length > MAX_PERSISTED_SESSIONS) {
+      // 用 session 内最大 lastActivatedAt 作为 session 整体活跃度，倒序保留 top N
+      const ranked = entries.map(([sid, state]) => {
+        const ts = state.openTabs.reduce((acc, t) => Math.max(acc, t.lastActivatedAt), 0);
+        return { sid, state, ts };
+      });
+      ranked.sort((a, b) => b.ts - a.ts);
+      kept = ranked.slice(0, MAX_PERSISTED_SESSIONS).map((x) => [x.sid, x.state]);
+    }
+    const slim: PersistedShape = {
+      version: 1,
+      activeSessionId: rightPaneState.activeSessionId,
+      perSession: Object.fromEntries(
+        kept.map(([sid, state]) => [
+          sid,
+          {
+            openTabs: state.openTabs.map(sanitizeTabForPersist),
+            activeTabId: state.activeTabId,
+            collapsed: state.collapsed,
+          },
+        ]),
+      ),
+    };
+    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(slim));
+  } catch {
+    // QuotaExceededError / SecurityError 等 → 静默忽略，不影响主流程
+  }
+}
+
 export const rightPaneState = $state<RightPaneRootState>({
   activeSessionId: '',
   perSession: {},
 });
+
+// 模块加载时立即恢复——必须放在 rightPaneState 定义之后、任何使用方读取之前
+loadPersisted();
+
+// 自动持久化：$state proxy 是深度 reactive 的，任何 perSession / activeSessionId / tab 字段
+// 的变化都会被 persistState 内部的遍历"读取"触发，从而重新写入 localStorage。
+// 用 $effect.root 创建与模块寿命同生命周期的 reactive scope；页面 unload 时浏览器自动 GC。
+// 这个收敛实现避免在每个 mutation 末尾手写一次 persist——新增 mutation 函数也不会漏。
+if (typeof window !== 'undefined') {
+  $effect.root(() => {
+    $effect(() => {
+      persistState();
+    });
+  });
+}
 
 function normalizeSessionId(sessionId: string | null | undefined): string {
   if (typeof sessionId !== 'string') {

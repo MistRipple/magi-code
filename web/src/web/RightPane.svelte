@@ -292,13 +292,90 @@
   }
 
   // ============ 交互 ============
+  /**
+   * Tab 条 drag-to-pan 状态：
+   * - 滚轮鼠标横向需求由 onwheel（deltaY → scrollLeft）解决；
+   * - 触控板横滑由原生 deltaX 路径解决；
+   * - 这里补的是「按住鼠标在 tab 条上拖动来平移」——VSCode / Chrome tab strip 的标准交互。
+   */
+  let dragState: { startX: number; startScrollLeft: number; moved: boolean } | null = null;
+  let isDraggingTabs = $state(false);
+  /** 真实拖拽刚结束的时间戳；用于吞掉紧随 pointerup 的 click 事件，避免拖拽结束误切换 tab */
+  let dragEndedAt = 0;
+  const DRAG_THRESHOLD = 4;
+  const DRAG_CLICK_SUPPRESS_MS = 50;
+
+  function recentlyDragged(): boolean {
+    return performance.now() - dragEndedAt < DRAG_CLICK_SUPPRESS_MS;
+  }
+
   function handleTabClick(tabId: string) {
+    if (recentlyDragged()) return;
     setActiveRightPaneTab(sessionId, tabId);
   }
 
   function handleTabClose(event: MouseEvent, tabId: string) {
     event.stopPropagation();
+    if (recentlyDragged()) return;
     closeTab(sessionId, tabId);
+  }
+
+  /**
+   * 单行 tab 条只在水平方向溢出（overflow-x: auto），但标准鼠标滚轮只发出
+   * 垂直方向的 deltaY，浏览器不会自动把它翻译成 scrollLeft——结果就是
+   * 滚轮鼠标用户完全无法浏览溢出的 tab。这里把 deltaY 转成 scrollLeft，
+   * 保留触控板原生 deltaX 走原路径（不重复消费）。
+   */
+  function handleTabsWheel(event: WheelEvent) {
+    if (event.deltaX !== 0) return; // 触控板已经在水平方向输入 delta，不干预
+    if (event.deltaY === 0) return;
+    const target = event.currentTarget as HTMLDivElement;
+    if (target.scrollWidth <= target.clientWidth) return; // 没有溢出就别拦
+    target.scrollLeft += event.deltaY;
+    event.preventDefault();
+  }
+
+  function handleTabsPointerDown(event: PointerEvent) {
+    // 只对鼠标主键启用 drag-to-pan；触摸 / 笔 / 触控板交给原生路径
+    if (event.pointerType !== 'mouse' || event.button !== 0) return;
+    // 关闭按钮 (×) 不接管——保证用户点 × 关闭 tab 时不会进入拖拽
+    const targetEl = event.target as HTMLElement | null;
+    if (targetEl?.closest('.right-pane-tab-close')) return;
+    const strip = event.currentTarget as HTMLDivElement;
+    dragState = {
+      startX: event.clientX,
+      startScrollLeft: strip.scrollLeft,
+      moved: false,
+    };
+  }
+
+  function handleTabsPointerMove(event: PointerEvent) {
+    if (!dragState) return;
+    const dx = event.clientX - dragState.startX;
+    if (!dragState.moved) {
+      if (Math.abs(dx) < DRAG_THRESHOLD) return; // 未越过阈值仍按普通点击处理
+      dragState.moved = true;
+      isDraggingTabs = true;
+      const strip = event.currentTarget as HTMLDivElement;
+      strip.setPointerCapture(event.pointerId);
+    }
+    const strip = event.currentTarget as HTMLDivElement;
+    strip.scrollLeft = dragState.startScrollLeft - dx;
+    event.preventDefault();
+  }
+
+  function handleTabsPointerEnd(event: PointerEvent) {
+    if (!dragState) return;
+    const moved = dragState.moved;
+    dragState = null;
+    if (moved) {
+      dragEndedAt = performance.now();
+      isDraggingTabs = false;
+      const strip = event.currentTarget as HTMLDivElement;
+      if (strip.hasPointerCapture(event.pointerId)) {
+        strip.releasePointerCapture(event.pointerId);
+      }
+    }
   }
 
   function formatSize(value?: number): string {
@@ -323,7 +400,17 @@
 <aside class="right-pane" aria-label={i18n.t('rightPane.title')}>
   <!-- 顶部 Tab 条 + 折叠按钮 -->
   <header class="right-pane-tabbar">
-    <div class="right-pane-tabs" role="tablist" aria-label={i18n.t('rightPane.title')}>
+    <div
+      class="right-pane-tabs"
+      class:dragging={isDraggingTabs}
+      role="tablist"
+      aria-label={i18n.t('rightPane.title')}
+      onwheel={handleTabsWheel}
+      onpointerdown={handleTabsPointerDown}
+      onpointermove={handleTabsPointerMove}
+      onpointerup={handleTabsPointerEnd}
+      onpointercancel={handleTabsPointerEnd}
+    >
       {#each openTabs as tab (tab.id)}
         {@const isActive = tab.id === paneState.activeTabId}
         {@const accent = tabAccent(tab)}
@@ -510,8 +597,13 @@
     min-width: 0;
     overflow-x: auto;
     scrollbar-width: none;
+    /* drag-to-pan：默认抓握光标，提示用户「这一条可以按住拖」；
+       拖拽进行中切到 grabbing 并禁用文字选择，避免选中 tab 文字 */
+    cursor: grab;
+    user-select: none;
   }
   .right-pane-tabs::-webkit-scrollbar { display: none; }
+  .right-pane-tabs.dragging { cursor: grabbing; }
 
   .right-pane-tab {
     flex: 0 0 auto;
