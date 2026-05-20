@@ -1,6 +1,7 @@
 pub mod assignment_dispatch;
 pub mod auto_compaction;
 pub mod base_adapter;
+pub mod cache_boundary;
 mod clients;
 pub mod conversation_compaction;
 pub mod decision_engine;

@@ -5,6 +5,7 @@ use super::capability::supports_extended_thinking;
 use super::utils::{
     convert_messages_to_anthropic, parse_anthropic_usage, serialize_anthropic_tool_definitions,
 };
+use crate::cache_boundary::split_at_cache_boundary;
 use crate::llm_types::{LlmMessageParams, ToolCall};
 use magi_usage_authority::ReasoningEffort;
 
@@ -92,7 +93,7 @@ impl ProviderAdapter for AnthropicMessagesAdapter {
         });
 
         if !system_text.is_empty() {
-            body["system"] = json!(system_text);
+            body["system"] = build_system_field(&system_text);
         }
 
         if thinking_enabled {
@@ -209,5 +210,82 @@ fn truncate(s: &str, max: usize) -> String {
         trimmed.to_string()
     } else {
         format!("{}...", &trimmed[..max])
+    }
+}
+
+/// 根据 system_text 中是否含 [`PROMPT_CACHE_BOUNDARY`] 标记，决定 `system`
+/// 字段的形态：
+///
+/// - 含标记：切成 `[static_prefix, dynamic_suffix]` 两段 content blocks，
+///   静态前缀打 `cache_control: {type: ephemeral}`，命中后输入计费按 1/10。
+/// - 不含标记 / 任一段为空：回退到原有单 string 形态，保持向后兼容
+///   （没有提示词侧 boundary 的旧调用方不受影响）。
+///
+/// [`PROMPT_CACHE_BOUNDARY`]: crate::cache_boundary::PROMPT_CACHE_BOUNDARY
+fn build_system_field(system_text: &str) -> Value {
+    let Some((static_part, dynamic_part)) = split_at_cache_boundary(system_text) else {
+        return json!(system_text);
+    };
+    let static_trimmed = static_part.trim();
+    let dynamic_trimmed = dynamic_part.trim();
+    // 任一段为空意味着 boundary 出现在最前或最后——退化场景，不值得
+    // 引入 cache breakpoint，回退到去掉标记后的单 string。
+    if static_trimmed.is_empty() || dynamic_trimmed.is_empty() {
+        let cleaned = system_text.replace(crate::cache_boundary::PROMPT_CACHE_BOUNDARY, "");
+        return json!(cleaned);
+    }
+    json!([
+        {
+            "type": "text",
+            "text": static_trimmed,
+            "cache_control": {"type": "ephemeral"}
+        },
+        {
+            "type": "text",
+            "text": dynamic_trimmed
+        }
+    ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cache_boundary::PROMPT_CACHE_BOUNDARY;
+
+    #[test]
+    fn build_system_field_returns_plain_string_without_boundary() {
+        let value = build_system_field("plain system prompt");
+        assert_eq!(value, json!("plain system prompt"));
+    }
+
+    #[test]
+    fn build_system_field_returns_blocks_array_with_boundary() {
+        let text = format!("STATIC PREFIX{}DYNAMIC SUFFIX", PROMPT_CACHE_BOUNDARY);
+        let value = build_system_field(&text);
+        let arr = value.as_array().expect("应当是 content blocks 数组");
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["type"], "text");
+        assert_eq!(arr[0]["text"], "STATIC PREFIX");
+        assert_eq!(arr[0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(arr[1]["type"], "text");
+        assert_eq!(arr[1]["text"], "DYNAMIC SUFFIX");
+        // dynamic block 不应携带 cache_control（避免 breakpoint 浪费）
+        assert!(arr[1].get("cache_control").is_none());
+    }
+
+    #[test]
+    fn build_system_field_degenerates_when_static_part_empty() {
+        // boundary 出现在最前——不值得设 cache breakpoint，回退单 string
+        let text = format!("{}DYNAMIC ONLY", PROMPT_CACHE_BOUNDARY);
+        let value = build_system_field(&text);
+        assert_eq!(value, json!("DYNAMIC ONLY"));
+    }
+
+    #[test]
+    fn build_system_field_degenerates_when_dynamic_part_empty() {
+        // boundary 出现在最后——同样退化
+        let text = format!("STATIC ONLY{}", PROMPT_CACHE_BOUNDARY);
+        let value = build_system_field(&text);
+        assert_eq!(value, json!("STATIC ONLY"));
     }
 }

@@ -201,7 +201,17 @@ impl HttpModelBridgeClient {
     /// Build the JSON body for a chat completions request.
     fn build_chat_request_body(&self, request: &ModelInvocationRequest) -> serde_json::Value {
         let messages = if let Some(ref msgs) = request.messages {
-            serde_json::to_value(msgs).unwrap_or_else(|_| json!([]))
+            // 透明剥离 PROMPT_CACHE_BOUNDARY 标记消息——它只用于 Anthropic
+            // adapter 切分 content blocks，对 ChatCompletions 协议没有语义，
+            // 不能泄漏到 OpenAI 兼容模型的 prompt。
+            let filtered: Vec<&crate::types::ChatMessage> = msgs
+                .iter()
+                .filter(|m| {
+                    m.content.as_deref()
+                        != Some(crate::cache_boundary::PROMPT_CACHE_BOUNDARY)
+                })
+                .collect();
+            serde_json::to_value(&filtered).unwrap_or_else(|_| json!([]))
         } else {
             json!([{ "role": "user", "content": request.prompt }])
         };
@@ -1139,6 +1149,61 @@ mod tests {
         assert_eq!(body["messages"][0]["role"], "user");
         assert_eq!(body["messages"][0]["content"], "hello world");
         assert_eq!(body["stream"], false);
+    }
+
+    #[test]
+    fn build_chat_request_body_strips_cache_boundary_marker() {
+        let client = HttpModelBridgeClient::new(
+            "https://api.example.com/v1".to_string(),
+            Some("test-key".to_string()),
+            "gpt-4.1-mini".to_string(),
+        );
+
+        let body = client.build_request_body(&ModelInvocationRequest {
+            provider: "openai".to_string(),
+            prompt: "unused".to_string(),
+            messages: Some(vec![
+                crate::types::ChatMessage {
+                    role: "system".to_string(),
+                    content: Some("static prompt".to_string()),
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                },
+                crate::types::ChatMessage {
+                    role: "system".to_string(),
+                    content: Some(crate::cache_boundary::PROMPT_CACHE_BOUNDARY.to_string()),
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                },
+                crate::types::ChatMessage {
+                    role: "system".to_string(),
+                    content: Some("dynamic prompt".to_string()),
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                },
+                crate::types::ChatMessage {
+                    role: "user".to_string(),
+                    content: Some("hi".to_string()),
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                },
+            ]),
+            tools: None,
+            tool_choice: None,
+        });
+
+        let messages = body["messages"].as_array().expect("messages should be array");
+        assert_eq!(messages.len(), 3, "boundary marker message should be stripped");
+        assert_eq!(messages[0]["content"], "static prompt");
+        assert_eq!(messages[1]["content"], "dynamic prompt");
+        assert_eq!(messages[2]["content"], "hi");
+
+        // Boundary marker must never appear in any serialized message content.
+        let body_text = body.to_string();
+        assert!(
+            !body_text.contains(crate::cache_boundary::PROMPT_CACHE_BOUNDARY),
+            "boundary marker leaked into OpenAI ChatCompletions body: {body_text}"
+        );
     }
 
     #[test]

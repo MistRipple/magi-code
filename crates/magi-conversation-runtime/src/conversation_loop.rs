@@ -410,6 +410,23 @@ fn run_conversation_loop_inner(
         }
     }
 
+    // ---- Cache breakpoint · STATIC → NON-STATIC ----
+    // 上面 Tier A 三段同一角色 / workspace / mission 多轮不变，是 prompt
+    // 缓存命中的真正受益面。这里插入一条 boundary 标记消息，下游
+    // `AnthropicMessagesAdapter` 在 join system 后据此切分 content blocks,
+    // 给静态前缀打 `cache_control: {type: ephemeral}`。其他不支持
+    // cache_control 的 adapter 会透明剥离这个标记，不影响输出语义。
+    //
+    // 仅在 STATIC 段实际产出过至少一条消息时插入，避免空前缀触发退化路径。
+    if messages.iter().any(|m| m.role == "system") {
+        messages.push(ChatMessage {
+            role: "system".to_string(),
+            content: Some(magi_bridge_client::cache_boundary::PROMPT_CACHE_BOUNDARY.to_string()),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        });
+    }
+
     // -------- Tier B · SEMI-STATIC --------
     // [CACHE: SEMI-STATIC] S10 · ProjectMemory 索引。
     // 把 `~/.magi/projects/{slug}/memory/MEMORY.md` 视图渲染进 system prompt，
