@@ -413,44 +413,14 @@
     background: var(--surface-1);
   }
 
-  .tool-header {
-    display: flex;
-    align-items: center;
-    gap: var(--space-3);
-    width: 100%;
-    /* padding-left 让出 3px 给 accent 状态色条（见 styles/tool-card.css） */
-    padding: var(--space-2) var(--space-4) var(--space-2) calc(var(--space-4) + 3px);
-    background: transparent;
-    border: none;
-    text-align: left;
-    cursor: pointer;
-    transition: background var(--transition-fast);
-  }
-
-  .tool-header:hover {
-    background: var(--surface-hover);
-  }
-
+  /* header 高度/padding/字号/accent 条/chevron 等共享规范见 styles/tool-card.css；
+     terminal-header-flat 是不可点击的扁平模式，需要覆盖共享 cursor 与 hover */
   .terminal-header-flat {
     cursor: default;
   }
 
   .terminal-header-flat:hover {
     background: transparent;
-  }
-
-  .chevron {
-    display: flex;
-    color: var(--foreground-muted);
-    transition: transform var(--transition-fast);
-  }
-
-  .collapsed .chevron {
-    transform: rotate(0deg);
-  }
-
-  .tool-call:not(.collapsed) .chevron {
-    transform: rotate(90deg);
   }
 
   /* tool-icon 中性化：accent 条承担状态色，图标用 muted 避免三层颜色冲突 */
@@ -466,13 +436,6 @@
     gap: var(--space-3);
     min-width: 0;
     overflow: hidden;
-  }
-
-  .tool-name {
-    font-weight: 500;
-    font-size: var(--text-sm);
-    white-space: nowrap;
-    flex-shrink: 0;
   }
 
   .tool-summary {

@@ -265,32 +265,7 @@
     background: var(--surface-1, rgba(255,255,255,0.02));
   }
 
-  .tool-header {
-    display: flex;
-    align-items: center;
-    gap: var(--space-3);
-    width: 100%;
-    /* padding-left 让出 3px 给 accent 状态色条（见 styles/tool-card.css） */
-    padding: var(--space-2) var(--space-4) var(--space-2) calc(var(--space-4) + 3px);
-    background: transparent;
-    border: none;
-    text-align: left;
-    cursor: pointer;
-    transition: background var(--transition-fast);
-  }
-
-  .tool-header:hover {
-    background: var(--surface-hover, rgba(255,255,255,0.05));
-  }
-
-  .chevron {
-    display: flex;
-    color: var(--foreground-muted);
-    transition: transform var(--transition-fast);
-  }
-
-  .collapsed .chevron { transform: rotate(0deg); }
-  .tool-call:not(.collapsed) .chevron { transform: rotate(90deg); }
+  /* header 高度/padding/字号/accent 条/chevron 等共享规范见 styles/tool-card.css */
 
   /* tool-icon 中性化：accent 条承担状态色，图标用 muted 避免三层颜色冲突 */
   .tool-icon {
@@ -305,12 +280,6 @@
     gap: var(--space-2, 8px);
     min-width: 0;
     overflow: hidden;
-  }
-
-  .tool-name {
-    font-weight: 500;
-    font-size: var(--text-sm, 13px);
-    white-space: nowrap;
   }
 
   .rename-path {
