@@ -782,45 +782,11 @@
     margin-top: var(--space-2);
   }
 
-  .file-mutation-header {
-    cursor: default;
-    /* padding-left 让出 3px 给 accent 状态色条（见 styles/tool-card.css） */
-    padding: var(--space-2) var(--space-4) var(--space-2) calc(var(--space-4) + 3px);
-  }
-
-  .file-mutation-header:hover {
-    background: transparent;
-  }
-
+  /* header 共享规范（高度/padding/字号/accent 条/chevron）见 styles/tool-card.css；
+     此处仅保留 ToolCall 特有的 clickable 变体 */
   .file-mutation-header.clickable {
     cursor: pointer;
   }
-
-  .tool-header {
-    display: flex;
-    align-items: center;
-    gap: var(--space-3);
-    width: 100%;
-    /* padding-left 让出 3px 给 accent 状态色条（见 styles/tool-card.css） */
-    padding: var(--space-2) var(--space-4) var(--space-2) calc(var(--space-4) + 3px);
-    background: transparent;
-    border: none;
-    text-align: left;
-    cursor: pointer;
-    transition: background var(--transition-fast);
-  }
-
-  .tool-header:hover {
-    background: var(--surface-hover);
-  }
-
-  .chevron {
-    display: flex;
-    color: var(--foreground-muted);
-  }
-
-  .collapsed .chevron { transform: rotate(0deg); }
-  .tool-call:not(.collapsed) .chevron { transform: rotate(90deg); }
 
   /* tool-icon 中性化：accent 条承担状态色，图标用 muted 避免三层颜色冲突 */
   .tool-icon {
@@ -835,13 +801,6 @@
     gap: var(--space-3);
     min-width: 0;
     overflow: hidden;
-  }
-
-  .tool-name {
-    font-weight: 500;
-    font-size: var(--text-sm);
-    white-space: nowrap;
-    flex-shrink: 0;
   }
 
   .tool-summary {
