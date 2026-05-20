@@ -17,53 +17,15 @@
   // 使用 getter 确保子组件总能获取最新值
   setContext('markdown-streaming', { get isStreaming() { return isStreaming; } });
 
-  // 预处理后的 Markdown 源文本（原先是 $derived 同步绑定）
-  // 🚀 高级优化一：动态流式退爬节流 (Adaptive Throttling)
-  // 解决 O(N²) 算力黑洞：当消息长度突破千字时，每一帧全量 AST 解析和 Diff 会拖垮 CPU
-  let processedSource = $state('');
-  let _lastUpdateTime = 0;
-  let _pendingTimer: ReturnType<typeof setTimeout> | null = null;
-
-  function updateProcessedSource(rawContent: string, streaming: boolean): void {
-    const nextSource = preprocessMarkdown(rawContent, streaming);
-    if (nextSource !== processedSource) {
-      processedSource = nextSource;
-    }
-  }
-
-  $effect(() => {
-    const rawContent = content || '';
-    const streaming = isStreaming;
-
-    if (!streaming) {
-      if (_pendingTimer) { clearTimeout(_pendingTimer); _pendingTimer = null; }
-      updateProcessedSource(rawContent, false);
-      _lastUpdateTime = performance.now();
-      return;
-    }
-
-    const now = performance.now();
-    const len = rawContent.length;
-    // 阶梯降频策略：超过5000字降到150ms帧，2000字100ms帧，让出算力给 UI
-    const interval = len > 5000 ? 150 : len > 2000 ? 100 : len > 500 ? 50 : 16;
-    const elapsed = now - _lastUpdateTime;
-
-    if (elapsed >= interval) {
-      if (_pendingTimer) { clearTimeout(_pendingTimer); _pendingTimer = null; }
-      updateProcessedSource(rawContent, true);
-      _lastUpdateTime = now;
-    } else {
-      if (!_pendingTimer) {
-        _pendingTimer = setTimeout(() => {
-          if (isStreaming) {
-            updateProcessedSource(content || '', true);
-            _lastUpdateTime = performance.now();
-          }
-          _pendingTimer = null;
-        }, interval - elapsed);
-      }
-    }
-  });
+  // 预处理后的 Markdown 源文本：$derived 同步派生，上游推多快就渲染多快。
+  //
+  // 历史：曾按消息长度阶梯降频（>5000 字 150ms / 2000 字 100ms / 500 字 50ms /
+  // 短消息 16ms）以规避 marked AST 全量重解析的"O(N²) 算力黑洞"。但该方案让
+  // 流式内容呈现为"块状蹦字"（最差 6.7fps），用户感知就是打字机。
+  // 现代浏览器 + 新版 svelte-markdown + marked 解析 5000 字开销已降至个位数 ms，
+  // 不再需要节流；如果未来真的复现长消息卡顿，应该上 Web Worker 或增量 parse，
+  // 而不是把延迟丢回用户视野。
+  const processedSource = $derived(preprocessMarkdown(content || '', isStreaming));
 
   // 自定义 renderer：覆盖代码块、链接、图片
   const renderers = {
