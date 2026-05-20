@@ -301,9 +301,45 @@ impl BuiltinToolName {
 
     pub fn description(&self) -> &'static str {
         match self {
-            Self::FileRead => "读取指定路径文件的内容",
-            Self::FileWrite => "创建或覆盖一个文件并写入指定内容",
-            Self::FilePatch => "对文件进行精确文本替换（find-and-replace 风格的局部修改）",
+            Self::FileRead => {
+                "读取指定路径文件的内容。\n\n\
+                # 何时用\n\
+                - 需要查看文件内容、配置、源码以做出后续决策\n\
+                - 读取已知具体路径的文件（含大文件可用 max_bytes 截取）\n\n\
+                # 何时不用\n\
+                - 列目录 / 找文件路径 → 用 shell_exec 跑 `ls` 或 `find`\n\
+                - 跨文件搜索文本 → 用 search_text，不要逐个 file_read 后自己 grep\n\
+                - 语义检索代码 → 用 search_semantic\n\n\
+                # 反例\n\
+                - ❌ 用 file_read 读取目录路径希望拿到列表\n\
+                - ✅ 已经从 search_text 拿到候选文件路径后，再用 file_read 看具体行"
+            }
+            Self::FileWrite => {
+                "创建或覆盖一个文件并写入指定内容（整体写入）。\n\n\
+                # 何时用\n\
+                - 创建新文件\n\
+                - 对已有文件做完全重写（变化范围 ≥ 50% 或整体重构）\n\n\
+                # 何时不用\n\
+                - 修改已有文件中一段或几段 → 用 file_patch（保护未改部分、降低风险）\n\
+                - 仅追加内容 → 用 file_patch 在末尾锚点做替换，或用 shell_exec 重定向\n\n\
+                # 反例\n\
+                - ❌ 把已有 500 行文件整段 file_write 回去只为改 3 行 → 极易丢失并发写入、破坏 diff\n\
+                - ✅ 新建配置文件 / 新建源码模块时用 file_write\n\
+                - ✅ 改 3 行用 file_patch，未改部分零风险"
+            }
+            Self::FilePatch => {
+                "对文件进行精确文本替换（find-and-replace 风格的局部修改）。\n\n\
+                # 何时用\n\
+                - 修改已有文件中一段或几段（最常见的代码修改场景）\n\
+                - old_string 必须在文件中精确出现一次；不唯一时先扩大上下文片段\n\n\
+                # 何时不用\n\
+                - 创建新文件 → 用 file_write\n\
+                - 整体重构 / 改动量 ≥ 50% → 用 file_write 整体覆盖更清晰\n\
+                - old_string 在文件中出现多次又不能扩展上下文 → 改用批量 patches 数组逐条精确替换\n\n\
+                # 反例\n\
+                - ❌ old_string 只写一行短代码且文件里出现多次 → 替换位置歧义、可能改错位置\n\
+                - ✅ old_string 包含目标行 + 前后各 1-2 行上下文确保唯一性"
+            }
             Self::FileRemove => "删除一个文件或目录",
             Self::FileMkdir => "创建一个目录（包含父目录）",
             Self::FileCopy => "把文件或目录复制到新位置",
@@ -312,7 +348,23 @@ impl BuiltinToolName {
             Self::SearchSemantic => {
                 "语义代码检索：基于自然语言描述定位相关代码"
             }
-            Self::ShellExec => "执行一条 shell 命令并返回 stdout / stderr",
+            Self::ShellExec => {
+                "执行一条 shell 命令并返回 stdout / stderr。\n\n\
+                # 何时用\n\
+                - 没有专用工具能完成的任务：构建（cargo build / npm run）、运行测试、git 操作、查 PID\n\
+                - 一次性 ad-hoc 命令（解压、统计行数、查磁盘占用）\n\n\
+                # 何时不用\n\
+                - 读文件内容 → file_read（更安全、有大小保护）\n\
+                - 写文件内容 → file_write（避免引号转义陷阱）\n\
+                - 改文件局部 → file_patch（避免 sed 转义灾难）\n\
+                - 找文件路径 → 优先 search_text；search_text 不便时再 shell `find`\n\
+                - 启长进程（守护、watch 模式）→ process_launch（受管、可清理）\n\n\
+                # 反例\n\
+                - ❌ `shell_exec: cat /path/file` 仅为读文件 → 失去字节限制保护\n\
+                - ❌ `shell_exec: sed -i 's/foo/bar/'` 改文件 → 引号转义易错且不可预览\n\
+                - ✅ `shell_exec: cargo test -p magi-agent-role` 跑测试\n\
+                - ✅ `shell_exec: git log --oneline -20` 查提交历史"
+            }
             Self::ProcessLaunch => "在当前会话 / 工作区启动一个后台进程",
             Self::ProcessRead => "读取受管后台进程的 stdout / stderr",
             Self::ProcessWrite => "向受管后台进程的 stdin 写入数据",
@@ -329,7 +381,20 @@ impl BuiltinToolName {
                 "查询项目知识库：检索 README、文档与代码文档"
             }
             Self::AgentSpawn => {
-                "向已注册的子 agent 角色派发一个子任务（architect / integration-dev / reviewer 等）。返回新的 task_id；子 agent 的最终结果会通过 send_message 回流。"
+                "向已注册的子 agent 角色派发一个子任务（architect / integration-dev / reviewer 等）。返回新的 task_id；子 agent 的最终结果会通过 send_message 回流。\n\n\
+                # 何时用\n\
+                - 任务可拆出 1 个或多个明确边界的子工作单元，且子单元能独立完成（有清晰输入、输出、验收）\n\
+                - 需要专家视角（reviewer 做代码审查、security-analyst 做风险评估）\n\
+                - 多个子工作可并行执行节省时间\n\n\
+                # 何时不用\n\
+                - 1-3 步能自己完成的任务 → 直接做，派发开销不值\n\
+                - 子任务需要你在场即时回答澄清问题 → 自己做更顺\n\
+                - 仅是查询性问题（找文件 / 读代码） → 用 search_text / file_read，不要派 agent\n\n\
+                # 反例\n\
+                - ❌ 派 integration-dev 去「改一行配置」→ 启动开销远超价值\n\
+                - ❌ 派 reviewer 去「看看代码好不好」（边界模糊、验收不清）\n\
+                - ✅ 派 reviewer 审查具体 PR：「审查 commits abc..def 的安全性，按通过 / 不通过给结论」\n\
+                - ✅ 派 integration-dev 实现独立模块：「在 crate X 实现 Y trait，跑通 cargo test -p X」"
             }
             Self::SendMessage => {
                 "向同一 mission 中的另一个任务投递结构化消息。Coordinator 用它转发结果、下达后续指令或回传子 agent 的回复。"
@@ -338,7 +403,20 @@ impl BuiltinToolName {
                 "终止一个任务并在 SpawnGraph 上级联停止它的所有后代。仅在整个子树已明显偏离目标，或用户主动撤回工作时使用。"
             }
             Self::TodoWrite => {
-                "用给定列表整体替换当前会话的 TodoLedger（沿用 claude-code TodoWrite 语义）。用于把长任务拆分成步骤并跟踪进度；ledger 快照会自动注入到后续 Turn。每次调用整体覆盖。"
+                "用给定列表整体替换当前会话的 TodoLedger（沿用 claude-code TodoWrite 语义）。用于把长任务拆分成步骤并跟踪进度；ledger 快照会自动注入到后续 Turn。每次调用整体覆盖。\n\n\
+                # 何时用\n\
+                - 任务 ≥ 3 个非平凡步骤，且步骤之间有先后关系或可能被打断\n\
+                - 跨多轮对话推进、需要让用户随时看到进度\n\
+                - 任务边界用户给得模糊，需要先拆解再让用户对齐\n\n\
+                # 何时不用\n\
+                - 单步任务（改一个文件、回答一个问题、跑一条命令）\n\
+                - 纯查询 / 纯解释类对话（不会产出多步动作）\n\
+                - 任务步骤太琐碎（每步 < 5 秒）→ todo 噪音超过价值\n\n\
+                # 反例\n\
+                - ❌ 「读一个文件」也建 todo → ledger 污染、降低后续 todo 信号价值\n\
+                - ❌ 把『思考过程』当 todo（「想想 X」「分析 Y」）→ todo 应只记录可观察可验收的动作\n\
+                - ✅ 实现一个跨多文件的功能：拆「读现状 / 改 A / 改 B / 跑测试 / commit」5 步\n\
+                - ✅ 起步先写 todo 与用户对齐，确认后再开始执行"
             }
             Self::MemoryWrite => {
                 "对当前工作区的 ProjectMemory 条目进行写入或删除。Memory 文件存于 ~/.magi/projects/<slug>/memory/，每次新会话开始时自动加载到系统提示。使用 action: save 进行 upsert（覆盖同 file_stem 的文件），action: delete 删除条目。Memory 类别：user / feedback / project / reference。"
