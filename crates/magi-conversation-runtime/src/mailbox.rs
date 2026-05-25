@@ -27,7 +27,7 @@ pub enum MailboxAuthor {
 
 /// Mailbox 信号类型。与 v2 架构文档保持一致的运行时信号分类。
 ///
-/// 注：原 `AgentResult` 类型已随同步 agent_spawn 改造移除——子代理终态
+/// 注：原代理结果旁路信号已随同步 agent_spawn 改造移除——代理终态
 /// 直接以 tool_call_result 形式返回给父代理本轮 LLM 上下文，不再走 mailbox 回流。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -38,7 +38,7 @@ pub enum MailboxKind {
     Followup,
 }
 
-/// 非用户输入类运行时信号。所有跨任务/父子代理/系统调度输入都以该结构进入
+/// 非用户输入类运行时信号。所有跨任务/代理/系统调度输入都以该结构进入
 /// Conversation Mailbox，在下一次 Turn 边界被一次性 drain。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]

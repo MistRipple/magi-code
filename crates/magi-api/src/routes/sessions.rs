@@ -776,7 +776,11 @@ fn session_turn_requests_explicit_task_or_worker_mode(request: &SessionTurnReque
         || normalized.contains("worker 必须")
         || normalized.contains("worker 调用")
         || normalized.contains("worker 执行")
-        || normalized.contains("子代理")
+        || normalized.contains("派发代理")
+        || normalized.contains("分派代理")
+        || normalized.contains("代理执行")
+        || normalized.contains("代理任务")
+        || normalized.contains("代理角色")
         || normalized.contains("子任务")
 }
 

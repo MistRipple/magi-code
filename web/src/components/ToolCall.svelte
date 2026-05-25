@@ -215,9 +215,9 @@
   );
   const isCompactMutation = $derived(isFileMutationTool && (status === 'running' || status === 'pending'));
 
-  // agent_spawn 工具调用：父代理派发子代理的同步阻塞工具。每一次调用即父代理
+  // agent_spawn 工具调用：父代理派发代理的同步阻塞工具。每一次调用即父代理
   // ToolCall 流中的一张内嵌卡片，多个并行 agent_spawn 即多张并列卡片，点击卡片
-  // 打开右侧 RightPane 子代理 transcript（按 metadata.taskId 过滤）。
+  // 打开右侧 RightPane 代理 transcript（按 metadata.taskId 过滤）。
   //
   // input 形态：{ role, display_name, goal }
   // output 形态（tool_batch.rs::wait_for_child_terminal_outcome）：
@@ -228,13 +228,13 @@
   const isAgentSpawn = $derived(name === 'agent_spawn');
 
   interface AgentSpawnDisplay {
-    /** 子代理展示名（首选 output.title，回退到 input.display_name） */
+    /** 代理展示名（首选 output.title，回退到 input.display_name） */
     title: string;
-    /** 子代理角色（如 executor / explorer / tester），用于角标与色 token */
+    /** 代理角色（如 executor / explorer / tester），用于角标与色 token */
     role: string;
-    /** 子代理 TaskId，作为 RightPane tab 去重 key；未就绪时为 undefined */
+    /** 代理 TaskId，作为 RightPane tab 去重 key；未就绪时为 undefined */
     childTaskId: string | undefined;
-    /** 子代理终态结果字符串（succeeded / degraded / failed / killed），未终态为 undefined */
+    /** 代理终态结果字符串（succeeded / degraded / failed / killed），未终态为 undefined */
     outcome: 'succeeded' | 'degraded' | 'failed' | 'killed' | undefined;
     /** 失败原因摘要，若有 */
     error: string | undefined;
@@ -280,7 +280,7 @@
         : undefined;
 
     return {
-      title: outputTitle || inputTitle || '子代理',
+      title: outputTitle || inputTitle || '代理',
       role: outputRole || inputRole || '',
       childTaskId: outputChildId || undefined,
       outcome,
@@ -578,7 +578,7 @@
       'agent_spawn delegation',
       'orchestrator cannot execute tools in long mission',
       'Long Mission 下主模型不可直接执行',
-      '请通过 agent_spawn 委派给子代理',
+      '请通过 agent_spawn 委派给代理',
     )) {
       return {
         category: 'role_constraint',
@@ -1187,9 +1187,9 @@
     border-top: 1px dashed var(--border);
   }
 
-  /* ===== agent_spawn 子代理派发卡片 ===== */
+  /* ===== agent_spawn 代理派发卡片 ===== */
   /* 父代理 ToolCall 流中的内嵌单元——一次 agent_spawn 即一张卡片，多个并行派发
-     即多张并列卡片，点击进入 RightPane 查看该子代理完整 transcript（按
+     即多张并列卡片，点击进入 RightPane 查看该代理完整 transcript（按
      metadata.taskId 过滤）。 */
   .agent-spawn-card {
     width: 100%;

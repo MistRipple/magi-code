@@ -89,7 +89,7 @@ pub const CANONICAL_TURN_SCHEMA_VERSION: &str = "canonical-turn.v1";
 
 /// `source_thread_id` 的可见性判定结果：
 /// - `Main`：对应 session 的 orchestrator thread，item 归属主线时间线
-/// - `TaskDetail`：对应某条子代理 task thread，item 归属该 task 详情
+/// - `TaskDetail`：对应某条代理 task thread，item 归属该 task 详情
 ///
 /// 由 `SessionStore::resolve_thread_visibility` 返回，是后端路由可见性的唯一出口。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -264,7 +264,7 @@ pub struct CanonicalTurnItem {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worker: Option<CanonicalWorkerRef>,
     /// item 归属的 thread_id。orchestrator 主线 item 为 session 级 orchestrator thread，
-    /// 子代理 item 为对应 task thread。前端 projection 用它作为单一路由键。
+    /// 代理 item 为对应 task thread。前端 projection 用它作为单一路由键。
     pub source_thread_id: ThreadId,
     #[serde(default)]
     pub visibility: CanonicalTurnVisibility,
@@ -430,7 +430,7 @@ pub struct ActiveExecutionTurnItem {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeline_entry_id: Option<String>,
     /// item 归属的 thread。orchestrator 主线 item 为 session 级 orchestrator thread；
-    /// 子代理 item 为对应 task thread。单一路由键，前端按此 + thread 的 `role_id`
+    /// 代理 item 为对应 task thread。单一路由键，前端按此 + thread 的 `role_id`
     /// 判定主线 / task 详情归属。
     pub source_thread_id: ThreadId,
 }

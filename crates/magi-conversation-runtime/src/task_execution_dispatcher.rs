@@ -104,7 +104,7 @@ impl ModelBridgeClient for FailoverModelBridgeClient {
                     role_id = %self.role_id,
                     engine_id = %self.engine_id,
                     error = %error,
-                    "角色专属模型不可用，使用编排模型继续执行子代理"
+                    "角色专属模型不可用，使用编排模型继续执行代理任务"
                 );
                 self.fallback.invoke(request)
             }
@@ -136,7 +136,7 @@ impl ModelBridgeClient for FailoverModelBridgeClient {
                     role_id = %self.role_id,
                     engine_id = %self.engine_id,
                     error = %error,
-                    "角色专属流式模型不可用，使用编排模型继续执行子代理"
+                    "角色专属流式模型不可用，使用编排模型继续执行代理任务"
                 );
                 self.fallback.invoke_streaming(request, on_delta)
             }
@@ -227,11 +227,11 @@ pub struct LlmTaskDispatcher {
 ///   `default_client`（`MAGI_OPENAI_COMPAT_*` env 兜底）。
 /// - [`RoleTarget::Auxiliary`]：`auxiliary` 段——会话标题精修、知识抽取、会话记忆、
 ///   Prompt 增强等"低价值/低延迟敏感"任务。未配置时返回 `None`，调用方静默跳过。
-/// - [`RoleTarget::Agent`]：子代理角色，按 `agents[*]` 段查 `engineId` 绑定，
+/// - [`RoleTarget::Agent`]：代理角色，按 `agents[*]` 段查 `engineId` 绑定，
 ///   再从 `engines[*]` 段取 llm 配置。未绑定 engine（继承 orchestrator 模式）时
 ///   返回 `None`，调用方应回退到 orchestrator。
 ///   `wrap_with_orchestrator_failover = true` 时，primary 调用失败将自动降级到
-///   orchestrator client（保证子代理在 agent 模型故障时仍可继续）。
+///   orchestrator client（保证代理任务在 agent 模型故障时仍可继续）。
 #[derive(Clone, Copy, Debug)]
 pub enum RoleTarget<'a> {
     Orchestrator,

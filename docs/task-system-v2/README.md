@@ -26,7 +26,7 @@ Session
   用户交互入口与 UI 容器
 
 ExecutionChain
-  当前可恢复执行链，连接 UI、任务树、worker lane 与恢复信息
+  当前可恢复执行链，连接 UI、任务树、代理详情与恢复信息
 
 Mission
   复杂目标的长期业务边界，持有 Charter / Plan / KG / Validation / Checkpoint / HumanCheckpoint
@@ -38,7 +38,7 @@ Conversation
   单个 Task 的运行时容器，负责 Turn / Mailbox / 模型调用边界
 
 Thread
-  单个 worker/task 的持久化消息历史，防止不同 worker 上下文串线
+  单个 task/代理实例的持久化消息历史，防止不同执行上下文串线
 ```
 
 关键约定：

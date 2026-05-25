@@ -890,7 +890,7 @@ impl SessionStore {
         }
     }
 
-    /// P6b：读取指定 thread 内部的对话记录。子代理 task thread 为单 task 独占，
+    /// P6b：读取指定 thread 内部的对话记录。代理 task thread 为单 task 独占，
     /// 因此这里不会把同 role 的历史 task 注入新 task。
     pub fn thread_message_history(&self, thread_id: &ThreadId) -> Vec<ThreadChatMessage> {
         let state = self.state.read().expect("session state read lock poisoned");

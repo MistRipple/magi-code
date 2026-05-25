@@ -85,9 +85,7 @@ impl BootstrapDto {
             state.event_bus.runtime_read_model_input(),
             state.audit_usage_ledger_dto(),
             state.bridge_services_dto(),
-            // bootstrap 是首屏状态快照，不能同步触发模型/MCP 预检；
-            // 主动预检由 `/bridges/preflight` 负责，避免页面初始化被外部模型响应时间拖住。
-            BridgePreflightSnapshotDto::default(),
+            state.bridge_preflight_dto(),
             state.task_store(),
             state.collect_mission_aggregate_exports(),
         );
@@ -179,8 +177,19 @@ impl BootstrapDto {
     }
 
     fn prune_initial_load_runtime_details(&mut self) {
-        self.recent_events
-            .retain(|event| event.event_type != RUNTIME_MAINTENANCE_STATUS_EVENT);
+        let current_session_id = self
+            .current_session
+            .as_ref()
+            .map(|session| session.session_id.to_string());
+        self.recent_events.retain(|event| {
+            event.event_type != RUNTIME_MAINTENANCE_STATUS_EVENT
+                && current_session_id.as_deref().is_some_and(|session_id| {
+                    event
+                        .session_id
+                        .as_ref()
+                        .is_some_and(|event_session_id| event_session_id.as_str() == session_id)
+                })
+        });
         if self.recent_events.len() > BOOTSTRAP_RECENT_EVENT_PAGE_SIZE {
             let start = self
                 .recent_events
@@ -189,15 +198,80 @@ impl BootstrapDto {
             self.recent_events = self.recent_events.split_off(start);
         }
 
-        let current_session_id = self
-            .current_session
-            .as_ref()
-            .map(|session| session.session_id.to_string());
         self.runtime_read_model.details.sessions.retain(|entry| {
             current_session_id
                 .as_deref()
                 .is_some_and(|session_id| entry.session_id == session_id)
         });
+        let current_runtime_session = self.runtime_read_model.details.sessions.first();
+        let current_recovery_ids = current_runtime_session
+            .map(|entry| entry.recovery_ids.clone())
+            .unwrap_or_default();
+        let current_recovery_ref =
+            current_runtime_session.and_then(|entry| entry.recovery_ref.clone());
+        let current_mission_id = current_runtime_session.and_then(|entry| entry.mission_id.clone());
+        let current_chain_ref =
+            current_runtime_session.and_then(|entry| entry.execution_chain_ref.clone());
+        self.runtime_read_model
+            .recovery
+            .summaries
+            .retain(|summary| {
+                current_session_id.as_deref().is_some_and(|session_id| {
+                    summary
+                        .session_id
+                        .as_ref()
+                        .is_some_and(|summary_session_id| summary_session_id.as_str() == session_id)
+                }) || current_recovery_ids
+                    .iter()
+                    .any(|recovery_id| recovery_id == &summary.recovery_id)
+                    || current_recovery_ref
+                        .as_deref()
+                        .is_some_and(|recovery_id| summary.recovery_id == recovery_id)
+                    || current_mission_id.as_deref().is_some_and(|mission_id| {
+                        summary
+                            .mission_id
+                            .as_ref()
+                            .is_some_and(|summary_mission_id| {
+                                summary_mission_id.as_str() == mission_id
+                            })
+                    })
+                    || current_chain_ref.as_deref().is_some_and(|chain_ref| {
+                        summary.execution_chain_ref.as_deref() == Some(chain_ref)
+                    })
+            });
+        self.runtime_read_model.recovery.entries.retain(|entry| {
+            current_session_id.as_deref().is_some_and(|session_id| {
+                entry
+                    .session_id
+                    .as_ref()
+                    .is_some_and(|entry_session_id| entry_session_id.as_str() == session_id)
+            }) || current_recovery_ids
+                .iter()
+                .any(|recovery_id| recovery_id == &entry.recovery_id)
+                || current_recovery_ref
+                    .as_deref()
+                    .is_some_and(|recovery_id| entry.recovery_id == recovery_id)
+                || current_mission_id.as_deref().is_some_and(|mission_id| {
+                    entry
+                        .mission_id
+                        .as_ref()
+                        .is_some_and(|entry_mission_id| entry_mission_id.as_str() == mission_id)
+                })
+                || current_chain_ref.as_deref().is_some_and(|chain_ref| {
+                    entry.execution_chain_ref.as_deref() == Some(chain_ref)
+                })
+        });
+        let visible_recovery_ids = self
+            .runtime_read_model
+            .recovery
+            .summaries
+            .iter()
+            .map(|summary| summary.recovery_id.clone())
+            .collect::<Vec<_>>();
+        self.runtime_read_model
+            .recovery
+            .active_recovery_ids
+            .retain(|recovery_id| visible_recovery_ids.contains(recovery_id));
         for session in &mut self.runtime_read_model.details.sessions {
             session.current_turn = None;
             session.turn_items.clear();
@@ -439,7 +513,7 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap首屏会裁掉维护心跳和sidecar_turn明细() {
+    fn bootstrap首屏会裁掉非当前会话运行态明细() {
         let session_id = SessionId::new("session-current");
         let other_session_id = SessionId::new("session-other");
         let now = UtcMillis::now();
@@ -462,6 +536,11 @@ mod tests {
                     EventId::new("maintenance-1"),
                     RUNTIME_MAINTENANCE_STATUS_EVENT,
                     json!({"tick": 1}),
+                ),
+                EventEnvelope::system(
+                    EventId::new("system-started-1"),
+                    "system.started",
+                    json!({"status": "ready"}),
                 ),
                 EventEnvelope::domain(
                     EventId::new("domain-1"),
@@ -497,7 +576,7 @@ mod tests {
                     active_execution_chain: None,
                 },
                 SessionRuntimeSidecarExport {
-                    session_id: other_session_id,
+                    session_id: other_session_id.clone(),
                     current_status: SessionExecutionSidecarStatus::Bound,
                     last_update: now,
                     ownership: ExecutionOwnership::default(),
@@ -507,7 +586,20 @@ mod tests {
                     active_execution_chain: None,
                 },
             ],
-            Vec::new(),
+            vec![WorkspaceRecoverySidecarExport {
+                recovery_ref: "recovery-other".to_string(),
+                workspace_id: WorkspaceId::new("workspace-other"),
+                current_status: RecoveryStatus::Ready,
+                last_update: now,
+                ownership: ExecutionOwnership {
+                    session_id: Some(other_session_id),
+                    ..ExecutionOwnership::default()
+                },
+                execution_chain_ref: Some("chain-other".to_string()),
+                snapshot_id: "snapshot-other".to_string(),
+                diagnostic_summary: Some("other session recovery".to_string()),
+                consumed_at: None,
+            }],
             event_snapshot,
             RuntimeReadModelInput::default(),
             AuditUsageLedgerDto::default(),
@@ -525,6 +617,15 @@ mod tests {
         assert_eq!(session.session_id, "session-current");
         assert!(session.current_turn.is_none());
         assert!(session.turn_items.is_empty());
+        assert!(bootstrap.runtime_read_model.recovery.entries.is_empty());
+        assert!(bootstrap.runtime_read_model.recovery.summaries.is_empty());
+        assert!(
+            bootstrap
+                .runtime_read_model
+                .recovery
+                .active_recovery_ids
+                .is_empty()
+        );
     }
 
     #[test]

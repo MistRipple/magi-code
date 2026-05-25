@@ -93,7 +93,7 @@ pub struct ConversationCheckpoint {
     /// 被快照的 Session（= Conversation 标识）。
     pub session_id: SessionId,
     /// 指向 WorkspaceStore 中那条可 resume 的 recovery_id（来自 SessionRuntimeSidecar）。
-    /// 在 §1.4 中是"child result 仍能路由到 parent mailbox"的回放入口。
+    /// 在 §1.4 中用于重建 active execution chain，使恢复后能继续推进未完成任务。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovery_ref: Option<String>,
     /// 指向 ActiveExecutionChain 的 execution_chain_ref；与 recovery_ref 至少存其一。

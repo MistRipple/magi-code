@@ -186,6 +186,8 @@ struct MissionProgressSummary {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct TaskRuntimeSummaryEntry {
     pub task_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     pub mission_id: Option<String>,
     pub assignment_id: Option<String>,
     pub event_count: usize,

@@ -171,6 +171,16 @@ impl SessionStore {
         title: impl Into<String>,
         workspace_id: Option<String>,
     ) -> DomainResult<SessionRecord> {
+        self.create_session_for_workspace_at(session_id, title, workspace_id, UtcMillis::now())
+    }
+
+    pub fn create_session_for_workspace_at(
+        &self,
+        session_id: SessionId,
+        title: impl Into<String>,
+        workspace_id: Option<String>,
+        created_at: UtcMillis,
+    ) -> DomainResult<SessionRecord> {
         let mut state = self
             .state
             .write()
@@ -184,13 +194,12 @@ impl SessionStore {
         }
 
         let title = title.into();
-        let now = UtcMillis::now();
         let session = SessionRecord {
             session_id: session_id.clone(),
             title: title.clone(),
             status: SessionLifecycleStatus::Active,
-            created_at: now,
-            updated_at: now,
+            created_at,
+            updated_at: created_at,
             message_count: None,
             workspace_id: workspace_id.clone(),
         };
@@ -201,7 +210,7 @@ impl SessionStore {
             session_id: session_id.clone(),
             kind: TimelineEntryKind::SessionCreated,
             message: format!("会话已创建: {}", title),
-            occurred_at: now,
+            occurred_at: created_at,
         });
         drop(state);
         if let Some(observer) = self.lifecycle_observer() {

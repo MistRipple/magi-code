@@ -511,6 +511,7 @@ export interface ExecutionGroupRuntimeSummaryDto {
 
 export interface TaskRuntimeSummaryDto {
   task_id: string;
+  title?: string | null;
   mission_id?: string | null;
   assignment_id?: string | null;
   event_count: number;

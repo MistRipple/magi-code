@@ -14,6 +14,7 @@
     getRightPaneState,
     closeTab,
     setActiveRightPaneTab,
+    toggleRightPane,
     type RightPaneTab,
     type CodeTabPayload,
     type AgentTabPayload,
@@ -247,7 +248,7 @@
   );
 
   // ============ Tab 视觉 ============
-  // 子代理 tab 的 label / accentToken 由 ToolCall 触发 openAgentTab 时一次性写入；
+  // 代理 tab 的 label / accentToken 由 ToolCall 触发 openAgentTab 时一次性写入；
   // RightPane 不再二次按 roleId 反查 registry —— tab 本身即为视觉真源。
 
   function tabAccent(tab: RightPaneTab): string {
@@ -423,6 +424,15 @@
         </div>
       {/each}
     </div>
+    <button
+      type="button"
+      class="right-pane-collapse-btn"
+      onclick={() => toggleRightPane(sessionId)}
+      title={i18n.t('rightPane.collapse')}
+      aria-label={i18n.t('rightPane.collapse')}
+    >
+      <Icon name="sidebar-toggle" size={14} />
+    </button>
   </header>
 
   <!-- 当前 code tab 的副标题：路径 + Markdown 渲染/源码切换 -->
@@ -586,6 +596,32 @@
   }
   .right-pane-tabs::-webkit-scrollbar { display: none; }
   .right-pane-tabs.dragging { cursor: grabbing; }
+
+  /* 面板内折叠按钮：与 Header 的 toggle 等价，主要服务于窄屏 overlay 模式（顶部按钮被遮挡） */
+  .right-pane-collapse-btn {
+    flex: 0 0 auto;
+    align-self: center;
+    width: 28px;
+    height: 28px;
+    margin-left: var(--space-2);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border: none;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--foreground-muted);
+    cursor: pointer;
+    transition: background var(--transition-fast), color var(--transition-fast);
+  }
+  .right-pane-collapse-btn:hover {
+    background: var(--surface-hover);
+    color: var(--foreground);
+  }
+  .right-pane-collapse-btn:focus-visible {
+    outline: 2px solid color-mix(in srgb, var(--ind-tab-accent, currentColor) 60%, transparent);
+    outline-offset: -2px;
+  }
 
   .right-pane-tab {
     flex: 0 0 auto;

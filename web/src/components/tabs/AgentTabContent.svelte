@@ -6,7 +6,7 @@
   import MessageList from '../MessageList.svelte';
 
   interface Props {
-    /** 子代理 taskId —— 用于按 metadata.taskId 过滤 projection artifacts */
+    /** 代理 taskId —— 用于按 metadata.taskId 过滤 projection artifacts */
     taskId: string;
   }
 

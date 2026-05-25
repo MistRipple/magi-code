@@ -51,7 +51,7 @@ export interface CanonicalTurnItem {
   worker?: CanonicalWorkerRef;
   /**
    * item 归属的 thread_id。orchestrator 主线 item 对应 session 级
-   * orchestrator thread，子代理 item 对应各 task thread。
+   * orchestrator thread，代理 item 对应各 task thread。
    * 由后端 canonical projection 保证非空，是前端 thread/task 详情的唯一路由信号。
    */
   sourceThreadId: string;

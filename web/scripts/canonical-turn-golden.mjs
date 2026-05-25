@@ -75,9 +75,9 @@ function assertAgentSpawnToolCardStaysOnMainlineAndTaskTabsFilterByTaskId(reduce
   spawnItem.worker = { taskId: 'task-root', title: 'agent_spawn' };
   const childTool = tool(c, 3, 'child-tool-a', 'call-child-a', 'printf child', 'completed', { stdout: 'child' });
   childTool.worker = { taskId: 'task-child-a', workerId: 'worker-child-a', roleId: 'executor', title: 'shell_exec' };
-  const childFinal = assistantText(c, 4, 'child-final-a', '子代理已完成验证。', 'completed');
+  const childFinal = assistantText(c, 4, 'child-final-a', '代理已完成验证。', 'completed');
   childFinal.worker = { taskId: 'task-child-a', workerId: 'worker-child-a', roleId: 'executor', title: '最终回复' };
-  const rootFinal = assistantText(c, 5, 'root-final', '我已汇总子代理结果，验证通过。', 'completed');
+  const rootFinal = assistantText(c, 5, 'root-final', '我已汇总代理结果，验证通过。', 'completed');
   rootFinal.worker = { taskId: 'task-root', title: '最终回复' };
 
   const state = reducer.replaceCanonicalTurns(c.sessionId, [
@@ -878,13 +878,13 @@ function agentSpawnTool(c, itemSeq, itemId, callId, role, displayName, childTask
         child_task_id: childTaskId,
         role,
         title: displayName,
-        ...(failed ? { error: '子代理执行失败' } : { output_refs: ['子代理执行完成'] }),
+        ...(failed ? { error: '代理执行失败' } : { output_refs: ['代理执行完成'] }),
       },
     } : {}),
-    ...(failed ? { error: '子代理执行失败' } : {}),
+    ...(failed ? { error: '代理执行失败' } : {}),
   };
   return item(c, itemSeq, itemId, 'tool_call', status, {
-    content: status === 'running' ? `正在派发子代理：${displayName}` : `子代理完成：${displayName}`,
+    content: status === 'running' ? `正在派发代理：${displayName}` : `代理完成：${displayName}`,
     title: displayName,
     tool: toolCall,
   });

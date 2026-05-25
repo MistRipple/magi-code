@@ -36,6 +36,10 @@ fn task_status_is_continue_recoverable(status: &TaskStatus) -> bool {
     matches!(status, TaskStatus::Failed)
 }
 
+fn root_task_allows_continue(status: &TaskStatus) -> bool {
+    !matches!(status, TaskStatus::Completed | TaskStatus::Killed)
+}
+
 fn task_status_needs_terminal_branch_finalization(status: &TaskStatus) -> bool {
     matches!(
         status,
@@ -81,6 +85,12 @@ pub fn active_execution_branch_is_continue_recoverable(
     let Some(task_store) = task_store else {
         return false;
     };
+    let Some(root_task) = task_store.get_task(&chain.root_task_id) else {
+        return false;
+    };
+    if root_task.mission_id != chain.mission_id || !root_task_allows_continue(&root_task.status) {
+        return false;
+    }
     let Some(task) = task_store.get_task(&branch.task_id) else {
         return false;
     };

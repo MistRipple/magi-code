@@ -53,8 +53,8 @@ pub enum BuiltinToolName {
     // ── 知识库 ──
     KnowledgeQuery,
     // ── 协调器（Task System v2 L10，仅 coordinator_mode 角色可见）──
-    /// 派发新的子代理执行子任务。该工具是同步阻塞 tool call：父代理在该 tool_call
-    /// 上等待，直到子代理跑完整个对话，最终输出作为 tool_call_result 直接回写到
+    /// 派发新的代理执行子任务。该工具是同步阻塞 tool call：父代理在该 tool_call
+    /// 上等待，直到代理跑完整个对话，最终输出作为 tool_call_result 直接回写到
     /// 父代理上下文，不再走 mailbox 路由。同一 turn 内多个 agent_spawn 调用并发执行。
     AgentSpawn,
     // ── In-session 思维锚点（Task System v2 L13）──
@@ -366,7 +366,7 @@ impl BuiltinToolName {
             }
             Self::KnowledgeQuery => "查询项目知识库：检索 README、文档与代码文档",
             Self::AgentSpawn => {
-                "向已注册的子 agent 角色同步派发一个子任务（architect / executor / reviewer 等）。该工具是同步阻塞调用：父代理在本轮停在该 tool call 上等待子代理跑完整个对话，最终输出作为 tool_call_result 直接回写到父代理上下文，不再走 mailbox 回流。同一轮调用多次 agent_spawn 时所有子代理并发执行。若返回 status=degraded，表示子代理当前不可用，父代理必须改派其他可用角色或由主线继续完成，不能直接停止任务。\n\n\
+                "向已注册的代理角色同步派发一个子任务（architect / executor / reviewer 等）。该工具是同步阻塞调用：父代理在本轮停在该 tool call 上等待代理跑完整个对话，最终输出作为 tool_call_result 直接回写到父代理上下文，不再走 mailbox 回流。同一轮调用多次 agent_spawn 时所有代理并发执行。若返回 status=degraded，表示代理当前不可用，父代理必须改派其他可用角色或由主线继续完成，不能直接停止任务。\n\n\
                 # 何时用\n\
                 - 任务可拆出 1 个或多个明确边界的子工作单元，且子单元能独立完成（有清晰输入、输出、验收）\n\
                 - 需要专家视角（reviewer 做代码审查、explorer 做根因定位、tester 做验证）\n\
@@ -376,7 +376,7 @@ impl BuiltinToolName {
                 - 子任务需要你在场即时回答澄清问题 → 自己做更顺\n\
                 - 仅是查询性问题（找文件 / 读代码） → 用 search_text / file_read，不要派 agent\n\n\
                 # display_name 写法\n\
-                - 长度 3-30 个字符，前端子代理卡片直接展示\n\
+                - 长度 3-30 个字符，前端代理卡片直接展示\n\
                 - 要让用户一眼看出『谁在做什么具体的事』，写成「职责 + 对象」短语\n\
                 - ✅ 例：『登录流程审查员』『订单模块迁移设计师』『支付冒烟测试执行人』\n\
                 - ❌ 反例：纯角色名『executor』『reviewer-1』；冗长重复『执行删除日志模块的所有引用并跑通测试的执行器』\n\n\
@@ -690,8 +690,8 @@ impl BuiltinToolName {
             Self::AgentSpawn => serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "role": { "type": "string", "description": "已注册的 agent 角色 id，如 architect / executor / explorer / reviewer / tester / coordinator" },
-                    "display_name": { "type": "string", "description": "本次派发的子代理实例展示名（3-30 个字符），用于前端子代理卡片标题。要求高度概括本次具体职责，例如『登录流程审查员』『支付迁移设计师』『冒烟测试执行人』；不要写成纯角色名（如『executor』）或冗长目标重复。" },
+                    "role": { "type": "string", "description": "已注册的代理角色 id，如 architect / executor / explorer / reviewer / tester。不要传 coordinator，主线协调身份由当前主模型承接。" },
+                    "display_name": { "type": "string", "description": "本次派发的代理实例展示名（3-30 个字符），用于前端代理卡片标题。要求高度概括本次具体职责，例如『登录流程审查员』『支付迁移设计师』『冒烟测试执行人』；不要写成纯角色名（如『executor』）或冗长目标重复。" },
                     "goal": { "type": "string", "description": "子任务的具体目标；角色级 system prompt 会与该目标合并使用" },
                     "task_kind": {
                         "type": "string",
@@ -932,7 +932,7 @@ impl BuiltinToolName {
                                 },
                                 "execution_chain_ref": {
                                     "type": "string",
-                                    "description": "指向活跃 ExecutionChain 日志的指针，便于恢复后将子任务结果重新路由回父 mailbox。"
+                                    "description": "指向活跃 ExecutionChain 日志的指针，便于恢复后重建当前任务链。"
                                 },
                                 "turn_cursor": {
                                     "type": "integer",

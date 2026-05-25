@@ -198,7 +198,7 @@ impl TaskRunner {
             .unwrap_or("unknown");
         if task.parent_task_id.is_some() {
             return format!(
-                "子代理不可用：没有匹配角色 {role} 的可用执行器。父代理应改派其他可用角色，或由主线根据已有上下文继续完成。"
+                "代理不可用：没有匹配角色 {role} 的可用执行器。父代理应改派其他可用角色，或由主线根据已有上下文继续完成。"
             );
         }
         format!("任务不可运行：没有匹配角色 {role} 的可用执行器。")

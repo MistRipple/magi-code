@@ -56,7 +56,7 @@ impl Conversation {
         self.mailbox.push(MailboxItem::user(signal));
     }
 
-    /// 推入运行时信号。父子代理回执、Coordinator 指令、系统 followup 等都通过
+    /// 推入运行时信号。代理回执、Coordinator 指令、系统 followup 等都通过
     /// Mailbox 进入下一次 Turn，而不是绕到事件总线里当作隐式业务通道。
     pub fn ingest_runtime_signal(&mut self, signal: RuntimeSignal) {
         self.mailbox.push(MailboxItem::runtime(signal));

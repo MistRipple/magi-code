@@ -10,7 +10,7 @@
 //! 文件并触发迁移。当前内置集与默认值均为 `1`。
 //!
 //! 加载顺序：
-//! 1. crate 内置 builtin 集（编译期 `include_str!` 嵌入，6 个角色一一对应一个 .md）
+//! 1. crate 内置 builtin 集（编译期 `include_str!` 嵌入，5 个代理角色 + 1 个内部主线协调器）
 //! 2. 用户 override（`~/.magi/roles/*.md`），同 id 时 user override 覆盖 builtin
 //!
 //! 解析失败（front-matter 缺失、字段无法识别）走 tracing warn，跳过该文件而不
@@ -45,7 +45,7 @@ pub enum AgentRoleError {
 /// 单个 role 的定义。
 ///
 /// `coordinator_mode = true` 表示该角色采用 Prompt-as-Code 协调器模式：
-/// LLM 通过 `Agent` 内置工具同步派发子代理，子代理完成的结果作为 tool_call_result
+/// LLM 通过 `Agent` 内置工具同步派发代理，代理完成的结果作为 tool_call_result
 /// 直接回写到协调器上下文，整个 orchestration 由 prompt 驱动，而不是 Code-as-Coordinator
 /// 在外层硬编码状态机。架构详见 docs/task-system-v2/01-architecture.md L10。
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -175,6 +175,27 @@ impl AgentRoleRegistry {
 
     pub fn role_supports_task_kind(&self, role_id: &str, kind: TaskKind) -> bool {
         self.supported_task_kinds(role_id).contains(&kind)
+    }
+
+    /// 判断 role 是否允许作为 agent_spawn 的目标。
+    ///
+    /// coordinator_mode 角色是主线编排身份，只能由 root task 使用；agent_spawn 只能派发
+    /// 非 coordinator 的专业代理，避免出现“协调器派生协调器”的递归编排语义。
+    pub fn is_spawnable_agent_role(&self, role_id: &str) -> bool {
+        self.roles.get(role_id).is_some_and(|role| {
+            !role.coordinator_mode && role.supported_task_kinds().contains(&TaskKind::LocalAgent)
+        })
+    }
+
+    pub fn spawnable_agent_role_ids(&self) -> Vec<String> {
+        let mut ids = self
+            .roles
+            .values()
+            .filter(|role| self.is_spawnable_agent_role(&role.id))
+            .map(|role| role.id.clone())
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids
     }
 
     pub fn all(&self) -> impl Iterator<Item = &AgentRole> {

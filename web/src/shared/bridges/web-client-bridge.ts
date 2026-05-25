@@ -1788,7 +1788,7 @@ async function dispatchRegistryAgents(): Promise<void> {
     for (const t of templates) {
       templateMap.set(t.templateId, t as unknown as Record<string, unknown>);
     }
-    // 内置角色全部默认参与调度，无需 enabled 过滤。
+    // 可派发代理角色默认可用，无需 enabled 过滤。
     const enabledAgents = agents
       .map((a) => {
         const tmpl = templateMap.get(a.templateId as string);

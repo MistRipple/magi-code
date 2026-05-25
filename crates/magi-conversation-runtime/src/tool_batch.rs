@@ -206,6 +206,7 @@ pub fn execute_task_tool_call_batch(
 /// `execute_task_tool_call` 的常规工具路径形状一致，便于上层把回执拼回 LLM 消息流。
 fn execute_coordinator_tool(
     event_bus: &InMemoryEventBus,
+    agent_role_registry: &magi_agent_role::AgentRoleRegistry,
     task_store: &TaskStore,
     session_store: &SessionStore,
     execution_registry: &TaskExecutionRegistry,
@@ -312,10 +313,25 @@ fn execute_coordinator_tool(
                     ExecutionResultStatus::Failed,
                 );
             }
-            // display_name 是 LLM 提供的子代理展示名，作为 Task.title 直接面向用户。
+            if !agent_role_registry.is_spawnable_agent_role(&role) {
+                return (
+                    serde_json::json!({
+                        "tool": tool.as_str(),
+                        "status": "degraded",
+                        "fallback_mode": "mainline_or_reassign",
+                        "role": role,
+                        "available_roles": agent_role_registry.spawnable_agent_role_ids(),
+                        "error": "该 role 不是可派发代理角色。coordinator 是主线编排身份，不能通过 agent_spawn 派发。",
+                        "instruction": "请改派 architect / executor / explorer / reviewer / tester 等专业代理；如果无需继续派发，则由主线基于已有上下文直接推进并给出结果。",
+                    })
+                    .to_string(),
+                    ExecutionResultStatus::Succeeded,
+                );
+            }
+            // display_name 是 LLM 提供的代理展示名，作为 Task.title 直接面向用户。
             // 长度限制 3-30 个 Unicode 字符：下限 3 既能拒绝『x』『ab』之类的占位符，
             // 又允许典型 4 字中文短语（如『探索目录』『统计行数』）这一最自然的命名密度；
-            // 上限 30 防止破坏前端子代理卡片版式。
+            // 上限 30 防止破坏前端代理卡片版式。
             let display_name = parsed
                 .get("display_name")
                 .and_then(|v| v.as_str())
@@ -451,7 +467,7 @@ fn execute_coordinator_tool(
                 }),
             );
 
-            // 同步阻塞：父代理本轮停在该 tool call 上，等待子代理终态。
+            // 同步阻塞：父代理本轮停在该 tool call 上，等待代理终态。
             // 后台 TaskRunner 调度线程独立运行，会持续派发本子任务到 worker；
             // 子任务终态由 TaskRunner.apply_results 写入 TaskStore，本线程在此轮询读取。
             wait_for_child_terminal_outcome(task_store, &child_id, tool, &role)
@@ -463,7 +479,7 @@ fn execute_coordinator_tool(
 /// 父代理在本线程同步阻塞至子任务进入 Completed / Failed / Killed 终态，
 /// 把 TaskStore 中写下的 output_refs 直接打包成 tool_call_result 返回。
 ///
-/// - 不再依赖 mailbox AgentResult 信号或 Conversation 重新发起轮次；
+/// - 不再依赖 mailbox 旁路信号或 Conversation 重新发起轮次；
 /// - TaskRunner 后台线程独立运行，本线程阻塞不影响其调度；
 /// - 父任务的租约由 TaskRunner.heartbeat 持续续期，不会因等待过期。
 fn wait_for_child_terminal_outcome(
@@ -511,7 +527,7 @@ fn wait_for_child_terminal_outcome(
                     .cloned()
                     .unwrap_or_else(|| "子任务执行失败".to_string());
                 let summary = compact_child_agent_output(&child.output_refs);
-                if subagent_unavailable_failure(&error) {
+                if agent_unavailable_failure(&error) {
                     return (
                         serde_json::json!({
                             "tool": tool.as_str(),
@@ -524,7 +540,7 @@ fn wait_for_child_terminal_outcome(
                             "summary": summary,
                             "output_ref_count": child.output_refs.len(),
                             "error": error,
-                            "instruction": "子代理当前不可用。请不要停止任务：优先改派其他可用角色继续；如果没有必要继续派发，则由主线根据已有上下文直接推进并给出最终结果。",
+                            "instruction": "代理当前不可用。请不要停止任务：优先改派其他可用角色继续；如果没有必要继续派发，则由主线根据已有上下文直接推进并给出最终结果。",
                         })
                         .to_string(),
                         ExecutionResultStatus::Succeeded,
@@ -571,7 +587,7 @@ fn compact_child_agent_output(output_refs: &[String]) -> String {
         .iter()
         .rev()
         .find_map(|output| child_agent_final_text(output).or_else(|| non_empty_text(output)))
-        .unwrap_or_else(|| "子代理未返回可展示输出".to_string());
+        .unwrap_or_else(|| "代理未返回可展示输出".to_string());
     truncate_for_agent_spawn_summary(&raw)
 }
 
@@ -612,13 +628,13 @@ fn truncate_for_agent_spawn_summary(value: &str) -> String {
     output
 }
 
-fn subagent_unavailable_failure(error: &str) -> bool {
+fn agent_unavailable_failure(error: &str) -> bool {
     let normalized = error.trim().to_ascii_lowercase();
     [
         "llm invocation failed",
         "模型配置不可用",
         "model bridge client",
-        "子代理不可用",
+        "代理不可用",
         "没有匹配角色",
         "没有匹配",
         "provider transport failed",
@@ -682,6 +698,7 @@ fn execute_task_tool_call(
         if matches!(canonical, magi_tool_runtime::BuiltinToolName::AgentSpawn) {
             return execute_coordinator_tool(
                 event_bus,
+                agent_role_registry,
                 task_store,
                 session_store,
                 execution_registry,
@@ -1308,14 +1325,14 @@ mod tests {
     }
 
     #[test]
-    fn subagent_unavailable_failure_is_degradable() {
-        assert!(subagent_unavailable_failure(
+    fn agent_unavailable_failure_is_degradable() {
+        assert!(agent_unavailable_failure(
             "LLM invocation failed (round 0): provider transport failed: timed out"
         ));
-        assert!(subagent_unavailable_failure(
+        assert!(agent_unavailable_failure(
             "模型配置不可用: model bridge client 未配置"
         ));
-        assert!(!subagent_unavailable_failure(
+        assert!(!agent_unavailable_failure(
             "工具执行失败，任务不能标记完成：file_write: denied"
         ));
     }

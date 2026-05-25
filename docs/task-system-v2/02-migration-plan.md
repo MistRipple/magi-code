@@ -28,10 +28,10 @@ v2 只保留一个设计主线：
 已经进入主线的能力：
 
 - `chat / execute / task / continue` 分类入口。
-- `dispatch_submission` 创建 root task、execution chain、worker thread。
+- `dispatch_submission` 创建 root task、execution chain、task thread。
 - TaskRunner 推进 pending/running/terminal 状态、lease 和结果回收。
 - task-level Conversation 承载 Turn/Mailbox。
-- `agent_spawn / send_message / task_stop` 进入 coordinator 工具层。
+- `agent_spawn` 作为主编排工具进入工具层，并以同步 `tool_call_result` 回写父 turn。
 - SpawnGraph 使用 `TaskId` 做父子拓扑。
 - Tier 4 stores 已有文件化记录、工具写入和 prompt 注入。
 

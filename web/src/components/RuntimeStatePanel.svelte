@@ -6,7 +6,6 @@
   import type {
     OrchestratorRuntimeState,
     OrchestratorRuntimeDecisionTraceEntry,
-    OrchestrationRuntimeFailureRootCause,
   } from '../types/message';
   import Icon from './Icon.svelte';
   import type { IconName } from '../lib/icons';
@@ -21,7 +20,6 @@
   /** knowledgeAudit 运行时结构（后端类型为 unknown，这里给出前端期望的形状） */
   interface KnowledgeAuditView {
     recentEntries?: KnowledgeAuditEntry[];
-    auditPath?: string;
     eventCount?: number;
   }
 
@@ -32,6 +30,8 @@
     summary?: string;
     purpose?: string;
     consumer?: string;
+    resultKind?: string;
+    referenceCount?: number;
     [key: string]: unknown;
   }
 
@@ -99,6 +99,7 @@
     return errors
       .filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
       .map((item) => item.trim())
+      .filter((item) => !isGeneratedRuntimeIdentifier(item))
       .filter((item, index, arr) => arr.indexOf(item) === index);
   });
 
@@ -113,26 +114,17 @@
       return [] as Array<{ label: string; value: string }>;
     }
     const entries: Array<{ label: string; value: string }> = [];
-    if (executionGroupSummary?.title || scope.executionGroupId) {
+    if (executionGroupSummary?.title) {
       entries.push({
         label: i18n.t('runtimeState.summary.executionGroup'),
-        value: formatNamedReference(executionGroupSummary?.title, scope.executionGroupId),
+        value: executionGroupSummary.title,
       });
     }
     if (planSummary?.planId || scope.planId) {
       entries.push({
         label: i18n.t('runtimeState.summary.plan'),
-        value: formatPlanSummaryLabel(planSummary?.status, planSummary?.version, planSummary?.planId || scope.planId),
+        value: formatPlanSummaryLabel(planSummary?.status, planSummary?.version),
       });
-    }
-    if (scope.sessionId) {
-      entries.push({ label: i18n.t('runtimeDiagnostics.scope.session'), value: shortenIdentifier(scope.sessionId) });
-    }
-    if (scope.requestId) {
-      entries.push({ label: i18n.t('runtimeDiagnostics.scope.request'), value: shortenIdentifier(scope.requestId) });
-    }
-    if (scope.batchId) {
-      entries.push({ label: i18n.t('runtimeDiagnostics.scope.batch'), value: shortenIdentifier(scope.batchId) });
     }
     return entries;
   });
@@ -145,19 +137,30 @@
     if (!knowledgeAudit) {
       return [] as Array<{ label: string; value: string }>;
     }
-    return [
-      { label: i18n.t('runtimeDiagnostics.auditPath'), value: knowledgeAudit.auditPath },
-      { label: i18n.t('runtimeDiagnostics.auditEvents'), value: String(knowledgeAudit.eventCount || 0) },
-    ];
+    const entries: Array<{ label: string; value: string }> = [];
+    if (typeof knowledgeAudit.eventCount === 'number' && knowledgeAudit.eventCount > 0) {
+      entries.push({ label: i18n.t('runtimeDiagnostics.auditEvents'), value: String(knowledgeAudit.eventCount) });
+    }
+    return entries;
   });
 
-  const recentTimeline = $derived.by(() => Array.isArray(opsView?.recentTimeline) ? opsView.recentTimeline : []);
-  const recentStateDiffs = $derived.by(() => Array.isArray(opsView?.recentStateDiffs) ? opsView.recentStateDiffs : []);
+  const recentTimeline = $derived.by(() => (
+    Array.isArray(opsView?.recentTimeline)
+      ? opsView.recentTimeline.filter((item) => Boolean(formatTimelineSummary(item)))
+      : []
+  ));
+  const recentStateDiffs = $derived.by(() => (
+    Array.isArray(opsView?.recentStateDiffs)
+      ? opsView.recentStateDiffs.filter((item) => hasReadableStateDiff(item))
+      : []
+  ));
   const assignmentSummaries = $derived.by(() => Array.isArray(runtimeState?.assignments) ? runtimeState.assignments : []);
-  const readableAssignmentCount = $derived.by(() => assignmentSummaries.length);
   const activeWorkerSummary = $derived.by(() => {
     const names = assignmentSummaries
-      .map((item) => formatWorkerName(item.workerId))
+      .map((item) => item.workerId)
+      .filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+      .filter((item) => !isGeneratedRuntimeIdentifier(item))
+      .map((item) => formatWorkerName(item))
       .filter((item, index, arr) => item && arr.indexOf(item) === index);
     return names.slice(0, 4).join('、');
   });
@@ -180,13 +183,13 @@
     if (planSummary?.planId) {
       entries.push({
         label: i18n.t('runtimeState.summary.plan'),
-        value: formatPlanSummaryLabel(planSummary.status, planSummary.version, planSummary.planId),
+        value: formatPlanSummaryLabel(planSummary.status, planSummary.version),
       });
     }
-    if (readableAssignmentCount > 0) {
+    if (activeWorkerSummary) {
       entries.push({
         label: i18n.t('runtimeState.summary.activeWorkers'),
-        value: activeWorkerSummary || String(readableAssignmentCount),
+        value: activeWorkerSummary,
       });
     }
     if (runtimeState.startedAt) {
@@ -198,7 +201,7 @@
     if (runtimeState.chain?.chainId) {
       entries.push({
         label: i18n.t('runtimeState.summary.chain'),
-        value: formatChainSummary(runtimeState.chain.status, runtimeState.chain.attempt, runtimeState.chain.chainId),
+        value: formatChainSummary(runtimeState.chain.status, runtimeState.chain.attempt),
       });
     }
     if (runtimeState.canResume) {
@@ -400,10 +403,11 @@
   function formatNamedReference(title: string | undefined | null, id?: string | null): string {
     const normalizedTitle = typeof title === 'string' ? title.trim() : '';
     const normalizedId = typeof id === 'string' ? id.trim() : '';
-    if (normalizedTitle && normalizedId) {
-      return `${normalizedTitle} (${shortenIdentifier(normalizedId)})`;
+    const readableId = normalizedId && !isGeneratedRuntimeIdentifier(normalizedId) ? normalizedId : '';
+    if (normalizedTitle && readableId) {
+      return `${normalizedTitle} (${shortenIdentifier(readableId)})`;
     }
-    return normalizedTitle || shortenIdentifier(normalizedId);
+    return normalizedTitle || (readableId ? shortenIdentifier(readableId) : '--');
   }
 
   function formatRuntimePhase(phase: string | undefined): string {
@@ -446,25 +450,21 @@
     return label !== key ? label : normalized;
   }
 
-  function formatPlanSummaryLabel(status?: string, version?: number, planId?: string): string {
+  function formatPlanSummaryLabel(status?: string, version?: number): string {
     const statusLabel = formatPlanStatus(status);
     const versionLabel = typeof version === 'number' && Number.isFinite(version)
       ? i18n.t('runtimeState.summary.planVersion', { version })
       : '';
-    const refLabel = planId ? shortenIdentifier(planId) : '';
-    return [statusLabel, versionLabel, refLabel].filter(Boolean).join(' · ') || '--';
+    return [statusLabel, versionLabel].filter(Boolean).join(' · ') || '--';
   }
 
-  function formatChainSummary(status: string | undefined, attempt: number | undefined, chainId?: string): string {
+  function formatChainSummary(status: string | undefined, attempt: number | undefined): string {
     const parts: string[] = [];
     if (typeof attempt === 'number' && Number.isFinite(attempt)) {
       parts.push(i18n.t('runtimeState.summary.chainAttempt', { attempt }));
     }
     if (typeof status === 'string' && status.trim()) {
-      parts.push(status.trim());
-    }
-    if (chainId) {
-      parts.push(shortenIdentifier(chainId));
+      parts.push(formatAssignmentStatus(status));
     }
     return parts.join(' · ') || '--';
   }
@@ -496,6 +496,15 @@
     return parts.map((part) => part.charAt(0).toUpperCase() + part.slice(1)).join(' ');
   }
 
+  function isGeneratedRuntimeIdentifier(value: string | undefined): boolean {
+    const normalized = typeof value === 'string' ? value.trim().toLowerCase() : '';
+    if (!normalized) return false;
+    return /\b(task|session|worker|mission|chain|recovery|assignment|request|batch|execution[_-]?group)[-_][a-z0-9_-]*\d{4,}/.test(normalized)
+      || /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(normalized)
+      || /\d{10,}/.test(normalized)
+      || normalized.startsWith('task_failed:');
+  }
+
   function resolveTaskRuntimeIdentifier(entry: Record<string, unknown>): string {
     const taskId = typeof entry.taskId === 'string' ? entry.taskId.trim() : '';
     if (taskId) {
@@ -504,21 +513,8 @@
     return '';
   }
 
-  function resolveFailureRootCauseTaskRuntimeIdentifier(
-    rootCause: OrchestrationRuntimeFailureRootCause | null | undefined,
-  ): string {
-    if (!rootCause) {
-      return '';
-    }
-    return resolveTaskRuntimeIdentifier(rootCause as unknown as Record<string, unknown>);
-  }
-
   function formatAssignmentMeta(item: { assignmentId?: string; workerId?: string; status: string }): string {
-    return [
-      formatWorkerName(item.workerId),
-      formatAssignmentStatus(item.status),
-      item.assignmentId ? shortenIdentifier(item.assignmentId) : '',
-    ].filter(Boolean).join(' · ');
+    return formatAssignmentStatus(item.status);
   }
 
   function formatAssignmentStatus(status: string | undefined): string {
@@ -729,7 +725,17 @@
     if (!Array.isArray(keys) || keys.length === 0) {
       return '--';
     }
-    return keys.join(', ');
+    const labels = keys
+      .map((key) => formatRuntimeFieldLabel(key))
+      .filter((label) => label.length > 0)
+      .filter((label, index, arr) => arr.indexOf(label) === index);
+    if (labels.length === 0) {
+      return '状态已更新';
+    }
+    const visibleLabels = labels.slice(0, 4);
+    return labels.length > visibleLabels.length
+      ? `${visibleLabels.join('、')} 等 ${labels.length} 项`
+      : visibleLabels.join('、');
   }
 
   function formatKnowledgePurpose(purpose: string): string {
@@ -745,50 +751,325 @@
       case 'ui_panel':
         return i18n.t('runtimeDiagnostics.knowledgePurpose.uiPanel');
       default:
-        return purpose;
+        return formatHumanizedRuntimeText(purpose) || '知识记录';
     }
   }
 
   function formatKnowledgeAuditScope(entry: KnowledgeAuditEntry): string {
     const scopes: string[] = [];
-    if (entry.requestId) {
-      scopes.push(`${i18n.t('runtimeDiagnostics.scope.request')}: ${entry.requestId}`);
+    appendReadableScope(scopes, i18n.t('runtimeDiagnostics.scope.request'), entry.requestId);
+    appendReadableScope(scopes, i18n.t('runtimeDiagnostics.scope.executionGroup'), entry.executionGroupId);
+    appendReadableScope(scopes, i18n.t('runtimeDiagnostics.scope.assignment'), entry.assignmentId);
+    appendReadableScope(scopes, i18n.t('runtimeDiagnostics.scope.task'), resolveTaskRuntimeIdentifier(entry));
+    appendReadableScope(scopes, i18n.t('runtimeDiagnostics.scope.worker'), entry.workerId);
+    appendReadableScope(scopes, i18n.t('runtimeDiagnostics.scope.session'), entry.sessionId);
+    return scopes.length > 0 ? scopes.join(' · ') : '';
+  }
+
+  function appendReadableScope(scopes: string[], label: string, value: unknown): void {
+    const normalized = typeof value === 'string' ? value.trim() : '';
+    if (!normalized || isGeneratedRuntimeIdentifier(normalized)) {
+      return;
     }
-    if (entry.executionGroupId) {
-      scopes.push(`${i18n.t('runtimeDiagnostics.scope.executionGroup')}: ${entry.executionGroupId}`);
+    scopes.push(`${label}: ${shortenIdentifier(normalized)}`);
+  }
+
+  function formatKnowledgeAuditMeta(entry: KnowledgeAuditEntry): string {
+    const parts: string[] = [];
+    const consumer = formatKnowledgeConsumer(entry.consumer);
+    if (consumer) {
+      parts.push(`${i18n.t('runtimeDiagnostics.consumer')}: ${consumer}`);
     }
-    if (entry.assignmentId) {
-      scopes.push(`${i18n.t('runtimeDiagnostics.scope.assignment')}: ${entry.assignmentId}`);
+    const resultKind = formatKnowledgeResultKind(entry.resultKind);
+    if (resultKind) {
+      parts.push(`${i18n.t('runtimeDiagnostics.resultKind')}: ${resultKind}`);
     }
-    const taskRuntimeId = resolveTaskRuntimeIdentifier(entry);
-    if (taskRuntimeId) {
-      scopes.push(`${i18n.t('runtimeDiagnostics.scope.task')}: ${taskRuntimeId}`);
+    if (typeof entry.referenceCount === 'number' && Number.isFinite(entry.referenceCount)) {
+      parts.push(`${i18n.t('runtimeDiagnostics.references')}: ${entry.referenceCount}`);
     }
-    if (entry.workerId) {
-      scopes.push(`${i18n.t('runtimeDiagnostics.scope.worker')}: ${entry.workerId}`);
+    return parts.join(' · ');
+  }
+
+  function formatKnowledgeConsumer(consumer: unknown): string {
+    const normalized = typeof consumer === 'string' ? consumer.trim() : '';
+    if (!normalized || isGeneratedRuntimeIdentifier(normalized)) {
+      return '';
     }
-    if (scopes.length === 0 && entry.sessionId) {
-      scopes.push(`${i18n.t('runtimeDiagnostics.scope.session')}: ${entry.sessionId}`);
+    switch (normalized) {
+      case 'prompt':
+      case 'prompt_context':
+      case 'prompt-context':
+        return '提示词上下文';
+      case 'runtime':
+      case 'orchestrator':
+        return '任务编排';
+      case 'ui':
+      case 'ui_panel':
+      case 'ui-panel':
+        return '运行态面板';
+      default:
+        return formatHumanizedRuntimeText(normalized);
     }
-    return scopes.length > 0 ? scopes.join(' · ') : '--';
+  }
+
+  function formatKnowledgeResultKind(resultKind: unknown): string {
+    const normalized = typeof resultKind === 'string' ? resultKind.trim() : '';
+    if (!normalized) {
+      return '';
+    }
+    switch (normalized) {
+      case 'hit':
+      case 'hits':
+      case 'matched':
+        return '已命中';
+      case 'miss':
+      case 'empty':
+        return '未命中';
+      case 'error':
+      case 'failed':
+        return '查询失败';
+      default:
+        return formatHumanizedRuntimeText(normalized);
+    }
   }
 
   function formatTimelineTypeLabel(type: string): string {
     const normalized = typeof type === 'string' ? type.trim() : '';
     if (!normalized) return '--';
-    return normalized
-      .split('.')
-      .pop()
-      ?.replace(/[_-]/g, ' ')
-      .replace(/\b\w/g, (char) => char.toUpperCase()) || normalized;
+    switch (normalized) {
+      case 'task.dispatched':
+        return '任务已派发';
+      case 'task.status.changed':
+        return '任务状态更新';
+      case 'mission.execution.overview':
+        return '执行概览';
+      case 'mission.resume.dispatch.created':
+        return '恢复调度已创建';
+      case 'worker.reported':
+        return '执行者上报';
+      case 'worker.tool.observed':
+      case 'tool.invoked':
+        return '工具调用';
+      case 'worker.skill_dispatch.observed':
+      case 'worker.skill_dispatch.applied':
+        return '技能调度';
+      case 'worker.executor.observed':
+        return '执行器状态';
+      case 'governance.decision.applied':
+        return '决策已应用';
+      case 'system.runtime.maintenance.status':
+        return '运行态维护';
+      default:
+        return normalized
+          .split('.')
+          .map((part) => formatRuntimeTokenLabel(part))
+          .filter(Boolean)
+          .join(' · ') || '运行事件';
+    }
+  }
+
+  function formatTimelineSummary(item: { type: string; summary: string }): string {
+    const typeLabel = formatTimelineTypeLabel(item.type);
+    const cleanedSummary = formatHumanizedRuntimeText(item.summary);
+    if (!cleanedSummary || cleanedSummary === typeLabel) {
+      return typeLabel;
+    }
+    const normalizedType = typeof item.type === 'string' ? item.type.trim() : '';
+    if (normalizedType && cleanedSummary.toLowerCase().startsWith(normalizedType.toLowerCase())) {
+      const rest = formatHumanizedRuntimeText(cleanedSummary.slice(normalizedType.length));
+      return rest ? `${typeLabel}：${rest}` : typeLabel;
+    }
+    return cleanedSummary;
   }
 
   function formatStateDiffEntityLabel(item: { entityType: string; entityId: string }): string {
     const entityType = item.entityType || '--';
-    const typeLabel = entityType
+    const typeLabel = formatRuntimeEntityTypeLabel(entityType);
+    return isGeneratedRuntimeIdentifier(item.entityId)
+      ? typeLabel
+      : `${typeLabel} · ${shortenIdentifier(item.entityId)}`;
+  }
+
+  function formatStateSummary(value: string | undefined): string {
+    return formatHumanizedRuntimeText(value);
+  }
+
+  function hasReadableStateDiff(item: { entityType: string; entityId: string; changedKeys: string[]; beforeSummary?: string; afterSummary?: string }): boolean {
+    return formatStateDiffEntityLabel(item) !== '--'
+      || formatChangedKeys(item.changedKeys) !== '--'
+      || Boolean(formatStateSummary(item.beforeSummary))
+      || Boolean(formatStateSummary(item.afterSummary));
+  }
+
+  function formatRuntimeEntityTypeLabel(entityType: string | undefined): string {
+    const normalized = typeof entityType === 'string' ? entityType.trim() : '';
+    if (!normalized) return '--';
+    switch (normalized) {
+      case 'task':
+        return '任务';
+      case 'mission':
+      case 'execution_group':
+        return '执行组';
+      case 'assignment':
+        return '任务分配';
+      case 'worker':
+        return '执行者';
+      case 'session':
+        return '会话';
+      case 'plan':
+        return '计划';
+      case 'recovery':
+        return '恢复状态';
+      default:
+        return formatHumanizedRuntimeText(normalized) || '--';
+    }
+  }
+
+  function formatRuntimeFieldLabel(key: string): string {
+    const normalized = typeof key === 'string' ? key.trim() : '';
+    if (!normalized || isInternalRuntimeField(normalized)) {
+      return '';
+    }
+    switch (normalized) {
+      case 'status':
+      case 'current_status':
+      case 'root_task_status':
+        return '状态';
+      case 'phase':
+      case 'current_phase':
+        return '阶段';
+      case 'title':
+      case 'task_title':
+        return '标题';
+      case 'goal':
+        return '目标';
+      case 'updated_at':
+      case 'last_update':
+        return '更新时间';
+      case 'failed_dispatch_count':
+        return '失败次数';
+      case 'active_task_ids':
+        return '活动任务';
+      case 'active_branches':
+        return '活动分支';
+      default:
+        return formatHumanizedRuntimeText(normalized);
+    }
+  }
+
+  function isInternalRuntimeField(key: string): boolean {
+    return /(^|_)(id|ids|ref|refs)$/.test(key)
+      || key === 'event_id'
+      || key === 'request_id'
+      || key === 'session_id'
+      || key === 'task_id'
+      || key === 'worker_id'
+      || key === 'assignment_id'
+      || key === 'mission_id';
+  }
+
+  function formatDecisionAction(action: string): string {
+    switch (action) {
+      case 'continue':
+        return '继续执行';
+      case 'continue_with_prompt':
+        return '补充约束后继续';
+      case 'terminate':
+        return '结束本轮';
+      case 'handoff':
+        return '交接处理';
+      case 'fallback':
+        return '改用备选路径';
+      default:
+        return formatHumanizedRuntimeText(action) || '决策更新';
+    }
+  }
+
+  function formatDecisionDetail(item: OrchestratorRuntimeDecisionTraceEntry): string {
+    const parts = [
+      formatDecisionReason(item.reason),
+      formatHumanizedRuntimeText(item.note),
+    ].filter((part) => part.length > 0);
+    return parts.join(' · ');
+  }
+
+  function formatDecisionReason(reason: string | undefined): string {
+    const normalized = typeof reason === 'string' ? reason.trim() : '';
+    if (!normalized) return '';
+    switch (normalized) {
+      case 'completed':
+        return '已完成';
+      case 'failed':
+        return '执行失败';
+      case 'cancelled':
+        return '已取消';
+      case 'governance_pause':
+        return '等待治理检查';
+      case 'stalled':
+        return '进展停滞';
+      case 'budget_exceeded':
+        return '预算已耗尽';
+      case 'external_wait_timeout':
+        return '外部等待超时';
+      case 'external_abort':
+        return '外部中止';
+      case 'upstream_model_error':
+        return '上游模型连续失败';
+      case 'interrupted':
+        return '执行中断';
+      case 'unknown':
+        return '原因未知';
+      default:
+        return formatHumanizedRuntimeText(normalized);
+    }
+  }
+
+  function formatRuntimeTokenLabel(token: string): string {
+    switch (token) {
+      case 'task': return '任务';
+      case 'mission': return '执行组';
+      case 'worker': return '执行者';
+      case 'tool': return '工具';
+      case 'governance': return '决策';
+      case 'decision': return '决策';
+      case 'system': return '系统';
+      case 'runtime': return '运行态';
+      case 'execution': return '执行';
+      case 'overview': return '概览';
+      case 'status': return '状态';
+      case 'changed': return '更新';
+      case 'dispatched': return '已派发';
+      case 'reported': return '上报';
+      case 'observed': return '已观测';
+      case 'applied': return '已应用';
+      case 'resume': return '恢复';
+      case 'dispatch': return '调度';
+      case 'created': return '已创建';
+      default:
+        return token
+          .replace(/[_-]/g, ' ')
+          .replace(/\b\w/g, (char) => char.toUpperCase());
+    }
+  }
+
+  function formatHumanizedRuntimeText(value: unknown): string {
+    const raw = typeof value === 'string' ? value.trim() : '';
+    if (!raw || isGeneratedRuntimeIdentifier(raw)) {
+      return '';
+    }
+    const withoutIdentifiers = raw
+      .replace(/\b(task|session|worker|mission|chain|recovery|assignment|request|batch|execution[_-]?group)[-_:][a-z0-9_-]*\d{4,}\b/gi, '')
+      .replace(/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi, '')
+      .replace(/\b\d{10,}\b/g, '')
+      .replace(/\s+/g, ' ')
+      .replace(/^[\s:：,，;；·-]+|[\s:：,，;；·-]+$/g, '')
+      .trim();
+    if (!withoutIdentifiers || isGeneratedRuntimeIdentifier(withoutIdentifiers)) {
+      return '';
+    }
+    return withoutIdentifiers
       .replace(/[_-]/g, ' ')
-      .replace(/\b\w/g, (char) => char.toUpperCase());
-    return `${typeLabel} · ${shortenIdentifier(item.entityId)}`;
+      .replace(/\b[a-z]/g, (char) => char.toUpperCase());
   }
 
   function togglePanel(): void {
@@ -1016,7 +1297,9 @@
         {/if}
       </div>
 
+      {#if recentTimeline.length > 0 || recentStateDiffs.length > 0 || recentTrace.length > 0}
       <div class="runtime-diagnostics__section-stack">
+        {#if recentTimeline.length > 0}
         <section class="runtime-diagnostics__section-toggle">
           <button
             type="button"
@@ -1033,30 +1316,28 @@
           </button>
           {#if isTimelineExpanded}
           <div class="runtime-diagnostics__section-body">
-            {#if recentTimeline.length > 0}
-              <div class="runtime-diagnostics__ops-list">
-                {#each recentTimeline as item}
-                  <div class="runtime-diagnostics__ops-item">
-                    <div class="runtime-diagnostics__ops-title-row">
-                      <span class="runtime-diagnostics__ops-title">{item.summary}</span>
-                      <span class="runtime-diagnostics__ops-time">{formatTimestamp(item.timestamp)}</span>
-                    </div>
-                    <div class="runtime-diagnostics__ops-sub">
-                      {formatTimelineTypeLabel(item.type)}
-                      {#if item.diffCount > 0}
-                        · {item.diffCount} 项变更
-                      {/if}
-                    </div>
+            <div class="runtime-diagnostics__ops-list">
+              {#each recentTimeline as item}
+                <div class="runtime-diagnostics__ops-item">
+                  <div class="runtime-diagnostics__ops-title-row">
+                    <span class="runtime-diagnostics__ops-title">{formatTimelineSummary(item)}</span>
+                    <span class="runtime-diagnostics__ops-time">{formatTimestamp(item.timestamp)}</span>
                   </div>
-                {/each}
-              </div>
-            {:else}
-              <div class="runtime-diagnostics__empty">{i18n.t('runtimeDiagnostics.noTimeline')}</div>
-            {/if}
+                  <div class="runtime-diagnostics__ops-sub">
+                    {formatTimelineTypeLabel(item.type)}
+                    {#if item.diffCount > 0}
+                      · {item.diffCount} 项变更
+                    {/if}
+                  </div>
+                </div>
+              {/each}
+            </div>
           </div>
           {/if}
         </section>
+        {/if}
 
+        {#if recentStateDiffs.length > 0}
         <section class="runtime-diagnostics__section-toggle">
           <button
             type="button"
@@ -1073,32 +1354,32 @@
           </button>
           {#if isStateDiffExpanded}
           <div class="runtime-diagnostics__section-body">
-            {#if recentStateDiffs.length > 0}
-              <div class="runtime-diagnostics__ops-list">
-                {#each recentStateDiffs as item}
-                  <div class="runtime-diagnostics__ops-item">
-                    <div class="runtime-diagnostics__ops-title-row">
-                      <span class="runtime-diagnostics__ops-title">{formatStateDiffEntityLabel(item)}</span>
-                      <span class="runtime-diagnostics__ops-time">{formatTimestamp(item.timestamp)}</span>
-                    </div>
-                    <div class="runtime-diagnostics__ops-sub">
-                      {i18n.t('runtimeDiagnostics.changedKeys')}: {formatChangedKeys(item.changedKeys)}
-                    </div>
-                    {#if item.beforeSummary || item.afterSummary}
-                      <div class="runtime-diagnostics__ops-sub">
-                        {item.beforeSummary || '--'} → {item.afterSummary || '--'}
-                      </div>
-                    {/if}
+            <div class="runtime-diagnostics__ops-list">
+              {#each recentStateDiffs as item}
+                {@const beforeSummary = formatStateSummary(item.beforeSummary)}
+                {@const afterSummary = formatStateSummary(item.afterSummary)}
+                <div class="runtime-diagnostics__ops-item">
+                  <div class="runtime-diagnostics__ops-title-row">
+                    <span class="runtime-diagnostics__ops-title">{formatStateDiffEntityLabel(item)}</span>
+                    <span class="runtime-diagnostics__ops-time">{formatTimestamp(item.timestamp)}</span>
                   </div>
-                {/each}
-              </div>
-            {:else}
-              <div class="runtime-diagnostics__empty">{i18n.t('runtimeDiagnostics.noStateDiffs')}</div>
-            {/if}
+                  <div class="runtime-diagnostics__ops-sub">
+                    {i18n.t('runtimeDiagnostics.changedKeys')}: {formatChangedKeys(item.changedKeys)}
+                  </div>
+                  {#if beforeSummary || afterSummary}
+                    <div class="runtime-diagnostics__ops-sub">
+                      {beforeSummary || '--'} → {afterSummary || '--'}
+                    </div>
+                  {/if}
+                </div>
+              {/each}
+            </div>
           </div>
           {/if}
         </section>
+        {/if}
 
+        {#if recentTrace.length > 0}
         <section class="runtime-diagnostics__section-toggle">
           <button
             type="button"
@@ -1115,30 +1396,29 @@
           </button>
           {#if isDecisionTraceExpanded}
           <div class="runtime-diagnostics__section-body">
-            {#if recentTrace.length > 0}
-              <div class="trace-list">
-                {#each recentTrace as item}
-                  <div class="trace-item">
-                    <span class="trace-item__round">R{item.round}</span>
-                    <span class="trace-item__phase {phaseClass(item.phase)}">{phaseLabel(item.phase)}</span>
-                    <span class="trace-item__arrow">→</span>
-                    <span class="trace-item__action {actionClass(item.action)}">{item.action}</span>
-                    {#if item.requiredTotal > 0}
-                      <span class="trace-item__meta">({item.requiredTotal})</span>
-                    {/if}
-                    {#if item.reason || item.note}
-                      <span class="trace-item__note">{item.reason || item.note}</span>
-                    {/if}
-                  </div>
-                {/each}
-              </div>
-            {:else}
-              <div class="runtime-diagnostics__empty">{i18n.t('runtimeDiagnostics.noTrace')}</div>
-            {/if}
+            <div class="trace-list">
+              {#each recentTrace as item}
+                {@const decisionDetail = formatDecisionDetail(item)}
+                <div class="trace-item">
+                  <span class="trace-item__round">R{item.round}</span>
+                  <span class="trace-item__phase {phaseClass(item.phase)}">{phaseLabel(item.phase)}</span>
+                  <span class="trace-item__arrow">→</span>
+                  <span class="trace-item__action {actionClass(item.action)}">{formatDecisionAction(item.action)}</span>
+                  {#if item.requiredTotal > 0}
+                    <span class="trace-item__meta">({item.requiredTotal})</span>
+                  {/if}
+                  {#if decisionDetail}
+                    <span class="trace-item__note">{decisionDetail}</span>
+                  {/if}
+                </div>
+              {/each}
+            </div>
           </div>
           {/if}
         </section>
+        {/if}
       </div>
+      {/if}
 
       {#if runtimeState?.status === 'failed' && (failureReason || failureErrors.length > 0)}
         <div class="runtime-diagnostics__block runtime-diagnostics__block--failure">
@@ -1160,18 +1440,6 @@
         <div class="runtime-diagnostics__block runtime-diagnostics__block--failure">
           <div class="runtime-diagnostics__label">{i18n.t('runtimeDiagnostics.failureRootCauseTitle')}</div>
           <div class="runtime-diagnostics__failure-reason">{failureRootCause.summary}</div>
-          <div class="runtime-diagnostics__meta-line">
-            {formatDateTime(failureRootCause.occurredAt)}
-            {#if failureRootCause.eventType}
-              · {formatTimelineTypeLabel(failureRootCause.eventType)}
-            {/if}
-            {#if failureRootCause.assignmentId}
-              · {i18n.t('runtimeDiagnostics.scope.assignment')}: {shortenIdentifier(failureRootCause.assignmentId)}
-            {/if}
-            {#if resolveFailureRootCauseTaskRuntimeIdentifier(failureRootCause)}
-              · {i18n.t('runtimeDiagnostics.scope.task')}: {shortenIdentifier(resolveFailureRootCauseTaskRuntimeIdentifier(failureRootCause))}
-            {/if}
-          </div>
         </div>
       {/if}
 
@@ -1203,6 +1471,7 @@
         </div>
       {/if}
 
+      {#if knowledgeAuditSummaryEntries.length > 0 || knowledgeAuditEntries.length > 0}
       <div class="runtime-diagnostics__block">
         <div class="runtime-diagnostics__label">{i18n.t('runtimeDiagnostics.knowledgeAuditTitle')}</div>
         {#if knowledgeAuditSummaryEntries.length > 0}
@@ -1217,27 +1486,28 @@
           {#if knowledgeAuditEntries.length > 0}
             <div class="runtime-diagnostics__ops-list">
               {#each knowledgeAuditEntries as item}
+                {@const knowledgeMeta = formatKnowledgeAuditMeta(item)}
+                {@const knowledgeScope = formatKnowledgeAuditScope(item)}
                 <div class="runtime-diagnostics__ops-item">
                   <div class="runtime-diagnostics__ops-title-row">
                     <span class="runtime-diagnostics__ops-title">{formatKnowledgePurpose(item.purpose ?? '')}</span>
                     <span class="runtime-diagnostics__ops-time">{formatTimestamp(item.timestamp ?? 0)}</span>
                   </div>
+                  {#if knowledgeMeta}
                   <div class="runtime-diagnostics__ops-sub">
-                    {i18n.t('runtimeDiagnostics.consumer')}: {item.consumer || '--'}
-                    · {i18n.t('runtimeDiagnostics.resultKind')}: {item.resultKind}
-                    · {i18n.t('runtimeDiagnostics.references')}: {item.referenceCount}
+                    {knowledgeMeta}
                   </div>
-                  <div class="runtime-diagnostics__ops-sub">{formatKnowledgeAuditScope(item)}</div>
+                  {/if}
+                  {#if knowledgeScope}
+                    <div class="runtime-diagnostics__ops-sub">{knowledgeScope}</div>
+                  {/if}
                 </div>
               {/each}
             </div>
-          {:else}
-            <div class="runtime-diagnostics__empty">{i18n.t('runtimeDiagnostics.noKnowledgeAudit')}</div>
           {/if}
-        {:else}
-          <div class="runtime-diagnostics__empty">{i18n.t('runtimeDiagnostics.noKnowledgeAudit')}</div>
         {/if}
       </div>
+      {/if}
     </div>
     {/if}
   </section>

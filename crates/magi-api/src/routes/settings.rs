@@ -237,25 +237,9 @@ pub fn routes() -> Router<ApiState> {
 }
 
 pub(crate) fn builtin_role_templates() -> Vec<Value> {
+    // 这里只暴露可被 agent_spawn 派发的代理角色。
+    // coordinator 是主线编排的内部身份，由主模型承接，不进入用户可配置角色列表。
     vec![
-        json!({
-            "templateId": "coordinator",
-            "displayName": "Coordinator",
-            "description": "负责理解主目标、拆分子任务并向 executor / explorer / reviewer / tester 派发",
-            "i18n": {
-                "displayNameKey": "roleTemplate.coordinator.displayName",
-                "descriptionKey": "roleTemplate.coordinator.description",
-            },
-            "defaultUI": { "colorToken": "agent-coordinator", "icon": "grid" },
-            "profile": {
-                "role": "coordinator",
-                "focus": ["planning", "dispatch", "synthesis"],
-                "constraints": ["single-source-of-truth", "no-direct-execution"],
-                "outputPreferences": ["plan", "decision", "follow-up"],
-            },
-            "ownerships": ["orchestration"],
-            "insightPreferences": ["decision", "constraint", "risk"],
-        }),
         json!({
             "templateId": "executor",
             "displayName": "Executor",

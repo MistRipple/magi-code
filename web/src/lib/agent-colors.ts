@@ -25,9 +25,8 @@ const KNOWN_AGENT_COLORS: Record<string, AgentColorPair> = {
   gemini: { color: 'var(--color-gemini)', muted: 'var(--color-gemini-muted)' },
 };
 
-/** 角色模板 colorToken → 颜色映射（codex 风格 6 角色） */
+/** 角色模板 colorToken → 颜色映射（可派发代理角色） */
 const ROLE_COLOR_TOKENS: Record<string, AgentColorPair> = {
-  'agent-coordinator': { color: '#f59e0b', muted: 'rgba(245, 158, 11, 0.15)' },   // 琥珀色 · 协调
   'agent-executor':    { color: '#3b82f6', muted: 'rgba(59, 130, 246, 0.15)' },   // 蓝色 · 主力执行
   'agent-explorer':    { color: '#ef4444', muted: 'rgba(239, 68, 68, 0.15)' },    // 红色 · 探索/debug
   'agent-reviewer':    { color: '#10b981', muted: 'rgba(16, 185, 129, 0.15)' },   // 绿色 · 审核
@@ -93,7 +92,6 @@ interface AgentBrandInfo {
 }
 
 const ROLE_TEMPLATE_LABEL_KEYS: Record<string, string> = {
-  coordinator: 'roleTemplate.coordinator.displayName',
   executor: 'roleTemplate.executor.displayName',
   explorer: 'roleTemplate.explorer.displayName',
   reviewer: 'roleTemplate.reviewer.displayName',
@@ -103,6 +101,7 @@ const ROLE_TEMPLATE_LABEL_KEYS: Record<string, string> = {
 
 const SYSTEM_LABEL_KEYS: Record<string, string> = {
   orchestrator: 'workerBadge.role.orchestrator',
+  coordinator: 'workerBadge.role.orchestrator',
   auxiliary: 'workerBadge.role.auxiliary',
 };
 

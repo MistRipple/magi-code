@@ -10,7 +10,6 @@
     mcpExpandedServer,
     mcpServerTools,
     mcpRefreshingServers,
-    mcpExpandedTool,
     builtinTools,
     skills,
     openMCPDialog,
@@ -19,7 +18,6 @@
     toggleMCPServer,
     deleteMCPServer,
     refreshMCPTools,
-    toggleMCPToolDesc,
     openSkillLibraryDialog,
     openRepoDialog,
     deleteSkill
@@ -30,7 +28,6 @@
     mcpExpandedServer: string | null;
     mcpServerTools: Record<string, any[]>;
     mcpRefreshingServers: Set<string>;
-    mcpExpandedTool: string | null;
     builtinTools: Array<{
       name: string;
       riskLevel: string;
@@ -45,7 +42,6 @@
     toggleMCPServer: (sid: string, enabled: boolean) => void;
     deleteMCPServer: (sid: string) => void;
     refreshMCPTools: (sid: string) => void;
-    toggleMCPToolDesc: (toolKey: string, e: MouseEvent) => void;
     openSkillLibraryDialog: () => void;
     openRepoDialog: () => void;
     deleteSkill: (skill: any) => void;
@@ -102,6 +98,49 @@
   const builtinEnabledCount = $derived(
     (builtinTools as Array<{ enabled: boolean }>).filter((t) => t.enabled).length,
   );
+
+  // MCP 工具描述 hover 浮层：默认右侧弹出；按钮 + 浮层共同构成 hover 区域，移出即消失
+  const DESC_POPOVER_WIDTH = 320;
+  const DESC_POPOVER_MAX_HEIGHT = 240;
+  const DESC_CLOSE_GRACE_MS = 120;
+  let descAnchor = $state<{ x: number; y: number; description: string } | null>(null);
+  let closeTimer: ReturnType<typeof setTimeout> | null = null;
+
+  function clearCloseTimer() {
+    if (closeTimer !== null) {
+      clearTimeout(closeTimer);
+      closeTimer = null;
+    }
+  }
+
+  function scheduleClose() {
+    clearCloseTimer();
+    closeTimer = setTimeout(() => {
+      descAnchor = null;
+      closeTimer = null;
+    }, DESC_CLOSE_GRACE_MS);
+  }
+
+  function openDesc(description: string, e: MouseEvent) {
+    clearCloseTimer();
+    const btn = e.currentTarget as HTMLElement;
+    const rect = btn.getBoundingClientRect();
+    const gutter = 8;
+    // 默认按钮右侧弹出；右侧不够则回落到左侧
+    let left = rect.right + 8;
+    if (left + DESC_POPOVER_WIDTH + gutter > window.innerWidth) {
+      left = rect.left - DESC_POPOVER_WIDTH - 8;
+    }
+    if (left < gutter) left = gutter;
+    // 垂直对齐按钮中线，再按底部/顶部边界 clamp
+    const btnCenter = rect.top + rect.height / 2;
+    let top = btnCenter - DESC_POPOVER_MAX_HEIGHT / 2;
+    if (top + DESC_POPOVER_MAX_HEIGHT + gutter > window.innerHeight) {
+      top = window.innerHeight - DESC_POPOVER_MAX_HEIGHT - gutter;
+    }
+    if (top < gutter) top = gutter;
+    descAnchor = { x: left, y: top, description };
+  }
 </script>
 
 <div class="apple-manager tools-manager">
@@ -244,21 +283,24 @@
                         {#if mcpRefreshingServers.has(server.id)}
                           <div class="mcp-tools-empty" style="font-size: 11px; padding: 12px; text-align: center;">{i18n.t('settings.tools.loading')}</div>
                         {:else if mcpServerTools[server.id] && mcpServerTools[server.id].length > 0}
-                          {#each mcpServerTools[server.id] as tool, toolIndex}
-                            {@const toolKey = `${server.id}-${toolIndex}`}
-                            <!-- svelte-ignore a11y_no_static_element_interactions a11y_click_events_have_key_events -->
-                            <div class="mcp-tool-item" class:show-desc={mcpExpandedTool === toolKey} style="background: rgba(var(--foreground-rgb), 0.04); border-radius: 6px; padding: 6px 8px;">
+                          {#each mcpServerTools[server.id] as tool}
+                            <div class="mcp-tool-item" style="background: rgba(var(--foreground-rgb), 0.04); border-radius: 6px; padding: 6px 8px;">
                               <div class="mcp-tool-row" style="display: flex; justify-content: space-between; align-items: center;">
                                 <div class="mcp-tool-name" style="font-size: 11px; font-weight: 500;">{tool.name}</div>
                                 {#if tool.description}
-                                  <button class="mcp-tool-desc-btn" title={i18n.t('settings.tools.viewDesc')} onclick={(e) => toggleMCPToolDesc(toolKey, e)} style="transform: scale(0.8);">
+                                  <button
+                                    class="mcp-tool-desc-btn"
+                                    title={i18n.t('settings.tools.viewDesc')}
+                                    onmouseenter={(e) => openDesc(tool.description, e)}
+                                    onmouseleave={scheduleClose}
+                                    onfocus={(e) => openDesc(tool.description, e as unknown as MouseEvent)}
+                                    onblur={scheduleClose}
+                                    style="transform: scale(0.8);"
+                                  >
                                     <Icon name="info" size={12} />
                                   </button>
                                 {/if}
                               </div>
-                              {#if tool.description && mcpExpandedTool === toolKey}
-                                <div class="mcp-tool-desc" style="font-size: 10px; margin-top: 4px; color: var(--foreground-muted); line-height: 1.4;">{tool.description}</div>
-                              {/if}
                             </div>
                           {/each}
                         {:else}
@@ -331,6 +373,19 @@
       </div>
     </div>
 </div>
+
+{#if descAnchor}
+  <!-- svelte-ignore a11y_no_static_element_interactions -->
+  <div
+    class="mcp-tool-desc-popover"
+    style="top: {descAnchor.y}px; left: {descAnchor.x}px;"
+    role="tooltip"
+    onmouseenter={clearCloseTimer}
+    onmouseleave={scheduleClose}
+  >
+    {descAnchor.description}
+  </div>
+{/if}
 
 <style>
   .tools-manager {
@@ -504,12 +559,10 @@
     top: calc(100% + 8px);
     left: 0;
     width: 100%;
-    background: rgba(255, 255, 255, 0.96);
-    backdrop-filter: blur(24px);
-    -webkit-backdrop-filter: blur(24px);
-    border: 1px solid rgba(60, 60, 67, 0.16);
+    background: var(--background);
+    border: 1px solid var(--border);
     border-radius: 12px;
-    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.12), 0 1px 2px rgba(0, 0, 0, 0.04);
+    box-shadow: 0 18px 40px rgba(0, 0, 0, 0.35), 0 1px 2px rgba(0, 0, 0, 0.08);
     z-index: var(--z-popover);
     padding: 12px;
     max-height: 250px;
@@ -517,14 +570,6 @@
     box-sizing: border-box;
     display: flex;
     flex-direction: column;
-  }
-
-  :global(body.theme-dark) .mcp-tools-popover,
-  :global(body.vscode-dark) .mcp-tools-popover,
-  :global(:root.theme-dark) .mcp-tools-popover {
-    background: rgba(255, 255, 255, 0.06);
-    border-color: rgba(255, 255, 255, 0.14);
-    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.3), 0 1px 2px rgba(0, 0, 0, 0.1);
   }
 
   .mcp-tools-header {
@@ -536,13 +581,7 @@
     color: var(--foreground-muted);
     margin-bottom: 12px;
     padding-bottom: 8px;
-    border-bottom: 1px solid rgba(60, 60, 67, 0.10);
-  }
-
-  :global(body.theme-dark) .mcp-tools-header,
-  :global(body.vscode-dark) .mcp-tools-header,
-  :global(:root.theme-dark) .mcp-tools-header {
-    border-bottom-color: rgba(255, 255, 255, 0.08);
+    border-bottom: 1px solid var(--border);
   }
 
   /* Apply consistent tile classes */
@@ -642,7 +681,6 @@
     transform: rotate(180deg);
   }
 
-  .mcp-tools-header { display: flex; justify-content: space-between; align-items: center; font-size: var(--text-sm); font-weight: var(--font-medium); color: var(--foreground-muted); margin-bottom: var(--space-2); }
   .mcp-tools-list { display: flex; flex-direction: column; gap: var(--space-2); }
 
   /* MCP 工具项样式 */
@@ -657,7 +695,26 @@
   .mcp-tool-item:hover { border-color: var(--primary-muted); background: var(--surface-hover); }
   .mcp-tool-row { display: flex; align-items: center; gap: var(--space-2); }
   .mcp-tool-name { font-size: var(--text-sm); font-weight: var(--font-medium); color: var(--foreground); flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .mcp-tool-desc { font-size: var(--text-xs); color: var(--foreground-muted); margin-top: 2px; display: -webkit-box; -webkit-line-clamp: 2; line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+
+  /* MCP 工具描述浮层气泡：fixed 定位，已在脚本中按视口边界 clamp */
+  .mcp-tool-desc-popover {
+    position: fixed;
+    width: 320px;
+    max-height: 240px;
+    overflow-y: auto;
+    padding: 10px 12px;
+    background: var(--background);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    box-shadow: 0 18px 40px rgba(0, 0, 0, 0.35), 0 1px 2px rgba(0, 0, 0, 0.08);
+    font-size: var(--text-xs);
+    line-height: 1.5;
+    color: var(--foreground);
+    z-index: calc(var(--z-popover) + 10);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    box-sizing: border-box;
+  }
 
   /* MCP 工具描述查看按钮 */
   .mcp-tool-desc-btn {

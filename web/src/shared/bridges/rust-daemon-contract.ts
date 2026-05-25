@@ -92,6 +92,7 @@ interface RustAssignmentRuntimeSummary {
 
 interface RustTaskRuntimeSummary {
   task_id?: string;
+  title?: string | null;
   mission_id?: string | null;
   assignment_id?: string | null;
   latest_event_type?: string | null;
@@ -365,6 +366,7 @@ function normalizeTaskRuntimeEntries(
     .filter((entry): entry is Record<string, unknown> => entry !== null)
     .map((entry) => ({
       task_id: normalizeString(entry.task_id) || undefined,
+      title: normalizeString(entry.title) || undefined,
       mission_id: normalizeString(entry.mission_id) || undefined,
       assignment_id: normalizeString(entry.assignment_id) || undefined,
       latest_event_type: normalizeString(entry.latest_event_type) || undefined,
@@ -600,16 +602,6 @@ function buildLookupMaps(events: RustEventEnvelope[]): {
   };
 }
 
-function shortenId(value: string, prefix: string): string {
-  if (!value) {
-    return prefix;
-  }
-  if (value.length <= 20) {
-    return value;
-  }
-  return `${prefix}-${value.slice(-8)}`;
-}
-
 function normalizeSubTaskStatus(status: string, failedDispatchCount = 0): SubTaskItem['status'] {
   const normalized = status.toLowerCase();
   if (normalized.includes('approval')) {
@@ -618,7 +610,7 @@ function normalizeSubTaskStatus(status: string, failedDispatchCount = 0): SubTas
   if (normalized.includes('review')) {
     return 'review_required';
   }
-  if (normalized.includes('cancel') || normalized.includes('abort')) {
+  if (normalized.includes('cancel') || normalized.includes('abort') || normalized.includes('kill')) {
     return 'cancelled';
   }
   if (normalized.includes('reject')) {
@@ -654,7 +646,7 @@ function buildAssignmentsFromRuntime(
   sessionId: string,
 ): OrchestrationRuntimeAssignmentSummary[] {
   const assignmentEntries = normalizeAssignmentRuntimeEntries(runtimeReadModel);
-  const { taskEntries, activeMissionIds } = resolveSessionTaskEntries(runtimeReadModel, sessionId);
+  const { activeSession, taskEntries, activeMissionIds } = resolveSessionTaskEntries(runtimeReadModel, sessionId);
   const tasksByAssignment = new Map<string, RustTaskRuntimeSummary[]>();
   for (const task of taskEntries) {
     const assignmentId = normalizeString(task.assignment_id);
@@ -698,7 +690,7 @@ function buildAssignmentsFromRuntime(
     assignments.push({
       assignmentId,
       workerId: lookups.assignmentWorkers.get(assignmentId) || undefined,
-      title: lookups.assignmentTitles.get(assignmentId) || shortenId(assignmentId, 'assignment'),
+      title: lookups.assignmentTitles.get(assignmentId) || '任务分配',
       status: normalizeString(assignment.current_status) || 'pending',
       progress,
       taskTotal,
@@ -710,7 +702,82 @@ function buildAssignmentsFromRuntime(
       runningTaskCount,
     });
   }
-  return assignments;
+  if (assignments.length > 0) {
+    return assignments;
+  }
+  return buildBranchTaskTrackingSummaries(activeSession, taskEntries, lookups);
+}
+
+function taskTrackingProgressForStatus(status: SubTaskItem['status']): number {
+  switch (status) {
+    case 'completed':
+    case 'skipped':
+    case 'failed':
+    case 'blocked':
+    case 'cancelled':
+      return 100;
+    case 'running':
+    case 'in_progress':
+      return 50;
+    default:
+      return 0;
+  }
+}
+
+function fallbackBranchTaskTitle(branch: RustSessionRuntimeBranchSummary, index: number): string {
+  if (branch.is_primary) {
+    return '主线任务';
+  }
+  return `代理任务 ${Math.max(1, index)}`;
+}
+
+function buildBranchTaskTrackingSummaries(
+  activeSession: RustSessionRuntimeSummary | undefined,
+  taskEntries: RustTaskRuntimeSummary[],
+  lookups: ReturnType<typeof buildLookupMaps>,
+): OrchestrationRuntimeAssignmentSummary[] {
+  const branches = Array.isArray(activeSession?.active_branches) ? activeSession.active_branches : [];
+  if (branches.length === 0) {
+    return [];
+  }
+  const taskById = new Map<string, RustTaskRuntimeSummary>();
+  for (const task of taskEntries) {
+    const taskId = normalizeString(task.task_id);
+    if (taskId && !taskById.has(taskId)) {
+      taskById.set(taskId, task);
+    }
+  }
+
+  const summaries: OrchestrationRuntimeAssignmentSummary[] = [];
+  for (const [index, branch] of branches.entries()) {
+    const taskId = normalizeString(branch.task_id);
+    if (!taskId) {
+      continue;
+    }
+    const task = taskById.get(taskId);
+    const status = normalizeSubTaskStatus(normalizeString(task?.current_status || branch.status));
+    const title = normalizeString(task?.title)
+      || lookups.taskTitles.get(taskId)
+      || fallbackBranchTaskTitle(branch, index);
+    const completedTaskCount = status === 'completed' || status === 'skipped' ? 1 : 0;
+    const failedTaskCount = status === 'failed' || status === 'blocked' ? 1 : 0;
+    const runningTaskCount = status === 'running' || status === 'in_progress' ? 1 : 0;
+    summaries.push({
+      assignmentId: taskId,
+      workerId: normalizeString(branch.worker_id) || undefined,
+      title,
+      status,
+      progress: taskTrackingProgressForStatus(status),
+      taskTotal: 1,
+      awaitingApprovalTaskCount: status === 'awaiting_approval' ? 1 : 0,
+      reviewRequiredTaskCount: status === 'review_required' ? 1 : 0,
+      blockedTaskCount: status === 'blocked' ? 1 : 0,
+      completedTaskCount,
+      failedTaskCount,
+      runningTaskCount,
+    });
+  }
+  return summaries;
 }
 
 function resolveSessionTaskEntries(
@@ -725,12 +792,23 @@ function resolveSessionTaskEntries(
   const activeSession = normalizeSessionRuntimeEntries(runtimeReadModel)
     .find((entry) => normalizeString(entry.session_id) === sessionId);
   const activeTaskIds = new Set(normalizeStringArray(activeSession?.active_task_ids));
+  const sessionTaskIds = new Set(activeTaskIds);
+  const rootTaskId = normalizeString(activeSession?.root_task_id);
+  if (rootTaskId) {
+    sessionTaskIds.add(rootTaskId);
+  }
+  for (const branch of activeSession?.active_branches || []) {
+    const branchTaskId = normalizeString(branch.task_id);
+    if (branchTaskId) {
+      sessionTaskIds.add(branchTaskId);
+    }
+  }
   const activeMissionIds = new Set(normalizeStringArray(activeSession?.active_execution_group_ids));
-  if (activeMissionIds.size === 0 && activeTaskIds.size > 0) {
+  if (activeMissionIds.size === 0 && sessionTaskIds.size > 0) {
     for (const task of allTaskEntries) {
       const taskId = normalizeString(task.task_id);
       const missionId = normalizeString(task.mission_id);
-      if (taskId && missionId && activeTaskIds.has(taskId)) {
+      if (taskId && missionId && sessionTaskIds.has(taskId)) {
         activeMissionIds.add(missionId);
       }
     }
@@ -739,7 +817,7 @@ function resolveSessionTaskEntries(
     .filter((entry) => {
       const taskId = normalizeString(entry.task_id);
       const missionId = normalizeString(entry.mission_id);
-      return activeTaskIds.has(taskId) || (missionId && activeMissionIds.has(missionId));
+      return sessionTaskIds.has(taskId) || (missionId && activeMissionIds.has(missionId));
     });
   return { activeSession, taskEntries, activeMissionIds };
 }
@@ -815,19 +893,41 @@ function deriveProcessingState(
  */
 function deriveRecoverySummary(
   runtimeReadModel: RustRuntimeReadModelDto,
+  activeSession: RustSessionRuntimeSummary | undefined,
+  sessionId: string,
 ): OrchestrationRuntimeRecoverySummary | undefined {
   const summaries = runtimeReadModel.recovery?.summaries;
   const activeIds = normalizeStringArray(runtimeReadModel.recovery?.active_recovery_ids);
   if (!Array.isArray(summaries) || summaries.length === 0) {
     return undefined;
   }
+  const sessionRecoveryIds = new Set(normalizeStringArray(activeSession?.recovery_ids));
+  const recoveryRef = normalizeString(activeSession?.recovery_ref);
+  if (recoveryRef) {
+    sessionRecoveryIds.add(recoveryRef);
+  }
+  const missionId = normalizeString(activeSession?.mission_id);
+  const chainRef = normalizeString(activeSession?.execution_chain_ref);
+  const scopedSummaries = summaries.filter((summary) => {
+    const summarySessionId = normalizeString(summary.session_id);
+    const summaryRecoveryId = normalizeString(summary.recovery_id);
+    return (summarySessionId && summarySessionId === sessionId)
+      || (summaryRecoveryId && sessionRecoveryIds.has(summaryRecoveryId))
+      || (missionId && normalizeString(summary.mission_id) === missionId)
+      || (chainRef && normalizeString(summary.execution_chain_ref) === chainRef);
+  });
+  const scopedRecoveryIds = new Set(scopedSummaries.map((summary) => normalizeString(summary.recovery_id)).filter(Boolean));
+  const scopedActiveIds = activeIds.filter((id) => scopedRecoveryIds.has(id) || sessionRecoveryIds.has(id));
+  if (scopedSummaries.length === 0 || (scopedActiveIds.length === 0 && activeSession?.has_recoverable_chain !== true)) {
+    return undefined;
+  }
   // 取最新的 recovery 摘要
-  const sorted = [...summaries].sort(
+  const sorted = [...scopedSummaries].sort(
     (a, b) => normalizeNumber(b.latest_occurred_at, 0) - normalizeNumber(a.latest_occurred_at, 0),
   );
   const latest = sorted[0];
-  const pendingCount = activeIds.length;
-  const completedCount = summaries.filter(
+  const pendingCount = scopedActiveIds.length;
+  const completedCount = scopedSummaries.filter(
     (s) => normalizeString(s.current_status) === 'consumed'
       || normalizeString(s.current_status) === 'worker_resumed',
   ).length;
@@ -839,7 +939,7 @@ function deriveRecoverySummary(
     latestSnapshotCreatedAt: normalizeNumber(latest.latest_occurred_at, undefined as unknown as number) || undefined,
     pendingTaskCount: pendingCount,
     completedTaskCount: completedCount,
-    runningTaskCount: summaries.filter(
+    runningTaskCount: scopedSummaries.filter(
       (s) => normalizeString(s.current_status) === 'ready',
     ).length,
   };
@@ -859,8 +959,7 @@ function deriveRecentTimeline(
   return recentEvents
     .filter((event) => {
       const eventSessionId = normalizeString(event.session_id);
-      // 保留匹配当前 session 的事件，或无 session 归属的系统事件
-      return !eventSessionId || eventSessionId === sessionId;
+      return Boolean(eventSessionId) && eventSessionId === sessionId;
     })
     .map((event) => ({
       eventId: normalizeString(event.event_id) || `evt-${normalizeNumber(event.sequence, 0)}`,
@@ -876,52 +975,142 @@ function deriveRecentTimeline(
 /** 从 EventEnvelope 构建可读摘要 */
 function buildEventSummary(event: RustEventEnvelope): string {
   const eventType = normalizeString(event.event_type);
+  const payload = resolveEventPayload(event);
+  const eventLabel = formatRuntimeEventLabel(eventType);
   const parts: string[] = [];
-  if (eventType) {
-    parts.push(eventType);
+  const title = resolveEventReadableTitle(payload);
+  if (title) {
+    parts.push(title);
   }
-  const taskId = normalizeString(event.task_id);
-  if (taskId) {
-    parts.push(`task:${taskId}`);
+  const status = formatRuntimeStatusLabel(
+    normalizeString(payload.current_status)
+      || normalizeString(payload.status)
+      || normalizeString(payload.next_status)
+      || normalizeString(payload.stage)
+      || normalizeString(payload.current_stage),
+  );
+  if (status) {
+    parts.push(status);
   }
-  const missionId = normalizeString(event.mission_id);
-  if (missionId && !taskId) {
-    parts.push(`mission:${missionId}`);
+  const error = normalizeString(payload.error)
+    || normalizeString(payload.error_message)
+    || normalizeString(payload.failure_reason)
+    || normalizeString(payload.diagnostic_summary);
+  if (error) {
+    parts.push(error);
   }
-  return parts.join(' ') || 'event';
+  return parts.length > 0 ? `${eventLabel}：${parts.join(' · ')}` : eventLabel;
+}
+
+function resolveEventReadableTitle(payload: Record<string, unknown>): string {
+  return normalizeString(payload.task_title)
+    || normalizeString(payload.assignment_title)
+    || normalizeString(payload.mission_title)
+    || normalizeString(payload.display_name)
+    || normalizeString(payload.title)
+    || normalizeString(payload.tool_name)
+    || normalizeString(payload.name);
+}
+
+function formatRuntimeEventLabel(eventType: string): string {
+  switch (eventType) {
+    case 'task.dispatched':
+      return '任务已派发';
+    case 'task.status.changed':
+      return '任务状态更新';
+    case 'mission.execution.overview':
+      return '执行概览';
+    case 'mission.resume.dispatch.created':
+      return '恢复调度已创建';
+    case 'worker.reported':
+      return '执行者上报';
+    case 'worker.tool.observed':
+    case 'tool.invoked':
+      return '工具调用';
+    case 'worker.skill_dispatch.observed':
+    case 'worker.skill_dispatch.applied':
+      return '技能调度';
+    case 'worker.executor.observed':
+      return '执行器状态';
+    case 'governance.decision.applied':
+      return '决策已应用';
+    case 'system.runtime.maintenance.status':
+      return '运行态维护';
+    default:
+      return eventType
+        ? eventType.split('.').map(formatRuntimeEventTokenLabel).filter(Boolean).join(' · ')
+        : '运行事件';
+  }
+}
+
+function formatRuntimeEventTokenLabel(token: string): string {
+  switch (token) {
+    case 'task': return '任务';
+    case 'mission': return '执行组';
+    case 'worker': return '执行者';
+    case 'tool': return '工具';
+    case 'governance': return '决策';
+    case 'decision': return '决策';
+    case 'system': return '系统';
+    case 'runtime': return '运行态';
+    case 'execution': return '执行';
+    case 'overview': return '概览';
+    case 'status': return '状态';
+    case 'changed': return '更新';
+    case 'dispatched': return '已派发';
+    case 'reported': return '上报';
+    case 'observed': return '已观测';
+    case 'applied': return '已应用';
+    case 'resume': return '恢复';
+    case 'dispatch': return '调度';
+    case 'created': return '已创建';
+    default:
+      return token.replace(/[_-]/g, ' ');
+  }
+}
+
+function formatRuntimeStatusLabel(status: string): string {
+  const raw = normalizeString(status);
+  if (!raw) {
+    return '';
+  }
+  switch (normalizeSubTaskStatus(raw)) {
+    case 'completed':
+      return '已完成';
+    case 'failed':
+      return '已失败';
+    case 'blocked':
+      return '已阻塞';
+    case 'cancelled':
+      return '已取消';
+    case 'running':
+    case 'in_progress':
+      return '运行中';
+    case 'awaiting_approval':
+      return '等待审批';
+    case 'review_required':
+      return '需要返工';
+    case 'pending':
+      return '待执行';
+    default:
+      return '';
+  }
 }
 
 /**
  * 从后端 operations.attention 构建 failureRootCause（仅在有失败时）。
  */
 function deriveFailureRootCause(
-  runtimeReadModel: RustRuntimeReadModelDto,
   generatedAt: number,
+  failedTaskLabels: string[],
 ): OrchestrationRuntimeFailureRootCause | undefined {
-  const attention = runtimeReadModel.operations?.attention;
-  if (!attention) {
+  if (failedTaskLabels.length === 0) {
     return undefined;
   }
-  const failedTaskIds = normalizeStringArray(attention.failed_task_ids);
-  const failedWorkerIds = normalizeStringArray(attention.failed_worker_ids);
-  const failedAssignmentIds = normalizeStringArray(attention.failed_assignment_ids);
-  if (failedTaskIds.length === 0 && failedWorkerIds.length === 0 && failedAssignmentIds.length === 0) {
-    return undefined;
-  }
-  const parts: string[] = [];
-  if (failedTaskIds.length > 0) {
-    parts.push(`${failedTaskIds.length} 个任务失败 (${failedTaskIds.join(', ')})`);
-  }
-  if (failedWorkerIds.length > 0) {
-    parts.push(`${failedWorkerIds.length} 个 Worker 失败`);
-  }
-  if (failedAssignmentIds.length > 0) {
-    parts.push(`${failedAssignmentIds.length} 个分配失败`);
-  }
+  const taskList = failedTaskLabels.slice(0, 4).join('、');
+  const suffix = failedTaskLabels.length > 4 ? `等 ${failedTaskLabels.length} 个任务` : `${failedTaskLabels.length} 个任务`;
   return {
-    summary: parts.join('; '),
-    taskId: failedTaskIds[0] || undefined,
-    assignmentId: failedAssignmentIds[0] || undefined,
+    summary: `${suffix}执行失败：${taskList}。请查看任务追踪中的失败项。`,
     occurredAt: generatedAt,
   };
 }
@@ -934,30 +1123,21 @@ function deriveOpsView(
   recentEvents: RustEventEnvelope[],
   sessionId: string,
   generatedAt: number,
+  activeSession: RustSessionRuntimeSummary | undefined,
+  failedTaskLabels: string[],
+  status: OrchestratorRuntimeState['status'],
 ): OrchestrationRuntimeOpsView | null {
-  const recovery = deriveRecoverySummary(runtimeReadModel);
+  const recovery = deriveRecoverySummary(runtimeReadModel, activeSession, sessionId);
   const recentTimeline = deriveRecentTimeline(recentEvents, sessionId);
-  const failureRootCause = deriveFailureRootCause(runtimeReadModel, generatedAt);
-  const diagnostics = runtimeReadModel.overview?.diagnostics;
-  const categoryCounts = runtimeReadModel.overview?.category_counts;
-
-  // 计算总事件数
-  const eventCount = (categoryCounts?.domain ?? 0)
-    + (categoryCounts?.audit ?? 0)
-    + (categoryCounts?.usage ?? 0)
-    + (categoryCounts?.projection ?? 0)
-    + (categoryCounts?.system ?? 0);
+  const failureRootCause = status === 'failed' || status === 'blocked'
+    ? deriveFailureRootCause(generatedAt, failedTaskLabels)
+    : undefined;
+  const eventCount = recentTimeline.length;
 
   // 没有任何有意义数据时返回 null，避免空壳
   const hasContent = recentTimeline.length > 0
     || recovery !== undefined
-    || failureRootCause !== undefined
-    || eventCount > 0
-    || (diagnostics && (
-      (diagnostics.running_task_count ?? 0) > 0
-      || (diagnostics.failed_task_count ?? 0) > 0
-      || (diagnostics.active_worker_count ?? 0) > 0
-    ));
+    || failureRootCause !== undefined;
   if (!hasContent) {
     return null;
   }
@@ -991,13 +1171,13 @@ function deriveRuntimeState(
     runtimeReadModel,
     sessionId,
   );
-  const hasRecoverableChain = activeSession?.has_recoverable_chain === true;
+  const rawRootTaskStatus = normalizeString(activeSession?.root_task_status || activeSession?.current_status);
+  const rootTaskStatus = normalizeSubTaskStatus(rawRootTaskStatus);
+  const rootAllowsResume = rootTaskStatus !== 'completed' && rootTaskStatus !== 'cancelled';
+  const hasRecoverableChain = activeSession?.has_recoverable_chain === true && rootAllowsResume;
   const recoverableBranchCount = typeof activeSession?.recoverable_branch_count === 'number'
     ? activeSession.recoverable_branch_count
     : 0;
-  const rootTaskStatus = normalizeSubTaskStatus(
-    normalizeString(activeSession?.root_task_status || activeSession?.current_status),
-  );
   const status = runningTaskIds.length > 0
     ? 'running'
     : rootTaskStatus === 'running'
@@ -1015,8 +1195,23 @@ function deriveRuntimeState(
                 : activeSession
                   ? 'idle'
                   : 'idle';
+  const failedTaskLabels = assignments
+    .filter((assignment) => {
+      const normalizedStatus = normalizeSubTaskStatus(normalizeString(assignment.status));
+      return normalizedStatus === 'failed' || normalizedStatus === 'blocked';
+    })
+    .map((assignment) => normalizeString(assignment.title))
+    .filter((title, index, arr) => title && arr.indexOf(title) === index);
 
-  const opsView = deriveOpsView(runtimeReadModel, recentEvents, sessionId, generatedAt);
+  const opsView = deriveOpsView(
+    runtimeReadModel,
+    recentEvents,
+    sessionId,
+    generatedAt,
+    activeSession,
+    failedTaskLabels,
+    status,
+  );
 
   return {
     sessionId: sessionId || undefined,
@@ -1026,7 +1221,7 @@ function deriveRuntimeState(
       : status === 'blocked'
         ? 'blocked'
         : 'idle',
-    errors: failedTaskIds.length > 0 ? failedTaskIds.map((id) => `task_failed:${id}`) : [],
+    errors: failedTaskLabels.map((title) => `${title} 执行失败`),
     statusChangedAt: normalizeNumber(activeSession?.last_update, generatedAt),
     lastEventAt: normalizeNumber(activeSession?.last_update, generatedAt),
     canResume: hasRecoverableChain,

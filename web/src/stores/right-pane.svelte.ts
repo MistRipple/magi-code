@@ -1,7 +1,7 @@
 /**
  * Right Pane Store - 右侧多 Tab 面板状态。
  *
- * 设计约束（子代理详情与代码详情共用的右侧多 Tab 面板）：
+ * 设计约束（代理详情与代码详情共用的右侧多 Tab 面板）：
  * - 状态以 session 为边界，跨会话隔离
  * - 三个正交轴：openTabs（LRU 上限 6）/ activeTabId / collapsed
  * - collapsed 与 openTabs 正交：折叠不销毁 tabs，关闭单 tab 才销毁
@@ -13,7 +13,7 @@
 
 export type RightPaneTabKind = 'agent' | 'code';
 
-/** Agent tab payload —— 子代理 taskId，内容由 canonical projection 按 metadata.taskId 过滤投影 */
+/** Agent tab payload —— 代理 taskId，内容由 canonical projection 按 metadata.taskId 过滤投影 */
 export interface AgentTabPayload {
   taskId: string;
 }

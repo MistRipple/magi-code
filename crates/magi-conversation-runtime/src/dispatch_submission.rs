@@ -172,7 +172,7 @@ fn infer_dispatch_task_role(skill_name: Option<&str>, task_tier: TaskTier) -> &'
     // TodoWrite / MemoryWrite 全部判为不可见，模型在运行期看不到协调器工具——再没有任何
     // 后续路径能补救。LongMission / ExecutionChain 在这一点上同构：主线入口都是协调器。
     //
-    // 子代理（executor / reviewer / tester / explorer / architect）由 `execute_coordinator_tool`
+    // 代理（executor / reviewer / tester / explorer / architect）由 `execute_coordinator_tool`
     // 通过 agent_spawn 子派发显式创建，不走本函数；本函数只决定**主线入口**的默认 role。
     if matches!(task_tier, TaskTier::LongMission) {
         return "coordinator";

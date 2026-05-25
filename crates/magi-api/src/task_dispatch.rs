@@ -46,8 +46,8 @@ pub fn submit_dispatch_submission(
 /// 所有 tier 都走同一条后台 runner 路径：单一实现、单一调度模型，
 /// 避免「同一功能两种实现方式」（cn-engineering-standard）。
 ///
-/// agent_spawn 是同步阻塞 tool call，父代理会等待子代理终态；后台 runner 模型下
-/// dispatch 由独立调度循环持续推进，子代理可以继续被派发，符合 codex 同步语义。
+/// agent_spawn 是同步阻塞 tool call，父代理会等待代理终态；后台 runner 模型下
+/// dispatch 由独立调度循环持续推进，代理可以继续被派发，符合 codex 同步语义。
 pub fn drive_dispatch_submission(
     state: &ApiState,
     accepted: &mut DispatchSubmissionAccepted,

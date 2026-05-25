@@ -1255,8 +1255,16 @@ async fn daemon_bootstrap_exports_recovery_context_after_resume_and_followup_dis
     let after_resume_read_model = get_json(app.clone(), "/runtime/read-model").await;
     let after_resume_bootstrap = get_json(app.clone(), "/bootstrap").await;
     assert_eq!(
-        after_resume_bootstrap["runtimeReadModel"],
-        after_resume_read_model
+        after_resume_bootstrap["runtimeReadModel"]["meta"], after_resume_read_model["meta"],
+        "bootstrap 应保留全局运行态元信息"
+    );
+    assert!(
+        after_resume_bootstrap["runtimeReadModel"]["details"]["sessions"]
+            .as_array()
+            .expect("bootstrap sessions should be array")
+            .iter()
+            .all(|entry| entry["session_id"] == session_id.as_str()),
+        "bootstrap 首屏运行态应裁剪到当前会话"
     );
     let recovery_summary = after_resume_bootstrap["runtimeReadModel"]["recovery"]["summaries"]
         .as_array()

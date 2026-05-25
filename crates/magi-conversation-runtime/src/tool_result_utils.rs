@@ -140,7 +140,7 @@ mod tests {
         );
         assert_eq!(infer_tool_call_status(r#"{"status":"ok"}"#), "success");
         assert_eq!(
-            infer_tool_call_status(r#"{"status":"degraded","error":"子代理不可用"}"#),
+            infer_tool_call_status(r#"{"status":"degraded","error":"代理不可用"}"#),
             "success"
         );
         assert_eq!(

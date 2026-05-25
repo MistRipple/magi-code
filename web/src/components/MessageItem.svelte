@@ -524,7 +524,7 @@
     transition: border-color 0.2s ease, box-shadow 0.2s ease;
   }
 
-  /* 主角色连续消息紧凑间距（orchestrator 在主对话区，子代理在任务详情中） */
+  /* 主角色连续消息紧凑间距（orchestrator 在主对话区，代理在任务详情中） */
   .message-item.assistant.plain-shell:not(.inline-guest) {
     margin-top: calc(-1 * var(--space-2));
   }

@@ -535,9 +535,6 @@ function createSettingsStore(props: { onClose?: () => void }) {
     for (const workerId of Object.keys(workerConfigs)) {
       append(workerId);
     }
-    for (const workerId of Object.keys(modelStatuses)) {
-      append(workerId);
-    }
     for (const workerId of unsavedEngines) {
       append(workerId);
     }
@@ -588,7 +585,6 @@ function createSettingsStore(props: { onClose?: () => void }) {
       Array<{ name: string; description: string; inputSchema?: any }>
     >
   >({});
-  let mcpExpandedTool = $state<string | null>(null); // 用于跟踪展开描述的工具
   let currentEditingMCPServer = $state<MCPServer | null>(null);
   let mcpRefreshingServers = $state<Set<string>>(new Set()); // 正在刷新工具的服务器 ID
 
@@ -985,6 +981,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
     }
     try {
       const payload = await getAgentSettingsBootstrap({ scope });
+      appState.settingsBootstrapSnapshot = payload;
       applySettingsBootstrapPayload(payload);
     } catch (e) {
       if (hydratesMcpState) {
@@ -1049,7 +1046,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
   /**
    * 将当前 registryAgents + roleTemplates 合成 EnabledAgent 列表并写入全局 store
    * 在任何 agent binding 变更后调用。
-   * 这里同步的是「内置角色目录」——系统内置 6 个角色全部默认参与调度。
+   * 这里同步的是「可派发代理角色目录」——主线 coordinator 由主模型承接，不进入该列表。
    */
   function syncEnabledAgentsToStore() {
     const templateMap = new Map(roleTemplates.map((t) => [t.templateId, t]));
@@ -1140,13 +1137,15 @@ function createSettingsStore(props: { onClose?: () => void }) {
       try {
         await removeAgentRegistryEngine(engineId);
         await removeAgentWorkerConfig(engineId);
+        purgeEngineFromFrontend(engineId);
+        appState.settingsBootstrapSnapshot = null;
+        await requestSettingsBootstrap(true);
         notifySettingsSuccess("引擎已删除");
       } catch (e) {
         console.error("[SettingsPanel] 删除引擎失败:", e);
         notifySettingsError("删除引擎", e);
+        await requestSettingsBootstrap(true);
       }
-      purgeEngineFromFrontend(engineId);
-      await requestSettingsBootstrap();
     });
   }
 
@@ -1786,16 +1785,6 @@ function createSettingsStore(props: { onClose?: () => void }) {
     const newSet = new Set(mcpRefreshingServers);
     newSet.delete(serverId);
     mcpRefreshingServers = newSet;
-  }
-
-  // 切换 MCP 工具描述展开状态
-  function toggleMCPToolDesc(toolKey: string, e: Event) {
-    e.stopPropagation();
-    if (mcpExpandedTool === toolKey) {
-      mcpExpandedTool = null;
-    } else {
-      mcpExpandedTool = toolKey;
-    }
   }
 
   function getMCPHealthLabel(server: MCPServer): string {
@@ -2565,9 +2554,6 @@ function createSettingsStore(props: { onClose?: () => void }) {
     get mcpServerTools() {
       return mcpServerTools;
     },
-    get mcpExpandedTool() {
-      return mcpExpandedTool;
-    },
     get mcpRefreshingServers() {
       return mcpRefreshingServers;
     },
@@ -2702,7 +2688,6 @@ function createSettingsStore(props: { onClose?: () => void }) {
     toggleMCPServer,
     toggleMCPExpand,
     refreshMCPTools,
-    toggleMCPToolDesc,
     getMCPHealthLabel,
     openRepoDialog,
     closeRepoDialog,

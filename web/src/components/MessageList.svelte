@@ -18,7 +18,7 @@
 
   // Props - Svelte 5 语法
   interface Props {
-    /** 子代理 taskId —— displayContext='task' 时作为 panelKey 与 data-panel-id 的来源 */
+    /** 代理 taskId —— displayContext='task' 时作为 panelKey 与 data-panel-id 的来源 */
     taskId?: string;
     renderItems: TimelineRenderItem[];
     /** 空状态配置（可选） */
@@ -29,7 +29,7 @@
     };
     /** 是否为只读模式（主对话区模式），隐藏冗余操作按钮 */
     readOnly?: boolean;
-    /** 显示上下文：thread=主对话区, task=右侧子代理 tab */
+    /** 显示上下文：thread=主对话区, task=右侧代理 tab */
     displayContext?: 'thread' | 'task';
     /** 当前面板是否处于可见激活状态（用于 display:none -> visible 场景下的滚动恢复） */
     isActive?: boolean;

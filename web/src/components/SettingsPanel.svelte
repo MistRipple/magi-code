@@ -176,6 +176,7 @@ import { getAgentColor } from '../lib/agent-colors';
       {:else if store.activeTab === 'agents'}
         <!-- 角色管理 Tab -->
         <SettingsAgentsTab roleTemplates={store.roleTemplates} registryAgents={store.registryAgents} registryEngines={store.registryEngines}
+          inheritModelLabel={store.orchConfig.model ?? ''} modelStatuses={store.modelStatuses}
           {getAgentColor} getWorkerDisplayName={store.getWorkerDisplayName} updateRoleEngine={store.updateRoleEngine}
         />
       {:else if store.activeTab === 'rules'}
@@ -184,7 +185,7 @@ import { getAgentColor } from '../lib/agent-colors';
         />
       {:else if store.activeTab === 'tools'}
         <!-- 工具 Tab -->
-        <SettingsToolsTab mcpServersHydrated={store.mcpServersHydrated} mcpServersLoading={store.mcpServersLoading} mcpServers={store.mcpServers} mcpExpandedServer={store.mcpExpandedServer} mcpServerTools={store.mcpServerTools} mcpRefreshingServers={store.mcpRefreshingServers} mcpExpandedTool={store.mcpExpandedTool} builtinTools={store.builtinTools} skills={store.skills} openMCPDialog={store.openMCPDialog} toggleMCPExpand={store.toggleMCPExpand} getMCPHealthLabel={store.getMCPHealthLabel} toggleMCPServer={store.toggleMCPServer} deleteMCPServer={store.deleteMCPServer} refreshMCPTools={store.refreshMCPTools} toggleMCPToolDesc={store.toggleMCPToolDesc} openSkillLibraryDialog={store.openSkillLibraryDialog} openRepoDialog={store.openRepoDialog} deleteSkill={store.deleteSkill}
+        <SettingsToolsTab mcpServersHydrated={store.mcpServersHydrated} mcpServersLoading={store.mcpServersLoading} mcpServers={store.mcpServers} mcpExpandedServer={store.mcpExpandedServer} mcpServerTools={store.mcpServerTools} mcpRefreshingServers={store.mcpRefreshingServers} builtinTools={store.builtinTools} skills={store.skills} openMCPDialog={store.openMCPDialog} toggleMCPExpand={store.toggleMCPExpand} getMCPHealthLabel={store.getMCPHealthLabel} toggleMCPServer={store.toggleMCPServer} deleteMCPServer={store.deleteMCPServer} refreshMCPTools={store.refreshMCPTools} openSkillLibraryDialog={store.openSkillLibraryDialog} openRepoDialog={store.openRepoDialog} deleteSkill={store.deleteSkill}
         />
       {/if}
     </div>

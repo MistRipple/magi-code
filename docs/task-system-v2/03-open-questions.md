@@ -14,31 +14,31 @@ Mailbox 保持 push 模型。外部信号进入 mailbox，Conversation 只在 Tu
 规则：
 
 - 不提供模型主动 peek/pull mailbox 的工具。
-- worker 想接收更新，由 parent/coordinator 使用 `send_message`。
 - mailbox 项不得插入正在进行的模型 round。
+- `agent_spawn` 终态结果不进入 mailbox，而是作为同步 `tool_call_result` 回写父 turn。
 
 风险：
 
-- 长跑 worker 只能在下一次 Turn 看到更新。
+- 长跑 task 只能在下一次 Turn 看到用户继续输入或系统 followup。
 
 验收：
 
-- `send_message` 能投递到目标 task mailbox。
 - 下一次 task turn 能看到该 runtime signal。
+- `agent_spawn` 完成后父 turn 能拿到结构化 `tool_call_result`。
 
-### 1.2 Coordinator
+### 1.2 主编排
 
-Coordinator 使用 Prompt-as-Code 协调，但 runtime 执行边界必须硬约束。
+主编排使用 Prompt-as-Code 协调，但 runtime 执行边界必须硬约束。
 
 规则：
 
-- Coordinator 可以调用 `agent_spawn / send_message / task_stop`。
-- Coordinator 不能绕过 tool visibility、permissions、SafetyGate、HumanCheckpoint、Validation gate。
-- 弱模型不允许自动降级成“无约束 coordinator”；如果无法满足 coordinator 能力，应拒绝或退回 single-worker task。
+- 主代理可以调用 `agent_spawn` 创建一个或多个代理 task。
+- 主代理不能绕过 tool visibility、permissions、SafetyGate、HumanCheckpoint、Validation gate。
+- 弱模型不允许自动降级成“无约束编排器”；如果无法满足编排能力，应拒绝或退回 single-task 推进。
 
 风险：
 
-- 模型理解 coordinator prompt 失败，导致拆解差或重复 spawn。
+- 模型理解主编排 prompt 失败，导致拆解差或重复 spawn。
 
 验收：
 
@@ -88,7 +88,7 @@ Checkpoint 服务恢复，不只是展示摘要。
 验收：
 
 - 进程重启后能恢复 active execution chain。
-- child result 仍能路由到 parent mailbox。
+- child 终态结果仍能作为 `agent_spawn` 的 `tool_call_result` 回写 parent turn。
 
 落地状态：
 
@@ -233,9 +233,9 @@ Charter 是复杂任务契约，有生命周期。
 
 预期：
 
-- root task 使用 coordinator role。
-- coordinator spawn 子 task。
-- child result 进入 parent mailbox。
+- root task 使用主编排角色。
+- 主代理 spawn 子 task。
+- child 终态结果作为 `agent_spawn` 的 `tool_call_result` 回写父 turn。
 - parent 汇总后完成。
 - SpawnGraph open edge 关闭。
 

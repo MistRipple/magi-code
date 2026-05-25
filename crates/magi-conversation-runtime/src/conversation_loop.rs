@@ -122,7 +122,7 @@ pub struct ConversationLoopRequest<'a> {
     pub worker_id: Option<&'a magi_core::WorkerId>,
     /// P7：执行上下文必须绑定到 thread。LLM 入口会 prepend 该 thread 的历史、
     /// 结束时把本轮消息 append 回 thread。orchestrator task 走 session 的
-    /// orchestrator thread；子代理 task 走本次执行独占的 task thread。
+    /// orchestrator thread；代理 task 走本次执行独占的 task thread。
     pub thread_id: &'a ThreadId,
     pub context_summary: Option<ExecutionContextSummary>,
     pub system_prompt: Option<String>,
@@ -568,7 +568,7 @@ fn run_conversation_loop_inner(
         }
     }
     // [CACHE: DYNAMIC] Runtime tail · Mailbox 待处理消息。
-    // 来自 user / system / 子代理回执的跨 task 投递；按 Conversation 层渲染。
+    // 来自 user / system / 代理回执的跨 task 投递；按 Conversation 层渲染。
     if let Some(rendered) = render_mailbox_items_for_prompt(&pending_mailbox_items) {
         messages.push(ChatMessage {
             role: "system".to_string(),
@@ -2917,7 +2917,7 @@ mod tests {
         assert!(
             invoked_events.iter().all(|event| event.payload["worker_id"]
                 == serde_json::Value::String(worker_id.to_string())),
-            "worker 工具事件必须携带执行 worker，供 worker tab 和 runtime 归属使用"
+            "worker 工具事件必须携带执行 worker，供代理详情和 runtime 归属使用"
         );
         let runtime_tool_events = tool_event_bus.snapshot().recent_events;
         assert!(

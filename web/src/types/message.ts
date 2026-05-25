@@ -550,13 +550,13 @@ export interface TimelineProjectionArtifact {
   cardId?: string;
   lifecycleKey?: string;
   /**
-   * 子代理 transcript 路由信号。
+   * 代理 transcript 路由信号。
    *
    * - `undefined` 表示 artifact 归属 root agent 主线（thread）；
-   * - 非空字符串表示 artifact 归属对应子代理 Task，RightPane 以 `agent:${taskId}` 去重。
+   * - 非空字符串表示 artifact 归属对应代理 Task，RightPane 以 `agent:${taskId}` 去重。
    *
    * 由 sidechain `CanonicalTurnItem.worker.taskId` 派生；roleId / workerId 只作为展示元信息，
-   * 不再参与 tab 聚合，避免同一 role 的多个子代理被合并。
+   * 不再参与 tab 聚合，避免同一 role 的多个代理被合并。
    */
   taskId?: string;
   messageIds: string[];

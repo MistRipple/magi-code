@@ -1,4 +1,4 @@
-//! Task System v2 — L5 SpawnGraph：父代理 spawn 子代理的拓扑图。
+//! Task System v2 — L5 SpawnGraph：父代理 spawn 代理的拓扑图。
 //!
 //! 设计目标：把父子关系、派发记录与回执路由收敛到一份正式数据结构。
 //!
@@ -10,7 +10,8 @@
 //! - **边（edge）**：父 spawn 子的有向关系，附带 `TaskKind`、状态（`Open`/`Closed`）、
 //!   创建/关闭时间戳。一条边 = 一次 spawn 行为。
 //! - **回执路由**：子节点完成（status=Closed）后通过 `mark_closed` 标记；上层
-//!   调用 `parent_of(child)` 找回需要投递的父 Mailbox。
+//!   调用 `parent_of(child)` 找回父任务，并把代理终态作为 `agent_spawn` 的
+//!   `tool_call_result` 回写父 turn。
 //! - **级联停止**：`open_descendants(root)` 一次返回所有未关闭的子孙节点，
 //!   交给 caller 逐个取消（SpawnGraph 不直接调度任务，只提供拓扑）。
 //! - **限制**：`enforce_limits` 在 `add_edge` 时检查 max_depth / max_fanout，
@@ -68,8 +69,8 @@ pub struct SpawnGraphLimits {
 
 impl Default for SpawnGraphLimits {
     fn default() -> Self {
-        // 默认参数贴合 codex/claude-code 实践：6 层深度足够 Coordinator → 子代理
-        // → 子子代理；单节点 16 个 open 子节点对常规多代理场景已经偏宽。
+        // 默认参数贴合 codex/claude-code 实践：6 层深度足够 Coordinator → 代理
+        // → 多级代理；单节点 16 个 open 子节点对常规多代理场景已经偏宽。
         Self {
             max_depth: 6,
             max_fanout_per_node: 16,

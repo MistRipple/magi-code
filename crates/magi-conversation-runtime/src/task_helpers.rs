@@ -77,9 +77,9 @@ pub(crate) fn task_can_see_builtin_tool(
 /// - `Mainline`：item.source_thread_id = orchestrator thread，前端 projection
 ///   会把它归到主线时间线。orchestrator 自身 turn 与无独立详情页的子任务
 ///   都走这条路径。
-/// - `Sidechain`：item.source_thread_id = task thread，归到对应子代理详情。
+/// - `Sidechain`：item.source_thread_id = task thread，归到对应代理详情。
 ///   Task #103 起 agent_spawn 改为同步工具调用，主线由父代理的 ToolCall 卡承接展示，
-///   sidechain 不再向主线写摘要 item。子代理与父代理的 item 在前端按 `metadata.taskId`
+///   sidechain 不再向主线写摘要 item。代理与父代理的 item 在前端按 `metadata.taskId`
 ///   过滤到 RightPane 子标签，主线仅 turnSeq/itemSeq 排序，因此本变体不再持有
 ///   lane_id/lane_seq——它们随 Task #105 退役。
 #[derive(Clone, Debug)]
@@ -89,7 +89,7 @@ pub enum TaskTurnVisibility {
         thread_id: ThreadId,
     },
     Sidechain {
-        /// task thread = 子代理本次执行的独占 thread。所有 sidechain item 写到这里。
+        /// task thread = 代理本次执行的独占 thread。所有 sidechain item 写到这里。
         thread_id: ThreadId,
         role_id: String,
         worker_id: WorkerId,
@@ -178,7 +178,7 @@ pub fn apply_task_worker_detail_visibility(
 }
 
 /// final 回复的归属规则与执行细节一致：sidechain task 的 final 永远只归 task 详情。
-/// Task #103 起主线由父代理的 agent_spawn ToolCall 卡承接子代理状态，sidechain 不再向主线写摘要。
+/// Task #103 起主线由父代理的 agent_spawn ToolCall 卡承接代理状态，sidechain 不再向主线写摘要。
 pub fn apply_task_final_visibility(
     item: &mut ActiveExecutionTurnItem,
     task_store: &TaskStore,

@@ -238,7 +238,7 @@ pub fn configured_role_engine_model_config(
         return Ok(None);
     };
     if !binding.enabled {
-        return Err(format!("角色 {role_id} 已禁用，不能执行子代理任务"));
+        return Err(format!("角色 {role_id} 已禁用，不能执行代理任务"));
     }
     let engine_llm = engine_llm_config(settings_store, &binding.engine_id).ok_or_else(|| {
         format!(

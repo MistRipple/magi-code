@@ -2,7 +2,7 @@
 //!
 //! 借鉴 Claude Code 的 `wrapInSystemReminder` 约定：把"非用户直接输入、
 //! 也不是长期系统规则"的临时上下文——生命周期通知 / 计划状态变更 / 工具
-//! 结果附注 / 子代理回传等——统一裹一层 `<system-reminder>...</system-reminder>`
+//! 结果附注 / 代理回传等——统一裹一层 `<system-reminder>...</system-reminder>`
 //! 标签，让模型把这部分识别为"系统补充信息"，而不是用户/助手实际发言或
 //! 长期不变的系统规则。
 //!
@@ -38,7 +38,7 @@ pub fn wrap_in_system_reminder(content: &str) -> String {
 
 /// 多条提醒聚合器。
 ///
-/// 每轮 prompt 拼装通常会有多个零散提醒（生命周期、计划状态、子代理回执
+/// 每轮 prompt 拼装通常会有多个零散提醒（生命周期、计划状态、代理回执
 /// ……），把它们推进 builder，最后一次性 `build()` 拼到同一个
 /// `<system-reminder>` 块里，避免一条消息里出现多个独立 tag 碎片。
 ///
@@ -132,11 +132,11 @@ mod tests {
     #[test]
     fn builder_joins_sections_with_blank_line() {
         let mut b = ReminderBuilder::new();
-        b.push("Mission M-1 已恢复").push("子代理 T-3 已完成");
+        b.push("Mission M-1 已恢复").push("代理 T-3 已完成");
         let out = b.build().expect("有内容应该输出");
         assert_eq!(
             out,
-            "<system-reminder>\nMission M-1 已恢复\n\n子代理 T-3 已完成\n</system-reminder>"
+            "<system-reminder>\nMission M-1 已恢复\n\n代理 T-3 已完成\n</system-reminder>"
         );
     }
 

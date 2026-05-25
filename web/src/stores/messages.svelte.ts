@@ -702,7 +702,7 @@ function buildProjectionRenderEntriesFromArtifacts(
 
   for (const artifact of artifacts) {
     if (artifact.taskId) {
-      // 子代理 artifacts 仅在 RightPane task tab 内按 metadata.taskId 过滤呈现，主时间线不收纳
+      // 代理 artifacts 仅在 RightPane task tab 内按 metadata.taskId 过滤呈现，主时间线不收纳
       continue;
     }
     const artifactMetadata = resolveMessageMetadataRecord(artifact.message);

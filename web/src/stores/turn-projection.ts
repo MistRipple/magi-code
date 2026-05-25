@@ -57,7 +57,7 @@ function normalizeCanonicalTaskId(item: CanonicalTurnItem): string | undefined {
 }
 
 function isAgentTaskSidechainItem(item: CanonicalTurnItem): boolean {
-  // Sidechain 归属只由执行实例事实决定：子代理 item 会携带 roleId/workerId；
+  // Sidechain 归属只由执行实例事实决定：代理 item 会携带 roleId/workerId；
   // root agent item 可能也携带 taskId，但不应因此被移出主线。
   const roleId = typeof item.worker?.roleId === 'string' ? item.worker.roleId.trim() : '';
   if (roleId && roleId !== 'orchestrator') {
@@ -278,7 +278,7 @@ function buildMessage(
       ...(roleId ? { roleId } : {}),
       // sourceThreadId 保留为底层审计事实；UI tab 路由只看 metadata.taskId。
       ...(item.sourceThreadId ? { sourceThreadId: item.sourceThreadId } : {}),
-      // metadata.taskId 是 RightPane task tab 按子代理过滤 timeline 的唯一信号
+      // metadata.taskId 是 RightPane task tab 按代理过滤 timeline 的唯一信号
       // （Task #103 落地：每个 agent_spawn 工具调用产生独立 taskId，前端按此聚合）。
       ...(taskId ? { taskId } : {}),
       toolCallId: item.tool?.callId,
@@ -539,7 +539,7 @@ export function buildCanonicalTimelineProjection(state: CanonicalTurnReducerStat
     .filter((artifact): artifact is TimelineProjectionArtifact => Boolean(artifact))
     .sort(compareArtifacts));
   // 主时间线只承接 root agent artifacts；
-  // 子代理 artifacts 由 RightPane task tab 按 metadata.taskId 过滤呈现。
+  // 代理 artifacts 由 RightPane task tab 按 metadata.taskId 过滤呈现。
   const threadRenderEntries = artifacts
     .filter((artifact) => !artifact.taskId)
     .map(renderEntry);

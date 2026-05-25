@@ -114,11 +114,16 @@ fn merge_session_sidecars(
                 .iter()
                 .map(|branch| session_branch_summary(branch, task_store))
                 .collect();
-            entry.recoverable_branch_count = entry
-                .active_branches
-                .iter()
-                .filter(|branch| branch_is_recoverable(branch))
-                .count();
+            entry.recoverable_branch_count =
+                if session_root_task_allows_continue(entry.root_task_status.as_deref()) {
+                    entry
+                        .active_branches
+                        .iter()
+                        .filter(|branch| branch_is_recoverable(branch))
+                        .count()
+                } else {
+                    0
+                };
             entry.has_recoverable_chain = entry.recoverable_branch_count > 0;
             push_unique(
                 &mut entry.active_execution_group_ids,
@@ -305,9 +310,13 @@ fn branch_stage_is_terminal(stage: &str) -> bool {
 fn branch_is_recoverable(branch: &SessionRuntimeBranchSummaryEntry) -> bool {
     // 与 `magi_conversation_runtime::execution_chain_recovery::active_execution_branch_is_continue_recoverable`
     // 保持一致：UI 看到的可恢复语义必须等价于 `/api/session/continue` 实际接受的语义，
-    // 避免出现 UI 提示"无可恢复"但 API 仍能继续的两套实现。
+    // 避免出现 UI 与 API 对"可继续"判断不一致的两套实现。
     // V2 中只有 `Failed` 且 stage 非 finish 的 branch 才是"可继续"。
     matches!(branch.status.as_str(), "failed") && !branch_stage_is_terminal(&branch.stage)
+}
+
+fn session_root_task_allows_continue(status: Option<&str>) -> bool {
+    !matches!(status, Some("completed" | "killed"))
 }
 
 fn session_root_task_is_terminal(status: Option<&str>) -> bool {
@@ -688,6 +697,7 @@ fn merge_task_store_projection(
                     .expect("task entry inserted above")
             }
         };
+        task_entry.title = Some(task.title.clone());
         task_entry.mission_id = Some(mission_id.clone());
         task_entry.current_status = Some(task_status_label(&task.status));
     }
@@ -1127,7 +1137,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_read_model_keeps_recoverable_terminal_branch_out_of_active_ids() {
+    fn runtime_read_model_excludes_completed_root_from_recoverable_chain() {
         let task_store = TaskStore::new();
         let mission_id = magi_core::MissionId::new("mission-terminal-recoverable");
         let root_task_id = magi_core::TaskId::new("task-root-terminal-recoverable");
@@ -1252,8 +1262,8 @@ mod tests {
             .iter()
             .find(|entry| entry.session_id == "session-terminal-recoverable")
             .expect("session summary should exist");
-        assert!(session.has_recoverable_chain);
-        assert_eq!(session.recoverable_branch_count, 1);
+        assert!(!session.has_recoverable_chain);
+        assert_eq!(session.recoverable_branch_count, 0);
         assert!(session.active_task_ids.is_empty());
         assert!(session.active_execution_group_ids.is_empty());
         assert!(

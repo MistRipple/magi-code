@@ -228,6 +228,32 @@ mod tests {
     }
 
     #[test]
+    fn resolve_dispatch_session_uses_turn_accept_time_for_new_session_creation() {
+        let state = test_state();
+        let workspace_id = WorkspaceId::new("workspace-dispatch-accepted-at");
+        state
+            .workspace_registry
+            .register(
+                workspace_id.clone(),
+                AbsolutePath::new("/tmp/magi-dispatch-accepted-at"),
+            )
+            .expect("workspace should register");
+        let accepted_at = UtcMillis(1_779_700_000_000);
+
+        let (resolved_session_id, created_session, _) =
+            resolve_dispatch_session(&state, None, Some(workspace_id), "新会话", accepted_at)
+                .expect("dispatch session should resolve");
+
+        let session = state
+            .session_store
+            .session(&resolved_session_id)
+            .expect("created session should exist");
+        assert!(created_session);
+        assert_eq!(session.created_at, accepted_at);
+        assert_eq!(session.updated_at, accepted_at);
+    }
+
+    #[test]
     fn resolve_dispatch_session_creates_new_without_explicit_session_even_when_current_has_history()
     {
         let state = test_state();
@@ -321,7 +347,7 @@ pub(super) fn resolve_dispatch_session(
     requested_session_id: Option<SessionId>,
     requested_workspace_id: Option<WorkspaceId>,
     placeholder_title: &str,
-    _accepted_at: UtcMillis,
+    accepted_at: UtcMillis,
 ) -> Result<(SessionId, bool, Option<WorkspaceId>), ApiError> {
     if let Some(session_id) = requested_session_id {
         let session = state
@@ -336,10 +362,11 @@ pub(super) fn resolve_dispatch_session(
     let session_id = new_session_id();
     state
         .session_store
-        .create_session_for_workspace(
+        .create_session_for_workspace_at(
             session_id.clone(),
             placeholder_title.to_string(),
             requested_workspace_id.as_ref().map(ToString::to_string),
+            accepted_at,
         )
         .map_err(|err| ApiError::internal_assembly("创建会话失败", err))?;
     Ok((session_id, true, requested_workspace_id))

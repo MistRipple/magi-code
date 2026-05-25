@@ -17,7 +17,7 @@ fn concurrent_safe_tools() -> HashSet<&'static str> {
         "diagram_render",
         "code_search_semantic",
         "project_knowledge_query",
-        // agent_spawn 是同步阻塞工具：同一轮多次调用代表派发多个子代理并发执行，
+        // agent_spawn 是同步阻塞工具：同一轮多次调用代表派发多个代理并发执行，
         // 各自在独立线程中阻塞等待自身子任务终态，互相独立无共享写入，并发安全。
         "agent_spawn",
     ]

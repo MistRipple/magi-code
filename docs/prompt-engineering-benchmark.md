@@ -74,4 +74,4 @@
 1. 接入 Anthropic prompt caching API 之后
 2. 开始针对特定模型分化 prompt 之后
 3. claude-code 或 codex 发布显著版本更新之后（如 claude-code 3.x、codex 引入新 persona 体系）
-4. magi 引入新一类工具（例如 MCP 接入、远程 sub-agent）需要重新审视工具描述规范之后
+4. magi 引入新一类工具（例如 MCP 接入、远程代理）需要重新审视工具描述规范之后
