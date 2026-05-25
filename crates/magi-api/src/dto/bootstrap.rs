@@ -20,6 +20,8 @@ use magi_workspace::{
 use serde::Serialize;
 
 const BOOTSTRAP_TIMELINE_PAGE_SIZE: usize = 50;
+const BOOTSTRAP_RECENT_EVENT_PAGE_SIZE: usize = 200;
+const RUNTIME_MAINTENANCE_STATUS_EVENT: &str = "system.runtime.maintenance.status";
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -83,7 +85,9 @@ impl BootstrapDto {
             state.event_bus.runtime_read_model_input(),
             state.audit_usage_ledger_dto(),
             state.bridge_services_dto(),
-            state.bridge_preflight_dto(),
+            // bootstrap 是首屏状态快照，不能同步触发模型/MCP 预检；
+            // 主动预检由 `/bridges/preflight` 负责，避免页面初始化被外部模型响应时间拖住。
+            BridgePreflightSnapshotDto::default(),
             state.task_store(),
             state.collect_mission_aggregate_exports(),
         );
@@ -134,7 +138,7 @@ impl BootstrapDto {
             &mission_aggregate_exports,
         );
 
-        Self {
+        let mut dto = Self {
             agent: BootstrapAgentDto { runtime_epoch },
             service,
             generated_at: UtcMillis::now(),
@@ -154,7 +158,9 @@ impl BootstrapDto {
             has_more_before: false,
             before_cursor: None,
             pending_changes: Vec::new(),
-        }
+        };
+        dto.prune_initial_load_runtime_details();
+        dto
     }
 
     fn truncate_initial_timeline_page(&mut self) {
@@ -170,6 +176,32 @@ impl BootstrapDto {
         self.timeline = self.timeline.split_off(start);
         self.has_more_before = true;
         self.before_cursor = self.timeline.first().map(|entry| entry.entry_id.clone());
+    }
+
+    fn prune_initial_load_runtime_details(&mut self) {
+        self.recent_events
+            .retain(|event| event.event_type != RUNTIME_MAINTENANCE_STATUS_EVENT);
+        if self.recent_events.len() > BOOTSTRAP_RECENT_EVENT_PAGE_SIZE {
+            let start = self
+                .recent_events
+                .len()
+                .saturating_sub(BOOTSTRAP_RECENT_EVENT_PAGE_SIZE);
+            self.recent_events = self.recent_events.split_off(start);
+        }
+
+        let current_session_id = self
+            .current_session
+            .as_ref()
+            .map(|session| session.session_id.to_string());
+        self.runtime_read_model.details.sessions.retain(|entry| {
+            current_session_id
+                .as_deref()
+                .is_some_and(|session_id| entry.session_id == session_id)
+        });
+        for session in &mut self.runtime_read_model.details.sessions {
+            session.current_turn = None;
+            session.turn_items.clear();
+        }
     }
 }
 
@@ -203,14 +235,21 @@ fn select_session_projection(
 mod tests {
     use super::*;
     use crate::dto::ledger_dto;
-    use magi_core::{ExecutionOwnership, SessionId, WorkspaceId};
+    use magi_core::{
+        EventId, ExecutionOwnership, SessionId, SessionLifecycleStatus, ThreadId, UtcMillis,
+        WorkspaceId,
+    };
     use magi_event_bus::{
         AuditUsageLedgerStatus, RuntimeExecutorSummary, RuntimeMaintenanceSummary,
     };
     use magi_governance::GovernanceService;
-    use magi_session_store::SessionExecutionSidecarStatus;
     use magi_session_store::SessionStore;
+    use magi_session_store::{
+        ActiveExecutionTurn, ActiveExecutionTurnItem, CanonicalTurn, CanonicalTurnStatus,
+        SessionExecutionSidecarStatus,
+    };
     use magi_workspace::{RecoveryStatus, WorkspaceStore};
+    use serde_json::json;
     use std::sync::Arc;
 
     fn service_info() -> ServiceInfo {
@@ -231,6 +270,64 @@ mod tests {
             timeline: Vec::new(),
             canonical_turns: Vec::new(),
             notifications: Vec::new(),
+        }
+    }
+
+    fn session_record(session_id: &str) -> SessionRecord {
+        let now = UtcMillis::now();
+        SessionRecord {
+            session_id: SessionId::new(session_id),
+            title: session_id.to_string(),
+            status: SessionLifecycleStatus::Active,
+            created_at: now,
+            updated_at: now,
+            message_count: None,
+            workspace_id: None,
+        }
+    }
+
+    fn session_projection_with_current(session_id: &str) -> SessionProjectionInput {
+        SessionProjectionInput {
+            current_session_id: Some(SessionId::new(session_id)),
+            sessions: vec![session_record(session_id)],
+            timeline: Vec::new(),
+            canonical_turns: Vec::new(),
+            notifications: Vec::new(),
+        }
+    }
+
+    fn active_turn(turn_id: &str, content: &str) -> ActiveExecutionTurn {
+        let now = UtcMillis::now();
+        ActiveExecutionTurn {
+            turn_id: turn_id.to_string(),
+            turn_seq: now.0,
+            accepted_at: now,
+            completed_at: Some(now),
+            status: "completed".to_string(),
+            user_message: Some("用户输入".to_string()),
+            items: vec![ActiveExecutionTurnItem {
+                item_id: format!("{turn_id}-item"),
+                item_seq: 1,
+                kind: "assistant_final".to_string(),
+                status: "completed".to_string(),
+                source: "orchestrator".to_string(),
+                title: Some("总结".to_string()),
+                content: Some(content.to_string()),
+                task_id: None,
+                worker_id: None,
+                role_id: None,
+                tool_call_id: None,
+                tool_name: None,
+                tool_status: None,
+                tool_arguments: None,
+                tool_result: None,
+                tool_error: None,
+                request_id: None,
+                user_message_id: None,
+                placeholder_message_id: None,
+                timeline_entry_id: None,
+                source_thread_id: ThreadId::new("thread-test-orchestrator"),
+            }],
         }
     }
 
@@ -281,7 +378,7 @@ mod tests {
         let bootstrap = BootstrapDto::from_projection(
             runtime_epoch(),
             service_info(),
-            empty_session_projection(),
+            session_projection_with_current("session-1"),
             empty_workspace_projection(),
             vec![SessionRuntimeSidecarExport {
                 session_id: SessionId::new("session-1"),
@@ -339,6 +436,95 @@ mod tests {
             bootstrap.runtime_read_model.recovery.active_recovery_ids,
             vec!["recovery-1".to_string()]
         );
+    }
+
+    #[test]
+    fn bootstrap首屏会裁掉维护心跳和sidecar_turn明细() {
+        let session_id = SessionId::new("session-current");
+        let other_session_id = SessionId::new("session-other");
+        let now = UtcMillis::now();
+        let canonical_turn = CanonicalTurn {
+            session_id: session_id.clone(),
+            turn_id: "canonical-turn-1".to_string(),
+            turn_seq: 1,
+            accepted_at: now,
+            completed_at: Some(now),
+            status: CanonicalTurnStatus::Completed,
+            response_duration_ms: Some(1),
+            usage: None,
+            items: Vec::new(),
+            metadata: Default::default(),
+        };
+        let event_snapshot = EventStreamSnapshot {
+            next_sequence: 3,
+            recent_events: vec![
+                EventEnvelope::system(
+                    EventId::new("maintenance-1"),
+                    RUNTIME_MAINTENANCE_STATUS_EVENT,
+                    json!({"tick": 1}),
+                ),
+                EventEnvelope::domain(
+                    EventId::new("domain-1"),
+                    "task.created",
+                    json!({"task_title": "保留当前会话事件"}),
+                )
+                .with_context(magi_event_bus::EventContext {
+                    session_id: Some(session_id.clone()),
+                    ..magi_event_bus::EventContext::default()
+                }),
+            ],
+        };
+        let bootstrap = BootstrapDto::from_projection(
+            runtime_epoch(),
+            service_info(),
+            SessionProjectionInput {
+                current_session_id: Some(session_id.clone()),
+                sessions: vec![session_record(session_id.as_str())],
+                timeline: Vec::new(),
+                canonical_turns: vec![canonical_turn],
+                notifications: Vec::new(),
+            },
+            empty_workspace_projection(),
+            vec![
+                SessionRuntimeSidecarExport {
+                    session_id: session_id.clone(),
+                    current_status: SessionExecutionSidecarStatus::Bound,
+                    last_update: now,
+                    ownership: ExecutionOwnership::default(),
+                    execution_chain_ref: None,
+                    recovery_ref: None,
+                    current_turn: Some(active_turn("turn-current", "current detail")),
+                    active_execution_chain: None,
+                },
+                SessionRuntimeSidecarExport {
+                    session_id: other_session_id,
+                    current_status: SessionExecutionSidecarStatus::Bound,
+                    last_update: now,
+                    ownership: ExecutionOwnership::default(),
+                    execution_chain_ref: None,
+                    recovery_ref: None,
+                    current_turn: Some(active_turn("turn-other", "other detail")),
+                    active_execution_chain: None,
+                },
+            ],
+            Vec::new(),
+            event_snapshot,
+            RuntimeReadModelInput::default(),
+            AuditUsageLedgerDto::default(),
+            BridgeServicesSnapshotDto::default(),
+            BridgePreflightSnapshotDto::default(),
+            None,
+            Vec::new(),
+        );
+
+        assert_eq!(bootstrap.recent_events.len(), 1);
+        assert_eq!(bootstrap.recent_events[0].event_type, "task.created");
+        assert_eq!(bootstrap.canonical_turns.len(), 1);
+        assert_eq!(bootstrap.runtime_read_model.details.sessions.len(), 1);
+        let session = &bootstrap.runtime_read_model.details.sessions[0];
+        assert_eq!(session.session_id, "session-current");
+        assert!(session.current_turn.is_none());
+        assert!(session.turn_items.is_empty());
     }
 
     #[test]
