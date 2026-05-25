@@ -1,8 +1,25 @@
+use magi_usage_authority::ReasoningEffort;
 use serde_json::{Value, json};
 
 use crate::llm_types::{
     LlmContentBlock, LlmMessage, LlmMessageContent, LlmUsage, ToolCall, ToolDefinition,
 };
+
+/// 将 `ReasoningEffort` 序列化为下游协议接受的字符串字面量。
+///
+/// 四档粒度（`low | medium | high | xhigh`）原样透传，由下游模型/网关自行解释。
+/// magi 不在这里做向下兼容降级——把"极高"偷偷映射成"high"会让用户看见的等级
+/// 与真实生效等级永久错位（见 Task #59 回归）。该函数被两个协议适配器共用：
+/// - OpenAI Chat Completions 写入顶层 `reasoning_effort` 字段；
+/// - Anthropic Messages 在 `thinking.effort`（Opus 4.7+）形态下写入同字段。
+pub fn reasoning_effort_label(effort: ReasoningEffort) -> &'static str {
+    match effort {
+        ReasoningEffort::Low => "low",
+        ReasoningEffort::Medium => "medium",
+        ReasoningEffort::High => "high",
+        ReasoningEffort::Xhigh => "xhigh",
+    }
+}
 
 pub fn estimate_message_tokens(messages: &[LlmMessage]) -> u64 {
     let mut total = 0u64;

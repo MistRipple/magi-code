@@ -2,8 +2,9 @@
 //!
 //! 设计目标
 //! - 复用现有 `auxiliary` 配置：客户端构造统一走
-//!   [`magi_conversation_runtime::task_execution_dispatcher::build_auxiliary_model_client`]，
-//!   未配置辅助模型时静默跳过，绝不退化到业务模型，避免在标题这种低价值任务上消耗主模型配额。
+//!   [`magi_conversation_runtime::task_execution_dispatcher::resolve_target_for_role`]
+//!   （`RoleTarget::Auxiliary`），未配置辅助模型时静默跳过，绝不退化到业务模型，
+//!   避免在标题这种低价值任务上消耗主模型配额。
 //! - 单一写入点：标题改名通过 `session_store.rename_session`，沿用既有 timeline / lifecycle 通路。
 //! - 安全栅栏：异步精修期间若用户已手动改名 / charter 写入了标题，会留下与 placeholder 不一致的
 //!   当前值，此时直接放弃覆盖，避免与人工动作冲突。
@@ -34,9 +35,13 @@ pub(crate) fn spawn_new_session_title_refinement(
     placeholder_title: &str,
 ) {
     let Some(client) =
-        magi_conversation_runtime::task_execution_dispatcher::build_auxiliary_model_client(
-            &state.settings_store,
+        magi_conversation_runtime::task_execution_dispatcher::resolve_target_for_role(
+            Some(&state.settings_store),
+            None,
+            magi_conversation_runtime::task_execution_dispatcher::RoleTarget::Auxiliary,
         )
+        .ok()
+        .flatten()
     else {
         tracing::debug!(
             session_id = %session_id,

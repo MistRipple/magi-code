@@ -221,8 +221,9 @@ function createSettingsStore(props: { onClose?: () => void }) {
   // 跟踪前端暂存但未持久化的引擎 ID
   // 用户点"+"添加后暂存于此；保存配置后移除；关闭面板时自动清理残留
   const unsavedEngines = new Set<string>();
-  // 记录新引擎的用户输入名称（用于后续 Registry upsert）
-  const engineDisplayNames = new Map<string, string>();
+  // 记录引擎的当前显示名称（新建时录入，inline 改名时更新）
+  // 使用 $state 让改名能驱动 tab/概览区 UI 即时刷新
+  let engineDisplayNames = $state<Record<string, string>>({});
 
   // 使用全局 store 的模型状态（与执行状态共用）
   const appState = getState();
@@ -258,8 +259,13 @@ function createSettingsStore(props: { onClose?: () => void }) {
   });
 
   // Model Tab 状态
-  let modelConfigTab = $state<"orch" | "comp">("orch");
-  let workerModelTab = $state<string>("");
+  // 统一 tab 选择：'orch' | 'comp' | 任意 engineId（worker）
+  let modelConfigTab = $state<string>("orch");
+  // worker 模式下的当前引擎 ID；'orch' / 'comp' 时为空串。
+  // 给保留依赖 worker key 的 API（saveModelConfig/probeModelStatus 等）一个稳定入口。
+  const activeWorkerEngineId = $derived(
+    modelConfigTab === "orch" || modelConfigTab === "comp" ? "" : modelConfigTab,
+  );
 
   function createInteractiveConfig(
     overrides: Partial<InteractiveModelFormConfig> = {},
@@ -553,13 +559,14 @@ function createSettingsStore(props: { onClose?: () => void }) {
     }
   });
 
-  // workerModelTab 初始同步：当 tab 为空或无效时，自动切换到第一个可用 worker
+  // 当前选中的 worker 被删除时，回落到主模型 tab。
+  // 系统 tab（orch/comp）永远存在，不需要 fallback。
   $effect(() => {
     if (
-      workerModelTabs.length > 0 &&
-      (!workerModelTab || !workerModelTabs.includes(workerModelTab))
+      activeWorkerEngineId &&
+      !workerModelTabs.includes(activeWorkerEngineId)
     ) {
-      workerModelTab = workerModelTabs[0];
+      modelConfigTab = "orch";
     }
   });
 
@@ -830,7 +837,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
     target: "orch" | "comp" | "worker",
     explicitWorkerKey?: string,
   ): Promise<{ key: string; value: ModelStatus }> {
-    const workerKey = explicitWorkerKey || workerModelTab;
+    const workerKey = explicitWorkerKey || activeWorkerEngineId;
     const statusKey =
       target === "worker"
         ? workerKey
@@ -1042,12 +1049,11 @@ function createSettingsStore(props: { onClose?: () => void }) {
   /**
    * 将当前 registryAgents + roleTemplates 合成 EnabledAgent 列表并写入全局 store
    * 在任何 agent binding 变更后调用。
-   * 这里同步的是“允许参与调度的角色目录”，不是“当前可见 tab 列表”。
+   * 这里同步的是「内置角色目录」——系统内置 6 个角色全部默认参与调度。
    */
   function syncEnabledAgentsToStore() {
     const templateMap = new Map(roleTemplates.map((t) => [t.templateId, t]));
     const agents: EnabledAgent[] = registryAgents
-      .filter((a) => a.enabled !== false)
       .map((a) => {
         const tmpl = templateMap.get(a.templateId);
         return {
@@ -1055,10 +1061,6 @@ function createSettingsStore(props: { onClose?: () => void }) {
           displayName: tmpl?.displayName || a.templateId,
           displayNameKey: tmpl?.i18n?.displayNameKey,
           engineId: a.engineId,
-          modelSource:
-            a.modelSource === "engine"
-              ? ("engine" as const)
-              : ("orchestrator" as const),
           order: a.order || 0,
           colorToken: tmpl?.defaultUI?.colorToken || "",
           icon: tmpl?.defaultUI?.icon || undefined,
@@ -1071,32 +1073,38 @@ function createSettingsStore(props: { onClose?: () => void }) {
   // ============================================
   // 引擎管理操作
   // ============================================
+  // 新增 worker 引擎：直接生成「模型 N」默认名 + engineId，无对话框，
+  // 切到新 tab 让用户立即进入编辑/双击改名
   function openAddEngineDialog() {
-    // 通过现有的输入对话框让用户输入引擎名称，确认后新增一个 worker tab（纯前端暂存）
-    inputDialogTitle = i18n.t("settings.model.addEngine");
-    inputDialogValue = "";
-    inputDialogCallback = async (name: string) => {
-      const engineId =
-        name
-          .toLowerCase()
-          .replace(/[^a-z0-9]+/g, "-")
-          .replace(/^-|-$/g, "") || `engine-${Date.now()}`;
-      // 为新引擎创建默认配置并加入 workerConfigs（前端暂存，不调后端）
-      if (!workerConfigs[engineId]) {
-        workerConfigs[engineId] = createWorkerConfig();
-      }
-      // 将新引擎注入 modelStatuses，确保 workerModelTabs 立即可见
-      appState.modelStatus = {
-        ...appState.modelStatus,
-        [engineId]: { status: "not_configured" },
-      };
-      // 标记为未保存 + 记录显示名称
-      unsavedEngines.add(engineId);
-      engineDisplayNames.set(engineId, name);
-      // 切换到新 tab
-      workerModelTab = engineId;
+    let n = workerModelTabs.length + 1;
+    let engineId = `model-${n}`;
+    // 防止 engineId 冲突（已存在配置或与已用 id 重复）
+    while (workerConfigs[engineId] || workerModelTabs.includes(engineId)) {
+      n += 1;
+      engineId = `model-${n}`;
+    }
+    const displayName = i18n.t("settings.model.defaultEngineName", { n });
+    workerConfigs[engineId] = createWorkerConfig();
+    // 注入 modelStatuses 让 workerModelTabs 立即包含新 id
+    appState.modelStatus = {
+      ...appState.modelStatus,
+      [engineId]: { status: "not_configured" },
     };
-    showInputDialog = true;
+    unsavedEngines.add(engineId);
+    engineDisplayNames = { ...engineDisplayNames, [engineId]: displayName };
+    modelConfigTab = engineId;
+  }
+
+  // Inline 改名：把新名暂存到 engineDisplayNames，下次 saveModelConfig 一并持久化。
+  // 主/辅助 tab 名固定，不处理。
+  function renameEngineDisplay(engineId: string, newName: string) {
+    if (engineId === "orch" || engineId === "comp") return;
+    const trimmed = newName.trim();
+    if (!trimmed) return;
+    const current =
+      engineDisplayNames[engineId] || getWorkerDisplayName(engineId);
+    if (current === trimmed) return;
+    engineDisplayNames = { ...engineDisplayNames, [engineId]: trimmed };
   }
 
   // 从前端状态中移除指定引擎（workerConfigs + modelStatus + unsavedEngines）
@@ -1106,10 +1114,11 @@ function createSettingsStore(props: { onClose?: () => void }) {
     const { [engineId]: _, ...restStatus } = appState.modelStatus;
     appState.modelStatus = restStatus as ModelStatusMap;
     unsavedEngines.delete(engineId);
-    engineDisplayNames.delete(engineId);
-    // 如果删除的是当前选中 tab，切到第一个可用 worker
-    if (workerModelTab === engineId) {
-      workerModelTab = "";
+    const { [engineId]: _name, ...restNames } = engineDisplayNames;
+    engineDisplayNames = restNames;
+    // 如果删除的是当前选中 tab，回落到主模型
+    if (modelConfigTab === engineId) {
+      modelConfigTab = "orch";
     }
   }
 
@@ -1144,35 +1153,12 @@ function createSettingsStore(props: { onClose?: () => void }) {
   // ============================================
   // 角色管理操作
   // ============================================
-  async function updateRoleEnabled(templateId: string, enabled: boolean) {
-    const existing = registryAgents.find((agent) => agent.templateId === templateId);
-    if (!existing) {
-      return;
-    }
-    const updated: AgentBinding = {
-      ...existing,
-      enabled,
-      bindingRevision: existing.bindingRevision + 1,
-    };
-    try {
-      const result = await upsertAgentRegistryBinding(updated);
-      registryAgents = result;
-      syncEnabledAgentsToStore();
-      notifySettingsSuccess(enabled ? "角色已启用" : "角色已暂停");
-    } catch (e) {
-      console.error("[SettingsPanel] 更新角色启用状态失败:", e);
-      notifySettingsError("更新角色状态", e);
-    }
-  }
-
   async function updateRoleEngine(templateId: string, engineId: string) {
     const existing = registryAgents.find((a) => a.templateId === templateId);
     if (!existing) return;
     const updated: AgentBinding = {
       ...existing,
-      modelSource: engineId ? "engine" : "orchestrator",
       engineId,
-      enabled: existing.enabled !== false,
       bindingRevision: existing.bindingRevision + 1,
     };
     try {
@@ -1189,7 +1175,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
   // 获取 worker/引擎的展示名称
   // 优先使用 engineDisplayNames（用户输入）→ registryEngines.displayName → 首字母大写
   function getWorkerDisplayName(workerId: string): string {
-    const displayName = engineDisplayNames.get(workerId);
+    const displayName = engineDisplayNames[workerId];
     if (displayName) return displayName;
     const roleTemplate = roleTemplates.find((template) => template.templateId === workerId);
     if (roleTemplate?.displayName) return roleTemplate.displayName;
@@ -1330,12 +1316,12 @@ function createSettingsStore(props: { onClose?: () => void }) {
     target: "orch" | "comp" | "worker",
     explicitWorkerKey?: string,
   ) {
-    if (target === "worker" && !explicitWorkerKey && !workerModelTab) {
+    if (target === "worker" && !explicitWorkerKey && !activeWorkerEngineId) {
       return;
     }
 
     // 设置测试中状态
-    const workerKey = explicitWorkerKey || workerModelTab;
+    const workerKey = explicitWorkerKey || activeWorkerEngineId;
     const statusKey = target === "worker" ? workerKey : target;
     const modelStatusKey =
       target === "worker"
@@ -1391,10 +1377,10 @@ function createSettingsStore(props: { onClose?: () => void }) {
   }
 
   async function fetchModelList(target: "orch" | "comp" | "worker") {
-    const key = target === "worker" ? workerModelTab : target;
+    const key = target === "worker" ? activeWorkerEngineId : target;
     let config: any;
     if (target === "worker") {
-      config = workerConfigs[workerModelTab];
+      config = workerConfigs[activeWorkerEngineId];
     } else if (target === "orch") {
       config = orchConfig;
     } else {
@@ -1484,7 +1470,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
   }
 
   async function saveModelConfig(target: "orch" | "comp" | "worker") {
-    const key = target === "worker" ? workerModelTab : target;
+    const key = target === "worker" ? activeWorkerEngineId : target;
 
     // 设置保存中状态
     saveStatus[key] = "saving";
@@ -1494,9 +1480,10 @@ function createSettingsStore(props: { onClose?: () => void }) {
       if (target === "worker") {
         const workerKey = key;
         const wc = workerConfigs[workerKey];
-        // 如果是未保存的新引擎，先持久化到 Registry + LLM Config
-        if (unsavedEngines.has(workerKey)) {
-          const displayName = engineDisplayNames.get(workerKey) || workerKey;
+        // 新建或待持久化改名：调用 Registry upsert 写入 displayName
+        const pendingName = engineDisplayNames[workerKey];
+        if (unsavedEngines.has(workerKey) || pendingName) {
+          const displayName = pendingName || workerKey;
           const workerPayload = buildWorkerModelConfigPayload(wc);
           await upsertAgentRegistryEngine({
             id: workerKey,
@@ -1505,9 +1492,10 @@ function createSettingsStore(props: { onClose?: () => void }) {
           });
         }
         await saveAgentWorkerConfig(workerKey, buildWorkerModelConfigPayload(wc));
-        // 保存成功后标记为已持久化
+        // 保存成功后清理暂存
         unsavedEngines.delete(workerKey);
-        engineDisplayNames.delete(workerKey);
+        const { [workerKey]: _renamed, ...restNames } = engineDisplayNames;
+        engineDisplayNames = restNames;
         await loadRegistryData();
       } else if (target === "orch") {
         await saveAgentOrchestratorConfig(
@@ -2511,12 +2499,6 @@ function createSettingsStore(props: { onClose?: () => void }) {
     set modelConfigTab(v) {
       modelConfigTab = v;
     },
-    get workerModelTab() {
-      return workerModelTab;
-    },
-    set workerModelTab(v) {
-      workerModelTab = v;
-    },
     get testStatus() {
       return testStatus;
     },
@@ -2697,7 +2679,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
     getWorkerStats,
     openAddEngineDialog,
     deleteEngine,
-    updateRoleEnabled,
+    renameEngineDisplay,
     updateRoleEngine,
     getWorkerDisplayName,
     refreshConnections,

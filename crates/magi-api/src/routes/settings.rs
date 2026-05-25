@@ -377,9 +377,7 @@ fn builtin_template_order_map() -> HashMap<String, usize> {
 fn default_agent_binding(template_id: &str, order: usize) -> Value {
     json!({
         "templateId": template_id,
-        "modelSource": "orchestrator",
         "engineId": "",
-        "enabled": true,
         "bindingRevision": 0,
         "order": order,
     })
@@ -508,42 +506,27 @@ fn normalize_agent_override_entry(
     if !template_ids.contains(template_id) {
         return None;
     }
-    let raw_engine_id = raw
+    // `engineId` 是「继承 vs 显式」的唯一字段：空串 = 继承编排模型，非空 = 显式绑定到 engine。
+    // 历史载荷里的 `modelSource` 枚举（"orchestrator"/"engine"）在 normalize 阶段直接丢弃，
+    // 不再作为二级判定项——避免「modelSource=engine 但 engineId 空」这类矛盾态。
+    let engine_id = raw
         .get("engineId")
         .and_then(Value::as_str)
         .map(str::trim)
-        .unwrap_or("");
-    let model_source = match raw.get("modelSource").and_then(Value::as_str) {
-        Some("engine") if !raw_engine_id.is_empty() => "engine",
-        Some("orchestrator") => "orchestrator",
-        _ if !raw_engine_id.is_empty() => "engine",
-        _ => "orchestrator",
-    };
+        .unwrap_or("")
+        .to_string();
     let order = order_map.get(template_id).copied().unwrap_or(0);
     let binding_revision = raw
         .get("bindingRevision")
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    let enabled = raw.get("enabled").and_then(Value::as_bool).unwrap_or(true);
 
     let mut normalized = Map::new();
     normalized.insert(
         "templateId".to_string(),
         Value::String(template_id.to_string()),
     );
-    normalized.insert(
-        "modelSource".to_string(),
-        Value::String(model_source.to_string()),
-    );
-    normalized.insert(
-        "engineId".to_string(),
-        Value::String(if model_source == "engine" {
-            raw_engine_id.to_string()
-        } else {
-            String::new()
-        }),
-    );
-    normalized.insert("enabled".to_string(), Value::Bool(enabled));
+    normalized.insert("engineId".to_string(), Value::String(engine_id));
     normalized.insert("bindingRevision".to_string(), Value::from(binding_revision));
     normalized.insert("order".to_string(), Value::from(order as u64));
 
@@ -558,29 +541,17 @@ fn normalize_agent_override_entry(
 }
 
 fn is_default_agent_override(override_entry: &Value) -> bool {
-    let model_source = override_entry
-        .get("modelSource")
-        .and_then(Value::as_str)
-        .unwrap_or("orchestrator");
     let engine_id = override_entry
         .get("engineId")
         .and_then(Value::as_str)
         .unwrap_or("");
-    let enabled = override_entry
-        .get("enabled")
-        .and_then(Value::as_bool)
-        .unwrap_or(true);
     let has_ui_overrides = override_entry
         .get("uiOverrides")
         .is_some_and(|value| !value.is_null());
     let has_profile_overrides = override_entry
         .get("profileOverrides")
         .is_some_and(|value| !value.is_null());
-    enabled
-        && model_source == "orchestrator"
-        && engine_id.is_empty()
-        && !has_ui_overrides
-        && !has_profile_overrides
+    engine_id.is_empty() && !has_ui_overrides && !has_profile_overrides
 }
 
 fn load_agent_overrides(
@@ -657,15 +628,9 @@ pub(crate) fn resolve_registry_agents(state: &ApiState) -> Vec<Value> {
         .collect()
 }
 
-pub(crate) fn enabled_registry_agent_roles(state: &ApiState) -> Vec<String> {
+pub(crate) fn registered_role_template_ids(state: &ApiState) -> Vec<String> {
     resolve_registry_agents(state)
         .into_iter()
-        .filter(|entry| {
-            entry
-                .get("enabled")
-                .and_then(Value::as_bool)
-                .unwrap_or(true)
-        })
         .filter_map(|entry| {
             entry
                 .get("templateId")
@@ -889,22 +854,6 @@ async fn upsert_agent(
     State(state): State<ApiState>,
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let raw_request = request.get("agent").unwrap_or(&request);
-    let requested_model_source = raw_request
-        .get("modelSource")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    let requested_engine_id = raw_request
-        .get("engineId")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .unwrap_or("");
-    if requested_model_source == "engine" && requested_engine_id.is_empty() {
-        return Err(ApiError::InvalidInput(
-            "显式绑定模型时必须提供 engineId".to_string(),
-        ));
-    }
-
     let template_ids = builtin_template_ids();
     let order_map = builtin_template_order_map();
     let normalized = normalize_agent_override_entry(&request, &template_ids, &order_map)
@@ -914,21 +863,14 @@ async fn upsert_agent(
         .and_then(Value::as_str)
         .ok_or_else(|| ApiError::InvalidInput("角色绑定缺少有效的 templateId".to_string()))?
         .to_string();
-    let model_source = normalized
-        .get("modelSource")
-        .and_then(Value::as_str)
-        .unwrap_or("orchestrator");
     let engine_id = normalized
         .get("engineId")
         .and_then(Value::as_str)
         .unwrap_or("");
 
-    if model_source == "engine" {
-        if engine_id.is_empty() {
-            return Err(ApiError::InvalidInput(
-                "显式绑定模型时必须提供 engineId".to_string(),
-            ));
-        }
+    // engineId 非空 ⇒ 显式绑定，必须能在 engines 段里查到。
+    // 空串则代表「继承编排模型」，没有 engine 概念，直接进 overrides 收敛。
+    if !engine_id.is_empty() {
         let engines = load_registry_engines(&state);
         let engine_exists = engines.iter().any(|entry| {
             entry

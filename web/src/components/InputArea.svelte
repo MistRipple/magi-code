@@ -10,7 +10,14 @@
   } from '../stores/messages.svelte';
   import { getTaskProjectionState, refreshTaskProjection } from '../stores/task-projection-store.svelte';
   import { RustDaemonClient } from '../shared/rust-daemon-client';
-  import { enhanceAgentPrompt, resolveAgentBaseUrl } from '../web/agent-api';
+  import {
+    enhanceAgentPrompt,
+    fetchAgentModelList,
+    getAgentSettingsBootstrap,
+    resolveAgentBaseUrl,
+    saveAgentOrchestratorConfig,
+    type AgentSettingsBootstrapSnapshot,
+  } from '../web/agent-api';
   import { categoryLabel, listTaskTemplates, type ResolvedTemplate } from '../lib/task-templates';
   import Icon from './Icon.svelte';
   import { generateId } from '../lib/utils';
@@ -57,6 +64,16 @@
   let stopLoading = $state(false);
   let enhanceLoading = $state(false);
   let templatesOpen = $state(false);
+
+  // 主线模型 picker：弹窗状态 + 模型列表惰性拉取。
+  // 选中后直接写回 orchestrator 配置，后续会话轮次都读取同一份持久化配置。
+  let pickerOpen = $state(false);
+  let pickerLoading = $state(false);
+  let pickerSavingModel = $state<string | null>(null);
+  let pickerModels = $state<string[]>([]);
+  let pickerError = $state<string | null>(null);
+  let pickerLoadedOnce = false;
+  const currentPickerModel = $derived.by(() => readOrchestratorModel());
   const templates = $derived<ResolvedTemplate[]>(templatesOpen ? listTaskTemplates() : []);
   const groupedTemplates = $derived.by(() => {
     if (!templatesOpen) return [] as Array<{ category: ResolvedTemplate['category']; label: string; items: ResolvedTemplate[] }>;
@@ -720,6 +737,110 @@
     queueMicrotask(focusEditor);
   }
 
+  function getOrchestratorConfigSnapshot(): Record<string, unknown> | null {
+    const snapshot = messagesState.settingsBootstrapSnapshot;
+    const orchestratorConfig = snapshot?.orchestratorConfig;
+    if (!orchestratorConfig || typeof orchestratorConfig !== 'object' || Array.isArray(orchestratorConfig)) {
+      return null;
+    }
+    return orchestratorConfig as Record<string, unknown>;
+  }
+
+  function readOrchestratorModel(): string {
+    const config = getOrchestratorConfigSnapshot();
+    const model = config?.model;
+    return typeof model === 'string' ? model.trim() : '';
+  }
+
+  function applyLocalOrchestratorConfig(config: Record<string, unknown>) {
+    const snapshot = messagesState.settingsBootstrapSnapshot;
+    if (!snapshot) return;
+    messagesState.settingsBootstrapSnapshot = {
+      ...snapshot,
+      orchestratorConfig: { ...config },
+    } as AgentSettingsBootstrapSnapshot;
+  }
+
+  async function refreshPickerSettingsSnapshot() {
+    const latest = await getAgentSettingsBootstrap({ scope: 'core' });
+    messagesState.settingsBootstrapSnapshot = latest;
+  }
+
+  // 主线模型 picker：打开 / 关闭 + 模型列表惰性拉取。
+  // 数据源：messagesState.settingsBootstrapSnapshot.orchestratorConfig，
+  // 复用现有 /api/settings/models/fetch 和 /api/settings/orchestrator/save 端点。
+  async function togglePicker() {
+    if (pickerOpen) {
+      pickerOpen = false;
+      return;
+    }
+    pickerOpen = true;
+    if (!pickerLoadedOnce && !pickerLoading) {
+      await loadPickerModels();
+    }
+  }
+  async function loadPickerModels() {
+    const orchestratorConfig = getOrchestratorConfigSnapshot();
+    if (!orchestratorConfig) {
+      pickerError = '主模型配置未就绪，先到「设置 · 模型」配置 baseUrl 与 apiKey';
+      pickerLoading = false;
+      return;
+    }
+    pickerLoading = true;
+    pickerError = null;
+    try {
+      const payload = await fetchAgentModelList(
+        orchestratorConfig as Record<string, unknown>,
+        'orch',
+      );
+      pickerModels = Array.isArray(payload.models) ? payload.models : [];
+      pickerLoadedOnce = true;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error ?? '');
+      pickerError = message || '拉取模型列表失败';
+    } finally {
+      pickerLoading = false;
+    }
+  }
+  async function selectPickerModel(model: string) {
+    const normalizedModel = model.trim();
+    if (!normalizedModel) return;
+    if (normalizedModel === currentPickerModel) {
+      pickerOpen = false;
+      return;
+    }
+    const currentConfig = getOrchestratorConfigSnapshot();
+    if (!currentConfig) {
+      pickerError = '主模型配置未就绪，无法保存当前模型';
+      return;
+    }
+
+    pickerSavingModel = normalizedModel;
+    pickerError = null;
+    const nextConfig = {
+      ...currentConfig,
+      model: normalizedModel,
+    };
+    try {
+      await saveAgentOrchestratorConfig(nextConfig);
+      applyLocalOrchestratorConfig(nextConfig);
+      try {
+        await refreshPickerSettingsSnapshot();
+      } catch (error) {
+        console.warn('[InputArea] 切换主线模型后刷新设置快照失败:', error);
+        addToast('warning', '主线模型已保存，但刷新设置快照失败，刷新页面后会同步');
+      }
+      addToast('success', `主线模型已切换为 ${normalizedModel}`);
+      pickerOpen = false;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error ?? '');
+      pickerError = message || '保存主线模型失败';
+      addToast('error', `保存主线模型失败：${pickerError}`);
+    } finally {
+      pickerSavingModel = null;
+    }
+  }
+
   // 通用清洗：模型偶尔会把改写结果包成 ```json ... ``` 或对象字面量，这里在前端兜底剥壳。
   // 设计原则：只做一次确定性还原；任何解析失败都退回原文，避免吞掉用户实际想要的内容。
   function unwrapEnhancedPromptPayload(raw: string): string {
@@ -980,6 +1101,65 @@
       </div>
 
       <div class="ia-right">
+        <div class="ia-picker-wrap">
+          <button
+            type="button"
+            class="ia-picker-btn"
+            class:active={pickerOpen}
+            class:configured={currentPickerModel !== ''}
+            onclick={togglePicker}
+            disabled={sessionInputLocked || isInteractionBlocking || pickerSavingModel !== null}
+            title={currentPickerModel
+              ? `当前主线模型：${currentPickerModel}。选择后会保存到设置。`
+              : '选择主线模型，选择后会保存到设置'}
+            aria-expanded={pickerOpen}
+          >
+            <Icon name="model" size={12} />
+            <span class="ia-picker-btn-label">{currentPickerModel || '选择主模型'}</span>
+            <Icon name="chevron-down" size={10} />
+          </button>
+          {#if pickerOpen}
+            <!-- svelte-ignore a11y_click_events_have_key_events -->
+            <!-- svelte-ignore a11y_no_static_element_interactions -->
+            <div class="ia-templates-backdrop" onclick={() => (pickerOpen = false)}></div>
+            <div class="ia-picker-popover" role="menu">
+              <div class="ia-picker-header">切换主线模型 · 保存到设置</div>
+              {#if pickerLoading}
+                <div class="ia-picker-status">拉取主模型可用列表中…</div>
+              {:else if pickerError}
+                <div class="ia-picker-status ia-picker-status-error">
+                  {pickerError}
+                  <button
+                    type="button"
+                    class="ia-picker-retry"
+                    onclick={() => { pickerError = null; loadPickerModels(); }}
+                  >重试</button>
+                </div>
+              {:else if pickerModels.length === 0}
+                <div class="ia-picker-status">主模型 channel 暂无可用模型</div>
+              {:else}
+                <div class="ia-picker-list">
+                  {#each pickerModels as model (model)}
+                    <button
+                      type="button"
+                      class="ia-picker-item"
+                      class:selected={currentPickerModel === model}
+                      onclick={() => void selectPickerModel(model)}
+                      disabled={pickerSavingModel !== null}
+                    >
+                      <span class="ia-picker-item-label">{model}</span>
+                      {#if pickerSavingModel === model}
+                        <span class="ia-picker-item-desc">保存中…</span>
+                      {:else if currentPickerModel === model}
+                        <span class="ia-picker-item-desc">当前主线模型</span>
+                      {/if}
+                    </button>
+                  {/each}
+                </div>
+              {/if}
+            </div>
+          {/if}
+        </div>
         {#if isSending}
           {#if hasContent}
             <button
@@ -1277,6 +1457,145 @@
     font-size: 11px;
     color: var(--foreground-muted);
     line-height: 1.4;
+  }
+
+  /* 主线模型 picker：右下角，向上展开 */
+  .ia-picker-wrap {
+    position: relative;
+    display: inline-flex;
+  }
+  .ia-picker-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    height: 24px;
+    max-width: 180px;
+    padding: 0 8px;
+    background: transparent;
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-full);
+    color: var(--foreground-muted);
+    font-size: 11px;
+    cursor: pointer;
+    transition: all var(--transition-fast);
+  }
+  .ia-picker-btn:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--primary) 12%, transparent);
+    border-color: color-mix(in srgb, var(--primary) 38%, transparent);
+    color: var(--primary);
+  }
+  .ia-picker-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .ia-picker-btn.active {
+    background: color-mix(in srgb, var(--primary) 14%, transparent);
+    border-color: color-mix(in srgb, var(--primary) 42%, transparent);
+    color: var(--primary);
+  }
+  .ia-picker-btn.configured {
+    background: color-mix(in srgb, var(--primary) 18%, transparent);
+    border-color: color-mix(in srgb, var(--primary) 55%, transparent);
+    color: var(--primary);
+  }
+  .ia-picker-btn-label {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 130px;
+  }
+  .ia-picker-popover {
+    position: absolute;
+    bottom: calc(100% + 6px);
+    right: 0;
+    z-index: 31;
+    width: 280px;
+    max-height: 360px;
+    overflow-y: auto;
+    padding: 8px;
+    background: color-mix(in srgb, var(--background) 100%, white 8%);
+    backdrop-filter: blur(18px);
+    -webkit-backdrop-filter: blur(18px);
+    border: 1px solid color-mix(in srgb, var(--border) 80%, var(--foreground) 20%);
+    border-radius: var(--radius-md);
+    box-shadow: 0 14px 40px rgba(0, 0, 0, 0.45), 0 2px 8px rgba(0, 0, 0, 0.22);
+  }
+  .ia-picker-header {
+    font-size: 11px;
+    color: var(--foreground-muted);
+    padding: 2px 6px 6px;
+    border-bottom: 1px dashed var(--border-subtle);
+    margin-bottom: 4px;
+  }
+  .ia-picker-item {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 2px;
+    width: 100%;
+    padding: 6px 8px;
+    background: transparent;
+    border: none;
+    border-radius: var(--radius-sm, 6px);
+    cursor: pointer;
+    text-align: left;
+    color: var(--foreground);
+    transition: background var(--transition-fast);
+  }
+  .ia-picker-item:hover {
+    background: color-mix(in srgb, var(--primary) 10%, transparent);
+  }
+  .ia-picker-item:disabled {
+    cursor: wait;
+    opacity: 0.72;
+  }
+  .ia-picker-item.selected {
+    background: color-mix(in srgb, var(--primary) 16%, transparent);
+    color: var(--primary);
+  }
+  .ia-picker-item-label {
+    font-size: 12px;
+    font-weight: var(--font-medium, 500);
+    word-break: break-all;
+  }
+  .ia-picker-item-desc {
+    font-size: 11px;
+    color: var(--foreground-muted);
+    line-height: 1.4;
+  }
+  .ia-picker-list {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding-top: 4px;
+    margin-top: 4px;
+    border-top: 1px dashed var(--border-subtle);
+  }
+  .ia-picker-status {
+    font-size: 11px;
+    color: var(--foreground-muted);
+    padding: 8px 6px;
+    text-align: center;
+  }
+  .ia-picker-status-error {
+    color: var(--error);
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    align-items: center;
+  }
+  .ia-picker-retry {
+    align-self: center;
+    padding: 2px 10px;
+    font-size: 11px;
+    background: transparent;
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-full);
+    color: var(--foreground-muted);
+    cursor: pointer;
+    transition: all var(--transition-fast);
+  }
+  .ia-picker-retry:hover {
+    background: color-mix(in srgb, var(--primary) 12%, transparent);
+    border-color: color-mix(in srgb, var(--primary) 38%, transparent);
+    color: var(--primary);
   }
 
   /* 斜杠技能选择：chip + 列表 + 预览 */

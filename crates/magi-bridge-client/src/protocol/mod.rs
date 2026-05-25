@@ -8,7 +8,9 @@ mod utils;
 
 pub use adapter::{AdaptedRequest, AdaptedResponse, ProviderAdapter, ProviderFamily};
 pub use anthropic::AnthropicMessagesAdapter;
-pub use capability::{CapabilityRegistry, ModelCapability, supports_extended_thinking};
+pub use capability::{
+    ModelCapabilityProfile, ThinkingKind, UNKNOWN_MODEL_DEFAULT, resolve_capability_profile,
+};
 pub use conformance::{ConformanceValidator, ConformanceViolation};
 pub use openai_chat::OpenAiChatCompletionsAdapter;
 pub use streaming::{SseLineParser, StreamAccumulator, parse_stream_event};

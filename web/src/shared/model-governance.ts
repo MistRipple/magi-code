@@ -71,13 +71,12 @@ export function resolveSelectableRegistryEngines(
 }
 
 export function isAgentBindingOperational(
-  agent: Pick<AgentBinding, 'enabled' | 'modelSource' | 'engineId'>,
+  agent: Pick<AgentBinding, 'engineId'>,
   registryEngines: ReadonlyArray<ModelEngine>,
 ): boolean {
-  if (agent.enabled === false) {
-    return false;
-  }
-  if (agent.modelSource !== 'engine') {
+  // engineId 空串 = 继承编排模型，编排模型由 orchestrator 章节单独治理，
+  // 角色 binding 自身视为 operational。
+  if (!agent.engineId) {
     return true;
   }
   return isEngineRegistered(agent.engineId, registryEngines);

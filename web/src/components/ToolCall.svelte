@@ -221,9 +221,9 @@
   //
   // input 形态：{ role, display_name, goal }
   // output 形态（tool_batch.rs::wait_for_child_terminal_outcome）：
-  //   succeeded → { tool, status: 'succeeded', child_task_id, role, title, output_refs }
-  //   degraded  → { tool, status: 'degraded',  child_task_id, role, title, output_refs, error, instruction }
-  //   failed    → { tool, status: 'failed',    child_task_id, role, title, output_refs, error }
+  //   succeeded → { tool, status: 'succeeded', child_task_id, role, title, summary, output_ref_count }
+  //   degraded  → { tool, status: 'degraded',  child_task_id, role, title, summary, output_ref_count, error, instruction }
+  //   failed    → { tool, status: 'failed',    child_task_id, role, title, summary, output_ref_count, error }
   //   killed    → { tool, status: 'killed',    child_task_id, role, title, error }
   const isAgentSpawn = $derived(name === 'agent_spawn');
 
@@ -572,12 +572,12 @@
       };
     }
 
-    // 编排者角色约束（agent_spawn 引导）— 与用户权限无关，是系统架构层面的职责划分
+    // 主模型角色约束（agent_spawn 引导）— 与用户权限无关，是系统架构层面的职责划分
     if (matches(
       'orchestrator',
       'agent_spawn delegation',
       'orchestrator cannot execute tools in long mission',
-      'Long Mission 下编排者不可直接执行',
+      'Long Mission 下主模型不可直接执行',
       '请通过 agent_spawn 委派给子代理',
     )) {
       return {

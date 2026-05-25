@@ -3,7 +3,10 @@ use crate::llm_types::{
     ToolInputSchema,
 };
 use crate::protocol::streaming::{SseLineParser, StreamAccumulator, parse_stream_event};
-use crate::protocol::{AdaptedResponse, AnthropicMessagesAdapter, ProviderAdapter, ProviderFamily};
+use crate::protocol::{
+    AdaptedResponse, AnthropicMessagesAdapter, OpenAiChatCompletionsAdapter, ProviderAdapter,
+    ProviderFamily,
+};
 use crate::types::{
     BridgeClientError, BridgeErrorLayer, BridgeResponse, ModelBridgeClient, ModelInvocationRequest,
     ModelStreamingDelta,
@@ -11,13 +14,19 @@ use crate::types::{
 use magi_usage_authority::ReasoningEffort;
 use serde::Deserialize;
 use serde_json::json;
+use std::collections::HashMap;
 use std::env;
 use std::io::Read as IoRead;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::Duration;
 
 const OPENAI_BASE_URL_ENV: &str = "MAGI_OPENAI_COMPAT_BASE_URL";
 const OPENAI_API_KEY_ENV: &str = "MAGI_OPENAI_COMPAT_API_KEY";
 const OPENAI_MODEL_ENV: &str = "MAGI_OPENAI_COMPAT_MODEL";
-const OPENAI_CHAT_COMPLETIONS_PATH: &str = "/v1/chat/completions";
+const MODEL_PROVIDER_MAX_IN_FLIGHT: usize = 2;
+const MODEL_PROVIDER_MAX_RETRIES: usize = 2;
+const MODEL_PROVIDER_BACKOFF_BASE_MS: u64 = 200;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HttpModelBridgeProtocol {
@@ -68,9 +77,10 @@ impl HttpModelBridgeClient {
 
     /// Create with explicit protocol and reasoning effort.
     ///
-    /// `reasoning_effort = Some(_)` 时，无论模型是否原生支持，都会显式注入到协议层：
-    /// - Chat Completions：写入顶层 `reasoning_effort` 字段。
-    /// - Anthropic Messages：映射成 `thinking.budget_tokens` 并强制启用 thinking。
+    /// `reasoning_effort = Some(_)` 时交给协议适配器按模型能力表装配：
+    /// - 支持 OpenAI reasoning 的模型写入顶层 `reasoning_effort` 字段；
+    /// - 支持 Anthropic thinking 的模型映射为对应 thinking 形态；
+    /// - 未知或不支持的模型不注入可选推理字段。
     pub fn new_with_protocol(
         base_url: String,
         api_key: Option<String>,
@@ -85,16 +95,6 @@ impl HttpModelBridgeClient {
             protocol,
             reasoning_effort,
         }
-    }
-
-    fn openai_request_url(&self, endpoint_path: &str) -> Result<String, BridgeClientError> {
-        build_protocol_endpoint_url(&self.base_url, endpoint_path).map_err(|reason| {
-            BridgeClientError::CallFailed {
-                layer: BridgeErrorLayer::Protocol,
-                code: None,
-                message: format!("invalid base_url: {reason}"),
-            }
-        })
     }
 
     #[cfg(test)]
@@ -136,36 +136,37 @@ impl HttpModelBridgeClient {
         stream: bool,
     ) -> Result<HttpModelRequest, BridgeClientError> {
         let mut headers = self.request_headers();
-        let (url, body) = match self.protocol {
-            HttpModelBridgeProtocol::ChatCompletions => {
-                let url = self.openai_request_url(OPENAI_CHAT_COMPLETIONS_PATH)?;
-                let mut body = self.build_chat_request_body(request);
-                body["stream"] = json!(stream);
-                (url, body)
-            }
-            HttpModelBridgeProtocol::AnthropicMessages => {
-                let mut adapted = AnthropicMessagesAdapter
-                    .build_request(
-                        &llm_message_params_from_invocation(request, stream, self.reasoning_effort),
-                        &self.model,
-                    )
-                    .map_err(|reason| BridgeClientError::CallFailed {
-                        layer: BridgeErrorLayer::Protocol,
-                        code: None,
-                        message: format!("build anthropic request failed: {reason}"),
-                    })?;
-                let url = build_protocol_endpoint_url(&self.base_url, &adapted.url_path).map_err(
-                    |reason| BridgeClientError::CallFailed {
-                        layer: BridgeErrorLayer::Protocol,
-                        code: None,
-                        message: format!("invalid base_url: {reason}"),
-                    },
-                )?;
-                headers.append(&mut adapted.extra_headers);
-                (url, adapted.body)
-            }
+        let params = llm_message_params_from_invocation(request, stream, self.reasoning_effort);
+        let mut adapted = match self.protocol {
+            HttpModelBridgeProtocol::ChatCompletions => OpenAiChatCompletionsAdapter
+                .build_request(&params, &self.model)
+                .map_err(|reason| BridgeClientError::CallFailed {
+                    layer: BridgeErrorLayer::Protocol,
+                    code: None,
+                    message: format!("build openai chat request failed: {reason}"),
+                })?,
+            HttpModelBridgeProtocol::AnthropicMessages => AnthropicMessagesAdapter
+                .build_request(&params, &self.model)
+                .map_err(|reason| BridgeClientError::CallFailed {
+                    layer: BridgeErrorLayer::Protocol,
+                    code: None,
+                    message: format!("build anthropic request failed: {reason}"),
+                })?,
         };
-        Ok(HttpModelRequest { url, body, headers })
+        let url =
+            build_protocol_endpoint_url(&self.base_url, &adapted.url_path).map_err(|reason| {
+                BridgeClientError::CallFailed {
+                    layer: BridgeErrorLayer::Protocol,
+                    code: None,
+                    message: format!("invalid base_url: {reason}"),
+                }
+            })?;
+        headers.append(&mut adapted.extra_headers);
+        Ok(HttpModelRequest {
+            url,
+            body: adapted.body,
+            headers,
+        })
     }
 
     #[cfg(test)]
@@ -194,42 +195,123 @@ impl HttpModelBridgeClient {
         Ok((http_request.url, http_request.body, http_request.headers))
     }
 
-    /// Build the JSON body for a chat completions request.
-    fn build_chat_request_body(&self, request: &ModelInvocationRequest) -> serde_json::Value {
-        let messages = if let Some(ref msgs) = request.messages {
-            // 透明剥离 PROMPT_CACHE_BOUNDARY 标记消息——它只用于 Anthropic
-            // adapter 切分 content blocks，对 ChatCompletions 协议没有语义，
-            // 不能泄漏到 OpenAI 兼容模型的 prompt。
-            let filtered: Vec<&crate::types::ChatMessage> = msgs
-                .iter()
-                .filter(|m| {
-                    m.content.as_deref() != Some(crate::cache_boundary::PROMPT_CACHE_BOUNDARY)
-                })
-                .collect();
-            serde_json::to_value(&filtered).unwrap_or_else(|_| json!([]))
-        } else {
-            json!([{ "role": "user", "content": request.prompt }])
-        };
-        let mut body = json!({
-            "model": self.model,
-            "messages": messages,
-            "stream": false,
-        });
-        if let Some(ref tools) = request.tools {
-            if !tools.is_empty() {
-                body["tools"] = serde_json::to_value(tools).unwrap_or_else(|_| json!([]));
-                body["tool_choice"] = request
-                    .tool_choice
-                    .as_ref()
-                    .and_then(|tool_choice| serde_json::to_value(tool_choice).ok())
-                    .unwrap_or_else(|| json!("auto"));
-            }
-        }
-        if let Some(effort) = self.reasoning_effort {
-            body["reasoning_effort"] = json!(reasoning_effort_label(effort));
-        }
-        body
+    fn provider_request_key(&self) -> String {
+        format!(
+            "{protocol}|{base_url}|{model}",
+            protocol = self.protocol.label(),
+            base_url = normalize_provider_base_url(&self.base_url),
+            model = self.model.trim(),
+        )
     }
+}
+
+impl HttpModelBridgeProtocol {
+    fn label(self) -> &'static str {
+        match self {
+            HttpModelBridgeProtocol::ChatCompletions => "chat-completions",
+            HttpModelBridgeProtocol::AnthropicMessages => "anthropic-messages",
+        }
+    }
+}
+
+struct ModelProviderGate {
+    slots: Mutex<HashMap<String, Arc<ModelProviderSlot>>>,
+}
+
+struct ModelProviderSlot {
+    in_flight: Mutex<usize>,
+    available: Condvar,
+}
+
+struct ModelProviderPermit {
+    slot: Arc<ModelProviderSlot>,
+}
+
+impl ModelProviderGate {
+    fn acquire(&self, key: &str) -> ModelProviderPermit {
+        let slot = {
+            let mut slots = self
+                .slots
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            slots
+                .entry(key.to_string())
+                .or_insert_with(|| {
+                    Arc::new(ModelProviderSlot {
+                        in_flight: Mutex::new(0),
+                        available: Condvar::new(),
+                    })
+                })
+                .clone()
+        };
+
+        let mut in_flight = slot
+            .in_flight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while *in_flight >= MODEL_PROVIDER_MAX_IN_FLIGHT {
+            in_flight = slot
+                .available
+                .wait(in_flight)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        *in_flight += 1;
+        drop(in_flight);
+
+        ModelProviderPermit { slot }
+    }
+}
+
+impl Drop for ModelProviderPermit {
+    fn drop(&mut self) {
+        let mut in_flight = self
+            .slot
+            .in_flight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *in_flight = in_flight.saturating_sub(1);
+        self.slot.available.notify_one();
+    }
+}
+
+fn model_provider_gate() -> &'static ModelProviderGate {
+    static GATE: OnceLock<ModelProviderGate> = OnceLock::new();
+    GATE.get_or_init(|| ModelProviderGate {
+        slots: Mutex::new(HashMap::new()),
+    })
+}
+
+fn normalize_provider_base_url(base_url: &str) -> String {
+    base_url.trim().trim_end_matches('/').to_string()
+}
+
+fn retry_delay(attempt: usize, provider_key: &str) -> Duration {
+    let exponent = attempt.saturating_sub(1).min(4) as u32;
+    let base = MODEL_PROVIDER_BACKOFF_BASE_MS.saturating_mul(2_u64.saturating_pow(exponent));
+    let jitter_window = (base / 10).max(1);
+    let jitter_seed = provider_key.bytes().fold(attempt as u64, |acc, byte| {
+        acc.wrapping_mul(31).wrapping_add(byte as u64)
+    });
+    let jitter = jitter_seed % (jitter_window + 1);
+    Duration::from_millis(base + jitter)
+}
+
+fn retryable_http_status(status: u16) -> bool {
+    matches!(status, 408 | 409 | 429 | 529) || status >= 500
+}
+
+fn retryable_bridge_error(error: &BridgeClientError) -> bool {
+    matches!(
+        error,
+        BridgeClientError::CallFailed {
+            layer: BridgeErrorLayer::Transport,
+            ..
+        }
+    )
+}
+
+fn sleep_before_retry(provider_key: &str, retry_attempt: usize) {
+    std::thread::sleep(retry_delay(retry_attempt, provider_key));
 }
 
 /// Execute a blocking HTTP POST on a dedicated thread so we never conflict
@@ -239,11 +321,13 @@ impl HttpModelBridgeClient {
 /// allowed" panic that `reqwest::blocking::Client` triggers when constructed
 /// or dropped inside a `#[tokio::test]` or other async context.
 fn execute_http_post(
+    provider_key: String,
     url: String,
     body: serde_json::Value,
     headers: Vec<(String, String)>,
 ) -> Result<(u16, String), BridgeClientError> {
     std::thread::spawn(move || {
+        let _permit = model_provider_gate().acquire(&provider_key);
         let client = reqwest::blocking::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(10))
             .timeout(std::time::Duration::from_secs(30))
@@ -291,6 +375,40 @@ fn execute_http_post(
     })?
 }
 
+fn execute_http_post_with_retries(
+    provider_key: String,
+    url: String,
+    body: serde_json::Value,
+    headers: Vec<(String, String)>,
+) -> Result<(u16, String), BridgeClientError> {
+    let mut retries = 0usize;
+    loop {
+        let result = execute_http_post(
+            provider_key.clone(),
+            url.clone(),
+            body.clone(),
+            headers.clone(),
+        );
+        match result {
+            Ok((status, _response_body))
+                if retryable_http_status(status) && retries < MODEL_PROVIDER_MAX_RETRIES =>
+            {
+                retries += 1;
+                sleep_before_retry(&provider_key, retries);
+                continue;
+            }
+            Err(error)
+                if retryable_bridge_error(&error) && retries < MODEL_PROVIDER_MAX_RETRIES =>
+            {
+                retries += 1;
+                sleep_before_retry(&provider_key, retries);
+                continue;
+            }
+            other => return other,
+        }
+    }
+}
+
 /// 流式 HTTP 线程发回的消息类型。
 enum StreamMessage {
     /// LLM 增量快照——携带已累积的正文与上游 thinking。
@@ -305,6 +423,7 @@ enum StreamMessage {
 /// 异步运行时中创建 `reqwest::blocking::Client` 导致 panic。
 /// 增量快照通过 channel 发回调用线程，由 `on_chunk` 回调处理。
 fn execute_streaming_http_post(
+    provider_key: String,
     url: String,
     body: serde_json::Value,
     headers: Vec<(String, String)>,
@@ -314,6 +433,7 @@ fn execute_streaming_http_post(
     let (tx, rx) = std::sync::mpsc::channel::<StreamMessage>();
 
     std::thread::spawn(move || {
+        let _permit = model_provider_gate().acquire(&provider_key);
         let result = streaming_http_io(url, body, headers, provider_family, &tx);
         // 无论成功失败，都通过 Done 发送最终结果
         let _ = tx.send(StreamMessage::Done(result));
@@ -337,6 +457,49 @@ fn execute_streaming_http_post(
         code: Some(-32005),
         message: "streaming HTTP request thread terminated unexpectedly".to_string(),
     })
+}
+
+fn execute_streaming_http_post_with_retries(
+    provider_key: String,
+    url: String,
+    body: serde_json::Value,
+    headers: Vec<(String, String)>,
+    provider_family: ProviderFamily,
+    on_chunk: &dyn Fn(&ModelStreamingDelta),
+) -> Result<(u16, String), BridgeClientError> {
+    let mut retries = 0usize;
+    loop {
+        let emitted_delta = AtomicBool::new(false);
+        let guarded_chunk = |delta: &ModelStreamingDelta| {
+            if !delta.content.is_empty() || !delta.thinking.is_empty() {
+                emitted_delta.store(true, Ordering::SeqCst);
+            }
+            on_chunk(delta);
+        };
+        let result = execute_streaming_http_post(
+            provider_key.clone(),
+            url.clone(),
+            body.clone(),
+            headers.clone(),
+            provider_family,
+            &guarded_chunk,
+        );
+        let can_retry =
+            !emitted_delta.load(Ordering::SeqCst) && retries < MODEL_PROVIDER_MAX_RETRIES;
+        match result {
+            Ok((status, _response_body)) if can_retry && retryable_http_status(status) => {
+                retries += 1;
+                sleep_before_retry(&provider_key, retries);
+                continue;
+            }
+            Err(error) if can_retry && retryable_bridge_error(&error) => {
+                retries += 1;
+                sleep_before_retry(&provider_key, retries);
+                continue;
+            }
+            other => return other,
+        }
+    }
 }
 
 /// 独立线程内执行的流式 HTTP I/O 逻辑。
@@ -476,8 +639,12 @@ impl ModelBridgeClient for HttpModelBridgeClient {
 
         let http_request = self.build_http_request(&request, false)?;
 
-        let (status, response_body) =
-            execute_http_post(http_request.url, http_request.body, http_request.headers)?;
+        let (status, response_body) = execute_http_post_with_retries(
+            self.provider_request_key(),
+            http_request.url,
+            http_request.body,
+            http_request.headers,
+        )?;
 
         if !(200..300).contains(&status) {
             // Attempt to extract OpenAI-style error details
@@ -523,7 +690,8 @@ impl ModelBridgeClient for HttpModelBridgeClient {
 
         let http_request = self.build_http_request(&request, true)?;
 
-        let (status, response_body) = execute_streaming_http_post(
+        let (status, response_body) = execute_streaming_http_post_with_retries(
+            self.provider_request_key(),
             http_request.url,
             http_request.body,
             http_request.headers,
@@ -823,7 +991,7 @@ fn read_non_empty_env(key: &str) -> Option<String> {
 
 #[cfg(test)]
 fn build_openai_chat_completions_url(base_url: &str) -> Result<String, String> {
-    build_protocol_endpoint_url(base_url, OPENAI_CHAT_COMPLETIONS_PATH)
+    build_protocol_endpoint_url(base_url, "/v1/chat/completions")
 }
 
 #[cfg(test)]
@@ -919,21 +1087,6 @@ fn llm_message_params_from_invocation(
         stream_hard_timeout_ms: None,
         retry_policy: None,
         reasoning_effort,
-    }
-}
-
-/// 将 `ReasoningEffort` 序列化为下游 Chat Completions API 接受的字符串字面量。
-///
-/// 四档粒度（`low | medium | high | xhigh`）原样透传，由下游模型/网关自行解释。
-/// magi 不在这里做向下兼容降级——把"极高"偷偷映射成"high"会让用户看见的等级
-/// 与真实生效等级永久错位（见 Task #59 回归）。Anthropic Messages 协议不消费
-/// 该字符串，只读 `params.reasoning_effort` 枚举映射 budget tokens。
-fn reasoning_effort_label(effort: ReasoningEffort) -> &'static str {
-    match effort {
-        ReasoningEffort::Low => "low",
-        ReasoningEffort::Medium => "medium",
-        ReasoningEffort::High => "high",
-        ReasoningEffort::Xhigh => "xhigh",
     }
 }
 
@@ -1145,67 +1298,6 @@ mod tests {
     }
 
     #[test]
-    fn build_chat_request_body_strips_cache_boundary_marker() {
-        let client = HttpModelBridgeClient::new(
-            "https://api.example.com/v1".to_string(),
-            Some("test-key".to_string()),
-            "gpt-4.1-mini".to_string(),
-        );
-
-        let body = client.build_request_body(&ModelInvocationRequest {
-            provider: "openai".to_string(),
-            prompt: "unused".to_string(),
-            messages: Some(vec![
-                crate::types::ChatMessage {
-                    role: "system".to_string(),
-                    content: Some("static prompt".to_string()),
-                    tool_calls: Vec::new(),
-                    tool_call_id: None,
-                },
-                crate::types::ChatMessage {
-                    role: "system".to_string(),
-                    content: Some(crate::cache_boundary::PROMPT_CACHE_BOUNDARY.to_string()),
-                    tool_calls: Vec::new(),
-                    tool_call_id: None,
-                },
-                crate::types::ChatMessage {
-                    role: "system".to_string(),
-                    content: Some("dynamic prompt".to_string()),
-                    tool_calls: Vec::new(),
-                    tool_call_id: None,
-                },
-                crate::types::ChatMessage {
-                    role: "user".to_string(),
-                    content: Some("hi".to_string()),
-                    tool_calls: Vec::new(),
-                    tool_call_id: None,
-                },
-            ]),
-            tools: None,
-            tool_choice: None,
-        });
-
-        let messages = body["messages"]
-            .as_array()
-            .expect("messages should be array");
-        assert_eq!(
-            messages.len(),
-            3,
-            "boundary marker message should be stripped"
-        );
-        assert_eq!(messages[0]["content"], "static prompt");
-        assert_eq!(messages[1]["content"], "dynamic prompt");
-        assert_eq!(messages[2]["content"], "hi");
-
-        // Boundary marker must never appear in any serialized message content.
-        let body_text = body.to_string();
-        assert!(
-            !body_text.contains(crate::cache_boundary::PROMPT_CACHE_BOUNDARY),
-            "boundary marker leaked into OpenAI ChatCompletions body: {body_text}"
-        );
-    }
-
-    #[test]
     fn build_request_body_preserves_forced_tool_choice() {
         let client = HttpModelBridgeClient::new(
             "https://api.example.com/v1".to_string(),
@@ -1310,7 +1402,9 @@ mod tests {
             let client = HttpModelBridgeClient::new_with_protocol(
                 "https://api.example.com/v1".to_string(),
                 Some("test-key".to_string()),
-                "gpt-test".to_string(),
+                // 选用命中能力表 OpenAI reasoning profile 的模型名（gpt-5*）；
+                // 未命中条目的模型即便配置了 effort 也不会注入 reasoning_effort。
+                "gpt-5-test".to_string(),
                 HttpModelBridgeProtocol::ChatCompletions,
                 Some(effort),
             );
@@ -1361,8 +1455,9 @@ mod tests {
             let client = HttpModelBridgeClient::new_with_protocol(
                 "https://api.anthropic.com".to_string(),
                 Some("sk-ant-test".to_string()),
-                // 选用不在 extended thinking 能力清单中的模型名，确保启用完全由配置驱动
-                "claude-non-thinking-test".to_string(),
+                // 选用命中能力表 BudgetTokens profile 的模型名（claude-opus-4 前缀）；
+                // 4.7 系列改走 effort 路径，legacy 4.x 才映射到 budget_tokens。
+                "claude-opus-4-5-test".to_string(),
                 HttpModelBridgeProtocol::AnthropicMessages,
                 Some(effort),
             );
@@ -1402,7 +1497,7 @@ mod tests {
         let client = HttpModelBridgeClient::new_with_protocol(
             "https://api.example.com/v1".to_string(),
             Some("test-key".to_string()),
-            "gpt-test".to_string(),
+            "gpt-5-test".to_string(),
             HttpModelBridgeProtocol::ChatCompletions,
             Some(ReasoningEffort::Xhigh),
         );
@@ -1411,7 +1506,7 @@ mod tests {
             .expect("probe request should build");
 
         assert_eq!(url, "https://api.example.com/v1/chat/completions");
-        assert_eq!(body["model"], "gpt-test");
+        assert_eq!(body["model"], "gpt-5-test");
         assert_eq!(body["messages"][0]["content"], "ping");
         assert_eq!(
             body["reasoning_effort"], "xhigh",
@@ -1427,7 +1522,8 @@ mod tests {
         let client = HttpModelBridgeClient::new_with_protocol(
             "https://api.anthropic.com".to_string(),
             Some("sk-ant-test".to_string()),
-            "claude-test".to_string(),
+            // 命中 claude-opus-4 → BudgetTokens profile；4.7 系列改走 effort 路径。
+            "claude-opus-4-5-test".to_string(),
             HttpModelBridgeProtocol::AnthropicMessages,
             Some(ReasoningEffort::Xhigh),
         );
@@ -1436,7 +1532,7 @@ mod tests {
             .expect("probe request should build");
 
         assert_eq!(url, "https://api.anthropic.com/v1/messages");
-        assert_eq!(body["model"], "claude-test");
+        assert_eq!(body["model"], "claude-opus-4-5-test");
         assert_eq!(body["thinking"]["type"], "enabled");
         assert_eq!(body["thinking"]["budget_tokens"], 32768);
         assert_eq!(body["temperature"], 1);
@@ -1591,6 +1687,12 @@ mod tests {
         anthropic_version: Option<String>,
     }
 
+    struct MockHttpResponse {
+        status: u16,
+        content_type: String,
+        response_text: String,
+    }
+
     fn spawn_mock_server(status: u16, response_body: serde_json::Value) -> MockHttpServer {
         spawn_mock_server_with_response_text(status, "application/json", response_body.to_string())
     }
@@ -1600,88 +1702,102 @@ mod tests {
         content_type: &'static str,
         response_text: String,
     ) -> MockHttpServer {
+        spawn_mock_server_sequence(vec![MockHttpResponse {
+            status,
+            content_type: content_type.to_string(),
+            response_text,
+        }])
+    }
+
+    fn spawn_mock_server_sequence(responses: Vec<MockHttpResponse>) -> MockHttpServer {
         let listener = TcpListener::bind("127.0.0.1:0").expect("mock server should bind");
         let address = listener.local_addr().expect("address should exist");
         let (sender, receiver) = mpsc::channel();
 
         let handle = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("mock server should accept");
-            stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .expect("timeout should set");
+            for response_config in responses {
+                let (mut stream, _) = listener.accept().expect("mock server should accept");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .expect("timeout should set");
 
-            let mut buffer = Vec::new();
-            let mut chunk = [0_u8; 4096];
-            let header_end = loop {
-                let read = stream.read(&mut chunk).expect("should read");
-                assert!(read > 0, "should receive data");
-                buffer.extend_from_slice(&chunk[..read]);
-                if let Some(pos) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
-                    break pos + 4;
-                }
-            };
+                let mut buffer = Vec::new();
+                let mut chunk = [0_u8; 4096];
+                let header_end = loop {
+                    let read = stream.read(&mut chunk).expect("should read");
+                    assert!(read > 0, "should receive data");
+                    buffer.extend_from_slice(&chunk[..read]);
+                    if let Some(pos) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                };
 
-            let header_text =
-                String::from_utf8(buffer[..header_end].to_vec()).expect("headers should be utf-8");
-            let mut lines = header_text.split("\r\n");
-            let request_line = lines.next().expect("request line should exist").to_string();
-            let mut authorization = None;
-            let mut x_api_key = None;
-            let mut anthropic_version = None;
-            let mut content_length: usize = 0;
-            for line in lines {
-                if line.is_empty() {
-                    continue;
+                let header_text = String::from_utf8(buffer[..header_end].to_vec())
+                    .expect("headers should be utf-8");
+                let mut lines = header_text.split("\r\n");
+                let request_line = lines.next().expect("request line should exist").to_string();
+                let mut authorization = None;
+                let mut x_api_key = None;
+                let mut anthropic_version = None;
+                let mut content_length: usize = 0;
+                for line in lines {
+                    if line.is_empty() {
+                        continue;
+                    }
+                    if let Some((name, value)) = line.split_once(':') {
+                        let name_lower = name.trim().to_ascii_lowercase();
+                        if name_lower == "content-length" {
+                            content_length = value.trim().parse().unwrap_or(0);
+                        }
+                        if name_lower == "authorization" {
+                            authorization = Some(value.trim().to_string());
+                        }
+                        if name_lower == "x-api-key" {
+                            x_api_key = Some(value.trim().to_string());
+                        }
+                        if name_lower == "anthropic-version" {
+                            anthropic_version = Some(value.trim().to_string());
+                        }
+                    }
                 }
-                if let Some((name, value)) = line.split_once(':') {
-                    let name_lower = name.trim().to_ascii_lowercase();
-                    if name_lower == "content-length" {
-                        content_length = value.trim().parse().unwrap_or(0);
-                    }
-                    if name_lower == "authorization" {
-                        authorization = Some(value.trim().to_string());
-                    }
-                    if name_lower == "x-api-key" {
-                        x_api_key = Some(value.trim().to_string());
-                    }
-                    if name_lower == "anthropic-version" {
-                        anthropic_version = Some(value.trim().to_string());
-                    }
+
+                while buffer.len() < header_end + content_length {
+                    let read = stream.read(&mut chunk).expect("should read body");
+                    assert!(read > 0, "should receive body data");
+                    buffer.extend_from_slice(&chunk[..read]);
                 }
+
+                let body =
+                    String::from_utf8(buffer[header_end..header_end + content_length].to_vec())
+                        .expect("body should be utf-8");
+
+                // Parse method and path from request line
+                let parts: Vec<&str> = request_line.split_whitespace().collect();
+                let method = parts.first().unwrap_or(&"").to_string();
+                let path = parts.get(1).unwrap_or(&"").to_string();
+
+                let _ = sender.send(RecordedRequest {
+                    method,
+                    path,
+                    body,
+                    authorization,
+                    x_api_key,
+                    anthropic_version,
+                });
+
+                let response = format!(
+                    "HTTP/1.1 {status} {}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response_text}",
+                    status_reason(response_config.status),
+                    response_config.response_text.len(),
+                    status = response_config.status,
+                    content_type = response_config.content_type,
+                    response_text = response_config.response_text,
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("should write response");
+                stream.flush().expect("should flush");
             }
-
-            while buffer.len() < header_end + content_length {
-                let read = stream.read(&mut chunk).expect("should read body");
-                assert!(read > 0, "should receive body data");
-                buffer.extend_from_slice(&chunk[..read]);
-            }
-
-            let body = String::from_utf8(buffer[header_end..header_end + content_length].to_vec())
-                .expect("body should be utf-8");
-
-            // Parse method and path from request line
-            let parts: Vec<&str> = request_line.split_whitespace().collect();
-            let method = parts.first().unwrap_or(&"").to_string();
-            let path = parts.get(1).unwrap_or(&"").to_string();
-
-            let _ = sender.send(RecordedRequest {
-                method,
-                path,
-                body,
-                authorization,
-                x_api_key,
-                anthropic_version,
-            });
-
-            let response = format!(
-                "HTTP/1.1 {status} {}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response_text}",
-                status_reason(status),
-                response_text.len()
-            );
-            stream
-                .write_all(response.as_bytes())
-                .expect("should write response");
-            stream.flush().expect("should flush");
         });
 
         MockHttpServer {
@@ -1694,9 +1810,11 @@ mod tests {
     fn status_reason(status: u16) -> &'static str {
         match status {
             200 => "OK",
+            400 => "Bad Request",
             401 => "Unauthorized",
             429 => "Too Many Requests",
             500 => "Internal Server Error",
+            503 => "Service Unavailable",
             _ => "Test Response",
         }
     }
@@ -1799,6 +1917,118 @@ mod tests {
         let body: serde_json::Value =
             serde_json::from_str(&recorded.body).expect("body should be json");
         assert_eq!(body["stream"], true);
+    }
+
+    #[test]
+    fn invoke_retries_retryable_status_before_success() {
+        let server = spawn_mock_server_sequence(vec![
+            MockHttpResponse {
+                status: 429,
+                content_type: "application/json".to_string(),
+                response_text: serde_json::json!({
+                    "error": {
+                        "message": "rate limited",
+                        "type": "rate_limit_error",
+                        "code": "too_many_requests",
+                    }
+                })
+                .to_string(),
+            },
+            MockHttpResponse {
+                status: 200,
+                content_type: "application/json".to_string(),
+                response_text: serde_json::json!({
+                    "choices": [{
+                        "message": {
+                            "content": "retry recovered"
+                        }
+                    }]
+                })
+                .to_string(),
+            },
+        ]);
+
+        let client = HttpModelBridgeClient::new(
+            server.address.clone(),
+            Some("sk-test-key".to_string()),
+            "gpt-4.1-mini".to_string(),
+        );
+
+        let response = client
+            .invoke(ModelInvocationRequest {
+                provider: "openai-compatible".to_string(),
+                prompt: "hello".to_string(),
+                messages: None,
+                tools: None,
+                tool_choice: None,
+            })
+            .expect("retryable rejection should recover on the next attempt");
+
+        assert_eq!(response.payload, "retry recovered");
+        for _ in 0..2 {
+            let recorded = server
+                .request_receiver
+                .recv_timeout(Duration::from_secs(5))
+                .expect("mock server should receive every retry attempt");
+            assert_eq!(recorded.path, "/v1/chat/completions");
+        }
+    }
+
+    #[test]
+    fn streaming_retries_before_first_delta_only() {
+        let server = spawn_mock_server_sequence(vec![
+            MockHttpResponse {
+                status: 503,
+                content_type: "application/json".to_string(),
+                response_text: serde_json::json!({
+                    "error": {
+                        "message": "provider warming up",
+                        "type": "server_error",
+                        "code": "unavailable",
+                    }
+                })
+                .to_string(),
+            },
+            MockHttpResponse {
+                status: 200,
+                content_type: "text/event-stream".to_string(),
+                response_text: concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n",
+                    "data: [DONE]\n\n",
+                )
+                .to_string(),
+            },
+        ]);
+
+        let client = HttpModelBridgeClient::new(
+            server.address.clone(),
+            Some("sk-test-key".to_string()),
+            "gpt-4.1-mini".to_string(),
+        );
+        let deltas = std::cell::RefCell::new(Vec::new());
+
+        let response = client
+            .invoke_streaming(
+                ModelInvocationRequest {
+                    provider: "openai-compatible".to_string(),
+                    prompt: "hello".to_string(),
+                    messages: None,
+                    tools: None,
+                    tool_choice: None,
+                },
+                &|delta| deltas.borrow_mut().push(delta.content.clone()),
+            )
+            .expect("streaming retry should recover before any delta is emitted");
+
+        assert!(response.ok);
+        assert_eq!(deltas.into_inner(), vec!["Hi".to_string()]);
+        for _ in 0..2 {
+            let recorded = server
+                .request_receiver
+                .recv_timeout(Duration::from_secs(5))
+                .expect("mock server should receive streaming retry attempts");
+            assert_eq!(recorded.path, "/v1/chat/completions");
+        }
     }
 
     #[test]
@@ -1915,12 +2145,12 @@ mod tests {
     #[test]
     fn invoke_against_mock_server_handles_rejection() {
         let server = spawn_mock_server(
-            429,
+            400,
             serde_json::json!({
                 "error": {
-                    "message": "rate limited",
-                    "type": "rate_limit_error",
-                    "code": "too_many_requests",
+                    "message": "bad request",
+                    "type": "invalid_request_error",
+                    "code": "invalid_request",
                 }
             }),
         );
@@ -1949,7 +2179,7 @@ mod tests {
             } => {
                 assert_eq!(layer, BridgeErrorLayer::RemoteBusiness);
                 assert_eq!(code, Some(-32006));
-                assert!(message.contains("rate limited"), "message was: {message}");
+                assert!(message.contains("bad request"), "message was: {message}");
             }
             other => panic!("unexpected error: {other:?}"),
         }

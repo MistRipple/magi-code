@@ -369,14 +369,14 @@ impl BuiltinToolName {
                 "向已注册的子 agent 角色同步派发一个子任务（architect / executor / reviewer 等）。该工具是同步阻塞调用：父代理在本轮停在该 tool call 上等待子代理跑完整个对话，最终输出作为 tool_call_result 直接回写到父代理上下文，不再走 mailbox 回流。同一轮调用多次 agent_spawn 时所有子代理并发执行。若返回 status=degraded，表示子代理当前不可用，父代理必须改派其他可用角色或由主线继续完成，不能直接停止任务。\n\n\
                 # 何时用\n\
                 - 任务可拆出 1 个或多个明确边界的子工作单元，且子单元能独立完成（有清晰输入、输出、验收）\n\
-                - 需要专家视角（reviewer 做代码审查、security-analyst 做风险评估）\n\
+                - 需要专家视角（reviewer 做代码审查、explorer 做根因定位、tester 做验证）\n\
                 - 多个子工作可并行执行节省时间\n\n\
                 # 何时不用\n\
                 - 1-3 步能自己完成的任务 → 直接做，派发开销不值\n\
                 - 子任务需要你在场即时回答澄清问题 → 自己做更顺\n\
                 - 仅是查询性问题（找文件 / 读代码） → 用 search_text / file_read，不要派 agent\n\n\
                 # display_name 写法\n\
-                - 长度 5-30 个字符，前端子代理卡片直接展示\n\
+                - 长度 3-30 个字符，前端子代理卡片直接展示\n\
                 - 要让用户一眼看出『谁在做什么具体的事』，写成「职责 + 对象」短语\n\
                 - ✅ 例：『登录流程审查员』『订单模块迁移设计师』『支付冒烟测试执行人』\n\
                 - ❌ 反例：纯角色名『executor』『reviewer-1』；冗长重复『执行删除日志模块的所有引用并跑通测试的执行器』\n\n\
@@ -691,7 +691,7 @@ impl BuiltinToolName {
                 "type": "object",
                 "properties": {
                     "role": { "type": "string", "description": "已注册的 agent 角色 id，如 architect / executor / explorer / reviewer / tester / coordinator" },
-                    "display_name": { "type": "string", "description": "本次派发的子代理实例展示名（5-30 个字符），用于前端子代理卡片标题。要求高度概括本次具体职责，例如『登录流程审查员』『支付迁移设计师』『冒烟测试执行人』；不要写成纯角色名（如『executor』）或冗长目标重复。" },
+                    "display_name": { "type": "string", "description": "本次派发的子代理实例展示名（3-30 个字符），用于前端子代理卡片标题。要求高度概括本次具体职责，例如『登录流程审查员』『支付迁移设计师』『冒烟测试执行人』；不要写成纯角色名（如『executor』）或冗长目标重复。" },
                     "goal": { "type": "string", "description": "子任务的具体目标；角色级 system prompt 会与该目标合并使用" },
                     "task_kind": {
                         "type": "string",
@@ -4225,7 +4225,6 @@ mod tests {
     fn orchestration_tools_are_not_registered_as_builtins() {
         let registry = make_registry();
         for tool_name in [
-            "worker_send_message",
             "task_split",
             "task_list",
             "task_update",

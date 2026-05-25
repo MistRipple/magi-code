@@ -7,7 +7,7 @@ use crate::dto::{
 };
 use crate::errors::ApiError;
 use crate::routes::settings::{
-    builtin_role_templates, enabled_registry_agent_roles, load_registry_engines,
+    builtin_role_templates, load_registry_engines, registered_role_template_ids,
     resolve_registry_agents,
 };
 use crate::settings_store::SettingsStore;
@@ -698,7 +698,7 @@ impl ApiState {
     pub fn task_worker_catalog(&self) -> Vec<WorkerInfo> {
         build_worker_catalog_for_roles(
             &self.agent_role_registry,
-            enabled_registry_agent_roles(self),
+            registered_role_template_ids(self),
         )
     }
 

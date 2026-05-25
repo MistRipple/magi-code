@@ -1000,17 +1000,21 @@ function deriveRuntimeState(
   );
   const status = runningTaskIds.length > 0
     ? 'running'
-    : rootTaskStatus === 'blocked'
-      ? 'blocked'
-      : hasRecoverableChain
-      ? 'paused'
-      : failedTaskIds.length > 0
-        ? 'failed'
-        : activeSession
-          ? rootTaskStatus === 'completed'
-            ? 'completed'
-            : 'idle'
-          : 'idle';
+    : rootTaskStatus === 'running'
+      ? 'running'
+      : rootTaskStatus === 'blocked'
+        ? 'blocked'
+        : rootTaskStatus === 'completed'
+          ? 'completed'
+          : rootTaskStatus === 'cancelled'
+            ? 'cancelled'
+            : rootTaskStatus === 'failed' || failedTaskIds.length > 0
+              ? 'failed'
+              : rootTaskStatus === 'paused'
+                ? 'paused'
+                : activeSession
+                  ? 'idle'
+                  : 'idle';
 
   const opsView = deriveOpsView(runtimeReadModel, recentEvents, sessionId, generatedAt);
 
@@ -1021,7 +1025,7 @@ function deriveRuntimeState(
       ? 'execute'
       : status === 'blocked'
         ? 'blocked'
-        : (hasRecoverableChain ? 'paused' : 'idle'),
+        : 'idle',
     errors: failedTaskIds.length > 0 ? failedTaskIds.map((id) => `task_failed:${id}`) : [],
     statusChangedAt: normalizeNumber(activeSession?.last_update, generatedAt),
     lastEventAt: normalizeNumber(activeSession?.last_update, generatedAt),

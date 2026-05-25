@@ -522,13 +522,11 @@ let modelStatus = $state<ModelStatusMap>({
 export interface EnabledAgent {
   /** 角色模板 ID（= 运行时 agentId = workerSlot） */
   templateId: string;
-  /** 模型来源：继承编排模型或显式绑定引擎 */
-  modelSource: 'orchestrator' | 'engine';
   /** 展示名称（来自 RoleTemplate.displayName） */
   displayName: string;
   /** 展示名称国际化 key（若存在则优先用于 UI 本地化） */
   displayNameKey?: string;
-  /** 绑定的引擎 ID */
+  /** 绑定的引擎 ID：空串 = 继承编排模型，非空 = 显式绑定 */
   engineId: string;
   /** 排序序号 */
   order: number;

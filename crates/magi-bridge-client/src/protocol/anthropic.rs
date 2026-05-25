@@ -1,9 +1,10 @@
 use serde_json::{Value, json};
 
 use super::adapter::{AdaptedRequest, AdaptedResponse, ProviderAdapter, ProviderFamily};
-use super::capability::supports_extended_thinking;
+use super::capability::{ThinkingKind, resolve_capability_profile};
 use super::utils::{
-    convert_messages_to_anthropic, parse_anthropic_usage, serialize_anthropic_tool_definitions,
+    convert_messages_to_anthropic, parse_anthropic_usage, reasoning_effort_label,
+    serialize_anthropic_tool_definitions,
 };
 use crate::cache_boundary::split_at_cache_boundary;
 use crate::llm_types::{LlmMessageParams, ToolCall};
@@ -11,19 +12,16 @@ use magi_usage_authority::ReasoningEffort;
 
 /// Anthropic Extended Thinking 默认预算（tokens）。
 ///
-/// 仅在调用方未显式指定 `reasoning_effort` 时使用。Anthropic 要求 `max_tokens > budget_tokens`。
-/// 这里取一个中等值，足够大多数推理场景，同时保证 `max_tokens.unwrap_or(4096)` 仍有可用余量。
-const DEFAULT_THINKING_BUDGET_TOKENS: u32 = 4096;
+/// 仅在 `ThinkingKind::BudgetTokens` 形态、且能力表未提供 `default_budget_tokens`、
+/// 且调用方未传 `reasoning_effort` 时使用。Anthropic 要求 `max_tokens > budget_tokens`。
+const FALLBACK_THINKING_BUDGET_TOKENS: u32 = 4096;
 /// 启用 thinking 时 `max_tokens` 的最低值（必须严格大于 budget）。
 const MIN_MAX_TOKENS_WITH_THINKING: u32 = 8192;
 
 /// 将 `ReasoningEffort` 映射为 Anthropic `thinking.budget_tokens` 数值。
 ///
-/// 上限对齐官方文档「thinking budget」可用区间：
-/// - Low: 1024 — 轻量推理；
-/// - Medium: 4096 — 与默认值一致；
-/// - High: 16384 — 复杂任务；
-/// - Xhigh: 32768 — 极限推理预算。
+/// 仅在 `ThinkingKind::BudgetTokens` 形态下使用（legacy Claude 3.7 / 4.x 系列）。
+/// Opus 4.7+ 的 Adaptive Thinking 走 `thinking.effort` 字符串路径，不经过该函数。
 fn reasoning_effort_budget_tokens(effort: ReasoningEffort) -> u32 {
     match effort {
         ReasoningEffort::Low => 1024,
@@ -64,26 +62,35 @@ impl ProviderAdapter for AnthropicMessagesAdapter {
         let non_system_owned: Vec<_> = non_system.into_iter().cloned().collect();
         let messages = convert_messages_to_anthropic(&non_system_owned);
 
-        // 触发 thinking 的两条路径：
-        //   1) 调用方显式配置了 `reasoning_effort`（用户在 UI 显式选了等级，必须强制启用）；
-        //   2) 模型能力声明支持 extended thinking（fallback 默认开关）。
-        // 这里采用 OR 语义：只要任一条件成立就启用 thinking，确保配置永远生效。
+        // thinking / beta header / temperature 全部由能力表驱动；
+        // 不再保留"配置覆盖能力"的 OR 语义——未知 / 不支持 thinking 的模型
+        // 即便调用方传了 reasoning_effort 也绝不写入 thinking 字段，
+        // 避免向后端注入会触发 400 的可选字段。
+        let capability = resolve_capability_profile(model);
         let configured_effort = params.reasoning_effort;
-        let thinking_enabled = configured_effort.is_some() || supports_extended_thinking(model);
+        let thinking_value = build_thinking_value(
+            capability.thinking_kind,
+            capability.supports_thinking_display,
+            capability.default_budget_tokens,
+            configured_effort,
+        );
+        let thinking_budget_floor = thinking_value
+            .as_ref()
+            .and_then(|tv| tv["budget_tokens"].as_u64())
+            .map(|n| n as u32);
 
-        let budget_tokens = configured_effort
-            .map(reasoning_effort_budget_tokens)
-            .unwrap_or(DEFAULT_THINKING_BUDGET_TOKENS);
-
-        let min_max_tokens_with_thinking = budget_tokens.saturating_add(4096);
-
-        let max_tokens = if thinking_enabled {
-            params
+        let max_tokens = match (thinking_value.as_ref(), thinking_budget_floor) {
+            (Some(_), Some(budget)) => {
+                let floor = budget
+                    .saturating_add(4096)
+                    .max(MIN_MAX_TOKENS_WITH_THINKING);
+                params.max_tokens.unwrap_or(floor).max(floor)
+            }
+            (Some(_), None) => params
                 .max_tokens
-                .unwrap_or(min_max_tokens_with_thinking.max(MIN_MAX_TOKENS_WITH_THINKING))
-                .max(min_max_tokens_with_thinking.max(MIN_MAX_TOKENS_WITH_THINKING))
-        } else {
-            params.max_tokens.unwrap_or(4096)
+                .unwrap_or(MIN_MAX_TOKENS_WITH_THINKING)
+                .max(MIN_MAX_TOKENS_WITH_THINKING),
+            (None, _) => params.max_tokens.unwrap_or(4096),
         };
 
         let mut body = json!({
@@ -96,11 +103,8 @@ impl ProviderAdapter for AnthropicMessagesAdapter {
             body["system"] = build_system_field(&system_text);
         }
 
-        if thinking_enabled {
-            body["thinking"] = json!({
-                "type": "enabled",
-                "budget_tokens": budget_tokens,
-            });
+        if let Some(thinking) = thinking_value {
+            body["thinking"] = thinking;
             // Anthropic 约束：thinking 启用时 temperature 必须 = 1。
             body["temperature"] = json!(1);
         } else if let Some(temperature) = params.temperature {
@@ -120,7 +124,10 @@ impl ProviderAdapter for AnthropicMessagesAdapter {
             body["stream"] = json!(stream);
         }
 
-        let extra_headers = vec![("anthropic-version".to_string(), "2023-06-01".to_string())];
+        let mut extra_headers = vec![("anthropic-version".to_string(), "2023-06-01".to_string())];
+        for (name, value) in capability.beta_headers {
+            extra_headers.push((name.to_string(), value.to_string()));
+        }
 
         Ok(AdaptedRequest {
             url_path: "/v1/messages".to_string(),
@@ -204,6 +211,57 @@ impl ProviderAdapter for AnthropicMessagesAdapter {
     }
 }
 
+/// 根据能力表 `thinking_kind` 字段构造 Anthropic `thinking` JSON 载荷。
+///
+/// - `None`：模型不支持 thinking，返回 `None`，主体不写 `thinking` 字段；
+/// - `BudgetTokens`（3.7 / 4.x legacy）：写 `{ type:"enabled", budget_tokens }`，
+///   优先用调用方 `reasoning_effort` 映射的预算，否则用能力表 default，再否则用全局 fallback；
+/// - `Effort`（4.7+ Adaptive Thinking only mode）：写 `{ type:"enabled", effort:"low|medium|high|xhigh" }`，
+///   未配置时默认 `medium`，并尊重 `supports_thinking_display` 追加 `display:"summarized"`；
+/// - `Adaptive`：写 `{ type:"adaptive" }`，模型自行决定预算，可带 `display`。
+fn build_thinking_value(
+    kind: ThinkingKind,
+    supports_display: bool,
+    default_budget: u32,
+    configured_effort: Option<ReasoningEffort>,
+) -> Option<Value> {
+    let attach_display = |mut value: Value| -> Value {
+        if supports_display {
+            value["display"] = json!("summarized");
+        }
+        value
+    };
+
+    match kind {
+        ThinkingKind::None => None,
+        ThinkingKind::BudgetTokens => {
+            let budget = configured_effort
+                .map(reasoning_effort_budget_tokens)
+                .unwrap_or_else(|| {
+                    if default_budget > 0 {
+                        default_budget
+                    } else {
+                        FALLBACK_THINKING_BUDGET_TOKENS
+                    }
+                });
+            Some(attach_display(json!({
+                "type": "enabled",
+                "budget_tokens": budget,
+            })))
+        }
+        ThinkingKind::Effort => {
+            let label = configured_effort
+                .map(reasoning_effort_label)
+                .unwrap_or("medium");
+            Some(attach_display(json!({
+                "type": "enabled",
+                "effort": label,
+            })))
+        }
+        ThinkingKind::Adaptive => Some(attach_display(json!({ "type": "adaptive" }))),
+    }
+}
+
 fn truncate(s: &str, max: usize) -> String {
     let trimmed = s.trim();
     if trimmed.len() <= max {
@@ -251,6 +309,24 @@ fn build_system_field(system_text: &str) -> Value {
 mod tests {
     use super::*;
     use crate::cache_boundary::PROMPT_CACHE_BOUNDARY;
+    use crate::llm_types::{LlmMessage, LlmMessageContent, LlmMessageParams};
+
+    fn base_params(messages: Vec<LlmMessage>) -> LlmMessageParams {
+        LlmMessageParams {
+            messages,
+            max_tokens: None,
+            temperature: None,
+            tools: None,
+            stream: None,
+            system_prompt: None,
+            tool_choice: None,
+            timeout_ms: None,
+            stream_idle_timeout_ms: None,
+            stream_hard_timeout_ms: None,
+            retry_policy: None,
+            reasoning_effort: None,
+        }
+    }
 
     #[test]
     fn build_system_field_returns_plain_string_without_boundary() {
@@ -269,13 +345,11 @@ mod tests {
         assert_eq!(arr[0]["cache_control"]["type"], "ephemeral");
         assert_eq!(arr[1]["type"], "text");
         assert_eq!(arr[1]["text"], "DYNAMIC SUFFIX");
-        // dynamic block 不应携带 cache_control（避免 breakpoint 浪费）
         assert!(arr[1].get("cache_control").is_none());
     }
 
     #[test]
     fn build_system_field_degenerates_when_static_part_empty() {
-        // boundary 出现在最前——不值得设 cache breakpoint，回退单 string
         let text = format!("{}DYNAMIC ONLY", PROMPT_CACHE_BOUNDARY);
         let value = build_system_field(&text);
         assert_eq!(value, json!("DYNAMIC ONLY"));
@@ -283,9 +357,84 @@ mod tests {
 
     #[test]
     fn build_system_field_degenerates_when_dynamic_part_empty() {
-        // boundary 出现在最后——同样退化
         let text = format!("STATIC ONLY{}", PROMPT_CACHE_BOUNDARY);
         let value = build_system_field(&text);
         assert_eq!(value, json!("STATIC ONLY"));
+    }
+
+    #[test]
+    fn opus_4_7_emits_effort_thinking_with_display_and_beta_header() {
+        let mut params = base_params(vec![LlmMessage {
+            role: "user".to_string(),
+            content: LlmMessageContent::Text("hi".to_string()),
+        }]);
+        params.reasoning_effort = Some(ReasoningEffort::Xhigh);
+        let adapted = AnthropicMessagesAdapter
+            .build_request(&params, "claude-opus-4-7-20260520")
+            .expect("build");
+        assert_eq!(adapted.body["thinking"]["type"], "enabled");
+        assert_eq!(adapted.body["thinking"]["effort"], "xhigh");
+        assert_eq!(adapted.body["thinking"]["display"], "summarized");
+        assert!(adapted.body["thinking"].get("budget_tokens").is_none());
+        assert_eq!(adapted.body["temperature"], 1);
+        assert!(
+            adapted
+                .extra_headers
+                .iter()
+                .any(|(n, v)| { n == "anthropic-beta" && v == "task-budgets-2026-03-13" })
+        );
+    }
+
+    #[test]
+    fn opus_4_7_default_effort_is_medium() {
+        let params = base_params(vec![LlmMessage {
+            role: "user".to_string(),
+            content: LlmMessageContent::Text("hi".to_string()),
+        }]);
+        let adapted = AnthropicMessagesAdapter
+            .build_request(&params, "claude-opus-4-7-20260520")
+            .expect("build");
+        assert_eq!(adapted.body["thinking"]["effort"], "medium");
+    }
+
+    #[test]
+    fn legacy_claude_uses_budget_tokens_from_effort() {
+        let mut params = base_params(vec![LlmMessage {
+            role: "user".to_string(),
+            content: LlmMessageContent::Text("hi".to_string()),
+        }]);
+        params.reasoning_effort = Some(ReasoningEffort::High);
+        let adapted = AnthropicMessagesAdapter
+            .build_request(&params, "claude-opus-4-5-20250930")
+            .expect("build");
+        assert_eq!(adapted.body["thinking"]["type"], "enabled");
+        assert_eq!(adapted.body["thinking"]["budget_tokens"], 16384);
+        assert!(adapted.body["thinking"].get("effort").is_none());
+        assert!(adapted.body["thinking"].get("display").is_none());
+        let max_tokens = adapted.body["max_tokens"].as_u64().expect("max_tokens");
+        assert!(max_tokens > 16384);
+        // legacy 模型不带 beta header
+        assert!(
+            !adapted
+                .extra_headers
+                .iter()
+                .any(|(n, _)| n == "anthropic-beta")
+        );
+    }
+
+    #[test]
+    fn unknown_model_omits_thinking_even_with_configured_effort() {
+        let mut params = base_params(vec![LlmMessage {
+            role: "user".to_string(),
+            content: LlmMessageContent::Text("hi".to_string()),
+        }]);
+        params.reasoning_effort = Some(ReasoningEffort::High);
+        let adapted = AnthropicMessagesAdapter
+            .build_request(&params, "unknown-claude-variant")
+            .expect("build");
+        assert!(
+            adapted.body.get("thinking").is_none(),
+            "未知模型不得注入 thinking 字段"
+        );
     }
 }

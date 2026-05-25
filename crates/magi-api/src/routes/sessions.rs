@@ -9,6 +9,7 @@ use magi_bridge_client::{
 };
 use magi_conversation_runtime::session_turn_execution::SessionTurnExecutionRequest;
 use magi_conversation_runtime::session_writeback::publish_current_session_turn_item_event;
+use magi_conversation_runtime::task_execution_dispatcher::{RoleTarget, resolve_target_for_role};
 use magi_conversation_runtime::{
     MailboxAuthor, MailboxKind, RuntimeSignal, task_execution_registry::TaskExecutionPlan,
 };
@@ -386,7 +387,13 @@ fn decide_session_turn_with_task_planner(
     state: &ApiState,
     request: &SessionTurnRequestDto,
 ) -> Result<SessionTurnIntentDecision, ApiError> {
-    let client = state.model_bridge_client().cloned().ok_or_else(|| {
+    let client = resolve_target_for_role(
+        Some(&state.settings_store),
+        state.model_bridge_client().cloned(),
+        RoleTarget::Orchestrator,
+    )
+    .map_err(|error| ApiError::InvalidInput(format!("Session Turn 分类器模型配置不可用: {error}")))?
+    .ok_or_else(|| {
         ApiError::InvalidInput("Session Turn 分类器未配置任务规划模型客户端".to_string())
     })?;
     let has_recoverable_chain = request

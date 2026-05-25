@@ -59,13 +59,16 @@ export interface ModelEngine {
 // AgentBinding（用户配置，极轻量）
 // ============================================================================
 
-export type AgentModelSource = 'orchestrator' | 'engine';
-
 export interface AgentBinding {
   templateId: string;
-  modelSource: AgentModelSource;
+  /**
+   * 「继承编排模型 vs 显式绑定 engine」的唯一字段：
+   * - 空串：继承 orchestrator 当前模型
+   * - 非空：显式绑定到指定 engine
+   *
+   * 不再保留 `modelSource` 二次枚举——单一事实源避免双轨编码同一比特。
+   */
   engineId: string;
-  enabled: boolean;
   bindingRevision: number;
   order: number;
   uiOverrides?: {

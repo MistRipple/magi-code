@@ -219,57 +219,107 @@ pub struct LlmTaskDispatcher {
     mission_metrics_registry: Arc<MissionMetricsRegistry>,
 }
 
-/// 业务派发模型客户端的统一入口。
+/// 业务派发模型客户端解析的角色目标。
 ///
-/// 单一事实源：优先读 settings.json 的 `orchestrator` 段（前端「主对话/编排模型」
-/// 表单写入位置，携带 `reasoningEffort` 字段）。该段未配置（缺 base_url）时退回
-/// daemon 启动期注入的 `default_client`（基于 `MAGI_OPENAI_COMPAT_*` env 的兜底实现），
-/// 保证开发/测试场景下无需 UI 也能连得通。
+/// 三类目标对应 settings.json 中三段独立配置：
+/// - [`RoleTarget::Orchestrator`]：`orchestrator` 段——业务主对话的权威入口，
+///   携带 `reasoningEffort` 等全套字段。未配置时回退到 daemon bootstrap 注入的
+///   `default_client`（`MAGI_OPENAI_COMPAT_*` env 兜底）。
+/// - [`RoleTarget::Auxiliary`]：`auxiliary` 段——会话标题精修、知识抽取、会话记忆、
+///   Prompt 增强等"低价值/低延迟敏感"任务。未配置时返回 `None`，调用方静默跳过。
+/// - [`RoleTarget::Agent`]：子代理角色，按 `agents[*]` 段查 `engineId` 绑定，
+///   再从 `engines[*]` 段取 llm 配置。未绑定 engine（继承 orchestrator 模式）时
+///   返回 `None`，调用方应回退到 orchestrator。
+///   `wrap_with_orchestrator_failover = true` 时，primary 调用失败将自动降级到
+///   orchestrator client（保证子代理在 agent 模型故障时仍可继续）。
+#[derive(Clone, Copy, Debug)]
+pub enum RoleTarget<'a> {
+    Orchestrator,
+    Auxiliary,
+    Agent {
+        role_id: &'a str,
+        wrap_with_orchestrator_failover: bool,
+    },
+}
+
+/// 角色模型客户端解析的**单一入口**。
 ///
-/// 历史上这里读的是 `auxiliary` 段，但 auxiliary 表单没有 `reasoningEffort`
-/// 字段，导致用户在 UI 上设置「思考强度」永远不会被业务模型读到。auxiliary
-/// 段现在只服务于会话标题精修、知识抽取等辅助任务，由 [`build_auxiliary_model_client`]
-/// 独立消费。
-pub fn resolve_configured_model_client(
+/// 三段配置（orchestrator / auxiliary / agents+engines）的读取、归一化、HTTP client
+/// 构造、必要时的 Failover 包装全部收敛到此函数；调用方按 [`RoleTarget`] 表达意图，
+/// 不再各自重复"读 settings → normalize → build client"的样板。
+///
+/// 返回 `Result<Option<Arc<dyn ModelBridgeClient>>, String>`：
+/// - `Ok(Some(client))`：成功解析出 client；
+/// - `Ok(None)`：目标未配置（按 target 含义视作正常的"跳过"或"继承"信号）；
+/// - `Err(msg)`：仅 Agent 路径下 engine 绑定存在但配置非法时返回，调用方应失败。
+pub fn resolve_target_for_role(
     settings_store: Option<&Arc<SettingsStore>>,
     default_client: Option<Arc<dyn ModelBridgeClient>>,
-) -> Option<Arc<dyn ModelBridgeClient>> {
-    if let Some(store) = settings_store {
-        if let Some(client) = build_orchestrator_model_client(store) {
-            return Some(client);
+    target: RoleTarget<'_>,
+) -> Result<Option<Arc<dyn ModelBridgeClient>>, String> {
+    match target {
+        RoleTarget::Orchestrator => {
+            if let Some(store) = settings_store
+                && let Some(client) = build_client_from_section(store, "orchestrator")
+            {
+                return Ok(Some(client));
+            }
+            Ok(default_client)
+        }
+        RoleTarget::Auxiliary => {
+            let Some(store) = settings_store else {
+                return Ok(None);
+            };
+            Ok(build_client_from_section(store, "auxiliary"))
+        }
+        RoleTarget::Agent {
+            role_id,
+            wrap_with_orchestrator_failover,
+        } => {
+            let Some(store) = settings_store else {
+                return Ok(None);
+            };
+            let Some(role_model) = configured_role_engine_model_config(store, role_id)? else {
+                return Ok(None);
+            };
+            let primary = role_model
+                .config
+                .to_http_model_client("gpt-4")
+                .ok_or_else(|| {
+                    format!(
+                        "角色 {} 的模型引擎 {} 缺少可用 HTTP 模型配置",
+                        role_model.template_id, role_model.engine_id
+                    )
+                })?;
+            let primary = Arc::new(primary) as Arc<dyn ModelBridgeClient>;
+            if !wrap_with_orchestrator_failover {
+                return Ok(Some(primary));
+            }
+            // wrap_with_orchestrator_failover：递归取 orchestrator client 作 fallback。
+            // 这里复用 RoleTarget::Orchestrator 分支，保证 fallback 解析口径与主路径完全一致。
+            let fallback =
+                resolve_target_for_role(settings_store, default_client, RoleTarget::Orchestrator)?;
+            let Some(fallback) = fallback else {
+                return Ok(Some(primary));
+            };
+            Ok(Some(Arc::new(FailoverModelBridgeClient::new(
+                primary,
+                fallback,
+                role_model.template_id,
+                role_model.engine_id,
+            )) as Arc<dyn ModelBridgeClient>))
         }
     }
-    default_client
 }
 
-/// 按 `orchestrator` 配置段构造业务模型客户端。
+/// 内部 helper：从 settings 指定段（"orchestrator" / "auxiliary"）读取并构造 client。
 ///
-/// `orchestrator` 段对应前端「主对话/编排模型」表单（[`InteractiveModelFormConfig`]），
-/// 包含 `baseUrl` / `apiKey` / `model` / `urlMode` / `reasoningEffort` 全套字段，
-/// 是业务派发的唯一权威入口。未配置（缺 base_url 或缺 api_key）时返回 `None`，
-/// 调用方据此回退到 daemon 默认 client。
-pub fn build_orchestrator_model_client(
+/// 未配置（缺 base_url）时返回 `None`，与既有"段未配置 → 静默跳过/回退"语义一致。
+fn build_client_from_section(
     settings_store: &Arc<SettingsStore>,
+    section: &str,
 ) -> Option<Arc<dyn ModelBridgeClient>> {
-    let config = settings_store.get_section("orchestrator");
-    let normalized = NormalizedModelConfig::from_settings_value(&config, "openai");
-    normalized
-        .to_http_model_client("gpt-4")
-        .map(|client| Arc::new(client) as Arc<dyn ModelBridgeClient>)
-}
-
-/// 按 `auxiliary` 配置段构造辅助模型客户端。
-///
-/// `auxiliary` 段只服务于会话标题精修、知识抽取、会话记忆、Prompt 增强等
-/// "低价值/低延迟敏感"任务；它不参与业务派发的模型选择（业务侧走
-/// [`resolve_configured_model_client`] → [`build_orchestrator_model_client`]）。
-///
-/// 未配置（缺 base_url 或缺 api_key）时返回 `None`，调用方应直接跳过该次辅助调用，
-/// 不做任何兜底（与"辅助模型未配置则静默跳过"的既有语义一致）。
-pub fn build_auxiliary_model_client(
-    settings_store: &Arc<SettingsStore>,
-) -> Option<Arc<dyn ModelBridgeClient>> {
-    let config = settings_store.get_section("auxiliary");
+    let config = settings_store.get_section(section);
     let normalized = NormalizedModelConfig::from_settings_value(&config, "openai");
     normalized
         .to_http_model_client("gpt-4")
@@ -666,10 +716,10 @@ impl LlmTaskDispatcher {
             .join("\n\n");
         let output_text = output_refs.join("\n\n");
         let extraction_text = format!("{timeline_text}\n\n{output_text}");
-        let Some(client) = self
-            .settings_store
-            .as_ref()
-            .and_then(|store| build_auxiliary_model_client(store))
+        let Some(client) =
+            resolve_target_for_role(self.settings_store.as_ref(), None, RoleTarget::Auxiliary)
+                .ok()
+                .flatten()
         else {
             return;
         };
@@ -725,10 +775,10 @@ impl LlmTaskDispatcher {
     /// 辅助模型未配置、调用失败、JSON 解析异常一律静默跳过（`tracing::debug!`），
     /// 不做任何"退回到 marker 写回"之类的兜底 —— 与现有辅助模型路径同语义。
     fn extract_and_persist_session_memory(&self, session_id: &SessionId) {
-        let Some(client) = self
-            .settings_store
-            .as_ref()
-            .and_then(|store| build_auxiliary_model_client(store))
+        let Some(client) =
+            resolve_target_for_role(self.settings_store.as_ref(), None, RoleTarget::Auxiliary)
+                .ok()
+                .flatten()
         else {
             return;
         };
@@ -1115,54 +1165,41 @@ impl LlmTaskDispatcher {
         }
     }
 
-    fn resolve_orchestrator_model_client(&self) -> Option<Arc<dyn ModelBridgeClient>> {
-        resolve_configured_model_client(
-            self.settings_store.as_ref(),
-            self.model_bridge_client.clone(),
-        )
-    }
-
     fn resolve_model_client_for_task(
         &self,
         task: Option<&magi_core::Task>,
         execution_role_id: Option<&str>,
     ) -> Result<Arc<dyn ModelBridgeClient>, String> {
-        let orchestrator_client = self.resolve_orchestrator_model_client();
         let role_id = execution_role_id
             .map(str::trim)
             .filter(|role| !role.is_empty())
             .or_else(|| task.and_then(|task| task_role_id(Some(task))));
-        if let (Some(store), Some(role_id)) = (self.settings_store.as_ref(), role_id) {
-            match configured_role_engine_model_config(store, role_id) {
-                Ok(Some(role_model)) => {
-                    let client =
-                        role_model
-                            .config
-                            .to_http_model_client("gpt-4")
-                            .ok_or_else(|| {
-                                format!(
-                                    "角色 {} 的模型引擎 {} 缺少可用 HTTP 模型配置",
-                                    role_model.template_id, role_model.engine_id
-                                )
-                            })?;
-                    let primary = Arc::new(client) as Arc<dyn ModelBridgeClient>;
-                    if task.and_then(|task| task.parent_task_id.as_ref()).is_some()
-                        && let Some(fallback) = orchestrator_client.clone()
-                    {
-                        return Ok(Arc::new(FailoverModelBridgeClient::new(
-                            primary,
-                            fallback,
-                            role_model.template_id,
-                            role_model.engine_id,
-                        )) as Arc<dyn ModelBridgeClient>);
-                    }
-                    return Ok(primary);
-                }
-                Ok(None) => {}
-                Err(error) => return Err(error),
+
+        // 有 role_id 时走 RoleTarget::Agent，让 resolve_target_for_role 统一处理:
+        //   - 角色未配置 engineId → Ok(None) → 降级到 orchestrator
+        //   - 角色已配置且本任务有父任务 → 自动用 FailoverModelBridgeClient 包 orchestrator
+        // 无 role_id（顶层会话调用）或角色未配置 → 直接走 orchestrator。
+        if let Some(role_id) = role_id {
+            let wrap_with_orchestrator_failover =
+                task.and_then(|task| task.parent_task_id.as_ref()).is_some();
+            if let Some(client) = resolve_target_for_role(
+                self.settings_store.as_ref(),
+                self.model_bridge_client.clone(),
+                RoleTarget::Agent {
+                    role_id,
+                    wrap_with_orchestrator_failover,
+                },
+            )? {
+                return Ok(client);
             }
         }
-        orchestrator_client.ok_or_else(|| "model bridge client 未配置".to_string())
+
+        resolve_target_for_role(
+            self.settings_store.as_ref(),
+            self.model_bridge_client.clone(),
+            RoleTarget::Orchestrator,
+        )?
+        .ok_or_else(|| "model bridge client 未配置".to_string())
     }
 
     fn apply_skill_prompt_injections(
@@ -1644,7 +1681,7 @@ fn parse_learning_candidates(raw: &str) -> Option<Vec<LearningCandidate>> {
 ///
 /// 调用约定与 `extract_learnings_via_auxiliary` 一致：失败 / `ok=false` /
 /// JSON 解析异常一律 `tracing::debug!` 后返回 `None`。调用方需先确保辅助模型
-/// 已配置（外层使用 `build_auxiliary_model_client` 短路）。
+/// 已配置（外层使用 `resolve_target_for_role(.., RoleTarget::Auxiliary)` 短路）。
 fn extract_session_memory_via_auxiliary(
     client: Arc<dyn ModelBridgeClient>,
     text: &str,
@@ -1964,10 +2001,11 @@ mod tests {
     }
 
     /// 回归测试：用户在前端「主对话/编排模型」面板设置 reasoningEffort 后，
-    /// resolve_configured_model_client 必须返回 orchestrator 段构造的 client，
-    /// 而不是默默退回 default_client（旧 bug：读 auxiliary 段，导致 reasoningEffort 丢失）。
+    /// `resolve_target_for_role(.., RoleTarget::Orchestrator)` 必须返回 orchestrator 段
+    /// 构造的 client，而不是默默退回 default_client（旧 bug：读 auxiliary 段，导致
+    /// reasoningEffort 丢失）。
     #[test]
-    fn resolve_configured_model_client_reads_orchestrator_segment() {
+    fn resolve_target_for_role_orchestrator_reads_orchestrator_segment() {
         use crate::settings_store::SettingsStore;
 
         let store = Arc::new(SettingsStore::new());
@@ -1982,17 +2020,18 @@ mod tests {
             }),
         );
 
-        let resolved = resolve_configured_model_client(Some(&store), None);
+        let resolved = resolve_target_for_role(Some(&store), None, RoleTarget::Orchestrator)
+            .expect("orchestrator 段构造不应失败");
         assert!(
             resolved.is_some(),
             "orchestrator 段已配置时必须返回业务模型 client"
         );
     }
 
-    /// 回归测试：orchestrator 段未配置时，resolve 应该如实回退到 default_client，
-    /// 不应该误读 auxiliary 段去补位（两个段语义完全不同）。
+    /// 回归测试：orchestrator 段未配置时，resolve 应该如实回退到 default_client；
+    /// 即便 auxiliary 段有配置，也绝不能被误读补位（两个段语义完全不同）。
     #[test]
-    fn resolve_configured_model_client_falls_back_when_orchestrator_unset() {
+    fn resolve_target_for_role_orchestrator_falls_back_when_unset() {
         use crate::settings_store::SettingsStore;
 
         let store = Arc::new(SettingsStore::new());
@@ -2007,7 +2046,8 @@ mod tests {
             }),
         );
 
-        let resolved = resolve_configured_model_client(Some(&store), None);
+        let resolved = resolve_target_for_role(Some(&store), None, RoleTarget::Orchestrator)
+            .expect("orchestrator 段解析不应失败");
         assert!(
             resolved.is_none(),
             "orchestrator 段未配置 + 无 default_client 时应返回 None，\
@@ -2016,9 +2056,9 @@ mod tests {
     }
 
     /// 回归测试：auxiliary 段独立可用，serve 辅助任务（会话标题精修 / 知识抽取 / 等等）。
-    /// 与业务派发路径解耦。
+    /// 与业务派发路径解耦——auxiliary 段配置不应被 Orchestrator 分支看到。
     #[test]
-    fn build_auxiliary_model_client_reads_auxiliary_segment() {
+    fn resolve_target_for_role_auxiliary_reads_auxiliary_segment() {
         use crate::settings_store::SettingsStore;
 
         let store = Arc::new(SettingsStore::new());
@@ -2032,9 +2072,17 @@ mod tests {
             }),
         );
 
-        assert!(build_auxiliary_model_client(&store).is_some());
+        let aux = resolve_target_for_role(Some(&store), None, RoleTarget::Auxiliary)
+            .expect("auxiliary 段解析不应失败");
+        assert!(aux.is_some(), "auxiliary 段已配置时必须返回辅助模型 client");
+
         // 业务路径不应该被辅助配置干扰
-        assert!(build_orchestrator_model_client(&store).is_none());
+        let orch = resolve_target_for_role(Some(&store), None, RoleTarget::Orchestrator)
+            .expect("orchestrator 段解析不应失败");
+        assert!(
+            orch.is_none(),
+            "orchestrator 未配置且无 default 时必须返回 None"
+        );
     }
 }
 

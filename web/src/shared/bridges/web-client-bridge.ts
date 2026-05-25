@@ -1788,9 +1788,8 @@ async function dispatchRegistryAgents(): Promise<void> {
     for (const t of templates) {
       templateMap.set(t.templateId, t as unknown as Record<string, unknown>);
     }
-    // 只发送 enabled 的 agent，保持“默认可调度角色目录”的完整性。
+    // 内置角色全部默认参与调度，无需 enabled 过滤。
     const enabledAgents = agents
-      .filter((a) => a.enabled !== false)
       .map((a) => {
         const tmpl = templateMap.get(a.templateId as string);
         const defaultUI = (tmpl?.defaultUI ?? {}) as Record<string, unknown>;
@@ -1799,7 +1798,6 @@ async function dispatchRegistryAgents(): Promise<void> {
           displayName: (tmpl?.displayName as string) || (a.templateId as string),
           displayNameKey: (tmpl?.i18n as Record<string, unknown> | undefined)?.displayNameKey as string | undefined,
           engineId: a.engineId as string,
-          modelSource: a.modelSource === 'engine' ? 'engine' : 'orchestrator',
           order: (a.order as number) || 0,
           colorToken: (defaultUI.colorToken as string) || '',
           icon: (defaultUI.icon as string) || undefined,
@@ -2665,7 +2663,7 @@ async function saveOrchestratorConfig(config: Record<string, unknown>): Promise<
   await saveAgentOrchestratorConfig(config);
   cachedSettingsBootstrap = null;
   await dispatchSettingsBootstrap(true);
-  emitBridgeSuccessToast('保存编排模型配置', '编排模型配置已保存', { displayMode: 'notification_center' });
+  emitBridgeSuccessToast('保存主模型配置', '主模型配置已保存', { displayMode: 'notification_center' });
 }
 
 async function saveAuxiliaryConfig(config: Record<string, unknown>): Promise<void> {
@@ -2691,7 +2689,7 @@ async function testWorkerConnection(worker: string, config: Record<string, unkno
 async function testOrchestratorConnection(config: Record<string, unknown>): Promise<void> {
   const payload = await testAgentOrchestratorConnection(config);
   emitDataMessage('orchestratorConnectionTestResult', payload);
-  emitBridgeSuccessToast('测试编排模型连接', '编排模型连接测试已完成', { displayMode: 'notification_center' });
+  emitBridgeSuccessToast('测试主模型连接', '主模型连接测试已完成', { displayMode: 'notification_center' });
 }
 
 async function testAuxiliaryConnection(config: Record<string, unknown>): Promise<void> {
@@ -2925,7 +2923,7 @@ export function createWebClientBridge(): ClientBridge {
         case 'saveOrchestratorConfig':
           if (message.config && typeof message.config === 'object') {
             void saveOrchestratorConfig(message.config as Record<string, unknown>).catch((error) => {
-              logBridgeOperationFailure('保存编排模型配置', '[web-client-bridge] 保存编排模型配置失败:', error);
+              logBridgeOperationFailure('保存主模型配置', '[web-client-bridge] 保存主模型配置失败:', error);
             });
           }
           return;
@@ -2953,7 +2951,7 @@ export function createWebClientBridge(): ClientBridge {
         case 'testOrchestratorConnection':
           if (message.config && typeof message.config === 'object') {
             void testOrchestratorConnection(message.config as Record<string, unknown>).catch((error) => {
-              logBridgeOperationFailure('测试编排模型连接', '[web-client-bridge] 测试编排模型连接失败:', error);
+              logBridgeOperationFailure('测试主模型连接', '[web-client-bridge] 测试主模型连接失败:', error);
             });
           }
           return;

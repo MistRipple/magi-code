@@ -287,25 +287,14 @@ fn role_engine_binding(
         if template_id != role_id {
             continue;
         }
+        // `engineId` 空串 = 继承编排模型（resolve_target_for_role 在 Agent 分支返回 None 后
+        // 上层会显式回退到 Orchestrator）；非空 = 显式绑定到某个 engine。
+        // 该字段是「继承 vs 显式」的唯一事实源，不再保留 modelSource 二次枚举。
         let engine_id = string_field(raw, "engineId").unwrap_or_default();
-        let model_source = string_field(raw, "modelSource").unwrap_or_else(|| {
-            if engine_id.is_empty() {
-                "orchestrator".to_string()
-            } else {
-                "engine".to_string()
-            }
-        });
-        let enabled = raw.get("enabled").and_then(Value::as_bool).unwrap_or(true);
-        if model_source != "engine" {
+        if engine_id.is_empty() {
             return None;
         }
-        if engine_id.is_empty() {
-            return Some(RoleEngineBinding {
-                engine_id,
-                binding_revision: binding_revision(raw),
-                enabled,
-            });
-        }
+        let enabled = raw.get("enabled").and_then(Value::as_bool).unwrap_or(true);
         return Some(RoleEngineBinding {
             engine_id,
             binding_revision: binding_revision(raw),
@@ -599,7 +588,6 @@ mod tests {
             "agents",
             json!([{
                 "templateId": "reviewer",
-                "modelSource": "engine",
                 "engineId": "sonnet-4-5",
                 "bindingRevision": 7,
                 "enabled": true
@@ -640,7 +628,6 @@ mod tests {
             "agents",
             json!([{
                 "templateId": "executor",
-                "modelSource": "orchestrator",
                 "engineId": "",
                 "enabled": true
             }]),

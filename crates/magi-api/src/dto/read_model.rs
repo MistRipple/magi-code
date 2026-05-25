@@ -10,6 +10,7 @@ use magi_mission_metrics::MissionMetrics;
 use magi_orchestrator::task_store::TaskStore;
 use magi_session_store::{SessionExecutionSidecarStatus, SessionRuntimeSidecarExport};
 use magi_workspace::{RecoveryStatus, WorkspaceRecoverySidecarExport};
+use std::collections::HashMap;
 
 /// Mission §1.4 聚合根派生属性的快照,用于从 `AppState` 收集后注入读模型 DTO。
 ///
@@ -38,6 +39,7 @@ pub fn runtime_read_model_dto(
     merge_session_sidecars(&mut runtime_read_model, session_sidecar_exports, task_store);
     merge_workspace_sidecars(&mut runtime_read_model, workspace_sidecar_exports);
     merge_mission_aggregates(&mut runtime_read_model, mission_aggregate_exports);
+    prune_terminal_runtime_live_ids(&mut runtime_read_model);
     runtime_read_model.meta.ledger = audit_usage_ledger;
     runtime_read_model
 }
@@ -317,6 +319,74 @@ fn clear_session_runtime_live_ids(entry: &mut SessionRuntimeSummaryEntry) {
     entry.active_task_ids.clear();
     entry.has_recoverable_chain = false;
     entry.recoverable_branch_count = 0;
+}
+
+fn runtime_status_is_terminal(status: Option<&str>) -> bool {
+    matches!(
+        status,
+        Some("completed" | "failed" | "killed" | "cancelled" | "canceled")
+    )
+}
+
+fn keep_runtime_live_id(id: &str, status_by_id: &HashMap<String, String>) -> bool {
+    !runtime_status_is_terminal(status_by_id.get(id).map(String::as_str))
+}
+
+fn prune_terminal_runtime_live_ids(runtime_read_model: &mut RuntimeReadModelInput) {
+    let task_status_by_id = runtime_read_model
+        .details
+        .tasks
+        .iter()
+        .filter_map(|task| {
+            task.current_status
+                .as_ref()
+                .map(|status| (task.task_id.clone(), status.clone()))
+        })
+        .collect::<HashMap<_, _>>();
+    let group_status_by_id = runtime_read_model
+        .details
+        .execution_groups
+        .iter()
+        .filter_map(|group| {
+            group
+                .current_status
+                .as_ref()
+                .map(|status| (group.mission_id.clone(), status.clone()))
+        })
+        .collect::<HashMap<_, _>>();
+
+    runtime_read_model
+        .overview
+        .activity
+        .active_task_ids
+        .retain(|task_id| keep_runtime_live_id(task_id, &task_status_by_id));
+    runtime_read_model
+        .overview
+        .activity
+        .active_execution_group_ids
+        .retain(|mission_id| keep_runtime_live_id(mission_id, &group_status_by_id));
+
+    for entry in &mut runtime_read_model.details.sessions {
+        entry
+            .active_task_ids
+            .retain(|task_id| keep_runtime_live_id(task_id, &task_status_by_id));
+        entry
+            .active_execution_group_ids
+            .retain(|mission_id| keep_runtime_live_id(mission_id, &group_status_by_id));
+    }
+    for entry in &mut runtime_read_model.details.workspaces {
+        entry
+            .active_task_ids
+            .retain(|task_id| keep_runtime_live_id(task_id, &task_status_by_id));
+        entry
+            .active_execution_group_ids
+            .retain(|mission_id| keep_runtime_live_id(mission_id, &group_status_by_id));
+    }
+    for entry in &mut runtime_read_model.details.execution_groups {
+        entry
+            .active_task_ids
+            .retain(|task_id| keep_runtime_live_id(task_id, &task_status_by_id));
+    }
 }
 
 fn session_sidecar_is_runtime_active(export: &SessionRuntimeSidecarExport) -> bool {
@@ -1054,6 +1124,152 @@ mod tests {
         assert!(session.has_recoverable_chain);
         assert_eq!(session.recoverable_branch_count, 1);
         assert_eq!(session.active_branches.len(), 5);
+    }
+
+    #[test]
+    fn runtime_read_model_keeps_recoverable_terminal_branch_out_of_active_ids() {
+        let task_store = TaskStore::new();
+        let mission_id = magi_core::MissionId::new("mission-terminal-recoverable");
+        let root_task_id = magi_core::TaskId::new("task-root-terminal-recoverable");
+        let failed_child_id = magi_core::TaskId::new("task-child-terminal-recoverable");
+        let now = UtcMillis::now();
+
+        for (task_id, parent_task_id, status) in [
+            (root_task_id.clone(), None, TaskStatus::Completed),
+            (
+                failed_child_id.clone(),
+                Some(root_task_id.clone()),
+                TaskStatus::Failed,
+            ),
+        ] {
+            task_store.insert_task(magi_core::Task {
+                task_id: task_id.clone(),
+                mission_id: mission_id.clone(),
+                root_task_id: root_task_id.clone(),
+                parent_task_id,
+                kind: magi_core::TaskKind::LocalAgent,
+                title: task_id.to_string(),
+                goal: task_id.to_string(),
+                status,
+                dependency_ids: Vec::new(),
+                required_children: Vec::new(),
+                policy_snapshot: None,
+                executor_binding: None,
+                knowledge_refs: Vec::new(),
+                workspace_scope: None,
+                write_scope: None,
+                input_refs: Vec::new(),
+                output_refs: Vec::new(),
+                evidence_refs: Vec::new(),
+                retry_count: 0,
+                runtime_payload: magi_core::TaskRuntimePayload::default(),
+                created_at: now,
+                updated_at: now,
+            });
+        }
+
+        let runtime_read_model = runtime_read_model_dto(
+            RuntimeReadModelInput::default(),
+            &[SessionRuntimeSidecarExport {
+                session_id: SessionId::new("session-terminal-recoverable"),
+                current_status: SessionExecutionSidecarStatus::Bound,
+                last_update: now,
+                ownership: ExecutionOwnership {
+                    session_id: Some(SessionId::new("session-terminal-recoverable")),
+                    mission_id: Some(mission_id.clone()),
+                    task_id: Some(root_task_id.clone()),
+                    execution_chain_ref: Some("chain-terminal-recoverable".to_string()),
+                    ..ExecutionOwnership::default()
+                },
+                execution_chain_ref: Some("chain-terminal-recoverable".to_string()),
+                recovery_ref: None,
+                current_turn: None,
+                active_execution_chain: Some(magi_session_store::ActiveExecutionChain {
+                    session_id: SessionId::new("session-terminal-recoverable"),
+                    mission_id: mission_id.clone(),
+                    root_task_id: root_task_id.clone(),
+                    execution_chain_ref: "chain-terminal-recoverable".to_string(),
+                    workspace_id: None,
+                    active_branch_task_ids: vec![root_task_id.clone(), failed_child_id.clone()],
+                    active_worker_bindings: vec![magi_core::WorkerId::new(
+                        "worker-terminal-recoverable",
+                    )],
+                    recovery_ref: None,
+                    branches: vec![
+                        magi_session_store::ActiveExecutionBranch {
+                            task_id: root_task_id.clone(),
+                            worker_id: magi_core::WorkerId::new("worker-terminal-recoverable"),
+                            stage: "finish".to_string(),
+                            lease_id: None,
+                            execution_intent_ref: None,
+                            binding_lifecycle: None,
+                            checkpoint_stage: None,
+                            next_step_index: None,
+                            checkpoint_at: None,
+                            resume_mode: None,
+                            resume_token: None,
+                            use_tools: true,
+                            skill_name: None,
+                            is_primary: true,
+                            thread_id: ThreadId::new("thread-root-terminal-recoverable"),
+                        },
+                        magi_session_store::ActiveExecutionBranch {
+                            task_id: failed_child_id.clone(),
+                            worker_id: magi_core::WorkerId::new("worker-terminal-recoverable"),
+                            stage: "execute".to_string(),
+                            lease_id: None,
+                            execution_intent_ref: None,
+                            binding_lifecycle: None,
+                            checkpoint_stage: Some("execute".to_string()),
+                            next_step_index: Some(1),
+                            checkpoint_at: Some(now),
+                            resume_mode: Some("stage-restart".to_string()),
+                            resume_token: None,
+                            use_tools: true,
+                            skill_name: None,
+                            is_primary: false,
+                            thread_id: ThreadId::new("thread-child-terminal-recoverable"),
+                        },
+                    ],
+                    dispatch_context: magi_session_store::ActiveExecutionDispatchContext {
+                        accepted_at: now,
+                        entry_id: "timeline-terminal-recoverable".to_string(),
+                        trimmed_text: Some("terminal recoverable".to_string()),
+                        skill_name: None,
+                    },
+                    current_turn: None,
+                }),
+            }],
+            &[],
+            ledger_dto(AuditUsageLedgerStatus::default()),
+            Some(&task_store),
+            &[],
+        );
+
+        let session = runtime_read_model
+            .details
+            .sessions
+            .iter()
+            .find(|entry| entry.session_id == "session-terminal-recoverable")
+            .expect("session summary should exist");
+        assert!(session.has_recoverable_chain);
+        assert_eq!(session.recoverable_branch_count, 1);
+        assert!(session.active_task_ids.is_empty());
+        assert!(session.active_execution_group_ids.is_empty());
+        assert!(
+            runtime_read_model
+                .overview
+                .activity
+                .active_task_ids
+                .is_empty()
+        );
+        assert!(
+            runtime_read_model
+                .overview
+                .activity
+                .active_execution_group_ids
+                .is_empty()
+        );
     }
 
     #[test]

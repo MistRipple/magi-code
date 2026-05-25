@@ -45,6 +45,7 @@ use crate::{
 /// child_id，进而触发 SpawnGraph 的边冲突。配合毫秒时间戳一起拼到 task_id
 /// 末尾，保证同一进程内绝对唯一。
 static AGENT_SPAWN_SEQ: AtomicU64 = AtomicU64::new(0);
+const AGENT_SPAWN_SUMMARY_MAX_CHARS: usize = 1200;
 
 #[allow(clippy::too_many_arguments)]
 pub fn execute_task_tool_call_batch(
@@ -312,7 +313,9 @@ fn execute_coordinator_tool(
                 );
             }
             // display_name 是 LLM 提供的子代理展示名，作为 Task.title 直接面向用户。
-            // 长度限制 5-30 个 Unicode 字符；过短无信息、过长破坏子代理卡片版式。
+            // 长度限制 3-30 个 Unicode 字符：下限 3 既能拒绝『x』『ab』之类的占位符，
+            // 又允许典型 4 字中文短语（如『探索目录』『统计行数』）这一最自然的命名密度；
+            // 上限 30 防止破坏前端子代理卡片版式。
             let display_name = parsed
                 .get("display_name")
                 .and_then(|v| v.as_str())
@@ -331,13 +334,13 @@ fn execute_coordinator_tool(
                     ExecutionResultStatus::Failed,
                 );
             }
-            if !(5..=30).contains(&display_name_chars) {
+            if !(3..=30).contains(&display_name_chars) {
                 return (
                     serde_json::json!({
                         "tool": tool.as_str(),
                         "status": "failed",
                         "error": format!(
-                            "agent_spawn display_name 长度必须在 5-30 个字符之间，实际 {display_name_chars}",
+                            "agent_spawn display_name 长度必须在 3-30 个字符之间，实际 {display_name_chars}",
                         ),
                     })
                     .to_string(),
@@ -486,6 +489,7 @@ fn wait_for_child_terminal_outcome(
         };
         match child.status {
             TaskStatus::Completed => {
+                let summary = compact_child_agent_output(&child.output_refs);
                 return (
                     serde_json::json!({
                         "tool": tool.as_str(),
@@ -493,7 +497,8 @@ fn wait_for_child_terminal_outcome(
                         "child_task_id": child_id.to_string(),
                         "role": role,
                         "title": child.title,
-                        "output_refs": child.output_refs,
+                        "summary": summary,
+                        "output_ref_count": child.output_refs.len(),
                     })
                     .to_string(),
                     ExecutionResultStatus::Succeeded,
@@ -505,6 +510,7 @@ fn wait_for_child_terminal_outcome(
                     .first()
                     .cloned()
                     .unwrap_or_else(|| "子任务执行失败".to_string());
+                let summary = compact_child_agent_output(&child.output_refs);
                 if subagent_unavailable_failure(&error) {
                     return (
                         serde_json::json!({
@@ -515,7 +521,8 @@ fn wait_for_child_terminal_outcome(
                             "child_task_id": child_id.to_string(),
                             "role": role,
                             "title": child.title,
-                            "output_refs": child.output_refs,
+                            "summary": summary,
+                            "output_ref_count": child.output_refs.len(),
                             "error": error,
                             "instruction": "子代理当前不可用。请不要停止任务：优先改派其他可用角色继续；如果没有必要继续派发，则由主线根据已有上下文直接推进并给出最终结果。",
                         })
@@ -530,7 +537,8 @@ fn wait_for_child_terminal_outcome(
                         "child_task_id": child_id.to_string(),
                         "role": role,
                         "title": child.title,
-                        "output_refs": child.output_refs,
+                        "summary": summary,
+                        "output_ref_count": child.output_refs.len(),
                         "error": error,
                     })
                     .to_string(),
@@ -556,6 +564,52 @@ fn wait_for_child_terminal_outcome(
             }
         }
     }
+}
+
+fn compact_child_agent_output(output_refs: &[String]) -> String {
+    let raw = output_refs
+        .iter()
+        .rev()
+        .find_map(|output| child_agent_final_text(output).or_else(|| non_empty_text(output)))
+        .unwrap_or_else(|| "子代理未返回可展示输出".to_string());
+    truncate_for_agent_spawn_summary(&raw)
+}
+
+fn child_agent_final_text(output: &str) -> Option<String> {
+    let parsed = serde_json::from_str::<serde_json::Value>(output).ok()?;
+    let blocks = parsed.get("blocks")?.as_array()?;
+    blocks.iter().rev().find_map(|block| {
+        let block_type = block.get("type").and_then(|value| value.as_str())?;
+        if block_type != "text" {
+            return None;
+        }
+        block
+            .get("content")
+            .and_then(|value| value.as_str())
+            .and_then(non_empty_text)
+    })
+}
+
+fn non_empty_text(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn truncate_for_agent_spawn_summary(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.chars().count() <= AGENT_SPAWN_SUMMARY_MAX_CHARS {
+        return trimmed.to_string();
+    }
+    let mut output = trimmed
+        .chars()
+        .take(AGENT_SPAWN_SUMMARY_MAX_CHARS)
+        .collect::<String>();
+    output.push('…');
+    output
 }
 
 fn subagent_unavailable_failure(error: &str) -> bool {

@@ -448,7 +448,8 @@ impl DaemonRuntime {
 
         // 业务模型桥用于会话正文生成和任务执行；任务规划/分类另走本地 loopback-model。
         //
-        // 单一事实源（按优先级，由 task_execution_dispatcher::resolve_configured_model_client 串联）：
+        // 单一事实源（按优先级，由 task_execution_dispatcher::resolve_target_for_role
+        // 的 RoleTarget::Orchestrator 分支串联）：
         //   1. 测试场景 model_bridge_override 注入的 stub
         //   2. settings.json 的 `orchestrator` 段（前端「主对话/编排模型」表单写入位置，
         //      携带 reasoningEffort / urlMode 全套字段，是业务模型的权威入口）
@@ -457,7 +458,7 @@ impl DaemonRuntime {
         //      用于开发/测试不带 UI 也能跑通的场景。
         //
         // settings.json 的 `auxiliary` 段不参与业务派发，只服务于会话标题、知识抽取、
-        // 会话记忆、Prompt 增强等辅助任务（task_execution_dispatcher::build_auxiliary_model_client）。
+        // 会话记忆、Prompt 增强等辅助任务（通过 RoleTarget::Auxiliary 分支独立解析）。
         let direct_http_probe_result = if model_bridge_override.is_some() {
             None
         } else {

@@ -2417,7 +2417,7 @@ mod tests {
     }
 
     #[test]
-    fn task_turn_visibility_does_not_promote_primary_role_to_worker_lane() {
+    fn task_turn_visibility_keeps_primary_role_on_mainline_without_sidechain_worker() {
         let task = make_task_loop_test_task("task-primary-role-only");
         let thread_id = ThreadId::new("thread-primary-role-only");
 

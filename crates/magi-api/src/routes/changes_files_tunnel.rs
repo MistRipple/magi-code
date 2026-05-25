@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use magi_bridge_client::ModelInvocationRequest;
 use magi_conversation_runtime::session_turn_execution::BUSINESS_MODEL_PROVIDER;
-use magi_conversation_runtime::task_execution_dispatcher::build_auxiliary_model_client;
+use magi_conversation_runtime::task_execution_dispatcher::{RoleTarget, resolve_target_for_role};
 use magi_core::SessionId;
 use magi_snapshot::SnapshotSession;
 
@@ -573,7 +573,11 @@ async fn enhance_prompt(
     State(state): State<ApiState>,
     Json(request): Json<EnhancePromptRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let Some(client) = build_auxiliary_model_client(&state.settings_store) else {
+    let Some(client) =
+        resolve_target_for_role(Some(&state.settings_store), None, RoleTarget::Auxiliary)
+            .ok()
+            .flatten()
+    else {
         return Err(ApiError::InvalidInput(
             "辅助模型未配置，无法增强提示词；请在设置中配置 auxiliary 模型".to_string(),
         ));

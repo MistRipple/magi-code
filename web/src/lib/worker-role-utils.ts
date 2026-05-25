@@ -4,10 +4,8 @@ export interface WorkerRoleSource {
   templateId: string;
   displayName: string;
   displayNameKey?: string;
-  modelSource?: 'orchestrator' | 'engine';
   engineId?: string;
   colorToken?: string;
-  enabled?: boolean;
 }
 
 export interface WorkerRoleRegistrySnapshot {
@@ -23,9 +21,8 @@ export interface WorkerRoleRegistrySnapshot {
   }>;
   registryAgents?: Array<{
     templateId: string;
-    modelSource: 'orchestrator' | 'engine';
+    /** engineId 空串 = 继承编排模型，非空 = 显式绑定到 engine */
     engineId: string;
-    enabled: boolean;
     order: number;
   }>;
 }
@@ -161,10 +158,8 @@ export function resolveWorkerRoleSource(
     templateId: normalizeWorkerId(matchedBinding.templateId),
     displayName: templateMeta.displayName || normalizeWorkerId(matchedBinding.templateId),
     displayNameKey: templateMeta.displayNameKey,
-    modelSource: matchedBinding.modelSource === 'engine' ? 'engine' : 'orchestrator',
     engineId: normalizeWorkerId(matchedBinding.engineId) || undefined,
     colorToken: templateMeta.colorToken,
-    enabled: matchedBinding.enabled,
   };
 }
 

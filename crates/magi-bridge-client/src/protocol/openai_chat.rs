@@ -1,8 +1,15 @@
 use serde_json::{Value, json};
 
 use super::adapter::{AdaptedRequest, AdaptedResponse, ProviderAdapter, ProviderFamily};
-use super::utils::{convert_messages_to_openai, parse_openai_usage, serialize_tool_definitions};
-use crate::llm_types::{LlmMessageParams, ToolCall, parse_tool_arguments};
+use super::capability::resolve_capability_profile;
+use super::utils::{
+    convert_messages_to_openai, parse_openai_usage, reasoning_effort_label,
+    serialize_tool_definitions,
+};
+use crate::cache_boundary::PROMPT_CACHE_BOUNDARY;
+use crate::llm_types::{
+    LlmMessageContent, LlmMessageParams, ToolCall, ToolChoice, parse_tool_arguments,
+};
 
 pub struct OpenAiChatCompletionsAdapter;
 
@@ -16,7 +23,16 @@ impl ProviderAdapter for OpenAiChatCompletionsAdapter {
         params: &LlmMessageParams,
         model: &str,
     ) -> Result<AdaptedRequest, String> {
-        let messages = convert_messages_to_openai(&params.messages);
+        // PROMPT_CACHE_BOUNDARY 标记仅服务于 Anthropic content-block 切分，
+        // 对 ChatCompletions 协议没有语义；在喂进 convert_messages_to_openai
+        // 之前过滤掉，避免泄漏到 OpenAI 兼容模型的 prompt。
+        let filtered_messages: Vec<crate::llm_types::LlmMessage> = params
+            .messages
+            .iter()
+            .filter(|m| !is_cache_boundary_marker(&m.content))
+            .cloned()
+            .collect();
+        let messages = convert_messages_to_openai(&filtered_messages);
 
         let mut body = json!({
             "model": model,
@@ -32,11 +48,7 @@ impl ProviderAdapter for OpenAiChatCompletionsAdapter {
         if let Some(ref tools) = params.tools {
             if !tools.is_empty() {
                 body["tools"] = json!(serialize_tool_definitions(tools));
-                if let Some(ref tc) = params.tool_choice {
-                    body["tool_choice"] = serde_json::to_value(tc).unwrap_or(json!("auto"));
-                } else {
-                    body["tool_choice"] = json!("auto");
-                }
+                body["tool_choice"] = translate_tool_choice_for_openai(params.tool_choice.as_ref());
             }
         }
         if let Some(stream) = params.stream {
@@ -46,10 +58,24 @@ impl ProviderAdapter for OpenAiChatCompletionsAdapter {
             }
         }
 
+        // reasoning_effort 顶层字段仅在能力表声明的模型上注入；未声明的模型
+        // （包括未知模型）即便调用方传了 effort 也不写入——盲发可能触发 400。
+        let capability = resolve_capability_profile(model);
+        if capability.supports_openai_reasoning_effort {
+            if let Some(effort) = params.reasoning_effort {
+                body["reasoning_effort"] = json!(reasoning_effort_label(effort));
+            }
+        }
+
+        let mut extra_headers = Vec::new();
+        for (name, value) in capability.beta_headers {
+            extra_headers.push((name.to_string(), value.to_string()));
+        }
+
         Ok(AdaptedRequest {
             url_path: "/v1/chat/completions".to_string(),
             body,
-            extra_headers: Vec::new(),
+            extra_headers,
         })
     }
 
@@ -108,6 +134,35 @@ impl ProviderAdapter for OpenAiChatCompletionsAdapter {
     }
 }
 
+fn is_cache_boundary_marker(content: &LlmMessageContent) -> bool {
+    match content {
+        LlmMessageContent::Text(text) => text.as_str() == PROMPT_CACHE_BOUNDARY,
+        LlmMessageContent::Blocks(_) => false,
+    }
+}
+
+/// 把统一的 `ToolChoice` enum 翻译成 OpenAI Chat Completions 协议形态。
+///
+/// - `ToolChoice::Simple(s)`（"auto" / "none" / "required"）：原样作为字符串透传；
+/// - `ToolChoice::Typed { kind, name: Some(n) }`：OpenAI 强制工具调用是
+///   `{"type":"function","function":{"name":n}}` 形态；适配器在此处翻译，
+///   不让 OpenAI 调用路径泄漏 Anthropic 风格 `{"type":"tool","name":...}`；
+/// - `ToolChoice::Typed { kind, name: None }`：退回到字符串字面量 `kind`；
+/// - `None`：默认 `"auto"`。
+fn translate_tool_choice_for_openai(choice: Option<&ToolChoice>) -> Value {
+    match choice {
+        None => json!("auto"),
+        Some(ToolChoice::Simple(label)) => json!(label),
+        Some(ToolChoice::Typed { kind, name }) => match name {
+            Some(name) => json!({
+                "type": "function",
+                "function": {"name": name},
+            }),
+            None => json!(kind),
+        },
+    }
+}
+
 fn parse_openai_tool_calls(value: &Value) -> Vec<ToolCall> {
     let Some(arr) = value.as_array() else {
         return Vec::new();
@@ -139,5 +194,116 @@ fn truncate(s: &str, max: usize) -> String {
         trimmed.to_string()
     } else {
         format!("{}...", &trimmed[..max])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::llm_types::{LlmMessage, LlmMessageContent, LlmMessageParams};
+
+    fn base_params(messages: Vec<LlmMessage>) -> LlmMessageParams {
+        LlmMessageParams {
+            messages,
+            max_tokens: None,
+            temperature: None,
+            tools: None,
+            stream: None,
+            system_prompt: None,
+            tool_choice: None,
+            timeout_ms: None,
+            stream_idle_timeout_ms: None,
+            stream_hard_timeout_ms: None,
+            retry_policy: None,
+            reasoning_effort: None,
+        }
+    }
+
+    #[test]
+    fn cache_boundary_marker_message_is_stripped() {
+        let params = base_params(vec![
+            LlmMessage {
+                role: "system".to_string(),
+                content: LlmMessageContent::Text("static prompt".to_string()),
+            },
+            LlmMessage {
+                role: "system".to_string(),
+                content: LlmMessageContent::Text(PROMPT_CACHE_BOUNDARY.to_string()),
+            },
+            LlmMessage {
+                role: "system".to_string(),
+                content: LlmMessageContent::Text("dynamic prompt".to_string()),
+            },
+        ]);
+        let adapted = OpenAiChatCompletionsAdapter
+            .build_request(&params, "gpt-4o")
+            .expect("build");
+        let messages = adapted.body["messages"].as_array().expect("messages");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["content"], "static prompt");
+        assert_eq!(messages[1]["content"], "dynamic prompt");
+        let text = adapted.body.to_string();
+        assert!(!text.contains(PROMPT_CACHE_BOUNDARY));
+    }
+
+    #[test]
+    fn reasoning_effort_only_emitted_on_capability_models() {
+        let mut params = base_params(vec![LlmMessage {
+            role: "user".to_string(),
+            content: LlmMessageContent::Text("hi".to_string()),
+        }]);
+        params.reasoning_effort = Some(magi_usage_authority::ReasoningEffort::Xhigh);
+
+        // 能力表声明支持 → 写入
+        let adapted = OpenAiChatCompletionsAdapter
+            .build_request(&params, "gpt-5-turbo")
+            .expect("build");
+        assert_eq!(adapted.body["reasoning_effort"], "xhigh");
+
+        // 未知模型 → 不得写入
+        let adapted2 = OpenAiChatCompletionsAdapter
+            .build_request(&params, "qwen-max")
+            .expect("build");
+        assert!(adapted2.body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn tool_choice_typed_translates_to_openai_shape() {
+        let mut params = base_params(vec![LlmMessage {
+            role: "user".to_string(),
+            content: LlmMessageContent::Text("classify".to_string()),
+        }]);
+        params.tools = Some(vec![crate::llm_types::ToolDefinition {
+            name: "classify".to_string(),
+            description: "test".to_string(),
+            input_schema: crate::llm_types::ToolInputSchema {
+                kind: "object".to_string(),
+                properties: json!({}),
+                required: None,
+            },
+        }]);
+        params.tool_choice = Some(ToolChoice::Typed {
+            kind: "tool".to_string(),
+            name: Some("classify".to_string()),
+        });
+        let adapted = OpenAiChatCompletionsAdapter
+            .build_request(&params, "gpt-4o")
+            .expect("build");
+        assert_eq!(adapted.body["tool_choice"]["type"], "function");
+        assert_eq!(adapted.body["tool_choice"]["function"]["name"], "classify");
+    }
+
+    #[test]
+    fn streaming_sets_include_usage() {
+        let mut params = base_params(vec![LlmMessage {
+            role: "user".to_string(),
+            content: LlmMessageContent::Text("hi".to_string()),
+        }]);
+        params.stream = Some(true);
+        let adapted = OpenAiChatCompletionsAdapter
+            .build_request(&params, "gpt-4o")
+            .expect("build");
+        assert_eq!(adapted.body["stream"], true);
+        assert_eq!(adapted.body["stream_options"]["include_usage"], true);
     }
 }
