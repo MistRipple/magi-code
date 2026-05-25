@@ -34,7 +34,6 @@ const CONTENT_BLOCK_TYPE_SET = new Set<ContentBlock['type']>([
   'tool_result',
   'file_change',
   'plan',
-  'dispatch_group',
 ]);
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
@@ -287,12 +286,6 @@ function resolveSanitizedBlockId(
       : (typeof sanitized.filePath === 'string' ? sanitized.filePath.trim() : '');
     if (filePath) {
       return `file_change:${filePath}`;
-    }
-  }
-  if (type === 'dispatch_group') {
-    const dispatchWaveId = typeof sanitized.dispatchWaveId === 'string' ? sanitized.dispatchWaveId.trim() : '';
-    if (dispatchWaveId) {
-      return `dispatch-group:${dispatchWaveId}`;
     }
   }
   throw new Error(`${errorPrefix} 消息块缺少稳定 id: type=${type}`);

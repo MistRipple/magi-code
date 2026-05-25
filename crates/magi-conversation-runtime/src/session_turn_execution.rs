@@ -118,7 +118,7 @@ fn build_session_turn_messages(
         .and_then(|sidecar| sidecar.current_turn)
         .filter(|turn| turn.turn_id == request.turn_id);
     let accepted_at = current_turn.as_ref().map(|turn| turn.accepted_at);
-    // 主线历史只取属于 orchestrator thread 的 item；非主线（worker drawer）item
+    // 主线历史只取属于 orchestrator thread 的 item；非主线（task 详情）item
     // 不进入 LLM 上下文。session 一生一 mission，因此 thread 必存。
     let orchestrator_thread_id = session_store
         .orchestrator_thread_for_session(&request.session_id)
@@ -1091,7 +1091,6 @@ mod tests {
                     status: "running".to_string(),
                     user_message: Some("请只回复一句话".to_string()),
                     items: vec![user_item],
-                    worker_lanes: Vec::new(),
                 },
             )
             .expect("current turn should be stored");
@@ -1236,8 +1235,6 @@ mod tests {
                         status: CanonicalTurnItemStatus::Completed,
                         item_version: None,
                         updated_at: ts(1000),
-                        lane_id: None,
-                        lane_seq: None,
                         title: None,
                         content: Some("请用一句话回答：2+3 等于几？".to_string()),
                         blocks: Vec::new(),
@@ -1258,8 +1255,6 @@ mod tests {
                         status: CanonicalTurnItemStatus::Completed,
                         item_version: None,
                         updated_at: ts(1200),
-                        lane_id: None,
-                        lane_seq: None,
                         title: None,
                         content: Some("2+3 等于 5。".to_string()),
                         blocks: Vec::new(),
@@ -1300,7 +1295,6 @@ mod tests {
                         "请基于上一轮结果，用一句话回答：再加 4 等于几？".to_string(),
                     ),
                     items: Vec::new(),
-                    worker_lanes: Vec::new(),
                 },
             )
             .expect("current turn should be stored");
@@ -1359,7 +1353,6 @@ mod tests {
                     status: "running".to_string(),
                     user_message: Some("分析一下当前项目".to_string()),
                     items: Vec::new(),
-                    worker_lanes: Vec::new(),
                 },
             )
             .expect("current turn should be stored");
@@ -1414,7 +1407,6 @@ mod tests {
                     status: "running".to_string(),
                     user_message: Some("请调用工具后回答".to_string()),
                     items: Vec::new(),
-                    worker_lanes: Vec::new(),
                 },
             )
             .expect("current turn should be stored");
@@ -1544,7 +1536,6 @@ mod tests {
                     status: "running".to_string(),
                     user_message: Some("请回答".to_string()),
                     items: Vec::new(),
-                    worker_lanes: Vec::new(),
                 },
             )
             .expect("current turn should be stored");

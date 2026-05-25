@@ -44,7 +44,7 @@ mod tests {
         let store = SessionStore::new();
         let session_id = SessionId::new("session-no-thread-reuse");
         let mission_id = MissionId::new("mission-no-thread-reuse");
-        let role_id = "integration-dev";
+        let role_id = "executor";
         let old_task_id = TaskId::new("task-old");
         let new_task_id = TaskId::new("task-new");
         let old_worker_id = WorkerId::new("worker-old");

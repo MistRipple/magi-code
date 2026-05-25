@@ -13,11 +13,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
 
-use crate::{
-    errors::ApiError,
-    model_config::NormalizedModelConfig,
-    state::ApiState,
-};
+use crate::{errors::ApiError, model_config::NormalizedModelConfig, state::ApiState};
 
 fn unwrap_settings_section_request(request: &serde_json::Value) -> serde_json::Value {
     request
@@ -144,20 +140,18 @@ async fn execute_connection_probe(
     let client = config
         .to_http_model_client("__probe__")
         .ok_or_else(|| ApiError::InvalidInput("模型配置缺少 baseUrl".to_string()))?;
-    let (url, body, extra_headers) = client.build_probe_request().map_err(|error| {
-        ApiError::InvalidInput(format!("构造连接测试请求失败: {error}"))
-    })?;
+    let (url, body, extra_headers) = client
+        .build_probe_request()
+        .map_err(|error| ApiError::InvalidInput(format!("构造连接测试请求失败: {error}")))?;
 
     let mut headers = HeaderMap::new();
     headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     for (name, value) in extra_headers {
-        let header_name = HeaderName::try_from(name.as_str()).map_err(|_| {
-            ApiError::InvalidInput(format!("探针请求包含非法 header 名: {name}"))
-        })?;
-        let header_value = HeaderValue::from_str(&value).map_err(|_| {
-            ApiError::InvalidInput(format!("探针请求包含非法 header 值: {name}"))
-        })?;
+        let header_name = HeaderName::try_from(name.as_str())
+            .map_err(|_| ApiError::InvalidInput(format!("探针请求包含非法 header 名: {name}")))?;
+        let header_value = HeaderValue::from_str(&value)
+            .map_err(|_| ApiError::InvalidInput(format!("探针请求包含非法 header 值: {name}")))?;
         headers.insert(header_name, header_value);
     }
 
@@ -245,44 +239,62 @@ pub fn routes() -> Router<ApiState> {
 pub(crate) fn builtin_role_templates() -> Vec<Value> {
     vec![
         json!({
-            "templateId": "frontend-dev",
-            "displayName": "Frontend Engineer",
-            "description": "负责界面实现、交互体验与前端状态流",
+            "templateId": "coordinator",
+            "displayName": "Coordinator",
+            "description": "负责理解主目标、拆分子任务并向 executor / explorer / reviewer / tester 派发",
             "i18n": {
-                "displayNameKey": "roleTemplate.frontend-dev.displayName",
-                "descriptionKey": "roleTemplate.frontend-dev.description",
+                "displayNameKey": "roleTemplate.coordinator.displayName",
+                "descriptionKey": "roleTemplate.coordinator.description",
             },
-            "defaultUI": { "colorToken": "agent-frontend-dev", "icon": "code" },
+            "defaultUI": { "colorToken": "agent-coordinator", "icon": "grid" },
             "profile": {
-                "role": "frontend-dev",
-                "focus": ["ui", "interaction", "state", "rendering"],
-                "constraints": ["preserve-design-system", "keep-runtime-contracts"],
-                "outputPreferences": ["diff", "ux-impact", "follow-up"],
+                "role": "coordinator",
+                "focus": ["planning", "dispatch", "synthesis"],
+                "constraints": ["single-source-of-truth", "no-direct-execution"],
+                "outputPreferences": ["plan", "decision", "follow-up"],
             },
-            "ownerships": ["web", "frontend-contracts"],
-            "insightPreferences": ["contract", "risk", "constraint"],
+            "ownerships": ["orchestration"],
+            "insightPreferences": ["decision", "constraint", "risk"],
         }),
         json!({
-            "templateId": "backend-dev",
-            "displayName": "Backend Engineer",
-            "description": "负责服务接口、状态流转与运行时主链实现",
+            "templateId": "executor",
+            "displayName": "Executor",
+            "description": "负责把已定义的 WorkPackage / Action 落地执行（写代码、改配置、跑构建）",
             "i18n": {
-                "displayNameKey": "roleTemplate.backend-dev.displayName",
-                "descriptionKey": "roleTemplate.backend-dev.description",
+                "displayNameKey": "roleTemplate.executor.displayName",
+                "descriptionKey": "roleTemplate.executor.description",
             },
-            "defaultUI": { "colorToken": "agent-backend-dev", "icon": "tool" },
+            "defaultUI": { "colorToken": "agent-executor", "icon": "tool" },
             "profile": {
-                "role": "backend-dev",
-                "focus": ["api", "runtime", "storage", "contracts"],
+                "role": "executor",
+                "focus": ["implementation", "build", "runtime", "contracts"],
                 "constraints": ["preserve-authoritative-state", "avoid-duplication"],
                 "outputPreferences": ["diff", "runtime-impact", "follow-up"],
             },
-            "ownerships": ["crates", "apps"],
+            "ownerships": ["implementation"],
             "insightPreferences": ["decision", "contract", "risk"],
         }),
         json!({
+            "templateId": "explorer",
+            "displayName": "Explorer",
+            "description": "负责搜索代码库、分析失败原因、定位根因与梳理调用链",
+            "i18n": {
+                "displayNameKey": "roleTemplate.explorer.displayName",
+                "descriptionKey": "roleTemplate.explorer.description",
+            },
+            "defaultUI": { "colorToken": "agent-explorer", "icon": "bug" },
+            "profile": {
+                "role": "explorer",
+                "focus": ["root-cause", "investigation", "evidence", "trace"],
+                "constraints": ["fix-at-source", "no-patchy-workarounds"],
+                "outputPreferences": ["root-cause", "evidence", "next-step"],
+            },
+            "ownerships": ["investigation"],
+            "insightPreferences": ["decision", "risk", "constraint"],
+        }),
+        json!({
             "templateId": "reviewer",
-            "displayName": "Code Review Engineer",
+            "displayName": "Reviewer",
             "description": "负责风险识别、回归扫描与交付质量把关",
             "i18n": {
                 "displayNameKey": "roleTemplate.reviewer.displayName",
@@ -299,130 +311,22 @@ pub(crate) fn builtin_role_templates() -> Vec<Value> {
             "insightPreferences": ["risk", "constraint", "decision"],
         }),
         json!({
-            "templateId": "test-engineer",
-            "displayName": "Test Engineer",
+            "templateId": "tester",
+            "displayName": "Tester",
             "description": "负责验证链路、场景覆盖与失败复现",
             "i18n": {
-                "displayNameKey": "roleTemplate.test-engineer.displayName",
-                "descriptionKey": "roleTemplate.test-engineer.description",
+                "displayNameKey": "roleTemplate.tester.displayName",
+                "descriptionKey": "roleTemplate.tester.description",
             },
-            "defaultUI": { "colorToken": "agent-test-engineer", "icon": "check-circle" },
+            "defaultUI": { "colorToken": "agent-tester", "icon": "check-circle" },
             "profile": {
-                "role": "test-engineer",
+                "role": "tester",
                 "focus": ["verification", "coverage", "smoke", "repro"],
                 "constraints": ["prefer-real-paths", "keep-signal-high"],
                 "outputPreferences": ["steps", "result", "follow-up"],
             },
             "ownerships": ["verification"],
             "insightPreferences": ["risk", "constraint"],
-        }),
-        json!({
-            "templateId": "doc-writer",
-            "displayName": "Documentation Engineer",
-            "description": "负责沉淀接口说明、迁移结论与交付说明",
-            "i18n": {
-                "displayNameKey": "roleTemplate.doc-writer.displayName",
-                "descriptionKey": "roleTemplate.doc-writer.description",
-            },
-            "defaultUI": { "colorToken": "agent-doc-writer", "icon": "document" },
-            "profile": {
-                "role": "doc-writer",
-                "focus": ["docs", "handoff", "clarity"],
-                "constraints": ["reflect-runtime-truth", "avoid-stale-docs"],
-                "outputPreferences": ["summary", "decision", "follow-up"],
-            },
-            "ownerships": ["docs"],
-            "insightPreferences": ["contract", "constraint"],
-        }),
-        json!({
-            "templateId": "debugger",
-            "displayName": "Debugging Engineer",
-            "description": "负责问题定位、根因分析与修复闭环",
-            "i18n": {
-                "displayNameKey": "roleTemplate.debugger.displayName",
-                "descriptionKey": "roleTemplate.debugger.description",
-            },
-            "defaultUI": { "colorToken": "agent-debugger", "icon": "bug" },
-            "profile": {
-                "role": "debugger",
-                "focus": ["root-cause", "runtime", "state-drift", "repair"],
-                "constraints": ["fix-at-source", "no-patchy-workarounds"],
-                "outputPreferences": ["root-cause", "fix", "verification"],
-            },
-            "ownerships": ["incident-response"],
-            "insightPreferences": ["decision", "risk", "constraint"],
-        }),
-        json!({
-            "templateId": "integration-dev",
-            "displayName": "Integration Engineer",
-            "description": "负责跨模块、跨端与跨服务联调收口",
-            "i18n": {
-                "displayNameKey": "roleTemplate.integration-dev.displayName",
-                "descriptionKey": "roleTemplate.integration-dev.description",
-            },
-            "defaultUI": { "colorToken": "agent-integration-dev", "icon": "tools" },
-            "profile": {
-                "role": "integration-dev",
-                "focus": ["integration", "contracts", "read-model", "events"],
-                "constraints": ["single-source-of-truth", "preserve-e2e-flow"],
-                "outputPreferences": ["diff", "integration-impact", "follow-up"],
-            },
-            "ownerships": ["integration"],
-            "insightPreferences": ["contract", "risk", "decision"],
-        }),
-        json!({
-            "templateId": "data-engineer",
-            "displayName": "Data Engineer",
-            "description": "负责数据投影、索引、提取与数据契约",
-            "i18n": {
-                "displayNameKey": "roleTemplate.data-engineer.displayName",
-                "descriptionKey": "roleTemplate.data-engineer.description",
-            },
-            "defaultUI": { "colorToken": "agent-data-engineer", "icon": "stats" },
-            "profile": {
-                "role": "data-engineer",
-                "focus": ["data-model", "projection", "indexing", "lineage"],
-                "constraints": ["preserve-data-shape", "avoid-silent-loss"],
-                "outputPreferences": ["diff", "data-impact", "follow-up"],
-            },
-            "ownerships": ["data"],
-            "insightPreferences": ["contract", "risk"],
-        }),
-        json!({
-            "templateId": "devops-engineer",
-            "displayName": "DevOps Engineer",
-            "description": "负责环境、部署、运行配置与运维可用性",
-            "i18n": {
-                "displayNameKey": "roleTemplate.devops-engineer.displayName",
-                "descriptionKey": "roleTemplate.devops-engineer.description",
-            },
-            "defaultUI": { "colorToken": "agent-devops-engineer", "icon": "tools" },
-            "profile": {
-                "role": "devops-engineer",
-                "focus": ["environment", "operations", "deployment", "health"],
-                "constraints": ["preserve-operability", "prefer-observable-changes"],
-                "outputPreferences": ["diff", "operational-impact", "follow-up"],
-            },
-            "ownerships": ["operations"],
-            "insightPreferences": ["risk", "constraint"],
-        }),
-        json!({
-            "templateId": "security-analyst",
-            "displayName": "Security Engineer",
-            "description": "负责权限、数据暴露面与安全风险评估",
-            "i18n": {
-                "displayNameKey": "roleTemplate.security-analyst.displayName",
-                "descriptionKey": "roleTemplate.security-analyst.description",
-            },
-            "defaultUI": { "colorToken": "agent-security-analyst", "icon": "shield" },
-            "profile": {
-                "role": "security-analyst",
-                "focus": ["security", "auth", "exposure", "governance"],
-                "constraints": ["least-privilege", "surface-security-risk"],
-                "outputPreferences": ["findings", "severity", "follow-up"],
-            },
-            "ownerships": ["security"],
-            "insightPreferences": ["risk", "constraint", "decision"],
         }),
         json!({
             "templateId": "architect",
@@ -826,10 +730,9 @@ async fn save_worker_config(
             .settings_store
             .set_section("workers", serde_json::Value::Object(workers));
     } else {
-        state.settings_store.set_section(
-            "workers",
-            scoped_settings_section_request(&request),
-        );
+        state
+            .settings_store
+            .set_section("workers", scoped_settings_section_request(&request));
     }
     Ok(Json(serde_json::json!({ "saved": true })))
 }
@@ -857,10 +760,9 @@ async fn save_orchestrator_config(
     State(state): State<ApiState>,
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    state.settings_store.set_section(
-        "orchestrator",
-        scoped_settings_section_request(&request),
-    );
+    state
+        .settings_store
+        .set_section("orchestrator", scoped_settings_section_request(&request));
     Ok(Json(serde_json::json!({ "saved": true })))
 }
 
@@ -875,10 +777,9 @@ async fn save_auxiliary_config(
     State(state): State<ApiState>,
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    state.settings_store.set_section(
-        "auxiliary",
-        scoped_settings_section_request(&request),
-    );
+    state
+        .settings_store
+        .set_section("auxiliary", scoped_settings_section_request(&request));
     Ok(Json(serde_json::json!({ "saved": true })))
 }
 
@@ -1444,7 +1345,7 @@ mod tests {
         let builtin_tools = bootstrap["builtinTools"]
             .as_array()
             .expect("builtin tools should be an array");
-        assert_eq!(builtin_tools.len(), 27);
+        assert_eq!(builtin_tools.len(), 25);
         let builtin_names: Vec<_> = builtin_tools
             .iter()
             .map(|tool| tool["name"].as_str().expect("tool name"))
@@ -1469,8 +1370,6 @@ mod tests {
                 "diagram_render",
                 "knowledge_query",
                 "agent_spawn",
-                "send_message",
-                "task_stop",
                 "todo_write",
                 "memory_write",
                 "mission_charter_write",

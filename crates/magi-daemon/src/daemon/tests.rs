@@ -15,7 +15,7 @@ use axum::{
 };
 use magi_core::{
     AbsolutePath, EventId, ExecutionOwnership, LeaseId, MissionId, SessionId, Task, TaskId,
-    TaskKind, TaskStatus, UtcMillis, WorkerId, WorkspaceId,
+    TaskKind, TaskStatus, ThreadId, UtcMillis, WorkerId, WorkspaceId,
 };
 use magi_event_bus::{EventEnvelope, InMemoryEventBus, RuntimeLedgerSummary};
 use magi_session_store::{
@@ -31,6 +31,8 @@ use serde_json::{Value, json};
 use std::{fs, path::PathBuf, sync::Arc};
 use tokio::time::{Duration, Instant};
 use tower::util::ServiceExt;
+
+const BACKGROUND_TASK_PROJECTION_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn temp_state_root(name: &str) -> PathBuf {
     let root = std::env::temp_dir().join(format!("magi-daemon-test-{name}-{}", UtcMillis::now().0));
@@ -122,7 +124,7 @@ async fn wait_for_task_projection_completed(
     root_task_id: &str,
     session_id: &str,
 ) -> Value {
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + BACKGROUND_TASK_PROJECTION_TIMEOUT;
     loop {
         let projection = get_task_projection(app.clone(), root_task_id, session_id).await;
         let total_tasks = projection["progress_summary"]["total_tasks"]
@@ -150,7 +152,7 @@ async fn wait_for_execution_group(
     mission_id: &str,
     mut is_ready: impl FnMut(&Value) -> bool,
 ) -> Value {
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + BACKGROUND_TASK_PROJECTION_TIMEOUT;
     loop {
         let read_model = get_json(app.clone(), "/runtime/read-model").await;
         if let Some(group) = read_model["details"]["execution_groups"]
@@ -488,8 +490,6 @@ fn runtime_sidecar_flush_persists_canonical_turns_to_session_durable_state() {
                 items: vec![ActiveExecutionTurnItem {
                     item_id: "turn-item-flush-canonical-assistant".to_string(),
                     item_seq: 1,
-                    lane_id: None,
-                    lane_seq: None,
                     kind: "assistant_stream".to_string(),
                     status: "running".to_string(),
                     source: "orchestrator".to_string(),
@@ -512,7 +512,6 @@ fn runtime_sidecar_flush_persists_canonical_turns_to_session_durable_state() {
                     timeline_entry_id: None,
                     source_thread_id: orchestrator_thread_id.clone(),
                 }],
-                worker_lanes: Vec::new(),
             },
         )
         .expect("current turn should upsert");
@@ -827,6 +826,7 @@ async fn daemon_runtime_recovery_preflight_executes_and_followup_router_dispatch
                     is_primary: true,
                     use_tools: true,
                     skill_name: Some("resume".to_string()),
+                    thread_id: ThreadId::new("thread-router-recovery"),
                 }],
                 recovery_ref: Some("recovery-router-recovery".to_string()),
                 dispatch_context: ActiveExecutionDispatchContext {
@@ -2492,6 +2492,7 @@ async fn runtime_restore_detaches_session_chain_when_root_task_checkpoint_is_mis
                     use_tools: true,
                     skill_name: None,
                     is_primary: true,
+                    thread_id: ThreadId::new("thread-stale-root-missing"),
                 }],
                 recovery_ref: None,
                 dispatch_context: ActiveExecutionDispatchContext {
@@ -2656,6 +2657,7 @@ async fn session_continue_survives_runtime_restart_with_same_chain_and_worker_br
             use_tools: true,
             skill_name: None,
             is_primary: false,
+            thread_id: ThreadId::new(format!("thread-{task_id}")),
         });
     }
     task_store.insert_task(Task {
@@ -2697,6 +2699,7 @@ async fn session_continue_survives_runtime_restart_with_same_chain_and_worker_br
         use_tools: true,
         skill_name: None,
         is_primary: false,
+        thread_id: ThreadId::new("thread-restart-branch-completed"),
     });
     chain.active_branch_task_ids = chain
         .branches

@@ -10,7 +10,7 @@
 //! 文件并触发迁移。当前内置集与默认值均为 `1`。
 //!
 //! 加载顺序：
-//! 1. crate 内置 builtin 集（编译期 `include_str!` 嵌入，12 个角色一一对应一个 .md）
+//! 1. crate 内置 builtin 集（编译期 `include_str!` 嵌入，6 个角色一一对应一个 .md）
 //! 2. 用户 override（`~/.magi/roles/*.md`），同 id 时 user override 覆盖 builtin
 //!
 //! 解析失败（front-matter 缺失、字段无法识别）走 tracing warn，跳过该文件而不
@@ -45,8 +45,8 @@ pub enum AgentRoleError {
 /// 单个 role 的定义。
 ///
 /// `coordinator_mode = true` 表示该角色采用 Prompt-as-Code 协调器模式：
-/// LLM 通过 `Agent` / `SendMessage` / `TaskStop` 三个内置工具发起子代理派发与
-/// 跨任务消息传递，整个 orchestration 由 prompt 驱动，而不是 Code-as-Coordinator
+/// LLM 通过 `Agent` 内置工具同步派发子代理，子代理完成的结果作为 tool_call_result
+/// 直接回写到协调器上下文，整个 orchestration 由 prompt 驱动，而不是 Code-as-Coordinator
 /// 在外层硬编码状态机。架构详见 docs/task-system-v2/01-architecture.md L10。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentRole {
@@ -265,45 +265,18 @@ const BUILTIN_ROLE_SOURCES: &[(&str, &str)] = &[
         include_str!("../assets/builtin-roles/architect.md"),
     ),
     (
-        "integration-dev",
-        include_str!("../assets/builtin-roles/integration-dev.md"),
+        "executor",
+        include_str!("../assets/builtin-roles/executor.md"),
     ),
     (
-        "frontend-dev",
-        include_str!("../assets/builtin-roles/frontend-dev.md"),
-    ),
-    (
-        "backend-dev",
-        include_str!("../assets/builtin-roles/backend-dev.md"),
-    ),
-    (
-        "data-engineer",
-        include_str!("../assets/builtin-roles/data-engineer.md"),
-    ),
-    (
-        "devops-engineer",
-        include_str!("../assets/builtin-roles/devops-engineer.md"),
-    ),
-    (
-        "security-analyst",
-        include_str!("../assets/builtin-roles/security-analyst.md"),
-    ),
-    (
-        "doc-writer",
-        include_str!("../assets/builtin-roles/doc-writer.md"),
+        "explorer",
+        include_str!("../assets/builtin-roles/explorer.md"),
     ),
     (
         "reviewer",
         include_str!("../assets/builtin-roles/reviewer.md"),
     ),
-    (
-        "test-engineer",
-        include_str!("../assets/builtin-roles/test-engineer.md"),
-    ),
-    (
-        "debugger",
-        include_str!("../assets/builtin-roles/debugger.md"),
-    ),
+    ("tester", include_str!("../assets/builtin-roles/tester.md")),
     (
         "coordinator",
         include_str!("../assets/builtin-roles/coordinator.md"),
@@ -474,11 +447,11 @@ mod tests {
         let reg = AgentRoleRegistry::from_map(builtin_roles_map());
         for role in [
             "architect",
-            "integration-dev",
+            "executor",
             "reviewer",
-            "debugger",
-            "frontend-dev",
-            "backend-dev",
+            "explorer",
+            "tester",
+            "coordinator",
         ] {
             assert!(reg.get(role).is_some(), "missing builtin role: {role}");
         }
@@ -528,7 +501,7 @@ mod tests {
     #[test]
     fn non_coordinator_roles_have_coordinator_mode_false_by_default() {
         let reg = AgentRoleRegistry::from_map(builtin_roles_map());
-        for id in ["architect", "integration-dev", "reviewer", "debugger"] {
+        for id in ["architect", "executor", "reviewer", "explorer"] {
             let role = reg.get(id).expect("builtin role exists");
             assert!(
                 !role.coordinator_mode,

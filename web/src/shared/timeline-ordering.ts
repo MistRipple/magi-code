@@ -1,7 +1,6 @@
 export interface TimelineSemanticOrderInput {
   turnOrderSeq: number;
   itemSeq: number;
-  laneSeq?: number;
   blockSeq?: number;
   displayOrder: number;
 }
@@ -46,12 +45,6 @@ export function resolveTimelineItemSeqFromMetadata(
   metadata: Record<string, unknown> | undefined,
 ): number {
   return resolveNonNegativeMetadataNumber(metadata, 'itemSeq');
-}
-
-export function resolveTimelineLaneSeqFromMetadata(
-  metadata: Record<string, unknown> | undefined,
-): number {
-  return resolveNonNegativeMetadataNumber(metadata, 'laneSeq');
 }
 
 export function resolveTimelineBlockSeqFromMetadata(
@@ -142,14 +135,6 @@ export function compareTimelineSemanticOrder(
   );
   if (itemOrder !== null) {
     return itemOrder;
-  }
-
-  const laneOrder = compareSharedFactOrder(
-    normalizeTimelineSequence(left.laneSeq),
-    normalizeTimelineSequence(right.laneSeq),
-  );
-  if (laneOrder !== null) {
-    return laneOrder;
   }
 
   const blockOrder = compareSharedFactOrder(

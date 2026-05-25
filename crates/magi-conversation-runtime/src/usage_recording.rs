@@ -3,7 +3,10 @@
 //! 复用 v2 内部的 `model_config::NormalizedModelConfig` 与
 //! `settings_store::SettingsStore`。
 
-use crate::{model_config::NormalizedModelConfig, settings_store::SettingsStore};
+use crate::{
+    model_config::{NormalizedModelConfig, configured_role_engine_model_config},
+    settings_store::SettingsStore,
+};
 use magi_core::{EventId, MissionId, MissionLifecyclePhase, SessionId, UtcMillis, WorkspaceId};
 use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
 use magi_mission_metrics::{MissionMetricsStore, TurnUsage};
@@ -55,6 +58,24 @@ pub fn model_usage_binding_for_worker(worker: &WorkerInfo, is_primary: bool) -> 
         role: UsageSourceRole::Worker,
         phase: UsagePhase::Execution,
     }
+}
+
+pub fn model_usage_binding_for_worker_with_settings(
+    worker: &WorkerInfo,
+    is_primary: bool,
+    settings_store: Option<&Arc<SettingsStore>>,
+) -> ModelUsageBinding {
+    let mut binding = model_usage_binding_for_worker(worker, is_primary);
+    if is_primary {
+        return binding;
+    }
+    if let Some(store) = settings_store
+        && let Ok(Some(role_model)) = configured_role_engine_model_config(store, &worker.role)
+    {
+        binding.engine_id = role_model.engine_id;
+        binding.binding_revision = role_model.binding_revision;
+    }
+    binding
 }
 
 pub fn publish_model_usage_record(
@@ -186,6 +207,11 @@ fn usage_model_config_for_binding(
 ) -> Option<LlmConfig> {
     let store = settings_store?;
     if matches!(binding.role, UsageSourceRole::Worker) {
+        if let Ok(Some(role_model)) =
+            configured_role_engine_model_config(store, &binding.template_id)
+        {
+            return role_model.config.to_usage_llm_config();
+        }
         let workers = store.get_section("workers");
         if let Some(config) = workers
             .get(&binding.engine_id)

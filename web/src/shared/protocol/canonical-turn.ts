@@ -7,9 +7,6 @@ export type CanonicalTurnItemKind =
   | 'assistant_text'
   | 'assistant_thinking'
   | 'tool_call'
-  | 'worker_dispatch'
-  | 'worker_status'
-  | 'worker_result'
   | 'task_status'
   | 'system_notice';
 
@@ -47,8 +44,6 @@ export interface CanonicalTurnItem {
   status: CanonicalTurnItemStatus;
   itemVersion?: number;
   updatedAt: number;
-  laneId?: string;
-  laneSeq?: number;
   title?: string;
   content?: string;
   blocks?: unknown[];
@@ -56,8 +51,8 @@ export interface CanonicalTurnItem {
   worker?: CanonicalWorkerRef;
   /**
    * item 归属的 thread_id。orchestrator 主线 item 对应 session 级
-   * orchestrator thread，worker sidechain item 对应各 worker thread。
-   * 由后端 canonical projection 保证非空，是前端 thread/worker drawer 的唯一路由信号。
+   * orchestrator thread，子代理 item 对应各 task thread。
+   * 由后端 canonical projection 保证非空，是前端 thread/task 详情的唯一路由信号。
    */
   sourceThreadId: string;
   visibility: CanonicalTurnVisibility;
@@ -103,9 +98,6 @@ const CANONICAL_TURN_ITEM_KINDS: CanonicalTurnItemKind[] = [
   'assistant_text',
   'assistant_thinking',
   'tool_call',
-  'worker_dispatch',
-  'worker_status',
-  'worker_result',
   'task_status',
   'system_notice',
 ];
@@ -249,8 +241,6 @@ export function normalizeCanonicalTurnItem(value: unknown): CanonicalTurnItem | 
   if (!sessionId || !turnId || !itemId || !kind || !status || turnSeq === undefined || itemSeq === undefined || createdAt === undefined || updatedAt === undefined || !sourceThreadId) {
     return undefined;
   }
-  const laneId = readString(record, 'laneId', 'lane_id') || undefined;
-  const laneSeq = readNumber(record, 'laneSeq', 'lane_seq');
   const title = readString(record, 'title') || undefined;
   const content = typeof record.content === 'string' ? record.content : undefined;
   const blocks = Array.isArray(record.blocks) ? record.blocks : undefined;
@@ -266,8 +256,6 @@ export function normalizeCanonicalTurnItem(value: unknown): CanonicalTurnItem | 
     status,
     ...(readNumber(record, 'itemVersion', 'item_version') !== undefined ? { itemVersion: readNumber(record, 'itemVersion', 'item_version') } : {}),
     updatedAt,
-    ...(laneId ? { laneId } : {}),
-    ...(laneSeq !== undefined ? { laneSeq } : {}),
     ...(title ? { title } : {}),
     ...(content !== undefined ? { content } : {}),
     ...(blocks ? { blocks } : {}),
@@ -416,8 +404,6 @@ export function validateCanonicalTurnItemUpdate(
     ['itemSeq', existing.itemSeq, incoming.itemSeq],
     ['kind', existing.kind, incoming.kind],
     ['createdAt', existing.createdAt, incoming.createdAt],
-    ['laneId', existing.laneId, incoming.laneId],
-    ['laneSeq', existing.laneSeq, incoming.laneSeq],
     ['tool.callId', existing.tool?.callId, incoming.tool?.callId],
   ];
 

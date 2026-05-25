@@ -52,15 +52,11 @@ pub enum BuiltinToolName {
     DiagramRender,
     // ── 知识库 ──
     KnowledgeQuery,
-    // ── 协调器（Task System v2 L10 / L11，仅 coordinator_mode 角色可见）──
-    /// 派发新的子任务给一个具体角色。返回新建任务的 task_id；子任务完成后，
-    /// 其结果会通过 `SendMessage` 路由回父任务的 Mailbox。
+    // ── 协调器（Task System v2 L10，仅 coordinator_mode 角色可见）──
+    /// 派发新的子代理执行子任务。该工具是同步阻塞 tool call：父代理在该 tool_call
+    /// 上等待，直到子代理跑完整个对话，最终输出作为 tool_call_result 直接回写到
+    /// 父代理上下文，不再走 mailbox 路由。同一 turn 内多个 agent_spawn 调用并发执行。
     AgentSpawn,
-    /// 在同一 mission 内向另一任务投递一条结构化消息（用于父子代理回执、
-    /// 子任务之间的协调指令等）。
-    SendMessage,
-    /// 终止指定任务及其所有 SpawnGraph 后代（级联停止）。
-    TaskStop,
     // ── In-session 思维锚点（Task System v2 L13）──
     /// 写入本 session 的 TodoLedger。整体替换列表语义（参考 claude-code 的 TodoWrite）。
     /// 由 orchestration 层拦截，不进入 ToolRegistry。
@@ -112,7 +108,7 @@ pub enum BuiltinToolName {
 }
 
 impl BuiltinToolName {
-    pub const ALL: [Self; 32] = [
+    pub const ALL: [Self; 30] = [
         Self::FileRead,
         Self::FileWrite,
         Self::FilePatch,
@@ -135,8 +131,6 @@ impl BuiltinToolName {
         Self::DiagramRender,
         Self::KnowledgeQuery,
         Self::AgentSpawn,
-        Self::SendMessage,
-        Self::TaskStop,
         Self::TodoWrite,
         Self::MemoryWrite,
         Self::MissionCharterWrite,
@@ -171,8 +165,6 @@ impl BuiltinToolName {
             Self::DiagramRender => "diagram_render",
             Self::KnowledgeQuery => "knowledge_query",
             Self::AgentSpawn => "agent_spawn",
-            Self::SendMessage => "send_message",
-            Self::TaskStop => "task_stop",
             Self::TodoWrite => "todo_write",
             Self::MemoryWrite => "memory_write",
             Self::MissionCharterWrite => "mission_charter_write",
@@ -208,8 +200,6 @@ impl BuiltinToolName {
             "diagram_render" => Some(Self::DiagramRender),
             "knowledge_query" | "project_knowledge_query" => Some(Self::KnowledgeQuery),
             "agent_spawn" | "agent" | "spawn_agent" => Some(Self::AgentSpawn),
-            "send_message" | "message_task" => Some(Self::SendMessage),
-            "task_stop" | "stop_task" | "cancel_task" => Some(Self::TaskStop),
             "todo_write" | "todowrite" | "todo" => Some(Self::TodoWrite),
             "memory_write" | "memorywrite" | "memory" => Some(Self::MemoryWrite),
             "mission_charter_write" | "missioncharterwrite" | "mission_charter" => {
@@ -270,7 +260,6 @@ impl BuiltinToolName {
             | Self::WebFetch
             | Self::DiagramRender
             | Self::KnowledgeQuery
-            | Self::SendMessage
             | Self::TodoWrite
             | Self::MemoryWrite
             | Self::MissionCharterWrite
@@ -286,7 +275,7 @@ impl BuiltinToolName {
             | Self::ProcessWrite
             | Self::AgentSpawn => RiskLevel::Medium,
             Self::FileRemove | Self::ShellExec | Self::ProcessLaunch => RiskLevel::High,
-            Self::ProcessKill | Self::ProcessInspect | Self::TaskStop => RiskLevel::Medium,
+            Self::ProcessKill | Self::ProcessInspect => RiskLevel::Medium,
         }
     }
 
@@ -377,7 +366,7 @@ impl BuiltinToolName {
             }
             Self::KnowledgeQuery => "查询项目知识库：检索 README、文档与代码文档",
             Self::AgentSpawn => {
-                "向已注册的子 agent 角色派发一个子任务（architect / integration-dev / reviewer 等）。返回新的 task_id；子 agent 的最终结果会通过 send_message 回流。\n\n\
+                "向已注册的子 agent 角色同步派发一个子任务（architect / executor / reviewer 等）。该工具是同步阻塞调用：父代理在本轮停在该 tool call 上等待子代理跑完整个对话，最终输出作为 tool_call_result 直接回写到父代理上下文，不再走 mailbox 回流。同一轮调用多次 agent_spawn 时所有子代理并发执行。若返回 status=degraded，表示子代理当前不可用，父代理必须改派其他可用角色或由主线继续完成，不能直接停止任务。\n\n\
                 # 何时用\n\
                 - 任务可拆出 1 个或多个明确边界的子工作单元，且子单元能独立完成（有清晰输入、输出、验收）\n\
                 - 需要专家视角（reviewer 做代码审查、security-analyst 做风险评估）\n\
@@ -386,17 +375,16 @@ impl BuiltinToolName {
                 - 1-3 步能自己完成的任务 → 直接做，派发开销不值\n\
                 - 子任务需要你在场即时回答澄清问题 → 自己做更顺\n\
                 - 仅是查询性问题（找文件 / 读代码） → 用 search_text / file_read，不要派 agent\n\n\
+                # display_name 写法\n\
+                - 长度 5-30 个字符，前端子代理卡片直接展示\n\
+                - 要让用户一眼看出『谁在做什么具体的事』，写成「职责 + 对象」短语\n\
+                - ✅ 例：『登录流程审查员』『订单模块迁移设计师』『支付冒烟测试执行人』\n\
+                - ❌ 反例：纯角色名『executor』『reviewer-1』；冗长重复『执行删除日志模块的所有引用并跑通测试的执行器』\n\n\
                 # 反例\n\
-                - ❌ 派 integration-dev 去「改一行配置」→ 启动开销远超价值\n\
+                - ❌ 派 executor 去「改一行配置」→ 启动开销远超价值\n\
                 - ❌ 派 reviewer 去「看看代码好不好」（边界模糊、验收不清）\n\
                 - ✅ 派 reviewer 审查具体 PR：「审查 commits abc..def 的安全性，按通过 / 不通过给结论」\n\
-                - ✅ 派 integration-dev 实现独立模块：「在 crate X 实现 Y trait，跑通 cargo test -p X」"
-            }
-            Self::SendMessage => {
-                "向同一 mission 中的另一个任务投递结构化消息。Coordinator 用它转发结果、下达后续指令或回传子 agent 的回复。"
-            }
-            Self::TaskStop => {
-                "终止一个任务并在 SpawnGraph 上级联停止它的所有后代。仅在整个子树已明显偏离目标，或用户主动撤回工作时使用。"
+                - ✅ 派 executor 实现独立模块：「在 crate X 实现 Y trait，跑通 cargo test -p X」"
             }
             Self::TodoWrite => {
                 "用给定列表整体替换当前会话的 TodoLedger（沿用 claude-code TodoWrite 语义）。用于把长任务拆分成步骤并跟踪进度；ledger 快照会自动注入到后续 Turn。每次调用整体覆盖。\n\n\
@@ -702,7 +690,8 @@ impl BuiltinToolName {
             Self::AgentSpawn => serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "role": { "type": "string", "description": "已注册的 agent 角色 id，如 architect / integration-dev / reviewer / debugger" },
+                    "role": { "type": "string", "description": "已注册的 agent 角色 id，如 architect / executor / explorer / reviewer / tester / coordinator" },
+                    "display_name": { "type": "string", "description": "本次派发的子代理实例展示名（5-30 个字符），用于前端子代理卡片标题。要求高度概括本次具体职责，例如『登录流程审查员』『支付迁移设计师』『冒烟测试执行人』；不要写成纯角色名（如『executor』）或冗长目标重复。" },
                     "goal": { "type": "string", "description": "子任务的具体目标；角色级 system prompt 会与该目标合并使用" },
                     "task_kind": {
                         "type": "string",
@@ -713,28 +702,7 @@ impl BuiltinToolName {
                     "working_dir": { "type": "string", "description": "可选的绝对工作目录；默认沿用父任务的 workspace 根目录" },
                     "parallelism_group": { "type": "string", "description": "可选的并行组名；同一 SpawnGraph 分支下相同组名的子 agent 互斥执行" }
                 },
-                "required": ["role", "goal"]
-            }),
-            Self::SendMessage => serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "target_task_id": { "type": "string", "description": "同一 mission 内的接收方任务 id" },
-                    "payload": { "type": "string", "description": "消息载荷——自由文本或 JSON 编码的结构化数据" },
-                    "kind": {
-                        "type": "string",
-                        "enum": ["reply", "directive", "status", "result"],
-                        "description": "给接收方的消息类型提示。默认 reply。"
-                    }
-                },
-                "required": ["target_task_id", "payload"]
-            }),
-            Self::TaskStop => serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "target_task_id": { "type": "string", "description": "要终止的任务 id；SpawnGraph 中的所有后代任务级联停止" },
-                    "reason": { "type": "string", "description": "终止原因简述，会出现在被取消任务的证据链路中" }
-                },
-                "required": ["target_task_id"]
+                "required": ["role", "display_name", "goal"]
             }),
             Self::TodoWrite => serde_json::json!({
                 "type": "object",
@@ -1827,7 +1795,7 @@ mod tests {
         path
     }
 
-    fn all_builtin_tools() -> [BuiltinToolName; 32] {
+    fn all_builtin_tools() -> [BuiltinToolName; 30] {
         BuiltinToolName::ALL
     }
 
@@ -4404,8 +4372,6 @@ mod tests {
                 "diagram_render",
                 "knowledge_query",
                 "agent_spawn",
-                "send_message",
-                "task_stop",
                 "todo_write",
                 "memory_write",
                 "mission_charter_write",

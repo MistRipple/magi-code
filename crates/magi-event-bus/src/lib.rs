@@ -25,7 +25,6 @@ pub use read_model::{
     RuntimeLedgerSummary, RuntimeMaintenanceSummary, RuntimeMetaSummary, RuntimeOperationsSummary,
     RuntimeOverviewSummary, RuntimeReadModelInput, RuntimeSectionOrderingRule,
     RuntimeWorkQueueSummary, SessionRuntimeBranchSummaryEntry, SessionRuntimeSummaryEntry,
-    SessionRuntimeTurnItemSummaryEntry, SessionRuntimeTurnLaneSummaryEntry,
-    SessionRuntimeTurnSummaryEntry, TaskRuntimeSummaryEntry, ToolRuntimeSummaryEntry,
-    WorkerRuntimeSummaryEntry, WorkspaceRuntimeSummaryEntry,
+    SessionRuntimeTurnItemSummaryEntry, SessionRuntimeTurnSummaryEntry, TaskRuntimeSummaryEntry,
+    ToolRuntimeSummaryEntry, WorkerRuntimeSummaryEntry, WorkspaceRuntimeSummaryEntry,
 };

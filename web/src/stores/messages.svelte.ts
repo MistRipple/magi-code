@@ -5,8 +5,6 @@
 
 import type {
   Message,
-  AgentOutputs,
-  AgentId,
   TimelineProjectionArtifact,
   TimelineProjectionRenderEntry,
   SessionTimelineProjection,
@@ -32,7 +30,6 @@ import type {
 import { vscode } from '../lib/vscode-bridge';
 import { ensureArray } from '../lib/utils';
 
-import { deriveWorkerRuntimeMap } from '../lib/worker-panel-state';
 import {
   buildTimelinePanelMessages,
 } from '../lib/timeline-render-items';
@@ -43,7 +40,6 @@ import {
   resolveTimelineCardStreamSeqFromMetadata,
   resolveTimelineEventSeqFromMetadata,
   resolveTimelineItemSeqFromMetadata,
-  resolveTimelineLaneSeqFromMetadata,
   resolveTimelineSortTimestamp,
   resolveTimelineTurnOrderSeqFromMetadata,
   resolveTimelineVersionFromMetadata,
@@ -51,9 +47,6 @@ import {
 import {
   resolveTimelinePresentationKind,
 } from '../shared/timeline-presentation';
-import {
-  resolveTimelineWorkerId,
-} from '../shared/timeline-worker-lifecycle';
 import {
   normalizeMessagePayload,
 } from '../lib/message-payload';
@@ -200,7 +193,7 @@ function normalizePersistedScrollPositions(value: unknown): ScrollPositions {
   }
   const source = value as Record<string, unknown>;
   const result: ScrollPositions = { thread: normalizeScrollTop(typeof source.thread === 'number' ? source.thread : 0) };
-  // 动态恢复所有持久化的 worker 滚动位置
+  // 动态恢复所有持久化的右侧面板滚动位置
   for (const key of Object.keys(source)) {
     if (key !== 'thread' && typeof source[key] === 'number') {
       result[key] = normalizeScrollTop(source[key] as number);
@@ -216,7 +209,7 @@ function normalizePersistedScrollAnchors(value: unknown): ScrollAnchors {
   }
   const source = value as Record<string, unknown>;
   const result: ScrollAnchors = { thread: normalizeScrollAnchor(source.thread as ScrollAnchor | null | undefined) };
-  // 动态恢复所有持久化的 worker 滚动锚点
+  // 动态恢复所有持久化的右侧面板滚动锚点
   for (const key of Object.keys(source)) {
     if (key !== 'thread' && source[key] && typeof source[key] === 'object') {
       result[key] = normalizeScrollAnchor(source[key] as ScrollAnchor | null | undefined);
@@ -232,7 +225,7 @@ function normalizePersistedAutoScrollConfig(value: unknown): AutoScrollConfig {
   }
   const source = value as Record<string, unknown>;
   const result: AutoScrollConfig = { thread: typeof source.thread === 'boolean' ? source.thread : defaults.thread };
-  // 动态恢复所有持久化的 worker 自动滚动配置
+  // 动态恢复所有持久化的右侧面板自动滚动配置
   for (const key of Object.keys(source)) {
     if (key !== 'thread' && typeof source[key] === 'boolean') {
       result[key] = source[key] as boolean;
@@ -465,33 +458,13 @@ let edits = $state<Edit[]>([]);
 
 const messageProjection = $derived.by(() => {
   const projection = messagesState.canonicalTimelineProjection;
-  const workers: Record<string, Message[]> = {};
   if (!projection) {
-    return {
-      thread: [],
-      workers,
-    };
-  }
-  const workerKeys = new Set<string>();
-  for (const artifact of projection.artifacts || []) {
-    if (artifact.worker) {
-      workerKeys.add(artifact.worker);
-    }
-  }
-  for (const workerId of workerKeys) {
-    workers[workerId] = buildTimelinePanelMessages(projection, 'worker', workerId);
+    return { thread: [] };
   }
   return {
     thread: buildTimelinePanelMessages(projection, 'thread'),
-    workers,
   };
 });
-
-const workerRuntime = $derived.by(() => deriveWorkerRuntimeMap({
-  messagesByWorker: messageProjection.workers,
-  pendingRequestIds: messagesState.pendingRequests,
-  runtimeState: messagesState.orchestratorRuntimeState,
-}));
 
 export type ToastCategory = 'incident' | 'audit' | 'feedback';
 export type NotificationCategory = 'incident' | 'audit';
@@ -647,11 +620,23 @@ function resolveTimelineCardId(message: Message): string | undefined {
   return rawCardId || undefined;
 }
 
-function resolveTimelineWorker(message: Message): AgentId | undefined {
-  const worker = resolveTimelineWorkerId(
-    resolveMessageMetadataRecord(message),
-  );
-  return worker || undefined;
+function normalizeMetadataString(metadata: Record<string, unknown> | undefined, key: string): string {
+  const value = metadata?.[key];
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function resolveSidechainTaskId(message: Message): string | undefined {
+  const metadata = resolveMessageMetadataRecord(message);
+  const taskId = normalizeMetadataString(metadata, 'taskId');
+  if (!taskId) {
+    return undefined;
+  }
+  const roleId = normalizeMetadataString(metadata, 'roleId');
+  const workerId = normalizeMetadataString(metadata, 'workerId');
+  if ((roleId && roleId !== 'orchestrator') || workerId) {
+    return taskId;
+  }
+  return undefined;
 }
 
 function resolveProjectionArtifactKind(message: Message): TimelineProjectionArtifact['kind'] {
@@ -688,7 +673,6 @@ interface LocalProjectionFlatRenderEntry {
   timestamp: number;
   turnOrderSeq: number;
   itemSeq: number;
-  laneSeq: number;
   anchorEventSeq: number;
   blockSeq: number;
   cardStreamSeq: number;
@@ -698,7 +682,6 @@ function renderEntryToOrderInput(entry: LocalProjectionFlatRenderEntry): Timelin
   return {
     turnOrderSeq: entry.turnOrderSeq,
     itemSeq: entry.itemSeq,
-    laneSeq: entry.laneSeq,
     blockSeq: entry.blockSeq,
     displayOrder: entry.cardStreamSeq || 0,
   };
@@ -714,34 +697,14 @@ function compareRenderEntryOrder(
   );
 }
 
-function buildDynamicWorkerRenderEntries(
-  artifacts: TimelineProjectionArtifact[],
-): Record<string, TimelineProjectionRenderEntry[]> {
-  const workerIds = new Set<string>();
-  for (const artifact of artifacts) {
-    if (artifact.worker) {
-      workerIds.add(artifact.worker);
-    }
-  }
-  const entries: Record<string, TimelineProjectionRenderEntry[]> = {};
-  for (const workerId of workerIds) {
-    entries[workerId] = buildProjectionRenderEntriesFromArtifacts(artifacts, 'worker', workerId);
-  }
-  return entries;
-}
-
 function buildProjectionRenderEntriesFromArtifacts(
   artifacts: TimelineProjectionArtifact[],
-  displayContext: 'thread' | 'worker',
-  worker?: AgentId,
 ): TimelineProjectionRenderEntry[] {
   const flatEntries: LocalProjectionFlatRenderEntry[] = [];
 
   for (const artifact of artifacts) {
-    const artifactVisible = displayContext === 'thread'
-      ? !artifact.worker
-      : Boolean(worker && artifact.worker === worker);
-    if (!artifactVisible) {
+    if (artifact.taskId) {
+      // 子代理 artifacts 仅在 RightPane task tab 内按 metadata.taskId 过滤呈现，主时间线不收纳
       continue;
     }
     const artifactMetadata = resolveMessageMetadataRecord(artifact.message);
@@ -752,7 +715,6 @@ function buildProjectionRenderEntriesFromArtifacts(
       timestamp: artifact.timestamp,
       turnOrderSeq: resolveTimelineTurnOrderSeqFromMetadata(artifactMetadata),
       itemSeq: resolveTimelineItemSeqFromMetadata(artifactMetadata) || artifact.displayOrder,
-      laneSeq: resolveTimelineLaneSeqFromMetadata(artifactMetadata),
       anchorEventSeq: artifact.anchorEventSeq,
       blockSeq: getMessageBlockSeq(artifact.message),
       cardStreamSeq: artifact.cardStreamSeq,
@@ -810,9 +772,7 @@ function canonicalizeTimelineProjection(
           ? Math.floor(artifact.timestamp)
           : resolveMessageSortTimestamp(message),
         cardId: artifact.cardId || resolveTimelineCardId(message),
-        dispatchWaveId: artifact.dispatchWaveId,
-        laneId: artifact.laneId,
-        worker: resolveTimelineWorker(message) || artifact.worker,
+        taskId: artifact.taskId || resolveSidechainTaskId(message),
         messageIds: Array.from(new Set([
           artifactMessageId,
           ...ensureArray<string>(artifact.messageIds),
@@ -832,8 +792,7 @@ function canonicalizeTimelineProjection(
     ...projection,
     sessionId: normalizeSessionId(projection.sessionId) || projection.sessionId,
     artifacts,
-    threadRenderEntries: buildProjectionRenderEntriesFromArtifacts(artifacts, 'thread'),
-    workerRenderEntries: buildDynamicWorkerRenderEntries(artifacts),
+    threadRenderEntries: buildProjectionRenderEntriesFromArtifacts(artifacts),
   };
 }
 
@@ -847,14 +806,12 @@ function compareProjectionArtifactsSemanticOrder(
     {
       turnOrderSeq: resolveTimelineTurnOrderSeqFromMetadata(leftMetadata),
       itemSeq: resolveTimelineItemSeqFromMetadata(leftMetadata),
-      laneSeq: resolveTimelineLaneSeqFromMetadata(leftMetadata),
       blockSeq: resolveTimelineBlockSeqFromMetadata(leftMetadata),
       displayOrder: left.displayOrder || 0,
     },
     {
       turnOrderSeq: resolveTimelineTurnOrderSeqFromMetadata(rightMetadata),
       itemSeq: resolveTimelineItemSeqFromMetadata(rightMetadata),
-      laneSeq: resolveTimelineLaneSeqFromMetadata(rightMetadata),
       blockSeq: resolveTimelineBlockSeqFromMetadata(rightMetadata),
       displayOrder: right.displayOrder || 0,
     },
@@ -1135,9 +1092,6 @@ export function getState() {
     get messageJump() { return messagesState.messageJump; },
     get canonicalTimelineProjection() { return messagesState.canonicalTimelineProjection; },
     get threadMessages() { return messageProjection.thread; },
-    get agentOutputs() {
-      return messageProjection.workers as AgentOutputs;
-    },
     get sessions() { return messagesState.sessions; },
     get currentWorkspaceId() { return messagesState.currentWorkspaceId; },
     get currentWorkspacePath() { return messagesState.currentWorkspacePath; },
@@ -1171,8 +1125,6 @@ export function getState() {
     // Wave 状态（提案 4.6）
     get waveState() { return waveState; },
     set waveState(v) { waveState = v; },
-    // Worker 运行态（统一入口）
-    get workerRuntime() { return workerRuntime; },
   };
 }
 
@@ -1495,7 +1447,7 @@ export function setCurrentSessionId(id: string | null) {
   if (hasChanged) {
     resetSessionScopedExecutionState();
     // 会话切换时消息内容以后端分页快照为唯一真相源。
-    // 本地只恢复滚动/定位等轻量视图状态，避免旧 session 的主线或 worker 内容短暂残留。
+    // 本地只恢复滚动/定位等轻量视图状态，避免旧 session 的主线或右侧面板内容短暂残留。
     messagesState.canonicalTimelineProjection = null;
     restoredSessionView = applySessionViewState(nextSessionId);
     if (!restoredSessionView) {

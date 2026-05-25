@@ -8,11 +8,6 @@
   import Icon from './Icon.svelte';
   import { tick, onDestroy } from 'svelte';
   import {
-    buildWorkerStageRenderGroups,
-    type WorkerStageRenderGroup,
-  } from '../lib/timeline-render-items';
-  import type { IconName } from '../lib/icons';
-  import {
     clearMessageJump,
     messagesState,
     setSessionHistoryState,
@@ -23,7 +18,8 @@
 
   // Props - Svelte 5 语法
   interface Props {
-    workerName?: string;
+    /** 子代理 taskId —— displayContext='task' 时作为 panelKey 与 data-panel-id 的来源 */
+    taskId?: string;
     renderItems: TimelineRenderItem[];
     /** 空状态配置（可选） */
     emptyState?: {
@@ -33,34 +29,19 @@
     };
     /** 是否为只读模式（主对话区模式），隐藏冗余操作按钮 */
     readOnly?: boolean;
-    /** 显示上下文：thread=主对话区, worker=Worker面板 */
-    displayContext?: 'thread' | 'worker';
+    /** 显示上下文：thread=主对话区, task=右侧子代理 tab */
+    displayContext?: 'thread' | 'task';
     /** 当前面板是否处于可见激活状态（用于 display:none -> visible 场景下的滚动恢复） */
     isActive?: boolean;
   }
-  let { workerName, renderItems, emptyState, readOnly = false, displayContext = 'thread', isActive = true }: Props = $props();
+  let { taskId, renderItems, emptyState, readOnly = false, displayContext = 'thread', isActive = true }: Props = $props();
 
   const safeRenderItems = $derived(
     (renderItems || [])
       .filter((item): item is TimelineRenderItem => Boolean(item && item.message && item.message.id))
   );
 
-  const workerStageGroups = $derived.by((): WorkerStageRenderGroup[] => {
-    if (displayContext !== 'worker') {
-      return [];
-    }
-    return buildWorkerStageRenderGroups(safeRenderItems, {
-      stageFallback: i18n.t('dispatchGroupCard.stageFallback'),
-      directTitle: i18n.t('workerStageGroup.directTitle'),
-      ungroupedTitle: i18n.t('workerStageGroup.ungroupedTitle'),
-    });
-  });
-
-  const activeRenderItems = $derived.by(() => (
-    displayContext === 'worker'
-      ? workerStageGroups.flatMap((group) => group.items)
-      : safeRenderItems
-  ));
+  const activeRenderItems = $derived(safeRenderItems);
 
   const currentSessionId = $derived.by(() => (
     typeof messagesState.currentSessionId === 'string' ? messagesState.currentSessionId.trim() : ''
@@ -223,7 +204,7 @@
     if (typeof window === 'undefined') return;
     window.dispatchEvent(new CustomEvent('magi:fillComposer', { detail: { text } }));
   }
-  const panelKey = $derived.by((): keyof ScrollPositions => (displayContext === 'worker' ? (workerName || 'worker') : 'thread'));
+  const panelKey = $derived.by((): keyof ScrollPositions => (displayContext === 'task' ? (taskId || 'task') : 'thread'));
   const persistedScrollTop = $derived(messagesState.scrollPositions[panelKey] || 0);
   const persistedScrollAnchor = $derived(messagesState.scrollAnchors[panelKey]);
   const shouldAutoScroll = $derived(messagesState.autoScrollEnabled[panelKey]);
@@ -520,29 +501,6 @@
     scrollPanelToBottom(false);
   }
 
-  function resolveWorkerStageIcon(status: WorkerStageRenderGroup['status']): IconName {
-    switch (status) {
-      case 'completed':
-        return 'check-circle';
-      case 'failed':
-      case 'cancelled':
-        return 'x-circle';
-      case 'blocked':
-      case 'awaiting_approval':
-      case 'review_required':
-        return 'alert-circle';
-      case 'running':
-        return 'loader';
-      case 'pending':
-      default:
-        return 'hourglass';
-    }
-  }
-
-  function resolveWorkerStageStatusLabel(status: WorkerStageRenderGroup['status']): string {
-    return i18n.t(`workerStageGroup.status.${status}`);
-  }
-
   onDestroy(() => {
     activationRestoreNonce += 1;
     clearRestoreAttemptTimers();
@@ -560,7 +518,7 @@
     bind:this={containerRef}
     onscroll={handleScroll}
     onwheel={handleWheel}
-    data-panel-id={displayContext === 'thread' ? 'thread' : (workerName || 'worker')}
+    data-panel-id={displayContext === 'thread' ? 'thread' : (taskId || 'task')}
     data-display-context={displayContext}
     data-panel-active={isActive ? 'true' : 'false'}
   >
@@ -595,63 +553,6 @@
             <span>{sessionHistory.isLoadingBefore ? i18n.t('messageList.loadingOlder') : i18n.t('messageList.loadOlder')}</span>
           </button>
         {/if}
-      </div>
-    {:else if displayContext === 'worker' && workerStageGroups.length > 0}
-      <div class="worker-stage-list">
-        {#each workerStageGroups as group (group.key)}
-          <section
-            class="worker-stage-group"
-            class:is-direct={group.isDirect}
-            data-worker-stage-id={group.key}
-            data-status={group.status}
-          >
-            <div class="worker-stage-group__header">
-              <span class="worker-stage-group__index">
-                {#if group.isDirect}
-                  <Icon name="terminal" size={12} />
-                {:else}
-                  {group.displayIndex}
-                {/if}
-              </span>
-              <span class="worker-stage-group__main">
-                <span class="worker-stage-group__title">{group.title}</span>
-                <span class="worker-stage-group__meta">
-                  {#if group.toolUseCount > 0}
-                    <span>{i18n.t('workerStageGroup.toolCount', { count: group.toolUseCount })}</span>
-                  {/if}
-                  {#if group.replyCount > 0}
-                    <span>{i18n.t('workerStageGroup.replyCount', { count: group.replyCount })}</span>
-                  {/if}
-                  {#if group.toolUseCount === 0 && group.replyCount === 0}
-                    <span>{i18n.t('workerStageGroup.noVisibleItems')}</span>
-                  {/if}
-                </span>
-              </span>
-              <span class={`worker-stage-group__status worker-stage-group__status--${group.status}`}>
-                <Icon
-                  name={resolveWorkerStageIcon(group.status)}
-                  size={12}
-                  class={group.status === 'running' ? 'spinning' : ''}
-                />
-                {resolveWorkerStageStatusLabel(group.status)}
-              </span>
-            </div>
-
-            {#if group.items.length > 0}
-              <div class="worker-stage-group__body">
-                {#each group.items as item (item.key)}
-                  <MessageItem
-                    message={item.message}
-                    {readOnly}
-                    {displayContext}
-                    showStreamingIndicator={item.key === streamingIndicatorRenderKey}
-                    streamingElapsedSeconds={item.key === streamingIndicatorRenderKey ? elapsedSeconds : 0}
-                  />
-                {/each}
-              </div>
-            {/if}
-          </section>
-        {/each}
       </div>
     {:else}
       {#each safeRenderItems as item (item.key)}
@@ -813,149 +714,6 @@
     opacity: 0.65;
   }
 
-  .worker-stage-list {
-    display: flex;
-    flex-direction: column;
-    gap: var(--space-3);
-  }
-
-  .worker-stage-group {
-    display: flex;
-    flex-direction: column;
-    border: 1px solid var(--border);
-    border-radius: var(--radius-lg);
-    background: color-mix(in srgb, var(--surface-1) 92%, var(--foreground) 8%);
-    overflow: hidden;
-  }
-
-  .worker-stage-group__header {
-    display: grid;
-    grid-template-columns: auto minmax(0, 1fr) auto;
-    align-items: center;
-    gap: var(--space-2);
-    min-height: 38px;
-    padding: var(--space-2) var(--space-3);
-    border-bottom: 1px solid var(--border);
-    background: var(--surface-1);
-  }
-
-  .worker-stage-group__index {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 22px;
-    height: 22px;
-    border-radius: 999px;
-    background: var(--surface-2);
-    border: 1px solid var(--border);
-    color: var(--foreground-muted);
-    font-size: var(--text-2xs);
-    font-weight: var(--font-semibold);
-    flex-shrink: 0;
-  }
-
-  .worker-stage-group__main {
-    min-width: 0;
-    display: flex;
-    align-items: baseline;
-    gap: var(--space-2);
-  }
-
-  .worker-stage-group__title {
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    font-size: var(--text-sm);
-    font-weight: var(--font-semibold);
-    color: var(--foreground);
-  }
-
-  .worker-stage-group__meta {
-    display: inline-flex;
-    align-items: center;
-    gap: var(--space-2);
-    min-width: 0;
-    color: var(--foreground-muted);
-    font-size: var(--text-2xs);
-    white-space: nowrap;
-  }
-
-  .worker-stage-group__meta > span + span::before {
-    content: "·";
-    margin-right: var(--space-2);
-    color: var(--foreground-subtle);
-  }
-
-  .worker-stage-group__status {
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-    padding: 2px 7px;
-    border-radius: 999px;
-    border: 1px solid var(--border);
-    background: var(--surface-2);
-    color: var(--foreground-muted);
-    font-size: var(--text-2xs);
-    line-height: 1.2;
-    white-space: nowrap;
-  }
-
-  .worker-stage-group__status--completed {
-    color: var(--success);
-    background: var(--success-muted);
-    border-color: color-mix(in srgb, var(--success) 30%, var(--border));
-  }
-
-  .worker-stage-group__status--failed,
-  .worker-stage-group__status--cancelled {
-    color: var(--error);
-    background: var(--error-muted);
-    border-color: color-mix(in srgb, var(--error) 30%, var(--border));
-  }
-
-  .worker-stage-group__status--blocked,
-  .worker-stage-group__status--awaiting_approval,
-  .worker-stage-group__status--review_required {
-    color: var(--warning);
-    background: var(--warning-muted);
-    border-color: color-mix(in srgb, var(--warning) 30%, var(--border));
-  }
-
-  .worker-stage-group__status--running {
-    color: var(--primary);
-    background: var(--primary-muted);
-    border-color: color-mix(in srgb, var(--primary) 30%, var(--border));
-  }
-
-  .worker-stage-group__body {
-    display: flex;
-    flex-direction: column;
-    gap: var(--space-2);
-    padding: var(--space-2) var(--space-3) var(--space-3);
-  }
-
-  .worker-stage-group__body :global(.message-item.assistant) {
-    padding: 0;
-    margin-right: 0;
-  }
-
-  .worker-stage-group__body :global(.message-item.assistant.plain-shell:not(.inline-guest)) {
-    margin-top: 0;
-  }
-
-  .worker-stage-group__body :global(.tool-call) {
-    margin-top: 0;
-  }
-
-  :global(.spinning) {
-    animation: worker-stage-spin 1s linear infinite;
-  }
-
-  @keyframes worker-stage-spin {
-    from { transform: rotate(0deg); }
-    to { transform: rotate(360deg); }
-  }
 
   /* 滚动按钮 - 绝对定位在消息列表右下角 */
   .scroll-to-bottom {

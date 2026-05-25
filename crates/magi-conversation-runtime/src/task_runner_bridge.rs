@@ -93,8 +93,9 @@ pub trait TaskResultReceiver: Send + Sync {
 /// pushed, subsequent pushes for the same task are silently ignored.  This
 /// prevents feedback loops when the Runner's own `apply_results` re-applies
 /// the terminal status via `update_status`, which would otherwise re-trigger
-/// the status-change callback.  Call `clear_seen` when a task is reset to a
-/// non-terminal state (e.g. Ready) to allow future results for that task.
+/// the status-change callback.  Call `clear_task_result_state` when a task is
+/// reset to a non-terminal state so stale terminal results cannot be consumed
+/// after recovery.
 pub struct EventBasedResultReceiver {
     results: Mutex<Vec<TaskResult>>,
     seen: Mutex<HashSet<TaskId>>,
@@ -128,14 +129,19 @@ impl EventBasedResultReceiver {
             .push(result);
     }
 
-    /// Clear the deduplication entry for a task.  Call this when a task is
-    /// reset to a non-terminal state (e.g. Ready after a lease expiry) so
-    /// that a future terminal transition can produce a new result.
-    pub fn clear_seen(&self, task_id: &TaskId) {
+    /// Clear all buffered terminal-result state for a task.
+    ///
+    /// 恢复链路会把 Failed 任务重新放回非终态。如果这里只清 dedup 标记而不清
+    /// 队列，Runner 下一轮会先消费旧 Failed 结果，把刚恢复的任务再次打失败。
+    pub fn clear_task_result_state(&self, task_id: &TaskId) {
         self.seen
             .lock()
             .expect("EventBasedResultReceiver seen lock poisoned")
             .remove(task_id);
+        self.results
+            .lock()
+            .expect("EventBasedResultReceiver results lock poisoned")
+            .retain(|result| &result.task_id != task_id);
     }
 }
 
@@ -146,5 +152,42 @@ impl TaskResultReceiver for EventBasedResultReceiver {
             .lock()
             .expect("EventBasedResultReceiver results lock poisoned");
         std::mem::take(&mut *guard)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clear_task_result_state_drops_stale_terminal_result() {
+        let receiver = EventBasedResultReceiver::new();
+        let task_id = TaskId::new("task-recovered");
+
+        receiver.push_result(TaskResult {
+            task_id: task_id.clone(),
+            lease_id: LeaseId::new("lease-stale"),
+            outcome: TaskOutcome::Failed {
+                error: "stale failure".to_string(),
+            },
+        });
+        receiver.clear_task_result_state(&task_id);
+        receiver.push_result(TaskResult {
+            task_id: task_id.clone(),
+            lease_id: LeaseId::new("lease-current"),
+            outcome: TaskOutcome::Completed {
+                output_refs: vec!["current result".to_string()],
+            },
+        });
+
+        let results = receiver.poll_results();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].lease_id, LeaseId::new("lease-current"));
+        match &results[0].outcome {
+            TaskOutcome::Completed { output_refs } => {
+                assert_eq!(output_refs, &vec!["current result".to_string()]);
+            }
+            TaskOutcome::Failed { error } => panic!("不应消费旧失败结果: {error}"),
+        }
     }
 }

@@ -4,9 +4,6 @@
   import MarkdownContent from '../components/MarkdownContent.svelte';
   import AgentTabContent from '../components/tabs/AgentTabContent.svelte';
   import { i18n } from '../stores/i18n.svelte';
-  import { messagesState, getEnabledAgents } from '../stores/messages.svelte';
-  import { resolveWorkerDisplayName, resolveWorkerRoleSource } from '../lib/worker-role-utils';
-  import { getAgentVisualInfo } from '../lib/agent-colors';
   import {
     isKnownBinaryFile,
     isMarkdownFile,
@@ -250,33 +247,17 @@
   );
 
   // ============ Tab 视觉 ============
-  const enabledAgents = $derived(getEnabledAgents());
-  const registrySnapshot = $derived(messagesState.settingsRegistrySnapshot);
-
-  function resolveAgentTabVisual(workerTabId: string) {
-    const roleSource = resolveWorkerRoleSource(workerTabId, enabledAgents, registrySnapshot);
-    const displayWorkerId = (roleSource?.templateId && roleSource.templateId.trim()) || workerTabId;
-    const displayName = resolveWorkerDisplayName(
-      displayWorkerId,
-      enabledAgents,
-      registrySnapshot,
-      (key) => i18n.t(key),
-    ) || displayWorkerId;
-    const visualInfo = getAgentVisualInfo(displayWorkerId, roleSource?.colorToken);
-    return { displayName, color: visualInfo.color };
-  }
+  // 子代理 tab 的 label / accentToken 由 ToolCall 触发 openAgentTab 时一次性写入；
+  // RightPane 不再二次按 roleId 反查 registry —— tab 本身即为视觉真源。
 
   function tabAccent(tab: RightPaneTab): string {
     if (tab.kind === 'agent') {
-      return resolveAgentTabVisual((tab.payload as AgentTabPayload).workerTabId).color;
+      return tab.accentToken ? `var(--${tab.accentToken})` : 'var(--accent)';
     }
     return 'var(--info)';
   }
 
   function tabLabel(tab: RightPaneTab): string {
-    if (tab.kind === 'agent') {
-      return resolveAgentTabVisual((tab.payload as AgentTabPayload).workerTabId).displayName;
-    }
     return tab.label;
   }
 
@@ -404,6 +385,7 @@
       class="right-pane-tabs"
       class:dragging={isDraggingTabs}
       role="tablist"
+      tabindex="-1"
       aria-label={i18n.t('rightPane.title')}
       onwheel={handleTabsWheel}
       onpointerdown={handleTabsPointerDown}
@@ -475,7 +457,7 @@
         <span class="right-pane-meta-line">{i18n.t('rightPane.empty.hint')}</span>
       </div>
     {:else if activeTab.kind === 'agent'}
-      <AgentTabContent workerTabId={(activeTab.payload as AgentTabPayload).workerTabId} />
+      <AgentTabContent taskId={(activeTab.payload as AgentTabPayload).taskId} />
     {:else if previewLoading}
       <div class="right-pane-state">{i18n.t('web.filePreviewLoading')}</div>
     {:else if previewError}

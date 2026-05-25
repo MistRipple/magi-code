@@ -1,6 +1,5 @@
 #![recursion_limit = "256"]
 
-mod a_path;
 mod change_projection;
 mod dto;
 mod errors;

@@ -8,14 +8,14 @@
  * - 全部 tab 关闭 → 强制 collapsed = true（下一次展开为空白 Pane）
  * - togglePane() 仅切 collapsed；openTab*() 触发自动展开
  * - LRU 淘汰：插入第 7 个 tab 时，从非 active tab 里挑 lastActivatedAt 最小的踢掉
- * - 同 kind 同 key（agent: workerTabId / code: filepath）幂等：复用现有 tab 并激活
+ * - 同 kind 同 key（agent: taskId / code: filepath）幂等：复用现有 tab 并激活
  */
 
 export type RightPaneTabKind = 'agent' | 'code';
 
-/** Agent tab payload —— 仅需 workerTabId，内容由 canonical projection 投影 */
+/** Agent tab payload —— 子代理 taskId，内容由 canonical projection 按 metadata.taskId 过滤投影 */
 export interface AgentTabPayload {
-  workerTabId: string;
+  taskId: string;
 }
 
 /** Code tab payload —— filepath 必填；diff 存在时走 diff 视图，否则走单文件 viewer */
@@ -210,7 +210,7 @@ function ensureSession(sessionId: string): SessionPaneState {
 
 function tabKey(kind: RightPaneTabKind, payload: RightPaneTabPayload): string {
   if (kind === 'agent') {
-    return `agent:${(payload as AgentTabPayload).workerTabId}`;
+    return `agent:${(payload as AgentTabPayload).taskId}`;
   }
   return `code:${(payload as CodeTabPayload).filepath}`;
 }
@@ -305,26 +305,26 @@ export function getRightPaneState(sessionId: string | null | undefined): Session
   return rightPaneState.perSession[normalized] ?? EMPTY_SESSION_STATE;
 }
 
-/** 打开（或激活）一个 agent tab；workerTabId 同时作为去重 key */
+/** 打开（或激活）一个 agent tab；taskId 同时作为去重 key */
 export function openAgentTab(
   sessionId: string | null | undefined,
-  workerTabId: string | null | undefined,
+  taskId: string | null | undefined,
   options?: { label?: string; accentToken?: string | null },
 ): void {
   const normalizedSession = normalizeSessionId(sessionId);
   if (!normalizedSession) {
     return;
   }
-  const trimmedWorkerTabId = typeof workerTabId === 'string' ? workerTabId.trim() : '';
-  if (!trimmedWorkerTabId) {
+  const trimmedTaskId = typeof taskId === 'string' ? taskId.trim() : '';
+  if (!trimmedTaskId) {
     return;
   }
-  const label = options?.label?.trim() || trimmedWorkerTabId;
+  const label = options?.label?.trim() || trimmedTaskId;
   const accentToken = options?.accentToken ?? null;
   upsertTab(
     normalizedSession,
     'agent',
-    { workerTabId: trimmedWorkerTabId },
+    { taskId: trimmedTaskId },
     label,
     accentToken,
   );

@@ -127,7 +127,6 @@ interface RustSessionRuntimeSummary {
   active_branches?: RustSessionRuntimeBranchSummary[];
   current_turn?: RustSessionRuntimeTurnSummary | null;
   turn_items?: RustSessionRuntimeTurnItemSummary[];
-  worker_lanes?: RustSessionRuntimeTurnLaneSummary[];
 }
 
 interface RustSessionRuntimeTurnSummary {
@@ -143,8 +142,6 @@ interface RustSessionRuntimeTurnSummary {
 interface RustSessionRuntimeTurnItemSummary {
   item_id?: string;
   item_seq?: number;
-  lane_id?: string | null;
-  lane_seq?: number | null;
   kind?: string;
   status?: string;
   source?: string;
@@ -163,17 +160,6 @@ interface RustSessionRuntimeTurnItemSummary {
   user_message_id?: string | null;
   placeholder_message_id?: string | null;
   timeline_entry_id?: string | null;
-}
-
-interface RustSessionRuntimeTurnLaneSummary {
-  lane_id?: string;
-  lane_seq?: number;
-  task_id?: string;
-  worker_id?: string;
-  role_id?: string;
-  title?: string;
-  status?: string;
-  is_primary?: boolean;
 }
 
 interface RustSessionRuntimeBranchSummary {
@@ -416,15 +402,6 @@ function normalizeRuntimeTurnItems(raw: unknown): RustSessionRuntimeTurnItemSumm
     : [];
 }
 
-function normalizeRuntimeTurnLanes(raw: unknown): RustSessionRuntimeTurnLaneSummary[] {
-  return Array.isArray(raw)
-    ? raw
-      .map((lane) => normalizeObjectRecord(lane))
-      .filter((lane): lane is Record<string, unknown> => lane !== null)
-      .map((lane) => lane as RustSessionRuntimeTurnLaneSummary)
-    : [];
-}
-
 function normalizeSessionRuntimeEntries(
   runtimeReadModel: RustRuntimeReadModelDto | undefined,
 ): RustSessionRuntimeSummary[] {
@@ -468,7 +445,6 @@ function normalizeSessionRuntimeEntries(
         : [],
       current_turn: normalizeRuntimeTurnSummary(entry.current_turn),
       turn_items: normalizeRuntimeTurnItems(entry.turn_items),
-      worker_lanes: normalizeRuntimeTurnLanes(entry.worker_lanes),
     }));
 }
 

@@ -25,15 +25,16 @@ pub enum MailboxAuthor {
     Child(String),
 }
 
-/// Mailbox 信号类型。与 v2 架构文档的 Message / Decision / Interrupt /
-/// AgentResult / Followup 五类保持一致。
+/// Mailbox 信号类型。与 v2 架构文档保持一致的运行时信号分类。
+///
+/// 注：原 `AgentResult` 类型已随同步 agent_spawn 改造移除——子代理终态
+/// 直接以 tool_call_result 形式返回给父代理本轮 LLM 上下文，不再走 mailbox 回流。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum MailboxKind {
     Message,
     Decision,
     Interrupt,
-    AgentResult,
     Followup,
 }
 

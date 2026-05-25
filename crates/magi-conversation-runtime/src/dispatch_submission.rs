@@ -19,8 +19,7 @@ use magi_orchestrator::{
 };
 use magi_session_store::{
     ActiveExecutionBranch, ActiveExecutionChain, ActiveExecutionDispatchContext,
-    ActiveExecutionTurn, ActiveExecutionTurnItem, ActiveExecutionTurnLane, SessionStore,
-    TimelineEntryKind,
+    ActiveExecutionTurn, ActiveExecutionTurnItem, SessionStore, TimelineEntryKind,
 };
 use magi_spawn_graph::SpawnGraph;
 
@@ -168,38 +167,37 @@ fn build_task_policy(task_tier: TaskTier) -> magi_core::TaskPolicy {
 }
 
 fn infer_dispatch_task_role(skill_name: Option<&str>, task_tier: TaskTier) -> &'static str {
-    // LongMission 必须由 coordinator role 承接：Charter/Plan/Checkpoint 等 long-mission
-    // 工具的可见性 gate 同时要求 coordinator_mode + tier=LongMission，二者必须共生。
-    // 不在此处强制 = tool gate 必然否决 = 必失败。从源头收敛到单一正确路径。
+    // Task #103 起 agent_spawn 改为同步工具调用，主线入口任务（用户从聊天框发出的 turn）
+    // 必须由 coordinator role 承接，否则 `task_can_see_builtin_tool` 会把 agent_spawn /
+    // TodoWrite / MemoryWrite 全部判为不可见，模型在运行期看不到协调器工具——再没有任何
+    // 后续路径能补救。LongMission / ExecutionChain 在这一点上同构：主线入口都是协调器。
+    //
+    // 子代理（executor / reviewer / tester / explorer / architect）由 `execute_coordinator_tool`
+    // 通过 agent_spawn 子派发显式创建，不走本函数；本函数只决定**主线入口**的默认 role。
     if matches!(task_tier, TaskTier::LongMission) {
         return "coordinator";
     }
     let Some(skill_name) = skill_name.map(str::trim).filter(|value| !value.is_empty()) else {
-        return "integration-dev";
+        return "coordinator";
     };
     let skill = skill_name.to_ascii_lowercase();
-    if skill.contains("front") || skill.contains("ui") {
-        "frontend-dev"
-    } else if skill.contains("back") || skill.contains("api") || skill.contains("server") {
-        "backend-dev"
-    } else if skill.contains("review") || skill.contains("audit") {
+    if skill.contains("review") || skill.contains("audit") {
         "reviewer"
     } else if skill.contains("test") || skill.contains("qa") || skill.contains("verify") {
-        "test-engineer"
-    } else if skill.contains("doc") || skill.contains("write") {
-        "doc-writer"
-    } else if skill.contains("debug") || skill.contains("fix") || skill.contains("bug") {
-        "debugger"
-    } else if skill.contains("data") || skill.contains("etl") || skill.contains("metric") {
-        "data-engineer"
-    } else if skill.contains("devops") || skill.contains("infra") || skill.contains("deploy") {
-        "devops-engineer"
-    } else if skill.contains("security") || skill.contains("auth") || skill.contains("sec") {
-        "security-analyst"
+        "tester"
+    } else if skill.contains("debug")
+        || skill.contains("fix")
+        || skill.contains("bug")
+        || skill.contains("explore")
+        || skill.contains("investigate")
+        || skill.contains("doc")
+    {
+        "explorer"
     } else if skill.contains("arch") || skill.contains("design") {
         "architect"
     } else {
-        "integration-dev"
+        // 所有具体落地（前/后端/数据/运维/安全/集成）统一收敛到 executor
+        "executor"
     }
 }
 
@@ -341,8 +339,6 @@ pub fn run_dispatch_submission(
         &act_task_id,
         now,
     );
-    let lane_id = format!("lane-{}", act_task_id);
-    let lane_seq = 1usize;
     let ownership = ExecutionOwnership {
         session_id: Some(session_id.clone()),
         workspace_id: workspace_id.clone(),
@@ -364,8 +360,6 @@ pub fn run_dispatch_submission(
                 execution_chain_ref: execution_chain_ref.clone(),
             },
             worker_id: worker_id.clone(),
-            lane_id: Some(lane_id.clone()),
-            lane_seq: Some(lane_seq),
             thread_id: worker_thread_id.clone(),
             is_primary: true,
             session_id: session_id.clone(),
@@ -400,6 +394,7 @@ pub fn run_dispatch_submission(
         use_tools: true,
         skill_name: request.skill_name.clone(),
         is_primary: true,
+        thread_id: worker_thread_id.clone(),
     }];
     let request_id = request.request_id.clone();
     let user_message_id = request.user_message_id.clone();
@@ -417,8 +412,6 @@ pub fn run_dispatch_submission(
         items: vec![ActiveExecutionTurnItem {
             item_id: user_message_item_id,
             item_seq: 1,
-            lane_id: None,
-            lane_seq: None,
             kind: "user_message".to_string(),
             status: "completed".to_string(),
             source: "user".to_string(),
@@ -438,16 +431,6 @@ pub fn run_dispatch_submission(
             placeholder_message_id: placeholder_message_id.clone(),
             timeline_entry_id: Some(entry_id.to_string()),
             source_thread_id: orchestrator_thread_id.clone(),
-        }],
-        worker_lanes: vec![ActiveExecutionTurnLane {
-            lane_id: lane_id.clone(),
-            lane_seq,
-            task_id: act_task_id.clone(),
-            worker_id: worker_id.clone(),
-            role_id: target_role.to_string(),
-            thread_id: worker_thread_id.clone(),
-            title: request.task_title.clone(),
-            is_primary: true,
         }],
     };
     current_turn.normalize();
@@ -530,7 +513,7 @@ mod tests {
         let spawn_graph = Mutex::new(SpawnGraph::new());
         let session_id = SessionId::new("session-dispatch-fresh-thread");
         let mission_id = MissionId::new("mission-dispatch-fresh-thread");
-        let old_thread_id = magi_core::ThreadId::new("thread-integration-dev-old");
+        let old_thread_id = magi_core::ThreadId::new("thread-executor-old");
 
         session_store
             .create_session(session_id.clone(), "dispatch fresh thread")
@@ -539,7 +522,7 @@ mod tests {
             thread_id: old_thread_id.clone(),
             session_id: session_id.clone(),
             mission_id: mission_id.clone(),
-            role_id: "integration-dev".to_string(),
+            role_id: "executor".to_string(),
             worker_instance_id: WorkerId::new("worker-old"),
             status: ExecutionThreadStatus::Idle,
             created_at: UtcMillis(1_000),
@@ -569,7 +552,7 @@ mod tests {
             execution_goal: Some("创建 v2-task-system-e2e.md 并写入当前 marker".to_string()),
             task_tier: TaskTier::ExecutionChain,
             skill_name: None,
-            target_role: Some("integration-dev".to_string()),
+            target_role: Some("executor".to_string()),
             request_id: None,
             user_message_id: None,
             placeholder_message_id: None,
@@ -590,9 +573,7 @@ mod tests {
         let chain = graph
             .active_execution_chain
             .expect("dispatch should create active execution chain");
-        let lane_thread_id = chain.current_turn.unwrap().worker_lanes[0]
-            .thread_id
-            .clone();
+        let lane_thread_id = chain.branches[0].thread_id.clone();
 
         assert_ne!(lane_thread_id, old_thread_id);
         assert!(
@@ -615,9 +596,13 @@ mod tests {
     /// 验收点：
     /// - route 已是 task（由 classifier 决定，本处不重测）；
     /// - dispatch 创建 action task 并落入 TaskStore；
-    /// - `policy_snapshot.task_tier == ExecutionChain`——`drive_dispatch_submission` 据此
-    ///   把任务路由到 `drive_a_path` 而**不是** `runner_manager.start`（Long-Mission 入口）；
+    /// - `policy_snapshot.task_tier == ExecutionChain`——下游 Charter/Plan/KG/
+    ///   Validation/Checkpoint/HumanCheckpoint 写端入口据 tier 判定是否启用；
     /// - 同步产生 ActiveExecutionChain，让运行期具备可观察的执行链。
+    ///
+    /// 注：Task #117 之后所有 tier 的 dispatch 都由 `runner_manager.start` 后台
+    /// 驱动，tier 字段只决定 Charter/Plan/KG/Validation/Checkpoint/HumanCheckpoint
+    /// 这 7 件套是否启用，不再决定调度模型本身。
     ///
     /// 反证："不启用 Long-Mission 层"的关键 invariant 是 task tier——一旦 tier 是
     /// ExecutionChain，§3.4 的 Charter/Plan/KG/Validation/Checkpoint/HumanCheckpoint
@@ -649,7 +634,7 @@ mod tests {
             execution_goal: Some("定位并修复 bug、再跑相关验证命令".to_string()),
             task_tier: TaskTier::ExecutionChain,
             skill_name: None,
-            target_role: Some("integration-dev".to_string()),
+            target_role: Some("executor".to_string()),
             request_id: None,
             user_message_id: None,
             placeholder_message_id: None,
@@ -679,7 +664,7 @@ mod tests {
             policy.task_tier,
             TaskTier::ExecutionChain,
             "§3.2: action task tier 必须是 ExecutionChain（非 LongMission），\
-             否则 drive_dispatch_submission 会把它路由到 runner_manager.start",
+             否则 runner 内部会错误激活 LongMission 7 件套写入入口",
         );
         assert_ne!(
             policy.task_tier,
@@ -698,19 +683,20 @@ mod tests {
     }
 
     /// Task System v2 §3.4 验收：复杂 Mission 走 LongMission 路径——dispatch 把
-    /// action task 的 `policy_snapshot` 写成 LongMission 形态，让下游
-    /// `drive_dispatch_submission` 据此路由到 `runner_manager.start`（runner 内部承担
-    /// Charter / Plan / Workspace / KG / Validation / Checkpoint / HumanCheckpoint
-    /// 7 件套的写入与编排）。
+    /// action task 的 `policy_snapshot` 写成 LongMission 形态，runner 据此在
+    /// 内部启用 Charter / Plan / Workspace / KG / Validation / Checkpoint /
+    /// HumanCheckpoint 7 件套的写入与编排。
     ///
     /// 这里覆盖的是 §3.4 的**路由前置条件**，是端到端链路的单点真相：
-    /// - `policy_snapshot.task_tier == LongMission`——`drive_dispatch_submission`
-    ///   ([crates/magi-api/src/task_dispatch.rs:55-70](../../../magi-api/src/task_dispatch.rs:55))
-    ///   读这个字段把任务交给 `runner_manager.start`，绕过 `drive_a_path`；
+    /// - `policy_snapshot.task_tier == LongMission`——下游 runner / dispatcher
+    ///   根据该字段决定是否激活 LongMission 7 件套写端入口；
     /// - `validation_profile == Some("Required")`——P3 Validation gate 的入口；
     /// - `checkpoint_mode == "task_or_phase"`——§1.4 复杂任务 checkpoint 节奏；
     /// - `background_allowed == true`——LongMission 才允许的长跑后台执行；
     /// - `escalation_conditions` 含 `"human_checkpoint"`——§1.5 HumanCheckpoint 阻塞钩。
+    ///
+    /// 注：Task #117 后所有 tier 的 dispatch 都由后台 `runner_manager.start` 驱动，
+    /// tier 字段只决定 7 件套写端是否启用，不再决定调度模型本身。
     ///
     /// §3.4 其余 invariant 由各自专属测试覆盖、本测不重复：
     /// - Charter 写入：`magi_mission_charter::*` + `tool_batch::*` 中
@@ -779,7 +765,7 @@ mod tests {
             policy.task_tier,
             TaskTier::LongMission,
             "§3.4 路由前置：action task tier 必须是 LongMission，\
-             否则 drive_dispatch_submission 会错误地走 drive_a_path 而不是 runner_manager.start",
+             否则 runner 内部不会激活 LongMission 7 件套写入入口",
         );
         assert_eq!(
             policy.validation_profile.as_deref(),
@@ -862,7 +848,7 @@ mod tests {
             execution_goal: Some("跨多阶段重构".to_string()),
             task_tier: TaskTier::LongMission,
             skill_name: None,
-            target_role: Some("integration-dev".to_string()),
+            target_role: Some("executor".to_string()),
             request_id: None,
             user_message_id: None,
             placeholder_message_id: None,

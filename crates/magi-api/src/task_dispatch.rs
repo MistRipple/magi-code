@@ -6,7 +6,6 @@ use magi_conversation_runtime::dispatch_submission::{
 pub(crate) use magi_conversation_runtime::dispatch_submission::{
     DispatchSubmissionAccepted, DispatchSubmissionRequest,
 };
-use magi_core::TaskTier;
 
 pub fn submit_dispatch_submission(
     state: &ApiState,
@@ -42,41 +41,25 @@ pub fn submit_dispatch_submission(
     .map_err(dispatch_accept_error_to_api_error)
 }
 
+/// 驱动任务派发：所有 tier 统一交给 [`RunnerManager`] 后台循环驱动。
+///
+/// 所有 tier 都走同一条后台 runner 路径：单一实现、单一调度模型，
+/// 避免「同一功能两种实现方式」（cn-engineering-standard）。
+///
+/// agent_spawn 是同步阻塞 tool call，父代理会等待子代理终态；后台 runner 模型下
+/// dispatch 由独立调度循环持续推进，子代理可以继续被派发，符合 codex 同步语义。
 pub fn drive_dispatch_submission(
     state: &ApiState,
     accepted: &mut DispatchSubmissionAccepted,
 ) -> Result<(), ApiError> {
-    let task_store = state
-        .task_store()
-        .ok_or_else(|| ApiError::internal_assembly("驱动任务派发", "task_store 未配置"))?;
-    let task = task_store
-        .get_task(&accepted.root_task_id)
-        .ok_or_else(|| ApiError::not_found("任务不存在", accepted.root_task_id.as_str()))?;
-    let is_long_mission = task
-        .policy_snapshot
-        .as_ref()
-        .is_some_and(|policy| policy.task_tier == TaskTier::LongMission);
-
-    if is_long_mission {
-        let manager = state
-            .runner_manager()
-            .ok_or_else(|| ApiError::internal_assembly("驱动任务派发", "runner_manager 未配置"))?;
-        let _ = manager.start(
-            accepted.root_task_id.as_str(),
-            Some(accepted.session_id.clone()),
-        );
-        accepted.runner_started = true;
-        return Ok(());
-    }
-
-    let drive_result = crate::a_path::drive_a_path(
-        state,
-        &accepted.root_task_id,
-        &accepted.action_task_id,
-        "驱动任务派发失败",
-    )
-    .map_err(|error| ApiError::internal_assembly("驱动任务派发失败", error.message()))?;
-    accepted.runner_started = drive_result.runner_started;
+    let manager = state
+        .runner_manager()
+        .ok_or_else(|| ApiError::internal_assembly("驱动任务派发", "runner_manager 未配置"))?;
+    let _ = manager.start(
+        accepted.root_task_id.as_str(),
+        Some(accepted.session_id.clone()),
+    );
+    accepted.runner_started = true;
     Ok(())
 }
 

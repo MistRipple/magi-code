@@ -36,20 +36,6 @@ function resolveSubTaskCardMetadata(
 }
 
 /**
- * 解析时间线消息归属的 worker Tab 聚合键。
- *
- * P1 身份契约：单一真源 `metadata.workerTabId`（由 canonical projection 写入，本质为 roleId）。
- * 旧 legacy 字段（worker / assignedWorker / agent / subTaskCard.worker / source）不再参与解析——
- * 这些字段在 role-first 架构里语义模糊（有时是实例 id、有时是 role id、有时是显示名），
- * 继续兜底会让前端身份判断不可预测。没有 workerTabId 的消息视为"非 worker 消息"。
- */
-export function resolveTimelineWorkerId(
-  metadata: Record<string, unknown> | undefined,
-): string {
-  return normalizeWorkerSlot(metadata?.workerTabId);
-}
-
-/**
  * 解析时间线消息归属的 worker 实例 id（card 身份）。
  *
  * 单一真源：`metadata.workerId`（由 canonical projection 写入）。
@@ -59,22 +45,6 @@ export function resolveTimelineWorkerInstanceId(
   metadata: Record<string, unknown> | undefined,
 ): string {
   return normalizeWorkerSlot(metadata?.workerId);
-}
-
-export function resolveTimelineDispatchWaveId(
-  metadata: Record<string, unknown> | undefined,
-): string {
-  const explicitDispatchWaveId = normalizeNonEmptyString(metadata?.dispatchWaveId);
-  if (explicitDispatchWaveId) {
-    return explicitDispatchWaveId;
-  }
-  const subTaskCard = resolveSubTaskCardMetadata(metadata);
-  const nestedDispatchWaveId = normalizeNonEmptyString(subTaskCard?.dispatchWaveId);
-  if (nestedDispatchWaveId) {
-    return nestedDispatchWaveId;
-  }
-  return normalizeNonEmptyString(metadata?.executionGroupId)
-    || normalizeNonEmptyString(subTaskCard?.executionGroupId);
 }
 
 export function resolveTimelineTaskCardScopeId(
@@ -124,27 +94,4 @@ export function resolveTimelineTaskResultKey(
     return buildTimelineAssignmentTaskKey(subTaskCardId, scopeId);
   }
   return normalizeNonEmptyString(metadata?.cardId);
-}
-
-export function resolveTimelineWorkerLaneId(
-  metadata: Record<string, unknown> | undefined,
-): string {
-  const explicitLaneId = normalizeNonEmptyString(metadata?.laneId);
-  if (explicitLaneId) {
-    return explicitLaneId;
-  }
-
-  const subTaskCard = resolveSubTaskCardMetadata(metadata);
-  const nestedLaneId = normalizeNonEmptyString(subTaskCard?.laneId);
-  if (nestedLaneId) {
-    return nestedLaneId;
-  }
-  const dispatchWaveId = resolveTimelineDispatchWaveId(metadata);
-  const worker = resolveTimelineWorkerId(metadata);
-
-  if (dispatchWaveId && worker) {
-    return `${dispatchWaveId}:${worker}`;
-  }
-
-  return '';
 }

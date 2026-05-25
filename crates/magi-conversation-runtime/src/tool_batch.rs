@@ -3,10 +3,17 @@
 //! - `execute_task_tool_call_batch`：按 concurrency 分组并发或串行调度本轮工具。
 //! - `execute_task_tool_call`：单工具入口，按 BuiltinToolName 走 coordinator/写工具/policy/
 //!   safety gate/tool registry 各分支。
-//! - `execute_coordinator_tool`：S7-E 协调器三件套（agent_spawn / send_message / task_stop）。
+//! - `execute_coordinator_tool`：协调器工具（agent_spawn）入口。
 //! - `task_policy_tool_rejection` / `safety_gate_rejection` 等支撑判定。
 
-use std::{path::PathBuf, sync::Mutex, thread};
+use std::{
+    path::PathBuf,
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+    thread,
+};
 
 use magi_bridge_client::{
     ChatToolCall,
@@ -19,7 +26,7 @@ use magi_core::{
 use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
 use magi_governance::ToolKind;
 use magi_orchestrator::task_store::TaskStore;
-use magi_session_store::{SessionStore, ThreadChatMessage};
+use magi_session_store::SessionStore;
 use magi_tool_runtime::{
     BuiltinToolName, ToolExecutionContext, ToolExecutionInput, ToolExecutionPolicy, ToolRegistry,
 };
@@ -27,12 +34,17 @@ use magi_tool_runtime::{
 use crate::builtin_tool_schema::internal_builtin_tool_rejection_payload;
 use crate::skill_apply_tool::{SKILL_APPLY_TOOL_NAME, execute_skill_apply_from_runtime};
 use crate::{
-    ConversationRegistry, MailboxAuthor, MailboxKind, RuntimeSignal,
-    task_execution_registry::{
-        SpawnedChildExecutionRequest, TaskExecutionPlan, TaskExecutionRegistry,
-    },
+    ConversationRegistry,
+    task_execution_registry::{SpawnedChildExecutionRequest, TaskExecutionRegistry},
     task_helpers::{task_can_see_builtin_tool, task_is_long_mission},
 };
+
+/// agent_spawn 生成 child task_id 时使用的进程内单调序号。
+///
+/// 仅靠 `UtcMillis::now()` 在同一毫秒内的多次并行 agent_spawn 会产生重复
+/// child_id，进而触发 SpawnGraph 的边冲突。配合毫秒时间戳一起拼到 task_id
+/// 末尾，保证同一进程内绝对唯一。
+static AGENT_SPAWN_SEQ: AtomicU64 = AtomicU64::new(0);
 
 #[allow(clippy::too_many_arguments)]
 pub fn execute_task_tool_call_batch(
@@ -189,14 +201,13 @@ pub fn execute_task_tool_call_batch(
         .collect()
 }
 
-/// S7-E：协调器三件套统一拦截入口。返回 (payload_json, status)，与
+/// S7-E：协调器工具（agent_spawn）的统一拦截入口。返回 (payload_json, status)，与
 /// `execute_task_tool_call` 的常规工具路径形状一致，便于上层把回执拼回 LLM 消息流。
 fn execute_coordinator_tool(
     event_bus: &InMemoryEventBus,
     task_store: &TaskStore,
     session_store: &SessionStore,
     execution_registry: &TaskExecutionRegistry,
-    conversation_registry: &ConversationRegistry,
     spawn_graph: &Mutex<magi_spawn_graph::SpawnGraph>,
     human_checkpoint: Option<&magi_human_checkpoint::HumanCheckpointStore>,
     task: &magi_core::Task,
@@ -300,6 +311,39 @@ fn execute_coordinator_tool(
                     ExecutionResultStatus::Failed,
                 );
             }
+            // display_name 是 LLM 提供的子代理展示名，作为 Task.title 直接面向用户。
+            // 长度限制 5-30 个 Unicode 字符；过短无信息、过长破坏子代理卡片版式。
+            let display_name = parsed
+                .get("display_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let display_name_chars = display_name.chars().count();
+            if display_name.is_empty() {
+                return (
+                    serde_json::json!({
+                        "tool": tool.as_str(),
+                        "status": "failed",
+                        "error": "agent_spawn 缺少必需字段 display_name",
+                    })
+                    .to_string(),
+                    ExecutionResultStatus::Failed,
+                );
+            }
+            if !(5..=30).contains(&display_name_chars) {
+                return (
+                    serde_json::json!({
+                        "tool": tool.as_str(),
+                        "status": "failed",
+                        "error": format!(
+                            "agent_spawn display_name 长度必须在 5-30 个字符之间，实际 {display_name_chars}",
+                        ),
+                    })
+                    .to_string(),
+                    ExecutionResultStatus::Failed,
+                );
+            }
             let context = parsed
                 .get("context")
                 .and_then(|v| v.as_str())
@@ -324,14 +368,22 @@ fn execute_coordinator_tool(
                 })
                 .unwrap_or(TaskKind::LocalAgent);
             let now = UtcMillis::now();
-            let child_id = TaskId::new(format!("task-spawn-{}-{}", task.task_id.as_str(), now.0));
+            // 单调序号 + 毫秒时间戳一起拼接，避免同一毫秒内多次并行 agent_spawn
+            // 生成同名 child_id（会击穿 SpawnGraph 边唯一性约束）。
+            let seq = AGENT_SPAWN_SEQ.fetch_add(1, Ordering::Relaxed);
+            let child_id = TaskId::new(format!(
+                "task-spawn-{}-{}-{}",
+                task.task_id.as_str(),
+                now.0,
+                seq
+            ));
             let child = magi_core::Task {
                 task_id: child_id.clone(),
                 mission_id: task.mission_id.clone(),
                 root_task_id: task.root_task_id.clone(),
                 parent_task_id: Some(task.task_id.clone()),
                 kind: task_kind,
-                title: format!("{role}: {goal}"),
+                title: display_name,
                 goal: child_goal,
                 status: TaskStatus::Pending,
                 dependency_ids: Vec::new(),
@@ -391,248 +443,139 @@ fn execute_coordinator_tool(
                     "goal": goal,
                     "task_kind": format!("{:?}", task_kind),
                     "worker_id": registered_execution.worker_id.to_string(),
-                    "lane_id": registered_execution.lane_id,
-                    "lane_seq": registered_execution.lane_seq,
                     "thread_id": registered_execution.thread_id.to_string(),
                     "execution_chain_ref": registered_execution.execution_chain_ref,
                 }),
             );
-            (
+
+            // 同步阻塞：父代理本轮停在该 tool call 上，等待子代理终态。
+            // 后台 TaskRunner 调度线程独立运行，会持续派发本子任务到 worker；
+            // 子任务终态由 TaskRunner.apply_results 写入 TaskStore，本线程在此轮询读取。
+            wait_for_child_terminal_outcome(task_store, &child_id, tool, &role)
+        }
+        _ => unreachable!("execute_coordinator_tool 只接收 AgentSpawn 变体"),
+    }
+}
+
+/// 父代理在本线程同步阻塞至子任务进入 Completed / Failed / Killed 终态，
+/// 把 TaskStore 中写下的 output_refs 直接打包成 tool_call_result 返回。
+///
+/// - 不再依赖 mailbox AgentResult 信号或 Conversation 重新发起轮次；
+/// - TaskRunner 后台线程独立运行，本线程阻塞不影响其调度；
+/// - 父任务的租约由 TaskRunner.heartbeat 持续续期，不会因等待过期。
+fn wait_for_child_terminal_outcome(
+    task_store: &TaskStore,
+    child_id: &TaskId,
+    tool: magi_tool_runtime::BuiltinToolName,
+    role: &str,
+) -> (String, ExecutionResultStatus) {
+    const POLL_INTERVAL_MS: u64 = 100;
+    loop {
+        let Some(child) = task_store.get_task(child_id) else {
+            return (
                 serde_json::json!({
                     "tool": tool.as_str(),
-                    "status": "succeeded",
+                    "status": "failed",
                     "child_task_id": child_id.to_string(),
                     "role": role,
+                    "error": "agent_spawn 等待子任务时 TaskStore 中未找到记录",
                 })
                 .to_string(),
-                ExecutionResultStatus::Succeeded,
-            )
-        }
-        magi_tool_runtime::BuiltinToolName::SendMessage => {
-            let target = parsed
-                .get("target_task_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            let payload = parsed
-                .get("payload")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null);
-            if target.is_empty() || payload.is_null() {
-                return (
-                    serde_json::json!({
-                        "tool": tool.as_str(),
-                        "status": "failed",
-                        "error": "send_message 缺少必需字段 target_task_id 或 payload",
-                    })
-                    .to_string(),
-                    ExecutionResultStatus::Failed,
-                );
-            }
-            let target_id = TaskId::new(target.clone());
-            let Some(target_task) = task_store.get_task(&target_id) else {
-                return (
-                    serde_json::json!({
-                        "tool": tool.as_str(),
-                        "status": "failed",
-                        "error": format!("send_message 目标 task {target} 不存在"),
-                    })
-                    .to_string(),
-                    ExecutionResultStatus::Failed,
-                );
-            };
-            if target_id == task.task_id {
-                return (
-                    serde_json::json!({
-                        "tool": tool.as_str(),
-                        "status": "failed",
-                        "error": "send_message 不允许投递给当前 task；请直接在当前 Turn 内处理该信息",
-                    })
-                    .to_string(),
-                    ExecutionResultStatus::Failed,
-                );
-            }
-            if target_task.mission_id != task.mission_id
-                || target_task.root_task_id != task.root_task_id
-            {
-                return (
-                    serde_json::json!({
-                        "tool": tool.as_str(),
-                        "status": "failed",
-                        "error": format!("send_message 目标 task {target} 不属于当前任务树"),
-                    })
-                    .to_string(),
-                    ExecutionResultStatus::Failed,
-                );
-            }
-            let related_by_spawn_graph = match spawn_graph.lock() {
-                Ok(graph) => {
-                    graph.parent_of(&target_id) == Some(&task.task_id)
-                        || graph.parent_of(&task.task_id) == Some(&target_id)
-                        || graph
-                            .ancestors(&target_id)
-                            .iter()
-                            .any(|id| id == &task.task_id)
-                        || graph
-                            .ancestors(&task.task_id)
-                            .iter()
-                            .any(|id| id == &target_id)
-                }
-                Err(err) => {
-                    tracing::warn!(?err, "send_message SpawnGraph mutex poisoned");
-                    false
-                }
-            };
-            if !related_by_spawn_graph {
-                return (
-                    serde_json::json!({
-                        "tool": tool.as_str(),
-                        "status": "failed",
-                        "error": format!("send_message 目标 task {target} 不是当前 task 的 SpawnGraph 父子/后代节点"),
-                    })
-                    .to_string(),
-                    ExecutionResultStatus::Failed,
-                );
-            }
-            let Some(TaskExecutionPlan::Dispatch { thread_id, .. }) =
-                execution_registry.get(&target_id)
-            else {
-                return (
-                    serde_json::json!({
-                        "tool": tool.as_str(),
-                        "status": "failed",
-                        "error": format!("send_message 目标 task {target} 尚未注册执行 thread，无法投递运行时输入"),
-                    })
-                    .to_string(),
-                    ExecutionResultStatus::Failed,
-                );
-            };
-            let now = UtcMillis::now();
-            let mailbox_kind = parsed
-                .get("kind")
-                .and_then(|v| v.as_str())
-                .and_then(parse_mailbox_kind)
-                .unwrap_or(MailboxKind::Message);
-            let signal_payload = serde_json::json!({
-                "from_task_id": task.task_id.to_string(),
-                "target_task_id": target,
-                "payload": payload,
-            });
-            conversation_registry
-                .conversation_for_task(session_id, &target_id)
-                .lock()
-                .expect("target task Conversation mutex poisoned")
-                .ingest_runtime_signal(RuntimeSignal {
-                    author: MailboxAuthor::Parent(task.task_id.to_string()),
-                    kind: mailbox_kind,
-                    trigger_turn: true,
-                    payload: signal_payload.clone(),
-                    enqueued_at: now,
-                });
-            session_store.append_thread_messages(
-                &thread_id,
-                vec![ThreadChatMessage {
-                    role: "system".to_string(),
-                    content: Some(format!(
-                        "[mailbox]\nauthor=parent:{}\nkind={}\npayload={}",
-                        task.task_id,
-                        mailbox_kind_name(mailbox_kind),
-                        signal_payload
-                    )),
-                    tool_calls: Vec::new(),
-                    tool_call_id: None,
-                }],
-                now,
+                ExecutionResultStatus::Failed,
             );
-            publish_event(
-                "task.coordinator.send_message",
-                serde_json::json!({
-                    "from_task_id": task.task_id.to_string(),
-                    "target_task_id": target,
-                    "thread_id": thread_id.to_string(),
-                    "kind": mailbox_kind_name(mailbox_kind),
-                    "payload": signal_payload,
-                }),
-            );
-            (
-                serde_json::json!({
-                    "tool": tool.as_str(),
-                    "status": "succeeded",
-                    "target_task_id": target,
-                })
-                .to_string(),
-                ExecutionResultStatus::Succeeded,
-            )
-        }
-        magi_tool_runtime::BuiltinToolName::TaskStop => {
-            let target = parsed
-                .get("target_task_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            if target.is_empty() {
+        };
+        match child.status {
+            TaskStatus::Completed => {
+                return (
+                    serde_json::json!({
+                        "tool": tool.as_str(),
+                        "status": "succeeded",
+                        "child_task_id": child_id.to_string(),
+                        "role": role,
+                        "title": child.title,
+                        "output_refs": child.output_refs,
+                    })
+                    .to_string(),
+                    ExecutionResultStatus::Succeeded,
+                );
+            }
+            TaskStatus::Failed => {
+                let error = child
+                    .output_refs
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "子任务执行失败".to_string());
+                if subagent_unavailable_failure(&error) {
+                    return (
+                        serde_json::json!({
+                            "tool": tool.as_str(),
+                            "status": "degraded",
+                            "child_status": "failed",
+                            "fallback_mode": "mainline_or_reassign",
+                            "child_task_id": child_id.to_string(),
+                            "role": role,
+                            "title": child.title,
+                            "output_refs": child.output_refs,
+                            "error": error,
+                            "instruction": "子代理当前不可用。请不要停止任务：优先改派其他可用角色继续；如果没有必要继续派发，则由主线根据已有上下文直接推进并给出最终结果。",
+                        })
+                        .to_string(),
+                        ExecutionResultStatus::Succeeded,
+                    );
+                }
                 return (
                     serde_json::json!({
                         "tool": tool.as_str(),
                         "status": "failed",
-                        "error": "task_stop 缺少必需字段 target_task_id",
+                        "child_task_id": child_id.to_string(),
+                        "role": role,
+                        "title": child.title,
+                        "output_refs": child.output_refs,
+                        "error": error,
                     })
                     .to_string(),
                     ExecutionResultStatus::Failed,
                 );
             }
-            let target_id = TaskId::new(target.clone());
-            if task_store.get_task(&target_id).is_none() {
+            TaskStatus::Killed => {
                 return (
                     serde_json::json!({
                         "tool": tool.as_str(),
-                        "status": "failed",
-                        "error": format!("task_stop 目标 task {target} 不存在"),
+                        "status": "killed",
+                        "child_task_id": child_id.to_string(),
+                        "role": role,
+                        "title": child.title,
+                        "error": "子任务被终止",
                     })
                     .to_string(),
                     ExecutionResultStatus::Failed,
                 );
             }
-            let mut cancelled: Vec<String> = Vec::new();
-            // 先收集 open 子孙，再统一标记 cancel —— 锁内只做拓扑查询，避免持锁更新 store。
-            let descendants = match spawn_graph.lock() {
-                Ok(graph) => graph.open_descendants(&target_id),
-                Err(err) => {
-                    tracing::warn!(?err, "task_stop SpawnGraph mutex poisoned，仅取消目标任务");
-                    Vec::new()
-                }
-            };
-            for id in std::iter::once(target_id.clone()).chain(descendants.into_iter()) {
-                if task_store.update_status(&id, TaskStatus::Killed).is_ok() {
-                    cancelled.push(id.to_string());
-                    if let Ok(mut graph) = spawn_graph.lock() {
-                        let _ = graph.mark_closed(&id, std::time::SystemTime::now());
-                    }
-                }
+            TaskStatus::Pending | TaskStatus::Running => {
+                thread::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS));
             }
-            publish_event(
-                "task.coordinator.task_stop",
-                serde_json::json!({
-                    "from_task_id": task.task_id.to_string(),
-                    "target_task_id": target,
-                    "cancelled_task_ids": cancelled,
-                    "reason": parsed.get("reason").and_then(|v| v.as_str()).unwrap_or(""),
-                }),
-            );
-            (
-                serde_json::json!({
-                    "tool": tool.as_str(),
-                    "status": "succeeded",
-                    "cancelled_task_ids": cancelled,
-                })
-                .to_string(),
-                ExecutionResultStatus::Succeeded,
-            )
         }
-        _ => unreachable!("execute_coordinator_tool 只接收 3 个协调器变体"),
     }
+}
+
+fn subagent_unavailable_failure(error: &str) -> bool {
+    let normalized = error.trim().to_ascii_lowercase();
+    [
+        "llm invocation failed",
+        "模型配置不可用",
+        "model bridge client",
+        "子代理不可用",
+        "没有匹配角色",
+        "没有匹配",
+        "provider transport failed",
+        "provider rejected request",
+        "invalid base_url",
+        "connection refused",
+        "timed out",
+        "timeout",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(&needle.to_ascii_lowercase()))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -644,7 +587,7 @@ fn execute_task_tool_call(
     task_store: &TaskStore,
     session_store: &SessionStore,
     execution_registry: &TaskExecutionRegistry,
-    conversation_registry: &ConversationRegistry,
+    _conversation_registry: &ConversationRegistry,
     spawn_graph: &Mutex<magi_spawn_graph::SpawnGraph>,
     safety_gate: Option<&magi_safety_gate::SafetyGate>,
     todo_ledger: &magi_todo_ledger::TodoLedger,
@@ -662,8 +605,8 @@ fn execute_task_tool_call(
     worker_id: Option<&magi_core::WorkerId>,
     tool_call: &ChatToolCall,
 ) -> (String, ExecutionResultStatus) {
-    // S7-E：协调器三件套（agent_spawn / send_message / task_stop）由 orchestration 层拦截，
-    // 不进 BuiltinTool::execute —— 它们需要 task_store / spawn_graph / event_bus 等上下文。
+    // S7-E：协调器工具（agent_spawn）由 orchestration 层拦截，
+    // 不进 BuiltinTool::execute —— 它需要 task_store / spawn_graph / event_bus 等上下文。
     // S9：TodoWrite 同样在此层拦截，因为它要操作 session 维度的 TodoLedger。
     // S10：MemoryWrite 同样在此层拦截，因为它要操作 workspace 维度的 ProjectMemoryStore。
     // S11：MissionCharterWrite 同样在此层拦截，因为它要操作 mission 维度的 MissionCharterStore。
@@ -682,18 +625,12 @@ fn execute_task_tool_call(
                 ExecutionResultStatus::Rejected,
             );
         }
-        if matches!(
-            canonical,
-            magi_tool_runtime::BuiltinToolName::AgentSpawn
-                | magi_tool_runtime::BuiltinToolName::SendMessage
-                | magi_tool_runtime::BuiltinToolName::TaskStop
-        ) {
+        if matches!(canonical, magi_tool_runtime::BuiltinToolName::AgentSpawn) {
             return execute_coordinator_tool(
                 event_bus,
                 task_store,
                 session_store,
                 execution_registry,
-                conversation_registry,
                 spawn_graph,
                 human_checkpoint,
                 task,
@@ -952,28 +889,6 @@ fn task_policy_tool_rejection(
     None
 }
 
-fn parse_mailbox_kind(raw: &str) -> Option<MailboxKind> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "" => None,
-        "message" | "user" => Some(MailboxKind::Message),
-        "decision" => Some(MailboxKind::Decision),
-        "interrupt" => Some(MailboxKind::Interrupt),
-        "agent_result" | "agent-result" | "result" => Some(MailboxKind::AgentResult),
-        "followup" | "follow_up" | "follow-up" => Some(MailboxKind::Followup),
-        _ => None,
-    }
-}
-
-fn mailbox_kind_name(kind: MailboxKind) -> &'static str {
-    match kind {
-        MailboxKind::Message => "message",
-        MailboxKind::Decision => "decision",
-        MailboxKind::Interrupt => "interrupt",
-        MailboxKind::AgentResult => "agent_result",
-        MailboxKind::Followup => "followup",
-    }
-}
-
 fn canonical_builtin_tool_name(tool_name: &str) -> Option<String> {
     BuiltinToolName::from_str(tool_name.trim()).map(|tool| tool.as_str().to_string())
 }
@@ -1027,17 +942,8 @@ fn safety_gate_rejection(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::MailboxItem;
     use magi_bridge_client::ChatToolFunction;
-    use magi_core::{
-        ExecutionOwnership, MissionId, Task, TaskExecutionTarget, TaskPolicy, TaskRuntimePayload,
-        ThreadId, WorkerId, WorkspaceRootPath,
-    };
-    use magi_orchestrator::ExecutionWritebackPlans;
-    use magi_session_store::{
-        ActiveExecutionBranch, ActiveExecutionChain, ActiveExecutionDispatchContext,
-        ActiveExecutionTurn,
-    };
+    use magi_core::{MissionId, Task, TaskPolicy, TaskRuntimePayload, WorkspaceRootPath};
 
     fn test_task(task_id: &str, root_task_id: &str, parent_task_id: Option<TaskId>) -> Task {
         Task {
@@ -1207,204 +1113,6 @@ mod tests {
         assert_eq!(coordinator_result[0].1, ExecutionResultStatus::Rejected);
     }
 
-    fn dispatch_plan(
-        session_id: &SessionId,
-        workspace_id: &Option<WorkspaceId>,
-        task: &Task,
-        thread_id: &ThreadId,
-    ) -> TaskExecutionPlan {
-        let worker_id = WorkerId::new(format!("worker-{}", task.task_id));
-        TaskExecutionPlan::Dispatch {
-            target: TaskExecutionTarget {
-                mission_id: task.mission_id.clone(),
-                root_task_id: task.root_task_id.clone(),
-                task_id: task.task_id.clone(),
-                requested_worker_id: Some(worker_id.clone()),
-                recovery_id: None,
-                execution_chain_ref: None,
-            },
-            worker_id: worker_id.clone(),
-            lane_id: None,
-            lane_seq: None,
-            thread_id: thread_id.clone(),
-            is_primary: false,
-            session_id: session_id.clone(),
-            workspace_id: workspace_id.clone(),
-            ownership: ExecutionOwnership {
-                session_id: Some(session_id.clone()),
-                workspace_id: workspace_id.clone(),
-                mission_id: Some(task.mission_id.clone()),
-                task_id: Some(task.task_id.clone()),
-                worker_id: Some(worker_id),
-                execution_chain_ref: None,
-            },
-            writebacks: ExecutionWritebackPlans::default(),
-            use_tools: true,
-            skill_name: None,
-        }
-    }
-
-    #[test]
-    fn agent_spawn_registers_child_execution_plan_and_lane() {
-        let event_bus = InMemoryEventBus::new(16);
-        let task_store = TaskStore::new();
-        let session_store = SessionStore::new();
-        let execution_registry = TaskExecutionRegistry::default();
-        let conversation_registry = ConversationRegistry::new();
-        let spawn_graph = Mutex::new(magi_spawn_graph::SpawnGraph::new());
-        let todo_ledger = magi_todo_ledger::TodoLedger::new();
-        let agent_role_registry = magi_agent_role::AgentRoleRegistry::load_default();
-
-        let session_id = SessionId::new("session-agent-spawn");
-        let workspace_id = Some(WorkspaceId::new("workspace-agent-spawn"));
-        let parent = coordinator_task(test_task("task-parent", "task-parent", None));
-        task_store.insert_task(parent.clone());
-        let now = UtcMillis::now();
-        let _ =
-            session_store.ensure_session_mission(&session_id, now, || parent.mission_id.clone());
-        let parent_worker_id = WorkerId::new("worker-parent");
-        session_store
-            .upsert_active_execution_chain(
-                session_id.clone(),
-                ActiveExecutionChain {
-                    session_id: session_id.clone(),
-                    mission_id: parent.mission_id.clone(),
-                    root_task_id: parent.root_task_id.clone(),
-                    execution_chain_ref: "chain-agent-spawn".to_string(),
-                    workspace_id: workspace_id.clone(),
-                    active_branch_task_ids: vec![parent.task_id.clone()],
-                    active_worker_bindings: vec![parent_worker_id.clone()],
-                    branches: vec![ActiveExecutionBranch {
-                        task_id: parent.task_id.clone(),
-                        worker_id: parent_worker_id,
-                        stage: "execute".to_string(),
-                        lease_id: None,
-                        execution_intent_ref: None,
-                        binding_lifecycle: None,
-                        checkpoint_stage: Some("execute".to_string()),
-                        next_step_index: Some(0),
-                        checkpoint_at: Some(now),
-                        resume_mode: Some("stage-restart".to_string()),
-                        resume_token: None,
-                        use_tools: true,
-                        skill_name: None,
-                        is_primary: true,
-                    }],
-                    recovery_ref: None,
-                    dispatch_context: ActiveExecutionDispatchContext {
-                        accepted_at: now,
-                        entry_id: "timeline-agent-spawn".to_string(),
-                        trimmed_text: Some("spawn child".to_string()),
-                        skill_name: None,
-                    },
-                    current_turn: Some(ActiveExecutionTurn {
-                        turn_id: "turn-agent-spawn".to_string(),
-                        turn_seq: now.0,
-                        accepted_at: now,
-                        completed_at: None,
-                        status: "running".to_string(),
-                        user_message: Some("spawn child".to_string()),
-                        items: Vec::new(),
-                        worker_lanes: Vec::new(),
-                    }),
-                },
-            )
-            .expect("active chain should be accepted");
-
-        let tool_call = ChatToolCall {
-            id: "call-agent-spawn".to_string(),
-            kind: "function".to_string(),
-            function: ChatToolFunction {
-                name: BuiltinToolName::AgentSpawn.as_str().to_string(),
-                arguments: serde_json::json!({
-                    "role": "integration-dev",
-                    "goal": "执行子任务",
-                    "context": "必须调用 shell_exec 输出 CHILD_OK",
-                    "task_kind": "action"
-                })
-                .to_string(),
-            },
-        };
-
-        let result = execute_task_tool_call_batch(
-            &event_bus,
-            None,
-            &agent_role_registry,
-            None,
-            &task_store,
-            &session_store,
-            &execution_registry,
-            &conversation_registry,
-            &spawn_graph,
-            None,
-            &todo_ledger,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            &parent,
-            &session_id,
-            &workspace_id,
-            None,
-            Some(&WorkerId::new("worker-parent")),
-            &[tool_call],
-        );
-
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].1, ExecutionResultStatus::Succeeded);
-        let payload: serde_json::Value =
-            serde_json::from_str(&result[0].0).expect("agent_spawn result should be json");
-        let child_task_id = TaskId::new(
-            payload["child_task_id"]
-                .as_str()
-                .expect("child_task_id should be present"),
-        );
-        let child = task_store
-            .get_task(&child_task_id)
-            .expect("spawned child task should exist");
-        assert!(child.goal.contains("CHILD_OK"));
-
-        let plan = execution_registry
-            .get(&child_task_id)
-            .expect("spawned child should have v2 execution plan");
-        match plan {
-            TaskExecutionPlan::Dispatch {
-                lane_id,
-                lane_seq,
-                session_id: plan_session_id,
-                use_tools,
-                ..
-            } => {
-                assert_eq!(plan_session_id, session_id);
-                assert!(lane_id.is_some());
-                assert_eq!(lane_seq, Some(1));
-                assert!(use_tools);
-            }
-        }
-        let sidecar = session_store
-            .runtime_sidecar(&session_id)
-            .expect("runtime sidecar should exist");
-        let chain = sidecar
-            .active_execution_chain
-            .expect("active chain should exist");
-        assert!(
-            chain
-                .branches
-                .iter()
-                .any(|branch| branch.task_id == child_task_id)
-        );
-        assert_eq!(
-            chain
-                .current_turn
-                .as_ref()
-                .map(|turn| turn.worker_lanes.len()),
-            Some(1)
-        );
-    }
-
     #[test]
     fn agent_spawn_rejects_when_human_checkpoint_is_pending() {
         let event_bus = InMemoryEventBus::new(16);
@@ -1432,7 +1140,7 @@ mod tests {
             function: ChatToolFunction {
                 name: BuiltinToolName::AgentSpawn.as_str().to_string(),
                 arguments: serde_json::json!({
-                    "role": "integration-dev",
+                    "role": "executor",
                     "goal": "不应创建的子任务"
                 })
                 .to_string(),
@@ -1503,7 +1211,7 @@ mod tests {
             function: ChatToolFunction {
                 name: BuiltinToolName::AgentSpawn.as_str().to_string(),
                 arguments: serde_json::json!({
-                    "role": "integration-dev",
+                    "role": "executor",
                     "goal": "缺少人审 store 时不应创建"
                 })
                 .to_string(),
@@ -1546,116 +1254,15 @@ mod tests {
     }
 
     #[test]
-    fn send_message_routes_to_target_task_mailbox_and_thread_history() {
-        let event_bus = InMemoryEventBus::new(16);
-        let task_store = TaskStore::new();
-        let session_store = SessionStore::new();
-        let execution_registry = TaskExecutionRegistry::default();
-        let conversation_registry = ConversationRegistry::new();
-        let spawn_graph = Mutex::new(magi_spawn_graph::SpawnGraph::new());
-        let todo_ledger = magi_todo_ledger::TodoLedger::new();
-        let agent_role_registry = magi_agent_role::AgentRoleRegistry::load_default();
-
-        let session_id = SessionId::new("session-mailbox");
-        let workspace_id = Some(WorkspaceId::new("workspace-mailbox"));
-        let parent = coordinator_task(test_task("task-parent", "task-parent", None));
-        let child = test_task(
-            "task-child",
-            "task-parent",
-            Some(TaskId::new("task-parent")),
-        );
-        task_store.insert_task(parent.clone());
-        task_store.insert_task(child.clone());
-        spawn_graph
-            .lock()
-            .expect("spawn graph lock should hold")
-            .add_edge(
-                parent.task_id.clone(),
-                child.task_id.clone(),
-                child.kind,
-                std::time::SystemTime::UNIX_EPOCH,
-            )
-            .expect("parent/child edge should register");
-        let (_, target_thread_id) =
-            session_store
-                .ensure_session_mission(&session_id, UtcMillis::now(), || child.mission_id.clone());
-        execution_registry.insert(
-            child.task_id.clone(),
-            dispatch_plan(&session_id, &workspace_id, &child, &target_thread_id),
-        );
-
-        let tool_call = ChatToolCall {
-            id: "call-send-message".to_string(),
-            kind: "function".to_string(),
-            function: ChatToolFunction {
-                name: BuiltinToolName::SendMessage.as_str().to_string(),
-                arguments: serde_json::json!({
-                    "target_task_id": child.task_id.to_string(),
-                    "kind": "agent-result",
-                    "payload": {"summary": "child result is ready"}
-                })
-                .to_string(),
-            },
-        };
-
-        let result = execute_task_tool_call_batch(
-            &event_bus,
-            None,
-            &agent_role_registry,
-            None,
-            &task_store,
-            &session_store,
-            &execution_registry,
-            &conversation_registry,
-            &spawn_graph,
-            None,
-            &todo_ledger,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            &parent,
-            &session_id,
-            &workspace_id,
-            None,
-            None,
-            &[tool_call],
-        );
-
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].1, ExecutionResultStatus::Succeeded);
-
-        let target_conversation =
-            conversation_registry.conversation_for_task(&session_id, &child.task_id);
-        let pending = target_conversation
-            .lock()
-            .expect("target conversation lock poisoned")
-            .drain_mailbox_items();
-        assert_eq!(pending.len(), 1);
-        match &pending[0] {
-            MailboxItem::Runtime(signal) => {
-                assert_eq!(signal.kind, MailboxKind::AgentResult);
-                assert_eq!(
-                    signal.author,
-                    MailboxAuthor::Parent(parent.task_id.to_string())
-                );
-                assert!(signal.trigger_turn);
-                assert_eq!(
-                    signal.payload["payload"]["summary"].as_str(),
-                    Some("child result is ready")
-                );
-            }
-            MailboxItem::User(_) => panic!("send_message must enqueue runtime mailbox item"),
-        }
-
-        let history = session_store.thread_message_history(&target_thread_id);
-        assert_eq!(history.len(), 1);
-        let content = history[0].content.as_deref().unwrap_or_default();
-        assert!(content.contains("[mailbox]"));
-        assert!(content.contains("kind=agent_result"));
-        assert!(content.contains("child result is ready"));
+    fn subagent_unavailable_failure_is_degradable() {
+        assert!(subagent_unavailable_failure(
+            "LLM invocation failed (round 0): provider transport failed: timed out"
+        ));
+        assert!(subagent_unavailable_failure(
+            "模型配置不可用: model bridge client 未配置"
+        ));
+        assert!(!subagent_unavailable_failure(
+            "工具执行失败，任务不能标记完成：file_write: denied"
+        ));
     }
 }

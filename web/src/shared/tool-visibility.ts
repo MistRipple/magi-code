@@ -1,11 +1,11 @@
 /**
- * 工具可见性分级 — 统一判定工具调用在 Thread/Worker Tab 中的可见性
+ * 工具可见性分级 — 统一判定工具调用在主线 / 子代理详情中的可见性
  *
  * 设计原则（架构方案）：
- * - runtime_internal：编排器内部协议工具（worker_dispatch/wait/send_message/task 等），
- *   不应出现在任何 UI 面板
- * - worker_sidechain：Worker 自身调用的工具（shell/edit/search 等），
- *   仅在 Worker Tab（侧链）展示
+ * - runtime_internal：模型侧内部协议工具，不应出现在任何 UI 面板
+ * - agent_spawn：同步子代理调用本身是主线可见的 ToolCall 卡片，不能归入内部工具
+ * - worker_sidechain：子代理自身调用的工具（shell/edit/search 等），
+ *   仅在子代理详情展示
  * - thread_visible：用户可见的工具调用（如搜索结果、文件变更摘要等），
  *   展示在主线
  *
@@ -21,21 +21,9 @@ export type ToolVisibility = 'thread_visible' | 'runtime_internal' | 'worker_sid
  * 该列表必须与后端 `BuiltinToolName::is_public_tool_surface()` 保持一致：
  *   - process_launch / process_read / process_write / process_kill / process_list
  *     在后端被标记为 shell_exec 的内部执行能力，不是模型可见工具；前端同样不展示。
- *   - 其余条目是编排协议工具（worker_dispatch / worker_wait / send_worker_message 等），
- *     由编排器内部使用，不面向用户。
  */
 const RUNTIME_INTERNAL_TOOLS = new Set<string>([
-  // 编排协议（worker lane / task projection）
-  'assignment_dispatch',
-  'worker_dispatch',
-  'worker_wait',
-  'send_worker_message',
-  'sendworkermessage',
-  'wait_for_workers',
-  'waitforworkers',
-  'worker_poll',
-  'dispatch_task',
-  'dispatchtask',
+  // 旧编排控制与状态类工具已经退出模型可见面；这里仅保留仍存在的内部控制项。
   'task_status',
   'context_window_status',
   'instruction_skill',
@@ -47,15 +35,10 @@ const RUNTIME_INTERNAL_TOOLS = new Set<string>([
   'submit_review',
   'read_instructions',
   'governance_handshake',
-  // Task System v2 协调 / 长任务工具：这些是模型侧编排协议，不进入用户可见时间线。
-  'agent_spawn',
+  // Task System v2 协调 / 长任务工具：这些是模型侧内部协议，不进入用户可见时间线。
+  // agent_spawn 除外：它是父代理主线上的同步子代理 ToolCall 卡片。
   'agent',
   'spawn_agent',
-  'send_message',
-  'message_task',
-  'task_stop',
-  'stop_task',
-  'cancel_task',
   'todo_write',
   'todowrite',
   'todo',
@@ -94,7 +77,7 @@ const RUNTIME_INTERNAL_TOOLS = new Set<string>([
  * 解析工具调用的可见性级别。
  *
  * @param toolName 工具名称
- * @param callerContext 调用者上下文（orchestrator = 编排器自身调用，worker = Worker 调用）
+ * @param callerContext 调用者上下文（orchestrator = 编排器自身调用，worker = 子代理调用）
  */
 export function resolveToolVisibility(
   toolName: string,
@@ -107,7 +90,7 @@ export function resolveToolVisibility(
     return 'runtime_internal';
   }
 
-  // Worker 调用的工具 → 侧链可见
+  // 子代理调用的工具 → 详情页可见
   if (callerContext === 'worker') {
     return 'worker_sidechain';
   }

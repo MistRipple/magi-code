@@ -78,39 +78,24 @@ pub struct ActiveExecutionBranch {
     pub skill_name: Option<String>,
     #[serde(default)]
     pub is_primary: bool,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-/// `ActiveExecutionTurnLane` 是 Thread 在某个 turn 的"派发快照"：
-/// thread 是跨 turn / 跨 task 的稳定身份（见 [`ExecutionThread`]），
-/// lane 是 thread 在当前 turn 中实际承担工作的视图记录。`thread_id` 必须
-/// 能回溯到同一 mission 下注册过的 ExecutionThread。
-pub struct ActiveExecutionTurnLane {
-    pub lane_id: String,
-    pub lane_seq: usize,
-    pub task_id: TaskId,
-    pub worker_id: WorkerId,
-    /// lane 所属角色。必填：P7 收敛后 lane 必须由 role 驱动派发。
-    pub role_id: String,
-    /// lane 绑定到其隶属的 Thread（worker thread 或 orchestrator thread）。
+    /// branch 关联的 thread id。
+    ///
+    /// session resume 时 rebuild dispatch plan 需要取回 sub-task 的 thread；
+    /// `ensure_thread_for_role` 用 `now.0` 拼 id 不可重放，必须持久化在 branch。
     pub thread_id: ThreadId,
-    pub title: String,
-    #[serde(default)]
-    pub is_primary: bool,
 }
 
 pub const CANONICAL_TURN_SCHEMA_VERSION: &str = "canonical-turn.v1";
 
 /// `source_thread_id` 的可见性判定结果：
 /// - `Main`：对应 session 的 orchestrator thread，item 归属主线时间线
-/// - `WorkerDrawer`：对应某条 worker thread，item 归属该 worker 的 drawer
+/// - `TaskDetail`：对应某条子代理 task thread，item 归属该 task 详情
 ///
 /// 由 `SessionStore::resolve_thread_visibility` 返回，是后端路由可见性的唯一出口。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ThreadVisibility {
     Main,
-    WorkerDrawer {
+    TaskDetail {
         role_id: String,
         worker_id: WorkerId,
     },
@@ -161,9 +146,6 @@ pub enum CanonicalTurnItemKind {
     AssistantText,
     AssistantThinking,
     ToolCall,
-    WorkerDispatch,
-    WorkerStatus,
-    WorkerResult,
     TaskStatus,
     SystemNotice,
 }
@@ -272,10 +254,6 @@ pub struct CanonicalTurnItem {
     pub item_version: Option<u64>,
     pub updated_at: UtcMillis,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub lane_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub lane_seq: Option<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
@@ -286,7 +264,7 @@ pub struct CanonicalTurnItem {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worker: Option<CanonicalWorkerRef>,
     /// item 归属的 thread_id。orchestrator 主线 item 为 session 级 orchestrator thread，
-    /// worker sidechain item 为对应 worker thread。前端 projection 用它作为单一路由键。
+    /// 子代理 item 为对应 task thread。前端 projection 用它作为单一路由键。
     pub source_thread_id: ThreadId,
     #[serde(default)]
     pub visibility: CanonicalTurnVisibility,
@@ -310,8 +288,6 @@ impl CanonicalTurnItem {
             self.created_at == existing.created_at,
             &self.item_id,
         )?;
-        reject_changed_field("laneId", self.lane_id == existing.lane_id, &self.item_id)?;
-        reject_changed_field("laneSeq", self.lane_seq == existing.lane_seq, &self.item_id)?;
         reject_changed_field(
             "tool.callId",
             self.tool_call_id() == existing.tool_call_id(),
@@ -420,10 +396,6 @@ fn reject_changed_field(field: &'static str, unchanged: bool, identity: &str) ->
 pub struct ActiveExecutionTurnItem {
     pub item_id: String,
     pub item_seq: usize,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub lane_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub lane_seq: Option<usize>,
     pub kind: String,
     pub status: String,
     pub source: String,
@@ -458,8 +430,8 @@ pub struct ActiveExecutionTurnItem {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeline_entry_id: Option<String>,
     /// item 归属的 thread。orchestrator 主线 item 为 session 级 orchestrator thread；
-    /// worker sidechain item 为对应 worker thread。单一路由键，前端按此 + thread 的
-    /// `role_id` 判定主线 / drawer 归属。
+    /// 子代理 item 为对应 task thread。单一路由键，前端按此 + thread 的 `role_id`
+    /// 判定主线 / task 详情归属。
     pub source_thread_id: ThreadId,
 }
 
@@ -476,8 +448,6 @@ pub struct ActiveExecutionTurn {
     pub user_message: Option<String>,
     #[serde(default)]
     pub items: Vec<ActiveExecutionTurnItem>,
-    #[serde(default)]
-    pub worker_lanes: Vec<ActiveExecutionTurnLane>,
 }
 
 fn default_true() -> bool {
@@ -486,11 +456,6 @@ fn default_true() -> bool {
 
 impl ActiveExecutionTurn {
     pub fn normalize(&mut self) {
-        self.worker_lanes.sort_by(|left, right| {
-            left.lane_seq
-                .cmp(&right.lane_seq)
-                .then_with(|| left.lane_id.cmp(&right.lane_id))
-        });
         self.items.sort_by(|left, right| {
             left.item_seq
                 .cmp(&right.item_seq)

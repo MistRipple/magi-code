@@ -31,16 +31,11 @@ export interface WorkerRoleRegistrySnapshot {
 }
 
 const BUILTIN_ROLE_TEMPLATE_IDS = [
-  'frontend-dev',
-  'backend-dev',
+  'coordinator',
+  'executor',
+  'explorer',
   'reviewer',
-  'test-engineer',
-  'doc-writer',
-  'debugger',
-  'integration-dev',
-  'data-engineer',
-  'devops-engineer',
-  'security-analyst',
+  'tester',
   'architect',
 ];
 

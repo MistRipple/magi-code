@@ -12,8 +12,7 @@ use crate::orchestrator_termination::{OrchestratorTerminationReason, Termination
 // 是过度工程。这里保持最小依赖。
 // ============================================================================
 
-const TPL_CONTINUE_NO_TASKS: &str =
-    include_str!("../templates/round_policy/continue_no_tasks.md");
+const TPL_CONTINUE_NO_TASKS: &str = include_str!("../templates/round_policy/continue_no_tasks.md");
 const TPL_CONTINUE_WITH_PROGRESS: &str =
     include_str!("../templates/round_policy/continue_with_progress.md");
 const TPL_OUTCOME_BLOCK_REQUEST: &str =

@@ -79,8 +79,7 @@ export function resolveTimelinePresentationKind(
   message: TimelinePresentationMessageLike,
 ): TimelinePresentationKind {
   if (hasToolBlock(message.blocks)) {
-    // 运行时内部工具（worker_dispatch / worker_wait / send_worker_message 等）
-    // 不允许进入主线工具卡路径，应作为普通编排消息处理（或更上层过滤掉）。
+    // 运行时内部工具不允许进入主线工具卡路径，应作为普通编排消息处理。
     if (hasOnlyRuntimeInternalToolBlocks(message.blocks)) {
       return 'message';
     }
@@ -143,7 +142,6 @@ export function messageHasRenderableTimelineContent(
     return block.type === 'tool_call'
       || block.type === 'tool_result'
       || block.type === 'file_change'
-      || block.type === 'plan'
-      || block.type === 'dispatch_group';
+      || block.type === 'plan';
   });
 }

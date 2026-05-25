@@ -3,7 +3,7 @@ import { svelte } from '@sveltejs/vite-plugin-svelte';
 import { resolve } from 'path';
 
 const DEFAULT_AGENT_BASE_URL = 'http://127.0.0.1:38123';
-const DEFAULT_DEV_HOST = '127.0.0.1';
+const DEFAULT_DEV_HOST = '0.0.0.0';
 const DEFAULT_DEV_PORT = 3000;
 const MAGI_VITE_READY_PATH = '/__magi_vite_ready';
 

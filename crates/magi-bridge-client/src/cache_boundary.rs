@@ -107,10 +107,7 @@ mod tests {
 
     #[test]
     fn split_only_splits_at_first_occurrence() {
-        let text = format!(
-            "A{}B{}C",
-            PROMPT_CACHE_BOUNDARY, PROMPT_CACHE_BOUNDARY
-        );
+        let text = format!("A{}B{}C", PROMPT_CACHE_BOUNDARY, PROMPT_CACHE_BOUNDARY);
         let (s, d) = split_at_cache_boundary(&text).expect("应当切分成功");
         assert_eq!(s, "A");
         // 第二个标记仍保留在 dynamic 段，下游 strip 会兜底清理
@@ -119,10 +116,7 @@ mod tests {
 
     #[test]
     fn strip_removes_all_occurrences() {
-        let text = format!(
-            "A{}B{}C",
-            PROMPT_CACHE_BOUNDARY, PROMPT_CACHE_BOUNDARY
-        );
+        let text = format!("A{}B{}C", PROMPT_CACHE_BOUNDARY, PROMPT_CACHE_BOUNDARY);
         assert_eq!(strip_cache_boundaries(&text), "ABC");
     }
 

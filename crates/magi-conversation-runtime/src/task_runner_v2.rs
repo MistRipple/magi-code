@@ -7,19 +7,17 @@ use crate::task_runner_bridge::{
     RunCycleOutcome, TaskDispatchGate, TaskDispatchGateDecision, TaskDispatcher, TaskOutcome,
     TaskResultReceiver,
 };
-use crate::{ConversationRegistry, MailboxAuthor, MailboxKind, RuntimeSignal};
 use magi_agent_role::AgentRoleRegistry;
-use magi_core::{SessionId, Task, TaskId, TaskStatus, UtcMillis};
+use magi_core::{Task, TaskId, TaskStatus};
 use magi_event_bus::InMemoryEventBus;
 use magi_orchestrator::{
     task_store::TaskStore,
     task_worker_catalog::{WorkerInfo, resolve_task_role},
 };
-use magi_session_store::SessionStore;
 use std::{
     collections::HashSet,
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -33,17 +31,8 @@ pub struct TaskRunner {
     result_receiver: Arc<dyn TaskResultReceiver>,
     dispatch_gate: Option<Arc<TaskDispatchGate>>,
     event_bus: Option<Arc<InMemoryEventBus>>,
-    child_result_route: Option<ChildResultRoute>,
     checkpoint_signal: AtomicBool,
     agent_role_registry: AgentRoleRegistry,
-}
-
-#[derive(Clone)]
-struct ChildResultRoute {
-    session_id: SessionId,
-    session_store: Arc<SessionStore>,
-    conversation_registry: Arc<ConversationRegistry>,
-    spawn_graph: Arc<Mutex<magi_spawn_graph::SpawnGraph>>,
 }
 
 impl TaskRunner {
@@ -60,7 +49,6 @@ impl TaskRunner {
             result_receiver,
             dispatch_gate: None,
             event_bus: None,
-            child_result_route: None,
             checkpoint_signal: AtomicBool::new(false),
             agent_role_registry: AgentRoleRegistry::load_default(),
         }
@@ -78,22 +66,6 @@ impl TaskRunner {
 
     pub fn with_dispatch_gate(mut self, gate: Arc<TaskDispatchGate>) -> Self {
         self.dispatch_gate = Some(gate);
-        self
-    }
-
-    pub fn with_child_result_route(
-        mut self,
-        session_id: SessionId,
-        session_store: Arc<SessionStore>,
-        conversation_registry: Arc<ConversationRegistry>,
-        spawn_graph: Arc<Mutex<magi_spawn_graph::SpawnGraph>>,
-    ) -> Self {
-        self.child_result_route = Some(ChildResultRoute {
-            session_id,
-            session_store,
-            conversation_registry,
-            spawn_graph,
-        });
         self
     }
 
@@ -209,6 +181,8 @@ impl TaskRunner {
                         self.store.revoke_lease(task_id, &lease.lease_id);
                     }
                     self.store
+                        .set_output_refs(task_id, vec![self.stalled_task_reason(&task)]);
+                    self.store
                         .update_status(task_id, TaskStatus::Failed)
                         .map_err(|error| format!("收口不可运行任务 {task_id} 失败: {error}"))?;
                 }
@@ -216,6 +190,18 @@ impl TaskRunner {
         }
         self.set_checkpoint_signal();
         Ok(())
+    }
+
+    fn stalled_task_reason(&self, task: &Task) -> String {
+        let role = resolve_task_role(task, &self.agent_role_registry)
+            .or_else(|| task.executor_binding_target_role())
+            .unwrap_or("unknown");
+        if task.parent_task_id.is_some() {
+            return format!(
+                "子代理不可用：没有匹配角色 {role} 的可用执行器。父代理应改派其他可用角色，或由主线根据已有上下文继续完成。"
+            );
+        }
+        format!("任务不可运行：没有匹配角色 {role} 的可用执行器。")
     }
 
     pub fn kill_task(&self, task_id: &TaskId) -> Result<(), String> {
@@ -271,7 +257,6 @@ impl TaskRunner {
     fn apply_results(&self) -> Result<(), String> {
         for result in self.result_receiver.poll_results() {
             self.store.complete_lease(&result.task_id, &result.lease_id);
-            self.route_child_result_to_parent(&result);
             match result.outcome {
                 TaskOutcome::Completed { output_refs } => {
                     self.store.set_output_refs(&result.task_id, output_refs);
@@ -293,87 +278,6 @@ impl TaskRunner {
             self.set_checkpoint_signal();
         }
         Ok(())
-    }
-
-    fn route_child_result_to_parent(&self, result: &crate::task_runner_bridge::TaskResult) {
-        let Some(route) = self.child_result_route.as_ref() else {
-            return;
-        };
-        let Some(task) = self.store.get_task(&result.task_id) else {
-            return;
-        };
-        let parent_id = match route.spawn_graph.lock() {
-            Ok(mut graph) => {
-                let parent_id = graph.parent_of(&result.task_id).cloned();
-                if parent_id.is_some() {
-                    let _ = graph.mark_closed(&result.task_id, std::time::SystemTime::now());
-                }
-                parent_id
-            }
-            Err(err) => {
-                tracing::warn!(?err, task_id = %result.task_id, "关闭 SpawnGraph 子任务边失败");
-                None
-            }
-        };
-        let Some(parent_id) = parent_id else {
-            return;
-        };
-        let Some(parent_task) = self.store.get_task(&parent_id) else {
-            return;
-        };
-        let (status, payload) = match &result.outcome {
-            TaskOutcome::Completed { output_refs } => (
-                "completed",
-                serde_json::json!({
-                    "task_id": result.task_id.to_string(),
-                    "status": "completed",
-                    "output_refs": output_refs,
-                    "title": task.title,
-                }),
-            ),
-            TaskOutcome::Failed { error } => (
-                "failed",
-                serde_json::json!({
-                    "task_id": result.task_id.to_string(),
-                    "status": "failed",
-                    "error": error,
-                    "title": task.title,
-                }),
-            ),
-        };
-        route
-            .conversation_registry
-            .conversation_for_task(&route.session_id, &parent_id)
-            .lock()
-            .expect("parent task Conversation mutex poisoned")
-            .ingest_runtime_signal(RuntimeSignal {
-                author: MailboxAuthor::Child(result.task_id.to_string()),
-                kind: MailboxKind::AgentResult,
-                trigger_turn: true,
-                payload,
-                enqueued_at: UtcMillis::now(),
-            });
-        route.session_store.append_thread_messages(
-            &route
-                .session_store
-                .ensure_session_mission(&route.session_id, UtcMillis::now(), || {
-                    parent_task.mission_id.clone()
-                })
-                .1,
-            vec![magi_session_store::ThreadChatMessage {
-                role: "system".to_string(),
-                content: Some(format!(
-                    "[mailbox]\nauthor=child:{}\nkind=agent_result\nstatus={}",
-                    result.task_id, status
-                )),
-                tool_calls: Vec::new(),
-                tool_call_id: None,
-            }],
-            UtcMillis::now(),
-        );
-        if parent_task.status == TaskStatus::Completed {
-            let _ = self.store.update_status(&parent_id, TaskStatus::Pending);
-        }
     }
 
     fn expire_stale_leases(&self, root_task_id: &TaskId) -> Result<(), String> {
@@ -413,6 +317,7 @@ impl TaskRunner {
         if task_ids.is_empty() {
             return TerminalState::NotTerminal;
         }
+        let root_status = self.store.get_task(root_task_id).map(|task| task.status);
         let mut failed = Vec::new();
         let mut killed = Vec::new();
         let mut all_terminal = true;
@@ -427,7 +332,9 @@ impl TaskRunner {
                 TaskStatus::Pending | TaskStatus::Running => all_terminal = false,
             }
         }
-        if !failed.is_empty() && all_terminal {
+        if root_status == Some(TaskStatus::Completed) && all_terminal {
+            TerminalState::AllCompleted
+        } else if !failed.is_empty() && all_terminal {
             TerminalState::HasFailures(failed)
         } else if !killed.is_empty() && all_terminal {
             TerminalState::HasKilled(killed)
@@ -479,10 +386,8 @@ enum TerminalState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::task_runner_bridge::{EventBasedResultReceiver, TaskResult};
-    use magi_core::{LeaseId, MissionId, TaskKind, TaskRuntimePayload};
-    use magi_orchestrator::task_store::TaskLeaseState;
-    use magi_session_store::SessionStore;
+    use crate::task_runner_bridge::EventBasedResultReceiver;
+    use magi_core::{MissionId, TaskKind, TaskRuntimePayload, UtcMillis};
 
     struct RejectingDispatcher;
 
@@ -557,385 +462,5 @@ mod tests {
             TaskStatus::Pending
         );
         assert!(store.get_active_lease(&root.task_id).is_none());
-    }
-
-    #[test]
-    fn child_result_closes_spawn_edge_and_wakes_parent_mailbox() {
-        let store = Arc::new(TaskStore::new());
-        let mut parent = test_task("task-parent-route", "task-parent-route", None);
-        parent.status = TaskStatus::Completed;
-        let mut child = test_task(
-            "task-child-route",
-            "task-parent-route",
-            Some(parent.task_id.clone()),
-        );
-        child.status = TaskStatus::Running;
-        store.insert_task(parent.clone());
-        store.insert_task(child.clone());
-        let lease_id = LeaseId::new("lease-child-route");
-        store.insert_lease(magi_orchestrator::task_store::TaskLease {
-            lease_id: lease_id.clone(),
-            task_id: child.task_id.clone(),
-            root_task_id: parent.task_id.clone(),
-            worker_id: magi_core::WorkerId::new("worker-child-route"),
-            role: "integration-dev".to_string(),
-            granted_at: UtcMillis(1_000),
-            expires_at: UtcMillis(60_000),
-            heartbeat_at: UtcMillis(1_000),
-            lease_status: TaskLeaseState::Active,
-        });
-
-        let receiver = Arc::new(EventBasedResultReceiver::new());
-        receiver.push_result(TaskResult {
-            task_id: child.task_id.clone(),
-            lease_id,
-            outcome: TaskOutcome::Completed {
-                output_refs: vec!["child done".to_string()],
-            },
-        });
-        let session_store = Arc::new(SessionStore::new());
-        let conversation_registry = Arc::new(ConversationRegistry::new());
-        let mut graph = magi_spawn_graph::SpawnGraph::new();
-        graph
-            .add_edge(
-                parent.task_id.clone(),
-                child.task_id.clone(),
-                child.kind,
-                std::time::SystemTime::UNIX_EPOCH,
-            )
-            .unwrap();
-        let spawn_graph = Arc::new(Mutex::new(graph));
-        let runner = TaskRunner::with_dispatcher(
-            Arc::clone(&store),
-            Vec::new(),
-            Arc::new(RejectingDispatcher),
-            receiver,
-        )
-        .with_child_result_route(
-            SessionId::new("session-child-result"),
-            session_store,
-            Arc::clone(&conversation_registry),
-            Arc::clone(&spawn_graph),
-        );
-
-        runner.apply_results().unwrap();
-
-        assert_eq!(
-            store.get_task(&parent.task_id).unwrap().status,
-            TaskStatus::Pending
-        );
-        assert_eq!(
-            spawn_graph
-                .lock()
-                .unwrap()
-                .edge_for(&child.task_id)
-                .unwrap()
-                .status,
-            magi_spawn_graph::SpawnEdgeStatus::Closed
-        );
-        let pending = conversation_registry
-            .conversation_for_task(&SessionId::new("session-child-result"), &parent.task_id)
-            .lock()
-            .unwrap()
-            .drain_mailbox_items();
-        assert_eq!(pending.len(), 1);
-        match &pending[0] {
-            crate::MailboxItem::Runtime(signal) => {
-                assert_eq!(signal.kind, MailboxKind::AgentResult);
-                assert_eq!(
-                    signal.author,
-                    MailboxAuthor::Child(child.task_id.to_string())
-                );
-                assert!(signal.trigger_turn);
-                assert_eq!(signal.payload["status"].as_str(), Some("completed"));
-            }
-            crate::MailboxItem::User(_) => panic!("child result must be a runtime signal"),
-        }
-    }
-
-    /// Task System v2 §3.3 验收：coordinator 通过 `agent_spawn` 派发的子任务，
-    /// 子任务完成后回执必须：
-    /// 1) 进入 parent 的 mailbox（`MailboxKind::AgentResult`）；
-    /// 2) 让 parent task 从 Completed/Idle 回到 Pending，使下一轮 conversation 能聚合结果；
-    /// 3) 关闭 SpawnGraph 上 parent→child 的 open edge。
-    ///
-    /// 已有的 `agent_spawn_registers_child_execution_plan_and_lane` 只覆盖了 spawn 的写端，
-    /// 已有的 `child_result_closes_spawn_edge_and_wakes_parent_mailbox` 只覆盖了
-    /// **手工置入** SpawnGraph 边的回收路径。本测试桥接两者，证明：
-    /// **`agent_spawn` 写入的 SpawnGraph 边正是 TaskRunner 结果路由消费的那条边**——
-    /// 二者共享单一 SpawnGraph instance 不是巧合而是契约。
-    #[test]
-    fn coordinator_agent_spawn_to_child_result_round_trip() {
-        use crate::task_execution_registry::TaskExecutionRegistry;
-        use crate::task_runner_bridge::TaskOutcome;
-        use crate::tool_batch::execute_task_tool_call_batch;
-        use magi_bridge_client::{ChatToolCall, ChatToolFunction};
-        use magi_core::{
-            ExecutionResultStatus, MissionId, TaskRuntimePayload, WorkerId, WorkspaceId,
-        };
-        use magi_event_bus::InMemoryEventBus;
-        use magi_orchestrator::task_store::TaskLeaseState;
-        use magi_session_store::{
-            ActiveExecutionBranch, ActiveExecutionChain, ActiveExecutionDispatchContext,
-            ActiveExecutionTurn,
-        };
-        use magi_tool_runtime::BuiltinToolName;
-
-        let event_bus = InMemoryEventBus::new(16);
-        let task_store_arc = Arc::new(TaskStore::new());
-        let session_store_arc = Arc::new(SessionStore::new());
-        let execution_registry = TaskExecutionRegistry::default();
-        let conversation_registry_arc = Arc::new(ConversationRegistry::new());
-        let spawn_graph_inner = Mutex::new(magi_spawn_graph::SpawnGraph::new());
-        let todo_ledger = magi_todo_ledger::TodoLedger::new();
-        let agent_role_registry = AgentRoleRegistry::load_default();
-
-        let session_id = SessionId::new("session-coord-spawn-roundtrip");
-        let workspace_id = Some(WorkspaceId::new("workspace-coord-spawn-roundtrip"));
-        let mission_id = MissionId::new("mission-coord-spawn-roundtrip");
-
-        let parent_task_id = TaskId::new("task-parent-coord");
-        let mut parent = Task {
-            task_id: parent_task_id.clone(),
-            mission_id: mission_id.clone(),
-            root_task_id: parent_task_id.clone(),
-            parent_task_id: None,
-            kind: magi_core::TaskKind::LocalAgent,
-            title: "coordinator root".to_string(),
-            goal: "coordinate sub-work".to_string(),
-            status: TaskStatus::Running,
-            dependency_ids: Vec::new(),
-            required_children: Vec::new(),
-            policy_snapshot: None,
-            executor_binding: Some(serde_json::json!({ "target_role": "coordinator" })),
-            knowledge_refs: Vec::new(),
-            workspace_scope: None,
-            write_scope: None,
-            input_refs: Vec::new(),
-            output_refs: Vec::new(),
-            evidence_refs: Vec::new(),
-            retry_count: 0,
-            runtime_payload: TaskRuntimePayload::default(),
-            created_at: UtcMillis::now(),
-            updated_at: UtcMillis::now(),
-        };
-        // 模拟「parent 在子任务回执前已经把当前 turn 跑完」，便于断言 mailbox 唤醒
-        parent.status = TaskStatus::Completed;
-        task_store_arc.insert_task(parent.clone());
-
-        let now = UtcMillis::now();
-        let _ = session_store_arc.ensure_session_mission(&session_id, now, || mission_id.clone());
-        let parent_worker_id = WorkerId::new("worker-parent-coord");
-        session_store_arc
-            .upsert_active_execution_chain(
-                session_id.clone(),
-                ActiveExecutionChain {
-                    session_id: session_id.clone(),
-                    mission_id: mission_id.clone(),
-                    root_task_id: parent_task_id.clone(),
-                    execution_chain_ref: "chain-coord-spawn-roundtrip".to_string(),
-                    workspace_id: workspace_id.clone(),
-                    active_branch_task_ids: vec![parent_task_id.clone()],
-                    active_worker_bindings: vec![parent_worker_id.clone()],
-                    branches: vec![ActiveExecutionBranch {
-                        task_id: parent_task_id.clone(),
-                        worker_id: parent_worker_id.clone(),
-                        stage: "execute".to_string(),
-                        lease_id: None,
-                        execution_intent_ref: None,
-                        binding_lifecycle: None,
-                        checkpoint_stage: Some("execute".to_string()),
-                        next_step_index: Some(0),
-                        checkpoint_at: Some(now),
-                        resume_mode: Some("stage-restart".to_string()),
-                        resume_token: None,
-                        use_tools: true,
-                        skill_name: None,
-                        is_primary: true,
-                    }],
-                    recovery_ref: None,
-                    dispatch_context: ActiveExecutionDispatchContext {
-                        accepted_at: now,
-                        entry_id: "timeline-coord-spawn-roundtrip".to_string(),
-                        trimmed_text: Some("spawn child via coordinator".to_string()),
-                        skill_name: None,
-                    },
-                    current_turn: Some(ActiveExecutionTurn {
-                        turn_id: "turn-coord-spawn-roundtrip".to_string(),
-                        turn_seq: now.0,
-                        accepted_at: now,
-                        completed_at: None,
-                        status: "running".to_string(),
-                        user_message: Some("spawn child".to_string()),
-                        items: Vec::new(),
-                        worker_lanes: Vec::new(),
-                    }),
-                },
-            )
-            .expect("active chain should be accepted");
-
-        // 1) coordinator 调用 agent_spawn 派发子任务
-        let tool_call = ChatToolCall {
-            id: "call-coord-spawn".to_string(),
-            kind: "function".to_string(),
-            function: ChatToolFunction {
-                name: BuiltinToolName::AgentSpawn.as_str().to_string(),
-                arguments: serde_json::json!({
-                    "role": "integration-dev",
-                    "goal": "处理一个独立 review comment",
-                    "context": "返回 CHILD_DONE 即可",
-                    "task_kind": "action"
-                })
-                .to_string(),
-            },
-        };
-        let spawn_results = execute_task_tool_call_batch(
-            &event_bus,
-            None,
-            &agent_role_registry,
-            None,
-            &task_store_arc,
-            &session_store_arc,
-            &execution_registry,
-            &conversation_registry_arc,
-            &spawn_graph_inner,
-            None,
-            &todo_ledger,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            &parent,
-            &session_id,
-            &workspace_id,
-            None,
-            Some(&parent_worker_id),
-            &[tool_call],
-        );
-        assert_eq!(spawn_results.len(), 1);
-        assert_eq!(spawn_results[0].1, ExecutionResultStatus::Succeeded);
-        let spawn_payload: serde_json::Value =
-            serde_json::from_str(&spawn_results[0].0).expect("agent_spawn result is json");
-        let child_task_id = TaskId::new(
-            spawn_payload["child_task_id"]
-                .as_str()
-                .expect("agent_spawn must return child_task_id"),
-        );
-
-        // 写端契约：spawn 必须在 SpawnGraph 上挂上 parent→child 的 open edge
-        {
-            let graph = spawn_graph_inner.lock().unwrap();
-            let edge = graph
-                .edge_for(&child_task_id)
-                .expect("SpawnGraph must record parent→child edge after agent_spawn");
-            assert_eq!(edge.parent, parent_task_id);
-            assert_eq!(
-                edge.status,
-                magi_spawn_graph::SpawnEdgeStatus::Open,
-                "刚 spawn 完的 edge 必须是 Open，等待子任务 result 关闭",
-            );
-        }
-
-        // 2) 模拟子任务完成回收：构造 TaskResult，喂给 TaskRunner.apply_results
-        let lease_id = magi_core::LeaseId::new("lease-child-coord");
-        task_store_arc.insert_lease(magi_orchestrator::task_store::TaskLease {
-            lease_id: lease_id.clone(),
-            task_id: child_task_id.clone(),
-            root_task_id: parent_task_id.clone(),
-            worker_id: WorkerId::new("worker-child-coord"),
-            role: "integration-dev".to_string(),
-            granted_at: UtcMillis(now.0 + 10),
-            expires_at: UtcMillis(now.0 + 60_000),
-            heartbeat_at: UtcMillis(now.0 + 10),
-            lease_status: TaskLeaseState::Active,
-        });
-        let receiver = Arc::new(EventBasedResultReceiver::new());
-        receiver.push_result(TaskResult {
-            task_id: child_task_id.clone(),
-            lease_id,
-            outcome: TaskOutcome::Completed {
-                output_refs: vec!["CHILD_DONE".to_string()],
-            },
-        });
-
-        // 共享同一个 SpawnGraph instance——这是 §3.3 桥接的关键不变量
-        let mut transplanted_graph = magi_spawn_graph::SpawnGraph::new();
-        {
-            let src = spawn_graph_inner.lock().unwrap();
-            for edge in src.all_edges() {
-                transplanted_graph
-                    .add_edge(
-                        edge.parent.clone(),
-                        edge.child.clone(),
-                        edge.task_kind,
-                        edge.created_at,
-                    )
-                    .unwrap();
-            }
-        }
-        let shared_spawn_graph = Arc::new(Mutex::new(transplanted_graph));
-
-        let runner = TaskRunner::with_dispatcher(
-            Arc::clone(&task_store_arc),
-            Vec::new(),
-            Arc::new(RejectingDispatcher),
-            receiver,
-        )
-        .with_child_result_route(
-            session_id.clone(),
-            Arc::clone(&session_store_arc),
-            Arc::clone(&conversation_registry_arc),
-            Arc::clone(&shared_spawn_graph),
-        );
-        runner
-            .apply_results()
-            .expect("apply_results 必须接受合法的子任务回执");
-
-        // 3) 断言三条 §3.3 不变量
-        assert_eq!(
-            shared_spawn_graph
-                .lock()
-                .unwrap()
-                .edge_for(&child_task_id)
-                .expect("edge 仍可见，只是状态从 Open 翻为 Closed")
-                .status,
-            magi_spawn_graph::SpawnEdgeStatus::Closed,
-            "§3.3：子任务回执必须关闭 SpawnGraph open edge",
-        );
-        assert_eq!(
-            task_store_arc.get_task(&parent_task_id).unwrap().status,
-            TaskStatus::Pending,
-            "§3.3：parent 被 mailbox 中的 AgentResult 唤醒，须从 Completed 回到 Pending",
-        );
-        let pending = conversation_registry_arc
-            .conversation_for_task(&session_id, &parent_task_id)
-            .lock()
-            .unwrap()
-            .drain_mailbox_items();
-        assert_eq!(
-            pending.len(),
-            1,
-            "§3.3：parent 应当且仅有一条 child result mailbox 项",
-        );
-        match &pending[0] {
-            crate::MailboxItem::Runtime(signal) => {
-                assert_eq!(signal.kind, MailboxKind::AgentResult);
-                assert_eq!(
-                    signal.author,
-                    MailboxAuthor::Child(child_task_id.to_string())
-                );
-                assert!(
-                    signal.trigger_turn,
-                    "AgentResult 必须 trigger_turn 以触发 parent 下一轮汇总",
-                );
-                assert_eq!(signal.payload["status"].as_str(), Some("completed"));
-            }
-            crate::MailboxItem::User(_) => {
-                panic!("子任务回执必须以 Runtime signal 形式进入 mailbox")
-            }
-        }
     }
 }

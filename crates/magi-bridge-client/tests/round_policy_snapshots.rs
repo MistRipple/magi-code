@@ -107,32 +107,23 @@ fn snapshot_summary_hijack_correction_level3plus() {
 #[test]
 fn snapshot_terminal_synthesis_completed_with_enforce() {
     let snap = snapshot_fixture(4, 4, 0, 0);
-    let prompt = build_terminal_synthesis_prompt(
-        OrchestratorTerminationReason::Completed,
-        &snap,
-        true,
-    );
+    let prompt =
+        build_terminal_synthesis_prompt(OrchestratorTerminationReason::Completed, &snap, true);
     assert_snapshot!(prompt);
 }
 
 #[test]
 fn snapshot_terminal_synthesis_completed_without_enforce() {
     let snap = snapshot_fixture(4, 4, 0, 0);
-    let prompt = build_terminal_synthesis_prompt(
-        OrchestratorTerminationReason::Completed,
-        &snap,
-        false,
-    );
+    let prompt =
+        build_terminal_synthesis_prompt(OrchestratorTerminationReason::Completed, &snap, false);
     assert_snapshot!(prompt);
 }
 
 #[test]
 fn snapshot_terminal_synthesis_failed_with_enforce() {
     let snap = snapshot_fixture(4, 3, 1, 2);
-    let prompt = build_terminal_synthesis_prompt(
-        OrchestratorTerminationReason::Failed,
-        &snap,
-        true,
-    );
+    let prompt =
+        build_terminal_synthesis_prompt(OrchestratorTerminationReason::Failed, &snap, true);
     assert_snapshot!(prompt);
 }

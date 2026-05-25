@@ -23,42 +23,28 @@ fn snapshot_prepend_all_three_sections() {
 
 #[test]
 fn snapshot_prepend_user_rules_only() {
-    let prompt = prepend_session_instructions(
-        Some("保持中文回复"),
-        None,
-        None,
-        "执行当前任务",
-    );
+    let prompt = prepend_session_instructions(Some("保持中文回复"), None, None, "执行当前任务");
     assert_snapshot!(prompt);
 }
 
 #[test]
 fn snapshot_prepend_safeguard_only() {
-    let prompt = prepend_session_instructions(
-        None,
-        Some("禁止读取 .env 文件"),
-        None,
-        "执行当前任务",
-    );
+    let prompt =
+        prepend_session_instructions(None, Some("禁止读取 .env 文件"), None, "执行当前任务");
     assert_snapshot!(prompt);
 }
 
 #[test]
 fn snapshot_prepend_lifecycle_only() {
-    let prompt = prepend_session_instructions(
-        None,
-        None,
-        Some("Mission M-1 已恢复"),
-        "执行当前任务",
-    );
+    let prompt =
+        prepend_session_instructions(None, None, Some("Mission M-1 已恢复"), "执行当前任务");
     assert_snapshot!(prompt);
 }
 
 #[test]
 fn snapshot_prepend_no_sections_returns_prompt_only() {
     // 三个小节全部为空时，输出应与原 prompt 字节一致。
-    let prompt =
-        prepend_session_instructions(Some("   "), Some(""), None, "执行当前任务");
+    let prompt = prepend_session_instructions(Some("   "), Some(""), None, "执行当前任务");
     assert_snapshot!(prompt);
 }
 

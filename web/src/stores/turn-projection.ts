@@ -1,12 +1,10 @@
 import type {
   AgentId,
   ContentBlock,
-  DispatchGroupLane,
   Message,
   SessionTimelineProjection,
   TimelineProjectionArtifact,
   TimelineProjectionRenderEntry,
-  WorkerLaneStatus,
 } from '../types/message';
 import type {
   CanonicalToolCall,
@@ -16,18 +14,6 @@ import type {
 } from '../shared/protocol/canonical-turn';
 import { isCanonicalTerminalStatus } from '../shared/protocol/canonical-turn';
 import type { CanonicalTurnReducerState } from './turn-reducer';
-
-interface LaneProjectionMeta {
-  laneId: string;
-  laneSeq?: number;
-  title: string;
-  status: WorkerLaneStatus;
-}
-
-interface LaneActivitySnapshot {
-  text: string;
-  itemSeq: number;
-}
 
 /**
  * 单个 turn 的「呈现层」预计算结果。
@@ -65,28 +51,34 @@ function normalizeCanonicalRoleId(item: CanonicalTurnItem): AgentId | undefined 
   return (roleId || undefined) as AgentId | undefined;
 }
 
-function resolveWorkerTabAggregateId(item: CanonicalTurnItem): AgentId | undefined {
-  // Tab 聚合键只接受 roleId。worker 实例 id 通过 metadata.workerId 单独暴露，
-  // 不再参与 tab 维度，避免 drawer 切换和 tab 聚合混用两根身份。
-  return normalizeCanonicalRoleId(item);
+function normalizeCanonicalTaskId(item: CanonicalTurnItem): string | undefined {
+  const taskId = typeof item.worker?.taskId === 'string' ? item.worker.taskId.trim() : '';
+  return taskId || undefined;
 }
 
-function isWorkerSidechainItem(item: CanonicalTurnItem): boolean {
-  // P7.E：item 是否归属 worker drawer 由 worker.roleId 单一信号决定。
-  // 归属 orchestrator thread 的 item 没有 roleId 或 roleId === 'orchestrator'。
+function isAgentTaskSidechainItem(item: CanonicalTurnItem): boolean {
+  // Sidechain 归属只由执行实例事实决定：子代理 item 会携带 roleId/workerId；
+  // root agent item 可能也携带 taskId，但不应因此被移出主线。
   const roleId = typeof item.worker?.roleId === 'string' ? item.worker.roleId.trim() : '';
-  return roleId.length > 0 && roleId !== 'orchestrator';
+  if (roleId && roleId !== 'orchestrator') {
+    return true;
+  }
+  const workerId = typeof item.worker?.workerId === 'string' ? item.worker.workerId.trim() : '';
+  return workerId.length > 0;
 }
 
-function resolveVisibleWorkerTabId(item: CanonicalTurnItem): AgentId | undefined {
-  return isWorkerSidechainItem(item) ? resolveWorkerTabAggregateId(item) : undefined;
+function resolveSidechainTaskId(item: CanonicalTurnItem): string | undefined {
+  return isAgentTaskSidechainItem(item) ? normalizeCanonicalTaskId(item) : undefined;
 }
 
 function resolveMessageSource(item: CanonicalTurnItem): Message['source'] {
   if (item.kind === 'user_message') {
     return 'user';
   }
-  return resolveVisibleWorkerTabId(item) || 'orchestrator';
+  if (isAgentTaskSidechainItem(item)) {
+    return normalizeCanonicalRoleId(item) || normalizeCanonicalWorkerId(item) || 'agent';
+  }
+  return 'orchestrator';
 }
 
 function statusToToolStatus(status: CanonicalTurnItemStatus): 'pending' | 'running' | 'success' | 'error' {
@@ -120,70 +112,6 @@ function valueToDisplayText(value: unknown): string | undefined {
   } catch {
     return String(value);
   }
-}
-
-function readObject(value: unknown): Record<string, unknown> | undefined {
-  return value && typeof value === 'object' && !Array.isArray(value)
-    ? value as Record<string, unknown>
-    : undefined;
-}
-
-function normalizeActivityText(value: unknown): string {
-  return typeof value === 'string'
-    ? value.replace(/\s+/g, ' ').trim()
-    : '';
-}
-
-function readStringField(record: Record<string, unknown> | undefined, keys: string[]): string {
-  if (!record) {
-    return '';
-  }
-  for (const key of keys) {
-    const value = normalizeActivityText(record[key]);
-    if (value) {
-      return value;
-    }
-  }
-  return '';
-}
-
-function summarizeToolResult(value: unknown): string {
-  if (typeof value === 'string') {
-    const trimmed = value.trim();
-    if (!trimmed) {
-      return '';
-    }
-    try {
-      const parsed = JSON.parse(trimmed);
-      return summarizeToolResult(parsed) || normalizeActivityText(trimmed);
-    } catch {
-      return normalizeActivityText(trimmed);
-    }
-  }
-  const record = readObject(value);
-  return readStringField(record, ['summary', 'message', 'error']);
-}
-
-function summarizeLaneItem(item: CanonicalTurnItem): string {
-  if (item.kind === 'worker_dispatch' || item.kind === 'user_message' || item.kind === 'system_notice') {
-    return '';
-  }
-  const metadata = readObject(item.metadata);
-  const explicitSummary = readStringField(metadata, [
-    'stageSummary',
-    'stage_summary',
-    'summary',
-    'message',
-  ]);
-  if (explicitSummary) {
-    return explicitSummary;
-  }
-  if (item.kind === 'tool_call') {
-    return summarizeToolResult(item.tool?.result)
-      || normalizeActivityText(item.content)
-      || normalizeActivityText(item.title || item.tool?.name);
-  }
-  return normalizeActivityText(item.content) || normalizeActivityText(item.title);
 }
 
 function buildToolBlock(tool: CanonicalToolCall, status: CanonicalTurnItemStatus): ContentBlock {
@@ -243,7 +171,7 @@ function resolveMessageType(item: CanonicalTurnItem): Message['type'] {
     return 'tool_call';
   }
   if (item.kind === 'system_notice') {
-    return isWorkerSidechainItem(item) ? 'system-notice' : 'text';
+    return isAgentTaskSidechainItem(item) ? 'system-notice' : 'text';
   }
   if (item.kind === 'assistant_text') {
     return 'text';
@@ -271,9 +199,6 @@ function shouldRenderItem(item: CanonicalTurnItem): boolean {
   if (item.visibility.renderable === false) {
     return false;
   }
-  if (item.kind === 'worker_status') {
-    return false;
-  }
   if (
     item.kind === 'assistant_text'
     && isCanonicalTerminalStatus(item.status)
@@ -287,7 +212,7 @@ function shouldRenderItem(item: CanonicalTurnItem): boolean {
 function isTurnResponseDurationAnchorCandidate(item: CanonicalTurnItem): boolean {
   return item.kind !== 'user_message'
     && item.kind !== 'system_notice'
-    && !isWorkerSidechainItem(item)
+    && !isAgentTaskSidechainItem(item)
     && shouldRenderItem(item);
 }
 
@@ -300,57 +225,17 @@ function canShowTurnResponseDuration(
   return presentation.responseDurationAnchorItemId === item.itemId;
 }
 
-function resolveDispatchGroupResponseDurationMs(
-  turn: CanonicalTurn,
-  presentation: TurnPresentation,
-): number | undefined {
-  // 锚点不存在表示无可用 item 承载 footer（例如整 turn 只有 worker_dispatch），
-  // 此时把 responseDurationMs 挂到 dispatch group artifact 上兜底；锚点存在
-  // 则交给那个 item 自己渲染 footer，dispatch group 不重复显示。
-  if (
-    !isCanonicalTerminalStatus(turn.status)
-    || typeof turn.responseDurationMs !== 'number'
-    || !Number.isFinite(turn.responseDurationMs)
-    || turn.responseDurationMs < 0
-  ) {
-    return undefined;
-  }
-  return presentation.responseDurationAnchorItemId ? undefined : turn.responseDurationMs;
-}
-
-function collectLaneProjectionMeta(turn: CanonicalTurn): Map<string, LaneProjectionMeta> {
-  const metaByLaneId = new Map<string, LaneProjectionMeta>();
-  for (const item of turn.items) {
-    if (item.kind !== 'worker_dispatch') {
-      continue;
-    }
-    const laneId = typeof item.laneId === 'string' ? item.laneId.trim() : '';
-    if (!laneId) {
-      continue;
-    }
-    const title = (item.title || item.worker?.title || laneId).trim();
-    metaByLaneId.set(laneId, {
-      laneId,
-      ...(typeof item.laneSeq === 'number' && Number.isFinite(item.laneSeq) ? { laneSeq: item.laneSeq } : {}),
-      title,
-      status: canonicalStatusToWorkerLaneStatus(item.status),
-    });
-  }
-  return metaByLaneId;
-}
-
 function buildMessage(
   turn: CanonicalTurn,
   item: CanonicalTurnItem,
   artifactId: string,
-  laneMetaById: Map<string, LaneProjectionMeta>,
   presentation: TurnPresentation,
 ): Message {
   const content = resolveItemContent(item);
-  const workerTabId = resolveVisibleWorkerTabId(item);
-  const isWorkerSidechain = isWorkerSidechainItem(item);
-  const workerId = isWorkerSidechain ? normalizeCanonicalWorkerId(item) : undefined;
-  const roleId = isWorkerSidechain ? normalizeCanonicalRoleId(item) : undefined;
+  const isAgentTaskSidechain = isAgentTaskSidechainItem(item);
+  const workerId = isAgentTaskSidechain ? normalizeCanonicalWorkerId(item) : undefined;
+  const roleId = isAgentTaskSidechain ? normalizeCanonicalRoleId(item) : undefined;
+  const taskId = normalizeCanonicalTaskId(item);
   const blocks = buildMessageBlocks(item, content);
   // 流式态对 assistant 的 text 与 thinking 都成立：
   //   - assistant_text：边推 token 边渲染正文；
@@ -363,8 +248,6 @@ function buildMessage(
   const responseDurationMs = canShowTurnResponseDuration(presentation, item)
     ? turn.responseDurationMs
     : undefined;
-  const laneId = typeof item.laneId === 'string' ? item.laneId.trim() : '';
-  const laneMeta = laneId ? laneMetaById.get(laneId) : undefined;
   const presentationSeq = requirePresentationSeq(presentation, item);
   return {
     id: artifactId,
@@ -390,18 +273,14 @@ function buildMessage(
       itemSeq: presentationSeq * 1000,
       canonicalItemSeq: item.itemSeq,
       blockSeq: item.itemSeq,
-      laneId: item.laneId,
-      laneSeq: item.laneSeq,
-      ...(laneMeta?.title ? { laneTitle: laneMeta.title } : {}),
-      ...(laneMeta?.status ? { laneStatus: laneMeta.status } : {}),
       cardStreamSeq: item.itemSeq,
       ...(workerId ? { workerId } : {}),
       ...(roleId ? { roleId } : {}),
-      ...(workerTabId ? { workerTabId } : {}),
-      // P7.E：UI 路由单一信号 —— worker.roleId 区分主线与 worker drawer，
-      // sourceThreadId 透传给后续多 thread 视图使用（resume、thread tree、跨 worker 追踪）。
+      // sourceThreadId 保留为底层审计事实；UI tab 路由只看 metadata.taskId。
       ...(item.sourceThreadId ? { sourceThreadId: item.sourceThreadId } : {}),
-      taskId: item.worker?.taskId,
+      // metadata.taskId 是 RightPane task tab 按子代理过滤 timeline 的唯一信号
+      // （Task #103 落地：每个 agent_spawn 工具调用产生独立 taskId，前端按此聚合）。
+      ...(taskId ? { taskId } : {}),
       toolCallId: item.tool?.callId,
       toolName: item.tool?.name,
       ...(responseDurationMs !== undefined ? { responseDurationMs } : {}),
@@ -456,7 +335,7 @@ function requirePresentationSeq(presentation: TurnPresentation, item: CanonicalT
  * 修复方式：在 projection 层用 kind 语义重排，剥离两者：
  *   - 存储层 `item_seq` 仍然是单调到达序（保留审计、status 不变性）；
  *   - 展示序由本函数按协议语义重新计算——同一 round 内 `thinking` 永远先于
- *     `text`，`tool_call` / `worker_dispatch` / `user_message` 等作为 round
+ *     `text`，`tool_call` / `user_message` 等作为 round
  *     边界保持原位（它们的 `item_seq` 已经能正确反映 round 顺序）。
  *
  * 算法：按 `item_seq` 升序遍历 turn.items；
@@ -528,14 +407,13 @@ function buildTurnPresentation(turn: CanonicalTurn): TurnPresentation {
 function buildArtifact(
   turn: CanonicalTurn,
   item: CanonicalTurnItem,
-  laneMetaById: Map<string, LaneProjectionMeta>,
   presentation: TurnPresentation,
 ): TimelineProjectionArtifact | null {
   if (!shouldRenderItem(item)) {
     return null;
   }
   const artifactId = resolveArtifactId(turn, item);
-  const workerTabId = resolveVisibleWorkerTabId(item);
+  const sidechainTaskId = resolveSidechainTaskId(item);
   const presentationSeq = requirePresentationSeq(presentation, item);
   return {
     artifactId,
@@ -547,222 +425,18 @@ function buildArtifact(
     cardStreamSeq: item.itemSeq,
     timestamp: item.createdAt,
     cardId: artifactId,
-    laneId: item.laneId,
-    worker: workerTabId,
+    taskId: sidechainTaskId,
     messageIds: [artifactId, item.itemId],
-    message: buildMessage(turn, item, artifactId, laneMetaById, presentation),
-  };
-}
-
-function canonicalStatusToWorkerLaneStatus(status: CanonicalTurnItemStatus): WorkerLaneStatus {
-  switch (status) {
-    case 'blocked':
-      return 'blocked';
-    case 'failed':
-      return 'failed';
-    case 'cancelled':
-      return 'cancelled';
-    case 'completed':
-      return 'completed';
-    case 'running':
-      return 'running';
-    case 'pending':
-    default:
-      return 'pending';
-  }
-}
-
-function mergeLaneStatus(current: WorkerLaneStatus, next: WorkerLaneStatus): WorkerLaneStatus {
-  if (next === 'failed' || current === 'failed') return 'failed';
-  if (next === 'blocked' || current === 'blocked') return 'blocked';
-  if (next === 'cancelled' || current === 'cancelled') return 'cancelled';
-  if (next === 'running' || current === 'running') return 'running';
-  if (next === 'pending' || current === 'pending') return 'pending';
-  return 'completed';
-}
-
-function buildDispatchGroupArtifact(
-  turn: CanonicalTurn,
-  presentation: TurnPresentation,
-): TimelineProjectionArtifact | null {
-  const dispatchItems = turn.items
-    .filter((item) => item.kind === 'worker_dispatch' && typeof item.laneId === 'string' && item.laneId.trim())
-    .sort((left, right) => left.itemSeq - right.itemSeq || left.itemId.localeCompare(right.itemId));
-  if (dispatchItems.length === 0) {
-    return null;
-  }
-
-  const laneById = new Map<string, DispatchGroupLane>();
-  const laneVersionById = new Map<string, number>();
-  const laneActivityById = new Map<string, LaneActivitySnapshot>();
-  for (const item of dispatchItems) {
-    const laneId = item.laneId?.trim();
-    if (!laneId) {
-      continue;
-    }
-    const worker = resolveWorkerTabAggregateId(item) || 'orchestrator';
-    const title = (item.title || item.worker?.title || laneId).trim();
-    const status = canonicalStatusToWorkerLaneStatus(item.status);
-    laneById.set(laneId, {
-      laneId,
-      laneVersion: item.itemSeq,
-      title,
-      description: item.content || title,
-      status,
-      startedAt: item.createdAt,
-      ...(isCanonicalTerminalStatus(item.status) ? { endedAt: item.updatedAt } : {}),
-      jumpTarget: { workerTabId: worker },
-    });
-    laneVersionById.set(laneId, item.itemSeq);
-  }
-
-  for (const item of turn.items) {
-    const laneId = item.laneId?.trim();
-    if (!laneId || !laneById.has(laneId)) {
-      continue;
-    }
-    const lane = laneById.get(laneId)!;
-    lane.laneVersion = Math.max(lane.laneVersion, item.itemSeq);
-    laneVersionById.set(laneId, lane.laneVersion);
-    if (item.kind === 'tool_call') {
-      lane.toolUseCount = (lane.toolUseCount || 0) + 1;
-    }
-    // P2：lane liveActivity / summary 只接受后端显式发出的 `worker_status` 摘要 item，
-    // 其它 worker 侧事件（thinking/tool_call/stream）不再参与主线摘要聚合——主线
-    // 信息密度由后端控制，drawer 仍保留完整事件流。
-    if (item.kind === 'worker_status') {
-      const activityText = summarizeLaneItem(item);
-      if (activityText) {
-        const currentActivity = laneActivityById.get(laneId);
-        if (!currentActivity || item.itemSeq >= currentActivity.itemSeq) {
-          laneActivityById.set(laneId, { text: activityText, itemSeq: item.itemSeq });
-        }
-      }
-    }
-    if (isCanonicalTerminalStatus(item.status)) {
-      lane.endedAt = item.updatedAt;
-    }
-  }
-
-  for (const [laneId, activity] of laneActivityById.entries()) {
-    const lane = laneById.get(laneId);
-    if (!lane) {
-      continue;
-    }
-    if (lane.status === 'running' || lane.status === 'pending') {
-      lane.liveActivity = activity.text;
-    } else {
-      lane.summary = activity.text;
-    }
-  }
-
-  const lanes = Array.from(laneById.values())
-    .sort((left, right) => {
-      const leftSeq = dispatchItems.find((item) => item.laneId === left.laneId)?.laneSeq ?? Number.MAX_SAFE_INTEGER;
-      const rightSeq = dispatchItems.find((item) => item.laneId === right.laneId)?.laneSeq ?? Number.MAX_SAFE_INTEGER;
-      return leftSeq - rightSeq || left.laneId.localeCompare(right.laneId);
-    })
-    .map((lane) => {
-      const totalTaskCount = 1;
-      return {
-        ...lane,
-        progressSummary: {
-          totalTaskCount,
-          completedTaskCount: lane.status === 'completed' ? 1 : 0,
-          blockedTaskCount: lane.status === 'blocked' ? 1 : 0,
-          awaitingApprovalTaskCount: lane.status === 'awaiting_approval' ? 1 : 0,
-          reviewRequiredTaskCount: lane.status === 'review_required' ? 1 : 0,
-        },
-        tasks: [{
-          taskId: dispatchItems.find((item) => item.laneId === lane.laneId)?.worker?.taskId,
-          title: lane.title,
-          status: lane.status,
-          isCurrent: lane.status === 'running' || lane.status === 'pending',
-          seq: dispatchItems.find((item) => item.laneId === lane.laneId)?.laneSeq,
-        }],
-      };
-    });
-  if (lanes.length === 0) {
-    return null;
-  }
-
-  const groupStatus = lanes.reduce<WorkerLaneStatus>(
-    (status, lane) => mergeLaneStatus(status, lane.status),
-    'completed',
-  );
-  const firstItem = dispatchItems[0]!;
-  const artifactId = `turn:${turn.turnId}:worker-dispatch-group`;
-  const responseDurationMs = resolveDispatchGroupResponseDurationMs(turn, presentation);
-  // worker_dispatch 在 buildTurnPresentation 里作为 round 边界保留原顺序，
-  // 必定在 presentation.presentationSeq 中，requirePresentationSeq 不会抛。
-  const firstItemPresentationSeq = requirePresentationSeq(presentation, firstItem);
-  const dispatchBlockId = `dispatch-group:${turn.turnId}`;
-  const block: ContentBlock = {
-    id: dispatchBlockId,
-    type: 'dispatch_group',
-    content: '',
-    blockId: dispatchBlockId,
-    dispatchWaveId: turn.turnId,
-    status: groupStatus,
-    lanes,
-  };
-  const message: Message = {
-    id: artifactId,
-    role: 'assistant',
-    source: 'orchestrator',
-    content: '',
-    blocks: [block],
-    timestamp: firstItem.createdAt,
-    updatedAt: Math.max(...dispatchItems.map((item) => item.updatedAt || item.createdAt)),
-    isStreaming: groupStatus === 'running' || groupStatus === 'pending',
-    isComplete: groupStatus !== 'running' && groupStatus !== 'pending',
-    type: 'text',
-    metadata: {
-      turnId: turn.turnId,
-      turnSeq: turn.turnSeq,
-      turnStatus: turn.status,
-      turnItemId: artifactId,
-      turnItemKind: 'worker_dispatch',
-      turnItemStatus: groupStatus,
-      // dispatch group 的 itemSeq 取首 dispatch item 的展示序（×1000），与
-      // buildMessage 写入值对齐，让 compareTimelineSemanticOrder 在跨 artifact
-      // 排序时数量级一致。
-      itemSeq: firstItemPresentationSeq * 1000,
-      canonicalItemSeq: firstItem.itemSeq,
-      blockSeq: firstItem.itemSeq,
-      cardStreamSeq: firstItem.itemSeq,
-      dispatchWaveId: turn.turnId,
-      ...(responseDurationMs !== undefined ? { responseDurationMs } : {}),
-      canonical: true,
-    },
-  };
-
-  return {
-    artifactId,
-    kind: 'message',
-    displayOrder: turn.turnSeq * 1_000_000 + firstItemPresentationSeq * 1000,
-    artifactVersion: Math.max(...Array.from(laneVersionById.values())),
-    anchorEventSeq: 0,
-    latestEventSeq: 0,
-    cardStreamSeq: firstItem.itemSeq,
-    timestamp: firstItem.createdAt,
-    cardId: artifactId,
-    dispatchWaveId: turn.turnId,
-    messageIds: [artifactId, ...dispatchItems.map((item) => item.itemId)],
-    message,
+    message: buildMessage(turn, item, artifactId, presentation),
   };
 }
 
 function buildTurnProjectionArtifacts(turn: CanonicalTurn): Array<TimelineProjectionArtifact | null> {
-  const laneMetaById = collectLaneProjectionMeta(turn);
   const presentation = buildTurnPresentation(turn);
-  return [
-    buildDispatchGroupArtifact(turn, presentation),
-    // 遍历 presentation.orderedItems（已按呈现序排好），不再用 turn.items 原顺序——
-    // 虽然下游 collapseArtifactsByStableCard 仍会按 displayOrder 总排序，但用
-    // orderedItems 让数据流意图更显式：呈现序在这里就已经固定。
-    ...presentation.orderedItems.map((item) => buildArtifact(turn, item, laneMetaById, presentation)),
-  ];
+  // 遍历 presentation.orderedItems（已按呈现序排好），不再用 turn.items 原顺序——
+  // 虽然下游 collapseArtifactsByStableCard 仍会按 displayOrder 总排序，但用
+  // orderedItems 让数据流意图更显式：呈现序在这里就已经固定。
+  return presentation.orderedItems.map((item) => buildArtifact(turn, item, presentation));
 }
 
 function compareArtifacts(left: TimelineProjectionArtifact, right: TimelineProjectionArtifact): number {
@@ -805,8 +479,7 @@ function mergeDuplicateArtifact(
     cardStreamSeq: Math.min(first.cardStreamSeq, latest.cardStreamSeq),
     timestamp: Math.min(first.timestamp, latest.timestamp),
     cardId: first.cardId,
-    laneId: first.laneId || latest.laneId,
-    worker: first.worker || latest.worker,
+    taskId: first.taskId || latest.taskId,
     messageIds: mergeMessageIds(first.messageIds, latest.messageIds),
     message: {
       ...latest.message,
@@ -865,23 +538,11 @@ export function buildCanonicalTimelineProjection(state: CanonicalTurnReducerStat
     .flatMap((turn) => buildTurnProjectionArtifacts(turn))
     .filter((artifact): artifact is TimelineProjectionArtifact => Boolean(artifact))
     .sort(compareArtifacts));
-  // P7.E：路由由 artifact.worker 单一信号决定。
-  // - artifact.worker 为空 → orchestrator 主线 thread；
-  // - artifact.worker 为非空字符串 → 对应 roleId 的 worker drawer。
+  // 主时间线只承接 root agent artifacts；
+  // 子代理 artifacts 由 RightPane task tab 按 metadata.taskId 过滤呈现。
   const threadRenderEntries = artifacts
-    .filter((artifact) => !artifact.worker)
+    .filter((artifact) => !artifact.taskId)
     .map(renderEntry);
-  const workerRenderEntries: Record<string, TimelineProjectionRenderEntry[]> = {};
-  for (const artifact of artifacts) {
-    const workerId = artifact.worker;
-    if (!workerId) {
-      continue;
-    }
-    if (!workerRenderEntries[workerId]) {
-      workerRenderEntries[workerId] = [];
-    }
-    workerRenderEntries[workerId].push(renderEntry(artifact));
-  }
   return {
     schemaVersion: 'session-timeline-projection.v2',
     sessionId,
@@ -889,6 +550,5 @@ export function buildCanonicalTimelineProjection(state: CanonicalTurnReducerStat
     lastAppliedEventSeq: state.lastAppliedEventSeq,
     artifacts,
     threadRenderEntries,
-    workerRenderEntries,
   };
 }

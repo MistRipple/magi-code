@@ -16,7 +16,7 @@ import { normalizeMessagePayload } from './message-payload';
 import { resolveTaskCardWorkerSlot } from './worker-role-utils';
 import { ensureArray } from './utils';
 import { i18n } from '../stores/i18n.svelte';
-import { resolveTimelineWorkerId } from '../shared/timeline-worker-lifecycle';
+import { normalizeWorkerSlot } from '../shared/timeline-worker-lifecycle';
 
 export function safeParseJson(value?: string): Record<string, unknown> | null {
   if (!value || typeof value !== 'string') return null;
@@ -105,10 +105,8 @@ export function resolveWorkerSlotFromMessage(message: Message): string | null {
   if (message.type === 'task_card') {
     return resolveTaskCardWorkerSlot(message.metadata as Record<string, unknown> | undefined);
   }
-  const worker = resolveTimelineWorkerId(
-    message.metadata as Record<string, unknown> | undefined,
-  );
-  return worker;
+  const metadata = message.metadata as Record<string, unknown> | undefined;
+  return normalizeWorkerSlot(metadata?.roleId) || normalizeWorkerSlot(metadata?.workerId) || null;
 }
 
 export function mapStandardBlocks(blocks: StandardContentBlock[]): ContentBlock[] {
@@ -264,52 +262,6 @@ export function mapStandardBlocks(blocks: StandardContentBlock[]): ContentBlock[
             riskFactors: block.riskFactors,
             rawJson: block.rawJson,
           },
-        };
-      }
-      case 'dispatch_group': {
-        const blockId = requireBlockId(block, 'dispatch_group');
-        return {
-          id: blockId,
-          type: 'dispatch_group',
-          content: '',
-          blockId,
-          dispatchWaveId: block.dispatchWaveId,
-          status: block.status,
-          summaryText: block.summaryText,
-          lanes: Array.isArray(block.lanes)
-            ? block.lanes.map((lane) => ({
-                laneId: lane.laneId,
-                laneVersion: lane.laneVersion,
-                title: lane.title,
-                description: lane.description,
-                status: lane.status,
-                startedAt: lane.startedAt,
-                endedAt: lane.endedAt,
-                liveActivity: lane.liveActivity,
-                toolUseCount: lane.toolUseCount,
-                progressSummary: lane.progressSummary
-                  ? {
-                      completedTaskCount: lane.progressSummary.completedTaskCount,
-                      totalTaskCount: lane.progressSummary.totalTaskCount,
-                      blockedTaskCount: lane.progressSummary.blockedTaskCount,
-                      awaitingApprovalTaskCount: lane.progressSummary.awaitingApprovalTaskCount,
-                      reviewRequiredTaskCount: lane.progressSummary.reviewRequiredTaskCount,
-                    }
-                  : undefined,
-                tasks: Array.isArray(lane.tasks)
-                  ? lane.tasks.map((task) => ({
-                      taskId: task.taskId,
-                      title: task.title,
-                      status: task.status,
-                      isCurrent: task.isCurrent,
-                      seq: task.seq,
-                    }))
-                  : undefined,
-                summary: lane.summary,
-                fileChangeCount: lane.fileChangeCount,
-                jumpTarget: lane.jumpTarget,
-              }))
-            : [],
         };
       }
       default:

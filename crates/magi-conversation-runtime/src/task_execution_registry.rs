@@ -16,7 +16,7 @@ use magi_core::{
     WorkerId, WorkspaceId,
 };
 use magi_orchestrator::{ExecutionWritebackPlans, task_store::TaskStore};
-use magi_session_store::{ActiveExecutionBranch, ActiveExecutionTurnLane, SessionStore};
+use magi_session_store::{ActiveExecutionBranch, SessionStore};
 use magi_spawn_graph::SpawnGraph;
 
 use crate::session_thread;
@@ -26,10 +26,8 @@ pub enum TaskExecutionPlan {
     Dispatch {
         target: TaskExecutionTarget,
         worker_id: WorkerId,
-        lane_id: Option<String>,
-        lane_seq: Option<usize>,
-        /// lane 绑定的 thread，由 `session_thread::ensure_thread_for_role` 为当前 task
-        /// 独立创建，是 worker drawer 归属与当前 task 恢复记录的路由键。
+        /// task 绑定的 thread，由 `session_thread::ensure_thread_for_role` 为当前 task
+        /// 独立创建，是 task 详情归属与当前 task 恢复记录的路由键。
         thread_id: ThreadId,
         is_primary: bool,
         session_id: SessionId,
@@ -54,8 +52,6 @@ pub struct SpawnedChildExecutionRequest<'a> {
 
 pub struct SpawnedChildExecution {
     pub worker_id: WorkerId,
-    pub lane_id: String,
-    pub lane_seq: usize,
     pub thread_id: ThreadId,
     pub execution_chain_ref: String,
 }
@@ -142,12 +138,6 @@ impl TaskExecutionRegistry {
             &child_task.task_id,
             now,
         );
-        let lane_seq = chain
-            .current_turn
-            .as_ref()
-            .map(|turn| turn.worker_lanes.len() + 1)
-            .unwrap_or(1);
-        let lane_id = format!("lane-{}", child_task.task_id);
         let branch = ActiveExecutionBranch {
             task_id: child_task.task_id.clone(),
             worker_id: worker_id.clone(),
@@ -163,6 +153,7 @@ impl TaskExecutionRegistry {
             use_tools: true,
             skill_name: None,
             is_primary: false,
+            thread_id: thread_id.clone(),
         };
         chain
             .branches
@@ -179,18 +170,6 @@ impl TaskExecutionRegistry {
             .map(|entry| entry.worker_id.clone())
             .collect();
         if let Some(turn) = chain.current_turn.as_mut() {
-            turn.worker_lanes
-                .retain(|lane| lane.task_id != child_task.task_id);
-            turn.worker_lanes.push(ActiveExecutionTurnLane {
-                lane_id: lane_id.clone(),
-                lane_seq,
-                task_id: child_task.task_id.clone(),
-                worker_id: worker_id.clone(),
-                role_id: role.to_string(),
-                thread_id: thread_id.clone(),
-                title: child_task.title.clone(),
-                is_primary: false,
-            });
             turn.normalize();
         }
         let execution_chain_ref = chain.execution_chain_ref.clone();
@@ -211,8 +190,6 @@ impl TaskExecutionRegistry {
                     execution_chain_ref: Some(execution_chain_ref.clone()),
                 },
                 worker_id: worker_id.clone(),
-                lane_id: Some(lane_id.clone()),
-                lane_seq: Some(lane_seq),
                 thread_id: thread_id.clone(),
                 is_primary: false,
                 session_id: session_id.clone(),
@@ -234,8 +211,6 @@ impl TaskExecutionRegistry {
 
         Ok(SpawnedChildExecution {
             worker_id,
-            lane_id,
-            lane_seq,
             thread_id,
             execution_chain_ref,
         })
@@ -318,6 +293,7 @@ mod tests {
                         use_tools: true,
                         skill_name: None,
                         is_primary: true,
+                        thread_id: ThreadId::new("thread-atomic-spawn-parent"),
                     }],
                     recovery_ref: None,
                     dispatch_context: ActiveExecutionDispatchContext {
@@ -334,7 +310,6 @@ mod tests {
                         status: "running".to_string(),
                         user_message: Some("spawn child".to_string()),
                         items: Vec::new(),
-                        worker_lanes: Vec::new(),
                     }),
                 },
             )
@@ -349,12 +324,11 @@ mod tests {
                 child_task: &child,
                 session_id: &session_id,
                 workspace_id: &workspace_id,
-                role: "integration-dev",
+                role: "executor",
                 now,
             })
             .expect("spawned child runtime registration should succeed");
 
-        assert_eq!(registered.lane_seq, 1);
         assert_eq!(registered.execution_chain_ref, "chain-atomic-spawn");
         assert!(
             task_store.get_task(&child.task_id).is_some(),
@@ -373,8 +347,6 @@ mod tests {
             .expect("child execution plan should be registered atomically");
         match plan {
             TaskExecutionPlan::Dispatch {
-                lane_id,
-                lane_seq,
                 thread_id,
                 session_id: plan_session_id,
                 workspace_id: plan_workspace_id,
@@ -382,8 +354,6 @@ mod tests {
                 use_tools,
                 ..
             } => {
-                assert_eq!(lane_id.as_deref(), Some(registered.lane_id.as_str()));
-                assert_eq!(lane_seq, Some(1));
                 assert_eq!(thread_id, registered.thread_id);
                 assert_eq!(plan_session_id, session_id);
                 assert_eq!(plan_workspace_id, workspace_id);
@@ -395,19 +365,15 @@ mod tests {
         let chain = session_store
             .active_execution_chain(&session_id)
             .expect("active execution chain should remain available");
-        assert!(chain.branches.iter().any(|branch| {
-            branch.task_id == child.task_id && branch.worker_id == registered.worker_id
-        }));
+        let child_branch = chain
+            .branches
+            .iter()
+            .find(|branch| {
+                branch.task_id == child.task_id && branch.worker_id == registered.worker_id
+            })
+            .expect("child branch should exist");
+        assert_eq!(child_branch.thread_id, registered.thread_id);
         assert!(chain.active_branch_task_ids.contains(&child.task_id));
         assert!(chain.active_worker_bindings.contains(&registered.worker_id));
-        let lanes = chain
-            .current_turn
-            .as_ref()
-            .expect("current turn should exist")
-            .worker_lanes
-            .as_slice();
-        assert_eq!(lanes.len(), 1);
-        assert_eq!(lanes[0].task_id, child.task_id);
-        assert_eq!(lanes[0].thread_id, registered.thread_id);
     }
 }

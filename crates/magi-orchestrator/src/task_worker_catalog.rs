@@ -5,7 +5,7 @@ use magi_core::{Task, TaskKind, WorkerId};
 #[derive(Clone, Debug)]
 pub struct WorkerInfo {
     pub worker_id: WorkerId,
-    /// The role this worker can fulfil (e.g. "integration-dev", "reviewer", "debugger").
+    /// The role this worker can fulfil (e.g. "executor", "reviewer", "explorer").
     pub role: String,
     /// Task kinds this worker is capable of handling.
     pub supported_kinds: Vec<TaskKind>,
@@ -21,11 +21,11 @@ use std::sync::RwLock;
 /// Task System v2：role / prompt 经 `AgentRoleRegistry` 解析；本模块只保留动态目录查询。
 pub fn default_task_role_for_kind(kind: TaskKind) -> Option<&'static str> {
     match kind {
-        TaskKind::LocalAgent => Some("integration-dev"),
-        TaskKind::LocalWorkflow => Some("integration-dev"),
-        TaskKind::RemoteAgent => Some("integration-dev"),
-        TaskKind::MonitorMcp => Some("integration-dev"),
-        TaskKind::InProcessTeammate => Some("integration-dev"),
+        TaskKind::LocalAgent => Some("executor"),
+        TaskKind::LocalWorkflow => Some("executor"),
+        TaskKind::RemoteAgent => Some("executor"),
+        TaskKind::MonitorMcp => Some("executor"),
+        TaskKind::InProcessTeammate => Some("executor"),
         TaskKind::Dream => Some("architect"),
     }
 }
@@ -282,7 +282,7 @@ mod tests {
             required_children: Vec::new(),
             policy_snapshot: None,
             executor_binding: Some(serde_json::json!({
-                "target_role": "test-engineer",
+                "target_role": "tester",
                 "capability_requirements": [],
                 "parallelism_group": null,
                 "exclusive_scope": null,
@@ -300,7 +300,7 @@ mod tests {
             updated_at: magi_core::UtcMillis::now(),
         };
 
-        assert_eq!(resolve_task_role(&task, &reg), Some("test-engineer"));
+        assert_eq!(resolve_task_role(&task, &reg), Some("tester"));
     }
 
     #[test]

@@ -83,21 +83,19 @@ pub fn publish_task_status_turn_item_for_active_sessions(
         let turn_matches = turn
             .items
             .iter()
-            .any(|item| item.task_id.as_ref() == Some(&task.task_id))
-            || turn
-                .worker_lanes
-                .iter()
-                .any(|lane| lane.task_id == task.task_id);
+            .any(|item| item.task_id.as_ref() == Some(&task.task_id));
         if !active_chain_matches && !turn_matches {
             continue;
         }
 
-        let lane = turn
-            .worker_lanes
-            .iter()
-            .find(|lane| lane.task_id == task.task_id);
-        let source_thread_id = match lane {
-            Some(lane) => lane.thread_id.clone(),
+        let branch = sidecar.active_execution_chain.as_ref().and_then(|chain| {
+            chain
+                .branches
+                .iter()
+                .find(|branch| branch.task_id == task.task_id)
+        });
+        let source_thread_id = match branch {
+            Some(branch) => branch.thread_id.clone(),
             None => match session_store.orchestrator_thread_for_session(&sidecar.session_id) {
                 Some(thread) => thread.thread_id,
                 None => continue,
@@ -115,10 +113,8 @@ pub fn publish_task_status_turn_item_for_active_sessions(
         item.source = "task".to_string();
         item.task_id = Some(task.task_id.clone());
         item.role_id = task.executor_binding_target_role().map(str::to_string);
-        if let Some(lane) = lane {
-            item.lane_id = Some(lane.lane_id.clone());
-            item.lane_seq = Some(lane.lane_seq);
-            item.worker_id = Some(lane.worker_id.clone());
+        if let Some(branch) = branch {
+            item.worker_id = Some(branch.worker_id.clone());
         }
         if let Some(published) = append_session_turn_item_with_task_store(
             session_store,

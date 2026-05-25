@@ -76,13 +76,6 @@ fn default_frozen_policy() -> TaskPolicy {
     }
 }
 
-fn task_requires_delivery_evidence(task: &Task) -> bool {
-    task.kind == TaskKind::LocalAgent
-        && task.policy_snapshot.as_ref().is_some_and(|policy| {
-            policy.task_tier == TaskTier::LongMission && policy.validation_profile.is_some()
-        })
-}
-
 fn output_ref_is_file_change(output_ref: &str) -> bool {
     let trimmed = output_ref.trim();
     if trimmed.is_empty()
@@ -267,15 +260,6 @@ impl TaskStore {
         let task = tasks
             .get_mut(task_id)
             .ok_or(DomainError::NotFound { entity: "Task" })?;
-        if status == TaskStatus::Completed
-            && task.status != TaskStatus::Completed
-            && task_requires_delivery_evidence(task)
-            && task.evidence_refs.is_empty()
-        {
-            return Err(DomainError::Validation {
-                message: format!("任务 {task_id} 在完成前必须写入 evidence_refs"),
-            });
-        }
         let old_status = task.status;
         task.status = status;
         task.updated_at = UtcMillis::now();
@@ -315,15 +299,6 @@ impl TaskStore {
             if task.policy_snapshot.is_none() {
                 task.policy_snapshot = Some(default_frozen_policy());
             }
-        }
-        if new_status == TaskStatus::Completed
-            && old_status != TaskStatus::Completed
-            && task_requires_delivery_evidence(task)
-            && task.evidence_refs.is_empty()
-        {
-            return Err(DomainError::Validation {
-                message: format!("任务 {task_id} 在完成前必须写入 evidence_refs"),
-            });
         }
         task.status = new_status;
         task.updated_at = UtcMillis::now();
@@ -502,17 +477,14 @@ impl TaskStore {
     }
 
     fn ancestor_chain_allows_dispatch_inner(task: &Task, tasks: &HashMap<TaskId, Task>) -> bool {
+        // 新执行模型（同步 agent_spawn）下，父任务调用 agent_spawn 后进入 Running
+        // 并阻塞等待子任务终态，因此祖先链允许出现 Running 节点；只有 Pending 祖先
+        // （还没开始执行）才说明该子任务尚不该被调度。父任务的依赖在父任务自身
+        // 进入 Running 前已被 dispatcher 校验过，这里不再重复校验。
         let mut current = task.parent_task_id.as_ref();
         while let Some(pid) = current {
             if let Some(parent) = tasks.get(pid) {
-                if parent.status != TaskStatus::Completed {
-                    return false;
-                }
-                if parent.dependency_ids.iter().any(|dependency_id| {
-                    !tasks
-                        .get(dependency_id)
-                        .is_some_and(|dependency| dependency.status == TaskStatus::Completed)
-                }) {
+                if parent.status == TaskStatus::Pending {
                     return false;
                 }
                 current = parent.parent_task_id.as_ref();
@@ -673,6 +645,8 @@ impl TaskStore {
 
         let aggregate_status = if root_task.status == TaskStatus::Killed {
             TaskStatus::Killed
+        } else if root_task.status == TaskStatus::Completed {
+            TaskStatus::Completed
         } else if failed_count > 0 {
             TaskStatus::Failed
         } else if running_count > 0 {
@@ -701,6 +675,8 @@ impl TaskStore {
         };
         let display_status = if root_task.status == TaskStatus::Killed {
             "已终止".to_string()
+        } else if root_task.status == TaskStatus::Completed && failed_count > 0 {
+            format!("主线已完成，{} 项子任务已降级处理", failed_count)
         } else if total_tasks == 0 {
             "待启动".to_string()
         } else {
@@ -909,7 +885,10 @@ impl TaskStore {
         let mut leases = self.leases.write().expect("leases write lock poisoned");
         if let Some(lease) = leases.get_mut(lease_id) {
             if lease.task_id == *task_id && lease.lease_status == TaskLeaseState::Active {
-                lease.heartbeat_at = UtcMillis::now();
+                let now = UtcMillis::now();
+                let lease_ttl_ms = lease.expires_at.0.saturating_sub(lease.granted_at.0);
+                lease.heartbeat_at = now;
+                lease.expires_at = UtcMillis(now.0 + lease_ttl_ms);
                 return true;
             }
         }

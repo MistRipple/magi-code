@@ -27,6 +27,7 @@ pub fn turn_item_status_for_tool_result(status: ExecutionResultStatus) -> &'stat
 pub fn infer_tool_call_status(result: &str) -> &'static str {
     let parsed = serde_json::from_str::<serde_json::Value>(result).ok();
     let mut explicit_success = false;
+    let mut explicit_degraded = false;
     if let Some(status) = parsed
         .as_ref()
         .and_then(|v| v.get("status"))
@@ -37,8 +38,15 @@ pub fn infer_tool_call_status(result: &str) -> &'static str {
             | "needs_approval" | "needsapproval" | "timeout" | "timed_out" | "killed"
             | "aborted" => return "error",
             "succeeded" | "success" | "ok" | "completed" => explicit_success = true,
+            "degraded" => {
+                explicit_success = true;
+                explicit_degraded = true;
+            }
             _ => {}
         }
+    }
+    if explicit_degraded {
+        return "success";
     }
     if parsed
         .as_ref()
@@ -131,6 +139,10 @@ mod tests {
             "error"
         );
         assert_eq!(infer_tool_call_status(r#"{"status":"ok"}"#), "success");
+        assert_eq!(
+            infer_tool_call_status(r#"{"status":"degraded","error":"子代理不可用"}"#),
+            "success"
+        );
         assert_eq!(
             infer_tool_call_status("高风险工具必须人工审批: shell_exec"),
             "error"

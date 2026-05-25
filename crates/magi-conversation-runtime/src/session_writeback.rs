@@ -10,12 +10,12 @@ use magi_bridge_client::{
     tool_concurrency::{ToolBatchKind, ToolConcurrencyInput, partition_tool_calls_with_inputs},
 };
 use magi_core::{
-    ApprovalRequirement, EventId, ExecutionResultStatus, RiskLevel, SessionId, TaskId, TaskStatus,
-    ThreadId, ToolCallId, UtcMillis, WorkspaceId,
+    ApprovalRequirement, EventId, ExecutionResultStatus, RiskLevel, SessionId, TaskId, ThreadId,
+    ToolCallId, UtcMillis, WorkspaceId,
 };
 use magi_event_bus::{
     EventContext, EventEnvelope, InMemoryEventBus, SessionRuntimeTurnItemSummaryEntry,
-    SessionRuntimeTurnLaneSummaryEntry, SessionRuntimeTurnSummaryEntry,
+    SessionRuntimeTurnSummaryEntry,
 };
 use magi_governance::ToolKind;
 use magi_orchestrator::task_store::TaskStore;
@@ -40,7 +40,6 @@ pub struct PublishedSessionTurnItem {
     pub item: ActiveExecutionTurnItem,
     pub current_turn: SessionRuntimeTurnSummaryEntry,
     pub turn_items: Vec<SessionRuntimeTurnItemSummaryEntry>,
-    pub worker_lanes: Vec<SessionRuntimeTurnLaneSummaryEntry>,
     pub canonical_turn: Option<CanonicalTurn>,
     pub canonical_item: Option<CanonicalTurnItem>,
 }
@@ -85,7 +84,6 @@ fn published_session_turn_item_from_sidecar(
     let response_duration_ms = turn
         .completed_at
         .map(|completed_at| completed_at.0.saturating_sub(turn.accepted_at.0));
-    let lane_status_by_id = turn_lane_status_by_id(turn, task_store);
     let canonical_turn = to_canonical_turn(&sidecar.session_id, turn);
     let canonical_item = to_canonical_turn_item(&sidecar.session_id, turn, &item);
     Some(PublishedSessionTurnItem {
@@ -109,17 +107,6 @@ fn published_session_turn_item_from_sidecar(
             .iter()
             .map(|item| to_turn_item_summary(item, task_store))
             .collect(),
-        worker_lanes: turn
-            .worker_lanes
-            .iter()
-            .map(|lane| {
-                let status = lane_status_by_id
-                    .get(&lane.lane_id)
-                    .map(String::as_str)
-                    .unwrap_or(turn.status.as_str());
-                to_turn_lane_summary(lane, status, task_store)
-            })
-            .collect(),
         canonical_turn,
         canonical_item,
     })
@@ -137,10 +124,9 @@ fn chain_for_turn_summary<'a>(
 }
 
 fn turn_has_execution_chain_items(turn: &ActiveExecutionTurn) -> bool {
-    !turn.worker_lanes.is_empty()
-        || turn.items.iter().any(|item| {
-            item.task_id.is_some() || item.worker_id.is_some() || item.lane_id.is_some()
-        })
+    turn.items
+        .iter()
+        .any(|item| item.task_id.is_some() || item.worker_id.is_some())
 }
 
 fn canonical_turn_status(status: &str) -> Option<CanonicalTurnStatus> {
@@ -188,9 +174,6 @@ fn canonical_item_kind(kind: &str) -> Option<CanonicalTurnItemKind> {
         "assistant_thinking" => Some(CanonicalTurnItemKind::AssistantThinking),
         "assistant_phase" => Some(CanonicalTurnItemKind::SystemNotice),
         "tool_call_started" | "tool_call_result" => Some(CanonicalTurnItemKind::ToolCall),
-        "worker_spawned" => Some(CanonicalTurnItemKind::WorkerDispatch),
-        "worker_status" => Some(CanonicalTurnItemKind::WorkerStatus),
-        "worker_result" => Some(CanonicalTurnItemKind::WorkerResult),
         "task_status" => Some(CanonicalTurnItemKind::TaskStatus),
         _ => None,
     }
@@ -312,8 +295,6 @@ fn to_canonical_turn_item(
         status,
         item_version: None,
         updated_at: UtcMillis::now(),
-        lane_id: item.lane_id.clone(),
-        lane_seq: item.lane_seq,
         title: item.title.clone(),
         content: item.content.clone(),
         blocks: Vec::new(),
@@ -370,8 +351,6 @@ pub fn session_turn_item(
     ActiveExecutionTurnItem {
         item_id: item_id.unwrap_or_else(|| format!("turn-item-{}-{}", kind, UtcMillis::now().0)),
         item_seq: 0,
-        lane_id: None,
-        lane_seq: None,
         kind: kind.to_string(),
         status: status.to_string(),
         source: "orchestrator".to_string(),
@@ -468,7 +447,6 @@ pub fn publish_session_turn_item_event_with_stream_update(
         "item": published.item,
         "current_turn": published.current_turn,
         "turn_items": published.turn_items,
-        "worker_lanes": published.worker_lanes,
         "canonical_schema_version": CANONICAL_TURN_SCHEMA_VERSION,
         "canonical_event_kind": canonical_event_kind(published.canonical_turn.as_ref()),
         "canonical_turn": published.canonical_turn,
@@ -566,37 +544,6 @@ fn task_role_id(task_store: Option<&TaskStore>, task_id: &TaskId) -> Option<Stri
         .and_then(|task| task.executor_binding_target_role().map(str::to_string))
 }
 
-fn task_status_label(status: &TaskStatus) -> &'static str {
-    match status {
-        TaskStatus::Pending => "pending",
-        TaskStatus::Running => "running",
-        TaskStatus::Completed => "completed",
-        TaskStatus::Failed => "failed",
-        TaskStatus::Killed => "killed",
-    }
-}
-
-fn turn_lane_status_by_id(
-    turn: &magi_session_store::ActiveExecutionTurn,
-    task_store: Option<&TaskStore>,
-) -> std::collections::HashMap<String, String> {
-    turn.worker_lanes
-        .iter()
-        .map(|lane| {
-            let status = task_store
-                .and_then(|store| store.get_task(&lane.task_id))
-                .map(|task| task_status_label(&task.status).to_string())
-                .or_else(|| {
-                    turn.items.iter().rev().find_map(|item| {
-                        (item.lane_id.as_ref() == Some(&lane.lane_id)).then(|| item.status.clone())
-                    })
-                })
-                .unwrap_or_else(|| turn.status.clone());
-            (lane.lane_id.clone(), status)
-        })
-        .collect()
-}
-
 fn to_turn_item_summary(
     item: &ActiveExecutionTurnItem,
     task_store: Option<&TaskStore>,
@@ -609,8 +556,6 @@ fn to_turn_item_summary(
     SessionRuntimeTurnItemSummaryEntry {
         item_id: item.item_id.clone(),
         item_seq: item.item_seq,
-        lane_id: item.lane_id.clone(),
-        lane_seq: item.lane_seq,
         kind: item.kind.clone(),
         status: item.status.clone(),
         source: item.source.clone(),
@@ -630,23 +575,6 @@ fn to_turn_item_summary(
         placeholder_message_id: item.placeholder_message_id.clone(),
         timeline_entry_id: item.timeline_entry_id.clone(),
         source_thread_id: item.source_thread_id.to_string(),
-    }
-}
-
-fn to_turn_lane_summary(
-    lane: &magi_session_store::ActiveExecutionTurnLane,
-    status: &str,
-    _task_store: Option<&TaskStore>,
-) -> SessionRuntimeTurnLaneSummaryEntry {
-    SessionRuntimeTurnLaneSummaryEntry {
-        lane_id: lane.lane_id.clone(),
-        lane_seq: lane.lane_seq,
-        task_id: lane.task_id.to_string(),
-        worker_id: lane.worker_id.to_string(),
-        role_id: lane.role_id.clone(),
-        title: lane.title.clone(),
-        status: status.to_string(),
-        is_primary: lane.is_primary,
     }
 }
 
@@ -992,11 +920,10 @@ fn execute_session_turn_tool_call(
 mod tests {
     use super::*;
     use magi_bridge_client::ChatToolFunction;
-    use magi_core::{MissionId, Task, TaskKind, ThreadId, WorkerId};
+    use magi_core::{MissionId, ThreadId};
     use magi_governance::GovernanceService;
     use magi_session_store::{
         ActiveExecutionChain, ActiveExecutionDispatchContext, ActiveExecutionTurn,
-        ActiveExecutionTurnLane, ExecutionThread, ExecutionThreadStatus,
     };
     use magi_skill_runtime::{SkillDefinition, SkillMetadata, SkillRegistry};
     use magi_tool_runtime::{BuiltinTool, BuiltinToolSpec};
@@ -1240,7 +1167,6 @@ mod tests {
                     status: "running".to_string(),
                     user_message: Some("并发执行 shell".to_string()),
                     items: Vec::new(),
-                    worker_lanes: Vec::new(),
                     completed_at: None,
                 },
             )
@@ -1410,142 +1336,6 @@ mod tests {
             Some(2),
             "实时 turn item 事件必须携带当前 turn 的全部 item"
         );
-        assert!(
-            snapshot_event.payload.get("worker_lanes").is_some(),
-            "实时 turn item 事件必须携带 worker_lanes，供前端走 canonical projection"
-        );
-    }
-
-    #[test]
-    fn live_turn_item_worker_lane_status_uses_task_store_instead_of_spawned_item() {
-        let session_store = SessionStore::new();
-        let task_store = TaskStore::new();
-        let session_id = SessionId::new("session-worker-lane-authority");
-        let task_id = TaskId::new("task-worker-lane-authority");
-        let worker_id = WorkerId::new("worker-worker-lane-authority");
-        let lane_id = "lane-task-worker-lane-authority".to_string();
-        session_store
-            .create_session(session_id.clone(), "worker lane authority")
-            .expect("session should be creatable");
-
-        let now = UtcMillis::now();
-        let (_, orchestrator_thread_id) =
-            session_store.ensure_session_mission(&session_id, now, || {
-                MissionId::new("mission-worker-lane-authority")
-            });
-        let worker_thread_id = ThreadId::new("thread-reviewer-worker-lane-authority");
-        session_store.register_thread(ExecutionThread {
-            thread_id: worker_thread_id.clone(),
-            session_id: session_id.clone(),
-            mission_id: MissionId::new("mission-worker-lane-authority"),
-            role_id: "reviewer".to_string(),
-            worker_instance_id: worker_id.clone(),
-            status: ExecutionThreadStatus::Active,
-            created_at: now,
-            last_used_at: now,
-            handled_task_ids: vec![task_id.clone()],
-            message_history: Vec::new(),
-        });
-        task_store.insert_task(Task {
-            task_id: task_id.clone(),
-            mission_id: MissionId::new("mission-worker-lane-authority"),
-            root_task_id: task_id.clone(),
-            parent_task_id: None,
-            kind: TaskKind::LocalAgent,
-            title: "权威任务状态".to_string(),
-            goal: "验证 worker lane 状态来源".to_string(),
-            status: TaskStatus::Running,
-            dependency_ids: Vec::new(),
-            required_children: Vec::new(),
-            policy_snapshot: None,
-            executor_binding: Some(serde_json::json!({
-                "target_role": "reviewer",
-                "capability_requirements": [],
-                "parallelism_group": null,
-                "exclusive_scope": null,
-                "worker_selector": null,
-            })),
-            knowledge_refs: Vec::new(),
-            workspace_scope: None,
-            write_scope: None,
-            input_refs: Vec::new(),
-            output_refs: Vec::new(),
-            evidence_refs: Vec::new(),
-            retry_count: 0,
-            runtime_payload: magi_core::TaskRuntimePayload::default(),
-            created_at: now,
-            updated_at: now,
-        });
-
-        let mut spawned_item = session_turn_item(
-            "worker_spawned",
-            "pending",
-            Some("权威任务状态".to_string()),
-            Some("已创建执行步骤。".to_string()),
-            Some("turn-item-worker-spawned-authority".to_string()),
-            worker_thread_id.clone(),
-        );
-        spawned_item.item_seq = 1;
-        spawned_item.lane_id = Some(lane_id.clone());
-        spawned_item.lane_seq = Some(1);
-        spawned_item.task_id = Some(task_id.clone());
-        spawned_item.worker_id = Some(worker_id.clone());
-        spawned_item.role_id = Some("reviewer".to_string());
-
-        session_store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: "turn-worker-lane-authority".to_string(),
-                    turn_seq: 1,
-                    accepted_at: now,
-                    status: "running".to_string(),
-                    user_message: Some("验证 worker lane 状态来源".to_string()),
-                    items: vec![spawned_item],
-                    worker_lanes: vec![ActiveExecutionTurnLane {
-                        lane_id: lane_id.clone(),
-                        lane_seq: 1,
-                        task_id: task_id.clone(),
-                        worker_id,
-                        role_id: "reviewer".to_string(),
-                        thread_id: worker_thread_id.clone(),
-                        title: "权威任务状态".to_string(),
-                        is_primary: true,
-                    }],
-                    completed_at: None,
-                },
-            )
-            .expect("turn should be creatable");
-
-        let published = append_session_turn_item_with_task_store(
-            &session_store,
-            &session_id,
-            session_turn_item(
-                "assistant_phase",
-                "running",
-                Some("理解请求".to_string()),
-                Some("准备中".to_string()),
-                Some("turn-item-phase-authority".to_string()),
-                orchestrator_thread_id.clone(),
-            ),
-            Some(&task_store),
-        )
-        .expect("published turn item should be available");
-
-        let lane = published
-            .worker_lanes
-            .iter()
-            .find(|lane| lane.lane_id == lane_id)
-            .expect("published payload should include worker lane");
-        assert_eq!(
-            lane.status, "running",
-            "worker_spawned 的 pending 只是生命周期事件，不能覆盖 TaskStore 中的执行状态"
-        );
-        assert_eq!(
-            lane.role_id.as_str(),
-            "reviewer",
-            "worker lane role_id 应继续从 task executor binding 回填"
-        );
     }
 
     #[test]
@@ -1603,7 +1393,6 @@ mod tests {
                     status: "running".to_string(),
                     user_message: Some("普通流式验证".to_string()),
                     items: vec![final_item],
-                    worker_lanes: Vec::new(),
                 },
             )
             .expect("plain turn should be stored");
@@ -1629,10 +1418,6 @@ mod tests {
         assert_eq!(
             published.current_turn.execution_chain_ref, None,
             "普通 turn summary 不能继承上一轮任务 execution_chain_ref"
-        );
-        assert!(
-            published.worker_lanes.is_empty(),
-            "普通 turn summary 不应携带上一轮 worker lane"
         );
     }
 }

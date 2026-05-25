@@ -25,19 +25,19 @@ http://127.0.0.1:38123/web.html
 
 这条路径是当前项目的主开发入口。它的职责分工是：
 
-- daemon 监听 `MAGI_HOST` / `MAGI_PORT`，默认 `127.0.0.1:38123`。
+- daemon 监听 `MAGI_HOST` / `MAGI_PORT`，默认 `0.0.0.0:38123`；本机浏览器仍访问 `127.0.0.1:38123`。
 - daemon 在 `MAGI_WEB_DEV=1` 时自动检查 Vite dev server。
 - 如果 Vite 已在固定端口就绪，daemon 会复用它。
 - 如果 Vite 未启动，daemon 会执行 `npm --prefix web run dev:daemon` 自动拉起。
-- 浏览器仍访问 daemon 的 `/web.html`，页面中的 HMR 模块从 Vite 固定端口加载。
+- 浏览器仍访问 daemon 的 `/web.html`，页面中的前端开发模块从 daemon 同源加载，并由 daemon 代理到固定端口 Vite。
 - API、SSE、设置、会话、任务、变更等请求仍回到当前 daemon，不走另一个前端服务。
 
 ## 前端热加载端口
 
-默认 Vite 热加载端口是：
+默认 Vite 热加载监听地址是：
 
 ```text
-127.0.0.1:3000
+0.0.0.0:3000
 ```
 
 如需修改端口，只改 daemon 的开发环境变量：
@@ -49,10 +49,10 @@ MAGI_WEB_DEV=1 MAGI_WEB_DEV_PORT=3000 cargo run -p magi-daemon-app
 可用变量：
 
 - `MAGI_WEB_DEV=1`：启用 daemon 托管的前端热加载模式。
-- `MAGI_WEB_DEV_HOST`：Vite dev server host，默认 `127.0.0.1`。
+- `MAGI_WEB_DEV_HOST`：Vite dev server host，默认 `0.0.0.0`。
 - `MAGI_WEB_DEV_PORT`：Vite dev server port，默认 `3000`。
 - `MAGI_WEB_DEV_ROOT`：前端目录，默认仓库根目录下的 `web`。
-- `MAGI_HOST`：daemon host，默认 `127.0.0.1`。
+- `MAGI_HOST`：daemon host，默认 `0.0.0.0`。
 - `MAGI_PORT`：daemon port，默认 `38123`。
 - `MAGI_STATE_ROOT`：daemon 状态目录，默认 `~/.magi`。
 

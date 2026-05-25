@@ -18,7 +18,7 @@
     message: Message;
     readOnly?: boolean;
     /** 显示上下文：thread=主对话区, worker=Worker面板 */
-    displayContext?: 'thread' | 'worker';
+    displayContext?: 'thread' | 'task';
     /** 是否允许渲染底部流式三点（仅最后一条流式消息启用） */
     showStreamingIndicator?: boolean;
     /** 当前面板流式计时（秒） */
@@ -70,8 +70,7 @@
       !!b && typeof b === 'object' && 'type' in b
     )
   );
-  // 主线不承载运行时内部工具（worker_dispatch / worker_wait 等）：
-  // 这些 block 只能作为任务面板/运行时日志的投影，不直接成为主线工具卡。
+  // 主线不承载运行时内部工具；这些 block 只能作为任务详情/运行时日志的投影。
   const presentationBlocks = $derived(
     safeBlocks.filter((block) => {
       if (block.type !== 'tool_call' && block.type !== 'tool_result') {
@@ -92,7 +91,6 @@
       if (block.type === 'tool_result') return true;
       if (block.type === 'file_change') return true;
       if (block.type === 'plan') return true;
-      if (block.type === 'dispatch_group') return true;
       if (block.type === 'thinking') {
         const thinkingText = block.thinking?.content || block.content || '';
         if (thinkingText.trim().length > 0) return true;
@@ -526,7 +524,7 @@
     transition: border-color 0.2s ease, box-shadow 0.2s ease;
   }
 
-  /* 主角色连续消息紧凑间距（orchestrator 在主对话区、worker 在 Worker 面板） */
+  /* 主角色连续消息紧凑间距（orchestrator 在主对话区，子代理在任务详情中） */
   .message-item.assistant.plain-shell:not(.inline-guest) {
     margin-top: calc(-1 * var(--space-2));
   }

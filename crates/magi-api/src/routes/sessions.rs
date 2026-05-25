@@ -909,8 +909,6 @@ fn build_user_message_turn_item(
         ActiveExecutionTurnItem {
             item_id: user_message_item_id,
             item_seq: 1,
-            lane_id: None,
-            lane_seq: None,
             kind: "user_message".to_string(),
             status: "completed".to_string(),
             source: "user".to_string(),
@@ -1004,7 +1002,6 @@ fn submit_regular_session_turn(
         completed_at: None,
         user_message: Some(message.clone()),
         items: vec![user_message_item],
-        worker_lanes: Vec::new(),
     };
     turn.normalize();
     let (entry_id, _) = state
@@ -1737,41 +1734,14 @@ fn finalize_continue_session(
     accepted: SessionContinueAccepted,
     continued_at: UtcMillis,
 ) {
-    let Some(task_store) = state.task_store() else {
+    let Some(_task_store) = state.task_store() else {
         return;
     };
 
-    let is_long_mission = task_store
-        .get_task(&accepted.root_task_id)
-        .and_then(|root| root.policy_snapshot)
-        .map(|policy| policy.task_tier == TaskTier::LongMission)
-        .unwrap_or(false);
-
-    // 中等任务：同步 drive task projection（后台 runner 未启动）
-    // Long Mission：后台 runner 已在 continue_execution_chain 中重新启动，
-    // 此处不再调用同步 drive，避免与后台 runner 竞争
-    if !is_long_mission {
-        if let Err(error) = crate::a_path::drive_a_path(
-            &state,
-            &accepted.root_task_id,
-            &accepted.action_task_id,
-            "继续会话执行失败",
-        ) {
-            let interrupted = task_store
-                .get_task(&accepted.action_task_id)
-                .is_some_and(|task| task.status == TaskStatus::Failed);
-            if !interrupted {
-                tracing::error!(
-                    session_id = %accepted.session_id,
-                    root_task_id = %accepted.root_task_id,
-                    action_task_id = %accepted.action_task_id,
-                    ?error,
-                    "session continue graph drive failed"
-                );
-                return;
-            }
-        }
-    }
+    // 所有 tier 的 dispatch 驱动统一交给后台 RunnerManager：runner 已在
+    // `continue_execution_chain` 中重新启动，此处不再补一次同步驱动，避免双轨竞争。终态汇聚由
+    // `RunnerManager::with_terminal_observer` 监听 root task 完成事件触发，
+    // `append_dispatch_assistant_message` 在 root 尚未完成时安全 no-op。
 
     super::append_dispatch_assistant_message(
         &state,

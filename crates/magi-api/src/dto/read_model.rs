@@ -3,8 +3,8 @@ use magi_event_bus::{
     AuditUsageLedgerStatus, ExecutionGroupRuntimeSummaryEntry, MissionMetricsSummary,
     RecoveryActivityStage, RecoveryDiagnosticSummaryEntry, RuntimeLedgerSummary,
     RuntimeReadModelInput, SessionRuntimeBranchSummaryEntry, SessionRuntimeSummaryEntry,
-    SessionRuntimeTurnItemSummaryEntry, SessionRuntimeTurnLaneSummaryEntry,
-    SessionRuntimeTurnSummaryEntry, WorkspaceRuntimeSummaryEntry,
+    SessionRuntimeTurnItemSummaryEntry, SessionRuntimeTurnSummaryEntry,
+    WorkspaceRuntimeSummaryEntry,
 };
 use magi_mission_metrics::MissionMetrics;
 use magi_orchestrator::task_store::TaskStore;
@@ -98,7 +98,6 @@ fn merge_session_sidecars(
         entry.root_task_created_at = None;
         entry.current_turn = None;
         entry.turn_items.clear();
-        entry.worker_lanes.clear();
         if let Some(chain) = export.active_execution_chain.as_ref() {
             entry.mission_id = Some(chain.mission_id.to_string());
             entry.root_task_id = Some(chain.root_task_id.to_string());
@@ -177,8 +176,6 @@ fn merge_session_sidecars(
                     SessionRuntimeTurnItemSummaryEntry {
                         item_id: item.item_id.clone(),
                         item_seq: item.item_seq,
-                        lane_id: item.lane_id.clone(),
-                        lane_seq: item.lane_seq,
                         kind: item.kind.clone(),
                         status: item.status.clone(),
                         source: item.source.clone(),
@@ -199,23 +196,6 @@ fn merge_session_sidecars(
                         timeline_entry_id: item.timeline_entry_id.clone(),
                         source_thread_id: item.source_thread_id.to_string(),
                     }
-                })
-                .collect();
-            entry.worker_lanes = turn
-                .worker_lanes
-                .iter()
-                .map(|lane| SessionRuntimeTurnLaneSummaryEntry {
-                    lane_id: lane.lane_id.clone(),
-                    lane_seq: lane.lane_seq,
-                    task_id: lane.task_id.to_string(),
-                    worker_id: lane.worker_id.to_string(),
-                    role_id: lane.role_id.clone(),
-                    title: lane.title.clone(),
-                    status: task_store
-                        .and_then(|store| store.get_task(&lane.task_id))
-                        .map(|task| task_status_label(&task.status))
-                        .unwrap_or_else(|| "unknown".to_string()),
-                    is_primary: lane.is_primary,
                 })
                 .collect();
         }
@@ -268,11 +248,6 @@ fn merge_session_sidecars(
             left.item_seq
                 .cmp(&right.item_seq)
                 .then_with(|| left.item_id.cmp(&right.item_id))
-        });
-        entry.worker_lanes.sort_by(|left, right| {
-            left.lane_seq
-                .cmp(&right.lane_seq)
-                .then_with(|| left.lane_id.cmp(&right.lane_id))
         });
     }
 }
@@ -658,7 +633,7 @@ fn task_status_is_terminal(status: &TaskStatus) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use magi_core::{ExecutionOwnership, SessionId, UtcMillis, WorkspaceId};
+    use magi_core::{ExecutionOwnership, SessionId, ThreadId, UtcMillis, WorkspaceId};
 
     #[test]
     fn runtime_read_model_merges_sidecars_and_ledger_summary() {
@@ -823,6 +798,7 @@ mod tests {
                         use_tools: true,
                         skill_name: None,
                         is_primary: true,
+                        thread_id: ThreadId::new("thread-projection-authority"),
                     }],
                     recovery_ref: None,
                     dispatch_context: magi_session_store::ActiveExecutionDispatchContext {
@@ -988,6 +964,7 @@ mod tests {
                             use_tools: true,
                             skill_name: None,
                             is_primary: true,
+                            thread_id: ThreadId::new("thread-branch-failed"),
                         },
                         magi_session_store::ActiveExecutionBranch {
                             task_id: magi_core::TaskId::new("task-branch-pending"),
@@ -1004,6 +981,7 @@ mod tests {
                             use_tools: true,
                             skill_name: None,
                             is_primary: false,
+                            thread_id: ThreadId::new("thread-branch-pending"),
                         },
                         magi_session_store::ActiveExecutionBranch {
                             task_id: magi_core::TaskId::new("task-branch-running"),
@@ -1020,6 +998,7 @@ mod tests {
                             use_tools: true,
                             skill_name: None,
                             is_primary: false,
+                            thread_id: ThreadId::new("thread-branch-running"),
                         },
                         magi_session_store::ActiveExecutionBranch {
                             task_id: magi_core::TaskId::new("task-branch-completed"),
@@ -1036,6 +1015,7 @@ mod tests {
                             use_tools: true,
                             skill_name: None,
                             is_primary: false,
+                            thread_id: ThreadId::new("thread-branch-completed"),
                         },
                         magi_session_store::ActiveExecutionBranch {
                             task_id: magi_core::TaskId::new("task-branch-finished-failed"),
@@ -1052,6 +1032,7 @@ mod tests {
                             use_tools: true,
                             skill_name: None,
                             is_primary: false,
+                            thread_id: ThreadId::new("thread-branch-finished-failed"),
                         },
                     ],
                     dispatch_context: magi_session_store::ActiveExecutionDispatchContext {
@@ -1435,6 +1416,7 @@ mod tests {
                         use_tools: false,
                         skill_name: None,
                         is_primary: true,
+                        thread_id: ThreadId::new("thread-chain-current"),
                     }],
                     dispatch_context: magi_session_store::ActiveExecutionDispatchContext {
                         accepted_at: UtcMillis::now(),
@@ -1471,7 +1453,6 @@ mod tests {
         );
         assert!(session.current_turn.is_none());
         assert!(session.turn_items.is_empty());
-        assert!(session.worker_lanes.is_empty());
     }
 
     #[test]
@@ -1563,8 +1544,6 @@ mod tests {
                     items: vec![magi_session_store::ActiveExecutionTurnItem {
                         item_id: "turn-item-final".to_string(),
                         item_seq: 1,
-                        lane_id: None,
-                        lane_seq: None,
                         kind: "assistant_final".to_string(),
                         status: "completed".to_string(),
                         source: "orchestrator".to_string(),
@@ -1584,18 +1563,6 @@ mod tests {
                         placeholder_message_id: None,
                         timeline_entry_id: None,
                         source_thread_id: magi_core::ThreadId::new("thread-test-orchestrator"),
-                    }],
-                    worker_lanes: vec![magi_session_store::ActiveExecutionTurnLane {
-                        lane_id: "lane-branch".to_string(),
-                        lane_seq: 1,
-                        task_id: branch_task_id.clone(),
-                        worker_id: worker_id.clone(),
-                        // P7：lane.role_id 已是权威字段，构造方必须填入正确值；
-                        // DTO 不再从 task.executor_binding 回填。
-                        role_id: "reviewer".to_string(),
-                        thread_id: magi_core::ThreadId::new("thread-test-branch"),
-                        title: "完成步骤".to_string(),
-                        is_primary: false,
                     }],
                 }),
                 active_execution_chain: Some(magi_session_store::ActiveExecutionChain {
@@ -1622,6 +1589,7 @@ mod tests {
                         use_tools: false,
                         skill_name: None,
                         is_primary: false,
+                        thread_id: ThreadId::new("thread-turn-completed"),
                     }],
                     dispatch_context: magi_session_store::ActiveExecutionDispatchContext {
                         accepted_at,
@@ -1639,8 +1607,6 @@ mod tests {
                         items: vec![magi_session_store::ActiveExecutionTurnItem {
                             item_id: "turn-item-final".to_string(),
                             item_seq: 1,
-                            lane_id: None,
-                            lane_seq: None,
                             kind: "assistant_final".to_string(),
                             status: "completed".to_string(),
                             source: "orchestrator".to_string(),
@@ -1661,16 +1627,6 @@ mod tests {
                             timeline_entry_id: None,
                             source_thread_id: magi_core::ThreadId::new("thread-test-orchestrator"),
                         }],
-                        worker_lanes: vec![magi_session_store::ActiveExecutionTurnLane {
-                            lane_id: "lane-branch".to_string(),
-                            lane_seq: 1,
-                            task_id: branch_task_id.clone(),
-                            worker_id: worker_id.clone(),
-                            role_id: "reviewer".to_string(),
-                            thread_id: magi_core::ThreadId::new("thread-test-branch"),
-                            title: "完成步骤".to_string(),
-                            is_primary: false,
-                        }],
                     }),
                 }),
             }],
@@ -1690,16 +1646,10 @@ mod tests {
         assert!(session.active_task_ids.is_empty());
         assert!(!session.active_branches.is_empty());
         assert!(!session.turn_items.is_empty());
-        assert_eq!(session.worker_lanes.len(), 1);
         assert_eq!(
             session.turn_items[0].role_id.as_deref(),
             Some("reviewer"),
             "turn item role_id should be backfilled from task executor binding"
-        );
-        assert_eq!(
-            session.worker_lanes[0].role_id.as_str(),
-            "reviewer",
-            "worker lane role_id should be backfilled from task executor binding"
         );
         let current_turn = session
             .current_turn

@@ -25,19 +25,14 @@ const KNOWN_AGENT_COLORS: Record<string, AgentColorPair> = {
   gemini: { color: 'var(--color-gemini)', muted: 'var(--color-gemini-muted)' },
 };
 
-/** 角色模板 colorToken → 颜色映射 */
+/** 角色模板 colorToken → 颜色映射（codex 风格 6 角色） */
 const ROLE_COLOR_TOKENS: Record<string, AgentColorPair> = {
-  'agent-frontend-dev':    { color: '#3b82f6', muted: 'rgba(59, 130, 246, 0.15)' },   // 蓝色
-  'agent-backend-dev':     { color: '#10b981', muted: 'rgba(16, 185, 129, 0.15)' },   // 绿色
-  'agent-reviewer':        { color: '#f59e0b', muted: 'rgba(245, 158, 11, 0.15)' },   // 琥珀色
-  'agent-test-engineer':   { color: '#8b5cf6', muted: 'rgba(139, 92, 246, 0.15)' },   // 紫色
-  'agent-doc-writer':      { color: '#06b6d4', muted: 'rgba(6, 182, 212, 0.15)' },    // 青色
-  'agent-debugger':        { color: '#ef4444', muted: 'rgba(239, 68, 68, 0.15)' },    // 红色
-  'agent-integration-dev': { color: '#f97316', muted: 'rgba(249, 115, 22, 0.15)' },   // 橙色
-  'agent-data-engineer':   { color: '#14b8a6', muted: 'rgba(20, 184, 166, 0.15)' },   // 青绿色
-  'agent-devops-engineer': { color: '#64748b', muted: 'rgba(100, 116, 139, 0.15)' },  // 石板灰蓝
-  'agent-security-analyst':{ color: '#ec4899', muted: 'rgba(236, 72, 153, 0.15)' },   // 粉色
-  'agent-architect':       { color: '#6366f1', muted: 'rgba(99, 102, 241, 0.15)' },   // 靛蓝色
+  'agent-coordinator': { color: '#f59e0b', muted: 'rgba(245, 158, 11, 0.15)' },   // 琥珀色 · 协调
+  'agent-executor':    { color: '#3b82f6', muted: 'rgba(59, 130, 246, 0.15)' },   // 蓝色 · 主力执行
+  'agent-explorer':    { color: '#ef4444', muted: 'rgba(239, 68, 68, 0.15)' },    // 红色 · 探索/debug
+  'agent-reviewer':    { color: '#10b981', muted: 'rgba(16, 185, 129, 0.15)' },   // 绿色 · 审核
+  'agent-tester':      { color: '#8b5cf6', muted: 'rgba(139, 92, 246, 0.15)' },   // 紫色 · 测试
+  'agent-architect':   { color: '#6366f1', muted: 'rgba(99, 102, 241, 0.15)' },   // 靛蓝色 · 架构
 };
 
 /** 动态 agent 颜色池：用于未知 agentId */
@@ -76,7 +71,7 @@ export function getAgentColor(agentId: string, colorToken?: string): AgentColorP
   if (KNOWN_AGENT_COLORS[lower]) {
     return KNOWN_AGENT_COLORS[lower];
   }
-  // 尝试用 agentId 匹配角色 colorToken（如 frontend-dev → agent-frontend-dev）
+  // 尝试用 agentId 匹配角色 colorToken（如 executor → agent-executor）
   const inferredToken = `agent-${lower}`;
   if (ROLE_COLOR_TOKENS[inferredToken]) {
     return ROLE_COLOR_TOKENS[inferredToken];
@@ -98,16 +93,11 @@ interface AgentBrandInfo {
 }
 
 const ROLE_TEMPLATE_LABEL_KEYS: Record<string, string> = {
-  'frontend-dev': 'roleTemplate.frontend-dev.displayName',
-  'backend-dev': 'roleTemplate.backend-dev.displayName',
+  coordinator: 'roleTemplate.coordinator.displayName',
+  executor: 'roleTemplate.executor.displayName',
+  explorer: 'roleTemplate.explorer.displayName',
   reviewer: 'roleTemplate.reviewer.displayName',
-  'test-engineer': 'roleTemplate.test-engineer.displayName',
-  'doc-writer': 'roleTemplate.doc-writer.displayName',
-  debugger: 'roleTemplate.debugger.displayName',
-  'integration-dev': 'roleTemplate.integration-dev.displayName',
-  'data-engineer': 'roleTemplate.data-engineer.displayName',
-  'devops-engineer': 'roleTemplate.devops-engineer.displayName',
-  'security-analyst': 'roleTemplate.security-analyst.displayName',
+  tester: 'roleTemplate.tester.displayName',
   architect: 'roleTemplate.architect.displayName',
 };
 
@@ -172,16 +162,11 @@ export function getAgentBrandInfo(
     claude: { colorVar: '--color-claude', icon: 'brain', label: 'Claude' },
     codex: { colorVar: '--color-codex', icon: 'zap', label: 'Codex' },
     gemini: { colorVar: '--color-gemini', icon: 'sparkles', label: 'Gemini' },
-    'frontend-dev': { colorVar: '', icon: 'code', label: resolveAgentDisplayLabel('frontend-dev', translate) },
-    'backend-dev': { colorVar: '', icon: 'tool', label: resolveAgentDisplayLabel('backend-dev', translate) },
+    coordinator: { colorVar: '', icon: 'target', label: resolveAgentDisplayLabel('coordinator', translate) },
+    executor: { colorVar: '', icon: 'tool', label: resolveAgentDisplayLabel('executor', translate) },
+    explorer: { colorVar: '', icon: 'search', label: resolveAgentDisplayLabel('explorer', translate) },
     reviewer: { colorVar: '', icon: 'shield', label: resolveAgentDisplayLabel('reviewer', translate) },
-    'test-engineer': { colorVar: '', icon: 'check-circle', label: resolveAgentDisplayLabel('test-engineer', translate) },
-    'doc-writer': { colorVar: '', icon: 'document', label: resolveAgentDisplayLabel('doc-writer', translate) },
-    debugger: { colorVar: '', icon: 'bug', label: resolveAgentDisplayLabel('debugger', translate) },
-    'integration-dev': { colorVar: '', icon: 'tools', label: resolveAgentDisplayLabel('integration-dev', translate) },
-    'data-engineer': { colorVar: '', icon: 'stats', label: resolveAgentDisplayLabel('data-engineer', translate) },
-    'devops-engineer': { colorVar: '', icon: 'tools', label: resolveAgentDisplayLabel('devops-engineer', translate) },
-    'security-analyst': { colorVar: '', icon: 'shield', label: resolveAgentDisplayLabel('security-analyst', translate) },
+    tester: { colorVar: '', icon: 'check-circle', label: resolveAgentDisplayLabel('tester', translate) },
     architect: { colorVar: '', icon: 'grid', label: resolveAgentDisplayLabel('architect', translate) },
   };
   if (KNOWN_BRANDS[lower]) {

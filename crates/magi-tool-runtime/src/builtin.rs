@@ -112,8 +112,6 @@ impl BuiltinTool for NormalizedBuiltinTool {
             BuiltinToolName::DiagramRender => execute_diagram_render(input),
             BuiltinToolName::KnowledgeQuery => execute_knowledge_query(input),
             BuiltinToolName::AgentSpawn
-            | BuiltinToolName::SendMessage
-            | BuiltinToolName::TaskStop
             | BuiltinToolName::TodoWrite
             | BuiltinToolName::MemoryWrite
             | BuiltinToolName::MissionCharterWrite
@@ -1318,7 +1316,7 @@ fn builtin_error(tool: &str, message: impl Into<String>) -> String {
     .to_string()
 }
 
-/// 协调器三工具（agent_spawn / send_message / task_stop）落到 BuiltinTool::execute 时
+/// 协调器 / 长任务工具（agent_spawn 等）落到 BuiltinTool::execute 时
 /// 必然是误调用——它们的语义需要 orchestration 层访问 task_store + spawn_graph +
 /// conversation registry，远超 BuiltinTool trait 暴露的 ToolExecutionContext。
 /// 真正的拦截点在 `crates/magi-conversation-runtime/src/tool_batch.rs::execute_task_tool_call`

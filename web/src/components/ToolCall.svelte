@@ -11,6 +11,8 @@
   import { i18n } from '../stores/i18n.svelte';
   import { getCurrentSessionId } from '../stores/messages.svelte';
   import { diagramSummary, parseToolDiagramPayload } from '../lib/diagram-payload';
+  import { openAgentTab } from '../stores/right-pane.svelte';
+  import { getAgentVisualInfo } from '../lib/agent-colors';
 
   interface ErrorDiagnosis {
     category: 'model_input' | 'context_stale' | 'permission' | 'role_constraint' | 'policy' | 'model_output' | 'workspace_write' | 'runtime';
@@ -212,6 +214,94 @@
     name === 'file_edit' || name === 'file_create' || name === 'file_insert' || name === 'file_remove'
   );
   const isCompactMutation = $derived(isFileMutationTool && (status === 'running' || status === 'pending'));
+
+  // agent_spawn 工具调用：父代理派发子代理的同步阻塞工具。每一次调用即父代理
+  // ToolCall 流中的一张内嵌卡片，多个并行 agent_spawn 即多张并列卡片，点击卡片
+  // 打开右侧 RightPane 子代理 transcript（按 metadata.taskId 过滤）。
+  //
+  // input 形态：{ role, display_name, goal }
+  // output 形态（tool_batch.rs::wait_for_child_terminal_outcome）：
+  //   succeeded → { tool, status: 'succeeded', child_task_id, role, title, output_refs }
+  //   degraded  → { tool, status: 'degraded',  child_task_id, role, title, output_refs, error, instruction }
+  //   failed    → { tool, status: 'failed',    child_task_id, role, title, output_refs, error }
+  //   killed    → { tool, status: 'killed',    child_task_id, role, title, error }
+  const isAgentSpawn = $derived(name === 'agent_spawn');
+
+  interface AgentSpawnDisplay {
+    /** 子代理展示名（首选 output.title，回退到 input.display_name） */
+    title: string;
+    /** 子代理角色（如 executor / explorer / tester），用于角标与色 token */
+    role: string;
+    /** 子代理 TaskId，作为 RightPane tab 去重 key；未就绪时为 undefined */
+    childTaskId: string | undefined;
+    /** 子代理终态结果字符串（succeeded / degraded / failed / killed），未终态为 undefined */
+    outcome: 'succeeded' | 'degraded' | 'failed' | 'killed' | undefined;
+    /** 失败原因摘要，若有 */
+    error: string | undefined;
+  }
+
+  const agentSpawnDisplay = $derived.by((): AgentSpawnDisplay | null => {
+    if (!isAgentSpawn) return null;
+    const inputObj = (input && typeof input === 'object' && !Array.isArray(input))
+      ? input as Record<string, unknown>
+      : {};
+    const inputTitle = typeof inputObj.display_name === 'string' ? inputObj.display_name.trim() : '';
+    const inputRole = typeof inputObj.role === 'string' ? inputObj.role.trim() : '';
+
+    // output 可能是 JSON 字符串（tool_batch 返回 .to_string()）或已被解析为 object。
+    let parsedOutput: Record<string, unknown> | null = null;
+    if (output && typeof output === 'object' && !Array.isArray(output)) {
+      parsedOutput = output as Record<string, unknown>;
+    } else if (typeof output === 'string') {
+      const trimmed = output.trim();
+      if (trimmed.startsWith('{')) {
+        try {
+          const parsed = JSON.parse(trimmed);
+          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+            parsedOutput = parsed as Record<string, unknown>;
+          }
+        } catch {
+          // 流式过程中可能拿到不完整 JSON，忽略
+        }
+      }
+    }
+
+    const outputTitle = typeof parsedOutput?.title === 'string' ? (parsedOutput.title as string).trim() : '';
+    const outputRole = typeof parsedOutput?.role === 'string' ? (parsedOutput.role as string).trim() : '';
+    const outputChildId = typeof parsedOutput?.child_task_id === 'string'
+      ? (parsedOutput.child_task_id as string).trim()
+      : '';
+    const outputStatus = typeof parsedOutput?.status === 'string' ? parsedOutput.status : '';
+    const outputError = typeof parsedOutput?.error === 'string' ? (parsedOutput.error as string) : '';
+
+    const outcome: AgentSpawnDisplay['outcome'] =
+      outputStatus === 'succeeded' || outputStatus === 'degraded' || outputStatus === 'failed' || outputStatus === 'killed'
+        ? outputStatus
+        : undefined;
+
+    return {
+      title: outputTitle || inputTitle || '子代理',
+      role: outputRole || inputRole || '',
+      childTaskId: outputChildId || undefined,
+      outcome,
+      error: outputError || undefined,
+    };
+  });
+
+  const agentSpawnRoleVisual = $derived.by(() => {
+    const role = agentSpawnDisplay?.role;
+    if (!role) return null;
+    return getAgentVisualInfo(role);
+  });
+
+  function openAgentSpawnTab(): void {
+    const display = agentSpawnDisplay;
+    if (!display || !display.childTaskId) return;
+    openAgentTab(getCurrentSessionId() || '', display.childTaskId, {
+      label: display.title,
+    });
+  }
+
 
   // 目录/文件只读工具：只需紧凑 header
   const isCompactReadOnlyTool = $derived(name === 'file_view' || name === 'list_files');
@@ -482,13 +572,13 @@
       };
     }
 
-    // 编排者角色约束（worker_dispatch 引导）— 与用户权限无关，是系统架构层面的职责划分
+    // 编排者角色约束（agent_spawn 引导）— 与用户权限无关，是系统架构层面的职责划分
     if (matches(
       'orchestrator',
-      'worker_dispatch delegation',
+      'agent_spawn delegation',
       'orchestrator cannot execute tools in long mission',
       'Long Mission 下编排者不可直接执行',
-      '请通过 worker_dispatch 委派给 worker',
+      '请通过 agent_spawn 委派给子代理',
     )) {
       return {
         category: 'role_constraint',
@@ -611,7 +701,57 @@
   </span>
 {/snippet}
 
-{#if isFileMutationTool && status === 'success'}
+{#if isAgentSpawn && agentSpawnDisplay}
+  {@const display = agentSpawnDisplay}
+  {@const canOpen = !!display.childTaskId}
+  {@const isRunning = status === 'running' || status === 'pending'}
+  <button
+    type="button"
+    class="agent-spawn-card status-{statusInfo.class}"
+    class:clickable={canOpen}
+    disabled={!canOpen}
+    onclick={canOpen ? openAgentSpawnTab : undefined}
+    data-tool-name="agent_spawn"
+    data-tool-call-id={id || undefined}
+  >
+    <span class="agent-spawn-icon">
+      <Icon name={agentSpawnRoleVisual?.icon ?? 'bot'} size={16} />
+    </span>
+    <span class="agent-spawn-body">
+      <span class="agent-spawn-title-line">
+        <span class="agent-spawn-title">{display.title}</span>
+        {#if agentSpawnRoleVisual}
+          <span
+            class="agent-spawn-role-badge"
+            style="color: {agentSpawnRoleVisual.color}; background: {agentSpawnRoleVisual.muted};"
+          >
+            {agentSpawnRoleVisual.label}
+          </span>
+        {/if}
+      </span>
+      {#if display.error && (display.outcome === 'degraded' || display.outcome === 'failed' || display.outcome === 'killed')}
+        <span class="agent-spawn-error" title={display.error}>{display.error}</span>
+      {/if}
+    </span>
+    <span class="agent-spawn-meta">
+      <span class="tool-status status-{statusInfo.class}">
+        {#if isRunning}
+          <span class="status-dot pulsing"></span>
+        {:else}
+          <span class="status-dot"></span>
+        {/if}
+      </span>
+      {#if canOpen}
+        <span class="agent-spawn-cta">
+          查看详情
+          <Icon name="chevron-right" size={12} />
+        </span>
+      {:else if isRunning}
+        <span class="agent-spawn-cta agent-spawn-cta-pending">派发中…</span>
+      {/if}
+    </span>
+  </button>
+{:else if isFileMutationTool && status === 'success'}
   <!-- 文件变更工具完成：由 FileChangeCard 全权展示 -->
 {:else}
   {#if shouldRenderCard}
@@ -1045,5 +1185,125 @@
     margin-top: var(--space-3);
     padding-top: var(--space-3);
     border-top: 1px dashed var(--border);
+  }
+
+  /* ===== agent_spawn 子代理派发卡片 ===== */
+  /* 父代理 ToolCall 流中的内嵌单元——一次 agent_spawn 即一张卡片，多个并行派发
+     即多张并列卡片，点击进入 RightPane 查看该子代理完整 transcript（按
+     metadata.taskId 过滤）。 */
+  .agent-spawn-card {
+    width: 100%;
+    appearance: none;
+    font: inherit;
+    text-align: left;
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    padding: var(--space-3);
+    margin-top: var(--space-2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--surface-1);
+    color: inherit;
+    transition: border-color var(--transition-fast), background var(--transition-fast);
+  }
+
+  .agent-spawn-card:disabled {
+    opacity: 1;
+  }
+
+  .agent-spawn-card.clickable {
+    cursor: pointer;
+  }
+
+  .agent-spawn-card.clickable:hover {
+    border-color: var(--info);
+    background: var(--surface-hover);
+  }
+
+  .agent-spawn-card.status-error {
+    border-color: var(--error);
+  }
+
+  .agent-spawn-icon {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    border-radius: var(--radius-sm);
+    background: var(--surface-2);
+    color: var(--foreground-muted);
+    flex-shrink: 0;
+  }
+
+  .agent-spawn-body {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    flex: 1;
+    min-width: 0;
+  }
+
+  .agent-spawn-title-line {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    min-width: 0;
+  }
+
+  .agent-spawn-title {
+    font-size: var(--text-sm);
+    font-weight: 500;
+    color: var(--foreground);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    min-width: 0;
+  }
+
+  .agent-spawn-role-badge {
+    display: inline-flex;
+    align-items: center;
+    padding: 1px 8px;
+    border-radius: 999px;
+    font-size: 11px;
+    line-height: 1.4;
+    font-weight: 500;
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+
+  .agent-spawn-error {
+    font-size: var(--text-xs);
+    color: var(--error);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    min-width: 0;
+  }
+
+  .agent-spawn-meta {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    flex-shrink: 0;
+  }
+
+  .agent-spawn-cta {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    font-size: var(--text-xs);
+    color: var(--foreground-muted);
+    white-space: nowrap;
+  }
+
+  .agent-spawn-card.clickable:hover .agent-spawn-cta {
+    color: var(--info);
+  }
+
+  .agent-spawn-cta-pending {
+    font-style: italic;
   }
 </style>

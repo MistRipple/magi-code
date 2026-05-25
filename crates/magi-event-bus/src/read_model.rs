@@ -308,8 +308,6 @@ pub struct SessionRuntimeTurnSummaryEntry {
 pub struct SessionRuntimeTurnItemSummaryEntry {
     pub item_id: String,
     pub item_seq: usize,
-    pub lane_id: Option<String>,
-    pub lane_seq: Option<usize>,
     pub kind: String,
     pub status: String,
     pub source: String,
@@ -329,20 +327,8 @@ pub struct SessionRuntimeTurnItemSummaryEntry {
     pub placeholder_message_id: Option<String>,
     pub timeline_entry_id: Option<String>,
     /// item 归属的 thread_id。前端按此 + thread_registry 的 role_id 判定
-    /// 主线 / worker drawer 归属。
+    /// 主线 / task 详情归属。
     pub source_thread_id: String,
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct SessionRuntimeTurnLaneSummaryEntry {
-    pub lane_id: String,
-    pub lane_seq: usize,
-    pub task_id: String,
-    pub worker_id: String,
-    pub role_id: String,
-    pub title: String,
-    pub status: String,
-    pub is_primary: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -370,7 +356,6 @@ pub struct SessionRuntimeSummaryEntry {
     pub active_branches: Vec<SessionRuntimeBranchSummaryEntry>,
     pub current_turn: Option<SessionRuntimeTurnSummaryEntry>,
     pub turn_items: Vec<SessionRuntimeTurnItemSummaryEntry>,
-    pub worker_lanes: Vec<SessionRuntimeTurnLaneSummaryEntry>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

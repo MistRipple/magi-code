@@ -6,7 +6,6 @@ import ThinkingBlockRenderer from '../components/ThinkingBlockRenderer.svelte';
 import ToolCallRenderer from '../components/ToolCallRenderer.svelte';
 import FileChangeCard from '../components/blocks/FileChangeCard.svelte';
 import PlanCard from '../components/blocks/PlanCard.svelte';
-import DispatchGroupRenderer from '../components/DispatchGroupRenderer.svelte';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type BlockComponent = Component<any, any, any>;
@@ -31,7 +30,6 @@ blockRegistry.register('tool_call', ToolCallRenderer);
 blockRegistry.register('tool_result', ToolCallRenderer);
 blockRegistry.register('file_change', FileChangeCard);
 blockRegistry.register('plan', PlanCard);
-blockRegistry.register('dispatch_group', DispatchGroupRenderer);
 
 export function getBlockRenderer(block: ContentBlock): BlockComponent {
   return blockRegistry.get(block.type);

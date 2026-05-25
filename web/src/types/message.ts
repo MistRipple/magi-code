@@ -328,53 +328,10 @@ export interface ThinkingBlock {
   blockId?: string;
 }
 
-export type WorkerLaneStatus =
-  | 'pending'
-  | 'running'
-  | 'blocked'
-  | 'awaiting_approval'
-  | 'review_required'
-  | 'completed'
-  | 'failed'
-  | 'cancelled';
-
-export interface WorkerLaneProgressSummary {
-  completedTaskCount?: number;
-  totalTaskCount?: number;
-  blockedTaskCount?: number;
-  awaitingApprovalTaskCount?: number;
-  reviewRequiredTaskCount?: number;
-}
-
-export interface WorkerLaneTaskItem {
-  taskId?: string;
-  title: string;
-  status: WorkerLaneStatus;
-  isCurrent?: boolean;
-  seq?: number;
-}
-
-export interface DispatchGroupLane {
-  laneId: string;
-  laneVersion: number;
-  title: string;
-  description?: string;
-  status: WorkerLaneStatus;
-  startedAt?: number;
-  endedAt?: number;
-  liveActivity?: string;
-  toolUseCount?: number;
-  progressSummary?: WorkerLaneProgressSummary;
-  tasks?: WorkerLaneTaskItem[];
-  summary?: string;
-  fileChangeCount?: number;
-  jumpTarget?: { workerTabId: string };
-}
-
 // 消息内容块
 export interface ContentBlock {
   id: string;                // 唯一标识符，用于 #each 循环的 key（构造时必须确定性赋值）
-  type: 'text' | 'code' | 'thinking' | 'tool_call' | 'tool_result' | 'file_change' | 'plan' | 'dispatch_group';
+  type: 'text' | 'code' | 'thinking' | 'tool_call' | 'tool_result' | 'file_change' | 'plan';
   content: string;
   language?: string;        // 代码块语言
   toolCall?: ToolCall;      // 工具调用信息
@@ -405,10 +362,8 @@ export interface ContentBlock {
     rawJson?: string;
   };
   blockId?: string;
-  dispatchWaveId?: string;
-  status?: WorkerLaneStatus | 'pending' | 'running' | 'completed' | 'blocked' | 'failed' | 'cancelled';
+  status?: 'pending' | 'running' | 'completed' | 'blocked' | 'failed' | 'cancelled';
   summaryText?: string;
-  lanes?: DispatchGroupLane[];
 }
 
 // 模型连接状态类型（供设置面板和任务执行状态共用）
@@ -563,8 +518,6 @@ export interface Message {
     placeholderState?: PlaceholderState; // 占位消息状态
     requestId?: string;               // 关联的请求 ID
     turnId?: string;                  // 对话轮次 ID（用于计划账本回溯定位）
-    dispatchWaveId?: string;          // Worker 生命周期所属的 dispatch wave
-    laneId?: string;                  // Worker lane 语义键（wave + lane）
     wasPlaceholder?: boolean;         // 是否从占位消息转换而来（用于过渡动画）
     justCompleted?: boolean;          // 是否刚完成（用于完成动画）
     sendingAnimation?: boolean;       // 用户消息发送动画
@@ -583,11 +536,6 @@ export interface Message {
 
 export type { AgentId, AnyAgentId };
 
-// Agent 输出（动态 key）
-export interface AgentOutputs {
-  [agentId: string]: Message[];
-}
-
 export type TimelineProjectionArtifactKind = 'message' | 'tool';
 
 export interface TimelineProjectionArtifact {
@@ -601,18 +549,16 @@ export interface TimelineProjectionArtifact {
   timestamp: number;
   cardId?: string;
   lifecycleKey?: string;
-  dispatchWaveId?: string;
-  laneId?: string;
   /**
-   * P7.E：UI 路由的唯一信号。
+   * 子代理 transcript 路由信号。
    *
-   * - `undefined` 表示 artifact 归属 orchestrator 主线（thread）；
-   * - 非空字符串表示 artifact 归属对应 `roleId` 的 worker drawer。
+   * - `undefined` 表示 artifact 归属 root agent 主线（thread）；
+   * - 非空字符串表示 artifact 归属对应子代理 Task，RightPane 以 `agent:${taskId}` 去重。
    *
-   * 由 `CanonicalTurnItem.worker.roleId` 直接派生（'orchestrator' 视为主线），
-   * 不再保留 `threadVisible / workerTabs` 双轨缓存。
+   * 由 sidechain `CanonicalTurnItem.worker.taskId` 派生；roleId / workerId 只作为展示元信息，
+   * 不再参与 tab 聚合，避免同一 role 的多个子代理被合并。
    */
-  worker?: AgentId;
+  taskId?: string;
   messageIds: string[];
   message: Message;
 }
@@ -634,7 +580,6 @@ export interface SessionTimelineProjection {
   lastAppliedEventSeq: number;
   artifacts: TimelineProjectionArtifact[];
   threadRenderEntries: TimelineProjectionRenderEntry[];
-  workerRenderEntries: Record<string, TimelineProjectionRenderEntry[]>;
 }
 
 // 会话信息
@@ -676,19 +621,19 @@ export interface ProcessingActor {
   agent: AnyAgentId;
 }
 
-// Tab 类型（动态架构下 Worker tab 为任意 string）
+// Tab 类型（动态架构下扩展 tab 为任意 string）
 export type TabType = 'thread' | string | 'settings' | 'knowledge' | 'tasks' | 'edits';
 
-// 滚动位置映射（动态 key：thread + worker:*）
+// 滚动位置映射（动态 key：thread + agent:${taskId} / code:${filepath}）
 export interface ScrollPositions {
   thread: number;
-  [workerTab: string]: number;
+  [panelKey: string]: number;
 }
 
 // 自动滚动配置（动态 key）
 export interface AutoScrollConfig {
   thread: boolean;
-  [workerId: string]: boolean;
+  [panelKey: string]: boolean;
 }
 
 export interface ScrollAnchor {

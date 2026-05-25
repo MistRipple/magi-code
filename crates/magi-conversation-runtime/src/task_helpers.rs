@@ -19,11 +19,7 @@ pub const MAX_TOOL_CALL_ROUNDS: usize = 32;
 pub(crate) fn is_orchestration_builtin_tool(tool: BuiltinToolName) -> bool {
     matches!(
         tool,
-        BuiltinToolName::AgentSpawn
-            | BuiltinToolName::SendMessage
-            | BuiltinToolName::TaskStop
-            | BuiltinToolName::TodoWrite
-            | BuiltinToolName::MemoryWrite
+        BuiltinToolName::AgentSpawn | BuiltinToolName::TodoWrite | BuiltinToolName::MemoryWrite
     )
 }
 
@@ -77,14 +73,15 @@ pub(crate) fn task_can_see_builtin_tool(
 }
 
 /// 单一可见性枚举：item 的归属由 `source_thread_id` 决定，本枚举仅承担
-/// "把该 task 的 turn item 写到主线 thread 还是 worker drawer thread"的派发判断。
+/// "把该 task 的 turn item 写到主线 thread 还是 task 详情 thread"的派发判断。
 /// - `Mainline`：item.source_thread_id = orchestrator thread，前端 projection
-///   会把它归到主线时间线。orchestrator 自身 turn 与"无独立 worker drawer 的子任务"
+///   会把它归到主线时间线。orchestrator 自身 turn 与无独立详情页的子任务
 ///   都走这条路径。
-/// - `Sidechain`：item.source_thread_id = lane 绑定的 worker thread，归到对应
-///   role 的 drawer。primary worker sidechain（同一 turn 内主 dispatch 拉起的
-///   worker 任务）会同时在主线 publish `worker_status` 摘要 item（其 source_thread_id
-///   仍是 orchestrator）以填充 dispatch 卡 liveActivity。
+/// - `Sidechain`：item.source_thread_id = task thread，归到对应子代理详情。
+///   Task #103 起 agent_spawn 改为同步工具调用，主线由父代理的 ToolCall 卡承接展示，
+///   sidechain 不再向主线写摘要 item。子代理与父代理的 item 在前端按 `metadata.taskId`
+///   过滤到 RightPane 子标签，主线仅 turnSeq/itemSeq 排序，因此本变体不再持有
+///   lane_id/lane_seq——它们随 Task #105 退役。
 #[derive(Clone, Debug)]
 pub enum TaskTurnVisibility {
     Mainline {
@@ -92,17 +89,10 @@ pub enum TaskTurnVisibility {
         thread_id: ThreadId,
     },
     Sidechain {
-        /// drawer thread = role 维度的 worker thread。所有 sidechain item 写到这里。
+        /// task thread = 子代理本次执行的独占 thread。所有 sidechain item 写到这里。
         thread_id: ThreadId,
-        /// 主线常驻 thread，用于 `publish_worker_lane_summary` 等场景把摘要写回主线。
-        orchestrator_thread_id: ThreadId,
         role_id: String,
         worker_id: WorkerId,
-        lane_id: String,
-        lane_seq: Option<usize>,
-        /// 当前 sidechain 是否同时为主线 dispatch 卡的 primary worker：是则需要
-        /// 在主线 publish 摘要 item；否则 drawer 里安静执行不污染主线。
-        has_mainline_summary: bool,
     },
 }
 
@@ -130,32 +120,21 @@ impl TaskTurnVisibility {
 
 pub fn task_turn_visibility(
     task: &Task,
-    worker_lane_id: Option<&str>,
-    worker_lane_seq: Option<usize>,
+    is_sidechain: bool,
     worker_id: Option<&WorkerId>,
     thread_id: &ThreadId,
-    orchestrator_thread_id: &ThreadId,
-    primary_worker_sidechain: bool,
     agent_role_registry: &magi_agent_role::AgentRoleRegistry,
 ) -> TaskTurnVisibility {
-    let lane_id = worker_lane_id
-        .map(str::trim)
-        .filter(|lane| !lane.is_empty())
-        .map(ToOwned::to_owned);
-    if let (Some(lane_id), Some(worker_id)) = (lane_id, worker_id) {
+    if let (true, Some(worker_id)) = (is_sidechain, worker_id) {
         let role_id = resolve_task_role(task, agent_role_registry)
             .map(str::trim)
             .filter(|role| !role.is_empty())
             .map(ToOwned::to_owned)
-            .expect("worker drawer task must carry resolvable role_id");
+            .expect("sidechain task must carry resolvable role_id");
         return TaskTurnVisibility::Sidechain {
             thread_id: thread_id.clone(),
-            orchestrator_thread_id: orchestrator_thread_id.clone(),
             role_id,
             worker_id: worker_id.clone(),
-            lane_id,
-            lane_seq: worker_lane_seq,
-            has_mainline_summary: primary_worker_sidechain,
         };
     }
     TaskTurnVisibility::Mainline {
@@ -177,13 +156,9 @@ pub fn apply_task_turn_visibility(
             thread_id,
             role_id,
             worker_id,
-            lane_id,
-            lane_seq,
             ..
         } => {
             item.source_thread_id = thread_id.clone();
-            item.lane_id = Some(lane_id.clone());
-            item.lane_seq = *lane_seq;
             item.worker_id = Some(worker_id.clone());
             item.role_id = Some(role_id.clone());
             item.source = role_id.clone();
@@ -202,8 +177,8 @@ pub fn apply_task_worker_detail_visibility(
     apply_task_turn_visibility(item, task, visibility);
 }
 
-/// final 回复的归属规则与执行细节一致：sidechain task 的 final 永远只归 worker drawer，
-/// 主线消费的是 `worker_status` 摘要 item（由 publish_worker_lane_summary 写入）。
+/// final 回复的归属规则与执行细节一致：sidechain task 的 final 永远只归 task 详情。
+/// Task #103 起主线由父代理的 agent_spawn ToolCall 卡承接子代理状态，sidechain 不再向主线写摘要。
 pub fn apply_task_final_visibility(
     item: &mut ActiveExecutionTurnItem,
     task_store: &TaskStore,

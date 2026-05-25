@@ -80,7 +80,6 @@ pub struct RunnerManager {
     worker_catalog: Arc<dyn Fn() -> Vec<WorkerInfo> + Send + Sync>,
     dispatcher: Option<Arc<dyn TaskDispatcher>>,
     dispatch_gate: Option<Arc<TaskDispatchGate>>,
-    child_result_route: Option<RunnerChildResultRoute>,
     /// Shared result receiver that collects task completion/failure results
     /// pushed from the TaskStore's status-change callback.
     result_receiver: Arc<EventBasedResultReceiver>,
@@ -90,13 +89,6 @@ pub struct RunnerManager {
     /// when the session is closed (design 1.5: Session-Runner linkage).
     session_runner_index: Arc<Mutex<HashMap<SessionId, Vec<String>>>>,
     terminal_observer: Option<RunnerTerminalObserver>,
-}
-
-#[derive(Clone)]
-struct RunnerChildResultRoute {
-    session_store: Arc<SessionStore>,
-    conversation_registry: Arc<ConversationRegistry>,
-    spawn_graph: Arc<Mutex<magi_spawn_graph::SpawnGraph>>,
 }
 
 /// Number of runner cycles between periodic checkpoints.
@@ -115,7 +107,6 @@ impl RunnerManager {
             worker_catalog,
             dispatcher: Some(dispatcher),
             dispatch_gate: None,
-            child_result_route: None,
             result_receiver,
             checkpoint_path: None,
             session_runner_index: Arc::new(Mutex::new(HashMap::new())),
@@ -127,26 +118,12 @@ impl RunnerManager {
         (self.worker_catalog)()
     }
 
-    pub fn with_child_result_route(
-        mut self,
-        session_store: Arc<SessionStore>,
-        conversation_registry: Arc<ConversationRegistry>,
-        spawn_graph: Arc<Mutex<magi_spawn_graph::SpawnGraph>>,
-    ) -> Self {
-        self.child_result_route = Some(RunnerChildResultRoute {
-            session_store,
-            conversation_registry,
-            spawn_graph,
-        });
-        self
-    }
-
     pub fn with_dispatch_gate(mut self, gate: Arc<TaskDispatchGate>) -> Self {
         self.dispatch_gate = Some(gate);
         self
     }
 
-    fn build_task_runner(&self, session_id: Option<SessionId>) -> TaskRunner {
+    fn build_task_runner(&self) -> TaskRunner {
         let workers = self.resolved_workers();
         let dispatcher = self
             .dispatcher
@@ -160,14 +137,6 @@ impl RunnerManager {
         );
         if let Some(gate) = &self.dispatch_gate {
             runner = runner.with_dispatch_gate(Arc::clone(gate));
-        }
-        if let (Some(route), Some(session_id)) = (&self.child_result_route, session_id) {
-            runner = runner.with_child_result_route(
-                session_id,
-                Arc::clone(&route.session_store),
-                Arc::clone(&route.conversation_registry),
-                Arc::clone(&route.spawn_graph),
-            );
         }
         runner
     }
@@ -232,7 +201,7 @@ impl RunnerManager {
         }
 
         // Spawn the background loop.
-        let task_runner = self.build_task_runner(observer_session_id.clone());
+        let task_runner = self.build_task_runner();
         let root_id = tid;
         let bg_handle = Arc::clone(&handle);
         let bg_active = Arc::clone(&handle.active);
@@ -462,7 +431,7 @@ impl RunnerManager {
         self.task_store
             .get_task(&tid)
             .ok_or_else(|| format!("任务不存在: {}", root_task_id))?;
-        let task_runner = self.build_task_runner(None);
+        let task_runner = self.build_task_runner();
         Ok(task_runner.run_cycle(&tid))
     }
 
@@ -471,7 +440,7 @@ impl RunnerManager {
         self.task_store
             .get_task(&tid)
             .ok_or_else(|| format!("任务不存在: {}", root_task_id))?;
-        self.build_task_runner(None).kill_tree(&tid)?;
+        self.build_task_runner().kill_tree(&tid)?;
         self.set_runner_status_if_present(root_task_id, "killed");
         Ok(())
     }
@@ -482,7 +451,7 @@ impl RunnerManager {
             .task_store
             .get_task(&tid)
             .ok_or_else(|| format!("任务不存在: {}", task_id))?;
-        self.build_task_runner(None).kill_task(&tid)?;
+        self.build_task_runner().kill_task(&tid)?;
         self.set_runner_status_if_present(task.root_task_id.as_str(), "killed");
         Ok(())
     }
@@ -492,7 +461,7 @@ impl RunnerManager {
         self.task_store
             .get_task(&tid)
             .ok_or_else(|| format!("任务不存在: {}", root_task_id))?;
-        self.build_task_runner(None).resume_task(&tid)
+        self.build_task_runner().resume_task(&tid)
     }
 
     fn set_runner_status_if_present(&self, root_task_id: &str, status: &str) {

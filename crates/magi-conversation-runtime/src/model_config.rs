@@ -78,6 +78,14 @@ pub struct NormalizedModelConfig {
     reasoning_effort: Option<ModelReasoningEffort>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RoleEngineModelConfig {
+    pub template_id: String,
+    pub engine_id: String,
+    pub binding_revision: u32,
+    pub config: NormalizedModelConfig,
+}
+
 impl NormalizedModelConfig {
     /// 从 settings JSON 构造归一化模型配置。
     ///
@@ -216,6 +224,130 @@ impl NormalizedModelConfig {
         let base_url = self.base_url.as_deref()?.trim().trim_end_matches('/');
         Some(base_url.to_string())
     }
+}
+
+pub fn configured_role_engine_model_config(
+    settings_store: &crate::settings_store::SettingsStore,
+    role_id: &str,
+) -> Result<Option<RoleEngineModelConfig>, String> {
+    let role_id = role_id.trim();
+    if role_id.is_empty() {
+        return Ok(None);
+    }
+    let Some(binding) = role_engine_binding(settings_store, role_id) else {
+        return Ok(None);
+    };
+    if !binding.enabled {
+        return Err(format!("角色 {role_id} 已禁用，不能执行子代理任务"));
+    }
+    let engine_llm = engine_llm_config(settings_store, &binding.engine_id).ok_or_else(|| {
+        format!(
+            "角色 {role_id} 绑定的模型引擎 {} 不存在或缺少 llm 配置",
+            binding.engine_id
+        )
+    })?;
+    let config = NormalizedModelConfig::from_settings_value(&engine_llm, "openai");
+    config.require_base_url().map_err(|error| {
+        format!(
+            "角色 {role_id} 的模型引擎 {} 配置无效：{error}",
+            binding.engine_id
+        )
+    })?;
+    config.require_model().map_err(|error| {
+        format!(
+            "角色 {role_id} 的模型引擎 {} 配置无效：{error}",
+            binding.engine_id
+        )
+    })?;
+    Ok(Some(RoleEngineModelConfig {
+        template_id: role_id.to_string(),
+        engine_id: binding.engine_id,
+        binding_revision: binding.binding_revision,
+        config,
+    }))
+}
+
+struct RoleEngineBinding {
+    engine_id: String,
+    binding_revision: u32,
+    enabled: bool,
+}
+
+fn role_engine_binding(
+    settings_store: &crate::settings_store::SettingsStore,
+    role_id: &str,
+) -> Option<RoleEngineBinding> {
+    let agents = settings_store.get_section("agents");
+    let entries = agents.as_array()?;
+    for entry in entries {
+        let raw = entry.get("agent").unwrap_or(entry);
+        let Some(template_id) = string_field(raw, "templateId") else {
+            continue;
+        };
+        if template_id != role_id {
+            continue;
+        }
+        let engine_id = string_field(raw, "engineId").unwrap_or_default();
+        let model_source = string_field(raw, "modelSource").unwrap_or_else(|| {
+            if engine_id.is_empty() {
+                "orchestrator".to_string()
+            } else {
+                "engine".to_string()
+            }
+        });
+        let enabled = raw.get("enabled").and_then(Value::as_bool).unwrap_or(true);
+        if model_source != "engine" {
+            return None;
+        }
+        if engine_id.is_empty() {
+            return Some(RoleEngineBinding {
+                engine_id,
+                binding_revision: binding_revision(raw),
+                enabled,
+            });
+        }
+        return Some(RoleEngineBinding {
+            engine_id,
+            binding_revision: binding_revision(raw),
+            enabled,
+        });
+    }
+    None
+}
+
+fn engine_llm_config(
+    settings_store: &crate::settings_store::SettingsStore,
+    engine_id: &str,
+) -> Option<Value> {
+    let engine_id = engine_id.trim();
+    if engine_id.is_empty() {
+        return None;
+    }
+    let engines = settings_store.get_section("engines");
+    let entries = engines.as_array()?;
+    for entry in entries {
+        let raw = entry.get("engine").unwrap_or(entry);
+        let Some(id) = string_field(raw, "id").or_else(|| string_field(raw, "engineId")) else {
+            continue;
+        };
+        if id != engine_id {
+            continue;
+        }
+        let llm = raw.get("llm")?.clone();
+        if llm.as_object().is_none_or(|object| object.is_empty()) {
+            return None;
+        }
+        return Some(llm);
+    }
+    None
+}
+
+fn binding_revision(value: &Value) -> u32 {
+    value
+        .get("bindingRevision")
+        .and_then(Value::as_u64)
+        .and_then(|revision| u32::try_from(revision).ok())
+        .unwrap_or(0)
 }
 
 fn string_field(value: &Value, key: &str) -> Option<String> {
@@ -457,6 +589,67 @@ mod tests {
         assert_eq!(
             config.inferred_protocol(),
             HttpModelBridgeProtocol::AnthropicMessages
+        );
+    }
+
+    #[test]
+    fn role_engine_model_config_resolves_agent_binding() {
+        let store = crate::settings_store::SettingsStore::new();
+        store.set_section(
+            "agents",
+            json!([{
+                "templateId": "reviewer",
+                "modelSource": "engine",
+                "engineId": "sonnet-4-5",
+                "bindingRevision": 7,
+                "enabled": true
+            }]),
+        );
+        store.set_section(
+            "engines",
+            json!([{
+                "id": "sonnet-4-5",
+                "llm": {
+                    "baseUrl": "https://api.example.com/v1",
+                    "apiKey": "sk-role",
+                    "model": "role-sonnet",
+                    "urlMode": "standard",
+                    "reasoningEffort": "high"
+                }
+            }]),
+        );
+
+        let resolved = configured_role_engine_model_config(&store, "reviewer")
+            .expect("role binding should parse")
+            .expect("role should bind engine");
+
+        assert_eq!(resolved.template_id, "reviewer");
+        assert_eq!(resolved.engine_id, "sonnet-4-5");
+        assert_eq!(resolved.binding_revision, 7);
+        assert_eq!(resolved.config.require_model().unwrap(), "role-sonnet");
+        assert_eq!(
+            resolved.config.inferred_protocol(),
+            HttpModelBridgeProtocol::ChatCompletions
+        );
+    }
+
+    #[test]
+    fn role_engine_model_config_returns_none_for_orchestrator_inheritance() {
+        let store = crate::settings_store::SettingsStore::new();
+        store.set_section(
+            "agents",
+            json!([{
+                "templateId": "executor",
+                "modelSource": "orchestrator",
+                "engineId": "",
+                "enabled": true
+            }]),
+        );
+
+        assert!(
+            configured_role_engine_model_config(&store, "executor")
+                .expect("orchestrator inheritance is valid")
+                .is_none()
         );
     }
 }

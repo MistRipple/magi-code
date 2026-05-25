@@ -15,9 +15,7 @@ use magi_conversation_runtime::{
     },
     task_execution_registry::TaskExecutionPlan,
 };
-use magi_core::{
-    ExecutionOwnership, SessionId, TaskExecutionTarget, TaskStatus, TaskTier, ThreadId, WorkerId,
-};
+use magi_core::{ExecutionOwnership, SessionId, TaskExecutionTarget, TaskStatus, WorkerId};
 use magi_orchestrator::ExecutionWritebackPlans;
 use magi_session_store::{ActiveExecutionBranch, ActiveExecutionChain};
 
@@ -30,7 +28,6 @@ pub(crate) use magi_conversation_runtime::execution_chain_recovery::{
 fn rebuild_dispatch_plan_for_branch(
     chain: &ActiveExecutionChain,
     branch: &ActiveExecutionBranch,
-    orchestrator_thread_id: &ThreadId,
 ) -> TaskExecutionPlan {
     let ownership = ExecutionOwnership {
         session_id: Some(chain.session_id.clone()),
@@ -53,17 +50,8 @@ fn rebuild_dispatch_plan_for_branch(
     } else {
         ExecutionWritebackPlans::default()
     };
-    // 恢复链路的 thread_id 来源：
-    //  * sub task 在 current_turn.worker_lanes 中有 lane，直接复用 lane.thread_id；
-    //  * primary action 没有 lane，归属 session 级 orchestrator thread。
-    // orchestrator thread 由调用方在 resume 入口通过 ensure_session_mission 幂等保证。
-    let lane_thread_id = chain.current_turn.as_ref().and_then(|turn| {
-        turn.worker_lanes
-            .iter()
-            .find(|lane| lane.task_id == branch.task_id)
-            .map(|lane| lane.thread_id.clone())
-    });
-    let thread_id = lane_thread_id.unwrap_or_else(|| orchestrator_thread_id.clone());
+    // 恢复链路的 thread_id：直接读 branch.thread_id。`ensure_thread_for_role`
+    // 用 `now.0` 拼 id 不可重放，必须持久化在 branch。
     TaskExecutionPlan::Dispatch {
         target: TaskExecutionTarget {
             mission_id: chain.mission_id.clone(),
@@ -74,19 +62,7 @@ fn rebuild_dispatch_plan_for_branch(
             execution_chain_ref: Some(chain.execution_chain_ref.clone()),
         },
         worker_id: branch.worker_id.clone(),
-        lane_id: chain.current_turn.as_ref().and_then(|turn| {
-            turn.worker_lanes
-                .iter()
-                .find(|lane| lane.task_id == branch.task_id)
-                .map(|lane| lane.lane_id.clone())
-        }),
-        lane_seq: chain.current_turn.as_ref().and_then(|turn| {
-            turn.worker_lanes
-                .iter()
-                .find(|lane| lane.task_id == branch.task_id)
-                .map(|lane| lane.lane_seq)
-        }),
-        thread_id,
+        thread_id: branch.thread_id.clone(),
         is_primary: branch.is_primary,
         session_id: chain.session_id.clone(),
         workspace_id: chain.workspace_id.clone(),
@@ -263,8 +239,9 @@ pub(crate) fn continue_execution_chain(
 
     // resume 入口幂等地保证 orchestrator thread 存在：
     //  * 已存在 → 直接复用 (同 session 同 mission 同 orchestrator thread 不变量)；
-    //  * 不存在 → 用 chain.mission_id spawn 新 thread，UI 主线归属即此 thread。
-    let (_, orchestrator_thread_id) = state.session_store.ensure_session_mission(
+    //  * 不存在 → 用 chain.mission_id spawn 新 thread。
+    // thread 自身由 branch.thread_id 承载，本调用仅维护 mission orchestrator thread 存在性。
+    state.session_store.ensure_session_mission(
         session_id,
         chain.dispatch_context.accepted_at,
         || chain.mission_id.clone(),
@@ -285,7 +262,7 @@ pub(crate) fn continue_execution_chain(
     for branch in &branches_to_resume {
         state.task_execution_registry().insert(
             branch.task_id.clone(),
-            rebuild_dispatch_plan_for_branch(&chain, branch, &orchestrator_thread_id),
+            rebuild_dispatch_plan_for_branch(&chain, branch),
         );
         if let Some(worker_runtime) = worker_runtime_handle {
             sync_branch_checkpoint_to_worker_runtime(worker_runtime, branch);
@@ -331,18 +308,13 @@ pub(crate) fn continue_execution_chain(
             .map_err(|msg| ApiError::internal_assembly("继续会话失败", msg))?;
     }
 
-    // Long Mission：恢复任务状态后需要重新启动后台 runner，避免退化为同步执行
-    let is_long_mission = root_task
-        .policy_snapshot
-        .as_ref()
-        .map(|policy| policy.task_tier == TaskTier::LongMission)
-        .unwrap_or(false);
-    if is_long_mission {
-        match manager.start(chain.root_task_id.as_str(), Some(session_id.clone())) {
-            Ok(_) | Err(RunnerStartError::AlreadyRunning) => {}
-            Err(RunnerStartError::NotFound) => {
-                return Err(ApiError::internal_assembly("继续会话失败", "根任务不存在"));
-            }
+    // 所有 tier 统一由后台 RunnerManager 驱动：恢复任务状态后立即重启 runner。
+    // `AlreadyRunning` 视为
+    // 幂等结果（重复恢复同一 root task 的常见场景）。
+    match manager.start(chain.root_task_id.as_str(), Some(session_id.clone())) {
+        Ok(_) | Err(RunnerStartError::AlreadyRunning) => {}
+        Err(RunnerStartError::NotFound) => {
+            return Err(ApiError::internal_assembly("继续会话失败", "根任务不存在"));
         }
     }
 

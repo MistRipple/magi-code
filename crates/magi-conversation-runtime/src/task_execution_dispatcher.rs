@@ -5,7 +5,7 @@
 use crate::{
     ConversationRegistry, SKILL_APPLY_TOOL_NAME,
     conversation_loop::{self, ConversationLoopRequest},
-    model_config::NormalizedModelConfig,
+    model_config::{NormalizedModelConfig, configured_role_engine_model_config},
     prompt_utils::prepend_session_instructions,
     public_builtin_tool_definitions,
     session_turn_execution::{
@@ -16,11 +16,16 @@ use crate::{
     settings_store::SettingsStore,
     skill_apply_tool_definition,
     task_execution_registry::{TaskExecutionPlan, TaskExecutionRegistry},
-    task_helpers::{task_can_see_builtin_tool, task_is_coordinator, task_is_long_mission},
+    task_helpers::{
+        task_can_see_builtin_tool, task_is_coordinator, task_is_long_mission, task_role_id,
+    },
     task_runner_bridge::{EventBasedResultReceiver, TaskDispatcher, TaskOutcome, TaskResult},
-    usage_recording::{ModelUsageBinding, model_usage_binding_for_worker},
+    usage_recording::{ModelUsageBinding, model_usage_binding_for_worker_with_settings},
 };
-use magi_bridge_client::{ChatToolDefinition, ModelBridgeClient, ModelInvocationRequest};
+use magi_bridge_client::{
+    BridgeClientError, BridgeErrorLayer, BridgeResponse, ChatToolDefinition, ModelBridgeClient,
+    ModelInvocationRequest, ModelStreamingDelta,
+};
 use magi_context_runtime::{
     ContextBudget, ContextRuntime, ExecutionContextAssemblyRequest, ExecutionContextClues,
 };
@@ -40,13 +45,104 @@ use magi_orchestrator::{
 use magi_session_store::{SessionStore, TimelineEntryKind, timeline_entry_visible_text};
 use magi_tool_runtime::{BuiltinToolName, ToolRegistry};
 use magi_workspace::WorkspaceStore;
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 #[derive(Clone)]
 pub struct ExecutionPipeline {
     pub orchestrator: OrchestratorService,
     pub execution_runtime: OrchestratedExecutionRuntime,
     pub memory_store: MemoryStore,
+}
+
+struct FailoverModelBridgeClient {
+    primary: Arc<dyn ModelBridgeClient>,
+    fallback: Arc<dyn ModelBridgeClient>,
+    role_id: String,
+    engine_id: String,
+}
+
+impl FailoverModelBridgeClient {
+    fn new(
+        primary: Arc<dyn ModelBridgeClient>,
+        fallback: Arc<dyn ModelBridgeClient>,
+        role_id: impl Into<String>,
+        engine_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            primary,
+            fallback,
+            role_id: role_id.into(),
+            engine_id: engine_id.into(),
+        }
+    }
+
+    fn should_failover(error: &BridgeClientError) -> bool {
+        match error {
+            BridgeClientError::CallFailed { layer, .. } => {
+                matches!(
+                    layer,
+                    BridgeErrorLayer::Transport | BridgeErrorLayer::Protocol
+                )
+            }
+            _ => false,
+        }
+    }
+}
+
+impl ModelBridgeClient for FailoverModelBridgeClient {
+    fn invoke(&self, request: ModelInvocationRequest) -> Result<BridgeResponse, BridgeClientError> {
+        match self.primary.invoke(request.clone()) {
+            Ok(response) => Ok(response),
+            Err(error) if Self::should_failover(&error) => {
+                tracing::warn!(
+                    role_id = %self.role_id,
+                    engine_id = %self.engine_id,
+                    error = %error,
+                    "角色专属模型不可用，使用编排模型继续执行子代理"
+                );
+                self.fallback.invoke(request)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn invoke_streaming(
+        &self,
+        request: ModelInvocationRequest,
+        on_delta: &dyn Fn(&ModelStreamingDelta),
+    ) -> Result<BridgeResponse, BridgeClientError> {
+        let emitted_delta = AtomicBool::new(false);
+        let guarded_delta = |delta: &ModelStreamingDelta| {
+            if !delta.content.is_empty() || !delta.thinking.is_empty() {
+                emitted_delta.store(true, Ordering::SeqCst);
+            }
+            on_delta(delta);
+        };
+        match self
+            .primary
+            .invoke_streaming(request.clone(), &guarded_delta)
+        {
+            Ok(response) => Ok(response),
+            Err(error)
+                if Self::should_failover(&error) && !emitted_delta.load(Ordering::SeqCst) =>
+            {
+                tracing::warn!(
+                    role_id = %self.role_id,
+                    engine_id = %self.engine_id,
+                    error = %error,
+                    "角色专属流式模型不可用，使用编排模型继续执行子代理"
+                );
+                self.fallback.invoke_streaming(request, on_delta)
+            }
+            Err(error) => Err(error),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -73,8 +169,8 @@ pub struct LlmTaskDispatcher {
     conversation_registry: Option<Arc<ConversationRegistry>>,
     /// Task System v2：AgentRole 注册表（来自 ApiState，注入到 conversation_loop）。
     agent_role_registry: Option<Arc<magi_agent_role::AgentRoleRegistry>>,
-    /// Task System v2 — L5：父子任务拓扑图。S7 协调器三件套（agent_spawn / send_message /
-    /// task_stop）需要在 conversation_loop 中读写。设计为构造期必填，避免运行期再做空检查。
+    /// Task System v2 — L5：父子任务拓扑图。S7 协调器工具 agent_spawn
+    /// 需要在 conversation_loop 中读写。设计为构造期必填，避免运行期再做空检查。
     spawn_graph: Arc<std::sync::Mutex<magi_spawn_graph::SpawnGraph>>,
     /// Task System v2 — L13：session 维度的 TodoLedger 索引。S9 中模型通过
     /// `todo_write` 工具往这里写分解 + 进度；下一轮 Turn 起始时把快照注入 system prompt。
@@ -112,8 +208,6 @@ pub struct LlmTaskDispatcher {
     /// orchestrator 通过 human_checkpoint_request 申请人工审核点；pending 存在时
     /// runtime 会拒绝 agent_spawn 并暂停新的 leaf dispatch。
     human_checkpoint_registry: Arc<magi_human_checkpoint::HumanCheckpointRegistry>,
-    /// 强制同步执行 dispatch，用于 ExecutionChain 同步 for 循环（设计 §1.3）。
-    force_sync_dispatch: Arc<std::sync::atomic::AtomicUsize>,
     /// codex goal 桥：mission 生命周期通知（recovery / 人审 resolve / plan step
     /// 完成）按 mission 维度排队，dispatcher 在装配 prompt 时 `pending_notice`
     /// 拉一段，由 `prepend_session_instructions` 用 `<system-reminder>` 包装注入。
@@ -239,23 +333,9 @@ impl LlmTaskDispatcher {
             human_checkpoint_registry: Arc::new(
                 magi_human_checkpoint::HumanCheckpointRegistry::new(),
             ),
-            force_sync_dispatch: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             lifecycle_notices: None,
             mission_metrics_registry: Arc::new(MissionMetricsRegistry::new()),
         }
-    }
-
-    pub fn set_force_sync_dispatch(&self, force: bool) {
-        if force {
-            self.force_sync_dispatch
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            return;
-        }
-        let _ = self.force_sync_dispatch.fetch_update(
-            std::sync::atomic::Ordering::SeqCst,
-            std::sync::atomic::Ordering::SeqCst,
-            |current| Some(current.saturating_sub(1)),
-        );
     }
 
     pub fn with_model_bridge_client(mut self, client: Arc<dyn ModelBridgeClient>) -> Self {
@@ -510,9 +590,9 @@ impl LlmTaskDispatcher {
         use_tools: bool,
         skill_name: Option<String>,
         usage_binding: ModelUsageBinding,
-        worker_lane_id: Option<String>,
-        worker_lane_seq: Option<usize>,
+        is_sidechain: bool,
         worker_id: WorkerId,
+        worker_role: String,
         thread_id: magi_core::ThreadId,
         system_prompt: Option<String>,
     ) {
@@ -533,9 +613,9 @@ impl LlmTaskDispatcher {
             skill_name,
             &usage_binding,
             streaming_entry_id.as_deref(),
-            worker_lane_id.as_deref(),
-            worker_lane_seq,
+            is_sidechain,
             Some(&worker_id),
+            Some(worker_role.as_str()),
             &thread_id,
             system_prompt,
         );
@@ -1035,11 +1115,54 @@ impl LlmTaskDispatcher {
         }
     }
 
-    fn resolve_model_client(&self) -> Option<Arc<dyn ModelBridgeClient>> {
+    fn resolve_orchestrator_model_client(&self) -> Option<Arc<dyn ModelBridgeClient>> {
         resolve_configured_model_client(
             self.settings_store.as_ref(),
             self.model_bridge_client.clone(),
         )
+    }
+
+    fn resolve_model_client_for_task(
+        &self,
+        task: Option<&magi_core::Task>,
+        execution_role_id: Option<&str>,
+    ) -> Result<Arc<dyn ModelBridgeClient>, String> {
+        let orchestrator_client = self.resolve_orchestrator_model_client();
+        let role_id = execution_role_id
+            .map(str::trim)
+            .filter(|role| !role.is_empty())
+            .or_else(|| task.and_then(|task| task_role_id(Some(task))));
+        if let (Some(store), Some(role_id)) = (self.settings_store.as_ref(), role_id) {
+            match configured_role_engine_model_config(store, role_id) {
+                Ok(Some(role_model)) => {
+                    let client =
+                        role_model
+                            .config
+                            .to_http_model_client("gpt-4")
+                            .ok_or_else(|| {
+                                format!(
+                                    "角色 {} 的模型引擎 {} 缺少可用 HTTP 模型配置",
+                                    role_model.template_id, role_model.engine_id
+                                )
+                            })?;
+                    let primary = Arc::new(client) as Arc<dyn ModelBridgeClient>;
+                    if task.and_then(|task| task.parent_task_id.as_ref()).is_some()
+                        && let Some(fallback) = orchestrator_client.clone()
+                    {
+                        return Ok(Arc::new(FailoverModelBridgeClient::new(
+                            primary,
+                            fallback,
+                            role_model.template_id,
+                            role_model.engine_id,
+                        )) as Arc<dyn ModelBridgeClient>);
+                    }
+                    return Ok(primary);
+                }
+                Ok(None) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        orchestrator_client.ok_or_else(|| "model bridge client 未配置".to_string())
     }
 
     fn apply_skill_prompt_injections(
@@ -1067,9 +1190,7 @@ impl LlmTaskDispatcher {
         &self,
         request: SessionTurnExecutionRequest,
     ) -> Result<SessionTurnExecutionOutput, String> {
-        let Some(client) = self.resolve_model_client() else {
-            return Err("model bridge client 未配置".to_string());
-        };
+        let client = self.resolve_model_client_for_task(None, None)?;
 
         let prompt = self.apply_skill_prompt_injections(
             prepend_session_instructions(
@@ -1113,40 +1234,33 @@ impl LlmTaskDispatcher {
         skill_name: Option<String>,
         usage_binding: &ModelUsageBinding,
         streaming_entry_id: Option<&str>,
-        worker_lane_id: Option<&str>,
-        worker_lane_seq: Option<usize>,
+        is_sidechain: bool,
         worker_id: Option<&WorkerId>,
+        execution_role_id: Option<&str>,
         thread_id: &magi_core::ThreadId,
         system_prompt: Option<String>,
     ) -> (TaskOutcome, Option<ExecutionContextSummary>) {
-        let Some(client) = self.resolve_model_client() else {
-            tracing::error!(task_id = %task.task_id, "invoke_llm_with_tools: no model bridge client configured");
-            return (
-                TaskOutcome::Failed {
-                    error: format!(
-                        "no model bridge client configured for task {}",
-                        task.task_id
-                    ),
-                },
-                None,
-            );
+        let role_for_model = if is_sidechain {
+            execution_role_id
+        } else {
+            None
+        };
+        let client = match self.resolve_model_client_for_task(Some(task), role_for_model) {
+            Ok(client) => client,
+            Err(error) => {
+                tracing::error!(task_id = %task.task_id, error = %error, "invoke_llm_with_tools: model bridge client resolve failed");
+                return (
+                    TaskOutcome::Failed {
+                        error: format!("模型配置不可用: {error}"),
+                    },
+                    None,
+                );
+            }
         };
 
         let (prompt, context_summary) = self.assemble_prompt(task, session_id, workspace_id);
         let prompt = self.apply_skill_prompt_injections(prompt, skill_name.as_deref());
         let workspace_root_path = self.resolve_workspace_root_path(workspace_id);
-
-        // P7：orchestrator_thread_id 为主线可见性锚点，分派到达时必然已 spawn；缺失即架构破坏。
-        let orchestrator_thread_id = self
-            .session_store
-            .orchestrator_thread_for_session(session_id)
-            .map(|thread| thread.thread_id)
-            .unwrap_or_else(|| {
-                panic!(
-                    "session {session_id} missing orchestrator thread when dispatching task {}",
-                    task.task_id
-                )
-            });
 
         let tools = if use_tools {
             let tool_defs = self.build_tool_definitions(Some(task));
@@ -1331,11 +1445,9 @@ impl LlmTaskDispatcher {
             tools,
             usage_binding,
             streaming_entry_id,
-            worker_lane_id,
-            worker_lane_seq,
+            is_sidechain,
             worker_id,
             thread_id,
-            orchestrator_thread_id: &orchestrator_thread_id,
             context_summary,
             system_prompt,
             workspace_root_path,
@@ -1374,8 +1486,6 @@ impl LlmTaskDispatcher {
             TaskExecutionPlan::Dispatch {
                 target: _,
                 worker_id,
-                lane_id,
-                lane_seq,
                 thread_id,
                 is_primary,
                 session_id,
@@ -1404,10 +1514,14 @@ impl LlmTaskDispatcher {
                     writebacks,
                     use_tools,
                     skill_name,
-                    model_usage_binding_for_worker(worker, is_primary),
-                    lane_id,
-                    lane_seq,
+                    model_usage_binding_for_worker_with_settings(
+                        worker,
+                        is_primary,
+                        self.settings_store.as_ref(),
+                    ),
+                    !is_primary,
                     worker_id,
+                    worker.role.clone(),
                     thread_id,
                     worker.system_prompt_template.clone(),
                 );
@@ -1702,7 +1816,7 @@ mod tests {
     #[test]
     fn tool_visibility_is_filtered_by_role_and_task_tier() {
         let registry = magi_agent_role::AgentRoleRegistry::load_default();
-        let worker_task = task_with_role("integration-dev", TaskTier::ExecutionChain);
+        let worker_task = task_with_role("executor", TaskTier::ExecutionChain);
         let coordinator_task = task_with_role("coordinator", TaskTier::ExecutionChain);
         let long_mission_task = task_with_role("coordinator", TaskTier::LongMission);
 
@@ -1931,15 +2045,6 @@ impl TaskDispatcher for LlmTaskDispatcher {
         worker: &WorkerInfo,
         lease: &magi_orchestrator::task_store::TaskLease,
     ) -> Result<(), String> {
-        // ExecutionChain 的同步 for 循环要求 dispatch 同步完成，直接走 inner。
-        if self
-            .force_sync_dispatch
-            .load(std::sync::atomic::Ordering::SeqCst)
-            > 0
-        {
-            return self.dispatch_inner(task, worker, lease);
-        }
-
         let dispatcher = self.clone();
         let task = task.clone();
         let worker = worker.clone();

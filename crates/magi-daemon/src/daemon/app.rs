@@ -4,7 +4,9 @@ use super::{
 };
 use axum::{
     Router,
-    response::{Html, Redirect},
+    body::Body,
+    http::{StatusCode, Uri, header},
+    response::{Html, IntoResponse, Redirect, Response},
     routing::get,
 };
 use std::{
@@ -22,7 +24,8 @@ const WEB_DEV_ENABLED_ENV: &str = "MAGI_WEB_DEV";
 const WEB_DEV_HOST_ENV: &str = "MAGI_WEB_DEV_HOST";
 const WEB_DEV_PORT_ENV: &str = "MAGI_WEB_DEV_PORT";
 const WEB_DEV_ROOT_ENV: &str = "MAGI_WEB_DEV_ROOT";
-const DEFAULT_WEB_DEV_HOST: &str = "127.0.0.1";
+const DEFAULT_WEB_DEV_HOST: &str = "0.0.0.0";
+const LOCAL_WEB_DEV_HOST: &str = "127.0.0.1";
 const DEFAULT_WEB_DEV_PORT: u16 = 3000;
 const WEB_DEV_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const WEB_DEV_READY_INTERVAL: Duration = Duration::from_millis(250);
@@ -86,7 +89,7 @@ async fn resolve_frontend_mode(config: &DaemonConfig) -> Result<FrontendMode, Da
     let host =
         read_env_trimmed(WEB_DEV_HOST_ENV).unwrap_or_else(|| DEFAULT_WEB_DEV_HOST.to_string());
     let port = read_env_u16(WEB_DEV_PORT_ENV, DEFAULT_WEB_DEV_PORT)?;
-    let origin = format!("http://{host}:{port}");
+    let origin = format!("http://{}:{port}", local_probe_host(&host));
     let agent_origin = format!("http://{}:{}", browser_host(&config.host), config.port);
     let web_root = resolve_web_root();
 
@@ -170,7 +173,14 @@ fn build_application_router(api_router: Router, frontend: &FrontendMode) -> Rout
                     }
                 }),
             )
-            .merge(api_router);
+            .merge(api_router)
+            .fallback(get({
+                let vite_origin = dev_server.origin.clone();
+                move |uri| {
+                    let vite_origin = vite_origin.clone();
+                    async move { proxy_vite_dev_asset(vite_origin, uri).await }
+                }
+            }));
     }
 
     let Some(web_dist_root) = resolve_web_dist_root() else {
@@ -211,8 +221,8 @@ fn build_application_router(api_router: Router, frontend: &FrontendMode) -> Rout
 }
 
 fn build_web_dev_html(vite_origin: &str, agent_origin: &str) -> String {
-    let vite_origin_json = serde_json::to_string(vite_origin).expect("origin should serialize");
     let agent_origin_json = serde_json::to_string(agent_origin).expect("origin should serialize");
+    let vite_origin_json = serde_json::to_string(vite_origin).expect("origin should serialize");
     format!(
         r#"<!DOCTYPE html>
 <html lang="zh-CN">
@@ -225,14 +235,73 @@ fn build_web_dev_html(vite_origin: &str, agent_origin: &str) -> String {
       window.__AGENT_BASE_URL__ = {agent_origin_json};
       window.__MAGI_WEB_DEV_ORIGIN__ = {vite_origin_json};
     </script>
-    <script type="module" src="{vite_origin}/@vite/client"></script>
+    <script type="module" src="/@vite/client"></script>
   </head>
   <body>
     <div id="app"></div>
-    <script type="module" src="{vite_origin}/src/main-web.ts"></script>
+    <script type="module" src="/src/main-web.ts"></script>
   </body>
 </html>"#
     )
+}
+
+async fn proxy_vite_dev_asset(vite_origin: String, uri: Uri) -> Response {
+    if !is_vite_dev_asset_path(uri.path()) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let path_and_query = uri
+        .path_and_query()
+        .map(|value| value.as_str())
+        .unwrap_or("/");
+    let url = format!("{}{}", vite_origin.trim_end_matches('/'), path_and_query);
+    let response = match reqwest::get(url).await {
+        Ok(response) => response,
+        Err(error) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                format!("Vite 前端热加载资源代理失败: {error}"),
+            )
+                .into_response();
+        }
+    };
+    let status = StatusCode::from_u16(response.status().as_u16())
+        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let content_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let bytes = match response.bytes().await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                format!("读取 Vite 前端热加载资源失败: {error}"),
+            )
+                .into_response();
+        }
+    };
+    let mut builder = Response::builder().status(status);
+    if let Some(content_type) = content_type {
+        builder = builder.header(header::CONTENT_TYPE, content_type);
+    }
+    builder.body(Body::from(bytes)).unwrap_or_else(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("构造 Vite 资源响应失败: {error}"),
+        )
+            .into_response()
+    })
+}
+
+fn is_vite_dev_asset_path(path: &str) -> bool {
+    path == "/favicon.ico"
+        || path.starts_with("/@vite/")
+        || path.starts_with("/@id/")
+        || path.starts_with("/@fs/")
+        || path.starts_with("/src/")
+        || path.starts_with("/node_modules/")
+        || path.starts_with("/assets/")
 }
 
 async fn is_web_dev_server_ready(origin: &str, agent_origin: &str, web_root: &PathBuf) -> bool {
@@ -352,7 +421,14 @@ fn read_env_u16(name: &str, default_value: u16) -> Result<u16, DaemonError> {
 
 fn browser_host(host: &str) -> String {
     match host.trim() {
-        "" | "0.0.0.0" | "::" => DEFAULT_WEB_DEV_HOST.to_string(),
+        "" | "0.0.0.0" | "::" => LOCAL_WEB_DEV_HOST.to_string(),
+        value => value.to_string(),
+    }
+}
+
+fn local_probe_host(host: &str) -> String {
+    match host.trim() {
+        "" | "0.0.0.0" | "::" => LOCAL_WEB_DEV_HOST.to_string(),
         value => value.to_string(),
     }
 }
@@ -381,4 +457,36 @@ fn resolve_web_dist_root() -> Option<PathBuf> {
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dev_html_uses_daemon_origin_for_vite_modules() {
+        let html = build_web_dev_html("http://127.0.0.1:3000", "http://127.0.0.1:38123");
+
+        assert!(html.contains(r#"src="/@vite/client""#));
+        assert!(html.contains(r#"src="/src/main-web.ts""#));
+        assert!(!html.contains(r#"src="http://127.0.0.1:3000"#));
+    }
+
+    #[test]
+    fn wildcard_hosts_use_loopback_for_local_process_probes() {
+        assert_eq!(browser_host("0.0.0.0"), "127.0.0.1");
+        assert_eq!(browser_host("::"), "127.0.0.1");
+        assert_eq!(local_probe_host("0.0.0.0"), "127.0.0.1");
+        assert_eq!(local_probe_host("::"), "127.0.0.1");
+        assert_eq!(local_probe_host("192.168.1.2"), "192.168.1.2");
+    }
+
+    #[test]
+    fn vite_dev_proxy_only_handles_frontend_asset_paths() {
+        assert!(is_vite_dev_asset_path("/@vite/client"));
+        assert!(is_vite_dev_asset_path("/src/main-web.ts"));
+        assert!(is_vite_dev_asset_path("/node_modules/.vite/deps/chunk.js"));
+        assert!(!is_vite_dev_asset_path("/api/lan-access"));
+        assert!(!is_vite_dev_asset_path("/health"));
+    }
 }

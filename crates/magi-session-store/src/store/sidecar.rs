@@ -122,9 +122,6 @@ fn canonical_current_turn_item_kind(kind: &str) -> DomainResult<CanonicalTurnIte
         "assistant_thinking" => Ok(CanonicalTurnItemKind::AssistantThinking),
         "assistant_phase" => Ok(CanonicalTurnItemKind::SystemNotice),
         "tool_call_started" | "tool_call_result" => Ok(CanonicalTurnItemKind::ToolCall),
-        "worker_spawned" => Ok(CanonicalTurnItemKind::WorkerDispatch),
-        "worker_status" => Ok(CanonicalTurnItemKind::WorkerStatus),
-        "worker_result" => Ok(CanonicalTurnItemKind::WorkerResult),
         "task_status" => Ok(CanonicalTurnItemKind::TaskStatus),
         _ => Err(DomainError::InvalidState {
             message: format!("unknown current turn item kind: {kind}"),
@@ -263,8 +260,6 @@ fn current_turn_item_to_canonical_item(
         status,
         item_version: None,
         updated_at: UtcMillis::now(),
-        lane_id: item.lane_id.clone(),
-        lane_seq: item.lane_seq,
         title: item.title.clone(),
         content: item.content.clone(),
         blocks: Vec::new(),
@@ -442,16 +437,6 @@ fn validate_current_turn_item_update(
     )?;
     reject_changed_current_turn_item_field(
         &incoming.item_id,
-        "laneId",
-        existing.lane_id == incoming.lane_id,
-    )?;
-    reject_changed_current_turn_item_field(
-        &incoming.item_id,
-        "laneSeq",
-        existing.lane_seq == incoming.lane_seq,
-    )?;
-    reject_changed_current_turn_item_field(
-        &incoming.item_id,
         "tool.callId",
         existing.tool_call_id == incoming.tool_call_id,
     )?;
@@ -607,14 +592,19 @@ impl SessionStore {
         sidecar: SessionRuntimeSidecar,
         reason: SessionSidecarFlushReason,
     ) {
+        // 本函数只写 sidecar 元数据（ownership / chain / recovery / status）。
+        // sidecar.current_turn 字段对调用方而言是只读快照——调用方在写锁之外
+        // 读取它，再传进来仅用于持久化镜像。canonical turn 由显式的 turn 变更
+        // 函数（upsert_current_turn_item / update_current_turn_status /
+        // complete_current_turn_from_completed_root_task / cancel_current_turn）
+        // 在各自的写锁内原子投影；这里若再次投影，会用过期快照对最新 canonical
+        // 触发非法状态转换（例如 Failed→Completed），导致 panic 并毒化整个
+        // session state RwLock。因此本函数绝不能从 sidecar.current_turn 反向
+        // 重投影 canonical。
         let mut state = self
             .state
             .write()
             .expect("session state write lock poisoned");
-        if let Some(turn) = sidecar.current_turn.as_ref() {
-            upsert_canonical_turn_in_state(&mut state, &sidecar.session_id, turn)
-                .expect("runtime sidecar current turn should be canonical-compatible");
-        }
         state
             .execution_sidecar_store
             .upsert_runtime_sidecar(sidecar);
@@ -874,9 +864,9 @@ impl SessionStore {
     }
 
     /// 依据 `source_thread_id` 判定 item 的可见性目的地。返回值是"主线"还是
-    /// "worker drawer"，由 thread 的 `role_id` 决定：
+    /// "task 详情"，由 thread 的 `role_id` 决定：
     /// - 该 thread 是 session 的 orchestrator thread → `Main`
-    /// - 其他 thread → `WorkerDrawer { role_id, worker_id }`
+    /// - 其他 thread → `TaskDetail { role_id, worker_id }`
     ///
     /// 约束：传入的 `source_thread_id` 必须是本 session 已注册 thread；
     /// 否则返回 `None`，调用方按"未知来源"处理（通常只出现在 P6 之前遗留的
@@ -893,14 +883,14 @@ impl SessionStore {
         if thread.role_id == ORCHESTRATOR_ROLE_ID {
             Some(ThreadVisibility::Main)
         } else {
-            Some(ThreadVisibility::WorkerDrawer {
+            Some(ThreadVisibility::TaskDetail {
                 role_id: thread.role_id.clone(),
                 worker_id: thread.worker_instance_id.clone(),
             })
         }
     }
 
-    /// P6b：读取指定 thread 内部的对话记录。worker thread 为单 task 独占，
+    /// P6b：读取指定 thread 内部的对话记录。子代理 task thread 为单 task 独占，
     /// 因此这里不会把同 role 的历史 task 注入新 task。
     pub fn thread_message_history(&self, thread_id: &ThreadId) -> Vec<ThreadChatMessage> {
         let state = self.state.read().expect("session state read lock poisoned");
@@ -1433,13 +1423,6 @@ impl SessionStore {
                     branch.resume_mode = resume_mode.clone();
                     branch.resume_token = resume_token.clone();
                     if let Some(turn) = sidecar.current_turn.as_mut() {
-                        if let Some(lane) = turn
-                            .worker_lanes
-                            .iter_mut()
-                            .find(|lane| lane.task_id == branch.task_id)
-                        {
-                            lane.worker_id = branch.worker_id.clone();
-                        }
                         turn.normalize();
                     }
                     chain.active_branch_task_ids = chain

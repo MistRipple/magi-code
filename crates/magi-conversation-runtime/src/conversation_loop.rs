@@ -60,7 +60,7 @@ pub struct ConversationLoopRequest<'a> {
     /// Task System v2 — AgentRole 注册表。task_turn_visibility 解析 role_id 时
     /// 必须走该注册表，不再依赖硬编码的 kind→role 默认 mapping。
     pub agent_role_registry: &'a magi_agent_role::AgentRoleRegistry,
-    /// Task System v2 — L5：父子任务拓扑图。S7 协调工具（agent_spawn / task_stop）
+    /// Task System v2 — L5：父子任务拓扑图。S7 协调工具（agent_spawn）
     /// 在 execute_task_tool_call 中拦截时操作此结构。
     pub spawn_graph: &'a std::sync::Mutex<magi_spawn_graph::SpawnGraph>,
     /// Task System v2 — L12：本次轮次的 SafetyGate 快照。`None` 表示当前没有
@@ -114,32 +114,21 @@ pub struct ConversationLoopRequest<'a> {
     pub tools: Option<Vec<ChatToolDefinition>>,
     pub usage_binding: &'a ModelUsageBinding,
     pub streaming_entry_id: Option<&'a str>,
-    pub worker_lane_id: Option<&'a str>,
-    pub worker_lane_seq: Option<usize>,
+    /// `true` 表示当前 task 走 sidechain（task 详情），由父代理派发的子任务。
+    /// `false` 表示走主线（mainline）orchestrator thread。来源是
+    /// `TaskExecutionPlan::Dispatch.is_primary` 的取反——is_primary=true 代表
+    /// session 的根任务/直接由用户激活的 orchestrator turn。
+    pub is_sidechain: bool,
     pub worker_id: Option<&'a magi_core::WorkerId>,
-    /// P7：lane 必须绑定到 thread。LLM 入口会 prepend 该 thread 的历史、
+    /// P7：执行上下文必须绑定到 thread。LLM 入口会 prepend 该 thread 的历史、
     /// 结束时把本轮消息 append 回 thread。orchestrator task 走 session 的
-    /// orchestrator thread；worker task 走对应 role 的 worker thread。
+    /// orchestrator thread；子代理 task 走本次执行独占的 task thread。
     pub thread_id: &'a ThreadId,
-    /// P7：本 session 的 orchestrator thread。Sidechain task 在主线 publish
-    /// `worker_status` 摘要 item 时把 source_thread_id 指向它，确保前端 projection
-    /// 把摘要归到主线时间线。当 task 自身就是 orchestrator task 时，与
-    /// `thread_id` 相等。
-    pub orchestrator_thread_id: &'a ThreadId,
     pub context_summary: Option<ExecutionContextSummary>,
     pub system_prompt: Option<String>,
     pub workspace_root_path: Option<PathBuf>,
 }
 
-/// 单一可见性枚举：item 的归属由 `source_thread_id` 决定，本枚举仅承担
-/// "把该 task 的 turn item 写到主线 thread 还是 worker drawer thread"的派发判断。
-/// - `Mainline`：item.source_thread_id = orchestrator thread，前端 projection
-///   会把它归到主线时间线。orchestrator 自身 turn 与"无独立 worker drawer 的子任务"
-///   都走这条路径。
-/// - `Sidechain`：item.source_thread_id = lane 绑定的 worker thread，归到对应
-///   role 的 drawer。primary worker sidechain（同一 turn 内主 dispatch 拉起的
-///   worker 任务）会同时在主线 publish `worker_status` 摘要 item（其 source_thread_id
-///   仍是 orchestrator）以填充 dispatch 卡 liveActivity。
 /// P6b：把 thread 持久化的消息记录（`ThreadChatMessage`）还原为 bridge-client 的
 /// `ChatMessage`。两者字段一一对应，独立类型仅是为了避免 session-store 反向依赖
 /// bridge-client，不承担额外语义。
@@ -317,11 +306,9 @@ fn run_conversation_loop_inner(
         tools,
         usage_binding,
         streaming_entry_id,
-        worker_lane_id,
-        worker_lane_seq,
+        is_sidechain,
         worker_id,
         thread_id,
-        orchestrator_thread_id,
         context_summary,
         system_prompt,
         workspace_root_path,
@@ -581,7 +568,7 @@ fn run_conversation_loop_inner(
         }
     }
     // [CACHE: DYNAMIC] Runtime tail · Mailbox 待处理消息。
-    // 来自 send_message 的跨 task 投递；按 Conversation 层渲染。
+    // 来自 user / system / 子代理回执的跨 task 投递；按 Conversation 层渲染。
     if let Some(rendered) = render_mailbox_items_for_prompt(&pending_mailbox_items) {
         messages.push(ChatMessage {
             role: "system".to_string(),
@@ -636,16 +623,11 @@ fn run_conversation_loop_inner(
     let mut completed_required_tool_names: Vec<String> = Vec::new();
     let mut last_stream_item_id: Option<String> = None;
     let mut had_tool_calls = false;
-    let primary_worker_sidechain =
-        worker_id.is_some() && current_turn_has_worker_lanes(session_store, session_id);
     let turn_visibility = task_turn_visibility(
         task,
-        worker_lane_id,
-        worker_lane_seq,
+        is_sidechain,
         worker_id,
         thread_id,
-        orchestrator_thread_id,
-        primary_worker_sidechain,
         agent_role_registry,
     );
 
@@ -875,17 +857,6 @@ fn run_conversation_loop_inner(
                 &turn_visibility,
                 tool_call,
             );
-            publish_worker_lane_summary(
-                event_bus,
-                session_store,
-                task_store,
-                task,
-                session_id,
-                workspace_id,
-                &turn_visibility,
-                "running",
-                &format!("正在调用 {}", tool_call.function.name),
-            );
         }
 
         let tool_results = execute_task_tool_call_batch(
@@ -929,28 +900,6 @@ fn run_conversation_loop_inner(
                 tool_call,
                 &result,
                 tool_status,
-            );
-            let outcome_label = match tool_status {
-                ExecutionResultStatus::Succeeded => "完成",
-                ExecutionResultStatus::Failed => "失败",
-                ExecutionResultStatus::Rejected => "已拒绝",
-                ExecutionResultStatus::NeedsApproval => "待审批",
-                ExecutionResultStatus::Cancelled => "已取消",
-            };
-            publish_worker_lane_summary(
-                event_bus,
-                session_store,
-                task_store,
-                task,
-                session_id,
-                workspace_id,
-                &turn_visibility,
-                if matches!(tool_status, ExecutionResultStatus::Succeeded) {
-                    "running"
-                } else {
-                    "blocked"
-                },
-                &format!("{} {}", tool_call.function.name, outcome_label),
             );
             if !matches!(tool_status, ExecutionResultStatus::Succeeded) {
                 failed_tool_summaries.push(format!(
@@ -1129,17 +1078,6 @@ fn run_conversation_loop_inner(
         streaming_entry_id,
         &turn_visibility,
     );
-    publish_worker_lane_summary(
-        event_bus,
-        session_store,
-        task_store,
-        task,
-        session_id,
-        workspace_id,
-        &turn_visibility,
-        "completed",
-        &summarize_final_for_lane(&final_content),
-    );
 
     // P6b：把本轮 LLM 对话追写进当前 thread 的审计 / 恢复记录。
     // 过滤掉 system 消息（prompt、workspace 上下文、边界标记），只沉淀真实对话
@@ -1301,7 +1239,6 @@ fn mailbox_kind_label(kind: MailboxKind) -> &'static str {
         MailboxKind::Message => "message",
         MailboxKind::Decision => "decision",
         MailboxKind::Interrupt => "interrupt",
-        MailboxKind::AgentResult => "agent_result",
         MailboxKind::Followup => "followup",
     }
 }
@@ -1390,8 +1327,8 @@ fn publish_stream_delta(
         Some(item_id.to_string()),
         turn_visibility.thread_id().clone(),
     );
-    // P2：子任务流式文本归 worker sidechain，主线靠 worker_lane_summary 呈现进度，
-    // 不再让同一条流式内容同时污染主线与 drawer。
+    // 子任务流式文本归 task 详情，主线靠父代理的 agent_spawn ToolCall 卡片呈现进度，
+    // 不再让同一条流式内容同时污染主线与详情页。
     apply_task_worker_detail_visibility(&mut item, task, turn_visibility);
     if let Some(published) =
         upsert_session_turn_item_with_task_store(session_store, session_id, item, Some(task_store))
@@ -1453,84 +1390,6 @@ fn publish_task_thinking_delta(
         trimmed,
         stream_update.as_ref(),
     );
-}
-
-/// 把 worker 最终回复压缩为 dispatch 卡可展示的单行摘要，保持主线信息密度。
-fn summarize_final_for_lane(final_content: &str) -> String {
-    const MAX_LEN: usize = 120;
-    let flat = final_content
-        .split('\n')
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .unwrap_or("")
-        .to_string();
-    if flat.chars().count() <= MAX_LEN {
-        return flat;
-    }
-    let mut truncated: String = flat.chars().take(MAX_LEN - 1).collect();
-    truncated.push('…');
-    truncated
-}
-
-/// 发送一条 thread-visible 的 `worker_status` 摘要 item，作为主线 dispatch 卡的
-/// liveActivity 数据源。前端 projection 已将 `worker_status` 从消息渲染列表过滤
-/// （[turn-projection.ts:241](web/src/stores/turn-projection.ts:241)），它只参与
-/// lane 聚合，不会二次污染主线消息流。
-///
-/// 只有当当前任务属于 worker sidechain（`primary_worker_sidechain` + 带 lane）
-/// 时才写入；其余情形（主线 primary、无 lane）没有 dispatch 卡可消费，跳过。
-fn publish_worker_lane_summary(
-    event_bus: &InMemoryEventBus,
-    session_store: &SessionStore,
-    task_store: &TaskStore,
-    task: &magi_core::Task,
-    session_id: &SessionId,
-    workspace_id: &Option<WorkspaceId>,
-    turn_visibility: &TaskTurnVisibility,
-    status: &str,
-    summary: &str,
-) {
-    let TaskTurnVisibility::Sidechain {
-        orchestrator_thread_id,
-        role_id,
-        worker_id,
-        lane_id,
-        lane_seq,
-        has_mainline_summary,
-        ..
-    } = turn_visibility
-    else {
-        return;
-    };
-    if !has_mainline_summary {
-        return;
-    }
-    let trimmed = summary.trim();
-    if trimmed.is_empty() {
-        return;
-    }
-    // 摘要归属主线 orchestrator thread：前端 projection 按 source_thread_id==
-    // orchestrator 把它投射到主线 dispatch 卡的 liveActivity。同时通过 role_id
-    // + lane_id 让主线知道它来自哪条 sidechain，便于点击"查看 drawer"。
-    let mut item = session_turn_item(
-        "worker_status",
-        status,
-        Some("执行进展".to_string()),
-        Some(trimmed.to_string()),
-        Some(format!("turn-item-worker-lane-summary-{lane_id}")),
-        orchestrator_thread_id.clone(),
-    );
-    item.task_id = Some(task.task_id.clone());
-    item.lane_id = Some(lane_id.clone());
-    item.lane_seq = *lane_seq;
-    item.worker_id = Some(worker_id.clone());
-    item.role_id = Some(role_id.clone());
-    item.source = role_id.clone();
-    if let Some(published) =
-        upsert_session_turn_item_with_task_store(session_store, session_id, item, Some(task_store))
-    {
-        publish_session_turn_item_event(event_bus, session_id, workspace_id, &published);
-    }
 }
 
 fn upsert_task_thinking_turn_item(
@@ -1785,13 +1644,6 @@ fn task_stream_item_id(task_id: &TaskId, round: usize, streaming_entry_id: Optio
     format!("turn-item-assistant-stream-{task_id}-{round}")
 }
 
-fn current_turn_has_worker_lanes(session_store: &SessionStore, session_id: &SessionId) -> bool {
-    session_store
-        .runtime_sidecar(session_id)
-        .and_then(|sidecar| sidecar.current_turn)
-        .is_some_and(|turn| !turn.worker_lanes.is_empty())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1801,9 +1653,8 @@ mod tests {
     };
     use magi_governance::GovernanceService;
     use magi_session_store::{
-        ActiveExecutionTurn, ActiveExecutionTurnLane, CanonicalTurnItemKind,
-        CanonicalTurnItemStatus, CanonicalTurnStatus, ExecutionThread, ExecutionThreadStatus,
-        TimelineEntryKind,
+        ActiveExecutionTurn, CanonicalTurnItemKind, CanonicalTurnItemStatus, CanonicalTurnStatus,
+        ExecutionThread, ExecutionThreadStatus, TimelineEntryKind,
     };
     use magi_tool_runtime::{BuiltinTool, BuiltinToolSpec, ToolExecutionContext};
     use std::{
@@ -2389,11 +2240,9 @@ mod tests {
             tools: None,
             usage_binding: &usage_binding,
             streaming_entry_id: None,
-            worker_lane_id: None,
-            worker_lane_seq: None,
+            is_sidechain: false,
             worker_id: Some(&worker_id),
             thread_id: &thread_id,
-            orchestrator_thread_id: &orchestrator_thread_id,
             context_summary: None,
             system_prompt: None,
             workspace_root_path: None,
@@ -2478,7 +2327,7 @@ mod tests {
                 &task.task_id,
                 &task.root_task_id,
                 &worker_id,
-                "integration-dev",
+                "executor",
                 60_000,
             )
             .expect("lease should be granted");
@@ -2526,11 +2375,9 @@ mod tests {
             tools: None,
             usage_binding: &usage_binding,
             streaming_entry_id: None,
-            worker_lane_id: None,
-            worker_lane_seq: None,
+            is_sidechain: false,
             worker_id: Some(&worker_id),
             thread_id: &thread_id,
-            orchestrator_thread_id: &orchestrator_thread_id,
             context_summary: None,
             system_prompt: None,
             workspace_root_path: None,
@@ -2573,21 +2420,11 @@ mod tests {
     fn task_turn_visibility_does_not_promote_primary_role_to_worker_lane() {
         let task = make_task_loop_test_task("task-primary-role-only");
         let thread_id = ThreadId::new("thread-primary-role-only");
-        let orchestrator_thread_id = thread_id.clone();
 
         let registry = magi_agent_role::AgentRoleRegistry::load_default();
-        let visibility = task_turn_visibility(
-            &task,
-            None,
-            None,
-            None,
-            &thread_id,
-            &orchestrator_thread_id,
-            false,
-            &registry,
-        );
+        let visibility = task_turn_visibility(&task, false, None, &thread_id, &registry);
 
-        // 没有 lane_id + worker_id 配对 → 必须落在 Mainline 分支。
+        // 没有 is_sidechain=true + worker_id 配对 → 必须落在 Mainline 分支。
         assert!(visibility.is_mainline());
         assert_eq!(visibility.thread_id(), &thread_id);
         assert!(visibility.worker_id().is_none());
@@ -2597,20 +2434,11 @@ mod tests {
     fn primary_task_worker_details_move_to_sidechain() {
         let task = make_task_loop_test_task("task-primary-deep-sidechain");
         let worker_id = WorkerId::new("worker-primary-deep-sidechain");
-        let lane_id = "lane-primary-deep-sidechain";
         let worker_thread_id = ThreadId::new("thread-worker-primary-deep-sidechain");
         let orchestrator_thread_id = ThreadId::new("thread-orch-primary-deep-sidechain");
         let registry = magi_agent_role::AgentRoleRegistry::load_default();
-        let visibility = task_turn_visibility(
-            &task,
-            Some(lane_id),
-            Some(1),
-            Some(&worker_id),
-            &worker_thread_id,
-            &orchestrator_thread_id,
-            true,
-            &registry,
-        );
+        let visibility =
+            task_turn_visibility(&task, true, Some(&worker_id), &worker_thread_id, &registry);
         let mut tool_item = session_turn_item(
             "tool_call_started",
             "running",
@@ -2625,10 +2453,9 @@ mod tests {
         // sidechain item 的 source_thread_id 必须切换到 worker thread。
         assert_eq!(tool_item.source_thread_id, worker_thread_id);
         assert_ne!(tool_item.source_thread_id, orchestrator_thread_id);
-        assert_eq!(tool_item.lane_id.as_deref(), Some(lane_id));
         assert_eq!(tool_item.worker_id.as_ref(), Some(&worker_id));
-        assert_eq!(tool_item.role_id.as_deref(), Some("integration-dev"));
-        assert_eq!(tool_item.source, "integration-dev");
+        assert_eq!(tool_item.role_id.as_deref(), Some("executor"));
+        assert_eq!(tool_item.source, "executor");
 
         let mut final_item = session_turn_item(
             "assistant_final",
@@ -2645,28 +2472,19 @@ mod tests {
         assert_eq!(final_item.source_thread_id, worker_thread_id);
         assert_ne!(final_item.source_thread_id, orchestrator_thread_id);
         assert_eq!(final_item.worker_id.as_ref(), Some(&worker_id));
-        assert_eq!(final_item.role_id.as_deref(), Some("integration-dev"));
-        assert_eq!(final_item.source, "integration-dev");
+        assert_eq!(final_item.role_id.as_deref(), Some("executor"));
+        assert_eq!(final_item.source, "executor");
     }
 
     #[test]
-    fn task_turn_visibility_uses_authoritative_worker_lane_from_plan() {
+    fn task_turn_visibility_routes_sidechain_to_worker_thread() {
         let task = make_task_loop_test_task("task-worker-lane-order");
         let worker_id = WorkerId::new("worker-worker-lane-order");
-        let lane_id = "lane-task-worker-lane-order";
         let worker_thread_id = ThreadId::new("thread-worker-worker-lane-order");
         let orchestrator_thread_id = ThreadId::new("thread-orch-worker-lane-order");
         let registry = magi_agent_role::AgentRoleRegistry::load_default();
-        let visibility = task_turn_visibility(
-            &task,
-            Some(lane_id),
-            Some(3),
-            Some(&worker_id),
-            &worker_thread_id,
-            &orchestrator_thread_id,
-            false,
-            &registry,
-        );
+        let visibility =
+            task_turn_visibility(&task, true, Some(&worker_id), &worker_thread_id, &registry);
         let mut item = session_turn_item(
             "assistant_final",
             "completed",
@@ -2680,10 +2498,8 @@ mod tests {
 
         assert_eq!(item.source_thread_id, worker_thread_id);
         assert_ne!(item.source_thread_id, orchestrator_thread_id);
-        assert_eq!(item.lane_id.as_deref(), Some(lane_id));
-        assert_eq!(item.lane_seq, Some(3));
         assert_eq!(item.worker_id.as_ref(), Some(&worker_id));
-        assert_eq!(item.role_id.as_deref(), Some("integration-dev"));
+        assert_eq!(item.role_id.as_deref(), Some("executor"));
     }
 
     #[test]
@@ -2705,7 +2521,6 @@ mod tests {
                     status: "running".to_string(),
                     user_message: Some("执行深度任务".to_string()),
                     items: Vec::new(),
-                    worker_lanes: Vec::new(),
                 },
             )
             .expect("turn should be stored");
@@ -2722,20 +2537,12 @@ mod tests {
         task.status = TaskStatus::Completed;
         task_store.insert_task(task.clone());
         // 该用例验证"root 未完成时不能提前收尾主线 turn"，因此 task 本身走 Mainline 路径：
-        // 不传 lane_id / worker_id，`task_turn_visibility` 会返回 Mainline，
+        // 传 is_sidechain=false，`task_turn_visibility` 会返回 Mainline，
         // 后续 append_task_final_turn_item 的 `is_mainline()` 分支才会被覆盖到。
         let orchestrator_thread_id = ThreadId::new("thread-orch-final-root-running");
         let registry = magi_agent_role::AgentRoleRegistry::load_default();
-        let visibility = task_turn_visibility(
-            &task,
-            None,
-            None,
-            None,
-            &orchestrator_thread_id,
-            &orchestrator_thread_id,
-            false,
-            &registry,
-        );
+        let visibility =
+            task_turn_visibility(&task, false, None, &orchestrator_thread_id, &registry);
 
         append_task_final_turn_item(
             &event_bus,
@@ -2791,7 +2598,6 @@ mod tests {
                     status: "running".to_string(),
                     user_message: Some("验证模型失败写回".to_string()),
                     items: Vec::new(),
-                    worker_lanes: Vec::new(),
                     completed_at: None,
                 },
             )
@@ -2805,7 +2611,7 @@ mod tests {
                 &task.task_id,
                 &task.root_task_id,
                 &worker_id,
-                "integration-dev",
+                "executor",
                 60_000,
             )
             .expect("lease should be granted");
@@ -2847,11 +2653,9 @@ mod tests {
             tools: None,
             usage_binding: &usage_binding,
             streaming_entry_id: Some(streaming_entry_id),
-            worker_lane_id: None,
-            worker_lane_seq: None,
+            is_sidechain: false,
             worker_id: None,
             thread_id: &thread_id,
-            orchestrator_thread_id: &orchestrator_thread_id,
             context_summary: None,
             system_prompt: None,
             workspace_root_path: None,
@@ -2940,7 +2744,6 @@ mod tests {
         let workspace_id = Some(WorkspaceId::new("workspace-task-tool-batch"));
         let task_id = TaskId::new("task-tool-batch");
         let worker_id = WorkerId::new("worker-task-tool-batch");
-        let lane_id = "lane-task-tool-batch".to_string();
         session_store
             .create_session_for_workspace(
                 session_id.clone(),
@@ -2952,12 +2755,11 @@ mod tests {
         let task = make_task_loop_test_task(task_id.as_str());
         task_store.insert_task(task.clone());
         let now = UtcMillis::now();
-        let (_, orchestrator_thread_id) =
+        let (_, _orchestrator_thread_id) =
             session_store.ensure_session_mission(&session_id, now, || task.mission_id.clone());
-        // worker lane 必须绑定到本 task 独占的 worker thread；历史 thread 只做审计，
-        // 不能复用为新的执行上下文。
+        // 子任务必须绑定到本 task 独占的执行 thread；历史 thread 只做审计，不能复用为新的执行上下文。
         let worker_thread_id = {
-            let role_id = "integration-dev";
+            let role_id = "executor";
             let new_thread = ExecutionThread {
                 thread_id: ThreadId::new(format!(
                     "thread-{role_id}-{}-{}",
@@ -2988,16 +2790,6 @@ mod tests {
                     status: "running".to_string(),
                     user_message: Some("验证 worker 工具并发".to_string()),
                     items: Vec::new(),
-                    worker_lanes: vec![ActiveExecutionTurnLane {
-                        lane_id: lane_id.clone(),
-                        lane_seq: 2,
-                        task_id: task_id.clone(),
-                        worker_id: worker_id.clone(),
-                        role_id: "integration-dev".to_string(),
-                        thread_id: worker_thread_id.clone(),
-                        title: "验证 worker 工具并发".to_string(),
-                        is_primary: false,
-                    }],
                     completed_at: None,
                 },
             )
@@ -3008,7 +2800,7 @@ mod tests {
                 &task.task_id,
                 &task.root_task_id,
                 &worker_id,
-                "integration-dev",
+                "executor",
                 60_000,
             )
             .expect("lease should be granted");
@@ -3060,11 +2852,9 @@ mod tests {
             tools: None,
             usage_binding: &usage_binding,
             streaming_entry_id: Some("timeline-streaming-task-tool-batch"),
-            worker_lane_id: Some(&lane_id),
-            worker_lane_seq: Some(2),
+            is_sidechain: true,
             worker_id: Some(&worker_id),
             thread_id: &worker_thread_id,
-            orchestrator_thread_id: &orchestrator_thread_id,
             context_summary: None,
             system_prompt: None,
             workspace_root_path: None,
@@ -3095,16 +2885,10 @@ mod tests {
         let turn = sidecar.current_turn.expect("turn should exist");
         assert!(
             turn.items.iter().all(|item| {
-                // Sidechain item 的 source_thread_id 必须切换到 worker thread；
-                // 主线摘要 (`worker_status`) 再次落回 orchestrator thread。
-                let routed_to_worker = item.source_thread_id == worker_thread_id
-                    && item.lane_id.as_deref() == Some(lane_id.as_str())
-                    && item.lane_seq == Some(2);
-                let routed_to_main =
-                    item.source_thread_id == orchestrator_thread_id && item.kind == "worker_status";
-                routed_to_worker || routed_to_main
+                // Sidechain item 的 source_thread_id 必须切换到 worker thread。
+                item.source_thread_id == worker_thread_id
             }),
-            "worker 输出必须沿用执行计划中的 lane 归属与顺序"
+            "worker 输出必须沿用执行计划中的 sidechain 归属"
         );
         assert_eq!(
             turn.items
@@ -3113,9 +2897,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 ("tool_call_result", Some("task-tool-shell-a")),
-                // P2：每次 tool_call_result 会追加一条 `worker_status` 摘要 item，
-                // 作为主线 dispatch 卡的 liveActivity 数据源。摘要不挂 tool_call_id。
-                ("worker_status", None),
                 ("tool_call_result", Some("task-tool-shell-b")),
                 ("assistant_final", None),
             ]

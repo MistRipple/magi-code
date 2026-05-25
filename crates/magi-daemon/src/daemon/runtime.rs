@@ -726,11 +726,6 @@ impl DaemonRuntime {
             }
             Ok(TaskDispatchGateDecision::Allow)
         }))
-        .with_child_result_route(
-            state.session_store.clone(),
-            state.conversation_registry.clone(),
-            state.spawn_graph.clone(),
-        )
         .with_checkpoint_path(task_store_checkpoint_path)
         .with_terminal_observer(move |root_task_id, session_id, status| {
             let Some(session_id) = session_id else {
@@ -1080,9 +1075,9 @@ fn push_terminal_task_result(
             });
         }
         _ => {
-            // Non-terminal: clear the dedup entry so the task can produce a
-            // new result after re-dispatch (e.g. after lease expiry reset).
-            receiver.clear_seen(task_id);
+            // 非终态重置代表任务将重新派发；必须清掉旧终态结果，避免 runner
+            // 下一轮先消费陈旧失败/完成事件。
+            receiver.clear_task_result_state(task_id);
         }
     }
 }

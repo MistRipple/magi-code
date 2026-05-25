@@ -243,66 +243,6 @@ export interface PlanBlock {
   rawJson?: string;
 }
 
-export type WorkerLaneStatus =
-  | 'pending'
-  | 'running'
-  | 'blocked'
-  | 'awaiting_approval'
-  | 'review_required'
-  | 'completed'
-  | 'failed'
-  | 'cancelled';
-
-export interface WorkerLaneProgressSummary {
-  completedTaskCount?: number;
-  totalTaskCount?: number;
-  blockedTaskCount?: number;
-  awaitingApprovalTaskCount?: number;
-  reviewRequiredTaskCount?: number;
-}
-
-export interface WorkerLaneTaskItem {
-  taskId?: string;
-  title: string;
-  status: WorkerLaneStatus;
-  isCurrent?: boolean;
-  seq?: number;
-}
-
-export interface WorkerLaneBlock {
-  laneId: string;
-  laneVersion: number;
-  worker: string;
-  title: string;
-  description?: string;
-  status: WorkerLaneStatus;
-  startedAt?: number;
-  endedAt?: number;
-  liveActivity?: string;
-  toolUseCount?: number;
-  progressSummary?: WorkerLaneProgressSummary;
-  tasks?: WorkerLaneTaskItem[];
-  summary?: string;
-  fileChangeCount?: number;
-  jumpTarget?: { workerTabId: string };
-}
-
-export type DispatchGroupStatus =
-  | 'pending'
-  | 'running'
-  | 'completed'
-  | 'failed'
-  | 'cancelled';
-
-export interface DispatchGroupBlock {
-  type: 'dispatch_group';
-  blockId: string;
-  dispatchWaveId: string;
-  status: DispatchGroupStatus;
-  summaryText?: string;
-  lanes: WorkerLaneBlock[];
-}
-
 export type ContentBlock =
   | TextBlock
   | CodeBlock
@@ -310,8 +250,7 @@ export type ContentBlock =
   | ToolCallBlock
   | ToolResultBlock
   | FileChangeBlock
-  | PlanBlock
-  | DispatchGroupBlock;
+  | PlanBlock;
 
 // ============================================================================
 // 交互请求类型
@@ -389,8 +328,6 @@ export interface MessageMetadata {
   workerId?: string;
   roleId?: string;
   dispatchToWorker?: boolean;
-  dispatchWaveId?: string;
-  laneId?: string;
   laneIndex?: number;
   laneTotal?: number;
   laneTaskIds?: string[];
@@ -432,7 +369,6 @@ export interface MessageMetadata {
   turnItemId?: string;
   turnItemKind?: string;
   itemSeq?: number;
-  laneSeq?: number;
   rustStreamItemId?: string;
   rustEventItemId?: string;
   eventId?: string;
