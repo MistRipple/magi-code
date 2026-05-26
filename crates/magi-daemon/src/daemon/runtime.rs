@@ -98,6 +98,22 @@ struct SettingsBackedBusinessModelBridgeClient {
     bridge_env: Vec<(String, String)>,
 }
 
+struct OpenAiCompatEnvConfig {
+    base_url: String,
+    api_key: Option<String>,
+    model: String,
+}
+
+fn orchestrator_settings_is_configured(value: &serde_json::Value) -> bool {
+    let field_is_present = |key: &str| {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|text| !text.trim().is_empty())
+    };
+    field_is_present("baseUrl") && field_is_present("model")
+}
+
 impl SettingsBackedBusinessModelBridgeClient {
     fn new(state_root: PathBuf, bridge_env: &[(&str, &str)]) -> Self {
         Self {
@@ -445,6 +461,7 @@ impl DaemonRuntime {
         if let Err(error) = settings_store.load_from_disk() {
             warn!(error = %error, "设置文件加载失败，使用空默认值");
         }
+        Self::seed_orchestrator_settings_from_env_if_empty(&settings_store, bridge_env);
 
         // 业务模型桥用于会话正文生成和任务执行；任务规划/分类另走本地 loopback-model。
         //
@@ -483,10 +500,14 @@ impl DaemonRuntime {
                             bridge_env,
                         ))
                     } else {
-                        warn!(
-                            state_root = %self.state_root.display(),
-                            "业务模型桥未配置，已退化为本地 loopback（仅用于开发/测试，生产请配置 MAGI_OPENAI_COMPAT_BASE_URL）"
-                        );
+                        if !orchestrator_settings_is_configured(
+                            &settings_store.get_section("orchestrator"),
+                        ) {
+                            warn!(
+                                state_root = %self.state_root.display(),
+                                "业务模型桥未配置，已退化为本地 loopback（仅用于开发/测试，生产请配置主模型或 MAGI_OPENAI_COMPAT_BASE_URL）"
+                            );
+                        }
                         Arc::new(JsonRpcModelBridgeClient::new(model_transport.clone()))
                     }
                 }
@@ -570,7 +591,11 @@ impl DaemonRuntime {
                 )))
             }
         };
-        self.reconcile_stale_session_task_chains(task_store.as_ref());
+        if self.reconcile_stale_session_task_chains(task_store.as_ref()) > 0
+            && let Err(error) = task_store.checkpoint_to_file(&task_store_checkpoint_path)
+        {
+            warn!(?error, "收敛重启遗留任务状态后持久化 task-store 失败");
+        }
         // 单一事实源：dispatch summary（execution_runtime）与 prompt 注入（LlmTaskDispatcher）
         // 使用同一份 ContextBudget。max_memory ≥ 一批 session-memory 的 slice 数（=5），
         // 否则辅助模型提取的 5 条 slice 会被预算切断、只投放前两条进 prompt。
@@ -757,7 +782,8 @@ impl DaemonRuntime {
         state
     }
 
-    fn reconcile_stale_session_task_chains(&self, task_store: &TaskStore) {
+    fn reconcile_stale_session_task_chains(&self, task_store: &TaskStore) -> usize {
+        let interrupted_task_count = self.fail_interrupted_session_task_chains(task_store);
         let stale_sidecars = self
             .session_store
             .runtime_sidecars()
@@ -779,7 +805,16 @@ impl DaemonRuntime {
             // 即便没有 stale chain，也要扫一遍 chain 缺失但 current_turn 非终态的 sidecar，
             // 防止 daemon 重启后这些孤立轮次让前端误判会话仍在执行。
             self.cancel_orphan_non_terminal_current_turns();
-            return;
+            if interrupted_task_count > 0 {
+                self.flush_reconciled_runtime_sidecars(
+                    "收敛重启遗留的 session task chain 后持久化 sidecar 失败",
+                );
+                warn!(
+                    interrupted_task_count,
+                    "已将 daemon 重启遗留的执行中任务收口为可恢复状态"
+                );
+            }
+            return interrupted_task_count;
         }
 
         let stale_count = stale_sidecars.len();
@@ -820,6 +855,60 @@ impl DaemonRuntime {
         // chain 已经清理完，再统一处理 chain 缺失但 current_turn 仍非终态的 sidecar。
         self.cancel_orphan_non_terminal_current_turns();
 
+        self.flush_reconciled_runtime_sidecars("清理失效 session task chain 后持久化 sidecar 失败");
+        warn!(
+            stale_count,
+            interrupted_task_count, "已清理指向缺失 root task 的 session task chain"
+        );
+        interrupted_task_count
+    }
+
+    fn fail_interrupted_session_task_chains(&self, task_store: &TaskStore) -> usize {
+        let root_task_ids = self
+            .session_store
+            .runtime_sidecars()
+            .into_iter()
+            .filter_map(|sidecar| {
+                let chain = sidecar.active_execution_chain?;
+                let root_task = task_store.get_task(&chain.root_task_id)?;
+                if matches!(root_task.status, TaskStatus::Completed | TaskStatus::Killed) {
+                    return None;
+                }
+                let turn_is_active = sidecar
+                    .current_turn
+                    .as_ref()
+                    .is_some_and(|turn| !current_turn_status_is_terminal(&turn.status));
+                let has_in_memory_task = task_store
+                    .collect_subtree_ids(&chain.root_task_id)
+                    .into_iter()
+                    .any(|task_id| {
+                        task_store.get_task(&task_id).is_some_and(|task| {
+                            matches!(task.status, TaskStatus::Pending | TaskStatus::Running)
+                        })
+                    });
+                (turn_is_active || has_in_memory_task).then_some(chain.root_task_id)
+            })
+            .collect::<HashSet<_>>();
+
+        let mut failed_count = 0usize;
+        for root_task_id in root_task_ids {
+            for task_id in task_store.collect_subtree_ids(&root_task_id) {
+                let Some(task) = task_store.get_task(&task_id) else {
+                    continue;
+                };
+                if matches!(task.status, TaskStatus::Pending | TaskStatus::Running)
+                    && task_store
+                        .update_status(&task_id, TaskStatus::Failed)
+                        .is_ok()
+                {
+                    failed_count += 1;
+                }
+            }
+        }
+        failed_count
+    }
+
+    fn flush_reconciled_runtime_sidecars(&self, warning: &'static str) {
         let repository = StateRepository::new(self.state_root.clone());
         let persistence = RuntimeSidecarPersistence::new(
             repository,
@@ -828,12 +917,8 @@ impl DaemonRuntime {
             self.worker_runtime.clone(),
         );
         if let Err(error) = persistence.flush_runtime_sidecars() {
-            warn!(?error, "清理失效 session task chain 后持久化 sidecar 失败");
+            warn!(?error, warning);
         }
-        warn!(
-            stale_count,
-            "已清理指向缺失 root task 的 session task chain"
-        );
     }
 
     /// daemon 重启后兜底清理：任何 sidecar 若失去 active_execution_chain 但
@@ -1001,6 +1086,46 @@ impl DaemonRuntime {
     fn try_build_http_model_client(
         bridge_env: &[(&str, &str)],
     ) -> Option<(HttpModelBridgeClient, DirectHttpModelProbeConfig)> {
+        let config = Self::openai_compat_env_config(bridge_env)?;
+        let base_url = config.base_url;
+        let api_key = config.api_key;
+        let model = config.model;
+        let protocol = HttpModelBridgeProtocol::ChatCompletions;
+
+        let probe_config = DirectHttpModelProbeConfig {
+            base_url: base_url.clone(),
+            api_key: api_key.clone(),
+            model: model.clone(),
+        };
+        Some((
+            HttpModelBridgeClient::new_with_protocol(base_url, api_key, model, protocol, None),
+            probe_config,
+        ))
+    }
+
+    fn seed_orchestrator_settings_from_env_if_empty(
+        settings_store: &Arc<SettingsStore>,
+        bridge_env: &[(&str, &str)],
+    ) {
+        if orchestrator_settings_is_configured(&settings_store.get_section("orchestrator")) {
+            return;
+        }
+        let Some(config) = Self::openai_compat_env_config(bridge_env) else {
+            return;
+        };
+        let mut section = serde_json::json!({
+            "baseUrl": config.base_url,
+            "model": config.model,
+            "urlMode": "standard",
+            "reasoningEffort": "medium"
+        });
+        if let Some(api_key) = config.api_key {
+            section["apiKey"] = serde_json::Value::String(api_key);
+        }
+        settings_store.set_section("orchestrator", section);
+    }
+
+    fn openai_compat_env_config(bridge_env: &[(&str, &str)]) -> Option<OpenAiCompatEnvConfig> {
         let find_env = |key: &str| -> Option<String> {
             bridge_env
                 .iter()
@@ -1015,20 +1140,11 @@ impl DaemonRuntime {
                 })
         };
 
-        let base_url = find_env("MAGI_OPENAI_COMPAT_BASE_URL")?;
-        let api_key = find_env("MAGI_OPENAI_COMPAT_API_KEY");
-        let model = find_env("MAGI_OPENAI_COMPAT_MODEL").unwrap_or_else(|| "gpt-4".to_string());
-        let protocol = HttpModelBridgeProtocol::ChatCompletions;
-
-        let probe_config = DirectHttpModelProbeConfig {
-            base_url: base_url.clone(),
-            api_key: api_key.clone(),
-            model: model.clone(),
-        };
-        Some((
-            HttpModelBridgeClient::new_with_protocol(base_url, api_key, model, protocol, None),
-            probe_config,
-        ))
+        Some(OpenAiCompatEnvConfig {
+            base_url: find_env("MAGI_OPENAI_COMPAT_BASE_URL")?,
+            api_key: find_env("MAGI_OPENAI_COMPAT_API_KEY"),
+            model: find_env("MAGI_OPENAI_COMPAT_MODEL").unwrap_or_else(|| "gpt-4".to_string()),
+        })
     }
 
     fn bridge_loopback_executable(binary_name: &str) -> String {
@@ -2298,6 +2414,36 @@ mod tests {
             "loopback-mcp-observability"
         );
         assert_eq!(mcp["mcp_default_route_gate"]["contract_ok"], true);
+    }
+
+    #[tokio::test]
+    async fn daemon_router_settings_bootstrap_exposes_env_seeded_orchestrator_config() {
+        let state_root = temp_state_root("router-settings-bootstrap-env-model");
+        let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
+        let runtime =
+            DaemonRuntime::restore(&config).expect("runtime restore should bootstrap empty state");
+        let (app, state) = runtime.router_with_bridge_env_for_tests(
+            "daemon-test".to_string(),
+            &[
+                ("MAGI_OPENAI_COMPAT_BASE_URL", "http://127.0.0.1:8317/v1"),
+                ("MAGI_OPENAI_COMPAT_API_KEY", "test-key"),
+                ("MAGI_OPENAI_COMPAT_MODEL", "gpt-test"),
+            ],
+        );
+
+        let bootstrap = get_json(app, "/api/settings/bootstrap?scope=core").await;
+
+        assert_eq!(
+            bootstrap["orchestratorConfig"]["baseUrl"],
+            json!("http://127.0.0.1:8317/v1")
+        );
+        assert_eq!(bootstrap["orchestratorConfig"]["apiKey"], json!("test-key"));
+        assert_eq!(bootstrap["orchestratorConfig"]["model"], json!("gpt-test"));
+        assert_eq!(
+            state.settings_store.get_section("orchestrator")["model"],
+            json!("gpt-test"),
+            "环境模型必须在启动期进入 settings store，避免前端另走一条配置读取链路"
+        );
     }
 
     #[tokio::test]

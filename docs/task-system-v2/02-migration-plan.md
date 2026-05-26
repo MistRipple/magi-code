@@ -31,17 +31,18 @@ v2 只保留一个设计主线：
 - `dispatch_submission` 创建 root task、execution chain、task thread。
 - TaskRunner 推进 pending/running/terminal 状态、lease 和结果回收。
 - task-level Conversation 承载 Turn/Mailbox。
-- `agent_spawn` 作为主编排工具进入工具层，并以同步 `tool_call_result` 回写父 turn。
+- `agent_spawn` 作为主编排工具进入工具层，负责创建代理并投递初始任务消息；`agent_wait` 负责收集代理终态结果。
 - SpawnGraph 使用 `TaskId` 做父子拓扑。
 - Tier 4 stores 已有文件化记录、工具写入和 prompt 注入。
 
-需要收敛的点：
+已收敛的关键点：
 
-- HumanCheckpoint 还需要 runtime 硬阻塞。
-- Validation 还需要接入 Plan 完成门槛。
-- Checkpoint 还需要从摘要日志升级为恢复协议。
-- MissionCharter 还需要生命周期。
-- Long Mission 激活条件还需要显式业务语义。
+- HumanCheckpoint pending 由 runtime 硬阻塞。
+- Validation 已接入 Plan 完成门槛。
+- Checkpoint 已从摘要日志升级为恢复协议。
+- MissionCharter 已具备 `draft / frozen` 生命周期。
+- Long Mission 激活条件已收敛为显式 `TaskTier::LongMission`。
+- 代理协作已收敛为 `agent_spawn` 创建代理、`agent_wait` 收集终态结果，前端以主线工具卡片 + 右侧代理 tab 展示。
 
 ## 3. 推进顺序
 

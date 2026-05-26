@@ -3,7 +3,7 @@
 //! - `execute_task_tool_call_batch`：按 concurrency 分组并发或串行调度本轮工具。
 //! - `execute_task_tool_call`：单工具入口，按 BuiltinToolName 走 coordinator/写工具/policy/
 //!   safety gate/tool registry 各分支。
-//! - `execute_coordinator_tool`：协调器工具（agent_spawn）入口。
+//! - `execute_coordinator_tool`：协调器工具（agent_spawn / agent_wait）入口。
 //! - `task_policy_tool_rejection` / `safety_gate_rejection` 等支撑判定。
 
 use std::{
@@ -21,7 +21,7 @@ use magi_bridge_client::{
 };
 use magi_core::{
     ApprovalRequirement, EventId, ExecutionResultStatus, RiskLevel, SessionId, TaskId, TaskKind,
-    TaskStatus, ToolCallId, UtcMillis, WorkspaceId,
+    TaskPolicy, TaskStatus, TaskTier, ToolCallId, UtcMillis, WorkspaceId,
 };
 use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
 use magi_governance::ToolKind;
@@ -34,7 +34,7 @@ use magi_tool_runtime::{
 use crate::builtin_tool_schema::internal_builtin_tool_rejection_payload;
 use crate::skill_apply_tool::{SKILL_APPLY_TOOL_NAME, execute_skill_apply_from_runtime};
 use crate::{
-    ConversationRegistry,
+    ConversationRegistry, MailboxAuthor, MailboxKind, RuntimeSignal,
     task_execution_registry::{SpawnedChildExecutionRequest, TaskExecutionRegistry},
     task_helpers::{task_can_see_builtin_tool, task_is_long_mission},
 };
@@ -46,6 +46,50 @@ use crate::{
 /// 末尾，保证同一进程内绝对唯一。
 static AGENT_SPAWN_SEQ: AtomicU64 = AtomicU64::new(0);
 const AGENT_SPAWN_SUMMARY_MAX_CHARS: usize = 1200;
+const AGENT_SPAWN_FINAL_TEXT_MAX_CHARS: usize = 6000;
+const AGENT_WAIT_POLL_INTERVAL_MS: u64 = 100;
+const AGENT_WAIT_DEFAULT_TIMEOUT_MS: u64 = 300_000;
+const AGENT_WAIT_MIN_TIMEOUT_MS: u64 = 1_000;
+const AGENT_WAIT_MAX_TIMEOUT_MS: u64 = 1_800_000;
+const AGENT_ROLE_IDS: &[&str] = &["architect", "executor", "explorer", "reviewer", "tester"];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AgentSpawnAccessMode {
+    ReadOnly,
+    ReadWrite,
+}
+
+impl AgentSpawnAccessMode {
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "read_only" | "readonly" | "read-only" | "read" => Some(Self::ReadOnly),
+            "read_write" | "readwrite" | "read-write" | "write" | "full" => Some(Self::ReadWrite),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read_only",
+            Self::ReadWrite => "read_write",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AgentSpawnParameterContract {
+    role: Option<String>,
+    display_name: String,
+    access_mode: Option<AgentSpawnAccessMode>,
+    goal: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ChildAgentOutput {
+    summary: String,
+    final_text: String,
+    truncated: bool,
+}
 
 #[allow(clippy::too_many_arguments)]
 pub fn execute_task_tool_call_batch(
@@ -210,6 +254,7 @@ fn execute_coordinator_tool(
     task_store: &TaskStore,
     session_store: &SessionStore,
     execution_registry: &TaskExecutionRegistry,
+    conversation_registry: &ConversationRegistry,
     spawn_graph: &Mutex<magi_spawn_graph::SpawnGraph>,
     human_checkpoint: Option<&magi_human_checkpoint::HumanCheckpointStore>,
     task: &magi_core::Task,
@@ -290,24 +335,68 @@ fn execute_coordinator_tool(
                     }
                 }
             }
-            let role = parsed
+            let requested_role = parsed
                 .get("role")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .trim()
                 .to_string();
-            let goal = parsed
+            let requested_goal = parsed
                 .get("goal")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .trim()
                 .to_string();
-            if role.is_empty() || goal.is_empty() {
+            if requested_role.is_empty() || requested_goal.is_empty() {
                 return (
                     serde_json::json!({
                         "tool": tool.as_str(),
                         "status": "failed",
                         "error": "agent_spawn 缺少必需字段 role 或 goal",
+                    })
+                    .to_string(),
+                    ExecutionResultStatus::Failed,
+                );
+            }
+            // display_name 是 LLM 提供的代理展示名，作为 Task.title 直接面向用户。
+            // 长度限制 3-30 个 Unicode 字符：下限 3 既能拒绝『x』『ab』之类的占位符，
+            // 又允许典型 4 字中文短语（如『探索目录』『统计行数』）这一最自然的命名密度；
+            // 上限 30 防止破坏前端代理卡片版式。
+            let requested_display_name = parsed
+                .get("display_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let parameter_contract = current_turn_user_message(session_store, session_id)
+                .as_deref()
+                .and_then(|message| {
+                    select_agent_spawn_parameter_contract(
+                        message,
+                        &requested_role,
+                        &requested_display_name,
+                        &requested_goal,
+                    )
+                });
+            let role = parameter_contract
+                .as_ref()
+                .and_then(|contract| contract.role.clone())
+                .unwrap_or(requested_role);
+            let goal = parameter_contract
+                .as_ref()
+                .and_then(|contract| contract.goal.clone())
+                .unwrap_or(requested_goal);
+            let display_name = parameter_contract
+                .as_ref()
+                .map(|contract| contract.display_name.clone())
+                .unwrap_or(requested_display_name);
+            let display_name_chars = display_name.chars().count();
+            if display_name.is_empty() {
+                return (
+                    serde_json::json!({
+                        "tool": tool.as_str(),
+                        "status": "failed",
+                        "error": "agent_spawn 缺少必需字段 display_name",
                     })
                     .to_string(),
                     ExecutionResultStatus::Failed,
@@ -326,28 +415,6 @@ fn execute_coordinator_tool(
                     })
                     .to_string(),
                     ExecutionResultStatus::Succeeded,
-                );
-            }
-            // display_name 是 LLM 提供的代理展示名，作为 Task.title 直接面向用户。
-            // 长度限制 3-30 个 Unicode 字符：下限 3 既能拒绝『x』『ab』之类的占位符，
-            // 又允许典型 4 字中文短语（如『探索目录』『统计行数』）这一最自然的命名密度；
-            // 上限 30 防止破坏前端代理卡片版式。
-            let display_name = parsed
-                .get("display_name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            let display_name_chars = display_name.chars().count();
-            if display_name.is_empty() {
-                return (
-                    serde_json::json!({
-                        "tool": tool.as_str(),
-                        "status": "failed",
-                        "error": "agent_spawn 缺少必需字段 display_name",
-                    })
-                    .to_string(),
-                    ExecutionResultStatus::Failed,
                 );
             }
             if !(3..=30).contains(&display_name_chars) {
@@ -372,6 +439,27 @@ fn execute_coordinator_tool(
                 Some(context) if context != goal => format!("{goal}\n\n上下文：{context}"),
                 _ => goal.clone(),
             };
+            let access_mode = match parsed.get("access_mode").and_then(|v| v.as_str()) {
+                Some(value) => match AgentSpawnAccessMode::parse(value) {
+                    Some(mode) => mode,
+                    None => {
+                        return (
+                            serde_json::json!({
+                                "tool": tool.as_str(),
+                                "status": "failed",
+                                "error": "agent_spawn access_mode 只能是 read_only 或 read_write",
+                            })
+                            .to_string(),
+                            ExecutionResultStatus::Failed,
+                        );
+                    }
+                },
+                None => default_agent_spawn_access_mode(&role),
+            };
+            let access_mode = parameter_contract
+                .as_ref()
+                .and_then(|contract| contract.access_mode)
+                .unwrap_or(access_mode);
             let task_kind = parsed
                 .get("task_kind")
                 .and_then(|v| v.as_str())
@@ -396,6 +484,8 @@ fn execute_coordinator_tool(
                 now.0,
                 seq
             ));
+            let child_policy_snapshot =
+                agent_spawn_child_policy_snapshot(task.policy_snapshot.as_ref(), access_mode);
             let child = magi_core::Task {
                 task_id: child_id.clone(),
                 mission_id: task.mission_id.clone(),
@@ -407,9 +497,10 @@ fn execute_coordinator_tool(
                 status: TaskStatus::Pending,
                 dependency_ids: Vec::new(),
                 required_children: Vec::new(),
-                policy_snapshot: task.policy_snapshot.clone(),
+                policy_snapshot: Some(child_policy_snapshot),
                 executor_binding: Some(serde_json::json!({
                     "target_role": role,
+                    "access_mode": access_mode.as_str(),
                     "capability_requirements": [],
                     "parallelism_group": parsed
                         .get("parallelism_group")
@@ -459,6 +550,7 @@ fn execute_coordinator_tool(
                     "parent_task_id": task.task_id.to_string(),
                     "child_task_id": child_id.to_string(),
                     "role": role,
+                    "access_mode": access_mode.as_str(),
                     "goal": goal,
                     "task_kind": format!("{:?}", task_kind),
                     "worker_id": registered_execution.worker_id.to_string(),
@@ -466,129 +558,471 @@ fn execute_coordinator_tool(
                     "execution_chain_ref": registered_execution.execution_chain_ref,
                 }),
             );
+            enqueue_agent_assignment_message(
+                conversation_registry,
+                session_id,
+                task,
+                &child,
+                &role,
+                now,
+            );
 
-            // 同步阻塞：父代理本轮停在该 tool call 上，等待代理终态。
-            // 后台 TaskRunner 调度线程独立运行，会持续派发本子任务到 worker；
-            // 子任务终态由 TaskRunner.apply_results 写入 TaskStore，本线程在此轮询读取。
-            wait_for_child_terminal_outcome(task_store, &child_id, tool, &role)
+            (
+                serde_json::json!({
+                    "tool": tool.as_str(),
+                    "status": "started",
+                    "child_task_id": child_id.to_string(),
+                    "role": role,
+                    "access_mode": access_mode.as_str(),
+                    "title": child.title,
+                    "assignment": {
+                        "title": child.title,
+                        "goal": child.goal,
+                        "role": role,
+                        "access_mode": access_mode.as_str(),
+                    },
+                    "worker_id": registered_execution.worker_id.to_string(),
+                    "thread_id": registered_execution.thread_id.to_string(),
+                    "execution_chain_ref": registered_execution.execution_chain_ref,
+                    "instruction": "代理已异步启动。若后续结论依赖该代理结果，必须调用 agent_wait，并传入 child_task_id 收集终态结果；不要在未等待必要代理结果时直接给最终答复。",
+                })
+                .to_string(),
+                ExecutionResultStatus::Succeeded,
+            )
         }
-        _ => unreachable!("execute_coordinator_tool 只接收 AgentSpawn 变体"),
+        magi_tool_runtime::BuiltinToolName::AgentWait => {
+            execute_agent_wait(task_store, tool, &parsed)
+        }
+        _ => unreachable!("execute_coordinator_tool 只接收协调器代理工具变体"),
     }
 }
 
-/// 父代理在本线程同步阻塞至子任务进入 Completed / Failed / Killed 终态，
-/// 把 TaskStore 中写下的 output_refs 直接打包成 tool_call_result 返回。
-///
-/// - 不再依赖 mailbox 旁路信号或 Conversation 重新发起轮次；
-/// - TaskRunner 后台线程独立运行，本线程阻塞不影响其调度；
-/// - 父任务的租约由 TaskRunner.heartbeat 持续续期，不会因等待过期。
-fn wait_for_child_terminal_outcome(
-    task_store: &TaskStore,
-    child_id: &TaskId,
-    tool: magi_tool_runtime::BuiltinToolName,
+fn current_turn_user_message(
+    session_store: &SessionStore,
+    session_id: &SessionId,
+) -> Option<String> {
+    session_store
+        .active_execution_chain(session_id)
+        .and_then(|chain| chain.current_turn)
+        .and_then(|turn| turn.user_message)
+        .map(|message| message.trim().to_string())
+        .filter(|message| !message.is_empty())
+}
+
+fn select_agent_spawn_parameter_contract(
+    user_message: &str,
+    requested_role: &str,
+    requested_display_name: &str,
+    requested_goal: &str,
+) -> Option<AgentSpawnParameterContract> {
+    parse_agent_spawn_parameter_contracts(user_message)
+        .into_iter()
+        .filter_map(|contract| {
+            let score = score_agent_spawn_parameter_contract(
+                &contract,
+                requested_role,
+                requested_display_name,
+                requested_goal,
+            );
+            (score >= 4).then_some((score, contract))
+        })
+        .max_by_key(|(score, _)| *score)
+        .map(|(_, contract)| contract)
+}
+
+fn parse_agent_spawn_parameter_contracts(user_message: &str) -> Vec<AgentSpawnParameterContract> {
+    user_message
+        .match_indices("display_name")
+        .filter_map(|(index, _)| {
+            let display_name =
+                extract_display_name_after(&user_message[index + "display_name".len()..])?;
+            Some(AgentSpawnParameterContract {
+                role: extract_contract_role(user_message, index),
+                display_name,
+                access_mode: extract_contract_access_mode(user_message, index),
+                goal: extract_contract_goal(user_message, index),
+            })
+        })
+        .collect()
+}
+
+fn extract_display_name_after(value: &str) -> Option<String> {
+    let trimmed = value.trim_start_matches(|ch: char| {
+        ch.is_whitespace() || matches!(ch, '=' | ':' | '：' | '`' | '"' | '\'' | '为')
+    });
+    if let Some(rest) = trimmed.strip_prefix('「') {
+        return rest
+            .split_once('」')
+            .map(|(name, _)| name.trim().to_string())
+            .filter(|name| !name.is_empty());
+    }
+    let display_name = trimmed
+        .chars()
+        .take_while(|ch| !matches!(ch, ',' | '，' | ';' | '；' | '。' | '\n' | '\r'))
+        .collect::<String>()
+        .trim_matches(|ch: char| ch.is_whitespace() || matches!(ch, '"' | '\'' | '`'))
+        .trim()
+        .to_string();
+    (!display_name.is_empty()).then_some(display_name)
+}
+
+fn extract_contract_role(user_message: &str, index: usize) -> Option<String> {
+    let window = surrounding_text_window(user_message, index, 120, 40).to_ascii_lowercase();
+    AGENT_ROLE_IDS
+        .iter()
+        .filter_map(|role| window.rfind(role).map(|pos| (pos, *role)))
+        .max_by_key(|(pos, _)| *pos)
+        .map(|(_, role)| role.to_string())
+}
+
+fn extract_contract_access_mode(user_message: &str, index: usize) -> Option<AgentSpawnAccessMode> {
+    let window = surrounding_text_window(user_message, index, 20, 180).to_ascii_lowercase();
+    if window.contains("read_only") || window.contains("readonly") || window.contains("read-only") {
+        Some(AgentSpawnAccessMode::ReadOnly)
+    } else if window.contains("read_write")
+        || window.contains("readwrite")
+        || window.contains("read-write")
+    {
+        Some(AgentSpawnAccessMode::ReadWrite)
+    } else {
+        None
+    }
+}
+
+fn extract_contract_goal(user_message: &str, index: usize) -> Option<String> {
+    let window = surrounding_text_window(user_message, index, 0, 260);
+    let goal_start = window
+        .find("目标：")
+        .map(|pos| pos + "目标：".len())
+        .or_else(|| window.find("目标:").map(|pos| pos + "目标:".len()))?;
+    let goal = window[goal_start..]
+        .chars()
+        .take_while(|ch| !matches!(ch, '；' | ';' | '。' | '\n' | '\r'))
+        .collect::<String>()
+        .trim()
+        .to_string();
+    (!goal.is_empty()).then_some(goal)
+}
+
+fn surrounding_text_window(
+    value: &str,
+    index: usize,
+    before_chars: usize,
+    after_chars: usize,
+) -> String {
+    let before = value[..index]
+        .chars()
+        .rev()
+        .take(before_chars)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<String>();
+    let after = value[index..].chars().take(after_chars).collect::<String>();
+    format!("{before}{after}")
+}
+
+fn score_agent_spawn_parameter_contract(
+    contract: &AgentSpawnParameterContract,
+    requested_role: &str,
+    requested_display_name: &str,
+    requested_goal: &str,
+) -> i32 {
+    let mut score = 0;
+    if contract
+        .role
+        .as_deref()
+        .is_some_and(|role| role == requested_role.trim())
+    {
+        score += 4;
+    }
+    if contract.display_name == requested_display_name.trim() {
+        score += 20;
+    }
+    score += keyword_overlap_score(&contract.display_name, requested_display_name);
+    if let Some(goal) = contract.goal.as_deref() {
+        score += keyword_overlap_score(goal, requested_goal);
+    }
+    score
+}
+
+fn keyword_overlap_score(left: &str, right: &str) -> i32 {
+    const KEYWORDS: &[&str] = &[
+        "目录",
+        "探查",
+        "顶层",
+        "配置",
+        "审查",
+        "检查",
+        "文件",
+        "README",
+        "package.json",
+        "tsconfig",
+        "测试",
+        "架构",
+        "实现",
+    ];
+    let left_lower = left.to_ascii_lowercase();
+    let right_lower = right.to_ascii_lowercase();
+    KEYWORDS
+        .iter()
+        .filter(|keyword| {
+            let keyword_lower = keyword.to_ascii_lowercase();
+            left_lower.contains(&keyword_lower) && right_lower.contains(&keyword_lower)
+        })
+        .count() as i32
+        * 4
+}
+
+fn default_agent_spawn_access_mode(role: &str) -> AgentSpawnAccessMode {
+    match role.trim() {
+        "architect" | "explorer" | "reviewer" => AgentSpawnAccessMode::ReadOnly,
+        _ => AgentSpawnAccessMode::ReadWrite,
+    }
+}
+
+fn agent_spawn_child_policy_snapshot(
+    parent_policy: Option<&TaskPolicy>,
+    access_mode: AgentSpawnAccessMode,
+) -> TaskPolicy {
+    let mut policy = parent_policy
+        .cloned()
+        .unwrap_or_else(default_agent_spawn_policy);
+    if access_mode == AgentSpawnAccessMode::ReadOnly
+        || policy.command_mode.eq_ignore_ascii_case("read_only")
+    {
+        policy.command_mode = "read_only".to_string();
+    } else if policy.command_mode.trim().is_empty() {
+        policy.command_mode = "full".to_string();
+    }
+    policy
+}
+
+fn default_agent_spawn_policy() -> TaskPolicy {
+    TaskPolicy {
+        autonomy_level: "Autonomous".to_string(),
+        approval_mode: "DecisionOnly".to_string(),
+        allowed_tools: Vec::new(),
+        denied_tools: Vec::new(),
+        allowed_paths: Vec::new(),
+        denied_paths: Vec::new(),
+        network_mode: "full".to_string(),
+        command_mode: "full".to_string(),
+        retry_limit: 1,
+        validation_profile: None,
+        checkpoint_mode: "turn".to_string(),
+        task_tier: TaskTier::ExecutionChain,
+        background_allowed: true,
+        escalation_conditions: Vec::new(),
+    }
+}
+
+fn enqueue_agent_assignment_message(
+    conversation_registry: &ConversationRegistry,
+    session_id: &SessionId,
+    parent: &magi_core::Task,
+    child: &magi_core::Task,
     role: &str,
+    now: UtcMillis,
+) {
+    let access_mode = child
+        .executor_binding
+        .as_ref()
+        .and_then(|binding| binding.get("access_mode"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("read_write");
+    let child_conversation =
+        conversation_registry.conversation_for_task(session_id, &child.task_id);
+    child_conversation
+        .lock()
+        .expect("child conversation mutex poisoned")
+        .ingest_runtime_signal(RuntimeSignal {
+            author: MailboxAuthor::Parent(parent.task_id.to_string()),
+            kind: MailboxKind::Message,
+            trigger_turn: true,
+            payload: serde_json::json!({
+                "type": "agent_assignment",
+                "parent_task_id": parent.task_id.to_string(),
+                "child_task_id": child.task_id.to_string(),
+                "title": child.title,
+                "goal": child.goal,
+                "role": role,
+                "access_mode": access_mode,
+            }),
+            enqueued_at: now,
+        });
+}
+
+fn execute_agent_wait(
+    task_store: &TaskStore,
+    tool: magi_tool_runtime::BuiltinToolName,
+    parsed: &serde_json::Value,
 ) -> (String, ExecutionResultStatus) {
-    const POLL_INTERVAL_MS: u64 = 100;
+    let task_ids = parse_agent_wait_task_ids(parsed);
+    if task_ids.is_empty() {
+        return (
+            serde_json::json!({
+                "tool": tool.as_str(),
+                "status": "failed",
+                "error": "agent_wait 缺少必需字段 task_ids",
+            })
+            .to_string(),
+            ExecutionResultStatus::Failed,
+        );
+    }
+    let timeout_ms = parse_agent_wait_timeout_ms(parsed);
+    let started_at = std::time::Instant::now();
     loop {
-        let Some(child) = task_store.get_task(child_id) else {
+        let mut results = Vec::with_capacity(task_ids.len());
+        let mut pending_task_ids = Vec::new();
+        for task_id in &task_ids {
+            let Some(child) = task_store.get_task(task_id) else {
+                results.push(serde_json::json!({
+                    "child_task_id": task_id.to_string(),
+                    "status": "failed",
+                    "child_status": "missing",
+                    "error": "TaskStore 中未找到该代理任务",
+                }));
+                continue;
+            };
+            if matches!(child.status, TaskStatus::Pending | TaskStatus::Running) {
+                pending_task_ids.push(task_id.to_string());
+            }
+            results.push(child_agent_terminal_payload(&child));
+        }
+        if pending_task_ids.is_empty() {
             return (
                 serde_json::json!({
                     "tool": tool.as_str(),
-                    "status": "failed",
-                    "child_task_id": child_id.to_string(),
-                    "role": role,
-                    "error": "agent_spawn 等待子任务时 TaskStore 中未找到记录",
+                    "status": "succeeded",
+                    "timed_out": false,
+                    "results": results,
+                    "instruction": "请读取 results 中每个代理的 assignment.goal 与 result.final_text，合并结论、证据、风险与缺口后再向用户答复。",
                 })
                 .to_string(),
-                ExecutionResultStatus::Failed,
+                ExecutionResultStatus::Succeeded,
             );
-        };
-        match child.status {
-            TaskStatus::Completed => {
-                let summary = compact_child_agent_output(&child.output_refs);
-                return (
-                    serde_json::json!({
-                        "tool": tool.as_str(),
-                        "status": "succeeded",
-                        "child_task_id": child_id.to_string(),
-                        "role": role,
-                        "title": child.title,
-                        "summary": summary,
-                        "output_ref_count": child.output_refs.len(),
-                    })
-                    .to_string(),
-                    ExecutionResultStatus::Succeeded,
-                );
-            }
-            TaskStatus::Failed => {
-                let error = child
-                    .output_refs
-                    .first()
-                    .cloned()
-                    .unwrap_or_else(|| "子任务执行失败".to_string());
-                let summary = compact_child_agent_output(&child.output_refs);
-                if agent_unavailable_failure(&error) {
-                    return (
-                        serde_json::json!({
-                            "tool": tool.as_str(),
-                            "status": "degraded",
-                            "child_status": "failed",
-                            "fallback_mode": "mainline_or_reassign",
-                            "child_task_id": child_id.to_string(),
-                            "role": role,
-                            "title": child.title,
-                            "summary": summary,
-                            "output_ref_count": child.output_refs.len(),
-                            "error": error,
-                            "instruction": "代理当前不可用。请不要停止任务：优先改派其他可用角色继续；如果没有必要继续派发，则由主线根据已有上下文直接推进并给出最终结果。",
-                        })
-                        .to_string(),
-                        ExecutionResultStatus::Succeeded,
-                    );
-                }
-                return (
-                    serde_json::json!({
-                        "tool": tool.as_str(),
-                        "status": "failed",
-                        "child_task_id": child_id.to_string(),
-                        "role": role,
-                        "title": child.title,
-                        "summary": summary,
-                        "output_ref_count": child.output_refs.len(),
-                        "error": error,
-                    })
-                    .to_string(),
-                    ExecutionResultStatus::Failed,
-                );
-            }
-            TaskStatus::Killed => {
-                return (
-                    serde_json::json!({
-                        "tool": tool.as_str(),
-                        "status": "killed",
-                        "child_task_id": child_id.to_string(),
-                        "role": role,
-                        "title": child.title,
-                        "error": "子任务被终止",
-                    })
-                    .to_string(),
-                    ExecutionResultStatus::Failed,
-                );
-            }
-            TaskStatus::Pending | TaskStatus::Running => {
-                thread::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS));
-            }
         }
+        if started_at.elapsed().as_millis() >= timeout_ms as u128 {
+            return (
+                serde_json::json!({
+                    "tool": tool.as_str(),
+                    "status": "timeout",
+                    "timed_out": true,
+                    "pending_task_ids": pending_task_ids,
+                    "results": results,
+                    "instruction": "仍有代理未完成。可以继续处理不依赖这些代理结果的工作；如果最终答复依赖它们，请稍后再次调用 agent_wait。",
+                })
+                .to_string(),
+                ExecutionResultStatus::Succeeded,
+            );
+        }
+        thread::sleep(std::time::Duration::from_millis(
+            AGENT_WAIT_POLL_INTERVAL_MS,
+        ));
     }
 }
 
-fn compact_child_agent_output(output_refs: &[String]) -> String {
+fn parse_agent_wait_task_ids(parsed: &serde_json::Value) -> Vec<TaskId> {
+    parsed
+        .get("task_ids")
+        .and_then(|value| value.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(TaskId::new)
+        .collect()
+}
+
+fn parse_agent_wait_timeout_ms(parsed: &serde_json::Value) -> u64 {
+    parsed
+        .get("timeout_ms")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(AGENT_WAIT_DEFAULT_TIMEOUT_MS)
+        .clamp(AGENT_WAIT_MIN_TIMEOUT_MS, AGENT_WAIT_MAX_TIMEOUT_MS)
+}
+
+fn child_agent_terminal_payload(child: &magi_core::Task) -> serde_json::Value {
+    let role = child.executor_binding_target_role().unwrap_or("agent");
+    let base = |status: &str, child_status: &str| {
+        serde_json::json!({
+            "status": status,
+            "child_status": child_status,
+            "child_task_id": child.task_id.to_string(),
+            "role": role,
+            "title": child.title,
+            "assignment": {
+                "title": child.title,
+                "goal": child.goal,
+                "role": role,
+            },
+        })
+    };
+    match child.status {
+        TaskStatus::Completed => {
+            let output = child_agent_output(&child.output_refs);
+            let mut payload = base("succeeded", "completed");
+            payload["result"] = serde_json::json!({
+                "final_text": output.final_text,
+                "truncated": output.truncated,
+                "output_ref_count": child.output_refs.len(),
+            });
+            payload["summary"] = serde_json::Value::String(output.summary);
+            payload["output_ref_count"] = serde_json::json!(child.output_refs.len());
+            payload
+        }
+        TaskStatus::Failed => {
+            let error = child
+                .output_refs
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "代理任务执行失败".to_string());
+            let output = child_agent_output(&child.output_refs);
+            let mut payload = if agent_unavailable_failure(&error) {
+                let mut payload = base("degraded", "failed");
+                payload["fallback_mode"] =
+                    serde_json::Value::String("mainline_or_reassign".to_string());
+                payload["instruction"] = serde_json::Value::String(
+                    "代理当前不可用。请不要停止任务：优先改派其他可用角色继续；如果没有必要继续派发，则由主线根据已有上下文直接推进并给出最终结果。".to_string(),
+                );
+                payload
+            } else {
+                base("failed", "failed")
+            };
+            payload["result"] = serde_json::json!({
+                "final_text": output.final_text,
+                "truncated": output.truncated,
+                "output_ref_count": child.output_refs.len(),
+            });
+            payload["summary"] = serde_json::Value::String(output.summary);
+            payload["output_ref_count"] = serde_json::json!(child.output_refs.len());
+            payload["error"] = serde_json::Value::String(error);
+            payload
+        }
+        TaskStatus::Killed => {
+            let mut payload = base("failed", "killed");
+            payload["error"] = serde_json::Value::String("代理任务被终止".to_string());
+            payload
+        }
+        TaskStatus::Pending => base("pending", "pending"),
+        TaskStatus::Running => base("running", "running"),
+    }
+}
+
+fn child_agent_output(output_refs: &[String]) -> ChildAgentOutput {
     let raw = output_refs
         .iter()
         .rev()
         .find_map(|output| child_agent_final_text(output).or_else(|| non_empty_text(output)))
         .unwrap_or_else(|| "代理未返回可展示输出".to_string());
-    truncate_for_agent_spawn_summary(&raw)
+    let (final_text, truncated) = truncate_for_agent_spawn_final_text(&raw);
+    ChildAgentOutput {
+        summary: truncate_for_agent_spawn_summary(&raw),
+        final_text,
+        truncated,
+    }
 }
 
 fn child_agent_final_text(output: &str) -> Option<String> {
@@ -616,16 +1050,21 @@ fn non_empty_text(value: &str) -> Option<String> {
 }
 
 fn truncate_for_agent_spawn_summary(value: &str) -> String {
+    truncate_for_agent_spawn_text(value, AGENT_SPAWN_SUMMARY_MAX_CHARS).0
+}
+
+fn truncate_for_agent_spawn_final_text(value: &str) -> (String, bool) {
+    truncate_for_agent_spawn_text(value, AGENT_SPAWN_FINAL_TEXT_MAX_CHARS)
+}
+
+fn truncate_for_agent_spawn_text(value: &str, max_chars: usize) -> (String, bool) {
     let trimmed = value.trim();
-    if trimmed.chars().count() <= AGENT_SPAWN_SUMMARY_MAX_CHARS {
-        return trimmed.to_string();
+    if trimmed.chars().count() <= max_chars {
+        return (trimmed.to_string(), false);
     }
-    let mut output = trimmed
-        .chars()
-        .take(AGENT_SPAWN_SUMMARY_MAX_CHARS)
-        .collect::<String>();
+    let mut output = trimmed.chars().take(max_chars).collect::<String>();
     output.push('…');
-    output
+    (output, true)
 }
 
 fn agent_unavailable_failure(error: &str) -> bool {
@@ -657,7 +1096,7 @@ fn execute_task_tool_call(
     task_store: &TaskStore,
     session_store: &SessionStore,
     execution_registry: &TaskExecutionRegistry,
-    _conversation_registry: &ConversationRegistry,
+    conversation_registry: &ConversationRegistry,
     spawn_graph: &Mutex<magi_spawn_graph::SpawnGraph>,
     safety_gate: Option<&magi_safety_gate::SafetyGate>,
     todo_ledger: &magi_todo_ledger::TodoLedger,
@@ -695,13 +1134,18 @@ fn execute_task_tool_call(
                 ExecutionResultStatus::Rejected,
             );
         }
-        if matches!(canonical, magi_tool_runtime::BuiltinToolName::AgentSpawn) {
+        if matches!(
+            canonical,
+            magi_tool_runtime::BuiltinToolName::AgentSpawn
+                | magi_tool_runtime::BuiltinToolName::AgentWait
+        ) {
             return execute_coordinator_tool(
                 event_bus,
                 agent_role_registry,
                 task_store,
                 session_store,
                 execution_registry,
+                conversation_registry,
                 spawn_graph,
                 human_checkpoint,
                 task,
@@ -1069,6 +1513,140 @@ mod tests {
         }
     }
 
+    #[test]
+    fn agent_spawn_access_mode_defaults_to_read_only_for_review_roles() {
+        assert_eq!(
+            default_agent_spawn_access_mode("explorer"),
+            AgentSpawnAccessMode::ReadOnly
+        );
+        assert_eq!(
+            default_agent_spawn_access_mode("reviewer"),
+            AgentSpawnAccessMode::ReadOnly
+        );
+        assert_eq!(
+            default_agent_spawn_access_mode("architect"),
+            AgentSpawnAccessMode::ReadOnly
+        );
+        assert_eq!(
+            default_agent_spawn_access_mode("executor"),
+            AgentSpawnAccessMode::ReadWrite
+        );
+    }
+
+    #[test]
+    fn agent_spawn_child_policy_applies_read_only_access_mode() {
+        let parent = default_agent_spawn_policy();
+        let child =
+            agent_spawn_child_policy_snapshot(Some(&parent), AgentSpawnAccessMode::ReadOnly);
+
+        assert_eq!(child.command_mode, "read_only");
+        assert_eq!(child.network_mode, parent.network_mode);
+        assert_eq!(child.task_tier, parent.task_tier);
+    }
+
+    #[test]
+    fn agent_spawn_child_policy_never_escalates_parent_read_only() {
+        let mut parent = default_agent_spawn_policy();
+        parent.command_mode = "read_only".to_string();
+
+        let child =
+            agent_spawn_child_policy_snapshot(Some(&parent), AgentSpawnAccessMode::ReadWrite);
+
+        assert_eq!(child.command_mode, "read_only");
+    }
+
+    #[test]
+    fn agent_spawn_contract_parser_extracts_explicit_user_parameters() {
+        let contracts = parse_agent_spawn_parameter_contracts(
+            "必须同一轮并行启动 2 个代理：1) role=explorer，display_name=「目录探查代理」，access_mode=read_only，目标：只读查看 /Users/xie/code/TEST 顶层目录；2) role=reviewer，display_name=「配置审查代理」，access_mode=read_only，目标：只读查看 README.md 和 package.json 是否存在。",
+        );
+
+        assert_eq!(contracts.len(), 2);
+        assert_eq!(contracts[0].role.as_deref(), Some("explorer"));
+        assert_eq!(contracts[0].display_name, "目录探查代理");
+        assert_eq!(
+            contracts[0].access_mode,
+            Some(AgentSpawnAccessMode::ReadOnly)
+        );
+        assert_eq!(contracts[1].role.as_deref(), Some("reviewer"));
+        assert_eq!(contracts[1].display_name, "配置审查代理");
+        assert!(
+            contracts[1]
+                .goal
+                .as_deref()
+                .unwrap_or_default()
+                .contains("package.json")
+        );
+    }
+
+    #[test]
+    fn agent_spawn_contract_selection_corrects_model_rewritten_display_name() {
+        let message = "必须同一轮并行启动 2 个代理：1) role=explorer，display_name=「目录探查代理」，access_mode=read_only，目标：只读查看 /Users/xie/code/TEST 顶层目录；2) role=reviewer，display_name=「配置审查代理」，access_mode=read_only，目标：只读查看 README.md 和 package.json 是否存在。";
+
+        let directory = select_agent_spawn_parameter_contract(
+            message,
+            "explorer",
+            "目录探查员",
+            "只读检查当前工作区目录 /Users/xie/code/TEST",
+        )
+        .expect("directory contract should be selected");
+        assert_eq!(directory.role.as_deref(), Some("explorer"));
+        assert_eq!(directory.display_name, "目录探查代理");
+
+        let config = select_agent_spawn_parameter_contract(
+            message,
+            "reviewer",
+            "文件存在审查员",
+            "只读查看 README.md 和 package.json 是否存在",
+        )
+        .expect("config contract should be selected");
+        assert_eq!(config.role.as_deref(), Some("reviewer"));
+        assert_eq!(config.display_name, "配置审查代理");
+    }
+
+    #[test]
+    fn agent_spawn_contract_selection_prefers_goal_when_model_rewrites_role() {
+        let message = "必须同一轮并行启动 2 个代理：1) role=explorer，display_name=「目录探查代理」，access_mode=read_only，目标：只读查看 /Users/xie/code/TEST 顶层目录；2) role=reviewer，display_name=「配置审查代理」，access_mode=read_only，目标：只读查看 README.md 和 package.json 是否存在。";
+
+        let config = select_agent_spawn_parameter_contract(
+            message,
+            "explorer",
+            "关键文件检查员",
+            "只读验证 /Users/xie/code/TEST/README.md 与 /Users/xie/code/TEST/package.json 是否存在且为普通文件",
+        )
+        .expect("config contract should be selected by goal overlap");
+
+        assert_eq!(config.role.as_deref(), Some("reviewer"));
+        assert_eq!(config.display_name, "配置审查代理");
+    }
+
+    #[test]
+    fn read_only_agent_policy_rejects_write_tool() {
+        let mut task = test_task("task-read-only-agent", "task-read-only-agent", None);
+        task.policy_snapshot = Some(agent_spawn_child_policy_snapshot(
+            Some(&default_agent_spawn_policy()),
+            AgentSpawnAccessMode::ReadOnly,
+        ));
+
+        let rejection = task_policy_tool_rejection(
+            &task,
+            BuiltinToolName::FileWrite.as_str(),
+            r#"{"path":"probe.txt","content":""}"#,
+        )
+        .expect("read-only agent should reject file_write");
+        let payload: serde_json::Value =
+            serde_json::from_str(&rejection).expect("rejection should be json");
+
+        assert_eq!(payload["status"].as_str(), Some("rejected"));
+        assert_eq!(payload["tool"].as_str(), Some("file_write"));
+        assert!(
+            payload["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("只读任务不允许执行写入工具")
+        );
+    }
+
     fn pending_human_checkpoint_store(
         mission_id: &MissionId,
     ) -> magi_human_checkpoint::HumanCheckpointStore {
@@ -1088,7 +1666,7 @@ mod tests {
             &mut log,
             magi_human_checkpoint::HumanCheckpointRequestArgs {
                 plan_step_id: "review-before-spawn".to_string(),
-                prompt_to_human: "确认后才能继续派发子任务".to_string(),
+                prompt_to_human: "确认后才能继续派发代理".to_string(),
                 label: Some("spawn-gate".to_string()),
                 context: None,
             },
@@ -1096,6 +1674,223 @@ mod tests {
         );
         store.save(&log).expect("human checkpoint log should save");
         store
+    }
+
+    #[test]
+    fn child_agent_output_extracts_final_text_and_marks_truncation() {
+        let long_final_text = "结果".repeat(4000);
+        let output_refs = vec![
+            serde_json::json!({
+                "blocks": [
+                    {
+                        "type": "tool_call",
+                        "content": "shell_exec: ok"
+                    },
+                    {
+                        "type": "text",
+                        "content": long_final_text
+                    }
+                ]
+            })
+            .to_string(),
+        ];
+
+        let output = child_agent_output(&output_refs);
+
+        assert!(output.summary.chars().count() <= AGENT_SPAWN_SUMMARY_MAX_CHARS + 1);
+        assert_eq!(
+            output.final_text.chars().count(),
+            AGENT_SPAWN_FINAL_TEXT_MAX_CHARS + 1
+        );
+        assert!(output.truncated);
+        assert!(output.final_text.starts_with("结果结果"));
+    }
+
+    #[test]
+    fn agent_wait_returns_completed_agent_final_text() {
+        let task_store = TaskStore::new();
+        let mut child = test_task(
+            "task-agent-wait-child",
+            "task-agent-wait-root",
+            Some(TaskId::new("task-agent-wait-root")),
+        );
+        child.status = TaskStatus::Completed;
+        child.title = "目录探索".to_string();
+        child.goal = "列出目录并汇报".to_string();
+        child.executor_binding = Some(serde_json::json!({
+            "target_role": "explorer",
+        }));
+        child.output_refs = vec![
+            serde_json::json!({
+                "blocks": [
+                    {
+                        "type": "text",
+                        "content": "已完成目录探索，发现 README.md。"
+                    }
+                ]
+            })
+            .to_string(),
+        ];
+        task_store.insert_task(child);
+
+        let (payload, status) = execute_agent_wait(
+            &task_store,
+            BuiltinToolName::AgentWait,
+            &serde_json::json!({
+                "task_ids": ["task-agent-wait-child"],
+                "timeout_ms": 1000,
+            }),
+        );
+
+        assert_eq!(status, ExecutionResultStatus::Succeeded);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&payload).expect("agent_wait result should be json");
+        assert_eq!(parsed["status"].as_str(), Some("succeeded"));
+        assert_eq!(parsed["timed_out"].as_bool(), Some(false));
+        assert_eq!(
+            parsed["results"][0]["child_status"].as_str(),
+            Some("completed")
+        );
+        assert_eq!(
+            parsed["results"][0]["assignment"]["goal"].as_str(),
+            Some("列出目录并汇报")
+        );
+        assert_eq!(
+            parsed["results"][0]["result"]["final_text"].as_str(),
+            Some("已完成目录探索，发现 README.md。")
+        );
+    }
+
+    #[test]
+    fn agent_wait_marks_unavailable_agent_as_degradable() {
+        let task_store = TaskStore::new();
+        let mut child = test_task(
+            "task-agent-wait-unavailable",
+            "task-agent-wait-root",
+            Some(TaskId::new("task-agent-wait-root")),
+        );
+        child.status = TaskStatus::Failed;
+        child.title = "配置审查代理".to_string();
+        child.goal = "检查模型配置是否可用".to_string();
+        child.executor_binding = Some(serde_json::json!({
+            "target_role": "reviewer",
+        }));
+        child.output_refs = vec!["provider transport failed: connection refused".to_string()];
+        task_store.insert_task(child);
+
+        let (payload, status) = execute_agent_wait(
+            &task_store,
+            BuiltinToolName::AgentWait,
+            &serde_json::json!({
+                "task_ids": ["task-agent-wait-unavailable"],
+                "timeout_ms": 1000,
+            }),
+        );
+
+        assert_eq!(status, ExecutionResultStatus::Succeeded);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&payload).expect("agent_wait result should be json");
+        let result = &parsed["results"][0];
+        assert_eq!(result["status"].as_str(), Some("degraded"));
+        assert_eq!(result["child_status"].as_str(), Some("failed"));
+        assert_eq!(
+            result["fallback_mode"].as_str(),
+            Some("mainline_or_reassign")
+        );
+        assert!(
+            result["instruction"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("不要停止任务")
+        );
+        assert_eq!(
+            result["result"]["final_text"].as_str(),
+            Some("provider transport failed: connection refused")
+        );
+    }
+
+    #[test]
+    fn agent_wait_preserves_non_degradable_agent_failure() {
+        let task_store = TaskStore::new();
+        let mut child = test_task(
+            "task-agent-wait-real-failure",
+            "task-agent-wait-root",
+            Some(TaskId::new("task-agent-wait-root")),
+        );
+        child.status = TaskStatus::Failed;
+        child.title = "冒烟测试代理".to_string();
+        child.goal = "运行冒烟测试并报告失败原因".to_string();
+        child.executor_binding = Some(serde_json::json!({
+            "target_role": "tester",
+        }));
+        child.output_refs = vec!["测试失败：断言不匹配".to_string()];
+        task_store.insert_task(child);
+
+        let (payload, status) = execute_agent_wait(
+            &task_store,
+            BuiltinToolName::AgentWait,
+            &serde_json::json!({
+                "task_ids": ["task-agent-wait-real-failure"],
+                "timeout_ms": 1000,
+            }),
+        );
+
+        assert_eq!(status, ExecutionResultStatus::Succeeded);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&payload).expect("agent_wait result should be json");
+        let result = &parsed["results"][0];
+        assert_eq!(result["status"].as_str(), Some("failed"));
+        assert_eq!(result["child_status"].as_str(), Some("failed"));
+        assert!(result.get("fallback_mode").is_none());
+        assert_eq!(
+            result["result"]["final_text"].as_str(),
+            Some("测试失败：断言不匹配")
+        );
+    }
+
+    #[test]
+    fn agent_spawn_assignment_message_enters_child_conversation_mailbox() {
+        let registry = ConversationRegistry::new();
+        let session_id = SessionId::new("session-agent-assignment-mailbox");
+        let parent = coordinator_task(test_task(
+            "task-agent-assignment-parent",
+            "task-agent-assignment-parent",
+            None,
+        ));
+        let mut child = test_task(
+            "task-agent-assignment-child",
+            "task-agent-assignment-parent",
+            Some(parent.task_id.clone()),
+        );
+        child.title = "目录探索".to_string();
+        child.goal = "列出目录并汇报".to_string();
+
+        enqueue_agent_assignment_message(
+            &registry,
+            &session_id,
+            &parent,
+            &child,
+            "explorer",
+            UtcMillis(42),
+        );
+
+        let child_conversation = registry.conversation_for_task(&session_id, &child.task_id);
+        let items = child_conversation.lock().unwrap().drain_mailbox_items();
+
+        assert_eq!(items.len(), 1);
+        match &items[0] {
+            crate::MailboxItem::Runtime(signal) => {
+                assert_eq!(
+                    signal.author,
+                    MailboxAuthor::Parent("task-agent-assignment-parent".to_string())
+                );
+                assert_eq!(signal.kind, MailboxKind::Message);
+                assert!(signal.trigger_turn);
+                assert_eq!(signal.payload["type"].as_str(), Some("agent_assignment"));
+                assert_eq!(signal.payload["goal"].as_str(), Some("列出目录并汇报"));
+            }
+            other => panic!("expected runtime assignment message, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1212,7 +2007,7 @@ mod tests {
                 name: BuiltinToolName::AgentSpawn.as_str().to_string(),
                 arguments: serde_json::json!({
                     "role": "executor",
-                    "goal": "不应创建的子任务"
+                    "goal": "不应创建的代理任务"
                 })
                 .to_string(),
             },

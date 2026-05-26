@@ -2650,7 +2650,7 @@ async function saveWorkerConfig(worker: string, config: Record<string, unknown>)
   await saveAgentWorkerConfig(worker, config);
   cachedSettingsBootstrap = null;
   await dispatchSettingsBootstrap(true);
-  emitBridgeSuccessToast('保存 worker 配置', `Worker ${worker} 配置已保存`, { displayMode: 'notification_center' });
+  emitBridgeSuccessToast('保存代理配置', `代理 ${worker} 配置已保存`, { displayMode: 'notification_center' });
 }
 
 async function saveUserRules(data: Record<string, unknown>): Promise<void> {
@@ -2683,7 +2683,7 @@ async function saveSafeguardConfig(config: Record<string, unknown>): Promise<voi
 async function testWorkerConnection(worker: string, config: Record<string, unknown>): Promise<void> {
   const payload = await testAgentWorkerConnection(worker, config);
   emitDataMessage('workerConnectionTestResult', payload);
-  emitBridgeSuccessToast('测试 worker 连接', `Worker ${worker} 连接测试已完成`, { displayMode: 'notification_center' });
+  emitBridgeSuccessToast('测试代理连接', `代理 ${worker} 连接测试已完成`, { displayMode: 'notification_center' });
 }
 
 async function testOrchestratorConnection(config: Record<string, unknown>): Promise<void> {
@@ -2916,7 +2916,7 @@ export function createWebClientBridge(): ClientBridge {
         case 'saveWorkerConfig':
           if (typeof message.worker === 'string' && message.config && typeof message.config === 'object') {
             void saveWorkerConfig(message.worker, message.config as Record<string, unknown>).catch((error) => {
-              logBridgeOperationFailure('保存 worker 配置', '[web-client-bridge] 保存 worker 配置失败:', error);
+              logBridgeOperationFailure('保存代理配置', '[web-client-bridge] 保存代理配置失败:', error);
             });
           }
           return;
@@ -2944,7 +2944,7 @@ export function createWebClientBridge(): ClientBridge {
         case 'testWorkerConnection':
           if (typeof message.worker === 'string' && message.config && typeof message.config === 'object') {
             void testWorkerConnection(message.worker, message.config as Record<string, unknown>).catch((error) => {
-              logBridgeOperationFailure('测试 worker 连接', '[web-client-bridge] 测试 worker 连接失败:', error);
+              logBridgeOperationFailure('测试代理连接', '[web-client-bridge] 测试代理连接失败:', error);
             });
           }
           return;
@@ -3463,7 +3463,7 @@ export function createWebClientBridge(): ClientBridge {
           });
           return;
         case 'selectWorker':
-          console.info('[web-client-bridge] Web 端 Worker 选择由前端本地视图状态自行处理。');
+          console.info('[web-client-bridge] Web 端代理选择由前端本地视图状态自行处理。');
           return;
         case 'toggleBuiltInTool':
           console.info('[web-client-bridge] 内置工具由运行时固定管理，已忽略切换请求。');

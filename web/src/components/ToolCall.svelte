@@ -11,7 +11,7 @@
   import { i18n } from '../stores/i18n.svelte';
   import { getCurrentSessionId } from '../stores/messages.svelte';
   import { diagramSummary, parseToolDiagramPayload } from '../lib/diagram-payload';
-  import { openAgentTab } from '../stores/right-pane.svelte';
+  import { openAgentTab, rightPaneState } from '../stores/right-pane.svelte';
   import { getAgentVisualInfo } from '../lib/agent-colors';
 
   interface ErrorDiagnosis {
@@ -215,16 +215,13 @@
   );
   const isCompactMutation = $derived(isFileMutationTool && (status === 'running' || status === 'pending'));
 
-  // agent_spawn 工具调用：父代理派发代理的同步阻塞工具。每一次调用即父代理
+  // agent_spawn 工具调用：父代理创建代理并投递初始任务消息。每一次调用即父代理
   // ToolCall 流中的一张内嵌卡片，多个并行 agent_spawn 即多张并列卡片，点击卡片
   // 打开右侧 RightPane 代理 transcript（按 metadata.taskId 过滤）。
   //
-  // input 形态：{ role, display_name, goal }
-  // output 形态（tool_batch.rs::wait_for_child_terminal_outcome）：
-  //   succeeded → { tool, status: 'succeeded', child_task_id, role, title, summary, output_ref_count }
-  //   degraded  → { tool, status: 'degraded',  child_task_id, role, title, summary, output_ref_count, error, instruction }
-  //   failed    → { tool, status: 'failed',    child_task_id, role, title, summary, output_ref_count, error }
-  //   killed    → { tool, status: 'killed',    child_task_id, role, title, error }
+  // input 形态：{ role, display_name, goal, access_mode }
+  // output 形态：{ tool, status: 'started', child_task_id, role, title, assignment, ... }
+  // 代理终态结果由主线后续 agent_wait 收集。
   const isAgentSpawn = $derived(name === 'agent_spawn');
 
   interface AgentSpawnDisplay {
@@ -297,7 +294,7 @@
   function openAgentSpawnTab(): void {
     const display = agentSpawnDisplay;
     if (!display || !display.childTaskId) return;
-    openAgentTab(getCurrentSessionId() || '', display.childTaskId, {
+    openAgentTab(getCurrentSessionId() || rightPaneState.activeSessionId, display.childTaskId, {
       label: display.title,
     });
   }

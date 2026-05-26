@@ -44,10 +44,10 @@ pub enum AgentRoleError {
 
 /// 单个 role 的定义。
 ///
-/// `coordinator_mode = true` 表示该角色采用 Prompt-as-Code 协调器模式：
-/// LLM 通过 `Agent` 内置工具同步派发代理，代理完成的结果作为 tool_call_result
-/// 直接回写到协调器上下文，整个 orchestration 由 prompt 驱动，而不是 Code-as-Coordinator
-/// 在外层硬编码状态机。架构详见 docs/task-system-v2/01-architecture.md L10。
+/// `coordinator_mode = true` 表示该角色采用 Prompt-as-Code 主线编排模式：
+/// LLM 通过 `agent_spawn` 创建代理并投递任务消息，随后通过 `agent_wait`
+/// 收集代理终态结果；整个 orchestration 由 prompt 驱动，而不是
+/// Code-as-Coordinator 在外层硬编码状态机。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentRole {
     #[serde(default)]

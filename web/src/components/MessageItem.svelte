@@ -17,7 +17,7 @@
   interface Props {
     message: Message;
     readOnly?: boolean;
-    /** 显示上下文：thread=主对话区, worker=Worker面板 */
+    /** 显示上下文：thread=主对话区, task=代理详情 */
     displayContext?: 'thread' | 'task';
     /** 是否允许渲染底部流式三点（仅最后一条流式消息启用） */
     showStreamingIndicator?: boolean;
@@ -170,7 +170,7 @@
     return formatDuration(normalizedMs);
   }
 
-  // 获取 worker 信息（如果有）
+  // 获取代理执行信息（如果有）
   const worker = $derived(message.metadata?.worker || null);
   const laneTitle = $derived.by(() => {
     const value = message.metadata?.laneTitle;
@@ -514,7 +514,7 @@
     box-shadow: none;
   }
 
-  /* ===== 外层卡片壳只用于整条交互/错误等消息；thinking / 工具 / worker card 由各自 block 组件渲染 ===== */
+  /* ===== 外层卡片壳只用于整条交互/错误等消息；thinking / 工具 / 代理卡片由各自 block 组件渲染 ===== */
   .message-item.assistant.card-shell {
     padding: var(--space-4);
     border-radius: var(--radius-lg);

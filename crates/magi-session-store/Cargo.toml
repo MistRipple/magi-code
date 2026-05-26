@@ -8,3 +8,4 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 magi-core = { path = "../magi-core" }
+magi-tool-runtime = { path = "../magi-tool-runtime" }

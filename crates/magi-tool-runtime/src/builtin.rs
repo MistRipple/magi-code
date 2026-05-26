@@ -112,6 +112,7 @@ impl BuiltinTool for NormalizedBuiltinTool {
             BuiltinToolName::DiagramRender => execute_diagram_render(input),
             BuiltinToolName::KnowledgeQuery => execute_knowledge_query(input),
             BuiltinToolName::AgentSpawn
+            | BuiltinToolName::AgentWait
             | BuiltinToolName::TodoWrite
             | BuiltinToolName::MemoryWrite
             | BuiltinToolName::MissionCharterWrite

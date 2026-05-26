@@ -13,11 +13,13 @@ use magi_conversation_runtime::{
         apply_chain_recovery_if_needed, release_resumed_branch_path,
         sync_branch_checkpoint_to_worker_runtime,
     },
+    settings_store::SettingsStore,
     task_execution_registry::TaskExecutionPlan,
 };
 use magi_core::{ExecutionOwnership, SessionId, TaskExecutionTarget, TaskStatus, WorkerId};
 use magi_orchestrator::ExecutionWritebackPlans;
 use magi_session_store::{ActiveExecutionBranch, ActiveExecutionChain};
+use std::sync::Arc;
 
 // 对 routes/sessions.rs 暴露继续会话所需的 runtime 数据载体与判定函数。
 pub(crate) use magi_conversation_runtime::execution_chain_recovery::{
@@ -28,6 +30,7 @@ pub(crate) use magi_conversation_runtime::execution_chain_recovery::{
 fn rebuild_dispatch_plan_for_branch(
     chain: &ActiveExecutionChain,
     branch: &ActiveExecutionBranch,
+    execution_settings_snapshot: Option<Arc<SettingsStore>>,
 ) -> TaskExecutionPlan {
     let ownership = ExecutionOwnership {
         session_id: Some(chain.session_id.clone()),
@@ -70,6 +73,7 @@ fn rebuild_dispatch_plan_for_branch(
         writebacks,
         use_tools: branch.use_tools,
         skill_name: branch.skill_name.clone(),
+        execution_settings_snapshot,
     }
 }
 
@@ -259,10 +263,11 @@ pub(crate) fn continue_execution_chain(
         ));
     }
 
+    let execution_settings_snapshot = Some(Arc::new(state.settings_store.execution_snapshot()));
     for branch in &branches_to_resume {
         state.task_execution_registry().insert(
             branch.task_id.clone(),
-            rebuild_dispatch_plan_for_branch(&chain, branch),
+            rebuild_dispatch_plan_for_branch(&chain, branch, execution_settings_snapshot.clone()),
         );
         if let Some(worker_runtime) = worker_runtime_handle {
             sync_branch_checkpoint_to_worker_runtime(worker_runtime, branch);

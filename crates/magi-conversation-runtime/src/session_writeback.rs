@@ -28,7 +28,7 @@ use magi_session_store::{
 use magi_skill_runtime::SkillRuntime;
 use magi_snapshot::{SnapshotSession, ToolHook, ToolHookCtx};
 use magi_tool_runtime::{
-    ToolExecutionContext, ToolExecutionInput, ToolExecutionPolicy, ToolRegistry,
+    BuiltinToolName, ToolExecutionContext, ToolExecutionInput, ToolExecutionPolicy, ToolRegistry,
 };
 use serde_json::Value;
 use std::{collections::HashMap, path::PathBuf, sync::Arc, thread};
@@ -257,6 +257,15 @@ fn canonical_item_renderable(
     kind: CanonicalTurnItemKind,
     status: CanonicalTurnItemStatus,
 ) -> bool {
+    if kind == CanonicalTurnItemKind::ToolCall
+        && item
+            .tool_name
+            .as_deref()
+            .and_then(BuiltinToolName::from_str)
+            .is_some_and(|tool| tool.is_runtime_internal_tool_call())
+    {
+        return false;
+    }
     let has_content = item
         .content
         .as_ref()
@@ -1032,6 +1041,85 @@ mod tests {
         assert_eq!(item.status, "running");
         assert_eq!(item.source, "orchestrator");
         assert_eq!(item.source_thread_id, orchestrator_thread);
+    }
+
+    #[test]
+    fn canonical_turn_hides_agent_wait_tool_call() {
+        let session_id = SessionId::new("session-agent-wait-hidden");
+        let thread_id = ThreadId::new("thread-agent-wait-hidden");
+        let now = UtcMillis::now();
+        let mut item = session_turn_item(
+            "tool_call_result",
+            "completed",
+            Some("agent_wait".to_string()),
+            Some("{\"status\":\"succeeded\"}".to_string()),
+            Some("turn-item-agent-wait".to_string()),
+            thread_id,
+        );
+        item.tool_call_id = Some("tool-call-agent-wait".to_string());
+        item.tool_name = Some("agent_wait".to_string());
+        item.tool_arguments = Some("{\"task_ids\":[\"task-1\"]}".to_string());
+        item.tool_result = Some("{\"status\":\"succeeded\"}".to_string());
+        let turn = ActiveExecutionTurn {
+            turn_id: "turn-agent-wait-hidden".to_string(),
+            turn_seq: 1,
+            accepted_at: now,
+            completed_at: None,
+            status: "running".to_string(),
+            user_message: None,
+            items: vec![item.clone()],
+        };
+
+        let canonical = to_canonical_turn_item(&session_id, &turn, &item)
+            .expect("agent_wait should still be kept in canonical audit log");
+
+        assert!(
+            !canonical.visibility.renderable,
+            "agent_wait 是编排协议回执，不能进入用户可见时间线"
+        );
+    }
+
+    #[test]
+    fn canonical_turn_keeps_agent_spawn_tool_call_renderable() {
+        let session_id = SessionId::new("session-agent-spawn-visible");
+        let thread_id = ThreadId::new("thread-agent-spawn-visible");
+        let now = UtcMillis::now();
+        let mut item = session_turn_item(
+            "tool_call_result",
+            "completed",
+            Some("agent_spawn".to_string()),
+            Some("{\"status\":\"started\"}".to_string()),
+            Some("turn-item-agent-spawn".to_string()),
+            thread_id,
+        );
+        item.tool_call_id = Some("tool-call-agent-spawn".to_string());
+        item.tool_name = Some("agent_spawn".to_string());
+        item.tool_arguments = Some(
+            serde_json::json!({
+                "role": "explorer",
+                "display_name": "目录探查代理",
+                "goal": "读取目录结构"
+            })
+            .to_string(),
+        );
+        item.tool_result = Some("{\"status\":\"started\"}".to_string());
+        let turn = ActiveExecutionTurn {
+            turn_id: "turn-agent-spawn-visible".to_string(),
+            turn_seq: 1,
+            accepted_at: now,
+            completed_at: None,
+            status: "running".to_string(),
+            user_message: None,
+            items: vec![item.clone()],
+        };
+
+        let canonical = to_canonical_turn_item(&session_id, &turn, &item)
+            .expect("agent_spawn should be canonicalized");
+
+        assert!(
+            canonical.visibility.renderable,
+            "agent_spawn 是主线代理卡片入口，必须保持可渲染"
+        );
     }
 
     #[test]

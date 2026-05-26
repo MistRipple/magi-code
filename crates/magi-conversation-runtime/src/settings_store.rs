@@ -47,6 +47,18 @@ impl SettingsStore {
         }
     }
 
+    /// 为一次执行创建只读配置快照。
+    ///
+    /// 快照复制当前所有 section，但不携带持久化路径，避免执行期工具或模型解析路径误写
+    /// 用户全局设置。运行中用户修改模型配置时，已接受的 turn / 任务树继续读取这份快照。
+    pub fn execution_snapshot(&self) -> Self {
+        let sections = self.sections.read().unwrap().clone();
+        Self {
+            sections: RwLock::new(sections),
+            persistence_path: None,
+        }
+    }
+
     /// 从磁盘 JSON 文件加载设置，文件不存在时使用空默认值
     pub fn load_from_disk(&self) -> Result<(), std::io::Error> {
         let path = match &self.persistence_path {
@@ -326,6 +338,42 @@ mod tests {
         store.set("key", json!("value"));
         // 纯内存模式不应产生任何磁盘操作
         assert_eq!(store.get("key"), Some(json!("value")));
+    }
+
+    #[test]
+    fn execution_snapshot_is_detached_from_later_mutations() {
+        let store = SettingsStore::new();
+        store.set_section(
+            "orchestrator",
+            json!({
+                "baseUrl": "https://old.example.com/v1",
+                "model": "model-old",
+            }),
+        );
+
+        let snapshot = store.execution_snapshot();
+        store.set_section(
+            "orchestrator",
+            json!({
+                "baseUrl": "https://new.example.com/v1",
+                "model": "model-new",
+            }),
+        );
+
+        assert_eq!(
+            snapshot.get_section("orchestrator"),
+            json!({
+                "baseUrl": "https://old.example.com/v1",
+                "model": "model-old",
+            })
+        );
+        assert_eq!(
+            store.get_section("orchestrator"),
+            json!({
+                "baseUrl": "https://new.example.com/v1",
+                "model": "model-new",
+            })
+        );
     }
 
     #[test]

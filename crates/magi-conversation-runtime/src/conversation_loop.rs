@@ -43,7 +43,7 @@ use magi_session_store::{
 };
 use magi_tool_runtime::ToolRegistry;
 use magi_usage_authority::UsageCallStatus;
-use std::{path::PathBuf, sync::Arc};
+use std::{collections::BTreeSet, path::PathBuf, sync::Arc};
 
 pub struct ConversationLoopRequest<'a> {
     pub client: &'a dyn ModelBridgeClient,
@@ -618,7 +618,7 @@ fn run_conversation_loop_inner(
 
     let mut final_content = String::new();
     let mut tool_call_records: Vec<serde_json::Value> = Vec::new();
-    let mut failed_tool_summaries: Vec<String> = Vec::new();
+    let mut unresolved_tool_failures: Vec<(String, String)> = Vec::new();
     let required_tool_chain = task_required_tool_chain(task);
     let mut completed_required_tool_names: Vec<String> = Vec::new();
     let mut last_stream_item_id: Option<String> = None;
@@ -836,7 +836,62 @@ fn run_conversation_loop_inner(
                 });
                 continue;
             }
+            if let Some(recovery_prompt) =
+                agent_spawn_requirement_recovery_prompt(task, task_store, &tool_call_records, &[])
+            {
+                messages.push(ChatMessage {
+                    role: "assistant".to_string(),
+                    content: parsed.content.clone(),
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                });
+                messages.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: Some(recovery_prompt),
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                });
+                continue;
+            }
+            if let Some(recovery_prompt) =
+                agent_coordination_recovery_prompt(task, task_store, &tool_call_records)
+            {
+                messages.push(ChatMessage {
+                    role: "assistant".to_string(),
+                    content: parsed.content.clone(),
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                });
+                messages.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: Some(recovery_prompt),
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                });
+                continue;
+            }
             break;
+        }
+
+        if let Some(recovery_prompt) = agent_spawn_requirement_recovery_prompt(
+            task,
+            task_store,
+            &tool_call_records,
+            &parsed.tool_calls,
+        ) {
+            messages.push(ChatMessage {
+                role: "assistant".to_string(),
+                content: parsed.content.clone(),
+                tool_calls: parsed.tool_calls.clone(),
+                tool_call_id: None,
+            });
+            messages.push(ChatMessage {
+                role: "user".to_string(),
+                content: Some(recovery_prompt),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+            });
+            continue;
         }
 
         messages.push(ChatMessage {
@@ -901,15 +956,24 @@ fn run_conversation_loop_inner(
                 &result,
                 tool_status,
             );
+            let canonical_tool_name = canonical_tool_call_name(&tool_call.function.name);
             if !matches!(tool_status, ExecutionResultStatus::Succeeded) {
-                failed_tool_summaries.push(format!(
+                let failure_summary = format!(
                     "{}: {}",
                     tool_call.function.name,
                     summarize_tool_result(&result)
-                ));
+                );
+                if let Some((_, existing_summary)) = unresolved_tool_failures
+                    .iter_mut()
+                    .find(|(tool_name, _)| tool_name == &canonical_tool_name)
+                {
+                    *existing_summary = failure_summary;
+                } else {
+                    unresolved_tool_failures.push((canonical_tool_name.clone(), failure_summary));
+                }
             }
-            let canonical_tool_name = canonical_tool_call_name(&tool_call.function.name);
             if matches!(tool_status, ExecutionResultStatus::Succeeded) {
+                unresolved_tool_failures.retain(|(tool_name, _)| tool_name != &canonical_tool_name);
                 if let Some(failure) = validate_task_content_requirements(
                     task,
                     &canonical_tool_name,
@@ -971,6 +1035,50 @@ fn run_conversation_loop_inner(
         );
     }
 
+    if let Some(recovery_prompt) =
+        agent_spawn_requirement_recovery_prompt(task, task_store, &tool_call_records, &[])
+    {
+        append_task_error_turn_item(
+            event_bus,
+            session_store,
+            task_store,
+            task,
+            session_id,
+            workspace_id,
+            &turn_visibility,
+            &recovery_prompt,
+            streaming_entry_id.or(last_stream_item_id.as_deref()),
+        );
+        return (
+            TaskOutcome::Failed {
+                error: recovery_prompt,
+            },
+            context_summary,
+        );
+    }
+
+    if let Some(recovery_prompt) =
+        agent_coordination_recovery_prompt(task, task_store, &tool_call_records)
+    {
+        append_task_error_turn_item(
+            event_bus,
+            session_store,
+            task_store,
+            task,
+            session_id,
+            workspace_id,
+            &turn_visibility,
+            &recovery_prompt,
+            streaming_entry_id.or(last_stream_item_id.as_deref()),
+        );
+        return (
+            TaskOutcome::Failed {
+                error: recovery_prompt,
+            },
+            context_summary,
+        );
+    }
+
     if final_content.trim().is_empty() {
         let failure_reason = if had_tool_calls {
             "模型在工具调用后未返回最终回复"
@@ -1025,6 +1133,10 @@ fn run_conversation_loop_inner(
         );
     }
 
+    let failed_tool_summaries = unresolved_tool_failures
+        .iter()
+        .map(|(_, summary)| summary.clone())
+        .collect::<Vec<_>>();
     if let Some(failure_reason) = task_tool_failure_reason(task.kind, &failed_tool_summaries) {
         append_task_error_turn_item(
             event_bus,
@@ -1165,6 +1277,208 @@ fn validate_task_content_requirements(
     } else {
         Some(format!("{tool_name} 内容缺少 {}", missing.join(", ")))
     }
+}
+
+fn agent_coordination_recovery_prompt(
+    task: &Task,
+    task_store: &TaskStore,
+    tool_call_records: &[serde_json::Value],
+) -> Option<String> {
+    let child_tasks = task_store.get_children(&task.task_id);
+    if child_tasks.is_empty() {
+        return None;
+    }
+
+    let pending_child_ids = child_tasks
+        .iter()
+        .filter(|child| matches!(child.status, TaskStatus::Pending | TaskStatus::Running))
+        .map(|child| child.task_id.to_string())
+        .collect::<Vec<_>>();
+    if !pending_child_ids.is_empty() {
+        return Some(format!(
+            "你已经启动代理，但仍有代理未进入终态：{}。不要给最终答复；必须调用 agent_wait(task_ids=[...]) 等待并收集这些代理结果。如果部分代理不可用，agent_wait 会返回 degraded/fallback 指令，再由主线改派或接管。",
+            pending_child_ids.join(", ")
+        ));
+    }
+
+    let child_ids = child_tasks
+        .iter()
+        .map(|child| child.task_id.to_string())
+        .collect::<BTreeSet<_>>();
+    let collected_ids = collected_agent_wait_child_ids(tool_call_records);
+    let missing_ids = child_ids
+        .difference(&collected_ids)
+        .cloned()
+        .collect::<Vec<_>>();
+    if missing_ids.is_empty() {
+        return None;
+    }
+
+    Some(format!(
+        "代理已经进入终态，但主线尚未通过 agent_wait 收集这些代理结果：{}。不要直接总结；必须调用 agent_wait(task_ids=[...]) 读取 results[].assignment.goal、child_status、result.final_text 后再合并答复。",
+        missing_ids.join(", ")
+    ))
+}
+
+fn agent_spawn_requirement_recovery_prompt(
+    task: &Task,
+    task_store: &TaskStore,
+    tool_call_records: &[serde_json::Value],
+    proposed_tool_calls: &[ChatToolCall],
+) -> Option<String> {
+    if !agent_spawn_required_by_task(task) {
+        return None;
+    }
+    if !task_store.get_children(&task.task_id).is_empty() {
+        return None;
+    }
+    if agent_spawn_was_attempted(tool_call_records) {
+        return None;
+    }
+    if !proposed_tool_calls.is_empty()
+        && proposed_tool_calls
+            .iter()
+            .all(|tool_call| canonical_tool_call_name(&tool_call.function.name) == "agent_spawn")
+    {
+        return None;
+    }
+
+    Some(
+        "用户已经明确要求启动或派发代理。本轮第一步必须调用 agent_spawn 创建对应代理；不要用主线 shell_exec、file_read 或直接总结替代代理执行。若需要多个代理，应在同一轮发起多次 agent_spawn 并为每个代理写清 display_name、role、goal 与 access_mode。"
+            .to_string(),
+    )
+}
+
+fn agent_spawn_required_by_task(task: &Task) -> bool {
+    if task.parent_task_id.is_some() {
+        return false;
+    }
+    let text = format!("{} {}", task.title, task.goal);
+    let lowered = text.to_ascii_lowercase();
+    if contains_any(
+        &text,
+        &[
+            "不要启动代理",
+            "不要使用代理",
+            "不需要代理",
+            "无需代理",
+            "不要派发代理",
+        ],
+    ) || contains_any(
+        &lowered,
+        &[
+            "no agent",
+            "no agents",
+            "without agent",
+            "without agents",
+            "do not use agent",
+            "don't use agent",
+        ],
+    ) {
+        return false;
+    }
+
+    if lowered.contains("agent_spawn") {
+        return true;
+    }
+
+    let mentions_agent = text.contains("代理")
+        || lowered.contains("agent")
+        || lowered.contains("subagent")
+        || contains_any(
+            &lowered,
+            &["explorer", "reviewer", "architect", "executor", "tester"],
+        )
+        || contains_any(
+            &text,
+            &[
+                "探索工程师",
+                "评审工程师",
+                "架构师",
+                "执行工程师",
+                "测试工程师",
+            ],
+        );
+    if !mentions_agent {
+        return false;
+    }
+
+    contains_any(
+        &text,
+        &[
+            "启动", "派发", "分配", "调用", "创建", "使用", "拉起", "开启",
+        ],
+    ) || contains_any(
+        &lowered,
+        &[
+            "spawn",
+            "start",
+            "launch",
+            "dispatch",
+            "assign",
+            "use agent",
+            "use agents",
+        ],
+    )
+}
+
+fn agent_spawn_was_attempted(tool_call_records: &[serde_json::Value]) -> bool {
+    tool_call_records.iter().any(|record| {
+        record
+            .get("toolCall")
+            .and_then(|tool_call| tool_call.get("name"))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|name| canonical_tool_call_name(name) == "agent_spawn")
+    })
+}
+
+fn collected_agent_wait_child_ids(tool_call_records: &[serde_json::Value]) -> BTreeSet<String> {
+    let mut collected = BTreeSet::new();
+    for record in tool_call_records {
+        let Some(tool_call) = record.get("toolCall") else {
+            continue;
+        };
+        let Some(tool_name) = tool_call.get("name").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        if canonical_tool_call_name(tool_name) != "agent_wait" {
+            continue;
+        }
+        let Some(result_text) = tool_call.get("result").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let Ok(result_payload) = serde_json::from_str::<serde_json::Value>(result_text) else {
+            continue;
+        };
+        if result_payload
+            .get("timed_out")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let Some(results) = result_payload
+            .get("results")
+            .and_then(serde_json::Value::as_array)
+        else {
+            continue;
+        };
+        for result in results {
+            if let Some(child_task_id) = result
+                .get("child_task_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                collected.insert(child_task_id.to_string());
+            }
+        }
+    }
+    collected
+}
+
+fn contains_any(value: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| value.contains(needle))
 }
 
 fn task_required_content_literals(task: &Task) -> Vec<String> {
@@ -1677,6 +1991,9 @@ mod tests {
     struct TaskToolFailureThenFinalModelBridgeClient {
         invoke_count: AtomicUsize,
     }
+    struct RecoverableTaskToolFailureModelBridgeClient {
+        invoke_count: AtomicUsize,
+    }
 
     impl ModelBridgeClient for TaskToolBatchModelBridgeClient {
         fn invoke(
@@ -1840,6 +2157,63 @@ mod tests {
             if self.invoke_count.load(Ordering::SeqCst) > 0 {
                 on_delta(&ModelStreamingDelta {
                     content: "FLOW_SHOULD_NOT_COMPLETE".to_string(),
+                    thinking: String::new(),
+                });
+            }
+            self.invoke(request)
+        }
+    }
+
+    impl ModelBridgeClient for RecoverableTaskToolFailureModelBridgeClient {
+        fn invoke(
+            &self,
+            _request: ModelInvocationRequest,
+        ) -> Result<BridgeResponse, BridgeClientError> {
+            let index = self.invoke_count.fetch_add(1, Ordering::SeqCst);
+            let payload = match index {
+                0 => serde_json::json!({
+                    "content": null,
+                    "finish_reason": "tool_calls",
+                    "tool_calls": [{
+                        "id": "recoverable-tool-failure",
+                        "type": "function",
+                        "function": {
+                            "name": "recoverable_probe",
+                            "arguments": "{\"attempt\":1}"
+                        }
+                    }]
+                }),
+                1 => serde_json::json!({
+                    "content": null,
+                    "finish_reason": "tool_calls",
+                    "tool_calls": [{
+                        "id": "recoverable-tool-success",
+                        "type": "function",
+                        "function": {
+                            "name": "recoverable_probe",
+                            "arguments": "{\"attempt\":2}"
+                        }
+                    }]
+                }),
+                _ => serde_json::json!({
+                    "content": "工具失败已通过重试恢复，任务可以完成。",
+                    "finish_reason": "stop"
+                }),
+            };
+            Ok(BridgeResponse {
+                ok: true,
+                payload: payload.to_string(),
+            })
+        }
+
+        fn invoke_streaming(
+            &self,
+            request: ModelInvocationRequest,
+            on_delta: &dyn Fn(&ModelStreamingDelta),
+        ) -> Result<BridgeResponse, BridgeClientError> {
+            if self.invoke_count.load(Ordering::SeqCst) > 1 {
+                on_delta(&ModelStreamingDelta {
+                    content: "工具失败已通过重试恢复，任务可以完成。".to_string(),
                     thinking: String::new(),
                 });
             }
@@ -2122,6 +2496,9 @@ mod tests {
         name: &'static str,
         probe: Arc<ConcurrentTaskToolProbe>,
     }
+    struct RecoverableProbeTool {
+        attempts: AtomicUsize,
+    }
 
     impl ProbeTaskBuiltinTool {
         fn new(name: &'static str, probe: Arc<ConcurrentTaskToolProbe>) -> Self {
@@ -2148,6 +2525,40 @@ mod tests {
         fn spec(&self) -> BuiltinToolSpec {
             BuiltinToolSpec {
                 name: self.name.to_string(),
+                risk_level: RiskLevel::Low,
+                approval_requirement: ApprovalRequirement::None,
+            }
+        }
+    }
+
+    impl BuiltinTool for RecoverableProbeTool {
+        fn name(&self) -> &'static str {
+            "recoverable_probe"
+        }
+
+        fn execute(&self, input: &str, _context: &ToolExecutionContext) -> String {
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
+            if attempt == 1 {
+                return serde_json::json!({
+                    "tool": self.name(),
+                    "status": "failed",
+                    "error": "首次验证证据不足",
+                    "input": input,
+                })
+                .to_string();
+            }
+            serde_json::json!({
+                "tool": self.name(),
+                "status": "succeeded",
+                "stdout": "重试成功",
+                "input": input,
+            })
+            .to_string()
+        }
+
+        fn spec(&self) -> BuiltinToolSpec {
+            BuiltinToolSpec {
+                name: self.name().to_string(),
                 risk_level: RiskLevel::Low,
                 approval_requirement: ApprovalRequirement::None,
             }
@@ -2313,6 +2724,165 @@ mod tests {
     }
 
     #[test]
+    fn agent_coordination_blocks_final_until_children_are_waited() {
+        let task_store = TaskStore::new();
+        let root = make_task_loop_test_task("task-agent-coordination-root");
+        let mut child = make_task_loop_test_task("task-agent-coordination-child");
+        child.root_task_id = root.task_id.clone();
+        child.parent_task_id = Some(root.task_id.clone());
+        child.title = "目录观察代理".to_string();
+        child.status = TaskStatus::Running;
+        task_store.insert_task(root.clone());
+        task_store.insert_task(child.clone());
+
+        let pending_prompt = agent_coordination_recovery_prompt(&root, &task_store, &[])
+            .expect("running child should block final answer");
+        assert!(pending_prompt.contains("仍有代理未进入终态"));
+        assert!(pending_prompt.contains("agent_wait"));
+
+        child.status = TaskStatus::Completed;
+        child.output_refs = vec!["代理完成".to_string()];
+        task_store.insert_task(child.clone());
+        let missing_wait_prompt = agent_coordination_recovery_prompt(&root, &task_store, &[])
+            .expect("completed child without agent_wait should block final answer");
+        assert!(missing_wait_prompt.contains("尚未通过 agent_wait 收集"));
+
+        let timed_out_wait_record = serde_json::json!({
+            "type": "tool_call",
+            "toolCall": {
+                "name": "agent_wait",
+                "result": serde_json::json!({
+                    "tool": "agent_wait",
+                    "status": "timeout",
+                    "timed_out": true,
+                    "results": [{ "child_task_id": child.task_id.to_string() }]
+                }).to_string()
+            }
+        });
+        assert!(
+            agent_coordination_recovery_prompt(&root, &task_store, &[timed_out_wait_record])
+                .is_some(),
+            "timeout wait 不能算作已收集终态结果"
+        );
+
+        let completed_wait_record = serde_json::json!({
+            "type": "tool_call",
+            "toolCall": {
+                "name": "agent_wait",
+                "result": serde_json::json!({
+                    "tool": "agent_wait",
+                    "status": "succeeded",
+                    "timed_out": false,
+                    "results": [{ "child_task_id": child.task_id.to_string() }]
+                }).to_string()
+            }
+        });
+        assert!(
+            agent_coordination_recovery_prompt(&root, &task_store, &[completed_wait_record])
+                .is_none(),
+            "所有代理终态都被 agent_wait 收集后才能允许最终答复"
+        );
+    }
+
+    #[test]
+    fn explicit_agent_request_blocks_final_until_agent_spawn_is_attempted() {
+        let mut task = make_task_loop_test_task("task-agent-spawn-required-final");
+        task.goal = "只读验证：请启动两个只读代理并行工作，一个 explorer 检查目录结构，一个 reviewer 检查配置风险。两个代理都必须完成后再汇总。"
+            .to_string();
+
+        let outcome = run_static_task_final(&task, "我直接在主线完成检查。");
+
+        match outcome {
+            TaskOutcome::Failed { error } => {
+                assert!(error.contains("agent_spawn"));
+                assert!(error.contains("不要用主线"));
+            }
+            other => panic!("明确要求代理时不能直接 final，got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn explicit_agent_request_rejects_mainline_tool_substitution() {
+        let task_store = TaskStore::new();
+        let mut task = make_task_loop_test_task("task-agent-spawn-required-tools");
+        task.goal = "请启动 explorer 代理检查 /tmp，只读执行，代理完成后再汇总。".to_string();
+        task_store.insert_task(task.clone());
+        let shell_call = ChatToolCall {
+            id: "call-shell".to_string(),
+            kind: "function".to_string(),
+            function: magi_bridge_client::ChatToolFunction {
+                name: "shell_exec".to_string(),
+                arguments: serde_json::json!({
+                    "command": "ls /tmp",
+                    "access_mode": "read_only"
+                })
+                .to_string(),
+            },
+        };
+        let spawn_call = ChatToolCall {
+            id: "call-agent-spawn".to_string(),
+            kind: "function".to_string(),
+            function: magi_bridge_client::ChatToolFunction {
+                name: "agent_spawn".to_string(),
+                arguments: serde_json::json!({
+                    "role": "explorer",
+                    "display_name": "目录观察代理",
+                    "goal": "检查 /tmp 顶层结构",
+                    "access_mode": "read_only"
+                })
+                .to_string(),
+            },
+        };
+
+        assert!(
+            agent_spawn_requirement_recovery_prompt(&task, &task_store, &[], &[shell_call])
+                .is_some(),
+            "明确要求代理时，主线工具不能替代 agent_spawn"
+        );
+        assert!(
+            agent_spawn_requirement_recovery_prompt(&task, &task_store, &[], &[spawn_call])
+                .is_none(),
+            "同一轮真正发起 agent_spawn 时允许进入工具执行"
+        );
+
+        let attempted_spawn_record = serde_json::json!({
+            "type": "tool_call",
+            "toolCall": {
+                "name": "agent_spawn",
+                "result": serde_json::json!({
+                    "tool": "agent_spawn",
+                    "status": "degraded",
+                    "fallback_mode": "mainline_or_reassign",
+                    "instruction": "改派其他代理或由主线接管"
+                }).to_string()
+            }
+        });
+        assert!(
+            agent_spawn_requirement_recovery_prompt(
+                &task,
+                &task_store,
+                &[attempted_spawn_record],
+                &[]
+            )
+            .is_none(),
+            "agent_spawn 已尝试但不可用时，后续允许模型按工具结果改派或主线接管"
+        );
+    }
+
+    #[test]
+    fn ordinary_task_does_not_require_agent_spawn() {
+        let task_store = TaskStore::new();
+        let mut task = make_task_loop_test_task("task-no-agent-spawn-required");
+        task.goal = "检查 /tmp 顶层结构并汇总，不要修改文件。".to_string();
+        task_store.insert_task(task.clone());
+
+        assert!(
+            agent_spawn_requirement_recovery_prompt(&task, &task_store, &[], &[]).is_none(),
+            "普通任务不应被代理硬约束误伤"
+        );
+    }
+
+    #[test]
     fn action_task_failed_tool_prevents_completed_final() {
         let session_store = SessionStore::new();
         let event_bus = InMemoryEventBus::new(64);
@@ -2389,6 +2959,97 @@ mod tests {
                 assert!(error.contains("missing_builtin_tool"));
             }
             other => panic!("failed tool must fail action task, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn action_task_tool_failure_can_be_recovered_by_later_success() {
+        let session_store = SessionStore::new();
+        let event_bus = InMemoryEventBus::new(64);
+        let session_id = SessionId::new("session-task-recovered-tool-final");
+        let workspace_id = Some(WorkspaceId::new("workspace-task-recovered-tool-final"));
+        let task_store = TaskStore::new();
+        let task = make_task_loop_test_task("task-recovered-tool-final");
+        task_store.insert_task(task.clone());
+        let worker_id = WorkerId::new("worker-task-recovered-tool-final");
+        let lease = task_store
+            .grant_lease(
+                &task.task_id,
+                &task.root_task_id,
+                &worker_id,
+                "executor",
+                60_000,
+            )
+            .expect("lease should be granted");
+        let usage_binding = crate::usage_recording::session_turn_model_usage_binding(true);
+        let client = RecoverableTaskToolFailureModelBridgeClient {
+            invoke_count: AtomicUsize::new(0),
+        };
+        let tool_event_bus = Arc::new(InMemoryEventBus::new(8));
+        let mut tool_registry = ToolRegistry::new(
+            Arc::new(GovernanceService::default()),
+            Arc::clone(&tool_event_bus),
+        );
+        tool_registry.register_builtin(Arc::new(RecoverableProbeTool {
+            attempts: AtomicUsize::new(0),
+        }));
+        session_store
+            .create_session(session_id.clone(), "task recovered tool fixture")
+            .expect("session should be creatable");
+        let now = UtcMillis::now();
+        let (_, orchestrator_thread_id) =
+            session_store.ensure_session_mission(&session_id, now, || task.mission_id.clone());
+        let thread_id = orchestrator_thread_id.clone();
+
+        let (outcome, _) = run_conversation_loop(ConversationLoopRequest {
+            client: &client,
+            event_bus: &event_bus,
+            session_store: &session_store,
+            settings_store: None,
+            tool_registry: Some(&tool_registry),
+            skill_runtime: None,
+            task_store: &task_store,
+            execution_registry: &TaskExecutionRegistry::default(),
+            conversation_registry: &ConversationRegistry::new(),
+            agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
+            spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
+            safety_gate: None,
+            todo_ledger: &magi_todo_ledger::TodoLedger::new(),
+            project_memory: None,
+            mission_charter: None,
+            plan: None,
+            mission_workspace: None,
+            knowledge_graph: None,
+            validation_runner: None,
+            checkpoint: None,
+            human_checkpoint: None,
+            mission_metrics: None,
+            task: &task,
+            task_id: &task.task_id,
+            lease_id: &lease.lease_id,
+            session_id: &session_id,
+            workspace_id: &workspace_id,
+            prompt: "请先处理失败工具，再通过重试完成任务".to_string(),
+            tools: None,
+            usage_binding: &usage_binding,
+            streaming_entry_id: None,
+            is_sidechain: false,
+            worker_id: Some(&worker_id),
+            thread_id: &thread_id,
+            context_summary: None,
+            system_prompt: None,
+            workspace_root_path: None,
+        });
+
+        match outcome {
+            TaskOutcome::Completed { output_refs } => {
+                assert!(
+                    output_refs
+                        .first()
+                        .is_some_and(|content| content.contains("重试恢复"))
+                );
+            }
+            other => panic!("recovered tool failure should complete action task, got {other:?}"),
         }
     }
 

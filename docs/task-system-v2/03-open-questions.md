@@ -15,7 +15,7 @@ Mailbox 保持 push 模型。外部信号进入 mailbox，Conversation 只在 Tu
 
 - 不提供模型主动 peek/pull mailbox 的工具。
 - mailbox 项不得插入正在进行的模型 round。
-- `agent_spawn` 终态结果不进入 mailbox，而是作为同步 `tool_call_result` 回写父 turn。
+- `agent_spawn` 初始任务消息进入 child Conversation mailbox；代理终态结果由 `agent_wait` 从 TaskStore 收集。
 
 风险：
 
@@ -24,7 +24,7 @@ Mailbox 保持 push 模型。外部信号进入 mailbox，Conversation 只在 Tu
 验收：
 
 - 下一次 task turn 能看到该 runtime signal。
-- `agent_spawn` 完成后父 turn 能拿到结构化 `tool_call_result`。
+- `agent_spawn` 返回 `child_task_id` 后，父 turn 能通过 `agent_wait` 拿到结构化代理结果。
 
 ### 1.2 主编排
 
@@ -88,7 +88,7 @@ Checkpoint 服务恢复，不只是展示摘要。
 验收：
 
 - 进程重启后能恢复 active execution chain。
-- child 终态结果仍能作为 `agent_spawn` 的 `tool_call_result` 回写 parent turn。
+- child 终态结果仍能通过 `agent_wait` 回写 parent turn。
 
 落地状态：
 
@@ -216,7 +216,7 @@ Charter 是复杂任务契约，有生命周期。
 - 不创建 Mission。
 - session timeline 有清晰结果和必要工具证据。
 
-### 3.2 中等 single-worker task
+### 3.2 中等 single-agent task
 
 输入：修复一个明确 bug 并运行相关验证。
 
@@ -235,7 +235,7 @@ Charter 是复杂任务契约，有生命周期。
 
 - root task 使用主编排角色。
 - 主代理 spawn 子 task。
-- child 终态结果作为 `agent_spawn` 的 `tool_call_result` 回写父 turn。
+- child 终态结果通过 `agent_wait` 回写父 turn。
 - parent 汇总后完成。
 - SpawnGraph open edge 关闭。
 

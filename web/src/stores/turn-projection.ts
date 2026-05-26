@@ -278,8 +278,7 @@ function buildMessage(
       ...(roleId ? { roleId } : {}),
       // sourceThreadId 保留为底层审计事实；UI tab 路由只看 metadata.taskId。
       ...(item.sourceThreadId ? { sourceThreadId: item.sourceThreadId } : {}),
-      // metadata.taskId 是 RightPane task tab 按代理过滤 timeline 的唯一信号
-      // （Task #103 落地：每个 agent_spawn 工具调用产生独立 taskId，前端按此聚合）。
+      // metadata.taskId 是 RightPane task tab 按代理过滤 timeline 的唯一信号。
       ...(taskId ? { taskId } : {}),
       toolCallId: item.tool?.callId,
       toolName: item.tool?.name,

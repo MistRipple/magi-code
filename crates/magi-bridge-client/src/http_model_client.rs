@@ -24,7 +24,7 @@ use std::time::Duration;
 const OPENAI_BASE_URL_ENV: &str = "MAGI_OPENAI_COMPAT_BASE_URL";
 const OPENAI_API_KEY_ENV: &str = "MAGI_OPENAI_COMPAT_API_KEY";
 const OPENAI_MODEL_ENV: &str = "MAGI_OPENAI_COMPAT_MODEL";
-const MODEL_PROVIDER_MAX_IN_FLIGHT: usize = 2;
+const MODEL_PROVIDER_MAX_IN_FLIGHT: usize = 1;
 const MODEL_PROVIDER_MAX_RETRIES: usize = 2;
 const MODEL_PROVIDER_BACKOFF_BASE_MS: u64 = 200;
 
@@ -1972,6 +1972,37 @@ mod tests {
                 .expect("mock server should receive every retry attempt");
             assert_eq!(recorded.path, "/v1/chat/completions");
         }
+    }
+
+    #[test]
+    fn model_provider_gate_serializes_same_provider_key() {
+        let gate = Arc::new(ModelProviderGate {
+            slots: Mutex::new(HashMap::new()),
+        });
+        let first_permit = gate.acquire("anthropic-messages|http://localhost:8317/v1|kiro");
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let second_gate = Arc::clone(&gate);
+
+        let handle = std::thread::spawn(move || {
+            let _second_permit =
+                second_gate.acquire("anthropic-messages|http://localhost:8317/v1|kiro");
+            acquired_tx
+                .send(())
+                .expect("test receiver should still be alive");
+        });
+
+        assert!(
+            acquired_rx
+                .recv_timeout(Duration::from_millis(120))
+                .is_err(),
+            "同一 provider/model 必须排队，不能同时打到同一个模型端点"
+        );
+
+        drop(first_permit);
+        acquired_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("释放首个请求后，下一个同端点请求应继续执行");
+        handle.join().expect("waiting thread should not panic");
     }
 
     #[test]

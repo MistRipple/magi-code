@@ -3,13 +3,8 @@ use axum::{
     extract::{Query, State},
     routing::{get, post},
 };
-use magi_bridge_client::{
-    ChatToolChoice, ChatToolDefinition, ChatToolFunctionDefinition, LOOPBACK_MODEL_PROVIDER,
-    ModelInvocationRequest,
-};
 use magi_conversation_runtime::session_turn_execution::SessionTurnExecutionRequest;
 use magi_conversation_runtime::session_writeback::publish_current_session_turn_item_event;
-use magi_conversation_runtime::task_execution_dispatcher::{RoleTarget, resolve_target_for_role};
 use magi_conversation_runtime::{
     MailboxAuthor, MailboxKind, RuntimeSignal, task_execution_registry::TaskExecutionPlan,
 };
@@ -156,49 +151,16 @@ async fn submit_session_turn(
                     .ensure_session_mission(&session_id, accepted_at, || {
                         accepted.mission_id.clone()
                     });
-            let (entry_id, user_message_item_id) = match prompt_text.as_deref() {
-                Some(prompt_text) => {
-                    let entry_id = format!("timeline-{}-{}", session_id, accepted_at.0);
-                    let (user_message_item_id, user_message_item) = build_user_message_turn_item(
-                        accepted_at,
-                        prompt_text,
-                        &entry_id,
-                        signal.request_id.clone(),
-                        signal.user_message_id.clone(),
-                        signal.placeholder_message_id.clone(),
-                        Some(accepted.action_task_id.clone()),
-                        orchestrator_thread_id.clone(),
-                    );
-                    let updated = state
-                        .session_store
-                        .append_current_turn_item_with_timeline_entry(
-                            &session_id,
-                            entry_id.clone(),
-                            TimelineEntryKind::UserMessage,
-                            prompt_text,
-                            accepted_at,
-                            user_message_item,
-                        )
-                        .map_err(|error| {
-                            ApiError::internal_assembly("写入 continue 用户消息失败", error)
-                        })?;
-                    if updated.is_none() {
-                        return Err(ApiError::internal_assembly(
-                            "写入 continue 用户消息失败",
-                            "current_turn 不存在",
-                        ));
-                    }
-                    publish_session_user_message_created_event(
-                        &state,
-                        &session_id,
-                        session_workspace_for_event(&state, &session_id),
-                        accepted_at,
-                        prompt_text,
-                    );
-                    (entry_id, Some(user_message_item_id))
-                }
-                None => (format!("timeline-{}-{}", session_id, accepted_at.0), None),
-            };
+            let (entry_id, user_message_item_id) = write_continue_user_message(
+                &state,
+                &accepted,
+                prompt_text.as_deref(),
+                accepted_at,
+                signal.request_id,
+                signal.user_message_id,
+                signal.placeholder_message_id,
+                orchestrator_thread_id,
+            )?;
             finalize_continue_session(state.clone(), accepted.clone(), accepted_at);
             state.persist_runtime_durable_state()?;
             let event_id = publish_session_turn_continue_event(&state, &accepted, accepted_at)?;
@@ -387,15 +349,6 @@ fn decide_session_turn_with_task_planner(
     state: &ApiState,
     request: &SessionTurnRequestDto,
 ) -> Result<SessionTurnIntentDecision, ApiError> {
-    let client = resolve_target_for_role(
-        Some(&state.settings_store),
-        state.model_bridge_client().cloned(),
-        RoleTarget::Orchestrator,
-    )
-    .map_err(|error| ApiError::InvalidInput(format!("Session Turn 分类器模型配置不可用: {error}")))?
-    .ok_or_else(|| {
-        ApiError::InvalidInput("Session Turn 分类器未配置任务规划模型客户端".to_string())
-    })?;
     let has_recoverable_chain = request
         .requested_session_id()
         .or_else(|| {
@@ -406,23 +359,27 @@ fn decide_session_turn_with_task_planner(
         })
         .map(|session_id| session_has_recoverable_chain(state, &session_id))
         .unwrap_or(false);
-    let prompt = build_session_turn_classifier_prompt(request, has_recoverable_chain);
-    let response = client
-        .invoke(ModelInvocationRequest {
-            provider: LOOPBACK_MODEL_PROVIDER.to_string(),
-            prompt,
-            messages: None,
-            tools: Some(vec![session_turn_classifier_tool()]),
-            tool_choice: Some(ChatToolChoice::force_function("classify_session_turn")),
-        })
-        .map_err(|error| ApiError::model_invocation_failed("Session Turn 分类失败", error))?;
-    if !response.ok {
-        return Err(ApiError::ModelInvocationFailed(
-            "Session Turn 分类器返回失败状态".to_string(),
-        ));
+    if has_recoverable_chain && session_turn_requests_continue_existing_task(request) {
+        return Ok(SessionTurnIntentDecision {
+            route: SessionTurnRouteDto::Continue,
+            task_title: None,
+            execution_goal: None,
+            task_tier: TaskTier::ExecutionChain,
+            required_workers: Vec::new(),
+            tool_intent: None,
+            forced_tool_name: None,
+            required_tool_chain: Vec::new(),
+            confidence: 1.0,
+            reason_code: Some("continue_requested".to_string()),
+            route_reason: Some("用户明确要求继续当前可恢复执行链。".to_string()),
+            task_evidence: Vec::new(),
+        });
     }
-    let decision =
-        normalize_session_turn_decision(parse_session_turn_decision(&response.payload)?, request);
+
+    let decision = normalize_session_turn_decision(
+        local_session_turn_intent_decision(request, has_recoverable_chain),
+        request,
+    );
     if matches!(decision.route, SessionTurnRouteDto::Continue) && !has_recoverable_chain {
         return Err(ApiError::InvalidInput(
             "当前会话没有可继续的执行链".to_string(),
@@ -448,208 +405,74 @@ fn session_has_recoverable_chain(state: &ApiState, session_id: &SessionId) -> bo
     })
 }
 
-fn build_session_turn_classifier_prompt(
+fn local_session_turn_intent_decision(
     request: &SessionTurnRequestDto,
     has_recoverable_chain: bool,
-) -> String {
-    let user_text = request.trimmed_text().unwrap_or_default();
+) -> SessionTurnIntentDecision {
     let skill_name = request
         .skill_name
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or("");
-    format!(
-        "Session Turn 编排分类器\n\
-         请只调用 classify_session_turn 工具，输出本轮 route。\n\
-         route 只能是 chat、execute、task、continue。\n\
-         普通问答使用 chat；需要工具但不创建任务投影使用 execute；需要产品级任务编排使用 task；用户要求继续且存在可恢复链时使用 continue。\n\
-         明确要求画、绘制、生成或渲染流程图、关系图、架构图、时序图、Mermaid、DOT、Graphviz 等可视化图表时必须选择 execute，toolIntent 必须要求直接调用 diagram_render，不允许在 chat 中让用户自己调用工具。\n\
-         如果选择 task，必须给出 confidence、reasonCode、routeReason、taskTier 和至少 1 条 taskEvidence；只有明确需要多步骤结构化执行、实现/修复/重构、长期复杂任务或多 worker 协作时才选择 task。\n\
-         taskTier 只能是 execution_chain 或 long_mission。中等任务、多步骤实现、修复、调研、验证、多 worker 协作选择 execution_chain；跨多轮、多阶段、可中断恢复、长期事实沉淀、人审、计划审计或强验收闭环的复杂 Mission 选择 long_mission。\n\
-         普通问答、状态追问、简单解释和寒暄必须选择 chat，不能只因为措辞模糊就创建任务投影。\n\
-         userText={user_text}\n\
-         skillName=\"{skill_name}\"\n\
-         imageCount={}\n\
-         hasRecoverableChain={has_recoverable_chain}",
-        request.images.len()
-    )
-}
-
-fn session_turn_classifier_tool() -> ChatToolDefinition {
-    ChatToolDefinition {
-        kind: "function".to_string(),
-        function: ChatToolFunctionDefinition {
-            name: "classify_session_turn".to_string(),
-            description: "判断当前 Session Turn 应进入普通对话、工具执行、任务编排或继续会话。"
-                .to_string(),
-            parameters: json!({
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["route", "confidence", "reasonCode", "routeReason", "taskTier", "taskEvidence"],
-                "properties": {
-                    "route": {
-                        "type": "string",
-                        "enum": ["chat", "execute", "task", "continue"]
-                    },
-                    "confidence": {
-                        "type": "number",
-                        "minimum": 0,
-                        "maximum": 1
-                    },
-                    "reasonCode": {
-                        "type": ["string", "null"],
-                        "enum": [
-                            "plain_chat",
-                            "tool_request",
-                            "continue_requested",
-                            "explicit_task_request",
-                            "multi_step_task",
-                            "implementation_or_fix",
-                            "requires_structured_execution",
-                            "image_task",
-                            "skill_task",
-                            null
-                        ]
-                    },
-                    "routeReason": { "type": ["string", "null"] },
-                    "taskTier": {
-                        "type": "string",
-                        "enum": ["execution_chain", "long_mission"]
-                    },
-                    "taskEvidence": {
-                        "type": "array",
-                        "items": { "type": "string" }
-                    },
-                    "taskTitle": { "type": ["string", "null"] },
-                    "executionGoal": { "type": ["string", "null"] },
-                    "requiredWorkers": {
-                        "type": "array",
-                        "items": { "type": "string" }
-                    },
-                    "toolIntent": { "type": ["string", "null"] }
-                }
-            }),
-        },
-    }
-}
-
-fn parse_session_turn_decision(payload: &str) -> Result<SessionTurnIntentDecision, ApiError> {
-    let normalized_payload = payload
-        .trim()
-        .strip_prefix("loopback-model::")
-        .unwrap_or_else(|| payload.trim())
-        .trim();
-    let parsed =
-        serde_json::from_str::<serde_json::Value>(normalized_payload).map_err(|error| {
-            ApiError::InvalidInput(format!("Session Turn 分类器输出不是有效 JSON: {error}"))
-        })?;
-    let calls = parsed
-        .get("tool_calls")
-        .and_then(|value| value.as_array())
-        .ok_or_else(|| {
-            ApiError::InvalidInput(
-                "Session Turn 分类器未调用 classify_session_turn 工具".to_string(),
-            )
-        })?;
-    for call in calls {
-        if let Some(arguments) = classifier_arguments_from_tool_call(call) {
-            return session_turn_decision_from_value(arguments?);
-        }
-    }
-    Err(ApiError::InvalidInput(
-        "Session Turn 分类器未调用 classify_session_turn 工具".to_string(),
-    ))
-}
-
-fn classifier_arguments_from_tool_call(
-    call: &serde_json::Value,
-) -> Option<Result<serde_json::Value, ApiError>> {
-    let function = call.get("function")?;
-    if function.get("name").and_then(|value| value.as_str())? != "classify_session_turn" {
-        return None;
-    }
-    let Some(arguments) = function.get("arguments").and_then(|value| value.as_str()) else {
-        return Some(Err(ApiError::InvalidInput(
-            "Session Turn 分类器工具参数缺失".to_string(),
-        )));
+    let route = if has_recoverable_chain && session_turn_requests_continue_existing_task(request) {
+        SessionTurnRouteDto::Continue
+    } else if !skill_name.is_empty()
+        || !request.images.is_empty()
+        || session_turn_requests_task_by_local_rules(request)
+    {
+        SessionTurnRouteDto::Task
+    } else if session_turn_requests_execute_by_local_rules(request) {
+        SessionTurnRouteDto::Execute
+    } else {
+        SessionTurnRouteDto::Chat
     };
-    Some(serde_json::from_str(arguments).map_err(|error| {
-        ApiError::InvalidInput(format!("Session Turn 分类器工具参数不是有效 JSON: {error}"))
-    }))
-}
-
-fn session_turn_decision_from_value(
-    value: serde_json::Value,
-) -> Result<SessionTurnIntentDecision, ApiError> {
-    let route = match value.get("route").and_then(|value| value.as_str()) {
-        Some("chat") => SessionTurnRouteDto::Chat,
-        Some("execute") => SessionTurnRouteDto::Execute,
-        Some("task") => SessionTurnRouteDto::Task,
-        Some("continue") => SessionTurnRouteDto::Continue,
-        Some(other) => {
-            return Err(ApiError::InvalidInput(format!(
-                "Session Turn 分类器返回未知 route: {other}"
-            )));
-        }
-        None => {
-            return Err(ApiError::InvalidInput(
-                "Session Turn 分类器缺少 route".to_string(),
-            ));
-        }
+    let task_tier = if matches!(route, SessionTurnRouteDto::Task)
+        && session_turn_requests_explicit_long_mission(request)
+    {
+        TaskTier::LongMission
+    } else {
+        TaskTier::ExecutionChain
     };
-    let task_tier = match value.get("taskTier").and_then(|value| value.as_str()) {
-        Some("long_mission") => TaskTier::LongMission,
-        Some("execution_chain") | None => TaskTier::ExecutionChain,
-        Some(other) => {
-            return Err(ApiError::InvalidInput(format!(
-                "Session Turn 分类器返回未知 taskTier: {other}"
-            )));
-        }
+    let task_text = request
+        .trimmed_text()
+        .unwrap_or_else(|| request.timeline_message(None));
+    let task_evidence = if matches!(route, SessionTurnRouteDto::Task) {
+        vec!["本地路由判定需要结构化任务执行".to_string()]
+    } else {
+        Vec::new()
     };
-    Ok(SessionTurnIntentDecision {
+    SessionTurnIntentDecision {
         route,
-        task_title: optional_trimmed_string(&value, "taskTitle"),
-        execution_goal: optional_trimmed_string(&value, "executionGoal"),
+        task_title: matches!(route, SessionTurnRouteDto::Task)
+            .then(|| request.mission_title(Some(&task_text))),
+        execution_goal: matches!(route, SessionTurnRouteDto::Task).then_some(task_text.clone()),
         task_tier,
-        required_workers: value
-            .get("requiredWorkers")
-            .and_then(|value| value.as_array())
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(|value| value.as_str())
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .map(ToOwned::to_owned)
-                    .collect()
-            })
-            .unwrap_or_default(),
-        tool_intent: optional_trimmed_string(&value, "toolIntent"),
+        required_workers: Vec::new(),
+        tool_intent: matches!(route, SessionTurnRouteDto::Execute).then_some(task_text),
         forced_tool_name: None,
         required_tool_chain: Vec::new(),
-        confidence: value
-            .get("confidence")
-            .and_then(|value| value.as_f64())
-            .filter(|value| value.is_finite())
-            .unwrap_or(0.0)
-            .clamp(0.0, 1.0),
-        reason_code: optional_trimmed_string(&value, "reasonCode"),
-        route_reason: optional_trimmed_string(&value, "routeReason"),
-        task_evidence: value
-            .get("taskEvidence")
-            .and_then(|value| value.as_array())
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(|value| value.as_str())
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .map(ToOwned::to_owned)
-                    .collect()
-            })
-            .unwrap_or_default(),
-    })
+        confidence: 0.9,
+        reason_code: Some(
+            match route {
+                SessionTurnRouteDto::Continue => "continue_requested",
+                SessionTurnRouteDto::Task => "explicit_task_request",
+                SessionTurnRouteDto::Execute => "tool_request",
+                SessionTurnRouteDto::Chat | SessionTurnRouteDto::SupplementContext => "plain_chat",
+            }
+            .to_string(),
+        ),
+        route_reason: Some(
+            match route {
+                SessionTurnRouteDto::Continue => "用户要求继续且存在可恢复链",
+                SessionTurnRouteDto::Task => "用户请求需要结构化任务执行",
+                SessionTurnRouteDto::Execute => "用户请求需要工具执行但不需要任务投影",
+                SessionTurnRouteDto::Chat | SessionTurnRouteDto::SupplementContext => "普通对话",
+            }
+            .to_string(),
+        ),
+        task_evidence,
+    }
 }
 
 fn normalize_session_turn_decision(
@@ -741,6 +564,93 @@ fn normalize_session_turn_decision(
         }
     }
     decision
+}
+
+fn session_turn_requests_task_by_local_rules(request: &SessionTurnRequestDto) -> bool {
+    let Some(text) = request.trimmed_text() else {
+        return false;
+    };
+    let normalized = text.to_ascii_lowercase();
+    [
+        "分析并拆分",
+        "拆分任务",
+        "重新规划",
+        "实现",
+        "开发",
+        "修复",
+        "重构",
+        "收口",
+        "迭代",
+        "推进",
+        "多代理",
+        "多 agent",
+        "multi-agent",
+        "subagent",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
+}
+
+fn session_turn_requests_execute_by_local_rules(request: &SessionTurnRequestDto) -> bool {
+    let Some(text) = request.trimmed_text() else {
+        return false;
+    };
+    let normalized = text.to_ascii_lowercase();
+    [
+        "搜索",
+        "查找",
+        "查询",
+        "读取",
+        "打开",
+        "查看",
+        "执行",
+        "运行",
+        "列出",
+        "画",
+        "绘制",
+        "生成图",
+        "渲染图",
+        "mermaid",
+        "dot",
+        "graphviz",
+        "search",
+        "find",
+        "grep",
+        "rg",
+        "ls",
+        "cat",
+        "git",
+        "npm",
+        "cargo",
+        "test",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
+}
+
+fn session_turn_requests_continue_existing_task(request: &SessionTurnRequestDto) -> bool {
+    let Some(text) = request.trimmed_text() else {
+        return false;
+    };
+    let normalized = text.trim().to_ascii_lowercase();
+    [
+        "继续",
+        "继续推进",
+        "继续执行",
+        "继续跑",
+        "接着",
+        "接着做",
+        "接着推进",
+        "往下做",
+        "恢复任务",
+        "恢复执行",
+        "从刚才",
+        "从上次",
+        "resume",
+        "continue",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
 }
 
 fn session_turn_requests_explicit_long_mission(request: &SessionTurnRequestDto) -> bool {
@@ -891,15 +801,6 @@ fn session_turn_task_route_has_creation_evidence(decision: &SessionTurnIntentDec
         return false;
     }
     decision.task_title.is_some() || decision.execution_goal.is_some()
-}
-
-fn optional_trimmed_string(value: &serde_json::Value, key: &str) -> Option<String> {
-    value
-        .get(key)
-        .and_then(|value| value.as_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
 }
 
 fn build_user_message_turn_item(
@@ -1462,6 +1363,86 @@ fn publish_session_user_message_created_event(
     );
 }
 
+fn write_continue_user_message(
+    state: &ApiState,
+    accepted: &SessionContinueAccepted,
+    prompt_text: Option<&str>,
+    continued_at: UtcMillis,
+    request_id: Option<String>,
+    user_message_id: Option<String>,
+    placeholder_message_id: Option<String>,
+    orchestrator_thread_id: magi_core::ThreadId,
+) -> Result<(String, Option<String>), ApiError> {
+    let entry_id = format!("timeline-{}-{}", accepted.session_id, continued_at.0);
+    let Some(prompt_text) = prompt_text else {
+        return Ok((entry_id, None));
+    };
+    let (user_message_item_id, user_message_item) = build_user_message_turn_item(
+        continued_at,
+        prompt_text,
+        &entry_id,
+        request_id,
+        user_message_id,
+        placeholder_message_id,
+        Some(accepted.action_task_id.clone()),
+        orchestrator_thread_id,
+    );
+    let append_to_current_turn = state
+        .session_store
+        .runtime_sidecar(&accepted.session_id)
+        .and_then(|sidecar| sidecar.current_turn)
+        .is_some_and(|turn| turn_status_is_interruptible(&turn.status));
+    if append_to_current_turn {
+        let updated = state
+            .session_store
+            .append_current_turn_item_with_timeline_entry(
+                &accepted.session_id,
+                entry_id.clone(),
+                TimelineEntryKind::UserMessage,
+                prompt_text,
+                continued_at,
+                user_message_item,
+            )
+            .map_err(|error| ApiError::internal_assembly("写入 continue 用户消息失败", error))?;
+        if updated.is_none() {
+            return Err(ApiError::internal_assembly(
+                "写入 continue 用户消息失败",
+                "current_turn 不存在",
+            ));
+        }
+    } else {
+        let mut turn = ActiveExecutionTurn {
+            turn_id: format!("turn-session-continue-{}", continued_at.0),
+            turn_seq: continued_at.0 as u64,
+            accepted_at: continued_at,
+            status: "running".to_string(),
+            completed_at: None,
+            user_message: Some(prompt_text.to_string()),
+            items: vec![user_message_item],
+        };
+        turn.normalize();
+        state
+            .session_store
+            .accept_current_turn_with_timeline_entry(
+                accepted.session_id.clone(),
+                entry_id.clone(),
+                TimelineEntryKind::UserMessage,
+                prompt_text,
+                continued_at,
+                turn,
+            )
+            .map_err(|error| ApiError::internal_assembly("写入 continue 用户消息失败", error))?;
+    }
+    publish_session_user_message_created_event(
+        state,
+        &accepted.session_id,
+        session_workspace_for_event(state, &accepted.session_id),
+        continued_at,
+        prompt_text,
+    );
+    Ok((entry_id, Some(user_message_item_id)))
+}
+
 fn current_turn_streaming_timeline_entry_ids(
     state: &ApiState,
     session_id: &SessionId,
@@ -1665,43 +1646,16 @@ async fn continue_session(
         state
             .session_store
             .ensure_session_mission(&session_id, continued_at, || accepted.mission_id.clone());
-    if let Some(prompt_text) = prompt_text.as_deref() {
-        let entry_id = format!("timeline-{}-{}", session_id, continued_at.0);
-        let (_, user_message_item) = build_user_message_turn_item(
-            continued_at,
-            prompt_text,
-            &entry_id,
-            request_id,
-            user_message_id,
-            placeholder_message_id,
-            Some(accepted.action_task_id.clone()),
-            orchestrator_thread_id.clone(),
-        );
-        let updated = state
-            .session_store
-            .append_current_turn_item_with_timeline_entry(
-                &session_id,
-                entry_id,
-                TimelineEntryKind::UserMessage,
-                prompt_text,
-                continued_at,
-                user_message_item,
-            )
-            .map_err(|error| ApiError::internal_assembly("写入 continue 用户消息失败", error))?;
-        if updated.is_none() {
-            return Err(ApiError::internal_assembly(
-                "写入 continue 用户消息失败",
-                "current_turn 不存在",
-            ));
-        }
-        publish_session_user_message_created_event(
-            &state,
-            &session_id,
-            session_workspace_for_event(&state, &session_id),
-            continued_at,
-            prompt_text,
-        );
-    }
+    let _ = write_continue_user_message(
+        &state,
+        &accepted,
+        prompt_text.as_deref(),
+        continued_at,
+        request_id,
+        user_message_id,
+        placeholder_message_id,
+        orchestrator_thread_id,
+    )?;
     finalize_continue_session(state.clone(), accepted.clone(), continued_at);
     state.persist_runtime_durable_state()?;
     let event_id = EventId::new(format!("event-session-continue-{}", continued_at.0));
@@ -2362,6 +2316,89 @@ mod tests {
             route_reason: Some("classifier returned chat".to_string()),
             task_evidence: Vec::new(),
         }
+    }
+
+    #[test]
+    fn explicit_continue_text_is_detected_before_classifier() {
+        let request = session_turn_request("继续推进刚才未完成的任务");
+
+        assert!(session_turn_requests_continue_existing_task(&request));
+    }
+
+    #[test]
+    fn session_turn_routing_does_not_require_model_bridge_for_plain_message() {
+        let state = test_state();
+        let request = session_turn_request("你好，解释一下当前状态");
+
+        let decision = decide_session_turn_with_task_planner(&state, &request)
+            .expect("本地路由不应依赖外部模型");
+
+        assert!(matches!(decision.route, SessionTurnRouteDto::Chat));
+    }
+
+    #[test]
+    fn continue_user_message_opens_new_running_turn_after_terminal_turn() {
+        let state = test_state();
+        let session_id = SessionId::new("session-continue-new-turn");
+        let mission_id = MissionId::new("mission-continue-new-turn");
+        let root_task_id = TaskId::new("task-root-continue-new-turn");
+        let action_task_id = TaskId::new("task-action-continue-new-turn");
+        let now = UtcMillis::now();
+        state
+            .session_store
+            .create_session(session_id.clone(), "继续测试")
+            .expect("session should create");
+        state
+            .session_store
+            .upsert_current_turn(
+                session_id.clone(),
+                ActiveExecutionTurn {
+                    turn_id: "turn-old-failed".to_string(),
+                    turn_seq: 1,
+                    accepted_at: now,
+                    status: "failed".to_string(),
+                    completed_at: Some(now),
+                    user_message: Some("旧任务".to_string()),
+                    items: Vec::new(),
+                },
+            )
+            .expect("failed turn should persist");
+
+        let accepted = SessionContinueAccepted {
+            session_id: session_id.clone(),
+            mission_id,
+            root_task_id,
+            action_task_id: action_task_id.clone(),
+            execution_chain_ref: "chain-continue-new-turn".to_string(),
+            resumed_branch_count: 1,
+            runner_started: true,
+        };
+        let (_, user_item_id) = write_continue_user_message(
+            &state,
+            &accepted,
+            Some("继续推进"),
+            UtcMillis(now.0 + 1),
+            None,
+            None,
+            None,
+            magi_core::ThreadId::new("thread-orchestrator-continue-new-turn"),
+        )
+        .expect("continue message should write");
+
+        let turn = state
+            .session_store
+            .runtime_sidecar(&session_id)
+            .and_then(|sidecar| sidecar.current_turn)
+            .expect("current turn should exist");
+        assert_eq!(turn.status, "running");
+        assert_ne!(turn.turn_id, "turn-old-failed");
+        assert_eq!(turn.user_message.as_deref(), Some("继续推进"));
+        assert_eq!(turn.items.len(), 1);
+        assert_eq!(turn.items[0].task_id.as_ref(), Some(&action_task_id));
+        assert_eq!(
+            user_item_id.as_deref(),
+            Some(turn.items[0].item_id.as_str())
+        );
     }
 
     #[test]

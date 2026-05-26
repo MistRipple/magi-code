@@ -15,6 +15,7 @@
     hasActiveLocalTimelineTurn,
   } from '../stores/messages.svelte';
   import { i18n } from '../stores/i18n.svelte';
+  import { formatElapsed } from '../lib/utils';
 
   // Props - Svelte 5 语法
   interface Props {
@@ -33,8 +34,21 @@
     displayContext?: 'thread' | 'task';
     /** 当前面板是否处于可见激活状态（用于 display:none -> visible 场景下的滚动恢复） */
     isActive?: boolean;
+    /** 外部任务运行态：右侧代理 tab 用 task status 驱动同一套响应动画 */
+    runtimeActive?: boolean;
+    /** 外部任务运行起点：右侧代理 tab 用 task.created_at 计时 */
+    runtimeStartedAt?: number;
   }
-  let { taskId, renderItems, emptyState, readOnly = false, displayContext = 'thread', isActive = true }: Props = $props();
+  let {
+    taskId,
+    renderItems,
+    emptyState,
+    readOnly = false,
+    displayContext = 'thread',
+    isActive = true,
+    runtimeActive = false,
+    runtimeStartedAt = 0,
+  }: Props = $props();
 
   const safeRenderItems = $derived(
     (renderItems || [])
@@ -46,6 +60,12 @@
   const currentSessionId = $derived.by(() => (
     typeof messagesState.currentSessionId === 'string' ? messagesState.currentSessionId.trim() : ''
   ));
+  const runtimePanelKey = $derived(`${currentSessionId}:${displayContext}:${taskId || ''}`);
+  const normalizedRuntimeStartedAt = $derived(
+    typeof runtimeStartedAt === 'number' && Number.isFinite(runtimeStartedAt)
+      ? Math.max(0, Math.floor(runtimeStartedAt))
+      : 0
+  );
 
   const safeRenderMessages = $derived.by(() => activeRenderItems.map((item) => item.message));
 
@@ -84,44 +104,68 @@
     return null;
   });
 
-  const currentStreamingMessage = $derived.by(() => currentStreamingRenderItem?.message || null);
+  function messageMetadataString(message: Message, key: string): string {
+    const value = message.metadata?.[key];
+    return typeof value === 'string' ? value.trim() : '';
+  }
+
+  function isLiveTurnStatus(status: string): boolean {
+    return status === 'pending' || status === 'running';
+  }
+
+  const currentRuntimeRenderItem = $derived.by(() => {
+    if (currentStreamingRenderItem) {
+      return currentStreamingRenderItem;
+    }
+    const hasThreadRuntime = displayContext === 'thread' && messagesState.isProcessing;
+    const hasTaskRuntime = displayContext === 'task' && runtimeActive;
+    if (!hasThreadRuntime && !hasTaskRuntime) {
+      return null;
+    }
+    for (let i = activeRenderItems.length - 1; i >= 0; i -= 1) {
+      const item = activeRenderItems[i];
+      if (isLiveTurnStatus(messageMetadataString(item.message, 'turnStatus'))) {
+        return item;
+      }
+    }
+    return activeRenderItems[activeRenderItems.length - 1] || null;
+  });
 
   // 计时器代表「整个 turn 还在跑」，锚到该 turn 内 displayOrder 最大的非 user_input render item，
   // 槽位渲染在 .message-content 末尾，使指示器始终位于当前 turn 最下方一张卡片的底部。
   // 反向遍历 activeRenderItems（已按 displayOrder 升序排列）找匹配 turnId 的第一项即为末尾项；
   // 跳过 user_input 是因为 user 模板无 streaming-indicator 槽位，命中后会导致整 turn 无指示器。
   const streamingIndicatorRenderKey = $derived.by(() => {
-    const streamingItem = currentStreamingRenderItem;
-    if (!streamingItem) {
+    const runtimeItem = currentRuntimeRenderItem;
+    if (!runtimeItem) {
       return null;
     }
-    const turnId = typeof streamingItem.message.metadata?.turnId === 'string'
-      ? streamingItem.message.metadata.turnId.trim()
-      : '';
+    const turnId = messageMetadataString(runtimeItem.message, 'turnId');
     if (!turnId) {
-      return streamingItem.key;
+      return runtimeItem.message.type === 'user_input' ? null : runtimeItem.key;
     }
     for (let i = activeRenderItems.length - 1; i >= 0; i -= 1) {
       const item = activeRenderItems[i];
       if (item.message.type === 'user_input') {
         continue;
       }
-      const itemTurnId = typeof item.message.metadata?.turnId === 'string'
-        ? item.message.metadata.turnId.trim()
-        : '';
+      const itemTurnId = messageMetadataString(item.message, 'turnId');
       if (itemTurnId === turnId) {
         return item.key;
       }
     }
-    return streamingItem.key;
+    return runtimeItem.message.type === 'user_input' ? null : runtimeItem.key;
   });
 
   const resolvedStreamingStartAt = $derived.by(() => {
-    const message = currentStreamingMessage;
+    const message = currentRuntimeRenderItem?.message || null;
     if (!message) {
       return 0;
     }
-    const processingStartAt = messagesState.thinkingStartAt;
+    if (displayContext === 'task' && normalizedRuntimeStartedAt > 0) {
+      return normalizedRuntimeStartedAt;
+    }
+    const processingStartAt = displayContext === 'thread' ? messagesState.thinkingStartAt : 0;
     if (
       typeof processingStartAt === 'number'
       && Number.isFinite(processingStartAt)
@@ -137,15 +181,15 @@
   });
 
   let stableStreamingStartAt = $state(0);
-  let stableStreamingSessionId = $state('');
+  let stableStreamingPanelKey = $state('');
 
   $effect(() => {
-    const sessionId = currentSessionId || '';
-    if (sessionId !== stableStreamingSessionId) {
-      stableStreamingSessionId = sessionId;
+    const panelKey = runtimePanelKey || '';
+    if (panelKey !== stableStreamingPanelKey) {
+      stableStreamingPanelKey = panelKey;
       stableStreamingStartAt = 0;
     }
-    if (!currentStreamingMessage) {
+    if (!currentRuntimeRenderItem) {
       stableStreamingStartAt = 0;
       return;
     }
@@ -161,8 +205,14 @@
   const timerStartTime = $derived.by(() => stableStreamingStartAt);
 
   const shouldRunTimer = $derived.by(() => {
-    return timerStartTime > 0;
+    return timerStartTime > 0 && Boolean(currentRuntimeRenderItem);
   });
+
+  const showStandaloneStreamingIndicator = $derived.by(() => (
+    shouldRunTimer
+    && streamingIndicatorRenderKey === null
+    && activeRenderItems.length > 0
+  ));
 
   let elapsedSeconds = $state(0);
   let timerInterval: ReturnType<typeof setInterval> | null = null;
@@ -564,6 +614,14 @@
           streamingElapsedSeconds={item.key === streamingIndicatorRenderKey ? elapsedSeconds : 0}
         />
       {/each}
+      {#if showStandaloneStreamingIndicator}
+        <div class="streaming-indicator-standalone" aria-label={i18n.t('runtimeState.status.running')}>
+          <span class="streaming-dot"></span>
+          <span class="streaming-dot"></span>
+          <span class="streaming-dot"></span>
+          <span class="streaming-elapsed-time">{formatElapsed(elapsedSeconds)}</span>
+        </div>
+      {/if}
     {/if}
   </div>
 
@@ -714,6 +772,51 @@
     opacity: 0.65;
   }
 
+  .streaming-indicator-standalone {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-height: 24px;
+    padding: var(--space-1) 0;
+    margin-top: calc(-1 * var(--space-1));
+    color: var(--foreground-muted);
+  }
+
+  .streaming-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--foreground-muted);
+    opacity: 0.72;
+    animation: streamingBounce 1.4s ease-in-out infinite;
+  }
+
+  .streaming-dot:nth-child(2) {
+    animation-delay: 0.2s;
+  }
+
+  .streaming-dot:nth-child(3) {
+    animation-delay: 0.4s;
+  }
+
+  .streaming-elapsed-time {
+    margin-left: var(--space-1);
+    font-size: var(--text-xs);
+    color: var(--foreground-muted);
+    font-variant-numeric: tabular-nums;
+    line-height: 1;
+  }
+
+  @keyframes streamingBounce {
+    0%, 80%, 100% {
+      transform: scale(0.72);
+      opacity: 0.46;
+    }
+    40% {
+      transform: scale(1);
+      opacity: 0.9;
+    }
+  }
 
   /* 滚动按钮 - 绝对定位在消息列表右下角 */
   .scroll-to-bottom {

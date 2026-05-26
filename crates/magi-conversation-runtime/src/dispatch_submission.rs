@@ -25,6 +25,7 @@ use magi_spawn_graph::SpawnGraph;
 
 use crate::session_thread;
 
+use crate::settings_store::SettingsStore;
 use crate::task_execution_registry::{TaskExecutionPlan, TaskExecutionRegistry};
 
 pub struct DispatchSubmissionGraph {
@@ -72,6 +73,7 @@ pub struct DispatchSubmissionRuntime<'a> {
     pub agent_role_registry: &'a AgentRoleRegistry,
     pub spawn_graph: &'a Mutex<SpawnGraph>,
     pub model_bridge_client: Option<&'a Arc<dyn ModelBridgeClient>>,
+    pub settings_store: Option<&'a Arc<SettingsStore>>,
     pub workspace_root_path: Option<&'a Path>,
 }
 
@@ -167,9 +169,9 @@ fn build_task_policy(task_tier: TaskTier) -> magi_core::TaskPolicy {
 }
 
 fn infer_dispatch_task_role(skill_name: Option<&str>, task_tier: TaskTier) -> &'static str {
-    // Task #103 起 agent_spawn 改为同步工具调用，主线入口任务（用户从聊天框发出的 turn）
+    // agent_spawn / agent_wait 都是 coordinator 工具，主线入口任务（用户从聊天框发出的 turn）
     // 必须由 coordinator role 承接，否则 `task_can_see_builtin_tool` 会把 agent_spawn /
-    // TodoWrite / MemoryWrite 全部判为不可见，模型在运行期看不到协调器工具——再没有任何
+    // agent_wait / TodoWrite / MemoryWrite 全部判为不可见，模型在运行期看不到协调器工具——再没有任何
     // 后续路径能补救。LongMission / ExecutionChain 在这一点上同构：主线入口都是协调器。
     //
     // 代理（executor / reviewer / tester / explorer / architect）由 `execute_coordinator_tool`
@@ -348,6 +350,9 @@ pub fn run_dispatch_submission(
         execution_chain_ref: execution_chain_ref.clone(),
         ..ExecutionOwnership::default()
     };
+    let execution_settings_snapshot = runtime
+        .settings_store
+        .map(|store| Arc::new(store.execution_snapshot()));
     runtime.execution_registry.insert(
         act_task_id.clone(),
         TaskExecutionPlan::Dispatch {
@@ -376,6 +381,7 @@ pub fn run_dispatch_submission(
             ),
             use_tools: true,
             skill_name: request.skill_name.clone(),
+            execution_settings_snapshot,
         },
     );
 
@@ -565,6 +571,7 @@ mod tests {
             agent_role_registry: &agent_role_registry,
             spawn_graph: &spawn_graph,
             model_bridge_client: None,
+            settings_store: None,
             workspace_root_path: None,
         };
 
@@ -647,6 +654,7 @@ mod tests {
             agent_role_registry: &agent_role_registry,
             spawn_graph: &spawn_graph,
             model_bridge_client: None,
+            settings_store: None,
             workspace_root_path: None,
         };
 
@@ -747,6 +755,7 @@ mod tests {
             agent_role_registry: &agent_role_registry,
             spawn_graph: &spawn_graph,
             model_bridge_client: None,
+            settings_store: None,
             workspace_root_path: None,
         };
 
@@ -861,6 +870,7 @@ mod tests {
             agent_role_registry: &agent_role_registry,
             spawn_graph: &spawn_graph,
             model_bridge_client: None,
+            settings_store: None,
             workspace_root_path: None,
         };
 

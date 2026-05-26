@@ -705,7 +705,7 @@
     gap: 12px;
   }
 
-  /* ---------- Left: Workers List ---------- */
+  /* ---------- Left: Agents List ---------- */
   .stats-left {
     background: var(--ind-bg-card);
     border: 1px solid var(--ind-border-card);

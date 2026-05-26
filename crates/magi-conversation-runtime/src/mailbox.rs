@@ -27,8 +27,8 @@ pub enum MailboxAuthor {
 
 /// Mailbox 信号类型。与 v2 架构文档保持一致的运行时信号分类。
 ///
-/// 注：原代理结果旁路信号已随同步 agent_spawn 改造移除——代理终态
-/// 直接以 tool_call_result 形式返回给父代理本轮 LLM 上下文，不再走 mailbox 回流。
+/// 注：代理初始任务、追问、系统 followup 等都统一进入 Conversation
+/// mailbox；代理终态结果由 agent_wait 从 TaskStore 读取。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum MailboxKind {

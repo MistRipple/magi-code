@@ -10,8 +10,8 @@
 //! - **边（edge）**：父 spawn 子的有向关系，附带 `TaskKind`、状态（`Open`/`Closed`）、
 //!   创建/关闭时间戳。一条边 = 一次 spawn 行为。
 //! - **回执路由**：子节点完成（status=Closed）后通过 `mark_closed` 标记；上层
-//!   调用 `parent_of(child)` 找回父任务，并把代理终态作为 `agent_spawn` 的
-//!   `tool_call_result` 回写父 turn。
+//!   调用 `parent_of(child)` 找回父任务。代理终态结果不旁路回写父 turn，
+//!   父任务需要结果时通过 `agent_wait` 从 TaskStore 收集。
 //! - **级联停止**：`open_descendants(root)` 一次返回所有未关闭的子孙节点，
 //!   交给 caller 逐个取消（SpawnGraph 不直接调度任务，只提供拓扑）。
 //! - **限制**：`enforce_limits` 在 `add_edge` 时检查 max_depth / max_fanout，

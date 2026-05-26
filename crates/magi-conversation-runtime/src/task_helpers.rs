@@ -19,7 +19,10 @@ pub const MAX_TOOL_CALL_ROUNDS: usize = 32;
 pub(crate) fn is_orchestration_builtin_tool(tool: BuiltinToolName) -> bool {
     matches!(
         tool,
-        BuiltinToolName::AgentSpawn | BuiltinToolName::TodoWrite | BuiltinToolName::MemoryWrite
+        BuiltinToolName::AgentSpawn
+            | BuiltinToolName::TodoWrite
+            | BuiltinToolName::MemoryWrite
+            | BuiltinToolName::AgentWait
     )
 }
 
@@ -78,7 +81,7 @@ pub(crate) fn task_can_see_builtin_tool(
 ///   会把它归到主线时间线。orchestrator 自身 turn 与无独立详情页的子任务
 ///   都走这条路径。
 /// - `Sidechain`：item.source_thread_id = task thread，归到对应代理详情。
-///   Task #103 起 agent_spawn 改为同步工具调用，主线由父代理的 ToolCall 卡承接展示，
+///   agent_spawn 的主线可见部分由父代理 ToolCall 卡承接展示，
 ///   sidechain 不再向主线写摘要 item。代理与父代理的 item 在前端按 `metadata.taskId`
 ///   过滤到 RightPane 子标签，主线仅 turnSeq/itemSeq 排序，因此本变体不再持有
 ///   lane_id/lane_seq——它们随 Task #105 退役。
@@ -177,8 +180,8 @@ pub fn apply_task_worker_detail_visibility(
     apply_task_turn_visibility(item, task, visibility);
 }
 
-/// final 回复的归属规则与执行细节一致：sidechain task 的 final 永远只归 task 详情。
-/// Task #103 起主线由父代理的 agent_spawn ToolCall 卡承接代理状态，sidechain 不再向主线写摘要。
+/// final 回复的归属规则与执行细节一致：代理 task 的 final 永远只归 task 详情。
+/// 主线由父代理的 agent_spawn ToolCall 卡承接代理入口，sidechain 不再向主线写摘要。
 pub fn apply_task_final_visibility(
     item: &mut ActiveExecutionTurnItem,
     task_store: &TaskStore,

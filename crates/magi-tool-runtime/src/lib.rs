@@ -53,10 +53,11 @@ pub enum BuiltinToolName {
     // ── 知识库 ──
     KnowledgeQuery,
     // ── 协调器（Task System v2 L10，仅 coordinator_mode 角色可见）──
-    /// 派发新的代理执行子任务。该工具是同步阻塞 tool call：父代理在该 tool_call
-    /// 上等待，直到代理跑完整个对话，最终输出作为 tool_call_result 直接回写到
-    /// 父代理上下文，不再走 mailbox 路由。同一 turn 内多个 agent_spawn 调用并发执行。
+    /// 派发新的代理执行子任务。该工具只创建代理并投递初始任务消息；
+    /// 后续由 agent_wait 收集代理终态结果。
     AgentSpawn,
+    /// 等待一个或多个已派发代理进入终态，并把代理最终答复返回给主线。
+    AgentWait,
     // ── In-session 思维锚点（Task System v2 L13）──
     /// 写入本 session 的 TodoLedger。整体替换列表语义（参考 claude-code 的 TodoWrite）。
     /// 由 orchestration 层拦截，不进入 ToolRegistry。
@@ -108,7 +109,7 @@ pub enum BuiltinToolName {
 }
 
 impl BuiltinToolName {
-    pub const ALL: [Self; 30] = [
+    pub const ALL: [Self; 31] = [
         Self::FileRead,
         Self::FileWrite,
         Self::FilePatch,
@@ -131,6 +132,7 @@ impl BuiltinToolName {
         Self::DiagramRender,
         Self::KnowledgeQuery,
         Self::AgentSpawn,
+        Self::AgentWait,
         Self::TodoWrite,
         Self::MemoryWrite,
         Self::MissionCharterWrite,
@@ -165,6 +167,7 @@ impl BuiltinToolName {
             Self::DiagramRender => "diagram_render",
             Self::KnowledgeQuery => "knowledge_query",
             Self::AgentSpawn => "agent_spawn",
+            Self::AgentWait => "agent_wait",
             Self::TodoWrite => "todo_write",
             Self::MemoryWrite => "memory_write",
             Self::MissionCharterWrite => "mission_charter_write",
@@ -200,6 +203,7 @@ impl BuiltinToolName {
             "diagram_render" => Some(Self::DiagramRender),
             "knowledge_query" | "project_knowledge_query" => Some(Self::KnowledgeQuery),
             "agent_spawn" | "agent" | "spawn_agent" => Some(Self::AgentSpawn),
+            "agent_wait" | "wait_agent" => Some(Self::AgentWait),
             "todo_write" | "todowrite" | "todo" => Some(Self::TodoWrite),
             "memory_write" | "memorywrite" | "memory" => Some(Self::MemoryWrite),
             "mission_charter_write" | "missioncharterwrite" | "mission_charter" => {
@@ -247,6 +251,26 @@ impl BuiltinToolName {
         )
     }
 
+    pub fn is_runtime_internal_tool_call(&self) -> bool {
+        matches!(
+            self,
+            Self::ProcessLaunch
+                | Self::ProcessRead
+                | Self::ProcessWrite
+                | Self::ProcessKill
+                | Self::ProcessList
+                | Self::AgentWait
+                | Self::TodoWrite
+                | Self::MemoryWrite
+                | Self::MissionCharterWrite
+                | Self::PlanWrite
+                | Self::KgWrite
+                | Self::ValidationRecord
+                | Self::Checkpoint
+                | Self::HumanCheckpointRequest
+        )
+    }
+
     pub fn default_risk_level(&self) -> RiskLevel {
         match self {
             Self::FileRead
@@ -260,6 +284,7 @@ impl BuiltinToolName {
             | Self::WebFetch
             | Self::DiagramRender
             | Self::KnowledgeQuery
+            | Self::AgentWait
             | Self::TodoWrite
             | Self::MemoryWrite
             | Self::MissionCharterWrite
@@ -366,17 +391,23 @@ impl BuiltinToolName {
             }
             Self::KnowledgeQuery => "查询项目知识库：检索 README、文档与代码文档",
             Self::AgentSpawn => {
-                "向已注册的代理角色同步派发一个子任务（architect / executor / reviewer 等）。该工具是同步阻塞调用：父代理在本轮停在该 tool call 上等待代理跑完整个对话，最终输出作为 tool_call_result 直接回写到父代理上下文，不再走 mailbox 回流。同一轮调用多次 agent_spawn 时所有代理并发执行。若返回 status=degraded，表示代理当前不可用，父代理必须改派其他可用角色或由主线继续完成，不能直接停止任务。\n\n\
+                "向已注册的代理角色派发一个子任务（architect / executor / reviewer 等）。该工具只创建代理并投递初始任务消息，立即返回代理 task_id；后续使用 agent_wait 收集代理终态结果。若返回 status=degraded，表示代理当前不可用，父代理必须改派其他可用角色或由主线继续完成，不能直接停止任务。\n\n\
                 # 何时用\n\
                 - 任务可拆出 1 个或多个明确边界的子工作单元，且子单元能独立完成（有清晰输入、输出、验收）\n\
                 - 需要专家视角（reviewer 做代码审查、explorer 做根因定位、tester 做验证）\n\
                 - 多个子工作可并行执行节省时间\n\n\
+                # 权限模式\n\
+                - access_mode 必须表达本次代理是否允许写入：read_only 禁止写文件和写类 shell；read_write 按父任务策略允许必要写入\n\
+                - 用户要求只读、审查、探索、方案分析、风险验证时使用 read_only\n\
+                - 只有明确需要落地修改、生成文件、补测试或执行修复时才使用 read_write\n\n\
                 # 何时不用\n\
                 - 1-3 步能自己完成的任务 → 直接做，派发开销不值\n\
                 - 子任务需要你在场即时回答澄清问题 → 自己做更顺\n\
                 - 仅是查询性问题（找文件 / 读代码） → 用 search_text / file_read，不要派 agent\n\n\
                 # display_name 写法\n\
                 - 长度 3-30 个字符，前端代理卡片直接展示\n\
+                - 如果用户明确给出了 display_name 或要求使用某个代理名称，必须原样使用该名称，不要自行改写、缩短或泛化\n\
+                - 如果用户同时指定 role / display_name / access_mode，把这些值视为强制参数契约逐项转写；不要替换 role、不要重命名、不要把两个代理合并成一个\n\
                 - 要让用户一眼看出『谁在做什么具体的事』，写成「职责 + 对象」短语\n\
                 - ✅ 例：『登录流程审查员』『订单模块迁移设计师』『支付冒烟测试执行人』\n\
                 - ❌ 反例：纯角色名『executor』『reviewer-1』；冗长重复『执行删除日志模块的所有引用并跑通测试的执行器』\n\n\
@@ -384,7 +415,24 @@ impl BuiltinToolName {
                 - ❌ 派 executor 去「改一行配置」→ 启动开销远超价值\n\
                 - ❌ 派 reviewer 去「看看代码好不好」（边界模糊、验收不清）\n\
                 - ✅ 派 reviewer 审查具体 PR：「审查 commits abc..def 的安全性，按通过 / 不通过给结论」\n\
-                - ✅ 派 executor 实现独立模块：「在 crate X 实现 Y trait，跑通 cargo test -p X」"
+                - ✅ 派 executor 实现独立模块：「在 crate X 实现 Y trait，跑通 cargo test -p X」\n\n\
+                # 返回结果处理\n\
+                - 返回 `status=started` 时，记录 `child_task_id`，后续通过 `agent_wait` 等待和收集结果\n\
+                - 不要在依赖代理结果的情况下直接给最终答复；必须先调用 `agent_wait`\n\
+                - agent_wait 返回 `child_status=completed` 时，`result.final_text` 是该代理的最终答复，`assignment.goal` 是你派给它的原始目标\n\
+                - 同一轮多个代理返回后，先按任务合并结论、证据、风险与缺口，再生成主线最终答复；不要把多个代理输出原样拼贴给用户\n\
+                - 返回 `status=degraded` 时代表代理不可用但主线必须继续：改派其他合适角色，或由主线基于已有上下文直接推进\n\
+                - 返回 `status=failed` 时先判断是否可补救；能补救就重派或改派，只有真实阻断时才向用户说明失败"
+            }
+            Self::AgentWait => {
+                "等待一个或多个已派发代理进入终态，并把代理最终答复作为结构化结果返回给主线。用于收集 agent_spawn 创建的代理结果；不要用轮询式重复调用，只有当下一步依赖代理结果时才调用。\n\n\
+                # 参数\n\
+                - task_ids：agent_spawn 返回的 child_task_id 列表\n\
+                - timeout_ms：可选等待时长，默认 300000，范围 1000-1800000\n\n\
+                # 返回结果处理\n\
+                - `results[].child_status=completed`：读取 `results[].result.final_text` 并对照 `assignment.goal` 汇总\n\
+                - `results[].child_status=failed/killed`：判断是否可改派或由主线接管，不要自动把单个代理失败当作整体失败\n\
+                - `timed_out=true`：说明至少一个代理仍未完成；可以继续做不依赖该代理的工作，或稍后再次等待"
             }
             Self::TodoWrite => {
                 "用给定列表整体替换当前会话的 TodoLedger（沿用 claude-code TodoWrite 语义）。用于把长任务拆分成步骤并跟踪进度；ledger 快照会自动注入到后续 Turn。每次调用整体覆盖。\n\n\
@@ -529,7 +577,7 @@ impl BuiltinToolName {
                     "timeout_ms": { "type": "integer", "description": "执行超时（毫秒）" },
                     "access_mode": {
                         "type": "string",
-                        "description": "声明命令访问模式：read_only / maybe_write / explicit_write。ls、cat、grep、git status、git diff、不会改文件的测试等只读探查请用 read_only。",
+                        "description": "声明命令访问模式：read_only / maybe_write / explicit_write。ls、cat、grep、git status、git diff、不会改文件的测试等只读探查请用 read_only。只读探测中“文件不存在/无匹配”属于可汇报结果时，命令必须用 if/else、|| true 或末尾 true 保证整体退出码为 0，避免把可恢复探测误判为任务失败。",
                         "enum": ["read_only", "maybe_write", "explicit_write"]
                     },
                     "background": { "type": "boolean", "description": "在后台启动而不阻塞等待完成" }
@@ -572,7 +620,8 @@ impl BuiltinToolName {
             }),
             Self::ProcessList => serde_json::json!({
                 "type": "object",
-                "properties": {}
+                "properties": {},
+                "required": []
             }),
             Self::ProcessInspect => serde_json::json!({
                 "type": "object",
@@ -582,7 +631,8 @@ impl BuiltinToolName {
                     "name": { "type": "string", "description": "query 的别名" },
                     "pattern": { "type": "string", "description": "query 的别名" },
                     "limit": { "type": "integer", "description": "最大匹配条数" }
-                }
+                },
+                "required": []
             }),
             Self::DiffPreview => serde_json::json!({
                 "type": "object",
@@ -599,7 +649,8 @@ impl BuiltinToolName {
                     "right_path": { "type": "string", "description": "after_path 的别名" },
                     "left_label": { "type": "string", "description": "before_label 的别名" },
                     "right_label": { "type": "string", "description": "after_label 的别名" }
-                }
+                },
+                "required": []
             }),
             Self::WebSearch => serde_json::json!({
                 "type": "object",
@@ -690,9 +741,14 @@ impl BuiltinToolName {
             Self::AgentSpawn => serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "role": { "type": "string", "description": "已注册的代理角色 id，如 architect / executor / explorer / reviewer / tester。不要传 coordinator，主线协调身份由当前主模型承接。" },
-                    "display_name": { "type": "string", "description": "本次派发的代理实例展示名（3-30 个字符），用于前端代理卡片标题。要求高度概括本次具体职责，例如『登录流程审查员』『支付迁移设计师』『冒烟测试执行人』；不要写成纯角色名（如『executor』）或冗长目标重复。" },
+                    "role": { "type": "string", "description": "已注册的代理角色 id，如 architect / executor / explorer / reviewer / tester。不要传 coordinator，主线协调身份由当前主模型承接。若用户明确指定 role，必须原样使用，不得替换成你认为更接近的角色。" },
+                    "display_name": { "type": "string", "description": "本次派发的代理实例展示名（3-30 个字符），用于前端代理卡片标题。若用户明确给出 display_name 或指定代理名称，必须原样使用；不得自行改写、缩短、泛化或把两个指定代理合并。否则要求高度概括本次具体职责，例如『登录流程审查员』『支付迁移设计师』『冒烟测试执行人』；不要写成纯角色名（如『executor』）或冗长目标重复。" },
                     "goal": { "type": "string", "description": "子任务的具体目标；角色级 system prompt 会与该目标合并使用" },
+                    "access_mode": {
+                        "type": "string",
+                        "enum": ["read_only", "read_write"],
+                        "description": "本次代理的权限模式。read_only 禁止写工具和写类 shell；read_write 按父任务策略允许必要写入。用户要求只读、审查、探索、方案分析或风险验证时必须用 read_only。"
+                    },
                     "task_kind": {
                         "type": "string",
                         "enum": ["work_package", "action", "validation", "repair"],
@@ -702,7 +758,22 @@ impl BuiltinToolName {
                     "working_dir": { "type": "string", "description": "可选的绝对工作目录；默认沿用父任务的 workspace 根目录" },
                     "parallelism_group": { "type": "string", "description": "可选的并行组名；同一 SpawnGraph 分支下相同组名的子 agent 互斥执行" }
                 },
-                "required": ["role", "display_name", "goal"]
+                "required": ["role", "display_name", "goal", "access_mode"]
+            }),
+            Self::AgentWait => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "task_ids": {
+                        "type": "array",
+                        "description": "要等待的代理 task_id 列表，来自 agent_spawn 返回的 child_task_id",
+                        "items": { "type": "string" }
+                    },
+                    "timeout_ms": {
+                        "type": "integer",
+                        "description": "可选等待时长，默认 300000，范围 1000-1800000"
+                    }
+                },
+                "required": ["task_ids"]
             }),
             Self::TodoWrite => serde_json::json!({
                 "type": "object",
@@ -791,7 +862,8 @@ impl BuiltinToolName {
                         "items": { "type": "string" },
                         "description": "需要被尊重的相关人或角色。"
                     }
-                }
+                },
+                "required": []
             }),
             Self::PlanWrite => serde_json::json!({
                 "type": "object",
@@ -1795,7 +1867,7 @@ mod tests {
         path
     }
 
-    fn all_builtin_tools() -> [BuiltinToolName; 30] {
+    fn all_builtin_tools() -> [BuiltinToolName; BuiltinToolName::ALL.len()] {
         BuiltinToolName::ALL
     }
 
@@ -4371,6 +4443,7 @@ mod tests {
                 "diagram_render",
                 "knowledge_query",
                 "agent_spawn",
+                "agent_wait",
                 "todo_write",
                 "memory_write",
                 "mission_charter_write",
@@ -4406,6 +4479,26 @@ mod tests {
                 public_specs
                     .iter()
                     .all(|spec| spec.name != internal_tool.as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn public_object_schemas_always_define_required_array() {
+        for tool in BuiltinToolName::ALL {
+            if !tool.is_public_tool_surface() {
+                continue;
+            }
+            let schema = tool.parameters_schema();
+            if schema.get("type").and_then(serde_json::Value::as_str) != Some("object") {
+                continue;
+            }
+            assert!(
+                schema
+                    .get("required")
+                    .is_some_and(serde_json::Value::is_array),
+                "{} schema must define required as an array for OpenAI-compatible providers",
+                tool.as_str()
             );
         }
     }

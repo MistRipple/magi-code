@@ -1,0 +1,1482 @@
+<!doctype html>
+<!--
+  magi · 设置面板重构 mockup
+  -----------------------------------
+  作者注（Junior Designer pass · 锚点）
+
+  一、前置分析摘要（来自上一轮，作为本设计的依据）
+    · 角色 Tab 的卡片 340px min-width 网格，单卡 ~120px 高，但实际信息只有
+      avatar + 名称 + 两行描述 + 引擎下拉 + Toggle，信息密度 < 50%。
+      inherit-pill 表达的"继承 default"和引擎下拉的"继承 orchestrator"是
+      同一件事的两种表达，违反 cn-engineering「不让同一功能并存多实现」。
+    · 统计 Tab 顶部三大冗余汇总数字 = 底下 widget 之和，是会计账面而非洞察。
+      卡片间缺横向对比维度（占比/趋势/对照均值），只能逐个读数。
+      并且 "worker" 在角色 Tab 指 roleTemplate、在统计 Tab 指 engine slot，
+      用户分不清当前看的是哪一层 → 提议的"双视角"是这层混淆的产物。
+
+  二、本 mockup 的设计意图
+    密度 ↑  ：单元从卡片 (120px) → 行 (38px)，从 widget 网格 → 紧凑列表
+    对比 ↑  ：β 方案右侧给切片占比条；统计 strip 给"Top 1 / 最近 1h / 高错率"洞察
+    重复 ↓  ：删 inherit-pill，让引擎下拉自我说明状态
+
+  三、未动产品代码，仅在 _temp/design-demos/ 下产出。
+-->
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <title>magi · Settings Mockup</title>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    :root {
+      --bg-page: #f5f5f7;
+      --bg-card: rgba(255, 255, 255, 0.92);
+      --bg-card-elevated: #ffffff;
+      --bg-control: rgba(0, 0, 0, 0.03);
+      --bg-control-hover: rgba(0, 0, 0, 0.06);
+      --border-card: rgba(60, 60, 67, 0.16);
+      --border-card-strong: rgba(60, 60, 67, 0.20);
+      --border-control: rgba(60, 60, 67, 0.14);
+      --border-separator: rgba(60, 60, 67, 0.10);
+      --ink: #1d1d1f;
+      --ink-secondary: #515154;
+      --ink-muted: #86868b;
+      --ink-soft: #aeaeb2;
+      --success: #34c759;
+      --warning: #ff9f0a;
+      --error: #ff3b30;
+      --info: #0a84ff;
+      --radius-card: 12px;
+      --radius-control: 8px;
+      --radius-avatar: 6px;
+      --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.04), 0 6px 18px rgba(0, 0, 0, 0.05);
+      --font-stack: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", sans-serif;
+    }
+    html, body {
+      margin: 0;
+      padding: 0;
+      background: var(--bg-page);
+      color: var(--ink);
+      font-family: var(--font-stack);
+      font-size: 14px;
+      -webkit-font-smoothing: antialiased;
+      text-rendering: optimizeLegibility;
+    }
+    body {
+      padding: 40px 48px 80px;
+      max-width: 1320px;
+      margin: 0 auto;
+    }
+    h1, h2, h3, h4 { margin: 0; font-weight: 600; letter-spacing: -0.01em; color: var(--ink); }
+    h1 { font-size: 28px; letter-spacing: -0.025em; }
+    h2 { font-size: 18px; }
+    .page-head { margin-bottom: 28px; }
+    .page-head .lede {
+      margin-top: 8px;
+      color: var(--ink-muted);
+      font-size: 13px;
+      line-height: 1.55;
+      max-width: 720px;
+    }
+
+    /* ============ 顶部设计 spec strip ============ */
+    .spec-strip {
+      display: grid;
+      grid-template-columns: 1.1fr 1.2fr 1fr;
+      gap: 16px;
+      padding: 20px 22px;
+      background: var(--bg-card);
+      border: 1px solid var(--border-card);
+      border-radius: var(--radius-card);
+      box-shadow: var(--shadow-card);
+      margin-bottom: 36px;
+    }
+    .spec-block .spec-label {
+      font-size: 10px;
+      font-weight: 600;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--ink-muted);
+      margin-bottom: 10px;
+    }
+    .swatch-row { display: flex; gap: 8px; flex-wrap: wrap; }
+    .swatch {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-start;
+      gap: 4px;
+      min-width: 0;
+    }
+    .swatch .chip {
+      width: 38px;
+      height: 38px;
+      border-radius: 8px;
+      border: 1px solid var(--border-separator);
+      box-sizing: border-box;
+    }
+    .swatch .chip-text {
+      font-size: 9.5px;
+      font-family: ui-monospace, SFMono-Regular, "SF Mono", monospace;
+      color: var(--ink-muted);
+      line-height: 1.2;
+    }
+    .type-scale-row { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; }
+    .type-sample { display: flex; flex-direction: column; gap: 2px; }
+    .type-sample .meta {
+      font-size: 9.5px;
+      color: var(--ink-soft);
+      font-family: ui-monospace, monospace;
+    }
+    .intent-list {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      margin: 0;
+      padding: 0;
+      list-style: none;
+    }
+    .intent-list li {
+      font-size: 12px;
+      color: var(--ink-secondary);
+      line-height: 1.5;
+    }
+    .intent-list li::before {
+      content: '— ';
+      color: var(--ink-soft);
+    }
+    .intent-list .badge-up {
+      display: inline-block;
+      font-size: 9.5px;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      padding: 1px 5px;
+      border-radius: 4px;
+      background: rgba(52, 199, 89, 0.12);
+      color: #1c8f3f;
+      margin-right: 4px;
+      vertical-align: 1px;
+    }
+    .intent-list .badge-down {
+      display: inline-block;
+      font-size: 9.5px;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      padding: 1px 5px;
+      border-radius: 4px;
+      background: rgba(255, 59, 48, 0.12);
+      color: #c1271e;
+      margin-right: 4px;
+      vertical-align: 1px;
+    }
+
+    /* ============ 段落分割 ============ */
+    .section {
+      margin-bottom: 56px;
+    }
+    .section-head {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      margin-bottom: 18px;
+      padding-bottom: 10px;
+      border-bottom: 1px solid var(--border-separator);
+    }
+    .section-head h2 .num {
+      display: inline-block;
+      width: 26px;
+      height: 26px;
+      line-height: 26px;
+      text-align: center;
+      background: var(--ink);
+      color: #fff;
+      border-radius: 50%;
+      font-size: 11px;
+      font-weight: 700;
+      margin-right: 10px;
+      vertical-align: 3px;
+    }
+    .section-head .sub {
+      font-size: 12px;
+      color: var(--ink-muted);
+    }
+
+    .variant {
+      margin-bottom: 28px;
+    }
+    .variant-head {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 12px;
+    }
+    .variant-head .tag {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      padding: 3px 8px;
+      border-radius: 999px;
+      text-transform: uppercase;
+    }
+    .tag.baseline { background: rgba(60, 60, 67, 0.10); color: var(--ink-secondary); }
+    .tag.alt { background: rgba(10, 132, 255, 0.10); color: var(--info); }
+    .tag.recommended {
+      background: rgba(52, 199, 89, 0.14);
+      color: #1c8f3f;
+    }
+    .variant-head .title {
+      font-size: 14px;
+      font-weight: 600;
+      color: var(--ink);
+    }
+    .variant-head .note {
+      font-size: 11.5px;
+      color: var(--ink-muted);
+    }
+
+    /* ============ Mockup 容器（设置面板 inner）============ */
+    .settings-frame {
+      background: var(--bg-page);
+      border: 1px solid var(--border-card);
+      border-radius: 14px;
+      padding: 18px 18px 20px;
+      box-shadow: var(--shadow-card);
+    }
+    .frame-tab-bar {
+      display: flex;
+      gap: 4px;
+      padding-bottom: 10px;
+      margin-bottom: 14px;
+      border-bottom: 1px solid var(--border-separator);
+    }
+    .frame-tab {
+      font-size: 12px;
+      font-weight: 500;
+      color: var(--ink-muted);
+      padding: 6px 10px;
+      border-radius: 6px;
+      cursor: default;
+    }
+    .frame-tab.active {
+      background: rgba(0, 0, 0, 0.04);
+      color: var(--ink);
+      font-weight: 600;
+    }
+
+    /* ============ 角色 Tab · 现状（卡片网格 340 min）============ */
+    .agent-grid-baseline {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+      gap: 12px;
+    }
+    .agent-tile {
+      background: var(--bg-card);
+      border: 1px solid var(--border-card);
+      border-radius: var(--radius-card);
+      padding: 14px 18px 18px 16px;
+      box-shadow: var(--shadow-card);
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .agent-tile.is-disabled { opacity: 0.55; filter: grayscale(0.35); border-style: dashed; }
+    .tile-head { display: flex; align-items: center; justify-content: space-between; min-height: 24px; }
+    .tile-brand { display: flex; align-items: center; gap: 8px; min-width: 0; }
+    .avatar-sq {
+      width: 22px; height: 22px;
+      border-radius: var(--radius-avatar);
+      display: flex; align-items: center; justify-content: center;
+      flex-shrink: 0;
+    }
+    .name-line { display: flex; align-items: center; gap: 6px; min-width: 0; }
+    .name-txt {
+      font-size: 13px; font-weight: 650; color: var(--ink);
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+      letter-spacing: -0.01em;
+    }
+    .badge-core {
+      font-size: 8px; font-weight: 700; padding: 1px 5px;
+      border-radius: 5px;
+      background: rgba(60, 60, 67, 0.06);
+      border: 1px solid var(--border-separator);
+      color: var(--ink-soft);
+      letter-spacing: 0.06em;
+    }
+    .tile-body {
+      min-height: 32px; display: flex; align-items: center;
+    }
+    .summary-txt {
+      margin: 0;
+      font-size: 11px;
+      color: var(--ink-muted);
+      line-height: 1.45;
+      display: -webkit-box;
+      -webkit-line-clamp: 2;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+    }
+    .tile-foot {
+      display: flex; align-items: center; justify-content: space-between; gap: 8px;
+      margin-top: auto;
+      padding-top: 4px;
+    }
+    .inherit-pill {
+      display: inline-flex; align-items: center; gap: 6px;
+      font-size: 10px; font-weight: 600;
+      color: var(--ink-soft);
+    }
+    .status-dot {
+      width: 4.5px; height: 4.5px; border-radius: 50%;
+      background: var(--success);
+      box-shadow: 0 0 6px rgba(52, 199, 89, 0.55);
+    }
+    .engine-select {
+      display: flex; align-items: center; gap: 6px;
+      height: 28px;
+      padding: 0 8px;
+      width: 150px;
+      background: rgba(0, 0, 0, 0.01);
+      border: 1px solid var(--border-control);
+      border-radius: var(--radius-control);
+      font-size: 10.5px;
+      color: var(--ink-secondary);
+      box-sizing: border-box;
+    }
+    .engine-select .label {
+      flex: 1; min-width: 0;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .toggle {
+      width: 32px; height: 18px;
+      border-radius: 999px;
+      background: var(--success);
+      position: relative;
+      flex-shrink: 0;
+    }
+    .toggle::after {
+      content: '';
+      position: absolute;
+      top: 1.5px; left: 15.5px;
+      width: 15px; height: 15px;
+      border-radius: 50%;
+      background: #fff;
+      box-shadow: 0 1px 2px rgba(0,0,0,0.18);
+    }
+    .toggle.off { background: rgba(120, 120, 128, 0.32); }
+    .toggle.off::after { left: 1.5px; }
+
+    /* ============ 角色 Tab · 方案 A（紧凑卡 240）============ */
+    .agent-grid-compact {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+      gap: 10px;
+    }
+    .agent-tile-compact {
+      background: var(--bg-card);
+      border: 1px solid var(--border-card);
+      border-radius: var(--radius-card);
+      padding: 10px 12px;
+      box-shadow: var(--shadow-card);
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .compact-head { display: flex; align-items: center; gap: 8px; min-width: 0; }
+    .compact-head .name-line { flex: 1; min-width: 0; }
+    .compact-head .name-line .name-txt { font-size: 12.5px; }
+    .compact-head .desc-inline {
+      font-size: 10.5px;
+      color: var(--ink-muted);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .compact-foot {
+      display: flex; align-items: center; gap: 8px;
+      justify-content: space-between;
+    }
+    .compact-foot .engine-select { width: 100%; height: 26px; font-size: 10px; }
+
+    /* ============ 角色 Tab · 方案 B（单行列表）============ */
+    .agent-list {
+      display: flex;
+      flex-direction: column;
+      background: var(--bg-card);
+      border: 1px solid var(--border-card);
+      border-radius: var(--radius-card);
+      box-shadow: var(--shadow-card);
+      overflow: hidden;
+    }
+    .agent-row {
+      display: grid;
+      grid-template-columns: 28px minmax(140px, 1.1fr) minmax(0, 2fr) 156px 40px;
+      align-items: center;
+      gap: 12px;
+      padding: 9px 16px;
+      border-bottom: 1px solid var(--border-separator);
+      min-height: 40px;
+      box-sizing: border-box;
+    }
+    .agent-row:last-child { border-bottom: none; }
+    .agent-row:hover { background: rgba(0,0,0,0.018); }
+    .agent-row .row-name {
+      display: flex; align-items: center; gap: 6px; min-width: 0;
+    }
+    .agent-row .row-name .name-txt { font-size: 12.5px; }
+    .agent-row .row-desc {
+      font-size: 11px;
+      color: var(--ink-muted);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .agent-row .engine-select { height: 26px; width: 100%; font-size: 10px; }
+    .agent-row.is-disabled { opacity: 0.5; }
+    .agent-row.is-disabled .row-desc { color: var(--ink-soft); }
+
+    /* ============ 统计 Tab · 现状 ============ */
+    .stats-dashboard-bar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 14px;
+      background: rgba(0, 0, 0, 0.025);
+      border: 1px solid var(--border-card);
+      border-radius: var(--radius-card);
+      padding: 14px 20px;
+      margin-bottom: 16px;
+    }
+    .summary-row { display: flex; align-items: center; gap: 22px; }
+    .summary-item { display: flex; align-items: baseline; gap: 6px; }
+    .summary-value {
+      font-size: 22px; font-weight: 700;
+      color: var(--ink);
+      font-variant-numeric: tabular-nums;
+      letter-spacing: -0.5px;
+    }
+    .summary-label {
+      font-size: 10px; font-weight: 600;
+      color: var(--ink-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    .summary-divider { width: 1px; height: 24px; background: var(--border-separator); }
+    .actions-row { display: flex; gap: 8px; }
+    .btn {
+      display: inline-flex; align-items: center; gap: 6px;
+      height: 30px; padding: 0 12px;
+      background: var(--bg-card);
+      border: 1px solid var(--border-control);
+      border-radius: var(--radius-control);
+      font-size: 11.5px;
+      color: var(--ink-secondary);
+      cursor: default;
+    }
+    .btn.danger { color: var(--error); border-color: rgba(255,59,48,0.25); }
+    .stats-widget-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(290px, 1fr));
+      gap: 12px;
+    }
+    .widget-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border-card);
+      border-radius: var(--radius-card);
+      padding: 14px 18px 18px 16px;
+      box-shadow: var(--shadow-card);
+      min-height: 136px;
+      display: flex;
+      flex-direction: column;
+    }
+    .widget-card.error { background: rgba(255, 59, 48, 0.05); border-color: rgba(255, 59, 48, 0.2); }
+    .widget-card.disabled { opacity: 0.6; filter: grayscale(0.8); }
+    .widget-header {
+      display: flex; justify-content: space-between; align-items: flex-start;
+      margin-bottom: 4px;
+    }
+    .widget-status {
+      display: flex; align-items: center; gap: 4px;
+      padding: 3px 6px;
+      background: rgba(0,0,0,0.04);
+      border-radius: 10px;
+      font-size: 8.5px;
+      font-weight: 600;
+    }
+    .widget-status.success { color: var(--success); }
+    .widget-status.error { color: var(--error); }
+    .widget-status.disabled { color: var(--ink-muted); }
+    .widget-status .ind {
+      width: 5px; height: 5px; border-radius: 50%; background: currentColor;
+    }
+    .widget-body {
+      flex: 1;
+      margin-bottom: 8px;
+    }
+    .model-text {
+      font-size: 11.5px; color: var(--ink-muted); font-weight: 500;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .error-text {
+      font-size: 11px; color: var(--error); font-weight: 500; line-height: 1.3;
+      display: -webkit-box;
+      -webkit-line-clamp: 2;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+    }
+    .metric-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      column-gap: 8px;
+      row-gap: 6px;
+      margin-top: auto;
+    }
+    .metric-block { display: flex; flex-direction: column; gap: 1px; }
+    .metric-value {
+      font-size: 14.5px; font-weight: 700; color: var(--ink);
+      font-variant-numeric: tabular-nums;
+      letter-spacing: -0.3px;
+      line-height: 1.1;
+    }
+    .metric-label {
+      font-size: 8.5px; font-weight: 600;
+      color: var(--ink-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+
+    /* ============ 统计 Tab · 方案 α（子 tab）============ */
+    .sub-tab-bar {
+      display: inline-flex;
+      padding: 3px;
+      background: rgba(0,0,0,0.05);
+      border-radius: 8px;
+      margin-bottom: 14px;
+    }
+    .sub-tab {
+      padding: 5px 12px;
+      font-size: 11.5px;
+      font-weight: 500;
+      color: var(--ink-muted);
+      border-radius: 6px;
+    }
+    .sub-tab.active {
+      background: var(--bg-card-elevated);
+      color: var(--ink);
+      font-weight: 600;
+      box-shadow: 0 1px 2px rgba(0,0,0,0.06);
+    }
+
+    /* ============ 统计 Tab · 方案 β（左视角列 + 右切片）============ */
+    .insight-strip {
+      display: grid;
+      grid-template-columns: 1.2fr 1fr 1fr;
+      gap: 0;
+      background: var(--bg-card);
+      border: 1px solid var(--border-card);
+      border-radius: var(--radius-card);
+      box-shadow: var(--shadow-card);
+      overflow: hidden;
+      margin-bottom: 14px;
+    }
+    .insight-cell {
+      padding: 12px 18px;
+      border-right: 1px solid var(--border-separator);
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .insight-cell:last-child { border-right: none; }
+    .insight-cell .insight-kicker {
+      font-size: 9.5px;
+      font-weight: 600;
+      color: var(--ink-muted);
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+    .insight-cell .insight-headline {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--ink);
+      letter-spacing: -0.01em;
+    }
+    .insight-cell .insight-meta {
+      font-size: 10.5px;
+      color: var(--ink-muted);
+    }
+    .insight-cell.warn .insight-headline { color: var(--error); }
+
+    .stats-split {
+      display: grid;
+      grid-template-columns: minmax(0, 1.05fr) minmax(0, 1.25fr);
+      gap: 14px;
+    }
+    .stats-left {
+      background: var(--bg-card);
+      border: 1px solid var(--border-card);
+      border-radius: var(--radius-card);
+      box-shadow: var(--shadow-card);
+      overflow: hidden;
+    }
+    .stats-left-head {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 10px 14px;
+      border-bottom: 1px solid var(--border-separator);
+    }
+    .stats-left-head .perspective-tabs {
+      display: inline-flex;
+      padding: 2px;
+      background: rgba(0,0,0,0.05);
+      border-radius: 7px;
+    }
+    .perspective-tab {
+      padding: 4px 10px;
+      font-size: 10.5px;
+      font-weight: 500;
+      color: var(--ink-muted);
+      border-radius: 5px;
+    }
+    .perspective-tab.active {
+      background: #fff;
+      color: var(--ink);
+      font-weight: 600;
+      box-shadow: 0 1px 2px rgba(0,0,0,0.06);
+    }
+    .stats-left .col-head {
+      display: grid;
+      grid-template-columns: 28px minmax(0, 1.2fr) 60px 56px 70px;
+      padding: 6px 14px;
+      font-size: 9px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      color: var(--ink-soft);
+      text-transform: uppercase;
+      gap: 10px;
+      background: rgba(0,0,0,0.018);
+      border-bottom: 1px solid var(--border-separator);
+    }
+    .stats-row {
+      display: grid;
+      grid-template-columns: 28px minmax(0, 1.2fr) 60px 56px 70px;
+      align-items: center;
+      gap: 10px;
+      padding: 9px 14px;
+      border-bottom: 1px solid var(--border-separator);
+      font-size: 11.5px;
+      cursor: default;
+    }
+    .stats-row:last-child { border-bottom: none; }
+    .stats-row.selected { background: rgba(10, 132, 255, 0.06); }
+    .stats-row.is-error .row-label-stack .row-name-txt::after {
+      content: '';
+      display: inline-block;
+      width: 5px; height: 5px;
+      border-radius: 50%;
+      background: var(--error);
+      margin-left: 6px;
+      vertical-align: 2px;
+    }
+    .row-label-stack { display: flex; flex-direction: column; min-width: 0; }
+    .row-name-txt {
+      font-size: 12px; font-weight: 600; color: var(--ink);
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .row-model-txt {
+      font-size: 10px; color: var(--ink-muted);
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .row-metric {
+      font-size: 12px;
+      font-weight: 600;
+      font-variant-numeric: tabular-nums;
+      color: var(--ink);
+      letter-spacing: -0.02em;
+    }
+    .row-metric .unit { font-weight: 500; color: var(--ink-muted); font-size: 10px; margin-left: 2px; }
+    .row-metric.success { color: var(--success); }
+    .row-metric.warn { color: var(--warning); }
+    .row-metric.danger { color: var(--error); }
+
+    .stats-right {
+      background: var(--bg-card);
+      border: 1px solid var(--border-card);
+      border-radius: var(--radius-card);
+      box-shadow: var(--shadow-card);
+      padding: 16px 18px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+      min-width: 0;
+    }
+    .slice-head { display: flex; flex-direction: column; gap: 2px; }
+    .slice-title {
+      font-size: 14px; font-weight: 600; color: var(--ink); letter-spacing: -0.01em;
+    }
+    .slice-kicker {
+      font-size: 10.5px; color: var(--ink-muted);
+      letter-spacing: 0.04em;
+    }
+    .slice-kpi {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 0;
+      border-top: 1px solid var(--border-separator);
+      border-bottom: 1px solid var(--border-separator);
+      padding: 10px 0;
+    }
+    .slice-kpi .kpi-block {
+      display: flex; flex-direction: column;
+      gap: 2px;
+      padding: 0 14px;
+      border-right: 1px solid var(--border-separator);
+    }
+    .slice-kpi .kpi-block:first-child { padding-left: 0; }
+    .slice-kpi .kpi-block:last-child { border-right: none; padding-right: 0; }
+    .kpi-value {
+      font-size: 18px; font-weight: 700;
+      font-variant-numeric: tabular-nums;
+      color: var(--ink);
+      letter-spacing: -0.4px;
+    }
+    .kpi-label {
+      font-size: 9.5px; font-weight: 600;
+      color: var(--ink-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+    .slice-section { display: flex; flex-direction: column; gap: 8px; }
+    .slice-section-head {
+      display: flex; align-items: center; justify-content: space-between;
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--ink-secondary);
+    }
+    .slice-section-head .small-note {
+      font-size: 10px; color: var(--ink-muted); font-weight: 500;
+    }
+    .bar-list { display: flex; flex-direction: column; gap: 7px; }
+    .bar-item {
+      display: grid;
+      grid-template-columns: 92px minmax(0, 1fr) 70px;
+      align-items: center;
+      gap: 10px;
+    }
+    .bar-item .bar-label {
+      font-size: 11px;
+      color: var(--ink);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .bar-track {
+      height: 8px;
+      background: rgba(0,0,0,0.05);
+      border-radius: 999px;
+      position: relative;
+      overflow: hidden;
+    }
+    .bar-fill {
+      position: absolute;
+      top: 0; bottom: 0; left: 0;
+      background: var(--ink);
+      border-radius: 999px;
+    }
+    .bar-item.muted .bar-fill { background: var(--ink-muted); }
+    .bar-item .bar-meta {
+      font-size: 10.5px;
+      font-variant-numeric: tabular-nums;
+      color: var(--ink-muted);
+      text-align: right;
+    }
+    .bar-item .bar-meta .strong {
+      color: var(--ink);
+      font-weight: 600;
+    }
+
+    .more-row {
+      display: flex; align-items: center; justify-content: space-between;
+      padding-top: 8px;
+      border-top: 1px solid var(--border-separator);
+      font-size: 10.5px;
+      color: var(--ink-muted);
+    }
+    .more-row a {
+      color: var(--info);
+      text-decoration: none;
+      font-weight: 500;
+    }
+    .more-row .danger-link { color: var(--error); }
+
+    /* ============ Footer ============ */
+    .footer-note {
+      margin-top: 56px;
+      padding-top: 22px;
+      border-top: 1px solid var(--border-separator);
+      font-size: 11.5px;
+      color: var(--ink-muted);
+      line-height: 1.65;
+      max-width: 880px;
+    }
+    .footer-note code {
+      font-family: ui-monospace, monospace;
+      font-size: 10.5px;
+      background: rgba(0,0,0,0.04);
+      padding: 1px 5px;
+      border-radius: 4px;
+      color: var(--ink-secondary);
+    }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel" data-presets="env,react">
+    const { useState } = React;
+
+    // ============================================================
+    // 头像 squircle 颜色（从角色色板里直接挑近似品牌色，未引入新色）
+    // ============================================================
+    const avatarColors = {
+      commander: { bg: 'rgba(255, 149, 0, 0.14)',  fg: '#cc7a00' },
+      executor:  { bg: 'rgba(48, 209, 88, 0.14)',  fg: '#1f8f3d' },
+      architect: { bg: 'rgba(10, 132, 255, 0.12)', fg: '#0a64c0' },
+      reviewer:  { bg: 'rgba(191, 90, 242, 0.12)', fg: '#8a39c4' },
+      explorer:  { bg: 'rgba(100, 210, 255, 0.16)',fg: '#0f7da2' },
+      tester:    { bg: 'rgba(255, 159, 10, 0.16)', fg: '#b87100' },
+    };
+
+    // ============================================================
+    // 6 个内置角色（与项目源码 builtin-roles 对应）
+    // ============================================================
+    const ROLES = [
+      { id: 'commander', name: '主控',     core: true,  desc: '统一调度协调主线对话与子代理派发',                  engine: 'inherit',      enabled: true,  engineLabel: '继承 default' },
+      { id: 'executor',  name: '执行者',   core: false, desc: '读写文件、跑脚本、应用变更的实干派',                engine: 'opus47',       enabled: true,  engineLabel: 'Claude Opus 4.7' },
+      { id: 'architect', name: '架构师',   core: false, desc: '拆解目标、设计实现路径、给出系统级方案',            engine: 'inherit',      enabled: true,  engineLabel: '继承 default' },
+      { id: 'reviewer',  name: '评审者',   core: false, desc: '审视代码风险、找潜在缺陷、给出修复建议',            engine: 'opus47',       enabled: true,  engineLabel: 'Claude Opus 4.7' },
+      { id: 'explorer',  name: '探索者',   core: false, desc: '不动手前提下读代码、答问题、勘察上下文',            engine: 'haiku46',      enabled: true,  engineLabel: 'Claude Haiku 4.6' },
+      { id: 'tester',    name: '测试员',   core: false, desc: '跑测试、设计验证步骤、回归覆盖',                    engine: 'inherit',      enabled: false, engineLabel: '继承 default' },
+    ];
+
+    // ============================================================
+    // 5 个 engine slot（统计 Tab 数据，从源码 statsDisplayKeys 推断）
+    // ============================================================
+    const ENGINES = [
+      { id: 'orchestrator', name: 'Orchestrator', core: true,  model: 'Claude Opus 4.7',  status: 'configured', calls: 142, success: 0.96, tIn: 23400, tOut: 8700 },
+      { id: 'auxiliary',    name: 'Auxiliary',    core: true,  model: 'Claude Haiku 4.6', status: 'configured', calls: 88,  success: 0.99, tIn: 9100,  tOut: 3400 },
+      { id: 'worker-fast',  name: 'Worker · Fast',core: false, model: 'Gemini 3 Pro',     status: 'configured', calls: 64,  success: 0.92, tIn: 12200, tOut: 4800 },
+      { id: 'worker-test',  name: 'Worker · Test',core: false, model: 'custom-endpoint',  status: 'error',     err: 'connect ETIMEDOUT 198.51.100.4:8443', calls: 7, success: 0.28, tIn: 410, tOut: 80 },
+      { id: 'worker-old',   name: 'Worker · Old', core: false, model: 'GPT-4o (legacy)',  status: 'disabled',  calls: 0,   success: null, tIn: 0,     tOut: 0 },
+    ];
+
+    // β 视角下的角色侧切片数据（commander/executor 占比之类）
+    const ROLE_SLICES = [
+      { role: '主控 · commander', token: 14800, pct: 0.44 },
+      { role: '执行者 · executor', token: 9100,  pct: 0.27 },
+      { role: '架构师 · architect',token: 4900,  pct: 0.14 },
+      { role: '评审者 · reviewer', token: 3200,  pct: 0.10 },
+      { role: '探索者 · explorer', token: 1700,  pct: 0.05 },
+    ];
+
+    const formatTokens = (n) => {
+      if (n == null) return '--';
+      if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + 'M';
+      if (n >= 1_000)     return (n / 1_000).toFixed(1) + 'K';
+      return String(n);
+    };
+    const formatPct = (p) => p == null ? '--' : Math.round(p * 100) + '%';
+
+    // ============================================================
+    // 内联 SVG 图标（不用 emoji）
+    // ============================================================
+    const IconBot = ({ size = 12 }) => (
+      <svg width={size} height={size} viewBox="0 0 16 16" fill="none">
+        <rect x="3" y="5" width="10" height="8" rx="2" stroke="currentColor" strokeWidth="1.3" />
+        <circle cx="6.3" cy="9" r="0.9" fill="currentColor" />
+        <circle cx="9.7" cy="9" r="0.9" fill="currentColor" />
+        <line x1="8" y1="3" x2="8" y2="5" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" />
+        <circle cx="8" cy="2.5" r="0.6" fill="currentColor" />
+      </svg>
+    );
+    const IconModel = ({ size = 10 }) => (
+      <svg width={size} height={size} viewBox="0 0 16 16" fill="none">
+        <path d="M3 4l5 -2.5 5 2.5v8l-5 2.5l-5 -2.5z" stroke="currentColor" strokeWidth="1.3" strokeLinejoin="round" />
+        <path d="M3 4l5 2.5l5 -2.5" stroke="currentColor" strokeWidth="1.3" strokeLinejoin="round" />
+        <line x1="8" y1="6.5" x2="8" y2="14" stroke="currentColor" strokeWidth="1.3" />
+      </svg>
+    );
+    const IconChevron = ({ size = 10 }) => (
+      <svg width={size} height={size} viewBox="0 0 16 16" fill="none">
+        <path d="M4 6l4 4l4 -4" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+      </svg>
+    );
+    const IconRefresh = ({ size = 13 }) => (
+      <svg width={size} height={size} viewBox="0 0 16 16" fill="none">
+        <path d="M2.5 8a5.5 5.5 0 0 1 9.6 -3.5M13.5 8a5.5 5.5 0 0 1 -9.6 3.5"
+              stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" />
+        <path d="M10 2v3h3M6 14v-3h-3" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" />
+      </svg>
+    );
+    const IconTrash = ({ size = 12 }) => (
+      <svg width={size} height={size} viewBox="0 0 16 16" fill="none">
+        <path d="M3 4h10M6 4V2.5h4V4M4.5 4l.5 9h6l.5 -9M7 6.5v4.5M9 6.5v4.5"
+              stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" />
+      </svg>
+    );
+    const IconMore = ({ size = 12 }) => (
+      <svg width={size} height={size} viewBox="0 0 16 16" fill="none">
+        <circle cx="4" cy="8" r="1" fill="currentColor" />
+        <circle cx="8" cy="8" r="1" fill="currentColor" />
+        <circle cx="12" cy="8" r="1" fill="currentColor" />
+      </svg>
+    );
+
+    // ============================================================
+    // 组件
+    // ============================================================
+    function SpecStrip() {
+      const swatches = [
+        { hex: 'rgba(255,255,255,0.92)', label: 'card bg', style: { background: 'rgba(255,255,255,0.92)' } },
+        { hex: '#1d1d1f', label: 'ink', style: { background: '#1d1d1f' } },
+        { hex: '#86868b', label: 'muted', style: { background: '#86868b' } },
+        { hex: '#34c759', label: 'success', style: { background: '#34c759' } },
+        { hex: '#ff3b30', label: 'error', style: { background: '#ff3b30' } },
+        { hex: '#0a84ff', label: 'info', style: { background: '#0a84ff' } },
+      ];
+      const typeSamples = [
+        { size: 22, weight: 700, txt: 'Display 22 / 700',    meta: 'KPI · 顶部洞察数字' },
+        { size: 14, weight: 600, txt: 'Heading 14 / 600',     meta: '小节标题' },
+        { size: 12.5, weight: 600, txt: 'Row 12.5 / 600',    meta: '行/卡片名称' },
+        { size: 11,  weight: 500, txt: 'Body 11 / 500',      meta: '描述文本' },
+        { size: 9.5, weight: 700, txt: 'EYEBROW 9.5 / 700',  meta: 'kicker · 状态标签' },
+      ];
+      return (
+        <div className="spec-strip">
+          <div className="spec-block">
+            <div className="spec-label">Palette · 直接复用源码 token</div>
+            <div className="swatch-row">
+              {swatches.map(s => (
+                <div className="swatch" key={s.label}>
+                  <div className="chip" style={s.style}></div>
+                  <span className="chip-text">{s.label}</span>
+                  <span className="chip-text" style={{ opacity: 0.7 }}>{s.hex}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+          <div className="spec-block">
+            <div className="spec-label">Type Scale · 字号阶梯</div>
+            <div className="type-scale-row">
+              {typeSamples.map(t => (
+                <div className="type-sample" key={t.txt}>
+                  <span style={{ fontSize: t.size, fontWeight: t.weight, letterSpacing: '-0.01em' }}>{t.txt}</span>
+                  <span className="meta">{t.meta}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+          <div className="spec-block">
+            <div className="spec-label">Intent · 设计意图</div>
+            <ul className="intent-list">
+              <li><span className="badge-up">密度 ↑</span>卡片 120px → 行 38px；widget 网格 → 紧凑列表</li>
+              <li><span className="badge-up">对比 ↑</span>右侧切片 + 顶部洞察 strip 替换冗余汇总</li>
+              <li><span className="badge-down">语义重复 ↓</span>删 inherit-pill；下拉自我说明继承状态</li>
+            </ul>
+          </div>
+        </div>
+      );
+    }
+
+    // ---------- 角色 Tab · baseline ----------
+    function AgentTileBaseline({ r }) {
+      const c = avatarColors[r.id];
+      const isInherit = r.engine === 'inherit';
+      return (
+        <div className={'agent-tile' + (r.enabled ? '' : ' is-disabled')}>
+          <div className="tile-head">
+            <div className="tile-brand">
+              <div className="avatar-sq" style={{ background: c.bg, color: c.fg }}><IconBot size={12} /></div>
+              <div className="name-line">
+                <span className="name-txt">{r.name}</span>
+                {r.core && <span className="badge-core">CORE</span>}
+              </div>
+            </div>
+            <div className={'toggle' + (r.enabled ? '' : ' off')}></div>
+          </div>
+          <div className="tile-body">
+            <p className="summary-txt">{r.desc}</p>
+          </div>
+          <div className="tile-foot">
+            <div className="inherit-pill">
+              {isInherit && <><span className="status-dot"></span><span>继承 default</span></>}
+            </div>
+            <div className="engine-select">
+              <span style={{ color: 'var(--ink-soft)' }}><IconModel size={10} /></span>
+              <span className="label">{r.engineLabel}</span>
+              <span style={{ color: 'var(--ink-soft)' }}><IconChevron size={10} /></span>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    function AgentTabBaseline() {
+      return (
+        <div className="settings-frame">
+          <div className="frame-tab-bar">
+            <div className="frame-tab">模型</div>
+            <div className="frame-tab">工具</div>
+            <div className="frame-tab active">角色</div>
+            <div className="frame-tab">规则</div>
+            <div className="frame-tab">统计</div>
+          </div>
+          <div className="agent-grid-baseline">
+            {ROLES.map(r => <AgentTileBaseline r={r} key={r.id} />)}
+          </div>
+        </div>
+      );
+    }
+
+    // ---------- 角色 Tab · 方案 A 紧凑卡 ----------
+    function AgentTileCompact({ r }) {
+      const c = avatarColors[r.id];
+      return (
+        <div className={'agent-tile-compact' + (r.enabled ? '' : ' is-disabled')} style={{ opacity: r.enabled ? 1 : 0.55 }}>
+          <div className="compact-head">
+            <div className="avatar-sq" style={{ width: 20, height: 20, background: c.bg, color: c.fg }}><IconBot size={11} /></div>
+            <div className="name-line">
+              <span className="name-txt">{r.name}</span>
+              {r.core && <span className="badge-core">CORE</span>}
+            </div>
+            <div className={'toggle' + (r.enabled ? '' : ' off')} style={{ flexShrink: 0 }}></div>
+          </div>
+          <div className="desc-inline">{r.desc}</div>
+          <div className="compact-foot">
+            <div className="engine-select">
+              <span style={{ color: 'var(--ink-soft)' }}><IconModel size={10} /></span>
+              <span className="label">{r.engineLabel}</span>
+              <span style={{ color: 'var(--ink-soft)' }}><IconChevron size={10} /></span>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    function AgentTabCompact() {
+      return (
+        <div className="settings-frame">
+          <div className="agent-grid-compact">
+            {ROLES.map(r => <AgentTileCompact r={r} key={r.id} />)}
+          </div>
+        </div>
+      );
+    }
+
+    // ---------- 角色 Tab · 方案 B 单行列表 ----------
+    function AgentRow({ r }) {
+      const c = avatarColors[r.id];
+      return (
+        <div className={'agent-row' + (r.enabled ? '' : ' is-disabled')}>
+          <div className="avatar-sq" style={{ background: c.bg, color: c.fg }}><IconBot size={12} /></div>
+          <div className="row-name">
+            <span className="name-txt">{r.name}</span>
+            {r.core && <span className="badge-core">CORE</span>}
+          </div>
+          <div className="row-desc">{r.desc}</div>
+          <div className="engine-select">
+            <span style={{ color: 'var(--ink-soft)' }}><IconModel size={10} /></span>
+            <span className="label">{r.engineLabel}</span>
+            <span style={{ color: 'var(--ink-soft)' }}><IconChevron size={10} /></span>
+          </div>
+          <div className={'toggle' + (r.enabled ? '' : ' off')}></div>
+        </div>
+      );
+    }
+
+    function AgentTabList() {
+      return (
+        <div className="settings-frame">
+          <div className="agent-list">
+            {ROLES.map(r => <AgentRow r={r} key={r.id} />)}
+          </div>
+        </div>
+      );
+    }
+
+    // ---------- 统计 Tab · baseline ----------
+    function StatsWidget({ e }) {
+      const cls = e.status === 'error' ? 'error' : e.status === 'disabled' ? 'disabled' : '';
+      const statusLabel = e.status === 'configured' ? '已配置' : e.status === 'error' ? '错误' : '已禁用';
+      return (
+        <div className={'widget-card ' + cls}>
+          <div className="widget-header">
+            <div className="tile-brand">
+              <div className="avatar-sq" style={{ width: 24, height: 24, background: 'rgba(60,60,67,0.06)', color: '#515154' }}>
+                <IconModel size={12} />
+              </div>
+              <div className="name-line" style={{ flexDirection: 'column', alignItems: 'flex-start' }}>
+                <span className="name-txt" style={{ fontSize: 13.5 }}>{e.name}</span>
+                {e.core && <span className="badge-core" style={{ marginTop: 2 }}>CORE</span>}
+              </div>
+            </div>
+            <div className={'widget-status ' + (e.status === 'configured' ? 'success' : cls)}>
+              <span className="ind"></span>
+              <span>{statusLabel}</span>
+            </div>
+          </div>
+          <div className="widget-body">
+            {e.err
+              ? <div className="error-text">{e.err}</div>
+              : <div className="model-text">{e.model}</div>}
+          </div>
+          <div className="metric-grid">
+            <div className="metric-block">
+              <div className="metric-value">{e.calls ?? '--'}</div>
+              <div className="metric-label">CALLS</div>
+            </div>
+            <div className="metric-block">
+              <div className="metric-value">{e.success != null ? formatPct(e.success) : '--'}</div>
+              <div className="metric-label">SUCCESS</div>
+            </div>
+            <div className="metric-block">
+              <div className="metric-value">{formatTokens(e.tIn)}</div>
+              <div className="metric-label">INPUT</div>
+            </div>
+            <div className="metric-block">
+              <div className="metric-value">{formatTokens(e.tOut)}</div>
+              <div className="metric-label">OUTPUT</div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    function StatsTabBaseline() {
+      const totalIn  = ENGINES.reduce((s, e) => s + (e.tIn || 0), 0);
+      const totalOut = ENGINES.reduce((s, e) => s + (e.tOut || 0), 0);
+      const total = totalIn + totalOut;
+      return (
+        <div className="settings-frame">
+          <div className="frame-tab-bar">
+            <div className="frame-tab">模型</div>
+            <div className="frame-tab">工具</div>
+            <div className="frame-tab">角色</div>
+            <div className="frame-tab">规则</div>
+            <div className="frame-tab active">统计</div>
+          </div>
+          <div className="stats-dashboard-bar">
+            <div className="summary-row">
+              <div className="summary-item">
+                <span className="summary-value">{formatTokens(totalIn)}</span>
+                <span className="summary-label">Input</span>
+              </div>
+              <div className="summary-divider"></div>
+              <div className="summary-item">
+                <span className="summary-value">{formatTokens(totalOut)}</span>
+                <span className="summary-label">Output</span>
+              </div>
+              <div className="summary-divider"></div>
+              <div className="summary-item">
+                <span className="summary-value">{formatTokens(total)}</span>
+                <span className="summary-label">Total Tokens</span>
+              </div>
+            </div>
+            <div className="actions-row">
+              <div className="btn"><IconRefresh size={13} /> 检测连接</div>
+              <div className="btn danger"><IconTrash size={12} /> 重置 Token</div>
+            </div>
+          </div>
+          <div className="stats-widget-grid">
+            {ENGINES.map(e => <StatsWidget e={e} key={e.id} />)}
+          </div>
+        </div>
+      );
+    }
+
+    // ---------- 统计 Tab · 方案 α 子 Tab ----------
+    function StatsTabSubTab() {
+      return (
+        <div className="settings-frame">
+          <div className="sub-tab-bar">
+            <div className="sub-tab active">按模型</div>
+            <div className="sub-tab">按角色</div>
+          </div>
+          <div className="stats-widget-grid">
+            {ENGINES.slice(0, 3).map(e => <StatsWidget e={e} key={e.id} />)}
+          </div>
+          <div style={{ marginTop: 10, fontSize: 10.5, color: 'var(--ink-soft)', fontStyle: 'italic' }}>
+            ※ 切「按角色」时同一个 widget 网格按 templateId 重排——但仍是同一形态。
+          </div>
+        </div>
+      );
+    }
+
+    // ---------- 统计 Tab · 方案 β 左视角列 + 右切片 ----------
+    function StatsTabSplit() {
+      const [perspective, setPerspective] = useState('engine'); // engine | role
+      const [selectedId, setSelectedId] = useState('orchestrator');
+      const selected = ENGINES.find(e => e.id === selectedId);
+      const topShare = ROLE_SLICES.reduce((s, r) => Math.max(s, r.pct), 0);
+
+      return (
+        <div className="settings-frame">
+          <div className="frame-tab-bar">
+            <div className="frame-tab">模型</div>
+            <div className="frame-tab">工具</div>
+            <div className="frame-tab">角色</div>
+            <div className="frame-tab">规则</div>
+            <div className="frame-tab active">统计</div>
+          </div>
+
+          <div className="insight-strip">
+            <div className="insight-cell">
+              <span className="insight-kicker">Top 1 引擎</span>
+              <span className="insight-headline">Orchestrator · Opus 4.7</span>
+              <span className="insight-meta">占总 Token 62% · 142 次调用 · 成功率 96%</span>
+            </div>
+            <div className="insight-cell">
+              <span className="insight-kicker">最近 1 小时</span>
+              <span className="insight-headline">+12.3K Token</span>
+              <span className="insight-meta">3 次调用 · 跨 2 个引擎</span>
+            </div>
+            <div className="insight-cell warn">
+              <span className="insight-kicker">需关注</span>
+              <span className="insight-headline">Worker · Test 失败率 72%</span>
+              <span className="insight-meta">connect ETIMEDOUT · 已连续 7 次</span>
+            </div>
+          </div>
+
+          <div className="stats-split">
+            <div className="stats-left">
+              <div className="stats-left-head">
+                <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--ink)' }}>
+                  {perspective === 'engine' ? '按模型 / 引擎' : '按角色 / Role'}
+                </div>
+                <div className="perspective-tabs">
+                  <div className={'perspective-tab' + (perspective === 'engine' ? ' active' : '')}
+                       onClick={() => { setPerspective('engine'); setSelectedId('orchestrator'); }}>
+                    模型
+                  </div>
+                  <div className={'perspective-tab' + (perspective === 'role' ? ' active' : '')}
+                       onClick={() => { setPerspective('role'); setSelectedId('commander'); }}>
+                    角色
+                  </div>
+                </div>
+              </div>
+              <div className="col-head">
+                <span></span>
+                <span>{perspective === 'engine' ? '引擎' : '角色'}</span>
+                <span style={{ textAlign: 'right' }}>调用</span>
+                <span style={{ textAlign: 'right' }}>成功</span>
+                <span style={{ textAlign: 'right' }}>Token</span>
+              </div>
+              {perspective === 'engine' && ENGINES.map(e => (
+                <div className={'stats-row' + (e.id === selectedId ? ' selected' : '') + (e.status === 'error' ? ' is-error' : '')}
+                     key={e.id}
+                     onClick={() => setSelectedId(e.id)}>
+                  <div className="avatar-sq" style={{ width: 22, height: 22, background: 'rgba(60,60,67,0.06)', color: '#515154' }}>
+                    <IconModel size={11} />
+                  </div>
+                  <div className="row-label-stack">
+                    <span className="row-name-txt">
+                      {e.name}{e.core && <span className="badge-core" style={{ marginLeft: 6 }}>CORE</span>}
+                    </span>
+                    <span className="row-model-txt">{e.model}</span>
+                  </div>
+                  <div className="row-metric" style={{ textAlign: 'right' }}>{e.calls || '--'}</div>
+                  <div className={'row-metric ' + (e.success == null ? '' : e.success >= 0.95 ? 'success' : e.success >= 0.7 ? 'warn' : 'danger')}
+                       style={{ textAlign: 'right' }}>
+                    {e.success != null ? formatPct(e.success) : '--'}
+                  </div>
+                  <div className="row-metric" style={{ textAlign: 'right' }}>{formatTokens((e.tIn || 0) + (e.tOut || 0))}</div>
+                </div>
+              ))}
+              {perspective === 'role' && ROLE_SLICES.map((r, i) => (
+                <div className={'stats-row' + (i === 0 ? ' selected' : '')} key={r.role}>
+                  <div className="avatar-sq" style={{ width: 22, height: 22, background: 'rgba(60,60,67,0.06)', color: '#515154' }}>
+                    <IconBot size={11} />
+                  </div>
+                  <div className="row-label-stack">
+                    <span className="row-name-txt">{r.role}</span>
+                    <span className="row-model-txt">跨 {Math.max(1, Math.round(r.pct * 6))} 个引擎</span>
+                  </div>
+                  <div className="row-metric" style={{ textAlign: 'right' }}>{Math.round(r.token / 130)}</div>
+                  <div className="row-metric success" style={{ textAlign: 'right' }}>{formatPct(0.94 + (1 - r.pct) * 0.05)}</div>
+                  <div className="row-metric" style={{ textAlign: 'right' }}>{formatTokens(r.token)}</div>
+                </div>
+              ))}
+            </div>
+
+            <div className="stats-right">
+              <div className="slice-head">
+                <span className="slice-kicker">按 {perspective === 'engine' ? '角色' : '引擎'} 切片</span>
+                <span className="slice-title">
+                  {perspective === 'engine'
+                    ? (selected ? selected.name : '—') + ' 的角色分布'
+                    : '主控 · commander 的引擎分布'}
+                </span>
+              </div>
+
+              <div className="slice-kpi">
+                <div className="kpi-block">
+                  <span className="kpi-value">
+                    {perspective === 'engine' && selected
+                      ? formatTokens((selected.tIn || 0) + (selected.tOut || 0))
+                      : '14.8K'}
+                  </span>
+                  <span className="kpi-label">Total Token</span>
+                </div>
+                <div className="kpi-block">
+                  <span className="kpi-value">
+                    {perspective === 'engine' && selected ? (selected.calls || '--') : '118'}
+                  </span>
+                  <span className="kpi-label">Calls</span>
+                </div>
+                <div className="kpi-block">
+                  <span className="kpi-value">
+                    {perspective === 'engine' && selected && selected.success != null
+                      ? formatPct(selected.success)
+                      : '96%'}
+                  </span>
+                  <span className="kpi-label">Success</span>
+                </div>
+              </div>
+
+              <div className="slice-section">
+                <div className="slice-section-head">
+                  <span>{perspective === 'engine' ? '哪些角色在跑这个引擎' : '这个角色跑过哪些引擎'}</span>
+                  <span className="small-note">本月累计</span>
+                </div>
+                <div className="bar-list">
+                  {(perspective === 'engine' ? ROLE_SLICES : [
+                    { role: 'Orchestrator · Opus 4.7',   token: 9800, pct: 0.66 },
+                    { role: 'Auxiliary · Haiku 4.6',     token: 3100, pct: 0.21 },
+                    { role: 'Worker · Fast (Gemini 3)',  token: 1900, pct: 0.13 },
+                  ]).map((s, i) => (
+                    <div className={'bar-item' + (i === 0 ? '' : ' muted')} key={s.role}>
+                      <span className="bar-label">{s.role}</span>
+                      <div className="bar-track">
+                        <div className="bar-fill" style={{ width: `${(s.pct / topShare) * 100}%` }}></div>
+                      </div>
+                      <span className="bar-meta">
+                        <span className="strong">{formatTokens(s.token)}</span> · {formatPct(s.pct)}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              <div className="more-row">
+                <span>状态：{selected ? (selected.status === 'configured' ? '已配置 · 链路正常' : selected.status === 'error' ? '报错 · 见错误日志' : '已禁用') : '—'}</span>
+                <span style={{ display: 'flex', gap: 14 }}>
+                  <a href="#">查看错误日志</a>
+                  <a className="danger-link" href="#"><IconMore size={11} /> 更多</a>
+                </span>
+              </div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ============================================================
+    // 主页面
+    // ============================================================
+    function Page() {
+      return (
+        <div>
+          <div className="page-head">
+            <h1>magi · 设置面板重构 mockup</h1>
+            <p className="lede">
+              对照「现状」与「重构候选」并排展示。所有色/字号/圆角/阴影从 <code>SettingsAgentsTab.svelte</code> /
+              <code> SettingsStatsTab.svelte</code> 直接抽取，未引入新色板。Mockup 仅在 <code>_temp/design-demos/</code>，未动产品代码。
+            </p>
+          </div>
+
+          <SpecStrip />
+
+          <section className="section">
+            <div className="section-head">
+              <h2><span className="num">A</span>角色 Tab · 三方案对照</h2>
+              <span className="sub">6 个内置角色 · 操作模型：开关 + 引擎绑定</span>
+            </div>
+
+            <div className="variant">
+              <div className="variant-head">
+                <span className="tag baseline">现状</span>
+                <span className="title">340 min-width 网格卡片</span>
+                <span className="note">卡片 ~120px 高，信息密度 &lt; 50%；inherit-pill 与下拉是同一语义的两种表达。</span>
+              </div>
+              <AgentTabBaseline />
+            </div>
+
+            <div className="variant">
+              <div className="variant-head">
+                <span className="tag alt">方案 A</span>
+                <span className="title">紧凑卡片（240 min-width，描述 inline，删 inherit-pill）</span>
+                <span className="note">保留卡片骨架，去掉空间消耗最大的两节。</span>
+              </div>
+              <AgentTabCompact />
+            </div>
+
+            <div className="variant">
+              <div className="variant-head">
+                <span className="tag recommended">方案 B · 推荐</span>
+                <span className="title">单行列表（行高 40px，5 列对齐）</span>
+                <span className="note">对齐 macOS「登录项 / 快捷键」型设置；6 行一屏放下；未来扩用户自定义角色天然可拉长。</span>
+              </div>
+              <AgentTabList />
+            </div>
+          </section>
+
+          <section className="section">
+            <div className="section-head">
+              <h2><span className="num">B</span>统计 Tab · 三方案对照</h2>
+              <span className="sub">5 个 engine slot · 操作模型：观察 + 排错 + 重置</span>
+            </div>
+
+            <div className="variant">
+              <div className="variant-head">
+                <span className="tag baseline">现状</span>
+                <span className="title">顶部三大汇总 + Apple Widget 网格</span>
+                <span className="note">三大数字 = 底下之和，重复；卡片缺横向对比维度；危险操作占视觉一等舱。</span>
+              </div>
+              <StatsTabBaseline />
+            </div>
+
+            <div className="variant">
+              <div className="variant-head">
+                <span className="tag alt">方案 α</span>
+                <span className="title">子 Tab 切换「按模型 / 按角色」（同一网格形态）</span>
+                <span className="note">认知零摩擦，但两份独立报表，看不到联动。</span>
+              </div>
+              <StatsTabSubTab />
+            </div>
+
+            <div className="variant">
+              <div className="variant-head">
+                <span className="tag recommended">方案 β · 推荐</span>
+                <span className="title">洞察 strip + 左视角列 + 右切片</span>
+                <span className="note">顶部 strip 把账面换成洞察；左右联动 = 视角即筛选，选 A 自动给你 A 切片下的 B 分布。点击左侧不同行体验。</span>
+              </div>
+              <StatsTabSplit />
+            </div>
+          </section>
+
+          <div className="footer-note">
+            <strong>下一步建议</strong>：先角色 Tab 走方案 B 落地——改动只在 <code>SettingsAgentsTab.svelte</code> 单文件，数据源不动，可控。
+            干掉 inherit-pill 这条重复语义符合 cn-engineering「不让同一功能并存多种实现方式」。
+            验证密度判断后再回头处理统计 Tab，届时也好顺势厘清 worker / role 命名混淆。
+            <br />
+            <br />
+            <strong>未做事项（明确标注）</strong>：本 mockup 没有暗色模式版本（产品支持；如需要可按 spec 里的 dark token 复用）；没有窄宽度断点（产品有 480px container query）；没有自定义角色添加流程（产品当前未提供）。
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<Page />);
+  </script>
+</body>
+</html>

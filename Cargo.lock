@@ -1357,6 +1357,7 @@ name = "magi-session-store"
 version = "0.1.0"
 dependencies = [
  "magi-core",
+ "magi-tool-runtime",
  "serde",
  "serde_json",
  "thiserror",

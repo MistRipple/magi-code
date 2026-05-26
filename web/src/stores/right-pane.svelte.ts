@@ -46,7 +46,7 @@ export type RightPaneTabPayload = AgentTabPayload | CodeTabPayload;
 export interface RightPaneTab {
   id: string;
   kind: RightPaneTabKind;
-  /** Tab 标题（如 worker label / 文件名）；展示用，可后续更新 */
+  /** Tab 标题（如代理名称 / 文件名）；展示用，可后续更新 */
   label: string;
   /** 强调色 token 名（如 'color-claude'）；null 表示无强调色 */
   accentToken: string | null;
@@ -244,6 +244,7 @@ function upsertTab(
   label: string,
   accentToken: string | null,
 ): RightPaneTab | null {
+  rightPaneState.activeSessionId = sessionId;
   const session = ensureSession(sessionId);
   const id = tabKey(kind, payload);
   const existing = session.openTabs.find((tab) => tab.id === id);

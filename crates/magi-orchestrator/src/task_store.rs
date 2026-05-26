@@ -477,8 +477,8 @@ impl TaskStore {
     }
 
     fn ancestor_chain_allows_dispatch_inner(task: &Task, tasks: &HashMap<TaskId, Task>) -> bool {
-        // 新执行模型（同步 agent_spawn）下，父任务调用 agent_spawn 后进入 Running
-        // 并阻塞等待子任务终态，因此祖先链允许出现 Running 节点；只有 Pending 祖先
+        // 新执行模型下，父任务调用 agent_spawn 后进入 Running，子任务由后台 runner
+        // 独立推进，因此祖先链允许出现 Running 节点；只有 Pending 祖先
         // （还没开始执行）才说明该子任务尚不该被调度。父任务的依赖在父任务自身
         // 进入 Running 前已被 dispatcher 校验过，这里不再重复校验。
         let mut current = task.parent_task_id.as_ref();
@@ -926,14 +926,13 @@ impl TaskStore {
             .collect()
     }
 
-    /// 获取所有未过期的活跃租约（不区分 root_task_id）。
+    /// 获取所有活跃租约（不区分 root_task_id）。
     /// 仅在 reconcile / checkpoint restore 等全量收敛场景使用。
     pub fn collect_all_active_leases(&self) -> Vec<(TaskId, LeaseId)> {
-        let now = UtcMillis::now();
         let leases = self.leases.read().expect("leases read lock poisoned");
         leases
             .values()
-            .filter(|l| l.lease_status == TaskLeaseState::Active && l.expires_at >= now)
+            .filter(|l| l.lease_status == TaskLeaseState::Active)
             .map(|l| (l.task_id.clone(), l.lease_id.clone()))
             .collect()
     }

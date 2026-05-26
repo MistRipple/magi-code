@@ -736,6 +736,71 @@ fn current_turn_writes_update_durable_canonical_turn_log() {
 }
 
 #[test]
+fn current_turn_hides_runtime_internal_tool_calls_in_durable_canonical_log() {
+    let store = SessionStore::new();
+    let session_id = SessionId::new("session-durable-internal-tool-hidden");
+    store
+        .create_session(session_id.clone(), "Durable Internal Tool Hidden")
+        .expect("session should be creatable");
+    store
+        .upsert_current_turn(
+            session_id.clone(),
+            test_turn("turn-internal-tool", "running", 10),
+        )
+        .expect("running turn should upsert");
+
+    let mut wait_item = test_turn_item("turn-item-agent-wait", "{\"status\":\"succeeded\"}");
+    wait_item.kind = "tool_call_result".to_string();
+    wait_item.status = "completed".to_string();
+    wait_item.title = Some("agent_wait".to_string());
+    wait_item.tool_call_id = Some("tool-call-agent-wait".to_string());
+    wait_item.tool_name = Some("agent_wait".to_string());
+    wait_item.tool_arguments = Some("{\"task_ids\":[\"task-1\"]}".to_string());
+    wait_item.tool_result = Some("{\"status\":\"succeeded\"}".to_string());
+    store
+        .upsert_current_turn_item(&session_id, wait_item)
+        .expect("agent_wait item should upsert");
+
+    let mut spawn_item = test_turn_item("turn-item-agent-spawn", "{\"status\":\"started\"}");
+    spawn_item.kind = "tool_call_result".to_string();
+    spawn_item.status = "completed".to_string();
+    spawn_item.title = Some("agent_spawn".to_string());
+    spawn_item.tool_call_id = Some("tool-call-agent-spawn".to_string());
+    spawn_item.tool_name = Some("agent_spawn".to_string());
+    spawn_item.tool_arguments = Some(
+        json!({
+            "role": "explorer",
+            "display_name": "目录探查代理",
+            "goal": "读取目录结构"
+        })
+        .to_string(),
+    );
+    spawn_item.tool_result = Some("{\"status\":\"started\"}".to_string());
+    store
+        .upsert_current_turn_item(&session_id, spawn_item)
+        .expect("agent_spawn item should upsert");
+
+    let turn = store
+        .canonical_turns_for_session(&session_id)
+        .into_iter()
+        .find(|turn| turn.turn_id == "turn-internal-tool")
+        .expect("canonical turn should exist");
+    let wait = turn
+        .items
+        .iter()
+        .find(|item| item.item_id == "turn-item-agent-wait")
+        .expect("agent_wait canonical item should exist");
+    let spawn = turn
+        .items
+        .iter()
+        .find(|item| item.item_id == "turn-item-agent-spawn")
+        .expect("agent_spawn canonical item should exist");
+
+    assert!(!wait.visibility.renderable);
+    assert!(spawn.visibility.renderable);
+}
+
+#[test]
 fn blocked_current_turn_is_terminal_in_canonical_log() {
     let store = SessionStore::new();
     let session_id = SessionId::new("session-blocked-terminal-canonical");

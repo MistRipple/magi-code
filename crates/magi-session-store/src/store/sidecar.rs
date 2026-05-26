@@ -12,6 +12,7 @@ use magi_core::{
     DomainError, DomainResult, ExecutionOwnership, LeaseId, MissionId, RecoveryResumeInput,
     SessionId, TaskExecutionTarget, TaskId, ThreadId, UtcMillis, WorkerId,
 };
+use magi_tool_runtime::BuiltinToolName;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 
@@ -220,6 +221,15 @@ fn current_turn_item_renderable(
     kind: CanonicalTurnItemKind,
     status: CanonicalTurnItemStatus,
 ) -> bool {
+    if kind == CanonicalTurnItemKind::ToolCall
+        && item
+            .tool_name
+            .as_deref()
+            .and_then(BuiltinToolName::from_str)
+            .is_some_and(|tool| tool.is_runtime_internal_tool_call())
+    {
+        return false;
+    }
     let has_content = item
         .content
         .as_ref()

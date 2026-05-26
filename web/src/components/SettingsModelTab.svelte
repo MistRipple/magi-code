@@ -212,7 +212,7 @@
               <span class="role-tab-name">{i18n.t('settings.model.auxiliaryModel')}</span>
             </button>
 
-            <!-- Worker 引擎 -->
+            <!-- 代理引擎 -->
             {#each workerModelTabs as workerTab (workerTab)}
               {@const workerStatus = resolveModelConfigTabStatus(workerTab, modelStatuses)}
               {@const workerIndicatorVariant = resolveAgentIndicatorVariant(workerStatus)}
@@ -571,7 +571,7 @@
   .role-tab-status.error { background: var(--error, #ff3b30); }
   .role-tab-status.disabled { background: color-mix(in srgb, var(--ind-foreground-soft) 55%, transparent); }
 
-  /* Worker tab 的状态点支持品牌色变体 */
+  /* 代理引擎 tab 的状态点支持品牌色变体 */
   .role-tab-status.worker-dot.brand { background: var(--worker-brand-color); }
 
   /* 删除按钮：hover 浮出 */

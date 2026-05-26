@@ -200,6 +200,34 @@ pub fn latest_orchestrator_assistant_final(
         .map(|(_, content, item_id)| (content, item_id))
 }
 
+/// root task 的最终答复优先作为主线回复。
+///
+/// coordinator root 现在有独立 task thread，但前端会把不带 worker/role 的 root item
+/// 投射到主线。如果这里只认 session orchestrator thread，root 已经生成的 final 会和
+/// fallback orchestrator summary 双显。
+pub fn latest_root_task_assistant_final(
+    turn: &ActiveExecutionTurn,
+    root_task_id: &TaskId,
+) -> Option<(String, String)> {
+    turn.items
+        .iter()
+        .filter(|item| {
+            item.kind == "assistant_final"
+                && item.task_id.as_ref() == Some(root_task_id)
+                && item.worker_id.is_none()
+                && item.role_id.is_none()
+        })
+        .filter_map(|item| {
+            let content = item.content.as_ref()?.trim();
+            if content.is_empty() {
+                return None;
+            }
+            Some((item.item_seq, content.to_string(), item.item_id.clone()))
+        })
+        .max_by_key(|(item_seq, _, _)| *item_seq)
+        .map(|(_, content, item_id)| (content, item_id))
+}
+
 pub fn compact_root_completion_summary(text: &str) -> String {
     let trimmed = text.trim();
     if trimmed.chars().count() <= ROOT_COMPLETION_SUMMARY_MAX_CHARS {
@@ -417,8 +445,8 @@ fn ensure_root_completion_final_item(
     let sidecar = session_store.runtime_sidecar(session_id)?;
     let turn = sidecar.current_turn.as_ref()?;
     let orchestrator_thread = session_store.orchestrator_thread_for_session(session_id)?;
-    if let Some(response) =
-        latest_orchestrator_assistant_final(turn, &orchestrator_thread.thread_id)
+    if let Some(response) = latest_root_task_assistant_final(turn, &root_task.task_id)
+        .or_else(|| latest_orchestrator_assistant_final(turn, &orchestrator_thread.thread_id))
     {
         return Some(response);
     }
@@ -448,7 +476,11 @@ fn ensure_root_completion_final_item(
         .runtime_sidecar(session_id)
         .and_then(|sidecar| sidecar.current_turn)
         .as_ref()
-        .and_then(|turn| latest_orchestrator_assistant_final(turn, &orchestrator_thread.thread_id))
+        .and_then(|turn| {
+            latest_root_task_assistant_final(turn, &root_task.task_id).or_else(|| {
+                latest_orchestrator_assistant_final(turn, &orchestrator_thread.thread_id)
+            })
+        })
 }
 
 pub fn finalize_background_session_task_turn_if_root_completed(
@@ -485,7 +517,8 @@ pub fn finalize_background_session_task_turn_if_root_completed(
     else {
         return false;
     };
-    let response = latest_orchestrator_assistant_final(turn, &orchestrator_thread.thread_id)
+    let response = latest_root_task_assistant_final(turn, &root_task.task_id)
+        .or_else(|| latest_orchestrator_assistant_final(turn, &orchestrator_thread.thread_id))
         .or_else(|| {
             ensure_root_completion_final_item(
                 session_store,
@@ -728,5 +761,56 @@ pub fn runner_status_for_terminal_task(status: TaskStatus) -> Option<&'static st
         TaskStatus::Failed => Some("error"),
         TaskStatus::Killed => Some("killed"),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn latest_root_task_assistant_final_prefers_root_without_worker_binding() {
+        let root_task_id = TaskId::new("task-root");
+        let child_task_id = TaskId::new("task-child");
+        let root_thread_id = ThreadId::new("thread-root");
+        let child_thread_id = ThreadId::new("thread-child");
+        let now = UtcMillis::now();
+        let mut child_final = session_turn_item(
+            "assistant_final",
+            "completed",
+            Some("最终回复".to_string()),
+            Some("代理答复".to_string()),
+            Some("turn-item-child-final".to_string()),
+            child_thread_id,
+        );
+        child_final.item_seq = 1;
+        child_final.task_id = Some(child_task_id);
+        child_final.worker_id = Some(magi_core::WorkerId::new("worker-child"));
+        child_final.role_id = Some("explorer".to_string());
+        let mut root_final = session_turn_item(
+            "assistant_final",
+            "completed",
+            Some("最终回复".to_string()),
+            Some("主线答复".to_string()),
+            Some("turn-item-root-final".to_string()),
+            root_thread_id,
+        );
+        root_final.item_seq = 2;
+        root_final.task_id = Some(root_task_id.clone());
+        let turn = ActiveExecutionTurn {
+            turn_id: "turn-root-final".to_string(),
+            turn_seq: 1,
+            accepted_at: now,
+            completed_at: None,
+            status: "running".to_string(),
+            user_message: None,
+            items: vec![child_final, root_final],
+        };
+
+        let response = latest_root_task_assistant_final(&turn, &root_task_id)
+            .expect("root final should be selected");
+
+        assert_eq!(response.0, "主线答复");
+        assert_eq!(response.1, "turn-item-root-final");
     }
 }

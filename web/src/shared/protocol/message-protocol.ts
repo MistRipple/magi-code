@@ -34,9 +34,9 @@ export enum MessageType {
   // ============== 新增消息类型（方案 B 扩展）==============
   /** 用户输入消息 */
   USER_INPUT = 'user_input',
-  /** 任务状态卡片（Worker 执行状态摘要，主对话区展示） */
+  /** 任务状态卡片（代理执行状态摘要，主对话区展示） */
   TASK_CARD = 'task_card',
-  /** 任务说明（编排者派发给 Worker 的详细任务描述） */
+  /** 任务说明（编排者派发给代理的详细任务描述） */
   INSTRUCTION = 'instruction',
 }
 

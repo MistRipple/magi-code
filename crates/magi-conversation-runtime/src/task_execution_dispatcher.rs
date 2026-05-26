@@ -645,6 +645,7 @@ impl LlmTaskDispatcher {
         worker_role: String,
         thread_id: magi_core::ThreadId,
         system_prompt: Option<String>,
+        execution_settings_snapshot: Option<Arc<SettingsStore>>,
     ) {
         // 仅在有 writebacks 时（即主 action task）才生成 streaming entry_id。
         // sub-task 的 writebacks 为空，不需要在 timeline 中创建流式条目。
@@ -668,6 +669,7 @@ impl LlmTaskDispatcher {
             Some(worker_role.as_str()),
             &thread_id,
             system_prompt,
+            execution_settings_snapshot.clone(),
         );
         if matches!(&outcome, TaskOutcome::Completed { .. }) {
             self.session_store
@@ -675,8 +677,15 @@ impl LlmTaskDispatcher {
             let should_extract_knowledge = !writebacks.is_empty();
             writebacks.apply(&self.pipeline.memory_store);
             if should_extract_knowledge {
-                self.extract_and_persist_knowledge(&session_id, &workspace_id, &outcome);
-                self.extract_and_persist_session_memory(&session_id);
+                let execution_settings =
+                    self.execution_settings_or_live(execution_settings_snapshot.as_ref());
+                self.extract_and_persist_knowledge(
+                    execution_settings,
+                    &session_id,
+                    &workspace_id,
+                    &outcome,
+                );
+                self.extract_and_persist_session_memory(execution_settings, &session_id);
             }
             self.publish_execution_overview(task, &session_id, &workspace_id, context_summary);
         }
@@ -685,6 +694,7 @@ impl LlmTaskDispatcher {
 
     fn extract_and_persist_knowledge(
         &self,
+        settings_store: Option<&Arc<SettingsStore>>,
         session_id: &SessionId,
         workspace_id: &Option<WorkspaceId>,
         outcome: &TaskOutcome,
@@ -716,10 +726,9 @@ impl LlmTaskDispatcher {
             .join("\n\n");
         let output_text = output_refs.join("\n\n");
         let extraction_text = format!("{timeline_text}\n\n{output_text}");
-        let Some(client) =
-            resolve_target_for_role(self.settings_store.as_ref(), None, RoleTarget::Auxiliary)
-                .ok()
-                .flatten()
+        let Some(client) = resolve_target_for_role(settings_store, None, RoleTarget::Auxiliary)
+            .ok()
+            .flatten()
         else {
             return;
         };
@@ -774,11 +783,14 @@ impl LlmTaskDispatcher {
     ///
     /// 辅助模型未配置、调用失败、JSON 解析异常一律静默跳过（`tracing::debug!`），
     /// 不做任何"退回到 marker 写回"之类的兜底 —— 与现有辅助模型路径同语义。
-    fn extract_and_persist_session_memory(&self, session_id: &SessionId) {
-        let Some(client) =
-            resolve_target_for_role(self.settings_store.as_ref(), None, RoleTarget::Auxiliary)
-                .ok()
-                .flatten()
+    fn extract_and_persist_session_memory(
+        &self,
+        settings_store: Option<&Arc<SettingsStore>>,
+        session_id: &SessionId,
+    ) {
+        let Some(client) = resolve_target_for_role(settings_store, None, RoleTarget::Auxiliary)
+            .ok()
+            .flatten()
         else {
             return;
         };
@@ -992,6 +1004,7 @@ impl LlmTaskDispatcher {
 
     fn assemble_prompt(
         &self,
+        settings_store: Option<&Arc<SettingsStore>>,
         task: &magi_core::Task,
         session_id: &SessionId,
         workspace_id: &Option<WorkspaceId>,
@@ -1001,8 +1014,8 @@ impl LlmTaskDispatcher {
         } else {
             format!("{}\n\n{}", task.title, task.goal)
         };
-        let user_rules_prefix = self.resolve_user_rules_prompt();
-        let safeguard_prefix = self.resolve_safeguard_prompt();
+        let user_rules_prefix = self.resolve_user_rules_prompt(settings_store);
+        let safeguard_prefix = self.resolve_safeguard_prompt(settings_store);
         let lifecycle_notice = self.lifecycle_notice_for_mission(&task.mission_id);
         let task_fact_context_parts = self.task_fact_context_parts(task);
 
@@ -1088,8 +1101,11 @@ impl LlmTaskDispatcher {
         )
     }
 
-    fn resolve_user_rules_prompt(&self) -> Option<String> {
-        let store = self.settings_store.as_ref()?;
+    fn resolve_user_rules_prompt(
+        &self,
+        settings_store: Option<&Arc<SettingsStore>>,
+    ) -> Option<String> {
+        let store = settings_store?;
         let raw = store.get_section("userRules");
         match raw {
             serde_json::Value::String(value) => {
@@ -1111,7 +1127,10 @@ impl LlmTaskDispatcher {
         }
     }
 
-    fn resolve_safeguard_prompt(&self) -> Option<String> {
+    fn resolve_safeguard_prompt(
+        &self,
+        settings_store: Option<&Arc<SettingsStore>>,
+    ) -> Option<String> {
         // S8：安全防护段。
         //
         // 内容分两层：
@@ -1124,7 +1143,7 @@ impl LlmTaskDispatcher {
         // 始终返回 `Some(...)`：哪怕没配置任何危险模式，基线本身也要注入。
         let mut sections = vec![INJECTION_DEFENSE_BASELINE.to_string()];
 
-        if let Some(gate) = self.build_safety_gate() {
+        if let Some(gate) = self.build_safety_gate(settings_store) {
             let patterns = gate
                 .rules()
                 .iter()
@@ -1146,9 +1165,12 @@ impl LlmTaskDispatcher {
 
     /// S8：依据当前 settings 快照构造 SafetyGate。
     /// 调用者每次进入 LLM 轮次循环前都构造一次；引擎本身无状态，可在该轮次内共享。
-    pub(crate) fn build_safety_gate(&self) -> Option<magi_safety_gate::SafetyGate> {
+    pub(crate) fn build_safety_gate(
+        &self,
+        settings_store: Option<&Arc<SettingsStore>>,
+    ) -> Option<magi_safety_gate::SafetyGate> {
         let mut rules = magi_safety_gate::builtin_rules();
-        if let Some(store) = self.settings_store.as_ref() {
+        if let Some(store) = settings_store {
             let raw = store.get_section("safeguardConfig");
             rules.extend(
                 raw.get("rules")
@@ -1165,8 +1187,22 @@ impl LlmTaskDispatcher {
         }
     }
 
+    fn execution_settings_snapshot(&self) -> Option<Arc<SettingsStore>> {
+        self.settings_store
+            .as_ref()
+            .map(|store| Arc::new(store.execution_snapshot()))
+    }
+
+    fn execution_settings_or_live<'a>(
+        &'a self,
+        execution_settings_snapshot: Option<&'a Arc<SettingsStore>>,
+    ) -> Option<&'a Arc<SettingsStore>> {
+        execution_settings_snapshot.or(self.settings_store.as_ref())
+    }
+
     fn resolve_model_client_for_task(
         &self,
+        settings_store: Option<&Arc<SettingsStore>>,
         task: Option<&magi_core::Task>,
         execution_role_id: Option<&str>,
     ) -> Result<Arc<dyn ModelBridgeClient>, String> {
@@ -1183,7 +1219,7 @@ impl LlmTaskDispatcher {
             let wrap_with_orchestrator_failover =
                 task.and_then(|task| task.parent_task_id.as_ref()).is_some();
             if let Some(client) = resolve_target_for_role(
-                self.settings_store.as_ref(),
+                settings_store,
                 self.model_bridge_client.clone(),
                 RoleTarget::Agent {
                     role_id,
@@ -1195,7 +1231,7 @@ impl LlmTaskDispatcher {
         }
 
         resolve_target_for_role(
-            self.settings_store.as_ref(),
+            settings_store,
             self.model_bridge_client.clone(),
             RoleTarget::Orchestrator,
         )?
@@ -1227,12 +1263,16 @@ impl LlmTaskDispatcher {
         &self,
         request: SessionTurnExecutionRequest,
     ) -> Result<SessionTurnExecutionOutput, String> {
-        let client = self.resolve_model_client_for_task(None, None)?;
+        let execution_settings_snapshot = self.execution_settings_snapshot();
+        let execution_settings =
+            self.execution_settings_or_live(execution_settings_snapshot.as_ref());
+        let client = self.resolve_model_client_for_task(execution_settings, None, None)?;
 
         let prompt = self.apply_skill_prompt_injections(
             prepend_session_instructions(
-                self.resolve_user_rules_prompt().as_deref(),
-                self.resolve_safeguard_prompt().as_deref(),
+                self.resolve_user_rules_prompt(execution_settings)
+                    .as_deref(),
+                self.resolve_safeguard_prompt(execution_settings).as_deref(),
                 None,
                 &request.prompt,
             ),
@@ -1249,7 +1289,7 @@ impl LlmTaskDispatcher {
             client: client.as_ref(),
             event_bus: self.event_bus.as_ref(),
             session_store: self.session_store.as_ref(),
-            settings_store: self.settings_store.as_ref(),
+            settings_store: execution_settings,
             tool_registry: self.tool_registry.as_ref(),
             skill_runtime: self.skill_runtime.as_deref(),
             snapshot_manager: self.snapshot_manager.as_ref(),
@@ -1276,13 +1316,20 @@ impl LlmTaskDispatcher {
         execution_role_id: Option<&str>,
         thread_id: &magi_core::ThreadId,
         system_prompt: Option<String>,
+        execution_settings_snapshot: Option<Arc<SettingsStore>>,
     ) -> (TaskOutcome, Option<ExecutionContextSummary>) {
+        let execution_settings =
+            self.execution_settings_or_live(execution_settings_snapshot.as_ref());
         let role_for_model = if is_sidechain {
             execution_role_id
         } else {
             None
         };
-        let client = match self.resolve_model_client_for_task(Some(task), role_for_model) {
+        let client = match self.resolve_model_client_for_task(
+            execution_settings,
+            Some(task),
+            role_for_model,
+        ) {
             Ok(client) => client,
             Err(error) => {
                 tracing::error!(task_id = %task.task_id, error = %error, "invoke_llm_with_tools: model bridge client resolve failed");
@@ -1295,7 +1342,8 @@ impl LlmTaskDispatcher {
             }
         };
 
-        let (prompt, context_summary) = self.assemble_prompt(task, session_id, workspace_id);
+        let (prompt, context_summary) =
+            self.assemble_prompt(execution_settings, task, session_id, workspace_id);
         let prompt = self.apply_skill_prompt_injections(prompt, skill_name.as_deref());
         let workspace_root_path = self.resolve_workspace_root_path(workspace_id);
 
@@ -1317,7 +1365,7 @@ impl LlmTaskDispatcher {
             .agent_role_registry
             .as_ref()
             .expect("LlmTaskDispatcher 缺少 AgentRoleRegistry，无法解析 task→role");
-        let safety_gate = self.build_safety_gate();
+        let safety_gate = self.build_safety_gate(execution_settings);
         let todo_ledger = self.todo_ledger_registry.get_or_create(session_id);
         let orchestration_enabled =
             task_is_coordinator(Some(task), Some(agent_role_registry.as_ref()));
@@ -1454,7 +1502,7 @@ impl LlmTaskDispatcher {
             client: client.as_ref(),
             event_bus: self.event_bus.as_ref(),
             session_store: self.session_store.as_ref(),
-            settings_store: self.settings_store.as_ref(),
+            settings_store: execution_settings,
             tool_registry: self.tool_registry.as_ref(),
             skill_runtime: self.skill_runtime.as_deref(),
             task_store: self.pipeline.execution_runtime.task_store(),
@@ -1531,6 +1579,7 @@ impl LlmTaskDispatcher {
                 writebacks,
                 use_tools,
                 skill_name,
+                execution_settings_snapshot,
             } => {
                 self.publish_task_dispatched_event(
                     &task.task_id,
@@ -1554,13 +1603,14 @@ impl LlmTaskDispatcher {
                     model_usage_binding_for_worker_with_settings(
                         worker,
                         is_primary,
-                        self.settings_store.as_ref(),
+                        self.execution_settings_or_live(execution_settings_snapshot.as_ref()),
                     ),
                     !is_primary,
                     worker_id,
                     worker.role.clone(),
                     thread_id,
                     worker.system_prompt_template.clone(),
+                    execution_settings_snapshot,
                 );
             }
         }
@@ -1865,12 +1915,22 @@ mod tests {
         assert!(!task_can_see_builtin_tool(
             Some(&worker_task),
             Some(&registry),
+            BuiltinToolName::AgentWait
+        ));
+        assert!(!task_can_see_builtin_tool(
+            Some(&worker_task),
+            Some(&registry),
             BuiltinToolName::PlanWrite
         ));
         assert!(task_can_see_builtin_tool(
             Some(&coordinator_task),
             Some(&registry),
             BuiltinToolName::AgentSpawn
+        ));
+        assert!(task_can_see_builtin_tool(
+            Some(&coordinator_task),
+            Some(&registry),
+            BuiltinToolName::AgentWait
         ));
         assert!(task_can_see_builtin_tool(
             Some(&coordinator_task),
@@ -1896,6 +1956,11 @@ mod tests {
             None,
             Some(&registry),
             BuiltinToolName::AgentSpawn
+        ));
+        assert!(!task_can_see_builtin_tool(
+            None,
+            Some(&registry),
+            BuiltinToolName::AgentWait
         ));
     }
 
@@ -2082,6 +2147,41 @@ mod tests {
         assert!(
             orch.is_none(),
             "orchestrator 未配置且无 default 时必须返回 None"
+        );
+    }
+
+    #[test]
+    fn resolve_target_for_role_reads_execution_snapshot_not_live_settings() {
+        use crate::settings_store::SettingsStore;
+
+        let live_store = Arc::new(SettingsStore::new());
+        live_store.set_section(
+            "orchestrator",
+            serde_json::json!({
+                "baseUrl": "https://api.example.com/v1",
+                "apiKey": "sk-old",
+                "model": "model-old",
+                "urlMode": "standard",
+            }),
+        );
+        let snapshot = Arc::new(live_store.execution_snapshot());
+
+        live_store.remove_section("orchestrator");
+
+        let snapshot_client =
+            resolve_target_for_role(Some(&snapshot), None, RoleTarget::Orchestrator)
+                .expect("快照内的 orchestrator 配置应可解析");
+        assert!(
+            snapshot_client.is_some(),
+            "执行快照必须保留任务接受时的模型配置"
+        );
+
+        let live_client =
+            resolve_target_for_role(Some(&live_store), None, RoleTarget::Orchestrator)
+                .expect("实时 settings 查询不应失败");
+        assert!(
+            live_client.is_none(),
+            "实时 settings 已删除 orchestrator，不应影响既有执行快照"
         );
     }
 }

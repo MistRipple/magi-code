@@ -284,7 +284,7 @@ export function handleUnifiedControlMessage(standard: StandardMessage) {
       break;
 
     case 'worker_status': {
-      // Worker 状态更新：从控制消息同步状态到 UI
+      // 代理状态更新：从控制消息同步状态到 UI
       const store = getState();
       const worker = payload?.worker as string | undefined;
       const available = payload?.available as boolean | undefined;
@@ -1024,7 +1024,7 @@ function handleClarificationRequest(_message: ClientBridgeMessage) {
 // Old Mission/Assignment incremental handlers superseded by Task Projection model.
 
 /**
- * 处理 Worker 状态更新消息
+ * 处理代理状态更新消息
  * 将检测到的模型状态同步到全局 store，供设置和执行状态共用
  */
 function handleWorkerStatusUpdate(message: ClientBridgeMessage) {
@@ -1070,7 +1070,7 @@ function handleConnectionTestResult(message: ClientBridgeMessage) {
   const success = Boolean(message.success);
   const error = message.error as string | undefined;
 
-  // Worker 连接测试
+  // 代理连接测试
   const worker = message.worker as string | undefined;
   if (worker) {
     store.modelStatus = {

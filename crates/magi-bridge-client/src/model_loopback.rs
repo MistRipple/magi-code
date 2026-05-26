@@ -966,8 +966,16 @@ struct OpenAiCompatibleChatMessage {
     reasoning_content: Option<String>,
     #[serde(default)]
     refusal: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     tool_calls: Vec<OpenAiCompatibleToolCall>,
+}
+
+fn null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(|value| value.unwrap_or_default())
 }
 
 #[derive(Debug, Deserialize)]

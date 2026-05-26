@@ -531,7 +531,7 @@ import { getAgentColor } from '../lib/agent-colors';
 
   /* worker-dot 颜色已通过行内 style 动态注入 */
 
-  /* Worker Model Tabs - 放在标题右侧 */
+  /* 代理模型 Tabs - 放在标题右侧 */
 
   /* 空状态 */
   

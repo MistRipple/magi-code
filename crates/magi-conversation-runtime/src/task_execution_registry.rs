@@ -19,7 +19,7 @@ use magi_orchestrator::{ExecutionWritebackPlans, task_store::TaskStore};
 use magi_session_store::{ActiveExecutionBranch, SessionStore};
 use magi_spawn_graph::SpawnGraph;
 
-use crate::session_thread;
+use crate::{session_thread, settings_store::SettingsStore};
 
 #[derive(Clone, Debug)]
 pub enum TaskExecutionPlan {
@@ -36,7 +36,19 @@ pub enum TaskExecutionPlan {
         writebacks: ExecutionWritebackPlans,
         use_tools: bool,
         skill_name: Option<String>,
+        execution_settings_snapshot: Option<Arc<SettingsStore>>,
     },
+}
+
+impl TaskExecutionPlan {
+    pub fn execution_settings_snapshot(&self) -> Option<Arc<SettingsStore>> {
+        match self {
+            Self::Dispatch {
+                execution_settings_snapshot,
+                ..
+            } => execution_settings_snapshot.clone(),
+        }
+    }
 }
 
 pub struct SpawnedChildExecutionRequest<'a> {
@@ -122,13 +134,13 @@ impl TaskExecutionRegistry {
             .lock()
             .map_err(|err| format!("SpawnGraph mutex poisoned: {err}"))?
             .add_edge(
-                parent_task_id,
+                parent_task_id.clone(),
                 child_task.task_id.clone(),
                 child_task.kind,
                 std::time::SystemTime::now(),
             )
             .map_err(|error| format!("agent_spawn 注册 SpawnGraph 边失败: {error}"))?;
-        let worker_id = WorkerId::new(format!("worker-spawn-{}", now.0));
+        let worker_id = WorkerId::new(format!("worker-spawn-{}", child_task.task_id.as_str()));
         let thread_id = session_thread::ensure_thread_for_role(
             session_store,
             session_id,
@@ -178,6 +190,10 @@ impl TaskExecutionRegistry {
             .upsert_active_execution_chain(session_id.clone(), chain)
             .map_err(|error| error.to_string())?;
 
+        let execution_settings_snapshot = self
+            .get(&parent_task_id)
+            .and_then(|plan| plan.execution_settings_snapshot());
+
         self.insert(
             child_task.task_id.clone(),
             TaskExecutionPlan::Dispatch {
@@ -205,6 +221,7 @@ impl TaskExecutionRegistry {
                 writebacks: ExecutionWritebackPlans::default(),
                 use_tools: true,
                 skill_name: None,
+                execution_settings_snapshot,
             },
         );
         task_store.insert_task(child_task.clone());
@@ -256,6 +273,8 @@ mod tests {
 
     #[test]
     fn spawned_local_agent_child_registration_is_atomic_runtime_source() {
+        use crate::settings_store::SettingsStore;
+
         let task_store = TaskStore::new();
         let spawn_graph = Mutex::new(SpawnGraph::new());
         let session_store = SessionStore::new();
@@ -315,6 +334,31 @@ mod tests {
             )
             .expect("active chain should be accepted");
 
+        let parent_settings_snapshot = Arc::new(SettingsStore::new().execution_snapshot());
+        registry.insert(
+            root_task_id.clone(),
+            TaskExecutionPlan::Dispatch {
+                target: magi_core::TaskExecutionTarget {
+                    mission_id: mission_id.clone(),
+                    root_task_id: root_task_id.clone(),
+                    task_id: root_task_id.clone(),
+                    requested_worker_id: None,
+                    recovery_id: None,
+                    execution_chain_ref: Some("chain-atomic-spawn".to_string()),
+                },
+                worker_id: WorkerId::new("worker-parent"),
+                thread_id: ThreadId::new("thread-atomic-spawn-parent"),
+                is_primary: true,
+                session_id: session_id.clone(),
+                workspace_id: workspace_id.clone(),
+                ownership: ExecutionOwnership::default(),
+                writebacks: ExecutionWritebackPlans::default(),
+                use_tools: true,
+                skill_name: None,
+                execution_settings_snapshot: Some(parent_settings_snapshot.clone()),
+            },
+        );
+
         let child = test_task("task-child", root_task_id.as_str(), &mission_id);
         let registered = registry
             .register_spawned_local_agent_child(SpawnedChildExecutionRequest {
@@ -352,6 +396,7 @@ mod tests {
                 workspace_id: plan_workspace_id,
                 is_primary,
                 use_tools,
+                execution_settings_snapshot,
                 ..
             } => {
                 assert_eq!(thread_id, registered.thread_id);
@@ -359,6 +404,12 @@ mod tests {
                 assert_eq!(plan_workspace_id, workspace_id);
                 assert!(!is_primary);
                 assert!(use_tools);
+                assert!(
+                    execution_settings_snapshot
+                        .as_ref()
+                        .is_some_and(|snapshot| Arc::ptr_eq(snapshot, &parent_settings_snapshot)),
+                    "agent_spawn 子任务必须继承父任务执行快照"
+                );
             }
         }
 

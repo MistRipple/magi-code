@@ -308,6 +308,57 @@ fn openai_compatible_provider_accepts_tool_call_only_success_payload() {
 }
 
 #[test]
+fn openai_compatible_provider_treats_null_tool_calls_as_empty() {
+    let (base_url, receiver, handle) = spawn_http_stub(
+        200,
+        json!({
+            "usage": {
+                "total_tokens": 5,
+            },
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {
+                    "content": "done",
+                    "tool_calls": null
+                }
+            }]
+        }),
+    );
+    let client = JsonRpcModelBridgeClient::new(Arc::new(loopback_transport_with_env(&[
+        ("MAGI_OPENAI_COMPAT_BASE_URL", base_url.as_str()),
+        ("MAGI_OPENAI_COMPAT_API_KEY", "test-key"),
+        ("MAGI_OPENAI_COMPAT_MODEL", "gpt-test"),
+    ])));
+
+    let response = client
+        .invoke(ModelInvocationRequest {
+            provider: "openai-compatible".to_string(),
+            prompt: "say hi".to_string(),
+            messages: None,
+            tools: None,
+            tool_choice: None,
+        })
+        .expect("null tool_calls should be treated as an empty tool call list");
+
+    assert!(response.ok);
+    let payload: Value = serde_json::from_str(&response.payload).expect("payload should be json");
+    assert_eq!(payload["content"], "done");
+    assert_eq!(payload["finish_reason"], "stop");
+    assert!(
+        payload
+            .get("tool_calls")
+            .and_then(serde_json::Value::as_array)
+            .map_or(true, Vec::is_empty)
+    );
+
+    let request = receiver
+        .recv_timeout(Duration::from_secs(5))
+        .expect("http stub should receive request");
+    handle.join().expect("http stub should join");
+    assert_eq!(request.request_line, "POST /v1/chat/completions HTTP/1.1");
+}
+
+#[test]
 fn openai_compatible_provider_surfaces_refusal_only_payload() {
     let (base_url, receiver, handle) = spawn_http_stub(
         200,
