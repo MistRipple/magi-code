@@ -52,6 +52,8 @@ pub struct PendingChangeDto {
     pub tail_summary: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub contributors: Vec<String>,
     pub execution_group_id: String,
@@ -261,6 +263,7 @@ fn convert_pending(scope: &SessionChangeScope, change: PendingChange) -> Pending
         head_summary: change.head_summary,
         tail_summary: change.tail_summary,
         tool_call_id: change.tool_call_id,
+        worker_id: change.worker_id,
         contributors: scope.contributors.clone(),
         execution_group_id: scope.execution_group_id.clone(),
     }

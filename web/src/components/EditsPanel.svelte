@@ -198,6 +198,19 @@
         return i18n.t('edits.kind.text');
     }
   }
+
+  function editActorLabel(edit: Edit): string | null {
+    if (edit.workerId?.trim()) return i18n.t('edits.actor.agent');
+    if (edit.sourceKind === 'tool') return i18n.t('edits.actor.mainline');
+    if (edit.sourceKind === 'watcher' || edit.sourceKind === 'external') return i18n.t('edits.actor.external');
+    return null;
+  }
+
+  function editActorTitle(edit: Edit): string {
+    if (edit.workerId?.trim()) return i18n.t('edits.actor.agentTitle');
+    if (edit.sourceKind === 'tool') return i18n.t('edits.actor.mainlineTitle');
+    return i18n.t('edits.actor.externalTitle');
+  }
 </script>
 
 {#snippet fileRow(edit: Edit)}
@@ -228,6 +241,9 @@
       {/if}
       {#if edit.error}
         <span class="file-error-tag" title={edit.error}>{i18n.t('edits.row.error')}</span>
+      {/if}
+      {#if editActorLabel(edit)}
+        <span class="file-actor-tag" title={editActorTitle(edit)}>{editActorLabel(edit)}</span>
       {/if}
     </div>
     <div class="file-stats">
@@ -616,7 +632,8 @@
   }
 
   .file-kind-tag,
-  .file-error-tag {
+  .file-error-tag,
+  .file-actor-tag {
     display: inline-flex;
     align-items: center;
     margin-left: 6px;
@@ -635,6 +652,12 @@
     background: color-mix(in srgb, var(--error) 18%, transparent);
     color: var(--error);
     border-color: color-mix(in srgb, var(--error) 35%, var(--edits-card-border));
+  }
+
+  .file-actor-tag {
+    background: color-mix(in srgb, var(--info) 13%, transparent);
+    color: var(--foreground-muted);
+    border-color: color-mix(in srgb, var(--info) 28%, var(--edits-card-border));
   }
 
   .file-actions {

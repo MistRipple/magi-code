@@ -1,3 +1,4 @@
+use crate::tool_declared_paths::{append_result_declared_paths, derive_declared_paths};
 use crate::tool_result_utils::{
     summarize_tool_result, tool_execution_status_label, turn_item_status_for_tool_result,
 };
@@ -680,36 +681,6 @@ pub fn append_session_tool_call_items_batch(
     true
 }
 
-/// 从 tool_call 参数推断可能被改写的路径，供 SnapshotSession 的 after_tool 强制拍后态。
-/// 覆盖 canonical 文件工具（file_write / file_patch / file_remove / file_mkdir）和 shell 工具（changed_paths）。
-/// 无法可靠推断时返回空 Vec，由 ChangeLog 的全树对账补齐。
-fn derive_declared_paths(tool_call: &ChatToolCall) -> Vec<PathBuf> {
-    let Ok(arguments) = serde_json::from_str::<Value>(&tool_call.function.arguments) else {
-        return Vec::new();
-    };
-    let tool_name = tool_call.function.name.as_str();
-    let mut paths: Vec<PathBuf> = Vec::new();
-    match tool_name {
-        "file_write" | "file_patch" | "file_remove" | "file_mkdir" | "file_create"
-        | "file_edit" => {
-            if let Some(path) = arguments.get("path").and_then(Value::as_str) {
-                paths.push(PathBuf::from(path));
-            }
-        }
-        "shell_exec" => {
-            if let Some(list) = arguments.get("changed_paths").and_then(Value::as_array) {
-                for item in list {
-                    if let Some(p) = item.as_str() {
-                        paths.push(PathBuf::from(p));
-                    }
-                }
-            }
-        }
-        _ => {}
-    }
-    paths
-}
-
 fn upsert_session_tool_call_result_item(
     session_store: &SessionStore,
     event_bus: &InMemoryEventBus,
@@ -774,9 +745,9 @@ fn execute_session_turn_tool_call_batch(
         match batch.kind {
             ToolBatchKind::Serial => {
                 for tool_index in batch.tool_indices {
-                    let hook_ctx = &hook_contexts[tool_index];
+                    let mut hook_ctx = hook_contexts[tool_index].clone();
                     if let Some(snapshot) = snapshot_session {
-                        snapshot.before_tool(hook_ctx);
+                        snapshot.before_tool(&hook_ctx);
                     }
                     let result = execute_session_turn_tool_call(
                         event_bus,
@@ -787,8 +758,9 @@ fn execute_session_turn_tool_call_batch(
                         workspace_id,
                         workspace_root_path,
                     );
+                    append_result_declared_paths(&mut hook_ctx.declared_paths, &result.0);
                     if let Some(snapshot) = snapshot_session {
-                        snapshot.after_tool(hook_ctx);
+                        snapshot.after_tool(&hook_ctx);
                     }
                     results[tool_index] = Some(result);
                 }
@@ -801,7 +773,7 @@ fn execute_session_turn_tool_call_batch(
                         .copied()
                         .map(|tool_index| {
                             let tool_call = &tool_calls[tool_index];
-                            let hook_ctx = hook_contexts[tool_index].clone();
+                            let mut hook_ctx = hook_contexts[tool_index].clone();
                             let snapshot_session = snapshot_session.cloned();
                             (
                                 tool_index,
@@ -814,6 +786,10 @@ fn execute_session_turn_tool_call_batch(
                                         session_id,
                                         workspace_id,
                                         workspace_root_path,
+                                    );
+                                    append_result_declared_paths(
+                                        &mut hook_ctx.declared_paths,
+                                        &result.0,
                                     );
                                     if let Some(snapshot) = snapshot_session.as_deref() {
                                         snapshot.after_tool(&hook_ctx);

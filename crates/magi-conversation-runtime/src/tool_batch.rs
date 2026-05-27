@@ -9,7 +9,7 @@
 use std::{
     path::PathBuf,
     sync::{
-        Mutex,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
     thread,
@@ -27,6 +27,7 @@ use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
 use magi_governance::ToolKind;
 use magi_orchestrator::task_store::TaskStore;
 use magi_session_store::SessionStore;
+use magi_snapshot::{SnapshotSession, ToolHook, ToolHookCtx};
 use magi_tool_runtime::{
     BuiltinToolName, ToolExecutionContext, ToolExecutionInput, ToolExecutionPolicy, ToolRegistry,
 };
@@ -37,6 +38,7 @@ use crate::{
     ConversationRegistry, MailboxAuthor, MailboxKind, RuntimeSignal,
     task_execution_registry::{SpawnedChildExecutionRequest, TaskExecutionRegistry},
     task_helpers::{task_can_see_builtin_tool, task_is_long_mission},
+    tool_declared_paths::{append_result_declared_paths, derive_declared_paths},
 };
 
 /// agent_spawn 生成 child task_id 时使用的进程内单调序号。
@@ -116,6 +118,8 @@ pub fn execute_task_tool_call_batch(
     workspace_root_path: Option<&PathBuf>,
     worker_id: Option<&magi_core::WorkerId>,
     tool_calls: &[ChatToolCall],
+    snapshot_session: Option<Arc<SnapshotSession>>,
+    execution_group_id: Option<String>,
 ) -> Vec<(String, ExecutionResultStatus)> {
     let parsed_arguments = tool_calls
         .iter()
@@ -132,12 +136,25 @@ pub fn execute_task_tool_call_batch(
         })
         .collect::<Vec<_>>();
     let mut results = vec![None; tool_calls.len()];
+    let hook_contexts = tool_calls
+        .iter()
+        .map(|tool_call| ToolHookCtx {
+            tool_call_id: tool_call.id.clone(),
+            worker_id: worker_id.map(ToString::to_string),
+            execution_group_id: execution_group_id.clone(),
+            declared_paths: derive_declared_paths(tool_call),
+        })
+        .collect::<Vec<_>>();
 
     for batch in partition_tool_calls_with_inputs(&tool_inputs) {
         match batch.kind {
             ToolBatchKind::Serial => {
                 for tool_index in batch.tool_indices {
-                    results[tool_index] = Some(execute_task_tool_call(
+                    let mut hook_ctx = hook_contexts[tool_index].clone();
+                    if let Some(snapshot) = snapshot_session.as_deref() {
+                        snapshot.before_tool(&hook_ctx);
+                    }
+                    let result = execute_task_tool_call(
                         event_bus,
                         tool_registry,
                         agent_role_registry,
@@ -162,7 +179,12 @@ pub fn execute_task_tool_call_batch(
                         workspace_root_path,
                         worker_id,
                         &tool_calls[tool_index],
-                    ));
+                    );
+                    append_result_declared_paths(&mut hook_ctx.declared_paths, &result.0);
+                    if let Some(snapshot) = snapshot_session.as_deref() {
+                        snapshot.after_tool(&hook_ctx);
+                    }
+                    results[tool_index] = Some(result);
                 }
             }
             ToolBatchKind::Concurrent => {
@@ -173,10 +195,12 @@ pub fn execute_task_tool_call_batch(
                         .copied()
                         .map(|tool_index| {
                             let tool_call = &tool_calls[tool_index];
+                            let mut hook_ctx = hook_contexts[tool_index].clone();
+                            let snapshot_session = snapshot_session.clone();
                             (
                                 tool_index,
                                 scope.spawn(move || {
-                                    execute_task_tool_call(
+                                    let result = execute_task_tool_call(
                                         event_bus,
                                         tool_registry,
                                         agent_role_registry,
@@ -201,7 +225,15 @@ pub fn execute_task_tool_call_batch(
                                         workspace_root_path,
                                         worker_id,
                                         tool_call,
-                                    )
+                                    );
+                                    append_result_declared_paths(
+                                        &mut hook_ctx.declared_paths,
+                                        &result.0,
+                                    );
+                                    if let Some(snapshot) = snapshot_session.as_deref() {
+                                        snapshot.after_tool(&hook_ctx);
+                                    }
+                                    result
                                 }),
                             )
                         })
@@ -224,6 +256,16 @@ pub fn execute_task_tool_call_batch(
                 });
             }
         }
+    }
+    if let Some(snapshot) = snapshot_session.as_deref()
+        && let Err(err) = snapshot.reconcile()
+    {
+        tracing::warn!(
+            session_id = %session_id.as_str(),
+            task_id = %task.task_id.as_str(),
+            error = %err,
+            "snapshot reconcile after task tool batch failed"
+        );
     }
 
     results
@@ -1565,6 +1607,8 @@ mod tests {
     use super::*;
     use magi_bridge_client::ChatToolFunction;
     use magi_core::{MissionId, Task, TaskPolicy, TaskRuntimePayload, WorkspaceRootPath};
+    use std::sync::Arc;
+    use tempfile::tempdir;
 
     fn test_task(task_id: &str, root_task_id: &str, parent_task_id: Option<TaskId>) -> Task {
         Task {
@@ -1763,6 +1807,151 @@ mod tests {
                 .as_str()
                 .unwrap_or_default()
                 .contains("只读任务不允许执行写入工具")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn task_tool_batch_records_snapshot_worker_attribution() {
+        let dir = tempdir().expect("temp dir");
+        let workspace_root = dir.path().to_path_buf();
+        let snapshot = magi_snapshot::SnapshotManager::new()
+            .start_session("session-task-snapshot".to_string(), workspace_root.clone())
+            .await
+            .expect("snapshot session should start");
+
+        let event_bus = InMemoryEventBus::new(16);
+        let task_store = TaskStore::new();
+        let session_store = SessionStore::new();
+        let execution_registry = TaskExecutionRegistry::default();
+        let conversation_registry = ConversationRegistry::new();
+        let spawn_graph = Mutex::new(magi_spawn_graph::SpawnGraph::new());
+        let todo_ledger = magi_todo_ledger::TodoLedger::new();
+        let agent_role_registry = magi_agent_role::AgentRoleRegistry::load_default();
+        let mut tool_registry = ToolRegistry::new(
+            Arc::new(magi_governance::GovernanceService::default()),
+            Arc::new(InMemoryEventBus::new(8)),
+        );
+        tool_registry.register_default_builtins();
+
+        let task = test_task("task-snapshot-agent", "task-snapshot-agent", None);
+        let session_id = SessionId::new("session-task-snapshot");
+        let workspace_id = Some(WorkspaceId::new("workspace-task-snapshot"));
+        let worker_id = magi_core::WorkerId::new("worker-agent-edit");
+        let tool_call = ChatToolCall {
+            id: "call-file-write-agent".to_string(),
+            kind: "function".to_string(),
+            function: ChatToolFunction {
+                name: BuiltinToolName::FileWrite.as_str().to_string(),
+                arguments: serde_json::json!({
+                    "path": "agent.txt",
+                    "content": "hello from agent"
+                })
+                .to_string(),
+            },
+        };
+
+        let result = execute_task_tool_call_batch(
+            &event_bus,
+            Some(&tool_registry),
+            &agent_role_registry,
+            None,
+            &task_store,
+            &session_store,
+            &execution_registry,
+            &conversation_registry,
+            &spawn_graph,
+            None,
+            &todo_ledger,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &task,
+            &session_id,
+            &workspace_id,
+            Some(&workspace_root),
+            Some(&worker_id),
+            &[tool_call],
+            Some(snapshot.clone()),
+            Some(task.mission_id.to_string()),
+        );
+
+        assert_eq!(result[0].1, ExecutionResultStatus::Succeeded);
+        let pending = snapshot.pending_changes().expect("pending changes");
+        let change = pending
+            .iter()
+            .find(|change| change.path == "agent.txt")
+            .expect("agent.txt should be tracked");
+        assert_eq!(change.source, magi_snapshot::SourceKind::Tool);
+        assert_eq!(
+            change.tool_call_id.as_deref(),
+            Some("call-file-write-agent")
+        );
+        assert_eq!(change.worker_id.as_deref(), Some("worker-agent-edit"));
+        assert_eq!(
+            change.execution_group_id.as_deref(),
+            Some("mission-mailbox")
+        );
+
+        let mainline_tool_call = ChatToolCall {
+            id: "call-file-write-mainline".to_string(),
+            kind: "function".to_string(),
+            function: ChatToolFunction {
+                name: BuiltinToolName::FileWrite.as_str().to_string(),
+                arguments: serde_json::json!({
+                    "path": "mainline.txt",
+                    "content": "hello from mainline"
+                })
+                .to_string(),
+            },
+        };
+        let mainline_result = execute_task_tool_call_batch(
+            &event_bus,
+            Some(&tool_registry),
+            &agent_role_registry,
+            None,
+            &task_store,
+            &session_store,
+            &execution_registry,
+            &conversation_registry,
+            &spawn_graph,
+            None,
+            &todo_ledger,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &task,
+            &session_id,
+            &workspace_id,
+            Some(&workspace_root),
+            None,
+            &[mainline_tool_call],
+            Some(snapshot.clone()),
+            Some(task.mission_id.to_string()),
+        );
+
+        assert_eq!(mainline_result[0].1, ExecutionResultStatus::Succeeded);
+        let pending = snapshot.pending_changes().expect("pending changes");
+        let mainline_change = pending
+            .iter()
+            .find(|change| change.path == "mainline.txt")
+            .expect("mainline.txt should be tracked");
+        assert_eq!(mainline_change.source, magi_snapshot::SourceKind::Tool);
+        assert_eq!(
+            mainline_change.tool_call_id.as_deref(),
+            Some("call-file-write-mainline")
+        );
+        assert_eq!(mainline_change.worker_id, None);
+        assert_eq!(
+            mainline_change.execution_group_id.as_deref(),
+            Some("mission-mailbox")
         );
     }
 
@@ -2131,6 +2320,8 @@ mod tests {
                     arguments: "{}".to_string(),
                 },
             }],
+            None,
+            None,
         );
         assert_eq!(worker_result[0].1, ExecutionResultStatus::Rejected);
 
@@ -2167,6 +2358,8 @@ mod tests {
                     arguments: "{}".to_string(),
                 },
             }],
+            None,
+            None,
         );
         assert_eq!(coordinator_result[0].1, ExecutionResultStatus::Rejected);
     }
@@ -2230,6 +2423,8 @@ mod tests {
             None,
             None,
             &[tool_call],
+            None,
+            None,
         );
 
         assert_eq!(result.len(), 1);
@@ -2301,6 +2496,8 @@ mod tests {
             None,
             None,
             &[tool_call],
+            None,
+            None,
         );
 
         assert_eq!(result.len(), 1);

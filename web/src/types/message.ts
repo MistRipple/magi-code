@@ -732,6 +732,7 @@ export interface Edit {
   headSummary?: string;
   tailSummary?: string;
   toolCallId?: string;
+  workerId?: string;
   contributors?: string[];
   executionGroupId?: string;
 }

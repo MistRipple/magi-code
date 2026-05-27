@@ -133,6 +133,10 @@ pub struct ConversationLoopRequest<'a> {
     pub context_summary: Option<ExecutionContextSummary>,
     pub system_prompt: Option<String>,
     pub workspace_root_path: Option<PathBuf>,
+    /// 当前 session 的文件变更账本。Task System v2 的主线/代理工具写入都必须通过
+    /// 同一个 SnapshotSession 记录，才能把文件变更归因到主线或具体代理 worker。
+    pub snapshot_session: Option<Arc<magi_snapshot::SnapshotSession>>,
+    pub execution_group_id: Option<String>,
 }
 
 /// P6b：把 thread 持久化的消息记录（`ThreadChatMessage`）还原为 bridge-client 的
@@ -576,6 +580,8 @@ fn run_conversation_loop_inner(
         context_summary,
         system_prompt,
         workspace_root_path,
+        snapshot_session,
+        execution_group_id,
     } = request;
 
     let mut messages = Vec::new();
@@ -1247,6 +1253,8 @@ fn run_conversation_loop_inner(
             workspace_root_path.as_ref(),
             turn_visibility.worker_id(),
             &parsed.tool_calls,
+            snapshot_session.clone(),
+            execution_group_id.clone(),
         );
 
         let mut completed_tool_names_this_round = Vec::new();
@@ -3280,6 +3288,8 @@ mod tests {
             context_summary: None,
             system_prompt: None,
             workspace_root_path: None,
+            snapshot_session: None,
+            execution_group_id: None,
         });
         outcome
     }
@@ -3724,6 +3734,8 @@ mod tests {
             context_summary: None,
             system_prompt: None,
             workspace_root_path: None,
+            snapshot_session: None,
+            execution_group_id: None,
         });
 
         match outcome {
@@ -3812,6 +3824,8 @@ mod tests {
             context_summary: None,
             system_prompt: None,
             workspace_root_path: None,
+            snapshot_session: None,
+            execution_group_id: None,
         });
 
         match outcome {
@@ -4093,6 +4107,8 @@ mod tests {
             context_summary: None,
             system_prompt: None,
             workspace_root_path: None,
+            snapshot_session: None,
+            execution_group_id: None,
         });
 
         match outcome {
@@ -4293,6 +4309,8 @@ mod tests {
             context_summary: None,
             system_prompt: None,
             workspace_root_path: None,
+            snapshot_session: None,
+            execution_group_id: None,
         });
 
         assert!(

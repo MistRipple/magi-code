@@ -1526,6 +1526,11 @@ impl LlmTaskDispatcher {
             context_summary,
             system_prompt,
             workspace_root_path,
+            snapshot_session: self
+                .snapshot_manager
+                .as_ref()
+                .and_then(|manager| manager.get_session(session_id.as_str())),
+            execution_group_id: Some(task.mission_id.to_string()),
         })
     }
 

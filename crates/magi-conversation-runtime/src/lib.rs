@@ -30,6 +30,7 @@ pub mod task_helpers;
 pub mod task_runner_bridge;
 pub mod task_runner_v2;
 pub mod tool_batch;
+mod tool_declared_paths;
 pub mod tool_result_utils;
 mod turn;
 pub mod usage_recording;
