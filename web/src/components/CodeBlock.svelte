@@ -3,6 +3,11 @@
   import DiagramRenderer from './DiagramRenderer.svelte';
   import { i18n } from '../stores/i18n.svelte';
   import { parseCodeBlockDiagramPayload } from '../lib/diagram-payload';
+  import {
+    dispatchFilePreviewEvent,
+    normalizeFileReferenceTarget,
+  } from '../lib/file-reference';
+  import { vscode } from '../lib/vscode-bridge';
 
   // Props
   interface Props {
@@ -108,6 +113,31 @@
       console.error('复制失败:', e);
     }
   }
+
+  function previewFilepathTarget() {
+    const target = filepath.trim();
+    if (!target) return;
+    const normalizedTarget = normalizeFileReferenceTarget(target) ?? target;
+    if (dispatchFilePreviewEvent({ filepath: normalizedTarget })) {
+      return;
+    }
+    vscode.postMessage({ type: 'openFile', filepath: normalizedTarget });
+  }
+
+  function previewFilepathClick(event: MouseEvent) {
+    event.preventDefault();
+    event.stopPropagation();
+    previewFilepathTarget();
+  }
+
+  function previewFilepathKeydown(event: KeyboardEvent) {
+    if (event.key !== 'Enter' && event.key !== ' ') {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    previewFilepathTarget();
+  }
 </script>
 
 {#if diagramPayload && !isStreaming}
@@ -135,7 +165,14 @@
             <span class="streaming-badge">{i18n.t('codeBlock.streaming')}</span>
           {/if}
           {#if filepath}
-            <span class="filepath" title={filepath}>{filepath}</span>
+            <span
+              class="filepath filepath-clickable"
+              title={filepath}
+              role="button"
+              tabindex="0"
+              onclick={previewFilepathClick}
+              onkeydown={previewFilepathKeydown}
+            >{filepath}</span>
           {/if}
         </span>
       </button>
@@ -237,6 +274,16 @@
     opacity: 0.6;
     font-family: var(--font-mono);
     font-size: var(--text-xs);
+  }
+
+  .filepath-clickable {
+    cursor: pointer;
+  }
+
+  .filepath-clickable:hover {
+    color: var(--info);
+    opacity: 1;
+    text-decoration: underline;
   }
 
   .streaming-badge {

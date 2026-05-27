@@ -2,8 +2,10 @@
   import { setContext } from 'svelte';
   import SvelteMarkdown from '@humanspeak/svelte-markdown';
   import MdCodeBlock from './renderers/MdCodeBlock.svelte';
+  import MdCodeSpan from './renderers/MdCodeSpan.svelte';
   import MdLink from './renderers/MdLink.svelte';
   import MdImage from './renderers/MdImage.svelte';
+  import MdText from './renderers/MdText.svelte';
 
   interface Props {
     source: string;
@@ -20,8 +22,10 @@
 
   const renderers = {
     code: MdCodeBlock,
+    codespan: MdCodeSpan,
     link: MdLink,
     image: MdImage,
+    text: MdText,
   };
 
   const options = {

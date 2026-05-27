@@ -175,7 +175,23 @@
       <span class="tool-title">
         <span class="tool-name">{changeLabel}</span>
         {#if change.changeType === 'rename' && change.oldPath}
-          <span class="rename-path" title={displayPath}>{displayPath}</span>
+          <span
+            class="rename-path"
+            title={displayPath}
+            role="button"
+            tabindex="0"
+            onclick={(event) => {
+              event.stopPropagation();
+              previewInRightPane(change.filePath);
+            }}
+            onkeydown={(event) => {
+              if (event.key === 'Enter' || event.key === ' ') {
+                event.preventDefault();
+                event.stopPropagation();
+                previewInRightPane(change.filePath);
+              }
+            }}
+          >{displayPath}</span>
         {:else}
           <FileSpan filepath={change.filePath} showIcon={false} clickable={true} onClick={previewInRightPane} />
         {/if}
@@ -287,8 +303,15 @@
     overflow: hidden;
     color: var(--foreground);
     font-size: var(--text-sm, 13px);
+    font-family: var(--font-mono);
     text-overflow: ellipsis;
     white-space: nowrap;
+    cursor: pointer;
+  }
+
+  .rename-path:hover {
+    color: var(--info);
+    text-decoration: underline;
   }
 
   .stats-badge {

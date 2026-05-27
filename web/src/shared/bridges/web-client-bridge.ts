@@ -73,6 +73,10 @@ import {
   listAgentRegistryEngines,
   listAgentRoleTemplates,
 } from '../../web/agent-api';
+import {
+  dispatchFilePreviewEvent,
+  normalizeFileReferenceTarget,
+} from '../../lib/file-reference';
 import type {
   AgentKnowledgeItemPatch,
   AgentKnowledgeItemPayload,
@@ -3244,6 +3248,16 @@ export function createWebClientBridge(): ClientBridge {
             return;
           }
           if (typeof message.url === 'string' && message.url.trim()) {
+            const fileTarget = normalizeFileReferenceTarget(message.url);
+            if (fileTarget) {
+              if (dispatchFilePreviewEvent({ filepath: fileTarget })) {
+                return;
+              }
+              void openFilePreview(fileTarget).catch((error) => {
+                logBridgeOperationFailure('打开文件预览', '[web-client-bridge] 打开文件预览失败:', error);
+              });
+              return;
+            }
             window.open(message.url, '_blank', 'noopener,noreferrer');
           }
           return;

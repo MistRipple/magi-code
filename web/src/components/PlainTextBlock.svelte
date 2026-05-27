@@ -9,14 +9,21 @@
   与 CodeBlockRenderer / MdCodeBlock 两条入口路径共用，避免同功能多实现。
 -->
 <script lang="ts">
+  import { splitPlainTextFileReferenceText } from '../lib/file-reference';
+  import FileReferenceInline from './renderers/FileReferenceInline.svelte';
+
   interface Props {
     content: string;
   }
 
   let { content }: Props = $props();
+  const segments = $derived(splitPlainTextFileReferenceText(content || ''));
 </script>
 
-<pre class="plain-text-block"><code>{content || ''}</code></pre>
+<pre class="plain-text-block"><code>{#each segments as segment}{#if segment.kind === 'file'}<FileReferenceInline
+        label={segment.text}
+        target={segment.target}
+      />{:else}{segment.text}{/if}{/each}</code></pre>
 
 <style>
   .plain-text-block {

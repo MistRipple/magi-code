@@ -3,7 +3,12 @@
   接收 @humanspeak/svelte-markdown 传入的 href + title + children props
 -->
 <script lang="ts">
+  import { setContext } from 'svelte';
   import type { Snippet } from 'svelte';
+  import {
+    dispatchFilePreviewEvent,
+    normalizeFileReferenceTarget,
+  } from '../../lib/file-reference';
   import { vscode } from '../../lib/vscode-bridge';
 
   interface Props {
@@ -12,12 +17,22 @@
     children?: Snippet;
   }
   const { href = '', title = undefined, children }: Props = $props();
+  setContext('markdown-link-context', true);
+  const fileTarget = $derived(normalizeFileReferenceTarget(href));
 
   function handleClick(e: MouseEvent) {
     e.preventDefault();
-    if (href) {
-      vscode.postMessage({ type: 'openLink', url: href });
+    if (!href) {
+      return;
     }
+    if (fileTarget) {
+      if (dispatchFilePreviewEvent({ filepath: fileTarget })) {
+        return;
+      }
+      vscode.postMessage({ type: 'openFile', filepath: fileTarget });
+      return;
+    }
+    vscode.postMessage({ type: 'openLink', url: href });
   }
 </script>
 
@@ -27,4 +42,3 @@
   class="md-link"
   onclick={handleClick}
 >{@render children?.()}</a>
-

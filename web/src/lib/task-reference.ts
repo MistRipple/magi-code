@@ -1,5 +1,9 @@
 import type { IconName } from './icons';
 import type { ClientBridgeMessage } from '../shared/bridges/client-bridge';
+import {
+  dispatchFilePreviewEvent,
+  normalizeFileReferenceTarget,
+} from './file-reference';
 
 export type TaskReferenceActionKind = 'file' | 'diff' | 'copy';
 
@@ -41,20 +45,6 @@ function stripKnownPrefix(value: string, prefix: string): string {
   return value.slice(prefix.length).trim();
 }
 
-function isLikelyFilePath(value: string): boolean {
-  if (!value) return false;
-  if (/^https?:\/\//i.test(value)) return false;
-  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(value)) return false;
-  return (
-    value.startsWith('./')
-    || value.startsWith('../')
-    || value.startsWith('/')
-    || /^[a-zA-Z]:[\\/]/.test(value)
-    || /[\\/]/.test(value)
-    || /\.[a-zA-Z0-9]{1,6}$/.test(value)
-  );
-}
-
 function parseEvidenceReference(reference: string): ParsedTaskReference | null {
   if (!reference.startsWith('evidence://')) {
     return null;
@@ -83,7 +73,8 @@ function parseEvidenceReference(reference: string): ParsedTaskReference | null {
 
 function parsePrefixedReference(reference: string): ParsedTaskReference | null {
   if (reference.startsWith('file:')) {
-    const filePath = stripKnownPrefix(reference, 'file:');
+    const stripped = stripKnownPrefix(reference, 'file:');
+    const filePath = normalizeFileReferenceTarget(stripped) ?? stripped;
     return {
       displayLabel: shortenMiddle(filePath),
       actionTarget: filePath,
@@ -92,7 +83,8 @@ function parsePrefixedReference(reference: string): ParsedTaskReference | null {
     };
   }
   if (reference.startsWith('diff:')) {
-    const filePath = stripKnownPrefix(reference, 'diff:');
+    const stripped = stripKnownPrefix(reference, 'diff:');
+    const filePath = normalizeFileReferenceTarget(stripped) ?? stripped;
     return {
       displayLabel: shortenMiddle(filePath),
       actionTarget: filePath,
@@ -144,13 +136,14 @@ export function describeTaskReference(
     };
   }
 
-  if (isLikelyFilePath(normalized)) {
+  const fileTarget = normalizeFileReferenceTarget(normalized);
+  if (fileTarget) {
     return {
       raw: normalized,
-      displayLabel: shortenMiddle(normalized),
-      title: normalized,
+      displayLabel: shortenMiddle(fileTarget),
+      title: fileTarget,
       actionKind: preferredAction === 'diff' ? 'diff' : 'file',
-      actionTarget: normalized,
+      actionTarget: fileTarget,
     };
   }
 
@@ -189,6 +182,9 @@ export async function executeTaskReferenceAction(
     return;
   }
   if (reference.actionKind === 'file') {
+    if (dispatchFilePreviewEvent({ filepath: reference.actionTarget })) {
+      return;
+    }
     runtime.postMessage({
       type: 'openFile',
       filepath: reference.actionTarget,
