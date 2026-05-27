@@ -1900,6 +1900,39 @@ mod tests {
         }
     }
 
+    fn dispatcher_with_default_tool_surface() -> LlmTaskDispatcher {
+        let event_bus = Arc::new(InMemoryEventBus::new(64));
+        let governance = Arc::new(magi_governance::GovernanceService::default());
+        let mut tool_registry = ToolRegistry::new(governance, Arc::clone(&event_bus));
+        tool_registry.register_default_builtins();
+        let orchestrator = OrchestratorService::new(Arc::clone(&event_bus));
+        let skill_runtime = magi_skill_runtime::SkillDispatchRuntime::new(
+            tool_registry.clone(),
+            magi_bridge_client::BridgeDispatchRuntime::new(),
+        );
+        let execution_runtime = orchestrator.execution_runtime(
+            magi_worker_runtime::WorkerRuntime::new(Arc::clone(&event_bus)),
+            tool_registry.clone(),
+            skill_runtime,
+        );
+        let pipeline = ExecutionPipeline {
+            orchestrator,
+            execution_runtime,
+            memory_store: MemoryStore::new(),
+        };
+
+        LlmTaskDispatcher::new(
+            Arc::clone(&event_bus),
+            pipeline,
+            Arc::new(SessionStore::new()),
+            TaskExecutionRegistry::default(),
+            Arc::new(EventBasedResultReceiver::new()),
+            Arc::new(std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new())),
+        )
+        .with_tool_registry(tool_registry)
+        .with_agent_role_registry(Arc::new(magi_agent_role::AgentRoleRegistry::load_default()))
+    }
+
     #[test]
     fn tool_visibility_is_filtered_by_role_and_task_tier() {
         let registry = magi_agent_role::AgentRoleRegistry::load_default();
@@ -1962,6 +1995,50 @@ mod tests {
             Some(&registry),
             BuiltinToolName::AgentWait
         ));
+    }
+
+    #[test]
+    fn long_mission_coordinator_builds_full_orchestration_tool_surface() {
+        let dispatcher = dispatcher_with_default_tool_surface();
+        let long_mission_task = task_with_role("coordinator", TaskTier::LongMission);
+        let execution_task = task_with_role("coordinator", TaskTier::ExecutionChain);
+        let worker_task = task_with_role("executor", TaskTier::ExecutionChain);
+
+        let long_mission_names = dispatcher
+            .build_tool_definitions(Some(&long_mission_task))
+            .into_iter()
+            .map(|definition| definition.function.name)
+            .collect::<Vec<_>>();
+        for expected in [
+            "mission_charter_write",
+            "plan_write",
+            "agent_spawn",
+            "agent_wait",
+            "validation_record",
+            "checkpoint_create",
+        ] {
+            assert!(
+                long_mission_names.iter().any(|name| name == expected),
+                "LongMission coordinator must expose {expected}; got {long_mission_names:?}"
+            );
+        }
+
+        let execution_names = dispatcher
+            .build_tool_definitions(Some(&execution_task))
+            .into_iter()
+            .map(|definition| definition.function.name)
+            .collect::<Vec<_>>();
+        assert!(execution_names.iter().any(|name| name == "agent_spawn"));
+        assert!(execution_names.iter().any(|name| name == "agent_wait"));
+        assert!(!execution_names.iter().any(|name| name == "plan_write"));
+
+        let worker_names = dispatcher
+            .build_tool_definitions(Some(&worker_task))
+            .into_iter()
+            .map(|definition| definition.function.name)
+            .collect::<Vec<_>>();
+        assert!(!worker_names.iter().any(|name| name == "agent_spawn"));
+        assert!(!worker_names.iter().any(|name| name == "plan_write"));
     }
 
     #[test]

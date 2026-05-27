@@ -265,7 +265,6 @@ fn classifier_payload_for_prompt(prompt: &str) -> Option<String> {
         "taskTitle": (route == "task").then_some("模型判定任务"),
         "executionGoal": (route == "task").then_some(user_text.trim_matches('"')),
         "taskTier": task_tier,
-        "requiredWorkers": [],
         "toolIntent": null,
         "confidence": (route == "task").then_some(0.95),
         "reasonCode": (route == "task").then_some("explicit_task_request"),

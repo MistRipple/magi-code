@@ -75,6 +75,6 @@ pub trait TurnDriver {
     fn finalize_round_failure(self, reason: String) -> Self::Outcome;
 
     /// for-round 跑满 `round_limit` 仍未拿到 Done 时——driver 自定义如何收尾
-    /// （通常走"模型未返回可显示回复"路径）。
+    /// （通常按 provider invalid response 显示桥接失败类型）。
     fn finalize_exhausted(self) -> Self::Outcome;
 }

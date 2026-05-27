@@ -186,7 +186,6 @@ struct SessionTurnIntentDecision {
     task_title: Option<String>,
     execution_goal: Option<String>,
     task_tier: TaskTier,
-    required_workers: Vec<String>,
     tool_intent: Option<String>,
     forced_tool_name: Option<String>,
     required_tool_chain: Vec<String>,
@@ -365,7 +364,6 @@ fn decide_session_turn_with_task_planner(
             task_title: None,
             execution_goal: None,
             task_tier: TaskTier::ExecutionChain,
-            required_workers: Vec::new(),
             tool_intent: None,
             forced_tool_name: None,
             required_tool_chain: Vec::new(),
@@ -448,7 +446,6 @@ fn local_session_turn_intent_decision(
             .then(|| request.mission_title(Some(&task_text))),
         execution_goal: matches!(route, SessionTurnRouteDto::Task).then_some(task_text.clone()),
         task_tier,
-        required_workers: Vec::new(),
         tool_intent: matches!(route, SessionTurnRouteDto::Execute).then_some(task_text),
         forced_tool_name: None,
         required_tool_chain: Vec::new(),
@@ -480,7 +477,7 @@ fn normalize_session_turn_decision(
     request: &SessionTurnRequestDto,
 ) -> SessionTurnIntentDecision {
     if !matches!(decision.route, SessionTurnRouteDto::Continue)
-        && session_turn_requests_explicit_task_or_worker_mode(request)
+        && session_turn_requests_explicit_task_or_agent_mode(request)
     {
         let task_text = request
             .trimmed_text()
@@ -506,7 +503,7 @@ fn normalize_session_turn_decision(
         if decision.task_evidence.is_empty() {
             decision
                 .task_evidence
-                .push("显式复杂任务/worker 编排请求".to_string());
+                .push("显式复杂任务/代理编排请求".to_string());
         }
     }
     if matches!(decision.route, SessionTurnRouteDto::Task)
@@ -516,7 +513,6 @@ fn normalize_session_turn_decision(
         decision.task_title = None;
         decision.execution_goal = None;
         decision.task_tier = TaskTier::ExecutionChain;
-        decision.required_workers.clear();
         decision.tool_intent = None;
         decision.required_tool_chain.clear();
     }
@@ -531,7 +527,6 @@ fn normalize_session_turn_decision(
                 decision.task_title = None;
                 decision.execution_goal = None;
                 decision.task_tier = TaskTier::ExecutionChain;
-                decision.required_workers.clear();
                 if decision.forced_tool_name.as_deref() != Some(tool_name) {
                     decision.tool_intent = Some(explicit_builtin_tool_intent(tool_name));
                     decision.forced_tool_name = Some(tool_name.to_string());
@@ -548,7 +543,6 @@ fn normalize_session_turn_decision(
                 decision.task_title = None;
                 decision.execution_goal = None;
                 decision.task_tier = TaskTier::ExecutionChain;
-                decision.required_workers.clear();
                 decision.tool_intent = Some(multi_builtin_tool_intent(&tool_names));
                 decision.forced_tool_name = None;
                 decision.required_tool_chain =
@@ -582,13 +576,15 @@ fn session_turn_requests_task_by_local_rules(request: &SessionTurnRequestDto) ->
         "收口",
         "迭代",
         "推进",
+        "中等任务",
+        "任务编排",
         "多代理",
         "多 agent",
         "multi-agent",
-        "subagent",
     ]
     .iter()
     .any(|marker| normalized.contains(marker))
+        || normalized_contains_agent_dispatch_request(&normalized)
 }
 
 fn session_turn_requests_execute_by_local_rules(request: &SessionTurnRequestDto) -> bool {
@@ -660,8 +656,10 @@ fn session_turn_requests_explicit_long_mission(request: &SessionTurnRequestDto) 
     let normalized = text.to_ascii_lowercase();
     normalized.contains("复杂任务模式")
         || normalized.contains("复杂任务")
+        || normalized.contains("复杂长期任务")
         || normalized.contains("深度任务")
         || normalized.contains("long mission")
+        || normalized.contains("longmission")
         || normalized.contains("长期任务")
         || normalized.contains("跨多轮")
         || normalized.contains("多阶段")
@@ -670,28 +668,41 @@ fn session_turn_requests_explicit_long_mission(request: &SessionTurnRequestDto) 
         || normalized.contains("审计")
 }
 
-fn session_turn_requests_explicit_task_or_worker_mode(request: &SessionTurnRequestDto) -> bool {
+fn session_turn_requests_explicit_task_or_agent_mode(request: &SessionTurnRequestDto) -> bool {
     let Some(text) = request.trimmed_text() else {
         return false;
     };
     let normalized = text.to_ascii_lowercase();
     normalized.contains("复杂任务模式")
         || normalized.contains("复杂任务")
+        || normalized.contains("复杂长期任务")
         || normalized.contains("深度任务")
+        || normalized.contains("long mission")
+        || normalized.contains("longmission")
+        || normalized.contains("长期任务")
+        || normalized.contains("中等任务")
+        || normalized.contains("任务编排")
         || normalized.contains("任务模式完成")
         || normalized.contains("以任务模式")
-        || normalized.contains("分派一个 worker")
-        || normalized.contains("分配一个 worker")
-        || normalized.contains("派发一个 worker")
-        || normalized.contains("worker 必须")
-        || normalized.contains("worker 调用")
-        || normalized.contains("worker 执行")
         || normalized.contains("派发代理")
         || normalized.contains("分派代理")
+        || normalized.contains("分配代理")
         || normalized.contains("代理执行")
         || normalized.contains("代理任务")
         || normalized.contains("代理角色")
+        || normalized.contains("agent 必须")
+        || normalized.contains("agent 调用")
+        || normalized.contains("agent 执行")
         || normalized.contains("子任务")
+        || normalized_contains_agent_dispatch_request(&normalized)
+}
+
+fn normalized_contains_agent_dispatch_request(normalized: &str) -> bool {
+    let has_agent_target = normalized.contains("代理") || normalized.contains("agent");
+    let has_dispatch_verb = ["派发", "分派", "分配", "启动", "创建", "调用", "spawn"]
+        .iter()
+        .any(|verb| normalized.contains(verb));
+    has_agent_target && has_dispatch_verb
 }
 
 enum RequestedBuiltinTools {
@@ -982,7 +993,6 @@ fn submit_regular_session_turn(
         accepted_at,
         decision.route,
         created_session,
-        decision.required_workers,
     );
 
     if created_session {
@@ -1019,7 +1029,6 @@ fn spawn_regular_session_turn_execution(
     accepted_at: UtcMillis,
     route: SessionTurnRouteDto,
     created_session: bool,
-    required_workers: Vec<String>,
 ) {
     tokio::task::spawn_blocking(move || {
         let session_id = execution_request.session_id.clone();
@@ -1074,7 +1083,6 @@ fn spawn_regular_session_turn_execution(
                             "session_id": session_id.to_string(),
                             "route": route,
                             "created_session": created_session,
-                            "required_workers": required_workers,
                         }),
                     )
                     .with_context(EventContext {
@@ -1234,7 +1242,7 @@ struct ContinueSessionRequest {
     session_id: String,
     prompt_text: Option<String>,
     #[serde(default)]
-    requested_worker_ids: Vec<String>,
+    requested_agent_ids: Vec<String>,
     #[serde(alias = "request_id")]
     request_id: Option<String>,
     #[serde(alias = "user_message_id")]
@@ -1633,15 +1641,15 @@ async fn continue_session(
     let user_message_id = trimmed_non_empty(request.user_message_id.as_deref()).map(str::to_string);
     let placeholder_message_id =
         trimmed_non_empty(request.placeholder_message_id.as_deref()).map(str::to_string);
-    let requested_worker_ids = request
-        .requested_worker_ids
+    let requested_agent_ids = request
+        .requested_agent_ids
         .into_iter()
-        .map(|worker_id| worker_id.trim().to_string())
-        .filter(|worker_id| !worker_id.is_empty())
+        .map(|agent_id| agent_id.trim().to_string())
+        .filter(|agent_id| !agent_id.is_empty())
         .map(WorkerId::new)
         .collect::<Vec<_>>();
     let continued_at = UtcMillis::now();
-    let accepted = continue_execution_chain(&state, &session_id, &requested_worker_ids)?;
+    let accepted = continue_execution_chain(&state, &session_id, &requested_agent_ids)?;
     let (_, orchestrator_thread_id) =
         state
             .session_store
@@ -2307,7 +2315,6 @@ mod tests {
             task_title: None,
             execution_goal: None,
             task_tier: TaskTier::ExecutionChain,
-            required_workers: Vec::new(),
             tool_intent: None,
             forced_tool_name: None,
             required_tool_chain: Vec::new(),
@@ -2543,9 +2550,9 @@ mod tests {
     }
 
     #[test]
-    fn explicit_complex_worker_request_is_task_even_when_shell_tool_is_named() {
+    fn explicit_complex_agent_request_is_task_even_when_shell_tool_is_named() {
         let request = session_turn_request(
-            "请以复杂任务模式完成，worker 必须调用 shell_exec 执行 printf ok，最后总结。",
+            "请以复杂任务模式完成，代理必须调用 shell_exec 执行 printf ok，最后总结。",
         );
         let decision = normalize_session_turn_decision(classifier_chat_decision(), &request);
 
@@ -2562,9 +2569,48 @@ mod tests {
     }
 
     #[test]
-    fn explicit_worker_request_uses_execution_chain_without_long_mission() {
-        let request =
-            session_turn_request("请分派一个 worker 修复这个明确问题，完成后汇总验证结果。");
+    fn explicit_long_mission_request_is_task_even_when_execute_words_are_present() {
+        let request = session_turn_request(
+            "以复杂长期任务 LongMission 模式执行稳定性验收，按步骤读取配置、派发代理并创建 checkpoint。",
+        );
+        let decision = normalize_session_turn_decision(classifier_chat_decision(), &request);
+
+        assert!(matches!(decision.route, SessionTurnRouteDto::Task));
+        assert!(decision.forced_tool_name.is_none());
+        assert!(decision.required_tool_chain.is_empty());
+        assert_eq!(decision.task_tier, TaskTier::LongMission);
+        assert_eq!(
+            decision.reason_code.as_deref(),
+            Some("explicit_task_request")
+        );
+        assert_eq!(
+            decision.execution_goal.as_deref(),
+            Some(
+                "以复杂长期任务 LongMission 模式执行稳定性验收，按步骤读取配置、派发代理并创建 checkpoint。"
+            )
+        );
+    }
+
+    #[test]
+    fn explicit_medium_agent_dispatch_request_is_task_even_when_read_words_are_present() {
+        let request = session_turn_request(
+            "请作为中等任务进行角色匹配冒烟：同时派发两个只读代理，explorer display_name「角色目录代理」只做根目录巡检；reviewer display_name「角色配置代理」只读取 package.json。",
+        );
+        let decision = normalize_session_turn_decision(classifier_chat_decision(), &request);
+
+        assert!(matches!(decision.route, SessionTurnRouteDto::Task));
+        assert_eq!(decision.task_tier, TaskTier::ExecutionChain);
+        assert!(decision.forced_tool_name.is_none());
+        assert!(decision.required_tool_chain.is_empty());
+        assert_eq!(
+            decision.reason_code.as_deref(),
+            Some("explicit_task_request")
+        );
+    }
+
+    #[test]
+    fn explicit_agent_request_uses_execution_chain_without_long_mission() {
+        let request = session_turn_request("请分派代理修复这个明确问题，完成后汇总验证结果。");
         let decision = normalize_session_turn_decision(classifier_chat_decision(), &request);
 
         assert!(matches!(decision.route, SessionTurnRouteDto::Task));
@@ -2572,8 +2618,8 @@ mod tests {
     }
 
     #[test]
-    fn explicit_complex_worker_request_preserves_raw_user_goal_as_execution_goal() {
-        let raw_goal = "【V2具体任务推进验收】请以复杂任务模式完成，必须由 worker 在当前工作区创建文件 v2-task-system-e2e.md，文件内容必须包含三行：title: v2 task concrete progress、marker: V2_TASK_E2E、status: completed。创建后 worker 必须读取该文件验证内容。";
+    fn explicit_complex_agent_request_preserves_raw_user_goal_as_execution_goal() {
+        let raw_goal = "【V2具体任务推进验收】请以复杂任务模式完成，必须由代理在当前工作区创建文件 v2-task-system-e2e.md，文件内容必须包含三行：title: v2 task concrete progress、marker: V2_TASK_E2E、status: completed。创建后代理必须读取该文件验证内容。";
         let request = session_turn_request(raw_goal);
         let mut classifier_decision = classifier_chat_decision();
         classifier_decision.route = SessionTurnRouteDto::Task;
@@ -2697,7 +2743,6 @@ mod tests {
                 task_title: None,
                 execution_goal: None,
                 task_tier: TaskTier::ExecutionChain,
-                required_workers: Vec::new(),
                 tool_intent: None,
                 forced_tool_name: None,
                 required_tool_chain: Vec::new(),

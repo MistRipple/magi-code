@@ -12,8 +12,8 @@ use magi_bridge_client::orchestrator_termination::{
 };
 use magi_bridge_client::round_policy::{
     build_continue_prompt, build_no_task_tool_loop_prompt, build_outcome_block_request_prompt,
-    build_pseudo_tool_call_recovery_prompt, build_summary_hijack_correction,
-    build_terminal_synthesis_prompt, build_thinking_only_orchestration_recovery_prompt,
+    build_summary_hijack_correction, build_terminal_synthesis_prompt,
+    build_thinking_only_orchestration_recovery_prompt,
 };
 
 fn snapshot_fixture(
@@ -68,11 +68,6 @@ fn snapshot_outcome_block_request_prompt() {
 fn snapshot_no_task_tool_loop_prompt() {
     // 连续 5 轮不用工具，且最近 3 轮签名重复。
     assert_snapshot!(build_no_task_tool_loop_prompt(5, 3));
-}
-
-#[test]
-fn snapshot_pseudo_tool_call_recovery_prompt() {
-    assert_snapshot!(build_pseudo_tool_call_recovery_prompt());
 }
 
 #[test]

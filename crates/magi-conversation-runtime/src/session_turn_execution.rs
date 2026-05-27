@@ -5,6 +5,7 @@
 //! 等方式桥接到 `ApiError` 枚举。
 
 use crate::{
+    model_error::provider_empty_assistant_response_error,
     prompt_utils::{
         normalize_model_stream_preview_content, normalize_model_visible_content,
         workspace_context_system_prompt,
@@ -328,11 +329,7 @@ pub fn run_session_turn_execution(
         if !request_turn_is_writable(session_store, &request) {
             return Ok(SessionTurnExecutionOutput::interrupted());
         }
-        let failure_reason = if had_tool_calls {
-            "模型在工具调用后未返回最终回复"
-        } else {
-            "模型未返回可显示回复"
-        };
+        let failure_reason = provider_empty_assistant_response_error(had_tool_calls);
         append_session_turn_error_item(
             event_bus,
             session_store,
@@ -342,11 +339,11 @@ pub fn run_session_turn_execution(
             request.request_id.as_deref(),
             request.user_message_id.as_deref(),
             request.placeholder_message_id.as_deref(),
-            failure_reason,
+            &failure_reason,
             main_timeline_entry_id.as_deref(),
             orchestrator_thread_id.clone(),
         );
-        return Err(failure_reason.to_string());
+        return Err(failure_reason);
     };
     if !request_turn_is_writable(session_store, &request) {
         return Ok(SessionTurnExecutionOutput::interrupted());
@@ -1055,6 +1052,92 @@ mod tests {
             tool_call_round_limit(&required_tool_chain) >= required_tool_chain.len() + 2,
             "显式工具链需要为每个工具调用轮和最终回复轮预留空间"
         );
+    }
+
+    #[test]
+    fn empty_session_turn_response_exposes_provider_failure_layer() {
+        let session_id = SessionId::new("session-empty-response-layer");
+        let store = SessionStore::new();
+        store
+            .create_session(session_id.clone(), "empty response layer")
+            .expect("session should be creatable");
+        let (_mission_id, orchestrator_thread_id) =
+            store.ensure_session_mission(&session_id, ts(910), || {
+                magi_core::MissionId::new("mission-empty-response-layer")
+            });
+        store
+            .upsert_current_turn(
+                session_id.clone(),
+                ActiveExecutionTurn {
+                    turn_id: "turn-empty-response-layer".to_string(),
+                    turn_seq: 1,
+                    accepted_at: ts(1_000),
+                    completed_at: None,
+                    status: "running".to_string(),
+                    user_message: Some("请回复一句话".to_string()),
+                    items: vec![session_turn_item(
+                        "user_message",
+                        "completed",
+                        None,
+                        Some("请回复一句话".to_string()),
+                        Some("user-empty-response-layer".to_string()),
+                        orchestrator_thread_id,
+                    )],
+                },
+            )
+            .expect("current turn should be stored");
+        let client = StreamingTextModelBridgeClient {
+            delta_content: String::new(),
+            payload: serde_json::json!({
+                "content": null,
+                "finish_reason": "stop"
+            })
+            .to_string(),
+        };
+        let event_bus = InMemoryEventBus::new(16);
+        let request = SessionTurnExecutionRequest {
+            session_id: session_id.clone(),
+            turn_id: "turn-empty-response-layer".to_string(),
+            workspace_id: None,
+            prompt: "请回复一句话".to_string(),
+            use_tools: false,
+            skill_name: None,
+            request_id: None,
+            user_message_id: None,
+            placeholder_message_id: None,
+            forced_tool_name: None,
+            required_tool_chain: Vec::new(),
+            workspace_root_path: None,
+        };
+
+        let error = match run_session_turn_execution(SessionTurnExecutionRuntime {
+            client: &client,
+            event_bus: &event_bus,
+            session_store: &store,
+            settings_store: None,
+            tool_registry: None,
+            skill_runtime: None,
+            snapshot_manager: None,
+            request,
+            prompt: "请回复一句话".to_string(),
+            tools: None,
+        }) {
+            Ok(_) => panic!("empty provider response should fail"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error,
+            "桥接调用失败[RemoteBusiness]: provider response invalid: empty assistant response"
+        );
+        let turn = store
+            .runtime_sidecar(&session_id)
+            .and_then(|sidecar| sidecar.current_turn)
+            .expect("failed turn should remain visible");
+        assert_eq!(turn.status, "failed");
+        assert!(turn.items.iter().any(|item| {
+            item.kind == "assistant_error" && item.content.as_deref() == Some(error.as_str())
+        }));
     }
 
     #[test]

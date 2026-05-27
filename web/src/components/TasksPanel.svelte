@@ -34,7 +34,7 @@
     getTaskStatusLabel,
     isUserVisibleTaskKind,
   } from '../lib/task-labels';
-  import { resolveWorkerDisplayName } from '../lib/worker-role-utils';
+  import { resolveAgentDisplayName } from '../lib/agent-role-utils';
   import {
     ensureTaskProjectionState,
     clearTaskProjection,
@@ -280,7 +280,7 @@
   function getTaskExecutorDisplayName(task: TaskDto): string {
     const roleId = task.executor_binding?.target_role?.trim() ?? '';
     if (!roleId) return '';
-    return resolveWorkerDisplayName(roleId, enabledAgents, registrySnapshot, (key) => i18n.t(key)) || roleId;
+    return resolveAgentDisplayName(roleId, enabledAgents, registrySnapshot, (key) => i18n.t(key)) || roleId;
   }
 
   function getTaskPerformerLabel(task: TaskDto): string {

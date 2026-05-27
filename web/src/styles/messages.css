@@ -11,7 +11,7 @@
   --msg-orchestrator-bg: var(--surface-1);
   --msg-orchestrator-border: var(--border);
 
-  /* Worker 消息 */
+  /* 代理消息 */
   --msg-worker-bg: var(--surface-1);
   --msg-worker-border: var(--info);
 

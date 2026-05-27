@@ -328,7 +328,7 @@ pub fn deterministic_execution_tool_validation_content(
     let mut has_final_text = false;
 
     for dependency in dependencies {
-        for tool_name in task_required_tool_chain(&dependency) {
+        for tool_name in task_required_tool_chain(&dependency, None) {
             if !required_tools.iter().any(|existing| existing == &tool_name) {
                 required_tools.push(tool_name);
             }
@@ -450,8 +450,16 @@ pub fn extract_task_goal(value: &str) -> Option<String> {
     )
 }
 
-pub fn task_required_tool_chain(task: &Task) -> Vec<String> {
+pub fn task_required_tool_chain(
+    task: &Task,
+    registry: Option<&magi_agent_role::AgentRoleRegistry>,
+) -> Vec<String> {
     if task.kind != TaskKind::LocalAgent {
+        return Vec::new();
+    }
+    if task.executor_binding_target_role() == Some("coordinator")
+        || task_is_coordinator(Some(task), registry)
+    {
         return Vec::new();
     }
     if task

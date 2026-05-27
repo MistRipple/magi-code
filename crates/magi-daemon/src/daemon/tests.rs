@@ -133,7 +133,7 @@ async fn wait_for_task_projection_completed(
         let completed_tasks = projection["progress_summary"]["completed_tasks"]
             .as_u64()
             .unwrap_or(0);
-        // V2 single-worker dispatch: ExecutionChain 只挂一个 root task；coordinator 才会再 spawn 子任务。
+        // V2 dispatch：ExecutionChain 只挂一个 root task；coordinator 才会再 spawn 代理任务。
         if total_tasks >= 1
             && completed_tasks == total_tasks
             && projection["root_task"]["status"] == "completed"

@@ -13,7 +13,7 @@ export interface TimelinePanelView {
 
 /**
  * 时间线显示上下文：
- * - `thread`：主对话区，渲染 root agent（无 worker）的 artifacts
+ * - `thread`：主对话区，渲染主线代理的 artifacts
  * - `task`：右侧 RightPane 代理 tab，按 `metadata.taskId` 过滤该代理自身的 artifacts
  */
 export type TimelineDisplayContext = 'thread' | 'task';

@@ -13,7 +13,7 @@ use crate::types::{
 };
 use magi_usage_authority::ReasoningEffort;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::env;
 use std::io::Read as IoRead;
@@ -563,6 +563,8 @@ fn streaming_http_io(
     let mut utf8_remainder: Vec<u8> = Vec::new();
     let mut last_content_delta_len = 0usize;
     let mut last_thinking_delta_len = 0usize;
+    let mut saw_sse_event = false;
+    let mut raw_response = String::new();
 
     'stream_read: loop {
         let bytes_read =
@@ -587,8 +589,10 @@ fn streaming_http_io(
         if valid_str.is_empty() {
             continue;
         }
+        raw_response.push_str(&valid_str);
 
         for sse_event in sse_parser.feed(&valid_str) {
+            saw_sse_event = true;
             // 检测 [DONE] 标记
             if sse_event.data.trim() == "[DONE]" {
                 continue;
@@ -619,9 +623,30 @@ fn streaming_http_io(
         }
     }
 
+    if !saw_sse_event {
+        return Err(BridgeClientError::CallFailed {
+            layer: BridgeErrorLayer::RemoteBusiness,
+            code: Some(-32007),
+            message: provider_non_sse_stream_message(&raw_response),
+        });
+    }
+
     // 直接将 StreamAccumulator 转换为 BridgeResponse payload，
     // 跳过自构造 OpenAI JSON → 再反序列化的冗余链路。
     let adapted = accumulator.finalize();
+    if adapted.content.trim().is_empty()
+        && adapted
+            .thinking
+            .as_ref()
+            .is_none_or(|thinking| thinking.trim().is_empty())
+        && adapted.tool_calls.is_empty()
+    {
+        return Err(BridgeClientError::CallFailed {
+            layer: BridgeErrorLayer::RemoteBusiness,
+            code: Some(-32007),
+            message: "provider response invalid: empty stream response".to_string(),
+        });
+    }
     let payload = adapted_response_to_bridge_payload(&adapted);
 
     Ok((status, payload))
@@ -733,6 +758,13 @@ impl ModelBridgeClient for HttpModelBridgeClient {
 
 impl HttpModelBridgeClient {
     fn parse_success_payload(&self, response_body: &str) -> Result<String, BridgeClientError> {
+        if let Some(message) = provider_error_message(response_body) {
+            return Err(BridgeClientError::CallFailed {
+                layer: BridgeErrorLayer::RemoteBusiness,
+                code: Some(-32006),
+                message: format!("provider rejected request: {message}"),
+            });
+        }
         match self.protocol {
             HttpModelBridgeProtocol::ChatCompletions => {
                 let envelope: OpenAiCompatibleChatCompletionEnvelope =
@@ -1243,6 +1275,32 @@ fn truncate_body(body: &str) -> String {
         collected.push_str("...");
     }
     collected
+}
+
+fn provider_error_message(body: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(body).ok()?;
+    match value.get("error")? {
+        Value::String(message) => {
+            Some(message.trim().to_string()).filter(|value| !value.is_empty())
+        }
+        Value::Object(error) => error
+            .get("message")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned),
+        _ => None,
+    }
+}
+
+fn provider_non_sse_stream_message(body: &str) -> String {
+    if let Some(message) = provider_error_message(body) {
+        return format!("provider rejected request: {message}");
+    }
+    format!(
+        "provider response invalid: expected event stream, body={}",
+        truncate_body(body)
+    )
 }
 
 #[cfg(test)]
@@ -1871,6 +1929,44 @@ mod tests {
     }
 
     #[test]
+    fn invoke_2xx_error_body_is_reported_as_provider_error() {
+        let server = spawn_mock_server_with_response_text(
+            200,
+            "application/json",
+            serde_json::json!({
+                "error": {
+                    "message": "claude executor: upstream returned empty stream response",
+                    "type": "server_error",
+                    "code": "internal_server_error",
+                }
+            })
+            .to_string(),
+        );
+
+        let client = HttpModelBridgeClient::new(
+            server.address.clone(),
+            Some("sk-test-key".to_string()),
+            "gpt-4.1-mini".to_string(),
+        );
+
+        let error = client
+            .invoke(ModelInvocationRequest {
+                provider: "openai-compatible".to_string(),
+                prompt: "hello".to_string(),
+                messages: None,
+                tools: None,
+                tool_choice: None,
+            })
+            .expect_err("2xx provider error envelope must be surfaced directly");
+
+        assert!(
+            error
+                .to_string()
+                .contains("claude executor: upstream returned empty stream response")
+        );
+    }
+
+    #[test]
     fn streaming_emits_delta_for_each_sse_event_in_one_http_read() {
         let server = spawn_mock_server_with_response_text(
             200,
@@ -1917,6 +2013,88 @@ mod tests {
         let body: serde_json::Value =
             serde_json::from_str(&recorded.body).expect("body should be json");
         assert_eq!(body["stream"], true);
+    }
+
+    #[test]
+    fn streaming_json_error_is_reported_as_provider_error() {
+        let server = spawn_mock_server_with_response_text(
+            200,
+            "application/json",
+            serde_json::json!({
+                "error": {
+                    "message": "empty_stream: upstream stream closed before first payload",
+                    "type": "server_error",
+                    "code": "internal_server_error",
+                }
+            })
+            .to_string(),
+        );
+
+        let client = HttpModelBridgeClient::new(
+            server.address.clone(),
+            Some("sk-test-key".to_string()),
+            "gpt-4.1-mini".to_string(),
+        );
+
+        let error = client
+            .invoke_streaming(
+                ModelInvocationRequest {
+                    provider: "openai-compatible".to_string(),
+                    prompt: "hello".to_string(),
+                    messages: None,
+                    tools: None,
+                    tool_choice: None,
+                },
+                &|_| {},
+            )
+            .expect_err("JSON error body must not be collapsed into empty assistant response");
+
+        assert!(matches!(
+            error,
+            BridgeClientError::CallFailed {
+                layer: BridgeErrorLayer::RemoteBusiness,
+                ..
+            }
+        ));
+        assert!(
+            error
+                .to_string()
+                .contains("empty_stream: upstream stream closed before first payload")
+        );
+    }
+
+    #[test]
+    fn streaming_non_sse_html_is_protocol_failure() {
+        let server = spawn_mock_server_with_response_text(
+            200,
+            "text/html",
+            "<!doctype html><html><body>gateway ui</body></html>".to_string(),
+        );
+
+        let client = HttpModelBridgeClient::new(
+            server.address.clone(),
+            Some("sk-test-key".to_string()),
+            "gpt-4.1-mini".to_string(),
+        );
+
+        let error = client
+            .invoke_streaming(
+                ModelInvocationRequest {
+                    provider: "openai-compatible".to_string(),
+                    prompt: "hello".to_string(),
+                    messages: None,
+                    tools: None,
+                    tool_choice: None,
+                },
+                &|_| {},
+            )
+            .expect_err("HTML response must not be treated as an empty model answer");
+
+        assert!(
+            error
+                .to_string()
+                .contains("provider response invalid: expected event stream")
+        );
     }
 
     #[test]

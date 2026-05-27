@@ -13,10 +13,8 @@ import {
 import type { Message, ContentBlock, ToolCall, ThinkingBlock, RetryRuntimeState } from '../types/message';
 import type { ContentBlock as StandardContentBlock } from '../shared/protocol/message-protocol';
 import { normalizeMessagePayload } from './message-payload';
-import { resolveTaskCardWorkerSlot } from './worker-role-utils';
 import { ensureArray } from './utils';
 import { i18n } from '../stores/i18n.svelte';
-import { normalizeWorkerSlot } from '../shared/timeline-worker-lifecycle';
 
 export function safeParseJson(value?: string): Record<string, unknown> | null {
   if (!value || typeof value !== 'string') return null;
@@ -99,14 +97,6 @@ export function handleRetryRuntimePayload(payload: Record<string, unknown>): voi
     delayMs,
     nextRetryAt,
   });
-}
-
-export function resolveWorkerSlotFromMessage(message: Message): string | null {
-  if (message.type === 'task_card') {
-    return resolveTaskCardWorkerSlot(message.metadata as Record<string, unknown> | undefined);
-  }
-  const metadata = message.metadata as Record<string, unknown> | undefined;
-  return normalizeWorkerSlot(metadata?.roleId) || normalizeWorkerSlot(metadata?.workerId) || null;
 }
 
 export function mapStandardBlocks(blocks: StandardContentBlock[]): ContentBlock[] {

@@ -99,7 +99,7 @@ export function messageHasRenderableTimelineContent(
   }
 
   // 普通 started / streaming 空消息同样需要先占住时间轴锚点。
-  // 否则 live 侧 update 先到时会找不到目标，导致主线正文/worker 正文被丢弃。
+  // 否则 live 侧 update 先到时会找不到目标，导致主线正文/代理正文被丢弃。
   // 仅排除 user / system 类型，避免把纯控制型空 notice 误投进时间轴。
   if (
     message.isStreaming === true

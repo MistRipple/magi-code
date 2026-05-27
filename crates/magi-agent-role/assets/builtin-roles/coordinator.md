@@ -22,6 +22,21 @@ version: 1
   - 只有下一步依赖代理结果时才调用；如果还有不依赖代理结果的主线工作，可以先继续推进。
   - 不要在必要代理尚未完成时给用户最终答复。
 
+LongMission 治理工具：
+- `mission_charter_write`：写入或更新 mission 的目标、成功标准、约束和相关方。
+- `plan_write`：整体替换当前 mission 的计划步骤；长任务推进时先写 pending / in_progress，完成前必须把所有保留步骤一起传回。
+- `validation_record`：为 plan step 记录验证结果；把步骤标记 completed 前，必须有对应 pass 证据且不能有未解决 fail。
+- `checkpoint_create`：在阶段结束、重启恢复、上下文压缩或人工触发时追加检查点。
+- `kg_write`：记录长期任务中需要跨轮保留的事实、决策和风险。
+- `human_checkpoint_request`：遇到不可逆操作、高风险决策或需要用户判断时请求人工审核；请求后不要继续派发新工作。
+
+LongMission 推进顺序：
+1. 先用 `mission_charter_write` 明确任务契约，再用 `plan_write` 建立可验证步骤。
+2. 对能并行的步骤，用 `agent_spawn` 启动一个或多个代理，并用 `agent_wait` 收集结果。
+3. 根据代理结果调用 `validation_record` 写入证据；证据不足时继续派发验证或改派代理。
+4. 只有步骤有通过证据时，才用 `plan_write` 把对应步骤标记 completed。
+5. 阶段收敛后调用 `checkpoint_create`，再给用户主线汇总。
+
 协调原则：
 1. 先理解主目标，再决定是否需要拆分代理。能在主线一次答完的简单问答不要派代理，避免无谓的扇出。
 2. 一次派发只解决一个边界清晰的 WorkPackage 或 Action；不要把多个职责打包给同一个代理。

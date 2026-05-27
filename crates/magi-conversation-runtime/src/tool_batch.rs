@@ -47,7 +47,6 @@ use crate::{
 static AGENT_SPAWN_SEQ: AtomicU64 = AtomicU64::new(0);
 const AGENT_SPAWN_SUMMARY_MAX_CHARS: usize = 1200;
 const AGENT_SPAWN_FINAL_TEXT_MAX_CHARS: usize = 6000;
-const AGENT_WAIT_POLL_INTERVAL_MS: u64 = 100;
 const AGENT_WAIT_DEFAULT_TIMEOUT_MS: u64 = 300_000;
 const AGENT_WAIT_MIN_TIMEOUT_MS: u64 = 1_000;
 const AGENT_WAIT_MAX_TIMEOUT_MS: u64 = 1_800_000;
@@ -256,6 +255,8 @@ fn execute_coordinator_tool(
     execution_registry: &TaskExecutionRegistry,
     conversation_registry: &ConversationRegistry,
     spawn_graph: &Mutex<magi_spawn_graph::SpawnGraph>,
+    mission_charter: Option<&magi_mission_charter::MissionCharterStore>,
+    plan: Option<&magi_plan::PlanStore>,
     human_checkpoint: Option<&magi_human_checkpoint::HumanCheckpointStore>,
     task: &magi_core::Task,
     session_id: &SessionId,
@@ -307,6 +308,11 @@ fn execute_coordinator_tool(
                     .to_string(),
                     ExecutionResultStatus::Failed,
                 );
+            }
+            if let Some(rejection) =
+                long_mission_agent_spawn_prerequisite_rejection(tool, mission_charter, plan, task)
+            {
+                return rejection;
             }
             if let Some(store) = human_checkpoint {
                 match store.has_pending(&task.mission_id) {
@@ -597,6 +603,90 @@ fn execute_coordinator_tool(
     }
 }
 
+fn long_mission_agent_spawn_prerequisite_rejection(
+    tool: magi_tool_runtime::BuiltinToolName,
+    mission_charter: Option<&magi_mission_charter::MissionCharterStore>,
+    plan: Option<&magi_plan::PlanStore>,
+    task: &magi_core::Task,
+) -> Option<(String, ExecutionResultStatus)> {
+    if !task_is_long_mission(Some(task)) {
+        return None;
+    }
+    let Some(mission_charter) = mission_charter else {
+        return Some((
+            serde_json::json!({
+                "tool": tool.as_str(),
+                "status": "failed",
+                "error": "long mission 缺少 MissionCharterStore，无法确认 mission 契约，禁止 agent_spawn",
+                "instruction": "先修复 workspace 绑定，让 mission_charter_write 能落盘；长任务不能在没有 mission 契约的情况下派发代理。",
+            })
+            .to_string(),
+            ExecutionResultStatus::Failed,
+        ));
+    };
+    match mission_charter.load(&task.mission_id) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return Some((
+                serde_json::json!({
+                    "tool": tool.as_str(),
+                    "status": "rejected",
+                    "error": "LongMission 尚未创建 mission charter，禁止 agent_spawn",
+                    "instruction": "先调用 mission_charter_write 写入 title、goal、success_criteria 和 constraints，再调用 plan_write 建立执行计划，然后再派发代理。",
+                })
+                .to_string(),
+                ExecutionResultStatus::Rejected,
+            ));
+        }
+        Err(error) => {
+            return Some((
+                serde_json::json!({
+                    "tool": tool.as_str(),
+                    "status": "failed",
+                    "error": format!("读取 mission charter 失败：{error}"),
+                })
+                .to_string(),
+                ExecutionResultStatus::Failed,
+            ));
+        }
+    }
+
+    let Some(plan) = plan else {
+        return Some((
+            serde_json::json!({
+                "tool": tool.as_str(),
+                "status": "failed",
+                "error": "long mission 缺少 PlanStore，无法确认 mission plan，禁止 agent_spawn",
+                "instruction": "先修复 workspace 绑定，让 plan_write 能落盘；长任务不能在没有执行计划的情况下派发代理。",
+            })
+            .to_string(),
+            ExecutionResultStatus::Failed,
+        ));
+    };
+    match plan.load(&task.mission_id) {
+        Ok(Some(plan)) if !plan.steps.is_empty() => None,
+        Ok(_) => Some((
+            serde_json::json!({
+                "tool": tool.as_str(),
+                "status": "rejected",
+                "error": "LongMission 尚未创建非空 mission plan，禁止 agent_spawn",
+                "instruction": "先调用 plan_write 写入 pending / in_progress 步骤，再派发代理；不要用 todo_write 替代 mission plan。",
+            })
+            .to_string(),
+            ExecutionResultStatus::Rejected,
+        )),
+        Err(error) => Some((
+            serde_json::json!({
+                "tool": tool.as_str(),
+                "status": "failed",
+                "error": format!("读取 mission plan 失败：{error}"),
+            })
+            .to_string(),
+            ExecutionResultStatus::Failed,
+        )),
+    }
+}
+
 fn current_turn_user_message(
     session_store: &SessionStore,
     session_id: &SessionId,
@@ -667,7 +757,7 @@ fn extract_display_name_after(value: &str) -> Option<String> {
 }
 
 fn extract_contract_role(user_message: &str, index: usize) -> Option<String> {
-    let window = surrounding_text_window(user_message, index, 120, 40).to_ascii_lowercase();
+    let window = surrounding_text_window(user_message, index, 120, 0).to_ascii_lowercase();
     AGENT_ROLE_IDS
         .iter()
         .filter_map(|role| window.rfind(role).map(|pos| (pos, *role)))
@@ -872,9 +962,11 @@ fn execute_agent_wait(
     }
     let timeout_ms = parse_agent_wait_timeout_ms(parsed);
     let started_at = std::time::Instant::now();
+    let mut observed_status_version = task_store.status_change_version();
     loop {
         let mut results = Vec::with_capacity(task_ids.len());
         let mut pending_task_ids = Vec::new();
+        let requested_task_ids = task_ids.iter().map(ToString::to_string).collect::<Vec<_>>();
         for task_id in &task_ids {
             let Some(child) = task_store.get_task(task_id) else {
                 results.push(serde_json::json!({
@@ -897,13 +989,19 @@ fn execute_agent_wait(
                     "status": "succeeded",
                     "timed_out": false,
                     "results": results,
+                    "merge_requirements": {
+                        "must_consume_child_task_ids": requested_task_ids,
+                        "must_read_fields": ["assignment.goal", "status", "child_status", "result.final_text", "error"],
+                        "final_answer_rule": "最终答复必须明确吸收每个代理结果；如果代理失败或降级，必须说明改派、主线接管或遗留风险。",
+                    },
                     "instruction": "请读取 results 中每个代理的 assignment.goal 与 result.final_text，合并结论、证据、风险与缺口后再向用户答复。",
                 })
                 .to_string(),
                 ExecutionResultStatus::Succeeded,
             );
         }
-        if started_at.elapsed().as_millis() >= timeout_ms as u128 {
+        let elapsed_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+        if elapsed_ms >= timeout_ms {
             return (
                 serde_json::json!({
                     "tool": tool.as_str(),
@@ -911,15 +1009,21 @@ fn execute_agent_wait(
                     "timed_out": true,
                     "pending_task_ids": pending_task_ids,
                     "results": results,
+                    "merge_requirements": {
+                        "must_consume_child_task_ids": requested_task_ids,
+                        "must_read_fields": ["assignment.goal", "status", "child_status", "result.final_text", "error"],
+                        "final_answer_rule": "未完成代理不能被当成已完成结论；最终答复依赖这些代理时必须稍后再次 agent_wait。",
+                    },
                     "instruction": "仍有代理未完成。可以继续处理不依赖这些代理结果的工作；如果最终答复依赖它们，请稍后再次调用 agent_wait。",
                 })
                 .to_string(),
                 ExecutionResultStatus::Succeeded,
             );
         }
-        thread::sleep(std::time::Duration::from_millis(
-            AGENT_WAIT_POLL_INTERVAL_MS,
-        ));
+        observed_status_version = task_store.wait_for_status_change_since(
+            observed_status_version,
+            std::time::Duration::from_millis(timeout_ms - elapsed_ms),
+        );
     }
 }
 
@@ -1147,6 +1251,8 @@ fn execute_task_tool_call(
                 execution_registry,
                 conversation_registry,
                 spawn_graph,
+                mission_charter,
+                plan,
                 human_checkpoint,
                 task,
                 session_id,
@@ -1580,6 +1686,19 @@ mod tests {
     }
 
     #[test]
+    fn agent_spawn_contract_role_does_not_bleed_from_next_agent_clause() {
+        let contracts = parse_agent_spawn_parameter_contracts(
+            "第一轮同时 agent_spawn 两个只读代理：explorer display_name「冻结目录代理」只做根目录巡检；reviewer display_name「冻结配置代理」只读取 package.json 指出一个风险。",
+        );
+
+        assert_eq!(contracts.len(), 2);
+        assert_eq!(contracts[0].role.as_deref(), Some("explorer"));
+        assert_eq!(contracts[0].display_name, "冻结目录代理");
+        assert_eq!(contracts[1].role.as_deref(), Some("reviewer"));
+        assert_eq!(contracts[1].display_name, "冻结配置代理");
+    }
+
+    #[test]
     fn agent_spawn_contract_selection_corrects_model_rewritten_display_name() {
         let message = "必须同一轮并行启动 2 个代理：1) role=explorer，display_name=「目录探查代理」，access_mode=read_only，目标：只读查看 /Users/xie/code/TEST 顶层目录；2) role=reviewer，display_name=「配置审查代理」，access_mode=read_only，目标：只读查看 README.md 和 package.json 是否存在。";
 
@@ -1674,6 +1793,79 @@ mod tests {
         );
         store.save(&log).expect("human checkpoint log should save");
         store
+    }
+
+    #[test]
+    fn long_mission_agent_spawn_requires_charter_and_non_empty_plan() {
+        let mut parent = coordinator_task(test_task(
+            "task-parent-long-mission-prerequisites",
+            "task-parent-long-mission-prerequisites",
+            None,
+        ));
+        parent.policy_snapshot = Some(long_mission_policy());
+        let tmp = std::env::temp_dir().join(format!(
+            "magi-tool-batch-long-mission-prereq-{}-{}",
+            std::process::id(),
+            UtcMillis::now().0
+        ));
+        std::fs::create_dir_all(&tmp).expect("temp long mission home should be created");
+        let workspace_root = WorkspaceRootPath::new(format!("{}/workspace", tmp.display()));
+        let charter_store =
+            magi_mission_charter::MissionCharterStore::open_with_home(&tmp, &workspace_root)
+                .expect("charter store should open");
+        let plan_store = magi_plan::PlanStore::open_with_home(&tmp, &workspace_root)
+            .expect("plan store should open");
+
+        let missing_charter = long_mission_agent_spawn_prerequisite_rejection(
+            BuiltinToolName::AgentSpawn,
+            Some(&charter_store),
+            Some(&plan_store),
+            &parent,
+        )
+        .expect("missing charter should reject agent_spawn");
+        assert_eq!(missing_charter.1, ExecutionResultStatus::Rejected);
+        assert!(missing_charter.0.contains("mission_charter_write"));
+
+        let mut charter = magi_mission_charter::MissionCharter::new(
+            parent.mission_id.clone(),
+            "LongMission 前置约束",
+            "验证长任务必须先建立 mission 契约和执行计划，然后才能派发代理。",
+            UtcMillis(1),
+        );
+        charter.success_criteria = vec!["代理派发前存在可追踪计划".to_string()];
+        charter.constraints = vec!["不能跳过治理前置步骤".to_string()];
+        charter_store.save(&charter).expect("charter should save");
+
+        let missing_plan = long_mission_agent_spawn_prerequisite_rejection(
+            BuiltinToolName::AgentSpawn,
+            Some(&charter_store),
+            Some(&plan_store),
+            &parent,
+        )
+        .expect("missing plan should reject agent_spawn");
+        assert_eq!(missing_plan.1, ExecutionResultStatus::Rejected);
+        assert!(missing_plan.0.contains("plan_write"));
+
+        let mut plan = magi_plan::Plan::new(parent.mission_id.clone(), UtcMillis(2));
+        plan.steps.push(magi_plan::PlanStep {
+            id: "spawn-wave".to_string(),
+            content: "建立首轮代理派发计划".to_string(),
+            status: magi_plan::PlanStepStatus::Pending,
+            depends_on: Vec::new(),
+            notes: None,
+        });
+        plan_store.save(&plan).expect("plan should save");
+
+        assert!(
+            long_mission_agent_spawn_prerequisite_rejection(
+                BuiltinToolName::AgentSpawn,
+                Some(&charter_store),
+                Some(&plan_store),
+                &parent,
+            )
+            .is_none(),
+            "charter 与非空 plan 都存在时才允许 LongMission 派发代理"
+        );
     }
 
     #[test]

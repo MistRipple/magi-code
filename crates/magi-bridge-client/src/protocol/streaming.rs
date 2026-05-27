@@ -381,20 +381,32 @@ impl StreamAccumulator {
             }
             LlmStreamChunkType::ToolCallStart => {
                 if let Some(ref tc) = chunk.tool_call {
-                    self.active_tool_calls.push(ActiveToolCall {
-                        id: tc.id.clone().unwrap_or_default(),
-                        name: tc.name.clone().unwrap_or_default(),
-                        arguments_buffer: String::new(),
-                    });
+                    let initial_arguments = tool_call_argument_fragment(tc.arguments.as_ref());
+                    if let Some(index) = tc.index.filter(|idx| *idx < self.active_tool_calls.len())
+                    {
+                        if let Some(id) = tc.id.as_ref().filter(|id| !id.is_empty()) {
+                            self.active_tool_calls[index].id = id.clone();
+                        }
+                        if let Some(name) = tc.name.as_ref().filter(|name| !name.is_empty()) {
+                            self.active_tool_calls[index].name = name.clone();
+                        }
+                        if let Some(fragment) = initial_arguments {
+                            self.active_tool_calls[index]
+                                .arguments_buffer
+                                .push_str(&fragment);
+                        }
+                    } else {
+                        self.active_tool_calls.push(ActiveToolCall {
+                            id: tc.id.clone().unwrap_or_default(),
+                            name: tc.name.clone().unwrap_or_default(),
+                            arguments_buffer: initial_arguments.unwrap_or_default(),
+                        });
+                    }
                 }
             }
             LlmStreamChunkType::ToolCallDelta => {
                 if let Some(ref tc) = chunk.tool_call {
-                    if let Some(args) = &tc.arguments {
-                        let fragment = match args {
-                            Value::String(s) => s.clone(),
-                            other => other.to_string(),
-                        };
+                    if let Some(fragment) = tool_call_argument_fragment(tc.arguments.as_ref()) {
                         // 使用 index 路由到正确的 tool call（OpenAI 并行调用），
                         // 无 index 时回退到最后一个（Anthropic 顺序调用）
                         let target_idx = tc
@@ -488,6 +500,13 @@ impl StreamAccumulator {
     pub fn pending_tool_call_count(&self) -> usize {
         self.active_tool_calls.len()
     }
+}
+
+fn tool_call_argument_fragment(arguments: Option<&Value>) -> Option<String> {
+    arguments.map(|args| match args {
+        Value::String(value) => value.clone(),
+        other => other.to_string(),
+    })
 }
 
 #[cfg(test)]
@@ -770,6 +789,33 @@ mod tests {
         assert_eq!(result.tool_calls[0].name, "search");
         assert_eq!(result.tool_calls[0].arguments["q"], "test");
         assert_eq!(result.stop_reason, "tool_use");
+    }
+
+    #[test]
+    fn accumulator_preserves_openai_arguments_on_tool_call_start() {
+        let mut parser = SseLineParser::new();
+        let mut acc = StreamAccumulator::new();
+        let sse_payload = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"shell_exec\",\"arguments\":\"{\\\"command\\\":\\\"pwd\\\",\\\"access_mode\\\":\\\"read_only\\\"}\"}}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+
+        for event in parser.feed(sse_payload) {
+            let chunks = parse_stream_event(ProviderFamily::OpenAiChat, &event);
+            acc.apply_all(&chunks);
+        }
+
+        let result = acc.finalize();
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(result.tool_calls[0].id, "call_1");
+        assert_eq!(result.tool_calls[0].name, "shell_exec");
+        assert_eq!(result.tool_calls[0].arguments["command"], "pwd");
+        assert_eq!(result.tool_calls[0].arguments["access_mode"], "read_only");
+        assert_eq!(
+            result.tool_calls[0].raw_arguments.as_deref(),
+            Some(r#"{"command":"pwd","access_mode":"read_only"}"#)
+        );
     }
 
     #[test]

@@ -1,4 +1,3 @@
-pub mod assignment_dispatch;
 pub mod auto_compaction;
 pub mod base_adapter;
 pub mod cache_boundary;
@@ -23,8 +22,6 @@ pub mod structured_dispatch;
 pub mod tool_concurrency;
 mod transport;
 mod types;
-pub mod worker_adapter;
-pub mod worker_duplicate_guard;
 
 #[cfg(test)]
 mod tests;

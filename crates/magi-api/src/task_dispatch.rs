@@ -1,4 +1,7 @@
-use crate::{errors::ApiError, state::ApiState};
+use crate::{
+    errors::ApiError,
+    state::{ApiState, RunnerStartError},
+};
 use magi_conversation_runtime::dispatch_submission::{
     DispatchSubmissionAcceptError, DispatchSubmissionRuntime, accept_dispatch_submission,
     ensure_dispatch_submission_acceptance_available, run_dispatch_submission,
@@ -56,10 +59,15 @@ pub fn drive_dispatch_submission(
     let manager = state
         .runner_manager()
         .ok_or_else(|| ApiError::internal_assembly("驱动任务派发", "runner_manager 未配置"))?;
-    let _ = manager.start(
+    match manager.start(
         accepted.root_task_id.as_str(),
         Some(accepted.session_id.clone()),
-    );
+    ) {
+        Ok(_) | Err(RunnerStartError::AlreadyRunning) => {}
+        Err(RunnerStartError::NotFound) => {
+            return Err(ApiError::internal_assembly("驱动任务派发", "根任务不存在"));
+        }
+    }
     accepted.runner_started = true;
     Ok(())
 }

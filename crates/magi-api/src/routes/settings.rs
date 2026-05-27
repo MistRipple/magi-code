@@ -1199,7 +1199,7 @@ mod tests {
             .await
             .expect("stub listener should bind");
         let base_url = format!(
-            "http://{}",
+            "http://{}/v1/messages",
             listener.local_addr().expect("stub addr should exist")
         );
         let app = Router::new().route("/v1/messages", post(anthropic_probe_stub));
@@ -1215,7 +1215,7 @@ mod tests {
                 "baseUrl": base_url,
                 "apiKey": "test-key",
                 "model": "claude-sonnet-test",
-                "urlMode": "standard"
+                "urlMode": "full"
             }),
             "openai",
         );

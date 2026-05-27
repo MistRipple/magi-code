@@ -18,8 +18,6 @@ const TPL_CONTINUE_WITH_PROGRESS: &str =
 const TPL_OUTCOME_BLOCK_REQUEST: &str =
     include_str!("../templates/round_policy/outcome_block_request.md");
 const TPL_NO_TASK_TOOL_LOOP: &str = include_str!("../templates/round_policy/no_task_tool_loop.md");
-const TPL_PSEUDO_TOOL_CALL_RECOVERY: &str =
-    include_str!("../templates/round_policy/pseudo_tool_call_recovery.md");
 const TPL_THINKING_ONLY_RECOVERY: &str =
     include_str!("../templates/round_policy/thinking_only_recovery.md");
 const TPL_SUMMARY_HIJACK_LVL1: &str =
@@ -95,10 +93,6 @@ pub fn build_no_task_tool_loop_prompt(
             ),
         ],
     )
-}
-
-pub fn build_pseudo_tool_call_recovery_prompt() -> &'static str {
-    TPL_PSEUDO_TOOL_CALL_RECOVERY.trim_end()
 }
 
 pub fn build_thinking_only_orchestration_recovery_prompt() -> &'static str {

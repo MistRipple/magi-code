@@ -80,7 +80,7 @@ fn rebuild_dispatch_plan_for_branch(
 pub(crate) fn continue_execution_chain(
     state: &ApiState,
     session_id: &SessionId,
-    requested_worker_ids: &[WorkerId],
+    requested_agent_ids: &[WorkerId],
 ) -> Result<SessionContinueAccepted, ApiError> {
     if state.session_store.session(session_id).is_none() {
         return Err(ApiError::session_not_found(session_id.as_str()));
@@ -137,7 +137,7 @@ pub(crate) fn continue_execution_chain(
         worker_runtime_handle,
         session_id,
     )
-    .map_err(|msg| ApiError::internal_assembly("收敛 worker 终态失败", msg))?;
+    .map_err(|msg| ApiError::internal_assembly("收敛代理终态失败", msg))?;
 
     let resumable_branches = chain
         .branches
@@ -157,56 +157,56 @@ pub(crate) fn continue_execution_chain(
             "当前会话没有可继续的 branch".to_string(),
         ));
     }
-    if !requested_worker_ids.is_empty() {
-        for worker_id in requested_worker_ids {
+    if !requested_agent_ids.is_empty() {
+        for agent_id in requested_agent_ids {
             if !chain
                 .branches
                 .iter()
-                .any(|branch| &branch.worker_id == worker_id)
+                .any(|branch| &branch.worker_id == agent_id)
             {
                 return Err(ApiError::InvalidInput(format!(
-                    "请求继续的 worker 不属于当前执行链: {}",
-                    worker_id
+                    "请求继续的代理不属于当前执行链: {}",
+                    agent_id
                 )));
             }
         }
-        let has_requested_resumable_worker = requested_worker_ids.iter().any(|worker_id| {
+        let has_requested_resumable_agent = requested_agent_ids.iter().any(|agent_id| {
             resumable_branches
                 .iter()
-                .any(|branch| &branch.worker_id == worker_id)
+                .any(|branch| &branch.worker_id == agent_id)
         });
-        if !has_requested_resumable_worker {
+        if !has_requested_resumable_agent {
             return Err(ApiError::InvalidInput(
-                "请求继续的 worker 当前不可继续".to_string(),
+                "请求继续的代理当前不可继续".to_string(),
             ));
         }
     }
 
-    let branches_to_resume = if requested_worker_ids.is_empty() {
+    let branches_to_resume = if requested_agent_ids.is_empty() {
         resumable_branches.clone()
     } else {
         resumable_branches
             .iter()
             .filter(|branch| {
-                requested_worker_ids
+                requested_agent_ids
                     .iter()
-                    .any(|worker_id| worker_id == &branch.worker_id)
+                    .any(|agent_id| agent_id == &branch.worker_id)
             })
             .cloned()
             .collect::<Vec<_>>()
     };
     if branches_to_resume.is_empty() {
         return Err(ApiError::InvalidInput(
-            "请求继续的 worker 当前不可继续".to_string(),
+            "请求继续的代理当前不可继续".to_string(),
         ));
     }
 
     let primary_branch = branches_to_resume
         .iter()
         .find(|branch| {
-            requested_worker_ids
+            requested_agent_ids
                 .iter()
-                .any(|worker_id| worker_id == &branch.worker_id)
+                .any(|agent_id| agent_id == &branch.worker_id)
         })
         .or_else(|| branches_to_resume.iter().find(|branch| branch.is_primary))
         .or_else(|| branches_to_resume.first())
@@ -293,7 +293,7 @@ pub(crate) fn continue_execution_chain(
         .runner_manager()
         .ok_or_else(|| ApiError::internal_assembly("继续会话失败", "runner_manager 未配置"))?;
     match root_status {
-        TaskStatus::Failed if requested_worker_ids.is_empty() => manager
+        TaskStatus::Failed if requested_agent_ids.is_empty() => manager
             .resume_tree(chain.root_task_id.as_str())
             .map_err(|error| ApiError::internal_assembly("继续会话失败", error))?,
         TaskStatus::Failed => {

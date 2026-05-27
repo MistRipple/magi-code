@@ -137,7 +137,7 @@ pub fn runtime_terminal_evidence_ref(branch: &ActiveExecutionBranch) -> String {
 /// 用于 `tasks_interaction::interrupt_task` 与 `continue_execution_chain` 的入口护栏。
 ///
 /// `Result::Err(String)`：上层 magi-api 用
-/// `.map_err(|msg| ApiError::internal_assembly("收敛 worker 终态失败", msg))` 桥回 ApiError。
+/// `.map_err(|msg| ApiError::internal_assembly("收敛代理终态失败", msg))` 桥回 ApiError。
 pub fn finalize_terminal_worker_branches(
     session_store: &SessionStore,
     task_store: Option<&TaskStore>,

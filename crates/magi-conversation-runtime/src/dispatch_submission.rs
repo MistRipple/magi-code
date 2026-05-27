@@ -597,7 +597,7 @@ mod tests {
         );
     }
 
-    /// Task System v2 §3.2 验收：中等 single-worker task 走 ExecutionChain 路径，
+    /// Task System v2 §3.2 验收：中等单 root task 走 ExecutionChain 路径，
     /// **不**进入 Long-Mission 层。
     ///
     /// 验收点：

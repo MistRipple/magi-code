@@ -200,7 +200,7 @@ async fn interrupt_task(
         worker_runtime_handle,
         &session_id,
     )
-    .map_err(|msg| ApiError::internal_assembly("收敛 worker 终态失败", msg))?;
+    .map_err(|msg| ApiError::internal_assembly("收敛代理终态失败", msg))?;
     let _ = state
         .session_store
         .update_current_turn_status(&session_id, "failed");

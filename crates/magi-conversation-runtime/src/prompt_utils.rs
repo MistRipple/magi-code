@@ -1,5 +1,3 @@
-use magi_bridge_client::assignment_dispatch::{strip_dispatch_preview_text, strip_dispatch_text};
-
 use crate::prompt_reminder::wrap_in_system_reminder;
 
 /// 17 段 system prompt 装配中，文本级小节之间的固定分隔串。
@@ -60,24 +58,19 @@ pub fn workspace_context_system_prompt(root_path: &str) -> String {
 }
 
 pub fn normalize_model_visible_content(content: String) -> String {
-    let content = content
+    content
         .strip_prefix("loopback-model::")
         .unwrap_or(content.as_str())
         .trim()
-        .to_string();
-    strip_dispatch_text(&content).trim().to_string()
+        .to_string()
 }
 
 pub fn normalize_model_stream_preview_content(content: &str) -> String {
-    let content = content
+    content
         .strip_prefix("loopback-model::")
         .unwrap_or(content)
-        .trim();
-    let stripped = strip_dispatch_text(content);
-    if stripped != content {
-        return stripped.trim().to_string();
-    }
-    strip_dispatch_preview_text(content).trim().to_string()
+        .trim()
+        .to_string()
 }
 
 #[cfg(test)]
@@ -148,44 +141,5 @@ mod tests {
         assert!(prompt.contains("NOT_GIT_WORKTREE"));
         assert!(prompt.contains("access_mode=read_only"));
         assert!(prompt.contains("不要继续重复 Git 状态命令"));
-    }
-
-    #[test]
-    fn normalize_model_visible_content_strips_assignment_dispatch_payload() {
-        let content = r#"分析完成。
-我将安排以下任务：
-```json
-{
-  "mission_title": "实现用户认证",
-  "tasks": [{
-    "task_name": "实现 JWT 验证",
-    "ownership_hint": "backend",
-    "mode_hint": "implement",
-    "goal": "实现 JWT token 验证中间件",
-    "acceptance": ["通过单元测试"],
-    "constraints": ["使用现有模块"],
-    "context": ["auth"],
-    "requires_modification": true
-  }]
-}
-```"#;
-        assert_eq!(
-            normalize_model_visible_content(content.to_string()),
-            "分析完成。"
-        );
-    }
-
-    #[test]
-    fn normalize_model_stream_preview_content_hides_partial_assignment_dispatch_payload() {
-        let content = r#"分析完成。
-我将安排以下任务：
-```json
-{
-  "mission_title": "实现用户认证",
-  "tasks": [{"#;
-        assert_eq!(
-            normalize_model_stream_preview_content(content),
-            "分析完成。"
-        );
     }
 }

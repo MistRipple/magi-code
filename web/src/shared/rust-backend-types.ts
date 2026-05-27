@@ -793,7 +793,7 @@ export interface SessionSaveRequestDto {
 export interface SessionContinueRequestDto {
   sessionId: string;
   promptText?: string | null;
-  requestedWorkerIds?: string[];
+  requestedAgentIds?: string[];
   requestId?: string | null;
   userMessageId?: string | null;
   placeholderMessageId?: string | null;

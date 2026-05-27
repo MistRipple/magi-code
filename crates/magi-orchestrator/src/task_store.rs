@@ -7,7 +7,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, RwLock};
+use std::sync::{Condvar, Mutex, RwLock};
+use std::time::Duration;
 
 static LEASE_COUNTER: AtomicU64 = AtomicU64::new(1);
 static CHECKPOINT_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -55,6 +56,8 @@ pub struct TaskStore {
     /// Optional callback fired on every successful status change for checkpoint
     /// persistence (design 6.8).
     on_checkpoint: Mutex<Option<Box<dyn Fn(&TaskStore) + Send + Sync>>>,
+    status_change_version: Mutex<u64>,
+    status_change_signal: Condvar,
 }
 
 fn default_frozen_policy() -> TaskPolicy {
@@ -141,6 +144,8 @@ impl TaskStore {
             mission_index: RwLock::new(HashMap::new()),
             on_status_change: Mutex::new(None),
             on_checkpoint: Mutex::new(None),
+            status_change_version: Mutex::new(0),
+            status_change_signal: Condvar::new(),
         }
     }
 
@@ -153,6 +158,8 @@ impl TaskStore {
             mission_index: RwLock::new(HashMap::new()),
             on_status_change: Mutex::new(Some(callback)),
             on_checkpoint: Mutex::new(None),
+            status_change_version: Mutex::new(0),
+            status_change_signal: Condvar::new(),
         }
     }
 
@@ -185,6 +192,37 @@ impl TaskStore {
         if let Some(ref cb) = *guard {
             cb(self);
         }
+    }
+
+    fn notify_status_change(&self) {
+        let mut version = self
+            .status_change_version
+            .lock()
+            .expect("status_change_version lock poisoned");
+        *version = version.saturating_add(1);
+        self.status_change_signal.notify_all();
+    }
+
+    pub fn status_change_version(&self) -> u64 {
+        *self
+            .status_change_version
+            .lock()
+            .expect("status_change_version lock poisoned")
+    }
+
+    pub fn wait_for_status_change_since(&self, observed_version: u64, timeout: Duration) -> u64 {
+        let version = self
+            .status_change_version
+            .lock()
+            .expect("status_change_version lock poisoned");
+        if *version != observed_version || timeout.is_zero() {
+            return *version;
+        }
+        let (version, _) = self
+            .status_change_signal
+            .wait_timeout_while(version, timeout, |current| *current == observed_version)
+            .expect("status_change_signal wait poisoned");
+        *version
     }
 
     /// 插入一个任务并更新索引。
@@ -273,6 +311,7 @@ impl TaskStore {
             cb(task_id, old_status, status, cloned_task);
         }
         drop(callback);
+        self.notify_status_change();
         self.fire_checkpoint();
         Ok(())
     }
@@ -312,6 +351,7 @@ impl TaskStore {
             cb(task_id, old_status, new_status, cloned_task);
         }
         drop(callback);
+        self.notify_status_change();
         self.fire_checkpoint();
         Ok(())
     }

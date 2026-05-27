@@ -253,7 +253,6 @@ fn loopback_classifier_response(prompt: &str) -> Option<String> {
         "taskTitle": (route == "task").then_some("模型判定任务"),
         "executionGoal": task_goal,
         "taskTier": task_tier,
-        "requiredWorkers": [],
         "toolIntent": tool_intent,
         "confidence": if route == "task" { 0.93 } else { 0.88 },
         "reasonCode": match route {

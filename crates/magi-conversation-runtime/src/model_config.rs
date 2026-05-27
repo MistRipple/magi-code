@@ -2,9 +2,9 @@
 //!
 //! 错误返回值使用 `Result<_, String>`，由上层调用方桥接到自己的错误类型。
 //!
-//! 协议判定的**唯一事实源**是 `baseUrl` 的路径后缀：
-//! - `urlMode = standard|proxy`：`baseUrl` 严格以 `/v1` 结尾 → OpenAI Chat Completions；
-//!   其他 → Anthropic Messages。
+//! 协议判定的**唯一事实源**是路径模式：
+//! - `urlMode = standard|proxy`：按 OpenAI 兼容 Chat Completions 处理，并由 HTTP client
+//!   自动补齐 `/v1/chat/completions`。
 //! - `urlMode = full`：`baseUrl` 严格以 `/v1/messages` 结尾 → Anthropic Messages；
 //!   其他 → OpenAI Chat Completions。
 //!
@@ -138,7 +138,10 @@ impl NormalizedModelConfig {
             .ok_or_else(|| "模型配置缺少 model".to_string())
     }
 
-    /// 推断 HTTP 协议族，唯一事实源是 `baseUrl` 的路径后缀。
+    /// 推断 HTTP 协议族。
+    ///
+    /// standard/proxy 是产品默认的 OpenAI 兼容网关形态，不能因为用户填的是网关根地址
+    /// 就误判成 Anthropic。Anthropic 直连必须通过 full 模式显式写到 `/v1/messages`。
     pub fn inferred_protocol(&self) -> HttpModelBridgeProtocol {
         let normalized = self
             .base_url
@@ -155,11 +158,7 @@ impl NormalizedModelConfig {
                 }
             }
             ModelUrlMode::Standard | ModelUrlMode::Proxy => {
-                if normalized.ends_with("/v1") {
-                    HttpModelBridgeProtocol::ChatCompletions
-                } else {
-                    HttpModelBridgeProtocol::AnthropicMessages
-                }
+                HttpModelBridgeProtocol::ChatCompletions
             }
         }
     }
@@ -372,21 +371,21 @@ mod tests {
     }
 
     #[test]
-    fn standard_mode_without_v1_suffix_infers_anthropic() {
+    fn standard_mode_without_v1_suffix_uses_openai_chat() {
         let config = NormalizedModelConfig::from_settings_value(
             &json!({
-                "baseUrl": "https://api.anthropic.com",
+                "baseUrl": "https://gateway.example.com",
                 "apiKey": "sk-test",
-                "model": "claude-sonnet",
+                "model": "gateway-model",
                 "urlMode": "standard"
             }),
             "openai",
         );
         assert_eq!(
             config.inferred_protocol(),
-            HttpModelBridgeProtocol::AnthropicMessages
+            HttpModelBridgeProtocol::ChatCompletions
         );
-        assert_eq!(config.provider(), "anthropic");
+        assert_eq!(config.provider(), "openai");
     }
 
     #[test]
@@ -489,7 +488,7 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_base_url_allows_models_listing() {
+    fn standard_root_base_url_uses_openai_compatible_models_listing() {
         let config = NormalizedModelConfig::from_settings_value(
             &json!({
                 "baseUrl": "https://api.anthropic.com",
@@ -499,10 +498,13 @@ mod tests {
             "openai",
         );
 
-        // /v1/models 在两个协议下都是合法路径，缺少 /v1 时由后端自动补齐
+        assert_eq!(
+            config.inferred_protocol(),
+            HttpModelBridgeProtocol::ChatCompletions
+        );
         config
             .require_models_listable()
-            .expect("anthropic-style base url should also be listable");
+            .expect("standard url mode should list OpenAI-compatible models");
         assert_eq!(
             config.models_list_url().expect("models url"),
             "https://api.anthropic.com/v1/models"
@@ -563,13 +565,13 @@ mod tests {
     }
 
     #[test]
-    fn http_client_uses_anthropic_when_inferred() {
+    fn http_client_uses_anthropic_only_for_full_messages_path() {
         let config = NormalizedModelConfig::from_settings_value(
             &json!({
-                "baseUrl": "https://api.anthropic.com",
+                "baseUrl": "https://api.anthropic.com/v1/messages",
                 "apiKey": "test-key",
                 "model": "claude-sonnet",
-                "urlMode": "standard"
+                "urlMode": "full"
             }),
             "openai",
         );
