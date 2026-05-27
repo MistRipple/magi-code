@@ -348,17 +348,18 @@ fn decide_session_turn_with_task_planner(
     state: &ApiState,
     request: &SessionTurnRequestDto,
 ) -> Result<SessionTurnIntentDecision, ApiError> {
-    let has_recoverable_chain = request
-        .requested_session_id()
-        .or_else(|| {
-            state
-                .session_store
-                .current_session()
-                .map(|session| session.session_id)
-        })
-        .map(|session_id| session_has_recoverable_chain(state, &session_id))
+    let requested_session_id = request.requested_session_id().or_else(|| {
+        state
+            .session_store
+            .current_session()
+            .map(|session| session.session_id)
+    });
+    let has_recoverable_chain = requested_session_id
+        .as_ref()
+        .map(|session_id| session_has_recoverable_chain(state, session_id))
         .unwrap_or(false);
-    if has_recoverable_chain && session_turn_requests_continue_existing_task(request) {
+    let requests_continuation = session_turn_requests_continue_existing_task(request);
+    if has_recoverable_chain && requests_continuation {
         return Ok(SessionTurnIntentDecision {
             route: SessionTurnRouteDto::Continue,
             task_title: None,
@@ -371,6 +372,30 @@ fn decide_session_turn_with_task_planner(
             reason_code: Some("continue_requested".to_string()),
             route_reason: Some("用户明确要求继续当前可恢复执行链。".to_string()),
             task_evidence: Vec::new(),
+        });
+    }
+    if requests_continuation
+        && requested_session_id
+            .as_ref()
+            .is_some_and(|session_id| session_has_completed_long_mission_chain(state, session_id))
+    {
+        let task_text = request
+            .trimmed_text()
+            .unwrap_or_else(|| request.timeline_message(None));
+        return Ok(SessionTurnIntentDecision {
+            route: SessionTurnRouteDto::Task,
+            task_title: Some(request.mission_title(Some(&task_text))),
+            execution_goal: Some(task_text),
+            task_tier: TaskTier::LongMission,
+            tool_intent: None,
+            forced_tool_name: None,
+            required_tool_chain: Vec::new(),
+            confidence: 1.0,
+            reason_code: Some("next_mission_phase_requested".to_string()),
+            route_reason: Some(
+                "用户要求继续已完成的复杂任务，创建同一 Mission 下的下一条执行链。".to_string(),
+            ),
+            task_evidence: vec!["已完成 LongMission 的后续阶段请求".to_string()],
         });
     }
 
@@ -401,6 +426,24 @@ fn session_has_recoverable_chain(state: &ApiState, session_id: &SessionId) -> bo
             branch,
         )
     })
+}
+
+fn session_has_completed_long_mission_chain(state: &ApiState, session_id: &SessionId) -> bool {
+    let Some(chain) = state.session_store.active_execution_chain(session_id) else {
+        return false;
+    };
+    let Some(task_store) = state.task_store() else {
+        return false;
+    };
+    let Some(root_task) = task_store.get_task(&chain.root_task_id) else {
+        return false;
+    };
+    root_task.mission_id == chain.mission_id
+        && root_task.status == TaskStatus::Completed
+        && root_task
+            .policy_snapshot
+            .as_ref()
+            .is_some_and(|policy| policy.task_tier == TaskTier::LongMission)
 }
 
 fn local_session_turn_intent_decision(
@@ -519,6 +562,33 @@ fn normalize_session_turn_decision(
     if !matches!(
         decision.route,
         SessionTurnRouteDto::Continue | SessionTurnRouteDto::Task
+    ) && request
+        .trimmed_text()
+        .as_deref()
+        .map(|text| {
+            session_turn_requests_workspace_inspection_by_local_rules(&text.to_ascii_lowercase())
+        })
+        .unwrap_or(false)
+    {
+        let task_text = request
+            .trimmed_text()
+            .unwrap_or_else(|| request.timeline_message(None));
+        decision.route = SessionTurnRouteDto::Execute;
+        decision.task_title = None;
+        decision.execution_goal = None;
+        decision.task_tier = TaskTier::ExecutionChain;
+        decision.tool_intent = Some(workspace_inspection_tool_intent(&task_text));
+        decision.forced_tool_name = None;
+        decision.required_tool_chain.clear();
+        decision.confidence = decision.confidence.max(0.95);
+        decision.reason_code = Some("workspace_inspection_request".to_string());
+        decision.route_reason =
+            Some("用户请求理解当前工作区，必须通过工具读取真实项目内容后再回答。".to_string());
+        decision.task_evidence.clear();
+    }
+    if !matches!(
+        decision.route,
+        SessionTurnRouteDto::Continue | SessionTurnRouteDto::Task
     ) && let Some(tool_request) = session_turn_requested_public_builtin_tools(request)
     {
         match tool_request {
@@ -592,6 +662,9 @@ fn session_turn_requests_execute_by_local_rules(request: &SessionTurnRequestDto)
         return false;
     };
     let normalized = text.to_ascii_lowercase();
+    if session_turn_requests_workspace_inspection_by_local_rules(&normalized) {
+        return true;
+    }
     [
         "搜索",
         "查找",
@@ -624,6 +697,65 @@ fn session_turn_requests_execute_by_local_rules(request: &SessionTurnRequestDto)
     .any(|marker| normalized.contains(marker))
 }
 
+fn session_turn_requests_workspace_inspection_by_local_rules(normalized: &str) -> bool {
+    let workspace_target = [
+        "当前项目",
+        "当前工程",
+        "当前仓库",
+        "本项目",
+        "本工程",
+        "本仓库",
+        "这个项目",
+        "这个工程",
+        "这个仓库",
+        "项目结构",
+        "仓库结构",
+        "工程结构",
+        "目录结构",
+        "代码结构",
+        "current project",
+        "current repo",
+        "current repository",
+        "current codebase",
+        "this project",
+        "this repo",
+        "this repository",
+        "codebase",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker));
+    if !workspace_target {
+        return false;
+    }
+
+    [
+        "分析",
+        "检查",
+        "审查",
+        "查看",
+        "看看",
+        "看下",
+        "读取",
+        "梳理",
+        "总结",
+        "介绍",
+        "说明",
+        "是什么",
+        "有什么",
+        "如何",
+        "analyze",
+        "inspect",
+        "review",
+        "read",
+        "summarize",
+        "explain",
+        "what is",
+        "what's",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
+}
+
 fn session_turn_requests_continue_existing_task(request: &SessionTurnRequestDto) -> bool {
     let Some(text) = request.trimmed_text() else {
         return false;
@@ -642,6 +774,11 @@ fn session_turn_requests_continue_existing_task(request: &SessionTurnRequestDto)
         "恢复执行",
         "从刚才",
         "从上次",
+        "下一步",
+        "下一阶段",
+        "下个阶段",
+        "继续剩余",
+        "推进剩余",
         "resume",
         "continue",
     ]
@@ -776,6 +913,12 @@ fn is_tool_reference_boundary(value: Option<char>) -> bool {
 fn explicit_builtin_tool_intent(tool_name: &str) -> String {
     format!(
         "用户明确要求调用公开内置工具 {tool_name}。必须直接调用 {tool_name} 工具，并从用户原始输入中提取参数；不要创建任务，不要改用其它工具，不要只输出文字说明。工具完成后只基于该工具结果给出简短回复。"
+    )
+}
+
+fn workspace_inspection_tool_intent(user_text: &str) -> String {
+    format!(
+        "用户请求理解当前工作区：{user_text}。必须使用可用工具读取当前工作区的真实目录、README、配置或关键源码后再回答；不要在未调用工具时声称已经读取文件、执行命令或输出 tool_call_block。工具完成后只基于实际工具结果总结。"
     )
 }
 
@@ -2206,13 +2349,15 @@ mod tests {
         http::{Request, StatusCode},
     };
     use magi_core::{
-        AbsolutePath, ExecutionOwnership, MissionId, Task, TaskId, TaskKind, TaskRuntimePayload,
-        TaskStatus, UtcMillis, WorkspaceId,
+        AbsolutePath, ExecutionOwnership, MissionId, Task, TaskId, TaskKind, TaskPolicy,
+        TaskRuntimePayload, TaskStatus, UtcMillis, WorkspaceId,
     };
     use magi_event_bus::InMemoryEventBus;
     use magi_governance::GovernanceService;
     use magi_orchestrator::task_store::TaskStore;
-    use magi_session_store::SessionStore;
+    use magi_session_store::{
+        ActiveExecutionBranch, ActiveExecutionChain, ActiveExecutionDispatchContext, SessionStore,
+    };
     use magi_workspace::WorkspaceStore;
     use std::{fs, sync::Arc};
     use tower::ServiceExt;
@@ -2309,6 +2454,76 @@ mod tests {
         }
     }
 
+    fn long_mission_policy() -> TaskPolicy {
+        TaskPolicy {
+            autonomy_level: "Autonomous".to_string(),
+            approval_mode: "DecisionOnly".to_string(),
+            allowed_tools: Vec::new(),
+            denied_tools: Vec::new(),
+            allowed_paths: Vec::new(),
+            denied_paths: Vec::new(),
+            network_mode: "full".to_string(),
+            command_mode: "full".to_string(),
+            retry_limit: 1,
+            validation_profile: Some("required".to_string()),
+            checkpoint_mode: "task_or_phase".to_string(),
+            task_tier: TaskTier::LongMission,
+            background_allowed: true,
+            escalation_conditions: vec!["human_checkpoint".to_string()],
+        }
+    }
+
+    fn completed_long_mission_root_task(task_id: &str, mission_id: &MissionId) -> Task {
+        let mut task = test_root_task(task_id, mission_id.as_str());
+        task.status = TaskStatus::Completed;
+        task.policy_snapshot = Some(long_mission_policy());
+        task
+    }
+
+    fn completed_long_mission_chain(
+        session_id: &SessionId,
+        mission_id: &MissionId,
+        root_task_id: &TaskId,
+        now: UtcMillis,
+    ) -> ActiveExecutionChain {
+        let worker_id = WorkerId::new("worker-long-mission-completed");
+        let thread_id = magi_core::ThreadId::new("thread-long-mission-completed");
+        ActiveExecutionChain {
+            session_id: session_id.clone(),
+            mission_id: mission_id.clone(),
+            root_task_id: root_task_id.clone(),
+            execution_chain_ref: "chain-long-mission-completed".to_string(),
+            workspace_id: None,
+            active_branch_task_ids: vec![root_task_id.clone()],
+            active_worker_bindings: vec![worker_id.clone()],
+            branches: vec![ActiveExecutionBranch {
+                task_id: root_task_id.clone(),
+                worker_id,
+                stage: "finish".to_string(),
+                lease_id: None,
+                execution_intent_ref: None,
+                binding_lifecycle: None,
+                checkpoint_stage: Some("finish".to_string()),
+                next_step_index: None,
+                checkpoint_at: Some(now),
+                resume_mode: Some("stage-restart".to_string()),
+                resume_token: None,
+                use_tools: true,
+                skill_name: None,
+                is_primary: true,
+                thread_id,
+            }],
+            recovery_ref: None,
+            dispatch_context: ActiveExecutionDispatchContext {
+                accepted_at: now,
+                entry_id: "timeline-long-mission-completed".to_string(),
+                trimmed_text: Some("上一阶段".to_string()),
+                skill_name: None,
+            },
+            current_turn: None,
+        }
+    }
+
     fn classifier_chat_decision() -> SessionTurnIntentDecision {
         SessionTurnIntentDecision {
             route: SessionTurnRouteDto::Chat,
@@ -2330,6 +2545,11 @@ mod tests {
         let request = session_turn_request("继续推进刚才未完成的任务");
 
         assert!(session_turn_requests_continue_existing_task(&request));
+
+        let next_phase_request = session_turn_request("进入下一阶段，继续剩余验收");
+        assert!(session_turn_requests_continue_existing_task(
+            &next_phase_request
+        ));
     }
 
     #[test]
@@ -2341,6 +2561,100 @@ mod tests {
             .expect("本地路由不应依赖外部模型");
 
         assert!(matches!(decision.route, SessionTurnRouteDto::Chat));
+    }
+
+    #[test]
+    fn completed_long_mission_continue_routes_to_next_mission_phase() {
+        let task_store = Arc::new(TaskStore::new());
+        let state = test_state().with_task_store(task_store.clone());
+        let session_id = SessionId::new("session-completed-long-mission-followup");
+        let mission_id = MissionId::new("mission-completed-long-mission-followup");
+        let root_task =
+            completed_long_mission_root_task("task-completed-long-mission-followup", &mission_id);
+        let now = UtcMillis::now();
+        task_store.insert_task(root_task.clone());
+        state
+            .session_store
+            .create_session(session_id.clone(), "复杂任务")
+            .expect("session should create");
+        state
+            .session_store
+            .ensure_session_mission(&session_id, now, || mission_id.clone());
+        state
+            .session_store
+            .upsert_active_execution_chain(
+                session_id.clone(),
+                completed_long_mission_chain(&session_id, &mission_id, &root_task.task_id, now),
+            )
+            .expect("active chain should persist");
+
+        let mut request = session_turn_request("继续下一阶段，推进剩余验证");
+        request.session_id = Some(session_id.to_string());
+        let decision = decide_session_turn_with_task_planner(&state, &request)
+            .expect("completed long mission continuation should route");
+
+        assert!(matches!(decision.route, SessionTurnRouteDto::Task));
+        assert_eq!(decision.task_tier, TaskTier::LongMission);
+        assert_eq!(
+            decision.reason_code.as_deref(),
+            Some("next_mission_phase_requested")
+        );
+        assert_eq!(
+            decision.execution_goal.as_deref(),
+            Some("继续下一阶段，推进剩余验证")
+        );
+    }
+
+    #[test]
+    fn completed_long_mission_followup_dispatch_reuses_mission() {
+        let task_store = Arc::new(TaskStore::new());
+        let state = test_state().with_task_store(task_store.clone());
+        let session_id = SessionId::new("session-long-mission-next-chain");
+        let mission_id = MissionId::new("mission-long-mission-next-chain");
+        let root_task =
+            completed_long_mission_root_task("task-long-mission-finished-chain", &mission_id);
+        let now = UtcMillis::now();
+        task_store.insert_task(root_task.clone());
+        state
+            .session_store
+            .create_session(session_id.clone(), "复杂任务")
+            .expect("session should create");
+        state
+            .session_store
+            .ensure_session_mission(&session_id, now, || mission_id.clone());
+        state
+            .session_store
+            .upsert_active_execution_chain(
+                session_id.clone(),
+                completed_long_mission_chain(&session_id, &mission_id, &root_task.task_id, now),
+            )
+            .expect("active chain should persist");
+
+        let mut request = session_turn_request("继续下一阶段，派发代理完成剩余检查");
+        request.session_id = Some(session_id.to_string());
+        let decision = decide_session_turn_with_task_planner(&state, &request)
+            .expect("followup should route to next mission phase");
+        let (accepted, _) = super::super::accept_session_task_submission(
+            &state,
+            &request,
+            decision.task_title.clone(),
+            decision.execution_goal.clone(),
+            decision.task_tier,
+        )
+        .expect("followup dispatch should be accepted");
+
+        assert_ne!(accepted.root_task_id, root_task.task_id);
+        let next_root = task_store
+            .get_task(&accepted.root_task_id)
+            .expect("next phase root task should exist");
+        assert_eq!(next_root.mission_id, mission_id);
+        assert_eq!(
+            next_root
+                .policy_snapshot
+                .as_ref()
+                .map(|policy| policy.task_tier),
+            Some(TaskTier::LongMission)
+        );
     }
 
     #[test]
@@ -2495,6 +2809,26 @@ mod tests {
 
         assert!(matches!(decision.route, SessionTurnRouteDto::Chat));
         assert_eq!(decision.task_tier, TaskTier::ExecutionChain);
+        assert!(decision.forced_tool_name.is_none());
+    }
+
+    #[test]
+    fn current_project_analysis_routes_to_execute_tools() {
+        let request = session_turn_request("分析当前项目");
+        let decision = normalize_session_turn_decision(classifier_chat_decision(), &request);
+
+        assert!(matches!(decision.route, SessionTurnRouteDto::Execute));
+        assert!(decision.tool_intent.is_some());
+        assert!(decision.forced_tool_name.is_none());
+    }
+
+    #[test]
+    fn project_identity_question_routes_to_execute_tools() {
+        let request = session_turn_request("这个项目是什么");
+        let decision = normalize_session_turn_decision(classifier_chat_decision(), &request);
+
+        assert!(matches!(decision.route, SessionTurnRouteDto::Execute));
+        assert!(decision.tool_intent.is_some());
         assert!(decision.forced_tool_name.is_none());
     }
 

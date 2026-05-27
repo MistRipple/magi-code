@@ -26,7 +26,6 @@
     getRunnerUserStateLabel,
     getRunnerUserStateTone,
     getRunnerUserStateTooltip,
-    getTaskDisplayBlockedReason,
     getTaskDisplayGoal,
     getTaskDisplayText,
     getTaskDisplayTitle,
@@ -69,6 +68,11 @@
     label: string;
     sourceLabel: string;
     references: TaskReferenceDescriptor[];
+  }
+
+  interface TaskAttentionSummary {
+    title: string;
+    hint: string;
   }
 
   // ─── 任务投影视图 ─────────────────
@@ -258,14 +262,12 @@
       .map((id) => taskById.get(id))
       .filter((task): task is TaskDto => Boolean(task));
   });
-  // 给 runner badge 的 error 态准备一个简短的失败原因摘要（tooltip 用）。
-  const runnerBlockedReason = $derived.by(() => {
-    const proj = taskProjection.projection;
-    if (!proj || proj.runner_status !== 'error') return null;
-    const source = attentionTasks[0] ?? null;
-    if (!source) return null;
-    return getTaskDisplayBlockedReason(source);
-  });
+  const attentionSummary = $derived.by(() => buildTaskAttentionSummary(
+    taskProjection.projection,
+    attentionTasks,
+    canResumeTaskProjection,
+  ));
+  const runnerBlockedReason = $derived(attentionSummary?.title ?? null);
   // 用户面直接展示 v2 TaskPolymorphism 的所有任务变体。
   const userVisibleTasks = $derived.by(() => (
     activeProjectionTasks
@@ -403,6 +405,40 @@
     return {
       total: progress?.total_tasks ?? 0,
       completed: progress?.settled_tasks ?? 0,
+    };
+  }
+
+  function buildTaskAttentionSummary(
+    projection: TaskProjectionDto | null,
+    failedTasks: TaskDto[],
+    canResume: boolean,
+  ): TaskAttentionSummary | null {
+    if (!projection) return null;
+    const failedCount = failedTasks.length;
+    if (projection.runner_status !== 'error' && failedCount === 0) return null;
+
+    const rootTaskId = projection.root_task.task_id;
+    const rootFailed = failedTasks.some((task) => task.task_id === rootTaskId);
+    const agentFailedCount = failedTasks
+      .filter((task) => task.kind === 'local_agent' && task.task_id !== rootTaskId)
+      .length;
+
+    let title = '执行链未完成';
+    if (rootFailed && agentFailedCount > 0) {
+      title = `主线和 ${agentFailedCount} 个代理未完成`;
+    } else if (rootFailed) {
+      title = '主线任务未完成';
+    } else if (agentFailedCount > 0 && agentFailedCount === failedCount) {
+      title = `${agentFailedCount} 个代理未完成`;
+    } else if (failedCount > 0) {
+      title = `${failedCount} 个任务未完成`;
+    }
+
+    return {
+      title,
+      hint: canResume
+        ? '可以继续原执行链；如果上下文已失效，再重新执行。'
+        : '可以重新执行当前目标；需要定位链路时再展开排障明细。',
     };
   }
 
@@ -807,15 +843,12 @@
           </div>
         </div>
 
-        {#if proj.runner_status === 'error'}
+        {#if attentionSummary}
           <div class="task-attention-strip">
             <Icon name="alert-triangle" size={13} />
-            <span>
-              {#if canResumeTaskProjection}
-                任务中断在可恢复分支，可以继续原执行链，也可以重新执行一条新链。
-              {:else}
-                当前执行链不可直接继续，可以查看原因后重新执行。
-              {/if}
+            <span class="task-attention-strip-copy">
+              <strong>{attentionSummary.title}</strong>
+              <span>{attentionSummary.hint}</span>
             </span>
           </div>
         {/if}
@@ -981,11 +1014,11 @@
 
       <details class="task-details-disclosure">
         <summary>
-          <span>技术明细</span>
-          <span>{activeProjectionTasks.length} 个节点</span>
+          <span>排障明细</span>
+          <span>展开查看任务链路</span>
         </summary>
 
-      <div class="tg-tree" role="tree" aria-label="任务技术明细">
+      <div class="tg-tree" role="tree" aria-label="任务排障明细">
         {#each taskTreeRows as row (row.task.task_id)}
           {@const isExpanded = expandedProjectionNodes.has(row.task.task_id)}
           {@const statusIcon = getProjectionStatusIcon(row.task.status)}
@@ -1088,10 +1121,10 @@
               <span>重试 {selectedProjectionTask.retry_count}</span>
             {/if}
           </div>
-          {#if selectedProjectionTask.status === 'failed' && getTaskDisplayBlockedReason(selectedProjectionTask)}
+          {#if selectedProjectionTask.status === 'failed'}
             <div class="task-detail-blocker">
               <Icon name="alert-circle" size={12} />
-              <span>{getTaskDisplayBlockedReason(selectedProjectionTask)}</span>
+              <span>这个任务没有完成。优先回到进度区继续或重新执行；需要定位链路时再查看这里的父子任务关系。</span>
             </div>
           {/if}
           {#if selectedProjectionReferenceGroups.length > 0}
@@ -1120,26 +1153,6 @@
         </section>
       {/if}
       </details>
-
-      {#if attentionTasks.length > 0}
-        <div class="tg-attention-section">
-          <div class="task-section-header">
-            <span>需要处理</span>
-            <span class="task-section-meta">{attentionTasks.length} 项</span>
-          </div>
-          {#each attentionTasks as task (task.task_id)}
-            <div class="tg-attention-item tg-attention--failed">
-              <Icon name="alert-circle" size={12} />
-              <div class="tg-attention-copy">
-                <span class="tg-attention-title">{getTaskDisplayTitle(task)}</span>
-                <span class="tg-attention-meta">
-                  {getTaskDisplayBlockedReason(task)}
-                </span>
-              </div>
-            </div>
-          {/each}
-        </div>
-      {/if}
 
     {/if}
   {/if}
@@ -1335,8 +1348,7 @@
     font-weight: var(--font-semibold);
   }
 
-  .task-progress-meta,
-  .task-section-meta {
+  .task-progress-meta {
     color: var(--foreground-muted);
     font-size: var(--text-2xs);
   }
@@ -1385,7 +1397,7 @@
 
   .task-attention-strip {
     display: flex;
-    align-items: center;
+    align-items: flex-start;
     gap: var(--space-2);
     min-height: 30px;
     padding: var(--space-1) var(--space-2);
@@ -1399,18 +1411,33 @@
 
   .task-attention-strip :global(svg) {
     flex: 0 0 auto;
+    margin-top: 2px;
     color: var(--error);
   }
 
-  .task-section-header {
+  .task-attention-strip-copy {
     display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: var(--space-2);
-    padding: 0 var(--space-1);
+    flex-direction: column;
+    gap: 1px;
+    min-width: 0;
+  }
+
+  .task-attention-strip-copy strong {
+    color: var(--foreground);
     font-size: var(--text-xs);
-    font-weight: var(--font-medium);
+    font-weight: var(--font-semibold);
+  }
+
+  .task-attention-strip-copy span {
     color: var(--foreground-muted);
+    font-size: var(--text-2xs);
+    line-height: var(--leading-normal);
+  }
+
+  .task-attention-strip-copy strong,
+  .task-attention-strip-copy span {
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 
   .task-progress-rows {
@@ -1899,50 +1926,6 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-  }
-
-  /* ========== Attention Section ========== */
-  .tg-attention-section {
-    display: flex;
-    flex-direction: column;
-    gap: var(--space-2);
-  }
-
-  .tg-attention-item {
-    display: flex;
-    align-items: center;
-    flex-wrap: wrap;
-    gap: var(--space-2);
-    padding: var(--space-2) var(--space-3);
-    border-radius: var(--radius-md);
-    font-size: var(--text-xs);
-  }
-
-  .tg-attention-copy {
-    display: flex;
-    flex: 1;
-    flex-direction: column;
-    gap: 2px;
-    min-width: 0;
-  }
-
-  .tg-attention-title {
-    overflow: hidden;
-    color: var(--foreground);
-    font-weight: var(--font-medium);
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .tg-attention-meta {
-    color: var(--foreground-muted);
-    font-size: var(--text-2xs);
-  }
-
-  .tg-attention--failed {
-    color: var(--warning);
-    background: var(--warning-muted);
-    border: 1px solid color-mix(in srgb, var(--warning) 30%, var(--border));
   }
 
   /* ========== 最近任务 ========== */

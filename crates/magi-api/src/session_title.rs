@@ -34,6 +34,36 @@ pub(crate) fn spawn_new_session_title_refinement(
     first_message: &str,
     placeholder_title: &str,
 ) {
+    let state = state.clone();
+    let session_id = session_id.clone();
+    let first_message = first_message.to_string();
+    let placeholder_title = placeholder_title.to_string();
+    let thread_session_id = session_id.clone();
+    let _ = std::thread::Builder::new()
+        .name(format!("magi-session-title-{}", session_id))
+        .spawn(move || {
+            refine_new_session_title_and_publish(
+                &state,
+                &thread_session_id,
+                &first_message,
+                &placeholder_title,
+            );
+        })
+        .map_err(|error| {
+            tracing::warn!(
+                session_id = %session_id,
+                ?error,
+                "辅助模型会话标题线程启动失败"
+            );
+        });
+}
+
+pub(crate) fn refine_new_session_title_and_publish(
+    state: &ApiState,
+    session_id: &SessionId,
+    first_message: &str,
+    placeholder_title: &str,
+) -> bool {
     let Some(client) =
         magi_conversation_runtime::task_execution_dispatcher::resolve_target_for_role(
             Some(&state.settings_store),
@@ -47,66 +77,63 @@ pub(crate) fn spawn_new_session_title_refinement(
             session_id = %session_id,
             "辅助模型未配置，跳过会话标题精修"
         );
-        return;
+        return false;
     };
-    let state = state.clone();
-    let session_id = session_id.clone();
-    let first_message = first_message.to_string();
-    let placeholder_title = placeholder_title.to_string();
-    tokio::task::spawn_blocking(move || {
-        let refined_title = refine_new_session_title(
-            client,
-            state.session_store.clone(),
-            session_id.clone(),
-            first_message,
-            placeholder_title,
+    let refined_title = refine_new_session_title(
+        client,
+        state.session_store.clone(),
+        session_id.clone(),
+        first_message.to_string(),
+        placeholder_title.to_string(),
+    );
+    let Some(title) = refined_title else {
+        return false;
+    };
+    if let Err(error) = state.persist_session_durable_state() {
+        tracing::warn!(
+            session_id = %session_id,
+            ?error,
+            "辅助模型会话标题持久化失败"
         );
-        if let Some(title) = refined_title {
-            if let Err(error) = state.persist_session_durable_state() {
-                tracing::warn!(
-                    session_id = %session_id,
-                    ?error,
-                    "辅助模型会话标题持久化失败"
-                );
-            }
-            let workspace_id = state
-                .session_store
-                .session(&session_id)
-                .and_then(|session| state.session_workspace_id(&session));
-            let event_id = EventId::new(format!(
-                "event-session-title-updated-{}-{}",
-                session_id,
-                UtcMillis::now().0
-            ));
-            let event = EventEnvelope::domain(
-                event_id,
-                "session.title.updated",
-                json!({
-                    "session_id": session_id.to_string(),
-                    "workspace_id": workspace_id.as_ref().map(ToString::to_string),
-                    "title": title,
-                }),
-            )
-            .with_context(EventContext {
-                session_id: Some(session_id.clone()),
-                workspace_id,
-                ..EventContext::default()
-            });
-            if let Err(error) = state.event_bus.publish(event) {
-                tracing::warn!(
-                    session_id = %session_id,
-                    ?error,
-                    "辅助模型会话标题更新事件发布失败"
-                );
-            }
-        }
+    }
+    let workspace_id = state
+        .session_store
+        .session(session_id)
+        .and_then(|session| state.session_workspace_id(&session));
+    let event_id = EventId::new(format!(
+        "event-session-title-updated-{}-{}",
+        session_id,
+        UtcMillis::now().0
+    ));
+    let event = EventEnvelope::domain(
+        event_id,
+        "session.title.updated",
+        json!({
+            "session_id": session_id.to_string(),
+            "workspace_id": workspace_id.as_ref().map(ToString::to_string),
+            "title": title,
+        }),
+    )
+    .with_context(EventContext {
+        session_id: Some(session_id.clone()),
+        workspace_id,
+        ..EventContext::default()
     });
+    if let Err(error) = state.event_bus.publish(event) {
+        tracing::warn!(
+            session_id = %session_id,
+            ?error,
+            "辅助模型会话标题更新事件发布失败"
+        );
+        return false;
+    }
+    true
 }
 
 /// 同步执行一次会话标题精修。
 ///
 /// 调用方负责在合适的位置 fire-and-forget 包装（参考 `submit_regular_session_turn` 中的接线）：
-/// 该函数会发起一次阻塞式 LLM 调用，因此放进 `tokio::task::spawn_blocking` 中执行最稳妥。
+/// 该函数会发起一次阻塞式 LLM 调用，应放到独立线程，避免阻塞 HTTP 请求处理线程。
 pub fn refine_new_session_title(
     client: Arc<dyn ModelBridgeClient>,
     session_store: Arc<SessionStore>,
@@ -144,6 +171,11 @@ pub fn refine_new_session_title(
     };
     let payload = response.parse_chat_payload();
     let Some(raw) = payload.content else {
+        tracing::debug!(
+            session_id = %session_id,
+            thinking = ?payload.thinking,
+            "辅助模型返回缺少 content，跳过会话标题精修"
+        );
         return None;
     };
     let Some(title) = normalize_title(&raw) else {

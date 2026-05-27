@@ -859,7 +859,7 @@ struct OpenAiCompatibleChatMessage {
     reasoning_content: Option<String>,
     #[serde(default)]
     refusal: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_openai_tool_calls")]
     tool_calls: Vec<OpenAiCompatibleToolCall>,
 }
 
@@ -993,6 +993,16 @@ where
             serde_json::to_string(&arguments).map_err(serde::de::Error::custom)
         }
     }
+}
+
+fn deserialize_openai_tool_calls<'de, D>(
+    deserializer: D,
+) -> Result<Vec<OpenAiCompatibleToolCall>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<Vec<OpenAiCompatibleToolCall>>::deserialize(deserializer)
+        .map(|tool_calls| tool_calls.unwrap_or_default())
 }
 
 #[derive(Debug, Deserialize)]

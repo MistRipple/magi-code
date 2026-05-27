@@ -52,10 +52,9 @@ export interface TokenUsage {
 /**
  * LLM 基础配置
  *
- * 注意：协议类型不再由配置字段决定，统一由 baseUrl 推断：
- *   - urlMode=standard 且 baseUrl 以 `/v1` 结尾 → OpenAI Chat Completions
- *   - urlMode=full 且 baseUrl 以 `/v1/messages` 结尾 → Anthropic Messages
- *   - 其他场景 → Anthropic Messages
+ * 注意：urlMode 只表达路径形态，不直接表达模型协议：
+ *   - urlMode=standard → 按模型名识别协议；Claude 家族走 Anthropic Messages，其余走 OpenAI Chat
+ *   - urlMode=full → 用户填写完整端点，按端点路径识别协议
  */
 export interface LLMConfig {
   baseUrl: string;

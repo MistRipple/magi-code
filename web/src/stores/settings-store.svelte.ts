@@ -348,7 +348,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
     if (!normalized) {
       return false;
     }
-    // 这些 baseUrl 是“标准兼容形”端点：以 /v1 结尾且按 OpenAI 兼容协议派生，
+    // 这些 baseUrl 是“标准兼容形”端点：应作为根地址交给后端按模型名派生协议，
     // 因此推荐使用 standard 模式而非 full（避免把整条 URL 原样透传）。
     return (
       normalized === "https://api.openai.com/v1" ||
@@ -2164,7 +2164,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
     }
     // 以后端返回的 workerConfigs 为准重建，保留未保存引擎的前端暂存。
     // 注意：legacy 配置中的 provider / openaiProtocol / protocolEndpoint
-    // 字段不再参与协议派生（后端已统一由 baseUrl 推断），此处直接忽略。
+    // 字段不再参与协议派生（后端已统一由 urlMode/baseUrl/model 推断），此处直接忽略。
     const next: Record<string, any> = {};
     for (const [worker, config] of Object.entries(configs)) {
       if (config) {

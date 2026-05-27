@@ -187,7 +187,7 @@ Tier 1 — Conversation Runtime
 | 负载 | 激活控制面 |
 |------|------------|
 | 简单任务 | Tier 2 的普通 SessionTurn；必要时使用 ToolRegistry / Permissions / Streaming |
-| 中等任务 | Tier 1 + Tier 2 + TaskRunner / ExecutionChain；需要协作时激活 Tier 3 |
+| 中等任务 | Tier 1 + Tier 2 + TaskRunner / ExecutionChain；主线模型可直接推进，只有需要并行、专项或复核时才激活 Tier 3 |
 | 复杂任务 | Tier 1 + Tier 2 + Tier 3 + Tier 4 |
 
 ## 5. 核心层定义
@@ -208,7 +208,7 @@ Tier 1 — Conversation Runtime
 
 **AgentRole**
 
-Role 是配置：system prompt、工具可见性、是否 coordinator、默认 task kind 支持。Role 不应该通过运行时代码分支膨胀。
+Role 是配置：system prompt、工具可见性、是否 coordinator、默认 task kind 支持。Role 不应该通过运行时代码分支膨胀。`coordinator` 不是空壳调度器，而是主线模型的任务推进身份：它可以直接使用可见工具完成关键路径工作，也可以在需要并行、专项视角或独立复核时通过 `agent_spawn` 派发代理。
 
 **SpawnGraph**
 

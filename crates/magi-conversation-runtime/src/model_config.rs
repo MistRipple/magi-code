@@ -2,11 +2,11 @@
 //!
 //! 错误返回值使用 `Result<_, String>`，由上层调用方桥接到自己的错误类型。
 //!
-//! 协议判定的**唯一事实源**是路径模式：
-//! - `urlMode = standard|proxy`：按 OpenAI 兼容 Chat Completions 处理，并由 HTTP client
-//!   自动补齐 `/v1/chat/completions`。
-//! - `urlMode = full`：`baseUrl` 严格以 `/v1/messages` 结尾 → Anthropic Messages；
-//!   其他 → OpenAI Chat Completions。
+//! 协议判定的**唯一事实源**是归一化模型配置：
+//! - `urlMode = standard|proxy`：按模型名识别协议；Claude 家族走 Anthropic Messages，
+//!   其他模型走 OpenAI 兼容 Chat Completions。
+//! - `urlMode = full`：用户已经填写完整端点，按端点路径识别协议；`/v1/messages`
+//!   走 Anthropic Messages，其他走 OpenAI Chat Completions。
 //!
 //! `provider` 字段不再参与路由决策，仅作为统计/展示标签，由上述推断同步派生。
 //! 历史配置中残留的 `provider` 或 `openaiProtocol` JSON 字段会被静默忽略。
@@ -90,8 +90,8 @@ impl NormalizedModelConfig {
     /// 从 settings JSON 构造归一化模型配置。
     ///
     /// `_default_provider` 参数仅为保持上层调用方签名兼容，实际不再参与逻辑——
-    /// provider 完全由 `baseUrl + urlMode` 推断。历史配置里的 `provider` / `openaiProtocol`
-    /// / `protocolEndpoint` 字段会被静默忽略。
+    /// provider 完全由归一化后的 `urlMode + baseUrl + model` 推断。历史配置里的
+    /// `provider` / `openaiProtocol` / `protocolEndpoint` 字段会被静默忽略。
     pub fn from_settings_value(value: &Value, _default_provider: &str) -> Self {
         let url_mode_label =
             string_field(value, "urlMode").unwrap_or_else(|| "standard".to_string());
@@ -138,11 +138,17 @@ impl NormalizedModelConfig {
             .ok_or_else(|| "模型配置缺少 model".to_string())
     }
 
+    pub fn inferred_protocol(&self) -> HttpModelBridgeProtocol {
+        self.inferred_protocol_for_model(self.model.as_deref())
+    }
+
     /// 推断 HTTP 协议族。
     ///
-    /// standard/proxy 是产品默认的 OpenAI 兼容网关形态，不能因为用户填的是网关根地址
-    /// 就误判成 Anthropic。Anthropic 直连必须通过 full 模式显式写到 `/v1/messages`。
-    pub fn inferred_protocol(&self) -> HttpModelBridgeProtocol {
+    /// standard/proxy 是产品默认的网关根地址形态，同一个 baseUrl 下可同时承载
+    /// OpenAI 兼容模型和 Anthropic Messages 模型，因此用模型家族做确定性识别。
+    /// full 模式表示用户填写的是完整端点，必须优先尊重路径本身，避免把
+    /// OpenAI 兼容代理中的 Claude 模型误路由到错误端点。
+    fn inferred_protocol_for_model(&self, model: Option<&str>) -> HttpModelBridgeProtocol {
         let normalized = self
             .base_url
             .as_deref()
@@ -157,9 +163,12 @@ impl NormalizedModelConfig {
                     HttpModelBridgeProtocol::ChatCompletions
                 }
             }
-            ModelUrlMode::Standard | ModelUrlMode::Proxy => {
-                HttpModelBridgeProtocol::ChatCompletions
-            }
+            ModelUrlMode::Standard | ModelUrlMode::Proxy => match model {
+                Some(model) if is_anthropic_model_name(model) => {
+                    HttpModelBridgeProtocol::AnthropicMessages
+                }
+                _ => HttpModelBridgeProtocol::ChatCompletions,
+            },
         }
     }
 
@@ -169,11 +178,12 @@ impl NormalizedModelConfig {
             .model
             .clone()
             .unwrap_or_else(|| default_model.to_string());
+        let protocol = self.inferred_protocol_for_model(Some(&model));
         Some(HttpModelBridgeClient::new_with_protocol(
             base_url,
             self.api_key.clone(),
             model,
-            self.inferred_protocol(),
+            protocol,
             self.reasoning_effort
                 .map(ModelReasoningEffort::to_usage_reasoning_effort),
         ))
@@ -347,6 +357,10 @@ fn string_field(value: &Value, key: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn is_anthropic_model_name(model: &str) -> bool {
+    model.to_ascii_lowercase().contains("claude")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -386,6 +400,56 @@ mod tests {
             HttpModelBridgeProtocol::ChatCompletions
         );
         assert_eq!(config.provider(), "openai");
+    }
+
+    #[test]
+    fn standard_mode_claude_model_infers_anthropic_messages() {
+        let config = NormalizedModelConfig::from_settings_value(
+            &json!({
+                "baseUrl": "https://gateway.example.com",
+                "apiKey": "sk-test",
+                "model": "kiro-claude-sonnet-4-6",
+                "urlMode": "standard"
+            }),
+            "openai",
+        );
+        assert_eq!(
+            config.inferred_protocol(),
+            HttpModelBridgeProtocol::AnthropicMessages
+        );
+        assert_eq!(config.provider(), "anthropic");
+    }
+
+    #[test]
+    fn same_base_url_routes_by_model_family() {
+        let base = "https://gateway.example.com";
+        let claude_config = NormalizedModelConfig::from_settings_value(
+            &json!({
+                "baseUrl": base,
+                "apiKey": "sk-test",
+                "model": "claude-opus-4-5",
+                "urlMode": "standard"
+            }),
+            "openai",
+        );
+        let gpt_config = NormalizedModelConfig::from_settings_value(
+            &json!({
+                "baseUrl": base,
+                "apiKey": "sk-test",
+                "model": "gpt-5",
+                "urlMode": "standard"
+            }),
+            "openai",
+        );
+
+        assert_eq!(
+            claude_config.inferred_protocol(),
+            HttpModelBridgeProtocol::AnthropicMessages
+        );
+        assert_eq!(
+            gpt_config.inferred_protocol(),
+            HttpModelBridgeProtocol::ChatCompletions
+        );
     }
 
     #[test]
@@ -565,10 +629,29 @@ mod tests {
     }
 
     #[test]
-    fn http_client_uses_anthropic_only_for_full_messages_path() {
+    fn http_client_uses_anthropic_for_standard_claude_model() {
         let config = NormalizedModelConfig::from_settings_value(
             &json!({
-                "baseUrl": "https://api.anthropic.com/v1/messages",
+                "baseUrl": "https://api.anthropic.com",
+                "apiKey": "test-key",
+                "model": "claude-sonnet",
+                "urlMode": "standard"
+            }),
+            "openai",
+        );
+
+        assert!(config.to_http_model_client("gpt-4").is_some());
+        assert_eq!(
+            config.inferred_protocol(),
+            HttpModelBridgeProtocol::AnthropicMessages
+        );
+    }
+
+    #[test]
+    fn full_mode_path_overrides_claude_model_name() {
+        let config = NormalizedModelConfig::from_settings_value(
+            &json!({
+                "baseUrl": "https://openai-compatible.example.com/v1/chat/completions",
                 "apiKey": "test-key",
                 "model": "claude-sonnet",
                 "urlMode": "full"
@@ -579,7 +662,7 @@ mod tests {
         assert!(config.to_http_model_client("gpt-4").is_some());
         assert_eq!(
             config.inferred_protocol(),
-            HttpModelBridgeProtocol::AnthropicMessages
+            HttpModelBridgeProtocol::ChatCompletions
         );
     }
 

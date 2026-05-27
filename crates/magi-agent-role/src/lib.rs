@@ -520,6 +520,24 @@ mod tests {
     }
 
     #[test]
+    fn coordinator_prompt_keeps_mainline_execution_responsibility() {
+        let reg = AgentRoleRegistry::from_map(builtin_roles_map());
+        let role = reg.get("coordinator").expect("coordinator role exists");
+        assert!(
+            role.system_prompt
+                .contains("可以直接分析、读取、编辑、运行命令、验证并总结"),
+            "coordinator 必须保留主线亲自推进能力，实际: {}",
+            role.system_prompt
+        );
+        assert!(
+            !role
+                .system_prompt
+                .contains("不要直接编辑代码、不要直接跑测试"),
+            "coordinator 不能被弱化成只派活不执行的空壳角色"
+        );
+    }
+
+    #[test]
     fn non_coordinator_roles_have_coordinator_mode_false_by_default() {
         let reg = AgentRoleRegistry::from_map(builtin_roles_map());
         for id in ["architect", "executor", "reviewer", "explorer"] {

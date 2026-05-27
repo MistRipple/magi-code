@@ -15,10 +15,13 @@ export type ModelListFetchBlockReason =
   | 'full_url_mode'
   | 'missing_base_url_or_api_key';
 
+export type ResolvedModelApiProtocol = 'openai_chat' | 'anthropic_messages';
+
 export interface ModelListFetchConfigLike {
   baseUrl?: unknown;
   apiKey?: unknown;
   urlMode?: unknown;
+  model?: unknown;
 }
 
 function trimmedConfigString(value: unknown): string {
@@ -48,6 +51,21 @@ export function canFetchModelList(
   config: ModelListFetchConfigLike | null | undefined,
 ): boolean {
   return resolveModelListFetchBlockReason(config) === null;
+}
+
+export function resolveModelApiProtocol(
+  config: Pick<ModelListFetchConfigLike, 'baseUrl' | 'urlMode' | 'model'> | null | undefined,
+): ResolvedModelApiProtocol {
+  const urlMode = trimmedConfigString(config?.urlMode).toLowerCase();
+  const baseUrl = trimmedConfigString(config?.baseUrl)
+    .replace(/\/+$/, '')
+    .toLowerCase();
+  if (urlMode === 'full') {
+    return baseUrl.endsWith('/v1/messages') ? 'anthropic_messages' : 'openai_chat';
+  }
+
+  const model = trimmedConfigString(config?.model).toLowerCase();
+  return model.includes('claude') ? 'anthropic_messages' : 'openai_chat';
 }
 
 /**

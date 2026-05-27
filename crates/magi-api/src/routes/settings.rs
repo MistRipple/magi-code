@@ -1199,7 +1199,7 @@ mod tests {
             .await
             .expect("stub listener should bind");
         let base_url = format!(
-            "http://{}/v1/messages",
+            "http://{}",
             listener.local_addr().expect("stub addr should exist")
         );
         let app = Router::new().route("/v1/messages", post(anthropic_probe_stub));
@@ -1215,7 +1215,7 @@ mod tests {
                 "baseUrl": base_url,
                 "apiKey": "test-key",
                 "model": "claude-sonnet-test",
-                "urlMode": "full"
+                "urlMode": "standard"
             }),
             "openai",
         );
@@ -1566,17 +1566,19 @@ mod tests {
 
     #[test]
     fn fetch_models_config_allows_anthropic_compatible_provider() {
-        // /v1/models 在 Anthropic 端点同样合法，只要不是 Full 路径就放行。
+        // /v1/models 在 Anthropic 端点同样合法；standard 模式下协议由当前模型名识别。
         let (config, target) = parse_fetch_models_config(FetchModelsRequest {
             config: serde_json::json!({
                 "baseUrl": "https://api.anthropic.com",
                 "apiKey": "test-key",
+                "model": "claude-sonnet-test",
                 "urlMode": "standard"
             }),
             target: "orch".to_string(),
         })
         .expect("anthropic-style base url should also be listable");
 
+        assert_eq!(config.provider(), "anthropic");
         assert_eq!(
             config.models_list_url().expect("models url"),
             "https://api.anthropic.com/v1/models"

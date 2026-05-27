@@ -2299,6 +2299,12 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
     if (resolvedSessionId) {
       persistWorkspaceBinding(currentWorkspaceId, currentWorkspacePath, resolvedSessionId);
     }
+    if (turnResult.createdSession && resolvedSessionId) {
+      void fetchBootstrap({ forceFresh: true }).catch((error) => {
+        reportExpectedRecoveryFailure('新会话列表同步', '[web-client-bridge] 新会话 accepted 后刷新失败:', error);
+        scheduleRecovery('new_session_accepted_refresh', error, true);
+      });
+    }
     const successMessage = turnResult.route === 'task'
       ? '任务已提交'
       : turnResult.route === 'continue'

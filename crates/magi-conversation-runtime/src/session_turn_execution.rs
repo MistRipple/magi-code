@@ -162,7 +162,11 @@ fn build_session_turn_messages(
     if history.len() > MAX_SESSION_CONTEXT_MESSAGES {
         history = history.split_off(history.len() - MAX_SESSION_CONTEXT_MESSAGES);
     }
-    let mut messages = workspace_context_messages(request);
+    let mut messages = if request.use_tools {
+        workspace_context_messages(request)
+    } else {
+        Vec::new()
+    };
     messages.append(&mut history);
     messages.push(ChatMessage {
         role: "user".to_string(),
@@ -1466,6 +1470,49 @@ mod tests {
                 .and_then(|message| message.content.as_deref()),
             Some("分析一下当前项目")
         );
+    }
+
+    #[test]
+    fn build_session_turn_messages_does_not_inject_workspace_context_without_tools() {
+        let session_id = SessionId::new("session-workspace-chat");
+        let store = SessionStore::new();
+        store
+            .create_session(session_id.clone(), "workspace chat")
+            .expect("session should be created");
+        store
+            .upsert_current_turn(
+                session_id.clone(),
+                ActiveExecutionTurn {
+                    turn_id: "turn-workspace-chat".to_string(),
+                    turn_seq: 1,
+                    accepted_at: ts(1000),
+                    completed_at: None,
+                    status: "running".to_string(),
+                    user_message: Some("解释一下当前状态".to_string()),
+                    items: Vec::new(),
+                },
+            )
+            .expect("current turn should be stored");
+        let request = SessionTurnExecutionRequest {
+            session_id,
+            turn_id: "turn-workspace-chat".to_string(),
+            workspace_id: Some(WorkspaceId::new("workspace-context")),
+            prompt: "解释一下当前状态".to_string(),
+            use_tools: false,
+            skill_name: None,
+            request_id: None,
+            user_message_id: None,
+            placeholder_message_id: None,
+            forced_tool_name: None,
+            required_tool_chain: Vec::new(),
+            workspace_root_path: Some("/tmp/current-project".to_string()),
+        };
+
+        let messages = build_session_turn_messages(&store, &request, &request.prompt);
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages[0].content.as_deref(), Some("解释一下当前状态"));
     }
 
     #[test]

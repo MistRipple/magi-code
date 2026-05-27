@@ -1604,7 +1604,7 @@ fn agent_spawn_requirement_recovery_prompt(
     }
 
     Some(
-        "用户已经明确要求启动或派发代理。本轮第一步必须调用 agent_spawn 创建对应代理；不要用主线 shell_exec、file_read 或直接总结替代代理执行。若需要多个代理，应在同一轮发起多次 agent_spawn 并为每个代理写清 display_name、role、goal 与 access_mode。"
+        "用户已经明确要求启动或派发代理。本轮必须调用 agent_spawn 履行代理契约；不要把主线 shell_exec、file_read 或直接总结冒充为代理执行结果。若需要多个代理，应在同一轮发起多次 agent_spawn 并为每个代理写清 display_name、role、goal 与 access_mode。"
             .to_string(),
     )
 }
@@ -1695,12 +1695,25 @@ fn agent_spawn_required_by_task(task: &Task) -> bool {
         return false;
     }
 
-    contains_any(
+    let has_chinese_dispatch_verb = contains_any(
         &text,
-        &[
-            "启动", "派发", "分配", "调用", "创建", "使用", "拉起", "开启",
-        ],
-    ) || contains_any(
+        &["启动", "派发", "分配", "调用", "创建", "拉起", "开启"],
+    ) || (text.contains("使用")
+        && contains_any(
+            &text,
+            &[
+                "使用代理完成",
+                "使用代理处理",
+                "使用代理执行",
+                "使用代理验证",
+                "使用代理检查",
+                "使用代理审查",
+                "使用多个代理",
+                "使用两个代理",
+                "使用多代理",
+            ],
+        ));
+    let has_english_dispatch_verb = contains_any(
         &lowered,
         &[
             "spawn",
@@ -1708,10 +1721,11 @@ fn agent_spawn_required_by_task(task: &Task) -> bool {
             "launch",
             "dispatch",
             "assign",
-            "use agent",
-            "use agents",
+            "use agent to",
+            "use agents to",
         ],
-    )
+    );
+    has_chinese_dispatch_verb || has_english_dispatch_verb
 }
 
 fn agent_spawn_was_attempted(tool_call_records: &[serde_json::Value]) -> bool {
@@ -3166,9 +3180,22 @@ mod tests {
         match outcome {
             TaskOutcome::Failed { error } => {
                 assert!(error.contains("agent_spawn"));
-                assert!(error.contains("不要用主线"));
+                assert!(error.contains("代理契约"));
             }
             other => panic!("明确要求代理时不能直接 final，got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mainline_agent_concept_discussion_does_not_force_agent_spawn() {
+        let mut task = make_task_loop_test_task("task-agent-concept-no-spawn");
+        task.goal = "请说明主模型和代理的职责边界，以及什么时候应该使用代理。".to_string();
+
+        let outcome = run_static_task_final(&task, "主线可以直接推进关键路径，代理用于并行协作。");
+
+        match outcome {
+            TaskOutcome::Completed { .. } => {}
+            other => panic!("讨论代理使用方式不应强制 agent_spawn，got {other:?}"),
         }
     }
 
@@ -3215,7 +3242,7 @@ mod tests {
                 None
             )
             .is_some(),
-            "明确要求代理时，主线工具不能替代 agent_spawn"
+            "明确要求代理时，主线工具不能冒充代理契约"
         );
         assert!(
             agent_spawn_requirement_recovery_prompt(

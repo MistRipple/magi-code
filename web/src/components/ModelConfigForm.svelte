@@ -1,5 +1,6 @@
 <script lang="ts">
   import { i18n } from '../stores/i18n.svelte';
+  import { resolveModelApiProtocol } from '../shared/model-governance';
   import Icon from './Icon.svelte';
 
   type FormType = 'orch' | 'comp' | 'worker';
@@ -111,6 +112,10 @@
   const isTesting = $derived(currentTestStatus === 'testing');
   const saveDisabled = $derived(isSaving || !isDirty);
   const showSavedLabel = $derived(currentSaveStatus === 'saved' && !isDirty);
+  const resolvedProtocol = $derived(resolveModelApiProtocol(config));
+  const showResolvedProtocol = $derived(
+    Boolean(String(config.model || '').trim()) || config.urlMode === 'full',
+  );
 
   function handleModelListAction(event: MouseEvent) {
     const button = event.currentTarget as HTMLElement | null;
@@ -199,7 +204,21 @@
     </div>
 
     <div class="llm-config-field">
-      <label class="llm-config-label">{i18n.t('settings.model.field.model')}</label>
+      <div class="llm-config-label-row">
+        <label class="llm-config-label">{i18n.t('settings.model.field.model')}</label>
+        {#if showResolvedProtocol}
+          <span
+            class="model-protocol-chip"
+            title={i18n.t('settings.model.protocolHint')}
+          >
+            {i18n.t('settings.model.protocolResolved', {
+              protocol: resolvedProtocol === 'anthropic_messages'
+                ? i18n.t('settings.model.protocol.anthropic')
+                : i18n.t('settings.model.protocol.openai'),
+            })}
+          </span>
+        {/if}
+      </div>
       <div class="model-combobox" bind:this={comboboxEl}>
         <input
           type="text"
@@ -351,6 +370,29 @@
   .llm-config-label {
     font-size: var(--text-sm);
     color: var(--foreground-muted);
+  }
+
+  .llm-config-label-row {
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-2);
+  }
+
+  .model-protocol-chip {
+    min-width: 0;
+    max-width: 160px;
+    padding: 1px 7px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-full);
+    color: var(--foreground-muted);
+    background: var(--surface-2);
+    font-size: var(--text-xs);
+    line-height: 1.5;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 
   .llm-config-field--compact {

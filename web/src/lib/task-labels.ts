@@ -25,10 +25,6 @@ export function getTaskDisplayGoal(task: TaskDisplayInput): string {
   return normalizeTaskText(task.goal);
 }
 
-export function getTaskDisplayBlockedReason(task: Pick<TaskDto, 'goal'>): string {
-  return normalizeTaskText(task.goal) || '任务执行失败。';
-}
-
 export function getDecisionDisplayReason(reason: string | null | undefined): string {
   return normalizeTaskText(reason) || '任务执行失败。';
 }
