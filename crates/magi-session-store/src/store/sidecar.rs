@@ -936,6 +936,30 @@ impl SessionStore {
         }
     }
 
+    /// P6b：用压缩后的消息集替换指定 thread 的对话记录。
+    ///
+    /// 这是上下文压缩的唯一写入口：压缩不是追加一个旁路摘要，而是直接替换当前
+    /// thread 的可恢复历史，确保下一轮只会读取最新结构。
+    pub fn replace_thread_messages(
+        &self,
+        thread_id: &ThreadId,
+        messages: Vec<ThreadChatMessage>,
+        now: UtcMillis,
+    ) {
+        let mut state = self
+            .state
+            .write()
+            .expect("session state write lock poisoned");
+        if let Some(thread) = state
+            .thread_registry
+            .iter_mut()
+            .find(|thread| &thread.thread_id == thread_id)
+        {
+            thread.message_history = messages;
+            thread.last_used_at = now;
+        }
+    }
+
     pub fn bind_execution_ownership(&self, session_id: SessionId, ownership: ExecutionOwnership) {
         let session_key = session_id.clone();
         let existing = self.runtime_sidecar(&session_id);

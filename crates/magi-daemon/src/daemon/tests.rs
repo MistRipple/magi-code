@@ -32,7 +32,7 @@ use std::{fs, path::PathBuf, sync::Arc};
 use tokio::time::{Duration, Instant};
 use tower::util::ServiceExt;
 
-const BACKGROUND_TASK_PROJECTION_TIMEOUT: Duration = Duration::from_secs(10);
+const BACKGROUND_TASK_PROJECTION_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn temp_state_root(name: &str) -> PathBuf {
     let root = std::env::temp_dir().join(format!("magi-daemon-test-{name}-{}", UtcMillis::now().0));

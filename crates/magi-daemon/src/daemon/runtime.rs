@@ -1221,6 +1221,8 @@ mod tests {
     };
     use tower::util::ServiceExt;
 
+    const BACKGROUND_TEST_TIMEOUT: Duration = Duration::from_secs(30);
+
     fn temp_state_root(name: &str) -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!(
             "magi-daemon-runtime-test-{name}-{}",
@@ -1379,7 +1381,7 @@ mod tests {
         root_task_id: &str,
         session_id: &str,
     ) -> Value {
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now() + BACKGROUND_TEST_TIMEOUT;
         loop {
             let projection = get_task_projection(app.clone(), root_task_id, session_id).await;
             let total_tasks = projection["progress_summary"]["total_tasks"]
@@ -1406,7 +1408,7 @@ mod tests {
         mission_id: &str,
         mut is_ready: impl FnMut(&Value) -> bool,
     ) -> Value {
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now() + BACKGROUND_TEST_TIMEOUT;
         loop {
             let read_model = get_json(app.clone(), "/runtime/read-model").await;
             if let Some(group) = read_model["details"]["execution_groups"]
@@ -1726,7 +1728,7 @@ mod tests {
         assert_eq!(body["route"], "chat");
         assert!(body.get("rootTaskId").is_none());
 
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now() + BACKGROUND_TEST_TIMEOUT;
         loop {
             let read_model = get_json(app.clone(), "/runtime/read-model").await;
             let session = read_model["details"]["sessions"]

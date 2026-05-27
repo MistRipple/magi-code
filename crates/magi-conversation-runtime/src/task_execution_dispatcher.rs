@@ -16,9 +16,7 @@ use crate::{
     settings_store::SettingsStore,
     skill_apply_tool_definition,
     task_execution_registry::{TaskExecutionPlan, TaskExecutionRegistry},
-    task_helpers::{
-        task_can_see_builtin_tool, task_is_coordinator, task_is_long_mission, task_role_id,
-    },
+    task_helpers::{task_can_see_builtin_tool, task_is_long_mission, task_role_id},
     task_runner_bridge::{EventBasedResultReceiver, TaskDispatcher, TaskOutcome, TaskResult},
     usage_recording::{ModelUsageBinding, model_usage_binding_for_worker_with_settings},
 };
@@ -841,9 +839,7 @@ impl LlmTaskDispatcher {
         if excerpt_text.is_empty() {
             return;
         }
-        if magi_bridge_client::micro_compaction::estimate_token_count(&excerpt_text)
-            < SESSION_MEMORY_WATERLINE_TOKENS
-        {
+        if estimate_session_memory_tokens(&excerpt_text) < SESSION_MEMORY_WATERLINE_TOKENS {
             return;
         }
 
@@ -1367,24 +1363,18 @@ impl LlmTaskDispatcher {
             .expect("LlmTaskDispatcher 缺少 AgentRoleRegistry，无法解析 task→role");
         let safety_gate = self.build_safety_gate(execution_settings);
         let todo_ledger = self.todo_ledger_registry.get_or_create(session_id);
-        let orchestration_enabled =
-            task_is_coordinator(Some(task), Some(agent_role_registry.as_ref()));
-        let long_mission_enabled = orchestration_enabled && task_is_long_mission(Some(task));
-        let project_memory = if orchestration_enabled {
-            workspace_root_path.as_ref().and_then(|path| {
-                let workspace_root = magi_core::WorkspaceRootPath::new(path.to_string_lossy());
-                match self.project_memory_registry.get_or_open(&workspace_root) {
-                    Ok(store) => Some(store),
-                    Err(err) => {
-                        tracing::warn!(error = %err, workspace_root = %path.display(), "ProjectMemory: 打开失败，本次 Turn 不注入项目记忆");
-                        None
-                    }
+        let long_mission_context_enabled = task_is_long_mission(Some(task));
+        let project_memory = workspace_root_path.as_ref().and_then(|path| {
+            let workspace_root = magi_core::WorkspaceRootPath::new(path.to_string_lossy());
+            match self.project_memory_registry.get_or_open(&workspace_root) {
+                Ok(store) => Some(store),
+                Err(err) => {
+                    tracing::warn!(error = %err, workspace_root = %path.display(), "ProjectMemory: 打开失败，本次 Turn 不注入项目记忆");
+                    None
                 }
-            })
-        } else {
-            None
-        };
-        let mission_charter = if long_mission_enabled {
+            }
+        });
+        let mission_charter = if long_mission_context_enabled {
             workspace_root_path.as_ref().and_then(|path| {
                 let workspace_root = magi_core::WorkspaceRootPath::new(path.to_string_lossy());
                 match self.mission_charter_registry.get_or_open(&workspace_root) {
@@ -1398,7 +1388,7 @@ impl LlmTaskDispatcher {
         } else {
             None
         };
-        let plan = if long_mission_enabled {
+        let plan = if long_mission_context_enabled {
             workspace_root_path.as_ref().and_then(|path| {
                 let workspace_root = magi_core::WorkspaceRootPath::new(path.to_string_lossy());
                 match self.plan_registry.get_or_open(&workspace_root) {
@@ -1412,7 +1402,7 @@ impl LlmTaskDispatcher {
         } else {
             None
         };
-        let mission_workspace = if long_mission_enabled {
+        let mission_workspace = if long_mission_context_enabled {
             workspace_root_path.as_ref().and_then(|path| {
                 let workspace_root = magi_core::WorkspaceRootPath::new(path.to_string_lossy());
                 match self.mission_workspace_registry.get_or_open(&workspace_root) {
@@ -1426,7 +1416,7 @@ impl LlmTaskDispatcher {
         } else {
             None
         };
-        let knowledge_graph = if long_mission_enabled {
+        let knowledge_graph = if long_mission_context_enabled {
             workspace_root_path.as_ref().and_then(|path| {
                 let workspace_root = magi_core::WorkspaceRootPath::new(path.to_string_lossy());
                 match self.knowledge_graph_registry.get_or_open(&workspace_root) {
@@ -1440,7 +1430,7 @@ impl LlmTaskDispatcher {
         } else {
             None
         };
-        let validation_runner = if long_mission_enabled {
+        let validation_runner = if long_mission_context_enabled {
             workspace_root_path.as_ref().and_then(|path| {
                 let workspace_root = magi_core::WorkspaceRootPath::new(path.to_string_lossy());
                 match self.validation_runner_registry.get_or_open(&workspace_root) {
@@ -1454,7 +1444,7 @@ impl LlmTaskDispatcher {
         } else {
             None
         };
-        let checkpoint = if long_mission_enabled {
+        let checkpoint = if long_mission_context_enabled {
             workspace_root_path.as_ref().and_then(|path| {
                 let workspace_root = magi_core::WorkspaceRootPath::new(path.to_string_lossy());
                 match self.checkpoint_registry.get_or_open(&workspace_root) {
@@ -1468,7 +1458,7 @@ impl LlmTaskDispatcher {
         } else {
             None
         };
-        let human_checkpoint = if long_mission_enabled {
+        let human_checkpoint = if long_mission_context_enabled {
             workspace_root_path.as_ref().and_then(|path| {
                 let workspace_root = magi_core::WorkspaceRootPath::new(path.to_string_lossy());
                 match self.human_checkpoint_registry.get_or_open(&workspace_root) {
@@ -1629,6 +1619,10 @@ struct LearningCandidate {
 /// 估算 token 数超过该阈值才会触发新一轮辅助模型调用。
 const SESSION_MEMORY_WATERLINE_TOKENS: u64 = 3_000;
 const SESSION_MEMORY_SOURCE_PREFIX: &str = "session-memory://";
+
+fn estimate_session_memory_tokens(text: &str) -> u64 {
+    text.len() as u64 / 4 + 1
+}
 
 /// S8 安全防护段的固定基线 —— 防注入与越权防御。
 ///
@@ -2276,22 +2270,20 @@ impl TaskDispatcher for LlmTaskDispatcher {
         let lease = lease.clone();
 
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.clone().spawn(async move {
-                let result = handle
-                    .spawn_blocking(move || {
-                        if let Err(err) = dispatcher.dispatch_inner(&task, &worker, &lease) {
-                            tracing::error!("dispatch_inner failed: {}", err);
-                            dispatcher.push_result(
-                                &task.task_id,
-                                &lease.lease_id,
-                                TaskOutcome::Failed {
-                                    error: format!("dispatch failed: {}", err),
-                                },
-                            );
-                        }
-                    })
-                    .await;
-                if let Err(err) = result {
+            let join = handle.spawn_blocking(move || {
+                if let Err(err) = dispatcher.dispatch_inner(&task, &worker, &lease) {
+                    tracing::error!("dispatch_inner failed: {}", err);
+                    dispatcher.push_result(
+                        &task.task_id,
+                        &lease.lease_id,
+                        TaskOutcome::Failed {
+                            error: format!("dispatch failed: {}", err),
+                        },
+                    );
+                }
+            });
+            handle.spawn(async move {
+                if let Err(err) = join.await {
                     tracing::error!("dispatch spawn_blocking panicked: {:?}", err);
                 }
             });

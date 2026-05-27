@@ -45,7 +45,11 @@ use magi_session_store::{
 };
 use magi_tool_runtime::ToolRegistry;
 use magi_usage_authority::UsageCallStatus;
-use std::{collections::BTreeSet, path::PathBuf, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+    sync::Arc,
+};
 
 pub struct ConversationLoopRequest<'a> {
     pub client: &'a dyn ModelBridgeClient,
@@ -174,6 +178,264 @@ fn chat_message_to_thread_chat_message(message: &ChatMessage) -> ThreadChatMessa
             .collect(),
         tool_call_id: message.tool_call_id.clone(),
     }
+}
+
+const THREAD_HISTORY_COMPACT_THRESHOLD_TOKENS: usize = 18_000;
+const THREAD_HISTORY_COMPACT_TARGET_TOKENS: usize = 8_000;
+const THREAD_HISTORY_RECENT_MESSAGE_TARGET: usize = 12;
+const THREAD_HISTORY_RECENT_MESSAGE_FLOOR: usize = 8;
+const THREAD_HISTORY_SUMMARY_EXCERPT_LIMIT: usize = 16;
+const THREAD_HISTORY_SUMMARY_EXCERPT_CHARS: usize = 360;
+const THREAD_HISTORY_TOOL_ARGUMENT_CHARS: usize = 220;
+
+fn estimate_text_tokens(text: &str) -> usize {
+    text.len() / 4 + 1
+}
+
+fn estimate_thread_message_tokens(message: &ThreadChatMessage) -> usize {
+    let mut total = estimate_text_tokens(&message.role) + 4;
+    if let Some(content) = message.content.as_deref() {
+        total += estimate_text_tokens(content);
+    }
+    if let Some(tool_call_id) = message.tool_call_id.as_deref() {
+        total += estimate_text_tokens(tool_call_id);
+    }
+    for call in &message.tool_calls {
+        total += estimate_text_tokens(&call.id);
+        total += estimate_text_tokens(&call.kind);
+        total += estimate_text_tokens(&call.function.name);
+        total += estimate_text_tokens(&call.function.arguments);
+    }
+    total
+}
+
+fn estimate_thread_history_tokens(history: &[ThreadChatMessage]) -> usize {
+    history.iter().map(estimate_thread_message_tokens).sum()
+}
+
+fn truncate_for_thread_summary(value: &str, max_chars: usize) -> String {
+    let normalized = value
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if normalized.chars().count() <= max_chars {
+        return normalized;
+    }
+    let mut out = normalized
+        .chars()
+        .take(max_chars.saturating_sub(3))
+        .collect::<String>();
+    out.push_str("...");
+    out
+}
+
+fn thread_role_label(role: &str) -> &str {
+    match role {
+        "system" => "系统",
+        "user" => "用户",
+        "assistant" => "助手",
+        "tool" => "工具结果",
+        _ => "消息",
+    }
+}
+
+fn summarize_thread_message(index: usize, message: &ThreadChatMessage) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(content) = message
+        .content
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        parts.push(format!(
+            "内容：{}",
+            truncate_for_thread_summary(content, THREAD_HISTORY_SUMMARY_EXCERPT_CHARS)
+        ));
+    }
+    if !message.tool_calls.is_empty() {
+        let calls = message
+            .tool_calls
+            .iter()
+            .map(|call| {
+                let args = truncate_for_thread_summary(
+                    &call.function.arguments,
+                    THREAD_HISTORY_TOOL_ARGUMENT_CHARS,
+                );
+                if args.is_empty() {
+                    call.function.name.clone()
+                } else {
+                    format!("{}({args})", call.function.name)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("；");
+        parts.push(format!("工具调用：{calls}"));
+    }
+    if message.role == "tool" {
+        if let Some(tool_call_id) = message.tool_call_id.as_deref() {
+            parts.push(format!("对应调用：{tool_call_id}"));
+        }
+    }
+    if parts.is_empty() {
+        parts.push("空消息".to_string());
+    }
+    format!(
+        "- #{} {}：{}",
+        index + 1,
+        thread_role_label(&message.role),
+        parts.join("；")
+    )
+}
+
+fn thread_history_tail_is_tool_balanced(tail: &[ThreadChatMessage]) -> bool {
+    let mut tool_call_ids = BTreeSet::new();
+    let mut tool_result_ids = BTreeSet::new();
+    for message in tail {
+        for call in &message.tool_calls {
+            tool_call_ids.insert(call.id.as_str());
+        }
+        if message.role == "tool" {
+            let Some(tool_call_id) = message.tool_call_id.as_deref() else {
+                return false;
+            };
+            if !tool_call_ids.contains(tool_call_id) {
+                return false;
+            }
+            tool_result_ids.insert(tool_call_id);
+        }
+    }
+    tool_call_ids
+        .iter()
+        .all(|tool_call_id| tool_result_ids.contains(tool_call_id))
+}
+
+fn choose_thread_history_compaction_split(history: &[ThreadChatMessage]) -> Option<usize> {
+    if history.len() <= 1 {
+        return None;
+    }
+    let target_tail = THREAD_HISTORY_RECENT_MESSAGE_TARGET.min(history.len().saturating_sub(1));
+    let floor_tail = THREAD_HISTORY_RECENT_MESSAGE_FLOOR.min(history.len().saturating_sub(1));
+    let max_split = history.len().saturating_sub(floor_tail);
+    let mut split = history.len().saturating_sub(target_tail).max(1);
+
+    while split < max_split
+        && estimate_thread_history_tokens(&history[split..]) > THREAD_HISTORY_COMPACT_TARGET_TOKENS
+    {
+        split += 1;
+    }
+    while split > 0 && !thread_history_tail_is_tool_balanced(&history[split..]) {
+        split -= 1;
+    }
+
+    (split > 0).then_some(split)
+}
+
+fn build_thread_history_compaction_message(
+    compacted_prefix: &[ThreadChatMessage],
+    original_tokens: usize,
+) -> ThreadChatMessage {
+    let mut role_counts: BTreeMap<String, usize> = BTreeMap::new();
+    for message in compacted_prefix {
+        *role_counts.entry(message.role.clone()).or_default() += 1;
+    }
+    let role_summary = role_counts
+        .iter()
+        .map(|(role, count)| format!("{} {}", thread_role_label(role), count))
+        .collect::<Vec<_>>()
+        .join("，");
+
+    let mut selected_indices = BTreeSet::new();
+    for index in 0..compacted_prefix.len().min(3) {
+        selected_indices.insert(index);
+    }
+    let remaining_slots =
+        THREAD_HISTORY_SUMMARY_EXCERPT_LIMIT.saturating_sub(selected_indices.len());
+    let tail_start = compacted_prefix.len().saturating_sub(remaining_slots);
+    for index in tail_start..compacted_prefix.len() {
+        selected_indices.insert(index);
+    }
+
+    let excerpts = selected_indices
+        .into_iter()
+        .map(|index| summarize_thread_message(index, &compacted_prefix[index]))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let content = format!(
+        "[context_compaction]\n\
+这是 Magi 自动生成的当前 thread 早期历史摘要，用于替代已压缩的完整消息。它是历史事实；如果它与后续保留的完整消息冲突，以后续完整消息为准。\n\
+压缩范围：{} 条消息；压缩前估算 token：{}；角色分布：{}。\n\
+关键历史摘录：\n{}\n\
+[/context_compaction]",
+        compacted_prefix.len(),
+        original_tokens,
+        if role_summary.is_empty() {
+            "无".to_string()
+        } else {
+            role_summary
+        },
+        if excerpts.is_empty() {
+            "- 无".to_string()
+        } else {
+            excerpts
+        }
+    );
+
+    ThreadChatMessage {
+        role: "system".to_string(),
+        content: Some(content),
+        tool_calls: Vec::new(),
+        tool_call_id: None,
+    }
+}
+
+fn compact_thread_history_if_needed(
+    history: &[ThreadChatMessage],
+) -> Option<Vec<ThreadChatMessage>> {
+    let original_tokens = estimate_thread_history_tokens(history);
+    if original_tokens < THREAD_HISTORY_COMPACT_THRESHOLD_TOKENS {
+        return None;
+    }
+    let split = choose_thread_history_compaction_split(history)?;
+    let compacted_prefix = &history[..split];
+    let retained_tail = &history[split..];
+    let summary = build_thread_history_compaction_message(compacted_prefix, original_tokens);
+    let mut compacted = Vec::with_capacity(retained_tail.len() + 1);
+    compacted.push(summary);
+    compacted.extend(retained_tail.iter().cloned());
+
+    let compacted_tokens = estimate_thread_history_tokens(&compacted);
+    if compacted_tokens >= original_tokens {
+        return None;
+    }
+    Some(compacted)
+}
+
+fn compact_and_replace_thread_history(
+    session_store: &SessionStore,
+    thread_id: &ThreadId,
+    history: Vec<ThreadChatMessage>,
+    phase: &'static str,
+) -> Vec<ThreadChatMessage> {
+    let original_count = history.len();
+    let original_tokens = estimate_thread_history_tokens(&history);
+    let Some(compacted) = compact_thread_history_if_needed(&history) else {
+        return history;
+    };
+    let compacted_count = compacted.len();
+    let compacted_tokens = estimate_thread_history_tokens(&compacted);
+    session_store.replace_thread_messages(thread_id, compacted.clone(), UtcMillis::now());
+    tracing::info!(
+        thread_id = %thread_id,
+        phase,
+        original_count,
+        compacted_count,
+        original_tokens,
+        compacted_tokens,
+        "thread 历史已压缩并替换"
+    );
+    compacted
 }
 
 pub fn run_conversation_loop(
@@ -422,8 +684,20 @@ fn run_conversation_loop_inner(
     // [CACHE: SEMI-STATIC] S10 · ProjectMemory 索引。
     // 把 `~/.magi/projects/{slug}/memory/MEMORY.md` 视图渲染进 system prompt，
     // 跨 conversation 复用同一项目的长期记忆。仅在 memory_write 后变化。
+    // 代理也需要读取项目记忆；是否提示写入由实际工具面决定，避免只读代理看到
+    // 不可调用的 `memory_write` 指令。
+    let memory_write_visible = tools.as_ref().is_some_and(|definitions| {
+        definitions
+            .iter()
+            .any(|definition| definition.function.name == "memory_write")
+    });
     if let Some(store) = project_memory {
-        match store.render_for_prompt() {
+        let rendered = if memory_write_visible {
+            store.render_for_prompt()
+        } else {
+            store.render_for_prompt_read_only()
+        };
+        match rendered {
             Ok(Some(rendered)) => {
                 messages.push(ChatMessage {
                     role: "system".to_string(),
@@ -581,10 +855,14 @@ fn run_conversation_loop_inner(
     }
     // [CACHE: APPEND-ONLY] Runtime tail · Thread 历史。
     // P6b：只读取当前 thread 内部已经持久化的运行时输入 / 恢复记录。worker thread
-    // 为单 task 独占，因此这里不能出现同 role 的历史 task 对话。append-only 语义
-    // 让前缀对缓存稳定；新一轮 append 不破坏先前缀缓存命中。
-    let thread_history_snapshot: Vec<ThreadChatMessage> =
-        session_store.thread_message_history(thread_id);
+    // 为单 task 独占，因此这里不能出现同 role 的历史 task 对话。历史超出水位线时
+    // 直接替换为「摘要 + 最近完整消息」，下一轮不再读到旧结构。
+    let thread_history_snapshot = compact_and_replace_thread_history(
+        session_store,
+        thread_id,
+        session_store.thread_message_history(thread_id),
+        "pre_turn",
+    );
     if !thread_history_snapshot.is_empty() {
         for history_msg in &thread_history_snapshot {
             messages.push(thread_chat_message_to_chat_message(history_msg));
@@ -602,6 +880,7 @@ fn run_conversation_loop_inner(
     // [CACHE: DYNAMIC] Runtime tail · 本轮 user 输入。
     // 含 assemble_prompt 预拼装的 S2-S8（base task + 上下文 + skill 注入 +
     // 用户规则 + lifecycle reminder + safeguard），每轮都重新生成。
+    let turn_message_start_index = messages.len();
     messages.push(ChatMessage {
         role: "user".to_string(),
         content: Some(prompt.clone()),
@@ -1226,7 +1505,7 @@ fn run_conversation_loop_inner(
     //（user / assistant / tool）。
     // 补写 assistant final：循环里只把 assistant 写进 messages 是在"还有下一轮"时发生，
     // 最终 final_content 作为收尾时没有入列，这里用 final_content 显式收口。
-    let mut turn_messages: Vec<ThreadChatMessage> = messages
+    let mut turn_messages: Vec<ThreadChatMessage> = messages[turn_message_start_index..]
         .iter()
         .filter(|msg| msg.role != "system")
         .map(chat_message_to_thread_chat_message)
@@ -1238,6 +1517,12 @@ fn run_conversation_loop_inner(
         tool_call_id: None,
     });
     session_store.append_thread_messages(thread_id, turn_messages, UtcMillis::now());
+    let _ = compact_and_replace_thread_history(
+        session_store,
+        thread_id,
+        session_store.thread_message_history(thread_id),
+        "post_turn",
+    );
 
     (
         TaskOutcome::Completed {

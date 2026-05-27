@@ -1,8 +1,6 @@
-pub mod auto_compaction;
 pub mod base_adapter;
 pub mod cache_boundary;
 mod clients;
-pub mod conversation_compaction;
 pub mod decision_engine;
 mod dispatch;
 pub mod execution_outcome;
@@ -12,9 +10,7 @@ pub mod llm_types;
 mod local_process_protocol;
 mod mcp_client;
 mod mcp_loopback;
-pub mod micro_compaction;
 mod model_loopback;
-pub mod orchestrator_adapter;
 pub mod orchestrator_termination;
 pub mod protocol;
 pub mod round_policy;

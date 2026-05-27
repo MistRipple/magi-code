@@ -42,6 +42,7 @@
     title: string;
     content?: string;
     tags?: string[];
+    updatedAt?: number;
   }
 
   interface FAQ {
@@ -49,13 +50,15 @@
     question: string;
     answer?: string;
     tags?: string[];
+    updatedAt?: number;
   }
 
   interface Learning {
     id: string;
     content: string;
     context?: string;
-    createdAt?: string;
+    createdAt?: number;
+    updatedAt?: number;
     tags?: string[];
   }
 
@@ -192,6 +195,65 @@
     return ensureArray(tags).join(', ');
   }
 
+  function parseKnowledgeTimestamp(value: unknown): number | undefined {
+    if (typeof value === 'number' && Number.isFinite(value)) return value;
+    if (typeof value === 'string' && value.trim()) {
+      const parsed = Number(value);
+      if (Number.isFinite(parsed)) return parsed;
+    }
+    return undefined;
+  }
+
+  function formatKnowledgeDate(value: number | undefined): string {
+    if (!value) return '';
+    const date = new Date(value);
+    if (!Number.isFinite(date.getTime())) return '';
+    const currentYear = new Date().getFullYear();
+    if (i18n.locale === 'zh-CN') {
+      const month = date.getMonth() + 1;
+      const day = date.getDate();
+      return date.getFullYear() === currentYear
+        ? `${month}月${day}日`
+        : `${date.getFullYear()}年${month}月${day}日`;
+    }
+    const options: Intl.DateTimeFormatOptions = date.getFullYear() === currentYear
+      ? { month: '2-digit', day: '2-digit' }
+      : { year: 'numeric', month: '2-digit', day: '2-digit' };
+    return date.toLocaleDateString('en-US', options);
+  }
+
+  function isGeneratedSourceRef(value: string | undefined): boolean {
+    const normalized = value?.trim() ?? '';
+    return normalized.startsWith('session:')
+      || normalized.startsWith('session-')
+      || normalized.startsWith('task:')
+      || normalized.startsWith('task-');
+  }
+
+  function formatKnowledgeSource(value: string | undefined): string {
+    const normalized = value?.trim() ?? '';
+    if (!normalized) return '';
+    if (normalized.startsWith('session:') || normalized.startsWith('session-')) {
+      return i18n.t('knowledge.source.autoSession');
+    }
+    if (normalized.startsWith('task:') || normalized.startsWith('task-')) {
+      return i18n.t('knowledge.source.autoTask');
+    }
+    return normalized;
+  }
+
+  function visibleTags(tags?: string[]): string[] {
+    const hidden = new Set(['auto', 'learning', 'adr', 'faq', 'codeindex']);
+    return ensureArray(tags)
+      .map((tag) => String(tag).trim())
+      .filter((tag) => tag && !hidden.has(tag.toLowerCase()));
+  }
+
+  function formatLearningTitle(content: string): string {
+    const normalized = content.trim();
+    return normalized.length > 80 ? `${normalized.slice(0, 80)}...` : normalized;
+  }
+
   function closeEditor() {
     editorKind = null;
     editorId = null;
@@ -220,7 +282,7 @@
     formTitle = adr.title || '';
     formContent = adr.content || '';
     formContext = '';
-    formTags = joinTags(adr.tags);
+    formTags = joinTags(visibleTags(adr.tags));
     formError = '';
   }
 
@@ -231,7 +293,7 @@
     formTitle = faq.question || '';
     formContent = faq.answer || '';
     formContext = '';
-    formTags = joinTags(faq.tags);
+    formTags = joinTags(visibleTags(faq.tags));
     formError = '';
   }
 
@@ -241,8 +303,8 @@
     editorId = learning.id;
     formTitle = '';
     formContent = learning.content || '';
-    formContext = learning.context || '';
-    formTags = joinTags(learning.tags);
+    formContext = isGeneratedSourceRef(learning.context) ? '' : learning.context || '';
+    formTags = joinTags(visibleTags(learning.tags));
     formError = '';
   }
 
@@ -363,6 +425,7 @@
         title: typeof item.title === 'string' ? item.title : '',
         content: typeof item.content === 'string' ? item.content : '',
         tags: ensureArray(item.tags) as string[],
+        updatedAt: parseKnowledgeTimestamp(item.updatedAt),
       }));
     faqs = items
       .filter((item) => item.kind === 'faq')
@@ -371,6 +434,7 @@
         question: typeof item.title === 'string' ? item.title : '',
         answer: typeof item.content === 'string' ? item.content : '',
         tags: ensureArray(item.tags) as string[],
+        updatedAt: parseKnowledgeTimestamp(item.updatedAt),
       }));
     learnings = items
       .filter((item) => item.kind === 'learning')
@@ -378,7 +442,8 @@
         id: String(item.id ?? ''),
         content: typeof item.content === 'string' ? item.content : '',
         context: typeof item.context === 'string' ? item.context : undefined,
-        createdAt: typeof item.createdAt === 'number' ? String(item.createdAt) : undefined,
+        createdAt: parseKnowledgeTimestamp(item.createdAt),
+        updatedAt: parseKnowledgeTimestamp(item.updatedAt),
         tags: ensureArray(item.tags) as string[],
       }));
     codeIndex = codeIndexPayload
@@ -784,9 +849,33 @@
               <button class="kp-section-link" onclick={() => switchTab('adr')}>{i18n.t('knowledge.overview.viewAll')}</button>
             </h4>
             {#each adrs.slice(0, 3) as adr (adr.id)}
+              {@const adrDate = formatKnowledgeDate(adr.updatedAt)}
               <div class="kp-preview-item">
                 <span class="kp-preview-dot default"></span>
                 <span class="kp-preview-text">{adr.title}</span>
+                {#if adrDate}
+                  <span class="kp-preview-date">{adrDate}</span>
+                {/if}
+              </div>
+            {/each}
+          </div>
+        {/if}
+
+        {#if learnings.length > 0}
+          <div class="kp-section">
+            <h4 class="kp-section-title">
+              <Icon name="lightbulb" size={13} />
+              <span>{i18n.t('knowledge.overview.recentLearnings')}</span>
+              <button class="kp-section-link" onclick={() => switchTab('learning')}>{i18n.t('knowledge.overview.viewAll')}</button>
+            </h4>
+            {#each learnings.slice(0, 3) as learning (learning.id)}
+              {@const learningDate = formatKnowledgeDate(learning.updatedAt ?? learning.createdAt)}
+              <div class="kp-preview-item">
+                <span class="kp-preview-dot learning"></span>
+                <span class="kp-preview-text">{formatLearningTitle(learning.content)}</span>
+                {#if learningDate}
+                  <span class="kp-preview-date">{learningDate}</span>
+                {/if}
               </div>
             {/each}
           </div>
@@ -805,6 +894,8 @@
         {:else}
           {#each filteredAdrs as adr (adr.id)}
             {@const isExpanded = expandedAdrId === adr.id}
+            {@const adrDate = formatKnowledgeDate(adr.updatedAt)}
+            {@const adrTags = visibleTags(adr.tags)}
             <div class="kp-card" class:expanded={isExpanded}>
               <div class="kp-card-header" role="button" tabindex="0" onclick={() => toggleAdr(adr)} onkeydown={(e) => e.key === 'Enter' && toggleAdr(adr)}>
                 <span class="kp-card-indicator default"></span>
@@ -821,6 +912,9 @@
                   <button class="kp-card-delete" title={i18n.t('knowledge.adr.deleteTitle')} onclick={(e) => deleteAdr(adr.id, e)}>
                     <Icon name="trash" size={12} />
                   </button>
+                  {#if adrDate}
+                    <span class="kp-category-badge">{adrDate}</span>
+                  {/if}
                   <Icon name={isExpanded ? 'chevron-up' : 'chevron-down'} size={12} />
                 </div>
               </div>
@@ -831,9 +925,9 @@
                       <p>{adr.content}</p>
                     </div>
                   {/if}
-                  {#if adr.tags && adr.tags.length > 0}
+                  {#if adrTags.length > 0}
                     <div class="kp-tag-list">
-                      {#each adr.tags as tag}
+                      {#each adrTags as tag}
                         <span class="kp-tag">{tag}</span>
                       {/each}
                     </div>
@@ -857,6 +951,8 @@
         {:else}
           {#each filteredFaqs as faq (faq.id)}
             {@const isExpanded = expandedFaqId === faq.id}
+            {@const faqDate = formatKnowledgeDate(faq.updatedAt)}
+            {@const faqTags = visibleTags(faq.tags)}
             <div class="kp-card" class:expanded={isExpanded}>
               <div class="kp-card-header" role="button" tabindex="0" onclick={() => toggleFaq(faq)} onkeydown={(e) => e.key === 'Enter' && toggleFaq(faq)}>
                 <span class="kp-card-indicator faq"></span>
@@ -873,6 +969,9 @@
                   <button class="kp-card-delete" title={i18n.t('knowledge.faq.deleteTitle')} onclick={(e) => deleteFaq(faq.id, e)}>
                     <Icon name="trash" size={12} />
                   </button>
+                  {#if faqDate}
+                    <span class="kp-category-badge">{faqDate}</span>
+                  {/if}
                   <Icon name={isExpanded ? 'chevron-up' : 'chevron-down'} size={12} />
                 </div>
               </div>
@@ -883,9 +982,9 @@
                       <p>{faq.answer}</p>
                     </div>
                   {/if}
-                  {#if faq.tags && faq.tags.length > 0}
+                  {#if faqTags.length > 0}
                     <div class="kp-tag-list">
-                      {#each faq.tags as tag}
+                      {#each faqTags as tag}
                         <span class="kp-tag">{tag}</span>
                       {/each}
                     </div>
@@ -909,13 +1008,16 @@
         {:else}
           {#each filteredLearnings as learning (learning.id)}
             {@const isExpanded = expandedLearningId === learning.id}
+            {@const learningSource = formatKnowledgeSource(learning.context)}
+            {@const learningDate = formatKnowledgeDate(learning.updatedAt ?? learning.createdAt)}
+            {@const learningTags = visibleTags(learning.tags)}
             <div class="kp-card" class:expanded={isExpanded}>
               <div class="kp-card-header" role="button" tabindex="0" onclick={() => toggleLearning(learning)} onkeydown={(e) => e.key === 'Enter' && toggleLearning(learning)}>
                 <span class="kp-card-indicator learning"></span>
                 <div class="kp-card-main">
-                  <span class="kp-card-title">{learning.content.length > 80 ? learning.content.slice(0, 80) + '...' : learning.content}</span>
-                  {#if !isExpanded && learning.context}
-                    <p class="kp-card-preview">{learning.context}</p>
+                  <span class="kp-card-title">{formatLearningTitle(learning.content)}</span>
+                  {#if !isExpanded && learningSource}
+                    <p class="kp-card-preview">{learningSource}</p>
                   {/if}
                 </div>
                 <div class="kp-card-meta">
@@ -925,8 +1027,8 @@
                   <button class="kp-card-delete" title={i18n.t('knowledge.learning.deleteTitle')} onclick={(e) => deleteLearning(learning.id, e)}>
                     <Icon name="trash" size={12} />
                   </button>
-                  {#if learning.createdAt}
-                    <span class="kp-category-badge">{new Date(learning.createdAt).toLocaleDateString()}</span>
+                  {#if learningDate}
+                    <span class="kp-category-badge">{learningDate}</span>
                   {/if}
                   <Icon name={isExpanded ? 'chevron-up' : 'chevron-down'} size={12} />
                 </div>
@@ -936,15 +1038,15 @@
                   <div class="kp-detail-block">
                     <p>{learning.content}</p>
                   </div>
-                  {#if learning.context}
+                  {#if learningSource}
                     <div class="kp-detail-block">
-                      <h5>{i18n.t('knowledge.learning.context')}</h5>
-                      <p>{learning.context}</p>
+                      <h5>{i18n.t('knowledge.source.label')}</h5>
+                      <p>{learningSource}</p>
                     </div>
                   {/if}
-                  {#if learning.tags && learning.tags.length > 0}
+                  {#if learningTags.length > 0}
                     <div class="kp-tag-list">
-                      {#each learning.tags as tag}
+                      {#each learningTags as tag}
                         <span class="kp-tag">{tag}</span>
                       {/each}
                     </div>
@@ -1441,6 +1543,7 @@
   }
 
   .kp-preview-dot.default { background: var(--foreground-muted); opacity: 0.4; }
+  .kp-preview-dot.learning { background: var(--warning); opacity: 0.75; }
 
   .kp-preview-text {
     flex: 1;
@@ -1449,6 +1552,13 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  .kp-preview-date {
+    flex: 0 0 auto;
+    color: var(--foreground-muted);
+    font-size: var(--text-2xs);
+    font-variant-numeric: tabular-nums;
   }
 
   /* ---- 列表 ---- */

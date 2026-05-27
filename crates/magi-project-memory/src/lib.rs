@@ -196,6 +196,17 @@ impl ProjectMemoryStore {
     /// - 没有任何 entry → 返回 `None`。
     /// - 否则返回带前言的索引视图（包含 entries 的 stem + name + description）。
     pub fn render_for_prompt(&self) -> Result<Option<String>, ProjectMemoryError> {
+        self.render_for_prompt_with_write_hint(true)
+    }
+
+    pub fn render_for_prompt_read_only(&self) -> Result<Option<String>, ProjectMemoryError> {
+        self.render_for_prompt_with_write_hint(false)
+    }
+
+    fn render_for_prompt_with_write_hint(
+        &self,
+        include_write_hint: bool,
+    ) -> Result<Option<String>, ProjectMemoryError> {
         let entries = self.list_entries()?;
         if entries.is_empty() {
             return Ok(None);
@@ -211,7 +222,9 @@ impl ProjectMemoryStore {
                 description = entry.description,
             ));
         }
-        out.push_str("\n如需新增 / 修改 / 删除项目记忆，请调用 `memory_write` 工具（kind = user|feedback|project|reference）。");
+        if include_write_hint {
+            out.push_str("\n如需新增 / 修改 / 删除项目记忆，请调用 `memory_write` 工具（kind = user|feedback|project|reference）。");
+        }
         Ok(Some(out))
     }
 
@@ -810,6 +823,9 @@ mod tests {
         assert!(rendered.contains("[feedback] feedback_tests.md"));
         assert!(rendered.contains("测试策略"));
         assert!(rendered.contains("memory_write"));
+        let read_only = store.render_for_prompt_read_only().unwrap().unwrap();
+        assert!(read_only.contains("[feedback] feedback_tests.md"));
+        assert!(!read_only.contains("memory_write"));
     }
 
     #[test]
