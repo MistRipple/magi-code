@@ -133,7 +133,7 @@ async fn wait_for_task_projection_completed(
         let completed_tasks = projection["progress_summary"]["completed_tasks"]
             .as_u64()
             .unwrap_or(0);
-        // V2 dispatch：ExecutionChain 只挂一个 root task；coordinator 才会再 spawn 代理任务。
+        // Dispatch：ExecutionChain 只挂一个 root task；coordinator 才会再 spawn 代理任务。
         if total_tasks >= 1
             && completed_tasks == total_tasks
             && projection["root_task"]["status"] == "completed"
@@ -181,7 +181,7 @@ fn assert_completed_two_task_projection(projection: &Value) {
     let completed_tasks = projection["progress_summary"]["completed_tasks"]
         .as_u64()
         .expect("completed_tasks should serialize as integer");
-    // V2 ExecutionChain：单 worker 任务只产出 1 个 root task；coordinator 才会扩展为多任务。
+    // ExecutionChain：单 worker 任务只产出 1 个 root task；coordinator 才会扩展为多任务。
     assert!(
         total_tasks >= 1,
         "task projection should include the root task"

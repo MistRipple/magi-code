@@ -1,8 +1,8 @@
-//! Task System v2 — 执行链"继续会话"恢复路径。
+//! 任务系统 — 执行链"继续会话"恢复路径。
 //!
 //! 本文件承担数据载体（[`SessionContinueAccepted`]）+ 纯/弱状态判定 + recovery
 //! 校验 / 校对 / 应用 / writeback 落盘 / branch checkpoint 同步 / 子树解封等
-//! "继续会话"的 v2 实现细节。错误类型统一为 `String`，函数签名走显式 stores。
+//! "继续会话"实现细节。错误类型统一为 `String`，函数签名走显式 stores。
 
 use magi_core::{
     ExecutionOwnership, RecoveryResumeInput, SessionId, TaskStatus, TerminationReason, UtcMillis,

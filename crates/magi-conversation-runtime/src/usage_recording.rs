@@ -1,6 +1,6 @@
-//! Task System v2 — usage recording helpers。
+//! 任务系统 — usage recording helpers。
 //!
-//! 复用 v2 内部的 `model_config::NormalizedModelConfig` 与
+//! 复用内部的 `model_config::NormalizedModelConfig` 与
 //! `settings_store::SettingsStore`。
 
 use crate::{

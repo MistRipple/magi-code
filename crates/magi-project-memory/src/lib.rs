@@ -1,11 +1,11 @@
-//! Task System v2 — L14 ProjectMemory：跨 session、跨 conversation 的项目记忆。
+//! 任务系统 — L14 ProjectMemory：跨 session、跨 conversation 的项目记忆。
 //!
 //! 参考 claude-code 的 memory 系统：
 //! - 4 类 memory：user / feedback / project / reference。
 //! - 物理存储在 `~/.magi/projects/{slug}/memory/`。
 //! - `MEMORY.md` 是索引（一行一条 pointer），多条 typed 文件存正文。
 //! - 每次 Conversation 启动自动加载 `MEMORY.md` 索引并注入 system prompt。
-//! - 提供 auto-save 接口（`save_entry` / `delete_entry`），调用方（v2 `memory_write` 工具）
+//! - 提供 auto-save 接口（`save_entry` / `delete_entry`），调用方（`memory_write` 工具）
 //!   把读写权交给 LLM，自行决定何时持久化记忆。
 //!
 //! Slug 派生策略：与 claude-code 一致——取 workspace 绝对路径，把 `/` 替换为 `-`，
@@ -99,8 +99,7 @@ pub enum ProjectMemoryError {
 
 /// 单一项目的 memory 仓库，绑定 `~/.magi/projects/{slug}/memory/` 物理目录。
 /// 读写操作直落文件系统：单 process 内通过 `ProjectMemoryRegistry` 共享同一实例
-/// （`RwLock` 包裹），跨 process 时假定调用方不会同时写同一份文件——目前 v2
-/// 还没有 multi-process 写入需求。
+/// （`RwLock` 包裹），跨 process 时假定调用方不会同时写同一份文件。
 pub struct ProjectMemoryStore {
     root: PathBuf,
     lock: RwLock<()>,

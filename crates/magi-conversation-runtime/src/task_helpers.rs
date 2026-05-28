@@ -1,4 +1,4 @@
-//! Task System v2 - Task helper functions (visibility / validation / required-tool-chain)
+//! 任务系统 - Task helper functions (visibility / validation / required-tool-chain)
 //!
 //! conversation-runtime 统一承载 task 可见性、验证判定与 required-tool-chain 纯函数。
 //! 本模块严格遵守"无写回依赖"原则——任何需要 session writeback

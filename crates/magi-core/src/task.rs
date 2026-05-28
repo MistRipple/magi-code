@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::ids::{MissionId, TaskId};
 use crate::value_objects::UtcMillis;
 
-/// Task System v2 L11：任务运行变体。
+/// 任务系统 L11：任务运行变体。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskKind {
@@ -15,7 +15,7 @@ pub enum TaskKind {
     Dream,
 }
 
-/// Task System v2 L11：任务生命周期，固定为 5 态。
+/// 任务系统 L11：任务生命周期，固定为 5 态。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
@@ -26,7 +26,7 @@ pub enum TaskStatus {
     Killed,
 }
 
-/// Task System v2：任务复杂度分层。
+/// 任务系统：任务复杂度分层。
 ///
 /// 简单任务不进入 Task，因此这里仅表达进入任务系统后的两类路径：
 /// - `ExecutionChain`：中等任务，启用任务链与可选 coordinator；
@@ -65,7 +65,7 @@ pub struct TaskPolicy {
     pub escalation_conditions: Vec<String>,
 }
 
-/// Task System v2 L11：变体负载。
+/// 任务系统 L11：变体负载。
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TaskRuntimePayload {
@@ -90,8 +90,8 @@ pub struct Task {
     pub dependency_ids: Vec<TaskId>,
     pub required_children: Vec<TaskId>,
     pub policy_snapshot: Option<TaskPolicy>,
-    /// Executor routing metadata stored as JSON to keep v2 runtime-specific
-    /// binding shapes out of magi-core.
+    /// Executor routing metadata stored as JSON to keep runtime-specific binding shapes
+    /// out of magi-core.
     pub executor_binding: Option<serde_json::Value>,
     pub knowledge_refs: Vec<String>,
     pub workspace_scope: Option<String>,
@@ -100,7 +100,7 @@ pub struct Task {
     pub output_refs: Vec<String>,
     pub evidence_refs: Vec<String>,
     pub retry_count: u32,
-    /// Task System v2 — L11：运行变体的专用负载。
+    /// 任务系统 — L11：运行变体的专用负载。
     #[serde(default)]
     pub runtime_payload: TaskRuntimePayload,
     pub created_at: UtcMillis,

@@ -1,4 +1,4 @@
-//! Task System v2 — model config helpers。
+//! 任务系统 — model config helpers。
 //!
 //! 错误返回值使用 `Result<_, String>`，由上层调用方桥接到自己的错误类型。
 //!

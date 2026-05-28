@@ -1,4 +1,4 @@
-//! Task System v2 — conversation dispatcher runtime.
+//! 任务系统 — conversation dispatcher runtime.
 //!
 //! Owns the production task dispatch implementation for session turns and conversation loops.
 
@@ -163,46 +163,46 @@ pub struct LlmTaskDispatcher {
     tool_registry: Option<ToolRegistry>,
     skill_runtime: Option<Arc<magi_skill_runtime::SkillRuntime>>,
     snapshot_manager: Option<Arc<magi_snapshot::SnapshotManager>>,
-    /// Task System v2：Conversation 注册中心，承载 Turn 状态机与单 Conversation 不并发不变式。
+    /// 任务系统：Conversation 注册中心，承载 Turn 状态机与单 Conversation 不并发不变式。
     conversation_registry: Option<Arc<ConversationRegistry>>,
-    /// Task System v2：AgentRole 注册表（来自 ApiState，注入到 conversation_loop）。
+    /// 任务系统：AgentRole 注册表（来自 ApiState，注入到 conversation_loop）。
     agent_role_registry: Option<Arc<magi_agent_role::AgentRoleRegistry>>,
-    /// Task System v2 — L5：父子任务拓扑图。S7 协调器工具 agent_spawn
+    /// 任务系统 — L5：父子任务拓扑图。S7 协调器工具 agent_spawn
     /// 需要在 conversation_loop 中读写。设计为构造期必填，避免运行期再做空检查。
     spawn_graph: Arc<std::sync::Mutex<magi_spawn_graph::SpawnGraph>>,
-    /// Task System v2 — L13：session 维度的 TodoLedger 索引。S9 中模型通过
+    /// 任务系统 — L13：session 维度的 TodoLedger 索引。S9 中模型通过
     /// `todo_write` 工具往这里写分解 + 进度；下一轮 Turn 起始时把快照注入 system prompt。
     todo_ledger_registry: Arc<magi_todo_ledger::TodoLedgerRegistry>,
-    /// Task System v2 — L14：workspace 维度的 ProjectMemory 索引。S10 中模型通过
+    /// 任务系统 — L14：workspace 维度的 ProjectMemory 索引。S10 中模型通过
     /// `memory_write` 工具新增/删除项目记忆条目；每次 Turn 起始把 MEMORY.md 视图注入
     /// system prompt，跨 conversation 复用。
     project_memory_registry: Arc<magi_project_memory::ProjectMemoryRegistry>,
-    /// Task System v2 — Tier 4 / L15：workspace 维度的 MissionCharter 索引。S11 中模型
+    /// 任务系统 — Tier 4 / L15：workspace 维度的 MissionCharter 索引。S11 中模型
     /// 通过 `mission_charter_write` 工具增量更新 mission 宪章；每次 Turn 起始把当前
     /// mission 的 charter 注入 system prompt，跨 conversation 锚定目标契约。
     mission_charter_registry: Arc<magi_mission_charter::MissionCharterRegistry>,
-    /// Task System v2 — Tier 4 / L16：workspace 维度的 Plan 索引。S12 中模型通过
+    /// 任务系统 — Tier 4 / L16：workspace 维度的 Plan 索引。S12 中模型通过
     /// `plan_write` 工具整体替换 mission.plan.steps；每次 Turn 起始把当前 plan
     /// 注入 system prompt，长链路推进时保留计划上下文。
     plan_registry: Arc<magi_plan::PlanRegistry>,
-    /// Task System v2 — Tier 4 / L17：workspace 维度的 MissionWorkspace 索引。S13
+    /// 任务系统 — Tier 4 / L17：workspace 维度的 MissionWorkspace 索引。S13
     /// 中每个 Mission 拥有独占的 artifacts/logs/memory 目录骨架；Turn 起始时把目录
     /// 路径注入 system prompt，让 agent 把产物落在 mission 内而不是无主目录。
     mission_workspace_registry: Arc<magi_mission_workspace::MissionWorkspaceRegistry>,
-    /// Task System v2 — Tier 4 / L18：workspace 维度的 KnowledgeGraph 索引。S14
+    /// 任务系统 — Tier 4 / L18：workspace 维度的 KnowledgeGraph 索引。S14
     /// 中每个 Mission 累积"已知事实"（symbols / decisions / risks）；Turn 起始时把
     /// live facts 注入 system prompt，避免长 mission 中模型重新讨论已经达成的结论。
     knowledge_graph_registry: Arc<magi_knowledge_graph::KnowledgeGraphRegistry>,
-    /// Task System v2 — Tier 4 / L19：workspace 维度的 ValidationRunner 索引。S15
+    /// 任务系统 — Tier 4 / L19：workspace 维度的 ValidationRunner 索引。S15
     /// 中每个 Mission 在 Plan 节点上挂载验证记录（test_suite / type_check /
     /// integration_smoke / benchmark）；Coordinator 判定 Plan 节点完成的硬门槛
     /// 是：至少 1 条 Pass，且当前无 Fail。
     validation_runner_registry: Arc<magi_validation_runner::ValidationRunnerRegistry>,
-    /// Task System v2 — Tier 4 / L20：workspace 维度的 Checkpoint 索引。S16 中每个
+    /// 任务系统 — Tier 4 / L20：workspace 维度的 Checkpoint 索引。S16 中每个
     /// Mission 维护一份 append-only 的检查点日志（process_restart / context_compaction
     /// / phase_transition / manual），让事后能定位到“恢复到 Tn”所需要的最小语义快照。
     checkpoint_registry: Arc<magi_checkpoint::CheckpointRegistry>,
-    /// Task System v2 — Tier 4 / L21：workspace 维度的 HumanCheckpoint 索引。S17 中
+    /// 任务系统 — Tier 4 / L21：workspace 维度的 HumanCheckpoint 索引。S17 中
     /// orchestrator 通过 human_checkpoint_request 申请人工审核点；pending 存在时
     /// runtime 会拒绝 agent_spawn 并暂停新的 leaf dispatch。
     human_checkpoint_registry: Arc<magi_human_checkpoint::HumanCheckpointRegistry>,
@@ -1354,9 +1354,10 @@ impl LlmTaskDispatcher {
             None
         };
 
-        let conversation_registry = self.conversation_registry.as_ref().expect(
-            "LlmTaskDispatcher 缺少 ConversationRegistry，无法走 Task System v2 Turn 状态机",
-        );
+        let conversation_registry = self
+            .conversation_registry
+            .as_ref()
+            .expect("LlmTaskDispatcher 缺少 ConversationRegistry，无法走 任务系统 Turn 状态机");
         let agent_role_registry = self
             .agent_role_registry
             .as_ref()

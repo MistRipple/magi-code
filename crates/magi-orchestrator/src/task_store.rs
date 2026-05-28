@@ -499,7 +499,7 @@ impl TaskStore {
             })
             .collect();
 
-        // v2 runnable：pending 且所有依赖已完成。父子编排约束由 SpawnGraph/Coordinator
+        // runnable：pending 且所有依赖已完成。父子编排约束由 SpawnGraph/Coordinator
         // 管理，TaskStore 只维护最小执行事实。
         leaves
             .into_iter()
@@ -1230,7 +1230,7 @@ impl Default for TaskStore {
     }
 }
 
-/// Task System v2 L11 五态迁移表。
+/// 任务系统 L11 五态迁移表。
 pub fn is_valid_transition(from: TaskStatus, to: TaskStatus) -> bool {
     use TaskStatus::*;
     if from == to {

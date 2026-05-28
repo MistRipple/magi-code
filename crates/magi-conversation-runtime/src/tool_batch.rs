@@ -1,4 +1,4 @@
-//! Task System v2 — tool batch / coordinator / single 工具执行入口。
+//! 任务系统 — tool batch / coordinator / single 工具执行入口。
 //!
 //! - `execute_task_tool_call_batch`：按 concurrency 分组并发或串行调度本轮工具。
 //! - `execute_task_tool_call`：单工具入口，按 BuiltinToolName 走 coordinator/写工具/policy/
@@ -585,7 +585,7 @@ fn execute_coordinator_tool(
                         serde_json::json!({
                             "tool": tool.as_str(),
                             "status": "failed",
-                            "error": format!("agent_spawn 注册 v2 子执行失败: {error}"),
+                            "error": format!("agent_spawn 注册子执行失败: {error}"),
                         })
                         .to_string(),
                         ExecutionResultStatus::Failed,

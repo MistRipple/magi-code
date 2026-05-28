@@ -1,4 +1,4 @@
-//! Task System v2 §1.4 读端：Mission 聚合恢复入口。
+//! 任务系统 §1.4 读端：Mission 聚合恢复入口。
 //!
 //! 写端契约由 `magi-checkpoint` 落地：`Checkpoint::recovery_set_status` 和
 //! `append_checkpoint` 拒绝缺料写入；但读端长期是孤儿——`CheckpointLog::latest`

@@ -14,6 +14,9 @@ use crate::{
     state::ApiState,
 };
 
+const DEFAULT_SESSION_TASK_HISTORY_LIMIT: usize = 12;
+const MAX_SESSION_TASK_HISTORY_LIMIT: usize = 50;
+
 pub fn routes() -> Router<ApiState> {
     Router::new()
         .route("/tasks/session-history", get(get_session_task_history))
@@ -37,6 +40,7 @@ fn require_task_store(
 #[serde(rename_all = "camelCase")]
 struct SessionScopedTaskQuery {
     session_id: Option<String>,
+    limit: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -298,6 +302,11 @@ async fn get_session_task_history(
                 .cmp(left.root_task.task_id.as_str())
         })
     });
+    let limit = query
+        .limit
+        .unwrap_or(DEFAULT_SESSION_TASK_HISTORY_LIMIT)
+        .clamp(1, MAX_SESSION_TASK_HISTORY_LIMIT);
+    items.truncate(limit);
 
     Ok(Json(SessionTaskHistoryResponse {
         session_id: session_id.to_string(),

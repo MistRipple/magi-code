@@ -60,48 +60,48 @@ pub struct ConversationLoopRequest<'a> {
     pub skill_runtime: Option<&'a magi_skill_runtime::SkillRuntime>,
     pub task_store: &'a TaskStore,
     pub execution_registry: &'a TaskExecutionRegistry,
-    /// Task System v2：Turn 状态机驱动。每次 LLM 调用都通过 advance_turn 驱动，
+    /// 任务系统：Turn 状态机驱动。每次 LLM 调用都通过 advance_turn 驱动，
     /// 显式经过 Pending → Modeling → Done/Failed 不变式（同一 Conversation 不并发）。
     pub conversation_registry: &'a ConversationRegistry,
-    /// Task System v2 — AgentRole 注册表。task_turn_visibility 解析 role_id 时
+    /// 任务系统 — AgentRole 注册表。task_turn_visibility 解析 role_id 时
     /// 必须走该注册表，不再依赖硬编码的 kind→role 默认 mapping。
     pub agent_role_registry: &'a magi_agent_role::AgentRoleRegistry,
-    /// Task System v2 — L5：父子任务拓扑图。S7 协调工具（agent_spawn）
+    /// 任务系统 — L5：父子任务拓扑图。S7 协调工具（agent_spawn）
     /// 在 execute_task_tool_call 中拦截时操作此结构。
     pub spawn_graph: &'a std::sync::Mutex<magi_spawn_graph::SpawnGraph>,
-    /// Task System v2 — L12：本次轮次的 SafetyGate 快照。`None` 表示当前没有
+    /// 任务系统 — L12：本次轮次的 SafetyGate 快照。`None` 表示当前没有
     /// 启用任何危险模式规则（既无内置也无用户自定义），此时拦截器走 pass-through。
     /// 在 execute_task_tool_call 中工具调用执行前做语义判定。
     pub safety_gate: Option<&'a magi_safety_gate::SafetyGate>,
-    /// Task System v2 — L13：当前 session 的 TodoLedger。模型通过 `todo_write`
+    /// 任务系统 — L13：当前 session 的 TodoLedger。模型通过 `todo_write`
     /// 工具往里写分解 + 进度；本 Turn 起始时把快照渲染成 system prompt 注入。
     pub todo_ledger: &'a magi_todo_ledger::TodoLedger,
-    /// Task System v2 — L14：当前 workspace 的 ProjectMemory。`None` 表示当前 task
+    /// 任务系统 — L14：当前 workspace 的 ProjectMemory。`None` 表示当前 task
     /// 不绑定 workspace（极少数 orchestration-only 场景），此时不注入 prompt、
     /// 也不允许 `memory_write` 工具调用成功。
     pub project_memory: Option<&'a magi_project_memory::ProjectMemoryStore>,
-    /// Task System v2 — Tier 4 / L15：当前 workspace 的 MissionCharter 索引。`None` 表示
+    /// 任务系统 — Tier 4 / L15：当前 workspace 的 MissionCharter 索引。`None` 表示
     /// 当前 task 不绑定 workspace（极少数 orchestration-only 场景），此时不注入 prompt、
     /// 也不允许 `mission_charter_write` 工具调用成功。
     pub mission_charter: Option<&'a magi_mission_charter::MissionCharterStore>,
-    /// Task System v2 — Tier 4 / L16：当前 workspace 的 Plan 索引。`None` 表示当前 task
+    /// 任务系统 — Tier 4 / L16：当前 workspace 的 Plan 索引。`None` 表示当前 task
     /// 不绑定 workspace；此时不注入 prompt，也不允许 `plan_write` 工具调用成功。
     pub plan: Option<&'a magi_plan::PlanStore>,
-    /// Task System v2 — Tier 4 / L17：当前 workspace 的 MissionWorkspace 索引。`None`
+    /// 任务系统 — Tier 4 / L17：当前 workspace 的 MissionWorkspace 索引。`None`
     /// 表示当前 task 不绑定 workspace；此时不注入工作目录视图。
     pub mission_workspace: Option<&'a magi_mission_workspace::MissionWorkspaceStore>,
-    /// Task System v2 — Tier 4 / L18：当前 workspace 的 KnowledgeGraph 索引。`None`
+    /// 任务系统 — Tier 4 / L18：当前 workspace 的 KnowledgeGraph 索引。`None`
     /// 表示当前 task 不绑定 workspace；此时不注入 KG 视图，也不允许 `kg_write` 工具落盘。
     pub knowledge_graph: Option<&'a magi_knowledge_graph::KnowledgeGraphStore>,
-    /// Task System v2 — Tier 4 / L19：当前 workspace 的 ValidationRunner 索引。`None`
+    /// 任务系统 — Tier 4 / L19：当前 workspace 的 ValidationRunner 索引。`None`
     /// 表示当前 task 不绑定 workspace；此时不注入验证摘要，也不允许 `validation_record`
     /// 工具落盘。Coordinator 凭这里的 Pass/Fail 判定 Plan 节点是否真完成。
     pub validation_runner: Option<&'a magi_validation_runner::ValidationStore>,
-    /// Task System v2 — Tier 4 / L20：当前 workspace 的 Checkpoint 索引。`None`
+    /// 任务系统 — Tier 4 / L20：当前 workspace 的 Checkpoint 索引。`None`
     /// 表示当前 task 不绑定 workspace；此时不注入最近检查点列表，也不允许
     /// `checkpoint_create` 工具落盘。append-only 语义，仅追加不修改。
     pub checkpoint: Option<&'a magi_checkpoint::CheckpointStore>,
-    /// Task System v2 — Tier 4 / L21：当前 workspace 的 HumanCheckpoint 索引。`None`
+    /// 任务系统 — Tier 4 / L21：当前 workspace 的 HumanCheckpoint 索引。`None`
     /// 表示当前 task 不绑定 workspace 或长任务 store 打开失败；此时不注入人工审核点摘要，
     /// 也不允许 `human_checkpoint_request` 工具落盘。长任务缺少 store 时，agent_spawn
     /// 会在工具层失败，避免绕过 pending 检查。
@@ -133,7 +133,7 @@ pub struct ConversationLoopRequest<'a> {
     pub context_summary: Option<ExecutionContextSummary>,
     pub system_prompt: Option<String>,
     pub workspace_root_path: Option<PathBuf>,
-    /// 当前 session 的文件变更账本。Task System v2 的主线/代理工具写入都必须通过
+    /// 当前 session 的文件变更账本。任务系统 的主线/代理工具写入都必须通过
     /// 同一个 SnapshotSession 记录，才能把文件变更归因到主线或具体代理 worker。
     pub snapshot_session: Option<Arc<magi_snapshot::SnapshotSession>>,
     pub execution_group_id: Option<String>,
@@ -445,7 +445,7 @@ fn compact_and_replace_thread_history(
 pub fn run_conversation_loop(
     request: ConversationLoopRequest<'_>,
 ) -> (TaskOutcome, Option<ExecutionContextSummary>) {
-    // Task System v2 切入：经由 ConversationRegistry 拿到本 session 的 Conversation，
+    // 任务系统 切入：经由 ConversationRegistry 拿到本 session 的 Conversation，
     // 用 advance_turn 驱动 Turn 状态机；模型 IO + 工具 IO 段折叠到 driver 内部一次性执行。
     let registry = request.conversation_registry;
     let conv_handle = registry.conversation_for_task(request.session_id, request.task_id);
@@ -467,7 +467,7 @@ pub fn run_conversation_loop(
     }
 }
 
-/// Task System v2 — 把一次完整的 LLM IO + 工具 IO 段封装成 TurnDriver round。
+/// 任务系统 — 把一次完整的 LLM IO + 工具 IO 段封装成 TurnDriver round。
 ///
 /// 当前 driver 的 round_limit = 1：内部仍保留多轮工具调用 for 循环（围绕
 /// `messages` 累积器）。Conversation::advance_turn 提供外层 Turn 状态机，本 driver
@@ -2864,7 +2864,7 @@ mod tests {
     #[test]
     fn local_agent_infers_file_write_and_read_from_concrete_file_goal() {
         let mut task = make_task_loop_test_task("task-required-tool-chain-natural-language");
-        task.goal = "请在当前工作区创建文件 v2-task-system-e2e.md，文件内容必须包含 marker: V2_TASK_E2E。创建后读取该文件验证内容。"
+        task.goal = "请在当前工作区创建文件 task-system-e2e.md，文件内容必须包含 marker: TASK_E2E。创建后读取该文件验证内容。"
             .to_string();
         task.policy_snapshot = Some(magi_core::TaskPolicy {
             autonomy_level: "Autonomous".to_string(),
@@ -2924,7 +2924,7 @@ mod tests {
     #[test]
     fn content_requirement_validation_rejects_marker_typos() {
         let mut task = make_task_loop_test_task("task-content-requirement");
-        task.goal = "请创建文件 demo.md，文件内容必须包含三行：title: v2 task concrete progress、marker: V2_TASK_E2E_123、status: completed。创建后读取该文件验证内容。"
+        task.goal = "请创建文件 demo.md，文件内容必须包含三行：title: task concrete progress、marker: TASK_E2E_123、status: completed。创建后读取该文件验证内容。"
             .to_string();
         let bad_write = ChatToolCall {
             id: "call-bad-write".to_string(),
@@ -2933,7 +2933,7 @@ mod tests {
                 name: "file_write".to_string(),
                 arguments: serde_json::json!({
                     "path": "/tmp/demo.md",
-                    "content": "title: v2 task concrete progress\nmarker: V2_TASK_EE_123\nstatus: completed\n"
+                    "content": "title: task concrete progress\nmarker: TASK_EE_123\nstatus: completed\n"
                 })
                 .to_string(),
             },
@@ -2945,7 +2945,7 @@ mod tests {
                 name: "file_write".to_string(),
                 arguments: serde_json::json!({
                     "path": "/tmp/demo.md",
-                    "content": "title: v2 task concrete progress\nmarker: V2_TASK_E2E_123\nstatus: completed\n"
+                    "content": "title: task concrete progress\nmarker: TASK_E2E_123\nstatus: completed\n"
                 })
                 .to_string(),
             },
@@ -2954,14 +2954,14 @@ mod tests {
         assert_eq!(
             task_required_content_literals(&task),
             vec![
-                "title: v2 task concrete progress".to_string(),
-                "marker: V2_TASK_E2E_123".to_string(),
+                "title: task concrete progress".to_string(),
+                "marker: TASK_E2E_123".to_string(),
                 "status: completed".to_string()
             ]
         );
         assert!(
             validate_task_content_requirements(&task, "file_write", &bad_write, "{}")
-                .is_some_and(|failure| failure.contains("marker: V2_TASK_E2E_123"))
+                .is_some_and(|failure| failure.contains("marker: TASK_E2E_123"))
         );
         assert!(
             validate_task_content_requirements(&task, "file_write", &good_write, "{}").is_none()

@@ -228,7 +228,7 @@ async fn interrupt_task(
     })))
 }
 
-/// 重新执行当前 root 任务：创建新的 v2 执行链，旧任务树只保留为历史事实。
+/// 重新执行当前 root 任务：创建新的执行链，旧任务树只保留为历史事实。
 async fn restart_task(
     State(state): State<ApiState>,
     Json(request): Json<TaskIdRequest>,

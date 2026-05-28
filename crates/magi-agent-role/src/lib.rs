@@ -1,4 +1,4 @@
-//! Task System v2 — AgentRole（角色定义 + 注册表 + 文件加载）。
+//! 任务系统 — AgentRole（角色定义 + 注册表 + 文件加载）。
 //!
 //! role 定义以 markdown 文件承载，每个文件等价于一个 role：
 //! - 头部用 `---` 包围的 YAML 风格 front-matter，承载 `id` / `supported_kinds` /

@@ -549,9 +549,15 @@ export class RustDaemonClient {
     );
   }
 
-  public async getSessionTaskHistory(sessionId: string): Promise<SessionTaskHistoryResponseDto> {
+  public async getSessionTaskHistory(
+    sessionId: string,
+    limit?: number,
+  ): Promise<SessionTaskHistoryResponseDto> {
     const query = new URLSearchParams();
     query.set('sessionId', sessionId);
+    if (limit !== undefined) {
+      query.set('limit', String(limit));
+    }
     return this.getJson<SessionTaskHistoryResponseDto>(
       `/api/tasks/session-history?${query.toString()}`,
     );

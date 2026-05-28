@@ -52,54 +52,54 @@ pub enum BuiltinToolName {
     DiagramRender,
     // ── 知识库 ──
     KnowledgeQuery,
-    // ── 协调器（Task System v2 L10，仅 coordinator_mode 角色可见）──
+    // ── 协调器（任务系统 L10，仅 coordinator_mode 角色可见）──
     /// 派发新的代理执行子任务。该工具只创建代理并投递初始任务消息；
     /// 后续由 agent_wait 收集代理终态结果。
     AgentSpawn,
     /// 等待一个或多个已派发代理进入终态，并把代理最终答复返回给主线。
     AgentWait,
-    // ── In-session 思维锚点（Task System v2 L13）──
+    // ── In-session 思维锚点（任务系统 L13）──
     /// 写入本 session 的 TodoLedger。整体替换列表语义（参考 claude-code 的 TodoWrite）。
     /// 由 orchestration 层拦截，不进入 ToolRegistry。
     TodoWrite,
-    // ── 跨 session 项目记忆（Task System v2 L14）──
+    // ── 跨 session 项目记忆（任务系统 L14）──
     /// 写入或删除当前 workspace 的 ProjectMemory entry。物理存储在
     /// `~/.magi/projects/{slug}/memory/`，跨 conversation 自动加载到 system prompt。
     /// 由 orchestration 层拦截，不进入 ToolRegistry。
     MemoryWrite,
-    // ── Mission 宪章（Task System v2 Tier 4 / L15）──
+    // ── Mission 宪章（任务系统 Tier 4 / L15）──
     /// 增量写入当前 mission 的 charter（title / goal / success_criteria /
     /// constraints / stakeholders）。物理存储在
     /// `~/.magi/projects/{slug}/missions/{mission_id}/charter.md`。
     /// 由 orchestration 层拦截，不进入 ToolRegistry。
     MissionCharterWrite,
-    // ── Mission 执行计划（Task System v2 Tier 4 / L16）──
+    // ── Mission 执行计划（任务系统 Tier 4 / L16）──
     /// 整体替换当前 mission 的 plan.steps（id / content / status / depends_on / notes）。
     /// 物理存储在 `~/.magi/projects/{slug}/missions/{mission_id}/plan.md`，
     /// 每次 Turn 起始把当前 plan 自动注入 orchestrator system prompt。
     /// 由 orchestration 层拦截，不进入 ToolRegistry。
     PlanWrite,
-    // ── Mission KnowledgeGraph（Task System v2 Tier 4 / L18）──
+    // ── Mission KnowledgeGraph（任务系统 Tier 4 / L18）──
     /// 按 (kind, id) upsert 当前 mission 的 KnowledgeGraph 事实（symbol / decision / risk）。
     /// 物理存储在 `~/.magi/projects/{slug}/missions/{mission_id}/knowledge.md`，
     /// 每次 Turn 起始把当前 KG 自动注入 orchestrator system prompt。
     /// 由 orchestration 层拦截，不进入 ToolRegistry。
     KgWrite,
-    // ── Mission ValidationRunner（Task System v2 Tier 4 / L19）──
+    // ── Mission ValidationRunner（任务系统 Tier 4 / L19）──
     /// 把单条验证结果（test_suite / type_check / integration_smoke / benchmark）按
     /// (plan_step_id, kind) upsert 进当前 mission 的 ValidationReport。
     /// 物理存储在 `~/.magi/projects/{slug}/missions/{mission_id}/validation.md`，
     /// 每次 Turn 起始把当前 Validation 现状自动注入 orchestrator system prompt。
     /// 由 orchestration 层拦截，不进入 ToolRegistry。
     ValidationRecord,
-    // ── Mission Checkpoint（Task System v2 Tier 4 / L20）──
+    // ── Mission Checkpoint（任务系统 Tier 4 / L20）──
     /// Append-only 写入一条 mission 级检查点（process_restart / context_compaction /
     /// phase_transition / manual），用于事后恢复 mission 状态。
     /// 物理存储在 `~/.magi/projects/{slug}/missions/{mission_id}/checkpoints.md`，
     /// 每次 Turn 起始把最新若干检查点自动注入 orchestrator system prompt。
     /// 由 orchestration 层拦截，不进入 ToolRegistry。
     Checkpoint,
-    // ── Mission HumanCheckpoint（Task System v2 Tier 4 / L21）──
+    // ── Mission HumanCheckpoint（任务系统 Tier 4 / L21）──
     /// 由 orchestrator 申请的人工审核点，在 operator 给出 approve / reject 之前
     /// mission 会进入 awaiting_human 状态。
     /// 物理存储在 `~/.magi/projects/{slug}/missions/{mission_id}/human_checkpoints.md`，

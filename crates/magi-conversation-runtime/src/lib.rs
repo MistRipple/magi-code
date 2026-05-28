@@ -1,4 +1,4 @@
-//! Task System v2 - Conversation Runtime
+//! 任务系统 - Conversation Runtime
 //!
 //! 提供 Mailbox 作为 user 信号进入任务系统的单一通道，
 //! Conversation 绑定 SessionId、Mailbox 与当前 Turn 槽位，
@@ -27,8 +27,8 @@ mod skill_apply_tool;
 pub mod task_execution_dispatcher;
 pub mod task_execution_registry;
 pub mod task_helpers;
+pub mod task_runner;
 pub mod task_runner_bridge;
-pub mod task_runner_v2;
 pub mod tool_batch;
 mod tool_declared_paths;
 pub mod tool_result_utils;

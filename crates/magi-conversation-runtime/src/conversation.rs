@@ -12,7 +12,7 @@ use crate::turn::{Turn, TurnState, TurnTransitionError};
 pub struct Conversation {
     session_id: SessionId,
     mailbox: Mailbox,
-    /// 当前 Turn 槽位。终态后归 None。S2 范围内仅 v2 advance_turn 入口写。
+    /// 当前 Turn 槽位。终态后归 None。S2 范围内仅 advance_turn 入口写。
     current_turn: Option<Turn>,
 }
 

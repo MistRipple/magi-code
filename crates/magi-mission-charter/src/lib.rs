@@ -1,4 +1,4 @@
-//! Task System v2 — Tier 4 / L15 MissionCharter：mission 的"宪章"契约。
+//! 任务系统 — Tier 4 / L15 MissionCharter：mission 的"宪章"契约。
 //!
 //! 每个 Mission 在 `ensure_session_mission` 首次创建时同步落一份 charter，
 //! 把"为什么做、做到什么程度算完、有什么硬约束"沉淀为可读 markdown 文件，
@@ -782,7 +782,7 @@ fn dirs_home() -> Result<PathBuf, MissionCharterError> {
 /// `store: None` 表示当前 task 未绑定 workspace，直接失败。首次写入必须同时
 /// 提供 title + goal，否则拒绝（避免半成品契约落盘）。
 ///
-/// frozen 阶段规则（参见 docs/task-system-v2/03-open-questions.md §1.6）：
+/// frozen 阶段规则：
 /// - charter 已 frozen 且本次入参带有任意内容字段（title/goal/success_criteria/...）
 ///   时，必须同时提供 `approval_sequence`；该序号必须指向一条 status==Approved 且
 ///   严格大于 `charter.last_approval_sequence` 的 HumanCheckpoint。
@@ -1052,8 +1052,8 @@ mod tests {
         let store = MissionCharterStore::open_with_home(home.path(), &ws).expect("open");
         let charter = MissionCharter {
             mission_id: MissionId::new("mission-1"),
-            title: "迁移 Task System v2".to_string(),
-            goal: "收敛 Task System v2 4-Tier 21-Layer 完成态".to_string(),
+            title: "迁移 任务系统".to_string(),
+            goal: "收敛 任务系统 4-Tier 21-Layer 完成态".to_string(),
             success_criteria: vec!["S1-S18 全部完成".to_string(), "cargo test 通过".to_string()],
             constraints: vec!["不保留旧任务系统兼容路径".to_string()],
             stakeholders: vec!["用户（架构师）".to_string()],
@@ -1140,7 +1140,7 @@ mod tests {
         let mut charter = MissionCharter::new(
             MissionId::new("m"),
             "old".to_string(),
-            "实施 Task System v2 §1.4 验收闭环".to_string(),
+            "实施 任务系统 §1.4 验收闭环".to_string(),
             UtcMillis(100),
         );
         let args = MissionCharterWriteArgs {
@@ -1165,7 +1165,7 @@ mod tests {
         let mut charter = MissionCharter::new(
             MissionId::new("m"),
             "same".to_string(),
-            "实施 Task System v2 §1.4 验收闭环".to_string(),
+            "实施 任务系统 §1.4 验收闭环".to_string(),
             UtcMillis(100),
         );
         let args = MissionCharterWriteArgs {
@@ -1190,7 +1190,7 @@ mod tests {
         let mut charter = MissionCharter::new(
             MissionId::new("m"),
             "t".to_string(),
-            "实施 Task System v2 §1.4 验收闭环".to_string(),
+            "实施 任务系统 §1.4 验收闭环".to_string(),
             UtcMillis(0),
         );
         let args = MissionCharterWriteArgs {
@@ -1213,7 +1213,7 @@ mod tests {
         let mut charter = MissionCharter::new(
             MissionId::new("m"),
             "t".to_string(),
-            "实施 Task System v2 §1.4 验收闭环".to_string(),
+            "实施 任务系统 §1.4 验收闭环".to_string(),
             UtcMillis(0),
         );
         charter.state = CharterState::Frozen;
@@ -1238,7 +1238,7 @@ mod tests {
         let mut charter = MissionCharter::new(
             MissionId::new("m"),
             "t".to_string(),
-            "实施 Task System v2 §1.4 验收闭环".to_string(),
+            "实施 任务系统 §1.4 验收闭环".to_string(),
             UtcMillis(0),
         );
         charter.state = CharterState::Frozen;
@@ -1291,7 +1291,7 @@ mod tests {
         let mut charter = MissionCharter::new(
             MissionId::new("m"),
             "t".to_string(),
-            "实施 Task System v2 §1.4 验收闭环".to_string(),
+            "实施 任务系统 §1.4 验收闭环".to_string(),
             UtcMillis(0),
         );
         charter.state = CharterState::Frozen;
@@ -1462,7 +1462,7 @@ mod tests {
             Some(&workspace_id),
             &task_id,
             &mission_id,
-            r#"{"title":"T","goal":"实施 Task System v2 §1.4 验收闭环"}"#,
+            r#"{"title":"T","goal":"实施 任务系统 §1.4 验收闭环"}"#,
         );
         assert_eq!(
             status,
@@ -1600,7 +1600,7 @@ mod tests {
         MissionCharter::new(
             MissionId::new(mission_id),
             "title".to_string(),
-            "实施 Task System v2 §1.4 验收闭环".to_string(),
+            "实施 任务系统 §1.4 验收闭环".to_string(),
             UtcMillis(0),
         )
     }

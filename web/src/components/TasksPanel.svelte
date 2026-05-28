@@ -47,6 +47,9 @@
   import { resolveAgentBaseUrl } from '../web/agent-api';
   import { vscode } from '../lib/vscode-bridge';
 
+  const TASK_HISTORY_PREVIEW_LIMIT = 5;
+  const TASK_HISTORY_REQUEST_LIMIT = 20;
+
   const appState = getState();
   const enabledAgents = $derived(getEnabledAgents());
   const registrySnapshot = $derived(appState.settingsRegistrySnapshot);
@@ -91,6 +94,7 @@
     taskHistoryRequestScope = sid;
     taskHistoryItems = [];
     taskHistoryError = null;
+    taskHistoryExpanded = false;
     if (!sid) {
       taskHistoryLoading = false;
       return;
@@ -105,6 +109,7 @@
   let taskHistoryError = $state<string | null>(null);
   let taskHistoryRequestScope = $state('');
   let taskHistoryFetchGeneration = 0;
+  let taskHistoryExpanded = $state(false);
   let restartingHistoryRootTaskId = $state<string | null>(null);
   // 记录任务树节点展开状态。
   let expandedProjectionNodes = $state<Set<string>>(new Set());
@@ -209,7 +214,6 @@
   const taskTreeRows = $derived.by(() => (
     buildTaskTreeRows(taskProjection.projection?.root_task, childrenByParentId, expandedProjectionNodes)
   ));
-  const taskSummary = $derived.by(() => buildTaskSummary(taskProjection.projection));
   const canResumeTaskProjection = $derived.by(() => {
     const proj = taskProjection.projection;
     return proj?.runner_status === 'error'
@@ -247,6 +251,15 @@
     if (!activeRootTaskId) return taskHistoryItems;
     return taskHistoryItems.filter((item) => item.rootTask.task_id !== activeRootTaskId);
   });
+  const displayedTaskHistoryItems = $derived.by(() => (
+    taskHistoryExpanded
+      ? visibleTaskHistoryItems
+      : visibleTaskHistoryItems.slice(0, TASK_HISTORY_PREVIEW_LIMIT)
+  ));
+  const hiddenTaskHistoryCount = $derived(Math.max(
+    0,
+    visibleTaskHistoryItems.length - displayedTaskHistoryItems.length,
+  ));
   const hasVisibleTaskHistory = $derived(visibleTaskHistoryItems.length > 0);
   const attentionTasks = $derived.by(() => {
     const projection = taskProjection.projection;
@@ -268,16 +281,18 @@
     canResumeTaskProjection,
   ));
   const runnerBlockedReason = $derived(attentionSummary?.title ?? null);
-  // 用户面直接展示 v2 TaskPolymorphism 的所有任务变体。
+  // 用户面展示实际工作单元；root 只承担编排时不作为同级任务重复罗列。
   const userVisibleTasks = $derived.by(() => (
     activeProjectionTasks
       .filter((task) => isUserVisibleTaskKind(task.kind))
+      .filter((task) => !isCoordinationEnvelopeRoot(task, taskProjection.projection))
       .slice()
       .sort((left, right) => {
         if (left.created_at !== right.created_at) return left.created_at - right.created_at;
         return left.task_id.localeCompare(right.task_id);
       })
   ));
+  const taskSummary = $derived.by(() => buildTaskSummary(taskProjection.projection, userVisibleTasks));
 
   function getTaskExecutorDisplayName(task: TaskDto): string {
     const roleId = task.executor_binding?.target_role?.trim() ?? '';
@@ -393,6 +408,18 @@
     return rows;
   }
 
+  function isCoordinationEnvelopeRoot(
+    task: TaskDto,
+    projection: TaskProjectionDto | null,
+  ): boolean {
+    if (!projection || task.task_id !== projection.root_task.task_id) {
+      return false;
+    }
+    return (childrenByParentId.get(task.task_id) ?? [])
+      .filter((child) => child.status !== 'killed')
+      .some((child) => isUserVisibleTaskKind(child.kind));
+  }
+
   function settledChildCount(taskId: string): number {
     return (childrenByParentId.get(taskId) ?? [])
       .filter((child) => child.status !== 'killed')
@@ -400,11 +427,20 @@
       .length;
   }
 
-  function buildTaskSummary(projection: TaskProjectionDto | null) {
+  function buildTaskSummary(
+    projection: TaskProjectionDto | null,
+    visibleTasks: TaskDto[],
+  ) {
+    if (visibleTasks.length > 0) {
+      return {
+        total: visibleTasks.length,
+        completed: visibleTasks.filter((task) => task.status === 'completed').length,
+      };
+    }
     const progress = projection?.progress_summary;
     return {
       total: progress?.total_tasks ?? 0,
-      completed: progress?.settled_tasks ?? 0,
+      completed: progress?.completed_tasks ?? 0,
     };
   }
 
@@ -559,7 +595,7 @@
     taskHistoryError = null;
     const client = createClient();
     try {
-      const response = await client.getSessionTaskHistory(sid);
+      const response = await client.getSessionTaskHistory(sid, TASK_HISTORY_REQUEST_LIMIT);
       if (taskHistoryRequestScope !== sid || taskHistoryFetchGeneration !== generation) {
         return;
       }
@@ -1164,11 +1200,17 @@
           <Icon name="clock" size={12} />
           <span>最近任务</span>
         </span>
-        <span class="task-history-count">{visibleTaskHistoryItems.length} 个任务</span>
+        <span class="task-history-count">
+          {#if hiddenTaskHistoryCount > 0}
+            最近 {displayedTaskHistoryItems.length} / {visibleTaskHistoryItems.length}
+          {:else}
+            {visibleTaskHistoryItems.length} 个任务
+          {/if}
+        </span>
       </div>
 
       <div class="task-history-list" role="list">
-        {#each visibleTaskHistoryItems.slice(0, 12) as item (item.rootTask.task_id)}
+        {#each displayedTaskHistoryItems as item (item.rootTask.task_id)}
           {@const task = item.rootTask}
           {@const statusIcon = getProjectionStatusIcon(task.status)}
           {@const performerLabel = getTaskPerformerLabel(task)}
@@ -1217,6 +1259,20 @@
           </div>
         {/each}
       </div>
+
+      {#if hiddenTaskHistoryCount > 0 || taskHistoryExpanded}
+        <button
+          type="button"
+          class="task-history-toggle"
+          onclick={() => {
+            taskHistoryExpanded = !taskHistoryExpanded;
+          }}
+          aria-expanded={taskHistoryExpanded}
+        >
+          <Icon name={taskHistoryExpanded ? 'chevron-up' : 'chevron-down'} size={12} />
+          <span>{taskHistoryExpanded ? '收起历史任务' : `展开 ${hiddenTaskHistoryCount} 个历史任务`}</span>
+        </button>
+      {/if}
     </section>
   {/if}
 
@@ -1994,6 +2050,26 @@
   .task-history-row:hover {
     background: transparent;
     border-color: var(--border);
+  }
+
+  .task-history-toggle {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: var(--space-1);
+    min-height: 28px;
+    width: 100%;
+    border: 1px solid transparent;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--foreground-muted);
+    font-size: var(--text-xs);
+    cursor: pointer;
+  }
+
+  .task-history-toggle:hover {
+    border-color: var(--border);
+    color: var(--foreground);
   }
 
   .task-history-main {

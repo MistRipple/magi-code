@@ -1,4 +1,4 @@
-//! Task System v2 — Tier 4 / L18 KnowledgeGraph：Mission 进程中累积的"知道了什么"。
+//! 任务系统 — Tier 4 / L18 KnowledgeGraph：Mission 进程中累积的"知道了什么"。
 //!
 //! KnowledgeGraph 不是 vector store 本身（那是实现细节），而是一组**带版本的事实表**：
 //! - `symbols`：代码符号索引（哪些类/接口/模块对应什么职责、是否已迁移）

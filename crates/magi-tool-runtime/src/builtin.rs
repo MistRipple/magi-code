@@ -1321,7 +1321,7 @@ fn builtin_error(tool: &str, message: impl Into<String>) -> String {
 /// 必然是误调用——它们的语义需要 orchestration 层访问 task_store + spawn_graph +
 /// conversation registry，远超 BuiltinTool trait 暴露的 ToolExecutionContext。
 /// 真正的拦截点在 `crates/magi-conversation-runtime/src/tool_batch.rs::execute_task_tool_call`
-/// （v2 conversation runtime）。这里返回一个明确的 `orchestration_required` 状态，
+/// （conversation runtime）。这里返回一个明确的 `orchestration_required` 状态，
 /// 避免悄无声息地把它当成无副作用工具执行。
 fn execute_orchestration_only(name: BuiltinToolName, input: &str) -> String {
     serde_json::json!({

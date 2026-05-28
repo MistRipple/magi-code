@@ -1,6 +1,5 @@
-//! Task System v2 — Tier 4 / L21 HumanCheckpoint：Mission 级别的"人审挂起点"。
+//! HumanCheckpoint：Mission 级别的"人审挂起点"。
 //!
-//! 架构定义（参见 docs/task-system-v2/01-architecture.md L21）：
 //! 当 Coordinator 走到一个高风险节点（例如发布前的最终审阅、与外部系统的不可回滚操作、
 //! 涉及金钱/权限/合规的决策）时，可调 `human_checkpoint_request` 工具落一条
 //! **pending** 的 HumanCheckpoint。一旦有任何 pending 记录，runtime 必须拒绝

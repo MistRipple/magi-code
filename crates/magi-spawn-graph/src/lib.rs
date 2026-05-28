@@ -1,4 +1,4 @@
-//! Task System v2 — L5 SpawnGraph：父代理 spawn 代理的拓扑图。
+//! 任务系统 — L5 SpawnGraph：父代理 spawn 代理的拓扑图。
 //!
 //! 设计目标：把父子关系、派发记录与回执路由收敛到一份正式数据结构。
 //!

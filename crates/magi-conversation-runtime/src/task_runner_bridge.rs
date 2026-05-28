@@ -1,4 +1,4 @@
-//! Task System v2 — TaskRunner 执行桥层。
+//! 任务系统 — TaskRunner 执行桥层。
 //!
 //! WorkerInfo 仍由 magi_orchestrator::task_worker_catalog 提供；本模块持有调度 trait、
 //! 结果接收器、event-based dispatcher 与 WorkerRuntime dispatcher。

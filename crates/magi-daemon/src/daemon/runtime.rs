@@ -350,7 +350,7 @@ impl DaemonRuntime {
             &session_store,
             &workspace_store,
         )?;
-        // Task System v2 §1.4 Phase B：bootstrap 完成后扫描所有 workspace 的可恢复
+        // 任务系统 §1.4 Phase B：bootstrap 完成后扫描所有 workspace 的可恢复
         // Mission，把 Checkpoint 里的 recovery_ref 回灌到对应 session sidecar，并发布
         // `mission.resumed.from_recovery` 事件。单个 mission 失败不影响其它恢复。
         mission_recovery::recover_missions_at_bootstrap(
@@ -1437,7 +1437,7 @@ mod tests {
         let completed_tasks = projection["progress_summary"]["completed_tasks"]
             .as_u64()
             .expect("completed_tasks should serialize as integer");
-        // V2 ExecutionChain：单 worker 任务只产出 1 个 root task；coordinator 才会扩展为多任务。
+        // ExecutionChain：单 worker 任务只产出 1 个 root task；coordinator 才会扩展为多任务。
         assert!(
             total_tasks >= 1,
             "task projection should include the root task"

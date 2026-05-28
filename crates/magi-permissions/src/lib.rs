@@ -1,4 +1,4 @@
-//! Task System v2 — L7 Permissions：三维（工具 / 目录 / 命令）× 五模式
+//! 任务系统 — L7 Permissions：三维（工具 / 目录 / 命令）× 五模式
 //! （default / acceptAll / acceptEdits / plan / bypassPermissions）权限引擎。
 //!
 //! 目标：把 read-only 判定、工具白名单、shell 命令写入识别、Task.policy

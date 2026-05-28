@@ -29,7 +29,7 @@ const RUNTIME_INTERNAL_TOOLS = new Set<string>([
   'submit_review',
   'read_instructions',
   'governance_handshake',
-  // Task System v2 协调 / 长任务工具：这些是模型侧内部协议，不进入用户可见时间线。
+  // 任务系统 协调 / 长任务工具：这些是模型侧内部协议，不进入用户可见时间线。
   // agent_spawn 除外：它是父代理主线上的代理创建 ToolCall 卡片。
   'agent_wait',
   'todo_write',

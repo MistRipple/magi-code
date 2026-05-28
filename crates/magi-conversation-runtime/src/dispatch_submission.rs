@@ -1,6 +1,6 @@
-//! Task System v2 — 派发提交载体。
+//! 任务系统 — 派发提交载体。
 //!
-//! 这两个 DTO 与 ApiState / ApiError 无运行期耦合，是 v2 dispatch 流程的
+//! 这两个 DTO 与 ApiState / ApiError 无运行期耦合，是 dispatch 流程的
 //! "请求 → 接受" 一次性数据载体。magi-api 通过 `pub use` 重导出维持外部
 //! import 路径不变。
 
@@ -554,8 +554,8 @@ mod tests {
             created_session: false,
             mission_title: "当前任务推进".to_string(),
             task_title: "当前任务推进".to_string(),
-            trimmed_text: Some("创建 v2-task-system-e2e.md".to_string()),
-            execution_goal: Some("创建 v2-task-system-e2e.md 并写入当前 marker".to_string()),
+            trimmed_text: Some("创建 task-system-e2e.md".to_string()),
+            execution_goal: Some("创建 task-system-e2e.md 并写入当前 marker".to_string()),
             task_tier: TaskTier::ExecutionChain,
             skill_name: None,
             target_role: Some("executor".to_string()),
@@ -597,7 +597,7 @@ mod tests {
         );
     }
 
-    /// Task System v2 §3.2 验收：中等单 root task 走 ExecutionChain 路径，
+    /// 任务系统 §3.2 验收：中等单 root task 走 ExecutionChain 路径，
     /// **不**进入 Long-Mission 层。
     ///
     /// 验收点：
@@ -690,7 +690,7 @@ mod tests {
         );
     }
 
-    /// Task System v2 §3.4 验收：复杂 Mission 走 LongMission 路径——dispatch 把
+    /// 任务系统 §3.4 验收：复杂 Mission 走 LongMission 路径——dispatch 把
     /// action task 的 `policy_snapshot` 写成 LongMission 形态，runner 据此在
     /// 内部启用 Charter / Plan / Workspace / KG / Validation / Checkpoint /
     /// HumanCheckpoint 7 件套的写入与编排。

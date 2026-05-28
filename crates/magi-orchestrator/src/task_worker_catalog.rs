@@ -18,7 +18,7 @@ pub struct WorkerInfo {
 use std::collections::HashMap;
 use std::sync::RwLock;
 
-/// Task System v2：role / prompt 经 `AgentRoleRegistry` 解析；本模块只保留动态目录查询。
+/// 任务系统：role / prompt 经 `AgentRoleRegistry` 解析；本模块只保留动态目录查询。
 pub fn default_task_role_for_kind(kind: TaskKind) -> Option<&'static str> {
     match kind {
         TaskKind::LocalAgent => Some("executor"),
@@ -104,7 +104,7 @@ impl DynamicWorkerCatalog {
         }
     }
 
-    /// 由注册表中所有 role 一次性填充。v2 启动路径调用 `AgentRoleRegistry::load_default()`
+    /// 由注册表中所有 role 一次性填充。启动路径调用 `AgentRoleRegistry::load_default()`
     /// 拿到注册表后再传入这里，DynamicWorkerCatalog 自此不再持有硬编码 role 列表。
     pub fn with_registry(registry: &AgentRoleRegistry) -> Self {
         let catalog = Self::new();

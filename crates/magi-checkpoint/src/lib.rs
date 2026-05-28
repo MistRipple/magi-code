@@ -1,6 +1,5 @@
-//! Task System v2 — Tier 4 / L20 Checkpoint：Mission 级别的"可恢复"快照点。
+//! Checkpoint：Mission 级别的"可恢复"快照点。
 //!
-//! 架构定义（参见 docs/task-system-v2/01-architecture.md L20）：
 //! 每次进程重启、context 压缩、阶段切换都生成 Checkpoint。Checkpoint 包含 Plan 当前
 //! 状态、KG 快照引用、Workspace 工作树指针（git commit）、以及 open Conversations 的
 //! mailbox 与 turn 游标。**Checkpoint 让 Mission 跨进程存活**——这是 C 档与 A/B 档
@@ -69,7 +68,7 @@ impl CheckpointKind {
 
     /// 是否要求携带"最小恢复集"。`Manual` 是纯标签型快照，不强制；其它三种都是
     /// 跨进程或跨上下文边界，必须把恢复路径写明，否则未来根本无法 resume。
-    /// 详见 docs/task-system-v2/03-open-questions.md §1.4。
+    /// 跨进程或跨上下文边界必须携带恢复指针，否则恢复入口无法定位执行链。
     pub fn requires_recovery_set(self) -> bool {
         matches!(
             self,

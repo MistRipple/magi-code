@@ -311,7 +311,7 @@ fn branch_is_recoverable(branch: &SessionRuntimeBranchSummaryEntry) -> bool {
     // 与 `magi_conversation_runtime::execution_chain_recovery::active_execution_branch_is_continue_recoverable`
     // 保持一致：UI 看到的可恢复语义必须等价于 `/api/session/continue` 实际接受的语义，
     // 避免出现 UI 与 API 对"可继续"判断不一致的两套实现。
-    // V2 中只有 `Failed` 且 stage 非 finish 的 branch 才是"可继续"。
+    // 只有 `Failed` 且 stage 非 finish 的 branch 才是"可继续"。
     matches!(branch.status.as_str(), "failed") && !branch_stage_is_terminal(&branch.stage)
 }
 

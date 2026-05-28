@@ -1,4 +1,4 @@
-//! Task System v2 L17 — Mission Workspace.
+//! 任务系统 L17 — Mission Workspace.
 //!
 //! C 档 Mission 独占的工作目录。落在
 //! `~/.magi/projects/{slug}/missions/{mission_id}/workspace/` 下，包含：

@@ -1,4 +1,4 @@
-//! Task System v2 — Tier 4 / L16 Plan：mission 的"执行计划"工件。
+//! 任务系统 — Tier 4 / L16 Plan：mission 的"执行计划"工件。
 //!
 //! Charter（L15）回答"为什么做、做到什么程度算完"；
 //! Plan（L16）回答"怎么走，每一步是什么状态"；
@@ -22,7 +22,7 @@
 //! ## Steps
 //! - [ ] step-1 (pending) — 拆 v1
 //!   notes: 先盘 dispatch
-//! - [x] step-2 (completed) — 切 v2
+//! - [x] step-2 (completed) — 切新链路
 //!   depends_on: step-1
 //! ```
 //!
@@ -865,7 +865,7 @@ mod tests {
                 },
                 PlanStep {
                     id: "s2".to_string(),
-                    content: "切 v2".to_string(),
+                    content: "切新链路".to_string(),
                     status: PlanStepStatus::InProgress,
                     depends_on: vec!["s1".to_string()],
                     notes: None,

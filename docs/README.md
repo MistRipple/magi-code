@@ -6,11 +6,8 @@
 
 - `rust-backend-rewrite/`
   - 从 `/Users/xie/code/magi/docs/rust-backend-rewrite` 复制而来
-  - 作为当前 Rust 后端重构、协议冻结与切换治理的本地架构基线
-
-- `task-system-v2/`
-  - 任务系统 v2 设计文档（当前基线）
-  - 覆盖 A/B/C 三档任务、Runtime/Orchestration/Long-Mission 三层架构、9 Step 迁移路径
+  - 作为 Rust 后端重构历史、协议冻结与切换治理记录保留
+  - 其中包含早期迁移阶段的术语和任务树；当前实现判断不得直接以该目录作为事实源
 
 ## 当前项目状态
 
@@ -31,8 +28,8 @@
 
 ## 当前阶段约束
 
-当前阶段仍然遵守 `rust-backend-rewrite/01-governance-and-rules.md` 与
-`rust-backend-rewrite/05-milestones-and-cutover-gates.md` 的核心原则，但约束重点已经调整为：
+当前阶段保留 `rust-backend-rewrite/01-governance-and-rules.md` 与
+`rust-backend-rewrite/05-milestones-and-cutover-gates.md` 中的工程治理原则，但具体功能设计以当前代码、产品定位和真实运行链路为准：
 
 - 协议字段、DTO 结构、事件信封与宿主桥接命令必须继续保持冻结与收敛
 - 前端迁移必须以现有 `magi` 产品方案为基线，不发散成新的 UI 产品方向
@@ -56,6 +53,17 @@
 - 继续保持产品层方案与正式体验
 - 在冻结契约下稳步完善接线层与投影层
 - 为后续真实能力接入准备稳定的页面结构、消息读模型和宿主桥接边界
+
+## 任务系统设计源
+
+任务系统不再以旧版任务系统文档作为事实源。当前判断以产品定位与真实运行链路为准：
+
+- 简单事走会话流和工具证据，不进入任务面板。
+- 中等事创建执行链，任务面板展示真实工作单元。
+- 代理协作保留内部 root task 作为编排锚点，但用户主视图只展示实际代理任务。
+- 跨轮、可恢复、高风险工作以 Mission / Checkpoint / Validation 等运行事实承载。
+
+后续若需要补充设计说明，应从当前代码和产品形态反向整理，不再恢复旧版任务系统文档。
 
 ## 前端迁移实施原则与下一阶段方向
 

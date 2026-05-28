@@ -1,4 +1,4 @@
-//! Task System v2 — session-thread 创建入口。
+//! 任务系统 — session-thread 创建入口。
 //!
 //! `ensure_thread_for_role` 接收显式 `&SessionStore`，由 dispatch 装配层负责传入。
 

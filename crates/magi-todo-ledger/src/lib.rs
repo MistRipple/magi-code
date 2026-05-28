@@ -1,4 +1,4 @@
-//! Task System v2 — L13 TodoLedger：session 范围内的 todo 列表。
+//! 任务系统 — L13 TodoLedger：session 范围内的 todo 列表。
 //!
 //! 参考 claude-code 的 TodoWrite：
 //! - 不是项目管理工具，而是单 session 内的"思维锚点"。
@@ -272,8 +272,7 @@ pub enum TodoWriteError {
 // ---------------------------------------------------------------------------
 
 /// S9 工具下沉：把 `todo_write` 的完整执行体收口在本 crate，conversation_loop
-/// 不再持有这段业务（参考 02-migration-plan.md S9 合规自检"v2 新增：TodoLedger
-/// trait + 实现"，由 crate 自身承担实现）。
+/// 不再持有这段业务，由 crate 自身承担实现。
 ///
 /// 入参与 `&magi_core::Task` 解耦：只透传 `task_id` / `mission_id`，避免
 /// TodoLedger 反向依赖完整 Task 结构。

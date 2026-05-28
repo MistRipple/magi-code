@@ -1,4 +1,4 @@
-//! Task System v2 §1.4 Phase B：daemon bootstrap 阶段的 Mission 自动恢复入口。
+//! 任务系统 §1.4 Phase B：daemon bootstrap 阶段的 Mission 自动恢复入口。
 //!
 //! Phase A 已经在 `magi-mission` 落地读端聚合契约（`resume_mission` /
 //! `enumerate_resumable_missions`），但写完后没有调用方——重蹈 `CheckpointLog::latest()`

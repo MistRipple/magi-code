@@ -456,14 +456,19 @@ fn local_session_turn_intent_decision(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or("");
+    let requests_explicit_task_or_agent =
+        session_turn_requests_explicit_task_or_agent_mode(request);
+    let requests_simple_execution = session_turn_requests_simple_execution_by_local_rules(request)
+        || session_turn_requested_public_builtin_tools(request).is_some();
     let route = if has_recoverable_chain && session_turn_requests_continue_existing_task(request) {
         SessionTurnRouteDto::Continue
-    } else if !skill_name.is_empty()
+    } else if requests_explicit_task_or_agent
+        || !skill_name.is_empty()
         || !request.images.is_empty()
-        || session_turn_requests_task_by_local_rules(request)
+        || (session_turn_requests_task_by_local_rules(request) && !requests_simple_execution)
     {
         SessionTurnRouteDto::Task
-    } else if session_turn_requests_execute_by_local_rules(request) {
+    } else if requests_simple_execution || session_turn_requests_execute_by_local_rules(request) {
         SessionTurnRouteDto::Execute
     } else {
         SessionTurnRouteDto::Chat
@@ -548,6 +553,27 @@ fn normalize_session_turn_decision(
                 .task_evidence
                 .push("显式复杂任务/代理编排请求".to_string());
         }
+    }
+    let requests_direct_execution = session_turn_requests_simple_execution_by_local_rules(request)
+        || session_turn_requested_public_builtin_tools(request).is_some();
+    if matches!(decision.route, SessionTurnRouteDto::Task)
+        && !session_turn_requests_explicit_task_or_agent_mode(request)
+        && requests_direct_execution
+    {
+        let task_text = request
+            .trimmed_text()
+            .unwrap_or_else(|| request.timeline_message(None));
+        decision.route = SessionTurnRouteDto::Execute;
+        decision.task_title = None;
+        decision.execution_goal = None;
+        decision.task_tier = TaskTier::ExecutionChain;
+        decision.tool_intent = Some(task_text);
+        decision.forced_tool_name = None;
+        decision.required_tool_chain.clear();
+        decision.confidence = decision.confidence.max(0.9);
+        decision.reason_code = Some("simple_execution_request".to_string());
+        decision.route_reason = Some("用户请求是小范围一次性执行，不创建任务投影。".to_string());
+        decision.task_evidence.clear();
     }
     if matches!(decision.route, SessionTurnRouteDto::Task)
         && !session_turn_task_route_has_creation_evidence(&decision)
@@ -655,6 +681,105 @@ fn session_turn_requests_task_by_local_rules(request: &SessionTurnRequestDto) ->
     .iter()
     .any(|marker| normalized.contains(marker))
         || normalized_contains_agent_dispatch_request(&normalized)
+}
+
+fn session_turn_requests_simple_execution_by_local_rules(request: &SessionTurnRequestDto) -> bool {
+    let Some(text) = request.trimmed_text() else {
+        return false;
+    };
+    let normalized = text.to_ascii_lowercase();
+    if session_turn_requests_explicit_task_or_agent_mode(request)
+        || session_turn_has_structured_task_scope(&normalized)
+    {
+        return false;
+    }
+    let has_direct_work = [
+        "修复",
+        "修改",
+        "改一下",
+        "调整",
+        "更新",
+        "写入",
+        "创建",
+        "删除",
+        "替换",
+        "读取",
+        "查看",
+        "打开",
+        "运行",
+        "执行",
+        "列出",
+        "生成",
+        "画",
+        "绘制",
+        "fix",
+        "edit",
+        "update",
+        "write",
+        "create",
+        "delete",
+        "run",
+        "read",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker));
+    let has_small_scope = [
+        "简单",
+        "小范围",
+        "一次性",
+        "只",
+        "直接",
+        "顺手",
+        "这个文件",
+        "单文件",
+        "一处",
+        "一行",
+        "错别字",
+        "不用任务",
+        "不要创建任务",
+        "不需要任务",
+        "无需任务",
+        "simple",
+        "one-off",
+        "single file",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker));
+    has_direct_work && has_small_scope
+}
+
+fn session_turn_has_structured_task_scope(normalized: &str) -> bool {
+    [
+        "并验证",
+        "完成后",
+        "拆分",
+        "规划",
+        "多阶段",
+        "多轮",
+        "可恢复",
+        "代理",
+        "agent",
+        "任务编排",
+        "中等任务",
+        "复杂任务",
+        "长期任务",
+        "重构",
+        "迁移",
+        "架构",
+        "全量",
+        "完整",
+        "端到端",
+        "e2e",
+        "验收",
+        "运行测试",
+        "测试并",
+        "validate",
+        "verify",
+        "migration",
+        "refactor",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
 }
 
 fn session_turn_requests_execute_by_local_rules(request: &SessionTurnRequestDto) -> bool {
@@ -2884,6 +3009,46 @@ mod tests {
     }
 
     #[test]
+    fn explicit_public_tool_with_fix_word_routes_to_execute_not_task() {
+        let state = test_state();
+        let request = session_turn_request("请调用 file_patch 修复 /tmp/a.txt 中的拼写问题");
+
+        let decision = decide_session_turn_with_task_planner(&state, &request)
+            .expect("explicit public tool should route locally");
+
+        assert!(matches!(decision.route, SessionTurnRouteDto::Execute));
+        assert_eq!(decision.forced_tool_name.as_deref(), Some("file_patch"));
+        assert!(decision.task_evidence.is_empty());
+    }
+
+    #[test]
+    fn simple_one_shot_fix_routes_to_execute_without_task_projection() {
+        let state = test_state();
+        let request = session_turn_request("直接修复这个文件里的错别字，不需要创建任务");
+
+        let decision = decide_session_turn_with_task_planner(&state, &request)
+            .expect("simple one-shot work should route locally");
+
+        assert!(matches!(decision.route, SessionTurnRouteDto::Execute));
+        assert!(decision.execution_goal.is_none());
+        assert!(decision.task_evidence.is_empty());
+    }
+
+    #[test]
+    fn medium_fix_with_validation_stays_structured_task() {
+        let state = test_state();
+        let request = session_turn_request("修复登录流程问题，完成后运行测试并汇总验证结果");
+
+        let decision = decide_session_turn_with_task_planner(&state, &request)
+            .expect("medium fix should route locally");
+
+        assert!(matches!(decision.route, SessionTurnRouteDto::Task));
+        assert_eq!(decision.task_tier, TaskTier::ExecutionChain);
+        assert!(decision.execution_goal.is_some());
+        assert!(!decision.task_evidence.is_empty());
+    }
+
+    #[test]
     fn explicit_complex_agent_request_is_task_even_when_shell_tool_is_named() {
         let request = session_turn_request(
             "请以复杂任务模式完成，代理必须调用 shell_exec 执行 printf ok，最后总结。",
@@ -2953,12 +3118,12 @@ mod tests {
 
     #[test]
     fn explicit_complex_agent_request_preserves_raw_user_goal_as_execution_goal() {
-        let raw_goal = "【V2具体任务推进验收】请以复杂任务模式完成，必须由代理在当前工作区创建文件 v2-task-system-e2e.md，文件内容必须包含三行：title: v2 task concrete progress、marker: V2_TASK_E2E、status: completed。创建后代理必须读取该文件验证内容。";
+        let raw_goal = "【具体任务推进验收】请以复杂任务模式完成，必须由代理在当前工作区创建文件 task-system-e2e.md，文件内容必须包含三行：title: task concrete progress、marker: TASK_E2E、status: completed。创建后代理必须读取该文件验证内容。";
         let request = session_turn_request(raw_goal);
         let mut classifier_decision = classifier_chat_decision();
         classifier_decision.route = SessionTurnRouteDto::Task;
-        classifier_decision.task_title = Some("创建并验证 v2-task-system-e2e.md".to_string());
-        classifier_decision.execution_goal = Some("创建并验证 v2-task-system-e2e.md".to_string());
+        classifier_decision.task_title = Some("创建并验证 task-system-e2e.md".to_string());
+        classifier_decision.execution_goal = Some("创建并验证 task-system-e2e.md".to_string());
         classifier_decision
             .task_evidence
             .push("classifier saw a task".to_string());

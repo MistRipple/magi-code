@@ -1,4 +1,4 @@
-//! Task System v2 — L12 SafetyGate：高危操作语义判定层。
+//! 任务系统 — L12 SafetyGate：高危操作语义判定层。
 //!
 //! 与 L7 `PermissionEngine` 的边界：
 //! - PermissionEngine 是**工具白名单**：按工具名 + read/write 性质给出 allow/deny。

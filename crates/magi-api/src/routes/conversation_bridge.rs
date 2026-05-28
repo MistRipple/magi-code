@@ -1,4 +1,4 @@
-//! Task System v2 bridges: routes 与 magi-conversation-runtime 的通道。
+//! 任务系统 bridges: routes 与 magi-conversation-runtime 的通道。
 //!
 //! 该 helper 是 routes 层读取 user 信号字段与切换 Turn 生命周期的**唯一来源**：
 //! routes 不再直接调 `SessionTurnRequestDto::trimmed_text` 等方法来驱动业务路径。

@@ -20,11 +20,11 @@ use magi_conversation_runtime::{
     ConversationRegistry,
     task_execution_dispatcher::{ExecutionPipeline, LlmTaskDispatcher},
     task_execution_registry::TaskExecutionRegistry,
+    task_runner::TaskRunner,
     task_runner_bridge::{
         EventBasedResultReceiver, RunCycleOutcome, TaskDispatchGate, TaskDispatcher,
         TaskResultReceiver,
     },
-    task_runner_v2::TaskRunner,
 };
 use magi_core::{
     SessionId, SessionLifecycleStatus, TaskId, TaskStatus, UtcMillis, WorkspaceId,
@@ -128,7 +128,7 @@ impl RunnerManager {
         let dispatcher = self
             .dispatcher
             .as_ref()
-            .expect("RunnerManager 缺少 v2 LLM dispatcher");
+            .expect("RunnerManager 缺少 LLM dispatcher");
         let mut runner = TaskRunner::with_dispatcher(
             Arc::clone(&self.task_store),
             workers,
@@ -533,10 +533,10 @@ pub struct ApiState {
     pub tunnel_manager: crate::tunnel::TunnelManager,
     pub snapshot_manager: Arc<SnapshotManager>,
     pub conversation_registry: Arc<ConversationRegistry>,
-    /// Task System v2：AgentRole 注册表（替代 task_worker_catalog 硬编码 prompt）。
+    /// 任务系统：AgentRole 注册表（替代 task_worker_catalog 硬编码 prompt）。
     /// 加载策略：`~/.magi/roles/*.json` 优先，回落到 crate 内置 builtin 集。
     pub agent_role_registry: Arc<magi_agent_role::AgentRoleRegistry>,
-    /// Task System v2 — L5：父子任务关系图，作为 task_dispatch 中
+    /// 任务系统 — L5：父子任务关系图，作为 task_dispatch 中
     /// "parent_task_id 散落查询"的统一上层。同一进程共享。
     pub spawn_graph: Arc<Mutex<magi_spawn_graph::SpawnGraph>>,
 }

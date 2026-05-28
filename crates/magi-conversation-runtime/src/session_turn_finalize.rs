@@ -1,4 +1,4 @@
-//! Task System v2 — session turn 终态收尾 (finalize / reconcile)。
+//! 任务系统 — session turn 终态收尾 (finalize / reconcile)。
 //!
 //! 公开 API 使用显式依赖参数（`&SessionStore`、`&InMemoryEventBus`、`Option<&TaskStore>`），
 //! 不再耦合 ApiState。magi-api 侧保留薄壳转发。

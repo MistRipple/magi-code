@@ -1,6 +1,6 @@
-//! Task System v2 — TaskRunner 调度循环归属 conversation-runtime。
+//! 任务系统 — TaskRunner 调度循环归属 conversation-runtime。
 //!
-//! 本模块只维护 v2 的执行事实：pending/running/terminal 状态推进、
+//! 本模块只维护任务执行事实：pending/running/terminal 状态推进、
 //! worker 匹配、租约、结果回收。
 
 use crate::task_runner_bridge::{
@@ -248,7 +248,7 @@ impl TaskRunner {
                 .map_err(|error| format!("将任务 {task_id} 回退到 Pending 失败: {error}")),
             // 终态：Completed / Killed 不可恢复；Running 仍在跑也不需要 resume
             other => Err(format!(
-                "Task System v2 不支持从 {:?} 状态恢复任务 {}",
+                "任务系统 不支持从 {:?} 状态恢复任务 {}",
                 other, task_id
             )),
         }

@@ -25,7 +25,7 @@ pub enum MailboxAuthor {
     Child(String),
 }
 
-/// Mailbox 信号类型。与 v2 架构文档保持一致的运行时信号分类。
+/// Mailbox 信号类型。运行时信号统一按这个枚举分类。
 ///
 /// 注：代理初始任务、追问、系统 followup 等都统一进入 Conversation
 /// mailbox；代理终态结果由 agent_wait 从 TaskStore 读取。
@@ -69,7 +69,7 @@ impl MailboxItem {
 }
 
 /// 按 FIFO 顺序累积的信号缓冲。Conversation 在 Turn 边界 drain，不向外暴露
-/// 任意位置的 peek/pop（按 v2 设计，Conversation 不主动 pull）。
+/// 任意位置的 peek/pop，Conversation 不主动 pull。
 #[derive(Debug, Default)]
 pub struct Mailbox {
     items: VecDeque<MailboxItem>,

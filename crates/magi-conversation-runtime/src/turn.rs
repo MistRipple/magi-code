@@ -1,4 +1,4 @@
-//! Task System v2 - Turn 状态机（Slice S2）。
+//! 任务系统 - Turn 状态机（Slice S2）。
 //!
 //! Turn 表示一轮"user 信号 → assistant 完成（含工具调用循环）"的对话推进。
 //! 状态转换契约：
@@ -12,7 +12,7 @@
 //!                          Done | Failed
 //! ```
 //!
-//! v2 由 Conversation 持有"状态推进契约"，`Modeling` / `ToolCalling` 的 IO
+//! Conversation 持有"状态推进契约"，`Modeling` / `ToolCalling` 的 IO
 //! 通过 `TurnDriver` 注入；状态机本身不依赖具体任务执行实现。
 
 use std::fmt;

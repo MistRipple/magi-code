@@ -1,11 +1,11 @@
-//! Task System v2 — 任务派发计划与注册中心。
+//! 任务系统 — 任务派发计划与注册中心。
 //!
 //! - [`TaskExecutionPlan`]：dispatch_submission 接受后挂在 task_execution_registry
 //!   上的派发载体；当前派发链路只保留 Dispatch 一支。
 //! - [`TaskExecutionRegistry`]：线程安全的 `TaskId → TaskExecutionPlan` 索引，
 //!   `LlmTaskDispatcher` 与 `Runner` 通过它取出已接受派发计划。
 //!
-//! magi-api 不再实现这两个类型，改为 `pub use` 重导出；本模块是 v2 派发链路的
+//! magi-api 不再实现这两个类型，改为 `pub use` 重导出；本模块是任务派发链路的
 //! 唯一所有者。
 
 use std::collections::HashMap;
@@ -112,7 +112,7 @@ impl TaskExecutionRegistry {
         } = request;
         let mut chain = session_store
             .active_execution_chain(session_id)
-            .ok_or_else(|| "agent_spawn 需要当前会话存在活跃 v2 执行链".to_string())?;
+            .ok_or_else(|| "agent_spawn 需要当前会话存在活跃执行链".to_string())?;
         if chain.mission_id != child_task.mission_id
             || chain.root_task_id != child_task.root_task_id
         {
