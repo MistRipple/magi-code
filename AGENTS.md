@@ -14,7 +14,20 @@
 开发调试时只启动 daemon，让 daemon 负责拉起或复用前端热加载服务：
 
 ```bash
-MAGI_WEB_DEV=1 cargo run -p magi-daemon-app
+./scripts/dev-daemon.sh
+```
+
+该脚本会在启动前检查 `target` 目录大小，默认超过 `8GiB` 时执行 `cargo clean`，
+给后续编译增长预留空间，尽量避免开发缓存超过 `10GiB`。如需调整阈值：
+
+```bash
+MAGI_TARGET_PRUNE_GIB=6 ./scripts/dev-daemon.sh
+```
+
+大批量测试或多轮编译后，也可以只执行缓存清理检查：
+
+```bash
+./scripts/prune-target.sh
 ```
 
 默认访问地址：
@@ -43,7 +56,7 @@ http://127.0.0.1:38123/web.html
 如需修改端口，只改 daemon 的开发环境变量：
 
 ```bash
-MAGI_WEB_DEV=1 MAGI_WEB_DEV_PORT=3000 cargo run -p magi-daemon-app
+MAGI_WEB_DEV_PORT=3000 ./scripts/dev-daemon.sh
 ```
 
 可用变量：

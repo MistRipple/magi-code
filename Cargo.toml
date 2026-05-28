@@ -59,3 +59,12 @@ sha2 = "0.10"
 zstd = "0.13"
 ignore = "0.4"
 insta = "1.41"
+
+[profile.dev]
+# 开发态只保留行号级调试信息，避免频繁 cargo run/check 后 target 目录快速膨胀。
+debug = "line-tables-only"
+
+[profile.test]
+# 测试产物数量多，关闭增量缓存并降低调试信息，优先控制本地磁盘占用。
+debug = "line-tables-only"
+incremental = false
