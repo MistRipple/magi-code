@@ -8,49 +8,6 @@ use crate::llm_types::{LlmMessageParams, LlmResponse, LlmUsage};
 pub enum ProviderFamily {
     OpenAiChat,
     Anthropic,
-    Gemini,
-}
-
-impl ProviderFamily {
-    pub fn from_provider_string(provider: &str) -> Self {
-        let lower = provider.to_ascii_lowercase();
-        if lower.contains("anthropic") || lower.contains("claude") {
-            Self::Anthropic
-        } else if lower.contains("gemini") || lower.contains("google") {
-            Self::Gemini
-        } else {
-            Self::OpenAiChat
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn provider_family_detects_anthropic_aliases() {
-        assert_eq!(
-            ProviderFamily::from_provider_string("anthropic"),
-            ProviderFamily::Anthropic
-        );
-        assert_eq!(
-            ProviderFamily::from_provider_string("claude-sonnet"),
-            ProviderFamily::Anthropic
-        );
-    }
-
-    #[test]
-    fn provider_family_detects_google_aliases_as_gemini() {
-        assert_eq!(
-            ProviderFamily::from_provider_string("gemini"),
-            ProviderFamily::Gemini
-        );
-        assert_eq!(
-            ProviderFamily::from_provider_string("google-ai"),
-            ProviderFamily::Gemini
-        );
-    }
 }
 
 #[derive(Clone, Debug)]

@@ -74,7 +74,6 @@ pub fn parse_stream_event(family: ProviderFamily, event: &SseEvent) -> Vec<LlmSt
         ProviderFamily::Anthropic => {
             parse_anthropic_stream_event(event.event_type.as_deref(), &event.data)
         }
-        ProviderFamily::Gemini => parse_openai_stream_data(&event.data),
     }
 }
 
