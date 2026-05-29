@@ -335,6 +335,24 @@ impl LocalSearchEngine {
         self.save_index();
     }
 
+    /// 按符号名查定义（goto_definition 的底层）。返回匹配的符号条目。
+    pub fn find_symbol_definitions(
+        &self,
+        name: &str,
+        max_results: usize,
+    ) -> Vec<crate::symbol_index::SymbolEntry> {
+        self.symbol_index
+            .search(name, max_results)
+            .into_iter()
+            .map(|hit| hit.symbol)
+            .collect()
+    }
+
+    /// 列出某文件的全部符号（list_file_symbols 的底层）。
+    pub fn list_file_symbols(&self, file_path: &str) -> Vec<crate::symbol_index::SymbolEntry> {
+        self.symbol_index.get_symbols_for_file(file_path)
+    }
+
     pub fn on_file_created(&mut self, file_path: &str) {
         let relative = self.to_relative(file_path);
         let file_type = classify_file_type(&relative);

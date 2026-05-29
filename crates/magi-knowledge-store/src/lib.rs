@@ -202,13 +202,67 @@ impl KnowledgeStore {
         Some(engine.search(query, options))
     }
 
+    /// 按符号名查定义（goto_definition）。引擎未构建时返回 None。
+    pub fn find_symbol_definitions(
+        &self,
+        workspace_id: &WorkspaceId,
+        name: &str,
+        max_results: usize,
+    ) -> Option<Vec<symbol_index::SymbolEntry>> {
+        let engine = self
+            .search_engines
+            .read()
+            .expect("knowledge store search engines read lock poisoned")
+            .get(workspace_id)
+            .cloned()?;
+        let engine = engine.lock().expect("search engine mutex poisoned");
+        Some(engine.find_symbol_definitions(name, max_results))
+    }
+
+    /// 列出某文件的全部符号（list_file_symbols）。引擎未构建时返回 None。
+    pub fn list_file_symbols(
+        &self,
+        workspace_id: &WorkspaceId,
+        file_path: &str,
+    ) -> Option<Vec<symbol_index::SymbolEntry>> {
+        let engine = self
+            .search_engines
+            .read()
+            .expect("knowledge store search engines read lock poisoned")
+            .get(workspace_id)
+            .cloned()?;
+        let engine = engine.lock().expect("search engine mutex poisoned");
+        Some(engine.list_file_symbols(file_path))
+    }
+
+    /// 文件变更后增量刷新指定 workspace 的索引（P4：文件监听转发）。
+    pub fn on_workspace_file_changed(&self, workspace_id: &WorkspaceId, file_path: &str) {
+        if let Some(engine) = self
+            .search_engines
+            .read()
+            .expect("knowledge store search engines read lock poisoned")
+            .get(workspace_id)
+            .cloned()
+        {
+            engine
+                .lock()
+                .expect("search engine mutex poisoned")
+                .on_file_changed(file_path);
+        }
+    }
+
     /// 指定 workspace 的检索引擎是否已就绪。
     pub fn workspace_index_ready(&self, workspace_id: &WorkspaceId) -> bool {
         self.search_engines
             .read()
             .expect("knowledge store search engines read lock poisoned")
             .get(workspace_id)
-            .map(|engine| engine.lock().expect("search engine mutex poisoned").is_ready())
+            .map(|engine| {
+                engine
+                    .lock()
+                    .expect("search engine mutex poisoned")
+                    .is_ready()
+            })
             .unwrap_or(false)
     }
 

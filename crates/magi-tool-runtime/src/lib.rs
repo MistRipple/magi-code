@@ -52,6 +52,9 @@ pub enum BuiltinToolName {
     DiagramRender,
     // ── 知识库 ──
     KnowledgeQuery,
+    // ── 代码符号导航（基于本地索引引擎的符号表）──
+    /// 符号导航：按符号名查定义、或列出某文件的全部符号。
+    CodeSymbols,
     // ── 协调器（任务系统 L10，仅 coordinator_mode 角色可见）──
     /// 派发新的代理执行子任务。该工具只创建代理并投递初始任务消息；
     /// 后续由 agent_wait 收集代理终态结果。
@@ -109,7 +112,7 @@ pub enum BuiltinToolName {
 }
 
 impl BuiltinToolName {
-    pub const ALL: [Self; 31] = [
+    pub const ALL: [Self; 32] = [
         Self::FileRead,
         Self::FileWrite,
         Self::FilePatch,
@@ -131,6 +134,7 @@ impl BuiltinToolName {
         Self::WebFetch,
         Self::DiagramRender,
         Self::KnowledgeQuery,
+        Self::CodeSymbols,
         Self::AgentSpawn,
         Self::AgentWait,
         Self::TodoWrite,
@@ -166,6 +170,7 @@ impl BuiltinToolName {
             Self::WebFetch => "web_fetch",
             Self::DiagramRender => "diagram_render",
             Self::KnowledgeQuery => "knowledge_query",
+            Self::CodeSymbols => "code_symbols",
             Self::AgentSpawn => "agent_spawn",
             Self::AgentWait => "agent_wait",
             Self::TodoWrite => "todo_write",
@@ -202,6 +207,9 @@ impl BuiltinToolName {
             "web_fetch" => Some(Self::WebFetch),
             "diagram_render" => Some(Self::DiagramRender),
             "knowledge_query" | "project_knowledge_query" => Some(Self::KnowledgeQuery),
+            "code_symbols" | "symbol_nav" | "goto_definition" | "list_file_symbols" => {
+                Some(Self::CodeSymbols)
+            }
             "agent_spawn" | "agent" | "spawn_agent" => Some(Self::AgentSpawn),
             "agent_wait" | "wait_agent" => Some(Self::AgentWait),
             "todo_write" | "todowrite" | "todo" => Some(Self::TodoWrite),
@@ -284,6 +292,7 @@ impl BuiltinToolName {
             | Self::WebFetch
             | Self::DiagramRender
             | Self::KnowledgeQuery
+            | Self::CodeSymbols
             | Self::AgentWait
             | Self::TodoWrite
             | Self::MemoryWrite
@@ -390,6 +399,9 @@ impl BuiltinToolName {
                 "渲染图表：支持 Mermaid、DOT、结构化 graph 节点/边、结构化 flow 节点/边"
             }
             Self::KnowledgeQuery => "查询项目知识库：检索 README、文档与代码文档",
+            Self::CodeSymbols => {
+                "代码符号导航：按符号名查定义（goto_definition），或列出某文件的全部符号（list_file_symbols）"
+            }
             Self::AgentSpawn => {
                 "向已注册的代理角色派发一个子任务（architect / executor / reviewer 等）。该工具只创建代理并投递初始任务消息，立即返回代理 task_id；后续使用 agent_wait 收集代理终态结果。若返回 status=degraded，表示代理当前不可用，父代理必须改派其他可用角色或由主线继续完成，不能直接停止任务。\n\n\
                 # 何时用\n\
@@ -742,6 +754,20 @@ impl BuiltinToolName {
                     "category": { "type": "string", "description": "知识分类：all、readme、docs、code（默认 all）" }
                 },
                 "required": ["query"]
+            }),
+            Self::CodeSymbols => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["definition", "file_symbols"],
+                        "description": "definition：按符号名查定义；file_symbols：列出某文件的全部符号"
+                    },
+                    "name": { "type": "string", "description": "action=definition 时的符号名（函数/类/接口/类型等）" },
+                    "path": { "type": "string", "description": "action=file_symbols 时的文件路径（相对工作区根）" },
+                    "limit": { "type": "integer", "description": "definition 最多返回多少个匹配（默认 20）" }
+                },
+                "required": ["action"]
             }),
             Self::AgentSpawn => serde_json::json!({
                 "type": "object",
@@ -4473,6 +4499,7 @@ mod tests {
                 "web_fetch",
                 "diagram_render",
                 "knowledge_query",
+                "code_symbols",
                 "agent_spawn",
                 "agent_wait",
                 "todo_write",
@@ -4749,11 +4776,8 @@ mod tests {
             "pub fn authenticate_user(token: &str) -> bool { !token.is_empty() }\n",
         )
         .expect("write auth.rs");
-        fs::write(
-            root.join("notes.txt"),
-            "authenticate flow described here\n",
-        )
-        .expect("write notes.txt");
+        fs::write(root.join("notes.txt"), "authenticate flow described here\n")
+            .expect("write notes.txt");
 
         // 构建索引并注入 KnowledgeStore。
         let store = std::sync::Arc::new(magi_knowledge_store::KnowledgeStore::new());
@@ -4762,8 +4786,8 @@ mod tests {
 
         let governance = Arc::new(GovernanceService::default());
         let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(16));
-        let mut tool_registry = ToolRegistry::new(governance, event_bus)
-            .with_knowledge_store(store);
+        let mut tool_registry =
+            ToolRegistry::new(governance, event_bus).with_knowledge_store(store);
         tool_registry.register_default_builtins();
 
         let context = ToolExecutionContext {
@@ -4793,12 +4817,90 @@ mod tests {
         assert!(!results.is_empty(), "应有命中结果");
         // 引擎路命中代码符号文件。
         assert!(
-            results
-                .iter()
-                .any(|r| r["source"] == "engine"
-                    && r["path"].as_str().is_some_and(|p| p.contains("auth.rs"))),
+            results.iter().any(|r| r["source"] == "engine"
+                && r["path"].as_str().is_some_and(|p| p.contains("auth.rs"))),
             "引擎路应命中 auth.rs，实际: {results:?}"
         );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn code_symbols_definition_and_file_symbols() {
+        let root = unique_temp_dir("magi-tool-code-symbols");
+        fs::create_dir_all(root.join("src")).expect("create src");
+        fs::write(
+            root.join("src/auth.rs"),
+            "pub fn authenticate_user(token: &str) -> bool { !token.is_empty() }\n\
+             struct Session { id: u32 }\n",
+        )
+        .expect("write auth.rs");
+
+        let store = std::sync::Arc::new(magi_knowledge_store::KnowledgeStore::new());
+        let workspace_id = WorkspaceId::new("workspace-code-symbols");
+        store.build_workspace_index(&workspace_id, &root);
+
+        let governance = Arc::new(GovernanceService::default());
+        let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(16));
+        let mut tool_registry = ToolRegistry::new(governance, event_bus)
+            .with_knowledge_store(store);
+        tool_registry.register_default_builtins();
+
+        let context = ToolExecutionContext {
+            workspace_id: Some(workspace_id),
+            working_directory: Some(root.clone()),
+            ..ToolExecutionContext::default()
+        };
+
+        // definition：按名查定义
+        let def = tool_registry.execute_with_policy(
+            ToolExecutionInput {
+                tool_call_id: ToolCallId::new("tc-def"),
+                tool_name: BuiltinToolName::CodeSymbols.as_str().to_string(),
+                tool_kind: ToolKind::Builtin,
+                input: serde_json::json!({ "action": "definition", "name": "authenticate_user" })
+                    .to_string(),
+                approval_requirement: ApprovalRequirement::None,
+                risk_level: RiskLevel::Low,
+            },
+            context.clone(),
+            &ToolExecutionPolicy::default(),
+        );
+        assert_eq!(def.status, ExecutionResultStatus::Succeeded);
+        let def_payload: Value = serde_json::from_str(&def.payload).expect("def json");
+        let def_results = def_payload["results"].as_array().expect("def results");
+        assert!(
+            def_results
+                .iter()
+                .any(|r| r["name"] == "authenticate_user"
+                    && r["path"].as_str().is_some_and(|p| p.contains("auth.rs"))),
+            "definition 应命中 authenticate_user@auth.rs，实际: {def_results:?}"
+        );
+
+        // file_symbols：列文件符号
+        let list = tool_registry.execute_with_policy(
+            ToolExecutionInput {
+                tool_call_id: ToolCallId::new("tc-list"),
+                tool_name: BuiltinToolName::CodeSymbols.as_str().to_string(),
+                tool_kind: ToolKind::Builtin,
+                input: serde_json::json!({ "action": "file_symbols", "path": "src/auth.rs" })
+                    .to_string(),
+                approval_requirement: ApprovalRequirement::None,
+                risk_level: RiskLevel::Low,
+            },
+            context,
+            &ToolExecutionPolicy::default(),
+        );
+        assert_eq!(list.status, ExecutionResultStatus::Succeeded);
+        let list_payload: Value = serde_json::from_str(&list.payload).expect("list json");
+        let names: Vec<&str> = list_payload["results"]
+            .as_array()
+            .expect("list results")
+            .iter()
+            .filter_map(|r| r["name"].as_str())
+            .collect();
+        assert!(names.contains(&"authenticate_user"), "file_symbols 应含函数，实际: {names:?}");
+        assert!(names.contains(&"Session"), "file_symbols 应含 struct，实际: {names:?}");
 
         let _ = fs::remove_dir_all(&root);
     }

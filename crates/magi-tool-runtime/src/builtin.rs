@@ -116,6 +116,7 @@ impl BuiltinTool for NormalizedBuiltinTool {
             BuiltinToolName::WebFetch => execute_web_fetch(input),
             BuiltinToolName::DiagramRender => execute_diagram_render(input),
             BuiltinToolName::KnowledgeQuery => execute_knowledge_query(input),
+            BuiltinToolName::CodeSymbols => execute_code_symbols(input, context, resources),
             BuiltinToolName::AgentSpawn
             | BuiltinToolName::AgentWait
             | BuiltinToolName::TodoWrite
@@ -2480,6 +2481,97 @@ fn validate_graph_payload(value: &Value) -> bool {
 // ══════════════════════════════════════════════════════════════════════════════
 // search.semantic — 基于关键词拆分的语义代码检索
 // ══════════════════════════════════════════════════════════════════════════════
+
+/// 代码符号导航：按符号名查定义 / 列出文件符号。基于本地索引引擎的符号表。
+fn execute_code_symbols(
+    input: &str,
+    context: &ToolExecutionContext,
+    resources: &ToolRuntimeResources,
+) -> String {
+    let request = parse_json_object(input);
+    let action = request
+        .as_ref()
+        .and_then(|obj| field_string(obj, &["action"]))
+        .unwrap_or_default();
+
+    let Some(store) = resources.knowledge_store.as_ref() else {
+        return builtin_error("code_symbols", "代码索引引擎不可用");
+    };
+    let Some(workspace_id) = context.workspace_id.as_ref() else {
+        return builtin_error("code_symbols", "缺少 workspace 上下文，无法查询符号");
+    };
+
+    let symbol_to_json = |s: &magi_knowledge_store::symbol_index::SymbolEntry| {
+        serde_json::json!({
+            "name": s.name,
+            "kind": format!("{:?}", s.kind),
+            "path": s.file_path,
+            "line": s.line,
+            "endLine": s.end_line,
+            "exported": s.is_exported,
+            "container": s.container,
+            "signature": s.signature,
+        })
+    };
+
+    match action.as_str() {
+        "definition" => {
+            let Some(name) = request
+                .as_ref()
+                .and_then(|obj| field_string(obj, &["name", "symbol"]))
+            else {
+                return builtin_error("code_symbols", "action=definition 需要 name 字段");
+            };
+            let limit = request
+                .as_ref()
+                .and_then(|obj| field_usize(obj, &["limit", "max_results"]))
+                .unwrap_or(20)
+                .clamp(1, 100);
+            let Some(symbols) = store.find_symbol_definitions(workspace_id, &name, limit) else {
+                return builtin_error("code_symbols", "代码索引引擎未就绪");
+            };
+            let results: Vec<Value> = symbols.iter().map(symbol_to_json).collect();
+            serde_json::json!({
+                "tool": "code_symbols",
+                "status": "succeeded",
+                "access_mode": BuiltinToolAccessMode::ReadOnly.as_str(),
+                "action": "definition",
+                "name": name,
+                "returned_matches": results.len(),
+                "results": results,
+                "summary": format!("符号 \"{}\" 找到 {} 处定义", name, results.len())
+            })
+            .to_string()
+        }
+        "file_symbols" => {
+            let Some(path) = request
+                .as_ref()
+                .and_then(|obj| field_string(obj, &["path", "file", "filepath"]))
+            else {
+                return builtin_error("code_symbols", "action=file_symbols 需要 path 字段");
+            };
+            let Some(symbols) = store.list_file_symbols(workspace_id, &path) else {
+                return builtin_error("code_symbols", "代码索引引擎未就绪");
+            };
+            let results: Vec<Value> = symbols.iter().map(symbol_to_json).collect();
+            serde_json::json!({
+                "tool": "code_symbols",
+                "status": "succeeded",
+                "access_mode": BuiltinToolAccessMode::ReadOnly.as_str(),
+                "action": "file_symbols",
+                "path": path,
+                "returned_matches": results.len(),
+                "results": results,
+                "summary": format!("文件 \"{}\" 含 {} 个符号", path, results.len())
+            })
+            .to_string()
+        }
+        other => builtin_error(
+            "code_symbols",
+            format!("未知 action：{other}（支持 definition / file_symbols）"),
+        ),
+    }
+}
 
 /// 从自然语言查询中抽取检索关键词：小写化、按非标识符字符切分、过滤停用词。
 /// 引擎融合路径与关键词遍历兜底路径共用，避免两处各写一份停用词表。
