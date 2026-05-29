@@ -4737,4 +4737,69 @@ mod tests {
             Some(BuiltinToolAccessMode::MaybeWrite)
         );
     }
+
+    #[test]
+    fn search_semantic_fuses_engine_and_grep() {
+        // 造一个含已知符号的小仓库：auth.rs 含符号 authenticate_user，
+        // notes.txt 含关键词但非代码符号（用于验证 grep 路补充）。
+        let root = unique_temp_dir("magi-tool-search-fuse");
+        fs::create_dir_all(root.join("src")).expect("create src");
+        fs::write(
+            root.join("src/auth.rs"),
+            "pub fn authenticate_user(token: &str) -> bool { !token.is_empty() }\n",
+        )
+        .expect("write auth.rs");
+        fs::write(
+            root.join("notes.txt"),
+            "authenticate flow described here\n",
+        )
+        .expect("write notes.txt");
+
+        // 构建索引并注入 KnowledgeStore。
+        let store = std::sync::Arc::new(magi_knowledge_store::KnowledgeStore::new());
+        let workspace_id = WorkspaceId::new("workspace-search-fuse");
+        store.build_workspace_index(&workspace_id, &root);
+
+        let governance = Arc::new(GovernanceService::default());
+        let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(16));
+        let mut tool_registry = ToolRegistry::new(governance, event_bus)
+            .with_knowledge_store(store);
+        tool_registry.register_default_builtins();
+
+        let context = ToolExecutionContext {
+            workspace_id: Some(workspace_id),
+            working_directory: Some(root.clone()),
+            ..ToolExecutionContext::default()
+        };
+
+        let output = tool_registry.execute_with_policy(
+            ToolExecutionInput {
+                tool_call_id: ToolCallId::new("tool-call-search-fuse"),
+                tool_name: BuiltinToolName::SearchSemantic.as_str().to_string(),
+                tool_kind: ToolKind::Builtin,
+                input: serde_json::json!({ "query": "authenticate user" }).to_string(),
+                approval_requirement: ApprovalRequirement::None,
+                risk_level: RiskLevel::Low,
+            },
+            context,
+            &ToolExecutionPolicy::default(),
+        );
+
+        assert_eq!(output.status, ExecutionResultStatus::Succeeded);
+        let payload: Value = serde_json::from_str(&output.payload).expect("payload json");
+        // 走的是融合引擎路（而非手写遍历兜底）。
+        assert_eq!(payload["engine"], "local_search_engine+grep");
+        let results = payload["results"].as_array().expect("results array");
+        assert!(!results.is_empty(), "应有命中结果");
+        // 引擎路命中代码符号文件。
+        assert!(
+            results
+                .iter()
+                .any(|r| r["source"] == "engine"
+                    && r["path"].as_str().is_some_and(|p| p.contains("auth.rs"))),
+            "引擎路应命中 auth.rs，实际: {results:?}"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
 }
