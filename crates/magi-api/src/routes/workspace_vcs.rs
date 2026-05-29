@@ -10,6 +10,20 @@ use tokio::process::Command;
 
 use crate::{errors::ApiError, state::ApiState};
 
+/// 校验传入路径属于已注册 workspace，返回可直接喂给 git 的规范化绝对路径。
+///
+/// 信任边界收口：只有注册过的 workspace 才允许执行 git 操作，避免对任意本地路径
+/// 探测分支 / 触发 checkout。与 workspaces.rs 的注册校验复用同一套规范化逻辑。
+fn resolve_registered_workspace(state: &ApiState, raw_path: &str) -> Result<String, ApiError> {
+    let canonical_path = super::workspaces::canonical_workspace_path(raw_path)?;
+    if super::workspaces::registered_workspace_for_path(state, &canonical_path).is_none() {
+        return Err(ApiError::InvalidInput(
+            "工作区未注册，无法执行 Git 操作".to_string(),
+        ));
+    }
+    Ok(canonical_path.to_string_lossy().to_string())
+}
+
 pub fn routes() -> Router<ApiState> {
     Router::new()
         .route("/workspace/vcs/branches", post(list_branches))
@@ -92,13 +106,11 @@ async fn uncommitted_diff_stat(workspace_path: &str) -> (u64, u64) {
 }
 
 async fn list_branches(
-    State(_state): State<ApiState>,
+    State(state): State<ApiState>,
     Json(request): Json<BranchesRequest>,
 ) -> Result<Json<BranchesResponse>, ApiError> {
-    let workspace_path = request.workspace_path.trim();
-    if workspace_path.is_empty() {
-        return Err(ApiError::InvalidInput("工作区路径不能为空".to_string()));
-    }
+    let workspace_path = resolve_registered_workspace(&state, &request.workspace_path)?;
+    let workspace_path = workspace_path.as_str();
 
     // 非 git 仓库：返回 isRepo:false，前端据此隐藏分支入口（不视为错误）。
     let inside_work_tree = run_git(workspace_path, &["rev-parse", "--is-inside-work-tree"]).await?;
@@ -138,14 +150,12 @@ async fn list_branches(
 }
 
 async fn checkout_branch(
-    State(_state): State<ApiState>,
+    State(state): State<ApiState>,
     Json(request): Json<CheckoutRequest>,
 ) -> Result<Json<CheckoutResponse>, ApiError> {
-    let workspace_path = request.workspace_path.trim();
+    let workspace_path = resolve_registered_workspace(&state, &request.workspace_path)?;
+    let workspace_path = workspace_path.as_str();
     let branch = request.branch.trim();
-    if workspace_path.is_empty() {
-        return Err(ApiError::InvalidInput("工作区路径不能为空".to_string()));
-    }
     if branch.is_empty() {
         return Err(ApiError::InvalidInput("目标分支不能为空".to_string()));
     }

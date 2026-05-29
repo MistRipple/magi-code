@@ -908,6 +908,8 @@
   async function selectBranch(branch: string) {
     const target = branch.trim();
     if (!target) return;
+    // 任务进行中禁止切换：切走工作树会破坏运行中 agent 的文件一致性。
+    if (sessionInputLocked || isInteractionBlocking) return;
     if (target === currentBranch) {
       branchPickerOpen = false;
       return;
@@ -922,6 +924,10 @@
         branchPickerOpen = false;
         // 切换后工作区改动行数可能变化（如非冲突改动跟随切换），重新拉取以刷新计数。
         void refreshBranchState();
+        // 广播工作区内容变更：文件树 / RightPane 等视图据此刷新，避免停留在旧分支内容。
+        window.dispatchEvent(new CustomEvent('magi:workspaceContentChanged', {
+          detail: { reason: 'branchSwitched', branch: currentBranch },
+        }));
       } else {
         // git 拒绝（如未提交改动会被覆盖）：原文展示在 popover，不关闭、不兜底。
         branchError = result.error || i18n.t('input.branch.switchFailed');
@@ -1165,7 +1171,7 @@
               class="ia-branch-btn"
               class:active={branchPickerOpen}
               onclick={toggleBranchPicker}
-              disabled={branchSwitching !== null}
+              disabled={branchSwitching !== null || sessionInputLocked || isInteractionBlocking}
               title={i18n.t('input.branch.title')}
               aria-expanded={branchPickerOpen}
             >

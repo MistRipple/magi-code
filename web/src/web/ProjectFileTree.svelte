@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onMount } from 'svelte';
   import Icon from '../components/Icon.svelte';
   import { i18n } from '../stores/i18n.svelte';
   import { listAgentDirectory, type DirectoryEntry } from './agent-api';
@@ -97,6 +98,13 @@
     resetTree(rootPath);
     void loadDirectory(rootPath, { force: true });
   }
+
+  // 工作区内容变更（如切分支）后刷新文件树，避免停留在旧分支的目录结构。
+  onMount(() => {
+    const handleWorkspaceContentChanged = () => refreshRoot();
+    window.addEventListener('magi:workspaceContentChanged', handleWorkspaceContentChanged);
+    return () => window.removeEventListener('magi:workspaceContentChanged', handleWorkspaceContentChanged);
+  });
 
   function toggleHiddenFiles(): void {
     showHidden = !showHidden;

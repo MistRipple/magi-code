@@ -132,7 +132,7 @@ async fn register_workspace(
     })))
 }
 
-fn canonical_workspace_path(raw_path: &str) -> Result<PathBuf, ApiError> {
+pub(crate) fn canonical_workspace_path(raw_path: &str) -> Result<PathBuf, ApiError> {
     let trimmed_path = raw_path.trim();
     if trimmed_path.is_empty() {
         return Err(ApiError::InvalidInput("工作区路径不能为空".to_string()));
@@ -149,7 +149,7 @@ fn canonical_workspace_path(raw_path: &str) -> Result<PathBuf, ApiError> {
     Ok(canonical_path)
 }
 
-fn registered_workspace_for_path(
+pub(crate) fn registered_workspace_for_path(
     state: &ApiState,
     canonical_path: &Path,
 ) -> Option<magi_workspace::WorkspaceRecord> {

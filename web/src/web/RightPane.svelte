@@ -1,5 +1,6 @@
 <script lang="ts">
   import hljs from 'highlight.js';
+  import { onMount } from 'svelte';
   import Icon from '../components/Icon.svelte';
   import MarkdownContent from '../components/MarkdownContent.svelte';
   import AgentTabContent from '../components/tabs/AgentTabContent.svelte';
@@ -43,6 +44,17 @@
   let fetchingFlags = $state<Record<string, boolean>>({});
   /** filepath → 拉取出错时的错误信息 */
   let fetchErrors = $state<Record<string, string>>({});
+
+  // 工作区内容变更（如切分支）后，清空已拉取的文件内容缓存，触发 $effect 按新分支重新拉取。
+  onMount(() => {
+    const handleWorkspaceContentChanged = () => {
+      fetchedContents = {};
+      fetchErrors = {};
+      fetchingFlags = {};
+    };
+    window.addEventListener('magi:workspaceContentChanged', handleWorkspaceContentChanged);
+    return () => window.removeEventListener('magi:workspaceContentChanged', handleWorkspaceContentChanged);
+  });
 
   const activeCodePayload = $derived.by<CodeTabPayload | null>(() => {
     if (!activeTab || activeTab.kind !== 'code') return null;
