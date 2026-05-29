@@ -43,22 +43,18 @@
   const accessProfileOptions: Array<{
     value: AccessProfile;
     labelKey: string;
-    descriptionKey: string;
   }> = [
     {
       value: 'read_only',
       labelKey: 'input.access.readOnly',
-      descriptionKey: 'input.access.readOnlyDesc',
     },
     {
       value: 'restricted',
       labelKey: 'input.access.restricted',
-      descriptionKey: 'input.access.restrictedDesc',
     },
     {
       value: 'full_access',
       labelKey: 'input.access.fullAccess',
-      descriptionKey: 'input.access.fullAccessDesc',
     },
   ];
 
@@ -1304,9 +1300,8 @@
         <div class="ia-picker-wrap">
           <button
             type="button"
-            class="ia-access-btn"
+            class="ia-picker-btn ia-access-btn"
             class:active={accessProfilePickerOpen}
-            class:full-access={selectedAccessProfile === 'full_access'}
             onclick={() => (accessProfilePickerOpen = !accessProfilePickerOpen)}
             disabled={sessionInputLocked || isInteractionBlocking}
             title={`${i18n.t('input.access.title')}: ${i18n.t(currentAccessProfileOption.labelKey)}`}
@@ -1332,7 +1327,6 @@
                     onclick={() => selectAccessProfile(option.value)}
                   >
                     <span class="ia-picker-item-label">{i18n.t(option.labelKey)}</span>
-                    <span class="ia-picker-item-desc">{i18n.t(option.descriptionKey)}</span>
                   </button>
                 {/each}
               </div>
@@ -1665,44 +1659,15 @@
     position: relative;
     display: inline-flex;
   }
-  .ia-access-btn {
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-    height: 24px;
-    max-width: 124px;
-    padding: 0 8px;
-    background: transparent;
-    border: 1px solid var(--border-subtle);
-    border-radius: var(--radius-full);
-    color: var(--foreground-muted);
-    font-size: 11px;
-    cursor: pointer;
-    transition: all var(--transition-fast);
-  }
-  .ia-access-btn:hover:not(:disabled) {
-    background: color-mix(in srgb, var(--primary) 12%, transparent);
-    border-color: color-mix(in srgb, var(--primary) 38%, transparent);
-    color: var(--primary);
-  }
-  .ia-access-btn:disabled { opacity: 0.4; cursor: not-allowed; }
-  .ia-access-btn.active {
-    background: color-mix(in srgb, var(--primary) 14%, transparent);
-    border-color: color-mix(in srgb, var(--primary) 42%, transparent);
-    color: var(--primary);
-  }
-  .ia-access-btn.full-access {
-    border-color: color-mix(in srgb, var(--warning, #d29922) 55%, var(--border-subtle));
-    color: var(--warning, #d29922);
-  }
   .ia-access-btn-label {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    max-width: 72px;
+    max-width: 112px;
   }
-  .ia-access-popover {
-    width: 260px;
+  .ia-access-popover .ia-picker-item-label {
+    white-space: nowrap;
+    word-break: keep-all;
   }
   .ia-picker-btn {
     display: inline-flex;
@@ -1803,6 +1768,12 @@
     border: 1px solid color-mix(in srgb, var(--border) 80%, var(--foreground) 20%);
     border-radius: var(--radius-md);
     box-shadow: 0 14px 40px rgba(0, 0, 0, 0.45), 0 2px 8px rgba(0, 0, 0, 0.22);
+  }
+  .ia-picker-popover.ia-access-popover {
+    box-sizing: border-box;
+    width: max-content;
+    min-width: 112px;
+    max-width: 132px;
   }
   .ia-picker-header {
     font-size: 11px;
