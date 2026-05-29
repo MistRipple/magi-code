@@ -29,6 +29,8 @@ restart_fixed_port() {
   if [ -n "$pids" ]; then
     kill -9 $pids 2>/dev/null || true
   fi
+
+  return 0
 }
 
 "$ROOT_DIR/scripts/prune-target.sh"
