@@ -5,16 +5,18 @@
 //!   [`CAPABILITY_ENTRIES`] 中。协议适配器（`anthropic.rs` / `openai_chat.rs`）
 //!   不再 hardcode 字符串前缀分支，统一调 [`resolve_capability_profile`]
 //!   查表。
-//! - **未知模型保守默认**：命中不到任何条目的 model id 走
-//!   [`UNKNOWN_MODEL_DEFAULT`]：不发 thinking / 不发 reasoning_effort，
-//!   不附加任何 beta header，避免向未知端点注入可能被拒绝的字段。
-//! - **单实现**：本模块只暴露 [`resolve_capability_profile`] 一个入口，
-//!   不并存 HashMap registry + 函数式查表两种路径
-//!   （cn-engineering-standard：不让同一功能长期并存多种实现方式）。
-//!
-//! 后续 Task #121 将由 `anthropic.rs::build_request` / `openai_chat.rs::build_request`
-//! 按 profile 字段装配 `thinking.budget_tokens` vs `thinking.effort` vs
-//! `thinking.display` 与 `reasoning_effort` 顶层字段，并注入必要 beta header。
+//! - **Claude thinking 兼容靠 legacy 白名单，而非枚举新版本**：实测服务端
+//!   契约——`claude-*-3-7 / 4-0 / 4-5 / 4-6` 仍认旧的
+//!   `thinking: { type:"enabled", budget_tokens }`；`4-7+`（含未来新版）已切到
+//!   Adaptive Thinking only mode（`thinking: { type:"adaptive" }` +
+//!   顶层 `output_config.effort`），旧形态会被 400 拒绝。Anthropic 方向是
+//!   adaptive-only 单调演进，新版本不会倒退回 budget_tokens——故策略反转为：
+//!   **枚举有限且封闭的 legacy 集走 budget_tokens，其余所有 `claude-*`
+//!   （含未知新版）默认 adaptive**，新模型开箱即用，不必逐版加前缀。
+//! - **非 Claude 未知模型保守默认**：命中不到任何条目、且非 `claude-` 前缀的
+//!   model id 走 [`UNKNOWN_MODEL_DEFAULT`]：不发 thinking / 不发
+//!   reasoning_effort，避免向未知端点注入可能被拒绝的字段。
+//! - **单实现**：本模块只暴露 [`resolve_capability_profile`] 一个入口。
 
 /// Anthropic Messages 协议下 `thinking` 字段的载荷形态。
 ///
@@ -90,14 +92,14 @@ pub const UNKNOWN_MODEL_DEFAULT: ModelCapabilityProfile = ModelCapabilityProfile
     beta_headers: &[],
 };
 
-/// Anthropic Claude 4.7+ 系列（Adaptive Thinking only mode）。
+/// Anthropic Claude Adaptive Thinking only mode（4.7+ 及未来新版默认）。
 ///
-/// 协议变化点：
-/// - `thinking.budget_tokens` 废弃 → 改用 `thinking: { type: "adaptive" }`，
-///   推理强度由顶层 `output_config.effort: "low|medium|high|xhigh"` 控制；
-/// - 引入 `thinking.display: "summarized"` 控制思考块返回形态；
+/// 协议形态（实测服务端契约）：
+/// - `thinking: { type: "adaptive" }`，推理强度由顶层
+///   `output_config.effort: "low|medium|high|xhigh"` 控制；
+/// - 支持 `thinking.display: "summarized"` 控制思考块返回形态；
 /// - 必须附带 beta header `anthropic-beta: task-budgets-2026-03-13`。
-const PROFILE_CLAUDE_4_7: ModelCapabilityProfile = ModelCapabilityProfile {
+const PROFILE_CLAUDE_ADAPTIVE: ModelCapabilityProfile = ModelCapabilityProfile {
     thinking_kind: ThinkingKind::Effort,
     supports_thinking_display: true,
     supports_openai_reasoning_effort: false,
@@ -126,51 +128,52 @@ const PROFILE_OPENAI_REASONING: ModelCapabilityProfile = ModelCapabilityProfile 
 };
 
 const CAPABILITY_ENTRIES: &[CapabilityEntry] = &[
-    // ===== Anthropic Claude 4.7+（Adaptive Thinking only mode） =====
-    // 前缀比下面 4.x legacy 条目更长，最长前缀匹配确保优先命中本条。
-    CapabilityEntry {
-        prefix: "claude-opus-4-7",
-        profile: PROFILE_CLAUDE_4_7,
-    },
-    CapabilityEntry {
-        prefix: "claude-sonnet-4-7",
-        profile: PROFILE_CLAUDE_4_7,
-    },
-    CapabilityEntry {
-        prefix: "claude-haiku-4-7",
-        profile: PROFILE_CLAUDE_4_7,
-    },
-    CapabilityEntry {
-        prefix: "claude-opus-4-8",
-        profile: PROFILE_CLAUDE_4_7,
-    },
-    CapabilityEntry {
-        prefix: "claude-sonnet-4-8",
-        profile: PROFILE_CLAUDE_4_7,
-    },
-    CapabilityEntry {
-        prefix: "claude-haiku-4-8",
-        profile: PROFILE_CLAUDE_4_7,
-    },
-    // ===== Anthropic Claude 3.7 / 4.0 / 4.5 / 4.6（legacy budget_tokens） =====
+    // ===== Anthropic Claude legacy（budget_tokens 白名单，封闭有限集） =====
+    // 只有这些明确的旧版本仍认 thinking:{type:"enabled", budget_tokens}。
+    // 其余所有 claude-* —— 含 4.7 / 4.8 及未来新版 —— 由 resolve 默认走
+    // adaptive（见 PROFILE_CLAUDE_ADAPTIVE + Claude 默认分支），不必逐版枚举。
     CapabilityEntry {
         prefix: "claude-3-7",
         profile: PROFILE_CLAUDE_BUDGET_TOKENS,
     },
+    // 4.0 系列（无小版本号或 4-0-*）。注意不要用裸 "claude-opus-4" 这类宽前缀，
+    // 否则会错误吞掉 4-7 / 4-8。
     CapabilityEntry {
-        prefix: "claude-opus-4",
+        prefix: "claude-opus-4-0",
         profile: PROFILE_CLAUDE_BUDGET_TOKENS,
     },
     CapabilityEntry {
-        prefix: "claude-sonnet-4",
+        prefix: "claude-sonnet-4-0",
         profile: PROFILE_CLAUDE_BUDGET_TOKENS,
     },
     CapabilityEntry {
-        prefix: "claude-haiku-4",
+        prefix: "claude-haiku-4-0",
+        profile: PROFILE_CLAUDE_BUDGET_TOKENS,
+    },
+    // 4.5 系列
+    CapabilityEntry {
+        prefix: "claude-opus-4-5",
         profile: PROFILE_CLAUDE_BUDGET_TOKENS,
     },
     CapabilityEntry {
-        prefix: "claude-4",
+        prefix: "claude-sonnet-4-5",
+        profile: PROFILE_CLAUDE_BUDGET_TOKENS,
+    },
+    CapabilityEntry {
+        prefix: "claude-haiku-4-5",
+        profile: PROFILE_CLAUDE_BUDGET_TOKENS,
+    },
+    // 4.6 系列
+    CapabilityEntry {
+        prefix: "claude-opus-4-6",
+        profile: PROFILE_CLAUDE_BUDGET_TOKENS,
+    },
+    CapabilityEntry {
+        prefix: "claude-sonnet-4-6",
+        profile: PROFILE_CLAUDE_BUDGET_TOKENS,
+    },
+    CapabilityEntry {
+        prefix: "claude-haiku-4-6",
         profile: PROFILE_CLAUDE_BUDGET_TOKENS,
     },
     // ===== OpenAI reasoning 系列 =====
@@ -194,9 +197,12 @@ const CAPABILITY_ENTRIES: &[CapabilityEntry] = &[
 
 /// 根据 model id 查表得到能力 profile。
 ///
-/// 匹配规则：遍历 [`CAPABILITY_ENTRIES`]，取**前缀最长**的命中项。最长
-/// 前缀语义保证 `claude-opus-4-7-xxx` 优先匹配 4.7 条目而不是更宽的
-/// `claude-opus-4`。任何未命中返回 [`UNKNOWN_MODEL_DEFAULT`]。
+/// 匹配规则：
+/// 1. 遍历 [`CAPABILITY_ENTRIES`]，取**前缀最长**的命中项（legacy 白名单 +
+///    OpenAI reasoning 系列）。
+/// 2. 未命中但以 `claude-` 开头 → 默认 [`PROFILE_CLAUDE_ADAPTIVE`]。
+///    覆盖 4.7 / 4.8 及一切未来 Claude 新版——无需逐版加前缀。
+/// 3. 其余未知 model id → [`UNKNOWN_MODEL_DEFAULT`]（保守不发 thinking）。
 pub fn resolve_capability_profile(model: &str) -> &'static ModelCapabilityProfile {
     let mut best: Option<&CapabilityEntry> = None;
     for entry in CAPABILITY_ENTRIES {
@@ -208,7 +214,15 @@ pub fn resolve_capability_profile(model: &str) -> &'static ModelCapabilityProfil
             _ => best = Some(entry),
         }
     }
-    best.map(|e| &e.profile).unwrap_or(&UNKNOWN_MODEL_DEFAULT)
+    if let Some(entry) = best {
+        return &entry.profile;
+    }
+    // 未命中白名单：Claude 系默认走 adaptive（adaptive-only 单调演进，
+    // 新版本只会是 adaptive），其余未知模型保守不发 thinking。
+    if model.starts_with("claude-") {
+        return &PROFILE_CLAUDE_ADAPTIVE;
+    }
+    &UNKNOWN_MODEL_DEFAULT
 }
 
 #[cfg(test)]
@@ -216,7 +230,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn opus_4_7_maps_to_effort_profile_with_beta_header() {
+    fn opus_4_7_maps_to_adaptive_profile_with_beta_header() {
         let profile = resolve_capability_profile("claude-opus-4-7-20260520");
         assert_eq!(profile.thinking_kind, ThinkingKind::Effort);
         assert!(profile.supports_thinking_display);
@@ -229,8 +243,57 @@ mod tests {
     }
 
     #[test]
+    fn unenumerated_new_claude_versions_default_to_adaptive() {
+        // 兼容核心：未逐版枚举的新版本（4.8 / 4.9 / 5.0…）一律默认 adaptive，
+        // 开箱即用，不必每出一个新模型加一条前缀。
+        for model in [
+            "claude-opus-4-8",
+            "claude-opus-4-8-20260815",
+            "claude-sonnet-4-8",
+            "claude-haiku-4-9",
+            "claude-opus-5-0-20270101",
+            "claude-next-experimental",
+        ] {
+            let profile = resolve_capability_profile(model);
+            assert_eq!(
+                profile.thinking_kind,
+                ThinkingKind::Effort,
+                "新版 Claude {model} 应默认 adaptive(Effort) profile"
+            );
+            assert!(
+                !profile.beta_headers.is_empty(),
+                "adaptive profile 应带 beta header"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_claude_4_5_4_6_use_budget_tokens() {
+        for model in [
+            "claude-opus-4-5-20251101",
+            "claude-sonnet-4-5-20250929",
+            "claude-haiku-4-5-20251001",
+            "claude-opus-4-6",
+            "claude-opus-4-0-20250514",
+            "claude-3-7-sonnet-20250219",
+        ] {
+            let profile = resolve_capability_profile(model);
+            assert_eq!(
+                profile.thinking_kind,
+                ThinkingKind::BudgetTokens,
+                "legacy Claude {model} 应走 budget_tokens profile"
+            );
+            assert_eq!(profile.default_budget_tokens, 4096);
+            assert!(
+                profile.beta_headers.is_empty(),
+                "legacy profile 不带 adaptive beta header"
+            );
+        }
+    }
+
+    #[test]
     fn opus_4_5_falls_back_to_budget_tokens_profile() {
-        // 最长前缀语义：claude-opus-4-5 不应匹配到 claude-opus-4-7。
+        // 最长前缀语义：claude-opus-4-5 命中 legacy 白名单而非默认 adaptive。
         let profile = resolve_capability_profile("claude-opus-4-5-20250930");
         assert_eq!(profile.thinking_kind, ThinkingKind::BudgetTokens);
         assert!(!profile.supports_thinking_display);
