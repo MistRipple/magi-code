@@ -16,6 +16,7 @@ pub mod semantic_reranker;
 mod source_model;
 mod state;
 pub mod symbol_index;
+mod ts_symbol_extract;
 
 #[cfg(test)]
 mod tests;

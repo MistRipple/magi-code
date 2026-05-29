@@ -416,6 +416,24 @@ impl SymbolIndex {
 
     fn extract_symbols(&mut self, file_path: &str, content: &str) {
         let ext = file_extension(file_path);
+
+        // 优先用 tree-sitter（AST 级）提取；支持的语言走语法树，
+        // 不支持的语言回落到下方逐行正则提取（单一职责，按语言路由不双轨）。
+        if crate::ts_symbol_extract::tree_sitter_supports(ext) {
+            if let Some(entries) = crate::ts_symbol_extract::extract_symbols(file_path, content, ext)
+            {
+                let mut symbol_names = Vec::with_capacity(entries.len());
+                for entry in entries {
+                    symbol_names.push(entry.name.clone());
+                    self.symbols.entry(entry.name.clone()).or_default().push(entry);
+                }
+                if !symbol_names.is_empty() {
+                    self.file_symbols.insert(file_path.to_string(), symbol_names);
+                }
+                return;
+            }
+        }
+
         let Some(patterns) = self.lang_patterns.get(ext) else {
             return;
         };
