@@ -87,6 +87,9 @@ async fn register_workspace(
             &workspace.workspace_id,
             &canonical_path,
         );
+        state
+            .knowledge_store
+            .build_workspace_index(&workspace.workspace_id, &canonical_path);
         state.persist_knowledge_state()?;
         return Ok(Json(serde_json::json!({
             "workspaceId": workspace.workspace_id.to_string(),
@@ -109,6 +112,9 @@ async fn register_workspace(
                     &workspace.workspace_id,
                     &canonical_path,
                 );
+                state
+                    .knowledge_store
+                    .build_workspace_index(&workspace.workspace_id, &canonical_path);
                 state.persist_knowledge_state()?;
                 return Ok(Json(serde_json::json!({
                     "workspaceId": workspace.workspace_id.to_string(),
@@ -124,6 +130,9 @@ async fn register_workspace(
         &workspace_id,
         &canonical_path,
     );
+    state
+        .knowledge_store
+        .build_workspace_index(&workspace_id, &canonical_path);
     state.persist_workspace_durable_state()?;
     state.persist_knowledge_state()?;
     Ok(Json(serde_json::json!({

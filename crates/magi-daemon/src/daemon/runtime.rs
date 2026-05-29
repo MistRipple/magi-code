@@ -367,7 +367,7 @@ impl DaemonRuntime {
                 .into_iter()
                 .find(|workspace| workspace.workspace_id == ws_id)
         });
-        let ingested_code_index = if let Some(workspace) = active_workspace {
+        let ingested_code_index = if let Some(workspace) = active_workspace.as_ref() {
             if knowledge_store
                 .code_index_summary_for_workspace(&workspace.workspace_id)
                 .is_none_or(|summary| summary.files.is_empty())
@@ -393,6 +393,13 @@ impl DaemonRuntime {
         };
         if ingested_code_index {
             let _ = state_repository.save_knowledge_state(&knowledge_store.export_state());
+        }
+
+        // 装配本地代码检索引擎：引擎是进程内内存态，每次 daemon 启动都需构建
+        // （引擎内部有 .magi/cache 快照，新鲜时增量恢复、否则全量重建）。
+        if let Some(workspace) = active_workspace.as_ref() {
+            let scan_root = PathBuf::from(workspace.root_path.as_str());
+            knowledge_store.build_workspace_index(&workspace.workspace_id, &scan_root);
         }
 
         let runtime_maintenance = RuntimeMaintenance::new(
