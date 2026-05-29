@@ -37,6 +37,31 @@
     description: string;
   }
 
+  type AccessProfile = 'read_only' | 'restricted' | 'full_access';
+
+  const ACCESS_PROFILE_STORAGE_KEY = 'magi-composer-access-profile';
+  const accessProfileOptions: Array<{
+    value: AccessProfile;
+    labelKey: string;
+    descriptionKey: string;
+  }> = [
+    {
+      value: 'read_only',
+      labelKey: 'input.access.readOnly',
+      descriptionKey: 'input.access.readOnlyDesc',
+    },
+    {
+      value: 'restricted',
+      labelKey: 'input.access.restricted',
+      descriptionKey: 'input.access.restrictedDesc',
+    },
+    {
+      value: 'full_access',
+      labelKey: 'input.access.fullAccess',
+      descriptionKey: 'input.access.fullAccessDesc',
+    },
+  ];
+
   // 输入内容
   let inputValue = $state('');
 
@@ -87,7 +112,13 @@
   let branchIsRepo = $state(false);
   let branchAdditions = $state(0);
   let branchDeletions = $state(0);
+  let accessProfilePickerOpen = $state(false);
+  let selectedAccessProfile = $state<AccessProfile>('restricted');
   const currentPickerModel = $derived.by(() => readOrchestratorModel());
+  const currentAccessProfileOption = $derived.by(() => (
+    accessProfileOptions.find((option) => option.value === selectedAccessProfile)
+    ?? accessProfileOptions[1]
+  ));
   const auxiliaryConfig = $derived.by(() => getAuxiliaryConfigSnapshot());
   const auxiliaryEnhanceReady = $derived.by(() => hasUsableModelConfig(auxiliaryConfig));
   const enhanceButtonTitle = $derived.by(() => (
@@ -473,7 +504,31 @@
     handleComposerInput();
   }
 
+  function normalizeAccessProfile(value: unknown): AccessProfile {
+    return value === 'read_only' || value === 'restricted' || value === 'full_access'
+      ? value
+      : 'restricted';
+  }
+
+  function selectAccessProfile(profile: AccessProfile) {
+    selectedAccessProfile = profile;
+    accessProfilePickerOpen = false;
+    try {
+      window.localStorage.setItem(ACCESS_PROFILE_STORAGE_KEY, profile);
+    } catch {
+      // localStorage 不可用时，本轮内存态仍然生效。
+    }
+  }
+
   onMount(() => {
+    try {
+      selectedAccessProfile = normalizeAccessProfile(
+        window.localStorage.getItem(ACCESS_PROFILE_STORAGE_KEY),
+      );
+    } catch {
+      selectedAccessProfile = 'restricted';
+    }
+
     function handleFillComposer(event: Event) {
       const text = (event as CustomEvent<{ text?: string }>).detail?.text;
       if (typeof text !== 'string' || !text.trim()) return;
@@ -483,8 +538,22 @@
       queueMicrotask(focusEditor);
     }
     window.addEventListener('magi:fillComposer', handleFillComposer as EventListener);
-    void refreshBranchState();
     return () => window.removeEventListener('magi:fillComposer', handleFillComposer as EventListener);
+  });
+
+  // 分支状态随工作区 reactive 重查：currentWorkspacePath 由 SSE 异步 hydrate，
+  // 切换 workspace / session 也会变。监听它而非只在 onMount 查一次——否则首屏
+  // hydrate 慢于 onMount 时，分支查询发空 path 失败后 branchIsRepo 被永久置死，
+  // 表现为分支入口"时有时无"。path 为空则不查（等 hydrate），非空才查。
+  $effect(() => {
+    const workspacePath = messagesState.currentWorkspacePath;
+    // 读 currentSessionId 建立依赖：切会话也重查（分支状态与工作树绑定）。
+    void currentSessionId;
+    if (typeof workspacePath !== 'string' || !workspacePath.trim()) {
+      branchIsRepo = false;
+      return;
+    }
+    void refreshBranchState();
   });
 
   function resolveComposerRawContent(): string {
@@ -521,6 +590,7 @@
       text: submissionText,
       requestId,
       skillName: selectedSkill?.name ?? null,
+      accessProfile: selectedAccessProfile,
       followUpMode: isSending ? 'queue' : undefined,
       images: selectedImages.map((img) => ({
         name: img.name,
@@ -1234,6 +1304,44 @@
         <div class="ia-picker-wrap">
           <button
             type="button"
+            class="ia-access-btn"
+            class:active={accessProfilePickerOpen}
+            class:full-access={selectedAccessProfile === 'full_access'}
+            onclick={() => (accessProfilePickerOpen = !accessProfilePickerOpen)}
+            disabled={sessionInputLocked || isInteractionBlocking}
+            title={`${i18n.t('input.access.title')}: ${i18n.t(currentAccessProfileOption.labelKey)}`}
+            aria-expanded={accessProfilePickerOpen}
+            aria-label={i18n.t('input.access.title')}
+          >
+            <Icon name="shield" size={12} />
+            <span class="ia-access-btn-label">{i18n.t(currentAccessProfileOption.labelKey)}</span>
+            <Icon name="chevron-down" size={10} />
+          </button>
+          {#if accessProfilePickerOpen}
+            <!-- svelte-ignore a11y_click_events_have_key_events -->
+            <!-- svelte-ignore a11y_no_static_element_interactions -->
+            <div class="ia-popover-backdrop" onclick={() => (accessProfilePickerOpen = false)}></div>
+            <div class="ia-picker-popover ia-access-popover" role="menu">
+              <div class="ia-picker-header">{i18n.t('input.access.title')}</div>
+              <div class="ia-picker-list">
+                {#each accessProfileOptions as option (option.value)}
+                  <button
+                    type="button"
+                    class="ia-picker-item"
+                    class:selected={selectedAccessProfile === option.value}
+                    onclick={() => selectAccessProfile(option.value)}
+                  >
+                    <span class="ia-picker-item-label">{i18n.t(option.labelKey)}</span>
+                    <span class="ia-picker-item-desc">{i18n.t(option.descriptionKey)}</span>
+                  </button>
+                {/each}
+              </div>
+            </div>
+          {/if}
+        </div>
+        <div class="ia-picker-wrap">
+          <button
+            type="button"
             class="ia-picker-btn"
             class:active={pickerOpen}
             class:configured={currentPickerModel !== ''}
@@ -1556,6 +1664,45 @@
   .ia-picker-wrap {
     position: relative;
     display: inline-flex;
+  }
+  .ia-access-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    height: 24px;
+    max-width: 124px;
+    padding: 0 8px;
+    background: transparent;
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-full);
+    color: var(--foreground-muted);
+    font-size: 11px;
+    cursor: pointer;
+    transition: all var(--transition-fast);
+  }
+  .ia-access-btn:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--primary) 12%, transparent);
+    border-color: color-mix(in srgb, var(--primary) 38%, transparent);
+    color: var(--primary);
+  }
+  .ia-access-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .ia-access-btn.active {
+    background: color-mix(in srgb, var(--primary) 14%, transparent);
+    border-color: color-mix(in srgb, var(--primary) 42%, transparent);
+    color: var(--primary);
+  }
+  .ia-access-btn.full-access {
+    border-color: color-mix(in srgb, var(--warning, #d29922) 55%, var(--border-subtle));
+    color: var(--warning, #d29922);
+  }
+  .ia-access-btn-label {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 72px;
+  }
+  .ia-access-popover {
+    width: 260px;
   }
   .ia-picker-btn {
     display: inline-flex;

@@ -95,6 +95,7 @@ fn execute_dispatch_submission(
         trimmed_text,
         execution_goal,
         task_tier,
+        access_profile: request.requested_access_profile(),
         skill_name,
         target_role,
         request_id: signal.request_id.clone(),

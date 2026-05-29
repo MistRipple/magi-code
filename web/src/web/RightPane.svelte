@@ -9,6 +9,7 @@
     isKnownBinaryFile,
     isMarkdownFile,
     isWordFile,
+    isImageFile,
   } from '../lib/file-preview-utils';
   import {
     rightPaneState,
@@ -20,7 +21,7 @@
     type CodeTabPayload,
     type AgentTabPayload,
   } from '../stores/right-pane.svelte';
-  import { getAgentFilePreview } from './agent-api';
+  import { getAgentFilePreview, agentUrl, buildWorkspaceBoundQuery } from './agent-api';
 
   interface Props {
     workspaceRoot: string;
@@ -224,10 +225,91 @@
   const displayPath = $derived(getDisplayPath(activeFilePath, workspaceRoot));
   const markdownFile = $derived(isMarkdownFile(activeFilePath));
   const wordFile = $derived(isWordFile(activeFilePath));
-  const binaryFile = $derived(activeContentKind === 'binary' || (activeFilePath ? isKnownBinaryFile(activeFilePath) : false));
+  const imageFile = $derived(activeFilePath ? isImageFile(activeFilePath) : false);
+  // 图片虽属二进制，但走专门的 <img> 预览分支，故从 binaryFile（元信息兜底）排除。
+  const binaryFile = $derived(
+    !imageFile
+      && (activeContentKind === 'binary' || (activeFilePath ? isKnownBinaryFile(activeFilePath) : false)),
+  );
   const largeTextFile = $derived(activeContentKind === 'large_text');
   const symlinkFile = $derived(activeContentKind === 'symlink');
   const specialFile = $derived(activeContentKind === 'special');
+
+  // ============ 图片缩放 / 平移 ============
+  const IMAGE_ZOOM_MIN = 0.1;
+  const IMAGE_ZOOM_MAX = 8;
+  const IMAGE_ZOOM_STEP = 0.2;
+  let imageZoom = $state(1);
+  let imagePanX = $state(0);
+  let imagePanY = $state(0);
+  let imageDragging = $state(false);
+  let imageDragStartX = 0;
+  let imageDragStartY = 0;
+  let imagePanStartX = 0;
+  let imagePanStartY = 0;
+
+  // 切换文件时重置缩放/平移，避免沿用上一张图的视图状态。
+  $effect(() => {
+    void activeFilePath;
+    imageZoom = 1;
+    imagePanX = 0;
+    imagePanY = 0;
+  });
+
+  function clampZoom(value: number): number {
+    return Math.min(IMAGE_ZOOM_MAX, Math.max(IMAGE_ZOOM_MIN, value));
+  }
+
+  function setImageZoom(next: number) {
+    const clamped = clampZoom(next);
+    if (clamped === 1) {
+      imagePanX = 0;
+      imagePanY = 0;
+    }
+    imageZoom = clamped;
+  }
+
+  function zoomImageIn() {
+    setImageZoom(imageZoom + IMAGE_ZOOM_STEP);
+  }
+
+  function zoomImageOut() {
+    setImageZoom(imageZoom - IMAGE_ZOOM_STEP);
+  }
+
+  function resetImageZoom() {
+    imageZoom = 1;
+    imagePanX = 0;
+    imagePanY = 0;
+  }
+
+  function handleImageWheel(event: WheelEvent) {
+    event.preventDefault();
+    const factor = event.deltaY < 0 ? 1 + IMAGE_ZOOM_STEP : 1 / (1 + IMAGE_ZOOM_STEP);
+    setImageZoom(imageZoom * factor);
+  }
+
+  function handleImagePointerDown(event: PointerEvent) {
+    if (imageZoom <= 1) return;
+    imageDragging = true;
+    imageDragStartX = event.clientX;
+    imageDragStartY = event.clientY;
+    imagePanStartX = imagePanX;
+    imagePanStartY = imagePanY;
+    (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
+  }
+
+  function handleImagePointerMove(event: PointerEvent) {
+    if (!imageDragging) return;
+    imagePanX = imagePanStartX + (event.clientX - imageDragStartX);
+    imagePanY = imagePanStartY + (event.clientY - imageDragStartY);
+  }
+
+  function handleImagePointerUp(event: PointerEvent) {
+    if (!imageDragging) return;
+    imageDragging = false;
+    (event.currentTarget as HTMLElement).releasePointerCapture(event.pointerId);
+  }
 
   // ============ Markdown 渲染/源码切换 ============
   let markdownMode = $state<'rendered' | 'raw'>('rendered');
@@ -490,6 +572,38 @@
       <div class="right-pane-state">
         <Icon name="document" size={22} />
         <span>{i18n.t('web.filePreviewUnsupportedWord')}</span>
+      </div>
+    {:else if imageFile}
+      <div class="right-pane-image-wrap">
+        <div
+          class="right-pane-image"
+          class:dragging={imageDragging}
+          class:zoomed={imageZoom > 1}
+          role="img"
+          aria-label={displayPath}
+          onwheel={handleImageWheel}
+          onpointerdown={handleImagePointerDown}
+          onpointermove={handleImagePointerMove}
+          onpointerup={handleImagePointerUp}
+          onpointercancel={handleImagePointerUp}
+        >
+          <img
+            class="right-pane-image-el"
+            src={agentUrl('/api/files/raw', buildWorkspaceBoundQuery({ filePath: activeFilePath }))}
+            alt={displayPath}
+            draggable="false"
+            style={`transform: translate(${imagePanX}px, ${imagePanY}px) scale(${imageZoom});`}
+          />
+        </div>
+        <div class="right-pane-image-controls">
+          <button class="image-zoom-btn" onclick={zoomImageOut} disabled={imageZoom <= IMAGE_ZOOM_MIN} title={i18n.t('web.imageZoomOut')} aria-label={i18n.t('web.imageZoomOut')}>
+            <Icon name="minus" size={14} />
+          </button>
+          <button class="image-zoom-level" onclick={resetImageZoom} title={i18n.t('web.imageZoomReset')}>{Math.round(imageZoom * 100)}%</button>
+          <button class="image-zoom-btn" onclick={zoomImageIn} disabled={imageZoom >= IMAGE_ZOOM_MAX} title={i18n.t('web.imageZoomIn')} aria-label={i18n.t('web.imageZoomIn')}>
+            <Icon name="plus" size={14} />
+          </button>
+        </div>
       </div>
     {:else if binaryFile}
       <div class="right-pane-state right-pane-state--metadata">
@@ -942,6 +1056,103 @@
     color: var(--foreground-muted);
     font-size: var(--text-xs);
     font-variant-numeric: tabular-nums;
+  }
+
+  .right-pane-image-wrap {
+    position: relative;
+    width: 100%;
+    height: 100%;
+    box-sizing: border-box;
+  }
+
+  .right-pane-image {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 100%;
+    height: 100%;
+    padding: var(--space-4);
+    overflow: hidden;
+    box-sizing: border-box;
+    touch-action: none;
+  }
+
+  .right-pane-image.zoomed {
+    cursor: grab;
+  }
+
+  .right-pane-image.dragging {
+    cursor: grabbing;
+  }
+
+  .right-pane-image-el {
+    max-width: 100%;
+    max-height: 100%;
+    object-fit: contain;
+    transform-origin: center center;
+    will-change: transform;
+    user-select: none;
+    -webkit-user-drag: none;
+    /* 透明图片用棋盘格底衬出边界，避免与面板同色看不清 */
+    background-image:
+      linear-gradient(45deg, var(--surface-subtle, #e5e7eb) 25%, transparent 25%),
+      linear-gradient(-45deg, var(--surface-subtle, #e5e7eb) 25%, transparent 25%),
+      linear-gradient(45deg, transparent 75%, var(--surface-subtle, #e5e7eb) 75%),
+      linear-gradient(-45deg, transparent 75%, var(--surface-subtle, #e5e7eb) 75%);
+    background-size: 16px 16px;
+    background-position: 0 0, 0 8px, 8px -8px, -8px 0;
+    border-radius: var(--radius-sm, 4px);
+  }
+
+  .right-pane-image-controls {
+    position: absolute;
+    bottom: var(--space-3);
+    left: 50%;
+    transform: translateX(-50%);
+    display: flex;
+    align-items: center;
+    gap: var(--space-1);
+    padding: 4px 6px;
+    background: var(--surface-overlay, rgba(20, 20, 22, 0.82));
+    border: 1px solid var(--border-subtle, rgba(255, 255, 255, 0.12));
+    border-radius: var(--radius-md, 8px);
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
+    backdrop-filter: blur(6px);
+  }
+
+  .image-zoom-btn,
+  .image-zoom-level {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border: none;
+    background: transparent;
+    color: var(--foreground-on-overlay, #f5f5f5);
+    cursor: pointer;
+    border-radius: var(--radius-sm, 4px);
+  }
+
+  .image-zoom-btn {
+    width: 26px;
+    height: 26px;
+  }
+
+  .image-zoom-level {
+    min-width: 48px;
+    height: 26px;
+    padding: 0 6px;
+    font-size: var(--text-xs);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .image-zoom-btn:hover:not(:disabled),
+  .image-zoom-level:hover {
+    background: rgba(255, 255, 255, 0.14);
+  }
+
+  .image-zoom-btn:disabled {
+    opacity: 0.4;
+    cursor: default;
   }
 
   .right-pane-large-text {

@@ -471,7 +471,11 @@ fn watcher_incrementally_refreshes_index_on_file_change() {
 
     // 初始检索：新符号尚不存在。
     let before = store
-        .search_workspace_code(&workspace_id, "freshly added symbol", SearchOptions::default())
+        .search_workspace_code(
+            &workspace_id,
+            "freshly added symbol",
+            SearchOptions::default(),
+        )
         .expect("engine ready");
     assert!(
         !before.iter().any(|r| r.file_path.contains("added.rs")),
@@ -491,7 +495,11 @@ fn watcher_incrementally_refreshes_index_on_file_change() {
     for _ in 0..50 {
         std::thread::sleep(std::time::Duration::from_millis(100));
         let after = store
-            .search_workspace_code(&workspace_id, "freshly added symbol", SearchOptions::default())
+            .search_workspace_code(
+                &workspace_id,
+                "freshly added symbol",
+                SearchOptions::default(),
+            )
             .expect("engine ready");
         if after.iter().any(|r| r.file_path.contains("added.rs")) {
             hit = true;

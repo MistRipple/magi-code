@@ -265,6 +265,7 @@ impl BaseAdapter {
                         tool_use_id: result.tool_call_id,
                         content: result.content,
                         is_error: result.is_error,
+                        images: Vec::new(),
                     })
                     .collect();
 

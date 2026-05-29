@@ -5,7 +5,6 @@ use crate::{
     routing::{resolve_bridge_binding_id, resolve_observation_binding, resolve_route},
 };
 use magi_bridge_client::BridgeDispatchInput;
-use magi_governance::ToolKind;
 use magi_tool_runtime::{ToolExecutionContext, ToolExecutionInput};
 use std::path::PathBuf;
 
@@ -43,14 +42,11 @@ fn execute_builtin_dispatch(
     let context = builtin_context_for_dispatch(input.context, input.working_directory.as_deref());
     Ok(SkillDispatchResult::Builtin {
         output: runtime.tool_registry.execute_with_policy(
-            ToolExecutionInput {
-                tool_call_id: input.tool_call_id,
-                tool_name: input.tool_name,
-                tool_kind: ToolKind::Builtin,
-                input: input.payload,
-                approval_requirement: input.approval_requirement,
-                risk_level: input.risk_level,
-            },
+            ToolExecutionInput::for_builtin_invocation(
+                input.tool_call_id,
+                input.tool_name,
+                input.payload,
+            ),
             context,
             &plan.tool_policy,
         ),

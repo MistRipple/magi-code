@@ -22,7 +22,7 @@ pub use status::{
     WorkspaceLifecycleStatus,
 };
 pub use task::{
-    ProgressSummary, Task, TaskKind, TaskPolicy, TaskProjection, TaskRuntimePayload, TaskStatus,
-    TaskTier,
+    AccessProfile, ProgressSummary, Task, TaskKind, TaskPolicy, TaskProjection, TaskRuntimePayload,
+    TaskStatus, TaskTier,
 };
 pub use value_objects::{AbsolutePath, UtcMillis, WorkspaceRootPath, WorktreeRootPath};

@@ -1,6 +1,7 @@
 use crate::{
     BuiltinTool, BuiltinToolAccessMode, BuiltinToolName, BuiltinToolSpec, ToolExecutionContext,
-    ToolExecutionContextQuery, ToolRuntimeResources,
+    ToolExecutionContextQuery, ToolRuntimeResources, apply_patch::execute_apply_patch,
+    tool_catalog::execute_tool_catalog, view_image::execute_view_image,
 };
 use magi_core::{ApprovalRequirement, ExecutionResultStatus, RiskLevel, UtcMillis};
 use serde_json::Value;
@@ -96,8 +97,10 @@ impl BuiltinTool for NormalizedBuiltinTool {
     ) -> String {
         match self.name {
             BuiltinToolName::FileRead => execute_file_read(input, context),
+            BuiltinToolName::ViewImage => execute_view_image(input, context),
             BuiltinToolName::FileWrite => execute_file_write(input, context),
             BuiltinToolName::FilePatch => execute_file_patch(input, context),
+            BuiltinToolName::ApplyPatch => execute_apply_patch(input, context),
             BuiltinToolName::FileRemove => execute_file_remove(input, context),
             BuiltinToolName::FileMkdir => execute_file_mkdir(input, context),
             BuiltinToolName::FileCopy => execute_file_copy(input, context),
@@ -117,6 +120,7 @@ impl BuiltinTool for NormalizedBuiltinTool {
             BuiltinToolName::DiagramRender => execute_diagram_render(input),
             BuiltinToolName::KnowledgeQuery => execute_knowledge_query(input),
             BuiltinToolName::CodeSymbols => execute_code_symbols(input, context, resources),
+            BuiltinToolName::ToolCatalog => execute_tool_catalog(input, context),
             BuiltinToolName::AgentSpawn
             | BuiltinToolName::AgentWait
             | BuiltinToolName::TodoWrite
@@ -412,6 +416,9 @@ fn execute_search_text(input: &str, context: &ToolExecutionContext) -> String {
 
 fn execute_shell_exec(input: &str, context: &ToolExecutionContext) -> String {
     let request = parse_json_object(input);
+    if let Some(payload) = execute_shell_exec_background_action(input, request.as_ref(), context) {
+        return payload;
+    }
     let command = match required_string_or_raw(
         input,
         request.as_ref(),
@@ -515,6 +522,52 @@ fn execute_shell_exec(input: &str, context: &ToolExecutionContext) -> String {
         }
     })
     .to_string()
+}
+
+fn execute_shell_exec_background_action(
+    input: &str,
+    request: Option<&serde_json::Map<String, Value>>,
+    context: &ToolExecutionContext,
+) -> Option<String> {
+    let request = request?;
+    let action = field_string(request, &["action", "operation", "op"])
+        .map(|value| value.trim().to_ascii_lowercase());
+    let has_terminal_id = field_usize(request, &["terminal_id", "terminalId", "id"]).is_some();
+    let has_command = field_string(request, &["command", "script", "line"])
+        .is_some_and(|value| !value.trim().is_empty());
+
+    let mode = match action.as_deref() {
+        None if has_terminal_id && !has_command => "read",
+        None => return None,
+        Some("run" | "exec" | "command") => return None,
+        Some("read" | "poll" | "status") => "read",
+        Some("write" | "stdin" | "send") => "write",
+        Some("kill" | "stop" | "terminate" | "cancel") => "kill",
+        Some("list" | "ls") => "list",
+        Some(other) => {
+            return Some(builtin_error(
+                "shell_exec",
+                format!("未知后台进程动作: {other}"),
+            ));
+        }
+    };
+
+    Some(match mode {
+        "read" => {
+            execute_process_read_with_surface(input, context, "shell_exec", Some("background_read"))
+        }
+        "write" => execute_process_write_with_surface(
+            input,
+            context,
+            "shell_exec",
+            Some("background_write"),
+        ),
+        "kill" => {
+            execute_process_kill_with_surface(input, context, "shell_exec", Some("background_kill"))
+        }
+        "list" => execute_process_list_with_surface(context, "shell_exec", Some("background_list")),
+        _ => unreachable!("validated shell_exec background action"),
+    })
 }
 
 fn non_git_read_only_probe_payload(
@@ -929,14 +982,23 @@ fn execute_process_launch_with_surface(
 }
 
 fn execute_process_read(input: &str, context: &ToolExecutionContext) -> String {
+    execute_process_read_with_surface(input, context, "process_read", None)
+}
+
+fn execute_process_read_with_surface(
+    input: &str,
+    context: &ToolExecutionContext,
+    surface_tool: &str,
+    mode: Option<&str>,
+) -> String {
     let request = match parse_json_object(input) {
         Some(request) => request,
-        None => return builtin_error("process_read", "输入必须为 JSON 对象，包含 terminal_id"),
+        None => return builtin_error(surface_tool, "输入必须为 JSON 对象，包含 terminal_id"),
     };
     let Some(terminal_id) = field_usize(&request, &["terminal_id", "terminalId", "id"]) else {
-        return builtin_error("process_read", "缺少 terminal_id");
+        return builtin_error(surface_tool, "缺少 terminal_id");
     };
-    if let Some(error) = require_process_context("process_read", context) {
+    if let Some(error) = require_process_context(surface_tool, context) {
         return error;
     }
     let max_bytes = field_usize(&request, &["max_bytes", "preview_bytes", "limit"])
@@ -945,10 +1007,10 @@ fn execute_process_read(input: &str, context: &ToolExecutionContext) -> String {
 
     let mut table = PROCESS_TABLE.lock().expect("process table lock poisoned");
     let Some(process) = table.get_mut(&(terminal_id as u64)) else {
-        return builtin_error("process_read", format!("进程不存在: {terminal_id}"));
+        return builtin_error(surface_tool, format!("进程不存在: {terminal_id}"));
     };
     if !process_belongs_to_context(process, context) {
-        return builtin_error("process_read", "进程不属于当前 session/workspace");
+        return builtin_error(surface_tool, "进程不属于当前 session/workspace");
     }
     let running = process
         .child
@@ -966,8 +1028,8 @@ fn execute_process_read(input: &str, context: &ToolExecutionContext) -> String {
         max_bytes,
     );
 
-    serde_json::json!({
-        "tool": "process_read",
+    let mut payload = serde_json::json!({
+        "tool": surface_tool,
         "status": "succeeded",
         "terminal_id": terminal_id,
         "running": running,
@@ -978,78 +1040,113 @@ fn execute_process_read(input: &str, context: &ToolExecutionContext) -> String {
         } else {
             format!("进程 #{terminal_id} 已结束")
         }
-    })
-    .to_string()
+    });
+    if let Some(mode) = mode {
+        payload["mode"] = serde_json::Value::String(mode.to_string());
+    }
+    payload.to_string()
 }
 
 fn execute_process_write(input: &str, context: &ToolExecutionContext) -> String {
+    execute_process_write_with_surface(input, context, "process_write", None)
+}
+
+fn execute_process_write_with_surface(
+    input: &str,
+    context: &ToolExecutionContext,
+    surface_tool: &str,
+    mode: Option<&str>,
+) -> String {
     let request = match parse_json_object(input) {
         Some(request) => request,
-        None => return builtin_error("process_write", "输入必须为 JSON 对象，包含 terminal_id"),
+        None => return builtin_error(surface_tool, "输入必须为 JSON 对象，包含 terminal_id"),
     };
     let Some(terminal_id) = field_usize(&request, &["terminal_id", "terminalId", "id"]) else {
-        return builtin_error("process_write", "缺少 terminal_id");
+        return builtin_error(surface_tool, "缺少 terminal_id");
     };
-    if let Some(error) = require_process_context("process_write", context) {
+    if let Some(error) = require_process_context(surface_tool, context) {
         return error;
     }
     let content = field_string(&request, &["input", "content", "text"]).unwrap_or_default();
     let mut table = PROCESS_TABLE.lock().expect("process table lock poisoned");
     let Some(process) = table.get_mut(&(terminal_id as u64)) else {
-        return builtin_error("process_write", format!("进程不存在: {terminal_id}"));
+        return builtin_error(surface_tool, format!("进程不存在: {terminal_id}"));
     };
     if !process_belongs_to_context(process, context) {
-        return builtin_error("process_write", "进程不属于当前 session/workspace");
+        return builtin_error(surface_tool, "进程不属于当前 session/workspace");
     }
     let Some(stdin) = process.child.stdin.as_mut() else {
-        return builtin_error("process_write", format!("进程 #{terminal_id} 不接受输入"));
+        return builtin_error(surface_tool, format!("进程 #{terminal_id} 不接受输入"));
     };
     if let Err(error) = stdin.write_all(content.as_bytes()) {
-        return builtin_error("process_write", format!("写入进程失败: {error}"));
+        return builtin_error(surface_tool, format!("写入进程失败: {error}"));
     }
     let _ = stdin.flush();
-    serde_json::json!({
-        "tool": "process_write",
+    let mut payload = serde_json::json!({
+        "tool": surface_tool,
         "status": "succeeded",
         "terminal_id": terminal_id,
         "written_bytes": content.len(),
         "summary": format!("已写入进程 #{terminal_id}")
-    })
-    .to_string()
+    });
+    if let Some(mode) = mode {
+        payload["mode"] = serde_json::Value::String(mode.to_string());
+    }
+    payload.to_string()
 }
 
 fn execute_process_kill(input: &str, context: &ToolExecutionContext) -> String {
+    execute_process_kill_with_surface(input, context, "process_kill", None)
+}
+
+fn execute_process_kill_with_surface(
+    input: &str,
+    context: &ToolExecutionContext,
+    surface_tool: &str,
+    mode: Option<&str>,
+) -> String {
     let request = match parse_json_object(input) {
         Some(request) => request,
-        None => return builtin_error("process_kill", "输入必须为 JSON 对象，包含 terminal_id"),
+        None => return builtin_error(surface_tool, "输入必须为 JSON 对象，包含 terminal_id"),
     };
     let Some(terminal_id) = field_usize(&request, &["terminal_id", "terminalId", "id"]) else {
-        return builtin_error("process_kill", "缺少 terminal_id");
+        return builtin_error(surface_tool, "缺少 terminal_id");
     };
-    if let Some(error) = require_process_context("process_kill", context) {
+    if let Some(error) = require_process_context(surface_tool, context) {
         return error;
     }
     let mut table = PROCESS_TABLE.lock().expect("process table lock poisoned");
     let Some(process) = table.get_mut(&(terminal_id as u64)) else {
-        return builtin_error("process_kill", format!("进程不存在: {terminal_id}"));
+        return builtin_error(surface_tool, format!("进程不存在: {terminal_id}"));
     };
     if !process_belongs_to_context(process, context) {
-        return builtin_error("process_kill", "进程不属于当前 session/workspace");
+        return builtin_error(surface_tool, "进程不属于当前 session/workspace");
     }
     let _ = process.child.kill();
     let _ = process.child.wait();
     table.remove(&(terminal_id as u64));
-    serde_json::json!({
-        "tool": "process_kill",
+    let mut payload = serde_json::json!({
+        "tool": surface_tool,
         "status": "succeeded",
         "terminal_id": terminal_id,
         "summary": format!("已停止进程 #{terminal_id}")
-    })
-    .to_string()
+    });
+    if let Some(mode) = mode {
+        payload["mode"] = serde_json::Value::String(mode.to_string());
+    }
+    payload.to_string()
 }
 
 fn execute_process_list(context: &ToolExecutionContext) -> String {
-    if let Some(error) = require_process_context("process_list", context) {
+    execute_process_list_with_surface(context, "process_list", None)
+}
+
+fn execute_process_list_with_surface(
+    context: &ToolExecutionContext,
+    surface_tool: &str,
+    mode: Option<&str>,
+) -> String {
+    if let Some(error) = require_process_context(surface_tool, context) {
         return error;
     }
     let mut table = PROCESS_TABLE.lock().expect("process table lock poisoned");
@@ -1075,13 +1172,16 @@ fn execute_process_list(context: &ToolExecutionContext) -> String {
             "started_at": process.started_at_ms,
         }));
     }
-    serde_json::json!({
-        "tool": "process_list",
+    let mut payload = serde_json::json!({
+        "tool": surface_tool,
         "status": "succeeded",
         "processes": processes,
         "summary": "已列出当前上下文后台进程"
-    })
-    .to_string()
+    });
+    if let Some(mode) = mode {
+        payload["mode"] = serde_json::Value::String(mode.to_string());
+    }
+    payload.to_string()
 }
 
 fn spawn_managed_process_reader<T: Read + Send + 'static>(

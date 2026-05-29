@@ -17,7 +17,7 @@ pub fn tool_execution_status_label(status: ExecutionResultStatus) -> &'static st
 pub fn turn_item_status_for_tool_result(status: ExecutionResultStatus) -> &'static str {
     match status {
         ExecutionResultStatus::Succeeded => "completed",
-        ExecutionResultStatus::NeedsApproval => "blocked",
+        ExecutionResultStatus::NeedsApproval => "awaiting_approval",
         ExecutionResultStatus::Failed
         | ExecutionResultStatus::Rejected
         | ExecutionResultStatus::Cancelled => "failed",
@@ -118,7 +118,7 @@ mod tests {
         );
         assert_eq!(
             turn_item_status_for_tool_result(ExecutionResultStatus::NeedsApproval),
-            "blocked"
+            "awaiting_approval"
         );
         assert_eq!(
             turn_item_status_for_tool_result(ExecutionResultStatus::Cancelled),

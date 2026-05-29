@@ -4,7 +4,7 @@
 //! - `execute_task_tool_call`：单工具入口，按 BuiltinToolName 走 coordinator/写工具/policy/
 //!   safety gate/tool registry 各分支。
 //! - `execute_coordinator_tool`：协调器工具（agent_spawn / agent_wait）入口。
-//! - `task_policy_tool_rejection` / `safety_gate_rejection` 等支撑判定。
+//! - `task_policy_tool_decision` / `safety_gate_tool_decision` 等支撑判定。
 
 use std::{
     path::PathBuf,
@@ -20,11 +20,10 @@ use magi_bridge_client::{
     tool_concurrency::{ToolBatchKind, ToolConcurrencyInput, partition_tool_calls_with_inputs},
 };
 use magi_core::{
-    ApprovalRequirement, EventId, ExecutionResultStatus, RiskLevel, SessionId, TaskId, TaskKind,
-    TaskPolicy, TaskStatus, TaskTier, ToolCallId, UtcMillis, WorkspaceId,
+    EventId, ExecutionResultStatus, SessionId, TaskId, TaskKind, TaskPolicy, TaskStatus, TaskTier,
+    ToolCallId, UtcMillis, WorkspaceId,
 };
 use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
-use magi_governance::ToolKind;
 use magi_orchestrator::task_store::TaskStore;
 use magi_session_store::SessionStore;
 use magi_snapshot::{SnapshotSession, ToolHook, ToolHookCtx};
@@ -39,6 +38,7 @@ use crate::{
     task_execution_registry::{SpawnedChildExecutionRequest, TaskExecutionRegistry},
     task_helpers::{task_can_see_builtin_tool, task_is_long_mission},
     tool_declared_paths::{append_result_declared_paths, derive_declared_paths},
+    tool_result_utils::tool_execution_status_label,
 };
 use crate::{execute_skill_custom_tool, parse_skill_custom_tool_name};
 
@@ -59,6 +59,11 @@ const AGENT_ROLE_IDS: &[&str] = &["architect", "executor", "explorer", "reviewer
 enum AgentSpawnAccessMode {
     ReadOnly,
     ReadWrite,
+}
+
+pub(crate) struct ToolPreflightDecision {
+    pub(crate) payload: String,
+    pub(crate) status: ExecutionResultStatus,
 }
 
 impl AgentSpawnAccessMode {
@@ -940,7 +945,7 @@ fn agent_spawn_child_policy_snapshot(
 fn default_agent_spawn_policy() -> TaskPolicy {
     TaskPolicy {
         autonomy_level: "Autonomous".to_string(),
-        approval_mode: "DecisionOnly".to_string(),
+        access_profile: magi_core::AccessProfile::Restricted,
         allowed_tools: Vec::new(),
         denied_tools: Vec::new(),
         allowed_paths: Vec::new(),
@@ -1479,35 +1484,36 @@ fn execute_task_tool_call(
         return (rejection, ExecutionResultStatus::Failed);
     }
 
-    if let Some(rejection) = task_policy_tool_rejection(
+    let task_policy_decision = task_policy_tool_decision(
         task,
         &tool_call.function.name,
         &tool_call.function.arguments,
-    ) {
-        return (rejection, ExecutionResultStatus::Rejected);
-    }
+    );
 
-    // S8：SafetyGate 语义判定。Permission 通过后仍可能命中"高危子串"（如
-    // `git push --force` / `rm -rf`），此处对 arguments 内容直接做匹配。
-    if let Some(gate) = safety_gate {
-        if let Some(rejection) = safety_gate_rejection(
+    // S8：SafetyGate 语义判定。它和 TaskPolicy 都属于执行前判定：
+    // HardBlock 必须压过普通审批，TaskPolicy 的 Rejected 也不能被 SafetyGate
+    // 的 NeedsApproval 降级。
+    let safety_gate_decision = safety_gate.and_then(|gate| {
+        safety_gate_tool_decision(
             gate,
+            task.policy_snapshot
+                .as_ref()
+                .map(|policy| policy.access_profile)
+                .unwrap_or_default(),
             &tool_call.function.name,
             &tool_call.function.arguments,
-        ) {
-            return (rejection, ExecutionResultStatus::Rejected);
-        }
+        )
+    });
+    if let Some(decision) = select_preflight_decision(task_policy_decision, safety_gate_decision) {
+        return (decision.payload, decision.status);
     }
 
     let output = registry.execute_with_policy(
-        ToolExecutionInput {
-            tool_call_id: ToolCallId::new(&tool_call.id),
-            tool_name: tool_call.function.name.clone(),
-            tool_kind: ToolKind::Builtin,
-            input: tool_call.function.arguments.clone(),
-            approval_requirement: ApprovalRequirement::None,
-            risk_level: RiskLevel::Low,
-        },
+        ToolExecutionInput::for_builtin_invocation(
+            ToolCallId::new(&tool_call.id),
+            &tool_call.function.name,
+            tool_call.function.arguments.clone(),
+        ),
         ToolExecutionContext {
             worker_id: worker_id.cloned(),
             task_id: Some(task.task_id.clone()),
@@ -1515,17 +1521,24 @@ fn execute_task_tool_call(
             workspace_id: workspace_id.clone(),
             working_directory: workspace_root_path.cloned(),
         },
-        &ToolExecutionPolicy::default(),
+        &ToolExecutionPolicy {
+            access_profile: task
+                .policy_snapshot
+                .as_ref()
+                .map(|policy| policy.access_profile)
+                .unwrap_or_default(),
+            ..ToolExecutionPolicy::default()
+        },
     );
 
     (output.payload, output.status)
 }
 
-fn task_policy_tool_rejection(
+fn task_policy_tool_decision(
     task: &magi_core::Task,
     requested_tool_name: &str,
     arguments: &str,
-) -> Option<String> {
+) -> Option<ToolPreflightDecision> {
     let policy_snapshot = task.policy_snapshot.as_ref()?;
     let canonical_tool_name = canonical_builtin_tool_name(requested_tool_name)
         .unwrap_or_else(|| requested_tool_name.trim().to_string());
@@ -1534,9 +1547,11 @@ fn task_policy_tool_rejection(
         .command_mode
         .eq_ignore_ascii_case("no_tools")
     {
-        return Some(task_policy_rejection_payload(
+        return Some(task_policy_decision_payload(
             &canonical_tool_name,
+            ExecutionResultStatus::Rejected,
             format!("当前任务阶段不允许调用工具: {canonical_tool_name}"),
+            Some(policy_snapshot.access_profile),
         ));
     }
     // PermissionEngine 比对工具名是按字面比对，因此把 policy 中的别名先 canonical 化。
@@ -1554,6 +1569,7 @@ fn task_policy_tool_rejection(
         .collect();
 
     let engine = magi_permissions::PermissionEngine::with_builtin_defaults();
+    let access_profile = policy_snapshot.access_profile;
     let is_write_tool = BuiltinToolName::from_str(canonical_tool_name.as_str())
         .is_some_and(|tool| tool.is_write_operation());
 
@@ -1561,76 +1577,163 @@ fn task_policy_tool_rejection(
         tool_name: canonical_tool_name.as_str(),
         is_write_tool,
     };
-    if let magi_permissions::Decision::Deny { reason } = engine.decide(
-        &tool_request,
-        &canonical_policy,
-        magi_permissions::PermissionMode::Default,
+    if let Some(decision) = permission_decision_payload(
+        &canonical_tool_name,
+        engine.decide(&tool_request, &canonical_policy, access_profile),
+        access_profile,
     ) {
-        return Some(task_policy_rejection_payload(&canonical_tool_name, reason));
+        return Some(decision);
     }
     // shell_exec 在只读任务下需要 access_mode=read_only —— 走 ShellCommand 轴判定。
     if canonical_tool_name == BuiltinToolName::ShellExec.as_str() {
         let shell_request = magi_permissions::PermissionRequest::ShellCommand {
             arguments_json: arguments,
         };
-        if let magi_permissions::Decision::Deny { reason } = engine.decide(
-            &shell_request,
-            &canonical_policy,
-            magi_permissions::PermissionMode::Default,
+        if let Some(decision) = permission_decision_payload(
+            &canonical_tool_name,
+            engine.decide(&shell_request, &canonical_policy, access_profile),
+            access_profile,
         ) {
-            return Some(task_policy_rejection_payload(&canonical_tool_name, reason));
+            return Some(decision);
         }
     }
     None
+}
+
+fn select_preflight_decision(
+    task_policy_decision: Option<ToolPreflightDecision>,
+    safety_gate_decision: Option<ToolPreflightDecision>,
+) -> Option<ToolPreflightDecision> {
+    match (task_policy_decision, safety_gate_decision) {
+        (Some(policy), Some(safety)) => match (policy.status, safety.status) {
+            (_, ExecutionResultStatus::Rejected) => Some(safety),
+            (ExecutionResultStatus::Rejected, _) => Some(policy),
+            (_, ExecutionResultStatus::NeedsApproval) => Some(safety),
+            (ExecutionResultStatus::NeedsApproval, _) => Some(policy),
+            _ => Some(policy),
+        },
+        (Some(policy), None) => Some(policy),
+        (None, Some(safety)) => Some(safety),
+        (None, None) => None,
+    }
+}
+
+fn permission_decision_payload(
+    tool_name: &str,
+    decision: magi_permissions::Decision,
+    access_profile: magi_core::AccessProfile,
+) -> Option<ToolPreflightDecision> {
+    match decision {
+        magi_permissions::Decision::Allow => None,
+        magi_permissions::Decision::Deny { reason } => Some(task_policy_decision_payload(
+            tool_name,
+            ExecutionResultStatus::Rejected,
+            reason,
+            Some(access_profile),
+        )),
+        magi_permissions::Decision::NeedsApproval { reason } => Some(task_policy_decision_payload(
+            tool_name,
+            ExecutionResultStatus::NeedsApproval,
+            reason,
+            Some(access_profile),
+        )),
+    }
 }
 
 fn canonical_builtin_tool_name(tool_name: &str) -> Option<String> {
     BuiltinToolName::from_str(tool_name.trim()).map(|tool| tool.as_str().to_string())
 }
 
-fn task_policy_rejection_payload(tool_name: &str, error: String) -> String {
-    serde_json::json!({
-        "tool": tool_name,
-        "status": "rejected",
-        "error": error,
-    })
-    .to_string()
+fn task_policy_decision_payload(
+    tool_name: &str,
+    status: ExecutionResultStatus,
+    reason: String,
+    access_profile: Option<magi_core::AccessProfile>,
+) -> ToolPreflightDecision {
+    ToolPreflightDecision {
+        payload: serde_json::json!({
+            "tool": tool_name,
+            "status": tool_execution_status_label(status),
+            "error": reason,
+            "access_profile": access_profile.map(|profile| profile.as_str()),
+        })
+        .to_string(),
+        status,
+    }
 }
 
-/// S8：把 SafetyGate 的 Block / RequireApproval 判定折叠成"Rejected payload"。
-/// 当前 conversation_loop 没有交互审批通道（governance 走自己的回路），所以
-/// RequireApproval 在本层与 Block 同语义：拒绝执行并把原因回灌给模型，由模型决定
-/// 是否换更精确的命令或转向人审通道。
-fn safety_gate_rejection(
+/// S8：SafetyGate 的 HardBlock / RequireApprovalInRestricted 都是执行前判定。
+/// HardBlock 代表禁止执行；RequireApprovalInRestricted 代表受限模式下保留待审批语义。
+pub(crate) fn safety_gate_tool_decision(
     gate: &magi_safety_gate::SafetyGate,
+    access_profile: magi_core::AccessProfile,
     tool_name: &str,
     arguments: &str,
-) -> Option<String> {
+) -> Option<ToolPreflightDecision> {
     let canonical_tool_name =
         canonical_builtin_tool_name(tool_name).unwrap_or_else(|| tool_name.trim().to_string());
     match gate.evaluate(&canonical_tool_name, arguments) {
         magi_safety_gate::SafetyDecision::Allow => None,
-        magi_safety_gate::SafetyDecision::Block {
+        magi_safety_gate::SafetyDecision::AuditOnly { .. } => None,
+        magi_safety_gate::SafetyDecision::HardBlock {
             category,
             pattern,
             reason,
-        }
-        | magi_safety_gate::SafetyDecision::RequireApproval {
+        } => Some(safety_gate_decision_payload(
+            &canonical_tool_name,
+            ExecutionResultStatus::Rejected,
+            category,
+            magi_safety_gate::SafetyAction::HardBlock,
+            pattern,
+            reason,
+        )),
+        magi_safety_gate::SafetyDecision::RequireApprovalInRestricted {
             category,
             pattern,
             reason,
-        } => Some(
-            serde_json::json!({
-                "tool": canonical_tool_name,
-                "status": "rejected",
-                "error": reason,
-                "safety_gate": {
-                    "category": category.as_str(),
-                    "pattern": pattern,
-                },
-            })
-            .to_string(),
-        ),
+        } => match access_profile {
+            magi_core::AccessProfile::FullAccess => None,
+            magi_core::AccessProfile::Restricted => Some(safety_gate_decision_payload(
+                &canonical_tool_name,
+                ExecutionResultStatus::NeedsApproval,
+                category,
+                magi_safety_gate::SafetyAction::RequireApprovalInRestricted,
+                pattern,
+                reason,
+            )),
+            magi_core::AccessProfile::ReadOnly => Some(safety_gate_decision_payload(
+                &canonical_tool_name,
+                ExecutionResultStatus::Rejected,
+                category,
+                magi_safety_gate::SafetyAction::RequireApprovalInRestricted,
+                pattern,
+                format!("{reason}；只读分析模式不支持通过审批升级执行"),
+            )),
+        },
+    }
+}
+
+fn safety_gate_decision_payload(
+    tool_name: &str,
+    status: ExecutionResultStatus,
+    category: magi_safety_gate::SafetyCategory,
+    action: magi_safety_gate::SafetyAction,
+    pattern: String,
+    reason: String,
+) -> ToolPreflightDecision {
+    ToolPreflightDecision {
+        payload: serde_json::json!({
+            "tool": tool_name,
+            "status": tool_execution_status_label(status),
+            "error": reason,
+            "safety_gate": {
+                "category": category.as_str(),
+                "pattern": pattern,
+                "action": action.as_str(),
+            },
+        })
+        .to_string(),
+        status,
     }
 }
 
@@ -1679,7 +1782,7 @@ mod tests {
     fn long_mission_policy() -> TaskPolicy {
         TaskPolicy {
             autonomy_level: "Autonomous".to_string(),
-            approval_mode: "HumanCheckpoint".to_string(),
+            access_profile: magi_core::AccessProfile::Restricted,
             allowed_tools: Vec::new(),
             denied_tools: Vec::new(),
             allowed_paths: Vec::new(),
@@ -1823,15 +1926,16 @@ mod tests {
             AgentSpawnAccessMode::ReadOnly,
         ));
 
-        let rejection = task_policy_tool_rejection(
+        let decision = task_policy_tool_decision(
             &task,
             BuiltinToolName::FileWrite.as_str(),
             r#"{"path":"probe.txt","content":""}"#,
         )
         .expect("read-only agent should reject file_write");
         let payload: serde_json::Value =
-            serde_json::from_str(&rejection).expect("rejection should be json");
+            serde_json::from_str(&decision.payload).expect("rejection should be json");
 
+        assert_eq!(decision.status, ExecutionResultStatus::Rejected);
         assert_eq!(payload["status"].as_str(), Some("rejected"));
         assert_eq!(payload["tool"].as_str(), Some("file_write"));
         assert!(
@@ -1840,6 +1944,253 @@ mod tests {
                 .unwrap_or_default()
                 .contains("只读任务不允许执行写入工具")
         );
+    }
+
+    #[test]
+    fn human_checkpoint_policy_marks_write_shell_as_needs_approval() {
+        let mut task = test_task(
+            "task-human-approval-shell",
+            "task-human-approval-shell",
+            None,
+        );
+        task.policy_snapshot = Some(long_mission_policy());
+
+        let decision = task_policy_tool_decision(
+            &task,
+            BuiltinToolName::ShellExec.as_str(),
+            r#"{"command":"cargo test"}"#,
+        )
+        .expect("human checkpoint policy should require approval for write-like shell");
+        let payload: serde_json::Value =
+            serde_json::from_str(&decision.payload).expect("decision should be json");
+
+        assert_eq!(decision.status, ExecutionResultStatus::NeedsApproval);
+        assert_eq!(payload["status"].as_str(), Some("needs_approval"));
+        assert_eq!(payload["access_profile"].as_str(), Some("restricted"));
+    }
+
+    #[test]
+    fn full_access_policy_keeps_write_shell_autonomous() {
+        let mut task = test_task("task-full-access-shell", "task-full-access-shell", None);
+        task.policy_snapshot = Some(default_agent_spawn_policy());
+        task.policy_snapshot
+            .as_mut()
+            .expect("policy")
+            .access_profile = magi_core::AccessProfile::FullAccess;
+
+        assert!(
+            task_policy_tool_decision(
+                &task,
+                BuiltinToolName::ShellExec.as_str(),
+                r#"{"command":"cargo test"}"#,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn safety_gate_custom_rule_keeps_require_approval_status() {
+        let gate = magi_safety_gate::SafetyGate::new(vec![magi_safety_gate::SafetyRule::new(
+            "deploy-prod",
+            magi_safety_gate::SafetyCategory::Custom,
+        )]);
+
+        let decision = safety_gate_tool_decision(
+            &gate,
+            magi_core::AccessProfile::Restricted,
+            BuiltinToolName::ShellExec.as_str(),
+            r#"{"command":"deploy-prod"}"#,
+        )
+        .expect("custom rule should require approval");
+        let payload: serde_json::Value =
+            serde_json::from_str(&decision.payload).expect("decision should be json");
+
+        assert_eq!(decision.status, ExecutionResultStatus::NeedsApproval);
+        assert_eq!(payload["status"].as_str(), Some("needs_approval"));
+        assert_eq!(payload["safety_gate"]["category"].as_str(), Some("custom"));
+    }
+
+    #[test]
+    fn safety_gate_restricted_approval_is_skipped_in_full_access() {
+        let gate = magi_safety_gate::SafetyGate::new(vec![magi_safety_gate::SafetyRule::new(
+            "deploy-prod",
+            magi_safety_gate::SafetyCategory::Custom,
+        )]);
+
+        assert!(
+            safety_gate_tool_decision(
+                &gate,
+                magi_core::AccessProfile::FullAccess,
+                BuiltinToolName::ShellExec.as_str(),
+                r#"{"command":"deploy-prod"}"#,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn safety_gate_hard_block_is_not_skipped_in_full_access() {
+        let gate =
+            magi_safety_gate::SafetyGate::new(vec![magi_safety_gate::SafetyRule::with_action(
+                "destroy-everything",
+                magi_safety_gate::SafetyCategory::Custom,
+                magi_safety_gate::SafetyAction::HardBlock,
+            )]);
+
+        let decision = safety_gate_tool_decision(
+            &gate,
+            magi_core::AccessProfile::FullAccess,
+            BuiltinToolName::ShellExec.as_str(),
+            r#"{"command":"destroy-everything"}"#,
+        )
+        .expect("hard block must reject even in full access");
+
+        assert_eq!(decision.status, ExecutionResultStatus::Rejected);
+    }
+
+    #[test]
+    fn preflight_selects_safety_hard_block_over_restricted_shell_approval() {
+        let mut task = test_task("task-hard-block-shell", "task-hard-block-shell", None);
+        task.policy_snapshot = Some(long_mission_policy());
+        let gate =
+            magi_safety_gate::SafetyGate::new(vec![magi_safety_gate::SafetyRule::with_action(
+                "destroy-everything",
+                magi_safety_gate::SafetyCategory::Custom,
+                magi_safety_gate::SafetyAction::HardBlock,
+            )]);
+
+        let policy_decision = task_policy_tool_decision(
+            &task,
+            BuiltinToolName::ShellExec.as_str(),
+            r#"{"command":"destroy-everything"}"#,
+        )
+        .expect("restricted shell should require approval before safety merge");
+        let safety_decision = safety_gate_tool_decision(
+            &gate,
+            magi_core::AccessProfile::Restricted,
+            BuiltinToolName::ShellExec.as_str(),
+            r#"{"command":"destroy-everything"}"#,
+        )
+        .expect("hard block should reject");
+
+        let selected = select_preflight_decision(Some(policy_decision), Some(safety_decision))
+            .expect("preflight should select a decision");
+        let payload: serde_json::Value =
+            serde_json::from_str(&selected.payload).expect("decision should be json");
+
+        assert_eq!(selected.status, ExecutionResultStatus::Rejected);
+        assert_eq!(
+            payload["safety_gate"]["action"].as_str(),
+            Some("hard_block")
+        );
+    }
+
+    #[test]
+    fn preflight_keeps_task_rejection_over_safety_approval() {
+        let mut task = test_task("task-no-tools", "task-no-tools", None);
+        let mut policy = long_mission_policy();
+        policy.command_mode = "no_tools".to_string();
+        task.policy_snapshot = Some(policy);
+        let gate = magi_safety_gate::SafetyGate::new(vec![magi_safety_gate::SafetyRule::new(
+            "deploy-prod",
+            magi_safety_gate::SafetyCategory::Custom,
+        )]);
+
+        let policy_decision = task_policy_tool_decision(
+            &task,
+            BuiltinToolName::ShellExec.as_str(),
+            r#"{"command":"deploy-prod"}"#,
+        )
+        .expect("no_tools should reject tool calls");
+        let safety_decision = safety_gate_tool_decision(
+            &gate,
+            magi_core::AccessProfile::Restricted,
+            BuiltinToolName::ShellExec.as_str(),
+            r#"{"command":"deploy-prod"}"#,
+        )
+        .expect("safety should require approval");
+
+        let selected = select_preflight_decision(Some(policy_decision), Some(safety_decision))
+            .expect("preflight should select a decision");
+        let payload: serde_json::Value =
+            serde_json::from_str(&selected.payload).expect("decision should be json");
+
+        assert_eq!(selected.status, ExecutionResultStatus::Rejected);
+        assert_eq!(
+            payload["error"].as_str(),
+            Some("当前任务阶段不允许调用工具: shell_exec")
+        );
+    }
+
+    #[test]
+    fn task_tool_call_applies_builtin_invocation_policy() {
+        let event_bus = InMemoryEventBus::new(16);
+        let task_store = TaskStore::new();
+        let session_store = SessionStore::new();
+        let execution_registry = TaskExecutionRegistry::default();
+        let conversation_registry = ConversationRegistry::new();
+        let spawn_graph = Mutex::new(magi_spawn_graph::SpawnGraph::new());
+        let todo_ledger = magi_todo_ledger::TodoLedger::new();
+        let agent_role_registry = magi_agent_role::AgentRoleRegistry::load_default();
+        let mut tool_registry = ToolRegistry::new(
+            Arc::new(magi_governance::GovernanceService::default()),
+            Arc::new(InMemoryEventBus::new(8)),
+        );
+        tool_registry.register_default_builtins();
+        let dir = tempdir().expect("temp dir");
+        let target = dir.path().join("nested");
+        std::fs::create_dir_all(target.join("child")).expect("create nested dir");
+        std::fs::write(target.join("child").join("probe.txt"), "probe").expect("write probe");
+        let task = test_task("task-recursive-remove", "task-recursive-remove", None);
+        let session_id = SessionId::new("session-recursive-remove");
+        let workspace_id = Some(WorkspaceId::new("workspace-recursive-remove"));
+        let tool_call = ChatToolCall {
+            id: "call-recursive-remove".to_string(),
+            kind: "function".to_string(),
+            function: ChatToolFunction {
+                name: BuiltinToolName::FileRemove.as_str().to_string(),
+                arguments: serde_json::json!({
+                    "path": target.to_string_lossy(),
+                    "recursive": true
+                })
+                .to_string(),
+            },
+        };
+
+        let result = execute_task_tool_call_batch(
+            &event_bus,
+            Some(&tool_registry),
+            &agent_role_registry,
+            None,
+            None,
+            None,
+            &task_store,
+            &session_store,
+            &execution_registry,
+            &conversation_registry,
+            &spawn_graph,
+            None,
+            &todo_ledger,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &task,
+            &session_id,
+            &workspace_id,
+            Some(&dir.path().to_path_buf()),
+            None,
+            &[tool_call],
+            None,
+            None,
+        );
+
+        assert_eq!(result[0].1, ExecutionResultStatus::NeedsApproval);
+        assert!(result[0].0.contains("高风险工具必须人工审批"));
+        assert!(target.exists(), "需要审批的递归删除不能提前执行");
     }
 
     #[tokio::test(flavor = "multi_thread")]

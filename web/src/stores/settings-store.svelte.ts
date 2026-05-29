@@ -1,5 +1,5 @@
 import { getClientKind, vscode } from "../lib/vscode-bridge";
-import { onMount } from "svelte";
+import { onMount, untrack } from "svelte";
 import type { StandardMessage } from "../shared/protocol/message-protocol";
 import { MessageCategory } from "../shared/protocol/message-protocol";
 import { ensureArray } from "../lib/utils";
@@ -938,11 +938,10 @@ function createSettingsStore(props: { onClose?: () => void }) {
       i18n.setLocale(runtimeLocale);
     }
     applyUserRulesConfig(payload.userRulesConfig);
-    applyWorkerConfigs(
-      payload.workerConfigs as Record<string, any> | undefined,
-    );
-    applyOrchestratorConfig(payload.orchestratorConfig);
-    applyAuxiliaryConfig(payload.auxiliaryConfig);
+    // 主模型 / 辅助模型 / 引擎草稿不在此处派生——统一由监听
+    // appState.settingsBootstrapSnapshot 的 $effect 派生（见 createSettingsStore
+    // 顶部）。这样无论 snapshot 经由设置面板保存还是主线 picker 切换更新，
+    // 草稿都从同一事实源重新派生，不会出现两处各持副本的不同步。
     applyMcpServersPayload(payload.mcpServers);
     mcpServersHydrated = payload.mcpServersHydrated !== false;
     mcpServersLoading = false;
@@ -2369,6 +2368,29 @@ function createSettingsStore(props: { onClose?: () => void }) {
       .map((rule, index) => ({ rule, index }))
       .filter(({ rule }) => rule.category === category);
   }
+
+  // 主模型 / 辅助模型 / 引擎草稿统一派生自单一事实源
+  // messagesState.settingsBootstrapSnapshot —— 主线右下角 picker 与设置面板
+  // 共享同一份 snapshot。picker 切换模型会替换 snapshot 引用，此 effect 据此
+  // 重新派生草稿，确保「设置面板已打开时 picker 切换」也实时同步，消除两处
+  // 各持一份本地副本导致的不同步。apply 内部读写 workerConfigs/unsavedEngines，
+  // 用 untrack 包裹避免把它们登记为依赖造成自循环——本 effect 只应由 snapshot
+  // 引用变化驱动。
+  $effect(() => {
+    const snapshot = appState.settingsBootstrapSnapshot as
+      | AgentSettingsBootstrapSnapshot
+      | null;
+    if (!snapshot) {
+      return;
+    }
+    untrack(() => {
+      applyWorkerConfigs(
+        snapshot.workerConfigs as Record<string, any> | undefined,
+      );
+      applyOrchestratorConfig(snapshot.orchestratorConfig);
+      applyAuxiliaryConfig(snapshot.auxiliaryConfig);
+    });
+  });
 
   // 监听来自扩展的实时状态推送（仅保留 SSE 实时推送类型）
   onMount(() => {

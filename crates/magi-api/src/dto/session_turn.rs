@@ -1,4 +1,4 @@
-use magi_core::{EventId, SessionId, TaskId, UtcMillis};
+use magi_core::{AccessProfile, EventId, SessionId, TaskId, UtcMillis};
 use magi_session_store::{CANONICAL_TURN_SCHEMA_VERSION, CanonicalTurn, CanonicalTurnItem};
 use serde::{Deserialize, Serialize};
 
@@ -24,6 +24,8 @@ pub struct SessionTurnRequestDto {
     pub skill_name: Option<String>,
     #[serde(default)]
     pub images: Vec<SessionTurnImageDto>,
+    #[serde(default, alias = "access_profile")]
+    pub access_profile: Option<AccessProfile>,
     #[serde(alias = "request_id")]
     pub request_id: Option<String>,
     #[serde(alias = "user_message_id")]
@@ -58,6 +60,10 @@ impl SessionTurnRequestDto {
 
     pub fn requested_workspace_path(&self) -> Option<String> {
         trimmed_non_empty(self.workspace_path.as_deref())
+    }
+
+    pub fn requested_access_profile(&self) -> AccessProfile {
+        self.access_profile.unwrap_or_default()
     }
 
     pub fn trimmed_text(&self) -> Option<String> {
@@ -223,6 +229,7 @@ mod tests {
             text: Some("请分析项目".to_string()),
             skill_name: None,
             images: Vec::new(),
+            access_profile: None,
             request_id: None,
             user_message_id: None,
             placeholder_message_id: None,
@@ -233,6 +240,21 @@ mod tests {
         assert_eq!(
             request.timeline_message(request.trimmed_text().as_deref()),
             "请分析项目"
+        );
+    }
+
+    #[test]
+    fn session_turn_request_accepts_camel_case_access_profile() {
+        let request: SessionTurnRequestDto = serde_json::from_value(serde_json::json!({
+            "text": "请执行当前任务",
+            "images": [],
+            "accessProfile": "full_access"
+        }))
+        .expect("request should parse");
+
+        assert_eq!(
+            request.requested_access_profile(),
+            magi_core::AccessProfile::FullAccess
         );
     }
 }

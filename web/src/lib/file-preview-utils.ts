@@ -59,6 +59,12 @@ const BINARY_EXTENSIONS = new Set([
 
 const WORD_EXTENSIONS = new Set(['doc', 'docx']);
 
+// 可在 <img> 中直接预览的图片扩展名白名单，与后端 /api/files/raw 的
+// image_mime_for_path 保持一致。tiff 不在内（浏览器原生不支持）。
+const IMAGE_EXTENSIONS = new Set([
+  'png', 'jpg', 'jpeg', 'gif', 'webp', 'avif', 'bmp', 'ico', 'svg',
+]);
+
 export function getFileExtension(path: string): string {
   const normalized = path.split(/[\\/]/).pop() || path;
   const index = normalized.lastIndexOf('.');
@@ -84,4 +90,8 @@ export function isKnownBinaryFile(path: string): boolean {
 
 export function isWordFile(path: string): boolean {
   return WORD_EXTENSIONS.has(getFileExtension(path));
+}
+
+export function isImageFile(path: string): boolean {
+  return IMAGE_EXTENSIONS.has(getFileExtension(path));
 }

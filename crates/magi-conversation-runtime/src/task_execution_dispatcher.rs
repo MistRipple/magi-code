@@ -1308,11 +1308,13 @@ impl LlmTaskDispatcher {
         } else {
             None
         };
+        let safety_gate = self.build_safety_gate(execution_settings);
         run_session_turn_execution(SessionTurnExecutionRuntime {
             client: client.as_ref(),
             event_bus: self.event_bus.as_ref(),
             session_store: self.session_store.as_ref(),
             settings_store: execution_settings,
+            safety_gate: safety_gate.as_ref(),
             tool_registry: self.tool_registry.as_ref(),
             skill_runtime: self.skill_runtime.as_deref(),
             skill_dispatch_runtime: self.skill_dispatch_runtime.as_deref(),
@@ -1901,7 +1903,7 @@ mod tests {
             required_children: Vec::new(),
             policy_snapshot: Some(TaskPolicy {
                 autonomy_level: "Autonomous".to_string(),
-                approval_mode: "DecisionOnly".to_string(),
+                access_profile: magi_core::AccessProfile::Restricted,
                 allowed_tools: Vec::new(),
                 denied_tools: Vec::new(),
                 allowed_paths: Vec::new(),

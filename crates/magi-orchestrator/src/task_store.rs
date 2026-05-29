@@ -1,6 +1,6 @@
 use magi_core::{
-    DomainError, DomainResult, LeaseId, MissionId, ProgressSummary, Task, TaskId, TaskKind,
-    TaskPolicy, TaskProjection, TaskStatus, TaskTier, UtcMillis, WorkerId,
+    AccessProfile, DomainError, DomainResult, LeaseId, MissionId, ProgressSummary, Task, TaskId,
+    TaskKind, TaskPolicy, TaskProjection, TaskStatus, TaskTier, UtcMillis, WorkerId,
 };
 use magi_worker_runtime::WorkerRuntimeDurableSnapshot;
 use serde::{Deserialize, Serialize};
@@ -63,7 +63,7 @@ pub struct TaskStore {
 fn default_frozen_policy() -> TaskPolicy {
     TaskPolicy {
         autonomy_level: "Assisted".to_string(),
-        approval_mode: "Interactive".to_string(),
+        access_profile: AccessProfile::Restricted,
         allowed_tools: Vec::new(),
         denied_tools: Vec::new(),
         allowed_paths: Vec::new(),

@@ -16,13 +16,39 @@ use crate::{
     WorkerToolInvocation, derive_final_report,
 };
 use magi_bridge_client::BridgeDispatchRuntime;
-use magi_core::{SessionId, UtcMillis, WorkspaceId};
+use magi_core::{ApprovalRequirement, RiskLevel, SessionId, ToolCallId, UtcMillis, WorkspaceId};
 use magi_event_bus::InMemoryEventBus;
-use magi_governance::GovernanceService;
+use magi_governance::{GovernanceService, ToolKind};
 use magi_skill_runtime::SkillDispatchRuntime;
-use magi_tool_runtime::ToolRegistry;
+use magi_tool_runtime::{ToolExecutionInput, ToolRegistry};
 use std::io::{Read, Write};
 use std::sync::Arc;
+
+fn worker_tool_execution_input(
+    tool_call_id: &ToolCallId,
+    tool_name: &str,
+    tool_kind: &ToolKind,
+    input: &str,
+    approval_requirement: ApprovalRequirement,
+    risk_level: RiskLevel,
+) -> ToolExecutionInput {
+    if *tool_kind == ToolKind::Builtin {
+        return ToolExecutionInput::for_builtin_invocation(
+            tool_call_id.clone(),
+            tool_name,
+            input.to_string(),
+        );
+    }
+
+    ToolExecutionInput {
+        tool_call_id: tool_call_id.clone(),
+        tool_name: tool_name.to_string(),
+        tool_kind: tool_kind.clone(),
+        input: input.to_string(),
+        approval_requirement,
+        risk_level,
+    }
+}
 
 pub fn execute_intent_with_loopback_drivers(
     intent: &WorkerExecutionIntent,
@@ -77,15 +103,16 @@ pub fn execute_intent_with_drivers(
                 risk_level,
                 ..
             } => {
+                let execution_input = worker_tool_execution_input(
+                    tool_call_id,
+                    tool_name,
+                    tool_kind,
+                    input,
+                    *approval_requirement,
+                    *risk_level,
+                );
                 let output = tool_registry.execute_with_policy(
-                    magi_tool_runtime::ToolExecutionInput {
-                        tool_call_id: tool_call_id.clone(),
-                        tool_name: tool_name.clone(),
-                        tool_kind: tool_kind.clone(),
-                        input: input.clone(),
-                        approval_requirement: *approval_requirement,
-                        risk_level: *risk_level,
-                    },
+                    execution_input,
                     context.clone(),
                     &magi_tool_runtime::ToolExecutionPolicy::default(),
                 );
@@ -175,15 +202,16 @@ pub fn execute_intent_step_with_drivers(
             risk_level,
             ..
         } => {
+            let execution_input = worker_tool_execution_input(
+                tool_call_id,
+                tool_name,
+                tool_kind,
+                input,
+                *approval_requirement,
+                *risk_level,
+            );
             let output = tool_registry.execute_with_policy(
-                magi_tool_runtime::ToolExecutionInput {
-                    tool_call_id: tool_call_id.clone(),
-                    tool_name: tool_name.clone(),
-                    tool_kind: tool_kind.clone(),
-                    input: input.clone(),
-                    approval_requirement: *approval_requirement,
-                    risk_level: *risk_level,
-                },
+                execution_input,
                 context.clone(),
                 &magi_tool_runtime::ToolExecutionPolicy::default(),
             );

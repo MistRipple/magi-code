@@ -151,6 +151,57 @@ mod tests {
     }
 
     #[test]
+    fn apply_patch_definition_exposes_patch_envelope_contract() {
+        let definition = public_builtin_tool_definition("apply_patch").expect("public apply_patch");
+
+        assert_eq!(definition.kind, "function");
+        assert_eq!(definition.function.name, "apply_patch");
+        assert_eq!(
+            definition.function.parameters["required"],
+            serde_json::json!(["patch"])
+        );
+        assert!(
+            definition.function.parameters["properties"]["patch"]["description"]
+                .as_str()
+                .expect("patch description")
+                .contains("*** Begin Patch")
+        );
+    }
+
+    #[test]
+    fn view_image_definition_exposes_local_image_contract() {
+        let definition = public_builtin_tool_definition("view_image").expect("public view_image");
+
+        assert_eq!(definition.kind, "function");
+        assert_eq!(definition.function.name, "view_image");
+        assert_eq!(
+            definition.function.parameters["required"],
+            serde_json::json!(["path"])
+        );
+        assert!(
+            definition.function.description.contains("多模态工具结果"),
+            "view_image description should make multimodal behavior explicit"
+        );
+    }
+
+    #[test]
+    fn tool_catalog_definition_exposes_diagnostics_contract() {
+        let definition =
+            public_builtin_tool_definition("tool_catalog").expect("public tool_catalog");
+
+        assert_eq!(definition.kind, "function");
+        assert_eq!(definition.function.name, "tool_catalog");
+        assert_eq!(
+            definition.function.parameters["required"],
+            serde_json::json!([])
+        );
+        assert!(
+            definition.function.description.contains("健康状态"),
+            "tool_catalog description should make diagnostics behavior explicit"
+        );
+    }
+
+    #[test]
     fn internal_builtin_rejection_only_targets_known_internal_tools() {
         assert!(internal_builtin_tool_rejection_payload("process_launch").is_some());
         assert!(internal_builtin_tool_rejection_payload("shell_exec").is_none());

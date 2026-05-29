@@ -5,20 +5,19 @@ use crate::tool_result_utils::{
 use crate::{
     SKILL_APPLY_TOOL_NAME, execute_skill_apply_from_runtime, execute_skill_custom_tool,
     internal_builtin_tool_rejection_payload, parse_skill_custom_tool_name,
+    tool_batch::safety_gate_tool_decision,
 };
 use magi_bridge_client::{
     ChatMessage, ChatToolCall,
     tool_concurrency::{ToolBatchKind, ToolConcurrencyInput, partition_tool_calls_with_inputs},
 };
 use magi_core::{
-    ApprovalRequirement, EventId, ExecutionResultStatus, RiskLevel, SessionId, TaskId, ThreadId,
-    ToolCallId, UtcMillis, WorkspaceId,
+    EventId, ExecutionResultStatus, SessionId, TaskId, ThreadId, ToolCallId, UtcMillis, WorkspaceId,
 };
 use magi_event_bus::{
     EventContext, EventEnvelope, InMemoryEventBus, SessionRuntimeTurnItemSummaryEntry,
     SessionRuntimeTurnSummaryEntry,
 };
-use magi_governance::ToolKind;
 use magi_orchestrator::task_store::TaskStore;
 use magi_session_store::{
     ActiveExecutionChain, ActiveExecutionTurn, ActiveExecutionTurnItem,
@@ -595,9 +594,11 @@ pub fn append_session_tool_call_items_batch(
     skill_runtime: Option<&SkillRuntime>,
     skill_dispatch_runtime: Option<&SkillDispatchRuntime>,
     skill_name: Option<&str>,
+    safety_gate: Option<&magi_safety_gate::SafetyGate>,
     session_id: &SessionId,
     workspace_id: &Option<WorkspaceId>,
     workspace_root_path: Option<PathBuf>,
+    access_profile: magi_core::AccessProfile,
     tool_calls: &[ChatToolCall],
     messages: &mut Vec<ChatMessage>,
     snapshot_session: Option<Arc<SnapshotSession>>,
@@ -643,10 +644,12 @@ pub fn append_session_tool_call_items_batch(
         skill_runtime,
         skill_dispatch_runtime,
         skill_name,
+        safety_gate,
         tool_calls,
         session_id,
         workspace_id,
         workspace_root_path.as_ref(),
+        access_profile,
         snapshot_session.as_ref(),
         &hook_contexts,
     );
@@ -724,10 +727,12 @@ fn execute_session_turn_tool_call_batch(
     skill_runtime: Option<&SkillRuntime>,
     skill_dispatch_runtime: Option<&SkillDispatchRuntime>,
     skill_name: Option<&str>,
+    safety_gate: Option<&magi_safety_gate::SafetyGate>,
     tool_calls: &[ChatToolCall],
     session_id: &SessionId,
     workspace_id: &Option<WorkspaceId>,
     workspace_root_path: Option<&PathBuf>,
+    access_profile: magi_core::AccessProfile,
     snapshot_session: Option<&Arc<SnapshotSession>>,
     hook_contexts: &[ToolHookCtx],
 ) -> Vec<(String, ExecutionResultStatus)> {
@@ -761,10 +766,12 @@ fn execute_session_turn_tool_call_batch(
                         skill_runtime,
                         skill_dispatch_runtime,
                         skill_name,
+                        safety_gate,
                         &tool_calls[tool_index],
                         session_id,
                         workspace_id,
                         workspace_root_path,
+                        access_profile,
                     );
                     append_result_declared_paths(&mut hook_ctx.declared_paths, &result.0);
                     if let Some(snapshot) = snapshot_session {
@@ -792,10 +799,12 @@ fn execute_session_turn_tool_call_batch(
                                         skill_runtime,
                                         skill_dispatch_runtime,
                                         skill_name,
+                                        safety_gate,
                                         tool_call,
                                         session_id,
                                         workspace_id,
                                         workspace_root_path,
+                                        access_profile,
                                     );
                                     append_result_declared_paths(
                                         &mut hook_ctx.declared_paths,
@@ -854,10 +863,12 @@ fn execute_session_turn_tool_call(
     skill_runtime: Option<&SkillRuntime>,
     skill_dispatch_runtime: Option<&SkillDispatchRuntime>,
     skill_name: Option<&str>,
+    safety_gate: Option<&magi_safety_gate::SafetyGate>,
     tool_call: &ChatToolCall,
     session_id: &SessionId,
     workspace_id: &Option<WorkspaceId>,
     workspace_root_path: Option<&PathBuf>,
+    access_profile: magi_core::AccessProfile,
 ) -> (String, ExecutionResultStatus) {
     let Some(registry) = tool_registry else {
         return (
@@ -915,15 +926,23 @@ fn execute_session_turn_tool_call(
         return (rejection, ExecutionResultStatus::Failed);
     }
 
+    if let Some(gate) = safety_gate
+        && let Some(decision) = safety_gate_tool_decision(
+            gate,
+            access_profile,
+            &tool_call.function.name,
+            &tool_call.function.arguments,
+        )
+    {
+        return (decision.payload, decision.status);
+    }
+
     let output = registry.execute_with_policy(
-        ToolExecutionInput {
-            tool_call_id: ToolCallId::new(&tool_call.id),
-            tool_name: tool_call.function.name.clone(),
-            tool_kind: ToolKind::Builtin,
-            input: tool_call.function.arguments.clone(),
-            approval_requirement: ApprovalRequirement::None,
-            risk_level: RiskLevel::Low,
-        },
+        ToolExecutionInput::for_builtin_invocation(
+            ToolCallId::new(&tool_call.id),
+            &tool_call.function.name,
+            tool_call.function.arguments.clone(),
+        ),
         ToolExecutionContext {
             worker_id: None,
             task_id: None,
@@ -931,7 +950,10 @@ fn execute_session_turn_tool_call(
             workspace_id: workspace_id.clone(),
             working_directory: workspace_root_path.cloned(),
         },
-        &ToolExecutionPolicy::default(),
+        &ToolExecutionPolicy {
+            access_profile,
+            ..ToolExecutionPolicy::default()
+        },
     );
     (output.payload, output.status)
 }
@@ -943,7 +965,7 @@ mod tests {
         BridgeBindingKind, BridgeDispatchAction, BridgeDispatchRuntime, BridgeResponse,
         ChatToolFunction, McpBridgeClient, McpToolCallRequest,
     };
-    use magi_core::{MissionId, ThreadId};
+    use magi_core::{ApprovalRequirement, MissionId, RiskLevel, ThreadId};
     use magi_governance::GovernanceService;
     use magi_session_store::{
         ActiveExecutionChain, ActiveExecutionDispatchContext, ActiveExecutionTurn,
@@ -1188,10 +1210,12 @@ mod tests {
             None,
             None,
             None,
+            None,
             &call,
             &SessionId::new("session-1"),
             &None,
             None,
+            magi_core::AccessProfile::Restricted,
         );
 
         assert_eq!(status, ExecutionResultStatus::Failed);
@@ -1234,10 +1258,12 @@ mod tests {
             Some(&skill_runtime),
             None,
             None,
+            None,
             &call,
             &SessionId::new("session-1"),
             &None,
             None,
+            magi_core::AccessProfile::Restricted,
         );
 
         assert_eq!(status, ExecutionResultStatus::Succeeded);
@@ -1295,10 +1321,12 @@ mod tests {
             Some(&skill_runtime),
             Some(&skill_dispatch_runtime),
             Some("code-review"),
+            None,
             &call,
             &SessionId::new("session-1"),
             &None,
             None,
+            magi_core::AccessProfile::Restricted,
         );
 
         assert_eq!(status, ExecutionResultStatus::Succeeded);
@@ -1336,10 +1364,12 @@ mod tests {
             None,
             None,
             None,
+            None,
             &call,
             &SessionId::new("session-1"),
             &None,
             None,
+            magi_core::AccessProfile::Restricted,
         );
 
         assert_eq!(status, ExecutionResultStatus::Failed);
@@ -1352,6 +1382,135 @@ mod tests {
                 .expect("error should be string")
                 .contains("shell_exec")
         );
+    }
+
+    #[test]
+    fn execute_session_turn_tool_call_applies_safety_gate() {
+        let tool_registry = ToolRegistry::new(
+            Arc::new(GovernanceService::default()),
+            Arc::new(InMemoryEventBus::new(8)),
+        );
+        let event_bus = InMemoryEventBus::new(8);
+        let safety_gate = magi_safety_gate::SafetyGate::with_builtin_defaults();
+        let call = ChatToolCall {
+            id: "tool-call-dangerous-shell".to_string(),
+            kind: "function".to_string(),
+            function: ChatToolFunction {
+                name: "shell_exec".to_string(),
+                arguments: serde_json::json!({
+                    "command": "rm -rf /tmp/magi-safety-gate-probe"
+                })
+                .to_string(),
+            },
+        };
+
+        let (payload, status) = execute_session_turn_tool_call(
+            &event_bus,
+            Some(&tool_registry),
+            None,
+            None,
+            None,
+            Some(&safety_gate),
+            &call,
+            &SessionId::new("session-1"),
+            &None,
+            None,
+            magi_core::AccessProfile::Restricted,
+        );
+
+        assert_eq!(status, ExecutionResultStatus::NeedsApproval);
+        let parsed: serde_json::Value = serde_json::from_str(&payload).expect("payload json");
+        assert_eq!(parsed["tool"], "shell_exec");
+        assert_eq!(parsed["status"], "needs_approval");
+        assert_eq!(parsed["safety_gate"]["pattern"], "rm -rf");
+    }
+
+    #[test]
+    fn execute_session_turn_tool_call_skips_restricted_safety_gate_in_full_access() {
+        let mut tool_registry = ToolRegistry::new(
+            Arc::new(GovernanceService::default()),
+            Arc::new(InMemoryEventBus::new(8)),
+        );
+        tool_registry.register_default_builtins();
+        let event_bus = InMemoryEventBus::new(8);
+        let safety_gate =
+            magi_safety_gate::SafetyGate::new(vec![magi_safety_gate::SafetyRule::new(
+                "printf full-access-ok",
+                magi_safety_gate::SafetyCategory::Custom,
+            )]);
+        let call = ChatToolCall {
+            id: "tool-call-full-access-shell".to_string(),
+            kind: "function".to_string(),
+            function: ChatToolFunction {
+                name: "shell_exec".to_string(),
+                arguments: serde_json::json!({
+                    "command": "printf full-access-ok"
+                })
+                .to_string(),
+            },
+        };
+
+        let (payload, status) = execute_session_turn_tool_call(
+            &event_bus,
+            Some(&tool_registry),
+            None,
+            None,
+            None,
+            Some(&safety_gate),
+            &call,
+            &SessionId::new("session-1"),
+            &None,
+            None,
+            magi_core::AccessProfile::FullAccess,
+        );
+
+        assert_eq!(status, ExecutionResultStatus::Succeeded);
+        let parsed: serde_json::Value = serde_json::from_str(&payload).expect("payload json");
+        assert_eq!(parsed["stdout"], "full-access-ok");
+    }
+
+    #[test]
+    fn execute_session_turn_tool_call_applies_builtin_invocation_policy() {
+        let mut tool_registry = ToolRegistry::new(
+            Arc::new(GovernanceService::default()),
+            Arc::new(InMemoryEventBus::new(8)),
+        );
+        tool_registry.register_default_builtins();
+        let event_bus = InMemoryEventBus::new(8);
+        let dir = tempfile::tempdir().expect("temp dir");
+        let target = dir.path().join("nested");
+        std::fs::create_dir_all(target.join("child")).expect("create nested dir");
+        std::fs::write(target.join("child").join("probe.txt"), "probe").expect("write probe");
+        let call = ChatToolCall {
+            id: "tool-call-recursive-remove".to_string(),
+            kind: "function".to_string(),
+            function: ChatToolFunction {
+                name: "file_remove".to_string(),
+                arguments: serde_json::json!({
+                    "path": target.to_string_lossy(),
+                    "recursive": true
+                })
+                .to_string(),
+            },
+        };
+
+        let (payload, status) = execute_session_turn_tool_call(
+            &event_bus,
+            Some(&tool_registry),
+            None,
+            None,
+            None,
+            None,
+            &call,
+            &SessionId::new("session-1"),
+            &None,
+            None,
+            magi_core::AccessProfile::Restricted,
+        );
+
+        assert_eq!(status, ExecutionResultStatus::NeedsApproval);
+        assert!(payload.contains("高风险工具必须人工审批"));
+        assert!(target.exists(), "需要审批的递归删除不能提前执行");
     }
 
     #[test]
@@ -1427,9 +1586,11 @@ mod tests {
             None,
             None,
             None,
+            None,
             &session_id,
             &workspace_id,
             None,
+            magi_core::AccessProfile::Restricted,
             &tool_calls,
             &mut messages,
             None,

@@ -288,6 +288,11 @@ function normalizeQueuedMessageList(value: unknown): QueuedMessage[] {
       skillName: typeof item.skillName === 'string' && item.skillName.trim()
         ? item.skillName.trim()
         : null,
+      accessProfile: item.accessProfile === 'read_only'
+        || item.accessProfile === 'restricted'
+        || item.accessProfile === 'full_access'
+        ? item.accessProfile
+        : null,
       images: ensureArray(item.images)
         .map(normalizeQueuedMessageImage)
         .filter((image): image is QueuedMessageImageItem => image !== null),

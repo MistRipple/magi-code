@@ -2118,6 +2118,7 @@ interface ExecuteTaskInput {
   text?: string | null;
   requestId?: string;
   skillName?: string | null;
+  accessProfile?: 'read_only' | 'restricted' | 'full_access' | null;
   followUpMode?: 'queue';
   images: Array<{
     name: string;
@@ -2142,6 +2143,7 @@ function enqueueFollowUpTurn(input: ExecuteTaskInput, normalizedText: string): v
     text: input.text ?? null,
     createdAt: Date.now(),
     skillName: input.skillName ?? null,
+    accessProfile: input.accessProfile ?? null,
     images: input.images,
   };
   enqueueQueuedMessage(queued);
@@ -2179,6 +2181,7 @@ async function drainQueuedTurns(reason: string): Promise<void> {
       text: next.text ?? next.content,
       requestId: next.requestId || next.id,
       skillName: next.skillName ?? null,
+      accessProfile: next.accessProfile ?? null,
       images: next.images ?? [],
     });
     if (!submitted) {
@@ -2272,6 +2275,7 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
       text,
       skillName,
       images,
+      accessProfile: input.accessProfile ?? null,
       requestId,
       userMessageId,
       placeholderMessageId,
@@ -3156,6 +3160,11 @@ export function createWebClientBridge(): ClientBridge {
               text: typeof message.text === 'string' ? message.text : null,
               requestId: typeof message.requestId === 'string' ? message.requestId : undefined,
               skillName: typeof message.skillName === 'string' ? message.skillName : null,
+              accessProfile: message.accessProfile === 'read_only'
+                || message.accessProfile === 'restricted'
+                || message.accessProfile === 'full_access'
+                ? message.accessProfile
+                : null,
               followUpMode: message.followUpMode === 'queue' ? 'queue' : undefined,
               images: Array.isArray(message.images)
                 ? message.images as Array<{ name: string; dataUrl: string }>

@@ -1271,7 +1271,7 @@ mod tests {
         let builtin_tools = bootstrap["builtinTools"]
             .as_array()
             .expect("builtin tools should be an array");
-        assert_eq!(builtin_tools.len(), 27);
+        assert_eq!(builtin_tools.len(), 30);
         let builtin_names: Vec<_> = builtin_tools
             .iter()
             .map(|tool| tool["name"].as_str().expect("tool name"))
@@ -1280,8 +1280,10 @@ mod tests {
             builtin_names,
             vec![
                 "file_read",
+                "view_image",
                 "file_write",
                 "file_patch",
+                "apply_patch",
                 "file_remove",
                 "file_mkdir",
                 "file_copy",
@@ -1296,6 +1298,7 @@ mod tests {
                 "diagram_render",
                 "knowledge_query",
                 "code_symbols",
+                "tool_catalog",
                 "agent_spawn",
                 "agent_wait",
                 "todo_write",

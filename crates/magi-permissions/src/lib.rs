@@ -1,5 +1,5 @@
-//! 任务系统 — L7 Permissions：三维（工具 / 目录 / 命令）× 五模式
-//! （default / acceptAll / acceptEdits / plan / bypassPermissions）权限引擎。
+//! 任务系统 — L7 Permissions：三维（工具 / 目录 / 命令）× 产品级访问模式
+//! （read_only / restricted / full_access）权限引擎。
 //!
 //! 目标：把 read-only 判定、工具白名单、shell 命令写入识别、Task.policy
 //! 中的 allow/deny 列表统一收敛到一个 `PermissionEngine`，
@@ -10,8 +10,7 @@
 //!   * `ToolInvocation` — 按工具名 allow/deny
 //!   * `PathAccess` — 按目录读/写 scope
 //!   * `ShellCommand` — 按 shell 参数推断读/写性质
-//! - 五种 mode 通过单个 `PermissionMode` 枚举建模，调用方在每次 decide 时显式
-//!   传入（mode 一般来自 Task.policy）。引擎本身无状态，便于跨线程复用。
+//! - 访问模式来自 `TaskPolicy.access_profile`。引擎本身无状态，便于跨线程复用。
 //! - 引擎不直接处理用户审批弹窗；它只输出 `Decision`（Allow / Deny / NeedsApproval），
 //!   交给上层（SafetyGate / governance 服务 / UI）决定怎么呈现。
 //!
@@ -19,60 +18,9 @@
 //! 即"已经判定 NeedsApproval 之后由谁审批、怎么记录"；permissions 关注
 //! "在调用前根据规则给出 Allow/Deny/NeedsApproval"。两者职责互不重叠。
 
-use serde::{Deserialize, Serialize};
+use magi_core::AccessProfile;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-
-// ---------------------------------------------------------------------------
-// PermissionMode
-// ---------------------------------------------------------------------------
-
-/// 五种 permission 模式。同一份 `PermissionEngine` 服务所有 Conversation，
-/// 但具体调用时 caller 必须显式提供当前模式，避免误用全局开关。
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum PermissionMode {
-    /// 默认：按规则 allow/deny；命中模糊地带返回 NeedsApproval，由用户审批。
-    Default,
-    /// 自动同意所有写入；只有显式 deny 才会拒绝。开发自助场景使用。
-    AcceptAll,
-    /// 自动同意"编辑"类操作（文件写入、读类 shell）；shell 写命令仍需审批。
-    AcceptEdits,
-    /// 计划模式：所有可见副作用一律拒绝；模型只能 read / 查询，不能改文件或跑写命令。
-    Plan,
-    /// 已显式放行：例如 Mission 自己的隔离 worktree 内部，所有判定一律 Allow。
-    /// 调用方必须显式选择，引擎不会自动升级到该模式。
-    BypassPermissions,
-}
-
-impl Default for PermissionMode {
-    fn default() -> Self {
-        Self::Default
-    }
-}
-
-impl PermissionMode {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Default => "default",
-            Self::AcceptAll => "acceptAll",
-            Self::AcceptEdits => "acceptEdits",
-            Self::Plan => "plan",
-            Self::BypassPermissions => "bypassPermissions",
-        }
-    }
-
-    pub fn parse(input: &str) -> Option<Self> {
-        match input.trim() {
-            "default" | "Default" => Some(Self::Default),
-            "acceptAll" | "accept_all" | "acceptall" => Some(Self::AcceptAll),
-            "acceptEdits" | "accept_edits" | "acceptedits" => Some(Self::AcceptEdits),
-            "plan" | "Plan" => Some(Self::Plan),
-            "bypassPermissions" | "bypass_permissions" | "bypass" => Some(Self::BypassPermissions),
-            _ => None,
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // PermissionRequest / Decision
@@ -204,23 +152,19 @@ impl PermissionEngine {
         &self,
         request: &PermissionRequest<'_>,
         policy: &PermissionPolicy,
-        mode: PermissionMode,
+        access_profile: AccessProfile,
     ) -> Decision {
-        // Bypass 模式跳过任何规则。
-        if mode == PermissionMode::BypassPermissions {
-            return Decision::Allow;
-        }
         match request {
             PermissionRequest::ToolInvocation {
                 tool_name,
                 is_write_tool,
-            } => self.decide_tool(tool_name, *is_write_tool, policy, mode),
+            } => self.decide_tool(tool_name, *is_write_tool, policy, access_profile),
             PermissionRequest::PathAccess {
                 absolute_path,
                 kind,
-            } => self.decide_path(absolute_path, *kind, policy, mode),
+            } => self.decide_path(absolute_path, *kind, policy, access_profile),
             PermissionRequest::ShellCommand { arguments_json } => {
-                self.decide_shell_command(arguments_json, policy, mode)
+                self.decide_shell_command(arguments_json, policy, access_profile)
             }
         }
     }
@@ -230,7 +174,7 @@ impl PermissionEngine {
         tool_name: &str,
         is_write_tool: bool,
         policy: &PermissionPolicy,
-        mode: PermissionMode,
+        access_profile: AccessProfile,
     ) -> Decision {
         if policy.denied_tools.contains(tool_name) {
             return Decision::Deny {
@@ -242,18 +186,17 @@ impl PermissionEngine {
                 reason: format!("任务策略未授权工具：{tool_name}"),
             };
         }
-        if policy.is_read_only_command_mode() && is_write_tool {
+        if (access_profile == AccessProfile::ReadOnly || policy.is_read_only_command_mode())
+            && is_write_tool
+        {
             return Decision::Deny {
                 reason: format!("只读任务不允许执行写入工具：{tool_name}"),
             };
         }
-        match mode {
-            PermissionMode::Plan if is_write_tool => Decision::Deny {
-                reason: format!("计划模式拒绝写入工具：{tool_name}"),
-            },
-            PermissionMode::AcceptEdits if is_write_tool && !self.is_edit_tool(tool_name) => {
+        match access_profile {
+            AccessProfile::Restricted if is_write_tool && !self.is_edit_tool(tool_name) => {
                 Decision::NeedsApproval {
-                    reason: format!("acceptEdits 仅自动放行编辑类写入，{tool_name} 需审批"),
+                    reason: format!("受限执行仅自动放行编辑类写入，{tool_name} 需审批"),
                 }
             }
             _ => Decision::Allow,
@@ -265,7 +208,7 @@ impl PermissionEngine {
         absolute_path: &Path,
         kind: PathAccessKind,
         policy: &PermissionPolicy,
-        mode: PermissionMode,
+        access_profile: AccessProfile,
     ) -> Decision {
         if policy
             .denied_paths
@@ -287,14 +230,9 @@ impl PermissionEngine {
             };
         }
         if kind == PathAccessKind::Write {
-            if policy.is_read_only_command_mode() {
+            if access_profile == AccessProfile::ReadOnly || policy.is_read_only_command_mode() {
                 return Decision::Deny {
                     reason: format!("只读任务不允许写入路径：{}", absolute_path.display()),
-                };
-            }
-            if mode == PermissionMode::Plan {
-                return Decision::Deny {
-                    reason: format!("计划模式不允许写入路径：{}", absolute_path.display()),
                 };
             }
         }
@@ -305,20 +243,19 @@ impl PermissionEngine {
         &self,
         arguments_json: &str,
         policy: &PermissionPolicy,
-        mode: PermissionMode,
+        access_profile: AccessProfile,
     ) -> Decision {
         let is_read_only = Self::shell_arguments_request_read_only(arguments_json);
-        if policy.is_read_only_command_mode() && !is_read_only {
+        if (access_profile == AccessProfile::ReadOnly || policy.is_read_only_command_mode())
+            && !is_read_only
+        {
             return Decision::Deny {
                 reason: "只读任务中的 shell_exec 必须显式声明 access_mode=read_only".to_string(),
             };
         }
-        match mode {
-            PermissionMode::Plan if !is_read_only => Decision::Deny {
-                reason: "计划模式禁止执行可能写入的 shell 命令".to_string(),
-            },
-            PermissionMode::AcceptEdits if !is_read_only => Decision::NeedsApproval {
-                reason: "acceptEdits 不自动放行写类 shell 命令".to_string(),
+        match access_profile {
+            AccessProfile::Restricted if !is_read_only => Decision::NeedsApproval {
+                reason: "受限执行不自动放行写类 shell 命令".to_string(),
             },
             _ => Decision::Allow,
         }
@@ -359,18 +296,40 @@ fn path_is_within(target: &Path, root: &Path) -> bool {
 
 /// 内置只读工具名，供权限判定与 dedup 逻辑共享。
 const BUILTIN_READ_ONLY_TOOLS: &[&str] = &[
+    "file_read",
     "file_view",
+    "view_image",
+    "image_view",
+    "search_text",
     "code_search_regex",
+    "search_semantic",
+    "code_search_semantic",
+    "diff_preview",
     "web_search",
     "web_fetch",
     "diagram_render",
-    "code_search_semantic",
+    "knowledge_query",
     "project_knowledge_query",
+    "code_symbols",
+    "tool_catalog",
+    "tool_diagnostics",
+    "process_inspect",
 ];
 
-/// 编辑类写入工具：acceptEdits 模式下自动放行的子集，shell 等其他写入工具
+/// 编辑类写入工具：受限执行模式下自动放行的子集，shell 等其他写入工具
 /// 不在此列。
-const BUILTIN_EDIT_TOOLS: &[&str] = &["file_create", "file_edit", "file_insert", "file_remove"];
+const BUILTIN_EDIT_TOOLS: &[&str] = &[
+    "file_write",
+    "file_create",
+    "file_patch",
+    "file_edit",
+    "file_insert",
+    "apply_patch",
+    "file_remove",
+    "file_mkdir",
+    "file_copy",
+    "file_move",
+];
 
 #[cfg(test)]
 mod tests {
@@ -387,15 +346,15 @@ mod tests {
     }
 
     #[test]
-    fn bypass_mode_always_allows() {
+    fn full_access_does_not_override_read_only_command_policy() {
         let engine = PermissionEngine::with_builtin_defaults();
         let policy = policy_read_only();
         let req = PermissionRequest::ToolInvocation {
             tool_name: "file_edit",
             is_write_tool: true,
         };
-        let decision = engine.decide(&req, &policy, PermissionMode::BypassPermissions);
-        assert_eq!(decision, Decision::Allow);
+        let decision = engine.decide(&req, &policy, AccessProfile::FullAccess);
+        assert!(decision.is_deny());
     }
 
     #[test]
@@ -408,7 +367,7 @@ mod tests {
             tool_name: "file_edit",
             is_write_tool: true,
         };
-        let decision = engine.decide(&req, &policy, PermissionMode::Default);
+        let decision = engine.decide(&req, &policy, AccessProfile::Restricted);
         assert!(decision.is_deny());
     }
 
@@ -421,7 +380,7 @@ mod tests {
             tool_name: "file_edit",
             is_write_tool: true,
         };
-        let decision = engine.decide(&req, &policy, PermissionMode::Default);
+        let decision = engine.decide(&req, &policy, AccessProfile::Restricted);
         assert!(decision.is_deny());
     }
 
@@ -433,24 +392,24 @@ mod tests {
             tool_name: "file_edit",
             is_write_tool: true,
         };
-        let decision = engine.decide(&req, &policy, PermissionMode::Default);
+        let decision = engine.decide(&req, &policy, AccessProfile::Restricted);
         assert!(decision.is_deny());
     }
 
     #[test]
-    fn plan_mode_denies_write_tool() {
+    fn read_only_profile_denies_write_tool() {
         let engine = PermissionEngine::with_builtin_defaults();
         let policy = policy_empty();
         let req = PermissionRequest::ToolInvocation {
             tool_name: "file_edit",
             is_write_tool: true,
         };
-        let decision = engine.decide(&req, &policy, PermissionMode::Plan);
+        let decision = engine.decide(&req, &policy, AccessProfile::ReadOnly);
         assert!(decision.is_deny());
     }
 
     #[test]
-    fn accept_edits_passes_edit_tool_blocks_shell() {
+    fn restricted_profile_passes_edit_tool_blocks_shell() {
         let engine = PermissionEngine::with_builtin_defaults();
         let policy = policy_empty();
         let edit_req = PermissionRequest::ToolInvocation {
@@ -458,14 +417,30 @@ mod tests {
             is_write_tool: true,
         };
         assert_eq!(
-            engine.decide(&edit_req, &policy, PermissionMode::AcceptEdits),
+            engine.decide(&edit_req, &policy, AccessProfile::Restricted),
+            Decision::Allow
+        );
+        let canonical_edit_req = PermissionRequest::ToolInvocation {
+            tool_name: "file_write",
+            is_write_tool: true,
+        };
+        assert_eq!(
+            engine.decide(&canonical_edit_req, &policy, AccessProfile::Restricted),
+            Decision::Allow
+        );
+        let apply_patch_req = PermissionRequest::ToolInvocation {
+            tool_name: "apply_patch",
+            is_write_tool: true,
+        };
+        assert_eq!(
+            engine.decide(&apply_patch_req, &policy, AccessProfile::Restricted),
             Decision::Allow
         );
         let shell_req = PermissionRequest::ToolInvocation {
             tool_name: "shell_exec",
             is_write_tool: true,
         };
-        let decision = engine.decide(&shell_req, &policy, PermissionMode::AcceptEdits);
+        let decision = engine.decide(&shell_req, &policy, AccessProfile::Restricted);
         assert!(matches!(decision, Decision::NeedsApproval { .. }));
     }
 
@@ -479,7 +454,7 @@ mod tests {
             absolute_path: &path,
             kind: PathAccessKind::Read,
         };
-        let decision = engine.decide(&req, &policy, PermissionMode::Default);
+        let decision = engine.decide(&req, &policy, AccessProfile::Restricted);
         assert!(decision.is_deny());
     }
 
@@ -493,7 +468,7 @@ mod tests {
             absolute_path: &path,
             kind: PathAccessKind::Read,
         };
-        let decision = engine.decide(&req, &policy, PermissionMode::Default);
+        let decision = engine.decide(&req, &policy, AccessProfile::Restricted);
         assert!(decision.is_deny());
     }
 
@@ -505,7 +480,7 @@ mod tests {
         let req = PermissionRequest::ShellCommand {
             arguments_json: args,
         };
-        let decision = engine.decide(&req, &policy, PermissionMode::Default);
+        let decision = engine.decide(&req, &policy, AccessProfile::Restricted);
         assert_eq!(decision, Decision::Allow);
     }
 
@@ -517,7 +492,7 @@ mod tests {
         let req = PermissionRequest::ShellCommand {
             arguments_json: args,
         };
-        let decision = engine.decide(&req, &policy, PermissionMode::Default);
+        let decision = engine.decide(&req, &policy, AccessProfile::Restricted);
         assert!(decision.is_deny());
     }
 
@@ -530,16 +505,14 @@ mod tests {
     }
 
     #[test]
-    fn permission_mode_parse_round_trips() {
-        for mode in [
-            PermissionMode::Default,
-            PermissionMode::AcceptAll,
-            PermissionMode::AcceptEdits,
-            PermissionMode::Plan,
-            PermissionMode::BypassPermissions,
-        ] {
-            let s = mode.as_str();
-            assert_eq!(PermissionMode::parse(s), Some(mode));
-        }
+    fn full_access_allows_write_shell_without_permission_approval() {
+        let engine = PermissionEngine::with_builtin_defaults();
+        let policy = policy_empty();
+        let args = r#"{"command":"printf hi > out.txt"}"#;
+        let req = PermissionRequest::ShellCommand {
+            arguments_json: args,
+        };
+        let decision = engine.decide(&req, &policy, AccessProfile::FullAccess);
+        assert_eq!(decision, Decision::Allow);
     }
 }

@@ -34,6 +34,7 @@ export interface SessionTurnRequestDto {
   text?: string | null;
   skillName?: string | null;
   images: SessionTurnImageDto[];
+  accessProfile?: 'read_only' | 'restricted' | 'full_access' | null;
   requestId?: string | null;
   userMessageId?: string | null;
   placeholderMessageId?: string | null;
@@ -1221,7 +1222,7 @@ export interface ExecutorBindingDto {
 
 export interface TaskPolicyDto {
   autonomy_level: string;
-  approval_mode: string;
+  access_profile: 'read_only' | 'restricted' | 'full_access';
   allowed_tools: string[];
   denied_tools: string[];
   allowed_paths: string[];

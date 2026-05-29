@@ -10,8 +10,8 @@ use std::sync::{Arc, Mutex};
 use magi_agent_role::AgentRoleRegistry;
 use magi_bridge_client::ModelBridgeClient;
 use magi_core::{
-    DomainError, ExecutionOwnership, MissionId, SessionId, TaskExecutionTarget, TaskId, TaskKind,
-    TaskStatus, TaskTier, UtcMillis, WorkerId, WorkspaceId,
+    AccessProfile, DomainError, ExecutionOwnership, MissionId, SessionId, TaskExecutionTarget,
+    TaskId, TaskKind, TaskStatus, TaskTier, UtcMillis, WorkerId, WorkspaceId,
 };
 use magi_event_bus::{EventContext, InMemoryEventBus, task_events};
 use magi_orchestrator::{
@@ -47,6 +47,7 @@ pub struct DispatchSubmissionRequest {
     pub trimmed_text: Option<String>,
     pub execution_goal: Option<String>,
     pub task_tier: TaskTier,
+    pub access_profile: AccessProfile,
     pub skill_name: Option<String>,
     pub target_role: Option<String>,
     pub request_id: Option<String>,
@@ -140,10 +141,10 @@ pub fn cleanup_rejected_dispatch(
     }
 }
 
-fn build_task_policy(task_tier: TaskTier) -> magi_core::TaskPolicy {
+fn build_task_policy(task_tier: TaskTier, access_profile: AccessProfile) -> magi_core::TaskPolicy {
     magi_core::TaskPolicy {
         autonomy_level: "Autonomous".to_string(),
-        approval_mode: "DecisionOnly".to_string(),
+        access_profile,
         allowed_tools: Vec::new(),
         denied_tools: Vec::new(),
         allowed_paths: Vec::new(),
@@ -211,6 +212,7 @@ fn make_dispatch_task(
     now: UtcMillis,
     target_role: &str,
     task_tier: TaskTier,
+    access_profile: AccessProfile,
 ) -> magi_core::Task {
     magi_core::Task {
         task_id: task_id.clone(),
@@ -223,7 +225,7 @@ fn make_dispatch_task(
         status: TaskStatus::Pending,
         dependency_ids: Vec::new(),
         required_children: Vec::new(),
-        policy_snapshot: Some(build_task_policy(task_tier)),
+        policy_snapshot: Some(build_task_policy(task_tier, access_profile)),
         executor_binding: Some(serde_json::json!({
             "target_role": target_role,
             "capability_requirements": [],
@@ -319,6 +321,7 @@ pub fn run_dispatch_submission(
         now,
         target_role,
         request.task_tier,
+        request.access_profile,
     );
     runtime.task_store.insert_task(task);
     let event =
@@ -557,6 +560,7 @@ mod tests {
             trimmed_text: Some("创建 task-system-e2e.md".to_string()),
             execution_goal: Some("创建 task-system-e2e.md 并写入当前 marker".to_string()),
             task_tier: TaskTier::ExecutionChain,
+            access_profile: AccessProfile::Restricted,
             skill_name: None,
             target_role: Some("executor".to_string()),
             request_id: None,
@@ -640,6 +644,7 @@ mod tests {
             trimmed_text: Some("修复明确 bug 并跑相关验证".to_string()),
             execution_goal: Some("定位并修复 bug、再跑相关验证命令".to_string()),
             task_tier: TaskTier::ExecutionChain,
+            access_profile: AccessProfile::FullAccess,
             skill_name: None,
             target_role: Some("executor".to_string()),
             request_id: None,
@@ -678,6 +683,11 @@ mod tests {
             policy.task_tier,
             TaskTier::LongMission,
             "§3.2 反证：ExecutionChain 路径的 task 绝不应被记为 LongMission tier",
+        );
+        assert_eq!(
+            policy.access_profile,
+            AccessProfile::FullAccess,
+            "用户选择的访问模式必须写入 action task policy_snapshot",
         );
 
         let chain = graph
@@ -741,6 +751,7 @@ mod tests {
             trimmed_text: Some("跨多阶段重构：拆模块、迁数据、灰度切换".to_string()),
             execution_goal: Some("完成跨多阶段重构并保留每阶段可恢复的 checkpoint".to_string()),
             task_tier: TaskTier::LongMission,
+            access_profile: AccessProfile::Restricted,
             skill_name: None,
             target_role: Some("coordinator".to_string()),
             request_id: None,
@@ -856,6 +867,7 @@ mod tests {
             trimmed_text: Some("复杂任务模式：跨多阶段重构".to_string()),
             execution_goal: Some("跨多阶段重构".to_string()),
             task_tier: TaskTier::LongMission,
+            access_profile: AccessProfile::Restricted,
             skill_name: None,
             target_role: Some("executor".to_string()),
             request_id: None,

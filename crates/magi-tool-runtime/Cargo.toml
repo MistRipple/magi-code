@@ -13,3 +13,4 @@ magi-knowledge-store = { path = "../magi-knowledge-store" }
 reqwest = { workspace = true, features = ["blocking"] }
 regex = "1"
 urlencoding = "2"
+base64 = "0.22"

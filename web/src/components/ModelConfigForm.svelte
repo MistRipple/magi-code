@@ -158,7 +158,7 @@
           type="button"
           class="segmented-control__option"
           class:active={config.urlMode === 'standard'}
-          onclick={() => (config.urlMode = 'standard')}
+          onclick={() => { config.urlMode = 'standard'; markUserEdited(); }}
         >
           {i18n.t('settings.model.urlMode.standard')}
         </button>
@@ -166,7 +166,7 @@
           type="button"
           class="segmented-control__option"
           class:active={config.urlMode === 'full'}
-          onclick={() => (config.urlMode = 'full')}
+          onclick={() => { config.urlMode = 'full'; markUserEdited(); }}
         >
           {i18n.t('settings.model.urlMode.full')}
         </button>

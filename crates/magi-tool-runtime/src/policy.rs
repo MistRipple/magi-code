@@ -1,6 +1,7 @@
 use crate::{
     BuiltinToolAccessMode, ToolExecutionContext, ToolExecutionInput, ToolExecutionOutput,
     ToolExecutionPolicy, ToolRegistry, WriteProtectionScope,
+    apply_patch::apply_patch_declared_paths_from_input,
     builtin::{field_string, parse_json_object, resolve_path_with_context},
 };
 use magi_core::{ToolCallId, UtcMillis};
@@ -187,6 +188,17 @@ impl ToolRegistry {
 
         let request = parse_json_object(&input.input);
         let mut paths = Vec::new();
+
+        if crate::BuiltinToolName::from_str(input.tool_name.trim())
+            == Some(crate::BuiltinToolName::ApplyPatch)
+        {
+            for path_value in apply_patch_declared_paths_from_input(&input.input) {
+                if let Ok(path) = resolve_path_with_context(&path_value.to_string_lossy(), context)
+                {
+                    paths.push(normalize_path_for_lock(&path));
+                }
+            }
+        }
 
         if let Some(object) = &request {
             for key in [

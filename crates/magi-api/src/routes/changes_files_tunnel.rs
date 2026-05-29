@@ -1,6 +1,8 @@
 use axum::{
     Json, Router,
     extract::{Query, State},
+    http::header,
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 use serde::Deserialize;
@@ -35,6 +37,7 @@ pub fn routes() -> Router<ApiState> {
             post(revert_execution_group_changes),
         )
         .route("/files/content", get(get_file_content))
+        .route("/files/raw", get(get_file_raw))
         .route("/filesystem/list", get(list_filesystem))
         .route("/tunnel/start", post(start_tunnel))
         .route("/tunnel/stop", post(stop_tunnel))
@@ -335,6 +338,72 @@ async fn get_file_content(
         "filePath": query.file_path,
         "sessionId": query.session_id,
     })))
+}
+
+/// 按文件扩展名推断图片 MIME 类型；非图片返回 None（用于白名单拦截）。
+fn image_mime_for_path(path: &Path) -> Option<&'static str> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())?;
+    match ext.as_str() {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        "avif" => Some("image/avif"),
+        "bmp" => Some("image/bmp"),
+        "ico" => Some("image/x-icon"),
+        "svg" => Some("image/svg+xml"),
+        _ => None,
+    }
+}
+
+/// 返回图片文件原始字节流（带 Content-Type），供前端 `<img src>` 直接预览。
+///
+/// 与 `/files/content`（仅 UTF-8 文本）职责分离：图片是二进制，read_to_string
+/// 会乱码/报错。仅服务图片扩展名白名单——非图片返回 415，避免该端点被当作任意
+/// 文件下载通道。路径解析、工作区越界防护完全复用 content 端点的同一套逻辑。
+async fn get_file_raw(
+    State(state): State<ApiState>,
+    Query(query): Query<FileContentQuery>,
+) -> Result<Response, ApiError> {
+    let path = query
+        .file_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::InvalidInput("文件路径不能为空".to_string()))?;
+
+    let absolute_path = if query
+        .session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some()
+    {
+        let session_id = parse_session_id(query.session_id.as_deref())?;
+        let scope = resolve_session_change_scope(
+            &state,
+            &session_id,
+            query.workspace_id.as_deref(),
+            query.execution_group_id.as_deref(),
+        )?;
+        let (absolute, _relative) = safe_workspace_path(&scope.workspace_root, path)?;
+        absolute
+    } else {
+        let root = resolve_workspace_root_or_active(&state, query.workspace_id.as_deref())?;
+        let (absolute, _) = safe_workspace_path(&root, path)?;
+        absolute
+    };
+
+    let mime = image_mime_for_path(&absolute_path)
+        .ok_or_else(|| ApiError::InvalidInput("仅支持图片文件预览".to_string()))?;
+
+    let bytes = std::fs::read(&absolute_path)
+        .map_err(|e| ApiError::internal_assembly("读取文件内容失败", e))?;
+
+    Ok(([(header::CONTENT_TYPE, mime)], bytes).into_response())
 }
 
 #[derive(Debug, Deserialize)]

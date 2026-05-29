@@ -98,7 +98,7 @@ fn task_serialization_roundtrip() {
         required_children: Vec::new(),
         policy_snapshot: Some(TaskPolicy {
             autonomy_level: "full".to_string(),
-            approval_mode: "none".to_string(),
+            access_profile: crate::AccessProfile::Restricted,
             allowed_tools: vec!["search".to_string()],
             denied_tools: Vec::new(),
             allowed_paths: vec!["/src".to_string()],

@@ -724,6 +724,7 @@ fn sanitize_tool_order_removes_orphan_tool_results() {
                 tool_use_id: "orphan".into(),
                 content: "result".into(),
                 is_error: false,
+                images: Vec::new(),
             }]),
         },
     ];
@@ -755,6 +756,7 @@ fn sanitize_tool_order_preserves_valid_pairs() {
                 tool_use_id: "t1".into(),
                 content: "file content".into(),
                 is_error: false,
+                images: Vec::new(),
             }]),
         },
     ];

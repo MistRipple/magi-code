@@ -318,6 +318,7 @@ impl SkillRegistry {
         SkillToolRuntimePlan {
             skill_ids: resolved.skill_ids.clone(),
             tool_policy: ToolExecutionPolicy {
+                access_profile: magi_core::AccessProfile::Restricted,
                 source_skill_ids: resolved.skill_ids.clone(),
                 allowed_tool_names: allowed_builtin_tools,
                 denied_tool_names: denied_builtin_tools,
@@ -441,7 +442,21 @@ mod tests {
     use magi_tool_runtime::{
         BuiltinTool, BuiltinToolSpec, ToolExecutionContext, ToolRegistry, ToolRuntimeResources,
     };
-    use std::{path::PathBuf, sync::Arc};
+    use std::{
+        path::PathBuf,
+        sync::Arc,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    fn unique_temp_dir(name: &str) -> PathBuf {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("{}-{}-{}", name, std::process::id(), suffix));
+        std::fs::create_dir_all(&path).expect("create temp dir");
+        path
+    }
 
     #[derive(Clone, Debug)]
     struct EchoTool;
@@ -647,6 +662,62 @@ mod tests {
             Ok(SkillDispatchResult::Builtin { ref output })
                 if output.status == magi_core::ExecutionResultStatus::Succeeded
         ));
+    }
+
+    #[test]
+    fn builtin_dispatch_uses_runtime_invocation_policy() {
+        let governance = Arc::new(GovernanceService::default());
+        let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(16));
+        let mut tool_registry = ToolRegistry::new(governance, event_bus);
+        tool_registry.register_default_builtins();
+        let root = unique_temp_dir("magi-skill-runtime-policy");
+        let target = root.join("nested");
+        std::fs::create_dir_all(target.join("child")).expect("create nested dir");
+        std::fs::write(target.join("child").join("probe.txt"), "probe").expect("write probe");
+
+        let skill_registry = SkillRegistry::new();
+        skill_registry.register(SkillDefinition {
+            skill_id: "skill-policy".to_string(),
+            title: "Skill Policy".to_string(),
+            instruction: "instruction".to_string(),
+            metadata: SkillMetadata {
+                category: "general".to_string(),
+                tags: vec!["tag".to_string()],
+            },
+            allowed_tools: vec!["file_remove".to_string()],
+            custom_tool_bindings: vec![],
+            prompt_priority: 10,
+        });
+
+        let runtime = SkillDispatchRuntime::new(tool_registry, BridgeDispatchRuntime::new());
+        let plan = skill_registry.build_tool_runtime_plan(&SkillSelection {
+            skill_ids: vec!["skill-policy".to_string()],
+            requested_tools: vec!["file_remove".to_string()],
+        });
+        let outcome = runtime.dispatch_observed(
+            &plan,
+            SkillDispatchInput {
+                tool_call_id: ToolCallId::new("call-skill-policy"),
+                tool_name: "file_remove".to_string(),
+                binding_id: None,
+                payload: format!(
+                    r#"{{"path":"{}","recursive":true}}"#,
+                    target.to_string_lossy()
+                ),
+                approval_requirement: ApprovalRequirement::None,
+                risk_level: RiskLevel::Low,
+                context: ToolExecutionContext::default(),
+                working_directory: None,
+            },
+        );
+
+        assert_eq!(outcome.observation.status, SkillDispatchStatus::Rejected);
+        assert!(matches!(
+            outcome.result,
+            Ok(SkillDispatchResult::Builtin { ref output })
+                if output.status == magi_core::ExecutionResultStatus::NeedsApproval
+        ));
+        assert!(target.exists(), "需要审批的递归删除不能提前执行");
     }
 
     #[test]

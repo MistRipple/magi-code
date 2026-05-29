@@ -12,9 +12,9 @@
 //! - 引擎本身无可变状态；规则以快照形式注入。
 //! - 规则可以来自：内置默认集（`builtin_rules`）+ 用户在 settings 里自定义的
 //!   `safeguardConfig.rules`。两者最终都汇成同一份 `Vec<SafetyRule>`。
-//! - `evaluate` 返回三态 `Decision`：Allow / Block / RequireApproval。
-//!   B 档默认 Block，C 档（受信任的 worktree）可降级到 RequireApproval，由
-//!   governance 层决定弹窗与否。
+//! - `evaluate` 返回 Safety Policy 动作：Allow / HardBlock /
+//!   RequireApprovalInRestricted / AuditOnly。访问模式如何解释这些动作由
+//!   上层 ToolPreflight 统一决定，SafetyGate 本身不持有用户授权状态。
 
 use serde::{Deserialize, Serialize};
 
@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 // SafetyCategory / SafetyRule
 // ---------------------------------------------------------------------------
 
-/// 规则分类。决定 default 行为：内置类别默认 Block，custom 默认 RequireApproval。
+/// 规则分类。分类用于审计和默认动作推导，真正裁决由 `SafetyAction` 表达。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SafetyCategory {
@@ -59,12 +59,10 @@ impl SafetyCategory {
         }
     }
 
-    /// 内置类别默认 Block（破坏性高、几乎一定误操作）；custom 默认 RequireApproval。
+    /// 内置高危类别默认在受限执行下审批，custom 也默认审批。
+    /// 真正不可接受的模式必须在规则上显式声明 HardBlock。
     pub fn default_action(self) -> SafetyAction {
-        match self {
-            Self::Custom => SafetyAction::RequireApproval,
-            _ => SafetyAction::Block,
-        }
+        SafetyAction::RequireApprovalInRestricted
     }
 }
 
@@ -75,6 +73,8 @@ pub struct SafetyRule {
     #[serde(default = "default_true")]
     pub enabled: bool,
     pub category: SafetyCategory,
+    #[serde(default)]
+    pub action: SafetyAction,
 }
 
 fn default_true() -> bool {
@@ -87,6 +87,20 @@ impl SafetyRule {
             pattern: pattern.into(),
             enabled: true,
             category,
+            action: category.default_action(),
+        }
+    }
+
+    pub fn with_action(
+        pattern: impl Into<String>,
+        category: SafetyCategory,
+        action: SafetyAction,
+    ) -> Self {
+        Self {
+            pattern: pattern.into(),
+            enabled: true,
+            category,
+            action,
         }
     }
 
@@ -109,21 +123,54 @@ impl SafetyRule {
 // Decision
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SafetyAction {
-    Block,
-    RequireApproval,
+    /// 任何访问模式下都拒绝。
+    HardBlock,
+    /// 受限执行下需要批准；完全授权下允许但应审计。
+    #[default]
+    RequireApprovalInRestricted,
+    /// 允许执行，仅记录风险。
+    AuditOnly,
+}
+
+impl SafetyAction {
+    pub fn parse(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "hard_block" | "block" | "deny" => Self::HardBlock,
+            "require_approval_in_restricted"
+            | "require_approval"
+            | "approval"
+            | "needs_approval" => Self::RequireApprovalInRestricted,
+            "audit_only" | "audit" => Self::AuditOnly,
+            _ => Self::RequireApprovalInRestricted,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::HardBlock => "hard_block",
+            Self::RequireApprovalInRestricted => "require_approval_in_restricted",
+            Self::AuditOnly => "audit_only",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SafetyDecision {
     Allow,
-    Block {
+    HardBlock {
         category: SafetyCategory,
         pattern: String,
         reason: String,
     },
-    RequireApproval {
+    RequireApprovalInRestricted {
+        category: SafetyCategory,
+        pattern: String,
+        reason: String,
+    },
+    AuditOnly {
         category: SafetyCategory,
         pattern: String,
         reason: String,
@@ -135,15 +182,17 @@ impl SafetyDecision {
         matches!(self, Self::Allow)
     }
     pub fn is_block(&self) -> bool {
-        matches!(self, Self::Block { .. })
+        matches!(self, Self::HardBlock { .. })
     }
     pub fn is_require_approval(&self) -> bool {
-        matches!(self, Self::RequireApproval { .. })
+        matches!(self, Self::RequireApprovalInRestricted { .. })
     }
     pub fn reason(&self) -> Option<&str> {
         match self {
             Self::Allow => None,
-            Self::Block { reason, .. } | Self::RequireApproval { reason, .. } => Some(reason),
+            Self::HardBlock { reason, .. }
+            | Self::RequireApprovalInRestricted { reason, .. }
+            | Self::AuditOnly { reason, .. } => Some(reason),
         }
     }
 }
@@ -196,13 +245,20 @@ impl SafetyGate {
                     rule.category.as_str(),
                     pattern
                 );
-                return match rule.category.default_action() {
-                    SafetyAction::Block => SafetyDecision::Block {
+                return match rule.action {
+                    SafetyAction::HardBlock => SafetyDecision::HardBlock {
                         category: rule.category,
                         pattern,
                         reason,
                     },
-                    SafetyAction::RequireApproval => SafetyDecision::RequireApproval {
+                    SafetyAction::RequireApprovalInRestricted => {
+                        SafetyDecision::RequireApprovalInRestricted {
+                            category: rule.category,
+                            pattern,
+                            reason,
+                        }
+                    }
+                    SafetyAction::AuditOnly => SafetyDecision::AuditOnly {
                         category: rule.category,
                         pattern,
                         reason,
@@ -238,10 +294,16 @@ fn rule_from_json(value: &serde_json::Value) -> Option<SafetyRule> {
         .and_then(serde_json::Value::as_str)
         .map(SafetyCategory::parse)
         .unwrap_or(SafetyCategory::Custom);
+    let action = object
+        .get("action")
+        .and_then(serde_json::Value::as_str)
+        .map(SafetyAction::parse)
+        .unwrap_or_else(|| category.default_action());
     Some(SafetyRule {
         pattern,
         enabled,
         category,
+        action,
     })
 }
 
@@ -289,13 +351,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn shell_exec_force_push_is_blocked() {
+    fn shell_exec_force_push_requires_restricted_approval() {
         let gate = SafetyGate::with_builtin_defaults();
         let args = serde_json::json!({ "command": "git push --force origin main" }).to_string();
         let decision = gate.evaluate("shell_exec", &args);
         assert!(matches!(
             decision,
-            SafetyDecision::Block {
+            SafetyDecision::RequireApprovalInRestricted {
                 category: SafetyCategory::GitHistory,
                 ..
             }
@@ -303,13 +365,13 @@ mod tests {
     }
 
     #[test]
-    fn shell_exec_rm_rf_is_blocked() {
+    fn shell_exec_rm_rf_requires_restricted_approval() {
         let gate = SafetyGate::with_builtin_defaults();
         let args = serde_json::json!({ "command": "rm -rf /tmp/foo" }).to_string();
         let decision = gate.evaluate("shell_exec", &args);
         assert!(matches!(
             decision,
-            SafetyDecision::Block {
+            SafetyDecision::RequireApprovalInRestricted {
                 category: SafetyCategory::BulkDelete,
                 ..
             }
@@ -336,6 +398,7 @@ mod tests {
             pattern: "rm -rf".to_string(),
             enabled: false,
             category: SafetyCategory::BulkDelete,
+            action: SafetyAction::RequireApprovalInRestricted,
         };
         let gate = SafetyGate::new(vec![rule]);
         let args = serde_json::json!({ "command": "rm -rf /tmp" }).to_string();
@@ -343,12 +406,12 @@ mod tests {
     }
 
     #[test]
-    fn custom_category_requires_approval_instead_of_block() {
+    fn custom_category_requires_restricted_approval() {
         let gate = SafetyGate::new(vec![SafetyRule::new("aws s3 rm", SafetyCategory::Custom)]);
         let args =
             serde_json::json!({ "command": "aws s3 rm s3://bucket --recursive" }).to_string();
         match gate.evaluate("shell_exec", &args) {
-            SafetyDecision::RequireApproval { category, .. } => {
+            SafetyDecision::RequireApprovalInRestricted { category, .. } => {
                 assert_eq!(category, SafetyCategory::Custom);
             }
             other => panic!("unexpected decision: {other:?}"),
@@ -359,7 +422,7 @@ mod tests {
     fn case_insensitive_matching() {
         let gate = SafetyGate::with_builtin_defaults();
         let args = serde_json::json!({ "command": "GIT PUSH --FORCE origin main" }).to_string();
-        assert!(gate.evaluate("shell_exec", &args).is_block());
+        assert!(gate.evaluate("shell_exec", &args).is_require_approval());
     }
 
     #[test]
@@ -367,7 +430,7 @@ mod tests {
         let json = serde_json::json!([
             { "pattern": "git push --force", "enabled": true, "category": "git_history" },
             { "pattern": "  ", "category": "custom" }, // pattern 为空：丢弃
-            { "pattern": "aws s3 rm", "category": "custom" },
+            { "pattern": "aws s3 rm", "category": "custom", "action": "hard_block" },
             "not-an-object", // 非对象：丢弃
         ]);
         let rules = rules_from_settings_value(&json);
@@ -375,6 +438,21 @@ mod tests {
         assert_eq!(rules[0].pattern, "git push --force");
         assert_eq!(rules[0].category, SafetyCategory::GitHistory);
         assert_eq!(rules[1].category, SafetyCategory::Custom);
+        assert_eq!(rules[1].action, SafetyAction::HardBlock);
+    }
+
+    #[test]
+    fn explicit_hard_block_rule_blocks_in_every_mode() {
+        let gate = SafetyGate::new(vec![SafetyRule::with_action(
+            "dangerous-op",
+            SafetyCategory::Custom,
+            SafetyAction::HardBlock,
+        )]);
+        let args = serde_json::json!({ "command": "dangerous-op --now" }).to_string();
+        assert!(matches!(
+            gate.evaluate("shell_exec", &args),
+            SafetyDecision::HardBlock { .. }
+        ));
     }
 
     #[test]

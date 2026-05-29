@@ -110,8 +110,7 @@ type WorkspaceSearchEngines = Arc<RwLock<HashMap<WorkspaceId, Arc<Mutex<LocalSea
 
 /// 每个 workspace 的文件监听句柄：持有它仅为维持监听任务存活。
 /// 与索引引擎同生命周期——build_workspace_index 时一并建立，store 释放时随之 drop。
-type WorkspaceWatchers =
-    Arc<RwLock<HashMap<WorkspaceId, Arc<magi_snapshot::watcher::FsWatcher>>>>;
+type WorkspaceWatchers = Arc<RwLock<HashMap<WorkspaceId, Arc<magi_snapshot::watcher::FsWatcher>>>>;
 
 #[derive(Clone, Default)]
 pub struct KnowledgeStore {
@@ -174,8 +173,8 @@ impl KnowledgeStore {
         // （macOS 上 /tmp → /private/tmp），引擎 to_relative 用 root 做前缀剥离。
         // 若两端 root 规范化来源不同，增量更新的相对路径会对不上，导致索引落空。
         // 在此统一 canonicalize，引擎与 watcher 共用同一规范化 root。
-        let root = std::fs::canonicalize(workspace_root)
-            .unwrap_or_else(|_| workspace_root.to_path_buf());
+        let root =
+            std::fs::canonicalize(workspace_root).unwrap_or_else(|_| workspace_root.to_path_buf());
 
         let outcome = code_scanner::scan_workspace(&root);
         let Some(summary) = outcome.summary.as_ref() else {

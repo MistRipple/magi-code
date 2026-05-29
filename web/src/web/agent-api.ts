@@ -601,7 +601,7 @@ function buildBoundQuery(
   return buildBoundQueryWithOverride(extra, undefined, options);
 }
 
-function buildWorkspaceBoundQuery(extra: Record<string, string>): string {
+export function buildWorkspaceBoundQuery(extra: Record<string, string>): string {
   return buildBoundQuery(extra, { includeSession: false });
 }
 
@@ -983,6 +983,7 @@ export async function submitSessionTurn(
     text?: string | null;
     skillName?: string | null;
     images: AgentSessionTurnImagePayload[];
+    accessProfile?: 'read_only' | 'restricted' | 'full_access' | null;
     requestId?: string | null;
     userMessageId?: string | null;
     placeholderMessageId?: string | null;
@@ -1007,6 +1008,7 @@ export async function submitSessionTurn(
         workspacePath: binding.workspacePath || null,
         text: payload.text ?? null,
         skillName: payload.skillName ?? null,
+        accessProfile: payload.accessProfile ?? null,
         requestId: payload.requestId ?? null,
         userMessageId: payload.userMessageId ?? null,
         placeholderMessageId: payload.placeholderMessageId ?? null,

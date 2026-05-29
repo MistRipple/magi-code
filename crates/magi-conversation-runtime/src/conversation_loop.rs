@@ -2840,7 +2840,7 @@ mod tests {
                 .to_string();
         task.policy_snapshot = Some(magi_core::TaskPolicy {
             autonomy_level: "Autonomous".to_string(),
-            approval_mode: "DecisionOnly".to_string(),
+            access_profile: magi_core::AccessProfile::Restricted,
             allowed_tools: Vec::new(),
             denied_tools: Vec::new(),
             allowed_paths: Vec::new(),
@@ -2880,7 +2880,7 @@ mod tests {
             .to_string();
         task.policy_snapshot = Some(magi_core::TaskPolicy {
             autonomy_level: "Autonomous".to_string(),
-            approval_mode: "DecisionOnly".to_string(),
+            access_profile: magi_core::AccessProfile::Restricted,
             allowed_tools: Vec::new(),
             denied_tools: Vec::new(),
             allowed_paths: Vec::new(),
@@ -2909,7 +2909,7 @@ mod tests {
             .to_string();
         task.policy_snapshot = Some(magi_core::TaskPolicy {
             autonomy_level: "Autonomous".to_string(),
-            approval_mode: "DecisionOnly".to_string(),
+            access_profile: magi_core::AccessProfile::Restricted,
             allowed_tools: Vec::new(),
             denied_tools: Vec::new(),
             allowed_paths: Vec::new(),
@@ -3012,7 +3012,7 @@ mod tests {
             .to_string();
         planning.policy_snapshot = Some(magi_core::TaskPolicy {
             autonomy_level: "Autonomous".to_string(),
-            approval_mode: "DecisionOnly".to_string(),
+            access_profile: magi_core::AccessProfile::Restricted,
             allowed_tools: Vec::new(),
             denied_tools: Vec::new(),
             allowed_paths: Vec::new(),
@@ -3324,7 +3324,7 @@ mod tests {
         task.kind = TaskKind::LocalAgent;
         task.policy_snapshot = Some(magi_core::TaskPolicy {
             autonomy_level: "Autonomous".to_string(),
-            approval_mode: "DecisionOnly".to_string(),
+            access_profile: magi_core::AccessProfile::Restricted,
             allowed_tools: Vec::new(),
             denied_tools: Vec::new(),
             allowed_paths: Vec::new(),
@@ -3609,7 +3609,7 @@ mod tests {
         task.goal = "LongMission：先建立治理记录，再启动两个代理并行验证。".to_string();
         task.policy_snapshot = Some(magi_core::TaskPolicy {
             autonomy_level: "Autonomous".to_string(),
-            approval_mode: "DecisionOnly".to_string(),
+            access_profile: magi_core::AccessProfile::Restricted,
             allowed_tools: Vec::new(),
             denied_tools: Vec::new(),
             allowed_paths: Vec::new(),

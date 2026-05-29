@@ -17,8 +17,12 @@ use std::{
     sync::{Arc, RwLock},
 };
 
+mod apply_patch;
 mod builtin;
 mod policy;
+mod tool_catalog;
+mod view_image;
+pub use apply_patch::apply_patch_declared_paths_from_input;
 use builtin::{NormalizedBuiltinTool, infer_execution_status};
 use policy::WriteProtectionClaim;
 
@@ -26,8 +30,10 @@ use policy::WriteProtectionClaim;
 pub enum BuiltinToolName {
     // ── 文件系统 ──
     FileRead,
+    ViewImage,
     FileWrite,
     FilePatch,
+    ApplyPatch,
     FileRemove,
     FileMkdir,
     FileCopy,
@@ -55,6 +61,9 @@ pub enum BuiltinToolName {
     // ── 代码符号导航（基于本地索引引擎的符号表）──
     /// 符号导航：按符号名查定义、或列出某文件的全部符号。
     CodeSymbols,
+    // ── 工具目录 / 健康诊断 ──
+    /// 列出当前内置工具目录、访问模式、风险等级与 schema 健康状态。
+    ToolCatalog,
     // ── 协调器（任务系统 L10，仅 coordinator_mode 角色可见）──
     /// 派发新的代理执行子任务。该工具只创建代理并投递初始任务消息；
     /// 后续由 agent_wait 收集代理终态结果。
@@ -112,10 +121,12 @@ pub enum BuiltinToolName {
 }
 
 impl BuiltinToolName {
-    pub const ALL: [Self; 32] = [
+    pub const ALL: [Self; 35] = [
         Self::FileRead,
+        Self::ViewImage,
         Self::FileWrite,
         Self::FilePatch,
+        Self::ApplyPatch,
         Self::FileRemove,
         Self::FileMkdir,
         Self::FileCopy,
@@ -135,6 +146,7 @@ impl BuiltinToolName {
         Self::DiagramRender,
         Self::KnowledgeQuery,
         Self::CodeSymbols,
+        Self::ToolCatalog,
         Self::AgentSpawn,
         Self::AgentWait,
         Self::TodoWrite,
@@ -150,8 +162,10 @@ impl BuiltinToolName {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::FileRead => "file_read",
+            Self::ViewImage => "view_image",
             Self::FileWrite => "file_write",
             Self::FilePatch => "file_patch",
+            Self::ApplyPatch => "apply_patch",
             Self::FileRemove => "file_remove",
             Self::FileMkdir => "file_mkdir",
             Self::FileCopy => "file_copy",
@@ -171,6 +185,7 @@ impl BuiltinToolName {
             Self::DiagramRender => "diagram_render",
             Self::KnowledgeQuery => "knowledge_query",
             Self::CodeSymbols => "code_symbols",
+            Self::ToolCatalog => "tool_catalog",
             Self::AgentSpawn => "agent_spawn",
             Self::AgentWait => "agent_wait",
             Self::TodoWrite => "todo_write",
@@ -184,11 +199,49 @@ impl BuiltinToolName {
         }
     }
 
+    pub fn category(&self) -> &'static str {
+        match self {
+            Self::FileRead
+            | Self::ViewImage
+            | Self::FileWrite
+            | Self::FilePatch
+            | Self::ApplyPatch
+            | Self::FileRemove
+            | Self::FileMkdir
+            | Self::FileCopy
+            | Self::FileMove => "filesystem",
+            Self::SearchText | Self::SearchSemantic | Self::CodeSymbols => "code_navigation",
+            Self::ShellExec
+            | Self::ProcessLaunch
+            | Self::ProcessRead
+            | Self::ProcessWrite
+            | Self::ProcessKill
+            | Self::ProcessList
+            | Self::ProcessInspect => "process",
+            Self::DiffPreview => "diff",
+            Self::WebSearch | Self::WebFetch => "web",
+            Self::DiagramRender => "visualization",
+            Self::KnowledgeQuery => "knowledge",
+            Self::ToolCatalog => "tooling",
+            Self::AgentSpawn | Self::AgentWait => "agent_coordination",
+            Self::TodoWrite => "session_state",
+            Self::MemoryWrite => "project_memory",
+            Self::MissionCharterWrite
+            | Self::PlanWrite
+            | Self::KgWrite
+            | Self::ValidationRecord
+            | Self::Checkpoint
+            | Self::HumanCheckpointRequest => "mission_governance",
+        }
+    }
+
     pub fn from_str(name: &str) -> Option<Self> {
         match name {
             "file_read" | "file_view" => Some(Self::FileRead),
+            "view_image" | "image_view" => Some(Self::ViewImage),
             "file_write" | "file_create" => Some(Self::FileWrite),
             "file_patch" | "file_edit" | "file_insert" => Some(Self::FilePatch),
+            "apply_patch" => Some(Self::ApplyPatch),
             "file_remove" => Some(Self::FileRemove),
             "file_mkdir" => Some(Self::FileMkdir),
             "file_copy" => Some(Self::FileCopy),
@@ -209,6 +262,9 @@ impl BuiltinToolName {
             "knowledge_query" | "project_knowledge_query" => Some(Self::KnowledgeQuery),
             "code_symbols" | "symbol_nav" | "goto_definition" | "list_file_symbols" => {
                 Some(Self::CodeSymbols)
+            }
+            "tool_catalog" | "tool_diagnostics" | "builtin_tools" | "builtin_tool_catalog" => {
+                Some(Self::ToolCatalog)
             }
             "agent_spawn" | "agent" | "spawn_agent" => Some(Self::AgentSpawn),
             "agent_wait" | "wait_agent" => Some(Self::AgentWait),
@@ -237,6 +293,7 @@ impl BuiltinToolName {
             self,
             Self::FileWrite
                 | Self::FilePatch
+                | Self::ApplyPatch
                 | Self::FileRemove
                 | Self::FileMkdir
                 | Self::FileCopy
@@ -282,6 +339,7 @@ impl BuiltinToolName {
     pub fn default_risk_level(&self) -> RiskLevel {
         match self {
             Self::FileRead
+            | Self::ViewImage
             | Self::FileMkdir
             | Self::SearchText
             | Self::SearchSemantic
@@ -293,6 +351,7 @@ impl BuiltinToolName {
             | Self::DiagramRender
             | Self::KnowledgeQuery
             | Self::CodeSymbols
+            | Self::ToolCatalog
             | Self::AgentWait
             | Self::TodoWrite
             | Self::MemoryWrite
@@ -304,6 +363,7 @@ impl BuiltinToolName {
             | Self::HumanCheckpointRequest => RiskLevel::Low,
             Self::FileWrite
             | Self::FilePatch
+            | Self::ApplyPatch
             | Self::FileCopy
             | Self::FileMove
             | Self::ProcessWrite
@@ -322,6 +382,17 @@ impl BuiltinToolName {
         }
     }
 
+    pub fn invocation_policy_for_input(&self, input: &str) -> BuiltinToolInvocationPolicy {
+        match self {
+            Self::ShellExec => shell_exec_invocation_policy(input),
+            Self::FileRemove => file_remove_invocation_policy(input),
+            _ => BuiltinToolInvocationPolicy {
+                risk_level: self.default_risk_level(),
+                approval_requirement: self.default_approval_requirement(),
+            },
+        }
+    }
+
     pub fn description(&self) -> &'static str {
         match self {
             Self::FileRead => {
@@ -336,6 +407,18 @@ impl BuiltinToolName {
                 # 反例\n\
                 - ❌ 用 file_read 读取目录路径希望拿到列表\n\
                 - ✅ 已经从 search_text 拿到候选文件路径后，再用 file_read 看具体行"
+            }
+            Self::ViewImage => {
+                "读取本地图片并把图片内容作为多模态工具结果提供给模型。\n\n\
+                # 何时用\n\
+                - 需要查看截图、设计稿、照片、渲染结果或其他本地图片文件\n\
+                - 用户给出图片路径，或代码生成了图片后需要视觉检查\n\n\
+                # 何时不用\n\
+                - 读取文本文件 → 用 file_read\n\
+                - 列目录或查找图片文件路径 → 用 search_text 或 shell_exec 的只读命令\n\n\
+                # 约束\n\
+                - 只支持 png/jpeg/gif/webp\n\
+                - 输出会同时包含审计 JSON 和模型可用的 image content；不要把 base64 当普通文本复述"
             }
             Self::FileWrite => {
                 "创建或覆盖一个文件并写入指定内容（整体写入）。\n\n\
@@ -363,6 +446,19 @@ impl BuiltinToolName {
                 - ❌ old_string 只写一行短代码且文件里出现多次 → 替换位置歧义、可能改错位置\n\
                 - ✅ old_string 包含目标行 + 前后各 1-2 行上下文确保唯一性"
             }
+            Self::ApplyPatch => {
+                "应用 Codex 风格的补丁信封（*** Begin Patch / *** End Patch），支持新增、删除、更新和移动文件。\n\n\
+                # 何时用\n\
+                - 一次修改涉及多个文件或多个 hunk，需要用统一补丁表达完整 diff\n\
+                - 需要生成接近代码审查 diff 的结构化改动，而不是单点 old_string 替换\n\n\
+                # 何时不用\n\
+                - 单文件单处精确替换 → 用 file_patch，约束更窄、失败更明确\n\
+                - 整体创建或覆盖一个文件 → 用 file_write\n\n\
+                # 输入格式\n\
+                - 当前 function tool 传 JSON：{ \"patch\": \"*** Begin Patch\\n...\\n*** End Patch\\n\" }\n\
+                - 未来 freeform 通道可直接传 patch 文本\n\
+                - Update File 的上下文必须唯一匹配；不唯一时扩大上下文"
+            }
             Self::FileRemove => "删除一个文件或目录",
             Self::FileMkdir => "创建一个目录（包含父目录）",
             Self::FileCopy => "把文件或目录复制到新位置",
@@ -373,13 +469,14 @@ impl BuiltinToolName {
                 "执行一条 shell 命令并返回 stdout / stderr。\n\n\
                 # 何时用\n\
                 - 没有专用工具能完成的任务：构建（cargo build / npm run）、运行测试、git 操作、查 PID\n\
-                - 一次性 ad-hoc 命令（解压、统计行数、查磁盘占用）\n\n\
+                - 一次性 ad-hoc 命令（解压、统计行数、查磁盘占用）\n\
+                - 启动后台命令时设置 background=true；后续用同一个 shell_exec 传 action=read/write/kill/list 和 terminal_id 管理\n\n\
                 # 何时不用\n\
                 - 读文件内容 → file_read（更安全、有大小保护）\n\
                 - 写文件内容 → file_write（避免引号转义陷阱）\n\
                 - 改文件局部 → file_patch（避免 sed 转义灾难）\n\
                 - 找文件路径 → 优先 search_text；search_text 不便时再 shell `find`\n\
-                - 启长进程（守护、watch 模式）→ process_launch（受管、可清理）\n\n\
+                - 不要直接调用 process_launch / process_read / process_write / process_kill / process_list；它们是 shell_exec 的内部后台能力\n\n\
                 # 反例\n\
                 - ❌ `shell_exec: cat /path/file` 仅为读文件 → 失去字节限制保护\n\
                 - ❌ `shell_exec: sed -i 's/foo/bar/'` 改文件 → 引号转义易错且不可预览\n\
@@ -401,6 +498,17 @@ impl BuiltinToolName {
             Self::KnowledgeQuery => "查询项目知识库：检索 README、文档与代码文档",
             Self::CodeSymbols => {
                 "代码符号导航：按符号名查定义（goto_definition），或列出某文件的全部符号（list_file_symbols）"
+            }
+            Self::ToolCatalog => {
+                "列出 Magi 内置工具目录与健康状态。\n\n\
+                # 何时用\n\
+                - 需要确认当前运行时有哪些内置工具、各自访问模式和风险等级\n\
+                - 需要诊断工具 schema 是否完整，或区分模型可见工具与运行时内部工具\n\n\
+                # 何时不用\n\
+                - 需要调用外部 MCP / skill 工具目录 → 使用对应外部工具管理入口\n\
+                - 已知道具体工具且要完成任务 → 直接调用对应工具\n\n\
+                # 说明\n\
+                - 该工具只读取 BuiltinToolName::ALL 单一注册源，不扫描 MCP、skill 或自定义工具"
             }
             Self::AgentSpawn => {
                 "向已注册的代理角色派发一个子任务（architect / executor / reviewer 等）。该工具只创建代理并投递初始任务消息，立即返回代理 task_id；后续使用 agent_wait 收集代理终态结果。若返回 status=degraded，表示代理当前不可用，父代理必须改派其他可用角色或由主线继续完成，不能直接停止任务。\n\n\
@@ -501,6 +609,14 @@ impl BuiltinToolName {
                 },
                 "required": ["path"]
             }),
+            Self::ViewImage => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "要查看的本地图片路径，可为绝对路径或相对当前工作目录的路径" },
+                    "max_bytes": { "type": "integer", "description": "允许读取的最大字节数，默认 10MiB，硬上限 20MiB" }
+                },
+                "required": ["path"]
+            }),
             Self::FileWrite => serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -531,6 +647,16 @@ impl BuiltinToolName {
                     }
                 },
                 "required": ["path"]
+            }),
+            Self::ApplyPatch => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "patch": {
+                        "type": "string",
+                        "description": "Codex 风格补丁信封，必须以 *** Begin Patch 开始并以 *** End Patch 结束。支持 *** Add File、*** Update File、*** Delete File，以及 Update File 下的 *** Move to。"
+                    }
+                },
+                "required": ["patch"]
             }),
             Self::FileRemove => serde_json::json!({
                 "type": "object",
@@ -592,6 +718,16 @@ impl BuiltinToolName {
                     "cwd": { "type": "string", "description": "工作目录" },
                     "shell": { "type": "string", "description": "使用的 shell 程序" },
                     "timeout_ms": { "type": "integer", "description": "执行超时（毫秒）" },
+                    "action": {
+                        "type": "string",
+                        "description": "后台进程控制动作：run/read/write/kill/list。省略时默认 run；background=true 启动后台命令后，使用 read/write/kill/list 搭配 terminal_id 继续管理。",
+                        "enum": ["run", "read", "write", "kill", "list"]
+                    },
+                    "terminal_id": { "type": "integer", "description": "background=true 返回的受管终端 / 进程 ID；action=read/write/kill 时必填" },
+                    "input": { "type": "string", "description": "action=write 时写入后台进程 stdin 的文本" },
+                    "content": { "type": "string", "description": "input 的别名" },
+                    "text": { "type": "string", "description": "input 的别名" },
+                    "max_bytes": { "type": "integer", "description": "action=read 时 stdout / stderr 预览最多读取的字节数" },
                     "access_mode": {
                         "type": "string",
                         "description": "声明命令访问模式：read_only / maybe_write / explicit_write。ls、cat、grep、git status、git diff、不会改文件的测试等只读探查请用 read_only。只读探测中“文件不存在/无匹配”属于可汇报结果时，命令必须用 if/else、|| true 或末尾 true 保证整体退出码为 0，避免把可恢复探测误判为任务失败。",
@@ -599,7 +735,7 @@ impl BuiltinToolName {
                     },
                     "background": { "type": "boolean", "description": "在后台启动而不阻塞等待完成" }
                 },
-                "required": ["command"]
+                "required": []
             }),
             Self::ProcessLaunch => serde_json::json!({
                 "type": "object",
@@ -768,6 +904,14 @@ impl BuiltinToolName {
                     "limit": { "type": "integer", "description": "definition 最多返回多少个匹配（默认 20）" }
                 },
                 "required": ["action"]
+            }),
+            Self::ToolCatalog => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "include_internal": { "type": "boolean", "description": "是否包含运行时内部工具，默认 false" },
+                    "include_schema": { "type": "boolean", "description": "是否在每个工具条目中包含完整 parameters_schema，默认 false" }
+                },
+                "required": []
             }),
             Self::AgentSpawn => serde_json::json!({
                 "type": "object",
@@ -1102,6 +1246,12 @@ pub struct BuiltinToolSpec {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BuiltinToolInvocationPolicy {
+    pub risk_level: RiskLevel,
+    pub approval_requirement: ApprovalRequirement,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BuiltinToolAccessMode {
     ReadOnly,
     MaybeWrite,
@@ -1131,6 +1281,120 @@ impl BuiltinToolAccessMode {
     }
 }
 
+fn low_risk_policy() -> BuiltinToolInvocationPolicy {
+    BuiltinToolInvocationPolicy {
+        risk_level: RiskLevel::Low,
+        approval_requirement: ApprovalRequirement::None,
+    }
+}
+
+fn medium_risk_policy() -> BuiltinToolInvocationPolicy {
+    BuiltinToolInvocationPolicy {
+        risk_level: RiskLevel::Medium,
+        approval_requirement: ApprovalRequirement::None,
+    }
+}
+
+fn high_risk_approval_policy() -> BuiltinToolInvocationPolicy {
+    BuiltinToolInvocationPolicy {
+        risk_level: RiskLevel::High,
+        approval_requirement: ApprovalRequirement::Required,
+    }
+}
+
+fn shell_exec_invocation_policy(input: &str) -> BuiltinToolInvocationPolicy {
+    let Some(request) = serde_json::from_str::<serde_json::Value>(input)
+        .ok()
+        .and_then(|value| value.as_object().cloned())
+    else {
+        return medium_risk_policy();
+    };
+
+    let action = json_field_string(&request, &["action", "operation", "op"])
+        .map(|value| value.trim().to_ascii_lowercase());
+    let has_terminal_id = request
+        .get("terminal_id")
+        .or_else(|| request.get("terminalId"))
+        .or_else(|| request.get("id"))
+        .is_some();
+    let has_command = json_field_string(&request, &["command", "script", "line"])
+        .is_some_and(|value| !value.trim().is_empty());
+
+    match action.as_deref() {
+        None if has_terminal_id && !has_command => return low_risk_policy(),
+        Some("read" | "poll" | "status" | "list" | "ls") => return low_risk_policy(),
+        Some("write" | "stdin" | "send" | "kill" | "stop" | "terminate" | "cancel") => {
+            return medium_risk_policy();
+        }
+        Some("run" | "exec" | "command") | None => {}
+        Some(_) => return medium_risk_policy(),
+    }
+
+    if json_field_bool(&request, &["background", "long_running", "longRunning"]).unwrap_or(false) {
+        return medium_risk_policy();
+    }
+
+    match json_field_string(&request, &["access_mode", "write_mode", "intent"])
+        .and_then(|value| BuiltinToolAccessMode::from_str(&value))
+    {
+        Some(BuiltinToolAccessMode::ReadOnly) => low_risk_policy(),
+        Some(BuiltinToolAccessMode::MaybeWrite | BuiltinToolAccessMode::ExplicitWrite) => {
+            medium_risk_policy()
+        }
+        None => medium_risk_policy(),
+    }
+}
+
+fn file_remove_invocation_policy(input: &str) -> BuiltinToolInvocationPolicy {
+    let Some(request) = serde_json::from_str::<serde_json::Value>(input)
+        .ok()
+        .and_then(|value| value.as_object().cloned())
+    else {
+        return medium_risk_policy();
+    };
+
+    if json_field_bool(&request, &["recursive", "force"]).unwrap_or(false) {
+        return high_risk_approval_policy();
+    }
+
+    if json_field_string(&request, &["path", "file_path", "target_path"])
+        .is_some_and(|value| is_high_risk_remove_target(&value))
+    {
+        return high_risk_approval_policy();
+    }
+
+    medium_risk_policy()
+}
+
+fn json_field_string(
+    object: &serde_json::Map<String, serde_json::Value>,
+    keys: &[&str],
+) -> Option<String> {
+    keys.iter().find_map(|key| {
+        object
+            .get(*key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    })
+}
+
+fn json_field_bool(
+    object: &serde_json::Map<String, serde_json::Value>,
+    keys: &[&str],
+) -> Option<bool> {
+    keys.iter().find_map(|key| {
+        object.get(*key).and_then(|value| {
+            value
+                .as_bool()
+                .or_else(|| value.as_str().and_then(|value| value.parse::<bool>().ok()))
+        })
+    })
+}
+
+fn is_high_risk_remove_target(path: &str) -> bool {
+    matches!(path.trim(), "/" | "." | ".." | "~")
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ToolExecutionInput {
     pub tool_call_id: ToolCallId,
@@ -1139,6 +1403,35 @@ pub struct ToolExecutionInput {
     pub input: String,
     pub approval_requirement: ApprovalRequirement,
     pub risk_level: RiskLevel,
+}
+
+impl ToolExecutionInput {
+    pub fn for_builtin_invocation(
+        tool_call_id: ToolCallId,
+        requested_tool_name: impl AsRef<str>,
+        input: impl Into<String>,
+    ) -> Self {
+        let input = input.into();
+        let requested_tool_name = requested_tool_name.as_ref().trim();
+        let (tool_name, invocation_policy) =
+            if let Some(tool) = BuiltinToolName::from_str(requested_tool_name) {
+                (
+                    tool.as_str().to_string(),
+                    tool.invocation_policy_for_input(&input),
+                )
+            } else {
+                (requested_tool_name.to_string(), low_risk_policy())
+            };
+
+        Self {
+            tool_call_id,
+            tool_name,
+            tool_kind: ToolKind::Builtin,
+            input,
+            approval_requirement: invocation_policy.approval_requirement,
+            risk_level: invocation_policy.risk_level,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -1178,6 +1471,7 @@ pub struct ToolExecutionOutput {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ToolExecutionPolicy {
+    pub access_profile: magi_core::AccessProfile,
     pub source_skill_ids: Vec<String>,
     pub allowed_tool_names: Vec<String>,
     pub denied_tool_names: Vec<String>,
@@ -1384,14 +1678,21 @@ impl ToolRegistry {
             return output;
         }
 
-        let governance = self
-            .governance
-            .evaluate_tool_request(&ToolExecutionRequest {
-                tool_name: input.tool_name.clone(),
-                tool_kind: input.tool_kind.clone(),
-                risk_level: input.risk_level,
-                approval_requirement: input.approval_requirement,
-            });
+        let governance = if policy.access_profile == magi_core::AccessProfile::FullAccess {
+            GovernanceDecision::allowed(
+                DecisionPhase::ApprovalPolicy,
+                input.risk_level,
+                Some("完全授权模式跳过普通工具审批".to_string()),
+            )
+        } else {
+            self.governance
+                .evaluate_tool_request(&ToolExecutionRequest {
+                    tool_name: input.tool_name.clone(),
+                    tool_kind: input.tool_kind.clone(),
+                    risk_level: input.risk_level,
+                    approval_requirement: input.approval_requirement,
+                })
+        };
 
         let output = if !governance.allowed {
             ToolExecutionOutput {
@@ -2111,6 +2412,120 @@ mod tests {
             &ToolExecutionPolicy::default(),
         );
         assert_eq!(blocked.status, ExecutionResultStatus::NeedsApproval);
+    }
+
+    #[test]
+    fn shell_exec_background_process_can_be_controlled_through_shell_surface() {
+        let governance = Arc::new(GovernanceService::default());
+        let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(16));
+        let mut tool_registry = ToolRegistry::new(governance, event_bus);
+        tool_registry.register_default_builtins();
+        let root = unique_temp_dir("magi-tool-shell-background-control");
+        let context = ToolExecutionContext {
+            session_id: Some(SessionId::new("session-shell-background-control")),
+            workspace_id: Some(WorkspaceId::new("workspace-shell-background-control")),
+            working_directory: Some(root),
+            ..ToolExecutionContext::default()
+        };
+
+        let launch = tool_registry.execute_with_policy(
+            ToolExecutionInput {
+                tool_call_id: ToolCallId::new("tool-call-shell-background-launch"),
+                tool_name: BuiltinToolName::ShellExec.as_str().to_string(),
+                tool_kind: ToolKind::Builtin,
+                input: serde_json::json!({
+                    "command": "printf ready; sleep 5",
+                    "background": true
+                })
+                .to_string(),
+                approval_requirement: ApprovalRequirement::None,
+                risk_level: RiskLevel::Low,
+            },
+            context.clone(),
+            &ToolExecutionPolicy::default(),
+        );
+
+        assert_eq!(launch.status, ExecutionResultStatus::Succeeded);
+        let launch_payload: Value = serde_json::from_str(&launch.payload).expect("launch json");
+        assert_eq!(launch_payload["tool"], "shell_exec");
+        assert_eq!(launch_payload["mode"], "background");
+        let terminal_id = launch_payload["terminal_id"]
+            .as_u64()
+            .expect("terminal_id should be returned");
+
+        thread::sleep(Duration::from_millis(100));
+        let read = tool_registry.execute_with_policy(
+            ToolExecutionInput {
+                tool_call_id: ToolCallId::new("tool-call-shell-background-read"),
+                tool_name: BuiltinToolName::ShellExec.as_str().to_string(),
+                tool_kind: ToolKind::Builtin,
+                input: serde_json::json!({
+                    "action": "read",
+                    "terminal_id": terminal_id,
+                    "max_bytes": 1024
+                })
+                .to_string(),
+                approval_requirement: ApprovalRequirement::None,
+                risk_level: RiskLevel::Low,
+            },
+            context.clone(),
+            &ToolExecutionPolicy::default(),
+        );
+
+        assert_eq!(read.status, ExecutionResultStatus::Succeeded);
+        let read_payload: Value = serde_json::from_str(&read.payload).expect("read json");
+        assert_eq!(read_payload["tool"], "shell_exec");
+        assert_eq!(read_payload["mode"], "background_read");
+        assert!(
+            read_payload["stdout"]
+                .as_str()
+                .expect("stdout")
+                .contains("ready")
+        );
+
+        let list = tool_registry.execute_with_policy(
+            ToolExecutionInput {
+                tool_call_id: ToolCallId::new("tool-call-shell-background-list"),
+                tool_name: BuiltinToolName::ShellExec.as_str().to_string(),
+                tool_kind: ToolKind::Builtin,
+                input: serde_json::json!({ "action": "list" }).to_string(),
+                approval_requirement: ApprovalRequirement::None,
+                risk_level: RiskLevel::Low,
+            },
+            context.clone(),
+            &ToolExecutionPolicy::default(),
+        );
+        let list_payload: Value = serde_json::from_str(&list.payload).expect("list json");
+        assert_eq!(list_payload["mode"], "background_list");
+        assert!(
+            list_payload["processes"]
+                .as_array()
+                .expect("processes")
+                .iter()
+                .any(|process| process["terminal_id"].as_u64() == Some(terminal_id))
+        );
+
+        let kill = tool_registry.execute_with_policy(
+            ToolExecutionInput {
+                tool_call_id: ToolCallId::new("tool-call-shell-background-kill"),
+                tool_name: BuiltinToolName::ShellExec.as_str().to_string(),
+                tool_kind: ToolKind::Builtin,
+                input: serde_json::json!({
+                    "action": "kill",
+                    "terminal_id": terminal_id
+                })
+                .to_string(),
+                approval_requirement: ApprovalRequirement::None,
+                risk_level: RiskLevel::Low,
+            },
+            context,
+            &ToolExecutionPolicy::default(),
+        );
+
+        assert_eq!(kill.status, ExecutionResultStatus::Succeeded);
+        let kill_payload: Value = serde_json::from_str(&kill.payload).expect("kill json");
+        assert_eq!(kill_payload["tool"], "shell_exec");
+        assert_eq!(kill_payload["mode"], "background_kill");
     }
 
     #[test]
@@ -3435,6 +3850,7 @@ mod tests {
 
         // Policy that explicitly denies file.read
         let deny_policy = ToolExecutionPolicy {
+            access_profile: magi_core::AccessProfile::Restricted,
             source_skill_ids: vec!["skill-x".to_string()],
             allowed_tool_names: vec![
                 BuiltinToolName::FileRead.as_str().to_string(),
@@ -3464,6 +3880,7 @@ mod tests {
 
         // Policy that only allows search.text — file.read is not in allowed list
         let not_allowed_policy = ToolExecutionPolicy {
+            access_profile: magi_core::AccessProfile::Restricted,
             source_skill_ids: vec!["skill-y".to_string()],
             allowed_tool_names: vec![BuiltinToolName::SearchText.as_str().to_string()],
             denied_tool_names: vec![],
@@ -3615,6 +4032,7 @@ mod tests {
             },
             ctx.clone(),
             &ToolExecutionPolicy {
+                access_profile: magi_core::AccessProfile::Restricted,
                 source_skill_ids: vec!["sk-locked".to_string()],
                 allowed_tool_names: vec![BuiltinToolName::SearchText.as_str().to_string()],
                 denied_tool_names: vec![],
@@ -3676,6 +4094,33 @@ mod tests {
         let ledger = event_bus.audit_usage_ledger_status();
         assert_eq!(ledger.audit_count, 5);
         assert!(ledger.usage_count >= 5);
+    }
+
+    #[test]
+    fn full_access_policy_skips_regular_tool_approval() {
+        let governance = Arc::new(GovernanceService::default());
+        let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(32));
+        let mut tool_registry = ToolRegistry::new(governance, event_bus);
+        tool_registry.register_default_builtins();
+
+        let output = tool_registry.execute_with_policy(
+            ToolExecutionInput {
+                tool_call_id: ToolCallId::new("tc-full-access-shell"),
+                tool_name: BuiltinToolName::ShellExec.as_str().to_string(),
+                tool_kind: ToolKind::Builtin,
+                input: "printf full-access".to_string(),
+                approval_requirement: ApprovalRequirement::Required,
+                risk_level: RiskLevel::High,
+            },
+            ToolExecutionContext::default(),
+            &ToolExecutionPolicy {
+                access_profile: magi_core::AccessProfile::FullAccess,
+                ..ToolExecutionPolicy::default()
+            },
+        );
+
+        assert_eq!(output.status, ExecutionResultStatus::Succeeded);
+        assert_eq!(output.governance.outcome, GovernanceOutcome::Allowed);
     }
 
     fn make_registry() -> ToolRegistry {
@@ -3884,6 +4329,47 @@ mod tests {
     }
 
     #[test]
+    fn apply_patch_tool_applies_patch_envelope_through_registry() {
+        let root = unique_temp_dir("magi-tool-apply-patch");
+        let registry = make_registry();
+        fs::write(root.join("existing.txt"), "alpha\nbeta\n").unwrap();
+
+        let input = serde_json::json!({
+            "patch": "*** Begin Patch\n*** Add File: created.txt\n+created\n*** Update File: existing.txt\n@@\n-alpha\n+ALPHA\n beta\n*** End Patch\n"
+        })
+        .to_string();
+        let output = registry.execute_with_policy(
+            ToolExecutionInput {
+                tool_call_id: ToolCallId::new("tc-apply-patch"),
+                tool_name: BuiltinToolName::ApplyPatch.as_str().to_string(),
+                tool_kind: ToolKind::Builtin,
+                input,
+                approval_requirement: ApprovalRequirement::None,
+                risk_level: RiskLevel::Medium,
+            },
+            ToolExecutionContext {
+                working_directory: Some(root.clone()),
+                ..ToolExecutionContext::default()
+            },
+            &ToolExecutionPolicy::default(),
+        );
+
+        assert_eq!(output.status, ExecutionResultStatus::Succeeded);
+        let payload: Value = serde_json::from_str(&output.payload).unwrap();
+        assert_eq!(payload["tool"], "apply_patch");
+        assert_eq!(payload["status"], "succeeded");
+        assert_eq!(payload["operations"], 2);
+        assert_eq!(
+            fs::read_to_string(root.join("created.txt")).unwrap(),
+            "created\n"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("existing.txt")).unwrap(),
+            "ALPHA\nbeta\n"
+        );
+    }
+
+    #[test]
     fn file_remove_deletes_file_and_directory() {
         let root = unique_temp_dir("magi-tool-file-remove");
         let registry = make_registry();
@@ -4043,6 +4529,7 @@ mod tests {
     fn from_str_handles_ts_compatible_aliases() {
         let aliases = [
             ("file_view", BuiltinToolName::FileRead),
+            ("image_view", BuiltinToolName::ViewImage),
             ("file_create", BuiltinToolName::FileWrite),
             ("file_edit", BuiltinToolName::FilePatch),
             ("file_insert", BuiltinToolName::FilePatch),
@@ -4052,6 +4539,7 @@ mod tests {
             ("web_search", BuiltinToolName::WebSearch),
             ("web_fetch", BuiltinToolName::WebFetch),
             ("project_knowledge_query", BuiltinToolName::KnowledgeQuery),
+            ("tool_diagnostics", BuiltinToolName::ToolCatalog),
         ];
         for (alias, expected) in &aliases {
             assert_eq!(
@@ -4082,6 +4570,7 @@ mod tests {
         let write_ops = [
             BuiltinToolName::FileWrite,
             BuiltinToolName::FilePatch,
+            BuiltinToolName::ApplyPatch,
             BuiltinToolName::FileRemove,
             BuiltinToolName::FileMkdir,
             BuiltinToolName::FileCopy,
@@ -4089,11 +4578,13 @@ mod tests {
         ];
         let non_write = [
             BuiltinToolName::FileRead,
+            BuiltinToolName::ViewImage,
             BuiltinToolName::SearchText,
             BuiltinToolName::ShellExec,
             BuiltinToolName::WebSearch,
             BuiltinToolName::DiffPreview,
             BuiltinToolName::DiagramRender,
+            BuiltinToolName::ToolCatalog,
         ];
         for tool in &write_ops {
             assert!(tool.is_write_operation(), "{:?} should be write", tool);
@@ -4384,6 +4875,10 @@ mod tests {
     fn web_tools_are_read_only() {
         let registry = make_registry();
         assert_eq!(
+            registry.builtin_access_mode(BuiltinToolName::ViewImage.as_str()),
+            Some(BuiltinToolAccessMode::ReadOnly)
+        );
+        assert_eq!(
             registry.builtin_access_mode(BuiltinToolName::WebSearch.as_str()),
             Some(BuiltinToolAccessMode::ReadOnly)
         );
@@ -4393,6 +4888,10 @@ mod tests {
         );
         assert_eq!(
             registry.builtin_access_mode(BuiltinToolName::DiagramRender.as_str()),
+            Some(BuiltinToolAccessMode::ReadOnly)
+        );
+        assert_eq!(
+            registry.builtin_access_mode(BuiltinToolName::ToolCatalog.as_str()),
             Some(BuiltinToolAccessMode::ReadOnly)
         );
     }
@@ -4484,8 +4983,10 @@ mod tests {
             public_names,
             vec![
                 "file_read",
+                "view_image",
                 "file_write",
                 "file_patch",
+                "apply_patch",
                 "file_remove",
                 "file_mkdir",
                 "file_copy",
@@ -4500,6 +5001,7 @@ mod tests {
                 "diagram_render",
                 "knowledge_query",
                 "code_symbols",
+                "tool_catalog",
                 "agent_spawn",
                 "agent_wait",
                 "todo_write",
@@ -4582,6 +5084,90 @@ mod tests {
                 "{name} must not be accepted as a public builtin surface"
             );
         }
+    }
+
+    #[test]
+    fn builtin_invocation_policy_classifies_shell_exec_by_runtime_intent() {
+        let read_only = BuiltinToolName::ShellExec.invocation_policy_for_input(
+            &serde_json::json!({
+                "command": "git status --short",
+                "access_mode": "read_only"
+            })
+            .to_string(),
+        );
+        assert_eq!(read_only.risk_level, RiskLevel::Low);
+        assert_eq!(read_only.approval_requirement, ApprovalRequirement::None);
+
+        let background = BuiltinToolName::ShellExec.invocation_policy_for_input(
+            &serde_json::json!({
+                "command": "cargo check",
+                "background": true
+            })
+            .to_string(),
+        );
+        assert_eq!(background.risk_level, RiskLevel::Medium);
+        assert_eq!(background.approval_requirement, ApprovalRequirement::None);
+
+        let background_read = BuiltinToolName::ShellExec.invocation_policy_for_input(
+            &serde_json::json!({
+                "action": "read",
+                "terminal_id": 1
+            })
+            .to_string(),
+        );
+        assert_eq!(background_read.risk_level, RiskLevel::Low);
+        assert_eq!(
+            background_read.approval_requirement,
+            ApprovalRequirement::None
+        );
+
+        let raw_shell = BuiltinToolName::ShellExec.invocation_policy_for_input("cargo test");
+        assert_eq!(raw_shell.risk_level, RiskLevel::Medium);
+        assert_eq!(raw_shell.approval_requirement, ApprovalRequirement::None);
+    }
+
+    #[test]
+    fn builtin_invocation_policy_requires_approval_for_recursive_remove() {
+        let single_file = BuiltinToolName::FileRemove
+            .invocation_policy_for_input(&serde_json::json!({ "path": "tmp.txt" }).to_string());
+        assert_eq!(single_file.risk_level, RiskLevel::Medium);
+        assert_eq!(single_file.approval_requirement, ApprovalRequirement::None);
+
+        let recursive = BuiltinToolName::FileRemove.invocation_policy_for_input(
+            &serde_json::json!({ "path": "target/tmp", "recursive": true }).to_string(),
+        );
+        assert_eq!(recursive.risk_level, RiskLevel::High);
+        assert_eq!(
+            recursive.approval_requirement,
+            ApprovalRequirement::Required
+        );
+    }
+
+    #[test]
+    fn builtin_execution_input_canonicalizes_alias_and_applies_invocation_policy() {
+        let file_view = ToolExecutionInput::for_builtin_invocation(
+            ToolCallId::new("tool-call-file-view"),
+            "file_view",
+            "/tmp/example.txt",
+        );
+        assert_eq!(file_view.tool_name, BuiltinToolName::FileRead.as_str());
+        assert_eq!(file_view.risk_level, RiskLevel::Low);
+        assert_eq!(file_view.approval_requirement, ApprovalRequirement::None);
+
+        let recursive_remove = ToolExecutionInput::for_builtin_invocation(
+            ToolCallId::new("tool-call-file-remove"),
+            "file_remove",
+            serde_json::json!({ "path": "target/tmp", "recursive": true }).to_string(),
+        );
+        assert_eq!(
+            recursive_remove.tool_name,
+            BuiltinToolName::FileRemove.as_str()
+        );
+        assert_eq!(recursive_remove.risk_level, RiskLevel::High);
+        assert_eq!(
+            recursive_remove.approval_requirement,
+            ApprovalRequirement::Required
+        );
     }
 
     #[test]
@@ -4744,6 +5330,10 @@ mod tests {
             Some(BuiltinToolAccessMode::ExplicitWrite)
         );
         assert_eq!(
+            registry.builtin_access_mode(BuiltinToolName::ApplyPatch.as_str()),
+            Some(BuiltinToolAccessMode::ExplicitWrite)
+        );
+        assert_eq!(
             registry.builtin_access_mode(BuiltinToolName::FileRemove.as_str()),
             Some(BuiltinToolAccessMode::ExplicitWrite)
         );
@@ -4842,8 +5432,8 @@ mod tests {
 
         let governance = Arc::new(GovernanceService::default());
         let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(16));
-        let mut tool_registry = ToolRegistry::new(governance, event_bus)
-            .with_knowledge_store(store);
+        let mut tool_registry =
+            ToolRegistry::new(governance, event_bus).with_knowledge_store(store);
         tool_registry.register_default_builtins();
 
         let context = ToolExecutionContext {
@@ -4870,10 +5460,8 @@ mod tests {
         let def_payload: Value = serde_json::from_str(&def.payload).expect("def json");
         let def_results = def_payload["results"].as_array().expect("def results");
         assert!(
-            def_results
-                .iter()
-                .any(|r| r["name"] == "authenticate_user"
-                    && r["path"].as_str().is_some_and(|p| p.contains("auth.rs"))),
+            def_results.iter().any(|r| r["name"] == "authenticate_user"
+                && r["path"].as_str().is_some_and(|p| p.contains("auth.rs"))),
             "definition 应命中 authenticate_user@auth.rs，实际: {def_results:?}"
         );
 
@@ -4899,8 +5487,14 @@ mod tests {
             .iter()
             .filter_map(|r| r["name"].as_str())
             .collect();
-        assert!(names.contains(&"authenticate_user"), "file_symbols 应含函数，实际: {names:?}");
-        assert!(names.contains(&"Session"), "file_symbols 应含 struct，实际: {names:?}");
+        assert!(
+            names.contains(&"authenticate_user"),
+            "file_symbols 应含函数，实际: {names:?}"
+        );
+        assert!(
+            names.contains(&"Session"),
+            "file_symbols 应含 struct，实际: {names:?}"
+        );
 
         let _ = fs::remove_dir_all(&root);
     }

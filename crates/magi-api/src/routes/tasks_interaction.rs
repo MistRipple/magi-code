@@ -263,6 +263,10 @@ async fn restart_task(
             .and_then(serde_json::Value::as_str)
             .map(str::to_string),
         images: Vec::new(),
+        access_profile: root_task
+            .policy_snapshot
+            .as_ref()
+            .map(|policy| policy.access_profile),
         request_id: None,
         user_message_id: None,
         placeholder_message_id: None,

@@ -612,6 +612,7 @@ export interface QueuedMessage {
   text?: string | null;
   createdAt: number;
   skillName?: string | null;
+  accessProfile?: 'read_only' | 'restricted' | 'full_access' | null;
   images?: QueuedMessageImage[];
 }
 

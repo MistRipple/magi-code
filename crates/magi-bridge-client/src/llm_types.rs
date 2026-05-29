@@ -111,10 +111,12 @@ pub enum LlmContentBlock {
         content: String,
         #[serde(default)]
         is_error: bool,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<ImageSource>,
     },
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ImageSource {
     #[serde(rename = "type")]
     pub kind: String,
@@ -496,6 +498,7 @@ pub fn sanitize_tool_order(messages: &[LlmMessage]) -> Vec<LlmMessage> {
                                 tool_use_id,
                                 content,
                                 is_error,
+                                images,
                             } => {
                                 let incoming = tool_use_id.trim().to_string();
                                 let resolved = if !incoming.is_empty()
@@ -526,6 +529,7 @@ pub fn sanitize_tool_order(messages: &[LlmMessage]) -> Vec<LlmMessage> {
                                     tool_use_id: resolved,
                                     content: content.clone(),
                                     is_error: *is_error,
+                                    images: images.clone(),
                                 });
                             }
                             other => result_normalized.push(other.clone()),
