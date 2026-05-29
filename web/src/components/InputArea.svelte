@@ -1152,31 +1152,6 @@
 
     <div class="ia-actions">
       <div class="ia-left">
-        <button
-          type="button"
-          class="ia-enhance"
-          class:loading={enhanceLoading}
-          onclick={enhancePromptHandler}
-          disabled={enhanceLoading || !inputValue.trim() || sessionInputLocked || isInteractionBlocking || !auxiliaryEnhanceReady}
-          title={enhanceButtonTitle}
-          aria-label={enhanceButtonTitle}
-        >
-          <Icon name={enhanceLoading ? 'loader' : 'enhance'} size={14} class={enhanceLoading ? 'spinning' : ''} />
-          <span>{i18n.t('input.enhance.label')}</span>
-        </button>
-        {#if hasEnhanceSnapshot}
-          <button
-            type="button"
-            class="ia-enhance ia-enhance-restore"
-            onclick={restoreEnhancedPrompt}
-            disabled={sessionInputLocked || isInteractionBlocking}
-            title={i18n.t('input.enhance.restore')}
-            aria-label={i18n.t('input.enhance.restore')}
-          >
-            <Icon name="undo" size={14} />
-            <span>{i18n.t('input.enhance.restore')}</span>
-          </button>
-        {/if}
         {#if branchIsRepo}
           <div class="ia-picker-wrap">
             <button
@@ -1297,6 +1272,31 @@
             </div>
           {/if}
         </div>
+        <button
+          type="button"
+          class="ia-enhance"
+          class:loading={enhanceLoading}
+          onclick={enhancePromptHandler}
+          disabled={enhanceLoading || !inputValue.trim() || sessionInputLocked || isInteractionBlocking || !auxiliaryEnhanceReady}
+          title={enhanceButtonTitle}
+          aria-label={enhanceButtonTitle}
+        >
+          <Icon name={enhanceLoading ? 'loader' : 'enhance'} size={14} class={enhanceLoading ? 'spinning' : ''} />
+          <span>{i18n.t('input.enhance.label')}</span>
+        </button>
+        {#if hasEnhanceSnapshot}
+          <button
+            type="button"
+            class="ia-enhance ia-enhance-restore"
+            onclick={restoreEnhancedPrompt}
+            disabled={sessionInputLocked || isInteractionBlocking}
+            title={i18n.t('input.enhance.restore')}
+            aria-label={i18n.t('input.enhance.restore')}
+          >
+            <Icon name="undo" size={14} />
+            <span>{i18n.t('input.enhance.restore')}</span>
+          </button>
+        {/if}
         {#if isSending}
           {#if hasContent}
             <button
