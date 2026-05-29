@@ -567,12 +567,52 @@ fn fallback_udp_ip() -> String {
 #[serde(rename_all = "camelCase")]
 struct EnhancePromptRequest {
     prompt: String,
+    #[serde(default)]
+    skill_name: Option<String>,
+    #[serde(default)]
+    skill_description: Option<String>,
+}
+
+fn build_enhance_prompt_instruction(
+    prompt: &str,
+    skill_name: Option<&str>,
+    skill_description: Option<&str>,
+) -> String {
+    let mut sections = Vec::new();
+    sections.push(
+        "请优化以下用户 prompt，使其更清晰、具体、可执行。只输出优化后的 prompt，不要添加额外解释。"
+            .to_string(),
+    );
+    sections.push(
+        "要求：\n- 如果原文已经足够清晰，不要无意义扩写\n- 保留用户原始意图与语言风格\n- 如果存在当前技能上下文，请保留该技能的任务边界，不要改写成泛化闲聊或无关任务"
+            .to_string(),
+    );
+    let skill_name = skill_name.map(str::trim).filter(|value| !value.is_empty());
+    let skill_description = skill_description
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if skill_name.is_some() || skill_description.is_some() {
+        let mut skill_section = String::from("当前技能上下文：");
+        if let Some(name) = skill_name {
+            skill_section.push_str(&format!("\n- 名称：/{}", name));
+        }
+        if let Some(description) = skill_description {
+            skill_section.push_str(&format!("\n- 说明：{}", description));
+        }
+        sections.push(skill_section);
+    }
+    sections.push(format!("原始 prompt:\n{}", prompt.trim()));
+    sections.join("\n\n")
 }
 
 async fn enhance_prompt(
     State(state): State<ApiState>,
     Json(request): Json<EnhancePromptRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let prompt = request.prompt.trim();
+    if prompt.is_empty() {
+        return Err(ApiError::InvalidInput("提示词不能为空".to_string()));
+    }
     let Some(client) =
         resolve_target_for_role(Some(&state.settings_store), None, RoleTarget::Auxiliary)
             .ok()
@@ -585,9 +625,10 @@ async fn enhance_prompt(
 
     let invocation = ModelInvocationRequest {
         provider: BUSINESS_MODEL_PROVIDER.to_string(),
-        prompt: format!(
-            "请优化以下用户 prompt，使其更清晰、具体、可执行。只输出优化后的 prompt，不要添加额外解释。\n\n原始 prompt:\n{}",
-            request.prompt
+        prompt: build_enhance_prompt_instruction(
+            prompt,
+            request.skill_name.as_deref(),
+            request.skill_description.as_deref(),
         ),
         messages: None,
         tools: None,

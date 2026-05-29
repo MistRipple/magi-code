@@ -10,6 +10,7 @@ import type {
   SessionNotificationsResponseDto,
   MessagesResponseDto,
   FetchModelsResponseDto,
+  EnhancePromptRequestDto,
 } from '../shared/rust-backend-types';
 import type { CanonicalTurn, CanonicalTurnItem } from '../shared/protocol/canonical-turn';
 import { i18n } from '../stores/i18n.svelte';
@@ -1154,8 +1155,8 @@ export async function getAgentExecutionStats(): Promise<AgentExecutionStatsPaylo
   }
 }
 
-export async function enhanceAgentPrompt(prompt: string): Promise<{ enhancedPrompt: string; error?: string }> {
-  return await postBoundJson<{ enhancedPrompt: string; error?: string }>('/api/prompt/enhance', { prompt }, 'enhance prompt');
+export async function enhanceAgentPrompt(request: EnhancePromptRequestDto): Promise<{ enhancedPrompt: string; error?: string }> {
+  return await postBoundJson<{ enhancedPrompt: string; error?: string }>('/api/prompt/enhance', request, 'enhance prompt');
 }
 
 export async function updateAgentRuntimeSetting(key: string, value: unknown): Promise<AgentRuntimeSettings> {

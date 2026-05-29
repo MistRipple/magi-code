@@ -1176,12 +1176,10 @@ export interface FilesystemListResponseDto {
   entries: FilesystemEntryDto[];
 }
 
-export interface EnhancePromptRequestDto {
+export interface EnhancePromptRequestDto extends Record<string, unknown> {
   prompt: string;
-}
-
-export interface EnhancePromptResponseDto {
-  enhancedPrompt: string;
+  skillName?: string | null;
+  skillDescription?: string | null;
 }
 
 export interface MessagesResponseDto {

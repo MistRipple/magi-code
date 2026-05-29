@@ -27,7 +27,6 @@ import {
   deleteAgentMcpServer,
   deleteAgentRepository,
   disconnectAgentMcpServer,
-  enhanceAgentPrompt,
   fetchAgentModelList,
   getAgentMcpServerTools,
   getAgentExecutionStats,
@@ -2651,11 +2650,6 @@ async function removeNotification(scope: NotificationOperationScope, notificatio
   ));
 }
 
-async function enhancePrompt(prompt: string): Promise<void> {
-  const payload = await enhanceAgentPrompt(prompt);
-  emitDataMessage('promptEnhanced', payload);
-}
-
 async function saveWorkerConfig(worker: string, config: Record<string, unknown>): Promise<void> {
   await saveAgentWorkerConfig(worker, config);
   cachedSettingsBootstrap = null;
@@ -3458,16 +3452,6 @@ export function createWebClientBridge(): ClientBridge {
           if (message.tool && typeof message.tool === 'object') {
             void addCustomTool(message.tool as Record<string, unknown>).catch((error) => {
               logBridgeOperationFailure('添加自定义工具', '[web-client-bridge] 添加自定义工具失败:', error);
-            });
-          }
-          return;
-        case 'enhancePrompt':
-          if (typeof message.prompt === 'string' && message.prompt.trim()) {
-            void enhancePrompt(message.prompt).catch((error) => {
-              emitDataMessage('promptEnhanced', {
-                error: normalizeErrorMessage(error) || '增强提示词失败',
-              });
-              logBridgeOperationFailure('增强提示词', '[web-client-bridge] 增强提示词失败:', error);
             });
           }
           return;

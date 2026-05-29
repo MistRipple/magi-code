@@ -96,7 +96,6 @@ export type DataMessageType =
   | 'projectKnowledgeLoaded'
   | 'processingStateChanged'
   | 'registryAgentsLoaded'
-  | 'promptEnhanced'
   | 'recoveryRequest'
   | 'repositoryAdded'
   | 'repositoryAddFailed'

@@ -20,8 +20,6 @@ import type {
   DiffResponseDto,
   EngineIdRequestDto,
   EnginesResponseDto,
-  EnhancePromptRequestDto,
-  EnhancePromptResponseDto,
   EventEnvelope,
   FetchModelsRequestDto,
   FetchModelsResponseDto,
@@ -531,12 +529,6 @@ export class RustDaemonClient {
     return this.getJson<FilesystemListResponseDto>(
       `/api/filesystem/list${qs ? `?${qs}` : ''}`,
     );
-  }
-
-  public async enhancePrompt(
-    request: EnhancePromptRequestDto,
-  ): Promise<EnhancePromptResponseDto> {
-    return this.postJson<EnhancePromptResponseDto>('/api/prompt/enhance', request);
   }
 
   // ─── Task Projection ───────────────────────────────────────────────

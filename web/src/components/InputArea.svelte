@@ -18,7 +18,6 @@
     saveAgentOrchestratorConfig,
     type AgentSettingsBootstrapSnapshot,
   } from '../web/agent-api';
-  import { categoryLabel, listTaskTemplates, type ResolvedTemplate } from '../lib/task-templates';
   import Icon from './Icon.svelte';
   import { generateId } from '../lib/utils';
   import { i18n } from '../stores/i18n.svelte';
@@ -63,7 +62,8 @@
 
   let stopLoading = $state(false);
   let enhanceLoading = $state(false);
-  let templatesOpen = $state(false);
+  let enhanceOriginalPrompt = $state<string | null>(null);
+  let enhanceResultPrompt = $state<string | null>(null);
 
   // 主线模型 picker：弹窗状态 + 模型列表惰性拉取。
   // 选中后直接写回 orchestrator 配置，后续会话轮次都读取同一份持久化配置。
@@ -74,21 +74,15 @@
   let pickerError = $state<string | null>(null);
   let pickerLoadedOnce = false;
   const currentPickerModel = $derived.by(() => readOrchestratorModel());
-  const templates = $derived<ResolvedTemplate[]>(templatesOpen ? listTaskTemplates() : []);
-  const groupedTemplates = $derived.by(() => {
-    if (!templatesOpen) return [] as Array<{ category: ResolvedTemplate['category']; label: string; items: ResolvedTemplate[] }>;
-    const buckets = new Map<ResolvedTemplate['category'], ResolvedTemplate[]>();
-    for (const tpl of templates) {
-      const list = buckets.get(tpl.category) ?? [];
-      list.push(tpl);
-      buckets.set(tpl.category, list);
-    }
-    return Array.from(buckets.entries()).map(([category, items]) => ({
-      category,
-      label: categoryLabel(category),
-      items,
-    }));
-  });
+  const auxiliaryConfig = $derived.by(() => getAuxiliaryConfigSnapshot());
+  const auxiliaryEnhanceReady = $derived.by(() => hasUsableModelConfig(auxiliaryConfig));
+  const enhanceButtonTitle = $derived.by(() => (
+    auxiliaryEnhanceReady ? i18n.t('input.enhance.title') : i18n.t('input.enhance.disabled')
+  ));
+  const hasEnhanceSnapshot = $derived.by(() => (
+    enhanceOriginalPrompt !== null
+    && enhanceResultPrompt !== null
+  ));
 
   const currentSessionId = $derived(messagesState.currentSessionId);
   const taskProjection = $derived(getTaskProjectionState(currentSessionId));
@@ -232,6 +226,7 @@
     inputValue = '';
     selectedImages = [];
     selectedSkill = null;
+    clearEnhanceSnapshot();
     closeSlashMenu();
   }
 
@@ -357,7 +352,7 @@
     inputTextareaEl?.focus();
   }
 
-  // 当 inputValue 由外部驱动（模板、技能选择、enhance 等）变化时，
+  // 当 inputValue 由外部驱动（技能选择、enhance 等）变化时，
   // 与 DOM 比对一次，必要时重渲染并恢复 pendingCaretOffset。
   $effect(() => {
     const value = inputValue;
@@ -468,6 +463,7 @@
     function handleFillComposer(event: Event) {
       const text = (event as CustomEvent<{ text?: string }>).detail?.text;
       if (typeof text !== 'string' || !text.trim()) return;
+      clearEnhanceSnapshot();
       pendingCaretOffset = text.length;
       inputValue = text;
       queueMicrotask(focusEditor);
@@ -624,6 +620,7 @@
     if (!target) return;
     const text = (target.text ?? target.content ?? '').toString();
     removeQueuedMessage(normalizedId);
+    clearEnhanceSnapshot();
     pendingCaretOffset = text.length;
     inputValue = text;
     queueMicrotask(focusEditor);
@@ -722,21 +719,6 @@
     selectedImages = [];
   }
 
-  function toggleTemplates() {
-    templatesOpen = !templatesOpen;
-  }
-  function applyTemplate(tpl: ResolvedTemplate) {
-    const prompt = (tpl.prompt || '').trim();
-    if (!prompt) {
-      templatesOpen = false;
-      return;
-    }
-    pendingCaretOffset = prompt.length;
-    inputValue = prompt;
-    templatesOpen = false;
-    queueMicrotask(focusEditor);
-  }
-
   function getOrchestratorConfigSnapshot(): Record<string, unknown> | null {
     const snapshot = messagesState.settingsBootstrapSnapshot;
     const orchestratorConfig = snapshot?.orchestratorConfig;
@@ -750,6 +732,30 @@
     const config = getOrchestratorConfigSnapshot();
     const model = config?.model;
     return typeof model === 'string' ? model.trim() : '';
+  }
+
+  function getAuxiliaryConfigSnapshot(): Record<string, unknown> | null {
+    const snapshot = messagesState.settingsBootstrapSnapshot;
+    const auxiliaryConfig = snapshot?.auxiliaryConfig;
+    if (!auxiliaryConfig || typeof auxiliaryConfig !== 'object' || Array.isArray(auxiliaryConfig)) {
+      return null;
+    }
+    return auxiliaryConfig as Record<string, unknown>;
+  }
+
+  function hasUsableModelConfig(config: Record<string, unknown> | null): boolean {
+    if (!config) {
+      return false;
+    }
+    const baseUrl = typeof config.baseUrl === 'string' ? config.baseUrl.trim() : '';
+    const apiKey = typeof config.apiKey === 'string' ? config.apiKey.trim() : '';
+    const model = typeof config.model === 'string' ? config.model.trim() : '';
+    return Boolean(baseUrl && apiKey && model);
+  }
+
+  function clearEnhanceSnapshot() {
+    enhanceOriginalPrompt = null;
+    enhanceResultPrompt = null;
   }
 
   function applyLocalOrchestratorConfig(config: Record<string, unknown>) {
@@ -877,17 +883,25 @@
   }
 
   // Prompt enhance：调用后端模型重写当前 textarea 文本
+  // 这里固定走辅助模型，不占用主线模型配额；如果存在选中的技能上下文，一并传给后端增强。
   async function enhancePromptHandler() {
-    const draft = inputValue.trim();
-    if (enhanceLoading || !draft) return;
+    const draft = resolveComposerRawContent();
+    const normalizedDraft = draft.trim();
+    if (enhanceLoading || !normalizedDraft || !auxiliaryEnhanceReady) return;
     enhanceLoading = true;
     try {
-      const result = await enhanceAgentPrompt(draft);
+      const result = await enhanceAgentPrompt({
+        prompt: normalizedDraft,
+        skillName: selectedSkill?.name?.trim() || null,
+        skillDescription: selectedSkill?.description?.trim() || null,
+      });
       const next = unwrapEnhancedPromptPayload(result?.enhancedPrompt ?? '');
       if (!next) {
         addToast('warning', result?.error || i18n.t('input.enhance.empty'));
         return;
       }
+      enhanceOriginalPrompt = draft;
+      enhanceResultPrompt = next;
       inputValue = next;
       pendingCaretOffset = next.length;
       queueMicrotask(focusEditor);
@@ -898,6 +912,15 @@
     } finally {
       enhanceLoading = false;
     }
+  }
+
+  function restoreEnhancedPrompt() {
+    if (!enhanceOriginalPrompt || !enhanceResultPrompt) return;
+    inputValue = enhanceOriginalPrompt;
+    pendingCaretOffset = enhanceOriginalPrompt.length;
+    clearEnhanceSnapshot();
+    queueMicrotask(focusEditor);
+    addToast('info', i18n.t('input.enhance.restored'));
   }
 </script>
 
@@ -1047,57 +1070,31 @@
 
     <div class="ia-actions">
       <div class="ia-left">
-        <div class="ia-templates-wrap">
-          <button
-            type="button"
-            class="ia-enhance"
-            class:active={templatesOpen}
-            onclick={toggleTemplates}
-            disabled={sessionInputLocked || isInteractionBlocking}
-            title={i18n.t('input.templates.title')}
-            aria-label={i18n.t('input.templates.title')}
-            aria-expanded={templatesOpen}
-          >
-            <Icon name="lightbulb" size={14} />
-            <span>{i18n.t('input.templates.label')}</span>
-          </button>
-          {#if templatesOpen}
-            <!-- svelte-ignore a11y_click_events_have_key_events -->
-            <!-- svelte-ignore a11y_no_static_element_interactions -->
-            <div class="ia-templates-backdrop" onclick={() => (templatesOpen = false)}></div>
-            <div class="ia-templates-popover" role="menu">
-              <div class="ia-templates-header">{i18n.t('input.templates.heading')}</div>
-              {#each groupedTemplates as group (group.category)}
-                <div class="ia-templates-group">
-                  <div class="ia-templates-group-label">{group.label}</div>
-                  {#each group.items as tpl (tpl.id)}
-                    <button
-                      type="button"
-                      class="ia-templates-item"
-                      onclick={() => applyTemplate(tpl)}
-                      title={tpl.description}
-                    >
-                      <span class="ia-templates-item-label">{tpl.label}</span>
-                      <span class="ia-templates-item-desc">{tpl.description}</span>
-                    </button>
-                  {/each}
-                </div>
-              {/each}
-            </div>
-          {/if}
-        </div>
         <button
           type="button"
           class="ia-enhance"
           class:loading={enhanceLoading}
           onclick={enhancePromptHandler}
-          disabled={enhanceLoading || !inputValue.trim() || sessionInputLocked || isInteractionBlocking}
-          title={i18n.t('input.enhance.title')}
-          aria-label={i18n.t('input.enhance.title')}
+          disabled={enhanceLoading || !inputValue.trim() || sessionInputLocked || isInteractionBlocking || !auxiliaryEnhanceReady}
+          title={enhanceButtonTitle}
+          aria-label={enhanceButtonTitle}
         >
           <Icon name={enhanceLoading ? 'loader' : 'enhance'} size={14} class={enhanceLoading ? 'spinning' : ''} />
           <span>{i18n.t('input.enhance.label')}</span>
         </button>
+        {#if hasEnhanceSnapshot}
+          <button
+            type="button"
+            class="ia-enhance ia-enhance-restore"
+            onclick={restoreEnhancedPrompt}
+            disabled={sessionInputLocked || isInteractionBlocking}
+            title={i18n.t('input.enhance.restore')}
+            aria-label={i18n.t('input.enhance.restore')}
+          >
+            <Icon name="undo" size={14} />
+            <span>{i18n.t('input.enhance.restore')}</span>
+          </button>
+        {/if}
       </div>
 
       <div class="ia-right">
@@ -1121,7 +1118,7 @@
           {#if pickerOpen}
             <!-- svelte-ignore a11y_click_events_have_key_events -->
             <!-- svelte-ignore a11y_no_static_element_interactions -->
-            <div class="ia-templates-backdrop" onclick={() => (pickerOpen = false)}></div>
+            <div class="ia-popover-backdrop" onclick={() => (pickerOpen = false)}></div>
             <div class="ia-picker-popover" role="menu">
               <div class="ia-picker-header">切换主线模型 · 保存到设置</div>
               {#if pickerLoading}
@@ -1380,83 +1377,21 @@
   }
   .ia-enhance:disabled { opacity: 0.4; cursor: not-allowed; }
   .ia-enhance.loading { color: var(--primary); border-color: color-mix(in srgb, var(--primary) 50%, transparent); }
-  .ia-enhance.active {
-    background: color-mix(in srgb, var(--primary) 14%, transparent);
-    border-color: color-mix(in srgb, var(--primary) 42%, transparent);
+  .ia-enhance-restore {
+    background: color-mix(in srgb, var(--primary) 10%, transparent);
+    border-color: color-mix(in srgb, var(--primary) 32%, transparent);
     color: var(--primary);
   }
-
-  .ia-templates-wrap {
-    position: relative;
-    display: inline-flex;
+  .ia-enhance-restore:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--primary) 16%, transparent);
+    border-color: color-mix(in srgb, var(--primary) 46%, transparent);
   }
-  .ia-templates-backdrop {
+
+  .ia-popover-backdrop {
     position: fixed;
     inset: 0;
     background: transparent;
     z-index: 30;
-  }
-  .ia-templates-popover {
-    position: absolute;
-    bottom: calc(100% + 6px);
-    left: 0;
-    z-index: 31;
-    width: 320px;
-    max-height: 360px;
-    overflow-y: auto;
-    padding: 8px;
-    background: color-mix(in srgb, var(--background) 100%, white 8%);
-    backdrop-filter: blur(18px);
-    -webkit-backdrop-filter: blur(18px);
-    border: 1px solid color-mix(in srgb, var(--border) 80%, var(--foreground) 20%);
-    border-radius: var(--radius-md);
-    box-shadow: 0 14px 40px rgba(0, 0, 0, 0.45), 0 2px 8px rgba(0, 0, 0, 0.22);
-  }
-  .ia-templates-header {
-    font-size: 11px;
-    color: var(--foreground-muted);
-    padding: 2px 6px 6px;
-  }
-  .ia-templates-group {
-    padding: 4px 0;
-  }
-  .ia-templates-group + .ia-templates-group {
-    border-top: 1px dashed var(--border-subtle);
-    margin-top: 4px;
-  }
-  .ia-templates-group-label {
-    font-size: 10px;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-    color: var(--foreground-muted);
-    padding: 4px 6px 2px;
-  }
-  .ia-templates-item {
-    display: flex;
-    flex-direction: column;
-    align-items: flex-start;
-    gap: 2px;
-    width: 100%;
-    padding: 6px 8px;
-    background: transparent;
-    border: none;
-    border-radius: var(--radius-sm, 6px);
-    cursor: pointer;
-    text-align: left;
-    color: var(--foreground);
-    transition: background var(--transition-fast);
-  }
-  .ia-templates-item:hover {
-    background: color-mix(in srgb, var(--primary) 10%, transparent);
-  }
-  .ia-templates-item-label {
-    font-size: 12px;
-    font-weight: var(--font-medium, 500);
-  }
-  .ia-templates-item-desc {
-    font-size: 11px;
-    color: var(--foreground-muted);
-    line-height: 1.4;
   }
 
   /* 主线模型 picker：右下角，向上展开 */
