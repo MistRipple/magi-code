@@ -27,7 +27,6 @@ magi-mission-metrics = { path = "../magi-mission-metrics" }
 magi-orchestrator = { path = "../magi-orchestrator" }
 magi-session-store = { path = "../magi-session-store" }
 magi-skill-runtime = { path = "../magi-skill-runtime" }
-magi-snapshot = { path = "../magi-snapshot" }
 magi-tool-runtime = { path = "../magi-tool-runtime" }
 magi-worker-runtime = { path = "../magi-worker-runtime" }
 magi-workspace = { path = "../magi-workspace" }

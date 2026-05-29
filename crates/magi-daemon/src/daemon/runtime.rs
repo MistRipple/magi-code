@@ -299,9 +299,6 @@ pub(crate) struct DaemonRuntime {
     governance: Arc<GovernanceService>,
     worker_runtime: WorkerRuntime,
     runtime_maintenance: RuntimeMaintenance,
-    /// 活跃 workspace 的文件监听句柄：变更时增量刷新代码索引。
-    /// 持有它仅为维持监听任务存活；daemon 退出时随之 drop。Arc 以满足 Clone。
-    _index_watcher: Option<Arc<magi_snapshot::watcher::FsWatcher>>,
 }
 
 impl DaemonRuntime {
@@ -400,12 +397,10 @@ impl DaemonRuntime {
 
         // 装配本地代码检索引擎：引擎是进程内内存态，每次 daemon 启动都需构建
         // （引擎内部有 .magi/cache 快照，新鲜时增量恢复、否则全量重建）。
-        let mut index_watcher = None;
+        // 文件监听由 build_workspace_index 内部一并起，daemon 不再单独管理。
         if let Some(workspace) = active_workspace.as_ref() {
             let scan_root = PathBuf::from(workspace.root_path.as_str());
             knowledge_store.build_workspace_index(&workspace.workspace_id, &scan_root);
-            index_watcher =
-                Self::spawn_index_watcher(&knowledge_store, &workspace.workspace_id, &scan_root);
         }
 
         let runtime_maintenance = RuntimeMaintenance::new(
@@ -427,42 +422,7 @@ impl DaemonRuntime {
             governance: Arc::new(GovernanceService::default()),
             worker_runtime,
             runtime_maintenance,
-            _index_watcher: index_watcher,
         })
-    }
-
-    /// 为活跃 workspace 起文件监听，把去抖后的变更转发到代码索引增量更新。
-    ///
-    /// 仅在 tokio 运行时存在时启动（FsWatcher 内部 spawn 去抖任务）；
-    /// 非 async 上下文（如部分单测）直接返回 None，监听只是增强、缺失不影响功能。
-    fn spawn_index_watcher(
-        knowledge_store: &Arc<KnowledgeStore>,
-        workspace_id: &magi_core::WorkspaceId,
-        scan_root: &std::path::Path,
-    ) -> Option<Arc<magi_snapshot::watcher::FsWatcher>> {
-        if tokio::runtime::Handle::try_current().is_err() {
-            return None;
-        }
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        // 排除索引缓存目录，避免自激励循环（写 .magi/cache 又触发监听）。
-        let excluded = Arc::new(vec![scan_root.join(".magi"), scan_root.join(".git")]);
-        let watcher = match magi_snapshot::watcher::FsWatcher::start(scan_root, excluded, tx) {
-            Ok(watcher) => watcher,
-            Err(error) => {
-                tracing::warn!(error = %error, "代码索引文件监听启动失败，增量更新降级");
-                return None;
-            }
-        };
-
-        let store = knowledge_store.clone();
-        let workspace_id = workspace_id.clone();
-        tokio::spawn(async move {
-            while let Some(event) = rx.recv().await {
-                let path = event.path.to_string_lossy().to_string();
-                store.on_workspace_file_changed(&workspace_id, &path);
-            }
-        });
-        Some(Arc::new(watcher))
     }
 
     pub(crate) fn start_background_tasks(&self) {

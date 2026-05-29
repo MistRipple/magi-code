@@ -435,3 +435,70 @@ fn workspace_code_index_builds_and_searches_real_symbols() {
 
     let _ = fs::remove_dir_all(&base);
 }
+
+#[test]
+fn watcher_incrementally_refreshes_index_on_file_change() {
+    use crate::local_search_engine::SearchOptions;
+    use std::fs;
+
+    // 需要 tokio 运行时（watcher 内部 spawn 去抖任务）。
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build tokio runtime");
+
+    let base = std::env::temp_dir().join(format!(
+        "magi-ks-watch-test-{}-{}",
+        std::process::id(),
+        UtcMillis::now().0
+    ));
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir_all(base.join("src")).expect("create temp project dir");
+    fs::write(
+        base.join("src/seed.rs"),
+        "pub fn seed_symbol() -> u32 { 1 }\n",
+    )
+    .expect("write seed file");
+
+    let store = KnowledgeStore::new();
+    let workspace_id = WorkspaceId::new("ws-watch-test");
+
+    // 在 tokio 上下文里构建索引——此时 watcher 一并启动。
+    let _guard = runtime.enter();
+    store.build_workspace_index(&workspace_id, &base);
+    assert!(store.workspace_index_ready(&workspace_id));
+
+    // 初始检索：新符号尚不存在。
+    let before = store
+        .search_workspace_code(&workspace_id, "freshly added symbol", SearchOptions::default())
+        .expect("engine ready");
+    assert!(
+        !before.iter().any(|r| r.file_path.contains("added.rs")),
+        "改动前不应命中 added.rs"
+    );
+
+    // 让 OS 文件监听注册稳定后再写入（避免刚 watch 就漏掉首个事件）。
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    fs::write(
+        base.join("src/added.rs"),
+        "pub fn freshly_added_symbol() -> u32 { 42 }\n",
+    )
+    .expect("write added file");
+
+    // 轮询等待 watcher 去抖 + 转发 + 增量更新落地（最多 ~5s，避免固定 sleep 抖动）。
+    let mut hit = false;
+    for _ in 0..50 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let after = store
+            .search_workspace_code(&workspace_id, "freshly added symbol", SearchOptions::default())
+            .expect("engine ready");
+        if after.iter().any(|r| r.file_path.contains("added.rs")) {
+            hit = true;
+            break;
+        }
+    }
+    assert!(hit, "watcher 增量更新后应命中 added.rs");
+
+    let _ = fs::remove_dir_all(&base);
+}

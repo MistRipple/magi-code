@@ -108,10 +108,16 @@ pub struct GovernedKnowledgeOutput {
 /// 检索时只锁定目标 workspace 的引擎，不阻塞其他 workspace。
 type WorkspaceSearchEngines = Arc<RwLock<HashMap<WorkspaceId, Arc<Mutex<LocalSearchEngine>>>>>;
 
+/// 每个 workspace 的文件监听句柄：持有它仅为维持监听任务存活。
+/// 与索引引擎同生命周期——build_workspace_index 时一并建立，store 释放时随之 drop。
+type WorkspaceWatchers =
+    Arc<RwLock<HashMap<WorkspaceId, Arc<magi_snapshot::watcher::FsWatcher>>>>;
+
 #[derive(Clone, Default)]
 pub struct KnowledgeStore {
     state: Arc<RwLock<KnowledgeState>>,
     search_engines: WorkspaceSearchEngines,
+    watchers: WorkspaceWatchers,
 }
 
 impl std::fmt::Debug for KnowledgeStore {
@@ -148,6 +154,7 @@ impl KnowledgeStore {
         Self {
             state: Arc::new(RwLock::new(state)),
             search_engines: Arc::default(),
+            watchers: Arc::default(),
         }
     }
 
@@ -163,7 +170,14 @@ impl KnowledgeStore {
     /// 复用 code_scanner 的扫描结果生成 (相对路径, 文件类型) 列表喂给
     /// LocalSearchEngine::build_index；文件内容由引擎内部按需读盘。
     pub fn build_workspace_index(&self, workspace_id: &WorkspaceId, workspace_root: &Path) {
-        let outcome = code_scanner::scan_workspace(workspace_root);
+        // 规范化 root：watcher（FSEvents 等）派发的事件路径是 OS canonical 形态
+        // （macOS 上 /tmp → /private/tmp），引擎 to_relative 用 root 做前缀剥离。
+        // 若两端 root 规范化来源不同，增量更新的相对路径会对不上，导致索引落空。
+        // 在此统一 canonicalize，引擎与 watcher 共用同一规范化 root。
+        let root = std::fs::canonicalize(workspace_root)
+            .unwrap_or_else(|_| workspace_root.to_path_buf());
+
+        let outcome = code_scanner::scan_workspace(&root);
         let Some(summary) = outcome.summary.as_ref() else {
             return;
         };
@@ -173,16 +187,66 @@ impl KnowledgeStore {
             .map(|f| (f.path.clone(), classify_index_file_type(&f.path)))
             .collect();
 
-        let mut engine = LocalSearchEngine::new(
-            &workspace_root.to_string_lossy(),
-            SearchEngineConfig::default(),
-        );
+        let mut engine =
+            LocalSearchEngine::new(&root.to_string_lossy(), SearchEngineConfig::default());
         engine.build_index(&files);
 
         self.search_engines
             .write()
             .expect("knowledge store search engines write lock poisoned")
             .insert(workspace_id.clone(), Arc::new(Mutex::new(engine)));
+
+        // 与索引构建原子地起文件监听：变更去抖后转发到增量更新。
+        // 收敛 daemon 启动与 API 注册两条路径——所有 build 调用点自动获得 watcher。
+        self.spawn_watcher(workspace_id, workspace_root);
+    }
+
+    /// 为指定 workspace 起文件监听，把去抖后的变更转发到代码索引增量更新。
+    ///
+    /// 仅在 tokio 运行时存在时启动（FsWatcher 内部 spawn 去抖任务）；非 async
+    /// 上下文（部分单测）直接跳过——监听只是增强，缺失不影响检索功能。
+    /// 重复调用同一 workspace 会替换旧 watcher（旧句柄 drop 后监听停止）。
+    fn spawn_watcher(&self, workspace_id: &WorkspaceId, workspace_root: &Path) {
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        // 排除索引缓存与 git 目录，避免自激励循环（写 .magi/cache 又触发监听）。
+        let excluded = Arc::new(vec![
+            workspace_root.join(".magi"),
+            workspace_root.join(".git"),
+        ]);
+        let watcher = match magi_snapshot::watcher::FsWatcher::start(workspace_root, excluded, tx) {
+            Ok(watcher) => watcher,
+            Err(_) => return,
+        };
+
+        let engines = self.search_engines.clone();
+        let workspace_id_for_task = workspace_id.clone();
+        tokio::spawn(async move {
+            use magi_snapshot::watcher::DebouncedKind;
+            while let Some(event) = rx.recv().await {
+                let path = event.path.to_string_lossy().to_string();
+                let engine = engines
+                    .read()
+                    .ok()
+                    .and_then(|map| map.get(&workspace_id_for_task).cloned());
+                if let Some(engine) = engine {
+                    let mut engine = engine.lock().expect("search engine mutex poisoned");
+                    // 按事件类型路由到引擎对应的增量入口（新增/修改/删除语义不同）。
+                    match event.kind {
+                        DebouncedKind::Created => engine.on_file_created(&path),
+                        DebouncedKind::Modified => engine.on_file_changed(&path),
+                        DebouncedKind::Removed => engine.on_file_deleted(&path),
+                    }
+                }
+            }
+        });
+
+        self.watchers
+            .write()
+            .expect("knowledge store watchers write lock poisoned")
+            .insert(workspace_id.clone(), Arc::new(watcher));
     }
 
     /// 在指定 workspace 的本地代码索引上检索；引擎未构建时返回 None。
@@ -233,22 +297,6 @@ impl KnowledgeStore {
             .cloned()?;
         let engine = engine.lock().expect("search engine mutex poisoned");
         Some(engine.list_file_symbols(file_path))
-    }
-
-    /// 文件变更后增量刷新指定 workspace 的索引（P4：文件监听转发）。
-    pub fn on_workspace_file_changed(&self, workspace_id: &WorkspaceId, file_path: &str) {
-        if let Some(engine) = self
-            .search_engines
-            .read()
-            .expect("knowledge store search engines read lock poisoned")
-            .get(workspace_id)
-            .cloned()
-        {
-            engine
-                .lock()
-                .expect("search engine mutex poisoned")
-                .on_file_changed(file_path);
-        }
     }
 
     /// 指定 workspace 的检索引擎是否已就绪。
