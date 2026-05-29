@@ -204,12 +204,17 @@ mod tests {
                    struct Session { id: u32 }\n\
                    enum Mode { A, B }\n";
         let syms = extract_symbols("src/auth.rs", src, ".rs").expect("rust supported");
+        assert!(syms.iter().any(|s| s.name == "authenticate_user"
+            && s.kind == SymbolKind::Function
+            && s.is_exported));
         assert!(
             syms.iter()
-                .any(|s| s.name == "authenticate_user" && s.kind == SymbolKind::Function && s.is_exported)
+                .any(|s| s.name == "Session" && s.kind == SymbolKind::Class)
         );
-        assert!(syms.iter().any(|s| s.name == "Session" && s.kind == SymbolKind::Class));
-        assert!(syms.iter().any(|s| s.name == "Mode" && s.kind == SymbolKind::Enum));
+        assert!(
+            syms.iter()
+                .any(|s| s.name == "Mode" && s.kind == SymbolKind::Enum)
+        );
     }
 
     #[test]
@@ -218,10 +223,22 @@ mod tests {
                    export class UserService { fetch() {} }\n\
                    interface UserDto { id: string }\n";
         let syms = extract_symbols("src/user.ts", src, ".ts").expect("ts supported");
-        assert!(syms.iter().any(|s| s.name == "loadUser" && s.kind == SymbolKind::Function));
-        assert!(syms.iter().any(|s| s.name == "UserService" && s.kind == SymbolKind::Class));
-        assert!(syms.iter().any(|s| s.name == "UserDto" && s.kind == SymbolKind::Interface));
-        assert!(syms.iter().any(|s| s.name == "fetch" && s.kind == SymbolKind::Method));
+        assert!(
+            syms.iter()
+                .any(|s| s.name == "loadUser" && s.kind == SymbolKind::Function)
+        );
+        assert!(
+            syms.iter()
+                .any(|s| s.name == "UserService" && s.kind == SymbolKind::Class)
+        );
+        assert!(
+            syms.iter()
+                .any(|s| s.name == "UserDto" && s.kind == SymbolKind::Interface)
+        );
+        assert!(
+            syms.iter()
+                .any(|s| s.name == "fetch" && s.kind == SymbolKind::Method)
+        );
     }
 
     #[test]
