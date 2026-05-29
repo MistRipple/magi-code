@@ -2481,6 +2481,30 @@ fn validate_graph_payload(value: &Value) -> bool {
 // search.semantic — 基于关键词拆分的语义代码检索
 // ══════════════════════════════════════════════════════════════════════════════
 
+/// 从自然语言查询中抽取检索关键词：小写化、按非标识符字符切分、过滤停用词。
+/// 引擎融合路径与关键词遍历兜底路径共用，避免两处各写一份停用词表。
+fn extract_query_keywords(query: &str) -> Vec<String> {
+    const STOP_WORDS: &[&str] = &[
+        "the", "a", "an", "is", "are", "was", "were", "be", "been", "being", "have", "has", "had",
+        "do", "does", "did", "will", "would", "could", "should", "may", "might", "can", "shall",
+        "must", "need", "dare", "to", "of", "in", "for", "on", "with", "at", "by", "from", "as",
+        "into", "through", "during", "before", "after", "above", "below", "between", "out", "off",
+        "over", "under", "again", "further", "then", "once", "here", "there", "when", "where",
+        "why", "how", "all", "each", "every", "both", "few", "more", "most", "other", "some",
+        "such", "no", "not", "only", "own", "same", "so", "than", "too", "very", "just", "and",
+        "but", "or", "nor", "if", "that", "this", "what", "which", "who", "whom", "whose", "it",
+        "its", "i", "me", "my", "we", "our", "you", "your", "he", "she", "they", "them", "his",
+        "her", "their", "find", "search", "look", "show", "get", "code", "function", "file",
+    ];
+    let stop: std::collections::HashSet<&str> = STOP_WORDS.iter().cloned().collect();
+    query
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .filter(|w| w.len() >= 2 && !stop.contains(w))
+        .map(|w| w.to_string())
+        .collect()
+}
+
 fn execute_search_semantic(
     input: &str,
     context: &ToolExecutionContext,
@@ -2513,49 +2537,103 @@ fn execute_search_semantic(
         .clamp(1, 50);
 
     // 优先走本地代码检索引擎（LocalSearchEngine：TF-IDF + 符号索引 + 依赖图
-    // + 多信号排序），引擎未就绪时回落到下方关键词遍历（过渡兜底）。
-    if let (Some(store), Some(workspace_id)) =
-        (resources.knowledge_store.as_ref(), context.workspace_id.as_ref())
-        && let Some(engine_results) = store.search_workspace_code(
-            workspace_id,
-            &query,
-            magi_knowledge_store::local_search_engine::SearchOptions {
-                max_results: Some(limit),
-                ..Default::default()
-            },
-        )
-        && !engine_results.is_empty()
+    // 两路融合检索（对齐原版 CodebaseRetrievalService 的分层思路）：
+    // - 引擎路：LocalSearchEngine（TF-IDF + 符号索引 + 依赖图 + 多信号排序），
+    //   等价于原版 L1（语义）+ L3（符号），Rust 版已融为一路；
+    // - grep 路：search_text 精确正则匹配，等价于原版 L2。
+    // 引擎结果优先，grep 结果按文件去重后补充未覆盖文件。引擎不可用时整体回落
+    // 到下方关键词遍历（过渡兜底）。
+    if let (Some(store), Some(workspace_id)) = (
+        resources.knowledge_store.as_ref(),
+        context.workspace_id.as_ref(),
+    ) && let Some(engine_results) = store.search_workspace_code(
+        workspace_id,
+        &query,
+        magi_knowledge_store::local_search_engine::SearchOptions {
+            max_results: Some(limit),
+            ..Default::default()
+        },
+    ) && !engine_results.is_empty()
     {
-        let results: Vec<Value> = engine_results
-            .iter()
-            .map(|r| {
-                let snippet = r
-                    .snippets
-                    .first()
-                    .map(|s| s.content.clone())
-                    .unwrap_or_default();
-                let matched: Vec<String> = r
-                    .snippets
-                    .first()
-                    .map(|s| s.matched_tokens.clone())
-                    .unwrap_or_default();
-                serde_json::json!({
-                    "path": r.file_path,
-                    "score": format!("{:.2}", r.score),
-                    "matched_keywords": matched,
-                    "snippet": snippet,
-                })
-            })
-            .collect();
+        let mut covered_files: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut results: Vec<Value> = Vec::new();
+        for r in &engine_results {
+            covered_files.insert(r.file_path.clone());
+            let snippet = r
+                .snippets
+                .first()
+                .map(|s| s.content.clone())
+                .unwrap_or_default();
+            let matched: Vec<String> = r
+                .snippets
+                .first()
+                .map(|s| s.matched_tokens.clone())
+                .unwrap_or_default();
+            results.push(serde_json::json!({
+                "path": r.file_path,
+                "score": format!("{:.2}", r.score),
+                "source": "engine",
+                "matched_keywords": matched,
+                "snippet": snippet,
+            }));
+        }
+
+        // grep 补充：对查询里的关键词做精确匹配，补进引擎未覆盖的文件。
+        let mut grep_hits = 0usize;
+        if let Ok(root_path) = resolve_path_with_context(&root, context) {
+            let keywords = extract_query_keywords(&query);
+            if let Some(primary) = keywords.first() {
+                if let Ok((matches, _scanned, _truncated)) =
+                    search_text_matches(&root_path, primary, false, false, limit)
+                {
+                    for m in matches {
+                        let path = m
+                            .get("path")
+                            .and_then(Value::as_str)
+                            .map(ToOwned::to_owned)
+                            .unwrap_or_default();
+                        // 引擎返回相对路径、grep 返回绝对路径，用后缀包含判定去重。
+                        if path.is_empty()
+                            || covered_files.iter().any(|c| path.ends_with(c.as_str()))
+                        {
+                            continue;
+                        }
+                        covered_files.insert(path.clone());
+                        let line_text = m
+                            .get("line")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        results.push(serde_json::json!({
+                            "path": path,
+                            "source": "grep",
+                            "matched_keywords": [primary],
+                            "snippet": line_text,
+                        }));
+                        grep_hits += 1;
+                        if results.len() >= limit + limit / 2 {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
         return serde_json::json!({
             "tool": "search_semantic",
             "status": "succeeded",
             "access_mode": BuiltinToolAccessMode::ReadOnly.as_str(),
             "query": query,
-            "engine": "local_search_engine",
+            "engine": "local_search_engine+grep",
             "returned_matches": results.len(),
             "results": results,
-            "summary": format!("本地代码检索 \"{}\" 返回 {} 个匹配", query, results.len())
+            "summary": format!(
+                "本地代码检索 \"{}\" 返回 {} 个匹配（引擎 {} + grep 补充 {}）",
+                query,
+                results.len(),
+                engine_results.len(),
+                grep_hits
+            )
         })
         .to_string();
     }
@@ -2566,28 +2644,7 @@ fn execute_search_semantic(
     };
 
     // 将查询拆分为关键词（小写化），过滤停用词
-    let stop_words: std::collections::HashSet<&str> = [
-        "the", "a", "an", "is", "are", "was", "were", "be", "been", "being", "have", "has", "had",
-        "do", "does", "did", "will", "would", "could", "should", "may", "might", "can", "shall",
-        "must", "need", "dare", "to", "of", "in", "for", "on", "with", "at", "by", "from", "as",
-        "into", "through", "during", "before", "after", "above", "below", "between", "out", "off",
-        "over", "under", "again", "further", "then", "once", "here", "there", "when", "where",
-        "why", "how", "all", "each", "every", "both", "few", "more", "most", "other", "some",
-        "such", "no", "not", "only", "own", "same", "so", "than", "too", "very", "just", "and",
-        "but", "or", "nor", "if", "that", "this", "what", "which", "who", "whom", "whose", "it",
-        "its", "i", "me", "my", "we", "our", "you", "your", "he", "she", "they", "them", "his",
-        "her", "their", "find", "search", "look", "show", "get", "code", "function", "file",
-    ]
-    .iter()
-    .cloned()
-    .collect();
-
-    let keywords: Vec<String> = query
-        .to_lowercase()
-        .split(|c: char| !c.is_alphanumeric() && c != '_')
-        .filter(|w| w.len() >= 2 && !stop_words.contains(w))
-        .map(|w| w.to_string())
-        .collect();
+    let keywords: Vec<String> = extract_query_keywords(&query);
 
     if keywords.is_empty() {
         return builtin_error("search_semantic", "查询关键词过于宽泛，请提供更具体的描述");
