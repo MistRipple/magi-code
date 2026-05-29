@@ -93,7 +93,8 @@ pub const UNKNOWN_MODEL_DEFAULT: ModelCapabilityProfile = ModelCapabilityProfile
 /// Anthropic Claude 4.7+ 系列（Adaptive Thinking only mode）。
 ///
 /// 协议变化点：
-/// - `thinking.budget_tokens` 废弃 → 改用 `thinking.effort: "low|medium|high|xhigh"`；
+/// - `thinking.budget_tokens` 废弃 → 改用 `thinking: { type: "adaptive" }`，
+///   推理强度由顶层 `output_config.effort: "low|medium|high|xhigh"` 控制；
 /// - 引入 `thinking.display: "summarized"` 控制思考块返回形态；
 /// - 必须附带 beta header `anthropic-beta: task-budgets-2026-03-13`。
 const PROFILE_CLAUDE_4_7: ModelCapabilityProfile = ModelCapabilityProfile {
@@ -137,6 +138,18 @@ const CAPABILITY_ENTRIES: &[CapabilityEntry] = &[
     },
     CapabilityEntry {
         prefix: "claude-haiku-4-7",
+        profile: PROFILE_CLAUDE_4_7,
+    },
+    CapabilityEntry {
+        prefix: "claude-opus-4-8",
+        profile: PROFILE_CLAUDE_4_7,
+    },
+    CapabilityEntry {
+        prefix: "claude-sonnet-4-8",
+        profile: PROFILE_CLAUDE_4_7,
+    },
+    CapabilityEntry {
+        prefix: "claude-haiku-4-8",
         profile: PROFILE_CLAUDE_4_7,
     },
     // ===== Anthropic Claude 3.7 / 4.0 / 4.5 / 4.6（legacy budget_tokens） =====

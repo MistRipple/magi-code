@@ -107,6 +107,14 @@ impl ProviderAdapter for AnthropicMessagesAdapter {
             body["thinking"] = thinking;
             // Anthropic 约束：thinking 启用时 temperature 必须 = 1。
             body["temperature"] = json!(1);
+            // Adaptive Thinking only mode（Effort 类型）：推理强度走顶层
+            // output_config.effort，而非 thinking 内字段（服务端契约）。
+            if matches!(capability.thinking_kind, ThinkingKind::Effort) {
+                let label = configured_effort
+                    .map(reasoning_effort_label)
+                    .unwrap_or("medium");
+                body["output_config"] = json!({ "effort": label });
+            }
         } else if let Some(temperature) = params.temperature {
             body["temperature"] = json!(temperature);
         }
@@ -216,8 +224,9 @@ impl ProviderAdapter for AnthropicMessagesAdapter {
 /// - `None`：模型不支持 thinking，返回 `None`，主体不写 `thinking` 字段；
 /// - `BudgetTokens`（3.7 / 4.x legacy）：写 `{ type:"enabled", budget_tokens }`，
 ///   优先用调用方 `reasoning_effort` 映射的预算，否则用能力表 default，再否则用全局 fallback；
-/// - `Effort`（4.7+ Adaptive Thinking only mode）：写 `{ type:"enabled", effort:"low|medium|high|xhigh" }`，
-///   未配置时默认 `medium`，并尊重 `supports_thinking_display` 追加 `display:"summarized"`；
+/// - `Effort`（4.7+ Adaptive Thinking only mode）：写 `{ type:"adaptive" }`，
+///   推理强度由顶层 `output_config.effort` 控制（见 body 组装处），不再用
+///   已被服务端拒绝的 `{ type:"enabled", effort }` 形态；
 /// - `Adaptive`：写 `{ type:"adaptive" }`，模型自行决定预算，可带 `display`。
 fn build_thinking_value(
     kind: ThinkingKind,
@@ -249,16 +258,11 @@ fn build_thinking_value(
                 "budget_tokens": budget,
             })))
         }
-        ThinkingKind::Effort => {
-            let label = configured_effort
-                .map(reasoning_effort_label)
-                .unwrap_or("medium");
-            Some(attach_display(json!({
-                "type": "enabled",
-                "effort": label,
-            })))
+        // Effort 与 Adaptive 都使用 adaptive thinking；二者区别仅在于
+        // Effort 会在顶层附加 output_config.effort（由调用方推理强度驱动）。
+        ThinkingKind::Effort | ThinkingKind::Adaptive => {
+            Some(attach_display(json!({ "type": "adaptive" })))
         }
-        ThinkingKind::Adaptive => Some(attach_display(json!({ "type": "adaptive" }))),
     }
 }
 
@@ -363,7 +367,7 @@ mod tests {
     }
 
     #[test]
-    fn opus_4_7_emits_effort_thinking_with_display_and_beta_header() {
+    fn opus_4_7_emits_adaptive_thinking_with_output_config_and_beta_header() {
         let mut params = base_params(vec![LlmMessage {
             role: "user".to_string(),
             content: LlmMessageContent::Text("hi".to_string()),
@@ -372,9 +376,10 @@ mod tests {
         let adapted = AnthropicMessagesAdapter
             .build_request(&params, "claude-opus-4-7-20260520")
             .expect("build");
-        assert_eq!(adapted.body["thinking"]["type"], "enabled");
-        assert_eq!(adapted.body["thinking"]["effort"], "xhigh");
+        assert_eq!(adapted.body["thinking"]["type"], "adaptive");
+        assert_eq!(adapted.body["output_config"]["effort"], "xhigh");
         assert_eq!(adapted.body["thinking"]["display"], "summarized");
+        assert!(adapted.body["thinking"].get("effort").is_none());
         assert!(adapted.body["thinking"].get("budget_tokens").is_none());
         assert_eq!(adapted.body["temperature"], 1);
         assert!(
@@ -394,7 +399,23 @@ mod tests {
         let adapted = AnthropicMessagesAdapter
             .build_request(&params, "claude-opus-4-7-20260520")
             .expect("build");
-        assert_eq!(adapted.body["thinking"]["effort"], "medium");
+        assert_eq!(adapted.body["thinking"]["type"], "adaptive");
+        assert_eq!(adapted.body["output_config"]["effort"], "medium");
+    }
+
+    #[test]
+    fn opus_4_8_uses_adaptive_thinking_profile() {
+        let mut params = base_params(vec![LlmMessage {
+            role: "user".to_string(),
+            content: LlmMessageContent::Text("hi".to_string()),
+        }]);
+        params.reasoning_effort = Some(ReasoningEffort::High);
+        let adapted = AnthropicMessagesAdapter
+            .build_request(&params, "claude-opus-4-8-20260815")
+            .expect("build");
+        assert_eq!(adapted.body["thinking"]["type"], "adaptive");
+        assert_eq!(adapted.body["output_config"]["effort"], "high");
+        assert!(adapted.body["thinking"].get("budget_tokens").is_none());
     }
 
     #[test]
