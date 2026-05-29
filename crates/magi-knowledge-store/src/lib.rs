@@ -22,7 +22,11 @@ mod tests;
 
 use magi_core::{DomainError, UtcMillis, WorkspaceId};
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, RwLock};
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::{Arc, Mutex, RwLock};
+
+use local_search_engine::{LocalSearchEngine, SearchEngineConfig, SearchOptions, SearchResult};
 
 use normalization::{normalize_code_index_ingestion, normalize_record};
 pub use source_model::{
@@ -97,9 +101,32 @@ pub struct GovernedKnowledgeOutput {
     pub governance_link: Option<KnowledgeGovernanceLink>,
 }
 
-#[derive(Clone, Debug, Default)]
+/// 工作区代码检索引擎句柄：每个 workspace 一个 LocalSearchEngine。
+///
+/// search() 需要 &mut（写查询缓存），故用 Mutex 包裹单个引擎，
+/// 检索时只锁定目标 workspace 的引擎，不阻塞其他 workspace。
+type WorkspaceSearchEngines = Arc<RwLock<HashMap<WorkspaceId, Arc<Mutex<LocalSearchEngine>>>>>;
+
+#[derive(Clone, Default)]
 pub struct KnowledgeStore {
     state: Arc<RwLock<KnowledgeState>>,
+    search_engines: WorkspaceSearchEngines,
+}
+
+impl std::fmt::Debug for KnowledgeStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KnowledgeStore")
+            .field("state", &self.state)
+            .field(
+                "search_engines",
+                &self
+                    .search_engines
+                    .read()
+                    .map(|engines| engines.len())
+                    .unwrap_or(0),
+            )
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -119,6 +146,7 @@ impl KnowledgeStore {
     pub fn from_state(state: KnowledgeState) -> Self {
         Self {
             state: Arc::new(RwLock::new(state)),
+            search_engines: Arc::default(),
         }
     }
 
@@ -127,6 +155,60 @@ impl KnowledgeStore {
             .read()
             .expect("knowledge store read lock poisoned")
             .clone()
+    }
+
+    /// 为指定 workspace 构建/重建本地代码检索索引。
+    ///
+    /// 复用 code_scanner 的扫描结果生成 (相对路径, 文件类型) 列表喂给
+    /// LocalSearchEngine::build_index；文件内容由引擎内部按需读盘。
+    pub fn build_workspace_index(&self, workspace_id: &WorkspaceId, workspace_root: &Path) {
+        let outcome = code_scanner::scan_workspace(workspace_root);
+        let Some(summary) = outcome.summary.as_ref() else {
+            return;
+        };
+        let files: Vec<(String, String)> = summary
+            .files
+            .iter()
+            .map(|f| (f.path.clone(), classify_index_file_type(&f.path)))
+            .collect();
+
+        let mut engine = LocalSearchEngine::new(
+            &workspace_root.to_string_lossy(),
+            SearchEngineConfig::default(),
+        );
+        engine.build_index(&files);
+
+        self.search_engines
+            .write()
+            .expect("knowledge store search engines write lock poisoned")
+            .insert(workspace_id.clone(), Arc::new(Mutex::new(engine)));
+    }
+
+    /// 在指定 workspace 的本地代码索引上检索；引擎未构建时返回 None。
+    pub fn search_workspace_code(
+        &self,
+        workspace_id: &WorkspaceId,
+        query: &str,
+        options: SearchOptions,
+    ) -> Option<Vec<SearchResult>> {
+        let engine = self
+            .search_engines
+            .read()
+            .expect("knowledge store search engines read lock poisoned")
+            .get(workspace_id)
+            .cloned()?;
+        let mut engine = engine.lock().expect("search engine mutex poisoned");
+        Some(engine.search(query, options))
+    }
+
+    /// 指定 workspace 的检索引擎是否已就绪。
+    pub fn workspace_index_ready(&self, workspace_id: &WorkspaceId) -> bool {
+        self.search_engines
+            .read()
+            .expect("knowledge store search engines read lock poisoned")
+            .get(workspace_id)
+            .map(|engine| engine.lock().expect("search engine mutex poisoned").is_ready())
+            .unwrap_or(false)
     }
 
     pub fn upsert(&self, record: KnowledgeRecord) {
@@ -379,4 +461,38 @@ impl KnowledgeStore {
 
 fn workspace_project_code_index_id(workspace_id: &WorkspaceId) -> String {
     format!("{PROJECT_CODE_INDEX_ID}:{}", workspace_id.as_str())
+}
+
+/// 按文件路径粗分类型（source/test/config/doc），供 LocalSearchEngine::build_index 使用。
+fn classify_index_file_type(file_path: &str) -> String {
+    let lower = file_path.to_lowercase();
+    let base = Path::new(&lower)
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+
+    if base.contains(".test.")
+        || base.contains(".spec.")
+        || lower.contains("/test/")
+        || lower.contains("/tests/")
+        || lower.contains("/__tests__/")
+    {
+        return "test".to_string();
+    }
+
+    let ext = Path::new(&lower)
+        .extension()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+
+    match ext.as_str() {
+        "json" | "yaml" | "yml" | "toml" | "ini" | "env" | "cfg" => "config",
+        "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" | "py" | "go" | "java" | "rs" | "c" | "h"
+        | "cpp" | "cc" | "cxx" | "hpp" | "hh" | "cs" | "php" | "rb" | "swift" | "kt" | "kts"
+        | "m" | "mm" | "vue" | "svelte" => "source",
+        _ => "doc",
+    }
+    .to_string()
 }

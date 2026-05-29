@@ -387,3 +387,56 @@ fn project_code_index_summary(path: &str, updated_at: UtcMillis) -> CodeIndexIng
         governance: None,
     }
 }
+
+#[test]
+fn workspace_code_index_builds_and_searches_real_symbols() {
+    use crate::local_search_engine::SearchOptions;
+    use std::fs;
+
+    // 在临时目录造一个含已知符号的小项目
+    let base = std::env::temp_dir().join(format!(
+        "magi-ks-index-test-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir_all(base.join("src")).expect("create temp project dir");
+    fs::write(
+        base.join("src/auth.rs"),
+        "pub fn authenticate_user(token: &str) -> bool {\n    !token.is_empty()\n}\n",
+    )
+    .expect("write source file");
+    fs::write(
+        base.join("src/util.rs"),
+        "pub fn unrelated_helper() -> u32 {\n    42\n}\n",
+    )
+    .expect("write source file");
+
+    let store = KnowledgeStore::new();
+    let workspace_id = WorkspaceId::new("ws-index-test");
+
+    // 装配前：引擎未就绪、检索为 None
+    assert!(!store.workspace_index_ready(&workspace_id));
+    assert!(
+        store
+            .search_workspace_code(&workspace_id, "authenticate", SearchOptions::default())
+            .is_none()
+    );
+
+    // 构建索引
+    store.build_workspace_index(&workspace_id, &base);
+
+    // 装配后：引擎就绪、检索命中真实文件
+    assert!(store.workspace_index_ready(&workspace_id));
+    let results = store
+        .search_workspace_code(&workspace_id, "authenticate user", SearchOptions::default())
+        .expect("engine ready, results present");
+    assert!(
+        results
+            .iter()
+            .any(|r| r.file_path.contains("auth.rs")),
+        "search 应命中 auth.rs，实际: {:?}",
+        results.iter().map(|r| &r.file_path).collect::<Vec<_>>()
+    );
+
+    let _ = fs::remove_dir_all(&base);
+}
