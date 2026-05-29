@@ -16,6 +16,8 @@
     getAgentSettingsBootstrap,
     resolveAgentBaseUrl,
     saveAgentOrchestratorConfig,
+    fetchWorkspaceBranches,
+    checkoutWorkspaceBranch,
     type AgentSettingsBootstrapSnapshot,
   } from '../web/agent-api';
   import Icon from './Icon.svelte';
@@ -73,6 +75,16 @@
   let pickerModels = $state<string[]>([]);
   let pickerError = $state<string | null>(null);
   let pickerLoadedOnce = false;
+
+  // Git 分支切换器：仅在工作区是 git 仓库时显示。分支信息为即时查询的瞬态状态，
+  // 不进持久化 store；切换失败（如未提交改动被 git 拒绝）把原文展示给用户，不做兜底。
+  let branchPickerOpen = $state(false);
+  let branchLoading = $state(false);
+  let branchSwitching = $state<string | null>(null);
+  let branches = $state<string[]>([]);
+  let currentBranch = $state<string | null>(null);
+  let branchError = $state<string | null>(null);
+  let branchIsRepo = $state(false);
   const currentPickerModel = $derived.by(() => readOrchestratorModel());
   const auxiliaryConfig = $derived.by(() => getAuxiliaryConfigSnapshot());
   const auxiliaryEnhanceReady = $derived.by(() => hasUsableModelConfig(auxiliaryConfig));
@@ -469,6 +481,7 @@
       queueMicrotask(focusEditor);
     }
     window.addEventListener('magi:fillComposer', handleFillComposer as EventListener);
+    void refreshBranchState();
     return () => window.removeEventListener('magi:fillComposer', handleFillComposer as EventListener);
   });
 
@@ -847,7 +860,76 @@
     }
   }
 
-  // 通用清洗：模型偶尔会把改写结果包成 ```json ... ``` 或对象字面量，这里在前端兜底剥壳。
+  // 初次拉取分支状态：决定左下角分支入口是否显示，以及当前分支文案。
+  async function refreshBranchState() {
+    try {
+      const result = await fetchWorkspaceBranches();
+      branchIsRepo = result.isRepo;
+      currentBranch = result.currentBranch;
+      branches = result.branches;
+    } catch (error) {
+      // 拉取失败时静默隐藏入口，不打扰用户（git 能力是增强项，非核心链路）。
+      branchIsRepo = false;
+      console.warn('[InputArea] 拉取工作区分支失败:', error);
+    }
+  }
+
+  async function toggleBranchPicker() {
+    if (branchPickerOpen) {
+      branchPickerOpen = false;
+      return;
+    }
+    branchPickerOpen = true;
+    if (!branchLoading) {
+      await loadBranches();
+    }
+  }
+
+  async function loadBranches() {
+    branchLoading = true;
+    branchError = null;
+    try {
+      const result = await fetchWorkspaceBranches();
+      branchIsRepo = result.isRepo;
+      currentBranch = result.currentBranch;
+      branches = result.branches;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error ?? '');
+      branchError = message || i18n.t('input.branch.loadFailed');
+    } finally {
+      branchLoading = false;
+    }
+  }
+
+  async function selectBranch(branch: string) {
+    const target = branch.trim();
+    if (!target) return;
+    if (target === currentBranch) {
+      branchPickerOpen = false;
+      return;
+    }
+    branchSwitching = target;
+    branchError = null;
+    try {
+      const result = await checkoutWorkspaceBranch(target);
+      if (result.ok) {
+        currentBranch = result.currentBranch ?? target;
+        addToast('success', i18n.t('input.branch.switched', { branch: currentBranch }));
+        branchPickerOpen = false;
+      } else {
+        // git 拒绝（如未提交改动会被覆盖）：原文展示在 popover，不关闭、不兜底。
+        branchError = result.error || i18n.t('input.branch.switchFailed');
+        addToast('error', i18n.t('input.branch.switchFailed'));
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error ?? '');
+      branchError = message || i18n.t('input.branch.switchFailed');
+      addToast('error', i18n.t('input.branch.switchFailed'));
+    } finally {
+      branchSwitching = null;
+    }
+  }
+
   // 设计原则：只做一次确定性还原；任何解析失败都退回原文，避免吞掉用户实际想要的内容。
   function unwrapEnhancedPromptPayload(raw: string): string {
     let text = raw.trim();
@@ -1094,6 +1176,64 @@
             <Icon name="undo" size={14} />
             <span>{i18n.t('input.enhance.restore')}</span>
           </button>
+        {/if}
+        {#if branchIsRepo}
+          <div class="ia-picker-wrap">
+            <button
+              type="button"
+              class="ia-branch-btn"
+              class:active={branchPickerOpen}
+              onclick={toggleBranchPicker}
+              disabled={branchSwitching !== null}
+              title={i18n.t('input.branch.title')}
+              aria-expanded={branchPickerOpen}
+            >
+              <Icon name="git-branch" size={12} />
+              <span class="ia-branch-btn-label">{currentBranch || '—'}</span>
+              <Icon name="chevron-down" size={10} />
+            </button>
+            {#if branchPickerOpen}
+              <!-- svelte-ignore a11y_click_events_have_key_events -->
+              <!-- svelte-ignore a11y_no_static_element_interactions -->
+              <div class="ia-popover-backdrop" onclick={() => (branchPickerOpen = false)}></div>
+              <div class="ia-picker-popover ia-branch-popover" role="menu">
+                <div class="ia-picker-header">{i18n.t('input.branch.title')}</div>
+                {#if branchLoading}
+                  <div class="ia-picker-status">{i18n.t('input.branch.loading')}</div>
+                {:else if branchError}
+                  <div class="ia-picker-status ia-picker-status-error">
+                    {branchError}
+                    <button
+                      type="button"
+                      class="ia-picker-retry"
+                      onclick={() => { branchError = null; loadBranches(); }}
+                    >{i18n.t('input.branch.retry')}</button>
+                  </div>
+                {:else if branches.length === 0}
+                  <div class="ia-picker-status">{i18n.t('input.branch.empty')}</div>
+                {:else}
+                  <div class="ia-picker-list">
+                    {#each branches as branch (branch)}
+                      <button
+                        type="button"
+                        class="ia-picker-item"
+                        class:selected={currentBranch === branch}
+                        onclick={() => void selectBranch(branch)}
+                        disabled={branchSwitching !== null}
+                      >
+                        <span class="ia-picker-item-label">{branch}</span>
+                        {#if branchSwitching === branch}
+                          <span class="ia-picker-item-desc">{i18n.t('input.branch.switching')}</span>
+                        {:else if currentBranch === branch}
+                          <span class="ia-picker-item-desc">{i18n.t('input.branch.current')}</span>
+                        {/if}
+                      </button>
+                    {/each}
+                  </div>
+                {/if}
+              </div>
+            {/if}
+          </div>
         {/if}
       </div>
 
@@ -1435,6 +1575,43 @@
     text-overflow: ellipsis;
     white-space: nowrap;
     max-width: 130px;
+  }
+  .ia-branch-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    height: 24px;
+    max-width: 180px;
+    padding: 0 8px;
+    background: transparent;
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-full);
+    color: var(--foreground-muted);
+    font-size: 11px;
+    cursor: pointer;
+    transition: all var(--transition-fast);
+  }
+  .ia-branch-btn:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--primary) 12%, transparent);
+    border-color: color-mix(in srgb, var(--primary) 38%, transparent);
+    color: var(--primary);
+  }
+  .ia-branch-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .ia-branch-btn.active {
+    background: color-mix(in srgb, var(--primary) 14%, transparent);
+    border-color: color-mix(in srgb, var(--primary) 42%, transparent);
+    color: var(--primary);
+  }
+  .ia-branch-btn-label {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 120px;
+  }
+  /* 分支 picker 位于左下角，popover 锚定到左侧（覆盖模型 picker 的 right:0）。 */
+  .ia-branch-popover {
+    right: auto;
+    left: 0;
   }
   .ia-picker-popover {
     position: absolute;

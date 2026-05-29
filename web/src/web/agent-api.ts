@@ -1159,6 +1159,26 @@ export async function enhanceAgentPrompt(request: EnhancePromptRequestDto): Prom
   return await postBoundJson<{ enhancedPrompt: string; error?: string }>('/api/prompt/enhance', request, 'enhance prompt');
 }
 
+export interface WorkspaceBranchesResult {
+  isRepo: boolean;
+  currentBranch: string | null;
+  branches: string[];
+}
+
+export async function fetchWorkspaceBranches(): Promise<WorkspaceBranchesResult> {
+  return await postWorkspaceBoundJson<WorkspaceBranchesResult>('/api/workspace/vcs/branches', {}, 'fetch workspace branches');
+}
+
+export interface CheckoutBranchResult {
+  ok: boolean;
+  currentBranch: string | null;
+  error?: string;
+}
+
+export async function checkoutWorkspaceBranch(branch: string): Promise<CheckoutBranchResult> {
+  return await postWorkspaceBoundJson<CheckoutBranchResult>('/api/workspace/vcs/checkout', { branch }, 'checkout workspace branch');
+}
+
 export async function updateAgentRuntimeSetting(key: string, value: unknown): Promise<AgentRuntimeSettings> {
   const payload = await postWorkspaceBoundJson<AgentRuntimeSettings>('/api/settings/update', { key, value }, 'update runtime setting');
   if (key === 'locale' && (payload?.locale === 'zh-CN' || payload?.locale === 'en-US')) {

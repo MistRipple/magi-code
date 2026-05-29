@@ -9,6 +9,7 @@ mod sessions;
 pub(crate) mod settings;
 mod tasks_interaction;
 mod tasks_projection;
+mod workspace_vcs;
 mod workspaces;
 
 use axum::{
@@ -58,6 +59,7 @@ use dispatch_flow::{
 pub fn build_router(state: ApiState) -> Router {
     let api_routes = Router::new()
         .merge(workspaces::routes())
+        .merge(workspace_vcs::routes())
         .merge(sessions::routes())
         .merge(knowledge::routes())
         .merge(settings::routes())
