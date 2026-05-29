@@ -24,8 +24,8 @@ use crate::{
 use crate::{
     model_error::provider_empty_assistant_response_error,
     prompt_utils::{
-        normalize_model_stream_preview_content, normalize_model_visible_content,
-        workspace_context_system_prompt,
+        current_turn_context_priority_prompt, normalize_model_stream_preview_content,
+        normalize_model_visible_content, workspace_context_system_prompt,
     },
     settings_store::SettingsStore,
     usage_recording::{ModelUsageBinding, publish_model_usage_record, record_mission_turn},
@@ -887,6 +887,12 @@ fn run_conversation_loop_inner(
             tool_call_id: None,
         });
     }
+    messages.push(ChatMessage {
+        role: "system".to_string(),
+        content: Some(current_turn_context_priority_prompt()),
+        tool_calls: Vec::new(),
+        tool_call_id: None,
+    });
     // [CACHE: DYNAMIC] Runtime tail · 本轮 user 输入。
     // 含 assemble_prompt 预拼装的 S2-S8（base task + 上下文 + skill 注入 +
     // 用户规则 + lifecycle reminder + safeguard），每轮都重新生成。
@@ -3148,7 +3154,12 @@ mod tests {
             self.name
         }
 
-        fn execute(&self, input: &str, _context: &ToolExecutionContext, _resources: &magi_tool_runtime::ToolRuntimeResources) -> String {
+        fn execute(
+            &self,
+            input: &str,
+            _context: &ToolExecutionContext,
+            _resources: &magi_tool_runtime::ToolRuntimeResources,
+        ) -> String {
             self.probe.record_active_call();
             serde_json::json!({
                 "tool": self.name,
@@ -3173,7 +3184,12 @@ mod tests {
             "recoverable_probe"
         }
 
-        fn execute(&self, input: &str, _context: &ToolExecutionContext, _resources: &magi_tool_runtime::ToolRuntimeResources) -> String {
+        fn execute(
+            &self,
+            input: &str,
+            _context: &ToolExecutionContext,
+            _resources: &magi_tool_runtime::ToolRuntimeResources,
+        ) -> String {
             let attempt = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
             if attempt == 1 {
                 return serde_json::json!({

@@ -394,10 +394,7 @@ fn workspace_code_index_builds_and_searches_real_symbols() {
     use std::fs;
 
     // 在临时目录造一个含已知符号的小项目
-    let base = std::env::temp_dir().join(format!(
-        "magi-ks-index-test-{}",
-        std::process::id()
-    ));
+    let base = std::env::temp_dir().join(format!("magi-ks-index-test-{}", std::process::id()));
     let _ = fs::remove_dir_all(&base);
     fs::create_dir_all(base.join("src")).expect("create temp project dir");
     fs::write(
@@ -431,9 +428,7 @@ fn workspace_code_index_builds_and_searches_real_symbols() {
         .search_workspace_code(&workspace_id, "authenticate user", SearchOptions::default())
         .expect("engine ready, results present");
     assert!(
-        results
-            .iter()
-            .any(|r| r.file_path.contains("auth.rs")),
+        results.iter().any(|r| r.file_path.contains("auth.rs")),
         "search 应命中 auth.rs，实际: {:?}",
         results.iter().map(|r| &r.file_path).collect::<Vec<_>>()
     );

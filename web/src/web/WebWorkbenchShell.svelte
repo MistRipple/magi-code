@@ -342,9 +342,6 @@
   function resolveWorkspacePreferredSessionId(
     workspaceId: string,
     workspacePath: string,
-    options: {
-      preserveCurrentSession?: boolean;
-    } = {},
   ): string {
     if (typeof window === 'undefined') {
       return '';
@@ -359,15 +356,6 @@
     }
     if (!querySessionId && (queryWorkspaceId === workspaceId || queryWorkspacePath === workspacePath)) {
       return '';
-    }
-
-    if (
-      options.preserveCurrentSession !== false
-      && selectedWorkspaceId === workspaceId
-      && typeof currentSessionId === 'string'
-      && currentSessionId.trim()
-    ) {
-      return currentSessionId.trim();
     }
 
     return '';
@@ -392,7 +380,6 @@
   function applyWorkspaceSessionsSnapshot(
     workspaceId: string,
     snapshot: Awaited<ReturnType<typeof getWorkspaceSessions>>,
-    preferredSessionId = '',
   ): string {
     sessionsByWorkspace = {
       ...sessionsByWorkspace,
@@ -404,20 +391,10 @@
       return '';
     }
 
-    const requestedSessionId = preferredSessionId.trim();
-    const currentAnchoredSessionId = typeof currentSessionId === 'string' ? currentSessionId.trim() : '';
     const backendSelectedSessionId = typeof snapshot.sessionId === 'string' ? snapshot.sessionId.trim() : '';
-    const candidateSessionIds = [
-      requestedSessionId,
-      currentAnchoredSessionId,
-      backendSelectedSessionId,
-    ].filter((value, index, arr) => (
-      value.length > 0 && arr.indexOf(value) === index
-    ));
-    const preservedSessionId = candidateSessionIds.find((sessionId) => (
-      snapshot.sessions.some((session) => session.id === sessionId)
-    )) || '';
-    const resolvedSessionId = preservedSessionId;
+    const resolvedSessionId = snapshot.sessions.some((session) => session.id === backendSelectedSessionId)
+      ? backendSelectedSessionId
+      : '';
 
     currentSessionId = resolvedSessionId || null;
     setCurrentSessionId(resolvedSessionId || null);
@@ -695,7 +672,7 @@
     loadingWorkspaceIds = { ...loadingWorkspaceIds, [workspaceId]: true };
     try {
       const snapshot = await getWorkspaceSessions(workspaceId, preferredSessionId);
-      return applyWorkspaceSessionsSnapshot(workspaceId, snapshot, preferredSessionId);
+      return applyWorkspaceSessionsSnapshot(workspaceId, snapshot);
     } catch (error) {
       notifyWorkbenchError('加载工作区会话', error);
       return '';

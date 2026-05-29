@@ -90,7 +90,8 @@ async fn current_branch(workspace_path: &str) -> Option<String> {
 /// 统计未提交改动的新增/删除行数（git diff HEAD --numstat，含已暂存+未暂存）。
 /// 二进制文件 numstat 以 `-` 占位，按 0 行处理。失败时返回 (0, 0)，不阻断分支查询。
 async fn uncommitted_diff_stat(workspace_path: &str) -> (u64, u64) {
-    let Ok((true, stdout, _)) = run_git(workspace_path, &["diff", "HEAD", "--numstat"]).await else {
+    let Ok((true, stdout, _)) = run_git(workspace_path, &["diff", "HEAD", "--numstat"]).await
+    else {
         return (0, 0);
     };
     let mut additions = 0u64;

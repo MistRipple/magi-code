@@ -1098,13 +1098,19 @@ impl LlmTaskDispatcher {
         let mut ctx_parts: Vec<String> = Vec::new();
         ctx_parts.extend(task_fact_context_parts);
         for item in &result.selected_knowledge {
-            ctx_parts.push(format!("[knowledge] {}: {}", item.title, item.excerpt));
+            ctx_parts.push(format!(
+                "[reference:knowledge] {}: {}",
+                item.title, item.excerpt
+            ));
         }
         for item in &result.selected_memory {
-            ctx_parts.push(format!("[memory] {}", item.content));
+            ctx_parts.push(format!("[reference:memory] {}", item.content));
         }
         for item in &result.selected_shared_context {
-            ctx_parts.push(format!("[context] {}: {}", item.title, item.content));
+            ctx_parts.push(format!(
+                "[reference:context] {}: {}",
+                item.title, item.content
+            ));
         }
         let ctx_text = ctx_parts.join("\n");
         (

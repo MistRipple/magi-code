@@ -438,7 +438,9 @@ mod tests {
     use super::*;
     use magi_core::{ApprovalRequirement, RiskLevel, ToolCallId};
     use magi_governance::GovernanceService;
-    use magi_tool_runtime::{BuiltinTool, BuiltinToolSpec, ToolExecutionContext, ToolRegistry, ToolRuntimeResources};
+    use magi_tool_runtime::{
+        BuiltinTool, BuiltinToolSpec, ToolExecutionContext, ToolRegistry, ToolRuntimeResources,
+    };
     use std::{path::PathBuf, sync::Arc};
 
     #[derive(Clone, Debug)]
@@ -449,7 +451,12 @@ mod tests {
             "file_read"
         }
 
-        fn execute(&self, input: &str, _context: &ToolExecutionContext, _resources: &ToolRuntimeResources) -> String {
+        fn execute(
+            &self,
+            input: &str,
+            _context: &ToolExecutionContext,
+            _resources: &ToolRuntimeResources,
+        ) -> String {
             format!("echo:{input}")
         }
 
@@ -470,7 +477,12 @@ mod tests {
             "cwd_echo"
         }
 
-        fn execute(&self, _input: &str, context: &ToolExecutionContext, _resources: &ToolRuntimeResources) -> String {
+        fn execute(
+            &self,
+            _input: &str,
+            context: &ToolExecutionContext,
+            _resources: &ToolRuntimeResources,
+        ) -> String {
             format!(
                 "cwd:{}",
                 context

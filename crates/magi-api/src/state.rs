@@ -886,9 +886,7 @@ impl ApiState {
             {
                 return Some(workspace_id);
             }
-            return self
-                .workspace_id_for_root_path(requested_workspace_path)
-                .or(Some(workspace_id));
+            return self.workspace_id_for_root_path(requested_workspace_path);
         }
         self.workspace_id_for_root_path(requested_workspace_path)
     }
@@ -1719,5 +1717,115 @@ mod tests {
                 .all(|session| session.message_count.unwrap_or(0) > 0)
         );
         let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_workspace_session_ignores_foreign_requested_session() {
+        let state = ApiState::new(
+            "magi-test",
+            Arc::new(InMemoryEventBus::new(32)),
+            Arc::new(SessionStore::default()),
+            Arc::new(WorkspaceStore::default()),
+            Arc::new(GovernanceService::default()),
+        );
+        let workspace_a = WorkspaceId::new("workspace-bootstrap-a");
+        let workspace_b = WorkspaceId::new("workspace-bootstrap-b");
+        state
+            .workspace_registry
+            .register(
+                workspace_a.clone(),
+                AbsolutePath::new("/tmp/magi-bootstrap-workspace-a"),
+            )
+            .expect("workspace A should register");
+        state
+            .workspace_registry
+            .register(
+                workspace_b.clone(),
+                AbsolutePath::new("/tmp/magi-bootstrap-workspace-b"),
+            )
+            .expect("workspace B should register");
+
+        let session_a = SessionId::new("session-bootstrap-workspace-a");
+        state
+            .session_store
+            .create_session_for_workspace(
+                session_a.clone(),
+                "A 会话",
+                Some(workspace_a.to_string()),
+            )
+            .expect("session A should create");
+        state.session_store.append_timeline_entry(
+            session_a.clone(),
+            magi_session_store::TimelineEntryKind::UserMessage,
+            "A 消息",
+        );
+        let session_b = SessionId::new("session-bootstrap-workspace-b");
+        state
+            .session_store
+            .create_session_for_workspace(
+                session_b.clone(),
+                "B 会话",
+                Some(workspace_b.to_string()),
+            )
+            .expect("session B should create");
+        state.session_store.append_timeline_entry(
+            session_b.clone(),
+            magi_session_store::TimelineEntryKind::UserMessage,
+            "B 消息",
+        );
+
+        let bootstrap = state
+            .bootstrap_dto_for_workspace_session(Some(workspace_a.as_str()), Some(&session_b))
+            .expect("bootstrap should build");
+
+        assert_eq!(
+            bootstrap
+                .current_session
+                .as_ref()
+                .map(|session| session.session_id.clone()),
+            Some(session_a.clone())
+        );
+        assert_eq!(bootstrap.sessions.len(), 1);
+        assert_eq!(bootstrap.sessions[0].session_id, session_a);
+        assert!(
+            bootstrap
+                .timeline
+                .iter()
+                .all(|entry| entry.session_id == session_a)
+        );
+    }
+
+    #[test]
+    fn resolve_workspace_id_from_request_rejects_unknown_stale_workspace_id() {
+        let state = ApiState::new(
+            "magi-test",
+            Arc::new(InMemoryEventBus::new(32)),
+            Arc::new(SessionStore::default()),
+            Arc::new(WorkspaceStore::default()),
+            Arc::new(GovernanceService::default()),
+        );
+        let workspace_id = WorkspaceId::new("workspace-known-from-path");
+        state
+            .workspace_registry
+            .register(
+                workspace_id.clone(),
+                AbsolutePath::new("/tmp/magi-known-from-path"),
+            )
+            .expect("workspace should register");
+
+        assert_eq!(
+            state.resolve_workspace_id_from_request(
+                Some(WorkspaceId::new("workspace-stale-url")),
+                None,
+            ),
+            None
+        );
+        assert_eq!(
+            state.resolve_workspace_id_from_request(
+                Some(WorkspaceId::new("workspace-stale-url")),
+                Some("/tmp/magi-known-from-path"),
+            ),
+            Some(workspace_id)
+        );
     }
 }

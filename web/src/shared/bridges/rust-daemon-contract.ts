@@ -44,6 +44,8 @@ export interface RustEventEnvelope {
 
 interface RustBootstrapSessionRecord {
   sessionId?: string;
+  workspaceId?: string | null;
+  workspace_id?: string | null;
   title?: string | null;
   createdAt?: number;
   updatedAt?: number;
@@ -543,12 +545,24 @@ function resolveSelectedWorkspace(
 ): { workspaceId: string; rootPath: string; name: string } {
   const requestedWorkspaceId = normalizeString(options.workspaceId);
   const requestedWorkspacePath = normalizeString(options.workspacePath);
+  const currentSessionWorkspaceId = normalizeString(payload.currentSession?.workspaceId)
+    || normalizeString(payload.currentSession?.workspace_id);
   const workspaces = Array.isArray(payload.workspaces) ? payload.workspaces : [];
-  const selectedWorkspace = workspaces.find((workspace) => normalizeString(workspace.workspaceId) === requestedWorkspaceId)
+  const selectedWorkspace = workspaces.find((workspace) => (
+    requestedWorkspaceId && normalizeString(workspace.workspaceId) === requestedWorkspaceId
+  ))
+    || workspaces.find((workspace) => (
+      requestedWorkspacePath && normalizeString(workspace.rootPath) === requestedWorkspacePath
+    ))
+    || workspaces.find((workspace) => (
+      currentSessionWorkspaceId && normalizeString(workspace.workspaceId) === currentSessionWorkspaceId
+    ))
     || workspaces[0]
     || null;
-  const workspaceId = requestedWorkspaceId || normalizeString(selectedWorkspace?.workspaceId);
-  const rootPath = requestedWorkspacePath || normalizeString(selectedWorkspace?.rootPath);
+  const workspaceId = normalizeString(selectedWorkspace?.workspaceId)
+    || requestedWorkspaceId
+    || currentSessionWorkspaceId;
+  const rootPath = normalizeString(selectedWorkspace?.rootPath) || requestedWorkspacePath;
   return {
     workspaceId,
     rootPath,
@@ -1301,9 +1315,7 @@ export function normalizeRustBootstrapPayload(
   const payload = (rawPayload ?? {}) as RustBootstrapDto;
   const generatedAt = normalizeNumber(payload.generatedAt, Date.now());
   const sessions = normalizeRustSessions(payload, generatedAt);
-  const selectedSessionId = normalizeString(options.sessionId)
-    || normalizeString(payload.currentSession?.sessionId)
-    || '';
+  const selectedSessionId = normalizeString(payload.currentSession?.sessionId);
   const currentSession = selectedSessionId
     ? sessions.find((session) => session.id === selectedSessionId)
     : undefined;

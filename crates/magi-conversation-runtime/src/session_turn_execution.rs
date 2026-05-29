@@ -7,8 +7,8 @@
 use crate::{
     model_error::provider_empty_assistant_response_error,
     prompt_utils::{
-        normalize_model_stream_preview_content, normalize_model_visible_content,
-        workspace_context_system_prompt,
+        current_turn_context_priority_prompt, normalize_model_stream_preview_content,
+        normalize_model_visible_content, workspace_context_system_prompt,
     },
     session_writeback::{
         append_session_tool_call_items_batch, append_session_turn_error_item,
@@ -168,6 +168,14 @@ fn build_session_turn_messages(
         Vec::new()
     };
     messages.append(&mut history);
+    if !messages.is_empty() {
+        messages.push(ChatMessage {
+            role: "system".to_string(),
+            content: Some(current_turn_context_priority_prompt()),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        });
+    }
     messages.push(ChatMessage {
         role: "user".to_string(),
         content: Some(prompt.to_string()),
@@ -1421,18 +1429,19 @@ mod tests {
                 .iter()
                 .map(|message| message.role.as_str())
                 .collect::<Vec<_>>(),
-            vec!["user", "assistant", "user"]
+            vec!["user", "assistant", "system", "user"]
         );
+        let contents = messages
+            .iter()
+            .map(|message| message.content.as_deref().unwrap_or(""))
+            .collect::<Vec<_>>();
+        assert_eq!(contents[0], "请用一句话回答：2+3 等于几？");
+        assert_eq!(contents[1], "2+3 等于 5。");
+        assert!(contents[2].contains("本轮用户原始输入"));
+        assert!(contents[2].contains("只能作为参考证据"));
         assert_eq!(
-            messages
-                .iter()
-                .map(|message| message.content.as_deref().unwrap_or(""))
-                .collect::<Vec<_>>(),
-            vec![
-                "请用一句话回答：2+3 等于几？",
-                "2+3 等于 5。",
-                "请基于上一轮结果，用一句话回答：再加 4 等于几？",
-            ]
+            contents[3],
+            "请基于上一轮结果，用一句话回答：再加 4 等于几？"
         );
     }
 
@@ -1483,6 +1492,13 @@ mod tests {
                 .last()
                 .and_then(|message| message.content.as_deref()),
             Some("分析一下当前项目")
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.content.as_deref().is_some_and(|content| {
+                    content.contains("上下文优先级") && content.contains("ProjectMemory")
+                }))
         );
     }
 
