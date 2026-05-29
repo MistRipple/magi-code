@@ -3148,7 +3148,7 @@ mod tests {
             self.name
         }
 
-        fn execute(&self, input: &str, _context: &ToolExecutionContext) -> String {
+        fn execute(&self, input: &str, _context: &ToolExecutionContext, _resources: &magi_tool_runtime::ToolRuntimeResources) -> String {
             self.probe.record_active_call();
             serde_json::json!({
                 "tool": self.name,
@@ -3173,7 +3173,7 @@ mod tests {
             "recoverable_probe"
         }
 
-        fn execute(&self, input: &str, _context: &ToolExecutionContext) -> String {
+        fn execute(&self, input: &str, _context: &ToolExecutionContext, _resources: &magi_tool_runtime::ToolRuntimeResources) -> String {
             let attempt = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
             if attempt == 1 {
                 return serde_json::json!({

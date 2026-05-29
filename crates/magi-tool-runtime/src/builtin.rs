@@ -1,6 +1,6 @@
 use crate::{
     BuiltinTool, BuiltinToolAccessMode, BuiltinToolName, BuiltinToolSpec, ToolExecutionContext,
-    ToolExecutionContextQuery,
+    ToolExecutionContextQuery, ToolRuntimeResources,
 };
 use magi_core::{ApprovalRequirement, ExecutionResultStatus, RiskLevel, UtcMillis};
 use serde_json::Value;
@@ -88,7 +88,12 @@ impl BuiltinTool for NormalizedBuiltinTool {
         self.name.as_str()
     }
 
-    fn execute(&self, input: &str, context: &ToolExecutionContext) -> String {
+    fn execute(
+        &self,
+        input: &str,
+        context: &ToolExecutionContext,
+        resources: &ToolRuntimeResources,
+    ) -> String {
         match self.name {
             BuiltinToolName::FileRead => execute_file_read(input, context),
             BuiltinToolName::FileWrite => execute_file_write(input, context),
@@ -98,7 +103,7 @@ impl BuiltinTool for NormalizedBuiltinTool {
             BuiltinToolName::FileCopy => execute_file_copy(input, context),
             BuiltinToolName::FileMove => execute_file_move(input, context),
             BuiltinToolName::SearchText => execute_search_text(input, context),
-            BuiltinToolName::SearchSemantic => execute_search_semantic(input, context),
+            BuiltinToolName::SearchSemantic => execute_search_semantic(input, context, resources),
             BuiltinToolName::ShellExec => execute_shell_exec(input, context),
             BuiltinToolName::ProcessLaunch => execute_process_launch(input, context),
             BuiltinToolName::ProcessRead => execute_process_read(input, context),
@@ -2476,7 +2481,11 @@ fn validate_graph_payload(value: &Value) -> bool {
 // search.semantic — 基于关键词拆分的语义代码检索
 // ══════════════════════════════════════════════════════════════════════════════
 
-fn execute_search_semantic(input: &str, context: &ToolExecutionContext) -> String {
+fn execute_search_semantic(
+    input: &str,
+    context: &ToolExecutionContext,
+    resources: &ToolRuntimeResources,
+) -> String {
     let request = parse_json_object(input);
     let query = match required_string_or_raw(
         input,
@@ -2502,6 +2511,54 @@ fn execute_search_semantic(input: &str, context: &ToolExecutionContext) -> Strin
         .and_then(|obj| field_usize(obj, &["limit", "max_results"]))
         .unwrap_or(10)
         .clamp(1, 50);
+
+    // 优先走本地代码检索引擎（LocalSearchEngine：TF-IDF + 符号索引 + 依赖图
+    // + 多信号排序），引擎未就绪时回落到下方关键词遍历（过渡兜底）。
+    if let (Some(store), Some(workspace_id)) =
+        (resources.knowledge_store.as_ref(), context.workspace_id.as_ref())
+        && let Some(engine_results) = store.search_workspace_code(
+            workspace_id,
+            &query,
+            magi_knowledge_store::local_search_engine::SearchOptions {
+                max_results: Some(limit),
+                ..Default::default()
+            },
+        )
+        && !engine_results.is_empty()
+    {
+        let results: Vec<Value> = engine_results
+            .iter()
+            .map(|r| {
+                let snippet = r
+                    .snippets
+                    .first()
+                    .map(|s| s.content.clone())
+                    .unwrap_or_default();
+                let matched: Vec<String> = r
+                    .snippets
+                    .first()
+                    .map(|s| s.matched_tokens.clone())
+                    .unwrap_or_default();
+                serde_json::json!({
+                    "path": r.file_path,
+                    "score": format!("{:.2}", r.score),
+                    "matched_keywords": matched,
+                    "snippet": snippet,
+                })
+            })
+            .collect();
+        return serde_json::json!({
+            "tool": "search_semantic",
+            "status": "succeeded",
+            "access_mode": BuiltinToolAccessMode::ReadOnly.as_str(),
+            "query": query,
+            "engine": "local_search_engine",
+            "returned_matches": results.len(),
+            "results": results,
+            "summary": format!("本地代码检索 \"{}\" 返回 {} 个匹配", query, results.len())
+        })
+        .to_string();
+    }
 
     let root_path = match resolve_path_with_context(&root, context) {
         Ok(p) => p,

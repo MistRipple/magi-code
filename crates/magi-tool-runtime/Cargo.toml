@@ -9,6 +9,7 @@ serde_json.workspace = true
 magi-core = { path = "../magi-core" }
 magi-event-bus = { path = "../magi-event-bus" }
 magi-governance = { path = "../magi-governance" }
+magi-knowledge-store = { path = "../magi-knowledge-store" }
 reqwest = { workspace = true, features = ["blocking"] }
 regex = "1"
 urlencoding = "2"

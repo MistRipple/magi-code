@@ -1176,9 +1176,24 @@ pub struct ToolExecutionSummary {
     pub failed_invocations: usize,
 }
 
+/// 工具执行时可用的进程内运行时资源（非序列化句柄）。
+///
+/// 与 ToolExecutionContext（可序列化、随调用流转的标识信息）区分：
+/// 这里承载的是 daemon 进程内的共享服务引用，由 ToolRegistry 持有并在
+/// dispatch 时传入。将来需要更多运行时服务，扩这个结构即可，不改 trait 签名。
+#[derive(Clone, Default)]
+pub struct ToolRuntimeResources {
+    pub knowledge_store: Option<Arc<magi_knowledge_store::KnowledgeStore>>,
+}
+
 pub trait BuiltinTool: Send + Sync {
     fn name(&self) -> &'static str;
-    fn execute(&self, input: &str, context: &ToolExecutionContext) -> String;
+    fn execute(
+        &self,
+        input: &str,
+        context: &ToolExecutionContext,
+        resources: &ToolRuntimeResources,
+    ) -> String;
     fn spec(&self) -> BuiltinToolSpec;
 }
 
@@ -1189,6 +1204,7 @@ pub struct ToolRegistry {
     builtin_tools: HashMap<String, Arc<dyn BuiltinTool>>,
     invocations: Arc<RwLock<Vec<ToolInvocationRecord>>>,
     active_write_claims: Arc<RwLock<HashMap<ToolCallId, WriteProtectionClaim>>>,
+    runtime_resources: ToolRuntimeResources,
 }
 
 impl ToolRegistry {
@@ -1199,7 +1215,17 @@ impl ToolRegistry {
             builtin_tools: HashMap::new(),
             invocations: Arc::new(RwLock::new(Vec::new())),
             active_write_claims: Arc::new(RwLock::new(HashMap::new())),
+            runtime_resources: ToolRuntimeResources::default(),
         }
+    }
+
+    /// 注入 KnowledgeStore，让代码检索工具走真正的本地索引引擎。
+    pub fn with_knowledge_store(
+        mut self,
+        knowledge_store: Arc<magi_knowledge_store::KnowledgeStore>,
+    ) -> Self {
+        self.runtime_resources.knowledge_store = Some(knowledge_store);
+        self
     }
 
     pub fn register_builtin(&mut self, tool: Arc<dyn BuiltinTool>) {
@@ -1368,7 +1394,7 @@ impl ToolRegistry {
                         }
                     };
                     let before_changes = capture_tool_workspace_snapshot(&input, &context);
-                    let payload = tool.execute(&input.input, &context);
+                    let payload = tool.execute(&input.input, &context, &self.runtime_resources);
                     let payload =
                         append_workspace_changed_paths(payload, before_changes.as_ref(), &context);
                     drop(write_guard);

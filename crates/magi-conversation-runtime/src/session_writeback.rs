@@ -1025,7 +1025,7 @@ mod tests {
             self.name
         }
 
-        fn execute(&self, input: &str, _context: &ToolExecutionContext) -> String {
+        fn execute(&self, input: &str, _context: &ToolExecutionContext, _resources: &magi_tool_runtime::ToolRuntimeResources) -> String {
             self.probe.record_active_call();
             serde_json::json!({
                 "tool": self.name,

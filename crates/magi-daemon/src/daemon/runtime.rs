@@ -453,7 +453,8 @@ impl DaemonRuntime {
         model_bridge_override: Option<Arc<dyn magi_bridge_client::ModelBridgeClient>>,
     ) -> ApiState {
         let orchestrator = OrchestratorService::new(self.event_bus.clone());
-        let mut tool_registry = ToolRegistry::new(self.governance.clone(), self.event_bus.clone());
+        let mut tool_registry = ToolRegistry::new(self.governance.clone(), self.event_bus.clone())
+            .with_knowledge_store(self.knowledge_store.clone());
         tool_registry.register_default_builtins();
         let model_transport =
             Self::bridge_loopback_transport_with_env("model_bridge_loopback", bridge_env);
