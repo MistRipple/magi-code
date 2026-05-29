@@ -1,5 +1,8 @@
 use crate::settings_store::SettingsStore;
-use magi_skill_runtime::{SkillDefinition, SkillMetadata, SkillRegistry, SkillRuntime};
+use magi_bridge_client::{BridgeBindingKind, BridgeDispatchAction};
+use magi_skill_runtime::{
+    CustomToolBinding, SkillDefinition, SkillMetadata, SkillRegistry, SkillRuntime,
+};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::fs;
@@ -43,6 +46,86 @@ fn ensure_array_entry_mut<'a>(map: &'a mut Map<String, Value>, key: &str) -> &'a
         *value = Value::Array(Vec::new());
     }
     value.as_array_mut().expect("array value just inserted")
+}
+
+fn normalize_token(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| !matches!(ch, '_' | '-' | ' '))
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn read_string_field<'a>(object: &'a Map<String, Value>, keys: &[&str]) -> Option<&'a str> {
+    keys.iter()
+        .find_map(|key| object.get(*key).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn parse_bridge_kind(value: &str) -> Option<BridgeBindingKind> {
+    match normalize_token(value).as_str() {
+        "model" => Some(BridgeBindingKind::Model),
+        "mcp" => Some(BridgeBindingKind::Mcp),
+        _ => None,
+    }
+}
+
+fn parse_dispatch_action(value: &str) -> Option<BridgeDispatchAction> {
+    match normalize_token(value).as_str() {
+        "modelprompt" | "prompt" => Some(BridgeDispatchAction::ModelPrompt),
+        "mcptoolcall" | "toolcall" | "call" => Some(BridgeDispatchAction::McpToolCall),
+        _ => None,
+    }
+}
+
+fn parse_custom_tool_bindings(value: &Value) -> Vec<CustomToolBinding> {
+    let Some(entries) = value.as_array() else {
+        return Vec::new();
+    };
+
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let object = entry.as_object()?;
+            let tool_name = read_string_field(object, &["tool_name", "toolName", "name"])?;
+            let bridge_target = read_string_field(
+                object,
+                &["bridge_target", "bridgeTarget", "target", "serverId"],
+            )?
+            .to_string();
+            let binding_id = read_string_field(object, &["binding_id", "bindingId"])
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| format!("{tool_name}:{bridge_target}"));
+            let description = read_string_field(object, &["description"])
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| tool_name.to_string());
+            let bridge_kind = object
+                .get("bridge_kind")
+                .or_else(|| object.get("bridgeKind"))
+                .and_then(Value::as_str)
+                .and_then(parse_bridge_kind)
+                .unwrap_or(BridgeBindingKind::Mcp);
+            let dispatch_action = object
+                .get("dispatch_action")
+                .or_else(|| object.get("dispatchAction"))
+                .and_then(Value::as_str)
+                .and_then(parse_dispatch_action)
+                .unwrap_or(match bridge_kind {
+                    BridgeBindingKind::Model => BridgeDispatchAction::ModelPrompt,
+                    BridgeBindingKind::Mcp => BridgeDispatchAction::McpToolCall,
+                });
+
+            Some(CustomToolBinding {
+                binding_id,
+                tool_name: tool_name.to_string(),
+                description,
+                bridge_kind,
+                dispatch_action,
+                bridge_target,
+            })
+        })
+        .collect()
 }
 
 fn migrate_top_level_custom_tools_into_skills_config(
@@ -208,7 +291,7 @@ fn build_skill_registry_from_config(config: &Map<String, Value>) -> SkillRegistr
                     let instruction = read_skill_instruction(&skill_dir);
 
                     let mut allowed_tools = Vec::new();
-                    let custom_tool_bindings = Vec::new();
+                    let mut custom_tool_bindings = Vec::new();
 
                     let config_path = skill_dir.join("config.json");
                     if let Ok(content) = fs::read_to_string(config_path) {
@@ -221,6 +304,13 @@ fn build_skill_registry_from_config(config: &Map<String, Value>) -> SkillRegistr
                                         allowed_tools.push(t_str.to_string());
                                     }
                                 }
+                            }
+                            if let Some(bindings) = parsed
+                                .get("custom_tool_bindings")
+                                .or_else(|| parsed.get("customToolBindings"))
+                                .or_else(|| parsed.get("customTools"))
+                            {
+                                custom_tool_bindings = parse_custom_tool_bindings(bindings);
                             }
                         }
                     }
@@ -358,6 +448,72 @@ mod tests {
 
         assert_eq!(plan.prompt_injections.len(), 1);
         assert!(plan.prompt_injections[0].body.contains("skill-loader-e2e"));
+
+        std::fs::remove_dir_all(&skill_dir).expect("temp skill dir should be removed");
+    }
+
+    #[test]
+    fn load_skills_into_registry_reads_custom_tool_bindings() {
+        let skill_dir = make_local_skill_dir("custom-binding", "# Custom binding\n\n");
+        std::fs::write(
+            skill_dir.join("config.json"),
+            serde_json::json!({
+                "allowed_tools": ["file_read"],
+                "custom_tool_bindings": [
+                    {
+                        "binding_id": "openai-prompter",
+                        "tool_name": "model.prompt",
+                        "description": "让辅助模型润色一段提示词",
+                        "bridge_kind": "model",
+                        "dispatch_action": "model_prompt",
+                        "bridge_target": "openai"
+                    },
+                    {
+                        "bindingId": "anthropic-reviewer",
+                        "toolName": "mcp.review",
+                        "description": "调用 MCP 进行审查",
+                        "bridgeKind": "mcp",
+                        "dispatchAction": "mcp_tool_call",
+                        "bridgeTarget": "review-server"
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .expect("skill config should be written");
+
+        let store = SettingsStore::new();
+        store.set_section(
+            "skillsConfig",
+            serde_json::json!({
+                "instructionSkills": [
+                    {
+                        "skillId": "custom-skill",
+                        "name": "custom-skill",
+                        "directoryPath": skill_dir.to_string_lossy().to_string()
+                    }
+                ]
+            }),
+        );
+
+        let registry = load_skills_into_registry(&store);
+        let skill = registry.get("custom-skill").expect("skill should exist");
+        assert_eq!(skill.allowed_tools, vec!["file_read".to_string()]);
+        assert_eq!(skill.custom_tool_bindings.len(), 2);
+        assert_eq!(
+            skill.custom_tool_bindings[0].binding_id,
+            "anthropic-reviewer"
+        );
+        assert_eq!(skill.custom_tool_bindings[0].tool_name, "mcp.review");
+        assert_eq!(
+            skill.custom_tool_bindings[0].bridge_kind,
+            BridgeBindingKind::Mcp
+        );
+        assert_eq!(skill.custom_tool_bindings[1].binding_id, "openai-prompter");
+        assert_eq!(
+            skill.custom_tool_bindings[1].bridge_kind,
+            BridgeBindingKind::Model
+        );
 
         std::fs::remove_dir_all(&skill_dir).expect("temp skill dir should be removed");
     }

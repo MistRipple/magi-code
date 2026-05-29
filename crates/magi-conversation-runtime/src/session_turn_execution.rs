@@ -202,6 +202,8 @@ pub struct SessionTurnExecutionRuntime<'a> {
     pub settings_store: Option<&'a Arc<SettingsStore>>,
     pub tool_registry: Option<&'a ToolRegistry>,
     pub skill_runtime: Option<&'a magi_skill_runtime::SkillRuntime>,
+    pub skill_dispatch_runtime: Option<&'a magi_skill_runtime::SkillDispatchRuntime>,
+    pub skill_name: Option<String>,
     pub snapshot_manager: Option<&'a Arc<SnapshotManager>>,
     pub request: SessionTurnExecutionRequest,
     pub prompt: String,
@@ -218,6 +220,8 @@ pub fn run_session_turn_execution(
         settings_store,
         tool_registry,
         skill_runtime,
+        skill_dispatch_runtime,
+        skill_name,
         snapshot_manager,
         request,
         prompt,
@@ -264,6 +268,8 @@ pub fn run_session_turn_execution(
             },
             tool_registry,
             skill_runtime,
+            skill_dispatch_runtime,
+            skill_name.as_deref(),
         ) {
             Ok(output) => output,
             Err(error) => {
@@ -454,6 +460,8 @@ fn stream_session_turn_round(
     runtime: SessionTurnRoundRuntime<'_>,
     tool_registry: Option<&ToolRegistry>,
     skill_runtime: Option<&magi_skill_runtime::SkillRuntime>,
+    skill_dispatch_runtime: Option<&magi_skill_runtime::SkillDispatchRuntime>,
+    skill_name: Option<&str>,
 ) -> Result<SessionTurnRoundOutput, String> {
     let SessionTurnRoundRuntime {
         client,
@@ -744,6 +752,8 @@ fn stream_session_turn_round(
             event_bus,
             tool_registry,
             skill_runtime,
+            skill_dispatch_runtime,
+            skill_name.as_deref(),
             &request.session_id,
             &request.workspace_id,
             request.workspace_root_path.as_deref().map(PathBuf::from),
@@ -1121,6 +1131,8 @@ mod tests {
             settings_store: None,
             tool_registry: None,
             skill_runtime: None,
+            skill_dispatch_runtime: None,
+            skill_name: None,
             snapshot_manager: None,
             request,
             prompt: "请回复一句话".to_string(),
@@ -1224,6 +1236,8 @@ mod tests {
                 round: 0,
                 orchestrator_thread_id: &orchestrator_thread_id,
             },
+            None,
+            None,
             None,
             None,
         )

@@ -3,8 +3,8 @@ use crate::tool_result_utils::{
     summarize_tool_result, tool_execution_status_label, turn_item_status_for_tool_result,
 };
 use crate::{
-    SKILL_APPLY_TOOL_NAME, execute_skill_apply_from_runtime,
-    internal_builtin_tool_rejection_payload,
+    SKILL_APPLY_TOOL_NAME, execute_skill_apply_from_runtime, execute_skill_custom_tool,
+    internal_builtin_tool_rejection_payload, parse_skill_custom_tool_name,
 };
 use magi_bridge_client::{
     ChatMessage, ChatToolCall,
@@ -26,7 +26,7 @@ use magi_session_store::{
     CanonicalTurnItem, CanonicalTurnItemKind, CanonicalTurnItemStatus, CanonicalTurnStatus,
     CanonicalTurnVisibility, CanonicalWorkerRef, SessionRuntimeSidecar, SessionStore,
 };
-use magi_skill_runtime::SkillRuntime;
+use magi_skill_runtime::{SkillDispatchRuntime, SkillRuntime};
 use magi_snapshot::{SnapshotSession, ToolHook, ToolHookCtx};
 use magi_tool_runtime::{
     BuiltinToolName, ToolExecutionContext, ToolExecutionInput, ToolExecutionPolicy, ToolRegistry,
@@ -593,6 +593,8 @@ pub fn append_session_tool_call_items_batch(
     event_bus: &InMemoryEventBus,
     tool_registry: Option<&ToolRegistry>,
     skill_runtime: Option<&SkillRuntime>,
+    skill_dispatch_runtime: Option<&SkillDispatchRuntime>,
+    skill_name: Option<&str>,
     session_id: &SessionId,
     workspace_id: &Option<WorkspaceId>,
     workspace_root_path: Option<PathBuf>,
@@ -639,6 +641,8 @@ pub fn append_session_tool_call_items_batch(
         event_bus,
         tool_registry,
         skill_runtime,
+        skill_dispatch_runtime,
+        skill_name,
         tool_calls,
         session_id,
         workspace_id,
@@ -718,6 +722,8 @@ fn execute_session_turn_tool_call_batch(
     event_bus: &InMemoryEventBus,
     tool_registry: Option<&ToolRegistry>,
     skill_runtime: Option<&SkillRuntime>,
+    skill_dispatch_runtime: Option<&SkillDispatchRuntime>,
+    skill_name: Option<&str>,
     tool_calls: &[ChatToolCall],
     session_id: &SessionId,
     workspace_id: &Option<WorkspaceId>,
@@ -753,6 +759,8 @@ fn execute_session_turn_tool_call_batch(
                         event_bus,
                         tool_registry,
                         skill_runtime,
+                        skill_dispatch_runtime,
+                        skill_name,
                         &tool_calls[tool_index],
                         session_id,
                         workspace_id,
@@ -782,6 +790,8 @@ fn execute_session_turn_tool_call_batch(
                                         event_bus,
                                         tool_registry,
                                         skill_runtime,
+                                        skill_dispatch_runtime,
+                                        skill_name,
                                         tool_call,
                                         session_id,
                                         workspace_id,
@@ -842,6 +852,8 @@ fn execute_session_turn_tool_call(
     event_bus: &InMemoryEventBus,
     tool_registry: Option<&ToolRegistry>,
     skill_runtime: Option<&SkillRuntime>,
+    skill_dispatch_runtime: Option<&SkillDispatchRuntime>,
+    skill_name: Option<&str>,
     tool_call: &ChatToolCall,
     session_id: &SessionId,
     workspace_id: &Option<WorkspaceId>,
@@ -876,6 +888,29 @@ fn execute_session_turn_tool_call(
         return execute_skill_apply_from_runtime(&tool_call.function.arguments, skill_runtime);
     }
 
+    if let Some((tool_skill_name, binding_id)) =
+        parse_skill_custom_tool_name(&tool_call.function.name)
+    {
+        return execute_skill_custom_tool(
+            tool_call,
+            &tool_skill_name,
+            &binding_id,
+            skill_name,
+            skill_runtime,
+            skill_dispatch_runtime,
+            ToolExecutionContext {
+                worker_id: None,
+                task_id: None,
+                session_id: Some(session_id.clone()),
+                workspace_id: workspace_id.clone(),
+                working_directory: workspace_root_path.cloned(),
+            },
+            workspace_root_path
+                .as_ref()
+                .map(|path| path.display().to_string()),
+        );
+    }
+
     if let Some(rejection) = internal_builtin_tool_rejection_payload(&tool_call.function.name) {
         return (rejection, ExecutionResultStatus::Failed);
     }
@@ -904,17 +939,22 @@ fn execute_session_turn_tool_call(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use magi_bridge_client::ChatToolFunction;
+    use magi_bridge_client::{
+        BridgeBindingKind, BridgeDispatchAction, BridgeDispatchRuntime, BridgeResponse,
+        ChatToolFunction, McpBridgeClient, McpToolCallRequest,
+    };
     use magi_core::{MissionId, ThreadId};
     use magi_governance::GovernanceService;
     use magi_session_store::{
         ActiveExecutionChain, ActiveExecutionDispatchContext, ActiveExecutionTurn,
     };
-    use magi_skill_runtime::{SkillDefinition, SkillMetadata, SkillRegistry};
+    use magi_skill_runtime::{
+        SkillDefinition, SkillDispatchRuntime, SkillMetadata, SkillRegistry, SkillRuntime,
+    };
     use magi_tool_runtime::{BuiltinTool, BuiltinToolSpec};
     use std::{
         sync::{
-            Arc,
+            Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
         },
         thread,
@@ -969,6 +1009,11 @@ mod tests {
         probe: Arc<ConcurrentToolProbe>,
     }
 
+    #[derive(Clone, Default)]
+    struct RecordingMcpClient {
+        calls: Arc<Mutex<Vec<McpToolCallRequest>>>,
+    }
+
     impl ProbeBuiltinTool {
         fn new(name: &'static str, probe: Arc<ConcurrentToolProbe>) -> Self {
             Self { name, probe }
@@ -997,6 +1042,28 @@ mod tests {
                 risk_level: RiskLevel::Low,
                 approval_requirement: ApprovalRequirement::None,
             }
+        }
+    }
+
+    impl McpBridgeClient for RecordingMcpClient {
+        fn call_tool(
+            &self,
+            request: McpToolCallRequest,
+        ) -> Result<BridgeResponse, magi_bridge_client::BridgeClientError> {
+            self.calls
+                .lock()
+                .expect("recording mcp calls lock poisoned")
+                .push(request.clone());
+            Ok(BridgeResponse {
+                ok: true,
+                payload: serde_json::json!({
+                    "tool": request.tool_name,
+                    "server": request.server_name,
+                    "input": request.input,
+                    "ok": true,
+                })
+                .to_string(),
+            })
         }
     }
 
@@ -1114,6 +1181,8 @@ mod tests {
             &event_bus,
             None,
             None,
+            None,
+            None,
             &call,
             &SessionId::new("session-1"),
             &None,
@@ -1158,6 +1227,8 @@ mod tests {
             &event_bus,
             Some(&tool_registry),
             Some(&skill_runtime),
+            None,
+            None,
             &call,
             &SessionId::new("session-1"),
             &None,
@@ -1167,6 +1238,74 @@ mod tests {
         assert_eq!(status, ExecutionResultStatus::Succeeded);
         let parsed: serde_json::Value = serde_json::from_str(&payload).expect("payload json");
         assert_eq!(parsed["skill_name"], "code-review");
+        assert_eq!(event_bus.snapshot().recent_events.len(), 1);
+    }
+
+    #[test]
+    fn execute_session_turn_tool_call_dispatches_custom_skill_binding() {
+        let registry = SkillRegistry::new();
+        registry.register(SkillDefinition {
+            skill_id: "code-review".to_string(),
+            title: "代码审查".to_string(),
+            instruction: "检查稳定性风险。".to_string(),
+            metadata: magi_skill_runtime::SkillMetadata {
+                category: "quality".to_string(),
+                tags: vec!["review".to_string()],
+            },
+            allowed_tools: vec![],
+            custom_tool_bindings: vec![magi_skill_runtime::CustomToolBinding {
+                binding_id: "review-mcp".to_string(),
+                tool_name: "echo.describe".to_string(),
+                description: "回显描述".to_string(),
+                bridge_kind: BridgeBindingKind::Mcp,
+                dispatch_action: BridgeDispatchAction::McpToolCall,
+                bridge_target: "loopback-mcp".to_string(),
+            }],
+            prompt_priority: 50,
+        });
+        let skill_runtime = SkillRuntime::new(registry);
+        let tool_registry = magi_tool_runtime::ToolRegistry::new(
+            Arc::new(GovernanceService::default()),
+            Arc::new(magi_event_bus::InMemoryEventBus::new(8)),
+        );
+        let mcp_client = RecordingMcpClient::default();
+        let mcp_calls = mcp_client.calls.clone();
+        let skill_dispatch_runtime = SkillDispatchRuntime::new(
+            tool_registry.clone(),
+            BridgeDispatchRuntime::new().with_mcp_client(Arc::new(mcp_client)),
+        );
+        let event_bus = InMemoryEventBus::new(8);
+        let call = ChatToolCall {
+            id: "tool-call-1".to_string(),
+            kind: "function".to_string(),
+            function: ChatToolFunction {
+                name: "skill__code-review__review-mcp".to_string(),
+                arguments: serde_json::json!({ "payload": "hello mcp" }).to_string(),
+            },
+        };
+
+        let (payload, status) = execute_session_turn_tool_call(
+            &event_bus,
+            Some(&tool_registry),
+            Some(&skill_runtime),
+            Some(&skill_dispatch_runtime),
+            Some("code-review"),
+            &call,
+            &SessionId::new("session-1"),
+            &None,
+            None,
+        );
+
+        assert_eq!(status, ExecutionResultStatus::Succeeded);
+        let parsed: serde_json::Value = serde_json::from_str(&payload).expect("payload json");
+        assert_eq!(parsed["tool"], "echo.describe");
+        assert_eq!(parsed["server"], "loopback-mcp");
+        assert_eq!(parsed["input"], "hello mcp");
+        let recorded = mcp_calls.lock().expect("mcp calls lock");
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].server_name, "loopback-mcp");
+        assert_eq!(recorded[0].tool_name, "echo.describe");
+        assert_eq!(recorded[0].input, "hello mcp");
         assert_eq!(event_bus.snapshot().recent_events.len(), 1);
     }
 
@@ -1189,6 +1328,8 @@ mod tests {
         let (payload, status) = execute_session_turn_tool_call(
             &event_bus,
             Some(&tool_registry),
+            None,
+            None,
             None,
             &call,
             &SessionId::new("session-1"),
@@ -1278,6 +1419,8 @@ mod tests {
             &session_store,
             &event_bus,
             Some(&tool_registry),
+            None,
+            None,
             None,
             &session_id,
             &workspace_id,

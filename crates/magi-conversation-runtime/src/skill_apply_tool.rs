@@ -79,6 +79,20 @@ pub fn execute_skill_apply_from_runtime(
     };
     let skill_id = skill.skill_id.clone();
     let title = skill.title.clone();
+    let custom_tool_bindings = skill
+        .custom_tool_bindings
+        .iter()
+        .map(|binding| {
+            serde_json::json!({
+                "binding_id": binding.binding_id,
+                "tool_name": binding.tool_name,
+                "description": binding.description,
+                "bridge_kind": binding.bridge_kind,
+                "dispatch_action": binding.dispatch_action,
+                "bridge_target": binding.bridge_target,
+            })
+        })
+        .collect::<Vec<_>>();
     (
         serde_json::json!({
             "tool": SKILL_APPLY_TOOL_NAME,
@@ -87,6 +101,7 @@ pub fn execute_skill_apply_from_runtime(
             "title": skill.title,
             "instruction": skill.instruction,
             "allowed_tools": skill.allowed_tools,
+            "custom_tool_bindings": custom_tool_bindings,
             "metadata": {
                 "category": skill.metadata.category,
                 "tags": skill.metadata.tags,

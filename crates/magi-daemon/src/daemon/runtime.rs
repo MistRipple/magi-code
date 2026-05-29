@@ -606,7 +606,7 @@ impl DaemonRuntime {
             max_file_summaries: 4,
         };
         let execution_runtime = orchestrator
-            .execution_runtime(worker_runtime.clone(), tool_registry, skill_runtime)
+            .execution_runtime(worker_runtime.clone(), tool_registry, skill_runtime.clone())
             .with_task_store(Arc::clone(&task_store))
             .with_context_runtime(
                 context_runtime,
@@ -630,6 +630,7 @@ impl DaemonRuntime {
         .with_knowledge_store(self.knowledge_store.clone())
         .with_settings_store(settings_store.clone())
         .with_skill_runtime(app_skill_runtime.clone())
+        .with_skill_dispatch_runtime(Arc::new(skill_runtime.clone()))
         .with_tool_registry(tool_registry_for_dispatcher.clone())
         .with_tunnel_port(self.local_port)
         .with_runtime_persistence(Arc::new(RuntimeStatePersistence::new(

@@ -3,7 +3,7 @@
 //! Owns the production task dispatch implementation for session turns and conversation loops.
 
 use crate::{
-    ConversationRegistry, SKILL_APPLY_TOOL_NAME,
+    ConversationRegistry, SKILL_APPLY_TOOL_NAME, build_skill_custom_tool_definitions,
     conversation_loop::{self, ConversationLoopRequest},
     model_config::{NormalizedModelConfig, configured_role_engine_model_config},
     prompt_utils::prepend_session_instructions,
@@ -162,6 +162,7 @@ pub struct LlmTaskDispatcher {
     workspace_registry: Option<Arc<WorkspaceStore>>,
     tool_registry: Option<ToolRegistry>,
     skill_runtime: Option<Arc<magi_skill_runtime::SkillRuntime>>,
+    skill_dispatch_runtime: Option<Arc<magi_skill_runtime::SkillDispatchRuntime>>,
     snapshot_manager: Option<Arc<magi_snapshot::SnapshotManager>>,
     /// 任务系统：Conversation 注册中心，承载 Turn 状态机与单 Conversation 不并发不变式。
     conversation_registry: Option<Arc<ConversationRegistry>>,
@@ -362,6 +363,7 @@ impl LlmTaskDispatcher {
             workspace_registry: None,
             tool_registry: None,
             skill_runtime: None,
+            skill_dispatch_runtime: None,
             snapshot_manager: None,
             conversation_registry: None,
             agent_role_registry: None,
@@ -433,6 +435,14 @@ impl LlmTaskDispatcher {
 
     pub fn with_skill_runtime(mut self, runtime: Arc<magi_skill_runtime::SkillRuntime>) -> Self {
         self.skill_runtime = Some(runtime);
+        self
+    }
+
+    pub fn with_skill_dispatch_runtime(
+        mut self,
+        runtime: Arc<magi_skill_runtime::SkillDispatchRuntime>,
+    ) -> Self {
+        self.skill_dispatch_runtime = Some(runtime);
         self
     }
 
@@ -915,7 +925,11 @@ impl LlmTaskDispatcher {
         let _ = self.event_bus.publish(event);
     }
 
-    fn build_tool_definitions(&self, task: Option<&magi_core::Task>) -> Vec<ChatToolDefinition> {
+    fn build_tool_definitions(
+        &self,
+        task: Option<&magi_core::Task>,
+        skill_name: Option<&str>,
+    ) -> Vec<ChatToolDefinition> {
         let Some(ref registry) = self.tool_registry else {
             return Vec::new();
         };
@@ -941,6 +955,13 @@ impl LlmTaskDispatcher {
             .collect::<Vec<_>>();
         if self.skill_runtime.is_some() {
             definitions.push(skill_apply_tool_definition());
+        }
+        if let (Some(skill_name), Some(skill_runtime)) = (skill_name, self.skill_runtime.as_ref()) {
+            let plan = skill_runtime.build_tool_runtime_plan(magi_skill_runtime::SkillSelection {
+                skill_ids: vec![skill_name.to_string()],
+                requested_tools: Vec::new(),
+            });
+            definitions.extend(build_skill_custom_tool_definitions(skill_name, &plan));
         }
         definitions
     }
@@ -1276,7 +1297,7 @@ impl LlmTaskDispatcher {
         );
 
         let tools = if request.use_tools {
-            let tool_defs = self.build_tool_definitions(None);
+            let tool_defs = self.build_tool_definitions(None, request.skill_name.as_deref());
             (!tool_defs.is_empty()).then_some(tool_defs)
         } else {
             None
@@ -1288,6 +1309,8 @@ impl LlmTaskDispatcher {
             settings_store: execution_settings,
             tool_registry: self.tool_registry.as_ref(),
             skill_runtime: self.skill_runtime.as_deref(),
+            skill_dispatch_runtime: self.skill_dispatch_runtime.as_deref(),
+            skill_name: request.skill_name.clone(),
             snapshot_manager: self.snapshot_manager.as_ref(),
             request,
             prompt,
@@ -1344,7 +1367,7 @@ impl LlmTaskDispatcher {
         let workspace_root_path = self.resolve_workspace_root_path(workspace_id);
 
         let tools = if use_tools {
-            let tool_defs = self.build_tool_definitions(Some(task));
+            let tool_defs = self.build_tool_definitions(Some(task), skill_name.as_deref());
             if tool_defs.is_empty() {
                 None
             } else {
@@ -1496,6 +1519,8 @@ impl LlmTaskDispatcher {
             settings_store: execution_settings,
             tool_registry: self.tool_registry.as_ref(),
             skill_runtime: self.skill_runtime.as_deref(),
+            skill_dispatch_runtime: self.skill_dispatch_runtime.as_deref(),
+            skill_name: skill_name.clone(),
             task_store: self.pipeline.execution_runtime.task_store(),
             execution_registry: &self.execution_registry,
             conversation_registry: conversation_registry.as_ref(),
@@ -2005,7 +2030,7 @@ mod tests {
         let worker_task = task_with_role("executor", TaskTier::ExecutionChain);
 
         let long_mission_names = dispatcher
-            .build_tool_definitions(Some(&long_mission_task))
+            .build_tool_definitions(Some(&long_mission_task), None)
             .into_iter()
             .map(|definition| definition.function.name)
             .collect::<Vec<_>>();
@@ -2024,7 +2049,7 @@ mod tests {
         }
 
         let execution_names = dispatcher
-            .build_tool_definitions(Some(&execution_task))
+            .build_tool_definitions(Some(&execution_task), None)
             .into_iter()
             .map(|definition| definition.function.name)
             .collect::<Vec<_>>();
@@ -2033,12 +2058,54 @@ mod tests {
         assert!(!execution_names.iter().any(|name| name == "plan_write"));
 
         let worker_names = dispatcher
-            .build_tool_definitions(Some(&worker_task))
+            .build_tool_definitions(Some(&worker_task), None)
             .into_iter()
             .map(|definition| definition.function.name)
             .collect::<Vec<_>>();
         assert!(!worker_names.iter().any(|name| name == "agent_spawn"));
         assert!(!worker_names.iter().any(|name| name == "plan_write"));
+    }
+
+    #[test]
+    fn active_skill_custom_bindings_are_exposed_in_tool_surface() {
+        let dispatcher = dispatcher_with_default_tool_surface().with_skill_runtime(Arc::new({
+            let registry = magi_skill_runtime::SkillRegistry::new();
+            registry.register(magi_skill_runtime::SkillDefinition {
+                skill_id: "code-review".to_string(),
+                title: "代码审查".to_string(),
+                instruction: "检查稳定性风险。".to_string(),
+                metadata: magi_skill_runtime::SkillMetadata {
+                    category: "quality".to_string(),
+                    tags: vec!["review".to_string()],
+                },
+                allowed_tools: vec![],
+                custom_tool_bindings: vec![magi_skill_runtime::CustomToolBinding {
+                    binding_id: "review-mcp".to_string(),
+                    tool_name: "echo.describe".to_string(),
+                    description: "回显描述".to_string(),
+                    bridge_kind: magi_bridge_client::BridgeBindingKind::Mcp,
+                    dispatch_action: magi_bridge_client::BridgeDispatchAction::McpToolCall,
+                    bridge_target: "loopback-mcp".to_string(),
+                }],
+                prompt_priority: 50,
+            });
+            magi_skill_runtime::SkillRuntime::new(registry)
+        }));
+        let task = task_with_role("coordinator", TaskTier::ExecutionChain);
+
+        let names = dispatcher
+            .build_tool_definitions(Some(&task), Some("code-review"))
+            .into_iter()
+            .map(|definition| definition.function.name)
+            .collect::<Vec<_>>();
+
+        assert!(
+            names
+                .iter()
+                .any(|name| name == "skill__code-review__review-mcp"),
+            "active skill custom binding should surface as callable tool"
+        );
+        assert!(names.iter().any(|name| name == SKILL_APPLY_TOOL_NAME));
     }
 
     #[test]

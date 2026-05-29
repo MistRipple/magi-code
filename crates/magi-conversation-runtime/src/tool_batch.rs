@@ -40,6 +40,7 @@ use crate::{
     task_helpers::{task_can_see_builtin_tool, task_is_long_mission},
     tool_declared_paths::{append_result_declared_paths, derive_declared_paths},
 };
+use crate::{execute_skill_custom_tool, parse_skill_custom_tool_name};
 
 /// agent_spawn 生成 child task_id 时使用的进程内单调序号。
 ///
@@ -98,6 +99,8 @@ pub fn execute_task_tool_call_batch(
     tool_registry: Option<&ToolRegistry>,
     agent_role_registry: &magi_agent_role::AgentRoleRegistry,
     skill_runtime: Option<&magi_skill_runtime::SkillRuntime>,
+    skill_dispatch_runtime: Option<&magi_skill_runtime::SkillDispatchRuntime>,
+    skill_name: Option<&str>,
     task_store: &TaskStore,
     session_store: &SessionStore,
     execution_registry: &TaskExecutionRegistry,
@@ -159,6 +162,8 @@ pub fn execute_task_tool_call_batch(
                         tool_registry,
                         agent_role_registry,
                         skill_runtime,
+                        skill_dispatch_runtime,
+                        skill_name,
                         task_store,
                         session_store,
                         execution_registry,
@@ -205,6 +210,8 @@ pub fn execute_task_tool_call_batch(
                                         tool_registry,
                                         agent_role_registry,
                                         skill_runtime,
+                                        skill_dispatch_runtime,
+                                        skill_name,
                                         task_store,
                                         session_store,
                                         execution_registry,
@@ -1239,6 +1246,8 @@ fn execute_task_tool_call(
     tool_registry: Option<&ToolRegistry>,
     agent_role_registry: &magi_agent_role::AgentRoleRegistry,
     skill_runtime: Option<&magi_skill_runtime::SkillRuntime>,
+    skill_dispatch_runtime: Option<&magi_skill_runtime::SkillDispatchRuntime>,
+    skill_name: Option<&str>,
     task_store: &TaskStore,
     session_store: &SessionStore,
     execution_registry: &TaskExecutionRegistry,
@@ -1441,6 +1450,29 @@ fn execute_task_tool_call(
 
     if tool_call.function.name == SKILL_APPLY_TOOL_NAME {
         return execute_skill_apply_from_runtime(&tool_call.function.arguments, skill_runtime);
+    }
+
+    if let Some((tool_skill_name, binding_id)) =
+        parse_skill_custom_tool_name(&tool_call.function.name)
+    {
+        return execute_skill_custom_tool(
+            tool_call,
+            &tool_skill_name,
+            &binding_id,
+            skill_name,
+            skill_runtime,
+            skill_dispatch_runtime,
+            ToolExecutionContext {
+                worker_id: worker_id.cloned(),
+                task_id: Some(task.task_id.clone()),
+                session_id: Some(session_id.clone()),
+                workspace_id: workspace_id.clone(),
+                working_directory: workspace_root_path.cloned(),
+            },
+            workspace_root_path
+                .as_ref()
+                .map(|path| path.display().to_string()),
+        );
     }
 
     if let Some(rejection) = internal_builtin_tool_rejection_payload(&tool_call.function.name) {
@@ -1855,6 +1887,8 @@ mod tests {
             Some(&tool_registry),
             &agent_role_registry,
             None,
+            None,
+            None,
             &task_store,
             &session_store,
             &execution_registry,
@@ -1912,6 +1946,8 @@ mod tests {
             &event_bus,
             Some(&tool_registry),
             &agent_role_registry,
+            None,
+            None,
             None,
             &task_store,
             &session_store,
@@ -2293,6 +2329,8 @@ mod tests {
             None,
             &agent_role_registry,
             None,
+            None,
+            None,
             &task_store,
             &session_store,
             &execution_registry,
@@ -2330,6 +2368,8 @@ mod tests {
             &event_bus,
             None,
             &agent_role_registry,
+            None,
+            None,
             None,
             &task_store,
             &session_store,
@@ -2403,6 +2443,8 @@ mod tests {
             None,
             &agent_role_registry,
             None,
+            None,
+            None,
             &task_store,
             &session_store,
             &execution_registry,
@@ -2475,6 +2517,8 @@ mod tests {
             &event_bus,
             None,
             &agent_role_registry,
+            None,
+            None,
             None,
             &task_store,
             &session_store,

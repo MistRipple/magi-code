@@ -54,7 +54,7 @@
   let copySuccess = $state(false);
 
   interface ParsedToolIdentity {
-    source: 'builtin' | 'mcp';
+    source: 'builtin' | 'mcp' | 'skill';
     baseName: string;
     qualifier?: string;
     displayName: string;
@@ -75,6 +75,16 @@
       const baseName = parts.slice(2).join('__') || toolName;
       return {
         source: 'mcp',
+        baseName,
+        qualifier,
+        displayName: `${baseName} · ${qualifier}`,
+      };
+    }
+    if (parts.length >= 3 && parts[0] === 'skill') {
+      const qualifier = parts[1] || 'skill';
+      const baseName = parts[2] || toolName;
+      return {
+        source: 'skill',
         baseName,
         qualifier,
         displayName: `${baseName} · ${qualifier}`,
@@ -147,6 +157,9 @@
 
     const parsedTool = parseToolIdentity(toolName);
     if (parsedTool.source === 'mcp') {
+      return 'plug';
+    }
+    if (parsedTool.source === 'skill') {
       return 'plug';
     }
     const baseToolName = parsedTool.baseName;
@@ -338,6 +351,9 @@
     if (parsedTool.source === 'mcp') {
       return parsedTool.displayName;
     }
+    if (parsedTool.source === 'skill') {
+      return parsedTool.displayName;
+    }
     const baseToolName = parsedTool.baseName;
 
     // 文件操作工具直接使用语义化显示名
@@ -379,6 +395,14 @@
   function getToolSummary(toolName: string, toolInput: unknown): string {
     if (!toolInput || typeof toolInput !== 'object') return '';
     const args = toolInput as Record<string, unknown>;
+    const parsedTool = parseToolIdentity(toolName);
+    if (parsedTool.source === 'skill') {
+      return typeof args.payload === 'string'
+        ? args.payload
+        : typeof args.input === 'string'
+          ? args.input
+          : '';
+    }
     switch (toolName) {
       case 'shell_exec':
         return typeof args.command === 'string' ? args.command : '';

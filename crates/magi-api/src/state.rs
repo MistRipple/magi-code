@@ -530,6 +530,7 @@ pub struct ApiState {
     model_bridge_client_is_real: bool,
     tool_registry: Option<ToolRegistry>,
     pub skill_runtime: Option<Arc<magi_skill_runtime::SkillRuntime>>,
+    pub skill_dispatch_runtime: Option<Arc<magi_skill_runtime::SkillDispatchRuntime>>,
     pub tunnel_manager: crate::tunnel::TunnelManager,
     pub snapshot_manager: Arc<SnapshotManager>,
     pub conversation_registry: Arc<ConversationRegistry>,
@@ -649,6 +650,7 @@ impl ApiState {
             model_bridge_client_is_real: false,
             tool_registry: None,
             skill_runtime: None,
+            skill_dispatch_runtime: None,
             tunnel_manager: crate::tunnel::TunnelManager::new(38123),
             snapshot_manager: Arc::new(SnapshotManager::new()),
             conversation_registry: Arc::new(ConversationRegistry::new()),
@@ -1278,6 +1280,14 @@ impl ApiState {
         skill_runtime: Arc<magi_skill_runtime::SkillRuntime>,
     ) -> Self {
         self.skill_runtime = Some(skill_runtime);
+        self
+    }
+
+    pub fn with_skill_dispatch_runtime(
+        mut self,
+        skill_dispatch_runtime: Arc<magi_skill_runtime::SkillDispatchRuntime>,
+    ) -> Self {
+        self.skill_dispatch_runtime = Some(skill_dispatch_runtime);
         self
     }
 
