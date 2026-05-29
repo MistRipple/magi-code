@@ -85,6 +85,8 @@
   let currentBranch = $state<string | null>(null);
   let branchError = $state<string | null>(null);
   let branchIsRepo = $state(false);
+  let branchAdditions = $state(0);
+  let branchDeletions = $state(0);
   const currentPickerModel = $derived.by(() => readOrchestratorModel());
   const auxiliaryConfig = $derived.by(() => getAuxiliaryConfigSnapshot());
   const auxiliaryEnhanceReady = $derived.by(() => hasUsableModelConfig(auxiliaryConfig));
@@ -861,12 +863,17 @@
   }
 
   // 初次拉取分支状态：决定左下角分支入口是否显示，以及当前分支文案。
+  function applyBranchResult(result: { isRepo: boolean; currentBranch: string | null; branches: string[]; additions: number; deletions: number }) {
+    branchIsRepo = result.isRepo;
+    currentBranch = result.currentBranch;
+    branches = result.branches;
+    branchAdditions = result.additions ?? 0;
+    branchDeletions = result.deletions ?? 0;
+  }
+
   async function refreshBranchState() {
     try {
-      const result = await fetchWorkspaceBranches();
-      branchIsRepo = result.isRepo;
-      currentBranch = result.currentBranch;
-      branches = result.branches;
+      applyBranchResult(await fetchWorkspaceBranches());
     } catch (error) {
       // 拉取失败时静默隐藏入口，不打扰用户（git 能力是增强项，非核心链路）。
       branchIsRepo = false;
@@ -889,10 +896,7 @@
     branchLoading = true;
     branchError = null;
     try {
-      const result = await fetchWorkspaceBranches();
-      branchIsRepo = result.isRepo;
-      currentBranch = result.currentBranch;
-      branches = result.branches;
+      applyBranchResult(await fetchWorkspaceBranches());
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error ?? '');
       branchError = message || i18n.t('input.branch.loadFailed');
@@ -916,6 +920,8 @@
         currentBranch = result.currentBranch ?? target;
         addToast('success', i18n.t('input.branch.switched', { branch: currentBranch }));
         branchPickerOpen = false;
+        // 切换后工作区改动行数可能变化（如非冲突改动跟随切换），重新拉取以刷新计数。
+        void refreshBranchState();
       } else {
         // git 拒绝（如未提交改动会被覆盖）：原文展示在 popover，不关闭、不兜底。
         branchError = result.error || i18n.t('input.branch.switchFailed');
@@ -1165,6 +1171,12 @@
             >
               <Icon name="git-branch" size={12} />
               <span class="ia-branch-btn-label">{currentBranch || '—'}</span>
+              {#if branchAdditions > 0 || branchDeletions > 0}
+                <span class="ia-branch-diffstat">
+                  <span class="ia-branch-add">+{branchAdditions}</span>
+                  <span class="ia-branch-del">-{branchDeletions}</span>
+                </span>
+              {/if}
               <Icon name="chevron-down" size={10} />
             </button>
             {#if branchPickerOpen}
@@ -1608,6 +1620,16 @@
     white-space: nowrap;
     max-width: 120px;
   }
+  .ia-branch-diffstat {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 10px;
+    font-variant-numeric: tabular-nums;
+    font-weight: 600;
+  }
+  .ia-branch-add { color: var(--success, #2ea043); }
+  .ia-branch-del { color: var(--danger, #f85149); }
   /* 分支 picker 位于左下角，popover 锚定到左侧（覆盖模型 picker 的 right:0）。 */
   .ia-branch-popover {
     right: auto;

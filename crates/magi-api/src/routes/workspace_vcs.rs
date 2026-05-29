@@ -28,6 +28,10 @@ struct BranchesResponse {
     is_repo: bool,
     current_branch: Option<String>,
     branches: Vec<String>,
+    /// 未提交改动的新增行数（git diff HEAD，含已暂存+未暂存）。
+    additions: u64,
+    /// 未提交改动的删除行数。
+    deletions: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -69,6 +73,24 @@ async fn current_branch(workspace_path: &str) -> Option<String> {
     }
 }
 
+/// 统计未提交改动的新增/删除行数（git diff HEAD --numstat，含已暂存+未暂存）。
+/// 二进制文件 numstat 以 `-` 占位，按 0 行处理。失败时返回 (0, 0)，不阻断分支查询。
+async fn uncommitted_diff_stat(workspace_path: &str) -> (u64, u64) {
+    let Ok((true, stdout, _)) = run_git(workspace_path, &["diff", "HEAD", "--numstat"]).await else {
+        return (0, 0);
+    };
+    let mut additions = 0u64;
+    let mut deletions = 0u64;
+    for line in stdout.lines() {
+        let mut cols = line.split('\t');
+        let add = cols.next().and_then(|v| v.trim().parse::<u64>().ok());
+        let del = cols.next().and_then(|v| v.trim().parse::<u64>().ok());
+        additions += add.unwrap_or(0);
+        deletions += del.unwrap_or(0);
+    }
+    (additions, deletions)
+}
+
 async fn list_branches(
     State(_state): State<ApiState>,
     Json(request): Json<BranchesRequest>,
@@ -85,6 +107,8 @@ async fn list_branches(
             is_repo: false,
             current_branch: None,
             branches: Vec::new(),
+            additions: 0,
+            deletions: 0,
         }));
     }
 
@@ -102,10 +126,14 @@ async fn list_branches(
         .map(ToOwned::to_owned)
         .collect();
 
+    let (additions, deletions) = uncommitted_diff_stat(workspace_path).await;
+
     Ok(Json(BranchesResponse {
         is_repo: true,
         current_branch: current_branch(workspace_path).await,
         branches,
+        additions,
+        deletions,
     }))
 }
 

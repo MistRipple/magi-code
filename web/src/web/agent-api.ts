@@ -1163,6 +1163,8 @@ export interface WorkspaceBranchesResult {
   isRepo: boolean;
   currentBranch: string | null;
   branches: string[];
+  additions: number;
+  deletions: number;
 }
 
 export async function fetchWorkspaceBranches(): Promise<WorkspaceBranchesResult> {
