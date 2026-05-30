@@ -1369,13 +1369,14 @@ function clearSettingsBootstrapCacheIfWorkspaceChanged(
   previousWorkspacePath: string,
   nextWorkspaceId: string,
   nextWorkspacePath: string,
-): void {
-  if (
+): boolean {
+  const changed =
     settingsBootstrapBindingKey(previousWorkspaceId, previousWorkspacePath)
-    !== settingsBootstrapBindingKey(nextWorkspaceId, nextWorkspacePath)
-  ) {
+    !== settingsBootstrapBindingKey(nextWorkspaceId, nextWorkspacePath);
+  if (changed) {
     clearSettingsBootstrapCache();
   }
+  return changed;
 }
 
 function isCurrentSettingsBootstrapRequest(bindingKey: string, requestSeq: number): boolean {
@@ -1383,14 +1384,14 @@ function isCurrentSettingsBootstrapRequest(bindingKey: string, requestSeq: numbe
     && bindingKey === settingsBootstrapBindingKey();
 }
 
-function persistWorkspaceBinding(workspaceId: string, workspacePath: string, sessionId: string): void {
+function persistWorkspaceBinding(workspaceId: string, workspacePath: string, sessionId: string): boolean {
   const previousWorkspaceId = currentWorkspaceId;
   const previousWorkspacePath = currentWorkspacePath;
   const normalizedWorkspaceId = workspaceId.trim();
   const normalizedWorkspacePath = workspacePath.trim();
   const incomingSessionId = sessionId.trim();
 
-  clearSettingsBootstrapCacheIfWorkspaceChanged(
+  const workspaceChanged = clearSettingsBootstrapCacheIfWorkspaceChanged(
     previousWorkspaceId,
     previousWorkspacePath,
     normalizedWorkspaceId,
@@ -1406,7 +1407,7 @@ function persistWorkspaceBinding(workspaceId: string, workspacePath: string, ses
 
   const currentUrl = getCurrentUrl();
   if (!currentUrl) {
-    return;
+    return workspaceChanged;
   }
   const nextUrl = new URL(currentUrl.toString());
   if (normalizedWorkspaceId) {
@@ -1427,14 +1428,15 @@ function persistWorkspaceBinding(workspaceId: string, workspacePath: string, ses
   if (nextUrl.toString() !== currentUrl.toString()) {
     window.history.replaceState(window.history.state, '', nextUrl);
   }
+  return workspaceChanged;
 }
 
-function clearWorkspaceSessionBinding(workspaceId: string, workspacePath: string): void {
+function clearWorkspaceSessionBinding(workspaceId: string, workspacePath: string): boolean {
   const previousWorkspaceId = currentWorkspaceId;
   const previousWorkspacePath = currentWorkspacePath;
   const normalizedWorkspaceId = workspaceId.trim();
   const normalizedWorkspacePath = workspacePath.trim();
-  clearSettingsBootstrapCacheIfWorkspaceChanged(
+  const workspaceChanged = clearSettingsBootstrapCacheIfWorkspaceChanged(
     previousWorkspaceId,
     previousWorkspacePath,
     normalizedWorkspaceId,
@@ -1457,7 +1459,7 @@ function clearWorkspaceSessionBinding(workspaceId: string, workspacePath: string
 
   const currentUrl = getCurrentUrl();
   if (!currentUrl) {
-    return;
+    return workspaceChanged;
   }
   const nextUrl = new URL(currentUrl.toString());
   if (normalizedWorkspaceId) {
@@ -1474,15 +1476,19 @@ function clearWorkspaceSessionBinding(workspaceId: string, workspacePath: string
   if (nextUrl.toString() !== currentUrl.toString()) {
     window.history.replaceState(window.history.state, '', nextUrl);
   }
+  return workspaceChanged;
 }
 
 function dispatchWorkspaceSessionCleared(workspaceId: string, workspacePath: string): void {
   closeEventStream();
-  clearWorkspaceSessionBinding(workspaceId, workspacePath);
+  const workspaceChanged = clearWorkspaceSessionBinding(workspaceId, workspacePath);
   emitDataMessage('workspaceSessionCleared', {
     workspaceId: workspaceId.trim(),
     workspacePath: workspacePath.trim(),
   });
+  if (workspaceChanged) {
+    refreshSettingsBootstrapForCurrentWorkspace('workspace_session_cleared');
+  }
 }
 
 function clearPersistedWorkspaceBinding(): void {
@@ -1560,10 +1566,11 @@ async function restoreBridgeState(reason: string, force = false): Promise<void> 
     if (force) {
       clearSettingsBootstrapCache();
     }
-    await Promise.all([
-      fetchBootstrap({ forceEventStreamReconnect: true }),
-      dispatchSettingsBootstrap(force, 'core'),
-    ]);
+    await fetchBootstrap({
+      forceEventStreamReconnect: true,
+      refreshSettingsBootstrapOnWorkspaceChange: false,
+    });
+    await dispatchSettingsBootstrap(force, 'core');
     clearRecoveryTimer();
     recoveryAttempt = 0;
     emitConnectedState(reason, recovered);
@@ -1710,7 +1717,11 @@ async function ensureEventStream(
 
 async function dispatchBootstrap(
   payload: BootstrapPayload,
-  options: { forceEventStreamReconnect?: boolean; rawPayload?: unknown } = {},
+  options: {
+    forceEventStreamReconnect?: boolean;
+    rawPayload?: unknown;
+    refreshSettingsBootstrapOnWorkspaceChange?: boolean;
+  } = {},
 ): Promise<void> {
   const previousSessionId = currentSessionId;
   const pageMeta = readRustTimelinePageMeta(options.rawPayload ?? payload);
@@ -1725,7 +1736,11 @@ async function dispatchBootstrap(
   if (incomingEpoch) {
     currentRuntimeEpoch = incomingEpoch;
   }
-  persistWorkspaceBinding(payload.workspace.workspaceId, payload.workspace.rootPath, payload.sessionId);
+  const workspaceChanged = persistWorkspaceBinding(
+    payload.workspace.workspaceId,
+    payload.workspace.rootPath,
+    payload.sessionId,
+  );
   activateTaskProjectionSession(payload.sessionId);
   const taskTrackingHints = extractBootstrapTaskTrackingHints(payload, options.rawPayload);
   if (previousSessionId && payload.sessionId && previousSessionId !== payload.sessionId) {
@@ -1758,10 +1773,17 @@ async function dispatchBootstrap(
   if ((payload.state as { isProcessing?: boolean } | undefined)?.isProcessing !== true) {
     scheduleQueuedTurnDrain('bootstrap_idle');
   }
+  if (workspaceChanged && options.refreshSettingsBootstrapOnWorkspaceChange !== false) {
+    refreshSettingsBootstrapForCurrentWorkspace('bootstrap_workspace_changed');
+  }
 }
 
 async function fetchBootstrap(
-  options: { forceEventStreamReconnect?: boolean; forceFresh?: boolean } = {},
+  options: {
+    forceEventStreamReconnect?: boolean;
+    forceFresh?: boolean;
+    refreshSettingsBootstrapOnWorkspaceChange?: boolean;
+  } = {},
 ): Promise<void> {
   // 防重入：如果已有 bootstrap 请求在飞行中，直接复用
   if (bootstrapInFlight && options.forceFresh !== true) {
@@ -1873,6 +1895,16 @@ async function dispatchSettingsBootstrap(
   return settingsBootstrapInFlight;
 }
 
+function refreshSettingsBootstrapForCurrentWorkspace(reason: string): void {
+  void dispatchSettingsBootstrap(true, 'core').catch((error) => {
+    reportExpectedRecoveryFailure(
+      i18n.t('settings.toast.action.loadSettingsData'),
+      `[web-client-bridge] workspace 变化后刷新 settings 失败(${reason}):`,
+      error,
+    );
+  });
+}
+
 async function dispatchExecutionStats(): Promise<void> {
   const payload = await getAgentExecutionStats();
   emitDataMessage('executionStatsUpdate', payload as unknown as Record<string, unknown>);
@@ -1963,7 +1995,11 @@ async function dispatchSessionSnapshot(
     workspaceId: options.workspaceId,
     workspacePath: options.workspacePath,
   });
-  persistWorkspaceBinding(payload.workspace.workspaceId, payload.workspace.rootPath, payload.sessionId);
+  const workspaceChanged = persistWorkspaceBinding(
+    payload.workspace.workspaceId,
+    payload.workspace.rootPath,
+    payload.sessionId,
+  );
   activateTaskProjectionSession(payload.sessionId);
   const taskTrackingHints = extractBootstrapTaskTrackingHints(payload, rawPayload);
   if (previousSessionId && payload.sessionId && previousSessionId !== payload.sessionId) {
@@ -1992,6 +2028,9 @@ async function dispatchSessionSnapshot(
   }
   if ((payload.state as { isProcessing?: boolean } | undefined)?.isProcessing !== true) {
     scheduleQueuedTurnDrain('session_snapshot_idle');
+  }
+  if (workspaceChanged) {
+    refreshSettingsBootstrapForCurrentWorkspace('session_snapshot_workspace_changed');
   }
 }
 
@@ -3108,7 +3147,10 @@ export function createWebClientBridge(): ClientBridge {
           const workspaceId = typeof message.workspaceId === 'string' ? message.workspaceId : '';
           const workspacePath = typeof message.workspacePath === 'string' ? message.workspacePath : '';
           const sessionId = typeof message.sessionId === 'string' ? message.sessionId.trim() : '';
-          persistWorkspaceBinding(workspaceId, workspacePath, sessionId);
+          const workspaceChanged = persistWorkspaceBinding(workspaceId, workspacePath, sessionId);
+          if (workspaceChanged) {
+            refreshSettingsBootstrapForCurrentWorkspace('workspace_binding_changed');
+          }
           return;
         }
         case 'webviewReady':
