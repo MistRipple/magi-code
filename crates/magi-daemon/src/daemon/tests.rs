@@ -29,6 +29,7 @@ use magi_workspace::{
 };
 use serde_json::{Value, json};
 use std::{fs, path::PathBuf, sync::Arc};
+use tokio::sync::broadcast;
 use tokio::time::{Duration, Instant};
 use tower::util::ServiceExt;
 
@@ -109,6 +110,33 @@ async fn get_json(app: axum::Router, path: &str) -> Value {
         panic!("get_json({path}) returned {status}: {snippet}");
     }
     serde_json::from_slice(&bytes).expect("response should be valid json")
+}
+
+async fn wait_for_event_matching(
+    receiver: &mut broadcast::Receiver<EventEnvelope>,
+    description: &str,
+    mut predicate: impl FnMut(&EventEnvelope) -> bool,
+) -> EventEnvelope {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match tokio::time::timeout(Duration::from_millis(250), receiver.recv()).await {
+            Ok(Ok(event)) if predicate(&event) => return event,
+            Ok(Ok(_)) => {}
+            Ok(Err(broadcast::error::RecvError::Lagged(_))) => {}
+            Ok(Err(broadcast::error::RecvError::Closed)) => {
+                panic!("event bus closed before receiving {description}");
+            }
+            Err(_) => {
+                if Instant::now() >= deadline {
+                    panic!("timed out waiting for {description}");
+                }
+            }
+        }
+    }
+}
+
+fn event_payload_contains_request_id(event: &EventEnvelope, request_id: &str) -> bool {
+    event.payload.to_string().contains(request_id)
 }
 
 async fn get_task_projection(app: axum::Router, root_task_id: &str, session_id: &str) -> Value {
@@ -2273,6 +2301,301 @@ fn graceful_shutdown_marks_runtime_status_complete_after_final_tick() {
 // ═══════════════════════════════════════════════════════════════════
 
 #[tokio::test]
+async fn session_turn_live_events_reach_multiple_subscribers() {
+    let state_root = temp_state_root("e2e-session-live-event-subscribers");
+    let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
+    let runtime =
+        DaemonRuntime::restore(&config).expect("runtime restore should bootstrap empty state");
+    let (app, state) = runtime.router_with_state_for_tests("daemon-test".to_string());
+
+    let mut first_receiver = state.event_bus.subscribe();
+    let mut second_receiver = state.event_bus.subscribe();
+
+    let (status, body) = post_json(
+        app.clone(),
+        "/api/session/turn",
+        json!({
+            "text": "multi subscriber live event",
+            "workspace_id": "test-workspace-001",
+            "request_id": "request-multi-subscriber-live",
+            "user_message_id": "user-multi-subscriber-live",
+            "placeholder_message_id": "placeholder-multi-subscriber-live",
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "session turn should accept: {body:?}"
+    );
+    let session_id = body["sessionId"]
+        .as_str()
+        .expect("session id should serialize as string");
+
+    let first_event = wait_for_event_matching(
+        &mut first_receiver,
+        "first subscriber session.turn.accepted",
+        |event| {
+            event.event_type == "session.turn.accepted"
+                && event_payload_contains_request_id(event, "request-multi-subscriber-live")
+        },
+    )
+    .await;
+    let second_event = wait_for_event_matching(
+        &mut second_receiver,
+        "second subscriber session.turn.accepted",
+        |event| {
+            event.event_type == "session.turn.accepted"
+                && event_payload_contains_request_id(event, "request-multi-subscriber-live")
+        },
+    )
+    .await;
+
+    assert_eq!(
+        first_event.session_id.as_ref().map(SessionId::as_str),
+        Some(session_id)
+    );
+    assert_eq!(
+        second_event.session_id.as_ref().map(SessionId::as_str),
+        Some(session_id)
+    );
+    assert_eq!(
+        first_event.workspace_id.as_ref().map(WorkspaceId::as_str),
+        Some("test-workspace-001")
+    );
+    assert_eq!(
+        second_event.workspace_id.as_ref().map(WorkspaceId::as_str),
+        Some("test-workspace-001")
+    );
+}
+
+#[tokio::test]
+async fn session_turn_persists_without_live_subscriber_and_recovers_after_restart() {
+    let state_root = temp_state_root("e2e-session-no-subscriber-recovery");
+    let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root.clone());
+
+    let runtime =
+        DaemonRuntime::restore(&config).expect("runtime restore should bootstrap empty state");
+    let (app, _state) = runtime.router_with_state_for_tests("daemon-test".to_string());
+    let (status, body) = post_json(
+        app.clone(),
+        "/api/session/turn",
+        json!({
+            "text": "no subscriber persistence",
+            "workspace_id": "test-workspace-001",
+            "request_id": "request-no-subscriber-recovery",
+            "user_message_id": "user-no-subscriber-recovery",
+            "placeholder_message_id": "placeholder-no-subscriber-recovery",
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "session turn should accept: {body:?}"
+    );
+    let session_id = body["sessionId"]
+        .as_str()
+        .expect("session id should serialize as string")
+        .to_string();
+
+    let workspace_sessions_path = state_root
+        .join("bootstrap")
+        .join("workspace")
+        .join(".magi")
+        .join("sessions.json");
+    let durable_payload = fs::read_to_string(&workspace_sessions_path)
+        .expect("workspace sessions durable state should be written immediately");
+    assert!(
+        durable_payload.contains("request-no-subscriber-recovery"),
+        "durable state should contain accepted turn before any SSE subscriber is present"
+    );
+
+    let sidecar_payload = fs::read_to_string(state_root.join("session-sidecars.json"))
+        .expect("session sidecar state should be written immediately");
+    assert!(
+        sidecar_payload.contains("request-no-subscriber-recovery"),
+        "sidecar state should contain accepted current turn before periodic maintenance"
+    );
+
+    drop(app);
+    drop(runtime);
+
+    let restarted_runtime =
+        DaemonRuntime::restore(&config).expect("restart should recover persisted session state");
+    let (restarted_app, _restarted_state) =
+        restarted_runtime.router_with_state_for_tests("daemon-test".to_string());
+    let bootstrap = get_json(
+        restarted_app.clone(),
+        &format!("/bootstrap?workspaceId=test-workspace-001&sessionId={session_id}"),
+    )
+    .await;
+    assert_eq!(bootstrap["currentSession"]["sessionId"], session_id);
+    assert!(
+        bootstrap["timeline"]
+            .as_array()
+            .expect("bootstrap timeline should be an array")
+            .iter()
+            .any(|entry| entry["message"] == "no subscriber persistence"),
+        "bootstrap should recover the submitted message after restart"
+    );
+
+    let messages = get_json(
+        restarted_app,
+        &format!("/api/messages?workspaceId=test-workspace-001&sessionId={session_id}"),
+    )
+    .await;
+    assert!(
+        messages["timeline"]
+            .as_array()
+            .expect("messages timeline should be an array")
+            .iter()
+            .any(|entry| entry["message"] == "no subscriber persistence"),
+        "messages endpoint should recover the submitted message after restart"
+    );
+}
+
+#[tokio::test]
+async fn workspace_sessions_and_events_stay_workspace_scoped() {
+    let state_root = temp_state_root("e2e-workspace-session-isolation");
+    let second_workspace_root = temp_state_root("e2e-workspace-session-isolation-second");
+    let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root.clone());
+    let runtime =
+        DaemonRuntime::restore(&config).expect("runtime restore should bootstrap empty state");
+    let (app, state) = runtime.router_with_state_for_tests("daemon-test".to_string());
+
+    let (register_status, register_body) = post_json(
+        app.clone(),
+        "/api/workspaces/register",
+        json!({ "path": second_workspace_root.to_string_lossy() }),
+    )
+    .await;
+    assert_eq!(
+        register_status,
+        StatusCode::OK,
+        "workspace register should succeed: {register_body:?}"
+    );
+    let second_workspace_id = register_body["workspaceId"]
+        .as_str()
+        .expect("second workspace id should serialize as string")
+        .to_string();
+
+    let (status, body) = post_json(
+        app.clone(),
+        "/api/session/turn",
+        json!({
+            "text": "workspace two isolated message",
+            "workspace_id": second_workspace_id.clone(),
+            "request_id": "request-workspace-two-isolated",
+            "user_message_id": "user-workspace-two-isolated",
+            "placeholder_message_id": "placeholder-workspace-two-isolated",
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "session turn should accept: {body:?}"
+    );
+    let session_id = body["sessionId"]
+        .as_str()
+        .expect("session id should serialize as string");
+
+    let snapshot = state.event_bus.snapshot();
+    let matching_events = snapshot
+        .recent_events
+        .iter()
+        .filter(|event| event_payload_contains_request_id(event, "request-workspace-two-isolated"))
+        .collect::<Vec<_>>();
+    assert!(
+        !matching_events.is_empty(),
+        "event bus should contain workspace two events"
+    );
+    assert!(
+        matching_events
+            .iter()
+            .all(|event| event.workspace_id.as_ref().map(WorkspaceId::as_str)
+                == Some(second_workspace_id.as_str())),
+        "workspace two request events must not be scoped to the bootstrap workspace"
+    );
+
+    let bootstrap_one = get_json(app.clone(), "/bootstrap?workspaceId=test-workspace-001").await;
+    assert!(
+        !bootstrap_one["timeline"]
+            .as_array()
+            .expect("workspace one timeline should be an array")
+            .iter()
+            .any(|entry| entry["message"] == "workspace two isolated message"),
+        "workspace one bootstrap must not include workspace two messages"
+    );
+
+    let bootstrap_two = get_json(
+        app.clone(),
+        &format!("/bootstrap?workspaceId={second_workspace_id}&sessionId={session_id}"),
+    )
+    .await;
+    assert_eq!(bootstrap_two["currentSession"]["sessionId"], session_id);
+    assert!(
+        bootstrap_two["timeline"]
+            .as_array()
+            .expect("workspace two timeline should be an array")
+            .iter()
+            .any(|entry| entry["message"] == "workspace two isolated message"),
+        "workspace two bootstrap should include its own message"
+    );
+
+    let workspace_two_durable =
+        fs::read_to_string(second_workspace_root.join(".magi").join("sessions.json"))
+            .expect("workspace two sessions state should persist");
+    assert!(workspace_two_durable.contains("request-workspace-two-isolated"));
+}
+
+#[tokio::test]
+async fn orchestrator_settings_save_stays_global_when_session_scope_is_supplied() {
+    let state_root = temp_state_root("e2e-orchestrator-global-settings");
+    let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root.clone());
+    let runtime =
+        DaemonRuntime::restore(&config).expect("runtime restore should bootstrap empty state");
+    let (app, _state) = runtime.router_with_state_for_tests("daemon-test".to_string());
+
+    let (status, body) = post_json(
+        app,
+        "/api/settings/orchestrator/save",
+        json!({
+            "config": {
+                "baseUrl": "https://api.example.com/v1",
+                "apiKey": "sk-real-test",
+                "model": "global-main-model",
+                "urlMode": "standard",
+                "sessionId": "session-scoped-should-not-save",
+                "workspaceId": "test-workspace-001"
+            }
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "orchestrator settings save should succeed: {body:?}"
+    );
+
+    let settings_payload =
+        fs::read_to_string(state_root.join("settings.json")).expect("settings should persist");
+    let settings_json: Value =
+        serde_json::from_str(&settings_payload).expect("settings should be valid json");
+    let orchestrator = settings_json
+        .get("orchestrator")
+        .or_else(|| settings_json.get("orchestratorConfig"))
+        .expect("orchestrator section should persist");
+    assert_eq!(orchestrator["model"], "global-main-model");
+    assert!(
+        !settings_payload.contains("__session__")
+            && !settings_payload.contains("session-scoped-should-not-save"),
+        "main model settings must remain global, not session-scoped"
+    );
+}
+
+#[tokio::test]
 async fn session_action_happy_path_creates_tasks_and_records_timeline_messages() {
     let state_root = temp_state_root("e2e-session-action-messages");
     let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
@@ -3044,7 +3367,7 @@ async fn unbound_session_continue_survives_runtime_restart() {
         .execution_runtime
         .worker_runtime()
         .clone();
-    let flush_report = RuntimeSidecarPersistence::new(
+    let _flush_report = RuntimeSidecarPersistence::new(
         repository.clone(),
         state.session_store.clone(),
         state.workspace_registry.clone(),
@@ -3052,7 +3375,16 @@ async fn unbound_session_continue_survives_runtime_restart() {
     )
     .flush_runtime_sidecars()
     .expect("runtime sidecars should flush");
-    assert!(flush_report.session_sidecars_flushed);
+    let persisted_sidecars = repository
+        .load_session_sidecars()
+        .expect("session sidecars should be persisted by checkpoint or explicit flush");
+    assert!(
+        persisted_sidecars
+            .runtime_sidecars
+            .iter()
+            .any(|sidecar| sidecar.session_id == session_id),
+        "session sidecar must be persisted even when checkpoint already flushed before explicit flush"
+    );
 
     let global_session_state = repository
         .load_session_durable_state()
