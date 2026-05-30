@@ -24,6 +24,7 @@ import type {
   FetchModelsRequestDto,
   FetchModelsResponseDto,
   FileContentResponseDto,
+  FilesystemBrowseResponseDto,
   FilesystemListResponseDto,
   HealthDto,
   KnowledgeMutationResponseDto,
@@ -519,15 +520,30 @@ export class RustDaemonClient {
   }
 
   public async fetchFilesystemList(
-    path?: string,
-    workspaceId?: string,
+    path: string | undefined,
+    workspaceId: string,
+    showHidden = false,
   ): Promise<FilesystemListResponseDto> {
     const params = new URLSearchParams();
     if (path) params.set('path', path);
     if (workspaceId) params.set('workspaceId', workspaceId);
+    if (showHidden) params.set('showHidden', '1');
     const qs = params.toString();
     return this.getJson<FilesystemListResponseDto>(
       `/api/filesystem/list${qs ? `?${qs}` : ''}`,
+    );
+  }
+
+  public async fetchFilesystemBrowse(
+    path?: string,
+    showHidden = false,
+  ): Promise<FilesystemBrowseResponseDto> {
+    const params = new URLSearchParams();
+    if (path) params.set('path', path);
+    if (showHidden) params.set('showHidden', '1');
+    const qs = params.toString();
+    return this.getJson<FilesystemBrowseResponseDto>(
+      `/api/filesystem/browse${qs ? `?${qs}` : ''}`,
     );
   }
 

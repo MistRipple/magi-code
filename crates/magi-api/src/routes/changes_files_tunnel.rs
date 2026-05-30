@@ -14,7 +14,7 @@ use magi_conversation_runtime::session_turn_execution::BUSINESS_MODEL_PROVIDER;
 use magi_conversation_runtime::task_execution_dispatcher::{RoleTarget, resolve_target_for_role};
 use magi_snapshot::SnapshotSession;
 
-use super::session_scope::parse_session_id;
+use super::session_scope::{parse_session_id, require_workspace_id};
 use crate::{
     change_projection::{
         SessionChangeScope, WorkspaceChangeScope, resolve_session_change_scope,
@@ -39,6 +39,7 @@ pub fn routes() -> Router<ApiState> {
         .route("/files/content", get(get_file_content))
         .route("/files/raw", get(get_file_raw))
         .route("/filesystem/list", get(list_filesystem))
+        .route("/filesystem/browse", get(browse_filesystem))
         .route("/tunnel/start", post(start_tunnel))
         .route("/tunnel/stop", post(stop_tunnel))
         .route("/tunnel/status", get(tunnel_status))
@@ -469,52 +470,125 @@ async fn get_file_raw(
 struct FilesystemListQuery {
     path: Option<String>,
     workspace_id: Option<String>,
+    #[serde(default)]
+    show_hidden: Option<String>,
+}
+
+fn show_hidden_enabled(value: Option<&str>) -> bool {
+    value
+        .map(str::trim)
+        .is_some_and(|value| matches!(value, "1" | "true" | "yes" | "on"))
+}
+
+fn canonical_directory_path(
+    path: PathBuf,
+    error_context: &'static str,
+) -> Result<PathBuf, ApiError> {
+    let canonical = path
+        .canonicalize()
+        .map_err(|e| ApiError::internal_assembly(error_context, e))?;
+    if !canonical.is_dir() {
+        return Err(ApiError::InvalidInput("路径不是目录".to_string()));
+    }
+    Ok(canonical)
+}
+
+fn read_directory_entries(
+    path: &Path,
+    show_hidden: bool,
+) -> Result<Vec<serde_json::Value>, ApiError> {
+    if !path.is_dir() {
+        return Err(ApiError::InvalidInput("路径不是目录".to_string()));
+    }
+    let entries = std::fs::read_dir(path)
+        .map_err(|e| ApiError::internal_assembly("读取目录失败", e))?
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            show_hidden
+                || !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .as_ref()
+                    .starts_with('.')
+        })
+        .map(|entry| {
+            let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            serde_json::json!({
+                "name": entry.file_name().to_string_lossy(),
+                "path": entry.path().to_string_lossy(),
+                "isDirectory": is_dir,
+            })
+        })
+        .collect();
+    Ok(entries)
+}
+
+fn directory_parent(path: &Path, boundary: Option<&Path>) -> String {
+    let parent = path
+        .parent()
+        .filter(|parent| boundary.is_none_or(|boundary| parent.starts_with(boundary)))
+        .unwrap_or(path);
+    parent.to_string_lossy().to_string()
 }
 
 async fn list_filesystem(
     State(state): State<ApiState>,
     Query(query): Query<FilesystemListQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let workspace_id = require_workspace_id(query.workspace_id.as_deref())?;
+    let scope = resolve_workspace_change_scope_or_active(&state, Some(workspace_id.as_str()))?;
+    let canonical_workspace_root =
+        canonical_directory_path(scope.workspace_root.clone(), "规范化工作区根目录失败")?;
     let path = match query
         .path
         .as_deref()
         .filter(|value| !value.trim().is_empty())
     {
-        Some(p) => {
-            let p_path = Path::new(p);
-            if p_path.is_absolute() {
-                p_path.to_path_buf()
-            } else {
-                let root = resolve_workspace_root_or_active(&state, query.workspace_id.as_deref())?;
-                root.join(safe_relative_path(p)?)
-            }
-        }
-        None => {
-            if let Ok(root) =
-                resolve_workspace_root_or_active(&state, query.workspace_id.as_deref())
-            {
-                root
-            } else {
-                let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
-                PathBuf::from(home)
-            }
-        }
+        Some(p) => safe_workspace_path(&scope.workspace_root, p)?.0,
+        None => canonical_workspace_root.clone(),
     };
-    let entries: Vec<serde_json::Value> = std::fs::read_dir(path)
-        .map(|dir| {
-            dir.filter_map(|e| e.ok())
-                .map(|e| {
-                    let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
-                    serde_json::json!({
-                        "name": e.file_name().to_string_lossy(),
-                        "path": e.path().to_string_lossy(),
-                        "isDirectory": is_dir,
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    Ok(Json(serde_json::json!({ "entries": entries })))
+    let path = canonical_directory_path(path, "规范化目录失败")?;
+    let show_hidden = show_hidden_enabled(query.show_hidden.as_deref());
+    let entries = read_directory_entries(&path, show_hidden)?;
+    Ok(Json(serde_json::json!({
+        "workspaceId": scope.workspace_id.as_str(),
+        "workspacePath": workspace_path_string(&scope.workspace_root),
+        "path": path.to_string_lossy(),
+        "parent": directory_parent(&path, Some(&canonical_workspace_root)),
+        "entries": entries,
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FilesystemBrowseQuery {
+    path: Option<String>,
+    #[serde(default)]
+    show_hidden: Option<String>,
+}
+
+async fn browse_filesystem(
+    Query(query): Query<FilesystemBrowseQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let raw_path = query
+        .path
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::var("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from("/"))
+        });
+    let path = canonical_directory_path(raw_path, "规范化目录失败")?;
+    let show_hidden = show_hidden_enabled(query.show_hidden.as_deref());
+    let entries = read_directory_entries(&path, show_hidden)?;
+    Ok(Json(serde_json::json!({
+        "path": path.to_string_lossy(),
+        "parent": directory_parent(&path, None),
+        "entries": entries,
+    })))
 }
 
 // ─── Tunnel ──────────────────────────────────────────────────────────────────
@@ -853,6 +927,13 @@ mod tests {
         state
     }
 
+    async fn read_json_response(response: axum::response::Response) -> serde_json::Value {
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should read");
+        serde_json::from_slice(&body).expect("payload should deserialize")
+    }
+
     /// 注册 workspace + session（可选 mission）。session 创建后立即在 SnapshotManager
     /// 中拉起 SnapshotSession，并完成首次 baseline 扫描；调用方随后做文件改动 + reconcile。
     async fn register_workspace_and_snapshot(
@@ -923,6 +1004,176 @@ mod tests {
                 .as_str()
                 .expect("url should be string")
                 .contains(":39219/web.html?workspaceId=workspace-lan-access")
+        );
+    }
+
+    #[tokio::test]
+    async fn filesystem_list_is_workspace_bound_and_filters_hidden_entries() {
+        let root = unique_temp_dir("magi-filesystem-list-bound");
+        fs::write(root.join("visible.txt"), "visible\n").expect("visible file should write");
+        fs::write(root.join(".hidden"), "hidden\n").expect("hidden file should write");
+        fs::create_dir_all(root.join("src")).expect("src dir should create");
+        let state = build_state_with_workspace_root(&root, "workspace-filesystem-list");
+
+        let response = routes()
+            .with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/filesystem/list?workspaceId=workspace-filesystem-list")
+                    .method("GET")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = read_json_response(response).await;
+        assert_eq!(payload["workspaceId"], "workspace-filesystem-list");
+        assert!(
+            payload["workspacePath"]
+                .as_str()
+                .is_some_and(|path| path.contains("magi-filesystem-list-bound")),
+            "filesystem payload must carry workspace path"
+        );
+        assert!(
+            payload["path"]
+                .as_str()
+                .is_some_and(|path| path.contains("magi-filesystem-list-bound")),
+            "filesystem payload must carry listed path"
+        );
+        let entries = payload["entries"].as_array().expect("entries array");
+        assert!(
+            entries.iter().any(|entry| entry["name"] == "visible.txt"),
+            "visible file should be listed"
+        );
+        assert!(
+            entries.iter().all(|entry| entry["name"] != ".hidden"),
+            "hidden file should be filtered by default"
+        );
+
+        let response = routes()
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/filesystem/list?workspaceId=workspace-filesystem-list&showHidden=1")
+                    .method("GET")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = read_json_response(response).await;
+        let entries = payload["entries"].as_array().expect("entries array");
+        assert!(
+            entries.iter().any(|entry| entry["name"] == ".hidden"),
+            "showHidden=1 should include hidden entries"
+        );
+    }
+
+    #[tokio::test]
+    async fn filesystem_list_rejects_missing_workspace_and_outside_path() {
+        let root = unique_temp_dir("magi-filesystem-list-secure");
+        let outside = unique_temp_dir("magi-filesystem-list-outside");
+        let state = build_state_with_workspace_root(&root, "workspace-filesystem-secure");
+
+        let response = routes()
+            .with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/filesystem/list")
+                    .method("GET")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let response = routes()
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/filesystem/list?workspaceId=workspace-filesystem-secure&path={}",
+                        outside.to_string_lossy()
+                    ))
+                    .method("GET")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn filesystem_browse_lists_picker_directory_without_workspace_scope() {
+        let root = unique_temp_dir("magi-filesystem-browse-picker");
+        fs::write(root.join("visible.txt"), "visible\n").expect("visible file should write");
+        fs::write(root.join(".hidden"), "hidden\n").expect("hidden file should write");
+        fs::create_dir_all(root.join("workspace-candidate"))
+            .expect("workspace candidate dir should create");
+        let state = build_state();
+
+        let response = routes()
+            .with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/filesystem/browse?path={}",
+                        root.to_string_lossy()
+                    ))
+                    .method("GET")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = read_json_response(response).await;
+        assert!(
+            payload["workspaceId"].is_null(),
+            "browse payload must not claim a workspace binding"
+        );
+        assert!(
+            payload["path"]
+                .as_str()
+                .is_some_and(|path| path.contains("magi-filesystem-browse-picker")),
+            "browse payload must carry listed path"
+        );
+        let entries = payload["entries"].as_array().expect("entries array");
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry["name"] == "workspace-candidate"),
+            "directory candidates should be listed"
+        );
+        assert!(
+            entries.iter().all(|entry| entry["name"] != ".hidden"),
+            "hidden entries should be filtered by default"
+        );
+
+        let response = routes()
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/filesystem/browse?path={}&showHidden=1",
+                        root.to_string_lossy()
+                    ))
+                    .method("GET")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = read_json_response(response).await;
+        let entries = payload["entries"].as_array().expect("entries array");
+        assert!(
+            entries.iter().any(|entry| entry["name"] == ".hidden"),
+            "showHidden=1 should include hidden entries"
         );
     }
 

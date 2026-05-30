@@ -59,7 +59,7 @@
     dirErrors = nextErrors;
 
     try {
-      const result = await listAgentDirectory(path, showHidden);
+      const result = await listAgentDirectory(path, showHidden, workspaceId);
       const entries = [...(result.entries ?? [])].sort(compareEntries);
       const nextCache = new Map(dirCache);
       nextCache.set(path, entries);

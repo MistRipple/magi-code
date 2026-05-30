@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { listAgentDirectory, type DirectoryEntry } from './agent-api';
+  import { browseAgentDirectory, type DirectoryEntry } from './agent-api';
   import Icon from '../components/Icon.svelte';
 
   interface Props {
@@ -35,7 +35,7 @@
     selectedPath = '';
 
     try {
-      const result = await listAgentDirectory(dirPath, showHidden);
+      const result = await browseAgentDirectory(dirPath, showHidden);
       if (token !== requestToken) {
         return;
       }

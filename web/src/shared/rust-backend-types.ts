@@ -1225,6 +1225,16 @@ export interface FilesystemEntryDto {
 }
 
 export interface FilesystemListResponseDto {
+  workspaceId: string;
+  workspacePath: string;
+  path: string;
+  parent: string;
+  entries: FilesystemEntryDto[];
+}
+
+export interface FilesystemBrowseResponseDto {
+  path: string;
+  parent: string;
   entries: FilesystemEntryDto[];
 }
 

@@ -859,7 +859,53 @@ export interface DirectoryListResult {
   error?: string;
 }
 
-export async function listAgentDirectory(dirPath?: string, showHidden?: boolean): Promise<DirectoryListResult> {
+export interface WorkspaceDirectoryListResult extends DirectoryListResult {
+  workspaceId: string;
+  workspacePath: string;
+}
+
+function throwNormalizedDirectoryError(error: unknown): never {
+  if (error instanceof TypeError) {
+    throw new Error(i18n.t('bridge.agentUnreachable'));
+  }
+  if (error instanceof AgentApiError) {
+    const message = error.message.trim();
+    if (message.includes('ENOENT')) {
+      throw new Error(i18n.t('bridge.dirNotFound'));
+    }
+    if (message.includes('EACCES') || message.includes('EPERM')) {
+      throw new Error(i18n.t('bridge.dirNoAccess'));
+    }
+  }
+  throw error;
+}
+
+export async function listAgentDirectory(
+  dirPath: string,
+  showHidden: boolean,
+  workspaceId: string,
+): Promise<WorkspaceDirectoryListResult> {
+  try {
+    const query = new URLSearchParams();
+    if (dirPath) {
+      query.set('path', dirPath);
+    }
+    query.set('workspaceId', workspaceId);
+    if (showHidden) {
+      query.set('showHidden', '1');
+    }
+    const qs = query.toString();
+    const response = await getTransport().request(agentUrl(`/api/filesystem/list${qs ? `?${qs}` : ''}`));
+    return await parseAgentJson<WorkspaceDirectoryListResult>(response, 'list directory');
+  } catch (error) {
+    throwNormalizedDirectoryError(error);
+  }
+}
+
+export async function browseAgentDirectory(
+  dirPath?: string,
+  showHidden = false,
+): Promise<DirectoryListResult> {
   try {
     const query = new URLSearchParams();
     if (dirPath) {
@@ -869,64 +915,10 @@ export async function listAgentDirectory(dirPath?: string, showHidden?: boolean)
       query.set('showHidden', '1');
     }
     const qs = query.toString();
-    const response = await getTransport().request(agentUrl(`/api/filesystem/list${qs ? `?${qs}` : ''}`));
-    const result = await parseAgentJson<DirectoryListResult>(response, 'list directory');
-    
-    // Fallback: Infer path if backend doesn't provide it
-    if (!result.path) {
-      if (dirPath) {
-        result.path = dirPath;
-      } else if (result.entries && result.entries.length > 0) {
-        const first = result.entries[0];
-        if (first.path.endsWith(first.name)) {
-          let p = first.path.slice(0, -first.name.length);
-          if (p.endsWith('/') && p.length > 1) p = p.slice(0, -1);
-          else if (p.endsWith('\\') && p.length > 3) p = p.slice(0, -1);
-          result.path = p;
-        }
-      } else {
-        result.path = '/';
-      }
-    }
-
-    // Fallback: Infer parent path
-    if (!result.parent && result.path) {
-      const parts = result.path.replace(/\\/g, '/').split('/').filter(Boolean);
-      if (parts.length > 0) {
-        parts.pop();
-        const parentPath = parts.join('/');
-        const isWindows = result.path.includes('\\') || /^[A-Za-z]:/.test(result.path);
-        if (isWindows) {
-          result.parent = parentPath ? parentPath.replace(/\//g, '\\') : result.path;
-          if (result.parent === '') result.parent = result.path;
-        } else {
-          result.parent = parentPath ? '/' + parentPath : '/';
-        }
-      } else {
-        result.parent = result.path;
-      }
-    }
-    
-    // Fallback: Filter hidden files in frontend since Rust backend currently ignores the showHidden parameter
-    if (!showHidden && result && result.entries) {
-      result.entries = result.entries.filter(e => !e.name.startsWith('.'));
-    }
-    
-    return result;
+    const response = await getTransport().request(agentUrl(`/api/filesystem/browse${qs ? `?${qs}` : ''}`));
+    return await parseAgentJson<DirectoryListResult>(response, 'browse directory');
   } catch (error) {
-    if (error instanceof TypeError) {
-      throw new Error(i18n.t('bridge.agentUnreachable'));
-    }
-    if (error instanceof AgentApiError) {
-      const message = error.message.trim();
-      if (message.includes('ENOENT')) {
-        throw new Error(i18n.t('bridge.dirNotFound'));
-      }
-      if (message.includes('EACCES') || message.includes('EPERM')) {
-        throw new Error(i18n.t('bridge.dirNoAccess'));
-      }
-    }
-    throw error;
+    throwNormalizedDirectoryError(error);
   }
 }
 
