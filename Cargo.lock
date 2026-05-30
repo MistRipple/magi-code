@@ -1127,6 +1127,7 @@ dependencies = [
  "magi-plan",
  "magi-session-store",
  "magi-skill-runtime",
+ "magi-snapshot",
  "magi-tool-runtime",
  "magi-worker-runtime",
  "magi-workspace",

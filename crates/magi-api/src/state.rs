@@ -43,7 +43,10 @@ use magi_orchestrator::{
 };
 use magi_session_store::{SessionLifecycleObserver, SessionRecord, SessionStore};
 use magi_snapshot::{SnapshotManager, SnapshotSession};
-use magi_tool_runtime::{ToolExecutionContext, ToolExecutionContextQuery, ToolRegistry};
+use magi_tool_runtime::{
+    RuntimeCapabilityDependencyEntry, RuntimeCapabilityDependencyProvider, ToolExecutionContext,
+    ToolExecutionContextQuery, ToolRegistry,
+};
 use magi_workspace::WorkspaceStore;
 use std::collections::HashMap;
 use std::fs;
@@ -614,6 +617,76 @@ fn temp_path_for(path: &Path) -> PathBuf {
     path.with_file_name(file_name)
 }
 
+pub fn build_file_snapshot_capability_dependency_provider(
+    snapshot_manager: Arc<SnapshotManager>,
+    workspace_registry: Arc<WorkspaceStore>,
+) -> RuntimeCapabilityDependencyProvider {
+    Arc::new(move |context| {
+        vec![file_snapshot_capability_dependency(
+            snapshot_manager.as_ref(),
+            workspace_registry.as_ref(),
+            context,
+        )]
+    })
+}
+
+fn file_snapshot_capability_dependency(
+    snapshot_manager: &SnapshotManager,
+    workspace_registry: &WorkspaceStore,
+    context: &ToolExecutionContext,
+) -> RuntimeCapabilityDependencyEntry {
+    let session_id = context.session_id.as_ref().map(ToString::to_string);
+    let workspace_id = context.workspace_id.as_ref().map(ToString::to_string);
+    let has_workspace_root = context
+        .workspace_id
+        .as_ref()
+        .and_then(|workspace_id| {
+            workspace_root_path_from_registry(workspace_registry, workspace_id)
+        })
+        .or_else(|| context.working_directory.clone())
+        .is_some();
+    let snapshot_active = session_id
+        .as_deref()
+        .is_some_and(|session_id| snapshot_manager.get_session(session_id).is_some());
+    let status = if session_id.is_none() || workspace_id.is_none() {
+        "missing_context"
+    } else if snapshot_active {
+        "ready"
+    } else if has_workspace_root {
+        "not_ready"
+    } else {
+        "unavailable"
+    };
+
+    RuntimeCapabilityDependencyEntry {
+        name: "file_snapshot".to_string(),
+        status: status.to_string(),
+        required_by: vec![
+            "changes/diff".to_string(),
+            "changes/approve".to_string(),
+            "changes/revert".to_string(),
+        ],
+        workspace_id,
+        session_id,
+        file_count: None,
+        last_indexed: None,
+        role_count: None,
+        spawnable_role_count: None,
+        snapshot_active: Some(snapshot_active),
+    }
+}
+
+fn workspace_root_path_from_registry(
+    workspace_registry: &WorkspaceStore,
+    workspace_id: &WorkspaceId,
+) -> Option<PathBuf> {
+    workspace_registry
+        .workspaces()
+        .into_iter()
+        .find(|workspace| workspace.workspace_id == *workspace_id)
+        .map(|workspace| PathBuf::from(workspace.root_path.as_str()))
+}
+
 fn canonicalize_path_for_workspace_match(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
@@ -784,6 +857,11 @@ impl ApiState {
         self
     }
 
+    pub fn with_snapshot_manager(mut self, snapshot_manager: Arc<SnapshotManager>) -> Self {
+        self.snapshot_manager = snapshot_manager;
+        self
+    }
+
     pub fn with_agent_role_registry(
         mut self,
         registry: Arc<magi_agent_role::AgentRoleRegistry>,
@@ -912,11 +990,7 @@ impl ApiState {
         workspace_id: &Option<WorkspaceId>,
     ) -> Option<PathBuf> {
         let workspace_id = workspace_id.as_ref()?;
-        self.workspace_registry
-            .workspaces()
-            .into_iter()
-            .find(|workspace| workspace.workspace_id == *workspace_id)
-            .map(|workspace| PathBuf::from(workspace.root_path.as_str()))
+        workspace_root_path_from_registry(self.workspace_registry.as_ref(), workspace_id)
     }
 
     pub(crate) fn resolve_workspace_id_from_request(
@@ -1096,7 +1170,7 @@ impl ApiState {
             "repositories": array_section(&snapshot, "repositories"),
             "mcpServers": array_section(&snapshot, "mcpServers"),
             "builtinTools": self.builtin_tools_json(&tool_catalog),
-            "capabilityDependencies": self.capability_dependencies_json(&tool_catalog, tool_context),
+            "capabilityDependencies": self.capability_dependencies_json(&tool_catalog),
             "workerStatuses": object_section(&snapshot, "workerStatuses"),
             "runtimeSettings": runtime_settings_from_snapshot(&snapshot),
             "roleTemplates": builtin_role_templates(),
@@ -1145,55 +1219,15 @@ impl ApiState {
         serde_json::Value::Array(tools)
     }
 
-    fn capability_dependencies_json(
-        &self,
-        tool_catalog: &serde_json::Value,
-        tool_context: &ToolExecutionContext,
-    ) -> serde_json::Value {
-        let mut dependencies = tool_catalog
+    fn capability_dependencies_json(&self, tool_catalog: &serde_json::Value) -> serde_json::Value {
+        let dependencies = tool_catalog
             .get("runtime_dependencies")
             .and_then(serde_json::Value::as_array)
             .into_iter()
             .flatten()
             .map(normalize_capability_dependency_json)
             .collect::<Vec<_>>();
-        dependencies.push(self.file_snapshot_dependency_json(tool_context));
         serde_json::Value::Array(dependencies)
-    }
-
-    fn file_snapshot_dependency_json(
-        &self,
-        tool_context: &ToolExecutionContext,
-    ) -> serde_json::Value {
-        let session_id = tool_context.session_id.as_ref().map(ToString::to_string);
-        let workspace_id = tool_context.workspace_id.as_ref().map(ToString::to_string);
-        let has_workspace_root = tool_context
-            .workspace_id
-            .as_ref()
-            .and_then(|workspace_id| self.workspace_root_path(&Some(workspace_id.clone())))
-            .or_else(|| tool_context.working_directory.clone())
-            .is_some();
-        let snapshot_active = session_id
-            .as_deref()
-            .is_some_and(|session_id| self.snapshot_manager.get_session(session_id).is_some());
-        let status = if session_id.is_none() || workspace_id.is_none() {
-            "missing_context"
-        } else if snapshot_active {
-            "ready"
-        } else if has_workspace_root {
-            "not_ready"
-        } else {
-            "unavailable"
-        };
-
-        serde_json::json!({
-            "name": "file_snapshot",
-            "status": status,
-            "workspaceId": workspace_id,
-            "sessionId": session_id,
-            "snapshotActive": snapshot_active,
-            "requiredBy": ["changes/diff", "changes/approve", "changes/revert"],
-        })
     }
 
     pub fn settings_runtime_json(&self) -> serde_json::Value {
@@ -1496,10 +1530,12 @@ fn normalize_capability_dependency_json(raw: &serde_json::Value) -> serde_json::
         "requiredBy": capability_dependency_field(raw, "requiredBy", "required_by")
             .unwrap_or_else(|| serde_json::json!([])),
         "workspaceId": capability_dependency_field(raw, "workspaceId", "workspace_id"),
+        "sessionId": capability_dependency_field(raw, "sessionId", "session_id"),
         "fileCount": capability_dependency_field(raw, "fileCount", "file_count"),
         "lastIndexed": capability_dependency_field(raw, "lastIndexed", "last_indexed"),
         "roleCount": capability_dependency_field(raw, "roleCount", "role_count"),
         "spawnableRoleCount": capability_dependency_field(raw, "spawnableRoleCount", "spawnable_role_count"),
+        "snapshotActive": capability_dependency_field(raw, "snapshotActive", "snapshot_active"),
     })
 }
 

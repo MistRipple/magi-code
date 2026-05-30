@@ -8,7 +8,7 @@ use super::{
 };
 use magi_api::{
     ApiError, ApiState, DirectHttpModelProbeConfig, RunnerManager, RuntimeStatePersistence,
-    SettingsStore, build_router,
+    SettingsStore, build_file_snapshot_capability_dependency_provider, build_router,
 };
 use magi_bridge_client::{
     BridgeDispatchRuntime, BridgeServerKind, BridgeTransport, HttpModelBridgeClient,
@@ -44,6 +44,7 @@ use magi_mission_metrics::MissionMetricsRegistry;
 use magi_orchestrator::{ExecutionContextConfig, OrchestratorService, task_store::TaskStore};
 use magi_session_store::{SessionExecutionSidecarStatus, SessionStore};
 use magi_skill_runtime::SkillDispatchRuntime;
+use magi_snapshot::SnapshotManager;
 use magi_tool_runtime::{
     AgentRoleCatalogEntry, AgentRoleCatalogProvider, ExternalMcpServerCatalogEntry,
     ExternalToolCatalogEntry, ExternalToolCatalogProvider, ExternalToolCatalogSnapshot,
@@ -665,10 +666,17 @@ impl DaemonRuntime {
         );
         let agent_role_catalog_provider =
             build_agent_role_catalog_provider(agent_role_registry.clone());
+        let snapshot_manager = Arc::new(SnapshotManager::new());
+        let runtime_capability_dependency_provider =
+            build_file_snapshot_capability_dependency_provider(
+                snapshot_manager.clone(),
+                self.workspace_store.clone(),
+            );
         let mut tool_registry = ToolRegistry::new(self.governance.clone(), self.event_bus.clone())
             .with_knowledge_store(self.knowledge_store.clone())
             .with_external_tool_catalog_provider(external_tool_catalog_provider)
-            .with_agent_role_catalog_provider(agent_role_catalog_provider);
+            .with_agent_role_catalog_provider(agent_role_catalog_provider)
+            .with_runtime_capability_dependency_provider(runtime_capability_dependency_provider);
         tool_registry.register_default_builtins();
 
         // 业务模型桥用于会话正文生成和任务执行；任务规划/分类另走本地 loopback-model。
@@ -858,6 +866,7 @@ impl DaemonRuntime {
         )
         .with_knowledge_store(self.knowledge_store.clone())
         .with_settings_store(settings_store.clone())
+        .with_snapshot_manager(snapshot_manager)
         .with_skill_runtime(app_skill_runtime.clone())
         .with_skill_dispatch_runtime(Arc::new(skill_runtime.clone()))
         .with_mcp_connections(mcp_connections)

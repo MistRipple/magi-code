@@ -1173,6 +1173,7 @@ mod tests {
     use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
     use magi_governance::GovernanceService;
     use magi_session_store::SessionStore;
+    use magi_snapshot::SnapshotManager;
     use magi_tool_runtime::ToolRegistry;
     use magi_workspace::WorkspaceStore;
     use std::sync::Arc;
@@ -1180,15 +1181,24 @@ mod tests {
     fn test_state() -> ApiState {
         let event_bus = Arc::new(InMemoryEventBus::new(32));
         let governance = Arc::new(GovernanceService::default());
-        let mut tool_registry = ToolRegistry::new(Arc::clone(&governance), Arc::clone(&event_bus));
+        let workspace_store = Arc::new(WorkspaceStore::default());
+        let snapshot_manager = Arc::new(SnapshotManager::new());
+        let runtime_capability_dependency_provider =
+            crate::state::build_file_snapshot_capability_dependency_provider(
+                snapshot_manager.clone(),
+                workspace_store.clone(),
+            );
+        let mut tool_registry = ToolRegistry::new(Arc::clone(&governance), Arc::clone(&event_bus))
+            .with_runtime_capability_dependency_provider(runtime_capability_dependency_provider);
         tool_registry.register_default_builtins();
         ApiState::new(
             "magi-test",
             event_bus,
             Arc::new(SessionStore::default()),
-            Arc::new(WorkspaceStore::default()),
+            workspace_store,
             governance,
         )
+        .with_snapshot_manager(snapshot_manager)
         .with_tool_registry(tool_registry)
     }
 

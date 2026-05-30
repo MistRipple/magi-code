@@ -182,7 +182,7 @@ pub(crate) fn build_tool_catalog_value(
         "internal_count": internal_count,
         "schema_warning_count": schema_warning_count,
         "runtime_warning_count": runtime_warning_count,
-        "runtime_dependencies": runtime_health.dependencies_json(),
+        "runtime_dependencies": runtime_health.dependencies_json(context, resources),
         "external_catalog_status": external_catalog_status,
         "skill_tool_count": skill_tool_count,
         "mcp_server_count": mcp_server_count,
@@ -344,29 +344,42 @@ impl RuntimeHealth {
         }
     }
 
-    fn dependencies_json(&self) -> serde_json::Value {
-        serde_json::json!([
-            {
+    fn dependencies_json(
+        &self,
+        context: &ToolExecutionContext,
+        resources: &ToolRuntimeResources,
+    ) -> serde_json::Value {
+        let mut dependencies = vec![
+            serde_json::json!({
                 "name": "knowledge_store",
                 "status": if self.knowledge_store_available { "available" } else { "unavailable" },
                 "required_by": ["knowledge_query", "search_semantic", "code_symbols"],
-            },
-            {
+            }),
+            serde_json::json!({
                 "name": "workspace_code_index",
                 "status": self.workspace_code_index_status(),
                 "workspace_id": self.workspace_id,
                 "file_count": self.workspace_code_index_file_count,
                 "last_indexed": self.workspace_code_index_last_indexed,
                 "required_by": ["search_semantic", "code_symbols"],
-            },
-            {
+            }),
+            serde_json::json!({
                 "name": "agent_role_registry",
                 "status": self.agent_role_registry_status(),
                 "role_count": self.agent_role_count,
                 "spawnable_role_count": self.spawnable_agent_role_count,
                 "required_by": ["agent_spawn", "agent_wait"],
-            }
-        ])
+            }),
+        ];
+
+        if let Some(provider) = &resources.runtime_capability_dependency_provider {
+            dependencies.extend(provider(context).into_iter().map(|entry| {
+                serde_json::to_value(entry)
+                    .expect("runtime capability dependency entry should serialize")
+            }));
+        }
+
+        serde_json::Value::Array(dependencies)
     }
 
     fn workspace_code_index_status(&self) -> &'static str {
@@ -510,6 +523,50 @@ mod tests {
 
         assert_eq!(process_launch["public"], false);
         assert_eq!(process_launch["parameters_schema"]["type"], "object");
+    }
+
+    #[test]
+    fn tool_catalog_includes_runtime_capability_dependency_provider_entries() {
+        let resources = ToolRuntimeResources {
+            runtime_capability_dependency_provider: Some(std::sync::Arc::new(|context| {
+                vec![crate::RuntimeCapabilityDependencyEntry {
+                    name: "file_snapshot".to_string(),
+                    status: if context.session_id.is_some() {
+                        "not_ready".to_string()
+                    } else {
+                        "missing_context".to_string()
+                    },
+                    required_by: vec!["changes/diff".to_string()],
+                    workspace_id: context.workspace_id.as_ref().map(ToString::to_string),
+                    session_id: context.session_id.as_ref().map(ToString::to_string),
+                    file_count: None,
+                    last_indexed: None,
+                    role_count: None,
+                    spawnable_role_count: None,
+                    snapshot_active: Some(false),
+                }]
+            })),
+            ..ToolRuntimeResources::default()
+        };
+        let context = ToolExecutionContext {
+            session_id: Some(magi_core::SessionId::new("session-tool-catalog")),
+            workspace_id: Some(magi_core::WorkspaceId::new("workspace-tool-catalog")),
+            ..ToolExecutionContext::default()
+        };
+
+        let output = execute_tool_catalog("{}", &context, &resources);
+        let payload: serde_json::Value = serde_json::from_str(&output).expect("json output");
+        let dependency = payload["runtime_dependencies"]
+            .as_array()
+            .expect("runtime dependencies")
+            .iter()
+            .find(|dependency| dependency["name"] == "file_snapshot")
+            .expect("provider dependency should be included");
+
+        assert_eq!(dependency["status"], "not_ready");
+        assert_eq!(dependency["workspace_id"], "workspace-tool-catalog");
+        assert_eq!(dependency["session_id"], "session-tool-catalog");
+        assert_eq!(dependency["snapshot_active"], false);
     }
 
     #[test]

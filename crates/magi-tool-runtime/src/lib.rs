@@ -1543,6 +1543,9 @@ pub type ExternalToolCatalogProvider =
     Arc<dyn Fn() -> ExternalToolCatalogSnapshot + Send + Sync + 'static>;
 pub type AgentRoleCatalogProvider =
     Arc<dyn Fn() -> Vec<AgentRoleCatalogEntry> + Send + Sync + 'static>;
+pub type RuntimeCapabilityDependencyProvider = Arc<
+    dyn Fn(&ToolExecutionContext) -> Vec<RuntimeCapabilityDependencyEntry> + Send + Sync + 'static,
+>;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ExternalToolCatalogSnapshot {
@@ -1587,11 +1590,34 @@ pub struct AgentRoleCatalogEntry {
     pub status: String,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RuntimeCapabilityDependencyEntry {
+    pub name: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_by: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_indexed: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawnable_role_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_active: Option<bool>,
+}
+
 #[derive(Clone, Default)]
 pub struct ToolRuntimeResources {
     pub knowledge_store: Option<Arc<magi_knowledge_store::KnowledgeStore>>,
     pub external_tool_catalog_provider: Option<ExternalToolCatalogProvider>,
     pub agent_role_catalog_provider: Option<AgentRoleCatalogProvider>,
+    pub runtime_capability_dependency_provider: Option<RuntimeCapabilityDependencyProvider>,
 }
 
 pub trait BuiltinTool: Send + Sync {
@@ -1646,6 +1672,15 @@ impl ToolRegistry {
 
     pub fn with_agent_role_catalog_provider(mut self, provider: AgentRoleCatalogProvider) -> Self {
         self.runtime_resources.agent_role_catalog_provider = Some(provider);
+        self
+    }
+
+    pub fn with_runtime_capability_dependency_provider(
+        mut self,
+        provider: RuntimeCapabilityDependencyProvider,
+    ) -> Self {
+        self.runtime_resources
+            .runtime_capability_dependency_provider = Some(provider);
         self
     }
 
