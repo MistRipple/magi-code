@@ -125,6 +125,10 @@ export interface BuiltinToolItem {
   riskLevel: string;
   approvalRequirement: string;
   accessMode: string;
+  runtimeStatus: string;
+  runtimeWarnings: string[];
+  schemaStatus: string;
+  schemaWarnings: string[];
   enabled: boolean;
 }
 
@@ -2271,6 +2275,14 @@ function createSettingsStore(props: { onClose?: () => void }) {
           riskLevel: typeof tool?.riskLevel === "string" ? tool.riskLevel : "",
           approvalRequirement: typeof tool?.approvalRequirement === "string" ? tool.approvalRequirement : "",
           accessMode: typeof tool?.accessMode === "string" ? tool.accessMode : "read_only",
+          runtimeStatus: typeof tool?.runtimeStatus === "string" ? tool.runtimeStatus : "ready",
+          runtimeWarnings: ensureArray<string>(tool?.runtimeWarnings)
+            .filter((warning): warning is string => typeof warning === "string" && warning.trim().length > 0)
+            .map((warning) => warning.trim()),
+          schemaStatus: typeof tool?.schemaStatus === "string" ? tool.schemaStatus : "ok",
+          schemaWarnings: ensureArray<string>(tool?.schemaWarnings)
+            .filter((warning): warning is string => typeof warning === "string" && warning.trim().length > 0)
+            .map((warning) => warning.trim()),
           enabled: tool?.enabled !== false,
         } satisfies BuiltinToolItem;
       })

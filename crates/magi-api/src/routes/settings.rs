@@ -4,7 +4,8 @@ use axum::{
     routing::{get, post},
 };
 use magi_bridge_client::HttpModelBridgeProtocol;
-use magi_core::UtcMillis;
+use magi_core::{SessionId, UtcMillis, WorkspaceId};
+use magi_tool_runtime::ToolExecutionContext;
 use magi_usage_authority::{
     SessionSummary, UsageAuthority, UsageCallRecordInput, UsageModelSnapshot, UsageTotals,
 };
@@ -632,7 +633,23 @@ async fn settings_bootstrap(
         .get("scope")
         .map(|value| value.trim())
         .is_none_or(|scope| scope != "core");
-    Json(state.settings_snapshot_json_with_mcp_hydration(hydrate_mcp_servers))
+    let tool_context = settings_bootstrap_tool_context(&query);
+    Json(
+        state.settings_snapshot_json_with_mcp_hydration_and_tool_context(
+            hydrate_mcp_servers,
+            &tool_context,
+        ),
+    )
+}
+
+fn settings_bootstrap_tool_context(query: &HashMap<String, String>) -> ToolExecutionContext {
+    ToolExecutionContext {
+        session_id: parse_optional_query_string(query, "sessionId", "session_id")
+            .map(SessionId::new),
+        workspace_id: parse_optional_query_string(query, "workspaceId", "workspace_id")
+            .map(WorkspaceId::new),
+        ..ToolExecutionContext::default()
+    }
 }
 
 async fn runtime_status(State(state): State<ApiState>) -> Json<serde_json::Value> {
@@ -1317,6 +1334,26 @@ mod tests {
                 .iter()
                 .any(|tool| tool["name"] == serde_json::json!("shell_exec")),
             "builtin tools should expose shell_exec"
+        );
+        let shell_exec = builtin_tools
+            .iter()
+            .find(|tool| tool["name"] == serde_json::json!("shell_exec"))
+            .expect("shell_exec should be exposed");
+        assert_eq!(shell_exec["runtimeStatus"], serde_json::json!("ready"));
+        let knowledge_query = builtin_tools
+            .iter()
+            .find(|tool| tool["name"] == serde_json::json!("knowledge_query"))
+            .expect("knowledge_query should be exposed");
+        assert_eq!(
+            knowledge_query["runtimeStatus"],
+            serde_json::json!("unavailable"),
+            "settings bootstrap must surface runtime health from tool_catalog"
+        );
+        assert!(
+            knowledge_query["runtimeWarnings"]
+                .as_array()
+                .is_some_and(|warnings| !warnings.is_empty()),
+            "unavailable builtin tools should include actionable runtime warnings"
         );
         assert!(
             builtin_tools

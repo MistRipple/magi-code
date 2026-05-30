@@ -43,7 +43,7 @@ use magi_orchestrator::{
 };
 use magi_session_store::{SessionLifecycleObserver, SessionRecord, SessionStore};
 use magi_snapshot::{SnapshotManager, SnapshotSession};
-use magi_tool_runtime::{ToolExecutionContextQuery, ToolRegistry};
+use magi_tool_runtime::{ToolExecutionContext, ToolExecutionContextQuery, ToolRegistry};
 use magi_workspace::WorkspaceStore;
 use std::collections::HashMap;
 use std::fs;
@@ -1086,6 +1086,17 @@ impl ApiState {
         &self,
         hydrate_mcp_servers: bool,
     ) -> serde_json::Value {
+        self.settings_snapshot_json_with_mcp_hydration_and_tool_context(
+            hydrate_mcp_servers,
+            &ToolExecutionContext::default(),
+        )
+    }
+
+    pub fn settings_snapshot_json_with_mcp_hydration_and_tool_context(
+        &self,
+        hydrate_mcp_servers: bool,
+        tool_context: &ToolExecutionContext,
+    ) -> serde_json::Value {
         let mut snapshot = self.settings_store.public_snapshot();
         normalize_settings_snapshot_sections(&mut snapshot);
         if hydrate_mcp_servers {
@@ -1100,7 +1111,7 @@ impl ApiState {
             "safeguardConfig": object_section(&snapshot, "safeguardConfig"),
             "repositories": array_section(&snapshot, "repositories"),
             "mcpServers": array_section(&snapshot, "mcpServers"),
-            "builtinTools": self.builtin_tools_json(),
+            "builtinTools": self.builtin_tools_json(tool_context),
             "workerStatuses": object_section(&snapshot, "workerStatuses"),
             "runtimeSettings": runtime_settings_from_snapshot(&snapshot),
             "roleTemplates": builtin_role_templates(),
@@ -1111,23 +1122,31 @@ impl ApiState {
         })
     }
 
-    fn builtin_tools_json(&self) -> serde_json::Value {
+    fn builtin_tools_json(&self, tool_context: &ToolExecutionContext) -> serde_json::Value {
         let Some(registry) = &self.tool_registry else {
             return serde_json::Value::Array(Vec::new());
         };
-        let tools = registry
-            .public_builtin_specs()
+        let catalog = registry.tool_catalog_value(
+            r#"{"includeExternal":false,"includeMcpServers":false,"includeAgentRoles":false}"#,
+            tool_context,
+        );
+        let tools = catalog
+            .get("tools")
+            .and_then(serde_json::Value::as_array)
             .into_iter()
-            .map(|spec| {
-                let access_mode = registry
-                    .builtin_access_mode(&spec.name)
-                    .map(|mode| mode.as_str())
-                    .unwrap_or("read_only");
+            .flatten()
+            .filter(|tool| tool.get("public").and_then(serde_json::Value::as_bool) == Some(true))
+            .into_iter()
+            .map(|tool| {
                 serde_json::json!({
-                    "name": spec.name,
-                    "riskLevel": spec.risk_level,
-                    "approvalRequirement": spec.approval_requirement,
-                    "accessMode": access_mode,
+                    "name": tool.get("name").cloned().unwrap_or(serde_json::Value::Null),
+                    "riskLevel": tool.get("risk_level").cloned().unwrap_or(serde_json::Value::String("low".to_string())),
+                    "approvalRequirement": tool.get("approval_requirement").cloned().unwrap_or(serde_json::Value::String("none".to_string())),
+                    "accessMode": tool.get("access_mode").cloned().unwrap_or(serde_json::Value::String("read_only".to_string())),
+                    "runtimeStatus": tool.get("runtime_status").cloned().unwrap_or(serde_json::Value::String("ready".to_string())),
+                    "runtimeWarnings": tool.get("runtime_warnings").cloned().unwrap_or_else(|| serde_json::json!([])),
+                    "schemaStatus": tool.get("schema_status").cloned().unwrap_or(serde_json::Value::String("ok".to_string())),
+                    "schemaWarnings": tool.get("schema_warnings").cloned().unwrap_or_else(|| serde_json::json!([])),
                     "enabled": true,
                 })
             })

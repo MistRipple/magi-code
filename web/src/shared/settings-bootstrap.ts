@@ -20,6 +20,10 @@ export interface SettingsBuiltinTool {
   riskLevel?: string;
   approvalRequirement?: string;
   accessMode?: 'read_only' | 'maybe_write' | 'explicit_write' | string;
+  runtimeStatus?: string;
+  runtimeWarnings?: string[];
+  schemaStatus?: string;
+  schemaWarnings?: string[];
   enabled?: boolean;
 }
 

@@ -1691,6 +1691,14 @@ impl ToolRegistry {
             .collect()
     }
 
+    pub fn tool_catalog_value(
+        &self,
+        input: &str,
+        context: &ToolExecutionContext,
+    ) -> serde_json::Value {
+        tool_catalog::build_tool_catalog_value(input, context, &self.runtime_resources)
+    }
+
     pub fn builtin_access_mode(&self, tool_name: &str) -> Option<BuiltinToolAccessMode> {
         self.builtin_tools
             .get(tool_name)

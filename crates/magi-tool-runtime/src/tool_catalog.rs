@@ -8,6 +8,14 @@ pub(crate) fn execute_tool_catalog(
     context: &ToolExecutionContext,
     resources: &ToolRuntimeResources,
 ) -> String {
+    build_tool_catalog_value(input, context, resources).to_string()
+}
+
+pub(crate) fn build_tool_catalog_value(
+    input: &str,
+    context: &ToolExecutionContext,
+    resources: &ToolRuntimeResources,
+) -> serde_json::Value {
     let request = serde_json::from_str::<serde_json::Value>(input).ok();
     let include_internal = request
         .as_ref()
@@ -199,7 +207,6 @@ pub(crate) fn execute_tool_catalog(
             serde_json::json!([])
         },
     })
-    .to_string()
 }
 
 struct RuntimeHealth {

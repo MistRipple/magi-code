@@ -33,6 +33,10 @@
       riskLevel: string;
       approvalRequirement: string;
       accessMode: string;
+      runtimeStatus: string;
+      runtimeWarnings: string[];
+      schemaStatus: string;
+      schemaWarnings: string[];
       enabled: boolean;
     }>;
     skills: any[];
@@ -92,6 +96,46 @@
       default:
         return riskLevel || i18n.t('settings.tools.unknown');
     }
+  }
+
+  function getBuiltinToolRuntimeLabel(status: string): string {
+    switch (status) {
+      case 'ready':
+        return i18n.t('settings.tools.runtimeReady');
+      case 'not_ready':
+        return i18n.t('settings.tools.runtimeNotReady');
+      case 'missing_context':
+        return i18n.t('settings.tools.runtimeMissingContext');
+      case 'unavailable':
+        return i18n.t('settings.tools.runtimeUnavailable');
+      default:
+        return status || i18n.t('settings.tools.unknown');
+    }
+  }
+
+  function getBuiltinToolRuntimeClass(status: string): string {
+    switch (status) {
+      case 'ready':
+        return 'success';
+      case 'not_ready':
+      case 'missing_context':
+        return 'warning';
+      case 'unavailable':
+        return 'error';
+      default:
+        return 'disabled';
+    }
+  }
+
+  function getBuiltinToolRuntimeTitle(tool: {
+    runtimeStatus: string;
+    runtimeWarnings: string[];
+    schemaWarnings: string[];
+  }): string {
+    const parts = [getBuiltinToolRuntimeLabel(tool.runtimeStatus)];
+    if (tool.runtimeWarnings.length > 0) parts.push(...tool.runtimeWarnings);
+    if (tool.schemaWarnings.length > 0) parts.push(...tool.schemaWarnings);
+    return parts.join('\n');
   }
 
   let builtinExpanded = $state(false);
@@ -185,7 +229,13 @@
                       <div class="builtin-tool-badges">
                         <span class="tool-badge">{getBuiltinToolAccessLabel(tool.accessMode)}</span>
                         <span class="tool-badge" class:tool-badge--risk={tool.riskLevel.toLowerCase() === 'high'}>{getBuiltinToolRiskLabel(tool.riskLevel)}</span>
-                        <span class="apple-indicator" class:success={tool.enabled} title={tool.enabled ? i18n.t('settings.tools.enabled') : i18n.t('settings.tools.disabledLabel')}></span>
+                        <span class="tool-runtime-status">
+                          {getBuiltinToolRuntimeLabel(tool.runtimeStatus)}
+                        </span>
+                        <span
+                          class={`apple-indicator ${getBuiltinToolRuntimeClass(tool.runtimeStatus)}`}
+                          title={getBuiltinToolRuntimeTitle(tool)}
+                        ></span>
                       </div>
                     </div>
                   {/each}
@@ -552,6 +602,12 @@
   .tool-badge--risk {
     color: var(--warning, #b7791f);
     background: rgba(181, 118, 20, 0.12);
+  }
+
+  .tool-runtime-status {
+    font-size: 10px;
+    color: var(--foreground-muted);
+    white-space: nowrap;
   }
 
   .mcp-tools-popover {
