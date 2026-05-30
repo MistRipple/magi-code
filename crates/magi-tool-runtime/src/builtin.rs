@@ -120,7 +120,7 @@ impl BuiltinTool for NormalizedBuiltinTool {
             BuiltinToolName::DiagramRender => execute_diagram_render(input),
             BuiltinToolName::KnowledgeQuery => execute_knowledge_query(input, context, resources),
             BuiltinToolName::CodeSymbols => execute_code_symbols(input, context, resources),
-            BuiltinToolName::ToolCatalog => execute_tool_catalog(input, context),
+            BuiltinToolName::ToolCatalog => execute_tool_catalog(input, context, resources),
             BuiltinToolName::AgentSpawn
             | BuiltinToolName::AgentWait
             | BuiltinToolName::TodoWrite

@@ -1517,6 +1517,11 @@ fn execute_task_tool_call(
             &tool_skill_name,
             &binding_id,
             skill_name,
+            task.policy_snapshot
+                .as_ref()
+                .map(|policy| policy.access_profile)
+                .unwrap_or_default(),
+            safety_gate,
             skill_runtime,
             skill_dispatch_runtime,
             ToolExecutionContext {

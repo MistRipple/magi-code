@@ -100,6 +100,7 @@ pub enum SkillDispatchRoute {
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SkillDispatchStatus {
     Succeeded,
+    NeedsApproval,
     Failed,
     Rejected,
 }
@@ -127,6 +128,7 @@ pub struct SkillDispatchInput {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum SkillDispatchResult {
     Builtin { output: ToolExecutionOutput },
+    Preflight { output: ToolExecutionOutput },
     Bridge { output: BridgeDispatchResult },
 }
 
@@ -444,7 +446,7 @@ mod tests {
     };
     use std::{
         path::PathBuf,
-        sync::Arc,
+        sync::{Arc, Mutex},
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -545,6 +547,11 @@ mod tests {
     #[derive(Clone, Debug, Default)]
     struct FailingModelClient;
 
+    #[derive(Clone, Debug, Default)]
+    struct TestMcpClient {
+        calls: Arc<Mutex<Vec<magi_bridge_client::McpToolCallRequest>>>,
+    }
+
     impl magi_bridge_client::ModelBridgeClient for FailingModelClient {
         fn invoke(
             &self,
@@ -565,6 +572,28 @@ mod tests {
         ) -> Result<magi_bridge_client::BridgeResponse, magi_bridge_client::BridgeClientError>
         {
             self.invoke(request)
+        }
+    }
+
+    impl magi_bridge_client::McpBridgeClient for TestMcpClient {
+        fn call_tool(
+            &self,
+            request: magi_bridge_client::McpToolCallRequest,
+        ) -> Result<magi_bridge_client::BridgeResponse, magi_bridge_client::BridgeClientError>
+        {
+            self.calls
+                .lock()
+                .expect("test mcp calls lock poisoned")
+                .push(request.clone());
+            Ok(magi_bridge_client::BridgeResponse {
+                ok: true,
+                payload: serde_json::json!({
+                    "server": request.server_name,
+                    "tool": request.tool_name,
+                    "input": request.input,
+                })
+                .to_string(),
+            })
         }
     }
 
@@ -711,7 +740,10 @@ mod tests {
             },
         );
 
-        assert_eq!(outcome.observation.status, SkillDispatchStatus::Rejected);
+        assert_eq!(
+            outcome.observation.status,
+            SkillDispatchStatus::NeedsApproval
+        );
         assert!(matches!(
             outcome.result,
             Ok(SkillDispatchResult::Builtin { ref output })
@@ -825,6 +857,158 @@ mod tests {
             Ok(SkillDispatchResult::Bridge { ref output })
                 if output.response.ok && output.response.payload == "model:hello"
         ));
+    }
+
+    #[test]
+    fn mcp_bridge_requests_require_approval_in_restricted_profile() {
+        let governance = Arc::new(GovernanceService::default());
+        let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(16));
+        let mut tool_registry = ToolRegistry::new(Arc::clone(&governance), Arc::clone(&event_bus));
+        tool_registry.register_builtin(Arc::new(EchoTool));
+
+        let skill_registry = SkillRegistry::new();
+        skill_registry.register(SkillDefinition {
+            skill_id: "skill-mcp".to_string(),
+            title: "MCP Skill".to_string(),
+            instruction: "instruction".to_string(),
+            metadata: SkillMetadata {
+                category: "general".to_string(),
+                tags: vec!["mcp".to_string()],
+            },
+            allowed_tools: vec![],
+            custom_tool_bindings: vec![CustomToolBinding {
+                binding_id: "binding-mcp".to_string(),
+                tool_name: "echo.inspect".to_string(),
+                description: "inspect".to_string(),
+                bridge_kind: BridgeBindingKind::Mcp,
+                dispatch_action: BridgeDispatchAction::McpToolCall,
+                bridge_target: "loopback-mcp".to_string(),
+            }],
+            prompt_priority: 10,
+        });
+
+        let mcp_client = TestMcpClient::default();
+        let calls = mcp_client.calls.clone();
+        let runtime = SkillDispatchRuntime::new(
+            tool_registry.clone(),
+            BridgeDispatchRuntime::new().with_mcp_client(Arc::new(mcp_client)),
+        );
+        let plan = skill_registry.build_tool_runtime_plan(&SkillSelection {
+            skill_ids: vec!["skill-mcp".to_string()],
+            requested_tools: vec!["echo.inspect".to_string()],
+        });
+
+        let outcome = runtime.dispatch_observed(
+            &plan,
+            SkillDispatchInput {
+                tool_call_id: ToolCallId::new("call-mcp-restricted"),
+                tool_name: "echo.inspect".to_string(),
+                binding_id: Some("binding-mcp".to_string()),
+                payload: "payload".to_string(),
+                approval_requirement: ApprovalRequirement::None,
+                risk_level: RiskLevel::Low,
+                context: ToolExecutionContext::default(),
+                working_directory: None,
+            },
+        );
+
+        assert_eq!(
+            outcome.observation.status,
+            SkillDispatchStatus::NeedsApproval
+        );
+        let output = match outcome.result {
+            Ok(SkillDispatchResult::Preflight { output }) => output,
+            other => panic!("unexpected result: {other:?}"),
+        };
+        assert_eq!(
+            output.status,
+            magi_core::ExecutionResultStatus::NeedsApproval
+        );
+        assert!(calls.lock().expect("mcp calls lock").is_empty());
+        let invocations = tool_registry.invocations();
+        assert_eq!(invocations.len(), 1);
+        assert_eq!(invocations[0].tool_kind, magi_governance::ToolKind::Mcp);
+        assert_eq!(
+            invocations[0].status,
+            magi_core::ExecutionResultStatus::NeedsApproval
+        );
+        let audit_events = event_bus
+            .snapshot()
+            .recent_events
+            .into_iter()
+            .filter(|event| event.event_type == "tool.invoked")
+            .collect::<Vec<_>>();
+        assert_eq!(audit_events.len(), 1);
+        assert_eq!(audit_events[0].payload["tool_kind"], "Mcp");
+    }
+
+    #[test]
+    fn mcp_bridge_requests_execute_in_full_access_profile() {
+        let governance = Arc::new(GovernanceService::default());
+        let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(16));
+        let mut tool_registry = ToolRegistry::new(Arc::clone(&governance), Arc::clone(&event_bus));
+        tool_registry.register_builtin(Arc::new(EchoTool));
+
+        let skill_registry = SkillRegistry::new();
+        skill_registry.register(SkillDefinition {
+            skill_id: "skill-mcp-full".to_string(),
+            title: "MCP Full Skill".to_string(),
+            instruction: "instruction".to_string(),
+            metadata: SkillMetadata {
+                category: "general".to_string(),
+                tags: vec!["mcp".to_string()],
+            },
+            allowed_tools: vec![],
+            custom_tool_bindings: vec![CustomToolBinding {
+                binding_id: "binding-mcp-full".to_string(),
+                tool_name: "echo.inspect".to_string(),
+                description: "inspect".to_string(),
+                bridge_kind: BridgeBindingKind::Mcp,
+                dispatch_action: BridgeDispatchAction::McpToolCall,
+                bridge_target: "loopback-mcp".to_string(),
+            }],
+            prompt_priority: 10,
+        });
+
+        let mcp_client = TestMcpClient::default();
+        let calls = mcp_client.calls.clone();
+        let runtime = SkillDispatchRuntime::new(
+            tool_registry.clone(),
+            BridgeDispatchRuntime::new().with_mcp_client(Arc::new(mcp_client)),
+        );
+        let mut plan = skill_registry.build_tool_runtime_plan(&SkillSelection {
+            skill_ids: vec!["skill-mcp-full".to_string()],
+            requested_tools: vec!["echo.inspect".to_string()],
+        });
+        plan.tool_policy.access_profile = magi_core::AccessProfile::FullAccess;
+
+        let outcome = runtime.dispatch_observed(
+            &plan,
+            SkillDispatchInput {
+                tool_call_id: ToolCallId::new("call-mcp-full"),
+                tool_name: "echo.inspect".to_string(),
+                binding_id: Some("binding-mcp-full".to_string()),
+                payload: "payload".to_string(),
+                approval_requirement: ApprovalRequirement::None,
+                risk_level: RiskLevel::Low,
+                context: ToolExecutionContext::default(),
+                working_directory: None,
+            },
+        );
+
+        assert_eq!(outcome.observation.status, SkillDispatchStatus::Succeeded);
+        assert!(matches!(
+            outcome.result,
+            Ok(SkillDispatchResult::Bridge { ref output }) if output.response.ok
+        ));
+        assert_eq!(calls.lock().expect("mcp calls lock").len(), 1);
+        let invocations = tool_registry.invocations();
+        assert_eq!(invocations.len(), 1);
+        assert_eq!(invocations[0].tool_kind, magi_governance::ToolKind::Mcp);
+        assert_eq!(
+            invocations[0].status,
+            magi_core::ExecutionResultStatus::Succeeded
+        );
     }
 
     #[test]
@@ -1305,7 +1489,7 @@ mod tests {
             SkillDispatchStatus::Rejected
         );
 
-        // Verify event bus: 1 builtin dispatch should produce audit+usage events
+        // Verify event bus: builtin and bridge dispatch both produce audit events.
         let snapshot = event_bus.snapshot();
         let audit_count = snapshot
             .recent_events
@@ -1314,7 +1498,10 @@ mod tests {
                 e.category == magi_event_bus::EventCategory::Audit && e.event_type == "tool.invoked"
             })
             .count();
-        assert_eq!(audit_count, 1, "only builtin dispatches emit tool.invoked");
+        assert_eq!(
+            audit_count, 2,
+            "builtin and bridge dispatches emit tool.invoked"
+        );
     }
 
     #[test]

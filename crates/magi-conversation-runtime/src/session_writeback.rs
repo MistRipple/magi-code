@@ -925,6 +925,8 @@ fn execute_session_turn_tool_call(
             &tool_skill_name,
             &binding_id,
             skill_name,
+            access_profile,
+            safety_gate,
             skill_runtime,
             skill_dispatch_runtime,
             ToolExecutionContext {
@@ -1352,7 +1354,7 @@ mod tests {
             &SessionId::new("session-1"),
             &None,
             None,
-            magi_core::AccessProfile::Restricted,
+            magi_core::AccessProfile::FullAccess,
         );
 
         assert_eq!(status, ExecutionResultStatus::Succeeded);
@@ -1366,6 +1368,146 @@ mod tests {
         assert_eq!(recorded[0].tool_name, "echo.describe");
         assert_eq!(recorded[0].input, "hello mcp");
         assert_eq!(event_bus.snapshot().recent_events.len(), 1);
+    }
+
+    #[test]
+    fn restricted_mcp_skill_binding_requires_approval() {
+        let registry = SkillRegistry::new();
+        registry.register(SkillDefinition {
+            skill_id: "code-review".to_string(),
+            title: "代码审查".to_string(),
+            instruction: "检查稳定性风险。".to_string(),
+            metadata: magi_skill_runtime::SkillMetadata {
+                category: "quality".to_string(),
+                tags: vec!["review".to_string()],
+            },
+            allowed_tools: vec![],
+            custom_tool_bindings: vec![magi_skill_runtime::CustomToolBinding {
+                binding_id: "review-mcp".to_string(),
+                tool_name: "echo.describe".to_string(),
+                description: "回显描述".to_string(),
+                bridge_kind: BridgeBindingKind::Mcp,
+                dispatch_action: BridgeDispatchAction::McpToolCall,
+                bridge_target: "loopback-mcp".to_string(),
+            }],
+            prompt_priority: 50,
+        });
+        let skill_runtime = SkillRuntime::new(registry);
+        let tool_registry = magi_tool_runtime::ToolRegistry::new(
+            Arc::new(GovernanceService::default()),
+            Arc::new(magi_event_bus::InMemoryEventBus::new(8)),
+        );
+        let mcp_client = RecordingMcpClient::default();
+        let mcp_calls = mcp_client.calls.clone();
+        let skill_dispatch_runtime = SkillDispatchRuntime::new(
+            tool_registry.clone(),
+            BridgeDispatchRuntime::new().with_mcp_client(Arc::new(mcp_client)),
+        );
+        let event_bus = InMemoryEventBus::new(8);
+        let call = ChatToolCall {
+            id: "tool-call-mcp-restricted".to_string(),
+            kind: "function".to_string(),
+            function: ChatToolFunction {
+                name: "skill__code-review__review-mcp".to_string(),
+                arguments: serde_json::json!({ "payload": "hello mcp" }).to_string(),
+            },
+        };
+
+        let (payload, status) = execute_session_turn_tool_call(
+            &event_bus,
+            Some(&tool_registry),
+            Some(&skill_runtime),
+            Some(&skill_dispatch_runtime),
+            Some("code-review"),
+            None,
+            &call,
+            &SessionId::new("session-1"),
+            &None,
+            None,
+            magi_core::AccessProfile::Restricted,
+        );
+
+        assert_eq!(status, ExecutionResultStatus::NeedsApproval);
+        let parsed: serde_json::Value = serde_json::from_str(&payload).expect("payload json");
+        assert_eq!(parsed["status"], "needs_approval");
+        assert_eq!(parsed["tool"], "echo.describe");
+        assert_eq!(parsed["bridge_kind"], "Mcp");
+        assert!(mcp_calls.lock().expect("mcp calls lock").is_empty());
+        let invocations = tool_registry.invocations();
+        assert_eq!(invocations.len(), 1);
+        assert_eq!(invocations[0].tool_kind, magi_governance::ToolKind::Mcp);
+        assert_eq!(invocations[0].status, ExecutionResultStatus::NeedsApproval);
+    }
+
+    #[test]
+    fn execute_session_turn_tool_call_applies_safety_gate_to_mcp_skill_payload() {
+        let registry = SkillRegistry::new();
+        registry.register(SkillDefinition {
+            skill_id: "shell-mcp".to_string(),
+            title: "Shell MCP".to_string(),
+            instruction: "调用外接 shell 能力。".to_string(),
+            metadata: magi_skill_runtime::SkillMetadata {
+                category: "ops".to_string(),
+                tags: vec!["mcp".to_string()],
+            },
+            allowed_tools: vec![],
+            custom_tool_bindings: vec![magi_skill_runtime::CustomToolBinding {
+                binding_id: "shell-mcp-binding".to_string(),
+                tool_name: "shell.run".to_string(),
+                description: "运行 shell".to_string(),
+                bridge_kind: BridgeBindingKind::Mcp,
+                dispatch_action: BridgeDispatchAction::McpToolCall,
+                bridge_target: "loopback-mcp".to_string(),
+            }],
+            prompt_priority: 50,
+        });
+        let skill_runtime = SkillRuntime::new(registry);
+        let tool_registry = magi_tool_runtime::ToolRegistry::new(
+            Arc::new(GovernanceService::default()),
+            Arc::new(magi_event_bus::InMemoryEventBus::new(8)),
+        );
+        let mcp_client = RecordingMcpClient::default();
+        let mcp_calls = mcp_client.calls.clone();
+        let skill_dispatch_runtime = SkillDispatchRuntime::new(
+            tool_registry.clone(),
+            BridgeDispatchRuntime::new().with_mcp_client(Arc::new(mcp_client)),
+        );
+        let safety_gate =
+            magi_safety_gate::SafetyGate::new(vec![magi_safety_gate::SafetyRule::with_action(
+                "rm -rf",
+                magi_safety_gate::SafetyCategory::BulkDelete,
+                magi_safety_gate::SafetyAction::HardBlock,
+            )]);
+        let event_bus = InMemoryEventBus::new(8);
+        let call = ChatToolCall {
+            id: "tool-call-mcp-safety".to_string(),
+            kind: "function".to_string(),
+            function: ChatToolFunction {
+                name: "skill__shell-mcp__shell-mcp-binding".to_string(),
+                arguments: serde_json::json!({ "payload": r#"{"command":"rm -rf /tmp/demo"}"# })
+                    .to_string(),
+            },
+        };
+
+        let (payload, status) = execute_session_turn_tool_call(
+            &event_bus,
+            Some(&tool_registry),
+            Some(&skill_runtime),
+            Some(&skill_dispatch_runtime),
+            Some("shell-mcp"),
+            Some(&safety_gate),
+            &call,
+            &SessionId::new("session-1"),
+            &None,
+            None,
+            magi_core::AccessProfile::FullAccess,
+        );
+
+        assert_eq!(status, ExecutionResultStatus::Rejected);
+        let parsed: serde_json::Value = serde_json::from_str(&payload).expect("payload json");
+        assert_eq!(parsed["status"], "rejected");
+        assert_eq!(parsed["safety_gate"]["action"], "hard_block");
+        assert!(mcp_calls.lock().expect("mcp calls lock").is_empty());
     }
 
     #[test]

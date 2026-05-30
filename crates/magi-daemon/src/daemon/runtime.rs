@@ -44,14 +44,151 @@ use magi_mission_metrics::MissionMetricsRegistry;
 use magi_orchestrator::{ExecutionContextConfig, OrchestratorService, task_store::TaskStore};
 use magi_session_store::{SessionExecutionSidecarStatus, SessionStore};
 use magi_skill_runtime::SkillDispatchRuntime;
-use magi_tool_runtime::ToolRegistry;
+use magi_tool_runtime::{
+    ExternalMcpServerCatalogEntry, ExternalToolCatalogEntry, ExternalToolCatalogProvider,
+    ExternalToolCatalogSnapshot, ToolRegistry,
+};
 use magi_worker_runtime::WorkerRuntime;
 use magi_workspace::WorkspaceStore;
-use std::{collections::HashSet, env, path::PathBuf, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    env,
+    path::PathBuf,
+    sync::{Arc, RwLock},
+};
 use tracing::warn;
 
 #[cfg(test)]
 struct StaticTestModelBridgeClient;
+
+fn build_external_tool_catalog_provider(
+    settings_store: Arc<SettingsStore>,
+    skill_runtime: Arc<magi_skill_runtime::SkillRuntime>,
+    mcp_connections: Arc<RwLock<HashMap<String, Arc<StdioMcpBridgeClient>>>>,
+) -> ExternalToolCatalogProvider {
+    Arc::new(move || {
+        let mut skill_tools = Vec::new();
+        for skill in skill_runtime.registry().list() {
+            for binding in skill.custom_tool_bindings {
+                let (access_profile_behavior, risk_level, approval_requirement) =
+                    external_binding_policy_labels(binding.bridge_kind);
+                let status = if binding.tool_name.trim().is_empty()
+                    || binding.binding_id.trim().is_empty()
+                    || binding.bridge_target.trim().is_empty()
+                {
+                    "invalid"
+                } else {
+                    "available"
+                };
+                skill_tools.push(ExternalToolCatalogEntry {
+                    source: "skill".to_string(),
+                    skill_id: Some(skill.skill_id.clone()),
+                    binding_id: Some(binding.binding_id),
+                    name: binding.tool_name,
+                    description: binding.description,
+                    bridge_kind: format!("{:?}", binding.bridge_kind),
+                    dispatch_action: format!("{:?}", binding.dispatch_action),
+                    bridge_target: binding.bridge_target,
+                    access_profile_behavior: access_profile_behavior.to_string(),
+                    risk_level: risk_level.to_string(),
+                    approval_requirement: approval_requirement.to_string(),
+                    status: status.to_string(),
+                });
+            }
+        }
+        skill_tools.sort_by(|left, right| {
+            left.skill_id
+                .cmp(&right.skill_id)
+                .then_with(|| left.name.cmp(&right.name))
+                .then_with(|| left.binding_id.cmp(&right.binding_id))
+        });
+
+        let settings_snapshot = settings_store.public_snapshot();
+        let mcp_servers = settings_snapshot
+            .get("mcpServers")
+            .and_then(serde_json::Value::as_array)
+            .map(|servers| {
+                servers
+                    .iter()
+                    .filter_map(|entry| external_mcp_server_catalog_entry(entry, &mcp_connections))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        ExternalToolCatalogSnapshot {
+            skill_tools,
+            mcp_servers,
+        }
+    })
+}
+
+fn external_binding_policy_labels(
+    bridge_kind: magi_bridge_client::BridgeBindingKind,
+) -> (&'static str, &'static str, &'static str) {
+    match bridge_kind {
+        magi_bridge_client::BridgeBindingKind::Mcp => {
+            ("restricted_requires_approval", "high", "required")
+        }
+        magi_bridge_client::BridgeBindingKind::Model => ("access_profile_inherited", "low", "none"),
+    }
+}
+
+fn external_mcp_server_catalog_entry(
+    entry: &serde_json::Value,
+    mcp_connections: &Arc<RwLock<HashMap<String, Arc<StdioMcpBridgeClient>>>>,
+) -> Option<ExternalMcpServerCatalogEntry> {
+    let server_id = read_json_string(entry, &["id", "serverId", "name"])?;
+    let name =
+        read_json_string(entry, &["name", "serverName"]).unwrap_or_else(|| server_id.clone());
+    let enabled = entry
+        .get("enabled")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
+    let connected_client = {
+        let pool = mcp_connections
+            .read()
+            .expect("mcp connections read lock poisoned");
+        pool.get(&server_id).cloned()
+    };
+    let connected = connected_client.is_some();
+    let tool_count = connected_client
+        .as_ref()
+        .and_then(|client| client.list_tools().ok().map(|tools| tools.len()))
+        .or_else(|| {
+            entry
+                .get("toolCount")
+                .or_else(|| entry.get("tool_count"))
+                .and_then(serde_json::Value::as_u64)
+                .map(|count| count as usize)
+        });
+    let health = if !enabled {
+        "disabled"
+    } else if connected {
+        "connected"
+    } else {
+        "disconnected"
+    };
+    Some(ExternalMcpServerCatalogEntry {
+        server_id,
+        name,
+        enabled,
+        connected,
+        health: health.to_string(),
+        tool_count,
+        error: read_json_string(entry, &["error"]),
+    })
+}
+
+fn read_json_string(value: &serde_json::Value, fields: &[&str]) -> Option<String> {
+    fields.iter().find_map(|field| {
+        value
+            .get(*field)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+    })
+}
 
 #[derive(Clone)]
 struct UnavailableBusinessModelBridgeClient {
@@ -456,9 +593,7 @@ impl DaemonRuntime {
         model_bridge_override: Option<Arc<dyn magi_bridge_client::ModelBridgeClient>>,
     ) -> ApiState {
         let orchestrator = OrchestratorService::new(self.event_bus.clone());
-        let mut tool_registry = ToolRegistry::new(self.governance.clone(), self.event_bus.clone())
-            .with_knowledge_store(self.knowledge_store.clone());
-        tool_registry.register_default_builtins();
+        let mcp_connections = Arc::new(RwLock::new(HashMap::new()));
         let model_transport =
             Self::bridge_loopback_transport_with_env("model_bridge_loopback", bridge_env);
         let mcp_transport =
@@ -472,6 +607,18 @@ impl DaemonRuntime {
             warn!(error = %error, "设置文件加载失败，使用空默认值");
         }
         Self::seed_orchestrator_settings_from_env_if_empty(&settings_store, bridge_env);
+        let app_skill_runtime = Arc::new(
+            magi_api::skill_loader::build_skill_runtime_from_settings(&settings_store),
+        );
+        let external_tool_catalog_provider = build_external_tool_catalog_provider(
+            settings_store.clone(),
+            app_skill_runtime.clone(),
+            mcp_connections.clone(),
+        );
+        let mut tool_registry = ToolRegistry::new(self.governance.clone(), self.event_bus.clone())
+            .with_knowledge_store(self.knowledge_store.clone())
+            .with_external_tool_catalog_provider(external_tool_catalog_provider);
+        tool_registry.register_default_builtins();
 
         // 业务模型桥用于会话正文生成和任务执行；任务规划/分类另走本地 loopback-model。
         //
@@ -633,10 +780,6 @@ impl DaemonRuntime {
                 },
             );
 
-        let app_skill_runtime = Arc::new(
-            magi_api::skill_loader::build_skill_runtime_from_settings(&settings_store),
-        );
-
         let session_checkpoint_persistence = RuntimeSidecarPersistence::new(
             StateRepository::new(self.state_root.clone()),
             self.session_store.clone(),
@@ -666,6 +809,7 @@ impl DaemonRuntime {
         .with_settings_store(settings_store.clone())
         .with_skill_runtime(app_skill_runtime.clone())
         .with_skill_dispatch_runtime(Arc::new(skill_runtime.clone()))
+        .with_mcp_connections(mcp_connections)
         .with_tool_registry(tool_registry_for_dispatcher.clone())
         .with_tunnel_port(self.local_port)
         .with_runtime_persistence(Arc::new(RuntimeStatePersistence::new(

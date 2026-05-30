@@ -1,6 +1,6 @@
 use magi_core::{
-    ApprovalRequirement, EventId, ExecutionResultStatus, RiskLevel, SessionId, TaskId, ToolCallId,
-    UtcMillis, WorkerId, WorkspaceId,
+    AccessProfile, ApprovalRequirement, EventId, ExecutionResultStatus, RiskLevel, SessionId,
+    TaskId, ToolCallId, UtcMillis, WorkerId, WorkspaceId,
 };
 use magi_event_bus::{EventCategory, EventContext, EventEnvelope, InMemoryEventBus};
 use magi_governance::{
@@ -500,15 +500,15 @@ impl BuiltinToolName {
                 "代码符号导航：按符号名查定义（goto_definition），或列出某文件的全部符号（list_file_symbols）"
             }
             Self::ToolCatalog => {
-                "列出 Magi 内置工具目录与健康状态。\n\n\
+                "列出 Magi 工具目录与健康状态。\n\n\
                 # 何时用\n\
-                - 需要确认当前运行时有哪些内置工具、各自访问模式和风险等级\n\
-                - 需要诊断工具 schema 是否完整，或区分模型可见工具与运行时内部工具\n\n\
+                - 需要确认当前运行时有哪些内置工具、skill 绑定工具、MCP server 状态\n\
+                - 需要诊断工具 schema 是否完整，或区分模型可见工具、外接工具与运行时内部工具\n\n\
                 # 何时不用\n\
-                - 需要调用外部 MCP / skill 工具目录 → 使用对应外部工具管理入口\n\
                 - 已知道具体工具且要完成任务 → 直接调用对应工具\n\n\
                 # 说明\n\
-                - 该工具只读取 BuiltinToolName::ALL 单一注册源，不扫描 MCP、skill 或自定义工具"
+                - 内置工具读取 BuiltinToolName::ALL 单一注册源\n\
+                - 外接工具只读取 daemon 注入的 skill/MCP 运行时快照，不扫描文件系统"
             }
             Self::AgentSpawn => {
                 "向已注册的代理角色派发一个子任务（architect / executor / reviewer 等）。该工具只创建代理并投递初始任务消息，立即返回代理 task_id；后续使用 agent_wait 收集代理终态结果。若返回 status=degraded，表示代理当前不可用，父代理必须改派其他可用角色或由主线继续完成，不能直接停止任务。\n\n\
@@ -918,7 +918,9 @@ impl BuiltinToolName {
                 "type": "object",
                 "properties": {
                     "include_internal": { "type": "boolean", "description": "是否包含运行时内部工具，默认 false" },
-                    "include_schema": { "type": "boolean", "description": "是否在每个工具条目中包含完整 parameters_schema，默认 false" }
+                    "include_schema": { "type": "boolean", "description": "是否在每个内置工具条目中包含完整 parameters_schema，默认 false" },
+                    "include_external": { "type": "boolean", "description": "是否包含 skill 绑定工具与 MCP server 快照，默认 true" },
+                    "include_mcp_servers": { "type": "boolean", "description": "包含外接工具时是否同时返回 MCP server 健康摘要，默认 true" }
                 },
                 "required": []
             }),
@@ -1510,9 +1512,46 @@ pub struct ToolExecutionSummary {
 /// 与 ToolExecutionContext（可序列化、随调用流转的标识信息）区分：
 /// 这里承载的是 daemon 进程内的共享服务引用，由 ToolRegistry 持有并在
 /// dispatch 时传入。将来需要更多运行时服务，扩这个结构即可，不改 trait 签名。
+pub type ExternalToolCatalogProvider =
+    Arc<dyn Fn() -> ExternalToolCatalogSnapshot + Send + Sync + 'static>;
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ExternalToolCatalogSnapshot {
+    pub skill_tools: Vec<ExternalToolCatalogEntry>,
+    pub mcp_servers: Vec<ExternalMcpServerCatalogEntry>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ExternalToolCatalogEntry {
+    pub source: String,
+    pub skill_id: Option<String>,
+    pub binding_id: Option<String>,
+    pub name: String,
+    pub description: String,
+    pub bridge_kind: String,
+    pub dispatch_action: String,
+    pub bridge_target: String,
+    pub access_profile_behavior: String,
+    pub risk_level: String,
+    pub approval_requirement: String,
+    pub status: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ExternalMcpServerCatalogEntry {
+    pub server_id: String,
+    pub name: String,
+    pub enabled: bool,
+    pub connected: bool,
+    pub health: String,
+    pub tool_count: Option<usize>,
+    pub error: Option<String>,
+}
+
 #[derive(Clone, Default)]
 pub struct ToolRuntimeResources {
     pub knowledge_store: Option<Arc<magi_knowledge_store::KnowledgeStore>>,
+    pub external_tool_catalog_provider: Option<ExternalToolCatalogProvider>,
 }
 
 pub trait BuiltinTool: Send + Sync {
@@ -1554,6 +1593,14 @@ impl ToolRegistry {
         knowledge_store: Arc<magi_knowledge_store::KnowledgeStore>,
     ) -> Self {
         self.runtime_resources.knowledge_store = Some(knowledge_store);
+        self
+    }
+
+    pub fn with_external_tool_catalog_provider(
+        mut self,
+        provider: ExternalToolCatalogProvider,
+    ) -> Self {
+        self.runtime_resources.external_tool_catalog_provider = Some(provider);
         self
     }
 
@@ -1828,6 +1875,30 @@ impl ToolRegistry {
             })
             .cloned()
             .collect()
+    }
+
+    pub fn governance_decision_for_tool_request(
+        &self,
+        request: &ToolExecutionRequest,
+        access_profile: AccessProfile,
+    ) -> GovernanceDecision {
+        if access_profile == AccessProfile::FullAccess {
+            return GovernanceDecision::allowed(
+                DecisionPhase::ApprovalPolicy,
+                request.risk_level,
+                Some("完全授权模式跳过普通工具审批".to_string()),
+            );
+        }
+        self.governance.evaluate_tool_request(request)
+    }
+
+    pub fn record_external_invocation(
+        &self,
+        input: &ToolExecutionInput,
+        context: &ToolExecutionContext,
+        output: &ToolExecutionOutput,
+    ) {
+        self.record_invocation(input, context, output);
     }
 
     pub fn summary_for_query(&self, query: &ToolExecutionContextQuery) -> ToolExecutionSummary {

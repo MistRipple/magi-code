@@ -25,6 +25,22 @@ pub(crate) fn build_dispatch_observation(
             bridge_error_message: None,
             detail: output.payload.clone(),
         },
+        Ok(SkillDispatchResult::Preflight { output }) => SkillDispatchObservation {
+            tool_call_id: input.tool_call_id.clone(),
+            tool_name: input.tool_name.clone(),
+            route,
+            binding_id: input
+                .binding_id
+                .clone()
+                .or_else(|| binding.map(|binding| binding.binding_id.clone())),
+            bridge_kind: binding.map(|binding| binding.bridge_kind),
+            dispatch_action: binding.map(|binding| binding.dispatch_action),
+            status: map_builtin_dispatch_status(output.status),
+            error_kind: None,
+            bridge_error_layer: None,
+            bridge_error_message: None,
+            detail: output.payload.clone(),
+        },
         Ok(SkillDispatchResult::Bridge { output }) => SkillDispatchObservation {
             tool_call_id: input.tool_call_id.clone(),
             tool_name: input.tool_name.clone(),
@@ -64,9 +80,8 @@ pub(crate) fn build_dispatch_observation(
 fn map_builtin_dispatch_status(status: ExecutionResultStatus) -> SkillDispatchStatus {
     match status {
         ExecutionResultStatus::Succeeded => SkillDispatchStatus::Succeeded,
-        ExecutionResultStatus::Rejected | ExecutionResultStatus::NeedsApproval => {
-            SkillDispatchStatus::Rejected
-        }
+        ExecutionResultStatus::NeedsApproval => SkillDispatchStatus::NeedsApproval,
+        ExecutionResultStatus::Rejected => SkillDispatchStatus::Rejected,
         ExecutionResultStatus::Failed | ExecutionResultStatus::Cancelled => {
             SkillDispatchStatus::Failed
         }

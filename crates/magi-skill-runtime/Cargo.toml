@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 serde.workspace = true
+serde_json.workspace = true
 magi-core = { path = "../magi-core" }
 magi-governance = { path = "../magi-governance" }
 magi-bridge-client = { path = "../magi-bridge-client" }

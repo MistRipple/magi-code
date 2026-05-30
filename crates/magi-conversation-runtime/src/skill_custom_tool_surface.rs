@@ -128,6 +128,8 @@ pub fn execute_skill_custom_tool(
     tool_skill_name: &str,
     binding_id: &str,
     active_skill_name: Option<&str>,
+    access_profile: AccessProfile,
+    safety_gate: Option<&magi_safety_gate::SafetyGate>,
     skill_runtime: Option<&SkillRuntime>,
     skill_dispatch_runtime: Option<&SkillDispatchRuntime>,
     context: ToolExecutionContext,
@@ -162,10 +164,11 @@ pub fn execute_skill_custom_tool(
         );
     };
 
-    let plan = skill_runtime.build_tool_runtime_plan(SkillSelection {
+    let mut plan = skill_runtime.build_tool_runtime_plan(SkillSelection {
         skill_ids: vec![tool_skill_name.to_string()],
         requested_tools: Vec::new(),
     });
+    plan.tool_policy.access_profile = access_profile;
     let Some(binding) = plan
         .custom_tool_bindings
         .iter()
@@ -180,6 +183,16 @@ pub fn execute_skill_custom_tool(
     };
 
     let payload = extract_skill_custom_tool_payload(&tool_call.function.arguments);
+    if let Some(preflight) = custom_tool_safety_decision(
+        safety_gate,
+        access_profile,
+        tool_name,
+        tool_skill_name,
+        &binding,
+        &payload,
+    ) {
+        return preflight;
+    }
     let outcome = skill_dispatch_runtime.dispatch_observed(
         &plan,
         SkillDispatchInput {
@@ -196,6 +209,7 @@ pub fn execute_skill_custom_tool(
     let observation = outcome.observation;
     match outcome.result {
         Ok(SkillDispatchResult::Builtin { output }) => (output.payload, output.status),
+        Ok(SkillDispatchResult::Preflight { output }) => (output.payload, output.status),
         Ok(SkillDispatchResult::Bridge { output }) => (
             output.response.payload,
             if output.response.ok {
@@ -216,9 +230,103 @@ pub fn execute_skill_custom_tool(
             })
             .to_string(),
             match observation.status {
+                SkillDispatchStatus::NeedsApproval => ExecutionResultStatus::NeedsApproval,
                 SkillDispatchStatus::Rejected => ExecutionResultStatus::Rejected,
                 _ => ExecutionResultStatus::Failed,
             },
         ),
     }
+}
+
+fn custom_tool_safety_decision(
+    safety_gate: Option<&magi_safety_gate::SafetyGate>,
+    access_profile: AccessProfile,
+    tool_name: &str,
+    skill_name: &str,
+    binding: &CustomToolBinding,
+    payload: &str,
+) -> Option<(String, ExecutionResultStatus)> {
+    if binding.bridge_kind != magi_bridge_client::BridgeBindingKind::Mcp {
+        return None;
+    }
+    let decision = safety_gate?.evaluate_text(payload);
+    match decision {
+        magi_safety_gate::SafetyDecision::Allow
+        | magi_safety_gate::SafetyDecision::AuditOnly { .. } => None,
+        magi_safety_gate::SafetyDecision::HardBlock {
+            category,
+            pattern,
+            reason,
+        } => Some(custom_tool_safety_payload(
+            tool_name,
+            skill_name,
+            binding,
+            ExecutionResultStatus::Rejected,
+            category,
+            magi_safety_gate::SafetyAction::HardBlock,
+            pattern,
+            reason,
+        )),
+        magi_safety_gate::SafetyDecision::RequireApprovalInRestricted {
+            category,
+            pattern,
+            reason,
+        } => match access_profile {
+            AccessProfile::FullAccess => None,
+            AccessProfile::Restricted => Some(custom_tool_safety_payload(
+                tool_name,
+                skill_name,
+                binding,
+                ExecutionResultStatus::NeedsApproval,
+                category,
+                magi_safety_gate::SafetyAction::RequireApprovalInRestricted,
+                pattern,
+                reason,
+            )),
+            AccessProfile::ReadOnly => Some(custom_tool_safety_payload(
+                tool_name,
+                skill_name,
+                binding,
+                ExecutionResultStatus::Rejected,
+                category,
+                magi_safety_gate::SafetyAction::RequireApprovalInRestricted,
+                pattern,
+                format!("{reason}；只读分析模式不支持通过审批升级执行"),
+            )),
+        },
+    }
+}
+
+fn custom_tool_safety_payload(
+    tool_name: &str,
+    skill_name: &str,
+    binding: &CustomToolBinding,
+    status: ExecutionResultStatus,
+    category: magi_safety_gate::SafetyCategory,
+    action: magi_safety_gate::SafetyAction,
+    pattern: String,
+    reason: String,
+) -> (String, ExecutionResultStatus) {
+    (
+        serde_json::json!({
+            "tool": tool_name,
+            "status": match status {
+                ExecutionResultStatus::Succeeded => "succeeded",
+                ExecutionResultStatus::Failed => "failed",
+                ExecutionResultStatus::Rejected => "rejected",
+                ExecutionResultStatus::NeedsApproval => "needs_approval",
+                ExecutionResultStatus::Cancelled => "cancelled",
+            },
+            "binding_id": &binding.binding_id,
+            "skill_name": skill_name,
+            "error": reason,
+            "safety_gate": {
+                "category": category.as_str(),
+                "pattern": pattern,
+                "action": action.as_str(),
+            },
+        })
+        .to_string(),
+        status,
+    )
 }

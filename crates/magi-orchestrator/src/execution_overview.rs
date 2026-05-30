@@ -375,7 +375,9 @@ where
         }
         match observation.status {
             SkillDispatchStatus::Succeeded => summary.succeeded_dispatches += 1,
-            SkillDispatchStatus::Rejected => summary.rejected_dispatches += 1,
+            SkillDispatchStatus::NeedsApproval | SkillDispatchStatus::Rejected => {
+                summary.rejected_dispatches += 1
+            }
             SkillDispatchStatus::Failed => summary.failed_dispatches += 1,
         }
     }

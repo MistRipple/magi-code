@@ -522,7 +522,9 @@ impl WorkerExecutor for DeterministicWorkerExecutor {
             if skill_dispatches.iter().any(|record| {
                 matches!(
                     record.status,
-                    SkillDispatchStatus::Failed | SkillDispatchStatus::Rejected
+                    SkillDispatchStatus::Failed
+                        | SkillDispatchStatus::NeedsApproval
+                        | SkillDispatchStatus::Rejected
                 )
             }) {
                 summary_parts.push("skill dispatch step failed");

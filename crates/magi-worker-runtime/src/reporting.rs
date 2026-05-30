@@ -327,7 +327,9 @@ pub(crate) fn derive_final_report(
     let skill_failed = skill_dispatches.iter().any(|record| {
         matches!(
             record.status,
-            SkillDispatchStatus::Failed | SkillDispatchStatus::Rejected
+            SkillDispatchStatus::Failed
+                | SkillDispatchStatus::NeedsApproval
+                | SkillDispatchStatus::Rejected
         )
     });
 

@@ -6,7 +6,8 @@ use axum::{
 use magi_conversation_runtime::session_turn_execution::SessionTurnExecutionRequest;
 use magi_conversation_runtime::session_writeback::publish_current_session_turn_item_event;
 use magi_conversation_runtime::{
-    MailboxAuthor, MailboxKind, RuntimeSignal, task_execution_registry::TaskExecutionPlan,
+    MailboxAuthor, MailboxKind, RuntimeSignal, public_builtin_tool_reference_aliases,
+    task_execution_registry::TaskExecutionPlan, tool_reference_position,
 };
 use magi_core::TaskStatus;
 use magi_core::{
@@ -18,7 +19,6 @@ use magi_session_store::{
     ActiveExecutionTurn, ActiveExecutionTurnItem, CANONICAL_TURN_SCHEMA_VERSION, CanonicalTurn,
     NotificationRecord, SessionRecord, ThreadChatMessage, TimelineEntryKind,
 };
-use magi_tool_runtime::BuiltinToolName;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -999,40 +999,6 @@ fn session_turn_requested_public_builtin_tools(
         [tool_name] => Some(RequestedBuiltinTools::Single(tool_name)),
         _ => Some(RequestedBuiltinTools::Multiple(tool_names)),
     }
-}
-
-fn public_builtin_tool_reference_aliases() -> Vec<(&'static str, &'static str)> {
-    let mut aliases = Vec::new();
-    for tool in BuiltinToolName::ALL {
-        if tool.is_public_tool_surface() {
-            let name = tool.as_str();
-            aliases.push((name, name));
-        }
-    }
-    aliases.extend([
-        ("file_view", "file_read"),
-        ("file_create", "file_write"),
-        ("file_edit", "file_patch"),
-        ("file_insert", "file_patch"),
-        ("code_search_regex", "search_text"),
-        ("code_search_semantic", "search_semantic"),
-        ("project_knowledge_query", "knowledge_query"),
-    ]);
-    aliases
-}
-
-fn tool_reference_position(text: &str, tool_name: &str) -> Option<usize> {
-    text.match_indices(tool_name).find_map(|(start, _)| {
-        let before = text[..start].chars().next_back();
-        let after = text[start + tool_name.len()..].chars().next();
-        (is_tool_reference_boundary(before) && is_tool_reference_boundary(after)).then_some(start)
-    })
-}
-
-fn is_tool_reference_boundary(value: Option<char>) -> bool {
-    value
-        .map(|ch| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'))
-        .unwrap_or(true)
 }
 
 fn explicit_builtin_tool_intent(tool_name: &str) -> String {

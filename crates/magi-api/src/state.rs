@@ -1307,6 +1307,14 @@ impl ApiState {
         self
     }
 
+    pub fn with_mcp_connections(
+        mut self,
+        mcp_connections: Arc<RwLock<HashMap<String, Arc<StdioMcpBridgeClient>>>>,
+    ) -> Self {
+        self.mcp_connections = mcp_connections;
+        self
+    }
+
     pub fn runner_manager(&self) -> Option<&RunnerManager> {
         self.runner_manager.as_ref()
     }
