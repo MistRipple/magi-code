@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { getCurrentSessionId, getState } from '../stores/messages.svelte';
+  import { getCurrentSessionId, getState, messagesState } from '../stores/messages.svelte';
   import { vscode } from '../lib/vscode-bridge';
   import { ensureArray } from '../lib/utils';
   import { openCodeTab } from '../stores/right-pane.svelte';
@@ -53,38 +53,41 @@
     return 'file-text';
   }
 
-  function approveChange(filePath: string) {
-    const sessionId = getCurrentSessionId() || undefined;
-    vscode.postMessage({ type: 'approveChange', filePath, sessionId });
+  function editScope(edit?: Edit): { sessionId?: string; workspaceId?: string; workspacePath?: string } {
+    return {
+      sessionId: edit?.sessionId?.trim() || getCurrentSessionId() || undefined,
+      workspaceId: edit?.workspaceId?.trim() || messagesState.currentWorkspaceId?.trim() || undefined,
+      workspacePath: edit?.workspacePath?.trim() || messagesState.currentWorkspacePath?.trim() || undefined,
+    };
   }
-  function revertChange(filePath: string) {
-    const sessionId = getCurrentSessionId() || undefined;
-    vscode.postMessage({ type: 'revertChange', filePath, sessionId });
+
+  function approveChange(edit: Edit) {
+    vscode.postMessage({ type: 'approveChange', filePath: edit.filePath, ...editScope(edit) });
+  }
+  function revertChange(edit: Edit) {
+    vscode.postMessage({ type: 'revertChange', filePath: edit.filePath, ...editScope(edit) });
   }
 
   let pendingBatch = $state<'approveAll' | 'revertAll' | 'revertRound' | null>(null);
   function approveAllChanges() {
     if (pendingBatch || edits.length === 0) return;
     pendingBatch = 'approveAll';
-    const sessionId = getCurrentSessionId() || undefined;
-    vscode.postMessage({ type: 'approveAllChanges', sessionId });
+    vscode.postMessage({ type: 'approveAllChanges', ...editScope(currentRoundEdits[0] ?? stagedEdits[0]) });
     setTimeout(() => { pendingBatch = null; }, 1500);
   }
   function revertAllChanges() {
     if (pendingBatch || edits.length === 0) return;
     pendingBatch = 'revertAll';
-    const sessionId = getCurrentSessionId() || undefined;
-    vscode.postMessage({ type: 'revertAllChanges', sessionId });
+    vscode.postMessage({ type: 'revertAllChanges', ...editScope(currentRoundEdits[0] ?? stagedEdits[0]) });
     setTimeout(() => { pendingBatch = null; }, 1500);
   }
   function revertCurrentRound() {
     if (pendingBatch || !latestExecutionGroupId) return;
     pendingBatch = 'revertRound';
-    const sessionId = getCurrentSessionId() || undefined;
     vscode.postMessage({
       type: 'revertExecutionGroup',
       executionGroupId: latestExecutionGroupId,
-      sessionId,
+      ...editScope(currentRoundEdits[0]),
     });
     setTimeout(() => { pendingBatch = null; }, 1500);
   }
@@ -136,7 +139,7 @@
       vscode.postMessage({
         type: 'viewDiff',
         filePath: edit.filePath,
-        sessionId: getCurrentSessionId() || undefined,
+        ...editScope(edit),
         diff: edit.diff || '',
         originalContent: edit?.originalContent,
         previewContent:
@@ -155,7 +158,9 @@
       });
       return;
     }
-    openCodeTab(getCurrentSessionId(), edit.filePath, {
+    const scope = editScope(edit);
+    openCodeTab(scope.sessionId, edit.filePath, {
+      ...scope,
       diff: synthesizeDiff(edit),
       content:
         typeof edit.previewContent === 'string' && edit.previewContent.length > 0
@@ -255,10 +260,10 @@
       {/if}
     </div>
     <div class="file-actions">
-      <button class="action-icon approve" title={i18n.t('edits.actions.approveChange')} onclick={(e) => { e.stopPropagation(); approveChange(edit.filePath); }}>
+      <button class="action-icon approve" title={i18n.t('edits.actions.approveChange')} onclick={(e) => { e.stopPropagation(); approveChange(edit); }}>
         <Icon name="check" size={14} />
       </button>
-      <button class="action-icon revert" title={i18n.t('edits.actions.revertChange')} onclick={(e) => { e.stopPropagation(); revertChange(edit.filePath); }}>
+      <button class="action-icon revert" title={i18n.t('edits.actions.revertChange')} onclick={(e) => { e.stopPropagation(); revertChange(edit); }}>
         <Icon name="undo" size={14} />
       </button>
     </div>

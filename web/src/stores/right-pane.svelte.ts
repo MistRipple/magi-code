@@ -21,6 +21,9 @@ export interface AgentTabPayload {
 /** Code tab payload —— filepath 必填；diff 存在时走 diff 视图，否则走单文件 viewer */
 export interface CodeTabPayload {
   filepath: string;
+  workspaceId?: string;
+  workspacePath?: string;
+  sessionId?: string;
   /** 可选：unified diff 文本；存在时优先走 diff 视图 */
   diff?: string | null;
   /** 可选：单文件源码；不存在时 RightPane 异步拉取 */
@@ -98,6 +101,9 @@ function sanitizeTabForPersist(tab: RightPaneTab): RightPaneTab {
   const payload = tab.payload as CodeTabPayload;
   const slim: CodeTabPayload = {
     filepath: payload.filepath,
+    workspaceId: payload.workspaceId,
+    workspacePath: payload.workspacePath,
+    sessionId: payload.sessionId,
     language: payload.language ?? null,
     contentKind: payload.contentKind,
     size: payload.size,
@@ -340,6 +346,9 @@ export function openCodeTab(
     diff?: string | null;
     content?: string | null;
     language?: string | null;
+    workspaceId?: string;
+    workspacePath?: string;
+    sessionId?: string;
     contentKind?: import('../types/message').EditContentKind;
     size?: number;
     mime?: string;
@@ -363,6 +372,9 @@ export function openCodeTab(
     'code',
     {
       filepath: trimmedFilepath,
+      workspaceId: options?.workspaceId,
+      workspacePath: options?.workspacePath,
+      sessionId: options?.sessionId,
       diff: options?.diff ?? null,
       content: options?.content ?? null,
       language: options?.language ?? null,

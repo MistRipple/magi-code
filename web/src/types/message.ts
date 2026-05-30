@@ -712,6 +712,9 @@ export type EditContentKind = 'text' | 'large_text' | 'binary' | 'symlink' | 'sp
 export type EditSourceKind = 'tool' | 'watcher' | 'external' | 'baseline';
 
 export interface Edit {
+  sessionId?: string;
+  workspaceId?: string;
+  workspacePath?: string;
   filePath: string;
   oldPath?: string;
   snapshotId?: string;

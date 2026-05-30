@@ -63,6 +63,15 @@
   });
 
   const activeFilePath = $derived(activeCodePayload?.filepath ?? '');
+  const activeContentCacheKey = $derived.by(() => {
+    if (!activeFilePath) return '';
+    return [
+      activeCodePayload?.workspaceId ?? '',
+      activeCodePayload?.workspacePath ?? '',
+      activeCodePayload?.sessionId ?? '',
+      activeFilePath,
+    ].join('::');
+  });
   const activeContentKind = $derived(activeCodePayload?.contentKind ?? 'text');
   const explicitContent = $derived(activeCodePayload?.content ?? null);
   const explicitDiff = $derived(activeCodePayload?.diff ?? null);
@@ -73,37 +82,44 @@
    */
   $effect(() => {
     const filepath = activeFilePath;
+    const cacheKey = activeContentCacheKey;
     if (!filepath) return;
+    if (!cacheKey) return;
     if (typeof explicitContent === 'string') return; // 已经有内容
     if (typeof explicitDiff === 'string' && explicitDiff.trim().length > 0) return; // diff 模式
     if (activeContentKind !== 'text') return; // 非文本类不拉取
     if (isWordFile(filepath) || isKnownBinaryFile(filepath)) return;
-    if (typeof fetchedContents[filepath] === 'string') return; // 已成功拉过
-    if (typeof fetchErrors[filepath] === 'string' && fetchErrors[filepath].length > 0) return; // 已失败过，停止重试避免死循环
-    if (fetchingFlags[filepath]) return; // 拉取中
+    if (typeof fetchedContents[cacheKey] === 'string') return; // 已成功拉过
+    if (typeof fetchErrors[cacheKey] === 'string' && fetchErrors[cacheKey].length > 0) return; // 已失败过，停止重试避免死循环
+    if (fetchingFlags[cacheKey]) return; // 拉取中
 
-    fetchingFlags = { ...fetchingFlags, [filepath]: true };
-    fetchErrors = { ...fetchErrors, [filepath]: '' };
+    fetchingFlags = { ...fetchingFlags, [cacheKey]: true };
+    fetchErrors = { ...fetchErrors, [cacheKey]: '' };
     (async () => {
       try {
-        const payload = await getAgentFilePreview(filepath, { includeSession: false });
-        fetchedContents = { ...fetchedContents, [filepath]: payload.content || '' };
+        const payload = await getAgentFilePreview(filepath, {
+          includeSession: false,
+          sessionId: activeCodePayload?.sessionId,
+          workspaceId: activeCodePayload?.workspaceId,
+          workspacePath: activeCodePayload?.workspacePath,
+        });
+        fetchedContents = { ...fetchedContents, [cacheKey]: payload.content || '' };
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        fetchErrors = { ...fetchErrors, [filepath]: message };
+        fetchErrors = { ...fetchErrors, [cacheKey]: message };
       } finally {
-        fetchingFlags = { ...fetchingFlags, [filepath]: false };
+        fetchingFlags = { ...fetchingFlags, [cacheKey]: false };
       }
     })();
   });
 
-  const previewLoading = $derived(Boolean(activeFilePath && fetchingFlags[activeFilePath]));
-  const previewError = $derived(activeFilePath ? (fetchErrors[activeFilePath] || '') : '');
+  const previewLoading = $derived(Boolean(activeContentCacheKey && fetchingFlags[activeContentCacheKey]));
+  const previewError = $derived(activeContentCacheKey ? (fetchErrors[activeContentCacheKey] || '') : '');
   /** 最终用于渲染的内容：优先 store 显式 content，其次异步拉取结果 */
   const previewContent = $derived.by<string | null>(() => {
     if (typeof explicitContent === 'string') return explicitContent;
-    if (!activeFilePath) return null;
-    return fetchedContents[activeFilePath] ?? null;
+    if (!activeContentCacheKey) return null;
+    return fetchedContents[activeContentCacheKey] ?? null;
   });
 
   // ============ Diff 渲染（hunk-aware：单列行号 + 类代码块外观） ============

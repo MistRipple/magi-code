@@ -292,26 +292,34 @@ export type AgentSessionNotificationsPayload = SessionNotificationsResponseDto;
 
 export interface AgentKnowledgeMutationPayload {
   success: boolean;
-  workspaceId?: string;
-  workspacePath?: string;
-  knowledgeCount?: number;
+  workspaceId: string;
+  workspacePath: string;
+  knowledgeCount: number;
   error?: string;
   payload?: Record<string, unknown>;
 }
 
 export interface AgentFilePreviewPayload {
-  filePath: string;
-  absolutePath: string;
-  exists: boolean;
+  filePath: string | null;
   content: string;
-  language: string;
+  sessionId?: string | null;
+  workspaceId: string;
+  workspacePath: string;
+  executionGroupId?: string | null;
+  absolutePath?: string;
+  exists?: boolean;
+  language?: string;
 }
 
 export interface AgentChangeDiffPayload {
-  filePath: string;
+  filePath: string | null;
   diff: string;
-  additions: number;
-  deletions: number;
+  sessionId?: string | null;
+  workspaceId: string;
+  workspacePath: string;
+  executionGroupId?: string | null;
+  additions?: number;
+  deletions?: number;
   originalContent?: string;
   currentContent?: string;
   currentAbsolutePath?: string;
@@ -1514,9 +1522,12 @@ export async function updateAllAgentSkills(): Promise<Record<string, unknown>> {
   return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/skills/update-all', {}, 'update all skills');
 }
 
-export async function getAgentChangeDiff(filePath: string): Promise<AgentChangeDiffPayload> {
+export async function getAgentChangeDiff(
+  filePath: string,
+  options: { sessionId?: string; workspaceId?: string; workspacePath?: string } = {},
+): Promise<AgentChangeDiffPayload> {
   try {
-    const query = buildBoundQuery({ filePath });
+    const query = buildBoundQueryWithOverride({ filePath }, options);
     const response = await getTransport().request(agentUrl(`/api/changes/diff`, query));
     return await parseAgentJson<AgentChangeDiffPayload>(response, 'load change diff');
   } catch (error) {
@@ -1529,10 +1540,18 @@ export async function getAgentChangeDiff(filePath: string): Promise<AgentChangeD
 
 export async function getAgentFilePreview(
   filePath: string,
-  options: { includeSession?: boolean } = {},
+  options: { includeSession?: boolean; sessionId?: string; workspaceId?: string; workspacePath?: string } = {},
 ): Promise<AgentFilePreviewPayload> {
   try {
-    const query = buildBoundQuery({ filePath }, { includeSession: options.includeSession });
+    const query = buildBoundQueryWithOverride(
+      { filePath },
+      {
+        sessionId: options.sessionId,
+        workspaceId: options.workspaceId,
+        workspacePath: options.workspacePath,
+      },
+      { includeSession: options.includeSession },
+    );
     const response = await getTransport().request(agentUrl(`/api/files/content`, query));
     return await parseAgentJson<AgentFilePreviewPayload>(response, 'load file preview');
   } catch (error) {
@@ -1543,30 +1562,40 @@ export async function getAgentFilePreview(
   }
 }
 
-export async function approveAgentChange(filePath: string, sessionId?: string): Promise<void> {
-  await postBoundJson('/api/changes/approve', { filePath }, 'approve change', { sessionId });
+export async function approveAgentChange(
+  filePath: string,
+  options: { sessionId?: string; workspaceId?: string; workspacePath?: string } = {},
+): Promise<void> {
+  await postBoundJson('/api/changes/approve', { filePath }, 'approve change', options);
 }
 
-export async function revertAgentChange(filePath: string, sessionId?: string): Promise<void> {
-  await postBoundJson('/api/changes/revert', { filePath }, 'revert change', { sessionId });
+export async function revertAgentChange(
+  filePath: string,
+  options: { sessionId?: string; workspaceId?: string; workspacePath?: string } = {},
+): Promise<void> {
+  await postBoundJson('/api/changes/revert', { filePath }, 'revert change', options);
 }
 
-export async function approveAllAgentChanges(sessionId?: string): Promise<void> {
-  await postBoundJson('/api/changes/approve-all', {}, 'approve all changes', { sessionId });
+export async function approveAllAgentChanges(
+  options: { sessionId?: string; workspaceId?: string; workspacePath?: string } = {},
+): Promise<void> {
+  await postBoundJson('/api/changes/approve-all', {}, 'approve all changes', options);
 }
 
-export async function revertAllAgentChanges(sessionId?: string): Promise<void> {
-  await postBoundJson('/api/changes/revert-all', {}, 'revert all changes', { sessionId });
+export async function revertAllAgentChanges(
+  options: { sessionId?: string; workspaceId?: string; workspacePath?: string } = {},
+): Promise<void> {
+  await postBoundJson('/api/changes/revert-all', {}, 'revert all changes', options);
 }
 
 export async function revertAgentExecutionGroupChanges(
   executionGroupId: string,
-  sessionId?: string,
+  options: { sessionId?: string; workspaceId?: string; workspacePath?: string } = {},
 ): Promise<void> {
   await postBoundJson(
     '/api/changes/revert-execution-group',
     { executionGroupId },
     'revert execution group changes',
-    { sessionId },
+    options,
   );
 }

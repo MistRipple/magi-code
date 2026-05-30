@@ -1127,46 +1127,85 @@ export interface RemovedResponseDto {
 export interface DiffResponseDto {
   diff: string;
   filePath?: string | null;
+  sessionId?: string | null;
+  workspaceId: string;
+  workspacePath: string;
+  executionGroupId?: string | null;
 }
 
 export interface ApproveChangeRequestDto {
   filePath: string;
+  sessionId?: string;
+  workspaceId?: string;
+  workspacePath?: string;
 }
 
 export interface ApproveChangeResponseDto {
   approved: boolean;
   filePath: string;
+  sessionId: string;
+  workspaceId: string;
+  workspacePath: string;
+  executionGroupId: string;
 }
 
 export interface RevertChangeRequestDto {
   filePath: string;
+  sessionId?: string;
+  workspaceId?: string;
+  workspacePath?: string;
 }
 
 export interface RevertChangeResponseDto {
   reverted: boolean;
   filePath: string;
+  sessionId: string;
+  workspaceId: string;
+  workspacePath: string;
+  executionGroupId: string;
 }
 
 export interface ApproveAllChangesResponseDto {
   approved: boolean;
+  approvedFiles: string[];
+  sessionId: string;
+  workspaceId: string;
+  workspacePath: string;
+  executionGroupId: string;
 }
 
 export interface RevertAllChangesResponseDto {
   reverted: boolean;
+  revertedFiles: string[];
+  sessionId: string;
+  workspaceId: string;
+  workspacePath: string;
+  executionGroupId: string;
 }
 
 export interface RevertExecutionGroupChangesRequestDto {
   executionGroupId: string;
+  sessionId?: string;
+  workspaceId?: string;
+  workspacePath?: string;
 }
 
 export interface RevertExecutionGroupChangesResponseDto {
   reverted: boolean;
   executionGroupId: string;
+  revertedFiles: string[];
+  sessionId: string;
+  workspaceId: string;
+  workspacePath: string;
 }
 
 export interface FileContentResponseDto {
   content: string;
   filePath?: string | null;
+  sessionId?: string | null;
+  workspaceId: string;
+  workspacePath: string;
+  executionGroupId?: string | null;
 }
 
 export interface FilesystemEntryDto {

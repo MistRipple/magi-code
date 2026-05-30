@@ -353,6 +353,23 @@ function trimBridgeString(value: unknown): string {
   return typeof value === 'string' ? value.trim() : '';
 }
 
+type BridgeRequestScope = {
+  sessionId?: string;
+  workspaceId?: string;
+  workspacePath?: string;
+};
+
+function requestScopeFromMessage(
+  message: Record<string, unknown>,
+  fallbackSessionId: string = currentSessionId,
+): BridgeRequestScope {
+  return {
+    sessionId: trimBridgeString(message.sessionId) || fallbackSessionId || undefined,
+    workspaceId: trimBridgeString(message.workspaceId) || currentWorkspaceId || undefined,
+    workspacePath: trimBridgeString(message.workspacePath) || currentWorkspacePath || undefined,
+  };
+}
+
 function asBridgeRecord(value: unknown): Record<string, unknown> | null {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     return null;
@@ -2674,22 +2691,30 @@ function openDiagramPreview(source: string, title?: string, svgContent?: string)
   openPreviewWindow(resolvedTitle, '图表源码预览', source, 'file');
 }
 
-async function openFilePreview(filePath: string, previewContent?: string): Promise<void> {
+async function openFilePreview(
+  filePath: string,
+  previewContent?: string,
+  scope: BridgeRequestScope = {},
+): Promise<void> {
   if (typeof previewContent === 'string') {
     openPreviewWindow(filePath, '文件预览', previewContent, 'file');
     return;
   }
-  const payload = await getAgentFilePreview(filePath);
-  openPreviewWindow(payload.filePath, '文件预览', payload.content || '', 'file');
+  const payload = await getAgentFilePreview(filePath, scope);
+  openPreviewWindow(payload.filePath || filePath, '文件预览', payload.content || '', 'file');
 }
 
-async function openDiffPreview(filePath: string, diffContent?: string): Promise<void> {
+async function openDiffPreview(
+  filePath: string,
+  diffContent?: string,
+  scope: BridgeRequestScope = {},
+): Promise<void> {
   if (typeof diffContent === 'string') {
     openPreviewWindow(filePath, '差异预览', diffContent, 'diff');
     return;
   }
-  const payload = await getAgentChangeDiff(filePath);
-  openPreviewWindow(payload.filePath, '差异预览', payload.diff || '', 'diff');
+  const payload = await getAgentChangeDiff(filePath, scope);
+  openPreviewWindow(payload.filePath || filePath, '差异预览', payload.diff || '', 'diff');
 }
 
 async function updateSetting(key: string, value: unknown): Promise<void> {
@@ -3619,7 +3644,7 @@ export function createWebClientBridge(): ClientBridge {
               if (dispatchFilePreviewEvent({ filepath: fileTarget })) {
                 return;
               }
-              void openFilePreview(fileTarget).catch((error) => {
+              void openFilePreview(fileTarget, undefined, requestScopeFromMessage(message)).catch((error) => {
                 logBridgeOperationFailure('打开文件预览', '[web-client-bridge] 打开文件预览失败:', error);
               });
               return;
@@ -3655,7 +3680,7 @@ export function createWebClientBridge(): ClientBridge {
               const previewContent = typeof message.previewContent === 'string'
                 ? message.previewContent
                 : undefined;
-              void openFilePreview(filePath, previewContent).catch((error) => {
+              void openFilePreview(filePath, previewContent, requestScopeFromMessage(message)).catch((error) => {
                 logBridgeOperationFailure('打开文件预览', '[web-client-bridge] 打开文件预览失败:', error);
               });
             }
@@ -3667,17 +3692,14 @@ export function createWebClientBridge(): ClientBridge {
           }
           if (typeof message.filePath === 'string' && message.filePath.trim()) {
             const diffContent = typeof message.diff === 'string' ? message.diff : undefined;
-            void openDiffPreview(message.filePath, diffContent).catch((error) => {
+            void openDiffPreview(message.filePath, diffContent, requestScopeFromMessage(message)).catch((error) => {
               logBridgeOperationFailure('打开差异预览', '[web-client-bridge] 打开差异预览失败:', error);
             });
           }
           return;
         case 'approveChange':
           if (typeof message.filePath === 'string' && message.filePath.trim()) {
-            const targetSessionId = typeof message.sessionId === 'string' && message.sessionId.trim()
-              ? message.sessionId.trim()
-              : currentSessionId;
-            void approveAgentChange(message.filePath, targetSessionId).then(async () => {
+            void approveAgentChange(message.filePath, requestScopeFromMessage(message)).then(async () => {
               await fetchBootstrap();
               emitBridgeSuccessToast('批准变更', '变更已批准');
             }).catch((error) => {
@@ -3687,10 +3709,7 @@ export function createWebClientBridge(): ClientBridge {
           return;
         case 'revertChange':
           if (typeof message.filePath === 'string' && message.filePath.trim()) {
-            const targetSessionId = typeof message.sessionId === 'string' && message.sessionId.trim()
-              ? message.sessionId.trim()
-              : currentSessionId;
-            void revertAgentChange(message.filePath, targetSessionId).then(async () => {
+            void revertAgentChange(message.filePath, requestScopeFromMessage(message)).then(async () => {
               await fetchBootstrap();
               emitBridgeSuccessToast('还原变更', '变更已还原');
             }).catch((error) => {
@@ -3699,11 +3718,7 @@ export function createWebClientBridge(): ClientBridge {
           }
           return;
         case 'approveAllChanges':
-          void approveAllAgentChanges(
-            typeof message.sessionId === 'string' && message.sessionId.trim()
-              ? message.sessionId.trim()
-              : currentSessionId,
-          ).then(async () => {
+          void approveAllAgentChanges(requestScopeFromMessage(message)).then(async () => {
             await fetchBootstrap();
             emitBridgeSuccessToast('批准全部变更', '全部变更已批准');
           }).catch((error) => {
@@ -3711,11 +3726,7 @@ export function createWebClientBridge(): ClientBridge {
           });
           return;
         case 'revertAllChanges':
-          void revertAllAgentChanges(
-            typeof message.sessionId === 'string' && message.sessionId.trim()
-              ? message.sessionId.trim()
-              : currentSessionId,
-          ).then(async () => {
+          void revertAllAgentChanges(requestScopeFromMessage(message)).then(async () => {
             await fetchBootstrap();
             emitBridgeSuccessToast('还原全部变更', '全部变更已还原');
           }).catch((error) => {
@@ -3724,10 +3735,10 @@ export function createWebClientBridge(): ClientBridge {
           return;
         case 'revertExecutionGroup':
           if (typeof message.executionGroupId === 'string' && message.executionGroupId.trim()) {
-            const targetSessionId = typeof message.sessionId === 'string' && message.sessionId.trim()
-              ? message.sessionId.trim()
-              : currentSessionId;
-            void revertAgentExecutionGroupChanges(message.executionGroupId, targetSessionId).then(async () => {
+            void revertAgentExecutionGroupChanges(
+              message.executionGroupId,
+              requestScopeFromMessage(message),
+            ).then(async () => {
               await fetchBootstrap();
               emitBridgeSuccessToast('还原执行分组变更', '执行分组变更已还原');
             }).catch((error) => {

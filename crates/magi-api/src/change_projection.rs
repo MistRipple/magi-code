@@ -15,14 +15,24 @@ use std::path::{Path, PathBuf};
 #[derive(Clone)]
 pub(crate) struct SessionChangeScope {
     pub session_id: SessionId,
+    pub workspace_id: WorkspaceId,
     pub workspace_root: PathBuf,
     pub execution_group_id: String,
     pub contributors: Vec<String>,
 }
 
+#[derive(Clone)]
+pub(crate) struct WorkspaceChangeScope {
+    pub workspace_id: WorkspaceId,
+    pub workspace_root: PathBuf,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PendingChangeDto {
+    pub session_id: String,
+    pub workspace_id: String,
+    pub workspace_path: String,
     pub file_path: String,
     pub snapshot_id: String,
     pub updated_at: UtcMillis,
@@ -135,6 +145,7 @@ pub(crate) fn resolve_session_change_scope(
 
     Ok(SessionChangeScope {
         session_id: session_id.clone(),
+        workspace_id: bound_workspace_id,
         workspace_root,
         execution_group_id,
         contributors,
@@ -145,6 +156,13 @@ pub(crate) fn resolve_workspace_root_or_active(
     state: &ApiState,
     workspace_id: Option<&str>,
 ) -> Result<PathBuf, ApiError> {
+    resolve_workspace_change_scope_or_active(state, workspace_id).map(|scope| scope.workspace_root)
+}
+
+pub(crate) fn resolve_workspace_change_scope_or_active(
+    state: &ApiState,
+    workspace_id: Option<&str>,
+) -> Result<WorkspaceChangeScope, ApiError> {
     let ws_id = match workspace_id
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -157,7 +175,11 @@ pub(crate) fn resolve_workspace_root_or_active(
                 ApiError::InvalidInput("未指定 workspace_id 且没有活动 workspace".to_string())
             })?,
     };
-    resolve_workspace_root(state, &ws_id)
+    let workspace_root = resolve_workspace_root(state, &ws_id)?;
+    Ok(WorkspaceChangeScope {
+        workspace_id: ws_id,
+        workspace_root,
+    })
 }
 
 /// 取出会话的 pending changes（来自 SnapshotSession）。
@@ -242,6 +264,9 @@ fn convert_pending(scope: &SessionChangeScope, change: PendingChange) -> Pending
     let source_kind = source_kind_to_string(change.source);
 
     PendingChangeDto {
+        session_id: scope.session_id.as_str().to_string(),
+        workspace_id: scope.workspace_id.as_str().to_string(),
+        workspace_path: scope.workspace_root.to_string_lossy().to_string(),
         file_path: change.path.clone(),
         snapshot_id: format!("{}:{}", scope.execution_group_id, change.path),
         updated_at: UtcMillis(change.timestamp_ms),

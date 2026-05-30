@@ -156,6 +156,9 @@
   function previewInRightPane(filepath: string) {
     if (!filepath) return;
     openCodeTab(messagesState.currentSessionId, filepath, {
+      sessionId: messagesState.currentSessionId ?? undefined,
+      workspaceId: messagesState.currentWorkspaceId ?? undefined,
+      workspacePath: messagesState.currentWorkspacePath || undefined,
       diff: change?.diff ?? null,
     });
   }

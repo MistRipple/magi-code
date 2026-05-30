@@ -17,7 +17,8 @@ use magi_snapshot::SnapshotSession;
 use super::session_scope::parse_session_id;
 use crate::{
     change_projection::{
-        SessionChangeScope, resolve_session_change_scope, resolve_workspace_root_or_active,
+        SessionChangeScope, WorkspaceChangeScope, resolve_session_change_scope,
+        resolve_workspace_change_scope_or_active, resolve_workspace_root_or_active,
         safe_relative_path, safe_workspace_path,
     },
     errors::ApiError,
@@ -54,6 +55,28 @@ async fn require_snapshot_session(
         .await
 }
 
+fn workspace_path_string(path: &Path) -> String {
+    path.to_string_lossy().to_string()
+}
+
+fn session_scope_binding(scope: &SessionChangeScope) -> serde_json::Value {
+    serde_json::json!({
+        "sessionId": scope.session_id.as_str(),
+        "workspaceId": scope.workspace_id.as_str(),
+        "workspacePath": workspace_path_string(&scope.workspace_root),
+        "executionGroupId": scope.execution_group_id,
+    })
+}
+
+fn workspace_scope_binding(scope: &WorkspaceChangeScope) -> serde_json::Value {
+    serde_json::json!({
+        "sessionId": serde_json::Value::Null,
+        "workspaceId": scope.workspace_id.as_str(),
+        "workspacePath": workspace_path_string(&scope.workspace_root),
+        "executionGroupId": serde_json::Value::Null,
+    })
+}
+
 // ─── Changes ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -70,7 +93,7 @@ async fn get_diff(
     Query(query): Query<DiffQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // 没有 sessionId 时不再回退到 git diff —— 全局变更视图已不再属于本系统职责。
-    let diff = match query
+    let (diff, binding) = match query
         .session_id
         .as_deref()
         .map(str::trim)
@@ -88,7 +111,7 @@ async fn get_diff(
             let pending = snapshot
                 .pending_changes()
                 .map_err(|e| ApiError::internal_assembly("读取快照变更失败", e))?;
-            match query.file_path.as_deref() {
+            let diff = match query.file_path.as_deref() {
                 Some(fp) => {
                     let rel = safe_relative_path(fp)?;
                     pending
@@ -117,19 +140,27 @@ async fn get_diff(
                         .collect::<Vec<_>>()
                         .join("\n")
                 }
-            }
+            };
+            (diff, session_scope_binding(&scope))
         }
         None => {
             // 无 session 调用：仅做一次 workspace 校验，统一返回空 diff，
             // 不再读 git 来伪装出全局变更。
-            let _ = resolve_workspace_root_or_active(&state, query.workspace_id.as_deref())?;
-            String::new()
+            let scope =
+                resolve_workspace_change_scope_or_active(&state, query.workspace_id.as_deref())?;
+            (String::new(), workspace_scope_binding(&scope))
         }
     };
-    Ok(Json(serde_json::json!({
+    let mut payload = serde_json::json!({
         "diff": diff,
         "filePath": query.file_path,
-    })))
+    });
+    if let Some(object) = payload.as_object_mut()
+        && let Some(binding) = binding.as_object()
+    {
+        object.extend(binding.clone());
+    }
+    Ok(Json(payload))
 }
 
 #[derive(Debug, Deserialize)]
@@ -155,6 +186,10 @@ async fn approve_change(
     Ok(Json(serde_json::json!({
         "approved": true,
         "filePath": request.file_path,
+        "sessionId": scope.session_id.as_str(),
+        "workspaceId": scope.workspace_id.as_str(),
+        "workspacePath": workspace_path_string(&scope.workspace_root),
+        "executionGroupId": scope.execution_group_id,
     })))
 }
 
@@ -181,6 +216,10 @@ async fn revert_change(
     Ok(Json(serde_json::json!({
         "reverted": true,
         "filePath": request.file_path,
+        "sessionId": scope.session_id.as_str(),
+        "workspaceId": scope.workspace_id.as_str(),
+        "workspacePath": workspace_path_string(&scope.workspace_root),
+        "executionGroupId": scope.execution_group_id,
     })))
 }
 
@@ -209,6 +248,10 @@ async fn approve_all_changes(
     Ok(Json(serde_json::json!({
         "approved": true,
         "approvedFiles": paths,
+        "sessionId": scope.session_id.as_str(),
+        "workspaceId": scope.workspace_id.as_str(),
+        "workspacePath": workspace_path_string(&scope.workspace_root),
+        "executionGroupId": scope.execution_group_id,
     })))
 }
 
@@ -237,6 +280,10 @@ async fn revert_all_changes(
     Ok(Json(serde_json::json!({
         "reverted": true,
         "revertedFiles": paths,
+        "sessionId": scope.session_id.as_str(),
+        "workspaceId": scope.workspace_id.as_str(),
+        "workspacePath": workspace_path_string(&scope.workspace_root),
+        "executionGroupId": scope.execution_group_id,
     })))
 }
 
@@ -287,6 +334,9 @@ async fn revert_execution_group_changes(
         "reverted": true,
         "executionGroupId": request.execution_group_id,
         "revertedFiles": paths,
+        "sessionId": scope.session_id.as_str(),
+        "workspaceId": scope.workspace_id.as_str(),
+        "workspacePath": workspace_path_string(&scope.workspace_root),
     })))
 }
 
@@ -305,8 +355,8 @@ async fn get_file_content(
     State(state): State<ApiState>,
     Query(query): Query<FileContentQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let content = if let Some(ref path) = query.file_path {
-        let absolute_path = if query
+    let (content, binding) = if let Some(ref path) = query.file_path {
+        let (absolute_path, binding) = if query
             .session_id
             .as_deref()
             .map(str::trim)
@@ -321,22 +371,31 @@ async fn get_file_content(
                 query.execution_group_id.as_deref(),
             )?;
             let (absolute, _relative) = safe_workspace_path(&scope.workspace_root, path)?;
-            absolute
+            (absolute, session_scope_binding(&scope))
         } else {
-            let root = resolve_workspace_root_or_active(&state, query.workspace_id.as_deref())?;
-            let (absolute, _) = safe_workspace_path(&root, path)?;
-            absolute
+            let scope =
+                resolve_workspace_change_scope_or_active(&state, query.workspace_id.as_deref())?;
+            let (absolute, _) = safe_workspace_path(&scope.workspace_root, path)?;
+            (absolute, workspace_scope_binding(&scope))
         };
-        std::fs::read_to_string(&absolute_path)
-            .map_err(|e| ApiError::internal_assembly("读取文件内容失败", e))?
+        let content = std::fs::read_to_string(&absolute_path)
+            .map_err(|e| ApiError::internal_assembly("读取文件内容失败", e))?;
+        (content, binding)
     } else {
-        String::new()
+        let scope =
+            resolve_workspace_change_scope_or_active(&state, query.workspace_id.as_deref())?;
+        (String::new(), workspace_scope_binding(&scope))
     };
-    Ok(Json(serde_json::json!({
+    let mut payload = serde_json::json!({
         "content": content,
         "filePath": query.file_path,
-        "sessionId": query.session_id,
-    })))
+    });
+    if let Some(object) = payload.as_object_mut()
+        && let Some(binding) = binding.as_object()
+    {
+        object.extend(binding.clone());
+    }
+    Ok(Json(payload))
 }
 
 /// 按文件扩展名推断图片 MIME 类型；非图片返回 None（用于白名单拦截）。
@@ -929,6 +988,15 @@ mod tests {
             .expect("body should read");
         let payload: serde_json::Value =
             serde_json::from_slice(&body).expect("payload should deserialize");
+        assert_eq!(payload["workspaceId"], "ws-session-diff");
+        assert!(
+            payload["workspacePath"]
+                .as_str()
+                .is_some_and(|path| path.contains("magi-changes-route-session-diff")),
+            "diff payload must carry canonical workspace path"
+        );
+        assert_eq!(payload["sessionId"], "sess-session-diff");
+        assert_eq!(payload["executionGroupId"], "mission-diff");
         let diff = payload["diff"].as_str().unwrap_or_default();
         assert!(diff.contains("alpha"), "diff should mention path: {}", diff);
         assert!(
@@ -1026,6 +1094,20 @@ mod tests {
             .expect("route should respond");
 
         assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should read");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&body).expect("payload should deserialize");
+        assert_eq!(payload["workspaceId"], "ws-approve-all");
+        assert!(
+            payload["workspacePath"]
+                .as_str()
+                .is_some_and(|path| path.contains("magi-changes-route-approve-all")),
+            "approve payload must carry canonical workspace path"
+        );
+        assert_eq!(payload["sessionId"], "sess-approve-all");
+        assert_eq!(payload["executionGroupId"], "session:sess-approve-all");
 
         let after = collect_session_pending_changes(
             &state,
