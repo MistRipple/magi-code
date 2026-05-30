@@ -98,6 +98,70 @@
     };
   }
 
+  const TOOL_DISPLAY_NAME_KEYS: Record<string, string> = {
+    'tool_result': 'toolCall.displayName.default',
+    'file_view': 'toolCall.displayName.fileView',
+    'image_view': 'toolCall.displayName.viewImage',
+    'file_create': 'toolCall.displayName.fileCreate',
+    'file_edit': 'toolCall.displayName.fileEdit',
+    'file_insert': 'toolCall.displayName.fileInsert',
+    'code_search_regex': 'toolCall.displayName.grepSearch',
+    'code_search_semantic': 'toolCall.displayName.codebaseRetrieval',
+    'skill_apply': 'toolCall.displayName.skillApply',
+    'project_knowledge_query': 'toolCall.displayName.knowledgeQuery',
+    'code_intel_query': 'toolCall.displayName.codeSymbols',
+    'list_files': 'toolCall.displayName.listFiles',
+    'shell_exec': 'toolCall.displayName.shell',
+    'file_read': 'toolCall.displayName.fileView',
+    'view_image': 'toolCall.displayName.viewImage',
+    'file_write': 'toolCall.displayName.fileCreate',
+    'file_patch': 'toolCall.displayName.fileEdit',
+    'apply_patch': 'toolCall.displayName.applyPatch',
+    'file_remove': 'toolCall.displayName.fileRemove',
+    'file_mkdir': 'toolCall.displayName.fileMkdir',
+    'file_copy': 'toolCall.displayName.fileCopy',
+    'file_move': 'toolCall.displayName.fileMove',
+    'search_text': 'toolCall.displayName.grepSearch',
+    'search_semantic': 'toolCall.displayName.codebaseRetrieval',
+    'process_inspect': 'toolCall.displayName.processInspect',
+    'diff_preview': 'toolCall.displayName.diffPreview',
+    'web_search': 'toolCall.displayName.webSearch',
+    'web_fetch': 'toolCall.displayName.webFetch',
+    'diagram_render': 'toolCall.displayName.diagramRender',
+    'knowledge_query': 'toolCall.displayName.knowledgeQuery',
+    'code_symbols': 'toolCall.displayName.codeSymbols',
+    'tool_catalog': 'toolCall.displayName.toolCatalog',
+    'agent_spawn': 'toolCall.displayName.agentSpawn',
+    'agent_wait': 'toolCall.displayName.agentWait',
+    'todo_write': 'toolCall.displayName.todoWrite',
+    'memory_write': 'toolCall.displayName.memoryWrite',
+    'mission_charter_write': 'toolCall.displayName.missionCharterWrite',
+    'plan_write': 'toolCall.displayName.planWrite',
+    'kg_write': 'toolCall.displayName.kgWrite',
+    'validation_record': 'toolCall.displayName.validationRecord',
+    'checkpoint_create': 'toolCall.displayName.checkpointCreate',
+    'human_checkpoint_request': 'toolCall.displayName.humanCheckpointRequest',
+  };
+
+  function toolDisplayNameI18nKey(name: string): string {
+    const explicitKey = TOOL_DISPLAY_NAME_KEYS[name];
+    if (explicitKey) return explicitKey;
+    const suffix = name
+      .split('_')
+      .filter(Boolean)
+      .map((part, index) => index === 0 ? part : part.charAt(0).toUpperCase() + part.slice(1))
+      .join('');
+    return suffix ? `toolCall.displayName.${suffix}` : '';
+  }
+
+  function formatToolNameFallback(name: string): string {
+    const parts = name.split('_').map((part) => part.trim()).filter(Boolean);
+    if (parts.length === 0) return name;
+    return parts
+      .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+      .join(' ');
+  }
+
   $effect(() => {
     if (status === lastStatus) {
       return;
@@ -143,6 +207,97 @@
     }
   }
 
+  interface ViewImagePreview {
+    src: string;
+    path: string;
+    mime: string;
+    bytes: number | undefined;
+  }
+
+  function parseJsonObjectValue(content: unknown): Record<string, unknown> | null {
+    if (content && typeof content === 'object' && !Array.isArray(content)) {
+      return content as Record<string, unknown>;
+    }
+    if (typeof content !== 'string') {
+      return null;
+    }
+    const trimmed = content.trim();
+    if (!trimmed.startsWith('{')) {
+      return null;
+    }
+    try {
+      const parsed = JSON.parse(trimmed);
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+        ? parsed as Record<string, unknown>
+        : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function isViewImageTool(toolName: string): boolean {
+    const parsed = parseToolIdentity(toolName);
+    return parsed.baseName === 'view_image' || parsed.baseName === 'image_view';
+  }
+
+  function parseViewImagePreview(toolName: string, content: unknown): ViewImagePreview | null {
+    if (!isViewImageTool(toolName)) return null;
+    const payload = parseJsonObjectValue(content);
+    if (!payload) return null;
+    const modelContent = Array.isArray(payload.model_content) ? payload.model_content : [];
+    for (const item of modelContent) {
+      if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+      const source = (item as Record<string, unknown>).source;
+      if (!source || typeof source !== 'object' || Array.isArray(source)) continue;
+      const sourceObj = source as Record<string, unknown>;
+      const mediaType = typeof sourceObj.media_type === 'string'
+        ? sourceObj.media_type
+        : typeof sourceObj.mediaType === 'string'
+          ? sourceObj.mediaType
+          : '';
+      const data = typeof sourceObj.data === 'string' ? sourceObj.data : '';
+      if (!mediaType.startsWith('image/') || !data.trim()) continue;
+      const path = typeof payload.path === 'string' ? payload.path : '';
+      const bytes = typeof payload.bytes === 'number' ? payload.bytes : undefined;
+      return {
+        src: `data:${mediaType};base64,${data}`,
+        path,
+        mime: mediaType,
+        bytes,
+      };
+    }
+    return null;
+  }
+
+  function omitLargeImageData(value: unknown): unknown {
+    if (Array.isArray(value)) {
+      return value.map(omitLargeImageData);
+    }
+    if (!value || typeof value !== 'object') {
+      return value;
+    }
+    const object = value as Record<string, unknown>;
+    const next: Record<string, unknown> = {};
+    for (const [key, child] of Object.entries(object)) {
+      if (key === 'data' && typeof child === 'string' && child.length > 256) {
+        next[key] = `[base64 image data omitted: ${child.length} chars]`;
+      } else {
+        next[key] = omitLargeImageData(child);
+      }
+    }
+    return next;
+  }
+
+  function formatToolOutput(toolName: string, content: unknown): string {
+    if (isViewImageTool(toolName)) {
+      const payload = parseJsonObjectValue(content);
+      if (payload) {
+        return JSON.stringify(omitLargeImageData(payload), null, 2);
+      }
+    }
+    return formatContent(content);
+  }
+
   // 获取工具图标（基于当前项目实际工具名）
   function getToolIcon(toolName: string): IconName {
     if (!toolName || typeof toolName !== 'string') {
@@ -170,6 +325,8 @@
       'file_create': 'file-plus',
       'file_edit': 'pencil',
       'file_insert': 'plus',
+      'view_image': 'eye',
+      'image_view': 'eye',
       'code_search_regex': 'search',
       'file_remove': 'trash',
       'web_search': 'search',
@@ -184,6 +341,7 @@
       'file_read': 'eye',
       'file_write': 'file-plus',
       'file_patch': 'pencil',
+      'apply_patch': 'file-edit',
       'file_mkdir': 'folder',
       'file_copy': 'file-plus',
       'file_move': 'file-plus',
@@ -192,6 +350,18 @@
       'process_inspect': 'terminal',
       'diff_preview': 'file-text',
       'knowledge_query': 'question',
+      'code_symbols': 'search',
+      'tool_catalog': 'tool',
+      'agent_spawn': 'bot',
+      'agent_wait': 'hourglass',
+      'todo_write': 'list',
+      'memory_write': 'database',
+      'mission_charter_write': 'document',
+      'plan_write': 'list',
+      'kg_write': 'git-branch',
+      'validation_record': 'check-circle',
+      'checkpoint_create': 'shield',
+      'human_checkpoint_request': 'profile',
     };
 
     if (iconMap[baseToolName]) {
@@ -320,7 +490,9 @@
 
   // 检查是否有内容
   const hasInput = $derived(!!input && !!formatContent(input));
-  const hasOutput = $derived(!!output && !!formatContent(output));
+  const imagePreview = $derived(parseViewImagePreview(name, output));
+  const outputText = $derived(formatToolOutput(name, output));
+  const hasOutput = $derived(!!output && (!!outputText || !!imagePreview));
   const hasError = $derived(!!error && !!error.trim());
 
   const diagramPayload = $derived(parseToolDiagramPayload(name, output));
@@ -355,40 +527,9 @@
       return parsedTool.displayName;
     }
     const baseToolName = parsedTool.baseName;
-
-    // 文件操作工具直接使用语义化显示名
-    const displayNameMap: Record<string, string> = {
-      'tool_result': i18n.t('toolCall.displayName.default'),
-      'file_view': i18n.t('toolCall.displayName.fileView'),
-      'file_create': i18n.t('toolCall.displayName.fileCreate'),
-      'file_edit': i18n.t('toolCall.displayName.fileEdit'),
-      'file_insert': i18n.t('toolCall.displayName.fileInsert'),
-      'code_search_regex': i18n.t('toolCall.displayName.grepSearch'),
-      'file_remove': i18n.t('toolCall.displayName.fileRemove'),
-      'web_search': i18n.t('toolCall.displayName.webSearch'),
-      'web_fetch': i18n.t('toolCall.displayName.webFetch'),
-      'diagram_render': i18n.t('toolCall.displayName.diagramRender'),
-      'code_search_semantic': i18n.t('toolCall.displayName.codebaseRetrieval'),
-      'skill_apply': 'skill_apply',
-      'project_knowledge_query': 'project_knowledge_query',
-      'code_intel_query': 'code_intel_query',
-      'list_files': i18n.t('toolCall.displayName.listFiles'),
-      // 后端规范名
-      'shell_exec': i18n.t('toolCall.displayName.shell'),
-      'file_read': i18n.t('toolCall.displayName.fileView'),
-      'file_write': i18n.t('toolCall.displayName.fileCreate'),
-      'file_patch': i18n.t('toolCall.displayName.fileEdit'),
-      'file_mkdir': 'file_mkdir',
-      'file_copy': 'file_copy',
-      'file_move': 'file_move',
-      'search_text': i18n.t('toolCall.displayName.grepSearch'),
-      'search_semantic': i18n.t('toolCall.displayName.codebaseRetrieval'),
-      'process_inspect': i18n.t('toolCall.displayName.processInspect'),
-      'diff_preview': 'diff_preview',
-      'knowledge_query': 'project_knowledge_query',
-    };
-
-    return displayNameMap[baseToolName] ?? baseToolName;
+    const key = toolDisplayNameI18nKey(baseToolName);
+    const translated = key ? i18n.t(key) : '';
+    return translated && translated !== key ? translated : formatToolNameFallback(baseToolName);
   }
 
   // 从工具参数中提取语义摘要
@@ -411,10 +552,16 @@
       case 'file_edit':
       case 'file_insert':
       case 'file_read':
+      case 'view_image':
+      case 'image_view':
       case 'file_write':
       case 'file_patch':
+      case 'apply_patch':
       case 'list_files': {
-        const p = typeof args.path === 'string' ? args.path : '';
+        const p = typeof args.path === 'string' ? args.path
+          : typeof args.file_path === 'string' ? args.file_path
+          : typeof args.image_path === 'string' ? args.image_path
+          : '';
         return p;
       }
       case 'code_search_regex':
@@ -456,9 +603,23 @@
       case 'diff_preview':
         return '';
       case 'file_mkdir':
-      case 'file_copy':
-      case 'file_move':
         return typeof args.path === 'string' ? args.path : '';
+      case 'file_copy':
+      case 'file_move': {
+        const source = typeof args.source === 'string' ? args.source : '';
+        const destination = typeof args.destination === 'string' ? args.destination : '';
+        return source && destination ? `${source} → ${destination}` : source || destination;
+      }
+      case 'code_symbols': {
+        const action = typeof args.action === 'string' ? args.action : '';
+        const symbolName = typeof args.name === 'string' ? args.name : '';
+        const p = typeof args.path === 'string' ? args.path : '';
+        return [action, symbolName || p].filter(Boolean).join(' ');
+      }
+      case 'agent_wait': {
+        const taskIds = Array.isArray(args.task_ids) ? args.task_ids : [];
+        return taskIds.map(String).filter(Boolean).join(', ');
+      }
       default:
         // MCP 或其他未知工具：尝试提取常见字段
         return (typeof args.command === 'string' ? args.command : '')
@@ -487,7 +648,6 @@
   const toolSummary = $derived(diagramPayload ? diagramSummary(diagramPayload) : getToolSummary(name, input));
 
   // 判断输出内容是否包含 markdown 格式（标题、表格、列表等）
-  const outputText = $derived(formatContent(output));
   const isToolOutputStreaming = $derived(status === 'running' || status === 'pending');
   const isMarkdownOutput = $derived.by(() => {
     if (!outputText || outputText.length < 20) return false;
@@ -639,7 +799,7 @@
   }
 
   async function copyOutput() {
-    const content = formatContent(output);
+    const content = formatToolOutput(name, output);
     if (!content) return;
     try {
       await navigator.clipboard.writeText(content);
@@ -834,7 +994,20 @@
                     <Icon name={copySuccess ? 'check' : 'copy'} size={12} />
                   </button>
                 </div>
-                {#if isMarkdownOutput}
+                {#if imagePreview}
+                  <div class="image-output-preview">
+                    <img src={imagePreview.src} alt={imagePreview.path || toolDisplayName} />
+                    <div class="image-output-meta">
+                      {#if imagePreview.path}
+                        <span title={imagePreview.path}>{imagePreview.path}</span>
+                      {/if}
+                      <span>{imagePreview.mime}</span>
+                      {#if typeof imagePreview.bytes === 'number'}
+                        <span>{imagePreview.bytes.toLocaleString()} bytes</span>
+                      {/if}
+                    </div>
+                  </div>
+                {:else if isMarkdownOutput}
                   <div class="markdown-output">
                     <MarkdownContent content={outputText} isStreaming={isToolOutputStreaming} />
                   </div>
@@ -1165,6 +1338,38 @@
     word-break: break-word;
     max-height: 300px;
     overflow-y: auto;
+  }
+
+  .image-output-preview {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+  }
+
+  .image-output-preview img {
+    display: block;
+    max-width: min(100%, 640px);
+    max-height: 420px;
+    object-fit: contain;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--code-bg);
+  }
+
+  .image-output-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+    font-size: var(--text-xs);
+    color: var(--foreground-muted);
+  }
+
+  .image-output-meta span {
+    min-width: 0;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .error-content {
