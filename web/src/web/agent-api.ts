@@ -975,18 +975,19 @@ export async function getWorkspaceSessions(
 
 export async function loadAgentSessionSnapshot(
   sessionId: string,
-  options: { limit?: number; beforeCursor?: string; workspaceId?: string } = {},
+  options: { limit?: number; beforeCursor?: string; workspaceId: string },
 ): Promise<MessagesResponseDto> {
   try {
     const binding = resolveAgentBindingContext();
+    const workspaceId = options.workspaceId.trim() || binding.workspaceId;
+    if (!workspaceId) {
+      throw new Error('workspaceId 不能为空');
+    }
     const query = new URLSearchParams({
       sessionId: sessionId.trim(),
+      workspaceId,
       limit: String(options.limit ?? 50),
     });
-    const workspaceId = options.workspaceId?.trim() || binding.workspaceId;
-    if (workspaceId) {
-      query.set('workspaceId', workspaceId);
-    }
     if (options.beforeCursor?.trim()) {
       query.set('beforeCursor', options.beforeCursor.trim());
     }

@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use super::session_scope::{
     parse_session_id, require_current_session_record_in_workspace,
-    require_session_record_in_workspace,
+    require_session_record_in_workspace, require_workspace_id,
 };
 use crate::{errors::ApiError, state::ApiState};
 
@@ -46,11 +46,7 @@ async fn get_messages(
     State(state): State<ApiState>,
     Query(query): Query<MessagesQuery>,
 ) -> Result<Json<MessagesResponseDto>, ApiError> {
-    let requested_workspace_id = query
-        .workspace_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|workspace_id| !workspace_id.is_empty());
+    let requested_workspace_id = require_workspace_id(query.workspace_id.as_deref())?;
     let current_session = match query
         .session_id
         .as_deref()
@@ -59,16 +55,18 @@ async fn get_messages(
     {
         Some(id) => {
             let sid = parse_session_id(Some(id))?;
-            require_session_record_in_workspace(&state, &sid, requested_workspace_id)?
+            require_session_record_in_workspace(
+                &state,
+                &sid,
+                Some(requested_workspace_id.as_str()),
+            )?
         }
-        None => require_current_session_record_in_workspace(&state, requested_workspace_id)?,
+        None => require_current_session_record_in_workspace(
+            &state,
+            Some(requested_workspace_id.as_str()),
+        )?,
     };
     let session_id = current_session.session_id.clone();
-    let scope_workspace_id = requested_workspace_id.map(str::to_string).or_else(|| {
-        state
-            .session_workspace_id(&current_session)
-            .map(|workspace_id| workspace_id.to_string())
-    });
 
     let timeline = state.session_store.timeline_for_session(&session_id);
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
@@ -86,7 +84,7 @@ async fn get_messages(
     };
     let start = end.saturating_sub(limit);
     let page = timeline[start..end].to_vec();
-    let sessions = state.session_records_for_workspace(scope_workspace_id.as_deref());
+    let sessions = state.session_records_for_workspace(Some(requested_workspace_id.as_str()));
     let canonical_turns = state.session_store.canonical_turns_for_session(&session_id);
     let before_cursor = page.first().map(|entry| entry.entry_id.clone());
 
@@ -129,6 +127,55 @@ mod tests {
             Arc::new(WorkspaceStore::default()),
             Arc::new(GovernanceService::default()),
         )
+    }
+
+    async fn read_json_response(response: axum::response::Response) -> serde_json::Value {
+        serde_json::from_slice::<serde_json::Value>(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should read"),
+        )
+        .expect("body should be json")
+    }
+
+    #[tokio::test]
+    async fn messages_requires_workspace_scope() {
+        let session_id = SessionId::new("session-messages-requires-workspace");
+        let store = SessionStore::default();
+        store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "必须绑定工作区查询",
+                Some("workspace-messages-required".to_string()),
+            )
+            .expect("session should create");
+        store.append_timeline_entry(
+            session_id.clone(),
+            TimelineEntryKind::UserMessage,
+            "真实消息",
+        );
+        let state = test_state(store);
+
+        let response = routes()
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/messages?sessionId=session-messages-requires-workspace")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = read_json_response(response).await;
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("workspaceId 不能为空"),
+            "unexpected body: {body}"
+        );
     }
 
     #[tokio::test]
@@ -182,12 +229,7 @@ mod tests {
             .expect("route should respond");
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        let body = serde_json::from_slice::<serde_json::Value>(
-            &to_bytes(response.into_body(), usize::MAX)
-                .await
-                .expect("body should read"),
-        )
-        .expect("body should be json");
+        let body = read_json_response(response).await;
         assert!(
             body["message"]
                 .as_str()
