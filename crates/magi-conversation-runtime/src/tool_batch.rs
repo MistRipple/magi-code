@@ -1554,22 +1554,45 @@ fn task_policy_tool_decision(
             Some(policy_snapshot.access_profile),
         ));
     }
-    // PermissionEngine 比对工具名是按字面比对，因此把 policy 中的别名先 canonical 化。
-    let mut canonical_policy =
-        magi_permissions::PermissionPolicy::from_core_policy(policy_snapshot);
-    canonical_policy.allowed_tools = policy_snapshot
-        .allowed_tools
-        .iter()
-        .map(|tool| canonical_builtin_tool_name(tool).unwrap_or_else(|| tool.trim().to_string()))
-        .collect();
-    canonical_policy.denied_tools = policy_snapshot
-        .denied_tools
-        .iter()
-        .map(|tool| canonical_builtin_tool_name(tool).unwrap_or_else(|| tool.trim().to_string()))
-        .collect();
 
+    access_profile_tool_decision(
+        policy_snapshot.access_profile,
+        &policy_snapshot.command_mode,
+        &policy_snapshot.allowed_tools,
+        &policy_snapshot.denied_tools,
+        requested_tool_name,
+        arguments,
+    )
+}
+
+pub(crate) fn access_profile_tool_decision(
+    access_profile: magi_core::AccessProfile,
+    command_mode: &str,
+    allowed_tools: &[String],
+    denied_tools: &[String],
+    requested_tool_name: &str,
+    arguments: &str,
+) -> Option<ToolPreflightDecision> {
+    let canonical_tool_name = canonical_builtin_tool_name(requested_tool_name)
+        .unwrap_or_else(|| requested_tool_name.trim().to_string());
+    // PermissionEngine 比对工具名是按字面比对，因此把 policy 中的别名先 canonical 化。
+    let canonical_policy = magi_permissions::PermissionPolicy {
+        allowed_tools: allowed_tools
+            .iter()
+            .map(|tool| {
+                canonical_builtin_tool_name(tool).unwrap_or_else(|| tool.trim().to_string())
+            })
+            .collect(),
+        denied_tools: denied_tools
+            .iter()
+            .map(|tool| {
+                canonical_builtin_tool_name(tool).unwrap_or_else(|| tool.trim().to_string())
+            })
+            .collect(),
+        command_mode: command_mode.to_string(),
+        ..magi_permissions::PermissionPolicy::default()
+    };
     let engine = magi_permissions::PermissionEngine::with_builtin_defaults();
-    let access_profile = policy_snapshot.access_profile;
     let is_write_tool = BuiltinToolName::from_str(canonical_tool_name.as_str())
         .is_some_and(|tool| tool.is_write_operation());
 
@@ -1600,7 +1623,7 @@ fn task_policy_tool_decision(
     None
 }
 
-fn select_preflight_decision(
+pub(crate) fn select_preflight_decision(
     task_policy_decision: Option<ToolPreflightDecision>,
     safety_gate_decision: Option<ToolPreflightDecision>,
 ) -> Option<ToolPreflightDecision> {

@@ -5,7 +5,9 @@ use crate::tool_result_utils::{
 use crate::{
     SKILL_APPLY_TOOL_NAME, execute_skill_apply_from_runtime, execute_skill_custom_tool,
     internal_builtin_tool_rejection_payload, parse_skill_custom_tool_name,
-    tool_batch::safety_gate_tool_decision,
+    tool_batch::{
+        access_profile_tool_decision, safety_gate_tool_decision, select_preflight_decision,
+    },
 };
 use magi_bridge_client::{
     ChatMessage, ChatToolCall,
@@ -943,13 +945,23 @@ fn execute_session_turn_tool_call(
         return (rejection, ExecutionResultStatus::Failed);
     }
 
-    if let Some(gate) = safety_gate
-        && let Some(decision) = safety_gate_tool_decision(
+    let access_profile_decision = access_profile_tool_decision(
+        access_profile,
+        "",
+        &[],
+        &[],
+        &tool_call.function.name,
+        &tool_call.function.arguments,
+    );
+    let safety_gate_decision = safety_gate.and_then(|gate| {
+        safety_gate_tool_decision(
             gate,
             access_profile,
             &tool_call.function.name,
             &tool_call.function.arguments,
         )
+    });
+    if let Some(decision) = select_preflight_decision(access_profile_decision, safety_gate_decision)
     {
         return (decision.payload, decision.status);
     }
@@ -1399,6 +1411,142 @@ mod tests {
                 .expect("error should be string")
                 .contains("shell_exec")
         );
+    }
+
+    #[test]
+    fn execute_session_turn_tool_call_rejects_write_tool_in_read_only_access_profile() {
+        let mut tool_registry = ToolRegistry::new(
+            Arc::new(GovernanceService::default()),
+            Arc::new(InMemoryEventBus::new(8)),
+        );
+        tool_registry.register_default_builtins();
+        let event_bus = InMemoryEventBus::new(8);
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().to_path_buf();
+        let target = root.join("blocked.txt");
+        let call = ChatToolCall {
+            id: "tool-call-read-only-file-write".to_string(),
+            kind: "function".to_string(),
+            function: ChatToolFunction {
+                name: "file_write".to_string(),
+                arguments: serde_json::json!({
+                    "path": target.to_string_lossy(),
+                    "content": "should not write"
+                })
+                .to_string(),
+            },
+        };
+
+        let (payload, status) = execute_session_turn_tool_call(
+            &event_bus,
+            Some(&tool_registry),
+            None,
+            None,
+            None,
+            None,
+            &call,
+            &SessionId::new("session-read-only-tool"),
+            &None,
+            Some(&root),
+            magi_core::AccessProfile::ReadOnly,
+        );
+
+        assert_eq!(status, ExecutionResultStatus::Rejected);
+        assert!(!target.exists(), "只读访问模式下 file_write 不能落盘");
+        let parsed: serde_json::Value = serde_json::from_str(&payload).expect("payload json");
+        assert_eq!(parsed["tool"], "file_write");
+        assert_eq!(parsed["status"], "rejected");
+        assert_eq!(parsed["access_profile"], "read_only");
+    }
+
+    #[test]
+    fn execute_session_turn_tool_call_requires_approval_for_write_shell_in_restricted_profile() {
+        let mut tool_registry = ToolRegistry::new(
+            Arc::new(GovernanceService::default()),
+            Arc::new(InMemoryEventBus::new(8)),
+        );
+        tool_registry.register_default_builtins();
+        let event_bus = InMemoryEventBus::new(8);
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().to_path_buf();
+        let target = root.join("blocked-shell.txt");
+        let call = ChatToolCall {
+            id: "tool-call-restricted-shell".to_string(),
+            kind: "function".to_string(),
+            function: ChatToolFunction {
+                name: "shell_exec".to_string(),
+                arguments: serde_json::json!({
+                    "command": format!("printf restricted > {}", target.display())
+                })
+                .to_string(),
+            },
+        };
+
+        let (payload, status) = execute_session_turn_tool_call(
+            &event_bus,
+            Some(&tool_registry),
+            None,
+            None,
+            None,
+            None,
+            &call,
+            &SessionId::new("session-restricted-shell"),
+            &None,
+            Some(&root),
+            magi_core::AccessProfile::Restricted,
+        );
+
+        assert_eq!(status, ExecutionResultStatus::NeedsApproval);
+        assert!(
+            !target.exists(),
+            "受限模式下写类 shell 需要审批，不能提前执行"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&payload).expect("payload json");
+        assert_eq!(parsed["tool"], "shell_exec");
+        assert_eq!(parsed["status"], "needs_approval");
+        assert_eq!(parsed["access_profile"], "restricted");
+    }
+
+    #[test]
+    fn execute_session_turn_tool_call_allows_read_only_shell_in_read_only_profile() {
+        let mut tool_registry = ToolRegistry::new(
+            Arc::new(GovernanceService::default()),
+            Arc::new(InMemoryEventBus::new(8)),
+        );
+        tool_registry.register_default_builtins();
+        let event_bus = InMemoryEventBus::new(8);
+        let call = ChatToolCall {
+            id: "tool-call-read-only-shell".to_string(),
+            kind: "function".to_string(),
+            function: ChatToolFunction {
+                name: "shell_exec".to_string(),
+                arguments: serde_json::json!({
+                    "command": "printf readonly",
+                    "access_mode": "read_only"
+                })
+                .to_string(),
+            },
+        };
+
+        let (payload, status) = execute_session_turn_tool_call(
+            &event_bus,
+            Some(&tool_registry),
+            None,
+            None,
+            None,
+            None,
+            &call,
+            &SessionId::new("session-read-only-shell"),
+            &None,
+            None,
+            magi_core::AccessProfile::ReadOnly,
+        );
+
+        assert_eq!(status, ExecutionResultStatus::Succeeded);
+        let parsed: serde_json::Value = serde_json::from_str(&payload).expect("payload json");
+        assert_eq!(parsed["tool"], "shell_exec");
+        assert_eq!(parsed["access_mode"], "read_only");
+        assert_eq!(parsed["stdout"], "readonly");
     }
 
     #[test]
