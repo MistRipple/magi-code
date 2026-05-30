@@ -32,10 +32,12 @@ export interface SettingsCapabilityDependency {
   status: string;
   requiredBy: string[];
   workspaceId?: string | null;
+  sessionId?: string | null;
   fileCount?: number | null;
   lastIndexed?: number | null;
   roleCount?: number | null;
   spawnableRoleCount?: number | null;
+  snapshotActive?: boolean | null;
 }
 
 export interface SettingsRuntimeSnapshot {

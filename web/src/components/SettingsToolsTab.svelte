@@ -46,10 +46,12 @@
       status: string;
       requiredBy: string[];
       workspaceId?: string | null;
+      sessionId?: string | null;
       fileCount?: number | null;
       lastIndexed?: number | null;
       roleCount?: number | null;
       spawnableRoleCount?: number | null;
+      snapshotActive?: boolean | null;
     }>;
     skills: any[];
     openMCPDialog: (server: any) => void;
@@ -158,6 +160,8 @@
         return i18n.t('settings.tools.dependency.workspaceCodeIndex');
       case 'agent_role_registry':
         return i18n.t('settings.tools.dependency.agentRoleRegistry');
+      case 'file_snapshot':
+        return i18n.t('settings.tools.dependency.fileSnapshot');
       default:
         return name;
     }
@@ -203,6 +207,8 @@
         return 'search';
       case 'agent_role_registry':
         return 'bot';
+      case 'file_snapshot':
+        return 'file';
       default:
         return 'tools';
     }
@@ -212,6 +218,7 @@
     name: string;
     fileCount?: number | null;
     spawnableRoleCount?: number | null;
+    snapshotActive?: boolean | null;
   }): string {
     if (dependency.name === 'workspace_code_index' && typeof dependency.fileCount === 'number') {
       return i18n.t('settings.tools.dependency.fileCount', { count: dependency.fileCount });
@@ -220,6 +227,11 @@
       return i18n.t('settings.tools.dependency.spawnableRoleCount', {
         count: dependency.spawnableRoleCount,
       });
+    }
+    if (dependency.name === 'file_snapshot' && typeof dependency.snapshotActive === 'boolean') {
+      return i18n.t(dependency.snapshotActive
+        ? 'settings.tools.dependency.snapshotActive'
+        : 'settings.tools.dependency.snapshotInactive');
     }
     return '';
   }
@@ -230,6 +242,7 @@
     requiredBy: string[];
     fileCount?: number | null;
     spawnableRoleCount?: number | null;
+    snapshotActive?: boolean | null;
   }): string {
     const parts = [
       `${getCapabilityDependencyLabel(dependency.name)}: ${getCapabilityDependencyStatusLabel(dependency.status)}`,

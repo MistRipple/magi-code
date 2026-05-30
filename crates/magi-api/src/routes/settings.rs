@@ -13,6 +13,7 @@ use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 
 use crate::{errors::ApiError, model_config::NormalizedModelConfig, state::ApiState};
 
@@ -655,6 +656,8 @@ fn settings_bootstrap_tool_context(query: &HashMap<String, String>) -> ToolExecu
             .map(SessionId::new),
         workspace_id: parse_optional_query_string(query, "workspaceId", "workspace_id")
             .map(WorkspaceId::new),
+        working_directory: parse_optional_query_string(query, "workspacePath", "workspace_path")
+            .map(PathBuf::from),
         ..ToolExecutionContext::default()
     }
 }
@@ -1375,7 +1378,7 @@ mod tests {
         let capability_dependencies = bootstrap["capabilityDependencies"]
             .as_array()
             .expect("capability dependencies should be an array");
-        assert_eq!(capability_dependencies.len(), 3);
+        assert_eq!(capability_dependencies.len(), 4);
         assert_eq!(
             capability_dependencies[0]["name"],
             serde_json::json!("knowledge_store")
@@ -1385,12 +1388,37 @@ mod tests {
             serde_json::json!("unavailable")
         );
         assert_eq!(
+            capability_dependencies[0]["requiredBy"],
+            serde_json::json!(["knowledge_query", "search_semantic", "code_symbols"])
+        );
+        assert!(
+            capability_dependencies[0].get("required_by").is_none(),
+            "settings bootstrap should expose dependency fields in frontend camelCase"
+        );
+        assert_eq!(
             capability_dependencies[1]["name"],
             serde_json::json!("workspace_code_index")
         );
         assert_eq!(
+            capability_dependencies[1]["workspaceId"],
+            serde_json::json!("workspace-contract")
+        );
+        assert_eq!(
             capability_dependencies[2]["name"],
             serde_json::json!("agent_role_registry")
+        );
+        assert_eq!(
+            capability_dependencies[3]["name"],
+            serde_json::json!("file_snapshot")
+        );
+        assert_eq!(
+            capability_dependencies[3]["status"],
+            serde_json::json!("not_ready"),
+            "snapshot dependency should be visible even before the lazy snapshot session starts"
+        );
+        assert_eq!(
+            capability_dependencies[3]["sessionId"],
+            serde_json::json!("session-empty-contract")
         );
         assert!(
             builtin_tools

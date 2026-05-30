@@ -138,10 +138,12 @@ export interface CapabilityDependencyItem {
   status: string;
   requiredBy: string[];
   workspaceId?: string | null;
+  sessionId?: string | null;
   fileCount?: number | null;
   lastIndexed?: number | null;
   roleCount?: number | null;
   spawnableRoleCount?: number | null;
+  snapshotActive?: boolean | null;
 }
 
 function notifySettingsSuccess(
@@ -2371,29 +2373,46 @@ function createSettingsStore(props: { onClose?: () => void }) {
 
   function applyCapabilityDependenciesPayload(dependenciesPayload: unknown): void {
     const dependencies: CapabilityDependencyItem[] = [];
+    const readDependencyField = (dependency: any, camelKey: string, snakeKey: string): unknown =>
+      dependency?.[camelKey] ?? dependency?.[snakeKey];
     for (const dependency of ensureArray<any>(dependenciesPayload)) {
       const name = typeof dependency?.name === "string" ? dependency.name.trim() : "";
       if (!name) {
         continue;
       }
+      const fileCount = readDependencyField(dependency, "fileCount", "file_count");
+      const lastIndexed = readDependencyField(dependency, "lastIndexed", "last_indexed");
+      const roleCount = readDependencyField(dependency, "roleCount", "role_count");
+      const spawnableRoleCount = readDependencyField(dependency, "spawnableRoleCount", "spawnable_role_count");
+      const workspaceId = readDependencyField(dependency, "workspaceId", "workspace_id");
+      const sessionId = readDependencyField(dependency, "sessionId", "session_id");
+      const snapshotActive = readDependencyField(dependency, "snapshotActive", "snapshot_active");
       dependencies.push({
         name,
         status: typeof dependency?.status === "string" ? dependency.status : "unknown",
-        requiredBy: ensureArray<string>(dependency?.requiredBy)
+        requiredBy: ensureArray<string>(readDependencyField(dependency, "requiredBy", "required_by"))
           .filter((tool): tool is string => typeof tool === "string" && tool.trim().length > 0)
           .map((tool) => tool.trim()),
-        workspaceId: typeof dependency?.workspaceId === "string" ? dependency.workspaceId : null,
-        fileCount: typeof dependency?.fileCount === "number" && Number.isFinite(dependency.fileCount)
-          ? dependency.fileCount
+        workspaceId: typeof workspaceId === "string"
+          ? workspaceId
           : null,
-        lastIndexed: typeof dependency?.lastIndexed === "number" && Number.isFinite(dependency.lastIndexed)
-          ? dependency.lastIndexed
+        sessionId: typeof sessionId === "string"
+          ? sessionId
           : null,
-        roleCount: typeof dependency?.roleCount === "number" && Number.isFinite(dependency.roleCount)
-          ? dependency.roleCount
+        fileCount: typeof fileCount === "number" && Number.isFinite(fileCount)
+          ? fileCount
           : null,
-        spawnableRoleCount: typeof dependency?.spawnableRoleCount === "number" && Number.isFinite(dependency.spawnableRoleCount)
-          ? dependency.spawnableRoleCount
+        lastIndexed: typeof lastIndexed === "number" && Number.isFinite(lastIndexed)
+          ? lastIndexed
+          : null,
+        roleCount: typeof roleCount === "number" && Number.isFinite(roleCount)
+          ? roleCount
+          : null,
+        spawnableRoleCount: typeof spawnableRoleCount === "number" && Number.isFinite(spawnableRoleCount)
+          ? spawnableRoleCount
+          : null,
+        snapshotActive: typeof snapshotActive === "boolean"
+          ? snapshotActive
           : null,
       });
     }

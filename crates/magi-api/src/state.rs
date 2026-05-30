@@ -1096,7 +1096,7 @@ impl ApiState {
             "repositories": array_section(&snapshot, "repositories"),
             "mcpServers": array_section(&snapshot, "mcpServers"),
             "builtinTools": self.builtin_tools_json(&tool_catalog),
-            "capabilityDependencies": self.capability_dependencies_json(&tool_catalog),
+            "capabilityDependencies": self.capability_dependencies_json(&tool_catalog, tool_context),
             "workerStatuses": object_section(&snapshot, "workerStatuses"),
             "runtimeSettings": runtime_settings_from_snapshot(&snapshot),
             "roleTemplates": builtin_role_templates(),
@@ -1145,11 +1145,55 @@ impl ApiState {
         serde_json::Value::Array(tools)
     }
 
-    fn capability_dependencies_json(&self, tool_catalog: &serde_json::Value) -> serde_json::Value {
-        tool_catalog
+    fn capability_dependencies_json(
+        &self,
+        tool_catalog: &serde_json::Value,
+        tool_context: &ToolExecutionContext,
+    ) -> serde_json::Value {
+        let mut dependencies = tool_catalog
             .get("runtime_dependencies")
-            .cloned()
-            .unwrap_or_else(|| serde_json::Value::Array(Vec::new()))
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .map(normalize_capability_dependency_json)
+            .collect::<Vec<_>>();
+        dependencies.push(self.file_snapshot_dependency_json(tool_context));
+        serde_json::Value::Array(dependencies)
+    }
+
+    fn file_snapshot_dependency_json(
+        &self,
+        tool_context: &ToolExecutionContext,
+    ) -> serde_json::Value {
+        let session_id = tool_context.session_id.as_ref().map(ToString::to_string);
+        let workspace_id = tool_context.workspace_id.as_ref().map(ToString::to_string);
+        let has_workspace_root = tool_context
+            .workspace_id
+            .as_ref()
+            .and_then(|workspace_id| self.workspace_root_path(&Some(workspace_id.clone())))
+            .or_else(|| tool_context.working_directory.clone())
+            .is_some();
+        let snapshot_active = session_id
+            .as_deref()
+            .is_some_and(|session_id| self.snapshot_manager.get_session(session_id).is_some());
+        let status = if session_id.is_none() || workspace_id.is_none() {
+            "missing_context"
+        } else if snapshot_active {
+            "ready"
+        } else if has_workspace_root {
+            "not_ready"
+        } else {
+            "unavailable"
+        };
+
+        serde_json::json!({
+            "name": "file_snapshot",
+            "status": status,
+            "workspaceId": workspace_id,
+            "sessionId": session_id,
+            "snapshotActive": snapshot_active,
+            "requiredBy": ["changes/diff", "changes/approve", "changes/revert"],
+        })
     }
 
     pub fn settings_runtime_json(&self) -> serde_json::Value {
@@ -1443,6 +1487,31 @@ fn alias_snapshot_keys(snapshot: &mut HashMap<String, serde_json::Value>) {
             }
         }
     }
+}
+
+fn normalize_capability_dependency_json(raw: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "name": raw.get("name").cloned().unwrap_or(serde_json::Value::Null),
+        "status": raw.get("status").cloned().unwrap_or(serde_json::Value::String("unknown".to_string())),
+        "requiredBy": capability_dependency_field(raw, "requiredBy", "required_by")
+            .unwrap_or_else(|| serde_json::json!([])),
+        "workspaceId": capability_dependency_field(raw, "workspaceId", "workspace_id"),
+        "fileCount": capability_dependency_field(raw, "fileCount", "file_count"),
+        "lastIndexed": capability_dependency_field(raw, "lastIndexed", "last_indexed"),
+        "roleCount": capability_dependency_field(raw, "roleCount", "role_count"),
+        "spawnableRoleCount": capability_dependency_field(raw, "spawnableRoleCount", "spawnable_role_count"),
+    })
+}
+
+fn capability_dependency_field(
+    raw: &serde_json::Value,
+    camel_key: &str,
+    snake_key: &str,
+) -> Option<serde_json::Value> {
+    raw.get(camel_key)
+        .or_else(|| raw.get(snake_key))
+        .cloned()
+        .filter(|value| !value.is_null())
 }
 
 fn object_section(snapshot: &HashMap<String, serde_json::Value>, key: &str) -> serde_json::Value {
