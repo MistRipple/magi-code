@@ -21,7 +21,7 @@
     type CodeTabPayload,
     type AgentTabPayload,
   } from '../stores/right-pane.svelte';
-  import { getAgentFilePreview, agentUrl, buildWorkspaceBoundQuery } from './agent-api';
+  import { getAgentFilePreview, agentUrl, buildFilePreviewQuery } from './agent-api';
 
   interface Props {
     workspaceRoot: string;
@@ -75,6 +75,15 @@
   const activeContentKind = $derived(activeCodePayload?.contentKind ?? 'text');
   const explicitContent = $derived(activeCodePayload?.content ?? null);
   const explicitDiff = $derived(activeCodePayload?.diff ?? null);
+  const activeFilePreviewQuery = $derived.by(() => {
+    if (!activeFilePath) return '';
+    return buildFilePreviewQuery(activeFilePath, {
+      includeSession: false,
+      sessionId: activeCodePayload?.sessionId,
+      workspaceId: activeCodePayload?.workspaceId,
+      workspacePath: activeCodePayload?.workspacePath,
+    });
+  });
 
   /**
    * 是否需要异步拉取内容：text 类型、未带 content、未带 diff、且非二进制/word 文件。
@@ -605,7 +614,7 @@
         >
           <img
             class="right-pane-image-el"
-            src={agentUrl('/api/files/raw', buildWorkspaceBoundQuery({ filePath: activeFilePath }))}
+            src={agentUrl('/api/files/raw', activeFilePreviewQuery)}
             alt={displayPath}
             draggable="false"
             style={`transform: translate(${imagePanX}px, ${imagePanY}px) scale(${imageZoom});`}

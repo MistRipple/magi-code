@@ -691,6 +691,21 @@ export function buildWorkspaceBoundQuery(extra: Record<string, string>): string 
   return buildBoundQuery(extra, { includeSession: false });
 }
 
+export function buildFilePreviewQuery(
+  filePath: string,
+  options: { includeSession?: boolean; sessionId?: string; workspaceId?: string; workspacePath?: string } = {},
+): string {
+  return buildBoundQueryWithOverride(
+    { filePath },
+    {
+      sessionId: options.sessionId,
+      workspaceId: options.workspaceId,
+      workspacePath: options.workspacePath,
+    },
+    { includeSession: options.includeSession },
+  );
+}
+
 function resolveBindingOverrideValue(
   bindingOverride: Partial<AgentBindingContext> | undefined,
   key: keyof AgentBindingContext,
@@ -1535,15 +1550,7 @@ export async function getAgentFilePreview(
   options: { includeSession?: boolean; sessionId?: string; workspaceId?: string; workspacePath?: string } = {},
 ): Promise<AgentFilePreviewPayload> {
   try {
-    const query = buildBoundQueryWithOverride(
-      { filePath },
-      {
-        sessionId: options.sessionId,
-        workspaceId: options.workspaceId,
-        workspacePath: options.workspacePath,
-      },
-      { includeSession: options.includeSession },
-    );
+    const query = buildFilePreviewQuery(filePath, options);
     const response = await getTransport().request(agentUrl(`/api/files/content`, query));
     return await parseAgentJson<AgentFilePreviewPayload>(response, 'load file preview');
   } catch (error) {

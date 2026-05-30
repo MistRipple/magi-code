@@ -152,13 +152,6 @@ pub(crate) fn resolve_session_change_scope(
     })
 }
 
-pub(crate) fn resolve_workspace_root_or_active(
-    state: &ApiState,
-    workspace_id: Option<&str>,
-) -> Result<PathBuf, ApiError> {
-    resolve_workspace_change_scope_or_active(state, workspace_id).map(|scope| scope.workspace_root)
-}
-
 pub(crate) fn resolve_workspace_change_scope_or_active(
     state: &ApiState,
     workspace_id: Option<&str>,

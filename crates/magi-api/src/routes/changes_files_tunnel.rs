@@ -18,8 +18,7 @@ use super::session_scope::{parse_session_id, require_workspace_id};
 use crate::{
     change_projection::{
         SessionChangeScope, WorkspaceChangeScope, resolve_session_change_scope,
-        resolve_workspace_change_scope_or_active, resolve_workspace_root_or_active,
-        safe_relative_path, safe_workspace_path,
+        resolve_workspace_change_scope_or_active, safe_relative_path, safe_workspace_path,
     },
     errors::ApiError,
     state::ApiState,
@@ -356,37 +355,36 @@ async fn get_file_content(
     State(state): State<ApiState>,
     Query(query): Query<FileContentQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let (content, binding) = if let Some(ref path) = query.file_path {
-        let (absolute_path, binding) = if query
-            .session_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .is_some()
-        {
-            let session_id = parse_session_id(query.session_id.as_deref())?;
-            let scope = resolve_session_change_scope(
-                &state,
-                &session_id,
-                query.workspace_id.as_deref(),
-                query.execution_group_id.as_deref(),
-            )?;
-            let (absolute, _relative) = safe_workspace_path(&scope.workspace_root, path)?;
-            (absolute, session_scope_binding(&scope))
-        } else {
-            let scope =
-                resolve_workspace_change_scope_or_active(&state, query.workspace_id.as_deref())?;
-            let (absolute, _) = safe_workspace_path(&scope.workspace_root, path)?;
-            (absolute, workspace_scope_binding(&scope))
-        };
-        let content = std::fs::read_to_string(&absolute_path)
-            .map_err(|e| ApiError::internal_assembly("读取文件内容失败", e))?;
-        (content, binding)
+    let path = query
+        .file_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::InvalidInput("文件路径不能为空".to_string()))?;
+    let (absolute_path, binding) = if query
+        .session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some()
+    {
+        let session_id = parse_session_id(query.session_id.as_deref())?;
+        let scope = resolve_session_change_scope(
+            &state,
+            &session_id,
+            query.workspace_id.as_deref(),
+            query.execution_group_id.as_deref(),
+        )?;
+        let (absolute, _relative) = safe_workspace_path(&scope.workspace_root, path)?;
+        (absolute, session_scope_binding(&scope))
     } else {
-        let scope =
-            resolve_workspace_change_scope_or_active(&state, query.workspace_id.as_deref())?;
-        (String::new(), workspace_scope_binding(&scope))
+        let workspace_id = require_workspace_id(query.workspace_id.as_deref())?;
+        let scope = resolve_workspace_change_scope_or_active(&state, Some(workspace_id.as_str()))?;
+        let (absolute, _) = safe_workspace_path(&scope.workspace_root, path)?;
+        (absolute, workspace_scope_binding(&scope))
     };
+    let content = std::fs::read_to_string(&absolute_path)
+        .map_err(|e| ApiError::internal_assembly("读取文件内容失败", e))?;
     let mut payload = serde_json::json!({
         "content": content,
         "filePath": query.file_path,
@@ -451,8 +449,9 @@ async fn get_file_raw(
         let (absolute, _relative) = safe_workspace_path(&scope.workspace_root, path)?;
         absolute
     } else {
-        let root = resolve_workspace_root_or_active(&state, query.workspace_id.as_deref())?;
-        let (absolute, _) = safe_workspace_path(&root, path)?;
+        let workspace_id = require_workspace_id(query.workspace_id.as_deref())?;
+        let scope = resolve_workspace_change_scope_or_active(&state, Some(workspace_id.as_str()))?;
+        let (absolute, _) = safe_workspace_path(&scope.workspace_root, path)?;
         absolute
     };
 
@@ -1574,5 +1573,71 @@ mod tests {
             serde_json::from_slice(&body).expect("payload should deserialize");
         let message = payload["message"].as_str().unwrap_or_default();
         assert!(message.contains("路径越出工作区边界"));
+    }
+
+    #[tokio::test]
+    async fn get_file_content_rejects_missing_workspace_without_session() {
+        let root = unique_temp_dir("magi-changes-route-content-missing-workspace");
+        fs::write(root.join("alpha.txt"), "alpha changed\n").expect("alpha should write");
+        let state = build_state_with_workspace_root(&root, "workspace-content-missing-scope");
+
+        let response = routes()
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/files/content?filePath=alpha.txt")
+                    .method("GET")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let payload = read_json_response(response).await;
+        let message = payload["message"].as_str().unwrap_or_default();
+        assert!(message.contains("workspaceId 不能为空"));
+    }
+
+    #[tokio::test]
+    async fn get_file_raw_requires_workspace_and_serves_workspace_image() {
+        let root = unique_temp_dir("magi-changes-route-raw-image");
+        fs::write(root.join("image.png"), b"not-a-real-png").expect("image should write");
+        let state = build_state_with_workspace_root(&root, "workspace-raw-image");
+
+        let missing_scope = routes()
+            .with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/files/raw?filePath=image.png")
+                    .method("GET")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+        assert_eq!(missing_scope.status(), StatusCode::BAD_REQUEST);
+
+        let response = routes()
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/files/raw?workspaceId=workspace-raw-image&filePath=image.png")
+                    .method("GET")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(axum::http::header::CONTENT_TYPE),
+            Some(&axum::http::HeaderValue::from_static("image/png"))
+        );
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should read");
+        assert_eq!(&body[..], b"not-a-real-png");
     }
 }
