@@ -2023,7 +2023,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
       localSkillInstalling = false;
       const scannedSkills = ensureArray<any>((result as any)?.skills);
       if (scannedSkills.length === 0) {
-        localSkillInstallError = i18n.t("settings.skillLibrary.noSkillsFound") || "所选目录下未发现可导入的技能";
+        localSkillInstallError = i18n.t("settings.skillLibrary.noSkillsFound");
         return;
       }
       // Append scanned local skills to the library list for preview
@@ -2036,7 +2036,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
         category: "",
         skillType: "instruction",
         repositoryId: "__local__",
-        repositoryName: i18n.t("settings.skillLibrary.localDirectory") || "本地目录",
+        repositoryName: i18n.t("settings.skillLibrary.localDirectory"),
         installed: false,
         icon: "",
         directoryPath: s.directoryPath || path,
@@ -2051,7 +2051,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
       localSkillInstalling = false;
       localSkillInstallError = i18n.t(
         "settings.skillLibrary.localImportFailed",
-      ) || "本地导入失败";
+      );
       notifySettingsError("扫描本地技能目录", e);
     }
   }
