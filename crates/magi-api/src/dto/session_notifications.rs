@@ -73,17 +73,6 @@ pub struct SessionNotificationsResponseDto {
 }
 
 impl SessionNotificationsResponseDto {
-    pub fn empty(session_id: Option<&SessionId>, workspace_id: Option<String>) -> Self {
-        Self {
-            session_id: session_id.map(ToString::to_string).unwrap_or_default(),
-            workspace_id,
-            notifications: SessionNotificationSnapshotDto {
-                last_updated_at: UtcMillis::now(),
-                records: Vec::new(),
-            },
-        }
-    }
-
     pub fn from_records(
         session_id: &SessionId,
         workspace_id: Option<String>,

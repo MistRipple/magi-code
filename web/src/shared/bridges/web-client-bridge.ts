@@ -2732,12 +2732,13 @@ async function resetExecutionStats(): Promise<void> {
 
 function resolveNotificationOperationScope(message: ClientBridgeMessage): NotificationOperationScope | null {
   const sessionId = trimBridgeString(message.sessionId);
-  if (!sessionId) {
+  const workspaceId = trimBridgeString(message.workspaceId);
+  if (!sessionId || !workspaceId) {
     return null;
   }
   return {
     sessionId,
-    workspaceId: trimBridgeString(message.workspaceId),
+    workspaceId,
     workspacePath: trimBridgeString(message.workspacePath),
   };
 }

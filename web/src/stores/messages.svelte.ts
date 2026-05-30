@@ -1767,12 +1767,13 @@ function resetNotificationCenterStatus(): void {
 
 function getCurrentNotificationOperationScope(): NotificationOperationScope | null {
   const sessionId = getCurrentNotificationSessionId();
-  if (!sessionId) {
+  const workspaceId = getCurrentNotificationWorkspaceId();
+  if (!sessionId || !workspaceId) {
     return null;
   }
   return {
     sessionId,
-    workspaceId: getCurrentNotificationWorkspaceId(),
+    workspaceId,
     workspacePath: typeof messagesState.currentWorkspacePath === 'string'
       ? messagesState.currentWorkspacePath.trim()
       : '',

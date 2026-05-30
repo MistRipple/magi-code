@@ -383,7 +383,7 @@ export interface AgentWorkspaceBindingContext {
 }
 
 export interface AgentNotificationScope {
-  workspaceId?: string;
+  workspaceId: string;
   workspacePath?: string;
   sessionId: string;
 }
@@ -742,9 +742,17 @@ function buildBoundQueryWithOverride(
 }
 
 function createNotificationBindingOverride(scope: AgentNotificationScope): Partial<AgentBindingContext> {
+  const sessionId = scope.sessionId.trim();
+  const workspaceId = scope.workspaceId.trim();
+  if (!sessionId) {
+    throw new AgentApiError(400, 'sessionId 不能为空', 'resolve notification scope');
+  }
+  if (!workspaceId) {
+    throw new AgentApiError(400, 'workspaceId 不能为空', 'resolve notification scope');
+  }
   return {
-    sessionId: scope.sessionId.trim(),
-    workspaceId: scope.workspaceId?.trim() || '',
+    sessionId,
+    workspaceId,
     workspacePath: scope.workspacePath?.trim() || '',
   };
 }

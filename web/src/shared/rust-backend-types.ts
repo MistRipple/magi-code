@@ -856,19 +856,19 @@ export interface SessionNotificationsResponseDto {
 }
 
 export interface ClearNotificationsRequestDto {
-  workspaceId?: string | null;
-  sessionId?: string | null;
+  workspaceId: string;
+  sessionId: string;
 }
 
 export interface RemoveNotificationRequestDto {
-  workspaceId?: string | null;
-  sessionId?: string | null;
+  workspaceId: string;
+  sessionId: string;
   notificationId: string;
 }
 
 export interface AppendNotificationRequestDto {
-  workspaceId?: string | null;
-  sessionId?: string | null;
+  workspaceId: string;
+  sessionId: string;
   notificationId?: string | null;
   kind?: 'incident' | 'audit' | 'center' | 'toast' | string | null;
   level?: string | null;

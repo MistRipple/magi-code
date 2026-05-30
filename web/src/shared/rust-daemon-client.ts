@@ -201,16 +201,12 @@ export class RustDaemonClient {
   }
 
   public async fetchNotifications(
-    sessionId?: string,
-    workspaceId?: string,
+    sessionId: string,
+    workspaceId: string,
   ): Promise<SessionNotificationsResponseDto> {
     const params = new URLSearchParams();
-    if (workspaceId) {
-      params.set('workspaceId', workspaceId);
-    }
-    if (sessionId) {
-      params.set('sessionId', sessionId);
-    }
+    params.set('workspaceId', workspaceId);
+    params.set('sessionId', sessionId);
     const query = params.toString();
     return this.getJson<SessionNotificationsResponseDto>(
       `/api/session/notifications${query ? `?${query}` : ''}`,
@@ -218,20 +214,20 @@ export class RustDaemonClient {
   }
 
   public async markAllNotificationsRead(
-    request?: ClearNotificationsRequestDto,
+    request: ClearNotificationsRequestDto,
   ): Promise<SessionNotificationsResponseDto> {
     return this.postJson<SessionNotificationsResponseDto>(
       '/api/session/notifications/mark-all-read',
-      request ?? {},
+      request,
     );
   }
 
   public async clearNotifications(
-    request?: ClearNotificationsRequestDto,
+    request: ClearNotificationsRequestDto,
   ): Promise<SessionNotificationsResponseDto> {
     return this.postJson<SessionNotificationsResponseDto>(
       '/api/session/notifications/clear',
-      request ?? {},
+      request,
     );
   }
 
