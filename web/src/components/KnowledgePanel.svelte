@@ -521,6 +521,10 @@
     return resolvePayloadWorkspaceKey(payload) === currentWorkspaceKey;
   }
 
+  function refreshSettingsAfterKnowledgePayload() {
+    vscode.postMessage({ type: 'loadSettingsBootstrap', force: true });
+  }
+
   async function fetchKnowledgeViaApi() {
     const requestWorkspaceKey = currentWorkspaceKey;
     const res = await getAgentProjectKnowledge();
@@ -529,7 +533,9 @@
     }
     if (!applyKnowledgePayload(res)) {
       isLoading = false;
+      return;
     }
+    refreshSettingsAfterKnowledgePayload();
   }
 
   function requestKnowledgeLoad() {
@@ -631,7 +637,9 @@
       if (standard.data.dataType !== 'projectKnowledgeLoaded') return;
 
       const payload = standard.data.payload as Record<string, unknown>;
-      applyKnowledgePayload(payload);
+      if (applyKnowledgePayload(payload)) {
+        refreshSettingsAfterKnowledgePayload();
+      }
     });
 
     return () => unsubscribe();

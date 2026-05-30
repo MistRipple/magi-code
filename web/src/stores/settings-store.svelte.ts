@@ -2534,6 +2534,15 @@ function createSettingsStore(props: { onClose?: () => void }) {
         payload: any;
       };
 
+      if (dataType === "settingsBootstrapLoaded") {
+        const snapshot = payload as AgentSettingsBootstrapSnapshot;
+        if (settingsBootstrapMatchesCurrentWorkspace(snapshot)) {
+          appState.settingsBootstrapSnapshot = snapshot;
+          applySettingsBootstrapPayload(snapshot, { allowLocaleHydration: false });
+        }
+        return;
+      }
+
       // 执行统计更新（SSE 推送）
       if (dataType === "executionStatsUpdate") {
         if (Array.isArray(payload?.items)) {
