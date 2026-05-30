@@ -34,24 +34,17 @@ pub fn is_concurrency_safe(tool_name: &str) -> bool {
 
 pub fn is_concurrency_safe_call(input: &ToolConcurrencyInput<'_>) -> bool {
     if is_shell_like_tool(input.tool_name) {
-        return input
-            .arguments
-            .and_then(read_access_mode)
-            .is_some_and(|mode| mode == "read_only" || mode == "readonly" || mode == "read-only");
+        return input.arguments.is_some_and(|arguments| {
+            magi_permissions::PermissionEngine::shell_arguments_request_read_only(
+                &arguments.to_string(),
+            )
+        });
     }
     concurrent_safe_tools().contains(input.tool_name)
 }
 
 fn is_shell_like_tool(tool_name: &str) -> bool {
     tool_name == "shell_exec"
-}
-
-fn read_access_mode(arguments: &serde_json::Value) -> Option<String> {
-    let object = arguments.as_object()?;
-    ["access_mode", "write_mode", "intent"]
-        .iter()
-        .find_map(|key| object.get(*key).and_then(serde_json::Value::as_str))
-        .map(|value| value.trim().to_ascii_lowercase())
 }
 
 #[derive(Clone, Debug)]

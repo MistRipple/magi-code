@@ -43,7 +43,7 @@ pub enum PermissionRequest<'a> {
         kind: PathAccessKind,
     },
     /// shell 命令分类：caller 把 shell_exec 的 `arguments` 原文传进来，由引擎
-    /// 推断这是不是只读命令。
+    /// 结合模型声明与命令文本推断这是不是只读命令。
     ShellCommand { arguments_json: &'a str },
 }
 
@@ -242,7 +242,9 @@ impl PermissionEngine {
             && !is_read_only
         {
             return Decision::Deny {
-                reason: "只读任务中的 shell_exec 必须显式声明 access_mode=read_only".to_string(),
+                reason:
+                    "只读任务中的 shell_exec 必须声明 access_mode=read_only，且命令不能包含写入迹象"
+                        .to_string(),
             };
         }
         match access_profile {
@@ -253,33 +255,181 @@ impl PermissionEngine {
         }
     }
 
-    /// 检查 arguments JSON 顶层是否有 `access_mode` / `write_mode` 字段且取值在只读集合里。
+    /// 检查 arguments JSON 是否表达了只读 shell。
+    ///
+    /// 只读判定不能只相信模型声明：`access_mode=read_only` 只是必要条件，命令文本中
+    /// 出现重定向或常见写类命令时仍然视为写类 shell。
     pub fn shell_arguments_request_read_only(arguments_json: &str) -> bool {
-        serde_json::from_str::<serde_json::Value>(arguments_json)
+        let Some(object) = serde_json::from_str::<serde_json::Value>(arguments_json)
             .ok()
-            .and_then(|value| {
-                value
-                    .as_object()
-                    .and_then(|object| {
-                        object
-                            .get("access_mode")
-                            .or_else(|| object.get("write_mode"))
-                    })
-                    .and_then(serde_json::Value::as_str)
-                    .map(|m| {
-                        matches!(
-                            m.trim().to_ascii_lowercase().as_str(),
-                            "read" | "read_only" | "readonly"
-                        )
-                    })
-            })
-            .unwrap_or(false)
+            .and_then(|value| value.as_object().cloned())
+        else {
+            return false;
+        };
+        let action = json_string(&object, &["action", "operation", "op"])
+            .map(|value| value.trim().to_ascii_lowercase());
+        let has_terminal_id = json_has_any(&object, &["terminal_id", "terminalId", "id"]);
+        let has_command = json_string(&object, &["command", "script", "line"])
+            .is_some_and(|value| !value.trim().is_empty());
+
+        match action.as_deref() {
+            None if has_terminal_id && !has_command => return true,
+            Some("read" | "poll" | "status" | "list" | "ls") => return true,
+            Some("write" | "stdin" | "send" | "kill" | "stop" | "terminate" | "cancel") => {
+                return false;
+            }
+            Some("run" | "exec" | "command") | None => {}
+            Some(_) => return false,
+        }
+
+        if !json_string(&object, &["access_mode", "write_mode", "intent"]).is_some_and(|mode| {
+            matches!(
+                mode.trim().to_ascii_lowercase().as_str(),
+                "read" | "read_only" | "readonly"
+            )
+        }) {
+            return false;
+        }
+        let Some(command) = json_string(&object, &["command", "script", "line"]) else {
+            return false;
+        };
+        !shell_command_has_write_indicator(&command)
     }
 
     /// caller 直接拿 list 用于 dedup 逻辑。
     pub fn read_only_tool_names(&self) -> Vec<&'static str> {
         self.read_only_tools.iter().copied().collect()
     }
+}
+
+fn json_string(
+    object: &serde_json::Map<String, serde_json::Value>,
+    keys: &[&str],
+) -> Option<String> {
+    keys.iter().find_map(|key| {
+        object
+            .get(*key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    })
+}
+
+fn json_has_any(object: &serde_json::Map<String, serde_json::Value>, keys: &[&str]) -> bool {
+    keys.iter().any(|key| object.contains_key(*key))
+}
+
+fn shell_command_has_write_indicator(command: &str) -> bool {
+    let tokens = shell_command_tokens(command);
+    shell_command_has_unquoted_redirection(command)
+        || tokens
+            .iter()
+            .any(|token| shell_token_is_write_indicator(token))
+        || shell_tokens_include_mutating_git(&tokens)
+}
+
+fn shell_command_has_unquoted_redirection(command: &str) -> bool {
+    let mut single_quoted = false;
+    let mut double_quoted = false;
+    let mut escaped = false;
+    for ch in command.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        match ch {
+            '\'' if !double_quoted => single_quoted = !single_quoted,
+            '"' if !single_quoted => double_quoted = !double_quoted,
+            '>' if !single_quoted && !double_quoted => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+fn shell_command_tokens(command: &str) -> Vec<String> {
+    command
+        .split(|ch: char| ch.is_whitespace() || matches!(ch, ';' | '|' | '&' | '(' | ')'))
+        .filter_map(|part| {
+            let token = part
+                .trim_matches(|ch: char| {
+                    matches!(ch, '"' | '\'' | '`' | '[' | ']' | '{' | '}' | ',')
+                })
+                .trim()
+                .to_ascii_lowercase();
+            (!token.is_empty()).then_some(token)
+        })
+        .collect()
+}
+
+fn shell_token_is_write_indicator(token: &str) -> bool {
+    matches!(
+        token,
+        "rm" | "rmdir"
+            | "mv"
+            | "cp"
+            | "mkdir"
+            | "touch"
+            | "ln"
+            | "chmod"
+            | "chown"
+            | "chgrp"
+            | "truncate"
+            | "dd"
+            | "tee"
+            | "install"
+            | "rsync"
+            | "scp"
+    )
+}
+
+fn shell_tokens_include_mutating_git(tokens: &[String]) -> bool {
+    for (index, token) in tokens.iter().enumerate() {
+        if token != "git" {
+            continue;
+        }
+        let Some(subcommand) = git_subcommand_after(&tokens[index + 1..]) else {
+            continue;
+        };
+        if !git_subcommand_is_read_only(subcommand) {
+            return true;
+        }
+    }
+    false
+}
+
+fn git_subcommand_after(tokens: &[String]) -> Option<&str> {
+    let mut index = 0usize;
+    while index < tokens.len() {
+        match tokens[index].as_str() {
+            "-c" | "-C" | "--git-dir" | "--work-tree" => index += 2,
+            token if token.starts_with("--git-dir=") || token.starts_with("--work-tree=") => {
+                index += 1
+            }
+            token if token.starts_with('-') => index += 1,
+            token => return Some(token),
+        }
+    }
+    None
+}
+
+fn git_subcommand_is_read_only(subcommand: &str) -> bool {
+    matches!(
+        subcommand,
+        "status"
+            | "diff"
+            | "log"
+            | "show"
+            | "rev-parse"
+            | "ls-files"
+            | "grep"
+            | "describe"
+            | "merge-base"
+            | "name-rev"
+    )
 }
 
 fn path_is_within(target: &Path, root: &Path) -> bool {
@@ -458,6 +608,53 @@ mod tests {
         };
         let decision = engine.decide(&req, &policy, AccessProfile::Restricted);
         assert!(decision.is_deny());
+    }
+
+    #[test]
+    fn shell_read_only_declaration_does_not_hide_redirection_write() {
+        let engine = engine_with_test_tools();
+        let policy = policy_empty();
+        let args = r#"{"command":"printf hi > out.txt","access_mode":"read_only"}"#;
+        let req = PermissionRequest::ShellCommand {
+            arguments_json: args,
+        };
+
+        assert!(!PermissionEngine::shell_arguments_request_read_only(args));
+        assert!(
+            engine
+                .decide(&req, &policy, AccessProfile::ReadOnly)
+                .is_deny()
+        );
+        assert!(matches!(
+            engine.decide(&req, &policy, AccessProfile::Restricted),
+            Decision::NeedsApproval { .. }
+        ));
+    }
+
+    #[test]
+    fn shell_read_only_declaration_rejects_common_write_commands() {
+        let args = r#"{"command":"touch out.txt","access_mode":"read_only"}"#;
+
+        assert!(!PermissionEngine::shell_arguments_request_read_only(args));
+    }
+
+    #[test]
+    fn shell_read_only_declaration_rejects_mutating_git_subcommands() {
+        let checkout = r#"{"command":"git checkout main","access_mode":"read_only"}"#;
+        let status =
+            r#"{"command":"git -C /tmp/project status --short","access_mode":"read_only"}"#;
+
+        assert!(!PermissionEngine::shell_arguments_request_read_only(
+            checkout
+        ));
+        assert!(PermissionEngine::shell_arguments_request_read_only(status));
+    }
+
+    #[test]
+    fn shell_read_only_allows_quoted_redirection_text() {
+        let args = r#"{"command":"printf 'a > b'","access_mode":"read_only"}"#;
+
+        assert!(PermissionEngine::shell_arguments_request_read_only(args));
     }
 
     #[test]

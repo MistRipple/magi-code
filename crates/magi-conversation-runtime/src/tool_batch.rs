@@ -2106,6 +2106,38 @@ mod tests {
     }
 
     #[test]
+    fn read_only_agent_policy_rejects_shell_with_write_redirection() {
+        let mut task = test_task(
+            "task-read-only-shell-redirection",
+            "task-read-only-shell-redirection",
+            None,
+        );
+        task.policy_snapshot = Some(agent_spawn_child_policy_snapshot(
+            Some(&default_agent_spawn_policy()),
+            AgentSpawnAccessMode::ReadOnly,
+        ));
+
+        let decision = task_policy_tool_decision(
+            &task,
+            BuiltinToolName::ShellExec.as_str(),
+            r#"{"command":"printf hidden > out.txt","access_mode":"read_only"}"#,
+        )
+        .expect("read-only agent should reject write-like shell even when declared read_only");
+        let payload: serde_json::Value =
+            serde_json::from_str(&decision.payload).expect("rejection should be json");
+
+        assert_eq!(decision.status, ExecutionResultStatus::Rejected);
+        assert_eq!(payload["status"].as_str(), Some("rejected"));
+        assert_eq!(payload["tool"].as_str(), Some("shell_exec"));
+        assert!(
+            payload["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("不能包含写入迹象")
+        );
+    }
+
+    #[test]
     fn human_checkpoint_policy_marks_write_shell_as_needs_approval() {
         let mut task = test_task(
             "task-human-approval-shell",

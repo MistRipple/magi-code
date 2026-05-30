@@ -1375,11 +1375,15 @@ fn shell_exec_invocation_policy(input: &str) -> BuiltinToolInvocationPolicy {
     match json_field_string(&request, &["access_mode", "write_mode", "intent"])
         .and_then(|value| BuiltinToolAccessMode::from_str(&value))
     {
-        Some(BuiltinToolAccessMode::ReadOnly) => low_risk_policy(),
+        Some(BuiltinToolAccessMode::ReadOnly)
+            if magi_permissions::PermissionEngine::shell_arguments_request_read_only(input) =>
+        {
+            low_risk_policy()
+        }
         Some(BuiltinToolAccessMode::MaybeWrite | BuiltinToolAccessMode::ExplicitWrite) => {
             medium_risk_policy()
         }
-        None => medium_risk_policy(),
+        Some(BuiltinToolAccessMode::ReadOnly) | None => medium_risk_policy(),
     }
 }
 
@@ -2572,6 +2576,43 @@ mod tests {
             &ToolExecutionPolicy::default(),
         );
         assert_eq!(blocked.status, ExecutionResultStatus::NeedsApproval);
+    }
+
+    #[test]
+    fn shell_exec_rejects_read_only_mode_with_write_redirection() {
+        let governance = Arc::new(GovernanceService::default());
+        let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(16));
+        let mut tool_registry = ToolRegistry::new(governance, event_bus);
+        tool_registry.register_default_builtins();
+        let root = unique_temp_dir("magi-tool-shell-read-only-redirection");
+        let target = root.join("should-not-exist.txt");
+
+        let output = tool_registry.execute_with_policy(
+            ToolExecutionInput {
+                tool_call_id: ToolCallId::new("tool-call-shell-read-only-redirection"),
+                tool_name: BuiltinToolName::ShellExec.as_str().to_string(),
+                tool_kind: ToolKind::Builtin,
+                input: serde_json::json!({
+                    "command": format!("printf hidden > {}", target.display()),
+                    "access_mode": "read_only"
+                })
+                .to_string(),
+                approval_requirement: ApprovalRequirement::None,
+                risk_level: RiskLevel::Low,
+            },
+            ToolExecutionContext {
+                working_directory: Some(root.clone()),
+                ..ToolExecutionContext::default()
+            },
+            &ToolExecutionPolicy::default(),
+        );
+
+        assert_eq!(output.status, ExecutionResultStatus::Rejected);
+        assert!(!target.exists(), "read_only shell 不应执行写入重定向");
+        let payload: Value = serde_json::from_str(&output.payload).expect("payload json");
+        assert_eq!(payload["tool"], "shell_exec");
+        assert_eq!(payload["status"], "rejected");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -5458,6 +5499,19 @@ mod tests {
         );
         assert_eq!(read_only.risk_level, RiskLevel::Low);
         assert_eq!(read_only.approval_requirement, ApprovalRequirement::None);
+
+        let misdeclared_read_only = BuiltinToolName::ShellExec.invocation_policy_for_input(
+            &serde_json::json!({
+                "command": "printf hidden > out.txt",
+                "access_mode": "read_only"
+            })
+            .to_string(),
+        );
+        assert_eq!(misdeclared_read_only.risk_level, RiskLevel::Medium);
+        assert_eq!(
+            misdeclared_read_only.approval_requirement,
+            ApprovalRequirement::None
+        );
 
         let background = BuiltinToolName::ShellExec.invocation_policy_for_input(
             &serde_json::json!({

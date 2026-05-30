@@ -555,7 +555,7 @@ fn tool_concurrency_read_only_safe() {
     assert!(crate::tool_concurrency::is_concurrency_safe_call(
         &crate::tool_concurrency::ToolConcurrencyInput {
             tool_name: "shell_exec",
-            arguments: Some(&json!({ "access_mode": "read_only" })),
+            arguments: Some(&json!({ "command": "printf probe", "access_mode": "read_only" })),
         }
     ));
     assert!(!crate::tool_concurrency::is_concurrency_safe("file_edit"));
@@ -615,6 +615,35 @@ fn tool_concurrency_partitions_read_only_shells_concurrently() {
         crate::tool_concurrency::ToolBatchKind::Concurrent
     ));
     assert_eq!(batches[0].tool_indices, vec![0, 1]);
+}
+
+#[test]
+fn tool_concurrency_does_not_trust_read_only_shell_with_write_redirection() {
+    let read_only_shell = json!({ "command": "printf a", "access_mode": "read_only" });
+    let write_shell = json!({ "command": "printf b > out.txt", "access_mode": "read_only" });
+    let tools = [
+        crate::tool_concurrency::ToolConcurrencyInput {
+            tool_name: "shell_exec",
+            arguments: Some(&read_only_shell),
+        },
+        crate::tool_concurrency::ToolConcurrencyInput {
+            tool_name: "shell_exec",
+            arguments: Some(&write_shell),
+        },
+    ];
+    let batches = crate::tool_concurrency::partition_tool_calls_with_inputs(&tools);
+
+    assert_eq!(batches.len(), 2);
+    assert!(matches!(
+        batches[0].kind,
+        crate::tool_concurrency::ToolBatchKind::Concurrent
+    ));
+    assert_eq!(batches[0].tool_indices, vec![0]);
+    assert!(matches!(
+        batches[1].kind,
+        crate::tool_concurrency::ToolBatchKind::Serial
+    ));
+    assert_eq!(batches[1].tool_indices, vec![1]);
 }
 
 struct SleepingToolExecutor {

@@ -448,6 +448,14 @@ fn execute_shell_exec(input: &str, context: &ToolExecutionContext) -> String {
                 .and_then(|value| BuiltinToolAccessMode::from_str(&value))
         })
         .unwrap_or(BuiltinToolAccessMode::MaybeWrite);
+    if access_mode == BuiltinToolAccessMode::ReadOnly
+        && !magi_permissions::PermissionEngine::shell_arguments_request_read_only(input)
+    {
+        return builtin_rejected(
+            "shell_exec",
+            "shell_exec 声明 access_mode=read_only 时，命令不能包含写入迹象",
+        );
+    }
     let cwd_input = request
         .as_ref()
         .and_then(|object| field_string(object, &["cwd", "working_directory", "workdir"]));
