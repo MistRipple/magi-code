@@ -47,6 +47,7 @@ struct WorkspaceSessionDto {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct WorkspaceSessionsResponse {
+    workspace: WorkspaceDto,
     session_id: String,
     sessions: Vec<WorkspaceSessionDto>,
 }
@@ -220,15 +221,32 @@ struct WorkspaceSessionsQuery {
 async fn workspace_sessions(
     State(state): State<ApiState>,
     Query(query): Query<WorkspaceSessionsQuery>,
-) -> Json<WorkspaceSessionsResponse> {
-    let workspace_id = query
+) -> Result<Json<WorkspaceSessionsResponse>, ApiError> {
+    let requested_workspace_id = query
         .workspace_id
         .as_deref()
         .map(str::trim)
-        .filter(|value| !value.is_empty());
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::InvalidInput("workspaceId 不能为空".to_string()))?;
+    let workspace = state
+        .workspace_registry
+        .workspaces()
+        .into_iter()
+        .find(|workspace| workspace.workspace_id.as_str() == requested_workspace_id)
+        .ok_or_else(|| {
+            ApiError::InvalidInput(format!("workspace 不存在: {requested_workspace_id}"))
+        })?;
+    let active_id = state.workspace_registry.active_workspace_id();
+    let workspace_dto = WorkspaceDto {
+        workspace_id: workspace.workspace_id.to_string(),
+        path: workspace.root_path.to_string(),
+        name: workspace.name.clone(),
+        is_active: active_id.as_ref() == Some(&workspace.workspace_id),
+    };
+    let scoped_workspace_id = workspace.workspace_id.to_string();
 
     let scoped_sessions = state
-        .session_records_for_workspace(workspace_id)
+        .session_records_for_workspace(Some(scoped_workspace_id.as_str()))
         .iter()
         .map(|session| WorkspaceSessionDto {
             session_id: session.session_id.to_string(),
@@ -259,10 +277,11 @@ async fn workspace_sessions(
         .unwrap_or_default()
         .to_string();
 
-    Json(WorkspaceSessionsResponse {
+    Ok(Json(WorkspaceSessionsResponse {
+        workspace: workspace_dto,
         session_id: current_session_id,
         sessions: scoped_sessions,
-    })
+    }))
 }
 
 #[cfg(test)]
@@ -292,6 +311,13 @@ mod tests {
             Arc::new(WorkspaceStore::default()),
             Arc::new(GovernanceService::default()),
         )
+    }
+
+    async fn read_json_response(response: axum::response::Response) -> serde_json::Value {
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should read");
+        serde_json::from_slice(&body).expect("payload should deserialize")
     }
 
     #[tokio::test]
@@ -460,11 +486,8 @@ mod tests {
             .expect("route should respond");
 
         assert_eq!(response.status(), StatusCode::OK);
-        let body = to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("body should read");
-        let payload: serde_json::Value =
-            serde_json::from_slice(&body).expect("payload should deserialize");
+        let payload = read_json_response(response).await;
+        assert_eq!(payload["workspace"]["workspaceId"], "workspace-count");
         assert_eq!(payload["sessionId"], "session-counted");
         let sessions = payload["sessions"]
             .as_array()
@@ -473,6 +496,64 @@ mod tests {
         assert_eq!(sessions[0]["sessionId"], "session-counted");
         assert_eq!(sessions[0]["messageCount"], 2);
         assert!(sessions[0]["updatedAt"].as_u64().unwrap_or_default() > 0);
+    }
+
+    #[tokio::test]
+    async fn workspace_sessions_requires_registered_workspace_scope() {
+        let state = test_state();
+        state
+            .workspace_registry
+            .register(
+                WorkspaceId::new("workspace-required-scope"),
+                AbsolutePath::new("/tmp/magi-workspace-required-scope"),
+            )
+            .expect("workspace should register");
+        state
+            .session_store
+            .create_session_for_workspace(
+                SessionId::new("session-required-scope"),
+                "不应无 scope 出现在列表里",
+                Some("workspace-required-scope".to_string()),
+            )
+            .expect("session should create");
+
+        let response = routes()
+            .with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/workspaces/sessions")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let payload = read_json_response(response).await;
+        assert!(
+            payload["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("workspaceId 不能为空")
+        );
+
+        let response = routes()
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/workspaces/sessions?workspaceId=workspace-missing")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let payload = read_json_response(response).await;
+        assert!(
+            payload["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("workspace 不存在")
+        );
     }
 
     #[tokio::test]
