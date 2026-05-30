@@ -30,7 +30,7 @@ export type SessionTurnRouteDto =
 
 export interface SessionTurnRequestDto {
   sessionId?: string | null;
-  workspaceId?: string | null;
+  workspaceId: string;
   text?: string | null;
   skillName?: string | null;
   images: SessionTurnImageDto[];

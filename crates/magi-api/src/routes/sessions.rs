@@ -25,7 +25,7 @@ use serde_json::json;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::session_scope::{
-    parse_session_id, require_current_session_record_in_workspace,
+    parse_session_id, require_current_session_record_in_workspace, require_registered_workspace_id,
     require_session_record_in_workspace, require_workspace_id, session_workspace_id,
 };
 use crate::{
@@ -86,15 +86,17 @@ async fn submit_session_turn(
 ) -> Result<Json<SessionTurnResponseDto>, ApiError> {
     validate_session_turn_input(&request)?;
     let accepted_at = super::monotonic_accepted_at();
+    let requested_workspace_id = request.requested_workspace_id();
+    let workspace_id = require_registered_workspace_id(&state, requested_workspace_id.as_deref())?;
     if request.supplement_context {
-        return submit_supplement_context_turn(&state, &request, accepted_at)
+        return submit_supplement_context_turn(&state, &request, &workspace_id, accepted_at)
             .await
             .map(Json);
     }
     let decision = decide_session_turn_with_task_planner(&state, &request)?;
     match decision.route {
         SessionTurnRouteDto::Chat | SessionTurnRouteDto::Execute => {
-            submit_regular_session_turn(state, request, accepted_at, decision)
+            submit_regular_session_turn(state, request, workspace_id, accepted_at, decision)
                 .await
                 .map(Json)
         }
@@ -102,6 +104,7 @@ async fn submit_session_turn(
             let (accepted, event_id) = super::accept_session_task_submission(
                 &state,
                 &request,
+                workspace_id.clone(),
                 decision.task_title.clone(),
                 decision.execution_goal.clone(),
                 decision.task_tier,
@@ -134,13 +137,8 @@ async fn submit_session_turn(
         SessionTurnRouteDto::Continue => {
             let session_id = request
                 .requested_session_id()
-                .or_else(|| {
-                    state
-                        .session_store
-                        .current_session()
-                        .map(|session| session.session_id)
-                })
                 .ok_or_else(|| ApiError::InvalidInput("继续会话需要明确的 session".to_string()))?;
+            require_session_record_in_workspace(&state, &session_id, Some(workspace_id.as_str()))?;
             // S1：user 信号经 Conversation Mailbox 入栈，下游一律读 signal.* 不再读 request.*
             let signal = super::ingest_user_input_to_conversation(
                 &state,
@@ -167,7 +165,7 @@ async fn submit_session_turn(
                 orchestrator_thread_id,
             )?;
             state
-                .ensure_snapshot_session_for_bound_session(&session_id)
+                .ensure_snapshot_session_for_workspace_id(&session_id, &Some(workspace_id))
                 .await?;
             finalize_continue_session(state.clone(), accepted.clone(), accepted_at);
             state.persist_runtime_durable_state()?;
@@ -208,11 +206,13 @@ static SUPPLEMENT_SIGNAL_COUNTER: AtomicU64 = AtomicU64::new(1);
 async fn submit_supplement_context_turn(
     state: &ApiState,
     request: &SessionTurnRequestDto,
+    workspace_id: &WorkspaceId,
     accepted_at: UtcMillis,
 ) -> Result<SessionTurnResponseDto, ApiError> {
     let session_id = parse_session_id(request.session_id.as_deref())?;
+    require_session_record_in_workspace(state, &session_id, Some(workspace_id.as_str()))?;
     state
-        .ensure_snapshot_session_for_bound_session(&session_id)
+        .ensure_snapshot_session_for_workspace_id(&session_id, &Some(workspace_id.clone()))
         .await?;
     // S1：user 信号经 Conversation Mailbox 入栈，下游一律读 signal.* 不再读 request.*
     let signal = super::ingest_user_input_to_conversation(state, &session_id, request, accepted_at);
@@ -359,12 +359,7 @@ fn decide_session_turn_with_task_planner(
     state: &ApiState,
     request: &SessionTurnRequestDto,
 ) -> Result<SessionTurnIntentDecision, ApiError> {
-    let requested_session_id = request.requested_session_id().or_else(|| {
-        state
-            .session_store
-            .current_session()
-            .map(|session| session.session_id)
-    });
+    let requested_session_id = request.requested_session_id();
     let has_recoverable_chain = requested_session_id
         .as_ref()
         .map(|session_id| session_has_recoverable_chain(state, session_id))
@@ -1104,22 +1099,16 @@ fn build_user_message_turn_item(
 async fn submit_regular_session_turn(
     state: ApiState,
     request: SessionTurnRequestDto,
+    requested_workspace_id: WorkspaceId,
     accepted_at: UtcMillis,
     decision: SessionTurnIntentDecision,
 ) -> Result<SessionTurnResponseDto, ApiError> {
     let message = request.timeline_message(request.trimmed_text().as_deref());
     let placeholder_title = crate::session_title::NEW_SESSION_PLACEHOLDER_TITLE;
-    let requested_workspace_path = request.requested_workspace_path();
-    let requested_workspace_id = state.resolve_workspace_id_from_request(
-        request
-            .requested_workspace_id()
-            .map(magi_core::WorkspaceId::new),
-        requested_workspace_path.as_deref(),
-    );
     let (session_id, created_session, workspace_id) = super::resolve_dispatch_session(
         &state,
         request.requested_session_id(),
-        requested_workspace_id,
+        Some(requested_workspace_id),
         placeholder_title,
         accepted_at,
     )?;
@@ -2426,6 +2415,19 @@ mod tests {
         path
     }
 
+    fn register_workspace(state: &ApiState, workspace_id: &str, prefix: &str) -> WorkspaceId {
+        let root = unique_temp_dir(prefix);
+        let workspace_id = WorkspaceId::new(workspace_id);
+        state
+            .workspace_registry
+            .register(
+                workspace_id.clone(),
+                AbsolutePath::new(root.display().to_string()),
+            )
+            .expect("workspace should register");
+        workspace_id
+    }
+
     async fn post_json(
         state: ApiState,
         uri: &str,
@@ -2457,7 +2459,6 @@ mod tests {
         SessionTurnRequestDto {
             session_id: None,
             workspace_id: None,
-            workspace_path: None,
             text: Some(text.to_string()),
             skill_name: None,
             images: Vec::new(),
@@ -2608,6 +2609,28 @@ mod tests {
         assert!(matches!(decision.route, SessionTurnRouteDto::Chat));
     }
 
+    #[tokio::test]
+    async fn session_turn_rejects_missing_workspace_scope() {
+        let (status, body) = post_json(
+            test_state(),
+            "/session/turn",
+            serde_json::json!({
+                "text": "你好",
+                "images": [],
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "unexpected body: {body}");
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("workspaceId 不能为空"),
+            "unexpected body: {body}"
+        );
+    }
+
     #[test]
     fn completed_long_mission_continue_routes_to_next_mission_phase() {
         let task_store = Arc::new(TaskStore::new());
@@ -2654,6 +2677,11 @@ mod tests {
     async fn completed_long_mission_followup_dispatch_reuses_mission() {
         let task_store = Arc::new(TaskStore::new());
         let state = test_state().with_task_store(task_store.clone());
+        let workspace_id = register_workspace(
+            &state,
+            "workspace-long-mission-next-chain",
+            "long-mission-next-chain",
+        );
         let session_id = SessionId::new("session-long-mission-next-chain");
         let mission_id = MissionId::new("mission-long-mission-next-chain");
         let root_task =
@@ -2662,7 +2690,11 @@ mod tests {
         task_store.insert_task(root_task.clone());
         state
             .session_store
-            .create_session(session_id.clone(), "复杂任务")
+            .create_session_for_workspace(
+                session_id.clone(),
+                "复杂任务",
+                Some(workspace_id.to_string()),
+            )
             .expect("session should create");
         state
             .session_store
@@ -2677,11 +2709,13 @@ mod tests {
 
         let mut request = session_turn_request("继续下一阶段，派发代理完成剩余检查");
         request.session_id = Some(session_id.to_string());
+        request.workspace_id = Some(workspace_id.to_string());
         let decision = decide_session_turn_with_task_planner(&state, &request)
             .expect("followup should route to next mission phase");
         let (accepted, _) = super::super::accept_session_task_submission(
             &state,
             &request,
+            workspace_id,
             decision.task_title.clone(),
             decision.execution_goal.clone(),
             decision.task_tier,
@@ -2772,18 +2806,25 @@ mod tests {
     async fn supplement_context_turn_enqueues_followup_mailbox_signal() {
         let task_store = Arc::new(TaskStore::new());
         let state = test_state().with_task_store(task_store.clone());
+        let workspace_id =
+            register_workspace(&state, "workspace-supplement-mailbox", "supplement-mailbox");
         let session_id = SessionId::new("session-supplement-mailbox");
         let mission_id = MissionId::new("mission-supplement-mailbox");
         let root_task = test_root_task("task-root-supplement", mission_id.as_str());
         task_store.insert_task(root_task.clone());
         state
             .session_store
-            .create_session(session_id.clone(), "Supplement Mailbox")
+            .create_session_for_workspace(
+                session_id.clone(),
+                "Supplement Mailbox",
+                Some(workspace_id.to_string()),
+            )
             .expect("session should be creatable");
         state.session_store.bind_execution_ownership(
             session_id.clone(),
             ExecutionOwnership {
                 session_id: Some(session_id.clone()),
+                workspace_id: Some(workspace_id.clone()),
                 mission_id: Some(mission_id.clone()),
                 task_id: Some(root_task.task_id.clone()),
                 execution_chain_ref: Some("chain-supplement-mailbox".to_string()),
@@ -2797,10 +2838,12 @@ mod tests {
 
         let mut request = session_turn_request("请优先处理这个 followup");
         request.session_id = Some(session_id.to_string());
+        request.workspace_id = Some(workspace_id.to_string());
         request.supplement_context = true;
-        let response = submit_supplement_context_turn(&state, &request, UtcMillis::now())
-            .await
-            .expect("supplement should enqueue mailbox signal");
+        let response =
+            submit_supplement_context_turn(&state, &request, &workspace_id, UtcMillis::now())
+                .await
+                .expect("supplement should enqueue mailbox signal");
 
         assert_eq!(response.route, SessionTurnRouteDto::SupplementContext);
         assert!(
@@ -3202,13 +3245,17 @@ mod tests {
     #[tokio::test]
     async fn regular_session_turn_accept_does_not_pre_reserve_assistant_placeholder_item() {
         let state = test_state();
+        let workspace_id = register_workspace(
+            &state,
+            "workspace-canonical-first-frame",
+            "canonical-first-frame",
+        );
         let accepted_at = UtcMillis(1777000000000);
         let response = submit_regular_session_turn(
             state.clone(),
             SessionTurnRequestDto {
                 session_id: None,
-                workspace_id: None,
-                workspace_path: None,
+                workspace_id: Some(workspace_id.to_string()),
                 text: Some("请只回复一句话".to_string()),
                 skill_name: None,
                 images: Vec::new(),
@@ -3219,6 +3266,7 @@ mod tests {
                 supplement_context: false,
                 target_task_id: None,
             },
+            workspace_id,
             accepted_at,
             SessionTurnIntentDecision {
                 route: SessionTurnRouteDto::Chat,
@@ -3279,10 +3327,10 @@ mod tests {
     async fn simple_chat_route_does_not_create_task_or_execution_chain() {
         let task_store = Arc::new(TaskStore::new());
         let state = test_state().with_task_store(task_store.clone());
+        let workspace_id = register_workspace(&state, "workspace-simple-chat", "simple-chat");
         let request = SessionTurnRequestDto {
             session_id: None,
-            workspace_id: None,
-            workspace_path: None,
+            workspace_id: Some(workspace_id.to_string()),
             text: Some("解释一下流程图的概念".to_string()),
             skill_name: None,
             images: Vec::new(),
@@ -3297,6 +3345,7 @@ mod tests {
         let response = submit_regular_session_turn(
             state.clone(),
             request,
+            workspace_id,
             accepted_at,
             classifier_chat_decision(),
         )
@@ -3334,10 +3383,10 @@ mod tests {
     async fn simple_execute_route_does_not_create_task_or_execution_chain() {
         let task_store = Arc::new(TaskStore::new());
         let state = test_state().with_task_store(task_store.clone());
+        let workspace_id = register_workspace(&state, "workspace-simple-execute", "simple-execute");
         let request = SessionTurnRequestDto {
             session_id: None,
-            workspace_id: None,
-            workspace_path: None,
+            workspace_id: Some(workspace_id.to_string()),
             text: Some("请调用 file_mkdir 工具创建目录".to_string()),
             skill_name: None,
             images: Vec::new(),
@@ -3353,9 +3402,15 @@ mod tests {
         decision.route = SessionTurnRouteDto::Execute;
         decision.forced_tool_name = Some("file_mkdir".to_string());
         decision.tool_intent = Some("显式调用 file_mkdir".to_string());
-        let response = submit_regular_session_turn(state.clone(), request, accepted_at, decision)
-            .await
-            .expect("execute route should accept");
+        let response = submit_regular_session_turn(
+            state.clone(),
+            request,
+            workspace_id,
+            accepted_at,
+            decision,
+        )
+        .await
+        .expect("execute route should accept");
 
         assert!(matches!(response.route, SessionTurnRouteDto::Execute));
         let session_id = SessionId::new(&response.session_id);

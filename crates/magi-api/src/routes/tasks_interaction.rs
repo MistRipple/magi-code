@@ -262,10 +262,6 @@ async fn restart_task(
     )?;
     let session_id = scope.session_id.clone();
     let root_task = ensure_terminal_root_action(&state, &task.root_task_id, "重新执行")?;
-    let ownership = state
-        .session_store
-        .execution_ownership(&session_id)
-        .ok_or_else(|| ApiError::session_not_found(session_id.as_str()))?;
     let restart_text = root_task
         .goal
         .trim()
@@ -274,8 +270,7 @@ async fn restart_task(
         .unwrap_or_else(|| root_task.goal.trim().to_string());
     let restart_request = SessionTurnRequestDto {
         session_id: Some(session_id.to_string()),
-        workspace_id: ownership.workspace_id.map(|id| id.to_string()),
-        workspace_path: root_task.workspace_scope.clone(),
+        workspace_id: Some(scope.workspace_id.to_string()),
         text: Some(restart_text),
         skill_name: root_task
             .executor_binding
@@ -302,6 +297,7 @@ async fn restart_task(
     let (accepted, event_id) = accept_session_task_submission(
         &state,
         &restart_request,
+        scope.workspace_id.clone(),
         Some(root_task.title.clone()),
         Some(root_task.goal.clone()),
         task_tier,

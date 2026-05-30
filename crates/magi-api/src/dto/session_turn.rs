@@ -17,8 +17,6 @@ pub struct SessionTurnRequestDto {
     pub session_id: Option<String>,
     #[serde(alias = "workspace_id")]
     pub workspace_id: Option<String>,
-    #[serde(default, alias = "workspace_path")]
-    pub workspace_path: Option<String>,
     pub text: Option<String>,
     #[serde(alias = "skill_name")]
     pub skill_name: Option<String>,
@@ -56,10 +54,6 @@ impl SessionTurnRequestDto {
 
     pub fn requested_workspace_id(&self) -> Option<String> {
         trimmed_non_empty(self.workspace_id.as_deref())
-    }
-
-    pub fn requested_workspace_path(&self) -> Option<String> {
-        trimmed_non_empty(self.workspace_path.as_deref())
     }
 
     pub fn requested_access_profile(&self) -> AccessProfile {
@@ -225,7 +219,6 @@ mod tests {
         let request = SessionTurnRequestDto {
             session_id: Some("session-a".to_string()),
             workspace_id: Some("workspace-a".to_string()),
-            workspace_path: None,
             text: Some("请分析项目".to_string()),
             skill_name: None,
             images: Vec::new(),

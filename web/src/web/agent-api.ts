@@ -1102,13 +1102,15 @@ export async function submitSessionTurn(
       workspacePath: bindingOverride?.workspacePath?.trim() || resolvedBinding.workspacePath,
       sessionId: bindingOverride?.sessionId?.trim() || resolvedBinding.sessionId,
     };
+    if (!binding.workspaceId) {
+      throw new AgentApiError(400, 'workspaceId 不能为空', 'submit session turn');
+    }
     const response = await getTransport().request(agentUrl('/api/session/turn'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         sessionId: binding.sessionId || null,
         workspaceId: binding.workspaceId || null,
-        workspacePath: binding.workspacePath || null,
         text: payload.text ?? null,
         skillName: payload.skillName ?? null,
         accessProfile: payload.accessProfile ?? null,

@@ -21,6 +21,7 @@ use magi_conversation_runtime::session_writeback::publish_current_session_turn_i
 pub(super) async fn accept_session_task_submission(
     state: &ApiState,
     request: &SessionTurnRequestDto,
+    workspace_id: WorkspaceId,
     task_title: Option<String>,
     execution_goal: Option<String>,
     task_tier: TaskTier,
@@ -42,10 +43,7 @@ pub(super) async fn accept_session_task_submission(
     execute_dispatch_submission(
         state,
         request.requested_session_id(),
-        state.resolve_workspace_id_from_request(
-            request.requested_workspace_id().map(WorkspaceId::new),
-            request.requested_workspace_path().as_deref(),
-        ),
+        workspace_id,
         mission_title,
         message,
         trimmed_text,
@@ -61,7 +59,7 @@ pub(super) async fn accept_session_task_submission(
 async fn execute_dispatch_submission(
     state: &ApiState,
     requested_session_id: Option<SessionId>,
-    requested_workspace_id: Option<WorkspaceId>,
+    requested_workspace_id: WorkspaceId,
     mission_title: String,
     message: String,
     trimmed_text: Option<String>,
@@ -76,7 +74,7 @@ async fn execute_dispatch_submission(
     let (session_id, created_session, workspace_id) = resolve_dispatch_session(
         state,
         requested_session_id,
-        requested_workspace_id,
+        Some(requested_workspace_id),
         placeholder_title,
         accepted_at,
     )?;

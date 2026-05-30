@@ -715,23 +715,6 @@ impl ApiState {
             .map(Some)
     }
 
-    pub(crate) async fn ensure_snapshot_session_for_bound_session(
-        &self,
-        session_id: &SessionId,
-    ) -> Result<Option<Arc<SnapshotSession>>, ApiError> {
-        let session = self
-            .session_store
-            .session(session_id)
-            .ok_or_else(|| ApiError::session_not_found(session_id.as_str()))?;
-        let workspace_id = self
-            .session_store
-            .execution_ownership(session_id)
-            .and_then(|ownership| ownership.workspace_id)
-            .or_else(|| self.session_workspace_id(&session));
-        self.ensure_snapshot_session_for_workspace_id(session_id, &workspace_id)
-            .await
-    }
-
     pub fn with_tunnel_port(mut self, port: u16) -> Self {
         self.tunnel_manager = crate::tunnel::TunnelManager::new(port);
         self

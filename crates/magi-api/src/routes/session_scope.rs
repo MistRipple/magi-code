@@ -25,6 +25,23 @@ pub(super) fn require_workspace_id(value: Option<&str>) -> Result<WorkspaceId, A
         .ok_or_else(|| ApiError::InvalidInput("workspaceId 不能为空".to_string()))
 }
 
+pub(super) fn require_registered_workspace_id(
+    state: &ApiState,
+    value: Option<&str>,
+) -> Result<WorkspaceId, ApiError> {
+    let workspace_id = require_workspace_id(value)?;
+    if state
+        .workspace_root_path(&Some(workspace_id.clone()))
+        .is_none()
+    {
+        return Err(ApiError::not_found(
+            "workspace 不存在",
+            workspace_id.as_str(),
+        ));
+    }
+    Ok(workspace_id)
+}
+
 pub(super) fn require_session_workspace_scope(
     state: &ApiState,
     session_id_value: Option<&str>,
