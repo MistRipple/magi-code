@@ -214,12 +214,13 @@ async fn list_knowledge_items(
     State(state): State<ApiState>,
     Query(query): Query<KnowledgeItemsQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let workspace_id = require_registered_workspace_id(&state, query.workspace_id.as_deref())?;
+    let (workspace_id, workspace_path) =
+        require_registered_workspace_binding(&state, query.workspace_id.as_deref())?;
     let kq = KnowledgeQuery {
         kind: query.kind.map(KnowledgeKindParam::into_domain),
         text: None,
         tags: vec![],
-        workspace_id: Some(workspace_id),
+        workspace_id: Some(workspace_id.clone()),
         limit: 1000,
     };
     let result = state.knowledge_store.query(&kq);
@@ -229,7 +230,11 @@ async fn list_knowledge_items(
         .filter(|m| m.record.kind != KnowledgeKind::CodeIndex)
         .map(|m| knowledge_item_json(&m.record))
         .collect::<Vec<_>>();
-    Ok(Json(serde_json::json!({ "items": items })))
+    Ok(Json(serde_json::json!({
+        "workspaceId": workspace_id.as_str(),
+        "workspacePath": workspace_path,
+        "items": items
+    })))
 }
 
 #[derive(Debug, Deserialize)]
@@ -244,7 +249,8 @@ async fn search_knowledge_items(
     State(state): State<ApiState>,
     Query(query): Query<KnowledgeSearchQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let workspace_id = require_registered_workspace_id(&state, query.workspace_id.as_deref())?;
+    let (workspace_id, workspace_path) =
+        require_registered_workspace_binding(&state, query.workspace_id.as_deref())?;
     let text = query
         .q
         .map(|text| text.trim().to_string())
@@ -253,7 +259,7 @@ async fn search_knowledge_items(
         kind: query.kind.map(KnowledgeKindParam::into_domain),
         text,
         tags: vec![],
-        workspace_id: Some(workspace_id),
+        workspace_id: Some(workspace_id.clone()),
         limit: 100,
     };
     let result = state.knowledge_store.query(&kq);
@@ -269,7 +275,11 @@ async fn search_knowledge_items(
             value
         })
         .collect::<Vec<_>>();
-    Ok(Json(serde_json::json!({ "results": results })))
+    Ok(Json(serde_json::json!({
+        "workspaceId": workspace_id.as_str(),
+        "workspacePath": workspace_path,
+        "results": results
+    })))
 }
 
 async fn get_project_knowledge(
@@ -833,6 +843,13 @@ mod tests {
             .expect("list should respond");
         assert_eq!(response.status(), StatusCode::OK);
         let payload = read_json(response).await;
+        assert_eq!(payload["workspaceId"], workspace_id.as_str());
+        assert!(
+            payload["workspacePath"]
+                .as_str()
+                .is_some_and(|path| path.ends_with("magi-knowledge-workspace-unified-knowledge")),
+            "list payload must carry canonical workspace path"
+        );
         let items = payload["items"].as_array().expect("items array");
         assert_eq!(items.len(), 3);
         let kinds: Vec<&str> = items
@@ -880,6 +897,13 @@ mod tests {
             .await
             .expect("search should respond");
         let payload = read_json(response).await;
+        assert_eq!(payload["workspaceId"], workspace_id.as_str());
+        assert!(
+            payload["workspacePath"]
+                .as_str()
+                .is_some_and(|path| path.ends_with("magi-knowledge-workspace-unified-knowledge")),
+            "search payload must carry canonical workspace path"
+        );
         let results = payload["results"].as_array().expect("results array");
         assert!(
             results.iter().any(|r| r["kind"] == "faq"),
