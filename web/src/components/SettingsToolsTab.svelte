@@ -52,26 +52,41 @@
   }>();
 
   const BUILTIN_TOOL_LABELS: Record<string, string> = {
-    shell_exec: 'Shell 命令',
-    process_inspect: '进程检查',
-    file_read: '读取文件',
-    file_write: '写入文件',
-    file_patch: '修改文件',
-    file_remove: '删除文件',
-    file_mkdir: '创建目录',
-    file_copy: '复制文件',
-    file_move: '移动文件',
-    search_text: '文本搜索',
-    search_semantic: '语义搜索',
-    diff_preview: '差异预览',
-    web_search: '网页搜索',
-    web_fetch: '网页读取',
-    diagram_render: '图表渲染',
-    knowledge_query: '知识库检索',
+    file_read: 'settings.tools.builtin.fileRead',
+    view_image: 'settings.tools.builtin.viewImage',
+    file_write: 'settings.tools.builtin.fileWrite',
+    file_patch: 'settings.tools.builtin.filePatch',
+    apply_patch: 'settings.tools.builtin.applyPatch',
+    file_remove: 'settings.tools.builtin.fileRemove',
+    file_mkdir: 'settings.tools.builtin.fileMkdir',
+    file_copy: 'settings.tools.builtin.fileCopy',
+    file_move: 'settings.tools.builtin.fileMove',
+    search_text: 'settings.tools.builtin.searchText',
+    search_semantic: 'settings.tools.builtin.searchSemantic',
+    shell_exec: 'settings.tools.builtin.shellExec',
+    process_inspect: 'settings.tools.builtin.processInspect',
+    diff_preview: 'settings.tools.builtin.diffPreview',
+    web_search: 'settings.tools.builtin.webSearch',
+    web_fetch: 'settings.tools.builtin.webFetch',
+    diagram_render: 'settings.tools.builtin.diagramRender',
+    knowledge_query: 'settings.tools.builtin.knowledgeQuery',
+    code_symbols: 'settings.tools.builtin.codeSymbols',
+    tool_catalog: 'settings.tools.builtin.toolCatalog',
+    agent_spawn: 'settings.tools.builtin.agentSpawn',
+    agent_wait: 'settings.tools.builtin.agentWait',
+    todo_write: 'settings.tools.builtin.todoWrite',
+    memory_write: 'settings.tools.builtin.memoryWrite',
+    mission_charter_write: 'settings.tools.builtin.missionCharterWrite',
+    plan_write: 'settings.tools.builtin.planWrite',
+    kg_write: 'settings.tools.builtin.kgWrite',
+    validation_record: 'settings.tools.builtin.validationRecord',
+    checkpoint_create: 'settings.tools.builtin.checkpointCreate',
+    human_checkpoint_request: 'settings.tools.builtin.humanCheckpointRequest',
   };
 
   function getBuiltinToolLabel(name: string): string {
-    return BUILTIN_TOOL_LABELS[name] ?? name;
+    const key = BUILTIN_TOOL_LABELS[name];
+    return key ? i18n.t(key) : name;
   }
 
   function getBuiltinToolAccessLabel(accessMode: string): string {
@@ -139,8 +154,8 @@
   }
 
   let builtinExpanded = $state(false);
-  const builtinEnabledCount = $derived(
-    (builtinTools as Array<{ enabled: boolean }>).filter((t) => t.enabled).length,
+  const builtinReadyCount = $derived(
+    (builtinTools as Array<{ runtimeStatus: string }>).filter((t) => t.runtimeStatus === 'ready').length,
   );
 
   // MCP 工具描述 hover 浮层：默认右侧弹出；按钮 + 浮层共同构成 hover 区域，移出即消失
@@ -200,7 +215,7 @@
           >
             <div class="header-title-group" style="display: flex; align-items: baseline; gap: 10px;">
               <div class="settings-section-title" style="margin-bottom: 0;">{i18n.t('settings.tools.builtinTools')}</div>
-              <span class="builtin-count-tag">{i18n.t('settings.tools.builtinCount', { enabled: builtinEnabledCount, total: builtinTools.length })}</span>
+              <span class="builtin-count-tag">{i18n.t('settings.tools.builtinCount', { ready: builtinReadyCount, total: builtinTools.length })}</span>
             </div>
             <span class="builtin-expand-icon" class:expanded={builtinExpanded}>
               <Icon name="chevronDown" size={14} />
