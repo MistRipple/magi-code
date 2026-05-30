@@ -2,6 +2,7 @@
   import { i18n } from '../stores/i18n.svelte';
   import Icon from './Icon.svelte';
   import Toggle from './Toggle.svelte';
+  import type { IconName } from '../lib/icons';
 
   let {
     mcpServers,
@@ -11,6 +12,7 @@
     mcpServerTools,
     mcpRefreshingServers,
     builtinTools,
+    capabilityDependencies,
     skills,
     openMCPDialog,
     toggleMCPExpand,
@@ -38,6 +40,16 @@
       schemaStatus: string;
       schemaWarnings: string[];
       enabled: boolean;
+    }>;
+    capabilityDependencies: Array<{
+      name: string;
+      status: string;
+      requiredBy: string[];
+      workspaceId?: string | null;
+      fileCount?: number | null;
+      lastIndexed?: number | null;
+      roleCount?: number | null;
+      spawnableRoleCount?: number | null;
     }>;
     skills: any[];
     openMCPDialog: (server: any) => void;
@@ -138,6 +150,100 @@
     return parts.join('\n');
   }
 
+  function getCapabilityDependencyLabel(name: string): string {
+    switch (name) {
+      case 'knowledge_store':
+        return i18n.t('settings.tools.dependency.knowledgeStore');
+      case 'workspace_code_index':
+        return i18n.t('settings.tools.dependency.workspaceCodeIndex');
+      case 'agent_role_registry':
+        return i18n.t('settings.tools.dependency.agentRoleRegistry');
+      default:
+        return name;
+    }
+  }
+
+  function getCapabilityDependencyStatusLabel(status: string): string {
+    switch (status) {
+      case 'available':
+        return i18n.t('settings.tools.dependency.status.available');
+      case 'ready':
+        return i18n.t('settings.tools.dependency.status.ready');
+      case 'not_ready':
+        return i18n.t('settings.tools.dependency.status.notReady');
+      case 'missing_context':
+        return i18n.t('settings.tools.dependency.status.missingContext');
+      case 'unavailable':
+        return i18n.t('settings.tools.dependency.status.unavailable');
+      default:
+        return status || i18n.t('settings.tools.unknown');
+    }
+  }
+
+  function getCapabilityDependencyClass(status: string): string {
+    switch (status) {
+      case 'available':
+      case 'ready':
+        return 'success';
+      case 'not_ready':
+      case 'missing_context':
+        return 'warning';
+      case 'unavailable':
+        return 'error';
+      default:
+        return 'disabled';
+    }
+  }
+
+  function getCapabilityDependencyIcon(name: string): IconName {
+    switch (name) {
+      case 'knowledge_store':
+        return 'database';
+      case 'workspace_code_index':
+        return 'search';
+      case 'agent_role_registry':
+        return 'bot';
+      default:
+        return 'tools';
+    }
+  }
+
+  function getCapabilityDependencyMetric(dependency: {
+    name: string;
+    fileCount?: number | null;
+    spawnableRoleCount?: number | null;
+  }): string {
+    if (dependency.name === 'workspace_code_index' && typeof dependency.fileCount === 'number') {
+      return i18n.t('settings.tools.dependency.fileCount', { count: dependency.fileCount });
+    }
+    if (dependency.name === 'agent_role_registry' && typeof dependency.spawnableRoleCount === 'number') {
+      return i18n.t('settings.tools.dependency.spawnableRoleCount', {
+        count: dependency.spawnableRoleCount,
+      });
+    }
+    return '';
+  }
+
+  function getCapabilityDependencyTitle(dependency: {
+    name: string;
+    status: string;
+    requiredBy: string[];
+    fileCount?: number | null;
+    spawnableRoleCount?: number | null;
+  }): string {
+    const parts = [
+      `${getCapabilityDependencyLabel(dependency.name)}: ${getCapabilityDependencyStatusLabel(dependency.status)}`,
+    ];
+    const metric = getCapabilityDependencyMetric(dependency);
+    if (metric) parts.push(metric);
+    if (dependency.requiredBy.length > 0) {
+      parts.push(i18n.t('settings.tools.dependency.requiredBy', {
+        tools: dependency.requiredBy.join(', '),
+      }));
+    }
+    return parts.join('\n');
+  }
+
   let builtinExpanded = $state(false);
   const builtinReadyCount = $derived(
     (builtinTools as Array<{ runtimeStatus: string }>).filter((t) => t.runtimeStatus === 'ready').length,
@@ -198,9 +304,30 @@
             onclick={() => { builtinExpanded = !builtinExpanded; }}
             aria-expanded={builtinExpanded}
           >
-            <div class="header-title-group" style="display: flex; align-items: baseline; gap: 10px;">
-              <div class="settings-section-title" style="margin-bottom: 0;">{i18n.t('settings.tools.builtinTools')}</div>
-              <span class="builtin-count-tag">{i18n.t('settings.tools.builtinCount', { ready: builtinReadyCount, total: builtinTools.length })}</span>
+            <div class="builtin-summary-main">
+              <div class="header-title-group" style="display: flex; align-items: baseline; gap: 10px;">
+                <div class="settings-section-title" style="margin-bottom: 0;">{i18n.t('settings.tools.builtinTools')}</div>
+                <span class="builtin-count-tag">{i18n.t('settings.tools.builtinCount', { ready: builtinReadyCount, total: builtinTools.length })}</span>
+              </div>
+              {#if capabilityDependencies.length > 0}
+                <div
+                  class="capability-dependency-strip"
+                  aria-label={i18n.t('settings.tools.capabilityDependencySummary')}
+                >
+                  {#each capabilityDependencies as dependency (dependency.name)}
+                    <span
+                      class={`capability-dependency-chip capability-dependency-chip--${getCapabilityDependencyClass(dependency.status)}`}
+                      title={getCapabilityDependencyTitle(dependency)}
+                    >
+                      <Icon name={getCapabilityDependencyIcon(dependency.name)} size={11} />
+                      <span>{getCapabilityDependencyLabel(dependency.name)}</span>
+                      <span class="capability-dependency-status">
+                        {getCapabilityDependencyStatusLabel(dependency.status)}
+                      </span>
+                    </span>
+                  {/each}
+                </div>
+              {/if}
             </div>
             <span class="builtin-expand-icon" class:expanded={builtinExpanded}>
               <Icon name="chevronDown" size={14} />
@@ -538,6 +665,14 @@
     border-color: rgba(var(--primary-rgb, 0, 122, 255), 0.35);
   }
 
+  .builtin-summary-main {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    min-width: 0;
+    flex: 1;
+  }
+
   .builtin-count-tag {
     font-size: 11px;
     color: var(--foreground-muted);
@@ -546,10 +681,56 @@
     background: rgba(var(--foreground-rgb), 0.06);
   }
 
+  .capability-dependency-strip {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+    flex-wrap: wrap;
+  }
+
+  .capability-dependency-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    min-height: 22px;
+    padding: 2px 7px;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    color: var(--foreground-muted);
+    background: rgba(var(--foreground-rgb), 0.04);
+    font-size: 10px;
+    font-weight: 500;
+    white-space: nowrap;
+  }
+
+  .capability-dependency-chip--success {
+    color: var(--success, #2f855a);
+    border-color: color-mix(in srgb, var(--success, #2f855a) 28%, transparent);
+    background: color-mix(in srgb, var(--success, #2f855a) 10%, transparent);
+  }
+
+  .capability-dependency-chip--warning {
+    color: var(--warning, #b7791f);
+    border-color: color-mix(in srgb, var(--warning, #b7791f) 32%, transparent);
+    background: color-mix(in srgb, var(--warning, #b7791f) 12%, transparent);
+  }
+
+  .capability-dependency-chip--error {
+    color: var(--error, #d33);
+    border-color: color-mix(in srgb, var(--error, #d33) 30%, transparent);
+    background: color-mix(in srgb, var(--error, #d33) 10%, transparent);
+  }
+
+  .capability-dependency-status {
+    opacity: 0.78;
+  }
+
   .builtin-expand-icon {
     display: inline-flex;
     align-items: center;
     justify-content: center;
+    margin-left: 10px;
     transition: transform 0.2s cubic-bezier(0.3, 0, 0.2, 1);
     color: var(--foreground-muted);
   }

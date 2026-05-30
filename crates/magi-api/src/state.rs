@@ -1102,6 +1102,7 @@ impl ApiState {
         if hydrate_mcp_servers {
             self.enrich_mcp_servers_with_connection_status(&mut snapshot);
         }
+        let tool_catalog = self.settings_tool_catalog_json(tool_context);
         serde_json::json!({
             "workerConfigs": object_section(&snapshot, "workerConfigs"),
             "orchestratorConfig": object_section(&snapshot, "orchestratorConfig"),
@@ -1111,7 +1112,8 @@ impl ApiState {
             "safeguardConfig": object_section(&snapshot, "safeguardConfig"),
             "repositories": array_section(&snapshot, "repositories"),
             "mcpServers": array_section(&snapshot, "mcpServers"),
-            "builtinTools": self.builtin_tools_json(tool_context),
+            "builtinTools": self.builtin_tools_json(&tool_catalog),
+            "capabilityDependencies": self.capability_dependencies_json(&tool_catalog),
             "workerStatuses": object_section(&snapshot, "workerStatuses"),
             "runtimeSettings": runtime_settings_from_snapshot(&snapshot),
             "roleTemplates": builtin_role_templates(),
@@ -1122,15 +1124,21 @@ impl ApiState {
         })
     }
 
-    fn builtin_tools_json(&self, tool_context: &ToolExecutionContext) -> serde_json::Value {
+    fn settings_tool_catalog_json(&self, tool_context: &ToolExecutionContext) -> serde_json::Value {
         let Some(registry) = &self.tool_registry else {
-            return serde_json::Value::Array(Vec::new());
+            return serde_json::Value::Null;
         };
-        let catalog = registry.tool_catalog_value(
+        registry.tool_catalog_value(
             r#"{"includeExternal":false,"includeMcpServers":false,"includeAgentRoles":false}"#,
             tool_context,
-        );
-        let tools = catalog
+        )
+    }
+
+    fn builtin_tools_json(&self, tool_catalog: &serde_json::Value) -> serde_json::Value {
+        if tool_catalog.is_null() {
+            return serde_json::Value::Array(Vec::new());
+        }
+        let tools = tool_catalog
             .get("tools")
             .and_then(serde_json::Value::as_array)
             .into_iter()
@@ -1152,6 +1160,13 @@ impl ApiState {
             })
             .collect::<Vec<_>>();
         serde_json::Value::Array(tools)
+    }
+
+    fn capability_dependencies_json(&self, tool_catalog: &serde_json::Value) -> serde_json::Value {
+        tool_catalog
+            .get("runtime_dependencies")
+            .cloned()
+            .unwrap_or_else(|| serde_json::Value::Array(Vec::new()))
     }
 
     pub fn settings_runtime_json(&self) -> serde_json::Value {

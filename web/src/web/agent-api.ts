@@ -3,7 +3,11 @@ import { getTransport } from '../shared/transport';
 import { readStoredBrowserWorkspaceBinding } from '../shared/bridges/browser-workspace-binding';
 import type { AgentBinding, ModelEngine } from '../shared/types/registry-types';
 import type { RoleTemplate } from '../shared/types/role-templates';
-import type { SettingsBootstrapPayload, SettingsRuntimeSnapshot } from '../shared/settings-bootstrap';
+import type {
+  SettingsBootstrapPayload,
+  SettingsCapabilityDependency,
+  SettingsRuntimeSnapshot,
+} from '../shared/settings-bootstrap';
 import type {
   SessionNotificationItemDto,
   SessionNotificationSnapshotDto,
@@ -118,6 +122,48 @@ function normalizeMcpServerConfig(server: Record<string, unknown>): Record<strin
   };
 }
 
+function normalizeNullableNumber(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+function normalizeNullableString(value: unknown): string | null {
+  return typeof value === 'string' && value.trim() ? value.trim() : null;
+}
+
+function normalizeRequiredBy(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+    .map((item) => item.trim());
+}
+
+function normalizeCapabilityDependencies(value: unknown): SettingsCapabilityDependency[] {
+  if (!Array.isArray(value)) return [];
+  const dependencies: SettingsCapabilityDependency[] = [];
+  for (const entry of value) {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
+    const record = entry as Record<string, unknown>;
+    const name = typeof record.name === 'string' ? record.name.trim() : '';
+    if (!name) continue;
+    const status = typeof record.status === 'string' && record.status.trim()
+      ? record.status.trim()
+      : 'unknown';
+    dependencies.push({
+      name,
+      status,
+      requiredBy: normalizeRequiredBy(record.required_by ?? record.requiredBy),
+      workspaceId: normalizeNullableString(record.workspace_id ?? record.workspaceId),
+      fileCount: normalizeNullableNumber(record.file_count ?? record.fileCount),
+      lastIndexed: normalizeNullableNumber(record.last_indexed ?? record.lastIndexed),
+      roleCount: normalizeNullableNumber(record.role_count ?? record.roleCount),
+      spawnableRoleCount: normalizeNullableNumber(
+        record.spawnable_role_count ?? record.spawnableRoleCount,
+      ),
+    });
+  }
+  return dependencies;
+}
+
 function normalizeSettingsBootstrapPayload(
   payload: Record<string, unknown>,
 ): AgentSettingsBootstrapSnapshot {
@@ -153,6 +199,7 @@ function normalizeSettingsBootstrapPayload(
     repositories: Array.isArray(payload.repositories) ? payload.repositories : [],
     mcpServers: Array.isArray(payload.mcpServers) ? payload.mcpServers : [],
     builtinTools: Array.isArray(payload.builtinTools) ? payload.builtinTools : [],
+    capabilityDependencies: normalizeCapabilityDependencies(payload.capabilityDependencies),
     workerStatuses: (
       payload.workerStatuses
       && typeof payload.workerStatuses === 'object'

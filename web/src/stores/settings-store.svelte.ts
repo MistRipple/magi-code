@@ -132,6 +132,17 @@ export interface BuiltinToolItem {
   enabled: boolean;
 }
 
+export interface CapabilityDependencyItem {
+  name: string;
+  status: string;
+  requiredBy: string[];
+  workspaceId?: string | null;
+  fileCount?: number | null;
+  lastIndexed?: number | null;
+  roleCount?: number | null;
+  spawnableRoleCount?: number | null;
+}
+
 function notifySettingsSuccess(
   message: string,
   options: {
@@ -601,6 +612,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
   // Skills 完整结构（内置工具已迁移到 ToolManager，不再通过 Skills 配置）
   let skills = $state<SkillItem[]>([]);
   let builtinTools = $state<BuiltinToolItem[]>([]);
+  let capabilityDependencies = $state<CapabilityDependencyItem[]>([]);
 
   // 仓库管理
   let repositories = $state<Repository[]>([]);
@@ -959,6 +971,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
       ensureToolsBootstrapHydrated();
     }
     applyBuiltinToolsPayload(payload.builtinTools);
+    applyCapabilityDependenciesPayload(payload.capabilityDependencies);
     applySkillsConfig(payload.skillsConfig);
     applyRepositoriesPayload(payload.repositories);
     applySafeguardConfig(payload.safeguardConfig);
@@ -2326,6 +2339,37 @@ function createSettingsStore(props: { onClose?: () => void }) {
       .filter((tool): tool is BuiltinToolItem => tool !== null);
   }
 
+  function applyCapabilityDependenciesPayload(dependenciesPayload: unknown): void {
+    const dependencies: CapabilityDependencyItem[] = [];
+    for (const dependency of ensureArray<any>(dependenciesPayload)) {
+      const name = typeof dependency?.name === "string" ? dependency.name.trim() : "";
+      if (!name) {
+        continue;
+      }
+      dependencies.push({
+        name,
+        status: typeof dependency?.status === "string" ? dependency.status : "unknown",
+        requiredBy: ensureArray<string>(dependency?.requiredBy)
+          .filter((tool): tool is string => typeof tool === "string" && tool.trim().length > 0)
+          .map((tool) => tool.trim()),
+        workspaceId: typeof dependency?.workspaceId === "string" ? dependency.workspaceId : null,
+        fileCount: typeof dependency?.fileCount === "number" && Number.isFinite(dependency.fileCount)
+          ? dependency.fileCount
+          : null,
+        lastIndexed: typeof dependency?.lastIndexed === "number" && Number.isFinite(dependency.lastIndexed)
+          ? dependency.lastIndexed
+          : null,
+        roleCount: typeof dependency?.roleCount === "number" && Number.isFinite(dependency.roleCount)
+          ? dependency.roleCount
+          : null,
+        spawnableRoleCount: typeof dependency?.spawnableRoleCount === "number" && Number.isFinite(dependency.spawnableRoleCount)
+          ? dependency.spawnableRoleCount
+          : null,
+      });
+    }
+    capabilityDependencies = dependencies;
+  }
+
   function applySkillsConfig(config: any): void {
     const skillList: SkillItem[] = [];
     if (Array.isArray(config?.customTools)) {
@@ -2639,6 +2683,9 @@ function createSettingsStore(props: { onClose?: () => void }) {
     },
     get builtinTools() {
       return builtinTools;
+    },
+    get capabilityDependencies() {
+      return capabilityDependencies;
     },
     get repositories() {
       return repositories;

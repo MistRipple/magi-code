@@ -1279,6 +1279,7 @@ mod tests {
             "repositories",
             "mcpServers",
             "builtinTools",
+            "capabilityDependencies",
             "roleTemplates",
             "registryEngines",
             "registryAgents",
@@ -1354,6 +1355,26 @@ mod tests {
                 .as_array()
                 .is_some_and(|warnings| !warnings.is_empty()),
             "unavailable builtin tools should include actionable runtime warnings"
+        );
+        let capability_dependencies = bootstrap["capabilityDependencies"]
+            .as_array()
+            .expect("capability dependencies should be an array");
+        assert_eq!(capability_dependencies.len(), 3);
+        assert_eq!(
+            capability_dependencies[0]["name"],
+            serde_json::json!("knowledge_store")
+        );
+        assert_eq!(
+            capability_dependencies[0]["status"],
+            serde_json::json!("unavailable")
+        );
+        assert_eq!(
+            capability_dependencies[1]["name"],
+            serde_json::json!("workspace_code_index")
+        );
+        assert_eq!(
+            capability_dependencies[2]["name"],
+            serde_json::json!("agent_role_registry")
         );
         assert!(
             builtin_tools

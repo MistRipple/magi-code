@@ -27,6 +27,17 @@ export interface SettingsBuiltinTool {
   enabled?: boolean;
 }
 
+export interface SettingsCapabilityDependency {
+  name: string;
+  status: string;
+  requiredBy: string[];
+  workspaceId?: string | null;
+  fileCount?: number | null;
+  lastIndexed?: number | null;
+  roleCount?: number | null;
+  spawnableRoleCount?: number | null;
+}
+
 export interface SettingsRuntimeSnapshot {
   locale: string;
 }
@@ -41,6 +52,7 @@ export interface SettingsBootstrapPayload {
   repositories: unknown[];
   mcpServers: unknown[];
   builtinTools?: SettingsBuiltinTool[];
+  capabilityDependencies?: SettingsCapabilityDependency[];
   workerStatuses: SettingsWorkerStatusSnapshot;
   runtimeSettings: SettingsRuntimeSnapshot;
   roleTemplates?: RoleTemplate[];
