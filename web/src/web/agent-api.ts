@@ -292,6 +292,9 @@ export type AgentSessionNotificationsPayload = SessionNotificationsResponseDto;
 
 export interface AgentKnowledgeMutationPayload {
   success: boolean;
+  workspaceId?: string;
+  workspacePath?: string;
+  knowledgeCount?: number;
   error?: string;
   payload?: Record<string, unknown>;
 }

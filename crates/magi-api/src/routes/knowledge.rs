@@ -63,12 +63,33 @@ fn kind_to_lower(kind: KnowledgeKind) -> &'static str {
 #[serde(rename_all = "camelCase")]
 struct KnowledgeMutationResponse {
     success: bool,
+    workspace_id: String,
+    workspace_path: String,
     knowledge_count: usize,
 }
 
-fn mutation_response(state: &ApiState, workspace_id: &WorkspaceId) -> KnowledgeMutationResponse {
-    KnowledgeMutationResponse {
+fn registered_workspace_path(
+    state: &ApiState,
+    workspace_id: &WorkspaceId,
+) -> Result<String, ApiError> {
+    state
+        .workspace_registry
+        .workspaces()
+        .into_iter()
+        .find(|workspace| workspace.workspace_id == *workspace_id)
+        .map(|workspace| workspace.root_path.to_string())
+        .ok_or_else(|| ApiError::not_found("工作区不存在", workspace_id.as_str()))
+}
+
+fn mutation_response(
+    state: &ApiState,
+    workspace_id: &WorkspaceId,
+) -> Result<KnowledgeMutationResponse, ApiError> {
+    let workspace_path = registered_workspace_path(state, workspace_id)?;
+    Ok(KnowledgeMutationResponse {
         success: true,
+        workspace_id: workspace_id.as_str().to_string(),
+        workspace_path,
         knowledge_count: state
             .knowledge_store
             .list()
@@ -78,7 +99,7 @@ fn mutation_response(state: &ApiState, workspace_id: &WorkspaceId) -> KnowledgeM
                     && record.kind != KnowledgeKind::CodeIndex
             })
             .count(),
-    }
+    })
 }
 
 fn normalize_text(value: impl Into<String>, field: &str) -> Result<String, ApiError> {
@@ -139,13 +160,8 @@ fn require_registered_workspace_binding(
     value: Option<&str>,
 ) -> Result<(WorkspaceId, String), ApiError> {
     let workspace_id = require_workspace_id(value)?;
-    let workspace = state
-        .workspace_registry
-        .workspaces()
-        .into_iter()
-        .find(|workspace| workspace.workspace_id == workspace_id)
-        .ok_or_else(|| ApiError::not_found("工作区不存在", workspace_id.as_str()))?;
-    Ok((workspace_id, workspace.root_path.to_string()))
+    let workspace_path = registered_workspace_path(state, &workspace_id)?;
+    Ok((workspace_id, workspace_path))
 }
 
 fn normalize_tags(tags: Vec<String>) -> Vec<String> {
@@ -200,7 +216,7 @@ async fn clear_knowledge(
     let workspace_id = require_registered_workspace_id(&state, request.workspace_id.as_deref())?;
     state.knowledge_store.clear_workspace(&workspace_id);
     state.persist_knowledge_state()?;
-    Ok(Json(mutation_response(&state, &workspace_id)))
+    Ok(Json(mutation_response(&state, &workspace_id)?))
 }
 
 #[derive(Debug, Deserialize)]
@@ -446,7 +462,7 @@ async fn add_knowledge_item(
     };
     state.knowledge_store.upsert(record);
     state.persist_knowledge_state()?;
-    Ok(Json(mutation_response(&state, &workspace_id)))
+    Ok(Json(mutation_response(&state, &workspace_id)?))
 }
 
 #[derive(Debug, Deserialize)]
@@ -509,7 +525,7 @@ async fn update_knowledge_item(
     };
     state.knowledge_store.upsert(updated);
     state.persist_knowledge_state()?;
-    Ok(Json(mutation_response(&state, &workspace_id)))
+    Ok(Json(mutation_response(&state, &workspace_id)?))
 }
 
 #[derive(Debug, Deserialize)]
@@ -529,7 +545,7 @@ async fn delete_knowledge_item(
         .delete_in_workspace(&request.knowledge_id, &workspace_id)
         .map_err(|error| map_knowledge_delete_error(error, &request.knowledge_id))?;
     state.persist_knowledge_state()?;
-    Ok(Json(mutation_response(&state, &workspace_id)))
+    Ok(Json(mutation_response(&state, &workspace_id)?))
 }
 
 fn map_knowledge_delete_error(error: DomainError, id: &str) -> ApiError {
@@ -609,6 +625,18 @@ mod tests {
         serde_json::from_slice(&body).expect("payload should deserialize")
     }
 
+    fn assert_workspace_binding(payload: &serde_json::Value, workspace_id: &WorkspaceId) {
+        assert_eq!(payload["workspaceId"], workspace_id.as_str());
+        let workspace_path = payload["workspacePath"]
+            .as_str()
+            .expect("workspacePath should be a string");
+        let expected_suffix = format!("magi-knowledge-{}", workspace_id.as_str());
+        assert!(
+            workspace_path.ends_with(&expected_suffix),
+            "payload must carry canonical workspace path, got {workspace_path}"
+        );
+    }
+
     #[tokio::test]
     async fn project_knowledge_returns_workspace_scoped_code_index() {
         let knowledge_store = KnowledgeStore::new();
@@ -633,13 +661,7 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         let payload = read_json(response).await;
-        assert_eq!(payload["workspaceId"], "workspace-knowledge-a");
-        assert!(
-            payload["workspacePath"]
-                .as_str()
-                .is_some_and(|path| path.ends_with("magi-knowledge-workspace-knowledge-a")),
-            "knowledge payload must carry canonical workspace path"
-        );
+        assert_workspace_binding(&payload, &workspace_a);
         assert_eq!(payload["codeIndex"]["files"][0]["path"], "src/a.rs");
         assert!(payload["items"].is_array(), "items 字段必须存在且为数组");
     }
@@ -800,6 +822,9 @@ mod tests {
             .await
             .expect("add adr should respond");
         assert_eq!(response.status(), StatusCode::OK);
+        let payload = read_json(response).await;
+        assert_workspace_binding(&payload, &workspace_id);
+        assert_eq!(payload["knowledgeCount"], 1);
 
         // add faq
         let response = app()
@@ -816,6 +841,9 @@ mod tests {
             .await
             .expect("add faq should respond");
         assert_eq!(response.status(), StatusCode::OK);
+        let payload = read_json(response).await;
+        assert_workspace_binding(&payload, &workspace_id);
+        assert_eq!(payload["knowledgeCount"], 2);
 
         // add learning
         let response = app()
@@ -832,6 +860,9 @@ mod tests {
             .await
             .expect("add learning should respond");
         assert_eq!(response.status(), StatusCode::OK);
+        let payload = read_json(response).await;
+        assert_workspace_binding(&payload, &workspace_id);
+        assert_eq!(payload["knowledgeCount"], 3);
 
         // list (no kind)
         let response = app()
@@ -843,13 +874,7 @@ mod tests {
             .expect("list should respond");
         assert_eq!(response.status(), StatusCode::OK);
         let payload = read_json(response).await;
-        assert_eq!(payload["workspaceId"], workspace_id.as_str());
-        assert!(
-            payload["workspacePath"]
-                .as_str()
-                .is_some_and(|path| path.ends_with("magi-knowledge-workspace-unified-knowledge")),
-            "list payload must carry canonical workspace path"
-        );
+        assert_workspace_binding(&payload, &workspace_id);
         let items = payload["items"].as_array().expect("items array");
         assert_eq!(items.len(), 3);
         let kinds: Vec<&str> = items
@@ -897,13 +922,7 @@ mod tests {
             .await
             .expect("search should respond");
         let payload = read_json(response).await;
-        assert_eq!(payload["workspaceId"], workspace_id.as_str());
-        assert!(
-            payload["workspacePath"]
-                .as_str()
-                .is_some_and(|path| path.ends_with("magi-knowledge-workspace-unified-knowledge")),
-            "search payload must carry canonical workspace path"
-        );
+        assert_workspace_binding(&payload, &workspace_id);
         let results = payload["results"].as_array().expect("results array");
         assert!(
             results.iter().any(|r| r["kind"] == "faq"),
@@ -923,6 +942,9 @@ mod tests {
             .await
             .expect("update should respond");
         assert_eq!(response.status(), StatusCode::OK);
+        let payload = read_json(response).await;
+        assert_workspace_binding(&payload, &workspace_id);
+        assert_eq!(payload["knowledgeCount"], 3);
 
         // delete
         let response = app()
@@ -936,6 +958,9 @@ mod tests {
             .await
             .expect("delete should respond");
         assert_eq!(response.status(), StatusCode::OK);
+        let payload = read_json(response).await;
+        assert_workspace_binding(&payload, &workspace_id);
+        assert_eq!(payload["knowledgeCount"], 2);
 
         // confirm count after delete
         let response = app()
@@ -947,5 +972,20 @@ mod tests {
             .expect("final list should respond");
         let payload = read_json(response).await;
         assert_eq!(payload["items"].as_array().unwrap().len(), 2);
+
+        // clear
+        let response = app()
+            .oneshot(post_json(
+                "/knowledge/clear",
+                serde_json::json!({
+                    "workspaceId": workspace_id.as_str(),
+                }),
+            ))
+            .await
+            .expect("clear should respond");
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = read_json(response).await;
+        assert_workspace_binding(&payload, &workspace_id);
+        assert_eq!(payload["knowledgeCount"], 0);
     }
 }

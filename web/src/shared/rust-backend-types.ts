@@ -1039,6 +1039,8 @@ export interface SavedResponseDto {
 
 export interface KnowledgeMutationResponseDto {
   success: boolean;
+  workspaceId: string;
+  workspacePath: string;
   knowledgeCount: number;
 }
 
