@@ -146,6 +146,7 @@ let currentInterruptTaskId = '';
 let currentRuntimeEpoch = '';
 let cachedSettingsBootstrap: SettingsBootstrapPayload | null = null;
 let cachedSettingsBootstrapScope: 'none' | 'core' | 'full' = 'none';
+let cachedSettingsBootstrapBindingKey = '';
 const QUEUE_DRAIN_DELAY_MS = 120;
 const QUEUE_DRAIN_BUSY_RETRY_MS = 1000;
 let queueDrainTimer: ReturnType<typeof setTimeout> | null = null;
@@ -169,6 +170,8 @@ let bridgeRecovering = false;
 // 后续调用复用同一 Promise，避免重复 dispatchBootstrap 打乱 eventSeq 追踪。
 let bootstrapInFlight: Promise<void> | null = null;
 let settingsBootstrapInFlight: Promise<void> | null = null;
+let settingsBootstrapInFlightBindingKey = '';
+let settingsBootstrapRequestSeq = 0;
 let recoveryAttempt = 0;
 let recoveryTimer: number | null = null;
 let recoveryInFlight: Promise<void> | null = null;
@@ -1345,11 +1348,54 @@ function hydrateCanonicalWorkspaceBinding(): void {
   currentSessionId = binding.sessionId;
 }
 
+function settingsBootstrapBindingKey(
+  workspaceId = currentWorkspaceId,
+  workspacePath = currentWorkspacePath,
+): string {
+  return JSON.stringify({
+    workspaceId: workspaceId.trim(),
+    workspacePath: workspacePath.trim(),
+  });
+}
+
+function clearSettingsBootstrapCache(): void {
+  cachedSettingsBootstrap = null;
+  cachedSettingsBootstrapScope = 'none';
+  cachedSettingsBootstrapBindingKey = '';
+}
+
+function clearSettingsBootstrapCacheIfWorkspaceChanged(
+  previousWorkspaceId: string,
+  previousWorkspacePath: string,
+  nextWorkspaceId: string,
+  nextWorkspacePath: string,
+): void {
+  if (
+    settingsBootstrapBindingKey(previousWorkspaceId, previousWorkspacePath)
+    !== settingsBootstrapBindingKey(nextWorkspaceId, nextWorkspacePath)
+  ) {
+    clearSettingsBootstrapCache();
+  }
+}
+
+function isCurrentSettingsBootstrapRequest(bindingKey: string, requestSeq: number): boolean {
+  return requestSeq === settingsBootstrapRequestSeq
+    && bindingKey === settingsBootstrapBindingKey();
+}
+
 function persistWorkspaceBinding(workspaceId: string, workspacePath: string, sessionId: string): void {
+  const previousWorkspaceId = currentWorkspaceId;
+  const previousWorkspacePath = currentWorkspacePath;
   const normalizedWorkspaceId = workspaceId.trim();
   const normalizedWorkspacePath = workspacePath.trim();
   const incomingSessionId = sessionId.trim();
 
+  clearSettingsBootstrapCacheIfWorkspaceChanged(
+    previousWorkspaceId,
+    previousWorkspacePath,
+    normalizedWorkspaceId,
+    normalizedWorkspacePath,
+  );
   currentWorkspaceId = normalizedWorkspaceId;
   currentWorkspacePath = normalizedWorkspacePath;
   currentSessionId = incomingSessionId;
@@ -1384,8 +1430,16 @@ function persistWorkspaceBinding(workspaceId: string, workspacePath: string, ses
 }
 
 function clearWorkspaceSessionBinding(workspaceId: string, workspacePath: string): void {
+  const previousWorkspaceId = currentWorkspaceId;
+  const previousWorkspacePath = currentWorkspacePath;
   const normalizedWorkspaceId = workspaceId.trim();
   const normalizedWorkspacePath = workspacePath.trim();
+  clearSettingsBootstrapCacheIfWorkspaceChanged(
+    previousWorkspaceId,
+    previousWorkspacePath,
+    normalizedWorkspaceId,
+    normalizedWorkspacePath,
+  );
   currentWorkspaceId = normalizedWorkspaceId;
   currentWorkspacePath = normalizedWorkspacePath;
   currentSessionId = '';
@@ -1432,6 +1486,7 @@ function dispatchWorkspaceSessionCleared(workspaceId: string, workspacePath: str
 }
 
 function clearPersistedWorkspaceBinding(): void {
+  clearSettingsBootstrapCache();
   currentWorkspaceId = '';
   currentWorkspacePath = '';
   currentSessionId = '';
@@ -1503,8 +1558,7 @@ async function restoreBridgeState(reason: string, force = false): Promise<void> 
       throw new Error('无法连接 Local Agent，正在等待恢复。');
     }
     if (force) {
-      cachedSettingsBootstrap = null;
-      cachedSettingsBootstrapScope = 'none';
+      clearSettingsBootstrapCache();
     }
     await Promise.all([
       fetchBootstrap({ forceEventStreamReconnect: true }),
@@ -1760,31 +1814,62 @@ async function fetchBootstrap(
 async function fetchSettingsBootstrap(
   force = false,
   scope: 'core' | 'full' = 'full',
+  bindingKey = settingsBootstrapBindingKey(),
+  requestSeq = settingsBootstrapRequestSeq,
 ): Promise<SettingsBootstrapPayload> {
   const cachedScopeSatisfiesRequest = cachedSettingsBootstrapScope === 'full'
     || cachedSettingsBootstrapScope === scope;
-  if (!force && cachedSettingsBootstrap && cachedScopeSatisfiesRequest) {
+  if (
+    !force
+    && cachedSettingsBootstrap
+    && cachedScopeSatisfiesRequest
+    && cachedSettingsBootstrapBindingKey === bindingKey
+  ) {
     return cachedSettingsBootstrap;
   }
-  cachedSettingsBootstrap = await getAgentSettingsBootstrap({ scope });
-  cachedSettingsBootstrapScope = cachedSettingsBootstrap.bootstrapScope === 'core' ? 'core' : 'full';
-  return cachedSettingsBootstrap;
+  const snapshot = await getAgentSettingsBootstrap({ scope });
+  if (isCurrentSettingsBootstrapRequest(bindingKey, requestSeq)) {
+    cachedSettingsBootstrap = snapshot;
+    cachedSettingsBootstrapScope = snapshot.bootstrapScope === 'core' ? 'core' : 'full';
+    cachedSettingsBootstrapBindingKey = bindingKey;
+  }
+  return snapshot;
 }
 
 async function dispatchSettingsBootstrap(
   force = false,
   scope: 'core' | 'full' = 'full',
 ): Promise<void> {
-  if (!force && settingsBootstrapInFlight) {
+  const bindingKey = settingsBootstrapBindingKey();
+  if (
+    !force
+    && settingsBootstrapInFlight
+    && settingsBootstrapInFlightBindingKey === bindingKey
+  ) {
     return settingsBootstrapInFlight;
   }
+  const requestSeq = settingsBootstrapRequestSeq + 1;
+  settingsBootstrapRequestSeq = requestSeq;
   const doDispatch = async (): Promise<void> => {
-    const snapshot: SettingsBootstrapSnapshot = await fetchSettingsBootstrap(force, scope);
+    const snapshot: SettingsBootstrapSnapshot = await fetchSettingsBootstrap(
+      force,
+      scope,
+      bindingKey,
+      requestSeq,
+    );
+    if (!isCurrentSettingsBootstrapRequest(bindingKey, requestSeq)) {
+      return;
+    }
     emitDataMessage('settingsBootstrapLoaded', snapshot as unknown as Record<string, unknown>);
   };
-  settingsBootstrapInFlight = doDispatch().finally(() => {
-    settingsBootstrapInFlight = null;
+  const request = doDispatch().finally(() => {
+    if (settingsBootstrapInFlight === request) {
+      settingsBootstrapInFlight = null;
+      settingsBootstrapInFlightBindingKey = '';
+    }
   });
+  settingsBootstrapInFlight = request;
+  settingsBootstrapInFlightBindingKey = bindingKey;
   return settingsBootstrapInFlight;
 }
 
@@ -2674,7 +2759,7 @@ async function removeNotification(scope: NotificationOperationScope, notificatio
 
 async function saveWorkerConfig(worker: string, config: Record<string, unknown>): Promise<void> {
   await saveAgentWorkerConfig(worker, config);
-  cachedSettingsBootstrap = null;
+  clearSettingsBootstrapCache();
   await dispatchSettingsBootstrap(true);
   emitBridgeSuccessToast(
     i18n.t('settings.toast.action.saveWorkerConfig'),
@@ -2695,7 +2780,7 @@ async function saveUserRules(data: Record<string, unknown>): Promise<void> {
 
 async function saveOrchestratorConfig(config: Record<string, unknown>): Promise<void> {
   await saveAgentOrchestratorConfig(config);
-  cachedSettingsBootstrap = null;
+  clearSettingsBootstrapCache();
   await dispatchSettingsBootstrap(true);
   emitBridgeSuccessToast(
     i18n.t('settings.toast.action.saveOrchestratorConfig'),
@@ -2706,7 +2791,7 @@ async function saveOrchestratorConfig(config: Record<string, unknown>): Promise<
 
 async function saveAuxiliaryConfig(config: Record<string, unknown>): Promise<void> {
   await saveAgentAuxiliaryConfig(config);
-  cachedSettingsBootstrap = null;
+  clearSettingsBootstrapCache();
   await dispatchSettingsBootstrap(true);
   emitBridgeSuccessToast(
     i18n.t('settings.toast.action.saveAuxiliaryConfig'),
@@ -2717,7 +2802,7 @@ async function saveAuxiliaryConfig(config: Record<string, unknown>): Promise<voi
 
 async function saveSafeguardConfig(config: Record<string, unknown>): Promise<void> {
   await saveAgentSafeguardConfig(config);
-  cachedSettingsBootstrap = null;
+  clearSettingsBootstrapCache();
   await dispatchSettingsBootstrap(true);
   emitBridgeSuccessToast(
     i18n.t('settings.toast.action.saveSafeguardConfig'),
