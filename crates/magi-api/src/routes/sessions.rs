@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::session_scope::{
     parse_session_id, require_current_session_record_in_workspace,
-    require_session_record_in_workspace, session_workspace_id,
+    require_session_record_in_workspace, require_workspace_id, session_workspace_id,
 };
 use crate::{
     dto::{
@@ -1995,24 +1995,16 @@ async fn delete_session(
     State(state): State<ApiState>,
     Json(request): Json<DeleteSessionRequest>,
 ) -> Result<Json<BootstrapDto>, ApiError> {
+    let workspace_id = require_workspace_id(request.requested_workspace_id())?;
     let session_id = SessionId::new(&request.session_id);
-    let session =
-        require_session_record_in_workspace(&state, &session_id, request.requested_workspace_id())?;
-    let response_workspace_id = request
-        .requested_workspace_id()
-        .map(str::to_string)
-        .or_else(|| {
-            state
-                .session_workspace_id(&session)
-                .map(|workspace_id| workspace_id.to_string())
-        });
+    require_session_record_in_workspace(&state, &session_id, Some(workspace_id.as_str()))?;
     state
         .session_store
         .delete_session(&session_id)
         .map_err(|e| ApiError::internal_assembly("删除会话失败", e))?;
     state.persist_session_durable_state()?;
     Ok(Json(state.bootstrap_dto_for_workspace_session(
-        response_workspace_id.as_deref(),
+        Some(workspace_id.as_str()),
         None,
     )?))
 }
@@ -2036,24 +2028,16 @@ async fn rename_session(
     State(state): State<ApiState>,
     Json(request): Json<RenameSessionRequest>,
 ) -> Result<Json<BootstrapDto>, ApiError> {
+    let workspace_id = require_workspace_id(request.requested_workspace_id())?;
     let session_id = SessionId::new(&request.session_id);
-    let session =
-        require_session_record_in_workspace(&state, &session_id, request.requested_workspace_id())?;
-    let response_workspace_id = request
-        .requested_workspace_id()
-        .map(str::to_string)
-        .or_else(|| {
-            state
-                .session_workspace_id(&session)
-                .map(|workspace_id| workspace_id.to_string())
-        });
+    require_session_record_in_workspace(&state, &session_id, Some(workspace_id.as_str()))?;
     state
         .session_store
         .rename_session(&session_id, &request.name)
         .map_err(|e| ApiError::internal_assembly("重命名会话失败", e))?;
     state.persist_session_durable_state()?;
     Ok(Json(state.bootstrap_dto_for_workspace_session(
-        response_workspace_id.as_deref(),
+        Some(workspace_id.as_str()),
         Some(&session_id),
     )?))
 }
@@ -2076,17 +2060,9 @@ async fn close_session(
     State(state): State<ApiState>,
     Json(request): Json<CloseSessionRequest>,
 ) -> Result<Json<BootstrapDto>, ApiError> {
+    let workspace_id = require_workspace_id(request.requested_workspace_id())?;
     let session_id = SessionId::new(&request.session_id);
-    let session =
-        require_session_record_in_workspace(&state, &session_id, request.requested_workspace_id())?;
-    let response_workspace_id = request
-        .requested_workspace_id()
-        .map(str::to_string)
-        .or_else(|| {
-            state
-                .session_workspace_id(&session)
-                .map(|workspace_id| workspace_id.to_string())
-        });
+    require_session_record_in_workspace(&state, &session_id, Some(workspace_id.as_str()))?;
     state
         .session_store
         .archive_session(&session_id)
@@ -2096,7 +2072,7 @@ async fn close_session(
     }
     state.persist_session_durable_state()?;
     Ok(Json(state.bootstrap_dto_for_workspace_session(
-        response_workspace_id.as_deref(),
+        Some(workspace_id.as_str()),
         None,
     )?))
 }
@@ -3193,6 +3169,66 @@ mod tests {
             state.session_store.session(&session_id).is_some(),
             "workspace 不匹配时不应删除原会话"
         );
+    }
+
+    #[tokio::test]
+    async fn session_management_actions_require_workspace_scope() {
+        let actions = [
+            (
+                "/session/delete",
+                "session-delete-missing-workspace",
+                serde_json::json!({
+                    "sessionId": "session-delete-missing-workspace",
+                }),
+            ),
+            (
+                "/session/rename",
+                "session-rename-missing-workspace",
+                serde_json::json!({
+                    "sessionId": "session-rename-missing-workspace",
+                    "name": "不应改名",
+                }),
+            ),
+            (
+                "/session/close",
+                "session-close-missing-workspace",
+                serde_json::json!({
+                    "sessionId": "session-close-missing-workspace",
+                }),
+            ),
+        ];
+
+        for (path, session_id, body) in actions {
+            let state = test_state();
+            let session_id = SessionId::new(session_id);
+            state
+                .session_store
+                .create_session_for_workspace(
+                    session_id.clone(),
+                    "缺 workspace 操作保护",
+                    Some("workspace-management-required".to_string()),
+                )
+                .expect("session should create");
+
+            let (status, payload) = post_json(state.clone(), path, body).await;
+
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "unexpected body: {payload}"
+            );
+            assert!(
+                payload["message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("workspaceId 不能为空"),
+                "unexpected body: {payload}"
+            );
+            assert!(
+                state.session_store.session(&session_id).is_some(),
+                "缺 workspace 时不应修改会话"
+            );
+        }
     }
 
     /// §P7：accept 阶段不再为 assistant 预占 turn item，避免 thinking → text
