@@ -1,10 +1,10 @@
 use magi_bridge_client::{ChatToolCall, ChatToolDefinition, ChatToolFunctionDefinition};
-use magi_core::{ApprovalRequirement, ExecutionResultStatus, RiskLevel, ToolCallId};
+use magi_core::{AccessProfile, ApprovalRequirement, ExecutionResultStatus, RiskLevel, ToolCallId};
 use magi_skill_runtime::{
     CustomToolBinding, SkillDispatchInput, SkillDispatchResult, SkillDispatchRuntime,
     SkillDispatchStatus, SkillRuntime, SkillSelection, SkillToolRuntimePlan,
 };
-use magi_tool_runtime::ToolExecutionContext;
+use magi_tool_runtime::{ToolExecutionContext, ToolExecutionPolicy};
 use serde_json::Value;
 
 const SKILL_CUSTOM_TOOL_PREFIX: &str = "skill";
@@ -44,6 +44,32 @@ pub fn extract_skill_custom_tool_payload(arguments: &str) -> String {
                 .map(ToOwned::to_owned)
         })
         .unwrap_or_else(|| arguments.to_string())
+}
+
+pub fn active_skill_tool_execution_policy(
+    access_profile: AccessProfile,
+    skill_runtime: Option<&SkillRuntime>,
+    skill_name: Option<&str>,
+) -> ToolExecutionPolicy {
+    let mut policy = ToolExecutionPolicy {
+        access_profile,
+        ..ToolExecutionPolicy::default()
+    };
+    let (Some(skill_runtime), Some(skill_name)) = (
+        skill_runtime,
+        skill_name.map(str::trim).filter(|value| !value.is_empty()),
+    ) else {
+        return policy;
+    };
+
+    let plan = skill_runtime.build_tool_runtime_plan(SkillSelection {
+        skill_ids: vec![skill_name.to_string()],
+        requested_tools: Vec::new(),
+    });
+    policy.source_skill_ids = plan.tool_policy.source_skill_ids;
+    policy.allowed_tool_names = plan.tool_policy.allowed_tool_names;
+    policy.denied_tool_names = plan.tool_policy.denied_tool_names;
+    policy
 }
 
 fn build_skill_custom_tool_definition(

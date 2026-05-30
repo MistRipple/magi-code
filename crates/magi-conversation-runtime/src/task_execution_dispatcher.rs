@@ -3,7 +3,8 @@
 //! Owns the production task dispatch implementation for session turns and conversation loops.
 
 use crate::{
-    ConversationRegistry, SKILL_APPLY_TOOL_NAME, build_skill_custom_tool_definitions,
+    ConversationRegistry, SKILL_APPLY_TOOL_NAME, active_skill_tool_execution_policy,
+    build_skill_custom_tool_definitions,
     conversation_loop::{self, ConversationLoopRequest},
     model_config::{NormalizedModelConfig, configured_role_engine_model_config},
     prompt_utils::prepend_session_instructions,
@@ -27,6 +28,7 @@ use magi_bridge_client::{
 };
 use magi_context_runtime::{
     ContextBudget, ContextRuntime, ExecutionContextAssemblyRequest, ExecutionContextClues,
+    RecentTurnSource,
 };
 use magi_core::{
     EventId, ExecutionOwnership, LeaseId, MissionId, SessionId, TaskId, TaskKind, UtcMillis,
@@ -955,11 +957,25 @@ impl LlmTaskDispatcher {
         } else {
             registry.clone()
         };
+        let active_skill_policy = active_skill_tool_execution_policy(
+            magi_core::AccessProfile::Restricted,
+            self.skill_runtime.as_deref(),
+            skill_name,
+        );
+        let active_skill_allowed_tools = (!active_skill_policy.source_skill_ids.is_empty())
+            .then_some(active_skill_policy.allowed_tool_names.as_slice());
         let mut definitions = public_builtin_tool_definitions(&registry)
             .into_iter()
             .filter(|definition| {
                 BuiltinToolName::from_str(definition.function.name.as_str()).is_some_and(|tool| {
                     task_can_see_builtin_tool(task, self.agent_role_registry.as_deref(), tool)
+                })
+            })
+            .filter(|definition| {
+                active_skill_allowed_tools.is_none_or(|allowed_tools| {
+                    allowed_tools
+                        .iter()
+                        .any(|tool_name| tool_name == &definition.function.name)
                 })
             })
             .filter(|definition| definition.function.name != SKILL_APPLY_TOOL_NAME)
@@ -1071,9 +1087,23 @@ impl LlmTaskDispatcher {
             );
         };
 
-        let ws_id = workspace_id
-            .clone()
-            .unwrap_or_else(|| WorkspaceId::new("default"));
+        let Some(ws_id) = workspace_id.clone() else {
+            let ctx_text = task_fact_context_parts.join("\n");
+            let prompt = if ctx_text.is_empty() {
+                base_prompt
+            } else {
+                format!("--- Context ---\n{ctx_text}\n--- Task ---\n{base_prompt}")
+            };
+            return (
+                prepend_session_instructions(
+                    user_rules_prefix.as_deref(),
+                    safeguard_prefix.as_deref(),
+                    lifecycle_notice.as_deref(),
+                    &prompt,
+                ),
+                None,
+            );
+        };
         let result = ctx_runtime.assemble_execution_context(&ExecutionContextAssemblyRequest {
             session_id: session_id.clone(),
             workspace_id: ws_id,
@@ -1088,9 +1118,11 @@ impl LlmTaskDispatcher {
                 .clone()
                 .unwrap_or_else(fallback_context_budget),
         });
-        let has_context = !result.selected_knowledge.is_empty()
+        let has_context = !result.selected_recent_turns.is_empty()
+            || !result.selected_knowledge.is_empty()
             || !result.selected_memory.is_empty()
             || !result.selected_shared_context.is_empty()
+            || !result.selected_file_summaries.is_empty()
             || !task_fact_context_parts.is_empty();
 
         let context_summary = ExecutionContextSummary::from_context_assembly(&result);
@@ -1108,6 +1140,13 @@ impl LlmTaskDispatcher {
         }
         let mut ctx_parts: Vec<String> = Vec::new();
         ctx_parts.extend(task_fact_context_parts);
+        for item in &result.selected_recent_turns {
+            ctx_parts.push(format!(
+                "[reference:recent-turn:{}] {}",
+                recent_turn_source_label(item.source),
+                item.content
+            ));
+        }
         for item in &result.selected_knowledge {
             ctx_parts.push(format!(
                 "[reference:knowledge] {}: {}",
@@ -1121,6 +1160,12 @@ impl LlmTaskDispatcher {
             ctx_parts.push(format!(
                 "[reference:context] {}: {}",
                 item.title, item.content
+            ));
+        }
+        for item in &result.selected_file_summaries {
+            ctx_parts.push(format!(
+                "[reference:file-summary] {}: {}",
+                item.absolute_path, item.summary
             ));
         }
         let ctx_text = ctx_parts.join("\n");
@@ -1661,6 +1706,14 @@ impl LlmTaskDispatcher {
     }
 }
 
+fn recent_turn_source_label(source: RecentTurnSource) -> &'static str {
+    match source {
+        RecentTurnSource::Session => "session",
+        RecentTurnSource::Project => "project",
+        RecentTurnSource::Provided => "provided",
+    }
+}
+
 struct LearningCandidate {
     content: String,
     context: Option<String>,
@@ -1980,6 +2033,118 @@ mod tests {
     }
 
     #[test]
+    fn assemble_prompt_injects_runtime_turns_and_file_summaries_as_references() {
+        let session_id = SessionId::new("session-context-prompt");
+        let workspace_id = WorkspaceId::new("workspace-context-prompt");
+        let session_store = SessionStore::from_state(magi_session_store::SessionStoreState {
+            current_session_id: Some(session_id.clone()),
+            sessions: vec![magi_session_store::SessionRecord {
+                session_id: session_id.clone(),
+                title: "Context prompt session".to_string(),
+                status: magi_core::SessionLifecycleStatus::Active,
+                created_at: UtcMillis(1),
+                updated_at: UtcMillis(1),
+                message_count: None,
+                workspace_id: Some(workspace_id.to_string()),
+            }],
+            timeline: vec![magi_session_store::TimelineEntry {
+                entry_id: "timeline-context-prompt".to_string(),
+                session_id: session_id.clone(),
+                kind: TimelineEntryKind::SystemNote,
+                message: "prior session fact for runtime context".to_string(),
+                occurred_at: UtcMillis(10),
+            }],
+            notifications: vec![],
+            canonical_turns: vec![],
+            thread_registry: vec![],
+            execution_sidecar_store: magi_session_store::SessionExecutionSidecarStoreState {
+                runtime_sidecars: vec![],
+            },
+        });
+
+        let file_summary_store = magi_context_runtime::FileSummaryStore::default();
+        file_summary_store.upsert(magi_context_runtime::FileSummaryRecord {
+            item: magi_context_runtime::FileSummaryItem {
+                absolute_path: "/repo/src/lib.rs".to_string(),
+                summary: "Important file summary from current workspace.".to_string(),
+            },
+            workspace_id: Some(workspace_id.clone()),
+            project_key: None,
+            updated_at: UtcMillis(20),
+        });
+
+        let context_runtime = ContextRuntime::with_runtime_sources(
+            KnowledgeStore::new(),
+            MemoryStore::new(),
+            session_store,
+            magi_context_runtime::SharedContextPool::default(),
+            file_summary_store,
+            magi_context_runtime::ProjectRecentTurnStore::default(),
+        );
+        let dispatcher = dispatcher_with_default_tool_surface()
+            .with_context_runtime(Arc::new(context_runtime))
+            .with_context_budget(ContextBudget {
+                max_turns: 1,
+                max_knowledge: 0,
+                max_memory: 0,
+                max_shared_items: 0,
+                max_file_summaries: 1,
+            });
+        let task = task_with_role("executor", TaskTier::ExecutionChain);
+
+        let (prompt, summary) =
+            dispatcher.assemble_prompt(None, &task, &session_id, &Some(workspace_id));
+
+        assert!(
+            prompt
+                .contains("[reference:recent-turn:session] prior session fact for runtime context")
+        );
+        assert!(prompt.contains(
+            "[reference:file-summary] /repo/src/lib.rs: Important file summary from current workspace."
+        ));
+        let summary = summary.expect("context summary");
+        assert_eq!(summary.used_turns, 1);
+        assert_eq!(summary.used_file_summaries, 1);
+    }
+
+    #[test]
+    fn assemble_prompt_without_workspace_does_not_query_default_workspace_context() {
+        let session_id = SessionId::new("session-no-workspace-context");
+        let knowledge_store = KnowledgeStore::new();
+        knowledge_store.upsert(KnowledgeRecord {
+            knowledge_id: "kb-default-workspace".to_string(),
+            kind: KnowledgeKind::Learning,
+            title: "Default workspace note".to_string(),
+            content: "This note must not leak into workspace-less task prompts.".to_string(),
+            tags: vec!["leak-check".to_string()],
+            workspace_id: Some(WorkspaceId::new("default")),
+            source_ref: Some("memory/default.md".to_string()),
+            updated_at: UtcMillis(1),
+        });
+        let dispatcher = dispatcher_with_default_tool_surface()
+            .with_context_runtime(Arc::new(ContextRuntime::new(
+                knowledge_store,
+                MemoryStore::new(),
+            )))
+            .with_context_budget(ContextBudget {
+                max_turns: 0,
+                max_knowledge: 4,
+                max_memory: 0,
+                max_shared_items: 0,
+                max_file_summaries: 0,
+            });
+        let task = task_with_role("executor", TaskTier::ExecutionChain);
+
+        let (prompt, summary) = dispatcher.assemble_prompt(None, &task, &session_id, &None);
+
+        assert!(
+            !prompt.contains("Default workspace note"),
+            "缺少 workspace 时不得伪造 default workspace 并注入知识库内容"
+        );
+        assert!(summary.is_none());
+    }
+
+    #[test]
     fn tool_visibility_is_filtered_by_role_and_task_tier() {
         let registry = magi_agent_role::AgentRoleRegistry::load_default();
         let worker_task = task_with_role("executor", TaskTier::ExecutionChain);
@@ -2127,6 +2292,47 @@ mod tests {
             "active skill custom binding should surface as callable tool"
         );
         assert!(names.iter().any(|name| name == SKILL_APPLY_TOOL_NAME));
+        assert!(
+            !names.iter().any(|name| name == "file_read"),
+            "active skill 没有声明 allowed_tools 时不应暴露普通内置工具"
+        );
+        assert!(
+            !names.iter().any(|name| name == "shell_exec"),
+            "active skill 没有声明 allowed_tools 时不应暴露 shell_exec"
+        );
+    }
+
+    #[test]
+    fn active_skill_allowed_tools_filter_builtin_tool_surface() {
+        let dispatcher = dispatcher_with_default_tool_surface().with_skill_runtime(Arc::new({
+            let registry = magi_skill_runtime::SkillRegistry::new();
+            registry.register(magi_skill_runtime::SkillDefinition {
+                skill_id: "read-only-skill".to_string(),
+                title: "只读 Skill".to_string(),
+                instruction: "只能读取文件。".to_string(),
+                metadata: magi_skill_runtime::SkillMetadata {
+                    category: "quality".to_string(),
+                    tags: vec!["read".to_string()],
+                },
+                allowed_tools: vec!["file_read".to_string()],
+                custom_tool_bindings: vec![],
+                prompt_priority: 50,
+            });
+            magi_skill_runtime::SkillRuntime::new(registry)
+        }));
+        let task = task_with_role("coordinator", TaskTier::ExecutionChain);
+
+        let names = dispatcher
+            .build_tool_definitions(Some(&task), Some("read-only-skill"))
+            .into_iter()
+            .map(|definition| definition.function.name)
+            .collect::<Vec<_>>();
+
+        assert!(names.iter().any(|name| name == "file_read"));
+        assert!(names.iter().any(|name| name == SKILL_APPLY_TOOL_NAME));
+        assert!(!names.iter().any(|name| name == "search_text"));
+        assert!(!names.iter().any(|name| name == "shell_exec"));
+        assert!(!names.iter().any(|name| name == "agent_spawn"));
     }
 
     #[test]

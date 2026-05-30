@@ -705,8 +705,7 @@ impl BuiltinToolName {
             Self::SearchSemantic => serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "query": { "type": "string", "description": "目标代码的自然语言描述" },
-                    "root": { "type": "string", "description": "搜索根目录" },
+                    "query": { "type": "string", "description": "基于当前工作区本地代码索引检索的自然语言描述" },
                     "limit": { "type": "integer", "description": "最大结果数（默认：10）" }
                 },
                 "required": ["query"]
@@ -886,8 +885,18 @@ impl BuiltinToolName {
             Self::KnowledgeQuery => serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "query": { "type": "string", "description": "用于检索项目文档的自然语言问题" },
-                    "category": { "type": "string", "description": "知识分类：all、readme、docs、code（默认 all）" }
+                    "query": { "type": "string", "description": "用于检索当前工作区知识库的自然语言问题" },
+                    "kind": {
+                        "type": "string",
+                        "enum": ["all", "adr", "faq", "learning", "code_index"],
+                        "description": "知识类型过滤，默认 all"
+                    },
+                    "tags": {
+                        "type": "array",
+                        "description": "可选标签过滤",
+                        "items": { "type": "string" }
+                    },
+                    "limit": { "type": "integer", "description": "最多返回多少个匹配（默认 10，最大 50）" }
                 },
                 "required": ["query"]
             }),
@@ -4798,35 +4807,85 @@ mod tests {
     // ── 实际工具行为验证 ──
 
     #[test]
-    fn search_semantic_returns_results_structure() {
+    fn search_semantic_requires_workspace_index() {
         let registry = make_registry();
         let output = exec_tool(
             &registry,
             BuiltinToolName::SearchSemantic,
             &serde_json::json!({ "query": "test query" }).to_string(),
         );
-        assert_eq!(output.status, ExecutionResultStatus::Succeeded);
+        assert_eq!(output.status, ExecutionResultStatus::Failed);
         let payload: Value = serde_json::from_str(&output.payload).unwrap();
         assert_eq!(payload["tool"], "search_semantic");
-        assert_eq!(payload["status"], "succeeded");
-        assert!(payload["results"].is_array());
-        assert!(payload["scanned_files"].is_number());
+        assert_eq!(payload["status"], "failed");
+        assert_eq!(payload["error"], "代码索引引擎不可用");
     }
 
     #[test]
-    fn knowledge_query_returns_results_structure() {
-        let registry = make_registry();
-        let output = exec_tool(
-            &registry,
-            BuiltinToolName::KnowledgeQuery,
-            &serde_json::json!({ "query": "architecture" }).to_string(),
+    fn knowledge_query_reads_workspace_knowledge_store() {
+        let store = Arc::new(magi_knowledge_store::KnowledgeStore::new());
+        let workspace_id = WorkspaceId::new("workspace-knowledge-query");
+        store.upsert(magi_knowledge_store::KnowledgeRecord {
+            knowledge_id: "kb-runtime-architecture".to_string(),
+            kind: magi_knowledge_store::KnowledgeKind::Learning,
+            title: "Runtime architecture".to_string(),
+            content: "The runtime architecture keeps knowledge in the governed workspace store."
+                .to_string(),
+            tags: vec!["runtime".to_string()],
+            workspace_id: Some(workspace_id.clone()),
+            source_ref: Some("memory/runtime.md".to_string()),
+            updated_at: UtcMillis(100),
+        });
+        store.upsert(magi_knowledge_store::KnowledgeRecord {
+            knowledge_id: "kb-other-workspace".to_string(),
+            kind: magi_knowledge_store::KnowledgeKind::Learning,
+            title: "Other workspace".to_string(),
+            content: "The same architecture term must not leak across workspaces.".to_string(),
+            tags: vec!["runtime".to_string()],
+            workspace_id: Some(WorkspaceId::new("workspace-knowledge-query-other")),
+            source_ref: Some("memory/other.md".to_string()),
+            updated_at: UtcMillis(200),
+        });
+
+        let governance = Arc::new(GovernanceService::default());
+        let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(16));
+        let mut registry = ToolRegistry::new(governance, event_bus).with_knowledge_store(store);
+        registry.register_default_builtins();
+
+        let output = registry.execute_with_policy(
+            ToolExecutionInput {
+                tool_call_id: ToolCallId::new("tool-call-knowledge-query"),
+                tool_name: BuiltinToolName::KnowledgeQuery.as_str().to_string(),
+                tool_kind: ToolKind::Builtin,
+                input: serde_json::json!({
+                    "query": "runtime architecture",
+                    "kind": "learning",
+                    "tags": ["runtime"],
+                    "limit": 5
+                })
+                .to_string(),
+                approval_requirement: ApprovalRequirement::None,
+                risk_level: RiskLevel::Low,
+            },
+            ToolExecutionContext {
+                workspace_id: Some(workspace_id.clone()),
+                ..ToolExecutionContext::default()
+            },
+            &ToolExecutionPolicy::default(),
         );
         assert_eq!(output.status, ExecutionResultStatus::Succeeded);
         let payload: Value = serde_json::from_str(&output.payload).unwrap();
         assert_eq!(payload["tool"], "knowledge_query");
         assert_eq!(payload["status"], "succeeded");
-        assert!(payload["results"].is_array());
-        assert!(payload["scanned_docs"].is_number());
+        assert_eq!(payload["workspace_id"], workspace_id.as_str());
+        assert_eq!(payload["kind"], "learning");
+        assert_eq!(payload["total_matches"], 1);
+        assert_eq!(payload["returned_matches"], 1);
+        assert_eq!(
+            payload["results"][0]["knowledge_id"],
+            "kb-runtime-architecture"
+        );
+        assert_eq!(payload["results"][0]["source_ref"], "memory/runtime.md");
     }
 
     #[test]
@@ -5356,9 +5415,8 @@ mod tests {
     }
 
     #[test]
-    fn search_semantic_fuses_engine_and_grep() {
-        // 造一个含已知符号的小仓库：auth.rs 含符号 authenticate_user，
-        // notes.txt 含关键词但非代码符号（用于验证 grep 路补充）。
+    fn search_semantic_uses_workspace_local_index() {
+        // 造一个含已知符号的小仓库，验证 search_semantic 只走工作区本地代码索引。
         let root = unique_temp_dir("magi-tool-search-fuse");
         fs::create_dir_all(root.join("src")).expect("create src");
         fs::write(
@@ -5366,8 +5424,6 @@ mod tests {
             "pub fn authenticate_user(token: &str) -> bool { !token.is_empty() }\n",
         )
         .expect("write auth.rs");
-        fs::write(root.join("notes.txt"), "authenticate flow described here\n")
-            .expect("write notes.txt");
 
         // 构建索引并注入 KnowledgeStore。
         let store = std::sync::Arc::new(magi_knowledge_store::KnowledgeStore::new());
@@ -5401,15 +5457,69 @@ mod tests {
 
         assert_eq!(output.status, ExecutionResultStatus::Succeeded);
         let payload: Value = serde_json::from_str(&output.payload).expect("payload json");
-        // 走的是融合引擎路（而非手写遍历兜底）。
-        assert_eq!(payload["engine"], "local_search_engine+grep");
+        assert_eq!(payload["engine"], "local_search_engine");
+        assert_eq!(payload["workspace_id"], "workspace-search-fuse");
         let results = payload["results"].as_array().expect("results array");
         assert!(!results.is_empty(), "应有命中结果");
-        // 引擎路命中代码符号文件。
         assert!(
             results.iter().any(|r| r["source"] == "engine"
                 && r["path"].as_str().is_some_and(|p| p.contains("auth.rs"))),
-            "引擎路应命中 auth.rs，实际: {results:?}"
+            "本地索引应命中 auth.rs，实际: {results:?}"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn search_semantic_does_not_fallback_to_text_scan() {
+        let root = unique_temp_dir("magi-tool-search-no-scan");
+        fs::create_dir_all(root.join("src")).expect("create src");
+        fs::write(root.join("src/main.rs"), "pub fn unrelated_code() {}\n").expect("write main.rs");
+        fs::write(
+            root.join("notes.txt"),
+            "only_in_txt_note should not be returned by code index search\n",
+        )
+        .expect("write notes.txt");
+
+        let store = std::sync::Arc::new(magi_knowledge_store::KnowledgeStore::new());
+        let workspace_id = WorkspaceId::new("workspace-search-no-scan");
+        store.build_workspace_index(&workspace_id, &root);
+
+        let governance = Arc::new(GovernanceService::default());
+        let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(16));
+        let mut tool_registry =
+            ToolRegistry::new(governance, event_bus).with_knowledge_store(store);
+        tool_registry.register_default_builtins();
+
+        let context = ToolExecutionContext {
+            workspace_id: Some(workspace_id),
+            working_directory: Some(root.clone()),
+            ..ToolExecutionContext::default()
+        };
+
+        let output = tool_registry.execute_with_policy(
+            ToolExecutionInput {
+                tool_call_id: ToolCallId::new("tool-call-search-no-scan"),
+                tool_name: BuiltinToolName::SearchSemantic.as_str().to_string(),
+                tool_kind: ToolKind::Builtin,
+                input: serde_json::json!({ "query": "only_in_txt_note" }).to_string(),
+                approval_requirement: ApprovalRequirement::None,
+                risk_level: RiskLevel::Low,
+            },
+            context,
+            &ToolExecutionPolicy::default(),
+        );
+
+        assert_eq!(output.status, ExecutionResultStatus::Succeeded);
+        let payload: Value = serde_json::from_str(&output.payload).expect("payload json");
+        assert_eq!(payload["engine"], "local_search_engine");
+        assert_eq!(payload["returned_matches"], 0);
+        assert!(
+            payload["results"]
+                .as_array()
+                .expect("results array")
+                .is_empty(),
+            "非代码文件不应通过旧文本扫描兜底命中"
         );
 
         let _ = fs::remove_dir_all(&root);

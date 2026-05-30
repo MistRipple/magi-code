@@ -130,10 +130,12 @@ fn query_and_governed_output_close_the_code_index_loop() {
             .contains(&"safe".to_string())
     );
 
-    let governed = store.governed_output(&query);
-    assert_eq!(governed.len(), 1);
+    let governed_query = store.governed_query(&query);
+    assert_eq!(governed_query.total_matches, 1);
+    assert!(!governed_query.truncated);
+    assert_eq!(governed_query.results.len(), 1);
 
-    let record = &governed[0];
+    let record = &governed_query.results[0];
     assert_eq!(record.knowledge_id, "kb-code-1");
     assert_eq!(record.source_ref.as_deref(), Some("src/query.rs#execute"));
     assert_eq!(

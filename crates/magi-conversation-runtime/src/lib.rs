@@ -47,8 +47,8 @@ pub use skill_apply_tool::{
     SKILL_APPLY_TOOL_NAME, execute_skill_apply_from_runtime, skill_apply_tool_definition,
 };
 pub use skill_custom_tool_surface::{
-    build_skill_custom_tool_definitions, execute_skill_custom_tool,
-    extract_skill_custom_tool_payload, parse_skill_custom_tool_name,
+    active_skill_tool_execution_policy, build_skill_custom_tool_definitions,
+    execute_skill_custom_tool, extract_skill_custom_tool_payload, parse_skill_custom_tool_name,
 };
 pub use task_helpers::{
     BASE_TOOL_CALL_ROUNDS, MAX_TOOL_CALL_ROUNDS, TaskTurnVisibility, apply_task_final_visibility,

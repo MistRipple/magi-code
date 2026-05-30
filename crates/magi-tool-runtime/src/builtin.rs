@@ -118,7 +118,7 @@ impl BuiltinTool for NormalizedBuiltinTool {
             BuiltinToolName::WebSearch => execute_web_search(input),
             BuiltinToolName::WebFetch => execute_web_fetch(input),
             BuiltinToolName::DiagramRender => execute_diagram_render(input),
-            BuiltinToolName::KnowledgeQuery => execute_knowledge_query(input),
+            BuiltinToolName::KnowledgeQuery => execute_knowledge_query(input, context, resources),
             BuiltinToolName::CodeSymbols => execute_code_symbols(input, context, resources),
             BuiltinToolName::ToolCatalog => execute_tool_catalog(input, context),
             BuiltinToolName::AgentSpawn
@@ -2673,30 +2673,6 @@ fn execute_code_symbols(
     }
 }
 
-/// 从自然语言查询中抽取检索关键词：小写化、按非标识符字符切分、过滤停用词。
-/// 引擎融合路径与关键词遍历兜底路径共用，避免两处各写一份停用词表。
-fn extract_query_keywords(query: &str) -> Vec<String> {
-    const STOP_WORDS: &[&str] = &[
-        "the", "a", "an", "is", "are", "was", "were", "be", "been", "being", "have", "has", "had",
-        "do", "does", "did", "will", "would", "could", "should", "may", "might", "can", "shall",
-        "must", "need", "dare", "to", "of", "in", "for", "on", "with", "at", "by", "from", "as",
-        "into", "through", "during", "before", "after", "above", "below", "between", "out", "off",
-        "over", "under", "again", "further", "then", "once", "here", "there", "when", "where",
-        "why", "how", "all", "each", "every", "both", "few", "more", "most", "other", "some",
-        "such", "no", "not", "only", "own", "same", "so", "than", "too", "very", "just", "and",
-        "but", "or", "nor", "if", "that", "this", "what", "which", "who", "whom", "whose", "it",
-        "its", "i", "me", "my", "we", "our", "you", "your", "he", "she", "they", "them", "his",
-        "her", "their", "find", "search", "look", "show", "get", "code", "function", "file",
-    ];
-    let stop: std::collections::HashSet<&str> = STOP_WORDS.iter().cloned().collect();
-    query
-        .to_lowercase()
-        .split(|c: char| !c.is_alphanumeric() && c != '_')
-        .filter(|w| w.len() >= 2 && !stop.contains(w))
-        .map(|w| w.to_string())
-        .collect()
-}
-
 fn execute_search_semantic(
     input: &str,
     context: &ToolExecutionContext,
@@ -2714,167 +2690,44 @@ fn execute_search_semantic(
         Err(error) => return error,
     };
 
-    let root = request
-        .as_ref()
-        .and_then(|obj| field_string(obj, &["root", "dir", "directory"]))
-        .unwrap_or_else(|| {
-            context_working_directory(context)
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|_| ".".to_string())
-        });
     let limit = request
         .as_ref()
         .and_then(|obj| field_usize(obj, &["limit", "max_results"]))
         .unwrap_or(10)
         .clamp(1, 50);
 
-    // 优先走本地代码检索引擎（LocalSearchEngine：TF-IDF + 符号索引 + 依赖图
-    // 两路融合检索（对齐原版 CodebaseRetrievalService 的分层思路）：
-    // - 引擎路：LocalSearchEngine（TF-IDF + 符号索引 + 依赖图 + 多信号排序），
-    //   等价于原版 L1（语义）+ L3（符号），Rust 版已融为一路；
-    // - grep 路：search_text 精确正则匹配，等价于原版 L2。
-    // 引擎结果优先，grep 结果按文件去重后补充未覆盖文件。引擎不可用时整体回落
-    // 到下方关键词遍历（过渡兜底）。
-    if let (Some(store), Some(workspace_id)) = (
-        resources.knowledge_store.as_ref(),
-        context.workspace_id.as_ref(),
-    ) && let Some(engine_results) = store.search_workspace_code(
+    let Some(store) = resources.knowledge_store.as_ref() else {
+        return builtin_error("search_semantic", "代码索引引擎不可用");
+    };
+    let Some(workspace_id) = context.workspace_id.as_ref() else {
+        return builtin_error("search_semantic", "缺少 workspace 上下文，无法查询代码索引");
+    };
+    let Some(engine_results) = store.search_workspace_code(
         workspace_id,
         &query,
         magi_knowledge_store::local_search_engine::SearchOptions {
             max_results: Some(limit),
             ..Default::default()
         },
-    ) && !engine_results.is_empty()
-    {
-        let mut covered_files: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut results: Vec<Value> = Vec::new();
-        for r in &engine_results {
-            covered_files.insert(r.file_path.clone());
-            let snippet = r
-                .snippets
-                .first()
-                .map(|s| s.content.clone())
-                .unwrap_or_default();
-            let matched: Vec<String> = r
-                .snippets
-                .first()
-                .map(|s| s.matched_tokens.clone())
-                .unwrap_or_default();
-            results.push(serde_json::json!({
-                "path": r.file_path,
-                "score": format!("{:.2}", r.score),
-                "source": "engine",
-                "matched_keywords": matched,
-                "snippet": snippet,
-            }));
-        }
-
-        // grep 补充：对查询里的关键词做精确匹配，补进引擎未覆盖的文件。
-        let mut grep_hits = 0usize;
-        if let Ok(root_path) = resolve_path_with_context(&root, context) {
-            let keywords = extract_query_keywords(&query);
-            if let Some(primary) = keywords.first() {
-                if let Ok((matches, _scanned, _truncated)) =
-                    search_text_matches(&root_path, primary, false, false, limit)
-                {
-                    for m in matches {
-                        let path = m
-                            .get("path")
-                            .and_then(Value::as_str)
-                            .map(ToOwned::to_owned)
-                            .unwrap_or_default();
-                        // 引擎返回相对路径、grep 返回绝对路径，用后缀包含判定去重。
-                        if path.is_empty()
-                            || covered_files.iter().any(|c| path.ends_with(c.as_str()))
-                        {
-                            continue;
-                        }
-                        covered_files.insert(path.clone());
-                        let line_text = m
-                            .get("line")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_string();
-                        results.push(serde_json::json!({
-                            "path": path,
-                            "source": "grep",
-                            "matched_keywords": [primary],
-                            "snippet": line_text,
-                        }));
-                        grep_hits += 1;
-                        if results.len() >= limit + limit / 2 {
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        return serde_json::json!({
-            "tool": "search_semantic",
-            "status": "succeeded",
-            "access_mode": BuiltinToolAccessMode::ReadOnly.as_str(),
-            "query": query,
-            "engine": "local_search_engine+grep",
-            "returned_matches": results.len(),
-            "results": results,
-            "summary": format!(
-                "本地代码检索 \"{}\" 返回 {} 个匹配（引擎 {} + grep 补充 {}）",
-                query,
-                results.len(),
-                engine_results.len(),
-                grep_hits
-            )
-        })
-        .to_string();
-    }
-
-    let root_path = match resolve_path_with_context(&root, context) {
-        Ok(p) => p,
-        Err(e) => return builtin_error("search_semantic", e),
+    ) else {
+        return builtin_error("search_semantic", "代码索引引擎未就绪");
     };
 
-    // 将查询拆分为关键词（小写化），过滤停用词
-    let keywords: Vec<String> = extract_query_keywords(&query);
-
-    if keywords.is_empty() {
-        return builtin_error("search_semantic", "查询关键词过于宽泛，请提供更具体的描述");
-    }
-
-    // 代码文件扩展名
-    let code_extensions: std::collections::HashSet<&str> = [
-        "rs", "ts", "tsx", "js", "jsx", "py", "go", "java", "c", "cpp", "h", "hpp", "cs", "rb",
-        "swift", "kt", "scala", "lua", "sh", "bash", "zsh", "sql", "toml", "yaml", "yml", "json",
-        "xml", "html", "css", "scss", "svelte", "vue", "md", "txt",
-    ]
-    .iter()
-    .cloned()
-    .collect();
-
-    let mut scored_results: Vec<(f64, String, String, Vec<String>)> = Vec::new();
-    let mut scanned = 0usize;
-    semantic_walk_dir(
-        &root_path,
-        &code_extensions,
-        &keywords,
-        &mut scored_results,
-        &mut scanned,
-        5000,
-    );
-
-    // 按分数降序排序
-    scored_results.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-    scored_results.truncate(limit);
-
-    let results: Vec<Value> = scored_results
+    let results: Vec<Value> = engine_results
         .iter()
-        .map(|(score, path, snippet, matched_kw)| {
+        .map(|result| {
+            let primary_snippet = result.snippets.first();
+            let matched_keywords = primary_snippet
+                .map(|snippet| snippet.matched_tokens.clone())
+                .unwrap_or_default();
             serde_json::json!({
-                "path": path,
-                "score": format!("{:.2}", score),
-                "matched_keywords": matched_kw,
-                "snippet": snippet,
+                "path": &result.file_path,
+                "score": format!("{:.2}", result.score),
+                "source": "engine",
+                "matched_keywords": matched_keywords,
+                "snippet": primary_snippet.map(|snippet| snippet.content.as_str()).unwrap_or_default(),
+                "snippets": &result.snippets,
+                "score_breakdown": &result.score_breakdown,
             })
         })
         .collect();
@@ -2884,146 +2737,24 @@ fn execute_search_semantic(
         "status": "succeeded",
         "access_mode": BuiltinToolAccessMode::ReadOnly.as_str(),
         "query": query,
-        "keywords": keywords,
-        "scanned_files": scanned,
+        "engine": "local_search_engine",
+        "workspace_id": workspace_id.as_str(),
         "returned_matches": results.len(),
         "results": results,
-        "summary": format!("语义搜索 \"{}\" 扫描了 {} 个文件，返回 {} 个匹配", query, scanned, results.len())
+        "summary": format!("本地代码索引检索 \"{}\" 返回 {} 个匹配", query, results.len())
     })
     .to_string()
 }
 
-fn semantic_walk_dir(
-    dir: &Path,
-    code_extensions: &std::collections::HashSet<&str>,
-    keywords: &[String],
-    results: &mut Vec<(f64, String, String, Vec<String>)>,
-    scanned: &mut usize,
-    max_files: usize,
-) {
-    if *scanned >= max_files {
-        return;
-    }
-    let entries = match fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(_) => return,
-    };
-    let mut dirs = Vec::new();
-    for entry in entries.filter_map(|e| e.ok()) {
-        if *scanned >= max_files {
-            break;
-        }
-        let path = entry.path();
-        let name = entry.file_name().to_string_lossy().to_string();
-        // 跳过隐藏目录和常见忽略目录
-        if name.starts_with('.')
-            || name == "node_modules"
-            || name == "target"
-            || name == "dist"
-            || name == "build"
-            || name == "__pycache__"
-            || name == "vendor"
-            || name == ".git"
-        {
-            continue;
-        }
-        if path.is_dir() {
-            dirs.push(path);
-        } else if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-            if code_extensions.contains(ext) {
-                *scanned += 1;
-                if let Ok(content) = fs::read_to_string(&path) {
-                    let (score, matched, snippet) = score_file_content(&content, &name, keywords);
-                    if score > 0.0 {
-                        results.push((score, path.display().to_string(), snippet, matched));
-                    }
-                }
-            }
-        }
-    }
-    for subdir in dirs {
-        semantic_walk_dir(
-            &subdir,
-            code_extensions,
-            keywords,
-            results,
-            scanned,
-            max_files,
-        );
-    }
-}
-
-fn score_file_content(
-    content: &str,
-    filename: &str,
-    keywords: &[String],
-) -> (f64, Vec<String>, String) {
-    let content_lower = content.to_lowercase();
-    let filename_lower = filename.to_lowercase();
-    let mut score = 0.0f64;
-    let mut matched_keywords = Vec::new();
-    let mut best_line_score = 0.0f64;
-    let mut best_line_idx = 0usize;
-
-    for kw in keywords {
-        // 文件名匹配权重更高
-        if filename_lower.contains(kw) {
-            score += 5.0;
-            if !matched_keywords.contains(kw) {
-                matched_keywords.push(kw.clone());
-            }
-        }
-        // 内容匹配
-        let count = content_lower.matches(kw.as_str()).count();
-        if count > 0 {
-            score += (count as f64).min(10.0);
-            if !matched_keywords.contains(kw) {
-                matched_keywords.push(kw.clone());
-            }
-        }
-    }
-
-    // 匹配关键词覆盖率加权
-    let coverage = matched_keywords.len() as f64 / keywords.len() as f64;
-    score *= coverage;
-
-    // 找到匹配度最高的行区域用于 snippet
-    let lines: Vec<&str> = content.lines().collect();
-    for (i, line) in lines.iter().enumerate() {
-        let line_lower = line.to_lowercase();
-        let line_score: f64 = keywords
-            .iter()
-            .filter(|kw| line_lower.contains(kw.as_str()))
-            .count() as f64;
-        if line_score > best_line_score {
-            best_line_score = line_score;
-            best_line_idx = i;
-        }
-    }
-
-    // 提取 snippet: 最佳匹配行 ±2 行
-    let start = best_line_idx.saturating_sub(2);
-    let end = (best_line_idx + 3).min(lines.len());
-    let snippet = lines[start..end].join("\n");
-    // 截断过长 snippet
-    let snippet = if snippet.len() > 500 {
-        let mut end = 500;
-        while !snippet.is_char_boundary(end) {
-            end -= 1;
-        }
-        format!("{}…", &snippet[..end])
-    } else {
-        snippet
-    };
-
-    (score, matched_keywords, snippet)
-}
-
 // ══════════════════════════════════════════════════════════════════════════════
-// knowledge.query — 项目文档知识检索
+// knowledge.query — 当前工作区知识库检索
 // ══════════════════════════════════════════════════════════════════════════════
 
-fn execute_knowledge_query(input: &str) -> String {
+fn execute_knowledge_query(
+    input: &str,
+    context: &ToolExecutionContext,
+    resources: &ToolRuntimeResources,
+) -> String {
     let request = parse_json_object(input);
     let query = match required_string_or_raw(
         input,
@@ -3035,220 +2766,127 @@ fn execute_knowledge_query(input: &str) -> String {
         Ok(value) => value,
         Err(error) => return error,
     };
-    let category = request
-        .as_ref()
-        .and_then(|obj| field_string(obj, &["category"]))
-        .unwrap_or_else(|| "all".to_string());
 
-    let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-
-    // 收集项目文档文件
-    let mut doc_files: Vec<PathBuf> = Vec::new();
-    let doc_patterns: &[&str] = match category.as_str() {
-        "readme" => &["README.md", "README", "README.txt", "README.rst"],
-        "docs" => &[], // 只扫描 docs/ 目录
-        "code" => &[], // 只扫描代码注释
-        _ => &[
-            "README.md",
-            "README",
-            "README.txt",
-            "CLAUDE.md",
-            "CONTRIBUTING.md",
-            "CHANGELOG.md",
-            "LICENSE",
-            "Cargo.toml",
-            "package.json",
-        ],
+    let Some(store) = resources.knowledge_store.as_ref() else {
+        return builtin_error("knowledge_query", "知识库不可用");
+    };
+    let Some(workspace_id) = context.workspace_id.as_ref() else {
+        return builtin_error(
+            "knowledge_query",
+            "缺少 workspace 上下文，无法查询项目知识库",
+        );
     };
 
-    // 添加根目录下的文档文件
-    for pattern in doc_patterns {
-        let path = root.join(pattern);
-        if path.exists() && path.is_file() {
-            doc_files.push(path);
-        }
-    }
+    let kind = match parse_knowledge_kind(request.as_ref()) {
+        Ok(kind) => kind,
+        Err(error) => return error,
+    };
+    let tags = parse_knowledge_tags(request.as_ref());
+    let limit = request
+        .as_ref()
+        .and_then(|obj| field_usize(obj, &["limit", "max_results"]))
+        .unwrap_or(10)
+        .clamp(1, 50);
 
-    // 添加 .claude/ 目录下的文档
-    if category == "all" || category == "docs" {
-        let claude_dir = root.join(".claude");
-        if claude_dir.exists() {
-            if let Ok(entries) = fs::read_dir(&claude_dir) {
-                for entry in entries.filter_map(|e| e.ok()) {
-                    let path = entry.path();
-                    if path.extension().and_then(|e| e.to_str()) == Some("md") {
-                        doc_files.push(path);
-                    }
-                }
-            }
-        }
-    }
-
-    // 扫描 docs/ 目录
-    if category == "all" || category == "docs" {
-        let docs_dir = root.join("docs");
-        if docs_dir.exists() {
-            collect_doc_files(&docs_dir, &mut doc_files, 3);
-        }
-        let doc_dir = root.join("doc");
-        if doc_dir.exists() {
-            collect_doc_files(&doc_dir, &mut doc_files, 3);
-        }
-    }
-
-    // 关键词拆分
-    let keywords: Vec<String> = query
-        .to_lowercase()
-        .split(|c: char| !c.is_alphanumeric() && c != '_')
-        .filter(|w| w.len() >= 2)
-        .map(|w| w.to_string())
+    let knowledge_query = magi_knowledge_store::KnowledgeQuery {
+        kind,
+        text: Some(query.clone()),
+        tags: tags.clone(),
+        workspace_id: Some(workspace_id.clone()),
+        limit,
+    };
+    let governed_query = store.governed_query(&knowledge_query);
+    let results: Vec<Value> = governed_query
+        .results
+        .iter()
+        .map(|item| {
+            serde_json::json!({
+                "knowledge_id": &item.knowledge_id,
+                "title": &item.title,
+                "kind": knowledge_kind_label(item.kind),
+                "excerpt": &item.excerpt,
+                "updated_at": item.updated_at,
+                "score": item.score,
+                "matched_terms": &item.matched_terms,
+                "source_ref": item.source_ref.as_deref(),
+                "code_source": item.code_source.as_ref(),
+                "audit_link": item.audit_link.as_ref(),
+                "governance_link": item.governance_link.as_ref(),
+            })
+        })
         .collect();
-
-    if keywords.is_empty() {
-        return builtin_error("knowledge_query", "查询关键词为空");
-    }
-
-    // 搜索文档并提取匹配段落
-    let mut results: Vec<Value> = Vec::new();
-    for doc_path in &doc_files {
-        if let Ok(content) = fs::read_to_string(doc_path) {
-            let sections = extract_matching_sections(&content, &keywords);
-            if !sections.is_empty() {
-                let rel_path = doc_path
-                    .strip_prefix(&root)
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|_| doc_path.display().to_string());
-                for section in sections {
-                    results.push(serde_json::json!({
-                        "source": rel_path,
-                        "heading": section.0,
-                        "content": section.1,
-                        "relevance": section.2,
-                    }));
-                }
-            }
-        }
-    }
-
-    // 按相关度排序
-    results.sort_by(|a, b| {
-        let ra = a["relevance"].as_f64().unwrap_or(0.0);
-        let rb = b["relevance"].as_f64().unwrap_or(0.0);
-        rb.partial_cmp(&ra).unwrap_or(std::cmp::Ordering::Equal)
-    });
-    results.truncate(10);
 
     serde_json::json!({
         "tool": "knowledge_query",
         "status": "succeeded",
         "access_mode": BuiltinToolAccessMode::ReadOnly.as_str(),
+        "workspace_id": workspace_id.as_str(),
         "query": query,
-        "category": category,
-        "scanned_docs": doc_files.len(),
-        "returned_sections": results.len(),
+        "kind": kind.map(knowledge_kind_label).unwrap_or("all"),
+        "tags": tags,
+        "limit": limit,
+        "total_matches": governed_query.total_matches,
+        "returned_matches": results.len(),
+        "truncated": governed_query.truncated,
         "results": results,
-        "summary": format!("在 {} 个文档中搜索 \"{}\"，返回 {} 个匹配段落", doc_files.len(), query, results.len())
+        "summary": format!("在当前工作区知识库中搜索 \"{}\"，返回 {} 个匹配项", query, results.len())
     })
     .to_string()
 }
 
-fn collect_doc_files(dir: &Path, files: &mut Vec<PathBuf>, max_depth: usize) {
-    if max_depth == 0 {
-        return;
-    }
-    let entries = match fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
+fn parse_knowledge_kind(
+    request: Option<&serde_json::Map<String, Value>>,
+) -> Result<Option<magi_knowledge_store::KnowledgeKind>, String> {
+    let Some(raw_kind) = request.and_then(|obj| field_string(obj, &["kind"])) else {
+        return Ok(None);
     };
-    for entry in entries.filter_map(|e| e.ok()) {
-        let path = entry.path();
-        let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with('.') {
-            continue;
+    let normalized = raw_kind
+        .trim()
+        .to_ascii_lowercase()
+        .replace('-', "_")
+        .replace(' ', "_");
+    match normalized.as_str() {
+        "" | "all" => Ok(None),
+        "adr" | "architecture_decision" | "architecture_decision_record" => {
+            Ok(Some(magi_knowledge_store::KnowledgeKind::Adr))
         }
-        if path.is_dir() {
-            collect_doc_files(&path, files, max_depth - 1);
-        } else {
-            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-            if matches!(ext, "md" | "txt" | "rst" | "adoc") {
-                files.push(path);
-            }
-        }
+        "faq" => Ok(Some(magi_knowledge_store::KnowledgeKind::Faq)),
+        "learning" => Ok(Some(magi_knowledge_store::KnowledgeKind::Learning)),
+        "code_index" | "codeindex" => Ok(Some(magi_knowledge_store::KnowledgeKind::CodeIndex)),
+        other => Err(builtin_error(
+            "knowledge_query",
+            format!("未知 kind：{other}（支持 all / adr / faq / learning / code_index）"),
+        )),
     }
 }
 
-/// 从文档内容中提取与关键词匹配的段落
-fn extract_matching_sections(content: &str, keywords: &[String]) -> Vec<(String, String, f64)> {
-    let mut sections = Vec::new();
-    let mut current_heading = String::new();
-    let mut current_body = String::new();
-
-    for line in content.lines() {
-        if line.starts_with('#') {
-            // 保存上一个段落
-            if !current_body.is_empty() {
-                let score = section_relevance(&current_heading, &current_body, keywords);
-                if score > 0.0 {
-                    let body = truncate_section(&current_body, 600);
-                    sections.push((current_heading.clone(), body, score));
-                }
-            }
-            current_heading = line.trim_start_matches('#').trim().to_string();
-            current_body.clear();
-        } else {
-            if !current_body.is_empty() || !line.trim().is_empty() {
-                current_body.push_str(line);
-                current_body.push('\n');
-            }
-        }
+fn parse_knowledge_tags(request: Option<&serde_json::Map<String, Value>>) -> Vec<String> {
+    let Some(value) = request.and_then(|obj| obj.get("tags")) else {
+        return Vec::new();
+    };
+    match value {
+        Value::Array(items) => items
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|tag| !tag.is_empty())
+            .map(str::to_string)
+            .collect(),
+        Value::String(value) => value
+            .split(',')
+            .map(str::trim)
+            .filter(|tag| !tag.is_empty())
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
     }
-    // 最后一个段落
-    if !current_body.is_empty() {
-        let score = section_relevance(&current_heading, &current_body, keywords);
-        if score > 0.0 {
-            let body = truncate_section(&current_body, 600);
-            sections.push((current_heading, body, score));
-        }
-    }
-    // 如果没有 markdown 标题，整体匹配
-    if sections.is_empty() && !content.is_empty() {
-        let score = section_relevance("", content, keywords);
-        if score > 0.0 {
-            let body = truncate_section(content, 600);
-            sections.push(("(document)".to_string(), body, score));
-        }
-    }
-    sections
 }
 
-fn section_relevance(heading: &str, body: &str, keywords: &[String]) -> f64 {
-    let combined = format!("{}\n{}", heading, body).to_lowercase();
-    let mut matched = 0usize;
-    let mut score = 0.0f64;
-    for kw in keywords {
-        let count = combined.matches(kw.as_str()).count();
-        if count > 0 {
-            matched += 1;
-            score += (count as f64).min(5.0);
-            // 标题匹配加权
-            if heading.to_lowercase().contains(kw.as_str()) {
-                score += 3.0;
-            }
-        }
+fn knowledge_kind_label(kind: magi_knowledge_store::KnowledgeKind) -> &'static str {
+    match kind {
+        magi_knowledge_store::KnowledgeKind::Adr => "adr",
+        magi_knowledge_store::KnowledgeKind::Faq => "faq",
+        magi_knowledge_store::KnowledgeKind::Learning => "learning",
+        magi_knowledge_store::KnowledgeKind::CodeIndex => "code_index",
     }
-    if matched == 0 {
-        return 0.0;
-    }
-    score * (matched as f64 / keywords.len() as f64)
-}
-
-fn truncate_section(text: &str, max_chars: usize) -> String {
-    if text.len() <= max_chars {
-        return text.trim().to_string();
-    }
-    let mut end = max_chars;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}…", &text[..end].trim())
 }

@@ -853,7 +853,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "pre-existing knowledge assembly regression unmasked after P6/P7 made the crate compile again; selected_knowledge returns 0 instead of 1 — root cause sits in knowledge governed_output path, out of P7 scope"]
     fn assemble_execution_context_uses_text_clues_and_runtime_sources() {
         let session_id = SessionId::new("session-exec");
         let workspace_id = WorkspaceId::new("workspace-exec");
@@ -862,7 +861,7 @@ mod tests {
 
         let knowledge_store = KnowledgeStore::new();
         knowledge_store.upsert(magi_knowledge_store::KnowledgeRecord {
-            workspace_id: None,
+            workspace_id: Some(workspace_id.clone()),
             knowledge_id: "kb-parser-diagnostics".to_string(),
             kind: magi_knowledge_store::KnowledgeKind::Adr,
             title: "Parser diagnostics cutover notes".to_string(),

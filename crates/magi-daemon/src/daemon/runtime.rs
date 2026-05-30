@@ -15,7 +15,9 @@ use magi_bridge_client::{
     HttpModelBridgeProtocol, JsonRpcMcpBridgeClient, JsonRpcModelBridgeClient,
     JsonRpcStdioTransport, StdioMcpBridgeClient,
 };
-use magi_context_runtime::{ContextBudget, ContextRuntime};
+use magi_context_runtime::{
+    ContextBudget, ContextRuntime, FileSummaryStore, ProjectRecentTurnStore, SharedContextPool,
+};
 use magi_conversation_runtime::{
     session_turn_finalize::{
         current_turn_status_is_terminal, publish_task_status_turn_item_for_active_sessions,
@@ -530,8 +532,14 @@ impl DaemonRuntime {
         let skill_runtime = SkillDispatchRuntime::new(tool_registry.clone(), bridge_runtime);
         let worker_runtime = self.worker_runtime.clone();
         let memory_store = MemoryStore::new();
-        let context_runtime =
-            ContextRuntime::new((*self.knowledge_store).clone(), memory_store.clone());
+        let context_runtime = ContextRuntime::with_runtime_sources(
+            (*self.knowledge_store).clone(),
+            memory_store.clone(),
+            (*self.session_store).clone(),
+            SharedContextPool::default(),
+            FileSummaryStore::default(),
+            ProjectRecentTurnStore::default(),
+        );
         let context_runtime_for_dispatcher = Arc::new(context_runtime.clone());
         let tool_registry_for_dispatcher = tool_registry.clone();
         let task_store_checkpoint_path = self.state_root.join("task-store.json");

@@ -27,9 +27,7 @@ use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
 use magi_orchestrator::task_store::TaskStore;
 use magi_session_store::SessionStore;
 use magi_snapshot::{SnapshotSession, ToolHook, ToolHookCtx};
-use magi_tool_runtime::{
-    BuiltinToolName, ToolExecutionContext, ToolExecutionInput, ToolExecutionPolicy, ToolRegistry,
-};
+use magi_tool_runtime::{BuiltinToolName, ToolExecutionContext, ToolExecutionInput, ToolRegistry};
 
 use crate::builtin_tool_schema::internal_builtin_tool_rejection_payload;
 use crate::skill_apply_tool::{SKILL_APPLY_TOOL_NAME, execute_skill_apply_from_runtime};
@@ -40,7 +38,9 @@ use crate::{
     tool_declared_paths::{append_result_declared_paths, derive_declared_paths},
     tool_result_utils::tool_execution_status_label,
 };
-use crate::{execute_skill_custom_tool, parse_skill_custom_tool_name};
+use crate::{
+    active_skill_tool_execution_policy, execute_skill_custom_tool, parse_skill_custom_tool_name,
+};
 
 /// agent_spawn 生成 child task_id 时使用的进程内单调序号。
 ///
@@ -1508,6 +1508,12 @@ fn execute_task_tool_call(
         return (decision.payload, decision.status);
     }
 
+    let access_profile = task
+        .policy_snapshot
+        .as_ref()
+        .map(|policy| policy.access_profile)
+        .unwrap_or_default();
+    let tool_policy = active_skill_tool_execution_policy(access_profile, skill_runtime, skill_name);
     let output = registry.execute_with_policy(
         ToolExecutionInput::for_builtin_invocation(
             ToolCallId::new(&tool_call.id),
@@ -1521,14 +1527,7 @@ fn execute_task_tool_call(
             workspace_id: workspace_id.clone(),
             working_directory: workspace_root_path.cloned(),
         },
-        &ToolExecutionPolicy {
-            access_profile: task
-                .policy_snapshot
-                .as_ref()
-                .map(|policy| policy.access_profile)
-                .unwrap_or_default(),
-            ..ToolExecutionPolicy::default()
-        },
+        &tool_policy,
     );
 
     (output.payload, output.status)

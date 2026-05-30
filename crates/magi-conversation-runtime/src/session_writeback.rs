@@ -3,8 +3,9 @@ use crate::tool_result_utils::{
     summarize_tool_result, tool_execution_status_label, turn_item_status_for_tool_result,
 };
 use crate::{
-    SKILL_APPLY_TOOL_NAME, execute_skill_apply_from_runtime, execute_skill_custom_tool,
-    internal_builtin_tool_rejection_payload, parse_skill_custom_tool_name,
+    SKILL_APPLY_TOOL_NAME, active_skill_tool_execution_policy, execute_skill_apply_from_runtime,
+    execute_skill_custom_tool, internal_builtin_tool_rejection_payload,
+    parse_skill_custom_tool_name,
     tool_batch::{
         access_profile_tool_decision, safety_gate_tool_decision, select_preflight_decision,
     },
@@ -29,9 +30,7 @@ use magi_session_store::{
 };
 use magi_skill_runtime::{SkillDispatchRuntime, SkillRuntime};
 use magi_snapshot::{SnapshotSession, ToolHook, ToolHookCtx};
-use magi_tool_runtime::{
-    BuiltinToolName, ToolExecutionContext, ToolExecutionInput, ToolExecutionPolicy, ToolRegistry,
-};
+use magi_tool_runtime::{BuiltinToolName, ToolExecutionContext, ToolExecutionInput, ToolRegistry};
 use serde_json::Value;
 use std::{collections::HashMap, path::PathBuf, sync::Arc, thread};
 
@@ -966,6 +965,7 @@ fn execute_session_turn_tool_call(
         return (decision.payload, decision.status);
     }
 
+    let tool_policy = active_skill_tool_execution_policy(access_profile, skill_runtime, skill_name);
     let output = registry.execute_with_policy(
         ToolExecutionInput::for_builtin_invocation(
             ToolCallId::new(&tool_call.id),
@@ -979,10 +979,7 @@ fn execute_session_turn_tool_call(
             workspace_id: workspace_id.clone(),
             working_directory: workspace_root_path.cloned(),
         },
-        &ToolExecutionPolicy {
-            access_profile,
-            ..ToolExecutionPolicy::default()
-        },
+        &tool_policy,
     );
     (output.payload, output.status)
 }
@@ -1369,6 +1366,58 @@ mod tests {
         assert_eq!(recorded[0].tool_name, "echo.describe");
         assert_eq!(recorded[0].input, "hello mcp");
         assert_eq!(event_bus.snapshot().recent_events.len(), 1);
+    }
+
+    #[test]
+    fn execute_session_turn_tool_call_enforces_active_skill_allowed_tools() {
+        let registry = SkillRegistry::new();
+        registry.register(SkillDefinition {
+            skill_id: "search-only".to_string(),
+            title: "只允许搜索".to_string(),
+            instruction: "只能检索文本。".to_string(),
+            metadata: SkillMetadata {
+                category: "quality".to_string(),
+                tags: vec!["search".to_string()],
+            },
+            allowed_tools: vec!["search_text".to_string()],
+            custom_tool_bindings: vec![],
+            prompt_priority: 50,
+        });
+        let skill_runtime = SkillRuntime::new(registry);
+        let mut tool_registry = ToolRegistry::new(
+            Arc::new(GovernanceService::default()),
+            Arc::new(InMemoryEventBus::new(8)),
+        );
+        tool_registry.register_default_builtins();
+        let event_bus = InMemoryEventBus::new(8);
+        let call = ChatToolCall {
+            id: "tool-call-file-read".to_string(),
+            kind: "function".to_string(),
+            function: ChatToolFunction {
+                name: "file_read".to_string(),
+                arguments: serde_json::json!({ "path": "Cargo.toml" }).to_string(),
+            },
+        };
+
+        let (payload, status) = execute_session_turn_tool_call(
+            &event_bus,
+            Some(&tool_registry),
+            Some(&skill_runtime),
+            None,
+            Some("search-only"),
+            None,
+            &call,
+            &SessionId::new("session-1"),
+            &None,
+            None,
+            magi_core::AccessProfile::Restricted,
+        );
+
+        assert_eq!(status, ExecutionResultStatus::Rejected);
+        assert!(
+            payload.contains("skill runtime 未授权工具: file_read"),
+            "{payload}"
+        );
     }
 
     #[test]

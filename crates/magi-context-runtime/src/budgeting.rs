@@ -97,16 +97,15 @@ fn select_knowledge(
     mut knowledge_query: KnowledgeQuery,
 ) -> (Vec<GovernedKnowledgeOutput>, Option<TruncationRecord>) {
     knowledge_query.limit = budget.max_knowledge.min(knowledge_query.limit);
-    let knowledge_query_result = runtime.knowledge_store.query(&knowledge_query);
-    let selected_knowledge = runtime.knowledge_store.governed_output(&knowledge_query);
+    let knowledge_query_result = runtime.knowledge_store.governed_query(&knowledge_query);
     let knowledge_truncation = knowledge_query_result
         .truncated
         .then_some(TruncationRecord {
             part: "knowledge".to_string(),
             original_count: knowledge_query_result.total_matches,
-            retained_count: selected_knowledge.len(),
+            retained_count: knowledge_query_result.results.len(),
         });
-    (selected_knowledge, knowledge_truncation)
+    (knowledge_query_result.results, knowledge_truncation)
 }
 
 fn select_memory(

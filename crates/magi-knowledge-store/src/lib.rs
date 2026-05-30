@@ -102,6 +102,13 @@ pub struct GovernedKnowledgeOutput {
     pub governance_link: Option<KnowledgeGovernanceLink>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GovernedKnowledgeQueryResult {
+    pub results: Vec<GovernedKnowledgeOutput>,
+    pub total_matches: usize,
+    pub truncated: bool,
+}
+
 /// 工作区代码检索引擎句柄：每个 workspace 一个 LocalSearchEngine。
 ///
 /// search() 需要 &mut（写查询缓存），故用 Mutex 包裹单个引擎，
@@ -431,6 +438,10 @@ impl KnowledgeStore {
     }
 
     pub fn governed_output(&self, query: &KnowledgeQuery) -> Vec<GovernedKnowledgeOutput> {
+        self.governed_query(query).results
+    }
+
+    pub fn governed_query(&self, query: &KnowledgeQuery) -> GovernedKnowledgeQueryResult {
         let state = self
             .state
             .read()
@@ -443,12 +454,19 @@ impl KnowledgeStore {
             &state.governance_links,
             query,
         );
-        GovernedKnowledgeService::project(
+        let total_matches = query_result.total_matches;
+        let truncated = query_result.truncated;
+        let results = GovernedKnowledgeService::project(
             query_result,
             &state.code_sources,
             &state.audit_links,
             &state.governance_links,
-        )
+        );
+        GovernedKnowledgeQueryResult {
+            results,
+            total_matches,
+            truncated,
+        }
     }
 
     /// 获取代码索引摘要（用于 API 返回前端所需格式）
