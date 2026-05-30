@@ -411,7 +411,10 @@
     return error instanceof Error ? error.message : String(error || i18n.t('knowledgePanel.unknownError'));
   }
 
-  function applyKnowledgePayload(payload: Record<string, unknown> | null | undefined) {
+  function applyKnowledgePayload(payload: Record<string, unknown> | null | undefined): boolean {
+    if (!payloadMatchesCurrentWorkspace(payload)) {
+      return false;
+    }
     const codeIndexPayload = payload?.codeIndex && typeof payload.codeIndex === 'object'
       ? payload.codeIndex as Record<string, unknown>
       : null;
@@ -456,6 +459,7 @@
       : null;
     loadError = '';
     isLoading = false;
+    return true;
   }
 
   function normalizeCodeIndexStatus(value: unknown): CodeIndexStatus | null {
@@ -513,13 +517,19 @@
     return workspaceId || workspacePath ? `${workspaceId}::${workspacePath}` : '';
   }
 
+  function payloadMatchesCurrentWorkspace(payload: Record<string, unknown> | null | undefined): boolean {
+    return resolvePayloadWorkspaceKey(payload) === currentWorkspaceKey;
+  }
+
   async function fetchKnowledgeViaApi() {
     const requestWorkspaceKey = currentWorkspaceKey;
     const res = await getAgentProjectKnowledge();
     if (requestWorkspaceKey !== currentWorkspaceKey) {
       return;
     }
-    applyKnowledgePayload(res);
+    if (!applyKnowledgePayload(res)) {
+      isLoading = false;
+    }
   }
 
   function requestKnowledgeLoad() {
@@ -621,10 +631,6 @@
       if (standard.data.dataType !== 'projectKnowledgeLoaded') return;
 
       const payload = standard.data.payload as Record<string, unknown>;
-      const payloadWorkspaceKey = resolvePayloadWorkspaceKey(payload);
-      if (payloadWorkspaceKey && payloadWorkspaceKey !== currentWorkspaceKey) {
-        return;
-      }
       applyKnowledgePayload(payload);
     });
 

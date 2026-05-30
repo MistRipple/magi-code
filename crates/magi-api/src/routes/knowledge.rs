@@ -134,6 +134,20 @@ fn require_registered_workspace_id(
     }
 }
 
+fn require_registered_workspace_binding(
+    state: &ApiState,
+    value: Option<&str>,
+) -> Result<(WorkspaceId, String), ApiError> {
+    let workspace_id = require_workspace_id(value)?;
+    let workspace = state
+        .workspace_registry
+        .workspaces()
+        .into_iter()
+        .find(|workspace| workspace.workspace_id == workspace_id)
+        .ok_or_else(|| ApiError::not_found("工作区不存在", workspace_id.as_str()))?;
+    Ok((workspace_id, workspace.root_path.to_string()))
+}
+
 fn normalize_tags(tags: Vec<String>) -> Vec<String> {
     let mut normalized = Vec::new();
     for tag in tags {
@@ -262,7 +276,8 @@ async fn get_project_knowledge(
     State(state): State<ApiState>,
     Query(query): Query<KnowledgeWorkspaceRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let workspace_id = require_registered_workspace_id(&state, query.workspace_id.as_deref())?;
+    let (workspace_id, workspace_path) =
+        require_registered_workspace_binding(&state, query.workspace_id.as_deref())?;
     let scan_outcome = ensure_workspace_code_index(&state, &workspace_id)?;
 
     let kq = KnowledgeQuery {
@@ -299,6 +314,8 @@ async fn get_project_knowledge(
         .unwrap_or(serde_json::Value::Null);
 
     Ok(Json(serde_json::json!({
+        "workspaceId": workspace_id.as_str(),
+        "workspacePath": workspace_path,
         "items": items,
         "codeIndex": code_index,
         "codeIndexStatus": code_index_status,
@@ -606,6 +623,13 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         let payload = read_json(response).await;
+        assert_eq!(payload["workspaceId"], "workspace-knowledge-a");
+        assert!(
+            payload["workspacePath"]
+                .as_str()
+                .is_some_and(|path| path.ends_with("magi-knowledge-workspace-knowledge-a")),
+            "knowledge payload must carry canonical workspace path"
+        );
         assert_eq!(payload["codeIndex"]["files"][0]["path"], "src/a.rs");
         assert!(payload["items"].is_array(), "items 字段必须存在且为数组");
     }

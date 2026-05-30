@@ -1969,10 +1969,16 @@ async function dispatchProjectKnowledge(): Promise<void> {
     throw new Error(`project knowledge failed: ${response.status}`);
   }
   const payload = await response.json() as Record<string, unknown>;
+  const responseWorkspaceId = typeof payload.workspaceId === 'string' && payload.workspaceId.trim()
+    ? payload.workspaceId.trim()
+    : requestWorkspaceId;
+  const responseWorkspacePath = typeof payload.workspacePath === 'string' && payload.workspacePath.trim()
+    ? payload.workspacePath.trim()
+    : requestWorkspacePath;
   emitDataMessage('projectKnowledgeLoaded', {
     ...payload,
-    workspaceId: requestWorkspaceId,
-    workspacePath: requestWorkspacePath,
+    workspaceId: responseWorkspaceId,
+    workspacePath: responseWorkspacePath,
   });
 }
 
