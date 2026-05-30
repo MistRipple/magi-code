@@ -152,25 +152,13 @@ pub(crate) fn resolve_session_change_scope(
     })
 }
 
-pub(crate) fn resolve_workspace_change_scope_or_active(
+pub(crate) fn resolve_workspace_change_scope(
     state: &ApiState,
-    workspace_id: Option<&str>,
+    workspace_id: &WorkspaceId,
 ) -> Result<WorkspaceChangeScope, ApiError> {
-    let ws_id = match workspace_id
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        Some(id) => WorkspaceId::new(id),
-        None => state
-            .workspace_registry
-            .active_workspace_id()
-            .ok_or_else(|| {
-                ApiError::InvalidInput("未指定 workspace_id 且没有活动 workspace".to_string())
-            })?,
-    };
-    let workspace_root = resolve_workspace_root(state, &ws_id)?;
+    let workspace_root = resolve_workspace_root(state, workspace_id)?;
     Ok(WorkspaceChangeScope {
-        workspace_id: ws_id,
+        workspace_id: workspace_id.clone(),
         workspace_root,
     })
 }

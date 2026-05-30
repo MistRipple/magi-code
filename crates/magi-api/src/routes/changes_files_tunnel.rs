@@ -18,7 +18,7 @@ use super::session_scope::{parse_session_id, require_workspace_id};
 use crate::{
     change_projection::{
         SessionChangeScope, WorkspaceChangeScope, resolve_session_change_scope,
-        resolve_workspace_change_scope_or_active, safe_relative_path, safe_workspace_path,
+        resolve_workspace_change_scope, safe_relative_path, safe_workspace_path,
     },
     errors::ApiError,
     state::ApiState,
@@ -146,8 +146,8 @@ async fn get_diff(
         None => {
             // 无 session 调用：仅做一次 workspace 校验，统一返回空 diff，
             // 不再读 git 来伪装出全局变更。
-            let scope =
-                resolve_workspace_change_scope_or_active(&state, query.workspace_id.as_deref())?;
+            let workspace_id = require_workspace_id(query.workspace_id.as_deref())?;
+            let scope = resolve_workspace_change_scope(&state, &workspace_id)?;
             (String::new(), workspace_scope_binding(&scope))
         }
     };
@@ -379,7 +379,7 @@ async fn get_file_content(
         (absolute, session_scope_binding(&scope))
     } else {
         let workspace_id = require_workspace_id(query.workspace_id.as_deref())?;
-        let scope = resolve_workspace_change_scope_or_active(&state, Some(workspace_id.as_str()))?;
+        let scope = resolve_workspace_change_scope(&state, &workspace_id)?;
         let (absolute, _) = safe_workspace_path(&scope.workspace_root, path)?;
         (absolute, workspace_scope_binding(&scope))
     };
@@ -450,7 +450,7 @@ async fn get_file_raw(
         absolute
     } else {
         let workspace_id = require_workspace_id(query.workspace_id.as_deref())?;
-        let scope = resolve_workspace_change_scope_or_active(&state, Some(workspace_id.as_str()))?;
+        let scope = resolve_workspace_change_scope(&state, &workspace_id)?;
         let (absolute, _) = safe_workspace_path(&scope.workspace_root, path)?;
         absolute
     };
@@ -535,7 +535,7 @@ async fn list_filesystem(
     Query(query): Query<FilesystemListQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let workspace_id = require_workspace_id(query.workspace_id.as_deref())?;
-    let scope = resolve_workspace_change_scope_or_active(&state, Some(workspace_id.as_str()))?;
+    let scope = resolve_workspace_change_scope(&state, &workspace_id)?;
     let canonical_workspace_root =
         canonical_directory_path(scope.workspace_root.clone(), "规范化工作区根目录失败")?;
     let path = match query
@@ -1202,6 +1202,34 @@ mod tests {
             serde_json::from_slice(&body).expect("payload should deserialize");
         assert_eq!(payload["diff"], "");
         assert!(payload["filePath"].is_null());
+    }
+
+    #[tokio::test]
+    async fn get_diff_rejects_missing_workspace_without_session() {
+        let root = unique_temp_dir("magi-changes-route-no-session-missing-workspace");
+        fs::write(root.join("notes.txt"), "hello\n").expect("workspace file should write");
+        let state = build_state_with_workspace_root(&root, "workspace-no-session-missing");
+
+        let response = routes()
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/changes/diff")
+                    .method("GET")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let payload = read_json_response(response).await;
+        assert!(
+            payload["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("workspaceId 不能为空")
+        );
     }
 
     #[tokio::test]
