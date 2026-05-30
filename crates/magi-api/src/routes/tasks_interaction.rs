@@ -284,7 +284,8 @@ async fn restart_task(
         Some(root_task.title.clone()),
         Some(root_task.goal.clone()),
         task_tier,
-    )?;
+    )
+    .await?;
     finalize_session_task_dispatch(state.clone(), accepted.clone());
     let execution_chain_ref = state
         .session_store

@@ -12,14 +12,13 @@ use std::sync::Arc;
 use magi_bridge_client::ModelInvocationRequest;
 use magi_conversation_runtime::session_turn_execution::BUSINESS_MODEL_PROVIDER;
 use magi_conversation_runtime::task_execution_dispatcher::{RoleTarget, resolve_target_for_role};
-use magi_core::SessionId;
 use magi_snapshot::SnapshotSession;
 
 use super::session_scope::parse_session_id;
 use crate::{
     change_projection::{
-        resolve_session_change_scope, resolve_workspace_root_or_active, safe_relative_path,
-        safe_workspace_path,
+        SessionChangeScope, resolve_session_change_scope, resolve_workspace_root_or_active,
+        safe_relative_path, safe_workspace_path,
     },
     errors::ApiError,
     state::ApiState,
@@ -48,11 +47,11 @@ pub fn routes() -> Router<ApiState> {
 
 async fn require_snapshot_session(
     state: &ApiState,
-    session_id: &SessionId,
+    scope: &SessionChangeScope,
 ) -> Result<Arc<SnapshotSession>, ApiError> {
-    state.snapshot_session(session_id).ok_or_else(|| {
-        ApiError::InvalidInput(format!("会话 {} 的快照账本尚未就绪", session_id.as_str()))
-    })
+    state
+        .ensure_snapshot_session(&scope.session_id, &scope.workspace_root)
+        .await
 }
 
 // ─── Changes ────────────────────────────────────────────────────────────────
@@ -85,7 +84,7 @@ async fn get_diff(
                 query.workspace_id.as_deref(),
                 query.execution_group_id.as_deref(),
             )?;
-            let snapshot = require_snapshot_session(&state, &session_id).await?;
+            let snapshot = require_snapshot_session(&state, &scope).await?;
             let pending = snapshot
                 .pending_changes()
                 .map_err(|e| ApiError::internal_assembly("读取快照变更失败", e))?;
@@ -146,10 +145,10 @@ async fn approve_change(
     Json(request): Json<ApproveChangeRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let session_id = parse_session_id(request.session_id.as_deref())?;
-    let _scope =
+    let scope =
         resolve_session_change_scope(&state, &session_id, request.workspace_id.as_deref(), None)?;
     let rel = safe_relative_path(&request.file_path)?.to_string();
-    let snapshot = require_snapshot_session(&state, &session_id).await?;
+    let snapshot = require_snapshot_session(&state, &scope).await?;
     snapshot
         .approve(&[rel])
         .map_err(|e| ApiError::internal_assembly("approve 变更失败", e))?;
@@ -172,10 +171,10 @@ async fn revert_change(
     Json(request): Json<RevertChangeRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let session_id = parse_session_id(request.session_id.as_deref())?;
-    let _scope =
+    let scope =
         resolve_session_change_scope(&state, &session_id, request.workspace_id.as_deref(), None)?;
     let rel = safe_relative_path(&request.file_path)?.to_string();
-    let snapshot = require_snapshot_session(&state, &session_id).await?;
+    let snapshot = require_snapshot_session(&state, &scope).await?;
     snapshot
         .revert(&[rel])
         .map_err(|e| ApiError::internal_assembly("revert 变更失败", e))?;
@@ -197,9 +196,9 @@ async fn approve_all_changes(
     Json(request): Json<ApproveAllRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let session_id = parse_session_id(request.session_id.as_deref())?;
-    let _scope =
+    let scope =
         resolve_session_change_scope(&state, &session_id, request.workspace_id.as_deref(), None)?;
-    let snapshot = require_snapshot_session(&state, &session_id).await?;
+    let snapshot = require_snapshot_session(&state, &scope).await?;
     let pending = snapshot
         .pending_changes()
         .map_err(|e| ApiError::internal_assembly("读取快照变更失败", e))?;
@@ -225,9 +224,9 @@ async fn revert_all_changes(
     Json(request): Json<RevertAllRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let session_id = parse_session_id(request.session_id.as_deref())?;
-    let _scope =
+    let scope =
         resolve_session_change_scope(&state, &session_id, request.workspace_id.as_deref(), None)?;
-    let snapshot = require_snapshot_session(&state, &session_id).await?;
+    let snapshot = require_snapshot_session(&state, &scope).await?;
     let pending = snapshot
         .pending_changes()
         .map_err(|e| ApiError::internal_assembly("读取快照变更失败", e))?;
@@ -266,7 +265,7 @@ async fn revert_execution_group_changes(
             request.execution_group_id, scope.session_id
         )));
     }
-    let snapshot = require_snapshot_session(&state, &session_id).await?;
+    let snapshot = require_snapshot_session(&state, &scope).await?;
     let pending = snapshot
         .pending_changes()
         .map_err(|e| ApiError::internal_assembly("读取快照变更失败", e))?;
@@ -941,6 +940,44 @@ mod tests {
             diff.contains("+alpha changed"),
             "diff should contain new line marker: {}",
             diff
+        );
+    }
+
+    #[tokio::test]
+    async fn get_diff_lazily_starts_snapshot_session_for_bound_session() {
+        let root = unique_temp_dir("magi-changes-route-lazy-snapshot");
+        fs::write(root.join("alpha.txt"), "alpha\n").expect("alpha should write");
+        let state = build_state_with_workspace_root(&root, "ws-lazy-snapshot");
+        let session_id = SessionId::new("sess-lazy-snapshot");
+        state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "lazy snapshot",
+                Some("ws-lazy-snapshot".to_string()),
+            )
+            .expect("session should create");
+        assert!(
+            state.snapshot_session(&session_id).is_none(),
+            "测试前不应手动启动快照账本"
+        );
+
+        let response = routes()
+            .with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/changes/diff?sessionId=sess-lazy-snapshot&workspaceId=ws-lazy-snapshot")
+                    .method("GET")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            state.snapshot_session(&session_id).is_some(),
+            "显式变更路由必须在账本缺失时按会话/工作区启动快照账本"
         );
     }
 

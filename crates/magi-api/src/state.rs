@@ -682,6 +682,56 @@ impl ApiState {
         self.snapshot_manager.get_session(session_id.as_str())
     }
 
+    pub(crate) async fn ensure_snapshot_session(
+        &self,
+        session_id: &SessionId,
+        workspace_root: &Path,
+    ) -> Result<Arc<SnapshotSession>, ApiError> {
+        if let Some(session) = self.snapshot_session(session_id) {
+            return Ok(session);
+        }
+        self.snapshot_manager
+            .start_session(
+                session_id.as_str().to_string(),
+                workspace_root.to_path_buf(),
+            )
+            .await
+            .map_err(|error| ApiError::internal_assembly("启动会话快照账本失败", error))
+    }
+
+    pub(crate) async fn ensure_snapshot_session_for_workspace_id(
+        &self,
+        session_id: &SessionId,
+        workspace_id: &Option<WorkspaceId>,
+    ) -> Result<Option<Arc<SnapshotSession>>, ApiError> {
+        let Some(workspace_id) = workspace_id else {
+            return Ok(None);
+        };
+        let workspace_root = self
+            .workspace_root_path(&Some(workspace_id.clone()))
+            .ok_or_else(|| ApiError::not_found("workspace 不存在", workspace_id.as_str()))?;
+        self.ensure_snapshot_session(session_id, &workspace_root)
+            .await
+            .map(Some)
+    }
+
+    pub(crate) async fn ensure_snapshot_session_for_bound_session(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<Arc<SnapshotSession>>, ApiError> {
+        let session = self
+            .session_store
+            .session(session_id)
+            .ok_or_else(|| ApiError::session_not_found(session_id.as_str()))?;
+        let workspace_id = self
+            .session_store
+            .execution_ownership(session_id)
+            .and_then(|ownership| ownership.workspace_id)
+            .or_else(|| self.session_workspace_id(&session));
+        self.ensure_snapshot_session_for_workspace_id(session_id, &workspace_id)
+            .await
+    }
+
     pub fn with_tunnel_port(mut self, port: u16) -> Self {
         self.tunnel_manager = crate::tunnel::TunnelManager::new(port);
         self

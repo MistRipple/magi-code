@@ -18,7 +18,7 @@ use crate::{
 };
 use magi_conversation_runtime::session_writeback::publish_current_session_turn_item_event;
 
-pub(super) fn accept_session_task_submission(
+pub(super) async fn accept_session_task_submission(
     state: &ApiState,
     request: &SessionTurnRequestDto,
     task_title: Option<String>,
@@ -55,9 +55,10 @@ pub(super) fn accept_session_task_submission(
         None,
         request,
     )
+    .await
 }
 
-fn execute_dispatch_submission(
+async fn execute_dispatch_submission(
     state: &ApiState,
     requested_session_id: Option<SessionId>,
     requested_workspace_id: Option<WorkspaceId>,
@@ -79,6 +80,9 @@ fn execute_dispatch_submission(
         placeholder_title,
         accepted_at,
     )?;
+    state
+        .ensure_snapshot_session_for_workspace_id(&session_id, &workspace_id)
+        .await?;
     let signal = ingest_user_input_to_conversation(state, &session_id, request, accepted_at);
     let user_timeline_entry_id = format!("timeline-{}-{}", session_id, accepted_at.0);
     let action_task_title = format_action_task_title(&mission_title);

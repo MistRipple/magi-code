@@ -4,7 +4,7 @@ use crate::session::SnapshotSession;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock as StdRwLock};
-use tokio::sync::RwLock as AsyncRwLock;
+use tokio::sync::{Mutex as AsyncMutex, RwLock as AsyncRwLock};
 
 /// 顶层管理：跨 session 共享 BlobStore，按 session_id 维持 SnapshotSession 实例。
 ///
@@ -16,6 +16,7 @@ use tokio::sync::RwLock as AsyncRwLock;
 pub struct SnapshotManager {
     blob_stores: AsyncRwLock<HashMap<PathBuf, Arc<BlobStore>>>,
     sessions: StdRwLock<HashMap<String, Arc<SnapshotSession>>>,
+    start_lock: AsyncMutex<()>,
 }
 
 impl SnapshotManager {
@@ -23,6 +24,7 @@ impl SnapshotManager {
         Self {
             blob_stores: AsyncRwLock::new(HashMap::new()),
             sessions: StdRwLock::new(HashMap::new()),
+            start_lock: AsyncMutex::new(()),
         }
     }
 
@@ -32,6 +34,15 @@ impl SnapshotManager {
         session_id: String,
         workspace_root: PathBuf,
     ) -> SnapshotResult<Arc<SnapshotSession>> {
+        if let Some(session) = self.get_session(&session_id) {
+            return Ok(session);
+        }
+
+        let _start_guard = self.start_lock.lock().await;
+        if let Some(session) = self.get_session(&session_id) {
+            return Ok(session);
+        }
+
         let snapshots_root = snapshots_root_for(&workspace_root);
         let blobs_dir = snapshots_root.join("blobs");
 

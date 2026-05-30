@@ -8,6 +8,7 @@
 use magi_snapshot::{ChangeKind, ContentKind, SnapshotManager, SourceKind, ToolHook, ToolHookCtx};
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tempfile::tempdir;
 
 #[tokio::test(flavor = "multi_thread")]
@@ -22,6 +23,28 @@ async fn baseline_scan_records_existing_files() {
 
     let pending = session.pending_changes().unwrap();
     assert!(pending.is_empty(), "fresh baseline should have no pending");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn start_session_is_idempotent_for_existing_session() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    fs::write(root.join("a.txt"), "hello").unwrap();
+
+    let mgr = SnapshotManager::new();
+    let first = mgr
+        .start_session("s-idempotent".into(), root.clone())
+        .await
+        .unwrap();
+    let second = mgr
+        .start_session("s-idempotent".into(), root.clone())
+        .await
+        .unwrap();
+
+    assert!(
+        Arc::ptr_eq(&first, &second),
+        "同一 session 重复启动必须复用内存账本，避免重复 watcher 与账本覆盖"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

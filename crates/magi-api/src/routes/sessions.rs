@@ -87,12 +87,16 @@ async fn submit_session_turn(
     validate_session_turn_input(&request)?;
     let accepted_at = super::monotonic_accepted_at();
     if request.supplement_context {
-        return submit_supplement_context_turn(&state, &request, accepted_at).map(Json);
+        return submit_supplement_context_turn(&state, &request, accepted_at)
+            .await
+            .map(Json);
     }
     let decision = decide_session_turn_with_task_planner(&state, &request)?;
     match decision.route {
         SessionTurnRouteDto::Chat | SessionTurnRouteDto::Execute => {
-            submit_regular_session_turn(state, request, accepted_at, decision).map(Json)
+            submit_regular_session_turn(state, request, accepted_at, decision)
+                .await
+                .map(Json)
         }
         SessionTurnRouteDto::Task => {
             let (accepted, event_id) = super::accept_session_task_submission(
@@ -101,7 +105,8 @@ async fn submit_session_turn(
                 decision.task_title.clone(),
                 decision.execution_goal.clone(),
                 decision.task_tier,
-            )?;
+            )
+            .await?;
             super::finalize_session_task_dispatch(state.clone(), accepted.clone());
             let execution_chain_ref = state
                 .session_store
@@ -161,6 +166,9 @@ async fn submit_session_turn(
                 signal.placeholder_message_id,
                 orchestrator_thread_id,
             )?;
+            state
+                .ensure_snapshot_session_for_bound_session(&session_id)
+                .await?;
             finalize_continue_session(state.clone(), accepted.clone(), accepted_at);
             state.persist_runtime_durable_state()?;
             let event_id = publish_session_turn_continue_event(&state, &accepted, accepted_at)?;
@@ -197,12 +205,15 @@ struct SessionTurnIntentDecision {
 
 static SUPPLEMENT_SIGNAL_COUNTER: AtomicU64 = AtomicU64::new(1);
 
-fn submit_supplement_context_turn(
+async fn submit_supplement_context_turn(
     state: &ApiState,
     request: &SessionTurnRequestDto,
     accepted_at: UtcMillis,
 ) -> Result<SessionTurnResponseDto, ApiError> {
     let session_id = parse_session_id(request.session_id.as_deref())?;
+    state
+        .ensure_snapshot_session_for_bound_session(&session_id)
+        .await?;
     // S1：user 信号经 Conversation Mailbox 入栈，下游一律读 signal.* 不再读 request.*
     let signal = super::ingest_user_input_to_conversation(state, &session_id, request, accepted_at);
     let message = signal
@@ -1090,7 +1101,7 @@ fn build_user_message_turn_item(
     )
 }
 
-fn submit_regular_session_turn(
+async fn submit_regular_session_turn(
     state: ApiState,
     request: SessionTurnRequestDto,
     accepted_at: UtcMillis,
@@ -1118,6 +1129,9 @@ fn submit_regular_session_turn(
     let workspace_root_path = state
         .workspace_root_path(&workspace_id)
         .map(|path| path.display().to_string());
+    state
+        .ensure_snapshot_session_for_workspace_id(&session_id, &workspace_id)
+        .await?;
     let entry_id = format!("timeline-{}-{}", session_id, accepted_at.0);
     let request_id = signal.request_id.clone();
     let user_message_id = signal.user_message_id.clone();
@@ -2700,8 +2714,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn completed_long_mission_followup_dispatch_reuses_mission() {
+    #[tokio::test]
+    async fn completed_long_mission_followup_dispatch_reuses_mission() {
         let task_store = Arc::new(TaskStore::new());
         let state = test_state().with_task_store(task_store.clone());
         let session_id = SessionId::new("session-long-mission-next-chain");
@@ -2736,6 +2750,7 @@ mod tests {
             decision.execution_goal.clone(),
             decision.task_tier,
         )
+        .await
         .expect("followup dispatch should be accepted");
 
         assert_ne!(accepted.root_task_id, root_task.task_id);
@@ -2817,8 +2832,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn supplement_context_turn_enqueues_followup_mailbox_signal() {
+    #[tokio::test]
+    async fn supplement_context_turn_enqueues_followup_mailbox_signal() {
         let task_store = Arc::new(TaskStore::new());
         let state = test_state().with_task_store(task_store.clone());
         let session_id = SessionId::new("session-supplement-mailbox");
@@ -2848,6 +2863,7 @@ mod tests {
         request.session_id = Some(session_id.to_string());
         request.supplement_context = true;
         let response = submit_supplement_context_turn(&state, &request, UtcMillis::now())
+            .await
             .expect("supplement should enqueue mailbox signal");
 
         assert_eq!(response.route, SessionTurnRouteDto::SupplementContext);
@@ -3222,6 +3238,7 @@ mod tests {
                 task_evidence: Vec::new(),
             },
         )
+        .await
         .expect("regular turn should be accepted");
 
         assert_eq!(
@@ -3287,6 +3304,7 @@ mod tests {
             accepted_at,
             classifier_chat_decision(),
         )
+        .await
         .expect("chat route should accept");
 
         assert!(matches!(response.route, SessionTurnRouteDto::Chat));
@@ -3340,6 +3358,7 @@ mod tests {
         decision.forced_tool_name = Some("file_mkdir".to_string());
         decision.tool_intent = Some("显式调用 file_mkdir".to_string());
         let response = submit_regular_session_turn(state.clone(), request, accepted_at, decision)
+            .await
             .expect("execute route should accept");
 
         assert!(matches!(response.route, SessionTurnRouteDto::Execute));
