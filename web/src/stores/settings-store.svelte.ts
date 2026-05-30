@@ -161,9 +161,15 @@ function notifySettingsInfo(message: string): void {
 
 function notifySettingsError(actionLabel: string, error: unknown): void {
   const detail = error instanceof Error ? error.message : String(error);
+  const message = detail
+    ? i18n.t("settings.toast.actionFailedWithDetail", {
+        action: actionLabel,
+        detail,
+      })
+    : i18n.t("settings.toast.actionFailed", { action: actionLabel });
   addToast(
     "error",
-    detail ? `${actionLabel}失败：${detail}` : `${actionLabel}失败`,
+    message,
     undefined,
     {
       category: "incident",
@@ -991,7 +997,10 @@ function createSettingsStore(props: { onClose?: () => void }) {
         mcpServersLoading = false;
       }
       console.error("[SettingsPanel] 加载设置数据失败:", e);
-      notifySettingsError("加载设置数据", e);
+      notifySettingsError(
+        i18n.t("settings.toast.action.loadSettingsData"),
+        e,
+      );
     }
   }
 
@@ -1042,7 +1051,10 @@ function createSettingsStore(props: { onClose?: () => void }) {
       syncEnabledAgentsToStore();
     } catch (e) {
       console.error("[SettingsPanel] 加载 Registry 数据失败:", e);
-      notifySettingsError("加载 Registry 数据", e);
+      notifySettingsError(
+        i18n.t("settings.toast.action.loadRegistryData"),
+        e,
+      );
     }
   }
 
@@ -1143,10 +1155,10 @@ function createSettingsStore(props: { onClose?: () => void }) {
         purgeEngineFromFrontend(engineId);
         appState.settingsBootstrapSnapshot = null;
         await requestSettingsBootstrap(true);
-        notifySettingsSuccess("引擎已删除");
+        notifySettingsSuccess(i18n.t("settings.toast.engineDeleted"));
       } catch (e) {
         console.error("[SettingsPanel] 删除引擎失败:", e);
-        notifySettingsError("删除引擎", e);
+        notifySettingsError(i18n.t("settings.toast.action.deleteEngine"), e);
         await requestSettingsBootstrap(true);
       }
     });
@@ -1167,10 +1179,12 @@ function createSettingsStore(props: { onClose?: () => void }) {
       const result = await upsertAgentRegistryBinding(updated);
       registryAgents = result;
       syncEnabledAgentsToStore();
-      notifySettingsSuccess("角色绑定已更新", { displayMode: "notification_center" });
+      notifySettingsSuccess(i18n.t("settings.toast.roleBindingUpdated"), {
+        displayMode: "notification_center",
+      });
     } catch (e) {
       console.error("[SettingsPanel] 更新角色引擎失败:", e);
-      notifySettingsError("更新角色绑定", e);
+      notifySettingsError(i18n.t("settings.toast.action.updateRoleBinding"), e);
     }
   }
 
@@ -1228,10 +1242,10 @@ function createSettingsStore(props: { onClose?: () => void }) {
       await resetAgentExecutionStats();
       executionStats = [];
       recomputeTokenStatsSummary();
-      notifySettingsSuccess("执行统计已重置");
+      notifySettingsSuccess(i18n.t("settings.toast.executionStatsReset"));
     } catch (e) {
       console.error("[SettingsPanel] 重置统计失败:", e);
-      notifySettingsError("重置执行统计", e);
+      notifySettingsError(i18n.t("settings.toast.action.resetExecutionStats"), e);
     }
   }
 
@@ -1279,7 +1293,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
       }
       console.error("[SettingsPanel] 保存规则失败:", e);
       userRulesSaveStatus = "error";
-      notifySettingsError("保存用户规则", e);
+      notifySettingsError(i18n.t("settings.toast.action.saveUserRules"), e);
     }
     clearUserRulesSaveStatusLater();
   }
@@ -1355,7 +1369,10 @@ function createSettingsStore(props: { onClose?: () => void }) {
       };
       testStatus[statusKey] =
         result.value.status === "connected" ? "success" : "error";
-      notifySettingsSuccess("连接测试已完成", { displayMode: "notification_center" });
+      notifySettingsSuccess(
+        i18n.t("settings.toast.connectionTestCompleted"),
+        { displayMode: "notification_center" },
+      );
     } catch (e) {
       console.error("[SettingsPanel] 连接测试失败:", e);
       testStatus[statusKey] = "error";
@@ -1372,7 +1389,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
                 : compConfig.model)?.trim() || undefined,
         },
       };
-      notifySettingsError("连接测试", e);
+      notifySettingsError(i18n.t("settings.toast.action.testConnection"), e);
     }
     testStatus = { ...testStatus };
     resetTestStatus(statusKey);
@@ -1423,13 +1440,15 @@ function createSettingsStore(props: { onClose?: () => void }) {
           modelDropdownOpen[key] = true;
           modelDropdownOpen = { ...modelDropdownOpen };
         }
-        notifySettingsSuccess("模型列表已刷新", { displayMode: "notification_center" });
+        notifySettingsSuccess(i18n.t("settings.toast.modelListRefreshed"), {
+          displayMode: "notification_center",
+        });
       }
     } catch (e) {
       console.error("[SettingsPanel] 获取模型列表失败:", e);
       fetchingModels[key] = false;
       fetchingModels = { ...fetchingModels };
-      notifySettingsError("获取模型列表", e);
+      notifySettingsError(i18n.t("settings.toast.action.fetchModelList"), e);
     }
   }
 
@@ -1509,12 +1528,12 @@ function createSettingsStore(props: { onClose?: () => void }) {
 
       saveStatus[key] = "saved";
       saveStatus = { ...saveStatus };
-      notifySettingsSuccess("模型配置已保存");
+      notifySettingsSuccess(i18n.t("settings.toast.modelConfigSaved"));
       resetSaveStatus(key);
     } catch (e) {
       console.error("[SettingsPanel] 保存模型配置失败:", e);
       saveStatus[key] = "error";
-      notifySettingsError("保存模型配置", e);
+      notifySettingsError(i18n.t("settings.toast.action.saveModelConfig"), e);
       saveStatus = { ...saveStatus };
       resetSaveStatus(key);
     }
@@ -1701,7 +1720,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
       }
       saveStatus.mcp = "saved";
       saveStatus = { ...saveStatus };
-      notifySettingsSuccess("MCP 服务器配置已保存");
+      notifySettingsSuccess(i18n.t("settings.toast.mcpConfigSaved"));
       resetSaveStatus("mcp");
       closeMCPDialog();
     } else {
@@ -1720,10 +1739,10 @@ function createSettingsStore(props: { onClose?: () => void }) {
           await deleteAgentMcpServer(serverId);
           const payload = await getAgentSettingsBootstrap();
           applyMcpServersPayload(payload.mcpServers);
-          notifySettingsSuccess("MCP 服务器已删除");
+          notifySettingsSuccess(i18n.t("settings.toast.mcpServerDeleted"));
         } catch (e) {
           console.error("[SettingsPanel] 删除 MCP 服务器失败:", e);
-          notifySettingsError("删除 MCP 服务器", e);
+          notifySettingsError(i18n.t("settings.toast.action.deleteMcpServer"), e);
         }
       },
     );
@@ -1736,10 +1755,10 @@ function createSettingsStore(props: { onClose?: () => void }) {
         await updateAgentMcpServer(serverId, { ...server, enabled: !enabled });
         const payload = await getAgentSettingsBootstrap();
         applyMcpServersPayload(payload.mcpServers);
-        notifySettingsSuccess("MCP 服务器状态已更新");
+        notifySettingsSuccess(i18n.t("settings.toast.mcpServerStatusUpdated"));
       } catch (e) {
         console.error("[SettingsPanel] 切换 MCP 服务器状态失败:", e);
-        notifySettingsError("切换 MCP 服务器状态", e);
+        notifySettingsError(i18n.t("settings.toast.action.toggleMcpServer"), e);
       }
     }
   }
@@ -1759,10 +1778,16 @@ function createSettingsStore(props: { onClose?: () => void }) {
           if ((result as any)?.servers) {
             applyMcpServersPayload((result as any).servers);
           }
-        notifySettingsSuccess("MCP 工具列表已加载", { displayMode: "notification_center" });
+          notifySettingsSuccess(
+            i18n.t("settings.toast.mcpToolListLoaded"),
+            { displayMode: "notification_center" },
+          );
         } catch (e) {
           console.error("[SettingsPanel] 获取 MCP 工具列表失败:", e);
-          notifySettingsError("获取 MCP 工具列表", e);
+          notifySettingsError(
+            i18n.t("settings.toast.action.loadMcpToolList"),
+            e,
+          );
         }
         const newSet = new Set(mcpRefreshingServers);
         newSet.delete(serverId);
@@ -1780,10 +1805,12 @@ function createSettingsStore(props: { onClose?: () => void }) {
       if ((result as any)?.servers) {
         applyMcpServersPayload((result as any).servers);
       }
-      notifySettingsSuccess("MCP 工具已刷新", { displayMode: "notification_center" });
+      notifySettingsSuccess(i18n.t("settings.toast.mcpToolsRefreshed"), {
+        displayMode: "notification_center",
+      });
     } catch (e) {
       console.error("[SettingsPanel] 刷新 MCP 工具失败:", e);
-      notifySettingsError("刷新 MCP 工具", e);
+      notifySettingsError(i18n.t("settings.toast.action.refreshMcpTools"), e);
     }
     const newSet = new Set(mcpRefreshingServers);
     newSet.delete(serverId);
@@ -1829,12 +1856,12 @@ function createSettingsStore(props: { onClose?: () => void }) {
         // 刷新仓库列表
         const payload = await getAgentSettingsBootstrap();
         applyRepositoriesPayload(payload.repositories);
-        notifySettingsSuccess("仓库已添加");
+        notifySettingsSuccess(i18n.t("settings.toast.repositoryAdded"));
       }
     } catch (e) {
       console.error("[SettingsPanel] 添加仓库失败:", e);
       repoAddLoading = false;
-      notifySettingsError("添加仓库", e);
+      notifySettingsError(i18n.t("settings.toast.action.addRepository"), e);
     }
   }
 
@@ -1847,10 +1874,10 @@ function createSettingsStore(props: { onClose?: () => void }) {
           await deleteAgentRepository(repositoryId);
           const payload = await getAgentSettingsBootstrap();
           applyRepositoriesPayload(payload.repositories);
-          notifySettingsSuccess("仓库已删除");
+          notifySettingsSuccess(i18n.t("settings.toast.repositoryDeleted"));
         } catch (e) {
           console.error("[SettingsPanel] 删除仓库失败:", e);
-          notifySettingsError("删除仓库", e);
+          notifySettingsError(i18n.t("settings.toast.action.deleteRepository"), e);
         }
       },
     );
@@ -1894,7 +1921,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
         .filter((repo: any) => repo.repositoryId);
     } catch (e) {
       console.error("[SettingsPanel] 加载 Skill 库失败:", e);
-      notifySettingsError("加载技能库", e);
+      notifySettingsError(i18n.t("settings.toast.action.loadSkillLibrary"), e);
     }
     skillLibraryLoading = false;
   }
@@ -1930,7 +1957,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
           );
           const bootstrapPayload = await getAgentSettingsBootstrap();
           applySkillsConfig(bootstrapPayload.skillsConfig);
-          notifySettingsSuccess("本地技能已安装");
+          notifySettingsSuccess(i18n.t("settings.toast.localSkillInstalled"));
         }
       } else {
         // Remote skill: install via normal endpoint
@@ -1960,14 +1987,14 @@ function createSettingsStore(props: { onClose?: () => void }) {
           ];
           const bootstrapPayload = await getAgentSettingsBootstrap();
           applySkillsConfig(bootstrapPayload.skillsConfig);
-          notifySettingsSuccess("技能已安装");
+          notifySettingsSuccess(i18n.t("settings.toast.skillInstalled"));
         }
       }
     } catch (e) {
       console.error("[SettingsPanel] 安装 Skill 失败:", e);
       installingSkills.delete(skillFullName);
       installingSkills = new Set(installingSkills);
-      notifySettingsError("安装技能", e);
+      notifySettingsError(i18n.t("settings.toast.action.installSkill"), e);
     }
     localSkillInstalling = false;
     localSkillInstallError = "";
@@ -1992,7 +2019,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
           const bootstrapPayload = await getAgentSettingsBootstrap();
           applySkillsConfig(bootstrapPayload.skillsConfig);
           showSkillLibraryDialogState = false;
-          notifySettingsSuccess("本地技能已安装");
+          notifySettingsSuccess(i18n.t("settings.toast.localSkillInstalled"));
         } else {
           localSkillInstallError =
             typeof (result as any)?.error === "string" &&
@@ -2006,7 +2033,10 @@ function createSettingsStore(props: { onClose?: () => void }) {
         localSkillInstallError = i18n.t(
           "settings.skillLibrary.localImportFailed",
         );
-        notifySettingsError("安装本地技能", e);
+        notifySettingsError(
+          i18n.t("settings.toast.action.installLocalSkill"),
+          e,
+        );
       }
     }
   }
@@ -2052,7 +2082,10 @@ function createSettingsStore(props: { onClose?: () => void }) {
       localSkillInstallError = i18n.t(
         "settings.skillLibrary.localImportFailed",
       );
-      notifySettingsError("扫描本地技能目录", e);
+      notifySettingsError(
+        i18n.t("settings.toast.action.scanLocalSkillDirectory"),
+        e,
+      );
     }
   }
 
@@ -2069,8 +2102,12 @@ function createSettingsStore(props: { onClose?: () => void }) {
     const confirmKey = isCustom
       ? "settings.tools.deleteCustomToolConfirm"
       : "settings.tools.deleteInstructionSkillConfirm";
-    const successText = isCustom ? "自定义工具已删除" : "指令技能已删除";
-    const errorText = isCustom ? "删除自定义工具" : "删除指令技能";
+    const successText = isCustom
+      ? i18n.t("settings.toast.customToolDeleted")
+      : i18n.t("settings.toast.instructionSkillDeleted");
+    const errorText = isCustom
+      ? i18n.t("settings.toast.action.deleteCustomTool")
+      : i18n.t("settings.toast.action.deleteInstructionSkill");
     showConfirm(
       i18n.t(titleKey),
       i18n.t(confirmKey, { name: skill.name }),
@@ -2340,10 +2377,13 @@ function createSettingsStore(props: { onClose?: () => void }) {
       await saveAgentSafeguardConfig({
         rules: safeguardRules.map((r) => ({ ...r })),
       });
-      notifySettingsSuccess("安全规则已保存");
+      notifySettingsSuccess(i18n.t("settings.toast.safeguardRulesSaved"));
     } catch (e) {
       console.error("[SettingsPanel] 保存安全规则失败:", e);
-      notifySettingsError("保存安全规则", e);
+      notifySettingsError(
+        i18n.t("settings.toast.action.saveSafeguardRules"),
+        e,
+      );
     }
   }
 
@@ -2457,7 +2497,10 @@ function createSettingsStore(props: { onClose?: () => void }) {
       })
       .catch((e) => {
         console.error("[SettingsPanel] 获取执行统计失败:", e);
-        notifySettingsError("获取执行统计", e);
+        notifySettingsError(
+          i18n.t("settings.toast.action.fetchExecutionStats"),
+          e,
+        );
       });
 
     return () => unsubscribe();
