@@ -19,6 +19,7 @@
     fetchWorkspaceBranches,
     checkoutWorkspaceBranch,
     type AgentSettingsBootstrapSnapshot,
+    settingsBootstrapMatchesCurrentWorkspace,
   } from '../web/agent-api';
   import Icon from './Icon.svelte';
   import { generateId } from '../lib/utils';
@@ -802,6 +803,9 @@
 
   function getOrchestratorConfigSnapshot(): Record<string, unknown> | null {
     const snapshot = messagesState.settingsBootstrapSnapshot;
+    if (!settingsBootstrapMatchesCurrentWorkspace(snapshot)) {
+      return null;
+    }
     const orchestratorConfig = snapshot?.orchestratorConfig;
     if (!orchestratorConfig || typeof orchestratorConfig !== 'object' || Array.isArray(orchestratorConfig)) {
       return null;
@@ -817,6 +821,9 @@
 
   function getAuxiliaryConfigSnapshot(): Record<string, unknown> | null {
     const snapshot = messagesState.settingsBootstrapSnapshot;
+    if (!settingsBootstrapMatchesCurrentWorkspace(snapshot)) {
+      return null;
+    }
     const auxiliaryConfig = snapshot?.auxiliaryConfig;
     if (!auxiliaryConfig || typeof auxiliaryConfig !== 'object' || Array.isArray(auxiliaryConfig)) {
       return null;
@@ -841,7 +848,7 @@
 
   function applyLocalOrchestratorConfig(config: Record<string, unknown>) {
     const snapshot = messagesState.settingsBootstrapSnapshot;
-    if (!snapshot) return;
+    if (!snapshot || !settingsBootstrapMatchesCurrentWorkspace(snapshot)) return;
     messagesState.settingsBootstrapSnapshot = {
       ...snapshot,
       orchestratorConfig: { ...config },
@@ -850,6 +857,9 @@
 
   async function refreshPickerSettingsSnapshot() {
     const latest = await getAgentSettingsBootstrap({ scope: 'core' });
+    if (!settingsBootstrapMatchesCurrentWorkspace(latest)) {
+      return;
+    }
     messagesState.settingsBootstrapSnapshot = latest;
   }
 

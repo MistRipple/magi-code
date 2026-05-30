@@ -55,6 +55,7 @@ import {
   handleRetryRuntimePayload,
 } from './message-utils';
 import { buildEmptyWorkspaceAppState } from '../shared/bridges/empty-workspace-state';
+import { settingsBootstrapMatchesCurrentWorkspace } from '../web/agent-api';
 import type { CanonicalTurn, CanonicalTurnEvent } from '../shared/protocol/canonical-turn';
 import { isCanonicalTerminalStatus } from '../shared/protocol/canonical-turn';
 import { deriveProcessingStateFromCanonicalTurns } from '../shared/protocol/canonical-processing';
@@ -1043,9 +1044,13 @@ function handleWorkerStatusUpdate(message: ClientBridgeMessage) {
 
 function handleSettingsBootstrapLoaded(message: ClientBridgeMessage) {
   const store = getState();
-  store.settingsBootstrapSnapshot = {
+  const snapshot = {
     ...message,
   } as unknown as SettingsBootstrapSnapshot;
+  if (!settingsBootstrapMatchesCurrentWorkspace(snapshot)) {
+    return;
+  }
+  store.settingsBootstrapSnapshot = snapshot;
 
   handleWorkerStatusUpdate({
     statuses: message.workerStatuses,

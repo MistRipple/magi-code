@@ -28,6 +28,7 @@ import {
   removeAgentRegistryEngine,
   scanAgentLocalSkillDirectory,
   resetAgentExecutionStats,
+  settingsBootstrapMatchesCurrentWorkspace,
   saveAgentAuxiliaryConfig,
   saveAgentUserRules,
   saveAgentSafeguardConfig,
@@ -996,13 +997,21 @@ function createSettingsStore(props: { onClose?: () => void }) {
     );
   }
 
+  async function fetchCurrentSettingsBootstrap(
+    options: { scope?: SettingsBootstrapScope } = {},
+  ): Promise<AgentSettingsBootstrapSnapshot | null> {
+    const payload = await getAgentSettingsBootstrap(options);
+    return settingsBootstrapMatchesCurrentWorkspace(payload) ? payload : null;
+  }
+
   async function refreshSettingsBootstrapFromApi(scope: SettingsBootstrapScope = "core"): Promise<void> {
     const hydratesMcpState = scope === "full";
     if (hydratesMcpState) {
       mcpServersLoading = true;
     }
     try {
-      const payload = await getAgentSettingsBootstrap({ scope });
+      const payload = await fetchCurrentSettingsBootstrap({ scope });
+      if (!payload) return;
       appState.settingsBootstrapSnapshot = payload;
       applySettingsBootstrapPayload(payload);
     } catch (e) {
@@ -1025,10 +1034,13 @@ function createSettingsStore(props: { onClose?: () => void }) {
       ? (appState.settingsBootstrapSnapshot as AgentSettingsBootstrapSnapshot | null)
       : null;
 
-    if (cachedSnapshot) {
+    if (cachedSnapshot && settingsBootstrapMatchesCurrentWorkspace(cachedSnapshot)) {
       applySettingsBootstrapPayload(cachedSnapshot, { allowLocaleHydration: false });
       void refreshSettingsBootstrapFromApi();
       return;
+    }
+    if (cachedSnapshot) {
+      appState.settingsBootstrapSnapshot = null;
     }
 
     await refreshSettingsBootstrapFromApi(scope);
@@ -1726,8 +1738,10 @@ function createSettingsStore(props: { onClose?: () => void }) {
     if (savedCount > 0) {
       // 保存成功后刷新 MCP 列表
       try {
-        const payload = await getAgentSettingsBootstrap();
-        applyMcpServersPayload(payload.mcpServers);
+        const payload = await fetchCurrentSettingsBootstrap();
+        if (payload) {
+          applyMcpServersPayload(payload.mcpServers);
+        }
       } catch (_) {
         /* 忽略刷新失败 */
       }
@@ -1750,8 +1764,10 @@ function createSettingsStore(props: { onClose?: () => void }) {
       async () => {
         try {
           await deleteAgentMcpServer(serverId);
-          const payload = await getAgentSettingsBootstrap();
-          applyMcpServersPayload(payload.mcpServers);
+          const payload = await fetchCurrentSettingsBootstrap();
+          if (payload) {
+            applyMcpServersPayload(payload.mcpServers);
+          }
           notifySettingsSuccess(i18n.t("settings.toast.mcpServerDeleted"));
         } catch (e) {
           console.error("[SettingsPanel] 删除 MCP 服务器失败:", e);
@@ -1766,8 +1782,10 @@ function createSettingsStore(props: { onClose?: () => void }) {
     if (server) {
       try {
         await updateAgentMcpServer(serverId, { ...server, enabled: !enabled });
-        const payload = await getAgentSettingsBootstrap();
-        applyMcpServersPayload(payload.mcpServers);
+        const payload = await fetchCurrentSettingsBootstrap();
+        if (payload) {
+          applyMcpServersPayload(payload.mcpServers);
+        }
         notifySettingsSuccess(i18n.t("settings.toast.mcpServerStatusUpdated"));
       } catch (e) {
         console.error("[SettingsPanel] 切换 MCP 服务器状态失败:", e);
@@ -1867,8 +1885,10 @@ function createSettingsStore(props: { onClose?: () => void }) {
       if ((result as any)?.success !== false) {
         repoAddUrl = "";
         // 刷新仓库列表
-        const payload = await getAgentSettingsBootstrap();
-        applyRepositoriesPayload(payload.repositories);
+        const payload = await fetchCurrentSettingsBootstrap();
+        if (payload) {
+          applyRepositoriesPayload(payload.repositories);
+        }
         notifySettingsSuccess(i18n.t("settings.toast.repositoryAdded"));
       }
     } catch (e) {
@@ -1885,8 +1905,10 @@ function createSettingsStore(props: { onClose?: () => void }) {
       async () => {
         try {
           await deleteAgentRepository(repositoryId);
-          const payload = await getAgentSettingsBootstrap();
-          applyRepositoriesPayload(payload.repositories);
+          const payload = await fetchCurrentSettingsBootstrap();
+          if (payload) {
+            applyRepositoriesPayload(payload.repositories);
+          }
           notifySettingsSuccess(i18n.t("settings.toast.repositoryDeleted"));
         } catch (e) {
           console.error("[SettingsPanel] 删除仓库失败:", e);
@@ -1968,8 +1990,10 @@ function createSettingsStore(props: { onClose?: () => void }) {
           librarySkills = librarySkills.map((s) =>
             s.fullName === skillFullName ? { ...s, installed: true } : s
           );
-          const bootstrapPayload = await getAgentSettingsBootstrap();
-          applySkillsConfig(bootstrapPayload.skillsConfig);
+          const bootstrapPayload = await fetchCurrentSettingsBootstrap();
+          if (bootstrapPayload) {
+            applySkillsConfig(bootstrapPayload.skillsConfig);
+          }
           notifySettingsSuccess(i18n.t("settings.toast.localSkillInstalled"));
         }
       } else {
@@ -1998,8 +2022,10 @@ function createSettingsStore(props: { onClose?: () => void }) {
             })),
             ...localEntries,
           ];
-          const bootstrapPayload = await getAgentSettingsBootstrap();
-          applySkillsConfig(bootstrapPayload.skillsConfig);
+          const bootstrapPayload = await fetchCurrentSettingsBootstrap();
+          if (bootstrapPayload) {
+            applySkillsConfig(bootstrapPayload.skillsConfig);
+          }
           notifySettingsSuccess(i18n.t("settings.toast.skillInstalled"));
         }
       }
@@ -2029,8 +2055,10 @@ function createSettingsStore(props: { onClose?: () => void }) {
           localSkillInstallError = "";
         } else if ((result as any)?.success !== false) {
           localSkillInstallError = "";
-          const bootstrapPayload = await getAgentSettingsBootstrap();
-          applySkillsConfig(bootstrapPayload.skillsConfig);
+          const bootstrapPayload = await fetchCurrentSettingsBootstrap();
+          if (bootstrapPayload) {
+            applySkillsConfig(bootstrapPayload.skillsConfig);
+          }
           showSkillLibraryDialogState = false;
           notifySettingsSuccess(i18n.t("settings.toast.localSkillInstalled"));
         } else {
@@ -2127,8 +2155,10 @@ function createSettingsStore(props: { onClose?: () => void }) {
       async () => {
         try {
           await removeAgentInstalledSkill(skill.name, skill.source);
-          const payload = await getAgentSettingsBootstrap();
-          applySkillsConfig(payload.skillsConfig);
+          const payload = await fetchCurrentSettingsBootstrap();
+          if (payload) {
+            applySkillsConfig(payload.skillsConfig);
+          }
           notifySettingsSuccess(successText);
         } catch (e) {
           console.error(`[SettingsPanel] ${errorText}失败:`, e);

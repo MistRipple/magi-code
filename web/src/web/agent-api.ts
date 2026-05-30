@@ -130,6 +130,10 @@ function normalizeNullableString(value: unknown): string | null {
   return typeof value === 'string' && value.trim() ? value.trim() : null;
 }
 
+function normalizeBindingString(value: unknown): string {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
 function normalizeRequiredBy(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
   return value
@@ -178,6 +182,8 @@ function normalizeSettingsBootstrapPayload(
   ) as SettingsRuntimeSnapshot;
 
   return {
+    workspaceId: normalizeBindingString(payload.workspaceId ?? payload.workspace_id),
+    workspacePath: normalizeBindingString(payload.workspacePath ?? payload.workspace_path),
     workerConfigs: (
       payload.workerConfigs
       && typeof payload.workerConfigs === 'object'
@@ -218,6 +224,23 @@ function normalizeSettingsBootstrapPayload(
     bootstrapScope: payload.bootstrapScope === 'core' ? 'core' : 'full',
     mcpServersHydrated: payload.mcpServersHydrated !== false,
   };
+}
+
+export function resolveAgentWorkspaceBindingContext(): AgentWorkspaceBindingContext {
+  const binding = resolveAgentBindingContext();
+  return {
+    workspaceId: binding.workspaceId,
+    workspacePath: binding.workspacePath,
+  };
+}
+
+export function settingsBootstrapMatchesCurrentWorkspace(
+  snapshot: Pick<SettingsBootstrapPayload, 'workspaceId' | 'workspacePath'> | null | undefined,
+): boolean {
+  if (!snapshot) return false;
+  const binding = resolveAgentWorkspaceBindingContext();
+  return normalizeBindingString(snapshot.workspaceId) === binding.workspaceId
+    && normalizeBindingString(snapshot.workspacePath) === binding.workspacePath;
 }
 
 export interface AgentExecutionStatsItem {
@@ -339,6 +362,11 @@ interface AgentBindingContext {
   workspaceId: string;
   workspacePath: string;
   sessionId: string;
+}
+
+export interface AgentWorkspaceBindingContext {
+  workspaceId: string;
+  workspacePath: string;
 }
 
 export interface AgentNotificationScope {

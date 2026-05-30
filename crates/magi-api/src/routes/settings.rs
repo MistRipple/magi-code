@@ -634,12 +634,19 @@ async fn settings_bootstrap(
         .map(|value| value.trim())
         .is_none_or(|scope| scope != "core");
     let tool_context = settings_bootstrap_tool_context(&query);
-    Json(
-        state.settings_snapshot_json_with_mcp_hydration_and_tool_context(
-            hydrate_mcp_servers,
-            &tool_context,
-        ),
-    )
+    let workspace_id =
+        parse_optional_query_string(&query, "workspaceId", "workspace_id").unwrap_or_default();
+    let workspace_path =
+        parse_optional_query_string(&query, "workspacePath", "workspace_path").unwrap_or_default();
+    let mut snapshot = state.settings_snapshot_json_with_mcp_hydration_and_tool_context(
+        hydrate_mcp_servers,
+        &tool_context,
+    );
+    if let Some(object) = snapshot.as_object_mut() {
+        object.insert("workspaceId".to_string(), Value::String(workspace_id));
+        object.insert("workspacePath".to_string(), Value::String(workspace_path));
+    }
+    Json(snapshot)
 }
 
 fn settings_bootstrap_tool_context(query: &HashMap<String, String>) -> ToolExecutionContext {
@@ -1252,10 +1259,14 @@ mod tests {
 
         let bootstrap = settings_bootstrap(
             State(state),
-            Query(HashMap::from([(
-                "sessionId".to_string(),
-                session_id.as_str().to_string(),
-            )])),
+            Query(HashMap::from([
+                ("sessionId".to_string(), session_id.as_str().to_string()),
+                ("workspaceId".to_string(), "workspace-contract".to_string()),
+                (
+                    "workspacePath".to_string(),
+                    "/tmp/magi-settings-contract".to_string(),
+                ),
+            ])),
         )
         .await
         .0;
@@ -1275,6 +1286,11 @@ mod tests {
         ] {
             assert!(bootstrap[key].is_object(), "{key} should be an object");
         }
+        assert_eq!(bootstrap["workspaceId"], json!("workspace-contract"));
+        assert_eq!(
+            bootstrap["workspacePath"],
+            json!("/tmp/magi-settings-contract")
+        );
         for key in [
             "repositories",
             "mcpServers",
