@@ -1,5 +1,5 @@
 use axum::response::sse::{Event, KeepAlive, Sse};
-use futures_util::{StreamExt, stream};
+use futures_util::{Stream, StreamExt, stream};
 use magi_core::{EventId, UtcMillis, WorkspaceId};
 use magi_event_bus::{EventContext, EventEnvelope};
 use std::{convert::Infallible, time::Duration};
@@ -15,20 +15,27 @@ pub async fn events(
         .map(|workspace_id| workspace_id.trim().to_string())
         .filter(|workspace_id| !workspace_id.is_empty())
         .map(|workspace_id| WorkspaceId::new(workspace_id));
+    let stream = event_envelope_stream(state, workspace_id).map(|event| Ok(event_to_sse(event)));
+
+    Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("keep-alive"),
+    )
+}
+
+fn event_envelope_stream(
+    state: ApiState,
+    workspace_id: Option<WorkspaceId>,
+) -> impl Stream<Item = EventEnvelope> {
     let (snapshot, receiver) = state.event_bus.snapshot_and_subscribe();
     let snapshot_state = state.clone();
     let live_state = state;
     let snapshot_workspace_id = workspace_id.clone();
     let live_workspace_id = workspace_id;
-    let recent_stream = stream::iter(
-        snapshot
-            .recent_events
-            .into_iter()
-            .filter(move |event| {
-                event_matches_workspace(&snapshot_state, event, snapshot_workspace_id.as_ref())
-            })
-            .map(|event| Ok(event_to_sse(event))),
-    );
+    let recent_stream = stream::iter(snapshot.recent_events.into_iter().filter(move |event| {
+        event_matches_workspace(&snapshot_state, event, snapshot_workspace_id.as_ref())
+    }));
     let live_stream = BroadcastStream::new(receiver).filter_map(move |event| {
         let live_state = live_state.clone();
         let live_workspace_id = live_workspace_id.clone();
@@ -36,21 +43,15 @@ pub async fn events(
             match event {
                 Ok(envelope) => {
                     event_matches_workspace(&live_state, &envelope, live_workspace_id.as_ref())
-                        .then(|| Ok(event_to_sse(envelope)))
+                        .then_some(envelope)
                 }
-                Err(BroadcastStreamRecvError::Lagged(skipped)) => Some(Ok(event_to_sse(
-                    lagged_recovery_event(skipped, live_workspace_id.as_ref()),
-                ))),
+                Err(BroadcastStreamRecvError::Lagged(skipped)) => {
+                    Some(lagged_recovery_event(skipped, live_workspace_id.as_ref()))
+                }
             }
         }
     });
-    let stream = recent_stream.chain(live_stream);
-
-    Sse::new(stream).keep_alive(
-        KeepAlive::new()
-            .interval(Duration::from_secs(15))
-            .text("keep-alive"),
-    )
+    recent_stream.chain(live_stream)
 }
 
 fn event_matches_workspace(
@@ -112,9 +113,13 @@ mod tests {
     use std::sync::Arc;
 
     fn test_state() -> ApiState {
+        test_state_with_event_capacity(32)
+    }
+
+    fn test_state_with_event_capacity(event_capacity: usize) -> ApiState {
         ApiState::new(
             "magi-sse-test",
-            Arc::new(InMemoryEventBus::new(32)),
+            Arc::new(InMemoryEventBus::new(event_capacity)),
             Arc::new(SessionStore::default()),
             Arc::new(WorkspaceStore::default()),
             Arc::new(GovernanceService::default()),
@@ -235,5 +240,46 @@ mod tests {
         assert_eq!(event.workspace_id.as_ref(), Some(&workspace));
         assert_eq!(event.payload["skipped"], json!(7));
         assert_eq!(event.payload["recovery"], json!("bootstrap"));
+    }
+
+    #[tokio::test]
+    async fn event_stream_emits_lagged_recovery_event_when_receiver_falls_behind() {
+        let state = test_state_with_event_capacity(2);
+        let workspace = workspace_id("workspace-lagged-stream");
+        let mut events = Box::pin(event_envelope_stream(
+            state.clone(),
+            Some(workspace.clone()),
+        ));
+
+        for index in 0..8 {
+            state
+                .event_bus
+                .publish(
+                    EventEnvelope::domain(
+                        EventId::new(format!("event-sse-lagged-{index}")),
+                        "message.created",
+                        json!({ "index": index }),
+                    )
+                    .with_context(EventContext {
+                        workspace_id: Some(workspace.clone()),
+                        ..EventContext::default()
+                    }),
+                )
+                .expect("event should publish");
+        }
+
+        let event = tokio::time::timeout(Duration::from_secs(1), events.next())
+            .await
+            .expect("lagged recovery event should arrive")
+            .expect("stream should stay open");
+
+        assert_eq!(event.event_type, "event.stream.lagged");
+        assert_eq!(event.workspace_id.as_ref(), Some(&workspace));
+        assert_eq!(event.payload["reason"], json!("broadcast_lagged"));
+        assert_eq!(event.payload["recovery"], json!("bootstrap"));
+        assert!(
+            event.payload["skipped"].as_u64().unwrap_or_default() > 0,
+            "lagged event should expose skipped event count"
+        );
     }
 }
