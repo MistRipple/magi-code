@@ -1,9 +1,10 @@
 //! 任务系统 — L7 Permissions：三维（工具 / 目录 / 命令）× 产品级访问模式
 //! （read_only / restricted / full_access）权限引擎。
 //!
-//! 目标：把 read-only 判定、工具白名单、shell 命令写入识别、Task.policy
+//! 目标：把工具类别判定、工具白名单、shell 命令写入识别、Task.policy
 //! 中的 allow/deny 列表统一收敛到一个 `PermissionEngine`，
 //! 让 Conversation/Task 在调用工具或访问路径前都经过同一份判定。
+//! 具体产品的工具名分类由调用方注入；本 crate 不硬编码 Magi 内置工具清单。
 //!
 //! 设计要点：
 //! - 三个 axis 分别对应一种 `PermissionRequest`：
@@ -122,15 +123,6 @@ pub struct PermissionEngine {
 }
 
 impl PermissionEngine {
-    /// 默认构造：注入内置的"已知只读"工具名 + "已知编辑"工具名。
-    /// 这两份名单是 magi 内置工具语义的客观分类，可被 caller 通过 builder 扩展。
-    pub fn with_builtin_defaults() -> Self {
-        Self {
-            read_only_tools: BUILTIN_READ_ONLY_TOOLS.iter().copied().collect(),
-            edit_tools: BUILTIN_EDIT_TOOLS.iter().copied().collect(),
-        }
-    }
-
     pub fn register_read_only_tool(&mut self, name: &'static str) {
         self.read_only_tools.insert(name);
     }
@@ -294,46 +286,18 @@ fn path_is_within(target: &Path, root: &Path) -> bool {
     target.starts_with(root)
 }
 
-/// 内置只读工具名，供权限判定与 dedup 逻辑共享。
-const BUILTIN_READ_ONLY_TOOLS: &[&str] = &[
-    "file_read",
-    "file_view",
-    "view_image",
-    "image_view",
-    "search_text",
-    "code_search_regex",
-    "search_semantic",
-    "code_search_semantic",
-    "diff_preview",
-    "web_search",
-    "web_fetch",
-    "diagram_render",
-    "knowledge_query",
-    "project_knowledge_query",
-    "code_symbols",
-    "tool_catalog",
-    "tool_diagnostics",
-    "process_inspect",
-];
-
-/// 编辑类写入工具：受限执行模式下自动放行的子集，shell 等其他写入工具
-/// 不在此列。
-const BUILTIN_EDIT_TOOLS: &[&str] = &[
-    "file_write",
-    "file_create",
-    "file_patch",
-    "file_edit",
-    "file_insert",
-    "apply_patch",
-    "file_remove",
-    "file_mkdir",
-    "file_copy",
-    "file_move",
-];
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn engine_with_test_tools() -> PermissionEngine {
+        let mut engine = PermissionEngine::default();
+        engine.register_read_only_tool("file_view");
+        engine.register_edit_tool("file_edit");
+        engine.register_edit_tool("file_write");
+        engine.register_edit_tool("apply_patch");
+        engine
+    }
 
     fn policy_empty() -> PermissionPolicy {
         PermissionPolicy::default()
@@ -347,7 +311,7 @@ mod tests {
 
     #[test]
     fn full_access_does_not_override_read_only_command_policy() {
-        let engine = PermissionEngine::with_builtin_defaults();
+        let engine = engine_with_test_tools();
         let policy = policy_read_only();
         let req = PermissionRequest::ToolInvocation {
             tool_name: "file_edit",
@@ -359,7 +323,7 @@ mod tests {
 
     #[test]
     fn denied_tool_takes_precedence_over_allow_list() {
-        let engine = PermissionEngine::with_builtin_defaults();
+        let engine = engine_with_test_tools();
         let mut policy = policy_empty();
         policy.denied_tools.insert("file_edit".to_string());
         policy.allowed_tools.insert("file_edit".to_string());
@@ -373,7 +337,7 @@ mod tests {
 
     #[test]
     fn allow_list_excludes_unlisted_tool() {
-        let engine = PermissionEngine::with_builtin_defaults();
+        let engine = engine_with_test_tools();
         let mut policy = policy_empty();
         policy.allowed_tools.insert("file_view".to_string());
         let req = PermissionRequest::ToolInvocation {
@@ -386,7 +350,7 @@ mod tests {
 
     #[test]
     fn read_only_policy_blocks_write_tool() {
-        let engine = PermissionEngine::with_builtin_defaults();
+        let engine = engine_with_test_tools();
         let policy = policy_read_only();
         let req = PermissionRequest::ToolInvocation {
             tool_name: "file_edit",
@@ -398,7 +362,7 @@ mod tests {
 
     #[test]
     fn read_only_profile_denies_write_tool() {
-        let engine = PermissionEngine::with_builtin_defaults();
+        let engine = engine_with_test_tools();
         let policy = policy_empty();
         let req = PermissionRequest::ToolInvocation {
             tool_name: "file_edit",
@@ -410,7 +374,7 @@ mod tests {
 
     #[test]
     fn restricted_profile_passes_edit_tool_blocks_shell() {
-        let engine = PermissionEngine::with_builtin_defaults();
+        let engine = engine_with_test_tools();
         let policy = policy_empty();
         let edit_req = PermissionRequest::ToolInvocation {
             tool_name: "file_edit",
@@ -446,7 +410,7 @@ mod tests {
 
     #[test]
     fn path_within_denied_root_is_rejected() {
-        let engine = PermissionEngine::with_builtin_defaults();
+        let engine = engine_with_test_tools();
         let mut policy = policy_empty();
         policy.denied_paths.push(PathBuf::from("/etc"));
         let path = PathBuf::from("/etc/passwd");
@@ -460,7 +424,7 @@ mod tests {
 
     #[test]
     fn path_outside_allow_list_is_rejected() {
-        let engine = PermissionEngine::with_builtin_defaults();
+        let engine = engine_with_test_tools();
         let mut policy = policy_empty();
         policy.allowed_paths.push(PathBuf::from("/work"));
         let path = PathBuf::from("/secret/file");
@@ -474,7 +438,7 @@ mod tests {
 
     #[test]
     fn shell_read_only_passes_in_read_only_policy() {
-        let engine = PermissionEngine::with_builtin_defaults();
+        let engine = engine_with_test_tools();
         let policy = policy_read_only();
         let args = r#"{"command":"ls","access_mode":"read_only"}"#;
         let req = PermissionRequest::ShellCommand {
@@ -486,7 +450,7 @@ mod tests {
 
     #[test]
     fn shell_writes_blocked_in_read_only_policy() {
-        let engine = PermissionEngine::with_builtin_defaults();
+        let engine = engine_with_test_tools();
         let policy = policy_read_only();
         let args = r#"{"command":"rm -rf /tmp/foo"}"#;
         let req = PermissionRequest::ShellCommand {
@@ -497,16 +461,15 @@ mod tests {
     }
 
     #[test]
-    fn builtin_read_only_tools_recognised() {
-        let engine = PermissionEngine::with_builtin_defaults();
-        for tool in BUILTIN_READ_ONLY_TOOLS {
-            assert!(engine.is_read_only_tool(tool), "{tool} should be read-only");
-        }
+    fn registered_read_only_tools_recognised() {
+        let engine = engine_with_test_tools();
+        assert!(engine.is_read_only_tool("file_view"));
+        assert!(!engine.is_read_only_tool("file_edit"));
     }
 
     #[test]
     fn full_access_allows_write_shell_without_permission_approval() {
-        let engine = PermissionEngine::with_builtin_defaults();
+        let engine = engine_with_test_tools();
         let policy = policy_empty();
         let args = r#"{"command":"printf hi > out.txt"}"#;
         let req = PermissionRequest::ShellCommand {

@@ -115,17 +115,13 @@ impl ToolRegistry {
         let Some(tool_name) = crate::BuiltinToolName::from_str(input.tool_name.trim()) else {
             return BuiltinToolAccessMode::ReadOnly;
         };
-        if tool_name == crate::BuiltinToolName::ShellExec
-            || tool_name == crate::BuiltinToolName::ProcessLaunch
-        {
+        let default_access_mode = tool_name.default_access_mode();
+        if default_access_mode == BuiltinToolAccessMode::MaybeWrite {
             return self
                 .parse_requested_access_mode(&input.input)
-                .unwrap_or(BuiltinToolAccessMode::MaybeWrite);
+                .unwrap_or(default_access_mode);
         }
-        if tool_name.is_write_operation() {
-            return BuiltinToolAccessMode::ExplicitWrite;
-        }
-        BuiltinToolAccessMode::ReadOnly
+        default_access_mode
     }
 
     pub(crate) fn parse_requested_access_mode(&self, input: &str) -> Option<BuiltinToolAccessMode> {

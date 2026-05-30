@@ -27,7 +27,10 @@ use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
 use magi_orchestrator::task_store::TaskStore;
 use magi_session_store::SessionStore;
 use magi_snapshot::{SnapshotSession, ToolHook, ToolHookCtx};
-use magi_tool_runtime::{BuiltinToolName, ToolExecutionContext, ToolExecutionInput, ToolRegistry};
+use magi_tool_runtime::{
+    BuiltinToolName, ToolExecutionContext, ToolExecutionInput, ToolRegistry,
+    builtin_permission_engine, canonical_builtin_tool_name,
+};
 
 use crate::builtin_tool_schema::internal_builtin_tool_rejection_payload;
 use crate::skill_apply_tool::{SKILL_APPLY_TOOL_NAME, execute_skill_apply_from_runtime};
@@ -1648,7 +1651,7 @@ pub(crate) fn access_profile_tool_decision(
         command_mode: command_mode.to_string(),
         ..magi_permissions::PermissionPolicy::default()
     };
-    let engine = magi_permissions::PermissionEngine::with_builtin_defaults();
+    let engine = builtin_permission_engine();
     let is_write_tool = BuiltinToolName::from_str(canonical_tool_name.as_str())
         .is_some_and(|tool| tool.is_write_operation());
 
@@ -1717,10 +1720,6 @@ fn permission_decision_payload(
             Some(access_profile),
         )),
     }
-}
-
-fn canonical_builtin_tool_name(tool_name: &str) -> Option<String> {
-    BuiltinToolName::from_str(tool_name.trim()).map(|tool| tool.as_str().to_string())
 }
 
 fn task_policy_decision_payload(

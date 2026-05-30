@@ -158,16 +158,7 @@ pub(crate) fn execute_tool_catalog(
 }
 
 fn access_mode_for_tool(tool: BuiltinToolName) -> BuiltinToolAccessMode {
-    if matches!(
-        tool,
-        BuiltinToolName::ShellExec | BuiltinToolName::ProcessLaunch
-    ) {
-        BuiltinToolAccessMode::MaybeWrite
-    } else if tool.is_write_operation() {
-        BuiltinToolAccessMode::ExplicitWrite
-    } else {
-        BuiltinToolAccessMode::ReadOnly
-    }
+    tool.default_access_mode()
 }
 
 fn risk_level_label(tool: BuiltinToolName) -> &'static str {

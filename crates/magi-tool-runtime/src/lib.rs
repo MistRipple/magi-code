@@ -301,6 +301,16 @@ impl BuiltinToolName {
         )
     }
 
+    pub fn default_access_mode(&self) -> BuiltinToolAccessMode {
+        if matches!(self, Self::ShellExec | Self::ProcessLaunch) {
+            BuiltinToolAccessMode::MaybeWrite
+        } else if self.is_write_operation() {
+            BuiltinToolAccessMode::ExplicitWrite
+        } else {
+            BuiltinToolAccessMode::ReadOnly
+        }
+    }
+
     fn captures_workspace_changes(&self) -> bool {
         self.is_write_operation() || matches!(self, Self::ShellExec)
     }
@@ -1249,6 +1259,22 @@ pub fn is_internal_builtin_tool_surface(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+pub fn canonical_builtin_tool_name(name: &str) -> Option<String> {
+    BuiltinToolName::from_str(name.trim()).map(|tool| tool.as_str().to_string())
+}
+
+pub fn builtin_permission_engine() -> magi_permissions::PermissionEngine {
+    let mut engine = magi_permissions::PermissionEngine::default();
+    for tool in BuiltinToolName::ALL {
+        match tool.default_access_mode() {
+            BuiltinToolAccessMode::ReadOnly => engine.register_read_only_tool(tool.as_str()),
+            BuiltinToolAccessMode::ExplicitWrite => engine.register_edit_tool(tool.as_str()),
+            BuiltinToolAccessMode::MaybeWrite => {}
+        }
+    }
+    engine
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BuiltinToolSpec {
     pub name: String,
@@ -1649,16 +1675,8 @@ impl ToolRegistry {
     pub fn builtin_access_mode(&self, tool_name: &str) -> Option<BuiltinToolAccessMode> {
         self.builtin_tools
             .get(tool_name)
-            .map(|_| match BuiltinToolName::from_str(tool_name) {
-                Some(name)
-                    if name == BuiltinToolName::ShellExec
-                        || name == BuiltinToolName::ProcessLaunch =>
-                {
-                    BuiltinToolAccessMode::MaybeWrite
-                }
-                Some(name) if name.is_write_operation() => BuiltinToolAccessMode::ExplicitWrite,
-                _ => BuiltinToolAccessMode::ReadOnly,
-            })
+            .and_then(|_| BuiltinToolName::from_str(tool_name))
+            .map(|name| name.default_access_mode())
     }
 
     /// 根据允许/拒绝列表创建过滤后的工具注册表副本。
@@ -4646,6 +4664,19 @@ mod tests {
     }
 
     #[test]
+    fn canonical_builtin_tool_name_uses_builtin_aliases() {
+        assert_eq!(
+            canonical_builtin_tool_name("file_edit"),
+            Some("file_patch".to_string())
+        );
+        assert_eq!(
+            canonical_builtin_tool_name("tool_diagnostics"),
+            Some("tool_catalog".to_string())
+        );
+        assert_eq!(canonical_builtin_tool_name("unknown_tool"), None);
+    }
+
+    #[test]
     fn is_write_operation_identifies_correct_tools() {
         let write_ops = [
             BuiltinToolName::FileWrite,
@@ -4672,6 +4703,41 @@ mod tests {
         for tool in &non_write {
             assert!(!tool.is_write_operation(), "{:?} should not be write", tool);
         }
+    }
+
+    #[test]
+    fn builtin_permission_engine_uses_builtin_access_modes() {
+        let engine = builtin_permission_engine();
+        let policy = magi_permissions::PermissionPolicy::default();
+
+        let patch_request = magi_permissions::PermissionRequest::ToolInvocation {
+            tool_name: BuiltinToolName::FilePatch.as_str(),
+            is_write_tool: true,
+        };
+        assert_eq!(
+            engine.decide(
+                &patch_request,
+                &policy,
+                magi_core::AccessProfile::Restricted
+            ),
+            magi_permissions::Decision::Allow
+        );
+
+        let shell_request = magi_permissions::PermissionRequest::ToolInvocation {
+            tool_name: BuiltinToolName::ShellExec.as_str(),
+            is_write_tool: true,
+        };
+        assert!(matches!(
+            engine.decide(
+                &shell_request,
+                &policy,
+                magi_core::AccessProfile::Restricted
+            ),
+            magi_permissions::Decision::NeedsApproval { .. }
+        ));
+
+        assert!(engine.is_read_only_tool(BuiltinToolName::ToolCatalog.as_str()));
+        assert!(!engine.is_read_only_tool("tool_diagnostics"));
     }
 
     // ── diagram.render 验证 ──

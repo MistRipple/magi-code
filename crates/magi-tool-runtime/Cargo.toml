@@ -10,6 +10,7 @@ magi-core = { path = "../magi-core" }
 magi-event-bus = { path = "../magi-event-bus" }
 magi-governance = { path = "../magi-governance" }
 magi-knowledge-store = { path = "../magi-knowledge-store" }
+magi-permissions = { path = "../magi-permissions" }
 reqwest = { workspace = true, features = ["blocking"] }
 regex = "1"
 urlencoding = "2"
