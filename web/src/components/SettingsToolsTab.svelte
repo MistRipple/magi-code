@@ -51,41 +51,17 @@
     deleteSkill: (skill: any) => void;
   }>();
 
-  const BUILTIN_TOOL_LABELS: Record<string, string> = {
-    file_read: 'settings.tools.builtin.fileRead',
-    view_image: 'settings.tools.builtin.viewImage',
-    file_write: 'settings.tools.builtin.fileWrite',
-    file_patch: 'settings.tools.builtin.filePatch',
-    apply_patch: 'settings.tools.builtin.applyPatch',
-    file_remove: 'settings.tools.builtin.fileRemove',
-    file_mkdir: 'settings.tools.builtin.fileMkdir',
-    file_copy: 'settings.tools.builtin.fileCopy',
-    file_move: 'settings.tools.builtin.fileMove',
-    search_text: 'settings.tools.builtin.searchText',
-    search_semantic: 'settings.tools.builtin.searchSemantic',
-    shell_exec: 'settings.tools.builtin.shellExec',
-    process_inspect: 'settings.tools.builtin.processInspect',
-    diff_preview: 'settings.tools.builtin.diffPreview',
-    web_search: 'settings.tools.builtin.webSearch',
-    web_fetch: 'settings.tools.builtin.webFetch',
-    diagram_render: 'settings.tools.builtin.diagramRender',
-    knowledge_query: 'settings.tools.builtin.knowledgeQuery',
-    code_symbols: 'settings.tools.builtin.codeSymbols',
-    tool_catalog: 'settings.tools.builtin.toolCatalog',
-    agent_spawn: 'settings.tools.builtin.agentSpawn',
-    agent_wait: 'settings.tools.builtin.agentWait',
-    todo_write: 'settings.tools.builtin.todoWrite',
-    memory_write: 'settings.tools.builtin.memoryWrite',
-    mission_charter_write: 'settings.tools.builtin.missionCharterWrite',
-    plan_write: 'settings.tools.builtin.planWrite',
-    kg_write: 'settings.tools.builtin.kgWrite',
-    validation_record: 'settings.tools.builtin.validationRecord',
-    checkpoint_create: 'settings.tools.builtin.checkpointCreate',
-    human_checkpoint_request: 'settings.tools.builtin.humanCheckpointRequest',
-  };
+  function builtinToolI18nKey(name: string): string {
+    const suffix = name
+      .split('_')
+      .filter(Boolean)
+      .map((part, index) => index === 0 ? part : part.charAt(0).toUpperCase() + part.slice(1))
+      .join('');
+    return suffix ? `settings.tools.builtin.${suffix}` : '';
+  }
 
   function getBuiltinToolLabel(name: string): string {
-    const key = BUILTIN_TOOL_LABELS[name];
+    const key = builtinToolI18nKey(name);
     return key ? i18n.t(key) : name;
   }
 
