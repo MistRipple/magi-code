@@ -138,16 +138,17 @@ fn resolve_bootstrap_workspace_id(
     requested_workspace_path: Option<String>,
     requested_session_id: Option<&SessionId>,
 ) -> Option<String> {
-    if let Some(workspace_id) = state.resolve_workspace_id_from_request(
+    let requested_workspace_id = state.resolve_workspace_id_from_request(
         requested_workspace_id.map(WorkspaceId::new),
         requested_workspace_path.as_deref(),
-    ) {
-        return Some(workspace_id.to_string());
-    }
+    );
     if let Some(session_id) = requested_session_id
         && let Some(session) = state.session_store.session(session_id)
         && let Some(workspace_id) = session_scope::session_workspace_id(state, &session)
     {
+        return Some(workspace_id.to_string());
+    }
+    if let Some(workspace_id) = requested_workspace_id {
         return Some(workspace_id.to_string());
     }
     state
@@ -193,4 +194,64 @@ async fn stream_events(
     Query(query): Query<EventStreamQuery>,
 ) -> impl axum::response::IntoResponse {
     sse::events(state, query.workspace_id).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use magi_core::AbsolutePath;
+    use magi_event_bus::InMemoryEventBus;
+    use magi_governance::GovernanceService;
+    use magi_session_store::SessionStore;
+    use magi_workspace::WorkspaceStore;
+    use std::sync::Arc;
+
+    fn test_state() -> ApiState {
+        ApiState::new(
+            "magi-test",
+            Arc::new(InMemoryEventBus::new(32)),
+            Arc::new(SessionStore::default()),
+            Arc::new(WorkspaceStore::default()),
+            Arc::new(GovernanceService::default()),
+        )
+    }
+
+    #[test]
+    fn bootstrap_workspace_resolution_prefers_requested_session_workspace() {
+        let state = test_state();
+        let workspace_a = WorkspaceId::new("workspace-bootstrap-url-a");
+        let workspace_b = WorkspaceId::new("workspace-bootstrap-url-b");
+        state
+            .workspace_registry
+            .register(
+                workspace_a.clone(),
+                AbsolutePath::new("/tmp/magi-bootstrap-url-a"),
+            )
+            .expect("workspace A should register");
+        state
+            .workspace_registry
+            .register(
+                workspace_b.clone(),
+                AbsolutePath::new("/tmp/magi-bootstrap-url-b"),
+            )
+            .expect("workspace B should register");
+        let session_b = SessionId::new("session-bootstrap-url-b");
+        state
+            .session_store
+            .create_session_for_workspace(
+                session_b.clone(),
+                "B 会话",
+                Some(workspace_b.to_string()),
+            )
+            .expect("session B should create");
+
+        let resolved = resolve_bootstrap_workspace_id(
+            &state,
+            Some(workspace_a.to_string()),
+            None,
+            Some(&session_b),
+        );
+
+        assert_eq!(resolved.as_deref(), Some(workspace_b.as_str()));
+    }
 }
