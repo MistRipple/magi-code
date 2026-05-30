@@ -58,7 +58,6 @@ const AGENT_SPAWN_INHERITED_INPUT_REF_MAX: usize = 16;
 const AGENT_WAIT_DEFAULT_TIMEOUT_MS: u64 = 300_000;
 const AGENT_WAIT_MIN_TIMEOUT_MS: u64 = 1_000;
 const AGENT_WAIT_MAX_TIMEOUT_MS: u64 = 1_800_000;
-const AGENT_ROLE_IDS: &[&str] = &["architect", "executor", "explorer", "reviewer", "tester"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AgentSpawnAccessMode {
@@ -357,6 +356,7 @@ fn execute_coordinator_tool(
 
     match tool {
         magi_tool_runtime::BuiltinToolName::AgentSpawn => {
+            let spawnable_role_ids = agent_role_registry.spawnable_agent_role_ids();
             if human_checkpoint.is_none() && task_is_long_mission(Some(task)) {
                 return (
                     serde_json::json!({
@@ -441,6 +441,7 @@ fn execute_coordinator_tool(
                         &requested_role,
                         &requested_display_name,
                         &requested_goal,
+                        &spawnable_role_ids,
                     )
                 });
             let role = parameter_contract
@@ -468,15 +469,16 @@ fn execute_coordinator_tool(
                 );
             }
             if !agent_role_registry.is_spawnable_agent_role(&role) {
+                let role_hint = spawnable_role_ids.join(" / ");
                 return (
                     serde_json::json!({
                         "tool": tool.as_str(),
                         "status": "degraded",
                         "fallback_mode": "mainline_or_reassign",
                         "role": role,
-                        "available_roles": agent_role_registry.spawnable_agent_role_ids(),
+                        "available_roles": spawnable_role_ids,
                         "error": "该 role 不是可派发代理角色。coordinator 是主线编排身份，不能通过 agent_spawn 派发。",
-                        "instruction": "请改派 architect / executor / explorer / reviewer / tester 等专业代理；如果无需继续派发，则由主线基于已有上下文直接推进并给出结果。",
+                        "instruction": format!("请改派 {role_hint} 等可用专业代理；如果无需继续派发，则由主线基于已有上下文直接推进并给出结果。"),
                     })
                     .to_string(),
                     ExecutionResultStatus::Succeeded,
@@ -765,8 +767,9 @@ fn select_agent_spawn_parameter_contract(
     requested_role: &str,
     requested_display_name: &str,
     requested_goal: &str,
+    spawnable_role_ids: &[String],
 ) -> Option<AgentSpawnParameterContract> {
-    parse_agent_spawn_parameter_contracts(user_message)
+    parse_agent_spawn_parameter_contracts(user_message, spawnable_role_ids)
         .into_iter()
         .filter_map(|contract| {
             let score = score_agent_spawn_parameter_contract(
@@ -781,14 +784,17 @@ fn select_agent_spawn_parameter_contract(
         .map(|(_, contract)| contract)
 }
 
-fn parse_agent_spawn_parameter_contracts(user_message: &str) -> Vec<AgentSpawnParameterContract> {
+fn parse_agent_spawn_parameter_contracts(
+    user_message: &str,
+    spawnable_role_ids: &[String],
+) -> Vec<AgentSpawnParameterContract> {
     user_message
         .match_indices("display_name")
         .filter_map(|(index, _)| {
             let display_name =
                 extract_display_name_after(&user_message[index + "display_name".len()..])?;
             Some(AgentSpawnParameterContract {
-                role: extract_contract_role(user_message, index),
+                role: extract_contract_role(user_message, index, spawnable_role_ids),
                 display_name,
                 access_mode: extract_contract_access_mode(user_message, index),
                 goal: extract_contract_goal(user_message, index),
@@ -817,11 +823,18 @@ fn extract_display_name_after(value: &str) -> Option<String> {
     (!display_name.is_empty()).then_some(display_name)
 }
 
-fn extract_contract_role(user_message: &str, index: usize) -> Option<String> {
+fn extract_contract_role(
+    user_message: &str,
+    index: usize,
+    spawnable_role_ids: &[String],
+) -> Option<String> {
     let window = surrounding_text_window(user_message, index, 120, 0).to_ascii_lowercase();
-    AGENT_ROLE_IDS
+    spawnable_role_ids
         .iter()
-        .filter_map(|role| window.rfind(role).map(|pos| (pos, *role)))
+        .filter_map(|role| {
+            let role_lower = role.to_ascii_lowercase();
+            window.rfind(&role_lower).map(|pos| (pos, role.as_str()))
+        })
         .max_by_key(|(pos, _)| *pos)
         .map(|(_, role)| role.to_string())
 }
@@ -1857,6 +1870,14 @@ mod tests {
         task
     }
 
+    fn default_spawnable_role_ids() -> Vec<String> {
+        magi_agent_role::AgentRoleRegistry::load_default().spawnable_agent_role_ids()
+    }
+
+    fn spawnable_role_ids(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|id| (*id).to_string()).collect()
+    }
+
     fn long_mission_policy() -> TaskPolicy {
         TaskPolicy {
             autonomy_level: "Autonomous".to_string(),
@@ -1958,8 +1979,10 @@ mod tests {
 
     #[test]
     fn agent_spawn_contract_parser_extracts_explicit_user_parameters() {
+        let role_ids = default_spawnable_role_ids();
         let contracts = parse_agent_spawn_parameter_contracts(
             "必须同一轮并行启动 2 个代理：1) role=explorer，display_name=「目录探查代理」，access_mode=read_only，目标：只读查看 /Users/xie/code/TEST 顶层目录；2) role=reviewer，display_name=「配置审查代理」，access_mode=read_only，目标：只读查看 README.md 和 package.json 是否存在。",
+            &role_ids,
         );
 
         assert_eq!(contracts.len(), 2);
@@ -1982,8 +2005,10 @@ mod tests {
 
     #[test]
     fn agent_spawn_contract_role_does_not_bleed_from_next_agent_clause() {
+        let role_ids = default_spawnable_role_ids();
         let contracts = parse_agent_spawn_parameter_contracts(
             "第一轮同时 agent_spawn 两个只读代理：explorer display_name「冻结目录代理」只做根目录巡检；reviewer display_name「冻结配置代理」只读取 package.json 指出一个风险。",
+            &role_ids,
         );
 
         assert_eq!(contracts.len(), 2);
@@ -1996,12 +2021,14 @@ mod tests {
     #[test]
     fn agent_spawn_contract_selection_corrects_model_rewritten_display_name() {
         let message = "必须同一轮并行启动 2 个代理：1) role=explorer，display_name=「目录探查代理」，access_mode=read_only，目标：只读查看 /Users/xie/code/TEST 顶层目录；2) role=reviewer，display_name=「配置审查代理」，access_mode=read_only，目标：只读查看 README.md 和 package.json 是否存在。";
+        let role_ids = default_spawnable_role_ids();
 
         let directory = select_agent_spawn_parameter_contract(
             message,
             "explorer",
             "目录探查员",
             "只读检查当前工作区目录 /Users/xie/code/TEST",
+            &role_ids,
         )
         .expect("directory contract should be selected");
         assert_eq!(directory.role.as_deref(), Some("explorer"));
@@ -2012,6 +2039,7 @@ mod tests {
             "reviewer",
             "文件存在审查员",
             "只读查看 README.md 和 package.json 是否存在",
+            &role_ids,
         )
         .expect("config contract should be selected");
         assert_eq!(config.role.as_deref(), Some("reviewer"));
@@ -2021,17 +2049,32 @@ mod tests {
     #[test]
     fn agent_spawn_contract_selection_prefers_goal_when_model_rewrites_role() {
         let message = "必须同一轮并行启动 2 个代理：1) role=explorer，display_name=「目录探查代理」，access_mode=read_only，目标：只读查看 /Users/xie/code/TEST 顶层目录；2) role=reviewer，display_name=「配置审查代理」，access_mode=read_only，目标：只读查看 README.md 和 package.json 是否存在。";
+        let role_ids = default_spawnable_role_ids();
 
         let config = select_agent_spawn_parameter_contract(
             message,
             "explorer",
             "关键文件检查员",
             "只读验证 /Users/xie/code/TEST/README.md 与 /Users/xie/code/TEST/package.json 是否存在且为普通文件",
+            &role_ids,
         )
         .expect("config contract should be selected by goal overlap");
 
         assert_eq!(config.role.as_deref(), Some("reviewer"));
         assert_eq!(config.display_name, "配置审查代理");
+    }
+
+    #[test]
+    fn agent_spawn_contract_parser_uses_registry_role_ids() {
+        let role_ids = spawnable_role_ids(&["auditor", "executor"]);
+        let contracts = parse_agent_spawn_parameter_contracts(
+            "请启动 role=auditor，display_name=「安全审计代理」，access_mode=read_only，目标：检查鉴权风险。",
+            &role_ids,
+        );
+
+        assert_eq!(contracts.len(), 1);
+        assert_eq!(contracts[0].role.as_deref(), Some("auditor"));
+        assert_eq!(contracts[0].display_name, "安全审计代理");
     }
 
     #[test]
