@@ -801,6 +801,14 @@ impl ApiState {
         self
     }
 
+    pub fn with_agent_role_registry(
+        mut self,
+        registry: Arc<magi_agent_role::AgentRoleRegistry>,
+    ) -> Self {
+        self.agent_role_registry = registry;
+        self
+    }
+
     pub fn cancel_active_tool_executions(
         &self,
         session_id: Option<&SessionId>,

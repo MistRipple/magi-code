@@ -1,6 +1,6 @@
 use crate::{
-    BuiltinToolAccessMode, BuiltinToolName, ExternalToolCatalogSnapshot, ToolExecutionContext,
-    ToolRuntimeResources,
+    AgentRoleCatalogEntry, BuiltinToolAccessMode, BuiltinToolName, ExternalToolCatalogSnapshot,
+    ToolExecutionContext, ToolRuntimeResources,
 };
 
 pub(crate) fn execute_tool_catalog(
@@ -49,12 +49,31 @@ pub(crate) fn execute_tool_catalog(
         })
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(true);
+    let include_agent_roles = request
+        .as_ref()
+        .and_then(|value| value.get("include_agent_roles"))
+        .or_else(|| {
+            request
+                .as_ref()
+                .and_then(|value| value.get("includeAgentRoles"))
+        })
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
 
     let mut tools = Vec::new();
     let mut public_count = 0usize;
     let mut internal_count = 0usize;
     let mut schema_warning_count = 0usize;
-    let runtime_health = RuntimeHealth::from_context(context, resources);
+    let agent_roles = resources
+        .agent_role_catalog_provider
+        .as_ref()
+        .map(|provider| {
+            let mut roles = provider();
+            roles.sort_by(|left, right| left.role_id.cmp(&right.role_id));
+            roles
+        })
+        .unwrap_or_default();
+    let runtime_health = RuntimeHealth::from_context(context, resources, &agent_roles);
     let mut runtime_warning_count = 0usize;
 
     for tool in BuiltinToolName::ALL {
@@ -117,6 +136,8 @@ pub(crate) fn execute_tool_catalog(
     } else {
         0
     };
+    let agent_role_count = agent_roles.len();
+    let spawnable_agent_role_count = agent_roles.iter().filter(|role| role.spawnable).count();
     let external_catalog_status =
         if include_external && resources.external_tool_catalog_provider.is_some() {
             "available"
@@ -125,18 +146,25 @@ pub(crate) fn execute_tool_catalog(
         } else {
             "disabled"
         };
+    let agent_role_catalog_status = if resources.agent_role_catalog_provider.is_some() {
+        "available"
+    } else {
+        "unavailable"
+    };
 
     serde_json::json!({
         "tool": "tool_catalog",
         "status": "succeeded",
         "access_mode": BuiltinToolAccessMode::ReadOnly.as_str(),
         "summary": format!(
-            "工具目录: builtin_public={} builtin_internal={} skill_tools={} mcp_servers={} connected_mcp_servers={} schema_warnings={} runtime_warnings={}",
+            "工具目录: builtin_public={} builtin_internal={} skill_tools={} mcp_servers={} connected_mcp_servers={} agent_roles={} spawnable_agent_roles={} schema_warnings={} runtime_warnings={}",
             public_count,
             internal_count,
             skill_tool_count,
             mcp_server_count,
             connected_mcp_server_count,
+            agent_role_count,
+            spawnable_agent_role_count,
             schema_warning_count,
             runtime_warning_count
         ),
@@ -151,6 +179,9 @@ pub(crate) fn execute_tool_catalog(
         "skill_tool_count": skill_tool_count,
         "mcp_server_count": mcp_server_count,
         "connected_mcp_server_count": connected_mcp_server_count,
+        "agent_role_catalog_status": agent_role_catalog_status,
+        "agent_role_count": agent_role_count,
+        "spawnable_agent_role_count": spawnable_agent_role_count,
         "tools": tools,
         "skill_tools": if include_external {
             serde_json::to_value(external_catalog.skill_tools).unwrap_or_else(|_| serde_json::json!([]))
@@ -159,6 +190,11 @@ pub(crate) fn execute_tool_catalog(
         },
         "mcp_servers": if include_external && include_mcp_servers {
             serde_json::to_value(external_catalog.mcp_servers).unwrap_or_else(|_| serde_json::json!([]))
+        } else {
+            serde_json::json!([])
+        },
+        "agent_roles": if include_agent_roles {
+            serde_json::to_value(agent_roles).unwrap_or_else(|_| serde_json::json!([]))
         } else {
             serde_json::json!([])
         },
@@ -172,6 +208,9 @@ struct RuntimeHealth {
     workspace_code_index_ready: bool,
     workspace_code_index_file_count: Option<usize>,
     workspace_code_index_last_indexed: Option<u64>,
+    agent_role_registry_available: bool,
+    agent_role_count: usize,
+    spawnable_agent_role_count: usize,
 }
 
 struct RuntimeToolStatus {
@@ -180,7 +219,11 @@ struct RuntimeToolStatus {
 }
 
 impl RuntimeHealth {
-    fn from_context(context: &ToolExecutionContext, resources: &ToolRuntimeResources) -> Self {
+    fn from_context(
+        context: &ToolExecutionContext,
+        resources: &ToolRuntimeResources,
+        agent_roles: &[AgentRoleCatalogEntry],
+    ) -> Self {
         let knowledge_store_available = resources.knowledge_store.is_some();
         let workspace_id = context
             .workspace_id
@@ -211,6 +254,9 @@ impl RuntimeHealth {
             workspace_code_index_ready,
             workspace_code_index_file_count,
             workspace_code_index_last_indexed,
+            agent_role_registry_available: resources.agent_role_catalog_provider.is_some(),
+            agent_role_count: agent_roles.len(),
+            spawnable_agent_role_count: agent_roles.iter().filter(|role| role.spawnable).count(),
         }
     }
 
@@ -219,6 +265,9 @@ impl RuntimeHealth {
             BuiltinToolName::KnowledgeQuery => self.knowledge_tool_status("knowledge_query"),
             BuiltinToolName::SearchSemantic => self.code_index_tool_status("search_semantic"),
             BuiltinToolName::CodeSymbols => self.code_index_tool_status("code_symbols"),
+            BuiltinToolName::AgentSpawn | BuiltinToolName::AgentWait => {
+                self.agent_role_tool_status(tool.as_str())
+            }
             _ => RuntimeToolStatus {
                 status: "ready",
                 warnings: Vec::new(),
@@ -239,6 +288,30 @@ impl RuntimeHealth {
             return RuntimeToolStatus {
                 status: "missing_context",
                 warnings: vec![format!("{tool_name} 需要 workspace 上下文")],
+            };
+        }
+        RuntimeToolStatus {
+            status: "ready",
+            warnings: Vec::new(),
+        }
+    }
+
+    fn agent_role_tool_status(&self, tool_name: &str) -> RuntimeToolStatus {
+        if !self.agent_role_registry_available {
+            return RuntimeToolStatus {
+                status: "unavailable",
+                warnings: vec![format!(
+                    "{tool_name} 需要 AgentRoleRegistry，但当前运行时未注入"
+                )],
+            };
+        }
+        if self.spawnable_agent_role_count == 0 {
+            return RuntimeToolStatus {
+                status: "not_ready",
+                warnings: vec![format!(
+                    "{tool_name} 需要至少一个可派发代理角色；当前注册角色数 {}，可派发 0",
+                    self.agent_role_count
+                )],
             };
         }
         RuntimeToolStatus {
@@ -278,6 +351,13 @@ impl RuntimeHealth {
                 "file_count": self.workspace_code_index_file_count,
                 "last_indexed": self.workspace_code_index_last_indexed,
                 "required_by": ["search_semantic", "code_symbols"],
+            },
+            {
+                "name": "agent_role_registry",
+                "status": self.agent_role_registry_status(),
+                "role_count": self.agent_role_count,
+                "spawnable_role_count": self.spawnable_agent_role_count,
+                "required_by": ["agent_spawn", "agent_wait"],
             }
         ])
     }
@@ -291,6 +371,16 @@ impl RuntimeHealth {
             "ready"
         } else {
             "not_ready"
+        }
+    }
+
+    fn agent_role_registry_status(&self) -> &'static str {
+        if !self.agent_role_registry_available {
+            "unavailable"
+        } else if self.spawnable_agent_role_count == 0 {
+            "not_ready"
+        } else {
+            "ready"
         }
     }
 }
@@ -378,11 +468,23 @@ mod tests {
             .find(|tool| tool["name"] == "search_semantic")
             .expect("search_semantic should be listed");
         assert_eq!(search_semantic["runtime_status"], "unavailable");
+        let agent_spawn = payload["tools"]
+            .as_array()
+            .expect("tools")
+            .iter()
+            .find(|tool| tool["name"] == "agent_spawn")
+            .expect("agent_spawn should be listed");
+        assert_eq!(agent_spawn["runtime_status"], "unavailable");
         assert_eq!(
             payload["runtime_dependencies"][0]["name"],
             "knowledge_store"
         );
         assert_eq!(payload["runtime_dependencies"][0]["status"], "unavailable");
+        assert_eq!(
+            payload["runtime_dependencies"][2]["name"],
+            "agent_role_registry"
+        );
+        assert_eq!(payload["runtime_dependencies"][2]["status"], "unavailable");
     }
 
     #[test]
@@ -444,6 +546,58 @@ mod tests {
         assert_eq!(payload["connected_mcp_server_count"], 1);
         assert_eq!(payload["skill_tools"][0]["name"], "echo.describe");
         assert_eq!(payload["mcp_servers"][0]["health"], "connected");
+    }
+
+    #[test]
+    fn tool_catalog_reports_agent_role_registry_health_when_provider_exists() {
+        let resources = ToolRuntimeResources {
+            agent_role_catalog_provider: Some(std::sync::Arc::new(|| {
+                vec![
+                    crate::AgentRoleCatalogEntry {
+                        role_id: "coordinator".to_string(),
+                        spawnable: false,
+                        coordinator_mode: true,
+                        supported_kinds: vec!["local_agent".to_string()],
+                        parallelism_limit: None,
+                        status: "coordinator_only".to_string(),
+                    },
+                    crate::AgentRoleCatalogEntry {
+                        role_id: "executor".to_string(),
+                        spawnable: true,
+                        coordinator_mode: false,
+                        supported_kinds: vec!["local_agent".to_string()],
+                        parallelism_limit: Some(2),
+                        status: "spawnable".to_string(),
+                    },
+                ]
+            })),
+            ..ToolRuntimeResources::default()
+        };
+
+        let output = execute_tool_catalog("{}", &ToolExecutionContext::default(), &resources);
+        let payload: serde_json::Value = serde_json::from_str(&output).expect("json output");
+        let agent_spawn = payload["tools"]
+            .as_array()
+            .expect("tools")
+            .iter()
+            .find(|tool| tool["name"] == "agent_spawn")
+            .expect("agent_spawn should be listed");
+        let agent_wait = payload["tools"]
+            .as_array()
+            .expect("tools")
+            .iter()
+            .find(|tool| tool["name"] == "agent_wait")
+            .expect("agent_wait should be listed");
+
+        assert_eq!(payload["agent_role_catalog_status"], "available");
+        assert_eq!(payload["agent_role_count"], 2);
+        assert_eq!(payload["spawnable_agent_role_count"], 1);
+        assert_eq!(agent_spawn["runtime_status"], "ready");
+        assert_eq!(agent_wait["runtime_status"], "ready");
+        assert_eq!(payload["runtime_dependencies"][2]["status"], "ready");
+        assert_eq!(payload["agent_roles"][0]["role_id"], "coordinator");
+        assert_eq!(payload["agent_roles"][1]["role_id"], "executor");
+        assert_eq!(payload["agent_roles"][1]["parallelism_limit"], 2);
     }
 
     #[test]

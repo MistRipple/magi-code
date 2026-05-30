@@ -13,6 +13,7 @@ tracing.workspace = true
 reqwest.workspace = true
 tower-http = { version = "0.6.6", features = ["fs"] }
 magi-api = { path = "../magi-api" }
+magi-agent-role = { path = "../magi-agent-role" }
 magi-bridge-client = { path = "../magi-bridge-client" }
 magi-context-runtime = { path = "../magi-context-runtime" }
 magi-core = { path = "../magi-core" }

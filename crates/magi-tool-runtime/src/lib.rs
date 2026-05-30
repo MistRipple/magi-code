@@ -512,7 +512,7 @@ impl BuiltinToolName {
             Self::ToolCatalog => {
                 "列出 Magi 工具目录与健康状态。\n\n\
                 # 何时用\n\
-                - 需要确认当前运行时有哪些内置工具、skill 绑定工具、MCP server 状态\n\
+                - 需要确认当前运行时有哪些内置工具、skill 绑定工具、MCP server 状态、agent_spawn 可派发角色\n\
                 - 需要诊断工具 schema 是否完整，或区分模型可见工具、外接工具与运行时内部工具\n\n\
                 # 何时不用\n\
                 - 已知道具体工具且要完成任务 → 直接调用对应工具\n\n\
@@ -930,7 +930,8 @@ impl BuiltinToolName {
                     "include_internal": { "type": "boolean", "description": "是否包含运行时内部工具，默认 false" },
                     "include_schema": { "type": "boolean", "description": "是否在每个内置工具条目中包含完整 parameters_schema，默认 false" },
                     "include_external": { "type": "boolean", "description": "是否包含 skill 绑定工具与 MCP server 快照，默认 true" },
-                    "include_mcp_servers": { "type": "boolean", "description": "包含外接工具时是否同时返回 MCP server 健康摘要，默认 true" }
+                    "include_mcp_servers": { "type": "boolean", "description": "包含外接工具时是否同时返回 MCP server 健康摘要，默认 true" },
+                    "include_agent_roles": { "type": "boolean", "description": "是否包含可通过 agent_spawn 派发的代理角色健康摘要，默认 true" }
                 },
                 "required": []
             }),
@@ -1540,6 +1541,8 @@ pub struct ToolExecutionSummary {
 /// dispatch 时传入。将来需要更多运行时服务，扩这个结构即可，不改 trait 签名。
 pub type ExternalToolCatalogProvider =
     Arc<dyn Fn() -> ExternalToolCatalogSnapshot + Send + Sync + 'static>;
+pub type AgentRoleCatalogProvider =
+    Arc<dyn Fn() -> Vec<AgentRoleCatalogEntry> + Send + Sync + 'static>;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ExternalToolCatalogSnapshot {
@@ -1574,10 +1577,21 @@ pub struct ExternalMcpServerCatalogEntry {
     pub error: Option<String>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentRoleCatalogEntry {
+    pub role_id: String,
+    pub spawnable: bool,
+    pub coordinator_mode: bool,
+    pub supported_kinds: Vec<String>,
+    pub parallelism_limit: Option<u32>,
+    pub status: String,
+}
+
 #[derive(Clone, Default)]
 pub struct ToolRuntimeResources {
     pub knowledge_store: Option<Arc<magi_knowledge_store::KnowledgeStore>>,
     pub external_tool_catalog_provider: Option<ExternalToolCatalogProvider>,
+    pub agent_role_catalog_provider: Option<AgentRoleCatalogProvider>,
 }
 
 pub trait BuiltinTool: Send + Sync {
@@ -1627,6 +1641,11 @@ impl ToolRegistry {
         provider: ExternalToolCatalogProvider,
     ) -> Self {
         self.runtime_resources.external_tool_catalog_provider = Some(provider);
+        self
+    }
+
+    pub fn with_agent_role_catalog_provider(mut self, provider: AgentRoleCatalogProvider) -> Self {
+        self.runtime_resources.agent_role_catalog_provider = Some(provider);
         self
     }
 

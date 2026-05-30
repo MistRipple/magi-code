@@ -45,8 +45,9 @@ use magi_orchestrator::{ExecutionContextConfig, OrchestratorService, task_store:
 use magi_session_store::{SessionExecutionSidecarStatus, SessionStore};
 use magi_skill_runtime::SkillDispatchRuntime;
 use magi_tool_runtime::{
-    ExternalMcpServerCatalogEntry, ExternalToolCatalogEntry, ExternalToolCatalogProvider,
-    ExternalToolCatalogSnapshot, ToolRegistry,
+    AgentRoleCatalogEntry, AgentRoleCatalogProvider, ExternalMcpServerCatalogEntry,
+    ExternalToolCatalogEntry, ExternalToolCatalogProvider, ExternalToolCatalogSnapshot,
+    ToolRegistry,
 };
 use magi_worker_runtime::WorkerRuntime;
 use magi_workspace::WorkspaceStore;
@@ -120,6 +121,52 @@ fn build_external_tool_catalog_provider(
             mcp_servers,
         }
     })
+}
+
+fn build_agent_role_catalog_provider(
+    registry: Arc<magi_agent_role::AgentRoleRegistry>,
+) -> AgentRoleCatalogProvider {
+    Arc::new(move || {
+        let mut roles = registry
+            .all()
+            .map(|role| {
+                let spawnable = registry.is_spawnable_agent_role(&role.id);
+                let status = if spawnable {
+                    "spawnable"
+                } else if role.coordinator_mode {
+                    "coordinator_only"
+                } else {
+                    "unsupported"
+                };
+                AgentRoleCatalogEntry {
+                    role_id: role.id.clone(),
+                    spawnable,
+                    coordinator_mode: role.coordinator_mode,
+                    supported_kinds: role
+                        .supported_task_kinds()
+                        .into_iter()
+                        .map(task_kind_label)
+                        .collect(),
+                    parallelism_limit: role.parallelism_limit,
+                    status: status.to_string(),
+                }
+            })
+            .collect::<Vec<_>>();
+        roles.sort_by(|left, right| left.role_id.cmp(&right.role_id));
+        roles
+    })
+}
+
+fn task_kind_label(kind: magi_core::TaskKind) -> String {
+    match kind {
+        magi_core::TaskKind::LocalAgent => "local_agent",
+        magi_core::TaskKind::LocalWorkflow => "local_workflow",
+        magi_core::TaskKind::RemoteAgent => "remote_agent",
+        magi_core::TaskKind::MonitorMcp => "monitor_mcp",
+        magi_core::TaskKind::InProcessTeammate => "in_process_teammate",
+        magi_core::TaskKind::Dream => "dream",
+    }
+    .to_string()
 }
 
 fn external_binding_policy_labels(
@@ -607,6 +654,7 @@ impl DaemonRuntime {
             warn!(error = %error, "设置文件加载失败，使用空默认值");
         }
         Self::seed_orchestrator_settings_from_env_if_empty(&settings_store, bridge_env);
+        let agent_role_registry = Arc::new(magi_agent_role::AgentRoleRegistry::load_default());
         let app_skill_runtime = Arc::new(
             magi_api::skill_loader::build_skill_runtime_from_settings(&settings_store),
         );
@@ -615,9 +663,12 @@ impl DaemonRuntime {
             app_skill_runtime.clone(),
             mcp_connections.clone(),
         );
+        let agent_role_catalog_provider =
+            build_agent_role_catalog_provider(agent_role_registry.clone());
         let mut tool_registry = ToolRegistry::new(self.governance.clone(), self.event_bus.clone())
             .with_knowledge_store(self.knowledge_store.clone())
-            .with_external_tool_catalog_provider(external_tool_catalog_provider);
+            .with_external_tool_catalog_provider(external_tool_catalog_provider)
+            .with_agent_role_catalog_provider(agent_role_catalog_provider);
         tool_registry.register_default_builtins();
 
         // 业务模型桥用于会话正文生成和任务执行；任务规划/分类另走本地 loopback-model。
@@ -811,6 +862,7 @@ impl DaemonRuntime {
         .with_skill_dispatch_runtime(Arc::new(skill_runtime.clone()))
         .with_mcp_connections(mcp_connections)
         .with_tool_registry(tool_registry_for_dispatcher.clone())
+        .with_agent_role_registry(agent_role_registry)
         .with_tunnel_port(self.local_port)
         .with_runtime_persistence(Arc::new(RuntimeStatePersistence::new(
             self.state_root.join("sessions.json"),
@@ -1390,7 +1442,7 @@ fn push_terminal_task_result(
 
 #[cfg(test)]
 mod tests {
-    use super::DaemonRuntime;
+    use super::{DaemonRuntime, build_agent_role_catalog_provider};
     use crate::daemon::config::DaemonConfig;
     use axum::{
         body::{Body, to_bytes},
@@ -1420,6 +1472,33 @@ mod tests {
         ));
         fs::create_dir_all(&root).expect("temp state root should be creatable");
         root
+    }
+
+    #[test]
+    fn agent_role_catalog_provider_exports_spawnable_roles() {
+        let registry = std::sync::Arc::new(magi_agent_role::AgentRoleRegistry::load_default());
+        let provider = build_agent_role_catalog_provider(registry);
+        let roles = provider();
+
+        assert!(
+            roles
+                .iter()
+                .any(|role| role.role_id == "executor" && role.spawnable),
+            "executor 应作为 agent_spawn 可派发角色暴露"
+        );
+        assert!(
+            roles
+                .iter()
+                .any(|role| role.role_id == "coordinator" && !role.spawnable),
+            "coordinator 是主线编排身份，不应作为可派发代理暴露"
+        );
+        assert!(
+            roles.iter().any(|role| role
+                .supported_kinds
+                .iter()
+                .any(|kind| kind == "local_agent")),
+            "代理角色目录应暴露 supported_kinds，便于 tool_catalog 诊断"
+        );
     }
 
     #[test]
