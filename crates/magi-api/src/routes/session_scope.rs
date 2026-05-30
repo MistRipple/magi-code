@@ -91,18 +91,6 @@ pub(super) fn require_session_record_in_workspace(
     Ok(session)
 }
 
-pub(super) fn require_current_session_record_in_workspace(
-    state: &ApiState,
-    requested_workspace_id: Option<&str>,
-) -> Result<SessionRecord, ApiError> {
-    let session = state
-        .session_store
-        .current_session()
-        .ok_or_else(|| ApiError::InvalidInput("当前没有活动 session".to_string()))?;
-    require_session_workspace_match(state, &session, requested_workspace_id)?;
-    Ok(session)
-}
-
 pub(super) fn session_workspace_id(
     state: &ApiState,
     session: &SessionRecord,

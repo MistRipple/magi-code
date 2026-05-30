@@ -8,8 +8,7 @@ use magi_session_store::{CanonicalTurn, NotificationRecord, SessionRecord, Timel
 use serde::{Deserialize, Serialize};
 
 use super::session_scope::{
-    parse_session_id, require_current_session_record_in_workspace,
-    require_session_record_in_workspace, require_workspace_id,
+    parse_session_id, require_session_record_in_workspace, require_workspace_id,
 };
 use crate::{errors::ApiError, state::ApiState};
 
@@ -47,25 +46,9 @@ async fn get_messages(
     Query(query): Query<MessagesQuery>,
 ) -> Result<Json<MessagesResponseDto>, ApiError> {
     let requested_workspace_id = require_workspace_id(query.workspace_id.as_deref())?;
-    let current_session = match query
-        .session_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        Some(id) => {
-            let sid = parse_session_id(Some(id))?;
-            require_session_record_in_workspace(
-                &state,
-                &sid,
-                Some(requested_workspace_id.as_str()),
-            )?
-        }
-        None => require_current_session_record_in_workspace(
-            &state,
-            Some(requested_workspace_id.as_str()),
-        )?,
-    };
+    let sid = parse_session_id(query.session_id.as_deref())?;
+    let current_session =
+        require_session_record_in_workspace(&state, &sid, Some(requested_workspace_id.as_str()))?;
     let session_id = current_session.session_id.clone();
 
     let timeline = state.session_store.timeline_for_session(&session_id);
@@ -174,6 +157,41 @@ mod tests {
                 .as_str()
                 .unwrap_or_default()
                 .contains("workspaceId 不能为空"),
+            "unexpected body: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn messages_requires_explicit_session_scope() {
+        let session_id = SessionId::new("session-messages-requires-session");
+        let store = SessionStore::default();
+        store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "必须指定会话查询",
+                Some("workspace-messages-required".to_string()),
+            )
+            .expect("session should create");
+        let state = test_state(store);
+
+        let response = routes()
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/messages?workspaceId=workspace-messages-required")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = read_json_response(response).await;
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("sessionId 不能为空"),
             "unexpected body: {body}"
         );
     }
