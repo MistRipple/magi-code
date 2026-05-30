@@ -6,6 +6,7 @@ use crate::dto::{
     RuntimeReadModelDto, ServiceInfo, VersionHandshakeDto, runtime_read_model_dto,
 };
 use crate::errors::ApiError;
+use crate::mcp_config::{build_mcp_config_from_entry, normalize_mcp_server_snapshot_entry};
 use crate::routes::settings::{
     builtin_role_templates, load_registry_engines, registered_role_template_ids,
     resolve_registry_agents,
@@ -13,8 +14,8 @@ use crate::routes::settings::{
 use crate::settings_store::SettingsStore;
 use crate::skill_loader;
 use magi_bridge_client::{
-    BridgeServerKind, BridgeTransport, JsonRpcBridgeServerProbeClient, McpServerConfig,
-    ModelBridgeClient, StdioMcpBridgeClient,
+    BridgeServerKind, BridgeTransport, JsonRpcBridgeServerProbeClient, ModelBridgeClient,
+    StdioMcpBridgeClient,
 };
 use magi_conversation_runtime::{
     ConversationRegistry,
@@ -1529,71 +1530,6 @@ fn normalize_mcp_servers_section(snapshot: &mut HashMap<String, serde_json::Valu
         .filter_map(normalize_mcp_server_snapshot_entry)
         .collect();
     *entries = normalized_entries;
-}
-
-fn normalize_mcp_server_snapshot_entry(entry: &serde_json::Value) -> Option<serde_json::Value> {
-    let raw = entry
-        .get("server")
-        .or_else(|| entry.get("updates"))
-        .cloned()
-        .unwrap_or_else(|| entry.clone());
-    let mut object = raw.as_object().cloned()?;
-    let server_id = object
-        .get("id")
-        .and_then(|value| value.as_str())
-        .or_else(|| object.get("serverId").and_then(|value| value.as_str()))
-        .or_else(|| entry.get("serverId").and_then(|value| value.as_str()))
-        .map(str::trim)
-        .filter(|value| !value.is_empty())?
-        .to_string();
-    object.insert("id".to_string(), serde_json::json!(server_id));
-    object.insert("serverId".to_string(), serde_json::json!(server_id));
-    if object
-        .get("name")
-        .and_then(|value| value.as_str())
-        .map(str::trim)
-        .unwrap_or_default()
-        .is_empty()
-    {
-        object.insert("name".to_string(), serde_json::json!(server_id));
-    }
-    Some(serde_json::Value::Object(object))
-}
-
-pub(crate) fn build_mcp_config_from_entry(entry: &serde_json::Value) -> Option<McpServerConfig> {
-    let command = entry.get("command")?.as_str()?.to_string();
-    if command.is_empty() {
-        return None;
-    }
-    let args: Vec<String> = entry
-        .get("args")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default();
-    let working_directory = entry
-        .get("workingDirectory")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(std::path::PathBuf::from);
-    let env: std::collections::BTreeMap<String, String> = entry
-        .get("env")
-        .and_then(|v| v.as_object())
-        .map(|obj| {
-            obj.iter()
-                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                .collect()
-        })
-        .unwrap_or_default();
-    Some(McpServerConfig {
-        command,
-        args,
-        working_directory,
-        env,
-    })
 }
 
 #[cfg(test)]

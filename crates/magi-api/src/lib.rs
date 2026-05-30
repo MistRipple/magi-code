@@ -3,6 +3,7 @@
 mod change_projection;
 mod dto;
 mod errors;
+mod mcp_config;
 mod model_config;
 mod routes;
 pub(crate) mod session_continue;
