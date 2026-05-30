@@ -25,8 +25,8 @@ use serde_json::json;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::session_scope::{
-    parse_session_id, require_current_session_record_in_workspace, require_registered_workspace_id,
-    require_session_record_in_workspace, require_workspace_id, session_workspace_id,
+    parse_session_id, require_registered_workspace_id, require_session_record_in_workspace,
+    require_workspace_id, session_workspace_id,
 };
 use crate::{
     dto::{
@@ -1418,11 +1418,13 @@ fn publish_session_turn_continue_event(
     continued_at: UtcMillis,
 ) -> Result<EventId, ApiError> {
     let event_id = EventId::new(format!("event-session-turn-continue-{}", continued_at.0));
+    let workspace_id = session_workspace_for_event(state, &accepted.session_id);
     let event = EventEnvelope::domain(
         event_id.clone(),
         "session.turn.continue.executed",
         json!({
             "session_id": accepted.session_id.to_string(),
+            "workspace_id": workspace_id.as_ref().map(ToString::to_string),
             "mission_id": accepted.mission_id.to_string(),
             "root_task_id": accepted.root_task_id.to_string(),
             "execution_chain_ref": accepted.execution_chain_ref.clone(),
@@ -1432,6 +1434,7 @@ fn publish_session_turn_continue_event(
     )
     .with_context(EventContext {
         session_id: Some(accepted.session_id.clone()),
+        workspace_id,
         mission_id: Some(accepted.mission_id.clone()),
         task_id: Some(accepted.root_task_id.clone()),
         ..EventContext::default()
@@ -1479,6 +1482,8 @@ impl SaveSessionRequest {
 #[serde(rename_all = "camelCase")]
 struct ContinueSessionRequest {
     session_id: String,
+    #[serde(default, alias = "workspace_id")]
+    workspace_id: Option<String>,
     prompt_text: Option<String>,
     #[serde(default)]
     requested_agent_ids: Vec<String>,
@@ -1488,6 +1493,12 @@ struct ContinueSessionRequest {
     user_message_id: Option<String>,
     #[serde(alias = "placeholder_message_id")]
     placeholder_message_id: Option<String>,
+}
+
+impl ContinueSessionRequest {
+    fn requested_workspace_id(&self) -> Option<&str> {
+        trimmed_non_empty(self.workspace_id.as_deref())
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1512,6 +1523,7 @@ impl InterruptSessionTurnRequest {
 #[serde(rename_all = "camelCase")]
 struct ContinueSessionResponseDto {
     session_id: String,
+    workspace_id: String,
     mission_id: String,
     root_task_id: String,
     execution_chain_ref: String,
@@ -1527,6 +1539,7 @@ struct ContinueSessionResponseDto {
 struct SessionInterruptResponseDto {
     interrupted: bool,
     session_id: String,
+    workspace_id: Option<String>,
     turn_id: Option<String>,
     event_id: String,
     requested_at: UtcMillis,
@@ -1545,14 +1558,11 @@ fn resolve_interrupt_session_record(
     state: &ApiState,
     request: &InterruptSessionTurnRequest,
 ) -> Result<SessionRecord, ApiError> {
-    if let Some(session_id) = request.requested_session_id() {
-        return require_session_record_in_workspace(
-            state,
-            &session_id,
-            request.requested_workspace_id(),
-        );
-    }
-    require_current_session_record_in_workspace(state, request.requested_workspace_id())
+    let workspace_id = require_registered_workspace_id(state, request.requested_workspace_id())?;
+    let session_id = request
+        .requested_session_id()
+        .ok_or_else(|| ApiError::InvalidInput("sessionId 不能为空".to_string()))?;
+    require_session_record_in_workspace(state, &session_id, Some(workspace_id.as_str()))
 }
 
 fn turn_status_is_interruptible(status: &str) -> bool {
@@ -1799,6 +1809,7 @@ async fn interrupt_session_turn(
     Ok(Json(SessionInterruptResponseDto {
         interrupted,
         session_id: session_id.to_string(),
+        workspace_id: workspace_id.as_ref().map(ToString::to_string),
         turn_id,
         event_id: event_id.to_string(),
         requested_at: now,
@@ -1871,6 +1882,8 @@ async fn continue_session(
     Json(request): Json<ContinueSessionRequest>,
 ) -> Result<Json<ContinueSessionResponseDto>, ApiError> {
     let session_id = SessionId::new(&request.session_id);
+    let workspace_id = require_registered_workspace_id(&state, request.requested_workspace_id())?;
+    require_session_record_in_workspace(&state, &session_id, Some(workspace_id.as_str()))?;
     let prompt_text = request
         .prompt_text
         .as_deref()
@@ -1912,6 +1925,7 @@ async fn continue_session(
         "session.continue.executed",
         json!({
             "session_id": accepted.session_id.to_string(),
+            "workspace_id": workspace_id.to_string(),
             "mission_id": accepted.mission_id.to_string(),
             "root_task_id": accepted.root_task_id.to_string(),
             "execution_chain_ref": accepted.execution_chain_ref,
@@ -1921,6 +1935,7 @@ async fn continue_session(
     )
     .with_context(EventContext {
         session_id: Some(accepted.session_id.clone()),
+        workspace_id: Some(workspace_id.clone()),
         mission_id: Some(accepted.mission_id.clone()),
         task_id: Some(accepted.root_task_id.clone()),
         ..EventContext::default()
@@ -1931,6 +1946,7 @@ async fn continue_session(
         .map_err(|err| ApiError::event_publish_failed("会话继续事件发布失败", err))?;
     Ok(Json(ContinueSessionResponseDto {
         session_id: accepted.session_id.to_string(),
+        workspace_id: workspace_id.to_string(),
         mission_id: accepted.mission_id.to_string(),
         root_task_id: accepted.root_task_id.to_string(),
         execution_chain_ref: accepted.execution_chain_ref,
@@ -2627,6 +2643,122 @@ mod tests {
                 .as_str()
                 .unwrap_or_default()
                 .contains("workspaceId 不能为空"),
+            "unexpected body: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_interrupt_requires_explicit_workspace_and_session_scope() {
+        let state = test_state();
+        let workspace_id = register_workspace(
+            &state,
+            "workspace-interrupt-scope",
+            "session-interrupt-scope",
+        );
+        let session_id = SessionId::new("session-interrupt-scope");
+        state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "中断 scope 会话",
+                Some(workspace_id.to_string()),
+            )
+            .expect("session should create");
+
+        let (status, body) = post_json(
+            state.clone(),
+            "/session/interrupt",
+            serde_json::json!({ "sessionId": session_id.as_str() }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "unexpected body: {body}");
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("workspaceId 不能为空"),
+            "unexpected body: {body}"
+        );
+
+        let (status, body) = post_json(
+            state.clone(),
+            "/session/interrupt",
+            serde_json::json!({ "workspaceId": workspace_id.as_str() }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "unexpected body: {body}");
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("sessionId 不能为空"),
+            "unexpected body: {body}"
+        );
+
+        let (status, body) = post_json(
+            state,
+            "/session/interrupt",
+            serde_json::json!({
+                "workspaceId": workspace_id.as_str(),
+                "sessionId": session_id.as_str(),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "unexpected body: {body}");
+        assert_eq!(body["sessionId"], session_id.as_str());
+        assert_eq!(body["workspaceId"], workspace_id.as_str());
+    }
+
+    #[tokio::test]
+    async fn continue_session_requires_matching_workspace_scope() {
+        let state = test_state();
+        let workspace_id =
+            register_workspace(&state, "workspace-continue-scope", "session-continue-scope");
+        let foreign_workspace_id = register_workspace(
+            &state,
+            "workspace-continue-foreign",
+            "session-continue-foreign",
+        );
+        let session_id = SessionId::new("session-continue-scope");
+        state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "继续 scope 会话",
+                Some(workspace_id.to_string()),
+            )
+            .expect("session should create");
+
+        let (status, body) = post_json(
+            state.clone(),
+            "/session/continue",
+            serde_json::json!({ "sessionId": session_id.as_str() }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "unexpected body: {body}");
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("workspaceId 不能为空"),
+            "unexpected body: {body}"
+        );
+
+        let (status, body) = post_json(
+            state,
+            "/session/continue",
+            serde_json::json!({
+                "workspaceId": foreign_workspace_id.as_str(),
+                "sessionId": session_id.as_str(),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "unexpected body: {body}");
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("不属于 workspace"),
             "unexpected body: {body}"
         );
     }

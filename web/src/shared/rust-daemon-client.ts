@@ -151,7 +151,7 @@ export class RustDaemonClient {
   }
 
   public async interruptSession(
-    request: SessionInterruptRequestDto = {},
+    request: SessionInterruptRequestDto,
   ): Promise<SessionInterruptResponseDto> {
     return this.postJson<SessionInterruptResponseDto>('/api/session/interrupt', request);
   }

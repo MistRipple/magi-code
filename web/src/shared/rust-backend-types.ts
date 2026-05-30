@@ -100,13 +100,14 @@ export interface TaskArchiveResponseDto {
 }
 
 export interface SessionInterruptRequestDto {
-  workspaceId?: string | null;
-  sessionId?: string | null;
+  workspaceId: string;
+  sessionId: string;
 }
 
 export interface SessionInterruptResponseDto {
   interrupted: boolean;
   sessionId: string;
+  workspaceId?: string | null;
   turnId?: string | null;
   eventId: string;
   requestedAt: number;
@@ -801,7 +802,7 @@ export interface SessionSaveRequestDto {
 
 export interface SessionContinueRequestDto {
   sessionId: string;
-  workspaceId?: string | null;
+  workspaceId: string;
   workspace_id?: string | null;
   promptText?: string | null;
   requestedAgentIds?: string[];
@@ -812,6 +813,7 @@ export interface SessionContinueRequestDto {
 
 export interface SessionContinueResponseDto {
   sessionId: string;
+  workspaceId: string;
   missionId: string;
   rootTaskId: string;
   executionChainRef: string;

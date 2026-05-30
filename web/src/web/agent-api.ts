@@ -1188,12 +1188,15 @@ export async function interruptAgentTask(
 }
 
 export async function interruptAgentSession(
-  sessionId?: string,
+  sessionId: string,
 ): Promise<Record<string, unknown>> {
-  const normalizedSessionId = sessionId?.trim() || '';
+  const normalizedSessionId = sessionId.trim();
+  if (!normalizedSessionId) {
+    throw new AgentApiError(400, 'sessionId 不能为空', 'interrupt session turn');
+  }
   return await postBoundJson<Record<string, unknown>>(
     '/api/session/interrupt',
-    normalizedSessionId ? { sessionId: normalizedSessionId } : {},
+    { sessionId: normalizedSessionId },
     'interrupt session turn',
   );
 }
@@ -1209,9 +1212,13 @@ export async function startAgentTask(taskId: string): Promise<Record<string, unk
 export async function continueAgentSession(
   sessionId: string,
 ): Promise<Record<string, unknown>> {
+  const normalizedSessionId = sessionId.trim();
+  if (!normalizedSessionId) {
+    throw new AgentApiError(400, 'sessionId 不能为空', 'continue session');
+  }
   return await postBoundJson<Record<string, unknown>>(
     '/api/session/continue',
-    { sessionId },
+    { sessionId: normalizedSessionId },
     'continue session',
   );
 }
