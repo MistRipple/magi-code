@@ -95,10 +95,6 @@ import type {
   SettingsBootstrapPayload,
   SettingsBootstrapSnapshot,
 } from '../settings-bootstrap';
-import {
-  persistStoredBrowserWorkspaceBinding,
-  readStoredBrowserWorkspaceBinding,
-} from './browser-workspace-binding';
 import { buildEmptyWorkspaceAppState } from './empty-workspace-state';
 import {
   normalizeRustBootstrapPayload,
@@ -1340,19 +1336,16 @@ function resolveInjectedWorkspaceBinding(): { workspaceId: string; workspacePath
 function resolveWorkspaceQuery(): { workspaceId: string; workspacePath: string; sessionId: string } {
   const currentUrl = getCurrentUrl();
   const injectedBinding = resolveInjectedWorkspaceBinding();
-  const storedBinding = readStoredBrowserWorkspaceBinding();
   const queryWorkspaceId = currentUrl?.searchParams.get('workspaceId')?.trim() || '';
   const queryWorkspacePath = currentUrl?.searchParams.get('workspacePath')?.trim() || '';
   const querySessionId = currentUrl?.searchParams.get('sessionId')?.trim() || '';
   const workspaceId = queryWorkspaceId
     || currentWorkspaceId
     || injectedBinding.workspaceId
-    || storedBinding.workspaceId
     || '';
   const workspacePath = queryWorkspacePath
     || currentWorkspacePath
     || injectedBinding.workspacePath
-    || storedBinding.workspacePath
     || '';
   const sessionId = querySessionId;
   return { workspaceId, workspacePath, sessionId };
@@ -1417,10 +1410,6 @@ function persistWorkspaceBinding(workspaceId: string, workspacePath: string, ses
   currentWorkspaceId = normalizedWorkspaceId;
   currentWorkspacePath = normalizedWorkspacePath;
   currentSessionId = incomingSessionId;
-  persistStoredBrowserWorkspaceBinding({
-    workspaceId: normalizedWorkspaceId,
-    workspacePath: normalizedWorkspacePath,
-  });
 
   const currentUrl = getCurrentUrl();
   if (!currentUrl) {
@@ -1469,10 +1458,6 @@ function clearWorkspaceSessionBinding(workspaceId: string, workspacePath: string
     queueDrainTimer = null;
   }
   queueDrainActive = false;
-  persistStoredBrowserWorkspaceBinding({
-    workspaceId: normalizedWorkspaceId,
-    workspacePath: normalizedWorkspacePath,
-  });
 
   const currentUrl = getCurrentUrl();
   if (!currentUrl) {
@@ -1515,10 +1500,6 @@ function clearPersistedWorkspaceBinding(): void {
   currentSessionId = '';
   clearCurrentInterruptTaskId();
   clearTaskProjection();
-  persistStoredBrowserWorkspaceBinding({
-    workspaceId: '',
-    workspacePath: '',
-  });
   const currentUrl = getCurrentUrl();
   if (!currentUrl) {
     return;

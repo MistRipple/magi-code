@@ -30,10 +30,6 @@
     type AgentWorkspaceSummary,
   } from './agent-api';
   import {
-    clearStoredBrowserWorkspaceBinding,
-    persistStoredBrowserWorkspaceBinding,
-  } from '../shared/bridges/browser-workspace-binding';
-  import {
     rightPaneState,
     getRightPaneState,
     openCodeTab,
@@ -365,7 +361,6 @@
     const nextUrl = new URL(window.location.href);
 
     if (!normalizedWorkspaceId || !normalizedWorkspacePath) {
-      clearStoredBrowserWorkspaceBinding();
       nextUrl.searchParams.delete('workspaceId');
       nextUrl.searchParams.delete('workspacePath');
       nextUrl.searchParams.delete('sessionId');
@@ -375,10 +370,6 @@
       return;
     }
 
-    persistStoredBrowserWorkspaceBinding({
-      workspaceId: normalizedWorkspaceId,
-      workspacePath: normalizedWorkspacePath,
-    });
     nextUrl.searchParams.set('workspaceId', normalizedWorkspaceId);
     nextUrl.searchParams.set('workspacePath', normalizedWorkspacePath);
 

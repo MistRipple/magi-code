@@ -1,6 +1,5 @@
 import { getDefaultAgentBaseUrl } from '../shared/agent-shared-config';
 import { getTransport } from '../shared/transport';
-import { readStoredBrowserWorkspaceBinding } from '../shared/bridges/browser-workspace-binding';
 import type { AgentBinding, ModelEngine } from '../shared/types/registry-types';
 import type { RoleTemplate } from '../shared/types/role-templates';
 import type {
@@ -668,18 +667,15 @@ function resolveAgentBindingContext(): AgentBindingContext {
     __INITIAL_WORKSPACE_ID__?: string;
     __INITIAL_WORKSPACE_PATH__?: string;
   };
-  const storedBinding = readStoredBrowserWorkspaceBinding();
   const queryWorkspaceId = currentUrl.searchParams.get('workspaceId')?.trim() || '';
   const queryWorkspacePath = currentUrl.searchParams.get('workspacePath')?.trim() || '';
   const querySessionId = currentUrl.searchParams.get('sessionId')?.trim() || '';
   return {
     workspaceId: queryWorkspaceId
       || bootstrapWindow.__INITIAL_WORKSPACE_ID__?.trim()
-      || storedBinding.workspaceId
       || '',
     workspacePath: queryWorkspacePath
       || bootstrapWindow.__INITIAL_WORKSPACE_PATH__?.trim()
-      || storedBinding.workspacePath
       || '',
     sessionId: querySessionId,
   };
