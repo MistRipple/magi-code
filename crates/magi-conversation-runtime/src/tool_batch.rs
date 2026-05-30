@@ -50,6 +50,8 @@ use crate::{
 static AGENT_SPAWN_SEQ: AtomicU64 = AtomicU64::new(0);
 const AGENT_SPAWN_SUMMARY_MAX_CHARS: usize = 1200;
 const AGENT_SPAWN_FINAL_TEXT_MAX_CHARS: usize = 6000;
+const AGENT_SPAWN_PARENT_CONTEXT_MAX_CHARS: usize = 600;
+const AGENT_SPAWN_INHERITED_INPUT_REF_MAX: usize = 16;
 const AGENT_WAIT_DEFAULT_TIMEOUT_MS: u64 = 300_000;
 const AGENT_WAIT_MIN_TIMEOUT_MS: u64 = 1_000;
 const AGENT_WAIT_MAX_TIMEOUT_MS: u64 = 1_800_000;
@@ -546,6 +548,8 @@ fn execute_coordinator_tool(
             ));
             let child_policy_snapshot =
                 agent_spawn_child_policy_snapshot(task.policy_snapshot.as_ref(), access_mode);
+            let child_dependency_ids = agent_spawn_child_dependency_ids(task);
+            let child_input_refs = agent_spawn_child_input_refs(task);
             let child = magi_core::Task {
                 task_id: child_id.clone(),
                 mission_id: task.mission_id.clone(),
@@ -555,7 +559,7 @@ fn execute_coordinator_tool(
                 title: display_name,
                 goal: child_goal,
                 status: TaskStatus::Pending,
-                dependency_ids: Vec::new(),
+                dependency_ids: child_dependency_ids,
                 required_children: Vec::new(),
                 policy_snapshot: Some(child_policy_snapshot),
                 executor_binding: Some(serde_json::json!({
@@ -571,7 +575,7 @@ fn execute_coordinator_tool(
                 knowledge_refs: Vec::new(),
                 workspace_scope: task.workspace_scope.clone(),
                 write_scope: task.write_scope.clone(),
-                input_refs: Vec::new(),
+                input_refs: child_input_refs,
                 output_refs: Vec::new(),
                 evidence_refs: Vec::new(),
                 retry_count: 0,
@@ -942,6 +946,52 @@ fn agent_spawn_child_policy_snapshot(
     policy
 }
 
+fn agent_spawn_child_dependency_ids(parent: &magi_core::Task) -> Vec<TaskId> {
+    parent.dependency_ids.clone()
+}
+
+fn agent_spawn_child_input_refs(parent: &magi_core::Task) -> Vec<String> {
+    let mut refs = Vec::new();
+    push_agent_spawn_input_ref(
+        &mut refs,
+        format!(
+            "父任务事实：id={} title={} goal={}",
+            parent.task_id,
+            compact_agent_spawn_context_ref(&parent.title),
+            compact_agent_spawn_context_ref(&parent.goal)
+        ),
+    );
+    for input_ref in &parent.input_refs {
+        push_agent_spawn_input_ref(&mut refs, input_ref.clone());
+    }
+    for evidence_ref in &parent.evidence_refs {
+        push_agent_spawn_input_ref(&mut refs, format!("父任务证据：{evidence_ref}"));
+    }
+    refs
+}
+
+fn push_agent_spawn_input_ref(refs: &mut Vec<String>, value: String) {
+    if refs.len() >= AGENT_SPAWN_INHERITED_INPUT_REF_MAX {
+        return;
+    }
+    let compact = compact_agent_spawn_context_ref(&value);
+    if compact.is_empty() || refs.iter().any(|existing| existing == &compact) {
+        return;
+    }
+    refs.push(compact);
+}
+
+fn compact_agent_spawn_context_ref(value: &str) -> String {
+    let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() <= AGENT_SPAWN_PARENT_CONTEXT_MAX_CHARS {
+        return compact;
+    }
+    compact
+        .chars()
+        .take(AGENT_SPAWN_PARENT_CONTEXT_MAX_CHARS)
+        .collect::<String>()
+}
+
 fn default_agent_spawn_policy() -> TaskPolicy {
     TaskPolicy {
         autonomy_level: "Autonomous".to_string(),
@@ -992,6 +1042,8 @@ fn enqueue_agent_assignment_message(
                 "goal": child.goal,
                 "role": role,
                 "access_mode": access_mode,
+                "dependency_ids": child.dependency_ids.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                "input_refs": &child.input_refs,
             }),
             enqueued_at: now,
         });
@@ -1863,6 +1915,44 @@ mod tests {
     }
 
     #[test]
+    fn agent_spawn_child_context_inherits_parent_task_facts() {
+        let mut parent = test_task("task-agent-context-parent", "task-agent-context-root", None);
+        parent.title = "修复会话同步".to_string();
+        parent.goal = "必须检查 sessionId 和 workspaceId 是否匹配".to_string();
+        parent.input_refs = vec![
+            "用户要求：不要跨 workspace 读取 session".to_string(),
+            "用户要求：不要跨 workspace 读取 session".to_string(),
+        ];
+        parent.evidence_refs = vec!["证据：bootstrap 只接受后端 session".to_string()];
+        parent.dependency_ids = vec![TaskId::new("task-parent-dependency")];
+
+        let input_refs = agent_spawn_child_input_refs(&parent);
+        let dependency_ids = agent_spawn_child_dependency_ids(&parent);
+
+        assert_eq!(dependency_ids, vec![TaskId::new("task-parent-dependency")]);
+        assert!(
+            input_refs.iter().any(|value| value.contains("父任务事实")
+                && value.contains("task-agent-context-parent")
+                && value.contains("sessionId")),
+            "子代理 input_refs 必须包含父任务标题/目标事实，实际: {input_refs:?}"
+        );
+        assert_eq!(
+            input_refs
+                .iter()
+                .filter(|value| value.contains("不要跨 workspace 读取 session"))
+                .count(),
+            1,
+            "重复父 input_refs 只能继承一次"
+        );
+        assert!(
+            input_refs
+                .iter()
+                .any(|value| value.contains("父任务证据：证据：bootstrap")),
+            "父任务 evidence_refs 应作为子代理输入参考继承"
+        );
+    }
+
+    #[test]
     fn agent_spawn_contract_parser_extracts_explicit_user_parameters() {
         let contracts = parse_agent_spawn_parameter_contracts(
             "必须同一轮并行启动 2 个代理：1) role=explorer，display_name=「目录探查代理」，access_mode=read_only，目标：只读查看 /Users/xie/code/TEST 顶层目录；2) role=reviewer，display_name=「配置审查代理」，access_mode=read_only，目标：只读查看 README.md 和 package.json 是否存在。",
@@ -2654,6 +2744,8 @@ mod tests {
         );
         child.title = "目录探索".to_string();
         child.goal = "列出目录并汇报".to_string();
+        child.dependency_ids = vec![TaskId::new("task-agent-assignment-dependency")];
+        child.input_refs = vec!["父任务要求：只读检查目录".to_string()];
 
         enqueue_agent_assignment_message(
             &registry,
@@ -2678,6 +2770,14 @@ mod tests {
                 assert!(signal.trigger_turn);
                 assert_eq!(signal.payload["type"].as_str(), Some("agent_assignment"));
                 assert_eq!(signal.payload["goal"].as_str(), Some("列出目录并汇报"));
+                assert_eq!(
+                    signal.payload["dependency_ids"],
+                    serde_json::json!(["task-agent-assignment-dependency"])
+                );
+                assert_eq!(
+                    signal.payload["input_refs"],
+                    serde_json::json!(["父任务要求：只读检查目录"])
+                );
             }
             other => panic!("expected runtime assignment message, got {other:?}"),
         }
