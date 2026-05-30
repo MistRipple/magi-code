@@ -756,11 +756,13 @@ function syncBindingFromBridgeMessage(message: ClientBridgeMessage): void {
   if (!nextSessionId || nextSessionId === currentSessionId) {
     return;
   }
-  persistWorkspaceBinding(
-    binding.workspaceId || currentWorkspaceId,
-    binding.workspacePath || currentWorkspacePath,
-    nextSessionId,
-  );
+  if (!binding.workspaceId) {
+    console.warn('[web-client-bridge] 忽略缺少 workspaceId 的会话绑定更新', {
+      sessionId: nextSessionId,
+    });
+    return;
+  }
+  persistWorkspaceBinding(binding.workspaceId, binding.workspacePath, nextSessionId);
   ensureEventStream();
 }
 
