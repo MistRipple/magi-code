@@ -7,6 +7,7 @@ import {
   probeReachableAgentBaseUrl,
   resolveAgentBaseUrl,
 } from '../../web/agent-api';
+import { i18n } from '../../stores/i18n.svelte';
 import { getHostApi, getTransport, initTransport } from '../transport';
 import {
   approveAgentChange,
@@ -1153,9 +1154,14 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
 }
 
 function emitBridgeErrorToast(action: string, error: unknown): void {
-  const normalizedAction = action.trim() || '请求';
+  const normalizedAction = action.trim() || i18n.t('bridge.toast.defaultAction');
   const detail = normalizeErrorMessage(error);
-  const content = detail ? `${normalizedAction}失败：${detail}` : `${normalizedAction}失败`;
+  const content = detail
+    ? i18n.t('bridge.toast.actionFailedWithDetail', {
+        action: normalizedAction,
+        detail,
+      })
+    : i18n.t('bridge.toast.actionFailed', { action: normalizedAction });
   const now = Date.now();
   const message = createNotifyMessage(
     content,
@@ -1163,7 +1169,7 @@ function emitBridgeErrorToast(action: string, error: unknown): void {
     `web-bridge:${normalizedAction}`,
     undefined,
     {
-      title: '请求失败',
+      title: i18n.t('bridge.toast.requestFailedTitle'),
       displayMode: 'toast',
       category: 'incident',
       source: 'bridge-runtime',
@@ -1187,8 +1193,10 @@ function emitBridgeSuccessToast(
     displayMode?: 'toast' | 'notification_center';
   } = {},
 ): void {
-  const normalizedAction = action.trim() || '请求';
-  const content = detail?.trim() || `${normalizedAction}成功`;
+  const normalizedAction = action.trim() || i18n.t('bridge.toast.defaultAction');
+  const content = detail?.trim() || i18n.t('bridge.toast.actionSucceeded', {
+    action: normalizedAction,
+  });
   const now = Date.now();
   const message = createNotifyMessage(
     content,
@@ -1196,7 +1204,7 @@ function emitBridgeSuccessToast(
     `web-bridge-success:${normalizedAction}`,
     undefined,
     {
-      title: '操作完成',
+      title: i18n.t('bridge.toast.operationCompletedTitle'),
       displayMode: options.displayMode || 'toast',
       category: 'audit',
       source: 'bridge-runtime',
@@ -1220,7 +1228,7 @@ function emitBridgeInfoToast(
     displayMode?: 'toast' | 'notification_center';
   } = {},
 ): void {
-  const normalizedAction = action.trim() || '提示';
+  const normalizedAction = action.trim() || i18n.t('bridge.toast.defaultInfoAction');
   const content = detail.trim() || normalizedAction;
   const now = Date.now();
   const message = createNotifyMessage(
@@ -1229,7 +1237,7 @@ function emitBridgeInfoToast(
     `web-bridge-info:${normalizedAction}`,
     undefined,
     {
-      title: '提示',
+      title: i18n.t('bridge.toast.infoTitle'),
       displayMode: options.displayMode || 'toast',
       category: 'audit',
       source: 'bridge-runtime',
@@ -2668,147 +2676,225 @@ async function saveWorkerConfig(worker: string, config: Record<string, unknown>)
   await saveAgentWorkerConfig(worker, config);
   cachedSettingsBootstrap = null;
   await dispatchSettingsBootstrap(true);
-  emitBridgeSuccessToast('保存代理配置', `代理 ${worker} 配置已保存`, { displayMode: 'notification_center' });
+  emitBridgeSuccessToast(
+    i18n.t('settings.toast.action.saveWorkerConfig'),
+    i18n.t('settings.toast.workerConfigSaved', { worker }),
+    { displayMode: 'notification_center' },
+  );
 }
 
 async function saveUserRules(data: Record<string, unknown>): Promise<void> {
   await saveAgentUserRules(data);
   await dispatchSettingsBootstrap(true);
-  emitBridgeSuccessToast('保存用户规则', '用户规则已保存', { displayMode: 'notification_center' });
+  emitBridgeSuccessToast(
+    i18n.t('settings.toast.action.saveUserRules'),
+    i18n.t('settings.toast.userRulesSaved'),
+    { displayMode: 'notification_center' },
+  );
 }
 
 async function saveOrchestratorConfig(config: Record<string, unknown>): Promise<void> {
   await saveAgentOrchestratorConfig(config);
   cachedSettingsBootstrap = null;
   await dispatchSettingsBootstrap(true);
-  emitBridgeSuccessToast('保存主模型配置', '主模型配置已保存', { displayMode: 'notification_center' });
+  emitBridgeSuccessToast(
+    i18n.t('settings.toast.action.saveOrchestratorConfig'),
+    i18n.t('settings.toast.orchestratorConfigSaved'),
+    { displayMode: 'notification_center' },
+  );
 }
 
 async function saveAuxiliaryConfig(config: Record<string, unknown>): Promise<void> {
   await saveAgentAuxiliaryConfig(config);
   cachedSettingsBootstrap = null;
   await dispatchSettingsBootstrap(true);
-  emitBridgeSuccessToast('保存辅助模型配置', '辅助模型配置已保存', { displayMode: 'notification_center' });
+  emitBridgeSuccessToast(
+    i18n.t('settings.toast.action.saveAuxiliaryConfig'),
+    i18n.t('settings.toast.auxiliaryConfigSaved'),
+    { displayMode: 'notification_center' },
+  );
 }
 
 async function saveSafeguardConfig(config: Record<string, unknown>): Promise<void> {
   await saveAgentSafeguardConfig(config);
   cachedSettingsBootstrap = null;
   await dispatchSettingsBootstrap(true);
-  emitBridgeSuccessToast('保存安全防护配置', '安全防护配置已保存', { displayMode: 'notification_center' });
+  emitBridgeSuccessToast(
+    i18n.t('settings.toast.action.saveSafeguardConfig'),
+    i18n.t('settings.toast.safeguardConfigSaved'),
+    { displayMode: 'notification_center' },
+  );
 }
 
 async function testWorkerConnection(worker: string, config: Record<string, unknown>): Promise<void> {
   const payload = await testAgentWorkerConnection(worker, config);
   emitDataMessage('workerConnectionTestResult', payload);
-  emitBridgeSuccessToast('测试代理连接', `代理 ${worker} 连接测试已完成`, { displayMode: 'notification_center' });
+  emitBridgeSuccessToast(
+    i18n.t('settings.toast.action.testWorkerConnection'),
+    i18n.t('settings.toast.workerConnectionTestCompleted', { worker }),
+    { displayMode: 'notification_center' },
+  );
 }
 
 async function testOrchestratorConnection(config: Record<string, unknown>): Promise<void> {
   const payload = await testAgentOrchestratorConnection(config);
   emitDataMessage('orchestratorConnectionTestResult', payload);
-  emitBridgeSuccessToast('测试主模型连接', '主模型连接测试已完成', { displayMode: 'notification_center' });
+  emitBridgeSuccessToast(
+    i18n.t('settings.toast.action.testOrchestratorConnection'),
+    i18n.t('settings.toast.orchestratorConnectionTestCompleted'),
+    { displayMode: 'notification_center' },
+  );
 }
 
 async function testAuxiliaryConnection(config: Record<string, unknown>): Promise<void> {
   const payload = await testAgentAuxiliaryConnection(config);
   emitDataMessage('auxiliaryConnectionTestResult', payload);
-  emitBridgeSuccessToast('测试辅助模型连接', '辅助模型连接测试已完成', { displayMode: 'notification_center' });
+  emitBridgeSuccessToast(
+    i18n.t('settings.toast.action.testAuxiliaryConnection'),
+    i18n.t('settings.toast.auxiliaryConnectionTestCompleted'),
+    { displayMode: 'notification_center' },
+  );
 }
 
 async function fetchModelList(config: Record<string, unknown>, target: string): Promise<void> {
   const blockReason = resolveModelListFetchBlockReason(config);
   if (blockReason) {
     emitBridgeInfoToast(
-      '获取模型列表',
+      i18n.t('settings.toast.action.fetchModelList'),
       blockReason === 'full_url_mode'
-        ? '完整路径模式下不支持自动获取模型列表，请手动填写模型名'
-        : '请先填写 Base URL 和 API Key',
+        ? i18n.t('config.toast.modelListUnsupportedInFullMode')
+        : i18n.t('config.toast.fillBaseUrlFirst'),
     );
     return;
   }
   const payload = await fetchAgentModelList(config, target);
   emitDataMessage('modelListFetched', { ...payload });
-  emitBridgeSuccessToast('获取模型列表', `${target} 模型列表已刷新`, { displayMode: 'notification_center' });
+  emitBridgeSuccessToast(
+    i18n.t('settings.toast.action.fetchModelList'),
+    i18n.t('settings.toast.modelListRefreshedForTarget', { target }),
+    { displayMode: 'notification_center' },
+  );
 }
 
 async function addMcpServer(server: Record<string, unknown>): Promise<void> {
   const payload = await addAgentMcpServer(server);
   emitDataMessage('mcpServerAdded', payload);
   await dispatchSettingsBootstrap(true);
-  emitBridgeSuccessToast('添加 MCP 服务器', 'MCP 服务器已添加');
+  emitBridgeSuccessToast(
+    i18n.t('settings.toast.action.addMcpServer'),
+    i18n.t('settings.toast.mcpServerAdded'),
+  );
 }
 
 async function updateMcpServer(serverId: string, updates: Record<string, unknown>): Promise<void> {
   const payload = await updateAgentMcpServer(serverId, updates);
   emitDataMessage('mcpServerUpdated', payload);
   await dispatchSettingsBootstrap(true);
-  emitBridgeSuccessToast('更新 MCP 服务器', 'MCP 服务器已更新');
+  emitBridgeSuccessToast(
+    i18n.t('settings.toast.action.updateMcpServer'),
+    i18n.t('settings.toast.mcpServerUpdated'),
+  );
 }
 
 async function deleteMcpServer(serverId: string): Promise<void> {
   const payload = await deleteAgentMcpServer(serverId);
   emitDataMessage('mcpServerDeleted', payload);
   await dispatchSettingsBootstrap(true);
-  emitBridgeSuccessToast('删除 MCP 服务器', 'MCP 服务器已删除');
+  emitBridgeSuccessToast(
+    i18n.t('settings.toast.action.deleteMcpServer'),
+    i18n.t('settings.toast.mcpServerDeleted'),
+  );
 }
 
 async function getMcpServerTools(serverId: string): Promise<void> {
   const payload = await getAgentMcpServerTools(serverId);
   emitDataMessage('mcpServerTools', payload);
-  emitBridgeSuccessToast('获取 MCP 工具', 'MCP 工具列表已加载', { displayMode: 'notification_center' });
+  emitBridgeSuccessToast(
+    i18n.t('settings.toast.action.loadMcpToolList'),
+    i18n.t('settings.toast.mcpToolListLoaded'),
+    { displayMode: 'notification_center' },
+  );
 }
 
 async function refreshMcpTools(serverId: string): Promise<void> {
   const payload = await refreshAgentMcpTools(serverId);
   emitDataMessage('mcpToolsRefreshed', payload);
   await dispatchSettingsBootstrap(true);
-  emitBridgeSuccessToast('刷新 MCP 工具', 'MCP 工具已刷新', { displayMode: 'notification_center' });
+  emitBridgeSuccessToast(
+    i18n.t('settings.toast.action.refreshMcpTools'),
+    i18n.t('settings.toast.mcpToolsRefreshed'),
+    { displayMode: 'notification_center' },
+  );
 }
 
 async function connectMcpServer(serverId: string): Promise<void> {
   await connectAgentMcpServer(serverId);
   await dispatchSettingsBootstrap(true);
-  emitBridgeSuccessToast('连接 MCP 服务器', 'MCP 服务器已连接', { displayMode: 'notification_center' });
+  emitBridgeSuccessToast(
+    i18n.t('settings.toast.action.connectMcpServer'),
+    i18n.t('settings.toast.mcpServerConnected'),
+    { displayMode: 'notification_center' },
+  );
 }
 
 async function disconnectMcpServer(serverId: string): Promise<void> {
   await disconnectAgentMcpServer(serverId);
   await dispatchSettingsBootstrap(true);
-  emitBridgeSuccessToast('断开 MCP 服务器', 'MCP 服务器已断开', { displayMode: 'notification_center' });
+  emitBridgeSuccessToast(
+    i18n.t('settings.toast.action.disconnectMcpServer'),
+    i18n.t('settings.toast.mcpServerDisconnected'),
+    { displayMode: 'notification_center' },
+  );
 }
 
 async function addRepository(url: string): Promise<void> {
   const payload = await addAgentRepository(url);
   emitDataMessage('repositoryAdded', payload);
   await dispatchSettingsBootstrap(true);
-  emitBridgeSuccessToast('添加仓库', '仓库已添加');
+  emitBridgeSuccessToast(
+    i18n.t('settings.toast.action.addRepository'),
+    i18n.t('settings.toast.repositoryAdded'),
+  );
 }
 
 async function updateRepository(repositoryId: string, updates: Record<string, unknown>): Promise<void> {
   await updateAgentRepository(repositoryId, updates);
   await dispatchSettingsBootstrap(true);
-  emitBridgeSuccessToast('更新仓库', '仓库已更新');
+  emitBridgeSuccessToast(
+    i18n.t('settings.toast.action.updateRepository'),
+    i18n.t('settings.toast.repositoryUpdated'),
+  );
 }
 
 async function deleteRepository(repositoryId: string): Promise<void> {
   const payload = await deleteAgentRepository(repositoryId);
   emitDataMessage('repositoryDeleted', payload);
   await dispatchSettingsBootstrap(true);
-  emitBridgeSuccessToast('删除仓库', '仓库已删除');
+  emitBridgeSuccessToast(
+    i18n.t('settings.toast.action.deleteRepository'),
+    i18n.t('settings.toast.repositoryDeleted'),
+  );
 }
 
 async function refreshRepository(repositoryId: string): Promise<void> {
   const payload = await refreshAgentRepository(repositoryId);
   emitDataMessage('repositoryRefreshed', payload);
   await dispatchSettingsBootstrap(true);
-  emitBridgeSuccessToast('刷新仓库', '仓库已刷新', { displayMode: 'notification_center' });
+  emitBridgeSuccessToast(
+    i18n.t('settings.toast.action.refreshRepository'),
+    i18n.t('settings.toast.repositoryRefreshed'),
+    { displayMode: 'notification_center' },
+  );
 }
 
 async function loadSkillLibrary(): Promise<void> {
   const payload = await loadAgentSkillLibrary();
   emitDataMessage('skillLibraryLoaded', payload);
-  emitBridgeSuccessToast('加载技能库', '技能库已加载', { displayMode: 'notification_center' });
+  emitBridgeSuccessToast(
+    i18n.t('settings.toast.action.loadSkillLibrary'),
+    i18n.t('settings.toast.skillLibraryLoaded'),
+    { displayMode: 'notification_center' },
+  );
 }
 
 async function installSkill(skillId: string): Promise<void> {
@@ -2817,13 +2903,17 @@ async function installSkill(skillId: string): Promise<void> {
     emitDataMessage('skillInstalled', payload);
     await dispatchSettingsBootstrap(true);
     await loadSkillLibrary();
-    emitBridgeSuccessToast('安装技能', '技能已安装');
+    emitBridgeSuccessToast(
+      i18n.t('settings.toast.action.installSkill'),
+      i18n.t('settings.toast.skillInstalled'),
+    );
   } catch (error) {
     emitDataMessage('skillInstallFailed', {
       skillId,
       error: error instanceof Error ? error.message : String(error),
       source: 'repository',
     });
+    emitBridgeErrorToast(i18n.t('settings.toast.action.installSkill'), error);
   }
 }
 
@@ -2840,26 +2930,37 @@ async function installLocalSkill(directoryPath?: string): Promise<void> {
     emitDataMessage('skillInstalled', payload);
     await dispatchSettingsBootstrap(true);
     await loadSkillLibrary();
-    emitBridgeSuccessToast('安装本地技能', '本地技能已安装');
+    emitBridgeSuccessToast(
+      i18n.t('settings.toast.action.installLocalSkill'),
+      i18n.t('settings.toast.localSkillInstalled'),
+    );
   } catch (error) {
     emitDataMessage('skillInstallFailed', {
       error: error instanceof Error ? error.message : String(error),
       source: 'local',
     });
+    emitBridgeErrorToast(i18n.t('settings.toast.action.installLocalSkill'), error);
   }
 }
 
 async function saveSkillsConfig(config: Record<string, unknown>): Promise<void> {
   await saveAgentSkillsConfig(config);
   await dispatchSettingsBootstrap(true);
-  emitBridgeSuccessToast('保存技能配置', '技能配置已保存', { displayMode: 'notification_center' });
+  emitBridgeSuccessToast(
+    i18n.t('settings.toast.action.saveSkillConfig'),
+    i18n.t('settings.toast.skillConfigSaved'),
+    { displayMode: 'notification_center' },
+  );
 }
 
 async function addCustomTool(tool: Record<string, unknown>): Promise<void> {
   const payload = await addAgentCustomTool(tool);
   emitDataMessage('customToolAdded', payload);
   await dispatchSettingsBootstrap(true);
-  emitBridgeSuccessToast('添加自定义工具', '自定义工具已添加');
+  emitBridgeSuccessToast(
+    i18n.t('settings.toast.action.addCustomTool'),
+    i18n.t('settings.toast.customToolAdded'),
+  );
 }
 
 async function removeInstalledSkill(
@@ -2870,28 +2971,42 @@ async function removeInstalledSkill(
   const messageType = source === 'custom' ? 'customToolRemoved' : 'instructionSkillRemoved';
   emitDataMessage(messageType, payload);
   await dispatchSettingsBootstrap(true);
-  const label = source === 'custom' ? '自定义工具' : '指令技能';
-  emitBridgeSuccessToast(`删除${label}`, `${label}已删除`);
+  const action = source === 'custom'
+    ? i18n.t('settings.toast.action.deleteCustomTool')
+    : i18n.t('settings.toast.action.deleteInstructionSkill');
+  const detail = source === 'custom'
+    ? i18n.t('settings.toast.customToolDeleted')
+    : i18n.t('settings.toast.instructionSkillDeleted');
+  emitBridgeSuccessToast(action, detail);
 }
 
 async function updateSkill(skillName: string): Promise<void> {
   const payload = await updateAgentSkill(skillName);
   emitDataMessage('skillUpdated', payload);
   await dispatchSettingsBootstrap(true);
-  emitBridgeSuccessToast('更新技能', '技能已更新');
+  emitBridgeSuccessToast(
+    i18n.t('settings.toast.action.updateSkill'),
+    i18n.t('settings.toast.skillUpdated'),
+  );
 }
 
 async function updateAllSkills(): Promise<void> {
   const payload = await updateAllAgentSkills();
   emitDataMessage('allSkillsUpdated', payload);
   await dispatchSettingsBootstrap(true);
-  emitBridgeSuccessToast('更新全部技能', '全部技能已更新');
+  emitBridgeSuccessToast(
+    i18n.t('settings.toast.action.updateAllSkills'),
+    i18n.t('settings.toast.allSkillsUpdated'),
+  );
 }
 
 async function clearProjectKnowledge(): Promise<void> {
   await clearAgentProjectKnowledge();
   await emitKnowledgePayload();
-  emitBridgeSuccessToast('清空项目知识', '项目知识已清空');
+  emitBridgeSuccessToast(
+    i18n.t('settings.toast.action.clearProjectKnowledge'),
+    i18n.t('settings.toast.projectKnowledgeCleared'),
+  );
 }
 
 export function createWebClientBridge(): ClientBridge {
@@ -2921,150 +3036,238 @@ export function createWebClientBridge(): ClientBridge {
           return;
         case 'loadSettingsBootstrap':
           void dispatchSettingsBootstrap(Boolean(message.force), 'core').catch((error) => {
-            reportExpectedRecoveryFailure('settings 配置加载', '[web-client-bridge] settings 配置加载失败:', error);
+            reportExpectedRecoveryFailure(
+              i18n.t('settings.toast.action.loadSettingsData'),
+              '[web-client-bridge] settings 配置加载失败:',
+              error,
+            );
           });
           return;
         case 'saveUserRules':
           if (message.data && typeof message.data === 'object') {
             void saveUserRules(message.data as Record<string, unknown>).catch((error) => {
-              logBridgeOperationFailure('保存用户规则', '[web-client-bridge] 保存用户规则失败:', error);
+              logBridgeOperationFailure(
+                i18n.t('settings.toast.action.saveUserRules'),
+                '[web-client-bridge] 保存用户规则失败:',
+                error,
+              );
             });
           }
           return;
         case 'saveWorkerConfig':
           if (typeof message.worker === 'string' && message.config && typeof message.config === 'object') {
             void saveWorkerConfig(message.worker, message.config as Record<string, unknown>).catch((error) => {
-              logBridgeOperationFailure('保存代理配置', '[web-client-bridge] 保存代理配置失败:', error);
+              logBridgeOperationFailure(
+                i18n.t('settings.toast.action.saveWorkerConfig'),
+                '[web-client-bridge] 保存代理配置失败:',
+                error,
+              );
             });
           }
           return;
         case 'saveOrchestratorConfig':
           if (message.config && typeof message.config === 'object') {
             void saveOrchestratorConfig(message.config as Record<string, unknown>).catch((error) => {
-              logBridgeOperationFailure('保存主模型配置', '[web-client-bridge] 保存主模型配置失败:', error);
+              logBridgeOperationFailure(
+                i18n.t('settings.toast.action.saveOrchestratorConfig'),
+                '[web-client-bridge] 保存主模型配置失败:',
+                error,
+              );
             });
           }
           return;
         case 'saveAuxiliaryConfig':
           if (message.config && typeof message.config === 'object') {
             void saveAuxiliaryConfig(message.config as Record<string, unknown>).catch((error) => {
-              logBridgeOperationFailure('保存辅助模型配置', '[web-client-bridge] 保存辅助模型配置失败:', error);
+              logBridgeOperationFailure(
+                i18n.t('settings.toast.action.saveAuxiliaryConfig'),
+                '[web-client-bridge] 保存辅助模型配置失败:',
+                error,
+              );
             });
           }
           return;
         case 'saveSafeguardConfig':
           if (message.config && typeof message.config === 'object') {
             void saveSafeguardConfig(message.config as any).catch((error) => {
-              logBridgeOperationFailure('保存安全防护配置', '[web-client-bridge] 保存安全防护配置失败:', error);
+              logBridgeOperationFailure(
+                i18n.t('settings.toast.action.saveSafeguardConfig'),
+                '[web-client-bridge] 保存安全防护配置失败:',
+                error,
+              );
             });
           }
           return;
         case 'testWorkerConnection':
           if (typeof message.worker === 'string' && message.config && typeof message.config === 'object') {
             void testWorkerConnection(message.worker, message.config as Record<string, unknown>).catch((error) => {
-              logBridgeOperationFailure('测试代理连接', '[web-client-bridge] 测试代理连接失败:', error);
+              logBridgeOperationFailure(
+                i18n.t('settings.toast.action.testWorkerConnection'),
+                '[web-client-bridge] 测试代理连接失败:',
+                error,
+              );
             });
           }
           return;
         case 'testOrchestratorConnection':
           if (message.config && typeof message.config === 'object') {
             void testOrchestratorConnection(message.config as Record<string, unknown>).catch((error) => {
-              logBridgeOperationFailure('测试主模型连接', '[web-client-bridge] 测试主模型连接失败:', error);
+              logBridgeOperationFailure(
+                i18n.t('settings.toast.action.testOrchestratorConnection'),
+                '[web-client-bridge] 测试主模型连接失败:',
+                error,
+              );
             });
           }
           return;
         case 'testAuxiliaryConnection':
           if (message.config && typeof message.config === 'object') {
             void testAuxiliaryConnection(message.config as Record<string, unknown>).catch((error) => {
-              logBridgeOperationFailure('测试辅助模型连接', '[web-client-bridge] 测试辅助模型连接失败:', error);
+              logBridgeOperationFailure(
+                i18n.t('settings.toast.action.testAuxiliaryConnection'),
+                '[web-client-bridge] 测试辅助模型连接失败:',
+                error,
+              );
             });
           }
           return;
         case 'fetchModelList':
           if (message.config && typeof message.config === 'object' && typeof message.target === 'string') {
             void fetchModelList(message.config as Record<string, unknown>, message.target).catch((error) => {
-              logBridgeOperationFailure('获取模型列表', '[web-client-bridge] 获取模型列表失败:', error);
+              logBridgeOperationFailure(
+                i18n.t('settings.toast.action.fetchModelList'),
+                '[web-client-bridge] 获取模型列表失败:',
+                error,
+              );
             });
           }
           return;
         case 'addMCPServer':
           if (message.server && typeof message.server === 'object') {
             void addMcpServer(message.server as Record<string, unknown>).catch((error) => {
-              logBridgeOperationFailure('添加 MCP 服务器', '[web-client-bridge] 添加 MCP 服务器失败:', error);
+              logBridgeOperationFailure(
+                i18n.t('settings.toast.action.addMcpServer'),
+                '[web-client-bridge] 添加 MCP 服务器失败:',
+                error,
+              );
             });
           }
           return;
         case 'updateMCPServer':
           if (typeof message.serverId === 'string' && message.updates && typeof message.updates === 'object') {
             void updateMcpServer(message.serverId, message.updates as Record<string, unknown>).catch((error) => {
-              logBridgeOperationFailure('更新 MCP 服务器', '[web-client-bridge] 更新 MCP 服务器失败:', error);
+              logBridgeOperationFailure(
+                i18n.t('settings.toast.action.updateMcpServer'),
+                '[web-client-bridge] 更新 MCP 服务器失败:',
+                error,
+              );
             });
           }
           return;
         case 'deleteMCPServer':
           if (typeof message.serverId === 'string' && message.serverId.trim()) {
             void deleteMcpServer(message.serverId).catch((error) => {
-              logBridgeOperationFailure('删除 MCP 服务器', '[web-client-bridge] 删除 MCP 服务器失败:', error);
+              logBridgeOperationFailure(
+                i18n.t('settings.toast.action.deleteMcpServer'),
+                '[web-client-bridge] 删除 MCP 服务器失败:',
+                error,
+              );
             });
           }
           return;
         case 'getMCPServerTools':
           if (typeof message.serverId === 'string' && message.serverId.trim()) {
             void getMcpServerTools(message.serverId).catch((error) => {
-              logBridgeOperationFailure('获取 MCP 工具', '[web-client-bridge] 获取 MCP 工具失败:', error);
+              logBridgeOperationFailure(
+                i18n.t('settings.toast.action.loadMcpToolList'),
+                '[web-client-bridge] 获取 MCP 工具失败:',
+                error,
+              );
             });
           }
           return;
         case 'refreshMCPTools':
           if (typeof message.serverId === 'string' && message.serverId.trim()) {
             void refreshMcpTools(message.serverId).catch((error) => {
-              logBridgeOperationFailure('刷新 MCP 工具', '[web-client-bridge] 刷新 MCP 工具失败:', error);
+              logBridgeOperationFailure(
+                i18n.t('settings.toast.action.refreshMcpTools'),
+                '[web-client-bridge] 刷新 MCP 工具失败:',
+                error,
+              );
             });
           }
           return;
         case 'addRepository':
           if (typeof message.url === 'string' && message.url.trim()) {
             void addRepository(message.url).catch((error) => {
-              logBridgeOperationFailure('添加仓库', '[web-client-bridge] 添加仓库失败:', error);
+              logBridgeOperationFailure(
+                i18n.t('settings.toast.action.addRepository'),
+                '[web-client-bridge] 添加仓库失败:',
+                error,
+              );
             });
           }
           return;
         case 'updateRepository':
           if (typeof message.repositoryId === 'string' && message.updates && typeof message.updates === 'object') {
             void updateRepository(message.repositoryId, message.updates as Record<string, unknown>).catch((error) => {
-              logBridgeOperationFailure('更新仓库', '[web-client-bridge] 更新仓库失败:', error);
+              logBridgeOperationFailure(
+                i18n.t('settings.toast.action.updateRepository'),
+                '[web-client-bridge] 更新仓库失败:',
+                error,
+              );
             });
           }
           return;
         case 'deleteRepository':
           if (typeof message.repositoryId === 'string' && message.repositoryId.trim()) {
             void deleteRepository(message.repositoryId).catch((error) => {
-              logBridgeOperationFailure('删除仓库', '[web-client-bridge] 删除仓库失败:', error);
+              logBridgeOperationFailure(
+                i18n.t('settings.toast.action.deleteRepository'),
+                '[web-client-bridge] 删除仓库失败:',
+                error,
+              );
             });
           }
           return;
         case 'refreshRepository':
           if (typeof message.repositoryId === 'string' && message.repositoryId.trim()) {
             void refreshRepository(message.repositoryId).catch((error) => {
-              logBridgeOperationFailure('刷新仓库', '[web-client-bridge] 刷新仓库失败:', error);
+              logBridgeOperationFailure(
+                i18n.t('settings.toast.action.refreshRepository'),
+                '[web-client-bridge] 刷新仓库失败:',
+                error,
+              );
             });
           }
           return;
         case 'loadSkillLibrary':
           void loadSkillLibrary().catch((error) => {
-            logBridgeOperationFailure('加载技能库', '[web-client-bridge] 加载技能库失败:', error);
+            logBridgeOperationFailure(
+              i18n.t('settings.toast.action.loadSkillLibrary'),
+              '[web-client-bridge] 加载技能库失败:',
+              error,
+            );
           });
           return;
         case 'installSkill':
           if (typeof message.skillId === 'string' && message.skillId.trim()) {
             void installSkill(message.skillId).catch((error) => {
-              logBridgeOperationFailure('安装技能', '[web-client-bridge] 安装技能失败:', error);
+              logBridgeOperationFailure(
+                i18n.t('settings.toast.action.installSkill'),
+                '[web-client-bridge] 安装技能失败:',
+                error,
+              );
             });
           }
           return;
         case 'installLocalSkill':
           void installLocalSkill(typeof message.directoryPath === 'string' ? message.directoryPath : undefined).catch((error) => {
-            logBridgeOperationFailure('安装本地技能', '[web-client-bridge] 安装本地技能失败:', error);
+            logBridgeOperationFailure(
+              i18n.t('settings.toast.action.installLocalSkill'),
+              '[web-client-bridge] 安装本地技能失败:',
+              error,
+            );
           });
           return;
         case 'removeInstalledSkill': {
@@ -3077,9 +3280,18 @@ export function createWebClientBridge(): ClientBridge {
             ? message.source
             : null;
           if (skillName.trim() && source) {
-            const label = source === 'custom' ? '自定义工具' : '指令技能';
+            const action = source === 'custom'
+              ? i18n.t('settings.toast.action.deleteCustomTool')
+              : i18n.t('settings.toast.action.deleteInstructionSkill');
+            const logLabel = source === 'custom'
+              ? '[web-client-bridge] 删除自定义工具失败:'
+              : '[web-client-bridge] 删除指令技能失败:';
             void removeInstalledSkill(skillName, source).catch((error) => {
-              logBridgeOperationFailure(`删除${label}`, `[web-client-bridge] 删除${label}失败:`, error);
+              logBridgeOperationFailure(
+                action,
+                logLabel,
+                error,
+              );
             });
           }
           return;
@@ -3087,13 +3299,21 @@ export function createWebClientBridge(): ClientBridge {
         case 'updateSkill':
           if (typeof message.skillName === 'string' && message.skillName.trim()) {
             void updateSkill(message.skillName).catch((error) => {
-              logBridgeOperationFailure('更新技能', '[web-client-bridge] 更新技能失败:', error);
+              logBridgeOperationFailure(
+                i18n.t('settings.toast.action.updateSkill'),
+                '[web-client-bridge] 更新技能失败:',
+                error,
+              );
             });
           }
           return;
         case 'updateAllSkills':
           void updateAllSkills().catch((error) => {
-            logBridgeOperationFailure('更新全部技能', '[web-client-bridge] 更新全部技能失败:', error);
+            logBridgeOperationFailure(
+              i18n.t('settings.toast.action.updateAllSkills'),
+              '[web-client-bridge] 更新全部技能失败:',
+              error,
+            );
           });
           return;
         case 'newSession':
@@ -3388,12 +3608,20 @@ export function createWebClientBridge(): ClientBridge {
           return;
         case 'getProjectKnowledge':
           void dispatchProjectKnowledge().catch((error) => {
-            logBridgeOperationFailure('项目知识加载', '[web-client-bridge] 项目知识加载失败:', error);
+            logBridgeOperationFailure(
+              i18n.t('settings.toast.action.loadProjectKnowledge'),
+              '[web-client-bridge] 项目知识加载失败:',
+              error,
+            );
           });
           return;
         case 'clearProjectKnowledge':
           void clearProjectKnowledge().catch((error) => {
-            logBridgeOperationFailure('清空项目知识', '[web-client-bridge] 清空项目知识失败:', error);
+            logBridgeOperationFailure(
+              i18n.t('settings.toast.action.clearProjectKnowledge'),
+              '[web-client-bridge] 清空项目知识失败:',
+              error,
+            );
           });
           return;
         case 'addKnowledgeItem': {
@@ -3449,28 +3677,44 @@ export function createWebClientBridge(): ClientBridge {
         case 'connectMCPServer':
           if (typeof message.serverId === 'string' && message.serverId.trim()) {
             void connectMcpServer(message.serverId).catch((error) => {
-              logBridgeOperationFailure('连接 MCP 服务器', '[web-client-bridge] 连接 MCP 服务器失败:', error);
+              logBridgeOperationFailure(
+                i18n.t('settings.toast.action.connectMcpServer'),
+                '[web-client-bridge] 连接 MCP 服务器失败:',
+                error,
+              );
             });
           }
           return;
         case 'disconnectMCPServer':
           if (typeof message.serverId === 'string' && message.serverId.trim()) {
             void disconnectMcpServer(message.serverId).catch((error) => {
-              logBridgeOperationFailure('断开 MCP 服务器', '[web-client-bridge] 断开 MCP 服务器失败:', error);
+              logBridgeOperationFailure(
+                i18n.t('settings.toast.action.disconnectMcpServer'),
+                '[web-client-bridge] 断开 MCP 服务器失败:',
+                error,
+              );
             });
           }
           return;
         case 'saveSkillsConfig':
           if (message.config && typeof message.config === 'object') {
             void saveSkillsConfig(message.config as Record<string, unknown>).catch((error) => {
-              logBridgeOperationFailure('保存技能配置', '[web-client-bridge] 保存技能配置失败:', error);
+              logBridgeOperationFailure(
+                i18n.t('settings.toast.action.saveSkillConfig'),
+                '[web-client-bridge] 保存技能配置失败:',
+                error,
+              );
             });
           }
           return;
         case 'addCustomTool':
           if (message.tool && typeof message.tool === 'object') {
             void addCustomTool(message.tool as Record<string, unknown>).catch((error) => {
-              logBridgeOperationFailure('添加自定义工具', '[web-client-bridge] 添加自定义工具失败:', error);
+              logBridgeOperationFailure(
+                i18n.t('settings.toast.action.addCustomTool'),
+                '[web-client-bridge] 添加自定义工具失败:',
+                error,
+              );
             });
           }
           return;
