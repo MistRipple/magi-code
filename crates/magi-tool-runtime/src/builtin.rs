@@ -1423,6 +1423,15 @@ fn builtin_error(tool: &str, message: impl Into<String>) -> String {
     .to_string()
 }
 
+fn builtin_rejected(tool: &str, message: impl Into<String>) -> String {
+    serde_json::json!({
+        "tool": tool,
+        "status": "rejected",
+        "error": message.into(),
+    })
+    .to_string()
+}
+
 /// 协调器 / 长任务工具（agent_spawn 等）落到 BuiltinTool::execute 时
 /// 必然是误调用——它们的语义需要 orchestration 层访问 task_store + spawn_graph +
 /// conversation registry，远超 BuiltinTool trait 暴露的 ToolExecutionContext。
@@ -1844,6 +1853,9 @@ fn execute_file_remove(input: &str, context: &ToolExecutionContext) -> String {
     if !path.exists() {
         return builtin_error("file_remove", format!("路径不存在: {}", path.display()));
     }
+    if let Some(reason) = protected_remove_target_reason(&path_input, &path, context) {
+        return builtin_rejected("file_remove", reason);
+    }
 
     let is_dir = path.is_dir();
     let result = if is_dir {
@@ -1870,6 +1882,59 @@ fn execute_file_remove(input: &str, context: &ToolExecutionContext) -> String {
         "summary": format!("已删除 {}", path.display())
     })
     .to_string()
+}
+
+fn protected_remove_target_reason(
+    raw_input: &str,
+    path: &Path,
+    context: &ToolExecutionContext,
+) -> Option<String> {
+    let trimmed = raw_input.trim();
+    if matches!(trimmed, "/" | "." | ".." | "~") {
+        return Some(format!(
+            "拒绝删除受保护路径: {}",
+            if trimmed.is_empty() {
+                "<empty>"
+            } else {
+                trimmed
+            }
+        ));
+    }
+
+    let canonical_target = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    if is_filesystem_root(&canonical_target) {
+        return Some(format!(
+            "拒绝删除文件系统根目录: {}",
+            canonical_target.display()
+        ));
+    }
+
+    if let Ok(cwd) = context_working_directory(context)
+        && let Ok(canonical_cwd) = cwd.canonicalize()
+        && canonical_target == canonical_cwd
+    {
+        return Some(format!(
+            "拒绝删除当前工作目录: {}",
+            canonical_target.display()
+        ));
+    }
+
+    if let Some(home) = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .and_then(|path| path.canonicalize().ok())
+        && canonical_target == home
+    {
+        return Some(format!(
+            "拒绝删除用户 HOME 目录: {}",
+            canonical_target.display()
+        ));
+    }
+
+    None
+}
+
+fn is_filesystem_root(path: &Path) -> bool {
+    path.parent().is_none()
 }
 
 fn execute_file_mkdir(input: &str, context: &ToolExecutionContext) -> String {

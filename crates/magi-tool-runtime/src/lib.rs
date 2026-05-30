@@ -4261,6 +4261,22 @@ mod tests {
         tool: BuiltinToolName,
         input: &str,
     ) -> ToolExecutionOutput {
+        exec_tool_with_context_and_policy(
+            registry,
+            tool,
+            input,
+            ToolExecutionContext::default(),
+            ToolExecutionPolicy::default(),
+        )
+    }
+
+    fn exec_tool_with_context_and_policy(
+        registry: &ToolRegistry,
+        tool: BuiltinToolName,
+        input: &str,
+        context: ToolExecutionContext,
+        policy: ToolExecutionPolicy,
+    ) -> ToolExecutionOutput {
         registry.execute_with_policy(
             ToolExecutionInput {
                 tool_call_id: ToolCallId::new(format!("tc-{}", tool.as_str())),
@@ -4270,8 +4286,8 @@ mod tests {
                 approval_requirement: ApprovalRequirement::None,
                 risk_level: RiskLevel::Low,
             },
-            ToolExecutionContext::default(),
-            &ToolExecutionPolicy::default(),
+            context,
+            &policy,
         )
     }
 
@@ -4520,6 +4536,93 @@ mod tests {
         );
         assert_eq!(output2.status, ExecutionResultStatus::Succeeded);
         assert!(!subdir.exists());
+    }
+
+    #[test]
+    fn file_remove_rejects_workspace_root_even_in_full_access() {
+        let root = unique_temp_dir("magi-tool-file-remove-protected-root");
+        fs::write(root.join("keep.txt"), "keep").unwrap();
+        let registry = make_registry();
+
+        let output = exec_tool_with_context_and_policy(
+            &registry,
+            BuiltinToolName::FileRemove,
+            &serde_json::json!({ "path": ".", "recursive": true }).to_string(),
+            ToolExecutionContext {
+                working_directory: Some(root.clone()),
+                ..ToolExecutionContext::default()
+            },
+            ToolExecutionPolicy {
+                access_profile: magi_core::AccessProfile::FullAccess,
+                ..ToolExecutionPolicy::default()
+            },
+        );
+
+        assert_eq!(output.status, ExecutionResultStatus::Rejected);
+        let payload: Value = serde_json::from_str(&output.payload).unwrap();
+        assert!(
+            payload["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("拒绝删除受保护路径")
+        );
+        assert!(root.join("keep.txt").exists());
+    }
+
+    #[test]
+    fn file_remove_rejects_absolute_working_directory_even_in_full_access() {
+        let root = unique_temp_dir("magi-tool-file-remove-protected-absolute");
+        fs::write(root.join("keep.txt"), "keep").unwrap();
+        let registry = make_registry();
+
+        let output = exec_tool_with_context_and_policy(
+            &registry,
+            BuiltinToolName::FileRemove,
+            &serde_json::json!({ "path": root.to_string_lossy(), "recursive": true }).to_string(),
+            ToolExecutionContext {
+                working_directory: Some(root.clone()),
+                ..ToolExecutionContext::default()
+            },
+            ToolExecutionPolicy {
+                access_profile: magi_core::AccessProfile::FullAccess,
+                ..ToolExecutionPolicy::default()
+            },
+        );
+
+        assert_eq!(output.status, ExecutionResultStatus::Rejected);
+        let payload: Value = serde_json::from_str(&output.payload).unwrap();
+        assert!(
+            payload["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("拒绝删除当前工作目录")
+        );
+        assert!(root.join("keep.txt").exists());
+    }
+
+    #[test]
+    fn file_remove_rejects_filesystem_root_even_in_full_access() {
+        let registry = make_registry();
+
+        let output = exec_tool_with_context_and_policy(
+            &registry,
+            BuiltinToolName::FileRemove,
+            &serde_json::json!({ "path": "/", "recursive": true }).to_string(),
+            ToolExecutionContext::default(),
+            ToolExecutionPolicy {
+                access_profile: magi_core::AccessProfile::FullAccess,
+                ..ToolExecutionPolicy::default()
+            },
+        );
+
+        assert_eq!(output.status, ExecutionResultStatus::Rejected);
+        let payload: Value = serde_json::from_str(&output.payload).unwrap();
+        assert!(
+            payload["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("拒绝删除受保护路径")
+        );
     }
 
     #[test]
