@@ -460,7 +460,7 @@
         : undefined;
 
     return {
-      title: outputTitle || inputTitle || '代理',
+      title: outputTitle || inputTitle || i18n.t('toolCall.agentSpawn.defaultTitle'),
       role: outputRole || inputRole || '',
       childTaskId: outputChildId || undefined,
       outcome,
@@ -924,11 +924,11 @@
       </span>
       {#if canOpen}
         <span class="agent-spawn-cta">
-          查看详情
+          {i18n.t('toolCall.agentSpawn.viewDetails')}
           <Icon name="chevron-right" size={12} />
         </span>
       {:else if isRunning}
-        <span class="agent-spawn-cta agent-spawn-cta-pending">派发中…</span>
+        <span class="agent-spawn-cta agent-spawn-cta-pending">{i18n.t('toolCall.agentSpawn.dispatching')}</span>
       {/if}
     </span>
   </button>
@@ -1021,30 +1021,30 @@
           {#if skillApplyPolicy}
             <div class="tool-section">
               <div class="section-header">
-                <span class="section-label">Policy</span>
+                <span class="section-label">{i18n.t('toolCall.policy.title')}</span>
               </div>
               <div class="policy-card">
                 {#if skillApplyPolicy.activeInstructionSkillName}
                   <div class="policy-row">
-                    <span class="policy-key">Skill</span>
+                    <span class="policy-key">{i18n.t('toolCall.policy.skill')}</span>
                     <span class="policy-value">{skillApplyPolicy.activeInstructionSkillName}</span>
                   </div>
                 {/if}
                 {#if skillApplyPolicy.allowedToolNames && skillApplyPolicy.allowedToolNames.length > 0}
                   <div class="policy-row policy-column">
-                    <span class="policy-key">Allowed Tools</span>
+                    <span class="policy-key">{i18n.t('toolCall.policy.allowedTools')}</span>
                     <span class="policy-value policy-wrap">{skillApplyPolicy.allowedToolNames.join(', ')}</span>
                   </div>
                 {/if}
                 {#if skillApplyPolicy.readOnly}
                   <div class="policy-row">
-                    <span class="policy-key">Mode</span>
-                    <span class="policy-value">read-only</span>
+                    <span class="policy-key">{i18n.t('toolCall.policy.mode')}</span>
+                    <span class="policy-value">{i18n.t('toolCall.policy.readOnly')}</span>
                   </div>
                 {/if}
                 {#if skillApplyPolicy.allowedFilePatternGroups && skillApplyPolicy.allowedFilePatternGroups.length > 0}
                   <div class="policy-row policy-column">
-                    <span class="policy-key">Allowed Paths</span>
+                    <span class="policy-key">{i18n.t('toolCall.policy.allowedPaths')}</span>
                     <span class="policy-value policy-wrap">
                       {skillApplyPolicy.allowedFilePatternGroups.map((group) => group.join(' | ')).join(' ; ')}
                     </span>
@@ -1052,7 +1052,7 @@
                 {/if}
                 {#if skillApplyPolicy.forbiddenFilePatterns && skillApplyPolicy.forbiddenFilePatterns.length > 0}
                   <div class="policy-row policy-column">
-                    <span class="policy-key">Blocked Paths</span>
+                    <span class="policy-key">{i18n.t('toolCall.policy.blockedPaths')}</span>
                     <span class="policy-value policy-wrap">{skillApplyPolicy.forbiddenFilePatterns.join(', ')}</span>
                   </div>
                 {/if}
