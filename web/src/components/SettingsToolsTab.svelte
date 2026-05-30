@@ -60,9 +60,18 @@
     return suffix ? `settings.tools.builtin.${suffix}` : '';
   }
 
+  function formatBuiltinToolFallbackLabel(name: string): string {
+    const parts = name.split('_').map((part) => part.trim()).filter(Boolean);
+    if (parts.length === 0) return name;
+    return parts
+      .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+      .join(' ');
+  }
+
   function getBuiltinToolLabel(name: string): string {
     const key = builtinToolI18nKey(name);
-    return key ? i18n.t(key) : name;
+    const translated = key ? i18n.t(key) : '';
+    return translated && translated !== key ? translated : formatBuiltinToolFallbackLabel(name);
   }
 
   function getBuiltinToolAccessLabel(accessMode: string): string {
