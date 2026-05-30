@@ -32,7 +32,6 @@
   import {
     clearStoredBrowserWorkspaceBinding,
     persistStoredBrowserWorkspaceBinding,
-    readStoredBrowserWorkspaceBinding,
   } from '../shared/bridges/browser-workspace-binding';
   import {
     rightPaneState,
@@ -131,13 +130,37 @@
     rightPaneVisible && viewportWidth > 0 && viewportWidth <= VIEWPORT_PREVIEW_OVERLAY_BREAKPOINT,
   );
 
+  function currentBootstrapWorkspaceId(): string {
+    return typeof messagesState.currentWorkspaceId === 'string'
+      ? messagesState.currentWorkspaceId.trim()
+      : '';
+  }
+
+  function currentBootstrapSessionIdForWorkspace(workspaceId: string): string {
+    const authoritativeWorkspaceId = currentBootstrapWorkspaceId();
+    if (!authoritativeWorkspaceId || authoritativeWorkspaceId !== workspaceId) {
+      return '';
+    }
+    return typeof messagesState.currentSessionId === 'string'
+      ? messagesState.currentSessionId.trim()
+      : '';
+  }
+
+  function resolveBackendWorkspaceSelection(nextWorkspaces: AgentWorkspaceSummary[]): string {
+    const authoritativeWorkspaceId = currentBootstrapWorkspaceId();
+    if (authoritativeWorkspaceId && nextWorkspaces.some((workspace) => workspace.workspaceId === authoritativeWorkspaceId)) {
+      return authoritativeWorkspaceId;
+    }
+    return nextWorkspaces.find((workspace) => workspace.isActive)?.workspaceId
+      || nextWorkspaces[0]?.workspaceId
+      || '';
+  }
+
   // 列表同步 effect：把 messagesState.sessions 投影到 sessionsByWorkspace[workspaceId]。
   // 与"激活指针同步"正交——删除当前会话时 currentSessionId 会被后端清空，但列表本身的
   // 增删（删除/新建/改名）必须独立地落到 sessionsByWorkspace 上，否则左侧列表不刷新。
   $effect(() => {
-    const authoritativeWorkspaceId = typeof messagesState.currentWorkspaceId === 'string'
-      ? messagesState.currentWorkspaceId.trim()
-      : '';
+    const authoritativeWorkspaceId = currentBootstrapWorkspaceId();
     if (!authoritativeWorkspaceId) {
       return;
     }
@@ -160,13 +183,40 @@
     }
   });
 
+  // 工作区指针同步 effect：bootstrap 是工作区选择真值。
+  // 左侧列表只镜像后端已确认的 workspace；用户发起中的 session 切换由 pendingSessionSwitchId 暂时保护。
+  $effect(() => {
+    const authoritativeWorkspaceId = currentBootstrapWorkspaceId();
+    if (!authoritativeWorkspaceId || loading || pendingSessionSwitchId || workspaceActionPending) {
+      return;
+    }
+    if (selectedWorkspaceId === authoritativeWorkspaceId) {
+      return;
+    }
+    const workspace = workspaces.find((item) => item.workspaceId === authoritativeWorkspaceId) ?? null;
+    if (!workspace) {
+      return;
+    }
+    const bootstrapSessionId = currentBootstrapSessionIdForWorkspace(authoritativeWorkspaceId);
+    selectedWorkspaceId = authoritativeWorkspaceId;
+    expandedWorkspaceIds = {
+      ...expandedWorkspaceIds,
+      [authoritativeWorkspaceId]: true,
+    };
+    currentSessionId = bootstrapSessionId || null;
+    setCurrentSessionId(bootstrapSessionId || null);
+    syncBrowserSessionBinding(workspace.workspaceId, workspace.rootPath, bootstrapSessionId || null);
+    const currentSessions = sessionsByWorkspace[authoritativeWorkspaceId] ?? [];
+    if (currentSessions.length === 0 || (bootstrapSessionId && !currentSessions.some((session) => session.id === bootstrapSessionId))) {
+      void refreshWorkspaceSessions(authoritativeWorkspaceId, bootstrapSessionId);
+    }
+  });
+
   // 激活会话指针同步 effect：把 bootstrap 的 currentSessionId 镜像到本地 currentSessionId。
   // bootstrap 是真值——非空就切过去；空也要镜像为空（删除/关闭/新建当前会话都会让它清空），
   // 否则本地 currentSessionId 和 URL 残留指向已删除的会话。
   $effect(() => {
-    const authoritativeWorkspaceId = typeof messagesState.currentWorkspaceId === 'string'
-      ? messagesState.currentWorkspaceId.trim()
-      : '';
+    const authoritativeWorkspaceId = currentBootstrapWorkspaceId();
     if (!authoritativeWorkspaceId) {
       return;
     }
@@ -219,6 +269,10 @@
       return;
     }
     const workspaceId = selectedWorkspaceId.trim();
+    const authoritativeWorkspaceId = currentBootstrapWorkspaceId();
+    if (authoritativeWorkspaceId && authoritativeWorkspaceId !== workspaceId) {
+      return;
+    }
     const workspacePath = selectedWorkspace?.rootPath?.trim() || '';
     const sessionId = typeof currentSessionId === 'string' ? currentSessionId.trim() : '';
     syncBrowserSessionBinding(workspaceId, workspacePath, sessionId || null);
@@ -337,28 +391,6 @@
     if (nextUrl.toString() !== currentUrl.toString()) {
       window.history.replaceState(window.history.state, '', nextUrl);
     }
-  }
-
-  function resolveWorkspacePreferredSessionId(
-    workspaceId: string,
-    workspacePath: string,
-  ): string {
-    if (typeof window === 'undefined') {
-      return '';
-    }
-
-    const currentUrl = new URL(window.location.href);
-    const queryWorkspaceId = currentUrl.searchParams.get('workspaceId')?.trim() || '';
-    const queryWorkspacePath = currentUrl.searchParams.get('workspacePath')?.trim() || '';
-    const querySessionId = currentUrl.searchParams.get('sessionId')?.trim() || '';
-    if (querySessionId && (queryWorkspaceId === workspaceId || queryWorkspacePath === workspacePath)) {
-      return querySessionId;
-    }
-    if (!querySessionId && (queryWorkspaceId === workspaceId || queryWorkspacePath === workspacePath)) {
-      return '';
-    }
-
-    return '';
   }
 
   function requestWorkspaceBindingSync(workspace: AgentWorkspaceSummary, sessionId: string | null): void {
@@ -691,33 +723,13 @@
       sessionsByWorkspace = {};
       loadingWorkspaceIds = {};
       expandedWorkspaceIds = {};
-      const currentUrl = typeof window !== 'undefined' ? new URL(window.location.href) : null;
-      const queryWorkspaceId = currentUrl?.searchParams.get('workspaceId')?.trim() || '';
-      const queryWorkspacePath = currentUrl?.searchParams.get('workspacePath')?.trim() || '';
-      const queryMatchedWorkspace = next.find((workspace) => {
-        if (queryWorkspaceId && workspace.workspaceId === queryWorkspaceId) {
-          return true;
-        }
-        if (queryWorkspacePath && workspace.rootPath === queryWorkspacePath) {
-          return true;
-        }
-        return false;
-      }) ?? null;
-      const storedWorkspaceId = readStoredBrowserWorkspaceBinding().workspaceId;
-      if (queryMatchedWorkspace) {
-        selectedWorkspaceId = queryMatchedWorkspace.workspaceId;
-      } else if (storedWorkspaceId && next.some((workspace) => workspace.workspaceId === storedWorkspaceId)) {
-        selectedWorkspaceId = storedWorkspaceId;
-      } else {
-        selectedWorkspaceId = next[0]?.workspaceId || '';
-      }
+      selectedWorkspaceId = resolveBackendWorkspaceSelection(next);
       if (selectedWorkspaceId) {
         expandedWorkspaceIds = { [selectedWorkspaceId]: true };
       }
-      const selectedWorkspacePath = next.find((workspace) => workspace.workspaceId === selectedWorkspaceId)?.rootPath || '';
       await refreshWorkspaceSessions(
         selectedWorkspaceId,
-        resolveWorkspacePreferredSessionId(selectedWorkspaceId, selectedWorkspacePath),
+        currentBootstrapSessionIdForWorkspace(selectedWorkspaceId),
       );
       if (selectedWorkspaceId) {
         requestCurrentSessionState();
@@ -762,10 +774,7 @@
         };
         await refreshWorkspaceSessions(
           selectedWorkspaceId,
-          resolveWorkspacePreferredSessionId(
-            selectedWorkspaceId,
-            addedWorkspace?.rootPath || '',
-          ),
+          currentBootstrapSessionIdForWorkspace(selectedWorkspaceId),
         );
         requestCurrentSessionState();
       }
@@ -846,17 +855,16 @@
       );
 
       if (selectedWorkspaceId === removedId) {
-        selectedWorkspaceId = next[0]?.workspaceId || '';
+        selectedWorkspaceId = resolveBackendWorkspaceSelection(next);
         currentSessionId = null;
         if (selectedWorkspaceId) {
           expandedWorkspaceIds = {
             ...expandedWorkspaceIds,
             [selectedWorkspaceId]: true,
           };
-          const nextWorkspacePath = next.find((workspace) => workspace.workspaceId === selectedWorkspaceId)?.rootPath || '';
           await refreshWorkspaceSessions(
             selectedWorkspaceId,
-            resolveWorkspacePreferredSessionId(selectedWorkspaceId, nextWorkspacePath),
+            currentBootstrapSessionIdForWorkspace(selectedWorkspaceId),
           );
           requestCurrentSessionState();
         }

@@ -38,6 +38,7 @@ export interface AgentWorkspaceSummary {
   workspaceId: string;
   name: string;
   rootPath: string;
+  isActive: boolean;
 }
 
 export interface AgentSessionSummary {
@@ -76,6 +77,8 @@ interface RawAgentWorkspaceSummary {
   rootPath?: string;
   root_path?: string;
   name?: string | null;
+  isActive?: boolean;
+  is_active?: boolean;
 }
 
 interface RawAgentSessionSummary {
@@ -436,6 +439,7 @@ function normalizeWorkspaceSummary(raw: RawAgentWorkspaceSummary): AgentWorkspac
     workspaceId,
     rootPath,
     name: deriveWorkspaceName(rootPath, workspaceId),
+    isActive: raw.isActive === true || raw.is_active === true,
   };
 }
 
@@ -449,6 +453,7 @@ function findCachedWorkspaceSummary(workspaceId: string): AgentWorkspaceSummary 
     workspaceId,
     rootPath: '',
     name: workspaceId || 'workspace',
+    isActive: false,
   };
 }
 
