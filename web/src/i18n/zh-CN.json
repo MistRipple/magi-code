@@ -551,7 +551,7 @@
   "settings.status.orchestrator": "使用主模型",
   "settings.model.orchestratorModel": "主模型",
   "settings.model.auxiliaryModel": "辅助模型",
-  "settings.model.orchestratorDesc": "驱动主对话与协调代理；右下角模型选择会直接保存为当前主线模型。",
+  "settings.model.orchestratorDesc": "驱动主对话与协调代理；右下角模型选择会保存为全局主模型。",
   "settings.model.auxiliaryDesc": "用于会话标题精修、知识抽取、长上下文压缩等内部任务（不参与主对话）",
   "settings.model.workerModel": "角色模型",
   "settings.model.field.baseUrl": "接口地址",

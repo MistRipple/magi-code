@@ -7,8 +7,8 @@ use super::{
     persistence::{RuntimeSidecarPersistence, StateRepository},
 };
 use magi_api::{
-    ApiState, DirectHttpModelProbeConfig, RunnerManager, RuntimeStatePersistence, SettingsStore,
-    build_router,
+    ApiError, ApiState, DirectHttpModelProbeConfig, RunnerManager, RuntimeStatePersistence,
+    SettingsStore, build_router,
 };
 use magi_bridge_client::{
     BridgeDispatchRuntime, BridgeServerKind, BridgeTransport, HttpModelBridgeClient,
@@ -629,6 +629,24 @@ impl DaemonRuntime {
             magi_api::skill_loader::build_skill_runtime_from_settings(&settings_store),
         );
 
+        let session_checkpoint_persistence = RuntimeSidecarPersistence::new(
+            StateRepository::new(self.state_root.clone()),
+            self.session_store.clone(),
+            self.workspace_store.clone(),
+            self.worker_runtime.clone(),
+        );
+        let session_state_checkpoint_persist = Arc::new(move |checkpoint: &str| {
+            session_checkpoint_persistence
+                .flush_session_sidecars()
+                .map(|_| ())
+                .map_err(|error| {
+                    ApiError::internal_assembly(
+                        "session turn 关键状态持久化失败",
+                        format!("{checkpoint}: {error}"),
+                    )
+                })
+        });
+
         let mut state = ApiState::new(
             service_name,
             self.event_bus.clone(),
@@ -647,6 +665,7 @@ impl DaemonRuntime {
             self.state_root.join("workspaces.json"),
             self.state_root.join("knowledge.json"),
         )))
+        .with_session_state_checkpoint_persist(session_state_checkpoint_persist)
         .with_bridge_probe_transport(BridgeServerKind::Model, model_transport)
         .with_bridge_probe_transport(BridgeServerKind::Mcp, mcp_transport)
         .with_execution_pipeline(orchestrator, execution_runtime, memory_store);
@@ -658,9 +677,17 @@ impl DaemonRuntime {
         let state_for_task_workers = state.clone();
         let state_for_runner_terminal = state.clone();
         let state_for_knowledge_persist = state.clone();
+        let state_for_session_turn_persist = state.clone();
         let knowledge_persist_callback = Arc::new(move || {
             if let Err(error) = state_for_knowledge_persist.persist_knowledge_state() {
                 tracing::warn!(?error, "自动知识沉淀持久化失败");
+            }
+        });
+        let session_state_persist_callback = Arc::new(move |checkpoint: &str| {
+            if let Err(error) =
+                state_for_session_turn_persist.persist_session_state_checkpoint(checkpoint)
+            {
+                tracing::warn!(checkpoint, ?error, "session turn 关键状态持久化失败");
             }
         });
         let llm_task_dispatcher = LlmTaskDispatcher::new(
@@ -685,6 +712,7 @@ impl DaemonRuntime {
                 .with_model_bridge_client(business_model_client.clone())
                 .with_knowledge_store(state.knowledge_store.clone())
                 .with_knowledge_persist_callback(knowledge_persist_callback)
+                .with_session_state_persist_callback(session_state_persist_callback)
                 .with_settings_store(state.settings_store.clone())
                 .with_context_runtime(context_runtime_for_dispatcher)
                 .with_context_budget(context_budget.clone())

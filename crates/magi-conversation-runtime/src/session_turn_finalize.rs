@@ -11,7 +11,8 @@ use magi_orchestrator::task_store::TaskStore;
 use magi_session_store::{ActiveExecutionTurn, SessionStore};
 
 use crate::session_writeback::{
-    append_session_turn_item_with_task_store, publish_current_session_turn_item_event,
+    SessionStatePersistCallback, append_session_turn_item_with_task_store,
+    persist_session_state_checkpoint, publish_current_session_turn_item_event,
     publish_session_turn_item_event, session_turn_item,
 };
 
@@ -489,6 +490,7 @@ pub fn finalize_background_session_task_turn_if_root_completed(
     task_store: Option<&TaskStore>,
     session_id: &SessionId,
     root_task_id: &TaskId,
+    persist_session_state: Option<&SessionStatePersistCallback>,
 ) -> bool {
     let Some(task_store) = task_store else {
         return false;
@@ -540,6 +542,7 @@ pub fn finalize_background_session_task_turn_if_root_completed(
     if update_current_turn_completed_from_root(session_store, session_id).is_err() {
         return false;
     }
+    persist_session_state_checkpoint(persist_session_state, "session_task_turn_completed");
     publish_current_session_turn_item_event(
         event_bus,
         session_store,
@@ -600,6 +603,7 @@ pub fn finalize_background_session_task_turn_if_root_terminal(
     session_id: &SessionId,
     root_task_id: &TaskId,
     runner_status: &str,
+    persist_session_state: Option<&SessionStatePersistCallback>,
 ) -> bool {
     if finalize_background_session_task_turn_if_root_completed(
         session_store,
@@ -607,6 +611,7 @@ pub fn finalize_background_session_task_turn_if_root_terminal(
         task_store,
         session_id,
         root_task_id,
+        persist_session_state,
     ) {
         return true;
     }
@@ -681,6 +686,7 @@ pub fn finalize_background_session_task_turn_if_root_terminal(
         error_item,
         Some(task_store),
     ) {
+        persist_session_state_checkpoint(persist_session_state, "session_task_turn_failed");
         publish_session_turn_item_event(event_bus, session_id, &workspace_id, &published);
     }
 
@@ -728,6 +734,7 @@ pub fn reconcile_terminal_session_task_turns(
                 session_id,
                 root_task_id,
                 runner_status,
+                None,
             )
         })
         .count()

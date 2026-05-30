@@ -1568,6 +1568,37 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn save_orchestrator_config_ignores_session_scope_and_writes_global_main_model() {
+        let state = test_state();
+        let _ = save_orchestrator_config(
+            State(state.clone()),
+            Json(json!({
+                "config": {
+                    "baseUrl": "https://api.example.com/v1",
+                    "apiKey": "sk-global",
+                    "model": "global-main-model",
+                    "sessionId": "session-a",
+                    "workspaceId": "workspace-a"
+                }
+            })),
+        )
+        .await
+        .expect("orchestrator config should save");
+
+        let saved = state.settings_store.get_section("orchestrator");
+        assert_eq!(saved["model"], json!("global-main-model"));
+        assert!(saved.get("sessionId").is_none());
+        assert!(saved.get("workspaceId").is_none());
+        assert!(
+            state
+                .settings_store
+                .get_session_section(&SessionId::new("session-a"), "orchestrator")
+                .is_null(),
+            "主模型不支持按 session 保存，保存接口只能写全局 orchestrator 段"
+        );
+    }
+
     #[test]
     fn fetch_models_config_allows_anthropic_compatible_provider() {
         // /v1/models 在 Anthropic 端点同样合法；standard 模式下协议由当前模型名识别。

@@ -1,8 +1,8 @@
 use crate::session_writeback::{
-    SessionTurnStreamUpdate, append_session_turn_item_with_task_store,
-    publish_current_session_turn_item_event, publish_session_turn_item_event,
-    publish_session_turn_item_event_with_stream_update, session_turn_item,
-    session_turn_stream_update, upsert_session_turn_item_with_task_store,
+    SessionStatePersistCallback, SessionTurnStreamUpdate, append_session_turn_item_with_task_store,
+    persist_session_state_checkpoint, publish_current_session_turn_item_event,
+    publish_session_turn_item_event, publish_session_turn_item_event_with_stream_update,
+    session_turn_item, session_turn_stream_update, upsert_session_turn_item_with_task_store,
 };
 use crate::task_execution_registry::TaskExecutionRegistry;
 use crate::task_helpers::task_is_long_mission;
@@ -139,6 +139,7 @@ pub struct ConversationLoopRequest<'a> {
     /// 同一个 SnapshotSession 记录，才能把文件变更归因到主线或具体代理 worker。
     pub snapshot_session: Option<Arc<magi_snapshot::SnapshotSession>>,
     pub execution_group_id: Option<String>,
+    pub persist_session_state: Option<&'a SessionStatePersistCallback>,
 }
 
 /// P6b：把 thread 持久化的消息记录（`ThreadChatMessage`）还原为 bridge-client 的
@@ -586,6 +587,7 @@ fn run_conversation_loop_inner(
         workspace_root_path,
         snapshot_session,
         execution_group_id,
+        persist_session_state,
     } = request;
 
     let mut messages = Vec::new();
@@ -940,6 +942,7 @@ fn run_conversation_loop_inner(
             None,
             streaming_entry_id,
             &turn_visibility,
+            persist_session_state,
         );
         return (
             TaskOutcome::Completed {
@@ -1016,6 +1019,7 @@ fn run_conversation_loop_inner(
                             &turn_visibility,
                             &error_message,
                             streaming_entry_id.or(last_stream_item_id.as_deref()),
+                            persist_session_state,
                         );
                     }
                     return (
@@ -1043,6 +1047,7 @@ fn run_conversation_loop_inner(
                             &turn_visibility,
                             &error_message,
                             streaming_entry_id.or(last_stream_item_id.as_deref()),
+                            persist_session_state,
                         );
                     }
                     return (
@@ -1283,6 +1288,7 @@ fn run_conversation_loop_inner(
                 tool_call,
                 &result,
                 tool_status,
+                persist_session_state,
             );
             let canonical_tool_name = canonical_tool_call_name(&tool_call.function.name);
             if !matches!(tool_status, ExecutionResultStatus::Succeeded) {
@@ -1354,6 +1360,7 @@ fn run_conversation_loop_inner(
             &turn_visibility,
             &failure_reason,
             streaming_entry_id.or(last_stream_item_id.as_deref()),
+            persist_session_state,
         );
         return (
             TaskOutcome::Failed {
@@ -1381,6 +1388,7 @@ fn run_conversation_loop_inner(
             &turn_visibility,
             &recovery_prompt,
             streaming_entry_id.or(last_stream_item_id.as_deref()),
+            persist_session_state,
         );
         return (
             TaskOutcome::Failed {
@@ -1403,6 +1411,7 @@ fn run_conversation_loop_inner(
             &turn_visibility,
             &recovery_prompt,
             streaming_entry_id.or(last_stream_item_id.as_deref()),
+            persist_session_state,
         );
         return (
             TaskOutcome::Failed {
@@ -1424,6 +1433,7 @@ fn run_conversation_loop_inner(
             &turn_visibility,
             &failure_reason,
             streaming_entry_id.or(last_stream_item_id.as_deref()),
+            persist_session_state,
         );
         return (
             TaskOutcome::Failed {
@@ -1445,6 +1455,7 @@ fn run_conversation_loop_inner(
             &turn_visibility,
             &failure_reason,
             streaming_entry_id.or(last_stream_item_id.as_deref()),
+            persist_session_state,
         );
         return (
             TaskOutcome::Failed {
@@ -1477,6 +1488,7 @@ fn run_conversation_loop_inner(
             &turn_visibility,
             &failure_reason,
             streaming_entry_id.or(last_stream_item_id.as_deref()),
+            persist_session_state,
         );
         return (
             TaskOutcome::Failed {
@@ -1498,6 +1510,7 @@ fn run_conversation_loop_inner(
             &turn_visibility,
             &failure_reason,
             streaming_entry_id.or(last_stream_item_id.as_deref()),
+            persist_session_state,
         );
         return (
             TaskOutcome::Failed {
@@ -1518,6 +1531,7 @@ fn run_conversation_loop_inner(
         last_stream_item_id.as_deref().or(streaming_entry_id),
         streaming_entry_id,
         &turn_visibility,
+        persist_session_state,
     );
 
     // P6b：把本轮 LLM 对话追写进当前 thread 的审计 / 恢复记录。
@@ -2397,6 +2411,7 @@ fn upsert_task_tool_call_result_turn_item(
     tool_call: &ChatToolCall,
     tool_result: &str,
     tool_status: ExecutionResultStatus,
+    persist_session_state: Option<&SessionStatePersistCallback>,
 ) {
     let status_label = tool_execution_status_label(tool_status);
     let mut item = session_turn_item(
@@ -2419,6 +2434,7 @@ fn upsert_task_tool_call_result_turn_item(
     if let Some(published) =
         upsert_session_turn_item_with_task_store(session_store, session_id, item, Some(task_store))
     {
+        persist_session_state_checkpoint(persist_session_state, "task_turn_tool_result");
         publish_session_turn_item_event(event_bus, session_id, workspace_id, &published);
     }
 }
@@ -2450,6 +2466,7 @@ fn append_task_final_turn_item(
     final_item_id: Option<&str>,
     timeline_entry_id: Option<&str>,
     turn_visibility: &TaskTurnVisibility,
+    persist_session_state: Option<&SessionStatePersistCallback>,
 ) {
     let has_requested_final_item_id = final_item_id.is_some();
     let mut final_item = session_turn_item(
@@ -2472,6 +2489,7 @@ fn append_task_final_turn_item(
             final_item,
             Some(task_store),
         ) {
+            persist_session_state_checkpoint(persist_session_state, "task_turn_final_item");
             publish_session_turn_item_event(event_bus, session_id, workspace_id, &published);
         }
     } else if let Some(published) = append_session_turn_item_with_task_store(
@@ -2480,6 +2498,7 @@ fn append_task_final_turn_item(
         final_item,
         Some(task_store),
     ) {
+        persist_session_state_checkpoint(persist_session_state, "task_turn_final_item");
         publish_session_turn_item_event(event_bus, session_id, workspace_id, &published);
     }
     let root_task_completed = task_store
@@ -2487,6 +2506,7 @@ fn append_task_final_turn_item(
         .is_some_and(|root_task| root_task.status == TaskStatus::Completed);
     if turn_visibility.is_mainline() && root_task_completed {
         let _ = session_store.update_current_turn_status(session_id, "completed");
+        persist_session_state_checkpoint(persist_session_state, "task_turn_completed");
         publish_current_session_turn_item_event(
             event_bus,
             session_store,
@@ -2508,6 +2528,7 @@ fn append_task_error_turn_item(
     turn_visibility: &TaskTurnVisibility,
     error_text: &str,
     _streaming_entry_id: Option<&str>,
+    persist_session_state: Option<&SessionStatePersistCallback>,
 ) {
     let mut error_item = session_turn_item(
         "assistant_error",
@@ -2529,6 +2550,7 @@ fn append_task_error_turn_item(
     }
     if turn_visibility.is_mainline() {
         let _ = session_store.update_current_turn_status(session_id, "failed");
+        persist_session_state_checkpoint(persist_session_state, "task_turn_failed");
         publish_current_session_turn_item_event(
             event_bus,
             session_store,
@@ -3314,6 +3336,7 @@ mod tests {
             workspace_root_path: None,
             snapshot_session: None,
             execution_group_id: None,
+            persist_session_state: None,
         });
         outcome
     }
@@ -3762,6 +3785,7 @@ mod tests {
             workspace_root_path: None,
             snapshot_session: None,
             execution_group_id: None,
+            persist_session_state: None,
         });
 
         match outcome {
@@ -3854,6 +3878,7 @@ mod tests {
             workspace_root_path: None,
             snapshot_session: None,
             execution_group_id: None,
+            persist_session_state: None,
         });
 
         match outcome {
@@ -4031,6 +4056,7 @@ mod tests {
             Some("timeline-streaming-task-action-final-root-running"),
             Some("timeline-streaming-task-action-final-root-running"),
             &visibility,
+            None,
         );
 
         let current_turn = session_store
@@ -4139,6 +4165,7 @@ mod tests {
             workspace_root_path: None,
             snapshot_session: None,
             execution_group_id: None,
+            persist_session_state: None,
         });
 
         match outcome {
@@ -4343,6 +4370,7 @@ mod tests {
             workspace_root_path: None,
             snapshot_session: None,
             execution_group_id: None,
+            persist_session_state: None,
         });
 
         assert!(

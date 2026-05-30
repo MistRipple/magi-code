@@ -103,6 +103,7 @@ fn execute_dispatch_submission(
         placeholder_message_id: signal.placeholder_message_id.clone(),
     };
     let accepted = submit_dispatch_submission(state, dispatch)?;
+    state.persist_session_state_checkpoint("session_task_turn_accepted")?;
     publish_session_user_message_event(
         state,
         &session_id,
@@ -111,7 +112,6 @@ fn execute_dispatch_submission(
         &message,
     );
     let event_id = publish_session_turn_task_accepted_event(state, request, &accepted)?;
-    state.persist_session_durable_state()?;
     if created_session {
         crate::session_title::spawn_new_session_title_refinement(
             state,
@@ -136,18 +136,10 @@ pub(super) fn finalize_session_task_dispatch(
             ?error,
             "session turn task dispatch failed"
         );
-        let _ = state.persist_session_durable_state();
+        let _ = state.persist_session_state_checkpoint("session_task_turn_failed");
         return;
     }
     append_dispatch_assistant_message(&state, &accepted);
-    if let Err(error) = state.persist_session_durable_state() {
-        tracing::error!(
-            session_id = %accepted.session_id,
-            root_task_id = %accepted.root_task_id,
-            ?error,
-            "session turn task dispatch persist failed"
-        );
-    }
 }
 
 fn format_action_task_title(mission_title: &str) -> String {
@@ -446,6 +438,14 @@ pub(super) fn append_dispatch_assistant_message(
     let _ = state
         .session_store
         .update_current_turn_status(&accepted.session_id, "completed");
+    if let Err(error) = state.persist_session_state_checkpoint("session_task_turn_completed") {
+        tracing::error!(
+            session_id = %accepted.session_id,
+            final_item_id = %final_item_id,
+            ?error,
+            "session task turn terminal persist failed before event publish"
+        );
+    }
     let workspace_id = state
         .session_store
         .execution_ownership(&accepted.session_id)

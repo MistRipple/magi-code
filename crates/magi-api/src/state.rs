@@ -67,6 +67,7 @@ pub struct RunnerHandle {
 }
 
 type RunnerTerminalObserver = Arc<dyn Fn(TaskId, Option<SessionId>, String) + Send + Sync>;
+pub type SessionStateCheckpointPersist = Arc<dyn Fn(&str) -> Result<(), ApiError> + Send + Sync>;
 
 pub(crate) fn session_has_user_content(session: &SessionRecord) -> bool {
     session.message_count.unwrap_or(0) > 0
@@ -516,6 +517,7 @@ pub struct ApiState {
     pub knowledge_store: Arc<KnowledgeStore>,
     pub settings_store: Arc<SettingsStore>,
     runtime_persistence: Option<Arc<RuntimeStatePersistence>>,
+    session_state_checkpoint_persist: Option<SessionStateCheckpointPersist>,
     bridge_probe_snapshot_provider: BridgeProbeSnapshotProvider,
     bridge_preflight_snapshot_provider: BridgePreflightSnapshotProvider,
     bridge_cutover_smoke_provider: BridgeCutoverSmokeSnapshotProvider,
@@ -636,6 +638,7 @@ impl ApiState {
             knowledge_store: Arc::new(KnowledgeStore::new()),
             settings_store: Arc::new(SettingsStore::new()),
             runtime_persistence: None,
+            session_state_checkpoint_persist: None,
             bridge_probe_snapshot_provider: BridgeProbeSnapshotProvider::default(),
             bridge_preflight_snapshot_provider: BridgePreflightSnapshotProvider::default(),
             bridge_cutover_smoke_provider: BridgeCutoverSmokeSnapshotProvider::default(),
@@ -1179,6 +1182,21 @@ impl ApiState {
         self
     }
 
+    pub fn with_session_state_checkpoint_persist(
+        mut self,
+        persist: SessionStateCheckpointPersist,
+    ) -> Self {
+        self.session_state_checkpoint_persist = Some(persist);
+        self
+    }
+
+    pub fn persist_session_state_checkpoint(&self, checkpoint: &str) -> Result<(), ApiError> {
+        if let Some(persist) = &self.session_state_checkpoint_persist {
+            persist(checkpoint)?;
+        }
+        self.persist_session_durable_state()
+    }
+
     pub fn persist_session_durable_state(&self) -> Result<(), ApiError> {
         let Some(persistence) = &self.runtime_persistence else {
             return Ok(());
@@ -1626,6 +1644,59 @@ mod tests {
             &store,
             &[pending_id]
         ));
+    }
+
+    #[test]
+    fn session_state_checkpoint_runs_callback_and_persists_durable_state() {
+        let state_root = std::env::temp_dir().join(format!(
+            "magi-api-session-checkpoint-{}",
+            UtcMillis::now().0
+        ));
+        let event_bus = Arc::new(InMemoryEventBus::new(32));
+        let session_store = Arc::new(SessionStore::default());
+        let workspace_store = Arc::new(WorkspaceStore::default());
+        let governance = Arc::new(GovernanceService::default());
+        let session_id = SessionId::new("session-checkpoint-durable");
+        session_store
+            .create_session(session_id.clone(), "checkpoint durable")
+            .expect("session should create");
+        let observed_checkpoints = Arc::new(Mutex::new(Vec::<String>::new()));
+        let observed_for_callback = observed_checkpoints.clone();
+
+        let state = ApiState::new(
+            "magi-test",
+            event_bus,
+            session_store,
+            workspace_store,
+            governance,
+        )
+        .with_runtime_persistence(Arc::new(RuntimeStatePersistence::new(
+            state_root.join("sessions.json"),
+            state_root.join("workspaces.json"),
+            state_root.join("knowledge.json"),
+        )))
+        .with_session_state_checkpoint_persist(Arc::new(move |checkpoint| {
+            observed_for_callback
+                .lock()
+                .expect("checkpoint observer lock should not poison")
+                .push(checkpoint.to_string());
+            Ok(())
+        }));
+
+        state
+            .persist_session_state_checkpoint("checkpoint-test")
+            .expect("checkpoint should persist");
+
+        assert_eq!(
+            observed_checkpoints
+                .lock()
+                .expect("checkpoint observer lock should not poison")
+                .as_slice(),
+            ["checkpoint-test"]
+        );
+        let persisted = std::fs::read_to_string(state_root.join("sessions.json"))
+            .expect("global session durable state should be written");
+        assert!(persisted.contains(session_id.as_str()));
     }
 
     #[tokio::test]

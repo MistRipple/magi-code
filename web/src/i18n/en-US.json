@@ -551,7 +551,7 @@
   "settings.status.orchestrator": "Using Main Model",
   "settings.model.orchestratorModel": "Main Model",
   "settings.model.auxiliaryModel": "Auxiliary Model",
-  "settings.model.orchestratorDesc": "Drives the main conversation and coordinates agents; the model picker in the bottom-right saves the current mainline model.",
+  "settings.model.orchestratorDesc": "Drives the main conversation and coordinates agents; the model picker in the bottom-right saves the global main model.",
   "settings.model.auxiliaryDesc": "For session-title refinement, knowledge extraction, and long-context compression (not used in the main conversation)",
   "settings.model.workerModel": "Role Model",
   "settings.model.field.baseUrl": "Base URL",

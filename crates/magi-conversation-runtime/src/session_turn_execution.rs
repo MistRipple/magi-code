@@ -11,10 +11,11 @@ use crate::{
         normalize_model_visible_content, workspace_context_system_prompt,
     },
     session_writeback::{
-        append_session_tool_call_items_batch, append_session_turn_error_item,
-        append_session_turn_item, publish_current_session_turn_item_event,
-        publish_session_turn_item_event, publish_session_turn_item_event_with_stream_update,
-        session_turn_item, session_turn_stream_update, upsert_session_turn_item,
+        SessionStatePersistCallback, append_session_tool_call_items_batch,
+        append_session_turn_error_item, append_session_turn_item, persist_session_state_checkpoint,
+        publish_current_session_turn_item_event, publish_session_turn_item_event,
+        publish_session_turn_item_event_with_stream_update, session_turn_item,
+        session_turn_stream_update, upsert_session_turn_item,
     },
     settings_store::SettingsStore,
     usage_recording::{
@@ -218,6 +219,7 @@ pub struct SessionTurnExecutionRuntime<'a> {
     pub request: SessionTurnExecutionRequest,
     pub prompt: String,
     pub tools: Option<Vec<ChatToolDefinition>>,
+    pub persist_session_state: Option<&'a SessionStatePersistCallback>,
 }
 
 pub fn run_session_turn_execution(
@@ -237,6 +239,7 @@ pub fn run_session_turn_execution(
         request,
         prompt,
         tools,
+        persist_session_state,
     } = runtime;
 
     if !request_turn_is_writable(session_store, &request) {
@@ -277,6 +280,7 @@ pub fn run_session_turn_execution(
                 completed_required_tool_names: &completed_required_tool_names,
                 round,
                 orchestrator_thread_id: &orchestrator_thread_id,
+                persist_session_state,
             },
             tool_registry,
             skill_runtime,
@@ -300,6 +304,7 @@ pub fn run_session_turn_execution(
                     &error,
                     main_timeline_entry_id.as_deref(),
                     orchestrator_thread_id.clone(),
+                    persist_session_state,
                 );
                 return Err(error);
             }
@@ -364,6 +369,7 @@ pub fn run_session_turn_execution(
             &failure_reason,
             main_timeline_entry_id.as_deref(),
             orchestrator_thread_id.clone(),
+            persist_session_state,
         );
         return Err(failure_reason);
     };
@@ -378,6 +384,7 @@ pub fn run_session_turn_execution(
         final_item_id.as_deref(),
         main_timeline_entry_id.as_deref(),
         &orchestrator_thread_id,
+        persist_session_state,
     );
 
     Ok(SessionTurnExecutionOutput::completed(final_content))
@@ -399,6 +406,7 @@ struct SessionTurnRoundRuntime<'a> {
     round: usize,
     /// session 主线 thread：该 turn 内所有 session_turn_item 的 source_thread_id。
     orchestrator_thread_id: &'a magi_core::ThreadId,
+    persist_session_state: Option<&'a SessionStatePersistCallback>,
 }
 
 struct SessionTurnRoundOutput {
@@ -491,6 +499,7 @@ fn stream_session_turn_round(
         completed_required_tool_names,
         round,
         orchestrator_thread_id,
+        persist_session_state,
     } = runtime;
 
     let stream_item_id = if round == 0 {
@@ -683,6 +692,10 @@ fn stream_session_turn_round(
         if let Some(published) =
             upsert_session_turn_item(session_store, &request.session_id, thinking_item)
         {
+            persist_session_state_checkpoint(
+                persist_session_state,
+                "session_turn_thinking_completed",
+            );
             publish_session_turn_item_event(
                 event_bus,
                 &request.session_id,
@@ -724,6 +737,10 @@ fn stream_session_turn_round(
         if let Some(published) =
             upsert_session_turn_item(session_store, &request.session_id, stream_item)
         {
+            persist_session_state_checkpoint(
+                persist_session_state,
+                "session_turn_stream_completed",
+            );
             publish_session_turn_item_event(
                 event_bus,
                 &request.session_id,
@@ -778,6 +795,7 @@ fn stream_session_turn_round(
             snapshot_session,
             Some(execution_group_id),
             orchestrator_thread_id,
+            persist_session_state,
             || request_turn_is_writable(session_store, request),
         );
         if !request_turn_is_writable(session_store, request) {
@@ -871,6 +889,7 @@ fn append_final_item(
     final_item_id: Option<&str>,
     timeline_entry_id: Option<&str>,
     orchestrator_thread_id: &magi_core::ThreadId,
+    persist_session_state: Option<&SessionStatePersistCallback>,
 ) {
     let has_requested_final_item_id = final_item_id.is_some();
     let mut final_item = session_turn_item(
@@ -890,6 +909,7 @@ fn append_final_item(
         if let Some(published) =
             upsert_session_turn_item(session_store, &request.session_id, final_item)
         {
+            persist_session_state_checkpoint(persist_session_state, "session_turn_final_item");
             publish_session_turn_item_event(
                 event_bus,
                 &request.session_id,
@@ -900,6 +920,7 @@ fn append_final_item(
     } else if let Some(published) =
         append_session_turn_item(session_store, &request.session_id, final_item)
     {
+        persist_session_state_checkpoint(persist_session_state, "session_turn_final_item");
         publish_session_turn_item_event(
             event_bus,
             &request.session_id,
@@ -908,6 +929,7 @@ fn append_final_item(
         );
     }
     let _ = session_store.update_current_turn_status(&request.session_id, "completed");
+    persist_session_state_checkpoint(persist_session_state, "session_turn_completed");
     publish_current_session_turn_item_event(
         event_bus,
         session_store,
@@ -1157,6 +1179,7 @@ mod tests {
             request,
             prompt: "请回复一句话".to_string(),
             tools: None,
+            persist_session_state: None,
         }) {
             Ok(_) => panic!("empty provider response should fail"),
             Err(error) => error,
@@ -1257,6 +1280,7 @@ mod tests {
                 snapshot_manager: None,
                 round: 0,
                 orchestrator_thread_id: &orchestrator_thread_id,
+                persist_session_state: None,
             },
             None,
             None,
@@ -1634,6 +1658,7 @@ mod tests {
             Some("turn-item-assistant-stream-post-tool"),
             Some("turn-item-assistant-stream-main"),
             &orchestrator_thread_id,
+            None,
         );
 
         let turn = store
@@ -1742,6 +1767,7 @@ mod tests {
             None,
             None,
             &orchestrator_thread_id,
+            None,
         );
 
         let terminal_event = event_bus

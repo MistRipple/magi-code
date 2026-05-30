@@ -392,6 +392,12 @@ impl RuntimeSidecarPersistence {
             worker_runtime_snapshot_flushed,
         })
     }
+
+    pub(crate) fn flush_session_sidecars(&self) -> Result<bool, DaemonError> {
+        self.session_store.flush_execution_sidecars_with(|state| {
+            self.state_repository.save_session_sidecars(state)
+        })
+    }
 }
 
 fn temp_path_for(path: &Path) -> PathBuf {

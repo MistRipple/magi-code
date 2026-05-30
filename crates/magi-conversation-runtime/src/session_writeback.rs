@@ -33,6 +33,17 @@ use magi_tool_runtime::{
 use serde_json::Value;
 use std::{collections::HashMap, path::PathBuf, sync::Arc, thread};
 
+pub type SessionStatePersistCallback = dyn Fn(&str) + Send + Sync;
+
+pub fn persist_session_state_checkpoint(
+    callback: Option<&SessionStatePersistCallback>,
+    checkpoint: &'static str,
+) {
+    if let Some(callback) = callback {
+        callback(checkpoint);
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct PublishedSessionTurnItem {
     pub turn_id: String,
@@ -519,6 +530,7 @@ pub fn append_session_turn_error_item(
     error_text: &str,
     _streaming_entry_id: Option<&str>,
     source_thread_id: ThreadId,
+    persist_session_state: Option<&SessionStatePersistCallback>,
 ) {
     let mut error_item = session_turn_item(
         "assistant_error",
@@ -537,6 +549,7 @@ pub fn append_session_turn_error_item(
     error_item.placeholder_message_id = placeholder_message_id.map(str::to_string);
     let _ = append_session_turn_item(session_store, session_id, error_item);
     let _ = session_store.update_current_turn_status(session_id, "failed");
+    persist_session_state_checkpoint(persist_session_state, "session_turn_failed");
     publish_current_session_turn_item_event(
         event_bus,
         session_store,
@@ -604,6 +617,7 @@ pub fn append_session_tool_call_items_batch(
     snapshot_session: Option<Arc<SnapshotSession>>,
     execution_group_id: Option<String>,
     source_thread_id: &ThreadId,
+    persist_session_state: Option<&SessionStatePersistCallback>,
     write_allowed: impl Fn() -> bool,
 ) -> bool {
     for tool_call in tool_calls {
@@ -677,6 +691,7 @@ pub fn append_session_tool_call_items_batch(
             &tool_result,
             tool_status,
             source_thread_id,
+            persist_session_state,
         );
         messages.push(ChatMessage {
             role: "tool".to_string(),
@@ -697,6 +712,7 @@ fn upsert_session_tool_call_result_item(
     tool_result: &str,
     tool_status: ExecutionResultStatus,
     source_thread_id: &ThreadId,
+    persist_session_state: Option<&SessionStatePersistCallback>,
 ) {
     let status_label = tool_execution_status_label(tool_status);
     let mut result_item = session_turn_item(
@@ -717,6 +733,7 @@ fn upsert_session_tool_call_result_item(
         result_item.tool_error = Some(tool_result.to_string());
     }
     if let Some(published) = upsert_session_turn_item(session_store, session_id, result_item) {
+        persist_session_state_checkpoint(persist_session_state, "session_turn_tool_result");
         publish_session_turn_item_event(event_bus, session_id, workspace_id, &published);
     }
 }
@@ -1596,6 +1613,7 @@ mod tests {
             None,
             None,
             &ThreadId::new("thread-shell-batch"),
+            None,
             || true,
         );
 

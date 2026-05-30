@@ -1036,6 +1036,16 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
   }
   const eventType = trimBridgeString(event.event_type);
 
+  if (eventType === 'event.stream.lagged') {
+    console.warn('[web-client-bridge] 事件流出现 lag，切换到 bootstrap recovery', {
+      payload: event.payload ?? {},
+      sequence: event.sequence,
+    });
+    closeEventStream();
+    scheduleRecovery('event_stream_lagged', undefined, true);
+    return;
+  }
+
   if ((eventType === 'session.turn.accepted' || eventType === 'session.turn.task.accepted') && event.payload) {
     const acceptedSessionId = trimBridgeString(event.payload.session_id)
       || trimBridgeString(event.payload.sessionId)

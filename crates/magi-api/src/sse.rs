@@ -1,9 +1,9 @@
 use axum::response::sse::{Event, KeepAlive, Sse};
 use futures_util::{StreamExt, stream};
-use magi_core::WorkspaceId;
-use magi_event_bus::EventEnvelope;
+use magi_core::{EventId, UtcMillis, WorkspaceId};
+use magi_event_bus::{EventContext, EventEnvelope};
 use std::{convert::Infallible, time::Duration};
-use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::wrappers::{BroadcastStream, errors::BroadcastStreamRecvError};
 
 use crate::state::ApiState;
 
@@ -38,7 +38,9 @@ pub async fn events(
                     event_matches_workspace(&live_state, &envelope, live_workspace_id.as_ref())
                         .then(|| Ok(event_to_sse(envelope)))
                 }
-                Err(_) => None,
+                Err(BroadcastStreamRecvError::Lagged(skipped)) => Some(Ok(event_to_sse(
+                    lagged_recovery_event(skipped, live_workspace_id.as_ref()),
+                ))),
             }
         }
     });
@@ -79,6 +81,23 @@ fn event_to_sse(event: EventEnvelope) -> Event {
     Event::default()
         .id(event.event_id.to_string())
         .data(payload)
+}
+
+fn lagged_recovery_event(skipped: u64, workspace_id: Option<&WorkspaceId>) -> EventEnvelope {
+    let now = UtcMillis::now();
+    EventEnvelope::system(
+        EventId::new(format!("event-stream-lagged-{}-{}", now.0, skipped)),
+        "event.stream.lagged",
+        serde_json::json!({
+            "skipped": skipped,
+            "recovery": "bootstrap",
+            "reason": "broadcast_lagged",
+        }),
+    )
+    .with_context(EventContext {
+        workspace_id: workspace_id.cloned(),
+        ..EventContext::default()
+    })
 }
 
 #[cfg(test)]
@@ -204,5 +223,17 @@ mod tests {
             &mismatched_event,
             Some(&requested)
         ));
+    }
+
+    #[test]
+    fn lagged_recovery_event_is_workspace_scoped_and_bootstrap_actionable() {
+        let workspace = workspace_id("workspace-lagged");
+        let event = lagged_recovery_event(7, Some(&workspace));
+
+        assert_eq!(event.event_type, "event.stream.lagged");
+        assert_eq!(event.category, magi_event_bus::EventCategory::System);
+        assert_eq!(event.workspace_id.as_ref(), Some(&workspace));
+        assert_eq!(event.payload["skipped"], json!(7));
+        assert_eq!(event.payload["recovery"], json!("bootstrap"));
     }
 }

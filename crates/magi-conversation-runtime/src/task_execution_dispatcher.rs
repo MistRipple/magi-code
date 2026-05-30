@@ -13,6 +13,7 @@ use crate::{
         SessionTurnExecutionRuntime, run_session_turn_execution,
     },
     session_turn_finalize::{format_dependency_task_context, format_task_ref_list},
+    session_writeback::SessionStatePersistCallback,
     settings_store::SettingsStore,
     skill_apply_tool_definition,
     task_execution_registry::{TaskExecutionPlan, TaskExecutionRegistry},
@@ -153,6 +154,7 @@ pub struct LlmTaskDispatcher {
     model_bridge_client: Option<Arc<dyn ModelBridgeClient>>,
     knowledge_store: Option<Arc<KnowledgeStore>>,
     knowledge_persist_callback: Option<Arc<dyn Fn() + Send + Sync>>,
+    session_state_persist_callback: Option<Arc<SessionStatePersistCallback>>,
     settings_store: Option<Arc<SettingsStore>>,
     context_runtime: Option<Arc<ContextRuntime>>,
     /// 由 daemon bootstrap 注入的上下文预算，决定每轮 Turn 装配 prompt 时记忆 / 知识 /
@@ -357,6 +359,7 @@ impl LlmTaskDispatcher {
             model_bridge_client: None,
             knowledge_store: None,
             knowledge_persist_callback: None,
+            session_state_persist_callback: None,
             settings_store: None,
             context_runtime: None,
             context_budget: None,
@@ -403,6 +406,14 @@ impl LlmTaskDispatcher {
         callback: Arc<dyn Fn() + Send + Sync>,
     ) -> Self {
         self.knowledge_persist_callback = Some(callback);
+        self
+    }
+
+    pub fn with_session_state_persist_callback(
+        mut self,
+        callback: Arc<SessionStatePersistCallback>,
+    ) -> Self {
+        self.session_state_persist_callback = Some(callback);
         self
     }
 
@@ -1323,6 +1334,7 @@ impl LlmTaskDispatcher {
             request,
             prompt,
             tools,
+            persist_session_state: self.session_state_persist_callback.as_deref(),
         })
         .map_err(|msg| msg)
     }
@@ -1565,6 +1577,7 @@ impl LlmTaskDispatcher {
                 .as_ref()
                 .and_then(|manager| manager.get_session(session_id.as_str())),
             execution_group_id: Some(task.mission_id.to_string()),
+            persist_session_state: self.session_state_persist_callback.as_deref(),
         })
     }
 
@@ -2242,6 +2255,31 @@ mod tests {
         assert!(
             resolved.is_some(),
             "orchestrator 段已配置时必须返回业务模型 client"
+        );
+    }
+
+    #[test]
+    fn resolve_target_for_role_orchestrator_ignores_session_scoped_orchestrator_section() {
+        use crate::settings_store::SettingsStore;
+
+        let store = Arc::new(SettingsStore::new());
+        let session_id = SessionId::new("session-model-scope");
+        store.set_session_section(
+            &session_id,
+            "orchestrator",
+            serde_json::json!({
+                "baseUrl": "https://api.example.com/v1",
+                "apiKey": "sk-session",
+                "model": "session-only-model",
+                "urlMode": "standard",
+            }),
+        );
+
+        let resolved = resolve_target_for_role(Some(&store), None, RoleTarget::Orchestrator)
+            .expect("orchestrator 段解析不应失败");
+        assert!(
+            resolved.is_none(),
+            "主模型是全局共享配置，session-scoped orchestrator 段不能参与解析"
         );
     }
 

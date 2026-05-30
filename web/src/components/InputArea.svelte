@@ -89,7 +89,7 @@
   let enhanceResultPrompt = $state<string | null>(null);
 
   // 主线模型 picker：弹窗状态 + 模型列表惰性拉取。
-  // 选中后直接写回 orchestrator 配置，后续会话轮次都读取同一份持久化配置。
+  // 选中后直接写回全局 orchestrator 配置，后续所有会话轮次都读取同一份持久化配置。
   let pickerOpen = $state(false);
   let pickerLoading = $state(false);
   let pickerSavingModel = $state<string | null>(null);
@@ -1342,8 +1342,8 @@
             onclick={togglePicker}
             disabled={sessionInputLocked || isInteractionBlocking || pickerSavingModel !== null}
             title={currentPickerModel
-              ? `当前主线模型：${currentPickerModel}。选择后会保存到设置。`
-              : '选择主线模型，选择后会保存到设置'}
+              ? `当前全局主模型：${currentPickerModel}。选择后会保存到全局设置。`
+              : '选择全局主模型，选择后会保存到全局设置'}
             aria-expanded={pickerOpen}
           >
             <Icon name="model" size={12} />
@@ -1355,7 +1355,7 @@
             <!-- svelte-ignore a11y_no_static_element_interactions -->
             <div class="ia-popover-backdrop" onclick={() => (pickerOpen = false)}></div>
             <div class="ia-picker-popover" role="menu">
-              <div class="ia-picker-header">切换主线模型 · 保存到设置</div>
+              <div class="ia-picker-header">切换全局主模型</div>
               {#if pickerLoading}
                 <div class="ia-picker-status">拉取主模型可用列表中…</div>
               {:else if pickerError}

@@ -285,7 +285,7 @@ fn submit_supplement_context_turn(
         accepted_at,
     );
     let entry_id = format!("timeline-{}-{}", session_id, accepted_at.0);
-    state.persist_session_durable_state()?;
+    state.persist_session_state_checkpoint("session_supplement_context")?;
 
     let event_id = EventId::new(format!(
         "event-session-supplement-context-{}-{}",
@@ -1206,6 +1206,7 @@ fn submit_regular_session_turn(
             turn,
         )
         .map_err(|error| map_current_turn_accept_error("接受 session turn 失败", error))?;
+    state.persist_session_state_checkpoint("session_turn_accepted")?;
     publish_session_user_message_created_event(
         &state,
         &session_id,
@@ -1710,6 +1711,7 @@ fn write_continue_user_message(
             )
             .map_err(|error| ApiError::internal_assembly("写入 continue 用户消息失败", error))?;
     }
+    state.persist_session_state_checkpoint("session_continue_user_message")?;
     publish_session_user_message_created_event(
         state,
         &accepted.session_id,
@@ -1800,7 +1802,7 @@ async fn interrupt_session_turn(
         }
     }
 
-    state.persist_session_durable_state()?;
+    state.persist_session_state_checkpoint("session_turn_interrupted")?;
     let event_id = EventId::new(format!("event-session-turn-interrupt-{}", now.0));
     let event = EventEnvelope::domain(
         event_id.clone(),
