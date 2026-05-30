@@ -14,6 +14,7 @@ import type {
 import { RustDaemonClient } from '../shared/rust-daemon-client';
 import { resolveAgentBaseUrl } from '../web/agent-api';
 import { onBridgeMessage } from '../shared/bridges/bridge-runtime';
+import { messagesState } from './messages.svelte';
 
 export interface TaskProjectionState {
   projection: TaskProjectionDto | null;
@@ -52,6 +53,12 @@ function normalizeSessionKey(sessionId: string | null | undefined): string {
 
 function createClient(): RustDaemonClient {
   return new RustDaemonClient(resolveAgentBaseUrl());
+}
+
+function currentWorkspaceId(): string {
+  return typeof messagesState.currentWorkspaceId === 'string'
+    ? messagesState.currentWorkspaceId.trim()
+    : '';
 }
 
 function sessionRootKey(sessionId: string, rootTaskId: string): string {
@@ -154,7 +161,7 @@ export async function fetchTaskProjection(
 
   try {
     const client = createClient();
-    const projection = await client.getTaskProjection(rootTaskId, normalizedSessionId);
+    const projection = await client.getTaskProjection(rootTaskId, normalizedSessionId, currentWorkspaceId());
     const latestState = ensureSessionState(normalizedSessionId);
     if (
       latestState.fetchGeneration !== fetchGeneration

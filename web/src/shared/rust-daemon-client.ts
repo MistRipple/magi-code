@@ -533,9 +533,14 @@ export class RustDaemonClient {
 
   // ─── Task Projection ───────────────────────────────────────────────
 
-  public async getTaskProjection(rootTaskId: string, sessionId: string): Promise<TaskProjectionDto> {
+  public async getTaskProjection(
+    rootTaskId: string,
+    sessionId: string,
+    workspaceId?: string,
+  ): Promise<TaskProjectionDto> {
     const query = new URLSearchParams();
     query.set('sessionId', sessionId);
+    if (workspaceId) query.set('workspaceId', workspaceId);
     return this.getJson<TaskProjectionDto>(
       `/api/tasks/projection/${encodeURIComponent(rootTaskId)}?${query.toString()}`,
     );
@@ -544,9 +549,11 @@ export class RustDaemonClient {
   public async getSessionTaskHistory(
     sessionId: string,
     limit?: number,
+    workspaceId?: string,
   ): Promise<SessionTaskHistoryResponseDto> {
     const query = new URLSearchParams();
     query.set('sessionId', sessionId);
+    if (workspaceId) query.set('workspaceId', workspaceId);
     if (limit !== undefined) {
       query.set('limit', String(limit));
     }
@@ -555,17 +562,23 @@ export class RustDaemonClient {
     );
   }
 
-  public async getTask(taskId: string, sessionId: string): Promise<TaskDto> {
+  public async getTask(taskId: string, sessionId: string, workspaceId?: string): Promise<TaskDto> {
     const query = new URLSearchParams();
     query.set('sessionId', sessionId);
+    if (workspaceId) query.set('workspaceId', workspaceId);
     return this.getJson<TaskDto>(
       `/api/tasks/${encodeURIComponent(taskId)}?${query.toString()}`,
     );
   }
 
-  public async getDeliveryPackage(rootTaskId: string, sessionId: string): Promise<DeliveryPackageDto> {
+  public async getDeliveryPackage(
+    rootTaskId: string,
+    sessionId: string,
+    workspaceId?: string,
+  ): Promise<DeliveryPackageDto> {
     const query = new URLSearchParams();
     query.set('sessionId', sessionId);
+    if (workspaceId) query.set('workspaceId', workspaceId);
     return this.getJson<DeliveryPackageDto>(
       `/api/tasks/${encodeURIComponent(rootTaskId)}/delivery-package?${query.toString()}`,
     );

@@ -2249,7 +2249,7 @@ export async function autoConnectTaskTracking(
     for (const taskId of activeTaskIds) {
       let task;
       try {
-        task = await client.getTask(taskId, sessionId);
+        task = await client.getTask(taskId, sessionId, currentWorkspaceId);
       } catch {
         continue;
       }

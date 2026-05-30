@@ -66,6 +66,10 @@ export interface SessionTurnResponseDto {
 
 export interface TaskInterruptResponseDto {
   interrupted: boolean;
+  sessionId: string;
+  workspaceId: string;
+  workspacePath: string;
+  rootTaskId: string;
   eventId: string;
   requestedAt: number;
 }
@@ -81,11 +85,15 @@ export interface TaskRestartResponseDto {
   actionTaskId: string;
   executionChainRef?: string | null;
   requestedAt: number;
+  workspaceId: string;
+  workspacePath: string;
 }
 
 export interface TaskArchiveResponseDto {
   archived: boolean;
   sessionId: string;
+  workspaceId: string;
+  workspacePath: string;
   rootTaskId: string;
   eventId: string;
   requestedAt: number;
@@ -793,6 +801,8 @@ export interface SessionSaveRequestDto {
 
 export interface SessionContinueRequestDto {
   sessionId: string;
+  workspaceId?: string | null;
+  workspace_id?: string | null;
   promptText?: string | null;
   requestedAgentIds?: string[];
   requestId?: string | null;
@@ -1279,6 +1289,9 @@ export interface TaskPolicyDto {
 }
 
 export interface TaskDto {
+  sessionId?: string;
+  workspaceId?: string;
+  workspacePath?: string;
   task_id: string;
   mission_id: string;
   root_task_id: string;
@@ -1315,6 +1328,9 @@ export interface ProgressSummaryDto {
 export type TaskExecutionModeDto = 'session_turn' | 'execution_chain' | 'long_mission';
 
 export interface TaskProjectionDto {
+  sessionId: string;
+  workspaceId: string;
+  workspacePath: string;
   root_task: TaskDto;
   tasks: TaskDto[];
   running_tasks: string[];
@@ -1344,6 +1360,8 @@ export interface SessionTaskHistoryItemDto {
 
 export interface SessionTaskHistoryResponseDto {
   sessionId: string;
+  workspaceId: string;
+  workspacePath: string;
   items: SessionTaskHistoryItemDto[];
 }
 
@@ -1371,6 +1389,9 @@ export interface DeliveryPackageExecutionRecordDto {
 }
 
 export interface DeliveryPackageDto {
+  sessionId: string;
+  workspaceId: string;
+  workspacePath: string;
   goal: string;
   scope?: string | null;
   execution_mode: TaskExecutionModeDto;

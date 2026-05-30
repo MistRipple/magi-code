@@ -4,6 +4,7 @@
     addToast,
     getEnabledAgents,
     getState,
+    messagesState,
   } from '../stores/messages.svelte';
   import Icon from './Icon.svelte';
   import { i18n } from '../stores/i18n.svelte';
@@ -172,7 +173,7 @@
     deliveryPackageLoading = true;
     deliveryPackageRequestScope = nextScope;
     const client = createClient();
-    client.getDeliveryPackage(rootTaskId, sid)
+    client.getDeliveryPackage(rootTaskId, sid, currentWorkspaceIdValue())
       .then((pkg) => {
         if (deliveryPackageScope === nextScope && deliveryPackageRequestScope === nextScope) {
           deliveryPackage = pkg;
@@ -585,6 +586,12 @@
     return new RustDaemonClient(resolveAgentBaseUrl());
   }
 
+  function currentWorkspaceIdValue(): string {
+    return typeof messagesState.currentWorkspaceId === 'string'
+      ? messagesState.currentWorkspaceId.trim()
+      : '';
+  }
+
   async function loadSessionTaskHistory(
     sessionId: string,
     generation = taskHistoryFetchGeneration,
@@ -595,7 +602,7 @@
     taskHistoryError = null;
     const client = createClient();
     try {
-      const response = await client.getSessionTaskHistory(sid, TASK_HISTORY_REQUEST_LIMIT);
+      const response = await client.getSessionTaskHistory(sid, TASK_HISTORY_REQUEST_LIMIT, currentWorkspaceIdValue());
       if (taskHistoryRequestScope !== sid || taskHistoryFetchGeneration !== generation) {
         return;
       }
@@ -649,7 +656,7 @@
     if (!sessionId || !rootTaskId) return;
     await runTaskAction('stop', async () => {
       const client = createClient();
-      await client.interruptTask({ taskId: rootTaskId, sessionId });
+      await client.interruptTask({ taskId: rootTaskId, sessionId, workspaceId: currentWorkspaceIdValue() });
       clearDeliveryPackageViewState();
       await refreshTaskProjection(sessionId);
       addToast('info', '任务已中断，进度已保留');
@@ -665,7 +672,7 @@
     if (!sessionId || !rootTaskId) return;
     await runTaskAction('resume', async () => {
       const client = createClient();
-      await client.continueSession({ sessionId });
+      await client.continueSession({ sessionId, workspaceId: currentWorkspaceIdValue() });
       clearDeliveryPackageViewState();
       await refreshTaskProjection(sessionId);
       addToast('success', '任务已继续');
@@ -681,7 +688,7 @@
     if (!sessionId || !rootTaskId) return;
     await runTaskAction('restart', async () => {
       const client = createClient();
-      const result = await client.restartTask({ taskId: rootTaskId, sessionId });
+      const result = await client.restartTask({ taskId: rootTaskId, sessionId, workspaceId: currentWorkspaceIdValue() });
       clearDeliveryPackageViewState();
       if (result.rootTaskId) {
         await fetchTaskProjection(sessionId, result.rootTaskId);
@@ -702,7 +709,7 @@
     if (!sessionId || !rootTaskId) return;
     await runTaskAction('archive', async () => {
       const client = createClient();
-      await client.archiveTask({ taskId: rootTaskId, sessionId });
+      await client.archiveTask({ taskId: rootTaskId, sessionId, workspaceId: currentWorkspaceIdValue() });
       clearDeliveryPackageViewState();
       clearTaskProjection(sessionId, rootTaskId);
       await refreshSessionTaskHistory();
@@ -719,7 +726,7 @@
     restartingHistoryRootTaskId = rootTaskId;
     try {
       const client = createClient();
-      const result = await client.restartTask({ taskId: rootTaskId, sessionId });
+      const result = await client.restartTask({ taskId: rootTaskId, sessionId, workspaceId: currentWorkspaceIdValue() });
       clearDeliveryPackageViewState();
       if (result.rootTaskId) {
         await fetchTaskProjection(sessionId, result.rootTaskId);

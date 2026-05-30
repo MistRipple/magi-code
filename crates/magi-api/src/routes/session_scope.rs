@@ -2,12 +2,63 @@ use crate::{errors::ApiError, state::ApiState};
 use magi_core::{SessionId, WorkspaceId};
 use magi_session_store::SessionRecord;
 
+#[derive(Clone, Debug)]
+pub(super) struct SessionWorkspaceScope {
+    pub session_id: SessionId,
+    pub workspace_id: WorkspaceId,
+    pub workspace_path: String,
+}
+
 pub(super) fn parse_session_id(value: Option<&str>) -> Result<SessionId, ApiError> {
     let session_id = value
         .map(str::trim)
         .filter(|session_id| !session_id.is_empty())
         .ok_or_else(|| ApiError::InvalidInput("sessionId 不能为空".to_string()))?;
     Ok(SessionId::new(session_id))
+}
+
+pub(super) fn require_workspace_id(value: Option<&str>) -> Result<WorkspaceId, ApiError> {
+    value
+        .map(str::trim)
+        .filter(|workspace_id| !workspace_id.is_empty())
+        .map(WorkspaceId::new)
+        .ok_or_else(|| ApiError::InvalidInput("workspaceId 不能为空".to_string()))
+}
+
+pub(super) fn require_session_workspace_scope(
+    state: &ApiState,
+    session_id_value: Option<&str>,
+    requested_workspace_id: Option<&str>,
+    action: &str,
+) -> Result<SessionWorkspaceScope, ApiError> {
+    let session_id = parse_session_id(session_id_value)?;
+    let requested_workspace_id = require_workspace_id(requested_workspace_id)?;
+    let session = state
+        .session_store
+        .session(&session_id)
+        .ok_or_else(|| ApiError::session_not_found(session_id.as_str()))?;
+    let bound_workspace_id = state
+        .session_store
+        .execution_ownership(&session_id)
+        .and_then(|ownership| ownership.workspace_id)
+        .or_else(|| session_workspace_id(state, &session))
+        .ok_or_else(|| ApiError::InvalidInput(format!("当前会话未绑定 workspace，不能{action}")))?;
+    if bound_workspace_id != requested_workspace_id {
+        return Err(session_workspace_mismatch(
+            &session_id,
+            requested_workspace_id.as_str(),
+        ));
+    }
+    let workspace_path = state
+        .workspace_root_path(&Some(bound_workspace_id.clone()))
+        .ok_or_else(|| ApiError::not_found("workspace 不存在", bound_workspace_id.as_str()))?
+        .to_string_lossy()
+        .to_string();
+    Ok(SessionWorkspaceScope {
+        session_id,
+        workspace_id: bound_workspace_id,
+        workspace_path,
+    })
 }
 
 pub(super) fn require_session_record_in_workspace(

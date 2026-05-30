@@ -6,7 +6,7 @@ use serde_json::json;
 
 use super::{
     dispatch_flow::{accept_session_task_submission, finalize_session_task_dispatch},
-    session_scope::parse_session_id,
+    session_scope::{SessionWorkspaceScope, require_session_workspace_scope},
 };
 use crate::{dto::SessionTurnRequestDto, errors::ApiError, state::ApiState};
 use magi_conversation_runtime::execution_chain_recovery::finalize_terminal_worker_branches;
@@ -23,13 +23,14 @@ pub fn routes() -> Router<ApiState> {
 fn require_session_owned_task(
     state: &ApiState,
     session_id_value: Option<&str>,
+    workspace_id_value: Option<&str>,
     task_id: &str,
-) -> Result<(SessionId, magi_core::Task), ApiError> {
-    let session_id = parse_session_id(session_id_value)?;
+) -> Result<(SessionWorkspaceScope, magi_core::Task), ApiError> {
+    let scope = require_task_request_scope(state, session_id_value, workspace_id_value)?;
     let ownership = state
         .session_store
-        .execution_ownership(&session_id)
-        .ok_or_else(|| ApiError::session_not_found(session_id.as_str()))?;
+        .execution_ownership(&scope.session_id)
+        .ok_or_else(|| ApiError::session_not_found(scope.session_id.as_str()))?;
     let mission_id = ownership
         .mission_id
         .ok_or_else(|| ApiError::InvalidInput("当前会话没有活跃任务".to_string()))?;
@@ -43,10 +44,18 @@ fn require_session_owned_task(
     if task.mission_id != mission_id {
         return Err(ApiError::InvalidInput(format!(
             "任务 {} 不属于当前会话 {}",
-            task_id, session_id
+            task_id, scope.session_id
         )));
     }
-    Ok((session_id, task))
+    Ok((scope, task))
+}
+
+fn require_task_request_scope(
+    state: &ApiState,
+    session_id_value: Option<&str>,
+    workspace_id_value: Option<&str>,
+) -> Result<SessionWorkspaceScope, ApiError> {
+    require_session_workspace_scope(state, session_id_value, workspace_id_value, "执行任务操作")
 }
 
 fn turn_contains_task_root(
@@ -102,13 +111,10 @@ fn session_history_contains_task(
 fn require_session_historical_task(
     state: &ApiState,
     session_id_value: Option<&str>,
+    workspace_id_value: Option<&str>,
     task_id: &str,
-) -> Result<(SessionId, magi_core::Task), ApiError> {
-    let session_id = parse_session_id(session_id_value)?;
-    state
-        .session_store
-        .session(&session_id)
-        .ok_or_else(|| ApiError::session_not_found(session_id.as_str()))?;
+) -> Result<(SessionWorkspaceScope, magi_core::Task), ApiError> {
+    let scope = require_task_request_scope(state, session_id_value, workspace_id_value)?;
     let store = state.task_store().ok_or_else(|| {
         ApiError::internal_assembly("session task history guard", "task_store 未配置")
     })?;
@@ -116,13 +122,13 @@ fn require_session_historical_task(
     let task = store
         .get_task(&tid)
         .ok_or_else(|| ApiError::not_found("任务不存在", task_id))?;
-    if !session_history_contains_task(state, store, &session_id, &task) {
+    if !session_history_contains_task(state, store, &scope.session_id, &task) {
         return Err(ApiError::InvalidInput(format!(
             "任务 {} 不属于当前会话 {}",
-            task_id, session_id
+            task_id, scope.session_id
         )));
     }
-    Ok((session_id, task))
+    Ok((scope, task))
 }
 
 #[derive(Debug, Deserialize)]
@@ -130,6 +136,7 @@ fn require_session_historical_task(
 struct TaskIdRequest {
     task_id: String,
     session_id: Option<String>,
+    workspace_id: Option<String>,
 }
 
 fn ensure_terminal_root_action(
@@ -166,8 +173,13 @@ async fn interrupt_task(
     let store = state
         .task_store()
         .ok_or_else(|| ApiError::internal_assembly("interrupt task", "task_store 未配置"))?;
-    let (session_id, task) =
-        require_session_owned_task(&state, request.session_id.as_deref(), task_id)?;
+    let (scope, task) = require_session_owned_task(
+        &state,
+        request.session_id.as_deref(),
+        request.workspace_id.as_deref(),
+        task_id,
+    )?;
+    let session_id = scope.session_id.clone();
     let root_task_id = task.root_task_id.clone();
     let manager = state
         .runner_manager()
@@ -225,6 +237,10 @@ async fn interrupt_task(
         "cancelledToolProcessCount": cancelled_tool_process_count,
         "eventId": event_id.to_string(),
         "requestedAt": now.0,
+        "sessionId": session_id.to_string(),
+        "workspaceId": scope.workspace_id.to_string(),
+        "workspacePath": scope.workspace_path,
+        "rootTaskId": root_task_id.to_string(),
     })))
 }
 
@@ -238,8 +254,13 @@ async fn restart_task(
     if task_id.is_empty() {
         return Err(ApiError::InvalidInput("taskId 不能为空".to_string()));
     }
-    let (session_id, task) =
-        require_session_historical_task(&state, request.session_id.as_deref(), task_id)?;
+    let (scope, task) = require_session_historical_task(
+        &state,
+        request.session_id.as_deref(),
+        request.workspace_id.as_deref(),
+        task_id,
+    )?;
+    let session_id = scope.session_id.clone();
     let root_task = ensure_terminal_root_action(&state, &task.root_task_id, "重新执行")?;
     let ownership = state
         .session_store
@@ -317,6 +338,8 @@ async fn restart_task(
         "actionTaskId": accepted.action_task_id.to_string(),
         "executionChainRef": execution_chain_ref,
         "requestedAt": now.0,
+        "workspaceId": scope.workspace_id.to_string(),
+        "workspacePath": scope.workspace_path,
     })))
 }
 
@@ -330,8 +353,13 @@ async fn archive_task(
     if task_id.is_empty() {
         return Err(ApiError::InvalidInput("taskId 不能为空".to_string()));
     }
-    let (session_id, task) =
-        require_session_owned_task(&state, request.session_id.as_deref(), task_id)?;
+    let (scope, task) = require_session_owned_task(
+        &state,
+        request.session_id.as_deref(),
+        request.workspace_id.as_deref(),
+        task_id,
+    )?;
+    let session_id = scope.session_id.clone();
     let root_task = ensure_terminal_root_action(&state, &task.root_task_id, "从面板移除")?;
     state
         .session_store
@@ -360,5 +388,7 @@ async fn archive_task(
         "rootTaskId": root_task.task_id.to_string(),
         "eventId": event_id.to_string(),
         "requestedAt": now.0,
+        "workspaceId": scope.workspace_id.to_string(),
+        "workspacePath": scope.workspace_path,
     })))
 }
