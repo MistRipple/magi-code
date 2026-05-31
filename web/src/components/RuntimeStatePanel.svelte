@@ -88,7 +88,7 @@
 
   const failureReason = $derived.by(() => {
     const raw = runtimeState?.failureReason;
-    return typeof raw === 'string' && raw.trim().length > 0 ? raw.trim() : '';
+    return sanitizeRuntimeDisplayText(raw);
   });
 
   const failureErrors = $derived.by(() => {
@@ -98,7 +98,8 @@
     }
     return errors
       .filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
-      .map((item) => item.trim())
+      .map((item) => sanitizeRuntimeDisplayText(item))
+      .filter((item) => item.length > 0)
       .filter((item) => !isGeneratedRuntimeIdentifier(item))
       .filter((item, index, arr) => arr.indexOf(item) === index);
   });
@@ -216,34 +217,40 @@
       return [] as Array<{ label: string; value: string }>;
     }
     const entries: Array<{ label: string; value: string }> = [];
-    if (recovery.continuationPolicy) {
-      entries.push({ label: i18n.t('runtimeDiagnostics.recovery.continuationPolicy'), value: recovery.continuationPolicy });
+    const continuationPolicy = formatContinuationPolicy(recovery.continuationPolicy);
+    if (continuationPolicy) {
+      entries.push({ label: i18n.t('runtimeDiagnostics.recovery.continuationPolicy'), value: continuationPolicy });
     }
-    if (recovery.continuationReason) {
-      entries.push({ label: i18n.t('runtimeDiagnostics.recovery.continuationReason'), value: recovery.continuationReason });
+    const continuationReason = sanitizeRuntimeDisplayText(recovery.continuationReason);
+    if (continuationReason) {
+      entries.push({ label: i18n.t('runtimeDiagnostics.recovery.continuationReason'), value: continuationReason });
     }
-    if (recovery.waitState) {
-      entries.push({ label: i18n.t('runtimeDiagnostics.recovery.waitState'), value: recovery.waitState });
+    const waitState = formatRecoveryState(recovery.waitState);
+    if (waitState) {
+      entries.push({ label: i18n.t('runtimeDiagnostics.recovery.waitState'), value: waitState });
     }
-    if (recovery.replanState) {
-      entries.push({ label: i18n.t('runtimeDiagnostics.recovery.replanState'), value: recovery.replanState });
+    const replanState = formatRecoveryState(recovery.replanState);
+    if (replanState) {
+      entries.push({ label: i18n.t('runtimeDiagnostics.recovery.replanState'), value: replanState });
     }
-    if (recovery.terminationReason) {
-      entries.push({ label: i18n.t('runtimeDiagnostics.recovery.terminationReason'), value: recovery.terminationReason });
+    const terminationReason = sanitizeRuntimeDisplayText(recovery.terminationReason);
+    if (terminationReason) {
+      entries.push({ label: i18n.t('runtimeDiagnostics.recovery.terminationReason'), value: terminationReason });
     }
     if (recovery.acceptanceSummary) {
-      entries.push({ label: i18n.t('runtimeDiagnostics.recovery.acceptanceSummary'), value: String(recovery.acceptanceSummary) });
+      const acceptanceSummary = sanitizeRuntimeDisplayText(String(recovery.acceptanceSummary));
+      if (acceptanceSummary) {
+        entries.push({ label: i18n.t('runtimeDiagnostics.recovery.acceptanceSummary'), value: acceptanceSummary });
+      }
     }
-    if (recovery.reviewState) {
-      entries.push({ label: i18n.t('runtimeDiagnostics.recovery.reviewState'), value: recovery.reviewState });
+    const reviewState = formatRecoveryState(recovery.reviewState);
+    if (reviewState) {
+      entries.push({ label: i18n.t('runtimeDiagnostics.recovery.reviewState'), value: reviewState });
     }
     if (recovery.latestSnapshotId) {
       entries.push({
         label: i18n.t('runtimeDiagnostics.recovery.latestSnapshotId'),
-        value: formatNamedReference(
-          formatSnapshotStorageLabel(recovery.snapshotStorage),
-          recovery.latestSnapshotId,
-        ),
+        value: formatSnapshotStorageLabel(recovery.snapshotStorage) || i18n.t('runtimeDiagnostics.recovery.snapshotReady'),
       });
     }
     if (recovery.latestSnapshotCreatedAt) {
@@ -255,7 +262,7 @@
     if (recovery.snapshotStorage) {
       entries.push({
         label: i18n.t('runtimeDiagnostics.recovery.snapshotStorage'),
-        value: formatSnapshotStorageDetail(recovery.snapshotStorage, recovery.snapshotBaseRef),
+        value: formatSnapshotStorageLabel(recovery.snapshotStorage),
       });
     }
     if (typeof recovery.snapshotDirtyFileCount === 'number') {
@@ -393,23 +400,6 @@
     return new Date(timestamp).toLocaleString();
   }
 
-  function shortenIdentifier(value: string | undefined): string {
-    const normalized = typeof value === 'string' ? value.trim() : '';
-    if (!normalized) return '--';
-    if (normalized.length <= 20) return normalized;
-    return `${normalized.slice(0, 8)}…${normalized.slice(-6)}`;
-  }
-
-  function formatNamedReference(title: string | undefined | null, id?: string | null): string {
-    const normalizedTitle = typeof title === 'string' ? title.trim() : '';
-    const normalizedId = typeof id === 'string' ? id.trim() : '';
-    const readableId = normalizedId && !isGeneratedRuntimeIdentifier(normalizedId) ? normalizedId : '';
-    if (normalizedTitle && readableId) {
-      return `${normalizedTitle} (${shortenIdentifier(readableId)})`;
-    }
-    return normalizedTitle || (readableId ? shortenIdentifier(readableId) : '--');
-  }
-
   function formatRuntimePhase(phase: string | undefined): string {
     const normalized = typeof phase === 'string' ? phase.trim() : '';
     if (!normalized) return '--';
@@ -476,16 +466,37 @@
       case 'head_commit':
         return i18n.t('runtimeDiagnostics.recovery.storage.headCommit');
       default:
-        return '--';
+        return '';
     }
   }
 
-  function formatSnapshotStorageDetail(storage: string | undefined, baseRef?: string): string {
-    const storageLabel = formatSnapshotStorageLabel(storage);
-    const baseLabel = typeof baseRef === 'string' && baseRef.trim()
-      ? `${i18n.t('runtimeDiagnostics.recovery.snapshotBaseRef')}: ${shortenIdentifier(baseRef)}`
-      : '';
-    return [storageLabel, baseLabel].filter(Boolean).join(' · ') || '--';
+  function formatContinuationPolicy(policy: string | undefined): string {
+    switch (policy) {
+      case 'resumable':
+        return i18n.t('runtimeDiagnostics.recovery.continuation.resumable');
+      case 'none':
+        return i18n.t('runtimeDiagnostics.recovery.continuation.none');
+      default:
+        return formatHumanizedRuntimeText(policy);
+    }
+  }
+
+  function formatRecoveryState(state: string | undefined): string {
+    const normalized = typeof state === 'string' ? state.trim() : '';
+    if (!normalized) return '';
+    const assignmentStatus = formatAssignmentStatus(normalized);
+    if (assignmentStatus && assignmentStatus !== normalized) {
+      return assignmentStatus;
+    }
+    switch (normalized) {
+      case 'ready':
+        return i18n.t('runtimeDiagnostics.recovery.state.ready');
+      case 'consumed':
+      case 'worker_resumed':
+        return i18n.t('runtimeDiagnostics.recovery.state.consumed');
+      default:
+        return formatHumanizedRuntimeText(normalized);
+    }
   }
 
   function formatWorkerName(workerId: string | undefined): string {
@@ -499,18 +510,11 @@
   function isGeneratedRuntimeIdentifier(value: string | undefined): boolean {
     const normalized = typeof value === 'string' ? value.trim().toLowerCase() : '';
     if (!normalized) return false;
-    return /\b(task|session|worker|mission|chain|recovery|assignment|request|batch|execution[_-]?group)[-_][a-z0-9_-]*\d{4,}/.test(normalized)
+    return /\b(task|session|worker|mission|chain|recovery|assignment|request|batch|execution[_-]?group|snapshot|tool[_-]?call)[-_][a-z0-9_-]*\d{4,}/.test(normalized)
       || /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(normalized)
+      || /^[a-f0-9]{12,}$/.test(normalized)
       || /\d{10,}/.test(normalized)
       || normalized.startsWith('task_failed:');
-  }
-
-  function resolveTaskRuntimeIdentifier(entry: Record<string, unknown>): string {
-    const taskId = typeof entry.taskId === 'string' ? entry.taskId.trim() : '';
-    if (taskId) {
-      return taskId;
-    }
-    return '';
   }
 
   function formatAssignmentMeta(item: { assignmentId?: string; workerId?: string; status: string }): string {
@@ -756,22 +760,8 @@
   }
 
   function formatKnowledgeAuditScope(entry: KnowledgeAuditEntry): string {
-    const scopes: string[] = [];
-    appendReadableScope(scopes, i18n.t('runtimeDiagnostics.scope.request'), entry.requestId);
-    appendReadableScope(scopes, i18n.t('runtimeDiagnostics.scope.executionGroup'), entry.executionGroupId);
-    appendReadableScope(scopes, i18n.t('runtimeDiagnostics.scope.assignment'), entry.assignmentId);
-    appendReadableScope(scopes, i18n.t('runtimeDiagnostics.scope.task'), resolveTaskRuntimeIdentifier(entry));
-    appendReadableScope(scopes, i18n.t('runtimeDiagnostics.scope.worker'), entry.workerId);
-    appendReadableScope(scopes, i18n.t('runtimeDiagnostics.scope.session'), entry.sessionId);
-    return scopes.length > 0 ? scopes.join(' · ') : '';
-  }
-
-  function appendReadableScope(scopes: string[], label: string, value: unknown): void {
-    const normalized = typeof value === 'string' ? value.trim() : '';
-    if (!normalized || isGeneratedRuntimeIdentifier(normalized)) {
-      return;
-    }
-    scopes.push(`${label}: ${shortenIdentifier(normalized)}`);
+    void entry;
+    return '';
   }
 
   function formatKnowledgeAuditMeta(entry: KnowledgeAuditEntry): string {
@@ -884,10 +874,7 @@
 
   function formatStateDiffEntityLabel(item: { entityType: string; entityId: string }): string {
     const entityType = item.entityType || '--';
-    const typeLabel = formatRuntimeEntityTypeLabel(entityType);
-    return isGeneratedRuntimeIdentifier(item.entityId)
-      ? typeLabel
-      : `${typeLabel} · ${shortenIdentifier(item.entityId)}`;
+    return formatRuntimeEntityTypeLabel(entityType);
   }
 
   function formatStateSummary(value: string | undefined): string {
@@ -1057,10 +1044,7 @@
     if (!raw || isGeneratedRuntimeIdentifier(raw)) {
       return '';
     }
-    const withoutIdentifiers = raw
-      .replace(/\b(task|session|worker|mission|chain|recovery|assignment|request|batch|execution[_-]?group)[-_:][a-z0-9_-]*\d{4,}\b/gi, '')
-      .replace(/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi, '')
-      .replace(/\b\d{10,}\b/g, '')
+    const withoutIdentifiers = stripRuntimeIdentifiers(raw)
       .replace(/\s+/g, ' ')
       .replace(/^[\s:：,，;；·-]+|[\s:：,，;；·-]+$/g, '')
       .trim();
@@ -1070,6 +1054,26 @@
     return withoutIdentifiers
       .replace(/[_-]/g, ' ')
       .replace(/\b[a-z]/g, (char) => char.toUpperCase());
+  }
+
+  function sanitizeRuntimeDisplayText(value: unknown): string {
+    const raw = typeof value === 'string' ? value.trim() : '';
+    if (!raw || isGeneratedRuntimeIdentifier(raw)) {
+      return '';
+    }
+    const sanitized = stripRuntimeIdentifiers(raw)
+      .replace(/\s+/g, ' ')
+      .replace(/^[\s:：,，;；·-]+|[\s:：,，;；·-]+$/g, '')
+      .trim();
+    return isGeneratedRuntimeIdentifier(sanitized) ? '' : sanitized;
+  }
+
+  function stripRuntimeIdentifiers(value: string): string {
+    return value
+      .replace(/\b(task|session|worker|mission|chain|recovery|assignment|request|batch|execution[_-]?group|snapshot|tool[_-]?call)[-_:][a-z0-9_-]*\d{4,}\b/gi, '')
+      .replace(/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi, '')
+      .replace(/\b[a-f0-9]{12,}\b/gi, '')
+      .replace(/\b\d{10,}\b/g, '');
   }
 
   function togglePanel(): void {
