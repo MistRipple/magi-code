@@ -8,6 +8,10 @@ use magi_tool_runtime::{ToolExecutionContext, ToolExecutionPolicy};
 use serde_json::Value;
 
 const SKILL_CUSTOM_TOOL_PREFIX: &str = "skill";
+const SKILL_TOOL_UNAVAILABLE_PUBLIC_ERROR: &str = "Skill 工具暂不可用，请稍后重试";
+const SKILL_TOOL_CONFIG_PUBLIC_ERROR: &str = "Skill 工具配置不可用，请重新加载该 Skill";
+const SKILL_TOOL_SCOPE_PUBLIC_ERROR: &str = "该 Skill 工具不属于当前激活 Skill";
+const SKILL_TOOL_DISPATCH_PUBLIC_ERROR: &str = "Skill 工具执行失败，请稍后重试";
 
 pub fn build_skill_custom_tool_definitions(
     skill_name: &str,
@@ -98,9 +102,10 @@ fn build_skill_custom_tool_definition(
     }
 }
 
-fn custom_tool_failure(
+fn custom_tool_public_failure(
     tool_name: &str,
-    error: impl Into<String>,
+    error_code: &'static str,
+    public_error: &'static str,
     status: ExecutionResultStatus,
 ) -> (String, ExecutionResultStatus) {
     (
@@ -108,9 +113,11 @@ fn custom_tool_failure(
             "tool": tool_name,
             "status": match status {
                 ExecutionResultStatus::Rejected => "rejected",
+                ExecutionResultStatus::NeedsApproval => "needs_approval",
                 _ => "failed",
             },
-            "error": error.into(),
+            "error_code": error_code,
+            "error": public_error,
         })
         .to_string(),
         status,
@@ -138,28 +145,38 @@ pub fn execute_skill_custom_tool(
     let tool_name = tool_call.function.name.as_str();
 
     if active_skill_name.is_some_and(|active_skill| active_skill != tool_skill_name) {
-        return custom_tool_failure(
+        tracing::warn!(
             tool_name,
-            format!(
-                "custom skill tool {} 不属于当前激活 skill {}",
-                tool_name,
-                active_skill_name.unwrap_or_default()
-            ),
+            requested_skill = %tool_skill_name,
+            active_skill = active_skill_name.unwrap_or_default(),
+            "skill custom tool called outside active skill"
+        );
+        return custom_tool_public_failure(
+            tool_name,
+            "skill_tool_scope_mismatch",
+            SKILL_TOOL_SCOPE_PUBLIC_ERROR,
             ExecutionResultStatus::Rejected,
         );
     }
 
     let Some(skill_runtime) = skill_runtime else {
-        return custom_tool_failure(
+        tracing::warn!(tool_name, "skill runtime unavailable for custom tool");
+        return custom_tool_public_failure(
             tool_name,
-            "skill runtime not available",
+            "skill_runtime_unavailable",
+            SKILL_TOOL_UNAVAILABLE_PUBLIC_ERROR,
             ExecutionResultStatus::Failed,
         );
     };
     let Some(skill_dispatch_runtime) = skill_dispatch_runtime else {
-        return custom_tool_failure(
+        tracing::warn!(
             tool_name,
-            "skill dispatch runtime not available",
+            "skill dispatch runtime unavailable for custom tool"
+        );
+        return custom_tool_public_failure(
+            tool_name,
+            "skill_dispatch_unavailable",
+            SKILL_TOOL_UNAVAILABLE_PUBLIC_ERROR,
             ExecutionResultStatus::Failed,
         );
     };
@@ -175,9 +192,16 @@ pub fn execute_skill_custom_tool(
         .find(|binding| binding.binding_id == binding_id)
         .cloned()
     else {
-        return custom_tool_failure(
+        tracing::warn!(
             tool_name,
-            format!("未找到 custom skill binding: {tool_skill_name} / {binding_id}"),
+            skill_name = %tool_skill_name,
+            binding_id,
+            "skill custom tool binding not found"
+        );
+        return custom_tool_public_failure(
+            tool_name,
+            "skill_tool_binding_missing",
+            SKILL_TOOL_CONFIG_PUBLIC_ERROR,
             ExecutionResultStatus::Failed,
         );
     };
@@ -218,24 +242,59 @@ pub fn execute_skill_custom_tool(
                 ExecutionResultStatus::Failed
             },
         ),
-        Err(_error) => (
-            serde_json::json!({
-                "tool": tool_name,
-                "status": "failed",
-                "binding_id": observation.binding_id,
-                "skill_name": tool_skill_name,
-                "error": observation.detail,
-                "bridge_error_layer": observation.bridge_error_layer,
-                "bridge_error_message": observation.bridge_error_message,
-            })
-            .to_string(),
-            match observation.status {
-                SkillDispatchStatus::NeedsApproval => ExecutionResultStatus::NeedsApproval,
-                SkillDispatchStatus::Rejected => ExecutionResultStatus::Rejected,
-                _ => ExecutionResultStatus::Failed,
-            },
-        ),
+        Err(_error) => {
+            custom_tool_dispatch_failure_payload(tool_name, tool_skill_name, observation)
+        }
     }
+}
+
+fn custom_tool_dispatch_failure_payload(
+    tool_name: &str,
+    skill_name: &str,
+    observation: magi_skill_runtime::SkillDispatchObservation,
+) -> (String, ExecutionResultStatus) {
+    tracing::warn!(
+        tool_name,
+        skill_name,
+        binding_id = observation.binding_id.as_deref().unwrap_or_default(),
+        error_kind = ?observation.error_kind,
+        bridge_error_layer = ?observation.bridge_error_layer,
+        bridge_error_message = observation.bridge_error_message.as_deref().unwrap_or_default(),
+        detail = %observation.detail,
+        "skill custom tool dispatch failed"
+    );
+    let (status_label, status, error_code, public_error) = match observation.status {
+        SkillDispatchStatus::NeedsApproval => (
+            "needs_approval",
+            ExecutionResultStatus::NeedsApproval,
+            "skill_tool_needs_approval",
+            "Skill 工具需要批准后执行",
+        ),
+        SkillDispatchStatus::Rejected => (
+            "rejected",
+            ExecutionResultStatus::Rejected,
+            "skill_tool_config_unavailable",
+            SKILL_TOOL_CONFIG_PUBLIC_ERROR,
+        ),
+        _ => (
+            "failed",
+            ExecutionResultStatus::Failed,
+            "skill_tool_dispatch_failed",
+            SKILL_TOOL_DISPATCH_PUBLIC_ERROR,
+        ),
+    };
+    (
+        serde_json::json!({
+            "tool": tool_name,
+            "status": status_label,
+            "binding_id": observation.binding_id,
+            "skill_name": skill_name,
+            "error_code": error_code,
+            "error": public_error,
+        })
+        .to_string(),
+        status,
+    )
 }
 
 fn custom_tool_safety_decision(
@@ -329,4 +388,104 @@ fn custom_tool_safety_payload(
         .to_string(),
         status,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use magi_bridge_client::{BridgeDispatchRuntime, ChatToolFunction};
+    use magi_event_bus::InMemoryEventBus;
+    use magi_governance::GovernanceService;
+    use magi_skill_runtime::SkillRegistry;
+    use magi_tool_runtime::ToolRegistry;
+    use std::sync::Arc;
+
+    fn tool_call(name: &str) -> ChatToolCall {
+        ChatToolCall {
+            id: "skill-tool-call".to_string(),
+            kind: "function".to_string(),
+            function: ChatToolFunction {
+                name: name.to_string(),
+                arguments: serde_json::json!({ "payload": "hello" }).to_string(),
+            },
+        }
+    }
+
+    fn dispatch_runtime() -> SkillDispatchRuntime {
+        let tool_registry = ToolRegistry::new(
+            Arc::new(GovernanceService::default()),
+            Arc::new(InMemoryEventBus::new(8)),
+        );
+        SkillDispatchRuntime::new(tool_registry, BridgeDispatchRuntime::new())
+    }
+
+    #[test]
+    fn custom_skill_tool_missing_runtime_uses_public_error() {
+        let (payload, status) = execute_skill_custom_tool(
+            &tool_call("skill__code-review__review"),
+            "code-review",
+            "review",
+            Some("code-review"),
+            AccessProfile::Restricted,
+            None,
+            None,
+            None,
+            ToolExecutionContext::default(),
+            None,
+        );
+
+        assert_eq!(status, ExecutionResultStatus::Failed);
+        let parsed: Value = serde_json::from_str(&payload).expect("payload should be json");
+        assert_eq!(parsed["error_code"], "skill_runtime_unavailable");
+        assert_eq!(parsed["error"], SKILL_TOOL_UNAVAILABLE_PUBLIC_ERROR);
+        assert!(!payload.contains("runtime not available"));
+    }
+
+    #[test]
+    fn custom_skill_tool_scope_mismatch_uses_public_error() {
+        let (payload, status) = execute_skill_custom_tool(
+            &tool_call("skill__other__review"),
+            "other",
+            "review",
+            Some("active"),
+            AccessProfile::Restricted,
+            None,
+            None,
+            None,
+            ToolExecutionContext::default(),
+            None,
+        );
+
+        assert_eq!(status, ExecutionResultStatus::Rejected);
+        let parsed: Value = serde_json::from_str(&payload).expect("payload should be json");
+        assert_eq!(parsed["error_code"], "skill_tool_scope_mismatch");
+        assert_eq!(parsed["error"], SKILL_TOOL_SCOPE_PUBLIC_ERROR);
+        assert!(!payload.contains("custom skill tool"));
+    }
+
+    #[test]
+    fn custom_skill_tool_missing_binding_uses_public_error() {
+        let skill_runtime = SkillRuntime::new(SkillRegistry::new());
+        let dispatch_runtime = dispatch_runtime();
+
+        let (payload, status) = execute_skill_custom_tool(
+            &tool_call("skill__code-review__missing"),
+            "code-review",
+            "missing",
+            Some("code-review"),
+            AccessProfile::Restricted,
+            None,
+            Some(&skill_runtime),
+            Some(&dispatch_runtime),
+            ToolExecutionContext::default(),
+            None,
+        );
+
+        assert_eq!(status, ExecutionResultStatus::Failed);
+        let parsed: Value = serde_json::from_str(&payload).expect("payload should be json");
+        assert_eq!(parsed["error_code"], "skill_tool_binding_missing");
+        assert_eq!(parsed["error"], SKILL_TOOL_CONFIG_PUBLIC_ERROR);
+        assert!(!payload.contains("custom skill binding"));
+        assert!(!payload.contains("code-review / missing"));
+    }
 }
