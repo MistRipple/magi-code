@@ -1352,11 +1352,7 @@ fn spawn_regular_session_turn_execution(
                     EventEnvelope::domain(
                         event_id,
                         "session.turn.failed",
-                        json!({
-                            "session_id": session_id.to_string(),
-                            "route": route,
-                            "error": error,
-                        }),
+                        session_turn_failed_event_payload(&session_id, route),
                     )
                     .with_context(EventContext {
                         session_id: Some(session_id),
@@ -1367,6 +1363,18 @@ fn spawn_regular_session_turn_execution(
             }
         }
     });
+}
+
+fn session_turn_failed_event_payload(
+    session_id: &SessionId,
+    route: SessionTurnRouteDto,
+) -> serde_json::Value {
+    json!({
+        "session_id": session_id.to_string(),
+        "route": route,
+        "error": "session_turn_failed",
+        "error_code": "session_turn_failed",
+    })
 }
 
 fn publish_regular_session_turn_accepted_event(
@@ -2442,6 +2450,23 @@ mod tests {
             )
             .expect("workspace should register");
         workspace_id
+    }
+
+    #[test]
+    fn session_turn_failed_event_payload_hides_runtime_error_detail() {
+        let payload = session_turn_failed_event_payload(
+            &SessionId::new("session-failed-redaction"),
+            SessionTurnRouteDto::Chat,
+        );
+
+        assert_eq!(payload["session_id"], json!("session-failed-redaction"));
+        assert_eq!(payload["error"], json!("session_turn_failed"));
+        assert_eq!(payload["error_code"], json!("session_turn_failed"));
+        assert!(
+            !payload
+                .to_string()
+                .contains("/Users/xie/.mcp/server failed: ENOENT")
+        );
     }
 
     async fn post_json(
