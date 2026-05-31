@@ -547,47 +547,37 @@ impl DaemonRuntime {
             &event_bus,
         );
 
-        // 引导阶段：代码索引与 workspace 绑定，避免多个工作区共用同一份上下文摘要。
-        let active_workspace = workspace_store.active_workspace_id().and_then(|ws_id| {
-            workspace_store
-                .workspaces()
-                .into_iter()
-                .find(|workspace| workspace.workspace_id == ws_id)
-        });
-        let ingested_code_index = if let Some(workspace) = active_workspace.as_ref() {
+        // 引导阶段：代码索引与 workspace 绑定。进程内检索引擎不持久化，
+        // daemon 每次启动都必须为所有已注册 workspace 重建，而不是只恢复 active workspace。
+        let registered_workspaces = workspace_store.workspaces();
+        let mut ingested_code_index = false;
+        if registered_workspaces.is_empty() {
             if knowledge_store
-                .code_index_summary_for_workspace(&workspace.workspace_id)
+                .code_index_summary()
                 .is_none_or(|summary| summary.files.is_empty())
             {
-                let scan_root = PathBuf::from(workspace.root_path.as_str());
-                ingest_workspace_code_index_in_workspace(
-                    &knowledge_store,
-                    &workspace.workspace_id,
-                    &scan_root,
-                );
-                true
-            } else {
-                false
+                ingest_workspace_code_index(&knowledge_store, &config.bootstrap_workspace_root);
+                ingested_code_index = true;
             }
-        } else if knowledge_store
-            .code_index_summary()
-            .is_none_or(|summary| summary.files.is_empty())
-        {
-            ingest_workspace_code_index(&knowledge_store, &config.bootstrap_workspace_root);
-            true
         } else {
-            false
-        };
+            for workspace in &registered_workspaces {
+                let scan_root = PathBuf::from(workspace.root_path.as_str());
+                if knowledge_store
+                    .code_index_summary_for_workspace(&workspace.workspace_id)
+                    .is_none_or(|summary| summary.files.is_empty())
+                {
+                    ingest_workspace_code_index_in_workspace(
+                        &knowledge_store,
+                        &workspace.workspace_id,
+                        &scan_root,
+                    );
+                    ingested_code_index = true;
+                }
+                knowledge_store.build_workspace_index(&workspace.workspace_id, &scan_root);
+            }
+        }
         if ingested_code_index {
             let _ = state_repository.save_knowledge_state(&knowledge_store.export_state());
-        }
-
-        // 装配本地代码检索引擎：引擎是进程内内存态，每次 daemon 启动都需构建
-        // （引擎内部有 .magi/cache 快照，新鲜时增量恢复、否则全量重建）。
-        // 文件监听由 build_workspace_index 内部一并起，daemon 不再单独管理。
-        if let Some(workspace) = active_workspace.as_ref() {
-            let scan_root = PathBuf::from(workspace.root_path.as_str());
-            knowledge_store.build_workspace_index(&workspace.workspace_id, &scan_root);
         }
 
         let runtime_maintenance = RuntimeMaintenance::new(
@@ -1602,6 +1592,69 @@ mod tests {
                 .is_some_and(|t| !t.is_empty()),
             "codeIndex.techStack should not be empty"
         );
+    }
+
+    #[tokio::test]
+    async fn restore_rebuilds_code_index_for_all_registered_workspaces() {
+        let state_root = temp_state_root("multi-workspace-code-index");
+        let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root.clone());
+        let secondary_root = state_root.join("secondary-workspace");
+        fs::create_dir_all(secondary_root.join("src")).unwrap();
+        fs::write(
+            secondary_root.join("src/lib.rs"),
+            "pub fn secondary_workspace_probe() -> bool { true }\n",
+        )
+        .unwrap();
+        fs::write(
+            secondary_root.join("Cargo.toml"),
+            "[package]\nname = \"secondary-workspace\"\n",
+        )
+        .unwrap();
+
+        let secondary_workspace_id = {
+            let runtime = DaemonRuntime::restore(&config)
+                .expect("initial runtime restore should bootstrap state");
+            let (status, body) = post_json(
+                runtime.router("daemon-test".to_string()),
+                "/api/workspaces/register",
+                json!({ "path": secondary_root.to_string_lossy() }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            let workspace_id = body["workspaceId"]
+                .as_str()
+                .expect("registered workspace id")
+                .to_string();
+            assert!(
+                runtime
+                    .knowledge_store
+                    .workspace_index_ready(&WorkspaceId::new(&workspace_id)),
+                "newly registered workspace should build an in-process search index"
+            );
+            workspace_id
+        };
+
+        let restored = DaemonRuntime::restore(&config)
+            .expect("runtime restore should rebuild indexes for every registered workspace");
+        assert!(
+            restored
+                .knowledge_store
+                .workspace_index_ready(&WorkspaceId::new(&secondary_workspace_id)),
+            "non-active registered workspace search index should be rebuilt after daemon restart"
+        );
+
+        let bootstrap = get_json(
+            restored.router("daemon-test".to_string()),
+            &format!("/api/settings/bootstrap?scope=core&workspaceId={secondary_workspace_id}"),
+        )
+        .await;
+        let workspace_code_index = bootstrap["capabilityDependencies"]
+            .as_array()
+            .expect("capability dependencies should be array")
+            .iter()
+            .find(|dependency| dependency["name"] == "workspace_code_index")
+            .expect("workspace_code_index dependency should be exposed");
+        assert_eq!(workspace_code_index["status"], "ready");
     }
 
     async fn post_json(app: axum::Router, path: &str, body: Value) -> (StatusCode, Value) {
