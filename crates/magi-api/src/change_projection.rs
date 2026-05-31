@@ -74,8 +74,7 @@ pub struct PendingChangeDto {
     pub source_kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub old_path: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
+    pub has_error: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub symlink_target: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -336,7 +335,10 @@ fn convert_pending(scope: &SessionChangeScope, change: PendingChange) -> Pending
         mime: change.mime,
         source_kind,
         old_path: change.old_path,
-        error: change.error,
+        has_error: change
+            .error
+            .as_deref()
+            .is_some_and(|error| !error.trim().is_empty()),
         symlink_target: change.symlink_target,
         head_summary: change.head_summary,
         tail_summary: change.tail_summary,
@@ -684,6 +686,45 @@ mod tests {
         assert_eq!(changes[0].old_path.as_deref(), Some("before.txt"));
         assert_eq!(changes[0].r#type, "rename");
         assert_eq!(changes[0].execution_group_id, "mission-rename");
+    }
+
+    #[test]
+    fn pending_change_projection_redacts_snapshot_error_detail() {
+        let scope = SessionChangeScope {
+            session_id: SessionId::new("session-change-error"),
+            workspace_id: WorkspaceId::new("workspace-change-error"),
+            workspace_root: unique_temp_dir("magi-change-projection-error"),
+            execution_group_id: "execution-error".to_string(),
+            contributors: Vec::new(),
+        };
+        let dto = convert_pending(
+            &scope,
+            PendingChange {
+                path: "restricted.txt".to_string(),
+                change_kind: ChangeKind::Modified,
+                old_path: None,
+                source: SourceKind::Watcher,
+                tool_call_id: None,
+                worker_id: None,
+                execution_group_id: None,
+                content_kind: ContentKind::Text,
+                size: 0,
+                mime: None,
+                error: Some("read failed: permission denied".to_string()),
+                symlink_target: None,
+                original_content: None,
+                preview_content: None,
+                head_summary: None,
+                tail_summary: None,
+                unified_diff: None,
+                timestamp_ms: 1,
+            },
+        );
+
+        assert!(dto.has_error);
+        let value = serde_json::to_value(dto).expect("pending change dto should serialize");
+        assert_eq!(value["hasError"], serde_json::json!(true));
+        assert!(value.get("error").is_none());
     }
 
     #[test]

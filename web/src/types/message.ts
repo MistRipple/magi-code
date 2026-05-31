@@ -731,7 +731,7 @@ export interface Edit {
   size?: number;
   mime?: string;
   sourceKind?: EditSourceKind;
-  error?: string;
+  hasError?: boolean;
   symlinkTarget?: string;
   headSummary?: string;
   tailSummary?: string;

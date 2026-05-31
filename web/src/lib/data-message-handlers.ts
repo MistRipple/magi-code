@@ -205,7 +205,7 @@ function normalizeIncomingEdits(state: AppState): Edit[] {
         size: typeof change.size === 'number' ? change.size : undefined,
         mime: change.mime,
         sourceKind: change.sourceKind,
-        error: change.error,
+        hasError: change.hasError === true,
         symlinkTarget: change.symlinkTarget,
         headSummary: change.headSummary,
         tailSummary: change.tailSummary,

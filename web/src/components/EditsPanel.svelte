@@ -243,7 +243,7 @@
       {#if !isText}
         <span class="file-kind-tag" title={contentKindLabel(kind)}>{contentKindLabel(kind)}</span>
       {/if}
-      {#if edit.error}
+      {#if edit.hasError}
         <span class="file-error-tag" title={i18n.t('edits.row.errorTitle')}>{i18n.t('edits.row.error')}</span>
       {/if}
       {#if editActorLabel(edit)}
