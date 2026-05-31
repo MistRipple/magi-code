@@ -22,6 +22,7 @@ import {
   listAgentRegistryAgents,
   listAgentRegistryEngines,
   listAgentRoleTemplates,
+  loadAgentToolCatalogDiagnostics,
   loadAgentSkillLibrary,
   refreshAgentMcpTools,
   removeAgentInstalledSkill,
@@ -621,6 +622,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
   // Skills 完整结构（内置工具已迁移到 ToolManager，不再通过 Skills 配置）
   let skills = $state<SkillItem[]>([]);
   let builtinTools = $state<BuiltinToolItem[]>([]);
+  let builtinToolsLoading = $state(false);
   let capabilityDependencies = $state<CapabilityDependencyItem[]>([]);
 
   // 仓库管理
@@ -2352,23 +2354,32 @@ function createSettingsStore(props: { onClose?: () => void }) {
   }
 
   function applyBuiltinToolsPayload(toolsPayload: unknown): void {
+    const readToolField = (tool: any, camelKey: string, snakeKey: string): unknown =>
+      tool?.[camelKey] ?? tool?.[snakeKey];
     builtinTools = ensureArray<any>(toolsPayload)
       .map((tool) => {
         const name = typeof tool?.name === "string" ? tool.name.trim() : "";
         if (!name) {
           return null;
         }
+        const riskLevel = readToolField(tool, "riskLevel", "risk_level");
+        const approvalRequirement = readToolField(tool, "approvalRequirement", "approval_requirement");
+        const accessMode = readToolField(tool, "accessMode", "access_mode");
+        const runtimeStatus = readToolField(tool, "runtimeStatus", "runtime_status");
+        const runtimeWarnings = readToolField(tool, "runtimeWarnings", "runtime_warnings");
+        const schemaStatus = readToolField(tool, "schemaStatus", "schema_status");
+        const schemaWarnings = readToolField(tool, "schemaWarnings", "schema_warnings");
         return {
           name,
-          riskLevel: typeof tool?.riskLevel === "string" ? tool.riskLevel : "",
-          approvalRequirement: typeof tool?.approvalRequirement === "string" ? tool.approvalRequirement : "",
-          accessMode: typeof tool?.accessMode === "string" ? tool.accessMode : "read_only",
-          runtimeStatus: typeof tool?.runtimeStatus === "string" ? tool.runtimeStatus : "ready",
-          runtimeWarnings: ensureArray<string>(tool?.runtimeWarnings)
+          riskLevel: typeof riskLevel === "string" ? riskLevel : "",
+          approvalRequirement: typeof approvalRequirement === "string" ? approvalRequirement : "",
+          accessMode: typeof accessMode === "string" ? accessMode : "read_only",
+          runtimeStatus: typeof runtimeStatus === "string" ? runtimeStatus : "ready",
+          runtimeWarnings: ensureArray<string>(runtimeWarnings)
             .filter((warning): warning is string => typeof warning === "string" && warning.trim().length > 0)
             .map((warning) => warning.trim()),
-          schemaStatus: typeof tool?.schemaStatus === "string" ? tool.schemaStatus : "ok",
-          schemaWarnings: ensureArray<string>(tool?.schemaWarnings)
+          schemaStatus: typeof schemaStatus === "string" ? schemaStatus : "ok",
+          schemaWarnings: ensureArray<string>(schemaWarnings)
             .filter((warning): warning is string => typeof warning === "string" && warning.trim().length > 0)
             .map((warning) => warning.trim()),
           enabled: tool?.enabled !== false,
@@ -2423,6 +2434,24 @@ function createSettingsStore(props: { onClose?: () => void }) {
       });
     }
     capabilityDependencies = dependencies;
+  }
+
+  async function refreshBuiltinToolCatalog(): Promise<void> {
+    if (builtinToolsLoading) {
+      return;
+    }
+    builtinToolsLoading = true;
+    try {
+      const snapshot = await loadAgentToolCatalogDiagnostics();
+      applyBuiltinToolsPayload(snapshot.builtinTools);
+      applyCapabilityDependenciesPayload(snapshot.capabilityDependencies);
+      notifySettingsSuccess(i18n.t("settings.toast.toolCatalogRefreshed"));
+    } catch (e) {
+      console.error("[SettingsPanel] 刷新内置工具状态失败:", e);
+      notifySettingsError(i18n.t("settings.toast.action.refreshToolCatalog"), e);
+    } finally {
+      builtinToolsLoading = false;
+    }
   }
 
   function applySkillsConfig(config: any): void {
@@ -2778,6 +2807,9 @@ function createSettingsStore(props: { onClose?: () => void }) {
     get builtinTools() {
       return builtinTools;
     },
+    get builtinToolsLoading() {
+      return builtinToolsLoading;
+    },
     get capabilityDependencies() {
       return capabilityDependencies;
     },
@@ -2906,6 +2938,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
     toggleMCPServer,
     toggleMCPExpand,
     refreshMCPTools,
+    refreshBuiltinToolCatalog,
     getMCPHealthLabel,
     openRepoDialog,
     closeRepoDialog,

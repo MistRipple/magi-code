@@ -98,6 +98,11 @@ interface RawAgentSessionSummary {
 export type AgentRuntimeSettings = SettingsRuntimeSnapshot;
 export type AgentSettingsBootstrapSnapshot = SettingsBootstrapPayload;
 
+export interface AgentToolCatalogDiagnosticsSnapshot {
+  builtinTools: unknown[];
+  capabilityDependencies: SettingsCapabilityDependency[];
+}
+
 function normalizeSettingsSectionConfig(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     return {};
@@ -1238,6 +1243,39 @@ export async function getAgentSettingsBootstrap(
     const response = await getTransport().request(agentUrl('/api/settings/bootstrap', query));
     const payload = await parseAgentJson<Record<string, unknown>>(response, 'load settings bootstrap');
     return normalizeSettingsBootstrapPayload(payload);
+  } catch (error) {
+    if (error instanceof TypeError) {
+      throw new Error(i18n.t('bridge.agentUnreachable'));
+    }
+    throw error;
+  }
+}
+
+export async function loadAgentToolCatalogDiagnostics(): Promise<AgentToolCatalogDiagnosticsSnapshot> {
+  try {
+    const query = buildBoundQuery({
+      includeExternal: 'true',
+      includeMcpServers: 'true',
+      includeAgentRoles: 'true',
+    });
+    const response = await getTransport().request(agentUrl('/api/tools/catalog', query));
+    const payload = await parseAgentJson<Record<string, unknown>>(response, 'load tool catalog diagnostics');
+    const builtinTools = Array.isArray(payload.tools)
+      ? payload.tools.filter((tool) => {
+          return Boolean(
+            tool
+              && typeof tool === 'object'
+              && !Array.isArray(tool)
+              && (tool as Record<string, unknown>).public === true,
+          );
+        })
+      : [];
+    return {
+      builtinTools,
+      capabilityDependencies: normalizeCapabilityDependencies(
+        payload.runtime_dependencies ?? payload.runtimeDependencies,
+      ),
+    };
   } catch (error) {
     if (error instanceof TypeError) {
       throw new Error(i18n.t('bridge.agentUnreachable'));

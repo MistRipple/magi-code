@@ -12,6 +12,7 @@
     mcpServerTools,
     mcpRefreshingServers,
     builtinTools,
+    builtinToolsLoading,
     capabilityDependencies,
     skills,
     openMCPDialog,
@@ -20,6 +21,7 @@
     toggleMCPServer,
     deleteMCPServer,
     refreshMCPTools,
+    refreshBuiltinToolCatalog,
     openSkillLibraryDialog,
     openRepoDialog,
     deleteSkill
@@ -30,6 +32,7 @@
     mcpExpandedServer: string | null;
     mcpServerTools: Record<string, any[]>;
     mcpRefreshingServers: Set<string>;
+    builtinToolsLoading: boolean;
     builtinTools: Array<{
       name: string;
       riskLevel: string;
@@ -60,6 +63,7 @@
     toggleMCPServer: (sid: string, enabled: boolean) => void;
     deleteMCPServer: (sid: string) => void;
     refreshMCPTools: (sid: string) => void;
+    refreshBuiltinToolCatalog: () => void | Promise<void>;
     openSkillLibraryDialog: () => void;
     openRepoDialog: () => void;
     deleteSkill: (skill: any) => void;
@@ -262,6 +266,10 @@
     (builtinTools as Array<{ runtimeStatus: string }>).filter((t) => t.runtimeStatus === 'ready').length,
   );
 
+  function toggleBuiltinExpanded() {
+    builtinExpanded = !builtinExpanded;
+  }
+
   // MCP 工具描述 hover 浮层：默认右侧弹出；按钮 + 浮层共同构成 hover 区域，移出即消失
   const DESC_POPOVER_WIDTH = 320;
   const DESC_POPOVER_MAX_HEIGHT = 240;
@@ -311,41 +319,55 @@
       <div class="tools-stack">
         <!-- 内置工具 -->
         <div class="settings-section tools-section builtin-section">
-          <button
-            type="button"
-            class="builtin-summary"
-            onclick={() => { builtinExpanded = !builtinExpanded; }}
-            aria-expanded={builtinExpanded}
-          >
-            <div class="builtin-summary-main">
-              <div class="header-title-group" style="display: flex; align-items: baseline; gap: 10px;">
-                <div class="settings-section-title" style="margin-bottom: 0;">{i18n.t('settings.tools.builtinTools')}</div>
-                <span class="builtin-count-tag">{i18n.t('settings.tools.builtinCount', { ready: builtinReadyCount, total: builtinTools.length })}</span>
-              </div>
-              {#if capabilityDependencies.length > 0}
-                <div
-                  class="capability-dependency-strip"
-                  aria-label={i18n.t('settings.tools.capabilityDependencySummary')}
-                >
-                  {#each capabilityDependencies as dependency (dependency.name)}
-                    <span
-                      class={`capability-dependency-chip capability-dependency-chip--${getCapabilityDependencyClass(dependency.status)}`}
-                      title={getCapabilityDependencyTitle(dependency)}
-                    >
-                      <Icon name={getCapabilityDependencyIcon(dependency.name)} size={11} />
-                      <span>{getCapabilityDependencyLabel(dependency.name)}</span>
-                      <span class="capability-dependency-status">
-                        {getCapabilityDependencyStatusLabel(dependency.status)}
-                      </span>
-                    </span>
-                  {/each}
+          <div class="builtin-summary">
+            <button
+              type="button"
+              class="builtin-summary-toggle"
+              onclick={toggleBuiltinExpanded}
+              aria-expanded={builtinExpanded}
+            >
+              <div class="builtin-summary-main">
+                <div class="header-title-group" style="display: flex; align-items: baseline; gap: 10px;">
+                  <div class="settings-section-title" style="margin-bottom: 0;">{i18n.t('settings.tools.builtinTools')}</div>
+                  <span class="builtin-count-tag">{i18n.t('settings.tools.builtinCount', { ready: builtinReadyCount, total: builtinTools.length })}</span>
                 </div>
-              {/if}
+                {#if capabilityDependencies.length > 0}
+                  <div
+                    class="capability-dependency-strip"
+                    aria-label={i18n.t('settings.tools.capabilityDependencySummary')}
+                  >
+                    {#each capabilityDependencies as dependency (dependency.name)}
+                      <span
+                        class={`capability-dependency-chip capability-dependency-chip--${getCapabilityDependencyClass(dependency.status)}`}
+                        title={getCapabilityDependencyTitle(dependency)}
+                      >
+                        <Icon name={getCapabilityDependencyIcon(dependency.name)} size={11} />
+                        <span>{getCapabilityDependencyLabel(dependency.name)}</span>
+                        <span class="capability-dependency-status">
+                          {getCapabilityDependencyStatusLabel(dependency.status)}
+                        </span>
+                      </span>
+                    {/each}
+                  </div>
+                {/if}
+              </div>
+              <span class="builtin-expand-icon" class:expanded={builtinExpanded}>
+                <Icon name="chevronDown" size={14} />
+              </span>
+            </button>
+            <div class="builtin-summary-actions">
+              <button
+                type="button"
+                class="btn-icon btn-icon--sm"
+                class:refreshing={builtinToolsLoading}
+                title={i18n.t('settings.tools.refreshBuiltinTools')}
+                onclick={() => refreshBuiltinToolCatalog()}
+                disabled={builtinToolsLoading}
+              >
+                <Icon name="refresh" size={12} />
+              </button>
             </div>
-            <span class="builtin-expand-icon" class:expanded={builtinExpanded}>
-              <Icon name="chevronDown" size={14} />
-            </span>
-          </button>
+          </div>
           {#if builtinExpanded}
             <div class="tools-fixed-panel tools-fixed-panel--builtin" style="margin-top: 12px;">
               {#if builtinTools.length === 0}
@@ -665,17 +687,37 @@
     align-items: center;
     justify-content: space-between;
     width: 100%;
-    padding: 8px 12px;
+    padding: 0;
     background: rgba(var(--foreground-rgb), 0.025);
     border: 1px solid var(--border);
     border-radius: 10px;
-    cursor: pointer;
     transition: background 0.15s ease, border-color 0.15s ease;
   }
 
   .builtin-summary:hover {
     background: rgba(var(--foreground-rgb), 0.05);
     border-color: rgba(var(--primary-rgb, 0, 122, 255), 0.35);
+  }
+
+  .builtin-summary-toggle {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex: 1 1 auto;
+    min-width: 0;
+    padding: 8px 0 8px 12px;
+    background: transparent;
+    border: 0;
+    color: inherit;
+    cursor: pointer;
+    font: inherit;
+    text-align: left;
+  }
+
+  .builtin-summary-toggle:focus-visible {
+    outline: 2px solid color-mix(in srgb, var(--primary) 58%, transparent);
+    outline-offset: -3px;
+    border-radius: 10px;
   }
 
   .builtin-summary-main {
@@ -737,6 +779,14 @@
 
   .capability-dependency-status {
     opacity: 0.78;
+  }
+
+  .builtin-summary-actions {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-shrink: 0;
+    padding: 0 8px 0 4px;
   }
 
   .builtin-expand-icon {
