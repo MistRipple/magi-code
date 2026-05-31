@@ -1356,15 +1356,20 @@ impl ApiState {
                             pool.insert(server_id, Arc::new(client));
                         }
                         Err(err) => {
+                            tracing::warn!(
+                                server_id = %server_id,
+                                error = ?err,
+                                "MCP server health check failed"
+                            );
                             entry["connected"] = serde_json::json!(false);
                             entry["health"] = serde_json::json!("disconnected");
-                            entry["error"] = serde_json::json!(err.to_string());
+                            entry["error"] = serde_json::json!("mcp_connection_failed");
                         }
                     }
                 } else {
                     entry["connected"] = serde_json::json!(false);
                     entry["health"] = serde_json::json!("disconnected");
-                    entry["error"] = serde_json::json!("配置无效：缺少 command 或 transport");
+                    entry["error"] = serde_json::json!("mcp_invalid_config");
                 }
             } else {
                 entry["connected"] = serde_json::json!(false);

@@ -2333,7 +2333,10 @@ function createSettingsStore(props: { onClose?: () => void }) {
             : s.connected === true
               ? "connected"
               : "disconnected",
-        error: typeof s.error === "string" ? s.error : undefined,
+        error:
+          typeof s.error === "string" && s.error.trim()
+            ? "connection_issue"
+            : undefined,
         toolCount: Number.isFinite(s.toolCount) ? Number(s.toolCount) : 0,
         reconnectAttempts: Number.isFinite(s.reconnectAttempts)
           ? Number(s.reconnectAttempts)
