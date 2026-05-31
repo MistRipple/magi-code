@@ -209,17 +209,10 @@
     const date = new Date(value);
     if (!Number.isFinite(date.getTime())) return '';
     const currentYear = new Date().getFullYear();
-    if (i18n.locale === 'zh-CN') {
-      const month = date.getMonth() + 1;
-      const day = date.getDate();
-      return date.getFullYear() === currentYear
-        ? `${month}月${day}日`
-        : `${date.getFullYear()}年${month}月${day}日`;
-    }
     const options: Intl.DateTimeFormatOptions = date.getFullYear() === currentYear
-      ? { month: '2-digit', day: '2-digit' }
-      : { year: 'numeric', month: '2-digit', day: '2-digit' };
-    return date.toLocaleDateString('en-US', options);
+      ? { month: 'numeric', day: 'numeric' }
+      : { year: 'numeric', month: 'numeric', day: 'numeric' };
+    return new Intl.DateTimeFormat(i18n.locale, options).format(date);
   }
 
   function isGeneratedSourceRef(value: string | undefined): boolean {
