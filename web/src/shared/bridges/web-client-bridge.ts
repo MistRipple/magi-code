@@ -615,10 +615,12 @@ function refreshBootstrapAfterTerminalTurn(reason: string): void {
 
 function emitRecoveringState(reason: string, error?: unknown): void {
   bridgeRecovering = true;
+  if (error !== undefined) {
+    console.warn('[web-client-bridge] 连接恢复已触发:', reason, error);
+  }
   dispatchAgentConnectionEvent({
     status: 'recovering',
     reason,
-    error: normalizeErrorMessage(error),
     baseUrl: resolveAgentBaseUrl(),
   });
 }
