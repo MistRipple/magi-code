@@ -2,6 +2,7 @@
   import type { ContentBlock, Message, TimelineRenderItem } from '../../types/message';
   import type { TaskDto } from '../../shared/rust-backend-types';
   import { buildTimelineRenderItems } from '../../lib/timeline-render-items';
+  import { getTaskDisplayGoal, getTaskDisplayText, getTaskDisplayTitle } from '../../lib/task-labels';
   import { messagesState } from '../../stores/messages.svelte';
   import { getTaskProjectionState } from '../../stores/task-projection-store.svelte';
   import { i18n } from '../../stores/i18n.svelte';
@@ -75,8 +76,8 @@
         const args = block.toolCall.arguments || {};
         const result = parseJsonRecord(block.toolCall.result);
         return {
-          title: normalizeString(result?.title) || normalizeString(args.display_name) || '代理任务',
-          goal: normalizeString(args.goal),
+          title: getTaskDisplayText(normalizeString(result?.title) || normalizeString(args.display_name)) || '代理任务',
+          goal: getTaskDisplayText(normalizeString(args.goal)),
         };
       }
     }
@@ -87,8 +88,8 @@
     const task = projectionTask;
     if (task) {
       return {
-        title: task.title || spawnAssignment?.title || '代理任务',
-        goal: task.goal || spawnAssignment?.goal || '',
+        title: getTaskDisplayTitle(task) || spawnAssignment?.title || '代理任务',
+        goal: getTaskDisplayGoal(task) || spawnAssignment?.goal || '',
       };
     }
     return spawnAssignment;

@@ -9,7 +9,6 @@
 
   let { block }: Props = $props();
   const plan = $derived(block.plan);
-  let isExpanded = $state(false);
 </script>
 
 {#if plan}
@@ -19,9 +18,6 @@
         <Icon name="note" size={14} />
         <span>{i18n.t('planCard.title')}</span>
       </span>
-      <button class="toggle-btn" onclick={() => (isExpanded = !isExpanded)}>
-        <Icon name={isExpanded ? 'chevron-up' : 'chevron-down'} size={14} />
-      </button>
     </div>
 
     <div class="plan-body">
@@ -74,12 +70,6 @@
         </div>
       {/if}
 
-      {#if plan.rawJson && isExpanded}
-        <div class="plan-raw">
-          <div class="section-title">{i18n.t('planCard.rawData')}</div>
-          <pre><code>{plan.rawJson}</code></pre>
-        </div>
-      {/if}
     </div>
   </div>
 {/if}
@@ -100,27 +90,6 @@
     display: flex;
     align-items: center;
     gap: var(--space-2);
-  }
-
-  .toggle-btn {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    /* 22×22 icon-only 按钮：14px icon + 4px×2 padding；
-       配合 header min-height: 36px（来自全局 SSoT），不会撑大 header 高度 */
-    width: 22px;
-    height: 22px;
-    padding: 0;
-    border-radius: 4px;
-    border: 1px solid var(--border);
-    background: var(--surface-2);
-    color: var(--foreground-muted);
-    cursor: pointer;
-  }
-
-  .toggle-btn:hover {
-    color: var(--foreground);
-    border-color: var(--primary);
   }
 
   /* plan-body：承载所有 header 以下内容的 padding */
@@ -185,11 +154,4 @@
     background: color-mix(in oklab, var(--error) 20%, transparent);
   }
 
-  .plan-raw pre {
-    background: var(--surface-2);
-    border-radius: var(--radius-md);
-    padding: var(--space-3);
-    font-size: var(--text-xs);
-    overflow-x: auto;
-  }
 </style>
