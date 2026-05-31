@@ -49,7 +49,7 @@ import type {
   AgentBinding,
 } from "../shared/types/registry-types";
 import type { LLMConfig } from "../shared/types/agent-types";
-import type { ModelStatus, ModelStatusMap } from "../types/message";
+import type { ModelStatus, ModelStatusMap, ModelStatusType } from "../types/message";
 import { setEnabledAgents, getState } from "../stores/messages.svelte";
 import type { EnabledAgent } from "../stores/messages.svelte";
 import {
@@ -731,6 +731,28 @@ function createSettingsStore(props: { onClose?: () => void }) {
     return statusTexts[status]?.() || status;
   }
 
+  function normalizeModelStatusType(status: unknown): ModelStatusType {
+    if (typeof status === "string" && statusTexts[status]) {
+      return status as ModelStatusType;
+    }
+    return "error";
+  }
+
+  function isModelErrorStatus(status: ModelStatusType): boolean {
+    return (
+      status === "error" ||
+      status === "unavailable" ||
+      status === "invalid_model" ||
+      status === "auth_failed" ||
+      status === "network_error" ||
+      status === "timeout"
+    );
+  }
+
+  function userSafeModelStatusError(status: ModelStatusType): string | undefined {
+    return isModelErrorStatus(status) ? getStatusText(status) : undefined;
+  }
+
   function toSafeTokenCount(value: unknown): number {
     if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
       return 0;
@@ -771,21 +793,21 @@ function createSettingsStore(props: { onClose?: () => void }) {
       || normalized.includes("unauthorized")
       || normalized.includes("forbidden")
     ) {
-      return { status: "auth_failed", error: message };
+      return { status: "auth_failed", error: i18n.t("settings.status.authFailed") };
     }
     if (
       normalized.includes("timeout")
       || normalized.includes("timed out")
       || normalized.includes("超时")
     ) {
-      return { status: "timeout", error: message };
+      return { status: "timeout", error: i18n.t("settings.status.timeout") };
     }
     if (
       normalized.includes("model")
       || normalized.includes("模型")
       || normalized.includes("not found")
     ) {
-      return { status: "invalid_model", error: message };
+      return { status: "invalid_model", error: i18n.t("settings.status.invalidModel") };
     }
     if (
       normalized.includes("econnrefused")
@@ -795,16 +817,45 @@ function createSettingsStore(props: { onClose?: () => void }) {
       || normalized.includes("连接失败")
       || normalized.includes("网络")
     ) {
-      return { status: "network_error", error: message };
+      return { status: "network_error", error: i18n.t("settings.status.networkError") };
     }
     if (
       normalized.includes("unavailable")
       || normalized.includes("不可用")
       || normalized.includes("5")
     ) {
-      return { status: "unavailable", error: message };
+      return { status: "unavailable", error: i18n.t("settings.status.unavailable") };
     }
-    return { status: "error", error: message };
+    return { status: "error", error: i18n.t("settings.status.error") };
+  }
+
+  function sanitizeIncomingModelStatus(
+    incoming: any,
+    fallbackModel?: string,
+  ): ModelStatus | null {
+    if (!incoming || typeof incoming !== "object" || incoming.status === "checking") {
+      return null;
+    }
+    const status = normalizeModelStatusType(incoming.status);
+    const model =
+      typeof incoming.model === "string" && incoming.model.trim()
+        ? incoming.model.trim()
+        : fallbackModel;
+    const next: ModelStatus = {
+      status,
+      ...(model ? { model } : {}),
+    };
+    if (typeof incoming.version === "string" && incoming.version.trim()) {
+      next.version = incoming.version.trim();
+    }
+    if (typeof incoming.tokens === "number" && Number.isFinite(incoming.tokens)) {
+      next.tokens = incoming.tokens;
+    }
+    const safeError = userSafeModelStatusError(status);
+    if (safeError) {
+      next.error = safeError;
+    }
+    return next;
   }
 
   function buildConfiguredModelStatuses(
@@ -812,18 +863,18 @@ function createSettingsStore(props: { onClose?: () => void }) {
   ): ModelStatusMap {
     const next: Record<string, any> = {};
 
-    const resolveIncoming = (key: string) =>
-      incoming[key] && incoming[key].status !== "checking" ? incoming[key] : null;
+    const resolveIncoming = (key: string, fallbackModel?: string) =>
+      sanitizeIncomingModelStatus(incoming[key], fallbackModel);
 
     const orchestratorModel = orchConfig.model?.trim() || undefined;
-    const incomingOrchestrator = resolveIncoming("orchestrator");
+    const incomingOrchestrator = resolveIncoming("orchestrator", orchestratorModel);
     next.orchestrator = incomingOrchestrator || {
       status: hasUsableModelConfig(orchConfig) ? "configured" : "not_configured",
       model: orchestratorModel,
     };
 
     const auxiliaryModel = compConfig.model?.trim() || undefined;
-    const incomingAuxiliary = resolveIncoming("auxiliary");
+    const incomingAuxiliary = resolveIncoming("auxiliary", auxiliaryModel);
     next.auxiliary = incomingAuxiliary || {
       status: hasUsableModelConfig(compConfig) ? "configured" : "not_configured",
       model: auxiliaryModel,
@@ -831,7 +882,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
 
     for (const workerId of deriveWorkerModelTabs()) {
       const config = workerConfigs[workerId];
-      const incomingWorker = resolveIncoming(workerId);
+      const incomingWorker = resolveIncoming(workerId, config?.model?.trim() || undefined);
       if (incomingWorker) {
         next[workerId] = incomingWorker;
         continue;
