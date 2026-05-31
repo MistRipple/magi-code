@@ -2119,11 +2119,16 @@ function createSettingsStore(props: { onClose?: () => void }) {
           showSkillLibraryDialogState = false;
           notifySettingsSuccess(i18n.t("settings.toast.localSkillInstalled"));
         } else {
-          localSkillInstallError =
-            typeof (result as any)?.error === "string" &&
-            (result as any).error.trim()
+          const backendError =
+            typeof (result as any)?.error === "string"
               ? (result as any).error.trim()
-              : i18n.t("settings.skillLibrary.localImportFailed");
+              : "";
+          if (backendError) {
+            console.warn("[SettingsPanel] 本地 Skill 安装返回失败:", backendError);
+          }
+          localSkillInstallError = i18n.t(
+            "settings.skillLibrary.localImportFailed",
+          );
         }
       } catch (e) {
         console.error("[SettingsPanel] 本地安装 Skill 失败:", e);
