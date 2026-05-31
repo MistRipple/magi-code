@@ -653,9 +653,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
   let showSkillLibraryDialogState = $state(false);
   let skillLibraryLoading = $state(false); // Skill 库加载状态
   let localSkillInstalling = $state(false);
-  let skillLibraryFailedRepositories = $state<
-    Array<{ repositoryId: string; url?: string }>
-  >([]);
+  let skillLibraryFailedRepositoryCount = $state(0);
   let localSkillInstallError = $state("");
   let showLocalSkillFolderPicker = $state(false);
 
@@ -1984,7 +1982,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
     showSkillLibraryDialogState = true;
     skillSearchQuery = "";
     skillLibraryLoading = true;
-    skillLibraryFailedRepositories = [];
+    skillLibraryFailedRepositoryCount = 0;
     localSkillInstallError = "";
     try {
       const payload = await loadAgentSkillLibrary();
@@ -2005,12 +2003,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
         installed: s.installed || false,
         icon: s.icon,
       }));
-      skillLibraryFailedRepositories = failedRepos
-        .map((repo: any) => ({
-          repositoryId: String(repo.repositoryId || ""),
-          url: repo.url ? String(repo.url) : undefined,
-        }))
-        .filter((repo: any) => repo.repositoryId);
+      skillLibraryFailedRepositoryCount = failedRepos.length;
     } catch (e) {
       console.error("[SettingsPanel] 加载 Skill 库失败:", e);
       notifySettingsError(i18n.t("settings.toast.action.loadSkillLibrary"), e);
@@ -2023,7 +2016,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
     skillSearchQuery = "";
     skillLibraryLoading = false;
     localSkillInstalling = false;
-    skillLibraryFailedRepositories = [];
+    skillLibraryFailedRepositoryCount = 0;
     localSkillInstallError = "";
   }
 
@@ -2947,8 +2940,8 @@ function createSettingsStore(props: { onClose?: () => void }) {
     get localSkillInstalling() {
       return localSkillInstalling;
     },
-    get skillLibraryFailedRepositories() {
-      return skillLibraryFailedRepositories;
+    get skillLibraryFailedRepositoryCount() {
+      return skillLibraryFailedRepositoryCount;
     },
     get localSkillInstallError() {
       return localSkillInstallError;

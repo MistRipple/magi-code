@@ -338,17 +338,10 @@ import { getAgentColor } from '../lib/agent-colors';
           <div class="skill-library-warning-title">{store.localSkillInstallError}</div>
         </div>
       {/if}
-      {#if store.skillLibraryFailedRepositories.length > 0}
+      {#if store.skillLibraryFailedRepositoryCount > 0}
         <div class="skill-library-warning">
           <div class="skill-library-warning-title">
-            {i18n.t('settings.skillLibrary.failedRepos', { count: store.skillLibraryFailedRepositories.length })}
-          </div>
-          <div class="skill-library-warning-list">
-            {#each store.skillLibraryFailedRepositories as repo}
-              <div class="skill-library-warning-item">
-                <strong>{repo.repositoryId}</strong>
-              </div>
-            {/each}
+            {i18n.t('settings.skillLibrary.failedRepos', { count: store.skillLibraryFailedRepositoryCount })}
           </div>
         </div>
       {/if}
@@ -625,17 +618,7 @@ import { getAgentColor } from '../lib/agent-colors';
     font-size: var(--text-sm);
     font-weight: var(--font-semibold);
     color: var(--warning);
-    margin-bottom: var(--space-2);
-  }
-  .skill-library-warning-list {
-    display: flex;
-    flex-direction: column;
-    gap: var(--space-1);
-  }
-  .skill-library-warning-item {
-    font-size: var(--text-xs);
-    color: var(--foreground-muted);
-    word-break: break-all;
+    margin-bottom: 0;
   }
 
   .skill-repo-group { margin-bottom: var(--space-5); }
