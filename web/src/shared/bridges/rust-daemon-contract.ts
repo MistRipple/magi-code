@@ -1032,12 +1032,12 @@ function buildEventSummary(event: RustEventEnvelope): string {
   if (status) {
     parts.push(status);
   }
-  const error = normalizeString(payload.error)
+  const hasIssueDetail = Boolean(normalizeString(payload.error)
     || normalizeString(payload.error_message)
     || normalizeString(payload.failure_reason)
-    || normalizeString(payload.diagnostic_summary);
-  if (error) {
-    parts.push(error);
+    || normalizeString(payload.diagnostic_summary));
+  if (hasIssueDetail && !status) {
+    parts.push('需要关注');
   }
   return parts.length > 0 ? `${eventLabel}：${parts.join(' · ')}` : eventLabel;
 }
