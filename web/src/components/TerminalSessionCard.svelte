@@ -174,12 +174,73 @@
     return value.trim().replace(/\s+/g, ' ');
   }
 
+  function terminalStatusLabel(value: string, classValue: string): string {
+    const normalized = value.trim().toLowerCase();
+    if (['pending', 'queued', 'starting'].includes(normalized)) {
+      return i18n.t('terminalSession.status.pending');
+    }
+    if (['running', 'in_progress', 'active'].includes(normalized) || normalized.includes('running')) {
+      return i18n.t('terminalSession.status.running');
+    }
+    if (
+      ['succeeded', 'success', 'completed', 'complete', 'done'].includes(normalized)
+      || normalized.includes('success')
+    ) {
+      return i18n.t('terminalSession.status.success');
+    }
+    if (
+      ['failed', 'error', 'timeout', 'cancelled', 'canceled', 'aborted', 'rejected'].includes(normalized)
+      || normalized.includes('fail')
+      || normalized.includes('error')
+      || normalized.includes('timeout')
+      || normalized.includes('cancel')
+      || normalized.includes('abort')
+      || normalized.includes('reject')
+    ) {
+      return i18n.t('terminalSession.status.error');
+    }
+    if (classValue === 'success') return i18n.t('terminalSession.status.success');
+    if (classValue === 'error') return i18n.t('terminalSession.status.error');
+    if (classValue === 'pending') return i18n.t('terminalSession.status.pending');
+    return i18n.t('terminalSession.status.running');
+  }
+
+  function terminalModeLabel(value: string): string {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === 'task') return i18n.t('terminalSession.mode.task');
+    if (normalized === 'service') return i18n.t('terminalSession.mode.service');
+    return i18n.t('terminalSession.mode.default');
+  }
+
+  function terminalPhaseLabel(value: string): string {
+    const normalized = value.trim().toLowerCase();
+    if (!normalized) return '';
+    if (normalized.includes('start') || normalized.includes('init')) {
+      return i18n.t('terminalSession.phase.starting');
+    }
+    if (normalized.includes('wait') || normalized.includes('approval') || normalized.includes('pending')) {
+      return i18n.t('terminalSession.phase.waiting');
+    }
+    if (normalized.includes('finish') || normalized.includes('complete') || normalized.includes('success')) {
+      return i18n.t('terminalSession.phase.completed');
+    }
+    if (
+      normalized.includes('fail')
+      || normalized.includes('error')
+      || normalized.includes('timeout')
+      || normalized.includes('cancel')
+    ) {
+      return i18n.t('terminalSession.phase.interrupted');
+    }
+    return i18n.t('terminalSession.phase.running');
+  }
+
   const outputCursor = $derived(terminal?.outputCursor);
   const returnCode = $derived(terminal?.returnCode);
   const locked = $derived(Boolean(terminal?.locked));
   const startupMessage = $derived(terminal?.startupMessage || '');
   const errorText = $derived(terminal?.error || structuredErrorText(parsedErrorResult) || toolCall?.error || '');
-  const showErrorText = $derived.by(() => {
+  const showErrorHint = $derived.by(() => {
     const normalizedError = normalizeDisplayText(errorText);
     if (!normalizedError) {
       return false;
@@ -215,6 +276,9 @@
     if (normalizedStatus.includes('pending') || normalizedStatus.includes('starting')) return 'pending';
     return 'running';
   });
+  const displayStatusLabel = $derived(terminalStatusLabel(displayStatus, statusClass));
+  const displayModeLabel = $derived(displayMode ? terminalModeLabel(displayMode) : '');
+  const displayPhaseLabel = $derived(displayPhase ? terminalPhaseLabel(displayPhase) : '');
 
   const showStatusPulse = $derived(statusClass === 'running' || statusClass === 'pending');
   const isActiveStatus = $derived(statusClass === 'running' || statusClass === 'pending');
@@ -243,7 +307,7 @@
     || displayCwd
     || showOutput
     || startupMessage
-    || showErrorText
+    || showErrorHint
     || typeof outputCursor === 'number'
     || typeof returnCode === 'number'
     || typeof accepted === 'boolean'
@@ -324,12 +388,12 @@
       <div class="tool-content terminal-content">
         <div class="terminal-meta-grid">
           <div class="terminal-meta-item">{i18n.t('terminalSession.title', { id: terminalId ?? '-' })}</div>
-          <div class="terminal-meta-item">{i18n.t('terminalSession.status')}: {displayStatus}</div>
-          {#if displayMode}
-            <div class="terminal-meta-item">{i18n.t('terminalSession.mode')}: {displayMode}</div>
+          <div class="terminal-meta-item">{i18n.t('terminalSession.status')}: {displayStatusLabel}</div>
+          {#if displayModeLabel}
+            <div class="terminal-meta-item">{i18n.t('terminalSession.mode')}: {displayModeLabel}</div>
           {/if}
-          {#if displayPhase}
-            <div class="terminal-meta-item">{i18n.t('terminalSession.phase')}: {displayPhase}</div>
+          {#if displayPhaseLabel}
+            <div class="terminal-meta-item">{i18n.t('terminalSession.phase')}: {displayPhaseLabel}</div>
           {/if}
         </div>
 
@@ -355,8 +419,8 @@
           <div class="terminal-hint">{i18n.t('terminalSession.startup')}: {startupMessage}</div>
         {/if}
 
-        {#if showErrorText}
-          <div class="terminal-error">{i18n.t('terminalSession.error')}: {errorText}</div>
+        {#if showErrorHint}
+          <div class="terminal-error">{i18n.t('terminalSession.error')}: {i18n.t('terminalSession.errorHint')}</div>
         {/if}
 
         <div class="terminal-footer">
