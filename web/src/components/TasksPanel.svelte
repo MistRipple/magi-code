@@ -305,12 +305,12 @@
     const executorName = getTaskExecutorDisplayName(task);
     if (executorName) return executorName;
     switch (task.kind) {
-      case 'local_workflow': return '流程';
-      case 'remote_agent': return '远程';
+      case 'local_workflow': return i18n.t('tasks.performer.localWorkflow');
+      case 'remote_agent': return i18n.t('tasks.performer.remoteAgent');
       case 'monitor_mcp': return 'MCP';
-      case 'in_process_teammate': return '队友';
-      case 'dream': return '后台';
-      default: return '代理';
+      case 'in_process_teammate': return i18n.t('tasks.performer.teammate');
+      case 'dream': return i18n.t('tasks.performer.background');
+      default: return i18n.t('tasks.performer.agent');
     }
   }
 
@@ -843,10 +843,10 @@
                 class="task-action-btn"
                 disabled={taskActionLoading !== null}
                 onclick={stopCurrentTaskProjection}
-                title="停止当前任务，保留进度"
+                title={i18n.t('tasks.action.stopTitle')}
               >
                 <Icon name={taskActionLoading === 'stop' ? 'loader' : 'stop'} size={12} class={taskActionLoading === 'stop' ? 'spinning' : ''} />
-                <span>停止</span>
+                <span>{i18n.t('tasks.action.stop')}</span>
               </button>
             {:else if canResumeTaskProjection}
               <button
@@ -854,10 +854,10 @@
                 class="task-action-btn"
                 disabled={taskActionLoading !== null}
                 onclick={resumeCurrentTaskProjection}
-                title="继续任务"
+                title={i18n.t('tasks.action.resumeTitle')}
               >
                 <Icon name={taskActionLoading === 'resume' ? 'loader' : 'play'} size={12} class={taskActionLoading === 'resume' ? 'spinning' : ''} />
-                <span>继续</span>
+                <span>{i18n.t('tasks.action.resume')}</span>
               </button>
             {/if}
             {#if canRestartTaskProjection}
@@ -866,10 +866,10 @@
                 class="task-action-btn"
                 disabled={taskActionLoading !== null}
                 onclick={restartCurrentTaskProjection}
-                title="基于当前目标创建新的执行链"
+                title={i18n.t('tasks.action.restartTitle')}
               >
                 <Icon name={taskActionLoading === 'restart' ? 'loader' : 'refresh'} size={12} class={taskActionLoading === 'restart' ? 'spinning' : ''} />
-                <span>重新执行</span>
+                <span>{i18n.t('tasks.action.restart')}</span>
               </button>
             {/if}
             {#if canArchiveTaskProjection}
@@ -878,10 +878,10 @@
                 class="task-action-btn task-action-btn--quiet"
                 disabled={taskActionLoading !== null}
                 onclick={archiveCurrentTaskProjection}
-                title="从当前面板移除，保留任务历史"
+                title={i18n.t('tasks.action.archiveTitle')}
               >
                 <Icon name={taskActionLoading === 'archive' ? 'loader' : 'eye-slash'} size={12} class={taskActionLoading === 'archive' ? 'spinning' : ''} />
-                <span>移除</span>
+                <span>{i18n.t('tasks.action.archive')}</span>
               </button>
             {/if}
           </div>
@@ -1202,17 +1202,20 @@
   {/if}
 
   {#if hasVisibleTaskHistory}
-    <section class="task-history-card" aria-label="最近任务">
+    <section class="task-history-card" aria-label={i18n.t('tasks.history.title')}>
       <div class="task-history-header">
         <span class="task-history-title">
           <Icon name="clock" size={12} />
-          <span>最近任务</span>
+          <span>{i18n.t('tasks.history.title')}</span>
         </span>
         <span class="task-history-count">
           {#if hiddenTaskHistoryCount > 0}
-            最近 {displayedTaskHistoryItems.length} / {visibleTaskHistoryItems.length}
+            {i18n.t('tasks.history.previewCount', {
+              displayed: displayedTaskHistoryItems.length,
+              total: visibleTaskHistoryItems.length,
+            })}
           {:else}
-            {visibleTaskHistoryItems.length} 个任务
+            {i18n.t('tasks.history.totalCount', { count: visibleTaskHistoryItems.length })}
           {/if}
         </span>
       </div>
@@ -1253,14 +1256,14 @@
                   class="task-action-btn"
                   disabled={restartingHistoryRootTaskId !== null}
                   onclick={() => restartHistoryTask(task.task_id)}
-                  title="基于这个任务目标重新执行"
+                  title={i18n.t('tasks.history.restartTitle')}
                 >
                   <Icon
                     name={restartingHistoryRootTaskId === task.task_id ? 'loader' : 'refresh'}
                     size={12}
                     class={restartingHistoryRootTaskId === task.task_id ? 'spinning' : ''}
                   />
-                  <span>重新执行</span>
+                  <span>{i18n.t('tasks.action.restart')}</span>
                 </button>
               {/if}
             </span>
@@ -1278,7 +1281,10 @@
           aria-expanded={taskHistoryExpanded}
         >
           <Icon name={taskHistoryExpanded ? 'chevron-up' : 'chevron-down'} size={12} />
-          <span>{taskHistoryExpanded ? '收起历史任务' : `展开 ${hiddenTaskHistoryCount} 个历史任务`}</span>
+          <span>{taskHistoryExpanded
+            ? i18n.t('tasks.history.collapse')
+            : i18n.t('tasks.history.expand', { count: hiddenTaskHistoryCount })}
+          </span>
         </button>
       {/if}
     </section>
@@ -1298,7 +1304,7 @@
         <Icon name="loader" size={18} class="spinning" />
       </div>
       <div class="task-empty-copy">
-        <div class="task-empty-title">正在加载任务</div>
+        <div class="task-empty-title">{i18n.t('tasks.loading.title')}</div>
       </div>
     </div>
   {:else if !hasTaskProjection && !hasVisibleTaskHistory}
