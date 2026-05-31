@@ -197,8 +197,9 @@
     if (runtimeState.startedAt) {
       entries.push({ label: i18n.t('runtimeState.summary.startedAt'), value: formatDateTime(runtimeState.startedAt) });
     }
-    if (runtimeState.statusReason) {
-      entries.push({ label: i18n.t('runtimeState.summary.reason'), value: runtimeState.statusReason });
+    const statusReason = sanitizeRuntimeDisplayText(runtimeState.statusReason);
+    if (statusReason) {
+      entries.push({ label: i18n.t('runtimeState.summary.reason'), value: statusReason });
     }
     if (runtimeState.chain?.chainId) {
       entries.push({
