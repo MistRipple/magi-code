@@ -2,12 +2,15 @@ use std::{sync::Arc, thread};
 
 use crate::llm_types::{
     LlmContentBlock, LlmMessage, LlmMessageContent, LlmMessageParams, LlmResponse, LlmUsage,
-    ToolCall, ToolResult, parse_tool_arguments,
+    ToolCall, ToolResult, parse_tool_arguments, parse_tool_result_model_content,
 };
 use crate::tool_concurrency::{
     ToolBatchKind, ToolConcurrencyInput, partition_tool_calls_with_inputs,
 };
-use crate::types::{BridgeClientError, ModelBridgeClient, ModelInvocationRequest};
+use crate::types::{
+    BridgeClientError, ChatMessage, ChatToolCall, ChatToolFunction, ModelBridgeClient,
+    ModelInvocationRequest,
+};
 
 #[derive(Clone, Debug)]
 pub struct AdapterConfig {
@@ -107,6 +110,103 @@ pub(crate) fn execute_tool_calls(
         .collect()
 }
 
+pub(crate) fn chat_messages_from_llm_message(message: &LlmMessage) -> Vec<ChatMessage> {
+    match &message.content {
+        LlmMessageContent::Text(text) => vec![ChatMessage {
+            role: message.role.clone(),
+            content: Some(text.clone()),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        }],
+        LlmMessageContent::Blocks(blocks) => {
+            chat_messages_from_content_blocks(&message.role, blocks)
+        }
+    }
+}
+
+fn chat_messages_from_content_blocks(role: &str, blocks: &[LlmContentBlock]) -> Vec<ChatMessage> {
+    let mut text_parts = Vec::new();
+    let mut tool_calls = Vec::new();
+    let mut tool_results = Vec::new();
+
+    for block in blocks {
+        match block {
+            LlmContentBlock::Text { text } if !text.trim().is_empty() => {
+                text_parts.push(text.clone());
+            }
+            LlmContentBlock::ToolUse { id, name, input } => {
+                tool_calls.push(ChatToolCall {
+                    id: id.clone(),
+                    kind: "function".to_string(),
+                    function: ChatToolFunction {
+                        name: name.clone(),
+                        arguments: input.to_string(),
+                    },
+                });
+            }
+            LlmContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                images,
+                ..
+            } => {
+                tool_results.push(ChatMessage {
+                    role: "tool".to_string(),
+                    content: Some(chat_tool_result_content(content, images)),
+                    tool_calls: Vec::new(),
+                    tool_call_id: Some(tool_use_id.clone()),
+                });
+            }
+            LlmContentBlock::Image { .. } | LlmContentBlock::Text { .. } => {}
+        }
+    }
+
+    if !tool_results.is_empty() {
+        return tool_results;
+    }
+
+    vec![ChatMessage {
+        role: role.to_string(),
+        content: if text_parts.is_empty() {
+            None
+        } else {
+            Some(text_parts.join("\n"))
+        },
+        tool_calls,
+        tool_call_id: None,
+    }]
+}
+
+fn chat_tool_result_content(content: &str, images: &[crate::llm_types::ImageSource]) -> String {
+    if images.is_empty() {
+        return content.to_string();
+    }
+
+    let mut model_content = Vec::with_capacity(images.len() + 1);
+    if !content.trim().is_empty() {
+        model_content.push(serde_json::json!({
+            "type": "text",
+            "text": content,
+        }));
+    }
+    model_content.extend(images.iter().map(|source| {
+        serde_json::json!({
+            "type": "image",
+            "source": {
+                "type": source.kind,
+                "media_type": source.media_type,
+                "data": source.data,
+            }
+        })
+    }));
+
+    serde_json::json!({
+        "summary": content,
+        "model_content": model_content,
+    })
+    .to_string()
+}
+
 pub struct BaseAdapter {
     config: AdapterConfig,
     model_client: Arc<dyn ModelBridgeClient>,
@@ -129,25 +229,7 @@ impl BaseAdapter {
                 params
                     .messages
                     .iter()
-                    .map(|m| crate::types::ChatMessage {
-                        role: m.role.clone(),
-                        content: match &m.content {
-                            LlmMessageContent::Text(t) => Some(t.clone()),
-                            LlmMessageContent::Blocks(blocks) => {
-                                let text: String = blocks
-                                    .iter()
-                                    .filter_map(|b| match b {
-                                        LlmContentBlock::Text { text } => Some(text.as_str()),
-                                        _ => None,
-                                    })
-                                    .collect::<Vec<_>>()
-                                    .join("\n");
-                                if text.is_empty() { None } else { Some(text) }
-                            }
-                        },
-                        tool_calls: Vec::new(),
-                        tool_call_id: None,
-                    })
+                    .flat_map(chat_messages_from_llm_message)
                     .collect(),
             ),
             tools: params.tools.as_ref().map(|tools| {
@@ -261,11 +343,14 @@ impl BaseAdapter {
             let result_blocks: Vec<LlmContentBlock> =
                 execute_tool_calls(&response.tool_calls, tool_executor)
                     .into_iter()
-                    .map(|result| LlmContentBlock::ToolResult {
-                        tool_use_id: result.tool_call_id,
-                        content: result.content,
-                        is_error: result.is_error,
-                        images: Vec::new(),
+                    .map(|result| {
+                        let content = parse_tool_result_model_content(Some(&result.content));
+                        LlmContentBlock::ToolResult {
+                            tool_use_id: result.tool_call_id,
+                            content: content.text,
+                            is_error: result.is_error,
+                            images: content.images,
+                        }
                     })
                     .collect();
 

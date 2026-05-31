@@ -124,6 +124,89 @@ pub struct ImageSource {
     pub data: String,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct ParsedToolResultModelContent {
+    pub text: String,
+    pub images: Vec<ImageSource>,
+}
+
+pub fn parse_tool_result_model_content(raw_content: Option<&str>) -> ParsedToolResultModelContent {
+    let raw = raw_content.unwrap_or_default();
+    let Ok(value) = serde_json::from_str::<Value>(raw) else {
+        return ParsedToolResultModelContent {
+            text: raw.to_string(),
+            images: Vec::new(),
+        };
+    };
+    let Some(items) = value.get("model_content").and_then(Value::as_array) else {
+        return ParsedToolResultModelContent {
+            text: raw.to_string(),
+            images: Vec::new(),
+        };
+    };
+
+    let mut texts = Vec::new();
+    let mut images = Vec::new();
+    for item in items {
+        match item.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                if let Some(text) = item
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .filter(|text| !text.trim().is_empty())
+                {
+                    texts.push(text.to_string());
+                }
+            }
+            Some("image") => {
+                if let Some(source) = parse_image_source(item.get("source")) {
+                    images.push(source);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if images.is_empty() {
+        return ParsedToolResultModelContent {
+            text: raw.to_string(),
+            images,
+        };
+    }
+
+    let text = value
+        .get("summary")
+        .and_then(Value::as_str)
+        .filter(|summary| !summary.trim().is_empty())
+        .map(str::to_string)
+        .or_else(|| (!texts.is_empty()).then(|| texts.join("\n")))
+        .unwrap_or_else(|| "工具返回了一张图片。".to_string());
+
+    ParsedToolResultModelContent { text, images }
+}
+
+fn parse_image_source(value: Option<&Value>) -> Option<ImageSource> {
+    let object = value?.as_object()?;
+    let kind = object
+        .get("type")
+        .or_else(|| object.get("kind"))
+        .and_then(Value::as_str)
+        .unwrap_or("base64");
+    let media_type = object
+        .get("media_type")
+        .or_else(|| object.get("mediaType"))
+        .and_then(Value::as_str)?;
+    let data = object.get("data").and_then(Value::as_str)?;
+    if kind != "base64" || !media_type.starts_with("image/") || data.trim().is_empty() {
+        return None;
+    }
+    Some(ImageSource {
+        kind: kind.to_string(),
+        media_type: media_type.to_string(),
+        data: data.to_string(),
+    })
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum LlmMessageContent {

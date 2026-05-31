@@ -5,7 +5,9 @@ use crate::{
     JsonRpcModelBridgeClient, JsonRpcStdioTransport, McpBridgeClient, McpToolCallRequest,
     ModelBridgeClient, ModelInvocationRequest,
     base_adapter::ToolExecutor,
-    llm_types::{ToolCall, ToolResult},
+    llm_types::{
+        ImageSource, LlmContentBlock, LlmMessage, LlmMessageContent, ToolCall, ToolResult,
+    },
 };
 use serde_json::{Value, json};
 use std::{
@@ -720,6 +722,45 @@ fn shell_tool_calls_execute_concurrently_and_preserve_order() {
             .collect::<Vec<_>>(),
         vec!["call-shell-a", "call-shell-b"]
     );
+}
+
+#[test]
+fn base_adapter_chat_message_conversion_preserves_multimodal_tool_result() {
+    let message = LlmMessage {
+        role: "user".to_string(),
+        content: LlmMessageContent::Blocks(vec![LlmContentBlock::ToolResult {
+            tool_use_id: "call_view_image".to_string(),
+            content: "已读取图片".to_string(),
+            is_error: false,
+            images: vec![ImageSource {
+                kind: "base64".to_string(),
+                media_type: "image/png".to_string(),
+                data: "AAA".to_string(),
+            }],
+        }]),
+    };
+
+    let chat_messages = crate::base_adapter::chat_messages_from_llm_message(&message);
+
+    assert_eq!(chat_messages.len(), 1);
+    assert_eq!(chat_messages[0].role, "tool");
+    assert_eq!(
+        chat_messages[0].tool_call_id.as_deref(),
+        Some("call_view_image")
+    );
+    let content: Value = serde_json::from_str(
+        chat_messages[0]
+            .content
+            .as_deref()
+            .expect("tool result content"),
+    )
+    .expect("multimodal tool result should stay structured");
+    assert_eq!(content["model_content"][0]["text"], "已读取图片");
+    assert_eq!(
+        content["model_content"][1]["source"]["media_type"],
+        "image/png"
+    );
+    assert_eq!(content["model_content"][1]["source"]["data"], "AAA");
 }
 
 // ============================================================================
