@@ -91,10 +91,16 @@ export type SafeguardCategory =
   | "bulk_delete"
   | "custom";
 
+export type SafeguardAction =
+  | "hard_block"
+  | "require_approval_in_restricted"
+  | "audit_only";
+
 export interface SafeguardRule {
   pattern: string;
   enabled: boolean;
   category: SafeguardCategory;
+  action: SafeguardAction;
 }
 
 export interface MCPServer {
@@ -2461,8 +2467,20 @@ function createSettingsStore(props: { onClose?: () => void }) {
           pattern: String(r.pattern || ""),
           enabled: r.enabled !== false,
           category: r.category || "custom",
+          action: normalizeSafeguardAction(r.action),
         }))
       : [];
+  }
+
+  function normalizeSafeguardAction(action: unknown): SafeguardAction {
+    if (
+      action === "hard_block" ||
+      action === "require_approval_in_restricted" ||
+      action === "audit_only"
+    ) {
+      return action;
+    }
+    return "require_approval_in_restricted";
   }
 
   async function saveSafeguardRules(): Promise<void> {
@@ -2500,7 +2518,12 @@ function createSettingsStore(props: { onClose?: () => void }) {
     if (safeguardRules.some((r) => r.pattern === pattern)) return;
     safeguardRules = [
       ...safeguardRules,
-      { pattern, enabled: true, category: "custom" as SafeguardCategory },
+      {
+        pattern,
+        enabled: true,
+        category: "custom" as SafeguardCategory,
+        action: "require_approval_in_restricted",
+      },
     ];
     newCustomRule = "";
     saveSafeguardRules();

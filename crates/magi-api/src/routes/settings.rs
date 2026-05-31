@@ -1918,7 +1918,8 @@ mod tests {
                 {
                     "pattern": "custom-danger-global",
                     "enabled": true,
-                    "category": "custom"
+                    "category": "custom",
+                    "action": "hard_block"
                 }
             ]
         });
@@ -1960,12 +1961,19 @@ mod tests {
             bootstrap_a["safeguardConfig"]["rules"][0]["pattern"],
             serde_json::json!("git push --force")
         );
+        assert_eq!(
+            bootstrap_a["safeguardConfig"]["rules"][0]["action"],
+            serde_json::json!("require_approval_in_restricted")
+        );
         assert!(
             bootstrap_a["safeguardConfig"]["rules"]
                 .as_array()
                 .expect("rules should be array")
                 .iter()
-                .any(|rule| rule["pattern"] == serde_json::json!("custom-danger-global"))
+                .any(
+                    |rule| rule["pattern"] == serde_json::json!("custom-danger-global")
+                        && rule["action"] == serde_json::json!("hard_block")
+                )
         );
         assert_eq!(
             bootstrap_b["userRulesConfig"]["userRules"],
@@ -1980,7 +1988,10 @@ mod tests {
                 .as_array()
                 .expect("rules should be array")
                 .iter()
-                .any(|rule| rule["pattern"] == serde_json::json!("custom-danger-global"))
+                .any(
+                    |rule| rule["pattern"] == serde_json::json!("custom-danger-global")
+                        && rule["action"] == serde_json::json!("hard_block")
+                )
         );
     }
 }

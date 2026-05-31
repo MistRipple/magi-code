@@ -34,6 +34,24 @@
         return '';
     }
   });
+
+  function getSafeguardActionLabel(action: string | undefined): string {
+    switch (action) {
+      case 'hard_block':
+        return i18n.t('settings.safeguard.action.hardBlock');
+      case 'audit_only':
+        return i18n.t('settings.safeguard.action.auditOnly');
+      default:
+        return i18n.t('settings.safeguard.action.requireApproval');
+    }
+  }
+
+  function getSafeguardRuleTitle(rule: any): string {
+    const status = rule.enabled
+      ? i18n.t('settings.tools.clickToDisable')
+      : i18n.t('settings.tools.clickToEnable');
+    return `${getSafeguardActionLabel(rule.action)}\n${status}`;
+  }
 </script>
 
 <div class="apple-manager">
@@ -88,9 +106,10 @@
                 class:disabled={!rule.enabled}
                 onclick={() => toggleSafeguardRule(index)}
                 onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleSafeguardRule(index); } }}
-                title={rule.enabled ? i18n.t('settings.tools.clickToDisable') : i18n.t('settings.tools.clickToEnable')}
+                title={getSafeguardRuleTitle(rule)}
               >
                 <span class="safeguard-badge-text">{rule.pattern}</span>
+                <span class="safeguard-action">{getSafeguardActionLabel(rule.action)}</span>
                 {#if category === 'custom'}
                   <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
                   <div role="button" tabindex="0" class="safeguard-badge-remove" onclick={(e) => { e.stopPropagation(); removeCustomRule(index); }} onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); e.stopPropagation(); removeCustomRule(index); } }} title={i18n.t('settings.tools.delete')}>×</div>
@@ -198,6 +217,21 @@
   .safeguard-badge.disabled:hover {
     border-color: var(--foreground);
     color: var(--foreground);
+  }
+
+  .safeguard-action {
+    font-family: var(--font-sans, sans-serif);
+    font-size: 10px;
+    line-height: 1;
+    padding: 2px 5px;
+    border-radius: 6px;
+    background: rgba(var(--primary-rgb, 0, 122, 255), 0.12);
+    color: inherit;
+    white-space: nowrap;
+  }
+
+  .safeguard-badge.enabled .safeguard-action {
+    background: rgba(255, 255, 255, 0.18);
   }
 
   .safeguard-badge-remove {

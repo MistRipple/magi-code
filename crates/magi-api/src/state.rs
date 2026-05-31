@@ -1638,6 +1638,7 @@ fn builtin_safeguard_rules() -> Vec<serde_json::Value> {
                 "pattern": rule.pattern,
                 "enabled": rule.enabled,
                 "category": rule.category.as_str(),
+                "action": rule.action.as_str(),
             })
         })
         .collect()
