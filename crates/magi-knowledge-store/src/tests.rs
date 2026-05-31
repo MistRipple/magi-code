@@ -2,7 +2,7 @@ use crate::{
     CodeIndexIngestion, CodeIndexSource, CodeIndexSymbol, CodeSymbolKind, KnowledgeAuditLink,
     KnowledgeGovernanceLink, KnowledgeGovernanceOutcome, KnowledgeKind, KnowledgeQuery,
     KnowledgeRecord, KnowledgeStore,
-    code_scanner::{CodeIndexFile, CodeIndexSummary},
+    code_scanner::{CodeIndexFile, CodeIndexScanStatus, CodeIndexSummary},
 };
 use magi_core::{UtcMillis, WorkspaceId};
 
@@ -433,6 +433,56 @@ fn workspace_code_index_builds_and_searches_real_symbols() {
         results.iter().any(|r| r.file_path.contains("auth.rs")),
         "search 应命中 auth.rs，实际: {:?}",
         results.iter().map(|r| &r.file_path).collect::<Vec<_>>()
+    );
+
+    let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
+fn workspace_index_rebuild_clears_runtime_when_workspace_has_no_indexable_files() {
+    use crate::local_search_engine::SearchOptions;
+    use std::fs;
+
+    let base = std::env::temp_dir().join(format!(
+        "magi-ks-index-clear-test-{}-{}",
+        std::process::id(),
+        UtcMillis::now().0
+    ));
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir_all(base.join("src")).expect("create temp project dir");
+    let source_path = base.join("src/auth.rs");
+    fs::write(
+        &source_path,
+        "pub fn authenticate_user(token: &str) -> bool {\n    !token.is_empty()\n}\n",
+    )
+    .expect("write source file");
+
+    let store = KnowledgeStore::new();
+    let workspace_id = WorkspaceId::new("ws-index-clear-test");
+
+    store.build_workspace_index(&workspace_id, &base);
+    assert!(store.workspace_index_ready(&workspace_id));
+    assert!(
+        store
+            .code_index_summary_for_workspace(&workspace_id)
+            .is_some()
+    );
+
+    fs::remove_file(source_path).expect("remove source file");
+    let outcome = store.build_workspace_index(&workspace_id, &base);
+
+    assert_eq!(outcome.status, CodeIndexScanStatus::Empty);
+    assert!(!store.workspace_index_ready(&workspace_id));
+    assert!(
+        store
+            .search_workspace_code(&workspace_id, "authenticate", SearchOptions::default())
+            .is_none()
+    );
+    assert!(
+        store
+            .code_index_summary_for_workspace(&workspace_id)
+            .is_none(),
+        "空 workspace 不应保留旧的代码索引摘要"
     );
 
     let _ = fs::remove_dir_all(&base);

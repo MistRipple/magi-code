@@ -1,5 +1,5 @@
 use crate::{CodeIndexIngestion, CodeIndexSource, KnowledgeStore};
-use magi_core::{UtcMillis, WorkspaceId};
+use magi_core::UtcMillis;
 use std::collections::HashSet;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
@@ -257,23 +257,7 @@ pub fn ingest_workspace_code_index(
     outcome
 }
 
-pub fn ingest_workspace_code_index_in_workspace(
-    store: &KnowledgeStore,
-    workspace_id: &WorkspaceId,
-    workspace_root: &Path,
-) -> CodeIndexScanOutcome {
-    let outcome = scan_workspace(workspace_root);
-    let Some(summary) = outcome.summary.as_ref() else {
-        store.delete_code_index_for_workspace(workspace_id);
-        return outcome;
-    };
-    if let Some(ingestion) = code_index_ingestion_for_summary(workspace_root, summary) {
-        store.ingest_code_index_in_workspace(workspace_id.clone(), ingestion);
-    }
-    outcome
-}
-
-fn code_index_ingestion_for_summary(
+pub(crate) fn code_index_ingestion_for_summary(
     workspace_root: &Path,
     summary: &CodeIndexSummary,
 ) -> Option<CodeIndexIngestion> {

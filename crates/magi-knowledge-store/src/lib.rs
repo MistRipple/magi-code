@@ -175,7 +175,11 @@ impl KnowledgeStore {
     ///
     /// 复用 code_scanner 的扫描结果生成 (相对路径, 文件类型) 列表喂给
     /// LocalSearchEngine::build_index；文件内容由引擎内部按需读盘。
-    pub fn build_workspace_index(&self, workspace_id: &WorkspaceId, workspace_root: &Path) {
+    pub fn build_workspace_index(
+        &self,
+        workspace_id: &WorkspaceId,
+        workspace_root: &Path,
+    ) -> code_scanner::CodeIndexScanOutcome {
         // 规范化 root：watcher（FSEvents 等）派发的事件路径是 OS canonical 形态
         // （macOS 上 /tmp → /private/tmp），引擎 to_relative 用 root 做前缀剥离。
         // 若两端 root 规范化来源不同，增量更新的相对路径会对不上，导致索引落空。
@@ -185,8 +189,12 @@ impl KnowledgeStore {
 
         let outcome = code_scanner::scan_workspace(&root);
         let Some(summary) = outcome.summary.as_ref() else {
-            return;
+            self.delete_code_index_for_workspace(workspace_id);
+            return outcome;
         };
+        if let Some(ingestion) = code_scanner::code_index_ingestion_for_summary(&root, summary) {
+            self.ingest_code_index_in_workspace(workspace_id.clone(), ingestion);
+        }
         let files: Vec<(String, String)> = summary
             .files
             .iter()
@@ -205,6 +213,7 @@ impl KnowledgeStore {
         // 与索引构建原子地起文件监听：变更去抖后转发到增量更新。
         // 收敛 daemon 启动与 API 注册两条路径——所有 build 调用点自动获得 watcher。
         self.spawn_watcher(workspace_id, workspace_root);
+        outcome
     }
 
     /// 为指定 workspace 起文件监听，把去抖后的变更转发到代码索引增量更新。
@@ -253,6 +262,17 @@ impl KnowledgeStore {
             .write()
             .expect("knowledge store watchers write lock poisoned")
             .insert(workspace_id.clone(), Arc::new(watcher));
+    }
+
+    fn clear_workspace_index_runtime(&self, workspace_id: &WorkspaceId) {
+        self.search_engines
+            .write()
+            .expect("knowledge store search engines write lock poisoned")
+            .remove(workspace_id);
+        self.watchers
+            .write()
+            .expect("knowledge store watchers write lock poisoned")
+            .remove(workspace_id);
     }
 
     /// 在指定 workspace 的本地代码索引上检索；引擎未构建时返回 None。
@@ -552,6 +572,7 @@ impl KnowledgeStore {
 
     pub fn delete_code_index_for_workspace(&self, workspace_id: &WorkspaceId) {
         let _ = self.delete(&workspace_project_code_index_id(workspace_id));
+        self.clear_workspace_index_runtime(workspace_id);
     }
 
     pub fn clear(&self) {
@@ -564,6 +585,14 @@ impl KnowledgeStore {
         state.code_sources.clear();
         state.audit_links.clear();
         state.governance_links.clear();
+        self.search_engines
+            .write()
+            .expect("knowledge store search engines write lock poisoned")
+            .clear();
+        self.watchers
+            .write()
+            .expect("knowledge store watchers write lock poisoned")
+            .clear();
     }
 
     pub fn clear_workspace(&self, workspace_id: &WorkspaceId) {
@@ -576,6 +605,7 @@ impl KnowledgeStore {
         for knowledge_id in knowledge_ids {
             let _ = self.delete(&knowledge_id);
         }
+        self.clear_workspace_index_runtime(workspace_id);
     }
 }
 

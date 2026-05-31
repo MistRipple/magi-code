@@ -3,7 +3,6 @@ use axum::{
     extract::{Query, State},
     routing::{get, post},
 };
-use magi_knowledge_store::code_scanner::ingest_workspace_code_index_in_workspace;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -83,11 +82,6 @@ async fn register_workspace(
     let canonical_path = canonical_workspace_path(&request.path)?;
     let path = magi_core::AbsolutePath::new(canonical_path.to_string_lossy().to_string());
     if let Some(workspace) = registered_workspace_for_path(&state, &canonical_path) {
-        ingest_workspace_code_index_in_workspace(
-            &state.knowledge_store,
-            &workspace.workspace_id,
-            &canonical_path,
-        );
         state
             .knowledge_store
             .build_workspace_index(&workspace.workspace_id, &canonical_path);
@@ -108,11 +102,6 @@ async fn register_workspace(
         Ok(_) => {}
         Err(error) => {
             if let Some(workspace) = registered_workspace_for_path(&state, &canonical_path) {
-                ingest_workspace_code_index_in_workspace(
-                    &state.knowledge_store,
-                    &workspace.workspace_id,
-                    &canonical_path,
-                );
                 state
                     .knowledge_store
                     .build_workspace_index(&workspace.workspace_id, &canonical_path);
@@ -126,11 +115,6 @@ async fn register_workspace(
             return Err(ApiError::internal_assembly("工作区注册失败", error));
         }
     }
-    ingest_workspace_code_index_in_workspace(
-        &state.knowledge_store,
-        &workspace_id,
-        &canonical_path,
-    );
     state
         .knowledge_store
         .build_workspace_index(&workspace_id, &canonical_path);

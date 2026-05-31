@@ -6,10 +6,7 @@ use axum::{
 use magi_core::{DomainError, UtcMillis, WorkspaceId};
 use magi_knowledge_store::{
     KnowledgeKind, KnowledgeQuery, KnowledgeRecord,
-    code_scanner::{
-        CodeIndexScanOutcome, CodeIndexScanStatus, CodeIndexSummary,
-        ingest_workspace_code_index_in_workspace,
-    },
+    code_scanner::{CodeIndexScanOutcome, CodeIndexScanStatus, CodeIndexSummary},
 };
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -352,14 +349,6 @@ fn ensure_workspace_code_index(
     state: &ApiState,
     workspace_id: &WorkspaceId,
 ) -> Result<CodeIndexScanOutcome, ApiError> {
-    if state
-        .knowledge_store
-        .code_index_summary_for_workspace(workspace_id)
-        .is_some_and(|summary| !summary.files.is_empty())
-    {
-        return Ok(CodeIndexScanOutcome::indexed_existing());
-    }
-
     let Some(workspace) = state
         .workspace_registry
         .workspaces()
@@ -368,14 +357,25 @@ fn ensure_workspace_code_index(
     else {
         return Err(ApiError::not_found("工作区不存在", workspace_id.as_str()));
     };
+    let workspace_root = PathBuf::from(workspace.root_path.as_str());
 
-    let outcome = ingest_workspace_code_index_in_workspace(
-        &state.knowledge_store,
-        workspace_id,
-        &PathBuf::from(workspace.root_path.as_str()),
-    );
+    let had_index_summary = state
+        .knowledge_store
+        .code_index_summary_for_workspace(workspace_id)
+        .is_some_and(|summary| !summary.files.is_empty());
+    if had_index_summary && state.knowledge_store.workspace_index_ready(workspace_id) {
+        return Ok(CodeIndexScanOutcome::indexed_existing());
+    }
+
+    let outcome = state
+        .knowledge_store
+        .build_workspace_index(workspace_id, &workspace_root);
     state.persist_knowledge_state_for_api()?;
-    Ok(outcome)
+    if had_index_summary && outcome.summary.is_some() {
+        Ok(CodeIndexScanOutcome::indexed_existing())
+    } else {
+        Ok(outcome)
+    }
 }
 
 fn code_index_status_json(
@@ -605,8 +605,10 @@ mod tests {
         });
     }
 
-    fn register_test_workspace(state: &ApiState, workspace_id: &WorkspaceId) {
+    fn register_test_workspace(state: &ApiState, workspace_id: &WorkspaceId) -> PathBuf {
         let root = std::env::temp_dir().join(format!("magi-knowledge-{}", workspace_id.as_str()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("workspace dir should create");
         state
             .workspace_registry
             .register(
@@ -614,6 +616,7 @@ mod tests {
                 AbsolutePath::new(root.to_string_lossy().to_string()),
             )
             .expect("workspace should register");
+        root
     }
 
     async fn read_json(response: axum::response::Response) -> serde_json::Value {
@@ -643,8 +646,14 @@ mod tests {
         insert_code_index(&knowledge_store, &workspace_a, "src/a.rs");
         insert_code_index(&knowledge_store, &workspace_b, "src/b.rs");
         let state = state_with_knowledge_store(knowledge_store);
-        register_test_workspace(&state, &workspace_a);
-        register_test_workspace(&state, &workspace_b);
+        let root_a = register_test_workspace(&state, &workspace_a);
+        let root_b = register_test_workspace(&state, &workspace_b);
+        fs::create_dir_all(root_a.join("src")).expect("workspace a source dir should create");
+        fs::create_dir_all(root_b.join("src")).expect("workspace b source dir should create");
+        fs::write(root_a.join("src/a.rs"), "pub fn workspace_a() {}\n")
+            .expect("workspace a source should write");
+        fs::write(root_b.join("src/b.rs"), "pub fn workspace_b() {}\n")
+            .expect("workspace b source should write");
 
         let response = routes()
             .with_state(state)
@@ -710,7 +719,7 @@ mod tests {
             .expect("workspace should register");
 
         let response = routes()
-            .with_state(state)
+            .with_state(state.clone())
             .oneshot(
                 Request::builder()
                     .uri("/knowledge?workspaceId=workspace-lazy-index")
@@ -733,6 +742,10 @@ mod tests {
             "knowledge endpoint should index the requested registered workspace"
         );
         assert_eq!(payload["codeIndexStatus"]["status"], "indexed");
+        assert!(
+            state.knowledge_store.workspace_index_ready(&workspace_id),
+            "knowledge endpoint should keep the local search engine aligned with the code index summary"
+        );
     }
 
     #[tokio::test]
