@@ -608,7 +608,7 @@ function emitForcedProcessingIdle(reason: string, extra?: Record<string, unknown
 
 function refreshBootstrapAfterTerminalTurn(reason: string): void {
   void fetchBootstrap({ forceFresh: true }).catch((error) => {
-    reportExpectedRecoveryFailure('终态变更同步', '[web-client-bridge] turn 终态后 bootstrap 同步失败:', error);
+    reportExpectedRecoveryFailure(i18n.t('bridge.action.syncTurnState'), '[web-client-bridge] turn 终态后 bootstrap 同步失败:', error);
     scheduleRecovery(reason, error, true);
   });
 }
@@ -854,7 +854,7 @@ function emitLocalPendingCanonicalTurn(input: {
     createdAt: input.createdAt,
     status: 'running' as const,
     updatedAt: input.createdAt,
-    title: '生成回复',
+    title: i18n.t('bridge.detail.generatingReply'),
     content: '',
     sourceThreadId,
     visibility: {
@@ -954,7 +954,7 @@ function emitLocalPendingCanonicalTurnFailed(input: {
     createdAt: input.createdAt,
     status: 'failed' as const,
     updatedAt: input.failedAt,
-    title: '发送失败',
+    title: i18n.t('bridge.detail.sendFailedTitle'),
     content: input.error,
     sourceThreadId,
     visibility: {
@@ -1137,7 +1137,7 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
 
   if (eventType === 'session.title.updated') {
     void fetchBootstrap({ forceFresh: true }).catch((error) => {
-      reportExpectedRecoveryFailure('会话标题刷新', '[web-client-bridge] 会话标题更新后刷新失败:', error);
+      reportExpectedRecoveryFailure(i18n.t('bridge.action.refreshSessionTitle'), '[web-client-bridge] 会话标题更新后刷新失败:', error);
       scheduleRecovery('session_title_updated_refresh', error, true);
     });
   }
@@ -1313,7 +1313,7 @@ function handleEventStreamParseFailure(data: string, error: unknown): void {
   const now = Date.now();
   if (now - lastEventStreamParseErrorAt >= EVENT_STREAM_PARSE_ERROR_DEBOUNCE_MS) {
     lastEventStreamParseErrorAt = now;
-    emitBridgeErrorToast('事件流解析', error);
+    emitBridgeErrorToast(i18n.t('bridge.action.syncMessages'), error);
   }
   closeEventStream();
   scheduleRecovery('event_stream_parse_error', error, true);
@@ -1764,7 +1764,7 @@ async function dispatchBootstrap(
     forceReconnect: options.forceEventStreamReconnect === true,
     waitUntilOpen: false,
   }).catch((error) => {
-    reportExpectedRecoveryFailure('事件流连接', '[web-client-bridge] bootstrap 后事件流连接失败:', error);
+    reportExpectedRecoveryFailure(i18n.t('bridge.action.connectEventStream'), '[web-client-bridge] bootstrap 后事件流连接失败:', error);
     scheduleRecovery('bootstrap_event_stream_connect', error, true);
   });
   // 并行加载 Registry agents（fire-and-forget，不阻断 bootstrap）
@@ -2029,7 +2029,7 @@ async function dispatchSessionSnapshot(
     forceReconnect: options.forceEventStreamReconnect === true,
     waitUntilOpen: false,
   }).catch((error) => {
-    reportExpectedRecoveryFailure('事件流连接', '[web-client-bridge] 会话快照后事件流连接失败:', error);
+    reportExpectedRecoveryFailure(i18n.t('bridge.action.connectEventStream'), '[web-client-bridge] 会话快照后事件流连接失败:', error);
     scheduleRecovery('session_snapshot_event_stream_connect', error, true);
   });
   if (taskTrackingHints.rootTaskId || taskTrackingHints.activeTaskIds.length > 0) {
@@ -2110,20 +2110,20 @@ async function deleteSession(sessionId: string): Promise<void> {
   // 删的是当前会话 → 后端 currentSession 为空，前端也清空；
   // 删的不是当前会话 → 后端 currentSession 仍是原会话，前端继续保持激活。
   await dispatchBootstrap(normalizeBootstrapResponse(payload), { rawPayload: payload });
-  emitBridgeSuccessToast('删除会话', '会话已删除');
+  emitBridgeSuccessToast(i18n.t('bridge.action.deleteSession'), i18n.t('toast.sessionDeleted'));
 }
 
 async function renameSession(sessionId: string, name: string): Promise<void> {
   const payload = await renameAgentSession(sessionId, name);
   await dispatchBootstrap(normalizeBootstrapResponse(payload, { sessionId }), { rawPayload: payload });
-  emitBridgeSuccessToast('重命名会话', '会话名称已更新');
+  emitBridgeSuccessToast(i18n.t('bridge.action.renameSession'), i18n.t('toast.sessionRenamed'));
 }
 
 async function closeSession(sessionId: string): Promise<void> {
   const payload = await closeAgentSession(sessionId);
   // 同 deleteSession：关闭后该会话不再出现在列表里，hint 会让归一化器误清空 currentSessionId
   await dispatchBootstrap(normalizeBootstrapResponse(payload), { rawPayload: payload });
-  emitBridgeSuccessToast('关闭会话', '会话已关闭');
+  emitBridgeSuccessToast(i18n.t('bridge.action.closeSession'), i18n.t('bridge.detail.sessionClosed'));
 }
 
 async function saveCurrentSession(): Promise<void> {
@@ -2132,7 +2132,11 @@ async function saveCurrentSession(): Promise<void> {
     normalizeBootstrapResponse(payload, { sessionId: currentSessionId || '' }),
     { rawPayload: payload },
   );
-  emitBridgeSuccessToast('保存会话', '当前会话已保存', { displayMode: 'notification_center' });
+  emitBridgeSuccessToast(
+    i18n.t('bridge.action.saveSession'),
+    i18n.t('bridge.detail.currentSessionSaved'),
+    { displayMode: 'notification_center' },
+  );
 }
 
 async function ensureFreshLiveBridge(reason: string): Promise<void> {
@@ -2461,16 +2465,24 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
     }
     if (turnResult.createdSession && resolvedSessionId) {
       void fetchBootstrap({ forceFresh: true }).catch((error) => {
-        reportExpectedRecoveryFailure('新会话列表同步', '[web-client-bridge] 新会话 accepted 后刷新失败:', error);
+        reportExpectedRecoveryFailure(
+          i18n.t('bridge.action.syncSessions'),
+          '[web-client-bridge] 新会话 accepted 后刷新失败:',
+          error,
+        );
         scheduleRecovery('new_session_accepted_refresh', error, true);
       });
     }
     const successMessage = turnResult.route === 'task'
-      ? '任务已提交'
+      ? i18n.t('bridge.detail.taskSubmitted')
       : turnResult.route === 'continue'
-        ? '继续请求已提交'
-        : '消息已发送';
-    emitBridgeSuccessToast('发送消息', successMessage, { displayMode: 'notification_center' });
+        ? i18n.t('bridge.detail.continueSubmitted')
+        : i18n.t('bridge.detail.messageSent');
+    emitBridgeSuccessToast(
+      i18n.t('bridge.action.sendMessage'),
+      successMessage,
+      { displayMode: 'notification_center' },
+    );
 
     setCurrentInterruptTaskId(turnResult.actionTaskId || '');
     const rootTaskId = turnResult.rootTaskId;
@@ -2487,7 +2499,7 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
     clearActiveTurnInFlight();
     clearCurrentInterruptTaskId();
     console.error('[web-client-bridge] 执行任务失败:', error);
-    const errorText = normalizeErrorMessage(error) || '发送消息失败';
+    const errorText = i18n.t('bridge.detail.messageSendFailed');
     if (!isQueuedDrainSubmission) {
       emitLocalPendingCanonicalTurnFailed({
         sessionId: currentSessionId,
@@ -2502,7 +2514,7 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
       });
     }
     clearRequestBinding(requestId);
-    emitBridgeErrorToast('发送消息', error);
+    emitBridgeErrorToast(i18n.t('bridge.action.sendMessage'), error);
     emitForcedProcessingIdle('execute_task_failed', {
       error: normalizeErrorMessage(error),
       requestId,
@@ -2522,7 +2534,10 @@ async function interruptTask(): Promise<void> {
   clearActiveTurnInFlight();
   if (!taskId && !sessionId) {
     emitForcedProcessingIdle('user_interrupt_missing_session', { trigger });
-    emitBridgeErrorToast('停止任务', new Error('当前没有可停止的会话。'));
+    emitBridgeErrorToast(
+      i18n.t('bridge.action.stopTask'),
+      new Error(i18n.t('bridge.detail.noStoppableSession')),
+    );
     return;
   }
   const idleReason = taskId ? 'user_interrupt_requested' : 'user_session_interrupt_requested';
@@ -2536,7 +2551,7 @@ async function interruptTask(): Promise<void> {
     }
   } catch (error) {
     console.error('[web-client-bridge] 中断执行失败（已执行前端强制停止）:', error);
-    emitBridgeErrorToast('停止任务', error);
+    emitBridgeErrorToast(i18n.t('bridge.action.stopTask'), error);
     emitForcedProcessingIdle('user_interrupt_failed', {
       trigger,
       taskId,
@@ -2556,7 +2571,7 @@ async function startTask(taskId: string): Promise<void> {
     await startAgentTask(taskId);
   } catch (error) {
     console.error('[web-client-bridge] 启动任务失败:', error);
-    emitBridgeErrorToast('启动任务', error);
+    emitBridgeErrorToast(i18n.t('bridge.action.startTask'), error);
     emitForcedProcessingIdle('start_task_failed', {
       error: normalizeErrorMessage(error),
       taskId,
@@ -2570,7 +2585,10 @@ async function startTask(taskId: string): Promise<void> {
 
 async function continueSessionExecution(): Promise<void> {
   if (!currentSessionId) {
-    emitBridgeErrorToast('继续会话', new Error('当前没有可继续的会话。'));
+    emitBridgeErrorToast(
+      i18n.t('bridge.action.continueSession'),
+      new Error(i18n.t('bridge.detail.noContinuableSession')),
+    );
     return;
   }
   try {
@@ -2578,7 +2596,7 @@ async function continueSessionExecution(): Promise<void> {
     await continueAgentSession(currentSessionId);
   } catch (error) {
     console.error('[web-client-bridge] 继续会话失败:', error);
-    emitBridgeErrorToast('继续会话', error);
+    emitBridgeErrorToast(i18n.t('bridge.action.continueSession'), error);
     emitForcedProcessingIdle('continue_session_failed', {
       error: normalizeErrorMessage(error),
       sessionId: currentSessionId,
@@ -3179,7 +3197,7 @@ export function createWebClientBridge(): ClientBridge {
         case 'getState':
         case 'requestState':
           void restoreBridgeState('request_state').catch((error) => {
-            reportExpectedRecoveryFailure('bootstrap ', '[web-client-bridge] bootstrap 失败:', error);
+            reportExpectedRecoveryFailure(i18n.t('bridge.action.syncMessages'), '[web-client-bridge] bootstrap 失败:', error);
             scheduleRecovery('request_state', error);
           });
           return;
@@ -3467,11 +3485,15 @@ export function createWebClientBridge(): ClientBridge {
           return;
         case 'newSession':
           dispatchWorkspaceSessionCleared(currentWorkspaceId, currentWorkspacePath);
-          emitBridgeSuccessToast('新建会话', '已切换到新会话面板', { displayMode: 'notification_center' });
+          emitBridgeSuccessToast(
+            i18n.t('bridge.action.newSession'),
+            i18n.t('bridge.detail.newSessionPanelReady'),
+            { displayMode: 'notification_center' },
+          );
           return;
         case 'saveCurrentSession':
           void saveCurrentSession().catch((error) => {
-            logBridgeOperationFailure('保存会话', '[web-client-bridge] 保存当前会话失败:', error);
+            logBridgeOperationFailure(i18n.t('bridge.action.saveSession'), '[web-client-bridge] 保存当前会话失败:', error);
           });
           return;
         case 'loadSessionNotifications':
@@ -3480,7 +3502,7 @@ export function createWebClientBridge(): ClientBridge {
             if (scope) {
               void loadSessionNotifications(scope).catch((error) => {
                 if (isSessionMissingError(error)) return;
-                reportExpectedRecoveryFailure('加载通知', '[web-client-bridge] 加载通知失败:', error);
+                reportExpectedRecoveryFailure(i18n.t('bridge.action.loadNotifications'), '[web-client-bridge] 加载通知失败:', error);
               });
             }
           }
@@ -3491,7 +3513,7 @@ export function createWebClientBridge(): ClientBridge {
             if (scope) {
               void appendSessionNotification(scope, message.notification as Record<string, unknown>).catch((error) => {
                 if (isSessionMissingError(error)) return;
-                reportExpectedRecoveryFailure('写入通知', '[web-client-bridge] 写入通知失败:', error);
+                reportExpectedRecoveryFailure(i18n.t('bridge.action.writeNotification'), '[web-client-bridge] 写入通知失败:', error);
               });
             }
           }
@@ -3502,7 +3524,7 @@ export function createWebClientBridge(): ClientBridge {
             if (scope) {
               void markAllNotificationsRead(scope).catch((error) => {
                 if (isSessionMissingError(error)) return;
-                reportExpectedRecoveryFailure('标记通知已读', '[web-client-bridge] 标记通知已读失败:', error);
+                reportExpectedRecoveryFailure(i18n.t('bridge.action.markNotificationsRead'), '[web-client-bridge] 标记通知已读失败:', error);
               });
             }
           }
@@ -3513,7 +3535,7 @@ export function createWebClientBridge(): ClientBridge {
             if (scope) {
               void clearAllNotifications(scope).catch((error) => {
                 if (isSessionMissingError(error)) return;
-                reportExpectedRecoveryFailure('清空通知', '[web-client-bridge] 清空通知失败:', error);
+                reportExpectedRecoveryFailure(i18n.t('bridge.action.clearNotifications'), '[web-client-bridge] 清空通知失败:', error);
               });
             }
           }
@@ -3524,7 +3546,7 @@ export function createWebClientBridge(): ClientBridge {
             if (scope) {
               void removeNotification(scope, message.notificationId).catch((error) => {
                 if (isSessionMissingError(error)) return;
-                reportExpectedRecoveryFailure('删除通知', '[web-client-bridge] 删除通知失败:', error);
+                reportExpectedRecoveryFailure(i18n.t('bridge.action.removeNotification'), '[web-client-bridge] 删除通知失败:', error);
               });
             }
           }
@@ -3565,13 +3587,13 @@ export function createWebClientBridge(): ClientBridge {
         case 'deleteTask':
           if (typeof message.taskId === 'string' && message.taskId.trim()) {
             void deleteTask(message.taskId).catch((error) => {
-              logBridgeOperationFailure('删除任务', '[web-client-bridge] 删除任务失败:', error);
+              logBridgeOperationFailure(i18n.t('bridge.action.deleteTask'), '[web-client-bridge] 删除任务失败:', error);
             });
           }
           return;
         case 'clearAllTasks':
           void clearAllTasks().catch((error) => {
-            logBridgeOperationFailure('清空任务', '[web-client-bridge] 清空任务失败:', error);
+            logBridgeOperationFailure(i18n.t('bridge.action.clearTasks'), '[web-client-bridge] 清空任务失败:', error);
           });
           return;
         case 'switchSession':
@@ -3580,7 +3602,7 @@ export function createWebClientBridge(): ClientBridge {
               workspaceId: typeof message.workspaceId === 'string' ? message.workspaceId : undefined,
               workspacePath: typeof message.workspacePath === 'string' ? message.workspacePath : undefined,
             }).catch((error) => {
-              logBridgeOperationFailure('切换会话', '[web-client-bridge] 切换会话失败:', error);
+              logBridgeOperationFailure(i18n.t('bridge.action.switchSession'), '[web-client-bridge] 切换会话失败:', error);
             });
           }
           return;
@@ -3590,39 +3612,39 @@ export function createWebClientBridge(): ClientBridge {
             && typeof message.name === 'string' && message.name.trim()
           ) {
             void renameSession(message.sessionId, message.name).catch((error) => {
-              logBridgeOperationFailure('重命名会话', '[web-client-bridge] 重命名会话失败:', error);
+              logBridgeOperationFailure(i18n.t('bridge.action.renameSession'), '[web-client-bridge] 重命名会话失败:', error);
             });
           }
           return;
         case 'closeSession':
           if (typeof message.sessionId === 'string' && message.sessionId.trim()) {
             void closeSession(message.sessionId).catch((error) => {
-              logBridgeOperationFailure('关闭会话', '[web-client-bridge] 关闭会话失败:', error);
+              logBridgeOperationFailure(i18n.t('bridge.action.closeSession'), '[web-client-bridge] 关闭会话失败:', error);
             });
           }
           return;
         case 'deleteSession':
           if (typeof message.sessionId === 'string' && message.sessionId.trim()) {
             void deleteSession(message.sessionId).catch((error) => {
-              logBridgeOperationFailure('删除会话', '[web-client-bridge] 删除会话失败:', error);
+              logBridgeOperationFailure(i18n.t('bridge.action.deleteSession'), '[web-client-bridge] 删除会话失败:', error);
             });
           }
           return;
         case 'updateSetting':
           if (typeof message.key === 'string' && (message.key === "locale")) {
             void updateSetting(message.key, message.value).catch((error) => {
-              logBridgeOperationFailure('更新设置', '[web-client-bridge] 更新设置失败:', error);
+              logBridgeOperationFailure(i18n.t('bridge.action.updateSetting'), '[web-client-bridge] 更新设置失败:', error);
             });
           }
           return;
         case 'requestExecutionStats':
           void dispatchExecutionStats().catch((error) => {
-            logBridgeOperationFailure('执行统计加载', '[web-client-bridge] 执行统计加载失败:', error);
+            logBridgeOperationFailure(i18n.t('bridge.action.loadExecutionStats'), '[web-client-bridge] 执行统计加载失败:', error);
           });
           return;
         case 'resetExecutionStats':
           void resetExecutionStats().catch((error) => {
-            logBridgeOperationFailure('重置执行统计', '[web-client-bridge] 重置执行统计失败:', error);
+            logBridgeOperationFailure(i18n.t('bridge.action.resetExecutionStats'), '[web-client-bridge] 重置执行统计失败:', error);
           });
           return;
         case 'openLink':
@@ -3636,7 +3658,7 @@ export function createWebClientBridge(): ClientBridge {
                 return;
               }
               void openFilePreview(fileTarget, undefined, requestScopeFromMessage(message)).catch((error) => {
-                logBridgeOperationFailure('打开文件预览', '[web-client-bridge] 打开文件预览失败:', error);
+                logBridgeOperationFailure(i18n.t('bridge.action.openFilePreview'), '[web-client-bridge] 打开文件预览失败:', error);
               });
               return;
             }
@@ -3672,7 +3694,7 @@ export function createWebClientBridge(): ClientBridge {
                 ? message.previewContent
                 : undefined;
               void openFilePreview(filePath, previewContent, requestScopeFromMessage(message)).catch((error) => {
-                logBridgeOperationFailure('打开文件预览', '[web-client-bridge] 打开文件预览失败:', error);
+                logBridgeOperationFailure(i18n.t('bridge.action.openFilePreview'), '[web-client-bridge] 打开文件预览失败:', error);
               });
             }
           }
@@ -3684,7 +3706,7 @@ export function createWebClientBridge(): ClientBridge {
           if (typeof message.filePath === 'string' && message.filePath.trim()) {
             const diffContent = typeof message.diff === 'string' ? message.diff : undefined;
             void openDiffPreview(message.filePath, diffContent, requestScopeFromMessage(message)).catch((error) => {
-              logBridgeOperationFailure('打开差异预览', '[web-client-bridge] 打开差异预览失败:', error);
+              logBridgeOperationFailure(i18n.t('bridge.action.openDiffPreview'), '[web-client-bridge] 打开差异预览失败:', error);
             });
           }
           return;
@@ -3692,9 +3714,9 @@ export function createWebClientBridge(): ClientBridge {
           if (typeof message.filePath === 'string' && message.filePath.trim()) {
             void approveAgentChange(message.filePath, requestScopeFromMessage(message)).then(async () => {
               await fetchBootstrap();
-              emitBridgeSuccessToast('批准变更', '变更已批准');
+              emitBridgeSuccessToast(i18n.t('bridge.action.approveChange'), i18n.t('toast.changeApproved'));
             }).catch((error) => {
-              logBridgeOperationFailure('批准变更', '[web-client-bridge] 批准变更失败:', error);
+              logBridgeOperationFailure(i18n.t('bridge.action.approveChange'), '[web-client-bridge] 批准变更失败:', error);
             });
           }
           return;
@@ -3702,26 +3724,26 @@ export function createWebClientBridge(): ClientBridge {
           if (typeof message.filePath === 'string' && message.filePath.trim()) {
             void revertAgentChange(message.filePath, requestScopeFromMessage(message)).then(async () => {
               await fetchBootstrap();
-              emitBridgeSuccessToast('还原变更', '变更已还原');
+              emitBridgeSuccessToast(i18n.t('bridge.action.revertChange'), i18n.t('toast.changeReverted'));
             }).catch((error) => {
-              logBridgeOperationFailure('还原变更', '[web-client-bridge] 还原变更失败:', error);
+              logBridgeOperationFailure(i18n.t('bridge.action.revertChange'), '[web-client-bridge] 还原变更失败:', error);
             });
           }
           return;
         case 'approveAllChanges':
           void approveAllAgentChanges(requestScopeFromMessage(message)).then(async () => {
             await fetchBootstrap();
-            emitBridgeSuccessToast('批准全部变更', '全部变更已批准');
+            emitBridgeSuccessToast(i18n.t('bridge.action.approveAllChanges'), i18n.t('bridge.detail.allChangesApproved'));
           }).catch((error) => {
-            logBridgeOperationFailure('批准全部变更', '[web-client-bridge] 批准全部变更失败:', error);
+            logBridgeOperationFailure(i18n.t('bridge.action.approveAllChanges'), '[web-client-bridge] 批准全部变更失败:', error);
           });
           return;
         case 'revertAllChanges':
           void revertAllAgentChanges(requestScopeFromMessage(message)).then(async () => {
             await fetchBootstrap();
-            emitBridgeSuccessToast('还原全部变更', '全部变更已还原');
+            emitBridgeSuccessToast(i18n.t('bridge.action.revertAllChanges'), i18n.t('bridge.detail.allChangesReverted'));
           }).catch((error) => {
-            logBridgeOperationFailure('还原全部变更', '[web-client-bridge] 还原全部变更失败:', error);
+            logBridgeOperationFailure(i18n.t('bridge.action.revertAllChanges'), '[web-client-bridge] 还原全部变更失败:', error);
           });
           return;
         case 'revertExecutionGroup':
@@ -3731,10 +3753,13 @@ export function createWebClientBridge(): ClientBridge {
               requestScopeFromMessage(message),
             ).then(async () => {
               await fetchBootstrap();
-              emitBridgeSuccessToast('还原执行分组变更', '执行分组变更已还原');
+              emitBridgeSuccessToast(
+                i18n.t('bridge.action.revertExecutionGroup'),
+                i18n.t('bridge.detail.executionGroupReverted'),
+              );
             }).catch((error) => {
               logBridgeOperationFailure(
-                '还原执行分组变更',
+                i18n.t('bridge.action.revertExecutionGroup'),
                 '[web-client-bridge] 还原执行分组变更失败:',
                 error,
               );
@@ -3774,9 +3799,9 @@ export function createWebClientBridge(): ClientBridge {
             };
             void addAgentKnowledgeItem(payload).then(async () => {
               await emitKnowledgePayload();
-              emitBridgeSuccessToast('添加知识条目', '知识条目已添加');
+              emitBridgeSuccessToast(i18n.t('bridge.action.addKnowledgeItem'), i18n.t('bridge.detail.knowledgeItemAdded'));
             }).catch((error) => {
-              logKnowledgeOperationFailure('添加知识条目', '[web-client-bridge] 添加知识条目失败:', error, knowledgeAddFailureKey(kind));
+              logKnowledgeOperationFailure(i18n.t('bridge.action.addKnowledgeItem'), '[web-client-bridge] 添加知识条目失败:', error, knowledgeAddFailureKey(kind));
             });
           }
           return;
@@ -3792,9 +3817,9 @@ export function createWebClientBridge(): ClientBridge {
             };
             void updateAgentKnowledgeItem(knowledgeId, patch).then(async () => {
               await emitKnowledgePayload();
-              emitBridgeSuccessToast('更新知识条目', '知识条目已更新');
+              emitBridgeSuccessToast(i18n.t('bridge.action.updateKnowledgeItem'), i18n.t('bridge.detail.knowledgeItemUpdated'));
             }).catch((error) => {
-              logKnowledgeOperationFailure('更新知识条目', '[web-client-bridge] 更新知识条目失败:', error, 'knowledge.form.saveFailed');
+              logKnowledgeOperationFailure(i18n.t('bridge.action.updateKnowledgeItem'), '[web-client-bridge] 更新知识条目失败:', error, 'knowledge.form.saveFailed');
             });
           }
           return;
@@ -3804,9 +3829,9 @@ export function createWebClientBridge(): ClientBridge {
           if (knowledgeId) {
             void deleteAgentKnowledgeItem(knowledgeId).then(async () => {
               await emitKnowledgePayload();
-              emitBridgeSuccessToast('删除知识条目', '知识条目已删除');
+              emitBridgeSuccessToast(i18n.t('bridge.action.deleteKnowledgeItem'), i18n.t('bridge.detail.knowledgeItemDeleted'));
             }).catch((error) => {
-              logKnowledgeOperationFailure('删除知识条目', '[web-client-bridge] 删除知识条目失败:', error, 'knowledge.toast.deleteFailed');
+              logKnowledgeOperationFailure(i18n.t('bridge.action.deleteKnowledgeItem'), '[web-client-bridge] 删除知识条目失败:', error, 'knowledge.toast.deleteFailed');
             });
           }
           return;
@@ -3921,7 +3946,7 @@ export function createWebClientBridge(): ClientBridge {
     },
     notifyReady(): void {
       void restoreBridgeState('notify_ready').catch((error) => {
-        reportExpectedRecoveryFailure('入口初始化', '[web-client-bridge] Web 入口初始化失败:', error);
+        reportExpectedRecoveryFailure(i18n.t('bridge.action.initializeApp'), '[web-client-bridge] Web 入口初始化失败:', error);
         scheduleRecovery('notify_ready', error);
       });
     },
