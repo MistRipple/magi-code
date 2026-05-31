@@ -1862,14 +1862,16 @@ function createSettingsStore(props: { onClose?: () => void }) {
         try {
           const result = await getAgentMcpServerTools(serverId);
           const tools = ensureArray<any>((result as any)?.tools);
-          mcpServerTools = { ...mcpServerTools, [serverId]: tools };
+          const loaded = applyMcpToolsResult(serverId, result, tools);
           if ((result as any)?.servers) {
             applyMcpServersPayload((result as any).servers);
           }
-          notifySettingsSuccess(
-            i18n.t("settings.toast.mcpToolListLoaded"),
-            { displayMode: "notification_center" },
-          );
+          if (loaded) {
+            notifySettingsSuccess(
+              i18n.t("settings.toast.mcpToolListLoaded"),
+              { displayMode: "notification_center" },
+            );
+          }
         } catch (e) {
           console.error("[SettingsPanel] 获取 MCP 工具列表失败:", e);
           notifySettingsError(
@@ -1889,13 +1891,15 @@ function createSettingsStore(props: { onClose?: () => void }) {
     try {
       const result = await refreshAgentMcpTools(serverId);
       const tools = ensureArray<any>((result as any)?.tools);
-      mcpServerTools = { ...mcpServerTools, [serverId]: tools };
+      const refreshed = applyMcpToolsResult(serverId, result, tools);
       if ((result as any)?.servers) {
         applyMcpServersPayload((result as any).servers);
       }
-      notifySettingsSuccess(i18n.t("settings.toast.mcpToolsRefreshed"), {
-        displayMode: "notification_center",
-      });
+      if (refreshed) {
+        notifySettingsSuccess(i18n.t("settings.toast.mcpToolsRefreshed"), {
+          displayMode: "notification_center",
+        });
+      }
     } catch (e) {
       console.error("[SettingsPanel] 刷新 MCP 工具失败:", e);
       notifySettingsError(i18n.t("settings.toast.action.refreshMcpTools"), e);
@@ -1903,6 +1907,39 @@ function createSettingsStore(props: { onClose?: () => void }) {
     const newSet = new Set(mcpRefreshingServers);
     newSet.delete(serverId);
     mcpRefreshingServers = newSet;
+  }
+
+  function applyMcpToolsResult(
+    serverId: string,
+    result: Record<string, unknown>,
+    tools: any[],
+  ): boolean {
+    const unavailable = result?.connected === false;
+    const connectionFailed =
+      unavailable
+      && typeof result?.error === "string"
+      && result.error.trim().length > 0;
+    mcpServerTools = { ...mcpServerTools, [serverId]: unavailable ? [] : tools };
+    mcpServers = mcpServers.map((server) => {
+      if (server.id !== serverId) return server;
+      if (unavailable) {
+        return {
+          ...server,
+          connected: false,
+          health: "disconnected",
+          error: connectionFailed ? "connection_issue" : undefined,
+          toolCount: 0,
+        };
+      }
+      return {
+        ...server,
+        connected: true,
+        health: "connected",
+        error: undefined,
+        toolCount: tools.length,
+      };
+    });
+    return !unavailable;
   }
 
   function getMCPHealthLabel(server: MCPServer): string {

@@ -1104,6 +1104,10 @@ export interface McpServerIdRequestDto {
 
 export interface McpToolsResponseDto {
   tools: unknown[];
+  connected?: boolean;
+  health?: string;
+  error?: string;
+  serverId?: string;
 }
 
 export interface McpConnectResponseDto {

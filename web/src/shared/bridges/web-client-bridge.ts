@@ -2973,6 +2973,11 @@ async function deleteMcpServer(serverId: string): Promise<void> {
 async function getMcpServerTools(serverId: string): Promise<void> {
   const payload = await getAgentMcpServerTools(serverId);
   emitDataMessage('mcpServerTools', payload);
+  if (isMcpToolPayloadUnavailable(payload)) {
+    await dispatchSettingsBootstrap(true);
+    emitBridgeErrorToast(i18n.t('settings.toast.action.loadMcpToolList'), new Error('mcp_connection_failed'));
+    return;
+  }
   emitBridgeSuccessToast(
     i18n.t('settings.toast.action.loadMcpToolList'),
     i18n.t('settings.toast.mcpToolListLoaded'),
@@ -2984,11 +2989,19 @@ async function refreshMcpTools(serverId: string): Promise<void> {
   const payload = await refreshAgentMcpTools(serverId);
   emitDataMessage('mcpToolsRefreshed', payload);
   await dispatchSettingsBootstrap(true);
+  if (isMcpToolPayloadUnavailable(payload)) {
+    emitBridgeErrorToast(i18n.t('settings.toast.action.refreshMcpTools'), new Error('mcp_connection_failed'));
+    return;
+  }
   emitBridgeSuccessToast(
     i18n.t('settings.toast.action.refreshMcpTools'),
     i18n.t('settings.toast.mcpToolsRefreshed'),
     { displayMode: 'notification_center' },
   );
+}
+
+function isMcpToolPayloadUnavailable(payload: Record<string, unknown>): boolean {
+  return payload.connected === false;
 }
 
 async function connectMcpServer(serverId: string): Promise<void> {

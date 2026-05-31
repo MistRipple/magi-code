@@ -453,6 +453,24 @@ fn find_server_entry(state: &ApiState, server_id: &str) -> Option<serde_json::Va
         .find(|entry| mcp_server_entry_id(entry).is_some_and(|id| id == server_id))
 }
 
+fn remove_mcp_connection(state: &ApiState, server_id: &str) {
+    let mut pool = state
+        .mcp_connections()
+        .write()
+        .expect("mcp connections write lock poisoned");
+    pool.remove(server_id);
+}
+
+fn mcp_tools_unavailable_response(server_id: &str) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "tools": [],
+        "connected": false,
+        "health": "disconnected",
+        "error": "mcp_connection_failed",
+        "serverId": server_id,
+    }))
+}
+
 async fn connect_mcp_server(
     State(state): State<ApiState>,
     Json(request): Json<serde_json::Value>,
@@ -470,9 +488,14 @@ async fn connect_mcp_server(
         .ok_or_else(|| ApiError::InvalidInput("MCP server 配置中缺少 command".to_string()))?;
 
     let client = StdioMcpBridgeClient::new(config);
-    let tools = client
-        .list_tools()
-        .map_err(|e| ApiError::internal_assembly("连接 MCP server 失败", format!("{e:?}")))?;
+    let tools = client.list_tools().map_err(|err| {
+        tracing::warn!(
+            server_id = %server_id,
+            error = ?err,
+            "MCP server connect failed"
+        );
+        ApiError::InvalidInput("MCP server 连接失败".to_string())
+    })?;
 
     let client = Arc::new(client);
     {
@@ -538,9 +561,18 @@ async fn get_mcp_tools(
         })));
     };
 
-    let tools = client
-        .list_tools()
-        .map_err(|e| ApiError::internal_assembly("获取 MCP tools 失败", format!("{e:?}")))?;
+    let tools = match client.list_tools() {
+        Ok(tools) => tools,
+        Err(err) => {
+            tracing::warn!(
+                server_id = %server_id,
+                error = ?err,
+                "MCP tools fetch failed"
+            );
+            remove_mcp_connection(&state, server_id);
+            return Ok(mcp_tools_unavailable_response(server_id));
+        }
+    };
 
     Ok(Json(serde_json::json!({
         "tools": tools,
@@ -574,9 +606,18 @@ async fn refresh_mcp_tools(
         })));
     };
 
-    let tools = client
-        .list_tools()
-        .map_err(|e| ApiError::internal_assembly("刷新 MCP tools 失败", format!("{e:?}")))?;
+    let tools = match client.list_tools() {
+        Ok(tools) => tools,
+        Err(err) => {
+            tracing::warn!(
+                server_id = %server_id,
+                error = ?err,
+                "MCP tools refresh failed"
+            );
+            remove_mcp_connection(&state, server_id);
+            return Ok(mcp_tools_unavailable_response(server_id));
+        }
+    };
 
     Ok(Json(serde_json::json!({
         "tools": tools,
