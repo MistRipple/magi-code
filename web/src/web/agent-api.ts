@@ -4,6 +4,7 @@ import type { AgentBinding, ModelEngine } from '../shared/types/registry-types';
 import type { RoleTemplate } from '../shared/types/role-templates';
 import type {
   SettingsBootstrapPayload,
+  SettingsBuiltinTool,
   SettingsCapabilityDependency,
   SettingsRuntimeSnapshot,
 } from '../shared/settings-bootstrap';
@@ -99,7 +100,7 @@ export type AgentRuntimeSettings = SettingsRuntimeSnapshot;
 export type AgentSettingsBootstrapSnapshot = SettingsBootstrapPayload;
 
 export interface AgentToolCatalogDiagnosticsSnapshot {
-  builtinTools: unknown[];
+  builtinTools: SettingsBuiltinTool[];
   capabilityDependencies: SettingsCapabilityDependency[];
 }
 
@@ -146,6 +147,47 @@ function normalizeRequiredBy(value: unknown): string[] {
   return value
     .filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
     .map((item) => item.trim());
+}
+
+function readRecordField(record: Record<string, unknown>, camelKey: string, snakeKey: string): unknown {
+  return record[camelKey] ?? record[snakeKey];
+}
+
+function normalizeWarningMarkers(value: unknown, marker: string): string[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter((item) => typeof item === 'string' && item.trim().length > 0)
+    .map(() => marker);
+}
+
+function normalizeBuiltinTools(value: unknown): SettingsBuiltinTool[] {
+  if (!Array.isArray(value)) return [];
+  const tools: SettingsBuiltinTool[] = [];
+  for (const entry of value) {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
+    const record = entry as Record<string, unknown>;
+    const name = typeof record.name === 'string' ? record.name.trim() : '';
+    if (!name) continue;
+    const riskLevel = readRecordField(record, 'riskLevel', 'risk_level');
+    const approvalRequirement = readRecordField(record, 'approvalRequirement', 'approval_requirement');
+    const accessMode = readRecordField(record, 'accessMode', 'access_mode');
+    const runtimeStatus = readRecordField(record, 'runtimeStatus', 'runtime_status');
+    const runtimeWarnings = readRecordField(record, 'runtimeWarnings', 'runtime_warnings');
+    const schemaStatus = readRecordField(record, 'schemaStatus', 'schema_status');
+    const schemaWarnings = readRecordField(record, 'schemaWarnings', 'schema_warnings');
+    tools.push({
+      name,
+      riskLevel: typeof riskLevel === 'string' ? riskLevel : '',
+      approvalRequirement: typeof approvalRequirement === 'string' ? approvalRequirement : '',
+      accessMode: typeof accessMode === 'string' ? accessMode : 'read_only',
+      runtimeStatus: typeof runtimeStatus === 'string' ? runtimeStatus : 'ready',
+      runtimeWarnings: normalizeWarningMarkers(runtimeWarnings, 'runtime_warning'),
+      schemaStatus: typeof schemaStatus === 'string' ? schemaStatus : 'ok',
+      schemaWarnings: normalizeWarningMarkers(schemaWarnings, 'schema_warning'),
+      enabled: record.enabled !== false,
+    });
+  }
+  return tools;
 }
 
 function normalizeCapabilityDependencies(value: unknown): SettingsCapabilityDependency[] {
@@ -218,7 +260,7 @@ function normalizeSettingsBootstrapPayload(
     safeguardConfig: normalizeSettingsSectionConfig(payload.safeguardConfig ?? payload.safeguard),
     repositories: Array.isArray(payload.repositories) ? payload.repositories : [],
     mcpServers: Array.isArray(payload.mcpServers) ? payload.mcpServers : [],
-    builtinTools: Array.isArray(payload.builtinTools) ? payload.builtinTools : [],
+    builtinTools: normalizeBuiltinTools(payload.builtinTools),
     capabilityDependencies: normalizeCapabilityDependencies(payload.capabilityDependencies),
     workerStatuses: (
       payload.workerStatuses
@@ -1265,7 +1307,7 @@ export async function loadAgentToolCatalogDiagnostics(): Promise<AgentToolCatalo
     });
     const response = await getTransport().request(agentUrl('/api/tools/catalog', query));
     const payload = await parseAgentJson<Record<string, unknown>>(response, 'load tool catalog diagnostics');
-    const builtinTools = Array.isArray(payload.tools)
+    const rawBuiltinTools = Array.isArray(payload.tools)
       ? payload.tools.filter((tool) => {
           return Boolean(
             tool
@@ -1276,7 +1318,7 @@ export async function loadAgentToolCatalogDiagnostics(): Promise<AgentToolCatalo
         })
       : [];
     return {
-      builtinTools,
+      builtinTools: normalizeBuiltinTools(rawBuiltinTools),
       capabilityDependencies: normalizeCapabilityDependencies(
         payload.runtime_dependencies ?? payload.runtimeDependencies,
       ),

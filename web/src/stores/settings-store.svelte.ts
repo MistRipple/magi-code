@@ -2402,34 +2402,25 @@ function createSettingsStore(props: { onClose?: () => void }) {
   }
 
   function applyBuiltinToolsPayload(toolsPayload: unknown): void {
-    const readToolField = (tool: any, camelKey: string, snakeKey: string): unknown =>
-      tool?.[camelKey] ?? tool?.[snakeKey];
-    const normalizeWarningMarkers = (warnings: unknown, marker: string): string[] =>
-      ensureArray<unknown>(warnings)
-        .filter((warning) => typeof warning === "string" && warning.trim().length > 0)
-        .map(() => marker);
     builtinTools = ensureArray<any>(toolsPayload)
       .map((tool) => {
         const name = typeof tool?.name === "string" ? tool.name.trim() : "";
         if (!name) {
           return null;
         }
-        const riskLevel = readToolField(tool, "riskLevel", "risk_level");
-        const approvalRequirement = readToolField(tool, "approvalRequirement", "approval_requirement");
-        const accessMode = readToolField(tool, "accessMode", "access_mode");
-        const runtimeStatus = readToolField(tool, "runtimeStatus", "runtime_status");
-        const runtimeWarnings = readToolField(tool, "runtimeWarnings", "runtime_warnings");
-        const schemaStatus = readToolField(tool, "schemaStatus", "schema_status");
-        const schemaWarnings = readToolField(tool, "schemaWarnings", "schema_warnings");
+        const runtimeWarnings: string[] = ensureArray<string>(tool.runtimeWarnings)
+          .filter((warning) => warning === "runtime_warning");
+        const schemaWarnings: string[] = ensureArray<string>(tool.schemaWarnings)
+          .filter((warning) => warning === "schema_warning");
         return {
           name,
-          riskLevel: typeof riskLevel === "string" ? riskLevel : "",
-          approvalRequirement: typeof approvalRequirement === "string" ? approvalRequirement : "",
-          accessMode: typeof accessMode === "string" ? accessMode : "read_only",
-          runtimeStatus: typeof runtimeStatus === "string" ? runtimeStatus : "ready",
-          runtimeWarnings: normalizeWarningMarkers(runtimeWarnings, "runtime_warning"),
-          schemaStatus: typeof schemaStatus === "string" ? schemaStatus : "ok",
-          schemaWarnings: normalizeWarningMarkers(schemaWarnings, "schema_warning"),
+          riskLevel: typeof tool.riskLevel === "string" ? tool.riskLevel : "",
+          approvalRequirement: typeof tool.approvalRequirement === "string" ? tool.approvalRequirement : "",
+          accessMode: typeof tool.accessMode === "string" ? tool.accessMode : "read_only",
+          runtimeStatus: typeof tool.runtimeStatus === "string" ? tool.runtimeStatus : "ready",
+          runtimeWarnings,
+          schemaStatus: typeof tool.schemaStatus === "string" ? tool.schemaStatus : "ok",
+          schemaWarnings,
           enabled: tool?.enabled !== false,
         } satisfies BuiltinToolItem;
       })

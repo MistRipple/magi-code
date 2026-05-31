@@ -1383,11 +1383,14 @@ mod tests {
             serde_json::json!("unavailable"),
             "settings bootstrap must surface runtime health from tool_catalog"
         );
+        assert_eq!(
+            knowledge_query["runtimeWarnings"],
+            serde_json::json!(["runtime_warning"]),
+            "settings bootstrap should expose warning markers instead of raw runtime details"
+        );
         assert!(
-            knowledge_query["runtimeWarnings"]
-                .as_array()
-                .is_some_and(|warnings| !warnings.is_empty()),
-            "unavailable builtin tools should include actionable runtime warnings"
+            !knowledge_query.to_string().contains("知识检索能力暂不可用"),
+            "settings bootstrap should not expose raw runtime warning text"
         );
         let capability_dependencies = bootstrap["capabilityDependencies"]
             .as_array()

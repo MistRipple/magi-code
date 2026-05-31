@@ -1262,9 +1262,9 @@ impl ApiState {
                     "approvalRequirement": tool.get("approval_requirement").cloned().unwrap_or(serde_json::Value::String("none".to_string())),
                     "accessMode": tool.get("access_mode").cloned().unwrap_or(serde_json::Value::String("read_only".to_string())),
                     "runtimeStatus": tool.get("runtime_status").cloned().unwrap_or(serde_json::Value::String("ready".to_string())),
-                    "runtimeWarnings": tool.get("runtime_warnings").cloned().unwrap_or_else(|| serde_json::json!([])),
+                    "runtimeWarnings": warning_markers(tool, "runtime_warnings", "runtime_warning"),
                     "schemaStatus": tool.get("schema_status").cloned().unwrap_or(serde_json::Value::String("ok".to_string())),
-                    "schemaWarnings": tool.get("schema_warnings").cloned().unwrap_or_else(|| serde_json::json!([])),
+                    "schemaWarnings": warning_markers(tool, "schema_warnings", "schema_warning"),
                     "enabled": true,
                 })
             })
@@ -1605,6 +1605,32 @@ fn normalize_capability_dependency_json(raw: &serde_json::Value) -> serde_json::
         "readyCount": capability_dependency_field(raw, "readyCount", "ready_count"),
         "toolCount": capability_dependency_field(raw, "toolCount", "tool_count"),
     })
+}
+
+fn warning_markers(
+    raw: &serde_json::Value,
+    field: &str,
+    marker: &'static str,
+) -> serde_json::Value {
+    let count = raw
+        .get(field)
+        .and_then(serde_json::Value::as_array)
+        .map(|warnings| {
+            warnings
+                .iter()
+                .filter(|warning| {
+                    warning
+                        .as_str()
+                        .is_some_and(|value| !value.trim().is_empty())
+                })
+                .count()
+        })
+        .unwrap_or(0);
+    serde_json::Value::Array(
+        std::iter::repeat_with(|| serde_json::Value::String(marker.to_string()))
+            .take(count)
+            .collect(),
+    )
 }
 
 fn capability_dependency_field(
