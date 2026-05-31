@@ -723,6 +723,7 @@
   "settings.tools.dependency.workspaceCodeIndex": "本地索引",
   "settings.tools.dependency.agentRoleRegistry": "子代理",
   "settings.tools.dependency.fileSnapshot": "文件快照",
+  "settings.tools.dependency.contextRuntime": "上下文",
   "settings.tools.dependency.skillRuntime": "Skills",
   "settings.tools.dependency.mcpServers": "MCP",
   "settings.tools.dependency.status.available": "可用",

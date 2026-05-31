@@ -23,5 +23,5 @@ pub use routes::build_router;
 pub use settings_store::SettingsStore;
 pub use state::{
     ApiState, RunnerManager, RunnerStartError, RunnerStopError, RuntimeStatePersistence,
-    build_file_snapshot_capability_dependency_provider,
+    build_runtime_capability_dependency_provider,
 };

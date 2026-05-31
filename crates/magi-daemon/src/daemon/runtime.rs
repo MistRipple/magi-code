@@ -8,7 +8,7 @@ use super::{
 };
 use magi_api::{
     ApiError, ApiState, DirectHttpModelProbeConfig, RunnerManager, RuntimeStatePersistence,
-    SettingsStore, build_file_snapshot_capability_dependency_provider, build_router,
+    SettingsStore, build_router, build_runtime_capability_dependency_provider,
 };
 use magi_bridge_client::{
     BridgeDispatchRuntime, BridgeServerKind, BridgeTransport, HttpModelBridgeClient,
@@ -657,11 +657,21 @@ impl DaemonRuntime {
         let agent_role_catalog_provider =
             build_agent_role_catalog_provider(agent_role_registry.clone());
         let snapshot_manager = Arc::new(SnapshotManager::new());
-        let runtime_capability_dependency_provider =
-            build_file_snapshot_capability_dependency_provider(
-                snapshot_manager.clone(),
-                self.workspace_store.clone(),
-            );
+        let memory_store = MemoryStore::new();
+        let context_runtime = ContextRuntime::with_runtime_sources(
+            (*self.knowledge_store).clone(),
+            memory_store.clone(),
+            (*self.session_store).clone(),
+            SharedContextPool::default(),
+            FileSummaryStore::default(),
+            ProjectRecentTurnStore::default(),
+        );
+        let context_runtime_for_dispatcher = Arc::new(context_runtime.clone());
+        let runtime_capability_dependency_provider = build_runtime_capability_dependency_provider(
+            snapshot_manager.clone(),
+            self.workspace_store.clone(),
+            true,
+        );
         let mut tool_registry = ToolRegistry::new(self.governance.clone(), self.event_bus.clone())
             .with_knowledge_store(self.knowledge_store.clone())
             .with_external_tool_catalog_provider(external_tool_catalog_provider)
@@ -727,16 +737,6 @@ impl DaemonRuntime {
             });
         let skill_runtime = SkillDispatchRuntime::new(tool_registry.clone(), bridge_runtime);
         let worker_runtime = self.worker_runtime.clone();
-        let memory_store = MemoryStore::new();
-        let context_runtime = ContextRuntime::with_runtime_sources(
-            (*self.knowledge_store).clone(),
-            memory_store.clone(),
-            (*self.session_store).clone(),
-            SharedContextPool::default(),
-            FileSummaryStore::default(),
-            ProjectRecentTurnStore::default(),
-        );
-        let context_runtime_for_dispatcher = Arc::new(context_runtime.clone());
         let tool_registry_for_dispatcher = tool_registry.clone();
         let task_store_checkpoint_path = self.state_root.join("task-store.json");
         let event_bus_for_task_store = self.event_bus.clone();
@@ -1597,6 +1597,15 @@ mod tests {
             .expect("workspace_code_index dependency should be exposed");
         assert_eq!(workspace_code_index["workspace_id"], "test-workspace-001");
         assert_eq!(workspace_code_index["status"], "ready");
+        let context_runtime = catalog["runtime_dependencies"]
+            .as_array()
+            .expect("runtime dependencies should be an array")
+            .iter()
+            .find(|dependency| dependency["name"] == "context_runtime")
+            .expect("context_runtime dependency should be exposed");
+        assert_eq!(context_runtime["workspace_id"], "test-workspace-001");
+        assert_eq!(context_runtime["session_id"], "test-session-001");
+        assert_eq!(context_runtime["status"], "ready");
         let process_launch = catalog["tools"]
             .as_array()
             .expect("tools should be an array")

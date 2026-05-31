@@ -170,6 +170,8 @@
         return i18n.t('settings.tools.dependency.agentRoleRegistry');
       case 'file_snapshot':
         return i18n.t('settings.tools.dependency.fileSnapshot');
+      case 'context_runtime':
+        return i18n.t('settings.tools.dependency.contextRuntime');
       case 'skill_runtime':
         return i18n.t('settings.tools.dependency.skillRuntime');
       case 'mcp_servers':
@@ -221,6 +223,8 @@
         return 'bot';
       case 'file_snapshot':
         return 'file';
+      case 'context_runtime':
+        return 'brain';
       case 'skill_runtime':
         return 'skill';
       case 'mcp_servers':

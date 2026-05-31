@@ -1184,11 +1184,13 @@ mod tests {
         let event_bus = Arc::new(InMemoryEventBus::new(32));
         let governance = Arc::new(GovernanceService::default());
         let workspace_store = Arc::new(WorkspaceStore::default());
+        let session_store = Arc::new(SessionStore::default());
         let snapshot_manager = Arc::new(SnapshotManager::new());
         let runtime_capability_dependency_provider =
-            crate::state::build_file_snapshot_capability_dependency_provider(
+            crate::state::build_runtime_capability_dependency_provider(
                 snapshot_manager.clone(),
                 workspace_store.clone(),
+                true,
             );
         let mut tool_registry = ToolRegistry::new(Arc::clone(&governance), Arc::clone(&event_bus))
             .with_runtime_capability_dependency_provider(runtime_capability_dependency_provider);
@@ -1196,7 +1198,7 @@ mod tests {
         ApiState::new(
             "magi-test",
             event_bus,
-            Arc::new(SessionStore::default()),
+            session_store,
             workspace_store,
             governance,
         )
@@ -1390,7 +1392,7 @@ mod tests {
         let capability_dependencies = bootstrap["capabilityDependencies"]
             .as_array()
             .expect("capability dependencies should be an array");
-        assert_eq!(capability_dependencies.len(), 6);
+        assert_eq!(capability_dependencies.len(), 7);
         assert_eq!(
             capability_dependencies[0]["name"],
             serde_json::json!("knowledge_store")
@@ -1445,15 +1447,27 @@ mod tests {
         );
         assert_eq!(
             capability_dependencies[5]["name"],
-            serde_json::json!("file_snapshot")
+            serde_json::json!("context_runtime")
         );
         assert_eq!(
             capability_dependencies[5]["status"],
+            serde_json::json!("ready")
+        );
+        assert_eq!(
+            capability_dependencies[5]["sessionId"],
+            serde_json::json!("session-empty-contract")
+        );
+        assert_eq!(
+            capability_dependencies[6]["name"],
+            serde_json::json!("file_snapshot")
+        );
+        assert_eq!(
+            capability_dependencies[6]["status"],
             serde_json::json!("not_ready"),
             "snapshot dependency should be visible even before the lazy snapshot session starts"
         );
         assert_eq!(
-            capability_dependencies[5]["sessionId"],
+            capability_dependencies[6]["sessionId"],
             serde_json::json!("session-empty-contract")
         );
         assert!(

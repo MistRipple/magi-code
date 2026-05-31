@@ -723,6 +723,7 @@
   "settings.tools.dependency.workspaceCodeIndex": "Local Index",
   "settings.tools.dependency.agentRoleRegistry": "Subagents",
   "settings.tools.dependency.fileSnapshot": "File Snapshots",
+  "settings.tools.dependency.contextRuntime": "Context",
   "settings.tools.dependency.skillRuntime": "Skills",
   "settings.tools.dependency.mcpServers": "MCP",
   "settings.tools.dependency.status.available": "Available",

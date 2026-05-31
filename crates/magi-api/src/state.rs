@@ -617,17 +617,57 @@ fn temp_path_for(path: &Path) -> PathBuf {
     path.with_file_name(file_name)
 }
 
-pub fn build_file_snapshot_capability_dependency_provider(
+pub fn build_runtime_capability_dependency_provider(
     snapshot_manager: Arc<SnapshotManager>,
     workspace_registry: Arc<WorkspaceStore>,
+    context_runtime_available: bool,
 ) -> RuntimeCapabilityDependencyProvider {
     Arc::new(move |context| {
-        vec![file_snapshot_capability_dependency(
-            snapshot_manager.as_ref(),
-            workspace_registry.as_ref(),
-            context,
-        )]
+        vec![
+            context_runtime_capability_dependency(context, context_runtime_available),
+            file_snapshot_capability_dependency(
+                snapshot_manager.as_ref(),
+                workspace_registry.as_ref(),
+                context,
+            ),
+        ]
     })
+}
+
+fn context_runtime_capability_dependency(
+    context: &ToolExecutionContext,
+    context_runtime_available: bool,
+) -> RuntimeCapabilityDependencyEntry {
+    let session_id = context.session_id.as_ref().map(ToString::to_string);
+    let workspace_id = context.workspace_id.as_ref().map(ToString::to_string);
+    let status = if !context_runtime_available {
+        "unavailable"
+    } else if session_id.is_none() || workspace_id.is_none() {
+        "missing_context"
+    } else {
+        "ready"
+    };
+
+    RuntimeCapabilityDependencyEntry {
+        name: "context_runtime".to_string(),
+        status: status.to_string(),
+        required_by: vec![
+            "task_execution".to_string(),
+            "conversation_context".to_string(),
+            "knowledge_memory_selection".to_string(),
+        ],
+        workspace_id,
+        session_id,
+        file_count: None,
+        last_indexed: None,
+        role_count: None,
+        spawnable_role_count: None,
+        snapshot_active: None,
+        configured_count: None,
+        enabled_count: None,
+        ready_count: None,
+        tool_count: None,
+    }
 }
 
 fn file_snapshot_capability_dependency(
