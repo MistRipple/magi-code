@@ -1463,7 +1463,6 @@ mod tests {
     use tower::util::ServiceExt;
 
     const BACKGROUND_TEST_TIMEOUT: Duration = Duration::from_secs(30);
-
     fn temp_state_root(name: &str) -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!(
             "magi-daemon-runtime-test-{name}-{}",
@@ -1699,10 +1698,17 @@ mod tests {
         .expect("response should be valid json")
     }
 
-    async fn get_task_projection(app: axum::Router, root_task_id: &str, session_id: &str) -> Value {
+    async fn get_task_projection(
+        app: axum::Router,
+        root_task_id: &str,
+        session_id: &str,
+        workspace_id: &str,
+    ) -> Value {
         get_json(
             app,
-            &format!("/api/tasks/projection/{root_task_id}?sessionId={session_id}"),
+            &format!(
+                "/api/tasks/projection/{root_task_id}?workspaceId={workspace_id}&sessionId={session_id}"
+            ),
         )
         .await
     }
@@ -1711,10 +1717,12 @@ mod tests {
         app: axum::Router,
         root_task_id: &str,
         session_id: &str,
+        workspace_id: &str,
     ) -> Value {
         let deadline = Instant::now() + BACKGROUND_TEST_TIMEOUT;
         loop {
-            let projection = get_task_projection(app.clone(), root_task_id, session_id).await;
+            let projection =
+                get_task_projection(app.clone(), root_task_id, session_id, workspace_id).await;
             let total_tasks = projection["progress_summary"]["total_tasks"]
                 .as_u64()
                 .unwrap_or(0);
@@ -1952,6 +1960,7 @@ mod tests {
                 "text": "remember parser constraint",
                 "skillName": "refactor",
                 "images": [],
+                "workspaceId": active_workspace_id.to_string(),
             }),
         )
         .await;
@@ -1979,9 +1988,13 @@ mod tests {
                 .len(),
             0
         );
-        let first_projection =
-            wait_for_task_projection_completed(app.clone(), first_root_task_id, "test-session-001")
-                .await;
+        let first_projection = wait_for_task_projection_completed(
+            app.clone(),
+            first_root_task_id,
+            "test-session-001",
+            active_workspace_id.as_str(),
+        )
+        .await;
         assert_completed_two_task_projection(&first_projection);
 
         let (status, second_body) = post_json(
@@ -1992,6 +2005,7 @@ mod tests {
                 "text": "follow up parser work",
                 "skillName": "refactor",
                 "images": [],
+                "workspaceId": active_workspace_id.to_string(),
             }),
         )
         .await;
@@ -2018,8 +2032,13 @@ mod tests {
             second_execution_group["context_memory_extraction_refs"],
             json!([expected_extraction_id])
         );
-        let second_projection =
-            wait_for_task_projection_completed(app, second_root_task_id, "test-session-001").await;
+        let second_projection = wait_for_task_projection_completed(
+            app,
+            second_root_task_id,
+            "test-session-001",
+            active_workspace_id.as_str(),
+        )
+        .await;
         assert_completed_two_task_projection(&second_projection);
     }
 
@@ -2052,6 +2071,7 @@ mod tests {
                 "text": "这是一条普通对话",
                 "skillName": null,
                 "images": [],
+                "workspaceId": active_workspace_id.to_string(),
             }),
         )
         .await;
@@ -2134,6 +2154,7 @@ mod tests {
                 "text": "seed recovery route state",
                 "skillName": "refactor",
                 "images": [],
+                "workspaceId": active_workspace_id.to_string(),
             }),
         )
         .await;
@@ -2176,7 +2197,7 @@ mod tests {
             "Daemon recovery snapshot",
         );
         let recovery = runtime.workspace_store.prepare_recovery_entry(
-            workspace_id,
+            workspace_id.clone(),
             ownership,
             snapshot.snapshot_id,
             "recovery-daemon-route",
@@ -2196,6 +2217,7 @@ mod tests {
             "/api/session/continue",
             json!({
                 "sessionId": session_id.to_string(),
+                "workspaceId": workspace_id.to_string(),
             }),
         )
         .await;
@@ -2215,6 +2237,7 @@ mod tests {
                 "text": "consume recovery memory",
                 "skillName": "refactor",
                 "images": [],
+                "workspaceId": workspace_id.to_string(),
             }),
         )
         .await;

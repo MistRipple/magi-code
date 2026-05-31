@@ -34,6 +34,7 @@ use tokio::time::{Duration, Instant};
 use tower::util::ServiceExt;
 
 const BACKGROUND_TASK_PROJECTION_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_TEST_WORKSPACE_ID: &str = "test-workspace-001";
 
 fn temp_state_root(name: &str) -> PathBuf {
     let root = std::env::temp_dir().join(format!("magi-daemon-test-{name}-{}", UtcMillis::now().0));
@@ -139,10 +140,17 @@ fn event_payload_contains_request_id(event: &EventEnvelope, request_id: &str) ->
     event.payload.to_string().contains(request_id)
 }
 
-async fn get_task_projection(app: axum::Router, root_task_id: &str, session_id: &str) -> Value {
+async fn get_task_projection(
+    app: axum::Router,
+    root_task_id: &str,
+    session_id: &str,
+    workspace_id: &str,
+) -> Value {
     get_json(
         app,
-        &format!("/api/tasks/projection/{root_task_id}?sessionId={session_id}"),
+        &format!(
+            "/api/tasks/projection/{root_task_id}?workspaceId={workspace_id}&sessionId={session_id}"
+        ),
     )
     .await
 }
@@ -151,10 +159,12 @@ async fn wait_for_task_projection_completed(
     app: axum::Router,
     root_task_id: &str,
     session_id: &str,
+    workspace_id: &str,
 ) -> Value {
     let deadline = Instant::now() + BACKGROUND_TASK_PROJECTION_TIMEOUT;
     loop {
-        let projection = get_task_projection(app.clone(), root_task_id, session_id).await;
+        let projection =
+            get_task_projection(app.clone(), root_task_id, session_id, workspace_id).await;
         let total_tasks = projection["progress_summary"]["total_tasks"]
             .as_u64()
             .unwrap_or(0);
@@ -806,16 +816,20 @@ async fn daemon_runtime_recovery_preflight_executes_and_followup_router_dispatch
     let execution_chain_ref = "chain-router-recovery".to_string();
 
     state
-        .session_store
-        .create_session(session_id.clone(), "router recovery session")
-        .expect("session should be creatable");
-    state
         .workspace_registry
         .register(
             workspace_id.clone(),
             temp_workspace_absolute_path("router-recovery-workspace"),
         )
         .expect("workspace should be registrable");
+    state
+        .session_store
+        .create_session_for_workspace(
+            session_id.clone(),
+            "router recovery session".to_string(),
+            Some(workspace_id.to_string()),
+        )
+        .expect("session should be creatable");
     state.session_store.bind_execution_ownership(
         session_id.clone(),
         ExecutionOwnership {
@@ -946,6 +960,7 @@ async fn daemon_runtime_recovery_preflight_executes_and_followup_router_dispatch
         "/api/session/continue",
         json!({
             "sessionId": session_id.to_string(),
+            "workspaceId": workspace_id.to_string(),
         }),
     )
     .await;
@@ -1020,6 +1035,7 @@ async fn daemon_runtime_recovery_preflight_executes_and_followup_router_dispatch
             "text": "follow up recovery task",
             "skill_name": "resume",
             "images": [],
+            "workspace_id": workspace_id.to_string(),
         }),
     )
     .await;
@@ -1063,8 +1079,13 @@ async fn daemon_runtime_recovery_preflight_executes_and_followup_router_dispatch
             .iter()
             .any(|value| value == &expected_extraction_id)
     );
-    let followup_projection =
-        wait_for_task_projection_completed(app, followup_root_task_id, session_id.as_str()).await;
+    let followup_projection = wait_for_task_projection_completed(
+        app,
+        followup_root_task_id,
+        session_id.as_str(),
+        workspace_id.as_str(),
+    )
+    .await;
     assert_completed_two_task_projection(&followup_projection);
 }
 
@@ -1097,6 +1118,7 @@ async fn daemon_bootstrap_exports_session_action_context_summary_after_followup_
             "text": "Route parser refresh",
             "skill_name": "refactor",
             "images": [],
+            "workspace_id": active_workspace_id.to_string(),
         }),
     )
     .await;
@@ -1113,9 +1135,13 @@ async fn daemon_bootstrap_exports_session_action_context_summary_after_followup_
     let first_root_task_id = first_body["rootTaskId"]
         .as_str()
         .expect("root_task_id should serialize as string");
-    let first_projection =
-        wait_for_task_projection_completed(app.clone(), first_root_task_id, session_id.as_str())
-            .await;
+    let first_projection = wait_for_task_projection_completed(
+        app.clone(),
+        first_root_task_id,
+        session_id.as_str(),
+        active_workspace_id.as_str(),
+    )
+    .await;
     assert_completed_two_task_projection(&first_projection);
 
     let (status, second_body) = post_json(
@@ -1126,6 +1152,7 @@ async fn daemon_bootstrap_exports_session_action_context_summary_after_followup_
             "text": "Route parser refresh followup",
             "skill_name": "refactor",
             "images": [],
+            "workspace_id": active_workspace_id.to_string(),
         }),
     )
     .await;
@@ -1152,9 +1179,13 @@ async fn daemon_bootstrap_exports_session_action_context_summary_after_followup_
         second_execution_group["context_memory_extraction_refs"],
         json!([expected_extraction_id])
     );
-    let second_projection =
-        wait_for_task_projection_completed(app.clone(), second_root_task_id, session_id.as_str())
-            .await;
+    let second_projection = wait_for_task_projection_completed(
+        app.clone(),
+        second_root_task_id,
+        session_id.as_str(),
+        active_workspace_id.as_str(),
+    )
+    .await;
     assert_completed_two_task_projection(&second_projection);
     let bootstrap = get_json(app.clone(), "/bootstrap").await;
     let bootstrap_execution_group = bootstrap["runtimeReadModel"]["details"]["execution_groups"]
@@ -1204,6 +1235,7 @@ async fn daemon_bootstrap_exports_recovery_context_after_resume_and_followup_dis
             "text": "seed bootstrap recovery state",
             "skill_name": "resume",
             "images": [],
+            "workspace_id": active_workspace_id.to_string(),
         }),
     )
     .await;
@@ -1245,7 +1277,7 @@ async fn daemon_bootstrap_exports_recovery_context_after_resume_and_followup_dis
         "Bootstrap recovery snapshot",
     );
     let recovery = state.workspace_registry.prepare_recovery_entry(
-        workspace_id,
+        workspace_id.clone(),
         ownership,
         snapshot.snapshot_id,
         "recovery-bootstrap-route",
@@ -1265,6 +1297,7 @@ async fn daemon_bootstrap_exports_recovery_context_after_resume_and_followup_dis
         "/api/session/continue",
         json!({
             "sessionId": session_id.to_string(),
+            "workspaceId": workspace_id.to_string(),
         }),
     )
     .await;
@@ -1276,9 +1309,13 @@ async fn daemon_bootstrap_exports_recovery_context_after_resume_and_followup_dis
     assert_eq!(recovery_body["sessionId"], session_id.to_string());
 
     let expected_extraction_id = "extract-session-continue-recovery-bootstrap-route";
-    let seed_projection =
-        wait_for_task_projection_completed(app.clone(), &seed_root_task_id, session_id.as_str())
-            .await;
+    let seed_projection = wait_for_task_projection_completed(
+        app.clone(),
+        &seed_root_task_id,
+        session_id.as_str(),
+        workspace_id.as_str(),
+    )
+    .await;
     assert_completed_two_task_projection(&seed_projection);
     let after_resume_read_model = get_json(app.clone(), "/runtime/read-model").await;
     let after_resume_bootstrap = get_json(app.clone(), "/bootstrap").await;
@@ -1314,6 +1351,7 @@ async fn daemon_bootstrap_exports_recovery_context_after_resume_and_followup_dis
             "text": "consume resumed bootstrap memory",
             "skill_name": "resume",
             "images": [],
+            "workspace_id": workspace_id.to_string(),
         }),
     )
     .await;
@@ -1352,9 +1390,13 @@ async fn daemon_bootstrap_exports_recovery_context_after_resume_and_followup_dis
             .any(|value| value == expected_extraction_id),
         "bootstrap followup execution group should include recovery extraction ref, got {extraction_refs:?}"
     );
-    let followup_projection =
-        wait_for_task_projection_completed(app.clone(), followup_root_task_id, session_id.as_str())
-            .await;
+    let followup_projection = wait_for_task_projection_completed(
+        app.clone(),
+        followup_root_task_id,
+        session_id.as_str(),
+        workspace_id.as_str(),
+    )
+    .await;
     assert_completed_two_task_projection(&followup_projection);
     let bootstrap = get_json(app.clone(), "/bootstrap").await;
     let bootstrap_execution_group = bootstrap["runtimeReadModel"]["details"]["execution_groups"]
@@ -2316,7 +2358,7 @@ async fn session_turn_live_events_reach_multiple_subscribers() {
         "/api/session/turn",
         json!({
             "text": "multi subscriber live event",
-            "workspace_id": "test-workspace-001",
+            "workspace_id": DEFAULT_TEST_WORKSPACE_ID,
             "request_id": "request-multi-subscriber-live",
             "user_message_id": "user-multi-subscriber-live",
             "placeholder_message_id": "placeholder-multi-subscriber-live",
@@ -2634,13 +2676,18 @@ async fn session_action_happy_path_creates_tasks_and_records_timeline_messages()
     let root_task_id = body["rootTaskId"]
         .as_str()
         .expect("root_task_id should serialize as string");
-    let projection =
-        wait_for_task_projection_completed(app.clone(), root_task_id, session_id).await;
+    let projection = wait_for_task_projection_completed(
+        app.clone(),
+        root_task_id,
+        session_id,
+        DEFAULT_TEST_WORKSPACE_ID,
+    )
+    .await;
     assert_completed_two_task_projection(&projection);
 
     let messages_page = get_json(
         app.clone(),
-        &format!("/api/messages?sessionId={session_id}"),
+        &format!("/api/messages?workspaceId={DEFAULT_TEST_WORKSPACE_ID}&sessionId={session_id}"),
     )
     .await;
     let timeline = messages_page["timeline"]
@@ -2705,7 +2752,7 @@ async fn session_action_messages_survive_runtime_restart_and_preserve_message_co
             "text": "Restart persistence verification",
             "skill_name": "code",
             "images": [],
-            "workspace_id": "test-workspace-001",
+            "workspace_id": DEFAULT_TEST_WORKSPACE_ID,
         }),
     )
     .await;
@@ -2721,7 +2768,7 @@ async fn session_action_messages_survive_runtime_restart_and_preserve_message_co
 
     let before_restart_messages = get_json(
         app.clone(),
-        &format!("/api/messages?sessionId={session_id}"),
+        &format!("/api/messages?workspaceId={DEFAULT_TEST_WORKSPACE_ID}&sessionId={session_id}"),
     )
     .await;
     assert_eq!(
@@ -2745,7 +2792,7 @@ async fn session_action_messages_survive_runtime_restart_and_preserve_message_co
 
     let after_restart_messages = get_json(
         restarted_app.clone(),
-        &format!("/api/messages?sessionId={session_id}"),
+        &format!("/api/messages?workspaceId={DEFAULT_TEST_WORKSPACE_ID}&sessionId={session_id}"),
     )
     .await;
     assert_eq!(
@@ -2901,6 +2948,7 @@ async fn session_continue_survives_runtime_restart_with_same_chain_and_worker_br
             "text": "Restart continue verification",
             "skill_name": "refactor",
             "images": [],
+            "workspace_id": DEFAULT_TEST_WORKSPACE_ID,
         }),
     )
     .await;
@@ -3211,6 +3259,7 @@ async fn session_continue_survives_runtime_restart_with_same_chain_and_worker_br
         "/api/session/continue",
         json!({
             "sessionId": session_id_text,
+            "workspaceId": DEFAULT_TEST_WORKSPACE_ID,
         }),
     )
     .await;
@@ -3306,8 +3355,8 @@ async fn session_continue_survives_runtime_restart_with_same_chain_and_worker_br
 }
 
 #[tokio::test]
-async fn unbound_session_continue_survives_runtime_restart() {
-    let state_root = temp_state_root("e2e-unbound-session-continue-restart");
+async fn workspace_bound_session_continue_survives_runtime_restart() {
+    let state_root = temp_state_root("e2e-workspace-bound-session-continue-restart");
     let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root.clone());
     let repository = StateRepository::new(state_root.clone());
 
@@ -3315,21 +3364,22 @@ async fn unbound_session_continue_survives_runtime_restart() {
         .expect("first runtime restore should bootstrap empty state");
     let (app, state) = runtime.router_with_state_for_tests("daemon-test".to_string());
 
-    // 不预先创建 session：直接发 turn，让 dispatch 自己开新 unbound session（不绑 workspace）。
+    // 不预先创建 session：直接发 turn，让 dispatch 在显式 workspace 下创建会话。
     let (action_status, action_body) = post_json(
         app.clone(),
         "/api/session/turn",
         json!({
-            "text": "Unbound session restart verification",
+            "text": "Workspace-bound session restart verification",
             "skill_name": "refactor",
             "images": [],
+            "workspace_id": DEFAULT_TEST_WORKSPACE_ID,
         }),
     )
     .await;
     assert_eq!(
         action_status,
         StatusCode::OK,
-        "session action on unbound session should succeed: {action_body:?}"
+        "session action on workspace-bound session should succeed: {action_body:?}"
     );
     let session_id_text = action_body["sessionId"]
         .as_str()
@@ -3340,7 +3390,7 @@ async fn unbound_session_continue_survives_runtime_restart() {
     let chain = state
         .session_store
         .active_execution_chain(&session_id)
-        .expect("dispatch should create active execution chain for unbound session");
+        .expect("dispatch should create active execution chain for workspace-bound session");
     let mission_id = chain.mission_id.clone();
     let root_task_id = chain.root_task_id.clone();
     let execution_chain_ref = chain.execution_chain_ref.clone();
@@ -3357,7 +3407,7 @@ async fn unbound_session_continue_survives_runtime_restart() {
 
     state
         .persist_session_durable_state()
-        .expect("unbound session durable state should persist globally");
+        .expect("workspace-bound session durable state should persist");
     task_store
         .checkpoint_to_file(&state_root.join("task-store.json"))
         .expect("task store checkpoint should persist");
@@ -3386,23 +3436,33 @@ async fn unbound_session_continue_survives_runtime_restart() {
         "session sidecar must be persisted even when checkpoint already flushed before explicit flush"
     );
 
+    let workspace_session_state = repository
+        .load_workspace_session_state(&config.bootstrap_workspace_root)
+        .expect("workspace session durable state should reload");
+    assert!(
+        workspace_session_state.sessions.iter().any(|session| {
+            session.session_id == session_id
+                && session.workspace_id.as_deref() == Some(DEFAULT_TEST_WORKSPACE_ID)
+        }),
+        "workspace-bound session must persist under workspace sessions.json"
+    );
     let global_session_state = repository
         .load_session_durable_state()
         .expect("global session durable state should reload");
     assert!(
-        global_session_state
+        !global_session_state
             .sessions
             .iter()
-            .any(|session| session.session_id == session_id && session.workspace_id.is_none()),
-        "unbound session must persist into global sessions.json"
+            .any(|session| session.session_id == session_id),
+        "workspace-bound session must not remain in global sessions.json"
     );
 
     drop(app);
     drop(state);
     drop(runtime);
 
-    let restarted_runtime =
-        DaemonRuntime::restore(&config).expect("restart should recover unbound session state");
+    let restarted_runtime = DaemonRuntime::restore(&config)
+        .expect("restart should recover workspace-bound session state");
     let (restarted_app, restarted_state) =
         restarted_runtime.router_with_state_for_tests("daemon-test".to_string());
 
@@ -3416,7 +3476,7 @@ async fn unbound_session_continue_survives_runtime_restart() {
         .expect("session summaries should be an array")
         .iter()
         .find(|entry| entry["session_id"] == session_id_text)
-        .expect("restarted runtime should still export unbound session summary");
+        .expect("restarted runtime should still export workspace-bound session summary");
     assert_eq!(session_summary["mission_id"], mission_id.to_string());
     assert_eq!(session_summary["root_task_id"], root_task_id.to_string());
     assert_eq!(session_summary["execution_chain_ref"], execution_chain_ref);
@@ -3430,13 +3490,14 @@ async fn unbound_session_continue_survives_runtime_restart() {
         "/api/session/continue",
         json!({
             "sessionId": session_id_text,
+            "workspaceId": DEFAULT_TEST_WORKSPACE_ID,
         }),
     )
     .await;
     assert_eq!(
         continue_status,
         StatusCode::OK,
-        "restarted unbound session continue should succeed: {continue_body:?}"
+        "restarted workspace-bound session continue should succeed: {continue_body:?}"
     );
     assert_eq!(continue_body["missionId"], mission_id.to_string());
     assert_eq!(continue_body["rootTaskId"], root_task_id.to_string());
@@ -3475,6 +3536,7 @@ async fn session_action_publishes_domain_event_on_event_bus() {
             "text": "event bus test",
             "skill_name": "code",
             "images": [],
+            "workspace_id": active_workspace_id.to_string(),
         }),
     )
     .await;
@@ -3525,6 +3587,7 @@ async fn sequential_session_actions_share_session_and_accumulate_messages() {
             "text": "first action",
             "skill_name": "refactor",
             "images": [],
+            "workspace_id": DEFAULT_TEST_WORKSPACE_ID,
         }),
     )
     .await;
@@ -3535,8 +3598,13 @@ async fn sequential_session_actions_share_session_and_accumulate_messages() {
         .as_str()
         .expect("first root task id should serialize as string")
         .to_string();
-    let first_projection =
-        wait_for_task_projection_completed(app.clone(), &first_root_task_id, &session_id).await;
+    let first_projection = wait_for_task_projection_completed(
+        app.clone(),
+        &first_root_task_id,
+        &session_id,
+        DEFAULT_TEST_WORKSPACE_ID,
+    )
+    .await;
     assert_completed_two_task_projection(&first_projection);
 
     let (status, second_body) = post_json(
@@ -3547,6 +3615,7 @@ async fn sequential_session_actions_share_session_and_accumulate_messages() {
             "text": "second action",
             "skill_name": "refactor",
             "images": [],
+            "workspace_id": DEFAULT_TEST_WORKSPACE_ID,
         }),
     )
     .await;
@@ -3556,13 +3625,18 @@ async fn sequential_session_actions_share_session_and_accumulate_messages() {
         .as_str()
         .expect("second root task id should serialize as string")
         .to_string();
-    let second_projection =
-        wait_for_task_projection_completed(app.clone(), &second_root_task_id, &session_id).await;
+    let second_projection = wait_for_task_projection_completed(
+        app.clone(),
+        &second_root_task_id,
+        &session_id,
+        DEFAULT_TEST_WORKSPACE_ID,
+    )
+    .await;
     assert_completed_two_task_projection(&second_projection);
 
     let messages_page = get_json(
         app.clone(),
-        &format!("/api/messages?sessionId={session_id}"),
+        &format!("/api/messages?workspaceId={DEFAULT_TEST_WORKSPACE_ID}&sessionId={session_id}"),
     )
     .await;
     let timeline = messages_page["timeline"]
