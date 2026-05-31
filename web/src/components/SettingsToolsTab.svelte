@@ -83,11 +83,9 @@
   }
 
   function formatBuiltinToolFallbackLabel(name: string): string {
-    const parts = name.split('_').map((part) => part.trim()).filter(Boolean);
-    if (parts.length === 0) return name;
-    return parts
-      .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
-      .join(' ');
+    return name.trim()
+      ? i18n.t('settings.tools.builtin.unknown')
+      : i18n.t('settings.tools.unknown');
   }
 
   function getBuiltinToolLabel(name: string): string {
@@ -492,7 +490,7 @@
                         </div>
                         <div class="identity-stack">
                           <span class="main-label">{getBuiltinToolLabel(tool.name)}</span>
-                          <span class="tool-code">{tool.name}</span>
+                          <span class="tool-code">{i18n.t('settings.tools.builtin.localCapability')}</span>
                         </div>
                       </div>
                       <div class="builtin-tool-badges">

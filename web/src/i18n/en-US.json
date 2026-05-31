@@ -684,6 +684,8 @@
   "settings.tools.builtinTools": "Built-in Tools",
   "settings.tools.builtinDesc": "Built-in local tool capabilities with availability based on the current workspace state",
   "settings.tools.builtinCount": "{ready}/{total} ready",
+  "settings.tools.builtin.localCapability": "Built-in local capability",
+  "settings.tools.builtin.unknown": "Unknown built-in capability",
   "settings.tools.builtin.fileRead": "Read File",
   "settings.tools.builtin.viewImage": "View Image",
   "settings.tools.builtin.fileWrite": "Write File",
