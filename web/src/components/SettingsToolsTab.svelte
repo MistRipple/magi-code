@@ -156,7 +156,7 @@
   }): string {
     const parts = [getBuiltinToolRuntimeLabel(tool.runtimeStatus)];
     if (tool.runtimeWarnings.length > 0) parts.push(...tool.runtimeWarnings);
-    if (tool.schemaWarnings.length > 0) parts.push(...tool.schemaWarnings);
+    if (tool.schemaWarnings.length > 0) parts.push(i18n.t('settings.tools.schemaWarning'));
     return parts.join('\n');
   }
 

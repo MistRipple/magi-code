@@ -714,6 +714,7 @@
   "settings.tools.runtimeNotReady": "未就绪",
   "settings.tools.runtimeMissingContext": "缺少上下文",
   "settings.tools.runtimeUnavailable": "不可用",
+  "settings.tools.schemaWarning": "工具定义需更新",
   "settings.tools.riskLow": "低风险",
   "settings.tools.riskMedium": "中风险",
   "settings.tools.riskHigh": "高风险",

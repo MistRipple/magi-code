@@ -714,6 +714,7 @@
   "settings.tools.runtimeNotReady": "Not Ready",
   "settings.tools.runtimeMissingContext": "Missing Context",
   "settings.tools.runtimeUnavailable": "Unavailable",
+  "settings.tools.schemaWarning": "Tool definition needs an update",
   "settings.tools.riskLow": "Low risk",
   "settings.tools.riskMedium": "Medium risk",
   "settings.tools.riskHigh": "High risk",
