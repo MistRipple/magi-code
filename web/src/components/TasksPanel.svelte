@@ -1184,10 +1184,10 @@
               <span>{i18n.t('tasks.detail.executor', { executor: selectedProjectionExecutorDisplayName })}</span>
             {/if}
             {#if selectedProjectionTask.workspace_scope}
-              <span>{i18n.t('tasks.detail.workspace', { workspace: selectedProjectionTask.workspace_scope })}</span>
+              <span>{i18n.t('tasks.detail.workspaceScoped')}</span>
             {/if}
             {#if selectedProjectionTask.write_scope}
-              <span>{i18n.t('tasks.detail.writeScope', { scope: selectedProjectionTask.write_scope })}</span>
+              <span>{i18n.t('tasks.detail.writeScopeLimited')}</span>
             {/if}
             {#if selectedProjectionTask.retry_count > 0}
               <span>{i18n.t('tasks.detail.retryCount', { count: selectedProjectionTask.retry_count })}</span>
