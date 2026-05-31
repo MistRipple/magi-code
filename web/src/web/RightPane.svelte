@@ -114,8 +114,8 @@
         });
         fetchedContents = { ...fetchedContents, [cacheKey]: payload.content || '' };
       } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        fetchErrors = { ...fetchErrors, [cacheKey]: message };
+        console.warn('[RightPane] file preview load failed:', error);
+        fetchErrors = { ...fetchErrors, [cacheKey]: i18n.t('web.filePreviewError') };
       } finally {
         fetchingFlags = { ...fetchingFlags, [cacheKey]: false };
       }
@@ -591,7 +591,7 @@
       <div class="right-pane-state">{i18n.t('web.filePreviewLoading')}</div>
     {:else if previewError}
       <div class="right-pane-state right-pane-state--error">
-        {i18n.t('web.filePreviewError', { message: previewError })}
+        {previewError}
       </div>
     {:else if wordFile}
       <div class="right-pane-state">

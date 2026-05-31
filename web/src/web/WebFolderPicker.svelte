@@ -23,6 +23,7 @@
   let showHidden = $state(false);
   let hasLoaded = $state(false);
   let requestToken = 0;
+  const directoryLoadFailedText = '目录读取失败，请稍后重试';
 
   onMount(() => {
     void loadDirectory();
@@ -40,7 +41,8 @@
         return;
       }
       if (result.error) {
-        error = result.error;
+        console.warn('[WebFolderPicker] directory browse returned error:', result.error);
+        error = directoryLoadFailedText;
         return;
       }
       currentPath = result.path;
@@ -52,7 +54,8 @@
       if (token !== requestToken) {
         return;
       }
-      error = err instanceof Error ? err.message : String(err);
+      console.warn('[WebFolderPicker] directory browse failed:', err);
+      error = directoryLoadFailedText;
     } finally {
       if (token === requestToken) {
         loading = false;

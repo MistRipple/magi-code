@@ -178,6 +178,7 @@ export async function fetchTaskProjection(
       }
     }
   } catch (err) {
+    console.warn('[task-projection-store] task projection refresh failed:', err);
     const latestState = ensureSessionState(normalizedSessionId);
     if (
       latestState.fetchGeneration !== fetchGeneration
@@ -185,7 +186,7 @@ export async function fetchTaskProjection(
     ) {
       return;
     }
-    latestState.error = err instanceof Error ? err.message : String(err);
+    latestState.error = 'load_failed';
   } finally {
     const latestState = ensureSessionState(normalizedSessionId);
     if (

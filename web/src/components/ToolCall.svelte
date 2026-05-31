@@ -911,7 +911,7 @@
         {/if}
       </span>
       {#if display.error && (display.outcome === 'degraded' || display.outcome === 'failed' || display.outcome === 'killed')}
-        <span class="agent-spawn-error" title={display.error}>{display.error}</span>
+        <span class="agent-spawn-error">{i18n.t('toolCall.agentSpawn.failed')}</span>
       {/if}
     </span>
     <span class="agent-spawn-meta">

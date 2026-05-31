@@ -65,8 +65,9 @@
       nextCache.set(path, entries);
       dirCache = nextCache;
     } catch (error) {
+      console.warn('[ProjectFileTree] directory load failed:', error);
       const nextErrorMap = new Map(dirErrors);
-      nextErrorMap.set(path, error instanceof Error ? error.message : String(error));
+      nextErrorMap.set(path, i18n.t('web.projectFilesLoadFailed'));
       dirErrors = nextErrorMap;
     } finally {
       const nextLoading = new Set(loadingDirPaths);

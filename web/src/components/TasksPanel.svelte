@@ -1284,7 +1284,7 @@
   {/if}
 
   {#if taskProjection.error}
-    <div class="tg-error">{taskProjection.error}</div>
+    <div class="tg-error">{i18n.t('tasks.projectionLoadFailed')}</div>
   {/if}
 
   {#if taskHistoryError}
