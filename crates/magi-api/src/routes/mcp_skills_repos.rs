@@ -141,13 +141,13 @@ fn build_local_instruction_skill_entry(
         .to_str()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| ApiError::InvalidInput("directoryPath 无法解析技能名称".to_string()))?;
+        .ok_or_else(|| ApiError::InvalidInput("本地 Skill 目录不可用".to_string()))?;
     let skill_name = dir
         .file_name()
         .and_then(|value| value.to_str())
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| ApiError::InvalidInput("directoryPath 无法解析技能名称".to_string()))?;
+        .ok_or_else(|| ApiError::InvalidInput("本地 Skill 名称不可用".to_string()))?;
     let metadata = read_local_skill_metadata(dir);
     let description = read_local_skill_description(dir);
     Ok(serde_json::json!({
@@ -198,16 +198,10 @@ fn scan_local_instruction_skill_entries(
     root_dir: &std::path::Path,
 ) -> Result<Vec<serde_json::Value>, ApiError> {
     if !root_dir.exists() {
-        return Err(ApiError::InvalidInput(format!(
-            "目录不存在: {}",
-            root_dir.display()
-        )));
+        return Err(ApiError::InvalidInput("所选目录不存在".to_string()));
     }
     if !root_dir.is_dir() {
-        return Err(ApiError::InvalidInput(format!(
-            "路径不是目录: {}",
-            root_dir.display()
-        )));
+        return Err(ApiError::InvalidInput("所选路径不是目录".to_string()));
     }
 
     if is_local_skill_dir(root_dir) {
@@ -215,7 +209,7 @@ fn scan_local_instruction_skill_entries(
     }
 
     let mut candidates = std::fs::read_dir(root_dir)
-        .map_err(|e| ApiError::internal_assembly("读取本地技能目录失败", e))?
+        .map_err(|_| ApiError::InvalidInput("无法读取所选目录".to_string()))?
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
         .filter(|path| path.is_dir())
         .filter(|path| is_local_skill_dir(path))
@@ -267,8 +261,30 @@ fn normalize_local_instruction_skill_request_path(
         .and_then(|value| value.as_str())
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| ApiError::InvalidInput("directoryPath 不能为空".to_string()))?;
+        .ok_or_else(|| ApiError::InvalidInput("请选择本地 Skill 目录".to_string()))?;
     Ok(std::path::PathBuf::from(directory_path))
+}
+
+fn normalize_local_instruction_skill_request_skill_id(
+    request: &serde_json::Value,
+) -> Option<String> {
+    ["skillId", "skillName", "name"]
+        .iter()
+        .find_map(|field| request.get(*field).and_then(|value| value.as_str()))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn public_local_instruction_skill_entry(entry: &serde_json::Value) -> serde_json::Value {
+    let mut obj = entry.as_object().cloned().unwrap_or_default();
+    obj.remove("directoryPath");
+    if !obj.contains_key("localSkillId") {
+        if let Some(skill_name) = instruction_skill_name(entry) {
+            obj.insert("localSkillId".to_string(), serde_json::json!(skill_name));
+        }
+    }
+    serde_json::Value::Object(obj)
 }
 
 fn epoch_ms_now() -> u64 {
@@ -671,6 +687,7 @@ async fn list_skills(State(state): State<ApiState>) -> Json<serde_json::Value> {
         .into_iter()
         .map(|skill| {
             let mut entry = skill.as_object().cloned().unwrap_or_default();
+            entry.remove("directoryPath");
             entry.insert("installed".to_string(), serde_json::json!(true));
             serde_json::Value::Object(entry)
         })
@@ -802,10 +819,10 @@ async fn install_skill(
 
     let target_dir = cache_dir.join(skill_id.replace('/', "_"));
 
-    // Download the skill from github
+    // 从仓库下载技能内容到本地缓存，运行时只读取本地目录。
     download_github_skill(&skill_id, &target_dir).await?;
 
-    // Inject the directoryPath so the local loader can read it
+    // directoryPath 仅保存在后端配置中供本地加载器读取，不作为安装响应外发。
     if let Some(obj) = normalized.as_object_mut() {
         obj.insert(
             "directoryPath".to_string(),
@@ -828,12 +845,20 @@ async fn install_local_skill(
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let root_dir = normalize_local_instruction_skill_request_path(&request)?;
-    let entries = scan_local_instruction_skill_entries(&root_dir)?;
+    let mut entries = scan_local_instruction_skill_entries(&root_dir)?;
     if entries.is_empty() {
-        return Err(ApiError::InvalidInput(format!(
-            "所选目录下未发现可导入的技能子目录: {}",
-            root_dir.display()
-        )));
+        return Err(ApiError::InvalidInput(
+            "所选目录下未发现可导入的 Skill".to_string(),
+        ));
+    }
+
+    if let Some(skill_id) = normalize_local_instruction_skill_request_skill_id(&request) {
+        entries.retain(|entry| instruction_skill_matches(entry, &skill_id));
+        if entries.is_empty() {
+            return Err(ApiError::InvalidInput(
+                "所选目录中未找到该 Skill".to_string(),
+            ));
+        }
     }
 
     let mut instruction_skills = load_instruction_skills(&state);
@@ -849,7 +874,6 @@ async fn install_local_skill(
     Ok(Json(serde_json::json!({
         "installed": true,
         "count": entries.len(),
-        "skills": entries,
     })))
 }
 
@@ -858,10 +882,13 @@ async fn scan_local_skill_directory(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let root_dir = normalize_local_instruction_skill_request_path(&request)?;
     let entries = scan_local_instruction_skill_entries(&root_dir)?;
+    let public_entries = entries
+        .iter()
+        .map(public_local_instruction_skill_entry)
+        .collect::<Vec<_>>();
     Ok(Json(serde_json::json!({
-        "directoryPath": root_dir.to_string_lossy(),
-        "skills": entries,
-        "count": entries.len(),
+        "skills": public_entries,
+        "count": public_entries.len(),
     })))
 }
 
@@ -1008,9 +1035,9 @@ async fn update_skill(
     if let Some(dir_path) = skill.get("directoryPath").and_then(|v| v.as_str()) {
         let path = std::path::Path::new(dir_path);
         if !path.is_dir() {
-            return Err(ApiError::InvalidInput(format!(
-                "技能目录不存在: {dir_path}"
-            )));
+            return Err(ApiError::InvalidInput(
+                "技能源不可用，请重新导入该 Skill".to_string(),
+            ));
         }
         let mut updated_entry = skill.as_object().cloned().unwrap_or_default();
         let meta = read_local_skill_metadata(path);
@@ -1145,10 +1172,9 @@ async fn download_github_skill(
     }
 
     if !prompt_downloaded {
-        return Err(ApiError::InvalidInput(format!(
-            "Could not find prompt.md or README.md in repository {}",
-            skill_id
-        )));
+        return Err(ApiError::InvalidInput(
+            "该技能仓库缺少可导入的说明文件".to_string(),
+        ));
     }
 
     Ok(())
@@ -1177,7 +1203,7 @@ async fn get_instruction_skill_preview(
         .and_then(|value| value.as_str())
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| ApiError::InvalidInput(format!("技能缺少 directoryPath: {skill_id}")))?;
+        .ok_or_else(|| ApiError::InvalidInput("技能源不可用，请重新导入该 Skill".to_string()))?;
 
     let dir = PathBuf::from(directory_path);
     let instruction = skill_loader::read_skill_instruction(&dir);

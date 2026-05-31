@@ -222,7 +222,7 @@ export interface LibrarySkill {
   repositoryName?: string;
   installed?: boolean;
   icon?: string;
-  directoryPath?: string;
+  localSkillId?: string;
 }
 
 function createSettingsStore(props: { onClose?: () => void }) {
@@ -655,6 +655,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
   let localSkillInstalling = $state(false);
   let skillLibraryFailedRepositoryCount = $state(0);
   let localSkillInstallError = $state("");
+  let localSkillScanRootPath = $state("");
   let showLocalSkillFolderPicker = $state(false);
 
   // 通用确认对话框状态
@@ -2018,6 +2019,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
     localSkillInstalling = false;
     skillLibraryFailedRepositoryCount = 0;
     localSkillInstallError = "";
+    localSkillScanRootPath = "";
   }
 
   async function installSkill(skillFullName: string) {
@@ -2025,18 +2027,27 @@ function createSettingsStore(props: { onClose?: () => void }) {
     installingSkills = new Set(installingSkills);
 
     try {
-      // Check if this is a local skill
       const localSkill = librarySkills.find(
         (s) => (s.fullName === skillFullName || s.name === skillFullName) && s.repositoryId === "__local__"
       );
 
-      if (localSkill?.directoryPath) {
-        // Local skill: install via install-local endpoint
-        const result = await installAgentLocalSkill(localSkill.directoryPath);
+      if (localSkill) {
+        const localSkillId = localSkill.localSkillId || localSkill.fullName || localSkill.name;
+        if (!localSkillScanRootPath || !localSkillId) {
+          localSkillInstallError = i18n.t(
+            "settings.skillLibrary.localImportFailed",
+          );
+          installingSkills.delete(skillFullName);
+          installingSkills = new Set(installingSkills);
+          return;
+        }
+        const result = await installAgentLocalSkill({
+          directoryPath: localSkillScanRootPath,
+          skillId: localSkillId,
+        });
         installingSkills.delete(skillFullName);
         installingSkills = new Set(installingSkills);
         if ((result as any)?.success !== false) {
-          // Mark as installed in library list
           librarySkills = librarySkills.map((s) =>
             s.fullName === skillFullName ? { ...s, installed: true } : s
           );
@@ -2116,13 +2127,6 @@ function createSettingsStore(props: { onClose?: () => void }) {
           showSkillLibraryDialogState = false;
           notifySettingsSuccess(i18n.t("settings.toast.localSkillInstalled"));
         } else {
-          const backendError =
-            typeof (result as any)?.error === "string"
-              ? (result as any).error.trim()
-              : "";
-          if (backendError) {
-            console.warn("[SettingsPanel] 本地 Skill 安装返回失败:", backendError);
-          }
           localSkillInstallError = i18n.t(
             "settings.skillLibrary.localImportFailed",
           );
@@ -2148,6 +2152,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
     }
     localSkillInstalling = true;
     localSkillInstallError = "";
+    localSkillScanRootPath = "";
     try {
       const result = await scanAgentLocalSkillDirectory(path);
       localSkillInstalling = false;
@@ -2156,7 +2161,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
         localSkillInstallError = i18n.t("settings.skillLibrary.noSkillsFound");
         return;
       }
-      // Append scanned local skills to the library list for preview
+      localSkillScanRootPath = path;
       const localEntries: LibrarySkill[] = scannedSkills.map((s: any) => ({
         name: s.name || s.skillName || "",
         fullName: s.fullName || s.name || s.skillName || "",
@@ -2169,9 +2174,8 @@ function createSettingsStore(props: { onClose?: () => void }) {
         repositoryName: i18n.t("settings.skillLibrary.localDirectory"),
         installed: false,
         icon: "",
-        directoryPath: s.directoryPath || path,
+        localSkillId: s.localSkillId || s.skillId || s.skillName || s.name || "",
       }));
-      // Remove previous local entries, then add new ones
       librarySkills = [
         ...librarySkills.filter((s) => s.repositoryId !== "__local__"),
         ...localEntries,

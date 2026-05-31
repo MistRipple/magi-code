@@ -1204,12 +1204,13 @@ impl ApiState {
             self.enrich_mcp_servers_with_connection_status(&mut snapshot);
         }
         let tool_catalog = self.settings_tool_catalog_json(tool_context);
+        let skills_config = public_skills_config_section(object_section(&snapshot, "skillsConfig"));
         serde_json::json!({
             "workerConfigs": object_section(&snapshot, "workerConfigs"),
             "orchestratorConfig": object_section(&snapshot, "orchestratorConfig"),
             "auxiliaryConfig": object_section(&snapshot, "auxiliaryConfig"),
             "userRulesConfig": object_section(&snapshot, "userRulesConfig"),
-            "skillsConfig": object_section(&snapshot, "skillsConfig"),
+            "skillsConfig": skills_config,
             "safeguardConfig": object_section(&snapshot, "safeguardConfig"),
             "repositories": array_section(&snapshot, "repositories"),
             "mcpServers": array_section(&snapshot, "mcpServers"),
@@ -1572,6 +1573,18 @@ fn normalize_settings_snapshot_sections(snapshot: &mut HashMap<String, serde_jso
     alias_snapshot_keys(snapshot);
 }
 
+fn public_skills_config_section(value: serde_json::Value) -> serde_json::Value {
+    let mut config = value.as_object().cloned().unwrap_or_default();
+    if let Some(serde_json::Value::Array(skills)) = config.get_mut("instructionSkills") {
+        for skill in skills {
+            if let Some(object) = skill.as_object_mut() {
+                object.remove("directoryPath");
+            }
+        }
+    }
+    serde_json::Value::Object(config)
+}
+
 fn alias_snapshot_keys(snapshot: &mut HashMap<String, serde_json::Value>) {
     let aliases: &[(&str, &str)] = &[
         ("workers", "workerConfigs"),
@@ -1896,6 +1909,32 @@ mod tests {
             &store,
             &[pending_id]
         ));
+    }
+
+    #[test]
+    fn public_skills_config_section_hides_directory_paths() {
+        let public = public_skills_config_section(serde_json::json!({
+            "instructionSkills": [
+                {
+                    "name": "local-skill",
+                    "skillId": "local-skill",
+                    "directoryPath": "/tmp/magi-private-skill-path",
+                    "description": "desc"
+                }
+            ],
+            "customTools": [
+                {
+                    "name": "custom-tool"
+                }
+            ]
+        }));
+
+        let skill = public["instructionSkills"][0]
+            .as_object()
+            .expect("skill should stay object");
+        assert_eq!(skill["name"], serde_json::json!("local-skill"));
+        assert!(!skill.contains_key("directoryPath"));
+        assert_eq!(public["customTools"][0]["name"], "custom-tool");
     }
 
     #[test]

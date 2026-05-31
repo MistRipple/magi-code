@@ -1599,10 +1599,24 @@ export async function installAgentSkill(skillId: string): Promise<Record<string,
   return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/skills/install', { skillId }, 'install skill');
 }
 
-export async function installAgentLocalSkill(directoryPath?: string): Promise<Record<string, unknown>> {
+export interface AgentLocalSkillInstallRequest {
+  directoryPath?: string;
+  skillId?: string;
+}
+
+export async function installAgentLocalSkill(
+  request?: string | AgentLocalSkillInstallRequest,
+): Promise<Record<string, unknown>> {
   const payload: Record<string, unknown> = {};
-  if (directoryPath) {
-    payload.directoryPath = directoryPath;
+  if (typeof request === 'string') {
+    payload.directoryPath = request;
+  } else if (request) {
+    if (request.directoryPath) {
+      payload.directoryPath = request.directoryPath;
+    }
+    if (request.skillId) {
+      payload.skillId = request.skillId;
+    }
   }
   return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/skills/install-local', payload, 'install local skill');
 }
