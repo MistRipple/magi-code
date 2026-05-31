@@ -1991,7 +1991,7 @@ export function applySessionNotificationsStatus(rawStatus: unknown): void {
     isLoading: status.isLoading === true,
     operation,
     error: typeof status.error === 'string' && status.error.trim()
-      ? status.error.trim()
+      ? 'operation_failed'
       : null,
     updatedAt: typeof status.updatedAt === 'number' && Number.isFinite(status.updatedAt)
       ? status.updatedAt

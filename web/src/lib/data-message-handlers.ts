@@ -43,7 +43,7 @@ import {
 import type {
   AppState, Message, Session,
   Edit,
-  ModelStatusMap, OrchestratorRuntimeState,
+  ModelStatus, ModelStatusMap, ModelStatusType, OrchestratorRuntimeState,
 } from '../types/message';
 import type { StandardMessage, ContentBlock as StandardContentBlock } from '../shared/protocol/message-protocol';
 import type { SessionBootstrapSnapshot } from '../shared/session-bootstrap';
@@ -67,6 +67,94 @@ import {
 
 function normalizeStateSliceVersion(value: unknown): number {
   return typeof value === 'number' && Number.isFinite(value) ? Math.floor(value) : 0;
+}
+
+const MODEL_STATUS_TYPES = new Set<ModelStatusType>([
+  'available',
+  'connected',
+  'configured',
+  'disabled',
+  'not_configured',
+  'checking',
+  'error',
+  'unavailable',
+  'invalid_model',
+  'auth_failed',
+  'network_error',
+  'timeout',
+  'orchestrator',
+]);
+
+function normalizeModelStatusType(status: unknown): ModelStatusType {
+  return typeof status === 'string' && MODEL_STATUS_TYPES.has(status as ModelStatusType)
+    ? status as ModelStatusType
+    : 'error';
+}
+
+function safeModelStatusError(status: ModelStatusType): string | undefined {
+  switch (status) {
+    case 'error':
+      return i18n.t('settings.status.error');
+    case 'unavailable':
+      return i18n.t('settings.status.unavailable');
+    case 'invalid_model':
+      return i18n.t('settings.status.invalidModel');
+    case 'auth_failed':
+      return i18n.t('settings.status.authFailed');
+    case 'network_error':
+      return i18n.t('settings.status.networkError');
+    case 'timeout':
+      return i18n.t('settings.status.timeout');
+    default:
+      return undefined;
+  }
+}
+
+function sanitizeModelStatusValue(value: unknown, fallbackModel?: string): ModelStatus | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return null;
+  }
+  const raw = value as Record<string, unknown>;
+  const status = normalizeModelStatusType(raw.status);
+  const model = typeof raw.model === 'string' && raw.model.trim()
+    ? raw.model.trim()
+    : fallbackModel;
+  const next: ModelStatus = {
+    status,
+    ...(model ? { model } : {}),
+  };
+  if (typeof raw.version === 'string' && raw.version.trim()) {
+    next.version = raw.version.trim();
+  }
+  if (typeof raw.tokens === 'number' && Number.isFinite(raw.tokens)) {
+    next.tokens = raw.tokens;
+  }
+  const safeError = safeModelStatusError(status);
+  if (safeError) {
+    next.error = safeError;
+  }
+  return next;
+}
+
+function sanitizeModelStatusMap(
+  statuses: unknown,
+  existing: ModelStatusMap,
+): ModelStatusMap {
+  if (!statuses || typeof statuses !== 'object' || Array.isArray(statuses)) {
+    return {};
+  }
+  const next: ModelStatusMap = {};
+  for (const [key, value] of Object.entries(statuses as Record<string, unknown>)) {
+    const normalizedKey = key.trim();
+    if (!normalizedKey) {
+      continue;
+    }
+    const sanitized = sanitizeModelStatusValue(value, existing[normalizedKey]?.model);
+    if (sanitized) {
+      next[normalizedKey] = sanitized;
+    }
+  }
+  return next;
 }
 
 function shouldApplyStateSlice(params: {
@@ -1019,13 +1107,10 @@ function handleClarificationRequest(_message: ClientBridgeMessage) {
  * 将检测到的模型状态同步到全局 store，供设置和执行状态共用
  */
 function handleWorkerStatusUpdate(message: ClientBridgeMessage) {
-  const statuses = message.statuses as ModelStatusMap;
-  if (!statuses) return;
-
   const store = getState();
+  const statuses = sanitizeModelStatusMap(message.statuses, store.modelStatus);
+  if (Object.keys(statuses).length === 0) return;
 
-  // 直接存储完整的状态信息，不再简化。
-  // 设置面板和任务执行状态使用同一个数据源。
   store.modelStatus = { ...store.modelStatus, ...statuses };
 }
 
@@ -1063,7 +1148,7 @@ function handleSettingsBootstrapLoaded(message: ClientBridgeMessage) {
 function handleConnectionTestResult(message: ClientBridgeMessage) {
   const store = getState();
   const success = Boolean(message.success);
-  const error = message.error as string | undefined;
+  const error = safeModelStatusError('error');
 
   // 代理连接测试
   const worker = message.worker as string | undefined;
@@ -1109,7 +1194,6 @@ function handleConnectionTestResult(message: ClientBridgeMessage) {
         auxiliary: {
           status: 'orchestrator',
           model: orchestratorModel || store.modelStatus.auxiliary?.model,
-          error,
         },
       };
     }
