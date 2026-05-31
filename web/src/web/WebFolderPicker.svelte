@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import { browseAgentDirectory, type DirectoryEntry } from './agent-api';
   import Icon from '../components/Icon.svelte';
+  import { i18n } from '../stores/i18n.svelte';
 
   interface Props {
     title?: string;
@@ -23,7 +24,7 @@
   let showHidden = $state(false);
   let hasLoaded = $state(false);
   let requestToken = 0;
-  const directoryLoadFailedText = '目录读取失败，请稍后重试';
+  const directoryLoadFailedText = () => i18n.t('web.folderPickerLoadFailed');
 
   onMount(() => {
     void loadDirectory();
@@ -42,7 +43,7 @@
       }
       if (result.error) {
         console.warn('[WebFolderPicker] directory browse returned error:', result.error);
-        error = directoryLoadFailedText;
+        error = directoryLoadFailedText();
         return;
       }
       currentPath = result.path;
@@ -55,7 +56,7 @@
         return;
       }
       console.warn('[WebFolderPicker] directory browse failed:', err);
-      error = directoryLoadFailedText;
+      error = directoryLoadFailedText();
     } finally {
       if (token === requestToken) {
         loading = false;
@@ -199,7 +200,7 @@
     {#if title}
       <div class="mac-titlebar">
         <h2 class="mac-title">{title}</h2>
-        <button class="mac-close-btn" onclick={onCancel} aria-label="Close" title="关闭">
+        <button class="mac-close-btn" onclick={onCancel} aria-label={i18n.t('common.close')} title={i18n.t('common.close')}>
           <Icon name="close" size={18} />
         </button>
       </div>
@@ -207,7 +208,7 @@
 
     <div class="mac-toolbar">
       <div class="mac-nav-group">
-        <button class="mac-icon-btn" onclick={goUp} disabled={!canGoUp} title="返回上级">
+        <button class="mac-icon-btn" onclick={goUp} disabled={!canGoUp} title={i18n.t('web.folderPickerGoUp')}>
           <Icon name="chevron-up" size={16} />
         </button>
       </div>
@@ -231,13 +232,13 @@
           </div>
         {:else}
           <div class="mac-breadcrumbs">
-            <span class="mac-crumb-text current">正在定位目录...</span>
+            <span class="mac-crumb-text current">{i18n.t('web.folderPickerLocating')}</span>
           </div>
         {/if}
       </div>
 
       <div class="mac-actions-group">
-        <button class="mac-icon-btn" onclick={toggleManualInput} disabled={loading} title="手动输入路径" class:active={showManualInput}>
+        <button class="mac-icon-btn" onclick={toggleManualInput} disabled={loading} title={i18n.t('web.folderPickerManualPath')} class:active={showManualInput}>
           <Icon name="pencil" size={14} />
         </button>
       </div>
@@ -254,11 +255,11 @@
           type="text"
           bind:value={manualPathInput}
           onkeydown={handleManualInputKeydown}
-          placeholder="输入完整路径，按 Enter 跳转"
+          placeholder={i18n.t('web.folderPickerManualPathPlaceholder')}
         />
       </div>
       <button class="apple-action-btn primary" onclick={goToManualPath} disabled={loading || !manualPathInput.trim()}>
-        跳转
+        {i18n.t('web.folderPickerGo')}
       </button>
     </div>
   {/if}
@@ -268,21 +269,21 @@
     {#if loading}
       <div class="mac-empty-state">
         <div class="mac-spinner"></div>
-        <div class="mac-empty-text">读取目录内容中…</div>
+        <div class="mac-empty-text">{i18n.t('web.folderPickerLoading')}</div>
       </div>
     {:else if error}
       <div class="mac-empty-state error">
         <Icon name="close" size={24} />
         <div class="mac-empty-text">{error}</div>
         <div class="mac-empty-actions">
-          <button class="apple-action-btn secondary" onclick={retryLoad}>重试</button>
-          <button class="apple-action-btn" onclick={toggleManualInput}>手动输入</button>
+          <button class="apple-action-btn secondary" onclick={retryLoad}>{i18n.t('web.folderPickerRetry')}</button>
+          <button class="apple-action-btn" onclick={toggleManualInput}>{i18n.t('web.folderPickerManualPath')}</button>
         </div>
       </div>
     {:else if entries.length === 0}
       <div class="mac-empty-state">
         <div class="mac-empty-icon"><Icon name="folder" size={32} /></div>
-        <div class="mac-empty-text">当前文件夹为空</div>
+        <div class="mac-empty-text">{i18n.t('web.folderPickerEmpty')}</div>
       </div>
     {:else}
       <div class="mac-list">
@@ -315,21 +316,21 @@
       <label class="mac-checkbox-label">
         <input type="checkbox" checked={showHidden} onchange={toggleShowHidden} />
         <span class="mac-checkbox-box"></span>
-        <span class="mac-checkbox-text">显示隐藏文件</span>
+        <span class="mac-checkbox-text">{i18n.t('web.folderPickerShowHidden')}</span>
       </label>
       {#if selectedBasename}
         <div class="mac-selected-hint">
-          已选：<strong>{selectedBasename}</strong>
+          {i18n.t('web.folderPickerSelected')}<strong>{selectedBasename}</strong>
         </div>
       {/if}
     </div>
     
     <div class="mac-footer-right">
-      <button class="apple-action-btn secondary" onclick={onCancel} disabled={disabled}>取消</button>
+      <button class="apple-action-btn secondary" onclick={onCancel} disabled={disabled}>{i18n.t('web.folderPickerCancel')}</button>
       {#if selectedPath}
-        <button class="apple-action-btn primary" onclick={confirmSelection} disabled={disabled || loading}>确认选择</button>
+        <button class="apple-action-btn primary" onclick={confirmSelection} disabled={disabled || loading}>{i18n.t('web.folderPickerConfirm')}</button>
       {:else}
-        <button class="apple-action-btn primary" onclick={selectCurrentDir} disabled={disabled || loading || !hasLoaded}>选择当前目录</button>
+        <button class="apple-action-btn primary" onclick={selectCurrentDir} disabled={disabled || loading || !hasLoaded}>{i18n.t('web.folderPickerSelectCurrent')}</button>
       {/if}
     </div>
   </div>

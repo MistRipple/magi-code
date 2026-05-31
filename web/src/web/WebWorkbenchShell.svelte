@@ -428,7 +428,7 @@
 
   function notifyWorkbenchError(actionLabel: string, error: unknown): void {
     console.warn(`[WebWorkbenchShell] ${actionLabel} failed:`, error);
-    addToast('error', `${actionLabel}失败，请稍后重试`, undefined, {
+    addToast('error', i18n.t('web.workbenchActionFailed', { action: actionLabel }), undefined, {
       category: 'incident',
       source: 'web-workbench',
       actionRequired: true,
@@ -697,7 +697,7 @@
       const snapshot = await getWorkspaceSessions(workspaceId, preferredSessionId);
       return applyWorkspaceSessionsSnapshot(workspaceId, snapshot);
     } catch (error) {
-      notifyWorkbenchError('加载工作区会话', error);
+      notifyWorkbenchError(i18n.t('web.action.loadWorkspaceSessions'), error);
       return '';
     } finally {
       loadingWorkspaceIds = { ...loadingWorkspaceIds, [workspaceId]: false };
@@ -727,7 +727,7 @@
       }
     } catch (error) {
       loadError = i18n.t('web.workspaceUnavailable');
-      notifyWorkbenchError('加载工作区列表', error);
+      notifyWorkbenchError(i18n.t('web.action.loadWorkspaceList'), error);
     } finally {
       loading = false;
     }
@@ -748,8 +748,8 @@
       const next = await runActionWithFeedback(
         () => registerAgentWorkspace(normalizedRootPath),
         {
-          actionLabel: '添加工作区',
-          successMessage: '工作区已添加',
+          actionLabel: i18n.t('web.action.addWorkspace'),
+          successMessage: i18n.t('web.workspaceAdded'),
         },
       );
       if (!next) {
@@ -827,8 +827,8 @@
       const next = await runActionWithFeedback(
         () => removeAgentWorkspace(removedId, removedPath),
         {
-          actionLabel: '移除工作区',
-          successMessage: `工作区“${removedName}”已移除`,
+          actionLabel: i18n.t('web.action.removeWorkspace'),
+          successMessage: i18n.t('web.workspaceRemoved', { name: removedName }),
         },
       );
       if (!next) {
@@ -888,7 +888,7 @@
       return;
     }
     const nextSession = (sessionsByWorkspace[workspace.workspaceId] ?? []).find((session) => session.id === sessionId);
-    const nextSessionName = nextSession?.name || '未命名会话';
+    const nextSessionName = nextSession?.name || i18n.t('header.unnamedSession');
     const fallbackSessionId = typeof currentSessionId === 'string' ? currentSessionId : null;
     selectedWorkspaceId = workspace.workspaceId;
     currentSessionId = sessionId;
@@ -913,7 +913,7 @@
         currentSessionId,
       );
     }, 6000);
-    addToast('info', `正在切换到会话“${nextSessionName}”...`, undefined, {
+    addToast('info', i18n.t('web.sessionSwitching', { name: nextSessionName }), undefined, {
       category: 'feedback',
       source: 'session-management',
       persistToCenter: false,
@@ -949,7 +949,7 @@
     }
     const { workspace, session } = pendingDeleteSession;
     const displayName = session.name || i18n.t('header.unnamedSession');
-    addToast('info', `正在删除会话“${displayName}”...`, undefined, {
+    addToast('info', i18n.t('web.sessionDeleting', { name: displayName }), undefined, {
       category: 'feedback',
       source: 'session-management',
       persistToCenter: false,
@@ -1139,7 +1139,7 @@
     <button
       type="button"
       class="drawer-overlay"
-      aria-label="关闭工作区导航"
+      aria-label={i18n.t('web.closeNav')}
       onclick={() => {
         sidebarOpen = false;
       }}
@@ -1225,8 +1225,8 @@
                   <button
                     type="button"
                     class="workspace-remove-btn"
-                    title="从 Magi 中移除工作区"
-                    aria-label={`移除工作区 ${workspace.name}`}
+                    title={i18n.t('web.removeWorkspaceTitle')}
+                    aria-label={i18n.t('web.removeWorkspaceAria', { name: workspace.name })}
                     onclick={(event) => {
                       event.stopPropagation();
                       openRemoveWorkspaceDialog(workspace);
@@ -1240,7 +1240,7 @@
                     {#if loadingWorkspaceIds[workspace.workspaceId]}
                       <div class="sidebar-empty sidebar-empty--nested">{i18n.t('common.loading')}</div>
                     {:else if getWorkspaceSessionList(workspace.workspaceId).length === 0}
-                      <div class="sidebar-empty sidebar-empty--nested">当前工作区暂无会话</div>
+                      <div class="sidebar-empty sidebar-empty--nested">{i18n.t('web.noWorkspaceSessions')}</div>
                     {:else}
                       <div class="session-list session-list--nested">
                         {#each getWorkspaceSessionList(workspace.workspaceId) as session (session.id)}
@@ -1398,21 +1398,21 @@
 
 {#if showRemoveWorkspaceDialog && pendingRemoveWorkspace}
   <Modal
-    title="从 Magi 中移除工作区"
+    title={i18n.t('web.removeWorkspaceTitle')}
     onClose={closeRemoveWorkspaceDialog}
     closeOnBackdrop={true}
     size="sm"
   >
-    <p class="workspace-dialog-text">将从 Magi 的工作区注册表中移除 <strong>{pendingRemoveWorkspace.name}</strong>。</p>
-    <p class="workspace-dialog-text workspace-dialog-text--muted">不会删除本地项目目录，也不会删除该工作区下已有的历史会话。</p>
+    <p class="workspace-dialog-text">{i18n.t('web.removeWorkspaceDescPrefix')}<strong>{pendingRemoveWorkspace.name}</strong>{i18n.t('web.removeWorkspaceDescSuffix')}</p>
+    <p class="workspace-dialog-text workspace-dialog-text--muted">{i18n.t('web.removeWorkspaceKeepData')}</p>
     {#if workspaceDialogError}
       <div class="workspace-dialog-error">{workspaceDialogError}</div>
     {/if}
 
     {#snippet footer()}
-      <button class="modal-btn secondary" type="button" onclick={() => closeRemoveWorkspaceDialog()} disabled={workspaceActionPending}>取消</button>
+      <button class="modal-btn secondary" type="button" onclick={() => closeRemoveWorkspaceDialog()} disabled={workspaceActionPending}>{i18n.t('web.folderPickerCancel')}</button>
       <button class="modal-btn danger" type="button" onclick={() => void removeWorkspace()} disabled={workspaceActionPending}>
-        {workspaceActionPending ? '正在移除...' : '确认移除'}
+        {workspaceActionPending ? i18n.t('web.removingWorkspace') : i18n.t('web.confirmRemoveWorkspace')}
       </button>
     {/snippet}
   </Modal>
