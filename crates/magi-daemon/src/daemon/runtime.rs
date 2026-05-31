@@ -223,7 +223,14 @@ fn external_mcp_server_catalog_entry(
         connected,
         health: health.to_string(),
         tool_count,
-        error: read_json_string(entry, &["error"]),
+        error: external_mcp_error_marker(entry),
+    })
+}
+
+fn external_mcp_error_marker(entry: &serde_json::Value) -> Option<String> {
+    read_json_string(entry, &["error"]).map(|error| match error.as_str() {
+        "mcp_connection_failed" | "mcp_invalid_config" => error,
+        _ => "mcp_connection_failed".to_string(),
     })
 }
 
@@ -1557,6 +1564,23 @@ mod tests {
                 .any(|kind| kind == "local_agent")),
             "代理角色目录应暴露 supported_kinds，便于 tool_catalog 诊断"
         );
+    }
+
+    #[test]
+    fn external_mcp_catalog_redacts_raw_error_text() {
+        let connections =
+            std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+        let raw = json!({
+            "id": "local-mcp",
+            "name": "Local MCP",
+            "enabled": true,
+            "error": "/Users/xie/.mcp/server failed: ENOENT",
+        });
+
+        let entry = super::external_mcp_server_catalog_entry(&raw, &connections)
+            .expect("mcp catalog entry should be built");
+
+        assert_eq!(entry.error.as_deref(), Some("mcp_connection_failed"));
     }
 
     #[tokio::test]
