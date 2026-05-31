@@ -716,7 +716,13 @@ async fn list_skills(State(state): State<ApiState>) -> Json<serde_json::Value> {
                 }
             }
             Err(e) => {
-                failed_repos.push(serde_json::json!({"repositoryId": repo_id, "url": repo_url, "error": format!("{:?}", e)}));
+                tracing::warn!(
+                    repository_id = %repo_id,
+                    url = %repo_url,
+                    error = ?e,
+                    "Skill repository load failed"
+                );
+                failed_repos.push(serde_json::json!({"repositoryId": repo_id, "url": repo_url, "error": "repository_load_failed"}));
             }
         }
     }

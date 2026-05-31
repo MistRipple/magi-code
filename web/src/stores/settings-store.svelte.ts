@@ -185,13 +185,8 @@ function notifySettingsInfo(message: string): void {
 }
 
 function notifySettingsError(actionLabel: string, error: unknown): void {
-  const detail = error instanceof Error ? error.message : String(error);
-  const message = detail
-    ? i18n.t("settings.toast.actionFailedWithDetail", {
-        action: actionLabel,
-        detail,
-      })
-    : i18n.t("settings.toast.actionFailed", { action: actionLabel });
+  console.warn(`[SettingsPanel] ${actionLabel} failed:`, error);
+  const message = i18n.t("settings.toast.actionFailed", { action: actionLabel });
   addToast(
     "error",
     message,
@@ -659,7 +654,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
   let skillLibraryLoading = $state(false); // Skill 库加载状态
   let localSkillInstalling = $state(false);
   let skillLibraryFailedRepositories = $state<
-    Array<{ repositoryId: string; url?: string; error?: string }>
+    Array<{ repositoryId: string; url?: string }>
   >([]);
   let localSkillInstallError = $state("");
   let showLocalSkillFolderPicker = $state(false);
@@ -1965,7 +1960,6 @@ function createSettingsStore(props: { onClose?: () => void }) {
         .map((repo: any) => ({
           repositoryId: String(repo.repositoryId || ""),
           url: repo.url ? String(repo.url) : undefined,
-          error: repo.error ? String(repo.error) : undefined,
         }))
         .filter((repo: any) => repo.repositoryId);
     } catch (e) {

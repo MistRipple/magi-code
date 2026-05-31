@@ -347,9 +347,6 @@ import { getAgentColor } from '../lib/agent-colors';
             {#each store.skillLibraryFailedRepositories as repo}
               <div class="skill-library-warning-item">
                 <strong>{repo.repositoryId}</strong>
-                {#if repo.error}
-                  <span>：{repo.error}</span>
-                {/if}
               </div>
             {/each}
           </div>

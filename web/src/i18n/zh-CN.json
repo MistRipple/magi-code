@@ -982,7 +982,6 @@
   "bridge.toast.operationCompletedTitle": "操作完成",
   "bridge.toast.infoTitle": "提示",
   "settings.toast.actionFailed": "{action}失败",
-  "settings.toast.actionFailedWithDetail": "{action}失败：{detail}",
   "settings.toast.engineDeleted": "引擎已删除",
   "settings.toast.roleBindingUpdated": "角色绑定已更新",
   "settings.toast.executionStatsReset": "执行统计已重置",

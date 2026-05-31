@@ -982,7 +982,6 @@
   "bridge.toast.operationCompletedTitle": "Operation complete",
   "bridge.toast.infoTitle": "Notice",
   "settings.toast.actionFailed": "{action} failed",
-  "settings.toast.actionFailedWithDetail": "{action} failed: {detail}",
   "settings.toast.engineDeleted": "Engine deleted",
   "settings.toast.roleBindingUpdated": "Role binding updated",
   "settings.toast.executionStatsReset": "Execution statistics reset",
