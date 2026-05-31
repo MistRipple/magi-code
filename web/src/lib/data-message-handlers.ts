@@ -257,7 +257,10 @@ export function handleUnifiedControlMessage(standard: StandardMessage) {
       const reason = typeof reasonRaw === 'string' ? reasonRaw.trim() : '';
       const modelOriginIssue = payload?.modelOriginIssue === true;
       const toastLevel = modelOriginIssue ? 'warning' : 'error';
-      const finalReason = reason || i18n.t('messageHandler.requestRejected');
+      const finalReason = i18n.t('messageHandler.requestRejected');
+      if (reason) {
+        console.warn('[MessageHandler] 任务请求被拒绝:', reason);
+      }
 
       if (requestId) {
         clearPendingRequest(requestId);
