@@ -4433,6 +4433,33 @@ mod tests {
     }
 
     #[test]
+    fn file_write_filesystem_failure_uses_public_message() {
+        let root = unique_temp_dir("magi-tool-file-write-public-error");
+        let registry = make_registry();
+        let occupied = root.join("occupied");
+        fs::write(&occupied, "not a directory").unwrap();
+        let target = occupied.join("child.txt");
+
+        let output = exec_tool(
+            &registry,
+            BuiltinToolName::FileWrite,
+            &serde_json::json!({
+                "path": target.to_string_lossy(),
+                "content": "content"
+            })
+            .to_string(),
+        );
+
+        assert_eq!(output.status, ExecutionResultStatus::Failed);
+        let payload: Value = serde_json::from_str(&output.payload).unwrap();
+        assert_eq!(payload["error"], "文件暂不可写入，请检查路径或权限");
+        let text = output.payload.to_string();
+        assert!(!text.contains("occupied"));
+        assert!(!text.contains("Not a directory"));
+        assert!(!text.contains("os error"));
+    }
+
+    #[test]
     fn file_write_rejects_overwrite_when_disabled() {
         let root = unique_temp_dir("magi-tool-file-write-no-overwrite");
         let registry = make_registry();

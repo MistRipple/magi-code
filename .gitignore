@@ -19,6 +19,7 @@ yarn-error.log*
 
 # --- Project Specific ---
 /tmp/
+/.magi/
 *.log
 *.pid
 .magi-host-loopback-*

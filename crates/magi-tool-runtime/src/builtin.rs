@@ -7,6 +7,7 @@ use magi_core::{ApprovalRequirement, ExecutionResultStatus, RiskLevel, UtcMillis
 use serde_json::Value;
 use std::{
     collections::HashMap,
+    fmt::Display,
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -25,6 +26,12 @@ use std::os::unix::process::CommandExt;
 const DEFAULT_SHELL_TIMEOUT_MS: u64 = 30_000;
 const MAX_SHELL_TIMEOUT_MS: u64 = 120_000;
 const SHELL_TIMEOUT_POLL_MS: u64 = 20;
+const FILE_READ_PUBLIC_ERROR: &str = "文件暂不可读取，请检查路径或权限";
+const FILE_WRITE_PUBLIC_ERROR: &str = "文件暂不可写入，请检查路径或权限";
+const FILE_DELETE_PUBLIC_ERROR: &str = "文件暂不可删除，请检查路径或权限";
+const FILE_COPY_PUBLIC_ERROR: &str = "文件暂不可复制，请检查路径或权限";
+const FILE_MOVE_PUBLIC_ERROR: &str = "文件暂不可移动，请检查路径或权限";
+const DIRECTORY_CREATE_PUBLIC_ERROR: &str = "目录暂不可创建，请检查路径或权限";
 
 #[derive(Clone)]
 struct ActiveShellExec {
@@ -295,7 +302,15 @@ fn execute_file_read(input: &str, context: &ToolExecutionContext) -> String {
 
     let metadata = match fs::metadata(&path) {
         Ok(metadata) => metadata,
-        Err(error) => return builtin_error("file_read", format!("读取元数据失败: {error}")),
+        Err(error) => {
+            return builtin_filesystem_error(
+                "file_read",
+                FILE_READ_PUBLIC_ERROR,
+                "读取文件元数据失败",
+                &path,
+                error,
+            );
+        }
     };
 
     if metadata.is_dir() {
@@ -304,7 +319,15 @@ fn execute_file_read(input: &str, context: &ToolExecutionContext) -> String {
                 .filter_map(|entry| entry.ok())
                 .map(|entry| entry.file_name().to_string_lossy().to_string())
                 .collect::<Vec<_>>(),
-            Err(error) => return builtin_error("file_read", format!("读取目录失败: {error}")),
+            Err(error) => {
+                return builtin_filesystem_error(
+                    "file_read",
+                    FILE_READ_PUBLIC_ERROR,
+                    "读取目录失败",
+                    &path,
+                    error,
+                );
+            }
         };
         entries.sort();
         return serde_json::json!({
@@ -322,7 +345,15 @@ fn execute_file_read(input: &str, context: &ToolExecutionContext) -> String {
 
     let bytes = match fs::read(&path) {
         Ok(bytes) => bytes,
-        Err(error) => return builtin_error("file_read", format!("读取文件失败: {error}")),
+        Err(error) => {
+            return builtin_filesystem_error(
+                "file_read",
+                FILE_READ_PUBLIC_ERROR,
+                "读取文件失败",
+                &path,
+                error,
+            );
+        }
     };
     let truncated = bytes.len() > max_bytes;
     let preview_bytes = if truncated {
@@ -1431,6 +1462,23 @@ fn builtin_error(tool: &str, message: impl Into<String>) -> String {
     .to_string()
 }
 
+fn builtin_filesystem_error(
+    tool: &str,
+    public_message: &'static str,
+    action: &'static str,
+    path: &Path,
+    error: impl Display,
+) -> String {
+    tracing::warn!(
+        tool,
+        action,
+        path = %path.display(),
+        error = %error,
+        "builtin filesystem operation failed"
+    );
+    builtin_error(tool, public_message)
+}
+
 fn builtin_rejected(tool: &str, message: impl Into<String>) -> String {
     serde_json::json!({
         "tool": tool,
@@ -1701,7 +1749,13 @@ fn execute_file_write(input: &str, context: &ToolExecutionContext) -> String {
         if let Some(parent) = path.parent() {
             if !parent.exists() {
                 if let Err(e) = fs::create_dir_all(parent) {
-                    return builtin_error("file_write", format!("创建父目录失败: {e}"));
+                    return builtin_filesystem_error(
+                        "file_write",
+                        DIRECTORY_CREATE_PUBLIC_ERROR,
+                        "创建文件父目录失败",
+                        parent,
+                        e,
+                    );
                 }
             }
         }
@@ -1709,7 +1763,13 @@ fn execute_file_write(input: &str, context: &ToolExecutionContext) -> String {
 
     let bytes = content.len();
     if let Err(e) = fs::write(&path, &content) {
-        return builtin_error("file_write", format!("写入文件失败: {e}"));
+        return builtin_filesystem_error(
+            "file_write",
+            FILE_WRITE_PUBLIC_ERROR,
+            "写入文件失败",
+            &path,
+            e,
+        );
     }
 
     serde_json::json!({
@@ -1742,7 +1802,15 @@ fn execute_file_patch(input: &str, context: &ToolExecutionContext) -> String {
 
     let content = match fs::read_to_string(&path) {
         Ok(c) => c,
-        Err(e) => return builtin_error("file_patch", format!("读取文件失败: {e}")),
+        Err(e) => {
+            return builtin_filesystem_error(
+                "file_patch",
+                FILE_READ_PUBLIC_ERROR,
+                "读取待修改文件失败",
+                &path,
+                e,
+            );
+        }
     };
 
     let patches_from_array: Vec<(String, String)> = request
@@ -1818,7 +1886,13 @@ fn execute_file_patch(input: &str, context: &ToolExecutionContext) -> String {
     }
 
     if let Err(e) = fs::write(&path, &result) {
-        return builtin_error("file_patch", format!("写回文件失败: {e}"));
+        return builtin_filesystem_error(
+            "file_patch",
+            FILE_WRITE_PUBLIC_ERROR,
+            "写回修改文件失败",
+            &path,
+            e,
+        );
     }
 
     serde_json::json!({
@@ -1876,7 +1950,13 @@ fn execute_file_remove(input: &str, context: &ToolExecutionContext) -> String {
     };
 
     if let Err(e) = result {
-        return builtin_error("file_remove", format!("删除失败: {e}"));
+        return builtin_filesystem_error(
+            "file_remove",
+            FILE_DELETE_PUBLIC_ERROR,
+            "删除文件或目录失败",
+            &path,
+            e,
+        );
     }
 
     serde_json::json!({
@@ -1981,7 +2061,13 @@ fn execute_file_mkdir(input: &str, context: &ToolExecutionContext) -> String {
     }
 
     if let Err(e) = fs::create_dir_all(&path) {
-        return builtin_error("file_mkdir", format!("创建目录失败: {e}"));
+        return builtin_filesystem_error(
+            "file_mkdir",
+            DIRECTORY_CREATE_PUBLIC_ERROR,
+            "创建目录失败",
+            &path,
+            e,
+        );
     }
 
     serde_json::json!({
@@ -2040,18 +2126,36 @@ fn execute_file_copy(input: &str, context: &ToolExecutionContext) -> String {
     if let Some(parent) = dst.parent() {
         if !parent.exists() {
             if let Err(e) = fs::create_dir_all(parent) {
-                return builtin_error("file_copy", format!("创建目标父目录失败: {e}"));
+                return builtin_filesystem_error(
+                    "file_copy",
+                    DIRECTORY_CREATE_PUBLIC_ERROR,
+                    "创建复制目标父目录失败",
+                    parent,
+                    e,
+                );
             }
         }
     }
 
     if src.is_dir() {
         if let Err(e) = copy_dir_recursive(&src, &dst) {
-            return builtin_error("file_copy", format!("复制目录失败: {e}"));
+            return builtin_filesystem_error(
+                "file_copy",
+                FILE_COPY_PUBLIC_ERROR,
+                "复制目录失败",
+                &src,
+                e,
+            );
         }
     } else {
         if let Err(e) = fs::copy(&src, &dst) {
-            return builtin_error("file_copy", format!("复制文件失败: {e}"));
+            return builtin_filesystem_error(
+                "file_copy",
+                FILE_COPY_PUBLIC_ERROR,
+                "复制文件失败",
+                &src,
+                e,
+            );
         }
     }
 
@@ -2126,7 +2230,13 @@ fn execute_file_move(input: &str, context: &ToolExecutionContext) -> String {
     if let Some(parent) = dst.parent() {
         if !parent.exists() {
             if let Err(e) = fs::create_dir_all(parent) {
-                return builtin_error("file_move", format!("创建目标父目录失败: {e}"));
+                return builtin_filesystem_error(
+                    "file_move",
+                    DIRECTORY_CREATE_PUBLIC_ERROR,
+                    "创建移动目标父目录失败",
+                    parent,
+                    e,
+                );
             }
         }
     }
@@ -2142,17 +2252,41 @@ fn execute_file_move(input: &str, context: &ToolExecutionContext) -> String {
     if let Err(_) = fs::rename(&src, &dst) {
         if src.is_dir() {
             if let Err(e) = copy_dir_recursive(&src, &dst) {
-                return builtin_error("file_move", format!("跨设备移动目录失败: {e}"));
+                return builtin_filesystem_error(
+                    "file_move",
+                    FILE_MOVE_PUBLIC_ERROR,
+                    "移动目录失败",
+                    &src,
+                    e,
+                );
             }
             if let Err(e) = fs::remove_dir_all(&src) {
-                return builtin_error("file_move", format!("删除源目录失败: {e}"));
+                return builtin_filesystem_error(
+                    "file_move",
+                    FILE_DELETE_PUBLIC_ERROR,
+                    "删除移动源目录失败",
+                    &src,
+                    e,
+                );
             }
         } else {
             if let Err(e) = fs::copy(&src, &dst) {
-                return builtin_error("file_move", format!("跨设备移动文件失败: {e}"));
+                return builtin_filesystem_error(
+                    "file_move",
+                    FILE_MOVE_PUBLIC_ERROR,
+                    "移动文件失败",
+                    &src,
+                    e,
+                );
             }
             if let Err(e) = fs::remove_file(&src) {
-                return builtin_error("file_move", format!("删除源文件失败: {e}"));
+                return builtin_filesystem_error(
+                    "file_move",
+                    FILE_DELETE_PUBLIC_ERROR,
+                    "删除移动源文件失败",
+                    &src,
+                    e,
+                );
             }
         }
     }

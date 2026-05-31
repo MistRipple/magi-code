@@ -5,9 +5,12 @@ use crate::{
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet},
+    fmt::Display,
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
+
+const APPLY_PATCH_FILE_ACCESS_PUBLIC_ERROR: &str = "apply_patch 无法访问目标文件，请检查路径或权限";
 
 #[derive(Clone, Debug)]
 struct ApplyPatchPlan {
@@ -353,9 +356,10 @@ fn read_staged_or_disk(
     if let Some(content) = staged.get(path) {
         return content
             .clone()
-            .ok_or_else(|| format!("文件已在本 patch 中删除，不能继续更新: {}", path.display()));
+            .ok_or_else(|| "文件已在本 patch 中删除，不能继续更新".to_string());
     }
-    fs::read_to_string(path).map_err(|error| format!("读取文件失败 {}: {error}", path.display()))
+    fs::read_to_string(path)
+        .map_err(|error| apply_patch_access_error("读取 apply_patch 目标文件失败", path, error))
 }
 
 fn validate_file_can_be_deleted(
@@ -366,13 +370,10 @@ fn validate_file_can_be_deleted(
         return Ok(());
     }
     if !path.exists() {
-        return Err(format!("删除失败，文件不存在: {}", path.display()));
+        return Err("删除失败，文件不存在".to_string());
     }
     if path.is_dir() {
-        return Err(format!(
-            "Delete File 只能删除文件，不能删除目录: {}",
-            path.display()
-        ));
+        return Err("Delete File 只能删除文件，不能删除目录".to_string());
     }
     Ok(())
 }
@@ -430,11 +431,13 @@ fn commit_staged_changes(staged: BTreeMap<PathBuf, Option<String>>) -> Result<()
         .filter_map(|(path, content)| content.as_ref().map(|content| (path, content)))
     {
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|error| format!("创建父目录失败 {}: {error}", parent.display()))?;
+            fs::create_dir_all(parent).map_err(|error| {
+                apply_patch_access_error("创建 apply_patch 父目录失败", parent, error)
+            })?;
         }
-        fs::write(path, content)
-            .map_err(|error| format!("写入文件失败 {}: {error}", path.display()))?;
+        fs::write(path, content).map_err(|error| {
+            apply_patch_access_error("写入 apply_patch 目标文件失败", path, error)
+        })?;
     }
 
     for path in staged
@@ -442,11 +445,22 @@ fn commit_staged_changes(staged: BTreeMap<PathBuf, Option<String>>) -> Result<()
         .filter_map(|(path, content)| content.is_none().then_some(path))
     {
         if path.exists() {
-            fs::remove_file(path)
-                .map_err(|error| format!("删除文件失败 {}: {error}", path.display()))?;
+            fs::remove_file(path).map_err(|error| {
+                apply_patch_access_error("删除 apply_patch 目标文件失败", path, error)
+            })?;
         }
     }
     Ok(())
+}
+
+fn apply_patch_access_error(action: &'static str, path: &Path, error: impl Display) -> String {
+    tracing::warn!(
+        action,
+        path = %path.display(),
+        error = %error,
+        "apply_patch filesystem operation failed"
+    );
+    APPLY_PATCH_FILE_ACCESS_PUBLIC_ERROR.to_string()
 }
 
 fn apply_patch_error(message: impl Into<String>) -> String {
@@ -553,6 +567,29 @@ mod tests {
             fs::read_to_string(dir.join("dup.txt")).unwrap(),
             "same\nsame\n"
         );
+    }
+
+    #[test]
+    fn apply_patch_filesystem_failure_uses_public_message() {
+        let dir = unique_temp_dir("magi-apply-patch-public-error");
+        let missing = dir.join("missing.txt");
+        let patch = r#"*** Begin Patch
+*** Update File: missing.txt
+@@
+-old
++new
+*** End Patch
+"#;
+
+        let output = execute_apply_patch(patch, &context(&dir));
+        let payload: Value = serde_json::from_str(&output).expect("json output");
+
+        assert_eq!(payload["status"], "failed");
+        assert_eq!(payload["error"], APPLY_PATCH_FILE_ACCESS_PUBLIC_ERROR);
+        let text = output.to_string();
+        assert!(!text.contains(missing.to_string_lossy().as_ref()));
+        assert!(!text.contains("No such file"));
+        assert!(!text.contains("os error"));
     }
 
     #[test]
