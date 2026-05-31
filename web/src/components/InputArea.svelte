@@ -99,7 +99,7 @@
   let pickerLoadedOnce = false;
 
   // Git 分支切换器：仅在工作区是 git 仓库时显示。分支信息为即时查询的瞬态状态，
-  // 不进持久化 store；切换失败（如未提交改动被 git 拒绝）把原文展示给用户，不做兜底。
+  // 不进持久化 store；切换失败只展示稳定提示，原始错误保留在控制台日志。
   let branchPickerOpen = $state(false);
   let branchLoading = $state(false);
   let branchSwitching = $state<string | null>(null);
@@ -675,7 +675,7 @@
           const client = new RustDaemonClient(resolveAgentBaseUrl());
           await client.interruptTask({ taskId: rootTaskId, sessionId });
           await refreshTaskProjection(sessionId);
-          addToast('info', '任务已停止，进度已保存');
+          addToast('info', i18n.t('input.stopTaskSaved'));
         }
         return;
       }
@@ -1355,12 +1355,12 @@
             onclick={togglePicker}
             disabled={sessionInputLocked || isInteractionBlocking || pickerSavingModel !== null}
             title={currentPickerModel
-              ? `当前全局主模型：${currentPickerModel}。选择后会保存到全局设置。`
-              : '选择全局主模型，选择后会保存到全局设置'}
+              ? i18n.t('input.mainModelPicker.titleConfigured', { model: currentPickerModel })
+              : i18n.t('input.mainModelPicker.titleEmpty')}
             aria-expanded={pickerOpen}
           >
             <Icon name="model" size={12} />
-            <span class="ia-picker-btn-label">{currentPickerModel || '选择主模型'}</span>
+            <span class="ia-picker-btn-label">{currentPickerModel || i18n.t('input.mainModelPicker.buttonEmpty')}</span>
             <Icon name="chevron-down" size={10} />
           </button>
           {#if pickerOpen}
@@ -1368,9 +1368,9 @@
             <!-- svelte-ignore a11y_no_static_element_interactions -->
             <div class="ia-popover-backdrop" onclick={() => (pickerOpen = false)}></div>
             <div class="ia-picker-popover" role="menu">
-              <div class="ia-picker-header">切换全局主模型</div>
+              <div class="ia-picker-header">{i18n.t('input.mainModelPicker.header')}</div>
               {#if pickerLoading}
-                <div class="ia-picker-status">拉取主模型可用列表中…</div>
+                <div class="ia-picker-status">{i18n.t('input.mainModelPicker.loading')}</div>
               {:else if pickerError}
                 <div class="ia-picker-status ia-picker-status-error">
                   {pickerError}
@@ -1378,10 +1378,10 @@
                     type="button"
                     class="ia-picker-retry"
                     onclick={() => { pickerError = null; loadPickerModels(); }}
-                  >重试</button>
+                  >{i18n.t('input.mainModelPicker.retry')}</button>
                 </div>
               {:else if pickerModels.length === 0}
-                <div class="ia-picker-status">主模型 channel 暂无可用模型</div>
+                <div class="ia-picker-status">{i18n.t('input.mainModelPicker.empty')}</div>
               {:else}
                 <div class="ia-picker-list">
                   {#each pickerModels as model (model)}
@@ -1394,9 +1394,9 @@
                     >
                       <span class="ia-picker-item-label">{model}</span>
                       {#if pickerSavingModel === model}
-                        <span class="ia-picker-item-desc">保存中…</span>
+                        <span class="ia-picker-item-desc">{i18n.t('input.mainModelPicker.saving')}</span>
                       {:else if currentPickerModel === model}
-                        <span class="ia-picker-item-desc">当前主线模型</span>
+                        <span class="ia-picker-item-desc">{i18n.t('input.mainModelPicker.current')}</span>
                       {/if}
                     </button>
                   {/each}
@@ -1447,7 +1447,7 @@
             data-testid="input-stop-button"
             onclick={stopTask}
             disabled={stopLoading}
-            title={shouldInterruptTaskProjectionFromComposer ? '停止当前任务，保留进度' : i18n.t('input.stop')}
+            title={shouldInterruptTaskProjectionFromComposer ? i18n.t('input.stopTaskTitle') : i18n.t('input.stop')}
           >
             <Icon name={stopLoading ? 'loader' : 'stop'} size={14} class={stopLoading ? 'spinning' : ''} />
           </button>
