@@ -154,17 +154,20 @@ function normalizeCapabilityDependencies(value: unknown): SettingsCapabilityDepe
     const status = typeof record.status === 'string' && record.status.trim()
       ? record.status.trim()
       : 'unknown';
+    const snapshotActive = record.snapshot_active ?? record.snapshotActive;
     dependencies.push({
       name,
       status,
       requiredBy: normalizeRequiredBy(record.required_by ?? record.requiredBy),
       workspaceId: normalizeNullableString(record.workspace_id ?? record.workspaceId),
+      sessionId: normalizeNullableString(record.session_id ?? record.sessionId),
       fileCount: normalizeNullableNumber(record.file_count ?? record.fileCount),
       lastIndexed: normalizeNullableNumber(record.last_indexed ?? record.lastIndexed),
       roleCount: normalizeNullableNumber(record.role_count ?? record.roleCount),
       spawnableRoleCount: normalizeNullableNumber(
         record.spawnable_role_count ?? record.spawnableRoleCount,
       ),
+      snapshotActive: typeof snapshotActive === 'boolean' ? snapshotActive : null,
     });
   }
   return dependencies;
