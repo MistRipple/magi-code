@@ -3054,7 +3054,9 @@ async function installSkill(skillId: string): Promise<void> {
   } catch (error) {
     emitDataMessage('skillInstallFailed', {
       skillId,
-      error: error instanceof Error ? error.message : String(error),
+      error: i18n.t('bridge.toast.actionFailed', {
+        action: i18n.t('settings.toast.action.installSkill'),
+      }),
       source: 'repository',
     });
     emitBridgeErrorToast(i18n.t('settings.toast.action.installSkill'), error);
@@ -3080,7 +3082,7 @@ async function installLocalSkill(directoryPath?: string): Promise<void> {
     );
   } catch (error) {
     emitDataMessage('skillInstallFailed', {
-      error: error instanceof Error ? error.message : String(error),
+      error: i18n.t('settings.skillLibrary.localImportFailed'),
       source: 'local',
     });
     emitBridgeErrorToast(i18n.t('settings.toast.action.installLocalSkill'), error);
@@ -3432,7 +3434,7 @@ export function createWebClientBridge(): ClientBridge {
               : i18n.t('settings.toast.action.deleteInstructionSkill');
             const logLabel = source === 'custom'
               ? '[web-client-bridge] 删除自定义工具失败:'
-              : '[web-client-bridge] 删除指令技能失败:';
+              : '[web-client-bridge] 删除 Skill 失败:';
             void removeInstalledSkill(skillName, source).catch((error) => {
               logBridgeOperationFailure(
                 action,
