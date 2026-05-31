@@ -976,7 +976,6 @@
   "bridge.toast.defaultAction": "Request",
   "bridge.toast.defaultInfoAction": "Notice",
   "bridge.toast.actionFailed": "{action} failed",
-  "bridge.toast.actionFailedWithDetail": "{action} failed: {detail}",
   "bridge.toast.actionSucceeded": "{action} succeeded",
   "bridge.toast.requestFailedTitle": "Request failed",
   "bridge.toast.operationCompletedTitle": "Operation complete",

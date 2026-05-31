@@ -976,7 +976,6 @@
   "bridge.toast.defaultAction": "请求",
   "bridge.toast.defaultInfoAction": "提示",
   "bridge.toast.actionFailed": "{action}失败",
-  "bridge.toast.actionFailedWithDetail": "{action}失败：{detail}",
   "bridge.toast.actionSucceeded": "{action}成功",
   "bridge.toast.requestFailedTitle": "请求失败",
   "bridge.toast.operationCompletedTitle": "操作完成",

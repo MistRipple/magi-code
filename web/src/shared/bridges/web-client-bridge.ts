@@ -1171,15 +1171,9 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
   }
 }
 
-function emitBridgeErrorToast(action: string, error: unknown): void {
+function emitBridgeErrorToast(action: string, _error: unknown): void {
   const normalizedAction = action.trim() || i18n.t('bridge.toast.defaultAction');
-  const detail = normalizeErrorMessage(error);
-  const content = detail
-    ? i18n.t('bridge.toast.actionFailedWithDetail', {
-        action: normalizedAction,
-        detail,
-      })
-    : i18n.t('bridge.toast.actionFailed', { action: normalizedAction });
+  const content = i18n.t('bridge.toast.actionFailed', { action: normalizedAction });
   const now = Date.now();
   const message = createNotifyMessage(
     content,

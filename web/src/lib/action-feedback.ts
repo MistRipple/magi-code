@@ -13,16 +13,6 @@ export interface ActionFeedbackOptions<T> {
   onError?: (errorMessage: string, error: unknown) => void | Promise<void>;
 }
 
-function normalizeActionMessage(value: unknown): string {
-  if (value instanceof Error) {
-    return value.message.trim();
-  }
-  if (typeof value === 'string') {
-    return value.trim();
-  }
-  return '';
-}
-
 function resolveSuccessMessage<T>(
   result: T,
   options: ActionFeedbackOptions<T>,
@@ -58,8 +48,7 @@ export async function runActionWithFeedback<T>(
     );
     return result;
   } catch (error) {
-    const detail = normalizeActionMessage(error);
-    const errorMessage = detail ? `${options.actionLabel}失败：${detail}` : `${options.actionLabel}失败`;
+    const errorMessage = `${options.actionLabel}失败`;
     await options.onError?.(errorMessage, error);
     addToast(
       'error',
