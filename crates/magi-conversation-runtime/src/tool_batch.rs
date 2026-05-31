@@ -20,8 +20,9 @@ use magi_bridge_client::{
     tool_concurrency::{ToolBatchKind, ToolConcurrencyInput, partition_tool_calls_with_inputs},
 };
 use magi_core::{
-    EventId, ExecutionResultStatus, SessionId, TaskId, TaskKind, TaskPolicy, TaskStatus, TaskTier,
-    ToolCallId, UtcMillis, WorkspaceId, task_output_ref_is_internal_runtime_failure,
+    EventId, ExecutionResultStatus, SessionId, TASK_RUNTIME_FAILURE_PUBLIC_OUTPUT, TaskId,
+    TaskKind, TaskPolicy, TaskStatus, TaskTier, ToolCallId, UtcMillis, WorkspaceId,
+    public_task_output_refs, task_output_ref_is_internal_runtime_failure,
 };
 use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
 use magi_orchestrator::task_store::TaskStore;
@@ -1236,12 +1237,19 @@ fn child_agent_terminal_payload(child: &magi_core::Task) -> serde_json::Value {
             payload
         }
         TaskStatus::Failed => {
-            let error = child
-                .output_refs
+            let public_output_refs =
+                public_task_output_refs(TaskStatus::Failed, &child.output_refs);
+            let error = public_output_refs
                 .first()
                 .cloned()
                 .unwrap_or_else(|| "代理任务执行失败".to_string());
-            if agent_unavailable_failure(&error) {
+            let unavailable = public_output_refs
+                .iter()
+                .any(|output| agent_unavailable_failure(output))
+                || public_output_refs
+                    .first()
+                    .is_some_and(|output| output == TASK_RUNTIME_FAILURE_PUBLIC_OUTPUT);
+            if unavailable {
                 let mut payload = base("degraded", "failed");
                 payload["fallback_mode"] =
                     serde_json::Value::String("mainline_or_reassign".to_string());
@@ -1260,7 +1268,7 @@ fn child_agent_terminal_payload(child: &magi_core::Task) -> serde_json::Value {
                 payload["error"] = serde_json::Value::String("代理当前不可用".to_string());
                 return payload;
             }
-            let output = child_agent_output(&child.output_refs);
+            let output = child_agent_output(&public_output_refs);
             let mut payload = base("failed", "failed");
             payload["result"] = serde_json::json!({
                 "final_text": output.final_text,
@@ -2846,6 +2854,51 @@ mod tests {
         assert_eq!(
             result["result"]["final_text"].as_str(),
             Some("测试失败：断言不匹配")
+        );
+    }
+
+    #[test]
+    fn agent_wait_redacts_internal_failure_details_from_failed_agent_output() {
+        let task_store = TaskStore::new();
+        let mut child = test_task(
+            "task-agent-wait-redacted-failure",
+            "task-agent-wait-root",
+            Some(TaskId::new("task-agent-wait-root")),
+        );
+        child.status = TaskStatus::Failed;
+        child.title = "验证代理".to_string();
+        child.goal = "运行验证并报告失败原因".to_string();
+        child.executor_binding = Some(serde_json::json!({
+            "target_role": "tester",
+        }));
+        child.output_refs = vec![
+            "测试失败：断言不匹配".to_string(),
+            "provider transport failed: connection refused".to_string(),
+        ];
+        task_store.insert_task(child);
+
+        let (payload, status) = execute_agent_wait(
+            &task_store,
+            BuiltinToolName::AgentWait,
+            &serde_json::json!({
+                "task_ids": ["task-agent-wait-redacted-failure"],
+                "timeout_ms": 1000,
+            }),
+        );
+
+        assert_eq!(status, ExecutionResultStatus::Succeeded);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&payload).expect("agent_wait result should be json");
+        let result = &parsed["results"][0];
+        assert_eq!(result["status"].as_str(), Some("failed"));
+        assert_eq!(result["error"].as_str(), Some("测试失败：断言不匹配"));
+        assert_eq!(
+            result["result"]["final_text"].as_str(),
+            Some("测试失败：断言不匹配")
+        );
+        assert!(
+            !result.to_string().contains("provider transport failed"),
+            "agent_wait failed payload should not expose internal provider detail"
         );
     }
 
