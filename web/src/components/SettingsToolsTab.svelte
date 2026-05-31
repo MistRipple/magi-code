@@ -278,6 +278,44 @@
     return '';
   }
 
+  function getCapabilityDependencyConsumerLabel(name: string): string {
+    switch (name) {
+      case 'knowledge_query':
+        return i18n.t('settings.tools.dependency.consumer.knowledgeQuery');
+      case 'search_semantic':
+      case 'code_symbols':
+        return i18n.t('settings.tools.dependency.consumer.localCodeSearch');
+      case 'agent_spawn':
+      case 'agent_wait':
+        return i18n.t('settings.tools.dependency.consumer.subagentTasks');
+      case 'task_execution':
+        return i18n.t('settings.tools.dependency.consumer.taskExecution');
+      case 'conversation_context':
+        return i18n.t('settings.tools.dependency.consumer.conversationContext');
+      case 'knowledge_memory_selection':
+        return i18n.t('settings.tools.dependency.consumer.knowledgeMemorySelection');
+      case 'changes/diff':
+      case 'changes/approve':
+      case 'changes/revert':
+        return i18n.t('settings.tools.dependency.consumer.fileChangeManagement');
+      case 'skill prompt context':
+        return i18n.t('settings.tools.dependency.consumer.skillContext');
+      case 'skill custom tools':
+        return i18n.t('settings.tools.dependency.consumer.skillTools');
+      case 'mcp custom tools':
+      case 'skill MCP bridge tools':
+        return i18n.t('settings.tools.dependency.consumer.mcpTools');
+      default:
+        return i18n.t('settings.tools.dependency.consumer.other');
+    }
+  }
+
+  function formatCapabilityDependencyConsumers(requiredBy: string[]): string {
+    const labels = requiredBy.map(getCapabilityDependencyConsumerLabel);
+    const uniqueLabels = Array.from(new Set(labels)).filter(Boolean);
+    return uniqueLabels.join(i18n.t('settings.tools.dependency.consumer.separator'));
+  }
+
   function getCapabilityDependencyTitle(dependency: {
     name: string;
     status: string;
@@ -297,7 +335,7 @@
     if (metric) parts.push(metric);
     if (dependency.requiredBy.length > 0) {
       parts.push(i18n.t('settings.tools.dependency.requiredBy', {
-        tools: dependency.requiredBy.join(', '),
+        tools: formatCapabilityDependencyConsumers(dependency.requiredBy),
       }));
     }
     return parts.join('\n');
