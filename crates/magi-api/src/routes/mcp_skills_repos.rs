@@ -681,7 +681,7 @@ async fn list_skills(State(state): State<ApiState>) -> Json<serde_json::Value> {
         .as_array()
         .cloned()
         .unwrap_or_default();
-    let mut failed_repos: Vec<serde_json::Value> = Vec::new();
+    let mut failed_repo_count = 0usize;
     for repo in &repos {
         let repo_url = repo.get("url").and_then(|v| v.as_str()).unwrap_or_default();
         let repo_id = repo
@@ -722,11 +722,14 @@ async fn list_skills(State(state): State<ApiState>) -> Json<serde_json::Value> {
                     error = ?e,
                     "Skill repository load failed"
                 );
-                failed_repos.push(serde_json::json!({"repositoryId": repo_id, "url": repo_url, "error": "repository_load_failed"}));
+                failed_repo_count += 1;
             }
         }
     }
-    Json(serde_json::json!({"skills": all_skills, "failedRepositories": failed_repos}))
+    Json(serde_json::json!({
+        "skills": all_skills,
+        "failedRepositoryCount": failed_repo_count,
+    }))
 }
 
 async fn fetch_github_repo_skills(repo_url: &str) -> Result<Vec<serde_json::Value>, ApiError> {

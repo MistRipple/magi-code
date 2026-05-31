@@ -15,6 +15,7 @@ import type {
   MessagesResponseDto,
   FetchModelsResponseDto,
   EnhancePromptRequestDto,
+  SkillsLibraryResponseDto,
 } from '../shared/rust-backend-types';
 import type { CanonicalTurn, CanonicalTurnItem } from '../shared/protocol/canonical-turn';
 import { i18n } from '../stores/i18n.svelte';
@@ -1589,9 +1590,9 @@ export async function refreshAgentRepository(repositoryId: string): Promise<Reco
   return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/repositories/refresh', { repositoryId }, 'refresh repository');
 }
 
-export async function loadAgentSkillLibrary(): Promise<Record<string, unknown>> {
+export async function loadAgentSkillLibrary(): Promise<SkillsLibraryResponseDto> {
   const response = await getTransport().request(agentUrl('/api/settings/skills/library', buildWorkspaceBoundQuery({})));
-  return await parseAgentJson<Record<string, unknown>>(response, 'load skill library');
+  return await parseAgentJson<SkillsLibraryResponseDto>(response, 'load skill library');
 }
 
 export async function installAgentSkill(skillId: string): Promise<Record<string, unknown>> {

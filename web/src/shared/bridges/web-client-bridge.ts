@@ -3053,7 +3053,10 @@ async function refreshRepository(repositoryId: string): Promise<void> {
 
 async function loadSkillLibrary(): Promise<void> {
   const payload = await loadAgentSkillLibrary();
-  emitDataMessage('skillLibraryLoaded', payload);
+  emitDataMessage('skillLibraryLoaded', {
+    skills: payload.skills,
+    failedRepositoryCount: payload.failedRepositoryCount ?? 0,
+  });
   emitBridgeSuccessToast(
     i18n.t('settings.toast.action.loadSkillLibrary'),
     i18n.t('settings.toast.skillLibraryLoaded'),

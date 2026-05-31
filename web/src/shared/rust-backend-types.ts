@@ -1128,7 +1128,7 @@ export interface RepositoryRefreshResponseDto {
 
 export interface SkillsLibraryResponseDto {
   skills: unknown;
-  failedRepositories?: unknown;
+  failedRepositoryCount?: number;
 }
 
 export interface SkillInstallResponseDto {

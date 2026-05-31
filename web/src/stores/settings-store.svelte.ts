@@ -1986,10 +1986,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
     localSkillInstallError = "";
     try {
       const payload = await loadAgentSkillLibrary();
-      const skillsList = ensureArray<any>((payload as any)?.skills);
-      const failedRepos = ensureArray<any>(
-        (payload as any)?.failedRepositories,
-      );
+      const skillsList = ensureArray<any>(payload.skills);
       librarySkills = skillsList.map((s: any) => ({
         name: s.name,
         fullName: s.fullName || s.name,
@@ -2003,7 +2000,10 @@ function createSettingsStore(props: { onClose?: () => void }) {
         installed: s.installed || false,
         icon: s.icon,
       }));
-      skillLibraryFailedRepositoryCount = failedRepos.length;
+      skillLibraryFailedRepositoryCount =
+        typeof payload.failedRepositoryCount === "number" && Number.isFinite(payload.failedRepositoryCount)
+          ? payload.failedRepositoryCount
+          : 0;
     } catch (e) {
       console.error("[SettingsPanel] 加载 Skill 库失败:", e);
       notifySettingsError(i18n.t("settings.toast.action.loadSkillLibrary"), e);
@@ -2053,7 +2053,11 @@ function createSettingsStore(props: { onClose?: () => void }) {
         installingSkills = new Set(installingSkills);
         if ((result as any)?.success !== false) {
           const libPayload = await loadAgentSkillLibrary();
-          const skillsList = ensureArray<any>((libPayload as any)?.skills);
+          const skillsList = ensureArray<any>(libPayload.skills);
+          skillLibraryFailedRepositoryCount =
+            typeof libPayload.failedRepositoryCount === "number" && Number.isFinite(libPayload.failedRepositoryCount)
+              ? libPayload.failedRepositoryCount
+              : 0;
           // Preserve local entries
           const localEntries = librarySkills.filter((s) => s.repositoryId === "__local__");
           librarySkills = [
