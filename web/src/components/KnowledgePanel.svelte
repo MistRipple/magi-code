@@ -387,7 +387,8 @@
       closeEditor();
       refresh();
     } catch (error) {
-      formError = error instanceof Error ? error.message : i18n.t('knowledge.form.saveFailed');
+      console.warn('[KnowledgePanel] save knowledge item failed:', error);
+      formError = i18n.t('knowledge.form.saveFailed');
     } finally {
       isSaving = false;
     }
@@ -405,10 +406,6 @@
     expandedLearningId = null;
     showClearConfirm = false;
     closeEditor();
-  }
-
-  function formatLoadError(error: unknown): string {
-    return error instanceof Error ? error.message : String(error || i18n.t('knowledgePanel.unknownError'));
   }
 
   function applyKnowledgePayload(payload: Record<string, unknown> | null | undefined): boolean {
@@ -507,7 +504,14 @@
 
   function handleKnowledgeLoadError(error: unknown) {
     clearKnowledgeContent();
-    loadError = i18n.t('knowledge.toast.loadFailed', { error: formatLoadError(error) });
+    console.warn('[KnowledgePanel] load project knowledge failed:', error);
+    loadError = i18n.t('knowledge.toast.loadFailed');
+    isLoading = false;
+  }
+
+  function handleKnowledgeMutationError(error: unknown, messageKey: string) {
+    console.warn('[KnowledgePanel] project knowledge mutation failed:', error);
+    loadError = i18n.t(messageKey);
     isLoading = false;
   }
 
@@ -582,7 +586,9 @@
 
   function deleteKnowledgeEntry(id: string) {
     if (isWebMode) {
-      deleteAgentKnowledgeItem(id).then(() => refresh()).catch(console.error);
+      deleteAgentKnowledgeItem(id)
+        .then(() => refresh())
+        .catch((error) => handleKnowledgeMutationError(error, 'knowledge.toast.deleteFailed'));
     } else {
       vscode.postMessage({ type: 'deleteKnowledgeItem', knowledgeId: id });
     }
@@ -600,7 +606,9 @@
     showClearConfirm = false;
     isLoading = true;
     if (isWebMode) {
-      clearAgentProjectKnowledge().then(() => refresh()).catch(handleKnowledgeLoadError);
+      clearAgentProjectKnowledge()
+        .then(() => refresh())
+        .catch((error) => handleKnowledgeMutationError(error, 'knowledge.toast.clearFailed'));
     } else {
       vscode.postMessage({ type: 'clearProjectKnowledge' });
     }

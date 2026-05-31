@@ -427,8 +427,8 @@
   }
 
   function notifyWorkbenchError(actionLabel: string, error: unknown): void {
-    const detail = error instanceof Error ? error.message : String(error);
-    addToast('error', detail ? `${actionLabel}失败：${detail}` : `${actionLabel}失败`, undefined, {
+    console.warn(`[WebWorkbenchShell] ${actionLabel} failed:`, error);
+    addToast('error', `${actionLabel}失败，请稍后重试`, undefined, {
       category: 'incident',
       source: 'web-workbench',
       actionRequired: true,
@@ -726,7 +726,7 @@
         requestCurrentSessionState();
       }
     } catch (error) {
-      loadError = error instanceof Error ? error.message : String(error);
+      loadError = i18n.t('web.workspaceUnavailable');
       notifyWorkbenchError('加载工作区列表', error);
     } finally {
       loading = false;
@@ -876,7 +876,8 @@
         try {
           await refreshWorkspaceSessions(workspace.workspaceId, '');
         } catch (error) {
-          loadError = error instanceof Error ? error.message : String(error);
+          console.warn('[WebWorkbenchShell] refresh workspace sessions failed:', error);
+          loadError = i18n.t('web.workspaceUnavailable');
         }
       })();
     }

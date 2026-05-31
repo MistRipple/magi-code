@@ -1286,6 +1286,17 @@ function logBridgeOperationFailure(
   }
 }
 
+function logKnowledgeOperationFailure(action: string, logLabel: string, error: unknown, detailKey: string): void {
+  console.error(logLabel, error);
+  emitBridgeErrorToast(action, new Error(i18n.t(detailKey)));
+}
+
+function knowledgeAddFailureKey(kind: string): string {
+  if (kind === 'adr') return 'knowledge.toast.addAdrFailed';
+  if (kind === 'faq') return 'knowledge.toast.addFaqFailed';
+  return 'knowledge.toast.addLearningFailed';
+}
+
 function isBridgeRecoveringOrUnavailable(): boolean {
   return bridgeRecovering
     || recoveryInFlight !== null
@@ -3736,19 +3747,21 @@ export function createWebClientBridge(): ClientBridge {
           return;
         case 'getProjectKnowledge':
           void dispatchProjectKnowledge().catch((error) => {
-            logBridgeOperationFailure(
+            logKnowledgeOperationFailure(
               i18n.t('settings.toast.action.loadProjectKnowledge'),
               '[web-client-bridge] 项目知识加载失败:',
               error,
+              'knowledge.toast.loadFailed',
             );
           });
           return;
         case 'clearProjectKnowledge':
           void clearProjectKnowledge().catch((error) => {
-            logBridgeOperationFailure(
+            logKnowledgeOperationFailure(
               i18n.t('settings.toast.action.clearProjectKnowledge'),
               '[web-client-bridge] 清空项目知识失败:',
               error,
+              'knowledge.toast.clearFailed',
             );
           });
           return;
@@ -3767,7 +3780,7 @@ export function createWebClientBridge(): ClientBridge {
               await emitKnowledgePayload();
               emitBridgeSuccessToast('添加知识条目', '知识条目已添加');
             }).catch((error) => {
-              logBridgeOperationFailure('添加知识条目 ', '[web-client-bridge] 添加知识条目失败:', error);
+              logKnowledgeOperationFailure('添加知识条目', '[web-client-bridge] 添加知识条目失败:', error, knowledgeAddFailureKey(kind));
             });
           }
           return;
@@ -3785,7 +3798,7 @@ export function createWebClientBridge(): ClientBridge {
               await emitKnowledgePayload();
               emitBridgeSuccessToast('更新知识条目', '知识条目已更新');
             }).catch((error) => {
-              logBridgeOperationFailure('更新知识条目 ', '[web-client-bridge] 更新知识条目失败:', error);
+              logKnowledgeOperationFailure('更新知识条目', '[web-client-bridge] 更新知识条目失败:', error, 'knowledge.form.saveFailed');
             });
           }
           return;
@@ -3797,7 +3810,7 @@ export function createWebClientBridge(): ClientBridge {
               await emitKnowledgePayload();
               emitBridgeSuccessToast('删除知识条目', '知识条目已删除');
             }).catch((error) => {
-              logBridgeOperationFailure('删除知识条目 ', '[web-client-bridge] 删除知识条目失败:', error);
+              logKnowledgeOperationFailure('删除知识条目', '[web-client-bridge] 删除知识条目失败:', error, 'knowledge.toast.deleteFailed');
             });
           }
           return;
