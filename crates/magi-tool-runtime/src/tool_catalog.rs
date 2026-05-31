@@ -164,17 +164,15 @@ pub(crate) fn build_tool_catalog_value(
         "tool": "tool_catalog",
         "status": "succeeded",
         "access_mode": BuiltinToolAccessMode::ReadOnly.as_str(),
-        "summary": format!(
-            "工具目录: builtin_public={} builtin_internal={} skill_tools={} mcp_servers={} connected_mcp_servers={} agent_roles={} spawnable_agent_roles={} schema_warnings={} runtime_warnings={}",
+        "summary": tool_catalog_summary(
             public_count,
-            internal_count,
             skill_tool_count,
-            mcp_server_count,
             connected_mcp_server_count,
-            agent_role_count,
+            mcp_server_count,
             spawnable_agent_role_count,
+            agent_role_count,
             schema_warning_count,
-            runtime_warning_count
+            runtime_warning_count,
         ),
         "total": tools.len() + skill_tool_count,
         "builtin_total": BuiltinToolName::ALL.len(),
@@ -207,6 +205,26 @@ pub(crate) fn build_tool_catalog_value(
             serde_json::json!([])
         },
     })
+}
+
+fn tool_catalog_summary(
+    public_count: usize,
+    skill_tool_count: usize,
+    connected_mcp_server_count: usize,
+    mcp_server_count: usize,
+    spawnable_agent_role_count: usize,
+    agent_role_count: usize,
+    schema_warning_count: usize,
+    runtime_warning_count: usize,
+) -> String {
+    let mut summary = format!(
+        "工具目录已更新：{public_count} 个内置工具、{skill_tool_count} 个 Skill 工具、MCP {connected_mcp_server_count}/{mcp_server_count} 可用、子代理 {spawnable_agent_role_count}/{agent_role_count} 可派发"
+    );
+    let warning_count = schema_warning_count + runtime_warning_count;
+    if warning_count > 0 {
+        summary.push_str(&format!("，{warning_count} 项能力需关注"));
+    }
+    summary
 }
 
 struct RuntimeHealth {
@@ -529,6 +547,24 @@ mod tests {
         let payload: serde_json::Value = serde_json::from_str(&output).expect("json output");
 
         assert_eq!(payload["status"], "succeeded");
+        let summary = payload["summary"].as_str().expect("summary should be text");
+        assert!(
+            summary.starts_with("工具目录已更新："),
+            "tool catalog summary should use product language"
+        );
+        for forbidden in [
+            "builtin_public",
+            "builtin_internal",
+            "skill_tools",
+            "mcp_servers",
+            "schema_warnings",
+            "runtime_warnings",
+        ] {
+            assert!(
+                !summary.contains(forbidden),
+                "tool catalog summary should not expose internal field {forbidden}"
+            );
+        }
         assert_eq!(payload["schema_warning_count"], 0);
         assert!(
             payload["runtime_warning_count"]
