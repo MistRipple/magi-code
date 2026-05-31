@@ -665,7 +665,7 @@
       await client.interruptTask({ taskId: rootTaskId, sessionId, workspaceId: currentWorkspaceIdValue() });
       clearDeliveryPackageViewState();
       await refreshTaskProjection(sessionId);
-      addToast('info', '任务已中断，进度已保留');
+      addToast('info', i18n.t('tasks.action.stopped'));
     }).catch((err) => {
       reportTaskActionFailure('tasks.action.stopFailed', err);
     });
@@ -680,7 +680,7 @@
       await client.continueSession({ sessionId, workspaceId: currentWorkspaceIdValue() });
       clearDeliveryPackageViewState();
       await refreshTaskProjection(sessionId);
-      addToast('success', '任务已继续');
+      addToast('success', i18n.t('tasks.action.resumed'));
     }).catch((err) => {
       reportTaskActionFailure('tasks.action.resumeFailed', err);
     });
@@ -700,7 +700,7 @@
         await refreshTaskProjection(sessionId);
       }
       await refreshSessionTaskHistory();
-      addToast('success', '任务已重新执行');
+      addToast('success', i18n.t('tasks.action.restarted'));
     }).catch((err) => {
       reportTaskActionFailure('tasks.action.restartFailed', err);
     });
@@ -716,7 +716,7 @@
       clearDeliveryPackageViewState();
       clearTaskProjection(sessionId, rootTaskId);
       await refreshSessionTaskHistory();
-      addToast('info', '任务已从面板移除');
+      addToast('info', i18n.t('tasks.action.archived'));
     }).catch((err) => {
       reportTaskActionFailure('tasks.action.archiveFailed', err);
     });
@@ -736,7 +736,7 @@
         await refreshTaskProjection(sessionId);
       }
       await refreshSessionTaskHistory();
-      addToast('success', '任务已重新执行');
+      addToast('success', i18n.t('tasks.action.restarted'));
     } catch (err) {
       reportTaskActionFailure('tasks.action.restartFailed', err);
     } finally {
@@ -756,9 +756,9 @@
         deliverySummaryCopied = false;
         deliverySummaryCopyTimer = null;
       }, 1800);
-      addToast('info', '交付摘要已复制');
+      addToast('info', i18n.t('tasks.delivery.copySummarySuccess'));
     } catch {
-      addToast('error', '复制交付摘要失败');
+      addToast('error', i18n.t('tasks.delivery.copySummaryFailed'));
     }
   }
 
@@ -801,8 +801,8 @@
       sessionId: currentSessionIdValue(),
       postMessage: (message) => vscode.postMessage(message),
       writeClipboard: (text) => navigator.clipboard.writeText(text),
-      onCopySuccess: () => addToast('info', '引用已复制'),
-      onCopyFailure: () => addToast('error', '复制引用失败'),
+      onCopySuccess: () => addToast('info', i18n.t('tasks.reference.copySuccess')),
+      onCopyFailure: () => addToast('error', i18n.t('tasks.reference.copyFailed')),
     });
   }
 

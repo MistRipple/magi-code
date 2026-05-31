@@ -522,19 +522,11 @@ export function handleUnifiedData(standard: StandardMessage) {
     case 'taskStatusChanged': {
       const newStatus = typeof payload.newStatus === 'string' ? payload.newStatus : '';
       const title = typeof payload.title === 'string' && payload.title.trim() ? payload.title.trim() : '';
-      const kind = typeof payload.kind === 'string' ? payload.kind : '';
+      const label = title || i18n.t('messageHandler.taskDefaultLabel');
 
-      // Only surface Completed and Failed status transitions as system messages.
-      if (newStatus === 'Completed') {
-        const label = title || (kind ? `${kind} task` : 'Task');
-        addToast('success', `${label} completed`, undefined, {
-          category: 'audit',
-          source: 'task-runtime',
-          displayMode: 'notification_center',
-        });
-      } else if (newStatus === 'Failed') {
-        const label = title || (kind ? `${kind} task` : 'Task');
-        addToast('error', `${label} failed`, undefined, {
+      // 当前只弹出失败态，完成态由任务面板和时间线自然呈现，避免重复通知。
+      if (newStatus === 'Failed') {
+        addToast('error', i18n.t('messageHandler.taskFailedNotification', { label }), undefined, {
           category: 'incident',
           source: 'task-runtime',
           actionRequired: true,
@@ -544,15 +536,7 @@ export function handleUnifiedData(standard: StandardMessage) {
     }
 
     case 'messageCreated': {
-      const role = typeof payload.role === 'string' ? payload.role : '';
-      const content = typeof payload.content === 'string' ? payload.content : '';
-      if (role === 'assistant' && content) {
-        addToast('info', content.length > 80 ? content.slice(0, 80) + '…' : content, undefined, {
-          category: 'audit',
-          source: 'message-runtime',
-          displayMode: 'notification_center',
-        });
-      }
+      // 消息内容由时间线承载，不再重复写入通知中心。
       break;
     }
 
