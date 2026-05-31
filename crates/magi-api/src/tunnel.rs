@@ -13,6 +13,10 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
+const TUNNEL_ERROR_DEPENDENCY_UNAVAILABLE: &str = "tunnel_dependency_unavailable";
+const TUNNEL_ERROR_START_FAILED: &str = "tunnel_start_failed";
+const TUNNEL_ERROR_CONNECTION_LOST: &str = "tunnel_connection_lost";
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct TunnelState {
     pub status: String,
@@ -80,8 +84,9 @@ impl TunnelManager {
                 match install_cloudflared().await {
                     Ok(p) => p,
                     Err(e) => {
+                        tracing::warn!(error = %e, "cloudflared install failed");
                         inner.state.status = "error".into();
-                        inner.state.error = Some(format!("安装 cloudflared 失败: {e}"));
+                        inner.state.error = Some(TUNNEL_ERROR_DEPENDENCY_UNAVAILABLE.to_string());
                         return inner.state.clone();
                     }
                 }
@@ -150,9 +155,9 @@ impl TunnelManager {
                         inner.state.access_url = None;
                         inner.state.token = None;
                         inner.state.error = Some(if has_public_url {
-                            "cloudflared 已退出，公网映射已断开".to_string()
+                            TUNNEL_ERROR_CONNECTION_LOST.to_string()
                         } else {
-                            "cloudflared 未返回公网地址，公网映射启动失败".to_string()
+                            TUNNEL_ERROR_START_FAILED.to_string()
                         });
                     }
                 });
@@ -160,8 +165,9 @@ impl TunnelManager {
                 inner.state.clone()
             }
             Err(e) => {
+                tracing::warn!(error = %e, "cloudflared process spawn failed");
                 inner.state.status = "error".into();
-                inner.state.error = Some(format!("启动隧道失败: {e}"));
+                inner.state.error = Some(TUNNEL_ERROR_START_FAILED.to_string());
                 inner.state.token = None;
                 inner.state.clone()
             }
@@ -326,4 +332,40 @@ fn extract_tunnel_url(line: &str) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tunnel_state_error_uses_stable_marker() {
+        let state = TunnelState {
+            status: "error".to_string(),
+            public_url: None,
+            access_url: None,
+            token: None,
+            error: Some(TUNNEL_ERROR_START_FAILED.to_string()),
+        };
+
+        let value = serde_json::to_value(state).expect("tunnel state should serialize");
+        assert_eq!(value["error"], serde_json::json!("tunnel_start_failed"));
+        assert!(
+            !value
+                .to_string()
+                .contains("cloudflared failed: permission denied")
+        );
+    }
+
+    #[test]
+    fn tunnel_error_markers_do_not_expose_process_details() {
+        for marker in [
+            TUNNEL_ERROR_DEPENDENCY_UNAVAILABLE,
+            TUNNEL_ERROR_START_FAILED,
+            TUNNEL_ERROR_CONNECTION_LOST,
+        ] {
+            assert!(!marker.contains(' '));
+            assert!(!marker.contains("cloudflared"));
+        }
+    }
 }
