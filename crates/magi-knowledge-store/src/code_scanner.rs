@@ -163,7 +163,6 @@ impl CodeIndexScanReasonCode {
 pub struct CodeIndexScanOutcome {
     pub status: CodeIndexScanStatus,
     pub reason_code: Option<CodeIndexScanReasonCode>,
-    pub detail: Option<String>,
     pub summary: Option<CodeIndexSummary>,
 }
 
@@ -172,7 +171,6 @@ impl CodeIndexScanOutcome {
         Self {
             status: CodeIndexScanStatus::Indexed,
             reason_code: None,
-            detail: None,
             summary: Some(summary),
         }
     }
@@ -181,7 +179,6 @@ impl CodeIndexScanOutcome {
         Self {
             status: CodeIndexScanStatus::Indexed,
             reason_code: None,
-            detail: None,
             summary: None,
         }
     }
@@ -190,16 +187,14 @@ impl CodeIndexScanOutcome {
         Self {
             status: CodeIndexScanStatus::Empty,
             reason_code: Some(reason_code),
-            detail: None,
             summary: None,
         }
     }
 
-    fn failed(reason_code: CodeIndexScanReasonCode, detail: Option<String>) -> Self {
+    fn failed(reason_code: CodeIndexScanReasonCode) -> Self {
         Self {
             status: CodeIndexScanStatus::Failed,
             reason_code: Some(reason_code),
-            detail,
             summary: None,
         }
     }
@@ -208,16 +203,13 @@ impl CodeIndexScanOutcome {
 /// 扫描工作区代码并生成代码索引
 pub fn scan_workspace(workspace_root: &Path) -> CodeIndexScanOutcome {
     if !workspace_root.exists() {
-        return CodeIndexScanOutcome::failed(CodeIndexScanReasonCode::WorkspaceMissing, None);
+        return CodeIndexScanOutcome::failed(CodeIndexScanReasonCode::WorkspaceMissing);
     }
     if !workspace_root.is_dir() {
-        return CodeIndexScanOutcome::failed(CodeIndexScanReasonCode::WorkspaceNotDirectory, None);
+        return CodeIndexScanOutcome::failed(CodeIndexScanReasonCode::WorkspaceNotDirectory);
     }
-    if let Err(error) = std::fs::read_dir(workspace_root) {
-        return CodeIndexScanOutcome::failed(
-            CodeIndexScanReasonCode::WorkspaceUnreadable,
-            Some(error.to_string()),
-        );
+    if std::fs::read_dir(workspace_root).is_err() {
+        return CodeIndexScanOutcome::failed(CodeIndexScanReasonCode::WorkspaceUnreadable);
     }
 
     let mut files: Vec<ScannedFile> = Vec::new();

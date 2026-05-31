@@ -386,13 +386,11 @@ fn code_index_status_json(
         return serde_json::json!({
             "status": CodeIndexScanStatus::Indexed.as_str(),
             "reasonCode": serde_json::Value::Null,
-            "detail": serde_json::Value::Null,
         });
     }
     serde_json::json!({
         "status": scan_outcome.status.as_str(),
         "reasonCode": scan_outcome.reason_code.as_ref().map(|reason| reason.as_str()),
-        "detail": scan_outcome.detail.as_deref(),
     })
 }
 

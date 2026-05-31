@@ -34,7 +34,6 @@
   interface CodeIndexStatus {
     status: CodeIndexStatusValue;
     reasonCode?: CodeIndexReasonCode;
-    detail?: string;
   }
 
   interface ADR {
@@ -458,10 +457,7 @@
     const status = typeof record.status === 'string' ? record.status : '';
     if (status !== 'indexed' && status !== 'empty' && status !== 'failed') return null;
     const reasonCode = normalizeCodeIndexReasonCode(record.reasonCode);
-    const detail = typeof record.detail === 'string' && record.detail.trim()
-      ? record.detail.trim()
-      : undefined;
-    return { status, reasonCode, detail };
+    return { status, reasonCode };
   }
 
   function normalizeCodeIndexReasonCode(value: unknown): CodeIndexReasonCode | undefined {
