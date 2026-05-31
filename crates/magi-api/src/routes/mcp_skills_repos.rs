@@ -5,7 +5,8 @@ use axum::{
 };
 use magi_bridge_client::StdioMcpBridgeClient;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::fmt::Display;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::{
@@ -17,6 +18,11 @@ use crate::{
     skill_loader,
     state::ApiState,
 };
+
+const MCP_CONNECTION_FAILED_MARKER: &str = "mcp_connection_failed";
+const SKILL_REPOSITORY_PUBLIC_ERROR: &str = "Skill 仓库暂不可读取";
+const SKILL_DOWNLOAD_PUBLIC_ERROR: &str = "Skill 下载暂不可用，请稍后重试";
+const SKILL_CACHE_PUBLIC_ERROR: &str = "Skill 缓存不可保存，请检查本地权限";
 
 pub fn routes() -> Router<ApiState> {
     Router::new()
@@ -466,8 +472,9 @@ fn mcp_tools_unavailable_response(server_id: &str) -> Json<serde_json::Value> {
         "tools": [],
         "connected": false,
         "health": "disconnected",
-        "error": "mcp_connection_failed",
+        "error": MCP_CONNECTION_FAILED_MARKER,
         "serverId": server_id,
+        "toolCount": 0,
     }))
 }
 
@@ -554,11 +561,7 @@ async fn get_mcp_tools(
     };
 
     let Some(client) = client else {
-        return Ok(Json(serde_json::json!({
-            "tools": [],
-            "connected": false,
-            "serverId": server_id,
-        })));
+        return Ok(mcp_tools_unavailable_response(server_id));
     };
 
     let tools = match client.list_tools() {
@@ -599,11 +602,7 @@ async fn refresh_mcp_tools(
     };
 
     let Some(client) = client else {
-        return Ok(Json(serde_json::json!({
-            "tools": [],
-            "connected": false,
-            "serverId": server_id,
-        })));
+        return Ok(mcp_tools_unavailable_response(server_id));
     };
 
     let tools = match client.list_tools() {
@@ -805,23 +804,28 @@ async fn fetch_github_repo_skills(repo_url: &str) -> Result<Vec<serde_json::Valu
         .user_agent("magi-daemon")
         .timeout(std::time::Duration::from_secs(15))
         .build()
-        .map_err(|e| ApiError::internal_assembly("HTTP client error", e))?;
+        .map_err(|e| skill_repository_error(repo_url, "构建 GitHub 客户端失败", e))?;
     let resp = client
         .get(&api_url)
         .send()
         .await
-        .map_err(|e| ApiError::internal_assembly("GitHub API failed", e))?;
+        .map_err(|e| skill_repository_error(repo_url, "读取 GitHub Skill 仓库失败", e))?;
     if !resp.status().is_success() {
-        return Err(ApiError::InvalidInput(format!(
-            "GitHub API {} for {}",
-            resp.status(),
-            api_url
-        )));
+        let status = resp.status();
+        tracing::warn!(
+            repository_url = %repo_url,
+            api_url = %api_url,
+            status = %status,
+            "GitHub Skill repository returned non-success status"
+        );
+        return Err(ApiError::InvalidInput(
+            SKILL_REPOSITORY_PUBLIC_ERROR.to_string(),
+        ));
     }
     let items: Vec<serde_json::Value> = resp
         .json()
         .await
-        .map_err(|e| ApiError::internal_assembly("Parse GitHub response failed", e))?;
+        .map_err(|e| skill_repository_error(repo_url, "解析 GitHub Skill 列表失败", e))?;
     let mut skills = Vec::new();
     for item in items {
         let t = item
@@ -1142,17 +1146,18 @@ async fn download_github_skill(
     let client = reqwest::Client::builder()
         .user_agent("magi-agent")
         .build()
-        .map_err(|e| ApiError::internal_assembly("HTTP client build failed", e))?;
+        .map_err(|e| skill_download_error(skill_id, "构建 Skill 下载客户端失败", e))?;
 
     let branches = vec!["main", "master"];
 
     // Create target directory
     if !target_dir.exists() {
         std::fs::create_dir_all(target_dir)
-            .map_err(|e| ApiError::internal_assembly("Failed to create skill cache dir", e))?;
+            .map_err(|e| skill_cache_error("创建 Skill 缓存目录失败", target_dir, e))?;
     }
 
     let mut prompt_downloaded = false;
+    let mut download_failed = false;
 
     // Try fetching prompt.md or README.md
     for branch in &branches {
@@ -1160,27 +1165,36 @@ async fn download_github_skill(
             "https://raw.githubusercontent.com/{}/{}/prompt.md",
             skill_id, branch
         );
-        if let Ok(resp) = client.get(&prompt_url).send().await {
-            if resp.status().is_success() {
-                if let Ok(text) = resp.text().await {
-                    std::fs::write(target_dir.join("prompt.md"), text)
-                        .map_err(|e| ApiError::internal_assembly("Failed to write prompt.md", e))?;
+        match client.get(&prompt_url).send().await {
+            Ok(resp) if resp.status().is_success() => match resp.text().await {
+                Ok(text) => {
+                    let prompt_path = target_dir.join("prompt.md");
+                    std::fs::write(&prompt_path, text).map_err(|e| {
+                        skill_cache_error("写入 Skill prompt 失败", &prompt_path, e)
+                    })?;
                     prompt_downloaded = true;
-
-                    // Also try to download config.json from the same branch
-                    let config_url = format!(
-                        "https://raw.githubusercontent.com/{}/{}/config.json",
-                        skill_id, branch
-                    );
-                    if let Ok(c_resp) = client.get(&config_url).send().await {
-                        if c_resp.status().is_success() {
-                            if let Ok(c_text) = c_resp.text().await {
-                                let _ = std::fs::write(target_dir.join("config.json"), c_text);
-                            }
-                        }
-                    }
+                    download_optional_skill_config(&client, skill_id, branch, target_dir).await;
                     break;
                 }
+                Err(error) => {
+                    download_failed = true;
+                    tracing::warn!(
+                        skill_id,
+                        url = %prompt_url,
+                        error = %error,
+                        "Skill prompt body read failed"
+                    );
+                }
+            },
+            Ok(_) => {}
+            Err(error) => {
+                download_failed = true;
+                tracing::warn!(
+                    skill_id,
+                    url = %prompt_url,
+                    error = %error,
+                    "Skill prompt download failed"
+                );
             }
         }
 
@@ -1188,37 +1202,104 @@ async fn download_github_skill(
             "https://raw.githubusercontent.com/{}/{}/README.md",
             skill_id, branch
         );
-        if let Ok(resp) = client.get(&readme_url).send().await {
-            if resp.status().is_success() {
-                if let Ok(text) = resp.text().await {
-                    std::fs::write(target_dir.join("README.md"), text)
-                        .map_err(|e| ApiError::internal_assembly("Failed to write README.md", e))?;
+        match client.get(&readme_url).send().await {
+            Ok(resp) if resp.status().is_success() => match resp.text().await {
+                Ok(text) => {
+                    let readme_path = target_dir.join("README.md");
+                    std::fs::write(&readme_path, text).map_err(|e| {
+                        skill_cache_error("写入 Skill README 失败", &readme_path, e)
+                    })?;
                     prompt_downloaded = true;
-
-                    let config_url = format!(
-                        "https://raw.githubusercontent.com/{}/{}/config.json",
-                        skill_id, branch
-                    );
-                    if let Ok(c_resp) = client.get(&config_url).send().await {
-                        if c_resp.status().is_success() {
-                            if let Ok(c_text) = c_resp.text().await {
-                                let _ = std::fs::write(target_dir.join("config.json"), c_text);
-                            }
-                        }
-                    }
+                    download_optional_skill_config(&client, skill_id, branch, target_dir).await;
                     break;
                 }
+                Err(error) => {
+                    download_failed = true;
+                    tracing::warn!(
+                        skill_id,
+                        url = %readme_url,
+                        error = %error,
+                        "Skill README body read failed"
+                    );
+                }
+            },
+            Ok(_) => {}
+            Err(error) => {
+                download_failed = true;
+                tracing::warn!(
+                    skill_id,
+                    url = %readme_url,
+                    error = %error,
+                    "Skill README download failed"
+                );
             }
         }
     }
 
     if !prompt_downloaded {
+        if download_failed {
+            return Err(ApiError::InvalidInput(
+                SKILL_DOWNLOAD_PUBLIC_ERROR.to_string(),
+            ));
+        }
         return Err(ApiError::InvalidInput(
             "该技能仓库缺少可导入的说明文件".to_string(),
         ));
     }
 
     Ok(())
+}
+
+async fn download_optional_skill_config(
+    client: &reqwest::Client,
+    skill_id: &str,
+    branch: &str,
+    target_dir: &Path,
+) {
+    let config_url = format!(
+        "https://raw.githubusercontent.com/{}/{}/config.json",
+        skill_id, branch
+    );
+    if let Ok(response) = client.get(&config_url).send().await
+        && response.status().is_success()
+        && let Ok(text) = response.text().await
+    {
+        let _ = std::fs::write(target_dir.join("config.json"), text);
+    }
+}
+
+fn skill_repository_error(
+    repository_url: &str,
+    action: &'static str,
+    error: impl Display,
+) -> ApiError {
+    tracing::warn!(
+        action,
+        repository_url = %repository_url,
+        error = %error,
+        "Skill repository request failed"
+    );
+    ApiError::InvalidInput(SKILL_REPOSITORY_PUBLIC_ERROR.to_string())
+}
+
+fn skill_download_error(skill_id: &str, action: &'static str, error: impl Display) -> ApiError {
+    tracing::warn!(
+        action,
+        skill_id,
+        error = %error,
+        "Skill download failed"
+    );
+    ApiError::InvalidInput(SKILL_DOWNLOAD_PUBLIC_ERROR.to_string())
+}
+
+fn skill_cache_error(action: &'static str, path: &Path, error: impl Display) -> ApiError {
+    tracing::warn!(
+        action,
+        path = %path.display(),
+        error = %error,
+        "Skill cache write failed"
+    );
+    ApiError::InvalidInput(SKILL_CACHE_PUBLIC_ERROR.to_string())
 }
 
 async fn get_instruction_skill_preview(
@@ -1254,4 +1335,96 @@ async fn get_instruction_skill_preview(
         "skillId": skill_id,
         "preview": preview,
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{
+        body::{Body, to_bytes},
+        http::{Request, StatusCode},
+    };
+    use magi_event_bus::InMemoryEventBus;
+    use magi_governance::GovernanceService;
+    use magi_session_store::SessionStore;
+    use magi_workspace::WorkspaceStore;
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    fn test_state() -> ApiState {
+        ApiState::new(
+            "magi-mcp-skill-test",
+            Arc::new(InMemoryEventBus::new(32)),
+            Arc::new(SessionStore::default()),
+            Arc::new(WorkspaceStore::default()),
+            Arc::new(GovernanceService::default()),
+        )
+    }
+
+    async fn post_json(app: Router, path: &str, payload: serde_json::Value) -> serde_json::Value {
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body should read");
+        serde_json::from_slice(&bytes).expect("response should be json")
+    }
+
+    #[tokio::test]
+    async fn mcp_tools_routes_return_recoverable_disconnected_marker() {
+        for path in ["/settings/mcp/tools", "/settings/mcp/tools/refresh"] {
+            let app = Router::new().merge(routes()).with_state(test_state());
+            let body = post_json(app, path, serde_json::json!({ "serverId": "missing-mcp" })).await;
+
+            assert_eq!(body["serverId"], "missing-mcp");
+            assert_eq!(body["connected"], false);
+            assert_eq!(body["health"], "disconnected");
+            assert_eq!(body["error"], MCP_CONNECTION_FAILED_MARKER);
+            assert_eq!(body["toolCount"], 0);
+            assert_eq!(body["tools"].as_array().map(Vec::len), Some(0));
+        }
+    }
+
+    #[test]
+    fn skill_runtime_errors_keep_private_details_out_of_response() {
+        let repository_error =
+            skill_repository_error("https://github.com/private/repo", "读取仓库失败", "raw 404");
+        let download_error = skill_download_error("private/repo", "下载失败", "connection reset");
+        let cache_error = skill_cache_error(
+            "缓存失败",
+            std::path::Path::new("/private/cache/path"),
+            "permission denied",
+        );
+
+        assert_eq!(repository_error.message(), SKILL_REPOSITORY_PUBLIC_ERROR);
+        assert_eq!(download_error.message(), SKILL_DOWNLOAD_PUBLIC_ERROR);
+        assert_eq!(cache_error.message(), SKILL_CACHE_PUBLIC_ERROR);
+        assert!(!repository_error.message().contains("github.com"));
+        assert!(!download_error.message().contains("connection reset"));
+        assert!(!cache_error.message().contains("/private/cache/path"));
+    }
+
+    #[tokio::test]
+    async fn download_github_skill_cache_error_uses_public_message() {
+        let temp = tempfile::tempdir().expect("temp dir should create");
+        let file_path = temp.path().join("not-a-directory");
+        std::fs::write(&file_path, "occupied").expect("test file should write");
+        let blocked_target_dir = file_path.join("skill-cache");
+
+        let error = download_github_skill("owner/repo", &blocked_target_dir)
+            .await
+            .expect_err("cache path should fail before network request");
+
+        assert_eq!(error.message(), SKILL_CACHE_PUBLIC_ERROR);
+    }
 }
