@@ -122,7 +122,9 @@ impl MissionWorkspaceStore {
         out.push_str(&format!("- logs_dir: {}\n", ws.logs_dir.display()));
         out.push_str(&format!("- memory_path: {}\n\n", ws.memory_path.display()));
         out.push_str(
-            "约定：Mission 过程中产生的中间产物、报告、生成代码草稿请写入 artifacts_dir；\
+            "约定：Mission Workspace 只提供本 mission 的产物路径参考，不改变本轮用户输入、当前会话事实或当前 task 目标；\
+             若本轮明确指定其他路径或交付范围，以本轮要求为准。\
+             Mission 过程中产生的中间产物、报告、生成代码草稿请写入 artifacts_dir；\
              跨进程日志请写入 logs_dir；Mission 级 memory 走 memory_path。\
              与 Checkpoint / ValidationRunner / KG 共用此目录。\n",
         );
@@ -250,6 +252,8 @@ mod tests {
         assert!(rendered.contains("artifacts_dir"));
         assert!(rendered.contains("logs_dir"));
         assert!(rendered.contains("memory_path"));
+        assert!(rendered.contains("只提供本 mission 的产物路径参考"));
+        assert!(rendered.contains("不改变本轮用户输入"));
     }
 
     #[test]

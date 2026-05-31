@@ -130,7 +130,7 @@ impl TodoLedger {
         }
         let mut lines = Vec::with_capacity(snapshot.len() + 2);
         lines.push(
-            "当前 TodoLedger（本 session 内的任务分解，仅作为本轮执行参考；在不冲突时优先推进 in_progress 与 pending 项）："
+            "当前 TodoLedger（本 session 内的任务分解，仅作为本轮执行参考；不能覆盖本轮用户输入、当前会话事实或当前 task 目标；在不冲突时优先推进 in_progress 与 pending 项）："
                 .to_string(),
         );
         for (idx, item) in snapshot.iter().enumerate() {
@@ -370,6 +370,7 @@ mod tests {
         ]);
         let prompt = ledger.render_for_prompt().unwrap();
         assert!(prompt.contains("仅作为本轮执行参考"));
+        assert!(prompt.contains("不能覆盖本轮用户输入"));
         assert!(prompt.contains("在不冲突时优先推进"));
         assert!(prompt.contains("[ ] A"));
         assert!(prompt.contains("[~] B"));
