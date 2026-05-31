@@ -6,6 +6,7 @@ use axum::{
     routing::{get, post},
 };
 use serde::Deserialize;
+use std::fmt::Display;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -58,6 +59,26 @@ async fn require_snapshot_session(
 
 fn workspace_path_string(path: &Path) -> String {
     path.to_string_lossy().to_string()
+}
+
+fn file_access_error(action: &'static str, path: &Path, error: impl Display) -> ApiError {
+    tracing::warn!(
+        action,
+        path = %path.display(),
+        error = %error,
+        "file access failed"
+    );
+    ApiError::InvalidInput("文件不可读取或不存在".to_string())
+}
+
+fn directory_access_error(action: &'static str, path: &Path, error: impl Display) -> ApiError {
+    tracing::warn!(
+        action,
+        path = %path.display(),
+        error = %error,
+        "directory access failed"
+    );
+    ApiError::InvalidInput("目录不可读取或不存在".to_string())
 }
 
 fn session_scope_binding(scope: &SessionChangeScope) -> serde_json::Value {
@@ -406,7 +427,7 @@ async fn get_file_content(
         (absolute, workspace_scope_binding(&scope))
     };
     let content = std::fs::read_to_string(&absolute_path)
-        .map_err(|e| ApiError::internal_assembly("读取文件内容失败", e))?;
+        .map_err(|e| file_access_error("读取文件内容失败", &absolute_path, e))?;
     let mut payload = serde_json::json!({
         "content": content,
         "filePath": query.file_path,
@@ -481,7 +502,7 @@ async fn get_file_raw(
         .ok_or_else(|| ApiError::InvalidInput("仅支持图片文件预览".to_string()))?;
 
     let bytes = std::fs::read(&absolute_path)
-        .map_err(|e| ApiError::internal_assembly("读取文件内容失败", e))?;
+        .map_err(|e| file_access_error("读取文件内容失败", &absolute_path, e))?;
 
     Ok(([(header::CONTENT_TYPE, mime)], bytes).into_response())
 }
@@ -507,7 +528,7 @@ fn canonical_directory_path(
 ) -> Result<PathBuf, ApiError> {
     let canonical = path
         .canonicalize()
-        .map_err(|e| ApiError::internal_assembly(error_context, e))?;
+        .map_err(|e| directory_access_error(error_context, &path, e))?;
     if !canonical.is_dir() {
         return Err(ApiError::InvalidInput("路径不是目录".to_string()));
     }
@@ -522,7 +543,7 @@ fn read_directory_entries(
         return Err(ApiError::InvalidInput("路径不是目录".to_string()));
     }
     let entries = std::fs::read_dir(path)
-        .map_err(|e| ApiError::internal_assembly("读取目录失败", e))?
+        .map_err(|e| directory_access_error("读取目录失败", path, e))?
         .filter_map(|entry| entry.ok())
         .filter(|entry| {
             show_hidden
@@ -860,13 +881,17 @@ async fn enhance_prompt(
     let response = match client.invoke(invocation) {
         Ok(resp) if resp.ok => resp,
         Ok(resp) => {
-            return Err(ApiError::InvalidInput(format!(
-                "辅助模型返回失败: {}",
-                resp.payload.trim()
-            )));
+            tracing::warn!(
+                payload = %resp.payload.trim(),
+                "prompt enhance auxiliary model returned non-ok response"
+            );
+            return Err(ApiError::model_invocation_failed(
+                "辅助模型返回失败",
+                "辅助模型返回非成功状态",
+            ));
         }
         Err(error) => {
-            return Err(ApiError::InvalidInput(format!("辅助模型调用失败: {error}")));
+            return Err(ApiError::model_invocation_failed("辅助模型调用失败", error));
         }
     };
 
@@ -1196,6 +1221,32 @@ mod tests {
             entries.iter().any(|entry| entry["name"] == ".hidden"),
             "showHidden=1 should include hidden entries"
         );
+    }
+
+    #[tokio::test]
+    async fn filesystem_browse_uses_public_missing_directory_error() {
+        let root = unique_temp_dir("magi-filesystem-browse-missing");
+        let missing = root.join("missing");
+        let state = build_state();
+
+        let response = routes()
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/filesystem/browse?path={}",
+                        missing.to_string_lossy()
+                    ))
+                    .method("GET")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let payload = read_json_response(response).await;
+        assert_eq!(payload["message"], "目录不可读取或不存在");
     }
 
     #[tokio::test]
@@ -1655,6 +1706,34 @@ mod tests {
         let payload = read_json_response(response).await;
         let message = payload["message"].as_str().unwrap_or_default();
         assert!(message.contains("workspaceId 不能为空"));
+    }
+
+    #[tokio::test]
+    async fn get_file_content_uses_public_unreadable_file_error() {
+        let root = unique_temp_dir("magi-changes-route-content-binary");
+        fs::write(root.join("binary.bin"), [0xff, 0xfe, 0xfd]).expect("binary should write");
+        let state = build_state_with_workspace_root(&root, "workspace-content-binary");
+
+        let response = routes()
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/files/content?workspaceId=workspace-content-binary&filePath=binary.bin")
+                    .method("GET")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let payload = read_json_response(response).await;
+        assert_eq!(payload["message"], "文件不可读取或不存在");
+        let text = payload.to_string();
+        assert!(
+            !text.contains("invalid utf-8") && !text.contains("stream did not contain valid UTF-8"),
+            "file read detail should stay out of response: {text}"
+        );
     }
 
     #[tokio::test]

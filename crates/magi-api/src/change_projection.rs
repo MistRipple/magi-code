@@ -10,6 +10,7 @@ use crate::{errors::ApiError, state::ApiState};
 use magi_core::{SessionId, UtcMillis, WorkspaceId};
 use magi_snapshot::{ChangeKind, ContentKind, PendingChange, SourceKind};
 use serde::Serialize;
+use std::fmt::Display;
 use std::path::{Path, PathBuf};
 
 #[derive(Clone)]
@@ -450,16 +451,26 @@ pub(crate) fn safe_workspace_path(
     };
     let canonical_root = workspace_root
         .canonicalize()
-        .map_err(|e| ApiError::internal_assembly("规范化工作区根目录失败", e))?;
+        .map_err(|e| path_access_error("规范化工作区根目录失败", workspace_root, e))?;
     let canonical_path = candidate_abs
         .canonicalize()
-        .map_err(|e| ApiError::internal_assembly("规范化文件路径失败", e))?;
+        .map_err(|e| path_access_error("规范化文件路径失败", &candidate_abs, e))?;
     let relative = canonical_path
         .strip_prefix(&canonical_root)
         .map_err(|_| ApiError::InvalidInput("路径越出工作区边界".to_string()))?
         .to_string_lossy()
         .into_owned();
     Ok((canonical_path, relative))
+}
+
+fn path_access_error(context: &'static str, path: &Path, error: impl Display) -> ApiError {
+    tracing::warn!(
+        context,
+        path = %path.display(),
+        error = %error,
+        "workspace path access failed"
+    );
+    ApiError::InvalidInput("路径不可读取或不存在".to_string())
 }
 
 fn resolve_workspace_root(
@@ -743,5 +754,18 @@ mod tests {
         let abs = outside_file.to_string_lossy().into_owned();
         let err = safe_workspace_path(&root, &abs).unwrap_err();
         assert!(matches!(err, ApiError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn safe_workspace_path_uses_public_missing_path_error() {
+        let root = unique_temp_dir("magi-change-projection-missing-path");
+        let err = safe_workspace_path(&root, "missing.txt").unwrap_err();
+
+        match err {
+            ApiError::InvalidInput(message) => {
+                assert_eq!(message, "路径不可读取或不存在");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 }
