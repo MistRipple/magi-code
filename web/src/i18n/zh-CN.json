@@ -944,7 +944,6 @@
   "tasks.reference.sourceLabel": "来源：{source}",
   "tasks.reference.actionLabel": "动作：{action}",
   "tasks.reference.target": "目标",
-  "tasks.reference.raw": "原始引用",
   "tasks.delivery.title": "交付概览",
   "tasks.delivery.copySummaryTitle": "复制交付摘要",
   "tasks.delivery.copySummary": "复制摘要",

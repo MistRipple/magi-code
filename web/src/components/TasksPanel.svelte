@@ -1075,14 +1075,6 @@
               {selectedTaskReference.reference.actionTarget}
             </span>
           </div>
-          {#if selectedTaskReference.reference.raw !== selectedTaskReference.reference.actionTarget}
-            <div class="task-reference-detail-field">
-              <span class="task-reference-detail-label">{i18n.t('tasks.reference.raw')}</span>
-              <span class="task-reference-detail-value task-reference-detail-value--mono" title={selectedTaskReference.reference.raw}>
-                {selectedTaskReference.reference.raw}
-              </span>
-            </div>
-          {/if}
           <div class="task-reference-detail-actions">
             <button type="button" class="task-reference-detail-action" onclick={executeSelectedTaskReference}>
               <Icon name={getTaskReferenceIconName(selectedTaskReference.reference)} size={12} />

@@ -944,7 +944,6 @@
   "tasks.reference.sourceLabel": "Source: {source}",
   "tasks.reference.actionLabel": "Action: {action}",
   "tasks.reference.target": "Target",
-  "tasks.reference.raw": "Original reference",
   "tasks.delivery.title": "Delivery summary",
   "tasks.delivery.copySummaryTitle": "Copy delivery summary",
   "tasks.delivery.copySummary": "Copy summary",
