@@ -55,6 +55,7 @@ const AGENT_SPAWN_SUMMARY_MAX_CHARS: usize = 1200;
 const AGENT_SPAWN_FINAL_TEXT_MAX_CHARS: usize = 6000;
 const AGENT_SPAWN_PARENT_CONTEXT_MAX_CHARS: usize = 600;
 const AGENT_SPAWN_INHERITED_INPUT_REF_MAX: usize = 16;
+const AGENT_UNAVAILABLE_PUBLIC_TEXT: &str = "代理当前不可用，主线需要改派或接管。";
 const AGENT_WAIT_DEFAULT_TIMEOUT_MS: u64 = 300_000;
 const AGENT_WAIT_MIN_TIMEOUT_MS: u64 = 1_000;
 const AGENT_WAIT_MAX_TIMEOUT_MS: u64 = 1_800_000;
@@ -325,11 +326,13 @@ fn execute_coordinator_tool(
     let parsed: serde_json::Value = match serde_json::from_str(&tool_call.function.arguments) {
         Ok(value) => value,
         Err(err) => {
+            tracing::warn!(error = %err, tool = tool.as_str(), "coordinator tool arguments parse failed");
             return (
                 serde_json::json!({
                     "tool": tool.as_str(),
                     "status": "failed",
-                    "error": format!("协调器工具参数解析失败: {err}"),
+                    "error_code": "invalid_arguments",
+                    "error": "协调器工具参数格式无效",
                 })
                 .to_string(),
                 ExecutionResultStatus::Failed,
@@ -362,7 +365,8 @@ fn execute_coordinator_tool(
                     serde_json::json!({
                         "tool": tool.as_str(),
                         "status": "failed",
-                        "error": "long mission 缺少 HumanCheckpointStore，无法确认 pending 人审状态，禁止 agent_spawn",
+                        "error_code": "human_checkpoint_unavailable",
+                        "error": "长任务审核状态暂不可用，暂不能派发代理",
                     })
                     .to_string(),
                     ExecutionResultStatus::Failed,
@@ -380,7 +384,8 @@ fn execute_coordinator_tool(
                             serde_json::json!({
                                 "tool": tool.as_str(),
                                 "status": "rejected",
-                                "error": "mission 存在 pending HumanCheckpoint，operator resolve 前禁止 agent_spawn 派发新工作",
+                                "error_code": "pending_human_checkpoint",
+                                "error": "仍有待处理的人工审核，处理前不能派发新代理",
                             })
                             .to_string(),
                             ExecutionResultStatus::Rejected,
@@ -388,11 +393,17 @@ fn execute_coordinator_tool(
                     }
                     Ok(false) => {}
                     Err(error) => {
+                        tracing::warn!(
+                            error = %error,
+                            mission_id = %task.mission_id,
+                            "human checkpoint pending status read failed"
+                        );
                         return (
                             serde_json::json!({
                                 "tool": tool.as_str(),
                                 "status": "failed",
-                                "error": format!("HumanCheckpoint pending 状态读取失败: {error}"),
+                                "error_code": "human_checkpoint_read_failed",
+                                "error": "长任务审核状态读取失败，暂不能派发代理",
                             })
                             .to_string(),
                             ExecutionResultStatus::Failed,
@@ -477,6 +488,7 @@ fn execute_coordinator_tool(
                         "fallback_mode": "mainline_or_reassign",
                         "role": role,
                         "available_roles": spawnable_role_ids,
+                        "error_code": "agent_role_not_spawnable",
                         "error": "该 role 不是可派发代理角色。coordinator 是主线编排身份，不能通过 agent_spawn 派发。",
                         "instruction": format!("请改派 {role_hint} 等可用专业代理；如果无需继续派发，则由主线基于已有上下文直接推进并给出结果。"),
                     })
@@ -602,11 +614,18 @@ fn execute_coordinator_tool(
             ) {
                 Ok(registered) => registered,
                 Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        parent_task_id = %task.task_id,
+                        child_task_id = %child_id,
+                        "agent_spawn child execution registration failed"
+                    );
                     return (
                         serde_json::json!({
                             "tool": tool.as_str(),
                             "status": "failed",
-                            "error": format!("agent_spawn 注册子执行失败: {error}"),
+                            "error_code": "agent_spawn_registration_failed",
+                            "error": "代理启动失败，请由主线继续或改派其他角色",
                         })
                         .to_string(),
                         ExecutionResultStatus::Failed,
@@ -680,7 +699,8 @@ fn long_mission_agent_spawn_prerequisite_rejection(
             serde_json::json!({
                 "tool": tool.as_str(),
                 "status": "failed",
-                "error": "long mission 缺少 MissionCharterStore，无法确认 mission 契约，禁止 agent_spawn",
+                "error_code": "mission_charter_unavailable",
+                "error": "长任务契约状态暂不可用，暂不能派发代理",
                 "instruction": "先修复 workspace 绑定，让 mission_charter_write 能落盘；长任务不能在没有 mission 契约的情况下派发代理。",
             })
             .to_string(),
@@ -702,11 +722,17 @@ fn long_mission_agent_spawn_prerequisite_rejection(
             ));
         }
         Err(error) => {
+            tracing::warn!(
+                error = %error,
+                mission_id = %task.mission_id,
+                "mission charter load failed before agent_spawn"
+            );
             return Some((
                 serde_json::json!({
                     "tool": tool.as_str(),
                     "status": "failed",
-                    "error": format!("读取 mission charter 失败：{error}"),
+                    "error_code": "mission_charter_read_failed",
+                    "error": "长任务契约读取失败，暂不能派发代理",
                 })
                 .to_string(),
                 ExecutionResultStatus::Failed,
@@ -719,7 +745,8 @@ fn long_mission_agent_spawn_prerequisite_rejection(
             serde_json::json!({
                 "tool": tool.as_str(),
                 "status": "failed",
-                "error": "long mission 缺少 PlanStore，无法确认 mission plan，禁止 agent_spawn",
+                "error_code": "mission_plan_unavailable",
+                "error": "长任务计划状态暂不可用，暂不能派发代理",
                 "instruction": "先修复 workspace 绑定，让 plan_write 能落盘；长任务不能在没有执行计划的情况下派发代理。",
             })
             .to_string(),
@@ -739,12 +766,20 @@ fn long_mission_agent_spawn_prerequisite_rejection(
             ExecutionResultStatus::Rejected,
         )),
         Err(error) => Some((
-            serde_json::json!({
-                "tool": tool.as_str(),
-                "status": "failed",
-                "error": format!("读取 mission plan 失败：{error}"),
-            })
-            .to_string(),
+            {
+                tracing::warn!(
+                    error = %error,
+                    mission_id = %task.mission_id,
+                    "mission plan load failed before agent_spawn"
+                );
+                serde_json::json!({
+                    "tool": tool.as_str(),
+                    "status": "failed",
+                    "error_code": "mission_plan_read_failed",
+                    "error": "长任务计划读取失败，暂不能派发代理",
+                })
+                .to_string()
+            },
             ExecutionResultStatus::Failed,
         )),
     }
@@ -1095,7 +1130,8 @@ fn execute_agent_wait(
                     "child_task_id": task_id.to_string(),
                     "status": "failed",
                     "child_status": "missing",
-                    "error": "TaskStore 中未找到该代理任务",
+                    "error_code": "agent_task_unavailable",
+                    "error": "代理任务不可用",
                 }));
                 continue;
             };
@@ -1205,18 +1241,27 @@ fn child_agent_terminal_payload(child: &magi_core::Task) -> serde_json::Value {
                 .first()
                 .cloned()
                 .unwrap_or_else(|| "代理任务执行失败".to_string());
-            let output = child_agent_output(&child.output_refs);
-            let mut payload = if agent_unavailable_failure(&error) {
+            if agent_unavailable_failure(&error) {
                 let mut payload = base("degraded", "failed");
                 payload["fallback_mode"] =
                     serde_json::Value::String("mainline_or_reassign".to_string());
+                payload["error_code"] = serde_json::Value::String("agent_unavailable".to_string());
                 payload["instruction"] = serde_json::Value::String(
                     "代理当前不可用。请不要停止任务：优先改派其他可用角色继续；如果没有必要继续派发，则由主线根据已有上下文直接推进并给出最终结果。".to_string(),
                 );
-                payload
-            } else {
-                base("failed", "failed")
-            };
+                payload["result"] = serde_json::json!({
+                    "final_text": AGENT_UNAVAILABLE_PUBLIC_TEXT,
+                    "truncated": false,
+                    "output_ref_count": child.output_refs.len(),
+                });
+                payload["summary"] =
+                    serde_json::Value::String(AGENT_UNAVAILABLE_PUBLIC_TEXT.to_string());
+                payload["output_ref_count"] = serde_json::json!(child.output_refs.len());
+                payload["error"] = serde_json::Value::String("代理当前不可用".to_string());
+                return payload;
+            }
+            let output = child_agent_output(&child.output_refs);
+            let mut payload = base("failed", "failed");
             payload["result"] = serde_json::json!({
                 "final_text": output.final_text,
                 "truncated": output.truncated,
@@ -1229,6 +1274,7 @@ fn child_agent_terminal_payload(child: &magi_core::Task) -> serde_json::Value {
         }
         TaskStatus::Killed => {
             let mut payload = base("failed", "killed");
+            payload["error_code"] = serde_json::Value::String("agent_killed".to_string());
             payload["error"] = serde_json::Value::String("代理任务被终止".to_string());
             payload
         }
@@ -2762,9 +2808,15 @@ mod tests {
                 .unwrap_or_default()
                 .contains("不要停止任务")
         );
+        assert_eq!(result["error_code"].as_str(), Some("agent_unavailable"));
+        assert_eq!(result["error"].as_str(), Some("代理当前不可用"));
         assert_eq!(
             result["result"]["final_text"].as_str(),
-            Some("provider transport failed: connection refused")
+            Some(AGENT_UNAVAILABLE_PUBLIC_TEXT)
+        );
+        assert!(
+            !result.to_string().contains("provider transport failed"),
+            "agent_wait degraded payload should not expose provider transport detail"
         );
     }
 
@@ -3026,6 +3078,14 @@ mod tests {
         let payload: serde_json::Value =
             serde_json::from_str(&result[0].0).expect("agent_spawn rejection should be json");
         assert_eq!(payload["status"].as_str(), Some("rejected"));
+        assert_eq!(
+            payload["error_code"].as_str(),
+            Some("pending_human_checkpoint")
+        );
+        assert!(
+            !payload.to_string().contains("HumanCheckpoint"),
+            "agent_spawn rejection should use product language instead of store names"
+        );
         assert!(task_store.get_children(&parent.task_id).is_empty());
     }
 
@@ -3101,6 +3161,14 @@ mod tests {
         let payload: serde_json::Value =
             serde_json::from_str(&result[0].0).expect("agent_spawn failure should be json");
         assert_eq!(payload["status"].as_str(), Some("failed"));
+        assert_eq!(
+            payload["error_code"].as_str(),
+            Some("human_checkpoint_unavailable")
+        );
+        assert!(
+            !payload.to_string().contains("HumanCheckpointStore"),
+            "agent_spawn failure should not expose internal store names"
+        );
         assert!(task_store.get_children(&parent.task_id).is_empty());
     }
 
