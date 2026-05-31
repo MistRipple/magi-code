@@ -215,7 +215,7 @@ async fn clear_knowledge(
 ) -> Result<Json<KnowledgeMutationResponse>, ApiError> {
     let workspace_id = require_registered_workspace_id(&state, request.workspace_id.as_deref())?;
     state.knowledge_store.clear_workspace(&workspace_id);
-    state.persist_knowledge_state()?;
+    state.persist_knowledge_state_for_api()?;
     Ok(Json(mutation_response(&state, &workspace_id)?))
 }
 
@@ -374,7 +374,7 @@ fn ensure_workspace_code_index(
         workspace_id,
         &PathBuf::from(workspace.root_path.as_str()),
     );
-    state.persist_knowledge_state()?;
+    state.persist_knowledge_state_for_api()?;
     Ok(outcome)
 }
 
@@ -459,7 +459,7 @@ async fn add_knowledge_item(
         updated_at: UtcMillis::now(),
     };
     state.knowledge_store.upsert(record);
-    state.persist_knowledge_state()?;
+    state.persist_knowledge_state_for_api()?;
     Ok(Json(mutation_response(&state, &workspace_id)?))
 }
 
@@ -522,7 +522,7 @@ async fn update_knowledge_item(
         updated_at: UtcMillis::now(),
     };
     state.knowledge_store.upsert(updated);
-    state.persist_knowledge_state()?;
+    state.persist_knowledge_state_for_api()?;
     Ok(Json(mutation_response(&state, &workspace_id)?))
 }
 
@@ -542,7 +542,7 @@ async fn delete_knowledge_item(
         .knowledge_store
         .delete_in_workspace(&request.knowledge_id, &workspace_id)
         .map_err(|error| map_knowledge_delete_error(error, &request.knowledge_id))?;
-    state.persist_knowledge_state()?;
+    state.persist_knowledge_state_for_api()?;
     Ok(Json(mutation_response(&state, &workspace_id)?))
 }
 

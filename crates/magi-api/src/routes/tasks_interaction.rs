@@ -361,7 +361,7 @@ async fn archive_task(
         .session_store
         .archive_active_execution_chain(&session_id, &root_task.task_id)
         .map_err(|error| ApiError::internal_assembly("归档任务失败", error))?;
-    state.persist_runtime_durable_state()?;
+    state.persist_runtime_durable_state_for_api()?;
 
     let event_id = EventId::new(format!("event-task-archive-{}", now.0));
     let event = EventEnvelope::domain(

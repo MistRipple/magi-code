@@ -91,7 +91,7 @@ async fn register_workspace(
         state
             .knowledge_store
             .build_workspace_index(&workspace.workspace_id, &canonical_path);
-        state.persist_knowledge_state()?;
+        state.persist_knowledge_state_for_api()?;
         return Ok(Json(serde_json::json!({
             "workspaceId": workspace.workspace_id.to_string(),
             "registered": false,
@@ -116,7 +116,7 @@ async fn register_workspace(
                 state
                     .knowledge_store
                     .build_workspace_index(&workspace.workspace_id, &canonical_path);
-                state.persist_knowledge_state()?;
+                state.persist_knowledge_state_for_api()?;
                 return Ok(Json(serde_json::json!({
                     "workspaceId": workspace.workspace_id.to_string(),
                     "registered": false,
@@ -134,8 +134,8 @@ async fn register_workspace(
     state
         .knowledge_store
         .build_workspace_index(&workspace_id, &canonical_path);
-    state.persist_workspace_durable_state()?;
-    state.persist_knowledge_state()?;
+    state.persist_workspace_durable_state_for_api()?;
+    state.persist_knowledge_state_for_api()?;
     Ok(Json(serde_json::json!({
         "workspaceId": workspace_id.to_string(),
         "registered": true
@@ -149,12 +149,9 @@ pub(crate) fn canonical_workspace_path(raw_path: &str) -> Result<PathBuf, ApiErr
     }
     let canonical_path = PathBuf::from(trimmed_path)
         .canonicalize()
-        .map_err(|error| ApiError::InvalidInput(format!("工作区路径不可访问: {error}")))?;
+        .map_err(|_| ApiError::InvalidInput("工作区路径不可访问".to_string()))?;
     if !canonical_path.is_dir() {
-        return Err(ApiError::InvalidInput(format!(
-            "工作区路径必须是目录: {}",
-            canonical_path.display()
-        )));
+        return Err(ApiError::InvalidInput("工作区路径必须是目录".to_string()));
     }
     Ok(canonical_path)
 }
@@ -193,7 +190,7 @@ async fn remove_workspace(
         .workspace_registry
         .deregister(&workspace_id)
         .map_err(|e| ApiError::internal_assembly("工作区移除失败", e))?;
-    state.persist_workspace_durable_state()?;
+    state.persist_workspace_durable_state_for_api()?;
     Ok(Json(serde_json::json!({ "removed": true })))
 }
 
@@ -318,6 +315,27 @@ mod tests {
             .await
             .expect("body should read");
         serde_json::from_slice(&body).expect("payload should deserialize")
+    }
+
+    #[test]
+    fn canonical_workspace_path_uses_public_error_messages() {
+        let missing =
+            std::env::temp_dir().join(format!("magi-workspace-missing-{}", UtcMillis::now().0));
+        let error = canonical_workspace_path(&missing.to_string_lossy())
+            .expect_err("missing path should fail");
+        assert_eq!(error.message(), "工作区路径不可访问");
+        assert!(!error.message().contains("os error"));
+        assert!(!error.message().contains("No such"));
+
+        let file_path =
+            std::env::temp_dir().join(format!("magi-workspace-file-{}", UtcMillis::now().0));
+        fs::write(&file_path, "not a directory").expect("test file should write");
+        let error = canonical_workspace_path(&file_path.to_string_lossy())
+            .expect_err("file path should fail");
+        assert_eq!(error.message(), "工作区路径必须是目录");
+        let file_path_text = file_path.to_string_lossy().to_string();
+        assert!(!error.message().contains(&file_path_text));
+        let _ = fs::remove_file(file_path);
     }
 
     #[tokio::test]

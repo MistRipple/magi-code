@@ -557,6 +557,9 @@ pub struct RuntimeStatePersistence {
 }
 
 static RUNTIME_PERSISTENCE_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+const SESSION_PERSISTENCE_PUBLIC_ERROR: &str = "会话状态暂不可保存，请稍后重试";
+const WORKSPACE_PERSISTENCE_PUBLIC_ERROR: &str = "工作区状态暂不可保存，请稍后重试";
+const KNOWLEDGE_PERSISTENCE_PUBLIC_ERROR: &str = "知识库状态暂不可保存，请稍后重试";
 
 impl RuntimeStatePersistence {
     pub fn new(
@@ -615,6 +618,15 @@ fn temp_path_for(path: &Path) -> PathBuf {
     let nonce = RUNTIME_PERSISTENCE_TEMP_COUNTER.fetch_add(1, Ordering::SeqCst);
     file_name.push_str(&format!(".{nonce}.tmp"));
     path.with_file_name(file_name)
+}
+
+fn public_runtime_persistence_error(
+    domain: &'static str,
+    public_message: &'static str,
+    error: ApiError,
+) -> ApiError {
+    tracing::warn!(domain, error = ?error, "runtime state persistence failed");
+    ApiError::InternalAssemblyError(public_message.to_string())
 }
 
 pub fn build_runtime_capability_dependency_provider(
@@ -1449,11 +1461,23 @@ impl ApiState {
         Ok(())
     }
 
+    pub fn persist_session_durable_state_for_api(&self) -> Result<(), ApiError> {
+        self.persist_session_durable_state().map_err(|error| {
+            public_runtime_persistence_error("session", SESSION_PERSISTENCE_PUBLIC_ERROR, error)
+        })
+    }
+
     pub fn persist_workspace_durable_state(&self) -> Result<(), ApiError> {
         let Some(persistence) = &self.runtime_persistence else {
             return Ok(());
         };
         persistence.save_workspace_store(&self.workspace_registry)
+    }
+
+    pub fn persist_workspace_durable_state_for_api(&self) -> Result<(), ApiError> {
+        self.persist_workspace_durable_state().map_err(|error| {
+            public_runtime_persistence_error("workspace", WORKSPACE_PERSISTENCE_PUBLIC_ERROR, error)
+        })
     }
 
     pub fn persist_knowledge_state(&self) -> Result<(), ApiError> {
@@ -1463,10 +1487,23 @@ impl ApiState {
         persistence.save_knowledge_store(&self.knowledge_store)
     }
 
+    pub fn persist_knowledge_state_for_api(&self) -> Result<(), ApiError> {
+        self.persist_knowledge_state().map_err(|error| {
+            public_runtime_persistence_error("knowledge", KNOWLEDGE_PERSISTENCE_PUBLIC_ERROR, error)
+        })
+    }
+
     pub fn persist_runtime_durable_state(&self) -> Result<(), ApiError> {
         self.persist_session_durable_state()?;
         self.persist_workspace_durable_state()?;
         self.persist_knowledge_state()?;
+        Ok(())
+    }
+
+    pub fn persist_runtime_durable_state_for_api(&self) -> Result<(), ApiError> {
+        self.persist_session_durable_state_for_api()?;
+        self.persist_workspace_durable_state_for_api()?;
+        self.persist_knowledge_state_for_api()?;
         Ok(())
     }
 
@@ -1988,6 +2025,65 @@ mod tests {
         let persisted = std::fs::read_to_string(state_root.join("sessions.json"))
             .expect("global session durable state should be written");
         assert!(persisted.contains(session_id.as_str()));
+    }
+
+    #[test]
+    fn api_persistence_wrappers_redact_runtime_errors() {
+        let state_root = std::env::temp_dir().join(format!(
+            "magi-api-redacted-persistence-{}",
+            UtcMillis::now().0
+        ));
+        let session_path = state_root.join("sessions.json");
+        let workspace_path = state_root.join("workspaces.json");
+        let knowledge_path = state_root.join("knowledge.json");
+        std::fs::create_dir_all(&session_path).expect("session conflict dir should create");
+        std::fs::create_dir_all(&workspace_path).expect("workspace conflict dir should create");
+        std::fs::create_dir_all(&knowledge_path).expect("knowledge conflict dir should create");
+
+        let state = ApiState::new(
+            "magi-test",
+            Arc::new(InMemoryEventBus::new(32)),
+            Arc::new(SessionStore::default()),
+            Arc::new(WorkspaceStore::default()),
+            Arc::new(GovernanceService::default()),
+        )
+        .with_runtime_persistence(Arc::new(RuntimeStatePersistence::new(
+            session_path,
+            workspace_path,
+            knowledge_path,
+        )));
+
+        assert_public_persistence_error(
+            state
+                .persist_session_durable_state_for_api()
+                .expect_err("session persistence should fail"),
+            SESSION_PERSISTENCE_PUBLIC_ERROR,
+        );
+        assert_public_persistence_error(
+            state
+                .persist_workspace_durable_state_for_api()
+                .expect_err("workspace persistence should fail"),
+            WORKSPACE_PERSISTENCE_PUBLIC_ERROR,
+        );
+        assert_public_persistence_error(
+            state
+                .persist_knowledge_state_for_api()
+                .expect_err("knowledge persistence should fail"),
+            KNOWLEDGE_PERSISTENCE_PUBLIC_ERROR,
+        );
+
+        let _ = std::fs::remove_dir_all(state_root);
+    }
+
+    fn assert_public_persistence_error(error: ApiError, expected_message: &str) {
+        let ApiError::InternalAssemblyError(message) = error else {
+            panic!("expected internal assembly error");
+        };
+        assert_eq!(message, expected_message);
+        assert!(!message.contains("os error"));
+        assert!(!message.contains("Is a directory"));
+        assert!(!message.contains("Permission denied"));
+        assert!(!message.contains(".json"));
     }
 
     #[tokio::test]

@@ -168,7 +168,7 @@ async fn submit_session_turn(
                 .ensure_snapshot_session_for_workspace_id(&session_id, &Some(workspace_id))
                 .await?;
             finalize_continue_session(state.clone(), accepted.clone(), accepted_at);
-            state.persist_runtime_durable_state()?;
+            state.persist_runtime_durable_state_for_api()?;
             let event_id = publish_session_turn_continue_event(&state, &accepted, accepted_at)?;
             Ok(Json(SessionTurnResponseDto::new(
                 accepted.session_id,
@@ -1874,7 +1874,7 @@ async fn switch_session(
         .session_store
         .switch_session(&session_id)
         .map_err(|e| ApiError::internal_assembly("切换会话失败", e))?;
-    state.persist_session_durable_state()?;
+    state.persist_session_durable_state_for_api()?;
     let current_session = state.session_store.current_session();
     Ok(Json(SessionSelectionResponseDto {
         session_id: current_session
@@ -1926,7 +1926,7 @@ async fn continue_session(
         orchestrator_thread_id,
     )?;
     finalize_continue_session(state.clone(), accepted.clone(), continued_at);
-    state.persist_runtime_durable_state()?;
+    state.persist_runtime_durable_state_for_api()?;
     let event_id = EventId::new(format!("event-session-continue-{}", continued_at.0));
     let event = EventEnvelope::domain(
         event_id.clone(),
@@ -2015,7 +2015,7 @@ async fn delete_session(
         .session_store
         .delete_session(&session_id)
         .map_err(|e| ApiError::internal_assembly("删除会话失败", e))?;
-    state.persist_session_durable_state()?;
+    state.persist_session_durable_state_for_api()?;
     Ok(Json(state.bootstrap_dto_for_workspace_session(
         Some(workspace_id.as_str()),
         None,
@@ -2048,7 +2048,7 @@ async fn rename_session(
         .session_store
         .rename_session(&session_id, &request.name)
         .map_err(|e| ApiError::internal_assembly("重命名会话失败", e))?;
-    state.persist_session_durable_state()?;
+    state.persist_session_durable_state_for_api()?;
     Ok(Json(state.bootstrap_dto_for_workspace_session(
         Some(workspace_id.as_str()),
         Some(&session_id),
@@ -2083,7 +2083,7 @@ async fn close_session(
     if let Some(manager) = state.runner_manager() {
         manager.unbind_session(&session_id);
     }
-    state.persist_session_durable_state()?;
+    state.persist_session_durable_state_for_api()?;
     Ok(Json(state.bootstrap_dto_for_workspace_session(
         Some(workspace_id.as_str()),
         None,
@@ -2103,7 +2103,7 @@ async fn save_session(
     } else {
         None
     };
-    state.persist_session_durable_state()?;
+    state.persist_session_durable_state_for_api()?;
     Ok(Json(state.bootstrap_dto_for_workspace_session(
         Some(workspace_id),
         selected_session_id.as_ref(),
@@ -2250,7 +2250,7 @@ async fn append_session_notification(
             display_mode: request.normalized_display_mode(),
             duration: request.duration,
         });
-    state.persist_session_durable_state()?;
+    state.persist_session_durable_state_for_api()?;
     Ok(Json(build_notifications_response(
         &state,
         &session_id,
@@ -2268,7 +2268,7 @@ async fn mark_all_notifications_read(
     state
         .session_store
         .mark_notifications_handled_for_session(&session_id);
-    state.persist_session_durable_state()?;
+    state.persist_session_durable_state_for_api()?;
     Ok(Json(build_notifications_response(
         &state,
         &session_id,
@@ -2304,7 +2304,7 @@ async fn clear_notifications(
     state
         .session_store
         .clear_notifications_for_session(&session_id);
-    state.persist_session_durable_state()?;
+    state.persist_session_durable_state_for_api()?;
     Ok(Json(build_notifications_response(
         &state,
         &session_id,
@@ -2352,7 +2352,7 @@ async fn remove_notification(
             DomainError::NotFound { .. } => ApiError::not_found("通知不存在", &notification_id),
             other => ApiError::internal_assembly("移除通知失败", other),
         })?;
-    state.persist_session_durable_state()?;
+    state.persist_session_durable_state_for_api()?;
     Ok(Json(build_notifications_response(
         &state,
         &session_id,
