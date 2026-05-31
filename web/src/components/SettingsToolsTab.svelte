@@ -155,9 +155,19 @@
     schemaWarnings: string[];
   }): string {
     const parts = [getBuiltinToolRuntimeLabel(tool.runtimeStatus)];
-    if (tool.runtimeWarnings.length > 0) parts.push(...tool.runtimeWarnings);
+    if (tool.runtimeWarnings.length > 0) parts.push(i18n.t('settings.tools.runtimeWarning'));
     if (tool.schemaWarnings.length > 0) parts.push(i18n.t('settings.tools.schemaWarning'));
     return parts.join('\n');
+  }
+
+  function getMCPServerSubtitle(server: any): string {
+    if (typeof server?.toolCount === 'number' && Number.isFinite(server.toolCount) && server.toolCount > 0) {
+      return i18n.t('settings.tools.mcpToolCount', { count: server.toolCount });
+    }
+    if (server?.enabled === false) {
+      return i18n.t('settings.tools.disabledLabel');
+    }
+    return getMCPHealthLabel(server);
   }
 
   function getCapabilityDependencyLabel(name: string): string {
@@ -543,7 +553,7 @@
                       </div>
                       <div class="identity-stack">
                         <span class="main-label">{server.name}</span>
-                        <span style="font-size: 10px; color: var(--foreground-muted); font-family: var(--font-mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 140px;">{server.command || ''}</span>
+                        <span style="font-size: 10px; color: var(--foreground-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 140px;">{getMCPServerSubtitle(server)}</span>
                       </div>
                     </div>
                     <div class="header-action" style="display: flex; align-items: center; gap: 6px;">
