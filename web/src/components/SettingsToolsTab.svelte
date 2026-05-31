@@ -634,11 +634,11 @@
           </div>
         </div>
 
-        <!-- Claude Skills 工具 -->
+        <!-- Skill 工具 -->
         <div class="settings-section tools-section">
           <div class="settings-section-header" style="display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 16px;">
             <div class="header-title-group" style="display: flex; align-items: baseline; gap: 10px;">
-              <div class="settings-section-title" style="margin-bottom: 0;">{i18n.t('settings.tools.claudeSkills')}</div>
+              <div class="settings-section-title" style="margin-bottom: 0;">{i18n.t('settings.tools.skillsTools')}</div>
               <div class="settings-section-desc" style="margin-bottom: 0;">{i18n.t('settings.tools.skillsDesc')}</div>
             </div>
             <div class="settings-section-actions">
@@ -670,7 +670,7 @@
                       </div>
                       <div class="skill-name-box">
                         <span class="skill-name">{skill.name}</span>
-                        <span class="skill-source-tag">{skill.source === 'custom' ? i18n.t('settings.tools.custom') : 'Instruction'}</span>
+                        <span class="skill-source-tag">{skill.source === 'custom' ? i18n.t('settings.tools.custom') : i18n.t('settings.tools.skillSourceInstalled')}</span>
                       </div>
                     </div>
                     <button class="skill-delete-btn" title={i18n.t('settings.tools.delete')} onclick={() => deleteSkill(skill)}>
