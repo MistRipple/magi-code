@@ -1499,6 +1499,54 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn daemon_tools_catalog_route_exposes_runtime_catalog() {
+        let state_root = temp_state_root("tools-catalog-route");
+        let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
+        fs::create_dir_all(config.bootstrap_workspace_root.join("src"))
+            .expect("bootstrap workspace source directory should be creatable");
+        fs::write(
+            config.bootstrap_workspace_root.join("src/lib.rs"),
+            "pub fn tool_catalog_route_probe() -> bool { true }\n",
+        )
+        .expect("bootstrap workspace source file should be writable");
+        let runtime =
+            DaemonRuntime::restore(&config).expect("runtime restore should bootstrap state");
+        let catalog = get_json(
+            runtime.router("daemon-test".to_string()),
+            "/api/tools/catalog?workspaceId=test-workspace-001&sessionId=test-session-001&includeInternal=true&includeSchema=true",
+        )
+        .await;
+
+        assert_eq!(catalog["tool"], "tool_catalog");
+        assert_eq!(catalog["status"], "succeeded");
+        assert_eq!(catalog["external_catalog_status"], "available");
+        assert_eq!(catalog["agent_role_catalog_status"], "available");
+        assert!(
+            catalog["spawnable_agent_role_count"]
+                .as_u64()
+                .expect("spawnable agent role count should serialize")
+                > 0,
+            "daemon tool catalog should expose agent_spawn-capable roles"
+        );
+        let workspace_code_index = catalog["runtime_dependencies"]
+            .as_array()
+            .expect("runtime dependencies should be an array")
+            .iter()
+            .find(|dependency| dependency["name"] == "workspace_code_index")
+            .expect("workspace_code_index dependency should be exposed");
+        assert_eq!(workspace_code_index["workspace_id"], "test-workspace-001");
+        assert_eq!(workspace_code_index["status"], "ready");
+        let process_launch = catalog["tools"]
+            .as_array()
+            .expect("tools should be an array")
+            .iter()
+            .find(|tool| tool["name"] == "process_launch")
+            .expect("includeInternal=true should expose process_launch");
+        assert_eq!(process_launch["public"], false);
+        assert_eq!(process_launch["parameters_schema"]["type"], "object");
+    }
+
     #[test]
     fn restore_bootstraps_empty_state_and_persists_runtime_files() {
         let state_root = temp_state_root("bootstrap");

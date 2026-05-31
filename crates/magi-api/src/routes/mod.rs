@@ -9,6 +9,7 @@ mod sessions;
 pub(crate) mod settings;
 mod tasks_interaction;
 mod tasks_projection;
+mod tools;
 mod workspace_vcs;
 mod workspaces;
 
@@ -67,6 +68,7 @@ pub fn build_router(state: ApiState) -> Router {
         .merge(changes_files_tunnel::routes())
         .merge(tasks_interaction::routes())
         .merge(tasks_projection::routes())
+        .merge(tools::routes())
         .merge(messages::routes());
 
     Router::new()

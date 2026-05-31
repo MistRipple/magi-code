@@ -1182,13 +1182,22 @@ impl ApiState {
     }
 
     fn settings_tool_catalog_json(&self, tool_context: &ToolExecutionContext) -> serde_json::Value {
-        let Some(registry) = &self.tool_registry else {
-            return serde_json::Value::Null;
-        };
-        registry.tool_catalog_value(
+        self.tool_catalog_json(
             r#"{"includeExternal":false,"includeMcpServers":false,"includeAgentRoles":false}"#,
             tool_context,
         )
+        .unwrap_or(serde_json::Value::Null)
+    }
+
+    pub(crate) fn tool_catalog_json(
+        &self,
+        input: &str,
+        tool_context: &ToolExecutionContext,
+    ) -> Result<serde_json::Value, ApiError> {
+        let Some(registry) = &self.tool_registry else {
+            return Err(ApiError::not_found("工具注册表未配置", "tool_registry"));
+        };
+        Ok(registry.tool_catalog_value(input, tool_context))
     }
 
     fn builtin_tools_json(&self, tool_catalog: &serde_json::Value) -> serde_json::Value {
