@@ -1444,14 +1444,13 @@ fn builtin_rejected(tool: &str, message: impl Into<String>) -> String {
 /// 必然是误调用——它们的语义需要 orchestration 层访问 task_store + spawn_graph +
 /// conversation registry，远超 BuiltinTool trait 暴露的 ToolExecutionContext。
 /// 真正的拦截点在 `crates/magi-conversation-runtime/src/tool_batch.rs::execute_task_tool_call`
-/// （conversation runtime）。这里返回一个明确的 `orchestration_required` 状态，
-/// 避免悄无声息地把它当成无副作用工具执行。
-fn execute_orchestration_only(name: BuiltinToolName, input: &str) -> String {
+/// （conversation runtime）。这里返回稳定错误码，避免把内部调用链或原始输入暴露到产品表面。
+fn execute_orchestration_only(name: BuiltinToolName, _input: &str) -> String {
     serde_json::json!({
         "tool": name.as_str(),
         "status": "failed",
-        "error": "coordinator tool reached the builtin executor; this must be intercepted at the orchestration layer (see execute_task_tool_call)",
-        "input_echo": input,
+        "error_code": "orchestration_required",
+        "error": "该协调工具需要由任务运行时处理，当前执行入口不可用",
     })
     .to_string()
 }
