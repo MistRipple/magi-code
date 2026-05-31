@@ -47,10 +47,21 @@
     return translated !== key ? translated : tmpl.displayName;
   }
 
+  function formatLocalizedFallbackList(items: string[]): string {
+    const normalized = items.map((item) => item.trim()).filter(Boolean);
+    if (normalized.length === 0) return '';
+    return new Intl.ListFormat(i18n.locale, { style: 'short', type: 'conjunction' }).format(normalized);
+  }
+
   function resolveLocalizedTemplateDescription(tmpl: RoleTemplate): string {
     const key = tmpl.i18n?.descriptionKey || `roleTemplate.${tmpl.templateId}.description`;
     const translated = i18n.t(key);
-    return translated !== key ? translated : (tmpl.description || tmpl.profile.focus.join('，'));
+    if (translated !== key) return translated;
+    if (tmpl.description) return tmpl.description;
+    const localizedFocus = tmpl.profile.focus.map((item, index) => (
+      resolveLocalizedListPhrase(tmpl, 'focus', index, item)
+    ));
+    return formatLocalizedFallbackList(localizedFocus);
   }
 
   function resolveLocalizedRolePositioning(tmpl: RoleTemplate): string {
