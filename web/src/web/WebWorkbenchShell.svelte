@@ -1088,7 +1088,7 @@
       agentBaseUrl = resolveAgentBaseUrl();
       if (detail?.status === 'recovering') {
         if (!workspaces.length && !loading) {
-          loadError = detail.error || i18n.t('web.agentRecovering');
+          loadError = i18n.t('web.agentRecovering');
         }
         return;
       }

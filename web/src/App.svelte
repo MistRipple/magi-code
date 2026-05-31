@@ -57,7 +57,7 @@
         return;
       }
       if (!messagesState.bootstrapped) {
-        bootstrapConnectionError = detail?.error || i18n.t('bridge.agentUnreachable');
+        bootstrapConnectionError = i18n.t('bridge.agentUnreachable');
       }
     };
     window.addEventListener(AGENT_CONNECTION_EVENT, handleAgentConnection as EventListener);

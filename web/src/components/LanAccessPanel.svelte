@@ -55,7 +55,11 @@
   async function applyTunnelState(data: Record<string, unknown>) {
     tunnelStatus = typeof data?.status === 'string' ? data.status : 'stopped';
     tunnelAccessUrl = typeof data?.accessUrl === 'string' ? data.accessUrl : '';
-    tunnelError = typeof data?.error === 'string' ? data.error : '';
+    const rawError = typeof data?.error === 'string' ? data.error.trim() : '';
+    if (rawError) {
+      console.warn('[LanAccessPanel] tunnel state error:', rawError);
+    }
+    tunnelError = rawError ? i18n.t('lanAccess.tunnelUnavailable') : '';
     tunnelQrSvg = tunnelAccessUrl ? await renderQR(tunnelAccessUrl) : '';
   }
 
@@ -63,8 +67,9 @@
     try {
       const res = await fetch(`${resolveAgentBaseUrl()}/api/tunnel/status`);
       if (!res.ok) {
+        console.warn('[LanAccessPanel] tunnel status request failed:', res.status);
         tunnelStatus = 'error';
-        tunnelError = `获取公网映射状态失败：${res.status}`;
+        tunnelError = i18n.t('lanAccess.tunnelStatusFailed');
         tunnelAccessUrl = '';
         tunnelQrSvg = '';
         return;
@@ -72,8 +77,9 @@
       const data = await res.json();
       await applyTunnelState(data);
     } catch (error) {
+      console.warn('[LanAccessPanel] tunnel status request failed:', error);
       tunnelStatus = 'error';
-      tunnelError = error instanceof Error ? error.message : '获取公网映射状态失败';
+      tunnelError = i18n.t('lanAccess.tunnelStatusFailed');
       tunnelAccessUrl = '';
       tunnelQrSvg = '';
     }
@@ -92,8 +98,9 @@
         : { method: 'POST' };
       const res = await fetch(`${resolveAgentBaseUrl()}/api/tunnel/${action}`, init);
       if (!res.ok) {
+        console.warn('[LanAccessPanel] tunnel action failed:', action, res.status);
         tunnelStatus = 'error';
-        tunnelError = `${action === 'start' ? '启动' : '关闭'}公网映射失败：${res.status}`;
+        tunnelError = i18n.t(action === 'start' ? 'lanAccess.tunnelStartFailed' : 'lanAccess.tunnelStopFailed');
         tunnelAccessUrl = '';
         tunnelQrSvg = '';
         return;
@@ -103,8 +110,9 @@
       // 隧道启动是异步的，轮询直到状态稳定
       await pollTunnelUntilStable();
     } catch (error) {
+      console.warn('[LanAccessPanel] tunnel action failed:', action, error);
       tunnelStatus = 'error';
-      tunnelError = error instanceof Error ? error.message : '公网映射操作失败';
+      tunnelError = i18n.t(action === 'start' ? 'lanAccess.tunnelStartFailed' : 'lanAccess.tunnelStopFailed');
       tunnelAccessUrl = '';
       tunnelQrSvg = '';
     }

@@ -30,6 +30,7 @@ import {
   resolveTimelineCanonicalTurnSeqFromMetadata,
   resolveTimelineTurnOrderSeqFromMetadata,
 } from '../shared/timeline-ordering';
+import { i18n } from '../stores/i18n.svelte';
 
 // Re-export for external consumers
 export {
@@ -276,9 +277,7 @@ function handleUnhandledMessageError(error: unknown, message?: ClientBridgeMessa
   lastUnhandledMessageErrorAt = now;
   addToast(
     'error',
-    detail
-      ? `消息同步异常，已终止当前执行态：${detail}`
-      : '消息同步异常，已终止当前执行态，请重试。',
+    i18n.t('messageHandler.syncError'),
     undefined,
     {
       category: 'incident',
