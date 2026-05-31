@@ -1650,10 +1650,8 @@ function createSettingsStore(props: { onClose?: () => void }) {
     let parsed: any;
     try {
       parsed = JSON.parse(jsonText);
-    } catch (error: any) {
-      mcpDialogError = i18n.t("settings.mcp.jsonError", {
-        error: error.message,
-      });
+    } catch {
+      mcpDialogError = i18n.t("settings.mcp.jsonError");
       return;
     }
 

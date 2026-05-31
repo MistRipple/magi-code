@@ -116,7 +116,7 @@
       case 'low':
         return i18n.t('settings.tools.riskLow');
       default:
-        return riskLevel || i18n.t('settings.tools.unknown');
+        return i18n.t('settings.tools.unknown');
     }
   }
 
@@ -131,7 +131,7 @@
       case 'unavailable':
         return i18n.t('settings.tools.runtimeUnavailable');
       default:
-        return status || i18n.t('settings.tools.unknown');
+        return i18n.t('settings.tools.unknown');
     }
   }
 
@@ -187,7 +187,7 @@
       case 'mcp_servers':
         return i18n.t('settings.tools.dependency.mcpServers');
       default:
-        return name;
+        return i18n.t('settings.tools.unknown');
     }
   }
 
@@ -204,7 +204,7 @@
       case 'unavailable':
         return i18n.t('settings.tools.dependency.status.unavailable');
       default:
-        return status || i18n.t('settings.tools.unknown');
+        return i18n.t('settings.tools.unknown');
     }
   }
 
