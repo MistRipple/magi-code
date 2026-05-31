@@ -79,7 +79,8 @@
     } catch (e) {
       if (token !== renderToken) return;
       svgContent = '';
-      error = e instanceof Error ? e.message : String(e);
+      console.warn('[GraphvizRenderer] diagram render failed:', e);
+      error = i18n.t('diagramRenderer.renderHint');
     } finally {
       if (token === renderToken) {
         isRendering = false;

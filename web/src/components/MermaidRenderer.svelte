@@ -202,8 +202,8 @@
       translateY = 0;
     } catch (e) {
       if (token !== renderToken) return;
-      console.error('[DiagramRenderer] 渲染错误:', e);
-      error = e instanceof Error ? e.message : i18n.t('diagramRenderer.renderFailed');
+      console.warn('[MermaidRenderer] diagram render failed:', e);
+      error = i18n.t('diagramRenderer.renderHint');
       svgContent = '';
       lastRenderedKey = currentRenderKey;
     } finally {

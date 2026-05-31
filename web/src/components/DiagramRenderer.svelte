@@ -39,8 +39,9 @@
   let copied = $state(false);
 
   function recordLoadError(kind: DiagramPayload['kind'], error: unknown): void {
+    console.warn('[DiagramRenderer] diagram renderer load failed:', kind, error);
     failedKind = kind;
-    failedMessage = error instanceof Error ? error.message : String(error);
+    failedMessage = i18n.t('diagramRenderer.renderHint');
     loadError = failedMessage;
   }
 

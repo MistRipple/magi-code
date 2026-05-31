@@ -352,6 +352,7 @@
   "diagramRenderer.unsupportedMindmap": "Render mind maps with structured diagram data",
   "diagramRenderer.emptyGraph": "No graph data to render",
   "diagramRenderer.renderFailed": "Render Failed",
+  "diagramRenderer.renderHint": "Check the diagram content, or retry later",
   "diagramRenderer.rendering": "Rendering...",
   "diagramRenderer.copyData": "Copy diagram data",
   "diagramRenderer.openInNewTab": "Open in new tab",

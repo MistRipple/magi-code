@@ -352,6 +352,7 @@
   "diagramRenderer.unsupportedMindmap": "思维导图请使用结构化图表数据渲染",
   "diagramRenderer.emptyGraph": "没有可渲染的图数据",
   "diagramRenderer.renderFailed": "渲染失败",
+  "diagramRenderer.renderHint": "请检查图表内容，或稍后重试",
   "diagramRenderer.rendering": "渲染中...",
   "diagramRenderer.copyData": "复制图表数据",
   "diagramRenderer.openInNewTab": "在新标签页打开",

@@ -205,9 +205,8 @@
       await ensureLayoutRegistered(layoutName);
     } catch (registrationError) {
       if (currentRenderToken !== renderToken) return;
-      error = registrationError instanceof Error
-        ? registrationError.message
-        : i18n.t('diagramRenderer.renderFailed');
+      console.warn('[CytoscapeRenderer] graph layout registration failed:', registrationError);
+      error = i18n.t('diagramRenderer.renderHint');
       return;
     }
     if (!cy || currentRenderToken !== renderToken) return;
