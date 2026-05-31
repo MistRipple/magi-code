@@ -166,6 +166,7 @@
     return names.slice(0, 4).join('、');
   });
   const failureRootCause = $derived.by(() => opsView?.failureRootCause || null);
+  const failureRootCauseSummary = $derived.by(() => sanitizeRuntimeDisplayText(failureRootCause?.summary));
 
   const summaryEntries = $derived.by(() => {
     if (!runtimeState) {
@@ -1440,10 +1441,10 @@
         </div>
       {/if}
 
-      {#if failureRootCause}
+      {#if failureRootCauseSummary}
         <div class="runtime-diagnostics__block runtime-diagnostics__block--failure">
           <div class="runtime-diagnostics__label">{i18n.t('runtimeDiagnostics.failureRootCauseTitle')}</div>
-          <div class="runtime-diagnostics__failure-reason">{failureRootCause.summary}</div>
+          <div class="runtime-diagnostics__failure-reason">{failureRootCauseSummary}</div>
         </div>
       {/if}
 

@@ -20,6 +20,12 @@
   const normalizedText = $derived(typeof text === 'string' ? text.trim() : '');
   const inlineText = $derived(normalizedText.replace(/\s+/g, ' ').trim());
   const shouldShowMore = $derived.by(() => normalizedText.includes('\n') || inlineText.length > maxInlineChars);
+  const summaryText = $derived.by(() => {
+    if (!shouldShowMore) {
+      return inlineText;
+    }
+    return `${inlineText.slice(0, Math.max(1, maxInlineChars)).trim()}...`;
+  });
 
   function updatePopoverPosition() {
     if (!triggerEl) return;
@@ -56,7 +62,7 @@
       copySuccess = true;
       setTimeout(() => { copySuccess = false; }, 2000);
     } catch (error) {
-      console.error('复制错误详情失败:', error);
+      console.error('复制详情失败:', error);
     }
   }
 
@@ -85,7 +91,7 @@
 </script>
 
 <span class="error-detail" bind:this={rootEl}>
-  <span class="error-summary" title={normalizedText}>{inlineText}</span>
+  <span class="error-summary" title={summaryText}>{summaryText}</span>
   {#if shouldShowMore}
     <button class="error-more-btn" bind:this={triggerEl} onclick={togglePopover} type="button" title={i18n.t('errorDetail.more')}>
       {i18n.t('errorDetail.more')}
