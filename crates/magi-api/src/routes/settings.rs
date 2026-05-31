@@ -780,9 +780,11 @@ async fn save_safeguard_config(
     State(state): State<ApiState>,
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let normalized =
+        crate::state::normalize_safeguard_config_value(scoped_settings_section_request(&request));
     state
         .settings_store
-        .set_section("safeguardConfig", scoped_settings_section_request(&request));
+        .set_section("safeguardConfig", normalized);
     Ok(Json(serde_json::json!({ "saved": true })))
 }
 
@@ -1920,6 +1922,24 @@ mod tests {
                     "enabled": true,
                     "category": "custom",
                     "action": "hard_block"
+                },
+                {
+                    "pattern": "  custom-audit-global  ",
+                    "enabled": true,
+                    "category": "custom",
+                    "action": "audit_only"
+                },
+                {
+                    "pattern": "ignored-empty-rule",
+                    "enabled": true,
+                    "category": "unknown-category",
+                    "action": "unknown-action"
+                },
+                {
+                    "pattern": "   ",
+                    "enabled": true,
+                    "category": "custom",
+                    "action": "hard_block"
                 }
             ]
         });
@@ -1933,6 +1953,24 @@ mod tests {
             .await
             .expect("save safeguard config should succeed");
         assert_eq!(saved_safeguard.0["saved"], serde_json::json!(true));
+        let saved_section = state.settings_store.get_section("safeguardConfig");
+        let saved_rules = saved_section["rules"]
+            .as_array()
+            .expect("saved safeguard rules should be array");
+        assert_eq!(saved_rules.len(), 3);
+        assert!(
+            saved_rules.iter().any(|rule| rule["pattern"]
+                == serde_json::json!("custom-audit-global")
+                && rule["action"] == serde_json::json!("audit_only")),
+            "save path should trim pattern and preserve audit action"
+        );
+        assert!(
+            saved_rules.iter().any(|rule| rule["pattern"]
+                == serde_json::json!("ignored-empty-rule")
+                && rule["category"] == serde_json::json!("custom")
+                && rule["action"] == serde_json::json!("require_approval_in_restricted")),
+            "save path should normalize unknown category/action exactly as SafetyGate does"
+        );
 
         let bootstrap_a = settings_bootstrap(
             State(state.clone()),
@@ -1973,6 +2011,16 @@ mod tests {
                 .any(
                     |rule| rule["pattern"] == serde_json::json!("custom-danger-global")
                         && rule["action"] == serde_json::json!("hard_block")
+                )
+        );
+        assert!(
+            bootstrap_a["safeguardConfig"]["rules"]
+                .as_array()
+                .expect("rules should be array")
+                .iter()
+                .any(
+                    |rule| rule["pattern"] == serde_json::json!("custom-audit-global")
+                        && rule["action"] == serde_json::json!("audit_only")
                 )
         );
         assert_eq!(

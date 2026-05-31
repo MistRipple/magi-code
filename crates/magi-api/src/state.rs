@@ -1505,6 +1505,7 @@ fn normalize_settings_snapshot_sections(snapshot: &mut HashMap<String, serde_jso
     normalize_workers_section(snapshot);
     normalize_mcp_servers_section(snapshot);
     seed_default_safeguard_rules(snapshot);
+    normalize_safeguard_config_section(snapshot);
     alias_snapshot_keys(snapshot);
 }
 
@@ -1628,19 +1629,52 @@ fn normalize_user_rules_config_value(mut value: serde_json::Value) -> serde_json
     }
 }
 
+pub(crate) fn normalize_safeguard_config_value(mut value: serde_json::Value) -> serde_json::Value {
+    normalize_wrapped_section_value(&mut value);
+    let mut object = match value {
+        serde_json::Value::Object(object) => object,
+        _ => serde_json::Map::new(),
+    };
+    let rules = object
+        .get("rules")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!([]));
+    let normalized_rules = magi_safety_gate::rules_from_settings_value(&rules)
+        .into_iter()
+        .map(safeguard_rule_json)
+        .collect::<Vec<_>>();
+    object.insert(
+        "rules".to_string(),
+        serde_json::Value::Array(normalized_rules),
+    );
+    serde_json::Value::Object(object)
+}
+
+fn normalize_safeguard_config_section(snapshot: &mut HashMap<String, serde_json::Value>) {
+    let Some(value) = snapshot.remove("safeguardConfig") else {
+        return;
+    };
+    snapshot.insert(
+        "safeguardConfig".to_string(),
+        normalize_safeguard_config_value(value),
+    );
+}
+
+fn safeguard_rule_json(rule: magi_safety_gate::SafetyRule) -> serde_json::Value {
+    serde_json::json!({
+        "pattern": rule.pattern,
+        "enabled": rule.enabled,
+        "category": rule.category.as_str(),
+        "action": rule.action.as_str(),
+    })
+}
+
 fn builtin_safeguard_rules() -> Vec<serde_json::Value> {
     // 单一事实源：magi-safety-gate::builtin_rules() 持有内置危险模式集合。
     // 这里只做"规则结构 → settings JSON 形态"的转换，便于前端读取与编辑。
     magi_safety_gate::builtin_rules()
         .into_iter()
-        .map(|rule| {
-            serde_json::json!({
-                "pattern": rule.pattern,
-                "enabled": rule.enabled,
-                "category": rule.category.as_str(),
-                "action": rule.action.as_str(),
-            })
-        })
+        .map(safeguard_rule_json)
         .collect()
 }
 
