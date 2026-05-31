@@ -240,11 +240,7 @@ impl SafetyGate {
         for rule in &self.rules {
             if rule.matches(command) {
                 let pattern = rule.pattern.clone();
-                let reason = format!(
-                    "命中 SafetyGate {} 规则：{}",
-                    rule.category.as_str(),
-                    pattern
-                );
+                let reason = format!("命中安全规则（{}）：{}", rule.category.as_str(), pattern);
                 return match rule.action {
                     SafetyAction::HardBlock => SafetyDecision::HardBlock {
                         category: rule.category,
@@ -362,6 +358,10 @@ mod tests {
                 ..
             }
         ));
+        assert!(
+            !decision.reason().unwrap_or_default().contains("SafetyGate"),
+            "公开拦截理由不应暴露内部组件名"
+        );
     }
 
     #[test]

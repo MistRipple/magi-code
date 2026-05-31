@@ -1241,7 +1241,7 @@ impl LlmTaskDispatcher {
                 .collect::<Vec<_>>();
             if !patterns.is_empty() {
                 sections.push(format!(
-                    "执行 shell / git / 文件写操作前，如果命中以下危险模式，必须先向用户确认，不得直接执行（违规调用会被 SafetyGate 在运行期直接拦截）：\n{}",
+                    "执行 shell / git / 文件写操作前，如果命中以下危险模式，必须先向用户确认，不得直接执行（违规调用会被运行期安全策略拦截）：\n{}",
                     patterns.join("\n")
                 ));
             }
