@@ -18,7 +18,7 @@ function normalizeTaskText(text: string | null | undefined): string {
 }
 
 export function getTaskDisplayTitle(task: TaskDisplayInput): string {
-  return normalizeTaskText(task.title) || task.task_id;
+  return normalizeTaskText(task.title) || '未命名任务';
 }
 
 export function getTaskDisplayGoal(task: TaskDisplayInput): string {
@@ -41,7 +41,7 @@ export function getTaskKindLabel(kind: TaskKind): string {
     case 'monitor_mcp': return 'MCP 监控';
     case 'in_process_teammate': return '进程内队友';
     case 'dream': return '后台整理';
-    default: return kind;
+    default: return '任务';
   }
 }
 
@@ -65,7 +65,7 @@ export function getTaskStatusLabel(status: TaskStatus): string {
     case 'completed': return '已完成';
     case 'failed': return '失败';
     case 'killed': return '已终止';
-    default: return status;
+    default: return '未知';
   }
 }
 
