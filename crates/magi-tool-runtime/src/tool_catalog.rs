@@ -269,11 +269,11 @@ impl RuntimeHealth {
 
     fn tool_status(&self, tool: BuiltinToolName) -> RuntimeToolStatus {
         match tool {
-            BuiltinToolName::KnowledgeQuery => self.knowledge_tool_status("knowledge_query"),
-            BuiltinToolName::SearchSemantic => self.code_index_tool_status("search_semantic"),
-            BuiltinToolName::CodeSymbols => self.code_index_tool_status("code_symbols"),
+            BuiltinToolName::KnowledgeQuery => self.knowledge_tool_status(),
+            BuiltinToolName::SearchSemantic => self.code_index_tool_status(),
+            BuiltinToolName::CodeSymbols => self.code_index_tool_status(),
             BuiltinToolName::AgentSpawn | BuiltinToolName::AgentWait => {
-                self.agent_role_tool_status(tool.as_str())
+                self.agent_role_tool_status()
             }
             _ => RuntimeToolStatus {
                 status: "ready",
@@ -282,19 +282,17 @@ impl RuntimeHealth {
         }
     }
 
-    fn knowledge_tool_status(&self, tool_name: &str) -> RuntimeToolStatus {
+    fn knowledge_tool_status(&self) -> RuntimeToolStatus {
         if !self.knowledge_store_available {
             return RuntimeToolStatus {
                 status: "unavailable",
-                warnings: vec![format!(
-                    "{tool_name} 需要 KnowledgeStore，但当前运行时未注入"
-                )],
+                warnings: vec!["知识检索能力暂不可用".to_string()],
             };
         }
         if self.workspace_id.is_none() {
             return RuntimeToolStatus {
                 status: "missing_context",
-                warnings: vec![format!("{tool_name} 需要 workspace 上下文")],
+                warnings: vec!["需要先选择工作区".to_string()],
             };
         }
         RuntimeToolStatus {
@@ -303,22 +301,17 @@ impl RuntimeHealth {
         }
     }
 
-    fn agent_role_tool_status(&self, tool_name: &str) -> RuntimeToolStatus {
+    fn agent_role_tool_status(&self) -> RuntimeToolStatus {
         if !self.agent_role_registry_available {
             return RuntimeToolStatus {
                 status: "unavailable",
-                warnings: vec![format!(
-                    "{tool_name} 需要 AgentRoleRegistry，但当前运行时未注入"
-                )],
+                warnings: vec!["子代理能力暂不可用".to_string()],
             };
         }
         if self.spawnable_agent_role_count == 0 {
             return RuntimeToolStatus {
                 status: "not_ready",
-                warnings: vec![format!(
-                    "{tool_name} 需要至少一个可派发代理角色；当前注册角色数 {}，可派发 0",
-                    self.agent_role_count
-                )],
+                warnings: vec!["当前没有可派发的子代理角色".to_string()],
             };
         }
         RuntimeToolStatus {
@@ -327,15 +320,15 @@ impl RuntimeHealth {
         }
     }
 
-    fn code_index_tool_status(&self, tool_name: &str) -> RuntimeToolStatus {
-        let base = self.knowledge_tool_status(tool_name);
+    fn code_index_tool_status(&self) -> RuntimeToolStatus {
+        let base = self.knowledge_tool_status();
         if base.status != "ready" {
             return base;
         }
         if !self.workspace_code_index_ready {
             return RuntimeToolStatus {
                 status: "not_ready",
-                warnings: vec![format!("{tool_name} 需要当前 workspace 的本地代码索引就绪")],
+                warnings: vec!["当前工作区本地索引尚未就绪".to_string()],
             };
         }
         RuntimeToolStatus {
@@ -566,6 +559,10 @@ mod tests {
             .find(|tool| tool["name"] == "search_semantic")
             .expect("search_semantic should be listed");
         assert_eq!(search_semantic["runtime_status"], "unavailable");
+        assert_eq!(
+            search_semantic["runtime_warnings"],
+            serde_json::json!(["知识检索能力暂不可用"])
+        );
         let agent_spawn = payload["tools"]
             .as_array()
             .expect("tools")
@@ -573,6 +570,29 @@ mod tests {
             .find(|tool| tool["name"] == "agent_spawn")
             .expect("agent_spawn should be listed");
         assert_eq!(agent_spawn["runtime_status"], "unavailable");
+        assert_eq!(
+            agent_spawn["runtime_warnings"],
+            serde_json::json!(["子代理能力暂不可用"])
+        );
+        let warning_text = payload["tools"]
+            .as_array()
+            .expect("tools")
+            .iter()
+            .flat_map(|tool| {
+                tool["runtime_warnings"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(serde_json::Value::as_str)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        for forbidden in ["KnowledgeStore", "AgentRoleRegistry", "未注入", "workspace"] {
+            assert!(
+                !warning_text.contains(forbidden),
+                "runtime warnings should use product language, found {forbidden}"
+            );
+        }
         assert_eq!(
             payload["runtime_dependencies"][0]["name"],
             "knowledge_store"
