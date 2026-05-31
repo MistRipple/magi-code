@@ -4,11 +4,14 @@ use crate::{
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde_json::Value;
+use std::fmt::Display;
 use std::fs;
+use std::path::Path;
 
 const TOOL_NAME: &str = "view_image";
 const DEFAULT_MAX_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
 const HARD_MAX_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
+const IMAGE_ACCESS_PUBLIC_ERROR: &str = "图片不可读取或不存在";
 
 pub(crate) fn execute_view_image(input: &str, context: &ToolExecutionContext) -> String {
     let request = parse_json_object(input);
@@ -24,38 +27,37 @@ pub(crate) fn execute_view_image(input: &str, context: &ToolExecutionContext) ->
 
     let path = match resolve_path_with_context(&path_value, context) {
         Ok(path) => path,
-        Err(error) => return view_image_error(format!("{path_value}: {error}")),
+        Err(error) => {
+            tracing::warn!(
+                requested_path = %path_value,
+                error = %error,
+                "view_image path resolution failed"
+            );
+            return view_image_error("图片路径不可解析");
+        }
     };
     let metadata = match fs::metadata(&path) {
         Ok(metadata) => metadata,
-        Err(error) => {
-            return view_image_error(format!("读取图片元数据失败 {}: {error}", path.display()));
-        }
+        Err(error) => return view_image_access_error("读取图片元数据失败", &path, error),
     };
     if !metadata.is_file() {
-        return view_image_error(format!("view_image 只能读取图片文件: {}", path.display()));
+        return view_image_error("view_image 只能读取图片文件");
     }
     if metadata.len() > max_bytes {
         return view_image_error(format!(
-            "图片超过大小限制: {} bytes > {} bytes ({})",
+            "图片超过大小限制: {} bytes > {} bytes",
             metadata.len(),
-            max_bytes,
-            path.display()
+            max_bytes
         ));
     }
 
     let bytes = match fs::read(&path) {
         Ok(bytes) => bytes,
-        Err(error) => return view_image_error(format!("读取图片失败 {}: {error}", path.display())),
+        Err(error) => return view_image_access_error("读取图片失败", &path, error),
     };
     let mime = match detect_supported_image_mime(&bytes) {
         Some(mime) => mime,
-        None => {
-            return view_image_error(format!(
-                "不支持或无效的图片格式: {}。支持 png/jpeg/gif/webp",
-                path.display()
-            ));
-        }
+        None => return view_image_error("不支持或无效的图片格式，支持 png/jpeg/gif/webp"),
     };
     let data = STANDARD.encode(&bytes);
     let summary = format!(
@@ -141,6 +143,16 @@ fn view_image_error(message: impl Into<String>) -> String {
     .to_string()
 }
 
+fn view_image_access_error(action: &'static str, path: &Path, error: impl Display) -> String {
+    tracing::warn!(
+        action,
+        path = %path.display(),
+        error = %error,
+        "view_image file access failed"
+    );
+    view_image_error(IMAGE_ACCESS_PUBLIC_ERROR)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,5 +224,31 @@ mod tests {
         let payload: Value = serde_json::from_str(&output).expect("json output");
 
         assert_eq!(payload["status"], "failed");
+        assert_eq!(
+            payload["error"],
+            "不支持或无效的图片格式，支持 png/jpeg/gif/webp"
+        );
+        assert!(
+            !payload.to_string().contains("not-image.txt"),
+            "view_image failure should not echo file paths"
+        );
+    }
+
+    #[test]
+    fn view_image_hides_file_access_details() {
+        let root = unique_temp_dir("magi-view-image-missing");
+
+        let output = execute_view_image("missing.png", &context(root));
+        let payload: Value = serde_json::from_str(&output).expect("json output");
+
+        assert_eq!(payload["status"], "failed");
+        assert_eq!(payload["error"], IMAGE_ACCESS_PUBLIC_ERROR);
+        let text = payload.to_string();
+        assert!(
+            !text.contains("missing.png")
+                && !text.contains("No such file")
+                && !text.contains("os error"),
+            "view_image failure should not expose path or io details: {text}"
+        );
     }
 }
