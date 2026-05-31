@@ -251,10 +251,20 @@ pub struct BridgeProbeErrorDto {
 
 impl BridgeProbeErrorDto {
     pub(crate) fn from_client_error(error: BridgeClientError) -> Self {
+        let layer = error.layer();
         Self {
-            layer: error.layer(),
+            layer,
             code: error.code(),
-            message: error.to_string(),
+            message: public_bridge_probe_error_message(layer).to_string(),
         }
+    }
+}
+
+fn public_bridge_probe_error_message(layer: Option<BridgeErrorLayer>) -> &'static str {
+    match layer {
+        Some(BridgeErrorLayer::Transport) => "桥接服务暂不可用",
+        Some(BridgeErrorLayer::Protocol) => "桥接响应格式异常",
+        Some(BridgeErrorLayer::RemoteBusiness) => "桥接服务返回失败状态",
+        None => "桥接配置不可用",
     }
 }

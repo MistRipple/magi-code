@@ -292,8 +292,7 @@ fn probe_snapshot_provider_preserves_partial_failures() {
         Some(BridgeProbeErrorDto {
             layer: Some(BridgeErrorLayer::RemoteBusiness),
             code: Some(-32042),
-            message: "桥接调用失败[RemoteBusiness]: remote business error [-32042]: probe degraded"
-                .to_string(),
+            message: "桥接服务返回失败状态".to_string(),
         })
     );
 }
@@ -443,9 +442,7 @@ fn preflight_snapshot_provider_preserves_smoke_failures() {
         Some(BridgeProbeErrorDto {
             layer: Some(BridgeErrorLayer::RemoteBusiness),
             code: Some(-32006),
-            message:
-                "桥接调用失败[RemoteBusiness]: remote business error [-32006]: provider rejected"
-                    .to_string(),
+            message: "桥接服务返回失败状态".to_string(),
         })
     );
 }
@@ -1122,7 +1119,7 @@ fn cutover_smoke_snapshot_provider_reports_mcp_describe_failure_issue() {
     );
     assert_eq!(
         issue.error.as_ref().map(|error| error.message.as_str()),
-        Some("桥接调用失败[RemoteBusiness]: remote business error [-32022]: missing server")
+        Some("桥接服务返回失败状态")
     );
 }
 
