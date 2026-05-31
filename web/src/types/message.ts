@@ -788,6 +788,7 @@ export interface AppState {
   isProcessing?: boolean;
   processingState?: UIProcessingState | null;
   pendingChanges?: unknown[];
+  pendingChangesState?: unknown;
   locale?: LocaleCode;
   edits?: Edit[];
   pendingChangesStateVersion?: number;

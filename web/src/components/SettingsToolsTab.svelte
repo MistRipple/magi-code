@@ -55,6 +55,10 @@
       roleCount?: number | null;
       spawnableRoleCount?: number | null;
       snapshotActive?: boolean | null;
+      configuredCount?: number | null;
+      enabledCount?: number | null;
+      readyCount?: number | null;
+      toolCount?: number | null;
     }>;
     skills: any[];
     openMCPDialog: (server: any) => void;
@@ -166,6 +170,10 @@
         return i18n.t('settings.tools.dependency.agentRoleRegistry');
       case 'file_snapshot':
         return i18n.t('settings.tools.dependency.fileSnapshot');
+      case 'skill_runtime':
+        return i18n.t('settings.tools.dependency.skillRuntime');
+      case 'mcp_servers':
+        return i18n.t('settings.tools.dependency.mcpServers');
       default:
         return name;
     }
@@ -213,6 +221,10 @@
         return 'bot';
       case 'file_snapshot':
         return 'file';
+      case 'skill_runtime':
+        return 'skill';
+      case 'mcp_servers':
+        return 'plug';
       default:
         return 'tools';
     }
@@ -223,6 +235,10 @@
     fileCount?: number | null;
     spawnableRoleCount?: number | null;
     snapshotActive?: boolean | null;
+    configuredCount?: number | null;
+    enabledCount?: number | null;
+    readyCount?: number | null;
+    toolCount?: number | null;
   }): string {
     if (dependency.name === 'workspace_code_index' && typeof dependency.fileCount === 'number') {
       return i18n.t('settings.tools.dependency.fileCount', { count: dependency.fileCount });
@@ -237,6 +253,24 @@
         ? 'settings.tools.dependency.snapshotActive'
         : 'settings.tools.dependency.snapshotInactive');
     }
+    if (dependency.name === 'skill_runtime' && typeof dependency.toolCount === 'number') {
+      return i18n.t('settings.tools.dependency.toolCount', { count: dependency.toolCount });
+    }
+    if (
+      dependency.name === 'mcp_servers'
+      && typeof dependency.enabledCount === 'number'
+      && typeof dependency.readyCount === 'number'
+    ) {
+      return i18n.t('settings.tools.dependency.readyServerCount', {
+        ready: dependency.readyCount,
+        total: dependency.enabledCount,
+      });
+    }
+    if (dependency.name === 'mcp_servers' && typeof dependency.configuredCount === 'number') {
+      return i18n.t('settings.tools.dependency.configuredServerCount', {
+        count: dependency.configuredCount,
+      });
+    }
     return '';
   }
 
@@ -247,6 +281,10 @@
     fileCount?: number | null;
     spawnableRoleCount?: number | null;
     snapshotActive?: boolean | null;
+    configuredCount?: number | null;
+    enabledCount?: number | null;
+    readyCount?: number | null;
+    toolCount?: number | null;
   }): string {
     const parts = [
       `${getCapabilityDependencyLabel(dependency.name)}: ${getCapabilityDependencyStatusLabel(dependency.status)}`,

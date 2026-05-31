@@ -1,5 +1,5 @@
 use crate::{
-    change_projection::PendingChangeDto,
+    change_projection::{PendingChangeDto, PendingChangesStateDto},
     dto::{
         AuditUsageLedgerDto, BridgePreflightSnapshotDto, BridgeServicesSnapshotDto,
         MissionAggregateExport, RuntimeReadModelDto, ServiceInfo, runtime_read_model_dto,
@@ -53,6 +53,8 @@ pub struct BootstrapDto {
     pub before_cursor: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_changes: Vec<PendingChangeDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_changes_state: Option<PendingChangesStateDto>,
 }
 
 impl BootstrapDto {
@@ -90,11 +92,14 @@ impl BootstrapDto {
             state.collect_mission_aggregate_exports(),
         );
         if let Some(current_session) = dto.current_session.as_ref() {
-            dto.pending_changes = crate::change_projection::collect_session_pending_changes(
-                state,
-                &current_session.session_id,
-                current_session.workspace_id.as_deref(),
-            )?;
+            let pending_projection =
+                crate::change_projection::collect_session_pending_changes_with_state(
+                    state,
+                    &current_session.session_id,
+                    current_session.workspace_id.as_deref(),
+                )?;
+            dto.pending_changes = pending_projection.pending_changes;
+            dto.pending_changes_state = Some(pending_projection.state);
         }
         dto.truncate_initial_timeline_page();
         Ok(dto)
@@ -156,6 +161,7 @@ impl BootstrapDto {
             has_more_before: false,
             before_cursor: None,
             pending_changes: Vec::new(),
+            pending_changes_state: None,
         };
         dto.prune_initial_load_runtime_details();
         dto
@@ -310,8 +316,8 @@ mod tests {
     use super::*;
     use crate::dto::ledger_dto;
     use magi_core::{
-        EventId, ExecutionOwnership, SessionId, SessionLifecycleStatus, ThreadId, UtcMillis,
-        WorkspaceId,
+        AbsolutePath, EventId, ExecutionOwnership, SessionId, SessionLifecycleStatus, ThreadId,
+        UtcMillis, WorkspaceId,
     };
     use magi_event_bus::{
         AuditUsageLedgerStatus, RuntimeExecutorSummary, RuntimeMaintenanceSummary,
@@ -324,7 +330,7 @@ mod tests {
     };
     use magi_workspace::{RecoveryStatus, WorkspaceStore};
     use serde_json::json;
-    use std::sync::Arc;
+    use std::{fs, sync::Arc};
 
     fn service_info() -> ServiceInfo {
         ServiceInfo {
@@ -928,5 +934,58 @@ mod tests {
                 .first()
                 .map(|entry| entry.entry_id.as_str())
         );
+    }
+
+    #[test]
+    fn bootstrap_marks_pending_changes_not_ready_when_snapshot_session_is_missing() {
+        let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(32));
+        let session_store = Arc::new(SessionStore::default());
+        let workspace_store = Arc::new(WorkspaceStore::default());
+        let governance = Arc::new(GovernanceService::default());
+        let workspace_root = std::env::temp_dir().join(format!(
+            "magi-bootstrap-pending-state-{}",
+            UtcMillis::now().0
+        ));
+        fs::create_dir_all(&workspace_root).expect("workspace root should create");
+        workspace_store
+            .register(
+                WorkspaceId::new("workspace-pending-state"),
+                AbsolutePath::new(workspace_root.to_string_lossy().to_string()),
+            )
+            .expect("workspace should register");
+        let state = ApiState::new(
+            "magi",
+            event_bus,
+            session_store.clone(),
+            workspace_store,
+            governance,
+        );
+
+        let session_id = SessionId::new("session-pending-state");
+        session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "Pending State",
+                Some("workspace-pending-state".to_string()),
+            )
+            .expect("session should be creatable");
+
+        let bootstrap = BootstrapDto::from_state_with_selected_session(&state, Some(&session_id))
+            .expect("bootstrap should build");
+
+        assert!(bootstrap.pending_changes.is_empty());
+        let state = bootstrap
+            .pending_changes_state
+            .expect("bootstrap should expose pending changes state");
+        assert_eq!(state.status, "not_ready");
+        assert_eq!(state.reason_code.as_deref(), Some("changes_preparing"));
+        assert_eq!(state.pending_count, 0);
+        assert_eq!(state.session_id.as_deref(), Some("session-pending-state"));
+        assert_eq!(
+            state.workspace_id.as_deref(),
+            Some("workspace-pending-state")
+        );
+
+        let _ = fs::remove_dir_all(workspace_root);
     }
 }

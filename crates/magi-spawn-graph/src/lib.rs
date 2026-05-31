@@ -31,10 +31,11 @@
 //! 3. 一个 child 不能被 spawn 两次（第二次 add_edge 返回 `EdgeAlreadyExists`）。
 
 use std::collections::{HashMap, HashSet};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use magi_core::ids::TaskId;
-use magi_core::task::TaskKind;
+use magi_core::task::{Task, TaskKind, TaskStatus};
+use magi_core::value_objects::UtcMillis;
 
 // ---------------------------------------------------------------------------
 // SpawnEdge / SpawnEdgeStatus
@@ -54,6 +55,14 @@ pub struct SpawnEdge {
     pub task_kind: TaskKind,
     pub created_at: SystemTime,
     pub closed_at: Option<SystemTime>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SpawnGraphRebuildReport {
+    pub candidate_edges: usize,
+    pub restored_edges: usize,
+    pub closed_edges: usize,
+    pub skipped_edges: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -281,11 +290,79 @@ impl SpawnGraph {
     pub fn all_edges(&self) -> Vec<SpawnEdge> {
         self.edges.values().cloned().collect()
     }
+
+    /// 从持久化 TaskStore 的 parent_task_id 重建进程内 SpawnGraph。
+    ///
+    /// TaskStore 是恢复时的事实源；SpawnGraph 仍按当前安全限制校验深度、扇出和环。
+    /// 不合法边会被跳过并计入 report，避免把损坏 checkpoint 重新注入运行期。
+    pub fn rebuild_from_tasks(
+        tasks: impl IntoIterator<Item = Task>,
+    ) -> (Self, SpawnGraphRebuildReport) {
+        let mut tasks = tasks.into_iter().collect::<Vec<_>>();
+        tasks.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.task_id.as_str().cmp(right.task_id.as_str()))
+        });
+        let task_ids = tasks
+            .iter()
+            .map(|task| task.task_id.clone())
+            .collect::<HashSet<_>>();
+        let mut graph = Self::new();
+        let mut report = SpawnGraphRebuildReport::default();
+
+        for task in tasks {
+            let Some(parent_task_id) = task.parent_task_id.clone() else {
+                continue;
+            };
+            report.candidate_edges += 1;
+            if !task_ids.contains(&parent_task_id) {
+                report.skipped_edges += 1;
+                continue;
+            }
+            let child_task_id = task.task_id.clone();
+            if graph
+                .add_edge(
+                    parent_task_id,
+                    child_task_id.clone(),
+                    task.kind,
+                    system_time_from_utc_millis(task.created_at),
+                )
+                .is_err()
+            {
+                report.skipped_edges += 1;
+                continue;
+            }
+            report.restored_edges += 1;
+            if task_status_is_terminal(task.status) {
+                if graph
+                    .mark_closed(&child_task_id, system_time_from_utc_millis(task.updated_at))
+                    .is_ok()
+                {
+                    report.closed_edges += 1;
+                }
+            }
+        }
+
+        (graph, report)
+    }
+}
+
+fn task_status_is_terminal(status: TaskStatus) -> bool {
+    matches!(
+        status,
+        TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Killed
+    )
+}
+
+fn system_time_from_utc_millis(value: UtcMillis) -> SystemTime {
+    UNIX_EPOCH + Duration::from_millis(value.0)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use magi_core::{MissionId, TaskRuntimePayload};
 
     fn now() -> SystemTime {
         SystemTime::UNIX_EPOCH
@@ -293,6 +370,41 @@ mod tests {
 
     fn tid(s: &str) -> TaskId {
         TaskId::new(s)
+    }
+
+    fn task(
+        task_id: &str,
+        parent_task_id: Option<&str>,
+        status: TaskStatus,
+        created_at: u64,
+    ) -> Task {
+        let task_id_value = tid(task_id);
+        Task {
+            task_id: task_id_value.clone(),
+            mission_id: MissionId::new("mission-spawn-graph-test"),
+            root_task_id: parent_task_id
+                .map(tid)
+                .unwrap_or_else(|| task_id_value.clone()),
+            parent_task_id: parent_task_id.map(tid),
+            kind: TaskKind::LocalAgent,
+            title: format!("task {task_id}"),
+            goal: format!("run {task_id}"),
+            status,
+            dependency_ids: Vec::new(),
+            required_children: Vec::new(),
+            policy_snapshot: None,
+            executor_binding: None,
+            knowledge_refs: Vec::new(),
+            workspace_scope: None,
+            write_scope: None,
+            input_refs: Vec::new(),
+            output_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            retry_count: 0,
+            runtime_payload: TaskRuntimePayload::default(),
+            created_at: UtcMillis(created_at),
+            updated_at: UtcMillis(created_at + 1),
+        }
     }
 
     #[test]
@@ -427,5 +539,43 @@ mod tests {
         let mut graph = SpawnGraph::new();
         let err = graph.mark_closed(&tid("missing"), now()).unwrap_err();
         assert!(matches!(err, SpawnGraphError::UnknownChild { .. }));
+    }
+
+    #[test]
+    fn rebuild_from_tasks_restores_edges_and_terminal_status() {
+        let (graph, report) = SpawnGraph::rebuild_from_tasks(vec![
+            task("root", None, TaskStatus::Running, 1),
+            task("child-open", Some("root"), TaskStatus::Running, 2),
+            task("child-done", Some("root"), TaskStatus::Completed, 3),
+        ]);
+
+        assert_eq!(report.candidate_edges, 2);
+        assert_eq!(report.restored_edges, 2);
+        assert_eq!(report.closed_edges, 1);
+        assert_eq!(report.skipped_edges, 0);
+        assert_eq!(graph.parent_of(&tid("child-open")), Some(&tid("root")));
+        assert_eq!(
+            graph.edge_for(&tid("child-open")).unwrap().status,
+            SpawnEdgeStatus::Open
+        );
+        assert_eq!(
+            graph.edge_for(&tid("child-done")).unwrap().status,
+            SpawnEdgeStatus::Closed
+        );
+    }
+
+    #[test]
+    fn rebuild_from_tasks_skips_missing_parent_edges() {
+        let (graph, report) = SpawnGraph::rebuild_from_tasks(vec![task(
+            "orphan",
+            Some("missing-parent"),
+            TaskStatus::Running,
+            1,
+        )]);
+
+        assert_eq!(report.candidate_edges, 1);
+        assert_eq!(report.restored_edges, 0);
+        assert_eq!(report.skipped_edges, 1);
+        assert!(graph.parent_of(&tid("orphan")).is_none());
     }
 }

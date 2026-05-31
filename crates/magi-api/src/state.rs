@@ -673,6 +673,10 @@ fn file_snapshot_capability_dependency(
         role_count: None,
         spawnable_role_count: None,
         snapshot_active: Some(snapshot_active),
+        configured_count: None,
+        enabled_count: None,
+        ready_count: None,
+        tool_count: None,
     }
 }
 
@@ -1425,6 +1429,11 @@ impl ApiState {
         self
     }
 
+    pub fn with_spawn_graph(mut self, graph: Arc<Mutex<magi_spawn_graph::SpawnGraph>>) -> Self {
+        self.spawn_graph = graph;
+        self
+    }
+
     pub fn task_store(&self) -> Option<&TaskStore> {
         self.task_store.as_deref()
     }
@@ -1546,6 +1555,10 @@ fn normalize_capability_dependency_json(raw: &serde_json::Value) -> serde_json::
         "roleCount": capability_dependency_field(raw, "roleCount", "role_count"),
         "spawnableRoleCount": capability_dependency_field(raw, "spawnableRoleCount", "spawnable_role_count"),
         "snapshotActive": capability_dependency_field(raw, "snapshotActive", "snapshot_active"),
+        "configuredCount": capability_dependency_field(raw, "configuredCount", "configured_count"),
+        "enabledCount": capability_dependency_field(raw, "enabledCount", "enabled_count"),
+        "readyCount": capability_dependency_field(raw, "readyCount", "ready_count"),
+        "toolCount": capability_dependency_field(raw, "toolCount", "tool_count"),
     })
 }
 

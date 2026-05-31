@@ -234,6 +234,16 @@ impl RuntimeReadModelInput {
                 "details.execution_groups[].context_memory_extraction_refs",
                 &mut issues,
             );
+            validate_string_set(
+                &entry.context_shared_context_ids,
+                "details.execution_groups[].context_shared_context_ids",
+                &mut issues,
+            );
+            validate_string_set(
+                &entry.context_file_summary_paths,
+                "details.execution_groups[].context_file_summary_paths",
+                &mut issues,
+            );
         }
         for entry in &self.details.assignments {
             validate_string_set(

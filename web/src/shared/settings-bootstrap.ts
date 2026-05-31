@@ -38,6 +38,10 @@ export interface SettingsCapabilityDependency {
   roleCount?: number | null;
   spawnableRoleCount?: number | null;
   snapshotActive?: boolean | null;
+  configuredCount?: number | null;
+  enabledCount?: number | null;
+  readyCount?: number | null;
+  toolCount?: number | null;
 }
 
 export interface SettingsRuntimeSnapshot {

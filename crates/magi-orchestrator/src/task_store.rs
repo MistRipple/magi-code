@@ -240,6 +240,7 @@ impl TaskStore {
             .entry(mission_id)
             .or_default()
             .push(task_id.clone());
+        self.fire_checkpoint();
     }
 
     /// 通过 ID 获取任务。
@@ -249,6 +250,16 @@ impl TaskStore {
             .expect("tasks read lock poisoned")
             .get(task_id)
             .cloned()
+    }
+
+    /// 返回当前任务快照。用于从持久化 Task.parent_task_id 重建运行期拓扑。
+    pub fn all_tasks(&self) -> Vec<Task> {
+        self.tasks
+            .read()
+            .expect("tasks read lock poisoned")
+            .values()
+            .cloned()
+            .collect()
     }
 
     /// 迁移任务到新的父节点，同时修正 children 索引。

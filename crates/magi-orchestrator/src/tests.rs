@@ -413,6 +413,9 @@ fn execution_overview_exports_context_consumption_into_runtime_read_model() {
     assert_eq!(overview_context.used_turns, 1);
     assert_eq!(overview_context.used_knowledge, 1);
     assert_eq!(overview_context.used_memory, 2);
+    assert_eq!(overview_context.recent_turn_resolved_count, 1);
+    assert_eq!(overview_context.recent_turn_retained_count, 1);
+    assert_eq!(overview_context.recent_turn_provided_source_count, 1);
     assert_eq!(overview_context.code_index_knowledge_count, 1);
     assert_eq!(overview_context.audited_knowledge_count, 1);
     assert_eq!(overview_context.governed_knowledge_count, 1);
@@ -425,6 +428,14 @@ fn execution_overview_exports_context_consumption_into_runtime_read_model() {
         overview_context.memory_extraction_refs,
         vec!["extract-context-1".to_string()]
     );
+    assert_eq!(
+        overview_context.shared_context_ids,
+        vec!["shared-1".to_string()]
+    );
+    assert_eq!(
+        overview_context.file_summary_paths,
+        vec!["/tmp/parser.rs".to_string()]
+    );
 
     let read_model = event_bus.runtime_read_model_input();
     let mission_entry = read_model
@@ -436,6 +447,9 @@ fn execution_overview_exports_context_consumption_into_runtime_read_model() {
     assert_eq!(mission_entry.context_used_turn_count, 1);
     assert_eq!(mission_entry.context_used_knowledge_count, 1);
     assert_eq!(mission_entry.context_used_memory_count, 2);
+    assert_eq!(mission_entry.context_recent_turn_resolved_count, 1);
+    assert_eq!(mission_entry.context_recent_turn_retained_count, 1);
+    assert_eq!(mission_entry.context_recent_turn_provided_source_count, 1);
     assert_eq!(mission_entry.context_code_index_knowledge_count, 1);
     assert_eq!(mission_entry.context_audited_knowledge_count, 1);
     assert_eq!(mission_entry.context_governed_knowledge_count, 1);
@@ -455,6 +469,14 @@ fn execution_overview_exports_context_consumption_into_runtime_read_model() {
     assert_eq!(
         mission_entry.context_memory_extraction_refs,
         vec!["extract-context-1".to_string()]
+    );
+    assert_eq!(
+        mission_entry.context_shared_context_ids,
+        vec!["shared-1".to_string()]
+    );
+    assert_eq!(
+        mission_entry.context_file_summary_paths,
+        vec!["/tmp/parser.rs".to_string()]
     );
     assert_eq!(
         read_model

@@ -151,6 +151,10 @@ export interface CapabilityDependencyItem {
   roleCount?: number | null;
   spawnableRoleCount?: number | null;
   snapshotActive?: boolean | null;
+  configuredCount?: number | null;
+  enabledCount?: number | null;
+  readyCount?: number | null;
+  toolCount?: number | null;
 }
 
 function notifySettingsSuccess(
@@ -2404,6 +2408,10 @@ function createSettingsStore(props: { onClose?: () => void }) {
       const workspaceId = readDependencyField(dependency, "workspaceId", "workspace_id");
       const sessionId = readDependencyField(dependency, "sessionId", "session_id");
       const snapshotActive = readDependencyField(dependency, "snapshotActive", "snapshot_active");
+      const configuredCount = readDependencyField(dependency, "configuredCount", "configured_count");
+      const enabledCount = readDependencyField(dependency, "enabledCount", "enabled_count");
+      const readyCount = readDependencyField(dependency, "readyCount", "ready_count");
+      const toolCount = readDependencyField(dependency, "toolCount", "tool_count");
       dependencies.push({
         name,
         status: typeof dependency?.status === "string" ? dependency.status : "unknown",
@@ -2430,6 +2438,18 @@ function createSettingsStore(props: { onClose?: () => void }) {
           : null,
         snapshotActive: typeof snapshotActive === "boolean"
           ? snapshotActive
+          : null,
+        configuredCount: typeof configuredCount === "number" && Number.isFinite(configuredCount)
+          ? configuredCount
+          : null,
+        enabledCount: typeof enabledCount === "number" && Number.isFinite(enabledCount)
+          ? enabledCount
+          : null,
+        readyCount: typeof readyCount === "number" && Number.isFinite(readyCount)
+          ? readyCount
+          : null,
+        toolCount: typeof toolCount === "number" && Number.isFinite(toolCount)
+          ? toolCount
           : null,
       });
     }

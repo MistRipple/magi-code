@@ -371,6 +371,7 @@ impl RuntimeHealth {
                 "required_by": ["agent_spawn", "agent_wait"],
             }),
         ];
+        dependencies.extend(external_capability_dependencies(resources));
 
         if let Some(provider) = &resources.runtime_capability_dependency_provider {
             dependencies.extend(provider(context).into_iter().map(|entry| {
@@ -403,6 +404,83 @@ impl RuntimeHealth {
             "ready"
         }
     }
+}
+
+fn external_capability_dependencies(resources: &ToolRuntimeResources) -> Vec<serde_json::Value> {
+    let Some(provider) = &resources.external_tool_catalog_provider else {
+        return vec![
+            serde_json::json!({
+                "name": "skill_runtime",
+                "status": "unavailable",
+                "required_by": ["skill prompt context", "skill custom tools"],
+                "configured_count": 0,
+                "tool_count": 0,
+            }),
+            serde_json::json!({
+                "name": "mcp_servers",
+                "status": "unavailable",
+                "required_by": ["mcp custom tools", "skill MCP bridge tools"],
+                "configured_count": 0,
+                "enabled_count": 0,
+                "ready_count": 0,
+                "tool_count": 0,
+            }),
+        ];
+    };
+
+    let external = provider();
+    let skill_tool_count = external.skill_tools.len();
+    let invalid_skill_tool_count = external
+        .skill_tools
+        .iter()
+        .filter(|tool| tool.status != "available")
+        .count();
+    let skill_status = if invalid_skill_tool_count > 0 {
+        "not_ready"
+    } else {
+        "ready"
+    };
+
+    let configured_mcp_count = external.mcp_servers.len();
+    let enabled_mcp_count = external
+        .mcp_servers
+        .iter()
+        .filter(|server| server.enabled)
+        .count();
+    let ready_mcp_count = external
+        .mcp_servers
+        .iter()
+        .filter(|server| server.enabled && server.connected)
+        .count();
+    let mcp_tool_count = external
+        .mcp_servers
+        .iter()
+        .filter_map(|server| server.tool_count)
+        .sum::<usize>();
+    let mcp_status = if enabled_mcp_count == 0 || ready_mcp_count == enabled_mcp_count {
+        "ready"
+    } else {
+        "not_ready"
+    };
+
+    vec![
+        serde_json::json!({
+            "name": "skill_runtime",
+            "status": skill_status,
+            "required_by": ["skill prompt context", "skill custom tools"],
+            "configured_count": skill_tool_count,
+            "tool_count": skill_tool_count,
+        }),
+        serde_json::json!({
+            "name": "mcp_servers",
+            "status": mcp_status,
+            "required_by": ["mcp custom tools", "skill MCP bridge tools"],
+            "configured_count": configured_mcp_count,
+            "enabled_count": enabled_mcp_count,
+            "ready_count": ready_mcp_count,
+            "tool_count": mcp_tool_count,
+        }),
+    ]
 }
 
 fn access_mode_for_tool(tool: BuiltinToolName) -> BuiltinToolAccessMode {
@@ -544,6 +622,10 @@ mod tests {
                     role_count: None,
                     spawnable_role_count: None,
                     snapshot_active: Some(false),
+                    configured_count: None,
+                    enabled_count: None,
+                    ready_count: None,
+                    tool_count: None,
                 }]
             })),
             ..ToolRuntimeResources::default()
@@ -610,6 +692,24 @@ mod tests {
         assert_eq!(payload["connected_mcp_server_count"], 1);
         assert_eq!(payload["skill_tools"][0]["name"], "echo.describe");
         assert_eq!(payload["mcp_servers"][0]["health"], "connected");
+        let skill_dependency = payload["runtime_dependencies"]
+            .as_array()
+            .expect("runtime dependencies")
+            .iter()
+            .find(|dependency| dependency["name"] == "skill_runtime")
+            .expect("skill runtime dependency should be listed");
+        let mcp_dependency = payload["runtime_dependencies"]
+            .as_array()
+            .expect("runtime dependencies")
+            .iter()
+            .find(|dependency| dependency["name"] == "mcp_servers")
+            .expect("mcp dependency should be listed");
+        assert_eq!(skill_dependency["status"], "ready");
+        assert_eq!(skill_dependency["tool_count"], 1);
+        assert_eq!(mcp_dependency["status"], "ready");
+        assert_eq!(mcp_dependency["enabled_count"], 1);
+        assert_eq!(mcp_dependency["ready_count"], 1);
+        assert_eq!(mcp_dependency["tool_count"], 1);
     }
 
     #[test]

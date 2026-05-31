@@ -173,6 +173,10 @@ function normalizeCapabilityDependencies(value: unknown): SettingsCapabilityDepe
         record.spawnable_role_count ?? record.spawnableRoleCount,
       ),
       snapshotActive: typeof snapshotActive === 'boolean' ? snapshotActive : null,
+      configuredCount: normalizeNullableNumber(record.configured_count ?? record.configuredCount),
+      enabledCount: normalizeNullableNumber(record.enabled_count ?? record.enabledCount),
+      readyCount: normalizeNullableNumber(record.ready_count ?? record.readyCount),
+      toolCount: normalizeNullableNumber(record.tool_count ?? record.toolCount),
     });
   }
   return dependencies;
@@ -334,6 +338,7 @@ export interface AgentChangeDiffPayload {
   currentContent?: string;
   currentAbsolutePath?: string;
   currentExists?: boolean;
+  pendingChangesState?: unknown;
 }
 
 export interface AgentSessionTurnImagePayload {

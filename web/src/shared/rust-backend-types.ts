@@ -513,6 +513,29 @@ export interface ExecutionGroupRuntimeSummaryDto {
   rejected_dispatch_count: number;
   failed_dispatch_count: number;
   active_task_ids: string[];
+  context_used_turn_count: number;
+  context_used_knowledge_count: number;
+  context_used_memory_count: number;
+  context_used_shared_item_count: number;
+  context_used_file_summary_count: number;
+  context_recent_turn_resolved_count: number;
+  context_recent_turn_retained_count: number;
+  context_recent_turn_session_source_count: number;
+  context_recent_turn_project_source_count: number;
+  context_recent_turn_provided_source_count: number;
+  context_truncation_count: number;
+  context_truncation_parts: string[];
+  context_knowledge_ids: string[];
+  context_knowledge_source_paths: string[];
+  context_memory_ids: string[];
+  context_memory_extraction_refs: string[];
+  context_shared_context_ids: string[];
+  context_file_summary_paths: string[];
+  context_code_index_knowledge_count: number;
+  context_audited_knowledge_count: number;
+  context_governed_knowledge_count: number;
+  context_extracted_memory_count: number;
+  context_provenance_linked_memory_count: number;
   latest_event_type?: string | null;
   current_status?: string | null;
   lifecycle_phase?: string | null;
@@ -771,6 +794,8 @@ export interface BootstrapDto {
   recentEvents: EventEnvelope[];
   hasMoreBefore: boolean;
   beforeCursor?: string | null;
+  pendingChanges?: unknown[];
+  pendingChangesState?: unknown;
 }
 
 // ─── Session management endpoints ───────────────────────────────────
@@ -1143,6 +1168,7 @@ export interface DiffResponseDto {
   workspaceId: string;
   workspacePath: string;
   executionGroupId?: string | null;
+  pendingChangesState?: unknown;
 }
 
 export interface ApproveChangeRequestDto {

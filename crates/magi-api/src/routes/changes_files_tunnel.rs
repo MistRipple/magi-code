@@ -17,8 +17,9 @@ use magi_snapshot::SnapshotSession;
 use super::session_scope::{parse_session_id, require_workspace_id};
 use crate::{
     change_projection::{
-        SessionChangeScope, WorkspaceChangeScope, resolve_session_change_scope,
-        resolve_workspace_change_scope, safe_relative_path, safe_workspace_path,
+        SessionChangeScope, WorkspaceChangeScope, pending_changes_state,
+        resolve_session_change_scope, resolve_workspace_change_scope, safe_relative_path,
+        safe_workspace_path,
     },
     errors::ApiError,
     state::ApiState,
@@ -93,7 +94,7 @@ async fn get_diff(
     Query(query): Query<DiffQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // 没有 sessionId 时不再回退到 git diff —— 全局变更视图已不再属于本系统职责。
-    let (diff, binding) = match query
+    let (diff, binding, pending_changes_state) = match query
         .session_id
         .as_deref()
         .map(str::trim)
@@ -111,6 +112,14 @@ async fn get_diff(
             let pending = snapshot
                 .pending_changes()
                 .map_err(|e| ApiError::internal_assembly("读取快照变更失败", e))?;
+            let pending_state = pending_changes_state(
+                "ready",
+                Some(&scope.session_id),
+                Some(&scope.workspace_id),
+                Some(&scope.workspace_root),
+                pending.len(),
+                None,
+            );
             let diff = match query.file_path.as_deref() {
                 Some(fp) => {
                     let rel = safe_relative_path(fp)?;
@@ -141,19 +150,32 @@ async fn get_diff(
                         .join("\n")
                 }
             };
-            (diff, session_scope_binding(&scope))
+            (diff, session_scope_binding(&scope), pending_state)
         }
         None => {
             // 无 session 调用：仅做一次 workspace 校验，统一返回空 diff，
             // 不再读 git 来伪装出全局变更。
             let workspace_id = require_workspace_id(query.workspace_id.as_deref())?;
             let scope = resolve_workspace_change_scope(&state, &workspace_id)?;
-            (String::new(), workspace_scope_binding(&scope))
+            let pending_state = pending_changes_state(
+                "unavailable",
+                None,
+                Some(&scope.workspace_id),
+                Some(&scope.workspace_root),
+                0,
+                Some("session_unbound"),
+            );
+            (
+                String::new(),
+                workspace_scope_binding(&scope),
+                pending_state,
+            )
         }
     };
     let mut payload = serde_json::json!({
         "diff": diff,
         "filePath": query.file_path,
+        "pendingChangesState": pending_changes_state,
     });
     if let Some(object) = payload.as_object_mut()
         && let Some(binding) = binding.as_object()
@@ -865,7 +887,7 @@ async fn enhance_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::change_projection::collect_session_pending_changes;
+    use crate::change_projection::collect_session_pending_changes_with_state;
     use crate::state::ApiState;
     use axum::{
         body::{Body, to_bytes},
@@ -1267,6 +1289,8 @@ mod tests {
         let payload: serde_json::Value =
             serde_json::from_slice(&body).expect("payload should deserialize");
         assert_eq!(payload["workspaceId"], "ws-session-diff");
+        assert_eq!(payload["pendingChangesState"]["status"], "ready");
+        assert_eq!(payload["pendingChangesState"]["pendingCount"], 1);
         assert!(
             payload["workspacePath"]
                 .as_str()
@@ -1321,6 +1345,9 @@ mod tests {
             .expect("route should respond");
 
         assert_eq!(response.status(), StatusCode::OK);
+        let payload = read_json_response(response).await;
+        assert_eq!(payload["pendingChangesState"]["status"], "ready");
+        assert_eq!(payload["pendingChangesState"]["pendingCount"], 0);
         assert!(
             state.snapshot_session(&session_id).is_some(),
             "显式变更路由必须在账本缺失时按会话/工作区启动快照账本"
@@ -1343,12 +1370,13 @@ mod tests {
         fs::write(root.join("alpha.txt"), "alpha changed\n").expect("alpha modify");
         snap.reconcile().expect("reconcile should succeed");
 
-        let before = collect_session_pending_changes(
+        let before_projection = collect_session_pending_changes_with_state(
             &state,
             &SessionId::new("sess-approve-all"),
             Some("ws-approve-all"),
         )
         .expect("pending changes should collect before approval");
+        let before = before_projection.pending_changes;
         assert_eq!(before.len(), 1);
         assert_eq!(before[0].file_path, "alpha.txt");
 
@@ -1387,12 +1415,13 @@ mod tests {
         assert_eq!(payload["sessionId"], "sess-approve-all");
         assert_eq!(payload["executionGroupId"], "session:sess-approve-all");
 
-        let after = collect_session_pending_changes(
+        let after_projection = collect_session_pending_changes_with_state(
             &state,
             &SessionId::new("sess-approve-all"),
             Some("ws-approve-all"),
         )
         .expect("pending changes should collect after approval");
+        let after = after_projection.pending_changes;
         assert!(
             after.is_empty(),
             "approved files should disappear from pending changes"
@@ -1415,12 +1444,13 @@ mod tests {
         fs::write(root.join("tmp/added.txt"), "new file\n").expect("added file should write");
         snap.reconcile().expect("reconcile should succeed");
 
-        let before = collect_session_pending_changes(
+        let before_projection = collect_session_pending_changes_with_state(
             &state,
             &SessionId::new("sess-revert-all"),
             Some("ws-revert-all"),
         )
         .expect("pending changes should collect");
+        let before = before_projection.pending_changes;
         assert_eq!(before.len(), 1);
         assert_eq!(before[0].file_path, "tmp/added.txt");
         assert_eq!(before[0].r#type, "add");

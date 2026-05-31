@@ -29,6 +29,28 @@ pub(crate) struct WorkspaceChangeScope {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct PendingChangesStateDto {
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_path: Option<String>,
+    pub pending_count: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionPendingChangesProjection {
+    pub pending_changes: Vec<PendingChangeDto>,
+    pub state: PendingChangesStateDto,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PendingChangeDto {
     pub session_id: String,
     pub workspace_id: String,
@@ -164,11 +186,15 @@ pub(crate) fn resolve_workspace_change_scope(
 }
 
 /// 取出会话的 pending changes（来自 SnapshotSession）。
-pub(crate) fn collect_session_pending_changes(
+/// 取出当前会话的 pending changes，并携带快照账本状态。
+///
+/// 状态只表达产品可理解的阶段：ready / not_ready / unavailable / error。
+/// 具体底层错误不进入用户态 payload，详细信息留给日志和服务端错误链路。
+pub(crate) fn collect_session_pending_changes_with_state(
     state: &ApiState,
     session_id: &SessionId,
     workspace_id: Option<&str>,
-) -> Result<Vec<PendingChangeDto>, ApiError> {
+) -> Result<SessionPendingChangesProjection, ApiError> {
     let session = state
         .session_store
         .session(session_id)
@@ -191,44 +217,90 @@ pub(crate) fn collect_session_pending_changes(
         )));
     }
     let Some(bound_workspace_id) = bound_workspace_id else {
-        return Ok(Vec::new());
+        return Ok(SessionPendingChangesProjection {
+            pending_changes: Vec::new(),
+            state: pending_changes_state(
+                "unavailable",
+                Some(session_id),
+                None,
+                None,
+                0,
+                Some("workspace_unavailable"),
+            ),
+        });
     };
-    if state
-        .workspace_root_path(&Some(bound_workspace_id))
-        .is_none()
-    {
-        return Ok(Vec::new());
-    }
-    // 快照账本启动是异步的（SnapshotLifecycleObserver::on_session_created 通过
-    // tokio::spawn 触发 start_session）。在 bootstrap 等只读路径上，若账本尚未就绪，
-    // 等价于"当前没有 pending changes"，直接返回空列表，避免与异步生命周期形成竞态。
+    let Some(workspace_root) = state.workspace_root_path(&Some(bound_workspace_id.clone())) else {
+        return Ok(SessionPendingChangesProjection {
+            pending_changes: Vec::new(),
+            state: pending_changes_state(
+                "unavailable",
+                Some(session_id),
+                Some(&bound_workspace_id),
+                None,
+                0,
+                Some("workspace_unavailable"),
+            ),
+        });
+    };
     if state.snapshot_session(session_id).is_none() {
-        return Ok(Vec::new());
+        return Ok(SessionPendingChangesProjection {
+            pending_changes: Vec::new(),
+            state: pending_changes_state(
+                "not_ready",
+                Some(session_id),
+                Some(&bound_workspace_id),
+                Some(&workspace_root),
+                0,
+                Some("changes_preparing"),
+            ),
+        });
     }
     let scope = resolve_session_change_scope(state, session_id, workspace_id, None)?;
-    project_changes_from_snapshot(state, &scope)
-}
-
-/// 在已知 scope 的情况下投影：路由层（approve/revert）会先 resolve 一次 scope 再调用此函数。
-pub(crate) fn project_changes_from_snapshot(
-    state: &ApiState,
-    scope: &SessionChangeScope,
-) -> Result<Vec<PendingChangeDto>, ApiError> {
-    let session = state.snapshot_session(&scope.session_id).ok_or_else(|| {
-        ApiError::InvalidInput(format!(
-            "会话 {} 的快照账本尚未就绪",
-            scope.session_id.as_str()
-        ))
-    })?;
-    let pending = session
-        .pending_changes()
-        .map_err(|e| ApiError::internal_assembly("读取快照变更失败", e))?;
-    let mut out: Vec<PendingChangeDto> = pending
+    let Some(snapshot_session) = state.snapshot_session(&scope.session_id) else {
+        return Ok(SessionPendingChangesProjection {
+            pending_changes: Vec::new(),
+            state: pending_changes_state(
+                "not_ready",
+                Some(&scope.session_id),
+                Some(&scope.workspace_id),
+                Some(&scope.workspace_root),
+                0,
+                Some("changes_preparing"),
+            ),
+        });
+    };
+    let pending = match snapshot_session.pending_changes() {
+        Ok(pending) => pending,
+        Err(_) => {
+            return Ok(SessionPendingChangesProjection {
+                pending_changes: Vec::new(),
+                state: pending_changes_state(
+                    "error",
+                    Some(&scope.session_id),
+                    Some(&scope.workspace_id),
+                    Some(&scope.workspace_root),
+                    0,
+                    Some("changes_unavailable"),
+                ),
+            });
+        }
+    };
+    let mut pending_changes = pending
         .into_iter()
-        .map(|change| convert_pending(scope, change))
-        .collect();
-    out.sort_by(|left, right| left.file_path.cmp(&right.file_path));
-    Ok(out)
+        .map(|change| convert_pending(&scope, change))
+        .collect::<Vec<_>>();
+    pending_changes.sort_by(|left, right| left.file_path.cmp(&right.file_path));
+    Ok(SessionPendingChangesProjection {
+        state: pending_changes_state(
+            "ready",
+            Some(&scope.session_id),
+            Some(&scope.workspace_id),
+            Some(&scope.workspace_root),
+            pending_changes.len(),
+            None,
+        ),
+        pending_changes,
+    })
 }
 
 fn convert_pending(scope: &SessionChangeScope, change: PendingChange) -> PendingChangeDto {
@@ -272,6 +344,24 @@ fn convert_pending(scope: &SessionChangeScope, change: PendingChange) -> Pending
         worker_id: change.worker_id,
         contributors: scope.contributors.clone(),
         execution_group_id: scope.execution_group_id.clone(),
+    }
+}
+
+pub(crate) fn pending_changes_state(
+    status: &str,
+    session_id: Option<&SessionId>,
+    workspace_id: Option<&WorkspaceId>,
+    workspace_root: Option<&Path>,
+    pending_count: usize,
+    reason_code: Option<&str>,
+) -> PendingChangesStateDto {
+    PendingChangesStateDto {
+        status: status.to_string(),
+        reason_code: reason_code.map(ToString::to_string),
+        session_id: session_id.map(|id| id.as_str().to_string()),
+        workspace_id: workspace_id.map(|id| id.as_str().to_string()),
+        workspace_path: workspace_root.map(|path| path.to_string_lossy().to_string()),
+        pending_count,
     }
 }
 
@@ -472,9 +562,14 @@ mod tests {
             .session_store
             .create_session(session_id.clone(), "未绑定 workspace 的会话")
             .expect("session should create");
-        let changes = collect_session_pending_changes(&state, &session_id, None)
+        let projection = collect_session_pending_changes_with_state(&state, &session_id, None)
             .expect("missing workspace binding should be treated as empty");
-        assert!(changes.is_empty());
+        assert!(projection.pending_changes.is_empty());
+        assert_eq!(projection.state.status, "unavailable");
+        assert_eq!(
+            projection.state.reason_code.as_deref(),
+            Some("workspace_unavailable")
+        );
     }
 
     #[tokio::test]
@@ -491,9 +586,15 @@ mod tests {
             &root,
             None,
         );
-        let changes = collect_session_pending_changes(&state, &sid, Some("ws-no-snapshot"))
-            .expect("snapshot not yet started should be treated as empty");
-        assert!(changes.is_empty());
+        let projection =
+            collect_session_pending_changes_with_state(&state, &sid, Some("ws-no-snapshot"))
+                .expect("snapshot not yet started should be treated as empty");
+        assert!(projection.pending_changes.is_empty());
+        assert_eq!(projection.state.status, "not_ready");
+        assert_eq!(
+            projection.state.reason_code.as_deref(),
+            Some("changes_preparing")
+        );
     }
 
     #[tokio::test]
@@ -522,9 +623,13 @@ mod tests {
         fs::remove_file(root.join("beta.txt")).expect("beta delete");
         snap.reconcile().expect("reconcile should succeed");
 
-        let changes = collect_session_pending_changes(&state, &sid, Some("ws-snapshot"))
-            .expect("pending changes should collect");
-        let by_path: std::collections::BTreeMap<_, _> = changes
+        let projection =
+            collect_session_pending_changes_with_state(&state, &sid, Some("ws-snapshot"))
+                .expect("pending changes should collect");
+        assert_eq!(projection.state.status, "ready");
+        assert_eq!(projection.state.pending_count, 3);
+        let by_path: std::collections::BTreeMap<_, _> = projection
+            .pending_changes
             .iter()
             .map(|c| (c.file_path.clone(), c.clone()))
             .collect();
@@ -542,7 +647,7 @@ mod tests {
         );
 
         // execution_group_id 来自 mission_id。
-        for change in &changes {
+        for change in &projection.pending_changes {
             assert_eq!(change.execution_group_id, "mission-x");
             assert_eq!(change.content_kind, "text");
         }
@@ -569,8 +674,11 @@ mod tests {
         fs::rename(root.join("before.txt"), root.join("after.txt")).expect("file should rename");
         snap.reconcile().expect("reconcile should succeed");
 
-        let changes = collect_session_pending_changes(&state, &sid, Some("ws-rename"))
-            .expect("pending changes should collect");
+        let projection =
+            collect_session_pending_changes_with_state(&state, &sid, Some("ws-rename"))
+                .expect("pending changes should collect");
+        let changes = projection.pending_changes;
+        assert_eq!(projection.state.status, "ready");
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].file_path, "after.txt");
         assert_eq!(changes[0].old_path.as_deref(), Some("before.txt"));

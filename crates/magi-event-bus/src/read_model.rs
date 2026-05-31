@@ -137,12 +137,19 @@ pub struct ExecutionGroupRuntimeSummaryEntry {
     pub context_used_memory_count: usize,
     pub context_used_shared_item_count: usize,
     pub context_used_file_summary_count: usize,
+    pub context_recent_turn_resolved_count: usize,
+    pub context_recent_turn_retained_count: usize,
+    pub context_recent_turn_session_source_count: usize,
+    pub context_recent_turn_project_source_count: usize,
+    pub context_recent_turn_provided_source_count: usize,
     pub context_truncation_count: usize,
     pub context_truncation_parts: Vec<String>,
     pub context_knowledge_ids: Vec<String>,
     pub context_knowledge_source_paths: Vec<String>,
     pub context_memory_ids: Vec<String>,
     pub context_memory_extraction_refs: Vec<String>,
+    pub context_shared_context_ids: Vec<String>,
+    pub context_file_summary_paths: Vec<String>,
     pub context_code_index_knowledge_count: usize,
     pub context_audited_knowledge_count: usize,
     pub context_governed_knowledge_count: usize,
@@ -1190,6 +1197,16 @@ impl RuntimeReadModelInput {
                         nested_usize_field(context, "used_shared_items");
                     mission_entry.context_used_file_summary_count =
                         nested_usize_field(context, "used_file_summaries");
+                    mission_entry.context_recent_turn_resolved_count =
+                        nested_usize_field(context, "recent_turn_resolved_count");
+                    mission_entry.context_recent_turn_retained_count =
+                        nested_usize_field(context, "recent_turn_retained_count");
+                    mission_entry.context_recent_turn_session_source_count =
+                        nested_usize_field(context, "recent_turn_session_source_count");
+                    mission_entry.context_recent_turn_project_source_count =
+                        nested_usize_field(context, "recent_turn_project_source_count");
+                    mission_entry.context_recent_turn_provided_source_count =
+                        nested_usize_field(context, "recent_turn_provided_source_count");
                     mission_entry.context_truncation_count =
                         nested_usize_field(context, "truncation_count");
                     mission_entry.context_truncation_parts =
@@ -1202,6 +1219,10 @@ impl RuntimeReadModelInput {
                         nested_string_vec_field(context, "memory_ids");
                     mission_entry.context_memory_extraction_refs =
                         nested_string_vec_field(context, "memory_extraction_refs");
+                    mission_entry.context_shared_context_ids =
+                        nested_string_vec_field(context, "shared_context_ids");
+                    mission_entry.context_file_summary_paths =
+                        nested_string_vec_field(context, "file_summary_paths");
                     mission_entry.context_code_index_knowledge_count =
                         nested_usize_field(context, "code_index_knowledge_count");
                     mission_entry.context_audited_knowledge_count =
@@ -1837,6 +1858,8 @@ impl RuntimeReadModelInput {
             sort_string_vec(&mut entry.context_knowledge_source_paths);
             sort_string_vec(&mut entry.context_memory_ids);
             sort_string_vec(&mut entry.context_memory_extraction_refs);
+            sort_string_vec(&mut entry.context_shared_context_ids);
+            sort_string_vec(&mut entry.context_file_summary_paths);
         }
         for entry in &mut self.details.assignments {
             sort_string_vec(&mut entry.task_ids);
@@ -2276,12 +2299,19 @@ mod tests {
                     "used_memory": 3,
                     "used_shared_items": 1,
                     "used_file_summaries": 1,
+                    "recent_turn_resolved_count": 3,
+                    "recent_turn_retained_count": 2,
+                    "recent_turn_session_source_count": 1,
+                    "recent_turn_project_source_count": 1,
+                    "recent_turn_provided_source_count": 0,
                     "truncation_count": 2,
                     "truncation_parts": ["memory", "knowledge"],
                     "knowledge_ids": ["kb-b", "kb-a"],
                     "knowledge_source_paths": ["src/b.rs", "src/a.rs"],
                     "memory_ids": ["mem-b", "mem-a"],
                     "memory_extraction_refs": ["extract-b", "extract-a"],
+                    "shared_context_ids": ["shared-b", "shared-a"],
+                    "file_summary_paths": ["/tmp/b.rs", "/tmp/a.rs"],
                     "code_index_knowledge_count": 1,
                     "audited_knowledge_count": 1,
                     "governed_knowledge_count": 1,
@@ -2308,6 +2338,11 @@ mod tests {
         assert_eq!(mission.context_used_memory_count, 3);
         assert_eq!(mission.context_used_shared_item_count, 1);
         assert_eq!(mission.context_used_file_summary_count, 1);
+        assert_eq!(mission.context_recent_turn_resolved_count, 3);
+        assert_eq!(mission.context_recent_turn_retained_count, 2);
+        assert_eq!(mission.context_recent_turn_session_source_count, 1);
+        assert_eq!(mission.context_recent_turn_project_source_count, 1);
+        assert_eq!(mission.context_recent_turn_provided_source_count, 0);
         assert_eq!(mission.context_truncation_count, 2);
         assert_eq!(
             mission.context_truncation_parts,
@@ -2328,6 +2363,14 @@ mod tests {
         assert_eq!(
             mission.context_memory_extraction_refs,
             vec!["extract-a".to_string(), "extract-b".to_string()]
+        );
+        assert_eq!(
+            mission.context_shared_context_ids,
+            vec!["shared-a".to_string(), "shared-b".to_string()]
+        );
+        assert_eq!(
+            mission.context_file_summary_paths,
+            vec!["/tmp/a.rs".to_string(), "/tmp/b.rs".to_string()]
         );
         assert_eq!(mission.context_code_index_knowledge_count, 1);
         assert_eq!(mission.context_audited_knowledge_count, 1);
@@ -2391,7 +2434,9 @@ mod tests {
                     "used_knowledge": 1,
                     "used_memory": 1,
                     "knowledge_source_paths": ["src/z.rs", "src/a.rs", "src/z.rs"],
-                    "memory_extraction_refs": ["extract-z", "extract-a", "extract-z"]
+                    "memory_extraction_refs": ["extract-z", "extract-a", "extract-z"],
+                    "shared_context_ids": ["shared-z", "shared-a", "shared-z"],
+                    "file_summary_paths": ["/tmp/z.rs", "/tmp/a.rs", "/tmp/z.rs"]
                 }
             }),
         )
@@ -2435,6 +2480,14 @@ mod tests {
         assert_eq!(
             mission.context_memory_extraction_refs,
             vec!["extract-a".to_string(), "extract-z".to_string()]
+        );
+        assert_eq!(
+            mission.context_shared_context_ids,
+            vec!["shared-a".to_string(), "shared-z".to_string()]
+        );
+        assert_eq!(
+            mission.context_file_summary_paths,
+            vec!["/tmp/a.rs".to_string(), "/tmp/z.rs".to_string()]
         );
         assert_eq!(
             read_model

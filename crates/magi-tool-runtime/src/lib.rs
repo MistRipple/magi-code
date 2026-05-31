@@ -1614,6 +1614,14 @@ pub struct RuntimeCapabilityDependencyEntry {
     pub spawnable_role_count: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot_active: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configured_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ready_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_count: Option<usize>,
 }
 
 #[derive(Clone, Default)]

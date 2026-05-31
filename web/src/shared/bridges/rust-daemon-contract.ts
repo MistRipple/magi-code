@@ -80,6 +80,29 @@ interface RustExecutionGroupRuntimeSummary {
   current_status?: string | null;
   failed_dispatch_count?: number;
   active_task_ids?: string[];
+  context_used_turn_count?: number;
+  context_used_knowledge_count?: number;
+  context_used_memory_count?: number;
+  context_used_shared_item_count?: number;
+  context_used_file_summary_count?: number;
+  context_recent_turn_resolved_count?: number;
+  context_recent_turn_retained_count?: number;
+  context_recent_turn_session_source_count?: number;
+  context_recent_turn_project_source_count?: number;
+  context_recent_turn_provided_source_count?: number;
+  context_truncation_count?: number;
+  context_truncation_parts?: string[];
+  context_knowledge_ids?: string[];
+  context_knowledge_source_paths?: string[];
+  context_memory_ids?: string[];
+  context_memory_extraction_refs?: string[];
+  context_shared_context_ids?: string[];
+  context_file_summary_paths?: string[];
+  context_code_index_knowledge_count?: number;
+  context_audited_knowledge_count?: number;
+  context_governed_knowledge_count?: number;
+  context_extracted_memory_count?: number;
+  context_provenance_linked_memory_count?: number;
 }
 
 interface RustAssignmentRuntimeSummary {
@@ -290,6 +313,8 @@ interface RustBootstrapDto {
   canonical_turns?: unknown[];
   pendingChanges?: unknown[];
   pending_changes?: unknown[];
+  pendingChangesState?: unknown;
+  pending_changes_state?: unknown;
   workspaces?: RustBootstrapWorkspaceRecord[];
   runtimeReadModel?: RustRuntimeReadModelDto;
   notifications?: RustNotificationRecord[];
@@ -1347,6 +1372,7 @@ export function normalizeRustBootstrapPayload(
     : Array.isArray(payload.pending_changes)
       ? payload.pending_changes
       : [];
+  const pendingChangesState = payload.pendingChangesState ?? payload.pending_changes_state ?? null;
   const state: AppState = {
     ...buildEmptyWorkspaceAppState(generatedAt),
     sessions,
@@ -1355,6 +1381,7 @@ export function normalizeRustBootstrapPayload(
     isProcessing: Boolean(processingState?.isProcessing),
     processingState,
     pendingChanges,
+    pendingChangesState,
     pendingChangesStateVersion: generatedAt,
     stateUpdatedAt: generatedAt,
   };

@@ -1390,7 +1390,7 @@ mod tests {
         let capability_dependencies = bootstrap["capabilityDependencies"]
             .as_array()
             .expect("capability dependencies should be an array");
-        assert_eq!(capability_dependencies.len(), 4);
+        assert_eq!(capability_dependencies.len(), 6);
         assert_eq!(
             capability_dependencies[0]["name"],
             serde_json::json!("knowledge_store")
@@ -1421,15 +1421,39 @@ mod tests {
         );
         assert_eq!(
             capability_dependencies[3]["name"],
+            serde_json::json!("skill_runtime")
+        );
+        assert_eq!(
+            capability_dependencies[3]["toolCount"],
+            serde_json::json!(0)
+        );
+        assert!(
+            capability_dependencies[3].get("tool_count").is_none(),
+            "settings bootstrap should expose external dependency counts in frontend camelCase"
+        );
+        assert_eq!(
+            capability_dependencies[4]["name"],
+            serde_json::json!("mcp_servers")
+        );
+        assert_eq!(
+            capability_dependencies[4]["readyCount"],
+            serde_json::json!(0)
+        );
+        assert!(
+            capability_dependencies[4].get("ready_count").is_none(),
+            "settings bootstrap should expose external dependency counts in frontend camelCase"
+        );
+        assert_eq!(
+            capability_dependencies[5]["name"],
             serde_json::json!("file_snapshot")
         );
         assert_eq!(
-            capability_dependencies[3]["status"],
+            capability_dependencies[5]["status"],
             serde_json::json!("not_ready"),
             "snapshot dependency should be visible even before the lazy snapshot session starts"
         );
         assert_eq!(
-            capability_dependencies[3]["sessionId"],
+            capability_dependencies[5]["sessionId"],
             serde_json::json!("session-empty-contract")
         );
         assert!(

@@ -808,6 +808,29 @@ impl DaemonRuntime {
         {
             warn!(?error, "收敛重启遗留任务状态后持久化 task-store 失败");
         }
+        let (rebuilt_spawn_graph, spawn_graph_report) =
+            magi_spawn_graph::SpawnGraph::rebuild_from_tasks(task_store.all_tasks());
+        if spawn_graph_report.skipped_edges > 0 {
+            warn!(
+                candidate_edges = spawn_graph_report.candidate_edges,
+                restored_edges = spawn_graph_report.restored_edges,
+                skipped_edges = spawn_graph_report.skipped_edges,
+                "从 task-store 重建 SpawnGraph 时跳过了不合法父子边"
+            );
+        } else if spawn_graph_report.restored_edges > 0 {
+            tracing::debug!(
+                restored_edges = spawn_graph_report.restored_edges,
+                closed_edges = spawn_graph_report.closed_edges,
+                "已从 task-store 重建 SpawnGraph"
+            );
+        }
+        let spawn_graph = Arc::new(std::sync::Mutex::new(rebuilt_spawn_graph));
+        let task_store_checkpoint_path_for_callback = task_store_checkpoint_path.clone();
+        task_store.set_checkpoint_callback(Box::new(move |store| {
+            if let Err(error) = store.checkpoint_to_file(&task_store_checkpoint_path_for_callback) {
+                warn!(?error, "任务状态 checkpoint 持久化失败");
+            }
+        }));
         // 单一事实源：dispatch summary（execution_runtime）与 prompt 注入（LlmTaskDispatcher）
         // 使用同一份 ContextBudget。max_memory ≥ 一批 session-memory 的 slice 数（=5），
         // 否则辅助模型提取的 5 条 slice 会被预算切断、只投放前两条进 prompt。
@@ -861,6 +884,7 @@ impl DaemonRuntime {
         .with_skill_dispatch_runtime(Arc::new(skill_runtime.clone()))
         .with_mcp_connections(mcp_connections)
         .with_tool_registry(tool_registry_for_dispatcher.clone())
+        .with_spawn_graph(spawn_graph)
         .with_agent_role_registry(agent_role_registry)
         .with_tunnel_port(self.local_port)
         .with_runtime_persistence(Arc::new(RuntimeStatePersistence::new(
@@ -1447,8 +1471,11 @@ mod tests {
         body::{Body, to_bytes},
         http::{Request, StatusCode},
     };
-    use magi_core::{TaskStatus, WorkspaceId};
+    use magi_core::{
+        MissionId, Task, TaskId, TaskKind, TaskRuntimePayload, TaskStatus, UtcMillis, WorkspaceId,
+    };
     use magi_event_bus::AuditUsageLedgerSnapshot;
+    use magi_orchestrator::task_store::TaskStore;
     use serde_json::{Value, json};
     use std::{
         collections::BTreeMap,
@@ -1470,6 +1497,39 @@ mod tests {
         ));
         fs::create_dir_all(&root).expect("temp state root should be creatable");
         root
+    }
+
+    fn spawn_graph_restore_task(
+        task_id: &str,
+        root_task_id: &str,
+        parent_task_id: Option<&str>,
+        status: TaskStatus,
+        created_at: u64,
+    ) -> Task {
+        Task {
+            task_id: TaskId::new(task_id),
+            mission_id: MissionId::new("mission-spawn-graph-restore"),
+            root_task_id: TaskId::new(root_task_id),
+            parent_task_id: parent_task_id.map(TaskId::new),
+            kind: TaskKind::LocalAgent,
+            title: format!("task {task_id}"),
+            goal: format!("run task {task_id}"),
+            status,
+            dependency_ids: Vec::new(),
+            required_children: Vec::new(),
+            policy_snapshot: None,
+            executor_binding: None,
+            knowledge_refs: Vec::new(),
+            workspace_scope: None,
+            write_scope: None,
+            input_refs: Vec::new(),
+            output_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            retry_count: 0,
+            runtime_payload: TaskRuntimePayload::default(),
+            created_at: UtcMillis(created_at),
+            updated_at: UtcMillis(created_at + 1),
+        }
     }
 
     #[test]
@@ -1545,6 +1605,44 @@ mod tests {
             .expect("includeInternal=true should expose process_launch");
         assert_eq!(process_launch["public"], false);
         assert_eq!(process_launch["parameters_schema"]["type"], "object");
+    }
+
+    #[tokio::test]
+    async fn daemon_restore_rebuilds_spawn_graph_from_task_store_checkpoint() {
+        let state_root = temp_state_root("spawn-graph-restore");
+        let task_store = TaskStore::new();
+        task_store.insert_task(spawn_graph_restore_task(
+            "task-root-spawn-restore",
+            "task-root-spawn-restore",
+            None,
+            TaskStatus::Running,
+            1,
+        ));
+        task_store.insert_task(spawn_graph_restore_task(
+            "task-child-spawn-restore",
+            "task-root-spawn-restore",
+            Some("task-root-spawn-restore"),
+            TaskStatus::Pending,
+            2,
+        ));
+        task_store
+            .checkpoint_to_file(&state_root.join("task-store.json"))
+            .expect("task store checkpoint should be written");
+
+        let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
+        let runtime = DaemonRuntime::restore(&config)
+            .expect("runtime restore should load task-store checkpoint");
+        let (_router, state) = runtime.router_with_state_for_tests("daemon-test".to_string());
+        let graph = state
+            .spawn_graph
+            .lock()
+            .expect("spawn graph lock should not poison");
+
+        assert_eq!(
+            graph.parent_of(&TaskId::new("task-child-spawn-restore")),
+            Some(&TaskId::new("task-root-spawn-restore")),
+            "daemon restore should rebuild SpawnGraph from persisted Task.parent_task_id"
+        );
     }
 
     #[test]

@@ -393,6 +393,7 @@ interface PersistedSessionExecutionState {
   edits: Edit[];
   orchestratorRuntimeState: OrchestratorRuntimeState | null;
   pendingChanges: unknown[];
+  pendingChangesState?: unknown;
 }
 let sessionExecutionStateBySession = $state<Record<string, PersistedSessionExecutionState>>({});
 let sessionQueuedMessagesBySession = $state<Record<string, QueuedMessage[]>>({});
@@ -1167,6 +1168,7 @@ function createSessionExecutionStateSnapshot(
     edits: clonePersistablePayload(edits) as PersistedSessionExecutionState['edits'],
     orchestratorRuntimeState: clonePersistablePayload(messagesState.orchestratorRuntimeState) as OrchestratorRuntimeState | null,
     pendingChanges: ensureArray(clonePersistablePayload(messagesState.appState?.pendingChanges)),
+    pendingChangesState: clonePersistablePayload(messagesState.appState?.pendingChangesState ?? null),
   };
 }
 
@@ -1267,6 +1269,7 @@ function applySessionViewState(sessionId: string | null | undefined): boolean {
       messagesState.appState = {
         ...messagesState.appState,
         pendingChanges: ensureArray(clonePersistablePayload(executionSnapshot.pendingChanges)),
+        pendingChangesState: clonePersistablePayload(executionSnapshot.pendingChangesState ?? null),
       };
     }
   }
@@ -1280,6 +1283,7 @@ function resetSessionScopedExecutionState(): void {
     messagesState.appState = {
       ...messagesState.appState,
       pendingChanges: [],
+      pendingChangesState: null,
     };
   }
 }
