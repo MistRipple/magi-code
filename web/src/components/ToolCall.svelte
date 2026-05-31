@@ -18,6 +18,7 @@
     category: 'model_input' | 'context_stale' | 'permission' | 'role_constraint' | 'policy' | 'model_output' | 'workspace_write' | 'runtime';
     categoryLabel: string;
     ownerLabel: string;
+    message: string;
     hint: string;
   }
 
@@ -52,6 +53,7 @@
   let lastStatus = $state(untrack(() => status));
   let userToggled = $state(false);
   let copySuccess = $state(false);
+  let lastLoggedErrorSignature = $state('');
 
   interface ParsedToolIdentity {
     source: 'builtin' | 'mcp' | 'skill';
@@ -677,6 +679,7 @@
         category: 'context_stale',
         categoryLabel: i18n.t('toolCall.errorDiagnosis.contextStale.categoryLabel'),
         ownerLabel: i18n.t('toolCall.errorDiagnosis.contextStale.ownerLabel'),
+        message: i18n.t('toolCall.errorDiagnosis.contextStale.message'),
         hint: i18n.t('toolCall.errorDiagnosis.contextStale.hint'),
       };
     }
@@ -694,6 +697,7 @@
         category: 'policy',
         categoryLabel: i18n.t('toolCall.errorDiagnosis.policy.categoryLabel'),
         ownerLabel: i18n.t('toolCall.errorDiagnosis.policy.ownerLabel'),
+        message: i18n.t('toolCall.errorDiagnosis.policy.message'),
         hint: i18n.t('toolCall.errorDiagnosis.policy.hint'),
       };
     }
@@ -710,6 +714,7 @@
         category: 'model_output',
         categoryLabel: i18n.t('toolCall.errorDiagnosis.modelOutput.categoryLabel'),
         ownerLabel: i18n.t('toolCall.errorDiagnosis.modelOutput.ownerLabel'),
+        message: i18n.t('toolCall.errorDiagnosis.modelOutput.message'),
         hint: i18n.t('toolCall.errorDiagnosis.modelOutput.hint'),
       };
     }
@@ -724,6 +729,7 @@
         category: 'workspace_write',
         categoryLabel: i18n.t('toolCall.errorDiagnosis.workspaceWrite.categoryLabel'),
         ownerLabel: i18n.t('toolCall.errorDiagnosis.workspaceWrite.ownerLabel'),
+        message: i18n.t('toolCall.errorDiagnosis.workspaceWrite.message'),
         hint: i18n.t('toolCall.errorDiagnosis.workspaceWrite.hint'),
       };
     }
@@ -749,6 +755,7 @@
         category: 'model_input',
         categoryLabel: i18n.t('toolCall.errorDiagnosis.modelInput.categoryLabel'),
         ownerLabel: i18n.t('toolCall.errorDiagnosis.modelInput.ownerLabel'),
+        message: i18n.t('toolCall.errorDiagnosis.modelInput.message'),
         hint: i18n.t('toolCall.errorDiagnosis.modelInput.hint'),
       };
     }
@@ -765,6 +772,7 @@
         category: 'role_constraint',
         categoryLabel: i18n.t('toolCall.errorDiagnosis.roleConstraint.categoryLabel'),
         ownerLabel: i18n.t('toolCall.errorDiagnosis.roleConstraint.ownerLabel'),
+        message: i18n.t('toolCall.errorDiagnosis.roleConstraint.message'),
         hint: i18n.t('toolCall.errorDiagnosis.roleConstraint.hint'),
       };
     }
@@ -776,6 +784,7 @@
         category: 'permission',
         categoryLabel: i18n.t('toolCall.errorDiagnosis.permission.categoryLabel'),
         ownerLabel: i18n.t('toolCall.errorDiagnosis.permission.ownerLabel'),
+        message: i18n.t('toolCall.errorDiagnosis.permission.message'),
         hint: i18n.t('toolCall.errorDiagnosis.permission.hint'),
       };
     }
@@ -784,11 +793,30 @@
       category: 'runtime',
       categoryLabel: i18n.t('toolCall.errorDiagnosis.runtime.categoryLabel'),
       ownerLabel: i18n.t('toolCall.errorDiagnosis.runtime.ownerLabel'),
+      message: i18n.t('toolCall.errorDiagnosis.runtime.message'),
       hint: i18n.t('toolCall.errorDiagnosis.runtime.hint'),
     };
   }
 
   const errorDiagnosis = $derived.by(() => detectErrorDiagnosis(error, standardized));
+  const publicErrorMessage = $derived(errorDiagnosis?.message || i18n.t('toolCall.errorDiagnosis.runtime.message'));
+
+  $effect(() => {
+    if (!hasError) {
+      return;
+    }
+    const signature = `${id || name}:${status}:${error}`;
+    if (signature === lastLoggedErrorSignature) {
+      return;
+    }
+    lastLoggedErrorSignature = signature;
+    console.warn('Tool call failed', {
+      toolName: name,
+      toolCallId: id,
+      category: errorDiagnosis?.category || 'runtime',
+      error,
+    });
+  });
 
   function toggle() {
     if (!canExpand) {
@@ -1068,7 +1096,7 @@
                   <span class="diagnosis-owner">{errorDiagnosis.ownerLabel}</span>
                 {/if}
               </div>
-              <pre class="section-content error-content">{error}</pre>
+              <div class="section-content error-content">{publicErrorMessage}</div>
               {#if errorDiagnosis}
                 <div class="error-hint">{errorDiagnosis.hint}</div>
               {/if}
