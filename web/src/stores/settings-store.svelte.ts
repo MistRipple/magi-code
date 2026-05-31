@@ -2411,6 +2411,10 @@ function createSettingsStore(props: { onClose?: () => void }) {
   function applyBuiltinToolsPayload(toolsPayload: unknown): void {
     const readToolField = (tool: any, camelKey: string, snakeKey: string): unknown =>
       tool?.[camelKey] ?? tool?.[snakeKey];
+    const normalizeWarningMarkers = (warnings: unknown, marker: string): string[] =>
+      ensureArray<unknown>(warnings)
+        .filter((warning) => typeof warning === "string" && warning.trim().length > 0)
+        .map(() => marker);
     builtinTools = ensureArray<any>(toolsPayload)
       .map((tool) => {
         const name = typeof tool?.name === "string" ? tool.name.trim() : "";
@@ -2430,13 +2434,9 @@ function createSettingsStore(props: { onClose?: () => void }) {
           approvalRequirement: typeof approvalRequirement === "string" ? approvalRequirement : "",
           accessMode: typeof accessMode === "string" ? accessMode : "read_only",
           runtimeStatus: typeof runtimeStatus === "string" ? runtimeStatus : "ready",
-          runtimeWarnings: ensureArray<string>(runtimeWarnings)
-            .filter((warning): warning is string => typeof warning === "string" && warning.trim().length > 0)
-            .map((warning) => warning.trim()),
+          runtimeWarnings: normalizeWarningMarkers(runtimeWarnings, "runtime_warning"),
           schemaStatus: typeof schemaStatus === "string" ? schemaStatus : "ok",
-          schemaWarnings: ensureArray<string>(schemaWarnings)
-            .filter((warning): warning is string => typeof warning === "string" && warning.trim().length > 0)
-            .map((warning) => warning.trim()),
+          schemaWarnings: normalizeWarningMarkers(schemaWarnings, "schema_warning"),
           enabled: tool?.enabled !== false,
         } satisfies BuiltinToolItem;
       })
