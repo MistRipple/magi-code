@@ -14,7 +14,6 @@
   import { i18n } from './stores/i18n.svelte';
   import {
     AGENT_CONNECTION_EVENT,
-    resolveAgentBaseUrl,
     type AgentConnectionEventDetail,
   } from './web/agent-api';
 
@@ -30,10 +29,9 @@
   // 设置面板是否打开
   let settingsOpen = $state(false);
 
-  // 启动连接状态：后端 bootstrap 数据尚未就绪时显示等待提示
+  // 启动连接状态：启动数据尚未就绪时显示等待提示
   const isBootstrapping = $derived(!messagesState.bootstrapped);
-  let bootstrapConnectionError = $state('');
-  let bootstrapConnectionBaseUrl = $state('');
+  let bootstrapConnectionFailed = $state(false);
 
   function handleTabChange(tab: TopTabType) {
     setCurrentTopTab(tab);
@@ -48,16 +46,14 @@
   }
 
   onMount(() => {
-    bootstrapConnectionBaseUrl = resolveAgentBaseUrl();
     const handleAgentConnection = (event: Event) => {
       const detail = (event as CustomEvent<AgentConnectionEventDetail>).detail;
-      bootstrapConnectionBaseUrl = detail?.baseUrl || resolveAgentBaseUrl();
       if (detail?.status === 'connected') {
-        bootstrapConnectionError = '';
+        bootstrapConnectionFailed = false;
         return;
       }
       if (!messagesState.bootstrapped) {
-        bootstrapConnectionError = i18n.t('bridge.agentUnreachable');
+        bootstrapConnectionFailed = true;
       }
     };
     window.addEventListener(AGENT_CONNECTION_EVENT, handleAgentConnection as EventListener);
@@ -68,7 +64,7 @@
 
   $effect(() => {
     if (messagesState.bootstrapped) {
-      bootstrapConnectionError = '';
+      bootstrapConnectionFailed = false;
     }
   });
 
@@ -88,22 +84,18 @@
   <!-- Tab 内容区域：常驻 ThreadPanel + 按需挂载的其他 top-tab -->
   <div class="tab-content-wrapper">
     {#if isBootstrapping}
-      <!-- 启动连接等待层：后端 bootstrap 数据尚未就绪 -->
+      <!-- 启动连接等待层：启动数据尚未就绪 -->
       <div class="bootstrap-overlay">
-        <div class="bootstrap-content" class:error={Boolean(bootstrapConnectionError)}>
-          <div class="bootstrap-spinner" class:static={Boolean(bootstrapConnectionError)}>
-            <Icon name={bootstrapConnectionError ? 'warning' : 'loader'} size={32} />
+        <div class="bootstrap-content" class:error={bootstrapConnectionFailed}>
+          <div class="bootstrap-spinner" class:static={bootstrapConnectionFailed}>
+            <Icon name={bootstrapConnectionFailed ? 'warning' : 'loader'} size={32} />
           </div>
           <p class="bootstrap-title">
-            {bootstrapConnectionError ? i18n.t('app.bootstrapConnectionFailed') : i18n.t('app.bootstrapConnecting')}
+            {bootstrapConnectionFailed ? i18n.t('app.bootstrapConnectionFailed') : i18n.t('app.bootstrapConnecting')}
           </p>
           <p class="bootstrap-hint">
-            {bootstrapConnectionError || i18n.t('app.bootstrapConnectingHint')}
+            {bootstrapConnectionFailed ? i18n.t('app.bootstrapConnectionHint') : i18n.t('app.bootstrapConnectingHint')}
           </p>
-          {#if bootstrapConnectionError}
-            <p class="bootstrap-hint">{i18n.t('app.bootstrapConnectionAddress', { baseUrl: bootstrapConnectionBaseUrl || 'http://127.0.0.1:38123' })}</p>
-            <code class="bootstrap-command">MAGI_WEB_DEV=1 cargo run -p magi-daemon-app</code>
-          {/if}
         </div>
       </div>
     {/if}
@@ -202,18 +194,6 @@
     line-height: 1.6;
     color: var(--foreground-muted, #888);
     margin: 0;
-  }
-
-  .bootstrap-command {
-    margin-top: 4px;
-    padding: 7px 10px;
-    border: 1px solid var(--border, rgba(148, 163, 184, 0.2));
-    border-radius: 8px;
-    background: var(--panel-bg, rgba(15, 23, 42, 0.72));
-    color: var(--foreground, #ddd);
-    font-size: 11px;
-    white-space: normal;
-    word-break: break-word;
   }
 
   @keyframes bootstrap-spin {

@@ -224,7 +224,7 @@
     {#if !collapsed}
       <div class="tool-content">
         {#if change.error}
-          <div class="empty-diff-note error">{change.error}</div>
+          <div class="empty-diff-note error">{i18n.t('fileChangeCard.previewUnavailable')}</div>
         {:else if !isText}
           <div class="non-text-card">
             <div class="non-text-title">{kindLabel(kind)}</div>

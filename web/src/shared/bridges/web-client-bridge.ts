@@ -2762,7 +2762,7 @@ function emitSessionNotificationsStatus(
     workspacePath: scope.workspacePath,
     operation,
     isLoading,
-    error: error === undefined ? null : normalizeErrorMessage(error),
+    error: error === undefined ? null : 'operation_failed',
     updatedAt: Date.now(),
   });
 }

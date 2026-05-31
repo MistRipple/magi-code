@@ -130,7 +130,7 @@
         {:else if notificationStatus.error && filteredNotifications.length === 0}
           <div class="empty-state empty-state--error">
             <Icon name="warning" size={24} />
-            <span>{notificationStatus.error}</span>
+            <span>{i18n.t('notification.operationFailed')}</span>
           </div>
         {:else if filteredNotifications.length === 0}
           <div class="empty-state">
@@ -141,7 +141,7 @@
           {#if notificationStatus.error}
             <div class="inline-error">
               <Icon name="warning" size={12} />
-              <span>{notificationStatus.error}</span>
+              <span>{i18n.t('notification.operationFailed')}</span>
             </div>
           {/if}
           {#each filteredNotifications as notif (notif.id)}

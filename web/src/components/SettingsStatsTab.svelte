@@ -548,7 +548,7 @@
           {#if selectedRow.errorMsg}
             <div class="slice-error">
               <Icon name="warning" size={12} />
-              <span title={selectedRow.errorMsg}>{selectedRow.errorMsg}</span>
+              <span title={i18n.t('settings.stats.connectionIssueTitle')}>{i18n.t('settings.stats.connectionIssue')}</span>
             </div>
           {/if}
         {:else}

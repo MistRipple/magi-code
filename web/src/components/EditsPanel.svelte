@@ -151,7 +151,6 @@
         contentKind: edit?.contentKind ?? 'text',
         size: edit?.size,
         mime: edit?.mime,
-        error: edit?.error,
         symlinkTarget: edit?.symlinkTarget,
         headSummary: edit?.headSummary,
         tailSummary: edit?.tailSummary,
@@ -245,7 +244,7 @@
         <span class="file-kind-tag" title={contentKindLabel(kind)}>{contentKindLabel(kind)}</span>
       {/if}
       {#if edit.error}
-        <span class="file-error-tag" title={edit.error}>{i18n.t('edits.row.error')}</span>
+        <span class="file-error-tag" title={i18n.t('edits.row.errorTitle')}>{i18n.t('edits.row.error')}</span>
       {/if}
       {#if editActorLabel(edit)}
         <span class="file-actor-tag" title={editActorTitle(edit)}>{editActorLabel(edit)}</span>
