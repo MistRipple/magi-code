@@ -142,9 +142,10 @@ async fn execute_connection_probe(
     let client = config
         .to_http_model_client("__probe__")
         .ok_or_else(|| ApiError::InvalidInput("模型配置缺少 baseUrl".to_string()))?;
-    let (url, body, extra_headers) = client
-        .build_probe_request()
-        .map_err(|error| ApiError::InvalidInput(format!("构造连接测试请求失败: {error}")))?;
+    let (url, body, extra_headers) = client.build_probe_request().map_err(|error| {
+        tracing::warn!(error = %error, "model connection probe request build failed");
+        ApiError::InvalidInput("模型请求配置无效".to_string())
+    })?;
 
     let mut headers = HeaderMap::new();
     headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
@@ -163,38 +164,50 @@ async fn execute_connection_probe(
         .json(&body)
         .send()
         .await
-        .map_err(|error| ApiError::InvalidInput(format!("连接测试失败: {error}")))?;
+        .map_err(|error| {
+            tracing::warn!(error = %error, "model connection probe transport failed");
+            ApiError::InvalidInput(model_transport_error_message(&error).to_string())
+        })?;
     let status = response.status().as_u16();
-    let payload: Value = response
-        .json()
-        .await
-        .map_err(|error| ApiError::InvalidInput(format!("解析连接测试响应失败: {error}")))?;
+    if !(200..300).contains(&status) {
+        return Ok((status, Value::Null));
+    }
+    let payload: Value = response.json().await.map_err(|error| {
+        tracing::warn!(error = %error, "model connection probe response parse failed");
+        ApiError::InvalidInput("模型响应格式异常".to_string())
+    })?;
 
     Ok((status, payload))
 }
 
-fn extract_remote_error_message(payload: &Value) -> Option<String> {
-    payload
-        .get("error")
-        .and_then(|value| {
-            value
-                .get("message")
-                .and_then(Value::as_str)
-                .or_else(|| value.as_str())
-        })
-        .or_else(|| payload.get("message").and_then(Value::as_str))
-        .map(str::trim)
-        .filter(|message| !message.is_empty())
-        .map(ToOwned::to_owned)
+fn model_transport_error_message(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        return "模型连接超时";
+    }
+    if error.is_connect() {
+        return "模型服务连接失败";
+    }
+    "模型连接测试失败"
+}
+
+fn model_http_status_error_message(status: u16) -> &'static str {
+    match status {
+        401 | 403 => "模型鉴权失败",
+        404 => "模型不存在或端点不可用",
+        408 | 504 => "模型连接超时",
+        429 => "模型服务限流",
+        500..=599 => "模型服务暂不可用",
+        _ => "模型服务返回失败状态",
+    }
 }
 
 async fn probe_connection_response(request: Value) -> Result<Json<Value>, ApiError> {
     let config = parse_connection_probe_config(request)?;
-    let (status, payload) = execute_connection_probe(&config).await?;
+    let (status, _payload) = execute_connection_probe(&config).await?;
     if !(200..300).contains(&status) {
-        let message = extract_remote_error_message(&payload)
-            .unwrap_or_else(|| format!("连接测试失败: HTTP {status}"));
-        return Err(ApiError::InvalidInput(message));
+        return Err(ApiError::InvalidInput(
+            model_http_status_error_message(status).to_string(),
+        ));
     }
 
     Ok(Json(json!({
@@ -971,21 +984,20 @@ async fn fetch_models(
         .headers(headers)
         .send()
         .await
-        .map_err(|error| ApiError::InvalidInput(format!("获取模型列表失败: {error}")))?;
+        .map_err(|error| {
+            tracing::warn!(error = %error, "model list request transport failed");
+            ApiError::InvalidInput(model_transport_error_message(&error).to_string())
+        })?;
     let status = response.status();
-    let payload: Value = response
-        .json()
-        .await
-        .map_err(|error| ApiError::InvalidInput(format!("解析模型列表响应失败: {error}")))?;
     if !status.is_success() {
-        let message = payload
-            .get("error")
-            .and_then(|value| value.get("message"))
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(|| format!("模型列表请求失败: HTTP {}", status.as_u16()));
-        return Err(ApiError::InvalidInput(message));
+        return Err(ApiError::InvalidInput(
+            model_http_status_error_message(status.as_u16()).to_string(),
+        ));
     }
+    let payload: Value = response.json().await.map_err(|error| {
+        tracing::warn!(error = %error, "model list response parse failed");
+        ApiError::InvalidInput("模型列表响应格式异常".to_string())
+    })?;
 
     let models = parse_model_ids(&payload);
     if models.is_empty() {
@@ -1171,6 +1183,7 @@ async fn reset_stats(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::StatusCode;
     use magi_core::{EventId, SessionId, WorkspaceId};
     use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
     use magi_governance::GovernanceService;
@@ -1234,6 +1247,28 @@ mod tests {
         }))
     }
 
+    async fn rejected_probe_stub() -> (StatusCode, Json<Value>) {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "error": {
+                    "message": "provider rejected: /Users/xie/.magi/token"
+                }
+            })),
+        )
+    }
+
+    async fn rejected_models_stub() -> (StatusCode, Json<Value>) {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "error": {
+                    "message": "upstream crashed at /var/tmp/provider.log"
+                }
+            })),
+        )
+    }
+
     #[tokio::test]
     async fn connection_probe_supports_anthropic_messages_api() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1266,6 +1301,84 @@ mod tests {
 
         assert_eq!(status, 200);
         assert_eq!(payload["content"][0]["text"], json!("pong"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn connection_probe_redacts_remote_error_message() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("stub listener should bind");
+        let base_url = format!(
+            "http://{}",
+            listener.local_addr().expect("stub addr should exist")
+        );
+        let app = Router::new().route("/v1/chat/completions", post(rejected_probe_stub));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("stub server should run");
+        });
+
+        let result = probe_connection_response(json!({
+            "provider": "openai",
+            "baseUrl": base_url,
+            "apiKey": "test-key",
+            "model": "gpt-test",
+            "urlMode": "standard"
+        }))
+        .await;
+
+        match result {
+            Err(ApiError::InvalidInput(message)) => {
+                assert_eq!(message, "模型鉴权失败");
+                assert!(!message.contains("provider rejected"));
+                assert!(!message.contains("/Users/xie"));
+            }
+            other => panic!("unexpected probe result: {:?}", other),
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn fetch_models_redacts_remote_error_message() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("stub listener should bind");
+        let base_url = format!(
+            "http://{}",
+            listener.local_addr().expect("stub addr should exist")
+        );
+        let app = Router::new().route("/v1/models", get(rejected_models_stub));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("stub server should run");
+        });
+
+        let result = fetch_models(
+            State(test_state()),
+            Json(FetchModelsRequest {
+                config: json!({
+                    "provider": "openai",
+                    "baseUrl": base_url,
+                    "apiKey": "test-key",
+                    "model": "gpt-test",
+                    "urlMode": "standard"
+                }),
+                target: "orchestrator".to_string(),
+            }),
+        )
+        .await;
+
+        match result {
+            Err(ApiError::InvalidInput(message)) => {
+                assert_eq!(message, "模型服务暂不可用");
+                assert!(!message.contains("upstream crashed"));
+                assert!(!message.contains("/var/tmp"));
+            }
+            other => panic!("unexpected model fetch result: {:?}", other),
+        }
         server.abort();
     }
 
