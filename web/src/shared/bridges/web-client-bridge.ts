@@ -2296,7 +2296,7 @@ function enqueueFollowUpTurn(input: ExecuteTaskInput, normalizedText: string): v
   const queued: QueuedMessage = {
     id: input.requestId || generateMessageId(),
     requestId: input.requestId,
-    content: normalizedText || input.skillName || '后续消息',
+    content: normalizedText || input.skillName || i18n.t('bridge.detail.followUpMessage'),
     text: input.text ?? null,
     createdAt: Date.now(),
     skillName: input.skillName ?? null,
@@ -2622,14 +2622,15 @@ function escapePreviewHtml(content: string): string {
 function openPreviewWindow(title: string, subtitle: string, content: string, mode: 'file' | 'diff'): void {
   const popup = window.open('', '_blank', 'noopener,noreferrer');
   if (!popup) {
-    throw new Error('浏览器阻止了预览窗口，请允许当前站点打开新窗口。');
+    throw new Error(i18n.t('bridge.detail.previewWindowBlocked'));
   }
   const escapedTitle = escapePreviewHtml(title);
   const escapedSubtitle = escapePreviewHtml(subtitle);
   const escapedContent = escapePreviewHtml(content);
   const bodyClass = mode === 'diff' ? 'diff' : 'file';
+  const lang = i18n.locale === 'en-US' ? 'en-US' : 'zh-CN';
   popup.document.write(`<!doctype html>
-<html lang="zh-CN">
+<html lang="${lang}">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -2659,11 +2660,12 @@ function openPreviewWindow(title: string, subtitle: string, content: string, mod
 function openDiagramSvgPreview(title: string, svgContent: string): void {
   const popup = window.open('', '_blank', 'noopener,noreferrer');
   if (!popup) {
-    throw new Error('浏览器阻止了预览窗口，请允许当前站点打开新窗口。');
+    throw new Error(i18n.t('bridge.detail.previewWindowBlocked'));
   }
   const escapedTitle = escapePreviewHtml(title);
+  const lang = i18n.locale === 'en-US' ? 'en-US' : 'zh-CN';
   popup.document.write(`<!doctype html>
-<html lang="zh-CN">
+<html lang="${lang}">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -2688,13 +2690,13 @@ function openDiagramSvgPreview(title: string, svgContent: string): void {
 }
 
 function openDiagramPreview(source: string, title?: string, svgContent?: string): void {
-  const resolvedTitle = title?.trim() || '图表';
+  const resolvedTitle = title?.trim() || i18n.t('bridge.preview.diagramTitle');
   const sanitizedSvg = typeof svgContent === 'string' ? sanitizeSvgContent(svgContent) : '';
   if (sanitizedSvg) {
     openDiagramSvgPreview(resolvedTitle, sanitizedSvg);
     return;
   }
-  openPreviewWindow(resolvedTitle, '图表源码预览', source, 'file');
+  openPreviewWindow(resolvedTitle, i18n.t('bridge.preview.diagramSource'), source, 'file');
 }
 
 async function openFilePreview(
@@ -2703,11 +2705,11 @@ async function openFilePreview(
   scope: BridgeRequestScope = {},
 ): Promise<void> {
   if (typeof previewContent === 'string') {
-    openPreviewWindow(filePath, '文件预览', previewContent, 'file');
+    openPreviewWindow(filePath, i18n.t('bridge.preview.file'), previewContent, 'file');
     return;
   }
   const payload = await getAgentFilePreview(filePath, scope);
-  openPreviewWindow(payload.filePath || filePath, '文件预览', payload.content || '', 'file');
+  openPreviewWindow(payload.filePath || filePath, i18n.t('bridge.preview.file'), payload.content || '', 'file');
 }
 
 async function openDiffPreview(
@@ -2716,11 +2718,11 @@ async function openDiffPreview(
   scope: BridgeRequestScope = {},
 ): Promise<void> {
   if (typeof diffContent === 'string') {
-    openPreviewWindow(filePath, '差异预览', diffContent, 'diff');
+    openPreviewWindow(filePath, i18n.t('bridge.preview.diff'), diffContent, 'diff');
     return;
   }
   const payload = await getAgentChangeDiff(filePath, scope);
-  openPreviewWindow(payload.filePath || filePath, '差异预览', payload.diff || '', 'diff');
+  openPreviewWindow(payload.filePath || filePath, i18n.t('bridge.preview.diff'), payload.diff || '', 'diff');
 }
 
 async function updateSetting(key: string, value: unknown): Promise<void> {

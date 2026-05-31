@@ -879,7 +879,7 @@
   async function loadPickerModels() {
     const orchestratorConfig = getOrchestratorConfigSnapshot();
     if (!orchestratorConfig) {
-      pickerError = '主模型配置未就绪，先到「设置 · 模型」配置 baseUrl 与 apiKey';
+      pickerError = i18n.t('input.modelPickerNotReady');
       pickerLoading = false;
       return;
     }
@@ -908,7 +908,7 @@
     }
     const currentConfig = getOrchestratorConfigSnapshot();
     if (!currentConfig) {
-      pickerError = '主模型配置未就绪，无法保存当前模型';
+      pickerError = i18n.t('input.modelPickerSaveNotReady');
       return;
     }
 
@@ -927,7 +927,7 @@
         console.warn('[InputArea] 切换主线模型后刷新设置快照失败:', error);
         addToast('warning', i18n.t('input.modelSavedSyncPending'));
       }
-      addToast('success', `主线模型已切换为 ${normalizedModel}`);
+      addToast('success', i18n.t('input.modelSwitched', { model: normalizedModel }));
       pickerOpen = false;
     } catch (error) {
       console.warn('[InputArea] 保存主线模型失败:', error);
