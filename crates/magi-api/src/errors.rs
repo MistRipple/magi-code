@@ -109,14 +109,42 @@ impl ApiError {
             ApiError::Conflict(message) => message,
         }
     }
+
+    fn public_message(&self) -> &str {
+        match self {
+            ApiError::EventPublishFailed(_) => "消息同步暂不可用，请刷新后重试",
+            ApiError::ModelInvocationFailed(_) => "模型服务暂不可用，请检查模型配置或稍后重试",
+            ApiError::InternalAssemblyError(_) => "服务状态暂不可用，请稍后重试",
+            _ => self.message(),
+        }
+    }
+
+    fn hides_private_message(&self) -> bool {
+        matches!(
+            self,
+            ApiError::EventPublishFailed(_)
+                | ApiError::ModelInvocationFailed(_)
+                | ApiError::InternalAssemblyError(_)
+        )
+    }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = self.status_code();
+        let error_code = self.error_code();
+        let private_message = self.message().to_string();
+        let public_message = self.public_message().to_string();
+        if self.hides_private_message() {
+            tracing::warn!(
+                error_code,
+                error = %private_message,
+                "api runtime detail hidden from response"
+            );
+        }
         let body = ErrorResponseDto {
-            error_code: self.error_code().to_string(),
-            message: self.message().to_string(),
+            error_code: error_code.to_string(),
+            message: public_message,
             detail: None,
         };
         (status, Json(body)).into_response()
@@ -213,6 +241,21 @@ mod tests {
         let json = serde_json::to_string(&dto).unwrap();
         assert!(json.contains("detail"));
         assert!(json.contains("field 'text' is required"));
+    }
+
+    #[test]
+    fn runtime_error_public_messages_hide_internal_detail() {
+        let internal = ApiError::internal_assembly("创建会话失败", "task_store 未配置");
+        let publish = ApiError::event_publish_failed("事件发布失败", "broadcast closed");
+        let model = ApiError::model_invocation_failed("模型调用失败", "provider transport failed");
+
+        assert_eq!(internal.message(), "创建会话失败: task_store 未配置");
+        assert_eq!(internal.public_message(), "服务状态暂不可用，请稍后重试");
+        assert_eq!(publish.public_message(), "消息同步暂不可用，请刷新后重试");
+        assert_eq!(
+            model.public_message(),
+            "模型服务暂不可用，请检查模型配置或稍后重试"
+        );
     }
 
     #[test]

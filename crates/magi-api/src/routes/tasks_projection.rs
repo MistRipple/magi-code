@@ -3,7 +3,9 @@ use axum::{
     extract::{Path, Query, State},
     routing::get,
 };
-use magi_core::{MissionId, Task, TaskId, TaskKind, TaskProjection, TaskStatus};
+use magi_core::{
+    MissionId, Task, TaskId, TaskKind, TaskProjection, TaskStatus, public_task_output_refs,
+};
 use magi_session_store::ActiveExecutionTurn;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -198,6 +200,21 @@ fn runner_status_from_task_status(status: TaskStatus) -> &'static str {
     }
 }
 
+fn public_task_for_api(mut task: Task) -> Task {
+    task.output_refs = public_task_output_refs(task.status, &task.output_refs);
+    task
+}
+
+fn public_task_projection_for_api(mut projection: TaskProjection) -> TaskProjection {
+    projection.root_task = public_task_for_api(projection.root_task);
+    projection.tasks = projection
+        .tasks
+        .into_iter()
+        .map(public_task_for_api)
+        .collect();
+    projection
+}
+
 fn synthetic_history_task_from_turn(
     session_id: &magi_core::SessionId,
     turn: &ActiveExecutionTurn,
@@ -284,7 +301,7 @@ async fn get_session_task_history(
             .max()
             .unwrap_or(projection.root_task.updated_at);
         items.push(SessionTaskHistoryItemDto {
-            root_task: projection.root_task.clone(),
+            root_task: public_task_for_api(projection.root_task.clone()),
             runner_status: projection.runner_status,
             display_status: projection.display_status,
             execution_mode: projection.execution_mode,
@@ -311,7 +328,7 @@ async fn get_session_task_history(
             let task = synthetic_history_task_from_turn(&session_id, &turn, task_id);
             let runner_status = runner_status_from_task_status(task.status).to_string();
             items.push(SessionTaskHistoryItemDto {
-                root_task: task.clone(),
+                root_task: public_task_for_api(task.clone()),
                 runner_status,
                 display_status: "已完成".to_string(),
                 execution_mode: "session_turn".to_string(),
@@ -369,6 +386,7 @@ async fn get_task_projection(
         &root_id,
         &mut projection,
     )?;
+    let projection = public_task_projection_for_api(projection);
     let mut value = serde_json::to_value(&projection)
         .map_err(|err| ApiError::internal_assembly("序列化任务投影失败", err))?;
     attach_task_scope(&mut value, &scope);
@@ -473,6 +491,7 @@ async fn get_task(
     let task = store
         .get_task(&id)
         .ok_or_else(|| ApiError::not_found("任务不存在", &task_id))?;
+    let task = public_task_for_api(task);
     let mut value = serde_json::to_value(&task)
         .map_err(|err| ApiError::internal_assembly("序列化任务失败", err))?;
     attach_task_scope(&mut value, &scope);
@@ -505,7 +524,10 @@ async fn get_delivery_package(
 mod tests {
     use super::*;
     use crate::state::ApiState;
-    use magi_core::{AbsolutePath, ExecutionOwnership, SessionId, UtcMillis, WorkspaceId};
+    use magi_core::{
+        AbsolutePath, ExecutionOwnership, SessionId, TASK_RUNTIME_FAILURE_PUBLIC_OUTPUT, UtcMillis,
+        WorkspaceId,
+    };
     use magi_event_bus::InMemoryEventBus;
     use magi_governance::GovernanceService;
     use magi_orchestrator::task_store::TaskStore;
@@ -554,6 +576,57 @@ mod tests {
             created_at: UtcMillis(1),
             updated_at: UtcMillis(1),
         }
+    }
+
+    #[test]
+    fn public_task_for_api_redacts_internal_failed_output_refs() {
+        let mission_id = MissionId::new("mission-task-redacted");
+        let mut task = test_task("task-redacted", &mission_id);
+        task.status = TaskStatus::Failed;
+        task.output_refs =
+            vec!["LLM invocation failed: provider transport failed: timed out".to_string()];
+
+        let public_task = public_task_for_api(task);
+
+        assert_eq!(
+            public_task.output_refs,
+            vec![TASK_RUNTIME_FAILURE_PUBLIC_OUTPUT.to_string()]
+        );
+    }
+
+    #[test]
+    fn public_task_projection_for_api_keeps_user_failure_refs() {
+        let mission_id = MissionId::new("mission-task-user-failure");
+        let mut root = test_task("task-user-failure-root", &mission_id);
+        root.status = TaskStatus::Failed;
+        root.output_refs = vec!["测试失败：断言不匹配".to_string()];
+        let projection = TaskProjection {
+            root_task: root.clone(),
+            tasks: vec![root],
+            running_tasks: Vec::new(),
+            pending_tasks: Vec::new(),
+            completed_tasks: Vec::new(),
+            failed_tasks: vec![TaskId::new("task-user-failure-root")],
+            killed_tasks: Vec::new(),
+            progress_summary: Default::default(),
+            aggregate_status: TaskStatus::Failed,
+            display_status: "失败".to_string(),
+            execution_mode: "execution_chain".to_string(),
+            runner_status: "error".to_string(),
+            has_recoverable_chain: false,
+            recoverable_branch_count: 0,
+        };
+
+        let public_projection = public_task_projection_for_api(projection);
+
+        assert_eq!(
+            public_projection.root_task.output_refs,
+            vec!["测试失败：断言不匹配".to_string()]
+        );
+        assert_eq!(
+            public_projection.tasks[0].output_refs,
+            vec!["测试失败：断言不匹配".to_string()]
+        );
     }
 
     #[test]

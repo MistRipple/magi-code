@@ -21,7 +21,7 @@ use magi_bridge_client::{
 };
 use magi_core::{
     EventId, ExecutionResultStatus, SessionId, TaskId, TaskKind, TaskPolicy, TaskStatus, TaskTier,
-    ToolCallId, UtcMillis, WorkspaceId,
+    ToolCallId, UtcMillis, WorkspaceId, task_output_ref_is_internal_runtime_failure,
 };
 use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
 use magi_orchestrator::task_store::TaskStore;
@@ -1340,23 +1340,13 @@ fn truncate_for_agent_spawn_text(value: &str, max_chars: usize) -> (String, bool
 }
 
 fn agent_unavailable_failure(error: &str) -> bool {
+    if task_output_ref_is_internal_runtime_failure(error) {
+        return true;
+    }
     let normalized = error.trim().to_ascii_lowercase();
-    [
-        "llm invocation failed",
-        "模型配置不可用",
-        "model bridge client",
-        "代理不可用",
-        "没有匹配角色",
-        "没有匹配",
-        "provider transport failed",
-        "provider rejected request",
-        "invalid base_url",
-        "connection refused",
-        "timed out",
-        "timeout",
-    ]
-    .iter()
-    .any(|needle| normalized.contains(&needle.to_ascii_lowercase()))
+    ["模型配置不可用", "代理不可用", "没有匹配角色", "没有匹配"]
+        .iter()
+        .any(|needle| normalized.contains(&needle.to_ascii_lowercase()))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3176,6 +3166,9 @@ mod tests {
     fn agent_unavailable_failure_is_degradable() {
         assert!(agent_unavailable_failure(
             "LLM invocation failed (round 0): provider transport failed: timed out"
+        ));
+        assert!(agent_unavailable_failure(
+            "dispatch spawn_blocking panicked: runtime worker crashed"
         ));
         assert!(agent_unavailable_failure(
             "模型配置不可用: model bridge client 未配置"

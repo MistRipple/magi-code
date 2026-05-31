@@ -22,7 +22,8 @@ pub use status::{
     WorkspaceLifecycleStatus,
 };
 pub use task::{
-    AccessProfile, ProgressSummary, Task, TaskKind, TaskPolicy, TaskProjection, TaskRuntimePayload,
-    TaskStatus, TaskTier,
+    AccessProfile, ProgressSummary, TASK_RUNTIME_FAILURE_PUBLIC_OUTPUT, Task, TaskKind, TaskPolicy,
+    TaskProjection, TaskRuntimePayload, TaskStatus, TaskTier, public_task_output_refs,
+    task_output_ref_is_internal_runtime_failure,
 };
 pub use value_objects::{AbsolutePath, UtcMillis, WorkspaceRootPath, WorktreeRootPath};

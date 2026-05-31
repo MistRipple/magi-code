@@ -26,6 +26,77 @@ pub enum TaskStatus {
     Killed,
 }
 
+pub const TASK_RUNTIME_FAILURE_PUBLIC_OUTPUT: &str = "任务运行失败，详情已记录在日志中。";
+
+pub fn task_output_ref_is_internal_runtime_failure(output_ref: &str) -> bool {
+    let normalized = output_ref.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return false;
+    }
+
+    [
+        "llm invocation failed",
+        "model invocation failed",
+        "model bridge client",
+        "provider transport failed",
+        "provider rejected request",
+        "invalid base_url",
+        "connection refused",
+        "connection reset",
+        "http client error",
+        "spawn_blocking panicked",
+        "dispatch spawn_blocking panicked",
+        "dispatch failed",
+        "thread panicked",
+        "panicked at",
+        "stack backtrace",
+        "backtrace:",
+        "internal assembly",
+        "dispatcher missing",
+        "task_store",
+        "runner_manager",
+        "workerruntime",
+        "humancheckpointstore",
+        "sessionstore",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+        || (contains_any(&normalized, &["timed out", "timeout"])
+            && contains_any(
+                &normalized,
+                &["llm", "model", "provider", "transport", "request"],
+            ))
+}
+
+pub fn public_task_output_refs(status: TaskStatus, output_refs: &[String]) -> Vec<String> {
+    if status != TaskStatus::Failed {
+        return output_refs.to_vec();
+    }
+
+    let mut redacted = false;
+    let visible_refs = output_refs
+        .iter()
+        .filter_map(|output_ref| {
+            if task_output_ref_is_internal_runtime_failure(output_ref) {
+                redacted = true;
+                None
+            } else {
+                Some(output_ref.clone())
+            }
+        })
+        .collect::<Vec<_>>();
+
+    if redacted && visible_refs.is_empty() {
+        vec![TASK_RUNTIME_FAILURE_PUBLIC_OUTPUT.to_string()]
+    } else {
+        visible_refs
+    }
+}
+
+fn contains_any(value: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| value.contains(needle))
+}
+
 /// 任务系统：任务复杂度分层。
 ///
 /// 简单任务不进入 Task，因此这里仅表达进入任务系统后的两类路径：
@@ -191,4 +262,44 @@ pub struct ProgressSummary {
     pub failed_tasks: u32,
     pub killed_tasks: u32,
     pub settled_tasks: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn public_task_output_refs_redacts_internal_failed_details() {
+        let output_refs = vec![
+            "LLM invocation failed (round 0): provider transport failed: timed out".to_string(),
+        ];
+
+        assert_eq!(
+            public_task_output_refs(TaskStatus::Failed, &output_refs),
+            vec![TASK_RUNTIME_FAILURE_PUBLIC_OUTPUT.to_string()]
+        );
+    }
+
+    #[test]
+    fn public_task_output_refs_preserves_user_meaningful_failure() {
+        let output_refs = vec!["测试失败：断言不匹配".to_string()];
+
+        assert_eq!(
+            public_task_output_refs(TaskStatus::Failed, &output_refs),
+            output_refs
+        );
+        assert!(!task_output_ref_is_internal_runtime_failure(
+            "工具执行失败，任务不能标记完成：file_write: denied"
+        ));
+    }
+
+    #[test]
+    fn public_task_output_refs_preserves_completed_outputs() {
+        let output_refs = vec!["provider transport failed: timed out".to_string()];
+
+        assert_eq!(
+            public_task_output_refs(TaskStatus::Completed, &output_refs),
+            output_refs
+        );
+    }
 }
