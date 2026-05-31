@@ -286,6 +286,9 @@ impl MissionCharterStore {
         };
         let mut out = String::new();
         out.push_str("# Mission Charter\n\n");
+        out.push_str(
+            "> Mission Charter 是当前 mission 的长期目标与约束；执行时应结合本轮用户输入和当前 task 目标。如本轮明确调整目标或约束，不要用旧 charter 自行覆盖，应按审批/写入流程更新 charter。\n\n",
+        );
         out.push_str(&format!("- mission_id: {}\n", charter.mission_id.as_str()));
         out.push_str(&format!("- title: {}\n", charter.title));
         out.push_str(&format!("- state: {}\n", charter.state.as_str()));
@@ -1104,6 +1107,8 @@ mod tests {
             .expect("render")
             .expect("present");
         assert!(rendered.contains("# Mission Charter"));
+        assert!(rendered.contains("长期目标与约束"));
+        assert!(rendered.contains("不要用旧 charter 自行覆盖"));
         assert!(rendered.contains("## Goal"));
         assert!(rendered.contains("## Constraints"));
         assert!(!rendered.contains("## Success Criteria"));

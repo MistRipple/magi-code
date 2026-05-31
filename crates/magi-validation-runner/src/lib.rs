@@ -239,6 +239,9 @@ impl ValidationStore {
         }
         let mut out = String::new();
         out.push_str("# Mission Validation\n\n");
+        out.push_str(
+            "> Mission Validation 是历史验证证据；只能辅助判断既有 plan step 状态，不能替代本轮任务要求的验证对象、命令或交付标准。\n\n",
+        );
         out.push_str(&format!("- mission_id: {}\n", report.mission_id.as_str()));
         out.push_str(&format!("- total_records: {}\n\n", report.records.len()));
 
@@ -923,6 +926,8 @@ mod tests {
             .render_for_prompt(&report.mission_id)
             .expect("render")
             .expect("non-empty");
+        assert!(rendered.contains("Mission Validation 是历史验证证据"));
+        assert!(rendered.contains("不能替代本轮任务要求"));
         assert!(rendered.contains("## Step `s1`"));
         assert!(rendered.contains("## Step `s2`"));
         assert!(rendered.contains("test_suite → **pass**"));

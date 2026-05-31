@@ -338,6 +338,9 @@ impl CheckpointStore {
 
         let mut out = String::new();
         out.push_str("# Mission Checkpoints\n\n");
+        out.push_str(
+            "> Mission Checkpoints 只用于恢复定位和理解历史进展；不能覆盖本轮用户输入、当前会话事实或当前 task 目标。\n\n",
+        );
         out.push_str(&format!("- mission_id: {}\n", log.mission_id.as_str()));
         out.push_str(&format!("- total_checkpoints: {}\n", total));
         out.push_str(&format!("- showing: latest {}\n\n", recent.len()));
@@ -1120,6 +1123,8 @@ mod tests {
             .expect("render")
             .expect("non empty");
         // 默认尾部 5 条，前 3 条不应出现。
+        assert!(rendered.contains("只用于恢复定位和理解历史进展"));
+        assert!(rendered.contains("不能覆盖本轮用户输入"));
         assert!(rendered.contains("total_checkpoints: 8"));
         assert!(rendered.contains("showing: latest 5"));
         assert!(!rendered.contains("cp #0"));

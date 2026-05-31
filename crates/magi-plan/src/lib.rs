@@ -189,6 +189,9 @@ impl PlanStore {
         }
         let mut out = String::new();
         out.push_str("# Mission Plan\n\n");
+        out.push_str(
+            "> Mission Plan 是当前 mission 的执行状态参考；不得覆盖本轮用户输入、当前会话事实或当前 task 目标。如二者冲突，应以本轮任务事实为准并通过 plan_write 更新计划。\n\n",
+        );
         out.push_str(&format!("- mission_id: {}\n", plan.mission_id.as_str()));
         out.push_str(&format!("- total_steps: {}\n\n", plan.steps.len()));
         out.push_str("## Steps\n");
@@ -1147,6 +1150,8 @@ mod tests {
             .expect("render")
             .expect("present");
         assert!(rendered.contains("# Mission Plan"));
+        assert!(rendered.contains("不得覆盖本轮用户输入"));
+        assert!(rendered.contains("通过 plan_write 更新计划"));
         assert!(rendered.contains("s1"));
         assert!(rendered.contains("(completed)"));
         assert!(rendered.contains("depends_on: s0"));
