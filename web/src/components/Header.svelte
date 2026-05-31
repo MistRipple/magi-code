@@ -93,8 +93,8 @@
       downloadMarkdown(payload);
       addToast('success', i18n.t('header.exportSuccess', { count: payload.messageCount }));
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      addToast('error', i18n.t('header.exportFailed', { message }));
+      console.warn('[Header] export session failed:', error);
+      addToast('error', i18n.t('header.exportFailed'));
     }
   }
   const exportDisabled = $derived(

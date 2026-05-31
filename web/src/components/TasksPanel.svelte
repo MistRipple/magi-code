@@ -611,7 +611,8 @@
       if (taskHistoryRequestScope !== sid || taskHistoryFetchGeneration !== generation) {
         return;
       }
-      taskHistoryError = err instanceof Error ? err.message : String(err);
+      console.warn('[TasksPanel] task history load failed:', err);
+      taskHistoryError = i18n.t('tasks.historyLoadFailed');
     } finally {
       if (taskHistoryRequestScope === sid && taskHistoryFetchGeneration === generation) {
         taskHistoryLoading = false;
@@ -650,6 +651,11 @@
     }
   }
 
+  function reportTaskActionFailure(labelKey: string, error: unknown): void {
+    console.warn('[TasksPanel] task action failed:', error);
+    addToast('error', i18n.t(labelKey));
+  }
+
   async function stopCurrentTaskProjection() {
     const sessionId = currentSessionIdValue();
     const rootTaskId = currentRootTaskId();
@@ -661,8 +667,7 @@
       await refreshTaskProjection(sessionId);
       addToast('info', '任务已中断，进度已保留');
     }).catch((err) => {
-      const message = err instanceof Error ? err.message : String(err);
-      addToast('error', `停止失败: ${message}`);
+      reportTaskActionFailure('tasks.action.stopFailed', err);
     });
   }
 
@@ -677,8 +682,7 @@
       await refreshTaskProjection(sessionId);
       addToast('success', '任务已继续');
     }).catch((err) => {
-      const message = err instanceof Error ? err.message : String(err);
-      addToast('error', `恢复失败: ${message}`);
+      reportTaskActionFailure('tasks.action.resumeFailed', err);
     });
   }
 
@@ -698,8 +702,7 @@
       await refreshSessionTaskHistory();
       addToast('success', '任务已重新执行');
     }).catch((err) => {
-      const message = err instanceof Error ? err.message : String(err);
-      addToast('error', `重新执行失败: ${message}`);
+      reportTaskActionFailure('tasks.action.restartFailed', err);
     });
   }
 
@@ -715,8 +718,7 @@
       await refreshSessionTaskHistory();
       addToast('info', '任务已从面板移除');
     }).catch((err) => {
-      const message = err instanceof Error ? err.message : String(err);
-      addToast('error', `移除失败: ${message}`);
+      reportTaskActionFailure('tasks.action.archiveFailed', err);
     });
   }
 
@@ -736,8 +738,7 @@
       await refreshSessionTaskHistory();
       addToast('success', '任务已重新执行');
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      addToast('error', `重新执行失败: ${message}`);
+      reportTaskActionFailure('tasks.action.restartFailed', err);
     } finally {
       if (restartingHistoryRootTaskId === rootTaskId) {
         restartingHistoryRootTaskId = null;

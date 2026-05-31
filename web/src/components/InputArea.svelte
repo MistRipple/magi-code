@@ -681,8 +681,8 @@
       }
       vscode.postMessage({ type: 'interruptTask' });
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      addToast('error', `停止失败: ${message}`);
+      console.warn('[InputArea] stop task failed:', err);
+      addToast('error', i18n.t('input.stopFailed'));
     } finally {
       stopLoading = false;
     }
@@ -893,8 +893,8 @@
       pickerModels = Array.isArray(payload.models) ? payload.models : [];
       pickerLoadedOnce = true;
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error ?? '');
-      pickerError = message || '拉取模型列表失败';
+      console.warn('[InputArea] 拉取主线模型列表失败:', error);
+      pickerError = i18n.t('input.modelListLoadFailed');
     } finally {
       pickerLoading = false;
     }
@@ -925,14 +925,14 @@
         await refreshPickerSettingsSnapshot();
       } catch (error) {
         console.warn('[InputArea] 切换主线模型后刷新设置快照失败:', error);
-        addToast('warning', '主线模型已保存，但刷新设置快照失败，刷新页面后会同步');
+        addToast('warning', i18n.t('input.modelSavedSyncPending'));
       }
       addToast('success', `主线模型已切换为 ${normalizedModel}`);
       pickerOpen = false;
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error ?? '');
-      pickerError = message || '保存主线模型失败';
-      addToast('error', `保存主线模型失败：${pickerError}`);
+      console.warn('[InputArea] 保存主线模型失败:', error);
+      pickerError = i18n.t('input.modelSaveFailed');
+      addToast('error', pickerError);
     } finally {
       pickerSavingModel = null;
     }
@@ -974,8 +974,8 @@
     try {
       applyBranchResult(await fetchWorkspaceBranches());
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error ?? '');
-      branchError = message || i18n.t('input.branch.loadFailed');
+      console.warn('[InputArea] 读取工作区分支失败:', error);
+      branchError = i18n.t('input.branch.loadFailed');
     } finally {
       branchLoading = false;
     }
@@ -1005,13 +1005,13 @@
           detail: { reason: 'branchSwitched', branch: currentBranch },
         }));
       } else {
-        // git 拒绝（如未提交改动会被覆盖）：原文展示在 popover，不关闭、不兜底。
-        branchError = result.error || i18n.t('input.branch.switchFailed');
+        console.warn('[InputArea] 切换工作区分支被拒绝:', result.error);
+        branchError = i18n.t('input.branch.switchFailed');
         addToast('error', i18n.t('input.branch.switchFailed'));
       }
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error ?? '');
-      branchError = message || i18n.t('input.branch.switchFailed');
+      console.warn('[InputArea] 切换工作区分支失败:', error);
+      branchError = i18n.t('input.branch.switchFailed');
       addToast('error', i18n.t('input.branch.switchFailed'));
     } finally {
       branchSwitching = null;
@@ -1067,7 +1067,10 @@
       });
       const next = unwrapEnhancedPromptPayload(result?.enhancedPrompt ?? '');
       if (!next) {
-        addToast('warning', result?.error || i18n.t('input.enhance.empty'));
+        if (result?.error) {
+          console.warn('[InputArea] 提示词优化返回错误:', result.error);
+        }
+        addToast('warning', i18n.t('input.enhance.empty'));
         return;
       }
       enhanceOriginalPrompt = draft;
@@ -1077,8 +1080,8 @@
       queueMicrotask(focusEditor);
       addToast('success', i18n.t('input.enhance.success'));
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      addToast('error', i18n.t('input.enhance.failed', { message }));
+      console.warn('[InputArea] 提示词优化失败:', error);
+      addToast('error', i18n.t('input.enhance.failed'));
     } finally {
       enhanceLoading = false;
     }
