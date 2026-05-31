@@ -2507,6 +2507,19 @@ function createSettingsStore(props: { onClose?: () => void }) {
     saveSafeguardRules();
   }
 
+  function updateSafeguardRuleAction(index: number, action: string): void {
+    const rule = safeguardRules[index];
+    if (!rule) return;
+    const normalizedAction = normalizeSafeguardAction(action);
+    if (rule.action === normalizedAction) return;
+    safeguardRules[index] = {
+      ...rule,
+      action: normalizedAction,
+    };
+    safeguardRules = [...safeguardRules];
+    saveSafeguardRules();
+  }
+
   function removeCustomRule(index: number): void {
     safeguardRules = safeguardRules.filter((_, i) => i !== index);
     saveSafeguardRules();
@@ -2906,6 +2919,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
     cancelLocalSkillFolderPicker,
     deleteSkill,
     toggleSafeguardRule,
+    updateSafeguardRuleAction,
     removeCustomRule,
     addCustomRule,
     getRulesForCategory,

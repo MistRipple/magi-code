@@ -7,6 +7,7 @@
     SAFEGUARD_CATEGORIES,
     getRulesForCategory,
     toggleSafeguardRule,
+    updateSafeguardRuleAction,
     removeCustomRule,
     newCustomRule = $bindable(),
     addCustomRule,
@@ -16,11 +17,18 @@
     SAFEGUARD_CATEGORIES: any[];
     getRulesForCategory: (cat: any) => any[];
     toggleSafeguardRule: (index: number) => void;
+    updateSafeguardRuleAction: (index: number, action: string) => void;
     removeCustomRule: (index: number) => void;
     newCustomRule: string;
     addCustomRule: () => void;
     userRulesSaveStatus: string;
   }>();
+
+  const SAFEGUARD_ACTIONS = [
+    'require_approval_in_restricted',
+    'hard_block',
+    'audit_only',
+  ];
 
   const userRulesStatusText = $derived.by(() => {
     switch (userRulesSaveStatus) {
@@ -109,7 +117,18 @@
                 title={getSafeguardRuleTitle(rule)}
               >
                 <span class="safeguard-badge-text">{rule.pattern}</span>
-                <span class="safeguard-action">{getSafeguardActionLabel(rule.action)}</span>
+                <select
+                  class="safeguard-action-select"
+                  value={rule.action}
+                  aria-label={i18n.t('settings.safeguard.actionLabel')}
+                  onclick={(e) => e.stopPropagation()}
+                  onkeydown={(e) => e.stopPropagation()}
+                  onchange={(e) => updateSafeguardRuleAction(index, e.currentTarget.value)}
+                >
+                  {#each SAFEGUARD_ACTIONS as action}
+                    <option value={action}>{getSafeguardActionLabel(action)}</option>
+                  {/each}
+                </select>
                 {#if category === 'custom'}
                   <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
                   <div role="button" tabindex="0" class="safeguard-badge-remove" onclick={(e) => { e.stopPropagation(); removeCustomRule(index); }} onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); e.stopPropagation(); removeCustomRule(index); } }} title={i18n.t('settings.tools.delete')}>×</div>
@@ -219,18 +238,26 @@
     color: var(--foreground);
   }
 
-  .safeguard-action {
+  .safeguard-action-select {
+    appearance: none;
     font-family: var(--font-sans, sans-serif);
     font-size: 10px;
     line-height: 1;
     padding: 2px 5px;
     border-radius: 6px;
+    border: 0;
     background: rgba(var(--primary-rgb, 0, 122, 255), 0.12);
     color: inherit;
     white-space: nowrap;
+    cursor: pointer;
   }
 
-  .safeguard-badge.enabled .safeguard-action {
+  .safeguard-action-select:focus {
+    outline: 1px solid currentColor;
+    outline-offset: 1px;
+  }
+
+  .safeguard-badge.enabled .safeguard-action-select {
     background: rgba(255, 255, 255, 0.18);
   }
 

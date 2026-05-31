@@ -763,6 +763,7 @@
   "settings.safeguard.action.requireApproval": "需审批",
   "settings.safeguard.action.hardBlock": "阻断",
   "settings.safeguard.action.auditOnly": "审计",
+  "settings.safeguard.actionLabel": "安全动作",
   "settings.safeguard.addPlaceholder": "输入命令关键词...",
   "settings.safeguard.add": "添加",
   "settings.safeguard.duplicateRule": "规则已存在",
