@@ -341,6 +341,23 @@
     return parts.join('\n');
   }
 
+  function getMCPStatusTitle(server: any): string {
+    const status = getMCPHealthLabel(server);
+    return server.error
+      ? `${status}\n${i18n.t('settings.tools.mcpConnectionIssue')}`
+      : status;
+  }
+
+  function getMCPStatusSummary(server: any): string {
+    const status = getMCPHealthLabel(server);
+    return server.error
+      ? i18n.t('settings.tools.runtimeStatusWithDetail', {
+        status,
+        detail: i18n.t('settings.tools.mcpConnectionIssue'),
+      })
+      : i18n.t('settings.tools.runtimeStatus', { status });
+  }
+
   let builtinExpanded = $state(false);
   const builtinReadyCount = $derived(
     (builtinTools as Array<{ runtimeStatus: string }>).filter((t) => t.runtimeStatus === 'ready').length,
@@ -530,7 +547,7 @@
                       </div>
                     </div>
                     <div class="header-action" style="display: flex; align-items: center; gap: 6px;">
-                      <span class="apple-indicator" class:success={server.health === 'connected'} class:warning={server.health === 'degraded'} class:error={server.health === 'disconnected' || !server.health} title={server.error || getMCPHealthLabel(server)}></span>
+                      <span class="apple-indicator" class:success={server.health === 'connected'} class:warning={server.health === 'degraded'} class:error={server.health === 'disconnected' || !server.health} title={getMCPStatusTitle(server)}></span>
                       <span class="mcp-expand-icon" class:expanded={mcpExpandedServer === server.id} style="margin-left: 4px;">
                         <Icon name="chevronDown" size={14} />
                       </span>
@@ -538,9 +555,8 @@
                   </div>
                   
                   <div class="tile-row tile-body" style="height: 32px; display: flex; align-items: flex-start; margin-top: 4px;">
-                    <p class="apple-summary" title={server.error || getMCPHealthLabel(server)} style="margin: 0; font-size: 11px; color: {server.error ? 'var(--error)' : 'var(--foreground-muted)'}; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;">
-                      {i18n.t('settings.tools.runtimeStatus', { status: getMCPHealthLabel(server) })}
-                      {#if server.error} - {server.error}{/if}
+                    <p class="apple-summary" title={getMCPStatusTitle(server)} style="margin: 0; font-size: 11px; color: {server.error ? 'var(--error)' : 'var(--foreground-muted)'}; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;">
+                      {getMCPStatusSummary(server)}
                     </p>
                   </div>
 
