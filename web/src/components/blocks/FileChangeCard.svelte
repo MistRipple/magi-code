@@ -216,7 +216,7 @@
         </span>
       {/if}
 
-      <span class="tool-status status-success">
+      <span class="tool-status" class:status-success={!change.error} class:status-error={!!change.error}>
         <span class="status-dot"></span>
       </span>
     </button>
@@ -430,6 +430,7 @@
   }
 
   .status-success { color: var(--success); }
+  .status-error { color: var(--error); }
 
   .tool-content {
     border-top: 1px solid var(--border);
