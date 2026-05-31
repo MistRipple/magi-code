@@ -323,17 +323,21 @@
       .filter((ref): ref is TaskReferenceDescriptor => Boolean(ref));
   }
 
+  function taskDetailReferenceSourceLabel(sectionKey: string): string {
+    return i18n.t('tasks.reference.source.taskDetail', { section: i18n.t(sectionKey) });
+  }
+
   function buildTaskReferenceGroups(task: TaskDto | null): TaskReferenceGroup[] {
     if (!task) return [];
     return [
-      { label: '知识', sourceLabel: '任务详情 · 知识', refs: task.knowledge_refs, preferredAction: 'auto' as const },
-      { label: '输入', sourceLabel: '任务详情 · 输入', refs: task.input_refs, preferredAction: 'auto' as const },
-      { label: '产出', sourceLabel: '任务详情 · 产出', refs: task.output_refs, preferredAction: 'auto' as const },
-      { label: '证据', sourceLabel: '任务详情 · 证据', refs: task.evidence_refs, preferredAction: 'auto' as const },
+      { sectionKey: 'tasks.reference.section.knowledge', refs: task.knowledge_refs, preferredAction: 'auto' as const },
+      { sectionKey: 'tasks.reference.section.input', refs: task.input_refs, preferredAction: 'auto' as const },
+      { sectionKey: 'tasks.reference.section.output', refs: task.output_refs, preferredAction: 'auto' as const },
+      { sectionKey: 'tasks.reference.section.evidence', refs: task.evidence_refs, preferredAction: 'auto' as const },
     ]
       .map((group) => ({
-        label: group.label,
-        sourceLabel: group.sourceLabel,
+        label: i18n.t(group.sectionKey),
+        sourceLabel: taskDetailReferenceSourceLabel(group.sectionKey),
         references: buildTaskReferences(group.refs, group.preferredAction),
       }))
       .filter((group) => group.references.length > 0);
@@ -350,7 +354,7 @@
       lineage.unshift(getTaskDisplayTitle(parent));
       current = parent;
     }
-    return lineage.length > 0 ? lineage.join(' / ') : '根任务';
+    return lineage.length > 0 ? lineage.join(' / ') : i18n.t('tasks.detail.rootTask');
   }
 
   function resolveVisibleParentTaskId(
@@ -460,22 +464,22 @@
       .filter((task) => task.kind === 'local_agent' && task.task_id !== rootTaskId)
       .length;
 
-    let title = '执行链未完成';
+    let title = i18n.t('tasks.attention.executionIncomplete');
     if (rootFailed && agentFailedCount > 0) {
-      title = `主线和 ${agentFailedCount} 个代理未完成`;
+      title = i18n.t('tasks.attention.mainAndAgentsIncomplete', { count: agentFailedCount });
     } else if (rootFailed) {
-      title = '主线任务未完成';
+      title = i18n.t('tasks.attention.mainIncomplete');
     } else if (agentFailedCount > 0 && agentFailedCount === failedCount) {
-      title = `${agentFailedCount} 个代理未完成`;
+      title = i18n.t('tasks.attention.agentsIncomplete', { count: agentFailedCount });
     } else if (failedCount > 0) {
-      title = `${failedCount} 个任务未完成`;
+      title = i18n.t('tasks.attention.tasksIncomplete', { count: failedCount });
     }
 
     return {
       title,
       hint: canResume
-        ? '可以继续原执行链；如果上下文已失效，再重新执行。'
-        : '可以重新执行当前目标；需要定位链路时再展开排障明细。',
+        ? i18n.t('tasks.attention.resumeHint')
+        : i18n.t('tasks.attention.restartHint'),
     };
   }
 
@@ -486,13 +490,13 @@
     limit = 10,
   ) {
     if (items.length === 0) return;
-    lines.push('', `${label}（${items.length}）`);
+    lines.push('', i18n.t('tasks.delivery.summary.listTitle', { label, count: items.length }));
     for (const item of items.slice(0, limit)) {
       lines.push(`- ${item}`);
     }
     const remaining = items.length - limit;
     if (remaining > 0) {
-      lines.push(`- 另有 ${remaining} 项`);
+      lines.push(`- ${i18n.t('tasks.delivery.summary.remaining', { count: remaining })}`);
     }
   }
 
@@ -501,26 +505,40 @@
     const completed = pkg.progress.completed || 0;
     const percent = total > 0 ? Math.round((completed / total) * 100) : 0;
     const lines = [
-      '交付概览',
-      `目标：${getTaskDisplayText(pkg.goal) || '--'}`,
-      `状态：${getTaskStatusLabel(pkg.aggregate_status as TaskStatus)}`,
-      `进度：${completed}/${total}（${percent}%）`,
-      `执行态：待执行 ${pkg.progress.pending || 0} · 执行中 ${pkg.progress.running || 0} · 失败 ${pkg.progress.failed || 0} · 终止 ${pkg.progress.killed || 0}`,
-      `完成任务：${pkg.completed_task_count}`,
-      `资产：文件 ${pkg.file_changes.length} · 证据 ${pkg.evidence_list.length} · 核验 ${pkg.verification_results.length} · 执行记录 ${pkg.execution_records.length} · 风险 ${pkg.remaining_risks.length}`,
+      i18n.t('tasks.delivery.title'),
+      i18n.t('tasks.delivery.summary.goal', { goal: getTaskDisplayText(pkg.goal) || '--' }),
+      i18n.t('tasks.delivery.summary.status', { status: getTaskStatusLabel(pkg.aggregate_status as TaskStatus) }),
+      i18n.t('tasks.delivery.summary.progress', { completed, total, percent }),
+      i18n.t('tasks.delivery.summary.runtime', {
+        pending: pkg.progress.pending || 0,
+        running: pkg.progress.running || 0,
+        failed: pkg.progress.failed || 0,
+        killed: pkg.progress.killed || 0,
+      }),
+      i18n.t('tasks.delivery.summary.completedTasks', { count: pkg.completed_task_count }),
+      i18n.t('tasks.delivery.summary.assets', {
+        files: pkg.file_changes.length,
+        evidence: pkg.evidence_list.length,
+        verification: pkg.verification_results.length,
+        records: pkg.execution_records.length,
+        risks: pkg.remaining_risks.length,
+      }),
     ].filter((line): line is string => Boolean(line));
 
-    appendDeliverySummaryList(lines, '文件变更', pkg.file_changes);
-    appendDeliverySummaryList(lines, '证据', pkg.evidence_list);
+    appendDeliverySummaryList(lines, i18n.t('tasks.delivery.fileChanges'), pkg.file_changes);
+    appendDeliverySummaryList(lines, i18n.t('tasks.delivery.evidence'), pkg.evidence_list);
 
     if (pkg.verification_results.length > 0) {
-      lines.push('', `核验结果（${pkg.verification_results.length}）`);
+      lines.push('', i18n.t('tasks.delivery.summary.listTitle', {
+        label: i18n.t('tasks.delivery.verificationResults'),
+        count: pkg.verification_results.length,
+      }));
       for (const result of pkg.verification_results.slice(0, 10)) {
         lines.push(`- ${getTaskDisplayText(result.title)}: ${getTaskDisplayText(result.result)}`);
       }
     }
 
-    appendDeliverySummaryList(lines, '剩余风险', pkg.remaining_risks.map(getTaskDisplayText), 8);
+    appendDeliverySummaryList(lines, i18n.t('tasks.delivery.remainingRisks'), pkg.remaining_risks.map(getTaskDisplayText), 8);
     return lines.join('\n');
   }
 
@@ -786,7 +804,7 @@
 
   function selectProjectionTask(taskId: string) {
     selectTaskProjectionTask(currentSessionId, taskId);
-    if (selectedTaskReference?.sourceLabel.startsWith('任务详情 ·')) {
+    if (selectedTaskReference?.sourceLabel.startsWith(i18n.t('tasks.reference.source.taskDetailPrefix'))) {
       selectedTaskReference = null;
     }
   }
@@ -822,12 +840,17 @@
   {#if hasTaskProjection}
     {@const proj = taskProjection.projection}
     {#if proj}
-      <section class="task-progress-panel" aria-label="任务进度">
+      <section class="task-progress-panel" aria-label={i18n.t('tasks.progress.title')}>
         <div class="task-progress-head">
           <div class="task-progress-title-block">
-            <span class="task-progress-label">进度</span>
+            <span class="task-progress-label">{i18n.t('tasks.progress.title')}</span>
             {#if taskSummary.total > 0}
-              <span class="task-progress-meta">{taskSummary.completed}/{taskSummary.total} 已完成</span>
+              <span class="task-progress-meta">
+                {i18n.t('tasks.progress.completedCount', {
+                  completed: taskSummary.completed,
+                  total: taskSummary.total,
+                })}
+              </span>
             {/if}
           </div>
           <div class="task-progress-actions">
@@ -923,32 +946,39 @@
       </section>
 
       {#if deliveryPackage}
-        <section class="delivery-package-card" aria-label="交付概览">
+        <section class="delivery-package-card" aria-label={i18n.t('tasks.delivery.title')}>
           <div class="dp-header">
             <Icon name="taskComplete" size={14} />
-            <span class="dp-title">交付概览</span>
+            <span class="dp-title">{i18n.t('tasks.delivery.title')}</span>
             <button
               type="button"
               class="dp-summary-copy"
-              title={deliverySummaryCopied ? '交付摘要已复制' : '复制交付摘要'}
+              title={deliverySummaryCopied
+                ? i18n.t('tasks.delivery.copySummarySuccess')
+                : i18n.t('tasks.delivery.copySummaryTitle')}
               onclick={copyDeliveryPackageSummary}
             >
               <Icon name={deliverySummaryCopied ? 'check' : 'copy'} size={11} />
-              <span>{deliverySummaryCopied ? '已复制' : '复制摘要'}</span>
+              <span>{deliverySummaryCopied
+                ? i18n.t('tasks.delivery.copied')
+                : i18n.t('tasks.delivery.copySummary')}
+              </span>
             </button>
           </div>
 
           {#if deliveryPackage.file_changes.length > 0}
             <div class="dp-section">
-              <span class="dp-section-label">文件变更 ({deliveryPackage.file_changes.length})</span>
+              <span class="dp-section-label">
+                {i18n.t('tasks.delivery.fileChangesWithCount', { count: deliveryPackage.file_changes.length })}
+              </span>
               <div class="dp-chip-list">
                 {#each deliveryFileReferences as reference, index (`${reference.raw}:${index}`)}
                   <button
                     type="button"
                     class="dp-chip dp-chip--interactive"
-                    class:dp-chip--selected={isTaskReferenceSelected('交付 · 文件变更', reference)}
+                    class:dp-chip--selected={isTaskReferenceSelected(i18n.t('tasks.delivery.source.fileChanges'), reference)}
                     title={reference.title}
-                    onclick={() => selectTaskReference('交付 · 文件变更', reference)}
+                    onclick={() => selectTaskReference(i18n.t('tasks.delivery.source.fileChanges'), reference)}
                   >
                     <Icon name={getTaskReferenceIconName(reference)} size={11} />
                     <span>{reference.displayLabel}</span>
@@ -960,15 +990,17 @@
 
           {#if deliveryPackage.evidence_list.length > 0}
             <div class="dp-section">
-              <span class="dp-section-label">证据 ({deliveryPackage.evidence_list.length})</span>
+              <span class="dp-section-label">
+                {i18n.t('tasks.delivery.evidenceWithCount', { count: deliveryPackage.evidence_list.length })}
+              </span>
               <div class="dp-chip-list">
                 {#each deliveryEvidenceReferences as reference, index (`${reference.raw}:${index}`)}
                   <button
                     type="button"
                     class="dp-chip dp-chip--interactive"
-                    class:dp-chip--selected={isTaskReferenceSelected('交付 · 证据', reference)}
+                    class:dp-chip--selected={isTaskReferenceSelected(i18n.t('tasks.delivery.source.evidence'), reference)}
                     title={reference.title}
-                    onclick={() => selectTaskReference('交付 · 证据', reference)}
+                    onclick={() => selectTaskReference(i18n.t('tasks.delivery.source.evidence'), reference)}
                   >
                     <Icon name={getTaskReferenceIconName(reference)} size={11} />
                     <span>{reference.displayLabel}</span>
@@ -980,7 +1012,9 @@
 
           {#if deliveryPackage.verification_results.length > 0}
             <div class="dp-section">
-              <span class="dp-section-label">核验结果 ({deliveryPackage.verification_results.length})</span>
+              <span class="dp-section-label">
+                {i18n.t('tasks.delivery.verificationResultsWithCount', { count: deliveryPackage.verification_results.length })}
+              </span>
               {#each deliveryPackage.verification_results as vr}
                 <div class="dp-verification-row">
                   <Icon name="check-circle" size={12} />
@@ -993,7 +1027,9 @@
 
           {#if deliveryPackage.remaining_risks.length > 0}
             <div class="dp-section">
-              <span class="dp-section-label">剩余风险 ({deliveryPackage.remaining_risks.length})</span>
+              <span class="dp-section-label">
+                {i18n.t('tasks.delivery.remainingRisksWithCount', { count: deliveryPackage.remaining_risks.length })}
+              </span>
               {#each deliveryPackage.remaining_risks as risk}
                 <div class="dp-risk-row">
                   <Icon name="alert-triangle" size={12} />
@@ -1004,7 +1040,7 @@
           {/if}
 
           <div class="dp-progress">
-            <span class="dp-progress-label">完成度</span>
+            <span class="dp-progress-label">{i18n.t('tasks.delivery.progressLabel')}</span>
             <div class="dp-progress-bar">
               <div class="dp-progress-fill" style="width: {Math.round(((deliveryPackage.progress.completed || 0) / (deliveryPackage.progress.total || 1)) * 100)}%"></div>
             </div>
@@ -1014,7 +1050,7 @@
       {/if}
 
       {#if selectedTaskReference}
-        <section bind:this={referenceDetailEl} class="task-reference-detail-card" aria-label="引用详情">
+        <section bind:this={referenceDetailEl} class="task-reference-detail-card" aria-label={i18n.t('tasks.reference.detailTitle')}>
           <div class="task-reference-detail-top">
             <span class="task-reference-detail-title">
               <Icon name={getTaskReferenceIconName(selectedTaskReference.reference)} size={12} />
@@ -1023,25 +1059,25 @@
             <button
               type="button"
               class="task-reference-detail-close"
-              title="关闭引用详情"
+              title={i18n.t('tasks.reference.closeDetail')}
               onclick={() => selectedTaskReference = null}
             >
               <Icon name="close" size={12} />
             </button>
           </div>
           <div class="task-reference-detail-meta">
-            <span>来源：{selectedTaskReference.sourceLabel}</span>
-            <span>动作：{getTaskReferenceActionLabel(selectedTaskReference.reference)}</span>
+            <span>{i18n.t('tasks.reference.sourceLabel', { source: selectedTaskReference.sourceLabel })}</span>
+            <span>{i18n.t('tasks.reference.actionLabel', { action: getTaskReferenceActionLabel(selectedTaskReference.reference) })}</span>
           </div>
           <div class="task-reference-detail-field">
-            <span class="task-reference-detail-label">目标</span>
+            <span class="task-reference-detail-label">{i18n.t('tasks.reference.target')}</span>
             <span class="task-reference-detail-value task-reference-detail-value--mono" title={selectedTaskReference.reference.actionTarget}>
               {selectedTaskReference.reference.actionTarget}
             </span>
           </div>
           {#if selectedTaskReference.reference.raw !== selectedTaskReference.reference.actionTarget}
             <div class="task-reference-detail-field">
-              <span class="task-reference-detail-label">原始引用</span>
+              <span class="task-reference-detail-label">{i18n.t('tasks.reference.raw')}</span>
               <span class="task-reference-detail-value task-reference-detail-value--mono" title={selectedTaskReference.reference.raw}>
                 {selectedTaskReference.reference.raw}
               </span>
@@ -1058,11 +1094,11 @@
 
       <details class="task-details-disclosure">
         <summary>
-          <span>排障明细</span>
-          <span>展开查看任务链路</span>
+          <span>{i18n.t('tasks.troubleshooting.title')}</span>
+          <span>{i18n.t('tasks.troubleshooting.subtitle')}</span>
         </summary>
 
-      <div class="tg-tree" role="tree" aria-label="任务排障明细">
+      <div class="tg-tree" role="tree" aria-label={i18n.t('tasks.troubleshooting.title')}>
         {#each taskTreeRows as row (row.task.task_id)}
           {@const isExpanded = expandedProjectionNodes.has(row.task.task_id)}
           {@const statusIcon = getProjectionStatusIcon(row.task.status)}
@@ -1080,7 +1116,7 @@
                 type="button"
                 class="tg-tree-toggle"
                 class:expanded={isExpanded}
-                aria-label={isExpanded ? '折叠任务' : '展开任务'}
+                aria-label={isExpanded ? i18n.t('tasks.troubleshooting.collapseTask') : i18n.t('tasks.troubleshooting.expandTask')}
                 onclick={() => toggleProjectionNode(row.task.task_id)}
               >
                 <Icon name="chevron-right" size={12} />
@@ -1116,8 +1152,8 @@
               <button
                 type="button"
                 class="tg-tree-detail-btn"
-                title="查看任务详情"
-                aria-label="查看任务详情"
+                title={i18n.t('tasks.detail.viewTitle')}
+                aria-label={i18n.t('tasks.detail.viewTitle')}
                 onclick={() => selectProjectionTask(row.task.task_id)}
               >
                 <Icon name="info" size={11} />
@@ -1128,7 +1164,7 @@
       </div>
 
       {#if selectedProjectionTask}
-        <section class="task-detail-card" aria-label="任务详情">
+        <section class="task-detail-card" aria-label={i18n.t('tasks.detail.title')}>
           <div class="task-detail-top">
             <span class="task-detail-title">{getTaskDisplayTitle(selectedProjectionTask)}</span>
             <div class="task-detail-actions">
@@ -1138,8 +1174,8 @@
               <button
                 type="button"
                 class="task-detail-close"
-                title="关闭任务详情"
-                aria-label="关闭任务详情"
+                title={i18n.t('tasks.detail.closeTitle')}
+                aria-label={i18n.t('tasks.detail.closeTitle')}
                 onclick={() => selectTaskProjectionTask(currentSessionId, null)}
               >
                 <Icon name="close" size={11} />
@@ -1151,24 +1187,24 @@
           {/if}
           <div class="task-detail-meta">
             <span>{getTaskKindLabel(selectedProjectionTask.kind)}</span>
-            <span>路径：{getTaskLineageLabel(selectedProjectionTask)}</span>
+            <span>{i18n.t('tasks.detail.path', { path: getTaskLineageLabel(selectedProjectionTask) })}</span>
             {#if selectedProjectionExecutorDisplayName}
-              <span>执行者：{selectedProjectionExecutorDisplayName}</span>
+              <span>{i18n.t('tasks.detail.executor', { executor: selectedProjectionExecutorDisplayName })}</span>
             {/if}
             {#if selectedProjectionTask.workspace_scope}
-              <span>工作区：{selectedProjectionTask.workspace_scope}</span>
+              <span>{i18n.t('tasks.detail.workspace', { workspace: selectedProjectionTask.workspace_scope })}</span>
             {/if}
             {#if selectedProjectionTask.write_scope}
-              <span>写入范围：{selectedProjectionTask.write_scope}</span>
+              <span>{i18n.t('tasks.detail.writeScope', { scope: selectedProjectionTask.write_scope })}</span>
             {/if}
             {#if selectedProjectionTask.retry_count > 0}
-              <span>重试 {selectedProjectionTask.retry_count}</span>
+              <span>{i18n.t('tasks.detail.retryCount', { count: selectedProjectionTask.retry_count })}</span>
             {/if}
           </div>
           {#if selectedProjectionTask.status === 'failed'}
             <div class="task-detail-blocker">
               <Icon name="alert-circle" size={12} />
-              <span>这个任务没有完成。优先回到进度区继续或重新执行；需要定位链路时再查看这里的父子任务关系。</span>
+              <span>{i18n.t('tasks.detail.failedHint')}</span>
             </div>
           {/if}
           {#if selectedProjectionReferenceGroups.length > 0}
