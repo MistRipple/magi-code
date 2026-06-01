@@ -198,6 +198,9 @@ impl StdioMcpBridgeClient {
                 self.config.command
             ))
         })?;
+        if let Some(stderr) = child.stderr.take() {
+            spawn_mcp_stderr_drain(stderr);
+        }
 
         let mut conn = McpConnection {
             child,
@@ -485,6 +488,22 @@ fn mcp_transport_error(message: String) -> BridgeClientError {
         code: None,
         message,
     }
+}
+
+fn spawn_mcp_stderr_drain(stderr: std::process::ChildStderr) {
+    let _ = std::thread::Builder::new()
+        .name("magi-mcp-stderr-drain".to_string())
+        .spawn(move || {
+            let mut reader = BufReader::new(stderr);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        });
 }
 
 fn read_non_empty_env(key: &str) -> Option<String> {
