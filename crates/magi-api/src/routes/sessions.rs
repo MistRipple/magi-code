@@ -1218,7 +1218,7 @@ async fn submit_regular_session_turn(
         .and_then(|turn| {
             turn.items
                 .iter()
-                .find(|item| item.item_id == assistant_placeholder_item_id)
+                .find(|item| item.item_id == user_message_item_id)
         })
         .cloned();
     let event_id = publish_regular_session_turn_accepted_event(
@@ -1229,7 +1229,7 @@ async fn submit_regular_session_turn(
         created_session,
         decision.route,
         accepted_canonical_turn.as_ref(),
-        Some(&assistant_placeholder_item_id),
+        Some(&user_message_item_id),
     )?;
     let prompt = decision
         .tool_intent
@@ -3696,7 +3696,7 @@ mod tests {
     /// 新契约：
     /// - canonical_turn.items 在 accept 时只包含 user_message（不再预先 push 占位）
     /// - placeholder_message_id 仍透传给下游（用于首帧 upsert 时复用 item_id）
-    /// - canonical_item 此时为空，前端 normalize 兼容
+    /// - canonical_item 指向已接受的 user_message，不再指向尚未创建的 assistant 占位
     #[tokio::test]
     async fn regular_session_turn_accept_does_not_pre_reserve_assistant_placeholder_item() {
         let state = test_state();
@@ -3764,10 +3764,14 @@ mod tests {
         assert_eq!(items.len(), 1, "accept 阶段不应预占 assistant item");
         assert_eq!(items[0]["itemId"], "user-canonical-first-frame");
         assert_eq!(items[0]["kind"], "user_message");
-        // canonical_item 此时找不到（item 尚未创建），载荷为 null。
-        assert!(
-            accepted_event.payload["canonical_item"].is_null(),
-            "canonical_item 在 accept 阶段应为空，等待首帧创建"
+        // canonical_item 指向已接受的 user_message；assistant item 仍等待首帧创建。
+        assert_eq!(
+            accepted_event.payload["canonical_item"]["itemId"],
+            "user-canonical-first-frame"
+        );
+        assert_eq!(
+            accepted_event.payload["canonical_item"]["kind"],
+            "user_message"
         );
     }
 
@@ -3837,6 +3841,25 @@ mod tests {
             "data:image/png;base64,AAA"
         );
         assert_eq!(user_item.metadata["images"][0]["name"], "paste.png");
+        assert_eq!(
+            response
+                .canonical_item
+                .as_ref()
+                .expect("accepted response should carry user image item")
+                .metadata["images"][0]["dataUrl"],
+            "data:image/png;base64,AAA"
+        );
+        let accepted_event = state
+            .event_bus
+            .snapshot()
+            .recent_events
+            .into_iter()
+            .find(|event| event.event_id.to_string() == response.event_id)
+            .expect("accepted event should be published");
+        assert_eq!(
+            accepted_event.payload["canonical_item"]["metadata"]["images"][0]["dataUrl"],
+            "data:image/png;base64,AAA"
+        );
     }
 
     #[tokio::test]
