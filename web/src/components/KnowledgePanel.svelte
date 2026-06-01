@@ -74,6 +74,8 @@
   let isLoading = $state(false);
   let hasRequestedKnowledge = $state(false);
   let lastWorkspaceKey = $state('');
+  let knowledgeWorkspaceGeneration = 0;
+  let knowledgeLoadRequestSeq = 0;
   let loadError = $state('');
   let codeIndex = $state<CodeIndex | null>(null);
   let codeIndexStatus = $state<CodeIndexStatus | null>(null);
@@ -313,6 +315,7 @@
 
   async function saveEditor() {
     if (!editorKind || isSaving) return;
+    const request = currentKnowledgeWorkspaceRequest();
     const title = formTitle.trim();
     const content = formContent.trim();
     const context = formContext.trim();
@@ -380,13 +383,21 @@
           vscode.postMessage(addPayload);
         }
       }
+      if (!isCurrentKnowledgeWorkspaceRequest(request)) {
+        return;
+      }
       closeEditor();
       refresh();
     } catch (error) {
+      if (!isCurrentKnowledgeWorkspaceRequest(request)) {
+        return;
+      }
       console.warn('[KnowledgePanel] save knowledge item failed:', error);
       formError = i18n.t('knowledge.form.saveFailed');
     } finally {
-      isSaving = false;
+      if (isCurrentKnowledgeWorkspaceRequest(request)) {
+        isSaving = false;
+      }
     }
   }
 
@@ -495,14 +506,52 @@
       : i18n.t('knowledge.overview.indexEmptyHint');
   }
 
-  function handleKnowledgeLoadError(error: unknown) {
+  interface KnowledgeWorkspaceRequest {
+    workspaceKey: string;
+    workspaceGeneration: number;
+  }
+
+  interface KnowledgeLoadRequest extends KnowledgeWorkspaceRequest {
+    loadSeq: number;
+  }
+
+  function currentKnowledgeWorkspaceRequest(): KnowledgeWorkspaceRequest {
+    return {
+      workspaceKey: currentWorkspaceKey,
+      workspaceGeneration: knowledgeWorkspaceGeneration,
+    };
+  }
+
+  function nextKnowledgeLoadRequest(): KnowledgeLoadRequest {
+    return {
+      ...currentKnowledgeWorkspaceRequest(),
+      loadSeq: ++knowledgeLoadRequestSeq,
+    };
+  }
+
+  function isCurrentKnowledgeWorkspaceRequest(request: KnowledgeWorkspaceRequest): boolean {
+    return request.workspaceGeneration === knowledgeWorkspaceGeneration
+      && request.workspaceKey === currentWorkspaceKey;
+  }
+
+  function isCurrentKnowledgeLoadRequest(request: KnowledgeLoadRequest): boolean {
+    return request.loadSeq === knowledgeLoadRequestSeq && isCurrentKnowledgeWorkspaceRequest(request);
+  }
+
+  function handleKnowledgeLoadError(error: unknown, request: KnowledgeLoadRequest) {
+    if (!isCurrentKnowledgeLoadRequest(request)) {
+      return;
+    }
     clearKnowledgeContent();
     console.warn('[KnowledgePanel] load project knowledge failed:', error);
     loadError = i18n.t('knowledge.toast.loadFailed');
     isLoading = false;
   }
 
-  function handleKnowledgeMutationError(error: unknown, messageKey: string) {
+  function handleKnowledgeMutationError(error: unknown, messageKey: string, request: KnowledgeWorkspaceRequest) {
+    if (!isCurrentKnowledgeWorkspaceRequest(request)) {
+      return;
+    }
     console.warn('[KnowledgePanel] project knowledge mutation failed:', error);
     loadError = i18n.t(messageKey);
     isLoading = false;
@@ -522,10 +571,9 @@
     vscode.postMessage({ type: 'loadSettingsBootstrap', force: true });
   }
 
-  async function fetchKnowledgeViaApi() {
-    const requestWorkspaceKey = currentWorkspaceKey;
+  async function fetchKnowledgeViaApi(request: KnowledgeLoadRequest) {
     const res = await getAgentProjectKnowledge();
-    if (requestWorkspaceKey !== currentWorkspaceKey) {
+    if (!isCurrentKnowledgeLoadRequest(request)) {
       return;
     }
     if (!applyKnowledgePayload(res)) {
@@ -536,11 +584,13 @@
   }
 
   function requestKnowledgeLoad() {
+    const request = nextKnowledgeLoadRequest();
     hasRequestedKnowledge = true;
     isLoading = true;
     loadError = '';
     if (isWebMode) {
-      fetchKnowledgeViaApi().catch(handleKnowledgeLoadError);
+      fetchKnowledgeViaApi(request)
+        .catch((error) => handleKnowledgeLoadError(error, request));
     } else {
       vscode.postMessage({ type: 'getProjectKnowledge' });
     }
@@ -578,10 +628,15 @@
   }
 
   function deleteKnowledgeEntry(id: string) {
+    const request = currentKnowledgeWorkspaceRequest();
     if (isWebMode) {
       deleteAgentKnowledgeItem(id)
-        .then(() => refresh())
-        .catch((error) => handleKnowledgeMutationError(error, 'knowledge.toast.deleteFailed'));
+        .then(() => {
+          if (isCurrentKnowledgeWorkspaceRequest(request)) {
+            refresh();
+          }
+        })
+        .catch((error) => handleKnowledgeMutationError(error, 'knowledge.toast.deleteFailed', request));
     } else {
       vscode.postMessage({ type: 'deleteKnowledgeItem', knowledgeId: id });
     }
@@ -596,12 +651,17 @@
   }
 
   function executeClear() {
+    const request = currentKnowledgeWorkspaceRequest();
     showClearConfirm = false;
     isLoading = true;
     if (isWebMode) {
       clearAgentProjectKnowledge()
-        .then(() => refresh())
-        .catch((error) => handleKnowledgeMutationError(error, 'knowledge.toast.clearFailed'));
+        .then(() => {
+          if (isCurrentKnowledgeWorkspaceRequest(request)) {
+            refresh();
+          }
+        })
+        .catch((error) => handleKnowledgeMutationError(error, 'knowledge.toast.clearFailed', request));
     } else {
       vscode.postMessage({ type: 'clearProjectKnowledge' });
     }
@@ -613,6 +673,8 @@
       return;
     }
     lastWorkspaceKey = nextWorkspaceKey;
+    knowledgeWorkspaceGeneration += 1;
+    knowledgeLoadRequestSeq += 1;
     hasRequestedKnowledge = false;
     isLoading = false;
     loadError = '';

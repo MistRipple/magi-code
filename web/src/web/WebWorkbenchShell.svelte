@@ -2373,6 +2373,10 @@
     box-shadow: var(--shadow-lg);
   }
 
+  .web-workbench-shell--preview-overlay :global(.header-bar) {
+    z-index: calc(var(--z-overlay-preview) + 1);
+  }
+
   .mobile-toolbar {
     display: none;
   }
