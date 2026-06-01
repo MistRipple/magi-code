@@ -1,12 +1,46 @@
 use crate::{errors::ApiError, state::ApiState};
 use magi_core::{SessionId, WorkspaceId};
 use magi_session_store::SessionRecord;
+use magi_tool_runtime::ToolExecutionContext;
+use std::path::PathBuf;
 
 #[derive(Clone, Debug)]
 pub(super) struct SessionWorkspaceScope {
     pub session_id: SessionId,
     pub workspace_id: WorkspaceId,
     pub workspace_path: String,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct OptionalSessionWorkspaceScope {
+    session_id: Option<SessionId>,
+    workspace_id: Option<WorkspaceId>,
+    workspace_path: Option<PathBuf>,
+}
+
+impl OptionalSessionWorkspaceScope {
+    pub(super) fn tool_context(&self) -> ToolExecutionContext {
+        ToolExecutionContext {
+            session_id: self.session_id.clone(),
+            workspace_id: self.workspace_id.clone(),
+            working_directory: self.workspace_path.clone(),
+            ..ToolExecutionContext::default()
+        }
+    }
+
+    pub(super) fn workspace_id_string(&self) -> String {
+        self.workspace_id
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_default()
+    }
+
+    pub(super) fn workspace_path_string(&self) -> String {
+        self.workspace_path
+            .as_ref()
+            .map(|path| path.to_string_lossy().to_string())
+            .unwrap_or_default()
+    }
 }
 
 pub(super) fn parse_session_id(value: Option<&str>) -> Result<SessionId, ApiError> {
@@ -89,6 +123,39 @@ pub(super) fn require_session_record_in_workspace(
         .ok_or_else(|| ApiError::session_not_found(session_id.as_str()))?;
     require_session_workspace_match(state, &session, requested_workspace_id)?;
     Ok(session)
+}
+
+pub(super) fn resolve_optional_session_workspace_scope(
+    state: &ApiState,
+    session_id_value: Option<&str>,
+    requested_workspace_id_value: Option<&str>,
+    requested_workspace_path_value: Option<&str>,
+) -> Result<OptionalSessionWorkspaceScope, ApiError> {
+    let requested_workspace_path = trimmed_non_empty(requested_workspace_path_value);
+    let requested_workspace_id = state.resolve_workspace_id_from_request(
+        trimmed_non_empty(requested_workspace_id_value).map(WorkspaceId::new),
+        requested_workspace_path,
+    );
+    let session_id = trimmed_non_empty(session_id_value).map(SessionId::new);
+    let workspace_id = match session_id.as_ref() {
+        Some(session_id) => {
+            let session = state
+                .session_store
+                .session(session_id)
+                .ok_or_else(|| ApiError::session_not_found(session_id.as_str()))?;
+            resolve_session_workspace_binding(state, &session, requested_workspace_id.as_ref())?
+        }
+        None => requested_workspace_id,
+    };
+    let workspace_path = workspace_id
+        .as_ref()
+        .and_then(|workspace_id| state.workspace_root_path(&Some(workspace_id.clone())));
+
+    Ok(OptionalSessionWorkspaceScope {
+        session_id,
+        workspace_id,
+        workspace_path,
+    })
 }
 
 pub(super) fn session_workspace_id(

@@ -3,11 +3,9 @@ use axum::{
     extract::{Query, State},
     routing::get,
 };
-use magi_core::{SessionId, WorkspaceId};
-use magi_tool_runtime::ToolExecutionContext;
 use serde::Deserialize;
-use std::path::PathBuf;
 
+use super::session_scope;
 use crate::{errors::ApiError, state::ApiState};
 
 pub fn routes() -> Router<ApiState> {
@@ -39,7 +37,7 @@ async fn get_tool_catalog(
     State(state): State<ApiState>,
     Query(query): Query<ToolCatalogQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let context = query.tool_context();
+    let context = query.tool_context(&state)?;
     let input = query.catalog_input();
     Ok(Json(state.tool_catalog_json(&input.to_string(), &context)?))
 }
@@ -55,18 +53,18 @@ impl ToolCatalogQuery {
         })
     }
 
-    fn tool_context(&self) -> ToolExecutionContext {
-        ToolExecutionContext {
-            session_id: trimmed_non_empty(self.session_id.as_deref()).map(SessionId::new),
-            workspace_id: trimmed_non_empty(self.workspace_id.as_deref()).map(WorkspaceId::new),
-            working_directory: trimmed_non_empty(self.workspace_path.as_deref()).map(PathBuf::from),
-            ..ToolExecutionContext::default()
-        }
+    fn tool_context(
+        &self,
+        state: &ApiState,
+    ) -> Result<magi_tool_runtime::ToolExecutionContext, ApiError> {
+        Ok(session_scope::resolve_optional_session_workspace_scope(
+            state,
+            self.session_id.as_deref(),
+            self.workspace_id.as_deref(),
+            self.workspace_path.as_deref(),
+        )?
+        .tool_context())
     }
-}
-
-fn trimmed_non_empty(value: Option<&str>) -> Option<&str> {
-    value.map(str::trim).filter(|value| !value.is_empty())
 }
 
 #[cfg(test)]
@@ -76,6 +74,7 @@ mod tests {
         body::{Body, to_bytes},
         http::{Request, StatusCode},
     };
+    use magi_core::{AbsolutePath, SessionId, WorkspaceId};
     use magi_event_bus::InMemoryEventBus;
     use magi_governance::GovernanceService;
     use magi_session_store::SessionStore;
@@ -87,13 +86,20 @@ mod tests {
     fn test_state_with_tool_registry() -> ApiState {
         let event_bus = Arc::new(InMemoryEventBus::new(32));
         let governance = Arc::new(GovernanceService::default());
+        let workspace_store = Arc::new(WorkspaceStore::default());
+        workspace_store
+            .register(
+                WorkspaceId::new("workspace-tools"),
+                AbsolutePath::new("/tmp/magi-tools-test-workspace"),
+            )
+            .expect("workspace should register");
         let mut tool_registry = ToolRegistry::new(Arc::clone(&governance), Arc::clone(&event_bus));
         tool_registry.register_default_builtins();
         ApiState::new(
             "magi-tools-test",
             event_bus,
             Arc::new(SessionStore::default()),
-            Arc::new(WorkspaceStore::default()),
+            workspace_store,
             governance,
         )
         .with_tool_registry(tool_registry)
@@ -125,9 +131,16 @@ mod tests {
 
     #[tokio::test]
     async fn tools_catalog_route_reuses_tool_registry_health_source() {
-        let app = Router::new()
-            .merge(routes())
-            .with_state(test_state_with_tool_registry());
+        let state = test_state_with_tool_registry();
+        state
+            .session_store
+            .create_session_for_workspace(
+                SessionId::new("session-tools"),
+                "工具诊断会话",
+                Some("workspace-tools".to_string()),
+            )
+            .expect("session should create");
+        let app = Router::new().merge(routes()).with_state(state);
 
         let (status, body) = get_json(
             app,
@@ -175,5 +188,44 @@ mod tests {
             .expect("internal tool should be present when requested");
         assert_eq!(process_launch["public"], false);
         assert_eq!(process_launch["parameters_schema"]["type"], "object");
+    }
+
+    #[tokio::test]
+    async fn tools_catalog_route_rejects_workspace_mismatched_session_scope() {
+        let state = test_state_with_tool_registry();
+        let workspace_a = WorkspaceId::new("workspace-tools");
+        let workspace_b = WorkspaceId::new("workspace-tools-b");
+        state
+            .workspace_registry
+            .register(
+                workspace_b.clone(),
+                AbsolutePath::new("/tmp/magi-tools-test-workspace-b"),
+            )
+            .expect("workspace B should register");
+        let session_b = SessionId::new("session-tools-b");
+        state
+            .session_store
+            .create_session_for_workspace(
+                session_b.clone(),
+                "B 会话",
+                Some(workspace_b.to_string()),
+            )
+            .expect("session should create");
+        let app = Router::new().merge(routes()).with_state(state);
+
+        let (status, body) = get_json(
+            app,
+            &format!(
+                "/tools/catalog?workspaceId={}&sessionId={}",
+                workspace_a, session_b
+            ),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            body.to_string().contains("不属于 workspace"),
+            "mismatched scope should be rejected by backend authority: {body}"
+        );
     }
 }

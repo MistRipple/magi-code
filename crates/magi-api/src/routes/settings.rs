@@ -4,8 +4,7 @@ use axum::{
     routing::{get, post},
 };
 use magi_bridge_client::HttpModelBridgeProtocol;
-use magi_core::{SessionId, UtcMillis, WorkspaceId};
-use magi_tool_runtime::ToolExecutionContext;
+use magi_core::UtcMillis;
 use magi_usage_authority::{
     SessionSummary, UsageAuthority, UsageCallRecordInput, UsageModelSnapshot, UsageTotals,
 };
@@ -13,8 +12,8 @@ use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
 
+use super::session_scope;
 use crate::{errors::ApiError, model_config::NormalizedModelConfig, state::ApiState};
 
 fn unwrap_settings_section_request(request: &serde_json::Value) -> serde_json::Value {
@@ -642,37 +641,36 @@ pub(crate) fn registered_role_template_ids(state: &ApiState) -> Vec<String> {
 async fn settings_bootstrap(
     State(state): State<ApiState>,
     Query(query): Query<HashMap<String, String>>,
-) -> Json<serde_json::Value> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let hydrate_mcp_servers = query
         .get("scope")
         .map(|value| value.trim())
         .is_none_or(|scope| scope != "core");
-    let tool_context = settings_bootstrap_tool_context(&query);
-    let workspace_id =
-        parse_optional_query_string(&query, "workspaceId", "workspace_id").unwrap_or_default();
-    let workspace_path =
-        parse_optional_query_string(&query, "workspacePath", "workspace_path").unwrap_or_default();
+    let session_id = parse_optional_query_string(&query, "sessionId", "session_id");
+    let workspace_id = parse_optional_query_string(&query, "workspaceId", "workspace_id");
+    let workspace_path = parse_optional_query_string(&query, "workspacePath", "workspace_path");
+    let scope = session_scope::resolve_optional_session_workspace_scope(
+        &state,
+        session_id.as_deref(),
+        workspace_id.as_deref(),
+        workspace_path.as_deref(),
+    )?;
+    let tool_context = scope.tool_context();
     let mut snapshot = state.settings_snapshot_json_with_mcp_hydration_and_tool_context(
         hydrate_mcp_servers,
         &tool_context,
     );
     if let Some(object) = snapshot.as_object_mut() {
-        object.insert("workspaceId".to_string(), Value::String(workspace_id));
-        object.insert("workspacePath".to_string(), Value::String(workspace_path));
+        object.insert(
+            "workspaceId".to_string(),
+            Value::String(scope.workspace_id_string()),
+        );
+        object.insert(
+            "workspacePath".to_string(),
+            Value::String(scope.workspace_path_string()),
+        );
     }
-    Json(snapshot)
-}
-
-fn settings_bootstrap_tool_context(query: &HashMap<String, String>) -> ToolExecutionContext {
-    ToolExecutionContext {
-        session_id: parse_optional_query_string(query, "sessionId", "session_id")
-            .map(SessionId::new),
-        workspace_id: parse_optional_query_string(query, "workspaceId", "workspace_id")
-            .map(WorkspaceId::new),
-        working_directory: parse_optional_query_string(query, "workspacePath", "workspace_path")
-            .map(PathBuf::from),
-        ..ToolExecutionContext::default()
-    }
+    Ok(Json(snapshot))
 }
 
 async fn runtime_status(State(state): State<ApiState>) -> Json<serde_json::Value> {
@@ -1184,7 +1182,7 @@ async fn reset_stats(
 mod tests {
     use super::*;
     use axum::http::StatusCode;
-    use magi_core::{EventId, SessionId, WorkspaceId};
+    use magi_core::{AbsolutePath, EventId, SessionId, WorkspaceId};
     use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
     use magi_governance::GovernanceService;
     use magi_session_store::SessionStore;
@@ -1385,20 +1383,32 @@ mod tests {
     #[tokio::test]
     async fn settings_bootstrap_returns_frontend_contract_sections() {
         let state = test_state();
+        let workspace_id = WorkspaceId::new("workspace-contract");
+        let workspace_path = "/tmp/magi-settings-contract";
+        state
+            .workspace_registry
+            .register(workspace_id.clone(), AbsolutePath::new(workspace_path))
+            .expect("workspace should register");
         let session_id = SessionId::new("session-empty-contract");
+        state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "设置契约会话",
+                Some(workspace_id.to_string()),
+            )
+            .expect("session should create");
 
         let bootstrap = settings_bootstrap(
             State(state),
             Query(HashMap::from([
                 ("sessionId".to_string(), session_id.as_str().to_string()),
-                ("workspaceId".to_string(), "workspace-contract".to_string()),
-                (
-                    "workspacePath".to_string(),
-                    "/tmp/magi-settings-contract".to_string(),
-                ),
+                ("workspaceId".to_string(), workspace_id.to_string()),
+                ("workspacePath".to_string(), workspace_path.to_string()),
             ])),
         )
         .await
+        .expect("settings bootstrap should build")
         .0;
         let object = bootstrap
             .as_object()
@@ -1637,6 +1647,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn settings_bootstrap_resolves_workspace_from_registered_path() {
+        let state = test_state();
+        let workspace_id = WorkspaceId::new("workspace-settings-registered");
+        let workspace_path = "/tmp/magi-settings-registered";
+        state
+            .workspace_registry
+            .register(workspace_id.clone(), AbsolutePath::new(workspace_path))
+            .expect("workspace should register");
+
+        let bootstrap = settings_bootstrap(
+            State(state),
+            Query(HashMap::from([
+                (
+                    "workspaceId".to_string(),
+                    "workspace-stale-query".to_string(),
+                ),
+                ("workspacePath".to_string(), workspace_path.to_string()),
+            ])),
+        )
+        .await
+        .expect("settings bootstrap should build")
+        .0;
+
+        assert_eq!(bootstrap["workspaceId"], json!(workspace_id.as_str()));
+        assert_eq!(bootstrap["workspacePath"], json!(workspace_path));
+    }
+
+    #[tokio::test]
+    async fn settings_bootstrap_rejects_workspace_mismatched_session_scope() {
+        let state = test_state();
+        let workspace_a = WorkspaceId::new("workspace-settings-a");
+        let workspace_b = WorkspaceId::new("workspace-settings-b");
+        state
+            .workspace_registry
+            .register(
+                workspace_a.clone(),
+                AbsolutePath::new("/tmp/magi-settings-a"),
+            )
+            .expect("workspace A should register");
+        state
+            .workspace_registry
+            .register(
+                workspace_b.clone(),
+                AbsolutePath::new("/tmp/magi-settings-b"),
+            )
+            .expect("workspace B should register");
+        let session_b = SessionId::new("session-settings-b");
+        state
+            .session_store
+            .create_session_for_workspace(
+                session_b.clone(),
+                "B 会话",
+                Some(workspace_b.to_string()),
+            )
+            .expect("session should create");
+
+        let result = settings_bootstrap(
+            State(state),
+            Query(HashMap::from([
+                ("workspaceId".to_string(), workspace_a.to_string()),
+                ("sessionId".to_string(), session_b.to_string()),
+            ])),
+        )
+        .await;
+
+        match result {
+            Err(ApiError::InvalidInput(message)) => {
+                assert!(
+                    message.contains("不属于 workspace"),
+                    "settings bootstrap should reject mismatched scope: {message}"
+                );
+            }
+            other => panic!("unexpected settings bootstrap result: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
     async fn settings_bootstrap_preserves_anthropic_model_providers() {
         let state = test_state();
         state.settings_store.set_section(
@@ -1675,6 +1762,7 @@ mod tests {
 
         let bootstrap = settings_bootstrap(State(state), Query(HashMap::new()))
             .await
+            .expect("settings bootstrap should build")
             .0;
 
         assert_eq!(
@@ -1721,6 +1809,7 @@ mod tests {
 
         let bootstrap = settings_bootstrap(State(state.clone()), Query(HashMap::new()))
             .await
+            .expect("settings bootstrap should build")
             .0;
 
         assert_eq!(
@@ -1771,6 +1860,7 @@ mod tests {
 
         let bootstrap = settings_bootstrap(State(state), Query(HashMap::new()))
             .await
+            .expect("settings bootstrap should build")
             .0;
         let servers = bootstrap["mcpServers"]
             .as_array()
@@ -1811,6 +1901,7 @@ mod tests {
 
         let bootstrap = settings_bootstrap(State(state), Query(HashMap::new()))
             .await
+            .expect("settings bootstrap should build")
             .0;
 
         assert_eq!(
@@ -1827,6 +1918,7 @@ mod tests {
             Query(HashMap::from([("scope".to_string(), "core".to_string())])),
         )
         .await
+        .expect("settings bootstrap should build")
         .0;
 
         assert_eq!(bootstrap["bootstrapScope"], json!("core"));
@@ -2092,6 +2184,14 @@ mod tests {
         let state = test_state();
         let session_a = SessionId::new("session-a");
         let session_b = SessionId::new("session-b");
+        state
+            .session_store
+            .create_session(session_a.clone(), "A 会话")
+            .expect("session A should create");
+        state
+            .session_store
+            .create_session(session_b.clone(), "B 会话")
+            .expect("session B should create");
 
         let user_rules_payload = serde_json::json!({
             "userRules": "【全局生效】"
@@ -2161,6 +2261,7 @@ mod tests {
             )])),
         )
         .await
+        .expect("settings bootstrap A should build")
         .0;
         let bootstrap_b = settings_bootstrap(
             State(state.clone()),
@@ -2170,6 +2271,7 @@ mod tests {
             )])),
         )
         .await
+        .expect("settings bootstrap B should build")
         .0;
 
         assert_eq!(
