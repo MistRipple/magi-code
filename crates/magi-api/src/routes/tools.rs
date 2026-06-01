@@ -228,4 +228,76 @@ mod tests {
             "mismatched scope should be rejected by backend authority: {body}"
         );
     }
+
+    #[tokio::test]
+    async fn tools_catalog_route_resolves_workspace_from_registered_path_when_query_id_is_stale() {
+        let state = test_state_with_tool_registry();
+        let workspace_path = "/tmp/magi-tools-test-workspace";
+        let session_id = SessionId::new("session-tools-path-authority");
+        state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "路径权威工具诊断",
+                Some("workspace-tools".to_string()),
+            )
+            .expect("session should create");
+        let app = Router::new().merge(routes()).with_state(state);
+
+        let (status, body) = get_json(
+            app,
+            &format!(
+                "/tools/catalog?workspaceId=workspace-stale-query&workspacePath={}&sessionId={}",
+                workspace_path,
+                session_id.as_str()
+            ),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "succeeded");
+        assert_eq!(
+            body["runtime_dependencies"][1]["workspace_id"],
+            "workspace-tools"
+        );
+    }
+
+    #[tokio::test]
+    async fn tools_catalog_route_rejects_session_when_path_resolves_other_workspace() {
+        let state = test_state_with_tool_registry();
+        let workspace_b = WorkspaceId::new("workspace-tools-path-b");
+        state
+            .workspace_registry
+            .register(
+                workspace_b.clone(),
+                AbsolutePath::new("/tmp/magi-tools-test-workspace-path-b"),
+            )
+            .expect("workspace B should register");
+        let session_b = SessionId::new("session-tools-path-b");
+        state
+            .session_store
+            .create_session_for_workspace(
+                session_b.clone(),
+                "B 会话",
+                Some(workspace_b.to_string()),
+            )
+            .expect("session should create");
+        let app = Router::new().merge(routes()).with_state(state);
+
+        let (status, body) = get_json(
+            app,
+            &format!(
+                "/tools/catalog?workspaceId={}&workspacePath=/tmp/magi-tools-test-workspace&sessionId={}",
+                workspace_b,
+                session_b.as_str()
+            ),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            body.to_string().contains("不属于 workspace"),
+            "path authority should still reject session/workspace mismatch: {body}"
+        );
+    }
 }
