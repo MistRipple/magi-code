@@ -172,13 +172,15 @@ async fn version(State(state): State<ApiState>) -> Json<VersionHandshakeDto> {
 struct EventStreamQuery {
     #[serde(rename = "workspaceId", alias = "workspace_id")]
     workspace_id: Option<String>,
+    #[serde(rename = "workspacePath", alias = "workspace_path")]
+    workspace_path: Option<String>,
 }
 
 async fn stream_events(
     State(state): State<ApiState>,
     Query(query): Query<EventStreamQuery>,
 ) -> impl axum::response::IntoResponse {
-    sse::events(state, query.workspace_id).await
+    sse::events(state, query.workspace_id, query.workspace_path).await
 }
 
 #[cfg(test)]

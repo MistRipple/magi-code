@@ -13,11 +13,12 @@ use tokio_stream::wrappers::{BroadcastStream, errors::BroadcastStreamRecvError};
 
 use crate::state::ApiState;
 
-pub async fn events(state: ApiState, workspace_id: Option<String>) -> Response {
-    let workspace_id = workspace_id
-        .map(|workspace_id| workspace_id.trim().to_string())
-        .filter(|workspace_id| !workspace_id.is_empty())
-        .map(|workspace_id| WorkspaceId::new(workspace_id));
+pub async fn events(
+    state: ApiState,
+    workspace_id: Option<String>,
+    workspace_path: Option<String>,
+) -> Response {
+    let workspace_id = resolve_event_stream_workspace_id(&state, workspace_id, workspace_path);
     let stream = event_envelope_stream(state, workspace_id)
         .map(|event| Ok::<Event, Infallible>(event_to_sse(event)));
 
@@ -38,6 +39,31 @@ pub async fn events(state: ApiState, workspace_id: Option<String>) -> Response {
         HeaderValue::from_static("no"),
     );
     response
+}
+
+fn resolve_event_stream_workspace_id(
+    state: &ApiState,
+    workspace_id: Option<String>,
+    workspace_path: Option<String>,
+) -> Option<WorkspaceId> {
+    let requested_workspace_id = workspace_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|workspace_id| !workspace_id.is_empty());
+    let requested_workspace_path = workspace_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|workspace_path| !workspace_path.is_empty());
+    if requested_workspace_id.is_none() && requested_workspace_path.is_none() {
+        return None;
+    }
+    state
+        .resolve_workspace_id_from_request(
+            requested_workspace_id.map(WorkspaceId::new),
+            requested_workspace_path,
+        )
+        .or_else(|| requested_workspace_id.map(WorkspaceId::new))
+        .or_else(|| Some(WorkspaceId::new("__unresolved_event_stream_workspace__")))
 }
 
 fn event_envelope_stream(
@@ -137,7 +163,7 @@ fn lagged_recovery_event(skipped: u64, workspace_id: Option<&WorkspaceId>) -> Ev
 #[cfg(test)]
 mod tests {
     use super::*;
-    use magi_core::{EventId, SessionId};
+    use magi_core::{AbsolutePath, EventId, SessionId};
     use magi_event_bus::{EventContext, InMemoryEventBus};
     use magi_governance::GovernanceService;
     use magi_session_store::SessionStore;
@@ -165,7 +191,7 @@ mod tests {
 
     #[tokio::test]
     async fn events_response_disables_proxy_buffering() {
-        let response = events(test_state(), Some("workspace-a".to_string())).await;
+        let response = events(test_state(), Some("workspace-a".to_string()), None).await;
 
         assert_eq!(
             response.headers().get(header::CACHE_CONTROL),
@@ -285,6 +311,58 @@ mod tests {
             &state,
             &mismatched_event,
             Some(&requested)
+        ));
+    }
+
+    #[test]
+    fn event_stream_scope_resolves_workspace_from_registered_path_when_id_is_stale() {
+        let state = test_state();
+        let workspace_a = workspace_id("workspace-sse-path-a");
+        let workspace_b = workspace_id("workspace-sse-path-b");
+        state
+            .workspace_registry
+            .register(
+                workspace_a.clone(),
+                AbsolutePath::new("/tmp/magi-sse-path-a"),
+            )
+            .expect("workspace A should register");
+        state
+            .workspace_registry
+            .register(
+                workspace_b.clone(),
+                AbsolutePath::new("/tmp/magi-sse-path-b"),
+            )
+            .expect("workspace B should register");
+
+        let resolved = resolve_event_stream_workspace_id(
+            &state,
+            Some(workspace_b.to_string()),
+            Some("/tmp/magi-sse-path-a".to_string()),
+        );
+
+        assert_eq!(resolved, Some(workspace_a));
+    }
+
+    #[test]
+    fn event_stream_scope_keeps_unknown_path_restricted() {
+        let state = test_state();
+        let resolved = resolve_event_stream_workspace_id(
+            &state,
+            None,
+            Some("/tmp/magi-sse-missing-path".to_string()),
+        )
+        .expect("unknown explicit path should still produce a restrictive scope");
+
+        let unscoped_event = EventEnvelope::domain(
+            EventId::new("event-sse-unknown-path-unscoped"),
+            "message.created",
+            json!({ "content": "unscoped" }),
+        );
+
+        assert!(!event_matches_workspace(
+            &state,
+            &unscoped_event,
+            Some(&resolved)
         ));
     }
 
