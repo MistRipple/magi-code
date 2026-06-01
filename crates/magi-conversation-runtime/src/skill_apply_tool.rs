@@ -6,6 +6,10 @@ pub const SKILL_APPLY_TOOL_NAME: &str = "skill_apply";
 
 const SKILL_APPLY_TOOL_DESCRIPTION: &str =
     "Load and apply a named skill for specialized task execution";
+const SKILL_APPLY_UNAVAILABLE_PUBLIC_ERROR: &str = "Skill 能力暂不可用，请稍后重试";
+const SKILL_APPLY_INVALID_ARGUMENTS_PUBLIC_ERROR: &str = "Skill 调用参数不可用，请重新选择 Skill";
+const SKILL_APPLY_MISSING_NAME_PUBLIC_ERROR: &str = "缺少要应用的 Skill 名称";
+const SKILL_APPLY_NOT_FOUND_PUBLIC_ERROR: &str = "未找到已注册的 Skill";
 
 pub fn skill_apply_tool_definition() -> ChatToolDefinition {
     ChatToolDefinition {
@@ -36,13 +40,19 @@ pub fn execute_skill_apply_from_runtime(
     skill_runtime: Option<&SkillRuntime>,
 ) -> (String, ExecutionResultStatus) {
     let Some(skill_runtime) = skill_runtime else {
-        return skill_apply_failed("SkillRuntime 未配置，无法应用 skill", None, Vec::new());
+        return skill_apply_failed(
+            "skill_apply_unavailable",
+            SKILL_APPLY_UNAVAILABLE_PUBLIC_ERROR,
+            None,
+            Vec::new(),
+        );
     };
     let parsed = match serde_json::from_str::<serde_json::Value>(arguments) {
         Ok(value) => value,
-        Err(error) => {
+        Err(_) => {
             return skill_apply_failed(
-                format!("skill_apply 参数不是合法 JSON: {error}"),
+                "skill_apply_invalid_arguments",
+                SKILL_APPLY_INVALID_ARGUMENTS_PUBLIC_ERROR,
                 None,
                 Vec::new(),
             );
@@ -57,7 +67,12 @@ pub fn execute_skill_apply_from_runtime(
     {
         Some(value) => value,
         None => {
-            return skill_apply_failed("缺少 skill_name 字段", None, Vec::new());
+            return skill_apply_failed(
+                "skill_apply_missing_name",
+                SKILL_APPLY_MISSING_NAME_PUBLIC_ERROR,
+                None,
+                Vec::new(),
+            );
         }
     };
     let context = parsed
@@ -72,7 +87,8 @@ pub fn execute_skill_apply_from_runtime(
         .collect::<Vec<_>>();
     let Some(skill) = registry.get(skill_name) else {
         return skill_apply_failed(
-            format!("未找到已注册 skill: {skill_name}"),
+            "skill_apply_not_found",
+            SKILL_APPLY_NOT_FOUND_PUBLIC_ERROR,
             Some(skill_name),
             available_skills,
         );
@@ -115,7 +131,8 @@ pub fn execute_skill_apply_from_runtime(
 }
 
 fn skill_apply_failed(
-    error: impl Into<String>,
+    error_code: &'static str,
+    public_error: &'static str,
     skill_name: Option<&str>,
     available_skills: Vec<String>,
 ) -> (String, ExecutionResultStatus) {
@@ -123,7 +140,8 @@ fn skill_apply_failed(
         serde_json::json!({
             "tool": SKILL_APPLY_TOOL_NAME,
             "status": "failed",
-            "error": error.into(),
+            "error_code": error_code,
+            "error": public_error,
             "skill_name": skill_name,
             "available_skills": available_skills,
         })
@@ -193,9 +211,40 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&payload).expect("payload json");
         assert_eq!(parsed["tool"], SKILL_APPLY_TOOL_NAME);
         assert_eq!(parsed["status"], "failed");
+        assert_eq!(parsed["error_code"], "skill_apply_not_found");
         assert_eq!(parsed["skill_name"], "auto-review");
-        assert!(parsed["error"].as_str().unwrap().contains("auto-review"));
+        assert_eq!(parsed["error"], "未找到已注册的 Skill");
         assert!(parsed.get("search_paths").is_none());
         assert!(parsed.get("hint").is_none());
+    }
+
+    #[test]
+    fn skill_apply_failures_use_public_product_language() {
+        let (unavailable_payload, unavailable_status) =
+            execute_skill_apply_from_runtime("{}", None);
+        assert_eq!(unavailable_status, ExecutionResultStatus::Failed);
+        let unavailable: serde_json::Value =
+            serde_json::from_str(&unavailable_payload).expect("unavailable payload json");
+        assert_eq!(unavailable["error_code"], "skill_apply_unavailable");
+        assert_eq!(unavailable["error"], "Skill 能力暂不可用，请稍后重试");
+        assert!(
+            !unavailable_payload.contains("SkillRuntime"),
+            "失败信息不能暴露内部 runtime 类型名"
+        );
+
+        let runtime = make_skill_runtime();
+        let (invalid_payload, invalid_status) =
+            execute_skill_apply_from_runtime("{", Some(&runtime));
+        assert_eq!(invalid_status, ExecutionResultStatus::Failed);
+        let invalid: serde_json::Value =
+            serde_json::from_str(&invalid_payload).expect("invalid payload json");
+        assert_eq!(invalid["error_code"], "skill_apply_invalid_arguments");
+        assert_eq!(invalid["error"], "Skill 调用参数不可用，请重新选择 Skill");
+        assert!(
+            !invalid_payload.contains("expected")
+                && !invalid_payload.contains("line")
+                && !invalid_payload.contains("column"),
+            "失败信息不能暴露 JSON parser 细节"
+        );
     }
 }
