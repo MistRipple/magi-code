@@ -510,7 +510,10 @@
       ...expandedWorkspaceIds,
       [workspace.workspaceId]: true,
     };
+    messagesState.currentWorkspaceId = workspace.workspaceId;
+    messagesState.currentWorkspacePath = workspace.rootPath;
     setCurrentSessionId(null);
+    updateSessions(sessionsByWorkspace[workspace.workspaceId] ?? []);
     syncBrowserSessionBinding(workspace.workspaceId, workspace.rootPath, null);
   }
 
