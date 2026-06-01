@@ -47,12 +47,12 @@ impl InMemoryEventBus {
     }
 
     pub fn publish(&self, mut event: EventEnvelope) -> Result<u64, EventBusError> {
-        let sequence = self.sequence.fetch_add(1, Ordering::SeqCst) + 1;
-        event.sequence = sequence;
         let mut recent_events = self
             .recent_events
             .write()
             .expect("event bus recent events write lock poisoned");
+        let sequence = self.sequence.fetch_add(1, Ordering::SeqCst) + 1;
+        event.sequence = sequence;
         recent_events.push(event.clone());
         if recent_events.len() > self.retain_limit {
             let drain_count = recent_events.len() - self.retain_limit;
@@ -89,11 +89,11 @@ impl InMemoryEventBus {
             .recent_events
             .read()
             .expect("event bus recent events read lock poisoned");
+        let receiver = self.sender.subscribe();
         let snapshot = EventStreamSnapshot {
             next_sequence: self.sequence.load(Ordering::SeqCst) + 1,
             recent_events: recent_events.clone(),
         };
-        let receiver = self.sender.subscribe();
         (snapshot, receiver)
     }
 
@@ -313,7 +313,7 @@ mod tests {
     use crate::EventCategory;
     use magi_core::EventId;
     use serde_json::json;
-    use std::fs;
+    use std::{fs, thread, time::Duration};
 
     fn event(category: EventCategory, event_type: &str, sequence: u64) -> EventEnvelope {
         let mut event = match category {
@@ -373,6 +373,39 @@ mod tests {
         assert_eq!(snapshot.recent_events[0].event_type, "event.before");
         let live_event = receiver.try_recv().expect("live event should arrive");
         assert_eq!(live_event.event_type, "event.after");
+    }
+
+    #[test]
+    fn snapshot_and_subscribe_receives_publish_blocked_by_snapshot_reader() {
+        let bus = InMemoryEventBus::new(8);
+        bus.publish(event(EventCategory::Domain, "event.before", 1))
+            .expect("publish before snapshot");
+        let read_guard = bus
+            .recent_events
+            .read()
+            .expect("event bus recent events read lock should be available");
+        let (snapshot, mut receiver) = bus.snapshot_and_subscribe();
+        let publish_bus = bus.clone();
+        let publish_thread = thread::spawn(move || {
+            publish_bus
+                .publish(event(EventCategory::Domain, "event.inflight", 2))
+                .expect("blocked publish should complete after snapshot subscribes")
+        });
+        thread::sleep(Duration::from_millis(20));
+
+        assert_eq!(snapshot.next_sequence, 2);
+        assert_eq!(snapshot.recent_events.len(), 1);
+        assert_eq!(snapshot.recent_events[0].event_type, "event.before");
+        drop(read_guard);
+        let sequence = publish_thread
+            .join()
+            .expect("publish thread should not panic");
+        assert_eq!(sequence, 2);
+        let live_event = receiver
+            .try_recv()
+            .expect("in-flight event must be delivered to subscriber");
+        assert_eq!(live_event.event_type, "event.inflight");
+        assert_eq!(live_event.sequence, 2);
     }
 
     #[test]

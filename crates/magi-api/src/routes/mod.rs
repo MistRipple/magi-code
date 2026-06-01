@@ -176,6 +176,8 @@ struct EventStreamQuery {
     workspace_path: Option<String>,
     #[serde(rename = "sessionId", alias = "session_id")]
     session_id: Option<String>,
+    #[serde(rename = "afterSequence", alias = "after_sequence")]
+    after_sequence: Option<u64>,
 }
 
 async fn stream_events(
@@ -187,6 +189,7 @@ async fn stream_events(
         query.workspace_id,
         query.workspace_path,
         query.session_id,
+        query.after_sequence,
     )
     .await
 }

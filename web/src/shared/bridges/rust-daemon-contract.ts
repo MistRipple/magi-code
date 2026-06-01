@@ -21,6 +21,7 @@ export type BootstrapPayload = SessionBootstrapSnapshot & {
     runtimeEpoch?: string;
   };
   canonicalTurns?: CanonicalTurn[];
+  eventStreamNextSequence?: number;
   workspace: {
     workspaceId: string;
     name: string;
@@ -318,6 +319,8 @@ interface RustBootstrapDto {
   workspaces?: RustBootstrapWorkspaceRecord[];
   runtimeReadModel?: RustRuntimeReadModelDto;
   notifications?: RustNotificationRecord[];
+  eventStreamNextSequence?: number;
+  event_stream_next_sequence?: number;
   recentEvents?: RustEventEnvelope[];
   agent?: {
     runtimeEpoch?: string;
@@ -1399,6 +1402,10 @@ export function normalizeRustBootstrapPayload(
     sessions,
     state,
     canonicalTurns,
+    eventStreamNextSequence: normalizeNumber(
+      payload.eventStreamNextSequence ?? payload.event_stream_next_sequence,
+      0,
+    ),
     notifications: currentSession?.id
         ? {
           sessionId: currentSession.id,

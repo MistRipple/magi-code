@@ -18,10 +18,11 @@ pub async fn events(
     workspace_id: Option<String>,
     workspace_path: Option<String>,
     session_id: Option<String>,
+    after_sequence: Option<u64>,
 ) -> Response {
     let workspace_id = resolve_event_stream_workspace_id(&state, workspace_id, workspace_path);
     let session_id = resolve_event_stream_session_id(session_id);
-    let stream = event_envelope_stream(state, workspace_id, session_id)
+    let stream = event_envelope_stream(state, workspace_id, session_id, after_sequence)
         .map(|event| Ok::<Event, Infallible>(event_to_sse(event)));
 
     let mut response = Sse::new(stream)
@@ -80,6 +81,7 @@ fn event_envelope_stream(
     state: ApiState,
     workspace_id: Option<WorkspaceId>,
     session_id: Option<SessionId>,
+    after_sequence: Option<u64>,
 ) -> impl Stream<Item = EventEnvelope> {
     let (snapshot, receiver) = state.event_bus.snapshot_and_subscribe();
     let snapshot_state = state.clone();
@@ -89,12 +91,13 @@ fn event_envelope_stream(
     let snapshot_session_id = session_id.clone();
     let live_session_id = session_id;
     let recent_stream = stream::iter(snapshot.recent_events.into_iter().filter(move |event| {
-        event_matches_scope(
-            &snapshot_state,
-            event,
-            snapshot_workspace_id.as_ref(),
-            snapshot_session_id.as_ref(),
-        )
+        after_sequence.is_none_or(|sequence| event.sequence > sequence)
+            && event_matches_scope(
+                &snapshot_state,
+                event,
+                snapshot_workspace_id.as_ref(),
+                snapshot_session_id.as_ref(),
+            )
     }));
     let live_stream = BroadcastStream::new(receiver).filter_map(move |event| {
         let live_state = live_state.clone();
@@ -102,13 +105,18 @@ fn event_envelope_stream(
         let live_session_id = live_session_id.clone();
         async move {
             match event {
-                Ok(envelope) => event_matches_scope(
-                    &live_state,
-                    &envelope,
-                    live_workspace_id.as_ref(),
-                    live_session_id.as_ref(),
-                )
-                .then_some(envelope),
+                Ok(envelope) => {
+                    let matches_sequence =
+                        after_sequence.is_none_or(|sequence| envelope.sequence > sequence);
+                    (matches_sequence
+                        && event_matches_scope(
+                            &live_state,
+                            &envelope,
+                            live_workspace_id.as_ref(),
+                            live_session_id.as_ref(),
+                        ))
+                    .then_some(envelope)
+                }
                 Err(BroadcastStreamRecvError::Lagged(skipped)) => {
                     Some(lagged_recovery_event(skipped, live_workspace_id.as_ref()))
                 }
@@ -249,7 +257,14 @@ mod tests {
 
     #[tokio::test]
     async fn events_response_disables_proxy_buffering() {
-        let response = events(test_state(), Some("workspace-a".to_string()), None, None).await;
+        let response = events(
+            test_state(),
+            Some("workspace-a".to_string()),
+            None,
+            None,
+            None,
+        )
+        .await;
 
         assert_eq!(
             response.headers().get(header::CACHE_CONTROL),
@@ -519,6 +534,7 @@ mod tests {
             state.clone(),
             Some(workspace.clone()),
             None,
+            None,
         ));
 
         for index in 0..8 {
@@ -551,5 +567,36 @@ mod tests {
             event.payload["skipped"].as_u64().unwrap_or_default() > 0,
             "lagged event should expose skipped event count"
         );
+    }
+
+    #[tokio::test]
+    async fn event_stream_filters_snapshot_by_after_sequence_cursor() {
+        let state = test_state_with_event_capacity(8);
+        let workspace = workspace_id("workspace-after-sequence");
+        for index in 1..=3 {
+            state
+                .event_bus
+                .publish(
+                    EventEnvelope::domain(
+                        EventId::new(format!("event-after-sequence-{index}")),
+                        "message.created",
+                        json!({ "index": index }),
+                    )
+                    .with_context(EventContext {
+                        workspace_id: Some(workspace.clone()),
+                        ..EventContext::default()
+                    }),
+                )
+                .expect("event should publish");
+        }
+
+        let mut events = Box::pin(event_envelope_stream(state, Some(workspace), None, Some(2)));
+        let event = tokio::time::timeout(Duration::from_secs(1), events.next())
+            .await
+            .expect("event after cursor should arrive")
+            .expect("stream should stay open");
+
+        assert_eq!(event.event_id.as_str(), "event-after-sequence-3");
+        assert_eq!(event.sequence, 3);
     }
 }

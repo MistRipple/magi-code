@@ -48,6 +48,7 @@ pub struct BootstrapDto {
     pub bridge_services: BridgeServicesSnapshotDto,
     pub bridge_preflight: BridgePreflightSnapshotDto,
     pub notifications: Vec<NotificationRecord>,
+    pub event_stream_next_sequence: u64,
     pub recent_events: Vec<EventEnvelope>,
     pub has_more_before: bool,
     pub before_cursor: Option<String>,
@@ -157,6 +158,7 @@ impl BootstrapDto {
             bridge_services,
             bridge_preflight,
             notifications: session_projection.notifications,
+            event_stream_next_sequence: event_snapshot.next_sequence,
             recent_events: event_snapshot.recent_events,
             has_more_before: false,
             before_cursor: None,
@@ -616,6 +618,7 @@ mod tests {
             Vec::new(),
         );
 
+        assert_eq!(bootstrap.event_stream_next_sequence, 3);
         assert_eq!(bootstrap.recent_events.len(), 1);
         assert_eq!(bootstrap.recent_events[0].event_type, "task.created");
         assert_eq!(bootstrap.canonical_turns.len(), 1);

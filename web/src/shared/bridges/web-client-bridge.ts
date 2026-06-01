@@ -156,6 +156,8 @@ let activeEventStreamOpenTimeout: number | null = null;
 let activeEventStreamToken = 0;
 let activeEventStreamOpenResolve: (() => void) | null = null;
 let activeEventStreamOpenReject: ((error: Error) => void) | null = null;
+let eventStreamCursorScopeKey = '';
+let eventStreamAfterSequence = 0;
 // SSE 空闲检测：后端每 5s 发浏览器可见 keep-alive 事件，任何事件都会刷新 lastEventStreamActivityAt。
 // 超过 EVENT_STREAM_IDLE_TIMEOUT_MS 未收到任何事件即视为静默断流，触发 recovery 重拉 bootstrap，
 // 让 applyAuthoritativeProcessingState 根据权威快照收敛运行态，避免前端永久卡在 running。
@@ -1504,7 +1506,34 @@ function eventStreamBindingKey(): string {
   if (currentWorkspacePath) {
     query.set('workspacePath', currentWorkspacePath);
   }
+  if (eventStreamCursorScopeKey === eventStreamScopeKey() && eventStreamAfterSequence > 0) {
+    query.set('afterSequence', String(eventStreamAfterSequence));
+  }
   return query.toString();
+}
+
+function eventStreamScopeKey(): string {
+  const query = new URLSearchParams();
+  if (currentWorkspaceId) {
+    query.set('workspaceId', currentWorkspaceId);
+  }
+  if (currentWorkspacePath) {
+    query.set('workspacePath', currentWorkspacePath);
+  }
+  return query.toString();
+}
+
+function updateEventStreamCursorFromBootstrap(payload: BootstrapPayload): void {
+  const nextSequence = typeof payload.eventStreamNextSequence === 'number' && Number.isFinite(payload.eventStreamNextSequence)
+    ? Math.floor(payload.eventStreamNextSequence)
+    : 0;
+  if (nextSequence <= 1) {
+    eventStreamCursorScopeKey = '';
+    eventStreamAfterSequence = 0;
+    return;
+  }
+  eventStreamCursorScopeKey = eventStreamScopeKey();
+  eventStreamAfterSequence = nextSequence - 1;
 }
 
 async function readAgentErrorPayload(response: Response): Promise<{ errorCode?: string; message?: string }> {
@@ -1922,6 +1951,7 @@ async function dispatchBootstrap(
     payload.workspace.rootPath,
     payload.sessionId,
   );
+  updateEventStreamCursorFromBootstrap(payload);
   activateTaskProjectionSession(payload.sessionId, payload.workspace.workspaceId, payload.workspace.rootPath);
   const taskTrackingHints = extractBootstrapTaskTrackingHints(payload, options.rawPayload);
   if (previousSessionId && payload.sessionId && previousSessionId !== payload.sessionId) {
@@ -2208,6 +2238,7 @@ async function dispatchSessionSnapshot(
     payload.workspace.rootPath,
     payload.sessionId,
   );
+  updateEventStreamCursorFromBootstrap(payload);
   activateTaskProjectionSession(payload.sessionId, payload.workspace.workspaceId, payload.workspace.rootPath);
   const taskTrackingHints = extractBootstrapTaskTrackingHints(payload, rawPayload);
   if (previousSessionId && payload.sessionId && previousSessionId !== payload.sessionId) {

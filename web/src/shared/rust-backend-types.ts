@@ -795,6 +795,7 @@ export interface BootstrapDto {
   bridgeServices: BridgeServicesSnapshotDto;
   bridgePreflight: BridgePreflightSnapshotDto;
   notifications: NotificationDto[];
+  eventStreamNextSequence: number;
   recentEvents: EventEnvelope[];
   hasMoreBefore: boolean;
   beforeCursor?: string | null;
