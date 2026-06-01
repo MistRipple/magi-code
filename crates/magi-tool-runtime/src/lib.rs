@@ -4031,6 +4031,38 @@ mod tests {
     }
 
     #[test]
+    fn diff_preview_source_read_failure_uses_public_error_message() {
+        let root = unique_temp_dir("magi-tool-diff-preview-error");
+        let missing_path = root.join("missing-before.txt");
+        let registry = make_registry();
+
+        let output = exec_tool(
+            &registry,
+            BuiltinToolName::DiffPreview,
+            &serde_json::json!({
+                "before_path": missing_path.to_string_lossy(),
+                "after": "after",
+            })
+            .to_string(),
+        );
+
+        assert_eq!(output.status, ExecutionResultStatus::Failed);
+        let payload: Value = serde_json::from_str(&output.payload).expect("payload json");
+        assert_eq!(payload["tool"], BuiltinToolName::DiffPreview.as_str());
+        assert_eq!(payload["status"], "failed");
+        assert_eq!(payload["error"], "差异预览源暂不可读取，请检查路径或权限");
+        assert!(
+            !output.payload.contains("missing-before")
+                && !output.payload.contains("No such")
+                && !output.payload.contains("os error"),
+            "diff_preview 源读取失败不能暴露路径或 IO 细节: {}",
+            output.payload
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn builtin_invocation_emits_usage_event_and_updates_ledger() {
         let governance = Arc::new(GovernanceService::default());
         let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(16));

@@ -33,6 +33,7 @@ const FILE_COPY_PUBLIC_ERROR: &str = "文件暂不可复制，请检查路径或
 const FILE_MOVE_PUBLIC_ERROR: &str = "文件暂不可移动，请检查路径或权限";
 const DIRECTORY_CREATE_PUBLIC_ERROR: &str = "目录暂不可创建，请检查路径或权限";
 const SEARCH_TEXT_PUBLIC_ERROR: &str = "文本搜索暂不可用，请检查路径或权限";
+const DIFF_PREVIEW_PUBLIC_ERROR: &str = "差异预览源暂不可读取，请检查路径或权限";
 const SHELL_EXEC_PUBLIC_ERROR: &str = "shell 命令暂不可执行，请检查运行环境";
 const PROCESS_LAUNCH_PUBLIC_ERROR: &str = "后台进程暂不可启动，请检查运行环境";
 const PROCESS_WRITE_PUBLIC_ERROR: &str = "后台进程暂不可写入，请稍后重试";
@@ -1466,11 +1467,11 @@ fn execute_diff_preview(input: &str) -> String {
     let (before_path, after_path, before, after, before_label, after_label) = parsed;
     let before_text = match read_diff_source(before_path, before) {
         Ok(text) => text,
-        Err(error) => return builtin_error("diff_preview", error),
+        Err(error) => return diff_preview_source_error(error),
     };
     let after_text = match read_diff_source(after_path, after) {
         Ok(text) => text,
-        Err(error) => return builtin_error("diff_preview", error),
+        Err(error) => return diff_preview_source_error(error),
     };
 
     let diff = build_diff_preview(&before_text, &after_text);
@@ -1695,18 +1696,49 @@ fn parse_ps_line(line: &str) -> Option<Value> {
     }))
 }
 
-fn read_diff_source(path: Option<String>, inline: Option<String>) -> Result<String, String> {
+enum DiffSourceReadError {
+    Resolve(String),
+    Read {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+}
+
+fn read_diff_source(
+    path: Option<String>,
+    inline: Option<String>,
+) -> Result<String, DiffSourceReadError> {
     if let Some(inline) = inline {
         if !inline.is_empty() {
             return Ok(inline);
         }
     }
     if let Some(path) = path {
-        let resolved = resolve_path(&path)?;
-        return fs::read_to_string(&resolved)
-            .map_err(|error| format!("读取 diff 源失败 {}: {error}", resolved.display()));
+        let resolved = resolve_path(&path).map_err(DiffSourceReadError::Resolve)?;
+        return fs::read_to_string(&resolved).map_err(|source| DiffSourceReadError::Read {
+            path: resolved,
+            source,
+        });
     }
     Ok(String::new())
+}
+
+fn diff_preview_source_error(error: DiffSourceReadError) -> String {
+    match error {
+        DiffSourceReadError::Resolve(error) => builtin_runtime_error(
+            "diff_preview",
+            DIFF_PREVIEW_PUBLIC_ERROR,
+            "解析差异预览源路径失败",
+            error,
+        ),
+        DiffSourceReadError::Read { path, source } => builtin_filesystem_error(
+            "diff_preview",
+            DIFF_PREVIEW_PUBLIC_ERROR,
+            "读取差异预览源文件失败",
+            &path,
+            source,
+        ),
+    }
 }
 
 struct DiffPreviewResult {
