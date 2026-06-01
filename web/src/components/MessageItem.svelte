@@ -343,7 +343,7 @@
             {@const blockIsStreaming = block.type === 'thinking'
               ? (isStreaming && i === presentationBlocks.length - 1)
               : isStreaming}
-            <BlockRenderer {block} isStreaming={blockIsStreaming} {readOnly} />
+            <BlockRenderer {block} isStreaming={blockIsStreaming} {readOnly} {filePreviewScope} />
           {/each}
         {:else if message.content}
           <MarkdownContent content={message.content} {isStreaming} {filePreviewScope} />

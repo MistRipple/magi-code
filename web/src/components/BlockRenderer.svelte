@@ -1,14 +1,16 @@
 <script lang="ts">
   import type { ContentBlock } from '../types/message';
+  import type { FilePreviewScope } from '../lib/file-reference';
   import { getBlockRenderer } from '../lib/block-registry';
 
   interface Props {
     block: ContentBlock;
     isStreaming?: boolean;
     readOnly?: boolean;
+    filePreviewScope?: FilePreviewScope;
   }
 
-  let { block, isStreaming = false, readOnly = false }: Props = $props();
+  let { block, isStreaming = false, readOnly = false, filePreviewScope = undefined }: Props = $props();
 
   // 🔧 防御性检查：确保 block 有效且有 type 属性
   const isValidBlock = $derived(block && typeof block === 'object' && 'type' in block);
@@ -16,5 +18,5 @@
 </script>
 
 {#if Renderer}
-  <Renderer {block} {isStreaming} {readOnly} />
+  <Renderer {block} {isStreaming} {readOnly} {filePreviewScope} />
 {/if}

@@ -1,14 +1,16 @@
 <script lang="ts">
   import type { ContentBlock } from '../types/message';
+  import type { FilePreviewScope } from '../lib/file-reference';
   import { TERMINAL_TOOLS, normalizeTerminalToolName } from '../lib/terminal-utils';
   import ToolCall from './ToolCall.svelte';
   import TerminalSessionCard from './TerminalSessionCard.svelte';
 
   interface Props {
     block: ContentBlock;
+    filePreviewScope?: FilePreviewScope;
   }
 
-  let { block }: Props = $props();
+  let { block, filePreviewScope = undefined }: Props = $props();
 
   const toolName = $derived(block.toolCall?.name || 'Tool');
   const toolStatus = $derived(block.toolCall?.status);
@@ -30,6 +32,7 @@
     output={block.toolCall?.result}
     error={block.toolCall?.error}
     standardized={block.toolCall?.standardized}
+    {filePreviewScope}
     duration={typeof block.toolCall?.durationMs === 'number'
       ? block.toolCall.durationMs
       : (block.toolCall?.endTime && block.toolCall?.startTime ? block.toolCall.endTime - block.toolCall.startTime : undefined)}

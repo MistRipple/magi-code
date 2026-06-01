@@ -4,6 +4,7 @@
   import FileSpan from './FileSpan.svelte';
   import DiagramRenderer from './DiagramRenderer.svelte';
   import MarkdownContent from './MarkdownContent.svelte';
+  import type { FilePreviewScope } from '../lib/file-reference';
   import { vscode } from '../lib/vscode-bridge';
   import { extractLeadingJson } from '../lib/terminal-utils';
   import type { IconName } from '../lib/icons';
@@ -33,7 +34,7 @@
     status?: 'pending' | 'running' | 'success' | 'error';
     duration?: number;
     filepath?: string;
-    onOpenFile?: (filepath: string) => void;
+    filePreviewScope?: FilePreviewScope;
   }
 
   let {
@@ -46,7 +47,7 @@
     status = 'success',
     duration,
     filepath,
-    onOpenFile
+    filePreviewScope = undefined,
   }: Props = $props();
 
   let collapsed = $state(untrack(() => !(status === 'running' || status === 'pending')));
@@ -861,13 +862,9 @@
     if (!toolFilepath) {
       return;
     }
-    if (onOpenFile) {
-      onOpenFile(toolFilepath);
-      return;
-    }
     if (typeof window !== 'undefined') {
       const previewEvent = new CustomEvent('magi:previewFile', {
-        detail: { filepath: toolFilepath },
+        detail: { filepath: toolFilepath, ...filePreviewScope },
         cancelable: true,
       });
       window.dispatchEvent(previewEvent);
@@ -878,7 +875,9 @@
     vscode.postMessage({
       type: 'openFile',
       filepath: toolFilepath,
-      sessionId: getCurrentSessionId() || undefined,
+      sessionId: filePreviewScope?.sessionId || getCurrentSessionId() || undefined,
+      workspaceId: filePreviewScope?.workspaceId,
+      workspacePath: filePreviewScope?.workspacePath,
     });
   }
 </script>
@@ -1038,7 +1037,7 @@
                   </div>
                 {:else if isMarkdownOutput}
                   <div class="markdown-output">
-                    <MarkdownContent content={outputText} isStreaming={isToolOutputStreaming} />
+                    <MarkdownContent content={outputText} isStreaming={isToolOutputStreaming} {filePreviewScope} />
                   </div>
                 {:else}
                   <pre class="section-content">{outputText}</pre>
