@@ -1011,9 +1011,13 @@ export async function browseAgentDirectory(
 export async function getWorkspaceSessions(
   workspaceId: string,
   preferredSessionId?: string,
+  workspacePath?: string,
 ): Promise<AgentWorkspaceSessionsSnapshot> {
   try {
     const query = new URLSearchParams({ workspaceId });
+    if (workspacePath?.trim()) {
+      query.set('workspacePath', workspacePath.trim());
+    }
     if (preferredSessionId && preferredSessionId.trim()) {
       query.set('sessionId', preferredSessionId.trim());
     }

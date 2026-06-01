@@ -502,6 +502,7 @@
       const resolvedSessionId = await refreshWorkspaceSessions(
         workspace.workspaceId,
         preferredSessionIdForWorkspace(workspace.workspaceId),
+        workspace.rootPath,
       );
       if (resolvedSessionId) {
         requestCurrentSessionState();
@@ -814,7 +815,11 @@
     return true;
   }
 
-  async function refreshWorkspaceSessions(workspaceId: string, preferredSessionId = ''): Promise<string> {
+  async function refreshWorkspaceSessions(
+    workspaceId: string,
+    preferredSessionId = '',
+    workspacePath = '',
+  ): Promise<string> {
     if (!workspaceId) {
       currentSessionId = null;
       setCurrentSessionId(null);
@@ -822,7 +827,7 @@
     }
     loadingWorkspaceIds = { ...loadingWorkspaceIds, [workspaceId]: true };
     try {
-      const snapshot = await getWorkspaceSessions(workspaceId, preferredSessionId);
+      const snapshot = await getWorkspaceSessions(workspaceId, preferredSessionId, workspacePath);
       return applyWorkspaceSessionsSnapshot(workspaceId, snapshot);
     } catch (error) {
       notifyWorkbenchError(i18n.t('web.action.loadWorkspaceSessions'), error);
@@ -1006,7 +1011,7 @@
     if (!isExpanded && getWorkspaceSessionList(workspace.workspaceId).length === 0) {
       void (async () => {
         try {
-          await refreshWorkspaceSessions(workspace.workspaceId, '');
+          await refreshWorkspaceSessions(workspace.workspaceId, '', workspace.rootPath);
         } catch (error) {
           console.warn('[WebWorkbenchShell] refresh workspace sessions failed:', error);
           loadError = i18n.t('web.workspaceUnavailable');

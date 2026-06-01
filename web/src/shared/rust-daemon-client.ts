@@ -264,9 +264,15 @@ export class RustDaemonClient {
 
   public async fetchWorkspaceSessions(
     workspaceId?: string,
+    workspacePath?: string,
   ): Promise<WorkspaceSessionsResponseDto> {
-    const params = workspaceId ? `?workspaceId=${encodeURIComponent(workspaceId)}` : '';
-    return this.getJson<WorkspaceSessionsResponseDto>(`/api/workspaces/sessions${params}`);
+    const query = new URLSearchParams();
+    if (workspaceId) query.set('workspaceId', workspaceId);
+    if (workspacePath) query.set('workspacePath', workspacePath);
+    const params = query.toString();
+    return this.getJson<WorkspaceSessionsResponseDto>(
+      `/api/workspaces/sessions${params ? `?${params}` : ''}`,
+    );
   }
 
   // ─── Settings ─────────────────────────────────────────────────────

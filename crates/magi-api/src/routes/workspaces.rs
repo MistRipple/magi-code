@@ -6,6 +6,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+use super::session_scope::require_registered_workspace_binding;
 use crate::{errors::ApiError, state::ApiState};
 
 pub fn routes() -> Router<ApiState> {
@@ -195,6 +196,8 @@ async fn pick_workspace(State(state): State<ApiState>) -> Json<serde_json::Value
 struct WorkspaceSessionsQuery {
     #[serde(rename = "workspaceId", alias = "workspace_id")]
     workspace_id: Option<String>,
+    #[serde(rename = "workspacePath", alias = "workspace_path")]
+    workspace_path: Option<String>,
     #[serde(rename = "sessionId", alias = "session_id")]
     session_id: Option<String>,
 }
@@ -203,17 +206,35 @@ async fn workspace_sessions(
     State(state): State<ApiState>,
     Query(query): Query<WorkspaceSessionsQuery>,
 ) -> Result<Json<WorkspaceSessionsResponse>, ApiError> {
-    let requested_workspace_id = query
-        .workspace_id
+    let requested_workspace_id = match query
+        .workspace_path
         .as_deref()
         .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| ApiError::InvalidInput("workspaceId 不能为空".to_string()))?;
+        .filter(|workspace_path| !workspace_path.is_empty())
+    {
+        Some(_) => {
+            require_registered_workspace_binding(
+                &state,
+                query.workspace_id.as_deref(),
+                query.workspace_path.as_deref(),
+            )?
+            .workspace_id
+        }
+        None => {
+            let workspace_id = query
+                .workspace_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| ApiError::InvalidInput("workspaceId 不能为空".to_string()))?;
+            magi_core::WorkspaceId::new(workspace_id)
+        }
+    };
     let workspace = state
         .workspace_registry
         .workspaces()
         .into_iter()
-        .find(|workspace| workspace.workspace_id.as_str() == requested_workspace_id)
+        .find(|workspace| workspace.workspace_id == requested_workspace_id)
         .ok_or_else(|| {
             ApiError::InvalidInput(format!("workspace 不存在: {requested_workspace_id}"))
         })?;
@@ -498,6 +519,68 @@ mod tests {
         assert_eq!(sessions[0]["sessionId"], "session-counted");
         assert_eq!(sessions[0]["messageCount"], 2);
         assert!(sessions[0]["updatedAt"].as_u64().unwrap_or_default() > 0);
+    }
+
+    #[tokio::test]
+    async fn workspace_sessions_resolves_workspace_from_registered_path_when_query_id_is_stale() {
+        let state = test_state();
+        let workspace_id = WorkspaceId::new("workspace-session-path-binding");
+        let root = std::env::temp_dir().join(format!(
+            "magi-workspace-session-path-binding-{}-{}",
+            std::process::id(),
+            UtcMillis::now().0
+        ));
+        fs::create_dir_all(&root).expect("workspace root should create");
+        state
+            .workspace_registry
+            .register(
+                workspace_id.clone(),
+                AbsolutePath::new(root.to_string_lossy().as_ref()),
+            )
+            .expect("workspace should register");
+
+        let session_id = SessionId::new("session-path-bound");
+        state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "路径绑定会话",
+                Some(workspace_id.to_string()),
+            )
+            .expect("session should create");
+        state.session_store.append_timeline_entry(
+            session_id.clone(),
+            TimelineEntryKind::UserMessage,
+            "真实用户消息",
+        );
+
+        let response = routes()
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/workspaces/sessions?workspaceId=workspace-stale-query&workspacePath={}&sessionId=session-path-bound",
+                        urlencoding::encode(root.to_string_lossy().as_ref())
+                    ))
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = read_json_response(response).await;
+        assert_eq!(payload["workspace"]["workspaceId"], workspace_id.as_str());
+        assert_eq!(
+            payload["workspace"]["path"],
+            root.to_string_lossy().as_ref()
+        );
+        assert_eq!(payload["sessionId"], "session-path-bound");
+        let sessions = payload["sessions"]
+            .as_array()
+            .expect("sessions should be an array");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0]["sessionId"], "session-path-bound");
     }
 
     #[tokio::test]
