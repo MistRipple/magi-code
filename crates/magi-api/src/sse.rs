@@ -425,8 +425,22 @@ mod tests {
             task_id: Some(TaskId::new("task-unscoped")),
             ..EventContext::default()
         });
+        let task_event_with_session = EventEnvelope::domain(
+            EventId::new("event-sse-task-scoped"),
+            "task.status.changed",
+            json!({ "task_id": "task-scoped", "session_id": session.as_str() }),
+        )
+        .with_context(EventContext {
+            session_id: Some(session.clone()),
+            task_id: Some(TaskId::new("task-scoped")),
+            ..EventContext::default()
+        });
 
         assert!(event_matches_session(&payload_scoped_event, Some(&session)));
+        assert!(event_matches_session(
+            &task_event_with_session,
+            Some(&session)
+        ));
         assert!(!event_matches_session(
             &task_event_without_session,
             Some(&session)

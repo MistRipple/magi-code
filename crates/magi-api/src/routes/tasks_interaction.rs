@@ -1,6 +1,6 @@
 use axum::{Json, Router, extract::State, routing::post};
 use magi_core::{EventId, SessionId, TaskId, TaskStatus, TaskTier, UtcMillis};
-use magi_event_bus::EventEnvelope;
+use magi_event_bus::{EventContext, EventEnvelope};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -245,9 +245,18 @@ async fn interrupt_task(
         json!({
             "taskId": task_id,
             "rootTaskId": root_task_id.to_string(),
+            "sessionId": session_id.to_string(),
+            "workspaceId": scope.workspace_id.to_string(),
             "requestedAt": now.0,
         }),
-    );
+    )
+    .with_context(EventContext {
+        workspace_id: Some(scope.workspace_id.clone()),
+        session_id: Some(session_id.clone()),
+        mission_id: Some(task.mission_id.clone()),
+        task_id: Some(root_task_id.clone()),
+        ..EventContext::default()
+    });
     state
         .event_bus
         .publish(event)
@@ -340,9 +349,18 @@ async fn restart_task(
             "taskId": task_id,
             "oldRootTaskId": task.root_task_id.to_string(),
             "newRootTaskId": accepted.root_task_id.to_string(),
+            "sessionId": accepted.session_id.to_string(),
+            "workspaceId": scope.workspace_id.to_string(),
             "requestedAt": now.0,
         }),
-    );
+    )
+    .with_context(EventContext {
+        workspace_id: Some(scope.workspace_id.clone()),
+        session_id: Some(accepted.session_id.clone()),
+        mission_id: Some(root_task.mission_id.clone()),
+        task_id: Some(accepted.root_task_id.clone()),
+        ..EventContext::default()
+    });
     state
         .event_bus
         .publish(event)
@@ -396,9 +414,18 @@ async fn archive_task(
         json!({
             "taskId": task_id,
             "rootTaskId": root_task.task_id.to_string(),
+            "sessionId": session_id.to_string(),
+            "workspaceId": scope.workspace_id.to_string(),
             "requestedAt": now.0,
         }),
-    );
+    )
+    .with_context(EventContext {
+        workspace_id: Some(scope.workspace_id.clone()),
+        session_id: Some(session_id.clone()),
+        mission_id: Some(root_task.mission_id.clone()),
+        task_id: Some(root_task.task_id.clone()),
+        ..EventContext::default()
+    });
     state
         .event_bus
         .publish(event)
