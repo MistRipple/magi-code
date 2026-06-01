@@ -85,8 +85,9 @@ fn build_external_tool_catalog_provider(
                     binding_id: Some(binding.binding_id),
                     name: binding.tool_name,
                     description: binding.description,
-                    bridge_kind: format!("{:?}", binding.bridge_kind),
-                    dispatch_action: format!("{:?}", binding.dispatch_action),
+                    bridge_kind: bridge_binding_kind_label(binding.bridge_kind).to_string(),
+                    dispatch_action: bridge_dispatch_action_label(binding.dispatch_action)
+                        .to_string(),
                     bridge_target: binding.bridge_target,
                     access_profile_behavior: access_profile_behavior.to_string(),
                     risk_level: risk_level.to_string(),
@@ -119,6 +120,20 @@ fn build_external_tool_catalog_provider(
             mcp_servers,
         }
     })
+}
+
+fn bridge_binding_kind_label(kind: magi_bridge_client::BridgeBindingKind) -> &'static str {
+    match kind {
+        magi_bridge_client::BridgeBindingKind::Model => "model",
+        magi_bridge_client::BridgeBindingKind::Mcp => "mcp",
+    }
+}
+
+fn bridge_dispatch_action_label(action: magi_bridge_client::BridgeDispatchAction) -> &'static str {
+    match action {
+        magi_bridge_client::BridgeDispatchAction::ModelPrompt => "model_prompt",
+        magi_bridge_client::BridgeDispatchAction::McpToolCall => "mcp_tool_call",
+    }
 }
 
 fn build_agent_role_catalog_provider(
@@ -1641,6 +1656,47 @@ mod tests {
                 .any(|kind| kind == "local_agent")),
             "代理角色目录应暴露 supported_kinds，便于 tool_catalog 诊断"
         );
+    }
+
+    #[test]
+    fn external_tool_catalog_uses_stable_bridge_labels() {
+        let registry = magi_skill_runtime::SkillRegistry::new();
+        registry.register(magi_skill_runtime::SkillDefinition {
+            skill_id: "catalog-skill".to_string(),
+            title: "Catalog Skill".to_string(),
+            instruction: "test".to_string(),
+            metadata: magi_skill_runtime::SkillMetadata {
+                category: "test".to_string(),
+                tags: Vec::new(),
+            },
+            allowed_tools: Vec::new(),
+            custom_tool_bindings: vec![magi_skill_runtime::CustomToolBinding {
+                binding_id: "catalog-binding".to_string(),
+                tool_name: "catalog.inspect".to_string(),
+                description: "Inspect catalog".to_string(),
+                bridge_kind: magi_bridge_client::BridgeBindingKind::Mcp,
+                dispatch_action: magi_bridge_client::BridgeDispatchAction::McpToolCall,
+                bridge_target: "local-mcp".to_string(),
+            }],
+            prompt_priority: 50,
+        });
+        let provider = super::build_external_tool_catalog_provider(
+            std::sync::Arc::new(super::SettingsStore::default()),
+            std::sync::Arc::new(magi_skill_runtime::SkillRuntime::new(registry)),
+            std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        );
+
+        let snapshot = provider();
+        let tool = snapshot
+            .skill_tools
+            .iter()
+            .find(|tool| tool.name == "catalog.inspect")
+            .expect("skill custom tool should be exported");
+
+        assert_eq!(tool.bridge_kind, "mcp");
+        assert_eq!(tool.dispatch_action, "mcp_tool_call");
+        assert_eq!(tool.access_profile_behavior, "restricted_requires_approval");
+        assert_eq!(tool.approval_requirement, "required");
     }
 
     #[test]
