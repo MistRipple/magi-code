@@ -2090,7 +2090,7 @@ fn tool_path_access_requests(
                 && let Some(root) = workspace_root_path
                 && shell_exec_uses_working_directory(arguments, object)
             {
-                paths.push((normalize_permission_path(root.clone()), shell_kind));
+                paths.push((canonicalize_permission_path(root.as_path()), shell_kind));
             }
             if access_profile == magi_core::AccessProfile::ReadOnly {
                 for path in &mut paths {
@@ -2109,7 +2109,7 @@ fn tool_path_access_requests(
             if paths.is_empty()
                 && let Some(root) = workspace_root_path
             {
-                paths.push((normalize_permission_path(root.clone()), write));
+                paths.push((canonicalize_permission_path(root.as_path()), write));
             }
         }
         _ => {}
@@ -2737,6 +2737,32 @@ mod tests {
                 .unwrap_or_default()
                 .contains("策略未授权访问路径")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restricted_shell_workspace_fallback_uses_canonical_root_for_symlink_workspace() {
+        let workspace = tempdir().expect("workspace tempdir");
+        let real_root = workspace.path().join("real-root");
+        let link_root = workspace.path().join("link-root");
+        std::fs::create_dir_all(&real_root).expect("real workspace root should be creatable");
+        std::os::unix::fs::symlink(&real_root, &link_root)
+            .expect("workspace symlink should be creatable");
+
+        let decision = access_profile_tool_decision(
+            magi_core::AccessProfile::Restricted,
+            "",
+            &[],
+            &[],
+            &[],
+            &[],
+            BuiltinToolName::ShellExec.as_str(),
+            r#"{"command":"printf restricted > out.txt"}"#,
+            Some(&link_root),
+        )
+        .expect("restricted write shell inside symlinked workspace should require approval");
+
+        assert_eq!(decision.status, ExecutionResultStatus::NeedsApproval);
     }
 
     #[test]

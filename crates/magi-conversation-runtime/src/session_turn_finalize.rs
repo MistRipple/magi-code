@@ -26,7 +26,7 @@ pub fn turn_item_status_for_task_status(status: TaskStatus) -> &'static str {
         TaskStatus::Running => "running",
         TaskStatus::Completed => "completed",
         TaskStatus::Failed => "failed",
-        TaskStatus::Killed => "killed",
+        TaskStatus::Killed => "cancelled",
     }
 }
 
@@ -624,10 +624,10 @@ pub fn finalize_background_session_task_turn_if_root_terminal(
     };
     let (turn_status, message) = match root_task.status {
         TaskStatus::Failed => ("failed", "任务执行失败，未生成最终回复。"),
-        TaskStatus::Killed => ("killed", "任务执行已终止。"),
+        TaskStatus::Killed => ("cancelled", "任务执行已终止。"),
         _ if runner_status == "error" => ("failed", "任务执行异常，未生成最终回复。"),
         _ if runner_status == "stopped" || runner_status == "killed" => {
-            ("killed", "任务执行已终止。")
+            ("cancelled", "任务执行已终止。")
         }
         _ => return false,
     };
@@ -819,5 +819,13 @@ mod tests {
 
         assert_eq!(response.0, "主线答复");
         assert_eq!(response.1, "turn-item-root-final");
+    }
+
+    #[test]
+    fn killed_task_status_uses_cancelled_session_turn_item_status() {
+        assert_eq!(
+            turn_item_status_for_task_status(TaskStatus::Killed),
+            "cancelled"
+        );
     }
 }

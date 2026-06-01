@@ -350,6 +350,10 @@ impl BuiltinToolName {
         )
     }
 
+    pub fn is_session_timeline_renderable_tool_call(&self) -> bool {
+        matches!(self, Self::AgentSpawn) || !self.is_runtime_internal_tool_call()
+    }
+
     pub fn default_risk_level(&self) -> RiskLevel {
         match self {
             Self::FileRead

@@ -149,7 +149,7 @@ fn canonical_turn_status(status: &str) -> Option<CanonicalTurnStatus> {
         "completed" | "complete" | "succeeded" | "success" => Some(CanonicalTurnStatus::Completed),
         "blocked" => Some(CanonicalTurnStatus::Blocked),
         "failed" | "error" => Some(CanonicalTurnStatus::Failed),
-        "cancelled" | "canceled" => Some(CanonicalTurnStatus::Cancelled),
+        "cancelled" | "canceled" | "killed" => Some(CanonicalTurnStatus::Cancelled),
         _ => None,
     }
 }
@@ -274,7 +274,7 @@ fn canonical_item_renderable(
             .tool_name
             .as_deref()
             .and_then(BuiltinToolName::from_str)
-            .is_some_and(|tool| tool.is_runtime_internal_tool_call())
+            .is_some_and(|tool| !tool.is_session_timeline_renderable_tool_call())
     {
         return false;
     }

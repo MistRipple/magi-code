@@ -47,6 +47,7 @@ fn current_turn_status_is_terminal(status: &str) -> bool {
             | "blocked"
             | "cancelled"
             | "canceled"
+            | "killed"
     )
 }
 
@@ -71,7 +72,7 @@ fn terminal_item_status_for_turn_status(status: &str) -> Option<&'static str> {
         "completed" | "complete" | "succeeded" | "success" => Some("completed"),
         "blocked" => Some("blocked"),
         "failed" | "error" => Some("failed"),
-        "cancelled" | "canceled" => Some("cancelled"),
+        "cancelled" | "canceled" | "killed" => Some("cancelled"),
         _ => None,
     }
 }
@@ -84,11 +85,18 @@ fn canonical_current_turn_status(status: &str) -> DomainResult<CanonicalTurnStat
         "completed" | "complete" | "succeeded" | "success" => Ok(CanonicalTurnStatus::Completed),
         "blocked" => Ok(CanonicalTurnStatus::Blocked),
         "failed" | "error" => Ok(CanonicalTurnStatus::Failed),
-        "cancelled" | "canceled" => Ok(CanonicalTurnStatus::Cancelled),
+        "cancelled" | "canceled" | "killed" => Ok(CanonicalTurnStatus::Cancelled),
         _ => Err(DomainError::InvalidState {
             message: format!("unknown current turn status: {status}"),
         }),
     }
+}
+
+fn normalize_stored_current_turn_status(status: String) -> String {
+    if status.trim().eq_ignore_ascii_case("killed") {
+        return "cancelled".to_string();
+    }
+    status
 }
 
 fn canonical_current_turn_item_status(status: &str) -> DomainResult<CanonicalTurnItemStatus> {
@@ -226,7 +234,7 @@ fn current_turn_item_renderable(
             .tool_name
             .as_deref()
             .and_then(BuiltinToolName::from_str)
-            .is_some_and(|tool| tool.is_runtime_internal_tool_call())
+            .is_some_and(|tool| !tool.is_session_timeline_renderable_tool_call())
     {
         return false;
     }
@@ -1500,6 +1508,7 @@ impl SessionStore {
         session_id: SessionId,
         mut turn: ActiveExecutionTurn,
     ) -> DomainResult<SessionRuntimeSidecar> {
+        turn.status = normalize_stored_current_turn_status(turn.status);
         turn.normalize();
         let existing = self.runtime_sidecar(&session_id);
         let (ownership, recovery_id, active_execution_chain, status) =
@@ -1755,7 +1764,7 @@ impl SessionStore {
                 let Some(turn) = sidecar.current_turn.as_mut() else {
                     return Ok(None);
                 };
-                turn.status = status.into();
+                turn.status = normalize_stored_current_turn_status(status.into());
                 if let Some(item_status) = terminal_item_status_for_turn_status(&turn.status) {
                     for item in &mut turn.items {
                         if current_turn_item_status_is_active(&item.status) {
@@ -1770,12 +1779,7 @@ impl SessionStore {
                         }
                     }
                 }
-                if turn.completed_at.is_none()
-                    && matches!(
-                        turn.status.as_str(),
-                        "completed" | "failed" | "blocked" | "error" | "cancelled"
-                    )
-                {
+                if turn.completed_at.is_none() && current_turn_status_is_terminal(&turn.status) {
                     turn.completed_at = Some(UtcMillis::now());
                 }
                 turn.normalize();

@@ -840,6 +840,83 @@ fn blocked_current_turn_is_terminal_in_canonical_log() {
 }
 
 #[test]
+fn killed_current_turn_status_is_stored_as_cancelled_terminal_turn() {
+    let store = SessionStore::new();
+    let session_id = SessionId::new("session-killed-terminal-canonical");
+    store
+        .create_session(session_id.clone(), "Killed Terminal Canonical")
+        .expect("session should be creatable");
+    store
+        .upsert_current_turn(
+            session_id.clone(),
+            test_turn("turn-killed-terminal", "running", 10),
+        )
+        .expect("turn should upsert");
+
+    let mut assistant_item = test_turn_item("turn-item-killed-assistant", "任务执行已终止");
+    assistant_item.kind = "assistant_error".to_string();
+    assistant_item.status = "running".to_string();
+    store
+        .upsert_current_turn_item(&session_id, assistant_item)
+        .expect("assistant item should upsert");
+
+    let updated = store
+        .update_current_turn_status(&session_id, "killed")
+        .expect("killed turn status should update")
+        .expect("current turn should exist");
+    let updated_turn = updated.current_turn.expect("turn should remain");
+    assert_eq!(updated_turn.status, "cancelled");
+    assert!(
+        updated_turn.completed_at.is_some(),
+        "killed runner alias should not leave the chat UI in running state",
+    );
+    assert_eq!(updated_turn.items[0].status, "cancelled");
+
+    let turns = store.canonical_turns_for_session(&session_id);
+    assert_eq!(turns.len(), 1);
+    assert_eq!(turns[0].status, CanonicalTurnStatus::Cancelled);
+    assert!(
+        turns[0].completed_at.is_some(),
+        "canonical cancelled turn should carry a terminal timestamp",
+    );
+    assert_eq!(
+        turns[0].items[0].status,
+        crate::models::CanonicalTurnItemStatus::Cancelled
+    );
+}
+
+#[test]
+fn killed_task_status_item_is_written_as_cancelled_canonical_item() {
+    let store = SessionStore::new();
+    let session_id = SessionId::new("session-killed-task-status-item");
+    store
+        .create_session(session_id.clone(), "Killed Task Status Item")
+        .expect("session should be creatable");
+    store
+        .upsert_current_turn(
+            session_id.clone(),
+            test_turn("turn-killed-task-status-item", "running", 10),
+        )
+        .expect("turn should upsert");
+
+    let mut task_item = test_turn_item("turn-item-task-killed", "子任务已终止");
+    task_item.kind = "task_status".to_string();
+    task_item.status = "killed".to_string();
+    task_item.source = "task".to_string();
+    store
+        .upsert_current_turn_item(&session_id, task_item)
+        .expect("killed task status item should upsert");
+
+    let turns = store.canonical_turns_for_session(&session_id);
+    assert_eq!(turns.len(), 1);
+    assert_eq!(turns[0].status, CanonicalTurnStatus::Running);
+    assert_eq!(
+        turns[0].items[0].status,
+        crate::models::CanonicalTurnItemStatus::Cancelled
+    );
+}
+
+#[test]
 fn persisted_parts_keep_durable_terminal_turn_over_stale_sidecar_running_turn() {
     let store = SessionStore::new();
     let session_id = SessionId::new("session-sidecar-terminal-wins");
