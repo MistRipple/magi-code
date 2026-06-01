@@ -17,6 +17,9 @@ use crate::symbol_index::{SymbolIndex, SymbolSearchHit};
 
 const RECENT_EDIT_TTL_MS: u64 = 30 * 60 * 1000;
 const RECENT_EDIT_MAX_FILES: usize = 200;
+const INDEX_CACHE_STATUS_READY: &str = "ready";
+const INDEX_CACHE_STATUS_DEGRADED: &str = "degraded";
+const INDEX_CACHE_SAVE_FAILED_CODE: &str = "index_cache_save_failed";
 
 #[derive(Clone, Debug, Default)]
 pub struct SearchOptions {
@@ -70,6 +73,8 @@ pub struct SearchEngineStats {
     pub total_dep_edges: usize,
     pub cache_hit_rate: f64,
     pub index_version: u64,
+    pub index_cache_status: &'static str,
+    pub index_cache_error_code: Option<&'static str>,
 }
 
 pub struct LocalSearchEngine {
@@ -87,6 +92,8 @@ pub struct LocalSearchEngine {
     is_ready: bool,
     tracked_file_states: HashMap<String, (u64, u64)>,
     index_version: u64,
+    index_cache_status: &'static str,
+    index_cache_error_code: Option<&'static str>,
     project_vocabulary_dirty: bool,
     recent_edited_files: HashMap<String, u64>,
 }
@@ -108,6 +115,8 @@ impl LocalSearchEngine {
             is_ready: false,
             tracked_file_states: HashMap::new(),
             index_version: 0,
+            index_cache_status: INDEX_CACHE_STATUS_READY,
+            index_cache_error_code: None,
             project_vocabulary_dirty: true,
             recent_edited_files: HashMap::new(),
         }
@@ -410,6 +419,8 @@ impl LocalSearchEngine {
             total_dep_edges: dep_stats.total_edges,
             cache_hit_rate: cache_stats.hit_rate,
             index_version: self.index_version,
+            index_cache_status: self.index_cache_status,
+            index_cache_error_code: self.index_cache_error_code,
         }
     }
 
@@ -482,7 +493,7 @@ impl LocalSearchEngine {
         true
     }
 
-    fn save_index(&self) {
+    fn save_index(&mut self) {
         let manifest =
             IndexPersistence::build_file_manifest(&self.project_root, &self.indexed_files);
         let snapshot = PersistenceSnapshot {
@@ -496,7 +507,21 @@ impl LocalSearchEngine {
             dependency_graph: self.dependency_graph.to_snapshot(),
             expansion_cache: Some(self.query_expander.export_cache()),
         };
-        let _ = self.persistence.save(&snapshot);
+        match self.persistence.save(&snapshot) {
+            Ok(()) => {
+                self.index_cache_status = INDEX_CACHE_STATUS_READY;
+                self.index_cache_error_code = None;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    project_root = %self.project_root,
+                    error = %error,
+                    "local search index cache persistence failed"
+                );
+                self.index_cache_status = INDEX_CACHE_STATUS_DEGRADED;
+                self.index_cache_error_code = Some(INDEX_CACHE_SAVE_FAILED_CODE);
+            }
+        }
     }
 
     fn apply_changed_file(&mut self, relative_path: &str, file_type: &str) {
@@ -1104,6 +1129,47 @@ mod tests {
                 .iter()
                 .any(|result| result.file_path == "src/added.rs"),
             "正常源码文件仍应被增量索引"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn index_cache_persistence_failure_marks_engine_degraded_without_breaking_search() {
+        let root = std::env::temp_dir().join(format!(
+            "magi-local-search-cache-degraded-{}-{}",
+            std::process::id(),
+            now_millis()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).expect("create src");
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "pub fn cache_degraded_search_probe() -> bool { true }\n",
+        )
+        .expect("write source");
+        std::fs::write(root.join(".magi"), "occupied").expect("occupy .magi path");
+
+        let mut engine = LocalSearchEngine::new(
+            root.to_string_lossy().as_ref(),
+            SearchEngineConfig::default(),
+        );
+        engine.build_index(&[("src/lib.rs".to_string(), "source".to_string())]);
+        let stats = engine.get_stats();
+
+        assert!(stats.is_ready);
+        assert_eq!(stats.total_documents, 1);
+        assert_eq!(stats.index_cache_status, INDEX_CACHE_STATUS_DEGRADED);
+        assert_eq!(
+            stats.index_cache_error_code,
+            Some(INDEX_CACHE_SAVE_FAILED_CODE)
+        );
+        assert!(
+            engine
+                .search("cache degraded probe", SearchOptions::default())
+                .iter()
+                .any(|result| result.file_path == "src/lib.rs"),
+            "缓存落盘失败不能破坏当前进程内检索"
         );
 
         let _ = std::fs::remove_dir_all(&root);

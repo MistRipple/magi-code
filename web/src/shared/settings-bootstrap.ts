@@ -39,6 +39,8 @@ export interface SettingsCapabilityDependency {
   sessionId?: string | null;
   fileCount?: number | null;
   lastIndexed?: number | null;
+  cacheStatus?: string | null;
+  cacheErrorCode?: string | null;
   roleCount?: number | null;
   spawnableRoleCount?: number | null;
   snapshotActive?: boolean | null;

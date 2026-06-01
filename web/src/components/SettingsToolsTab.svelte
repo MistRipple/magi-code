@@ -126,6 +126,8 @@
     switch (status) {
       case 'ready':
         return i18n.t('settings.tools.runtimeReady');
+      case 'degraded':
+        return i18n.t('settings.tools.runtimeDegraded');
       case 'not_ready':
         return i18n.t('settings.tools.runtimeNotReady');
       case 'missing_context':
@@ -141,6 +143,7 @@
     switch (status) {
       case 'ready':
         return 'success';
+      case 'degraded':
       case 'not_ready':
       case 'missing_context':
         return 'warning';
@@ -206,6 +209,8 @@
         return i18n.t('settings.tools.dependency.status.available');
       case 'ready':
         return i18n.t('settings.tools.dependency.status.ready');
+      case 'degraded':
+        return i18n.t('settings.tools.dependency.status.degraded');
       case 'not_ready':
         return i18n.t('settings.tools.dependency.status.notReady');
       case 'missing_context':
@@ -222,6 +227,7 @@
       case 'available':
       case 'ready':
         return 'success';
+      case 'degraded':
       case 'not_ready':
       case 'missing_context':
         return 'warning';

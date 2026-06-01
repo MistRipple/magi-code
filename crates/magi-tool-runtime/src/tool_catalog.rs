@@ -236,6 +236,8 @@ struct RuntimeHealth {
     workspace_code_index_ready: bool,
     workspace_code_index_file_count: Option<usize>,
     workspace_code_index_last_indexed: Option<u64>,
+    workspace_code_index_cache_status: Option<String>,
+    workspace_code_index_cache_error_code: Option<String>,
     agent_role_registry_available: bool,
     agent_role_count: usize,
     spawnable_agent_role_count: usize,
@@ -261,19 +263,30 @@ impl RuntimeHealth {
             workspace_code_index_ready,
             workspace_code_index_file_count,
             workspace_code_index_last_indexed,
+            workspace_code_index_cache_status,
+            workspace_code_index_cache_error_code,
         ) = match (
             resources.knowledge_store.as_ref(),
             context.workspace_id.as_ref(),
         ) {
             (Some(store), Some(workspace_id)) => {
                 let summary = store.code_index_summary_for_workspace(workspace_id);
+                let stats = store.workspace_index_stats(workspace_id);
                 (
-                    store.workspace_index_ready(workspace_id),
+                    stats
+                        .as_ref()
+                        .is_some_and(|stats| stats.is_ready && stats.total_documents > 0),
                     summary.as_ref().map(|summary| summary.files.len()),
                     summary.as_ref().map(|summary| summary.last_indexed),
+                    stats
+                        .as_ref()
+                        .map(|stats| stats.index_cache_status.to_string()),
+                    stats
+                        .as_ref()
+                        .and_then(|stats| stats.index_cache_error_code.map(str::to_string)),
                 )
             }
-            _ => (false, None, None),
+            _ => (false, None, None, None, None),
         };
 
         Self {
@@ -282,6 +295,8 @@ impl RuntimeHealth {
             workspace_code_index_ready,
             workspace_code_index_file_count,
             workspace_code_index_last_indexed,
+            workspace_code_index_cache_status,
+            workspace_code_index_cache_error_code,
             agent_role_registry_available: resources.agent_role_catalog_provider.is_some(),
             agent_role_count: agent_roles.len(),
             spawnable_agent_role_count: agent_roles.iter().filter(|role| role.spawnable).count(),
@@ -352,6 +367,12 @@ impl RuntimeHealth {
                 warnings: vec!["当前工作区本地索引尚未就绪".to_string()],
             };
         }
+        if self.workspace_code_index_cache_status.as_deref() == Some("degraded") {
+            return RuntimeToolStatus {
+                status: "degraded",
+                warnings: vec!["本地索引缓存暂不可持久化，当前检索仍可用".to_string()],
+            };
+        }
         RuntimeToolStatus {
             status: "ready",
             warnings: Vec::new(),
@@ -375,6 +396,8 @@ impl RuntimeHealth {
                 "workspace_id": self.workspace_id,
                 "file_count": self.workspace_code_index_file_count,
                 "last_indexed": self.workspace_code_index_last_indexed,
+                "cache_status": self.workspace_code_index_cache_status,
+                "cache_error_code": self.workspace_code_index_cache_error_code,
                 "required_by": ["search_semantic", "code_symbols"],
             }),
             serde_json::json!({
@@ -402,6 +425,10 @@ impl RuntimeHealth {
             "unavailable"
         } else if self.workspace_id.is_none() {
             "missing_context"
+        } else if self.workspace_code_index_ready
+            && self.workspace_code_index_cache_status.as_deref() == Some("degraded")
+        {
+            "degraded"
         } else if self.workspace_code_index_ready {
             "ready"
         } else {
@@ -717,6 +744,8 @@ mod tests {
                     session_id: context.session_id.as_ref().map(ToString::to_string),
                     file_count: None,
                     last_indexed: None,
+                    cache_status: None,
+                    cache_error_code: None,
                     role_count: None,
                     spawnable_role_count: None,
                     snapshot_active: Some(false),
@@ -913,6 +942,62 @@ mod tests {
             "workspace_code_index"
         );
         assert_eq!(payload["runtime_dependencies"][1]["status"], "ready");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tool_catalog_reports_degraded_workspace_code_index_cache() {
+        let root = std::env::temp_dir().join(format!(
+            "magi-tool-catalog-index-degraded-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("src")).expect("create test workspace");
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "pub fn catalog_index_degraded_probe() -> bool { true }\n",
+        )
+        .expect("write test source");
+        std::fs::write(root.join(".magi"), "occupied").expect("occupy cache root");
+
+        let workspace_id = magi_core::WorkspaceId::new("workspace-tool-catalog-index-degraded");
+        let store = std::sync::Arc::new(magi_knowledge_store::KnowledgeStore::new());
+        store.build_workspace_index(&workspace_id, &root);
+        let resources = ToolRuntimeResources {
+            knowledge_store: Some(store),
+            ..ToolRuntimeResources::default()
+        };
+        let context = ToolExecutionContext {
+            workspace_id: Some(workspace_id),
+            working_directory: Some(root.clone()),
+            ..ToolExecutionContext::default()
+        };
+
+        let output = execute_tool_catalog("{}", &context, &resources);
+        let payload: serde_json::Value = serde_json::from_str(&output).expect("json output");
+        let search_semantic = payload["tools"]
+            .as_array()
+            .expect("tools")
+            .iter()
+            .find(|tool| tool["name"] == "search_semantic")
+            .expect("search_semantic should be listed");
+        let workspace_code_index = payload["runtime_dependencies"]
+            .as_array()
+            .expect("runtime dependencies")
+            .iter()
+            .find(|dependency| dependency["name"] == "workspace_code_index")
+            .expect("workspace_code_index dependency should be listed");
+
+        assert_eq!(search_semantic["runtime_status"], "degraded");
+        assert_eq!(workspace_code_index["status"], "degraded");
+        assert_eq!(workspace_code_index["cache_status"], "degraded");
+        assert_eq!(
+            workspace_code_index["cache_error_code"],
+            "index_cache_save_failed"
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }

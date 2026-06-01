@@ -27,6 +27,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
 
+pub use local_search_engine::SearchEngineStats;
 use local_search_engine::{LocalSearchEngine, SearchEngineConfig, SearchOptions, SearchResult};
 
 use normalization::{normalize_code_index_ingestion, normalize_record};
@@ -336,6 +337,17 @@ impl KnowledgeStore {
                 engine.is_ready() && engine.get_stats().total_documents > 0
             })
             .unwrap_or(false)
+    }
+
+    pub fn workspace_index_stats(&self, workspace_id: &WorkspaceId) -> Option<SearchEngineStats> {
+        let engine = self
+            .search_engines
+            .read()
+            .expect("knowledge store search engines read lock poisoned")
+            .get(workspace_id)
+            .cloned()?;
+        let engine = engine.lock().expect("search engine mutex poisoned");
+        Some(engine.get_stats())
     }
 
     pub fn upsert(&self, record: KnowledgeRecord) {

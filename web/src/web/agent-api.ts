@@ -223,6 +223,8 @@ function normalizeCapabilityDependencies(value: unknown): SettingsCapabilityDepe
       sessionId: normalizeNullableString(record.session_id ?? record.sessionId),
       fileCount: normalizeNullableNumber(record.file_count ?? record.fileCount),
       lastIndexed: normalizeNullableNumber(record.last_indexed ?? record.lastIndexed),
+      cacheStatus: normalizeNullableString(record.cache_status ?? record.cacheStatus),
+      cacheErrorCode: normalizeNullableString(record.cache_error_code ?? record.cacheErrorCode),
       roleCount: normalizeNullableNumber(record.role_count ?? record.roleCount),
       spawnableRoleCount: normalizeNullableNumber(
         record.spawnable_role_count ?? record.spawnableRoleCount,
