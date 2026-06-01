@@ -12,6 +12,12 @@ pub(super) struct SessionWorkspaceScope {
 }
 
 #[derive(Clone, Debug)]
+pub(super) struct RegisteredWorkspaceBinding {
+    pub workspace_id: WorkspaceId,
+    pub workspace_path: String,
+}
+
+#[derive(Clone, Debug)]
 pub(super) struct OptionalSessionWorkspaceScope {
     session_id: Option<SessionId>,
     workspace_id: Option<WorkspaceId>,
@@ -72,16 +78,48 @@ pub(super) fn require_registered_workspace_id(
     value: Option<&str>,
 ) -> Result<WorkspaceId, ApiError> {
     let workspace_id = require_workspace_id(value)?;
-    if state
-        .workspace_root_path(&Some(workspace_id.clone()))
-        .is_none()
-    {
-        return Err(ApiError::not_found(
-            "workspace 不存在",
-            workspace_id.as_str(),
-        ));
-    }
+    registered_workspace_path(state, &workspace_id)?;
     Ok(workspace_id)
+}
+
+pub(super) fn registered_workspace_path(
+    state: &ApiState,
+    workspace_id: &WorkspaceId,
+) -> Result<String, ApiError> {
+    state
+        .workspace_root_path(&Some(workspace_id.clone()))
+        .map(|path| path.to_string_lossy().to_string())
+        .ok_or_else(|| ApiError::not_found("workspace 不存在", workspace_id.as_str()))
+}
+
+pub(super) fn require_registered_workspace_binding(
+    state: &ApiState,
+    requested_workspace_id: Option<&str>,
+    requested_workspace_path: Option<&str>,
+) -> Result<RegisteredWorkspaceBinding, ApiError> {
+    let requested_workspace_id = trimmed_non_empty(requested_workspace_id);
+    let requested_workspace_path = trimmed_non_empty(requested_workspace_path);
+    if requested_workspace_id.is_none() && requested_workspace_path.is_none() {
+        return Err(ApiError::InvalidInput("workspaceId 不能为空".to_string()));
+    }
+    let workspace_id = state
+        .resolve_workspace_id_from_request(
+            requested_workspace_id.map(WorkspaceId::new),
+            requested_workspace_path,
+        )
+        .ok_or_else(|| {
+            ApiError::not_found(
+                "workspace 不存在",
+                requested_workspace_id
+                    .or(requested_workspace_path)
+                    .unwrap_or_default(),
+            )
+        })?;
+    let workspace_path = registered_workspace_path(state, &workspace_id)?;
+    Ok(RegisteredWorkspaceBinding {
+        workspace_id,
+        workspace_path,
+    })
 }
 
 pub(super) fn require_session_workspace_scope(

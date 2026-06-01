@@ -11,6 +11,7 @@ use magi_knowledge_store::{
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+use super::session_scope;
 use crate::{errors::ApiError, state::ApiState};
 
 pub fn routes() -> Router<ApiState> {
@@ -65,24 +66,11 @@ struct KnowledgeMutationResponse {
     knowledge_count: usize,
 }
 
-fn registered_workspace_path(
-    state: &ApiState,
-    workspace_id: &WorkspaceId,
-) -> Result<String, ApiError> {
-    state
-        .workspace_registry
-        .workspaces()
-        .into_iter()
-        .find(|workspace| workspace.workspace_id == *workspace_id)
-        .map(|workspace| workspace.root_path.to_string())
-        .ok_or_else(|| ApiError::not_found("工作区不存在", workspace_id.as_str()))
-}
-
 fn mutation_response(
     state: &ApiState,
     workspace_id: &WorkspaceId,
 ) -> Result<KnowledgeMutationResponse, ApiError> {
-    let workspace_path = registered_workspace_path(state, workspace_id)?;
+    let workspace_path = session_scope::registered_workspace_path(state, workspace_id)?;
     Ok(KnowledgeMutationResponse {
         success: true,
         workspace_id: workspace_id.as_str().to_string(),
@@ -123,42 +111,14 @@ fn normalize_optional_text(value: Option<String>) -> Option<String> {
         .filter(|text| !text.is_empty())
 }
 
-fn normalize_workspace_id(value: Option<&str>) -> Option<WorkspaceId> {
-    value
-        .map(str::trim)
-        .filter(|workspace_id| !workspace_id.is_empty())
-        .map(WorkspaceId::new)
-}
-
-fn require_workspace_id(value: Option<&str>) -> Result<WorkspaceId, ApiError> {
-    normalize_workspace_id(value)
-        .ok_or_else(|| ApiError::InvalidInput("workspaceId 不能为空".to_string()))
-}
-
-fn require_registered_workspace_id(
-    state: &ApiState,
-    value: Option<&str>,
-) -> Result<WorkspaceId, ApiError> {
-    let workspace_id = require_workspace_id(value)?;
-    if state
-        .workspace_registry
-        .workspaces()
-        .into_iter()
-        .any(|workspace| workspace.workspace_id == workspace_id)
-    {
-        Ok(workspace_id)
-    } else {
-        Err(ApiError::not_found("工作区不存在", workspace_id.as_str()))
-    }
-}
-
 fn require_registered_workspace_binding(
     state: &ApiState,
-    value: Option<&str>,
+    workspace_id: Option<&str>,
+    workspace_path: Option<&str>,
 ) -> Result<(WorkspaceId, String), ApiError> {
-    let workspace_id = require_workspace_id(value)?;
-    let workspace_path = registered_workspace_path(state, &workspace_id)?;
-    Ok((workspace_id, workspace_path))
+    let binding =
+        session_scope::require_registered_workspace_binding(state, workspace_id, workspace_path)?;
+    Ok((binding.workspace_id, binding.workspace_path))
 }
 
 fn normalize_tags(tags: Vec<String>) -> Vec<String> {
@@ -203,14 +163,21 @@ fn title_from_learning(content: &str) -> String {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct KnowledgeWorkspaceRequest {
+    #[serde(default, alias = "workspace_id")]
     workspace_id: Option<String>,
+    #[serde(default, alias = "workspace_path")]
+    workspace_path: Option<String>,
 }
 
 async fn clear_knowledge(
     State(state): State<ApiState>,
     Json(request): Json<KnowledgeWorkspaceRequest>,
 ) -> Result<Json<KnowledgeMutationResponse>, ApiError> {
-    let workspace_id = require_registered_workspace_id(&state, request.workspace_id.as_deref())?;
+    let (workspace_id, _) = require_registered_workspace_binding(
+        &state,
+        request.workspace_id.as_deref(),
+        request.workspace_path.as_deref(),
+    )?;
     state.knowledge_store.clear_workspace(&workspace_id);
     state.persist_knowledge_state_for_api()?;
     Ok(Json(mutation_response(&state, &workspace_id)?))
@@ -220,15 +187,21 @@ async fn clear_knowledge(
 #[serde(rename_all = "camelCase")]
 struct KnowledgeItemsQuery {
     kind: Option<KnowledgeKindParam>,
+    #[serde(default, alias = "workspace_id")]
     workspace_id: Option<String>,
+    #[serde(default, alias = "workspace_path")]
+    workspace_path: Option<String>,
 }
 
 async fn list_knowledge_items(
     State(state): State<ApiState>,
     Query(query): Query<KnowledgeItemsQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let (workspace_id, workspace_path) =
-        require_registered_workspace_binding(&state, query.workspace_id.as_deref())?;
+    let (workspace_id, workspace_path) = require_registered_workspace_binding(
+        &state,
+        query.workspace_id.as_deref(),
+        query.workspace_path.as_deref(),
+    )?;
     let kq = KnowledgeQuery {
         kind: query.kind.map(KnowledgeKindParam::into_domain),
         text: None,
@@ -254,7 +227,10 @@ async fn list_knowledge_items(
 #[serde(rename_all = "camelCase")]
 struct KnowledgeSearchQuery {
     kind: Option<KnowledgeKindParam>,
+    #[serde(default, alias = "workspace_id")]
     workspace_id: Option<String>,
+    #[serde(default, alias = "workspace_path")]
+    workspace_path: Option<String>,
     q: Option<String>,
 }
 
@@ -262,8 +238,11 @@ async fn search_knowledge_items(
     State(state): State<ApiState>,
     Query(query): Query<KnowledgeSearchQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let (workspace_id, workspace_path) =
-        require_registered_workspace_binding(&state, query.workspace_id.as_deref())?;
+    let (workspace_id, workspace_path) = require_registered_workspace_binding(
+        &state,
+        query.workspace_id.as_deref(),
+        query.workspace_path.as_deref(),
+    )?;
     let text = query
         .q
         .map(|text| text.trim().to_string())
@@ -299,8 +278,11 @@ async fn get_project_knowledge(
     State(state): State<ApiState>,
     Query(query): Query<KnowledgeWorkspaceRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let (workspace_id, workspace_path) =
-        require_registered_workspace_binding(&state, query.workspace_id.as_deref())?;
+    let (workspace_id, workspace_path) = require_registered_workspace_binding(
+        &state,
+        query.workspace_id.as_deref(),
+        query.workspace_path.as_deref(),
+    )?;
     let scan_outcome = ensure_workspace_code_index(&state, &workspace_id)?;
 
     let kq = KnowledgeQuery {
@@ -398,7 +380,10 @@ fn code_index_status_json(
 #[serde(rename_all = "camelCase")]
 struct AddKnowledgeItemRequest {
     kind: KnowledgeKindParam,
+    #[serde(default, alias = "workspace_id")]
     workspace_id: Option<String>,
+    #[serde(default, alias = "workspace_path")]
+    workspace_path: Option<String>,
     #[serde(default)]
     title: Option<String>,
     content: String,
@@ -412,7 +397,11 @@ async fn add_knowledge_item(
     State(state): State<ApiState>,
     Json(request): Json<AddKnowledgeItemRequest>,
 ) -> Result<Json<KnowledgeMutationResponse>, ApiError> {
-    let workspace_id = require_registered_workspace_id(&state, request.workspace_id.as_deref())?;
+    let (workspace_id, _) = require_registered_workspace_binding(
+        &state,
+        request.workspace_id.as_deref(),
+        request.workspace_path.as_deref(),
+    )?;
     let kind = request.kind.into_domain();
     let (id_prefix, title, content, source_ref) = match kind {
         KnowledgeKind::Adr => {
@@ -466,7 +455,10 @@ async fn add_knowledge_item(
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct UpdateKnowledgeItemRequest {
+    #[serde(default, alias = "workspace_id")]
     workspace_id: Option<String>,
+    #[serde(default, alias = "workspace_path")]
+    workspace_path: Option<String>,
     knowledge_id: String,
     #[serde(default)]
     title: Option<String>,
@@ -482,7 +474,11 @@ async fn update_knowledge_item(
     State(state): State<ApiState>,
     Json(request): Json<UpdateKnowledgeItemRequest>,
 ) -> Result<Json<KnowledgeMutationResponse>, ApiError> {
-    let workspace_id = require_registered_workspace_id(&state, request.workspace_id.as_deref())?;
+    let (workspace_id, _) = require_registered_workspace_binding(
+        &state,
+        request.workspace_id.as_deref(),
+        request.workspace_path.as_deref(),
+    )?;
     let existing = state
         .knowledge_store
         .get(&request.knowledge_id)
@@ -529,7 +525,10 @@ async fn update_knowledge_item(
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DeleteKnowledgeItemRequest {
+    #[serde(default, alias = "workspace_id")]
     workspace_id: Option<String>,
+    #[serde(default, alias = "workspace_path")]
+    workspace_path: Option<String>,
     knowledge_id: String,
 }
 
@@ -537,7 +536,11 @@ async fn delete_knowledge_item(
     State(state): State<ApiState>,
     Json(request): Json<DeleteKnowledgeItemRequest>,
 ) -> Result<Json<KnowledgeMutationResponse>, ApiError> {
-    let workspace_id = require_registered_workspace_id(&state, request.workspace_id.as_deref())?;
+    let (workspace_id, _) = require_registered_workspace_binding(
+        &state,
+        request.workspace_id.as_deref(),
+        request.workspace_path.as_deref(),
+    )?;
     state
         .knowledge_store
         .delete_in_workspace(&request.knowledge_id, &workspace_id)
@@ -671,6 +674,86 @@ mod tests {
         assert_workspace_binding(&payload, &workspace_a);
         assert_eq!(payload["codeIndex"]["files"][0]["path"], "src/a.rs");
         assert!(payload["items"].is_array(), "items 字段必须存在且为数组");
+    }
+
+    #[tokio::test]
+    async fn project_knowledge_resolves_workspace_from_registered_path_when_query_id_is_stale() {
+        let knowledge_store = KnowledgeStore::new();
+        let workspace_b = WorkspaceId::new("workspace-knowledge-path-b");
+        insert_code_index(&knowledge_store, &workspace_b, "src/b.rs");
+        let state = state_with_knowledge_store(knowledge_store);
+        let root_b = register_test_workspace(&state, &workspace_b);
+        fs::create_dir_all(root_b.join("src")).expect("workspace source dir should create");
+        fs::write(root_b.join("src/b.rs"), "pub fn workspace_b() {}\n")
+            .expect("workspace source should write");
+
+        let response = routes()
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/knowledge?workspaceId=workspace-stale-query&workspacePath={}",
+                        root_b.to_string_lossy()
+                    ))
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = read_json(response).await;
+        assert_workspace_binding(&payload, &workspace_b);
+        assert_eq!(payload["codeIndex"]["files"][0]["path"], "src/b.rs");
+    }
+
+    #[tokio::test]
+    async fn knowledge_mutation_resolves_workspace_from_registered_path_when_payload_id_is_stale() {
+        let state = state_with_knowledge_store(KnowledgeStore::new());
+        let workspace_b = WorkspaceId::new("workspace-knowledge-mutation-path-b");
+        let root_b = register_test_workspace(&state, &workspace_b);
+
+        let response = routes()
+            .with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/knowledge/items")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "kind": "learning",
+                            "workspaceId": "workspace-stale-payload",
+                            "workspacePath": root_b.to_string_lossy(),
+                            "content": "Knowledge writes must follow the registered workspace path.",
+                            "tags": ["scope"],
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = read_json(response).await;
+        assert_workspace_binding(&payload, &workspace_b);
+        assert_eq!(payload["knowledgeCount"], 1);
+        assert!(
+            state
+                .knowledge_store
+                .query(&KnowledgeQuery {
+                    kind: Some(KnowledgeKind::Learning),
+                    text: Some("registered workspace path".to_string()),
+                    tags: vec![],
+                    workspace_id: Some(workspace_b),
+                    limit: 10,
+                })
+                .matches
+                .iter()
+                .any(|entry| entry.record.title.contains("Knowledge writes")),
+            "mutation should write into the workspace resolved from workspacePath"
+        );
     }
 
     #[tokio::test]
