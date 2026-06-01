@@ -1,4 +1,6 @@
-use magi_core::{MissionLifecyclePhase, TaskId, TaskStatus, public_runtime_summary};
+use magi_core::{
+    MissionLifecyclePhase, TaskId, TaskStatus, public_runtime_summary, public_runtime_text,
+};
 use magi_event_bus::{
     AuditUsageLedgerStatus, ExecutionGroupRuntimeSummaryEntry, MissionMetricsSummary,
     RecoveryActivityStage, RecoveryDiagnosticSummaryEntry, RuntimeLedgerSummary,
@@ -194,9 +196,9 @@ fn merge_session_sidecars(
                         tool_call_id: item.tool_call_id.clone(),
                         tool_name: item.tool_name.clone(),
                         tool_status: item.tool_status.clone(),
-                        tool_arguments: item.tool_arguments.clone(),
-                        tool_result: item.tool_result.clone(),
-                        tool_error: item.tool_error.clone(),
+                        tool_arguments: public_runtime_turn_tool_text(&item.tool_arguments),
+                        tool_result: public_runtime_turn_tool_text(&item.tool_result),
+                        tool_error: public_runtime_turn_tool_text(&item.tool_error),
                         request_id: item.request_id.clone(),
                         user_message_id: item.user_message_id.clone(),
                         placeholder_message_id: item.placeholder_message_id.clone(),
@@ -263,6 +265,19 @@ fn task_role_id(task_store: Option<&TaskStore>, task_id: &TaskId) -> Option<Stri
     task_store
         .and_then(|store| store.get_task(task_id))
         .and_then(|task| task.executor_binding_target_role().map(str::to_string))
+}
+
+fn public_runtime_turn_tool_text(value: &Option<String>) -> Option<String> {
+    let value = value.as_deref()?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let public = public_runtime_text(value);
+    if public.is_empty() {
+        None
+    } else {
+        Some(public)
+    }
 }
 
 fn session_branch_summary(
@@ -783,6 +798,106 @@ mod tests {
         );
         assert_eq!(runtime_read_model.meta.ledger.next_sequence, 12);
         assert_eq!(runtime_read_model.meta.ledger.usage_count, 7);
+    }
+
+    #[test]
+    fn runtime_read_model_sanitizes_turn_item_tool_text_only() {
+        let runtime_read_model = runtime_read_model_dto(
+            RuntimeReadModelInput::default(),
+            &[SessionRuntimeSidecarExport {
+                session_id: SessionId::new("session-tool-text"),
+                current_status: SessionExecutionSidecarStatus::Bound,
+                last_update: UtcMillis::now(),
+                ownership: ExecutionOwnership::default(),
+                execution_chain_ref: None,
+                recovery_ref: None,
+                current_turn: Some(magi_session_store::ActiveExecutionTurn {
+                    turn_id: "turn-tool-text".to_string(),
+                    turn_seq: 1,
+                    accepted_at: UtcMillis(1),
+                    completed_at: None,
+                    status: "running".to_string(),
+                    user_message: Some("请检查 /Users/xie/code/TEST 里的文件".to_string()),
+                    items: vec![magi_session_store::ActiveExecutionTurnItem {
+                        item_id: "turn-item-tool".to_string(),
+                        item_seq: 1,
+                        kind: "tool_call".to_string(),
+                        status: "failed".to_string(),
+                        source: "worker".to_string(),
+                        title: Some("读取文件".to_string()),
+                        content: Some("用户要求检查 /Users/xie/code/TEST".to_string()),
+                        task_id: None,
+                        worker_id: None,
+                        role_id: None,
+                        tool_call_id: Some("tool-call-sensitive".to_string()),
+                        tool_name: Some("read_file".to_string()),
+                        tool_status: Some("failed".to_string()),
+                        tool_arguments: Some(
+                            r#"{"path":"/Users/xie/code/TEST/secret.txt","token":"sk-argument-secret"}"#
+                                .to_string(),
+                        ),
+                        tool_result: Some(
+                            "read /private/tmp/magi/result with Bearer resulttoken".to_string(),
+                        ),
+                        tool_error: Some(
+                            "failed at /var/folders/magi/cache with sk-error-secret".to_string(),
+                        ),
+                        request_id: None,
+                        user_message_id: None,
+                        placeholder_message_id: None,
+                        metadata: Default::default(),
+                        timeline_entry_id: None,
+                        source_thread_id: ThreadId::new("thread-tool-text"),
+                    }],
+                }),
+                active_execution_chain: None,
+            }],
+            &[],
+            ledger_dto(AuditUsageLedgerStatus::default()),
+            None,
+            &[],
+        );
+
+        let session = runtime_read_model
+            .details
+            .sessions
+            .first()
+            .expect("session summary should exist");
+        let turn = session
+            .current_turn
+            .as_ref()
+            .expect("current turn should exist");
+        assert_eq!(
+            turn.user_message.as_deref(),
+            Some("请检查 /Users/xie/code/TEST 里的文件")
+        );
+        let item = session.turn_items.first().expect("turn item should exist");
+        assert_eq!(
+            item.content.as_deref(),
+            Some("用户要求检查 /Users/xie/code/TEST")
+        );
+
+        let tool_arguments = item
+            .tool_arguments
+            .as_deref()
+            .expect("tool arguments should exist");
+        let tool_result = item
+            .tool_result
+            .as_deref()
+            .expect("tool result should exist");
+        let tool_error = item.tool_error.as_deref().expect("tool error should exist");
+        for public_text in [tool_arguments, tool_result, tool_error] {
+            assert!(public_text.contains("[path]"));
+            assert!(!public_text.contains("/Users/xie"));
+            assert!(!public_text.contains("/private/tmp"));
+            assert!(!public_text.contains("/var/folders"));
+            assert!(!public_text.contains("argument-secret"));
+            assert!(!public_text.contains("resulttoken"));
+            assert!(!public_text.contains("error-secret"));
+        }
+        assert!(tool_arguments.contains(r#""token":"[redacted]""#));
+        assert!(tool_result.contains("Bearer [redacted]"));
+        assert!(tool_error.contains("sk-[redacted]"));
     }
 
     #[test]
