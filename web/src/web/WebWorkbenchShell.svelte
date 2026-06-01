@@ -800,7 +800,7 @@
     window.addEventListener('pointerup', handlePointerUp);
   }
 
-  function resolvePreviewFilePath(filePath: string): string {
+  function resolvePreviewFilePath(filePath: string, workspaceRootHint = ''): string {
     const trimmedPath = filePath.trim();
     if (!trimmedPath) {
       return '';
@@ -808,7 +808,7 @@
     if (/^(?:[a-zA-Z]:[\\/]|\/|\\\\)/.test(trimmedPath)) {
       return trimmedPath;
     }
-    const workspaceRoot = selectedWorkspace?.rootPath?.trim() || '';
+    const workspaceRoot = workspaceRootHint.trim() || selectedWorkspace?.rootPath?.trim() || '';
     return workspaceRoot ? `${workspaceRoot.replace(/[\\/]+$/, '')}/${trimmedPath.replace(/^[\\/]+/, '')}` : trimmedPath;
   }
 
@@ -831,10 +831,6 @@
       tailSummary?: string;
     } = {},
   ): boolean {
-    const resolvedFilePath = resolvePreviewFilePath(filePath);
-    if (!resolvedFilePath) {
-      return false;
-    }
     const sessionId = metadata.sessionId?.trim() || currentSessionId || '';
     if (!sessionId) {
       return false;
@@ -842,6 +838,10 @@
     const workspaceId = metadata.workspaceId?.trim() || selectedWorkspace?.workspaceId?.trim() || selectedWorkspaceId.trim();
     const workspacePath = metadata.workspacePath?.trim() || selectedWorkspace?.rootPath?.trim() || '';
     if (!workspaceId || !workspacePath) {
+      return false;
+    }
+    const resolvedFilePath = resolvePreviewFilePath(filePath, workspacePath);
+    if (!resolvedFilePath) {
       return false;
     }
     openCodeTab(sessionId, resolvedFilePath, {
