@@ -2,6 +2,7 @@ pub mod errors;
 pub mod execution;
 pub mod ids;
 pub mod paths;
+pub mod public_text;
 pub mod status;
 pub mod task;
 pub mod value_objects;
@@ -14,6 +15,10 @@ pub use execution::{ExecutionOwnership, RecoveryResumeInput, TaskExecutionTarget
 pub use ids::{
     AssignmentId, EventId, LeaseId, MissionId, SessionId, TaskId, ThreadId, ToolCallId, WorkerId,
     WorkspaceId,
+};
+pub use public_text::{
+    PUBLIC_REDACTED_PATH, PUBLIC_REDACTED_VALUE, PUBLIC_RUNTIME_SUMMARY_MAX_CHARS,
+    public_runtime_excerpt, public_runtime_summary, public_runtime_text,
 };
 pub use status::{
     ApprovalRequirement, AssignmentLifecycleStatus, DispatchReason, ExecutionResultStatus,

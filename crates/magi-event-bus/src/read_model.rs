@@ -1,5 +1,7 @@
 use crate::{AuditUsageLedgerStatus, EventCategory, EventEnvelope};
-use magi_core::{AssignmentId, MissionId, SessionId, TaskId, UtcMillis, WorkspaceId};
+use magi_core::{
+    AssignmentId, MissionId, SessionId, TaskId, UtcMillis, WorkspaceId, public_runtime_summary,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -2254,7 +2256,7 @@ impl RecoveryActivityEntry {
                 .payload
                 .get("diagnostic_summary")
                 .and_then(|value| value.as_str())
-                .map(ToString::to_string),
+                .and_then(|value| public_runtime_summary(Some(value))),
         })
     }
 }
@@ -2313,6 +2315,42 @@ mod tests {
         assert!(!public_error.contains("/Users/xie"));
         assert!(!public_error.contains("Permission denied"));
         assert!(!summary.is_persist_healthy);
+    }
+
+    #[test]
+    fn recovery_diagnostic_summary进入读模型前会脱敏() {
+        let mut event = EventEnvelope::domain(
+            EventId::new("event-recovery-diagnostic"),
+            "mission.resume.command.created",
+            json!({
+                "recovery_id": "recovery-public-diagnostic",
+                "diagnostic_summary": "resume failed at /Users/xie/.magi/session.json with Bearer abcdef and sk-live-secret"
+            }),
+        );
+        event.sequence = 1;
+
+        let read_model = RuntimeReadModelInput::from_events(&[event]);
+        let entry_summary = read_model
+            .recovery
+            .entries
+            .first()
+            .and_then(|entry| entry.diagnostic_summary.as_deref())
+            .expect("recovery entry diagnostic should exist");
+        let aggregate_summary = read_model
+            .recovery
+            .summaries
+            .first()
+            .and_then(|summary| summary.diagnostic_summary.as_deref())
+            .expect("recovery aggregate diagnostic should exist");
+
+        for public_summary in [entry_summary, aggregate_summary] {
+            assert!(public_summary.contains("[path]"));
+            assert!(public_summary.contains("Bearer [redacted]"));
+            assert!(public_summary.contains("sk-[redacted]"));
+            assert!(!public_summary.contains("/Users/xie"));
+            assert!(!public_summary.contains("abcdef"));
+            assert!(!public_summary.contains("sk-live-secret"));
+        }
     }
 
     #[test]

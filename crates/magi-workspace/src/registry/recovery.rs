@@ -5,6 +5,7 @@ use crate::models::{
 };
 use magi_core::{
     DomainError, DomainResult, ExecutionOwnership, RecoveryResumeInput, UtcMillis, WorkspaceId,
+    public_runtime_summary,
 };
 
 fn flush_metadata(flush_state: &RecoverySidecarFlushState) -> WorkspaceRecoveryFlushMetadata {
@@ -83,7 +84,7 @@ impl WorkspaceStore {
                 ownership
             },
             snapshot_id: snapshot_id.into(),
-            diagnostic_summary,
+            diagnostic_summary: public_runtime_summary(diagnostic_summary.as_deref()),
             status: RecoveryStatus::Prepared,
             created_at: now,
             updated_at: now,
@@ -157,7 +158,7 @@ impl WorkspaceStore {
             recovery_id: handle.recovery_id,
             snapshot_id: handle.snapshot_id,
             ownership: handle.ownership,
-            diagnostic_summary: handle.diagnostic_summary,
+            diagnostic_summary: public_runtime_summary(handle.diagnostic_summary.as_deref()),
             created_at: handle.created_at,
             updated_at: handle.updated_at,
         })

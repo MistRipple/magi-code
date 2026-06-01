@@ -1022,6 +1022,68 @@ mod tests {
     }
 
     #[test]
+    fn recovery_diagnostic_summary_is_public_for_storage_export_and_resume_input() {
+        let store = WorkspaceStore::new();
+        let workspace_id = WorkspaceId::new("workspace-public-recovery");
+        store
+            .register(workspace_id.clone(), AbsolutePath::new("/tmp/ws"))
+            .expect("register");
+
+        let snapshot = store.append_execution_snapshot(
+            workspace_id.clone(),
+            ExecutionOwnership {
+                session_id: Some(SessionId::new("session-public-recovery")),
+                workspace_id: Some(workspace_id.clone()),
+                execution_chain_ref: Some("chain-public-recovery".to_string()),
+                ..ExecutionOwnership::default()
+            },
+            "snapshot-public-recovery",
+            "snapshot label",
+        );
+
+        let recovery = store.prepare_recovery_entry(
+            workspace_id.clone(),
+            ExecutionOwnership {
+                session_id: Some(SessionId::new("session-public-recovery")),
+                execution_chain_ref: Some("chain-public-recovery".to_string()),
+                ..ExecutionOwnership::default()
+            },
+            snapshot.snapshot_id,
+            "recovery-public-recovery",
+            Some(
+                "resume failed at /Users/xie/.magi/recovery.json with Bearer abcdef and sk-secret"
+                    .to_string(),
+            ),
+        );
+
+        store
+            .mark_recovery_ready(&recovery.recovery_id)
+            .expect("recovery should become ready");
+        let export = store
+            .recovery_sidecar_exports()
+            .into_iter()
+            .find(|export| export.recovery_ref == recovery.recovery_id)
+            .expect("recovery export should exist");
+        let input = store
+            .build_recovery_resume_input(&recovery.recovery_id)
+            .expect("resume input should build");
+
+        for public_summary in [
+            recovery.diagnostic_summary.as_deref(),
+            export.diagnostic_summary.as_deref(),
+            input.diagnostic_summary.as_deref(),
+        ] {
+            let public_summary = public_summary.expect("diagnostic summary should exist");
+            assert!(public_summary.contains("[path]"));
+            assert!(public_summary.contains("Bearer [redacted]"));
+            assert!(public_summary.contains("sk-[redacted]"));
+            assert!(!public_summary.contains("/Users/xie"));
+            assert!(!public_summary.contains("abcdef"));
+            assert!(!public_summary.contains("sk-secret"));
+        }
+    }
+
+    #[test]
     fn duplicate_ownership_allocation_rejected() {
         let store = WorkspaceStore::new();
         let workspace_id = WorkspaceId::new("workspace-dup");

@@ -1,6 +1,6 @@
 use magi_core::{
     AbsolutePath, DomainError, DomainResult, ExecutionOwnership, UtcMillis, WorkspaceId,
-    WorkspaceLifecycleStatus,
+    WorkspaceLifecycleStatus, public_runtime_summary,
 };
 use serde::{Deserialize, Serialize};
 
@@ -98,7 +98,7 @@ impl RecoveryHandle {
             ownership: self.ownership.clone(),
             execution_chain_ref: self.ownership.execution_chain_ref.clone(),
             snapshot_id: self.snapshot_id.clone(),
-            diagnostic_summary: self.diagnostic_summary.clone(),
+            diagnostic_summary: public_runtime_summary(self.diagnostic_summary.as_deref()),
             consumed_at: self.consumed_at,
         }
     }

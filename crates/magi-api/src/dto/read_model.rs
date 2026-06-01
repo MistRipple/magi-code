@@ -1,4 +1,4 @@
-use magi_core::{MissionLifecyclePhase, TaskId, TaskStatus};
+use magi_core::{MissionLifecyclePhase, TaskId, TaskStatus, public_runtime_summary};
 use magi_event_bus::{
     AuditUsageLedgerStatus, ExecutionGroupRuntimeSummaryEntry, MissionMetricsSummary,
     RecoveryActivityStage, RecoveryDiagnosticSummaryEntry, RuntimeLedgerSummary,
@@ -465,6 +465,8 @@ fn merge_workspace_sidecars(
             .summaries
             .iter_mut()
             .find(|summary| summary.recovery_id == export.recovery_ref);
+        let public_diagnostic_summary =
+            public_runtime_summary(export.diagnostic_summary.as_deref());
         let summary = match summary {
             Some(summary) => summary,
             None => {
@@ -485,7 +487,7 @@ fn merge_workspace_sidecars(
                         task_id: export.ownership.task_id.clone(),
                         worker_id: export.ownership.worker_id.as_ref().map(ToString::to_string),
                         execution_chain_ref: export.execution_chain_ref.clone(),
-                        diagnostic_summary: export.diagnostic_summary.clone(),
+                        diagnostic_summary: public_diagnostic_summary.clone(),
                         current_status: entry.current_status.clone().unwrap_or_default(),
                     });
                 runtime_read_model
@@ -514,7 +516,7 @@ fn merge_workspace_sidecars(
             summary.execution_chain_ref = export.execution_chain_ref.clone();
         }
         if summary.diagnostic_summary.is_none() {
-            summary.diagnostic_summary = export.diagnostic_summary.clone();
+            summary.diagnostic_summary = public_diagnostic_summary;
         }
         if summary.event_count == 0 {
             summary.latest_occurred_at = export.last_update;
@@ -1371,6 +1373,44 @@ mod tests {
             runtime_read_model.recovery.summaries[1].current_status,
             "ready".to_string()
         );
+    }
+
+    #[test]
+    fn runtime_read_model_sanitizes_workspace_recovery_diagnostic_summary() {
+        let runtime_read_model = runtime_read_model_dto(
+            RuntimeReadModelInput::default(),
+            &[],
+            &[WorkspaceRecoverySidecarExport {
+                recovery_ref: "recovery-public-sidecar".to_string(),
+                workspace_id: WorkspaceId::new("workspace-public-sidecar"),
+                current_status: RecoveryStatus::Ready,
+                last_update: UtcMillis::now(),
+                ownership: ExecutionOwnership::default(),
+                execution_chain_ref: None,
+                snapshot_id: "snapshot-public-sidecar".to_string(),
+                diagnostic_summary: Some(
+                    "resume from /Users/xie/.magi/recovery.json with Bearer abcdef and sk-test-secret"
+                        .to_string(),
+                ),
+                consumed_at: None,
+            }],
+            ledger_dto(AuditUsageLedgerStatus::default()),
+            None,
+            &[],
+        );
+
+        let summary = runtime_read_model
+            .recovery
+            .summaries
+            .first()
+            .and_then(|summary| summary.diagnostic_summary.as_deref())
+            .expect("recovery sidecar diagnostic should exist");
+        assert!(summary.contains("[path]"));
+        assert!(summary.contains("Bearer [redacted]"));
+        assert!(summary.contains("sk-[redacted]"));
+        assert!(!summary.contains("/Users/xie"));
+        assert!(!summary.contains("abcdef"));
+        assert!(!summary.contains("sk-test-secret"));
     }
 
     #[test]
