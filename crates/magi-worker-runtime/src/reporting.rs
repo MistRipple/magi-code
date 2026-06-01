@@ -6,6 +6,10 @@ use magi_core::{
 use magi_skill_runtime::{SkillDispatchObservation, SkillDispatchRoute, SkillDispatchStatus};
 use serde::{Deserialize, Serialize};
 
+const SKILL_DISPATCH_NEEDS_APPROVAL_DETAIL: &str = "Skill 工具需要批准后执行";
+const SKILL_DISPATCH_REJECTED_DETAIL: &str = "Skill 工具调用被策略或配置阻断";
+const SKILL_DISPATCH_FAILED_DETAIL: &str = "Skill 工具调用失败，请检查工具配置或外接服务状态";
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkerExecutionReport {
     pub worker_id: WorkerId,
@@ -218,7 +222,7 @@ impl WorkerRuntime {
             route: observation.route,
             binding_id: observation.binding_id.clone(),
             status: observation.status,
-            detail: observation.detail.clone(),
+            detail: public_skill_dispatch_detail(&observation),
             observed_at: UtcMillis::now(),
         };
         self.skill_dispatches
@@ -308,6 +312,15 @@ impl WorkerRuntime {
                     && report.stage == stage
             })
             .cloned()
+    }
+}
+
+fn public_skill_dispatch_detail(observation: &SkillDispatchObservation) -> String {
+    match observation.status {
+        SkillDispatchStatus::Succeeded => observation.detail.clone(),
+        SkillDispatchStatus::NeedsApproval => SKILL_DISPATCH_NEEDS_APPROVAL_DETAIL.to_string(),
+        SkillDispatchStatus::Rejected => SKILL_DISPATCH_REJECTED_DETAIL.to_string(),
+        SkillDispatchStatus::Failed => SKILL_DISPATCH_FAILED_DETAIL.to_string(),
     }
 }
 

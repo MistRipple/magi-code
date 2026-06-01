@@ -986,6 +986,66 @@ mod tests {
     }
 
     #[test]
+    fn worker_skill_dispatch_failure_detail_is_public_in_snapshot_and_event() {
+        let bus = Arc::new(InMemoryEventBus::new(16));
+        let runtime = WorkerRuntime::new_compare(bus.clone());
+        let worker_id = worker_id("worker-skill-public-detail");
+        let task_id = task_id("task-skill-public-detail");
+        runtime.register_worker(worker_id.clone());
+        runtime
+            .start_execution(&worker_id, task_id.clone())
+            .expect("worker should start execution");
+
+        let raw_detail = "桥接调用失败[Transport]: /Users/xie/.mcp/server failed: ENOENT";
+        let record = runtime
+            .observe_skill_dispatch(
+                &worker_id,
+                magi_skill_runtime::SkillDispatchObservation {
+                    tool_call_id: ToolCallId::new("skill-call-public-detail"),
+                    tool_name: "echo.inspect".to_string(),
+                    route: Some(SkillDispatchRoute::Bridge),
+                    binding_id: Some("inspect-binding".to_string()),
+                    bridge_kind: None,
+                    dispatch_action: None,
+                    status: SkillDispatchStatus::Failed,
+                    error_kind: Some(magi_skill_runtime::SkillDispatchErrorKind::BridgeError),
+                    bridge_error_layer: Some(magi_bridge_client::BridgeErrorLayer::Transport),
+                    bridge_error_message: Some(raw_detail.to_string()),
+                    detail: raw_detail.to_string(),
+                },
+            )
+            .expect("skill dispatch should be recorded");
+
+        assert_eq!(
+            record.detail,
+            "Skill 工具调用失败，请检查工具配置或外接服务状态"
+        );
+        assert!(!record.detail.contains("/Users/xie"));
+        assert!(!record.detail.contains("ENOENT"));
+
+        let event = bus
+            .snapshot()
+            .recent_events
+            .into_iter()
+            .find(|event| event.event_type == "worker.skill_dispatch.observed")
+            .expect("skill dispatch event should be published");
+        let event_text = event.payload.to_string();
+        assert!(event_text.contains("Skill 工具调用失败"));
+        assert!(
+            !event_text.contains("/Users/xie") && !event_text.contains("ENOENT"),
+            "worker skill dispatch event must not expose raw runtime detail: {event_text}"
+        );
+
+        let snapshot = runtime
+            .snapshot_for_task(&task_id)
+            .skill_dispatches
+            .into_iter()
+            .next()
+            .expect("skill dispatch should be present in task snapshot");
+        assert_eq!(snapshot.detail, record.detail);
+    }
+
+    #[test]
     fn worker_loop_can_run_success_cycle_step_by_step() {
         let bus = Arc::new(InMemoryEventBus::new(16));
         let runtime = WorkerRuntime::new_compare(bus);
