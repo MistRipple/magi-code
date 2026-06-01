@@ -302,7 +302,10 @@ impl BuiltinToolName {
     }
 
     pub fn default_access_mode(&self) -> BuiltinToolAccessMode {
-        if matches!(self, Self::ShellExec | Self::ProcessLaunch) {
+        if matches!(
+            self,
+            Self::ShellExec | Self::ProcessLaunch | Self::ProcessWrite | Self::ProcessKill
+        ) {
             BuiltinToolAccessMode::MaybeWrite
         } else if self.is_write_operation() {
             BuiltinToolAccessMode::ExplicitWrite
@@ -5937,6 +5940,14 @@ mod tests {
         );
         assert_eq!(
             registry.builtin_access_mode(BuiltinToolName::ShellExec.as_str()),
+            Some(BuiltinToolAccessMode::MaybeWrite)
+        );
+        assert_eq!(
+            registry.builtin_access_mode(BuiltinToolName::ProcessWrite.as_str()),
+            Some(BuiltinToolAccessMode::MaybeWrite)
+        );
+        assert_eq!(
+            registry.builtin_access_mode(BuiltinToolName::ProcessKill.as_str()),
             Some(BuiltinToolAccessMode::MaybeWrite)
         );
     }
