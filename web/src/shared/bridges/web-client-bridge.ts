@@ -3245,7 +3245,6 @@ async function getMcpServerTools(serverId: string): Promise<void> {
   emitDataMessage('mcpServerTools', payload);
   if (isMcpToolPayloadUnavailable(payload)) {
     await dispatchSettingsBootstrap(true);
-    emitBridgeErrorToast(i18n.t('settings.toast.action.loadMcpToolList'), new Error('mcp_connection_failed'));
     return;
   }
   emitBridgeSuccessToast(
@@ -3260,7 +3259,6 @@ async function refreshMcpTools(serverId: string): Promise<void> {
   emitDataMessage('mcpToolsRefreshed', payload);
   await dispatchSettingsBootstrap(true);
   if (isMcpToolPayloadUnavailable(payload)) {
-    emitBridgeErrorToast(i18n.t('settings.toast.action.refreshMcpTools'), new Error('mcp_connection_failed'));
     return;
   }
   emitBridgeSuccessToast(
