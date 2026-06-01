@@ -413,6 +413,13 @@ impl LocalSearchEngine {
         }
     }
 
+    pub fn code_index_summary(&self) -> crate::code_scanner::CodeIndexSummary {
+        crate::code_scanner::code_index_summary_from_relative_files(
+            Path::new(&self.project_root),
+            &self.indexed_files,
+        )
+    }
+
     fn full_build(&mut self, files: &[(String, String)]) {
         self.inverted_index
             .build_from_files(&self.project_root, files);

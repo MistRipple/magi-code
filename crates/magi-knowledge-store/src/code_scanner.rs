@@ -241,6 +241,38 @@ pub fn scan_workspace(workspace_root: &Path) -> CodeIndexScanOutcome {
     })
 }
 
+pub(crate) fn code_index_summary_from_relative_files(
+    workspace_root: &Path,
+    files: &[(String, String)],
+) -> CodeIndexSummary {
+    let mut scanned_files = files
+        .iter()
+        .filter_map(|(path, _)| scan_relative_file(workspace_root, path))
+        .collect::<Vec<_>>();
+    scanned_files.sort_by(|left, right| left.path.cmp(&right.path));
+
+    let mut tech_stack = Vec::new();
+    let mut entry_points = Vec::new();
+    detect_tech_stack(workspace_root, &scanned_files, &mut tech_stack);
+    detect_entry_points(&scanned_files, &mut entry_points);
+
+    let index_files = scanned_files
+        .into_iter()
+        .map(|file| CodeIndexFile {
+            path: file.path,
+            lines: Some(file.lines),
+            size: Some(file.size),
+        })
+        .collect();
+
+    CodeIndexSummary {
+        files: index_files,
+        tech_stack,
+        entry_points,
+        last_indexed: UtcMillis::now().0,
+    }
+}
+
 /// 将扫描结果摄取到知识存储中
 pub fn ingest_workspace_code_index(
     store: &KnowledgeStore,
@@ -323,6 +355,23 @@ fn scan_directory(root: &Path, current: &Path, files: &mut Vec<ScannedFile>) {
             }
         }
     }
+}
+
+fn scan_relative_file(root: &Path, relative_path: &str) -> Option<ScannedFile> {
+    if !is_indexable_code_path(relative_path) {
+        return None;
+    }
+    let path = root.join(relative_path);
+    let metadata = std::fs::metadata(&path).ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    Some(ScannedFile {
+        path: relative_path.replace('\\', "/"),
+        language: detect_language(relative_path),
+        size: metadata.len(),
+        lines: count_lines(&path),
+    })
 }
 
 fn should_ignore(name: &str) -> bool {

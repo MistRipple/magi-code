@@ -332,10 +332,8 @@ impl KnowledgeStore {
             .expect("knowledge store search engines read lock poisoned")
             .get(workspace_id)
             .map(|engine| {
-                engine
-                    .lock()
-                    .expect("search engine mutex poisoned")
-                    .is_ready()
+                let engine = engine.lock().expect("search engine mutex poisoned");
+                engine.is_ready() && engine.get_stats().total_documents > 0
             })
             .unwrap_or(false)
     }
@@ -509,6 +507,10 @@ impl KnowledgeStore {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Option<crate::code_scanner::CodeIndexSummary> {
+        if let Some(summary) = self.runtime_code_index_summary_for_workspace(workspace_id) {
+            return Some(summary);
+        }
+
         let state = self
             .state
             .read()
@@ -528,6 +530,20 @@ impl KnowledgeStore {
             })
             .max_by(|left, right| left.0.0.cmp(&right.0.0).then_with(|| left.1.cmp(&right.1)))
             .map(|(_, _, summary)| summary)
+    }
+
+    fn runtime_code_index_summary_for_workspace(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Option<crate::code_scanner::CodeIndexSummary> {
+        let engine = self
+            .search_engines
+            .read()
+            .expect("knowledge store search engines read lock poisoned")
+            .get(workspace_id)
+            .cloned()?;
+        let engine = engine.lock().expect("search engine mutex poisoned");
+        engine.is_ready().then(|| engine.code_index_summary())
     }
 
     pub fn delete(&self, knowledge_id: &str) -> Result<(), DomainError> {

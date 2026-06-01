@@ -617,6 +617,18 @@ fn watcher_incrementally_refreshes_index_on_file_change() {
         }
     }
     assert!(hit, "watcher 增量更新后应命中 added.rs");
+    let summary = store
+        .code_index_summary_for_workspace(&workspace_id)
+        .expect("runtime code index summary should exist");
+    assert!(
+        summary.files.iter().any(|file| file.path == "src/added.rs"),
+        "知识库代码索引摘要必须跟随运行时增量索引更新，实际: {:?}",
+        summary
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>()
+    );
 
     let _ = fs::remove_dir_all(&base);
 }
