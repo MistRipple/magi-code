@@ -1045,11 +1045,12 @@ export async function getWorkspaceSessions(
 
 export async function loadAgentSessionSnapshot(
   sessionId: string,
-  options: { limit?: number; beforeCursor?: string; workspaceId: string },
+  options: { limit?: number; beforeCursor?: string; workspaceId: string; workspacePath?: string },
 ): Promise<MessagesResponseDto> {
   try {
     const binding = resolveAgentBindingContext();
     const workspaceId = options.workspaceId.trim() || binding.workspaceId;
+    const workspacePath = options.workspacePath?.trim() || binding.workspacePath;
     if (!workspaceId) {
       throw new Error('workspaceId 不能为空');
     }
@@ -1058,6 +1059,9 @@ export async function loadAgentSessionSnapshot(
       workspaceId,
       limit: String(options.limit ?? 50),
     });
+    if (workspacePath) {
+      query.set('workspacePath', workspacePath);
+    }
     if (options.beforeCursor?.trim()) {
       query.set('beforeCursor', options.beforeCursor.trim());
     }

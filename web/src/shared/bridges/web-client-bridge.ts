@@ -2161,6 +2161,7 @@ async function loadLatestSessionSnapshot(
   const rawPayload = await loadAgentSessionSnapshot(sessionId, {
     limit: SESSION_TIMELINE_PAGE_SIZE,
     workspaceId: targetWorkspaceId,
+    workspacePath: targetWorkspacePath,
   });
   if (requestGeneration !== sessionSnapshotGeneration) {
     return;

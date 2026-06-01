@@ -8,7 +8,8 @@ use magi_session_store::{CanonicalTurn, NotificationRecord, SessionRecord, Timel
 use serde::{Deserialize, Serialize};
 
 use super::session_scope::{
-    parse_session_id, require_session_record_in_workspace, require_workspace_id,
+    parse_session_id, require_registered_workspace_binding, require_session_record_in_workspace,
+    require_workspace_id,
 };
 use crate::{errors::ApiError, state::ApiState};
 
@@ -22,6 +23,8 @@ struct MessagesQuery {
     session_id: Option<String>,
     #[serde(default, alias = "workspace_id")]
     workspace_id: Option<String>,
+    #[serde(default, alias = "workspace_path")]
+    workspace_path: Option<String>,
     limit: Option<usize>,
     before_cursor: Option<String>,
 }
@@ -45,7 +48,22 @@ async fn get_messages(
     State(state): State<ApiState>,
     Query(query): Query<MessagesQuery>,
 ) -> Result<Json<MessagesResponseDto>, ApiError> {
-    let requested_workspace_id = require_workspace_id(query.workspace_id.as_deref())?;
+    let requested_workspace_id = match query
+        .workspace_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|workspace_path| !workspace_path.is_empty())
+    {
+        Some(_) => {
+            require_registered_workspace_binding(
+                &state,
+                query.workspace_id.as_deref(),
+                query.workspace_path.as_deref(),
+            )?
+            .workspace_id
+        }
+        None => require_workspace_id(query.workspace_id.as_deref())?,
+    };
     let sid = parse_session_id(query.session_id.as_deref())?;
     let current_session =
         require_session_record_in_workspace(&state, &sid, Some(requested_workspace_id.as_str()))?;
@@ -91,7 +109,7 @@ mod tests {
         body::{Body, to_bytes},
         http::{Request, StatusCode},
     };
-    use magi_core::{ExecutionOwnership, SessionId, UtcMillis, WorkspaceId};
+    use magi_core::{AbsolutePath, ExecutionOwnership, SessionId, UtcMillis, WorkspaceId};
     use magi_event_bus::InMemoryEventBus;
     use magi_governance::GovernanceService;
     use magi_session_store::{
@@ -99,8 +117,13 @@ mod tests {
         SessionRuntimeSidecar, SessionStore, TimelineEntryKind,
     };
     use magi_workspace::WorkspaceStore;
+    use std::fs;
+    use std::path::PathBuf;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use tower::ServiceExt;
+
+    static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(1);
 
     fn test_state(session_store: SessionStore) -> ApiState {
         ApiState::new(
@@ -110,6 +133,19 @@ mod tests {
             Arc::new(WorkspaceStore::default()),
             Arc::new(GovernanceService::default()),
         )
+    }
+
+    fn unique_temp_dir(prefix: &str) -> PathBuf {
+        let unique = TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "{}-{}-{}-{}",
+            prefix,
+            std::process::id(),
+            UtcMillis::now().0,
+            unique
+        ));
+        fs::create_dir_all(&dir).expect("temp dir should create");
+        dir
     }
 
     async fn read_json_response(response: axum::response::Response) -> serde_json::Value {
@@ -193,6 +229,67 @@ mod tests {
                 .unwrap_or_default()
                 .contains("sessionId 不能为空"),
             "unexpected body: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn messages_resolves_workspace_from_registered_path_when_query_id_is_stale() {
+        let session_id = SessionId::new("session-messages-path-binding");
+        let workspace_id = WorkspaceId::new("workspace-messages-path-binding");
+        let root = unique_temp_dir("magi-messages-path-binding");
+        let store = SessionStore::default();
+        store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "路径绑定会话",
+                Some(workspace_id.to_string()),
+            )
+            .expect("session should create");
+        store.append_timeline_entry(
+            session_id.clone(),
+            TimelineEntryKind::UserMessage,
+            "来自路径绑定的消息",
+        );
+        let state = test_state(store);
+        state
+            .workspace_registry
+            .register(
+                workspace_id.clone(),
+                AbsolutePath::new(root.to_string_lossy().as_ref()),
+            )
+            .expect("workspace should register");
+
+        let response = routes()
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/messages?workspaceId=workspace-stale-query&workspacePath={}&sessionId={}",
+                        urlencoding::encode(root.to_string_lossy().as_ref()),
+                        session_id
+                    ))
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = read_json_response(response).await;
+        assert_eq!(body["sessionId"], session_id.as_str());
+        assert_eq!(
+            body["currentSession"]["workspaceId"],
+            workspace_id.as_str(),
+            "messages must resolve workspace from registered workspacePath"
+        );
+        assert_eq!(body["sessions"][0]["workspaceId"], workspace_id.as_str());
+        assert!(
+            body["timeline"]
+                .as_array()
+                .expect("timeline should be array")
+                .iter()
+                .any(|entry| entry["message"] == "来自路径绑定的消息"),
+            "messages response must include the timeline entry from the resolved workspace session"
         );
     }
 
