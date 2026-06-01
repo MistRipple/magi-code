@@ -195,6 +195,8 @@ fn build_task_projection_overview(
                 recovery_id: None,
                 execution_chain_ref: None,
             },
+            None,
+            None,
             worker_summary,
             tool_summary,
             skill_dispatch_observations,
@@ -719,6 +721,32 @@ fn execution_runtime_can_run_dispatch_through_worker_loop() {
     );
     assert_eq!(result.overview.tool_summary.total_invocations, 2);
     assert!(!result.overview.running_task_ids.contains(&task_id));
+
+    let snapshot = event_bus.snapshot();
+    for event_type in [
+        "worker.report.applied",
+        "worker.skill_dispatch.applied",
+        "mission.execution.overview",
+    ] {
+        let event = snapshot
+            .recent_events
+            .iter()
+            .find(|event| event.event_type == event_type)
+            .unwrap_or_else(|| panic!("{event_type} event should be published"));
+        assert_eq!(
+            event.session_id.as_ref().map(|id| id.as_str()),
+            Some("session-exec")
+        );
+        assert_eq!(
+            event.workspace_id.as_ref().map(|id| id.as_str()),
+            Some("workspace-exec")
+        );
+        assert_eq!(event.payload["session_id"].as_str(), Some("session-exec"));
+        assert_eq!(
+            event.payload["workspace_id"].as_str(),
+            Some("workspace-exec")
+        );
+    }
 }
 
 #[test]

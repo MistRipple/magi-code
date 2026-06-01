@@ -280,11 +280,16 @@ impl OrchestratedExecutionRuntime {
                 mission_id: target.mission_id.clone(),
             })?;
         if let Some(report) = outcome.report.clone() {
-            self.apply_worker_report(&target, &report)?;
+            self.apply_worker_report(&target, &report, &session_id, &workspace_id)?;
         }
         let snapshot = self.worker_runtime.snapshot_for_task(&target.task_id);
         for observation in &snapshot.skill_dispatches {
-            self.publish_worker_skill_dispatch_observation(&target, observation);
+            self.publish_worker_skill_dispatch_observation(
+                &target,
+                observation,
+                &session_id,
+                &workspace_id,
+            );
         }
         let tool_summary = match self.worker_runtime.executor_kind() {
             WorkerExecutorKind::LocalProcess => tool_summary_from_worker_snapshot(&snapshot),
@@ -303,6 +308,8 @@ impl OrchestratedExecutionRuntime {
             .build_execution_overview_from_task_projection(
                 &self.task_store,
                 &target,
+                session_id.clone(),
+                workspace_id.clone(),
                 self.worker_runtime.summary(),
                 tool_summary,
                 &snapshot.skill_dispatches,
@@ -341,6 +348,8 @@ impl OrchestratedExecutionRuntime {
         &self,
         target: &TaskExecutionTarget,
         report: &WorkerExecutionReport,
+        session_id: &Option<SessionId>,
+        workspace_id: &Option<WorkspaceId>,
     ) -> Result<(), OrchestratorCommandError> {
         let next_status = match report.termination_reason {
             Some(magi_core::TerminationReason::Completed) => TaskStatus::Completed,
@@ -393,6 +402,8 @@ impl OrchestratedExecutionRuntime {
             "worker.report.applied",
             EventCategory::Domain,
             EventContext {
+                workspace_id: workspace_id.clone(),
+                session_id: session_id.clone(),
                 mission_id: Some(target.mission_id.clone()),
                 assignment_id: assignment_id.clone(),
                 task_id: Some(report.task_id.clone()),
@@ -402,6 +413,8 @@ impl OrchestratedExecutionRuntime {
                 "worker_id": report.worker_id.to_string(),
                 "task_id": report.task_id.to_string(),
                 "mission_id": target.mission_id.to_string(),
+                "session_id": session_id.as_ref().map(ToString::to_string),
+                "workspace_id": workspace_id.as_ref().map(ToString::to_string),
                 "assignment_id": assignment_id.as_ref().map(ToString::to_string),
                 "status": format!("{:?}", next_status),
                 "stage": format!("{:?}", report.stage),
@@ -416,6 +429,8 @@ impl OrchestratedExecutionRuntime {
         &self,
         target: &TaskExecutionTarget,
         observation: &WorkerSkillDispatchObservation,
+        session_id: &Option<SessionId>,
+        workspace_id: &Option<WorkspaceId>,
     ) {
         let assignment_id = execution_overview::assignment_id_for_task(
             &self.task_store,
@@ -426,6 +441,8 @@ impl OrchestratedExecutionRuntime {
             "worker.skill_dispatch.applied",
             EventCategory::Audit,
             EventContext {
+                workspace_id: workspace_id.clone(),
+                session_id: session_id.clone(),
                 mission_id: Some(target.mission_id.clone()),
                 assignment_id: assignment_id.clone(),
                 task_id: Some(observation.task_id.clone()),
@@ -435,6 +452,8 @@ impl OrchestratedExecutionRuntime {
                 "worker_id": observation.worker_id.to_string(),
                 "task_id": observation.task_id.to_string(),
                 "mission_id": target.mission_id.to_string(),
+                "session_id": session_id.as_ref().map(ToString::to_string),
+                "workspace_id": workspace_id.as_ref().map(ToString::to_string),
                 "assignment_id": assignment_id.as_ref().map(ToString::to_string),
                 "tool_call_id": observation.tool_call_id.to_string(),
                 "tool_name": observation.tool_name,

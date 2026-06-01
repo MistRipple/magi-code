@@ -397,6 +397,8 @@ impl OrchestratorService {
         &self,
         task_store: &task_store::TaskStore,
         target: &TaskExecutionTarget,
+        session_id: Option<SessionId>,
+        workspace_id: Option<WorkspaceId>,
         worker_summary: WorkerRuntimeSummary,
         tool_summary: ToolExecutionSummary,
         skill_dispatch_observations: &[WorkerSkillDispatchObservation],
@@ -417,10 +419,17 @@ impl OrchestratorService {
             "mission.execution.overview",
             EventCategory::Audit,
             EventContext {
+                workspace_id: workspace_id.clone(),
+                session_id: session_id.clone(),
                 mission_id: Some(overview.runtime_snapshot.mission_id.clone()),
+                task_id: Some(target.root_task_id.clone()),
                 ..EventContext::default()
             },
-            execution_overview::build_execution_overview_payload(&overview),
+            scoped_execution_payload(
+                execution_overview::build_execution_overview_payload(&overview),
+                session_id.as_ref(),
+                workspace_id.as_ref(),
+            ),
         );
         Some(overview)
     }
@@ -461,6 +470,28 @@ impl OrchestratorService {
         };
         let _ = self.event_bus.publish(base.with_context(context));
     }
+}
+
+fn scoped_execution_payload(
+    mut payload: serde_json::Value,
+    session_id: Option<&SessionId>,
+    workspace_id: Option<&WorkspaceId>,
+) -> serde_json::Value {
+    if let Some(object) = payload.as_object_mut() {
+        if let Some(session_id) = session_id {
+            object.insert(
+                "session_id".to_string(),
+                serde_json::Value::String(session_id.to_string()),
+            );
+        }
+        if let Some(workspace_id) = workspace_id {
+            object.insert(
+                "workspace_id".to_string(),
+                serde_json::Value::String(workspace_id.to_string()),
+            );
+        }
+    }
+    payload
 }
 
 impl OrchestratedExecutionRuntime {
