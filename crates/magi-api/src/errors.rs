@@ -1,7 +1,9 @@
 use axum::{
     Json,
-    extract::rejection::JsonRejection,
-    http::StatusCode,
+    body::to_bytes,
+    extract::{Request, rejection::JsonRejection},
+    http::{StatusCode, header::CONTENT_TYPE},
+    middleware::Next,
     response::{IntoResponse, Response},
 };
 use serde::Serialize;
@@ -13,8 +15,10 @@ use std::fmt::Display;
 /// 所有对外错误必须经过此枚举映射，不允许 route handler 直接构造裸 HTTP 错误
 #[derive(Clone, Debug)]
 pub enum ApiError {
-    /// 请求体 JSON 格式不合法或字段缺失
+    /// 已进入业务处理后的输入校验失败，消息应当是可直接展示的产品文案
     InvalidInput(String),
+    /// 请求体无法被框架解析，原始 parser 细节只进入日志
+    InvalidRequestBody(String),
     /// 指定的 session 不存在
     SessionNotFound(String),
     /// 指定的 recovery 不存在
@@ -71,9 +75,14 @@ impl ApiError {
         Self::Conflict(format!("{}: {}", context, id))
     }
 
+    pub fn invalid_request_body(err: impl Display) -> Self {
+        Self::InvalidRequestBody(format!("请求体解析失败: {}", err))
+    }
+
     fn error_code(&self) -> &'static str {
         match self {
             ApiError::InvalidInput(_) => "INPUT_INVALID",
+            ApiError::InvalidRequestBody(_) => "REQUEST_BODY_INVALID",
             ApiError::SessionNotFound(_) => "SESSION_NOT_FOUND",
             ApiError::RecoveryNotFound(_) => "RECOVERY_NOT_FOUND",
             ApiError::NotFound(_) => "NOT_FOUND",
@@ -87,6 +96,7 @@ impl ApiError {
     fn status_code(&self) -> StatusCode {
         match self {
             ApiError::InvalidInput(_) => StatusCode::BAD_REQUEST,
+            ApiError::InvalidRequestBody(_) => StatusCode::BAD_REQUEST,
             ApiError::SessionNotFound(_) => StatusCode::NOT_FOUND,
             ApiError::RecoveryNotFound(_) => StatusCode::NOT_FOUND,
             ApiError::NotFound(_) => StatusCode::NOT_FOUND,
@@ -100,6 +110,7 @@ impl ApiError {
     pub(crate) fn message(&self) -> &str {
         match self {
             ApiError::InvalidInput(message) => message,
+            ApiError::InvalidRequestBody(message) => message,
             ApiError::SessionNotFound(message) => message,
             ApiError::RecoveryNotFound(message) => message,
             ApiError::NotFound(message) => message,
@@ -112,6 +123,7 @@ impl ApiError {
 
     fn public_message(&self) -> &str {
         match self {
+            ApiError::InvalidRequestBody(_) => "请求内容格式不正确，请检查后重试",
             ApiError::EventPublishFailed(_) => "消息同步暂不可用，请刷新后重试",
             ApiError::ModelInvocationFailed(_) => "模型服务暂不可用，请检查模型配置或稍后重试",
             ApiError::InternalAssemblyError(_) => "服务状态暂不可用，请稍后重试",
@@ -122,7 +134,8 @@ impl ApiError {
     fn hides_private_message(&self) -> bool {
         matches!(
             self,
-            ApiError::EventPublishFailed(_)
+            ApiError::InvalidRequestBody(_)
+                | ApiError::EventPublishFailed(_)
                 | ApiError::ModelInvocationFailed(_)
                 | ApiError::InternalAssemblyError(_)
         )
@@ -151,12 +164,60 @@ impl IntoResponse for ApiError {
     }
 }
 
+pub(crate) async fn normalize_framework_rejection_response(
+    request: Request,
+    next: Next,
+) -> Response {
+    let response = next.run(request).await;
+    if !is_framework_request_rejection_response(&response) {
+        return response;
+    }
+
+    let status = response.status();
+    let private_message = match to_bytes(response.into_body(), 16 * 1024).await {
+        Ok(bytes) => {
+            let body_text = String::from_utf8_lossy(&bytes).trim().to_string();
+            if body_text.is_empty() {
+                format!("framework request rejection: {status}")
+            } else {
+                body_text
+            }
+        }
+        Err(error) => format!("framework request rejection body unavailable: {error}"),
+    };
+    tracing::warn!(
+        status = %status,
+        error = %private_message,
+        "api framework rejection detail hidden from response"
+    );
+    ApiError::invalid_request_body(private_message).into_response()
+}
+
+fn is_framework_request_rejection_response(response: &Response) -> bool {
+    let status = response.status();
+    if !matches!(
+        status,
+        StatusCode::BAD_REQUEST
+            | StatusCode::UNSUPPORTED_MEDIA_TYPE
+            | StatusCode::UNPROCESSABLE_ENTITY
+    ) {
+        return false;
+    }
+
+    let content_type = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    !content_type.contains("application/json")
+}
+
 /// 从 Axum 的 JsonRejection 自动转换为 ApiError
 ///
-/// 覆盖 Axum 默认的 422 裸文本，统一为结构化错误响应
+/// 显式处理 JsonRejection 的 handler 也必须走同一套公共错误边界。
 impl From<JsonRejection> for ApiError {
     fn from(rejection: JsonRejection) -> Self {
-        ApiError::InvalidInput(rejection.body_text())
+        ApiError::invalid_request_body(rejection.body_text())
     }
 }
 
@@ -169,6 +230,10 @@ mod tests {
         assert_eq!(
             ApiError::InvalidInput("bad".into()).error_code(),
             "INPUT_INVALID"
+        );
+        assert_eq!(
+            ApiError::invalid_request_body("line 1 column 1").error_code(),
+            "REQUEST_BODY_INVALID"
         );
         assert_eq!(
             ApiError::SessionNotFound("missing".into()).error_code(),
@@ -196,6 +261,10 @@ mod tests {
     fn status_code_mapping() {
         assert_eq!(
             ApiError::InvalidInput("bad".into()).status_code(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            ApiError::invalid_request_body("line 1 column 1").status_code(),
             StatusCode::BAD_REQUEST
         );
         assert_eq!(
@@ -248,6 +317,7 @@ mod tests {
         let internal = ApiError::internal_assembly("创建会话失败", "task_store 未配置");
         let publish = ApiError::event_publish_failed("事件发布失败", "broadcast closed");
         let model = ApiError::model_invocation_failed("模型调用失败", "provider transport failed");
+        let request_body = ApiError::invalid_request_body("expected value at line 1 column 1");
 
         assert_eq!(internal.message(), "创建会话失败: task_store 未配置");
         assert_eq!(internal.public_message(), "服务状态暂不可用，请稍后重试");
@@ -256,6 +326,11 @@ mod tests {
             model.public_message(),
             "模型服务暂不可用，请检查模型配置或稍后重试"
         );
+        assert_eq!(
+            request_body.public_message(),
+            "请求内容格式不正确，请检查后重试"
+        );
+        assert!(request_body.hides_private_message());
     }
 
     #[test]
@@ -264,6 +339,7 @@ mod tests {
         let publish = ApiError::event_publish_failed("事件发布失败", "down");
         let model = ApiError::model_invocation_failed("模型调用失败", "down");
         let recovery = ApiError::recovery_not_found("recovery-1");
+        let request_body = ApiError::invalid_request_body("body parse failed");
 
         match internal {
             ApiError::InternalAssemblyError(message) => {
@@ -292,5 +368,33 @@ mod tests {
             }
             other => panic!("unexpected recovery runtime_payload: {:?}", other),
         }
+
+        match request_body {
+            ApiError::InvalidRequestBody(message) => {
+                assert_eq!(message, "请求体解析失败: body parse failed");
+            }
+            other => panic!("unexpected request body runtime_payload: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn request_body_parse_error_response_hides_parser_detail() {
+        let response =
+            ApiError::invalid_request_body("expected value at line 1 column 1").into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("error response json");
+
+        assert_eq!(payload["error_code"], "REQUEST_BODY_INVALID");
+        assert_eq!(payload["message"], "请求内容格式不正确，请检查后重试");
+        assert!(payload.get("detail").is_none());
+        assert!(
+            !String::from_utf8_lossy(&bytes).contains("line 1 column 1"),
+            "请求体解析器细节不能出现在响应体中"
+        );
     }
 }

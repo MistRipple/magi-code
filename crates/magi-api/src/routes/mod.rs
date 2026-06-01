@@ -16,6 +16,7 @@ mod workspaces;
 use axum::{
     Json, Router,
     extract::{Query, State},
+    middleware,
     routing::get,
 };
 use magi_core::{SessionId, UtcMillis};
@@ -69,7 +70,10 @@ pub fn build_router(state: ApiState) -> Router {
         .merge(tasks_interaction::routes())
         .merge(tasks_projection::routes())
         .merge(tools::routes())
-        .merge(messages::routes());
+        .merge(messages::routes())
+        .layer(middleware::from_fn(
+            crate::errors::normalize_framework_rejection_response,
+        ));
 
     Router::new()
         .route("/health", get(health))
@@ -243,6 +247,33 @@ mod tests {
         (status, body)
     }
 
+    async fn post_json_body(
+        app: Router,
+        path: &str,
+        body: &'static str,
+    ) -> (StatusCode, serde_json::Value, String) {
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body should read");
+        let raw_body = String::from_utf8_lossy(&bytes).to_string();
+        let body = serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+            panic!("response should be json: {error}; body={raw_body}");
+        });
+        (status, body, raw_body)
+    }
+
     #[test]
     fn bootstrap_workspace_resolution_rejects_workspace_mismatched_session() {
         let state = test_state();
@@ -372,6 +403,46 @@ mod tests {
                 .as_str()
                 .is_some_and(|message| message.contains("不属于 workspace")),
             "bootstrap mismatch should be actionable for bridge recovery: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn api_malformed_json_uses_public_error_response() {
+        let app = build_router(test_state());
+
+        let (status, body, raw_body) = post_json_body(app, "/api/workspaces/register", "{").await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body["error_code"],
+            serde_json::json!("REQUEST_BODY_INVALID")
+        );
+        assert_eq!(
+            body["message"],
+            serde_json::json!("请求内容格式不正确，请检查后重试")
+        );
+        assert!(
+            !raw_body.contains("line")
+                && !raw_body.contains("column")
+                && !raw_body.contains("expected"),
+            "框架 JSON parser 细节不能出现在 API 响应中: {raw_body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn api_business_invalid_input_keeps_actionable_message() {
+        let app = build_router(test_state());
+
+        let (status, body, _raw_body) =
+            post_json_body(app, "/api/workspaces/register", r#"{"path":""}"#).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error_code"], serde_json::json!("INPUT_INVALID"));
+        assert!(
+            body["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("工作区路径不能为空")),
+            "业务校验错误应保留可操作文案: {body}"
         );
     }
 }
