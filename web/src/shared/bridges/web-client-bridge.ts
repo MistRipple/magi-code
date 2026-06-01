@@ -1480,6 +1480,10 @@ function buildBootstrapQuery(
 }
 
 function eventStreamBindingKey(): string {
+  return eventStreamScopeKey();
+}
+
+function eventStreamQuery(): string {
   const query = new URLSearchParams();
   if (currentWorkspaceId) {
     query.set('workspaceId', currentWorkspaceId);
@@ -1900,7 +1904,7 @@ async function ensureEventStream(
   const streamToken = ++activeEventStreamToken;
   const openPromise = createEventStreamOpenPromise(streamToken);
   activeSseConnection = getTransport().connectEventStream(
-    agentUrl('/events', nextKey),
+    agentUrl('/events', eventStreamQuery()),
     {
       onOpen() {
         if (streamToken !== activeEventStreamToken) {
