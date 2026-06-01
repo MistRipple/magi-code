@@ -405,6 +405,44 @@ fn preflight_snapshot_provider_includes_openai_compatible_smoke_when_model_catal
 }
 
 #[test]
+fn preflight_snapshot_provider_redacts_sensitive_response_excerpt() {
+    let mut provider = BridgePreflightSnapshotProvider::default();
+    provider.register_transport(
+        BridgeServerKind::Model,
+        Arc::new(FakeTransport::new(HashMap::from([
+            (
+                "model.invoke".to_string(),
+                FakeTransportOutcome::Payload(bridge_response(
+                    r#"{"message":"provider rejected at /Users/xie/.magi/token with Bearer abcdef","api_key":"sk-live-secret"}"#,
+                )),
+            ),
+            (
+                LOCAL_BRIDGE_DESCRIBE_SERVICES_METHOD.to_string(),
+                FakeTransportOutcome::Payload(
+                    serde_json::to_value(BridgeServerServiceCatalog {
+                        protocol_version: "local-bridge-v1".to_string(),
+                        server_kind: BridgeServerKind::Model,
+                        services: vec![descriptor(LOOPBACK_MODEL_PROVIDER)],
+                    })
+                    .expect("catalog should serialize"),
+                ),
+            ),
+        ]))),
+    );
+
+    let snapshot = provider.preflight_snapshot();
+    let excerpt = snapshot.services[0].checks[0]
+        .response_excerpt
+        .as_deref()
+        .expect("response excerpt should exist");
+    assert!(excerpt.contains("[path]"));
+    assert!(excerpt.contains("[redacted]"));
+    assert!(!excerpt.contains("/Users/xie"));
+    assert!(!excerpt.contains("abcdef"));
+    assert!(!excerpt.contains("sk-live-secret"));
+}
+
+#[test]
 fn preflight_snapshot_provider_preserves_smoke_failures() {
     let mut provider = BridgePreflightSnapshotProvider::default();
     provider.register_transport(
