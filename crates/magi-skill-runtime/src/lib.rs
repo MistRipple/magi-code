@@ -1126,7 +1126,7 @@ mod tests {
         });
 
         let runtime = SkillDispatchRuntime::new(
-            tool_registry,
+            tool_registry.clone(),
             BridgeDispatchRuntime::new().with_model_client(Arc::new(FailingModelClient::default())),
         );
         let plan = skill_registry.build_tool_runtime_plan(&SkillSelection {
@@ -1172,6 +1172,22 @@ mod tests {
                 }
             ))
         ));
+
+        let invocations = tool_registry.invocations();
+        assert_eq!(invocations.len(), 1);
+        let payload: serde_json::Value =
+            serde_json::from_str(&invocations[0].payload).expect("bridge error payload json");
+        assert_eq!(payload["status"], "failed");
+        assert_eq!(payload["error_code"], "external_tool_remote_failed");
+        assert_eq!(
+            payload["error"],
+            "外接工具返回失败，请检查输入或外接工具状态"
+        );
+        assert_eq!(payload.get("binding_id"), None);
+        assert_eq!(payload.get("bridge_target"), None);
+        assert_eq!(payload.get("bridge_kind"), None);
+        assert_eq!(payload.get("dispatch_action"), None);
+        assert!(!invocations[0].payload.contains("remote denied"));
     }
 
     // ── T-304: Skill Runtime 切换前验证补齐 ────────────────────────────────

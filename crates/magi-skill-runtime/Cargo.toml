@@ -11,3 +11,4 @@ magi-governance = { path = "../magi-governance" }
 magi-bridge-client = { path = "../magi-bridge-client" }
 magi-tool-runtime = { path = "../magi-tool-runtime" }
 magi-event-bus = { path = "../magi-event-bus" }
+tracing.workspace = true

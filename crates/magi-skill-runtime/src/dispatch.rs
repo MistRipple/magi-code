@@ -14,6 +14,18 @@ use magi_governance::{DecisionPhase, GovernanceDecision, ToolExecutionRequest, T
 use magi_tool_runtime::{ToolExecutionContext, ToolExecutionInput, ToolExecutionOutput};
 use std::path::PathBuf;
 
+const EXTERNAL_TOOL_POLICY_REJECTED_CODE: &str = "external_tool_policy_rejected";
+const EXTERNAL_TOOL_NEEDS_APPROVAL_CODE: &str = "external_tool_needs_approval";
+const EXTERNAL_TOOL_CONFIG_UNAVAILABLE_CODE: &str = "external_tool_config_unavailable";
+const EXTERNAL_TOOL_TRANSPORT_FAILED_CODE: &str = "external_tool_transport_failed";
+const EXTERNAL_TOOL_PROTOCOL_FAILED_CODE: &str = "external_tool_protocol_failed";
+const EXTERNAL_TOOL_REMOTE_FAILED_CODE: &str = "external_tool_remote_failed";
+
+const EXTERNAL_TOOL_CONFIG_PUBLIC_ERROR: &str = "外接工具暂不可用，请检查配置";
+const EXTERNAL_TOOL_TRANSPORT_PUBLIC_ERROR: &str = "外接工具暂不可用，请稍后重试";
+const EXTERNAL_TOOL_PROTOCOL_PUBLIC_ERROR: &str = "外接工具协议异常，请检查外接工具状态";
+const EXTERNAL_TOOL_REMOTE_PUBLIC_ERROR: &str = "外接工具返回失败，请检查输入或外接工具状态";
+
 pub(crate) fn execute_dispatch(
     runtime: &SkillDispatchRuntime,
     plan: &SkillToolRuntimePlan,
@@ -191,10 +203,10 @@ fn bridge_preflight_output(
         return Some(ToolExecutionOutput {
             tool_call_id: input.tool_call_id.clone(),
             status: ExecutionResultStatus::Rejected,
-            payload: bridge_policy_payload(
+            payload: bridge_public_payload(
                 input,
-                binding,
                 ExecutionResultStatus::Rejected,
+                EXTERNAL_TOOL_POLICY_REJECTED_CODE,
                 reason.clone(),
             ),
             governance: GovernanceDecision::rejected(
@@ -226,10 +238,14 @@ fn bridge_preflight_output(
     Some(ToolExecutionOutput {
         tool_call_id: input.tool_call_id.clone(),
         status,
-        payload: bridge_policy_payload(
+        payload: bridge_public_payload(
             input,
-            binding,
             status,
+            if status == ExecutionResultStatus::NeedsApproval {
+                EXTERNAL_TOOL_NEEDS_APPROVAL_CODE
+            } else {
+                EXTERNAL_TOOL_POLICY_REJECTED_CODE
+            },
             governance
                 .reason
                 .clone()
@@ -273,10 +289,22 @@ fn bridge_error_output(
         | BridgeClientError::MissingWorkingDirectory { .. } => ExecutionResultStatus::Rejected,
         BridgeClientError::CallFailed { .. } => ExecutionResultStatus::Failed,
     };
+    tracing::warn!(
+        tool_name = %input.tool_name,
+        binding_id = %binding.binding_id,
+        bridge_kind = ?binding.bridge_kind,
+        dispatch_action = ?binding.dispatch_action,
+        bridge_target = %binding.bridge_target,
+        bridge_error_layer = ?error.layer(),
+        bridge_error_code = ?error.code(),
+        error = %error,
+        "skill bridge dispatch failed"
+    );
+    let (error_code, public_message) = bridge_public_error(error);
     ToolExecutionOutput {
         tool_call_id: input.tool_call_id.clone(),
         status,
-        payload: bridge_policy_payload(input, binding, status, error.to_string()),
+        payload: bridge_public_payload(input, status, error_code, public_message),
         governance: GovernanceDecision::allowed(
             DecisionPhase::ToolPolicy,
             input.risk_level,
@@ -285,11 +313,38 @@ fn bridge_error_output(
     }
 }
 
-fn bridge_policy_payload(
+fn bridge_public_error(error: &BridgeClientError) -> (&'static str, &'static str) {
+    match error {
+        BridgeClientError::InvalidBindingTarget { .. }
+        | BridgeClientError::IncompatibleBindingAction { .. }
+        | BridgeClientError::MissingClient { .. }
+        | BridgeClientError::MissingBinding { .. }
+        | BridgeClientError::MissingWorkingDirectory { .. } => (
+            EXTERNAL_TOOL_CONFIG_UNAVAILABLE_CODE,
+            EXTERNAL_TOOL_CONFIG_PUBLIC_ERROR,
+        ),
+        BridgeClientError::CallFailed { layer, .. } => match layer {
+            magi_bridge_client::BridgeErrorLayer::Transport => (
+                EXTERNAL_TOOL_TRANSPORT_FAILED_CODE,
+                EXTERNAL_TOOL_TRANSPORT_PUBLIC_ERROR,
+            ),
+            magi_bridge_client::BridgeErrorLayer::Protocol => (
+                EXTERNAL_TOOL_PROTOCOL_FAILED_CODE,
+                EXTERNAL_TOOL_PROTOCOL_PUBLIC_ERROR,
+            ),
+            magi_bridge_client::BridgeErrorLayer::RemoteBusiness => (
+                EXTERNAL_TOOL_REMOTE_FAILED_CODE,
+                EXTERNAL_TOOL_REMOTE_PUBLIC_ERROR,
+            ),
+        },
+    }
+}
+
+fn bridge_public_payload(
     input: &ToolExecutionInput,
-    binding: &BridgeBindingReference,
     status: ExecutionResultStatus,
-    message: String,
+    error_code: &'static str,
+    message: impl Into<String>,
 ) -> String {
     serde_json::json!({
         "tool": &input.tool_name,
@@ -300,13 +355,8 @@ fn bridge_policy_payload(
             ExecutionResultStatus::NeedsApproval => "needs_approval",
             ExecutionResultStatus::Cancelled => "cancelled",
         },
-        "error": message,
-        "bridge_kind": format!("{:?}", binding.bridge_kind),
-        "dispatch_action": format!("{:?}", binding.dispatch_action),
-        "binding_id": &binding.binding_id,
-        "bridge_target": &binding.bridge_target,
-        "risk_level": format!("{:?}", input.risk_level),
-        "approval_requirement": format!("{:?}", input.approval_requirement),
+        "error_code": error_code,
+        "error": message.into(),
     })
     .to_string()
 }

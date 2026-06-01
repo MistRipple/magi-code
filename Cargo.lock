@@ -1387,6 +1387,7 @@ dependencies = [
  "magi-tool-runtime",
  "serde",
  "serde_json",
+ "tracing",
 ]
 
 [[package]]
