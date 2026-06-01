@@ -3,7 +3,7 @@
 mod change_projection;
 mod dto;
 mod errors;
-mod mcp_config;
+pub mod mcp_config;
 mod model_config;
 mod routes;
 mod scope_binding;

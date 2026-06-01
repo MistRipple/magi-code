@@ -7,7 +7,7 @@ use crate::dto::{
 };
 use crate::errors::ApiError;
 use crate::mcp_config::{
-    build_mcp_config_from_entry, normalize_mcp_server_snapshot_entry,
+    build_mcp_config_from_entry, mcp_server_entry_enabled, normalize_mcp_server_snapshot_entry,
     redact_mcp_server_public_entry,
 };
 use crate::routes::settings::{
@@ -1363,10 +1363,7 @@ impl ApiState {
             else {
                 continue;
             };
-            let enabled = entry
-                .get("enabled")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(true);
+            let enabled = mcp_server_entry_enabled(entry);
 
             if !enabled {
                 let mut pool = self

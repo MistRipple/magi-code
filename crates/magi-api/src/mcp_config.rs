@@ -12,7 +12,7 @@ fn unwrap_mcp_server_payload<'a>(request: &'a Value) -> &'a Value {
         .unwrap_or(request)
 }
 
-pub(crate) fn mcp_server_entry_id(entry: &Value) -> Option<&str> {
+pub fn mcp_server_entry_id(entry: &Value) -> Option<&str> {
     entry
         .get("id")
         .and_then(Value::as_str)
@@ -21,7 +21,7 @@ pub(crate) fn mcp_server_entry_id(entry: &Value) -> Option<&str> {
         .filter(|value| !value.is_empty())
 }
 
-pub(crate) fn normalize_mcp_server_snapshot_entry(entry: &Value) -> Option<Value> {
+pub fn normalize_mcp_server_snapshot_entry(entry: &Value) -> Option<Value> {
     let raw = unwrap_mcp_server_payload(entry);
     let mut object = raw.as_object().cloned()?;
     let server_id = object
@@ -110,7 +110,14 @@ pub(crate) fn preserve_redacted_mcp_env_values(entry: &mut Value, existing: Opti
     }
 }
 
-pub(crate) fn build_mcp_config_from_entry(entry: &Value) -> Option<McpServerConfig> {
+pub fn mcp_server_entry_enabled(entry: &Value) -> bool {
+    entry
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(true)
+}
+
+pub fn build_mcp_config_from_entry(entry: &Value) -> Option<McpServerConfig> {
     let normalized = normalize_mcp_server_snapshot_entry(entry)?;
     let object = normalized.as_object()?;
     let command = object.get("command")?.as_str()?.trim().to_string();

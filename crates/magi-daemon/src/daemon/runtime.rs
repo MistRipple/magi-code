@@ -9,11 +9,13 @@ use super::{
 use magi_api::{
     ApiError, ApiState, DirectHttpModelProbeConfig, RunnerManager, RuntimeStatePersistence,
     SettingsStore, build_router, build_runtime_capability_dependency_provider,
+    mcp_config::{build_mcp_config_from_entry, mcp_server_entry_enabled, mcp_server_entry_id},
 };
 use magi_bridge_client::{
-    BridgeDispatchRuntime, BridgeServerKind, BridgeTransport, HttpModelBridgeClient,
-    HttpModelBridgeProtocol, JsonRpcMcpBridgeClient, JsonRpcModelBridgeClient,
-    JsonRpcStdioTransport, StdioMcpBridgeClient,
+    BridgeBindingKind, BridgeClientError, BridgeDispatchRuntime, BridgeResponse, BridgeServerKind,
+    BridgeTransport, HttpModelBridgeClient, HttpModelBridgeProtocol, JsonRpcMcpBridgeClient,
+    JsonRpcModelBridgeClient, JsonRpcStdioTransport, McpBridgeClient, McpToolCallRequest,
+    StdioMcpBridgeClient,
 };
 use magi_context_runtime::{
     ContextBudget, ContextRuntime, FileSummaryStore, ProjectRecentTurnStore, SharedContextPool,
@@ -252,6 +254,121 @@ fn external_mcp_error_marker(entry: &serde_json::Value) -> Option<String> {
         "mcp_connection_failed" | "mcp_invalid_config" => error,
         _ => "mcp_connection_failed".to_string(),
     })
+}
+
+#[derive(Clone)]
+struct SettingsBackedMcpBridgeClient {
+    settings_store: Arc<SettingsStore>,
+    mcp_connections: Arc<RwLock<HashMap<String, Arc<StdioMcpBridgeClient>>>>,
+    default_client: Arc<dyn McpBridgeClient>,
+}
+
+impl SettingsBackedMcpBridgeClient {
+    fn new(
+        settings_store: Arc<SettingsStore>,
+        mcp_connections: Arc<RwLock<HashMap<String, Arc<StdioMcpBridgeClient>>>>,
+        default_client: Arc<dyn McpBridgeClient>,
+    ) -> Self {
+        Self {
+            settings_store,
+            mcp_connections,
+            default_client,
+        }
+    }
+
+    fn settings_entry_for_target(&self, target: &str) -> Option<serde_json::Value> {
+        self.settings_store
+            .get_section("mcpServers")
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(magi_api::mcp_config::normalize_mcp_server_snapshot_entry)
+            .find(|entry| mcp_entry_matches_target(entry, target))
+    }
+
+    fn client_for_entry(
+        &self,
+        server_id: &str,
+        entry: &serde_json::Value,
+    ) -> Result<Arc<StdioMcpBridgeClient>, BridgeClientError> {
+        if !mcp_server_entry_enabled(entry) {
+            self.remove_connection(server_id);
+            return Err(mcp_config_unavailable_error(format!(
+                "MCP server {server_id} is disabled"
+            )));
+        }
+        if let Some(client) = self.connected_client(server_id) {
+            return Ok(client);
+        }
+
+        let config = build_mcp_config_from_entry(entry).ok_or_else(|| {
+            mcp_config_unavailable_error(format!("MCP server {server_id} config is incomplete"))
+        })?;
+        let client = Arc::new(StdioMcpBridgeClient::new(config));
+        {
+            let mut pool = self
+                .mcp_connections
+                .write()
+                .expect("mcp connections write lock poisoned");
+            pool.insert(server_id.to_string(), client.clone());
+        }
+        Ok(client)
+    }
+
+    fn connected_client(&self, server_id: &str) -> Option<Arc<StdioMcpBridgeClient>> {
+        let pool = self
+            .mcp_connections
+            .read()
+            .expect("mcp connections read lock poisoned");
+        pool.get(server_id).cloned()
+    }
+
+    fn remove_connection(&self, server_id: &str) {
+        let mut pool = self
+            .mcp_connections
+            .write()
+            .expect("mcp connections write lock poisoned");
+        pool.remove(server_id);
+    }
+}
+
+impl McpBridgeClient for SettingsBackedMcpBridgeClient {
+    fn call_tool(&self, request: McpToolCallRequest) -> Result<BridgeResponse, BridgeClientError> {
+        let target = request.server_name.trim();
+        if target.is_empty() {
+            return Err(mcp_config_unavailable_error(
+                "MCP bridge target is empty".to_string(),
+            ));
+        }
+
+        let Some(entry) = self.settings_entry_for_target(target) else {
+            return self.default_client.call_tool(request);
+        };
+        let server_id = mcp_server_entry_id(&entry)
+            .map(str::to_string)
+            .unwrap_or_else(|| target.to_string());
+        let client = self.client_for_entry(&server_id, &entry)?;
+        client.call_tool(request)
+    }
+}
+
+fn mcp_entry_matches_target(entry: &serde_json::Value, target: &str) -> bool {
+    ["id", "serverId", "name", "serverName"]
+        .iter()
+        .any(|field| {
+            entry
+                .get(*field)
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .is_some_and(|value| value == target)
+        })
+}
+
+fn mcp_config_unavailable_error(message: String) -> BridgeClientError {
+    warn!(reason = %message, "settings-backed MCP bridge target unavailable");
+    BridgeClientError::MissingClient {
+        bridge_kind: BridgeBindingKind::Mcp,
+    }
 }
 
 fn read_json_string(value: &serde_json::Value, fields: &[&str]) -> Option<String> {
@@ -745,13 +862,20 @@ impl DaemonRuntime {
                     }
                 }
             };
-        let bridge_runtime = BridgeDispatchRuntime::new()
-            .with_model_client(business_model_client.clone())
-            .with_mcp_client(if let Some(mcp_client) = direct_mcp_client {
+        let default_mcp_client: Arc<dyn McpBridgeClient> =
+            if let Some(mcp_client) = direct_mcp_client {
                 Arc::new(mcp_client)
             } else {
                 Arc::new(JsonRpcMcpBridgeClient::new(mcp_transport.clone()))
-            });
+            };
+        let settings_backed_mcp_client = SettingsBackedMcpBridgeClient::new(
+            settings_store.clone(),
+            mcp_connections.clone(),
+            default_mcp_client,
+        );
+        let bridge_runtime = BridgeDispatchRuntime::new()
+            .with_model_client(business_model_client.clone())
+            .with_mcp_client(Arc::new(settings_backed_mcp_client));
         let skill_runtime = SkillDispatchRuntime::new(tool_registry.clone(), bridge_runtime);
         let worker_runtime = self.worker_runtime.clone();
         let tool_registry_for_dispatcher = tool_registry.clone();
@@ -1566,12 +1690,17 @@ fn task_matches_runtime_sidecar(sidecar: &SessionRuntimeSidecar, task: &magi_cor
 #[cfg(test)]
 mod tests {
     use super::{
-        DaemonRuntime, build_agent_role_catalog_provider, publish_task_status_changed_event,
+        DaemonRuntime, SettingsBackedMcpBridgeClient, build_agent_role_catalog_provider,
+        publish_task_status_changed_event,
     };
     use crate::daemon::config::DaemonConfig;
     use axum::{
         body::{Body, to_bytes},
         http::{Request, StatusCode},
+    };
+    use magi_api::SettingsStore;
+    use magi_bridge_client::{
+        BridgeResponse, McpBridgeClient, McpServerConfig, McpToolCallRequest, StdioMcpBridgeClient,
     };
     use magi_core::{
         MissionId, SessionId, Task, TaskId, TaskKind, TaskRuntimePayload, TaskStatus, ThreadId,
@@ -1585,18 +1714,40 @@ mod tests {
     };
     use serde_json::{Value, json};
     use std::{
-        collections::BTreeMap,
+        collections::{BTreeMap, HashMap},
         fs,
         io::{Read, Write},
         net::{TcpListener, TcpStream},
         path::PathBuf,
-        sync::mpsc,
+        sync::{Arc, Mutex, RwLock, mpsc},
         thread::{self, JoinHandle},
         time::{Duration, Instant},
     };
     use tower::util::ServiceExt;
 
     const BACKGROUND_TEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+    #[derive(Default)]
+    struct RecordingMcpClient {
+        calls: Arc<Mutex<Vec<McpToolCallRequest>>>,
+    }
+
+    impl McpBridgeClient for RecordingMcpClient {
+        fn call_tool(
+            &self,
+            request: McpToolCallRequest,
+        ) -> Result<BridgeResponse, magi_bridge_client::BridgeClientError> {
+            self.calls
+                .lock()
+                .expect("recording mcp client mutex should lock")
+                .push(request);
+            Ok(BridgeResponse {
+                ok: true,
+                payload: "fallback-ok".to_string(),
+            })
+        }
+    }
+
     fn temp_state_root(name: &str) -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!(
             "magi-daemon-runtime-test-{name}-{}",
@@ -1840,6 +1991,93 @@ mod tests {
         assert_eq!(entry.health, "disabled");
         assert_eq!(entry.tool_count, None);
         assert_eq!(entry.error, None);
+    }
+
+    #[test]
+    fn settings_backed_mcp_bridge_delegates_unconfigured_targets_to_default_client() {
+        let settings_store = Arc::new(SettingsStore::new());
+        let fallback = Arc::new(RecordingMcpClient::default());
+        let calls = fallback.calls.clone();
+        let client = SettingsBackedMcpBridgeClient::new(
+            settings_store,
+            Arc::new(RwLock::new(HashMap::new())),
+            fallback,
+        );
+
+        let response = client
+            .call_tool(McpToolCallRequest {
+                server_name: "loopback-mcp".to_string(),
+                tool_name: "echo.inspect".to_string(),
+                input: "{}".to_string(),
+            })
+            .expect("unconfigured target should use default bridge client");
+
+        assert!(response.ok);
+        let calls = calls
+            .lock()
+            .expect("recording mcp client mutex should lock");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].server_name, "loopback-mcp");
+    }
+
+    #[test]
+    fn settings_backed_mcp_bridge_rejects_disabled_configured_target_before_default_client() {
+        let settings_store = Arc::new(SettingsStore::new());
+        settings_store.set_section(
+            "mcpServers",
+            json!([
+                {
+                    "id": "disabled-mcp",
+                    "name": "disabled-mcp",
+                    "command": "node",
+                    "enabled": false
+                }
+            ]),
+        );
+        let fallback = Arc::new(RecordingMcpClient::default());
+        let calls = fallback.calls.clone();
+        let connections = Arc::new(RwLock::new(HashMap::new()));
+        connections
+            .write()
+            .expect("mcp connection pool should lock")
+            .insert(
+                "disabled-mcp".to_string(),
+                Arc::new(StdioMcpBridgeClient::new(McpServerConfig {
+                    command: "node".to_string(),
+                    args: Vec::new(),
+                    working_directory: None,
+                    env: BTreeMap::new(),
+                })),
+            );
+        let client =
+            SettingsBackedMcpBridgeClient::new(settings_store, connections.clone(), fallback);
+
+        let error = client
+            .call_tool(McpToolCallRequest {
+                server_name: "disabled-mcp".to_string(),
+                tool_name: "echo.inspect".to_string(),
+                input: "{}".to_string(),
+            })
+            .expect_err("disabled configured target should not use default bridge client");
+
+        assert!(matches!(
+            error,
+            magi_bridge_client::BridgeClientError::MissingClient { .. }
+        ));
+        assert!(
+            calls
+                .lock()
+                .expect("recording mcp client mutex should lock")
+                .is_empty(),
+            "configured disabled target must not fall through to the default bridge client"
+        );
+        assert!(
+            !connections
+                .read()
+                .expect("mcp connection pool should lock")
+                .contains_key("disabled-mcp"),
+            "disabled configured target must clear stale settings-backed connection"
+        );
     }
 
     #[tokio::test]

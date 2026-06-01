@@ -12,7 +12,7 @@ use std::sync::Arc;
 use crate::{
     errors::ApiError,
     mcp_config::{
-        build_mcp_config_from_entry, mcp_server_entry_id,
+        build_mcp_config_from_entry, mcp_server_entry_enabled, mcp_server_entry_id,
         normalize_mcp_server_request_entry as normalize_mcp_server_entry,
         normalize_mcp_server_snapshot_entry, preserve_redacted_mcp_env_values,
         redact_mcp_server_public_entry,
@@ -522,13 +522,6 @@ fn remove_mcp_connection(state: &ApiState, server_id: &str) {
         .write()
         .expect("mcp connections write lock poisoned");
     pool.remove(server_id);
-}
-
-fn mcp_server_entry_enabled(entry: &serde_json::Value) -> bool {
-    entry
-        .get("enabled")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(true)
 }
 
 fn mcp_tools_unavailable_response(server_id: &str) -> Json<serde_json::Value> {
