@@ -1792,12 +1792,7 @@ async function ensureEventStream(
         }
         const openFailed = activeEventStreamState !== 'open';
         rejectEventStreamOpen(openFailed ? new Error('事件流连接失败') : undefined);
-        clearEventStreamOpenTimeout();
-        stopEventStreamIdleCheck();
-        activeSseConnection = null;
-        activeEventStreamKey = '';
-        activeEventStreamState = 'idle';
-        activeEventStreamOpenPromise = null;
+        closeEventStream();
         scheduleRecovery('event_stream_error');
       },
     },
