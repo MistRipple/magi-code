@@ -3,9 +3,10 @@ use axum::{
     extract::{Query, State},
     routing::get,
 };
-use magi_core::UtcMillis;
+use magi_core::{UtcMillis, public_runtime_text};
 use magi_session_store::{CanonicalTurn, NotificationRecord, SessionRecord, TimelineEntry};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use super::session_scope::{
     parse_session_id, require_registered_workspace_binding, require_session_record_in_workspace,
@@ -86,7 +87,12 @@ async fn get_messages(
     let start = end.saturating_sub(limit);
     let page = timeline[start..end].to_vec();
     let sessions = state.session_records_for_workspace(Some(requested_workspace_id.as_str()));
-    let canonical_turns = state.session_store.canonical_turns_for_session(&session_id);
+    let canonical_turns = state
+        .session_store
+        .canonical_turns_for_session(&session_id)
+        .into_iter()
+        .map(public_canonical_turn)
+        .collect();
     let before_cursor = page.first().map(|entry| entry.entry_id.clone());
 
     Ok(Json(MessagesResponseDto {
@@ -102,6 +108,41 @@ async fn get_messages(
     }))
 }
 
+fn public_canonical_turn(mut turn: CanonicalTurn) -> CanonicalTurn {
+    for item in &mut turn.items {
+        let Some(tool) = item.tool.as_mut() else {
+            continue;
+        };
+        tool.arguments = tool.arguments.take().and_then(public_canonical_tool_value);
+        tool.result = tool.result.take().and_then(public_canonical_tool_value);
+        tool.error = public_canonical_tool_text(tool.error.take());
+    }
+    turn
+}
+
+fn public_canonical_tool_value(value: Value) -> Option<Value> {
+    let public = public_runtime_text(&value.to_string());
+    if public.is_empty() {
+        return None;
+    }
+    serde_json::from_str(&public)
+        .ok()
+        .or_else(|| Some(Value::String(public)))
+}
+
+fn public_canonical_tool_text(value: Option<String>) -> Option<String> {
+    let value = value?.trim().to_string();
+    if value.is_empty() {
+        return None;
+    }
+    let public = public_runtime_text(&value);
+    if public.is_empty() {
+        None
+    } else {
+        Some(public)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -109,7 +150,9 @@ mod tests {
         body::{Body, to_bytes},
         http::{Request, StatusCode},
     };
-    use magi_core::{AbsolutePath, ExecutionOwnership, SessionId, UtcMillis, WorkspaceId};
+    use magi_core::{
+        AbsolutePath, ExecutionOwnership, SessionId, ThreadId, UtcMillis, WorkspaceId,
+    };
     use magi_event_bus::InMemoryEventBus;
     use magi_governance::GovernanceService;
     use magi_session_store::{
@@ -432,6 +475,133 @@ mod tests {
         assert!(
             first_ids.is_disjoint(&second_ids),
             "分页结果不应重复: first={first_ids:?}, second={second_ids:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn messages_redacts_canonical_tool_payloads_without_mutating_store() {
+        let session_id = SessionId::new("session-messages-tool-redaction");
+        let store = SessionStore::default();
+        store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "工具消息脱敏",
+                Some("workspace-messages-tool-redaction".to_string()),
+            )
+            .expect("session should create");
+        store
+            .upsert_current_turn(
+                session_id.clone(),
+                magi_session_store::ActiveExecutionTurn {
+                    turn_id: "turn-messages-tool-redaction".to_string(),
+                    turn_seq: 1,
+                    accepted_at: UtcMillis(1),
+                    completed_at: None,
+                    status: "running".to_string(),
+                    user_message: Some("请读取文件".to_string()),
+                    items: Vec::new(),
+                },
+            )
+            .expect("turn should upsert");
+        store
+            .upsert_current_turn_item(
+                &session_id,
+                magi_session_store::ActiveExecutionTurnItem {
+                    item_id: "turn-item-tool-redaction".to_string(),
+                    item_seq: 1,
+                    kind: "tool_call_result".to_string(),
+                    status: "failed".to_string(),
+                    source: "worker".to_string(),
+                    title: Some("读取文件".to_string()),
+                    content: Some("工具卡片".to_string()),
+                    task_id: None,
+                    worker_id: None,
+                    role_id: None,
+                    tool_call_id: Some("tool-call-redaction".to_string()),
+                    tool_name: Some("read_file".to_string()),
+                    tool_status: Some("failed".to_string()),
+                    tool_arguments: Some(
+                        serde_json::json!({
+                            "path": "/Users/xie/code/TEST/secret.txt",
+                            "token": "sk-argument-secret"
+                        })
+                        .to_string(),
+                    ),
+                    tool_result: Some(
+                        serde_json::json!({
+                            "output": "read /private/tmp/magi/result with Bearer resulttoken"
+                        })
+                        .to_string(),
+                    ),
+                    tool_error: Some(
+                        "failed at /var/folders/magi/cache with sk-error-secret".to_string(),
+                    ),
+                    request_id: None,
+                    user_message_id: None,
+                    placeholder_message_id: None,
+                    metadata: Default::default(),
+                    timeline_entry_id: None,
+                    source_thread_id: ThreadId::new("thread-tool-redaction"),
+                },
+            )
+            .expect("tool item should upsert");
+
+        let raw_turn = store
+            .canonical_turns_for_session(&session_id)
+            .into_iter()
+            .find(|turn| turn.turn_id == "turn-messages-tool-redaction")
+            .expect("raw canonical turn should exist");
+        let raw_tool = raw_turn.items[0]
+            .tool
+            .as_ref()
+            .expect("raw tool should exist");
+        assert!(
+            raw_tool
+                .arguments
+                .as_ref()
+                .expect("raw arguments should exist")
+                .to_string()
+                .contains("/Users/xie")
+        );
+
+        let state = test_state(store);
+        let response = routes()
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri(
+                        "/messages?workspaceId=workspace-messages-tool-redaction&sessionId=session-messages-tool-redaction",
+                    )
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = read_json_response(response).await;
+        let body_text = body.to_string();
+        assert!(!body_text.contains("/Users/xie"));
+        assert!(!body_text.contains("/private/tmp"));
+        assert!(!body_text.contains("/var/folders"));
+        assert!(!body_text.contains("argument-secret"));
+        assert!(!body_text.contains("resulttoken"));
+        assert!(!body_text.contains("error-secret"));
+
+        let tool = &body["canonicalTurns"][0]["items"][0]["tool"];
+        assert_eq!(tool["arguments"]["path"], "[path]");
+        assert_eq!(tool["arguments"]["token"], "[redacted]");
+        assert!(
+            tool["result"]["output"]
+                .as_str()
+                .expect("result output should be string")
+                .contains("Bearer [redacted]")
+        );
+        assert!(
+            tool["error"]
+                .as_str()
+                .expect("tool error should be string")
+                .contains("sk-[redacted]")
         );
     }
 }
