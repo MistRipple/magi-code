@@ -36,8 +36,8 @@ use magi_bridge_client::{
     ModelInvocationRequest, ModelStreamingDelta,
 };
 use magi_core::{
-    EventId, ExecutionResultStatus, LeaseId, SessionId, Task, TaskId, TaskStatus, ThreadId,
-    UtcMillis, WorkspaceId,
+    AccessProfile, EventId, ExecutionResultStatus, LeaseId, SessionId, Task, TaskId, TaskStatus,
+    ThreadId, UtcMillis, WorkspaceId,
 };
 use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
 use magi_orchestrator::{ExecutionContextSummary, task_store::TaskStore};
@@ -1938,6 +1938,9 @@ fn agent_spawn_requirement_recovery_prompt(
     if !agent_spawn_required_by_task(task) {
         return None;
     }
+    if !agent_spawn_requirement_is_policy_reachable(task) {
+        return None;
+    }
     if !task_store.get_children(&task.task_id).is_empty() {
         return None;
     }
@@ -1981,6 +1984,30 @@ fn agent_spawn_requirement_recovery_prompt(
         "用户已经明确要求启动或派发代理。本轮必须调用 agent_spawn 履行代理契约；不要把主线 shell_exec、file_read 或直接总结冒充为代理执行结果。若需要多个代理，应在同一轮发起多次 agent_spawn 并为每个代理写清 display_name、role、goal 与 access_mode。"
             .to_string(),
     )
+}
+
+fn agent_spawn_requirement_is_policy_reachable(task: &Task) -> bool {
+    let Some(policy) = task.policy_snapshot.as_ref() else {
+        return true;
+    };
+    if policy.access_profile == AccessProfile::ReadOnly
+        || policy.command_mode.eq_ignore_ascii_case("read_only")
+        || policy.command_mode.eq_ignore_ascii_case("no_tools")
+    {
+        return false;
+    }
+    if policy
+        .denied_tools
+        .iter()
+        .any(|tool| canonical_tool_call_name(tool) == "agent_spawn")
+    {
+        return false;
+    }
+    policy.allowed_tools.is_empty()
+        || policy
+            .allowed_tools
+            .iter()
+            .any(|tool| canonical_tool_call_name(tool) == "agent_spawn")
 }
 
 fn long_mission_governance_prerequisites_available(
@@ -3704,6 +3731,90 @@ mod tests {
             }
             other => panic!("明确要求代理时不能直接 final，got {other:?}"),
         }
+    }
+
+    #[test]
+    fn explicit_agent_request_does_not_force_unreachable_agent_spawn_in_read_only_mode() {
+        let mut task = make_task_loop_test_task("task-agent-spawn-read-only-unreachable");
+        task.goal = "只读验证：请启动 explorer 代理检查目录结构。".to_string();
+        task.policy_snapshot = Some(magi_core::TaskPolicy {
+            autonomy_level: "Autonomous".to_string(),
+            access_profile: magi_core::AccessProfile::ReadOnly,
+            allowed_tools: Vec::new(),
+            denied_tools: Vec::new(),
+            allowed_paths: Vec::new(),
+            denied_paths: Vec::new(),
+            network_mode: "full".to_string(),
+            command_mode: "read_only".to_string(),
+            retry_limit: 1,
+            validation_profile: Some("required".to_string()),
+            checkpoint_mode: "task_or_phase".to_string(),
+            task_tier: TaskTier::ExecutionChain,
+            background_allowed: true,
+            escalation_conditions: Vec::new(),
+        });
+
+        let outcome =
+            run_static_task_final(&task, "当前只读访问模式不启动代理；我在主线完成只读分析。");
+
+        match outcome {
+            TaskOutcome::Completed { .. } => {}
+            other => panic!("agent_spawn 不可达时不应制造无法满足的代理硬约束，got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn explicit_agent_request_respects_agent_spawn_tool_filters() {
+        let task_store = TaskStore::new();
+        let mut task = make_task_loop_test_task("task-agent-spawn-filtered");
+        task.goal = "请启动 explorer 代理检查目录结构。".to_string();
+        let mut policy = magi_core::TaskPolicy {
+            autonomy_level: "Autonomous".to_string(),
+            access_profile: magi_core::AccessProfile::Restricted,
+            allowed_tools: Vec::new(),
+            denied_tools: Vec::new(),
+            allowed_paths: Vec::new(),
+            denied_paths: Vec::new(),
+            network_mode: "full".to_string(),
+            command_mode: "full".to_string(),
+            retry_limit: 1,
+            validation_profile: Some("required".to_string()),
+            checkpoint_mode: "task_or_phase".to_string(),
+            task_tier: TaskTier::ExecutionChain,
+            background_allowed: true,
+            escalation_conditions: Vec::new(),
+        };
+        task.policy_snapshot = Some(policy.clone());
+        assert!(
+            agent_spawn_requirement_recovery_prompt(&task, &task_store, &[], &[], None, None)
+                .is_some(),
+            "agent_spawn 可达时仍应保护明确代理契约"
+        );
+
+        policy.denied_tools = vec!["agent_spawn".to_string()];
+        task.policy_snapshot = Some(policy.clone());
+        assert!(
+            agent_spawn_requirement_recovery_prompt(&task, &task_store, &[], &[], None, None)
+                .is_none(),
+            "策略显式拒绝 agent_spawn 时不能继续强制模型调用"
+        );
+
+        policy.denied_tools.clear();
+        policy.allowed_tools = vec!["file_read".to_string()];
+        task.policy_snapshot = Some(policy.clone());
+        assert!(
+            agent_spawn_requirement_recovery_prompt(&task, &task_store, &[], &[], None, None)
+                .is_none(),
+            "allowed_tools 白名单不含 agent_spawn 时不能继续强制模型调用"
+        );
+
+        policy.allowed_tools = vec!["spawn_agent".to_string()];
+        task.policy_snapshot = Some(policy);
+        assert!(
+            agent_spawn_requirement_recovery_prompt(&task, &task_store, &[], &[], None, None)
+                .is_some(),
+            "agent_spawn 别名进入白名单时仍应视为可达"
+        );
     }
 
     #[test]
