@@ -1300,10 +1300,13 @@ fn spawn_regular_session_turn_execution(
                     session_id = %session_id,
                     "regular session turn background execution failed: dispatcher missing"
                 );
-                let _ = state
-                    .session_store
-                    .update_current_turn_status(&session_id, "failed");
-                let _ = state.persist_session_durable_state();
+                publish_regular_session_turn_early_failed(
+                    &state,
+                    &session_id,
+                    workspace_id,
+                    accepted_at,
+                    route,
+                );
                 return;
             }
         };
@@ -1311,13 +1314,16 @@ fn spawn_regular_session_turn_execution(
         if let Err(error) = super::begin_session_turn(&state, &session_id) {
             tracing::error!(
                 session_id = %session_id,
-                ?error,
+                error = ?error,
                 "regular session turn background execution rejected: active turn already exists"
             );
-            let _ = state
-                .session_store
-                .update_current_turn_status(&session_id, "failed");
-            let _ = state.persist_session_durable_state();
+            publish_regular_session_turn_early_failed(
+                &state,
+                &session_id,
+                workspace_id,
+                accepted_at,
+                route,
+            );
             return;
         }
         let outcome = dispatcher.execute_session_turn(execution_request);
@@ -1384,6 +1390,32 @@ fn spawn_regular_session_turn_execution(
             }
         }
     });
+}
+
+fn publish_regular_session_turn_early_failed(
+    state: &ApiState,
+    session_id: &SessionId,
+    workspace_id: Option<WorkspaceId>,
+    accepted_at: UtcMillis,
+    route: SessionTurnRouteDto,
+) {
+    let _ = state
+        .session_store
+        .update_current_turn_status(session_id, "failed");
+    let _ = state.persist_session_durable_state();
+    let event_id = EventId::new(format!("event-session-turn-failed-{}", accepted_at.0));
+    let _ = state.event_bus.publish(
+        EventEnvelope::domain(
+            event_id,
+            "session.turn.failed",
+            session_turn_failed_event_payload(session_id, route),
+        )
+        .with_context(EventContext {
+            session_id: Some(session_id.clone()),
+            workspace_id,
+            ..EventContext::default()
+        }),
+    );
 }
 
 fn session_turn_failed_event_payload(
@@ -2612,6 +2644,64 @@ mod tests {
                 .to_string()
                 .contains("/Users/xie/.mcp/server failed: ENOENT")
         );
+    }
+
+    #[test]
+    fn early_regular_turn_failure_publishes_terminal_event() {
+        let state = test_state();
+        let workspace_id =
+            register_workspace(&state, "workspace-early-turn-failure", "early-turn-failure");
+        let session_id = SessionId::new("session-early-turn-failure");
+        let accepted_at = UtcMillis(1777000000200);
+        state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "早期失败事件",
+                Some(workspace_id.to_string()),
+            )
+            .expect("session should create");
+        state
+            .session_store
+            .upsert_current_turn(
+                session_id.clone(),
+                ActiveExecutionTurn {
+                    turn_id: "turn-early-failure".to_string(),
+                    turn_seq: accepted_at.0 as u64,
+                    accepted_at,
+                    status: "running".to_string(),
+                    completed_at: None,
+                    user_message: Some("触发早期失败".to_string()),
+                    items: Vec::new(),
+                },
+            )
+            .expect("current turn should persist");
+
+        publish_regular_session_turn_early_failed(
+            &state,
+            &session_id,
+            Some(workspace_id.clone()),
+            accepted_at,
+            SessionTurnRouteDto::Chat,
+        );
+
+        let current_turn = state
+            .session_store
+            .runtime_sidecar(&session_id)
+            .and_then(|sidecar| sidecar.current_turn)
+            .expect("current turn should remain for durable terminal display");
+        assert_eq!(current_turn.status, "failed");
+        let failed_event = state
+            .event_bus
+            .snapshot()
+            .recent_events
+            .into_iter()
+            .find(|event| event.event_type == "session.turn.failed")
+            .expect("terminal failed event should be published");
+        assert_eq!(failed_event.session_id.as_ref(), Some(&session_id));
+        assert_eq!(failed_event.workspace_id.as_ref(), Some(&workspace_id));
+        assert_eq!(failed_event.payload["session_id"], session_id.as_str());
+        assert_eq!(failed_event.payload["route"], "chat");
     }
 
     async fn post_json(

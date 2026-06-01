@@ -61,6 +61,7 @@ function runGoldenReplay(reducer, projection, timelineRenderItems, contract) {
   assertSplitToolStartedAndResultCollapseIntoOneCard(reducer, projection);
   assertCancelledToolShowsTurnResponseDuration(reducer, projection);
   assertFailedToolWithoutAssistantShowsTurnResponseDuration(reducer, projection);
+  assertUserImageMetadataProjectsToMessage(reducer, projection);
   assertAgentSpawnToolCardStaysOnMainlineAndTaskTabsFilterByTaskId(reducer, projection, timelineRenderItems);
   assertParallelAgentSpawnUsesTaskIdTabs(reducer, projection, timelineRenderItems);
   assertBootstrapProcessingStateFromRunningCanonicalTurn(contract);
@@ -204,6 +205,32 @@ function findArtifactByTurnItemId(projectionValue, itemId) {
   return projectionValue.artifacts.find((artifact) => (
     artifact.message.metadata?.turnItemId === itemId
   ));
+}
+
+function assertUserImageMetadataProjectsToMessage(reducer, projection) {
+  const c = baseCase('user-image-metadata', 'session-golden-user-image', 'turn-golden-user-image', 9300);
+  const imageMetadata = {
+    images: [
+      {
+        name: 'paste.png',
+        dataUrl: 'data:image/png;base64,AAA',
+      },
+    ],
+  };
+  const userItem = user(c, 1, '请分析这张图片。');
+  userItem.metadata = imageMetadata;
+  const assistantItem = assistantText(c, 2, 'assistant-final', '图片中包含测试内容。', 'completed');
+  const state = reducer.replaceCanonicalTurns(c.sessionId, [
+    turn(c, 'completed', [userItem, assistantItem], { completedAt: 9400, responseDurationMs: 100 }),
+  ]);
+  const projectionValue = projection.buildCanonicalTimelineProjection(state);
+  const userArtifact = findArtifactByTurnItemId(projectionValue, 'user-message');
+  assert.ok(userArtifact, 'user image message artifact should exist');
+  assert.deepEqual(
+    userArtifact.message.metadata?.images,
+    imageMetadata.images,
+    'user image metadata must survive canonical projection for MessageItem rendering',
+  );
 }
 
 function assertTerminalLateUpsertIsIgnored(reducer, projection) {
