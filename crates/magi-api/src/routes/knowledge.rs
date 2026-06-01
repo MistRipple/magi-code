@@ -9,7 +9,10 @@ use magi_knowledge_store::{
     code_scanner::{CodeIndexScanOutcome, CodeIndexScanStatus, CodeIndexSummary},
 };
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::{
+    path::PathBuf,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use super::session_scope;
 use crate::{errors::ApiError, state::ApiState};
@@ -29,6 +32,7 @@ pub fn routes() -> Router<ApiState> {
 
 const MIN_LEARNING_CONTENT_LENGTH: usize = 12;
 const MAX_TAGS: usize = 8;
+static KNOWLEDGE_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -158,6 +162,11 @@ fn title_from_learning(content: &str) -> String {
     } else {
         title
     }
+}
+
+fn new_knowledge_id(prefix: &str) -> String {
+    let nonce = KNOWLEDGE_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
+    format!("{prefix}-{}-{nonce}", UtcMillis::now().0)
 }
 
 #[derive(Debug, Deserialize)]
@@ -438,7 +447,7 @@ async fn add_knowledge_item(
         }
     };
     let record = KnowledgeRecord {
-        knowledge_id: format!("{id_prefix}-{}", UtcMillis::now().0),
+        knowledge_id: new_knowledge_id(id_prefix),
         kind,
         title,
         content,
@@ -639,6 +648,16 @@ mod tests {
             workspace_path.ends_with(&expected_suffix),
             "payload must carry canonical workspace path, got {workspace_path}"
         );
+    }
+
+    #[test]
+    fn new_knowledge_id_keeps_same_millisecond_writes_unique() {
+        let first = new_knowledge_id("learning");
+        let second = new_knowledge_id("learning");
+
+        assert_ne!(first, second);
+        assert!(first.starts_with("learning-"));
+        assert!(second.starts_with("learning-"));
     }
 
     #[tokio::test]

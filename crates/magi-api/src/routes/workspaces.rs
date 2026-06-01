@@ -4,10 +4,15 @@ use axum::{
     routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use super::session_scope::require_registered_workspace_binding;
 use crate::{errors::ApiError, state::ApiState};
+
+static WORKSPACE_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub fn routes() -> Router<ApiState> {
     Router::new()
@@ -94,8 +99,7 @@ async fn register_workspace(
         })));
     }
 
-    let workspace_id =
-        magi_core::WorkspaceId::new(format!("workspace-{}", magi_core::UtcMillis::now().0));
+    let workspace_id = new_workspace_id();
     match state
         .workspace_registry
         .register(workspace_id.clone(), path.clone())
@@ -125,6 +129,14 @@ async fn register_workspace(
         "workspaceId": workspace_id.to_string(),
         "registered": true
     })))
+}
+
+fn new_workspace_id() -> magi_core::WorkspaceId {
+    let nonce = WORKSPACE_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
+    magi_core::WorkspaceId::new(format!(
+        "workspace-{}-{nonce}",
+        magi_core::UtcMillis::now().0
+    ))
 }
 
 pub(crate) fn canonical_workspace_path(raw_path: &str) -> Result<PathBuf, ApiError> {
@@ -320,6 +332,16 @@ mod tests {
             .await
             .expect("body should read");
         serde_json::from_slice(&body).expect("payload should deserialize")
+    }
+
+    #[test]
+    fn new_workspace_id_keeps_same_millisecond_registrations_unique() {
+        let first = new_workspace_id();
+        let second = new_workspace_id();
+
+        assert_ne!(first, second);
+        assert!(first.as_str().starts_with("workspace-"));
+        assert!(second.as_str().starts_with("workspace-"));
     }
 
     #[test]
