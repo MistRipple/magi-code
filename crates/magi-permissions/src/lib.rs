@@ -373,6 +373,7 @@ fn shell_command_has_write_indicator(command: &str) -> bool {
         || tokens
             .iter()
             .any(|token| shell_token_is_write_indicator(token))
+        || shell_tokens_include_download_output_write(&tokens)
         || shell_tokens_include_mutating_git(&tokens)
 }
 
@@ -433,6 +434,93 @@ fn shell_token_is_write_indicator(token: &str) -> bool {
             | "rsync"
             | "scp"
     )
+}
+
+fn shell_tokens_include_download_output_write(tokens: &[String]) -> bool {
+    tokens
+        .iter()
+        .enumerate()
+        .any(|(index, token)| match token.as_str() {
+            "curl" => curl_tokens_write_output(&tokens[index + 1..]),
+            "wget" => wget_tokens_write_output(&tokens[index + 1..]),
+            _ => false,
+        })
+}
+
+fn curl_tokens_write_output(tokens: &[String]) -> bool {
+    let mut index = 0usize;
+    while index < tokens.len() {
+        let token = tokens[index].as_str();
+        if matches!(token, "-o" | "--output") {
+            if tokens
+                .get(index + 1)
+                .is_some_and(|value| value.as_str() == "-")
+            {
+                index += 2;
+                continue;
+            }
+            return true;
+        }
+        if token.starts_with("--output=") {
+            return token != "--output=-";
+        }
+        if token.starts_with('-')
+            && !token.starts_with("--")
+            && token.len() > 2
+            && token.contains('o')
+            && token != "-o-"
+        {
+            return true;
+        }
+        if token.starts_with("-o") && token != "-o-" {
+            return true;
+        }
+        if matches!(token, "--remote-name" | "--remote-name-all") {
+            return true;
+        }
+        index += 1;
+    }
+    false
+}
+
+fn wget_tokens_write_output(tokens: &[String]) -> bool {
+    let mut has_stdout_output = false;
+    let mut has_spider = false;
+    let mut index = 0usize;
+    while index < tokens.len() {
+        let token = tokens[index].as_str();
+        match token {
+            "--spider" => {
+                has_spider = true;
+            }
+            "-o" | "--output-document" => {
+                if tokens
+                    .get(index + 1)
+                    .is_some_and(|value| value.as_str() == "-")
+                {
+                    has_stdout_output = true;
+                    index += 2;
+                    continue;
+                }
+                return true;
+            }
+            "-o-" | "--output-document=-" => {
+                has_stdout_output = true;
+            }
+            value if value.starts_with("--output-document=") => {
+                if value != "--output-document=-" {
+                    return true;
+                }
+                has_stdout_output = true;
+            }
+            value if value.contains("o-") => {
+                has_stdout_output = true;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    !has_stdout_output && !has_spider
 }
 
 fn shell_tokens_include_mutating_git(tokens: &[String]) -> bool {
@@ -700,6 +788,45 @@ mod tests {
         let args = r#"{"command":"touch out.txt","access_mode":"read_only"}"#;
 
         assert!(!PermissionEngine::shell_arguments_request_read_only(args));
+    }
+
+    #[test]
+    fn shell_read_only_declaration_rejects_downloads_that_write_files() {
+        let curl_output = r#"{"command":"curl -L https://example.test/file -o out.bin","access_mode":"read_only"}"#;
+        let curl_remote_name =
+            r#"{"command":"curl -LO https://example.test/file","access_mode":"read_only"}"#;
+        let wget_default =
+            r#"{"command":"wget https://example.test/file","access_mode":"read_only"}"#;
+        let wget_output =
+            r#"{"command":"wget https://example.test/file -O out.bin","access_mode":"read_only"}"#;
+
+        assert!(!PermissionEngine::shell_arguments_request_read_only(
+            curl_output
+        ));
+        assert!(!PermissionEngine::shell_arguments_request_read_only(
+            curl_remote_name
+        ));
+        assert!(!PermissionEngine::shell_arguments_request_read_only(
+            wget_default
+        ));
+        assert!(!PermissionEngine::shell_arguments_request_read_only(
+            wget_output
+        ));
+    }
+
+    #[test]
+    fn shell_read_only_declaration_allows_downloads_to_stdout() {
+        let curl_stdout =
+            r#"{"command":"curl -L https://example.test/file -o -","access_mode":"read_only"}"#;
+        let wget_stdout =
+            r#"{"command":"wget -qO- https://example.test/file","access_mode":"read_only"}"#;
+
+        assert!(PermissionEngine::shell_arguments_request_read_only(
+            curl_stdout
+        ));
+        assert!(PermissionEngine::shell_arguments_request_read_only(
+            wget_stdout
+        ));
     }
 
     #[test]
