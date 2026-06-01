@@ -486,7 +486,6 @@ fn local_session_turn_intent_decision(
         SessionTurnRouteDto::Continue
     } else if requests_explicit_task_or_agent
         || !skill_name.is_empty()
-        || !request.images.is_empty()
         || (session_turn_requests_task_by_local_rules(request) && !requests_simple_execution)
     {
         SessionTurnRouteDto::Task
@@ -2884,6 +2883,36 @@ mod tests {
             .expect("本地路由不应依赖外部模型");
 
         assert!(matches!(decision.route, SessionTurnRouteDto::Chat));
+    }
+
+    #[test]
+    fn image_turn_defaults_to_regular_chat_route() {
+        let state = test_state();
+        let mut request = session_turn_request("识别这张图片");
+        request.images.push(crate::dto::SessionTurnImageDto {
+            name: "paste.png".to_string(),
+            data_url: "data:image/png;base64,AAA".to_string(),
+        });
+
+        let decision = decide_session_turn_with_task_planner(&state, &request)
+            .expect("图片会话不应默认升级为任务链");
+
+        assert!(matches!(decision.route, SessionTurnRouteDto::Chat));
+    }
+
+    #[test]
+    fn explicit_task_turn_with_image_still_uses_task_route() {
+        let state = test_state();
+        let mut request = session_turn_request("以任务模式分析这张图片并整理成待办");
+        request.images.push(crate::dto::SessionTurnImageDto {
+            name: "paste.png".to_string(),
+            data_url: "data:image/png;base64,AAA".to_string(),
+        });
+
+        let decision = decide_session_turn_with_task_planner(&state, &request)
+            .expect("显式任务请求仍应进入任务链");
+
+        assert!(matches!(decision.route, SessionTurnRouteDto::Task));
     }
 
     #[tokio::test]
