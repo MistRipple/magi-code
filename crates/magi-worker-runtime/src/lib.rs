@@ -1046,6 +1046,46 @@ mod tests {
     }
 
     #[test]
+    fn worker_skill_dispatch_query_output_redacts_raw_detail_even_for_existing_records() {
+        let bus = Arc::new(InMemoryEventBus::new(16));
+        let runtime = WorkerRuntime::new_compare(bus);
+        let worker_id = worker_id("worker-skill-query-public-detail");
+        let task_id = task_id("task-skill-query-public-detail");
+        let raw_detail = "桥接调用失败[Protocol]: /Users/xie/.mcp/config.json parse error";
+        runtime
+            .skill_dispatches
+            .write()
+            .expect("worker skill dispatch write lock poisoned")
+            .push(WorkerSkillDispatchObservation {
+                worker_id: worker_id.clone(),
+                task_id: task_id.clone(),
+                tool_call_id: ToolCallId::new("skill-call-query-public-detail"),
+                tool_name: "echo.inspect".to_string(),
+                route: Some(SkillDispatchRoute::Bridge),
+                binding_id: Some("inspect-binding".to_string()),
+                status: SkillDispatchStatus::Failed,
+                detail: raw_detail.to_string(),
+                observed_at: UtcMillis::now(),
+            });
+
+        let all_dispatches = runtime.skill_dispatches();
+        assert_eq!(all_dispatches.len(), 1);
+        assert_eq!(
+            all_dispatches[0].detail,
+            "Skill 工具调用失败，请检查工具配置或外接服务状态"
+        );
+        assert!(!all_dispatches[0].detail.contains("/Users/xie"));
+
+        let task_snapshot = runtime.snapshot_for_task(&task_id);
+        let event_text = serde_json::to_string(&task_snapshot.skill_dispatches)
+            .expect("skill dispatch snapshot should serialize");
+        assert!(
+            !event_text.contains("/Users/xie") && !event_text.contains("parse error"),
+            "worker skill dispatch query output must not expose raw detail: {event_text}"
+        );
+    }
+
+    #[test]
     fn worker_loop_can_run_success_cycle_step_by_step() {
         let bus = Arc::new(InMemoryEventBus::new(16));
         let runtime = WorkerRuntime::new_compare(bus);

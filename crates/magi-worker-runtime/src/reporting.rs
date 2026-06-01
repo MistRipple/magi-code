@@ -214,7 +214,7 @@ impl WorkerRuntime {
         observation: SkillDispatchObservation,
     ) -> Option<WorkerSkillDispatchObservation> {
         let task_id = self.current_task_id(worker_id)?;
-        let record = WorkerSkillDispatchObservation {
+        let record = public_worker_skill_dispatch_observation(WorkerSkillDispatchObservation {
             worker_id: worker_id.clone(),
             task_id: task_id.clone(),
             tool_call_id: observation.tool_call_id.clone(),
@@ -222,9 +222,9 @@ impl WorkerRuntime {
             route: observation.route,
             binding_id: observation.binding_id.clone(),
             status: observation.status,
-            detail: public_skill_dispatch_detail(&observation),
+            detail: observation.detail.clone(),
             observed_at: UtcMillis::now(),
-        };
+        });
         self.skill_dispatches
             .write()
             .expect("worker skill dispatch write lock poisoned")
@@ -315,9 +315,16 @@ impl WorkerRuntime {
     }
 }
 
-fn public_skill_dispatch_detail(observation: &SkillDispatchObservation) -> String {
-    match observation.status {
-        SkillDispatchStatus::Succeeded => observation.detail.clone(),
+pub(crate) fn public_worker_skill_dispatch_observation(
+    mut record: WorkerSkillDispatchObservation,
+) -> WorkerSkillDispatchObservation {
+    record.detail = public_skill_dispatch_detail(record.status, &record.detail);
+    record
+}
+
+fn public_skill_dispatch_detail(status: SkillDispatchStatus, raw_detail: &str) -> String {
+    match status {
+        SkillDispatchStatus::Succeeded => raw_detail.to_string(),
         SkillDispatchStatus::NeedsApproval => SKILL_DISPATCH_NEEDS_APPROVAL_DETAIL.to_string(),
         SkillDispatchStatus::Rejected => SKILL_DISPATCH_REJECTED_DETAIL.to_string(),
         SkillDispatchStatus::Failed => SKILL_DISPATCH_FAILED_DETAIL.to_string(),

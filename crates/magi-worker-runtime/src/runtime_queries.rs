@@ -4,6 +4,7 @@ use crate::{
     WorkerExecutorObservation, WorkerGovernanceObservation, WorkerGovernanceSummary, WorkerId,
     WorkerLifecycleStatus, WorkerRuntime, WorkerRuntimeBranchSnapshot,
     WorkerRuntimeDurableSnapshot, WorkerRuntimeSummary, WorkerSkillDispatchObservation,
+    reporting::public_worker_skill_dispatch_observation,
 };
 
 impl WorkerRuntime {
@@ -42,7 +43,10 @@ impl WorkerRuntime {
         self.skill_dispatches
             .read()
             .expect("worker skill dispatch read lock poisoned")
-            .clone()
+            .iter()
+            .cloned()
+            .map(public_worker_skill_dispatch_observation)
+            .collect()
     }
 
     pub fn skill_dispatch_summary(&self) -> SkillDispatchSummary {
@@ -186,6 +190,7 @@ impl WorkerRuntime {
             .iter()
             .filter(|record| &record.worker_id == worker_id)
             .cloned()
+            .map(public_worker_skill_dispatch_observation)
             .collect();
         let governance_observations: Vec<WorkerGovernanceObservation> = self
             .governance_observations
@@ -243,6 +248,7 @@ impl WorkerRuntime {
             .iter()
             .filter(|record| &record.task_id == task_id)
             .cloned()
+            .map(public_worker_skill_dispatch_observation)
             .collect();
         let governance_observations: Vec<WorkerGovernanceObservation> = self
             .governance_observations
