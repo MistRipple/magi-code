@@ -21,7 +21,7 @@ restart_fixed_port() {
     if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
       sleep 0.5
     else
-      return
+      return 0
     fi
   done
 

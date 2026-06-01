@@ -241,6 +241,7 @@ function normalizeSettingsBootstrapPayload(
   return {
     workspaceId: normalizeBindingString(payload.workspaceId ?? payload.workspace_id),
     workspacePath: normalizeBindingString(payload.workspacePath ?? payload.workspace_path),
+    sessionId: normalizeBindingString(payload.sessionId ?? payload.session_id),
     workerConfigs: (
       payload.workerConfigs
       && typeof payload.workerConfigs === 'object'
@@ -283,21 +284,14 @@ function normalizeSettingsBootstrapPayload(
   };
 }
 
-export function resolveAgentWorkspaceBindingContext(): AgentWorkspaceBindingContext {
-  const binding = resolveAgentBindingContext();
-  return {
-    workspaceId: binding.workspaceId,
-    workspacePath: binding.workspacePath,
-  };
-}
-
 export function settingsBootstrapMatchesCurrentWorkspace(
-  snapshot: Pick<SettingsBootstrapPayload, 'workspaceId' | 'workspacePath'> | null | undefined,
+  snapshot: Pick<SettingsBootstrapPayload, 'workspaceId' | 'workspacePath' | 'sessionId'> | null | undefined,
 ): boolean {
   if (!snapshot) return false;
-  const binding = resolveAgentWorkspaceBindingContext();
+  const binding = resolveAgentBindingContext();
   return normalizeBindingString(snapshot.workspaceId) === binding.workspaceId
-    && normalizeBindingString(snapshot.workspacePath) === binding.workspacePath;
+    && normalizeBindingString(snapshot.workspacePath) === binding.workspacePath
+    && normalizeBindingString(snapshot.sessionId) === binding.sessionId;
 }
 
 export interface AgentExecutionStatsItem {
@@ -431,11 +425,6 @@ interface AgentBindingContext {
   workspaceId: string;
   workspacePath: string;
   sessionId: string;
-}
-
-export interface AgentWorkspaceBindingContext {
-  workspaceId: string;
-  workspacePath: string;
 }
 
 export interface AgentNotificationScope {
@@ -1334,7 +1323,7 @@ export async function getAgentSettingsBootstrap(
   options: { scope?: 'core' | 'full' } = {},
 ): Promise<AgentSettingsBootstrapSnapshot> {
   try {
-    const query = buildWorkspaceBoundQuery(options.scope === 'core' ? { scope: 'core' } : {});
+    const query = buildBoundQuery(options.scope === 'core' ? { scope: 'core' } : {});
     const response = await getTransport().request(agentUrl('/api/settings/bootstrap', query));
     const payload = await parseAgentJson<Record<string, unknown>>(response, 'load settings bootstrap');
     return normalizeSettingsBootstrapPayload(payload);

@@ -656,6 +656,15 @@ async fn settings_bootstrap(
             "workspacePath".to_string(),
             Value::String(scope.workspace_path_string()),
         );
+        object.insert(
+            "sessionId".to_string(),
+            Value::String(
+                scope
+                    .session_id()
+                    .map(ToString::to_string)
+                    .unwrap_or_default(),
+            ),
+        );
     }
     Ok(Json(snapshot))
 }
@@ -1414,6 +1423,7 @@ mod tests {
             assert!(bootstrap[key].is_object(), "{key} should be an object");
         }
         assert_eq!(bootstrap["workspaceId"], json!("workspace-contract"));
+        assert_eq!(bootstrap["sessionId"], json!("session-empty-contract"));
         assert_eq!(
             bootstrap["workspacePath"],
             json!("/tmp/magi-settings-contract")

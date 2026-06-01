@@ -51,6 +51,7 @@ export interface SettingsRuntimeSnapshot {
 export interface SettingsBootstrapPayload {
   workspaceId?: string | null;
   workspacePath?: string | null;
+  sessionId?: string | null;
   workerConfigs: Record<string, unknown>;
   orchestratorConfig: Record<string, unknown>;
   auxiliaryConfig: Record<string, unknown>;
