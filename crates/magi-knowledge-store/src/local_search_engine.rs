@@ -155,6 +155,7 @@ impl LocalSearchEngine {
     pub fn search(&mut self, query: &str, options: SearchOptions) -> Vec<SearchResult> {
         let max_results = options.max_results.unwrap_or(10);
         let max_context_length = options.max_context_length.unwrap_or(8000);
+        let cache_key = search_cache_key(query, &options);
 
         let trimmed = query.trim();
         if trimmed.is_empty() {
@@ -163,7 +164,7 @@ impl LocalSearchEngine {
 
         self.reconcile_indexed_files();
 
-        if let Some(cached) = self.search_cache.get(query) {
+        if let Some(cached) = self.search_cache.get(&cache_key) {
             return cached;
         }
 
@@ -294,7 +295,8 @@ impl LocalSearchEngine {
         );
 
         let file_paths: Vec<String> = results.iter().map(|r| r.file_path.clone()).collect();
-        self.search_cache.set(query, results.clone(), file_paths);
+        self.search_cache
+            .set(&cache_key, results.clone(), file_paths);
 
         results
     }
@@ -922,6 +924,30 @@ fn normalize_scope_hints(scopes: &[String]) -> Vec<String> {
         .filter(|s| !s.is_empty())
         .take(8)
         .collect()
+}
+
+#[derive(Serialize)]
+struct SearchCacheKey<'a> {
+    query: &'a str,
+    max_results: Option<usize>,
+    max_context_length: Option<usize>,
+    preferred_scopes: Vec<String>,
+    prefer_recent_edits: bool,
+    llm_expand_result: &'a Option<LlmExpandResult>,
+    llm_rerank_response: &'a Option<String>,
+}
+
+fn search_cache_key(query: &str, options: &SearchOptions) -> String {
+    serde_json::to_string(&SearchCacheKey {
+        query,
+        max_results: options.max_results,
+        max_context_length: options.max_context_length,
+        preferred_scopes: normalize_scope_hints(&options.preferred_scopes),
+        prefer_recent_edits: options.prefer_recent_edits,
+        llm_expand_result: &options.llm_expand_result,
+        llm_rerank_response: &options.llm_rerank_response,
+    })
+    .unwrap_or_else(|_| query.to_string())
 }
 
 fn add_path_tokens_to_vocabulary(file_path: &str, vocab: &mut HashSet<String>) {

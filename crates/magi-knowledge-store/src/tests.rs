@@ -439,6 +439,64 @@ fn workspace_code_index_builds_and_searches_real_symbols() {
 }
 
 #[test]
+fn workspace_code_search_cache_respects_search_options() {
+    use crate::local_search_engine::SearchOptions;
+    use std::fs;
+
+    let base = std::env::temp_dir().join(format!(
+        "magi-ks-cache-options-test-{}-{}",
+        std::process::id(),
+        UtcMillis::now().0
+    ));
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir_all(base.join("src")).expect("create temp project dir");
+    fs::write(
+        base.join("src/alpha.rs"),
+        "pub fn shared_cache_probe_alpha() -> bool { true }\n",
+    )
+    .expect("write alpha source");
+    fs::write(
+        base.join("src/beta.rs"),
+        "pub fn shared_cache_probe_beta() -> bool { true }\n",
+    )
+    .expect("write beta source");
+
+    let store = KnowledgeStore::new();
+    let workspace_id = WorkspaceId::new("ws-cache-options-test");
+    store.build_workspace_index(&workspace_id, &base);
+
+    let first = store
+        .search_workspace_code(
+            &workspace_id,
+            "shared cache probe",
+            SearchOptions {
+                max_results: Some(1),
+                ..SearchOptions::default()
+            },
+        )
+        .expect("engine ready");
+    assert_eq!(first.len(), 1);
+
+    let second = store
+        .search_workspace_code(
+            &workspace_id,
+            "shared cache probe",
+            SearchOptions {
+                max_results: Some(10),
+                ..SearchOptions::default()
+            },
+        )
+        .expect("engine ready");
+    assert!(
+        second.len() >= 2,
+        "不同 max_results 不应复用只含 1 条结果的缓存，实际: {:?}",
+        second.iter().map(|r| &r.file_path).collect::<Vec<_>>()
+    );
+
+    let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
 fn workspace_index_rebuild_clears_runtime_when_workspace_has_no_indexable_files() {
     use crate::local_search_engine::SearchOptions;
     use std::fs;
