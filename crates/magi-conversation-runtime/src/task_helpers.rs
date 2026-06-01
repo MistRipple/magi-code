@@ -554,7 +554,7 @@ fn push_first_semantic_match(
 pub fn public_builtin_tool_reference_aliases() -> Vec<(&'static str, &'static str)> {
     let mut aliases = Vec::new();
     for tool in BuiltinToolName::ALL {
-        if tool.is_public_tool_surface() {
+        if tool.is_public_tool_surface() && !tool.is_runtime_internal_tool_call() {
             let name = tool.as_str();
             aliases.push((name, name));
         }

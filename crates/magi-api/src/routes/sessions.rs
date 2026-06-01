@@ -3533,6 +3533,23 @@ mod tests {
     }
 
     #[test]
+    fn does_not_force_orchestration_only_builtin_tool_names_to_regular_execute() {
+        for tool_name in ["todo_write", "memory_write", "plan_write", "agent_wait"] {
+            let request = session_turn_request(&format!("请调用 {tool_name} 完成这一步"));
+            let decision = normalize_session_turn_decision(classifier_chat_decision(), &request);
+
+            assert!(
+                !matches!(decision.route, SessionTurnRouteDto::Execute),
+                "{tool_name} 需要任务运行时上下文，不能被普通 Execute 路由强制调用"
+            );
+            assert!(
+                decision.forced_tool_name.is_none(),
+                "{tool_name} 不能成为普通会话 forced tool"
+            );
+        }
+    }
+
+    #[test]
     fn does_not_treat_substrings_as_explicit_tool_names() {
         let request = session_turn_request("profile_mkdir 是一个普通变量名");
         let decision = normalize_session_turn_decision(classifier_chat_decision(), &request);
