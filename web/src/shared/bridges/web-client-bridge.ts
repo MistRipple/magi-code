@@ -183,8 +183,11 @@ const RECOVERY_MAX_DELAY_MS = 10_000;
 const EVENT_STREAM_PARSE_ERROR_DEBOUNCE_MS = 5000;
 const EVENT_STREAM_OPEN_TIMEOUT_MS = 4000;
 // 后端 SSE keep-alive interval 为 5s（见 crates/magi-api/src/sse.rs）。
-// 给出 4 个心跳的容错窗口后再判定静默断流，兼顾移动网络抖动与恢复速度。
+// 空闲态给出 4 个心跳的容错窗口；活跃执行态只给出约 1.5 个心跳窗口。
+// 这样移动网络 / Tunnel 静默断流时，正在输出的对话会更快走 bootstrap recovery，
+// 避免用户长时间看到“内容停住但仍在响应中”。
 const EVENT_STREAM_IDLE_TIMEOUT_MS = 20_000;
+const ACTIVE_EVENT_STREAM_IDLE_TIMEOUT_MS = 8_000;
 const EVENT_STREAM_IDLE_CHECK_INTERVAL_MS = 5_000;
 const SESSION_TIMELINE_PAGE_SIZE = 50;
 const WEBVIEW_STATE_STORAGE_KEY = 'webview-state';
@@ -660,6 +663,12 @@ function markEventStreamActive(): void {
   lastEventStreamActivityAt = Date.now();
 }
 
+function currentEventStreamIdleTimeoutMs(): number {
+  return bridgeRuntimeIsBusy()
+    ? ACTIVE_EVENT_STREAM_IDLE_TIMEOUT_MS
+    : EVENT_STREAM_IDLE_TIMEOUT_MS;
+}
+
 function stopEventStreamIdleCheck(): void {
   if (eventStreamIdleCheckTimer !== null) {
     window.clearInterval(eventStreamIdleCheckTimer);
@@ -681,14 +690,19 @@ function startEventStreamIdleCheck(): void {
       return;
     }
     const idleMs = Date.now() - lastEventStreamActivityAt;
-    if (idleMs < EVENT_STREAM_IDLE_TIMEOUT_MS) {
+    const timeoutMs = currentEventStreamIdleTimeoutMs();
+    if (idleMs < timeoutMs) {
       return;
     }
     // SSE 握手仍 open，但超过容错窗口没收到任何事件（含 keep-alive），判定静默断流。
     // 重置活跃时间戳避免 recovery 调度期间重复触发，由 recovery 完成后的 ensureEventStream
     // 重新建连或 closeEventStream 停止检测。
     markEventStreamActive();
-    scheduleRecovery('event_stream_idle', new Error(`SSE 静默超时：${Math.round(idleMs / 1000)}s`), true);
+    scheduleRecovery(
+      bridgeRuntimeIsBusy() ? 'event_stream_active_idle' : 'event_stream_idle',
+      new Error(`SSE 静默超时：${Math.round(idleMs / 1000)}s`),
+      true,
+    );
   }, EVENT_STREAM_IDLE_CHECK_INTERVAL_MS);
 }
 
