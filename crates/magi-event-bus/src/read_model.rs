@@ -805,7 +805,7 @@ impl RuntimeExecutorSummary {
             health_detail: payload
                 .get("health_detail")
                 .and_then(serde_json::Value::as_str)
-                .map(str::to_string),
+                .and_then(|value| public_runtime_summary(Some(value))),
             reuse_scope: payload
                 .get("reuse_scope")
                 .and_then(serde_json::Value::as_str)
@@ -850,7 +850,7 @@ impl RuntimeExecutorSummary {
             failure_message: payload
                 .get("failure_message")
                 .and_then(serde_json::Value::as_str)
-                .map(str::to_string),
+                .and_then(|value| public_runtime_summary(Some(value))),
             last_observed_at: payload
                 .get("observed_at")
                 .and_then(serde_json::Value::as_u64)
@@ -1533,7 +1533,7 @@ impl RuntimeReadModelInput {
                         .payload
                         .get("failure_message")
                         .and_then(|value| value.as_str())
-                        .map(ToString::to_string);
+                        .and_then(|value| public_runtime_summary(Some(value)));
                     worker_entry.executor_supported_step_kinds = event
                         .payload
                         .get("supported_step_kinds")
@@ -2350,6 +2350,62 @@ mod tests {
             assert!(!public_summary.contains("/Users/xie"));
             assert!(!public_summary.contains("abcdef"));
             assert!(!public_summary.contains("sk-live-secret"));
+        }
+    }
+
+    #[test]
+    fn executor自由文本进入读模型前会脱敏() {
+        let mut event = EventEnvelope::audit(
+            EventId::new("event-executor-sensitive-text"),
+            "worker.executor.observed",
+            json!({
+                "worker_id": "worker-sensitive-executor",
+                "task_id": "task-sensitive-executor",
+                "observation_status": "unavailable",
+                "execution_mode": "local-process",
+                "executor_id": "local-process-worker-executor",
+                "executor_version": "worker-local-process-executor-v2",
+                "health_status": "Unavailable",
+                "health_detail": "probe failed at /Users/xie/.magi/executor.json with Bearer abcdef and sk-health-secret",
+                "failure_layer": "transport",
+                "failure_message": "spawn failed at /private/tmp/magi/executor with Bearer ghijkl and sk-failure-secret",
+                "supported_step_kinds": ["final-report"],
+                "max_parallelism": 1,
+                "observed_at": 1
+            }),
+        );
+        event.sequence = 1;
+
+        let read_model = RuntimeReadModelInput::from_events(&[event]);
+        let health_detail = read_model
+            .meta
+            .executor
+            .health_detail
+            .as_deref()
+            .expect("executor health detail should exist");
+        let failure_message = read_model
+            .meta
+            .executor
+            .failure_message
+            .as_deref()
+            .expect("executor failure message should exist");
+        let worker_failure_message = read_model
+            .details
+            .workers
+            .first()
+            .and_then(|worker| worker.executor_failure_message.as_deref())
+            .expect("worker executor failure message should exist");
+
+        for public_summary in [health_detail, failure_message, worker_failure_message] {
+            assert!(public_summary.contains("[path]"));
+            assert!(public_summary.contains("Bearer [redacted]"));
+            assert!(public_summary.contains("sk-[redacted]"));
+            assert!(!public_summary.contains("/Users/xie"));
+            assert!(!public_summary.contains("/private/tmp"));
+            assert!(!public_summary.contains("abcdef"));
+            assert!(!public_summary.contains("ghijkl"));
+            assert!(!public_summary.contains("sk-health-secret"));
+            assert!(!public_summary.contains("sk-failure-secret"));
         }
     }
 
