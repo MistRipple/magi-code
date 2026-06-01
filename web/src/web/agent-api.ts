@@ -172,6 +172,7 @@ function normalizeBuiltinTools(value: unknown): SettingsBuiltinTool[] {
     const riskLevel = readRecordField(record, 'riskLevel', 'risk_level');
     const approvalRequirement = readRecordField(record, 'approvalRequirement', 'approval_requirement');
     const accessMode = readRecordField(record, 'accessMode', 'access_mode');
+    const runtimeInternal = readRecordField(record, 'runtimeInternal', 'runtime_internal');
     const runtimeStatus = readRecordField(record, 'runtimeStatus', 'runtime_status');
     const runtimeWarnings = readRecordField(record, 'runtimeWarnings', 'runtime_warnings');
     const schemaStatus = readRecordField(record, 'schemaStatus', 'schema_status');
@@ -181,6 +182,7 @@ function normalizeBuiltinTools(value: unknown): SettingsBuiltinTool[] {
       riskLevel: typeof riskLevel === 'string' ? riskLevel : '',
       approvalRequirement: typeof approvalRequirement === 'string' ? approvalRequirement : '',
       accessMode: typeof accessMode === 'string' ? accessMode : 'read_only',
+      runtimeInternal: runtimeInternal === true,
       runtimeStatus: typeof runtimeStatus === 'string' ? runtimeStatus : 'ready',
       runtimeWarnings: normalizeWarningMarkers(runtimeWarnings, 'runtime_warning'),
       schemaStatus: typeof schemaStatus === 'string' ? schemaStatus : 'ok',

@@ -1494,6 +1494,20 @@ mod tests {
             .find(|tool| tool["name"] == serde_json::json!("shell_exec"))
             .expect("shell_exec should be exposed");
         assert_eq!(shell_exec["runtimeStatus"], serde_json::json!("ready"));
+        assert_eq!(
+            shell_exec["runtimeInternal"],
+            serde_json::json!(false),
+            "ordinary public tools should not be marked as task-runtime-only"
+        );
+        let agent_wait = builtin_tools
+            .iter()
+            .find(|tool| tool["name"] == serde_json::json!("agent_wait"))
+            .expect("agent_wait should be exposed for task runtime");
+        assert_eq!(
+            agent_wait["runtimeInternal"],
+            serde_json::json!(true),
+            "task protocol tools should be distinguishable from ordinary local tools"
+        );
         let knowledge_query = builtin_tools
             .iter()
             .find(|tool| tool["name"] == serde_json::json!("knowledge_query"))

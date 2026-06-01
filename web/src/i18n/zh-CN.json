@@ -684,6 +684,7 @@
   "settings.tools.builtinDesc": "系统内置的本地工具能力，按当前工作区状态展示可用性",
   "settings.tools.builtinCount": "{ready}/{total} 就绪",
   "settings.tools.builtin.localCapability": "本地内置能力",
+  "settings.tools.builtin.runtimeCapability": "任务运行时能力",
   "settings.tools.builtin.unknown": "未知内置能力",
   "settings.tools.builtin.fileRead": "读取文件",
   "settings.tools.builtin.viewImage": "查看图片",

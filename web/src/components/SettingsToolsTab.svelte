@@ -38,6 +38,7 @@
       riskLevel: string;
       approvalRequirement: string;
       accessMode: string;
+      runtimeInternal: boolean;
       runtimeStatus: string;
       runtimeWarnings: string[];
       schemaStatus: string;
@@ -148,6 +149,7 @@
   }
 
   function getBuiltinToolRuntimeTitle(tool: {
+    runtimeInternal: boolean;
     runtimeStatus: string;
     runtimeWarnings: string[];
     schemaWarnings: string[];
@@ -156,6 +158,12 @@
     if (tool.runtimeWarnings.length > 0) parts.push(i18n.t('settings.tools.runtimeWarning'));
     if (tool.schemaWarnings.length > 0) parts.push(i18n.t('settings.tools.schemaWarning'));
     return parts.join('\n');
+  }
+
+  function getBuiltinToolScopeLabel(tool: { runtimeInternal: boolean }): string {
+    return i18n.t(tool.runtimeInternal
+      ? 'settings.tools.builtin.runtimeCapability'
+      : 'settings.tools.builtin.localCapability');
   }
 
   function getMCPServerSubtitle(server: any): string {
@@ -490,7 +498,7 @@
                         </div>
                         <div class="identity-stack">
                           <span class="main-label">{getBuiltinToolLabel(tool.name)}</span>
-                          <span class="tool-code">{i18n.t('settings.tools.builtin.localCapability')}</span>
+                          <span class="tool-code">{getBuiltinToolScopeLabel(tool)}</span>
                         </div>
                       </div>
                       <div class="builtin-tool-badges">

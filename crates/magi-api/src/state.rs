@@ -1281,6 +1281,7 @@ impl ApiState {
                     "riskLevel": tool.get("risk_level").cloned().unwrap_or(serde_json::Value::String("low".to_string())),
                     "approvalRequirement": tool.get("approval_requirement").cloned().unwrap_or(serde_json::Value::String("none".to_string())),
                     "accessMode": tool.get("access_mode").cloned().unwrap_or(serde_json::Value::String("read_only".to_string())),
+                    "runtimeInternal": tool.get("runtime_internal").cloned().unwrap_or(serde_json::Value::Bool(false)),
                     "runtimeStatus": tool.get("runtime_status").cloned().unwrap_or(serde_json::Value::String("ready".to_string())),
                     "runtimeWarnings": warning_markers(tool, "runtime_warnings", "runtime_warning"),
                     "schemaStatus": tool.get("schema_status").cloned().unwrap_or(serde_json::Value::String("ok".to_string())),
