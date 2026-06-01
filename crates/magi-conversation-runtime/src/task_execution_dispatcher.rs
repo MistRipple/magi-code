@@ -32,8 +32,8 @@ use magi_context_runtime::{
     RecentTurnSource,
 };
 use magi_core::{
-    EventId, ExecutionOwnership, LeaseId, MissionId, SessionId, TaskId, TaskKind, UtcMillis,
-    WorkerId, WorkspaceId,
+    AccessProfile, EventId, ExecutionOwnership, LeaseId, MissionId, SessionId, TaskId, TaskKind,
+    UtcMillis, WorkerId, WorkspaceId,
 };
 use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
 use magi_knowledge_store::{KnowledgeKind, KnowledgeRecord, KnowledgeStore};
@@ -947,6 +947,7 @@ impl LlmTaskDispatcher {
         &self,
         task: Option<&magi_core::Task>,
         skill_name: Option<&str>,
+        access_profile: AccessProfile,
     ) -> Vec<ChatToolDefinition> {
         let Some(ref registry) = self.tool_registry else {
             return Vec::new();
@@ -957,13 +958,14 @@ impl LlmTaskDispatcher {
         {
             return Vec::new();
         }
+        let tool_surface_access_profile = tool_surface_access_profile(task, access_profile);
         let registry = if let Some(policy) = task.and_then(|task| task.policy_snapshot.as_ref()) {
             registry.filtered_clone(&policy.allowed_tools, &policy.denied_tools)
         } else {
             registry.clone()
         };
         let active_skill_policy = active_skill_tool_execution_policy(
-            magi_core::AccessProfile::Restricted,
+            tool_surface_access_profile,
             self.skill_runtime.as_deref(),
             skill_name,
         );
@@ -974,6 +976,7 @@ impl LlmTaskDispatcher {
             .filter(|definition| {
                 BuiltinToolName::from_str(definition.function.name.as_str()).is_some_and(|tool| {
                     task_can_see_builtin_tool(task, self.agent_role_registry.as_deref(), tool)
+                        && builtin_tool_visible_in_access_profile(tool, tool_surface_access_profile)
                 })
             })
             .filter(|definition| {
@@ -993,11 +996,37 @@ impl LlmTaskDispatcher {
                 skill_ids: vec![skill_name.to_string()],
                 requested_tools: Vec::new(),
             });
-            definitions.extend(build_skill_custom_tool_definitions(skill_name, &plan));
+            definitions.extend(build_skill_custom_tool_definitions(
+                skill_name,
+                &plan,
+                tool_surface_access_profile,
+            ));
         }
         definitions
     }
+}
 
+fn tool_surface_access_profile(
+    task: Option<&magi_core::Task>,
+    access_profile: AccessProfile,
+) -> AccessProfile {
+    let Some(policy) = task.and_then(|task| task.policy_snapshot.as_ref()) else {
+        return access_profile;
+    };
+    if policy.command_mode.eq_ignore_ascii_case("read_only") {
+        return AccessProfile::ReadOnly;
+    }
+    policy.access_profile
+}
+
+fn builtin_tool_visible_in_access_profile(
+    tool: BuiltinToolName,
+    access_profile: AccessProfile,
+) -> bool {
+    access_profile != AccessProfile::ReadOnly || !tool.is_write_operation()
+}
+
+impl LlmTaskDispatcher {
     fn resolve_workspace_root_path(&self, workspace_id: &Option<WorkspaceId>) -> Option<PathBuf> {
         let workspace_id = workspace_id.as_ref()?;
         self.workspace_registry
@@ -1373,7 +1402,11 @@ impl LlmTaskDispatcher {
         );
 
         let tools = if request.use_tools {
-            let tool_defs = self.build_tool_definitions(None, request.skill_name.as_deref());
+            let tool_defs = self.build_tool_definitions(
+                None,
+                request.skill_name.as_deref(),
+                request.access_profile,
+            );
             (!tool_defs.is_empty()).then_some(tool_defs)
         } else {
             None
@@ -1447,7 +1480,13 @@ impl LlmTaskDispatcher {
         let workspace_root_path = self.resolve_workspace_root_path(workspace_id);
 
         let tools = if use_tools {
-            let tool_defs = self.build_tool_definitions(Some(task), skill_name.as_deref());
+            let access_profile = task
+                .policy_snapshot
+                .as_ref()
+                .map(|policy| policy.access_profile)
+                .unwrap_or_default();
+            let tool_defs =
+                self.build_tool_definitions(Some(task), skill_name.as_deref(), access_profile);
             if tool_defs.is_empty() {
                 None
             } else {
@@ -2268,7 +2307,11 @@ mod tests {
         let worker_task = task_with_role("executor", TaskTier::ExecutionChain);
 
         let long_mission_names = dispatcher
-            .build_tool_definitions(Some(&long_mission_task), None)
+            .build_tool_definitions(
+                Some(&long_mission_task),
+                None,
+                magi_core::AccessProfile::Restricted,
+            )
             .into_iter()
             .map(|definition| definition.function.name)
             .collect::<Vec<_>>();
@@ -2287,7 +2330,11 @@ mod tests {
         }
 
         let execution_names = dispatcher
-            .build_tool_definitions(Some(&execution_task), None)
+            .build_tool_definitions(
+                Some(&execution_task),
+                None,
+                magi_core::AccessProfile::Restricted,
+            )
             .into_iter()
             .map(|definition| definition.function.name)
             .collect::<Vec<_>>();
@@ -2296,12 +2343,95 @@ mod tests {
         assert!(!execution_names.iter().any(|name| name == "plan_write"));
 
         let worker_names = dispatcher
-            .build_tool_definitions(Some(&worker_task), None)
+            .build_tool_definitions(
+                Some(&worker_task),
+                None,
+                magi_core::AccessProfile::Restricted,
+            )
             .into_iter()
             .map(|definition| definition.function.name)
             .collect::<Vec<_>>();
         assert!(!worker_names.iter().any(|name| name == "agent_spawn"));
         assert!(!worker_names.iter().any(|name| name == "plan_write"));
+    }
+
+    #[test]
+    fn read_only_tool_surface_hides_write_tools_before_model_call() {
+        let dispatcher = dispatcher_with_default_tool_surface();
+        let mut task = task_with_role("coordinator", TaskTier::LongMission);
+        task.policy_snapshot
+            .as_mut()
+            .expect("policy")
+            .access_profile = magi_core::AccessProfile::ReadOnly;
+
+        let names = dispatcher
+            .build_tool_definitions(Some(&task), None, magi_core::AccessProfile::Restricted)
+            .into_iter()
+            .map(|definition| definition.function.name)
+            .collect::<Vec<_>>();
+
+        for hidden in [
+            "file_write",
+            "file_patch",
+            "apply_patch",
+            "file_remove",
+            "file_mkdir",
+            "file_copy",
+            "file_move",
+            "agent_spawn",
+            "memory_write",
+            "mission_charter_write",
+            "plan_write",
+            "kg_write",
+            "validation_record",
+            "checkpoint_create",
+            "human_checkpoint_request",
+        ] {
+            assert!(
+                !names.iter().any(|name| name == hidden),
+                "read-only 工具面不应暴露写工具 {hidden}: {names:?}"
+            );
+        }
+        assert!(names.iter().any(|name| name == "file_read"));
+        assert!(names.iter().any(|name| name == "search_text"));
+        assert!(names.iter().any(|name| name == "shell_exec"));
+        assert!(names.iter().any(|name| name == "agent_wait"));
+    }
+
+    #[test]
+    fn read_only_session_tool_surface_hides_write_tools_without_task_policy() {
+        let dispatcher = dispatcher_with_default_tool_surface();
+
+        let names = dispatcher
+            .build_tool_definitions(None, None, magi_core::AccessProfile::ReadOnly)
+            .into_iter()
+            .map(|definition| definition.function.name)
+            .collect::<Vec<_>>();
+
+        assert!(names.iter().any(|name| name == "file_read"));
+        assert!(names.iter().any(|name| name == "shell_exec"));
+        assert!(!names.iter().any(|name| name == "file_write"));
+        assert!(!names.iter().any(|name| name == "apply_patch"));
+        assert!(!names.iter().any(|name| name == "memory_write"));
+    }
+
+    #[test]
+    fn read_only_command_mode_hides_write_tools_even_with_full_access_profile() {
+        let dispatcher = dispatcher_with_default_tool_surface();
+        let mut task = task_with_role("coordinator", TaskTier::LongMission);
+        let policy = task.policy_snapshot.as_mut().expect("policy");
+        policy.access_profile = magi_core::AccessProfile::FullAccess;
+        policy.command_mode = "read_only".to_string();
+
+        let names = dispatcher
+            .build_tool_definitions(Some(&task), None, magi_core::AccessProfile::FullAccess)
+            .into_iter()
+            .map(|definition| definition.function.name)
+            .collect::<Vec<_>>();
+
+        assert!(names.iter().any(|name| name == "file_read"));
+        assert!(!names.iter().any(|name| name == "file_write"));
+        assert!(!names.iter().any(|name| name == "agent_spawn"));
     }
 
     #[test]
@@ -2332,7 +2462,11 @@ mod tests {
         let task = task_with_role("coordinator", TaskTier::ExecutionChain);
 
         let names = dispatcher
-            .build_tool_definitions(Some(&task), Some("code-review"))
+            .build_tool_definitions(
+                Some(&task),
+                Some("code-review"),
+                magi_core::AccessProfile::Restricted,
+            )
             .into_iter()
             .map(|definition| definition.function.name)
             .collect::<Vec<_>>();
@@ -2351,6 +2485,71 @@ mod tests {
         assert!(
             !names.iter().any(|name| name == "shell_exec"),
             "active skill 没有声明 allowed_tools 时不应暴露 shell_exec"
+        );
+    }
+
+    #[test]
+    fn read_only_tool_surface_hides_mcp_skill_bindings() {
+        let dispatcher = dispatcher_with_default_tool_surface().with_skill_runtime(Arc::new({
+            let registry = magi_skill_runtime::SkillRegistry::new();
+            registry.register(magi_skill_runtime::SkillDefinition {
+                skill_id: "mixed-skill".to_string(),
+                title: "混合 Skill".to_string(),
+                instruction: "提供只读模型辅助和 MCP 外接工具。".to_string(),
+                metadata: magi_skill_runtime::SkillMetadata {
+                    category: "quality".to_string(),
+                    tags: vec!["mixed".to_string()],
+                },
+                allowed_tools: vec![],
+                custom_tool_bindings: vec![
+                    magi_skill_runtime::CustomToolBinding {
+                        binding_id: "mcp-tool".to_string(),
+                        tool_name: "echo.inspect".to_string(),
+                        description: "MCP 检查".to_string(),
+                        bridge_kind: magi_bridge_client::BridgeBindingKind::Mcp,
+                        dispatch_action: magi_bridge_client::BridgeDispatchAction::McpToolCall,
+                        bridge_target: "loopback-mcp".to_string(),
+                    },
+                    magi_skill_runtime::CustomToolBinding {
+                        binding_id: "model-tool".to_string(),
+                        tool_name: "model.summarize".to_string(),
+                        description: "模型摘要".to_string(),
+                        bridge_kind: magi_bridge_client::BridgeBindingKind::Model,
+                        dispatch_action: magi_bridge_client::BridgeDispatchAction::ModelPrompt,
+                        bridge_target: "loopback-model".to_string(),
+                    },
+                ],
+                prompt_priority: 50,
+            });
+            magi_skill_runtime::SkillRuntime::new(registry)
+        }));
+        let mut task = task_with_role("coordinator", TaskTier::ExecutionChain);
+        task.policy_snapshot
+            .as_mut()
+            .expect("policy")
+            .access_profile = magi_core::AccessProfile::ReadOnly;
+
+        let names = dispatcher
+            .build_tool_definitions(
+                Some(&task),
+                Some("mixed-skill"),
+                magi_core::AccessProfile::ReadOnly,
+            )
+            .into_iter()
+            .map(|definition| definition.function.name)
+            .collect::<Vec<_>>();
+
+        assert!(
+            !names
+                .iter()
+                .any(|name| name == "skill__mixed-skill__mcp-tool"),
+            "read-only 工具面不应暴露 MCP Skill 工具: {names:?}"
+        );
+        assert!(
+            names
+                .iter()
+                .any(|name| name == "skill__mixed-skill__model-tool"),
+            "read-only 工具面仍可保留模型型 Skill 工具: {names:?}"
         );
     }
 
@@ -2375,7 +2574,11 @@ mod tests {
         let task = task_with_role("coordinator", TaskTier::ExecutionChain);
 
         let names = dispatcher
-            .build_tool_definitions(Some(&task), Some("read-only-skill"))
+            .build_tool_definitions(
+                Some(&task),
+                Some("read-only-skill"),
+                magi_core::AccessProfile::Restricted,
+            )
             .into_iter()
             .map(|definition| definition.function.name)
             .collect::<Vec<_>>();

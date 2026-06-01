@@ -1,4 +1,6 @@
-use magi_bridge_client::{ChatToolCall, ChatToolDefinition, ChatToolFunctionDefinition};
+use magi_bridge_client::{
+    BridgeBindingKind, ChatToolCall, ChatToolDefinition, ChatToolFunctionDefinition,
+};
 use magi_core::{AccessProfile, ApprovalRequirement, ExecutionResultStatus, RiskLevel, ToolCallId};
 use magi_skill_runtime::{
     CustomToolBinding, SkillDispatchInput, SkillDispatchResult, SkillDispatchRuntime,
@@ -16,11 +18,20 @@ const SKILL_TOOL_DISPATCH_PUBLIC_ERROR: &str = "Skill 工具执行失败，请�
 pub fn build_skill_custom_tool_definitions(
     skill_name: &str,
     plan: &SkillToolRuntimePlan,
+    access_profile: AccessProfile,
 ) -> Vec<ChatToolDefinition> {
     plan.custom_tool_bindings
         .iter()
+        .filter(|binding| skill_custom_tool_visible_in_access_profile(binding, access_profile))
         .map(|binding| build_skill_custom_tool_definition(skill_name, binding))
         .collect()
+}
+
+fn skill_custom_tool_visible_in_access_profile(
+    binding: &CustomToolBinding,
+    access_profile: AccessProfile,
+) -> bool {
+    !(access_profile == AccessProfile::ReadOnly && binding.bridge_kind == BridgeBindingKind::Mcp)
 }
 
 pub fn parse_skill_custom_tool_name(tool_name: &str) -> Option<(String, String)> {
