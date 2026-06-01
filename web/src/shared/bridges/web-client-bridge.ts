@@ -183,6 +183,11 @@ let recoveryTimer: number | null = null;
 let recoveryInFlight: Promise<void> | null = null;
 let sessionSnapshotGeneration = 0;
 let externalSessionSummaryRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+
+function invalidateSessionSnapshotRequests(): void {
+  sessionSnapshotGeneration += 1;
+}
+
 function clearActiveTurnInFlight(): void {
   // 实时 turn 投影由后端 canonical snapshot 驱动，这里保留统一清理入口。
 }
@@ -1634,6 +1639,9 @@ function persistWorkspaceBinding(workspaceId: string, workspacePath: string, ses
     normalizedWorkspacePath,
     incomingSessionId,
   );
+  if (settingsBindingChanged) {
+    invalidateSessionSnapshotRequests();
+  }
   currentWorkspaceId = normalizedWorkspaceId;
   currentWorkspacePath = normalizedWorkspacePath;
   currentSessionId = incomingSessionId;
@@ -1683,6 +1691,9 @@ function clearWorkspaceSessionBinding(workspaceId: string, workspacePath: string
     normalizedWorkspacePath,
     '',
   );
+  if (settingsBindingChanged) {
+    invalidateSessionSnapshotRequests();
+  }
   currentWorkspaceId = normalizedWorkspaceId;
   currentWorkspacePath = normalizedWorkspacePath;
   currentSessionId = '';
@@ -1735,6 +1746,7 @@ function dispatchWorkspaceSessionCleared(workspaceId: string, workspacePath: str
 
 function clearPersistedWorkspaceBinding(): void {
   clearSettingsBootstrapCache();
+  invalidateSessionSnapshotRequests();
   currentWorkspaceId = '';
   currentWorkspacePath = '';
   currentSessionId = '';
