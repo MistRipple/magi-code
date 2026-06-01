@@ -1747,6 +1747,9 @@ async function ensureEventStream(
   if (currentWorkspacePath) {
     query.set('workspacePath', currentWorkspacePath);
   }
+  if (currentSessionId) {
+    query.set('sessionId', currentSessionId);
+  }
   const nextKey = query.toString();
   if (!nextKey) {
     closeEventStream();

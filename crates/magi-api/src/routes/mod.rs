@@ -174,13 +174,21 @@ struct EventStreamQuery {
     workspace_id: Option<String>,
     #[serde(rename = "workspacePath", alias = "workspace_path")]
     workspace_path: Option<String>,
+    #[serde(rename = "sessionId", alias = "session_id")]
+    session_id: Option<String>,
 }
 
 async fn stream_events(
     State(state): State<ApiState>,
     Query(query): Query<EventStreamQuery>,
 ) -> impl axum::response::IntoResponse {
-    sse::events(state, query.workspace_id, query.workspace_path).await
+    sse::events(
+        state,
+        query.workspace_id,
+        query.workspace_path,
+        query.session_id,
+    )
+    .await
 }
 
 #[cfg(test)]
