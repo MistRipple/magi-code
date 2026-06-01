@@ -30,6 +30,11 @@
     type AgentWorkspaceSummary,
   } from './agent-api';
   import {
+    clearAgentBindingContext,
+    resolveAgentBindingContext,
+    setAgentBindingContext,
+  } from './agent-binding-context';
+  import {
     rightPaneState,
     getRightPaneState,
     openCodeTab,
@@ -150,14 +155,11 @@
     }
   }
 
-  function currentUrlWorkspaceBinding(): { workspaceId: string; sessionId: string } {
-    if (typeof window === 'undefined') {
-      return { workspaceId: '', sessionId: '' };
-    }
-    const url = new URL(window.location.href);
+  function currentWorkspaceBinding(): { workspaceId: string; sessionId: string } {
+    const binding = resolveAgentBindingContext();
     return {
-      workspaceId: url.searchParams.get('workspaceId')?.trim() || '',
-      sessionId: url.searchParams.get('sessionId')?.trim() || '',
+      workspaceId: binding.workspaceId,
+      sessionId: binding.sessionId,
     };
   }
 
@@ -176,8 +178,8 @@
     if (bootstrapSessionId) {
       return bootstrapSessionId;
     }
-    const urlBinding = currentUrlWorkspaceBinding();
-    return urlBinding.workspaceId === workspaceId ? urlBinding.sessionId : '';
+    const binding = currentWorkspaceBinding();
+    return binding.workspaceId === workspaceId ? binding.sessionId : '';
   }
 
   function workspacePathForId(workspaceId: string): string {
@@ -189,7 +191,7 @@
     if (authoritativeWorkspaceId && nextWorkspaces.some((workspace) => workspace.workspaceId === authoritativeWorkspaceId)) {
       return authoritativeWorkspaceId;
     }
-    const requestedWorkspaceId = currentUrlWorkspaceBinding().workspaceId;
+    const requestedWorkspaceId = currentWorkspaceBinding().workspaceId;
     if (requestedWorkspaceId && nextWorkspaces.some((workspace) => workspace.workspaceId === requestedWorkspaceId)) {
       return requestedWorkspaceId;
     }
@@ -421,6 +423,7 @@
     const nextUrl = new URL(window.location.href);
 
     if (!normalizedWorkspaceId || !normalizedWorkspacePath) {
+      clearAgentBindingContext();
       nextUrl.searchParams.delete('workspaceId');
       nextUrl.searchParams.delete('workspacePath');
       nextUrl.searchParams.delete('sessionId');
@@ -430,6 +433,11 @@
       return;
     }
 
+    setAgentBindingContext({
+      workspaceId: normalizedWorkspaceId,
+      workspacePath: normalizedWorkspacePath,
+      sessionId: normalizedSessionId,
+    });
     nextUrl.searchParams.set('workspaceId', normalizedWorkspaceId);
     nextUrl.searchParams.set('workspacePath', normalizedWorkspacePath);
 

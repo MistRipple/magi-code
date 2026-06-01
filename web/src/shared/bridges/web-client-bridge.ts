@@ -7,6 +7,12 @@ import {
   probeReachableAgentBaseUrl,
   resolveAgentBaseUrl,
 } from '../../web/agent-api';
+import {
+  clearAgentBindingContext,
+  resolveAgentBindingContext,
+  seedAgentBindingContextFromWindow,
+  setAgentBindingContext,
+} from '../../web/agent-binding-context';
 import { i18n } from '../../stores/i18n.svelte';
 import { getHostApi, getTransport, initTransport } from '../transport';
 import {
@@ -1433,40 +1439,12 @@ function getCurrentUrl(): URL | null {
   return new URL(window.location.href);
 }
 
-function resolveInjectedWorkspaceBinding(): { workspaceId: string; workspacePath: string } {
-  if (typeof window === 'undefined') {
-    return { workspaceId: '', workspacePath: '' };
-  }
-  const bootstrapWindow = window as unknown as {
-    __INITIAL_WORKSPACE_ID__?: string;
-    __INITIAL_WORKSPACE_PATH__?: string;
-  };
-  return {
-    workspaceId: bootstrapWindow.__INITIAL_WORKSPACE_ID__?.trim() || '',
-    workspacePath: bootstrapWindow.__INITIAL_WORKSPACE_PATH__?.trim() || '',
-  };
-}
-
 function resolveWorkspaceQuery(): { workspaceId: string; workspacePath: string; sessionId: string } {
-  const currentUrl = getCurrentUrl();
-  const injectedBinding = resolveInjectedWorkspaceBinding();
-  const queryWorkspaceId = currentUrl?.searchParams.get('workspaceId')?.trim() || '';
-  const queryWorkspacePath = currentUrl?.searchParams.get('workspacePath')?.trim() || '';
-  const querySessionId = currentUrl?.searchParams.get('sessionId')?.trim() || '';
-  const workspaceId = queryWorkspaceId
-    || currentWorkspaceId
-    || injectedBinding.workspaceId
-    || '';
-  const workspacePath = queryWorkspacePath
-    || currentWorkspacePath
-    || injectedBinding.workspacePath
-    || '';
-  const sessionId = querySessionId;
-  return { workspaceId, workspacePath, sessionId };
+  return resolveAgentBindingContext();
 }
 
 function hydrateCanonicalWorkspaceBinding(): void {
-  const binding = resolveWorkspaceQuery();
+  const binding = seedAgentBindingContextFromWindow();
   currentWorkspaceId = binding.workspaceId;
   currentWorkspacePath = binding.workspacePath;
   currentSessionId = binding.sessionId;
@@ -1631,6 +1609,11 @@ function persistWorkspaceBinding(workspaceId: string, workspacePath: string, ses
   currentWorkspaceId = normalizedWorkspaceId;
   currentWorkspacePath = normalizedWorkspacePath;
   currentSessionId = incomingSessionId;
+  setAgentBindingContext({
+    workspaceId: normalizedWorkspaceId,
+    workspacePath: normalizedWorkspacePath,
+    sessionId: incomingSessionId,
+  });
 
   const currentUrl = getCurrentUrl();
   if (!currentUrl) {
@@ -1675,6 +1658,11 @@ function clearWorkspaceSessionBinding(workspaceId: string, workspacePath: string
   currentWorkspaceId = normalizedWorkspaceId;
   currentWorkspacePath = normalizedWorkspacePath;
   currentSessionId = '';
+  setAgentBindingContext({
+    workspaceId: normalizedWorkspaceId,
+    workspacePath: normalizedWorkspacePath,
+    sessionId: '',
+  });
   clearCurrentInterruptTaskId();
   clearTaskProjection();
   if (queueDrainTimer) {
@@ -1722,6 +1710,7 @@ function clearPersistedWorkspaceBinding(): void {
   currentWorkspaceId = '';
   currentWorkspacePath = '';
   currentSessionId = '';
+  clearAgentBindingContext();
   clearCurrentInterruptTaskId();
   clearTaskProjection();
   const currentUrl = getCurrentUrl();

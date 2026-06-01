@@ -19,6 +19,10 @@ import type {
 } from '../shared/rust-backend-types';
 import type { CanonicalTurn, CanonicalTurnItem } from '../shared/protocol/canonical-turn';
 import { i18n } from '../stores/i18n.svelte';
+import {
+  resolveAgentBindingContext,
+  type AgentBindingContext,
+} from './agent-binding-context';
 
 
 const AGENT_BASE_URL_STORAGE_KEY = 'magi-agent-base-url';
@@ -423,12 +427,6 @@ export class AgentApiError extends Error {
   }
 }
 
-interface AgentBindingContext {
-  workspaceId: string;
-  workspacePath: string;
-  sessionId: string;
-}
-
 export interface AgentNotificationScope {
   workspaceId: string;
   workspacePath?: string;
@@ -703,29 +701,6 @@ export function isWebAgentMode(): boolean {
   }
   const currentUrl = new URL(window.location.href);
   return currentUrl.pathname === '/web.html' || currentUrl.pathname.startsWith('/assets/');
-}
-
-function resolveAgentBindingContext(): AgentBindingContext {
-  if (typeof window === 'undefined') {
-    return { workspaceId: '', workspacePath: '', sessionId: '' };
-  }
-  const currentUrl = new URL(window.location.href);
-  const bootstrapWindow = window as unknown as {
-    __INITIAL_WORKSPACE_ID__?: string;
-    __INITIAL_WORKSPACE_PATH__?: string;
-  };
-  const queryWorkspaceId = currentUrl.searchParams.get('workspaceId')?.trim() || '';
-  const queryWorkspacePath = currentUrl.searchParams.get('workspacePath')?.trim() || '';
-  const querySessionId = currentUrl.searchParams.get('sessionId')?.trim() || '';
-  return {
-    workspaceId: queryWorkspaceId
-      || bootstrapWindow.__INITIAL_WORKSPACE_ID__?.trim()
-      || '',
-    workspacePath: queryWorkspacePath
-      || bootstrapWindow.__INITIAL_WORKSPACE_PATH__?.trim()
-      || '',
-    sessionId: querySessionId,
-  };
 }
 
 function buildBoundQuery(
