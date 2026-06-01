@@ -505,6 +505,7 @@
   function openWorkspaceFromBackend(workspace: AgentWorkspaceSummary): void {
     beginPendingWorkspaceSwitch(workspace.workspaceId);
     selectWorkspaceLocally(workspace);
+    requestWorkspaceBindingSync(workspace, null);
     messagesState.sessionHydrating = true;
     void (async () => {
       const resolvedSessionId = await refreshWorkspaceSessions(
