@@ -461,13 +461,6 @@
     });
   }
 
-  function requestCurrentSessionState(): void {
-    if (!currentSessionId) {
-      return;
-    }
-    getClientBridge().postMessage({ type: 'requestState' });
-  }
-
   function clearPendingSessionSwitchState(): void {
     if (pendingSessionSwitchTimer) {
       clearTimeout(pendingSessionSwitchTimer);
@@ -527,17 +520,11 @@
     requestWorkspaceBindingSync(workspace, null);
     messagesState.sessionHydrating = true;
     void (async () => {
-      const resolvedSessionId = await refreshWorkspaceSessions(
+      await refreshWorkspaceSessions(
         workspace.workspaceId,
         preferredSessionIdForWorkspace(workspace.workspaceId),
         workspace.rootPath,
       );
-      if (resolvedSessionId) {
-        requestCurrentSessionState();
-        return;
-      }
-      requestWorkspaceBindingSync(workspace, null);
-      getClientBridge().postMessage({ type: 'requestState' });
     })();
   }
 
@@ -593,6 +580,9 @@
     setCurrentSessionId(resolvedSessionId || null);
     syncBrowserSessionBinding(authoritativeWorkspaceId, snapshot.workspace.rootPath, resolvedSessionId || null);
     requestWorkspaceBindingSync(snapshot.workspace, resolvedSessionId || null);
+    if (resolvedSessionId) {
+      getClientBridge().postMessage({ type: 'requestState' });
+    }
     return resolvedSessionId;
   }
 
@@ -919,9 +909,6 @@
         preferredSessionIdForWorkspace(selectedWorkspaceId),
         workspacePathForId(selectedWorkspaceId),
       );
-      if (selectedWorkspaceId) {
-        requestCurrentSessionState();
-      }
     } catch (error) {
       loadError = i18n.t('web.workspaceUnavailable');
       notifyWorkbenchError(i18n.t('web.action.loadWorkspaceList'), error);
@@ -965,7 +952,6 @@
           preferredSessionIdForWorkspace(selectedWorkspaceId),
           workspacePathForId(selectedWorkspaceId),
         );
-        requestCurrentSessionState();
       }
     } finally {
       workspaceActionPending = false;
@@ -1057,7 +1043,6 @@
             preferredSessionIdForWorkspace(selectedWorkspaceId),
             workspacePathForId(selectedWorkspaceId),
           );
-          requestCurrentSessionState();
         }
       }
     } finally {
