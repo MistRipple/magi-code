@@ -33,6 +33,10 @@ const FILE_COPY_PUBLIC_ERROR: &str = "文件暂不可复制，请检查路径或
 const FILE_MOVE_PUBLIC_ERROR: &str = "文件暂不可移动，请检查路径或权限";
 const DIRECTORY_CREATE_PUBLIC_ERROR: &str = "目录暂不可创建，请检查路径或权限";
 const SEARCH_TEXT_PUBLIC_ERROR: &str = "文本搜索暂不可用，请检查路径或权限";
+const SHELL_EXEC_PUBLIC_ERROR: &str = "shell 命令暂不可执行，请检查运行环境";
+const PROCESS_LAUNCH_PUBLIC_ERROR: &str = "后台进程暂不可启动，请检查运行环境";
+const PROCESS_WRITE_PUBLIC_ERROR: &str = "后台进程暂不可写入，请稍后重试";
+const PROCESS_INSPECT_PUBLIC_ERROR: &str = "进程信息暂不可读取，请稍后重试";
 const WEB_SEARCH_PUBLIC_ERROR: &str = "网络搜索暂不可用，请稍后重试";
 const WEB_FETCH_PUBLIC_ERROR: &str = "网页内容暂不可获取，请稍后重试";
 
@@ -529,7 +533,14 @@ fn execute_shell_exec(input: &str, context: &ToolExecutionContext) -> String {
     let output =
         match execute_shell_command_with_timeout(&shell, &command, &cwd, timeout_ms, context) {
             Ok(output) => output,
-            Err(error) => return builtin_error("shell_exec", format!("命令执行失败: {error}")),
+            Err(error) => {
+                return builtin_runtime_error(
+                    "shell_exec",
+                    SHELL_EXEC_PUBLIC_ERROR,
+                    "启动 shell 命令失败",
+                    error,
+                );
+            }
         };
 
     let succeeded = output
@@ -986,7 +997,14 @@ fn execute_process_launch_with_surface(
         .spawn()
     {
         Ok(child) => child,
-        Err(error) => return builtin_error(surface_tool, format!("命令启动失败: {error}")),
+        Err(error) => {
+            let public_message = if surface_tool == "shell_exec" {
+                SHELL_EXEC_PUBLIC_ERROR
+            } else {
+                PROCESS_LAUNCH_PUBLIC_ERROR
+            };
+            return builtin_runtime_error(surface_tool, public_message, "启动后台进程失败", error);
+        }
     };
 
     let stdout_buffer = Arc::new(Mutex::new(Vec::new()));
@@ -1129,7 +1147,12 @@ fn execute_process_write_with_surface(
         return builtin_error(surface_tool, format!("进程 #{terminal_id} 不接受输入"));
     };
     if let Err(error) = stdin.write_all(content.as_bytes()) {
-        return builtin_error(surface_tool, format!("写入进程失败: {error}"));
+        return builtin_runtime_error(
+            surface_tool,
+            PROCESS_WRITE_PUBLIC_ERROR,
+            "写入后台进程失败",
+            error,
+        );
     }
     let _ = stdin.flush();
     let mut payload = serde_json::json!({
@@ -1328,7 +1351,12 @@ fn execute_process_inspect(input: &str) -> String {
         {
             Ok(output) => output.stdout,
             Err(error) => {
-                return builtin_error("process_inspect", format!("进程检查失败: {error}"));
+                return builtin_runtime_error(
+                    "process_inspect",
+                    PROCESS_INSPECT_PUBLIC_ERROR,
+                    "查询进程列表失败",
+                    error,
+                );
             }
         }
     } else {
@@ -1338,7 +1366,12 @@ fn execute_process_inspect(input: &str) -> String {
         {
             Ok(output) => output.stdout,
             Err(error) => {
-                return builtin_error("process_inspect", format!("进程检查失败: {error}"));
+                return builtin_runtime_error(
+                    "process_inspect",
+                    PROCESS_INSPECT_PUBLIC_ERROR,
+                    "查询进程信息失败",
+                    error,
+                );
             }
         }
     };

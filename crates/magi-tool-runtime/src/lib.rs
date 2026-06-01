@@ -2677,6 +2677,43 @@ mod tests {
     }
 
     #[test]
+    fn shell_exec_spawn_failure_uses_public_error_message() {
+        let registry = make_registry();
+        let missing_shell = "magi-missing-shell-for-public-error-test";
+
+        let output = registry.execute_with_policy(
+            ToolExecutionInput {
+                tool_call_id: ToolCallId::new("tool-call-shell-spawn-failed"),
+                tool_name: BuiltinToolName::ShellExec.as_str().to_string(),
+                tool_kind: ToolKind::Builtin,
+                input: serde_json::json!({
+                    "command": "printf hidden",
+                    "shell": missing_shell,
+                    "access_mode": "read_only",
+                })
+                .to_string(),
+                approval_requirement: ApprovalRequirement::None,
+                risk_level: RiskLevel::Low,
+            },
+            ToolExecutionContext::default(),
+            &full_access_policy(),
+        );
+
+        assert_eq!(output.status, ExecutionResultStatus::Failed);
+        let payload: Value = serde_json::from_str(&output.payload).expect("payload json");
+        assert_eq!(payload["tool"], "shell_exec");
+        assert_eq!(payload["status"], "failed");
+        assert_eq!(payload["error"], "shell 命令暂不可执行，请检查运行环境");
+        assert!(
+            !output.payload.contains(missing_shell)
+                && !output.payload.contains("No such")
+                && !output.payload.contains("os error"),
+            "shell_exec 启动失败不能暴露底层运行态细节: {}",
+            output.payload
+        );
+    }
+
+    #[test]
     fn shell_exec_rejects_read_only_mode_with_write_redirection() {
         let governance = Arc::new(GovernanceService::default());
         let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(16));
@@ -3584,6 +3621,119 @@ mod tests {
 
         assert_eq!(output.status, ExecutionResultStatus::Failed);
         assert!(output.payload.contains("缺少 shell 命令"));
+    }
+
+    #[test]
+    fn process_launch_spawn_failure_uses_public_error_message() {
+        let root = unique_temp_dir("magi-tool-process-spawn-error");
+        let registry = make_registry();
+        let missing_shell = "magi-missing-process-shell-for-public-error-test";
+        let context = ToolExecutionContext {
+            worker_id: None,
+            task_id: Some(TaskId::new("task-process-spawn-error")),
+            session_id: Some(SessionId::new("session-process-spawn-error")),
+            workspace_id: Some(WorkspaceId::new("workspace-process-spawn-error")),
+            working_directory: Some(root.clone()),
+        };
+
+        let output = registry.execute_internal_builtin_with_policy(
+            ToolExecutionInput {
+                tool_call_id: ToolCallId::new("tool-call-process-spawn-error"),
+                tool_name: BuiltinToolName::ProcessLaunch.as_str().to_string(),
+                tool_kind: ToolKind::Builtin,
+                input: serde_json::json!({
+                    "command": "printf hidden",
+                    "shell": missing_shell,
+                    "cwd": root.to_string_lossy(),
+                })
+                .to_string(),
+                approval_requirement: ApprovalRequirement::None,
+                risk_level: RiskLevel::Low,
+            },
+            context,
+            &full_access_policy(),
+        );
+
+        assert_eq!(output.status, ExecutionResultStatus::Failed);
+        let payload: Value = serde_json::from_str(&output.payload).expect("payload json");
+        assert_eq!(payload["tool"], BuiltinToolName::ProcessLaunch.as_str());
+        assert_eq!(payload["status"], "failed");
+        assert_eq!(payload["error"], "后台进程暂不可启动，请检查运行环境");
+        assert!(
+            !output.payload.contains(missing_shell)
+                && !output.payload.contains("No such")
+                && !output.payload.contains("os error"),
+            "process_launch 启动失败不能暴露底层运行态细节: {}",
+            output.payload
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn process_write_failure_uses_public_error_message() {
+        let root = unique_temp_dir("magi-tool-process-write-error");
+        let registry = make_registry();
+        let context = ToolExecutionContext {
+            worker_id: None,
+            task_id: Some(TaskId::new("task-process-write-error")),
+            session_id: Some(SessionId::new("session-process-write-error")),
+            workspace_id: Some(WorkspaceId::new("workspace-process-write-error")),
+            working_directory: Some(root.clone()),
+        };
+
+        let launch = registry.execute_internal_builtin_with_policy(
+            ToolExecutionInput {
+                tool_call_id: ToolCallId::new("tool-call-process-write-launch"),
+                tool_name: BuiltinToolName::ProcessLaunch.as_str().to_string(),
+                tool_kind: ToolKind::Builtin,
+                input: serde_json::json!({
+                    "command": "true",
+                    "cwd": root.to_string_lossy(),
+                })
+                .to_string(),
+                approval_requirement: ApprovalRequirement::None,
+                risk_level: RiskLevel::Low,
+            },
+            context.clone(),
+            &full_access_policy(),
+        );
+        assert_eq!(launch.status, ExecutionResultStatus::Succeeded);
+        let launch_payload: Value = serde_json::from_str(&launch.payload).expect("payload json");
+        let terminal_id = launch_payload["terminal_id"].as_u64().expect("terminal id");
+
+        thread::sleep(Duration::from_millis(100));
+        let write = registry.execute_internal_builtin_with_policy(
+            ToolExecutionInput {
+                tool_call_id: ToolCallId::new("tool-call-process-write-error"),
+                tool_name: BuiltinToolName::ProcessWrite.as_str().to_string(),
+                tool_kind: ToolKind::Builtin,
+                input: serde_json::json!({
+                    "terminal_id": terminal_id,
+                    "input": "hidden",
+                })
+                .to_string(),
+                approval_requirement: ApprovalRequirement::None,
+                risk_level: RiskLevel::Low,
+            },
+            context,
+            &full_access_policy(),
+        );
+
+        assert_eq!(write.status, ExecutionResultStatus::Failed);
+        let payload: Value = serde_json::from_str(&write.payload).expect("payload json");
+        assert_eq!(payload["tool"], BuiltinToolName::ProcessWrite.as_str());
+        assert_eq!(payload["status"], "failed");
+        assert_eq!(payload["error"], "后台进程暂不可写入，请稍后重试");
+        assert!(
+            !write.payload.contains("Broken pipe")
+                && !write.payload.contains("os error")
+                && !write.payload.contains("hidden"),
+            "process_write 写入失败不能暴露底层运行态细节: {}",
+            write.payload
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
