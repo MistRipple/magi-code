@@ -45,6 +45,23 @@ pub async fn events(
     response
 }
 
+pub(crate) fn resolve_after_sequence(
+    query_after_sequence: Option<u64>,
+    last_event_id: Option<&str>,
+) -> Option<u64> {
+    let last_event_sequence = last_event_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0);
+    match (query_after_sequence, last_event_sequence) {
+        (Some(query), Some(last_event)) => Some(query.max(last_event)),
+        (Some(query), None) => Some(query),
+        (None, Some(last_event)) => Some(last_event),
+        (None, None) => None,
+    }
+}
+
 fn resolve_event_stream_workspace_id(
     state: &ApiState,
     workspace_id: Option<String>,
@@ -227,9 +244,18 @@ fn event_matches_session(event: &EventEnvelope, requested_session_id: Option<&Se
 
 fn event_to_sse(event: EventEnvelope) -> Event {
     let event = public_event_envelope(event);
-    let event_id = event.event_id.to_string();
+    let event_sse_id = event_sse_id(&event);
     let payload = serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_string());
-    Event::default().id(event_id).data(payload)
+    let sse_event = Event::default().data(payload);
+    if let Some(event_sse_id) = event_sse_id {
+        sse_event.id(event_sse_id)
+    } else {
+        sse_event
+    }
+}
+
+fn event_sse_id(event: &EventEnvelope) -> Option<String> {
+    (event.sequence > 0).then(|| event.sequence.to_string())
 }
 
 fn keep_alive_sse_event() -> Event {
@@ -325,6 +351,30 @@ mod tests {
         assert_eq!(event.event_type, "event.stream.keep_alive");
         assert_eq!(event.category, magi_event_bus::EventCategory::System);
         assert_eq!(event.payload["heartbeat"], json!(true));
+    }
+
+    #[test]
+    fn resolve_after_sequence_prefers_newer_last_event_id_cursor() {
+        assert_eq!(resolve_after_sequence(Some(10), Some("12")), Some(12));
+        assert_eq!(resolve_after_sequence(Some(12), Some("10")), Some(12));
+        assert_eq!(resolve_after_sequence(None, Some("7")), Some(7));
+        assert_eq!(resolve_after_sequence(Some(5), Some("event-id")), Some(5));
+        assert_eq!(resolve_after_sequence(None, Some("0")), None);
+    }
+
+    #[test]
+    fn event_sse_id_uses_sequence_cursor_not_internal_event_id() {
+        let mut event = EventEnvelope::domain(
+            EventId::new("event-internal-id"),
+            "message.created",
+            json!({ "content": "hello" }),
+        );
+        event.sequence = 42;
+
+        assert_eq!(event_sse_id(&event), Some("42".to_string()));
+
+        event.sequence = 0;
+        assert_eq!(event_sse_id(&event), None);
     }
 
     #[test]

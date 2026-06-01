@@ -16,6 +16,7 @@ mod workspaces;
 use axum::{
     Json, Router,
     extract::{Query, State},
+    http::{HeaderMap, HeaderName},
     middleware,
     routing::get,
 };
@@ -187,13 +188,18 @@ struct EventStreamQuery {
 async fn stream_events(
     State(state): State<ApiState>,
     Query(query): Query<EventStreamQuery>,
+    headers: HeaderMap,
 ) -> impl axum::response::IntoResponse {
+    let last_event_id = headers
+        .get(HeaderName::from_static("last-event-id"))
+        .and_then(|value| value.to_str().ok());
+    let after_sequence = sse::resolve_after_sequence(query.after_sequence, last_event_id);
     sse::events(
         state,
         query.workspace_id,
         query.workspace_path,
         query.session_id,
-        query.after_sequence,
+        after_sequence,
     )
     .await
 }
