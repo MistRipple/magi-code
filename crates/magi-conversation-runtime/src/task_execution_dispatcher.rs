@@ -1261,17 +1261,14 @@ impl LlmTaskDispatcher {
         &self,
         settings_store: Option<&Arc<SettingsStore>>,
     ) -> Option<magi_safety_gate::SafetyGate> {
-        let mut rules = magi_safety_gate::builtin_rules();
-        if let Some(store) = settings_store {
-            let raw = store.get_section("safeguardConfig");
-            rules.extend(
+        let settings_rules = settings_store
+            .map(|store| store.get_section("safeguardConfig"))
+            .and_then(|raw| {
                 raw.get("rules")
                     .map(magi_safety_gate::rules_from_settings_value)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter(|rule| rule.category == magi_safety_gate::SafetyCategory::Custom),
-            );
-        }
+            })
+            .unwrap_or_default();
+        let rules = magi_safety_gate::merge_rules_with_builtin_defaults(settings_rules);
         if rules.is_empty() {
             None
         } else {
@@ -2595,6 +2592,45 @@ mod tests {
         assert!(
             orch.is_none(),
             "orchestrator 未配置且无 default 时必须返回 None"
+        );
+    }
+
+    #[test]
+    fn build_safety_gate_honors_settings_override_for_builtin_rules() {
+        use crate::settings_store::SettingsStore;
+
+        let dispatcher = dispatcher_with_default_tool_surface();
+        let store = Arc::new(SettingsStore::new());
+        store.set_section(
+            "safeguardConfig",
+            serde_json::json!({
+                "rules": [
+                    {
+                        "pattern": "rm -rf",
+                        "enabled": false,
+                        "category": "bulk_delete",
+                        "action": "require_approval_in_restricted"
+                    }
+                ]
+            }),
+        );
+
+        let gate = dispatcher
+            .build_safety_gate(Some(&store))
+            .expect("settings override 后仍应构造 SafetyGate");
+        let args = serde_json::json!({ "command": "rm -rf /tmp/demo" }).to_string();
+
+        assert_eq!(
+            gate.evaluate("shell_exec", &args),
+            magi_safety_gate::SafetyDecision::Allow,
+            "用户在设置页禁用内置规则后，运行期必须尊重同一份 settings"
+        );
+        let force_push =
+            serde_json::json!({ "command": "git push --force origin main" }).to_string();
+        assert!(
+            gate.evaluate("shell_exec", &force_push)
+                .is_require_approval(),
+            "settings 未覆盖的内置规则仍应自动补齐"
         );
     }
 

@@ -275,6 +275,34 @@ pub fn rules_from_settings_value(value: &serde_json::Value) -> Vec<SafetyRule> {
         .unwrap_or_default()
 }
 
+/// 合并内置默认规则与 settings 规则。
+///
+/// 同一 `(category, pattern)` 的 settings 规则覆盖内置规则，用于让用户在设置页
+/// 调整内置规则的 enabled/action 后，运行期 SafetyGate 与 UI 保持一致；缺失的
+/// 内置规则会自动补齐，保证版本升级新增默认规则时仍能生效。
+pub fn merge_rules_with_builtin_defaults(settings_rules: Vec<SafetyRule>) -> Vec<SafetyRule> {
+    let mut merged = builtin_rules();
+    for rule in settings_rules {
+        if let Some(existing) = merged
+            .iter_mut()
+            .find(|existing| same_rule_identity(existing, &rule))
+        {
+            *existing = rule;
+        } else {
+            merged.push(rule);
+        }
+    }
+    merged
+}
+
+fn same_rule_identity(left: &SafetyRule, right: &SafetyRule) -> bool {
+    left.category == right.category
+        && left
+            .pattern
+            .trim()
+            .eq_ignore_ascii_case(right.pattern.trim())
+}
+
 fn rule_from_json(value: &serde_json::Value) -> Option<SafetyRule> {
     let object = value.as_object()?;
     let pattern = object.get("pattern")?.as_str()?.trim().to_string();
@@ -439,6 +467,54 @@ mod tests {
         assert_eq!(rules[0].category, SafetyCategory::GitHistory);
         assert_eq!(rules[1].category, SafetyCategory::Custom);
         assert_eq!(rules[1].action, SafetyAction::HardBlock);
+    }
+
+    #[test]
+    fn settings_rules_override_builtin_defaults_and_keep_missing_builtins() {
+        let rules = merge_rules_with_builtin_defaults(vec![
+            SafetyRule {
+                pattern: "git push --force".to_string(),
+                enabled: false,
+                category: SafetyCategory::GitHistory,
+                action: SafetyAction::AuditOnly,
+            },
+            SafetyRule::with_action("aws s3 rm", SafetyCategory::Custom, SafetyAction::HardBlock),
+        ]);
+
+        let force_push = rules
+            .iter()
+            .find(|rule| {
+                rule.category == SafetyCategory::GitHistory && rule.pattern == "git push --force"
+            })
+            .expect("builtin rule should stay present");
+        assert!(!force_push.enabled);
+        assert_eq!(force_push.action, SafetyAction::AuditOnly);
+        assert!(
+            rules
+                .iter()
+                .any(|rule| rule.category == SafetyCategory::BulkDelete && rule.pattern == "rm -rf"),
+            "未在 settings 中出现的内置规则应继续补齐"
+        );
+        assert!(
+            rules
+                .iter()
+                .any(|rule| rule.category == SafetyCategory::Custom && rule.pattern == "aws s3 rm"),
+            "自定义规则应保留"
+        );
+    }
+
+    #[test]
+    fn merged_gate_honors_disabled_builtin_rule() {
+        let rules = merge_rules_with_builtin_defaults(vec![SafetyRule {
+            pattern: "rm -rf".to_string(),
+            enabled: false,
+            category: SafetyCategory::BulkDelete,
+            action: SafetyAction::RequireApprovalInRestricted,
+        }]);
+        let gate = SafetyGate::new(rules);
+        let args = serde_json::json!({ "command": "rm -rf /tmp/foo" }).to_string();
+
+        assert_eq!(gate.evaluate("shell_exec", &args), SafetyDecision::Allow);
     }
 
     #[test]
