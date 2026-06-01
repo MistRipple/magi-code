@@ -55,6 +55,7 @@ function runGoldenReplay(reducer, projection, timelineRenderItems, contract) {
 
   assertAcceptedFirstFrameRunning(reducer, projection);
   assertLocalPendingTurnIsReplacedByAcceptedCanonicalTurn(reducer, projection);
+  assertLocalPendingImageSurvivesRegularAcceptedTurn(reducer, projection);
   assertTerminalLateUpsertIsIgnored(reducer, projection);
   assertTerminalLateTurnStartedIsIgnored(reducer, projection);
   assertFailedAssistantTextUsesPlainMessageShell(reducer, projection);
@@ -357,6 +358,74 @@ function assertLocalPendingTurnIsReplacedByAcceptedCanonicalTurn(reducer, projec
       signatureMessageWithStatus('message', 'assistant_text', 2000, '', 'running'),
     ],
     'accepted canonical turn should keep the same visible timeline shape',
+  );
+}
+
+function assertLocalPendingImageSurvivesRegularAcceptedTurn(reducer, projection) {
+  const requestMetadata = {
+    requestId: 'request-local-image',
+    userMessageId: 'user-image-message',
+    placeholderMessageId: 'assistant-image-placeholder',
+  };
+  const imageMetadata = {
+    images: [
+      {
+        name: 'paste.png',
+        dataUrl: 'data:image/png;base64,AAA',
+      },
+    ],
+  };
+  const local = baseCase(
+    'local-pending-image-turn',
+    'session-golden-local-image',
+    'turn-local-request-local-image',
+    20,
+  );
+  const accepted = baseCase(
+    'accepted-image-replaces-local-pending',
+    local.sessionId,
+    'turn-session-1777600000020',
+    1777600000020,
+  );
+  const localUser = user(local, 1, '请分析这张图片。');
+  localUser.itemId = requestMetadata.userMessageId;
+  localUser.metadata = { ...requestMetadata, ...imageMetadata, localOptimistic: true };
+  const localAssistant = assistantPlaceholderText(local, 2, requestMetadata.placeholderMessageId, 'running');
+  localAssistant.metadata = { ...requestMetadata, localOptimistic: true };
+  const acceptedUser = user(accepted, 1, localUser.content);
+  acceptedUser.itemId = requestMetadata.userMessageId;
+  acceptedUser.metadata = { ...requestMetadata, ...imageMetadata };
+
+  let state = reducer.createCanonicalTurnReducerState(local.sessionId);
+  let result = reducer.reduceCanonicalTurnEvent(state, event(local, 0, 'turn_started', {
+    turn: {
+      ...turn(local, 'running', [localUser, localAssistant]),
+      metadata: { requestId: requestMetadata.requestId, localOptimistic: true },
+    },
+    item: localAssistant,
+  }));
+  assert.equal(result.error, undefined, 'local pending image canonical event should reduce');
+  state = result.state;
+  let projectionValue = projection.buildCanonicalTimelineProjection(state);
+  let userArtifact = findArtifactByTurnItemId(projectionValue, requestMetadata.userMessageId);
+  assert.deepEqual(
+    userArtifact?.message.images,
+    imageMetadata.images.map((image) => ({ dataUrl: image.dataUrl })),
+    'local pending image should enter Message.images immediately',
+  );
+
+  result = reducer.reduceCanonicalTurnEvent(state, event(accepted, 1, 'turn_started', {
+    turn: turn(accepted, 'running', [acceptedUser]),
+  }));
+  assert.equal(result.error, undefined, 'regular accepted canonical image event should reduce');
+  assert.equal(result.state.turns.length, 1, 'accepted canonical image turn must replace local optimistic turn');
+  assert.equal(result.state.turns[0].turnId, accepted.turnId);
+  projectionValue = projection.buildCanonicalTimelineProjection(result.state);
+  userArtifact = findArtifactByTurnItemId(projectionValue, requestMetadata.userMessageId);
+  assert.deepEqual(
+    userArtifact?.message.images,
+    imageMetadata.images.map((image) => ({ dataUrl: image.dataUrl })),
+    'accepted canonical user-only turn should keep image thumbnails in the message area',
   );
 }
 
