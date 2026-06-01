@@ -178,6 +178,10 @@
     return urlBinding.workspaceId === workspaceId ? urlBinding.sessionId : '';
   }
 
+  function workspacePathForId(workspaceId: string): string {
+    return workspaces.find((workspace) => workspace.workspaceId === workspaceId)?.rootPath?.trim() || '';
+  }
+
   function resolveBackendWorkspaceSelection(nextWorkspaces: AgentWorkspaceSummary[]): string {
     const authoritativeWorkspaceId = currentBootstrapWorkspaceId();
     if (authoritativeWorkspaceId && nextWorkspaces.some((workspace) => workspace.workspaceId === authoritativeWorkspaceId)) {
@@ -262,7 +266,11 @@
     syncBrowserSessionBinding(workspace.workspaceId, workspace.rootPath, bootstrapSessionId || null);
     const currentSessions = sessionsByWorkspace[authoritativeWorkspaceId] ?? [];
     if (currentSessions.length === 0 || (bootstrapSessionId && !currentSessions.some((session) => session.id === bootstrapSessionId))) {
-      void refreshWorkspaceSessions(authoritativeWorkspaceId, bootstrapSessionId);
+      void refreshWorkspaceSessions(
+        authoritativeWorkspaceId,
+        bootstrapSessionId,
+        workspace.rootPath,
+      );
     }
   });
 
@@ -854,6 +862,7 @@
       await refreshWorkspaceSessions(
         selectedWorkspaceId,
         preferredSessionIdForWorkspace(selectedWorkspaceId),
+        workspacePathForId(selectedWorkspaceId),
       );
       if (selectedWorkspaceId) {
         requestCurrentSessionState();
@@ -899,6 +908,7 @@
         await refreshWorkspaceSessions(
           selectedWorkspaceId,
           preferredSessionIdForWorkspace(selectedWorkspaceId),
+          workspacePathForId(selectedWorkspaceId),
         );
         requestCurrentSessionState();
       }
@@ -989,6 +999,7 @@
           await refreshWorkspaceSessions(
             selectedWorkspaceId,
             preferredSessionIdForWorkspace(selectedWorkspaceId),
+            workspacePathForId(selectedWorkspaceId),
           );
           requestCurrentSessionState();
         }
