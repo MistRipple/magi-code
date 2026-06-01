@@ -49,8 +49,9 @@ function createDirectTransport(): AgentTransport {
       stream.onopen = () => handlers.onOpen();
       stream.onmessage = (event) => handlers.onMessage(event.data);
       stream.onerror = () => {
-        stream.close();
-        handlers.onError();
+        if (stream.readyState === EventSource.CLOSED) {
+          handlers.onError();
+        }
       };
       return { close: () => stream.close() };
     },
