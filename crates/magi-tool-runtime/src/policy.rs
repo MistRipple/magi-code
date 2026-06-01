@@ -4,7 +4,7 @@ use crate::{
     apply_patch::apply_patch_declared_paths_from_input,
     builtin::{field_string, parse_json_object, resolve_path_with_context},
 };
-use magi_core::{ToolCallId, UtcMillis};
+use magi_core::{AccessProfile, ExecutionResultStatus, ToolCallId, UtcMillis};
 use magi_governance::{DecisionPhase, GovernanceDecision, GovernanceOutcome};
 use serde_json::Value;
 use std::{
@@ -129,6 +129,107 @@ impl ToolRegistry {
             field_string(&object, &["access_mode", "write_mode", "intent"])
                 .and_then(|value| BuiltinToolAccessMode::from_str(&value))
         })
+    }
+
+    pub(crate) fn enforce_access_profile_policy(
+        &self,
+        input: &ToolExecutionInput,
+        policy: &ToolExecutionPolicy,
+        access_mode: BuiltinToolAccessMode,
+    ) -> Option<ToolExecutionOutput> {
+        let engine = crate::builtin_permission_engine();
+        let permission_policy = magi_permissions::PermissionPolicy {
+            allowed_tools: policy
+                .allowed_tool_names
+                .iter()
+                .map(|tool_name| {
+                    crate::canonical_builtin_tool_name(tool_name)
+                        .unwrap_or_else(|| tool_name.trim().to_string())
+                })
+                .collect(),
+            denied_tools: policy
+                .denied_tool_names
+                .iter()
+                .map(|tool_name| {
+                    crate::canonical_builtin_tool_name(tool_name)
+                        .unwrap_or_else(|| tool_name.trim().to_string())
+                })
+                .collect(),
+            ..magi_permissions::PermissionPolicy::default()
+        };
+
+        let tool_is_writeful = if input.tool_name == crate::BuiltinToolName::ShellExec.as_str() {
+            false
+        } else {
+            access_mode.is_writeful()
+        };
+        let tool_decision = engine.decide(
+            &magi_permissions::PermissionRequest::ToolInvocation {
+                tool_name: &input.tool_name,
+                is_write_tool: tool_is_writeful,
+            },
+            &permission_policy,
+            policy.access_profile,
+        );
+        if let Some(output) =
+            self.permission_decision_output(input, tool_decision, policy.access_profile)
+        {
+            return Some(output);
+        }
+
+        if input.tool_name == crate::BuiltinToolName::ShellExec.as_str() {
+            let shell_decision = engine.decide(
+                &magi_permissions::PermissionRequest::ShellCommand {
+                    arguments_json: &input.input,
+                },
+                &permission_policy,
+                policy.access_profile,
+            );
+            return self.permission_decision_output(input, shell_decision, policy.access_profile);
+        }
+
+        None
+    }
+
+    fn permission_decision_output(
+        &self,
+        input: &ToolExecutionInput,
+        decision: magi_permissions::Decision,
+        access_profile: AccessProfile,
+    ) -> Option<ToolExecutionOutput> {
+        match decision {
+            magi_permissions::Decision::Allow => None,
+            magi_permissions::Decision::Deny { reason } => Some(ToolExecutionOutput {
+                tool_call_id: input.tool_call_id.clone(),
+                status: ExecutionResultStatus::Rejected,
+                payload: permission_decision_payload(
+                    &input.tool_name,
+                    "rejected",
+                    &reason,
+                    access_profile,
+                ),
+                governance: GovernanceDecision::rejected(
+                    DecisionPhase::ToolPolicy,
+                    input.risk_level,
+                    Some(reason),
+                ),
+            }),
+            magi_permissions::Decision::NeedsApproval { reason } => Some(ToolExecutionOutput {
+                tool_call_id: input.tool_call_id.clone(),
+                status: ExecutionResultStatus::NeedsApproval,
+                payload: permission_decision_payload(
+                    &input.tool_name,
+                    "needs_approval",
+                    &reason,
+                    access_profile,
+                ),
+                governance: GovernanceDecision::needs_approval(
+                    DecisionPhase::ApprovalPolicy,
+                    input.risk_level,
+                    Some(reason),
+                ),
+            }),
+        }
     }
 
     pub(crate) fn acquire_write_guard(
@@ -343,6 +444,21 @@ impl ToolRegistry {
             },
         }
     }
+}
+
+fn permission_decision_payload(
+    tool_name: &str,
+    status: &str,
+    reason: &str,
+    access_profile: AccessProfile,
+) -> String {
+    serde_json::json!({
+        "tool": tool_name,
+        "status": status,
+        "error": reason,
+        "access_profile": access_profile.as_str(),
+    })
+    .to_string()
 }
 
 fn normalize_execution_policy(policy: &ToolExecutionPolicy) -> ToolExecutionPolicy {

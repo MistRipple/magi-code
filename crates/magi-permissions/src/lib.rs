@@ -237,7 +237,16 @@ impl PermissionEngine {
         policy: &PermissionPolicy,
         access_profile: AccessProfile,
     ) -> Decision {
+        if !Self::shell_arguments_have_permission_relevant_operation(arguments_json) {
+            return Decision::Allow;
+        }
+        let declares_read_only = Self::shell_arguments_declare_read_only(arguments_json);
         let is_read_only = Self::shell_arguments_request_read_only(arguments_json);
+        if declares_read_only && !is_read_only {
+            return Decision::Deny {
+                reason: "shell_exec 声明为只读时，命令不能包含写入迹象".to_string(),
+            };
+        }
         if (access_profile == AccessProfile::ReadOnly || policy.is_read_only_command_mode())
             && !is_read_only
         {
@@ -294,6 +303,46 @@ impl PermissionEngine {
             return false;
         };
         !shell_command_has_write_indicator(&command)
+    }
+
+    fn shell_arguments_have_permission_relevant_operation(arguments_json: &str) -> bool {
+        if arguments_json.trim().is_empty() {
+            return false;
+        }
+        let Some(object) = serde_json::from_str::<serde_json::Value>(arguments_json)
+            .ok()
+            .and_then(|value| value.as_object().cloned())
+        else {
+            return true;
+        };
+        let action = json_string(&object, &["action", "operation", "op"])
+            .map(|value| value.trim().to_ascii_lowercase());
+        let has_terminal_id = json_has_any(&object, &["terminal_id", "terminalId", "id"]);
+        let has_command = json_string(&object, &["command", "script", "line"])
+            .is_some_and(|value| !value.trim().is_empty());
+
+        match action.as_deref() {
+            None => has_command || has_terminal_id,
+            Some("run" | "exec" | "command") => has_command,
+            Some(
+                "read" | "poll" | "status" | "list" | "ls" | "write" | "stdin" | "send" | "kill"
+                | "stop" | "terminate" | "cancel",
+            ) => true,
+            Some(_) => false,
+        }
+    }
+
+    fn shell_arguments_declare_read_only(arguments_json: &str) -> bool {
+        serde_json::from_str::<serde_json::Value>(arguments_json)
+            .ok()
+            .and_then(|value| value.as_object().cloned())
+            .and_then(|object| json_string(&object, &["access_mode", "write_mode", "intent"]))
+            .is_some_and(|mode| {
+                matches!(
+                    mode.trim().to_ascii_lowercase().as_str(),
+                    "read" | "read_only" | "readonly"
+                )
+            })
     }
 
     /// caller 直接拿 list 用于 dedup 逻辑。
@@ -625,10 +674,25 @@ mod tests {
                 .decide(&req, &policy, AccessProfile::ReadOnly)
                 .is_deny()
         );
-        assert!(matches!(
+        assert!(
+            engine
+                .decide(&req, &policy, AccessProfile::Restricted)
+                .is_deny()
+        );
+    }
+
+    #[test]
+    fn shell_missing_command_is_left_to_tool_validation() {
+        let engine = engine_with_test_tools();
+        let policy = policy_empty();
+        let req = PermissionRequest::ShellCommand {
+            arguments_json: r#"{"command":"   "}"#,
+        };
+
+        assert_eq!(
             engine.decide(&req, &policy, AccessProfile::Restricted),
-            Decision::NeedsApproval { .. }
-        ));
+            Decision::Allow
+        );
     }
 
     #[test]

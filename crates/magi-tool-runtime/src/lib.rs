@@ -1833,6 +1833,11 @@ impl ToolRegistry {
             self.record_invocation(&input, &context, &output);
             return output;
         }
+        let access_mode = self.resolve_access_mode(&input);
+        if let Some(output) = self.enforce_access_profile_policy(&input, policy, access_mode) {
+            self.record_invocation(&input, &context, &output);
+            return output;
+        }
 
         let governance = if policy.access_profile == magi_core::AccessProfile::FullAccess {
             GovernanceDecision::allowed(
@@ -1867,7 +1872,6 @@ impl ToolRegistry {
         } else {
             match self.builtin_tools.get(&input.tool_name) {
                 Some(tool) => {
-                    let access_mode = self.resolve_access_mode(&input);
                     let write_guard = match self.acquire_write_guard(&input, &context, access_mode)
                     {
                         Ok(guard) => guard,
@@ -2570,7 +2574,7 @@ mod tests {
                 risk_level: RiskLevel::Low,
             },
             ToolExecutionContext::default(),
-            &ToolExecutionPolicy::default(),
+            &full_access_policy(),
         );
 
         assert_eq!(output.status, ExecutionResultStatus::Succeeded);
@@ -2659,7 +2663,7 @@ mod tests {
                 risk_level: RiskLevel::Low,
             },
             context.clone(),
-            &ToolExecutionPolicy::default(),
+            &full_access_policy(),
         );
 
         assert_eq!(launch.status, ExecutionResultStatus::Succeeded);
@@ -2686,7 +2690,7 @@ mod tests {
                 risk_level: RiskLevel::Low,
             },
             context.clone(),
-            &ToolExecutionPolicy::default(),
+            &full_access_policy(),
         );
 
         assert_eq!(read.status, ExecutionResultStatus::Succeeded);
@@ -2710,7 +2714,7 @@ mod tests {
                 risk_level: RiskLevel::Low,
             },
             context.clone(),
-            &ToolExecutionPolicy::default(),
+            &full_access_policy(),
         );
         let list_payload: Value = serde_json::from_str(&list.payload).expect("list json");
         assert_eq!(list_payload["mode"], "background_list");
@@ -2736,7 +2740,7 @@ mod tests {
                 risk_level: RiskLevel::Low,
             },
             context,
-            &ToolExecutionPolicy::default(),
+            &full_access_policy(),
         );
 
         assert_eq!(kill.status, ExecutionResultStatus::Succeeded);
@@ -2884,7 +2888,7 @@ mod tests {
                 risk_level: RiskLevel::Low,
             },
             context,
-            &ToolExecutionPolicy::default(),
+            &full_access_policy(),
         );
 
         assert_eq!(output.status, ExecutionResultStatus::Succeeded);
@@ -2929,7 +2933,7 @@ mod tests {
                 risk_level: RiskLevel::Low,
             },
             context,
-            &ToolExecutionPolicy::default(),
+            &full_access_policy(),
         );
 
         assert_eq!(output.status, ExecutionResultStatus::Succeeded);
@@ -2972,7 +2976,7 @@ mod tests {
                     risk_level: RiskLevel::Low,
                 },
                 runner_context,
-                &ToolExecutionPolicy::default(),
+                &full_access_policy(),
             )
         });
 
@@ -3185,7 +3189,7 @@ mod tests {
                 ..guarded_input.clone()
             },
             context.clone(),
-            &ToolExecutionPolicy::default(),
+            &full_access_policy(),
         );
         assert_eq!(blocked.status, ExecutionResultStatus::Rejected);
         let blocked_payload: Value =
@@ -3201,11 +3205,8 @@ mod tests {
 
         drop(write_guard);
 
-        let allowed = tool_registry.execute_with_policy(
-            guarded_input,
-            context,
-            &ToolExecutionPolicy::default(),
-        );
+        let allowed =
+            tool_registry.execute_with_policy(guarded_input, context, &full_access_policy());
         assert_eq!(allowed.status, ExecutionResultStatus::Succeeded);
     }
 
@@ -3335,7 +3336,7 @@ mod tests {
                 ..guarded_input.clone()
             },
             other_context,
-            &ToolExecutionPolicy::default(),
+            &full_access_policy(),
         );
         assert_eq!(
             allowed_other_context.status,
@@ -3348,7 +3349,7 @@ mod tests {
                 ..guarded_input.clone()
             },
             guarded_context,
-            &ToolExecutionPolicy::default(),
+            &full_access_policy(),
         );
         assert_eq!(blocked.status, ExecutionResultStatus::Rejected);
         let blocked_payload: Value =
@@ -3433,7 +3434,7 @@ mod tests {
                 risk_level: RiskLevel::Low,
             },
             context.clone(),
-            &ToolExecutionPolicy::default(),
+            &full_access_policy(),
         );
         assert_eq!(launch.status, ExecutionResultStatus::Succeeded);
         let launch_payload: Value =
@@ -3456,7 +3457,7 @@ mod tests {
                 risk_level: RiskLevel::Low,
             },
             context.clone(),
-            &ToolExecutionPolicy::default(),
+            &full_access_policy(),
         );
 
         assert!(
@@ -3478,7 +3479,7 @@ mod tests {
                 risk_level: RiskLevel::Low,
             },
             context,
-            &ToolExecutionPolicy::default(),
+            &full_access_policy(),
         );
         assert_eq!(kill.status, ExecutionResultStatus::Succeeded);
     }
@@ -3500,7 +3501,7 @@ mod tests {
                 risk_level: RiskLevel::Low,
             },
             ToolExecutionContext::default(),
-            &ToolExecutionPolicy::default(),
+            &full_access_policy(),
         );
 
         assert_eq!(output.status, ExecutionResultStatus::Failed);
@@ -3529,7 +3530,7 @@ mod tests {
                 risk_level: RiskLevel::Low,
             },
             ToolExecutionContext::default(),
-            &ToolExecutionPolicy::default(),
+            &full_access_policy(),
         );
         assert_eq!(output.status, ExecutionResultStatus::Failed);
         assert!(output.payload.contains("需要 session 或 workspace 上下文"));
@@ -3555,7 +3556,7 @@ mod tests {
                 risk_level: RiskLevel::Low,
             },
             context.clone(),
-            &ToolExecutionPolicy::default(),
+            &full_access_policy(),
         );
         assert_eq!(launch.status, ExecutionResultStatus::Succeeded);
         let launch_payload: Value =
@@ -3591,7 +3592,7 @@ mod tests {
                 risk_level: RiskLevel::Low,
             },
             context,
-            &ToolExecutionPolicy::default(),
+            &full_access_policy(),
         );
         assert_eq!(kill.status, ExecutionResultStatus::Succeeded);
     }
@@ -3640,7 +3641,7 @@ mod tests {
                 risk_level: RiskLevel::Low,
             },
             owner_context.clone(),
-            &ToolExecutionPolicy::default(),
+            &full_access_policy(),
         );
         assert_eq!(launch.status, ExecutionResultStatus::Succeeded);
         let launch_payload: Value =
@@ -3717,7 +3718,7 @@ mod tests {
                 risk_level: RiskLevel::Low,
             },
             owner_context,
-            &ToolExecutionPolicy::default(),
+            &full_access_policy(),
         );
         assert_eq!(kill.status, ExecutionResultStatus::Succeeded);
     }
@@ -4421,6 +4422,92 @@ mod tests {
         let mut r = ToolRegistry::new(governance, event_bus);
         r.register_default_builtins();
         r
+    }
+
+    fn full_access_policy() -> ToolExecutionPolicy {
+        ToolExecutionPolicy {
+            access_profile: magi_core::AccessProfile::FullAccess,
+            ..ToolExecutionPolicy::default()
+        }
+    }
+
+    #[test]
+    fn registry_enforces_read_only_profile_for_write_tools() {
+        let root = unique_temp_dir("magi-tool-read-only-profile");
+        let registry = make_registry();
+        let target = root.join("blocked.txt");
+
+        let output = registry.execute_with_policy(
+            ToolExecutionInput::for_builtin_invocation(
+                ToolCallId::new("tc-read-only-file-write"),
+                BuiltinToolName::FileWrite.as_str(),
+                serde_json::json!({
+                    "path": target.to_string_lossy(),
+                    "content": "blocked"
+                })
+                .to_string(),
+            ),
+            ToolExecutionContext::default(),
+            &ToolExecutionPolicy {
+                access_profile: magi_core::AccessProfile::ReadOnly,
+                ..ToolExecutionPolicy::default()
+            },
+        );
+
+        assert_eq!(output.status, ExecutionResultStatus::Rejected);
+        assert!(!target.exists());
+        let payload: Value = serde_json::from_str(&output.payload).expect("payload json");
+        assert_eq!(payload["tool"], BuiltinToolName::FileWrite.as_str());
+        assert_eq!(payload["access_profile"], "read_only");
+    }
+
+    #[test]
+    fn registry_requires_approval_for_restricted_write_shell() {
+        let registry = make_registry();
+
+        let output = registry.execute_with_policy(
+            ToolExecutionInput::for_builtin_invocation(
+                ToolCallId::new("tc-restricted-shell-write"),
+                BuiltinToolName::ShellExec.as_str(),
+                serde_json::json!({
+                    "command": "printf write",
+                    "access_mode": "maybe_write"
+                })
+                .to_string(),
+            ),
+            ToolExecutionContext::default(),
+            &ToolExecutionPolicy::default(),
+        );
+
+        assert_eq!(output.status, ExecutionResultStatus::NeedsApproval);
+        assert_eq!(output.governance.outcome, GovernanceOutcome::NeedsApproval);
+        let payload: Value = serde_json::from_str(&output.payload).expect("payload json");
+        assert_eq!(payload["tool"], BuiltinToolName::ShellExec.as_str());
+        assert_eq!(payload["access_profile"], "restricted");
+    }
+
+    #[test]
+    fn registry_allows_restricted_read_only_shell() {
+        let registry = make_registry();
+
+        let output = registry.execute_with_policy(
+            ToolExecutionInput::for_builtin_invocation(
+                ToolCallId::new("tc-restricted-shell-read"),
+                BuiltinToolName::ShellExec.as_str(),
+                serde_json::json!({
+                    "command": "printf hello",
+                    "access_mode": "read_only"
+                })
+                .to_string(),
+            ),
+            ToolExecutionContext::default(),
+            &ToolExecutionPolicy::default(),
+        );
+
+        assert_eq!(output.status, ExecutionResultStatus::Succeeded);
+        let payload: Value = serde_json::from_str(&output.payload).expect("payload json");
+        assert_eq!(payload["access_mode"], "read_only");
+        assert_eq!(payload["stdout"], "hello");
     }
 
     fn exec_tool(
@@ -5845,7 +5932,7 @@ mod tests {
                 risk_level: RiskLevel::Low,
             },
             context,
-            &ToolExecutionPolicy::default(),
+            &full_access_policy(),
         );
 
         assert_eq!(output.status, ExecutionResultStatus::Succeeded);
