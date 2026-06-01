@@ -35,12 +35,20 @@ impl ExecutionWritebackPlans {
         Self {
             plans: vec![ExecutionWritebackPlan::MemoryExtraction(
                 MemoryExtractionApplyRequest {
-                    extraction_id: format!("extract-session-action-{}", input.accepted_at.0),
+                    extraction_id: session_action_extraction_id(
+                        input.session_id,
+                        input.accepted_at,
+                        input.timeline_entry_id,
+                    ),
                     session_id: input.session_id.clone(),
                     source_ref: Some(format!("timeline://{}", input.timeline_entry_id)),
                     summary: "session.action loopback extraction".to_string(),
                     memories: vec![ExtractedMemory {
-                        memory_id: format!("mem-session-action-{}", input.accepted_at.0),
+                        memory_id: session_action_memory_id(
+                            input.session_id,
+                            input.accepted_at,
+                            input.timeline_entry_id,
+                        ),
                         layer: MemoryLayer::Durable,
                         content,
                         created_at: input.accepted_at,
@@ -119,6 +127,32 @@ fn trimmed_non_empty(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|value| !value.is_empty())
 }
 
+fn session_action_extraction_id(
+    session_id: &SessionId,
+    accepted_at: UtcMillis,
+    timeline_entry_id: &str,
+) -> String {
+    format!(
+        "extract-session-action-{}-{}-{}",
+        session_id.as_str(),
+        accepted_at.0,
+        timeline_entry_id
+    )
+}
+
+fn session_action_memory_id(
+    session_id: &SessionId,
+    accepted_at: UtcMillis,
+    timeline_entry_id: &str,
+) -> String {
+    format!(
+        "mem-session-action-{}-{}-{}",
+        session_id.as_str(),
+        accepted_at.0,
+        timeline_entry_id
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{DispatchMemoryExtractionInput, ExecutionWritebackPlans};
@@ -182,11 +216,11 @@ mod tests {
         .apply(&store);
 
         let verification = store
-            .verify_extraction_linkage("extract-session-action-42")
+            .verify_extraction_linkage("extract-session-action-session-1-42-timeline-1")
             .expect("session action writeback should persist extraction linkage");
         assert!(verification.is_consistent);
         let linkage = store
-            .extraction_linkage("extract-session-action-42")
+            .extraction_linkage("extract-session-action-session-1-42-timeline-1")
             .expect("session action extraction linkage should exist");
         assert_eq!(
             linkage.extraction.source_ref.as_deref(),
@@ -198,12 +232,64 @@ mod tests {
         );
         assert_eq!(
             linkage.produced_records[0].memory_id,
-            "mem-session-action-42"
+            "mem-session-action-session-1-42-timeline-1"
         );
         assert_eq!(
             linkage.produced_records[0].content,
             "hello world\nskill:refactor"
         );
+    }
+
+    #[test]
+    fn session_action_input_ids_are_isolated_across_sessions_and_timeline_entries() {
+        let store = MemoryStore::new();
+        let session_a = SessionId::new("session-a");
+        let session_b = SessionId::new("session-b");
+
+        ExecutionWritebackPlans::from_session_action_input(DispatchMemoryExtractionInput {
+            accepted_at: UtcMillis(42),
+            session_id: &session_a,
+            timeline_entry_id: "timeline-1",
+            text: Some("session a first"),
+            skill_name: None,
+        })
+        .apply(&store);
+        ExecutionWritebackPlans::from_session_action_input(DispatchMemoryExtractionInput {
+            accepted_at: UtcMillis(42),
+            session_id: &session_a,
+            timeline_entry_id: "timeline-2",
+            text: Some("session a second"),
+            skill_name: None,
+        })
+        .apply(&store);
+        ExecutionWritebackPlans::from_session_action_input(DispatchMemoryExtractionInput {
+            accepted_at: UtcMillis(42),
+            session_id: &session_b,
+            timeline_entry_id: "timeline-1",
+            text: Some("session b first"),
+            skill_name: None,
+        })
+        .apply(&store);
+
+        for extraction_id in [
+            "extract-session-action-session-a-42-timeline-1",
+            "extract-session-action-session-a-42-timeline-2",
+            "extract-session-action-session-b-42-timeline-1",
+        ] {
+            let verification = store
+                .verify_extraction_linkage(extraction_id)
+                .expect("session action extraction linkage should exist");
+            assert!(verification.is_consistent, "{verification:?}");
+        }
+
+        let session_a_memory = store.list_for_session(&session_a);
+        assert_eq!(session_a_memory.len(), 2);
+        assert_eq!(session_a_memory[0].content, "session a first");
+        assert_eq!(session_a_memory[1].content, "session a second");
+
+        let session_b_memory = store.list_for_session(&session_b);
+        assert_eq!(session_b_memory.len(), 1);
+        assert_eq!(session_b_memory[0].content, "session b first");
     }
 
     #[test]
@@ -222,7 +308,7 @@ mod tests {
 
         assert!(
             store
-                .extraction_linkage("extract-session-action-7")
+                .extraction_linkage("extract-session-action-session-blank-7-timeline-blank")
                 .is_none()
         );
     }
