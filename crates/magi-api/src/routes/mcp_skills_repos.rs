@@ -23,6 +23,8 @@ use crate::{
 };
 
 const MCP_CONNECTION_FAILED_MARKER: &str = "mcp_connection_failed";
+const MCP_DISABLED_HEALTH: &str = "disabled";
+const MCP_DISCONNECTED_HEALTH: &str = "disconnected";
 const SKILL_REPOSITORY_PUBLIC_ERROR: &str = "Skill 仓库暂不可读取";
 const SKILL_DOWNLOAD_PUBLIC_ERROR: &str = "Skill 下载暂不可用，请稍后重试";
 const SKILL_CACHE_PUBLIC_ERROR: &str = "Skill 缓存不可保存，请检查本地权限";
@@ -408,20 +410,27 @@ fn canonical_mcp_servers(state: &ApiState) -> Vec<serde_json::Value> {
         .into_iter()
         .map(redact_mcp_server_public_entry)
         .map(|mut entry| {
+            let enabled = mcp_server_entry_enabled(&entry);
             let server_id = mcp_server_entry_id(&entry).map(str::to_string);
-            let connected = server_id.as_deref().is_some_and(|server_id| {
-                state
-                    .mcp_connections()
-                    .read()
-                    .expect("mcp connections read lock poisoned")
-                    .contains_key(server_id)
-            });
+            let connected = enabled
+                && server_id.as_deref().is_some_and(|server_id| {
+                    state
+                        .mcp_connections()
+                        .read()
+                        .expect("mcp connections read lock poisoned")
+                        .contains_key(server_id)
+                });
             entry["connected"] = serde_json::json!(connected);
-            entry["health"] = serde_json::json!(if connected {
+            entry["health"] = serde_json::json!(if !enabled {
+                MCP_DISABLED_HEALTH
+            } else if connected {
                 "connected"
             } else {
-                "disconnected"
+                MCP_DISCONNECTED_HEALTH
             });
+            if !enabled {
+                entry.as_object_mut().map(|object| object.remove("error"));
+            }
             entry
         })
         .collect()
@@ -476,6 +485,9 @@ async fn update_mcp_server(
     state
         .settings_store
         .upsert_array_entry("mcpServers", "id", &normalized);
+    if !mcp_server_entry_enabled(&normalized) {
+        remove_mcp_connection(&state, &server_id);
+    }
     Ok(Json(serde_json::json!({ "updated": true })))
 }
 
@@ -512,12 +524,29 @@ fn remove_mcp_connection(state: &ApiState, server_id: &str) {
     pool.remove(server_id);
 }
 
+fn mcp_server_entry_enabled(entry: &serde_json::Value) -> bool {
+    entry
+        .get("enabled")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true)
+}
+
 fn mcp_tools_unavailable_response(server_id: &str) -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "tools": [],
         "connected": false,
-        "health": "disconnected",
+        "health": MCP_DISCONNECTED_HEALTH,
         "error": MCP_CONNECTION_FAILED_MARKER,
+        "serverId": server_id,
+        "toolCount": 0,
+    }))
+}
+
+fn mcp_tools_disabled_response(server_id: &str) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "tools": [],
+        "connected": false,
+        "health": MCP_DISABLED_HEALTH,
         "serverId": server_id,
         "toolCount": 0,
     }))
@@ -535,6 +564,11 @@ async fn connect_mcp_server(
 
     let entry = find_server_entry(&state, &server_id)
         .ok_or_else(|| ApiError::not_found("MCP server 配置不存在", &server_id))?;
+
+    if !mcp_server_entry_enabled(&entry) {
+        remove_mcp_connection(&state, &server_id);
+        return Ok(mcp_tools_disabled_response(&server_id));
+    }
 
     let config = build_mcp_config_from_entry(&entry)
         .ok_or_else(|| ApiError::InvalidInput("MCP server 配置中缺少 command".to_string()))?;
@@ -597,6 +631,13 @@ async fn get_mcp_tools(
         .and_then(|v| v.as_str())
         .ok_or_else(|| ApiError::InvalidInput("serverId 不能为空".to_string()))?;
 
+    if let Some(entry) = stored_mcp_server_entry(&state, server_id)
+        && !mcp_server_entry_enabled(&entry)
+    {
+        remove_mcp_connection(&state, server_id);
+        return Ok(mcp_tools_disabled_response(server_id));
+    }
+
     let client = {
         let pool = state
             .mcp_connections()
@@ -637,6 +678,13 @@ async fn refresh_mcp_tools(
         .get("serverId")
         .and_then(|v| v.as_str())
         .ok_or_else(|| ApiError::InvalidInput("serverId 不能为空".to_string()))?;
+
+    if let Some(entry) = stored_mcp_server_entry(&state, server_id)
+        && !mcp_server_entry_enabled(&entry)
+    {
+        remove_mcp_connection(&state, server_id);
+        return Ok(mcp_tools_disabled_response(server_id));
+    }
 
     let client = {
         let pool = state
@@ -1697,6 +1745,41 @@ mod tests {
             assert_eq!(body["connected"], false);
             assert_eq!(body["health"], "disconnected");
             assert_eq!(body["error"], MCP_CONNECTION_FAILED_MARKER);
+            assert_eq!(body["toolCount"], 0);
+            assert_eq!(body["tools"].as_array().map(Vec::len), Some(0));
+        }
+    }
+
+    #[tokio::test]
+    async fn disabled_mcp_server_routes_do_not_report_connection_error() {
+        let state = test_state();
+        state.settings_store.upsert_array_entry(
+            "mcpServers",
+            "id",
+            &serde_json::json!({
+                "id": "disabled-mcp",
+                "name": "disabled-mcp",
+                "command": "node",
+                "enabled": false,
+                "error": "/private/path/raw transport error"
+            }),
+        );
+
+        let app = Router::new().merge(routes()).with_state(state.clone());
+        let list = get_json(app, "/settings/mcp").await;
+        assert_eq!(list["servers"][0]["connected"], false);
+        assert_eq!(list["servers"][0]["health"], MCP_DISABLED_HEALTH);
+        assert!(list["servers"][0].get("error").is_none());
+
+        for path in ["/settings/mcp/tools", "/settings/mcp/tools/refresh"] {
+            let app = Router::new().merge(routes()).with_state(state.clone());
+            let body =
+                post_json(app, path, serde_json::json!({ "serverId": "disabled-mcp" })).await;
+
+            assert_eq!(body["serverId"], "disabled-mcp");
+            assert_eq!(body["connected"], false);
+            assert_eq!(body["health"], MCP_DISABLED_HEALTH);
+            assert!(body.get("error").is_none());
             assert_eq!(body["toolCount"], 0);
             assert_eq!(body["tools"].as_array().map(Vec::len), Some(0));
         }

@@ -113,7 +113,7 @@ export interface MCPServer {
   env?: Record<string, string>;
   enabled: boolean;
   connected?: boolean;
-  health?: "connected" | "degraded" | "disconnected";
+  health?: "connected" | "degraded" | "disconnected" | "disabled";
   error?: string;
   toolCount?: number;
   reconnectAttempts?: number;
@@ -1921,19 +1921,22 @@ function createSettingsStore(props: { onClose?: () => void }) {
     tools: any[],
   ): boolean {
     const unavailable = result?.connected === false;
+    const resultHealth = typeof result?.health === "string" ? result.health : "";
     const connectionFailed =
       unavailable
+      && resultHealth !== "disabled"
       && typeof result?.error === "string"
       && result.error.trim().length > 0;
     mcpServerTools = { ...mcpServerTools, [serverId]: unavailable ? [] : tools };
     mcpServers = mcpServers.map((server) => {
       if (server.id !== serverId) return server;
       if (unavailable) {
+        const disabled = resultHealth === "disabled" || server.enabled === false;
         return {
           ...server,
           connected: false,
-          health: "disconnected",
-          error: connectionFailed ? "connection_issue" : undefined,
+          health: disabled ? "disabled" : "disconnected",
+          error: !disabled && connectionFailed ? "connection_issue" : undefined,
           toolCount: 0,
         };
       }
@@ -1949,6 +1952,8 @@ function createSettingsStore(props: { onClose?: () => void }) {
   }
 
   function getMCPHealthLabel(server: MCPServer): string {
+    if (server.enabled === false || server.health === "disabled")
+      return i18n.t("settings.tools.disabledLabel");
     if (server.health === "connected")
       return i18n.t("settings.tools.mcpHealthConnected");
     if (server.health === "degraded")
@@ -2414,6 +2419,18 @@ function createSettingsStore(props: { onClose?: () => void }) {
       if (!name) {
         throw new Error(`[SettingsPanel] MCP server ${id} 缺少 name`);
       }
+      const enabled = s.enabled !== false;
+      const rawHealth = typeof s?.health === "string" ? s.health : "";
+      const health: MCPServer["health"] =
+        !enabled
+          ? "disabled"
+          : rawHealth === "connected" ||
+              rawHealth === "degraded" ||
+              rawHealth === "disconnected"
+            ? rawHealth
+            : s.connected === true
+              ? "connected"
+              : "disconnected";
       return {
         id,
         name,
@@ -2421,18 +2438,11 @@ function createSettingsStore(props: { onClose?: () => void }) {
         command: s.command || "",
         args: s.args || [],
         env: s.env || {},
-        enabled: s.enabled !== false,
-        connected: s.connected === true,
-        health:
-          s.health === "connected" ||
-          s.health === "degraded" ||
-          s.health === "disconnected"
-            ? s.health
-            : s.connected === true
-              ? "connected"
-              : "disconnected",
+        enabled,
+        connected: enabled && s.connected === true,
+        health,
         error:
-          typeof s.error === "string" && s.error.trim()
+          enabled && typeof s.error === "string" && s.error.trim()
             ? "connection_issue"
             : undefined,
         toolCount: Number.isFinite(s.toolCount) ? Number(s.toolCount) : 0,

@@ -1903,6 +1903,15 @@ mod tests {
         assert!(servers.iter().any(|server| {
             server["id"] == json!("valid-server") && server["serverId"] == json!("valid-server")
         }));
+        assert!(
+            servers.iter().all(|server| {
+                server["enabled"] == json!(false)
+                    && server["connected"] == json!(false)
+                    && server["health"] == json!("disabled")
+                    && server.get("error").is_none()
+            }),
+            "disabled MCP servers should not be exposed as connection failures"
+        );
     }
 
     #[tokio::test]

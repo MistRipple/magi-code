@@ -142,7 +142,16 @@ pub(crate) fn build_tool_catalog_value(
         external_catalog
             .mcp_servers
             .iter()
-            .filter(|server| server.connected)
+            .filter(|server| server.enabled && server.connected)
+            .count()
+    } else {
+        0
+    };
+    let enabled_mcp_server_count = if include_mcp_servers {
+        external_catalog
+            .mcp_servers
+            .iter()
+            .filter(|server| server.enabled)
             .count()
     } else {
         0
@@ -171,7 +180,7 @@ pub(crate) fn build_tool_catalog_value(
             public_count,
             skill_tool_count,
             connected_mcp_server_count,
-            mcp_server_count,
+            enabled_mcp_server_count,
             spawnable_agent_role_count,
             agent_role_count,
             schema_warning_count,
@@ -214,14 +223,14 @@ fn tool_catalog_summary(
     public_count: usize,
     skill_tool_count: usize,
     connected_mcp_server_count: usize,
-    mcp_server_count: usize,
+    enabled_mcp_server_count: usize,
     spawnable_agent_role_count: usize,
     agent_role_count: usize,
     schema_warning_count: usize,
     runtime_warning_count: usize,
 ) -> String {
     let mut summary = format!(
-        "工具目录已更新：{public_count} 个内置工具、{skill_tool_count} 个 Skill 工具、MCP {connected_mcp_server_count}/{mcp_server_count} 可用、子代理 {spawnable_agent_role_count}/{agent_role_count} 可派发"
+        "工具目录已更新：{public_count} 个内置工具、{skill_tool_count} 个 Skill 工具、MCP 启用服务 {connected_mcp_server_count}/{enabled_mcp_server_count} 可用、子代理 {spawnable_agent_role_count}/{agent_role_count} 可派发"
     );
     let warning_count = schema_warning_count + runtime_warning_count;
     if warning_count > 0 {
@@ -496,6 +505,7 @@ fn external_capability_dependencies(resources: &ToolRuntimeResources) -> Vec<ser
     let mcp_tool_count = external
         .mcp_servers
         .iter()
+        .filter(|server| server.enabled)
         .filter_map(|server| server.tool_count)
         .sum::<usize>();
     let mcp_status = if enabled_mcp_count == 0 || ready_mcp_count == enabled_mcp_count {
@@ -837,6 +847,43 @@ mod tests {
         assert_eq!(mcp_dependency["enabled_count"], 1);
         assert_eq!(mcp_dependency["ready_count"], 1);
         assert_eq!(mcp_dependency["tool_count"], 1);
+    }
+
+    #[test]
+    fn tool_catalog_treats_disabled_mcp_servers_as_configured_not_active() {
+        let resources = ToolRuntimeResources {
+            external_tool_catalog_provider: Some(std::sync::Arc::new(|| {
+                ExternalToolCatalogSnapshot {
+                    skill_tools: Vec::new(),
+                    mcp_servers: vec![crate::ExternalMcpServerCatalogEntry {
+                        server_id: "disabled-mcp".to_string(),
+                        name: "disabled-mcp".to_string(),
+                        enabled: false,
+                        connected: true,
+                        health: "disabled".to_string(),
+                        tool_count: Some(3),
+                        error: Some("mcp_connection_failed".to_string()),
+                    }],
+                }
+            })),
+            ..ToolRuntimeResources::default()
+        };
+        let output = execute_tool_catalog("{}", &ToolExecutionContext::default(), &resources);
+        let payload: serde_json::Value = serde_json::from_str(&output).expect("json output");
+        let mcp_dependency = payload["runtime_dependencies"]
+            .as_array()
+            .expect("runtime dependencies")
+            .iter()
+            .find(|dependency| dependency["name"] == "mcp_servers")
+            .expect("mcp dependency should be listed");
+
+        assert_eq!(payload["mcp_server_count"], 1);
+        assert_eq!(payload["connected_mcp_server_count"], 0);
+        assert_eq!(mcp_dependency["status"], "ready");
+        assert_eq!(mcp_dependency["configured_count"], 1);
+        assert_eq!(mcp_dependency["enabled_count"], 0);
+        assert_eq!(mcp_dependency["ready_count"], 0);
+        assert_eq!(mcp_dependency["tool_count"], 0);
     }
 
     #[test]

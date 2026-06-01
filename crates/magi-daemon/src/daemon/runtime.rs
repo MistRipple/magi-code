@@ -210,17 +210,21 @@ fn external_mcp_server_catalog_entry(
             .expect("mcp connections read lock poisoned");
         pool.get(&server_id).cloned()
     };
-    let connected = connected_client.is_some();
-    let tool_count = connected_client
-        .as_ref()
-        .and_then(|client| client.list_tools().ok().map(|tools| tools.len()))
-        .or_else(|| {
-            entry
-                .get("toolCount")
-                .or_else(|| entry.get("tool_count"))
-                .and_then(serde_json::Value::as_u64)
-                .map(|count| count as usize)
-        });
+    let connected = enabled && connected_client.is_some();
+    let tool_count = if enabled {
+        connected_client
+            .as_ref()
+            .and_then(|client| client.list_tools().ok().map(|tools| tools.len()))
+            .or_else(|| {
+                entry
+                    .get("toolCount")
+                    .or_else(|| entry.get("tool_count"))
+                    .and_then(serde_json::Value::as_u64)
+                    .map(|count| count as usize)
+            })
+    } else {
+        None
+    };
     let health = if !enabled {
         "disabled"
     } else if connected {
@@ -235,7 +239,11 @@ fn external_mcp_server_catalog_entry(
         connected,
         health: health.to_string(),
         tool_count,
-        error: external_mcp_error_marker(entry),
+        error: if enabled {
+            external_mcp_error_marker(entry)
+        } else {
+            None
+        },
     })
 }
 
@@ -1810,6 +1818,28 @@ mod tests {
             .expect("mcp catalog entry should be built");
 
         assert_eq!(entry.error.as_deref(), Some("mcp_connection_failed"));
+    }
+
+    #[test]
+    fn external_mcp_catalog_keeps_disabled_servers_non_error() {
+        let connections =
+            std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+        let raw = json!({
+            "id": "disabled-mcp",
+            "name": "Disabled MCP",
+            "enabled": false,
+            "toolCount": 3,
+            "error": "/private/raw error"
+        });
+
+        let entry = super::external_mcp_server_catalog_entry(&raw, &connections)
+            .expect("mcp catalog entry should be built");
+
+        assert!(!entry.enabled);
+        assert!(!entry.connected);
+        assert_eq!(entry.health, "disabled");
+        assert_eq!(entry.tool_count, None);
+        assert_eq!(entry.error, None);
     }
 
     #[tokio::test]

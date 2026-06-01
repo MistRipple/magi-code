@@ -572,7 +572,14 @@
                       </div>
                     </div>
                     <div class="header-action" style="display: flex; align-items: center; gap: 6px;">
-                      <span class="apple-indicator" class:success={server.health === 'connected'} class:warning={server.health === 'degraded'} class:error={server.health === 'disconnected' || !server.health} title={getMCPStatusTitle(server)}></span>
+                      <span
+                        class="apple-indicator"
+                        class:success={server.health === 'connected'}
+                        class:warning={server.health === 'degraded'}
+                        class:disabled={server.health === 'disabled' || server.enabled === false}
+                        class:error={server.enabled !== false && (server.health === 'disconnected' || !server.health)}
+                        title={getMCPStatusTitle(server)}
+                      ></span>
                       <span class="mcp-expand-icon" class:expanded={mcpExpandedServer === server.id} style="margin-left: 4px;">
                         <Icon name="chevronDown" size={14} />
                       </span>

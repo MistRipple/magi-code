@@ -1368,6 +1368,18 @@ impl ApiState {
                 .and_then(|v| v.as_bool())
                 .unwrap_or(true);
 
+            if !enabled {
+                let mut pool = self
+                    .mcp_connections
+                    .write()
+                    .expect("mcp connections write lock poisoned");
+                pool.remove(&server_id);
+                entry["connected"] = serde_json::json!(false);
+                entry["health"] = serde_json::json!("disabled");
+                entry.as_object_mut().map(|m| m.remove("error"));
+                continue;
+            }
+
             let already_connected = {
                 let pool = self
                     .mcp_connections
@@ -1389,7 +1401,7 @@ impl ApiState {
                         entry["toolCount"] = serde_json::json!(tools.len());
                     }
                 }
-            } else if enabled {
+            } else {
                 if let Some(config) = build_mcp_config_from_entry(entry) {
                     let client = StdioMcpBridgeClient::new(config);
                     match client.list_tools() {
@@ -1420,10 +1432,6 @@ impl ApiState {
                     entry["health"] = serde_json::json!("disconnected");
                     entry["error"] = serde_json::json!("mcp_invalid_config");
                 }
-            } else {
-                entry["connected"] = serde_json::json!(false);
-                entry["health"] = serde_json::json!("disconnected");
-                entry.as_object_mut().map(|m| m.remove("error"));
             }
         }
     }
