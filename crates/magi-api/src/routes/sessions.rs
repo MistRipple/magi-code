@@ -25,7 +25,7 @@ use serde_json::json;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::session_scope::{
-    parse_session_id, require_registered_workspace_id, require_session_record_in_workspace,
+    parse_session_id, require_registered_workspace_binding, require_session_record_in_workspace,
     session_workspace_id,
 };
 use crate::{
@@ -72,11 +72,17 @@ struct DeleteSessionRequest {
     session_id: String,
     #[serde(default, alias = "workspace_id")]
     workspace_id: Option<String>,
+    #[serde(default, alias = "workspace_path")]
+    workspace_path: Option<String>,
 }
 
 impl DeleteSessionRequest {
     fn requested_workspace_id(&self) -> Option<&str> {
         trimmed_non_empty(self.workspace_id.as_deref())
+    }
+
+    fn requested_workspace_path(&self) -> Option<&str> {
+        trimmed_non_empty(self.workspace_path.as_deref())
     }
 }
 
@@ -90,7 +96,12 @@ async fn submit_session_turn(
         .map_err(|error| ApiError::InvalidInput(format!("图片输入无效: {error}")))?;
     let accepted_at = super::monotonic_accepted_at();
     let requested_workspace_id = request.requested_workspace_id();
-    let workspace_id = require_registered_workspace_id(&state, requested_workspace_id.as_deref())?;
+    let requested_workspace_path = request.requested_workspace_path();
+    let workspace_id = require_request_workspace_id(
+        &state,
+        requested_workspace_id.as_deref(),
+        requested_workspace_path.as_deref(),
+    )?;
     if request.supplement_context {
         return submit_supplement_context_turn(&state, &request, &workspace_id, accepted_at)
             .await
@@ -1470,11 +1481,17 @@ struct SwitchSessionRequest {
     session_id: String,
     #[serde(default, alias = "workspace_id")]
     workspace_id: Option<String>,
+    #[serde(default, alias = "workspace_path")]
+    workspace_path: Option<String>,
 }
 
 impl SwitchSessionRequest {
     fn requested_workspace_id(&self) -> Option<&str> {
         trimmed_non_empty(self.workspace_id.as_deref())
+    }
+
+    fn requested_workspace_path(&self) -> Option<&str> {
+        trimmed_non_empty(self.workspace_path.as_deref())
     }
 }
 
@@ -1484,6 +1501,8 @@ struct SaveSessionRequest {
     session_id: Option<String>,
     #[serde(default, alias = "workspace_id")]
     workspace_id: Option<String>,
+    #[serde(default, alias = "workspace_path")]
+    workspace_path: Option<String>,
 }
 
 impl SaveSessionRequest {
@@ -1494,6 +1513,10 @@ impl SaveSessionRequest {
     fn requested_workspace_id(&self) -> Option<&str> {
         trimmed_non_empty(self.workspace_id.as_deref())
     }
+
+    fn requested_workspace_path(&self) -> Option<&str> {
+        trimmed_non_empty(self.workspace_path.as_deref())
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1502,6 +1525,8 @@ struct ContinueSessionRequest {
     session_id: String,
     #[serde(default, alias = "workspace_id")]
     workspace_id: Option<String>,
+    #[serde(default, alias = "workspace_path")]
+    workspace_path: Option<String>,
     prompt_text: Option<String>,
     #[serde(default)]
     requested_agent_ids: Vec<String>,
@@ -1517,6 +1542,10 @@ impl ContinueSessionRequest {
     fn requested_workspace_id(&self) -> Option<&str> {
         trimmed_non_empty(self.workspace_id.as_deref())
     }
+
+    fn requested_workspace_path(&self) -> Option<&str> {
+        trimmed_non_empty(self.workspace_path.as_deref())
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1525,6 +1554,8 @@ struct InterruptSessionTurnRequest {
     session_id: Option<String>,
     #[serde(default, alias = "workspace_id")]
     workspace_id: Option<String>,
+    #[serde(default, alias = "workspace_path")]
+    workspace_path: Option<String>,
 }
 
 impl InterruptSessionTurnRequest {
@@ -1534,6 +1565,10 @@ impl InterruptSessionTurnRequest {
 
     fn requested_workspace_id(&self) -> Option<&str> {
         trimmed_non_empty(self.workspace_id.as_deref())
+    }
+
+    fn requested_workspace_path(&self) -> Option<&str> {
+        trimmed_non_empty(self.workspace_path.as_deref())
     }
 }
 
@@ -1576,7 +1611,11 @@ fn resolve_interrupt_session_record(
     state: &ApiState,
     request: &InterruptSessionTurnRequest,
 ) -> Result<SessionRecord, ApiError> {
-    let workspace_id = require_registered_workspace_id(state, request.requested_workspace_id())?;
+    let workspace_id = require_request_workspace_id(
+        state,
+        request.requested_workspace_id(),
+        request.requested_workspace_path(),
+    )?;
     let session_id = request
         .requested_session_id()
         .ok_or_else(|| ApiError::InvalidInput("sessionId 不能为空".to_string()))?;
@@ -1877,7 +1916,11 @@ async fn switch_session(
     Json(request): Json<SwitchSessionRequest>,
 ) -> Result<Json<SessionSelectionResponseDto>, ApiError> {
     let session_id = SessionId::new(&request.session_id);
-    let workspace_id = require_registered_workspace_id(&state, request.requested_workspace_id())?;
+    let workspace_id = require_request_workspace_id(
+        &state,
+        request.requested_workspace_id(),
+        request.requested_workspace_path(),
+    )?;
     require_session_record_in_workspace(&state, &session_id, Some(workspace_id.as_str()))?;
     state
         .session_store
@@ -1899,7 +1942,11 @@ async fn continue_session(
     Json(request): Json<ContinueSessionRequest>,
 ) -> Result<Json<ContinueSessionResponseDto>, ApiError> {
     let session_id = SessionId::new(&request.session_id);
-    let workspace_id = require_registered_workspace_id(&state, request.requested_workspace_id())?;
+    let workspace_id = require_request_workspace_id(
+        &state,
+        request.requested_workspace_id(),
+        request.requested_workspace_path(),
+    )?;
     require_session_record_in_workspace(&state, &session_id, Some(workspace_id.as_str()))?;
     let prompt_text = request
         .prompt_text
@@ -2017,7 +2064,11 @@ async fn delete_session(
     State(state): State<ApiState>,
     Json(request): Json<DeleteSessionRequest>,
 ) -> Result<Json<BootstrapDto>, ApiError> {
-    let workspace_id = require_registered_workspace_id(&state, request.requested_workspace_id())?;
+    let workspace_id = require_request_workspace_id(
+        &state,
+        request.requested_workspace_id(),
+        request.requested_workspace_path(),
+    )?;
     let session_id = SessionId::new(&request.session_id);
     require_session_record_in_workspace(&state, &session_id, Some(workspace_id.as_str()))?;
     state
@@ -2038,11 +2089,17 @@ struct RenameSessionRequest {
     name: String,
     #[serde(default, alias = "workspace_id")]
     workspace_id: Option<String>,
+    #[serde(default, alias = "workspace_path")]
+    workspace_path: Option<String>,
 }
 
 impl RenameSessionRequest {
     fn requested_workspace_id(&self) -> Option<&str> {
         trimmed_non_empty(self.workspace_id.as_deref())
+    }
+
+    fn requested_workspace_path(&self) -> Option<&str> {
+        trimmed_non_empty(self.workspace_path.as_deref())
     }
 }
 
@@ -2050,7 +2107,11 @@ async fn rename_session(
     State(state): State<ApiState>,
     Json(request): Json<RenameSessionRequest>,
 ) -> Result<Json<BootstrapDto>, ApiError> {
-    let workspace_id = require_registered_workspace_id(&state, request.requested_workspace_id())?;
+    let workspace_id = require_request_workspace_id(
+        &state,
+        request.requested_workspace_id(),
+        request.requested_workspace_path(),
+    )?;
     let session_id = SessionId::new(&request.session_id);
     require_session_record_in_workspace(&state, &session_id, Some(workspace_id.as_str()))?;
     state
@@ -2070,11 +2131,17 @@ struct CloseSessionRequest {
     session_id: String,
     #[serde(default, alias = "workspace_id")]
     workspace_id: Option<String>,
+    #[serde(default, alias = "workspace_path")]
+    workspace_path: Option<String>,
 }
 
 impl CloseSessionRequest {
     fn requested_workspace_id(&self) -> Option<&str> {
         trimmed_non_empty(self.workspace_id.as_deref())
+    }
+
+    fn requested_workspace_path(&self) -> Option<&str> {
+        trimmed_non_empty(self.workspace_path.as_deref())
     }
 }
 
@@ -2082,7 +2149,11 @@ async fn close_session(
     State(state): State<ApiState>,
     Json(request): Json<CloseSessionRequest>,
 ) -> Result<Json<BootstrapDto>, ApiError> {
-    let workspace_id = require_registered_workspace_id(&state, request.requested_workspace_id())?;
+    let workspace_id = require_request_workspace_id(
+        &state,
+        request.requested_workspace_id(),
+        request.requested_workspace_path(),
+    )?;
     let session_id = SessionId::new(&request.session_id);
     require_session_record_in_workspace(&state, &session_id, Some(workspace_id.as_str()))?;
     state
@@ -2103,7 +2174,11 @@ async fn save_session(
     State(state): State<ApiState>,
     Json(request): Json<SaveSessionRequest>,
 ) -> Result<Json<BootstrapDto>, ApiError> {
-    let workspace_id = require_registered_workspace_id(&state, request.requested_workspace_id())?;
+    let workspace_id = require_request_workspace_id(
+        &state,
+        request.requested_workspace_id(),
+        request.requested_workspace_path(),
+    )?;
     let selected_session_id = if let Some(session_id) = request.requested_session_id() {
         require_session_record_in_workspace(&state, &session_id, Some(workspace_id.as_str()))?;
         Some(session_id)
@@ -2123,6 +2198,8 @@ struct NotificationsQuery {
     session_id: Option<String>,
     #[serde(default, alias = "workspace_id")]
     workspace_id: Option<String>,
+    #[serde(default, alias = "workspace_path")]
+    workspace_path: Option<String>,
 }
 
 impl NotificationsQuery {
@@ -2133,13 +2210,21 @@ impl NotificationsQuery {
     fn requested_workspace_id(&self) -> Option<&str> {
         trimmed_non_empty(self.workspace_id.as_deref())
     }
+
+    fn requested_workspace_path(&self) -> Option<&str> {
+        trimmed_non_empty(self.workspace_path.as_deref())
+    }
 }
 
 async fn get_notifications(
     State(state): State<ApiState>,
     Query(query): Query<NotificationsQuery>,
 ) -> Result<Json<SessionNotificationsResponseDto>, ApiError> {
-    let workspace_id = require_registered_workspace_id(&state, query.requested_workspace_id())?;
+    let workspace_id = require_request_workspace_id(
+        &state,
+        query.requested_workspace_id(),
+        query.requested_workspace_path(),
+    )?;
     let session_id =
         require_notifications_session_id(&state, query.requested_session_id(), &workspace_id)?;
     Ok(Json(build_notifications_response(
@@ -2155,6 +2240,8 @@ struct NotificationScopeRequest {
     session_id: Option<String>,
     #[serde(default, alias = "workspace_id")]
     workspace_id: Option<String>,
+    #[serde(default, alias = "workspace_path")]
+    workspace_path: Option<String>,
 }
 
 impl NotificationScopeRequest {
@@ -2165,6 +2252,10 @@ impl NotificationScopeRequest {
     fn requested_workspace_id(&self) -> Option<&str> {
         trimmed_non_empty(self.workspace_id.as_deref())
     }
+
+    fn requested_workspace_path(&self) -> Option<&str> {
+        trimmed_non_empty(self.workspace_path.as_deref())
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -2173,6 +2264,8 @@ struct AppendNotificationRequest {
     session_id: Option<String>,
     #[serde(default, alias = "workspace_id")]
     workspace_id: Option<String>,
+    #[serde(default, alias = "workspace_path")]
+    workspace_path: Option<String>,
     notification_id: Option<String>,
     kind: Option<String>,
     level: Option<String>,
@@ -2193,6 +2286,10 @@ impl AppendNotificationRequest {
 
     fn requested_workspace_id(&self) -> Option<&str> {
         trimmed_non_empty(self.workspace_id.as_deref())
+    }
+
+    fn requested_workspace_path(&self) -> Option<&str> {
+        trimmed_non_empty(self.workspace_path.as_deref())
     }
 
     fn requested_notification_id(&self) -> Option<String> {
@@ -2221,7 +2318,11 @@ async fn append_session_notification(
     State(state): State<ApiState>,
     Json(request): Json<AppendNotificationRequest>,
 ) -> Result<Json<SessionNotificationsResponseDto>, ApiError> {
-    let workspace_id = require_registered_workspace_id(&state, request.requested_workspace_id())?;
+    let workspace_id = require_request_workspace_id(
+        &state,
+        request.requested_workspace_id(),
+        request.requested_workspace_path(),
+    )?;
     let session_id =
         require_notifications_session_id(&state, request.requested_session_id(), &workspace_id)?;
     if request.persist_to_center == Some(false) {
@@ -2269,7 +2370,11 @@ async fn mark_all_notifications_read(
     State(state): State<ApiState>,
     Json(request): Json<NotificationScopeRequest>,
 ) -> Result<Json<SessionNotificationsResponseDto>, ApiError> {
-    let workspace_id = require_registered_workspace_id(&state, request.requested_workspace_id())?;
+    let workspace_id = require_request_workspace_id(
+        &state,
+        request.requested_workspace_id(),
+        request.requested_workspace_path(),
+    )?;
     let session_id =
         require_notifications_session_id(&state, request.requested_session_id(), &workspace_id)?;
     state
@@ -2289,6 +2394,8 @@ struct ClearNotificationsRequest {
     session_id: Option<String>,
     #[serde(default, alias = "workspace_id")]
     workspace_id: Option<String>,
+    #[serde(default, alias = "workspace_path")]
+    workspace_path: Option<String>,
 }
 
 impl ClearNotificationsRequest {
@@ -2299,13 +2406,21 @@ impl ClearNotificationsRequest {
     fn requested_workspace_id(&self) -> Option<&str> {
         trimmed_non_empty(self.workspace_id.as_deref())
     }
+
+    fn requested_workspace_path(&self) -> Option<&str> {
+        trimmed_non_empty(self.workspace_path.as_deref())
+    }
 }
 
 async fn clear_notifications(
     State(state): State<ApiState>,
     Json(request): Json<ClearNotificationsRequest>,
 ) -> Result<Json<SessionNotificationsResponseDto>, ApiError> {
-    let workspace_id = require_registered_workspace_id(&state, request.requested_workspace_id())?;
+    let workspace_id = require_request_workspace_id(
+        &state,
+        request.requested_workspace_id(),
+        request.requested_workspace_path(),
+    )?;
     let session_id =
         require_notifications_session_id(&state, request.requested_session_id(), &workspace_id)?;
     state
@@ -2325,6 +2440,8 @@ struct RemoveNotificationRequest {
     session_id: Option<String>,
     #[serde(default, alias = "workspace_id")]
     workspace_id: Option<String>,
+    #[serde(default, alias = "workspace_path")]
+    workspace_path: Option<String>,
     notification_id: String,
 }
 
@@ -2337,6 +2454,10 @@ impl RemoveNotificationRequest {
         trimmed_non_empty(self.workspace_id.as_deref())
     }
 
+    fn requested_workspace_path(&self) -> Option<&str> {
+        trimmed_non_empty(self.workspace_path.as_deref())
+    }
+
     fn requested_notification_id(&self) -> Option<String> {
         trimmed_non_empty(Some(self.notification_id.as_str())).map(str::to_string)
     }
@@ -2346,7 +2467,11 @@ async fn remove_notification(
     State(state): State<ApiState>,
     Json(request): Json<RemoveNotificationRequest>,
 ) -> Result<Json<SessionNotificationsResponseDto>, ApiError> {
-    let workspace_id = require_registered_workspace_id(&state, request.requested_workspace_id())?;
+    let workspace_id = require_request_workspace_id(
+        &state,
+        request.requested_workspace_id(),
+        request.requested_workspace_path(),
+    )?;
     let session_id =
         require_notifications_session_id(&state, request.requested_session_id(), &workspace_id)?;
     let notification_id = request
@@ -2398,6 +2523,19 @@ fn require_notifications_session_id(
 
 fn parse_requested_session_id(value: Option<&str>) -> Option<SessionId> {
     trimmed_non_empty(value).map(SessionId::new)
+}
+
+fn require_request_workspace_id(
+    state: &ApiState,
+    requested_workspace_id: Option<&str>,
+    requested_workspace_path: Option<&str>,
+) -> Result<WorkspaceId, ApiError> {
+    Ok(require_registered_workspace_binding(
+        state,
+        requested_workspace_id,
+        requested_workspace_path,
+    )?
+    .workspace_id)
 }
 
 fn trimmed_non_empty(value: Option<&str>) -> Option<&str> {
@@ -2507,6 +2645,7 @@ mod tests {
         SessionTurnRequestDto {
             session_id: None,
             workspace_id: None,
+            workspace_path: None,
             text: Some(text.to_string()),
             skill_name: None,
             images: Vec::new(),
@@ -3423,6 +3562,7 @@ mod tests {
             SessionTurnRequestDto {
                 session_id: None,
                 workspace_id: Some(workspace_id.to_string()),
+                workspace_path: None,
                 text: Some("请只回复一句话".to_string()),
                 skill_name: None,
                 images: Vec::new(),
@@ -3489,6 +3629,7 @@ mod tests {
         let request = SessionTurnRequestDto {
             session_id: None,
             workspace_id: Some(workspace_id.to_string()),
+            workspace_path: None,
             text: Some("识别这张图片".to_string()),
             skill_name: None,
             images: vec![crate::dto::SessionTurnImageDto {
@@ -3566,6 +3707,7 @@ mod tests {
         let request = SessionTurnRequestDto {
             session_id: None,
             workspace_id: Some(workspace_id.to_string()),
+            workspace_path: None,
             text: Some("解释一下流程图的概念".to_string()),
             skill_name: None,
             images: Vec::new(),
@@ -3623,6 +3765,7 @@ mod tests {
         let request = SessionTurnRequestDto {
             session_id: None,
             workspace_id: Some(workspace_id.to_string()),
+            workspace_path: None,
             text: Some("请调用 file_mkdir 工具创建目录".to_string()),
             skill_name: None,
             images: Vec::new(),
@@ -3863,6 +4006,52 @@ mod tests {
                 .contains("workspaceId 不能为空"),
             "unexpected body: {body}"
         );
+    }
+
+    #[tokio::test]
+    async fn switch_session_uses_workspace_path_when_workspace_id_is_stale() {
+        let state = test_state();
+        let workspace_a = WorkspaceId::new("workspace-switch-path-a");
+        let workspace_b = WorkspaceId::new("workspace-switch-path-b");
+        let root_a = unique_temp_dir("session-switch-path-a");
+        let root_b = unique_temp_dir("session-switch-path-b");
+        state
+            .workspace_registry
+            .register(
+                workspace_a.clone(),
+                AbsolutePath::new(root_a.display().to_string()),
+            )
+            .expect("workspace a should register");
+        state
+            .workspace_registry
+            .register(
+                workspace_b.clone(),
+                AbsolutePath::new(root_b.display().to_string()),
+            )
+            .expect("workspace b should register");
+        let session_id = SessionId::new("session-switch-path-a");
+        state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "路径绑定切换",
+                Some(workspace_a.to_string()),
+            )
+            .expect("session should create");
+
+        let (status, body) = post_json(
+            state,
+            "/session/switch",
+            serde_json::json!({
+                "workspaceId": workspace_b.as_str(),
+                "workspacePath": root_a.display().to_string(),
+                "sessionId": session_id.as_str(),
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "unexpected body: {body}");
+        assert_eq!(body["sessionId"], session_id.as_str());
     }
 
     #[tokio::test]

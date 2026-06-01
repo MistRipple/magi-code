@@ -203,9 +203,11 @@ export class RustDaemonClient {
   public async fetchNotifications(
     sessionId: string,
     workspaceId: string,
+    workspacePath?: string,
   ): Promise<SessionNotificationsResponseDto> {
     const params = new URLSearchParams();
     params.set('workspaceId', workspaceId);
+    if (workspacePath) params.set('workspacePath', workspacePath);
     params.set('sessionId', sessionId);
     const query = params.toString();
     return this.getJson<SessionNotificationsResponseDto>(
@@ -555,10 +557,12 @@ export class RustDaemonClient {
     rootTaskId: string,
     sessionId: string,
     workspaceId?: string,
+    workspacePath?: string,
   ): Promise<TaskProjectionDto> {
     const query = new URLSearchParams();
     query.set('sessionId', sessionId);
     if (workspaceId) query.set('workspaceId', workspaceId);
+    if (workspacePath) query.set('workspacePath', workspacePath);
     return this.getJson<TaskProjectionDto>(
       `/api/tasks/projection/${encodeURIComponent(rootTaskId)}?${query.toString()}`,
     );
@@ -568,10 +572,12 @@ export class RustDaemonClient {
     sessionId: string,
     limit?: number,
     workspaceId?: string,
+    workspacePath?: string,
   ): Promise<SessionTaskHistoryResponseDto> {
     const query = new URLSearchParams();
     query.set('sessionId', sessionId);
     if (workspaceId) query.set('workspaceId', workspaceId);
+    if (workspacePath) query.set('workspacePath', workspacePath);
     if (limit !== undefined) {
       query.set('limit', String(limit));
     }
@@ -580,10 +586,16 @@ export class RustDaemonClient {
     );
   }
 
-  public async getTask(taskId: string, sessionId: string, workspaceId?: string): Promise<TaskDto> {
+  public async getTask(
+    taskId: string,
+    sessionId: string,
+    workspaceId?: string,
+    workspacePath?: string,
+  ): Promise<TaskDto> {
     const query = new URLSearchParams();
     query.set('sessionId', sessionId);
     if (workspaceId) query.set('workspaceId', workspaceId);
+    if (workspacePath) query.set('workspacePath', workspacePath);
     return this.getJson<TaskDto>(
       `/api/tasks/${encodeURIComponent(taskId)}?${query.toString()}`,
     );
@@ -593,10 +605,12 @@ export class RustDaemonClient {
     rootTaskId: string,
     sessionId: string,
     workspaceId?: string,
+    workspacePath?: string,
   ): Promise<DeliveryPackageDto> {
     const query = new URLSearchParams();
     query.set('sessionId', sessionId);
     if (workspaceId) query.set('workspaceId', workspaceId);
+    if (workspacePath) query.set('workspacePath', workspacePath);
     return this.getJson<DeliveryPackageDto>(
       `/api/tasks/${encodeURIComponent(rootTaskId)}/delivery-package?${query.toString()}`,
     );

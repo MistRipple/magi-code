@@ -73,15 +73,6 @@ pub(super) fn require_workspace_id(value: Option<&str>) -> Result<WorkspaceId, A
         .ok_or_else(|| ApiError::InvalidInput("workspaceId 不能为空".to_string()))
 }
 
-pub(super) fn require_registered_workspace_id(
-    state: &ApiState,
-    value: Option<&str>,
-) -> Result<WorkspaceId, ApiError> {
-    let workspace_id = require_workspace_id(value)?;
-    registered_workspace_path(state, &workspace_id)?;
-    Ok(workspace_id)
-}
-
 pub(super) fn registered_workspace_path(
     state: &ApiState,
     workspace_id: &WorkspaceId,
@@ -126,10 +117,15 @@ pub(super) fn require_session_workspace_scope(
     state: &ApiState,
     session_id_value: Option<&str>,
     requested_workspace_id: Option<&str>,
+    requested_workspace_path: Option<&str>,
     action: &str,
 ) -> Result<SessionWorkspaceScope, ApiError> {
     let session_id = parse_session_id(session_id_value)?;
-    let requested_workspace_id = require_workspace_id(requested_workspace_id)?;
+    let requested_workspace = require_registered_workspace_binding(
+        state,
+        requested_workspace_id,
+        requested_workspace_path,
+    )?;
     let session = state
         .session_store
         .session(&session_id)
@@ -140,21 +136,16 @@ pub(super) fn require_session_workspace_scope(
         .and_then(|ownership| ownership.workspace_id)
         .or_else(|| session_workspace_id(state, &session))
         .ok_or_else(|| ApiError::InvalidInput(format!("当前会话未绑定 workspace，不能{action}")))?;
-    if bound_workspace_id != requested_workspace_id {
+    if bound_workspace_id != requested_workspace.workspace_id {
         return Err(session_workspace_mismatch(
             &session_id,
-            requested_workspace_id.as_str(),
+            requested_workspace.workspace_id.as_str(),
         ));
     }
-    let workspace_path = state
-        .workspace_root_path(&Some(bound_workspace_id.clone()))
-        .ok_or_else(|| ApiError::not_found("workspace 不存在", bound_workspace_id.as_str()))?
-        .to_string_lossy()
-        .to_string();
     Ok(SessionWorkspaceScope {
         session_id,
         workspace_id: bound_workspace_id,
-        workspace_path,
+        workspace_path: requested_workspace.workspace_path,
     })
 }
 

@@ -1213,6 +1213,7 @@ export async function submitSessionTurn(
       body: JSON.stringify({
         sessionId: binding.sessionId || null,
         workspaceId: binding.workspaceId || null,
+        workspacePath: binding.workspacePath || null,
         text: payload.text ?? null,
         skillName: payload.skillName ?? null,
         accessProfile: payload.accessProfile ?? null,

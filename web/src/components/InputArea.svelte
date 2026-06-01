@@ -128,6 +128,7 @@
 
   const currentSessionId = $derived(messagesState.currentSessionId);
   const currentWorkspaceId = $derived(messagesState.currentWorkspaceId);
+  const currentWorkspacePath = $derived(messagesState.currentWorkspacePath);
   const taskProjection = $derived(getTaskProjectionState(currentSessionId, currentWorkspaceId));
 
   const shouldInterruptTaskProjectionFromComposer = $derived.by(() => {
@@ -687,8 +688,17 @@
         const rootTaskId = projection?.root_task.task_id ?? taskProjection.rootTaskId;
         if (sessionId && rootTaskId) {
           const client = new RustDaemonClient(resolveAgentBaseUrl());
-          await client.interruptTask({ taskId: rootTaskId, sessionId, workspaceId: currentWorkspaceId?.trim() || undefined });
-          await refreshTaskProjection(sessionId, currentWorkspaceId?.trim() || undefined);
+          await client.interruptTask({
+            taskId: rootTaskId,
+            sessionId,
+            workspaceId: currentWorkspaceId?.trim() || undefined,
+            workspacePath: currentWorkspacePath?.trim() || undefined,
+          });
+          await refreshTaskProjection(
+            sessionId,
+            currentWorkspaceId?.trim() || undefined,
+            currentWorkspacePath?.trim() || undefined,
+          );
           addToast('info', i18n.t('input.stopTaskSaved'));
         }
         return;

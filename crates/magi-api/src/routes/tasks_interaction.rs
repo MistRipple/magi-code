@@ -24,9 +24,15 @@ fn require_session_owned_task(
     state: &ApiState,
     session_id_value: Option<&str>,
     workspace_id_value: Option<&str>,
+    workspace_path_value: Option<&str>,
     task_id: &str,
 ) -> Result<(SessionWorkspaceScope, magi_core::Task), ApiError> {
-    let scope = require_task_request_scope(state, session_id_value, workspace_id_value)?;
+    let scope = require_task_request_scope(
+        state,
+        session_id_value,
+        workspace_id_value,
+        workspace_path_value,
+    )?;
     let ownership = state
         .session_store
         .execution_ownership(&scope.session_id)
@@ -54,8 +60,15 @@ fn require_task_request_scope(
     state: &ApiState,
     session_id_value: Option<&str>,
     workspace_id_value: Option<&str>,
+    workspace_path_value: Option<&str>,
 ) -> Result<SessionWorkspaceScope, ApiError> {
-    require_session_workspace_scope(state, session_id_value, workspace_id_value, "执行任务操作")
+    require_session_workspace_scope(
+        state,
+        session_id_value,
+        workspace_id_value,
+        workspace_path_value,
+        "执行任务操作",
+    )
 }
 
 fn turn_contains_task_root(
@@ -112,9 +125,15 @@ fn require_session_historical_task(
     state: &ApiState,
     session_id_value: Option<&str>,
     workspace_id_value: Option<&str>,
+    workspace_path_value: Option<&str>,
     task_id: &str,
 ) -> Result<(SessionWorkspaceScope, magi_core::Task), ApiError> {
-    let scope = require_task_request_scope(state, session_id_value, workspace_id_value)?;
+    let scope = require_task_request_scope(
+        state,
+        session_id_value,
+        workspace_id_value,
+        workspace_path_value,
+    )?;
     let store = state.task_store().ok_or_else(|| {
         ApiError::internal_assembly("session task history guard", "task_store 未配置")
     })?;
@@ -137,6 +156,8 @@ struct TaskIdRequest {
     task_id: String,
     session_id: Option<String>,
     workspace_id: Option<String>,
+    #[serde(default, alias = "workspace_path")]
+    workspace_path: Option<String>,
 }
 
 fn ensure_terminal_root_action(
@@ -177,6 +198,7 @@ async fn interrupt_task(
         &state,
         request.session_id.as_deref(),
         request.workspace_id.as_deref(),
+        request.workspace_path.as_deref(),
         task_id,
     )?;
     let session_id = scope.session_id.clone();
@@ -258,6 +280,7 @@ async fn restart_task(
         &state,
         request.session_id.as_deref(),
         request.workspace_id.as_deref(),
+        request.workspace_path.as_deref(),
         task_id,
     )?;
     let session_id = scope.session_id.clone();
@@ -271,6 +294,7 @@ async fn restart_task(
     let restart_request = SessionTurnRequestDto {
         session_id: Some(session_id.to_string()),
         workspace_id: Some(scope.workspace_id.to_string()),
+        workspace_path: Some(scope.workspace_path.clone()),
         text: Some(restart_text),
         skill_name: root_task
             .executor_binding
@@ -354,6 +378,7 @@ async fn archive_task(
         &state,
         request.session_id.as_deref(),
         request.workspace_id.as_deref(),
+        request.workspace_path.as_deref(),
         task_id,
     )?;
     let session_id = scope.session_id.clone();

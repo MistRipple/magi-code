@@ -45,6 +45,8 @@ fn require_task_store(
 struct SessionScopedTaskQuery {
     session_id: Option<String>,
     workspace_id: Option<String>,
+    #[serde(default, alias = "workspace_path")]
+    workspace_path: Option<String>,
     limit: Option<usize>,
 }
 
@@ -80,11 +82,13 @@ fn require_session_task_scope(
     state: &ApiState,
     session_id_value: Option<&str>,
     workspace_id_value: Option<&str>,
+    workspace_path_value: Option<&str>,
 ) -> Result<SessionTaskScope, ApiError> {
     let workspace = require_session_workspace_scope(
         state,
         session_id_value,
         workspace_id_value,
+        workspace_path_value,
         "读取任务投影",
     )?;
     let ownership = state
@@ -100,9 +104,15 @@ fn require_session_task(
     state: &ApiState,
     session_id_value: Option<&str>,
     workspace_id_value: Option<&str>,
+    workspace_path_value: Option<&str>,
     task_id: &TaskId,
 ) -> Result<SessionTaskScope, ApiError> {
-    let scope = require_session_task_scope(state, session_id_value, workspace_id_value)?;
+    let scope = require_session_task_scope(
+        state,
+        session_id_value,
+        workspace_id_value,
+        workspace_path_value,
+    )?;
     let mission_id = scope
         .mission_id
         .clone()
@@ -281,6 +291,7 @@ async fn get_session_task_history(
         &state,
         query.session_id.as_deref(),
         query.workspace_id.as_deref(),
+        query.workspace_path.as_deref(),
     )?;
     let session_id = scope.workspace.session_id.clone();
     let active_root_task_id = active_session_root_task_id(&state, &session_id);
@@ -374,6 +385,7 @@ async fn get_task_projection(
         &state,
         query.session_id.as_deref(),
         query.workspace_id.as_deref(),
+        query.workspace_path.as_deref(),
         &root_id,
     )?;
     let mut projection = store
@@ -486,6 +498,7 @@ async fn get_task(
         &state,
         query.session_id.as_deref(),
         query.workspace_id.as_deref(),
+        query.workspace_path.as_deref(),
         &id,
     )?;
     let task = store
@@ -509,6 +522,7 @@ async fn get_delivery_package(
         &state,
         query.session_id.as_deref(),
         query.workspace_id.as_deref(),
+        query.workspace_path.as_deref(),
         &root_id,
     )?;
 
@@ -678,6 +692,7 @@ mod tests {
             &state,
             Some(session_id.as_str()),
             Some(workspace_b.as_str()),
+            None,
             &task_id,
         )
         .expect_err("cross workspace task request must be rejected");
@@ -691,6 +706,7 @@ mod tests {
             &state,
             Some(session_id.as_str()),
             Some(workspace_a.as_str()),
+            None,
             &task_id,
         )
         .expect("matching workspace should pass");
@@ -702,5 +718,16 @@ mod tests {
                 .workspace_path
                 .ends_with("magi-task-workspace-a")
         );
+
+        let scope = require_session_task(
+            &state,
+            Some(session_id.as_str()),
+            Some("workspace-stale-query"),
+            Some("/tmp/magi-task-workspace-a"),
+            &task_id,
+        )
+        .expect("registered workspacePath should resolve stale workspace id");
+        assert_eq!(scope.workspace.workspace_id, workspace_a);
+        assert_eq!(scope.workspace.session_id, session_id);
     }
 }

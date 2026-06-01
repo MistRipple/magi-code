@@ -1140,7 +1140,7 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
           setCurrentInterruptTaskId(acceptedActionTaskId);
         }
         if (acceptedRootTaskId) {
-          initTaskTracking(acceptedSessionId, acceptedRootTaskId, currentWorkspaceId);
+          initTaskTracking(acceptedSessionId, acceptedRootTaskId, currentWorkspaceId, currentWorkspacePath);
         }
       }
     }
@@ -1833,7 +1833,7 @@ async function dispatchBootstrap(
     payload.workspace.rootPath,
     payload.sessionId,
   );
-  activateTaskProjectionSession(payload.sessionId, payload.workspace.workspaceId);
+  activateTaskProjectionSession(payload.sessionId, payload.workspace.workspaceId, payload.workspace.rootPath);
   const taskTrackingHints = extractBootstrapTaskTrackingHints(payload, options.rawPayload);
   if (previousSessionId && payload.sessionId && previousSessionId !== payload.sessionId) {
     clearCurrentInterruptTaskId();
@@ -1858,7 +1858,13 @@ async function dispatchBootstrap(
   dispatchRegistryAgents();
 
   if (taskTrackingHints.rootTaskId || taskTrackingHints.activeTaskIds.length > 0) {
-    void autoConnectTaskTracking(payload.sessionId, taskTrackingHints.activeTaskIds, taskTrackingHints.rootTaskId, payload.workspace.workspaceId).catch((error) => {
+    void autoConnectTaskTracking(
+      payload.sessionId,
+      taskTrackingHints.activeTaskIds,
+      taskTrackingHints.rootTaskId,
+      payload.workspace.workspaceId,
+      payload.workspace.rootPath,
+    ).catch((error) => {
       console.warn('[web-client-bridge] Auto-connect task tracking on bootstrap failed (non-critical):', error);
     });
   }
@@ -2113,7 +2119,7 @@ async function dispatchSessionSnapshot(
     payload.workspace.rootPath,
     payload.sessionId,
   );
-  activateTaskProjectionSession(payload.sessionId, payload.workspace.workspaceId);
+  activateTaskProjectionSession(payload.sessionId, payload.workspace.workspaceId, payload.workspace.rootPath);
   const taskTrackingHints = extractBootstrapTaskTrackingHints(payload, rawPayload);
   if (previousSessionId && payload.sessionId && previousSessionId !== payload.sessionId) {
     clearCurrentInterruptTaskId();
@@ -2135,7 +2141,13 @@ async function dispatchSessionSnapshot(
     scheduleRecovery('session_snapshot_event_stream_connect', error, true);
   });
   if (taskTrackingHints.rootTaskId || taskTrackingHints.activeTaskIds.length > 0) {
-    void autoConnectTaskTracking(payload.sessionId, taskTrackingHints.activeTaskIds, taskTrackingHints.rootTaskId, payload.workspace.workspaceId).catch((error) => {
+    void autoConnectTaskTracking(
+      payload.sessionId,
+      taskTrackingHints.activeTaskIds,
+      taskTrackingHints.rootTaskId,
+      payload.workspace.workspaceId,
+      payload.workspace.rootPath,
+    ).catch((error) => {
       console.warn('[web-client-bridge] Auto-connect task tracking on session snapshot failed (non-critical):', error);
     });
   }
@@ -2299,14 +2311,19 @@ async function ensureFreshLiveBridge(reason: string): Promise<void> {
  * Fetches the initial projection and starts auto-refresh + SSE subscription.
  * Defensive: logs warnings on failure but never breaks the caller.
  */
-function initTaskTracking(sessionId: string, rootTaskId: string, workspaceId = currentWorkspaceId): void {
+function initTaskTracking(
+  sessionId: string,
+  rootTaskId: string,
+  workspaceId = currentWorkspaceId,
+  workspacePath = currentWorkspacePath,
+): void {
   console.info('[web-client-bridge] Initializing task tracking for session/root task:', { sessionId, rootTaskId, workspaceId });
-  activateTaskProjectionSession(sessionId, workspaceId);
+  activateTaskProjectionSession(sessionId, workspaceId, workspacePath);
   const currentState = getTaskProjectionState(sessionId, workspaceId);
   if (currentState.rootTaskId && currentState.rootTaskId !== rootTaskId) {
     clearTaskProjection(sessionId, undefined, workspaceId);
   }
-  fetchTaskProjection(sessionId, rootTaskId, workspaceId)
+  fetchTaskProjection(sessionId, rootTaskId, workspaceId, workspacePath)
     .then(() => {
       startTaskAutoRefresh();
     })
@@ -2325,6 +2342,7 @@ export async function autoConnectTaskTracking(
   activeTaskIds: string[],
   preferredRootTaskId = '',
   workspaceId = currentWorkspaceId,
+  workspacePath = currentWorkspacePath,
 ): Promise<void> {
   if (!sessionId || sessionId !== currentSessionId || workspaceId !== currentWorkspaceId) {
     return;
@@ -2335,7 +2353,7 @@ export async function autoConnectTaskTracking(
       return;
     }
     console.info('[web-client-bridge] Auto-connecting task tracking from bootstrap root task:', preferredRootTaskId);
-    initTaskTracking(sessionId, preferredRootTaskId, workspaceId);
+    initTaskTracking(sessionId, preferredRootTaskId, workspaceId, workspacePath);
     return;
   }
 
@@ -2353,7 +2371,7 @@ export async function autoConnectTaskTracking(
     for (const taskId of activeTaskIds) {
       let task;
       try {
-        task = await client.getTask(taskId, sessionId, workspaceId);
+        task = await client.getTask(taskId, sessionId, workspaceId, workspacePath);
       } catch {
         continue;
       }
@@ -2375,7 +2393,7 @@ export async function autoConnectTaskTracking(
         taskId,
         rootTaskId,
       });
-      initTaskTracking(sessionId, rootTaskId, workspaceId);
+      initTaskTracking(sessionId, rootTaskId, workspaceId, workspacePath);
       return;
     }
   } catch (error) {
@@ -2635,7 +2653,7 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
     setCurrentInterruptTaskId(turnResult.actionTaskId || '');
     const rootTaskId = turnResult.rootTaskId;
     if (rootTaskId && resolvedSessionId) {
-      initTaskTracking(resolvedSessionId, rootTaskId, targetWorkspaceId);
+      initTaskTracking(resolvedSessionId, rootTaskId, targetWorkspaceId, targetWorkspacePath);
     }
 
     // 确保 SSE 连接存活以接收增量事件

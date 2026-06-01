@@ -1057,6 +1057,9 @@ impl ApiState {
         requested_workspace_id: Option<WorkspaceId>,
         requested_workspace_path: Option<&str>,
     ) -> Option<WorkspaceId> {
+        if let Some(workspace_id) = self.workspace_id_for_root_path(requested_workspace_path) {
+            return Some(workspace_id);
+        }
         if let Some(workspace_id) = requested_workspace_id {
             if self
                 .workspace_root_path(&Some(workspace_id.clone()))
@@ -1064,9 +1067,8 @@ impl ApiState {
             {
                 return Some(workspace_id);
             }
-            return self.workspace_id_for_root_path(requested_workspace_path);
         }
-        self.workspace_id_for_root_path(requested_workspace_path)
+        None
     }
 
     pub(crate) fn workspace_id_for_root_path(
@@ -2290,6 +2292,13 @@ mod tests {
                 AbsolutePath::new("/tmp/magi-known-from-path"),
             )
             .expect("workspace should register");
+        state
+            .workspace_registry
+            .register(
+                WorkspaceId::new("workspace-stale-registered-url"),
+                AbsolutePath::new("/tmp/magi-stale-registered-url"),
+            )
+            .expect("stale workspace should register");
 
         assert_eq!(
             state.resolve_workspace_id_from_request(
@@ -2301,6 +2310,13 @@ mod tests {
         assert_eq!(
             state.resolve_workspace_id_from_request(
                 Some(WorkspaceId::new("workspace-stale-url")),
+                Some("/tmp/magi-known-from-path"),
+            ),
+            Some(workspace_id.clone())
+        );
+        assert_eq!(
+            state.resolve_workspace_id_from_request(
+                Some(WorkspaceId::new("workspace-stale-registered-url")),
                 Some("/tmp/magi-known-from-path"),
             ),
             Some(workspace_id)

@@ -82,11 +82,12 @@
   // ─── 任务投影视图 ─────────────────
   const currentSessionId = $derived(appState.currentSessionId);
   const currentWorkspaceId = $derived(appState.currentWorkspaceId);
+  const currentWorkspacePath = $derived(messagesState.currentWorkspacePath);
   const taskProjection = $derived(getTaskProjectionState(currentSessionId, currentWorkspaceId));
   const hasTaskProjection = $derived(taskProjection.projection !== null);
 
   $effect(() => {
-    ensureTaskProjectionState(currentSessionId, currentWorkspaceId);
+    ensureTaskProjectionState(currentSessionId, currentWorkspaceId, currentWorkspacePathValue());
   });
 
   $effect(() => {
@@ -177,7 +178,7 @@
     deliveryPackageLoading = true;
     deliveryPackageRequestScope = nextScope;
     const client = createClient();
-    client.getDeliveryPackage(rootTaskId, sid, currentWorkspaceIdValue())
+    client.getDeliveryPackage(rootTaskId, sid, currentWorkspaceIdValue(), currentWorkspacePathValue())
       .then((pkg) => {
         if (deliveryPackageScope === nextScope && deliveryPackageRequestScope === nextScope) {
           deliveryPackage = pkg;
@@ -585,7 +586,7 @@
     if (referenceSelectionScope !== nextScope) {
       referenceSelectionScope = nextScope;
       selectedTaskReference = null;
-      selectTaskProjectionTask(currentSessionId, null, currentWorkspaceIdValue());
+      selectTaskProjectionTask(currentSessionId, null, currentWorkspaceIdValue(), currentWorkspacePathValue());
     }
   });
 
@@ -614,6 +615,12 @@
       : '';
   }
 
+  function currentWorkspacePathValue(): string {
+    return typeof currentWorkspacePath === 'string'
+      ? currentWorkspacePath.trim()
+      : '';
+  }
+
   function taskSessionScope(workspaceId: string, sessionId: string): string {
     return workspaceId ? `${workspaceId}\u0000${sessionId}` : `session:${sessionId}`;
   }
@@ -630,7 +637,12 @@
     taskHistoryError = null;
     const client = createClient();
     try {
-      const response = await client.getSessionTaskHistory(sid, TASK_HISTORY_REQUEST_LIMIT, workspaceId);
+      const response = await client.getSessionTaskHistory(
+        sid,
+        TASK_HISTORY_REQUEST_LIMIT,
+        workspaceId,
+        currentWorkspacePathValue(),
+      );
       if (taskHistoryRequestScope !== requestScope || taskHistoryFetchGeneration !== generation) {
         return;
       }
@@ -690,9 +702,14 @@
     if (!sessionId || !rootTaskId) return;
     await runTaskAction('stop', async () => {
       const client = createClient();
-      await client.interruptTask({ taskId: rootTaskId, sessionId, workspaceId: currentWorkspaceIdValue() });
+      await client.interruptTask({
+        taskId: rootTaskId,
+        sessionId,
+        workspaceId: currentWorkspaceIdValue(),
+        workspacePath: currentWorkspacePathValue(),
+      });
       clearDeliveryPackageViewState();
-      await refreshTaskProjection(sessionId, currentWorkspaceIdValue());
+      await refreshTaskProjection(sessionId, currentWorkspaceIdValue(), currentWorkspacePathValue());
       addToast('info', i18n.t('tasks.action.stopped'));
     }).catch((err) => {
       reportTaskActionFailure('tasks.action.stopFailed', err);
@@ -705,9 +722,13 @@
     if (!sessionId || !rootTaskId) return;
     await runTaskAction('resume', async () => {
       const client = createClient();
-      await client.continueSession({ sessionId, workspaceId: currentWorkspaceIdValue() });
+      await client.continueSession({
+        sessionId,
+        workspaceId: currentWorkspaceIdValue(),
+        workspacePath: currentWorkspacePathValue(),
+      });
       clearDeliveryPackageViewState();
-      await refreshTaskProjection(sessionId, currentWorkspaceIdValue());
+      await refreshTaskProjection(sessionId, currentWorkspaceIdValue(), currentWorkspacePathValue());
       addToast('success', i18n.t('tasks.action.resumed'));
     }).catch((err) => {
       reportTaskActionFailure('tasks.action.resumeFailed', err);
@@ -720,12 +741,17 @@
     if (!sessionId || !rootTaskId) return;
     await runTaskAction('restart', async () => {
       const client = createClient();
-      const result = await client.restartTask({ taskId: rootTaskId, sessionId, workspaceId: currentWorkspaceIdValue() });
+      const result = await client.restartTask({
+        taskId: rootTaskId,
+        sessionId,
+        workspaceId: currentWorkspaceIdValue(),
+        workspacePath: currentWorkspacePathValue(),
+      });
       clearDeliveryPackageViewState();
       if (result.rootTaskId) {
-        await fetchTaskProjection(sessionId, result.rootTaskId, currentWorkspaceIdValue());
+        await fetchTaskProjection(sessionId, result.rootTaskId, currentWorkspaceIdValue(), currentWorkspacePathValue());
       } else {
-        await refreshTaskProjection(sessionId, currentWorkspaceIdValue());
+        await refreshTaskProjection(sessionId, currentWorkspaceIdValue(), currentWorkspacePathValue());
       }
       await refreshSessionTaskHistory();
       addToast('success', i18n.t('tasks.action.restarted'));
@@ -740,7 +766,12 @@
     if (!sessionId || !rootTaskId) return;
     await runTaskAction('archive', async () => {
       const client = createClient();
-      await client.archiveTask({ taskId: rootTaskId, sessionId, workspaceId: currentWorkspaceIdValue() });
+      await client.archiveTask({
+        taskId: rootTaskId,
+        sessionId,
+        workspaceId: currentWorkspaceIdValue(),
+        workspacePath: currentWorkspacePathValue(),
+      });
       clearDeliveryPackageViewState();
       clearTaskProjection(sessionId, rootTaskId, currentWorkspaceIdValue());
       await refreshSessionTaskHistory();
@@ -756,12 +787,17 @@
     restartingHistoryRootTaskId = rootTaskId;
     try {
       const client = createClient();
-      const result = await client.restartTask({ taskId: rootTaskId, sessionId, workspaceId: currentWorkspaceIdValue() });
+      const result = await client.restartTask({
+        taskId: rootTaskId,
+        sessionId,
+        workspaceId: currentWorkspaceIdValue(),
+        workspacePath: currentWorkspacePathValue(),
+      });
       clearDeliveryPackageViewState();
       if (result.rootTaskId) {
-        await fetchTaskProjection(sessionId, result.rootTaskId, currentWorkspaceIdValue());
+        await fetchTaskProjection(sessionId, result.rootTaskId, currentWorkspaceIdValue(), currentWorkspacePathValue());
       } else {
-        await refreshTaskProjection(sessionId, currentWorkspaceIdValue());
+        await refreshTaskProjection(sessionId, currentWorkspaceIdValue(), currentWorkspacePathValue());
       }
       await refreshSessionTaskHistory();
       addToast('success', i18n.t('tasks.action.restarted'));
@@ -813,7 +849,7 @@
   }
 
   function selectProjectionTask(taskId: string) {
-    selectTaskProjectionTask(currentSessionId, taskId, currentWorkspaceIdValue());
+    selectTaskProjectionTask(currentSessionId, taskId, currentWorkspaceIdValue(), currentWorkspacePathValue());
     if (selectedTaskReference?.sourceLabel.startsWith(i18n.t('tasks.reference.source.taskDetailPrefix'))) {
       selectedTaskReference = null;
     }
@@ -1178,7 +1214,7 @@
                 class="task-detail-close"
                 title={i18n.t('tasks.detail.closeTitle')}
                 aria-label={i18n.t('tasks.detail.closeTitle')}
-                onclick={() => selectTaskProjectionTask(currentSessionId, null, currentWorkspaceIdValue())}
+                onclick={() => selectTaskProjectionTask(currentSessionId, null, currentWorkspaceIdValue(), currentWorkspacePathValue())}
               >
                 <Icon name="close" size={11} />
               </button>
