@@ -1,10 +1,9 @@
-use magi_bridge_client::{
-    BridgeBindingKind, ChatToolCall, ChatToolDefinition, ChatToolFunctionDefinition,
-};
+use magi_bridge_client::{ChatToolCall, ChatToolDefinition, ChatToolFunctionDefinition};
 use magi_core::{AccessProfile, ApprovalRequirement, ExecutionResultStatus, RiskLevel, ToolCallId};
 use magi_skill_runtime::{
     CustomToolBinding, SkillDispatchInput, SkillDispatchResult, SkillDispatchRuntime,
     SkillDispatchStatus, SkillRuntime, SkillSelection, SkillToolRuntimePlan,
+    bridge_binding_allowed_in_access_profile,
 };
 use magi_tool_runtime::{ToolExecutionContext, ToolExecutionPolicy};
 use serde_json::Value;
@@ -22,16 +21,11 @@ pub fn build_skill_custom_tool_definitions(
 ) -> Vec<ChatToolDefinition> {
     plan.custom_tool_bindings
         .iter()
-        .filter(|binding| skill_custom_tool_visible_in_access_profile(binding, access_profile))
+        .filter(|binding| {
+            bridge_binding_allowed_in_access_profile(binding.bridge_kind, access_profile)
+        })
         .map(|binding| build_skill_custom_tool_definition(skill_name, binding))
         .collect()
-}
-
-fn skill_custom_tool_visible_in_access_profile(
-    binding: &CustomToolBinding,
-    access_profile: AccessProfile,
-) -> bool {
-    !(access_profile == AccessProfile::ReadOnly && binding.bridge_kind == BridgeBindingKind::Mcp)
 }
 
 pub fn parse_skill_custom_tool_name(tool_name: &str) -> Option<(String, String)> {

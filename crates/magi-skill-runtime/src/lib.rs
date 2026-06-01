@@ -7,7 +7,7 @@ use magi_bridge_client::{
     BridgeBindingDispatchPlan, BridgeBindingKind, BridgeClientError, BridgeDispatchAction,
     BridgeDispatchResult, BridgeDispatchRuntime, BridgeErrorLayer,
 };
-use magi_core::{ApprovalRequirement, RiskLevel, ToolCallId};
+use magi_core::{AccessProfile, ApprovalRequirement, RiskLevel, ToolCallId};
 use magi_tool_runtime::{
     ToolExecutionContext, ToolExecutionOutput, ToolExecutionPolicy, ToolRegistry,
 };
@@ -81,6 +81,14 @@ pub struct SkillToolRuntimePlan {
     pub prompt_injections: Vec<SkillPromptInjection>,
     pub custom_tool_bindings: Vec<CustomToolBinding>,
     pub bridge_dispatch_plan: BridgeBindingDispatchPlan,
+}
+
+/// Skill 外接桥接工具在访问模式下的统一可达性策略。
+pub fn bridge_binding_allowed_in_access_profile(
+    bridge_kind: BridgeBindingKind,
+    access_profile: AccessProfile,
+) -> bool {
+    !(access_profile == AccessProfile::ReadOnly && bridge_kind == BridgeBindingKind::Mcp)
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -940,6 +948,83 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(audit_events.len(), 1);
         assert_eq!(audit_events[0].payload["tool_kind"], "Mcp");
+    }
+
+    #[test]
+    fn mcp_bridge_requests_are_rejected_in_read_only_profile() {
+        let governance = Arc::new(GovernanceService::default());
+        let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(16));
+        let mut tool_registry = ToolRegistry::new(Arc::clone(&governance), Arc::clone(&event_bus));
+        tool_registry.register_builtin(Arc::new(EchoTool));
+
+        let skill_registry = SkillRegistry::new();
+        skill_registry.register(SkillDefinition {
+            skill_id: "skill-mcp-read-only".to_string(),
+            title: "MCP Read Only Skill".to_string(),
+            instruction: "instruction".to_string(),
+            metadata: SkillMetadata {
+                category: "general".to_string(),
+                tags: vec!["mcp".to_string()],
+            },
+            allowed_tools: vec![],
+            custom_tool_bindings: vec![CustomToolBinding {
+                binding_id: "binding-mcp-read-only".to_string(),
+                tool_name: "echo.inspect".to_string(),
+                description: "inspect".to_string(),
+                bridge_kind: BridgeBindingKind::Mcp,
+                dispatch_action: BridgeDispatchAction::McpToolCall,
+                bridge_target: "loopback-mcp".to_string(),
+            }],
+            prompt_priority: 10,
+        });
+
+        let mcp_client = TestMcpClient::default();
+        let calls = mcp_client.calls.clone();
+        let runtime = SkillDispatchRuntime::new(
+            tool_registry.clone(),
+            BridgeDispatchRuntime::new().with_mcp_client(Arc::new(mcp_client)),
+        );
+        let mut plan = skill_registry.build_tool_runtime_plan(&SkillSelection {
+            skill_ids: vec!["skill-mcp-read-only".to_string()],
+            requested_tools: vec!["echo.inspect".to_string()],
+        });
+        plan.tool_policy.access_profile = AccessProfile::ReadOnly;
+
+        let outcome = runtime.dispatch_observed(
+            &plan,
+            SkillDispatchInput {
+                tool_call_id: ToolCallId::new("call-mcp-read-only"),
+                tool_name: "echo.inspect".to_string(),
+                binding_id: Some("binding-mcp-read-only".to_string()),
+                payload: "payload".to_string(),
+                approval_requirement: ApprovalRequirement::None,
+                risk_level: RiskLevel::Low,
+                context: ToolExecutionContext::default(),
+                working_directory: None,
+            },
+        );
+
+        assert_eq!(outcome.observation.status, SkillDispatchStatus::Rejected);
+        let output = match outcome.result {
+            Ok(SkillDispatchResult::Preflight { output }) => output,
+            other => panic!("unexpected result: {other:?}"),
+        };
+        assert_eq!(output.status, magi_core::ExecutionResultStatus::Rejected);
+        assert!(
+            output
+                .payload
+                .contains("只读访问模式不允许调用 MCP 外接工具"),
+            "{}",
+            output.payload
+        );
+        assert!(calls.lock().expect("mcp calls lock").is_empty());
+        let invocations = tool_registry.invocations();
+        assert_eq!(invocations.len(), 1);
+        assert_eq!(invocations[0].tool_kind, magi_governance::ToolKind::Mcp);
+        assert_eq!(
+            invocations[0].status,
+            magi_core::ExecutionResultStatus::Rejected
+        );
     }
 
     #[test]

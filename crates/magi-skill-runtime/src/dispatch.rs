@@ -1,6 +1,7 @@
 use crate::{
     SkillDispatchError, SkillDispatchExecutionOutcome, SkillDispatchInput, SkillDispatchResult,
     SkillDispatchRoute, SkillDispatchRuntime, SkillToolRuntimePlan,
+    bridge_binding_allowed_in_access_profile,
     observation::build_dispatch_observation,
     routing::{resolve_bridge_binding_id, resolve_observation_binding, resolve_route},
 };
@@ -182,9 +183,10 @@ fn bridge_preflight_output(
     input: &ToolExecutionInput,
     binding: &BridgeBindingReference,
 ) -> Option<ToolExecutionOutput> {
-    if plan.tool_policy.access_profile == magi_core::AccessProfile::ReadOnly
-        && binding.bridge_kind == BridgeBindingKind::Mcp
-    {
+    if !bridge_binding_allowed_in_access_profile(
+        binding.bridge_kind,
+        plan.tool_policy.access_profile,
+    ) {
         let reason = format!("只读访问模式不允许调用 MCP 外接工具: {}", binding.tool_name);
         return Some(ToolExecutionOutput {
             tool_call_id: input.tool_call_id.clone(),
