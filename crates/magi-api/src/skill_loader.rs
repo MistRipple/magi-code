@@ -1,4 +1,7 @@
-use crate::settings_store::SettingsStore;
+use crate::{
+    scope_binding::{strip_scope_binding_fields, strip_scope_binding_fields_from_map},
+    settings_store::SettingsStore,
+};
 use magi_bridge_client::{BridgeBindingKind, BridgeDispatchAction};
 use magi_skill_runtime::{
     CustomToolBinding, SkillDefinition, SkillMetadata, SkillRegistry, SkillRuntime,
@@ -35,7 +38,22 @@ fn normalize_wrapped_section_value(value: &mut Value) {
 fn normalize_skills_config_value(value: Value) -> Map<String, Value> {
     let mut value = value;
     normalize_wrapped_section_value(&mut value);
-    value.as_object().cloned().unwrap_or_default()
+    strip_scope_binding_fields(&mut value);
+    let mut config = value.as_object().cloned().unwrap_or_default();
+    normalize_skills_config_entries(&mut config);
+    config
+}
+
+fn normalize_skills_config_entries(config: &mut Map<String, Value>) {
+    strip_scope_binding_fields_from_map(config);
+    for key in ["instructionSkills", "customTools"] {
+        let Some(entries) = config.get_mut(key).and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for entry in entries {
+            strip_scope_binding_fields(entry);
+        }
+    }
 }
 
 fn ensure_array_entry_mut<'a>(map: &'a mut Map<String, Value>, key: &str) -> &'a mut Vec<Value> {
@@ -238,6 +256,7 @@ fn canonical_skills_config_from_snapshot(
         &mut config,
         snapshot.remove(TOP_LEVEL_INSTRUCTION_SKILLS_SECTION),
     );
+    normalize_skills_config_entries(&mut config);
     config
 }
 
@@ -622,5 +641,51 @@ mod tests {
             store.get_section("skillsConfig")["instructionSkills"][0]["skillId"],
             serde_json::json!("saved-skill")
         );
+    }
+
+    #[test]
+    fn save_skills_config_object_strips_scope_binding_fields() {
+        let store = SettingsStore::new();
+
+        save_skills_config_object(
+            &store,
+            serde_json::json!({
+                "workspaceId": "workspace-old",
+                "workspace_path": "/tmp/old",
+                "sessionId": "session-old",
+                "instructionSkills": [
+                    {
+                        "skillId": "saved-skill",
+                        "workspaceId": "workspace-old",
+                        "session_id": "session-old"
+                    }
+                ],
+                "customTools": [
+                    {
+                        "name": "saved-tool",
+                        "workspacePath": "/tmp/old",
+                        "sessionId": "session-old"
+                    }
+                ]
+            })
+            .as_object()
+            .cloned()
+            .expect("skills config should be an object"),
+        );
+
+        let saved = store.get_section("skillsConfig");
+        for key in [
+            "workspaceId",
+            "workspace_path",
+            "sessionId",
+            "workspacePath",
+            "session_id",
+        ] {
+            assert!(saved.get(key).is_none());
+        }
+        assert!(saved["instructionSkills"][0].get("workspaceId").is_none());
+        assert!(saved["instructionSkills"][0].get("session_id").is_none());
+        assert!(saved["customTools"][0].get("workspacePath").is_none());
+        assert!(saved["customTools"][0].get("sessionId").is_none());
     }
 }

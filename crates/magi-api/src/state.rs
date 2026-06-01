@@ -14,6 +14,7 @@ use crate::routes::settings::{
     builtin_role_templates, load_registry_engines, registered_role_template_ids,
     resolve_registry_agents,
 };
+use crate::scope_binding::strip_scope_binding_fields;
 use crate::settings_store::SettingsStore;
 use crate::skill_loader;
 use magi_bridge_client::{
@@ -1757,21 +1758,6 @@ fn normalize_wrapped_section_value(value: &mut serde_json::Value) {
         }
     }
     strip_scope_binding_fields(value);
-}
-
-fn strip_scope_binding_fields(value: &mut serde_json::Value) {
-    if let Some(object) = value.as_object_mut() {
-        for key in [
-            "workspaceId",
-            "workspace_id",
-            "workspacePath",
-            "workspace_path",
-            "sessionId",
-            "session_id",
-        ] {
-            object.remove(key);
-        }
-    }
 }
 
 fn seed_user_rules_config(snapshot: &mut HashMap<String, serde_json::Value>) {

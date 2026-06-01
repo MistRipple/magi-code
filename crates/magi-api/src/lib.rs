@@ -6,6 +6,7 @@ mod errors;
 mod mcp_config;
 mod model_config;
 mod routes;
+mod scope_binding;
 pub(crate) mod session_continue;
 pub mod session_title;
 pub mod settings_store;

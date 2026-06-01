@@ -1,17 +1,9 @@
-use crate::errors::ApiError;
+use crate::{errors::ApiError, scope_binding::strip_scope_binding_fields_from_map};
 use magi_bridge_client::McpServerConfig;
 use serde_json::Value;
 use std::{collections::BTreeMap, path::PathBuf};
 
 pub(crate) const REDACTED_MCP_ENV_VALUE: &str = "********";
-const SCOPE_BINDING_FIELDS: [&str; 6] = [
-    "workspaceId",
-    "workspace_id",
-    "workspacePath",
-    "workspace_path",
-    "sessionId",
-    "session_id",
-];
 
 fn unwrap_mcp_server_payload<'a>(request: &'a Value) -> &'a Value {
     request
@@ -68,9 +60,7 @@ pub(crate) fn normalize_mcp_server_snapshot_entry(entry: &Value) -> Option<Value
     object.insert("type".to_string(), serde_json::json!("stdio"));
     object.remove("url");
     object.remove("headers");
-    for field in SCOPE_BINDING_FIELDS {
-        object.remove(field);
-    }
+    strip_scope_binding_fields_from_map(&mut object);
     Some(Value::Object(object))
 }
 

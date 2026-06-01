@@ -14,7 +14,10 @@ use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
 
 use super::session_scope;
-use crate::{errors::ApiError, model_config::NormalizedModelConfig, state::ApiState};
+use crate::{
+    errors::ApiError, model_config::NormalizedModelConfig,
+    scope_binding::without_scope_binding_fields, state::ApiState,
+};
 
 fn unwrap_settings_section_request(request: &serde_json::Value) -> serde_json::Value {
     request
@@ -24,24 +27,8 @@ fn unwrap_settings_section_request(request: &serde_json::Value) -> serde_json::V
         .unwrap_or_else(|| request.clone())
 }
 
-fn strip_scope_binding_fields(mut request: serde_json::Value) -> serde_json::Value {
-    if let Some(object) = request.as_object_mut() {
-        for key in [
-            "workspaceId",
-            "workspace_id",
-            "workspacePath",
-            "workspace_path",
-            "sessionId",
-            "session_id",
-        ] {
-            object.remove(key);
-        }
-    }
-    request
-}
-
 fn scoped_settings_section_request(request: &serde_json::Value) -> serde_json::Value {
-    strip_scope_binding_fields(unwrap_settings_section_request(request))
+    without_scope_binding_fields(unwrap_settings_section_request(request))
 }
 
 fn parse_optional_query_string(

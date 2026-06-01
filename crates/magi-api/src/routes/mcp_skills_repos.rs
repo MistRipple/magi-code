@@ -17,6 +17,7 @@ use crate::{
         normalize_mcp_server_snapshot_entry, preserve_redacted_mcp_env_values,
         redact_mcp_server_public_entry,
     },
+    scope_binding::strip_scope_binding_fields_from_map,
     skill_loader,
     state::ApiState,
 };
@@ -120,6 +121,7 @@ fn normalize_instruction_skill_entry(
         .filter(|value| !value.is_empty())
         .ok_or_else(|| ApiError::InvalidInput("skillId 不能为空".to_string()))?;
     let mut entry = raw.as_object().cloned().unwrap_or_default();
+    strip_scope_binding_fields_from_map(&mut entry);
     entry.insert("name".to_string(), serde_json::json!(skill_id));
     entry.insert("skillName".to_string(), serde_json::json!(skill_id));
     entry.insert("skillId".to_string(), serde_json::json!(skill_id));
@@ -357,6 +359,7 @@ fn normalize_repository_entry(request: &serde_json::Value) -> Result<serde_json:
         .or(repository_url)
         .ok_or_else(|| ApiError::InvalidInput("repositoryId 或 url 不能为空".to_string()))?;
     let mut entry = raw.as_object().cloned().unwrap_or_default();
+    strip_scope_binding_fields_from_map(&mut entry);
     entry.insert("repositoryId".to_string(), serde_json::json!(repository_id));
     if entry
         .get("url")
@@ -670,13 +673,30 @@ async fn refresh_mcp_tools(
 // ─── Repositories ───────────────────────────────────────────────────────────
 
 async fn list_repositories(State(state): State<ApiState>) -> Json<serde_json::Value> {
-    let repos = state
+    let stored_repos = state
         .settings_store
         .get_section("repositories")
         .as_array()
         .cloned()
         .unwrap_or_default();
+    let repos = stored_repos
+        .iter()
+        .cloned()
+        .map(clean_repository_scope_fields)
+        .collect::<Vec<_>>();
+    if repos != stored_repos {
+        state
+            .settings_store
+            .set_section("repositories", serde_json::Value::Array(repos.clone()));
+    }
     Json(serde_json::json!({ "repositories": repos }))
+}
+
+fn clean_repository_scope_fields(mut entry: serde_json::Value) -> serde_json::Value {
+    if let Some(object) = entry.as_object_mut() {
+        strip_scope_binding_fields_from_map(object);
+    }
+    entry
 }
 
 async fn add_repository(
@@ -995,6 +1015,7 @@ async fn add_custom_tool(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let raw = unwrap_request_value(&request, &["tool"]);
     let mut entry = raw.as_object().cloned().unwrap_or_default();
+    strip_scope_binding_fields_from_map(&mut entry);
     let tool_name = entry
         .get("name")
         .and_then(|v| v.as_str())
@@ -1382,6 +1403,7 @@ async fn get_instruction_skill_preview(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scope_binding::SCOPE_BINDING_FIELDS;
     use axum::{
         body::{Body, to_bytes},
         http::{Request, StatusCode},
@@ -1536,6 +1558,133 @@ mod tests {
                 "MCP server settings are global and must not persist {key}"
             );
         }
+    }
+
+    fn assert_scope_fields_absent(value: &serde_json::Value) {
+        for key in SCOPE_BINDING_FIELDS {
+            assert!(
+                value.get(key).is_none(),
+                "global settings must not persist scope field {key}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn repository_save_strips_workspace_session_scope_fields() {
+        let state = test_state();
+        let app = Router::new().merge(routes()).with_state(state.clone());
+
+        let body = post_json(
+            app,
+            "/settings/repositories/add",
+            serde_json::json!({
+                "url": "https://github.com/example/skills",
+                "workspaceId": "workspace-old",
+                "workspace_path": "/tmp/old",
+                "sessionId": "session-old"
+            }),
+        )
+        .await;
+
+        assert_eq!(body["added"], true);
+        let stored = state.settings_store.get_section("repositories");
+        assert_scope_fields_absent(&stored[0]);
+    }
+
+    #[tokio::test]
+    async fn repository_list_cleans_legacy_scope_fields() {
+        let state = test_state();
+        state.settings_store.set_section(
+            "repositories",
+            serde_json::json!([
+                {
+                    "repositoryId": "legacy-repo",
+                    "url": "https://github.com/example/skills",
+                    "workspaceId": "workspace-old",
+                    "workspace_path": "/tmp/old",
+                    "sessionId": "session-old"
+                }
+            ]),
+        );
+        let app = Router::new().merge(routes()).with_state(state.clone());
+
+        let body = get_json(app, "/settings/repositories").await;
+
+        assert_scope_fields_absent(&body["repositories"][0]);
+        let stored = state.settings_store.get_section("repositories");
+        assert_scope_fields_absent(&stored[0]);
+    }
+
+    #[test]
+    fn instruction_skill_normalization_strips_workspace_session_scope_fields() {
+        let normalized = normalize_instruction_skill_entry(&serde_json::json!({
+            "skillId": "example/skill",
+            "workspaceId": "workspace-old",
+            "workspace_path": "/tmp/old",
+            "sessionId": "session-old"
+        }))
+        .expect("skill should normalize");
+
+        assert_scope_fields_absent(&normalized);
+    }
+
+    #[tokio::test]
+    async fn skills_config_save_strips_workspace_session_scope_fields() {
+        let state = test_state();
+        let app = Router::new().merge(routes()).with_state(state.clone());
+
+        let body = post_json(
+            app,
+            "/settings/skills/config/save",
+            serde_json::json!({
+                "workspaceId": "workspace-old",
+                "workspace_path": "/tmp/old",
+                "sessionId": "session-old",
+                "instructionSkills": [
+                    {
+                        "skillId": "example/skill",
+                        "workspaceId": "workspace-old",
+                        "session_id": "session-old"
+                    }
+                ],
+                "customTools": [
+                    {
+                        "name": "example-tool",
+                        "workspacePath": "/tmp/old",
+                        "sessionId": "session-old"
+                    }
+                ]
+            }),
+        )
+        .await;
+
+        assert_eq!(body["saved"], true);
+        let stored = state.settings_store.get_section("skillsConfig");
+        assert_scope_fields_absent(&stored);
+        assert_scope_fields_absent(&stored["instructionSkills"][0]);
+        assert_scope_fields_absent(&stored["customTools"][0]);
+    }
+
+    #[tokio::test]
+    async fn custom_tool_add_strips_workspace_session_scope_fields() {
+        let state = test_state();
+        let app = Router::new().merge(routes()).with_state(state.clone());
+
+        let body = post_json(
+            app,
+            "/settings/skills/custom-tool/add",
+            serde_json::json!({
+                "name": "example-tool",
+                "workspaceId": "workspace-old",
+                "workspace_path": "/tmp/old",
+                "sessionId": "session-old"
+            }),
+        )
+        .await;
+
+        assert_eq!(body["added"], true);
+        let stored = state.settings_store.get_section("skillsConfig");
+        assert_scope_fields_absent(&stored["customTools"][0]);
     }
 
     #[tokio::test]
