@@ -7,7 +7,7 @@
 //! - `task_policy_tool_decision` / `safety_gate_tool_decision` 等支撑判定。
 
 use std::{
-    path::{Component, PathBuf},
+    path::{Component, Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -1835,7 +1835,7 @@ fn effective_allowed_paths(
         return normalized;
     }
     workspace_root_path
-        .map(|root| vec![normalize_permission_path(root.clone())])
+        .map(|root| vec![canonicalize_permission_path(root.as_path())])
         .unwrap_or_default()
 }
 
@@ -1861,7 +1861,7 @@ fn resolve_policy_path(path: &str, workspace_root_path: Option<&PathBuf>) -> Pat
     } else {
         path
     };
-    normalize_permission_path(resolved)
+    canonicalize_permission_path(resolved.as_path())
 }
 
 fn resolve_tool_path(path: &str, workspace_root_path: Option<&PathBuf>) -> PathBuf {
@@ -1888,6 +1888,33 @@ fn normalize_permission_path(path: PathBuf) -> PathBuf {
         }
     }
     normalized
+}
+
+fn canonicalize_permission_path(path: &Path) -> PathBuf {
+    let lexical_path = normalize_permission_path(path.to_path_buf());
+    if let Ok(canonical_path) = lexical_path.canonicalize() {
+        return normalize_permission_path(canonical_path);
+    }
+    canonicalize_existing_permission_ancestor(&lexical_path).unwrap_or(lexical_path)
+}
+
+fn canonicalize_existing_permission_ancestor(path: &Path) -> Option<PathBuf> {
+    let mut ancestor = path.to_path_buf();
+    let mut missing_components = Vec::new();
+    loop {
+        if let Ok(canonical_ancestor) = ancestor.canonicalize() {
+            let mut resolved = normalize_permission_path(canonical_ancestor);
+            for component in missing_components.iter().rev() {
+                resolved.push(component);
+            }
+            return Some(normalize_permission_path(resolved));
+        }
+        let component = ancestor.file_name()?.to_os_string();
+        missing_components.push(component);
+        if !ancestor.pop() {
+            return None;
+        }
+    }
 }
 
 fn tool_path_access_requests(
@@ -2795,6 +2822,60 @@ mod tests {
                 Some(&workspace_root),
             )
             .expect("restricted default scope should reject outside read path");
+            let payload: serde_json::Value =
+                serde_json::from_str(&decision.payload).expect("decision should be json");
+
+            assert_eq!(decision.status, ExecutionResultStatus::Rejected);
+            assert!(
+                payload["error"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("策略未授权访问路径"),
+                "unexpected payload: {payload}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restricted_default_scope_rejects_symlink_escape_paths() {
+        let workspace = tempdir().expect("workspace tempdir");
+        let outside = tempdir().expect("outside tempdir");
+        let workspace_root = workspace.path().to_path_buf();
+        let outside_secret = outside.path().join("secret.txt");
+        std::fs::write(&outside_secret, "secret").expect("write outside secret");
+        std::os::unix::fs::symlink(&outside_secret, workspace_root.join("linked-secret.txt"))
+            .expect("create file symlink");
+        std::os::unix::fs::symlink(outside.path(), workspace_root.join("linked-dir"))
+            .expect("create dir symlink");
+
+        let mut task = test_task(
+            "task-restricted-default-symlink-path-scope",
+            "task-restricted-default-symlink-path-scope",
+            None,
+        );
+        task.policy_snapshot = Some(default_agent_spawn_policy());
+
+        for (tool, arguments) in [
+            (
+                BuiltinToolName::FileRead,
+                serde_json::json!({ "path": "linked-secret.txt" }),
+            ),
+            (
+                BuiltinToolName::FileWrite,
+                serde_json::json!({
+                    "path": "linked-dir/new-file.txt",
+                    "content": "outside"
+                }),
+            ),
+        ] {
+            let decision = task_policy_tool_decision_with_workspace_root(
+                &task,
+                tool.as_str(),
+                &arguments.to_string(),
+                Some(&workspace_root),
+            )
+            .expect("restricted default scope should reject symlink escape path");
             let payload: serde_json::Value =
                 serde_json::from_str(&decision.payload).expect("decision should be json");
 
