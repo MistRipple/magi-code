@@ -1400,6 +1400,53 @@ function bootstrapBindingKey(
   });
 }
 
+function buildBootstrapQuery(
+  binding: { workspaceId: string; workspacePath: string; sessionId: string },
+): string {
+  const query = new URLSearchParams();
+  if (binding.workspaceId) {
+    query.set('workspaceId', binding.workspaceId);
+  }
+  if (binding.workspacePath) {
+    query.set('workspacePath', binding.workspacePath);
+  }
+  if (binding.sessionId) {
+    query.set('sessionId', binding.sessionId);
+  }
+  return query.toString();
+}
+
+async function readAgentErrorPayload(response: Response): Promise<{ errorCode?: string; message?: string }> {
+  const contentType = response.headers.get('content-type') || '';
+  if (!contentType.includes('application/json')) {
+    return {};
+  }
+  try {
+    const payload = await response.json() as { error_code?: string; code?: string; message?: string; error?: string };
+    const errorCode = typeof payload.error_code === 'string' && payload.error_code.trim()
+      ? payload.error_code.trim()
+      : (typeof payload.code === 'string' && payload.code.trim() ? payload.code.trim() : undefined);
+    const message = typeof payload.message === 'string' && payload.message.trim()
+      ? payload.message.trim()
+      : (typeof payload.error === 'string' && payload.error.trim() ? payload.error.trim() : undefined);
+    return { errorCode, message };
+  } catch {
+    return {};
+  }
+}
+
+function isStaleSessionBindingError(
+  status: number,
+  error: { errorCode?: string; message?: string },
+  requestedSessionId: string,
+): boolean {
+  return status === 400
+    && requestedSessionId.trim().length > 0
+    && error.errorCode === 'INPUT_INVALID'
+    && typeof error.message === 'string'
+    && error.message.includes('不属于 workspace');
+}
+
 function isCurrentBootstrapRequest(bindingKey: string, requestSeq: number): boolean {
   return requestSeq === bootstrapRequestSeq
     && bindingKey === bootstrapBindingKey(resolveWorkspaceQuery());
@@ -1842,18 +1889,19 @@ async function fetchBootstrap(
   }
   const requestSeq = ++bootstrapRequestSeq;
   const doFetch = async (): Promise<void> => {
-    const { workspaceId, workspacePath, sessionId } = requestBinding;
-    const query = new URLSearchParams();
-    if (workspaceId) {
-      query.set('workspaceId', workspaceId);
+    let effectiveBinding = requestBinding;
+    let response = await getTransport().request(agentUrl('/bootstrap', buildBootstrapQuery(effectiveBinding)));
+    let errorPayload: { errorCode?: string; message?: string } = {};
+    if (!response.ok) {
+      errorPayload = await readAgentErrorPayload(response);
+      if (isStaleSessionBindingError(response.status, errorPayload, requestBinding.sessionId)) {
+        effectiveBinding = { ...requestBinding, sessionId: '' };
+        response = await getTransport().request(agentUrl('/bootstrap', buildBootstrapQuery(effectiveBinding)));
+        if (!response.ok) {
+          errorPayload = await readAgentErrorPayload(response);
+        }
+      }
     }
-    if (workspacePath) {
-      query.set('workspacePath', workspacePath);
-    }
-    if (sessionId) {
-      query.set('sessionId', sessionId);
-    }
-    const response = await getTransport().request(agentUrl('/bootstrap', query.toString()));
     if (!response.ok) {
       if (response.status === 404) {
         const workspaces = await listAgentWorkspaces();
@@ -1862,13 +1910,18 @@ async function fetchBootstrap(
           return;
         }
       }
-      throw new Error(`bootstrap failed: ${response.status}`);
+      throw new AgentApiError(
+        response.status,
+        errorPayload.message || `bootstrap failed: ${response.status}`,
+        'bootstrap',
+        errorPayload.errorCode,
+      );
     }
     const rawPayload = await response.json();
     const payload = normalizeBootstrapResponse(rawPayload, {
-      workspaceId,
-      workspacePath,
-      sessionId,
+      workspaceId: effectiveBinding.workspaceId,
+      workspacePath: effectiveBinding.workspacePath,
+      sessionId: effectiveBinding.sessionId,
     });
     if (!isCurrentBootstrapRequest(requestBindingKey, requestSeq)) {
       return;

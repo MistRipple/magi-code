@@ -18,7 +18,7 @@ use axum::{
     extract::{Query, State},
     routing::get,
 };
-use magi_core::{SessionId, UtcMillis, WorkspaceId};
+use magi_core::{SessionId, UtcMillis};
 use serde::Deserialize;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -99,64 +99,47 @@ struct BootstrapQuery {
     workspace_path: Option<String>,
 }
 
-impl BootstrapQuery {
-    fn requested_session_id(&self) -> Option<SessionId> {
-        self.session_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|session_id| !session_id.is_empty())
-            .map(SessionId::new)
-    }
-
-    fn requested_workspace_id(&self) -> Option<String> {
-        self.workspace_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|id| !id.is_empty())
-            .map(String::from)
-    }
-}
-
 async fn bootstrap(
     State(state): State<ApiState>,
     Query(query): Query<BootstrapQuery>,
 ) -> Result<Json<BootstrapDto>, ApiError> {
-    let requested_session_id = query.requested_session_id();
-    let workspace_id = resolve_bootstrap_workspace_id(
-        &state,
-        query.requested_workspace_id(),
-        query.workspace_path.clone(),
-        requested_session_id.as_ref(),
-    );
+    let scope = resolve_bootstrap_scope(&state, &query)?;
     Ok(Json(state.bootstrap_dto_for_workspace_session(
-        workspace_id.as_deref(),
-        requested_session_id.as_ref(),
+        scope.workspace_id.as_deref(),
+        scope.session_id.as_ref(),
     )?))
 }
 
-fn resolve_bootstrap_workspace_id(
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BootstrapScope {
+    workspace_id: Option<String>,
+    session_id: Option<SessionId>,
+}
+
+fn resolve_bootstrap_scope(
     state: &ApiState,
-    requested_workspace_id: Option<String>,
-    requested_workspace_path: Option<String>,
-    requested_session_id: Option<&SessionId>,
-) -> Option<String> {
-    let requested_workspace_id = state.resolve_workspace_id_from_request(
-        requested_workspace_id.map(WorkspaceId::new),
-        requested_workspace_path.as_deref(),
-    );
-    if let Some(workspace_id) = requested_workspace_id {
-        return Some(workspace_id.to_string());
-    }
-    if let Some(session_id) = requested_session_id
-        && let Some(session) = state.session_store.session(session_id)
-        && let Some(workspace_id) = session_scope::session_workspace_id(state, &session)
-    {
-        return Some(workspace_id.to_string());
-    }
-    state
-        .workspace_registry
-        .active_workspace_id()
-        .map(|workspace_id| workspace_id.to_string())
+    query: &BootstrapQuery,
+) -> Result<BootstrapScope, ApiError> {
+    let scope = session_scope::resolve_optional_session_workspace_scope(
+        state,
+        query.session_id.as_deref(),
+        query.workspace_id.as_deref(),
+        query.workspace_path.as_deref(),
+    )?;
+    let workspace_id = scope.workspace_id().map(ToString::to_string).or_else(|| {
+        if scope.session_id().is_none() {
+            state
+                .workspace_registry
+                .active_workspace_id()
+                .map(|workspace_id| workspace_id.to_string())
+        } else {
+            None
+        }
+    });
+    Ok(BootstrapScope {
+        workspace_id,
+        session_id: scope.session_id().cloned(),
+    })
 }
 
 async fn runtime_read_model(State(state): State<ApiState>) -> Json<RuntimeReadModelDto> {
@@ -201,12 +184,17 @@ async fn stream_events(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use magi_core::AbsolutePath;
+    use axum::{
+        body::{Body, to_bytes},
+        http::{Request, StatusCode},
+    };
+    use magi_core::{AbsolutePath, WorkspaceId};
     use magi_event_bus::InMemoryEventBus;
     use magi_governance::GovernanceService;
     use magi_session_store::SessionStore;
     use magi_workspace::WorkspaceStore;
     use std::sync::Arc;
+    use tower::ServiceExt;
 
     fn test_state() -> ApiState {
         ApiState::new(
@@ -218,8 +206,32 @@ mod tests {
         )
     }
 
+    async fn get_json(app: Router, path: &str) -> (StatusCode, serde_json::Value) {
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(path)
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body should read");
+        let body = serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+            panic!(
+                "response should be json: {error}; body={}",
+                String::from_utf8_lossy(&bytes)
+            )
+        });
+        (status, body)
+    }
+
     #[test]
-    fn bootstrap_workspace_resolution_prefers_requested_workspace_over_stale_session() {
+    fn bootstrap_workspace_resolution_rejects_workspace_mismatched_session() {
         let state = test_state();
         let workspace_a = WorkspaceId::new("workspace-bootstrap-url-a");
         let workspace_b = WorkspaceId::new("workspace-bootstrap-url-b");
@@ -247,14 +259,24 @@ mod tests {
             )
             .expect("session B should create");
 
-        let resolved = resolve_bootstrap_workspace_id(
+        let result = resolve_bootstrap_scope(
             &state,
-            Some(workspace_a.to_string()),
-            None,
-            Some(&session_b),
+            &BootstrapQuery {
+                workspace_id: Some(workspace_a.to_string()),
+                workspace_path: None,
+                session_id: Some(session_b.to_string()),
+            },
         );
 
-        assert_eq!(resolved.as_deref(), Some(workspace_a.as_str()));
+        match result {
+            Err(ApiError::InvalidInput(message)) => {
+                assert!(
+                    message.contains("不属于 workspace"),
+                    "bootstrap should reject mismatched session binding: {message}"
+                );
+            }
+            other => panic!("unexpected bootstrap scope result: {:?}", other),
+        }
     }
 
     #[test]
@@ -278,8 +300,65 @@ mod tests {
             )
             .expect("session should create");
 
-        let resolved = resolve_bootstrap_workspace_id(&state, None, None, Some(&session_b));
+        let resolved = resolve_bootstrap_scope(
+            &state,
+            &BootstrapQuery {
+                workspace_id: None,
+                workspace_path: None,
+                session_id: Some(session_b.to_string()),
+            },
+        )
+        .expect("session workspace should resolve");
 
-        assert_eq!(resolved.as_deref(), Some(workspace_b.as_str()));
+        assert_eq!(resolved.workspace_id.as_deref(), Some(workspace_b.as_str()));
+    }
+
+    #[tokio::test]
+    async fn bootstrap_route_rejects_workspace_mismatched_session_scope() {
+        let state = test_state();
+        let workspace_a = WorkspaceId::new("workspace-bootstrap-route-a");
+        let workspace_b = WorkspaceId::new("workspace-bootstrap-route-b");
+        state
+            .workspace_registry
+            .register(
+                workspace_a.clone(),
+                AbsolutePath::new("/tmp/magi-bootstrap-route-a"),
+            )
+            .expect("workspace A should register");
+        state
+            .workspace_registry
+            .register(
+                workspace_b.clone(),
+                AbsolutePath::new("/tmp/magi-bootstrap-route-b"),
+            )
+            .expect("workspace B should register");
+        let session_b = SessionId::new("session-bootstrap-route-b");
+        state
+            .session_store
+            .create_session_for_workspace(
+                session_b.clone(),
+                "B 会话",
+                Some(workspace_b.to_string()),
+            )
+            .expect("session B should create");
+        let app = build_router(state);
+
+        let (status, body) = get_json(
+            app,
+            &format!(
+                "/bootstrap?workspaceId={}&sessionId={}",
+                workspace_a, session_b
+            ),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error_code"], serde_json::json!("INPUT_INVALID"));
+        assert!(
+            body["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("不属于 workspace")),
+            "bootstrap mismatch should be actionable for bridge recovery: {body}"
+        );
     }
 }

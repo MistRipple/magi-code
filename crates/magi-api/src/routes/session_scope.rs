@@ -19,6 +19,14 @@ pub(super) struct OptionalSessionWorkspaceScope {
 }
 
 impl OptionalSessionWorkspaceScope {
+    pub(super) fn session_id(&self) -> Option<&SessionId> {
+        self.session_id.as_ref()
+    }
+
+    pub(super) fn workspace_id(&self) -> Option<&WorkspaceId> {
+        self.workspace_id.as_ref()
+    }
+
     pub(super) fn tool_context(&self) -> ToolExecutionContext {
         ToolExecutionContext {
             session_id: self.session_id.clone(),
