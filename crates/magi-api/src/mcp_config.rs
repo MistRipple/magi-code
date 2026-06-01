@@ -4,6 +4,14 @@ use serde_json::Value;
 use std::{collections::BTreeMap, path::PathBuf};
 
 pub(crate) const REDACTED_MCP_ENV_VALUE: &str = "********";
+const SCOPE_BINDING_FIELDS: [&str; 6] = [
+    "workspaceId",
+    "workspace_id",
+    "workspacePath",
+    "workspace_path",
+    "sessionId",
+    "session_id",
+];
 
 fn unwrap_mcp_server_payload<'a>(request: &'a Value) -> &'a Value {
     request
@@ -60,6 +68,9 @@ pub(crate) fn normalize_mcp_server_snapshot_entry(entry: &Value) -> Option<Value
     object.insert("type".to_string(), serde_json::json!("stdio"));
     object.remove("url");
     object.remove("headers");
+    for field in SCOPE_BINDING_FIELDS {
+        object.remove(field);
+    }
     Some(Value::Object(object))
 }
 
@@ -174,7 +185,10 @@ mod tests {
             "command": " npx ",
             "url": "https://example.test/mcp",
             "headers": { "Authorization": "Bearer test" },
-            "type": "streamable-http"
+            "type": "streamable-http",
+            "workspaceId": "workspace-old",
+            "workspacePath": "/tmp/old",
+            "sessionId": "session-old"
         }))
         .expect("stdio MCP server should normalize");
 
@@ -184,6 +198,9 @@ mod tests {
         assert_eq!(entry["type"], serde_json::json!("stdio"));
         assert!(entry.get("url").is_none());
         assert!(entry.get("headers").is_none());
+        assert!(entry.get("workspaceId").is_none());
+        assert!(entry.get("workspacePath").is_none());
+        assert!(entry.get("sessionId").is_none());
     }
 
     #[test]
@@ -191,7 +208,10 @@ mod tests {
         let entry = normalize_mcp_server_snapshot_entry(&serde_json::json!({
             "server": {
                 "serverId": " legacy ",
-                "url": "https://example.test/mcp"
+                "url": "https://example.test/mcp",
+                "workspace_id": "workspace-old",
+                "workspace_path": "/tmp/old",
+                "session_id": "session-old"
             }
         }))
         .expect("entry with id should remain visible");
@@ -202,6 +222,9 @@ mod tests {
         assert_eq!(entry["type"], serde_json::json!("stdio"));
         assert!(entry.get("command").is_none());
         assert!(entry.get("url").is_none());
+        assert!(entry.get("workspace_id").is_none());
+        assert!(entry.get("workspace_path").is_none());
+        assert!(entry.get("session_id").is_none());
     }
 
     #[test]

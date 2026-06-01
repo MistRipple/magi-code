@@ -1508,6 +1508,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mcp_server_save_strips_workspace_session_scope_fields() {
+        let state = test_state();
+        let app = Router::new().merge(routes()).with_state(state.clone());
+
+        let body = post_json(
+            app,
+            "/settings/mcp/add",
+            serde_json::json!({
+                "id": "server-scope-clean",
+                "name": "server-scope-clean",
+                "command": "node",
+                "enabled": false,
+                "workspaceId": "workspace-old",
+                "workspacePath": "/tmp/old",
+                "sessionId": "session-old"
+            }),
+        )
+        .await;
+
+        assert_eq!(body["added"], true);
+        let stored = stored_mcp_server_entry(&state, "server-scope-clean")
+            .expect("added server should remain stored");
+        for key in ["workspaceId", "workspacePath", "sessionId"] {
+            assert!(
+                stored.get(key).is_none(),
+                "MCP server settings are global and must not persist {key}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn mcp_tools_routes_return_recoverable_disconnected_marker() {
         for path in ["/settings/mcp/tools", "/settings/mcp/tools/refresh"] {
             let app = Router::new().merge(routes()).with_state(test_state());

@@ -1892,6 +1892,9 @@ mod tests {
                     "id": "secret-server",
                     "command": "npx",
                     "enabled": false,
+                    "workspaceId": "workspace-old",
+                    "workspacePath": "/tmp/old",
+                    "sessionId": "session-old",
                     "env": {
                         "TOKEN": "secret-token"
                     }
@@ -1908,6 +1911,12 @@ mod tests {
             bootstrap["mcpServers"][0]["env"]["TOKEN"],
             json!(crate::mcp_config::REDACTED_MCP_ENV_VALUE)
         );
+        for key in ["workspaceId", "workspacePath", "sessionId"] {
+            assert!(
+                bootstrap["mcpServers"][0].get(key).is_none(),
+                "settings bootstrap must not expose stale MCP scope field {key}"
+            );
+        }
     }
 
     #[tokio::test]
