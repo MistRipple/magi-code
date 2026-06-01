@@ -337,6 +337,7 @@ impl BuiltinToolName {
                 | Self::ProcessWrite
                 | Self::ProcessKill
                 | Self::ProcessList
+                | Self::AgentSpawn
                 | Self::AgentWait
                 | Self::TodoWrite
                 | Self::MemoryWrite

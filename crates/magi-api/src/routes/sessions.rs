@@ -3534,7 +3534,13 @@ mod tests {
 
     #[test]
     fn does_not_force_orchestration_only_builtin_tool_names_to_regular_execute() {
-        for tool_name in ["todo_write", "memory_write", "plan_write", "agent_wait"] {
+        for tool_name in [
+            "agent_spawn",
+            "todo_write",
+            "memory_write",
+            "plan_write",
+            "agent_wait",
+        ] {
             let request = session_turn_request(&format!("请调用 {tool_name} 完成这一步"));
             let decision = normalize_session_turn_decision(classifier_chat_decision(), &request);
 

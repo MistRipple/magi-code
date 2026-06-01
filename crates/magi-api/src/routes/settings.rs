@@ -1499,12 +1499,12 @@ mod tests {
             serde_json::json!(false),
             "ordinary public tools should not be marked as task-runtime-only"
         );
-        let agent_wait = builtin_tools
+        let agent_spawn = builtin_tools
             .iter()
-            .find(|tool| tool["name"] == serde_json::json!("agent_wait"))
-            .expect("agent_wait should be exposed for task runtime");
+            .find(|tool| tool["name"] == serde_json::json!("agent_spawn"))
+            .expect("agent_spawn should be exposed for task runtime");
         assert_eq!(
-            agent_wait["runtimeInternal"],
+            agent_spawn["runtimeInternal"],
             serde_json::json!(true),
             "task protocol tools should be distinguishable from ordinary local tools"
         );
