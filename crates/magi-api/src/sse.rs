@@ -90,6 +90,8 @@ fn event_envelope_stream(
     let live_workspace_id = workspace_id;
     let snapshot_session_id = session_id.clone();
     let live_session_id = session_id;
+    let snapshot_gap_recovery = snapshot_gap_skipped_count(&snapshot, after_sequence)
+        .map(|skipped| lagged_recovery_event(skipped, snapshot_workspace_id.as_ref()));
     let recent_stream = stream::iter(snapshot.recent_events.into_iter().filter(move |event| {
         after_sequence.is_none_or(|sequence| event.sequence > sequence)
             && event_matches_scope(
@@ -123,7 +125,27 @@ fn event_envelope_stream(
             }
         }
     });
-    recent_stream.chain(live_stream)
+    stream::iter(snapshot_gap_recovery)
+        .chain(recent_stream)
+        .chain(live_stream)
+}
+
+fn snapshot_gap_skipped_count(
+    snapshot: &magi_event_bus::EventStreamSnapshot,
+    after_sequence: Option<u64>,
+) -> Option<u64> {
+    let after_sequence = after_sequence?;
+    let earliest_available_sequence = snapshot
+        .recent_events
+        .first()
+        .map(|event| event.sequence)
+        .unwrap_or(snapshot.next_sequence);
+    let expected_next_sequence = after_sequence.saturating_add(1);
+    if expected_next_sequence < earliest_available_sequence {
+        Some(earliest_available_sequence - expected_next_sequence)
+    } else {
+        None
+    }
 }
 
 fn event_matches_scope(
@@ -566,6 +588,48 @@ mod tests {
         assert!(
             event.payload["skipped"].as_u64().unwrap_or_default() > 0,
             "lagged event should expose skipped event count"
+        );
+    }
+
+    #[tokio::test]
+    async fn event_stream_emits_lagged_recovery_event_when_after_sequence_is_outside_retention() {
+        let state = test_state_with_event_capacity(2);
+        let workspace = workspace_id("workspace-retention-gap");
+        for index in 0..5 {
+            state
+                .event_bus
+                .publish(
+                    EventEnvelope::domain(
+                        EventId::new(format!("event-retention-gap-{index}")),
+                        "message.created",
+                        json!({ "index": index }),
+                    )
+                    .with_context(EventContext {
+                        workspace_id: Some(workspace.clone()),
+                        ..EventContext::default()
+                    }),
+                )
+                .expect("event should publish");
+        }
+
+        let mut events = Box::pin(event_envelope_stream(
+            state,
+            Some(workspace.clone()),
+            None,
+            Some(1),
+        ));
+        let event = tokio::time::timeout(Duration::from_secs(1), events.next())
+            .await
+            .expect("retention gap recovery event should arrive")
+            .expect("stream should stay open");
+
+        assert_eq!(event.event_type, "event.stream.lagged");
+        assert_eq!(event.workspace_id.as_ref(), Some(&workspace));
+        assert_eq!(event.payload["reason"], json!("broadcast_lagged"));
+        assert_eq!(event.payload["recovery"], json!("bootstrap"));
+        assert!(
+            event.payload["skipped"].as_u64().unwrap_or_default() > 0,
+            "retention gap should expose skipped event count"
         );
     }
 

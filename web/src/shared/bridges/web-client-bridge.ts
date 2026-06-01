@@ -1156,6 +1156,7 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
   if (!eventMatchesCurrentWorkspace(event)) {
     return;
   }
+  advanceEventStreamCursorFromEvent(event);
 
   if (eventType === 'event.stream.lagged') {
     console.warn('[web-client-bridge] 事件流出现 lag，切换到 bootstrap recovery', {
@@ -1512,6 +1513,27 @@ function updateEventStreamCursorFromBootstrap(payload: BootstrapPayload): void {
   }
   eventStreamCursorScopeKey = eventStreamScopeKey();
   eventStreamAfterSequence = nextSequence - 1;
+}
+
+function advanceEventStreamCursorFromEvent(event: RustEventEnvelope): void {
+  const sequence = typeof event.sequence === 'number' && Number.isFinite(event.sequence)
+    ? Math.floor(event.sequence)
+    : 0;
+  if (sequence <= 0) {
+    return;
+  }
+  const scopeKey = eventStreamScopeKey();
+  if (!scopeKey) {
+    return;
+  }
+  if (eventStreamCursorScopeKey !== scopeKey) {
+    eventStreamCursorScopeKey = scopeKey;
+    eventStreamAfterSequence = sequence;
+    return;
+  }
+  if (sequence > eventStreamAfterSequence) {
+    eventStreamAfterSequence = sequence;
+  }
 }
 
 async function readAgentErrorPayload(response: Response): Promise<{ errorCode?: string; message?: string }> {
