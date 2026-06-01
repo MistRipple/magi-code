@@ -1188,7 +1188,7 @@ fn execution_runtime_rejects_unhealthy_local_process_executor_before_execute() {
 
     match error {
         OrchestratorCommandError::WorkerExecutorUnavailable { reason } => {
-            assert!(reason.contains("not healthy"));
+            assert_eq!(reason, "executor unavailable");
         }
         other => panic!("unexpected error: {other:?}"),
     }
@@ -1243,7 +1243,7 @@ fn execution_runtime_execute_dispatch_then_skips_hook_on_failure() {
 
     match error {
         OrchestratorCommandError::WorkerExecutorUnavailable { reason } => {
-            assert!(reason.contains("not healthy"));
+            assert_eq!(reason, "executor unavailable");
         }
         other => panic!("unexpected error: {other:?}"),
     }
@@ -1311,7 +1311,7 @@ fn execution_runtime_execute_dispatch_with_writebacks_skips_writeback_on_failure
 
     match error {
         OrchestratorCommandError::WorkerExecutorUnavailable { reason } => {
-            assert!(reason.contains("not healthy"));
+            assert_eq!(reason, "executor unavailable");
         }
         other => panic!("unexpected error: {other:?}"),
     }
@@ -1365,7 +1365,7 @@ fn execution_runtime_rejects_local_process_executor_missing_step_capability_befo
 
     match error {
         OrchestratorCommandError::WorkerExecutorUnavailable { reason } => {
-            assert!(reason.contains("missing required steps"));
+            assert_eq!(reason, "executor capability insufficient");
         }
         other => panic!("unexpected error: {other:?}"),
     }
@@ -1415,7 +1415,7 @@ fn execution_runtime_rejects_local_process_executor_affinity_mismatch_before_exe
 
     match error {
         OrchestratorCommandError::WorkerExecutorUnavailable { reason } => {
-            assert!(reason.contains("affinity mismatch"));
+            assert_eq!(reason, "executor capability insufficient");
         }
         other => panic!("unexpected error: {other:?}"),
     }

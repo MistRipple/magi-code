@@ -285,6 +285,28 @@ impl WorkerExecutorFailure {
             detail: Some(detail),
         }
     }
+
+    pub fn public_summary(&self) -> &'static str {
+        match self.layer {
+            WorkerExecutorFailureLayer::Transport => "executor unavailable",
+            WorkerExecutorFailureLayer::Protocol => "executor response invalid",
+            WorkerExecutorFailureLayer::RemoteBusiness => "executor capability insufficient",
+        }
+    }
+
+    pub fn public_execution_summary(&self) -> &'static str {
+        match self.layer {
+            WorkerExecutorFailureLayer::Transport => {
+                "external executor failed because the executor is unavailable"
+            }
+            WorkerExecutorFailureLayer::Protocol => {
+                "external executor failed because the executor response was invalid"
+            }
+            WorkerExecutorFailureLayer::RemoteBusiness => {
+                "external executor failed because the executor capability is insufficient"
+            }
+        }
+    }
 }
 
 impl fmt::Display for WorkerExecutorFailure {

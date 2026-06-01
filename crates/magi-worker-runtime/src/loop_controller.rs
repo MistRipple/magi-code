@@ -244,7 +244,7 @@ impl WorkerRuntimeLoop {
                         action,
                         governance_decision,
                         completed_at,
-                        &format!("executor capability insufficient: {error}"),
+                        error.public_summary(),
                     );
                 }
                 let worker = self.runtime.start_execution(&worker_id, task_id.clone());
@@ -282,11 +282,7 @@ impl WorkerRuntimeLoop {
                                 tool_invocations: Vec::new(),
                                 skill_dispatches: Vec::new(),
                                 final_report: WorkerExecutionFinalReport {
-                                    summary: format!(
-                                        "external executor failed [{}]: {}",
-                                        error.layer.label(),
-                                        error.message
-                                    ),
+                                    summary: error.public_execution_summary().to_string(),
                                     result_kind: Some(TaskResultKind::Failure),
                                     termination_reason: Some(TerminationReason::Failed),
                                     verification_status: VerificationStatus::Failed,
@@ -429,7 +425,7 @@ impl WorkerRuntimeLoop {
                             action,
                             governance_decision,
                             completed_at,
-                            &format!("executor capability insufficient: {error}"),
+                            error.public_summary(),
                         );
                     }
                 } else if let Err(error) = executor_probe.supports_stage(WorkerStage::Review) {
@@ -438,7 +434,7 @@ impl WorkerRuntimeLoop {
                         action,
                         governance_decision,
                         completed_at,
-                        &format!("executor capability insufficient: {error}"),
+                        error.public_summary(),
                     );
                 }
                 let worker = self.runtime.start_review(&worker_id);
@@ -503,7 +499,7 @@ impl WorkerRuntimeLoop {
                             action,
                             governance_decision,
                             completed_at,
-                            &format!("executor capability insufficient: {error}"),
+                            error.public_summary(),
                         );
                     }
                 } else if let Err(error) = executor_probe.supports_stage(WorkerStage::Verify) {
@@ -512,7 +508,7 @@ impl WorkerRuntimeLoop {
                         action,
                         governance_decision,
                         completed_at,
-                        &format!("executor capability insufficient: {error}"),
+                        error.public_summary(),
                     );
                 }
                 let worker = self.runtime.start_verification(&worker_id);
@@ -575,7 +571,7 @@ impl WorkerRuntimeLoop {
                             action,
                             governance_decision,
                             completed_at,
-                            &format!("executor capability insufficient: {error}"),
+                            error.public_summary(),
                         );
                     }
                 } else if let Err(error) = executor_probe.supports_stage(WorkerStage::Repair) {
@@ -584,7 +580,7 @@ impl WorkerRuntimeLoop {
                         action,
                         governance_decision,
                         completed_at,
-                        &format!("executor capability insufficient: {error}"),
+                        error.public_summary(),
                     );
                 }
                 let worker = self.runtime.start_repair(&worker_id);
@@ -645,7 +641,7 @@ impl WorkerRuntimeLoop {
                             action,
                             governance_decision,
                             completed_at,
-                            &format!("executor capability insufficient: {error}"),
+                            error.public_summary(),
                         );
                     }
                 } else if let Err(error) = executor_probe.supports_stage(WorkerStage::Repair) {
@@ -654,7 +650,7 @@ impl WorkerRuntimeLoop {
                         action,
                         governance_decision,
                         completed_at,
-                        &format!("executor capability insufficient: {error}"),
+                        error.public_summary(),
                     );
                 }
                 let worker = self.runtime.start_repair(&worker_id);
@@ -812,12 +808,7 @@ impl WorkerRuntimeLoop {
     }
 
     fn executor_probe_error_reason(&self, error: &WorkerExecutorFailure) -> String {
-        match error.layer {
-            crate::WorkerExecutorFailureLayer::RemoteBusiness => {
-                format!("executor capability insufficient: {error}")
-            }
-            _ => format!("executor probe failed: {error}"),
-        }
+        error.public_summary().to_string()
     }
 
     fn governance_outcome(

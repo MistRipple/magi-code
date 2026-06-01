@@ -200,28 +200,25 @@ impl OrchestratedExecutionRuntime {
         ) {
             let probe = self.worker_runtime.executor_probe().map_err(|error| {
                 OrchestratorCommandError::WorkerExecutorUnavailable {
-                    reason: error.to_string(),
+                    reason: error.public_summary().to_string(),
                 }
             })?;
             if !probe.capability.supports_execute {
                 return Err(OrchestratorCommandError::WorkerExecutorUnavailable {
-                    reason: "local process executor does not support execute".to_string(),
+                    reason: "executor capability insufficient".to_string(),
                 });
             }
             if probe.health.status != magi_worker_runtime::LocalProcessExecutorHealthStatus::Healthy
             {
                 return Err(OrchestratorCommandError::WorkerExecutorUnavailable {
-                    reason: format!(
-                        "local process executor is not healthy: {}",
-                        probe.health.detail
-                    ),
+                    reason: "executor unavailable".to_string(),
                 });
             }
             probe
                 .supports_context(&session_id, &workspace_id)
                 .map_err(
                     |error| OrchestratorCommandError::WorkerExecutorUnavailable {
-                        reason: error.to_string(),
+                        reason: error.public_summary().to_string(),
                     },
                 )?;
             Some(probe)
@@ -249,12 +246,12 @@ impl OrchestratedExecutionRuntime {
                 .supports_execution_profile(&intent.execution_profile)
                 .map_err(
                     |error| OrchestratorCommandError::WorkerExecutorUnavailable {
-                        reason: error.to_string(),
+                        reason: error.public_summary().to_string(),
                     },
                 )?;
             probe.supports_request(&executor_request).map_err(|error| {
                 OrchestratorCommandError::WorkerExecutorUnavailable {
-                    reason: error.to_string(),
+                    reason: error.public_summary().to_string(),
                 }
             })?;
         }

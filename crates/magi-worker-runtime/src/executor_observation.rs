@@ -27,6 +27,10 @@ impl WorkerExecutorObservationStatus {
     }
 }
 
+const EXECUTOR_HEALTH_READY_DETAIL: &str = "executor ready";
+const EXECUTOR_HEALTH_DEGRADED_DETAIL: &str = "executor degraded";
+const EXECUTOR_HEALTH_UNAVAILABLE_DETAIL: &str = "executor unavailable";
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkerExecutorObservation {
     pub worker_id: WorkerId,
@@ -290,7 +294,7 @@ impl WorkerRuntime {
             strict_workspace_affinity: Some(probe.capability.affinity.strict_workspace),
             supported_step_kinds: probe.capability.supported_step_kinds.clone(),
             health_status: Some(probe.health.status),
-            health_detail: Some(probe.health.detail.clone()),
+            health_detail: Some(public_executor_health_detail(probe.health.status).to_string()),
             failure_layer: None,
             failure_message: None,
             observed_at: UtcMillis::now(),
@@ -377,8 +381,16 @@ impl WorkerRuntime {
             health_status: None,
             health_detail: None,
             failure_layer: Some(error.layer),
-            failure_message: Some(error.message.clone()),
+            failure_message: Some(error.public_summary().to_string()),
             observed_at: UtcMillis::now(),
         }
+    }
+}
+
+fn public_executor_health_detail(status: LocalProcessExecutorHealthStatus) -> &'static str {
+    match status {
+        LocalProcessExecutorHealthStatus::Healthy => EXECUTOR_HEALTH_READY_DETAIL,
+        LocalProcessExecutorHealthStatus::Degraded => EXECUTOR_HEALTH_DEGRADED_DETAIL,
+        LocalProcessExecutorHealthStatus::Unavailable => EXECUTOR_HEALTH_UNAVAILABLE_DETAIL,
     }
 }

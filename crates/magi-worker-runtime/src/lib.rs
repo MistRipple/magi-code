@@ -985,6 +985,36 @@ mod tests {
         TaskId::new(value.to_string())
     }
 
+    #[derive(Clone)]
+    struct FailingCheckpointExecutor;
+
+    impl WorkerExecutor for FailingCheckpointExecutor {
+        fn execute(&self, intent: &WorkerExecutionIntent) -> WorkerExecutionTrace {
+            WorkerExecutionTrace {
+                worker_id: intent.worker_id.clone(),
+                task_id: intent.task_id.clone(),
+                tool_invocations: Vec::new(),
+                skill_dispatches: Vec::new(),
+                final_report: WorkerExecutionFinalReport {
+                    summary: "should not use raw executor failure".to_string(),
+                    result_kind: Some(TaskResultKind::Failure),
+                    termination_reason: Some(TerminationReason::Failed),
+                    verification_status: VerificationStatus::Failed,
+                },
+            }
+        }
+
+        fn execute_from_checkpoint(
+            &self,
+            _intent: &WorkerExecutionIntent,
+            _checkpoint_cursor: Option<&WorkerExecutionCheckpointCursor>,
+        ) -> Result<WorkerExecutionProgress, WorkerExecutorFailure> {
+            Err(WorkerExecutorFailure::remote_business(
+                "/Users/xie/.magi/worker failed: ENOENT",
+            ))
+        }
+    }
+
     #[test]
     fn worker_skill_dispatch_failure_detail_is_public_in_snapshot_and_event() {
         let bus = Arc::new(InMemoryEventBus::new(16));
@@ -1043,6 +1073,118 @@ mod tests {
             .next()
             .expect("skill dispatch should be present in task snapshot");
         assert_eq!(snapshot.detail, record.detail);
+    }
+
+    #[test]
+    fn worker_executor_failure_observation_is_public_in_snapshot_and_event() {
+        let bus = Arc::new(InMemoryEventBus::new(16));
+        let runtime = WorkerRuntime::new_compare(bus.clone());
+        let worker_id = worker_id("worker-executor-public-failure");
+        let task_id = task_id("task-executor-public-failure");
+        let raw_detail = "/Users/xie/.magi/worker failed: ENOENT";
+        let probe_result = Err(WorkerExecutorFailure::remote_business(raw_detail));
+
+        let record = runtime.observe_executor_probe(
+            &worker_id,
+            Some(task_id.clone()),
+            Some(WorkerStage::Execute),
+            None,
+            &probe_result,
+        );
+
+        assert_eq!(
+            record.failure_message.as_deref(),
+            Some("executor capability insufficient")
+        );
+        assert!(
+            !record
+                .failure_message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("/Users/xie")
+        );
+
+        let event = bus
+            .snapshot()
+            .recent_events
+            .into_iter()
+            .find(|event| event.event_type == "worker.executor.observed")
+            .expect("executor observation event should be published");
+        let event_text = event.payload.to_string();
+        assert!(event_text.contains("executor capability insufficient"));
+        assert!(
+            !event_text.contains("/Users/xie") && !event_text.contains("ENOENT"),
+            "worker executor event must not expose raw runtime detail: {event_text}"
+        );
+
+        let snapshot_text = serde_json::to_string(&runtime.snapshot_for_task(&task_id))
+            .expect("task snapshot should serialize");
+        assert!(
+            !snapshot_text.contains("/Users/xie") && !snapshot_text.contains("ENOENT"),
+            "worker executor snapshot must not expose raw runtime detail: {snapshot_text}"
+        );
+    }
+
+    #[test]
+    fn worker_loop_executor_step_failure_report_uses_public_summary() {
+        let bus = Arc::new(InMemoryEventBus::new(16));
+        let runtime = WorkerRuntime::new_compare(bus.clone())
+            .with_executor(Arc::new(FailingCheckpointExecutor));
+        let loop_controller = runtime.loop_controller();
+        let worker_id = worker_id("worker-executor-public-report");
+        let task_id = task_id("task-executor-public-report");
+
+        runtime.register_worker(worker_id.clone());
+        runtime.register_execution_intent(WorkerExecutionIntent {
+            worker_id: worker_id.clone(),
+            task_id: task_id.clone(),
+            session_id: None,
+            workspace_id: None,
+            execution_profile: WorkerExecutionProfile::default(),
+            steps: vec![WorkerExecutionIntentStep::FinalReport(
+                WorkerExecutionFinalReport {
+                    summary: "should be replaced by executor failure".to_string(),
+                    result_kind: Some(TaskResultKind::Success),
+                    termination_reason: Some(TerminationReason::Completed),
+                    verification_status: VerificationStatus::Passed,
+                },
+            )],
+        });
+
+        loop_controller.enqueue_action(WorkerLoopAction::Execute {
+            worker_id,
+            task_id: task_id.clone(),
+        });
+
+        let outcome = loop_controller
+            .step()
+            .expect("execute outcome should exist");
+        let report = outcome.report.expect("failure report should be recorded");
+        assert_eq!(
+            report.summary,
+            "external executor failed because the executor capability is insufficient"
+        );
+        assert!(!report.summary.contains("/Users/xie"));
+
+        let event_text = bus
+            .snapshot()
+            .recent_events
+            .into_iter()
+            .find(|event| event.event_type == "worker.reported")
+            .expect("worker report event should be published")
+            .payload
+            .to_string();
+        assert!(
+            !event_text.contains("/Users/xie") && !event_text.contains("ENOENT"),
+            "worker report event must not expose raw executor detail: {event_text}"
+        );
+
+        let snapshot_text = serde_json::to_string(&runtime.snapshot_for_task(&task_id))
+            .expect("task snapshot should serialize");
+        assert!(
+            !snapshot_text.contains("/Users/xie") && !snapshot_text.contains("ENOENT"),
+            "worker report snapshot must not expose raw executor detail: {snapshot_text}"
+        );
     }
 
     #[test]
