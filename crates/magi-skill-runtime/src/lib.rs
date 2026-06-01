@@ -332,6 +332,7 @@ impl SkillRegistry {
                 source_skill_ids: resolved.skill_ids.clone(),
                 allowed_tool_names: allowed_builtin_tools,
                 denied_tool_names: denied_builtin_tools,
+                ..ToolExecutionPolicy::default()
             },
             routing: routing.clone(),
             prompt_injections: resolved.prompt_injections,

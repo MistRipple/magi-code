@@ -7,7 +7,7 @@
 //! - `task_policy_tool_decision` / `safety_gate_tool_decision` 等支撑判定。
 
 use std::{
-    path::{Component, Path, PathBuf},
+    path::PathBuf,
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -20,8 +20,8 @@ use magi_bridge_client::{
     tool_concurrency::{ToolBatchKind, ToolConcurrencyInput, partition_tool_calls_with_inputs},
 };
 use magi_core::{
-    EventId, ExecutionResultStatus, SessionId, TASK_RUNTIME_FAILURE_PUBLIC_OUTPUT, TaskId,
-    TaskKind, TaskPolicy, TaskStatus, TaskTier, ToolCallId, UtcMillis, WorkspaceId,
+    AccessProfile, EventId, ExecutionResultStatus, SessionId, TASK_RUNTIME_FAILURE_PUBLIC_OUTPUT,
+    TaskId, TaskKind, TaskPolicy, TaskStatus, TaskTier, ToolCallId, UtcMillis, WorkspaceId,
     public_task_output_refs, task_output_ref_is_internal_runtime_failure,
 };
 use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
@@ -29,8 +29,9 @@ use magi_orchestrator::task_store::TaskStore;
 use magi_session_store::SessionStore;
 use magi_snapshot::{SnapshotSession, ToolHook, ToolHookCtx};
 use magi_tool_runtime::{
-    BuiltinToolName, ToolExecutionContext, ToolExecutionInput, ToolRegistry,
-    builtin_permission_engine, canonical_builtin_tool_name,
+    BuiltinToolName, ToolExecutionContext, ToolExecutionInput, ToolExecutionPolicy, ToolRegistry,
+    builtin_permission_engine, canonical_builtin_tool_name, effective_tool_policy_allowed_paths,
+    normalize_tool_policy_paths, tool_path_access_requests,
 };
 
 use crate::builtin_tool_schema::internal_builtin_tool_rejection_payload;
@@ -44,6 +45,7 @@ use crate::{
 };
 use crate::{
     active_skill_tool_execution_policy, execute_skill_custom_tool, parse_skill_custom_tool_name,
+    tool_execution_policy_scope,
 };
 
 /// agent_spawn 生成 child task_id 时使用的进程内单调序号。
@@ -1657,10 +1659,7 @@ fn execute_task_tool_call(
             &tool_skill_name,
             &binding_id,
             skill_name,
-            task.policy_snapshot
-                .as_ref()
-                .map(|policy| policy.access_profile)
-                .unwrap_or_default(),
+            task_tool_execution_policy_scope(task),
             safety_gate,
             skill_runtime,
             skill_dispatch_runtime,
@@ -1686,7 +1685,9 @@ fn execute_task_tool_call(
         .as_ref()
         .map(|policy| policy.access_profile)
         .unwrap_or_default();
-    let tool_policy = active_skill_tool_execution_policy(access_profile, skill_runtime, skill_name);
+    let mut tool_policy =
+        active_skill_tool_execution_policy(access_profile, skill_runtime, skill_name);
+    apply_task_policy_scope(&mut tool_policy, task.policy_snapshot.as_ref());
     let output = registry.execute_with_policy(
         ToolExecutionInput::for_builtin_invocation(
             ToolCallId::new(&tool_call.id),
@@ -1704,6 +1705,30 @@ fn execute_task_tool_call(
     );
 
     (output.payload, output.status)
+}
+
+fn task_tool_execution_policy_scope(task: &magi_core::Task) -> ToolExecutionPolicy {
+    let Some(policy) = task.policy_snapshot.as_ref() else {
+        return tool_execution_policy_scope(AccessProfile::default(), "", &[], &[]);
+    };
+    tool_execution_policy_scope(
+        policy.access_profile,
+        policy.command_mode.clone(),
+        &policy.allowed_paths,
+        &policy.denied_paths,
+    )
+}
+
+fn apply_task_policy_scope(
+    tool_policy: &mut ToolExecutionPolicy,
+    policy_snapshot: Option<&TaskPolicy>,
+) {
+    if let Some(policy) = policy_snapshot {
+        tool_policy.access_profile = policy.access_profile;
+        tool_policy.allowed_paths = policy.allowed_paths.clone();
+        tool_policy.denied_paths = policy.denied_paths.clone();
+        tool_policy.command_mode = policy.command_mode.clone();
+    }
 }
 
 #[cfg(test)]
@@ -1804,8 +1829,15 @@ pub(crate) fn access_profile_tool_decision(
                 canonical_builtin_tool_name(tool).unwrap_or_else(|| tool.trim().to_string())
             })
             .collect(),
-        allowed_paths: effective_allowed_paths(access_profile, allowed_paths, workspace_root_path),
-        denied_paths: normalize_policy_paths(denied_paths, workspace_root_path),
+        allowed_paths: effective_tool_policy_allowed_paths(
+            access_profile,
+            allowed_paths,
+            workspace_root_path.map(|path| path.as_path()),
+        ),
+        denied_paths: normalize_tool_policy_paths(
+            denied_paths,
+            workspace_root_path.map(|path| path.as_path()),
+        ),
         command_mode: command_mode.to_string(),
         ..magi_permissions::PermissionPolicy::default()
     };
@@ -1844,15 +1876,15 @@ pub(crate) fn access_profile_tool_decision(
             return Some(decision);
         }
     }
-    for (absolute_path, kind) in tool_path_access_requests(
+    for path_request in tool_path_access_requests(
         &canonical_tool_name,
         arguments,
-        workspace_root_path,
+        workspace_root_path.map(|path| path.as_path()),
         access_profile,
     ) {
         let path_request = magi_permissions::PermissionRequest::PathAccess {
-            absolute_path: absolute_path.as_path(),
-            kind,
+            absolute_path: path_request.absolute_path.as_path(),
+            kind: path_request.kind,
         };
         if let Some(decision) = select_access_profile_axis_decision(
             &mut pending_decision,
@@ -1866,289 +1898,6 @@ pub(crate) fn access_profile_tool_decision(
         }
     }
     pending_decision
-}
-
-fn effective_allowed_paths(
-    access_profile: magi_core::AccessProfile,
-    allowed_paths: &[String],
-    workspace_root_path: Option<&PathBuf>,
-) -> Vec<PathBuf> {
-    let normalized = normalize_policy_paths(allowed_paths, workspace_root_path);
-    if !normalized.is_empty() || access_profile == magi_core::AccessProfile::FullAccess {
-        return normalized;
-    }
-    workspace_root_path
-        .map(|root| vec![canonicalize_permission_path(root.as_path())])
-        .unwrap_or_default()
-}
-
-fn normalize_policy_paths(paths: &[String], workspace_root_path: Option<&PathBuf>) -> Vec<PathBuf> {
-    paths
-        .iter()
-        .filter_map(|path| {
-            let trimmed = path.trim();
-            if trimmed.is_empty() {
-                return None;
-            }
-            Some(resolve_policy_path(trimmed, workspace_root_path))
-        })
-        .collect()
-}
-
-fn resolve_policy_path(path: &str, workspace_root_path: Option<&PathBuf>) -> PathBuf {
-    let path = PathBuf::from(path);
-    let resolved = if path.is_absolute() {
-        path
-    } else if let Some(root) = workspace_root_path {
-        root.join(path)
-    } else {
-        path
-    };
-    canonicalize_permission_path(resolved.as_path())
-}
-
-fn resolve_tool_path(path: &str, workspace_root_path: Option<&PathBuf>) -> PathBuf {
-    resolve_policy_path(path, workspace_root_path)
-}
-
-fn normalize_permission_path(path: PathBuf) -> PathBuf {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
-            Component::RootDir => normalized.push(component.as_os_str()),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                let can_pop = normalized
-                    .components()
-                    .next_back()
-                    .is_some_and(|last| matches!(last, Component::Normal(_)));
-                if can_pop {
-                    normalized.pop();
-                }
-            }
-            Component::Normal(value) => normalized.push(value),
-        }
-    }
-    normalized
-}
-
-fn canonicalize_permission_path(path: &Path) -> PathBuf {
-    let lexical_path = normalize_permission_path(path.to_path_buf());
-    if let Ok(canonical_path) = lexical_path.canonicalize() {
-        return normalize_permission_path(canonical_path);
-    }
-    canonicalize_existing_permission_ancestor(&lexical_path).unwrap_or(lexical_path)
-}
-
-fn canonicalize_existing_permission_ancestor(path: &Path) -> Option<PathBuf> {
-    let mut ancestor = path.to_path_buf();
-    let mut missing_components = Vec::new();
-    loop {
-        if let Ok(canonical_ancestor) = ancestor.canonicalize() {
-            let mut resolved = normalize_permission_path(canonical_ancestor);
-            for component in missing_components.iter().rev() {
-                resolved.push(component);
-            }
-            return Some(normalize_permission_path(resolved));
-        }
-        let component = ancestor.file_name()?.to_os_string();
-        missing_components.push(component);
-        if !ancestor.pop() {
-            return None;
-        }
-    }
-}
-
-fn tool_path_access_requests(
-    canonical_tool_name: &str,
-    arguments: &str,
-    workspace_root_path: Option<&PathBuf>,
-    access_profile: magi_core::AccessProfile,
-) -> Vec<(PathBuf, magi_permissions::PathAccessKind)> {
-    let Some(tool) = BuiltinToolName::from_str(canonical_tool_name) else {
-        return Vec::new();
-    };
-    let write = magi_permissions::PathAccessKind::Write;
-    let read = magi_permissions::PathAccessKind::Read;
-    let mut paths = Vec::new();
-
-    if tool == BuiltinToolName::ApplyPatch {
-        for path in derive_declared_paths(&ChatToolCall {
-            id: "permission-path-probe".to_string(),
-            kind: "function".to_string(),
-            function: magi_bridge_client::ChatToolFunction {
-                name: canonical_tool_name.to_string(),
-                arguments: arguments.to_string(),
-            },
-        }) {
-            paths.push((
-                resolve_tool_path(&path.to_string_lossy(), workspace_root_path),
-                write,
-            ));
-        }
-        return dedup_path_accesses(paths);
-    }
-
-    let arguments_value = serde_json::from_str::<serde_json::Value>(arguments).ok();
-    let object = arguments_value.as_ref().and_then(|value| value.as_object());
-
-    match tool {
-        BuiltinToolName::FileRead | BuiltinToolName::ViewImage => {
-            push_tool_path_fields(
-                &mut paths,
-                object,
-                &["path", "file_path", "filePath", "image_path", "imagePath"],
-                read,
-                workspace_root_path,
-            );
-            push_raw_path_argument(&mut paths, object, arguments, read, workspace_root_path);
-        }
-        BuiltinToolName::FileWrite | BuiltinToolName::FilePatch | BuiltinToolName::FileRemove => {
-            push_tool_path_fields(
-                &mut paths,
-                object,
-                &["path", "file_path", "filePath"],
-                write,
-                workspace_root_path,
-            );
-        }
-        BuiltinToolName::FileMkdir => {
-            push_tool_path_fields(
-                &mut paths,
-                object,
-                &["path", "file_path", "filePath", "dir_path", "dirPath"],
-                write,
-                workspace_root_path,
-            );
-        }
-        BuiltinToolName::FileCopy => {
-            push_tool_path_fields(
-                &mut paths,
-                object,
-                &["source", "src", "from", "source_path", "sourcePath"],
-                read,
-                workspace_root_path,
-            );
-            push_tool_path_fields(
-                &mut paths,
-                object,
-                &[
-                    "destination",
-                    "dst",
-                    "dest",
-                    "to",
-                    "destination_path",
-                    "destinationPath",
-                    "target_path",
-                    "targetPath",
-                ],
-                write,
-                workspace_root_path,
-            );
-        }
-        BuiltinToolName::FileMove => {
-            push_tool_path_fields(
-                &mut paths,
-                object,
-                &["source", "src", "from", "source_path", "sourcePath"],
-                write,
-                workspace_root_path,
-            );
-            push_tool_path_fields(
-                &mut paths,
-                object,
-                &[
-                    "destination",
-                    "dst",
-                    "dest",
-                    "to",
-                    "destination_path",
-                    "destinationPath",
-                    "target_path",
-                    "targetPath",
-                ],
-                write,
-                workspace_root_path,
-            );
-        }
-        BuiltinToolName::DiffPreview => {
-            push_tool_path_fields(
-                &mut paths,
-                object,
-                &["before_path", "beforePath", "left_path", "leftPath"],
-                read,
-                workspace_root_path,
-            );
-            push_tool_path_fields(
-                &mut paths,
-                object,
-                &["after_path", "afterPath", "right_path", "rightPath"],
-                read,
-                workspace_root_path,
-            );
-        }
-        BuiltinToolName::SearchText | BuiltinToolName::CodeSymbols => {
-            push_tool_path_fields(
-                &mut paths,
-                object,
-                &[
-                    "path",
-                    "root",
-                    "cwd",
-                    "working_directory",
-                    "workingDirectory",
-                    "workdir",
-                ],
-                read,
-                workspace_root_path,
-            );
-        }
-        BuiltinToolName::ShellExec => {
-            let shell_kind =
-                if magi_permissions::PermissionEngine::shell_arguments_request_read_only(arguments)
-                {
-                    read
-                } else {
-                    write
-                };
-            push_tool_path_fields(
-                &mut paths,
-                object,
-                &["cwd", "working_directory", "workingDirectory", "workdir"],
-                shell_kind,
-                workspace_root_path,
-            );
-            if paths.is_empty()
-                && let Some(root) = workspace_root_path
-                && shell_exec_uses_working_directory(arguments, object)
-            {
-                paths.push((canonicalize_permission_path(root.as_path()), shell_kind));
-            }
-            if access_profile == magi_core::AccessProfile::ReadOnly {
-                for path in &mut paths {
-                    path.1 = read;
-                }
-            }
-        }
-        BuiltinToolName::ProcessLaunch => {
-            push_tool_path_fields(
-                &mut paths,
-                object,
-                &["cwd", "working_directory", "workingDirectory", "workdir"],
-                write,
-                workspace_root_path,
-            );
-            if paths.is_empty()
-                && let Some(root) = workspace_root_path
-            {
-                paths.push((canonicalize_permission_path(root.as_path()), write));
-            }
-        }
-        _ => {}
-    }
-
-    dedup_path_accesses(paths)
 }
 
 fn select_access_profile_axis_decision(
@@ -2165,79 +1914,6 @@ fn select_access_profile_axis_decision(
         }
         None => None,
     }
-}
-
-fn shell_exec_uses_working_directory(
-    arguments: &str,
-    object: Option<&serde_json::Map<String, serde_json::Value>>,
-) -> bool {
-    let Some(object) = object else {
-        return !arguments.trim().is_empty();
-    };
-    object_has_non_empty_string(object, &["command", "script", "line"])
-}
-
-fn object_has_non_empty_string(
-    object: &serde_json::Map<String, serde_json::Value>,
-    keys: &[&str],
-) -> bool {
-    keys.iter().any(|key| {
-        object
-            .get(*key)
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|value| !value.trim().is_empty())
-    })
-}
-
-fn push_tool_path_fields(
-    paths: &mut Vec<(PathBuf, magi_permissions::PathAccessKind)>,
-    object: Option<&serde_json::Map<String, serde_json::Value>>,
-    keys: &[&str],
-    kind: magi_permissions::PathAccessKind,
-    workspace_root_path: Option<&PathBuf>,
-) {
-    let Some(object) = object else {
-        return;
-    };
-    for key in keys {
-        if let Some(path) = object
-            .get(*key)
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|path| !path.is_empty())
-        {
-            paths.push((resolve_tool_path(path, workspace_root_path), kind));
-        }
-    }
-}
-
-fn push_raw_path_argument(
-    paths: &mut Vec<(PathBuf, magi_permissions::PathAccessKind)>,
-    object: Option<&serde_json::Map<String, serde_json::Value>>,
-    arguments: &str,
-    kind: magi_permissions::PathAccessKind,
-    workspace_root_path: Option<&PathBuf>,
-) {
-    if object.is_some() {
-        return;
-    }
-    let path = arguments.trim();
-    if path.is_empty() {
-        return;
-    }
-    paths.push((resolve_tool_path(path, workspace_root_path), kind));
-}
-
-fn dedup_path_accesses(
-    paths: Vec<(PathBuf, magi_permissions::PathAccessKind)>,
-) -> Vec<(PathBuf, magi_permissions::PathAccessKind)> {
-    let mut deduped = Vec::new();
-    for item in paths {
-        if !deduped.iter().any(|existing| existing == &item) {
-            deduped.push(item);
-        }
-    }
-    deduped
 }
 
 pub(crate) fn select_preflight_decision(

@@ -25,6 +25,10 @@ mod view_image;
 pub use apply_patch::apply_patch_declared_paths_from_input;
 use builtin::{NormalizedBuiltinTool, infer_execution_status};
 use policy::WriteProtectionClaim;
+pub use policy::{
+    ToolPathAccessRequest, canonicalize_tool_permission_path, effective_tool_policy_allowed_paths,
+    normalize_tool_policy_paths, tool_path_access_requests,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BuiltinToolName {
@@ -1551,6 +1555,12 @@ pub struct ToolExecutionPolicy {
     pub source_skill_ids: Vec<String>,
     pub allowed_tool_names: Vec<String>,
     pub denied_tool_names: Vec<String>,
+    #[serde(default)]
+    pub allowed_paths: Vec<String>,
+    #[serde(default)]
+    pub denied_paths: Vec<String>,
+    #[serde(default)]
+    pub command_mode: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1860,7 +1870,9 @@ impl ToolRegistry {
             return output;
         }
         let access_mode = self.resolve_access_mode(&input);
-        if let Some(output) = self.enforce_access_profile_policy(&input, policy, access_mode) {
+        if let Some(output) =
+            self.enforce_access_profile_policy(&input, &context, policy, access_mode)
+        {
             self.record_invocation(&input, &context, &output);
             return output;
         }
@@ -4176,6 +4188,7 @@ mod tests {
                 BuiltinToolName::SearchText.as_str().to_string(),
             ],
             denied_tool_names: vec![BuiltinToolName::FileRead.as_str().to_string()],
+            ..ToolExecutionPolicy::default()
         };
 
         let denied_output = tool_registry.execute_with_policy(
@@ -4203,6 +4216,7 @@ mod tests {
             source_skill_ids: vec!["skill-y".to_string()],
             allowed_tool_names: vec![BuiltinToolName::SearchText.as_str().to_string()],
             denied_tool_names: vec![],
+            ..ToolExecutionPolicy::default()
         };
 
         let not_allowed_output = tool_registry.execute_with_policy(
@@ -4355,6 +4369,7 @@ mod tests {
                 source_skill_ids: vec!["sk-locked".to_string()],
                 allowed_tool_names: vec![BuiltinToolName::SearchText.as_str().to_string()],
                 denied_tool_names: vec![],
+                ..ToolExecutionPolicy::default()
             },
         );
 
@@ -4569,6 +4584,99 @@ mod tests {
             context,
             &policy,
         )
+    }
+
+    #[test]
+    fn registry_rejects_restricted_file_write_outside_workspace_root() {
+        let workspace = unique_temp_dir("magi-tool-runtime-policy-workspace");
+        let outside = unique_temp_dir("magi-tool-runtime-policy-outside").join("blocked.txt");
+        let inside = workspace.join("allowed.txt");
+        let registry = make_registry();
+        let context = ToolExecutionContext {
+            working_directory: Some(workspace.clone()),
+            ..ToolExecutionContext::default()
+        };
+        let policy = ToolExecutionPolicy {
+            access_profile: magi_core::AccessProfile::Restricted,
+            ..ToolExecutionPolicy::default()
+        };
+
+        let blocked = exec_tool_with_context_and_policy(
+            &registry,
+            BuiltinToolName::FileWrite,
+            &serde_json::json!({
+                "path": outside.to_string_lossy(),
+                "content": "blocked"
+            })
+            .to_string(),
+            context.clone(),
+            policy.clone(),
+        );
+
+        assert_eq!(blocked.status, ExecutionResultStatus::Rejected);
+        assert!(!outside.exists());
+        let blocked_payload: Value =
+            serde_json::from_str(&blocked.payload).expect("blocked payload json");
+        assert_eq!(blocked_payload["tool"], BuiltinToolName::FileWrite.as_str());
+        assert!(
+            blocked_payload["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("策略未授权访问路径")
+        );
+
+        let allowed = exec_tool_with_context_and_policy(
+            &registry,
+            BuiltinToolName::FileWrite,
+            &serde_json::json!({
+                "path": inside.to_string_lossy(),
+                "content": "allowed"
+            })
+            .to_string(),
+            context,
+            policy,
+        );
+
+        assert_eq!(allowed.status, ExecutionResultStatus::Succeeded);
+        assert_eq!(fs::read_to_string(&inside).unwrap(), "allowed");
+    }
+
+    #[test]
+    fn registry_rejects_outside_shell_path_before_approval() {
+        let workspace = unique_temp_dir("magi-tool-runtime-shell-workspace");
+        let outside = unique_temp_dir("magi-tool-runtime-shell-outside");
+        let registry = make_registry();
+        let output = registry.execute_with_policy(
+            ToolExecutionInput::for_builtin_invocation(
+                ToolCallId::new("tc-shell-outside-before-approval"),
+                BuiltinToolName::ShellExec.as_str(),
+                serde_json::json!({
+                    "command": "printf outside",
+                    "cwd": outside.to_string_lossy(),
+                    "access_mode": "maybe_write"
+                })
+                .to_string(),
+            ),
+            ToolExecutionContext {
+                working_directory: Some(workspace),
+                ..ToolExecutionContext::default()
+            },
+            &ToolExecutionPolicy {
+                access_profile: magi_core::AccessProfile::Restricted,
+                ..ToolExecutionPolicy::default()
+            },
+        );
+
+        assert_eq!(output.status, ExecutionResultStatus::Rejected);
+        assert_eq!(output.governance.outcome, GovernanceOutcome::Rejected);
+        let payload: Value = serde_json::from_str(&output.payload).expect("payload json");
+        assert_eq!(payload["tool"], BuiltinToolName::ShellExec.as_str());
+        assert!(
+            payload["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("策略未授权访问路径")
+        );
     }
 
     #[test]

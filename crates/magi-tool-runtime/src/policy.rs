@@ -27,6 +27,12 @@ pub(crate) struct WriteProtectionGuard {
     pub(crate) tool_call_id: ToolCallId,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolPathAccessRequest {
+    pub absolute_path: PathBuf,
+    pub kind: magi_permissions::PathAccessKind,
+}
+
 impl Drop for WriteProtectionGuard {
     fn drop(&mut self) {
         self.active_claims
@@ -134,9 +140,12 @@ impl ToolRegistry {
     pub(crate) fn enforce_access_profile_policy(
         &self,
         input: &ToolExecutionInput,
+        context: &ToolExecutionContext,
         policy: &ToolExecutionPolicy,
         access_mode: BuiltinToolAccessMode,
     ) -> Option<ToolExecutionOutput> {
+        let policy = normalize_execution_policy(policy);
+        let workspace_root_path = context.working_directory.as_deref();
         let engine = crate::builtin_permission_engine();
         let permission_policy = magi_permissions::PermissionPolicy {
             allowed_tools: policy
@@ -155,8 +164,16 @@ impl ToolRegistry {
                         .unwrap_or_else(|| tool_name.trim().to_string())
                 })
                 .collect(),
+            allowed_paths: effective_tool_policy_allowed_paths(
+                policy.access_profile,
+                &policy.allowed_paths,
+                workspace_root_path,
+            ),
+            denied_paths: normalize_tool_policy_paths(&policy.denied_paths, workspace_root_path),
+            command_mode: policy.command_mode.clone(),
             ..magi_permissions::PermissionPolicy::default()
         };
+        let mut pending_output = None;
 
         let tool_is_writeful = if input.tool_name == crate::BuiltinToolName::ShellExec.as_str() {
             false
@@ -171,9 +188,10 @@ impl ToolRegistry {
             &permission_policy,
             policy.access_profile,
         );
-        if let Some(output) =
-            self.permission_decision_output(input, tool_decision, policy.access_profile)
-        {
+        if let Some(output) = select_permission_axis_output(
+            &mut pending_output,
+            self.permission_decision_output(input, tool_decision, policy.access_profile),
+        ) {
             return Some(output);
         }
 
@@ -185,10 +203,37 @@ impl ToolRegistry {
                 &permission_policy,
                 policy.access_profile,
             );
-            return self.permission_decision_output(input, shell_decision, policy.access_profile);
+            if let Some(output) = select_permission_axis_output(
+                &mut pending_output,
+                self.permission_decision_output(input, shell_decision, policy.access_profile),
+            ) {
+                return Some(output);
+            }
         }
 
-        None
+        for path_request in tool_path_access_requests(
+            &input.tool_name,
+            &input.input,
+            workspace_root_path,
+            policy.access_profile,
+        ) {
+            let path_decision = engine.decide(
+                &magi_permissions::PermissionRequest::PathAccess {
+                    absolute_path: path_request.absolute_path.as_path(),
+                    kind: path_request.kind,
+                },
+                &permission_policy,
+                policy.access_profile,
+            );
+            if let Some(output) = select_permission_axis_output(
+                &mut pending_output,
+                self.permission_decision_output(input, path_decision, policy.access_profile),
+            ) {
+                return Some(output);
+            }
+        }
+
+        pending_output
     }
 
     fn permission_decision_output(
@@ -461,6 +506,383 @@ fn permission_decision_payload(
     .to_string()
 }
 
+fn select_permission_axis_output(
+    pending_output: &mut Option<ToolExecutionOutput>,
+    output: Option<ToolExecutionOutput>,
+) -> Option<ToolExecutionOutput> {
+    match output {
+        Some(output) if output.status == ExecutionResultStatus::Rejected => Some(output),
+        Some(output) => {
+            if pending_output.is_none() {
+                *pending_output = Some(output);
+            }
+            None
+        }
+        None => None,
+    }
+}
+
+pub fn effective_tool_policy_allowed_paths(
+    access_profile: AccessProfile,
+    allowed_paths: &[String],
+    workspace_root_path: Option<&Path>,
+) -> Vec<PathBuf> {
+    let normalized = normalize_tool_policy_paths(allowed_paths, workspace_root_path);
+    if !normalized.is_empty() || access_profile == AccessProfile::FullAccess {
+        return normalized;
+    }
+    workspace_root_path
+        .map(|root| vec![canonicalize_tool_permission_path(root)])
+        .unwrap_or_default()
+}
+
+pub fn normalize_tool_policy_paths(
+    paths: &[String],
+    workspace_root_path: Option<&Path>,
+) -> Vec<PathBuf> {
+    paths
+        .iter()
+        .filter_map(|path| {
+            let trimmed = path.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            Some(resolve_tool_policy_path(trimmed, workspace_root_path))
+        })
+        .collect()
+}
+
+fn resolve_tool_policy_path(path: &str, workspace_root_path: Option<&Path>) -> PathBuf {
+    let path = PathBuf::from(path);
+    let resolved = if path.is_absolute() {
+        path
+    } else if let Some(root) = workspace_root_path {
+        root.join(path)
+    } else {
+        path
+    };
+    canonicalize_tool_permission_path(resolved.as_path())
+}
+
+fn resolve_tool_path(path: &str, workspace_root_path: Option<&Path>) -> PathBuf {
+    resolve_tool_policy_path(path, workspace_root_path)
+}
+
+fn normalize_permission_path(path: PathBuf) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                let can_pop = normalized
+                    .components()
+                    .next_back()
+                    .is_some_and(|last| matches!(last, Component::Normal(_)));
+                if can_pop {
+                    normalized.pop();
+                }
+            }
+            Component::Normal(value) => normalized.push(value),
+        }
+    }
+    normalized
+}
+
+pub fn canonicalize_tool_permission_path(path: &Path) -> PathBuf {
+    let lexical_path = normalize_permission_path(path.to_path_buf());
+    if let Ok(canonical_path) = lexical_path.canonicalize() {
+        return normalize_permission_path(canonical_path);
+    }
+    canonicalize_existing_permission_ancestor(&lexical_path).unwrap_or(lexical_path)
+}
+
+fn canonicalize_existing_permission_ancestor(path: &Path) -> Option<PathBuf> {
+    let mut ancestor = path.to_path_buf();
+    let mut missing_components = Vec::new();
+    loop {
+        if let Ok(canonical_ancestor) = ancestor.canonicalize() {
+            let mut resolved = normalize_permission_path(canonical_ancestor);
+            for component in missing_components.iter().rev() {
+                resolved.push(component);
+            }
+            return Some(normalize_permission_path(resolved));
+        }
+        let component = ancestor.file_name()?.to_os_string();
+        missing_components.push(component);
+        if !ancestor.pop() {
+            return None;
+        }
+    }
+}
+
+pub fn tool_path_access_requests(
+    canonical_tool_name: &str,
+    arguments: &str,
+    workspace_root_path: Option<&Path>,
+    access_profile: AccessProfile,
+) -> Vec<ToolPathAccessRequest> {
+    let Some(tool) = crate::BuiltinToolName::from_str(canonical_tool_name) else {
+        return Vec::new();
+    };
+    let write = magi_permissions::PathAccessKind::Write;
+    let read = magi_permissions::PathAccessKind::Read;
+    let mut paths = Vec::new();
+
+    if tool == crate::BuiltinToolName::ApplyPatch {
+        for path in apply_patch_declared_paths_from_input(arguments) {
+            paths.push(ToolPathAccessRequest {
+                absolute_path: resolve_tool_path(&path.to_string_lossy(), workspace_root_path),
+                kind: write,
+            });
+        }
+        return dedup_path_accesses(paths);
+    }
+
+    let arguments_value = serde_json::from_str::<Value>(arguments).ok();
+    let object = arguments_value.as_ref().and_then(Value::as_object);
+
+    match tool {
+        crate::BuiltinToolName::FileRead | crate::BuiltinToolName::ViewImage => {
+            push_tool_path_fields(
+                &mut paths,
+                object,
+                &["path", "file_path", "filePath", "image_path", "imagePath"],
+                read,
+                workspace_root_path,
+            );
+            push_raw_path_argument(&mut paths, object, arguments, read, workspace_root_path);
+        }
+        crate::BuiltinToolName::FileWrite
+        | crate::BuiltinToolName::FilePatch
+        | crate::BuiltinToolName::FileRemove => {
+            push_tool_path_fields(
+                &mut paths,
+                object,
+                &["path", "file_path", "filePath"],
+                write,
+                workspace_root_path,
+            );
+        }
+        crate::BuiltinToolName::FileMkdir => {
+            push_tool_path_fields(
+                &mut paths,
+                object,
+                &["path", "file_path", "filePath", "dir_path", "dirPath"],
+                write,
+                workspace_root_path,
+            );
+        }
+        crate::BuiltinToolName::FileCopy => {
+            push_tool_path_fields(
+                &mut paths,
+                object,
+                &["source", "src", "from", "source_path", "sourcePath"],
+                read,
+                workspace_root_path,
+            );
+            push_tool_path_fields(
+                &mut paths,
+                object,
+                &[
+                    "destination",
+                    "dst",
+                    "dest",
+                    "to",
+                    "destination_path",
+                    "destinationPath",
+                    "target_path",
+                    "targetPath",
+                ],
+                write,
+                workspace_root_path,
+            );
+        }
+        crate::BuiltinToolName::FileMove => {
+            push_tool_path_fields(
+                &mut paths,
+                object,
+                &["source", "src", "from", "source_path", "sourcePath"],
+                write,
+                workspace_root_path,
+            );
+            push_tool_path_fields(
+                &mut paths,
+                object,
+                &[
+                    "destination",
+                    "dst",
+                    "dest",
+                    "to",
+                    "destination_path",
+                    "destinationPath",
+                    "target_path",
+                    "targetPath",
+                ],
+                write,
+                workspace_root_path,
+            );
+        }
+        crate::BuiltinToolName::DiffPreview => {
+            push_tool_path_fields(
+                &mut paths,
+                object,
+                &["before_path", "beforePath", "left_path", "leftPath"],
+                read,
+                workspace_root_path,
+            );
+            push_tool_path_fields(
+                &mut paths,
+                object,
+                &["after_path", "afterPath", "right_path", "rightPath"],
+                read,
+                workspace_root_path,
+            );
+        }
+        crate::BuiltinToolName::SearchText | crate::BuiltinToolName::CodeSymbols => {
+            push_tool_path_fields(
+                &mut paths,
+                object,
+                &[
+                    "path",
+                    "root",
+                    "cwd",
+                    "working_directory",
+                    "workingDirectory",
+                    "workdir",
+                ],
+                read,
+                workspace_root_path,
+            );
+        }
+        crate::BuiltinToolName::ShellExec => {
+            let shell_kind =
+                if magi_permissions::PermissionEngine::shell_arguments_request_read_only(arguments)
+                {
+                    read
+                } else {
+                    write
+                };
+            push_tool_path_fields(
+                &mut paths,
+                object,
+                &["cwd", "working_directory", "workingDirectory", "workdir"],
+                shell_kind,
+                workspace_root_path,
+            );
+            if paths.is_empty()
+                && let Some(root) = workspace_root_path
+                && shell_exec_uses_working_directory(arguments, object)
+            {
+                paths.push(ToolPathAccessRequest {
+                    absolute_path: canonicalize_tool_permission_path(root),
+                    kind: shell_kind,
+                });
+            }
+            if access_profile == AccessProfile::ReadOnly {
+                for path in &mut paths {
+                    path.kind = read;
+                }
+            }
+        }
+        crate::BuiltinToolName::ProcessLaunch => {
+            push_tool_path_fields(
+                &mut paths,
+                object,
+                &["cwd", "working_directory", "workingDirectory", "workdir"],
+                write,
+                workspace_root_path,
+            );
+            if paths.is_empty()
+                && let Some(root) = workspace_root_path
+            {
+                paths.push(ToolPathAccessRequest {
+                    absolute_path: canonicalize_tool_permission_path(root),
+                    kind: write,
+                });
+            }
+        }
+        _ => {}
+    }
+
+    dedup_path_accesses(paths)
+}
+
+fn shell_exec_uses_working_directory(
+    arguments: &str,
+    object: Option<&serde_json::Map<String, Value>>,
+) -> bool {
+    let Some(object) = object else {
+        return !arguments.trim().is_empty();
+    };
+    object_has_non_empty_string(object, &["command", "script", "line"])
+}
+
+fn object_has_non_empty_string(object: &serde_json::Map<String, Value>, keys: &[&str]) -> bool {
+    keys.iter().any(|key| {
+        object
+            .get(*key)
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty())
+    })
+}
+
+fn push_tool_path_fields(
+    paths: &mut Vec<ToolPathAccessRequest>,
+    object: Option<&serde_json::Map<String, Value>>,
+    keys: &[&str],
+    kind: magi_permissions::PathAccessKind,
+    workspace_root_path: Option<&Path>,
+) {
+    let Some(object) = object else {
+        return;
+    };
+    for key in keys {
+        if let Some(path) = object
+            .get(*key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+        {
+            paths.push(ToolPathAccessRequest {
+                absolute_path: resolve_tool_path(path, workspace_root_path),
+                kind,
+            });
+        }
+    }
+}
+
+fn push_raw_path_argument(
+    paths: &mut Vec<ToolPathAccessRequest>,
+    object: Option<&serde_json::Map<String, Value>>,
+    arguments: &str,
+    kind: magi_permissions::PathAccessKind,
+    workspace_root_path: Option<&Path>,
+) {
+    if object.is_some() {
+        return;
+    }
+    let path = arguments.trim();
+    if path.is_empty() {
+        return;
+    }
+    paths.push(ToolPathAccessRequest {
+        absolute_path: resolve_tool_path(path, workspace_root_path),
+        kind,
+    });
+}
+
+fn dedup_path_accesses(paths: Vec<ToolPathAccessRequest>) -> Vec<ToolPathAccessRequest> {
+    let mut deduped = Vec::new();
+    for item in paths {
+        if !deduped.iter().any(|existing| existing == &item) {
+            deduped.push(item);
+        }
+    }
+    deduped
+}
+
 fn normalize_execution_policy(policy: &ToolExecutionPolicy) -> ToolExecutionPolicy {
     let mut normalized = policy.clone();
     normalized.source_skill_ids.sort();
@@ -469,6 +891,10 @@ fn normalize_execution_policy(policy: &ToolExecutionPolicy) -> ToolExecutionPoli
     normalized.allowed_tool_names.dedup();
     normalized.denied_tool_names.sort();
     normalized.denied_tool_names.dedup();
+    normalized.allowed_paths.sort();
+    normalized.allowed_paths.dedup();
+    normalized.denied_paths.sort();
+    normalized.denied_paths.dedup();
     normalized
 }
 

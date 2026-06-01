@@ -55,6 +55,21 @@ pub fn extract_skill_custom_tool_payload(arguments: &str) -> String {
         .unwrap_or_else(|| arguments.to_string())
 }
 
+pub fn tool_execution_policy_scope(
+    access_profile: AccessProfile,
+    command_mode: impl Into<String>,
+    allowed_paths: &[String],
+    denied_paths: &[String],
+) -> ToolExecutionPolicy {
+    ToolExecutionPolicy {
+        access_profile,
+        allowed_paths: allowed_paths.to_vec(),
+        denied_paths: denied_paths.to_vec(),
+        command_mode: command_mode.into(),
+        ..ToolExecutionPolicy::default()
+    }
+}
+
 pub fn active_skill_tool_execution_policy(
     access_profile: AccessProfile,
     skill_runtime: Option<&SkillRuntime>,
@@ -140,7 +155,7 @@ pub fn execute_skill_custom_tool(
     tool_skill_name: &str,
     binding_id: &str,
     active_skill_name: Option<&str>,
-    access_profile: AccessProfile,
+    execution_policy_scope: ToolExecutionPolicy,
     safety_gate: Option<&magi_safety_gate::SafetyGate>,
     skill_runtime: Option<&SkillRuntime>,
     skill_dispatch_runtime: Option<&SkillDispatchRuntime>,
@@ -186,11 +201,15 @@ pub fn execute_skill_custom_tool(
         );
     };
 
+    let access_profile = execution_policy_scope.access_profile;
     let mut plan = skill_runtime.build_tool_runtime_plan(SkillSelection {
         skill_ids: vec![tool_skill_name.to_string()],
         requested_tools: Vec::new(),
     });
     plan.tool_policy.access_profile = access_profile;
+    plan.tool_policy.allowed_paths = execution_policy_scope.allowed_paths;
+    plan.tool_policy.denied_paths = execution_policy_scope.denied_paths;
+    plan.tool_policy.command_mode = execution_policy_scope.command_mode;
     let Some(binding) = plan
         .custom_tool_bindings
         .iter()
@@ -431,7 +450,7 @@ mod tests {
             "code-review",
             "review",
             Some("code-review"),
-            AccessProfile::Restricted,
+            tool_execution_policy_scope(AccessProfile::Restricted, "", &[], &[]),
             None,
             None,
             None,
@@ -453,7 +472,7 @@ mod tests {
             "other",
             "review",
             Some("active"),
-            AccessProfile::Restricted,
+            tool_execution_policy_scope(AccessProfile::Restricted, "", &[], &[]),
             None,
             None,
             None,
@@ -478,7 +497,7 @@ mod tests {
             "code-review",
             "missing",
             Some("code-review"),
-            AccessProfile::Restricted,
+            tool_execution_policy_scope(AccessProfile::Restricted, "", &[], &[]),
             None,
             Some(&skill_runtime),
             Some(&dispatch_runtime),

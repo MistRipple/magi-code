@@ -9,6 +9,7 @@ use crate::{
     tool_batch::{
         access_profile_tool_decision, safety_gate_tool_decision, select_preflight_decision,
     },
+    tool_execution_policy_scope,
 };
 use magi_bridge_client::{
     ChatMessage, ChatToolCall,
@@ -943,7 +944,7 @@ fn execute_session_turn_tool_call(
             &tool_skill_name,
             &binding_id,
             skill_name,
-            access_profile,
+            tool_execution_policy_scope(access_profile, "", &[], &[]),
             safety_gate,
             skill_runtime,
             skill_dispatch_runtime,
