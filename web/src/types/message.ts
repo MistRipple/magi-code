@@ -529,7 +529,6 @@ export interface Message {
     finalStreamSeq?: number;          // 封口流式序号
     lateArrival?: boolean;            // 是否为晚到补遗
     lateFromCardId?: string;          // 晚到来源 cardId
-    images?: Array<{ dataUrl: string }>; // 🔧 从 metadata 提取的图片（后端传递）
     [key: string]: unknown;
   };
 }

@@ -195,6 +195,38 @@ function resolveItemContent(item: CanonicalTurnItem): string {
   return item.title || '';
 }
 
+function normalizeMessageImagesFromMetadata(
+  metadata: Record<string, unknown> | undefined,
+): Message['images'] | undefined {
+  const images = metadata?.images;
+  if (!Array.isArray(images)) {
+    return undefined;
+  }
+  const normalized = images
+    .filter((image): image is Record<string, unknown> => (
+      Boolean(image)
+      && typeof image === 'object'
+      && !Array.isArray(image)
+    ))
+    .map((image) => {
+      const dataUrl = typeof image.dataUrl === 'string' ? image.dataUrl.trim() : '';
+      return dataUrl ? { dataUrl } : null;
+    })
+    .filter((image): image is { dataUrl: string } => image !== null);
+  return normalized.length > 0 ? normalized : undefined;
+}
+
+function messageMetadataWithoutTransportImages(
+  metadata: Record<string, unknown> | undefined,
+): Record<string, unknown> {
+  if (!metadata) {
+    return {};
+  }
+  const messageMetadata = { ...metadata };
+  delete messageMetadata.images;
+  return messageMetadata;
+}
+
 function shouldRenderItem(item: CanonicalTurnItem): boolean {
   if (item.visibility.renderable === false) {
     return false;
@@ -249,19 +281,23 @@ function buildMessage(
     ? turn.responseDurationMs
     : undefined;
   const presentationSeq = requirePresentationSeq(presentation, item);
+  const images = item.kind === 'user_message'
+    ? normalizeMessageImagesFromMetadata(item.metadata)
+    : undefined;
   return {
     id: artifactId,
     role: resolveMessageRole(item),
     source: resolveMessageSource(item),
     content,
     ...(blocks ? { blocks } : {}),
+    ...(images ? { images } : {}),
     timestamp: item.createdAt,
     updatedAt: item.updatedAt,
     isStreaming,
     isComplete: !isStreaming,
     type: resolveMessageType(item),
     metadata: {
-      ...(item.metadata || {}),
+      ...messageMetadataWithoutTransportImages(item.metadata),
       turnId: item.turnId,
       turnSeq: item.turnSeq,
       turnStatus: turn.status,

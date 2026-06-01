@@ -234,11 +234,7 @@
     info: 'var(--info)',
   };
 
-  // 获取消息中的图片
-  // 优先从 message.images，其次从 message.metadata?.images
-  const messageImages = $derived(
-    message.images || (message.metadata?.images as Array<{ dataUrl: string }>) || []
-  );
+  const messageImages = $derived(message.images || []);
 
   // 图片预览弹窗状态
   let showImagePreview = $state(false);

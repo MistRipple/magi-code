@@ -227,9 +227,14 @@ function assertUserImageMetadataProjectsToMessage(reducer, projection) {
   const userArtifact = findArtifactByTurnItemId(projectionValue, 'user-message');
   assert.ok(userArtifact, 'user image message artifact should exist');
   assert.deepEqual(
+    userArtifact.message.images,
+    imageMetadata.images.map((image) => ({ dataUrl: image.dataUrl })),
+    'user image metadata must project to first-class Message.images for MessageItem rendering',
+  );
+  assert.equal(
     userArtifact.message.metadata?.images,
-    imageMetadata.images,
-    'user image metadata must survive canonical projection for MessageItem rendering',
+    undefined,
+    'transport image metadata should not remain duplicated on projected message metadata',
   );
 }
 
