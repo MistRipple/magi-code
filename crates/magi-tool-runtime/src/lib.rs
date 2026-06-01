@@ -411,6 +411,10 @@ impl BuiltinToolName {
         }
     }
 
+    pub fn uses_input_sensitive_invocation_policy(&self) -> bool {
+        matches!(self, Self::ShellExec | Self::FileRemove)
+    }
+
     pub fn description(&self) -> &'static str {
         match self {
             Self::FileRead => {

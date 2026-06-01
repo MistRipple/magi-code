@@ -107,6 +107,9 @@ pub(crate) fn build_tool_catalog_value(
             "public": is_public,
             "runtime_internal": tool.is_runtime_internal_tool_call(),
             "access_mode": access_mode_for_tool(tool).as_str(),
+            "policy_scope": policy_scope_label(tool),
+            "input_sensitive_policy": tool.uses_input_sensitive_invocation_policy(),
+            "policy_summary": policy_summary(tool),
             "risk_level": risk_level_label(tool),
             "approval_requirement": approval_requirement_label(tool),
             "schema_status": if schema_warnings.is_empty() { "ok" } else { "warning" },
@@ -498,6 +501,22 @@ fn access_mode_for_tool(tool: BuiltinToolName) -> BuiltinToolAccessMode {
     tool.default_access_mode()
 }
 
+fn policy_scope_label(tool: BuiltinToolName) -> &'static str {
+    if tool.uses_input_sensitive_invocation_policy() {
+        "input_sensitive"
+    } else {
+        "fixed"
+    }
+}
+
+fn policy_summary(tool: BuiltinToolName) -> &'static str {
+    match tool {
+        BuiltinToolName::ShellExec => "按 action、access_mode 和命令写入迹象逐次判定风险与审批要求",
+        BuiltinToolName::FileRemove => "普通单文件删除为中风险；递归、force 或高危目标删除需要审批",
+        _ => "使用工具默认风险与审批策略",
+    }
+}
+
 fn risk_level_label(tool: BuiltinToolName) -> &'static str {
     match tool.default_risk_level() {
         magi_core::RiskLevel::Low => "low",
@@ -588,6 +607,29 @@ mod tests {
         assert!(names.contains(&"view_image"));
         assert!(names.contains(&"tool_catalog"));
         assert!(!names.contains(&"process_launch"));
+        let shell_exec = payload["tools"]
+            .as_array()
+            .expect("tools")
+            .iter()
+            .find(|tool| tool["name"] == "shell_exec")
+            .expect("shell_exec should be listed");
+        assert_eq!(shell_exec["policy_scope"], "input_sensitive");
+        assert_eq!(shell_exec["input_sensitive_policy"], true);
+        assert!(
+            shell_exec["policy_summary"]
+                .as_str()
+                .expect("policy_summary")
+                .contains("逐次判定"),
+            "input-sensitive tools should explain that runtime policy is decided per invocation"
+        );
+        let file_read = payload["tools"]
+            .as_array()
+            .expect("tools")
+            .iter()
+            .find(|tool| tool["name"] == "file_read")
+            .expect("file_read should be listed");
+        assert_eq!(file_read["policy_scope"], "fixed");
+        assert_eq!(file_read["input_sensitive_policy"], false);
         let search_semantic = payload["tools"]
             .as_array()
             .expect("tools")

@@ -1495,6 +1495,16 @@ mod tests {
             .expect("shell_exec should be exposed");
         assert_eq!(shell_exec["runtimeStatus"], serde_json::json!("ready"));
         assert_eq!(
+            shell_exec["policyScope"],
+            serde_json::json!("input_sensitive"),
+            "settings bootstrap should preserve tool catalog policy scope"
+        );
+        assert_eq!(
+            shell_exec["inputSensitivePolicy"],
+            serde_json::json!(true),
+            "settings bootstrap should distinguish input-sensitive invocation policy"
+        );
+        assert_eq!(
             shell_exec["runtimeInternal"],
             serde_json::json!(false),
             "ordinary public tools should not be marked as task-runtime-only"

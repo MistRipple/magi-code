@@ -176,6 +176,9 @@ function normalizeBuiltinTools(value: unknown): SettingsBuiltinTool[] {
     const riskLevel = readRecordField(record, 'riskLevel', 'risk_level');
     const approvalRequirement = readRecordField(record, 'approvalRequirement', 'approval_requirement');
     const accessMode = readRecordField(record, 'accessMode', 'access_mode');
+    const policyScope = readRecordField(record, 'policyScope', 'policy_scope');
+    const inputSensitivePolicy = readRecordField(record, 'inputSensitivePolicy', 'input_sensitive_policy');
+    const policySummary = readRecordField(record, 'policySummary', 'policy_summary');
     const runtimeInternal = readRecordField(record, 'runtimeInternal', 'runtime_internal');
     const runtimeStatus = readRecordField(record, 'runtimeStatus', 'runtime_status');
     const runtimeWarnings = readRecordField(record, 'runtimeWarnings', 'runtime_warnings');
@@ -186,6 +189,9 @@ function normalizeBuiltinTools(value: unknown): SettingsBuiltinTool[] {
       riskLevel: typeof riskLevel === 'string' ? riskLevel : '',
       approvalRequirement: typeof approvalRequirement === 'string' ? approvalRequirement : '',
       accessMode: typeof accessMode === 'string' ? accessMode : 'read_only',
+      policyScope: typeof policyScope === 'string' ? policyScope : 'fixed',
+      inputSensitivePolicy: inputSensitivePolicy === true,
+      policySummary: typeof policySummary === 'string' ? policySummary : '',
       runtimeInternal: runtimeInternal === true,
       runtimeStatus: typeof runtimeStatus === 'string' ? runtimeStatus : 'ready',
       runtimeWarnings: normalizeWarningMarkers(runtimeWarnings, 'runtime_warning'),

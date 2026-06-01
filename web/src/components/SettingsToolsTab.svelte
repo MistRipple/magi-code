@@ -38,6 +38,9 @@
       riskLevel: string;
       approvalRequirement: string;
       accessMode: string;
+      policyScope: string;
+      inputSensitivePolicy: boolean;
+      policySummary: string;
       runtimeInternal: boolean;
       runtimeStatus: string;
       runtimeWarnings: string[];

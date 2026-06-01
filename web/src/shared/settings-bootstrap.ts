@@ -20,6 +20,9 @@ export interface SettingsBuiltinTool {
   riskLevel?: string;
   approvalRequirement?: string;
   accessMode?: 'read_only' | 'maybe_write' | 'explicit_write' | string;
+  policyScope?: 'fixed' | 'input_sensitive' | string;
+  inputSensitivePolicy?: boolean;
+  policySummary?: string;
   runtimeInternal?: boolean;
   runtimeStatus?: string;
   runtimeWarnings?: string[];
