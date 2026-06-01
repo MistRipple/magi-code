@@ -18,6 +18,9 @@ use crate::{
 };
 use magi_conversation_runtime::session_images::SessionTurnImage;
 use magi_conversation_runtime::session_writeback::publish_current_session_turn_item_event;
+use magi_session_store::{
+    CANONICAL_TURN_SCHEMA_VERSION, CanonicalTurn, CanonicalTurnItem, CanonicalTurnItemKind,
+};
 
 pub(super) async fn accept_session_task_submission(
     state: &ApiState,
@@ -128,6 +131,48 @@ async fn execute_dispatch_submission(
         );
     }
     Ok((accepted, event_id))
+}
+
+pub(super) fn dispatch_accepted_canonical_event(
+    state: &ApiState,
+    accepted: &DispatchSubmissionAccepted,
+) -> (Option<CanonicalTurn>, Option<CanonicalTurnItem>) {
+    let current_turn_id = state
+        .session_store
+        .runtime_sidecar(&accepted.session_id)
+        .and_then(|sidecar| sidecar.current_turn.map(|turn| turn.turn_id));
+    let canonical_turn = state
+        .session_store
+        .canonical_turns_for_session(&accepted.session_id)
+        .into_iter()
+        .find(|turn| {
+            current_turn_id
+                .as_ref()
+                .is_some_and(|turn_id| &turn.turn_id == turn_id)
+                || (turn.accepted_at == accepted.accepted_at
+                    && turn.items.iter().any(|item| {
+                        item.worker
+                            .as_ref()
+                            .and_then(|worker| worker.task_id.as_ref())
+                            == Some(&accepted.action_task_id)
+                    }))
+        });
+    let canonical_item = canonical_turn
+        .as_ref()
+        .and_then(|turn| {
+            turn.items
+                .iter()
+                .find(|item| item.item_id == accepted.user_message_item_id)
+        })
+        .or_else(|| {
+            canonical_turn.as_ref().and_then(|turn| {
+                turn.items
+                    .iter()
+                    .find(|item| item.kind == CanonicalTurnItemKind::UserMessage)
+            })
+        })
+        .cloned();
+    (canonical_turn, canonical_item)
 }
 
 pub(super) fn finalize_session_task_dispatch(
@@ -306,6 +351,8 @@ fn publish_session_turn_task_accepted_event(
         .execution_ownership(&accepted.session_id)
         .and_then(|ownership| ownership.workspace_id)
         .or_else(|| request.requested_workspace_id().map(WorkspaceId::new));
+    let workspace_id_payload = workspace_id.as_ref().map(ToString::to_string);
+    let (canonical_turn, canonical_item) = dispatch_accepted_canonical_event(state, accepted);
     let event_id = EventId::new(format!(
         "event-session-turn-task-{}",
         accepted.accepted_at.0
@@ -316,7 +363,7 @@ fn publish_session_turn_task_accepted_event(
         json!({
             "session_id": accepted.session_id,
             "entry_id": accepted.entry_id,
-            "workspace_id": request.requested_workspace_id(),
+            "workspace_id": workspace_id_payload,
             "text": request.trimmed_text(),
             "skill_name": request.skill_name.clone(),
             "request_id": request.request_id(),
@@ -328,6 +375,10 @@ fn publish_session_turn_task_accepted_event(
             "root_task_id": accepted.root_task_id.to_string(),
             "action_task_id": accepted.action_task_id.to_string(),
             "runner_started": accepted.runner_started,
+            "canonical_schema_version": CANONICAL_TURN_SCHEMA_VERSION,
+            "canonical_event_kind": "turn_started",
+            "canonical_turn": canonical_turn,
+            "canonical_item": canonical_item,
         }),
     )
     .with_context(EventContext {

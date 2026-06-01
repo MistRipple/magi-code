@@ -65,6 +65,7 @@ pub struct DispatchSubmissionAccepted {
     pub created_session: bool,
     pub root_task_id: TaskId,
     pub action_task_id: TaskId,
+    pub user_message_item_id: String,
     pub runner_started: bool,
 }
 
@@ -500,6 +501,11 @@ pub fn accept_dispatch_submission(
         }
     }
 
+    let user_message_item_id = request
+        .user_message_id
+        .clone()
+        .unwrap_or_else(|| format!("turn-item-user-{}", request.accepted_at.0));
+
     Ok(DispatchSubmissionAccepted {
         session_id: request.session_id,
         entry_id: request.entry_id,
@@ -507,6 +513,7 @@ pub fn accept_dispatch_submission(
         created_session: request.created_session,
         root_task_id: graph.root_task_id,
         action_task_id: graph.action_task_id,
+        user_message_item_id,
         runner_started: false,
     })
 }

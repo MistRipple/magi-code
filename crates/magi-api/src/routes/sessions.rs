@@ -130,21 +130,27 @@ async fn submit_session_turn(
                 .session_store
                 .runtime_sidecar(&accepted.session_id)
                 .and_then(|sidecar| sidecar.ownership.execution_chain_ref);
-            let user_message_item_id = request
-                .user_message_id()
-                .unwrap_or_else(|| format!("turn-item-user-{}", accepted.accepted_at.0));
-            Ok(Json(SessionTurnResponseDto::new(
-                accepted.session_id,
-                accepted.entry_id,
-                event_id,
-                accepted.accepted_at,
-                accepted.created_session,
-                SessionTurnRouteDto::Task,
-                Some(accepted.root_task_id),
-                Some(accepted.action_task_id),
-                execution_chain_ref,
-                Some(user_message_item_id),
-            )))
+            let (accepted_canonical_turn, accepted_canonical_item) =
+                super::dispatch_accepted_canonical_event(&state, &accepted);
+            Ok(Json(
+                SessionTurnResponseDto::new(
+                    accepted.session_id,
+                    accepted.entry_id,
+                    event_id,
+                    accepted.accepted_at,
+                    accepted.created_session,
+                    SessionTurnRouteDto::Task,
+                    Some(accepted.root_task_id),
+                    Some(accepted.action_task_id),
+                    execution_chain_ref,
+                    Some(accepted.user_message_item_id),
+                )
+                .with_canonical_event(
+                    "turn_started",
+                    accepted_canonical_turn,
+                    accepted_canonical_item,
+                ),
+            ))
         }
         SessionTurnRouteDto::SupplementContext => {
             unreachable!("supplement_context route should be handled before classifier")
@@ -2076,6 +2082,7 @@ fn finalize_continue_session(
             created_session: false,
             root_task_id: accepted.root_task_id.clone(),
             action_task_id: accepted.action_task_id.clone(),
+            user_message_item_id: format!("turn-item-user-{}", continued_at.0),
             runner_started: accepted.runner_started,
         },
     );
@@ -3830,6 +3837,66 @@ mod tests {
             "data:image/png;base64,AAA"
         );
         assert_eq!(user_item.metadata["images"][0]["name"], "paste.png");
+    }
+
+    #[tokio::test]
+    async fn task_session_turn_accept_returns_canonical_user_image_item() {
+        let task_store = Arc::new(TaskStore::new());
+        let state = test_state().with_task_store(task_store);
+        let workspace_id =
+            register_workspace(&state, "workspace-task-image-turn", "task-image-turn");
+        let (status, body) = post_json(
+            state.clone(),
+            "/session/turn",
+            serde_json::json!({
+                "workspaceId": workspace_id.to_string(),
+                "text": "以任务模式分析这张图片并整理成待办",
+                "images": [{
+                    "name": "paste.png",
+                    "dataUrl": "data:image/png;base64,AAA"
+                }],
+                "requestId": "request-task-image-turn",
+                "userMessageId": "user-task-image-turn",
+                "placeholderMessageId": "assistant-task-image-turn"
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "unexpected body: {body}");
+        assert_eq!(body["route"], "task");
+        assert_eq!(body["userMessageItemId"], "user-task-image-turn");
+        assert_eq!(body["canonicalEventKind"], "turn_started");
+        assert_eq!(
+            body["canonicalItem"]["metadata"]["images"][0]["dataUrl"],
+            "data:image/png;base64,AAA"
+        );
+        assert_eq!(
+            body["canonicalItem"]["metadata"]["images"][0]["name"],
+            "paste.png"
+        );
+
+        let event_id = body["eventId"]
+            .as_str()
+            .expect("task response should carry event id");
+        let accepted_event = state
+            .event_bus
+            .snapshot()
+            .recent_events
+            .into_iter()
+            .find(|event| event.event_id.to_string() == event_id)
+            .expect("task accepted event should be published");
+        assert_eq!(
+            accepted_event.payload["workspace_id"],
+            workspace_id.as_str()
+        );
+        assert_eq!(
+            accepted_event.payload["canonical_event_kind"],
+            "turn_started"
+        );
+        assert_eq!(
+            accepted_event.payload["canonical_item"]["metadata"]["images"][0]["dataUrl"],
+            "data:image/png;base64,AAA"
+        );
     }
 
     /// §3.1 端到端验收：simple task 路径（chat 路由）

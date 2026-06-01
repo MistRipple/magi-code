@@ -54,7 +54,7 @@ use conversation_bridge::{
 };
 use dispatch_flow::{
     accept_session_task_submission, append_dispatch_assistant_message,
-    finalize_session_task_dispatch, resolve_dispatch_session,
+    dispatch_accepted_canonical_event, finalize_session_task_dispatch, resolve_dispatch_session,
 };
 
 pub fn build_router(state: ApiState) -> Router {
