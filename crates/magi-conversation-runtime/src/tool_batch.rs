@@ -1215,14 +1215,24 @@ fn agent_wait_task_is_direct_child(
         .and_then(|graph| graph.parent_of(child_task_id).cloned())
         .as_ref()
         == Some(&parent_task.task_id);
-    if graph_match {
-        return true;
+    match task_store.get_task(child_task_id) {
+        Some(child) => {
+            let parent_match = child.parent_task_id.as_ref() == Some(&parent_task.task_id);
+            (graph_match || parent_match)
+                && agent_wait_child_execution_scope_matches(parent_task, &child)
+        }
+        None => graph_match,
     }
-    task_store
-        .get_task(child_task_id)
-        .and_then(|child| child.parent_task_id)
-        .as_ref()
-        == Some(&parent_task.task_id)
+}
+
+fn agent_wait_child_execution_scope_matches(
+    parent_task: &magi_core::Task,
+    child: &magi_core::Task,
+) -> bool {
+    child.mission_id == parent_task.mission_id
+        && child.root_task_id == parent_task.root_task_id
+        && child.workspace_scope == parent_task.workspace_scope
+        && child.write_scope == parent_task.write_scope
 }
 
 fn parse_agent_wait_task_ids(parsed: &serde_json::Value) -> Vec<TaskId> {
@@ -3567,6 +3577,91 @@ mod tests {
             Some("agent_wait_scope_mismatch")
         );
         assert!(!payload.contains("foreign result"));
+    }
+
+    #[test]
+    fn agent_wait_rejects_same_parent_id_outside_execution_scope() {
+        let task_store = TaskStore::new();
+        let parent = test_task("task-agent-wait-root", "task-agent-wait-root", None);
+        let spawn_graph = Mutex::new(magi_spawn_graph::SpawnGraph::new());
+        let mut foreign_child = test_task(
+            "task-agent-wait-same-parent-foreign-scope",
+            "task-other-root",
+            Some(parent.task_id.clone()),
+        );
+        foreign_child.mission_id = MissionId::new("mission-other");
+        foreign_child.status = TaskStatus::Completed;
+        foreign_child.output_refs = vec!["foreign scoped result".to_string()];
+        task_store.insert_task(foreign_child);
+
+        let (payload, status) = execute_agent_wait(
+            &task_store,
+            &spawn_graph,
+            &parent,
+            BuiltinToolName::AgentWait,
+            &serde_json::json!({
+                "task_ids": ["task-agent-wait-same-parent-foreign-scope"],
+                "timeout_ms": 1000,
+            }),
+        );
+
+        assert_eq!(status, ExecutionResultStatus::Rejected);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&payload).expect("agent_wait rejection should be json");
+        assert_eq!(
+            parsed["error_code"].as_str(),
+            Some("agent_wait_scope_mismatch")
+        );
+        assert!(!payload.contains("foreign scoped result"));
+    }
+
+    #[test]
+    fn agent_wait_rejects_spawn_graph_edge_with_different_workspace_scope() {
+        let task_store = TaskStore::new();
+        let mut parent = test_task("task-agent-wait-root", "task-agent-wait-root", None);
+        parent.workspace_scope = Some("/workspace-a".to_string());
+        parent.write_scope = Some("/workspace-a/src".to_string());
+        let spawn_graph = Mutex::new(magi_spawn_graph::SpawnGraph::new());
+        let mut child = test_task(
+            "task-agent-wait-workspace-mismatch",
+            "task-agent-wait-root",
+            Some(parent.task_id.clone()),
+        );
+        child.workspace_scope = Some("/workspace-b".to_string());
+        child.write_scope = Some("/workspace-b/src".to_string());
+        child.status = TaskStatus::Completed;
+        child.output_refs = vec!["workspace mismatched result".to_string()];
+        spawn_graph
+            .lock()
+            .expect("spawn graph lock should be available")
+            .add_edge(
+                parent.task_id.clone(),
+                child.task_id.clone(),
+                child.kind,
+                std::time::SystemTime::now(),
+            )
+            .expect("test spawn graph edge should be accepted");
+        task_store.insert_task(child);
+
+        let (payload, status) = execute_agent_wait(
+            &task_store,
+            &spawn_graph,
+            &parent,
+            BuiltinToolName::AgentWait,
+            &serde_json::json!({
+                "task_ids": ["task-agent-wait-workspace-mismatch"],
+                "timeout_ms": 1000,
+            }),
+        );
+
+        assert_eq!(status, ExecutionResultStatus::Rejected);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&payload).expect("agent_wait rejection should be json");
+        assert_eq!(
+            parsed["error_code"].as_str(),
+            Some("agent_wait_scope_mismatch")
+        );
+        assert!(!payload.contains("workspace mismatched result"));
     }
 
     #[test]
