@@ -32,14 +32,14 @@ use magi_core::{
     EventId, ExecutionOwnership, LeaseId, SessionId, TaskStatus, TaskTier, UtcMillis,
     WorkspaceRootPath,
 };
-use magi_event_bus::{EventEnvelope, InMemoryEventBus};
+use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
 use magi_governance::GovernanceService;
 use magi_knowledge_store::{KnowledgeStore, code_scanner::ingest_workspace_code_index};
 use magi_lifecycle_notice::{LifecycleNoticeRegistry, run_subscriber as run_lifecycle_subscriber};
 use magi_memory_store::MemoryStore;
 use magi_mission_metrics::MissionMetricsRegistry;
 use magi_orchestrator::{ExecutionContextConfig, OrchestratorService, task_store::TaskStore};
-use magi_session_store::{SessionExecutionSidecarStatus, SessionStore};
+use magi_session_store::{SessionExecutionSidecarStatus, SessionRuntimeSidecar, SessionStore};
 use magi_skill_runtime::SkillDispatchRuntime;
 use magi_snapshot::SnapshotManager;
 use magi_tool_runtime::{
@@ -743,14 +743,14 @@ impl DaemonRuntime {
                 let receiver = runner_result_receiver.clone();
                 restored.set_status_change_callback(Box::new(
                     move |task_id, old_status, new_status, task: magi_core::Task| {
-                        let event = magi_event_bus::task_events::task_status_changed_event(
-                            &task_id.to_string(),
-                            &task.mission_id.to_string(),
-                            &format!("{:?}", old_status),
-                            &format!("{:?}", new_status),
-                            &format!("{:?}", task.kind),
+                        publish_task_status_changed_event(
+                            eb.as_ref(),
+                            session_store.as_ref(),
+                            task_id,
+                            old_status,
+                            new_status,
+                            &task,
                         );
-                        let _ = eb.publish(event);
                         publish_task_status_turn_item_for_active_sessions(
                             &eb,
                             session_store.as_ref(),
@@ -777,14 +777,14 @@ impl DaemonRuntime {
                 let session_store = session_store_for_task_status.clone();
                 Arc::new(TaskStore::with_status_change_callback(Box::new(
                     move |task_id, old_status, new_status, task: magi_core::Task| {
-                        let event = magi_event_bus::task_events::task_status_changed_event(
-                            &task_id.to_string(),
-                            &task.mission_id.to_string(),
-                            &format!("{:?}", old_status),
-                            &format!("{:?}", new_status),
-                            &format!("{:?}", task.kind),
+                        publish_task_status_changed_event(
+                            event_bus_for_task_store.as_ref(),
+                            session_store.as_ref(),
+                            task_id,
+                            old_status,
+                            new_status,
+                            &task,
                         );
-                        let _ = event_bus_for_task_store.publish(event);
                         publish_task_status_turn_item_for_active_sessions(
                             &event_bus_for_task_store,
                             session_store.as_ref(),
@@ -1458,19 +1458,108 @@ fn push_terminal_task_result(
     }
 }
 
+fn publish_task_status_changed_event(
+    event_bus: &InMemoryEventBus,
+    session_store: &SessionStore,
+    task_id: &magi_core::TaskId,
+    old_status: TaskStatus,
+    new_status: TaskStatus,
+    task: &magi_core::Task,
+) {
+    let scoped = task_status_event_scope(session_store, task);
+    let session_id = scoped.as_ref().map(|(session_id, _)| session_id.clone());
+    let workspace_id = scoped.and_then(|(_, workspace_id)| workspace_id);
+    let event = EventEnvelope::domain(
+        EventId::new(format!(
+            "event-task-status-changed-{}-{}",
+            task_id,
+            UtcMillis::now().0
+        )),
+        magi_event_bus::task_events::TASK_STATUS_CHANGED,
+        serde_json::json!({
+            "task_id": task_id.to_string(),
+            "root_task_id": task.root_task_id.to_string(),
+            "mission_id": task.mission_id.to_string(),
+            "title": task.title.as_str(),
+            "old_status": format!("{:?}", old_status),
+            "new_status": format!("{:?}", new_status),
+            "kind": format!("{:?}", task.kind),
+            "session_id": session_id.as_ref().map(ToString::to_string),
+            "workspace_id": workspace_id.as_ref().map(ToString::to_string),
+        }),
+    )
+    .with_context(EventContext {
+        workspace_id,
+        session_id,
+        mission_id: Some(task.mission_id.clone()),
+        task_id: Some(task_id.clone()),
+        ..EventContext::default()
+    });
+    let _ = event_bus.publish(event);
+}
+
+fn task_status_event_scope(
+    session_store: &SessionStore,
+    task: &magi_core::Task,
+) -> Option<(SessionId, Option<magi_core::WorkspaceId>)> {
+    session_store
+        .active_execution_sidecars()
+        .into_iter()
+        .find(|sidecar| task_matches_runtime_sidecar(sidecar, task))
+        .map(|sidecar| {
+            let workspace_id = sidecar
+                .active_execution_chain
+                .as_ref()
+                .and_then(|chain| chain.workspace_id.clone())
+                .or_else(|| sidecar.ownership.workspace_id.clone());
+            (sidecar.session_id, workspace_id)
+        })
+}
+
+fn task_matches_runtime_sidecar(sidecar: &SessionRuntimeSidecar, task: &magi_core::Task) -> bool {
+    let active_chain_matches = sidecar
+        .active_execution_chain
+        .as_ref()
+        .is_some_and(|chain| {
+            chain.root_task_id == task.root_task_id
+                || chain.root_task_id == task.task_id
+                || chain
+                    .active_branch_task_ids
+                    .iter()
+                    .any(|task_id| task_id == &task.task_id)
+                || chain
+                    .branches
+                    .iter()
+                    .any(|branch| branch.task_id == task.task_id)
+        });
+    let turn_matches = sidecar.current_turn.as_ref().is_some_and(|turn| {
+        turn.items
+            .iter()
+            .any(|item| item.task_id.as_ref() == Some(&task.task_id))
+    });
+    active_chain_matches || turn_matches
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{DaemonRuntime, build_agent_role_catalog_provider};
+    use super::{
+        DaemonRuntime, build_agent_role_catalog_provider, publish_task_status_changed_event,
+    };
     use crate::daemon::config::DaemonConfig;
     use axum::{
         body::{Body, to_bytes},
         http::{Request, StatusCode},
     };
     use magi_core::{
-        MissionId, Task, TaskId, TaskKind, TaskRuntimePayload, TaskStatus, UtcMillis, WorkspaceId,
+        MissionId, SessionId, Task, TaskId, TaskKind, TaskRuntimePayload, TaskStatus, ThreadId,
+        UtcMillis, WorkerId, WorkspaceId,
     };
     use magi_event_bus::AuditUsageLedgerSnapshot;
     use magi_orchestrator::task_store::TaskStore;
+    use magi_session_store::{
+        ActiveExecutionBranch, ActiveExecutionChain, ActiveExecutionDispatchContext,
+        ActiveExecutionTurn, SessionStore,
+    };
     use serde_json::{Value, json};
     use std::{
         collections::BTreeMap,
@@ -1552,6 +1641,102 @@ mod tests {
                 .any(|kind| kind == "local_agent")),
             "代理角色目录应暴露 supported_kinds，便于 tool_catalog 诊断"
         );
+    }
+
+    #[test]
+    fn task_status_changed_event_uses_active_session_workspace_scope() {
+        let event_bus = magi_event_bus::InMemoryEventBus::new(16);
+        let session_store = SessionStore::new();
+        let session_id = SessionId::new("session-task-status-scope");
+        let workspace_id = WorkspaceId::new("workspace-task-status-scope");
+        let mission_id = MissionId::new("mission-task-status-scope");
+        let task_id = TaskId::new("task-status-scope");
+        let worker_id = WorkerId::new("worker-task-status-scope");
+        let now = UtcMillis::now();
+        session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "task status scope",
+                Some(workspace_id.to_string()),
+            )
+            .expect("session should be created");
+        session_store
+            .upsert_active_execution_chain(
+                session_id.clone(),
+                ActiveExecutionChain {
+                    session_id: session_id.clone(),
+                    mission_id: mission_id.clone(),
+                    root_task_id: task_id.clone(),
+                    execution_chain_ref: "chain-task-status-scope".to_string(),
+                    workspace_id: Some(workspace_id.clone()),
+                    active_branch_task_ids: vec![task_id.clone()],
+                    active_worker_bindings: vec![worker_id.clone()],
+                    branches: vec![ActiveExecutionBranch {
+                        task_id: task_id.clone(),
+                        worker_id,
+                        stage: "execute".to_string(),
+                        lease_id: None,
+                        execution_intent_ref: None,
+                        binding_lifecycle: None,
+                        checkpoint_stage: Some("execute".to_string()),
+                        next_step_index: Some(0),
+                        checkpoint_at: Some(now),
+                        resume_mode: Some("stage-restart".to_string()),
+                        resume_token: None,
+                        use_tools: true,
+                        skill_name: None,
+                        is_primary: true,
+                        thread_id: ThreadId::new("thread-task-status-scope"),
+                    }],
+                    recovery_ref: None,
+                    dispatch_context: ActiveExecutionDispatchContext {
+                        accepted_at: now,
+                        entry_id: "timeline-task-status-scope".to_string(),
+                        trimmed_text: Some("run scoped task".to_string()),
+                        skill_name: None,
+                    },
+                    current_turn: Some(ActiveExecutionTurn {
+                        turn_id: "turn-task-status-scope".to_string(),
+                        turn_seq: now.0,
+                        accepted_at: now,
+                        completed_at: None,
+                        status: "running".to_string(),
+                        user_message: Some("run scoped task".to_string()),
+                        items: Vec::new(),
+                    }),
+                },
+            )
+            .expect("active execution chain should be stored");
+        let mut task = spawn_graph_restore_task(
+            task_id.as_str(),
+            task_id.as_str(),
+            None,
+            TaskStatus::Running,
+            now.0,
+        );
+        task.mission_id = mission_id;
+
+        publish_task_status_changed_event(
+            &event_bus,
+            &session_store,
+            &task_id,
+            TaskStatus::Pending,
+            TaskStatus::Running,
+            &task,
+        );
+
+        let event = event_bus
+            .snapshot()
+            .recent_events
+            .into_iter()
+            .find(|event| event.event_type == "task.status.changed")
+            .expect("task status event should be published");
+        assert_eq!(event.session_id.as_ref(), Some(&session_id));
+        assert_eq!(event.workspace_id.as_ref(), Some(&workspace_id));
+        assert_eq!(event.payload["session_id"], json!(session_id.as_str()));
+        assert_eq!(event.payload["workspace_id"], json!(workspace_id.as_str()));
+        assert_eq!(event.payload["root_task_id"], json!(task_id.as_str()));
+        assert_eq!(event.payload["title"], json!(task.title));
     }
 
     #[test]
