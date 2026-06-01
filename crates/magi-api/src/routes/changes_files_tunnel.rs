@@ -15,7 +15,10 @@ use magi_conversation_runtime::session_turn_execution::BUSINESS_MODEL_PROVIDER;
 use magi_conversation_runtime::task_execution_dispatcher::{RoleTarget, resolve_target_for_role};
 use magi_snapshot::SnapshotSession;
 
-use super::session_scope::{parse_session_id, require_workspace_id};
+use super::session_scope::{
+    parse_session_id, require_registered_workspace_binding,
+    resolve_optional_session_workspace_scope,
+};
 use crate::{
     change_projection::{
         SessionChangeScope, WorkspaceChangeScope, pending_changes_state,
@@ -100,6 +103,39 @@ fn workspace_scope_binding(scope: &WorkspaceChangeScope) -> serde_json::Value {
     })
 }
 
+fn resolve_workspace_change_scope_from_request(
+    state: &ApiState,
+    workspace_id: Option<&str>,
+    workspace_path: Option<&str>,
+) -> Result<WorkspaceChangeScope, ApiError> {
+    let binding = require_registered_workspace_binding(state, workspace_id, workspace_path)?;
+    resolve_workspace_change_scope(state, &binding.workspace_id)
+}
+
+fn resolve_session_change_scope_from_request(
+    state: &ApiState,
+    session_id: &magi_core::SessionId,
+    workspace_id: Option<&str>,
+    workspace_path: Option<&str>,
+    execution_group_id: Option<&str>,
+) -> Result<SessionChangeScope, ApiError> {
+    let request_scope = resolve_optional_session_workspace_scope(
+        state,
+        Some(session_id.as_str()),
+        workspace_id,
+        workspace_path,
+    )?;
+    let resolved_workspace_id = request_scope
+        .workspace_id()
+        .map(|workspace_id| workspace_id.as_str().to_string());
+    resolve_session_change_scope(
+        state,
+        session_id,
+        resolved_workspace_id.as_deref(),
+        execution_group_id,
+    )
+}
+
 // ─── Changes ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -108,6 +144,7 @@ struct DiffQuery {
     file_path: Option<String>,
     session_id: Option<String>,
     workspace_id: Option<String>,
+    workspace_path: Option<String>,
     execution_group_id: Option<String>,
 }
 
@@ -124,10 +161,11 @@ async fn get_diff(
     {
         Some(_) => {
             let session_id = parse_session_id(query.session_id.as_deref())?;
-            let scope = resolve_session_change_scope(
+            let scope = resolve_session_change_scope_from_request(
                 &state,
                 &session_id,
                 query.workspace_id.as_deref(),
+                query.workspace_path.as_deref(),
                 query.execution_group_id.as_deref(),
             )?;
             let snapshot = require_snapshot_session(&state, &scope).await?;
@@ -177,8 +215,11 @@ async fn get_diff(
         None => {
             // 无 session 调用：仅做一次 workspace 校验，统一返回空 diff，
             // 不再读 git 来伪装出全局变更。
-            let workspace_id = require_workspace_id(query.workspace_id.as_deref())?;
-            let scope = resolve_workspace_change_scope(&state, &workspace_id)?;
+            let scope = resolve_workspace_change_scope_from_request(
+                &state,
+                query.workspace_id.as_deref(),
+                query.workspace_path.as_deref(),
+            )?;
             let pending_state = pending_changes_state(
                 "unavailable",
                 None,
@@ -213,6 +254,7 @@ struct ApproveChangeRequest {
     file_path: String,
     session_id: Option<String>,
     workspace_id: Option<String>,
+    workspace_path: Option<String>,
 }
 
 async fn approve_change(
@@ -220,8 +262,13 @@ async fn approve_change(
     Json(request): Json<ApproveChangeRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let session_id = parse_session_id(request.session_id.as_deref())?;
-    let scope =
-        resolve_session_change_scope(&state, &session_id, request.workspace_id.as_deref(), None)?;
+    let scope = resolve_session_change_scope_from_request(
+        &state,
+        &session_id,
+        request.workspace_id.as_deref(),
+        request.workspace_path.as_deref(),
+        None,
+    )?;
     let rel = safe_relative_path(&request.file_path)?.to_string();
     let snapshot = require_snapshot_session(&state, &scope).await?;
     snapshot
@@ -243,6 +290,7 @@ struct RevertChangeRequest {
     file_path: String,
     session_id: Option<String>,
     workspace_id: Option<String>,
+    workspace_path: Option<String>,
 }
 
 async fn revert_change(
@@ -250,8 +298,13 @@ async fn revert_change(
     Json(request): Json<RevertChangeRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let session_id = parse_session_id(request.session_id.as_deref())?;
-    let scope =
-        resolve_session_change_scope(&state, &session_id, request.workspace_id.as_deref(), None)?;
+    let scope = resolve_session_change_scope_from_request(
+        &state,
+        &session_id,
+        request.workspace_id.as_deref(),
+        request.workspace_path.as_deref(),
+        None,
+    )?;
     let rel = safe_relative_path(&request.file_path)?.to_string();
     let snapshot = require_snapshot_session(&state, &scope).await?;
     snapshot
@@ -272,6 +325,7 @@ async fn revert_change(
 struct ApproveAllRequest {
     session_id: Option<String>,
     workspace_id: Option<String>,
+    workspace_path: Option<String>,
 }
 
 async fn approve_all_changes(
@@ -279,8 +333,13 @@ async fn approve_all_changes(
     Json(request): Json<ApproveAllRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let session_id = parse_session_id(request.session_id.as_deref())?;
-    let scope =
-        resolve_session_change_scope(&state, &session_id, request.workspace_id.as_deref(), None)?;
+    let scope = resolve_session_change_scope_from_request(
+        &state,
+        &session_id,
+        request.workspace_id.as_deref(),
+        request.workspace_path.as_deref(),
+        None,
+    )?;
     let snapshot = require_snapshot_session(&state, &scope).await?;
     let pending = snapshot
         .pending_changes()
@@ -304,6 +363,7 @@ async fn approve_all_changes(
 struct RevertAllRequest {
     session_id: Option<String>,
     workspace_id: Option<String>,
+    workspace_path: Option<String>,
 }
 
 async fn revert_all_changes(
@@ -311,8 +371,13 @@ async fn revert_all_changes(
     Json(request): Json<RevertAllRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let session_id = parse_session_id(request.session_id.as_deref())?;
-    let scope =
-        resolve_session_change_scope(&state, &session_id, request.workspace_id.as_deref(), None)?;
+    let scope = resolve_session_change_scope_from_request(
+        &state,
+        &session_id,
+        request.workspace_id.as_deref(),
+        request.workspace_path.as_deref(),
+        None,
+    )?;
     let snapshot = require_snapshot_session(&state, &scope).await?;
     let pending = snapshot
         .pending_changes()
@@ -337,6 +402,7 @@ struct RevertExecutionGroupRequest {
     execution_group_id: String,
     session_id: Option<String>,
     workspace_id: Option<String>,
+    workspace_path: Option<String>,
 }
 
 async fn revert_execution_group_changes(
@@ -344,10 +410,11 @@ async fn revert_execution_group_changes(
     Json(request): Json<RevertExecutionGroupRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let session_id = parse_session_id(request.session_id.as_deref())?;
-    let scope = resolve_session_change_scope(
+    let scope = resolve_session_change_scope_from_request(
         &state,
         &session_id,
         request.workspace_id.as_deref(),
+        request.workspace_path.as_deref(),
         Some(request.execution_group_id.as_str()),
     )?;
     if scope.execution_group_id != request.execution_group_id {
@@ -392,6 +459,7 @@ struct FileContentQuery {
     file_path: Option<String>,
     session_id: Option<String>,
     workspace_id: Option<String>,
+    workspace_path: Option<String>,
     execution_group_id: Option<String>,
 }
 
@@ -413,17 +481,21 @@ async fn get_file_content(
         .is_some()
     {
         let session_id = parse_session_id(query.session_id.as_deref())?;
-        let scope = resolve_session_change_scope(
+        let scope = resolve_session_change_scope_from_request(
             &state,
             &session_id,
             query.workspace_id.as_deref(),
+            query.workspace_path.as_deref(),
             query.execution_group_id.as_deref(),
         )?;
         let (absolute, _relative) = safe_workspace_path(&scope.workspace_root, path)?;
         (absolute, session_scope_binding(&scope))
     } else {
-        let workspace_id = require_workspace_id(query.workspace_id.as_deref())?;
-        let scope = resolve_workspace_change_scope(&state, &workspace_id)?;
+        let scope = resolve_workspace_change_scope_from_request(
+            &state,
+            query.workspace_id.as_deref(),
+            query.workspace_path.as_deref(),
+        )?;
         let (absolute, _) = safe_workspace_path(&scope.workspace_root, path)?;
         (absolute, workspace_scope_binding(&scope))
     };
@@ -484,17 +556,21 @@ async fn get_file_raw(
         .is_some()
     {
         let session_id = parse_session_id(query.session_id.as_deref())?;
-        let scope = resolve_session_change_scope(
+        let scope = resolve_session_change_scope_from_request(
             &state,
             &session_id,
             query.workspace_id.as_deref(),
+            query.workspace_path.as_deref(),
             query.execution_group_id.as_deref(),
         )?;
         let (absolute, _relative) = safe_workspace_path(&scope.workspace_root, path)?;
         absolute
     } else {
-        let workspace_id = require_workspace_id(query.workspace_id.as_deref())?;
-        let scope = resolve_workspace_change_scope(&state, &workspace_id)?;
+        let scope = resolve_workspace_change_scope_from_request(
+            &state,
+            query.workspace_id.as_deref(),
+            query.workspace_path.as_deref(),
+        )?;
         let (absolute, _) = safe_workspace_path(&scope.workspace_root, path)?;
         absolute
     };
@@ -513,6 +589,7 @@ async fn get_file_raw(
 struct FilesystemListQuery {
     path: Option<String>,
     workspace_id: Option<String>,
+    workspace_path: Option<String>,
     #[serde(default)]
     show_hidden: Option<String>,
 }
@@ -578,8 +655,11 @@ async fn list_filesystem(
     State(state): State<ApiState>,
     Query(query): Query<FilesystemListQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let workspace_id = require_workspace_id(query.workspace_id.as_deref())?;
-    let scope = resolve_workspace_change_scope(&state, &workspace_id)?;
+    let scope = resolve_workspace_change_scope_from_request(
+        &state,
+        query.workspace_id.as_deref(),
+        query.workspace_path.as_deref(),
+    )?;
     let canonical_workspace_root =
         canonical_directory_path(scope.workspace_root.clone(), "规范化工作区根目录失败")?;
     let path = match query
@@ -1128,6 +1208,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn filesystem_list_resolves_workspace_from_registered_path_when_query_id_is_stale() {
+        let root = unique_temp_dir("magi-filesystem-list-path-binding");
+        fs::write(root.join("from-path.txt"), "workspace path wins\n")
+            .expect("workspace file should write");
+        let state = build_state_with_workspace_root(&root, "workspace-filesystem-path");
+
+        let response = routes()
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/filesystem/list?workspaceId=workspace-stale-query&workspacePath={}",
+                        urlencoding::encode(root.to_string_lossy().as_ref())
+                    ))
+                    .method("GET")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = read_json_response(response).await;
+        assert_eq!(payload["workspaceId"], "workspace-filesystem-path");
+        assert_eq!(payload["workspacePath"], root.to_string_lossy().as_ref());
+        let entries = payload["entries"].as_array().expect("entries array");
+        assert!(
+            entries.iter().any(|entry| entry["name"] == "from-path.txt"),
+            "filesystem list must read the workspace resolved from workspacePath"
+        );
+    }
+
+    #[tokio::test]
     async fn filesystem_list_rejects_missing_workspace_and_outside_path() {
         let root = unique_temp_dir("magi-filesystem-list-secure");
         let outside = unique_temp_dir("magi-filesystem-list-outside");
@@ -1288,6 +1401,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_diff_resolves_workspace_from_registered_path_when_query_id_is_stale() {
+        let root = unique_temp_dir("magi-changes-route-path-diff");
+        fs::write(root.join("notes.txt"), "hello\n").expect("workspace file should write");
+        let state = build_state_with_workspace_root(&root, "workspace-path-diff");
+
+        let response = routes()
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/changes/diff?workspaceId=workspace-stale-query&workspacePath={}",
+                        urlencoding::encode(root.to_string_lossy().as_ref())
+                    ))
+                    .method("GET")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = read_json_response(response).await;
+        assert_eq!(payload["workspaceId"], "workspace-path-diff");
+        assert_eq!(payload["workspacePath"], root.to_string_lossy().as_ref());
+        assert_eq!(payload["diff"], "");
+        assert_eq!(
+            payload["pendingChangesState"]["reasonCode"],
+            "session_unbound"
+        );
+    }
+
+    #[tokio::test]
     async fn get_diff_rejects_missing_workspace_without_session() {
         let root = unique_temp_dir("magi-changes-route-no-session-missing-workspace");
         fs::write(root.join("notes.txt"), "hello\n").expect("workspace file should write");
@@ -1371,6 +1516,50 @@ mod tests {
             diff.contains("+alpha changed"),
             "diff should contain new line marker: {}",
             diff
+        );
+    }
+
+    #[tokio::test]
+    async fn get_diff_resolves_session_workspace_from_registered_path_when_query_id_is_stale() {
+        let state = build_state();
+        let root = unique_temp_dir("magi-changes-route-session-path-diff");
+        fs::write(root.join("alpha.txt"), "alpha\n").expect("alpha should write");
+        let snap = register_workspace_and_snapshot(
+            &state,
+            "ws-session-path-diff",
+            "sess-session-path-diff",
+            &root,
+            None,
+        )
+        .await;
+        fs::write(root.join("alpha.txt"), "alpha changed\n").expect("alpha modify");
+        snap.reconcile().expect("reconcile should succeed");
+
+        let response = routes()
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/changes/diff?sessionId=sess-session-path-diff&workspaceId=workspace-stale-query&workspacePath={}&filePath=alpha.txt",
+                        urlencoding::encode(root.to_string_lossy().as_ref())
+                    ))
+                    .method("GET")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = read_json_response(response).await;
+        assert_eq!(payload["sessionId"], "sess-session-path-diff");
+        assert_eq!(payload["workspaceId"], "ws-session-path-diff");
+        assert_eq!(payload["workspacePath"], root.to_string_lossy().as_ref());
+        assert!(
+            payload["diff"]
+                .as_str()
+                .is_some_and(|diff| diff.contains("+alpha changed")),
+            "session diff must use the workspace resolved from workspacePath"
         );
     }
 
@@ -1660,6 +1849,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_file_content_resolves_workspace_from_registered_path_when_query_id_is_stale() {
+        let root = unique_temp_dir("magi-changes-route-content-path-binding");
+        fs::write(root.join("alpha.txt"), "alpha from bound path\n").expect("alpha should write");
+        let state = build_state_with_workspace_root(&root, "workspace-content-path");
+
+        let response = routes()
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/files/content?workspaceId=workspace-stale-query&workspacePath={}&filePath=alpha.txt",
+                        urlencoding::encode(root.to_string_lossy().as_ref())
+                    ))
+                    .method("GET")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = read_json_response(response).await;
+        assert_eq!(payload["workspaceId"], "workspace-content-path");
+        assert_eq!(payload["workspacePath"], root.to_string_lossy().as_ref());
+        assert_eq!(payload["content"], "alpha from bound path\n");
+    }
+
+    #[tokio::test]
     async fn get_file_content_rejects_absolute_path_outside_workspace() {
         let root = unique_temp_dir("magi-changes-route-content-inside-2");
         fs::write(root.join("alpha.txt"), "alpha changed\n").expect("alpha should write");
@@ -1770,6 +1987,38 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/files/raw?workspaceId=workspace-raw-image&filePath=image.png")
+                    .method("GET")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(axum::http::header::CONTENT_TYPE),
+            Some(&axum::http::HeaderValue::from_static("image/png"))
+        );
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should read");
+        assert_eq!(&body[..], b"not-a-real-png");
+    }
+
+    #[tokio::test]
+    async fn get_file_raw_resolves_workspace_from_registered_path_when_query_id_is_stale() {
+        let root = unique_temp_dir("magi-changes-route-raw-path-image");
+        fs::write(root.join("image.png"), b"not-a-real-png").expect("image should write");
+        let state = build_state_with_workspace_root(&root, "workspace-raw-path-image");
+
+        let response = routes()
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/files/raw?workspaceId=workspace-stale-query&workspacePath={}&filePath=image.png",
+                        urlencoding::encode(root.to_string_lossy().as_ref())
+                    ))
                     .method("GET")
                     .body(Body::empty())
                     .expect("request should build"),
