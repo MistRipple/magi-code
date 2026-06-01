@@ -141,7 +141,7 @@ impl WorkerRuntimeLoop {
         let worker_id = action.worker_id().clone();
         let task_id_hint = action.current_task_id_hint();
 
-        if let Some(decision) = governance_decision.clone() {
+        let public_governance_decision = if let Some(decision) = governance_decision.clone() {
             let observation = self.runtime.observe_governance_decision(
                 &worker_id,
                 task_id_hint
@@ -150,65 +150,50 @@ impl WorkerRuntimeLoop {
                 action.control_kind(),
                 decision.clone(),
             );
-            match decision.outcome {
+            let public_decision = observation.decision.clone();
+            match public_decision.outcome {
                 GovernanceOutcome::Allowed => {}
                 GovernanceOutcome::NeedsApproval => {
                     return self.governance_outcome(
                         sequence,
                         action,
-                        Some(decision),
+                        Some(public_decision.clone()),
                         completed_at,
                         WorkerLoopOutcomeKind::NeedsApproval,
                         None,
                         None,
-                        Some(format!(
-                            "需要人工审批: {}",
-                            observation
-                                .decision
-                                .reason
-                                .clone()
-                                .unwrap_or_else(|| "worker control action".to_string())
-                        )),
+                        public_decision.reason.clone(),
                     );
                 }
                 GovernanceOutcome::Blocked => {
                     return self.governance_outcome(
                         sequence,
                         action,
-                        Some(decision),
+                        Some(public_decision.clone()),
                         completed_at,
                         WorkerLoopOutcomeKind::Blocked,
                         None,
                         None,
-                        Some(
-                            observation
-                                .decision
-                                .reason
-                                .clone()
-                                .unwrap_or_else(|| "worker control 被治理阻断".to_string()),
-                        ),
+                        public_decision.reason.clone(),
                     );
                 }
                 GovernanceOutcome::Rejected => {
                     return self.governance_outcome(
                         sequence,
                         action,
-                        Some(decision),
+                        Some(public_decision.clone()),
                         completed_at,
                         WorkerLoopOutcomeKind::Rejected,
                         None,
                         None,
-                        Some(
-                            observation
-                                .decision
-                                .reason
-                                .clone()
-                                .unwrap_or_else(|| "worker control 被治理拒绝".to_string()),
-                        ),
+                        public_decision.reason.clone(),
                     );
                 }
             }
-        }
+            Some(public_decision)
+        } else {
+            None
+        };
 
         match action.clone() {
             WorkerLoopAction::Execute { worker_id, task_id } => {
@@ -232,7 +217,7 @@ impl WorkerRuntimeLoop {
                         return self.rejected_outcome(
                             sequence,
                             action,
-                            governance_decision,
+                            public_governance_decision.clone(),
                             completed_at,
                             self.executor_probe_error_reason(&error),
                         );
@@ -242,7 +227,7 @@ impl WorkerRuntimeLoop {
                     return self.rejected_outcome(
                         sequence,
                         action,
-                        governance_decision,
+                        public_governance_decision.clone(),
                         completed_at,
                         error.public_summary(),
                     );
@@ -252,7 +237,7 @@ impl WorkerRuntimeLoop {
                     return self.rejected_outcome(
                         sequence,
                         action,
-                        governance_decision,
+                        public_governance_decision.clone(),
                         completed_at,
                         "worker missing current task or not registered",
                     );
@@ -364,7 +349,7 @@ impl WorkerRuntimeLoop {
                     return self.rejected_outcome(
                         sequence,
                         action,
-                        governance_decision,
+                        public_governance_decision.clone(),
                         completed_at,
                         "worker missing current task or not registered",
                     );
@@ -381,7 +366,7 @@ impl WorkerRuntimeLoop {
                 self.outcome(
                     sequence,
                     action,
-                    governance_decision,
+                    public_governance_decision.clone(),
                     completed_at,
                     final_worker,
                     Some(report),
@@ -412,7 +397,7 @@ impl WorkerRuntimeLoop {
                         return self.rejected_outcome(
                             sequence,
                             action,
-                            governance_decision,
+                            public_governance_decision.clone(),
                             completed_at,
                             self.executor_probe_error_reason(&error),
                         );
@@ -423,7 +408,7 @@ impl WorkerRuntimeLoop {
                         return self.rejected_outcome(
                             sequence,
                             action,
-                            governance_decision,
+                            public_governance_decision.clone(),
                             completed_at,
                             error.public_summary(),
                         );
@@ -432,7 +417,7 @@ impl WorkerRuntimeLoop {
                     return self.rejected_outcome(
                         sequence,
                         action,
-                        governance_decision,
+                        public_governance_decision.clone(),
                         completed_at,
                         error.public_summary(),
                     );
@@ -442,7 +427,7 @@ impl WorkerRuntimeLoop {
                     return self.rejected_outcome(
                         sequence,
                         action,
-                        governance_decision,
+                        public_governance_decision.clone(),
                         completed_at,
                         "worker missing current task or not registered",
                     );
@@ -451,7 +436,7 @@ impl WorkerRuntimeLoop {
                 self.outcome(
                     sequence,
                     action,
-                    governance_decision,
+                    public_governance_decision.clone(),
                     completed_at,
                     worker,
                     report,
@@ -486,7 +471,7 @@ impl WorkerRuntimeLoop {
                         return self.rejected_outcome(
                             sequence,
                             action,
-                            governance_decision,
+                            public_governance_decision.clone(),
                             completed_at,
                             self.executor_probe_error_reason(&error),
                         );
@@ -497,7 +482,7 @@ impl WorkerRuntimeLoop {
                         return self.rejected_outcome(
                             sequence,
                             action,
-                            governance_decision,
+                            public_governance_decision.clone(),
                             completed_at,
                             error.public_summary(),
                         );
@@ -506,7 +491,7 @@ impl WorkerRuntimeLoop {
                     return self.rejected_outcome(
                         sequence,
                         action,
-                        governance_decision,
+                        public_governance_decision.clone(),
                         completed_at,
                         error.public_summary(),
                     );
@@ -516,7 +501,7 @@ impl WorkerRuntimeLoop {
                     return self.rejected_outcome(
                         sequence,
                         action,
-                        governance_decision,
+                        public_governance_decision.clone(),
                         completed_at,
                         "worker missing current task or not registered",
                     );
@@ -527,7 +512,7 @@ impl WorkerRuntimeLoop {
                 self.outcome(
                     sequence,
                     action,
-                    governance_decision,
+                    public_governance_decision.clone(),
                     completed_at,
                     worker,
                     report,
@@ -558,7 +543,7 @@ impl WorkerRuntimeLoop {
                         return self.rejected_outcome(
                             sequence,
                             action,
-                            governance_decision,
+                            public_governance_decision.clone(),
                             completed_at,
                             self.executor_probe_error_reason(&error),
                         );
@@ -569,7 +554,7 @@ impl WorkerRuntimeLoop {
                         return self.rejected_outcome(
                             sequence,
                             action,
-                            governance_decision,
+                            public_governance_decision.clone(),
                             completed_at,
                             error.public_summary(),
                         );
@@ -578,7 +563,7 @@ impl WorkerRuntimeLoop {
                     return self.rejected_outcome(
                         sequence,
                         action,
-                        governance_decision,
+                        public_governance_decision.clone(),
                         completed_at,
                         error.public_summary(),
                     );
@@ -588,7 +573,7 @@ impl WorkerRuntimeLoop {
                     return self.rejected_outcome(
                         sequence,
                         action,
-                        governance_decision,
+                        public_governance_decision.clone(),
                         completed_at,
                         "worker missing current task or not registered",
                     );
@@ -597,7 +582,7 @@ impl WorkerRuntimeLoop {
                 self.outcome(
                     sequence,
                     action,
-                    governance_decision,
+                    public_governance_decision.clone(),
                     completed_at,
                     worker,
                     report,
@@ -628,7 +613,7 @@ impl WorkerRuntimeLoop {
                         return self.rejected_outcome(
                             sequence,
                             action,
-                            governance_decision,
+                            public_governance_decision.clone(),
                             completed_at,
                             self.executor_probe_error_reason(&error),
                         );
@@ -639,7 +624,7 @@ impl WorkerRuntimeLoop {
                         return self.rejected_outcome(
                             sequence,
                             action,
-                            governance_decision,
+                            public_governance_decision.clone(),
                             completed_at,
                             error.public_summary(),
                         );
@@ -648,7 +633,7 @@ impl WorkerRuntimeLoop {
                     return self.rejected_outcome(
                         sequence,
                         action,
-                        governance_decision,
+                        public_governance_decision.clone(),
                         completed_at,
                         error.public_summary(),
                     );
@@ -658,7 +643,7 @@ impl WorkerRuntimeLoop {
                     return self.rejected_outcome(
                         sequence,
                         action,
-                        governance_decision,
+                        public_governance_decision.clone(),
                         completed_at,
                         "worker missing current task or not registered",
                     );
@@ -669,7 +654,7 @@ impl WorkerRuntimeLoop {
                 self.outcome(
                     sequence,
                     action,
-                    governance_decision,
+                    public_governance_decision.clone(),
                     completed_at,
                     worker,
                     report,
@@ -682,7 +667,7 @@ impl WorkerRuntimeLoop {
                     return self.rejected_outcome(
                         sequence,
                         action,
-                        governance_decision,
+                        public_governance_decision.clone(),
                         completed_at,
                         "worker missing current task or not registered",
                     );
@@ -697,7 +682,7 @@ impl WorkerRuntimeLoop {
                 self.outcome(
                     sequence,
                     action,
-                    governance_decision,
+                    public_governance_decision.clone(),
                     completed_at,
                     worker,
                     report,
@@ -710,7 +695,7 @@ impl WorkerRuntimeLoop {
                     return self.rejected_outcome(
                         sequence,
                         action,
-                        governance_decision,
+                        public_governance_decision.clone(),
                         completed_at,
                         "worker missing current task or not registered",
                     );
@@ -725,7 +710,7 @@ impl WorkerRuntimeLoop {
                 self.outcome(
                     sequence,
                     action,
-                    governance_decision,
+                    public_governance_decision.clone(),
                     completed_at,
                     worker,
                     report,

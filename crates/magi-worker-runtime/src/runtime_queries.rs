@@ -88,13 +88,13 @@ impl WorkerRuntime {
         action: WorkerControlKind,
         decision: GovernanceDecision,
     ) -> WorkerGovernanceObservation {
-        let observation = WorkerGovernanceObservation {
+        let observation = public_worker_governance_observation(WorkerGovernanceObservation {
             worker_id: worker_id.clone(),
             task_id,
             action,
             decision,
             observed_at: UtcMillis::now(),
-        };
+        });
         self.governance_observations
             .write()
             .expect("worker governance observation write lock poisoned")
@@ -125,7 +125,10 @@ impl WorkerRuntime {
         self.governance_observations
             .read()
             .expect("worker governance observation read lock poisoned")
-            .clone()
+            .iter()
+            .cloned()
+            .map(public_worker_governance_observation)
+            .collect()
     }
 
     pub fn governance_summary(&self) -> WorkerGovernanceSummary {
@@ -199,6 +202,7 @@ impl WorkerRuntime {
             .iter()
             .filter(|record| &record.worker_id == worker_id)
             .cloned()
+            .map(public_worker_governance_observation)
             .collect();
         let executor_observations: Vec<WorkerExecutorObservation> = self
             .executor_observations
@@ -257,6 +261,7 @@ impl WorkerRuntime {
             .iter()
             .filter(|record| record.task_id.as_ref() == Some(task_id))
             .cloned()
+            .map(public_worker_governance_observation)
             .collect();
         let executor_observations: Vec<WorkerExecutorObservation> = self
             .executor_observations
@@ -364,5 +369,30 @@ fn governance_outcome_status(outcome: &GovernanceOutcome) -> &'static str {
         GovernanceOutcome::NeedsApproval => "needs_approval",
         GovernanceOutcome::Rejected => "rejected",
         GovernanceOutcome::Blocked => "blocked",
+    }
+}
+
+fn public_worker_governance_observation(
+    mut observation: WorkerGovernanceObservation,
+) -> WorkerGovernanceObservation {
+    observation.decision.reason = Some(public_worker_governance_reason(
+        &observation.action,
+        &observation.decision,
+    ));
+    observation
+}
+
+fn public_worker_governance_reason(
+    action: &WorkerControlKind,
+    decision: &GovernanceDecision,
+) -> String {
+    match decision.outcome {
+        GovernanceOutcome::Allowed => "worker 控制动作已通过治理检查".to_string(),
+        GovernanceOutcome::NeedsApproval => "worker 控制动作需要人工审批".to_string(),
+        GovernanceOutcome::Blocked => "worker 控制动作被治理阻断".to_string(),
+        GovernanceOutcome::Rejected => match action {
+            WorkerControlKind::RepairRetry => "修复重试不满足执行条件".to_string(),
+            _ => "worker 控制动作被治理拒绝".to_string(),
+        },
     }
 }

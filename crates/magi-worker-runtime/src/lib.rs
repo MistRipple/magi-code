@@ -974,7 +974,9 @@ mod tests {
         WorkerLifecycleStatus,
     };
     use magi_event_bus::InMemoryEventBus;
-    use magi_governance::{GovernanceService, WorkerControlRequest};
+    use magi_governance::{
+        DecisionPhase, GovernanceDecision, GovernanceService, WorkerControlRequest,
+    };
     use std::sync::Arc;
 
     fn worker_id(value: &str) -> WorkerId {
@@ -1184,6 +1186,159 @@ mod tests {
         assert!(
             !snapshot_text.contains("/Users/xie") && !snapshot_text.contains("ENOENT"),
             "worker report snapshot must not expose raw executor detail: {snapshot_text}"
+        );
+    }
+
+    #[test]
+    fn worker_governance_reason_is_public_in_outcome_snapshot_and_event() {
+        let bus = Arc::new(InMemoryEventBus::new(16));
+        let runtime = WorkerRuntime::new_compare(bus.clone());
+        let loop_controller = runtime.loop_controller();
+        let worker_id = worker_id("worker-governance-public-reason");
+        let task_id = task_id("task-governance-public-reason");
+        let raw_reason = "/Users/xie/.magi/governance failed: ENOENT";
+        let blocked_request = WorkerControlRequest {
+            worker_id: Some(worker_id.clone()),
+            mission_id: None,
+            assignment_id: None,
+            task_id: Some(task_id.clone()),
+            action: WorkerControlKind::Execute,
+            risk_level: RiskLevel::Low,
+            approval_requirement: ApprovalRequirement::None,
+            retry_count: 0,
+            blocked: true,
+            reason: Some(raw_reason.to_string()),
+        };
+        let blocked_decision =
+            GovernanceService::default().evaluate_worker_control_request(&blocked_request);
+
+        loop_controller.enqueue_guarded_action(
+            WorkerLoopAction::Execute {
+                worker_id,
+                task_id: task_id.clone(),
+            },
+            Some(blocked_decision),
+        );
+
+        let outcome = loop_controller
+            .step()
+            .expect("blocked outcome should exist");
+        assert_eq!(outcome.kind, WorkerLoopOutcomeKind::Blocked);
+        assert_eq!(
+            outcome.rejection_reason.as_deref(),
+            Some("worker 控制动作被治理阻断")
+        );
+        assert_eq!(
+            outcome
+                .governance_decision
+                .as_ref()
+                .and_then(|decision| decision.reason.as_deref()),
+            Some("worker 控制动作被治理阻断")
+        );
+
+        let event = bus
+            .snapshot()
+            .recent_events
+            .into_iter()
+            .find(|event| event.event_type == "worker.governance.observed")
+            .expect("governance observation event should be published");
+        let event_text = event.payload.to_string();
+        assert!(event_text.contains("worker 控制动作被治理阻断"));
+        assert!(
+            !event_text.contains("/Users/xie") && !event_text.contains("ENOENT"),
+            "worker governance event must not expose raw reason: {event_text}"
+        );
+
+        let snapshot_text = serde_json::to_string(&runtime.snapshot_for_task(&task_id))
+            .expect("task snapshot should serialize");
+        assert!(
+            !snapshot_text.contains("/Users/xie") && !snapshot_text.contains("ENOENT"),
+            "worker governance snapshot must not expose raw reason: {snapshot_text}"
+        );
+    }
+
+    #[test]
+    fn worker_governance_allowed_outcome_uses_public_decision_reason() {
+        let bus = Arc::new(InMemoryEventBus::new(16));
+        let runtime = WorkerRuntime::new_compare(bus);
+        let loop_controller = runtime.loop_controller();
+        let worker_id = worker_id("worker-governance-allowed-public-reason");
+        let task_id = task_id("task-governance-allowed-public-reason");
+        let raw_reason = "/Users/xie/.magi/governance allowed with private context";
+        let allowed_request = WorkerControlRequest {
+            worker_id: Some(worker_id.clone()),
+            mission_id: None,
+            assignment_id: None,
+            task_id: Some(task_id.clone()),
+            action: WorkerControlKind::Execute,
+            risk_level: RiskLevel::Low,
+            approval_requirement: ApprovalRequirement::None,
+            retry_count: 0,
+            blocked: false,
+            reason: Some(raw_reason.to_string()),
+        };
+        let allowed_decision =
+            GovernanceService::default().evaluate_worker_control_request(&allowed_request);
+
+        loop_controller.enqueue_guarded_action(
+            WorkerLoopAction::Execute { worker_id, task_id },
+            Some(allowed_decision),
+        );
+
+        let outcome = loop_controller
+            .step()
+            .expect("allowed outcome should exist");
+        assert_eq!(outcome.kind, WorkerLoopOutcomeKind::Applied);
+        assert_eq!(
+            outcome
+                .governance_decision
+                .as_ref()
+                .and_then(|decision| decision.reason.as_deref()),
+            Some("worker 控制动作已通过治理检查")
+        );
+        let outcome_text =
+            serde_json::to_string(&outcome).expect("worker outcome should serialize");
+        assert!(
+            !outcome_text.contains("/Users/xie") && !outcome_text.contains("private context"),
+            "worker allowed outcome must not expose raw governance reason: {outcome_text}"
+        );
+    }
+
+    #[test]
+    fn worker_governance_query_output_redacts_existing_raw_reason() {
+        let bus = Arc::new(InMemoryEventBus::new(16));
+        let runtime = WorkerRuntime::new_compare(bus);
+        let worker_id = worker_id("worker-governance-query-public-reason");
+        let task_id = task_id("task-governance-query-public-reason");
+        let raw_reason = "/Users/xie/.magi/governance.json parse error";
+        runtime
+            .governance_observations
+            .write()
+            .expect("worker governance observation write lock poisoned")
+            .push(WorkerGovernanceObservation {
+                worker_id: worker_id.clone(),
+                task_id: Some(task_id.clone()),
+                action: WorkerControlKind::RepairRetry,
+                decision: GovernanceDecision::rejected(
+                    DecisionPhase::WorkerControl,
+                    RiskLevel::Medium,
+                    Some(raw_reason.to_string()),
+                ),
+                observed_at: UtcMillis::now(),
+            });
+
+        let observations = runtime.governance_observations();
+        assert_eq!(observations.len(), 1);
+        assert_eq!(
+            observations[0].decision.reason.as_deref(),
+            Some("修复重试不满足执行条件")
+        );
+
+        let snapshot_text = serde_json::to_string(&runtime.snapshot_for_worker(&worker_id))
+            .expect("worker snapshot should serialize");
+        assert!(
+            !snapshot_text.contains("/Users/xie") && !snapshot_text.contains("parse error"),
+            "worker governance query output must not expose raw reason: {snapshot_text}"
         );
     }
 
