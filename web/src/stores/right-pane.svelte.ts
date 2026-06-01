@@ -2,7 +2,7 @@
  * Right Pane Store - 右侧多 Tab 面板状态。
  *
  * 设计约束（代理详情与代码详情共用的右侧多 Tab 面板）：
- * - 状态以 session 为边界，跨会话隔离
+ * - 状态以 workspace/session 为边界，跨会话隔离；workspace 文件预览允许无 session
  * - 三个正交轴：openTabs（LRU 上限 6）/ activeTabId / collapsed
  * - collapsed 与 openTabs 正交：折叠不销毁 tabs，关闭单 tab 才销毁
  * - 全部 tab 关闭 → 强制 collapsed = true（下一次展开为空白 Pane）
@@ -65,7 +65,7 @@ export interface SessionPaneState {
 }
 
 interface RightPaneRootState {
-  /** 当前右侧面板作用域 key：workspace + session 共同决定，避免跨工作区串面板 */
+  /** 当前右侧面板作用域 key：workspace 或 workspace + session 共同决定，避免跨工作区串面板 */
   activeScopeKey: string;
   /** 当前工作区 id；仅用于后续打开 tab 时补齐作用域 */
   activeWorkspaceId: string;
@@ -87,6 +87,7 @@ const EMPTY_SESSION_STATE: SessionPaneState = {
 const STORAGE_KEY = 'magi-right-pane-state.v2';
 /** 持久化 session 总数硬上限：超过后按 lastActivatedAt 倒序保留最近 N 个，防止长期使用膨胀 */
 const MAX_PERSISTED_SESSIONS = 50;
+const WORKSPACE_SCOPE_PREFIX = 'workspace:';
 
 interface PersistedShape {
   version: 2;
@@ -118,6 +119,18 @@ function sessionScopeKey(
     : `session:${normalizedSessionId}`;
 }
 
+function workspaceScopeKey(workspaceId: string | null | undefined): string {
+  const normalizedWorkspaceId = normalizeWorkspaceId(workspaceId);
+  return normalizedWorkspaceId ? `${WORKSPACE_SCOPE_PREFIX}${normalizedWorkspaceId}` : '';
+}
+
+function paneScopeKey(
+  workspaceId: string | null | undefined,
+  sessionId: string | null | undefined,
+): string {
+  return sessionScopeKey(workspaceId, sessionId) || workspaceScopeKey(workspaceId);
+}
+
 function normalizeStoredScopeKey(scopeKeyOrSessionId: string | null | undefined): string {
   const value = normalizeSessionId(scopeKeyOrSessionId);
   if (!value) {
@@ -127,6 +140,7 @@ function normalizeStoredScopeKey(scopeKeyOrSessionId: string | null | undefined)
     rightPaneState.perSession[value]
     || value.includes('\u0000')
     || value.startsWith('session:')
+    || value.startsWith(WORKSPACE_SCOPE_PREFIX)
   ) {
     return value;
   }
@@ -340,8 +354,9 @@ function upsertTab(
 // ============================================================================
 
 /**
- * 激活某个 session 的右侧面板上下文。
- * - 切换 session 时调用一次；无显式状态时 ensure 空 state
+ * 激活右侧面板上下文。
+ * - 有 session 时使用 workspace/session 作用域
+ * - 无 session 时使用 workspace 作用域，保证文件树/知识库预览仍可打开
  */
 export function activateRightPaneSession(
   workspaceId: string | null | undefined,
@@ -349,7 +364,7 @@ export function activateRightPaneSession(
 ): void {
   const normalizedWorkspaceId = normalizeWorkspaceId(workspaceId);
   const normalizedSessionId = normalizeSessionId(sessionId);
-  const scopeKey = sessionScopeKey(normalizedWorkspaceId, normalizedSessionId);
+  const scopeKey = paneScopeKey(normalizedWorkspaceId, normalizedSessionId);
   rightPaneState.activeWorkspaceId = normalizedWorkspaceId;
   rightPaneState.activeSessionId = normalizedSessionId;
   rightPaneState.activeScopeKey = scopeKey;
@@ -420,17 +435,15 @@ export function openCodeTab(
     tailSummary?: string;
   },
 ): void {
-  const normalizedSession = normalizeSessionId(sessionId);
-  if (!normalizedSession) {
-    return;
-  }
   const trimmedFilepath = typeof filepath === 'string' ? filepath.trim() : '';
   if (!trimmedFilepath) {
     return;
   }
+  const normalizedSession = normalizeSessionId(options?.sessionId) || normalizeSessionId(sessionId);
   const workspaceId = normalizeWorkspaceId(options?.workspaceId)
-    || (normalizedSession === rightPaneState.activeSessionId ? rightPaneState.activeWorkspaceId : '');
-  const scopeKey = sessionScopeKey(workspaceId, normalizedSession);
+    || (normalizedSession === rightPaneState.activeSessionId ? rightPaneState.activeWorkspaceId : '')
+    || rightPaneState.activeWorkspaceId;
+  const scopeKey = paneScopeKey(workspaceId, normalizedSession);
   if (!scopeKey) {
     return;
   }
@@ -445,7 +458,7 @@ export function openCodeTab(
       filepath: trimmedFilepath,
       workspaceId,
       workspacePath: options?.workspacePath,
-      sessionId: options?.sessionId ?? normalizedSession,
+      sessionId: normalizedSession || undefined,
       diff: options?.diff ?? null,
       content: options?.content ?? null,
       language: options?.language ?? null,

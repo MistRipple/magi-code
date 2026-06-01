@@ -16,8 +16,7 @@
     toggleRightPane,
   } from '../stores/right-pane.svelte';
 
-  // 右侧面板：折叠/展开切换按钮作为常驻入口——空 tab 时点击也可展开为空态 RightPane，
-  // 由 store 自身的 activeScopeKey 决定能否操作（无 session 时 toggleRightPane 是 no-op）
+  // 右侧面板：折叠/展开切换按钮作为常驻入口；作用域由 store 的 activeScopeKey 决定。
   const currentRightPane = $derived(getRightPaneState(rightPaneState.activeScopeKey));
   const showRightPaneToggle = $derived(Boolean(rightPaneState.activeScopeKey));
 
