@@ -321,18 +321,7 @@ impl SharedContextPool {
             .read()
             .expect("shared context pool read lock poisoned")
             .values()
-            .filter(|record| {
-                query
-                    .session_id
-                    .as_ref()
-                    .is_none_or(|id| record.session_id.as_ref() == Some(id))
-            })
-            .filter(|record| {
-                query
-                    .project_key
-                    .as_ref()
-                    .is_none_or(|project_key| record.project_key.as_ref() == Some(project_key))
-            })
+            .filter(|record| shared_context_scope_matches(query, record))
             .cloned()
             .collect::<Vec<_>>();
         records.sort_by(|left, right| {
@@ -373,18 +362,7 @@ impl FileSummaryStore {
                 .read()
                 .expect("file summary store read lock poisoned")
                 .values()
-                .filter(|record| {
-                    query
-                        .workspace_id
-                        .as_ref()
-                        .is_none_or(|id| record.workspace_id.as_ref() == Some(id))
-                })
-                .filter(|record| {
-                    query
-                        .project_key
-                        .as_ref()
-                        .is_none_or(|project_key| record.project_key.as_ref() == Some(project_key))
-                })
+                .filter(|record| file_summary_scope_matches(query, record))
                 .filter(|record| {
                     query.path_prefix.as_ref().is_none_or(|path_prefix| {
                         record.item.absolute_path.starts_with(path_prefix)
@@ -404,6 +382,67 @@ impl FileSummaryStore {
         }
         records
     }
+}
+
+fn shared_context_scope_matches(query: &SharedContextQuery, record: &SharedContextRecord) -> bool {
+    let session_matches = query
+        .session_id
+        .as_ref()
+        .is_some_and(|session_id| record.session_id.as_ref() == Some(session_id));
+    let project_matches = query
+        .project_key
+        .as_ref()
+        .is_some_and(|project_key| record.project_key.as_ref() == Some(project_key));
+    let has_scope_query = query.session_id.is_some() || query.project_key.is_some();
+
+    if !has_scope_query {
+        return record.session_id.is_none() && record.project_key.is_none();
+    }
+    if record.session_id.is_some() && !session_matches {
+        return false;
+    }
+    if let Some(project_key) = query.project_key.as_ref()
+        && record
+            .project_key
+            .as_ref()
+            .is_some_and(|record_project| record_project != project_key)
+    {
+        return false;
+    }
+    session_matches || project_matches
+}
+
+fn file_summary_scope_matches(query: &FileSummaryQuery, record: &FileSummaryRecord) -> bool {
+    let workspace_matches = query
+        .workspace_id
+        .as_ref()
+        .is_some_and(|workspace_id| record.workspace_id.as_ref() == Some(workspace_id));
+    let project_matches = query
+        .project_key
+        .as_ref()
+        .is_some_and(|project_key| record.project_key.as_ref() == Some(project_key));
+    let has_scope_query = query.workspace_id.is_some() || query.project_key.is_some();
+
+    if !has_scope_query {
+        return record.workspace_id.is_none() && record.project_key.is_none();
+    }
+    if let Some(workspace_id) = query.workspace_id.as_ref()
+        && record
+            .workspace_id
+            .as_ref()
+            .is_some_and(|record_workspace| record_workspace != workspace_id)
+    {
+        return false;
+    }
+    if let Some(project_key) = query.project_key.as_ref()
+        && record
+            .project_key
+            .as_ref()
+            .is_some_and(|record_project| record_project != project_key)
+    {
+        return false;
+    }
+    workspace_matches || project_matches
 }
 
 impl ProjectRecentTurnStore {
@@ -1712,6 +1751,134 @@ mod tests {
 
         // no truncations because we're within budget
         assert!(result.usage.truncations.is_empty());
+    }
+
+    #[test]
+    fn context_scope_queries_include_broader_project_records_without_session_leakage() {
+        let session_id = SessionId::new("session-scope");
+        let other_session_id = SessionId::new("session-scope-other");
+        let workspace_id = WorkspaceId::new("workspace-scope");
+        let other_workspace_id = WorkspaceId::new("workspace-scope-other");
+        let project_key = "project-scope".to_string();
+        let other_project_key = "project-scope-other".to_string();
+
+        let shared_context_pool = SharedContextPool::default();
+        for (item_id, session_id, project_key, updated_at) in [
+            (
+                "shared-session",
+                Some(session_id.clone()),
+                None,
+                UtcMillis(10),
+            ),
+            (
+                "shared-project",
+                None,
+                Some(project_key.clone()),
+                UtcMillis(20),
+            ),
+            (
+                "shared-both",
+                Some(session_id.clone()),
+                Some(project_key.clone()),
+                UtcMillis(30),
+            ),
+            (
+                "shared-other-session",
+                Some(other_session_id),
+                Some(project_key.clone()),
+                UtcMillis(40),
+            ),
+            (
+                "shared-other-project",
+                None,
+                Some(other_project_key.clone()),
+                UtcMillis(50),
+            ),
+        ] {
+            shared_context_pool.upsert(SharedContextRecord {
+                item: SharedContextItem {
+                    item_id: item_id.to_string(),
+                    title: item_id.to_string(),
+                    content: item_id.to_string(),
+                },
+                session_id,
+                project_key,
+                updated_at,
+            });
+        }
+
+        let file_summary_store = FileSummaryStore::default();
+        for (path, workspace_id, project_key, updated_at) in [
+            (
+                "/repo/workspace.rs",
+                Some(workspace_id.clone()),
+                None,
+                UtcMillis(10),
+            ),
+            (
+                "/repo/project.rs",
+                None,
+                Some(project_key.clone()),
+                UtcMillis(20),
+            ),
+            (
+                "/repo/both.rs",
+                Some(workspace_id.clone()),
+                Some(project_key.clone()),
+                UtcMillis(30),
+            ),
+            (
+                "/repo/other-workspace.rs",
+                Some(other_workspace_id),
+                Some(project_key.clone()),
+                UtcMillis(40),
+            ),
+            (
+                "/repo/other-project.rs",
+                Some(workspace_id.clone()),
+                Some(other_project_key),
+                UtcMillis(50),
+            ),
+        ] {
+            file_summary_store.upsert(FileSummaryRecord {
+                item: FileSummaryItem {
+                    absolute_path: path.to_string(),
+                    summary: path.to_string(),
+                },
+                workspace_id,
+                project_key,
+                updated_at,
+            });
+        }
+
+        let shared = shared_context_pool.query(&SharedContextQuery {
+            session_id: Some(session_id),
+            project_key: Some(project_key.clone()),
+            limit: 10,
+        });
+        let shared_ids = shared
+            .iter()
+            .map(|record| record.item.item_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            shared_ids,
+            vec!["shared-both", "shared-project", "shared-session"]
+        );
+
+        let files = file_summary_store.query(&FileSummaryQuery {
+            workspace_id: Some(workspace_id),
+            project_key: Some(project_key),
+            path_prefix: None,
+            limit: 10,
+        });
+        let file_paths = files
+            .iter()
+            .map(|record| record.item.absolute_path.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            file_paths,
+            vec!["/repo/both.rs", "/repo/project.rs", "/repo/workspace.rs"]
+        );
     }
 
     #[test]
