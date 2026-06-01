@@ -174,6 +174,7 @@ let recoveryAttempt = 0;
 let recoveryTimer: number | null = null;
 let recoveryInFlight: Promise<void> | null = null;
 let sessionSnapshotGeneration = 0;
+let externalSessionSummaryRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 function clearActiveTurnInFlight(): void {
   // 实时 turn 投影由后端 canonical snapshot 驱动，这里保留统一清理入口。
 }
@@ -189,6 +190,15 @@ const EVENT_STREAM_OPEN_TIMEOUT_MS = 4000;
 const EVENT_STREAM_IDLE_TIMEOUT_MS = 20_000;
 const ACTIVE_EVENT_STREAM_IDLE_TIMEOUT_MS = 8_000;
 const EVENT_STREAM_IDLE_CHECK_INTERVAL_MS = 5_000;
+const EXTERNAL_SESSION_SUMMARY_EVENTS = new Set([
+  'session.turn.accepted',
+  'session.turn.task.accepted',
+  'session.turn.completed',
+  'session.turn.failed',
+  'session.turn.interrupted',
+  'session.title.updated',
+  'message.created',
+]);
 const SESSION_TIMELINE_PAGE_SIZE = 50;
 const WEBVIEW_STATE_STORAGE_KEY = 'webview-state';
 const WEBVIEW_STATE_WRITE_INTERVAL_MS = 1200;
@@ -1066,16 +1076,64 @@ function handleSessionTurnItemEvent(event: RustEventEnvelope): boolean {
   return true;
 }
 
-function shouldRefreshFromRustEvent(event: RustEventEnvelope): boolean {
-  const eventWorkspaceId = trimBridgeString(event.workspace_id);
+function rustEventPayloadString(event: RustEventEnvelope, snakeKey: string, camelKey: string): string {
+  return trimBridgeString(event.payload?.[snakeKey])
+    || trimBridgeString(event.payload?.[camelKey]);
+}
+
+function rustEventWorkspaceId(event: RustEventEnvelope): string {
+  return trimBridgeString(event.workspace_id)
+    || rustEventPayloadString(event, 'workspace_id', 'workspaceId');
+}
+
+function rustEventSessionId(event: RustEventEnvelope): string {
+  return trimBridgeString(event.session_id)
+    || rustEventPayloadString(event, 'session_id', 'sessionId');
+}
+
+function eventMatchesCurrentWorkspace(event: RustEventEnvelope): boolean {
+  const eventWorkspaceId = rustEventWorkspaceId(event);
   if (eventWorkspaceId && currentWorkspaceId && eventWorkspaceId !== currentWorkspaceId) {
     return false;
   }
-  const eventSessionId = trimBridgeString(event.session_id);
-  if (eventSessionId && currentSessionId && eventSessionId !== currentSessionId) {
+  return true;
+}
+
+function eventTargetsDifferentSession(event: RustEventEnvelope): boolean {
+  const eventSessionId = rustEventSessionId(event);
+  return Boolean(eventSessionId && currentSessionId && eventSessionId !== currentSessionId);
+}
+
+function shouldApplyCurrentSessionRustEvent(event: RustEventEnvelope): boolean {
+  if (!eventMatchesCurrentWorkspace(event)) {
+    return false;
+  }
+  if (eventTargetsDifferentSession(event)) {
     return false;
   }
   return true;
+}
+
+function scheduleExternalSessionSummaryRefresh(reason: string): void {
+  if (externalSessionSummaryRefreshTimer) {
+    return;
+  }
+  externalSessionSummaryRefreshTimer = setTimeout(() => {
+    externalSessionSummaryRefreshTimer = null;
+    void fetchBootstrap({ forceFresh: true }).catch((error) => {
+      reportExpectedRecoveryFailure(
+        i18n.t('bridge.action.syncMessages'),
+        `[web-client-bridge] 外部会话事件后刷新会话列表失败(${reason}):`,
+        error,
+      );
+      scheduleRecovery(reason, error, true);
+    });
+  }, 300);
+}
+
+function shouldRefreshWorkspaceSessionSummary(eventType: string, event: RustEventEnvelope): boolean {
+  return EXTERNAL_SESSION_SUMMARY_EVENTS.has(eventType)
+    && eventTargetsDifferentSession(event);
 }
 
 const TURN_TERMINAL_EVENTS = new Set([
@@ -1085,10 +1143,11 @@ const TURN_TERMINAL_EVENTS = new Set([
 ]);
 
 function handleRustEventStreamMessage(event: RustEventEnvelope): void {
-  if (!shouldRefreshFromRustEvent(event)) {
+  const eventType = trimBridgeString(event.event_type);
+
+  if (!eventMatchesCurrentWorkspace(event)) {
     return;
   }
-  const eventType = trimBridgeString(event.event_type);
 
   if (eventType === 'event.stream.lagged') {
     console.warn('[web-client-bridge] 事件流出现 lag，切换到 bootstrap recovery', {
@@ -1101,6 +1160,13 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
   }
 
   if (eventType === 'event.stream.keep_alive') {
+    return;
+  }
+
+  if (!shouldApplyCurrentSessionRustEvent(event)) {
+    if (shouldRefreshWorkspaceSessionSummary(eventType, event)) {
+      scheduleExternalSessionSummaryRefresh(`external_${eventType.replaceAll('.', '_')}`);
+    }
     return;
   }
 
@@ -1426,6 +1492,17 @@ function buildBootstrapQuery(
   }
   if (binding.sessionId) {
     query.set('sessionId', binding.sessionId);
+  }
+  return query.toString();
+}
+
+function eventStreamBindingKey(): string {
+  const query = new URLSearchParams();
+  if (currentWorkspaceId) {
+    query.set('workspaceId', currentWorkspaceId);
+  }
+  if (currentWorkspacePath) {
+    query.set('workspacePath', currentWorkspacePath);
   }
   return query.toString();
 }
@@ -1764,17 +1841,7 @@ async function ensureEventStream(
   if (typeof window === 'undefined') {
     return;
   }
-  const query = new URLSearchParams();
-  if (currentWorkspaceId) {
-    query.set('workspaceId', currentWorkspaceId);
-  }
-  if (currentWorkspacePath) {
-    query.set('workspacePath', currentWorkspacePath);
-  }
-  if (currentSessionId) {
-    query.set('sessionId', currentSessionId);
-  }
-  const nextKey = query.toString();
+  const nextKey = eventStreamBindingKey();
   if (!nextKey) {
     closeEventStream();
     return;
@@ -2293,10 +2360,7 @@ async function ensureFreshLiveBridge(reason: string): Promise<void> {
     return;
   }
   if (hasWorkspaceBinding && !currentSessionId) {
-    const query = new URLSearchParams();
-    if (currentWorkspaceId) query.set('workspaceId', currentWorkspaceId);
-    if (currentWorkspacePath) query.set('workspacePath', currentWorkspacePath);
-    const expectedKey = query.toString();
+    const expectedKey = eventStreamBindingKey();
     await ensureEventStream({
       forceReconnect: activeEventStreamKey !== expectedKey,
       waitUntilOpen: true,
@@ -2315,10 +2379,7 @@ async function ensureFreshLiveBridge(reason: string): Promise<void> {
   // 检查当前 SSE 连接的 key 是否与预期 workspace 绑定匹配。
   // 事件流按 workspace 订阅，session 展示由前端本地按 sessionId 分发，
   // 避免切换当前会话时重连 SSE 并抢占其他会话的实时输出。
-  const query = new URLSearchParams();
-  if (currentWorkspaceId) query.set('workspaceId', currentWorkspaceId);
-  if (currentWorkspacePath) query.set('workspacePath', currentWorkspacePath);
-  const expectedKey = query.toString();
+  const expectedKey = eventStreamBindingKey();
   const needsReconnect = activeEventStreamKey !== expectedKey;
   await ensureEventStream({
     forceReconnect: needsReconnect,
