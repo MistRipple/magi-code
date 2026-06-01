@@ -863,6 +863,8 @@
   async function activateTaskReference(reference: TaskReferenceDescriptor) {
     await executeTaskReferenceAction(reference, {
       sessionId: currentSessionIdValue(),
+      workspaceId: currentWorkspaceIdValue(),
+      workspacePath: currentWorkspacePathValue(),
       postMessage: (message) => vscode.postMessage(message),
       writeClipboard: (text) => navigator.clipboard.writeText(text),
       onCopySuccess: () => addToast('info', i18n.t('tasks.reference.copySuccess')),

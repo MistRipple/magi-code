@@ -789,6 +789,9 @@
   function handleFileSelect(
     filePath: string,
     metadata: {
+      workspaceId?: string;
+      workspacePath?: string;
+      sessionId?: string;
       contentKind?: EditContentKind;
       size?: number;
       mime?: string;
@@ -801,12 +804,12 @@
     if (!resolvedFilePath) {
       return false;
     }
-    const sessionId = currentSessionId || '';
+    const sessionId = metadata.sessionId?.trim() || currentSessionId || '';
     if (!sessionId) {
       return false;
     }
-    const workspaceId = selectedWorkspace?.workspaceId?.trim() || selectedWorkspaceId.trim();
-    const workspacePath = selectedWorkspace?.rootPath?.trim() || '';
+    const workspaceId = metadata.workspaceId?.trim() || selectedWorkspace?.workspaceId?.trim() || selectedWorkspaceId.trim();
+    const workspacePath = metadata.workspacePath?.trim() || selectedWorkspace?.rootPath?.trim() || '';
     if (!workspaceId || !workspacePath) {
       return false;
     }
@@ -1204,6 +1207,9 @@
     const handlePreviewFile = (event: Event) => {
       const detail = (event as CustomEvent<{
         filepath?: string;
+        workspaceId?: string;
+        workspacePath?: string;
+        sessionId?: string;
         contentKind?: EditContentKind;
         size?: number;
         mime?: string;
@@ -1214,6 +1220,9 @@
       const filepath = detail?.filepath;
       if (typeof filepath === 'string') {
         const handled = handleFileSelect(filepath, {
+          workspaceId: detail?.workspaceId,
+          workspacePath: detail?.workspacePath,
+          sessionId: detail?.sessionId,
           contentKind: detail?.contentKind,
           size: detail?.size,
           mime: detail?.mime,

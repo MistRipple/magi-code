@@ -1,5 +1,8 @@
 export interface FilePreviewEventDetail {
   filepath: string;
+  workspaceId?: string;
+  workspacePath?: string;
+  sessionId?: string;
   contentKind?: import('../types/message').EditContentKind;
   size?: number;
   mime?: string;
@@ -7,6 +10,10 @@ export interface FilePreviewEventDetail {
   headSummary?: string;
   tailSummary?: string;
 }
+
+export type FilePreviewScope = Pick<FilePreviewEventDetail, 'workspaceId' | 'workspacePath' | 'sessionId'>;
+export type FilePreviewScopeReader = () => FilePreviewScope | undefined;
+export const FILE_PREVIEW_SCOPE_CONTEXT = Symbol('magi-file-preview-scope');
 
 export type FileReferenceTextSegment =
   | { kind: 'text'; text: string }

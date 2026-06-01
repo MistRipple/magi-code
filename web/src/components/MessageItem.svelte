@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { ContentBlock, Message, PlaceholderState } from '../types/message';
+  import type { FilePreviewScope } from '../lib/file-reference';
   import type { IconName } from '../lib/icons';
   import MarkdownContent from './MarkdownContent.svelte';
   import ExecutorBadge from './ExecutorBadge.svelte';
@@ -23,6 +24,8 @@
     showStreamingIndicator?: boolean;
     /** 当前面板流式计时（秒） */
     streamingElapsedSeconds?: number;
+    /** 文件预览必须跟随当前消息所属 workspace/session，不能从右栏当前状态猜测 */
+    filePreviewScope?: FilePreviewScope;
   }
   let {
     message,
@@ -30,6 +33,7 @@
     displayContext = 'thread',
     showStreamingIndicator = true,
     streamingElapsedSeconds = 0,
+    filePreviewScope = undefined,
   }: Props = $props();
 
   // 派生状态
@@ -281,7 +285,7 @@
     <div class="user-row">
       <div class="user-content">
         <div class="user-plain-content">
-          <MarkdownContent content={message.content || ''} isStreaming={false} />
+          <MarkdownContent content={message.content || ''} isStreaming={false} {filePreviewScope} />
         </div>
       </div>
     </div>
@@ -331,7 +335,7 @@
               <span class="system-section-hint">{i18n.t('messageItem.systemSectionExpandHint')}</span>
             </summary>
             <div class="system-section-content">
-              <MarkdownContent content={message.content} isStreaming={false} />
+              <MarkdownContent content={message.content} isStreaming={false} {filePreviewScope} />
             </div>
           </details>
         {:else if presentationBlocks.length > 0}
@@ -342,7 +346,7 @@
             <BlockRenderer {block} isStreaming={blockIsStreaming} {readOnly} />
           {/each}
         {:else if message.content}
-          <MarkdownContent content={message.content} {isStreaming} />
+          <MarkdownContent content={message.content} {isStreaming} {filePreviewScope} />
         {/if}
 
         {#if showResponseDuration}

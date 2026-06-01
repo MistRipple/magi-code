@@ -1,4 +1,10 @@
 <script lang="ts">
+  import { setContext } from 'svelte';
+  import {
+    FILE_PREVIEW_SCOPE_CONTEXT,
+    type FilePreviewScope,
+    type FilePreviewScopeReader,
+  } from '../lib/file-reference';
   import { preprocessMarkdown, splitStreamingMarkdown } from '../lib/markdown-utils';
   import MarkdownRenderer from './MarkdownRenderer.svelte';
 
@@ -6,8 +12,12 @@
   interface Props {
     content: string;
     isStreaming?: boolean;
+    filePreviewScope?: FilePreviewScope;
   }
-  let { content, isStreaming = false }: Props = $props();
+  let { content, isStreaming = false, filePreviewScope = undefined }: Props = $props();
+
+  const readFilePreviewScope: FilePreviewScopeReader = () => filePreviewScope;
+  setContext(FILE_PREVIEW_SCOPE_CONTEXT, readFilePreviewScope);
 
   const markdownParts = $derived.by(() => {
     const source = content || '';

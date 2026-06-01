@@ -613,6 +613,11 @@
           message={item.message}
           {readOnly}
           {displayContext}
+          filePreviewScope={{
+            workspaceId: messagesState.currentWorkspaceId || undefined,
+            workspacePath: messagesState.currentWorkspacePath || undefined,
+            sessionId: messagesState.currentSessionId || undefined,
+          }}
           showStreamingIndicator={item.key === streamingIndicatorRenderKey}
           streamingElapsedSeconds={item.key === streamingIndicatorRenderKey ? elapsedSeconds : 0}
         />

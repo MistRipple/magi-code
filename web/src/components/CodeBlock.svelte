@@ -1,10 +1,13 @@
 <script lang="ts">
+  import { getContext } from 'svelte';
   import hljs from 'highlight.js';
   import DiagramRenderer from './DiagramRenderer.svelte';
   import { i18n } from '../stores/i18n.svelte';
   import { parseCodeBlockDiagramPayload } from '../lib/diagram-payload';
   import {
     dispatchFilePreviewEvent,
+    FILE_PREVIEW_SCOPE_CONTEXT,
+    type FilePreviewScopeReader,
     normalizeFileReferenceTarget,
   } from '../lib/file-reference';
   import { vscode } from '../lib/vscode-bridge';
@@ -51,6 +54,11 @@
   const trimmedCode = $derived(code.trimEnd().replace(/^\n/, ''));
   const lines = $derived(trimmedCode.split('\n'));
   const diagramPayload = $derived(parseCodeBlockDiagramPayload(language, trimmedCode));
+  const readFilePreviewScope = getContext<FilePreviewScopeReader | undefined>(FILE_PREVIEW_SCOPE_CONTEXT);
+
+  function currentFilePreviewScope() {
+    return readFilePreviewScope?.() ?? {};
+  }
 
   // 🔧 计算高亮 HTML
   // 策略：
@@ -118,10 +126,11 @@
     const target = filepath.trim();
     if (!target) return;
     const normalizedTarget = normalizeFileReferenceTarget(target) ?? target;
-    if (dispatchFilePreviewEvent({ filepath: normalizedTarget })) {
+    const scope = currentFilePreviewScope();
+    if (dispatchFilePreviewEvent({ filepath: normalizedTarget, ...scope })) {
       return;
     }
-    vscode.postMessage({ type: 'openFile', filepath: normalizedTarget });
+    vscode.postMessage({ type: 'openFile', filepath: normalizedTarget, ...scope });
   }
 
   function previewFilepathClick(event: MouseEvent) {

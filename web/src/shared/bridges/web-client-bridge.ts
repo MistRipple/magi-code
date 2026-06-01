@@ -3847,10 +3847,11 @@ export function createWebClientBridge(): ClientBridge {
           if (typeof message.url === 'string' && message.url.trim()) {
             const fileTarget = normalizeFileReferenceTarget(message.url);
             if (fileTarget) {
-              if (dispatchFilePreviewEvent({ filepath: fileTarget })) {
+              const scope = requestScopeFromMessage(message);
+              if (dispatchFilePreviewEvent({ filepath: fileTarget, ...scope })) {
                 return;
               }
-              void openFilePreview(fileTarget, undefined, requestScopeFromMessage(message)).catch((error) => {
+              void openFilePreview(fileTarget, undefined, scope).catch((error) => {
                 logBridgeOperationFailure(i18n.t('bridge.action.openFilePreview'), '[web-client-bridge] 打开文件预览失败:', error);
               });
               return;

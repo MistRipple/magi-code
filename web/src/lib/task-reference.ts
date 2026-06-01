@@ -17,6 +17,8 @@ export interface TaskReferenceDescriptor {
 
 export interface TaskReferenceActionRuntime {
   sessionId?: string | null;
+  workspaceId?: string | null;
+  workspacePath?: string | null;
   postMessage: (message: ClientBridgeMessage) => void;
   writeClipboard: (text: string) => Promise<void>;
   onCopySuccess?: () => void;
@@ -173,22 +175,33 @@ export async function executeTaskReferenceAction(
   runtime: TaskReferenceActionRuntime,
 ): Promise<void> {
   const sessionId = runtime.sessionId || undefined;
+  const workspaceId = runtime.workspaceId || undefined;
+  const workspacePath = runtime.workspacePath || undefined;
   if (reference.actionKind === 'diff') {
     runtime.postMessage({
       type: 'viewDiff',
       filePath: reference.actionTarget,
       sessionId,
+      workspaceId,
+      workspacePath,
     });
     return;
   }
   if (reference.actionKind === 'file') {
-    if (dispatchFilePreviewEvent({ filepath: reference.actionTarget })) {
+    if (dispatchFilePreviewEvent({
+      filepath: reference.actionTarget,
+      sessionId,
+      workspaceId,
+      workspacePath,
+    })) {
       return;
     }
     runtime.postMessage({
       type: 'openFile',
       filepath: reference.actionTarget,
       sessionId,
+      workspaceId,
+      workspacePath,
     });
     return;
   }
