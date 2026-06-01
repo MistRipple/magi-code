@@ -721,7 +721,7 @@ fn long_mission_agent_spawn_prerequisite_rejection(
                 "status": "failed",
                 "error_code": "mission_charter_unavailable",
                 "error": "长任务契约状态暂不可用，暂不能派发代理",
-                "instruction": "先修复 workspace 绑定，让 mission_charter_write 能落盘；长任务不能在没有 mission 契约的情况下派发代理。",
+                "instruction": "不要继续派发代理。请由主线继续完成不依赖代理的部分，并在最终结果中说明代理派发未执行。",
             })
             .to_string(),
             ExecutionResultStatus::Failed,
@@ -767,7 +767,7 @@ fn long_mission_agent_spawn_prerequisite_rejection(
                 "status": "failed",
                 "error_code": "mission_plan_unavailable",
                 "error": "长任务计划状态暂不可用，暂不能派发代理",
-                "instruction": "先修复 workspace 绑定，让 plan_write 能落盘；长任务不能在没有执行计划的情况下派发代理。",
+                "instruction": "不要继续派发代理。请由主线继续完成不依赖代理的部分，并在最终结果中说明代理派发未执行。",
             })
             .to_string(),
             ExecutionResultStatus::Failed,
@@ -3476,6 +3476,17 @@ mod tests {
         assert_eq!(missing_charter.1, ExecutionResultStatus::Rejected);
         assert!(missing_charter.0.contains("mission_charter_write"));
 
+        let unavailable_charter = long_mission_agent_spawn_prerequisite_rejection(
+            BuiltinToolName::AgentSpawn,
+            None,
+            Some(&plan_store),
+            &parent,
+        )
+        .expect("unavailable charter state should reject agent_spawn");
+        assert_eq!(unavailable_charter.1, ExecutionResultStatus::Failed);
+        assert!(!unavailable_charter.0.contains("workspace 绑定"));
+        assert!(!unavailable_charter.0.contains("落盘"));
+
         let mut charter = magi_mission_charter::MissionCharter::new(
             parent.mission_id.clone(),
             "LongMission 前置约束",
@@ -3495,6 +3506,17 @@ mod tests {
         .expect("missing plan should reject agent_spawn");
         assert_eq!(missing_plan.1, ExecutionResultStatus::Rejected);
         assert!(missing_plan.0.contains("plan_write"));
+
+        let unavailable_plan = long_mission_agent_spawn_prerequisite_rejection(
+            BuiltinToolName::AgentSpawn,
+            Some(&charter_store),
+            None,
+            &parent,
+        )
+        .expect("unavailable plan state should reject agent_spawn");
+        assert_eq!(unavailable_plan.1, ExecutionResultStatus::Failed);
+        assert!(!unavailable_plan.0.contains("workspace 绑定"));
+        assert!(!unavailable_plan.0.contains("落盘"));
 
         let mut plan = magi_plan::Plan::new(parent.mission_id.clone(), UtcMillis(2));
         plan.steps.push(magi_plan::PlanStep {
