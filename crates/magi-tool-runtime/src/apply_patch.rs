@@ -346,7 +346,8 @@ fn apply_plan(
 }
 
 fn resolve_patch_path(path: &str, context: &ToolExecutionContext) -> Result<PathBuf, String> {
-    resolve_path_with_context(path, context).map_err(|error| format!("{path}: {error}"))
+    resolve_path_with_context(path, context)
+        .map_err(|error| apply_patch_path_resolution_error(path, error))
 }
 
 fn read_staged_or_disk(
@@ -459,6 +460,15 @@ fn apply_patch_access_error(action: &'static str, path: &Path, error: impl Displ
         path = %path.display(),
         error = %error,
         "apply_patch filesystem operation failed"
+    );
+    APPLY_PATCH_FILE_ACCESS_PUBLIC_ERROR.to_string()
+}
+
+fn apply_patch_path_resolution_error(path: &str, error: impl Display) -> String {
+    tracing::warn!(
+        path,
+        error = %error,
+        "apply_patch path resolution failed"
     );
     APPLY_PATCH_FILE_ACCESS_PUBLIC_ERROR.to_string()
 }
@@ -590,6 +600,22 @@ mod tests {
         assert!(!text.contains(missing.to_string_lossy().as_ref()));
         assert!(!text.contains("No such file"));
         assert!(!text.contains("os error"));
+    }
+
+    #[test]
+    fn apply_patch_path_resolution_failure_uses_public_message() {
+        let message = apply_patch_path_resolution_error(
+            "/private/workspace/secret.txt",
+            "无法解析当前目录: No such file or directory (os error 2)",
+        );
+        let output = apply_patch_error(message);
+        let payload: Value = serde_json::from_str(&output).expect("json output");
+
+        assert_eq!(payload["status"], "failed");
+        assert_eq!(payload["error"], APPLY_PATCH_FILE_ACCESS_PUBLIC_ERROR);
+        assert!(!output.contains("/private/workspace/secret.txt"));
+        assert!(!output.contains("No such file"));
+        assert!(!output.contains("os error"));
     }
 
     #[test]

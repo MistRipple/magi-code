@@ -40,6 +40,7 @@ const PROCESS_WRITE_PUBLIC_ERROR: &str = "后台进程暂不可写入，请稍�
 const PROCESS_INSPECT_PUBLIC_ERROR: &str = "进程信息暂不可读取，请稍后重试";
 const WEB_SEARCH_PUBLIC_ERROR: &str = "网络搜索暂不可用，请稍后重试";
 const WEB_FETCH_PUBLIC_ERROR: &str = "网页内容暂不可获取，请稍后重试";
+const PATH_RESOLUTION_PUBLIC_ERROR: &str = "路径暂不可解析，请检查工作区或路径";
 
 #[derive(Clone)]
 struct ActiveShellExec {
@@ -305,7 +306,9 @@ fn execute_file_read(input: &str, context: &ToolExecutionContext) -> String {
 
     let path = match resolve_path_with_context(&path_input, context) {
         Ok(path) => path,
-        Err(error) => return builtin_error("file_read", error),
+        Err(error) => {
+            return builtin_path_resolution_error("file_read", &path_input, error);
+        }
     };
 
     let metadata = match fs::metadata(&path) {
@@ -409,7 +412,9 @@ fn execute_search_text(input: &str, context: &ToolExecutionContext) -> String {
         .unwrap_or_else(|| ".".to_string());
     let root = match resolve_path_with_context(&root_input, context) {
         Ok(path) => path,
-        Err(error) => return builtin_error("search_text", error),
+        Err(error) => {
+            return builtin_path_resolution_error("search_text", &root_input, error);
+        }
     };
     let limit = request
         .as_ref()
@@ -509,11 +514,15 @@ fn execute_shell_exec(input: &str, context: &ToolExecutionContext) -> String {
     let cwd = match cwd_input {
         Some(value) => match resolve_path_with_context(&value, context) {
             Ok(path) => path,
-            Err(error) => return builtin_error("shell_exec", error),
+            Err(error) => {
+                return builtin_path_resolution_error("shell_exec", &value, error);
+            }
         },
         None => match context_working_directory(context) {
             Ok(path) => path,
-            Err(error) => return builtin_error("shell_exec", error),
+            Err(error) => {
+                return builtin_path_resolution_error("shell_exec", "<context>", error);
+            }
         },
     };
     let shell = request
@@ -976,11 +985,15 @@ fn execute_process_launch_with_surface(
     let cwd = match cwd_input {
         Some(value) => match resolve_path_with_context(&value, context) {
             Ok(path) => path,
-            Err(error) => return builtin_error(surface_tool, error),
+            Err(error) => {
+                return builtin_path_resolution_error(surface_tool, &value, error);
+            }
         },
         None => match context_working_directory(context) {
             Ok(path) => path,
-            Err(error) => return builtin_error(surface_tool, error),
+            Err(error) => {
+                return builtin_path_resolution_error(surface_tool, "<context>", error);
+            }
         },
     };
     let shell = request
@@ -1539,6 +1552,16 @@ fn builtin_runtime_error(
     builtin_error(tool, public_message)
 }
 
+fn builtin_path_resolution_error(tool: &str, requested_path: &str, error: impl Display) -> String {
+    tracing::warn!(
+        tool,
+        requested_path,
+        error = %error,
+        "builtin path resolution failed"
+    );
+    builtin_error(tool, PATH_RESOLUTION_PUBLIC_ERROR)
+}
+
 fn builtin_rejected(tool: &str, message: impl Into<String>) -> String {
     serde_json::json!({
         "tool": tool,
@@ -1840,7 +1863,9 @@ fn execute_file_write(input: &str, context: &ToolExecutionContext) -> String {
 
     let path = match resolve_path_with_context(&path_input, context) {
         Ok(p) => p,
-        Err(e) => return builtin_error("file_write", e),
+        Err(error) => {
+            return builtin_path_resolution_error("file_write", &path_input, error);
+        }
     };
 
     let overwrite = field_bool(&request, &["overwrite", "force"]).unwrap_or(true);
@@ -1906,7 +1931,9 @@ fn execute_file_patch(input: &str, context: &ToolExecutionContext) -> String {
     };
     let path = match resolve_path_with_context(&path_input, context) {
         Ok(p) => p,
-        Err(e) => return builtin_error("file_patch", e),
+        Err(error) => {
+            return builtin_path_resolution_error("file_patch", &path_input, error);
+        }
     };
 
     let content = match fs::read_to_string(&path) {
@@ -2032,7 +2059,9 @@ fn execute_file_remove(input: &str, context: &ToolExecutionContext) -> String {
 
     let path = match resolve_path_with_context(&path_input, context) {
         Ok(p) => p,
-        Err(e) => return builtin_error("file_remove", e),
+        Err(error) => {
+            return builtin_path_resolution_error("file_remove", &path_input, error);
+        }
     };
 
     let recursive = request
@@ -2148,7 +2177,9 @@ fn execute_file_mkdir(input: &str, context: &ToolExecutionContext) -> String {
 
     let path = match resolve_path_with_context(&path_input, context) {
         Ok(p) => p,
-        Err(e) => return builtin_error("file_mkdir", e),
+        Err(error) => {
+            return builtin_path_resolution_error("file_mkdir", &path_input, error);
+        }
     };
 
     if path.exists() {
@@ -2227,11 +2258,15 @@ fn execute_file_copy(input: &str, context: &ToolExecutionContext) -> String {
 
     let src = match resolve_path_with_context(&src_input, context) {
         Ok(p) => p,
-        Err(e) => return builtin_error("file_copy", e),
+        Err(error) => {
+            return builtin_path_resolution_error("file_copy", &src_input, error);
+        }
     };
     let dst = match resolve_path_with_context(&dst_input, context) {
         Ok(p) => p,
-        Err(e) => return builtin_error("file_copy", e),
+        Err(error) => {
+            return builtin_path_resolution_error("file_copy", &dst_input, error);
+        }
     };
 
     let overwrite = field_bool(&request, &["overwrite", "force"]).unwrap_or(false);
@@ -2346,11 +2381,15 @@ fn execute_file_move(input: &str, context: &ToolExecutionContext) -> String {
 
     let src = match resolve_path_with_context(&src_input, context) {
         Ok(p) => p,
-        Err(e) => return builtin_error("file_move", e),
+        Err(error) => {
+            return builtin_path_resolution_error("file_move", &src_input, error);
+        }
     };
     let dst = match resolve_path_with_context(&dst_input, context) {
         Ok(p) => p,
-        Err(e) => return builtin_error("file_move", e),
+        Err(error) => {
+            return builtin_path_resolution_error("file_move", &dst_input, error);
+        }
     };
 
     let overwrite = field_bool(&request, &["overwrite", "force"]).unwrap_or(false);
@@ -3313,5 +3352,26 @@ fn knowledge_kind_label(kind: magi_knowledge_store::KnowledgeKind) -> &'static s
         magi_knowledge_store::KnowledgeKind::Faq => "faq",
         magi_knowledge_store::KnowledgeKind::Learning => "learning",
         magi_knowledge_store::KnowledgeKind::CodeIndex => "code_index",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn path_resolution_failure_uses_public_message() {
+        let output = builtin_path_resolution_error(
+            "file_read",
+            "/private/workspace/secret.txt",
+            "无法解析当前目录: No such file or directory (os error 2)",
+        );
+        let payload: Value = serde_json::from_str(&output).expect("json output");
+
+        assert_eq!(payload["status"], "failed");
+        assert_eq!(payload["error"], PATH_RESOLUTION_PUBLIC_ERROR);
+        assert!(!output.contains("/private/workspace/secret.txt"));
+        assert!(!output.contains("No such file"));
+        assert!(!output.contains("os error"));
     }
 }
