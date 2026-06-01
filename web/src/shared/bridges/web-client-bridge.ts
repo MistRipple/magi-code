@@ -192,11 +192,11 @@ const RECOVERY_MAX_DELAY_MS = 10_000;
 const EVENT_STREAM_PARSE_ERROR_DEBOUNCE_MS = 5000;
 const EVENT_STREAM_OPEN_TIMEOUT_MS = 4000;
 // 后端 SSE keep-alive interval 为 5s（见 crates/magi-api/src/sse.rs）。
-// 空闲态给出 4 个心跳的容错窗口；活跃执行态只给出约 1.5 个心跳窗口。
-// 这样移动网络 / Tunnel 静默断流时，正在输出的对话会更快走 bootstrap recovery，
-// 避免用户长时间看到“内容停住但仍在响应中”。
-const EVENT_STREAM_IDLE_TIMEOUT_MS = 20_000;
-const ACTIVE_EVENT_STREAM_IDLE_TIMEOUT_MS = 8_000;
+// 前端按“漏心跳数量”判断静默断流，避免手机 / Tunnel / 代理链路偶发心跳抖动时
+// 在输出中强制 recovery，造成多端同步抖动和流式体验中断。
+const EVENT_STREAM_KEEP_ALIVE_INTERVAL_MS = 5_000;
+const EVENT_STREAM_IDLE_TIMEOUT_MS = EVENT_STREAM_KEEP_ALIVE_INTERVAL_MS * 4;
+const ACTIVE_EVENT_STREAM_IDLE_TIMEOUT_MS = EVENT_STREAM_KEEP_ALIVE_INTERVAL_MS * 3;
 const EVENT_STREAM_IDLE_CHECK_INTERVAL_MS = 5_000;
 const EXTERNAL_SESSION_SUMMARY_EVENTS = new Set([
   'session.turn.accepted',
