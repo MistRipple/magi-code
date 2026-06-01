@@ -322,7 +322,8 @@ mod tests {
         UtcMillis, WorkspaceId,
     };
     use magi_event_bus::{
-        AuditUsageLedgerStatus, RuntimeExecutorSummary, RuntimeMaintenanceSummary,
+        AuditUsageLedgerStatus, RUNTIME_LEDGER_PERSIST_ERROR_SUMMARY, RuntimeExecutorSummary,
+        RuntimeMaintenanceSummary,
     };
     use magi_governance::GovernanceService;
     use magi_session_store::SessionStore;
@@ -774,7 +775,7 @@ mod tests {
                 .ledger
                 .last_persist_error
                 .as_deref(),
-            Some("blocked")
+            Some(RUNTIME_LEDGER_PERSIST_ERROR_SUMMARY)
         );
         assert!(bootstrap.runtime_read_model.meta.ledger.pending_flush);
         assert!(

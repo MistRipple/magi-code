@@ -17,6 +17,7 @@ pub use contract::{
 };
 use contract::{runtime_read_model_contract_sections, runtime_read_model_section_ordering_rules};
 pub const RUNTIME_LEDGER_SCHEMA_VERSION: &str = "audit-usage-ledger-v1";
+pub const RUNTIME_LEDGER_PERSIST_ERROR_SUMMARY: &str = "ledger persistence failed";
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct EventCategoryCounts {
@@ -564,7 +565,7 @@ pub struct RuntimeMetaSummary {
 
 impl From<AuditUsageLedgerStatus> for RuntimeLedgerSummary {
     fn from(value: AuditUsageLedgerStatus) -> Self {
-        let last_persist_error = value.last_persist_error;
+        let last_persist_error = public_ledger_persist_error(value.last_persist_error);
         let is_persist_healthy = last_persist_error.is_none();
         let mut summary = Self {
             schema_version: value.schema_version,
@@ -584,6 +585,10 @@ impl From<AuditUsageLedgerStatus> for RuntimeLedgerSummary {
         summary.refresh_readiness();
         summary
     }
+}
+
+fn public_ledger_persist_error(error: Option<String>) -> Option<String> {
+    error.map(|_| RUNTIME_LEDGER_PERSIST_ERROR_SUMMARY.to_string())
 }
 
 impl RuntimeLedgerSummary {
@@ -2282,6 +2287,33 @@ mod tests {
     use crate::EventContext;
     use magi_core::EventId;
     use serde_json::json;
+    use std::path::PathBuf;
+
+    #[test]
+    fn runtime_ledger公开摘要不暴露内部持久化错误() {
+        let summary = RuntimeLedgerSummary::from(AuditUsageLedgerStatus {
+            schema_version: RUNTIME_LEDGER_SCHEMA_VERSION.to_string(),
+            next_sequence: 1,
+            audit_count: 0,
+            usage_count: 0,
+            persistence_path: Some(PathBuf::from("/Users/xie/.magi/audit-usage-ledger.json")),
+            last_persist_error: Some(
+                "/Users/xie/.magi/audit-usage-ledger.json: Permission denied".to_string(),
+            ),
+        });
+
+        assert_eq!(
+            summary.last_persist_error.as_deref(),
+            Some(RUNTIME_LEDGER_PERSIST_ERROR_SUMMARY)
+        );
+        let public_error = summary
+            .last_persist_error
+            .as_deref()
+            .expect("public error should exist");
+        assert!(!public_error.contains("/Users/xie"));
+        assert!(!public_error.contains("Permission denied"));
+        assert!(!summary.is_persist_healthy);
+    }
 
     #[test]
     fn mission_execution_overview_context_summary_updates_runtime_read_model() {

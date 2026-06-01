@@ -714,6 +714,7 @@ fn task_status_is_terminal(status: &TaskStatus) -> bool {
 mod tests {
     use super::*;
     use magi_core::{ExecutionOwnership, SessionId, ThreadId, UtcMillis, WorkspaceId};
+    use magi_event_bus::RUNTIME_LEDGER_PERSIST_ERROR_SUMMARY;
 
     #[test]
     fn runtime_read_model_merges_sidecars_and_ledger_summary() {
@@ -1313,7 +1314,7 @@ mod tests {
         assert_eq!(runtime_read_model.meta.ledger.usage_count, 4);
         assert_eq!(
             runtime_read_model.meta.ledger.last_persist_error.as_deref(),
-            Some("blocked")
+            Some(RUNTIME_LEDGER_PERSIST_ERROR_SUMMARY)
         );
         assert!(runtime_read_model.meta.ledger.pending_flush);
         assert!(runtime_read_model.meta.ledger.last_persisted_at.is_some());

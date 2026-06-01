@@ -311,6 +311,7 @@ impl InMemoryEventBus {
 mod tests {
     use super::*;
     use crate::EventCategory;
+    use crate::RUNTIME_LEDGER_PERSIST_ERROR_SUMMARY;
     use magi_core::EventId;
     use serde_json::json;
     use std::{fs, thread, time::Duration};
@@ -575,7 +576,11 @@ mod tests {
                 .as_ref()
                 .map(|path| path.display().to_string())
         );
-        assert_eq!(runtime_ledger.last_persist_error, status.last_persist_error);
+        assert_ne!(runtime_ledger.last_persist_error, status.last_persist_error);
+        assert_eq!(
+            runtime_ledger.last_persist_error.as_deref(),
+            Some(RUNTIME_LEDGER_PERSIST_ERROR_SUMMARY)
+        );
         assert_eq!(
             runtime_ledger.is_persist_healthy,
             status.last_persist_error.is_none()
