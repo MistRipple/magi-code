@@ -5,6 +5,7 @@ use crate::{
         MissionAggregateExport, RuntimeReadModelDto, ServiceInfo, runtime_read_model_dto,
     },
     errors::ApiError,
+    public_canonical::{public_canonical_turn, public_event_envelope},
     state::ApiState,
 };
 use magi_core::{SessionId, UtcMillis};
@@ -149,7 +150,11 @@ impl BootstrapDto {
             current_session,
             sessions: session_projection.sessions,
             timeline: session_projection.timeline,
-            canonical_turns: session_projection.canonical_turns,
+            canonical_turns: session_projection
+                .canonical_turns
+                .into_iter()
+                .map(public_canonical_turn)
+                .collect(),
             workspaces: workspace_projection.workspaces,
             snapshots: workspace_projection.snapshots,
             recovery_handles: workspace_projection.recovery_handles,
@@ -159,7 +164,11 @@ impl BootstrapDto {
             bridge_preflight,
             notifications: session_projection.notifications,
             event_stream_next_sequence: event_snapshot.next_sequence,
-            recent_events: event_snapshot.recent_events,
+            recent_events: event_snapshot
+                .recent_events
+                .into_iter()
+                .map(public_event_envelope)
+                .collect(),
             has_more_before: false,
             before_cursor: None,
             pending_changes: Vec::new(),

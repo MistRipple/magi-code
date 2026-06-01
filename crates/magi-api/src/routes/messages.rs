@@ -3,16 +3,15 @@ use axum::{
     extract::{Query, State},
     routing::get,
 };
-use magi_core::{UtcMillis, public_runtime_text};
+use magi_core::UtcMillis;
 use magi_session_store::{CanonicalTurn, NotificationRecord, SessionRecord, TimelineEntry};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 use super::session_scope::{
     parse_session_id, require_registered_workspace_binding, require_session_record_in_workspace,
     require_workspace_id,
 };
-use crate::{errors::ApiError, state::ApiState};
+use crate::{errors::ApiError, public_canonical::public_canonical_turn, state::ApiState};
 
 pub fn routes() -> Router<ApiState> {
     Router::new().route("/messages", get(get_messages))
@@ -106,41 +105,6 @@ async fn get_messages(
         has_more_before: start > 0,
         before_cursor,
     }))
-}
-
-fn public_canonical_turn(mut turn: CanonicalTurn) -> CanonicalTurn {
-    for item in &mut turn.items {
-        let Some(tool) = item.tool.as_mut() else {
-            continue;
-        };
-        tool.arguments = tool.arguments.take().and_then(public_canonical_tool_value);
-        tool.result = tool.result.take().and_then(public_canonical_tool_value);
-        tool.error = public_canonical_tool_text(tool.error.take());
-    }
-    turn
-}
-
-fn public_canonical_tool_value(value: Value) -> Option<Value> {
-    let public = public_runtime_text(&value.to_string());
-    if public.is_empty() {
-        return None;
-    }
-    serde_json::from_str(&public)
-        .ok()
-        .or_else(|| Some(Value::String(public)))
-}
-
-fn public_canonical_tool_text(value: Option<String>) -> Option<String> {
-    let value = value?.trim().to_string();
-    if value.is_empty() {
-        return None;
-    }
-    let public = public_runtime_text(&value);
-    if public.is_empty() {
-        None
-    } else {
-        Some(public)
-    }
 }
 
 #[cfg(test)]

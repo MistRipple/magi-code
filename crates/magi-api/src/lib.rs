@@ -5,6 +5,7 @@ mod dto;
 mod errors;
 pub mod mcp_config;
 mod model_config;
+mod public_canonical;
 mod routes;
 mod scope_binding;
 pub(crate) mod session_continue;

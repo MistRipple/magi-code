@@ -11,6 +11,7 @@ use magi_event_bus::{EventContext, EventEnvelope};
 use std::{convert::Infallible, time::Duration};
 use tokio_stream::wrappers::{BroadcastStream, errors::BroadcastStreamRecvError};
 
+use crate::public_canonical::public_event_envelope;
 use crate::state::ApiState;
 
 pub async fn events(
@@ -225,10 +226,10 @@ fn event_matches_session(event: &EventEnvelope, requested_session_id: Option<&Se
 }
 
 fn event_to_sse(event: EventEnvelope) -> Event {
+    let event = public_event_envelope(event);
+    let event_id = event.event_id.to_string();
     let payload = serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_string());
-    Event::default()
-        .id(event.event_id.to_string())
-        .data(payload)
+    Event::default().id(event_id).data(payload)
 }
 
 fn keep_alive_sse_event() -> Event {
