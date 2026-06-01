@@ -9,6 +9,7 @@ use crate::{
     model_config::{NormalizedModelConfig, configured_role_engine_model_config},
     prompt_utils::prepend_session_instructions,
     public_builtin_tool_definitions,
+    session_images::SessionTurnImage,
     session_turn_execution::{
         BUSINESS_MODEL_PROVIDER, SessionTurnExecutionOutput, SessionTurnExecutionRequest,
         SessionTurnExecutionRuntime, run_session_turn_execution,
@@ -660,6 +661,7 @@ impl LlmTaskDispatcher {
         writebacks: ExecutionWritebackPlans,
         use_tools: bool,
         skill_name: Option<String>,
+        images: Vec<SessionTurnImage>,
         usage_binding: ModelUsageBinding,
         is_sidechain: bool,
         worker_id: WorkerId,
@@ -683,6 +685,7 @@ impl LlmTaskDispatcher {
             &workspace_id,
             use_tools,
             skill_name,
+            images,
             &usage_binding,
             streaming_entry_id.as_deref(),
             is_sidechain,
@@ -697,6 +700,8 @@ impl LlmTaskDispatcher {
                 .bind_execution_ownership(session_id.clone(), ownership);
             let should_extract_knowledge = !writebacks.is_empty();
             writebacks.apply(&self.pipeline.memory_store);
+            self.publish_execution_overview(task, &session_id, &workspace_id, context_summary);
+            self.push_result(task_id, lease_id, outcome.clone());
             if should_extract_knowledge {
                 let execution_settings =
                     self.execution_settings_or_live(execution_settings_snapshot.as_ref());
@@ -708,7 +713,7 @@ impl LlmTaskDispatcher {
                 );
                 self.extract_and_persist_session_memory(execution_settings, &session_id);
             }
-            self.publish_execution_overview(task, &session_id, &workspace_id, context_summary);
+            return;
         }
         self.push_result(task_id, lease_id, outcome);
     }
@@ -1405,6 +1410,7 @@ impl LlmTaskDispatcher {
         workspace_id: &Option<WorkspaceId>,
         use_tools: bool,
         skill_name: Option<String>,
+        images: Vec<SessionTurnImage>,
         usage_binding: &ModelUsageBinding,
         streaming_entry_id: Option<&str>,
         is_sidechain: bool,
@@ -1620,6 +1626,7 @@ impl LlmTaskDispatcher {
             session_id,
             workspace_id,
             prompt,
+            images,
             tools,
             usage_binding,
             streaming_entry_id,
@@ -1678,6 +1685,7 @@ impl LlmTaskDispatcher {
                 writebacks,
                 use_tools,
                 skill_name,
+                images,
                 execution_settings_snapshot,
             } => {
                 self.publish_task_dispatched_event(
@@ -1699,6 +1707,7 @@ impl LlmTaskDispatcher {
                     writebacks,
                     use_tools,
                     skill_name,
+                    images,
                     model_usage_binding_for_worker_with_settings(
                         worker,
                         is_primary,

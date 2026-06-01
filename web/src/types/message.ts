@@ -804,16 +804,15 @@ export interface AppState {
 // Webview 持久化状态
 export interface WebviewPersistedState {
   currentTopTab: TabType;
-  sessions: Session[];
-  currentSessionId: string | null;
   scrollPositions?: ScrollPositions;
   scrollAnchors?: ScrollAnchors;
   autoScrollEnabled?: AutoScrollConfig;
-  sessionViewStateBySession?: Record<string, PersistedSessionViewState>;
-  sessionQueuedMessagesBySession?: Record<string, QueuedMessage[]>;
+  sessionViewStateByScope?: Record<string, PersistedSessionViewState>;
+  sessionQueuedMessagesByScope?: Record<string, QueuedMessage[]>;
 }
 
 export interface PersistedSessionViewState {
+  workspaceId: string | null;
   sessionId: string;
   scrollPositions?: ScrollPositions;
   scrollAnchors?: ScrollAnchors;

@@ -127,7 +127,8 @@
   ));
 
   const currentSessionId = $derived(messagesState.currentSessionId);
-  const taskProjection = $derived(getTaskProjectionState(currentSessionId));
+  const currentWorkspaceId = $derived(messagesState.currentWorkspaceId);
+  const taskProjection = $derived(getTaskProjectionState(currentSessionId, currentWorkspaceId));
 
   const shouldInterruptTaskProjectionFromComposer = $derived.by(() => {
     const projection = taskProjection.projection;
@@ -686,8 +687,8 @@
         const rootTaskId = projection?.root_task.task_id ?? taskProjection.rootTaskId;
         if (sessionId && rootTaskId) {
           const client = new RustDaemonClient(resolveAgentBaseUrl());
-          await client.interruptTask({ taskId: rootTaskId, sessionId });
-          await refreshTaskProjection(sessionId);
+          await client.interruptTask({ taskId: rootTaskId, sessionId, workspaceId: currentWorkspaceId?.trim() || undefined });
+          await refreshTaskProjection(sessionId, currentWorkspaceId?.trim() || undefined);
           addToast('info', i18n.t('input.stopTaskSaved'));
         }
         return;
@@ -1264,10 +1265,9 @@
               class:active={branchPickerOpen}
               onclick={toggleBranchPicker}
               disabled={branchSwitching !== null || sessionInputLocked || isInteractionBlocking}
-              title={i18n.t('input.branch.title')}
+              title={`${i18n.t('input.branch.title')}: ${currentBranch || '—'}`}
               aria-expanded={branchPickerOpen}
             >
-              <Icon name="git-branch" size={12} />
               <span class="ia-branch-btn-label">{currentBranch || '—'}</span>
               {#if branchAdditions > 0 || branchDeletions > 0}
                 <span class="ia-branch-diffstat">
@@ -1275,7 +1275,6 @@
                   <span class="ia-branch-del">-{branchDeletions}</span>
                 </span>
               {/if}
-              <Icon name="chevron-down" size={10} />
             </button>
             {#if branchPickerOpen}
               <!-- svelte-ignore a11y_click_events_have_key_events -->
@@ -1334,9 +1333,7 @@
             aria-expanded={accessProfilePickerOpen}
             aria-label={i18n.t('input.access.title')}
           >
-            <Icon name="shield" size={12} />
             <span class="ia-access-btn-label">{i18n.t(currentAccessProfileOption.labelKey)}</span>
-            <Icon name="chevron-down" size={10} />
           </button>
           {#if accessProfilePickerOpen}
             <!-- svelte-ignore a11y_click_events_have_key_events -->
@@ -1372,9 +1369,7 @@
               : i18n.t('input.mainModelPicker.titleEmpty')}
             aria-expanded={pickerOpen}
           >
-            <Icon name="model" size={12} />
             <span class="ia-picker-btn-label">{currentPickerModel || i18n.t('input.mainModelPicker.buttonEmpty')}</span>
-            <Icon name="chevron-down" size={10} />
           </button>
           {#if pickerOpen}
             <!-- svelte-ignore a11y_click_events_have_key_events -->
@@ -1428,7 +1423,6 @@
           aria-label={enhanceButtonTitle}
         >
           <Icon name={enhanceLoading ? 'loader' : 'enhance'} size={14} class={enhanceLoading ? 'spinning' : ''} />
-          <span>{i18n.t('input.enhance.label')}</span>
         </button>
         {#if hasEnhanceSnapshot}
           <button
@@ -1440,7 +1434,6 @@
             aria-label={i18n.t('input.enhance.restore')}
           >
             <Icon name="undo" size={14} />
-            <span>{i18n.t('input.enhance.restore')}</span>
           </button>
         {/if}
         {#if isSending}
@@ -1652,9 +1645,10 @@
   .ia-enhance {
     display: inline-flex;
     align-items: center;
-    gap: 4px;
+    justify-content: center;
     height: 24px;
-    padding: 0 8px;
+    width: 24px;
+    padding: 0;
     background: transparent;
     border: 1px solid var(--border-subtle);
     border-radius: var(--radius-full);
@@ -1697,6 +1691,7 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+    min-width: 0;
     max-width: 112px;
   }
   .ia-access-popover .ia-picker-item-label {
@@ -1709,6 +1704,7 @@
     gap: 4px;
     height: 24px;
     max-width: 180px;
+    min-width: 0;
     padding: 0 8px;
     background: transparent;
     border: 1px solid var(--border-subtle);
@@ -1738,6 +1734,7 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+    min-width: 0;
     max-width: 130px;
   }
   .ia-branch-btn {
@@ -1746,6 +1743,7 @@
     gap: 4px;
     height: 24px;
     max-width: 180px;
+    min-width: 0;
     padding: 0 8px;
     background: transparent;
     border: 1px solid var(--border-subtle);
@@ -1767,9 +1765,11 @@
     color: var(--primary);
   }
   .ia-branch-btn-label {
+    flex: 0 1 auto;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+    min-width: 0;
     max-width: 120px;
   }
   .ia-branch-diffstat {
@@ -1779,6 +1779,8 @@
     font-size: 10px;
     font-variant-numeric: tabular-nums;
     font-weight: 600;
+    flex: 0 0 auto;
+    white-space: nowrap;
   }
   .ia-branch-add { color: var(--success, #2ea043); }
   .ia-branch-del { color: var(--danger, #f85149); }
@@ -2224,16 +2226,17 @@
     }
 
     .ia-actions {
-      flex-wrap: wrap;
-      align-items: stretch;
-      justify-content: flex-start;
-      gap: 6px;
-      padding: 6px;
+      flex-wrap: nowrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 4px;
+      padding: 4px 6px;
     }
 
     .ia-left {
-      flex: 1 1 100%;
-      width: 100%;
+      flex: 0 1 min(112px, 38vw);
+      width: auto;
+      min-width: 0;
     }
 
     .ia-left:empty {
@@ -2241,25 +2244,31 @@
     }
 
     .ia-right {
-      flex: 1 1 100%;
-      width: 100%;
-      flex-wrap: wrap;
-      justify-content: flex-start;
-      gap: 6px;
+      flex: 1 1 auto;
+      width: auto;
+      min-width: 0;
+      flex-wrap: nowrap;
+      justify-content: flex-end;
+      gap: 4px;
     }
 
     .ia-branch-btn {
+      width: 100%;
       max-width: 100%;
+    }
+
+    .ia-branch-btn-label {
+      min-width: 34px;
     }
 
     .ia-access-wrap {
       flex: 0 1 auto;
-      max-width: 118px;
+      max-width: 86px;
     }
 
     .ia-model-wrap {
       flex: 0 1 auto;
-      max-width: min(176px, 52vw);
+      max-width: min(144px, 40vw);
     }
 
     .ia-access-wrap .ia-picker-btn,
@@ -2269,16 +2278,16 @@
     }
 
     .ia-access-btn-label {
-      max-width: 72px;
+      max-width: 100%;
     }
 
     .ia-picker-btn-label {
-      max-width: none;
+      max-width: 100%;
       min-width: 0;
     }
 
     .ia-enhance {
-      flex: 0 0 auto;
+      flex: 0 0 24px;
     }
 
     .ia-send {

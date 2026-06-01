@@ -115,6 +115,7 @@ pub(crate) fn chat_messages_from_llm_message(message: &LlmMessage) -> Vec<ChatMe
         LlmMessageContent::Text(text) => vec![ChatMessage {
             role: message.role.clone(),
             content: Some(text.clone()),
+            images: Vec::new(),
             tool_calls: Vec::new(),
             tool_call_id: None,
         }],
@@ -126,6 +127,7 @@ pub(crate) fn chat_messages_from_llm_message(message: &LlmMessage) -> Vec<ChatMe
 
 fn chat_messages_from_content_blocks(role: &str, blocks: &[LlmContentBlock]) -> Vec<ChatMessage> {
     let mut text_parts = Vec::new();
+    let mut images = Vec::new();
     let mut tool_calls = Vec::new();
     let mut tool_results = Vec::new();
 
@@ -133,6 +135,9 @@ fn chat_messages_from_content_blocks(role: &str, blocks: &[LlmContentBlock]) -> 
         match block {
             LlmContentBlock::Text { text } if !text.trim().is_empty() => {
                 text_parts.push(text.clone());
+            }
+            LlmContentBlock::Image { source } => {
+                images.push(source.clone());
             }
             LlmContentBlock::ToolUse { id, name, input } => {
                 tool_calls.push(ChatToolCall {
@@ -153,11 +158,12 @@ fn chat_messages_from_content_blocks(role: &str, blocks: &[LlmContentBlock]) -> 
                 tool_results.push(ChatMessage {
                     role: "tool".to_string(),
                     content: Some(chat_tool_result_content(content, images)),
+                    images: Vec::new(),
                     tool_calls: Vec::new(),
                     tool_call_id: Some(tool_use_id.clone()),
                 });
             }
-            LlmContentBlock::Image { .. } | LlmContentBlock::Text { .. } => {}
+            LlmContentBlock::Text { .. } => {}
         }
     }
 
@@ -172,6 +178,7 @@ fn chat_messages_from_content_blocks(role: &str, blocks: &[LlmContentBlock]) -> 
         } else {
             Some(text_parts.join("\n"))
         },
+        images,
         tool_calls,
         tool_call_id: None,
     }]

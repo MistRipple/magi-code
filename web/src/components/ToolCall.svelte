@@ -9,7 +9,7 @@
   import type { IconName } from '../lib/icons';
   import type { StandardizedToolResult, ToolPolicyPayload } from '../types/message';
   import { i18n } from '../stores/i18n.svelte';
-  import { getCurrentSessionId } from '../stores/messages.svelte';
+  import { getCurrentSessionId, messagesState } from '../stores/messages.svelte';
   import { diagramSummary, parseToolDiagramPayload } from '../lib/diagram-payload';
   import { openAgentTab, rightPaneState } from '../stores/right-pane.svelte';
   import { getAgentVisualInfo } from '../lib/agent-colors';
@@ -481,6 +481,7 @@
     if (!display || !display.childTaskId) return;
     openAgentTab(getCurrentSessionId() || rightPaneState.activeSessionId, display.childTaskId, {
       label: display.title,
+      workspaceId: messagesState.currentWorkspaceId,
     });
   }
 

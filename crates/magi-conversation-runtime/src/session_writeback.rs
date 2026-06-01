@@ -236,7 +236,7 @@ fn to_canonical_worker_ref(item: &ActiveExecutionTurnItem) -> Option<CanonicalWo
 }
 
 fn canonical_item_metadata(item: &ActiveExecutionTurnItem) -> HashMap<String, Value> {
-    let mut metadata = HashMap::new();
+    let mut metadata = item.metadata.clone();
     if let Some(value) = item
         .request_id
         .as_ref()
@@ -389,6 +389,7 @@ pub fn session_turn_item(
         request_id: None,
         user_message_id: None,
         placeholder_message_id: None,
+        metadata: Default::default(),
         timeline_entry_id: None,
         source_thread_id,
     }
@@ -697,6 +698,7 @@ pub fn append_session_tool_call_items_batch(
         messages.push(ChatMessage {
             role: "tool".to_string(),
             content: Some(tool_result),
+            images: Vec::new(),
             tool_calls: Vec::new(),
             tool_call_id: Some(tool_call.id.clone()),
         });

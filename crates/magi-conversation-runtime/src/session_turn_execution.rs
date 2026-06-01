@@ -5,11 +5,12 @@
 //! 等方式桥接到 `ApiError` 枚举。
 
 use crate::{
-    model_error::provider_empty_assistant_response_error,
+    model_error::{provider_empty_assistant_response_error, public_model_invocation_error_message},
     prompt_utils::{
         current_turn_context_priority_prompt, normalize_model_stream_preview_content,
         normalize_model_visible_content, workspace_context_system_prompt,
     },
+    session_images::{SessionTurnImage, image_sources_from_metadata, session_turn_image_sources},
     session_writeback::{
         SessionStatePersistCallback, append_session_tool_call_items_batch,
         append_session_turn_error_item, append_session_turn_item, persist_session_state_checkpoint,
@@ -44,6 +45,7 @@ pub struct SessionTurnExecutionRequest {
     pub turn_id: String,
     pub workspace_id: Option<WorkspaceId>,
     pub prompt: String,
+    pub images: Vec<SessionTurnImage>,
     pub use_tools: bool,
     pub access_profile: AccessProfile,
     pub skill_name: Option<String>,
@@ -154,6 +156,11 @@ fn build_session_turn_messages(
                     Some(ChatMessage {
                         role: role.to_string(),
                         content: Some(content),
+                        images: if item.kind == CanonicalTurnItemKind::UserMessage {
+                            image_sources_from_metadata(&item.metadata)
+                        } else {
+                            Vec::new()
+                        },
                         tool_calls: Vec::new(),
                         tool_call_id: None,
                     })
@@ -174,6 +181,7 @@ fn build_session_turn_messages(
         messages.push(ChatMessage {
             role: "system".to_string(),
             content: Some(current_turn_context_priority_prompt()),
+            images: Vec::new(),
             tool_calls: Vec::new(),
             tool_call_id: None,
         });
@@ -181,6 +189,7 @@ fn build_session_turn_messages(
     messages.push(ChatMessage {
         role: "user".to_string(),
         content: Some(prompt.to_string()),
+        images: session_turn_image_sources(&request.images),
         tool_calls: Vec::new(),
         tool_call_id: None,
     });
@@ -200,6 +209,7 @@ fn workspace_context_messages(request: &SessionTurnExecutionRequest) -> Vec<Chat
     vec![ChatMessage {
         role: "system".to_string(),
         content: Some(workspace_context_system_prompt(root_path)),
+        images: Vec::new(),
         tool_calls: Vec::new(),
         tool_call_id: None,
     }]
@@ -292,6 +302,7 @@ pub fn run_session_turn_execution(
                 if !request_turn_is_writable(session_store, &request) {
                     return Ok(SessionTurnExecutionOutput::interrupted());
                 }
+                let public_error = public_model_invocation_error_message(&error);
                 append_session_turn_error_item(
                     event_bus,
                     session_store,
@@ -301,12 +312,12 @@ pub fn run_session_turn_execution(
                     request.request_id.as_deref(),
                     request.user_message_id.as_deref(),
                     request.placeholder_message_id.as_deref(),
-                    &error,
+                    &public_error,
                     main_timeline_entry_id.as_deref(),
                     orchestrator_thread_id.clone(),
                     persist_session_state,
                 );
-                return Err(error);
+                return Err(public_error);
             }
         };
         if streamed_content.interrupted || !request_turn_is_writable(session_store, &request) {
@@ -330,6 +341,7 @@ pub fn run_session_turn_execution(
                 messages.push(ChatMessage {
                     role: "assistant".to_string(),
                     content: Some(content),
+                    images: Vec::new(),
                     tool_calls: Vec::new(),
                     tool_call_id: None,
                 });
@@ -339,6 +351,7 @@ pub fn run_session_turn_execution(
                         &request.required_tool_chain,
                         &completed_required_tool_names,
                     )),
+                    images: Vec::new(),
                     tool_calls: Vec::new(),
                     tool_call_id: None,
                 });
@@ -634,7 +647,7 @@ fn stream_session_turn_round(
             },
             &on_delta,
         )
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| public_model_invocation_error_message(&error.to_string()))?;
     let parsed = response.parse_chat_payload();
     publish_model_usage_record(
         event_bus,
@@ -768,6 +781,7 @@ fn stream_session_turn_round(
         messages.push(ChatMessage {
             role: "assistant".to_string(),
             content: parsed.content.clone(),
+            images: Vec::new(),
             tool_calls: parsed.tool_calls.clone(),
             tool_call_id: None,
         });
@@ -993,6 +1007,7 @@ mod tests {
             turn_id: "turn-force-tool-choice".to_string(),
             workspace_id: None,
             prompt: "画一个流程图".to_string(),
+            images: Vec::new(),
             use_tools: true,
             access_profile: AccessProfile::Restricted,
             skill_name: None,
@@ -1029,6 +1044,7 @@ mod tests {
             turn_id: "turn-required-tool-chain".to_string(),
             workspace_id: None,
             prompt: "依次调用 shell_exec、file_write、file_read".to_string(),
+            images: Vec::new(),
             use_tools: true,
             access_profile: AccessProfile::Restricted,
             skill_name: None,
@@ -1109,7 +1125,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_session_turn_response_exposes_provider_failure_layer() {
+    fn empty_session_turn_response_uses_public_failure_message() {
         let session_id = SessionId::new("session-empty-response-layer");
         let store = SessionStore::new();
         store
@@ -1154,6 +1170,7 @@ mod tests {
             turn_id: "turn-empty-response-layer".to_string(),
             workspace_id: None,
             prompt: "请回复一句话".to_string(),
+            images: Vec::new(),
             use_tools: false,
             access_profile: AccessProfile::Restricted,
             skill_name: None,
@@ -1185,10 +1202,7 @@ mod tests {
             Err(error) => error,
         };
 
-        assert_eq!(
-            error,
-            "桥接调用失败[RemoteBusiness]: provider response invalid: empty assistant response"
-        );
+        assert_eq!(error, "模型服务暂时不可用，请稍后重试。");
         let turn = store
             .runtime_sidecar(&session_id)
             .and_then(|sidecar| sidecar.current_turn)
@@ -1246,6 +1260,7 @@ mod tests {
             turn_id: "turn-placeholder-reuse".to_string(),
             workspace_id: None,
             prompt: "请只回复一句话".to_string(),
+            images: Vec::new(),
             use_tools: false,
             access_profile: AccessProfile::Restricted,
             skill_name: None,
@@ -1260,6 +1275,7 @@ mod tests {
         let mut messages = vec![ChatMessage {
             role: "user".to_string(),
             content: Some(request.prompt.clone()),
+            images: Vec::new(),
             tool_calls: Vec::new(),
             tool_call_id: None,
         }];
@@ -1451,6 +1467,7 @@ mod tests {
             turn_id: "turn-session-2000".to_string(),
             workspace_id: None,
             prompt: "请基于上一轮结果，用一句话回答：再加 4 等于几？".to_string(),
+            images: Vec::new(),
             use_tools: false,
             access_profile: AccessProfile::Restricted,
             skill_name: None,
@@ -1510,6 +1527,7 @@ mod tests {
             turn_id: "turn-workspace-context".to_string(),
             workspace_id: Some(WorkspaceId::new("workspace-context")),
             prompt: "分析一下当前项目".to_string(),
+            images: Vec::new(),
             use_tools: true,
             access_profile: AccessProfile::Restricted,
             skill_name: None,
@@ -1543,6 +1561,57 @@ mod tests {
     }
 
     #[test]
+    fn build_session_turn_messages_attaches_current_user_images() {
+        let session_id = SessionId::new("session-current-image");
+        let store = SessionStore::new();
+        store
+            .create_session(session_id.clone(), "current image")
+            .expect("session should be created");
+        store
+            .upsert_current_turn(
+                session_id.clone(),
+                ActiveExecutionTurn {
+                    turn_id: "turn-current-image".to_string(),
+                    turn_seq: 1,
+                    accepted_at: ts(1000),
+                    completed_at: None,
+                    status: "running".to_string(),
+                    user_message: Some("识别图片".to_string()),
+                    items: Vec::new(),
+                },
+            )
+            .expect("current turn should be stored");
+        let request = SessionTurnExecutionRequest {
+            session_id,
+            turn_id: "turn-current-image".to_string(),
+            workspace_id: None,
+            prompt: "识别图片".to_string(),
+            images: vec![
+                SessionTurnImage::from_data_url("paste.png", "data:image/png;base64,AAA")
+                    .expect("image should parse"),
+            ],
+            use_tools: false,
+            access_profile: AccessProfile::Restricted,
+            skill_name: None,
+            request_id: None,
+            user_message_id: None,
+            placeholder_message_id: None,
+            forced_tool_name: None,
+            required_tool_chain: Vec::new(),
+            workspace_root_path: None,
+        };
+
+        let messages = build_session_turn_messages(&store, &request, &request.prompt);
+        let current_user_message = messages.last().expect("current user message");
+
+        assert_eq!(current_user_message.role, "user");
+        assert_eq!(current_user_message.content.as_deref(), Some("识别图片"));
+        assert_eq!(current_user_message.images.len(), 1);
+        assert_eq!(current_user_message.images[0].media_type, "image/png");
+        assert_eq!(current_user_message.images[0].data, "AAA");
+    }
+
+    #[test]
     fn build_session_turn_messages_does_not_inject_workspace_context_without_tools() {
         let session_id = SessionId::new("session-workspace-chat");
         let store = SessionStore::new();
@@ -1568,6 +1637,7 @@ mod tests {
             turn_id: "turn-workspace-chat".to_string(),
             workspace_id: Some(WorkspaceId::new("workspace-context")),
             prompt: "解释一下当前状态".to_string(),
+            images: Vec::new(),
             use_tools: false,
             access_profile: AccessProfile::Restricted,
             skill_name: None,
@@ -1617,6 +1687,7 @@ mod tests {
             turn_id: "turn-post-tool-final-item".to_string(),
             workspace_id: None,
             prompt: "请调用工具后回答".to_string(),
+            images: Vec::new(),
             use_tools: true,
             access_profile: AccessProfile::Restricted,
             skill_name: None,
@@ -1748,6 +1819,7 @@ mod tests {
             turn_id: "turn-terminal-duration".to_string(),
             workspace_id: None,
             prompt: "请回答".to_string(),
+            images: Vec::new(),
             use_tools: false,
             access_profile: AccessProfile::Restricted,
             skill_name: None,

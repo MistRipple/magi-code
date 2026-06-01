@@ -16,11 +16,13 @@ use crate::{
         submit_dispatch_submission,
     },
 };
+use magi_conversation_runtime::session_images::SessionTurnImage;
 use magi_conversation_runtime::session_writeback::publish_current_session_turn_item_event;
 
 pub(super) async fn accept_session_task_submission(
     state: &ApiState,
     request: &SessionTurnRequestDto,
+    images: Vec<SessionTurnImage>,
     workspace_id: WorkspaceId,
     task_title: Option<String>,
     execution_goal: Option<String>,
@@ -51,6 +53,7 @@ pub(super) async fn accept_session_task_submission(
         task_tier,
         request.skill_name.clone(),
         None,
+        images,
         request,
     )
     .await
@@ -67,6 +70,7 @@ async fn execute_dispatch_submission(
     task_tier: TaskTier,
     skill_name: Option<String>,
     target_role: Option<String>,
+    images: Vec<SessionTurnImage>,
     request: &SessionTurnRequestDto,
 ) -> Result<(DispatchSubmissionAccepted, EventId), ApiError> {
     let accepted_at = monotonic_accepted_at();
@@ -91,6 +95,7 @@ async fn execute_dispatch_submission(
         workspace_id: workspace_id.clone(),
         entry_id: user_timeline_entry_id,
         timeline_message: message.clone(),
+        images,
         created_session,
         mission_title,
         task_title: action_task_title,

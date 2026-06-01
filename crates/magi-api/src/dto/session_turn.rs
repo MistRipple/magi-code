@@ -1,3 +1,4 @@
+use magi_conversation_runtime::session_images::SessionTurnImage;
 use magi_core::{AccessProfile, EventId, SessionId, TaskId, UtcMillis};
 use magi_session_store::{CANONICAL_TURN_SCHEMA_VERSION, CanonicalTurn, CanonicalTurnItem};
 use serde::{Deserialize, Serialize};
@@ -93,6 +94,15 @@ impl SessionTurnRequestDto {
         } else {
             message_lines.join("\n")
         }
+    }
+
+    pub fn parsed_images(&self) -> Result<Vec<SessionTurnImage>, String> {
+        self.images
+            .iter()
+            .map(|image| {
+                SessionTurnImage::from_data_url(image.name.clone(), image.data_url.clone())
+            })
+            .collect()
     }
 }
 

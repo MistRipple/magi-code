@@ -25,6 +25,8 @@ export interface TaskProjectionState {
 }
 
 interface InternalSessionTaskProjectionState extends TaskProjectionState {
+  workspaceId: string;
+  sessionId: string;
   fetchGeneration: number;
   refreshAfterLoad: boolean;
 }
@@ -40,7 +42,7 @@ const SSE_DEBOUNCE_MS = 300;
 const SETTLE_REFRESH_DELAY_MS = 1500;
 
 let sessionStates = $state<Record<string, InternalSessionTaskProjectionState>>({});
-let activeTaskProjectionSessionId = '';
+let activeTaskProjectionScopeKey = '';
 let refreshTimer: ReturnType<typeof setInterval> | null = null;
 let settleRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 let sseUnsubscribe: (() => void) | null = null;
@@ -49,6 +51,24 @@ const retiredSessionRootIds = new Set<string>();
 
 function normalizeSessionKey(sessionId: string | null | undefined): string {
   return typeof sessionId === 'string' ? sessionId.trim() : '';
+}
+
+function normalizeWorkspaceKey(workspaceId: string | null | undefined): string {
+  return typeof workspaceId === 'string' ? workspaceId.trim() : '';
+}
+
+function projectionScopeKey(
+  workspaceId: string | null | undefined,
+  sessionId: string | null | undefined,
+): string {
+  const normalizedSessionId = normalizeSessionKey(sessionId);
+  if (!normalizedSessionId) {
+    return '';
+  }
+  const normalizedWorkspaceId = normalizeWorkspaceKey(workspaceId);
+  return normalizedWorkspaceId
+    ? `${normalizedWorkspaceId}\u0000${normalizedSessionId}`
+    : `session:${normalizedSessionId}`;
 }
 
 function createClient(): RustDaemonClient {
@@ -61,12 +81,14 @@ function currentWorkspaceId(): string {
     : '';
 }
 
-function sessionRootKey(sessionId: string, rootTaskId: string): string {
-  return `${sessionId}\u0000${rootTaskId}`;
+function sessionRootKey(workspaceId: string, sessionId: string, rootTaskId: string): string {
+  return `${workspaceId}\u0000${sessionId}\u0000${rootTaskId}`;
 }
 
-function createEmptyInternalState(): InternalSessionTaskProjectionState {
+function createEmptyInternalState(workspaceId: string, sessionId: string): InternalSessionTaskProjectionState {
   return {
+    workspaceId,
+    sessionId,
     projection: null,
     loading: false,
     error: null,
@@ -77,60 +99,84 @@ function createEmptyInternalState(): InternalSessionTaskProjectionState {
   };
 }
 
-function ensureSessionState(sessionId: string): InternalSessionTaskProjectionState {
-  if (!sessionStates[sessionId]) {
+function ensureSessionState(
+  sessionId: string,
+  workspaceId: string | null | undefined = currentWorkspaceId(),
+): InternalSessionTaskProjectionState {
+  const normalizedSessionId = normalizeSessionKey(sessionId);
+  const normalizedWorkspaceId = normalizeWorkspaceKey(workspaceId);
+  const scopeKey = projectionScopeKey(normalizedWorkspaceId, normalizedSessionId);
+  if (!scopeKey) {
+    return createEmptyInternalState('', '');
+  }
+  if (!sessionStates[scopeKey]) {
     sessionStates = {
       ...sessionStates,
-      [sessionId]: createEmptyInternalState(),
+      [scopeKey]: createEmptyInternalState(normalizedWorkspaceId, normalizedSessionId),
     };
   }
-  return sessionStates[sessionId];
+  return sessionStates[scopeKey];
 }
 
-function readSessionState(sessionId: string): InternalSessionTaskProjectionState | null {
-  return sessionStates[sessionId] ?? null;
+function readSessionState(
+  sessionId: string,
+  workspaceId: string | null | undefined = currentWorkspaceId(),
+): InternalSessionTaskProjectionState | null {
+  const scopeKey = projectionScopeKey(workspaceId, sessionId);
+  return scopeKey ? sessionStates[scopeKey] ?? null : null;
 }
 
-function trackedSessionIds(): string[] {
-  const activeSessionId = normalizeSessionKey(activeTaskProjectionSessionId);
-  const activeState = activeSessionId ? sessionStates[activeSessionId] : undefined;
-  return activeState?.rootTaskId ? [activeSessionId] : [];
+function trackedSessionStates(): InternalSessionTaskProjectionState[] {
+  const activeState = activeTaskProjectionScopeKey ? sessionStates[activeTaskProjectionScopeKey] : undefined;
+  return activeState?.rootTaskId ? [activeState] : [];
 }
 
 async function refreshTrackedSessions(): Promise<void> {
-  const sessions = trackedSessionIds();
-  await Promise.all(sessions.map((sessionId) => refreshTaskProjection(sessionId)));
+  const sessions = trackedSessionStates();
+  await Promise.all(sessions.map((state) => refreshTaskProjection(state.sessionId, state.workspaceId)));
 }
 
-export function getTaskProjectionState(sessionId: string | null | undefined): TaskProjectionState {
+export function getTaskProjectionState(
+  sessionId: string | null | undefined,
+  workspaceId: string | null | undefined = currentWorkspaceId(),
+): TaskProjectionState {
   const normalizedSessionId = normalizeSessionKey(sessionId);
   if (!normalizedSessionId) {
     return EMPTY_TASK_PROJECTION_STATE;
   }
   // 直接返回 sessionStates 中的引用，使 Svelte 响应性系统能追踪字段变化。
-  return readSessionState(normalizedSessionId) ?? EMPTY_TASK_PROJECTION_STATE;
+  return readSessionState(normalizedSessionId, workspaceId) ?? EMPTY_TASK_PROJECTION_STATE;
 }
 
-export function ensureTaskProjectionState(sessionId: string | null | undefined): void {
+export function ensureTaskProjectionState(
+  sessionId: string | null | undefined,
+  workspaceId: string | null | undefined = currentWorkspaceId(),
+): void {
   const normalizedSessionId = normalizeSessionKey(sessionId);
   if (!normalizedSessionId) {
     return;
   }
-  ensureSessionState(normalizedSessionId);
+  ensureSessionState(normalizedSessionId, workspaceId);
 }
 
-export function activateTaskProjectionSession(sessionId: string | null | undefined): void {
+export function activateTaskProjectionSession(
+  sessionId: string | null | undefined,
+  workspaceId: string | null | undefined = currentWorkspaceId(),
+): void {
   const normalizedSessionId = normalizeSessionKey(sessionId);
   if (!normalizedSessionId) {
-    activeTaskProjectionSessionId = '';
+    activeTaskProjectionScopeKey = '';
     stopAutoRefresh();
     return;
   }
-  if (activeTaskProjectionSessionId === normalizedSessionId) {
+  const normalizedWorkspaceId = normalizeWorkspaceKey(workspaceId);
+  const scopeKey = projectionScopeKey(normalizedWorkspaceId, normalizedSessionId);
+  if (activeTaskProjectionScopeKey === scopeKey) {
     return;
   }
-  activeTaskProjectionSessionId = normalizedSessionId;
-  if (trackedSessionIds().length === 0) {
+  activeTaskProjectionScopeKey = scopeKey;
+  ensureSessionState(normalizedSessionId, normalizedWorkspaceId);
+  if (trackedSessionStates().length === 0) {
     stopAutoRefresh();
   } else {
     startAutoRefresh();
@@ -140,15 +186,17 @@ export function activateTaskProjectionSession(sessionId: string | null | undefin
 export async function fetchTaskProjection(
   sessionId: string,
   rootTaskId: string,
+  workspaceId: string | null | undefined = currentWorkspaceId(),
 ): Promise<void> {
   const normalizedSessionId = normalizeSessionKey(sessionId);
   if (!normalizedSessionId) {
     return;
   }
-  if (retiredSessionRootIds.has(sessionRootKey(normalizedSessionId, rootTaskId))) {
+  const normalizedWorkspaceId = normalizeWorkspaceKey(workspaceId);
+  if (retiredSessionRootIds.has(sessionRootKey(normalizedWorkspaceId, normalizedSessionId, rootTaskId))) {
     return;
   }
-  const state = ensureSessionState(normalizedSessionId);
+  const state = ensureSessionState(normalizedSessionId, normalizedWorkspaceId);
   const fetchGeneration = state.fetchGeneration + 1;
   state.fetchGeneration = fetchGeneration;
   const rootChanged = state.rootTaskId !== rootTaskId;
@@ -161,8 +209,8 @@ export async function fetchTaskProjection(
 
   try {
     const client = createClient();
-    const projection = await client.getTaskProjection(rootTaskId, normalizedSessionId, currentWorkspaceId());
-    const latestState = ensureSessionState(normalizedSessionId);
+    const projection = await client.getTaskProjection(rootTaskId, normalizedSessionId, normalizedWorkspaceId);
+    const latestState = ensureSessionState(normalizedSessionId, normalizedWorkspaceId);
     if (
       latestState.fetchGeneration !== fetchGeneration
       || latestState.rootTaskId !== rootTaskId
@@ -179,7 +227,7 @@ export async function fetchTaskProjection(
     }
   } catch (err) {
     console.warn('[task-projection-store] task projection refresh failed:', err);
-    const latestState = ensureSessionState(normalizedSessionId);
+    const latestState = ensureSessionState(normalizedSessionId, normalizedWorkspaceId);
     if (
       latestState.fetchGeneration !== fetchGeneration
       || latestState.rootTaskId !== rootTaskId
@@ -188,7 +236,7 @@ export async function fetchTaskProjection(
     }
     latestState.error = 'load_failed';
   } finally {
-    const latestState = ensureSessionState(normalizedSessionId);
+    const latestState = ensureSessionState(normalizedSessionId, normalizedWorkspaceId);
     if (
       latestState.fetchGeneration !== fetchGeneration
       || latestState.rootTaskId !== rootTaskId
@@ -199,26 +247,31 @@ export async function fetchTaskProjection(
     if (latestState.refreshAfterLoad && latestState.rootTaskId) {
       latestState.refreshAfterLoad = false;
       queueMicrotask(() => {
-        const currentState = ensureSessionState(normalizedSessionId);
+        const currentState = ensureSessionState(normalizedSessionId, normalizedWorkspaceId);
         if (currentState.rootTaskId && !currentState.loading) {
-          void refreshTaskProjection(normalizedSessionId);
+          void refreshTaskProjection(normalizedSessionId, normalizedWorkspaceId);
         }
       });
     }
   }
 }
 
-export async function refreshTaskProjection(sessionId: string | null | undefined): Promise<void> {
+export async function refreshTaskProjection(
+  sessionId: string | null | undefined,
+  workspaceId: string | null | undefined = currentWorkspaceId(),
+): Promise<void> {
   const normalizedSessionId = normalizeSessionKey(sessionId);
   if (!normalizedSessionId) {
     return;
   }
-  if (activeTaskProjectionSessionId !== normalizedSessionId) {
+  const normalizedWorkspaceId = normalizeWorkspaceKey(workspaceId);
+  const scopeKey = projectionScopeKey(normalizedWorkspaceId, normalizedSessionId);
+  if (activeTaskProjectionScopeKey !== scopeKey) {
     return;
   }
-  const state = ensureSessionState(normalizedSessionId);
+  const state = ensureSessionState(normalizedSessionId, normalizedWorkspaceId);
   if (state.rootTaskId) {
-    await fetchTaskProjection(normalizedSessionId, state.rootTaskId);
+    await fetchTaskProjection(normalizedSessionId, state.rootTaskId, normalizedWorkspaceId);
   }
 }
 
@@ -230,13 +283,12 @@ function connectToSSE(): void {
     if (message.type !== 'rustTaskEvent') {
       return;
     }
-    const activeSessions = trackedSessionIds();
+    const activeSessions = trackedSessionStates();
     if (activeSessions.length === 0) {
       return;
     }
     let hasLoadingSession = false;
-    for (const sessionId of activeSessions) {
-      const state = ensureSessionState(sessionId);
+    for (const state of activeSessions) {
       if (state.loading) {
         state.refreshAfterLoad = true;
         hasLoadingSession = true;
@@ -290,33 +342,39 @@ export function stopAutoRefresh(): void {
   disconnectFromSSE();
 }
 
-export function clearTaskProjection(sessionId?: string | null, retiredRootTaskId?: string | null): void {
+export function clearTaskProjection(
+  sessionId?: string | null,
+  retiredRootTaskId?: string | null,
+  workspaceId: string | null | undefined = currentWorkspaceId(),
+): void {
   const normalizedSessionId = normalizeSessionKey(sessionId);
   if (!normalizedSessionId) {
     sessionStates = {};
-    activeTaskProjectionSessionId = '';
+    activeTaskProjectionScopeKey = '';
     stopAutoRefresh();
     return;
   }
+  const normalizedWorkspaceId = normalizeWorkspaceKey(workspaceId);
+  const scopeKey = projectionScopeKey(normalizedWorkspaceId, normalizedSessionId);
   const normalizedRetiredRootTaskId = typeof retiredRootTaskId === 'string'
     ? retiredRootTaskId.trim()
     : '';
   if (normalizedRetiredRootTaskId) {
-    retiredSessionRootIds.add(sessionRootKey(normalizedSessionId, normalizedRetiredRootTaskId));
+    retiredSessionRootIds.add(sessionRootKey(normalizedWorkspaceId, normalizedSessionId, normalizedRetiredRootTaskId));
   }
-  if (activeTaskProjectionSessionId === normalizedSessionId) {
-    activeTaskProjectionSessionId = '';
+  if (activeTaskProjectionScopeKey === scopeKey) {
+    activeTaskProjectionScopeKey = '';
   }
-  if (!sessionStates[normalizedSessionId]) {
-    if (trackedSessionIds().length === 0) {
+  if (!sessionStates[scopeKey]) {
+    if (trackedSessionStates().length === 0) {
       stopAutoRefresh();
     }
     return;
   }
   const nextStates = { ...sessionStates };
-  delete nextStates[normalizedSessionId];
+  delete nextStates[scopeKey];
   sessionStates = nextStates;
-  if (trackedSessionIds().length === 0) {
+  if (trackedSessionStates().length === 0) {
     stopAutoRefresh();
   }
 }
@@ -324,12 +382,13 @@ export function clearTaskProjection(sessionId?: string | null, retiredRootTaskId
 export function selectTaskProjectionTask(
   sessionId: string | null | undefined,
   taskId: string | null | undefined,
+  workspaceId: string | null | undefined = currentWorkspaceId(),
 ): void {
   const normalizedSessionId = normalizeSessionKey(sessionId);
   if (!normalizedSessionId) {
     return;
   }
-  const state = ensureSessionState(normalizedSessionId);
+  const state = ensureSessionState(normalizedSessionId, workspaceId);
   const normalizedTaskId = typeof taskId === 'string' ? taskId.trim() : '';
   state.selectedTaskId = normalizedTaskId || null;
 }

@@ -30,8 +30,8 @@
   let { workspaceRoot }: Props = $props();
 
   // ============ Tab 状态 ============
-  const sessionId = $derived(rightPaneState.activeSessionId);
-  const paneState = $derived(getRightPaneState(sessionId));
+  const paneScopeKey = $derived(rightPaneState.activeScopeKey);
+  const paneState = $derived(getRightPaneState(paneScopeKey));
   const openTabs = $derived(paneState.openTabs);
   const activeTab = $derived.by<RightPaneTab | null>(() => {
     if (!paneState.activeTabId) return null;
@@ -412,13 +412,13 @@
 
   function handleTabClick(tabId: string) {
     if (recentlyDragged()) return;
-    setActiveRightPaneTab(sessionId, tabId);
+    setActiveRightPaneTab(paneScopeKey, tabId);
   }
 
   function handleTabClose(event: MouseEvent, tabId: string) {
     event.stopPropagation();
     if (recentlyDragged()) return;
-    closeTab(sessionId, tabId);
+    closeTab(paneScopeKey, tabId);
   }
 
   /**
@@ -546,7 +546,7 @@
     <button
       type="button"
       class="right-pane-collapse-btn"
-      onclick={() => toggleRightPane(sessionId)}
+      onclick={() => toggleRightPane(paneScopeKey)}
       title={i18n.t('rightPane.collapse')}
       aria-label={i18n.t('rightPane.collapse')}
     >

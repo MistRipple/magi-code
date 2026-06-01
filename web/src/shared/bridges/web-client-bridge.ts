@@ -156,15 +156,17 @@ let activeEventStreamOpenTimeout: number | null = null;
 let activeEventStreamToken = 0;
 let activeEventStreamOpenResolve: (() => void) | null = null;
 let activeEventStreamOpenReject: ((error: Error) => void) | null = null;
-// SSE 空闲检测：后端每 15s 发 keep-alive 心跳，任何事件（包括心跳）都会刷新 lastEventStreamActivityAt。
+// SSE 空闲检测：后端每 5s 发浏览器可见 keep-alive 事件，任何事件都会刷新 lastEventStreamActivityAt。
 // 超过 EVENT_STREAM_IDLE_TIMEOUT_MS 未收到任何事件即视为静默断流，触发 recovery 重拉 bootstrap，
 // 让 applyAuthoritativeProcessingState 根据权威快照收敛运行态，避免前端永久卡在 running。
 let lastEventStreamActivityAt = 0;
 let eventStreamIdleCheckTimer: number | null = null;
 let bridgeRecovering = false;
-// fetchBootstrap 防重入：同一时刻只允许一个 bootstrap 请求在飞行中，
-// 后续调用复用同一 Promise，避免重复 dispatchBootstrap 打乱 eventSeq 追踪。
+// fetchBootstrap 防重入：只复用同一 workspace/session 绑定下的飞行请求。
+// workspace 发生切换时必须让旧请求失效，避免旧 bootstrap 覆盖新工作区首屏状态。
 let bootstrapInFlight: Promise<void> | null = null;
+let bootstrapInFlightBindingKey = '';
+let bootstrapRequestSeq = 0;
 let settingsBootstrapInFlight: Promise<void> | null = null;
 let settingsBootstrapInFlightBindingKey = '';
 let settingsBootstrapRequestSeq = 0;
@@ -180,9 +182,9 @@ const RECOVERY_BASE_DELAY_MS = 1000;
 const RECOVERY_MAX_DELAY_MS = 10_000;
 const EVENT_STREAM_PARSE_ERROR_DEBOUNCE_MS = 5000;
 const EVENT_STREAM_OPEN_TIMEOUT_MS = 4000;
-// 后端 SSE keep-alive interval 为 15s（见 crates/magi-api/src/sse.rs）。
-// 给出 3 个心跳的容错窗口后再判定静默断流，避免偶发网络抖动产生误恢复。
-const EVENT_STREAM_IDLE_TIMEOUT_MS = 45_000;
+// 后端 SSE keep-alive interval 为 5s（见 crates/magi-api/src/sse.rs）。
+// 给出 4 个心跳的容错窗口后再判定静默断流，兼顾移动网络抖动与恢复速度。
+const EVENT_STREAM_IDLE_TIMEOUT_MS = 20_000;
 const EVENT_STREAM_IDLE_CHECK_INTERVAL_MS = 5_000;
 const SESSION_TIMELINE_PAGE_SIZE = 50;
 const WEBVIEW_STATE_STORAGE_KEY = 'webview-state';
@@ -760,16 +762,24 @@ function extractSessionBootstrapBinding(
 function syncBindingFromBridgeMessage(message: ClientBridgeMessage): void {
   const binding = extractSessionBootstrapBinding(message);
   const nextSessionId = binding.sessionId;
-  if (!nextSessionId || nextSessionId === currentSessionId) {
+  const nextWorkspaceId = binding.workspaceId;
+  const nextWorkspacePath = binding.workspacePath;
+  if (!nextSessionId) {
     return;
   }
-  if (!binding.workspaceId) {
+  const bindingChanged = nextSessionId !== currentSessionId
+    || nextWorkspaceId !== currentWorkspaceId
+    || nextWorkspacePath !== currentWorkspacePath;
+  if (!bindingChanged) {
+    return;
+  }
+  if (!nextWorkspaceId) {
     console.warn('[web-client-bridge] 忽略缺少 workspaceId 的会话绑定更新', {
       sessionId: nextSessionId,
     });
     return;
   }
-  persistWorkspaceBinding(binding.workspaceId, binding.workspacePath, nextSessionId);
+  persistWorkspaceBinding(nextWorkspaceId, nextWorkspacePath, nextSessionId);
   ensureEventStream();
 }
 
@@ -836,6 +846,7 @@ function emitLocalPendingCanonicalTurn(input: {
   userMessageId: string;
   placeholderMessageId: string;
   text: string;
+  images: Array<{ name: string; dataUrl: string }>;
   turnSeq: number;
   createdAt: number;
 }): boolean {
@@ -849,6 +860,7 @@ function emitLocalPendingCanonicalTurn(input: {
     requestId: input.requestId,
     userMessageId: input.userMessageId,
     placeholderMessageId: input.placeholderMessageId,
+    ...(input.images.length > 0 ? { images: input.images } : {}),
     localOptimistic: true,
   };
   const assistantItem = {
@@ -917,6 +929,7 @@ function emitLocalPendingCanonicalTurnFailed(input: {
   userMessageId: string;
   placeholderMessageId: string;
   text: string;
+  images: Array<{ name: string; dataUrl: string }>;
   turnSeq: number;
   createdAt: number;
   failedAt: number;
@@ -932,6 +945,7 @@ function emitLocalPendingCanonicalTurnFailed(input: {
     requestId: input.requestId,
     userMessageId: input.userMessageId,
     placeholderMessageId: input.placeholderMessageId,
+    ...(input.images.length > 0 ? { images: input.images } : {}),
     localTerminal: true,
   };
   const userItem = {
@@ -1072,6 +1086,10 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
     return;
   }
 
+  if (eventType === 'event.stream.keep_alive') {
+    return;
+  }
+
   if ((eventType === 'session.turn.accepted' || eventType === 'session.turn.task.accepted') && event.payload) {
     const acceptedSessionId = trimBridgeString(event.payload.session_id)
       || trimBridgeString(event.payload.sessionId)
@@ -1122,7 +1140,7 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
           setCurrentInterruptTaskId(acceptedActionTaskId);
         }
         if (acceptedRootTaskId) {
-          initTaskTracking(acceptedSessionId, acceptedRootTaskId);
+          initTaskTracking(acceptedSessionId, acceptedRootTaskId, currentWorkspaceId);
         }
       }
     }
@@ -1370,6 +1388,21 @@ function hydrateCanonicalWorkspaceBinding(): void {
   currentWorkspaceId = binding.workspaceId;
   currentWorkspacePath = binding.workspacePath;
   currentSessionId = binding.sessionId;
+}
+
+function bootstrapBindingKey(
+  binding: { workspaceId: string; workspacePath: string; sessionId: string },
+): string {
+  return JSON.stringify({
+    workspaceId: binding.workspaceId.trim(),
+    workspacePath: binding.workspacePath.trim(),
+    sessionId: binding.sessionId.trim(),
+  });
+}
+
+function isCurrentBootstrapRequest(bindingKey: string, requestSeq: number): boolean {
+  return requestSeq === bootstrapRequestSeq
+    && bindingKey === bootstrapBindingKey(resolveWorkspaceQuery());
 }
 
 function settingsBootstrapBindingKey(
@@ -1753,14 +1786,14 @@ async function dispatchBootstrap(
     payload.workspace.rootPath,
     payload.sessionId,
   );
-  activateTaskProjectionSession(payload.sessionId);
+  activateTaskProjectionSession(payload.sessionId, payload.workspace.workspaceId);
   const taskTrackingHints = extractBootstrapTaskTrackingHints(payload, options.rawPayload);
   if (previousSessionId && payload.sessionId && previousSessionId !== payload.sessionId) {
     clearCurrentInterruptTaskId();
   }
   reconcileCurrentInterruptTaskId(taskTrackingHints.activeTaskIds);
   if (!taskTrackingHints.rootTaskId && taskTrackingHints.activeTaskIds.length === 0) {
-    clearTaskProjection(payload.sessionId);
+    clearTaskProjection(payload.sessionId, undefined, payload.workspace.workspaceId);
   }
   emitDataMessage('sessionBootstrapLoaded', {
     ...payload,
@@ -1778,7 +1811,7 @@ async function dispatchBootstrap(
   dispatchRegistryAgents();
 
   if (taskTrackingHints.rootTaskId || taskTrackingHints.activeTaskIds.length > 0) {
-    void autoConnectTaskTracking(payload.sessionId, taskTrackingHints.activeTaskIds, taskTrackingHints.rootTaskId).catch((error) => {
+    void autoConnectTaskTracking(payload.sessionId, taskTrackingHints.activeTaskIds, taskTrackingHints.rootTaskId, payload.workspace.workspaceId).catch((error) => {
       console.warn('[web-client-bridge] Auto-connect task tracking on bootstrap failed (non-critical):', error);
     });
   }
@@ -1797,19 +1830,19 @@ async function fetchBootstrap(
     refreshSettingsBootstrapOnWorkspaceChange?: boolean;
   } = {},
 ): Promise<void> {
-  // 防重入：如果已有 bootstrap 请求在飞行中，直接复用
-  if (bootstrapInFlight && options.forceFresh !== true) {
+  const requestBinding = resolveWorkspaceQuery();
+  const requestBindingKey = bootstrapBindingKey(requestBinding);
+  // 防重入：只有同一 workspace/session 绑定才能复用 bootstrap 请求。
+  if (
+    bootstrapInFlight
+    && options.forceFresh !== true
+    && bootstrapInFlightBindingKey === requestBindingKey
+  ) {
     return bootstrapInFlight;
   }
-  if (bootstrapInFlight && options.forceFresh === true) {
-    try {
-      await bootstrapInFlight;
-    } catch {
-      // 强制刷新场景需要忽略上一轮失败，继续拉取最新权威快照。
-    }
-  }
+  const requestSeq = ++bootstrapRequestSeq;
   const doFetch = async (): Promise<void> => {
-    const { workspaceId, workspacePath, sessionId } = resolveWorkspaceQuery();
+    const { workspaceId, workspacePath, sessionId } = requestBinding;
     const query = new URLSearchParams();
     if (workspaceId) {
       query.set('workspaceId', workspaceId);
@@ -1837,12 +1870,21 @@ async function fetchBootstrap(
       workspacePath,
       sessionId,
     });
+    if (!isCurrentBootstrapRequest(requestBindingKey, requestSeq)) {
+      return;
+    }
     await dispatchBootstrap(payload, { ...options, rawPayload });
   };
-  bootstrapInFlight = doFetch().finally(() => {
-    bootstrapInFlight = null;
+  let requestPromise: Promise<void>;
+  requestPromise = doFetch().finally(() => {
+    if (bootstrapInFlight === requestPromise) {
+      bootstrapInFlight = null;
+      bootstrapInFlightBindingKey = '';
+    }
   });
-  return bootstrapInFlight;
+  bootstrapInFlight = requestPromise;
+  bootstrapInFlightBindingKey = requestBindingKey;
+  return requestPromise;
 }
 
 async function fetchSettingsBootstrap(
@@ -2018,14 +2060,14 @@ async function dispatchSessionSnapshot(
     payload.workspace.rootPath,
     payload.sessionId,
   );
-  activateTaskProjectionSession(payload.sessionId);
+  activateTaskProjectionSession(payload.sessionId, payload.workspace.workspaceId);
   const taskTrackingHints = extractBootstrapTaskTrackingHints(payload, rawPayload);
   if (previousSessionId && payload.sessionId && previousSessionId !== payload.sessionId) {
     clearCurrentInterruptTaskId();
   }
   reconcileCurrentInterruptTaskId(taskTrackingHints.activeTaskIds);
   if (!taskTrackingHints.rootTaskId && taskTrackingHints.activeTaskIds.length === 0) {
-    clearTaskProjection(payload.sessionId);
+    clearTaskProjection(payload.sessionId, undefined, payload.workspace.workspaceId);
   }
   emitDataMessage('sessionBootstrapLoaded', {
     ...payload,
@@ -2040,7 +2082,7 @@ async function dispatchSessionSnapshot(
     scheduleRecovery('session_snapshot_event_stream_connect', error, true);
   });
   if (taskTrackingHints.rootTaskId || taskTrackingHints.activeTaskIds.length > 0) {
-    void autoConnectTaskTracking(payload.sessionId, taskTrackingHints.activeTaskIds, taskTrackingHints.rootTaskId).catch((error) => {
+    void autoConnectTaskTracking(payload.sessionId, taskTrackingHints.activeTaskIds, taskTrackingHints.rootTaskId, payload.workspace.workspaceId).catch((error) => {
       console.warn('[web-client-bridge] Auto-connect task tracking on session snapshot failed (non-critical):', error);
     });
   }
@@ -2203,14 +2245,14 @@ async function ensureFreshLiveBridge(reason: string): Promise<void> {
  * Fetches the initial projection and starts auto-refresh + SSE subscription.
  * Defensive: logs warnings on failure but never breaks the caller.
  */
-function initTaskTracking(sessionId: string, rootTaskId: string): void {
-  console.info('[web-client-bridge] Initializing task tracking for session/root task:', { sessionId, rootTaskId });
-  activateTaskProjectionSession(sessionId);
-  const currentState = getTaskProjectionState(sessionId);
+function initTaskTracking(sessionId: string, rootTaskId: string, workspaceId = currentWorkspaceId): void {
+  console.info('[web-client-bridge] Initializing task tracking for session/root task:', { sessionId, rootTaskId, workspaceId });
+  activateTaskProjectionSession(sessionId, workspaceId);
+  const currentState = getTaskProjectionState(sessionId, workspaceId);
   if (currentState.rootTaskId && currentState.rootTaskId !== rootTaskId) {
-    clearTaskProjection(sessionId);
+    clearTaskProjection(sessionId, undefined, workspaceId);
   }
-  fetchTaskProjection(sessionId, rootTaskId)
+  fetchTaskProjection(sessionId, rootTaskId, workspaceId)
     .then(() => {
       startTaskAutoRefresh();
     })
@@ -2228,17 +2270,18 @@ export async function autoConnectTaskTracking(
   sessionId: string,
   activeTaskIds: string[],
   preferredRootTaskId = '',
+  workspaceId = currentWorkspaceId,
 ): Promise<void> {
-  if (!sessionId || sessionId !== currentSessionId) {
+  if (!sessionId || sessionId !== currentSessionId || workspaceId !== currentWorkspaceId) {
     return;
   }
-  const currentState = getTaskProjectionState(sessionId);
+  const currentState = getTaskProjectionState(sessionId, workspaceId);
   if (preferredRootTaskId) {
     if (currentState.rootTaskId === preferredRootTaskId) {
       return;
     }
     console.info('[web-client-bridge] Auto-connecting task tracking from bootstrap root task:', preferredRootTaskId);
-    initTaskTracking(sessionId, preferredRootTaskId);
+    initTaskTracking(sessionId, preferredRootTaskId, workspaceId);
     return;
   }
 
@@ -2256,11 +2299,11 @@ export async function autoConnectTaskTracking(
     for (const taskId of activeTaskIds) {
       let task;
       try {
-        task = await client.getTask(taskId, sessionId, currentWorkspaceId);
+        task = await client.getTask(taskId, sessionId, workspaceId);
       } catch {
         continue;
       }
-      if (sessionId !== currentSessionId) {
+      if (sessionId !== currentSessionId || workspaceId !== currentWorkspaceId) {
         return;
       }
       const rootTaskId = typeof task.root_task_id === 'string' && task.root_task_id.trim()
@@ -2278,7 +2321,7 @@ export async function autoConnectTaskTracking(
         taskId,
         rootTaskId,
       });
-      initTaskTracking(sessionId, rootTaskId);
+      initTaskTracking(sessionId, rootTaskId, workspaceId);
       return;
     }
   } catch (error) {
@@ -2457,6 +2500,7 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
       userMessageId,
       placeholderMessageId,
       text: normalizedText,
+      images,
       turnSeq: turnOrderSeq,
       createdAt: requestCreatedAt,
     });
@@ -2537,7 +2581,7 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
     setCurrentInterruptTaskId(turnResult.actionTaskId || '');
     const rootTaskId = turnResult.rootTaskId;
     if (rootTaskId && resolvedSessionId) {
-      initTaskTracking(resolvedSessionId, rootTaskId);
+      initTaskTracking(resolvedSessionId, rootTaskId, targetWorkspaceId);
     }
 
     // 确保 SSE 连接存活以接收增量事件
@@ -2557,6 +2601,7 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
         userMessageId,
         placeholderMessageId,
         text: normalizedText,
+        images,
         turnSeq: turnOrderSeq,
         createdAt: requestCreatedAt,
         failedAt: Date.now(),

@@ -593,9 +593,10 @@ fn streaming_http_io(
 
         for sse_event in sse_parser.feed(&valid_str) {
             saw_sse_event = true;
-            // 检测 [DONE] 标记
+            // OpenAI Chat Completions SSE 以 [DONE] 作为协议终止信号；不能继续等底层 TCP EOF。
+            // 部分 tunnel / 代理会延迟关闭连接，继续读取会导致 UI 在内容完整后仍长时间显示响应中。
             if sse_event.data.trim() == "[DONE]" {
-                continue;
+                break 'stream_read;
             }
 
             let llm_chunks = parse_stream_event(provider_family, &sse_event);
@@ -1156,6 +1157,11 @@ fn llm_message_from_chat_message(message: &crate::types::ChatMessage) -> LlmMess
             text: content.clone(),
         });
     }
+    for image in &message.images {
+        blocks.push(LlmContentBlock::Image {
+            source: image.clone(),
+        });
+    }
     for tool_call in &message.tool_calls {
         let input = serde_json::from_str::<serde_json::Value>(&tool_call.function.arguments)
             .unwrap_or_else(|_| json!({}));
@@ -1166,7 +1172,9 @@ fn llm_message_from_chat_message(message: &crate::types::ChatMessage) -> LlmMess
         });
     }
 
-    let content = if blocks.is_empty() || (blocks.len() == 1 && message.tool_calls.is_empty()) {
+    let content = if blocks.is_empty()
+        || (blocks.len() == 1 && message.images.is_empty() && message.tool_calls.is_empty())
+    {
         LlmMessageContent::Text(message.content.clone().unwrap_or_default())
     } else {
         LlmMessageContent::Blocks(blocks)
@@ -1397,6 +1405,7 @@ mod tests {
             messages: Some(vec![crate::types::ChatMessage {
                 role: "tool".to_string(),
                 content: Some(tool_result.to_string()),
+                images: Vec::new(),
                 tool_calls: Vec::new(),
                 tool_call_id: Some("call_view_image".to_string()),
             }]),
@@ -1410,6 +1419,40 @@ mod tests {
         assert_eq!(body["messages"][1]["role"], "user");
         assert_eq!(
             body["messages"][1]["content"][1]["image_url"]["url"],
+            "data:image/png;base64,AAA"
+        );
+    }
+
+    #[test]
+    fn build_request_body_sends_chat_message_images_as_multimodal_blocks() {
+        let client = HttpModelBridgeClient::new(
+            "https://api.example.com/v1".to_string(),
+            Some("test-key".to_string()),
+            "gpt-4.1-mini".to_string(),
+        );
+
+        let body = client.build_request_body(&ModelInvocationRequest {
+            provider: "openai".to_string(),
+            prompt: "ignored when messages exist".to_string(),
+            messages: Some(vec![crate::types::ChatMessage {
+                role: "user".to_string(),
+                content: Some("识别这张图片".to_string()),
+                images: vec![crate::llm_types::ImageSource {
+                    kind: "base64".to_string(),
+                    media_type: "image/png".to_string(),
+                    data: "AAA".to_string(),
+                }],
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+            }]),
+            tools: None,
+            tool_choice: None,
+        });
+
+        assert_eq!(body["messages"][0]["role"], "user");
+        assert_eq!(body["messages"][0]["content"][0]["text"], "识别这张图片");
+        assert_eq!(
+            body["messages"][0]["content"][1]["image_url"]["url"],
             "data:image/png;base64,AAA"
         );
     }
@@ -1469,12 +1512,14 @@ mod tests {
                 crate::types::ChatMessage {
                     role: "system".to_string(),
                     content: Some("系统约束".to_string()),
+                    images: Vec::new(),
                     tool_calls: Vec::new(),
                     tool_call_id: None,
                 },
                 crate::types::ChatMessage {
                     role: "user".to_string(),
                     content: Some("你好".to_string()),
+                    images: Vec::new(),
                     tool_calls: Vec::new(),
                     tool_call_id: None,
                 },
@@ -2072,6 +2117,103 @@ mod tests {
         let body: serde_json::Value =
             serde_json::from_str(&recorded.body).expect("body should be json");
         assert_eq!(body["stream"], true);
+    }
+
+    #[test]
+    fn streaming_returns_when_done_marker_arrives_before_socket_close() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("mock stream server should bind");
+        let address = listener.local_addr().expect("address should exist");
+        let (request_sender, request_receiver) = mpsc::channel();
+        let server_handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("mock stream server should accept");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("timeout should set");
+
+            let mut buffer = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            let header_end = loop {
+                let read = stream.read(&mut chunk).expect("should read request");
+                assert!(read > 0, "should receive request bytes");
+                buffer.extend_from_slice(&chunk[..read]);
+                if let Some(pos) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break pos + 4;
+                }
+            };
+            let header_text =
+                String::from_utf8(buffer[..header_end].to_vec()).expect("headers should be utf-8");
+            let content_length = header_text
+                .split("\r\n")
+                .filter_map(|line| line.split_once(':'))
+                .find_map(|(name, value)| {
+                    name.trim()
+                        .eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap_or(0))
+                })
+                .unwrap_or(0);
+            while buffer.len() < header_end + content_length {
+                let read = stream.read(&mut chunk).expect("should read request body");
+                assert!(read > 0, "should receive request body");
+                buffer.extend_from_slice(&chunk[..read]);
+            }
+            let _ = request_sender.send(());
+
+            let response_head = concat!(
+                "HTTP/1.1 200 OK\r\n",
+                "content-type: text/event-stream\r\n",
+                "connection: keep-alive\r\n",
+                "\r\n",
+            );
+            stream
+                .write_all(response_head.as_bytes())
+                .expect("should write response headers");
+            stream
+                .write_all(
+                    concat!(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n",
+                        "data: [DONE]\n\n",
+                    )
+                    .as_bytes(),
+                )
+                .expect("should write stream body");
+            stream.flush().expect("should flush stream body");
+            std::thread::sleep(Duration::from_secs(2));
+        });
+
+        let client = HttpModelBridgeClient::new(
+            format!("http://{address}/v1"),
+            Some("sk-test-key".to_string()),
+            "gpt-4.1-mini".to_string(),
+        );
+        let (result_sender, result_receiver) = mpsc::channel();
+        let client_handle = std::thread::spawn(move || {
+            let result = client.invoke_streaming(
+                ModelInvocationRequest {
+                    provider: "openai-compatible".to_string(),
+                    prompt: "hello".to_string(),
+                    messages: None,
+                    tools: None,
+                    tool_choice: None,
+                },
+                &|_| {},
+            );
+            let _ = result_sender.send(result);
+        });
+
+        request_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("mock server should receive request");
+        let response = result_receiver
+            .recv_timeout(Duration::from_millis(500))
+            .expect("[DONE] 后必须立即完成，不能等 socket close");
+        assert!(response.expect("streaming invoke should succeed").ok);
+
+        client_handle
+            .join()
+            .expect("client streaming thread should not panic");
+        server_handle
+            .join()
+            .expect("mock stream server should not panic");
     }
 
     #[test]

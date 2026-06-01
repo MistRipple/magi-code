@@ -127,6 +127,7 @@ export function initMessageHandler(bridge: ClientBridge = getClientBridge()) {
 
 let lastAppliedEventSeq = 0;
 let eventSeqSessionId = '';
+let eventSeqWorkspaceId = '';
 const processedEventKeys = new Set<string>();
 const processedEventKeyQueue: string[] = [];
 const MAX_TRACKED_EVENT_KEYS = 4000;
@@ -134,18 +135,46 @@ const UNHANDLED_MESSAGE_TOAST_WINDOW_MS = 3000;
 let lastUnhandledMessageErrorSignature = '';
 let lastUnhandledMessageErrorAt = 0;
 
-function resetEventSeqTracking(seed: number = 0, sessionId?: string): void {
+function resetEventSeqTracking(seed: number = 0, sessionId?: string, workspaceId?: string): void {
   lastAppliedEventSeq = seed > 0 ? Math.floor(seed) : 0;
   eventSeqSessionId = typeof sessionId === 'string' ? sessionId.trim() : '';
+  eventSeqWorkspaceId = typeof workspaceId === 'string' ? workspaceId.trim() : '';
   processedEventKeys.clear();
   processedEventKeyQueue.length = 0;
 }
 
 export function primeEventSeqTracking(
   sessionId: string | null | undefined,
+  workspaceId?: string | null | undefined,
 ): void {
   const normalizedSessionId = typeof sessionId === 'string' ? sessionId.trim() : '';
-  resetEventSeqTracking(0, normalizedSessionId);
+  const normalizedWorkspaceId = typeof workspaceId === 'string' ? workspaceId.trim() : '';
+  resetEventSeqTracking(0, normalizedSessionId, normalizedWorkspaceId);
+}
+
+function resolveEventTrackingWorkspaceId(message: ClientBridgeMessage): string {
+  if (typeof message.workspaceId === 'string' && message.workspaceId.trim()) {
+    return message.workspaceId.trim();
+  }
+  if (message.type !== 'unifiedMessage') {
+    return '';
+  }
+  const standard = message.message as StandardMessage | undefined;
+  const payload = standard?.data?.payload;
+  if (payload && typeof payload === 'object' && !Array.isArray(payload)) {
+    const payloadRecord = payload as Record<string, unknown>;
+    if (typeof payloadRecord.workspaceId === 'string' && payloadRecord.workspaceId.trim()) {
+      return payloadRecord.workspaceId.trim();
+    }
+    const workspace = payloadRecord.workspace;
+    if (workspace && typeof workspace === 'object' && !Array.isArray(workspace)) {
+      const workspaceId = (workspace as Record<string, unknown>).workspaceId;
+      if (typeof workspaceId === 'string' && workspaceId.trim()) {
+        return workspaceId.trim();
+      }
+    }
+  }
+  return '';
 }
 
 function resolveEventTrackingSessionId(
@@ -182,10 +211,18 @@ function syncEventSeqTrackingFromBootstrap(standard: StandardMessage): void {
     return;
   }
   const incomingSessionId = typeof payload.sessionId === 'string' ? payload.sessionId.trim() : '';
-  if (incomingSessionId && incomingSessionId !== eventSeqSessionId) {
-    resetEventSeqTracking(0, incomingSessionId);
-  } else if (incomingSessionId) {
+  const workspace = payload.workspace && typeof payload.workspace === 'object'
+    ? payload.workspace as Record<string, unknown>
+    : undefined;
+  const incomingWorkspaceId = typeof workspace?.workspaceId === 'string' ? workspace.workspaceId.trim() : '';
+  if (
+    (incomingSessionId && incomingSessionId !== eventSeqSessionId)
+    || (incomingWorkspaceId && incomingWorkspaceId !== eventSeqWorkspaceId)
+  ) {
+    resetEventSeqTracking(0, incomingSessionId, incomingWorkspaceId);
+  } else if (incomingSessionId || incomingWorkspaceId) {
     eventSeqSessionId = incomingSessionId;
+    eventSeqWorkspaceId = incomingWorkspaceId;
   }
 }
 
@@ -222,12 +259,18 @@ function resolveEventSeqAndKey(message: ClientBridgeMessage): { eventSeq?: numbe
 
 function shouldProcessByEventSeq(message: ClientBridgeMessage): boolean {
   const incomingSessionId = resolveEventTrackingSessionId(message);
+  const incomingWorkspaceId = resolveEventTrackingWorkspaceId(message);
   // 会话切换时：无条件重置 eventSeq 追踪状态
   // 这确保后端重启或新会话时，eventSeq 从 0 开始不会被误判为逆序
-  if (incomingSessionId && incomingSessionId !== eventSeqSessionId) {
-    resetEventSeqTracking(0, incomingSessionId);
+  if (
+    (incomingSessionId && incomingSessionId !== eventSeqSessionId)
+    || (incomingWorkspaceId && incomingWorkspaceId !== eventSeqWorkspaceId)
+  ) {
+    resetEventSeqTracking(0, incomingSessionId, incomingWorkspaceId);
   } else if (!eventSeqSessionId && incomingSessionId) {
     eventSeqSessionId = incomingSessionId;
+  } else if (!eventSeqWorkspaceId && incomingWorkspaceId) {
+    eventSeqWorkspaceId = incomingWorkspaceId;
   }
   const { eventSeq, eventKey } = resolveEventSeqAndKey(message);
   if (eventSeq !== undefined && eventSeq < lastAppliedEventSeq) {

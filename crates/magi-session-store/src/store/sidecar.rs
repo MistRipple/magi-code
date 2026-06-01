@@ -188,7 +188,7 @@ fn current_turn_item_to_canonical_worker(
 }
 
 fn current_turn_item_metadata(item: &ActiveExecutionTurnItem) -> HashMap<String, Value> {
-    let mut metadata = HashMap::new();
+    let mut metadata = item.metadata.clone();
     if let Some(value) = item
         .request_id
         .as_ref()

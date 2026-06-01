@@ -85,6 +85,9 @@ async fn submit_session_turn(
     Json(request): Json<SessionTurnRequestDto>,
 ) -> Result<Json<SessionTurnResponseDto>, ApiError> {
     validate_session_turn_input(&request)?;
+    let images = request
+        .parsed_images()
+        .map_err(|error| ApiError::InvalidInput(format!("图片输入无效: {error}")))?;
     let accepted_at = super::monotonic_accepted_at();
     let requested_workspace_id = request.requested_workspace_id();
     let workspace_id = require_registered_workspace_id(&state, requested_workspace_id.as_deref())?;
@@ -96,7 +99,7 @@ async fn submit_session_turn(
     let decision = decide_session_turn_with_task_planner(&state, &request)?;
     match decision.route {
         SessionTurnRouteDto::Chat | SessionTurnRouteDto::Execute => {
-            submit_regular_session_turn(state, request, workspace_id, accepted_at, decision)
+            submit_regular_session_turn(state, request, images, workspace_id, accepted_at, decision)
                 .await
                 .map(Json)
         }
@@ -104,6 +107,7 @@ async fn submit_session_turn(
             let (accepted, event_id) = super::accept_session_task_submission(
                 &state,
                 &request,
+                images,
                 workspace_id.clone(),
                 decision.task_title.clone(),
                 decision.execution_goal.clone(),
@@ -290,6 +294,7 @@ async fn submit_supplement_context_turn(
                 "[mailbox]\nauthor=user\nkind=followup\npayload={}",
                 signal_payload
             )),
+            images: Vec::new(),
             tool_calls: Vec::new(),
             tool_call_id: None,
         }],
@@ -1061,6 +1066,7 @@ fn build_user_message_turn_item(
     request_id: Option<String>,
     user_message_id: Option<String>,
     placeholder_message_id: Option<String>,
+    metadata: std::collections::HashMap<String, serde_json::Value>,
     task_id: Option<magi_core::TaskId>,
     source_thread_id: magi_core::ThreadId,
 ) -> (String, ActiveExecutionTurnItem) {
@@ -1089,6 +1095,7 @@ fn build_user_message_turn_item(
             request_id,
             user_message_id,
             placeholder_message_id,
+            metadata,
             timeline_entry_id: Some(entry_id.to_string()),
             // P7：user_message 由前端用户发起，归属到 orchestrator thread，走主线可见性。
             source_thread_id,
@@ -1099,6 +1106,7 @@ fn build_user_message_turn_item(
 async fn submit_regular_session_turn(
     state: ApiState,
     request: SessionTurnRequestDto,
+    images: Vec<magi_conversation_runtime::session_images::SessionTurnImage>,
     requested_workspace_id: WorkspaceId,
     accepted_at: UtcMillis,
     decision: SessionTurnIntentDecision,
@@ -1150,6 +1158,7 @@ async fn submit_regular_session_turn(
         request_id.clone(),
         user_message_id.clone(),
         placeholder_message_id.clone(),
+        magi_conversation_runtime::session_images::session_turn_images_metadata(&images),
         None,
         orchestrator_thread_id.clone(),
     );
@@ -1219,6 +1228,7 @@ async fn submit_regular_session_turn(
             turn_id,
             workspace_id: workspace_id.clone(),
             prompt,
+            images,
             use_tools: matches!(decision.route, SessionTurnRouteDto::Execute),
             access_profile: request.requested_access_profile(),
             skill_name: request.skill_name.clone(),
@@ -1649,6 +1659,7 @@ fn write_continue_user_message(
         request_id,
         user_message_id,
         placeholder_message_id,
+        Default::default(),
         Some(accepted.action_task_id.clone()),
         orchestrator_thread_id,
     );
@@ -2868,6 +2879,7 @@ mod tests {
         let (accepted, _) = super::super::accept_session_task_submission(
             &state,
             &request,
+            Vec::new(),
             workspace_id,
             decision.task_title.clone(),
             decision.execution_goal.clone(),
@@ -3421,6 +3433,7 @@ mod tests {
                 supplement_context: false,
                 target_task_id: None,
             },
+            Vec::new(),
             workspace_id,
             accepted_at,
             SessionTurnIntentDecision {
@@ -3469,6 +3482,73 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn regular_session_turn_accept_persists_user_image_metadata() {
+        let state = test_state();
+        let workspace_id = register_workspace(&state, "workspace-image-turn", "image-turn");
+        let request = SessionTurnRequestDto {
+            session_id: None,
+            workspace_id: Some(workspace_id.to_string()),
+            text: Some("识别这张图片".to_string()),
+            skill_name: None,
+            images: vec![crate::dto::SessionTurnImageDto {
+                name: "paste.png".to_string(),
+                data_url: "data:image/png;base64,AAA".to_string(),
+            }],
+            access_profile: None,
+            request_id: Some("request-image-turn".to_string()),
+            user_message_id: Some("user-image-turn".to_string()),
+            placeholder_message_id: Some("assistant-image-turn".to_string()),
+            supplement_context: false,
+            target_task_id: None,
+        };
+        let images = request.parsed_images().expect("image should parse");
+        let response = submit_regular_session_turn(
+            state.clone(),
+            request.clone(),
+            images,
+            workspace_id,
+            UtcMillis(1777000000100),
+            SessionTurnIntentDecision {
+                route: SessionTurnRouteDto::Chat,
+                task_title: None,
+                execution_goal: None,
+                task_tier: TaskTier::ExecutionChain,
+                tool_intent: None,
+                forced_tool_name: None,
+                required_tool_chain: Vec::new(),
+                confidence: 1.0,
+                reason_code: Some("plain_chat".to_string()),
+                route_reason: Some("test".to_string()),
+                task_evidence: Vec::new(),
+            },
+        )
+        .await
+        .expect("regular image turn should be accepted");
+
+        let session_id = SessionId::new(response.session_id);
+        let canonical_turn = state
+            .session_store
+            .canonical_turns_for_session(&session_id)
+            .into_iter()
+            .find(|turn| {
+                turn.items
+                    .iter()
+                    .any(|item| item.item_id == "user-image-turn")
+            })
+            .expect("canonical turn should be present");
+        let user_item = canonical_turn
+            .items
+            .iter()
+            .find(|item| item.item_id == "user-image-turn")
+            .expect("user image item should be present");
+        assert_eq!(
+            user_item.metadata["images"][0]["dataUrl"],
+            "data:image/png;base64,AAA"
+        );
+        assert_eq!(user_item.metadata["images"][0]["name"], "paste.png");
+    }
+
     /// §3.1 端到端验收：simple task 路径（chat 路由）
     ///
     /// 闸门属性：chat 路由进入 `submit_regular_session_turn` 后，
@@ -3500,6 +3580,7 @@ mod tests {
         let response = submit_regular_session_turn(
             state.clone(),
             request,
+            Vec::new(),
             workspace_id,
             accepted_at,
             classifier_chat_decision(),
@@ -3560,6 +3641,7 @@ mod tests {
         let response = submit_regular_session_turn(
             state.clone(),
             request,
+            Vec::new(),
             workspace_id,
             accepted_at,
             decision,

@@ -60,7 +60,10 @@
   const currentSessionId = $derived.by(() => (
     typeof messagesState.currentSessionId === 'string' ? messagesState.currentSessionId.trim() : ''
   ));
-  const runtimePanelKey = $derived(`${currentSessionId}:${displayContext}:${taskId || ''}`);
+  const currentWorkspaceId = $derived.by(() => (
+    typeof messagesState.currentWorkspaceId === 'string' ? messagesState.currentWorkspaceId.trim() : ''
+  ));
+  const runtimePanelKey = $derived(`${currentWorkspaceId}:${currentSessionId}:${displayContext}:${taskId || ''}`);
   const normalizedRuntimeStartedAt = $derived(
     typeof runtimeStartedAt === 'number' && Number.isFinite(runtimeStartedAt)
       ? Math.max(0, Math.floor(runtimeStartedAt))

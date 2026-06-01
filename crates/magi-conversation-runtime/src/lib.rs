@@ -18,6 +18,7 @@ mod model_error;
 pub mod prompt_reminder;
 pub mod prompt_utils;
 mod registry;
+pub mod session_images;
 pub mod session_thread;
 pub mod session_turn_execution;
 pub mod session_turn_finalize;

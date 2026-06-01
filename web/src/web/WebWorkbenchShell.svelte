@@ -6,7 +6,7 @@
   import Modal from '../components/Modal.svelte';
   import { runActionWithFeedback } from '../lib/action-feedback';
   import type { IconName } from '../lib/icons';
-  import { addToast, messagesState, setCurrentSessionId } from '../stores/messages.svelte';
+  import { addToast, messagesState, setCurrentSessionId, updateSessions } from '../stores/messages.svelte';
   import { getClientBridge } from '../shared/bridges/bridge-runtime';
   import { i18n } from '../stores/i18n.svelte';
   import type { EditContentKind, Session } from '../types/message';
@@ -50,6 +50,7 @@
   let selectedWorkspaceId = $state('');
   let currentSessionId = $state<string | null>(null);
   let pendingSessionSwitchId = $state<string | null>(null);
+  let pendingSessionSwitchWorkspaceId = $state<string | null>(null);
   let pendingWorkspaceSwitchId = $state<string | null>(null);
   let sessionsByWorkspace = $state<Record<string, Session[]>>({});
   let loadingWorkspaceIds = $state<Record<string, boolean>>({});
@@ -114,7 +115,7 @@
   const sidebarHidden = $derived(!sidebarIsDrawer && sidebarCollapsed);
 
   /** 当前 session 的右栏多 tab 状态；由 right-pane store 派生 */
-  const activeRightPaneState = $derived(getRightPaneState(rightPaneState.activeSessionId));
+  const activeRightPaneState = $derived(getRightPaneState(rightPaneState.activeScopeKey));
   /** 右侧面板是否在 DOM 中：仅看 collapsed——空 tab 时也可展开，由 RightPane 自带空态承接 */
   const rightPaneVisible = $derived(!activeRightPaneState.collapsed);
   /** 项目文件树高亮：active code tab 的 filepath */
@@ -134,6 +135,30 @@
       : '';
   }
 
+  function clearCurrentSessionBeforeWorkspaceChange(nextWorkspaceId: string): void {
+    const currentWorkspaceId = currentBootstrapWorkspaceId();
+    const normalizedNextWorkspaceId = nextWorkspaceId.trim();
+    if (
+      normalizedNextWorkspaceId
+      && currentWorkspaceId
+      && normalizedNextWorkspaceId !== currentWorkspaceId
+      && messagesState.currentSessionId
+    ) {
+      setCurrentSessionId(null);
+    }
+  }
+
+  function currentUrlWorkspaceBinding(): { workspaceId: string; sessionId: string } {
+    if (typeof window === 'undefined') {
+      return { workspaceId: '', sessionId: '' };
+    }
+    const url = new URL(window.location.href);
+    return {
+      workspaceId: url.searchParams.get('workspaceId')?.trim() || '',
+      sessionId: url.searchParams.get('sessionId')?.trim() || '',
+    };
+  }
+
   function currentBootstrapSessionIdForWorkspace(workspaceId: string): string {
     const authoritativeWorkspaceId = currentBootstrapWorkspaceId();
     if (!authoritativeWorkspaceId || authoritativeWorkspaceId !== workspaceId) {
@@ -144,10 +169,23 @@
       : '';
   }
 
+  function preferredSessionIdForWorkspace(workspaceId: string): string {
+    const bootstrapSessionId = currentBootstrapSessionIdForWorkspace(workspaceId);
+    if (bootstrapSessionId) {
+      return bootstrapSessionId;
+    }
+    const urlBinding = currentUrlWorkspaceBinding();
+    return urlBinding.workspaceId === workspaceId ? urlBinding.sessionId : '';
+  }
+
   function resolveBackendWorkspaceSelection(nextWorkspaces: AgentWorkspaceSummary[]): string {
     const authoritativeWorkspaceId = currentBootstrapWorkspaceId();
     if (authoritativeWorkspaceId && nextWorkspaces.some((workspace) => workspace.workspaceId === authoritativeWorkspaceId)) {
       return authoritativeWorkspaceId;
+    }
+    const requestedWorkspaceId = currentUrlWorkspaceBinding().workspaceId;
+    if (requestedWorkspaceId && nextWorkspaces.some((workspace) => workspace.workspaceId === requestedWorkspaceId)) {
+      return requestedWorkspaceId;
     }
     return nextWorkspaces.find((workspace) => workspace.isActive)?.workspaceId
       || nextWorkspaces[0]?.workspaceId
@@ -195,7 +233,10 @@
     if (pendingWorkspaceSwitchId && pendingWorkspaceSwitchId !== authoritativeWorkspaceId) {
       return;
     }
-    if (pendingSessionSwitchId && pendingSessionSwitchId !== bootstrapSessionId) {
+    if (
+      pendingSessionSwitchId
+      && (pendingSessionSwitchId !== bootstrapSessionId || pendingSessionSwitchWorkspaceId !== authoritativeWorkspaceId)
+    ) {
       return;
     }
     if (pendingWorkspaceSwitchId === authoritativeWorkspaceId) {
@@ -215,7 +256,7 @@
     };
     currentSessionId = bootstrapSessionId || null;
     setCurrentSessionId(bootstrapSessionId || null);
-    if (pendingSessionSwitchId === bootstrapSessionId) {
+    if (pendingSessionSwitchId === bootstrapSessionId && pendingSessionSwitchWorkspaceId === authoritativeWorkspaceId) {
       clearPendingSessionSwitchState();
     }
     syncBrowserSessionBinding(workspace.workspaceId, workspace.rootPath, bootstrapSessionId || null);
@@ -261,7 +302,7 @@
       return;
     }
     currentSessionId = bootstrapSessionId;
-    if (pendingSessionSwitchId === bootstrapSessionId) {
+    if (pendingSessionSwitchId === bootstrapSessionId && pendingSessionSwitchWorkspaceId === selectedWorkspaceId) {
       clearPendingSessionSwitchState();
     }
     if (workspace) {
@@ -415,6 +456,7 @@
       pendingSessionSwitchTimer = null;
     }
     pendingSessionSwitchId = null;
+    pendingSessionSwitchWorkspaceId = null;
     messagesState.sessionHydrating = false;
   }
 
@@ -455,9 +497,19 @@
   function openWorkspaceFromBackend(workspace: AgentWorkspaceSummary): void {
     beginPendingWorkspaceSwitch(workspace.workspaceId);
     selectWorkspaceLocally(workspace);
-    requestWorkspaceBindingSync(workspace, null);
     messagesState.sessionHydrating = true;
-    getClientBridge().postMessage({ type: 'requestState' });
+    void (async () => {
+      const resolvedSessionId = await refreshWorkspaceSessions(
+        workspace.workspaceId,
+        preferredSessionIdForWorkspace(workspace.workspaceId),
+      );
+      if (resolvedSessionId) {
+        requestCurrentSessionState();
+        return;
+      }
+      requestWorkspaceBindingSync(workspace, null);
+      getClientBridge().postMessage({ type: 'requestState' });
+    })();
   }
 
   function applyWorkspaceSessionsSnapshot(
@@ -482,6 +534,10 @@
       ? backendSelectedSessionId
       : '';
 
+    clearCurrentSessionBeforeWorkspaceChange(snapshot.workspace.workspaceId);
+    messagesState.currentWorkspaceId = snapshot.workspace.workspaceId;
+    messagesState.currentWorkspacePath = snapshot.workspace.rootPath;
+    updateSessions(snapshot.sessions);
     currentSessionId = resolvedSessionId || null;
     setCurrentSessionId(resolvedSessionId || null);
     syncBrowserSessionBinding(snapshot.workspace.workspaceId, snapshot.workspace.rootPath, resolvedSessionId || null);
@@ -792,7 +848,7 @@
       }
       await refreshWorkspaceSessions(
         selectedWorkspaceId,
-        currentBootstrapSessionIdForWorkspace(selectedWorkspaceId),
+        preferredSessionIdForWorkspace(selectedWorkspaceId),
       );
       if (selectedWorkspaceId) {
         requestCurrentSessionState();
@@ -837,7 +893,7 @@
         };
         await refreshWorkspaceSessions(
           selectedWorkspaceId,
-          currentBootstrapSessionIdForWorkspace(selectedWorkspaceId),
+          preferredSessionIdForWorkspace(selectedWorkspaceId),
         );
         requestCurrentSessionState();
       }
@@ -927,7 +983,7 @@
           };
           await refreshWorkspaceSessions(
             selectedWorkspaceId,
-            currentBootstrapSessionIdForWorkspace(selectedWorkspaceId),
+            preferredSessionIdForWorkspace(selectedWorkspaceId),
           );
           requestCurrentSessionState();
         }
@@ -960,18 +1016,20 @@
   }
 
   function switchSession(workspace: AgentWorkspaceSummary, sessionId: string): void {
-    if (!sessionId || sessionId === currentSessionId || pendingSessionSwitchId) {
+    const isCurrentSelection = workspace.workspaceId === selectedWorkspaceId && sessionId === currentSessionId;
+    if (!sessionId || isCurrentSelection || pendingSessionSwitchId) {
       return;
     }
     const nextSession = (sessionsByWorkspace[workspace.workspaceId] ?? []).find((session) => session.id === sessionId);
     const nextSessionName = nextSession?.name || i18n.t('header.unnamedSession');
     pendingSessionSwitchId = sessionId;
+    pendingSessionSwitchWorkspaceId = workspace.workspaceId;
     messagesState.sessionHydrating = true;
     if (pendingSessionSwitchTimer) {
       clearTimeout(pendingSessionSwitchTimer);
     }
     pendingSessionSwitchTimer = setTimeout(() => {
-      if (pendingSessionSwitchId !== sessionId) {
+      if (pendingSessionSwitchId !== sessionId || pendingSessionSwitchWorkspaceId !== workspace.workspaceId) {
         return;
       }
       clearPendingSessionSwitchState();
@@ -1048,7 +1106,7 @@
     // 窄屏 drawer 模式下打开 sidebar 抽屉时，自动折叠右侧 overlay（z=900）
     // 避免抽屉（z=800）被 overlay 遮住，造成用户操作无入口
     if (nextOpen && sidebarIsDrawer && rightPaneVisible) {
-      setRightPaneCollapsed(rightPaneState.activeSessionId, true);
+      setRightPaneCollapsed(rightPaneState.activeScopeKey, true);
     }
   }
 
@@ -1318,7 +1376,7 @@
                               type="button"
                               class="session-item"
                               class:active={session.id === currentSessionId && workspace.workspaceId === selectedWorkspaceId}
-                              class:pending={session.id === pendingSessionSwitchId}
+                              class:pending={session.id === pendingSessionSwitchId && workspace.workspaceId === pendingSessionSwitchWorkspaceId}
                               data-session-id={session.id}
                               disabled={pendingSessionSwitchId !== null}
                               title={session.name || i18n.t('header.unnamedSession')}

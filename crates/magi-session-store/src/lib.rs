@@ -11,8 +11,8 @@ pub use models::{
     CanonicalWorkerRef, ExecutionThread, ExecutionThreadStatus, NotificationRecord,
     SessionDurableState, SessionExecutionSidecarStatus, SessionExecutionSidecarStoreState,
     SessionProjectionInput, SessionRecord, SessionRuntimeSidecar, SessionRuntimeSidecarExport,
-    SessionSidecarFlushMetadata, SessionSidecarFlushReason, SessionStoreState, ThreadChatMessage,
-    ThreadChatToolCall, ThreadChatToolFunction, ThreadVisibility, TimelineEntry, TimelineEntryKind,
-    timeline_entry_visible_text,
+    SessionSidecarFlushMetadata, SessionSidecarFlushReason, SessionStoreState,
+    ThreadChatImageSource, ThreadChatMessage, ThreadChatToolCall, ThreadChatToolFunction,
+    ThreadVisibility, TimelineEntry, TimelineEntryKind, timeline_entry_visible_text,
 };
 pub use store::{ORCHESTRATOR_ROLE_ID, SessionStore};

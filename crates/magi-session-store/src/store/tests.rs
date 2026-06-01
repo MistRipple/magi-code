@@ -70,6 +70,7 @@ fn test_turn_item(item_id: &str, content: &str) -> ActiveExecutionTurnItem {
         request_id: None,
         user_message_id: None,
         placeholder_message_id: None,
+        metadata: Default::default(),
         timeline_entry_id: None,
         source_thread_id: ThreadId::new("thread-main-default"),
     }

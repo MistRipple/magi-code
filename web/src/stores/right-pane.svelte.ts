@@ -65,7 +65,11 @@ export interface SessionPaneState {
 }
 
 interface RightPaneRootState {
-  /** 当前会话 id；活跃组件按此 key 读取 perSession */
+  /** 当前右侧面板作用域 key：workspace + session 共同决定，避免跨工作区串面板 */
+  activeScopeKey: string;
+  /** 当前工作区 id；仅用于后续打开 tab 时补齐作用域 */
+  activeWorkspaceId: string;
+  /** 当前原始会话 id；展示与调用外部 session API 时使用 */
   activeSessionId: string;
   perSession: Record<string, SessionPaneState>;
 }
@@ -80,14 +84,53 @@ const EMPTY_SESSION_STATE: SessionPaneState = {
 };
 
 /** localStorage 持久化 key，带 schema 版本号方便后续演化 */
-const STORAGE_KEY = 'magi-right-pane-state.v1';
+const STORAGE_KEY = 'magi-right-pane-state.v2';
 /** 持久化 session 总数硬上限：超过后按 lastActivatedAt 倒序保留最近 N 个，防止长期使用膨胀 */
 const MAX_PERSISTED_SESSIONS = 50;
 
 interface PersistedShape {
-  version: 1;
+  version: 2;
+  activeScopeKey: string;
+  activeWorkspaceId: string;
   activeSessionId: string;
   perSession: Record<string, SessionPaneState>;
+}
+
+function normalizeWorkspaceId(workspaceId: string | null | undefined): string {
+  return typeof workspaceId === 'string' ? workspaceId.trim() : '';
+}
+
+function normalizeSessionId(sessionId: string | null | undefined): string {
+  return typeof sessionId === 'string' ? sessionId.trim() : '';
+}
+
+function sessionScopeKey(
+  workspaceId: string | null | undefined,
+  sessionId: string | null | undefined,
+): string {
+  const normalizedSessionId = normalizeSessionId(sessionId);
+  if (!normalizedSessionId) {
+    return '';
+  }
+  const normalizedWorkspaceId = normalizeWorkspaceId(workspaceId);
+  return normalizedWorkspaceId
+    ? `${normalizedWorkspaceId}\u0000${normalizedSessionId}`
+    : `session:${normalizedSessionId}`;
+}
+
+function normalizeStoredScopeKey(scopeKeyOrSessionId: string | null | undefined): string {
+  const value = normalizeSessionId(scopeKeyOrSessionId);
+  if (!value) {
+    return '';
+  }
+  if (
+    rightPaneState.perSession[value]
+    || value.includes('\u0000')
+    || value.startsWith('session:')
+  ) {
+    return value;
+  }
+  return sessionScopeKey(rightPaneState.activeWorkspaceId, value);
 }
 
 /**
@@ -121,7 +164,7 @@ function loadPersisted(): void {
     const raw = window.localStorage.getItem(STORAGE_KEY);
     if (!raw) return;
     const parsed = JSON.parse(raw) as PersistedShape;
-    if (!parsed || parsed.version !== 1) return;
+    if (!parsed || parsed.version !== 2) return;
     const recovered: Record<string, SessionPaneState> = {};
     for (const [sid, state] of Object.entries(parsed.perSession ?? {})) {
       if (!state || !Array.isArray(state.openTabs)) continue;
@@ -132,8 +175,11 @@ function loadPersisted(): void {
       };
     }
     rightPaneState.perSession = recovered;
-    rightPaneState.activeSessionId =
-      typeof parsed.activeSessionId === 'string' ? parsed.activeSessionId : '';
+    rightPaneState.activeWorkspaceId = normalizeWorkspaceId(parsed.activeWorkspaceId);
+    rightPaneState.activeSessionId = normalizeSessionId(parsed.activeSessionId);
+    const activeScopeKey = normalizeSessionId(parsed.activeScopeKey)
+      || sessionScopeKey(rightPaneState.activeWorkspaceId, rightPaneState.activeSessionId);
+    rightPaneState.activeScopeKey = recovered[activeScopeKey] ? activeScopeKey : '';
   } catch {
     // 解析失败 → 维持空状态，不影响应用启动
   }
@@ -155,7 +201,9 @@ function persistState(): void {
       kept = ranked.slice(0, MAX_PERSISTED_SESSIONS).map((x) => [x.sid, x.state]);
     }
     const slim: PersistedShape = {
-      version: 1,
+      version: 2,
+      activeScopeKey: rightPaneState.activeScopeKey,
+      activeWorkspaceId: rightPaneState.activeWorkspaceId,
       activeSessionId: rightPaneState.activeSessionId,
       perSession: Object.fromEntries(
         kept.map(([sid, state]) => [
@@ -175,6 +223,8 @@ function persistState(): void {
 }
 
 export const rightPaneState = $state<RightPaneRootState>({
+  activeScopeKey: '',
+  activeWorkspaceId: '',
   activeSessionId: '',
   perSession: {},
 });
@@ -194,22 +244,15 @@ if (typeof window !== 'undefined') {
   });
 }
 
-function normalizeSessionId(sessionId: string | null | undefined): string {
-  if (typeof sessionId !== 'string') {
-    return '';
-  }
-  return sessionId.trim();
-}
-
-function ensureSession(sessionId: string): SessionPaneState {
-  let state = rightPaneState.perSession[sessionId];
+function ensureSession(scopeKey: string): SessionPaneState {
+  let state = rightPaneState.perSession[scopeKey];
   if (!state) {
     state = {
       openTabs: [],
       activeTabId: null,
       collapsed: true,
     };
-    rightPaneState.perSession[sessionId] = state;
+    rightPaneState.perSession[scopeKey] = state;
   }
   return state;
 }
@@ -244,14 +287,19 @@ function pickLruVictim(state: SessionPaneState): RightPaneTab | null {
 
 /** 内部：插入或激活已有 tab；负责 LRU 淘汰、自动展开、设为 active */
 function upsertTab(
-  sessionId: string,
+  scopeKey: string,
   kind: RightPaneTabKind,
   payload: RightPaneTabPayload,
   label: string,
   accentToken: string | null,
 ): RightPaneTab | null {
-  rightPaneState.activeSessionId = sessionId;
-  const session = ensureSession(sessionId);
+  rightPaneState.activeScopeKey = scopeKey;
+  if (kind === 'code') {
+    const codePayload = payload as CodeTabPayload;
+    rightPaneState.activeWorkspaceId = normalizeWorkspaceId(codePayload.workspaceId);
+    rightPaneState.activeSessionId = normalizeSessionId(codePayload.sessionId);
+  }
+  const session = ensureSession(scopeKey);
   const id = tabKey(kind, payload);
   const existing = session.openTabs.find((tab) => tab.id === id);
   const timestamp = now();
@@ -295,31 +343,44 @@ function upsertTab(
  * 激活某个 session 的右侧面板上下文。
  * - 切换 session 时调用一次；无显式状态时 ensure 空 state
  */
-export function activateRightPaneSession(sessionId: string | null | undefined): void {
-  const normalized = normalizeSessionId(sessionId);
-  rightPaneState.activeSessionId = normalized;
-  if (normalized) {
-    ensureSession(normalized);
+export function activateRightPaneSession(
+  workspaceId: string | null | undefined,
+  sessionId: string | null | undefined,
+): void {
+  const normalizedWorkspaceId = normalizeWorkspaceId(workspaceId);
+  const normalizedSessionId = normalizeSessionId(sessionId);
+  const scopeKey = sessionScopeKey(normalizedWorkspaceId, normalizedSessionId);
+  rightPaneState.activeWorkspaceId = normalizedWorkspaceId;
+  rightPaneState.activeSessionId = normalizedSessionId;
+  rightPaneState.activeScopeKey = scopeKey;
+  if (scopeKey) {
+    ensureSession(scopeKey);
   }
 }
 
 /** 读取某个 session 的面板状态（响应式引用）；空 sessionId 或未初始化时返回空快照 */
-export function getRightPaneState(sessionId: string | null | undefined): SessionPaneState {
-  const normalized = normalizeSessionId(sessionId);
-  if (!normalized) {
+export function getRightPaneState(scopeKeyOrSessionId: string | null | undefined): SessionPaneState {
+  const scopeKey = normalizeStoredScopeKey(scopeKeyOrSessionId);
+  if (!scopeKey) {
     return EMPTY_SESSION_STATE;
   }
-  return rightPaneState.perSession[normalized] ?? EMPTY_SESSION_STATE;
+  return rightPaneState.perSession[scopeKey] ?? EMPTY_SESSION_STATE;
 }
 
 /** 打开（或激活）一个 agent tab；taskId 同时作为去重 key */
 export function openAgentTab(
   sessionId: string | null | undefined,
   taskId: string | null | undefined,
-  options?: { label?: string; accentToken?: string | null },
+  options?: { label?: string; accentToken?: string | null; workspaceId?: string | null },
 ): void {
   const normalizedSession = normalizeSessionId(sessionId);
   if (!normalizedSession) {
+    return;
+  }
+  const workspaceId = normalizeWorkspaceId(options?.workspaceId)
+    || (normalizedSession === rightPaneState.activeSessionId ? rightPaneState.activeWorkspaceId : '');
+  const scopeKey = sessionScopeKey(workspaceId, normalizedSession);
+  if (!scopeKey) {
     return;
   }
   const trimmedTaskId = typeof taskId === 'string' ? taskId.trim() : '';
@@ -328,8 +389,10 @@ export function openAgentTab(
   }
   const label = options?.label?.trim() || trimmedTaskId;
   const accentToken = options?.accentToken ?? null;
+  rightPaneState.activeWorkspaceId = workspaceId;
+  rightPaneState.activeSessionId = normalizedSession;
   upsertTab(
-    normalizedSession,
+    scopeKey,
     'agent',
     { taskId: trimmedTaskId },
     label,
@@ -365,16 +428,24 @@ export function openCodeTab(
   if (!trimmedFilepath) {
     return;
   }
+  const workspaceId = normalizeWorkspaceId(options?.workspaceId)
+    || (normalizedSession === rightPaneState.activeSessionId ? rightPaneState.activeWorkspaceId : '');
+  const scopeKey = sessionScopeKey(workspaceId, normalizedSession);
+  if (!scopeKey) {
+    return;
+  }
   const baseName = trimmedFilepath.split('/').pop() || trimmedFilepath;
   const label = options?.label?.trim() || baseName;
+  rightPaneState.activeWorkspaceId = workspaceId;
+  rightPaneState.activeSessionId = normalizedSession;
   upsertTab(
-    normalizedSession,
+    scopeKey,
     'code',
     {
       filepath: trimmedFilepath,
-      workspaceId: options?.workspaceId,
+      workspaceId,
       workspacePath: options?.workspacePath,
-      sessionId: options?.sessionId,
+      sessionId: options?.sessionId ?? normalizedSession,
       diff: options?.diff ?? null,
       content: options?.content ?? null,
       language: options?.language ?? null,
@@ -396,14 +467,14 @@ export function openCodeTab(
  * - 关闭后 openTabs 为空 → 强制 collapsed = true
  */
 export function closeTab(
-  sessionId: string | null | undefined,
+  scopeKeyOrSessionId: string | null | undefined,
   tabId: string,
 ): void {
-  const normalizedSession = normalizeSessionId(sessionId);
-  if (!normalizedSession) {
+  const scopeKey = normalizeStoredScopeKey(scopeKeyOrSessionId);
+  if (!scopeKey) {
     return;
   }
-  const session = rightPaneState.perSession[normalizedSession];
+  const session = rightPaneState.perSession[scopeKey];
   if (!session) {
     return;
   }
@@ -433,38 +504,38 @@ export function closeTab(
 }
 
 /** 切换 collapsed；不动 openTabs */
-export function toggleRightPane(sessionId: string | null | undefined): void {
-  const normalizedSession = normalizeSessionId(sessionId);
-  if (!normalizedSession) {
+export function toggleRightPane(scopeKeyOrSessionId: string | null | undefined): void {
+  const scopeKey = normalizeStoredScopeKey(scopeKeyOrSessionId);
+  if (!scopeKey) {
     return;
   }
-  const session = ensureSession(normalizedSession);
+  const session = ensureSession(scopeKey);
   session.collapsed = !session.collapsed;
 }
 
 /** 显式设置 collapsed 状态 */
 export function setRightPaneCollapsed(
-  sessionId: string | null | undefined,
+  scopeKeyOrSessionId: string | null | undefined,
   collapsed: boolean,
 ): void {
-  const normalizedSession = normalizeSessionId(sessionId);
-  if (!normalizedSession) {
+  const scopeKey = normalizeStoredScopeKey(scopeKeyOrSessionId);
+  if (!scopeKey) {
     return;
   }
-  const session = ensureSession(normalizedSession);
+  const session = ensureSession(scopeKey);
   session.collapsed = collapsed;
 }
 
 /** 切换 active tab；更新 lastActivatedAt */
 export function setActiveRightPaneTab(
-  sessionId: string | null | undefined,
+  scopeKeyOrSessionId: string | null | undefined,
   tabId: string,
 ): void {
-  const normalizedSession = normalizeSessionId(sessionId);
-  if (!normalizedSession) {
+  const scopeKey = normalizeStoredScopeKey(scopeKeyOrSessionId);
+  if (!scopeKey) {
     return;
   }
-  const session = rightPaneState.perSession[normalizedSession];
+  const session = rightPaneState.perSession[scopeKey];
   if (!session) {
     return;
   }
@@ -477,15 +548,24 @@ export function setActiveRightPaneTab(
 }
 
 /** 清理某个 session 的所有 tab 状态（在 session 关闭/重置时调用） */
-export function clearRightPaneSession(sessionId: string | null | undefined): void {
-  const normalized = normalizeSessionId(sessionId);
-  if (!normalized) {
+export function clearRightPaneSession(
+  scopeKeyOrWorkspaceId: string | null | undefined,
+  sessionId?: string | null,
+): void {
+  const scopeKey = sessionId === undefined
+    ? normalizeStoredScopeKey(scopeKeyOrWorkspaceId)
+    : sessionScopeKey(scopeKeyOrWorkspaceId, sessionId);
+  if (!scopeKey) {
     rightPaneState.perSession = {};
+    rightPaneState.activeScopeKey = '';
+    rightPaneState.activeWorkspaceId = '';
     rightPaneState.activeSessionId = '';
     return;
   }
-  delete rightPaneState.perSession[normalized];
-  if (rightPaneState.activeSessionId === normalized) {
+  delete rightPaneState.perSession[scopeKey];
+  if (rightPaneState.activeScopeKey === scopeKey) {
+    rightPaneState.activeScopeKey = '';
+    rightPaneState.activeWorkspaceId = '';
     rightPaneState.activeSessionId = '';
   }
 }

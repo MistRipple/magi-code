@@ -69,7 +69,7 @@ export function bootstrapApp(
 
   initializeState();
   const restoredState = getState();
-  primeEventSeqTracking(restoredState.currentSessionId);
+  primeEventSeqTracking(restoredState.currentSessionId, restoredState.currentWorkspaceId);
   initMessageHandler(bridge);
   installPasteDeduplication();
 

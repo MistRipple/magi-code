@@ -13,7 +13,8 @@
 
   const appState = getState();
   const currentSessionId = $derived(appState.currentSessionId);
-  const taskProjection = $derived(getTaskProjectionState(currentSessionId));
+  const currentWorkspaceId = $derived(appState.currentWorkspaceId);
+  const taskProjection = $derived(getTaskProjectionState(currentSessionId, currentWorkspaceId));
 
   // 任务和变更的徽章数量
   const tasksBadge = $derived.by(() => {

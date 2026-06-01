@@ -547,6 +547,7 @@ fn runtime_sidecar_flush_persists_canonical_turns_to_session_durable_state() {
                     placeholder_message_id: Some(
                         "assistant-placeholder-flush-canonical".to_string(),
                     ),
+                    metadata: Default::default(),
                     timeline_entry_id: None,
                     source_thread_id: orchestrator_thread_id.clone(),
                 }],

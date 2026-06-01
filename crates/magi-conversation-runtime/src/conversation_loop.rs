@@ -22,11 +22,12 @@ use crate::{
     validation_result_rejects_delivery,
 };
 use crate::{
-    model_error::provider_empty_assistant_response_error,
+    model_error::{provider_empty_assistant_response_error, public_model_invocation_error_message},
     prompt_utils::{
         current_turn_context_priority_prompt, normalize_model_stream_preview_content,
         normalize_model_visible_content, workspace_context_system_prompt,
     },
+    session_images::{SessionTurnImage, session_turn_image_sources},
     settings_store::SettingsStore,
     usage_recording::{ModelUsageBinding, publish_model_usage_record, record_mission_turn},
 };
@@ -41,7 +42,8 @@ use magi_core::{
 use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
 use magi_orchestrator::{ExecutionContextSummary, task_store::TaskStore};
 use magi_session_store::{
-    SessionStore, ThreadChatMessage, ThreadChatToolCall, ThreadChatToolFunction, TimelineEntryKind,
+    SessionStore, ThreadChatImageSource, ThreadChatMessage, ThreadChatToolCall,
+    ThreadChatToolFunction, TimelineEntryKind,
 };
 use magi_tool_runtime::ToolRegistry;
 use magi_usage_authority::UsageCallStatus;
@@ -119,6 +121,7 @@ pub struct ConversationLoopRequest<'a> {
     pub session_id: &'a SessionId,
     pub workspace_id: &'a Option<WorkspaceId>,
     pub prompt: String,
+    pub images: Vec<SessionTurnImage>,
     pub tools: Option<Vec<ChatToolDefinition>>,
     pub usage_binding: &'a ModelUsageBinding,
     pub streaming_entry_id: Option<&'a str>,
@@ -149,6 +152,15 @@ fn thread_chat_message_to_chat_message(message: &ThreadChatMessage) -> ChatMessa
     ChatMessage {
         role: message.role.clone(),
         content: message.content.clone(),
+        images: message
+            .images
+            .iter()
+            .map(|image| magi_bridge_client::llm_types::ImageSource {
+                kind: image.kind.clone(),
+                media_type: image.media_type.clone(),
+                data: image.data.clone(),
+            })
+            .collect(),
         tool_calls: message
             .tool_calls
             .iter()
@@ -171,6 +183,15 @@ fn chat_message_to_thread_chat_message(message: &ChatMessage) -> ThreadChatMessa
     ThreadChatMessage {
         role: message.role.clone(),
         content: message.content.clone(),
+        images: message
+            .images
+            .iter()
+            .map(|image| ThreadChatImageSource {
+                kind: image.kind.clone(),
+                media_type: image.media_type.clone(),
+                data: image.data.clone(),
+            })
+            .collect(),
         tool_calls: message
             .tool_calls
             .iter()
@@ -392,6 +413,7 @@ fn build_thread_history_compaction_message(
     ThreadChatMessage {
         role: "system".to_string(),
         content: Some(content),
+        images: Vec::new(),
         tool_calls: Vec::new(),
         tool_call_id: None,
     }
@@ -576,6 +598,7 @@ fn run_conversation_loop_inner(
         session_id,
         workspace_id,
         prompt,
+        images,
         tools,
         usage_binding,
         streaming_entry_id,
@@ -638,6 +661,7 @@ fn run_conversation_loop_inner(
         messages.push(ChatMessage {
             role: "system".to_string(),
             content: Some(system),
+            images: Vec::new(),
             tool_calls: Vec::new(),
             tool_call_id: None,
         });
@@ -651,6 +675,7 @@ fn run_conversation_loop_inner(
             content: Some(workspace_context_system_prompt(
                 &root_path.display().to_string(),
             )),
+            images: Vec::new(),
             tool_calls: Vec::new(),
             tool_call_id: None,
         });
@@ -665,6 +690,7 @@ fn run_conversation_loop_inner(
                 messages.push(ChatMessage {
                     role: "system".to_string(),
                     content: Some(rendered),
+                    images: Vec::new(),
                     tool_calls: Vec::new(),
                     tool_call_id: None,
                 });
@@ -687,6 +713,7 @@ fn run_conversation_loop_inner(
         messages.push(ChatMessage {
             role: "system".to_string(),
             content: Some(magi_bridge_client::cache_boundary::PROMPT_CACHE_BOUNDARY.to_string()),
+            images: Vec::new(),
             tool_calls: Vec::new(),
             tool_call_id: None,
         });
@@ -714,6 +741,7 @@ fn run_conversation_loop_inner(
                 messages.push(ChatMessage {
                     role: "system".to_string(),
                     content: Some(rendered),
+                    images: Vec::new(),
                     tool_calls: Vec::new(),
                     tool_call_id: None,
                 });
@@ -734,6 +762,7 @@ fn run_conversation_loop_inner(
                 messages.push(ChatMessage {
                     role: "system".to_string(),
                     content: Some(rendered),
+                    images: Vec::new(),
                     tool_calls: Vec::new(),
                     tool_call_id: None,
                 });
@@ -753,6 +782,7 @@ fn run_conversation_loop_inner(
         messages.push(ChatMessage {
             role: "system".to_string(),
             content: Some(rendered),
+            images: Vec::new(),
             tool_calls: Vec::new(),
             tool_call_id: None,
         });
@@ -767,6 +797,7 @@ fn run_conversation_loop_inner(
                 messages.push(ChatMessage {
                     role: "system".to_string(),
                     content: Some(rendered),
+                    images: Vec::new(),
                     tool_calls: Vec::new(),
                     tool_call_id: None,
                 });
@@ -786,6 +817,7 @@ fn run_conversation_loop_inner(
                 messages.push(ChatMessage {
                     role: "system".to_string(),
                     content: Some(rendered),
+                    images: Vec::new(),
                     tool_calls: Vec::new(),
                     tool_call_id: None,
                 });
@@ -806,6 +838,7 @@ fn run_conversation_loop_inner(
                 messages.push(ChatMessage {
                     role: "system".to_string(),
                     content: Some(rendered),
+                    images: Vec::new(),
                     tool_calls: Vec::new(),
                     tool_call_id: None,
                 });
@@ -826,6 +859,7 @@ fn run_conversation_loop_inner(
                 messages.push(ChatMessage {
                     role: "system".to_string(),
                     content: Some(rendered),
+                    images: Vec::new(),
                     tool_calls: Vec::new(),
                     tool_call_id: None,
                 });
@@ -845,6 +879,7 @@ fn run_conversation_loop_inner(
                 messages.push(ChatMessage {
                     role: "system".to_string(),
                     content: Some(rendered),
+                    images: Vec::new(),
                     tool_calls: Vec::new(),
                     tool_call_id: None,
                 });
@@ -861,6 +896,7 @@ fn run_conversation_loop_inner(
         messages.push(ChatMessage {
             role: "system".to_string(),
             content: Some(rendered),
+            images: Vec::new(),
             tool_calls: Vec::new(),
             tool_call_id: None,
         });
@@ -885,6 +921,7 @@ fn run_conversation_loop_inner(
                 "以上是当前 thread 在本 task 启动前已有的运行时输入或恢复记录。下面的用户消息是本次执行的当前任务事实，必须以当前任务为准。"
                     .to_string(),
             ),
+            images: Vec::new(),
             tool_calls: Vec::new(),
             tool_call_id: None,
         });
@@ -892,6 +929,7 @@ fn run_conversation_loop_inner(
     messages.push(ChatMessage {
         role: "system".to_string(),
         content: Some(current_turn_context_priority_prompt()),
+        images: Vec::new(),
         tool_calls: Vec::new(),
         tool_call_id: None,
     });
@@ -902,6 +940,7 @@ fn run_conversation_loop_inner(
     messages.push(ChatMessage {
         role: "user".to_string(),
         content: Some(prompt.clone()),
+        images: session_turn_image_sources(&images),
         tool_calls: Vec::new(),
         tool_call_id: None,
     });
@@ -1006,7 +1045,8 @@ fn run_conversation_loop_inner(
             match client.invoke_streaming(invocation_request, &on_delta) {
                 Ok(response) => response,
                 Err(error) => {
-                    let error_message = error.to_string();
+                    let raw_error_message = error.to_string();
+                    let error_message = public_model_invocation_error_message(&raw_error_message);
                     tracing::error!(task_id = %task.task_id, round = round, ?error, "LLM streaming invocation failed");
                     if task_lease_is_current(task_store, task_id, lease_id) {
                         append_task_error_turn_item(
@@ -1034,7 +1074,8 @@ fn run_conversation_loop_inner(
             match client.invoke(invocation_request) {
                 Ok(response) => response,
                 Err(error) => {
-                    let error_message = error.to_string();
+                    let raw_error_message = error.to_string();
+                    let error_message = public_model_invocation_error_message(&raw_error_message);
                     tracing::error!(task_id = %task.task_id, round = round, ?error, "LLM invocation failed");
                     if task_lease_is_current(task_store, task_id, lease_id) {
                         append_task_error_turn_item(
@@ -1126,6 +1167,7 @@ fn run_conversation_loop_inner(
                 messages.push(ChatMessage {
                     role: "assistant".to_string(),
                     content: parsed.content.clone(),
+                    images: Vec::new(),
                     tool_calls: Vec::new(),
                     tool_call_id: None,
                 });
@@ -1135,6 +1177,7 @@ fn run_conversation_loop_inner(
                         &required_tool_chain,
                         &completed_required_tool_names,
                     )),
+                    images: Vec::new(),
                     tool_calls: Vec::new(),
                     tool_call_id: None,
                 });
@@ -1151,12 +1194,14 @@ fn run_conversation_loop_inner(
                 messages.push(ChatMessage {
                     role: "assistant".to_string(),
                     content: parsed.content.clone(),
+                    images: Vec::new(),
                     tool_calls: Vec::new(),
                     tool_call_id: None,
                 });
                 messages.push(ChatMessage {
                     role: "user".to_string(),
                     content: Some(recovery_prompt),
+                    images: Vec::new(),
                     tool_calls: Vec::new(),
                     tool_call_id: None,
                 });
@@ -1168,12 +1213,14 @@ fn run_conversation_loop_inner(
                 messages.push(ChatMessage {
                     role: "assistant".to_string(),
                     content: parsed.content.clone(),
+                    images: Vec::new(),
                     tool_calls: Vec::new(),
                     tool_call_id: None,
                 });
                 messages.push(ChatMessage {
                     role: "user".to_string(),
                     content: Some(recovery_prompt),
+                    images: Vec::new(),
                     tool_calls: Vec::new(),
                     tool_call_id: None,
                 });
@@ -1186,12 +1233,14 @@ fn run_conversation_loop_inner(
                 messages.push(ChatMessage {
                     role: "assistant".to_string(),
                     content: parsed.content.clone(),
+                    images: Vec::new(),
                     tool_calls: Vec::new(),
                     tool_call_id: None,
                 });
                 messages.push(ChatMessage {
                     role: "user".to_string(),
                     content: Some(recovery_prompt),
+                    images: Vec::new(),
                     tool_calls: Vec::new(),
                     tool_call_id: None,
                 });
@@ -1211,12 +1260,14 @@ fn run_conversation_loop_inner(
             messages.push(ChatMessage {
                 role: "assistant".to_string(),
                 content: parsed.content.clone(),
+                images: Vec::new(),
                 tool_calls: parsed.tool_calls.clone(),
                 tool_call_id: None,
             });
             messages.push(ChatMessage {
                 role: "user".to_string(),
                 content: Some(recovery_prompt),
+                images: Vec::new(),
                 tool_calls: Vec::new(),
                 tool_call_id: None,
             });
@@ -1226,6 +1277,7 @@ fn run_conversation_loop_inner(
         messages.push(ChatMessage {
             role: "assistant".to_string(),
             content: parsed.content.clone(),
+            images: Vec::new(),
             tool_calls: parsed.tool_calls.clone(),
             tool_call_id: None,
         });
@@ -1323,6 +1375,7 @@ fn run_conversation_loop_inner(
             messages.push(ChatMessage {
                 role: "tool".to_string(),
                 content: Some(result),
+                images: Vec::new(),
                 tool_calls: Vec::new(),
                 tool_call_id: Some(tool_call.id.clone()),
             });
@@ -1339,6 +1392,7 @@ fn run_conversation_loop_inner(
                     "上一轮工具调用没有满足当前任务的硬性内容要求：{}。请基于当前任务原文重新调用下一个缺失工具，必须逐字保留文件名、marker 和每一行要求。",
                     content_requirement_failures.join("；")
                 )),
+                images: Vec::new(),
                 tool_calls: Vec::new(),
                 tool_call_id: None,
             });
@@ -1547,6 +1601,7 @@ fn run_conversation_loop_inner(
     turn_messages.push(ThreadChatMessage {
         role: "assistant".to_string(),
         content: Some(final_content.clone()),
+        images: Vec::new(),
         tool_calls: Vec::new(),
         tool_call_id: None,
     });
@@ -2621,6 +2676,9 @@ mod tests {
     struct StaticTaskFinalModelBridgeClient {
         content: &'static str,
     }
+    struct RecordingImageTaskModelBridgeClient {
+        image_count: AtomicUsize,
+    }
     struct TaskToolFailureThenFinalModelBridgeClient {
         invoke_count: AtomicUsize,
     }
@@ -2745,6 +2803,41 @@ mod tests {
         ) -> Result<BridgeResponse, BridgeClientError> {
             on_delta(&ModelStreamingDelta {
                 content: self.content.to_string(),
+                thinking: String::new(),
+            });
+            self.invoke(request)
+        }
+    }
+
+    impl ModelBridgeClient for RecordingImageTaskModelBridgeClient {
+        fn invoke(
+            &self,
+            request: ModelInvocationRequest,
+        ) -> Result<BridgeResponse, BridgeClientError> {
+            let image_count = request
+                .messages
+                .as_ref()
+                .and_then(|messages| messages.iter().rev().find(|message| message.role == "user"))
+                .map(|message| message.images.len())
+                .unwrap_or_default();
+            self.image_count.store(image_count, Ordering::SeqCst);
+            Ok(BridgeResponse {
+                ok: true,
+                payload: serde_json::json!({
+                    "content": "已看到图片",
+                    "finish_reason": "stop"
+                })
+                .to_string(),
+            })
+        }
+
+        fn invoke_streaming(
+            &self,
+            request: ModelInvocationRequest,
+            on_delta: &dyn Fn(&ModelStreamingDelta),
+        ) -> Result<BridgeResponse, BridgeClientError> {
+            on_delta(&ModelStreamingDelta {
+                content: "已看到图片".to_string(),
                 thinking: String::new(),
             });
             self.invoke(request)
@@ -3325,6 +3418,7 @@ mod tests {
             session_id: &session_id,
             workspace_id: &workspace_id,
             prompt: "请执行任务".to_string(),
+            images: Vec::new(),
             tools: None,
             usage_binding: &usage_binding,
             streaming_entry_id: None,
@@ -3339,6 +3433,90 @@ mod tests {
             persist_session_state: None,
         });
         outcome
+    }
+
+    #[test]
+    fn task_conversation_loop_attaches_current_user_images_to_model_request() {
+        let session_store = SessionStore::new();
+        let event_bus = InMemoryEventBus::new(64);
+        let task_store = TaskStore::new();
+        let task = make_task_loop_test_task("task-current-image-input");
+        task_store.insert_task(task.clone());
+        let worker_id = WorkerId::new("worker-current-image-input");
+        let lease = task_store
+            .grant_lease(
+                &task.task_id,
+                &task.root_task_id,
+                &worker_id,
+                "executor",
+                60_000,
+            )
+            .expect("lease should be granted");
+        let usage_binding = crate::usage_recording::session_turn_model_usage_binding(true);
+        let client = RecordingImageTaskModelBridgeClient {
+            image_count: AtomicUsize::new(0),
+        };
+        let session_id = SessionId::new("session-current-image-input");
+        let workspace_id = Some(WorkspaceId::new("workspace-current-image-input"));
+        session_store
+            .create_session(session_id.clone(), "task image fixture")
+            .expect("session should be creatable");
+        let now = UtcMillis::now();
+        let (_, orchestrator_thread_id) =
+            session_store.ensure_session_mission(&session_id, now, || task.mission_id.clone());
+        let thread_id = orchestrator_thread_id.clone();
+
+        let (outcome, _) = run_conversation_loop(ConversationLoopRequest {
+            client: &client,
+            event_bus: &event_bus,
+            session_store: &session_store,
+            settings_store: None,
+            tool_registry: None,
+            skill_runtime: None,
+            skill_dispatch_runtime: None,
+            skill_name: None,
+            task_store: &task_store,
+            execution_registry: &TaskExecutionRegistry::default(),
+            conversation_registry: &ConversationRegistry::new(),
+            agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
+            spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
+            safety_gate: None,
+            todo_ledger: &magi_todo_ledger::TodoLedger::new(),
+            project_memory: None,
+            mission_charter: None,
+            plan: None,
+            mission_workspace: None,
+            knowledge_graph: None,
+            validation_runner: None,
+            checkpoint: None,
+            human_checkpoint: None,
+            mission_metrics: None,
+            task: &task,
+            task_id: &task.task_id,
+            lease_id: &lease.lease_id,
+            session_id: &session_id,
+            workspace_id: &workspace_id,
+            prompt: "识别图片".to_string(),
+            images: vec![
+                SessionTurnImage::from_data_url("smoke.png", "data:image/png;base64,AAA")
+                    .expect("image should parse"),
+            ],
+            tools: None,
+            usage_binding: &usage_binding,
+            streaming_entry_id: None,
+            is_sidechain: false,
+            worker_id: Some(&worker_id),
+            thread_id: &thread_id,
+            context_summary: None,
+            system_prompt: None,
+            workspace_root_path: None,
+            snapshot_session: None,
+            execution_group_id: None,
+            persist_session_state: None,
+        });
+
+        assert!(matches!(outcome, TaskOutcome::Completed { .. }));
+        assert_eq!(client.image_count.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -3774,6 +3952,7 @@ mod tests {
             session_id: &session_id,
             workspace_id: &workspace_id,
             prompt: "请调用一个失败工具后总结".to_string(),
+            images: Vec::new(),
             tools: None,
             usage_binding: &usage_binding,
             streaming_entry_id: None,
@@ -3867,6 +4046,7 @@ mod tests {
             session_id: &session_id,
             workspace_id: &workspace_id,
             prompt: "请先处理失败工具，再通过重试完成任务".to_string(),
+            images: Vec::new(),
             tools: None,
             usage_binding: &usage_binding,
             streaming_entry_id: None,
@@ -4172,6 +4352,7 @@ mod tests {
             session_id: &session_id,
             workspace_id: &workspace_id,
             prompt: "请生成回复".to_string(),
+            images: Vec::new(),
             tools: None,
             usage_binding: &usage_binding,
             streaming_entry_id: Some(streaming_entry_id),
@@ -4188,8 +4369,9 @@ mod tests {
 
         match outcome {
             TaskOutcome::Failed { error } => {
-                assert!(error.contains("桥接调用失败[RemoteBusiness]"));
-                assert!(error.contains("model bridge unavailable"));
+                assert_eq!(error, "模型服务暂时不可用，请稍后重试。");
+                assert!(!error.contains("RemoteBusiness"));
+                assert!(!error.contains("model bridge unavailable"));
                 assert!(!error.contains("LLM invocation failed"));
             }
             other => panic!("model failure must fail the task loop, got {other:?}"),
@@ -4211,8 +4393,9 @@ mod tests {
         assert_eq!(error_item.status, "failed");
         assert_eq!(error_item.task_id.as_ref(), Some(&task_id));
         assert!(error_item.content.as_deref().is_some_and(|content| {
-            content.contains("桥接调用失败[RemoteBusiness]")
-                && content.contains("model bridge unavailable")
+            content == "模型服务暂时不可用，请稍后重试。"
+                && !content.contains("RemoteBusiness")
+                && !content.contains("model bridge unavailable")
                 && !content.contains("LLM invocation failed")
         }));
 
@@ -4230,7 +4413,7 @@ mod tests {
                     && item
                         .content
                         .as_deref()
-                        .is_some_and(|content| content.contains("model bridge unavailable"))
+                        .is_some_and(|content| content == "模型服务暂时不可用，请稍后重试。")
             }),
             "failed task loop must persist the visible failure as canonical assistant_text"
         );
@@ -4377,6 +4560,7 @@ mod tests {
             session_id: &session_id,
             workspace_id: &workspace_id,
             prompt: "请执行两个只读 shell 工具".to_string(),
+            images: Vec::new(),
             tools: None,
             usage_binding: &usage_binding,
             streaming_entry_id: Some("timeline-streaming-task-tool-batch"),

@@ -70,7 +70,7 @@
 
   // 切换会话时同步 RightPane 上下文；空 sessionId 也要清掉，避免显示别的会话残留
   $effect(() => {
-    activateRightPaneSession(messagesState.currentSessionId);
+    activateRightPaneSession(messagesState.currentWorkspaceId, messagesState.currentSessionId);
   });
 
 </script>

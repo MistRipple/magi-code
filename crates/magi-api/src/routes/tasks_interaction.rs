@@ -297,6 +297,7 @@ async fn restart_task(
     let (accepted, event_id) = accept_session_task_submission(
         &state,
         &restart_request,
+        Vec::new(),
         scope.workspace_id.clone(),
         Some(root_task.title.clone()),
         Some(root_task.goal.clone()),

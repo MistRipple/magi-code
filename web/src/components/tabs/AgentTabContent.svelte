@@ -20,7 +20,10 @@
     goal: string;
   }
 
-  const taskProjection = $derived(getTaskProjectionState(messagesState.currentSessionId));
+  const taskProjection = $derived(getTaskProjectionState(
+    messagesState.currentSessionId,
+    messagesState.currentWorkspaceId,
+  ));
 
   const projectionTask = $derived.by<TaskDto | null>(() => {
     const projection = taskProjection.projection;

@@ -25,6 +25,7 @@ use magi_spawn_graph::SpawnGraph;
 
 use crate::session_thread;
 
+use crate::session_images::SessionTurnImage;
 use crate::settings_store::SettingsStore;
 use crate::task_execution_registry::{TaskExecutionPlan, TaskExecutionRegistry};
 
@@ -41,6 +42,7 @@ pub struct DispatchSubmissionRequest {
     pub workspace_id: Option<WorkspaceId>,
     pub entry_id: String,
     pub timeline_message: String,
+    pub images: Vec<SessionTurnImage>,
     pub created_session: bool,
     pub mission_title: String,
     pub task_title: String,
@@ -384,6 +386,7 @@ pub fn run_dispatch_submission(
             ),
             use_tools: true,
             skill_name: request.skill_name.clone(),
+            images: request.images.clone(),
             execution_settings_snapshot,
         },
     );
@@ -417,7 +420,7 @@ pub fn run_dispatch_submission(
         accepted_at,
         status: "accepted".to_string(),
         completed_at: None,
-        user_message: trimmed_text.map(str::to_string),
+        user_message: Some(request.timeline_message.clone()),
         items: vec![ActiveExecutionTurnItem {
             item_id: user_message_item_id,
             item_seq: 1,
@@ -425,7 +428,7 @@ pub fn run_dispatch_submission(
             status: "completed".to_string(),
             source: "user".to_string(),
             title: None,
-            content: trimmed_text.map(str::to_string),
+            content: Some(request.timeline_message.clone()),
             task_id: Some(act_task_id.clone()),
             worker_id: None,
             role_id: None,
@@ -438,6 +441,7 @@ pub fn run_dispatch_submission(
             request_id: request_id.clone(),
             user_message_id: user_message_id.clone(),
             placeholder_message_id: placeholder_message_id.clone(),
+            metadata: crate::session_images::session_turn_images_metadata(&request.images),
             timeline_entry_id: Some(entry_id.to_string()),
             source_thread_id: orchestrator_thread_id.clone(),
         }],
@@ -543,6 +547,7 @@ mod tests {
                     "历史验收任务：写 validation_auto_save_marker.txt / COMPLEX_WORKER_LANE_OK"
                         .to_string(),
                 ),
+                images: Vec::new(),
                 tool_calls: Vec::new(),
                 tool_call_id: None,
             }],
@@ -554,6 +559,7 @@ mod tests {
             workspace_id: Some(WorkspaceId::new("workspace-dispatch-fresh-thread")),
             entry_id: "timeline-dispatch-fresh-thread".to_string(),
             timeline_message: "创建当前任务文件".to_string(),
+            images: Vec::new(),
             created_session: false,
             mission_title: "当前任务推进".to_string(),
             task_title: "当前任务推进".to_string(),
@@ -638,6 +644,7 @@ mod tests {
             workspace_id: Some(WorkspaceId::new("workspace-exec-chain-tier")),
             entry_id: "timeline-exec-chain-tier".to_string(),
             timeline_message: "修复明确 bug 并跑相关验证".to_string(),
+            images: Vec::new(),
             created_session: false,
             mission_title: "修复 bug + 验证".to_string(),
             task_title: "修复 bug + 验证".to_string(),
@@ -745,6 +752,7 @@ mod tests {
             workspace_id: Some(WorkspaceId::new("workspace-long-mission")),
             entry_id: "timeline-long-mission".to_string(),
             timeline_message: "跨多阶段重构：拆模块、迁数据、灰度切换".to_string(),
+            images: Vec::new(),
             created_session: false,
             mission_title: "复杂重构 mission".to_string(),
             task_title: "复杂重构 mission".to_string(),
@@ -861,6 +869,7 @@ mod tests {
             workspace_id: Some(WorkspaceId::new("workspace-long-mission-bad-role")),
             entry_id: "timeline-long-mission-bad-role".to_string(),
             timeline_message: "复杂任务模式：跨多阶段重构".to_string(),
+            images: Vec::new(),
             created_session: false,
             mission_title: "重构 mission".to_string(),
             task_title: "重构 mission".to_string(),

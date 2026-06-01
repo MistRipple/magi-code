@@ -73,6 +73,7 @@ fn rebuild_dispatch_plan_for_branch(
         writebacks,
         use_tools: branch.use_tools,
         skill_name: branch.skill_name.clone(),
+        images: Vec::new(),
         execution_settings_snapshot,
     }
 }

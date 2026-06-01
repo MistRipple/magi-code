@@ -17,6 +17,59 @@ const TUNNEL_ERROR_DEPENDENCY_UNAVAILABLE: &str = "tunnel_dependency_unavailable
 const TUNNEL_ERROR_START_FAILED: &str = "tunnel_start_failed";
 const TUNNEL_ERROR_CONNECTION_LOST: &str = "tunnel_connection_lost";
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RemoteAccessBinding {
+    workspace_id: Option<String>,
+    workspace_path: Option<String>,
+    session_id: Option<String>,
+}
+
+impl RemoteAccessBinding {
+    pub fn new(
+        workspace_id: Option<&str>,
+        workspace_path: Option<&str>,
+        session_id: Option<&str>,
+    ) -> Self {
+        Self {
+            workspace_id: normalized_binding_value(workspace_id),
+            workspace_path: normalized_binding_value(workspace_path),
+            session_id: normalized_binding_value(session_id),
+        }
+    }
+
+    pub fn web_access_url(&self, web_base_url: &str, tunnel_token: Option<&str>) -> String {
+        let mut params = Vec::new();
+        if let Some(token) = normalized_binding_value(tunnel_token) {
+            params.push(("tunnel_token", token));
+        }
+        if let Some(workspace_id) = self.workspace_id.as_deref() {
+            params.push(("workspaceId", workspace_id.to_string()));
+        }
+        if let Some(workspace_path) = self.workspace_path.as_deref() {
+            params.push(("workspacePath", workspace_path.to_string()));
+        }
+        if let Some(session_id) = self.session_id.as_deref() {
+            params.push(("sessionId", session_id.to_string()));
+        }
+        if params.is_empty() {
+            return web_base_url.to_string();
+        }
+        let query = params
+            .into_iter()
+            .map(|(key, value)| format!("{key}={}", urlencoding::encode(&value)))
+            .collect::<Vec<_>>()
+            .join("&");
+        format!("{web_base_url}?{query}")
+    }
+}
+
+fn normalized_binding_value(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct TunnelState {
     pub status: String,
@@ -44,6 +97,7 @@ struct TunnelInner {
     state: TunnelState,
     child: Option<Child>,
     local_port: u16,
+    binding: RemoteAccessBinding,
 }
 
 #[derive(Clone)]
@@ -58,6 +112,7 @@ impl TunnelManager {
                 state: TunnelState::default(),
                 child: None,
                 local_port,
+                binding: RemoteAccessBinding::default(),
             })),
         }
     }
@@ -70,11 +125,23 @@ impl TunnelManager {
         self.inner.lock().await.local_port
     }
 
-    pub async fn start(&self, workspace_id: Option<&str>) -> TunnelState {
+    pub async fn start(&self, binding: RemoteAccessBinding) -> TunnelState {
         let mut inner = self.inner.lock().await;
         if inner.state.status == "running" || inner.state.status == "starting" {
+            inner.binding = binding;
+            if let (Some(public_url), Some(token)) = (
+                inner.state.public_url.as_deref(),
+                inner.state.token.as_deref(),
+            ) {
+                inner.state.access_url = Some(
+                    inner
+                        .binding
+                        .web_access_url(&format!("{public_url}/web.html"), Some(token)),
+                );
+            }
             return inner.state.clone();
         }
+        inner.binding = binding;
 
         // 查找 cloudflared
         let bin_path = match resolve_cloudflared_path().await {
@@ -100,7 +167,6 @@ impl TunnelManager {
         inner.state.error = None;
 
         let port = inner.local_port;
-        let ws_id = workspace_id.map(|s| s.to_string());
 
         // 启动子进程
         let result = Command::new(&bin_path)
@@ -118,7 +184,6 @@ impl TunnelManager {
                 // 在后台任务中解析公网 URL，并持续监听 cloudflared 是否提前退出。
                 let inner_clone = self.inner.clone();
                 let token_clone = token.clone();
-                let ws_id_clone = ws_id.clone();
                 tokio::spawn(async move {
                     let mut has_public_url = false;
                     if let Some(stderr) = stderr {
@@ -132,14 +197,10 @@ impl TunnelManager {
                                 }
                                 inner.state.public_url = Some(url.clone());
                                 inner.state.status = "running".into();
-                                // 构造带 token 的访问 URL
-                                let mut access = format!("{url}/web.html");
-                                let mut params = vec![format!("tunnel_token={token_clone}")];
-                                if let Some(ref ws) = ws_id_clone {
-                                    params.push(format!("workspaceId={ws}"));
-                                }
-                                access = format!("{access}?{}", params.join("&"));
-                                inner.state.access_url = Some(access);
+                                inner.state.access_url = Some(inner.binding.web_access_url(
+                                    &format!("{url}/web.html"),
+                                    Some(&token_clone),
+                                ));
                                 has_public_url = true;
                             }
                         }
@@ -181,6 +242,7 @@ impl TunnelManager {
         }
         inner.child = None;
         inner.state = TunnelState::default();
+        inner.binding = RemoteAccessBinding::default();
         inner.state.clone()
     }
 }
@@ -367,5 +429,21 @@ mod tests {
             assert!(!marker.contains(' '));
             assert!(!marker.contains("cloudflared"));
         }
+    }
+
+    #[test]
+    fn remote_access_binding_preserves_workspace_session_scope() {
+        let binding = RemoteAccessBinding::new(
+            Some("workspace-a"),
+            Some("/Users/xie/code/TEST"),
+            Some("session-a"),
+        );
+
+        let url = binding.web_access_url("https://example.trycloudflare.com/web.html", Some("t k"));
+
+        assert!(url.contains("tunnel_token=t%20k"));
+        assert!(url.contains("workspaceId=workspace-a"));
+        assert!(url.contains("workspacePath=%2FUsers%2Fxie%2Fcode%2FTEST"));
+        assert!(url.contains("sessionId=session-a"));
     }
 }

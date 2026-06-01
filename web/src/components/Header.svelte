@@ -17,9 +17,9 @@
   } from '../stores/right-pane.svelte';
 
   // 右侧面板：折叠/展开切换按钮作为常驻入口——空 tab 时点击也可展开为空态 RightPane，
-  // 由 store 自身的 activeSessionId 决定能否操作（无 session 时 toggleRightPane 是 no-op）
-  const currentRightPane = $derived(getRightPaneState(rightPaneState.activeSessionId));
-  const showRightPaneToggle = $derived(Boolean(rightPaneState.activeSessionId));
+  // 由 store 自身的 activeScopeKey 决定能否操作（无 session 时 toggleRightPane 是 no-op）
+  const currentRightPane = $derived(getRightPaneState(rightPaneState.activeScopeKey));
+  const showRightPaneToggle = $derived(Boolean(rightPaneState.activeScopeKey));
 
   import type { Snippet } from 'svelte';
   interface Props {
@@ -341,7 +341,7 @@
       <button
         class="btn-icon btn-icon--sm"
         class:active={!currentRightPane.collapsed}
-        onclick={() => toggleRightPane(rightPaneState.activeSessionId)}
+        onclick={() => toggleRightPane(rightPaneState.activeScopeKey)}
         title={currentRightPane.collapsed ? i18n.t('rightPane.expand') : i18n.t('rightPane.collapse')}
         aria-label={currentRightPane.collapsed ? i18n.t('rightPane.expand') : i18n.t('rightPane.collapse')}
         aria-expanded={!currentRightPane.collapsed}

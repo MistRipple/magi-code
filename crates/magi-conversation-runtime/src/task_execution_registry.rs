@@ -19,7 +19,7 @@ use magi_orchestrator::{ExecutionWritebackPlans, task_store::TaskStore};
 use magi_session_store::{ActiveExecutionBranch, SessionStore};
 use magi_spawn_graph::SpawnGraph;
 
-use crate::{session_thread, settings_store::SettingsStore};
+use crate::{session_images::SessionTurnImage, session_thread, settings_store::SettingsStore};
 
 #[derive(Clone, Debug)]
 pub enum TaskExecutionPlan {
@@ -36,6 +36,7 @@ pub enum TaskExecutionPlan {
         writebacks: ExecutionWritebackPlans,
         use_tools: bool,
         skill_name: Option<String>,
+        images: Vec<SessionTurnImage>,
         execution_settings_snapshot: Option<Arc<SettingsStore>>,
     },
 }
@@ -221,6 +222,7 @@ impl TaskExecutionRegistry {
                 writebacks: ExecutionWritebackPlans::default(),
                 use_tools: true,
                 skill_name: None,
+                images: Vec::new(),
                 execution_settings_snapshot,
             },
         );
@@ -355,6 +357,7 @@ mod tests {
                 writebacks: ExecutionWritebackPlans::default(),
                 use_tools: true,
                 skill_name: None,
+                images: Vec::new(),
                 execution_settings_snapshot: Some(parent_settings_snapshot.clone()),
             },
         );

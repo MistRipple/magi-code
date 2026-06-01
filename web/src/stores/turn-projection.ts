@@ -261,6 +261,7 @@ function buildMessage(
     isComplete: !isStreaming,
     type: resolveMessageType(item),
     metadata: {
+      ...(item.metadata || {}),
       turnId: item.turnId,
       turnSeq: item.turnSeq,
       turnStatus: turn.status,

@@ -1378,6 +1378,8 @@ export function normalizeRustBootstrapPayload(
     sessions,
     currentSession,
     currentSessionId: currentSession?.id || '',
+    currentWorkspaceId: workspace.workspaceId,
+    currentWorkspacePath: workspace.rootPath,
     isProcessing: Boolean(processingState?.isProcessing),
     processingState,
     pendingChanges,

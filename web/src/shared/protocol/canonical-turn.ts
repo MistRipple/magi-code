@@ -102,6 +102,13 @@ const CANONICAL_TURN_ITEM_KINDS: CanonicalTurnItemKind[] = [
   'system_notice',
 ];
 const CANONICAL_TURN_EVENT_KINDS: CanonicalTurnEventKind[] = ['turn_started', 'turn_item_upsert', 'turn_completed'];
+const PUBLIC_MODEL_INVOCATION_FAILURE_MESSAGE = '模型服务暂时不可用，请稍后重试。';
+const INTERNAL_MODEL_FAILURE_MARKERS = [
+  '桥接调用失败[RemoteBusiness]',
+  'provider response invalid',
+  'empty stream response',
+  'model bridge unavailable',
+];
 
 function readRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value)
@@ -127,6 +134,12 @@ function readRawString(record: Record<string, unknown>, ...keys: string[]): stri
     }
   }
   return undefined;
+}
+
+function publicCanonicalContent(content: string): string {
+  return INTERNAL_MODEL_FAILURE_MARKERS.some((marker) => content.includes(marker))
+    ? PUBLIC_MODEL_INVOCATION_FAILURE_MESSAGE
+    : content;
 }
 
 function readNumber(record: Record<string, unknown>, ...keys: string[]): number | undefined {
@@ -242,7 +255,9 @@ export function normalizeCanonicalTurnItem(value: unknown): CanonicalTurnItem | 
     return undefined;
   }
   const title = readString(record, 'title') || undefined;
-  const content = typeof record.content === 'string' ? record.content : undefined;
+  const content = typeof record.content === 'string'
+    ? publicCanonicalContent(record.content)
+    : undefined;
   const blocks = Array.isArray(record.blocks) ? record.blocks : undefined;
   const metadata = readRecord(record.metadata) || undefined;
   return {

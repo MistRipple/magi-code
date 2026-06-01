@@ -427,6 +427,8 @@ pub struct ActiveExecutionTurnItem {
     pub user_message_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub placeholder_message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub metadata: HashMap<String, Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeline_entry_id: Option<String>,
     /// item 归属的 thread。orchestrator 主线 item 为 session 级 orchestrator thread；
@@ -990,9 +992,20 @@ pub struct ThreadChatMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<ThreadChatImageSource>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ThreadChatToolCall>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadChatImageSource {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub media_type: String,
+    pub data: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

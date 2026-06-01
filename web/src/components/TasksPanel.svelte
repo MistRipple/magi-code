@@ -81,18 +81,21 @@
 
   // ─── 任务投影视图 ─────────────────
   const currentSessionId = $derived(appState.currentSessionId);
-  const taskProjection = $derived(getTaskProjectionState(currentSessionId));
+  const currentWorkspaceId = $derived(appState.currentWorkspaceId);
+  const taskProjection = $derived(getTaskProjectionState(currentSessionId, currentWorkspaceId));
   const hasTaskProjection = $derived(taskProjection.projection !== null);
 
   $effect(() => {
-    ensureTaskProjectionState(currentSessionId);
+    ensureTaskProjectionState(currentSessionId, currentWorkspaceId);
   });
 
   $effect(() => {
     const sid = currentSessionId?.trim() || '';
+    const workspaceId = currentWorkspaceIdValue();
+    const requestScope = taskSessionScope(workspaceId, sid);
     taskHistoryFetchGeneration += 1;
     const generation = taskHistoryFetchGeneration;
-    taskHistoryRequestScope = sid;
+    taskHistoryRequestScope = requestScope;
     taskHistoryItems = [];
     taskHistoryError = null;
     taskHistoryExpanded = false;
@@ -100,7 +103,7 @@
       taskHistoryLoading = false;
       return;
     }
-    void loadSessionTaskHistory(sid, generation);
+    void loadSessionTaskHistory(sid, workspaceId, generation);
   });
   const projectionTasks = $derived(taskProjection.projection?.tasks ?? []);
   const taskById = $derived.by(() => new Map(projectionTasks.map((task) => [task.task_id, task])));
@@ -154,7 +157,8 @@
   $effect(() => {
     const rootTaskId = taskProjection.projection?.root_task.task_id;
     const sid = currentSessionId?.trim() || '';
-    const nextScope = rootTaskId && sid ? `${sid}:${rootTaskId}` : '';
+    const workspaceId = currentWorkspaceIdValue();
+    const nextScope = rootTaskId && sid ? `${taskSessionScope(workspaceId, sid)}:${rootTaskId}` : '';
 
     if (deliveryPackageScope !== nextScope) {
       deliveryPackageScope = nextScope;
@@ -576,12 +580,12 @@
 
   $effect(() => {
     const nextScope = taskProjection.projection
-      ? `${currentSessionId ?? ''}:${taskProjection.projection.root_task.task_id}`
+      ? `${taskSessionScope(currentWorkspaceIdValue(), currentSessionId?.trim() || '')}:${taskProjection.projection.root_task.task_id}`
       : '';
     if (referenceSelectionScope !== nextScope) {
       referenceSelectionScope = nextScope;
       selectedTaskReference = null;
-      selectTaskProjectionTask(currentSessionId, null);
+      selectTaskProjectionTask(currentSessionId, null, currentWorkspaceIdValue());
     }
   });
 
@@ -610,29 +614,35 @@
       : '';
   }
 
+  function taskSessionScope(workspaceId: string, sessionId: string): string {
+    return workspaceId ? `${workspaceId}\u0000${sessionId}` : `session:${sessionId}`;
+  }
+
   async function loadSessionTaskHistory(
     sessionId: string,
+    workspaceId: string,
     generation = taskHistoryFetchGeneration,
   ) {
     const sid = sessionId.trim();
     if (!sid) return;
+    const requestScope = taskSessionScope(workspaceId, sid);
     taskHistoryLoading = true;
     taskHistoryError = null;
     const client = createClient();
     try {
-      const response = await client.getSessionTaskHistory(sid, TASK_HISTORY_REQUEST_LIMIT, currentWorkspaceIdValue());
-      if (taskHistoryRequestScope !== sid || taskHistoryFetchGeneration !== generation) {
+      const response = await client.getSessionTaskHistory(sid, TASK_HISTORY_REQUEST_LIMIT, workspaceId);
+      if (taskHistoryRequestScope !== requestScope || taskHistoryFetchGeneration !== generation) {
         return;
       }
       taskHistoryItems = response.items;
     } catch (err) {
-      if (taskHistoryRequestScope !== sid || taskHistoryFetchGeneration !== generation) {
+      if (taskHistoryRequestScope !== requestScope || taskHistoryFetchGeneration !== generation) {
         return;
       }
       console.warn('[TasksPanel] task history load failed:', err);
       taskHistoryError = i18n.t('tasks.historyLoadFailed');
     } finally {
-      if (taskHistoryRequestScope === sid && taskHistoryFetchGeneration === generation) {
+      if (taskHistoryRequestScope === requestScope && taskHistoryFetchGeneration === generation) {
         taskHistoryLoading = false;
       }
     }
@@ -642,7 +652,7 @@
     const sessionId = currentSessionIdValue();
     if (!sessionId) return;
     taskHistoryFetchGeneration += 1;
-    await loadSessionTaskHistory(sessionId, taskHistoryFetchGeneration);
+    await loadSessionTaskHistory(sessionId, currentWorkspaceIdValue(), taskHistoryFetchGeneration);
   }
 
   function currentRootTaskId(): string | null {
@@ -682,7 +692,7 @@
       const client = createClient();
       await client.interruptTask({ taskId: rootTaskId, sessionId, workspaceId: currentWorkspaceIdValue() });
       clearDeliveryPackageViewState();
-      await refreshTaskProjection(sessionId);
+      await refreshTaskProjection(sessionId, currentWorkspaceIdValue());
       addToast('info', i18n.t('tasks.action.stopped'));
     }).catch((err) => {
       reportTaskActionFailure('tasks.action.stopFailed', err);
@@ -697,7 +707,7 @@
       const client = createClient();
       await client.continueSession({ sessionId, workspaceId: currentWorkspaceIdValue() });
       clearDeliveryPackageViewState();
-      await refreshTaskProjection(sessionId);
+      await refreshTaskProjection(sessionId, currentWorkspaceIdValue());
       addToast('success', i18n.t('tasks.action.resumed'));
     }).catch((err) => {
       reportTaskActionFailure('tasks.action.resumeFailed', err);
@@ -713,9 +723,9 @@
       const result = await client.restartTask({ taskId: rootTaskId, sessionId, workspaceId: currentWorkspaceIdValue() });
       clearDeliveryPackageViewState();
       if (result.rootTaskId) {
-        await fetchTaskProjection(sessionId, result.rootTaskId);
+        await fetchTaskProjection(sessionId, result.rootTaskId, currentWorkspaceIdValue());
       } else {
-        await refreshTaskProjection(sessionId);
+        await refreshTaskProjection(sessionId, currentWorkspaceIdValue());
       }
       await refreshSessionTaskHistory();
       addToast('success', i18n.t('tasks.action.restarted'));
@@ -732,7 +742,7 @@
       const client = createClient();
       await client.archiveTask({ taskId: rootTaskId, sessionId, workspaceId: currentWorkspaceIdValue() });
       clearDeliveryPackageViewState();
-      clearTaskProjection(sessionId, rootTaskId);
+      clearTaskProjection(sessionId, rootTaskId, currentWorkspaceIdValue());
       await refreshSessionTaskHistory();
       addToast('info', i18n.t('tasks.action.archived'));
     }).catch((err) => {
@@ -749,9 +759,9 @@
       const result = await client.restartTask({ taskId: rootTaskId, sessionId, workspaceId: currentWorkspaceIdValue() });
       clearDeliveryPackageViewState();
       if (result.rootTaskId) {
-        await fetchTaskProjection(sessionId, result.rootTaskId);
+        await fetchTaskProjection(sessionId, result.rootTaskId, currentWorkspaceIdValue());
       } else {
-        await refreshTaskProjection(sessionId);
+        await refreshTaskProjection(sessionId, currentWorkspaceIdValue());
       }
       await refreshSessionTaskHistory();
       addToast('success', i18n.t('tasks.action.restarted'));
@@ -803,7 +813,7 @@
   }
 
   function selectProjectionTask(taskId: string) {
-    selectTaskProjectionTask(currentSessionId, taskId);
+    selectTaskProjectionTask(currentSessionId, taskId, currentWorkspaceIdValue());
     if (selectedTaskReference?.sourceLabel.startsWith(i18n.t('tasks.reference.source.taskDetailPrefix'))) {
       selectedTaskReference = null;
     }
@@ -1168,7 +1178,7 @@
                 class="task-detail-close"
                 title={i18n.t('tasks.detail.closeTitle')}
                 aria-label={i18n.t('tasks.detail.closeTitle')}
-                onclick={() => selectTaskProjectionTask(currentSessionId, null)}
+                onclick={() => selectTaskProjectionTask(currentSessionId, null, currentWorkspaceIdValue())}
               >
                 <Icon name="close" size={11} />
               </button>

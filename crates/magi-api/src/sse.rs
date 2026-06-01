@@ -1,4 +1,10 @@
-use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::{
+    http::{HeaderName, HeaderValue, header},
+    response::{
+        IntoResponse, Response,
+        sse::{Event, KeepAlive, Sse},
+    },
+};
 use futures_util::{Stream, StreamExt, stream};
 use magi_core::{EventId, UtcMillis, WorkspaceId};
 use magi_event_bus::{EventContext, EventEnvelope};
@@ -7,21 +13,31 @@ use tokio_stream::wrappers::{BroadcastStream, errors::BroadcastStreamRecvError};
 
 use crate::state::ApiState;
 
-pub async fn events(
-    state: ApiState,
-    workspace_id: Option<String>,
-) -> Sse<impl futures_util::stream::Stream<Item = Result<Event, Infallible>>> {
+pub async fn events(state: ApiState, workspace_id: Option<String>) -> Response {
     let workspace_id = workspace_id
         .map(|workspace_id| workspace_id.trim().to_string())
         .filter(|workspace_id| !workspace_id.is_empty())
         .map(|workspace_id| WorkspaceId::new(workspace_id));
-    let stream = event_envelope_stream(state, workspace_id).map(|event| Ok(event_to_sse(event)));
+    let stream = event_envelope_stream(state, workspace_id)
+        .map(|event| Ok::<Event, Infallible>(event_to_sse(event)));
 
-    Sse::new(stream).keep_alive(
-        KeepAlive::new()
-            .interval(Duration::from_secs(15))
-            .text("keep-alive"),
-    )
+    let mut response = Sse::new(stream)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(Duration::from_secs(5))
+                .event(keep_alive_sse_event()),
+        )
+        .into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-cache, no-transform"),
+    );
+    headers.insert(
+        HeaderName::from_static("x-accel-buffering"),
+        HeaderValue::from_static("no"),
+    );
+    response
 }
 
 fn event_envelope_stream(
@@ -84,6 +100,23 @@ fn event_to_sse(event: EventEnvelope) -> Event {
         .data(payload)
 }
 
+fn keep_alive_sse_event() -> Event {
+    let payload =
+        serde_json::to_string(&keep_alive_event_envelope()).unwrap_or_else(|_| "{}".to_string());
+    Event::default().data(payload)
+}
+
+fn keep_alive_event_envelope() -> EventEnvelope {
+    EventEnvelope::system(
+        EventId::new("event-stream-keep-alive"),
+        "event.stream.keep_alive",
+        serde_json::json!({
+            "heartbeat": true,
+            "transport": "sse",
+        }),
+    )
+}
+
 fn lagged_recovery_event(skipped: u64, workspace_id: Option<&WorkspaceId>) -> EventEnvelope {
     let now = UtcMillis::now();
     EventEnvelope::system(
@@ -128,6 +161,31 @@ mod tests {
 
     fn workspace_id(id: &str) -> WorkspaceId {
         WorkspaceId::new(id)
+    }
+
+    #[tokio::test]
+    async fn events_response_disables_proxy_buffering() {
+        let response = events(test_state(), Some("workspace-a".to_string())).await;
+
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL),
+            Some(&HeaderValue::from_static("no-cache, no-transform"))
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(HeaderName::from_static("x-accel-buffering")),
+            Some(&HeaderValue::from_static("no"))
+        );
+    }
+
+    #[test]
+    fn keep_alive_event_is_parseable_event_envelope() {
+        let event = keep_alive_event_envelope();
+
+        assert_eq!(event.event_type, "event.stream.keep_alive");
+        assert_eq!(event.category, magi_event_bus::EventCategory::System);
+        assert_eq!(event.payload["heartbeat"], json!(true));
     }
 
     #[test]

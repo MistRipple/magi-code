@@ -24,6 +24,7 @@ use crate::{
     },
     errors::ApiError,
     state::ApiState,
+    tunnel::RemoteAccessBinding,
 };
 
 pub fn routes() -> Router<ApiState> {
@@ -639,14 +640,20 @@ async fn browse_filesystem(
 #[serde(rename_all = "camelCase")]
 struct StartTunnelRequest {
     workspace_id: Option<String>,
+    workspace_path: Option<String>,
+    session_id: Option<String>,
 }
 
 async fn start_tunnel(
     State(state): State<ApiState>,
     Json(request): Json<StartTunnelRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let ws_id = request.workspace_id.as_deref();
-    let tunnel_state = state.tunnel_manager.start(ws_id).await;
+    let binding = RemoteAccessBinding::new(
+        request.workspace_id.as_deref(),
+        request.workspace_path.as_deref(),
+        request.session_id.as_deref(),
+    );
+    let tunnel_state = state.tunnel_manager.start(binding).await;
     Ok(Json(
         serde_json::to_value(&tunnel_state).unwrap_or_default(),
     ))
@@ -671,12 +678,12 @@ async fn lan_access_status(
     let ip = resolve_preferred_lan_ipv4();
     let port = state.tunnel_manager.local_port().await;
 
-    // 从 query 参数获取 workspaceId，构造完整的 web 访问 URL
-    let workspace_id = query.get("workspaceId").cloned().unwrap_or_default();
-    let mut url = format!("http://{}:{}/web.html", ip, port);
-    if !workspace_id.is_empty() {
-        url = format!("{}?workspaceId={}", url, workspace_id);
-    }
+    let binding = RemoteAccessBinding::new(
+        query.get("workspaceId").map(String::as_str),
+        query.get("workspacePath").map(String::as_str),
+        query.get("sessionId").map(String::as_str),
+    );
+    let url = binding.web_access_url(&format!("http://{}:{}/web.html", ip, port), None);
 
     Json(serde_json::json!({
         "enabled": true,
@@ -1030,7 +1037,7 @@ mod tests {
             .with_state(state)
             .oneshot(
                 Request::builder()
-                    .uri("/lan-access?workspaceId=workspace-lan-access")
+                    .uri("/lan-access?workspaceId=workspace-lan-access&workspacePath=%2Ftmp%2Fmagi%20test&sessionId=session-lan-access")
                     .method("GET")
                     .body(Body::empty())
                     .expect("request should build"),
@@ -1051,6 +1058,9 @@ mod tests {
                 .expect("url should be string")
                 .contains(":39219/web.html?workspaceId=workspace-lan-access")
         );
+        let url = payload["url"].as_str().expect("url should be string");
+        assert!(url.contains("workspacePath=%2Ftmp%2Fmagi%20test"));
+        assert!(url.contains("sessionId=session-lan-access"));
     }
 
     #[tokio::test]

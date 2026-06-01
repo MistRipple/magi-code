@@ -43,6 +43,7 @@ import {
 import type {
   AppState, Message, Session,
   Edit,
+  TimelineProjectionArtifact,
   ModelStatus, ModelStatusMap, ModelStatusType, OrchestratorRuntimeState,
 } from '../types/message';
 import type { StandardMessage, ContentBlock as StandardContentBlock } from '../shared/protocol/message-protocol';
@@ -67,6 +68,25 @@ import {
 
 function normalizeStateSliceVersion(value: unknown): number {
   return typeof value === 'number' && Number.isFinite(value) ? Math.floor(value) : 0;
+}
+
+function currentWorkspaceIdValue(): string {
+  return typeof messagesState.currentWorkspaceId === 'string'
+    ? messagesState.currentWorkspaceId.trim()
+    : '';
+}
+
+function clearCurrentSessionBeforeWorkspaceChange(nextWorkspaceId: string): void {
+  const currentWorkspaceId = currentWorkspaceIdValue();
+  const normalizedNextWorkspaceId = typeof nextWorkspaceId === 'string' ? nextWorkspaceId.trim() : '';
+  if (
+    normalizedNextWorkspaceId
+    && currentWorkspaceId
+    && normalizedNextWorkspaceId !== currentWorkspaceId
+    && messagesState.currentSessionId
+  ) {
+    setCurrentSessionId(null);
+  }
 }
 
 const MODEL_STATUS_TYPES = new Set<ModelStatusType>([
@@ -233,6 +253,15 @@ function handleStateUpdate(
   if (!state) return;
   const incomingSessionId = typeof state.currentSessionId === 'string' ? state.currentSessionId.trim() : '';
   const currentSessionId = getState().currentSessionId?.trim() || '';
+  const incomingWorkspaceId = typeof state.currentWorkspaceId === 'string' ? state.currentWorkspaceId.trim() : '';
+  const currentWorkspaceId = getState().currentWorkspaceId?.trim() || '';
+  if (incomingWorkspaceId && currentWorkspaceId && incomingWorkspaceId !== currentWorkspaceId) {
+    console.warn('[MessageHandler] 忽略非当前工作区的 stateUpdate', {
+      incomingWorkspaceId,
+      currentWorkspaceId,
+    });
+    return;
+  }
   if (incomingSessionId && currentSessionId && incomingSessionId !== currentSessionId) {
     console.warn('[MessageHandler] 忽略非当前会话的 stateUpdate', {
       incomingSessionId,
@@ -494,11 +523,14 @@ export function handleUnifiedData(standard: StandardMessage) {
           clearPendingInteractions();
           clearProcessingState({ skipAntiLiftBack: true });
         }
-        setCurrentSessionId(null);
-        messagesState.currentWorkspaceId = typeof payload.workspaceId === 'string' && payload.workspaceId.trim()
+        const nextWorkspaceId = typeof payload.workspaceId === 'string' && payload.workspaceId.trim()
           ? payload.workspaceId.trim()
-          : messagesState.currentWorkspaceId;
+          : currentWorkspaceIdValue();
+        clearCurrentSessionBeforeWorkspaceChange(nextWorkspaceId);
+        messagesState.currentWorkspaceId = nextWorkspaceId || messagesState.currentWorkspaceId;
         messagesState.currentWorkspacePath = typeof payload.workspacePath === 'string' ? payload.workspacePath.trim() : '';
+        updateSessions([]);
+        setCurrentSessionId(null);
         if (!hasPendingLocalTurn) {
           setQueuedMessages([]);
           clearCanonicalSessionTurns();
@@ -507,6 +539,9 @@ export function handleUnifiedData(standard: StandardMessage) {
         setAppState({
           ...buildEmptyWorkspaceAppState(Date.now()),
           currentSessionId: '',
+          currentWorkspaceId: messagesState.currentWorkspaceId,
+          currentWorkspacePath: messagesState.currentWorkspacePath,
+          sessions: [],
         });
       });
       break;
@@ -663,14 +698,15 @@ function handleEmptyWorkspaceStateLoaded(message: ClientBridgeMessage) {
       clearPendingInteractions();
       clearProcessingState({ skipAntiLiftBack: true });
     }
-    updateSessions([]);
     setCurrentSessionId(null);
     messagesState.currentWorkspaceId = workspaceId || messagesState.currentWorkspaceId;
     messagesState.currentWorkspacePath = workspacePath;
+    updateSessions([]);
     setAppState({
       ...state,
       sessions: [],
       currentSessionId: '',
+      currentWorkspaceId: workspaceId,
       pendingChanges: [],
       tasks: [],
       edits: [],
@@ -773,6 +809,39 @@ function hasPendingLocalRequest(): boolean {
   return messagesState.pendingRequests.size > 0;
 }
 
+function canonicalTurnsForSession(sessionId: string, turns: unknown): CanonicalTurn[] {
+  if (!Array.isArray(turns)) {
+    return [];
+  }
+  return (turns as CanonicalTurn[])
+    .filter((turn) => turn?.sessionId === sessionId)
+    .sort((left, right) => left.turnSeq - right.turnSeq || left.turnId.localeCompare(right.turnId));
+}
+
+function latestProjectedTurnSeq(): number {
+  return ensureArray<TimelineProjectionArtifact>(messagesState.canonicalTimelineProjection?.artifacts)
+    .reduce((latest, artifact) => {
+      const metadata = artifact?.message?.metadata;
+      const turnSeq = metadata && typeof metadata === 'object'
+        ? (metadata as Record<string, unknown>).turnSeq
+        : undefined;
+      return typeof turnSeq === 'number' && Number.isFinite(turnSeq)
+        ? Math.max(latest, Math.floor(turnSeq))
+        : latest;
+    }, 0);
+}
+
+function snapshotHasTerminalTurnAtOrAfterLocalProjection(turns: CanonicalTurn[]): boolean {
+  const localLatestTurnSeq = latestProjectedTurnSeq();
+  if (localLatestTurnSeq <= 0) {
+    return false;
+  }
+  return turns.some((turn) => (
+    turn.turnSeq >= localLatestTurnSeq
+    && isCanonicalTerminalStatus(turn.status)
+  ));
+}
+
 function reconcileRequestBindingsFromAuthoritativeThread(sessionId: string): void {
   const currentSessionId = getState().currentSessionId || '';
   if (!sessionId || !currentSessionId || currentSessionId !== sessionId) {
@@ -826,9 +895,7 @@ function applyCanonicalTurnsSnapshot(sessionId: string, turns: unknown): boolean
   if (!Array.isArray(turns)) {
     return false;
   }
-  const canonicalTurns = (turns as CanonicalTurn[])
-    .filter((turn) => turn?.sessionId === sessionId)
-    .sort((left, right) => left.turnSeq - right.turnSeq || left.turnId.localeCompare(right.turnId));
+  const canonicalTurns = canonicalTurnsForSession(sessionId, turns);
   const projection = replaceCanonicalSessionTurns(sessionId, canonicalTurns);
   if (!projection) {
     return false;
@@ -875,16 +942,18 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
         messagesState.canonicalTimelineProjection = null;
         setQueuedMessages([]);
       }
-      updateSessions(sessions);
-      setCurrentSessionId(null);
+      clearCurrentSessionBeforeWorkspaceChange(workspaceId);
       messagesState.currentWorkspaceId = workspaceId || messagesState.currentWorkspaceId;
       messagesState.currentWorkspacePath = workspacePath;
+      updateSessions(sessions);
+      setCurrentSessionId(null);
       setSessionHistoryState(null, { workspaceId });
       setAppState({
         ...state,
         sessions,
         currentSession: undefined,
         currentSessionId: '',
+        currentWorkspaceId: workspaceId,
         isProcessing: false,
         processingState: null,
       });
@@ -894,34 +963,40 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
   }
 
   const currentSessionId = getState().currentSessionId || '';
-  const isSameSession = currentSessionId === sessionId;
+  const currentWorkspaceId = getState().currentWorkspaceId?.trim() || '';
+  const isSameSession = currentSessionId === sessionId
+    && (!workspaceId || !currentWorkspaceId || workspaceId === currentWorkspaceId);
 
-  // 同 session 恢复（SSE 重连 / 后端重启）：活跃轮次期间只同步非时间线状态，
-  // 避免 bootstrap 快照整包替换 live 过程态；空闲时再接管权威历史投影。
+  // 同 session 恢复（SSE 重连 / 后端重启）：活跃轮次期间避免旧 idle 快照覆盖 live 过程态；
+  // 一旦权威快照已包含追上本地轮次的终态 turn，立即接管完整历史并收敛运行态。
   if (isSameSession) {
     batchWebviewStatePersistence(() => {
       messagesState.sessionHydrating = false;
       const snapshot = message as ClientBridgeMessage & SessionBootstrapSnapshot;
       const sessions = ensureArray(snapshot.sessions) as Session[];
-      if (sessions.length > 0) {
-        updateSessions(sessions);
-      }
       messagesState.currentWorkspaceId = workspaceId || messagesState.currentWorkspaceId;
       messagesState.currentWorkspacePath = workspacePath || messagesState.currentWorkspacePath;
+      updateSessions(sessions);
       const hadLiveTurnBeforeSnapshot = hasActiveLocalTimelineTurn();
       const hadPendingLocalRequestBeforeSnapshot = hasPendingLocalRequest();
       const authoritativeSnapshotIsIdle = state.isProcessing !== true
         && state.processingState?.isProcessing !== true;
+      const canonicalSessionTurns = canonicalTurnsForSession(sessionId, canonicalTurns);
+      const terminalSnapshotCaughtUpLocalTurn = authoritativeSnapshotIsIdle
+        && snapshotHasTerminalTurnAtOrAfterLocalProjection(canonicalSessionTurns);
+      const shouldApplyCanonicalSnapshot = !hadLiveTurnBeforeSnapshot || terminalSnapshotCaughtUpLocalTurn;
       const preserveLocalTurnDuringStaleIdle = hadLiveTurnBeforeSnapshot
         && hadPendingLocalRequestBeforeSnapshot
-        && authoritativeSnapshotIsIdle;
+        && authoritativeSnapshotIsIdle
+        && !terminalSnapshotCaughtUpLocalTurn;
 
       handleStateUpdate({
         ...message,
         state: {
           ...state,
           currentSessionId: sessionId,
-          sessions: sessions.length > 0 ? sessions : state.sessions,
+          currentWorkspaceId: workspaceId,
+          sessions,
         },
       }, { preserveLocalProcessing: preserveLocalTurnDuringStaleIdle });
 
@@ -942,11 +1017,11 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
         preserveLoadedWindow: true,
       });
 
-      if (!hadLiveTurnBeforeSnapshot) {
-        applyCanonicalTurnsSnapshot(sessionId, canonicalTurns);
+      if (shouldApplyCanonicalSnapshot) {
+        applyCanonicalTurnsSnapshot(sessionId, canonicalSessionTurns);
         reconcileRequestBindingsFromAuthoritativeThread(sessionId);
       }
-      if (authoritativeSnapshotIsIdle && !hadLiveTurnBeforeSnapshot) {
+      if (authoritativeSnapshotIsIdle && shouldApplyCanonicalSnapshot) {
         settleAuthoritativeIdleState();
       }
     });
@@ -971,11 +1046,10 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
 
     const snapshot = message as ClientBridgeMessage & SessionBootstrapSnapshot;
     const sessions = ensureArray(snapshot.sessions) as Session[];
-    if (sessions.length > 0) {
-      updateSessions(sessions);
-    }
+    clearCurrentSessionBeforeWorkspaceChange(workspaceId);
     messagesState.currentWorkspaceId = workspaceId || messagesState.currentWorkspaceId;
     messagesState.currentWorkspacePath = workspacePath || messagesState.currentWorkspacePath;
+    updateSessions(sessions);
 
     setCurrentSessionId(sessionId);
     applyCanonicalTurnsSnapshot(sessionId, canonicalTurns);
@@ -984,7 +1058,8 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
       state: {
         ...state,
         currentSessionId: sessionId,
-        sessions: sessions.length > 0 ? sessions : state.sessions,
+        currentWorkspaceId: workspaceId,
+        sessions,
       },
     });
     replaceOrchestratorRuntimeState(

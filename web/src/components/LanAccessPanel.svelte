@@ -22,8 +22,25 @@
   let tunnelCopied = $state(false);
   let tunnelBusy = $state(false);
 
-  function currentWorkspaceId(): string {
-    return new URLSearchParams(window.location.search).get('workspaceId') || '';
+  function currentBindingValue(name: string): string {
+    return new URLSearchParams(window.location.search).get(name) || '';
+  }
+
+  function currentAccessBinding(): { workspaceId: string; workspacePath: string; sessionId: string } {
+    return {
+      workspaceId: currentBindingValue('workspaceId'),
+      workspacePath: currentBindingValue('workspacePath'),
+      sessionId: currentBindingValue('sessionId'),
+    };
+  }
+
+  function currentAccessBindingQuery(): string {
+    const binding = currentAccessBinding();
+    const query = new URLSearchParams();
+    if (binding.workspaceId) query.set('workspaceId', binding.workspaceId);
+    if (binding.workspacePath) query.set('workspacePath', binding.workspacePath);
+    if (binding.sessionId) query.set('sessionId', binding.sessionId);
+    return query.toString();
   }
 
   async function renderQR(url: string): Promise<string> {
@@ -36,8 +53,8 @@
   async function requestLanInfo() {
     loading = true; lanUrl = ''; qrSvg = ''; qrError = '';
     try {
-      const wsId = currentWorkspaceId();
-      const res = await fetch(`${resolveAgentBaseUrl()}/api/lan-access?workspaceId=${encodeURIComponent(wsId)}`);
+      const query = currentAccessBindingQuery();
+      const res = await fetch(`${resolveAgentBaseUrl()}/api/lan-access${query ? `?${query}` : ''}`);
       const data = await res.json();
       if (data?.url) {
         lanUrl = data.url;
@@ -89,11 +106,12 @@
     tunnelBusy = true;
     const action = tunnelStatus === 'running' ? 'stop' : 'start';
     try {
+      const binding = currentAccessBinding();
       const init: RequestInit = action === 'start'
         ? {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ workspaceId: currentWorkspaceId() }),
+            body: JSON.stringify(binding),
           }
         : { method: 'POST' };
       const res = await fetch(`${resolveAgentBaseUrl()}/api/tunnel/${action}`, init);

@@ -63,6 +63,7 @@ mod tests {
             message_history: vec![magi_session_store::ThreadChatMessage {
                 role: "user".to_string(),
                 content: Some("历史任务：写 validation_auto_save_marker.txt".to_string()),
+                images: Vec::new(),
                 tool_calls: Vec::new(),
                 tool_call_id: None,
             }],
