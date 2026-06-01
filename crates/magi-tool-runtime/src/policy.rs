@@ -746,6 +746,10 @@ pub fn tool_path_access_requests(
                 object,
                 &[
                     "path",
+                    "file_path",
+                    "filePath",
+                    "filepath",
+                    "file",
                     "root",
                     "cwd",
                     "working_directory",

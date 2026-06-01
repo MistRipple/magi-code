@@ -2851,10 +2851,10 @@ fn execute_code_symbols(
     };
 
     match action.as_str() {
-        "definition" => {
+        "definition" | "goto_definition" => {
             let Some(name) = request
                 .as_ref()
-                .and_then(|obj| field_string(obj, &["name", "symbol"]))
+                .and_then(|obj| field_string(obj, &["name", "symbol", "query"]))
             else {
                 return builtin_error("code_symbols", "action=definition 需要 name 字段");
             };
@@ -2879,11 +2879,10 @@ fn execute_code_symbols(
             })
             .to_string()
         }
-        "file_symbols" => {
-            let Some(path) = request
-                .as_ref()
-                .and_then(|obj| field_string(obj, &["path", "file", "filepath"]))
-            else {
+        "file_symbols" | "list_file_symbols" => {
+            let Some(path) = request.as_ref().and_then(|obj| {
+                field_string(obj, &["path", "file", "file_path", "filePath", "filepath"])
+            }) else {
                 return builtin_error("code_symbols", "action=file_symbols 需要 path 字段");
             };
             let Some(symbols) = store.list_file_symbols(workspace_id, &path) else {
