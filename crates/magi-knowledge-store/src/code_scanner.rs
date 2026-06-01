@@ -307,7 +307,7 @@ fn scan_directory(root: &Path, current: &Path, files: &mut Vec<ScannedFile>) {
         } else if path.is_file() {
             if let Some(relative) = pathdiff::diff_paths(&path, root) {
                 let rel_str = relative.to_string_lossy().replace('\\', "/");
-                if should_index(&rel_str) {
+                if is_indexable_code_path(&rel_str) {
                     if let Ok(metadata) = std::fs::metadata(&path) {
                         let size = metadata.len();
                         let lines = count_lines(&path);
@@ -329,7 +329,23 @@ fn should_ignore(name: &str) -> bool {
     IGNORE_PATTERNS.iter().any(|pattern| name == *pattern)
 }
 
-fn should_index(path: &str) -> bool {
+/// 判定相对路径是否应进入本地代码索引。
+///
+/// 全量扫描和文件监听增量更新必须共用同一规则，否则长期运行后索引会偏离初始扫描范围。
+pub(crate) fn is_indexable_code_path(path: &str) -> bool {
+    !has_ignored_component(path) && has_indexed_extension(path)
+}
+
+fn has_ignored_component(path: &str) -> bool {
+    Path::new(path).components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::Normal(name) if name.to_str().is_some_and(should_ignore)
+        )
+    })
+}
+
+fn has_indexed_extension(path: &str) -> bool {
     let ext = std::path::Path::new(path)
         .extension()
         .and_then(|e| e.to_str())

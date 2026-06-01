@@ -329,7 +329,13 @@ impl LocalSearchEngine {
         if !self.is_ready {
             return;
         }
-        let relative = self.to_relative(file_path);
+        let Some(relative) = self.to_workspace_relative(file_path) else {
+            return;
+        };
+        if !crate::code_scanner::is_indexable_code_path(&relative) {
+            self.remove_stale_indexed_file(&relative);
+            return;
+        }
         let file_type = self.ensure_indexed_file_record(&relative, None);
         self.apply_changed_file(&relative, &file_type);
         self.refresh_project_vocabulary_if_needed();
@@ -356,7 +362,16 @@ impl LocalSearchEngine {
     }
 
     pub fn on_file_created(&mut self, file_path: &str) {
-        let relative = self.to_relative(file_path);
+        if !self.is_ready {
+            return;
+        }
+        let Some(relative) = self.to_workspace_relative(file_path) else {
+            return;
+        };
+        if !crate::code_scanner::is_indexable_code_path(&relative) {
+            self.remove_stale_indexed_file(&relative);
+            return;
+        }
         let file_type = classify_file_type(&relative);
         self.ensure_indexed_file_record(&relative, Some(&file_type));
         self.apply_changed_file(&relative, &file_type);
@@ -369,7 +384,9 @@ impl LocalSearchEngine {
         if !self.is_ready {
             return;
         }
-        let relative = self.to_relative(file_path);
+        let Some(relative) = self.to_workspace_relative(file_path) else {
+            return;
+        };
         self.apply_deleted_file(&relative);
         self.refresh_project_vocabulary_if_needed();
         self.bump_index_version();
@@ -498,6 +515,20 @@ impl LocalSearchEngine {
         self.symbol_index.remove_file(relative_path);
         self.dependency_graph.remove_file(relative_path);
         self.search_cache.invalidate_by_file(relative_path);
+    }
+
+    fn remove_stale_indexed_file(&mut self, relative_path: &str) {
+        if !self
+            .indexed_files
+            .iter()
+            .any(|(path, _)| path == relative_path)
+        {
+            return;
+        }
+        self.apply_deleted_file(relative_path);
+        self.refresh_project_vocabulary_if_needed();
+        self.bump_index_version();
+        self.save_index();
     }
 
     fn ensure_indexed_file_record(
@@ -768,15 +799,14 @@ impl LocalSearchEngine {
         results
     }
 
-    fn to_relative(&self, file_path: &str) -> String {
-        if Path::new(file_path).is_absolute() {
-            Path::new(file_path)
-                .strip_prefix(&self.project_root)
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_else(|_| file_path.to_string())
+    fn to_workspace_relative(&self, file_path: &str) -> Option<String> {
+        let path = Path::new(file_path);
+        let relative = if path.is_absolute() {
+            path.strip_prefix(&self.project_root).ok()?
         } else {
-            file_path.to_string()
-        }
+            path
+        };
+        Some(relative.to_string_lossy().replace('\\', "/"))
     }
 }
 
@@ -1013,5 +1043,62 @@ mod tests {
         let engine =
             LocalSearchEngine::new("/tmp/nonexistent_12345", SearchEngineConfig::default());
         assert!(!engine.is_ready());
+    }
+
+    #[test]
+    fn incremental_updates_keep_scan_indexing_rules() {
+        let root = std::env::temp_dir().join(format!(
+            "magi-local-search-incremental-filter-{}-{}",
+            std::process::id(),
+            now_millis()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).expect("create src");
+        std::fs::write(
+            root.join("src/seed.rs"),
+            "pub fn searchable_seed_symbol() -> bool { true }\n",
+        )
+        .expect("write seed");
+
+        let mut engine = LocalSearchEngine::new(
+            root.to_string_lossy().as_ref(),
+            SearchEngineConfig::default(),
+        );
+        engine.build_index(&[("src/seed.rs".to_string(), "source".to_string())]);
+        assert_eq!(engine.get_stats().total_documents, 1);
+
+        std::fs::create_dir_all(root.join("target")).expect("create target");
+        std::fs::write(
+            root.join("target/generated.rs"),
+            "pub fn ignored_target_symbol() -> bool { true }\n",
+        )
+        .expect("write ignored target file");
+        std::fs::write(root.join("scratch.txt"), "ignored plain text marker\n")
+            .expect("write ignored text file");
+
+        engine.on_file_created(root.join("target/generated.rs").to_string_lossy().as_ref());
+        engine.on_file_created(root.join("scratch.txt").to_string_lossy().as_ref());
+        assert_eq!(
+            engine.get_stats().total_documents,
+            1,
+            "增量更新必须沿用全量扫描的忽略目录和扩展名规则"
+        );
+
+        std::fs::write(
+            root.join("src/added.rs"),
+            "pub fn accepted_added_symbol() -> bool { true }\n",
+        )
+        .expect("write accepted file");
+        engine.on_file_created(root.join("src/added.rs").to_string_lossy().as_ref());
+        assert_eq!(engine.get_stats().total_documents, 2);
+        assert!(
+            engine
+                .search("accepted added symbol", SearchOptions::default())
+                .iter()
+                .any(|result| result.file_path == "src/added.rs"),
+            "正常源码文件仍应被增量索引"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
