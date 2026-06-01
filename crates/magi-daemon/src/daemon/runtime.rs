@@ -957,6 +957,7 @@ impl DaemonRuntime {
             llm_task_dispatcher,
             runner_result_receiver,
         )
+        .with_agent_role_registry(state.agent_role_registry.clone())
         .with_dispatch_gate(Arc::new(move |task| {
             if !task
                 .policy_snapshot

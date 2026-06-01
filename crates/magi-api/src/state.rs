@@ -87,6 +87,7 @@ pub struct RunnerManager {
     runners: Arc<Mutex<HashMap<String, Arc<RunnerHandle>>>>,
     task_store: Arc<TaskStore>,
     worker_catalog: Arc<dyn Fn() -> Vec<WorkerInfo> + Send + Sync>,
+    agent_role_registry: Arc<magi_agent_role::AgentRoleRegistry>,
     dispatcher: Option<Arc<dyn TaskDispatcher>>,
     dispatch_gate: Option<Arc<TaskDispatchGate>>,
     /// Shared result receiver that collects task completion/failure results
@@ -114,6 +115,7 @@ impl RunnerManager {
             runners: Arc::new(Mutex::new(HashMap::new())),
             task_store,
             worker_catalog,
+            agent_role_registry: Arc::new(magi_agent_role::AgentRoleRegistry::load_default()),
             dispatcher: Some(dispatcher),
             dispatch_gate: None,
             result_receiver,
@@ -132,6 +134,14 @@ impl RunnerManager {
         self
     }
 
+    pub fn with_agent_role_registry(
+        mut self,
+        registry: Arc<magi_agent_role::AgentRoleRegistry>,
+    ) -> Self {
+        self.agent_role_registry = registry;
+        self
+    }
+
     fn build_task_runner(&self) -> TaskRunner {
         let workers = self.resolved_workers();
         let dispatcher = self
@@ -144,6 +154,7 @@ impl RunnerManager {
             Arc::clone(dispatcher),
             Arc::clone(&self.result_receiver) as Arc<dyn TaskResultReceiver>,
         );
+        runner = runner.with_agent_role_registry((*self.agent_role_registry).clone());
         if let Some(gate) = &self.dispatch_gate {
             runner = runner.with_dispatch_gate(Arc::clone(gate));
         }
@@ -1912,7 +1923,10 @@ fn normalize_mcp_servers_section(snapshot: &mut HashMap<String, serde_json::Valu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use magi_core::{AbsolutePath, MissionId, Task, TaskKind};
+    use magi_agent_role::{AgentRole, AgentRoleRegistry, TaskKindLabel};
+    use magi_core::{AbsolutePath, MissionId, Task, TaskKind, WorkerId};
+    use magi_orchestrator::task_store::TaskLease;
+    use std::collections::HashMap;
     use std::time::Duration;
 
     fn task_with_status(task_id: &str, status: TaskStatus) -> Task {
@@ -1941,6 +1955,91 @@ mod tests {
             created_at: now,
             updated_at: now,
         }
+    }
+
+    struct RecordingDispatcher {
+        observed_role: Arc<Mutex<Option<String>>>,
+    }
+
+    impl TaskDispatcher for RecordingDispatcher {
+        fn dispatch(
+            &self,
+            _task: &Task,
+            worker: &WorkerInfo,
+            _lease: &TaskLease,
+        ) -> Result<(), String> {
+            *self
+                .observed_role
+                .lock()
+                .expect("observed role lock should not poison") = Some(worker.role.clone());
+            Ok(())
+        }
+    }
+
+    fn test_agent_role(id: &str) -> AgentRole {
+        AgentRole {
+            id: id.to_string(),
+            system_prompt: format!("{id} prompt"),
+            supported_kinds: vec![TaskKindLabel::LocalAgent],
+            parallelism_limit: None,
+            coordinator_mode: false,
+            version: 1,
+        }
+    }
+
+    #[test]
+    fn runner_manager_uses_injected_agent_role_registry_for_worker_matching() {
+        let store = Arc::new(TaskStore::new());
+        let mut task = task_with_status("task-custom-agent-role", TaskStatus::Pending);
+        task.root_task_id = task.task_id.clone();
+        task.executor_binding = Some(serde_json::json!({
+            "target_role": "auditor",
+        }));
+        let root_task_id = task.root_task_id.clone();
+        store.insert_task(task);
+
+        let observed_role = Arc::new(Mutex::new(None));
+        let dispatcher = Arc::new(RecordingDispatcher {
+            observed_role: observed_role.clone(),
+        });
+        let manager = RunnerManager::with_dispatcher_and_worker_catalog(
+            store,
+            Arc::new(|| {
+                vec![
+                    WorkerInfo {
+                        worker_id: WorkerId::new("worker-executor"),
+                        role: "executor".to_string(),
+                        supported_kinds: vec![TaskKind::LocalAgent],
+                        parallelism_limit: None,
+                        system_prompt_template: None,
+                    },
+                    WorkerInfo {
+                        worker_id: WorkerId::new("worker-auditor"),
+                        role: "auditor".to_string(),
+                        supported_kinds: vec![TaskKind::LocalAgent],
+                        parallelism_limit: None,
+                        system_prompt_template: None,
+                    },
+                ]
+            }),
+            dispatcher,
+            Arc::new(EventBasedResultReceiver::new()),
+        )
+        .with_agent_role_registry(Arc::new(AgentRoleRegistry::from_map(HashMap::from([
+            ("executor".to_string(), test_agent_role("executor")),
+            ("auditor".to_string(), test_agent_role("auditor")),
+        ]))));
+
+        let outcome = manager.build_task_runner().run_cycle(&root_task_id);
+
+        assert_eq!(outcome, RunCycleOutcome::Continue);
+        assert_eq!(
+            observed_role
+                .lock()
+                .expect("observed role lock should not poison")
+                .as_deref(),
+            Some("auditor")
+        );
     }
 
     #[test]
