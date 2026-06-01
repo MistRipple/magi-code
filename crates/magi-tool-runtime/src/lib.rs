@@ -2513,6 +2513,46 @@ mod tests {
     }
 
     #[test]
+    fn search_text_filesystem_failure_uses_public_error_message() {
+        let root = unique_temp_dir("magi-tool-search-text-error");
+        let missing_path = root.join("missing");
+        let governance = Arc::new(GovernanceService::default());
+        let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(16));
+        let mut tool_registry = ToolRegistry::new(governance, event_bus);
+        tool_registry.register_default_builtins();
+
+        let output = tool_registry.execute_with_policy(
+            ToolExecutionInput {
+                tool_call_id: ToolCallId::new("tool-call-search-text-error"),
+                tool_name: BuiltinToolName::SearchText.as_str().to_string(),
+                tool_kind: ToolKind::Builtin,
+                input: serde_json::json!({
+                    "query": "needle",
+                    "root": missing_path.to_string_lossy(),
+                })
+                .to_string(),
+                approval_requirement: ApprovalRequirement::None,
+                risk_level: RiskLevel::Low,
+            },
+            ToolExecutionContext::default(),
+            &ToolExecutionPolicy::default(),
+        );
+
+        assert_eq!(output.status, ExecutionResultStatus::Failed);
+        let payload: Value = serde_json::from_str(&output.payload).expect("payload json");
+        assert_eq!(payload["tool"], "search_text");
+        assert_eq!(payload["status"], "failed");
+        assert_eq!(payload["error"], "文本搜索暂不可用，请检查路径或权限");
+        assert!(
+            !output.payload.contains("missing")
+                && !output.payload.contains("No such")
+                && !output.payload.contains("os error"),
+            "搜索工具失败结果不能暴露底层路径或 IO 错误: {}",
+            output.payload
+        );
+    }
+
+    #[test]
     fn builtin_execution_emits_usage_event_and_updates_ledger() {
         let governance = Arc::new(GovernanceService::default());
         let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(16));

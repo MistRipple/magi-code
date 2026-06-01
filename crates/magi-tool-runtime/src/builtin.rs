@@ -32,6 +32,7 @@ const FILE_DELETE_PUBLIC_ERROR: &str = "文件暂不可删除，请检查路径�
 const FILE_COPY_PUBLIC_ERROR: &str = "文件暂不可复制，请检查路径或权限";
 const FILE_MOVE_PUBLIC_ERROR: &str = "文件暂不可移动，请检查路径或权限";
 const DIRECTORY_CREATE_PUBLIC_ERROR: &str = "目录暂不可创建，请检查路径或权限";
+const SEARCH_TEXT_PUBLIC_ERROR: &str = "文本搜索暂不可用，请检查路径或权限";
 
 #[derive(Clone)]
 struct ActiveShellExec {
@@ -420,7 +421,15 @@ fn execute_search_text(input: &str, context: &ToolExecutionContext) -> String {
     let (matches, scanned_files, truncated) =
         match search_text_matches(&root, &query, case_sensitive, include_hidden, limit) {
             Ok(result) => result,
-            Err(error) => return builtin_error("search_text", error),
+            Err(error) => {
+                return builtin_filesystem_error(
+                    "search_text",
+                    SEARCH_TEXT_PUBLIC_ERROR,
+                    error.action,
+                    &error.path,
+                    error.source,
+                );
+            }
         };
 
     serde_json::json!({
@@ -1526,13 +1535,19 @@ fn should_skip_directory(path: &Path, include_hidden: bool) -> bool {
     matches!(name, "target" | "node_modules" | "dist" | "coverage")
 }
 
+struct SearchTextFilesystemError {
+    action: &'static str,
+    path: PathBuf,
+    source: std::io::Error,
+}
+
 fn search_text_matches(
     root: &Path,
     query: &str,
     case_sensitive: bool,
     include_hidden: bool,
     limit: usize,
-) -> Result<(Vec<Value>, usize, bool), String> {
+) -> Result<(Vec<Value>, usize, bool), SearchTextFilesystemError> {
     let mut stack = vec![root.to_path_buf()];
     let mut matches = Vec::new();
     let mut scanned_files = 0usize;
@@ -1548,14 +1563,26 @@ fn search_text_matches(
         }
         let metadata = match fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
-            Err(error) => return Err(format!("读取路径失败 {}: {error}", path.display())),
+            Err(error) => {
+                return Err(SearchTextFilesystemError {
+                    action: "读取搜索路径元数据失败",
+                    path,
+                    source: error,
+                });
+            }
         };
         if metadata.is_dir() {
             let mut entries = match fs::read_dir(&path) {
                 Ok(entries) => entries
                     .filter_map(|entry| entry.ok().map(|entry| entry.path()))
                     .collect::<Vec<_>>(),
-                Err(error) => return Err(format!("读取目录失败 {}: {error}", path.display())),
+                Err(error) => {
+                    return Err(SearchTextFilesystemError {
+                        action: "读取搜索目录失败",
+                        path,
+                        source: error,
+                    });
+                }
             };
             entries.sort();
             for entry in entries.into_iter().rev() {
