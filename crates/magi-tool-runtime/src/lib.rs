@@ -6462,6 +6462,31 @@ mod tests {
             "file_symbols 应含 struct，实际: {names:?}"
         );
 
+        let absolute_list = tool_registry.execute_with_policy(
+            ToolExecutionInput {
+                tool_call_id: ToolCallId::new("tc-list-absolute"),
+                tool_name: BuiltinToolName::CodeSymbols.as_str().to_string(),
+                tool_kind: ToolKind::Builtin,
+                input: serde_json::json!({
+                    "action": "file_symbols",
+                    "path": root.join("src/auth.rs").to_string_lossy()
+                })
+                .to_string(),
+                approval_requirement: ApprovalRequirement::None,
+                risk_level: RiskLevel::Low,
+            },
+            context.clone(),
+            &ToolExecutionPolicy::default(),
+        );
+        assert_eq!(absolute_list.status, ExecutionResultStatus::Succeeded);
+        let absolute_payload: Value =
+            serde_json::from_str(&absolute_list.payload).expect("absolute list json");
+        assert_eq!(absolute_payload["path"], "src/auth.rs");
+        assert_eq!(
+            absolute_payload["returned_matches"], list_payload["returned_matches"],
+            "工作区内绝对路径必须归一化到符号索引使用的相对路径"
+        );
+
         // 兼容常见动作与字段别名，避免模型因不同命名习惯调用失败。
         let alias = tool_registry.execute_with_policy(
             ToolExecutionInput {

@@ -2885,6 +2885,7 @@ fn execute_code_symbols(
             }) else {
                 return builtin_error("code_symbols", "action=file_symbols 需要 path 字段");
             };
+            let path = normalize_code_symbols_file_path(&path, context);
             let Some(symbols) = store.list_file_symbols(workspace_id, &path) else {
                 return builtin_error("code_symbols", "代码索引引擎未就绪");
             };
@@ -2906,6 +2907,38 @@ fn execute_code_symbols(
             format!("未知 action：{other}（支持 definition / file_symbols）"),
         ),
     }
+}
+
+fn normalize_code_symbols_file_path(path: &str, context: &ToolExecutionContext) -> String {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let input_path = Path::new(trimmed);
+    let relative = if input_path.is_absolute() {
+        context
+            .working_directory
+            .as_ref()
+            .and_then(|workspace_root| {
+                input_path
+                    .strip_prefix(workspace_root)
+                    .ok()
+                    .map(Path::to_path_buf)
+            })
+            .or_else(|| {
+                let canonical_input = input_path.canonicalize().ok()?;
+                let canonical_root = context.working_directory.as_ref()?.canonicalize().ok()?;
+                canonical_input
+                    .strip_prefix(canonical_root)
+                    .ok()
+                    .map(Path::to_path_buf)
+            })
+            .unwrap_or_else(|| input_path.to_path_buf())
+    } else {
+        input_path.to_path_buf()
+    };
+
+    relative.to_string_lossy().replace('\\', "/")
 }
 
 fn execute_search_semantic(
