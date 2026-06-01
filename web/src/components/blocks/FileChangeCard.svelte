@@ -161,6 +161,12 @@
       workspaceId: change?.workspaceId || messagesState.currentWorkspaceId || undefined,
       workspacePath: change?.workspacePath || messagesState.currentWorkspacePath || undefined,
       diff: change?.diff ?? null,
+      contentKind: change?.contentKind,
+      size: change?.size,
+      mime: change?.mime,
+      symlinkTarget: change?.symlinkTarget,
+      headSummary: change?.headSummary,
+      tailSummary: change?.tailSummary,
     });
   }
 </script>

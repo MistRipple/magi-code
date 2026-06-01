@@ -78,7 +78,6 @@
   const activeFilePreviewQuery = $derived.by(() => {
     if (!activeFilePath) return '';
     return buildFilePreviewQuery(activeFilePath, {
-      includeSession: false,
       sessionId: activeCodePayload?.sessionId,
       workspaceId: activeCodePayload?.workspaceId,
       workspacePath: activeCodePayload?.workspacePath,
@@ -107,7 +106,6 @@
     (async () => {
       try {
         const payload = await getAgentFilePreview(filepath, {
-          includeSession: false,
           sessionId: activeCodePayload?.sessionId,
           workspaceId: activeCodePayload?.workspaceId,
           workspacePath: activeCodePayload?.workspacePath,
