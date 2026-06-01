@@ -1380,10 +1380,14 @@ mod tests {
     async fn settings_bootstrap_returns_frontend_contract_sections() {
         let state = test_state();
         let workspace_id = WorkspaceId::new("workspace-contract");
-        let workspace_path = "/tmp/magi-settings-contract";
+        let workspace_root =
+            std::env::temp_dir().join(format!("magi-settings-contract-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&workspace_root);
+        std::fs::create_dir_all(&workspace_root).expect("workspace root should create");
+        let workspace_path = workspace_root.to_string_lossy().to_string();
         state
             .workspace_registry
-            .register(workspace_id.clone(), AbsolutePath::new(workspace_path))
+            .register(workspace_id.clone(), AbsolutePath::new(&workspace_path))
             .expect("workspace should register");
         let session_id = SessionId::new("session-empty-contract");
         state
@@ -1400,7 +1404,7 @@ mod tests {
             Query(HashMap::from([
                 ("sessionId".to_string(), session_id.as_str().to_string()),
                 ("workspaceId".to_string(), workspace_id.to_string()),
-                ("workspacePath".to_string(), workspace_path.to_string()),
+                ("workspacePath".to_string(), workspace_path.clone()),
             ])),
         )
         .await
@@ -1424,10 +1428,7 @@ mod tests {
         }
         assert_eq!(bootstrap["workspaceId"], json!("workspace-contract"));
         assert_eq!(bootstrap["sessionId"], json!("session-empty-contract"));
-        assert_eq!(
-            bootstrap["workspacePath"],
-            json!("/tmp/magi-settings-contract")
-        );
+        assert_eq!(bootstrap["workspacePath"], json!(workspace_path));
         for key in [
             "repositories",
             "mcpServers",
@@ -1610,8 +1611,8 @@ mod tests {
         );
         assert_eq!(
             capability_dependencies[6]["status"],
-            serde_json::json!("not_ready"),
-            "snapshot dependency should be visible even before the lazy snapshot session starts"
+            serde_json::json!("ready"),
+            "snapshot dependency should report the lazy snapshot capability as ready before the session starts"
         );
         assert_eq!(
             capability_dependencies[6]["sessionId"],
@@ -1665,6 +1666,7 @@ mod tests {
         assert!(!object.contains_key("userRules"));
         assert!(!object.contains_key("engines"));
         assert!(!object.contains_key("agents"));
+        let _ = std::fs::remove_dir_all(&workspace_root);
     }
 
     #[tokio::test]

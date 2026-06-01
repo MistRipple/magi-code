@@ -713,7 +713,9 @@ fn file_snapshot_capability_dependency(
             workspace_root_path_from_registry(workspace_registry, workspace_id)
         })
         .or_else(|| context.working_directory.clone());
-    let has_workspace_root = workspace_root.is_some();
+    let workspace_root_available = workspace_root
+        .as_deref()
+        .is_some_and(|workspace_root| workspace_root.is_absolute() && workspace_root.is_dir());
     let snapshot_active = session_id.as_deref().is_some_and(|session_id| {
         workspace_root.as_ref().is_some_and(|workspace_root| {
             snapshot_manager
@@ -723,12 +725,10 @@ fn file_snapshot_capability_dependency(
     });
     let status = if session_id.is_none() || workspace_id.is_none() {
         "missing_context"
-    } else if snapshot_active {
-        "ready"
-    } else if has_workspace_root {
-        "not_ready"
-    } else {
+    } else if !workspace_root_available {
         "unavailable"
+    } else {
+        "ready"
     };
 
     RuntimeCapabilityDependencyEntry {
