@@ -33,6 +33,8 @@ const FILE_COPY_PUBLIC_ERROR: &str = "文件暂不可复制，请检查路径或
 const FILE_MOVE_PUBLIC_ERROR: &str = "文件暂不可移动，请检查路径或权限";
 const DIRECTORY_CREATE_PUBLIC_ERROR: &str = "目录暂不可创建，请检查路径或权限";
 const SEARCH_TEXT_PUBLIC_ERROR: &str = "文本搜索暂不可用，请检查路径或权限";
+const WEB_SEARCH_PUBLIC_ERROR: &str = "网络搜索暂不可用，请稍后重试";
+const WEB_FETCH_PUBLIC_ERROR: &str = "网页内容暂不可获取，请稍后重试";
 
 #[derive(Clone)]
 struct ActiveShellExec {
@@ -1488,6 +1490,21 @@ fn builtin_filesystem_error(
     builtin_error(tool, public_message)
 }
 
+fn builtin_runtime_error(
+    tool: &str,
+    public_message: &'static str,
+    action: &'static str,
+    error: impl Display,
+) -> String {
+    tracing::warn!(
+        tool,
+        action,
+        error = %error,
+        "builtin runtime operation failed"
+    );
+    builtin_error(tool, public_message)
+}
+
 fn builtin_rejected(tool: &str, message: impl Into<String>) -> String {
     serde_json::json!({
         "tool": tool,
@@ -2385,21 +2402,45 @@ fn execute_web_search(input: &str) -> String {
         .build()
     {
         Ok(c) => c,
-        Err(e) => return builtin_error("web_search", format!("HTTP 客户端初始化失败: {e}")),
+        Err(e) => {
+            return builtin_runtime_error(
+                "web_search",
+                WEB_SEARCH_PUBLIC_ERROR,
+                "初始化 HTTP 客户端失败",
+                e,
+            );
+        }
     };
 
     let response = match client.get(&search_url).send() {
         Ok(r) => r,
-        Err(e) => return builtin_error("web_search", format!("搜索请求失败: {e}")),
+        Err(e) => {
+            return builtin_runtime_error(
+                "web_search",
+                WEB_SEARCH_PUBLIC_ERROR,
+                "发送搜索请求失败",
+                e,
+            );
+        }
     };
 
     if !response.status().is_success() {
-        return builtin_error("web_search", format!("搜索返回 HTTP {}", response.status()));
+        return builtin_error(
+            "web_search",
+            format!("搜索服务返回 HTTP {}", response.status().as_u16()),
+        );
     }
 
     let html = match response.text() {
         Ok(t) => t,
-        Err(e) => return builtin_error("web_search", format!("读取响应失败: {e}")),
+        Err(e) => {
+            return builtin_runtime_error(
+                "web_search",
+                WEB_SEARCH_PUBLIC_ERROR,
+                "读取搜索响应失败",
+                e,
+            );
+        }
     };
 
     let results = parse_duckduckgo_results(&html);
@@ -2503,16 +2544,33 @@ fn execute_web_fetch(input: &str) -> String {
         .build()
     {
         Ok(c) => c,
-        Err(e) => return builtin_error("web_fetch", format!("HTTP 客户端初始化失败: {e}")),
+        Err(e) => {
+            return builtin_runtime_error(
+                "web_fetch",
+                WEB_FETCH_PUBLIC_ERROR,
+                "初始化 HTTP 客户端失败",
+                e,
+            );
+        }
     };
 
     let response = match client.get(&url).send() {
         Ok(r) => r,
-        Err(e) => return builtin_error("web_fetch", format!("请求失败: {e}")),
+        Err(e) => {
+            return builtin_runtime_error(
+                "web_fetch",
+                WEB_FETCH_PUBLIC_ERROR,
+                "发送网页请求失败",
+                e,
+            );
+        }
     };
 
     if !response.status().is_success() {
-        return builtin_error("web_fetch", format!("HTTP {}", response.status()));
+        return builtin_error(
+            "web_fetch",
+            format!("网页返回 HTTP {}", response.status().as_u16()),
+        );
     }
 
     let content_type = response
@@ -2524,7 +2582,14 @@ fn execute_web_fetch(input: &str) -> String {
 
     let body = match response.text() {
         Ok(t) => t,
-        Err(e) => return builtin_error("web_fetch", format!("读取响应体失败: {e}")),
+        Err(e) => {
+            return builtin_runtime_error(
+                "web_fetch",
+                WEB_FETCH_PUBLIC_ERROR,
+                "读取网页响应体失败",
+                e,
+            );
+        }
     };
 
     let content = if content_type.contains("application/json") {

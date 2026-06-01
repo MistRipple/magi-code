@@ -5849,6 +5849,71 @@ mod tests {
     }
 
     #[test]
+    fn web_fetch_network_failure_uses_public_error_message() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind closed local port");
+        let url = format!("http://{}", listener.local_addr().expect("local address"));
+        drop(listener);
+
+        let registry = make_registry();
+        let output = exec_tool(
+            &registry,
+            BuiltinToolName::WebFetch,
+            &serde_json::json!({ "url": url }).to_string(),
+        );
+
+        assert_eq!(output.status, ExecutionResultStatus::Failed);
+        let payload: Value = serde_json::from_str(&output.payload).expect("payload json");
+        assert_eq!(payload["tool"], BuiltinToolName::WebFetch.as_str());
+        assert_eq!(payload["status"], "failed");
+        assert_eq!(payload["error"], "网页内容暂不可获取，请稍后重试");
+        assert!(
+            !output.payload.contains("Connection")
+                && !output.payload.contains("refused")
+                && !output.payload.contains("tcp")
+                && !output.payload.contains("127.0.0.1"),
+            "web_fetch 运行态失败不能暴露底层网络细节: {}",
+            output.payload
+        );
+    }
+
+    #[test]
+    fn web_fetch_http_status_keeps_actionable_status_code() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local test server");
+        let url = format!(
+            "http://{}",
+            listener.local_addr().expect("local test server address")
+        );
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept web_fetch request");
+            let mut buffer = [0_u8; 1024];
+            let _ = stream.read(&mut buffer);
+            let body = "temporarily unavailable";
+            let response = format!(
+                "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.as_bytes().len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write web_fetch response");
+        });
+
+        let registry = make_registry();
+        let output = exec_tool(
+            &registry,
+            BuiltinToolName::WebFetch,
+            &serde_json::json!({ "url": url }).to_string(),
+        );
+        server.join().expect("local web_fetch server should finish");
+
+        assert_eq!(output.status, ExecutionResultStatus::Failed);
+        let payload: Value = serde_json::from_str(&output.payload).expect("payload json");
+        assert_eq!(payload["tool"], BuiltinToolName::WebFetch.as_str());
+        assert_eq!(payload["status"], "failed");
+        assert_eq!(payload["error"], "网页返回 HTTP 503");
+    }
+
+    #[test]
     #[ignore = "live network smoke for manually verifying DuckDuckGo-backed web_search"]
     fn web_search_live_smoke_returns_json_payload() {
         let registry = make_registry();
