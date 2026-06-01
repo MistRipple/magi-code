@@ -13,6 +13,7 @@ const SKILL_TOOL_UNAVAILABLE_PUBLIC_ERROR: &str = "Skill 工具暂不可用，�
 const SKILL_TOOL_CONFIG_PUBLIC_ERROR: &str = "Skill 工具配置不可用，请重新加载该 Skill";
 const SKILL_TOOL_SCOPE_PUBLIC_ERROR: &str = "该 Skill 工具不属于当前激活 Skill";
 const SKILL_TOOL_DISPATCH_PUBLIC_ERROR: &str = "Skill 工具执行失败，请稍后重试";
+const SKILL_TOOL_POLICY_PUBLIC_ERROR: &str = "该 Skill 工具在当前访问模式下不可用";
 
 pub fn build_skill_custom_tool_definitions(
     skill_name: &str,
@@ -257,7 +258,9 @@ pub fn execute_skill_custom_tool(
     let observation = outcome.observation;
     match outcome.result {
         Ok(SkillDispatchResult::Builtin { output }) => (output.payload, output.status),
-        Ok(SkillDispatchResult::Preflight { output }) => (output.payload, output.status),
+        Ok(SkillDispatchResult::Preflight { .. }) => {
+            custom_tool_preflight_payload(tool_name, tool_skill_name, observation)
+        }
         Ok(SkillDispatchResult::Bridge { output }) => (
             output.response.payload,
             if output.response.ok {
@@ -270,6 +273,45 @@ pub fn execute_skill_custom_tool(
             custom_tool_dispatch_failure_payload(tool_name, tool_skill_name, observation)
         }
     }
+}
+
+fn custom_tool_preflight_payload(
+    tool_name: &str,
+    skill_name: &str,
+    observation: magi_skill_runtime::SkillDispatchObservation,
+) -> (String, ExecutionResultStatus) {
+    let (status_label, status, error_code, public_error) = match observation.status {
+        SkillDispatchStatus::NeedsApproval => (
+            "needs_approval",
+            ExecutionResultStatus::NeedsApproval,
+            "skill_tool_needs_approval",
+            "Skill 工具需要批准后执行",
+        ),
+        SkillDispatchStatus::Rejected => (
+            "rejected",
+            ExecutionResultStatus::Rejected,
+            "skill_tool_policy_rejected",
+            SKILL_TOOL_POLICY_PUBLIC_ERROR,
+        ),
+        _ => (
+            "failed",
+            ExecutionResultStatus::Failed,
+            "skill_tool_dispatch_failed",
+            SKILL_TOOL_DISPATCH_PUBLIC_ERROR,
+        ),
+    };
+    (
+        serde_json::json!({
+            "tool": tool_name,
+            "status": status_label,
+            "binding_id": observation.binding_id,
+            "skill_name": skill_name,
+            "error_code": error_code,
+            "error": public_error,
+        })
+        .to_string(),
+        status,
+    )
 }
 
 fn custom_tool_dispatch_failure_payload(
@@ -417,10 +459,12 @@ fn custom_tool_safety_payload(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use magi_bridge_client::{BridgeDispatchRuntime, ChatToolFunction};
+    use magi_bridge_client::{
+        BridgeBindingKind, BridgeDispatchAction, BridgeDispatchRuntime, ChatToolFunction,
+    };
     use magi_event_bus::InMemoryEventBus;
     use magi_governance::GovernanceService;
-    use magi_skill_runtime::SkillRegistry;
+    use magi_skill_runtime::{CustomToolBinding, SkillDefinition, SkillMetadata, SkillRegistry};
     use magi_tool_runtime::ToolRegistry;
     use std::sync::Arc;
 
@@ -511,5 +555,60 @@ mod tests {
         assert_eq!(parsed["error"], SKILL_TOOL_CONFIG_PUBLIC_ERROR);
         assert!(!payload.contains("custom skill binding"));
         assert!(!payload.contains("code-review / missing"));
+    }
+
+    #[test]
+    fn custom_skill_tool_read_only_mcp_preflight_uses_public_error() {
+        let registry = SkillRegistry::new();
+        registry.register(SkillDefinition {
+            skill_id: "mcp-skill".to_string(),
+            title: "MCP Skill".to_string(),
+            instruction: "调用外接能力。".to_string(),
+            metadata: SkillMetadata {
+                category: "integration".to_string(),
+                tags: vec!["mcp".to_string()],
+            },
+            allowed_tools: vec![],
+            custom_tool_bindings: vec![CustomToolBinding {
+                binding_id: "inspect".to_string(),
+                tool_name: "echo.inspect".to_string(),
+                description: "检查输入".to_string(),
+                bridge_kind: BridgeBindingKind::Mcp,
+                dispatch_action: BridgeDispatchAction::McpToolCall,
+                bridge_target: "loopback-mcp".to_string(),
+            }],
+            prompt_priority: 50,
+        });
+        let skill_runtime = SkillRuntime::new(registry);
+        let dispatch_runtime = dispatch_runtime();
+
+        let (payload, status) = execute_skill_custom_tool(
+            &ChatToolCall {
+                id: "skill-tool-call-read-only".to_string(),
+                kind: "function".to_string(),
+                function: ChatToolFunction {
+                    name: "skill__mcp-skill__inspect".to_string(),
+                    arguments: serde_json::json!({ "payload": "inspect" }).to_string(),
+                },
+            },
+            "mcp-skill",
+            "inspect",
+            Some("mcp-skill"),
+            tool_execution_policy_scope(AccessProfile::ReadOnly, "", &[], &[]),
+            None,
+            Some(&skill_runtime),
+            Some(&dispatch_runtime),
+            ToolExecutionContext::default(),
+            None,
+        );
+
+        assert_eq!(status, ExecutionResultStatus::Rejected);
+        let parsed: Value = serde_json::from_str(&payload).expect("payload should be json");
+        assert_eq!(parsed["status"], "rejected");
+        assert_eq!(parsed["tool"], "skill__mcp-skill__inspect");
+        assert_eq!(parsed["error_code"], "skill_tool_policy_rejected");
+        assert_eq!(parsed["error"], SKILL_TOOL_POLICY_PUBLIC_ERROR);
+        assert_eq!(parsed.get("bridge_target"), None);
+        assert_eq!(parsed.get("bridge_kind"), None);
     }
 }

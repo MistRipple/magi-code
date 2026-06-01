@@ -1505,8 +1505,12 @@ mod tests {
         assert_eq!(status, ExecutionResultStatus::NeedsApproval);
         let parsed: serde_json::Value = serde_json::from_str(&payload).expect("payload json");
         assert_eq!(parsed["status"], "needs_approval");
-        assert_eq!(parsed["tool"], "echo.describe");
-        assert_eq!(parsed["bridge_kind"], "Mcp");
+        assert_eq!(parsed["tool"], "skill__code-review__review-mcp");
+        assert_eq!(parsed["error_code"], "skill_tool_needs_approval");
+        assert_eq!(parsed["error"], "Skill 工具需要批准后执行");
+        assert_eq!(parsed.get("bridge_kind"), None);
+        assert_eq!(parsed.get("bridge_target"), None);
+        assert_eq!(parsed.get("risk_level"), None);
         assert!(mcp_calls.lock().expect("mcp calls lock").is_empty());
         let invocations = tool_registry.invocations();
         assert_eq!(invocations.len(), 1);
