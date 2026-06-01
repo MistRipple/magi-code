@@ -693,17 +693,21 @@ fn file_snapshot_capability_dependency(
 ) -> RuntimeCapabilityDependencyEntry {
     let session_id = context.session_id.as_ref().map(ToString::to_string);
     let workspace_id = context.workspace_id.as_ref().map(ToString::to_string);
-    let has_workspace_root = context
+    let workspace_root = context
         .workspace_id
         .as_ref()
         .and_then(|workspace_id| {
             workspace_root_path_from_registry(workspace_registry, workspace_id)
         })
-        .or_else(|| context.working_directory.clone())
-        .is_some();
-    let snapshot_active = session_id
-        .as_deref()
-        .is_some_and(|session_id| snapshot_manager.get_session(session_id).is_some());
+        .or_else(|| context.working_directory.clone());
+    let has_workspace_root = workspace_root.is_some();
+    let snapshot_active = session_id.as_deref().is_some_and(|session_id| {
+        workspace_root.as_ref().is_some_and(|workspace_root| {
+            snapshot_manager
+                .get_session_for_workspace(session_id, workspace_root)
+                .is_some()
+        })
+    });
     let status = if session_id.is_none() || workspace_id.is_none() {
         "missing_context"
     } else if snapshot_active {
@@ -810,9 +814,15 @@ impl ApiState {
         }
     }
 
-    /// 同步取 session 对应的 SnapshotSession。未装载表示生命周期接线异常，调用方应显式报错。
-    pub fn snapshot_session(&self, session_id: &SessionId) -> Option<Arc<SnapshotSession>> {
-        self.snapshot_manager.get_session(session_id.as_str())
+    /// 同步取 session + workspace 对应的 SnapshotSession。未装载表示生命周期接线异常，
+    /// 调用方应显式报错或触发 lazy start。
+    pub fn snapshot_session(
+        &self,
+        session_id: &SessionId,
+        workspace_root: &Path,
+    ) -> Option<Arc<SnapshotSession>> {
+        self.snapshot_manager
+            .get_session_for_workspace(session_id.as_str(), workspace_root)
     }
 
     pub(crate) async fn ensure_snapshot_session(
@@ -820,7 +830,7 @@ impl ApiState {
         session_id: &SessionId,
         workspace_root: &Path,
     ) -> Result<Arc<SnapshotSession>, ApiError> {
-        if let Some(session) = self.snapshot_session(session_id) {
+        if let Some(session) = self.snapshot_session(session_id, workspace_root) {
             return Ok(session);
         }
         self.snapshot_manager

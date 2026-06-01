@@ -242,7 +242,10 @@ pub(crate) fn collect_session_pending_changes_with_state(
             ),
         });
     };
-    if state.snapshot_session(session_id).is_none() {
+    if state
+        .snapshot_session(session_id, &workspace_root)
+        .is_none()
+    {
         return Ok(SessionPendingChangesProjection {
             pending_changes: Vec::new(),
             state: pending_changes_state(
@@ -256,7 +259,8 @@ pub(crate) fn collect_session_pending_changes_with_state(
         });
     }
     let scope = resolve_session_change_scope(state, session_id, workspace_id, None)?;
-    let Some(snapshot_session) = state.snapshot_session(&scope.session_id) else {
+    let Some(snapshot_session) = state.snapshot_session(&scope.session_id, &scope.workspace_root)
+    else {
         return Ok(SessionPendingChangesProjection {
             pending_changes: Vec::new(),
             state: pending_changes_state(
@@ -602,6 +606,39 @@ mod tests {
         let projection =
             collect_session_pending_changes_with_state(&state, &sid, Some("ws-no-snapshot"))
                 .expect("snapshot not yet started should be treated as empty");
+        assert!(projection.pending_changes.is_empty());
+        assert_eq!(projection.state.status, "not_ready");
+        assert_eq!(
+            projection.state.reason_code.as_deref(),
+            Some("changes_preparing")
+        );
+    }
+
+    #[tokio::test]
+    async fn collect_pending_changes_ignores_snapshot_from_other_workspace_root() {
+        let state = build_state();
+        let root = unique_temp_dir("magi-change-projection-correct-workspace");
+        let other_root = unique_temp_dir("magi-change-projection-wrong-workspace");
+        let (_, sid) = register_workspace_and_session(
+            &state,
+            "ws-correct-snapshot-root",
+            "sess-cross-root",
+            &root,
+            None,
+        );
+        state
+            .snapshot_manager
+            .start_session(sid.as_str().to_string(), other_root)
+            .await
+            .expect("wrong root snapshot can exist before projection resolves scope");
+
+        let projection = collect_session_pending_changes_with_state(
+            &state,
+            &sid,
+            Some("ws-correct-snapshot-root"),
+        )
+        .expect("wrong workspace snapshot should be treated as not ready");
+
         assert!(projection.pending_changes.is_empty());
         assert_eq!(projection.state.status, "not_ready");
         assert_eq!(

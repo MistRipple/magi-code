@@ -48,6 +48,38 @@ async fn start_session_is_idempotent_for_existing_session() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn start_session_rejects_same_session_id_for_different_workspace() {
+    let dir_a = tempdir().unwrap();
+    let dir_b = tempdir().unwrap();
+    let root_a = dir_a.path().to_path_buf();
+    let root_b = dir_b.path().to_path_buf();
+    fs::write(root_a.join("a.txt"), "a").unwrap();
+    fs::write(root_b.join("b.txt"), "b").unwrap();
+
+    let mgr = SnapshotManager::new();
+    let first = mgr
+        .start_session("s-workspace-bound".into(), root_a.clone())
+        .await
+        .unwrap();
+    let second = mgr
+        .start_session("s-workspace-bound".into(), root_b.clone())
+        .await;
+
+    assert!(second.is_err(), "同名 session 不得复用到另一个 workspace");
+    assert!(
+        mgr.get_session_for_workspace("s-workspace-bound", &root_a)
+            .is_some(),
+        "原 workspace 的快照账本仍应可按 workspace 命中"
+    );
+    assert!(
+        mgr.get_session_for_workspace("s-workspace-bound", &root_b)
+            .is_none(),
+        "错误 workspace 不应命中已存在账本"
+    );
+    assert_eq!(first.workspace_root(), root_a.canonicalize().unwrap());
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn external_write_is_captured() {
     let dir = tempdir().unwrap();
     let root = dir.path().to_path_buf();

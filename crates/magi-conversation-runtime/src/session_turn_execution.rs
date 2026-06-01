@@ -785,8 +785,13 @@ fn stream_session_turn_round(
             tool_calls: parsed.tool_calls.clone(),
             tool_call_id: None,
         });
-        let snapshot_session =
-            snapshot_manager.and_then(|mgr| mgr.get_session(request.session_id.as_str()));
+        let snapshot_session = snapshot_manager.and_then(|mgr| {
+            request
+                .workspace_root_path
+                .as_deref()
+                .map(PathBuf::from)
+                .and_then(|root| mgr.get_session_for_workspace(request.session_id.as_str(), &root))
+        });
         let execution_group_id = session_store
             .execution_ownership(&request.session_id)
             .and_then(|ownership| ownership.mission_id)

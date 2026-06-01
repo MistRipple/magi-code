@@ -1592,6 +1592,11 @@ impl LlmTaskDispatcher {
         } else {
             None
         };
+        let snapshot_session = self.snapshot_manager.as_ref().and_then(|manager| {
+            workspace_root_path
+                .as_ref()
+                .and_then(|root| manager.get_session_for_workspace(session_id.as_str(), root))
+        });
         conversation_loop::run_conversation_loop(ConversationLoopRequest {
             client: client.as_ref(),
             event_bus: self.event_bus.as_ref(),
@@ -1633,10 +1638,7 @@ impl LlmTaskDispatcher {
             context_summary,
             system_prompt,
             workspace_root_path,
-            snapshot_session: self
-                .snapshot_manager
-                .as_ref()
-                .and_then(|manager| manager.get_session(session_id.as_str())),
+            snapshot_session,
             execution_group_id: Some(task.mission_id.to_string()),
             persist_session_state: self.session_state_persist_callback.as_deref(),
         })

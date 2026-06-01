@@ -1578,7 +1578,7 @@ mod tests {
             )
             .expect("session should create");
         assert!(
-            state.snapshot_session(&session_id).is_none(),
+            state.snapshot_session(&session_id, &root).is_none(),
             "测试前不应手动启动快照账本"
         );
 
@@ -1599,7 +1599,7 @@ mod tests {
         assert_eq!(payload["pendingChangesState"]["status"], "ready");
         assert_eq!(payload["pendingChangesState"]["pendingCount"], 0);
         assert!(
-            state.snapshot_session(&session_id).is_some(),
+            state.snapshot_session(&session_id, &root).is_some(),
             "显式变更路由必须在账本缺失时按会话/工作区启动快照账本"
         );
     }

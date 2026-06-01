@@ -7,6 +7,8 @@ use std::sync::{Arc, RwLock as StdRwLock};
 use tokio::sync::{Mutex as AsyncMutex, RwLock as AsyncRwLock};
 
 /// 顶层管理：跨 session 共享 BlobStore，按 session_id 维持 SnapshotSession 实例。
+/// session_id 在 session-store 内是全局唯一键；这里额外校验 workspace_root，
+/// 防止旧 URL 或错误调用把同一个 session 复用到另一个工作区快照账本。
 ///
 /// 每个 workspace 有自己的 `.magi/snapshots/blobs` 目录，blob 在 workspace 内跨 session 共享。
 ///
@@ -34,12 +36,15 @@ impl SnapshotManager {
         session_id: String,
         workspace_root: PathBuf,
     ) -> SnapshotResult<Arc<SnapshotSession>> {
+        let workspace_root = canonical_workspace_root(&workspace_root)?;
         if let Some(session) = self.get_session(&session_id) {
+            ensure_same_workspace(&session_id, &workspace_root, session.workspace_root())?;
             return Ok(session);
         }
 
         let _start_guard = self.start_lock.lock().await;
         if let Some(session) = self.get_session(&session_id) {
+            ensure_same_workspace(&session_id, &workspace_root, session.workspace_root())?;
             return Ok(session);
         }
 
@@ -88,6 +93,16 @@ impl SnapshotManager {
             .cloned()
     }
 
+    pub fn get_session_for_workspace(
+        &self,
+        session_id: &str,
+        workspace_root: &Path,
+    ) -> Option<Arc<SnapshotSession>> {
+        let workspace_root = canonical_workspace_root(workspace_root).ok()?;
+        self.get_session(session_id)
+            .filter(|session| session.workspace_root() == workspace_root.as_path())
+    }
+
     /// 关闭 watcher，但保留磁盘账本（archive 语义）。
     pub async fn archive_session(&self, session_id: &str) -> SnapshotResult<()> {
         let session = self
@@ -126,4 +141,35 @@ impl Default for SnapshotManager {
 
 pub fn snapshots_root_for(workspace_root: &Path) -> PathBuf {
     workspace_root.join(".magi").join("snapshots")
+}
+
+fn canonical_workspace_root(workspace_root: &Path) -> SnapshotResult<PathBuf> {
+    if !workspace_root.is_absolute() {
+        return Err(SnapshotError::InvalidRoot(format!(
+            "workspace_root must be absolute: {}",
+            workspace_root.display()
+        )));
+    }
+    if !workspace_root.is_dir() {
+        return Err(SnapshotError::InvalidRoot(format!(
+            "workspace_root not a directory: {}",
+            workspace_root.display()
+        )));
+    }
+    std::fs::canonicalize(workspace_root).map_err(|error| SnapshotError::io(workspace_root, error))
+}
+
+fn ensure_same_workspace(
+    session_id: &str,
+    requested_workspace_root: &Path,
+    existing_workspace_root: &Path,
+) -> SnapshotResult<()> {
+    if requested_workspace_root == existing_workspace_root {
+        return Ok(());
+    }
+    Err(SnapshotError::InvalidRoot(format!(
+        "snapshot session {session_id} already bound to workspace {}, requested {}",
+        existing_workspace_root.display(),
+        requested_workspace_root.display()
+    )))
 }
