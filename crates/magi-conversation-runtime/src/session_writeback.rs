@@ -813,19 +813,35 @@ fn execute_session_turn_tool_call_batch(
                             (
                                 tool_index,
                                 scope.spawn(move || {
-                                    let result = execute_session_turn_tool_call(
-                                        event_bus,
-                                        tool_registry,
-                                        skill_runtime,
-                                        skill_dispatch_runtime,
-                                        skill_name,
-                                        safety_gate,
-                                        tool_call,
-                                        session_id,
-                                        workspace_id,
-                                        workspace_root_path,
-                                        access_profile,
+                                    if let Some(snapshot) = snapshot_session.as_deref() {
+                                        snapshot.before_tool(&hook_ctx);
+                                    }
+                                    let result = std::panic::catch_unwind(
+                                        std::panic::AssertUnwindSafe(|| {
+                                            execute_session_turn_tool_call(
+                                                event_bus,
+                                                tool_registry,
+                                                skill_runtime,
+                                                skill_dispatch_runtime,
+                                                skill_name,
+                                                safety_gate,
+                                                tool_call,
+                                                session_id,
+                                                workspace_id,
+                                                workspace_root_path,
+                                                access_profile,
+                                            )
+                                        }),
                                     );
+                                    let result = match result {
+                                        Ok(result) => result,
+                                        Err(payload) => {
+                                            if let Some(snapshot) = snapshot_session.as_deref() {
+                                                snapshot.after_tool(&hook_ctx);
+                                            }
+                                            std::panic::resume_unwind(payload);
+                                        }
+                                    };
                                     append_result_declared_paths(
                                         &mut hook_ctx.declared_paths,
                                         &result.0,
@@ -1064,6 +1080,11 @@ mod tests {
         probe: Arc<ConcurrentToolProbe>,
     }
 
+    struct SnapshotReconcileProbeTool {
+        name: &'static str,
+        snapshot: Arc<SnapshotSession>,
+    }
+
     #[derive(Clone, Default)]
     struct RecordingMcpClient {
         calls: Arc<Mutex<Vec<McpToolCallRequest>>>,
@@ -1092,6 +1113,54 @@ mod tests {
                 "status": "succeeded",
                 "stdout": format!("{} done", self.name),
                 "input": input,
+            })
+            .to_string()
+        }
+
+        fn spec(&self) -> BuiltinToolSpec {
+            BuiltinToolSpec {
+                name: self.name.to_string(),
+                risk_level: RiskLevel::Low,
+                approval_requirement: ApprovalRequirement::None,
+            }
+        }
+    }
+
+    impl SnapshotReconcileProbeTool {
+        fn new(name: &'static str, snapshot: Arc<SnapshotSession>) -> Self {
+            Self { name, snapshot }
+        }
+    }
+
+    impl BuiltinTool for SnapshotReconcileProbeTool {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        fn execute(
+            &self,
+            input: &str,
+            context: &ToolExecutionContext,
+            _resources: &magi_tool_runtime::ToolRuntimeResources,
+        ) -> String {
+            let arguments = serde_json::from_str::<serde_json::Value>(input).unwrap_or_default();
+            let path = arguments
+                .get("changed_paths")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|items| items.first())
+                .and_then(serde_json::Value::as_str)
+                .expect("probe changed path");
+            let workspace_root = context
+                .working_directory
+                .as_ref()
+                .expect("probe working directory");
+            std::fs::write(workspace_root.join(path), format!("probe {path}"))
+                .expect("probe file write");
+            self.snapshot.reconcile().expect("probe reconcile");
+            serde_json::json!({
+                "tool": self.name,
+                "status": "succeeded",
+                "stdout": "snapshot reconciled"
             })
             .to_string()
         }
@@ -2071,6 +2140,132 @@ mod tests {
             Some(2),
             "实时 turn item 事件必须携带当前 turn 的全部 item"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn session_turn_concurrent_tool_batch_keeps_snapshot_context_during_execution() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let workspace_root = dir.path().to_path_buf();
+        let snapshot = magi_snapshot::SnapshotManager::new()
+            .start_session(
+                "session-turn-concurrent-snapshot".to_string(),
+                workspace_root.clone(),
+            )
+            .await
+            .expect("snapshot session should start");
+
+        let session_store = SessionStore::new();
+        let event_bus = InMemoryEventBus::new(32);
+        let session_id = SessionId::new("session-turn-concurrent-snapshot");
+        let workspace_id = Some(WorkspaceId::new("workspace-turn-concurrent-snapshot"));
+        session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "snapshot batch session",
+                workspace_id.as_ref().map(ToString::to_string),
+            )
+            .expect("session should be creatable");
+        session_store
+            .upsert_current_turn(
+                session_id.clone(),
+                ActiveExecutionTurn {
+                    turn_id: "turn-concurrent-snapshot".to_string(),
+                    turn_seq: 1,
+                    accepted_at: UtcMillis::now(),
+                    status: "running".to_string(),
+                    user_message: Some("并发工具快照归因".to_string()),
+                    items: Vec::new(),
+                    completed_at: None,
+                },
+            )
+            .expect("turn should be creatable");
+
+        let mut tool_registry = ToolRegistry::new(
+            Arc::new(GovernanceService::default()),
+            Arc::new(InMemoryEventBus::new(8)),
+        );
+        tool_registry.register_builtin(Arc::new(SnapshotReconcileProbeTool::new(
+            BuiltinToolName::ShellExec.as_str(),
+            snapshot.clone(),
+        )));
+        let tool_calls = vec![
+            ChatToolCall {
+                id: "tool-call-session-snapshot-a".to_string(),
+                kind: "function".to_string(),
+                function: ChatToolFunction {
+                    name: BuiltinToolName::ShellExec.as_str().to_string(),
+                    arguments: serde_json::json!({
+                        "command": "printf a",
+                        "access_mode": "read_only",
+                        "changed_paths": ["session-a.txt"]
+                    })
+                    .to_string(),
+                },
+            },
+            ChatToolCall {
+                id: "tool-call-session-snapshot-b".to_string(),
+                kind: "function".to_string(),
+                function: ChatToolFunction {
+                    name: BuiltinToolName::ShellExec.as_str().to_string(),
+                    arguments: serde_json::json!({
+                        "command": "printf b",
+                        "access_mode": "read_only",
+                        "changed_paths": ["session-b.txt"]
+                    })
+                    .to_string(),
+                },
+            },
+        ];
+        let mut messages = Vec::new();
+
+        append_session_tool_call_items_batch(
+            &session_store,
+            &event_bus,
+            Some(&tool_registry),
+            None,
+            None,
+            None,
+            None,
+            &session_id,
+            &workspace_id,
+            Some(workspace_root.clone()),
+            magi_core::AccessProfile::FullAccess,
+            &tool_calls,
+            &mut messages,
+            Some(snapshot.clone()),
+            Some("session-turn-group".to_string()),
+            &ThreadId::new("thread-session-snapshot"),
+            None,
+            || true,
+        );
+
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.tool_call_id.as_deref())
+                .collect::<Vec<_>>(),
+            vec![
+                Some("tool-call-session-snapshot-a"),
+                Some("tool-call-session-snapshot-b")
+            ]
+        );
+        let pending = snapshot.pending_changes().expect("pending changes");
+        for (path, call_id) in [
+            ("session-a.txt", "tool-call-session-snapshot-a"),
+            ("session-b.txt", "tool-call-session-snapshot-b"),
+        ] {
+            let change = pending
+                .iter()
+                .find(|change| change.path == path)
+                .expect("session turn concurrent tool change should be tracked");
+            assert_eq!(change.source, magi_snapshot::SourceKind::Tool);
+            assert_eq!(change.tool_call_id.as_deref(), Some(call_id));
+            assert_eq!(change.worker_id, None);
+            assert_eq!(
+                change.execution_group_id.as_deref(),
+                Some("session-turn-group")
+            );
+        }
     }
 
     #[test]

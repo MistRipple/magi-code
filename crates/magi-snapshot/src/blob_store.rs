@@ -4,10 +4,14 @@ use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{
+    Mutex,
+    atomic::{AtomicU64, Ordering},
+};
 
 const ZSTD_LEVEL: i32 = 3;
 const TEMP_PREFIX: &str = ".magi-snapshot-tmp";
+static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// 内容寻址 blob 存储，按 sha2-256 前 16 字节（32 hex）命名，
 /// 目录拆成两级（前两位作为子目录，避免 inode 爆炸）。
@@ -76,8 +80,7 @@ impl BlobStore {
             content.to_vec()
         };
 
-        let tmp =
-            target.with_file_name(format!("{TEMP_PREFIX}-{}-{}", std::process::id(), now_ns()));
+        let tmp = temp_path_for(&target);
 
         {
             let mut f = OpenOptions::new()
@@ -90,7 +93,13 @@ impl BlobStore {
             f.sync_all().map_err(|e| SnapshotError::io(&tmp, e))?;
         }
 
-        fs::rename(&tmp, &target).map_err(|e| SnapshotError::io(&target, e))?;
+        if let Err(error) = fs::rename(&tmp, &target) {
+            if target.exists() {
+                let _ = fs::remove_file(&tmp);
+                return Ok(hash);
+            }
+            return Err(SnapshotError::io(&target, error));
+        }
         Ok(hash)
     }
 
@@ -166,12 +175,21 @@ fn now_ns() -> u128 {
         .unwrap_or(0)
 }
 
+fn temp_path_for(target: &Path) -> PathBuf {
+    target.with_file_name(format!(
+        "{TEMP_PREFIX}-{}-{}-{}",
+        std::process::id(),
+        now_ns(),
+        TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
 /// 原子写一段 JSON 文本。
 pub(crate) fn write_atomic(path: &Path, payload: &[u8]) -> SnapshotResult<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| SnapshotError::io(parent, e))?;
     }
-    let tmp = path.with_file_name(format!("{TEMP_PREFIX}-{}-{}", std::process::id(), now_ns()));
+    let tmp = temp_path_for(path);
     {
         let mut f = OpenOptions::new()
             .write(true)
@@ -221,6 +239,31 @@ mod tests {
         assert_eq!(h1, h2);
         let counts = store.refcount.lock().unwrap();
         assert_eq!(counts.get(&h1).copied(), Some(2));
+    }
+
+    #[test]
+    fn concurrent_put_uses_distinct_temp_files() {
+        let dir = tempdir().unwrap();
+        let store = std::sync::Arc::new(BlobStore::new(dir.path()).unwrap());
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let mut handles = Vec::new();
+
+        for _ in 0..8 {
+            let store = std::sync::Arc::clone(&store);
+            let barrier = std::sync::Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                store.put(b"concurrent snapshot payload", true).unwrap()
+            }));
+        }
+
+        let hashes = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("put thread"))
+            .collect::<Vec<_>>();
+        assert!(hashes.windows(2).all(|pair| pair[0] == pair[1]));
+        let counts = store.refcount.lock().unwrap();
+        assert_eq!(counts.get(&hashes[0]).copied(), Some(8));
     }
 
     #[test]

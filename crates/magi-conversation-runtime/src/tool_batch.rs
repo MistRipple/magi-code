@@ -216,34 +216,50 @@ pub fn execute_task_tool_call_batch(
                             (
                                 tool_index,
                                 scope.spawn(move || {
-                                    let result = execute_task_tool_call(
-                                        event_bus,
-                                        tool_registry,
-                                        agent_role_registry,
-                                        skill_runtime,
-                                        skill_dispatch_runtime,
-                                        skill_name,
-                                        task_store,
-                                        session_store,
-                                        execution_registry,
-                                        conversation_registry,
-                                        spawn_graph,
-                                        safety_gate,
-                                        todo_ledger,
-                                        project_memory,
-                                        mission_charter,
-                                        plan,
-                                        knowledge_graph,
-                                        validation_runner,
-                                        checkpoint,
-                                        human_checkpoint,
-                                        task,
-                                        session_id,
-                                        workspace_id,
-                                        workspace_root_path,
-                                        worker_id,
-                                        tool_call,
+                                    if let Some(snapshot) = snapshot_session.as_deref() {
+                                        snapshot.before_tool(&hook_ctx);
+                                    }
+                                    let result = std::panic::catch_unwind(
+                                        std::panic::AssertUnwindSafe(|| {
+                                            execute_task_tool_call(
+                                                event_bus,
+                                                tool_registry,
+                                                agent_role_registry,
+                                                skill_runtime,
+                                                skill_dispatch_runtime,
+                                                skill_name,
+                                                task_store,
+                                                session_store,
+                                                execution_registry,
+                                                conversation_registry,
+                                                spawn_graph,
+                                                safety_gate,
+                                                todo_ledger,
+                                                project_memory,
+                                                mission_charter,
+                                                plan,
+                                                knowledge_graph,
+                                                validation_runner,
+                                                checkpoint,
+                                                human_checkpoint,
+                                                task,
+                                                session_id,
+                                                workspace_id,
+                                                workspace_root_path,
+                                                worker_id,
+                                                tool_call,
+                                            )
+                                        }),
                                     );
+                                    let result = match result {
+                                        Ok(result) => result,
+                                        Err(payload) => {
+                                            if let Some(snapshot) = snapshot_session.as_deref() {
+                                                snapshot.after_tool(&hook_ctx);
+                                            }
+                                            std::panic::resume_unwind(payload);
+                                        }
+                                    };
                                     append_result_declared_paths(
                                         &mut hook_ctx.declared_paths,
                                         &result.0,
@@ -2390,6 +2406,59 @@ mod tests {
         ids.iter().map(|id| (*id).to_string()).collect()
     }
 
+    struct SnapshotReconcileProbeTool {
+        name: &'static str,
+        snapshot: Arc<SnapshotSession>,
+    }
+
+    impl SnapshotReconcileProbeTool {
+        fn new(name: &'static str, snapshot: Arc<SnapshotSession>) -> Self {
+            Self { name, snapshot }
+        }
+    }
+
+    impl magi_tool_runtime::BuiltinTool for SnapshotReconcileProbeTool {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        fn execute(
+            &self,
+            input: &str,
+            context: &ToolExecutionContext,
+            _resources: &magi_tool_runtime::ToolRuntimeResources,
+        ) -> String {
+            let arguments = serde_json::from_str::<serde_json::Value>(input).unwrap_or_default();
+            let path = arguments
+                .get("changed_paths")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|items| items.first())
+                .and_then(serde_json::Value::as_str)
+                .expect("probe changed path");
+            let workspace_root = context
+                .working_directory
+                .as_ref()
+                .expect("probe working directory");
+            std::fs::write(workspace_root.join(path), format!("probe {path}"))
+                .expect("probe file write");
+            self.snapshot.reconcile().expect("probe reconcile");
+            serde_json::json!({
+                "tool": self.name,
+                "status": "succeeded",
+                "stdout": "snapshot reconciled"
+            })
+            .to_string()
+        }
+
+        fn spec(&self) -> magi_tool_runtime::BuiltinToolSpec {
+            magi_tool_runtime::BuiltinToolSpec {
+                name: self.name.to_string(),
+                risk_level: magi_core::RiskLevel::Low,
+                approval_requirement: magi_core::ApprovalRequirement::None,
+            }
+        }
+    }
+
     fn long_mission_policy() -> TaskPolicy {
         TaskPolicy {
             autonomy_level: "Autonomous".to_string(),
@@ -3376,6 +3445,128 @@ mod tests {
             mainline_change.execution_group_id.as_deref(),
             Some("mission-mailbox")
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn task_concurrent_tool_batch_keeps_snapshot_context_during_execution() {
+        let dir = tempdir().expect("temp dir");
+        let workspace_root = dir.path().to_path_buf();
+        let snapshot = magi_snapshot::SnapshotManager::new()
+            .start_session(
+                "session-task-concurrent-snapshot".to_string(),
+                workspace_root.clone(),
+            )
+            .await
+            .expect("snapshot session should start");
+
+        let event_bus = InMemoryEventBus::new(16);
+        let task_store = TaskStore::new();
+        let session_store = SessionStore::new();
+        let execution_registry = TaskExecutionRegistry::default();
+        let conversation_registry = ConversationRegistry::new();
+        let spawn_graph = Mutex::new(magi_spawn_graph::SpawnGraph::new());
+        let todo_ledger = magi_todo_ledger::TodoLedger::new();
+        let agent_role_registry = magi_agent_role::AgentRoleRegistry::load_default();
+        let mut tool_registry = ToolRegistry::new(
+            Arc::new(magi_governance::GovernanceService::default()),
+            Arc::new(InMemoryEventBus::new(8)),
+        );
+        tool_registry.register_builtin(Arc::new(SnapshotReconcileProbeTool::new(
+            BuiltinToolName::ShellExec.as_str(),
+            snapshot.clone(),
+        )));
+
+        let mut task = test_task("task-concurrent-snapshot", "task-concurrent-snapshot", None);
+        task.policy_snapshot = Some(default_agent_spawn_policy());
+        task.policy_snapshot
+            .as_mut()
+            .expect("policy")
+            .access_profile = magi_core::AccessProfile::FullAccess;
+        let session_id = SessionId::new("session-task-concurrent-snapshot");
+        let workspace_id = Some(WorkspaceId::new("workspace-task-concurrent-snapshot"));
+        let worker_id = magi_core::WorkerId::new("worker-concurrent-snapshot");
+        let tool_calls = vec![
+            ChatToolCall {
+                id: "call-concurrent-snapshot-a".to_string(),
+                kind: "function".to_string(),
+                function: ChatToolFunction {
+                    name: BuiltinToolName::ShellExec.as_str().to_string(),
+                    arguments: serde_json::json!({
+                        "command": "printf a",
+                        "access_mode": "read_only",
+                        "changed_paths": ["agent-a.txt"]
+                    })
+                    .to_string(),
+                },
+            },
+            ChatToolCall {
+                id: "call-concurrent-snapshot-b".to_string(),
+                kind: "function".to_string(),
+                function: ChatToolFunction {
+                    name: BuiltinToolName::ShellExec.as_str().to_string(),
+                    arguments: serde_json::json!({
+                        "command": "printf b",
+                        "access_mode": "read_only",
+                        "changed_paths": ["agent-b.txt"]
+                    })
+                    .to_string(),
+                },
+            },
+        ];
+
+        let result = execute_task_tool_call_batch(
+            &event_bus,
+            Some(&tool_registry),
+            &agent_role_registry,
+            None,
+            None,
+            None,
+            &task_store,
+            &session_store,
+            &execution_registry,
+            &conversation_registry,
+            &spawn_graph,
+            None,
+            &todo_ledger,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &task,
+            &session_id,
+            &workspace_id,
+            Some(&workspace_root),
+            Some(&worker_id),
+            &tool_calls,
+            Some(snapshot.clone()),
+            Some(task.mission_id.to_string()),
+        );
+
+        assert_eq!(result[0].1, ExecutionResultStatus::Succeeded);
+        assert_eq!(result[1].1, ExecutionResultStatus::Succeeded);
+        let pending = snapshot.pending_changes().expect("pending changes");
+        for (path, call_id) in [
+            ("agent-a.txt", "call-concurrent-snapshot-a"),
+            ("agent-b.txt", "call-concurrent-snapshot-b"),
+        ] {
+            let change = pending
+                .iter()
+                .find(|change| change.path == path)
+                .expect("concurrent tool change should be tracked");
+            assert_eq!(change.source, magi_snapshot::SourceKind::Tool);
+            assert_eq!(change.tool_call_id.as_deref(), Some(call_id));
+            assert_eq!(
+                change.worker_id.as_deref(),
+                Some("worker-concurrent-snapshot")
+            );
+            assert_eq!(
+                change.execution_group_id.as_deref(),
+                Some("mission-mailbox")
+            );
+        }
     }
 
     fn pending_human_checkpoint_store(
