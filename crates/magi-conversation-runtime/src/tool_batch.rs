@@ -59,6 +59,7 @@ const AGENT_SPAWN_FINAL_TEXT_MAX_CHARS: usize = 6000;
 const AGENT_SPAWN_PARENT_CONTEXT_MAX_CHARS: usize = 600;
 const AGENT_SPAWN_INHERITED_INPUT_REF_MAX: usize = 16;
 const AGENT_UNAVAILABLE_PUBLIC_TEXT: &str = "代理当前不可用，主线需要改派或接管。";
+const AGENT_SPAWN_STARTED_INSTRUCTION: &str = "代理已异步启动。若后续结论依赖该代理结果，必须调用 agent_wait，并传入 task_ids=[child_task_id] 收集终态结果；不要在未等待必要代理结果时直接给最终答复。";
 const AGENT_WAIT_DEFAULT_TIMEOUT_MS: u64 = 300_000;
 const AGENT_WAIT_MIN_TIMEOUT_MS: u64 = 1_000;
 const AGENT_WAIT_MAX_TIMEOUT_MS: u64 = 1_800_000;
@@ -691,7 +692,7 @@ fn execute_coordinator_tool(
                     "worker_id": registered_execution.worker_id.to_string(),
                     "thread_id": registered_execution.thread_id.to_string(),
                     "execution_chain_ref": registered_execution.execution_chain_ref,
-                    "instruction": "代理已异步启动。若后续结论依赖该代理结果，必须调用 agent_wait，并传入 child_task_id 收集终态结果；不要在未等待必要代理结果时直接给最终答复。",
+                    "instruction": AGENT_SPAWN_STARTED_INSTRUCTION,
                 })
                 .to_string(),
                 ExecutionResultStatus::Succeeded,
@@ -3603,6 +3604,19 @@ mod tests {
         assert_eq!(
             parsed["results"][0]["result"]["final_text"].as_str(),
             Some("已完成目录探索，发现 README.md。")
+        );
+    }
+
+    #[test]
+    fn agent_spawn_instruction_points_to_agent_wait_task_ids_contract() {
+        assert!(
+            AGENT_SPAWN_STARTED_INSTRUCTION.contains("agent_wait")
+                && AGENT_SPAWN_STARTED_INSTRUCTION.contains("task_ids=[child_task_id]"),
+            "agent_spawn 成功回执必须指向 agent_wait 的唯一 task_ids 参数契约"
+        );
+        assert!(
+            !AGENT_SPAWN_STARTED_INSTRUCTION.contains("传入 child_task_id 收集"),
+            "agent_spawn 回执不能把返回字段误写成 agent_wait 输入字段"
         );
     }
 
