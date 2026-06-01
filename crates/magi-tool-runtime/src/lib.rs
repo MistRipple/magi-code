@@ -298,6 +298,28 @@ impl BuiltinToolName {
                 | Self::FileMkdir
                 | Self::FileCopy
                 | Self::FileMove
+                | Self::AgentSpawn
+                | Self::TodoWrite
+                | Self::MemoryWrite
+                | Self::MissionCharterWrite
+                | Self::PlanWrite
+                | Self::KgWrite
+                | Self::ValidationRecord
+                | Self::Checkpoint
+                | Self::HumanCheckpointRequest
+        )
+    }
+
+    fn mutates_workspace_files(&self) -> bool {
+        matches!(
+            self,
+            Self::FileWrite
+                | Self::FilePatch
+                | Self::ApplyPatch
+                | Self::FileRemove
+                | Self::FileMkdir
+                | Self::FileCopy
+                | Self::FileMove
         )
     }
 
@@ -315,7 +337,7 @@ impl BuiltinToolName {
     }
 
     fn captures_workspace_changes(&self) -> bool {
-        self.is_write_operation() || matches!(self, Self::ShellExec)
+        self.mutates_workspace_files() || matches!(self, Self::ShellExec)
     }
 
     pub fn is_public_tool_surface(&self) -> bool {
@@ -5162,12 +5184,22 @@ mod tests {
             BuiltinToolName::FileMkdir,
             BuiltinToolName::FileCopy,
             BuiltinToolName::FileMove,
+            BuiltinToolName::AgentSpawn,
+            BuiltinToolName::TodoWrite,
+            BuiltinToolName::MemoryWrite,
+            BuiltinToolName::MissionCharterWrite,
+            BuiltinToolName::PlanWrite,
+            BuiltinToolName::KgWrite,
+            BuiltinToolName::ValidationRecord,
+            BuiltinToolName::Checkpoint,
+            BuiltinToolName::HumanCheckpointRequest,
         ];
         let non_write = [
             BuiltinToolName::FileRead,
             BuiltinToolName::ViewImage,
             BuiltinToolName::SearchText,
             BuiltinToolName::ShellExec,
+            BuiltinToolName::AgentWait,
             BuiltinToolName::WebSearch,
             BuiltinToolName::DiffPreview,
             BuiltinToolName::DiagramRender,
@@ -5198,6 +5230,27 @@ mod tests {
             ),
             magi_permissions::Decision::Allow
         );
+
+        let memory_write_request = magi_permissions::PermissionRequest::ToolInvocation {
+            tool_name: BuiltinToolName::MemoryWrite.as_str(),
+            is_write_tool: true,
+        };
+        assert_eq!(
+            engine.decide(
+                &memory_write_request,
+                &policy,
+                magi_core::AccessProfile::Restricted
+            ),
+            magi_permissions::Decision::Allow
+        );
+        assert!(matches!(
+            engine.decide(
+                &memory_write_request,
+                &policy,
+                magi_core::AccessProfile::ReadOnly
+            ),
+            magi_permissions::Decision::Deny { .. }
+        ));
 
         let shell_request = magi_permissions::PermissionRequest::ToolInvocation {
             tool_name: BuiltinToolName::ShellExec.as_str(),
@@ -6032,6 +6085,30 @@ mod tests {
         );
         assert_eq!(
             registry.builtin_access_mode(BuiltinToolName::FileMove.as_str()),
+            Some(BuiltinToolAccessMode::ExplicitWrite)
+        );
+        assert_eq!(
+            registry.builtin_access_mode(BuiltinToolName::AgentSpawn.as_str()),
+            Some(BuiltinToolAccessMode::ExplicitWrite)
+        );
+        assert_eq!(
+            registry.builtin_access_mode(BuiltinToolName::TodoWrite.as_str()),
+            Some(BuiltinToolAccessMode::ExplicitWrite)
+        );
+        assert_eq!(
+            registry.builtin_access_mode(BuiltinToolName::MemoryWrite.as_str()),
+            Some(BuiltinToolAccessMode::ExplicitWrite)
+        );
+        assert_eq!(
+            registry.builtin_access_mode(BuiltinToolName::PlanWrite.as_str()),
+            Some(BuiltinToolAccessMode::ExplicitWrite)
+        );
+        assert_eq!(
+            registry.builtin_access_mode(BuiltinToolName::KgWrite.as_str()),
+            Some(BuiltinToolAccessMode::ExplicitWrite)
+        );
+        assert_eq!(
+            registry.builtin_access_mode(BuiltinToolName::HumanCheckpointRequest.as_str()),
             Some(BuiltinToolAccessMode::ExplicitWrite)
         );
         assert_eq!(

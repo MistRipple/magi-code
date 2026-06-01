@@ -1471,6 +1471,21 @@ fn execute_task_tool_call(
                 ExecutionResultStatus::Rejected,
             );
         }
+    }
+
+    if let Some(decision) = task_tool_preflight_decision(
+        task,
+        safety_gate,
+        &tool_call.function.name,
+        &tool_call.function.arguments,
+        workspace_root_path,
+    ) {
+        return (decision.payload, decision.status);
+    }
+
+    if let Some(canonical) =
+        magi_tool_runtime::BuiltinToolName::from_str(tool_call.function.name.as_str())
+    {
         if matches!(
             canonical,
             magi_tool_runtime::BuiltinToolName::AgentSpawn
@@ -1666,31 +1681,6 @@ fn execute_task_tool_call(
         return (rejection, ExecutionResultStatus::Failed);
     }
 
-    let task_policy_decision = task_policy_tool_decision_with_workspace_root(
-        task,
-        &tool_call.function.name,
-        &tool_call.function.arguments,
-        workspace_root_path,
-    );
-
-    // S8：SafetyGate 语义判定。它和 TaskPolicy 都属于执行前判定：
-    // HardBlock 必须压过普通审批，TaskPolicy 的 Rejected 也不能被 SafetyGate
-    // 的 NeedsApproval 降级。
-    let safety_gate_decision = safety_gate.and_then(|gate| {
-        safety_gate_tool_decision(
-            gate,
-            task.policy_snapshot
-                .as_ref()
-                .map(|policy| policy.access_profile)
-                .unwrap_or_default(),
-            &tool_call.function.name,
-            &tool_call.function.arguments,
-        )
-    });
-    if let Some(decision) = select_preflight_decision(task_policy_decision, safety_gate_decision) {
-        return (decision.payload, decision.status);
-    }
-
     let access_profile = task
         .policy_snapshot
         .as_ref()
@@ -1723,6 +1713,33 @@ fn task_policy_tool_decision(
     arguments: &str,
 ) -> Option<ToolPreflightDecision> {
     task_policy_tool_decision_with_workspace_root(task, requested_tool_name, arguments, None)
+}
+
+fn task_tool_preflight_decision(
+    task: &magi_core::Task,
+    safety_gate: Option<&magi_safety_gate::SafetyGate>,
+    requested_tool_name: &str,
+    arguments: &str,
+    workspace_root_path: Option<&PathBuf>,
+) -> Option<ToolPreflightDecision> {
+    let task_policy_decision = task_policy_tool_decision_with_workspace_root(
+        task,
+        requested_tool_name,
+        arguments,
+        workspace_root_path,
+    );
+    // S8：SafetyGate 语义判定。它和 TaskPolicy 都属于执行前判定：
+    // HardBlock 必须压过普通审批，TaskPolicy 的 Rejected 也不能被 SafetyGate
+    // 的 NeedsApproval 降级。
+    let access_profile = task
+        .policy_snapshot
+        .as_ref()
+        .map(|policy| policy.access_profile)
+        .unwrap_or_default();
+    let safety_gate_decision = safety_gate.and_then(|gate| {
+        safety_gate_tool_decision(gate, access_profile, requested_tool_name, arguments)
+    });
+    select_preflight_decision(task_policy_decision, safety_gate_decision)
 }
 
 fn task_policy_tool_decision_with_workspace_root(
@@ -2683,6 +2700,159 @@ mod tests {
                 .as_str()
                 .unwrap_or_default()
                 .contains("只读任务不允许执行写入工具")
+        );
+    }
+
+    #[test]
+    fn read_only_agent_policy_rejects_state_write_tools() {
+        let mut task = test_task(
+            "task-read-only-state-tools",
+            "task-read-only-state-tools",
+            None,
+        );
+        task.policy_snapshot = Some(agent_spawn_child_policy_snapshot(
+            Some(&default_agent_spawn_policy()),
+            AgentSpawnAccessMode::ReadOnly,
+        ));
+
+        for tool in [
+            BuiltinToolName::AgentSpawn,
+            BuiltinToolName::TodoWrite,
+            BuiltinToolName::MemoryWrite,
+            BuiltinToolName::MissionCharterWrite,
+            BuiltinToolName::PlanWrite,
+            BuiltinToolName::KgWrite,
+            BuiltinToolName::ValidationRecord,
+            BuiltinToolName::Checkpoint,
+            BuiltinToolName::HumanCheckpointRequest,
+        ] {
+            let decision = task_policy_tool_decision(&task, tool.as_str(), "{}")
+                .unwrap_or_else(|| panic!("read-only agent should reject {}", tool.as_str()));
+            let payload: serde_json::Value =
+                serde_json::from_str(&decision.payload).expect("rejection should be json");
+
+            assert_eq!(decision.status, ExecutionResultStatus::Rejected);
+            assert_eq!(payload["status"].as_str(), Some("rejected"));
+            assert_eq!(payload["tool"].as_str(), Some(tool.as_str()));
+            assert!(
+                payload["error"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("只读任务不允许执行写入工具"),
+                "{} should be rejected as a write tool, got {}",
+                tool.as_str(),
+                decision.payload
+            );
+        }
+    }
+
+    #[test]
+    fn no_tools_policy_rejects_state_write_tool() {
+        let mut task = test_task("task-no-tools-state-tool", "task-no-tools-state-tool", None);
+        let mut policy = default_agent_spawn_policy();
+        policy.command_mode = "no_tools".to_string();
+        task.policy_snapshot = Some(policy);
+
+        let decision = task_policy_tool_decision(&task, BuiltinToolName::AgentSpawn.as_str(), "{}")
+            .expect("no_tools should reject agent_spawn");
+        let payload: serde_json::Value =
+            serde_json::from_str(&decision.payload).expect("rejection should be json");
+
+        assert_eq!(decision.status, ExecutionResultStatus::Rejected);
+        assert_eq!(
+            payload["tool"].as_str(),
+            Some(BuiltinToolName::AgentSpawn.as_str())
+        );
+        assert!(
+            payload["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("当前任务阶段不允许调用工具")
+        );
+    }
+
+    #[test]
+    fn task_runtime_preflight_blocks_read_only_state_tool_before_special_execution() {
+        let event_bus = InMemoryEventBus::new(16);
+        let agent_role_registry = magi_agent_role::AgentRoleRegistry::load_default();
+        let task_store = TaskStore::new();
+        let session_store = SessionStore::new();
+        let execution_registry = TaskExecutionRegistry::default();
+        let conversation_registry = ConversationRegistry::new();
+        let spawn_graph = Mutex::new(magi_spawn_graph::SpawnGraph::new());
+        let todo_ledger = magi_todo_ledger::TodoLedger::new();
+        let session_id = SessionId::new("session-read-only-state-tool");
+        let workspace_id = Some(WorkspaceId::new("workspace-read-only-state-tool"));
+        let mut task = coordinator_task(test_task(
+            "task-read-only-state-tool",
+            "task-read-only-state-tool",
+            None,
+        ));
+        let mut policy = default_agent_spawn_policy();
+        policy.access_profile = magi_core::AccessProfile::ReadOnly;
+        task.policy_snapshot = Some(policy);
+        let tool_call = ChatToolCall {
+            id: "tool-call-read-only-todo-write".to_string(),
+            kind: "function".to_string(),
+            function: ChatToolFunction {
+                name: BuiltinToolName::TodoWrite.as_str().to_string(),
+                arguments: serde_json::json!({
+                    "todos": [
+                        {
+                            "content": "不应写入",
+                            "status": "pending"
+                        }
+                    ]
+                })
+                .to_string(),
+            },
+        };
+
+        let (payload, status) = execute_task_tool_call(
+            &event_bus,
+            None,
+            &agent_role_registry,
+            None,
+            None,
+            None,
+            &task_store,
+            &session_store,
+            &execution_registry,
+            &conversation_registry,
+            &spawn_graph,
+            None,
+            &todo_ledger,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &task,
+            &session_id,
+            &workspace_id,
+            None,
+            None,
+            &tool_call,
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&payload).expect("preflight rejection should be json");
+
+        assert_eq!(status, ExecutionResultStatus::Rejected);
+        assert_eq!(
+            parsed["tool"].as_str(),
+            Some(BuiltinToolName::TodoWrite.as_str())
+        );
+        assert!(
+            parsed["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("只读任务不允许执行写入工具")
+        );
+        assert!(
+            todo_ledger.is_empty(),
+            "只读 preflight 必须发生在 todo_write 特殊执行前"
         );
     }
 
