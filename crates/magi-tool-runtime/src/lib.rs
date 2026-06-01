@@ -3202,6 +3202,81 @@ mod tests {
     }
 
     #[test]
+    fn write_guard_tracks_file_copy_camel_case_destination_alias() {
+        let root = unique_temp_dir("magi-tool-copy-write-guard");
+        let source = root.join("source.txt");
+        let destination = root.join("target.txt");
+        fs::write(&source, "source").expect("source file should write");
+
+        let governance = Arc::new(GovernanceService::default());
+        let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(16));
+        let mut tool_registry = ToolRegistry::new(governance, event_bus);
+        tool_registry.register_default_builtins();
+
+        let guarded_context = ToolExecutionContext {
+            worker_id: None,
+            task_id: Some(TaskId::new("copy-task")),
+            session_id: Some(SessionId::new("session-copy-guard")),
+            workspace_id: Some(WorkspaceId::new("workspace-copy-guard")),
+            working_directory: None,
+        };
+        let blocked_context = ToolExecutionContext {
+            task_id: Some(TaskId::new("write-task")),
+            ..guarded_context.clone()
+        };
+        let guarded_input = ToolExecutionInput {
+            tool_call_id: ToolCallId::new("tool-call-copy-guard"),
+            tool_name: BuiltinToolName::FileCopy.as_str().to_string(),
+            tool_kind: ToolKind::Builtin,
+            input: serde_json::json!({
+                "sourcePath": source.to_string_lossy(),
+                "destinationPath": destination.to_string_lossy()
+            })
+            .to_string(),
+            approval_requirement: ApprovalRequirement::None,
+            risk_level: RiskLevel::Low,
+        };
+
+        let write_guard = tool_registry
+            .acquire_write_guard(
+                &guarded_input,
+                &guarded_context,
+                BuiltinToolAccessMode::ExplicitWrite,
+            )
+            .expect("guard acquisition")
+            .expect("writeful guard");
+
+        let blocked = tool_registry.execute_with_policy(
+            ToolExecutionInput {
+                tool_call_id: ToolCallId::new("tool-call-copy-guard-blocked-write"),
+                tool_name: BuiltinToolName::FileWrite.as_str().to_string(),
+                tool_kind: ToolKind::Builtin,
+                input: serde_json::json!({
+                    "filePath": destination.to_string_lossy(),
+                    "content": "blocked"
+                })
+                .to_string(),
+                approval_requirement: ApprovalRequirement::None,
+                risk_level: RiskLevel::Low,
+            },
+            blocked_context,
+            &ToolExecutionPolicy::default(),
+        );
+        assert_eq!(blocked.status, ExecutionResultStatus::Rejected);
+        let blocked_payload: Value =
+            serde_json::from_str(&blocked.payload).expect("blocked payload json");
+        assert!(
+            blocked_payload["error"]
+                .as_str()
+                .expect("blocked error")
+                .contains("并发写冲突")
+        );
+        assert!(!destination.exists());
+
+        drop(write_guard);
+    }
+
+    #[test]
     fn shell_exec_isolates_write_guards_by_workspace_and_session() {
         let root = unique_temp_dir("magi-tool-shell-workdir");
         let governance = Arc::new(GovernanceService::default());
@@ -4411,6 +4486,67 @@ mod tests {
         assert_eq!(payload2["created"], false);
         assert_eq!(payload2["overwritten"], true);
         assert_eq!(fs::read_to_string(&file).unwrap(), "updated");
+    }
+
+    #[test]
+    fn file_tools_accept_camel_case_path_aliases() {
+        let root = unique_temp_dir("magi-tool-file-aliases");
+        let registry = make_registry();
+        let file = root.join("alias.txt");
+        let copy = root.join("alias-copy.txt");
+        let moved = root.join("alias-moved.txt");
+        let dir = root.join("alias-dir").join("nested");
+
+        let write = exec_tool(
+            &registry,
+            BuiltinToolName::FileWrite,
+            &serde_json::json!({
+                "filePath": file.to_string_lossy(),
+                "content": "alias content"
+            })
+            .to_string(),
+        );
+        assert_eq!(write.status, ExecutionResultStatus::Succeeded);
+
+        let read = exec_tool(
+            &registry,
+            BuiltinToolName::FileRead,
+            &serde_json::json!({ "filePath": file.to_string_lossy() }).to_string(),
+        );
+        assert_eq!(read.status, ExecutionResultStatus::Succeeded);
+
+        let mkdir = exec_tool(
+            &registry,
+            BuiltinToolName::FileMkdir,
+            &serde_json::json!({ "dirPath": dir.to_string_lossy() }).to_string(),
+        );
+        assert_eq!(mkdir.status, ExecutionResultStatus::Succeeded);
+        assert!(dir.is_dir());
+
+        let copied = exec_tool(
+            &registry,
+            BuiltinToolName::FileCopy,
+            &serde_json::json!({
+                "sourcePath": file.to_string_lossy(),
+                "destinationPath": copy.to_string_lossy()
+            })
+            .to_string(),
+        );
+        assert_eq!(copied.status, ExecutionResultStatus::Succeeded);
+        assert_eq!(fs::read_to_string(&copy).unwrap(), "alias content");
+
+        let moved_output = exec_tool(
+            &registry,
+            BuiltinToolName::FileMove,
+            &serde_json::json!({
+                "sourcePath": copy.to_string_lossy(),
+                "destinationPath": moved.to_string_lossy()
+            })
+            .to_string(),
+        );
+        assert_eq!(moved_output.status, ExecutionResultStatus::Succeeded);
+        assert!(!copy.exists());
+        assert_eq!(fs::read_to_string(&moved).unwrap(), "alias content");
     }
 
     #[test]

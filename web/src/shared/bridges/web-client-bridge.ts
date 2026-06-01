@@ -359,11 +359,16 @@ function requestScopeFromMessage(
   message: Record<string, unknown>,
   fallbackSessionId: string = currentSessionId,
 ): BridgeRequestScope {
-  return {
-    sessionId: trimBridgeString(message.sessionId) || fallbackSessionId || undefined,
+  const scope: BridgeRequestScope = {
     workspaceId: trimBridgeString(message.workspaceId) || currentWorkspaceId || undefined,
     workspacePath: trimBridgeString(message.workspacePath) || currentWorkspacePath || undefined,
   };
+  if (Object.prototype.hasOwnProperty.call(message, 'sessionId')) {
+    scope.sessionId = trimBridgeString(message.sessionId);
+  } else if (fallbackSessionId) {
+    scope.sessionId = fallbackSessionId;
+  }
+  return scope;
 }
 
 function asBridgeRecord(value: unknown): Record<string, unknown> | null {
@@ -2085,28 +2090,32 @@ async function switchSession(
   const targetWorkspacePath = typeof options.workspacePath === 'string' && options.workspacePath.trim()
     ? options.workspacePath.trim()
     : currentWorkspacePath;
-  activateTaskProjectionSession(sessionId);
-  const response = await getTransport().request(agentUrl('/api/session/switch'), {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
+  messagesState.sessionHydrating = true;
+  try {
+    const response = await getTransport().request(agentUrl('/api/session/switch'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        workspaceId: targetWorkspaceId,
+        workspacePath: targetWorkspacePath,
+        sessionId,
+      }),
+    });
+    if (!response.ok) {
+      throw new Error(`switch session failed: ${response.status}`);
+    }
+    await response.json();
+    await loadLatestSessionSnapshot(sessionId, {
       workspaceId: targetWorkspaceId,
       workspacePath: targetWorkspacePath,
-      sessionId,
-    }),
-  });
-  if (!response.ok) {
-    throw new Error(`switch session failed: ${response.status}`);
+    });
+  } finally {
+    messagesState.sessionHydrating = false;
   }
-  await response.json();
-  await loadLatestSessionSnapshot(sessionId, {
-    workspaceId: targetWorkspaceId,
-    workspacePath: targetWorkspacePath,
-  });
 }
 
-async function deleteSession(sessionId: string): Promise<void> {
-  const payload = await deleteAgentSession(sessionId);
+async function deleteSession(sessionId: string, scope: BridgeRequestScope = {}): Promise<void> {
+  const payload = await deleteAgentSession(sessionId, scope);
   // 不传 sessionId 提示——它指向已被删除的会话，归一化器会用它去新列表 find()
   // 找不到然后把 currentSessionId 错误地清空。让 bootstrap 自带的 currentSession 当真值：
   // 删的是当前会话 → 后端 currentSession 为空，前端也清空；
@@ -2115,21 +2124,25 @@ async function deleteSession(sessionId: string): Promise<void> {
   emitBridgeSuccessToast(i18n.t('bridge.action.deleteSession'), i18n.t('toast.sessionDeleted'));
 }
 
-async function renameSession(sessionId: string, name: string): Promise<void> {
-  const payload = await renameAgentSession(sessionId, name);
+async function renameSession(
+  sessionId: string,
+  name: string,
+  scope: BridgeRequestScope = {},
+): Promise<void> {
+  const payload = await renameAgentSession(sessionId, name, scope);
   await dispatchBootstrap(normalizeBootstrapResponse(payload, { sessionId }), { rawPayload: payload });
   emitBridgeSuccessToast(i18n.t('bridge.action.renameSession'), i18n.t('toast.sessionRenamed'));
 }
 
-async function closeSession(sessionId: string): Promise<void> {
-  const payload = await closeAgentSession(sessionId);
+async function closeSession(sessionId: string, scope: BridgeRequestScope = {}): Promise<void> {
+  const payload = await closeAgentSession(sessionId, scope);
   // 同 deleteSession：关闭后该会话不再出现在列表里，hint 会让归一化器误清空 currentSessionId
   await dispatchBootstrap(normalizeBootstrapResponse(payload), { rawPayload: payload });
   emitBridgeSuccessToast(i18n.t('bridge.action.closeSession'), i18n.t('bridge.detail.sessionClosed'));
 }
 
-async function saveCurrentSession(): Promise<void> {
-  const payload = await saveAgentCurrentSession();
+async function saveCurrentSession(scope: BridgeRequestScope = {}): Promise<void> {
+  const payload = await saveAgentCurrentSession(scope);
   await dispatchBootstrap(
     normalizeBootstrapResponse(payload, { sessionId: currentSessionId || '' }),
     { rawPayload: payload },
@@ -2275,6 +2288,9 @@ export async function autoConnectTaskTracking(
 
 interface ExecuteTaskInput {
   text?: string | null;
+  workspaceId?: string;
+  workspacePath?: string;
+  sessionId?: string;
   requestId?: string;
   skillName?: string | null;
   accessProfile?: 'read_only' | 'restricted' | 'full_access' | null;
@@ -2289,6 +2305,7 @@ function bridgeRuntimeIsBusy(): boolean {
   return Boolean(
     messagesState.isProcessing
       || messagesState.backendProcessing
+      || messagesState.sessionHydrating
       || messagesState.pendingRequests.size > 0
       || messagesState.activeMessageIds.size > 0,
   );
@@ -2300,6 +2317,11 @@ function enqueueFollowUpTurn(input: ExecuteTaskInput, normalizedText: string): v
     requestId: input.requestId,
     content: normalizedText || input.skillName || i18n.t('bridge.detail.followUpMessage'),
     text: input.text ?? null,
+    workspaceId: input.workspaceId ?? currentWorkspaceId,
+    workspacePath: input.workspacePath ?? currentWorkspacePath,
+    sessionId: Object.prototype.hasOwnProperty.call(input, 'sessionId')
+      ? trimBridgeString(input.sessionId)
+      : currentSessionId,
     createdAt: Date.now(),
     skillName: input.skillName ?? null,
     accessProfile: input.accessProfile ?? null,
@@ -2339,6 +2361,9 @@ async function drainQueuedTurns(reason: string): Promise<void> {
     const submitted = await executeTask({
       text: next.text ?? next.content,
       requestId: next.requestId || next.id,
+      workspaceId: next.workspaceId,
+      workspacePath: next.workspacePath,
+      sessionId: next.sessionId,
       skillName: next.skillName ?? null,
       accessProfile: next.accessProfile ?? null,
       images: next.images ?? [],
@@ -2368,6 +2393,15 @@ function restoreQueuedTurnToFront(queued: QueuedMessage): void {
 async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
   const text = typeof input.text === 'string' ? input.text : null;
   const normalizedText = text?.trim() || '';
+  const targetWorkspaceId = typeof input.workspaceId === 'string' && input.workspaceId.trim()
+    ? input.workspaceId.trim()
+    : currentWorkspaceId;
+  const targetWorkspacePath = typeof input.workspacePath === 'string' && input.workspacePath.trim()
+    ? input.workspacePath.trim()
+    : currentWorkspacePath;
+  const targetSessionId = Object.prototype.hasOwnProperty.call(input, 'sessionId')
+    ? trimBridgeString(input.sessionId)
+    : currentSessionId;
   const skillName = typeof input.skillName === 'string' && input.skillName.trim()
     ? input.skillName.trim()
     : null;
@@ -2418,7 +2452,7 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
     addPendingRequest(requestId);
     markMessageActive(placeholderMessageId);
     emitLocalPendingCanonicalTurn({
-      sessionId: currentSessionId,
+      sessionId: targetSessionId,
       requestId,
       userMessageId,
       placeholderMessageId,
@@ -2429,7 +2463,21 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
   }
 
   try {
-    await ensureFreshLiveBridge('execute_task_preflight');
+    if (
+      targetWorkspaceId !== currentWorkspaceId
+      || targetWorkspacePath !== currentWorkspacePath
+      || targetSessionId !== currentSessionId
+    ) {
+      persistWorkspaceBinding(targetWorkspaceId, targetWorkspacePath, targetSessionId);
+    }
+    try {
+      await ensureFreshLiveBridge('execute_task_preflight');
+    } catch (preflightError) {
+      if (!targetWorkspaceId) {
+        throw preflightError;
+      }
+      console.warn('[web-client-bridge] 发送前事件流预连接失败，继续提交本次消息:', preflightError);
+    }
     const turnResult = await submitSessionTurn({
       text,
       skillName,
@@ -2439,9 +2487,9 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
       userMessageId,
       placeholderMessageId,
     }, {
-      workspaceId: currentWorkspaceId,
-      workspacePath: currentWorkspacePath,
-      sessionId: currentSessionId,
+      workspaceId: targetWorkspaceId,
+      workspacePath: targetWorkspacePath,
+      sessionId: targetSessionId,
     });
 
     emitAcceptedCanonicalTurnFromResult(turnResult);
@@ -2452,7 +2500,7 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
       : undefined;
     const resolvedSessionId = typeof turnResult.sessionId === 'string' && turnResult.sessionId.trim()
       ? turnResult.sessionId.trim()
-      : currentSessionId;
+      : targetSessionId;
     updateRequestBinding(requestId, {
       userMessageId: canonicalUserMessageId,
       placeholderMessageId,
@@ -2463,7 +2511,7 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
       markMessageActive(placeholderMessageId);
     }
     if (resolvedSessionId) {
-      persistWorkspaceBinding(currentWorkspaceId, currentWorkspacePath, resolvedSessionId);
+      persistWorkspaceBinding(targetWorkspaceId, targetWorkspacePath, resolvedSessionId);
     }
     if (turnResult.createdSession && resolvedSessionId) {
       void fetchBootstrap({ forceFresh: true }).catch((error) => {
@@ -2504,7 +2552,7 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
     const errorText = i18n.t('bridge.detail.messageSendFailed');
     if (!isQueuedDrainSubmission) {
       emitLocalPendingCanonicalTurnFailed({
-        sessionId: currentSessionId,
+        sessionId: targetSessionId,
         requestId,
         userMessageId,
         placeholderMessageId,
@@ -3207,6 +3255,10 @@ export function createWebClientBridge(): ClientBridge {
           const workspaceId = typeof message.workspaceId === 'string' ? message.workspaceId : '';
           const workspacePath = typeof message.workspacePath === 'string' ? message.workspacePath : '';
           const sessionId = typeof message.sessionId === 'string' ? message.sessionId.trim() : '';
+          if (!sessionId && (workspaceId.trim() || workspacePath.trim())) {
+            dispatchWorkspaceSessionCleared(workspaceId, workspacePath);
+            return;
+          }
           const workspaceChanged = persistWorkspaceBinding(workspaceId, workspacePath, sessionId);
           if (workspaceChanged) {
             refreshSettingsBootstrapForCurrentWorkspace('workspace_binding_changed');
@@ -3503,16 +3555,19 @@ export function createWebClientBridge(): ClientBridge {
             );
           });
           return;
-        case 'newSession':
-          dispatchWorkspaceSessionCleared(currentWorkspaceId, currentWorkspacePath);
+        case 'newSession': {
+          const workspaceId = trimBridgeString(message.workspaceId) || currentWorkspaceId;
+          const workspacePath = trimBridgeString(message.workspacePath) || currentWorkspacePath;
+          dispatchWorkspaceSessionCleared(workspaceId, workspacePath);
           emitBridgeSuccessToast(
             i18n.t('bridge.action.newSession'),
             i18n.t('bridge.detail.newSessionPanelReady'),
             { displayMode: 'notification_center' },
           );
           return;
+        }
         case 'saveCurrentSession':
-          void saveCurrentSession().catch((error) => {
+          void saveCurrentSession(requestScopeFromMessage(message)).catch((error) => {
             logBridgeOperationFailure(i18n.t('bridge.action.saveSession'), '[web-client-bridge] 保存当前会话失败:', error);
           });
           return;
@@ -3579,6 +3634,9 @@ export function createWebClientBridge(): ClientBridge {
           ) {
             void executeTask({
               text: typeof message.text === 'string' ? message.text : null,
+              workspaceId: typeof message.workspaceId === 'string' ? message.workspaceId : undefined,
+              workspacePath: typeof message.workspacePath === 'string' ? message.workspacePath : undefined,
+              sessionId: typeof message.sessionId === 'string' ? message.sessionId : undefined,
               requestId: typeof message.requestId === 'string' ? message.requestId : undefined,
               skillName: typeof message.skillName === 'string' ? message.skillName : null,
               accessProfile: message.accessProfile === 'read_only'
@@ -3631,21 +3689,21 @@ export function createWebClientBridge(): ClientBridge {
             typeof message.sessionId === 'string' && message.sessionId.trim()
             && typeof message.name === 'string' && message.name.trim()
           ) {
-            void renameSession(message.sessionId, message.name).catch((error) => {
+            void renameSession(message.sessionId, message.name, requestScopeFromMessage(message)).catch((error) => {
               logBridgeOperationFailure(i18n.t('bridge.action.renameSession'), '[web-client-bridge] 重命名会话失败:', error);
             });
           }
           return;
         case 'closeSession':
           if (typeof message.sessionId === 'string' && message.sessionId.trim()) {
-            void closeSession(message.sessionId).catch((error) => {
+            void closeSession(message.sessionId, requestScopeFromMessage(message)).catch((error) => {
               logBridgeOperationFailure(i18n.t('bridge.action.closeSession'), '[web-client-bridge] 关闭会话失败:', error);
             });
           }
           return;
         case 'deleteSession':
           if (typeof message.sessionId === 'string' && message.sessionId.trim()) {
-            void deleteSession(message.sessionId).catch((error) => {
+            void deleteSession(message.sessionId, requestScopeFromMessage(message)).catch((error) => {
               logBridgeOperationFailure(i18n.t('bridge.action.deleteSession'), '[web-client-bridge] 删除会话失败:', error);
             });
           }

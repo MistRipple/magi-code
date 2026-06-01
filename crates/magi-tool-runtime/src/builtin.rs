@@ -281,7 +281,7 @@ fn execute_file_read(input: &str, context: &ToolExecutionContext) -> String {
     let path_input = match required_string_or_raw(
         input,
         request.as_ref(),
-        &["path", "file_path"],
+        &["path", "file_path", "filePath"],
         "file_read",
         "缺少文件路径",
     ) {
@@ -1720,7 +1720,7 @@ fn execute_file_write(input: &str, context: &ToolExecutionContext) -> String {
         }
     };
 
-    let path_input = match field_string(&request, &["path", "file_path"]) {
+    let path_input = match field_string(&request, &["path", "file_path", "filePath"]) {
         Some(p) => p,
         None => return builtin_error("file_write", "缺少 path 字段"),
     };
@@ -1791,7 +1791,7 @@ fn execute_file_patch(input: &str, context: &ToolExecutionContext) -> String {
         None => return builtin_error("file_patch", "输入必须为 JSON 对象"),
     };
 
-    let path_input = match field_string(&request, &["path", "file_path"]) {
+    let path_input = match field_string(&request, &["path", "file_path", "filePath"]) {
         Some(p) => p,
         None => return builtin_error("file_patch", "缺少 path 字段"),
     };
@@ -1913,7 +1913,7 @@ fn execute_file_remove(input: &str, context: &ToolExecutionContext) -> String {
     let path_input = match required_string_or_raw(
         input,
         request.as_ref(),
-        &["path", "file_path"],
+        &["path", "file_path", "filePath"],
         "file_remove",
         "缺少文件路径",
     ) {
@@ -2029,7 +2029,7 @@ fn execute_file_mkdir(input: &str, context: &ToolExecutionContext) -> String {
     let path_input = match required_string_or_raw(
         input,
         request.as_ref(),
-        &["path", "dir_path"],
+        &["path", "file_path", "filePath", "dir_path", "dirPath"],
         "file_mkdir",
         "缺少目录路径",
     ) {
@@ -2092,11 +2092,26 @@ fn execute_file_copy(input: &str, context: &ToolExecutionContext) -> String {
         }
     };
 
-    let src_input = match field_string(&request, &["source", "src", "from"]) {
+    let src_input = match field_string(
+        &request,
+        &["source", "src", "from", "source_path", "sourcePath"],
+    ) {
         Some(p) => p,
         None => return builtin_error("file_copy", "缺少 source 字段"),
     };
-    let dst_input = match field_string(&request, &["destination", "dst", "dest", "to"]) {
+    let dst_input = match field_string(
+        &request,
+        &[
+            "destination",
+            "dst",
+            "dest",
+            "to",
+            "destination_path",
+            "destinationPath",
+            "target_path",
+            "targetPath",
+        ],
+    ) {
         Some(p) => p,
         None => return builtin_error("file_copy", "缺少 destination 字段"),
     };
@@ -2196,11 +2211,26 @@ fn execute_file_move(input: &str, context: &ToolExecutionContext) -> String {
         }
     };
 
-    let src_input = match field_string(&request, &["source", "src", "from"]) {
+    let src_input = match field_string(
+        &request,
+        &["source", "src", "from", "source_path", "sourcePath"],
+    ) {
         Some(p) => p,
         None => return builtin_error("file_move", "缺少 source 字段"),
     };
-    let dst_input = match field_string(&request, &["destination", "dst", "dest", "to"]) {
+    let dst_input = match field_string(
+        &request,
+        &[
+            "destination",
+            "dst",
+            "dest",
+            "to",
+            "destination_path",
+            "destinationPath",
+            "target_path",
+            "targetPath",
+        ],
+    ) {
         Some(p) => p,
         None => return builtin_error("file_move", "缺少 destination 字段"),
     };

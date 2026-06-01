@@ -608,6 +608,9 @@ export interface QueuedMessage {
   localMessageId?: string;
   blockedByUserMessageId?: string;
   blockedByUserContent?: string;
+  workspaceId?: string;
+  workspacePath?: string;
+  sessionId?: string;
   content: string;
   text?: string | null;
   createdAt: number;

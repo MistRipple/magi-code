@@ -6,7 +6,10 @@ use crate::dto::{
     RuntimeReadModelDto, ServiceInfo, VersionHandshakeDto, runtime_read_model_dto,
 };
 use crate::errors::ApiError;
-use crate::mcp_config::{build_mcp_config_from_entry, normalize_mcp_server_snapshot_entry};
+use crate::mcp_config::{
+    build_mcp_config_from_entry, normalize_mcp_server_snapshot_entry,
+    redact_mcp_server_public_entry,
+};
 use crate::routes::settings::{
     builtin_role_templates, load_registry_engines, registered_role_template_ids,
     resolve_registry_agents,
@@ -1217,6 +1220,7 @@ impl ApiState {
         }
         let tool_catalog = self.settings_tool_catalog_json(tool_context);
         let skills_config = public_skills_config_section(object_section(&snapshot, "skillsConfig"));
+        let public_mcp_servers = public_mcp_servers_section(&snapshot);
         serde_json::json!({
             "workerConfigs": object_section(&snapshot, "workerConfigs"),
             "orchestratorConfig": object_section(&snapshot, "orchestratorConfig"),
@@ -1225,7 +1229,7 @@ impl ApiState {
             "skillsConfig": skills_config,
             "safeguardConfig": object_section(&snapshot, "safeguardConfig"),
             "repositories": array_section(&snapshot, "repositories"),
-            "mcpServers": array_section(&snapshot, "mcpServers"),
+            "mcpServers": public_mcp_servers,
             "builtinTools": self.builtin_tools_json(&tool_catalog),
             "capabilityDependencies": self.capability_dependencies_json(&tool_catalog),
             "workerStatuses": object_section(&snapshot, "workerStatuses"),
@@ -1707,6 +1711,22 @@ fn array_section(snapshot: &HashMap<String, serde_json::Value>, key: &str) -> se
         .get(key)
         .filter(|value| value.is_array())
         .cloned()
+        .unwrap_or_else(|| serde_json::json!([]))
+}
+
+fn public_mcp_servers_section(snapshot: &HashMap<String, serde_json::Value>) -> serde_json::Value {
+    snapshot
+        .get("mcpServers")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            serde_json::Value::Array(
+                items
+                    .iter()
+                    .cloned()
+                    .map(redact_mcp_server_public_entry)
+                    .collect(),
+            )
+        })
         .unwrap_or_else(|| serde_json::json!([]))
 }
 

@@ -50,6 +50,7 @@
   let selectedWorkspaceId = $state('');
   let currentSessionId = $state<string | null>(null);
   let pendingSessionSwitchId = $state<string | null>(null);
+  let pendingWorkspaceSwitchId = $state<string | null>(null);
   let sessionsByWorkspace = $state<Record<string, Session[]>>({});
   let loadingWorkspaceIds = $state<Record<string, boolean>>({});
   let expandedWorkspaceIds = $state<Record<string, boolean>>(readInitialExpandedWorkspaces());
@@ -72,6 +73,7 @@
   let previewPanelWidth = $state<number | null>(null);
   let isPreviewPanelResizing = $state(false);
   let pendingSessionSwitchTimer: ReturnType<typeof setTimeout> | null = null;
+  let pendingWorkspaceSwitchTimer: ReturnType<typeof setTimeout> | null = null;
 
   const INTERNAL_SESSION_NAME_PATTERNS = [
     /^auto-deep-followup-\d+$/i,
@@ -160,6 +162,9 @@
     if (!authoritativeWorkspaceId) {
       return;
     }
+    if (pendingWorkspaceSwitchId && pendingWorkspaceSwitchId !== authoritativeWorkspaceId) {
+      return;
+    }
     const currentSessions = Array.isArray(messagesState.sessions) ? messagesState.sessions : [];
     const existingSessions = sessionsByWorkspace[authoritativeWorkspaceId] ?? [];
     const sessionsChanged = existingSessions.length !== currentSessions.length
@@ -183,8 +188,18 @@
   // 左侧列表只镜像后端已确认的 workspace；用户发起中的 session 切换由 pendingSessionSwitchId 暂时保护。
   $effect(() => {
     const authoritativeWorkspaceId = currentBootstrapWorkspaceId();
-    if (!authoritativeWorkspaceId || loading || pendingSessionSwitchId || workspaceActionPending) {
+    if (!authoritativeWorkspaceId || loading || workspaceActionPending) {
       return;
+    }
+    const bootstrapSessionId = currentBootstrapSessionIdForWorkspace(authoritativeWorkspaceId);
+    if (pendingWorkspaceSwitchId && pendingWorkspaceSwitchId !== authoritativeWorkspaceId) {
+      return;
+    }
+    if (pendingSessionSwitchId && pendingSessionSwitchId !== bootstrapSessionId) {
+      return;
+    }
+    if (pendingWorkspaceSwitchId === authoritativeWorkspaceId) {
+      clearPendingWorkspaceSwitchState();
     }
     if (selectedWorkspaceId === authoritativeWorkspaceId) {
       return;
@@ -193,7 +208,6 @@
     if (!workspace) {
       return;
     }
-    const bootstrapSessionId = currentBootstrapSessionIdForWorkspace(authoritativeWorkspaceId);
     selectedWorkspaceId = authoritativeWorkspaceId;
     expandedWorkspaceIds = {
       ...expandedWorkspaceIds,
@@ -201,6 +215,9 @@
     };
     currentSessionId = bootstrapSessionId || null;
     setCurrentSessionId(bootstrapSessionId || null);
+    if (pendingSessionSwitchId === bootstrapSessionId) {
+      clearPendingSessionSwitchState();
+    }
     syncBrowserSessionBinding(workspace.workspaceId, workspace.rootPath, bootstrapSessionId || null);
     const currentSessions = sessionsByWorkspace[authoritativeWorkspaceId] ?? [];
     if (currentSessions.length === 0 || (bootstrapSessionId && !currentSessions.some((session) => session.id === bootstrapSessionId))) {
@@ -230,11 +247,7 @@
     if (!bootstrapSessionId) {
       // bootstrap 清空（删除/关闭/新建当前会话）→ 同步清空本地指针 + URL 参数
       currentSessionId = '';
-      if (pendingSessionSwitchTimer) {
-        clearTimeout(pendingSessionSwitchTimer);
-        pendingSessionSwitchTimer = null;
-      }
-      pendingSessionSwitchId = null;
+      clearPendingSessionSwitchState();
       if (workspace) {
         syncBrowserSessionBinding(workspace.workspaceId, workspace.rootPath, null);
       }
@@ -249,11 +262,7 @@
     }
     currentSessionId = bootstrapSessionId;
     if (pendingSessionSwitchId === bootstrapSessionId) {
-      if (pendingSessionSwitchTimer) {
-        clearTimeout(pendingSessionSwitchTimer);
-        pendingSessionSwitchTimer = null;
-      }
-      pendingSessionSwitchId = null;
+      clearPendingSessionSwitchState();
     }
     if (workspace) {
       syncBrowserSessionBinding(workspace.workspaceId, workspace.rootPath, bootstrapSessionId);
@@ -400,6 +409,57 @@
     getClientBridge().postMessage({ type: 'requestState' });
   }
 
+  function clearPendingSessionSwitchState(): void {
+    if (pendingSessionSwitchTimer) {
+      clearTimeout(pendingSessionSwitchTimer);
+      pendingSessionSwitchTimer = null;
+    }
+    pendingSessionSwitchId = null;
+    messagesState.sessionHydrating = false;
+  }
+
+  function clearPendingWorkspaceSwitchState(): void {
+    if (pendingWorkspaceSwitchTimer) {
+      clearTimeout(pendingWorkspaceSwitchTimer);
+      pendingWorkspaceSwitchTimer = null;
+    }
+    pendingWorkspaceSwitchId = null;
+  }
+
+  function beginPendingWorkspaceSwitch(workspaceId: string): void {
+    pendingWorkspaceSwitchId = workspaceId;
+    if (pendingWorkspaceSwitchTimer) {
+      clearTimeout(pendingWorkspaceSwitchTimer);
+    }
+    pendingWorkspaceSwitchTimer = setTimeout(() => {
+      if (pendingWorkspaceSwitchId !== workspaceId) {
+        return;
+      }
+      clearPendingWorkspaceSwitchState();
+      messagesState.sessionHydrating = false;
+    }, 6000);
+  }
+
+  function selectWorkspaceLocally(workspace: AgentWorkspaceSummary): void {
+    selectedWorkspaceId = workspace.workspaceId;
+    currentSessionId = null;
+    clearPendingSessionSwitchState();
+    expandedWorkspaceIds = {
+      ...expandedWorkspaceIds,
+      [workspace.workspaceId]: true,
+    };
+    setCurrentSessionId(null);
+    syncBrowserSessionBinding(workspace.workspaceId, workspace.rootPath, null);
+  }
+
+  function openWorkspaceFromBackend(workspace: AgentWorkspaceSummary): void {
+    beginPendingWorkspaceSwitch(workspace.workspaceId);
+    selectWorkspaceLocally(workspace);
+    requestWorkspaceBindingSync(workspace, null);
+    messagesState.sessionHydrating = true;
+    getClientBridge().postMessage({ type: 'requestState' });
+  }
+
   function applyWorkspaceSessionsSnapshot(
     workspaceId: string,
     snapshot: Awaited<ReturnType<typeof getWorkspaceSessions>>,
@@ -412,6 +472,9 @@
     const isStillSelectedWorkspace = selectedWorkspaceId === workspaceId;
     if (!isStillSelectedWorkspace) {
       return '';
+    }
+    if (pendingWorkspaceSwitchId === workspaceId) {
+      clearPendingWorkspaceSwitchState();
     }
 
     const backendSelectedSessionId = typeof snapshot.sessionId === 'string' ? snapshot.sessionId.trim() : '';
@@ -667,16 +730,24 @@
       headSummary?: string;
       tailSummary?: string;
     } = {},
-  ): void {
+  ): boolean {
     const resolvedFilePath = resolvePreviewFilePath(filePath);
     if (!resolvedFilePath) {
-      return;
+      return false;
     }
-    const sessionId = rightPaneState.activeSessionId || currentSessionId || '';
+    const sessionId = currentSessionId || '';
     if (!sessionId) {
-      return;
+      return false;
+    }
+    const workspaceId = selectedWorkspace?.workspaceId?.trim() || selectedWorkspaceId.trim();
+    const workspacePath = selectedWorkspace?.rootPath?.trim() || '';
+    if (!workspaceId || !workspacePath) {
+      return false;
     }
     openCodeTab(sessionId, resolvedFilePath, {
+      workspaceId,
+      workspacePath,
+      sessionId,
       contentKind: metadata.contentKind,
       size: metadata.size,
       mime: metadata.mime,
@@ -684,6 +755,7 @@
       headSummary: metadata.headSummary,
       tailSummary: metadata.tailSummary,
     });
+    return true;
   }
 
   async function refreshWorkspaceSessions(workspaceId: string, preferredSessionId = ''): Promise<string> {
@@ -867,6 +939,10 @@
 
   function toggleWorkspaceExpansion(workspace: AgentWorkspaceSummary): void {
     const isExpanded = !!expandedWorkspaceIds[workspace.workspaceId];
+    if (selectedWorkspaceId !== workspace.workspaceId) {
+      openWorkspaceFromBackend(workspace);
+      return;
+    }
     expandedWorkspaceIds = {
       ...expandedWorkspaceIds,
       [workspace.workspaceId]: !isExpanded,
@@ -889,11 +965,8 @@
     }
     const nextSession = (sessionsByWorkspace[workspace.workspaceId] ?? []).find((session) => session.id === sessionId);
     const nextSessionName = nextSession?.name || i18n.t('header.unnamedSession');
-    const fallbackSessionId = typeof currentSessionId === 'string' ? currentSessionId : null;
-    selectedWorkspaceId = workspace.workspaceId;
-    currentSessionId = sessionId;
     pendingSessionSwitchId = sessionId;
-    syncBrowserSessionBinding(workspace.workspaceId, workspace.rootPath, sessionId);
+    messagesState.sessionHydrating = true;
     if (pendingSessionSwitchTimer) {
       clearTimeout(pendingSessionSwitchTimer);
     }
@@ -901,17 +974,11 @@
       if (pendingSessionSwitchId !== sessionId) {
         return;
       }
-      pendingSessionSwitchId = null;
-      pendingSessionSwitchTimer = null;
-      const confirmedSessionId = typeof messagesState.currentSessionId === 'string'
-        ? messagesState.currentSessionId.trim()
-        : '';
-      currentSessionId = confirmedSessionId || fallbackSessionId;
-      syncBrowserSessionBinding(
-        workspace.workspaceId,
-        workspace.rootPath,
-        currentSessionId,
-      );
+      clearPendingSessionSwitchState();
+      messagesState.sessionHydrating = false;
+      if (selectedWorkspace) {
+        syncBrowserSessionBinding(selectedWorkspace.workspaceId, selectedWorkspace.rootPath, currentSessionId);
+      }
     }, 6000);
     addToast('info', i18n.t('web.sessionSwitching', { name: nextSessionName }), undefined, {
       category: 'feedback',
@@ -1071,8 +1138,7 @@
       }>).detail;
       const filepath = detail?.filepath;
       if (typeof filepath === 'string') {
-        event.preventDefault();
-        handleFileSelect(filepath, {
+        const handled = handleFileSelect(filepath, {
           contentKind: detail?.contentKind,
           size: detail?.size,
           mime: detail?.mime,
@@ -1080,6 +1146,9 @@
           headSummary: detail?.headSummary,
           tailSummary: detail?.tailSummary,
         });
+        if (handled) {
+          event.preventDefault();
+        }
       }
     };
     const handleAgentConnection = (event: Event) => {
@@ -1811,8 +1880,10 @@
     background: color-mix(in srgb, var(--surface-hover) 60%, transparent);
   }
 
-  .workspace-row:hover .workspace-remove-btn {
+  .workspace-row:hover .workspace-remove-btn,
+  .workspace-row:focus-within .workspace-remove-btn {
     opacity: 1;
+    pointer-events: auto;
   }
 
   .workspace-header-btn {
@@ -1891,6 +1962,7 @@
     align-items: center;
     justify-content: center;
     opacity: 0;
+    pointer-events: none;
     transition: opacity var(--transition-fast), background var(--transition-fast), color var(--transition-fast);
     flex-shrink: 0;
   }
@@ -2264,6 +2336,7 @@
       width: 28px;
       height: 28px;
       opacity: 1;
+      pointer-events: auto;
     }
 
     .mobile-toolbar {

@@ -212,7 +212,7 @@ impl KnowledgeStore {
 
         // 与索引构建原子地起文件监听：变更去抖后转发到增量更新。
         // 收敛 daemon 启动与 API 注册两条路径——所有 build 调用点自动获得 watcher。
-        self.spawn_watcher(workspace_id, workspace_root);
+        self.spawn_watcher(workspace_id, &root);
         outcome
     }
 

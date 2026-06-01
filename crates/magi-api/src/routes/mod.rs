@@ -144,13 +144,13 @@ fn resolve_bootstrap_workspace_id(
         requested_workspace_id.map(WorkspaceId::new),
         requested_workspace_path.as_deref(),
     );
+    if let Some(workspace_id) = requested_workspace_id {
+        return Some(workspace_id.to_string());
+    }
     if let Some(session_id) = requested_session_id
         && let Some(session) = state.session_store.session(session_id)
         && let Some(workspace_id) = session_scope::session_workspace_id(state, &session)
     {
-        return Some(workspace_id.to_string());
-    }
-    if let Some(workspace_id) = requested_workspace_id {
         return Some(workspace_id.to_string());
     }
     state
@@ -219,7 +219,7 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_workspace_resolution_prefers_requested_session_workspace() {
+    fn bootstrap_workspace_resolution_prefers_requested_workspace_over_stale_session() {
         let state = test_state();
         let workspace_a = WorkspaceId::new("workspace-bootstrap-url-a");
         let workspace_b = WorkspaceId::new("workspace-bootstrap-url-b");
@@ -253,6 +253,32 @@ mod tests {
             None,
             Some(&session_b),
         );
+
+        assert_eq!(resolved.as_deref(), Some(workspace_a.as_str()));
+    }
+
+    #[test]
+    fn bootstrap_workspace_resolution_uses_session_workspace_without_explicit_workspace() {
+        let state = test_state();
+        let workspace_b = WorkspaceId::new("workspace-bootstrap-session-deeplink");
+        state
+            .workspace_registry
+            .register(
+                workspace_b.clone(),
+                AbsolutePath::new("/tmp/magi-bootstrap-session-deeplink"),
+            )
+            .expect("workspace should register");
+        let session_b = SessionId::new("session-bootstrap-session-deeplink");
+        state
+            .session_store
+            .create_session_for_workspace(
+                session_b.clone(),
+                "B 会话",
+                Some(workspace_b.to_string()),
+            )
+            .expect("session should create");
+
+        let resolved = resolve_bootstrap_workspace_id(&state, None, None, Some(&session_b));
 
         assert_eq!(resolved.as_deref(), Some(workspace_b.as_str()));
     }

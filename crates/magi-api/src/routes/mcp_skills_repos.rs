@@ -14,6 +14,8 @@ use crate::{
     mcp_config::{
         build_mcp_config_from_entry, mcp_server_entry_id,
         normalize_mcp_server_request_entry as normalize_mcp_server_entry,
+        normalize_mcp_server_snapshot_entry, preserve_redacted_mcp_env_values,
+        redact_mcp_server_public_entry,
     },
     skill_loader,
     state::ApiState,
@@ -399,11 +401,45 @@ fn upsert_named_object_array_entry(
 // ─── MCP Servers ────────────────────────────────────────────────────────────
 
 fn canonical_mcp_servers(state: &ApiState) -> Vec<serde_json::Value> {
+    stored_mcp_servers(state)
+        .into_iter()
+        .map(redact_mcp_server_public_entry)
+        .map(|mut entry| {
+            let server_id = mcp_server_entry_id(&entry).map(str::to_string);
+            let connected = server_id.as_deref().is_some_and(|server_id| {
+                state
+                    .mcp_connections()
+                    .read()
+                    .expect("mcp connections read lock poisoned")
+                    .contains_key(server_id)
+            });
+            entry["connected"] = serde_json::json!(connected);
+            entry["health"] = serde_json::json!(if connected {
+                "connected"
+            } else {
+                "disconnected"
+            });
+            entry
+        })
+        .collect()
+}
+
+fn stored_mcp_servers(state: &ApiState) -> Vec<serde_json::Value> {
     state
-        .settings_snapshot_json()
+        .settings_store
+        .public_snapshot()
         .get("mcpServers")
-        .and_then(|value| value.as_array().cloned())
-        .unwrap_or_default()
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(normalize_mcp_server_snapshot_entry)
+        .collect()
+}
+
+fn stored_mcp_server_entry(state: &ApiState, server_id: &str) -> Option<serde_json::Value> {
+    stored_mcp_servers(state)
+        .into_iter()
+        .find(|entry| mcp_server_entry_id(entry).is_some_and(|id| id == server_id))
 }
 
 async fn list_mcp_servers(State(state): State<ApiState>) -> Json<serde_json::Value> {
@@ -425,7 +461,15 @@ async fn update_mcp_server(
     State(state): State<ApiState>,
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let normalized = normalize_mcp_server_entry(&request)?;
+    let requested_server_id = mcp_server_entry_id(&request).map(str::to_string);
+    let mut normalized = normalize_mcp_server_entry(&request)?;
+    let server_id = requested_server_id
+        .or_else(|| mcp_server_entry_id(&normalized).map(str::to_string))
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let existing = stored_mcp_server_entry(&state, &server_id);
+    preserve_redacted_mcp_env_values(&mut normalized, existing.as_ref());
     state
         .settings_store
         .upsert_array_entry("mcpServers", "id", &normalized);
@@ -454,9 +498,7 @@ async fn delete_mcp_server(
 }
 
 fn find_server_entry(state: &ApiState, server_id: &str) -> Option<serde_json::Value> {
-    canonical_mcp_servers(state)
-        .into_iter()
-        .find(|entry| mcp_server_entry_id(entry).is_some_and(|id| id == server_id))
+    stored_mcp_server_entry(state, server_id)
 }
 
 fn remove_mcp_connection(state: &ApiState, server_id: &str) {
@@ -1378,6 +1420,91 @@ mod tests {
             .await
             .expect("response body should read");
         serde_json::from_slice(&bytes).expect("response should be json")
+    }
+
+    async fn get_json(app: Router, path: &str) -> serde_json::Value {
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(path)
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body should read");
+        serde_json::from_slice(&bytes).expect("response should be json")
+    }
+
+    #[tokio::test]
+    async fn mcp_server_list_redacts_env_values() {
+        let state = test_state();
+        state.settings_store.upsert_array_entry(
+            "mcpServers",
+            "id",
+            &serde_json::json!({
+                "id": "server-redacted",
+                "name": "server-redacted",
+                "command": "node",
+                "enabled": false,
+                "env": {
+                    "TOKEN": "secret-token"
+                }
+            }),
+        );
+        let app = Router::new().merge(routes()).with_state(state);
+
+        let body = get_json(app, "/settings/mcp").await;
+
+        assert_eq!(
+            body["servers"][0]["env"]["TOKEN"],
+            serde_json::json!(crate::mcp_config::REDACTED_MCP_ENV_VALUE)
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_server_update_preserves_redacted_env_values() {
+        let state = test_state();
+        state.settings_store.upsert_array_entry(
+            "mcpServers",
+            "id",
+            &serde_json::json!({
+                "id": "server-preserve-env",
+                "name": "server-preserve-env",
+                "command": "node",
+                "env": {
+                    "TOKEN": "secret-token",
+                    "MODE": "old"
+                }
+            }),
+        );
+        let app = Router::new().merge(routes()).with_state(state.clone());
+
+        let body = post_json(
+            app,
+            "/settings/mcp/update",
+            serde_json::json!({
+                "id": "server-preserve-env",
+                "name": "server-preserve-env",
+                "command": "node",
+                "env": {
+                    "TOKEN": crate::mcp_config::REDACTED_MCP_ENV_VALUE,
+                    "MODE": "new"
+                },
+                "enabled": false
+            }),
+        )
+        .await;
+
+        assert_eq!(body["updated"], true);
+        let stored = stored_mcp_server_entry(&state, "server-preserve-env")
+            .expect("updated server should remain stored");
+        assert_eq!(stored["env"]["TOKEN"], serde_json::json!("secret-token"));
+        assert_eq!(stored["env"]["MODE"], serde_json::json!("new"));
+        assert_eq!(stored["enabled"], serde_json::json!(false));
     }
 
     #[tokio::test]

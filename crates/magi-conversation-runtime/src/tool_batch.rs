@@ -7,7 +7,7 @@
 //! - `task_policy_tool_decision` / `safety_gate_tool_decision` 等支撑判定。
 
 use std::{
-    path::PathBuf,
+    path::{Component, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -680,7 +680,7 @@ fn execute_coordinator_tool(
             )
         }
         magi_tool_runtime::BuiltinToolName::AgentWait => {
-            execute_agent_wait(task_store, tool, &parsed)
+            execute_agent_wait(task_store, spawn_graph, task, tool, &parsed)
         }
         _ => unreachable!("execute_coordinator_tool 只接收协调器代理工具变体"),
     }
@@ -1103,6 +1103,8 @@ fn enqueue_agent_assignment_message(
 
 fn execute_agent_wait(
     task_store: &TaskStore,
+    spawn_graph: &Mutex<magi_spawn_graph::SpawnGraph>,
+    parent_task: &magi_core::Task,
     tool: magi_tool_runtime::BuiltinToolName,
     parsed: &serde_json::Value,
 ) -> (String, ExecutionResultStatus) {
@@ -1116,6 +1118,21 @@ fn execute_agent_wait(
             })
             .to_string(),
             ExecutionResultStatus::Failed,
+        );
+    }
+    if let Some(task_id) = task_ids.iter().find(|task_id| {
+        !agent_wait_task_is_direct_child(task_store, spawn_graph, parent_task, task_id)
+    }) {
+        return (
+            serde_json::json!({
+                "tool": tool.as_str(),
+                "status": "rejected",
+                "error_code": "agent_wait_scope_mismatch",
+                "child_task_id": task_id.to_string(),
+                "error": "agent_wait 只能等待当前任务派发的代理",
+            })
+            .to_string(),
+            ExecutionResultStatus::Rejected,
         );
     }
     let timeout_ms = parse_agent_wait_timeout_ms(parsed);
@@ -1184,6 +1201,28 @@ fn execute_agent_wait(
             std::time::Duration::from_millis(timeout_ms - elapsed_ms),
         );
     }
+}
+
+fn agent_wait_task_is_direct_child(
+    task_store: &TaskStore,
+    spawn_graph: &Mutex<magi_spawn_graph::SpawnGraph>,
+    parent_task: &magi_core::Task,
+    child_task_id: &TaskId,
+) -> bool {
+    let graph_match = spawn_graph
+        .lock()
+        .ok()
+        .and_then(|graph| graph.parent_of(child_task_id).cloned())
+        .as_ref()
+        == Some(&parent_task.task_id);
+    if graph_match {
+        return true;
+    }
+    task_store
+        .get_task(child_task_id)
+        .and_then(|child| child.parent_task_id)
+        .as_ref()
+        == Some(&parent_task.task_id)
 }
 
 fn parse_agent_wait_task_ids(parsed: &serde_json::Value) -> Vec<TaskId> {
@@ -1601,10 +1640,11 @@ fn execute_task_tool_call(
         return (rejection, ExecutionResultStatus::Failed);
     }
 
-    let task_policy_decision = task_policy_tool_decision(
+    let task_policy_decision = task_policy_tool_decision_with_workspace_root(
         task,
         &tool_call.function.name,
         &tool_call.function.arguments,
+        workspace_root_path,
     );
 
     // S8：SafetyGate 语义判定。它和 TaskPolicy 都属于执行前判定：
@@ -1650,10 +1690,20 @@ fn execute_task_tool_call(
     (output.payload, output.status)
 }
 
+#[cfg(test)]
 fn task_policy_tool_decision(
     task: &magi_core::Task,
     requested_tool_name: &str,
     arguments: &str,
+) -> Option<ToolPreflightDecision> {
+    task_policy_tool_decision_with_workspace_root(task, requested_tool_name, arguments, None)
+}
+
+fn task_policy_tool_decision_with_workspace_root(
+    task: &magi_core::Task,
+    requested_tool_name: &str,
+    arguments: &str,
+    workspace_root_path: Option<&PathBuf>,
 ) -> Option<ToolPreflightDecision> {
     let policy_snapshot = task.policy_snapshot.as_ref()?;
     let canonical_tool_name = canonical_builtin_tool_name(requested_tool_name)
@@ -1676,8 +1726,11 @@ fn task_policy_tool_decision(
         &policy_snapshot.command_mode,
         &policy_snapshot.allowed_tools,
         &policy_snapshot.denied_tools,
+        &policy_snapshot.allowed_paths,
+        &policy_snapshot.denied_paths,
         requested_tool_name,
         arguments,
+        workspace_root_path,
     )
 }
 
@@ -1686,8 +1739,11 @@ pub(crate) fn access_profile_tool_decision(
     command_mode: &str,
     allowed_tools: &[String],
     denied_tools: &[String],
+    allowed_paths: &[String],
+    denied_paths: &[String],
     requested_tool_name: &str,
     arguments: &str,
+    workspace_root_path: Option<&PathBuf>,
 ) -> Option<ToolPreflightDecision> {
     let canonical_tool_name = canonical_builtin_tool_name(requested_tool_name)
         .unwrap_or_else(|| requested_tool_name.trim().to_string());
@@ -1705,21 +1761,27 @@ pub(crate) fn access_profile_tool_decision(
                 canonical_builtin_tool_name(tool).unwrap_or_else(|| tool.trim().to_string())
             })
             .collect(),
+        allowed_paths: effective_allowed_paths(access_profile, allowed_paths, workspace_root_path),
+        denied_paths: normalize_policy_paths(denied_paths, workspace_root_path),
         command_mode: command_mode.to_string(),
         ..magi_permissions::PermissionPolicy::default()
     };
     let engine = builtin_permission_engine();
     let is_write_tool = BuiltinToolName::from_str(canonical_tool_name.as_str())
         .is_some_and(|tool| tool.is_write_operation());
+    let mut pending_decision = None;
 
     let tool_request = magi_permissions::PermissionRequest::ToolInvocation {
         tool_name: canonical_tool_name.as_str(),
         is_write_tool,
     };
-    if let Some(decision) = permission_decision_payload(
-        &canonical_tool_name,
-        engine.decide(&tool_request, &canonical_policy, access_profile),
-        access_profile,
+    if let Some(decision) = select_access_profile_axis_decision(
+        &mut pending_decision,
+        permission_decision_payload(
+            &canonical_tool_name,
+            engine.decide(&tool_request, &canonical_policy, access_profile),
+            access_profile,
+        ),
     ) {
         return Some(decision);
     }
@@ -1728,15 +1790,384 @@ pub(crate) fn access_profile_tool_decision(
         let shell_request = magi_permissions::PermissionRequest::ShellCommand {
             arguments_json: arguments,
         };
-        if let Some(decision) = permission_decision_payload(
-            &canonical_tool_name,
-            engine.decide(&shell_request, &canonical_policy, access_profile),
-            access_profile,
+        if let Some(decision) = select_access_profile_axis_decision(
+            &mut pending_decision,
+            permission_decision_payload(
+                &canonical_tool_name,
+                engine.decide(&shell_request, &canonical_policy, access_profile),
+                access_profile,
+            ),
         ) {
             return Some(decision);
         }
     }
-    None
+    for (absolute_path, kind) in tool_path_access_requests(
+        &canonical_tool_name,
+        arguments,
+        workspace_root_path,
+        access_profile,
+    ) {
+        let path_request = magi_permissions::PermissionRequest::PathAccess {
+            absolute_path: absolute_path.as_path(),
+            kind,
+        };
+        if let Some(decision) = select_access_profile_axis_decision(
+            &mut pending_decision,
+            permission_decision_payload(
+                &canonical_tool_name,
+                engine.decide(&path_request, &canonical_policy, access_profile),
+                access_profile,
+            ),
+        ) {
+            return Some(decision);
+        }
+    }
+    pending_decision
+}
+
+fn effective_allowed_paths(
+    access_profile: magi_core::AccessProfile,
+    allowed_paths: &[String],
+    workspace_root_path: Option<&PathBuf>,
+) -> Vec<PathBuf> {
+    let normalized = normalize_policy_paths(allowed_paths, workspace_root_path);
+    if !normalized.is_empty() || access_profile == magi_core::AccessProfile::FullAccess {
+        return normalized;
+    }
+    workspace_root_path
+        .map(|root| vec![normalize_permission_path(root.clone())])
+        .unwrap_or_default()
+}
+
+fn normalize_policy_paths(paths: &[String], workspace_root_path: Option<&PathBuf>) -> Vec<PathBuf> {
+    paths
+        .iter()
+        .filter_map(|path| {
+            let trimmed = path.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            Some(resolve_policy_path(trimmed, workspace_root_path))
+        })
+        .collect()
+}
+
+fn resolve_policy_path(path: &str, workspace_root_path: Option<&PathBuf>) -> PathBuf {
+    let path = PathBuf::from(path);
+    let resolved = if path.is_absolute() {
+        path
+    } else if let Some(root) = workspace_root_path {
+        root.join(path)
+    } else {
+        path
+    };
+    normalize_permission_path(resolved)
+}
+
+fn resolve_tool_path(path: &str, workspace_root_path: Option<&PathBuf>) -> PathBuf {
+    resolve_policy_path(path, workspace_root_path)
+}
+
+fn normalize_permission_path(path: PathBuf) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                let can_pop = normalized
+                    .components()
+                    .next_back()
+                    .is_some_and(|last| matches!(last, Component::Normal(_)));
+                if can_pop {
+                    normalized.pop();
+                }
+            }
+            Component::Normal(value) => normalized.push(value),
+        }
+    }
+    normalized
+}
+
+fn tool_path_access_requests(
+    canonical_tool_name: &str,
+    arguments: &str,
+    workspace_root_path: Option<&PathBuf>,
+    access_profile: magi_core::AccessProfile,
+) -> Vec<(PathBuf, magi_permissions::PathAccessKind)> {
+    let Some(tool) = BuiltinToolName::from_str(canonical_tool_name) else {
+        return Vec::new();
+    };
+    let write = magi_permissions::PathAccessKind::Write;
+    let read = magi_permissions::PathAccessKind::Read;
+    let mut paths = Vec::new();
+
+    if tool == BuiltinToolName::ApplyPatch {
+        for path in derive_declared_paths(&ChatToolCall {
+            id: "permission-path-probe".to_string(),
+            kind: "function".to_string(),
+            function: magi_bridge_client::ChatToolFunction {
+                name: canonical_tool_name.to_string(),
+                arguments: arguments.to_string(),
+            },
+        }) {
+            paths.push((
+                resolve_tool_path(&path.to_string_lossy(), workspace_root_path),
+                write,
+            ));
+        }
+        return dedup_path_accesses(paths);
+    }
+
+    let arguments_value = serde_json::from_str::<serde_json::Value>(arguments).ok();
+    let object = arguments_value.as_ref().and_then(|value| value.as_object());
+
+    match tool {
+        BuiltinToolName::FileRead | BuiltinToolName::ViewImage => {
+            push_tool_path_fields(
+                &mut paths,
+                object,
+                &["path", "file_path", "filePath", "image_path", "imagePath"],
+                read,
+                workspace_root_path,
+            );
+            push_raw_path_argument(&mut paths, object, arguments, read, workspace_root_path);
+        }
+        BuiltinToolName::FileWrite | BuiltinToolName::FilePatch | BuiltinToolName::FileRemove => {
+            push_tool_path_fields(
+                &mut paths,
+                object,
+                &["path", "file_path", "filePath"],
+                write,
+                workspace_root_path,
+            );
+        }
+        BuiltinToolName::FileMkdir => {
+            push_tool_path_fields(
+                &mut paths,
+                object,
+                &["path", "file_path", "filePath", "dir_path", "dirPath"],
+                write,
+                workspace_root_path,
+            );
+        }
+        BuiltinToolName::FileCopy => {
+            push_tool_path_fields(
+                &mut paths,
+                object,
+                &["source", "src", "from", "source_path", "sourcePath"],
+                read,
+                workspace_root_path,
+            );
+            push_tool_path_fields(
+                &mut paths,
+                object,
+                &[
+                    "destination",
+                    "dst",
+                    "dest",
+                    "to",
+                    "destination_path",
+                    "destinationPath",
+                    "target_path",
+                    "targetPath",
+                ],
+                write,
+                workspace_root_path,
+            );
+        }
+        BuiltinToolName::FileMove => {
+            push_tool_path_fields(
+                &mut paths,
+                object,
+                &["source", "src", "from", "source_path", "sourcePath"],
+                write,
+                workspace_root_path,
+            );
+            push_tool_path_fields(
+                &mut paths,
+                object,
+                &[
+                    "destination",
+                    "dst",
+                    "dest",
+                    "to",
+                    "destination_path",
+                    "destinationPath",
+                    "target_path",
+                    "targetPath",
+                ],
+                write,
+                workspace_root_path,
+            );
+        }
+        BuiltinToolName::DiffPreview => {
+            push_tool_path_fields(
+                &mut paths,
+                object,
+                &["before_path", "beforePath", "left_path", "leftPath"],
+                read,
+                workspace_root_path,
+            );
+            push_tool_path_fields(
+                &mut paths,
+                object,
+                &["after_path", "afterPath", "right_path", "rightPath"],
+                read,
+                workspace_root_path,
+            );
+        }
+        BuiltinToolName::SearchText | BuiltinToolName::CodeSymbols => {
+            push_tool_path_fields(
+                &mut paths,
+                object,
+                &[
+                    "path",
+                    "root",
+                    "cwd",
+                    "working_directory",
+                    "workingDirectory",
+                    "workdir",
+                ],
+                read,
+                workspace_root_path,
+            );
+        }
+        BuiltinToolName::ShellExec => {
+            let shell_kind =
+                if magi_permissions::PermissionEngine::shell_arguments_request_read_only(arguments)
+                {
+                    read
+                } else {
+                    write
+                };
+            push_tool_path_fields(
+                &mut paths,
+                object,
+                &["cwd", "working_directory", "workingDirectory", "workdir"],
+                shell_kind,
+                workspace_root_path,
+            );
+            if paths.is_empty()
+                && let Some(root) = workspace_root_path
+                && shell_exec_uses_working_directory(arguments, object)
+            {
+                paths.push((normalize_permission_path(root.clone()), shell_kind));
+            }
+            if access_profile == magi_core::AccessProfile::ReadOnly {
+                for path in &mut paths {
+                    path.1 = read;
+                }
+            }
+        }
+        BuiltinToolName::ProcessLaunch => {
+            push_tool_path_fields(
+                &mut paths,
+                object,
+                &["cwd", "working_directory", "workingDirectory", "workdir"],
+                write,
+                workspace_root_path,
+            );
+            if paths.is_empty()
+                && let Some(root) = workspace_root_path
+            {
+                paths.push((normalize_permission_path(root.clone()), write));
+            }
+        }
+        _ => {}
+    }
+
+    dedup_path_accesses(paths)
+}
+
+fn select_access_profile_axis_decision(
+    pending_decision: &mut Option<ToolPreflightDecision>,
+    decision: Option<ToolPreflightDecision>,
+) -> Option<ToolPreflightDecision> {
+    match decision {
+        Some(decision) if decision.status == ExecutionResultStatus::Rejected => Some(decision),
+        Some(decision) => {
+            if pending_decision.is_none() {
+                *pending_decision = Some(decision);
+            }
+            None
+        }
+        None => None,
+    }
+}
+
+fn shell_exec_uses_working_directory(
+    arguments: &str,
+    object: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> bool {
+    let Some(object) = object else {
+        return !arguments.trim().is_empty();
+    };
+    object_has_non_empty_string(object, &["command", "script", "line"])
+}
+
+fn object_has_non_empty_string(
+    object: &serde_json::Map<String, serde_json::Value>,
+    keys: &[&str],
+) -> bool {
+    keys.iter().any(|key| {
+        object
+            .get(*key)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty())
+    })
+}
+
+fn push_tool_path_fields(
+    paths: &mut Vec<(PathBuf, magi_permissions::PathAccessKind)>,
+    object: Option<&serde_json::Map<String, serde_json::Value>>,
+    keys: &[&str],
+    kind: magi_permissions::PathAccessKind,
+    workspace_root_path: Option<&PathBuf>,
+) {
+    let Some(object) = object else {
+        return;
+    };
+    for key in keys {
+        if let Some(path) = object
+            .get(*key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+        {
+            paths.push((resolve_tool_path(path, workspace_root_path), kind));
+        }
+    }
+}
+
+fn push_raw_path_argument(
+    paths: &mut Vec<(PathBuf, magi_permissions::PathAccessKind)>,
+    object: Option<&serde_json::Map<String, serde_json::Value>>,
+    arguments: &str,
+    kind: magi_permissions::PathAccessKind,
+    workspace_root_path: Option<&PathBuf>,
+) {
+    if object.is_some() {
+        return;
+    }
+    let path = arguments.trim();
+    if path.is_empty() {
+        return;
+    }
+    paths.push((resolve_tool_path(path, workspace_root_path), kind));
+}
+
+fn dedup_path_accesses(
+    paths: Vec<(PathBuf, magi_permissions::PathAccessKind)>,
+) -> Vec<(PathBuf, magi_permissions::PathAccessKind)> {
+    let mut deduped = Vec::new();
+    for item in paths {
+        if !deduped.iter().any(|existing| existing == &item) {
+            deduped.push(item);
+        }
+    }
+    deduped
 }
 
 pub(crate) fn select_preflight_decision(
@@ -2220,6 +2651,259 @@ mod tests {
                 r#"{"command":"cargo test"}"#,
             )
             .is_none()
+        );
+    }
+
+    #[test]
+    fn restricted_default_scope_rejects_paths_outside_workspace() {
+        let workspace = tempdir().expect("workspace tempdir");
+        let workspace_root = workspace.path().to_path_buf();
+        let outside_path = workspace_root
+            .parent()
+            .expect("workspace should have parent")
+            .join("magi-outside-write-target.txt");
+        let mut task = test_task(
+            "task-restricted-default-path-scope",
+            "task-restricted-default-path-scope",
+            None,
+        );
+        task.policy_snapshot = Some(default_agent_spawn_policy());
+
+        assert!(
+            task_policy_tool_decision_with_workspace_root(
+                &task,
+                BuiltinToolName::FileWrite.as_str(),
+                r#"{"path":"src/lib.rs","content":"ok"}"#,
+                Some(&workspace_root),
+            )
+            .is_none()
+        );
+
+        let decision = task_policy_tool_decision_with_workspace_root(
+            &task,
+            BuiltinToolName::FileWrite.as_str(),
+            &serde_json::json!({
+                "path": outside_path.display().to_string(),
+                "content": "outside"
+            })
+            .to_string(),
+            Some(&workspace_root),
+        )
+        .expect("restricted default scope should reject outside workspace path");
+        let payload: serde_json::Value =
+            serde_json::from_str(&decision.payload).expect("decision should be json");
+
+        assert_eq!(decision.status, ExecutionResultStatus::Rejected);
+        assert!(
+            payload["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("策略未授权访问路径")
+        );
+    }
+
+    #[test]
+    fn restricted_default_scope_checks_filesystem_alias_paths() {
+        let workspace = tempdir().expect("workspace tempdir");
+        let workspace_root = workspace.path().to_path_buf();
+        let outside_path = workspace_root
+            .parent()
+            .expect("workspace should have parent")
+            .join("magi-outside-alias-target.txt");
+        let mut task = test_task(
+            "task-restricted-default-alias-path-scope",
+            "task-restricted-default-alias-path-scope",
+            None,
+        );
+        task.policy_snapshot = Some(default_agent_spawn_policy());
+
+        for (tool, arguments) in [
+            (
+                BuiltinToolName::FileCopy,
+                serde_json::json!({
+                    "source": "src/input.txt",
+                    "dest": outside_path.display().to_string()
+                }),
+            ),
+            (
+                BuiltinToolName::FileMove,
+                serde_json::json!({
+                    "from": outside_path.display().to_string(),
+                    "to": "src/output.txt"
+                }),
+            ),
+            (
+                BuiltinToolName::FileMkdir,
+                serde_json::json!({
+                    "dir_path": outside_path.display().to_string()
+                }),
+            ),
+        ] {
+            let decision = task_policy_tool_decision_with_workspace_root(
+                &task,
+                tool.as_str(),
+                &arguments.to_string(),
+                Some(&workspace_root),
+            )
+            .expect("restricted default scope should reject alias path outside workspace");
+            let payload: serde_json::Value =
+                serde_json::from_str(&decision.payload).expect("decision should be json");
+
+            assert_eq!(decision.status, ExecutionResultStatus::Rejected);
+            assert!(
+                payload["error"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("策略未授权访问路径"),
+                "unexpected payload: {payload}"
+            );
+        }
+    }
+
+    #[test]
+    fn restricted_default_scope_checks_read_alias_and_raw_paths() {
+        let workspace = tempdir().expect("workspace tempdir");
+        let workspace_root = workspace.path().to_path_buf();
+        let outside_path = workspace_root
+            .parent()
+            .expect("workspace should have parent")
+            .join("magi-outside-read-target.png");
+        let mut task = test_task(
+            "task-restricted-default-read-path-scope",
+            "task-restricted-default-read-path-scope",
+            None,
+        );
+        task.policy_snapshot = Some(default_agent_spawn_policy());
+
+        for (tool, arguments) in [
+            (
+                BuiltinToolName::ViewImage,
+                serde_json::json!({
+                    "imagePath": outside_path.display().to_string()
+                })
+                .to_string(),
+            ),
+            (
+                BuiltinToolName::FileRead,
+                outside_path.display().to_string(),
+            ),
+        ] {
+            let decision = task_policy_tool_decision_with_workspace_root(
+                &task,
+                tool.as_str(),
+                &arguments,
+                Some(&workspace_root),
+            )
+            .expect("restricted default scope should reject outside read path");
+            let payload: serde_json::Value =
+                serde_json::from_str(&decision.payload).expect("decision should be json");
+
+            assert_eq!(decision.status, ExecutionResultStatus::Rejected);
+            assert!(
+                payload["error"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("策略未授权访问路径"),
+                "unexpected payload: {payload}"
+            );
+        }
+    }
+
+    #[test]
+    fn full_access_default_scope_allows_paths_outside_workspace() {
+        let workspace = tempdir().expect("workspace tempdir");
+        let workspace_root = workspace.path().to_path_buf();
+        let outside_path = workspace_root
+            .parent()
+            .expect("workspace should have parent")
+            .join("magi-full-access-outside-target.txt");
+        let mut task = test_task(
+            "task-full-access-default-path-scope",
+            "task-full-access-default-path-scope",
+            None,
+        );
+        let mut policy = default_agent_spawn_policy();
+        policy.access_profile = magi_core::AccessProfile::FullAccess;
+        task.policy_snapshot = Some(policy);
+
+        assert!(
+            task_policy_tool_decision_with_workspace_root(
+                &task,
+                BuiltinToolName::FileWrite.as_str(),
+                &serde_json::json!({
+                    "path": outside_path.display().to_string(),
+                    "content": "outside"
+                })
+                .to_string(),
+                Some(&workspace_root),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn task_policy_allowed_paths_are_resolved_against_workspace_root() {
+        let workspace = tempdir().expect("workspace tempdir");
+        let workspace_root = workspace.path().to_path_buf();
+        let mut task = test_task("task-allowed-paths", "task-allowed-paths", None);
+        let mut policy = default_agent_spawn_policy();
+        policy.allowed_paths = vec!["src".to_string()];
+        task.policy_snapshot = Some(policy);
+
+        assert!(
+            task_policy_tool_decision_with_workspace_root(
+                &task,
+                BuiltinToolName::FileRead.as_str(),
+                r#"{"path":"src/lib.rs"}"#,
+                Some(&workspace_root),
+            )
+            .is_none()
+        );
+
+        let decision = task_policy_tool_decision_with_workspace_root(
+            &task,
+            BuiltinToolName::FileRead.as_str(),
+            r#"{"path":"README.md"}"#,
+            Some(&workspace_root),
+        )
+        .expect("path outside allow list should be rejected");
+        let payload: serde_json::Value =
+            serde_json::from_str(&decision.payload).expect("decision should be json");
+
+        assert_eq!(decision.status, ExecutionResultStatus::Rejected);
+        assert!(
+            payload["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("策略未授权访问路径")
+        );
+    }
+
+    #[test]
+    fn denied_path_overrides_restricted_shell_approval() {
+        let workspace = tempdir().expect("workspace tempdir");
+        let workspace_root = workspace.path().to_path_buf();
+        let mut task = test_task("task-denied-shell-path", "task-denied-shell-path", None);
+        let mut policy = long_mission_policy();
+        policy.denied_paths = vec!["private".to_string()];
+        task.policy_snapshot = Some(policy);
+
+        let decision = task_policy_tool_decision_with_workspace_root(
+            &task,
+            BuiltinToolName::ShellExec.as_str(),
+            r#"{"command":"cat secret.txt > out.txt","cwd":"private"}"#,
+            Some(&workspace_root),
+        )
+        .expect("denied path should reject before approval");
+        let payload: serde_json::Value =
+            serde_json::from_str(&decision.payload).expect("decision should be json");
+
+        assert_eq!(decision.status, ExecutionResultStatus::Rejected);
+        assert!(
+            payload["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("策略拒绝访问路径")
         );
     }
 
@@ -2712,6 +3396,8 @@ mod tests {
     #[test]
     fn agent_wait_returns_completed_agent_final_text() {
         let task_store = TaskStore::new();
+        let parent = test_task("task-agent-wait-root", "task-agent-wait-root", None);
+        let spawn_graph = Mutex::new(magi_spawn_graph::SpawnGraph::new());
         let mut child = test_task(
             "task-agent-wait-child",
             "task-agent-wait-root",
@@ -2738,6 +3424,8 @@ mod tests {
 
         let (payload, status) = execute_agent_wait(
             &task_store,
+            &spawn_graph,
+            &parent,
             BuiltinToolName::AgentWait,
             &serde_json::json!({
                 "task_ids": ["task-agent-wait-child"],
@@ -2765,8 +3453,46 @@ mod tests {
     }
 
     #[test]
+    fn agent_wait_rejects_task_outside_current_spawn_scope() {
+        let task_store = TaskStore::new();
+        let parent = test_task("task-agent-wait-root", "task-agent-wait-root", None);
+        let spawn_graph = Mutex::new(magi_spawn_graph::SpawnGraph::new());
+        let mut foreign_child = test_task(
+            "task-agent-wait-foreign-child",
+            "task-other-root",
+            Some(TaskId::new("task-other-root")),
+        );
+        foreign_child.status = TaskStatus::Completed;
+        foreign_child.output_refs = vec!["foreign result".to_string()];
+        task_store.insert_task(foreign_child);
+
+        let (payload, status) = execute_agent_wait(
+            &task_store,
+            &spawn_graph,
+            &parent,
+            BuiltinToolName::AgentWait,
+            &serde_json::json!({
+                "task_ids": ["task-agent-wait-foreign-child"],
+                "timeout_ms": 1000,
+            }),
+        );
+
+        assert_eq!(status, ExecutionResultStatus::Rejected);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&payload).expect("agent_wait rejection should be json");
+        assert_eq!(parsed["status"].as_str(), Some("rejected"));
+        assert_eq!(
+            parsed["error_code"].as_str(),
+            Some("agent_wait_scope_mismatch")
+        );
+        assert!(!payload.contains("foreign result"));
+    }
+
+    #[test]
     fn agent_wait_marks_unavailable_agent_as_degradable() {
         let task_store = TaskStore::new();
+        let parent = test_task("task-agent-wait-root", "task-agent-wait-root", None);
+        let spawn_graph = Mutex::new(magi_spawn_graph::SpawnGraph::new());
         let mut child = test_task(
             "task-agent-wait-unavailable",
             "task-agent-wait-root",
@@ -2783,6 +3509,8 @@ mod tests {
 
         let (payload, status) = execute_agent_wait(
             &task_store,
+            &spawn_graph,
+            &parent,
             BuiltinToolName::AgentWait,
             &serde_json::json!({
                 "task_ids": ["task-agent-wait-unavailable"],
@@ -2821,6 +3549,8 @@ mod tests {
     #[test]
     fn agent_wait_preserves_non_degradable_agent_failure() {
         let task_store = TaskStore::new();
+        let parent = test_task("task-agent-wait-root", "task-agent-wait-root", None);
+        let spawn_graph = Mutex::new(magi_spawn_graph::SpawnGraph::new());
         let mut child = test_task(
             "task-agent-wait-real-failure",
             "task-agent-wait-root",
@@ -2837,6 +3567,8 @@ mod tests {
 
         let (payload, status) = execute_agent_wait(
             &task_store,
+            &spawn_graph,
+            &parent,
             BuiltinToolName::AgentWait,
             &serde_json::json!({
                 "task_ids": ["task-agent-wait-real-failure"],
@@ -2860,6 +3592,8 @@ mod tests {
     #[test]
     fn agent_wait_redacts_internal_failure_details_from_failed_agent_output() {
         let task_store = TaskStore::new();
+        let parent = test_task("task-agent-wait-root", "task-agent-wait-root", None);
+        let spawn_graph = Mutex::new(magi_spawn_graph::SpawnGraph::new());
         let mut child = test_task(
             "task-agent-wait-redacted-failure",
             "task-agent-wait-root",
@@ -2879,6 +3613,8 @@ mod tests {
 
         let (payload, status) = execute_agent_wait(
             &task_store,
+            &spawn_graph,
+            &parent,
             BuiltinToolName::AgentWait,
             &serde_json::json!({
                 "task_ids": ["task-agent-wait-redacted-failure"],

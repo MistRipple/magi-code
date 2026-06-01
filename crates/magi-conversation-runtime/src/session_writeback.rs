@@ -951,8 +951,11 @@ fn execute_session_turn_tool_call(
         "",
         &[],
         &[],
+        &[],
+        &[],
         &tool_call.function.name,
         &tool_call.function.arguments,
+        workspace_root_path,
     );
     let safety_gate_decision = safety_gate.and_then(|gate| {
         safety_gate_tool_decision(

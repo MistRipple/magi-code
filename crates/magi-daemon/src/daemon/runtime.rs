@@ -3063,8 +3063,8 @@ mod tests {
             openai["error"]["message"]
                 .as_str()
                 .expect("model error should serialize as string")
-                .contains("provider rejected request"),
-            "provider failure should retain upstream bridge error: {openai:?}"
+                .contains("桥接服务返回失败状态"),
+            "provider failure should expose public bridge error: {openai:?}"
         );
 
         let request = receiver
@@ -3171,8 +3171,8 @@ mod tests {
             openai["error"]["message"]
                 .as_str()
                 .expect("model error should serialize as string")
-                .contains("provider unavailable"),
-            "degraded provider should keep unavailable error detail: {openai:?}"
+                .contains("桥接服务返回失败状态"),
+            "degraded provider should expose public bridge error: {openai:?}"
         );
 
         let mcp = services
@@ -3286,8 +3286,8 @@ mod tests {
             .as_str()
             .expect("model error should serialize as string");
         assert!(
-            error_message.contains("provider response invalid"),
-            "invalid provider response should retain bridge error: {openai:?}"
+            error_message.contains("桥接服务返回失败状态"),
+            "invalid provider response should expose public bridge error: {openai:?}"
         );
 
         let request = receiver
@@ -3643,8 +3643,8 @@ mod tests {
             .as_str()
             .expect("model error should serialize as string");
         assert!(
-            error_message.contains("provider transport failed"),
-            "transport failure should retain bridge error: {openai:?}"
+            error_message.contains("桥接服务返回失败状态"),
+            "transport failure should expose public bridge error: {openai:?}"
         );
 
         let mcp = services

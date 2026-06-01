@@ -769,7 +769,15 @@ function resolveBindingOverrideValue(
   fallback: string,
 ): string {
   if (bindingOverride && Object.prototype.hasOwnProperty.call(bindingOverride, key)) {
-    return bindingOverride[key]?.trim() || '';
+    const value = bindingOverride[key];
+    if (typeof value !== 'string') {
+      return fallback;
+    }
+    const trimmed = value.trim();
+    if (key === 'sessionId') {
+      return trimmed;
+    }
+    return trimmed || fallback;
   }
   return fallback;
 }
@@ -974,8 +982,7 @@ export async function listAgentDirectory(
     if (showHidden) {
       query.set('showHidden', '1');
     }
-    const qs = query.toString();
-    const response = await getTransport().request(agentUrl(`/api/filesystem/list${qs ? `?${qs}` : ''}`));
+    const response = await getTransport().request(agentUrl('/api/filesystem/list', query.toString()));
     return await parseAgentJson<WorkspaceDirectoryListResult>(response, 'list directory');
   } catch (error) {
     throwNormalizedDirectoryError(error);
@@ -994,8 +1001,7 @@ export async function browseAgentDirectory(
     if (showHidden) {
       query.set('showHidden', '1');
     }
-    const qs = query.toString();
-    const response = await getTransport().request(agentUrl(`/api/filesystem/browse${qs ? `?${qs}` : ''}`));
+    const response = await getTransport().request(agentUrl('/api/filesystem/browse', query.toString()));
     return await parseAgentJson<DirectoryListResult>(response, 'browse directory');
   } catch (error) {
     throwNormalizedDirectoryError(error);
@@ -1073,20 +1079,52 @@ async function postWorkspaceBoundJson<T>(
   return await postBoundJson<T>(pathname, payload, action, { sessionId: '' });
 }
 
-export async function deleteAgentSession(sessionId: string): Promise<AgentBootstrapSnapshot> {
-  return await postBoundJson<AgentBootstrapSnapshot>('/api/session/delete', { sessionId }, 'delete session');
+export async function deleteAgentSession(
+  sessionId: string,
+  bindingOverride?: Partial<AgentBindingContext>,
+): Promise<AgentBootstrapSnapshot> {
+  return await postBoundJson<AgentBootstrapSnapshot>(
+    '/api/session/delete',
+    { sessionId },
+    'delete session',
+    bindingOverride,
+  );
 }
 
-export async function renameAgentSession(sessionId: string, name: string): Promise<AgentBootstrapSnapshot> {
-  return await postBoundJson<AgentBootstrapSnapshot>('/api/session/rename', { sessionId, name }, 'rename session');
+export async function renameAgentSession(
+  sessionId: string,
+  name: string,
+  bindingOverride?: Partial<AgentBindingContext>,
+): Promise<AgentBootstrapSnapshot> {
+  return await postBoundJson<AgentBootstrapSnapshot>(
+    '/api/session/rename',
+    { sessionId, name },
+    'rename session',
+    bindingOverride,
+  );
 }
 
-export async function closeAgentSession(sessionId: string): Promise<AgentBootstrapSnapshot> {
-  return await postBoundJson<AgentBootstrapSnapshot>('/api/session/close', { sessionId }, 'close session');
+export async function closeAgentSession(
+  sessionId: string,
+  bindingOverride?: Partial<AgentBindingContext>,
+): Promise<AgentBootstrapSnapshot> {
+  return await postBoundJson<AgentBootstrapSnapshot>(
+    '/api/session/close',
+    { sessionId },
+    'close session',
+    bindingOverride,
+  );
 }
 
-export async function saveAgentCurrentSession(): Promise<AgentBootstrapSnapshot> {
-  return await postBoundJson<AgentBootstrapSnapshot>('/api/session/save', {}, 'save current session');
+export async function saveAgentCurrentSession(
+  bindingOverride?: Partial<AgentBindingContext>,
+): Promise<AgentBootstrapSnapshot> {
+  return await postBoundJson<AgentBootstrapSnapshot>(
+    '/api/session/save',
+    {},
+    'save current session',
+    bindingOverride,
+  );
 }
 
 export async function getAgentSessionNotifications(scope: AgentNotificationScope): Promise<AgentSessionNotificationsPayload> {
@@ -1154,9 +1192,9 @@ export async function submitSessionTurn(
   try {
     const resolvedBinding = resolveAgentBindingContext();
     const binding: AgentBindingContext = {
-      workspaceId: bindingOverride?.workspaceId?.trim() || resolvedBinding.workspaceId,
-      workspacePath: bindingOverride?.workspacePath?.trim() || resolvedBinding.workspacePath,
-      sessionId: bindingOverride?.sessionId?.trim() || resolvedBinding.sessionId,
+      workspaceId: resolveBindingOverrideValue(bindingOverride, 'workspaceId', resolvedBinding.workspaceId),
+      workspacePath: resolveBindingOverrideValue(bindingOverride, 'workspacePath', resolvedBinding.workspacePath),
+      sessionId: resolveBindingOverrideValue(bindingOverride, 'sessionId', resolvedBinding.sessionId),
     };
     if (!binding.workspaceId) {
       throw new AgentApiError(400, 'workspaceId 不能为空', 'submit session turn');

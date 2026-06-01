@@ -175,7 +175,11 @@
    */
   function previewEntryPoint(filepath: string) {
     if (!filepath) return;
-    openCodeTab(messagesState.currentSessionId, filepath);
+    openCodeTab(messagesState.currentSessionId, filepath, {
+      sessionId: messagesState.currentSessionId ?? undefined,
+      workspaceId: messagesState.currentWorkspaceId ?? undefined,
+      workspacePath: messagesState.currentWorkspacePath || undefined,
+    });
   }
 
   function splitTags(value: string): string[] {

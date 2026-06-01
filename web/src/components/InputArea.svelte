@@ -534,8 +534,18 @@
       inputValue = text;
       queueMicrotask(focusEditor);
     }
+    function handleAccessProfileOutsidePointerDown(event: PointerEvent) {
+      if (!accessProfilePickerOpen) return;
+      const target = event.target;
+      if (target instanceof Element && target.closest('.ia-access-wrap')) return;
+      accessProfilePickerOpen = false;
+    }
     window.addEventListener('magi:fillComposer', handleFillComposer as EventListener);
-    return () => window.removeEventListener('magi:fillComposer', handleFillComposer as EventListener);
+    document.addEventListener('pointerdown', handleAccessProfileOutsidePointerDown, true);
+    return () => {
+      window.removeEventListener('magi:fillComposer', handleFillComposer as EventListener);
+      document.removeEventListener('pointerdown', handleAccessProfileOutsidePointerDown, true);
+    };
   });
 
   // 分支状态随工作区 reactive 重查：currentWorkspacePath 由 SSE 异步 hydrate，
@@ -565,7 +575,7 @@
   async function sendMessage() {
     const rawContent = resolveComposerRawContent();
     const normalizedContent = rawContent.trim();
-    if ((!normalizedContent && selectedImages.length === 0) || isInteractionBlocking) return;
+    if ((!normalizedContent && selectedImages.length === 0) || sessionInputLocked || isInteractionBlocking) return;
     if (isSending && selectedImages.length > 0) {
       addToast('warning', i18n.t('input.noImageDuringExecution'));
       return;
@@ -586,6 +596,9 @@
       type: 'executeTask',
       text: submissionText,
       requestId,
+      workspaceId: messagesState.currentWorkspaceId || undefined,
+      workspacePath: messagesState.currentWorkspacePath || undefined,
+      sessionId: messagesState.currentSessionId || '',
       skillName: selectedSkill?.name ?? null,
       accessProfile: selectedAccessProfile,
       followUpMode: isSending ? 'queue' : undefined,
@@ -1310,7 +1323,7 @@
       </div>
 
       <div class="ia-right">
-        <div class="ia-picker-wrap">
+        <div class="ia-picker-wrap ia-access-wrap">
           <button
             type="button"
             class="ia-picker-btn ia-access-btn"
@@ -1346,7 +1359,7 @@
             </div>
           {/if}
         </div>
-        <div class="ia-picker-wrap">
+        <div class="ia-picker-wrap ia-model-wrap">
           <button
             type="button"
             class="ia-picker-btn"
@@ -1599,12 +1612,19 @@
     gap: var(--space-1);
     flex-shrink: 0;
     border-radius: 0 0 var(--radius-lg) var(--radius-lg);
+    min-width: 0;
   }
 
   .ia-left, .ia-right {
     display: flex;
     align-items: center;
     gap: 4px;
+    min-width: 0;
+  }
+
+  .ia-right {
+    flex-wrap: nowrap;
+    justify-content: flex-end;
   }
 
   /* 发送按钮：圆形 */
@@ -1671,6 +1691,7 @@
   .ia-picker-wrap {
     position: relative;
     display: inline-flex;
+    min-width: 0;
   }
   .ia-access-btn-label {
     overflow: hidden;
@@ -2189,6 +2210,84 @@
     .ia-queue-actions {
       opacity: 1;
       transform: none;
+    }
+  }
+
+  @media (max-width: 640px) {
+    .ia-container {
+      padding: var(--space-2) 10px calc(var(--space-2) + env(safe-area-inset-bottom));
+    }
+
+    .ia-wrapper {
+      max-height: min(46vh, 340px);
+      border-radius: var(--radius-lg);
+    }
+
+    .ia-actions {
+      flex-wrap: wrap;
+      align-items: stretch;
+      justify-content: flex-start;
+      gap: 6px;
+      padding: 6px;
+    }
+
+    .ia-left {
+      flex: 1 1 100%;
+      width: 100%;
+    }
+
+    .ia-left:empty {
+      display: none;
+    }
+
+    .ia-right {
+      flex: 1 1 100%;
+      width: 100%;
+      flex-wrap: wrap;
+      justify-content: flex-start;
+      gap: 6px;
+    }
+
+    .ia-branch-btn {
+      max-width: 100%;
+    }
+
+    .ia-access-wrap {
+      flex: 0 1 auto;
+      max-width: 118px;
+    }
+
+    .ia-model-wrap {
+      flex: 0 1 auto;
+      max-width: min(176px, 52vw);
+    }
+
+    .ia-access-wrap .ia-picker-btn,
+    .ia-model-wrap .ia-picker-btn {
+      width: auto;
+      max-width: 100%;
+    }
+
+    .ia-access-btn-label {
+      max-width: 72px;
+    }
+
+    .ia-picker-btn-label {
+      max-width: none;
+      min-width: 0;
+    }
+
+    .ia-enhance {
+      flex: 0 0 auto;
+    }
+
+    .ia-send {
+      flex: 0 0 28px;
+    }
+
+    .ia-picker-popover {
+      width: min(280px, calc(100vw - 24px));
+      max-height: min(360px, 56vh);
     }
   }
 

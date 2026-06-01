@@ -282,6 +282,15 @@ function normalizeQueuedMessageList(value: unknown): QueuedMessage[] {
       blockedByUserContent: typeof item.blockedByUserContent === 'string' && item.blockedByUserContent.trim()
         ? item.blockedByUserContent.trim()
         : undefined,
+      workspaceId: typeof item.workspaceId === 'string' && item.workspaceId.trim()
+        ? item.workspaceId.trim()
+        : undefined,
+      workspacePath: typeof item.workspacePath === 'string' && item.workspacePath.trim()
+        ? item.workspacePath.trim()
+        : undefined,
+      sessionId: typeof item.sessionId === 'string'
+        ? item.sessionId.trim()
+        : undefined,
       content: item.content,
       text: typeof item.text === 'string' ? item.text : null,
       createdAt: item.createdAt,

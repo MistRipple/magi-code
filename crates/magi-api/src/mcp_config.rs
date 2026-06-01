@@ -3,6 +3,8 @@ use magi_bridge_client::McpServerConfig;
 use serde_json::Value;
 use std::{collections::BTreeMap, path::PathBuf};
 
+pub(crate) const REDACTED_MCP_ENV_VALUE: &str = "********";
+
 fn unwrap_mcp_server_payload<'a>(request: &'a Value) -> &'a Value {
     request
         .get("server")
@@ -74,6 +76,37 @@ pub(crate) fn normalize_mcp_server_request_entry(request: &Value) -> Result<Valu
     let mut object = normalized.as_object().cloned().unwrap_or_default();
     object.insert("command".to_string(), serde_json::json!(command));
     Ok(Value::Object(object))
+}
+
+pub(crate) fn redact_mcp_server_public_entry(entry: Value) -> Value {
+    let mut entry = entry;
+    if let Some(env) = entry.get_mut("env").and_then(Value::as_object_mut) {
+        for value in env.values_mut() {
+            if value.as_str().is_some() {
+                *value = serde_json::json!(REDACTED_MCP_ENV_VALUE);
+            }
+        }
+    }
+    entry
+}
+
+pub(crate) fn preserve_redacted_mcp_env_values(entry: &mut Value, existing: Option<&Value>) {
+    let Some(existing_env) = existing
+        .and_then(|value| value.get("env"))
+        .and_then(Value::as_object)
+    else {
+        return;
+    };
+    let Some(next_env) = entry.get_mut("env").and_then(Value::as_object_mut) else {
+        return;
+    };
+    for (key, value) in next_env.iter_mut() {
+        if value.as_str() == Some(REDACTED_MCP_ENV_VALUE)
+            && let Some(existing_value) = existing_env.get(key).and_then(Value::as_str)
+        {
+            *value = serde_json::json!(existing_value);
+        }
+    }
 }
 
 pub(crate) fn build_mcp_config_from_entry(entry: &Value) -> Option<McpServerConfig> {
@@ -198,5 +231,45 @@ mod tests {
         assert_eq!(config.working_directory, Some(PathBuf::from("/tmp")));
         assert_eq!(config.env.get("A").map(String::as_str), Some("1"));
         assert!(!config.env.contains_key("IGNORED"));
+    }
+
+    #[test]
+    fn public_entry_redacts_env_values_but_keeps_keys() {
+        let public = redact_mcp_server_public_entry(serde_json::json!({
+            "id": "server",
+            "env": {
+                "TOKEN": "secret",
+                "COUNT": 1
+            }
+        }));
+
+        assert_eq!(
+            public["env"]["TOKEN"],
+            serde_json::json!(REDACTED_MCP_ENV_VALUE)
+        );
+        assert_eq!(public["env"]["COUNT"], serde_json::json!(1));
+    }
+
+    #[test]
+    fn redacted_env_values_preserve_existing_secret_on_update() {
+        let existing = serde_json::json!({
+            "id": "server",
+            "env": {
+                "TOKEN": "secret",
+                "OTHER": "old"
+            }
+        });
+        let mut next = serde_json::json!({
+            "id": "server",
+            "env": {
+                "TOKEN": REDACTED_MCP_ENV_VALUE,
+                "OTHER": "new"
+            }
+        });
+
+        preserve_redacted_mcp_env_values(&mut next, Some(&existing));
+
+        assert_eq!(next["env"]["TOKEN"], serde_json::json!("secret"));
+        assert_eq!(next["env"]["OTHER"], serde_json::json!("new"));
     }
 }

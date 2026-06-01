@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::session_scope::{
     parse_session_id, require_registered_workspace_id, require_session_record_in_workspace,
-    require_workspace_id, session_workspace_id,
+    session_workspace_id,
 };
 use crate::{
     dto::{
@@ -1866,10 +1866,8 @@ async fn switch_session(
     Json(request): Json<SwitchSessionRequest>,
 ) -> Result<Json<SessionSelectionResponseDto>, ApiError> {
     let session_id = SessionId::new(&request.session_id);
-    let workspace_id = request
-        .requested_workspace_id()
-        .ok_or_else(|| ApiError::InvalidInput("workspaceId 不能为空".to_string()))?;
-    require_session_record_in_workspace(&state, &session_id, Some(workspace_id))?;
+    let workspace_id = require_registered_workspace_id(&state, request.requested_workspace_id())?;
+    require_session_record_in_workspace(&state, &session_id, Some(workspace_id.as_str()))?;
     state
         .session_store
         .switch_session(&session_id)
@@ -2008,7 +2006,7 @@ async fn delete_session(
     State(state): State<ApiState>,
     Json(request): Json<DeleteSessionRequest>,
 ) -> Result<Json<BootstrapDto>, ApiError> {
-    let workspace_id = require_workspace_id(request.requested_workspace_id())?;
+    let workspace_id = require_registered_workspace_id(&state, request.requested_workspace_id())?;
     let session_id = SessionId::new(&request.session_id);
     require_session_record_in_workspace(&state, &session_id, Some(workspace_id.as_str()))?;
     state
@@ -2041,7 +2039,7 @@ async fn rename_session(
     State(state): State<ApiState>,
     Json(request): Json<RenameSessionRequest>,
 ) -> Result<Json<BootstrapDto>, ApiError> {
-    let workspace_id = require_workspace_id(request.requested_workspace_id())?;
+    let workspace_id = require_registered_workspace_id(&state, request.requested_workspace_id())?;
     let session_id = SessionId::new(&request.session_id);
     require_session_record_in_workspace(&state, &session_id, Some(workspace_id.as_str()))?;
     state
@@ -2073,7 +2071,7 @@ async fn close_session(
     State(state): State<ApiState>,
     Json(request): Json<CloseSessionRequest>,
 ) -> Result<Json<BootstrapDto>, ApiError> {
-    let workspace_id = require_workspace_id(request.requested_workspace_id())?;
+    let workspace_id = require_registered_workspace_id(&state, request.requested_workspace_id())?;
     let session_id = SessionId::new(&request.session_id);
     require_session_record_in_workspace(&state, &session_id, Some(workspace_id.as_str()))?;
     state
@@ -2094,18 +2092,16 @@ async fn save_session(
     State(state): State<ApiState>,
     Json(request): Json<SaveSessionRequest>,
 ) -> Result<Json<BootstrapDto>, ApiError> {
-    let workspace_id = request
-        .requested_workspace_id()
-        .ok_or_else(|| ApiError::InvalidInput("workspaceId 不能为空".to_string()))?;
+    let workspace_id = require_registered_workspace_id(&state, request.requested_workspace_id())?;
     let selected_session_id = if let Some(session_id) = request.requested_session_id() {
-        require_session_record_in_workspace(&state, &session_id, Some(workspace_id))?;
+        require_session_record_in_workspace(&state, &session_id, Some(workspace_id.as_str()))?;
         Some(session_id)
     } else {
         None
     };
     state.persist_session_durable_state_for_api()?;
     Ok(Json(state.bootstrap_dto_for_workspace_session(
-        Some(workspace_id),
+        Some(workspace_id.as_str()),
         selected_session_id.as_ref(),
     )?))
 }
@@ -2132,7 +2128,7 @@ async fn get_notifications(
     State(state): State<ApiState>,
     Query(query): Query<NotificationsQuery>,
 ) -> Result<Json<SessionNotificationsResponseDto>, ApiError> {
-    let workspace_id = require_workspace_id(query.requested_workspace_id())?;
+    let workspace_id = require_registered_workspace_id(&state, query.requested_workspace_id())?;
     let session_id =
         require_notifications_session_id(&state, query.requested_session_id(), &workspace_id)?;
     Ok(Json(build_notifications_response(
@@ -2214,7 +2210,7 @@ async fn append_session_notification(
     State(state): State<ApiState>,
     Json(request): Json<AppendNotificationRequest>,
 ) -> Result<Json<SessionNotificationsResponseDto>, ApiError> {
-    let workspace_id = require_workspace_id(request.requested_workspace_id())?;
+    let workspace_id = require_registered_workspace_id(&state, request.requested_workspace_id())?;
     let session_id =
         require_notifications_session_id(&state, request.requested_session_id(), &workspace_id)?;
     if request.persist_to_center == Some(false) {
@@ -2262,7 +2258,7 @@ async fn mark_all_notifications_read(
     State(state): State<ApiState>,
     Json(request): Json<NotificationScopeRequest>,
 ) -> Result<Json<SessionNotificationsResponseDto>, ApiError> {
-    let workspace_id = require_workspace_id(request.requested_workspace_id())?;
+    let workspace_id = require_registered_workspace_id(&state, request.requested_workspace_id())?;
     let session_id =
         require_notifications_session_id(&state, request.requested_session_id(), &workspace_id)?;
     state
@@ -2298,7 +2294,7 @@ async fn clear_notifications(
     State(state): State<ApiState>,
     Json(request): Json<ClearNotificationsRequest>,
 ) -> Result<Json<SessionNotificationsResponseDto>, ApiError> {
-    let workspace_id = require_workspace_id(request.requested_workspace_id())?;
+    let workspace_id = require_registered_workspace_id(&state, request.requested_workspace_id())?;
     let session_id =
         require_notifications_session_id(&state, request.requested_session_id(), &workspace_id)?;
     state
@@ -2339,7 +2335,7 @@ async fn remove_notification(
     State(state): State<ApiState>,
     Json(request): Json<RemoveNotificationRequest>,
 ) -> Result<Json<SessionNotificationsResponseDto>, ApiError> {
-    let workspace_id = require_workspace_id(request.requested_workspace_id())?;
+    let workspace_id = require_registered_workspace_id(&state, request.requested_workspace_id())?;
     let session_id =
         require_notifications_session_id(&state, request.requested_session_id(), &workspace_id)?;
     let notification_id = request
@@ -2475,7 +2471,7 @@ mod tests {
         body: serde_json::Value,
     ) -> (StatusCode, serde_json::Value) {
         let response = routes()
-            .with_state(state)
+            .with_state(state.clone())
             .oneshot(
                 Request::builder()
                     .uri(uri)
@@ -3297,6 +3293,8 @@ mod tests {
     #[tokio::test]
     async fn delete_session_rejects_workspace_mismatched_session() {
         let state = test_state();
+        register_workspace(&state, "workspace-a", "delete-mismatch-a");
+        register_workspace(&state, "workspace-b", "delete-mismatch-b");
         let session_id = SessionId::new("session-delete-workspace-a");
         state
             .session_store
@@ -3594,6 +3592,8 @@ mod tests {
     #[tokio::test]
     async fn delete_session_returns_workspace_scoped_bootstrap() {
         let state = test_state();
+        register_workspace(&state, "workspace-a", "delete-scoped-a");
+        register_workspace(&state, "workspace-b", "delete-scoped-b");
         let deleted_session_id = SessionId::new("session-delete-scoped-a1");
         let sibling_session_id = SessionId::new("session-delete-scoped-a2");
         let foreign_session_id = SessionId::new("session-delete-scoped-b1");
@@ -3664,6 +3664,8 @@ mod tests {
     #[tokio::test]
     async fn rename_session_rejects_workspace_mismatched_session() {
         let state = test_state();
+        register_workspace(&state, "workspace-a", "rename-mismatch-a");
+        register_workspace(&state, "workspace-b", "rename-mismatch-b");
         let session_id = SessionId::new("session-rename-workspace-a");
         state
             .session_store
@@ -3706,6 +3708,8 @@ mod tests {
     #[tokio::test]
     async fn close_session_rejects_workspace_mismatched_session() {
         let state = test_state();
+        register_workspace(&state, "workspace-a", "close-mismatch-a");
+        register_workspace(&state, "workspace-b", "close-mismatch-b");
         let session_id = SessionId::new("session-close-workspace-a");
         state
             .session_store
@@ -3857,6 +3861,8 @@ mod tests {
     #[tokio::test]
     async fn save_session_rejects_workspace_mismatched_session() {
         let state = test_state();
+        register_workspace(&state, "workspace-a", "save-mismatch-a");
+        register_workspace(&state, "workspace-b", "save-mismatch-b");
         let session_id = SessionId::new("session-save-workspace-a");
         state
             .session_store
@@ -3890,6 +3896,7 @@ mod tests {
     #[tokio::test]
     async fn notifications_require_explicit_workspace_and_session_scope() {
         let state = test_state();
+        register_workspace(&state, "workspace-a", "notification-explicit-a");
         let session_id = SessionId::new("session-notification-explicit-scope");
         state
             .session_store
@@ -3982,6 +3989,11 @@ mod tests {
     #[tokio::test]
     async fn notifications_workspace_query_uses_explicit_execution_owned_session() {
         let state = test_state();
+        register_workspace(
+            &state,
+            "workspace-owned-notifications",
+            "notification-owned-current",
+        );
         let session_id = SessionId::new("session-notification-owned-current");
         state
             .session_store
@@ -4003,7 +4015,7 @@ mod tests {
         );
 
         let response = routes()
-            .with_state(state)
+            .with_state(state.clone())
             .oneshot(
                 Request::builder()
                     .uri(format!(
@@ -4038,6 +4050,8 @@ mod tests {
     #[tokio::test]
     async fn mark_all_notifications_read_rejects_workspace_mismatched_session() {
         let state = test_state();
+        register_workspace(&state, "workspace-a", "notification-mismatch-a");
+        register_workspace(&state, "workspace-b", "notification-mismatch-b");
         let session_id = SessionId::new("session-notification-workspace-a");
         state
             .session_store
@@ -4097,6 +4111,11 @@ mod tests {
     #[tokio::test]
     async fn notifications_actions_accept_execution_owned_unbound_workspace_session() {
         let state = test_state();
+        register_workspace(
+            &state,
+            "workspace-owned-actions",
+            "notification-owned-actions",
+        );
         let session_id = SessionId::new("session-notification-owned-actions");
         state
             .session_store
@@ -4183,6 +4202,7 @@ mod tests {
     #[tokio::test]
     async fn append_session_notification_persists_backend_snapshot() {
         let state = test_state();
+        register_workspace(&state, "workspace-a", "notification-append-a");
         let session_id = SessionId::new("session-notification-append");
         state
             .session_store
@@ -4254,7 +4274,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mark_all_notifications_read_persists_unknown_workspace_session_with_explicit_scope() {
+    async fn mark_all_notifications_read_rejects_unregistered_workspace_scope() {
         let persistence_root = unique_temp_dir("magi-api-notification-orphan-workspace");
         let session_id = SessionId::new("session-notification-orphan-workspace");
         let state = test_state().with_runtime_persistence(Arc::new(RuntimeStatePersistence::new(
@@ -4278,7 +4298,7 @@ mod tests {
         );
 
         let response = routes()
-            .with_state(state)
+            .with_state(state.clone())
             .oneshot(
                 Request::builder()
                     .uri("/session/notifications/mark-all-read")
@@ -4303,14 +4323,18 @@ mod tests {
         )
         .expect("response should be json");
 
-        assert_eq!(status, StatusCode::OK, "unexpected body: {body}");
-        assert_eq!(body["sessionId"], serde_json::json!(session_id.as_str()));
-        assert_eq!(body["notifications"]["records"][0]["handled"], true);
-
-        let persisted = fs::read_to_string(persistence_root.join("sessions.json"))
-            .expect("orphan workspace session should persist globally");
-        assert!(persisted.contains("session-notification-orphan-workspace"));
-        assert!(persisted.contains("workspace-missing"));
+        assert_eq!(status, StatusCode::NOT_FOUND, "unexpected body: {body}");
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("workspace 不存在"),
+            "unexpected body: {body}"
+        );
+        assert_eq!(
+            state.session_store.notifications_for_session(&session_id)[0].handled,
+            false
+        );
 
         let _ = fs::remove_dir_all(persistence_root);
     }

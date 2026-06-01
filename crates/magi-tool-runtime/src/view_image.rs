@@ -98,7 +98,10 @@ fn requested_path(
     request: Option<&serde_json::Map<String, Value>>,
 ) -> Result<String, String> {
     let value = match request {
-        Some(object) => field_string(object, &["path", "file_path", "image_path"]),
+        Some(object) => field_string(
+            object,
+            &["path", "file_path", "filePath", "image_path", "imagePath"],
+        ),
         None => Some(input.trim().to_string()),
     }
     .map(|value| value.trim().to_string())
@@ -213,6 +216,21 @@ mod tests {
                 .len()
                 > 20
         );
+    }
+
+    #[test]
+    fn view_image_accepts_camel_case_path_alias() {
+        let root = unique_temp_dir("magi-view-image-file-path");
+        fs::write(root.join("pixel.png"), ONE_BY_ONE_PNG).expect("write png");
+
+        let output = execute_view_image(
+            &serde_json::json!({ "filePath": "pixel.png" }).to_string(),
+            &context(root),
+        );
+        let payload: Value = serde_json::from_str(&output).expect("json output");
+
+        assert_eq!(payload["status"], "succeeded");
+        assert_eq!(payload["mime"], "image/png");
     }
 
     #[test]

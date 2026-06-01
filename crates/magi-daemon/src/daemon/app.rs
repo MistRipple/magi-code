@@ -13,10 +13,12 @@ use std::{
     env,
     path::PathBuf,
     process::Stdio,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 use tokio::net::TcpListener;
 use tokio::process::{Child, Command};
+use tokio::sync::Mutex as AsyncMutex;
 use tower_http::services::{ServeDir, ServeFile};
 use tracing::{info, warn};
 
@@ -30,6 +32,7 @@ const DEFAULT_WEB_DEV_PORT: u16 = 3000;
 const WEB_DEV_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const WEB_DEV_READY_INTERVAL: Duration = Duration::from_millis(250);
 const WEB_DEV_READY_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+const WEB_DEV_PROXY_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug)]
 pub struct Daemon {
@@ -67,16 +70,147 @@ enum FrontendMode {
     Static,
 }
 
+#[derive(Clone)]
 struct WebDevServer {
-    origin: String,
-    agent_origin: String,
-    child: Option<Child>,
+    inner: Arc<WebDevServerInner>,
 }
 
-impl Drop for WebDevServer {
-    fn drop(&mut self) {
-        if let Some(child) = self.child.as_mut() {
+struct WebDevServerInner {
+    origin: String,
+    agent_origin: String,
+    web_root: PathBuf,
+    host: String,
+    port: u16,
+    child: Mutex<Option<Child>>,
+    recover_lock: AsyncMutex<()>,
+}
+
+impl WebDevServer {
+    fn new(
+        origin: String,
+        agent_origin: String,
+        web_root: PathBuf,
+        host: String,
+        port: u16,
+        child: Option<Child>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(WebDevServerInner {
+                origin,
+                agent_origin,
+                web_root,
+                host,
+                port,
+                child: Mutex::new(child),
+                recover_lock: AsyncMutex::new(()),
+            }),
+        }
+    }
+
+    fn origin(&self) -> &str {
+        &self.inner.origin
+    }
+
+    fn agent_origin(&self) -> &str {
+        &self.inner.agent_origin
+    }
+
+    async fn ensure_ready(&self) -> Result<(), String> {
+        if is_web_dev_server_ready(
+            &self.inner.origin,
+            &self.inner.agent_origin,
+            &self.inner.web_root,
+        )
+        .await
+        {
+            return Ok(());
+        }
+
+        let _recover_guard = self.inner.recover_lock.lock().await;
+        if is_web_dev_server_ready(
+            &self.inner.origin,
+            &self.inner.agent_origin,
+            &self.inner.web_root,
+        )
+        .await
+        {
+            return Ok(());
+        }
+
+        self.stop_owned_child().await?;
+        let mut child = spawn_web_dev_server(
+            &self.inner.host,
+            self.inner.port,
+            &self.inner.agent_origin,
+            &self.inner.web_root,
+        )?;
+        if let Err(error) = wait_for_spawned_web_dev_server(
+            &self.inner.origin,
+            &self.inner.agent_origin,
+            &self.inner.web_root,
+            &mut child,
+        )
+        .await
+        {
             let _ = child.start_kill();
+            return Err(error);
+        }
+        self.store_owned_child(child)?;
+        Ok(())
+    }
+
+    async fn stop_owned_child(&self) -> Result<(), String> {
+        let mut existing = {
+            let mut child = self
+                .inner
+                .child
+                .lock()
+                .map_err(|_| "Vite 前端热加载服务状态锁已损坏".to_string())?;
+            child.take()
+        };
+        if let Some(child) = existing.as_mut() {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    warn!(
+                        status = %status,
+                        "Vite 前端热加载服务已退出，准备重新启动"
+                    );
+                }
+                Ok(None) => {
+                    warn!("Vite 前端热加载服务未通过健康检查，准备重新启动");
+                    let _ = child.start_kill();
+                    let _ = child.wait().await;
+                }
+                Err(error) => {
+                    warn!(
+                        error = %error,
+                        "检查 Vite 前端热加载服务状态失败，准备重新启动"
+                    );
+                    let _ = child.start_kill();
+                    let _ = child.wait().await;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn store_owned_child(&self, new_child: Child) -> Result<(), String> {
+        let mut child = self
+            .inner
+            .child
+            .lock()
+            .map_err(|_| "Vite 前端热加载服务状态锁已损坏".to_string())?;
+        *child = Some(new_child);
+        Ok(())
+    }
+}
+
+impl Drop for WebDevServerInner {
+    fn drop(&mut self) {
+        if let Ok(child) = self.child.get_mut() {
+            if let Some(child) = child.as_mut() {
+                let _ = child.start_kill();
+            }
         }
     }
 }
@@ -98,11 +232,14 @@ async fn resolve_frontend_mode(config: &DaemonConfig) -> Result<FrontendMode, Da
             web_dev_origin = %origin,
             "已复用运行中的 Vite 前端热加载服务"
         );
-        return Ok(FrontendMode::Dev(WebDevServer {
+        return Ok(FrontendMode::Dev(WebDevServer::new(
             origin,
             agent_origin,
-            child: None,
-        }));
+            web_root,
+            host,
+            port,
+            None,
+        )));
     }
 
     if !web_root.join("package.json").is_file() {
@@ -117,27 +254,8 @@ async fn resolve_frontend_mode(config: &DaemonConfig) -> Result<FrontendMode, Da
         web_dev_origin = %origin,
         "正在启动 Vite 前端热加载服务"
     );
-    let mut child = Command::new("npm")
-        .arg("--prefix")
-        .arg(&web_root)
-        .arg("run")
-        .arg("dev:daemon")
-        .arg("--")
-        .arg("--host")
-        .arg(&host)
-        .arg("--port")
-        .arg(port.to_string())
-        .arg("--strictPort")
-        .env("VITE_AGENT_BASE_URL", &agent_origin)
-        .env("VITE_AGENT_PROXY_TARGET", &agent_origin)
-        .env("MAGI_VITE_HOST", &host)
-        .env("MAGI_VITE_PORT", port.to_string())
-        .env("MAGI_VITE_OPEN", "0")
-        .stdin(Stdio::null())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .map_err(|error| DaemonError::internal(format!("启动 Vite 前端热加载服务失败: {error}")))?;
+    let mut child = spawn_web_dev_server(&host, port, &agent_origin, &web_root)
+        .map_err(DaemonError::internal)?;
 
     if let Err(error) =
         wait_for_spawned_web_dev_server(&origin, &agent_origin, &web_root, &mut child).await
@@ -146,19 +264,22 @@ async fn resolve_frontend_mode(config: &DaemonConfig) -> Result<FrontendMode, Da
         return Err(DaemonError::internal(error));
     }
 
-    Ok(FrontendMode::Dev(WebDevServer {
+    Ok(FrontendMode::Dev(WebDevServer::new(
         origin,
         agent_origin,
-        child: Some(child),
-    }))
+        web_root,
+        host,
+        port,
+        Some(child),
+    )))
 }
 
 fn build_application_router(api_router: Router, frontend: &FrontendMode) -> Router {
     if let FrontendMode::Dev(dev_server) = frontend {
-        let dev_html = build_web_dev_html(&dev_server.origin, &dev_server.agent_origin);
+        let dev_html = build_web_dev_html(dev_server.origin(), dev_server.agent_origin());
         info!(
-            web_dev_origin = %dev_server.origin,
-            agent_origin = %dev_server.agent_origin,
+            web_dev_origin = %dev_server.origin(),
+            agent_origin = %dev_server.agent_origin(),
             "Rust daemon 已接入 Vite 热加载前端，启用单端口开发入口"
         );
         return Router::new()
@@ -175,10 +296,10 @@ fn build_application_router(api_router: Router, frontend: &FrontendMode) -> Rout
             )
             .merge(api_router)
             .fallback(get({
-                let vite_origin = dev_server.origin.clone();
+                let dev_server = dev_server.clone();
                 move |uri| {
-                    let vite_origin = vite_origin.clone();
-                    async move { proxy_vite_dev_asset(vite_origin, uri).await }
+                    let dev_server = dev_server.clone();
+                    async move { proxy_vite_dev_asset(dev_server, uri).await }
                 }
             }));
     }
@@ -245,7 +366,7 @@ fn build_web_dev_html(vite_origin: &str, agent_origin: &str) -> String {
     )
 }
 
-async fn proxy_vite_dev_asset(vite_origin: String, uri: Uri) -> Response {
+async fn proxy_vite_dev_asset(dev_server: WebDevServer, uri: Uri) -> Response {
     if !is_vite_dev_asset_path(uri.path()) {
         return StatusCode::NOT_FOUND.into_response();
     }
@@ -253,17 +374,65 @@ async fn proxy_vite_dev_asset(vite_origin: String, uri: Uri) -> Response {
         .path_and_query()
         .map(|value| value.as_str())
         .unwrap_or("/");
-    let url = format!("{}{}", vite_origin.trim_end_matches('/'), path_and_query);
-    let response = match reqwest::get(url).await {
+    match fetch_vite_dev_asset_response(&dev_server, path_and_query).await {
+        Ok(response) => return response,
+        Err(error) => {
+            warn!(
+                path = %path_and_query,
+                error = %error,
+                "Vite 前端热加载资源代理失败，尝试恢复"
+            );
+        }
+    }
+
+    if let Err(error) = dev_server.ensure_ready().await {
+        warn!(
+            path = %path_and_query,
+            error = %error,
+            "Vite 前端热加载服务恢复失败"
+        );
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "前端热加载服务暂不可用，请稍后刷新重试",
+        )
+            .into_response();
+    }
+
+    match fetch_vite_dev_asset_response(&dev_server, path_and_query).await {
         Ok(response) => response,
         Err(error) => {
-            return (
+            warn!(
+                path = %path_and_query,
+                error = %error,
+                "Vite 前端热加载资源代理重试失败"
+            );
+            (
                 StatusCode::BAD_GATEWAY,
-                format!("Vite 前端热加载资源代理失败: {error}"),
+                "前端热加载资源暂不可用，请稍后刷新重试",
             )
-                .into_response();
+                .into_response()
         }
-    };
+    }
+}
+
+async fn fetch_vite_dev_asset_response(
+    dev_server: &WebDevServer,
+    path_and_query: &str,
+) -> Result<Response, String> {
+    let url = format!(
+        "{}{}",
+        dev_server.origin().trim_end_matches('/'),
+        path_and_query
+    );
+    let client = reqwest::Client::builder()
+        .timeout(WEB_DEV_PROXY_REQUEST_TIMEOUT)
+        .build()
+        .map_err(|error| format!("构造 Vite 资源代理客户端失败: {error}"))?;
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|error| format!("请求 Vite 资源失败: {error}"))?;
     let status = StatusCode::from_u16(response.status().as_u16())
         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     let content_type = response
@@ -274,24 +443,16 @@ async fn proxy_vite_dev_asset(vite_origin: String, uri: Uri) -> Response {
     let bytes = match response.bytes().await {
         Ok(bytes) => bytes,
         Err(error) => {
-            return (
-                StatusCode::BAD_GATEWAY,
-                format!("读取 Vite 前端热加载资源失败: {error}"),
-            )
-                .into_response();
+            return Err(format!("读取 Vite 前端热加载资源失败: {error}"));
         }
     };
     let mut builder = Response::builder().status(status);
     if let Some(content_type) = content_type {
         builder = builder.header(header::CONTENT_TYPE, content_type);
     }
-    builder.body(Body::from(bytes)).unwrap_or_else(|error| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("构造 Vite 资源响应失败: {error}"),
-        )
-            .into_response()
-    })
+    builder
+        .body(Body::from(bytes))
+        .map_err(|error| format!("构造 Vite 资源响应失败: {error}"))
 }
 
 fn is_vite_dev_asset_path(path: &str) -> bool {
@@ -383,6 +544,35 @@ async fn wait_for_spawned_web_dev_server(
         "Vite 前端热加载服务未在 {} 秒内就绪: {origin}",
         WEB_DEV_READY_TIMEOUT.as_secs()
     ))
+}
+
+fn spawn_web_dev_server(
+    host: &str,
+    port: u16,
+    agent_origin: &str,
+    web_root: &PathBuf,
+) -> Result<Child, String> {
+    Command::new("npm")
+        .arg("--prefix")
+        .arg(web_root)
+        .arg("run")
+        .arg("dev:daemon")
+        .arg("--")
+        .arg("--host")
+        .arg(host)
+        .arg("--port")
+        .arg(port.to_string())
+        .arg("--strictPort")
+        .env("VITE_AGENT_BASE_URL", agent_origin)
+        .env("VITE_AGENT_PROXY_TARGET", agent_origin)
+        .env("MAGI_VITE_HOST", host)
+        .env("MAGI_VITE_PORT", port.to_string())
+        .env("MAGI_VITE_OPEN", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|error| format!("启动 Vite 前端热加载服务失败: {error}"))
 }
 
 fn normalize_ready_path(path: &PathBuf) -> String {

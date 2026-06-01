@@ -1793,6 +1793,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn settings_bootstrap_redacts_mcp_env_values() {
+        let state = test_state();
+        state.settings_store.set_section(
+            "mcpServers",
+            json!([
+                {
+                    "id": "secret-server",
+                    "command": "npx",
+                    "enabled": false,
+                    "env": {
+                        "TOKEN": "secret-token"
+                    }
+                }
+            ]),
+        );
+
+        let bootstrap = settings_bootstrap(State(state), Query(HashMap::new()))
+            .await
+            .0;
+
+        assert_eq!(
+            bootstrap["mcpServers"][0]["env"]["TOKEN"],
+            json!(crate::mcp_config::REDACTED_MCP_ENV_VALUE)
+        );
+    }
+
+    #[tokio::test]
     async fn settings_bootstrap_core_scope_defers_mcp_hydration() {
         let state = test_state();
         let bootstrap = settings_bootstrap(

@@ -67,15 +67,23 @@
     return segments.length > 0 ? segments[segments.length - 1] : cleaned;
   });
 
-  // 当前会话是否为空（无消息），为空时禁止创建新会话
+  // 只有“已有当前会话且该会话为空”时才禁止重复新建；未绑定 session 的工作区草稿态允许新建。
+  const hasCurrentWorkspace = $derived.by(() => Boolean(
+    messagesState.currentWorkspaceId?.trim() || messagesState.currentWorkspacePath?.trim()
+  ));
+  const hasCurrentSession = $derived.by(() => Boolean(messagesState.currentSessionId?.trim()));
   const isCurrentSessionEmpty = $derived(
     ensureArray(appState.threadMessages).length === 0
   );
-  const newSessionDisabled = $derived(isCurrentSessionEmpty || messagesState.sessionHydrating);
+  const newSessionDisabled = $derived(
+    messagesState.sessionHydrating || !hasCurrentWorkspace || (hasCurrentSession && isCurrentSessionEmpty)
+  );
   const newSessionTitle = $derived(
     messagesState.sessionHydrating
       ? '正在打开新会话面板'
-      : (isCurrentSessionEmpty ? i18n.t('header.currentSessionEmpty') : i18n.t('header.newSession'))
+      : (!hasCurrentWorkspace
+        ? i18n.t('web.unselectedWorkspace')
+        : (hasCurrentSession && isCurrentSessionEmpty ? i18n.t('header.currentSessionEmpty') : i18n.t('header.newSession')))
   );
   // 切换下拉菜单
   function toggleDropdown() {
@@ -153,7 +161,11 @@
       displayMode: 'notification_center',
       duration: 1800,
     });
-    vscode.postMessage({ type: 'newSession' });
+    vscode.postMessage({
+      type: 'newSession',
+      workspaceId: messagesState.currentWorkspaceId || undefined,
+      workspacePath: messagesState.currentWorkspacePath || undefined,
+    });
     dropdownOpen = false;
   }
 
@@ -182,7 +194,13 @@
         duration: 1800,
       });
       // 直接删除，无需后端再确认
-      vscode.postMessage({ type: 'deleteSession', sessionId: pendingDeleteSessionId, requireConfirm: false });
+      vscode.postMessage({
+        type: 'deleteSession',
+        sessionId: pendingDeleteSessionId,
+        workspaceId: messagesState.currentWorkspaceId || undefined,
+        workspacePath: messagesState.currentWorkspacePath || undefined,
+        requireConfirm: false,
+      });
     }
     closeDeleteConfirm();
   }
