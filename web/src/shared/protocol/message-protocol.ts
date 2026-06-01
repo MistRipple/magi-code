@@ -200,6 +200,9 @@ export interface ToolCallBlock {
 }
 
 interface FileChangePayload {
+  sessionId?: string;
+  workspaceId?: string;
+  workspacePath?: string;
   filePath: string;
   oldPath?: string;
   changeType: 'create' | 'modify' | 'delete' | 'rename';

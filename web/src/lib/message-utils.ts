@@ -195,6 +195,9 @@ export function mapStandardBlocks(blocks: StandardContentBlock[]): ContentBlock[
           toolCall,
           fileChange: block.fileChange
             ? {
+                sessionId: block.fileChange.sessionId,
+                workspaceId: block.fileChange.workspaceId,
+                workspacePath: block.fileChange.workspacePath,
                 filePath: block.fileChange.filePath,
                 oldPath: block.fileChange.oldPath,
                 changeType: block.fileChange.changeType,
@@ -220,6 +223,9 @@ export function mapStandardBlocks(blocks: StandardContentBlock[]): ContentBlock[
           type: 'file_change',
           content: '',
           fileChange: {
+            sessionId: block.sessionId,
+            workspaceId: block.workspaceId,
+            workspacePath: block.workspacePath,
             filePath,
             oldPath: block.oldPath,
             changeType: block.changeType,

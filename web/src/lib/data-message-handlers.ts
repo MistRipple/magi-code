@@ -70,6 +70,15 @@ function normalizeStateSliceVersion(value: unknown): number {
   return typeof value === 'number' && Number.isFinite(value) ? Math.floor(value) : 0;
 }
 
+function normalizeOptionalEditString(...values: unknown[]): string | undefined {
+  for (const value of values) {
+    if (typeof value === 'string' && value.trim()) {
+      return value.trim();
+    }
+  }
+  return undefined;
+}
+
 function currentWorkspaceIdValue(): string {
   return typeof messagesState.currentWorkspaceId === 'string'
     ? messagesState.currentWorkspaceId.trim()
@@ -200,6 +209,11 @@ function normalizeIncomingEdits(state: AppState): Edit[] {
   return ensureArray(state.pendingChanges)
     .filter((change): change is Edit => !!change && typeof change === 'object' && typeof (change as Edit).filePath === 'string' && !!(change as Edit).filePath)
     .map((change) => {
+      const rawChange = change as Edit & {
+        session_id?: unknown;
+        workspace_id?: unknown;
+        workspace_path?: unknown;
+      };
       let inferredType = change.type;
       if (!inferredType) {
         const adds = change.additions ?? 0;
@@ -209,6 +223,9 @@ function normalizeIncomingEdits(state: AppState): Edit[] {
         else inferredType = 'modify';
       }
       return {
+        sessionId: normalizeOptionalEditString(change.sessionId, rawChange.session_id),
+        workspaceId: normalizeOptionalEditString(change.workspaceId, rawChange.workspace_id),
+        workspacePath: normalizeOptionalEditString(change.workspacePath, rawChange.workspace_path),
         filePath: change.filePath,
         oldPath: change.oldPath,
         snapshotId: change.snapshotId,

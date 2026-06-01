@@ -337,6 +337,9 @@ export interface ContentBlock {
   toolCall?: ToolCall;      // 工具调用信息
   thinking?: ThinkingBlock; // 思考块信息
   fileChange?: {
+    sessionId?: string;
+    workspaceId?: string;
+    workspacePath?: string;
     filePath: string;
     oldPath?: string;
     changeType: 'create' | 'modify' | 'delete' | 'rename';

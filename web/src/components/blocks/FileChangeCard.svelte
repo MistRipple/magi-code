@@ -155,10 +155,11 @@
    */
   function previewInRightPane(filepath: string) {
     if (!filepath) return;
-    openCodeTab(messagesState.currentSessionId, filepath, {
-      sessionId: messagesState.currentSessionId ?? undefined,
-      workspaceId: messagesState.currentWorkspaceId ?? undefined,
-      workspacePath: messagesState.currentWorkspacePath || undefined,
+    const sessionId = change?.sessionId || messagesState.currentSessionId || undefined;
+    openCodeTab(sessionId, filepath, {
+      sessionId,
+      workspaceId: change?.workspaceId || messagesState.currentWorkspaceId || undefined,
+      workspacePath: change?.workspacePath || messagesState.currentWorkspacePath || undefined,
       diff: change?.diff ?? null,
     });
   }
