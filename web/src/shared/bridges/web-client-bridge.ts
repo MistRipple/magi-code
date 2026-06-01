@@ -1469,10 +1469,12 @@ function isCurrentBootstrapRequest(bindingKey: string, requestSeq: number): bool
 function settingsBootstrapBindingKey(
   workspaceId = currentWorkspaceId,
   workspacePath = currentWorkspacePath,
+  sessionId = currentSessionId,
 ): string {
   return JSON.stringify({
     workspaceId: workspaceId.trim(),
     workspacePath: workspacePath.trim(),
+    sessionId: sessionId.trim(),
   });
 }
 
@@ -1482,15 +1484,17 @@ function clearSettingsBootstrapCache(): void {
   cachedSettingsBootstrapBindingKey = '';
 }
 
-function clearSettingsBootstrapCacheIfWorkspaceChanged(
+function clearSettingsBootstrapCacheIfBindingChanged(
   previousWorkspaceId: string,
   previousWorkspacePath: string,
+  previousSessionId: string,
   nextWorkspaceId: string,
   nextWorkspacePath: string,
+  nextSessionId: string,
 ): boolean {
   const changed =
-    settingsBootstrapBindingKey(previousWorkspaceId, previousWorkspacePath)
-    !== settingsBootstrapBindingKey(nextWorkspaceId, nextWorkspacePath);
+    settingsBootstrapBindingKey(previousWorkspaceId, previousWorkspacePath, previousSessionId)
+    !== settingsBootstrapBindingKey(nextWorkspaceId, nextWorkspacePath, nextSessionId);
   if (changed) {
     clearSettingsBootstrapCache();
   }
@@ -1505,15 +1509,18 @@ function isCurrentSettingsBootstrapRequest(bindingKey: string, requestSeq: numbe
 function persistWorkspaceBinding(workspaceId: string, workspacePath: string, sessionId: string): boolean {
   const previousWorkspaceId = currentWorkspaceId;
   const previousWorkspacePath = currentWorkspacePath;
+  const previousSessionId = currentSessionId;
   const normalizedWorkspaceId = workspaceId.trim();
   const normalizedWorkspacePath = workspacePath.trim();
   const incomingSessionId = sessionId.trim();
 
-  const workspaceChanged = clearSettingsBootstrapCacheIfWorkspaceChanged(
+  const settingsBindingChanged = clearSettingsBootstrapCacheIfBindingChanged(
     previousWorkspaceId,
     previousWorkspacePath,
+    previousSessionId,
     normalizedWorkspaceId,
     normalizedWorkspacePath,
+    incomingSessionId,
   );
   currentWorkspaceId = normalizedWorkspaceId;
   currentWorkspacePath = normalizedWorkspacePath;
@@ -1521,7 +1528,7 @@ function persistWorkspaceBinding(workspaceId: string, workspacePath: string, ses
 
   const currentUrl = getCurrentUrl();
   if (!currentUrl) {
-    return workspaceChanged;
+    return settingsBindingChanged;
   }
   const nextUrl = new URL(currentUrl.toString());
   if (normalizedWorkspaceId) {
@@ -1542,19 +1549,22 @@ function persistWorkspaceBinding(workspaceId: string, workspacePath: string, ses
   if (nextUrl.toString() !== currentUrl.toString()) {
     window.history.replaceState(window.history.state, '', nextUrl);
   }
-  return workspaceChanged;
+  return settingsBindingChanged;
 }
 
 function clearWorkspaceSessionBinding(workspaceId: string, workspacePath: string): boolean {
   const previousWorkspaceId = currentWorkspaceId;
   const previousWorkspacePath = currentWorkspacePath;
+  const previousSessionId = currentSessionId;
   const normalizedWorkspaceId = workspaceId.trim();
   const normalizedWorkspacePath = workspacePath.trim();
-  const workspaceChanged = clearSettingsBootstrapCacheIfWorkspaceChanged(
+  const settingsBindingChanged = clearSettingsBootstrapCacheIfBindingChanged(
     previousWorkspaceId,
     previousWorkspacePath,
+    previousSessionId,
     normalizedWorkspaceId,
     normalizedWorkspacePath,
+    '',
   );
   currentWorkspaceId = normalizedWorkspaceId;
   currentWorkspacePath = normalizedWorkspacePath;
@@ -1569,7 +1579,7 @@ function clearWorkspaceSessionBinding(workspaceId: string, workspacePath: string
 
   const currentUrl = getCurrentUrl();
   if (!currentUrl) {
-    return workspaceChanged;
+    return settingsBindingChanged;
   }
   const nextUrl = new URL(currentUrl.toString());
   if (normalizedWorkspaceId) {
@@ -1586,17 +1596,17 @@ function clearWorkspaceSessionBinding(workspaceId: string, workspacePath: string
   if (nextUrl.toString() !== currentUrl.toString()) {
     window.history.replaceState(window.history.state, '', nextUrl);
   }
-  return workspaceChanged;
+  return settingsBindingChanged;
 }
 
 function dispatchWorkspaceSessionCleared(workspaceId: string, workspacePath: string): void {
   closeEventStream();
-  const workspaceChanged = clearWorkspaceSessionBinding(workspaceId, workspacePath);
+  const settingsBindingChanged = clearWorkspaceSessionBinding(workspaceId, workspacePath);
   emitDataMessage('workspaceSessionCleared', {
     workspaceId: workspaceId.trim(),
     workspacePath: workspacePath.trim(),
   });
-  if (workspaceChanged) {
+  if (settingsBindingChanged) {
     refreshSettingsBootstrapForCurrentWorkspace('workspace_session_cleared');
   }
 }
@@ -1674,7 +1684,7 @@ async function restoreBridgeState(reason: string, force = false): Promise<void> 
     }
     await fetchBootstrap({
       forceEventStreamReconnect: true,
-      refreshSettingsBootstrapOnWorkspaceChange: false,
+      refreshSettingsBootstrapOnBindingChange: false,
     });
     await dispatchSettingsBootstrap(force, 'core');
     clearRecoveryTimer();
@@ -1824,7 +1834,7 @@ async function dispatchBootstrap(
   options: {
     forceEventStreamReconnect?: boolean;
     rawPayload?: unknown;
-    refreshSettingsBootstrapOnWorkspaceChange?: boolean;
+    refreshSettingsBootstrapOnBindingChange?: boolean;
   } = {},
 ): Promise<void> {
   const previousSessionId = currentSessionId;
@@ -1840,7 +1850,7 @@ async function dispatchBootstrap(
   if (incomingEpoch) {
     currentRuntimeEpoch = incomingEpoch;
   }
-  const workspaceChanged = persistWorkspaceBinding(
+  const settingsBindingChanged = persistWorkspaceBinding(
     payload.workspace.workspaceId,
     payload.workspace.rootPath,
     payload.sessionId,
@@ -1883,8 +1893,8 @@ async function dispatchBootstrap(
   if ((payload.state as { isProcessing?: boolean } | undefined)?.isProcessing !== true) {
     scheduleQueuedTurnDrain('bootstrap_idle');
   }
-  if (workspaceChanged && options.refreshSettingsBootstrapOnWorkspaceChange !== false) {
-    refreshSettingsBootstrapForCurrentWorkspace('bootstrap_workspace_changed');
+  if (settingsBindingChanged && options.refreshSettingsBootstrapOnBindingChange !== false) {
+    refreshSettingsBootstrapForCurrentWorkspace('bootstrap_binding_changed');
   }
 }
 
@@ -1892,7 +1902,7 @@ async function fetchBootstrap(
   options: {
     forceEventStreamReconnect?: boolean;
     forceFresh?: boolean;
-    refreshSettingsBootstrapOnWorkspaceChange?: boolean;
+    refreshSettingsBootstrapOnBindingChange?: boolean;
   } = {},
 ): Promise<void> {
   const requestBinding = resolveWorkspaceQuery();
@@ -2126,7 +2136,7 @@ async function dispatchSessionSnapshot(
     workspaceId: options.workspaceId,
     workspacePath: options.workspacePath,
   });
-  const workspaceChanged = persistWorkspaceBinding(
+  const settingsBindingChanged = persistWorkspaceBinding(
     payload.workspace.workspaceId,
     payload.workspace.rootPath,
     payload.sessionId,
@@ -2166,8 +2176,8 @@ async function dispatchSessionSnapshot(
   if ((payload.state as { isProcessing?: boolean } | undefined)?.isProcessing !== true) {
     scheduleQueuedTurnDrain('session_snapshot_idle');
   }
-  if (workspaceChanged) {
-    refreshSettingsBootstrapForCurrentWorkspace('session_snapshot_workspace_changed');
+  if (settingsBindingChanged) {
+    refreshSettingsBootstrapForCurrentWorkspace('session_snapshot_binding_changed');
   }
 }
 
@@ -3388,8 +3398,8 @@ export function createWebClientBridge(): ClientBridge {
             dispatchWorkspaceSessionCleared(workspaceId, workspacePath);
             return;
           }
-          const workspaceChanged = persistWorkspaceBinding(workspaceId, workspacePath, sessionId);
-          if (workspaceChanged) {
+          const settingsBindingChanged = persistWorkspaceBinding(workspaceId, workspacePath, sessionId);
+          if (settingsBindingChanged) {
             refreshSettingsBootstrapForCurrentWorkspace('workspace_binding_changed');
           }
           return;

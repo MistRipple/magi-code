@@ -904,6 +904,13 @@ function applyCanonicalTurnsSnapshot(sessionId: string, turns: unknown): boolean
   return true;
 }
 
+function clearStaleSettingsBootstrapSnapshot(): void {
+  const store = getState();
+  if (store.settingsBootstrapSnapshot && !settingsBootstrapMatchesCurrentWorkspace(store.settingsBootstrapSnapshot)) {
+    store.settingsBootstrapSnapshot = null;
+  }
+}
+
 function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
   const sessionId = typeof message.sessionId === 'string' ? message.sessionId.trim() : '';
   const state = message.state as AppState | undefined;
@@ -947,6 +954,7 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
       messagesState.currentWorkspacePath = workspacePath;
       updateSessions(sessions);
       setCurrentSessionId(null);
+      clearStaleSettingsBootstrapSnapshot();
       setSessionHistoryState(null, { workspaceId });
       setAppState({
         ...state,
@@ -977,6 +985,7 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
       messagesState.currentWorkspaceId = workspaceId || messagesState.currentWorkspaceId;
       messagesState.currentWorkspacePath = workspacePath || messagesState.currentWorkspacePath;
       updateSessions(sessions);
+      clearStaleSettingsBootstrapSnapshot();
       const hadLiveTurnBeforeSnapshot = hasActiveLocalTimelineTurn();
       const hadPendingLocalRequestBeforeSnapshot = hasPendingLocalRequest();
       const authoritativeSnapshotIsIdle = state.isProcessing !== true
@@ -1052,6 +1061,7 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
     updateSessions(sessions);
 
     setCurrentSessionId(sessionId);
+    clearStaleSettingsBootstrapSnapshot();
     applyCanonicalTurnsSnapshot(sessionId, canonicalTurns);
     handleStateUpdate({
       ...message,
