@@ -172,6 +172,9 @@ fn event_matches_workspace(
     if event.workspace_id.is_some() {
         return false;
     }
+    if event_payload_workspace_matches(event, requested_workspace_id) {
+        return true;
+    }
     event
         .session_id
         .as_ref()
@@ -179,6 +182,20 @@ fn event_matches_workspace(
         .is_some_and(|session| {
             session.workspace_id.as_deref() == Some(requested_workspace_id.as_str())
         })
+}
+
+fn event_payload_workspace_matches(
+    event: &EventEnvelope,
+    requested_workspace_id: &WorkspaceId,
+) -> bool {
+    event
+        .payload
+        .get("workspace_id")
+        .or_else(|| event.payload.get("workspaceId"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|workspace_id| !workspace_id.is_empty())
+        .is_some_and(|workspace_id| workspace_id == requested_workspace_id.as_str())
 }
 
 fn event_matches_session(event: &EventEnvelope, requested_session_id: Option<&SessionId>) -> bool {
@@ -347,6 +364,52 @@ mod tests {
         assert!(event_matches_workspace(
             &state,
             &matching_event,
+            Some(&requested)
+        ));
+        assert!(!event_matches_workspace(
+            &state,
+            &mismatched_event,
+            Some(&requested)
+        ));
+    }
+
+    #[test]
+    fn event_workspace_filter_uses_payload_workspace_when_context_is_missing() {
+        let state = test_state();
+        let requested = workspace_id("workspace-payload-a");
+        let matching_snake_event = EventEnvelope::domain(
+            EventId::new("event-sse-payload-workspace-snake"),
+            "session.title.updated",
+            json!({
+                "workspace_id": "workspace-payload-a",
+                "session_id": "session-payload-a",
+            }),
+        );
+        let matching_camel_event = EventEnvelope::domain(
+            EventId::new("event-sse-payload-workspace-camel"),
+            "session.title.updated",
+            json!({
+                "workspaceId": "workspace-payload-a",
+                "sessionId": "session-payload-a",
+            }),
+        );
+        let mismatched_event = EventEnvelope::domain(
+            EventId::new("event-sse-payload-workspace-b"),
+            "session.title.updated",
+            json!({
+                "workspace_id": "workspace-payload-b",
+                "session_id": "session-payload-b",
+            }),
+        );
+
+        assert!(event_matches_workspace(
+            &state,
+            &matching_snake_event,
+            Some(&requested)
+        ));
+        assert!(event_matches_workspace(
+            &state,
+            &matching_camel_event,
             Some(&requested)
         ));
         assert!(!event_matches_workspace(
