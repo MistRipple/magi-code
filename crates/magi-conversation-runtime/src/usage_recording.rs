@@ -102,10 +102,15 @@ pub fn publish_model_usage_record(
         );
         return;
     };
-    let workspace_id_value = workspace_id
-        .as_ref()
-        .map(ToString::to_string)
-        .unwrap_or_else(|| "default-workspace".to_string());
+    let Some(workspace_id) = workspace_id.as_ref() else {
+        tracing::warn!(
+            session_id = %session_id,
+            call_id = %call_id,
+            "模型调用已返回用量，但缺少 workspace 绑定，跳过统计记录"
+        );
+        return;
+    };
+    let workspace_id_value = workspace_id.to_string();
     let input = UsageCallRecordInput {
         workspace_id: workspace_id_value.clone(),
         session_id: session_id.to_string(),
@@ -153,7 +158,7 @@ pub fn publish_model_usage_record(
             payload,
         )
         .with_context(EventContext {
-            workspace_id: workspace_id.clone(),
+            workspace_id: Some(workspace_id.clone()),
             session_id: Some(session_id.clone()),
             assignment_id: input
                 .assignment_id
@@ -429,6 +434,53 @@ mod tests {
             }),
         );
         let binding = session_turn_model_usage_binding(true);
+        let workspace_id = Some(WorkspaceId::new("workspace-1"));
+
+        publish_model_usage_record(
+            &event_bus,
+            &session_store,
+            Some(&settings_store),
+            &SessionId::new("session-1"),
+            &workspace_id,
+            &binding,
+            "call-1".to_string(),
+            Some(&json!({"prompt_tokens": 3, "completion_tokens": 7})),
+            UsageCallStatus::Success,
+            Some("assignment-1".to_string()),
+            None,
+        );
+
+        let snapshot = event_bus.snapshot();
+        assert_eq!(snapshot.recent_events.len(), 1);
+        assert_eq!(snapshot.recent_events[0].event_type, "model.usage.recorded");
+        assert_eq!(
+            snapshot.recent_events[0].category,
+            magi_event_bus::EventCategory::Usage
+        );
+        assert_eq!(
+            snapshot.recent_events[0].workspace_id.as_ref(),
+            workspace_id.as_ref()
+        );
+        assert_eq!(
+            snapshot.recent_events[0].payload["workspaceId"],
+            json!("workspace-1")
+        );
+    }
+
+    #[test]
+    fn publish_model_usage_record_skips_usage_event_without_workspace() {
+        let event_bus = InMemoryEventBus::new(8);
+        let session_store = SessionStore::new();
+        let settings_store = Arc::new(SettingsStore::new());
+        settings_store.set_section(
+            "orchestrator",
+            json!({
+                "baseUrl": "https://example.test",
+                "model": "gpt-test",
+                "provider": "openai-compatible"
+            }),
+        );
+        let binding = session_turn_model_usage_binding(true);
 
         publish_model_usage_record(
             &event_bus,
@@ -444,12 +496,9 @@ mod tests {
             None,
         );
 
-        let snapshot = event_bus.snapshot();
-        assert_eq!(snapshot.recent_events.len(), 1);
-        assert_eq!(snapshot.recent_events[0].event_type, "model.usage.recorded");
-        assert_eq!(
-            snapshot.recent_events[0].category,
-            magi_event_bus::EventCategory::Usage
+        assert!(
+            event_bus.snapshot().recent_events.is_empty(),
+            "workspace-less model usage must not be written into a synthetic workspace"
         );
     }
 }
