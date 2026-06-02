@@ -423,15 +423,6 @@ function resetPanelScrollRuntimeState(): void {
 
 let deferredWebviewStateSaveTimer: ReturnType<typeof setTimeout> | null = null;
 let sessionViewStateByScope = $state<Record<string, PersistedSessionViewState>>({});
-interface PersistedSessionExecutionState {
-  workspaceId: string | null;
-  sessionId: string;
-  edits: Edit[];
-  orchestratorRuntimeState: OrchestratorRuntimeState | null;
-  pendingChanges: unknown[];
-  pendingChangesState?: unknown;
-}
-let sessionExecutionStateByScope = $state<Record<string, PersistedSessionExecutionState>>({});
 let sessionQueuedMessagesByScope = $state<Record<string, QueuedMessage[]>>({});
 let webviewStateBatchDepth = 0;
 let webviewStateBatchPending = false;
@@ -1194,23 +1185,6 @@ function createSessionViewStateSnapshot(sessionId: string | null | undefined): P
   };
 }
 
-function createSessionExecutionStateSnapshot(
-  sessionId: string | null | undefined,
-): PersistedSessionExecutionState | null {
-  const normalizedSessionId = normalizeSessionId(sessionId);
-  if (!normalizedSessionId) {
-    return null;
-  }
-  return {
-    workspaceId: normalizeWorkspaceId(messagesState.currentWorkspaceId),
-    sessionId: normalizedSessionId,
-    edits: clonePersistablePayload(edits) as PersistedSessionExecutionState['edits'],
-    orchestratorRuntimeState: clonePersistablePayload(messagesState.orchestratorRuntimeState) as OrchestratorRuntimeState | null,
-    pendingChanges: ensureArray(clonePersistablePayload(messagesState.appState?.pendingChanges)),
-    pendingChangesState: clonePersistablePayload(messagesState.appState?.pendingChangesState ?? null),
-  };
-}
-
 function upsertSessionViewStateSnapshot(snapshot: PersistedSessionViewState | null): void {
   if (!snapshot) {
     return;
@@ -1227,17 +1201,6 @@ function upsertSessionViewStateSnapshot(snapshot: PersistedSessionViewState | nu
 
 function captureCurrentSessionViewState(): void {
   upsertSessionViewStateSnapshot(createSessionViewStateSnapshot(messagesState.currentSessionId));
-  const executionSnapshot = createSessionExecutionStateSnapshot(messagesState.currentSessionId);
-  if (executionSnapshot) {
-    const scopeKey = createSessionScopeKey(executionSnapshot.workspaceId, executionSnapshot.sessionId);
-    if (!scopeKey) {
-      return;
-    }
-    sessionExecutionStateByScope = {
-      ...sessionExecutionStateByScope,
-      [scopeKey]: executionSnapshot,
-    };
-  }
 }
 
 function getSessionViewState(sessionId: string | null | undefined): PersistedSessionViewState | null {
@@ -1280,14 +1243,6 @@ function pruneSessionViewStateByKnownSessions(): void {
     return;
   }
   sessionViewStateByScope = Object.fromEntries(nextEntries);
-  const nextExecutionEntries = Object.entries(sessionExecutionStateByScope)
-    .filter(([scopeKey, snapshot]) => (
-      normalizeWorkspaceId(snapshot.workspaceId) !== currentWorkspaceId
-      || knownScopeKeys.has(scopeKey)
-    ));
-  if (nextExecutionEntries.length !== Object.keys(sessionExecutionStateByScope).length) {
-    sessionExecutionStateByScope = Object.fromEntries(nextExecutionEntries);
-  }
   const nextQueuedEntries = Object.entries(sessionQueuedMessagesByScope)
     .filter(([scopeKey, queuedMessages]) => {
       if (queuedMessages.length === 0) {
@@ -1317,20 +1272,6 @@ function applySessionViewState(sessionId: string | null | undefined): boolean {
   messagesState.scrollPositions = normalizePersistedScrollPositions(normalizedSnapshot.scrollPositions);
   messagesState.scrollAnchors = normalizePersistedScrollAnchors(normalizedSnapshot.scrollAnchors);
   messagesState.autoScrollEnabled = normalizePersistedAutoScrollConfig(normalizedSnapshot.autoScrollEnabled);
-  const executionSnapshot = scopeKey
-    ? sessionExecutionStateByScope[scopeKey] || null
-    : null;
-  if (executionSnapshot) {
-    edits = clonePersistablePayload(executionSnapshot.edits) as PersistedSessionExecutionState['edits'];
-    messagesState.orchestratorRuntimeState = clonePersistablePayload(executionSnapshot.orchestratorRuntimeState) as OrchestratorRuntimeState | null;
-    if (messagesState.appState) {
-      messagesState.appState = {
-        ...messagesState.appState,
-        pendingChanges: ensureArray(clonePersistablePayload(executionSnapshot.pendingChanges)),
-        pendingChangesState: clonePersistablePayload(executionSnapshot.pendingChangesState ?? null),
-      };
-    }
-  }
   return true;
 }
 
@@ -2233,7 +2174,6 @@ export function initializeState() {
   clearAllRetryRuntime();
   resetPanelScrollRuntimeState();
   sessionViewStateByScope = {};
-  sessionExecutionStateByScope = {};
   sessionQueuedMessagesByScope = {};
   const persisted = vscode.getState<WebviewPersistedState>();
   if (persisted) {
