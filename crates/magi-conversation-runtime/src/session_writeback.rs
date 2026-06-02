@@ -2159,6 +2159,107 @@ mod tests {
         );
     }
 
+    #[test]
+    fn session_turn_approval_required_tool_is_terminal_error_item() {
+        let session_store = SessionStore::new();
+        let event_bus = InMemoryEventBus::new(32);
+        let session_id = SessionId::new("session-turn-approval-tool");
+        let workspace_id = Some(WorkspaceId::new("workspace-turn-approval-tool"));
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().to_path_buf();
+        let target = root.join("approval-required.txt");
+        session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "approval tool session",
+                workspace_id.as_ref().map(ToString::to_string),
+            )
+            .expect("session should be creatable");
+        session_store
+            .upsert_current_turn(
+                session_id.clone(),
+                ActiveExecutionTurn {
+                    turn_id: "turn-approval-tool".to_string(),
+                    turn_seq: 1,
+                    accepted_at: UtcMillis::now(),
+                    status: "running".to_string(),
+                    user_message: Some("受限模式执行写入 shell".to_string()),
+                    items: Vec::new(),
+                    completed_at: None,
+                },
+            )
+            .expect("turn should be creatable");
+
+        let mut tool_registry = ToolRegistry::new(
+            Arc::new(GovernanceService::default()),
+            Arc::new(InMemoryEventBus::new(8)),
+        );
+        tool_registry.register_default_builtins();
+        let tool_calls = vec![ChatToolCall {
+            id: "tool-call-approval-shell".to_string(),
+            kind: "function".to_string(),
+            function: ChatToolFunction {
+                name: "shell_exec".to_string(),
+                arguments: serde_json::json!({
+                    "command": format!("printf approval > {}", target.display())
+                })
+                .to_string(),
+            },
+        }];
+        let mut messages = Vec::new();
+
+        append_session_tool_call_items_batch(
+            &session_store,
+            &event_bus,
+            Some(&tool_registry),
+            None,
+            None,
+            None,
+            None,
+            &session_id,
+            &workspace_id,
+            Some(root.clone()),
+            magi_core::AccessProfile::Restricted,
+            &tool_calls,
+            &mut messages,
+            None,
+            None,
+            &ThreadId::new("thread-approval-tool"),
+            None,
+            || true,
+        );
+
+        assert!(!target.exists(), "需要审批的工具调用不能提前执行");
+        let sidecar = session_store
+            .runtime_sidecar(&session_id)
+            .expect("sidecar should exist");
+        let turn = sidecar.current_turn.expect("turn should exist");
+        let item = turn.items.first().expect("tool item should exist");
+        assert_eq!(item.status, "failed");
+        assert_eq!(item.tool_status.as_deref(), Some("needs_approval"));
+        assert!(item.tool_error.is_some(), "需要审批必须作为错误槽写回");
+        assert_eq!(
+            messages
+                .first()
+                .and_then(|message| message.tool_call_id.as_deref()),
+            Some("tool-call-approval-shell")
+        );
+
+        let canonical_turn = session_store
+            .canonical_turns_for_session(&session_id)
+            .into_iter()
+            .find(|turn| turn.turn_id == "turn-approval-tool")
+            .expect("canonical turn should be stored");
+        let canonical_item = canonical_turn
+            .items
+            .first()
+            .expect("canonical tool item should exist");
+        assert_eq!(canonical_item.status, CanonicalTurnItemStatus::Failed);
+        let canonical_tool = canonical_item.tool.as_ref().expect("canonical tool");
+        assert!(canonical_tool.result.is_some());
+        assert!(canonical_tool.error.is_some());
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn session_turn_concurrent_tool_batch_keeps_snapshot_context_during_execution() {
         let dir = tempfile::tempdir().expect("temp dir");

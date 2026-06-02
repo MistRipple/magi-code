@@ -238,6 +238,17 @@
     }
   }
 
+  function extractErrorCode(content: unknown): string {
+    const payload = parseJsonObjectValue(content);
+    if (!payload) return '';
+    const code = typeof payload.error_code === 'string'
+      ? payload.error_code
+      : typeof payload.errorCode === 'string'
+        ? payload.errorCode
+        : '';
+    return code.trim().toLowerCase();
+  }
+
   function isViewImageTool(toolName: string): boolean {
     const parsed = parseToolIdentity(toolName);
     return parsed.baseName === 'view_image' || parsed.baseName === 'image_view';
@@ -665,7 +676,12 @@
     const rawMessage = `${toolResult?.message || ''}\n${errorText || ''}`.trim();
     if (!rawMessage) return null;
 
-    const errorCode = (toolResult?.errorCode || '').toLowerCase();
+    const errorCode = (
+      toolResult?.errorCode
+      || extractErrorCode(errorText)
+      || extractErrorCode(toolResult?.message)
+      || ''
+    ).toLowerCase();
     // 只取消息前 300 字符做关键词匹配，避免工具输出正文中的常见词（如 authorization、timeout）
     // 导致误分类。后端结构化错误前缀（如 "Tool blocked:", "Command rejected:"）都在开头。
     const messageHead = rawMessage.slice(0, 300).toLowerCase();
@@ -698,6 +714,7 @@
       'tool_policy_failed',
       'skill_tool_policy_rejected',
       'skill_tool_policy_failed',
+      'external_tool_policy_rejected',
       'tool_safety_rejected',
       'tool_safety_failed',
     )) {
@@ -803,6 +820,7 @@
         'tool_policy_needs_approval',
         'skill_tool_policy_needs_approval',
         'skill_tool_needs_approval',
+        'external_tool_needs_approval',
         'tool_safety_needs_approval',
       )
       || messageHead.includes('user denied tool authorization')

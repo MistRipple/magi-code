@@ -40,7 +40,7 @@ pub fn safety_gate_public_error(status: ExecutionResultStatus) -> PublicToolErro
 pub fn turn_item_status_for_tool_result(status: ExecutionResultStatus) -> &'static str {
     match status {
         ExecutionResultStatus::Succeeded => "completed",
-        ExecutionResultStatus::NeedsApproval => "awaiting_approval",
+        ExecutionResultStatus::NeedsApproval => "failed",
         ExecutionResultStatus::Failed
         | ExecutionResultStatus::Rejected
         | ExecutionResultStatus::Cancelled => "failed",
@@ -141,7 +141,7 @@ mod tests {
         );
         assert_eq!(
             turn_item_status_for_tool_result(ExecutionResultStatus::NeedsApproval),
-            "awaiting_approval"
+            "failed"
         );
         assert_eq!(
             turn_item_status_for_tool_result(ExecutionResultStatus::Cancelled),
