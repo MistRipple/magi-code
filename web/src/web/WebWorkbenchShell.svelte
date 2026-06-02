@@ -835,9 +835,6 @@
     } = {},
   ): boolean {
     const sessionId = metadata.sessionId?.trim() || currentSessionId || '';
-    if (!sessionId) {
-      return false;
-    }
     const workspaceId = metadata.workspaceId?.trim() || selectedWorkspace?.workspaceId?.trim() || selectedWorkspaceId.trim();
     const workspacePath = metadata.workspacePath?.trim() || selectedWorkspace?.rootPath?.trim() || '';
     if (!workspaceId || !workspacePath) {
