@@ -4,7 +4,7 @@ use crate::types::{
     BINARY_BLOB_LIMIT, ContentKind, FileMeta, LARGE_TEXT_SUMMARY_BYTES, SymlinkInfo,
     TEXT_BLOB_LIMIT,
 };
-use ignore::WalkBuilder;
+use ignore::{WalkBuilder, gitignore::Gitignore};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -284,7 +284,7 @@ pub fn walk_workspace(
         }
         let depth = path.strip_prefix(workspace_root).ok();
         if let Some(rel) = depth {
-            if first_segment_excluded(rel) {
+            if has_default_excluded_component(rel) {
                 continue;
             }
         }
@@ -298,14 +298,98 @@ pub fn walk_workspace(
     Ok(paths)
 }
 
-fn first_segment_excluded(rel: &Path) -> bool {
-    let mut comps = rel.components();
-    if let Some(std::path::Component::Normal(name)) = comps.next() {
-        if let Some(s) = name.to_str() {
-            return DEFAULT_EXCLUDES.contains(&s);
+#[derive(Clone)]
+pub(crate) struct SnapshotPathFilter {
+    workspace_root: PathBuf,
+    gitignore: Option<Gitignore>,
+}
+
+impl SnapshotPathFilter {
+    pub(crate) fn new(workspace_root: &Path, respect_gitignore: bool) -> Self {
+        let gitignore = if respect_gitignore {
+            build_gitignore(workspace_root)
+        } else {
+            None
+        };
+        Self {
+            workspace_root: workspace_root.to_path_buf(),
+            gitignore,
         }
     }
-    false
+
+    pub(crate) fn excluded_prefixes(&self) -> Vec<PathBuf> {
+        DEFAULT_EXCLUDES
+            .iter()
+            .map(|exclude| self.workspace_root.join(exclude))
+            .collect()
+    }
+
+    pub(crate) fn excludes_abs_path(&self, abs: &Path) -> bool {
+        let Ok(rel) = abs.strip_prefix(&self.workspace_root) else {
+            return true;
+        };
+        if self.excludes_relative_path(rel) {
+            return true;
+        }
+        self.gitignore.as_ref().is_some_and(|gitignore| {
+            gitignore
+                .matched_path_or_any_parents(abs, abs.is_dir())
+                .is_ignore()
+        })
+    }
+
+    pub(crate) fn excludes_relative_str(&self, rel: &str) -> bool {
+        let rel = Path::new(rel);
+        if self.excludes_relative_path(rel) {
+            return true;
+        }
+        let abs = self.workspace_root.join(rel);
+        self.gitignore.as_ref().is_some_and(|gitignore| {
+            gitignore
+                .matched_path_or_any_parents(&abs, abs.is_dir())
+                .is_ignore()
+        })
+    }
+
+    fn excludes_relative_path(&self, rel: &Path) -> bool {
+        has_default_excluded_component(rel)
+    }
+}
+
+fn build_gitignore(workspace_root: &Path) -> Option<Gitignore> {
+    let gitignore_path = workspace_root.join(".gitignore");
+    if !gitignore_path.is_file() {
+        return None;
+    }
+    let mut builder = ignore::gitignore::GitignoreBuilder::new(workspace_root);
+    if let Some(error) = builder.add(&gitignore_path) {
+        tracing::warn!(
+            path = %gitignore_path.display(),
+            error = %error,
+            "snapshot gitignore load reported partial error"
+        );
+    }
+    match builder.build() {
+        Ok(gitignore) => Some(gitignore),
+        Err(error) => {
+            tracing::warn!(
+                path = %gitignore_path.display(),
+                error = %error,
+                "snapshot gitignore build failed"
+            );
+            None
+        }
+    }
+}
+
+fn has_default_excluded_component(rel: &Path) -> bool {
+    rel.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::Normal(name)
+                if name.to_str().is_some_and(|s| DEFAULT_EXCLUDES.contains(&s))
+        )
+    })
 }
 
 fn relative_path(root: &Path, abs: &Path) -> SnapshotResult<String> {

@@ -2,7 +2,7 @@ use crate::baseline_index::{BaselineIndex, RefsIndex, baseline_path, refs_path};
 use crate::blob_store::BlobStore;
 use crate::change_log::ChangeLog;
 use crate::error::{SnapshotError, SnapshotResult};
-use crate::scan::{read_file_meta, read_large_text_summary, walk_workspace};
+use crate::scan::{SnapshotPathFilter, read_file_meta, read_large_text_summary, walk_workspace};
 use crate::tool_hook::{ToolHook, ToolHookCtx};
 use crate::types::{ChangeEvent, ChangeKind, ContentKind, FileMeta, PendingChange, SourceKind};
 use crate::watcher::{DebouncedEvent, DebouncedKind, FsWatcher};
@@ -26,6 +26,7 @@ pub struct SnapshotSession {
     last_event: RwLock<HashMap<String, ChangeEvent>>,
     /// 当前正在执行中的工具调用。串行执行时 watcher 事件可直接归因；并发执行时仅按声明路径精确归因。
     active_tool_ctxs: RwLock<HashMap<String, ToolHookCtx>>,
+    path_filter: SnapshotPathFilter,
     _watcher: tokio::sync::Mutex<Option<FsWatcher>>,
 }
 
@@ -57,6 +58,7 @@ impl SnapshotSession {
 
         let session_dir = snapshots_root.join("index").join(&session_id);
         std::fs::create_dir_all(&session_dir).map_err(|e| SnapshotError::io(&session_dir, e))?;
+        let path_filter = SnapshotPathFilter::new(&workspace_root, respect_gitignore);
 
         let baseline = BaselineIndex::load(&baseline_path(&session_dir))?;
         let refs = RefsIndex::load(&refs_path(&session_dir))?;
@@ -73,6 +75,7 @@ impl SnapshotSession {
             current: RwLock::new(HashMap::new()),
             last_event: RwLock::new(HashMap::new()),
             active_tool_ctxs: RwLock::new(HashMap::new()),
+            path_filter,
             _watcher: tokio::sync::Mutex::new(None),
         });
 
@@ -90,10 +93,7 @@ impl SnapshotSession {
 
         // 启动 watcher。
         let (tx, mut rx) = mpsc::unbounded_channel::<DebouncedEvent>();
-        let excluded = Arc::new(vec![
-            workspace_root.join(".magi"),
-            workspace_root.join(".git"),
-        ]);
+        let excluded = Arc::new(session.path_filter.excluded_prefixes());
         let watcher = FsWatcher::start(&workspace_root, excluded, tx)?;
         {
             let mut guard = session._watcher.lock().await;
@@ -197,6 +197,9 @@ impl SnapshotSession {
     fn handle_watcher_event(&self, ev: DebouncedEvent) -> SnapshotResult<()> {
         let abs = ev.path;
         if !abs.starts_with(&self.workspace_root) {
+            return Ok(());
+        }
+        if self.path_filter.excludes_abs_path(&abs) {
             return Ok(());
         }
         let source = SourceKind::Watcher;
@@ -306,6 +309,9 @@ impl SnapshotSession {
                 Ok(r) => r.to_string_lossy().replace('\\', "/"),
                 Err(_) => continue,
             };
+            if self.path_filter.excludes_relative_str(&rel) {
+                continue;
+            }
             seen.insert(rel.clone());
             self.record_upsert(
                 &abs,
@@ -323,6 +329,9 @@ impl SnapshotSession {
             .cloned()
             .collect();
         for k in known_paths {
+            if self.path_filter.excludes_relative_str(&k) {
+                continue;
+            }
             if !seen.contains(&k) {
                 let abs = self.workspace_root.join(&k);
                 self.record_removal(
@@ -384,6 +393,9 @@ impl SnapshotSession {
 
         let mut primary = Vec::new();
         for p in all_paths {
+            if self.path_filter.excludes_relative_str(&p) {
+                continue;
+            }
             let base = baseline.entries.get(&p);
             let now = current.get(&p);
             let pending = match (base, now) {

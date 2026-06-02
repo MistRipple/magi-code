@@ -125,6 +125,45 @@ async fn new_file_creation_records_added() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn ignored_runtime_artifacts_do_not_enter_pending_changes() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join(".gitignore"), "web/dist/\n").unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn original() {}\n").unwrap();
+
+    let mgr = SnapshotManager::new();
+    let session = mgr
+        .start_session("s-ignored-runtime-artifacts".into(), root.clone())
+        .await
+        .unwrap();
+
+    fs::create_dir_all(root.join("target/debug/.fingerprint/pkg")).unwrap();
+    fs::write(
+        root.join("target/debug/.fingerprint/pkg/lib-pkg.json"),
+        "{}",
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("web/dist/assets")).unwrap();
+    fs::write(root.join("web/dist/assets/app.js"), "compiled").unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn changed() {}\n").unwrap();
+
+    session.reconcile().unwrap();
+    let pending = session.pending_changes().unwrap();
+    let paths = pending
+        .iter()
+        .map(|change| change.path.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        paths,
+        vec!["src/lib.rs"],
+        "snapshot pending changes 不应暴露 target 或 .gitignore 产物"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn deletion_records_deleted() {
     let dir = tempdir().unwrap();
     let root = dir.path().to_path_buf();
