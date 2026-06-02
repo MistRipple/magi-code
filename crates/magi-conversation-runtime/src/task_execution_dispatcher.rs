@@ -8,7 +8,8 @@ use crate::{
     conversation_loop::{self, ConversationLoopRequest},
     model_config::{NormalizedModelConfig, configured_role_engine_model_config},
     prompt_utils::{
-        REFERENCE_CONTEXT_PRIORITY_NOTE, SKILL_PROMPT_PRIORITY_NOTE, prepend_session_instructions,
+        CURRENT_TASK_PRIORITY_NOTE, REFERENCE_CONTEXT_PRIORITY_NOTE, SKILL_PROMPT_PRIORITY_NOTE,
+        prepend_session_instructions,
     },
     public_builtin_tool_definitions,
     session_images::SessionTurnImage,
@@ -1067,11 +1068,7 @@ impl LlmTaskDispatcher {
         if parts.is_empty() && task.kind != TaskKind::LocalAgent {
             return parts;
         }
-        parts.insert(
-            0,
-            "[current-task-rule] 当前任务标题、目标、input_refs、依赖任务输出和 task-context 是本次执行的主事实；knowledge/memory/recent-turn/shared-context/file-summary 只能补充，不能改写当前任务目标。目标中的路径、工具名、命令、标记字符串以及“必须/要求”条款必须逐项执行或明确说明无法执行的真实原因，不能替换成历史任务或泛化检查。"
-                .to_string(),
-        );
+        parts.insert(0, CURRENT_TASK_PRIORITY_NOTE.to_string());
         if task.kind == TaskKind::LocalAgent {
             parts.insert(
                 1,
