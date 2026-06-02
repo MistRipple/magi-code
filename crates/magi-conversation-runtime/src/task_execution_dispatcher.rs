@@ -1264,18 +1264,19 @@ impl LlmTaskDispatcher {
         let mut sections = vec![INJECTION_DEFENSE_BASELINE.to_string()];
 
         if let Some(gate) = self.build_safety_gate(settings_store) {
-            let patterns = gate
+            let rule_lines = gate
                 .rules()
                 .iter()
                 .filter(|rule| rule.enabled)
-                .map(|rule| rule.pattern.trim())
-                .filter(|pattern| !pattern.is_empty())
-                .map(|pattern| format!("- {}", pattern))
+                .filter_map(|rule| {
+                    let pattern = rule.pattern.trim();
+                    (!pattern.is_empty()).then(|| safeguard_rule_prompt_line(pattern, rule.action))
+                })
                 .collect::<Vec<_>>();
-            if !patterns.is_empty() {
+            if !rule_lines.is_empty() {
                 sections.push(format!(
-                    "执行 shell / git / 文件写操作前，如果命中以下危险模式，必须先向用户确认，不得直接执行（违规调用会被运行期安全策略拦截）：\n{}",
-                    patterns.join("\n")
+                    "执行 shell / git / 文件写操作前，以下 SafetyGate 规则与运行期动作必须按原样遵守（违规调用会被运行期安全策略拦截）：\n{}",
+                    rule_lines.join("\n")
                 ));
             }
         }
@@ -1792,6 +1793,20 @@ fn format_skill_prompt_injection(injection: &magi_skill_runtime::SkillPromptInje
 
 fn estimate_session_memory_tokens(text: &str) -> u64 {
     text.len() as u64 / 4 + 1
+}
+
+fn safeguard_rule_prompt_line(pattern: &str, action: magi_safety_gate::SafetyAction) -> String {
+    match action {
+        magi_safety_gate::SafetyAction::HardBlock => {
+            format!("- [阻断] {pattern}：任何访问模式下都不得执行，也不得请求用户批准后绕过。")
+        }
+        magi_safety_gate::SafetyAction::RequireApprovalInRestricted => format!(
+            "- [受限需审批] {pattern}：受限访问下必须等待用户批准；完全访问下按当前授权执行并保留风险说明。"
+        ),
+        magi_safety_gate::SafetyAction::AuditOnly => {
+            format!("- [审计] {pattern}：允许执行，但需要保持风险意识并如实说明影响。")
+        }
+    }
 }
 
 /// S8 安全防护段的固定基线 —— 防注入与越权防御。
@@ -2834,6 +2849,76 @@ mod tests {
             gate.evaluate("shell_exec", &force_push)
                 .is_require_approval(),
             "settings 未覆盖的内置规则仍应自动补齐"
+        );
+    }
+
+    #[test]
+    fn resolve_safeguard_prompt_renders_runtime_rule_actions() {
+        use crate::settings_store::SettingsStore;
+
+        let dispatcher = dispatcher_with_default_tool_surface();
+        let store = Arc::new(SettingsStore::new());
+        store.set_section(
+            "safeguardConfig",
+            serde_json::json!({
+                "rules": [
+                    {
+                        "pattern": "custom hard block",
+                        "enabled": true,
+                        "category": "custom",
+                        "action": "hard_block"
+                    },
+                    {
+                        "pattern": "custom approval command",
+                        "enabled": true,
+                        "category": "custom",
+                        "action": "require_approval_in_restricted"
+                    },
+                    {
+                        "pattern": "custom audit command",
+                        "enabled": true,
+                        "category": "custom",
+                        "action": "audit_only"
+                    },
+                    {
+                        "pattern": "disabled hard block",
+                        "enabled": false,
+                        "category": "custom",
+                        "action": "hard_block"
+                    }
+                ]
+            }),
+        );
+
+        let prompt = dispatcher
+            .resolve_safeguard_prompt(Some(&store))
+            .expect("安全防护基线必须始终注入");
+
+        assert!(
+            prompt.contains(
+                "- [阻断] custom hard block：任何访问模式下都不得执行，也不得请求用户批准后绕过。"
+            ),
+            "HardBlock 必须明确表达为不可审批绕过的阻断"
+        );
+        assert!(
+            prompt.contains(
+                "- [受限需审批] custom approval command：受限访问下必须等待用户批准；完全访问下按当前授权执行并保留风险说明。"
+            ),
+            "RequireApprovalInRestricted 必须表达访问模式差异"
+        );
+        assert!(
+            prompt.contains(
+                "- [审计] custom audit command：允许执行，但需要保持风险意识并如实说明影响。"
+            ),
+            "AuditOnly 必须表达为审计而非审批"
+        );
+        assert!(
+            !prompt.contains("disabled hard block"),
+            "禁用规则不能进入模型可见提示"
+        );
+        assert!(
+            !prompt.contains("如果命中以下危险模式，必须先向用户确认"),
+            "提示不能再把所有 SafetyGate 动作统一描述为审批"
         );
     }
 
