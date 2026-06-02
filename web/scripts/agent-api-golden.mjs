@@ -180,6 +180,8 @@ try {
     globalThis.fetch = async (url) => {
       capturedToolCatalogUrl = String(url);
       return new Response(JSON.stringify({
+        catalog_access_mode: 'read_only',
+        current_access_profile: 'full_access',
         tools: [
           {
             name: 'shell_exec',

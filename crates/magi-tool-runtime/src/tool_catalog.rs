@@ -183,7 +183,7 @@ pub(crate) fn build_tool_catalog_value(
     serde_json::json!({
         "tool": "tool_catalog",
         "status": "succeeded",
-        "access_mode": BuiltinToolAccessMode::ReadOnly.as_str(),
+        "catalog_access_mode": BuiltinToolAccessMode::ReadOnly.as_str(),
         "current_access_profile": access_profile.as_str(),
         "approval_policy_summary": approval_policy_summary(access_profile),
         "summary": tool_catalog_summary(
@@ -709,6 +709,8 @@ mod tests {
         let payload: serde_json::Value = serde_json::from_str(&output).expect("json output");
 
         assert_eq!(payload["status"], "succeeded");
+        assert!(payload.get("access_mode").is_none());
+        assert_eq!(payload["catalog_access_mode"], "read_only");
         assert_eq!(payload["current_access_profile"], "restricted");
         assert!(
             payload["approval_policy_summary"]
