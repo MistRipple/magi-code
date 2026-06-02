@@ -584,21 +584,24 @@ function resolveSelectedWorkspace(
     || normalizeString(payload.currentSession?.workspace_id);
   const workspaces = Array.isArray(payload.workspaces) ? payload.workspaces : [];
   const selectedWorkspace = workspaces.find((workspace) => (
-    currentSessionWorkspaceId && normalizeString(workspace.workspaceId) === currentSessionWorkspaceId
+    requestedWorkspacePath && normalizeString(workspace.rootPath) === requestedWorkspacePath
   ))
     || workspaces.find((workspace) => (
       requestedWorkspaceId && normalizeString(workspace.workspaceId) === requestedWorkspaceId
     ))
     || workspaces.find((workspace) => (
-      requestedWorkspacePath && normalizeString(workspace.rootPath) === requestedWorkspacePath
+      !requestedWorkspaceId
+      && !requestedWorkspacePath
+      && currentSessionWorkspaceId
+      && normalizeString(workspace.workspaceId) === currentSessionWorkspaceId
     ))
     || workspaces[0]
     || null;
   const workspaceId = normalizeString(selectedWorkspace?.workspaceId)
-    || currentSessionWorkspaceId
-    || requestedWorkspaceId;
+    || requestedWorkspaceId
+    || currentSessionWorkspaceId;
   const rootPath = normalizeString(selectedWorkspace?.rootPath)
-    || (currentSessionWorkspaceId ? '' : requestedWorkspacePath);
+    || requestedWorkspacePath;
   return {
     workspaceId,
     rootPath,

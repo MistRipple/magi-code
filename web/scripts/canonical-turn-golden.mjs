@@ -103,6 +103,7 @@ function runGoldenReplay(reducer, projection, messagesStore, timelineRenderItems
   assertBootstrapProcessingStateIgnoresTerminalCanonicalTurn(contract);
   assertBootstrapCarriesPendingChanges(contract);
   assertBootstrapFiltersForeignWorkspaceSessions(contract);
+  assertBootstrapExplicitWorkspaceWinsOverForeignCurrentSession(contract);
 }
 
 function assertAgentSpawnToolCardStaysOnMainlineAndTaskTabsFilterByTaskId(reducer, projection, timelineRenderItems) {
@@ -997,6 +998,63 @@ function assertBootstrapFiltersForeignWorkspaceSessions(contract) {
     bootstrap.state.sessions.map((session) => session.id),
     bootstrap.sessions.map((session) => session.id),
     'AppState sessions must use the same workspace-filtered list as bootstrap sessions',
+  );
+}
+
+function assertBootstrapExplicitWorkspaceWinsOverForeignCurrentSession(contract) {
+  const bootstrap = contract.normalizeRustBootstrapPayload({
+    generatedAt: 7500,
+    currentSession: {
+      sessionId: 'session-workspace-b-current',
+      workspaceId: 'workspace-b',
+      title: 'B current',
+      createdAt: 7000,
+      updatedAt: 7500,
+    },
+    sessions: [
+      {
+        sessionId: 'session-workspace-a-visible',
+        workspaceId: 'workspace-a',
+        title: 'A visible',
+        createdAt: 7000,
+        updatedAt: 7400,
+      },
+      {
+        sessionId: 'session-workspace-b-current',
+        workspaceId: 'workspace-b',
+        title: 'B current',
+        createdAt: 7000,
+        updatedAt: 7500,
+      },
+    ],
+    workspaces: [
+      { workspaceId: 'workspace-a', rootPath: '/tmp/workspace-a' },
+      { workspaceId: 'workspace-b', rootPath: '/tmp/workspace-b' },
+    ],
+  }, {
+    workspaceId: 'workspace-a',
+    workspacePath: '/tmp/workspace-a',
+  });
+
+  assert.equal(
+    bootstrap.workspace.workspaceId,
+    'workspace-a',
+    'explicit bootstrap workspace must not be replaced by a foreign currentSession workspace',
+  );
+  assert.deepEqual(
+    bootstrap.sessions.map((session) => session.id),
+    ['session-workspace-a-visible'],
+    'explicit bootstrap workspace must keep only sessions from that workspace',
+  );
+  assert.equal(
+    bootstrap.sessionId,
+    '',
+    'foreign currentSession must be discarded instead of making the frontend guess a replacement session',
+  );
+  assert.equal(
+    bootstrap.state.currentSessionId,
+    '',
+    'AppState currentSessionId must mirror the discarded foreign currentSession',
   );
 }
 
