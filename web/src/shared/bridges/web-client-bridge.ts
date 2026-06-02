@@ -2447,6 +2447,22 @@ async function ensureFreshLiveBridge(reason: string): Promise<void> {
   });
 }
 
+// 发送消息不能被弱网络下的 SSE 握手阻塞；HTTP 提交先行，事件流在后台追上。
+async function warmLiveBridgeForSubmission(reason: string): Promise<void> {
+  hydrateCanonicalWorkspaceBinding();
+  const hasWorkspaceBinding = Boolean(currentWorkspaceId || currentWorkspacePath);
+  const hasBinding = Boolean(hasWorkspaceBinding || currentSessionId);
+  if (!hasBinding) {
+    await restoreBridgeState(reason, true);
+    return;
+  }
+  const expectedKey = eventStreamBindingKey();
+  await ensureEventStream({
+    forceReconnect: activeEventStreamKey !== expectedKey,
+    waitUntilOpen: false,
+  });
+}
+
 // ─── Task tracking helpers ────────────────────────────────────────────
 
 /**
@@ -2730,7 +2746,7 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
       persistWorkspaceBinding(targetWorkspaceId, targetWorkspacePath, targetSessionId);
     }
     try {
-      await ensureFreshLiveBridge('execute_task_preflight');
+      await warmLiveBridgeForSubmission('execute_task_preflight');
     } catch (preflightError) {
       if (!targetWorkspaceId) {
         throw preflightError;
