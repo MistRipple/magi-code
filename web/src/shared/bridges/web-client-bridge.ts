@@ -1863,6 +1863,8 @@ function dispatchEmptyWorkspaceState(): void {
   closeEventStream();
   clearPersistedWorkspaceBinding();
   emitDataMessage('emptyWorkspaceStateLoaded', {
+    workspaceId: '',
+    workspacePath: '',
     state: buildEmptyWorkspaceAppState(now),
     workspaces: [],
   });
@@ -2168,6 +2170,9 @@ async function fetchBootstrap(
       if (response.status === 404) {
         const workspaces = await listAgentWorkspaces();
         if (workspaces.length === 0) {
+          if (!isCurrentBootstrapRequest(requestBindingKey, requestSeq)) {
+            return;
+          }
           dispatchEmptyWorkspaceState();
           return;
         }

@@ -704,6 +704,7 @@ function handleEmptyWorkspaceStateLoaded(message: ClientBridgeMessage) {
     : '';
 
   batchWebviewStatePersistence(() => {
+    messagesState.sessionHydrating = false;
     if (!hasPendingLocalTurn) {
       clearAllMessages({
         persist: false,
@@ -714,16 +715,22 @@ function handleEmptyWorkspaceStateLoaded(message: ClientBridgeMessage) {
       clearAllRequestBindings();
       clearPendingInteractions();
       clearProcessingState({ skipAntiLiftBack: true });
+      clearCanonicalSessionTurns();
+      messagesState.canonicalTimelineProjection = null;
+      setQueuedMessages([]);
     }
+    clearCurrentSessionBeforeWorkspaceChange(workspaceId);
     setCurrentSessionId(null);
-    messagesState.currentWorkspaceId = workspaceId || messagesState.currentWorkspaceId;
+    messagesState.currentWorkspaceId = workspaceId;
     messagesState.currentWorkspacePath = workspacePath;
     updateSessions([]);
+    setSessionHistoryState(null, { workspaceId });
     setAppState({
       ...state,
       sessions: [],
       currentSessionId: '',
       currentWorkspaceId: workspaceId,
+      currentWorkspacePath: workspacePath,
       pendingChanges: [],
       tasks: [],
       edits: [],
@@ -731,9 +738,6 @@ function handleEmptyWorkspaceStateLoaded(message: ClientBridgeMessage) {
       processingState: null,
     });
     setOrchestratorRuntimeState(null);
-    if (!hasPendingLocalTurn) {
-      setQueuedMessages([]);
-    }
   });
 }
 

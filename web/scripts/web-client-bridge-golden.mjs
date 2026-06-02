@@ -15,6 +15,7 @@ let acceptedPublished = false;
 let terminalPublished = false;
 let summaryMessageCount = 1;
 let summaryUpdatedAt = ACCEPTED_AT;
+let workspaceListPayload = null;
 const capturedTurnBodies = [];
 const bootstrapInterceptors = [];
 
@@ -271,6 +272,9 @@ function installFetchStub() {
         return interceptor(parsed);
       }
       return jsonResponse(bootstrapPayload());
+    }
+    if (parsed.pathname === '/api/workspaces' && Array.isArray(workspaceListPayload)) {
+      return jsonResponse({ workspaces: workspaceListPayload });
     }
     if (parsed.pathname === '/api/settings/bootstrap') {
       return jsonResponse(settingsBootstrapPayload());
@@ -697,6 +701,76 @@ try {
   } finally {
     console.warn = originalRaceWarn;
   }
+
+  workspaceListPayload = [];
+  const staleEmptyBootstrap = deferred();
+  let staleEmptyBootstrapRequested = false;
+  bootstrapInterceptors.push(() => {
+    staleEmptyBootstrapRequested = true;
+    return staleEmptyBootstrap.promise.then(() => new Response(
+      JSON.stringify({ message: 'workspace missing' }),
+      { status: 404, headers: { 'content-type': 'application/json' } },
+    ));
+  });
+  messagesStore.messagesState.bootstrapped = false;
+  bridge.postMessage({ type: 'requestState' });
+  await waitFor(
+    () => staleEmptyBootstrapRequested,
+    'stale empty-workspace bootstrap request must start',
+  );
+  bridge.postMessage({
+    type: 'workspaceBindingChanged',
+    workspaceId: WORKSPACE_ID,
+    workspacePath: WORKSPACE_PATH,
+    sessionId: SESSION_ID,
+  });
+  bootstrapInterceptors.push(() => jsonResponse(scopedBootstrapPayload(
+    WORKSPACE_ID,
+    WORKSPACE_PATH,
+    SESSION_ID,
+    '最新会话',
+  )));
+  bridge.postMessage({ type: 'requestState' });
+  await waitFor(
+    () => messagesStore.messagesState.currentWorkspaceId === WORKSPACE_ID
+      && messagesStore.messagesState.currentSessionId === SESSION_ID,
+    'fresh bootstrap must adopt the latest binding before stale empty response resolves',
+  );
+  staleEmptyBootstrap.resolve();
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(
+    messagesStore.messagesState.currentWorkspaceId,
+    WORKSPACE_ID,
+    'stale empty-workspace bootstrap must not clear the latest workspace binding',
+  );
+  assert.equal(
+    messagesStore.messagesState.currentSessionId,
+    SESSION_ID,
+    'stale empty-workspace bootstrap must not clear the latest session binding',
+  );
+
+  bootstrapInterceptors.push(() => new Response(
+    JSON.stringify({ message: 'workspace missing' }),
+    { status: 404, headers: { 'content-type': 'application/json' } },
+  ));
+  messagesStore.messagesState.bootstrapped = false;
+  bridge.postMessage({ type: 'requestState' });
+  await waitFor(
+    () => !messagesStore.messagesState.currentWorkspaceId
+      && !messagesStore.messagesState.currentSessionId,
+    'authoritative empty-workspace bootstrap must clear stale workspace and session bindings',
+  );
+  assert.equal(
+    window.location.href.includes('workspaceId='),
+    false,
+    'authoritative empty-workspace bootstrap must remove stale workspace from URL',
+  );
+  assert.deepEqual(
+    messagesStore.messagesState.sessions,
+    [],
+    'authoritative empty-workspace bootstrap must clear stale session summaries',
+  );
+  workspaceListPayload = null;
 
   console.log('web client bridge golden replay passed');
 } finally {
