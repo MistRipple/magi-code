@@ -4,6 +4,7 @@
   import { parseLeadingJson } from '../lib/terminal-utils';
   import { i18n } from '../stores/i18n.svelte';
   import type { ToolCall, TerminalSessionBlock } from '../types/message';
+  import { publicToolPayloadMessage, toolPayloadStatus } from '../lib/tool-error-payload';
 
   interface Props {
     toolCall?: ToolCall;
@@ -49,26 +50,6 @@
 
   function readString(value: unknown): string | undefined {
     return typeof value === 'string' ? value : undefined;
-  }
-
-  function publicStructuredErrorText(errorPayload: Record<string, unknown> | unknown[] | null): string {
-    if (!errorPayload || Array.isArray(errorPayload)) {
-      return '';
-    }
-    const errorCode = (
-      readString(errorPayload.error_code)
-      || readString(errorPayload.errorCode)
-      || ''
-    ).trim();
-    if (!errorCode) {
-      return '';
-    }
-    return (
-      readString(errorPayload.error)?.trim()
-      || readString(errorPayload.summary)?.trim()
-      || readString(errorPayload.message)?.trim()
-      || ''
-    );
   }
 
   function joinTerminalStreams(stdout: unknown, stderr: unknown): string | undefined {
@@ -154,7 +135,7 @@
     };
   });
   const terminalId = $derived(terminal?.terminalId);
-  const errorPayloadStatus = $derived(readString(parsedErrorResult?.status) || '');
+  const errorPayloadStatus = $derived(toolPayloadStatus(parsedErrorResult));
   const displayStatus = $derived(terminalStatusFromCanonical(
     status || toolCall?.status,
     terminal?.status || errorPayloadStatus,
@@ -264,8 +245,8 @@
   const locked = $derived(Boolean(terminal?.locked));
   const startupMessage = $derived(terminal?.startupMessage || '');
   const publicErrorText = $derived(
-    publicStructuredErrorText(parsedErrorResult)
-    || publicStructuredErrorText(parsedResult)
+    publicToolPayloadMessage(parsedErrorResult)
+    || publicToolPayloadMessage(parsedResult)
   );
   const errorText = $derived(terminal?.error || structuredErrorText(parsedErrorResult) || toolCall?.error || '');
   const showErrorHint = $derived.by(() => {

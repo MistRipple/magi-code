@@ -14,6 +14,7 @@
   import { diagramSummary, parseToolDiagramPayload } from '../lib/diagram-payload';
   import { openAgentTab, rightPaneState } from '../stores/right-pane.svelte';
   import { getAgentVisualInfo } from '../lib/agent-colors';
+  import { toolPayloadErrorCode } from '../lib/tool-error-payload';
 
   interface ErrorDiagnosis {
     category: 'model_input' | 'context_stale' | 'permission' | 'role_constraint' | 'policy' | 'model_output' | 'workspace_write' | 'runtime';
@@ -236,17 +237,6 @@
     } catch {
       return null;
     }
-  }
-
-  function extractErrorCode(content: unknown): string {
-    const payload = parseJsonObjectValue(content);
-    if (!payload) return '';
-    const code = typeof payload.error_code === 'string'
-      ? payload.error_code
-      : typeof payload.errorCode === 'string'
-        ? payload.errorCode
-        : '';
-    return code.trim().toLowerCase();
   }
 
   function isViewImageTool(toolName: string): boolean {
@@ -678,8 +668,8 @@
 
     const errorCode = (
       toolResult?.errorCode
-      || extractErrorCode(errorText)
-      || extractErrorCode(toolResult?.message)
+      || toolPayloadErrorCode(errorText)
+      || toolPayloadErrorCode(toolResult?.message)
       || ''
     ).toLowerCase();
     // 只取消息前 300 字符做关键词匹配，避免工具输出正文中的常见词（如 authorization、timeout）
@@ -715,6 +705,7 @@
       'skill_tool_policy_rejected',
       'skill_tool_policy_failed',
       'external_tool_policy_rejected',
+      'skill_tool_scope_mismatch',
       'tool_safety_rejected',
       'tool_safety_failed',
     )) {
