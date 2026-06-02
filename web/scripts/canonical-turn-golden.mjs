@@ -56,6 +56,8 @@ function runGoldenReplay(reducer, projection, timelineRenderItems, contract) {
   assertAcceptedFirstFrameRunning(reducer, projection);
   assertLocalPendingTurnIsReplacedByAcceptedCanonicalTurn(reducer, projection);
   assertLocalPendingImageSurvivesRegularAcceptedTurn(reducer, projection);
+  assertCrossSessionCanonicalEventIsRejected(reducer, projection);
+  assertReplaceCanonicalTurnsFiltersForeignSessions(reducer);
   assertTerminalLateUpsertIsIgnored(reducer, projection);
   assertTerminalLateTurnStartedIsIgnored(reducer, projection);
   assertFailedAssistantTextUsesPlainMessageShell(reducer, projection);
@@ -66,6 +68,7 @@ function runGoldenReplay(reducer, projection, timelineRenderItems, contract) {
   assertAgentSpawnToolCardStaysOnMainlineAndTaskTabsFilterByTaskId(reducer, projection, timelineRenderItems);
   assertParallelAgentSpawnUsesTaskIdTabs(reducer, projection, timelineRenderItems);
   assertBootstrapProcessingStateFromRunningCanonicalTurn(contract);
+  assertBootstrapProcessingStateIgnoresForeignSessionRunningTurn(contract);
   assertBootstrapProcessingStateIgnoresTerminalCanonicalTurn(contract);
   assertBootstrapCarriesPendingChanges(contract);
 }
@@ -429,6 +432,80 @@ function assertLocalPendingImageSurvivesRegularAcceptedTurn(reducer, projection)
   );
 }
 
+function assertCrossSessionCanonicalEventIsRejected(reducer, projection) {
+  const active = baseCase(
+    'active-session-event-scope',
+    'session-golden-active-scope',
+    'turn-golden-active-scope',
+    11000,
+  );
+  const foreign = baseCase(
+    'foreign-session-event-scope',
+    'session-golden-foreign-scope',
+    'turn-golden-foreign-scope',
+    11100,
+  );
+  const activeUser = user(active, 1, '当前会话内容。');
+  const activeAssistant = assistantText(active, 2, 'assistant-active', '当前会话已完成。', 'completed');
+  const foreignUser = user(foreign, 1, '其他会话内容。');
+  const foreignAssistant = assistantPlaceholderText(foreign, 2, 'assistant-foreign', 'running');
+  const state = reducer.replaceCanonicalTurns(active.sessionId, [
+    turn(active, 'completed', [activeUser, activeAssistant], { completedAt: 11050, responseDurationMs: 50 }),
+  ]);
+  const before = projectionSignature(projection.buildCanonicalTimelineProjection(state));
+
+  const result = reducer.reduceCanonicalTurnEvent(state, event(foreign, 1, 'turn_started', {
+    turn: turn(foreign, 'running', [foreignUser, foreignAssistant]),
+    item: foreignAssistant,
+  }));
+
+  assert.match(
+    result.error || '',
+    /session mismatch/,
+    'cross-session canonical event must be rejected instead of being applied to the active reducer',
+  );
+  assert.equal(result.changed, false);
+  assert.equal(result.state.sessionId, active.sessionId);
+  assert.equal(result.state.turns.length, 1);
+  assert.deepEqual(
+    projectionSignature(projection.buildCanonicalTimelineProjection(result.state)),
+    before,
+    'cross-session canonical event must not mutate active session projection',
+  );
+}
+
+function assertReplaceCanonicalTurnsFiltersForeignSessions(reducer) {
+  const active = baseCase(
+    'active-session-bootstrap-scope',
+    'session-golden-bootstrap-active',
+    'turn-golden-bootstrap-active',
+    11200,
+  );
+  const foreign = baseCase(
+    'foreign-session-bootstrap-scope',
+    'session-golden-bootstrap-foreign',
+    'turn-golden-bootstrap-foreign',
+    11300,
+  );
+  const activeTurn = turn(active, 'completed', [
+    user(active, 1, '当前会话 bootstrap 内容。'),
+    assistantText(active, 2, 'assistant-active-bootstrap', '当前会话完成。', 'completed'),
+  ], { completedAt: 11250, responseDurationMs: 50 });
+  const foreignTurn = turn(foreign, 'running', [
+    user(foreign, 1, '其他会话 bootstrap 内容。'),
+    assistantPlaceholderText(foreign, 2, 'assistant-foreign-bootstrap', 'running'),
+  ]);
+
+  const state = reducer.replaceCanonicalTurns(active.sessionId, [activeTurn, foreignTurn]);
+
+  assert.equal(state.sessionId, active.sessionId);
+  assert.deepEqual(
+    state.turns.map((item) => item.sessionId),
+    [active.sessionId],
+    'bootstrap canonical turn replacement must keep only the requested session turns',
+  );
+}
+
 function assertFailedAssistantTextUsesPlainMessageShell(reducer, projection) {
   const c = baseCase('failed-assistant-text', 'session-golden-failed-assistant', 'turn-golden-failed-assistant', 6000);
   const userItem = user(c, 1, '请调用工具后回答。');
@@ -571,6 +648,70 @@ function assertBootstrapProcessingStateFromRunningCanonicalTurn(contract) {
     ['request-bootstrap-running'],
     'bootstrap should carry request binding metadata from canonical items',
   );
+}
+
+function assertBootstrapProcessingStateIgnoresForeignSessionRunningTurn(contract) {
+  const active = baseCase(
+    'bootstrap-active-session-with-foreign-running',
+    'session-bootstrap-active-no-running',
+    'turn-bootstrap-active-no-running',
+    11400,
+  );
+  const foreign = baseCase(
+    'bootstrap-foreign-session-running',
+    'session-bootstrap-foreign-running',
+    'turn-bootstrap-foreign-running',
+    11500,
+  );
+  const activeUser = user(active, 1, '当前会话已经完成。');
+  const activeAssistant = assistantText(active, 2, 'assistant-bootstrap-active', '已完成', 'completed');
+  const foreignUser = user(foreign, 1, '其他会话仍在运行。');
+  const foreignAssistant = assistantPlaceholderText(foreign, 2, 'assistant-bootstrap-foreign', 'running');
+  foreignAssistant.metadata = { requestId: 'request-foreign-running' };
+
+  const bootstrap = contract.normalizeRustBootstrapPayload({
+    generatedAt: 11600,
+    currentSession: {
+      sessionId: active.sessionId,
+      title: '当前完成会话',
+      createdAt: 11400,
+      updatedAt: 11600,
+      messageCount: 2,
+    },
+    sessions: [
+      {
+        sessionId: active.sessionId,
+        title: '当前完成会话',
+        createdAt: 11400,
+        updatedAt: 11600,
+        messageCount: 2,
+      },
+      {
+        sessionId: foreign.sessionId,
+        title: '其他运行会话',
+        createdAt: 11500,
+        updatedAt: 11600,
+        messageCount: 1,
+      },
+    ],
+    canonicalTurns: [
+      turn(active, 'completed', [activeUser, activeAssistant], { completedAt: 11480, responseDurationMs: 80 }),
+      turn(foreign, 'running', [foreignUser, foreignAssistant]),
+    ],
+    runtimeReadModel: {
+      details: {
+        sessions: [],
+        tasks: [],
+      },
+    },
+  }, { sessionId: active.sessionId });
+
+  assert.equal(
+    bootstrap.state.isProcessing,
+    false,
+    'foreign session running canonical turn must not lift current session processing state',
+  );
+  assert.equal(bootstrap.state.processingState, null);
 }
 
 function assertBootstrapProcessingStateIgnoresTerminalCanonicalTurn(contract) {
