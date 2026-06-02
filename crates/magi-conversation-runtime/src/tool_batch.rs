@@ -65,6 +65,7 @@ const AGENT_SPAWN_STARTED_INSTRUCTION: &str = "代理已异步启动。若后续
 const AGENT_WAIT_DEFAULT_TIMEOUT_MS: u64 = 300_000;
 const AGENT_WAIT_MIN_TIMEOUT_MS: u64 = 1_000;
 const AGENT_WAIT_MAX_TIMEOUT_MS: u64 = 1_800_000;
+const TOOL_VISIBILITY_REJECTED_PUBLIC_ERROR: &str = "该工具在当前任务角色或阶段下不可用";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AgentSpawnAccessMode {
@@ -1471,15 +1472,8 @@ fn execute_task_tool_call(
         magi_tool_runtime::BuiltinToolName::from_str(tool_call.function.name.as_str())
     {
         if !task_can_see_builtin_tool(Some(task), Some(agent_role_registry), canonical) {
-            return (
-                serde_json::json!({
-                    "tool": canonical.as_str(),
-                    "status": "rejected",
-                    "error": "tool is not visible for this task role or task tier",
-                })
-                .to_string(),
-                ExecutionResultStatus::Rejected,
-            );
+            let decision = task_tool_visibility_decision_payload(canonical.as_str(), task);
+            return (decision.payload, decision.status);
         }
     }
 
@@ -1996,6 +1990,33 @@ fn task_policy_decision_payload(
         })
         .to_string(),
         status,
+    }
+}
+
+fn task_tool_visibility_decision_payload(
+    tool_name: &str,
+    task: &magi_core::Task,
+) -> ToolPreflightDecision {
+    let task_tier = task
+        .policy_snapshot
+        .as_ref()
+        .map(|policy| format!("{:?}", policy.task_tier))
+        .unwrap_or_else(|| "unknown".to_string());
+    tracing::warn!(
+        tool_name,
+        task_id = %task.task_id,
+        task_tier = %task_tier,
+        "tool preflight visibility decision"
+    );
+    ToolPreflightDecision {
+        payload: serde_json::json!({
+            "tool": tool_name,
+            "status": tool_execution_status_label(ExecutionResultStatus::Rejected),
+            "error_code": "tool_policy_rejected",
+            "error": TOOL_VISIBILITY_REJECTED_PUBLIC_ERROR,
+        })
+        .to_string(),
+        status: ExecutionResultStatus::Rejected,
     }
 }
 
@@ -4217,6 +4238,18 @@ mod tests {
             None,
         );
         assert_eq!(worker_result[0].1, ExecutionResultStatus::Rejected);
+        let worker_payload: serde_json::Value =
+            serde_json::from_str(&worker_result[0].0).expect("worker rejection should be json");
+        assert_eq!(worker_payload["status"].as_str(), Some("rejected"));
+        assert_eq!(
+            worker_payload["error_code"].as_str(),
+            Some("tool_policy_rejected")
+        );
+        assert_eq!(
+            worker_payload["error"].as_str(),
+            Some(TOOL_VISIBILITY_REJECTED_PUBLIC_ERROR)
+        );
+        assert!(!worker_result[0].0.contains("tool is not visible"));
 
         let coordinator = coordinator_task(test_task("task-coordinator", "task-coordinator", None));
         let coordinator_result = execute_task_tool_call_batch(
@@ -4257,6 +4290,18 @@ mod tests {
             None,
         );
         assert_eq!(coordinator_result[0].1, ExecutionResultStatus::Rejected);
+        let coordinator_payload: serde_json::Value = serde_json::from_str(&coordinator_result[0].0)
+            .expect("coordinator rejection should be json");
+        assert_eq!(coordinator_payload["status"].as_str(), Some("rejected"));
+        assert_eq!(
+            coordinator_payload["error_code"].as_str(),
+            Some("tool_policy_rejected")
+        );
+        assert_eq!(
+            coordinator_payload["error"].as_str(),
+            Some(TOOL_VISIBILITY_REJECTED_PUBLIC_ERROR)
+        );
+        assert!(!coordinator_result[0].0.contains("tool is not visible"));
     }
 
     #[test]
