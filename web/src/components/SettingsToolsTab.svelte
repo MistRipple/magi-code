@@ -156,6 +156,20 @@
     }
   }
 
+  function getBuiltinToolDisplayStatusLabel(tool: { runtimeStatus: string; accessProfileBehavior: string }): string {
+    if (tool.accessProfileBehavior === 'unavailable_in_read_only') {
+      return getBuiltinToolAccessProfileBehaviorLabel(tool.accessProfileBehavior);
+    }
+    return getBuiltinToolRuntimeLabel(tool.runtimeStatus);
+  }
+
+  function getBuiltinToolDisplayStatusClass(tool: { runtimeStatus: string; accessProfileBehavior: string }): string {
+    if (tool.accessProfileBehavior === 'unavailable_in_read_only') {
+      return 'disabled';
+    }
+    return getBuiltinToolRuntimeClass(tool.runtimeStatus);
+  }
+
   function getBuiltinToolRuntimeTitle(tool: {
     runtimeInternal: boolean;
     runtimeStatus: string;
@@ -567,10 +581,10 @@
                         <span class="tool-badge">{getBuiltinToolAccessLabel(tool.accessMode)}</span>
                         <span class="tool-badge" class:tool-badge--risk={tool.riskLevel.toLowerCase() === 'high'}>{getBuiltinToolRiskLabel(tool.riskLevel)}</span>
                         <span class="tool-runtime-status">
-                          {getBuiltinToolRuntimeLabel(tool.runtimeStatus)}
+                          {getBuiltinToolDisplayStatusLabel(tool)}
                         </span>
                         <span
-                          class={`apple-indicator ${getBuiltinToolRuntimeClass(tool.runtimeStatus)}`}
+                          class={`apple-indicator ${getBuiltinToolDisplayStatusClass(tool)}`}
                           title={getBuiltinToolRuntimeTitle(tool)}
                         ></span>
                       </div>
