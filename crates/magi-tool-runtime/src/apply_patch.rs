@@ -478,6 +478,7 @@ fn apply_patch_error(message: impl Into<String>) -> String {
         "tool": "apply_patch",
         "status": "failed",
         "access_mode": BuiltinToolAccessMode::ExplicitWrite.as_str(),
+        "error_code": "apply_patch_failed",
         "error": message.into(),
     })
     .to_string()
@@ -595,6 +596,7 @@ mod tests {
         let payload: Value = serde_json::from_str(&output).expect("json output");
 
         assert_eq!(payload["status"], "failed");
+        assert_eq!(payload["error_code"], "apply_patch_failed");
         assert_eq!(payload["error"], APPLY_PATCH_FILE_ACCESS_PUBLIC_ERROR);
         let text = output.to_string();
         assert!(!text.contains(missing.to_string_lossy().as_ref()));
@@ -612,6 +614,7 @@ mod tests {
         let payload: Value = serde_json::from_str(&output).expect("json output");
 
         assert_eq!(payload["status"], "failed");
+        assert_eq!(payload["error_code"], "apply_patch_failed");
         assert_eq!(payload["error"], APPLY_PATCH_FILE_ACCESS_PUBLIC_ERROR);
         assert!(!output.contains("/private/workspace/secret.txt"));
         assert!(!output.contains("No such file"));

@@ -141,6 +141,7 @@ fn view_image_error(message: impl Into<String>) -> String {
         "tool": TOOL_NAME,
         "status": "failed",
         "access_mode": BuiltinToolAccessMode::ReadOnly.as_str(),
+        "error_code": "view_image_failed",
         "error": message.into(),
     })
     .to_string()
@@ -242,6 +243,7 @@ mod tests {
         let payload: Value = serde_json::from_str(&output).expect("json output");
 
         assert_eq!(payload["status"], "failed");
+        assert_eq!(payload["error_code"], "view_image_failed");
         assert_eq!(
             payload["error"],
             "不支持或无效的图片格式，支持 png/jpeg/gif/webp"
@@ -260,6 +262,7 @@ mod tests {
         let payload: Value = serde_json::from_str(&output).expect("json output");
 
         assert_eq!(payload["status"], "failed");
+        assert_eq!(payload["error_code"], "view_image_failed");
         assert_eq!(payload["error"], IMAGE_ACCESS_PUBLIC_ERROR);
         let text = payload.to_string();
         assert!(

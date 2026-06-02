@@ -41,6 +41,9 @@ const PROCESS_INSPECT_PUBLIC_ERROR: &str = "进程信息暂不可读取，请稍
 const WEB_SEARCH_PUBLIC_ERROR: &str = "网络搜索暂不可用，请稍后重试";
 const WEB_FETCH_PUBLIC_ERROR: &str = "网页内容暂不可获取，请稍后重试";
 const PATH_RESOLUTION_PUBLIC_ERROR: &str = "路径暂不可解析，请检查工作区或路径";
+const PATH_NOT_FOUND_PUBLIC_ERROR: &str = "目标路径不存在，请检查路径";
+const PATH_ALREADY_EXISTS_PUBLIC_ERROR: &str = "目标路径已存在，请确认是否允许覆盖";
+const PROTECTED_DELETE_PUBLIC_ERROR: &str = "该路径受保护，不能删除";
 
 #[derive(Clone)]
 struct ActiveShellExec {
@@ -1515,6 +1518,7 @@ fn builtin_error(tool: &str, message: impl Into<String>) -> String {
     serde_json::json!({
         "tool": tool,
         "status": "failed",
+        "error_code": builtin_error_code(tool, "failed"),
         "error": message.into(),
     })
     .to_string()
@@ -1566,9 +1570,26 @@ fn builtin_rejected(tool: &str, message: impl Into<String>) -> String {
     serde_json::json!({
         "tool": tool,
         "status": "rejected",
+        "error_code": builtin_error_code(tool, "rejected"),
         "error": message.into(),
     })
     .to_string()
+}
+
+fn builtin_error_code(tool: &str, suffix: &str) -> String {
+    let tool = tool
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('_')
+        .to_string();
+    format!("{tool}_{suffix}")
 }
 
 /// 协调器 / 长任务工具（agent_spawn 等）落到 BuiltinTool::execute 时
@@ -1873,10 +1894,12 @@ fn execute_file_write(input: &str, context: &ToolExecutionContext) -> String {
     let existed_before = path.exists();
 
     if existed_before && !overwrite {
-        return builtin_error(
-            "file_write",
-            format!("文件已存在且 overwrite=false: {}", path.display()),
+        tracing::warn!(
+            tool = "file_write",
+            path = %path.display(),
+            "file_write target already exists and overwrite is disabled"
         );
+        return builtin_error("file_write", PATH_ALREADY_EXISTS_PUBLIC_ERROR);
     }
 
     if create_dirs {
@@ -2008,15 +2031,22 @@ fn execute_file_patch(input: &str, context: &ToolExecutionContext) -> String {
     }
 
     if applied == 0 {
+        tracing::warn!(
+            tool = "file_patch",
+            path = %path.display(),
+            total = patches.len(),
+            errors = ?errors,
+            "file_patch failed to apply any patch"
+        );
         return serde_json::json!({
             "tool": "file_patch",
             "status": "failed",
             "access_mode": BuiltinToolAccessMode::ExplicitWrite.as_str(),
-            "path": path.display().to_string(),
+            "error_code": builtin_error_code("file_patch", "failed"),
+            "error": "所有 patch 均未能应用",
             "applied": 0,
             "total": patches.len(),
             "errors": errors,
-            "error": "所有 patch 均未能应用"
         })
         .to_string();
     }
@@ -2070,7 +2100,12 @@ fn execute_file_remove(input: &str, context: &ToolExecutionContext) -> String {
         .unwrap_or(false);
 
     if !path.exists() {
-        return builtin_error("file_remove", format!("路径不存在: {}", path.display()));
+        tracing::warn!(
+            tool = "file_remove",
+            path = %path.display(),
+            "file_remove target path does not exist"
+        );
+        return builtin_error("file_remove", PATH_NOT_FOUND_PUBLIC_ERROR);
     }
     if let Some(reason) = protected_remove_target_reason(&path_input, &path, context) {
         return builtin_rejected("file_remove", reason);
@@ -2116,32 +2151,38 @@ fn protected_remove_target_reason(
 ) -> Option<String> {
     let trimmed = raw_input.trim();
     if matches!(trimmed, "/" | "." | ".." | "~") {
-        return Some(format!(
-            "拒绝删除受保护路径: {}",
-            if trimmed.is_empty() {
+        tracing::warn!(
+            tool = "file_remove",
+            requested_path = if trimmed.is_empty() {
                 "<empty>"
             } else {
                 trimmed
-            }
-        ));
+            },
+            "file_remove rejected protected raw path"
+        );
+        return Some(PROTECTED_DELETE_PUBLIC_ERROR.to_string());
     }
 
     let canonical_target = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     if is_filesystem_root(&canonical_target) {
-        return Some(format!(
-            "拒绝删除文件系统根目录: {}",
-            canonical_target.display()
-        ));
+        tracing::warn!(
+            tool = "file_remove",
+            target = %canonical_target.display(),
+            "file_remove rejected filesystem root"
+        );
+        return Some(PROTECTED_DELETE_PUBLIC_ERROR.to_string());
     }
 
     if let Ok(cwd) = context_working_directory(context)
         && let Ok(canonical_cwd) = cwd.canonicalize()
         && canonical_target == canonical_cwd
     {
-        return Some(format!(
-            "拒绝删除当前工作目录: {}",
-            canonical_target.display()
-        ));
+        tracing::warn!(
+            tool = "file_remove",
+            target = %canonical_target.display(),
+            "file_remove rejected current working directory"
+        );
+        return Some(PROTECTED_DELETE_PUBLIC_ERROR.to_string());
     }
 
     if let Some(home) = std::env::var_os("HOME")
@@ -2149,10 +2190,12 @@ fn protected_remove_target_reason(
         .and_then(|path| path.canonicalize().ok())
         && canonical_target == home
     {
-        return Some(format!(
-            "拒绝删除用户 HOME 目录: {}",
-            canonical_target.display()
-        ));
+        tracing::warn!(
+            tool = "file_remove",
+            target = %canonical_target.display(),
+            "file_remove rejected home directory"
+        );
+        return Some(PROTECTED_DELETE_PUBLIC_ERROR.to_string());
     }
 
     None
@@ -2194,10 +2237,12 @@ fn execute_file_mkdir(input: &str, context: &ToolExecutionContext) -> String {
             })
             .to_string();
         }
-        return builtin_error(
-            "file_mkdir",
-            format!("路径已存在且不是目录: {}", path.display()),
+        tracing::warn!(
+            tool = "file_mkdir",
+            path = %path.display(),
+            "file_mkdir target exists and is not a directory"
         );
+        return builtin_error("file_mkdir", DIRECTORY_CREATE_PUBLIC_ERROR);
     }
 
     if let Err(e) = fs::create_dir_all(&path) {
@@ -2272,14 +2317,21 @@ fn execute_file_copy(input: &str, context: &ToolExecutionContext) -> String {
     let overwrite = field_bool(&request, &["overwrite", "force"]).unwrap_or(false);
 
     if !src.exists() {
-        return builtin_error("file_copy", format!("源路径不存在: {}", src.display()));
+        tracing::warn!(
+            tool = "file_copy",
+            source = %src.display(),
+            "file_copy source path does not exist"
+        );
+        return builtin_error("file_copy", FILE_COPY_PUBLIC_ERROR);
     }
 
     if dst.exists() && !overwrite {
-        return builtin_error(
-            "file_copy",
-            format!("目标路径已存在且 overwrite=false: {}", dst.display()),
+        tracing::warn!(
+            tool = "file_copy",
+            destination = %dst.display(),
+            "file_copy destination exists and overwrite is disabled"
         );
+        return builtin_error("file_copy", PATH_ALREADY_EXISTS_PUBLIC_ERROR);
     }
 
     if let Some(parent) = dst.parent() {
@@ -2395,14 +2447,21 @@ fn execute_file_move(input: &str, context: &ToolExecutionContext) -> String {
     let overwrite = field_bool(&request, &["overwrite", "force"]).unwrap_or(false);
 
     if !src.exists() {
-        return builtin_error("file_move", format!("源路径不存在: {}", src.display()));
+        tracing::warn!(
+            tool = "file_move",
+            source = %src.display(),
+            "file_move source path does not exist"
+        );
+        return builtin_error("file_move", FILE_MOVE_PUBLIC_ERROR);
     }
 
     if dst.exists() && !overwrite {
-        return builtin_error(
-            "file_move",
-            format!("目标路径已存在且 overwrite=false: {}", dst.display()),
+        tracing::warn!(
+            tool = "file_move",
+            destination = %dst.display(),
+            "file_move destination exists and overwrite is disabled"
         );
+        return builtin_error("file_move", PATH_ALREADY_EXISTS_PUBLIC_ERROR);
     }
 
     if let Some(parent) = dst.parent() {
@@ -3369,6 +3428,7 @@ mod tests {
         let payload: Value = serde_json::from_str(&output).expect("json output");
 
         assert_eq!(payload["status"], "failed");
+        assert_eq!(payload["error_code"], "file_read_failed");
         assert_eq!(payload["error"], PATH_RESOLUTION_PUBLIC_ERROR);
         assert!(!output.contains("/private/workspace/secret.txt"));
         assert!(!output.contains("No such file"));

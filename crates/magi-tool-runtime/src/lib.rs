@@ -2546,6 +2546,7 @@ mod tests {
         let payload: Value = serde_json::from_str(&output.payload).expect("payload json");
         assert_eq!(payload["tool"], "search_text");
         assert_eq!(payload["status"], "failed");
+        assert_eq!(payload["error_code"], "search_text_failed");
         assert_eq!(payload["error"], "文本搜索暂不可用，请检查路径或权限");
         assert!(
             !output.payload.contains("missing")
@@ -2707,6 +2708,7 @@ mod tests {
         let payload: Value = serde_json::from_str(&output.payload).expect("payload json");
         assert_eq!(payload["tool"], "shell_exec");
         assert_eq!(payload["status"], "failed");
+        assert_eq!(payload["error_code"], "shell_exec_failed");
         assert_eq!(payload["error"], "shell 命令暂不可执行，请检查运行环境");
         assert!(
             !output.payload.contains(missing_shell)
@@ -3680,6 +3682,7 @@ mod tests {
         let payload: Value = serde_json::from_str(&output.payload).expect("payload json");
         assert_eq!(payload["tool"], BuiltinToolName::ProcessLaunch.as_str());
         assert_eq!(payload["status"], "failed");
+        assert_eq!(payload["error_code"], "process_launch_failed");
         assert_eq!(payload["error"], "后台进程暂不可启动，请检查运行环境");
         assert!(
             !output.payload.contains(missing_shell)
@@ -3746,6 +3749,7 @@ mod tests {
         let payload: Value = serde_json::from_str(&write.payload).expect("payload json");
         assert_eq!(payload["tool"], BuiltinToolName::ProcessWrite.as_str());
         assert_eq!(payload["status"], "failed");
+        assert_eq!(payload["error_code"], "process_write_failed");
         assert_eq!(payload["error"], "后台进程暂不可写入，请稍后重试");
         assert!(
             !write.payload.contains("Broken pipe")
@@ -4072,6 +4076,7 @@ mod tests {
         let payload: Value = serde_json::from_str(&output.payload).expect("payload json");
         assert_eq!(payload["tool"], BuiltinToolName::DiffPreview.as_str());
         assert_eq!(payload["status"], "failed");
+        assert_eq!(payload["error_code"], "diff_preview_failed");
         assert_eq!(payload["error"], "差异预览源暂不可读取，请检查路径或权限");
         assert!(
             !output.payload.contains("missing-before")
@@ -5144,6 +5149,11 @@ mod tests {
             .to_string(),
         );
         assert_eq!(output.status, ExecutionResultStatus::Failed);
+        let payload: Value = serde_json::from_str(&output.payload).unwrap();
+        assert_eq!(payload["error_code"], "file_write_failed");
+        assert_eq!(payload["error"], "目标路径已存在，请确认是否允许覆盖");
+        assert!(!output.payload.contains(file.to_string_lossy().as_ref()));
+        assert!(!output.payload.contains("overwrite=false"));
         assert_eq!(fs::read_to_string(&file).unwrap(), "original");
     }
 
@@ -5338,12 +5348,10 @@ mod tests {
 
         assert_eq!(output.status, ExecutionResultStatus::Rejected);
         let payload: Value = serde_json::from_str(&output.payload).unwrap();
-        assert!(
-            payload["error"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("拒绝删除受保护路径")
-        );
+        assert_eq!(payload["error_code"], "file_remove_rejected");
+        assert_eq!(payload["error"], "该路径受保护，不能删除");
+        assert!(!output.payload.contains(root.to_string_lossy().as_ref()));
+        assert!(!output.payload.contains("keep.txt"));
         assert!(root.join("keep.txt").exists());
     }
 
@@ -5369,12 +5377,10 @@ mod tests {
 
         assert_eq!(output.status, ExecutionResultStatus::Rejected);
         let payload: Value = serde_json::from_str(&output.payload).unwrap();
-        assert!(
-            payload["error"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("拒绝删除当前工作目录")
-        );
+        assert_eq!(payload["error_code"], "file_remove_rejected");
+        assert_eq!(payload["error"], "该路径受保护，不能删除");
+        assert!(!output.payload.contains(root.to_string_lossy().as_ref()));
+        assert!(!output.payload.contains("keep.txt"));
         assert!(root.join("keep.txt").exists());
     }
 
@@ -5395,12 +5401,8 @@ mod tests {
 
         assert_eq!(output.status, ExecutionResultStatus::Rejected);
         let payload: Value = serde_json::from_str(&output.payload).unwrap();
-        assert!(
-            payload["error"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("拒绝删除受保护路径")
-        );
+        assert_eq!(payload["error_code"], "file_remove_rejected");
+        assert_eq!(payload["error"], "该路径受保护，不能删除");
     }
 
     #[test]
@@ -5471,6 +5473,57 @@ mod tests {
     }
 
     #[test]
+    fn file_copy_failure_uses_public_error() {
+        let root = unique_temp_dir("magi-tool-file-copy-public-error");
+        let registry = make_registry();
+        let missing = root.join("missing.txt");
+        let destination = root.join("destination.txt");
+        fs::write(&destination, "existing").unwrap();
+
+        let missing_output = exec_tool(
+            &registry,
+            BuiltinToolName::FileCopy,
+            &serde_json::json!({
+                "source": missing.to_string_lossy(),
+                "destination": root.join("copy.txt").to_string_lossy()
+            })
+            .to_string(),
+        );
+        assert_eq!(missing_output.status, ExecutionResultStatus::Failed);
+        let missing_payload: Value = serde_json::from_str(&missing_output.payload).unwrap();
+        assert_eq!(missing_payload["error_code"], "file_copy_failed");
+        assert_eq!(missing_payload["error"], "文件暂不可复制，请检查路径或权限");
+        assert!(
+            !missing_output
+                .payload
+                .contains(missing.to_string_lossy().as_ref())
+        );
+
+        let exists_output = exec_tool(
+            &registry,
+            BuiltinToolName::FileCopy,
+            &serde_json::json!({
+                "source": destination.to_string_lossy(),
+                "destination": destination.to_string_lossy()
+            })
+            .to_string(),
+        );
+        assert_eq!(exists_output.status, ExecutionResultStatus::Failed);
+        let exists_payload: Value = serde_json::from_str(&exists_output.payload).unwrap();
+        assert_eq!(exists_payload["error_code"], "file_copy_failed");
+        assert_eq!(
+            exists_payload["error"],
+            "目标路径已存在，请确认是否允许覆盖"
+        );
+        assert!(
+            !exists_output
+                .payload
+                .contains(destination.to_string_lossy().as_ref())
+        );
+        assert!(!exists_output.payload.contains("overwrite=false"));
+    }
+
+    #[test]
     fn file_move_renames_file() {
         let root = unique_temp_dir("magi-tool-file-move");
         let registry = make_registry();
@@ -5513,6 +5566,12 @@ mod tests {
             .to_string(),
         );
         assert_eq!(output.status, ExecutionResultStatus::Failed);
+        let payload: Value = serde_json::from_str(&output.payload).unwrap();
+        assert_eq!(payload["error_code"], "file_move_failed");
+        assert_eq!(payload["error"], "目标路径已存在，请确认是否允许覆盖");
+        assert!(!output.payload.contains(src.to_string_lossy().as_ref()));
+        assert!(!output.payload.contains(dst.to_string_lossy().as_ref()));
+        assert!(!output.payload.contains("overwrite=false"));
         assert!(src.exists());
         assert_eq!(fs::read_to_string(&dst).unwrap(), "existing");
     }
@@ -6090,6 +6149,7 @@ mod tests {
         let payload: Value = serde_json::from_str(&output.payload).expect("payload json");
         assert_eq!(payload["tool"], BuiltinToolName::WebFetch.as_str());
         assert_eq!(payload["status"], "failed");
+        assert_eq!(payload["error_code"], "web_fetch_failed");
         assert_eq!(payload["error"], "网页内容暂不可获取，请稍后重试");
         assert!(
             !output.payload.contains("Connection")
@@ -6135,6 +6195,7 @@ mod tests {
         let payload: Value = serde_json::from_str(&output.payload).expect("payload json");
         assert_eq!(payload["tool"], BuiltinToolName::WebFetch.as_str());
         assert_eq!(payload["status"], "failed");
+        assert_eq!(payload["error_code"], "web_fetch_failed");
         assert_eq!(payload["error"], "网页返回 HTTP 503");
     }
 
