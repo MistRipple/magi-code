@@ -1017,38 +1017,29 @@ function shouldReplaceOrchestratorRuntimeState(
 
 export function applyAuthoritativeProcessingState(input: AppState['processingState']): void {
   const snapshot = normalizeProcessingStateSnapshot(input);
-  const hasLocalPendingRequest = messagesState.pendingRequests.size > 0;
   if (!snapshot) {
-    // 后端未给出权威 processingState：把 backend 信号清零，但保留本地乐观 pending。
-    // 不再从 orchestratorRuntimeState/canonical projection 推断 isProcessing，
-    // 单一事实源 = backend 权威订阅 + 本地 pendingRequests。
+    // 后端明确没有活跃处理态：权威 idle 必须收敛本地乐观 pending。
+    // 活跃轮次期间的旧 idle 快照由 bootstrap 的 preserveLocalProcessing 调用方拦截。
     messagesState.backendProcessing = false;
-    if (hasLocalPendingRequest) {
-      updateProcessingState();
-      return;
-    }
     messagesState.pendingRequests = new Set();
     messagesState.activeMessageIds = new Set();
+    messagesState.thinkingStartAt = null;
     sealAllStreamingMessages();
     updateProcessingState();
     return;
   }
+  const pendingRequestIds = new Set(snapshot.pendingRequestIds);
   // 防回抬保护：如果在 forced idle 冷却期内，拒绝后端权威状态覆盖
   const lastForcedIdleAt = messagesState.lastForcedIdleAt;
-  if (lastForcedIdleAt !== null && (Date.now() - lastForcedIdleAt) < ANTI_LIFT_BACK_COOLDOWN_MS) {
-    // 冷却期内只同步 actor，不改变 processing 状态
+  if (
+    lastForcedIdleAt !== null
+    && (Date.now() - lastForcedIdleAt) < ANTI_LIFT_BACK_COOLDOWN_MS
+    && (snapshot.isProcessing || pendingRequestIds.size > 0)
+  ) {
+    // 冷却期内只拒绝 running 回抬；idle 快照仍必须继续收敛本地状态。
     if (snapshot.source) {
       setProcessingActor(snapshot.source, snapshot.agent || undefined);
     }
-    return;
-  }
-  const pendingRequestIds = new Set(snapshot.pendingRequestIds);
-  if (!snapshot.isProcessing && pendingRequestIds.size === 0 && hasLocalPendingRequest) {
-    messagesState.backendProcessing = false;
-    if (snapshot.source) {
-      setProcessingActor(snapshot.source, snapshot.agent || undefined);
-    }
-    updateProcessingState();
     return;
   }
   const activeMessageIds = snapshot.isProcessing
@@ -2284,6 +2275,8 @@ export function updateRequestBinding(
  * 清除请求绑定
  */
 export function clearRequestBinding(requestId: string): void {
+  if (!requestId) return;
+  clearPendingRequest(requestId);
   const next = new Map(requestBindings);
   next.delete(requestId);
   requestBindings = next;
@@ -2297,4 +2290,8 @@ export function clearRequestBinding(requestId: string): void {
  */
 export function clearAllRequestBindings(): void {
   requestBindings = new Map();
+  if (messagesState.pendingRequests.size > 0) {
+    messagesState.pendingRequests = new Set();
+    updateProcessingState();
+  }
 }

@@ -104,6 +104,7 @@ function runGoldenReplay(reducer, projection, messagesStore, timelineRenderItems
   assertBootstrapCarriesPendingChanges(contract);
   assertBootstrapFiltersForeignWorkspaceSessions(contract);
   assertBootstrapExplicitWorkspaceWinsOverForeignCurrentSession(contract);
+  assertMessagesStoreClearsLocalPendingFromAuthoritativeIdle(messagesStore);
 }
 
 function assertAgentSpawnToolCardStaysOnMainlineAndTaskTabsFilterByTaskId(reducer, projection, timelineRenderItems) {
@@ -637,6 +638,75 @@ function assertMessagesStoreRejectsForeignSessionProjection(reducer, projection,
     before,
     'foreign session projection must not overwrite the active messages store projection',
   );
+  messagesStore.setCurrentSessionId(null);
+}
+
+function resetMessagesStoreForGoldenProcessing(messagesStore) {
+  messagesStore.messagesState.currentWorkspaceId = 'workspace-golden-processing';
+  messagesStore.setCurrentSessionId('session-golden-processing');
+  messagesStore.clearAllMessages({
+    persist: false,
+    resetTimelineView: true,
+    resetPanelState: true,
+    skipAntiLiftBack: true,
+  });
+  messagesStore.messagesState.lastForcedIdleAt = null;
+}
+
+function assertMessagesStoreClearsLocalPendingFromAuthoritativeIdle(messagesStore) {
+  resetMessagesStoreForGoldenProcessing(messagesStore);
+
+  messagesStore.addPendingRequest('request-authoritative-idle');
+  assert.equal(
+    messagesStore.messagesState.isProcessing,
+    true,
+    'local pending request should raise processing state before authoritative idle arrives',
+  );
+  messagesStore.applyAuthoritativeProcessingState({
+    isProcessing: false,
+    source: 'orchestrator',
+    agent: 'orchestrator',
+    startedAt: null,
+    pendingRequestIds: [],
+  });
+  assert.equal(
+    messagesStore.messagesState.pendingRequests.size,
+    0,
+    'authoritative idle snapshot must clear local pending request ids',
+  );
+  assert.equal(
+    messagesStore.messagesState.isProcessing,
+    false,
+    'authoritative idle snapshot must settle processing state',
+  );
+
+  messagesStore.addPendingRequest('request-authoritative-null');
+  messagesStore.applyAuthoritativeProcessingState(null);
+  assert.equal(
+    messagesStore.messagesState.pendingRequests.size,
+    0,
+    'missing backend processingState means authoritative idle and must clear local pending',
+  );
+  assert.equal(
+    messagesStore.messagesState.isProcessing,
+    false,
+    'missing backend processingState must not preserve local processing',
+  );
+
+  messagesStore.createRequestBinding({
+    requestId: 'request-binding-clear',
+    userMessageId: 'user-binding-clear',
+    placeholderMessageId: 'assistant-binding-clear',
+    createdAt: 9000,
+  });
+  messagesStore.addPendingRequest('request-binding-clear');
+  messagesStore.clearRequestBinding('request-binding-clear');
+  assert.equal(
+    messagesStore.messagesState.pendingRequests.has('request-binding-clear'),
+    false,
+    'clearing a request binding must also clear its pending request',
+  );
+
   messagesStore.setCurrentSessionId(null);
 }
 
