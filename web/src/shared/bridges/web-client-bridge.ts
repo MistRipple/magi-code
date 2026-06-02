@@ -206,14 +206,12 @@ const RECOVERY_MAX_DELAY_MS = 10_000;
 const EVENT_STREAM_PARSE_ERROR_DEBOUNCE_MS = 5000;
 const EVENT_STREAM_OPEN_TIMEOUT_MS = 12_000;
 // 后端 SSE keep-alive interval 为 5s（见 crates/magi-api/src/sse.rs）。
-// 前端按“漏心跳数量”判断静默断流。空闲期保留较宽窗口，避免手机 / Tunnel /
-// 代理链路偶发心跳抖动造成无意义 recovery；活跃 turn 期间收紧窗口，防止终态事件
-// 丢失后按钮和流式动画长时间卡在响应中。
+// 前端按“漏心跳数量”判断静默断流。Tunnel / 手机 / 代理链路下心跳可能抖动；
+// 静默判定必须稳定，不能因为正在响应就缩短窗口，否则会在活跃 turn 中误触发
+// bootstrap recovery + SSE 重连，造成多端实时输出不同步。
 const EVENT_STREAM_KEEP_ALIVE_INTERVAL_MS = 5_000;
 const EVENT_STREAM_IDLE_MISSED_KEEPALIVES = 6;
-const ACTIVE_EVENT_STREAM_IDLE_MISSED_KEEPALIVES = 2;
 const EVENT_STREAM_IDLE_TIMEOUT_MS = EVENT_STREAM_KEEP_ALIVE_INTERVAL_MS * EVENT_STREAM_IDLE_MISSED_KEEPALIVES;
-const ACTIVE_EVENT_STREAM_IDLE_TIMEOUT_MS = EVENT_STREAM_KEEP_ALIVE_INTERVAL_MS * ACTIVE_EVENT_STREAM_IDLE_MISSED_KEEPALIVES;
 const EVENT_STREAM_IDLE_CHECK_INTERVAL_MS = 5_000;
 const EXTERNAL_SESSION_SUMMARY_EVENTS = new Set([
   'session.turn.accepted',
@@ -727,9 +725,7 @@ function markEventStreamActive(): void {
 }
 
 function currentEventStreamIdleTimeoutMs(): number {
-  return bridgeRuntimeIsBusy()
-    ? ACTIVE_EVENT_STREAM_IDLE_TIMEOUT_MS
-    : EVENT_STREAM_IDLE_TIMEOUT_MS;
+  return EVENT_STREAM_IDLE_TIMEOUT_MS;
 }
 
 function stopEventStreamIdleCheck(): void {
