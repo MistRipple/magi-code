@@ -917,6 +917,64 @@ mod tests {
     }
 
     #[test]
+    fn custom_skill_tool_read_only_command_mode_mcp_preflight_uses_public_error() {
+        let registry = SkillRegistry::new();
+        registry.register(SkillDefinition {
+            skill_id: "mcp-skill".to_string(),
+            title: "MCP Skill".to_string(),
+            instruction: "调用外接能力。".to_string(),
+            metadata: SkillMetadata {
+                category: "integration".to_string(),
+                tags: vec!["mcp".to_string()],
+            },
+            allowed_tools: vec![],
+            custom_tool_bindings: vec![CustomToolBinding {
+                binding_id: "inspect".to_string(),
+                tool_name: "echo.inspect".to_string(),
+                description: "检查输入".to_string(),
+                bridge_kind: BridgeBindingKind::Mcp,
+                dispatch_action: BridgeDispatchAction::McpToolCall,
+                bridge_target: "loopback-mcp".to_string(),
+            }],
+            prompt_priority: 50,
+        });
+        let skill_runtime = SkillRuntime::new(registry);
+        let dispatch_runtime = dispatch_runtime();
+
+        let (payload, status) = execute_skill_custom_tool(
+            &ChatToolCall {
+                id: "skill-tool-call-effective-read-only".to_string(),
+                kind: "function".to_string(),
+                function: ChatToolFunction {
+                    name: "skill__mcp-skill__inspect".to_string(),
+                    arguments: serde_json::json!({ "payload": "inspect" }).to_string(),
+                },
+            },
+            "mcp-skill",
+            "inspect",
+            Some("mcp-skill"),
+            tool_execution_policy_scope(AccessProfile::FullAccess, "read_only", &[], &[]),
+            None,
+            Some(&skill_runtime),
+            Some(&dispatch_runtime),
+            ToolExecutionContext {
+                access_profile: AccessProfile::FullAccess,
+                ..ToolExecutionContext::default()
+            },
+            None,
+        );
+
+        assert_eq!(status, ExecutionResultStatus::Rejected);
+        let parsed: Value = serde_json::from_str(&payload).expect("payload should be json");
+        assert_eq!(parsed["status"], "rejected");
+        assert_eq!(parsed["tool"], "skill__mcp-skill__inspect");
+        assert_eq!(parsed["error_code"], "skill_tool_policy_rejected");
+        assert_eq!(parsed["error"], SKILL_TOOL_POLICY_PUBLIC_ERROR);
+        assert_eq!(parsed.get("bridge_target"), None);
+        assert_eq!(parsed.get("bridge_kind"), None);
+    }
+
+    #[test]
     fn custom_skill_tool_safety_gate_uses_public_error() {
         let registry = SkillRegistry::new();
         registry.register(SkillDefinition {

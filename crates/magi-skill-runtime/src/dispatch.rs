@@ -101,10 +101,15 @@ fn execute_bridge_dispatch(
             binding_id: binding_id.clone(),
         })?;
     let external_input = external_tool_execution_input(&input, binding);
+    let record_context = bridge_context_for_dispatch(
+        &input.context,
+        &plan.tool_policy,
+        input.working_directory.as_deref(),
+    );
     if let Some(output) = bridge_preflight_output(runtime, plan, &external_input, binding) {
         runtime
             .tool_registry
-            .record_external_invocation(&external_input, &input.context, &output);
+            .record_external_invocation(&external_input, &record_context, &output);
         return Ok(SkillDispatchResult::Preflight { output });
     }
 
@@ -122,17 +127,35 @@ fn execute_bridge_dispatch(
             let output = bridge_error_output(&external_input, binding, &error);
             runtime.tool_registry.record_external_invocation(
                 &external_input,
-                &input.context,
+                &record_context,
                 &output,
             );
             SkillDispatchError::Bridge(error)
         })?;
     runtime.tool_registry.record_external_invocation(
         &external_input,
-        &input.context,
+        &record_context,
         &bridge_response_output(&external_input, &output),
     );
     Ok(SkillDispatchResult::Bridge { output })
+}
+
+fn bridge_context_for_dispatch(
+    context: &ToolExecutionContext,
+    policy: &magi_tool_runtime::ToolExecutionPolicy,
+    working_directory: Option<&str>,
+) -> ToolExecutionContext {
+    let mut context = context.clone();
+    context.access_profile = policy.effective_access_profile();
+    if context.working_directory.is_none()
+        && let Some(path) = working_directory
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    {
+        context.working_directory = Some(path);
+    }
+    context
 }
 
 fn external_tool_execution_input(
@@ -195,10 +218,8 @@ fn bridge_preflight_output(
     input: &ToolExecutionInput,
     binding: &BridgeBindingReference,
 ) -> Option<ToolExecutionOutput> {
-    if !bridge_binding_allowed_in_access_profile(
-        binding.bridge_kind,
-        plan.tool_policy.access_profile,
-    ) {
+    let access_profile = plan.tool_policy.effective_access_profile();
+    if !bridge_binding_allowed_in_access_profile(binding.bridge_kind, access_profile) {
         let reason = format!("只读访问模式不允许调用 MCP 外接工具: {}", binding.tool_name);
         return Some(ToolExecutionOutput {
             tool_call_id: input.tool_call_id.clone(),
@@ -224,7 +245,7 @@ fn bridge_preflight_output(
             risk_level: input.risk_level,
             approval_requirement: input.approval_requirement,
         },
-        plan.tool_policy.access_profile,
+        access_profile,
     );
     if governance.allowed {
         return None;
