@@ -730,6 +730,7 @@ export function buildFilePreviewQuery(
   filePath: string,
   options: { includeSession?: boolean; sessionId?: string; workspaceId?: string; workspacePath?: string } = {},
 ): string {
+  const explicitSessionId = typeof options.sessionId === 'string' && options.sessionId.trim().length > 0;
   return buildBoundQueryWithOverride(
     { filePath },
     {
@@ -737,7 +738,7 @@ export function buildFilePreviewQuery(
       workspaceId: options.workspaceId,
       workspacePath: options.workspacePath,
     },
-    { includeSession: options.includeSession === true },
+    { includeSession: options.includeSession === true || explicitSessionId },
   );
 }
 

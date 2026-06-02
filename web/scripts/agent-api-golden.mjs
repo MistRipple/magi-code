@@ -48,10 +48,19 @@ try {
   assert.equal(overridePreviewQuery.get('workspaceId'), 'workspace-override');
   assert.equal(overridePreviewQuery.get('workspacePath'), '/tmp/workspace-override');
   assert.equal(overridePreviewQuery.get('filePath'), 'README.md');
+  assert.equal(overridePreviewQuery.get('sessionId'), 'session-override');
+
+  const workspaceOnlyOverridePreviewQuery = new URLSearchParams(
+    agentApi.buildFilePreviewQuery('README.md', {
+      workspaceId: 'workspace-override',
+      workspacePath: '/tmp/workspace-override',
+      sessionId: '',
+    }),
+  );
   assert.equal(
-    overridePreviewQuery.has('sessionId'),
+    workspaceOnlyOverridePreviewQuery.has('sessionId'),
     false,
-    'explicit file preview scope should still omit session unless includeSession is true',
+    'explicit empty file preview session should keep workspace-only scope',
   );
 
   console.log('agent api golden replay passed');

@@ -1877,6 +1877,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_file_content_rejects_workspace_mismatched_session_scope() {
+        let root_a = unique_temp_dir("magi-changes-route-content-session-a");
+        let root_b = unique_temp_dir("magi-changes-route-content-session-b");
+        fs::write(root_a.join("alpha.txt"), "alpha from workspace a\n").expect("alpha should write");
+        fs::write(root_b.join("alpha.txt"), "alpha from workspace b\n").expect("alpha should write");
+        let state = build_state();
+        state
+            .workspace_registry
+            .register(
+                WorkspaceId::new("workspace-content-a"),
+                AbsolutePath::new(root_a.to_string_lossy().as_ref()),
+            )
+            .expect("workspace a should register");
+        state
+            .workspace_registry
+            .register(
+                WorkspaceId::new("workspace-content-b"),
+                AbsolutePath::new(root_b.to_string_lossy().as_ref()),
+            )
+            .expect("workspace b should register");
+        state
+            .session_store
+            .create_session_for_workspace(
+                SessionId::new("session-content-a"),
+                "session-content-a",
+                Some("workspace-content-a".to_string()),
+            )
+            .expect("session should create");
+
+        let response = routes()
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/files/content?sessionId=session-content-a&workspaceId=workspace-content-b&filePath=alpha.txt")
+                    .method("GET")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let payload = read_json_response(response).await;
+        let message = payload["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("不属于 workspace workspace-content-b"),
+            "file preview must reject mismatched session/workspace scope: {message}"
+        );
+    }
+
+    #[tokio::test]
     async fn get_file_content_rejects_absolute_path_outside_workspace() {
         let root = unique_temp_dir("magi-changes-route-content-inside-2");
         fs::write(root.join("alpha.txt"), "alpha changed\n").expect("alpha should write");
