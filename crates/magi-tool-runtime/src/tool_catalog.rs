@@ -1,6 +1,6 @@
 use crate::{
-    AgentRoleCatalogEntry, BuiltinToolAccessMode, BuiltinToolName, ExternalToolCatalogSnapshot,
-    ToolExecutionContext, ToolRuntimeResources,
+    AgentRoleCatalogEntry, BuiltinToolAccessMode, BuiltinToolName, ExternalToolCatalogEntry,
+    ExternalToolCatalogSnapshot, ToolExecutionContext, ToolRuntimeResources,
 };
 
 pub(crate) fn execute_tool_catalog(
@@ -135,7 +135,11 @@ pub(crate) fn build_tool_catalog_value(
     } else {
         ExternalToolCatalogSnapshot::default()
     };
-    let skill_tool_count = external_catalog.skill_tools.len();
+    let skill_tools = effective_external_skill_tools_for_access_profile(
+        external_catalog.skill_tools,
+        access_profile,
+    );
+    let skill_tool_count = skill_tools.len();
     let mcp_server_count = if include_mcp_servers {
         external_catalog.mcp_servers.len()
     } else {
@@ -207,7 +211,7 @@ pub(crate) fn build_tool_catalog_value(
         "spawnable_agent_role_count": spawnable_agent_role_count,
         "tools": tools,
         "skill_tools": if include_external {
-            serde_json::to_value(external_catalog.skill_tools).unwrap_or_else(|_| serde_json::json!([]))
+            serde_json::to_value(skill_tools).unwrap_or_else(|_| serde_json::json!([]))
         } else {
             serde_json::json!([])
         },
@@ -530,6 +534,43 @@ fn external_capability_dependencies(resources: &ToolRuntimeResources) -> Vec<ser
             "tool_count": mcp_tool_count,
         }),
     ]
+}
+
+fn effective_external_skill_tools_for_access_profile(
+    skill_tools: Vec<ExternalToolCatalogEntry>,
+    access_profile: magi_core::AccessProfile,
+) -> Vec<ExternalToolCatalogEntry> {
+    skill_tools
+        .into_iter()
+        .map(|mut tool| {
+            if !external_skill_tool_is_mcp(&tool) {
+                return tool;
+            }
+            match access_profile {
+                magi_core::AccessProfile::ReadOnly => {
+                    if tool.status == "available" {
+                        tool.status = "unavailable_in_read_only".to_string();
+                    }
+                    tool.access_profile_behavior = "unavailable_in_read_only".to_string();
+                    tool.approval_requirement = "not_applicable".to_string();
+                }
+                magi_core::AccessProfile::Restricted => {
+                    tool.access_profile_behavior = "restricted_requires_approval".to_string();
+                    tool.approval_requirement = "required".to_string();
+                }
+                magi_core::AccessProfile::FullAccess => {
+                    tool.access_profile_behavior =
+                        "full_access_skips_ordinary_approval".to_string();
+                    tool.approval_requirement = "none".to_string();
+                }
+            }
+            tool
+        })
+        .collect()
+}
+
+fn external_skill_tool_is_mcp(tool: &ExternalToolCatalogEntry) -> bool {
+    tool.bridge_kind.trim().eq_ignore_ascii_case("mcp")
 }
 
 fn access_mode_for_tool(tool: BuiltinToolName) -> BuiltinToolAccessMode {
@@ -976,6 +1017,72 @@ mod tests {
         assert_eq!(mcp_dependency["enabled_count"], 1);
         assert_eq!(mcp_dependency["ready_count"], 1);
         assert_eq!(mcp_dependency["tool_count"], 1);
+    }
+
+    #[test]
+    fn tool_catalog_reports_effective_external_mcp_skill_policy_by_access_profile() {
+        let resources = ToolRuntimeResources {
+            external_tool_catalog_provider: Some(std::sync::Arc::new(|| {
+                ExternalToolCatalogSnapshot {
+                    skill_tools: vec![crate::ExternalToolCatalogEntry {
+                        source: "skill".to_string(),
+                        skill_id: Some("code-review".to_string()),
+                        binding_id: Some("review-mcp".to_string()),
+                        name: "echo.describe".to_string(),
+                        description: "回显描述".to_string(),
+                        bridge_kind: "Mcp".to_string(),
+                        dispatch_action: "McpToolCall".to_string(),
+                        bridge_target: "loopback-mcp".to_string(),
+                        access_profile_behavior: "restricted_requires_approval".to_string(),
+                        risk_level: "high".to_string(),
+                        approval_requirement: "required".to_string(),
+                        status: "available".to_string(),
+                    }],
+                    mcp_servers: Vec::new(),
+                }
+            })),
+            ..ToolRuntimeResources::default()
+        };
+
+        let read_only_context = ToolExecutionContext {
+            access_profile: magi_core::AccessProfile::ReadOnly,
+            ..ToolExecutionContext::default()
+        };
+        let read_only_payload: serde_json::Value =
+            serde_json::from_str(&execute_tool_catalog("{}", &read_only_context, &resources))
+                .expect("json output");
+        assert_eq!(
+            read_only_payload["skill_tools"][0]["status"],
+            "unavailable_in_read_only"
+        );
+        assert_eq!(
+            read_only_payload["skill_tools"][0]["access_profile_behavior"],
+            "unavailable_in_read_only"
+        );
+        assert_eq!(
+            read_only_payload["skill_tools"][0]["approval_requirement"],
+            "not_applicable"
+        );
+
+        let full_access_context = ToolExecutionContext {
+            access_profile: magi_core::AccessProfile::FullAccess,
+            ..ToolExecutionContext::default()
+        };
+        let full_access_payload: serde_json::Value = serde_json::from_str(&execute_tool_catalog(
+            "{}",
+            &full_access_context,
+            &resources,
+        ))
+        .expect("json output");
+        assert_eq!(full_access_payload["skill_tools"][0]["status"], "available");
+        assert_eq!(
+            full_access_payload["skill_tools"][0]["access_profile_behavior"],
+            "full_access_skips_ordinary_approval"
+        );
+        assert_eq!(
+            full_access_payload["skill_tools"][0]["approval_requirement"],
+            "none"
+        );
     }
 
     #[test]
