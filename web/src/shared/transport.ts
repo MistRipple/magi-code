@@ -45,15 +45,21 @@ function createDirectTransport(): AgentTransport {
       return fetch(url, init);
     },
     connectEventStream(url: string, handlers: SseHandlers): SseConnection {
+      let closedByClient = false;
       const stream = new EventSource(url);
       stream.onopen = () => handlers.onOpen();
       stream.onmessage = (event) => handlers.onMessage(event.data);
       stream.onerror = () => {
-        if (stream.readyState === EventSource.CLOSED) {
+        if (!closedByClient) {
           handlers.onError();
         }
       };
-      return { close: () => stream.close() };
+      return {
+        close: () => {
+          closedByClient = true;
+          stream.close();
+        },
+      };
     },
   };
 }
