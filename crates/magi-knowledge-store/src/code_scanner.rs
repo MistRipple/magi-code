@@ -202,14 +202,8 @@ impl CodeIndexScanOutcome {
 
 /// 扫描工作区代码并生成代码索引
 pub fn scan_workspace(workspace_root: &Path) -> CodeIndexScanOutcome {
-    if !workspace_root.exists() {
-        return CodeIndexScanOutcome::failed(CodeIndexScanReasonCode::WorkspaceMissing);
-    }
-    if !workspace_root.is_dir() {
-        return CodeIndexScanOutcome::failed(CodeIndexScanReasonCode::WorkspaceNotDirectory);
-    }
-    if std::fs::read_dir(workspace_root).is_err() {
-        return CodeIndexScanOutcome::failed(CodeIndexScanReasonCode::WorkspaceUnreadable);
+    if let Some(reason_code) = workspace_root_scan_failure(workspace_root) {
+        return CodeIndexScanOutcome::failed(reason_code);
     }
 
     let mut files: Vec<ScannedFile> = Vec::new();
@@ -239,6 +233,19 @@ pub fn scan_workspace(workspace_root: &Path) -> CodeIndexScanOutcome {
         entry_points,
         last_indexed: UtcMillis::now().0,
     })
+}
+
+pub fn workspace_root_scan_failure(workspace_root: &Path) -> Option<CodeIndexScanReasonCode> {
+    if !workspace_root.exists() {
+        return Some(CodeIndexScanReasonCode::WorkspaceMissing);
+    }
+    if !workspace_root.is_dir() {
+        return Some(CodeIndexScanReasonCode::WorkspaceNotDirectory);
+    }
+    if std::fs::read_dir(workspace_root).is_err() {
+        return Some(CodeIndexScanReasonCode::WorkspaceUnreadable);
+    }
+    None
 }
 
 pub(crate) fn code_index_summary_from_relative_files(

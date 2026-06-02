@@ -6,7 +6,9 @@ use axum::{
 use magi_core::{DomainError, UtcMillis, WorkspaceId};
 use magi_knowledge_store::{
     KnowledgeKind, KnowledgeQuery, KnowledgeRecord,
-    code_scanner::{CodeIndexScanOutcome, CodeIndexScanStatus, CodeIndexSummary},
+    code_scanner::{
+        CodeIndexScanOutcome, CodeIndexScanStatus, CodeIndexSummary, workspace_root_scan_failure,
+    },
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -354,7 +356,11 @@ fn ensure_workspace_code_index(
         .knowledge_store
         .code_index_summary_for_workspace(workspace_id)
         .is_some_and(|summary| !summary.files.is_empty());
-    if had_index_summary && state.knowledge_store.workspace_index_ready(workspace_id) {
+    let workspace_root_available = workspace_root_scan_failure(&workspace_root).is_none();
+    if workspace_root_available
+        && had_index_summary
+        && state.knowledge_store.workspace_index_ready(workspace_id)
+    {
         return Ok(CodeIndexScanOutcome::indexed_existing());
     }
 
@@ -847,6 +853,77 @@ mod tests {
         assert!(
             state.knowledge_store.workspace_index_ready(&workspace_id),
             "knowledge endpoint should keep the local search engine aligned with the code index summary"
+        );
+    }
+
+    #[tokio::test]
+    async fn project_knowledge_revalidates_ready_index_when_workspace_root_disappears() {
+        let state = state_with_knowledge_store(KnowledgeStore::new());
+        let workspace_id = WorkspaceId::new("workspace-stale-ready-index");
+        let root = std::env::temp_dir().join(format!(
+            "magi-knowledge-stale-ready-index-{}",
+            UtcMillis::now().0
+        ));
+        fs::create_dir_all(root.join("src")).expect("workspace dir should create");
+        fs::write(root.join("src/main.rs"), "fn main() {}\n").expect("source file should write");
+        state
+            .workspace_registry
+            .register(
+                workspace_id.clone(),
+                AbsolutePath::new(root.to_string_lossy().to_string()),
+            )
+            .expect("workspace should register");
+
+        let first_response = routes()
+            .with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/knowledge?workspaceId=workspace-stale-ready-index")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        assert_eq!(first_response.status(), StatusCode::OK);
+        let first_payload = read_json(first_response).await;
+        assert_eq!(first_payload["codeIndexStatus"]["status"], "indexed");
+        assert!(
+            state.knowledge_store.workspace_index_ready(&workspace_id),
+            "initial request should build a ready runtime index"
+        );
+
+        fs::remove_dir_all(&root).expect("workspace dir should remove");
+
+        let second_response = routes()
+            .with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/knowledge?workspaceId=workspace-stale-ready-index")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        assert_eq!(second_response.status(), StatusCode::OK);
+        let second_payload = read_json(second_response).await;
+        assert!(second_payload["codeIndex"].is_null());
+        assert_eq!(second_payload["codeIndexStatus"]["status"], "failed");
+        assert_eq!(
+            second_payload["codeIndexStatus"]["reasonCode"],
+            "workspace_missing"
+        );
+        assert!(
+            !state.knowledge_store.workspace_index_ready(&workspace_id),
+            "missing workspace root should clear the stale runtime index"
+        );
+        assert!(
+            state
+                .knowledge_store
+                .code_index_summary_for_workspace(&workspace_id)
+                .is_none(),
+            "missing workspace root should clear the stale durable code index summary"
         );
     }
 

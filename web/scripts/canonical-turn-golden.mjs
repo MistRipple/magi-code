@@ -66,6 +66,7 @@ function runGoldenReplay(reducer, projection, timelineRenderItems, contract) {
   assertFailedToolWithoutAssistantShowsTurnResponseDuration(reducer, projection);
   assertUserImageMetadataProjectsToMessage(reducer, projection);
   assertAgentSpawnToolCardStaysOnMainlineAndTaskTabsFilterByTaskId(reducer, projection, timelineRenderItems);
+  assertRuntimeInternalAgentWaitIsHiddenFromCanonicalMainline(reducer, projection, timelineRenderItems);
   assertParallelAgentSpawnUsesTaskIdTabs(reducer, projection, timelineRenderItems);
   assertBootstrapProcessingStateFromRunningCanonicalTurn(contract);
   assertBootstrapProcessingStateIgnoresForeignSessionRunningTurn(contract);
@@ -128,6 +129,51 @@ function assertAgentSpawnToolCardStaysOnMainlineAndTaskTabsFilterByTaskId(reduce
       .map((entry) => entry.message.metadata?.turnItemId),
     childTaskItems.map((entry) => entry.message.metadata?.turnItemId),
     'task transcript should survive snapshot reload by taskId without role-tab state',
+  );
+}
+
+function assertRuntimeInternalAgentWaitIsHiddenFromCanonicalMainline(reducer, projection, timelineRenderItems) {
+  const c = baseCase('agent-wait-hidden', 'session-golden-agent-wait-hidden', 'turn-golden-agent-wait-hidden', 9550);
+  const userItem = user(c, 1, '请等待子代理完成。');
+  const spawnItem = agentSpawnTool(c, 2, 'spawn-a', 'call-spawn-a', 'executor', '验证代理', 'task-child-a', 'completed');
+  spawnItem.worker = { taskId: 'task-root', title: 'agent_spawn' };
+  const waitItem = agentWaitTool(c, 3, 'wait-a', 'call-wait-a', 'task-child-a', 'completed');
+  waitItem.worker = { taskId: 'task-root', title: 'agent_wait' };
+  const childFinal = assistantText(c, 4, 'child-final-a', '子代理已完成。', 'completed');
+  childFinal.worker = { taskId: 'task-child-a', workerId: 'worker-child-a', roleId: 'executor', title: '最终回复' };
+  const rootFinal = assistantText(c, 5, 'root-final', '已收到子代理结果。', 'completed');
+  rootFinal.worker = { taskId: 'task-root', title: '最终回复' };
+
+  const state = reducer.replaceCanonicalTurns(c.sessionId, [
+    turn(c, 'completed', [userItem, spawnItem, waitItem, childFinal, rootFinal], { completedAt: 9650, responseDurationMs: 100 }),
+  ]);
+  const projectionValue = projection.buildCanonicalTimelineProjection(state);
+  assert.ok(projectionValue, 'agent_wait hidden projection should exist');
+  assert.deepEqual(
+    projectionValue.threadRenderEntries.map((entry) => entry.artifactId),
+    [
+      `turn:${c.turnId}:user-message`,
+      `turn:${c.turnId}:spawn-a`,
+      `turn:${c.turnId}:root-final`,
+    ],
+    'runtime-internal agent_wait must not appear in mainline render entries',
+  );
+  assert.equal(
+    findArtifactByTurnItemId(projectionValue, 'wait-a'),
+    undefined,
+    'runtime-internal agent_wait must not create a render artifact',
+  );
+  assert.ok(
+    !timelineRenderItems.buildTimelineRenderItems(projectionValue, 'task', 'task-root')
+      .map((entry) => entry.message.metadata?.turnItemId)
+      .includes('wait-a'),
+    'root task tab must not reintroduce runtime-internal agent_wait',
+  );
+  assert.deepEqual(
+    timelineRenderItems.buildTimelineRenderItems(projectionValue, 'task', 'task-child-a')
+      .map((entry) => entry.message.metadata?.turnItemId),
+    ['child-final-a'],
+    'child task tab should still show child task artifacts',
   );
 }
 
@@ -1188,6 +1234,31 @@ function agentSpawnTool(c, itemSeq, itemId, callId, role, displayName, childTask
     content: status === 'running' ? `正在派发代理：${displayName}` : `代理完成：${displayName}`,
     title: displayName,
     tool: toolCall,
+  });
+}
+
+function agentWaitTool(c, itemSeq, itemId, callId, childTaskId, status) {
+  const failed = status === 'failed' || status === 'cancelled';
+  const toolCall = {
+    callId,
+    name: 'agent_wait',
+    arguments: {
+      task_ids: [childTaskId],
+    },
+    result: {
+      tool: 'agent_wait',
+      status: failed ? 'failed' : 'succeeded',
+      task_ids: [childTaskId],
+    },
+    ...(failed ? { error: '代理等待失败' } : {}),
+  };
+  return item(c, itemSeq, itemId, 'tool_call', status, {
+    content: status === 'running' ? '正在等待代理完成' : '代理等待完成',
+    title: 'agent_wait',
+    tool: toolCall,
+    visibility: {
+      renderable: false,
+    },
   });
 }
 
