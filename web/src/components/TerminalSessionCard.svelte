@@ -51,6 +51,26 @@
     return typeof value === 'string' ? value : undefined;
   }
 
+  function publicStructuredErrorText(errorPayload: Record<string, unknown> | unknown[] | null): string {
+    if (!errorPayload || Array.isArray(errorPayload)) {
+      return '';
+    }
+    const errorCode = (
+      readString(errorPayload.error_code)
+      || readString(errorPayload.errorCode)
+      || ''
+    ).trim();
+    if (!errorCode) {
+      return '';
+    }
+    return (
+      readString(errorPayload.error)?.trim()
+      || readString(errorPayload.summary)?.trim()
+      || readString(errorPayload.message)?.trim()
+      || ''
+    );
+  }
+
   function joinTerminalStreams(stdout: unknown, stderr: unknown): string | undefined {
     const stdoutText = readString(stdout) || '';
     const stderrText = readString(stderr) || '';
@@ -134,7 +154,11 @@
     };
   });
   const terminalId = $derived(terminal?.terminalId);
-  const displayStatus = $derived(terminalStatusFromCanonical(status || toolCall?.status, terminal?.status));
+  const errorPayloadStatus = $derived(readString(parsedErrorResult?.status) || '');
+  const displayStatus = $derived(terminalStatusFromCanonical(
+    status || toolCall?.status,
+    terminal?.status || errorPayloadStatus,
+  ));
   const displayPhase = $derived(terminal?.phase || '');
   const displayMode = $derived(terminal?.runMode || '');
   const displayCommand = $derived(terminal?.command || '');
@@ -239,9 +263,13 @@
   const returnCode = $derived(terminal?.returnCode);
   const locked = $derived(Boolean(terminal?.locked));
   const startupMessage = $derived(terminal?.startupMessage || '');
+  const publicErrorText = $derived(
+    publicStructuredErrorText(parsedErrorResult)
+    || publicStructuredErrorText(parsedResult)
+  );
   const errorText = $derived(terminal?.error || structuredErrorText(parsedErrorResult) || toolCall?.error || '');
   const showErrorHint = $derived.by(() => {
-    const normalizedError = normalizeDisplayText(errorText);
+    const normalizedError = normalizeDisplayText(publicErrorText || errorText);
     if (!normalizedError) {
       return false;
     }
@@ -420,7 +448,7 @@
         {/if}
 
         {#if showErrorHint}
-          <div class="terminal-error">{i18n.t('terminalSession.error')}: {i18n.t('terminalSession.errorHint')}</div>
+          <div class="terminal-error">{i18n.t('terminalSession.error')}: {publicErrorText || i18n.t('terminalSession.errorHint')}</div>
         {/if}
 
         <div class="terminal-footer">
