@@ -39,6 +39,14 @@ export function toolPayloadStatus(content: unknown): string {
   return readString(payload.status).toLowerCase();
 }
 
+export function isStructuredToolErrorPayload(content: unknown): boolean {
+  if (!toolPayloadErrorCode(content)) {
+    return false;
+  }
+  const status = toolPayloadStatus(content);
+  return !status || !['succeeded', 'success', 'ok'].includes(status);
+}
+
 export function publicToolPayloadMessage(content: unknown): string {
   if (!toolPayloadErrorCode(content)) {
     return '';

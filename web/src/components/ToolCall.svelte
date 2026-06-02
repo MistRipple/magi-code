@@ -14,7 +14,11 @@
   import { diagramSummary, parseToolDiagramPayload } from '../lib/diagram-payload';
   import { openAgentTab } from '../stores/right-pane.svelte';
   import { getAgentVisualInfo } from '../lib/agent-colors';
-  import { toolPayloadErrorCode } from '../lib/tool-error-payload';
+  import {
+    isStructuredToolErrorPayload,
+    toolPayloadErrorCode,
+    toolPayloadStatus,
+  } from '../lib/tool-error-payload';
 
   interface ErrorDiagnosis {
     category: 'model_input' | 'context_stale' | 'permission' | 'role_constraint' | 'policy' | 'model_output' | 'workspace_write' | 'runtime';
@@ -496,10 +500,23 @@
 
   // 检查是否有内容
   const hasInput = $derived(!!input && !!formatContent(input));
-  const imagePreview = $derived(parseViewImagePreview(name, output));
-  const outputText = $derived(formatToolOutput(name, output));
+  const outputIsStructuredError = $derived(isStructuredToolErrorPayload(output));
+  const imagePreview = $derived(outputIsStructuredError ? null : parseViewImagePreview(name, output));
+  const outputText = $derived(outputIsStructuredError ? '' : formatToolOutput(name, output));
   const hasOutput = $derived(!!output && (!!outputText || !!imagePreview));
-  const hasError = $derived(!!error && !!error.trim());
+  const structuredErrorText = $derived.by(() => {
+    if (!outputIsStructuredError) {
+      return '';
+    }
+    const errorCode = toolPayloadErrorCode(output);
+    const payloadStatus = toolPayloadStatus(output);
+    return JSON.stringify({
+      error_code: errorCode,
+      status: payloadStatus || 'failed',
+    });
+  });
+  const errorForDiagnosis = $derived((error && error.trim()) || structuredErrorText);
+  const hasError = $derived(!!errorForDiagnosis);
 
   const diagramPayload = $derived(parseToolDiagramPayload(name, output));
   const isDiagramTool = $derived(!!diagramPayload);
@@ -835,14 +852,14 @@
     };
   }
 
-  const errorDiagnosis = $derived.by(() => detectErrorDiagnosis(error, standardized));
+  const errorDiagnosis = $derived.by(() => detectErrorDiagnosis(errorForDiagnosis, standardized));
   const publicErrorMessage = $derived(errorDiagnosis?.message || i18n.t('toolCall.errorDiagnosis.runtime.message'));
 
   $effect(() => {
     if (!hasError) {
       return;
     }
-    const signature = `${id || name}:${status}:${error}`;
+    const signature = `${id || name}:${status}:${errorForDiagnosis}`;
     if (signature === lastLoggedErrorSignature) {
       return;
     }
@@ -851,7 +868,7 @@
       toolName: name,
       toolCallId: id,
       category: errorDiagnosis?.category || 'runtime',
-      error,
+      error: errorForDiagnosis,
     });
   });
 
