@@ -2006,7 +2006,8 @@ impl ToolRegistry {
             return output;
         }
 
-        let governance = if policy.access_profile == magi_core::AccessProfile::FullAccess {
+        let effective_access_profile = policy.effective_access_profile();
+        let governance = if effective_access_profile == magi_core::AccessProfile::FullAccess {
             GovernanceDecision::allowed(
                 DecisionPhase::ApprovalPolicy,
                 input.risk_level,
@@ -4933,6 +4934,72 @@ mod tests {
             .find(|tool| tool["name"] == BuiltinToolName::FileWrite.as_str())
             .expect("file_write should be listed");
         assert_eq!(file_write["effective_approval_policy"], "not_applicable");
+    }
+
+    #[test]
+    fn registry_enforces_effective_read_only_profile_default_path_scope() {
+        let workspace = unique_temp_dir("magi-tool-runtime-effective-profile-workspace");
+        let outside = unique_temp_dir("magi-tool-runtime-effective-profile-outside");
+        let outside_file = outside.join("secret.txt");
+        fs::write(&outside_file, "outside").expect("write outside fixture");
+        let registry = make_registry();
+
+        let output = registry.execute_with_policy(
+            ToolExecutionInput::for_builtin_invocation(
+                ToolCallId::new("tc-effective-read-only-path"),
+                BuiltinToolName::FileRead.as_str(),
+                serde_json::json!({
+                    "path": outside_file.to_string_lossy()
+                })
+                .to_string(),
+            ),
+            ToolExecutionContext {
+                working_directory: Some(workspace),
+                ..ToolExecutionContext::default()
+            },
+            &ToolExecutionPolicy {
+                access_profile: magi_core::AccessProfile::FullAccess,
+                command_mode: "read_only".to_string(),
+                ..ToolExecutionPolicy::default()
+            },
+        );
+
+        assert_eq!(output.status, ExecutionResultStatus::Rejected);
+        let payload: Value = serde_json::from_str(&output.payload).expect("payload json");
+        assert_eq!(payload["tool"], BuiltinToolName::FileRead.as_str());
+        assert_eq!(payload["access_profile"], "read_only");
+    }
+
+    #[test]
+    fn registry_does_not_skip_approval_when_command_mode_downgrades_full_access() {
+        let registry = make_registry();
+
+        let output = registry.execute_with_policy(
+            ToolExecutionInput {
+                tool_call_id: ToolCallId::new("tc-effective-read-only-approval"),
+                tool_name: BuiltinToolName::ShellExec.as_str().to_string(),
+                tool_kind: ToolKind::Builtin,
+                input: serde_json::json!({
+                    "command": "printf approval",
+                    "access_mode": "read_only"
+                })
+                .to_string(),
+                approval_requirement: ApprovalRequirement::Required,
+                risk_level: RiskLevel::High,
+            },
+            ToolExecutionContext::default(),
+            &ToolExecutionPolicy {
+                access_profile: magi_core::AccessProfile::FullAccess,
+                command_mode: "read_only".to_string(),
+                ..ToolExecutionPolicy::default()
+            },
+        );
+
+        assert_eq!(output.status, ExecutionResultStatus::NeedsApproval);
+        assert_eq!(output.governance.outcome, GovernanceOutcome::NeedsApproval);
+        let payload: Value = serde_json::from_str(&output.payload).expect("payload json");
+        assert_eq!(payload["tool"], BuiltinToolName::ShellExec.as_str());
+        assert_eq!(payload["access_profile"], "read_only");
     }
 
     #[test]

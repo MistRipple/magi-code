@@ -149,6 +149,7 @@ impl ToolRegistry {
         access_mode: BuiltinToolAccessMode,
     ) -> Option<ToolExecutionOutput> {
         let policy = normalize_execution_policy(policy);
+        let effective_access_profile = policy.effective_access_profile();
         let workspace_root_path = context.working_directory.as_deref();
         let engine = crate::builtin_permission_engine();
         let permission_policy = magi_permissions::PermissionPolicy {
@@ -169,7 +170,7 @@ impl ToolRegistry {
                 })
                 .collect(),
             allowed_paths: effective_tool_policy_allowed_paths(
-                policy.access_profile,
+                effective_access_profile,
                 &policy.allowed_paths,
                 workspace_root_path,
             ),
@@ -190,11 +191,11 @@ impl ToolRegistry {
                 is_write_tool: tool_is_writeful,
             },
             &permission_policy,
-            policy.access_profile,
+            effective_access_profile,
         );
         if let Some(output) = select_permission_axis_output(
             &mut pending_output,
-            self.permission_decision_output(input, tool_decision, policy.access_profile),
+            self.permission_decision_output(input, tool_decision, effective_access_profile),
         ) {
             return Some(output);
         }
@@ -205,11 +206,11 @@ impl ToolRegistry {
                     arguments_json: &input.input,
                 },
                 &permission_policy,
-                policy.access_profile,
+                effective_access_profile,
             );
             if let Some(output) = select_permission_axis_output(
                 &mut pending_output,
-                self.permission_decision_output(input, shell_decision, policy.access_profile),
+                self.permission_decision_output(input, shell_decision, effective_access_profile),
             ) {
                 return Some(output);
             }
@@ -219,7 +220,7 @@ impl ToolRegistry {
             &input.tool_name,
             &input.input,
             workspace_root_path,
-            policy.access_profile,
+            effective_access_profile,
         ) {
             let path_decision = engine.decide(
                 &magi_permissions::PermissionRequest::PathAccess {
@@ -227,11 +228,11 @@ impl ToolRegistry {
                     kind: path_request.kind,
                 },
                 &permission_policy,
-                policy.access_profile,
+                effective_access_profile,
             );
             if let Some(output) = select_permission_axis_output(
                 &mut pending_output,
-                self.permission_decision_output(input, path_decision, policy.access_profile),
+                self.permission_decision_output(input, path_decision, effective_access_profile),
             ) {
                 return Some(output);
             }

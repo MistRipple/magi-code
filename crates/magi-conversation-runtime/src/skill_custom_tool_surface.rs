@@ -298,6 +298,7 @@ pub fn execute_skill_custom_tool(
     };
 
     let access_profile = execution_policy_scope.access_profile;
+    let effective_access_profile = execution_policy_scope.effective_access_profile();
     let resolved_skill_name = active_skill_name.unwrap_or(tool_skill_name);
     let mut plan = skill_runtime.build_tool_runtime_plan(SkillSelection {
         skill_ids: vec![resolved_skill_name.to_string()],
@@ -330,7 +331,7 @@ pub fn execute_skill_custom_tool(
     let payload = extract_skill_custom_tool_payload(&tool_call.function.arguments);
     if let Some(preflight) = custom_tool_safety_decision(
         safety_gate,
-        access_profile,
+        effective_access_profile,
         tool_name,
         tool_skill_name,
         &binding,
@@ -1037,6 +1038,73 @@ mod tests {
         assert!(!payload.contains("rm -rf"));
         assert!(!payload.contains("bulk_delete"));
         assert!(!payload.contains("hard_block"));
+        assert!(!payload.contains("loopback-mcp"));
+    }
+
+    #[test]
+    fn custom_skill_tool_safety_gate_uses_effective_read_only_profile() {
+        let registry = SkillRegistry::new();
+        registry.register(SkillDefinition {
+            skill_id: "mcp-skill".to_string(),
+            title: "MCP Skill".to_string(),
+            instruction: "调用外接能力。".to_string(),
+            metadata: SkillMetadata {
+                category: "integration".to_string(),
+                tags: vec!["mcp".to_string()],
+            },
+            allowed_tools: vec![],
+            custom_tool_bindings: vec![CustomToolBinding {
+                binding_id: "inspect".to_string(),
+                tool_name: "echo.inspect".to_string(),
+                description: "检查输入".to_string(),
+                bridge_kind: BridgeBindingKind::Mcp,
+                dispatch_action: BridgeDispatchAction::McpToolCall,
+                bridge_target: "loopback-mcp".to_string(),
+            }],
+            prompt_priority: 50,
+        });
+        let skill_runtime = SkillRuntime::new(registry);
+        let dispatch_runtime = dispatch_runtime();
+        let safety_gate =
+            magi_safety_gate::SafetyGate::new(vec![magi_safety_gate::SafetyRule::with_action(
+                "git push --force",
+                magi_safety_gate::SafetyCategory::GitHistory,
+                magi_safety_gate::SafetyAction::RequireApprovalInRestricted,
+            )]);
+
+        let (payload, status) = execute_skill_custom_tool(
+            &ChatToolCall {
+                id: "skill-tool-call-effective-safety".to_string(),
+                kind: "function".to_string(),
+                function: ChatToolFunction {
+                    name: "skill__mcp-skill__inspect".to_string(),
+                    arguments:
+                        serde_json::json!({ "payload": r#"{"command":"git push --force"}"# })
+                            .to_string(),
+                },
+            },
+            "mcp-skill",
+            "inspect",
+            Some("mcp-skill"),
+            tool_execution_policy_scope(AccessProfile::FullAccess, "read_only", &[], &[]),
+            Some(&safety_gate),
+            Some(&skill_runtime),
+            Some(&dispatch_runtime),
+            ToolExecutionContext {
+                access_profile: AccessProfile::FullAccess,
+                ..ToolExecutionContext::default()
+            },
+            None,
+        );
+
+        assert_eq!(status, ExecutionResultStatus::Rejected);
+        let parsed: Value = serde_json::from_str(&payload).expect("payload should be json");
+        assert_eq!(parsed["status"], "rejected");
+        assert_eq!(parsed["tool"], "skill__mcp-skill__inspect");
+        assert_eq!(parsed["error_code"], "tool_safety_rejected");
+        assert_eq!(parsed["error"], "该操作已被安全防护阻止");
+        assert_eq!(parsed.get("safety_gate"), None);
+        assert!(!payload.contains("git push --force"));
         assert!(!payload.contains("loopback-mcp"));
     }
 
