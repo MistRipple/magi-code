@@ -490,6 +490,7 @@
 
   function beginPendingWorkspaceSwitch(workspaceId: string): void {
     pendingWorkspaceSwitchId = workspaceId;
+    loadingWorkspaceIds = { ...loadingWorkspaceIds, [workspaceId]: true };
     if (pendingWorkspaceSwitchTimer) {
       clearTimeout(pendingWorkspaceSwitchTimer);
     }
@@ -498,6 +499,7 @@
         return;
       }
       clearPendingWorkspaceSwitchState();
+      loadingWorkspaceIds = { ...loadingWorkspaceIds, [workspaceId]: false };
       messagesState.sessionHydrating = false;
     }, 6000);
   }
@@ -513,7 +515,11 @@
     messagesState.currentWorkspaceId = workspace.workspaceId;
     messagesState.currentWorkspacePath = workspace.rootPath;
     setCurrentSessionId(null);
-    updateSessions(sessionsByWorkspace[workspace.workspaceId] ?? []);
+    sessionsByWorkspace = {
+      ...sessionsByWorkspace,
+      [workspace.workspaceId]: [],
+    };
+    updateSessions([]);
     syncBrowserSessionBinding(workspace.workspaceId, workspace.rootPath, null);
   }
 
