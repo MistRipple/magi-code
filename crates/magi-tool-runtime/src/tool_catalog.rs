@@ -2,6 +2,7 @@ use crate::{
     AgentRoleCatalogEntry, BuiltinToolAccessMode, BuiltinToolName, ExternalToolCatalogEntry,
     ExternalToolCatalogSnapshot, ToolExecutionContext, ToolRuntimeResources,
 };
+use magi_knowledge_store::code_scanner::workspace_root_scan_failure;
 
 pub(crate) fn execute_tool_catalog(
     input: &str,
@@ -276,6 +277,10 @@ impl RuntimeHealth {
             .workspace_id
             .as_ref()
             .map(|id| id.as_str().to_string());
+        let workspace_root_available = match context.working_directory.as_deref() {
+            Some(root) => workspace_root_scan_failure(root).is_none(),
+            None => true,
+        };
         let (
             workspace_code_index_ready,
             workspace_code_index_file_count,
@@ -285,6 +290,7 @@ impl RuntimeHealth {
             resources.knowledge_store.as_ref(),
             context.workspace_id.as_ref(),
         ) {
+            (Some(_), Some(_)) if !workspace_root_available => (false, None, None, None),
             (Some(store), Some(workspace_id)) => {
                 let summary = store.code_index_summary_for_workspace(workspace_id);
                 let stats = store.workspace_index_stats(workspace_id);
@@ -1227,6 +1233,62 @@ mod tests {
         assert_eq!(payload["runtime_dependencies"][1]["status"], "ready");
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tool_catalog_revalidates_workspace_code_index_root_before_ready_status() {
+        let root = std::env::temp_dir().join(format!(
+            "magi-tool-catalog-index-missing-root-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("src")).expect("create test workspace");
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "pub fn catalog_index_missing_root_probe() -> bool { true }\n",
+        )
+        .expect("write test source");
+
+        let workspace_id = magi_core::WorkspaceId::new("workspace-tool-catalog-index-missing-root");
+        let store = std::sync::Arc::new(magi_knowledge_store::KnowledgeStore::new());
+        store.build_workspace_index(&workspace_id, &root);
+        assert!(
+            store.workspace_index_ready(&workspace_id),
+            "fixture should start with a ready runtime index"
+        );
+        std::fs::remove_dir_all(&root).expect("remove test workspace");
+
+        let resources = ToolRuntimeResources {
+            knowledge_store: Some(store),
+            ..ToolRuntimeResources::default()
+        };
+        let context = ToolExecutionContext {
+            workspace_id: Some(workspace_id),
+            working_directory: Some(root),
+            ..ToolExecutionContext::default()
+        };
+
+        let output = execute_tool_catalog("{}", &context, &resources);
+        let payload: serde_json::Value = serde_json::from_str(&output).expect("json output");
+        let search_semantic = payload["tools"]
+            .as_array()
+            .expect("tools")
+            .iter()
+            .find(|tool| tool["name"] == "search_semantic")
+            .expect("search_semantic should be listed");
+        let workspace_code_index = payload["runtime_dependencies"]
+            .as_array()
+            .expect("runtime dependencies")
+            .iter()
+            .find(|dependency| dependency["name"] == "workspace_code_index")
+            .expect("workspace_code_index dependency should be listed");
+
+        assert_eq!(search_semantic["runtime_status"], "not_ready");
+        assert_eq!(workspace_code_index["status"], "not_ready");
+        assert!(workspace_code_index["file_count"].is_null());
+        assert!(workspace_code_index["last_indexed"].is_null());
     }
 
     #[test]
