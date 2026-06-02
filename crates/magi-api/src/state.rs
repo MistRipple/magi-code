@@ -1307,7 +1307,7 @@ impl ApiState {
                     "inputSensitivePolicy": tool.get("input_sensitive_policy").cloned().unwrap_or(serde_json::Value::Bool(false)),
                     "policySummary": tool.get("policy_summary").cloned().unwrap_or(serde_json::Value::String("使用工具默认风险与审批策略".to_string())),
                     "runtimeInternal": tool.get("runtime_internal").cloned().unwrap_or(serde_json::Value::Bool(false)),
-                    "runtimeStatus": tool.get("runtime_status").cloned().unwrap_or(serde_json::Value::String("ready".to_string())),
+                    "runtimeStatus": normalize_tool_runtime_status(tool.get("runtime_status")),
                     "runtimeWarnings": warning_markers(tool, "runtime_warnings", "runtime_warning"),
                     "schemaStatus": tool.get("schema_status").cloned().unwrap_or(serde_json::Value::String("ok".to_string())),
                     "schemaWarnings": warning_markers(tool, "schema_warnings", "schema_warning"),
@@ -1722,6 +1722,15 @@ fn warning_markers(
     )
 }
 
+fn normalize_tool_runtime_status(value: Option<&serde_json::Value>) -> serde_json::Value {
+    value
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|status| !status.is_empty())
+        .map(|status| serde_json::Value::String(status.to_string()))
+        .unwrap_or_else(|| serde_json::Value::String("unknown".to_string()))
+}
+
 fn capability_dependency_field(
     raw: &serde_json::Value,
     camel_key: &str,
@@ -2050,6 +2059,44 @@ mod tests {
                 .as_deref(),
             Some("auditor")
         );
+    }
+
+    #[test]
+    fn builtin_tools_json_does_not_assume_missing_runtime_status_ready() {
+        let state = ApiState::new(
+            "magi-test",
+            Arc::new(InMemoryEventBus::new(32)),
+            Arc::new(SessionStore::default()),
+            Arc::new(WorkspaceStore::default()),
+            Arc::new(GovernanceService::default()),
+        );
+        let catalog = serde_json::json!({
+            "tools": [
+                {
+                    "name": "file_read",
+                    "public": true,
+                    "runtime_status": "ready"
+                },
+                {
+                    "name": "tool_catalog",
+                    "public": true
+                },
+                {
+                    "name": "shell_exec",
+                    "public": true,
+                    "runtime_status": " "
+                }
+            ]
+        });
+
+        let tools = state.builtin_tools_json(&catalog);
+        let tools = tools
+            .as_array()
+            .expect("builtin tools should be an array");
+
+        assert_eq!(tools[0]["runtimeStatus"], serde_json::json!("ready"));
+        assert_eq!(tools[1]["runtimeStatus"], serde_json::json!("unknown"));
+        assert_eq!(tools[2]["runtimeStatus"], serde_json::json!("unknown"));
     }
 
     #[test]
