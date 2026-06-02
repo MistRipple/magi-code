@@ -557,6 +557,9 @@ mod tests {
     struct FailingModelClient;
 
     #[derive(Clone, Debug, Default)]
+    struct BusinessFailureModelClient;
+
+    #[derive(Clone, Debug, Default)]
     struct TestMcpClient {
         calls: Arc<Mutex<Vec<magi_bridge_client::McpToolCallRequest>>>,
     }
@@ -571,6 +574,28 @@ mod tests {
                 layer: magi_bridge_client::BridgeErrorLayer::RemoteBusiness,
                 code: None,
                 message: "remote denied".to_string(),
+            })
+        }
+
+        fn invoke_streaming(
+            &self,
+            request: magi_bridge_client::ModelInvocationRequest,
+            _on_delta: &dyn Fn(&magi_bridge_client::ModelStreamingDelta),
+        ) -> Result<magi_bridge_client::BridgeResponse, magi_bridge_client::BridgeClientError>
+        {
+            self.invoke(request)
+        }
+    }
+
+    impl magi_bridge_client::ModelBridgeClient for BusinessFailureModelClient {
+        fn invoke(
+            &self,
+            _request: magi_bridge_client::ModelInvocationRequest,
+        ) -> Result<magi_bridge_client::BridgeResponse, magi_bridge_client::BridgeClientError>
+        {
+            Ok(magi_bridge_client::BridgeResponse {
+                ok: false,
+                payload: "remote business detail: secret-token".to_string(),
             })
         }
 
@@ -1188,6 +1213,73 @@ mod tests {
         assert_eq!(payload.get("bridge_kind"), None);
         assert_eq!(payload.get("dispatch_action"), None);
         assert!(!invocations[0].payload.contains("remote denied"));
+    }
+
+    #[test]
+    fn bridge_ok_false_records_public_failure_payload() {
+        let governance = Arc::new(GovernanceService::default());
+        let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(16));
+        let tool_registry = ToolRegistry::new(governance, event_bus);
+        let skill_registry = SkillRegistry::new();
+        skill_registry.register(SkillDefinition {
+            skill_id: "skill-business-failure".to_string(),
+            title: "Business Failure Skill".to_string(),
+            instruction: "instruction".to_string(),
+            metadata: SkillMetadata {
+                category: "general".to_string(),
+                tags: vec!["tag".to_string()],
+            },
+            allowed_tools: vec![],
+            custom_tool_bindings: vec![CustomToolBinding {
+                binding_id: "business-failure".to_string(),
+                tool_name: "model.prompt".to_string(),
+                description: "prompt".to_string(),
+                bridge_kind: BridgeBindingKind::Model,
+                dispatch_action: BridgeDispatchAction::ModelPrompt,
+                bridge_target: "openai".to_string(),
+            }],
+            prompt_priority: 10,
+        });
+
+        let runtime = SkillDispatchRuntime::new(
+            tool_registry.clone(),
+            BridgeDispatchRuntime::new().with_model_client(Arc::new(BusinessFailureModelClient)),
+        );
+        let plan = skill_registry.build_tool_runtime_plan(&SkillSelection {
+            skill_ids: vec!["skill-business-failure".to_string()],
+            requested_tools: vec!["model.prompt".to_string()],
+        });
+        let outcome = runtime.dispatch_observed(
+            &plan,
+            SkillDispatchInput {
+                tool_call_id: ToolCallId::new("call-business-failure"),
+                tool_name: "model.prompt".to_string(),
+                binding_id: Some("business-failure".to_string()),
+                payload: "hello".to_string(),
+                approval_requirement: ApprovalRequirement::None,
+                risk_level: RiskLevel::Low,
+                context: ToolExecutionContext::default(),
+                working_directory: None,
+            },
+        );
+
+        assert_eq!(outcome.observation.status, SkillDispatchStatus::Failed);
+        assert!(matches!(
+            outcome.result,
+            Ok(SkillDispatchResult::Bridge { ref output }) if !output.response.ok
+        ));
+        let invocations = tool_registry.invocations();
+        assert_eq!(invocations.len(), 1);
+        let payload: serde_json::Value =
+            serde_json::from_str(&invocations[0].payload).expect("bridge ok=false payload json");
+        assert_eq!(payload["status"], "failed");
+        assert_eq!(payload["error_code"], "external_tool_remote_failed");
+        assert_eq!(
+            payload["error"],
+            "外接工具返回失败，请检查输入或外接工具状态"
+        );
+        assert!(!invocations[0].payload.contains("secret-token"));
+        assert!(!invocations[0].payload.contains("remote business detail"));
     }
 
     // ── T-304: Skill Runtime 切换前验证补齐 ────────────────────────────────

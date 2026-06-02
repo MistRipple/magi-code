@@ -14,6 +14,7 @@ const SKILL_TOOL_CONFIG_PUBLIC_ERROR: &str = "Skill 工具配置不可用，请�
 const SKILL_TOOL_SCOPE_PUBLIC_ERROR: &str = "该 Skill 工具不属于当前激活 Skill";
 const SKILL_TOOL_DISPATCH_PUBLIC_ERROR: &str = "Skill 工具执行失败，请稍后重试";
 const SKILL_TOOL_POLICY_PUBLIC_ERROR: &str = "该 Skill 工具在当前访问模式下不可用";
+const SKILL_TOOL_REMOTE_PUBLIC_ERROR: &str = "Skill 工具返回失败，请检查输入或外接工具状态";
 
 pub fn build_skill_custom_tool_definitions(
     skill_name: &str,
@@ -261,14 +262,13 @@ pub fn execute_skill_custom_tool(
         Ok(SkillDispatchResult::Preflight { .. }) => {
             custom_tool_preflight_payload(tool_name, tool_skill_name, observation)
         }
-        Ok(SkillDispatchResult::Bridge { output }) => (
-            output.response.payload,
+        Ok(SkillDispatchResult::Bridge { output }) => {
             if output.response.ok {
-                ExecutionResultStatus::Succeeded
+                (output.response.payload, ExecutionResultStatus::Succeeded)
             } else {
-                ExecutionResultStatus::Failed
-            },
-        ),
+                custom_tool_remote_failure_payload(tool_name, tool_skill_name, observation)
+            }
+        }
         Err(_error) => {
             custom_tool_dispatch_failure_payload(tool_name, tool_skill_name, observation)
         }
@@ -360,6 +360,32 @@ fn custom_tool_dispatch_failure_payload(
         })
         .to_string(),
         status,
+    )
+}
+
+fn custom_tool_remote_failure_payload(
+    tool_name: &str,
+    skill_name: &str,
+    observation: magi_skill_runtime::SkillDispatchObservation,
+) -> (String, ExecutionResultStatus) {
+    tracing::warn!(
+        tool_name,
+        skill_name,
+        binding_id = observation.binding_id.as_deref().unwrap_or_default(),
+        detail = %observation.detail,
+        "skill custom tool returned failed bridge response"
+    );
+    (
+        serde_json::json!({
+            "tool": tool_name,
+            "status": "failed",
+            "binding_id": observation.binding_id,
+            "skill_name": skill_name,
+            "error_code": "skill_tool_remote_failed",
+            "error": SKILL_TOOL_REMOTE_PUBLIC_ERROR,
+        })
+        .to_string(),
+        ExecutionResultStatus::Failed,
     )
 }
 
@@ -487,6 +513,31 @@ mod tests {
         SkillDispatchRuntime::new(tool_registry, BridgeDispatchRuntime::new())
     }
 
+    #[derive(Clone, Debug, Default)]
+    struct BusinessFailureModelClient;
+
+    impl magi_bridge_client::ModelBridgeClient for BusinessFailureModelClient {
+        fn invoke(
+            &self,
+            _request: magi_bridge_client::ModelInvocationRequest,
+        ) -> Result<magi_bridge_client::BridgeResponse, magi_bridge_client::BridgeClientError>
+        {
+            Ok(magi_bridge_client::BridgeResponse {
+                ok: false,
+                payload: "remote business detail: secret-token".to_string(),
+            })
+        }
+
+        fn invoke_streaming(
+            &self,
+            request: magi_bridge_client::ModelInvocationRequest,
+            _on_delta: &dyn Fn(&magi_bridge_client::ModelStreamingDelta),
+        ) -> Result<magi_bridge_client::BridgeResponse, magi_bridge_client::BridgeClientError>
+        {
+            self.invoke(request)
+        }
+    }
+
     #[test]
     fn custom_skill_tool_missing_runtime_uses_public_error() {
         let (payload, status) = execute_skill_custom_tool(
@@ -610,5 +661,69 @@ mod tests {
         assert_eq!(parsed["error"], SKILL_TOOL_POLICY_PUBLIC_ERROR);
         assert_eq!(parsed.get("bridge_target"), None);
         assert_eq!(parsed.get("bridge_kind"), None);
+    }
+
+    #[test]
+    fn custom_skill_tool_ok_false_bridge_response_uses_public_error() {
+        let registry = SkillRegistry::new();
+        registry.register(SkillDefinition {
+            skill_id: "model-skill".to_string(),
+            title: "Model Skill".to_string(),
+            instruction: "调用外接模型能力。".to_string(),
+            metadata: SkillMetadata {
+                category: "integration".to_string(),
+                tags: vec!["model".to_string()],
+            },
+            allowed_tools: vec![],
+            custom_tool_bindings: vec![CustomToolBinding {
+                binding_id: "ask".to_string(),
+                tool_name: "model.prompt".to_string(),
+                description: "询问模型".to_string(),
+                bridge_kind: BridgeBindingKind::Model,
+                dispatch_action: BridgeDispatchAction::ModelPrompt,
+                bridge_target: "openai".to_string(),
+            }],
+            prompt_priority: 50,
+        });
+        let skill_runtime = SkillRuntime::new(registry);
+        let tool_registry = ToolRegistry::new(
+            Arc::new(GovernanceService::default()),
+            Arc::new(InMemoryEventBus::new(8)),
+        );
+        let dispatch_runtime = SkillDispatchRuntime::new(
+            tool_registry,
+            BridgeDispatchRuntime::new().with_model_client(Arc::new(BusinessFailureModelClient)),
+        );
+
+        let (payload, status) = execute_skill_custom_tool(
+            &ChatToolCall {
+                id: "skill-tool-call-ok-false".to_string(),
+                kind: "function".to_string(),
+                function: ChatToolFunction {
+                    name: "skill__model-skill__ask".to_string(),
+                    arguments: serde_json::json!({ "payload": "ask" }).to_string(),
+                },
+            },
+            "model-skill",
+            "ask",
+            Some("model-skill"),
+            tool_execution_policy_scope(AccessProfile::Restricted, "", &[], &[]),
+            None,
+            Some(&skill_runtime),
+            Some(&dispatch_runtime),
+            ToolExecutionContext::default(),
+            None,
+        );
+
+        assert_eq!(status, ExecutionResultStatus::Failed);
+        let parsed: Value = serde_json::from_str(&payload).expect("payload should be json");
+        assert_eq!(parsed["status"], "failed");
+        assert_eq!(parsed["tool"], "skill__model-skill__ask");
+        assert_eq!(parsed["error_code"], "skill_tool_remote_failed");
+        assert_eq!(parsed["error"], SKILL_TOOL_REMOTE_PUBLIC_ERROR);
+        assert_eq!(parsed.get("bridge_target"), None);
+        assert_eq!(parsed.get("bridge_kind"), None);
+        assert!(!payload.contains("secret-token"));
+        assert!(!payload.contains("remote business detail"));
     }
 }

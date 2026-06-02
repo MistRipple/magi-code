@@ -130,7 +130,7 @@ fn execute_bridge_dispatch(
     runtime.tool_registry.record_external_invocation(
         &external_input,
         &input.context,
-        &bridge_success_output(&external_input, &output),
+        &bridge_response_output(&external_input, &output),
     );
     Ok(SkillDispatchResult::Bridge { output })
 }
@@ -255,7 +255,7 @@ fn bridge_preflight_output(
     })
 }
 
-fn bridge_success_output(
+fn bridge_response_output(
     input: &ToolExecutionInput,
     output: &BridgeDispatchResult,
 ) -> ToolExecutionOutput {
@@ -267,7 +267,23 @@ fn bridge_success_output(
     ToolExecutionOutput {
         tool_call_id: input.tool_call_id.clone(),
         status,
-        payload: output.response.payload.clone(),
+        payload: if output.response.ok {
+            output.response.payload.clone()
+        } else {
+            tracing::warn!(
+                tool_name = %input.tool_name,
+                binding_id = %output.binding_id,
+                bridge_kind = ?output.bridge_kind,
+                dispatch_action = ?output.dispatch_action,
+                "skill bridge returned ok=false"
+            );
+            bridge_public_payload(
+                input,
+                status,
+                EXTERNAL_TOOL_REMOTE_FAILED_CODE,
+                EXTERNAL_TOOL_REMOTE_PUBLIC_ERROR,
+            )
+        },
         governance: GovernanceDecision::allowed(
             DecisionPhase::ToolPolicy,
             input.risk_level,
