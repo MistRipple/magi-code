@@ -825,6 +825,7 @@ function assertSameSessionBootstrapAppliesAuthoritativeSnapshotWhenProjectionIsE
 
   messagesStore.messagesState.currentWorkspaceId = workspaceId;
   messagesStore.messagesState.currentWorkspacePath = workspacePath;
+  messagesStore.messagesState.bootstrapped = false;
   messagesStore.setCurrentSessionId(c.sessionId);
   messagesStore.clearAllMessages({
     persist: false,
@@ -904,6 +905,11 @@ function assertSameSessionBootstrapAppliesAuthoritativeSnapshotWhenProjectionIsE
     messagesStore.messagesState.isProcessing,
     false,
     'authoritative same-session bootstrap must settle processing after applying terminal snapshot',
+  );
+  assert.equal(
+    messagesStore.messagesState.bootstrapped,
+    true,
+    'authoritative same-session bootstrap must clear the startup overlay',
   );
   assert.equal(
     messagesStore.messagesState.pendingRequests.size,

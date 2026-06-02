@@ -183,6 +183,7 @@ let settingsBootstrapRequestSeq = 0;
 let recoveryAttempt = 0;
 let recoveryTimer: number | null = null;
 let recoveryInFlight: Promise<void> | null = null;
+let recoveryInFlightBindingKey = '';
 let sessionSnapshotGeneration = 0;
 let workspaceSessionSummaryRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -1899,10 +1900,12 @@ function normalizeBootstrapResponse(
 }
 
 async function restoreBridgeState(reason: string, force = false): Promise<void> {
-  if (recoveryInFlight) {
+  const recoveryBindingKey = bootstrapBindingKey(resolveWorkspaceQuery());
+  if (recoveryInFlight && !force && recoveryInFlightBindingKey === recoveryBindingKey) {
     return recoveryInFlight;
   }
-  recoveryInFlight = (async () => {
+  recoveryInFlightBindingKey = recoveryBindingKey;
+  const request = (async () => {
     const recovered = bridgeRecovering || recoveryAttempt > 0;
     const reachableBaseUrl = await probeReachableAgentBaseUrl();
     if (!reachableBaseUrl) {
@@ -1920,14 +1923,19 @@ async function restoreBridgeState(reason: string, force = false): Promise<void> 
     recoveryAttempt = 0;
     emitConnectedState(reason, recovered);
   })().finally(() => {
-    recoveryInFlight = null;
+    if (recoveryInFlight === request) {
+      recoveryInFlight = null;
+      recoveryInFlightBindingKey = '';
+    }
   });
-  return recoveryInFlight;
+  recoveryInFlight = request;
+  return request;
 }
 
 function scheduleRecovery(reason: string, error?: unknown, immediate = false): void {
   emitRecoveringState(reason, error);
-  if (recoveryInFlight) {
+  const recoveryBindingKey = bootstrapBindingKey(resolveWorkspaceQuery());
+  if (recoveryInFlight && recoveryInFlightBindingKey === recoveryBindingKey) {
     return;
   }
   if (recoveryTimer !== null) {

@@ -4,6 +4,9 @@ import { createServer } from 'vite';
 const WORKSPACE_ID = 'workspace-bridge-live-adopt';
 const WORKSPACE_PATH = '/tmp/workspace-bridge-live-adopt';
 const PARTIAL_WORKSPACE_ID = 'workspace-bridge-partial-scope';
+const RACE_WORKSPACE_ID = 'workspace-bridge-bootstrap-race';
+const RACE_WORKSPACE_PATH = '/tmp/workspace-bridge-bootstrap-race';
+const RACE_SESSION_ID = 'session-bridge-bootstrap-race';
 const SESSION_ID = 'session-bridge-live-adopt';
 const TURN_ID = 'turn-bridge-live-adopt';
 const USER_ITEM_ID = 'user-bridge-live-adopt';
@@ -13,6 +16,7 @@ let terminalPublished = false;
 let summaryMessageCount = 1;
 let summaryUpdatedAt = ACCEPTED_AT;
 const capturedTurnBodies = [];
+const bootstrapInterceptors = [];
 
 class MemoryStorage {
   constructor() {
@@ -172,6 +176,46 @@ function bootstrapPayload() {
   };
 }
 
+function scopedBootstrapPayload(workspaceId, workspacePath, sessionId, title) {
+  const session = {
+    sessionId,
+    title,
+    createdAt: ACCEPTED_AT + 2000,
+    updatedAt: ACCEPTED_AT + 2000,
+    messageCount: 0,
+    workspaceId,
+  };
+  return {
+    workspace: {
+      workspaceId,
+      rootPath: workspacePath,
+    },
+    currentSession: session,
+    sessions: [session],
+    state: {
+      currentSessionId: sessionId,
+      currentWorkspaceId: workspaceId,
+      currentWorkspacePath: workspacePath,
+      sessions: [session],
+      isProcessing: false,
+      processingState: null,
+      messages: [],
+      edits: [],
+      changedFiles: [],
+      pendingChanges: [],
+      pendingChangesState: null,
+    },
+    canonicalTurns: [],
+    notifications: {
+      notifications: [],
+    },
+    eventStreamNextSequence: 1,
+    agent: {
+      runtimeEpoch: `${workspaceId}:${sessionId}`,
+    },
+  };
+}
+
 function settingsBootstrapPayload() {
   return {
     workspaceId: WORKSPACE_ID,
@@ -222,6 +266,10 @@ function installFetchStub() {
       });
     }
     if (parsed.pathname === '/bootstrap') {
+      const interceptor = bootstrapInterceptors.shift();
+      if (interceptor) {
+        return interceptor(parsed);
+      }
       return jsonResponse(bootstrapPayload());
     }
     if (parsed.pathname === '/api/settings/bootstrap') {
@@ -418,6 +466,16 @@ function currentSessionSummary(messagesStore) {
   return messagesStore.messagesState.sessions.find((session) => session.id === SESSION_ID);
 }
 
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
 installBrowserGlobals();
 installFetchStub();
 
@@ -582,6 +640,63 @@ try {
     null,
     'workspaceId-only bridge submit must not inherit stale current sessionId',
   );
+
+  const originalRaceWarn = console.warn;
+  try {
+    console.warn = () => {};
+    const firstBootstrap = deferred();
+    const secondBootstrap = deferred();
+    const raceBootstrapRequests = [];
+    bootstrapInterceptors.push((parsed) => {
+      raceBootstrapRequests.push(parsed);
+      return firstBootstrap.promise.then(() => jsonResponse(bootstrapPayload()));
+    });
+    messagesStore.messagesState.bootstrapped = false;
+    bridge.postMessage({ type: 'requestState' });
+    await waitFor(
+      () => raceBootstrapRequests.length === 1,
+      'race setup must start the first bootstrap request',
+    );
+
+    bridge.postMessage({
+      type: 'workspaceBindingChanged',
+      workspaceId: RACE_WORKSPACE_ID,
+      workspacePath: RACE_WORKSPACE_PATH,
+      sessionId: RACE_SESSION_ID,
+    });
+    bootstrapInterceptors.push((parsed) => {
+      raceBootstrapRequests.push(parsed);
+      return secondBootstrap.promise.then(() => jsonResponse(scopedBootstrapPayload(
+        RACE_WORKSPACE_ID,
+        RACE_WORKSPACE_PATH,
+        RACE_SESSION_ID,
+        '启动竞态会话',
+      )));
+    });
+    bridge.postMessage({ type: 'requestState' });
+    await waitFor(
+      () => raceBootstrapRequests.length === 2,
+      'binding-changed requestState must start a fresh bootstrap instead of reusing stale recovery',
+    );
+    secondBootstrap.resolve();
+    firstBootstrap.resolve();
+    await waitFor(
+      () => messagesStore.messagesState.currentSessionId === RACE_SESSION_ID,
+      'binding-changed bootstrap race must adopt the latest session',
+    );
+    assert.equal(
+      messagesStore.messagesState.bootstrapped,
+      true,
+      'binding-changed bootstrap race must clear the startup overlay',
+    );
+    assert.equal(
+      messagesStore.messagesState.currentWorkspaceId,
+      RACE_WORKSPACE_ID,
+      'binding-changed bootstrap race must adopt the latest workspace',
+    );
+  } finally {
+    console.warn = originalRaceWarn;
+  }
 
   console.log('web client bridge golden replay passed');
 } finally {
