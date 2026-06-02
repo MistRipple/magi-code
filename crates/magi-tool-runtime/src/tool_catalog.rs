@@ -132,23 +132,32 @@ pub(crate) fn build_tool_catalog_value(
             .external_tool_catalog_provider
             .as_ref()
             .map(|provider| provider())
-            .unwrap_or_default()
     } else {
-        ExternalToolCatalogSnapshot::default()
+        None
     };
-    let skill_tools = effective_external_skill_tools_for_access_profile(
-        external_catalog.skill_tools,
-        access_profile,
-    );
+    let external_dependency_source = if include_external {
+        external_catalog
+            .as_ref()
+            .map(ExternalCapabilityDependencySource::Available)
+            .unwrap_or(ExternalCapabilityDependencySource::Unavailable)
+    } else {
+        ExternalCapabilityDependencySource::Disabled
+    };
+    let runtime_dependencies =
+        runtime_health.dependencies_json(context, resources, external_dependency_source);
+    let (raw_skill_tools, external_mcp_servers) = external_catalog
+        .map(|catalog| (catalog.skill_tools, catalog.mcp_servers))
+        .unwrap_or_default();
+    let skill_tools =
+        effective_external_skill_tools_for_access_profile(raw_skill_tools, access_profile);
     let skill_tool_count = skill_tools.len();
     let mcp_server_count = if include_mcp_servers {
-        external_catalog.mcp_servers.len()
+        external_mcp_servers.len()
     } else {
         0
     };
     let connected_mcp_server_count = if include_mcp_servers {
-        external_catalog
-            .mcp_servers
+        external_mcp_servers
             .iter()
             .filter(|server| server.enabled && server.connected)
             .count()
@@ -156,8 +165,7 @@ pub(crate) fn build_tool_catalog_value(
         0
     };
     let enabled_mcp_server_count = if include_mcp_servers {
-        external_catalog
-            .mcp_servers
+        external_mcp_servers
             .iter()
             .filter(|server| server.enabled)
             .count()
@@ -202,7 +210,7 @@ pub(crate) fn build_tool_catalog_value(
         "internal_count": internal_count,
         "schema_warning_count": schema_warning_count,
         "runtime_warning_count": runtime_warning_count,
-        "runtime_dependencies": runtime_health.dependencies_json(context, resources),
+        "runtime_dependencies": runtime_dependencies,
         "external_catalog_status": external_catalog_status,
         "skill_tool_count": skill_tool_count,
         "mcp_server_count": mcp_server_count,
@@ -217,7 +225,7 @@ pub(crate) fn build_tool_catalog_value(
             serde_json::json!([])
         },
         "mcp_servers": if include_external && include_mcp_servers {
-            serde_json::to_value(external_catalog.mcp_servers).unwrap_or_else(|_| serde_json::json!([]))
+            serde_json::to_value(external_mcp_servers).unwrap_or_else(|_| serde_json::json!([]))
         } else {
             serde_json::json!([])
         },
@@ -264,6 +272,13 @@ struct RuntimeHealth {
 struct RuntimeToolStatus {
     status: &'static str,
     warnings: Vec<String>,
+}
+
+#[derive(Clone, Copy)]
+enum ExternalCapabilityDependencySource<'a> {
+    Available(&'a ExternalToolCatalogSnapshot),
+    Unavailable,
+    Disabled,
 }
 
 impl RuntimeHealth {
@@ -397,6 +412,7 @@ impl RuntimeHealth {
         &self,
         context: &ToolExecutionContext,
         resources: &ToolRuntimeResources,
+        external_source: ExternalCapabilityDependencySource<'_>,
     ) -> serde_json::Value {
         let mut dependencies = vec![
             serde_json::json!({
@@ -421,7 +437,7 @@ impl RuntimeHealth {
                 "required_by": ["agent_spawn", "agent_wait"],
             }),
         ];
-        dependencies.extend(external_capability_dependencies(resources));
+        dependencies.extend(external_capability_dependencies(external_source));
 
         if let Some(provider) = &resources.runtime_capability_dependency_provider {
             dependencies.extend(provider(context).into_iter().map(|entry| {
@@ -460,29 +476,48 @@ impl RuntimeHealth {
     }
 }
 
-fn external_capability_dependencies(resources: &ToolRuntimeResources) -> Vec<serde_json::Value> {
-    let Some(provider) = &resources.external_tool_catalog_provider else {
-        return vec![
-            serde_json::json!({
-                "name": "skill_runtime",
-                "status": "unavailable",
-                "required_by": ["skill prompt context", "skill custom tools"],
-                "configured_count": 0,
-                "tool_count": 0,
-            }),
-            serde_json::json!({
-                "name": "mcp_servers",
-                "status": "unavailable",
-                "required_by": ["mcp custom tools", "skill MCP bridge tools"],
-                "configured_count": 0,
-                "enabled_count": 0,
-                "ready_count": 0,
-                "tool_count": 0,
-            }),
-        ];
-    };
+fn external_capability_dependencies(
+    source: ExternalCapabilityDependencySource<'_>,
+) -> Vec<serde_json::Value> {
+    match source {
+        ExternalCapabilityDependencySource::Disabled => {
+            external_capability_dependencies_unloaded("disabled")
+        }
+        ExternalCapabilityDependencySource::Unavailable => {
+            external_capability_dependencies_unloaded("unavailable")
+        }
+        ExternalCapabilityDependencySource::Available(external) => {
+            external_capability_dependencies_from_snapshot(external)
+        }
+    }
+}
 
-    let external = provider();
+fn external_capability_dependencies_unloaded(status: &'static str) -> Vec<serde_json::Value> {
+    vec![
+        serde_json::json!({
+            "name": "skill_runtime",
+            "status": status,
+            "required_by": ["skill prompt context", "skill custom tools"],
+            "configured_count": 0,
+            "tool_count": 0,
+        }),
+        serde_json::json!({
+            "name": "mcp_servers",
+            "status": status,
+            "required_by": ["mcp custom tools", "skill MCP bridge tools"],
+            "configured_count": 0,
+            "enabled_count": 0,
+            "ready_count": 0,
+            "enabled_tool_count": 0,
+            "ready_tool_count": 0,
+            "tool_count": 0,
+        }),
+    ]
+}
+
+fn external_capability_dependencies_from_snapshot(
+    external: &ExternalToolCatalogSnapshot,
+) -> Vec<serde_json::Value> {
     let skill_tool_count = external.skill_tools.len();
     let invalid_skill_tool_count = external
         .skill_tools
@@ -706,6 +741,10 @@ fn schema_warnings(schema: &serde_json::Value) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     #[test]
     fn tool_catalog_reports_builtin_health_from_single_source() {
@@ -986,32 +1025,30 @@ mod tests {
     #[test]
     fn tool_catalog_includes_external_skill_and_mcp_health_when_provider_exists() {
         let resources = ToolRuntimeResources {
-            external_tool_catalog_provider: Some(std::sync::Arc::new(|| {
-                ExternalToolCatalogSnapshot {
-                    skill_tools: vec![crate::ExternalToolCatalogEntry {
-                        source: "skill".to_string(),
-                        skill_id: Some("code-review".to_string()),
-                        binding_id: Some("review-mcp".to_string()),
-                        name: "echo.describe".to_string(),
-                        description: "回显描述".to_string(),
-                        bridge_kind: "Mcp".to_string(),
-                        dispatch_action: "McpToolCall".to_string(),
-                        bridge_target: "loopback-mcp".to_string(),
-                        access_profile_behavior: "restricted_requires_approval".to_string(),
-                        risk_level: "high".to_string(),
-                        approval_requirement: "required".to_string(),
-                        status: "available".to_string(),
-                    }],
-                    mcp_servers: vec![crate::ExternalMcpServerCatalogEntry {
-                        server_id: "loopback-mcp".to_string(),
-                        name: "loopback-mcp".to_string(),
-                        enabled: true,
-                        connected: true,
-                        health: "connected".to_string(),
-                        tool_count: Some(1),
-                        error: None,
-                    }],
-                }
+            external_tool_catalog_provider: Some(Arc::new(|| ExternalToolCatalogSnapshot {
+                skill_tools: vec![crate::ExternalToolCatalogEntry {
+                    source: "skill".to_string(),
+                    skill_id: Some("code-review".to_string()),
+                    binding_id: Some("review-mcp".to_string()),
+                    name: "echo.describe".to_string(),
+                    description: "回显描述".to_string(),
+                    bridge_kind: "Mcp".to_string(),
+                    dispatch_action: "McpToolCall".to_string(),
+                    bridge_target: "loopback-mcp".to_string(),
+                    access_profile_behavior: "restricted_requires_approval".to_string(),
+                    risk_level: "high".to_string(),
+                    approval_requirement: "required".to_string(),
+                    status: "available".to_string(),
+                }],
+                mcp_servers: vec![crate::ExternalMcpServerCatalogEntry {
+                    server_id: "loopback-mcp".to_string(),
+                    name: "loopback-mcp".to_string(),
+                    enabled: true,
+                    connected: true,
+                    health: "connected".to_string(),
+                    tool_count: Some(1),
+                    error: None,
+                }],
             })),
             ..ToolRuntimeResources::default()
         };
@@ -1047,9 +1084,79 @@ mod tests {
     }
 
     #[test]
-    fn tool_catalog_reports_effective_external_mcp_skill_policy_by_access_profile() {
+    fn tool_catalog_does_not_call_external_provider_when_external_disabled() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider_calls = Arc::clone(&calls);
         let resources = ToolRuntimeResources {
-            external_tool_catalog_provider: Some(std::sync::Arc::new(|| {
+            external_tool_catalog_provider: Some(Arc::new(move || {
+                provider_calls.fetch_add(1, Ordering::SeqCst);
+                ExternalToolCatalogSnapshot {
+                    skill_tools: vec![crate::ExternalToolCatalogEntry {
+                        source: "skill".to_string(),
+                        skill_id: Some("slow-skill".to_string()),
+                        binding_id: Some("slow-mcp".to_string()),
+                        name: "slow.describe".to_string(),
+                        description: "不应被加载的外部工具".to_string(),
+                        bridge_kind: "Mcp".to_string(),
+                        dispatch_action: "McpToolCall".to_string(),
+                        bridge_target: "slow-mcp".to_string(),
+                        access_profile_behavior: "restricted_requires_approval".to_string(),
+                        risk_level: "high".to_string(),
+                        approval_requirement: "required".to_string(),
+                        status: "available".to_string(),
+                    }],
+                    mcp_servers: vec![crate::ExternalMcpServerCatalogEntry {
+                        server_id: "slow-mcp".to_string(),
+                        name: "slow-mcp".to_string(),
+                        enabled: true,
+                        connected: true,
+                        health: "connected".to_string(),
+                        tool_count: Some(1),
+                        error: None,
+                    }],
+                }
+            })),
+            ..ToolRuntimeResources::default()
+        };
+
+        let output = execute_tool_catalog(
+            r#"{"includeExternal":false,"includeMcpServers":false}"#,
+            &ToolExecutionContext::default(),
+            &resources,
+        );
+        let payload: serde_json::Value = serde_json::from_str(&output).expect("json output");
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "includeExternal=false must not hydrate external tool providers"
+        );
+        assert_eq!(payload["external_catalog_status"], "disabled");
+        assert_eq!(payload["skill_tool_count"], 0);
+        assert_eq!(payload["mcp_server_count"], 0);
+        let skill_dependency = payload["runtime_dependencies"]
+            .as_array()
+            .expect("runtime dependencies")
+            .iter()
+            .find(|dependency| dependency["name"] == "skill_runtime")
+            .expect("skill runtime dependency should be listed");
+        let mcp_dependency = payload["runtime_dependencies"]
+            .as_array()
+            .expect("runtime dependencies")
+            .iter()
+            .find(|dependency| dependency["name"] == "mcp_servers")
+            .expect("mcp dependency should be listed");
+        assert_eq!(skill_dependency["status"], "disabled");
+        assert_eq!(mcp_dependency["status"], "disabled");
+    }
+
+    #[test]
+    fn tool_catalog_reuses_single_external_snapshot_for_dependencies() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider_calls = Arc::clone(&calls);
+        let resources = ToolRuntimeResources {
+            external_tool_catalog_provider: Some(Arc::new(move || {
+                provider_calls.fetch_add(1, Ordering::SeqCst);
                 ExternalToolCatalogSnapshot {
                     skill_tools: vec![crate::ExternalToolCatalogEntry {
                         source: "skill".to_string(),
@@ -1065,8 +1172,66 @@ mod tests {
                         approval_requirement: "required".to_string(),
                         status: "available".to_string(),
                     }],
-                    mcp_servers: Vec::new(),
+                    mcp_servers: vec![crate::ExternalMcpServerCatalogEntry {
+                        server_id: "loopback-mcp".to_string(),
+                        name: "loopback-mcp".to_string(),
+                        enabled: true,
+                        connected: true,
+                        health: "connected".to_string(),
+                        tool_count: Some(1),
+                        error: None,
+                    }],
                 }
+            })),
+            ..ToolRuntimeResources::default()
+        };
+
+        let output = execute_tool_catalog("{}", &ToolExecutionContext::default(), &resources);
+        let payload: serde_json::Value = serde_json::from_str(&output).expect("json output");
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "external provider should be called once and reused for dependency health"
+        );
+        assert_eq!(payload["external_catalog_status"], "available");
+        assert_eq!(payload["skill_tool_count"], 1);
+        assert_eq!(payload["mcp_server_count"], 1);
+        let skill_dependency = payload["runtime_dependencies"]
+            .as_array()
+            .expect("runtime dependencies")
+            .iter()
+            .find(|dependency| dependency["name"] == "skill_runtime")
+            .expect("skill runtime dependency should be listed");
+        let mcp_dependency = payload["runtime_dependencies"]
+            .as_array()
+            .expect("runtime dependencies")
+            .iter()
+            .find(|dependency| dependency["name"] == "mcp_servers")
+            .expect("mcp dependency should be listed");
+        assert_eq!(skill_dependency["tool_count"], 1);
+        assert_eq!(mcp_dependency["ready_tool_count"], 1);
+    }
+
+    #[test]
+    fn tool_catalog_reports_effective_external_mcp_skill_policy_by_access_profile() {
+        let resources = ToolRuntimeResources {
+            external_tool_catalog_provider: Some(Arc::new(|| ExternalToolCatalogSnapshot {
+                skill_tools: vec![crate::ExternalToolCatalogEntry {
+                    source: "skill".to_string(),
+                    skill_id: Some("code-review".to_string()),
+                    binding_id: Some("review-mcp".to_string()),
+                    name: "echo.describe".to_string(),
+                    description: "回显描述".to_string(),
+                    bridge_kind: "Mcp".to_string(),
+                    dispatch_action: "McpToolCall".to_string(),
+                    bridge_target: "loopback-mcp".to_string(),
+                    access_profile_behavior: "restricted_requires_approval".to_string(),
+                    risk_level: "high".to_string(),
+                    approval_requirement: "required".to_string(),
+                    status: "available".to_string(),
+                }],
+                mcp_servers: Vec::new(),
             })),
             ..ToolRuntimeResources::default()
         };
@@ -1115,19 +1280,17 @@ mod tests {
     #[test]
     fn tool_catalog_treats_disabled_mcp_servers_as_configured_not_active() {
         let resources = ToolRuntimeResources {
-            external_tool_catalog_provider: Some(std::sync::Arc::new(|| {
-                ExternalToolCatalogSnapshot {
-                    skill_tools: Vec::new(),
-                    mcp_servers: vec![crate::ExternalMcpServerCatalogEntry {
-                        server_id: "disabled-mcp".to_string(),
-                        name: "disabled-mcp".to_string(),
-                        enabled: false,
-                        connected: true,
-                        health: "disabled".to_string(),
-                        tool_count: Some(3),
-                        error: Some("mcp_connection_failed".to_string()),
-                    }],
-                }
+            external_tool_catalog_provider: Some(Arc::new(|| ExternalToolCatalogSnapshot {
+                skill_tools: Vec::new(),
+                mcp_servers: vec![crate::ExternalMcpServerCatalogEntry {
+                    server_id: "disabled-mcp".to_string(),
+                    name: "disabled-mcp".to_string(),
+                    enabled: false,
+                    connected: true,
+                    health: "disabled".to_string(),
+                    tool_count: Some(3),
+                    error: Some("mcp_connection_failed".to_string()),
+                }],
             })),
             ..ToolRuntimeResources::default()
         };
@@ -1154,19 +1317,17 @@ mod tests {
     #[test]
     fn tool_catalog_counts_only_connected_mcp_tools_as_ready() {
         let resources = ToolRuntimeResources {
-            external_tool_catalog_provider: Some(std::sync::Arc::new(|| {
-                ExternalToolCatalogSnapshot {
-                    skill_tools: Vec::new(),
-                    mcp_servers: vec![crate::ExternalMcpServerCatalogEntry {
-                        server_id: "disconnected-mcp".to_string(),
-                        name: "disconnected-mcp".to_string(),
-                        enabled: true,
-                        connected: false,
-                        health: "disconnected".to_string(),
-                        tool_count: Some(7),
-                        error: Some("mcp_connection_failed".to_string()),
-                    }],
-                }
+            external_tool_catalog_provider: Some(Arc::new(|| ExternalToolCatalogSnapshot {
+                skill_tools: Vec::new(),
+                mcp_servers: vec![crate::ExternalMcpServerCatalogEntry {
+                    server_id: "disconnected-mcp".to_string(),
+                    name: "disconnected-mcp".to_string(),
+                    enabled: true,
+                    connected: false,
+                    health: "disconnected".to_string(),
+                    tool_count: Some(7),
+                    error: Some("mcp_connection_failed".to_string()),
+                }],
             })),
             ..ToolRuntimeResources::default()
         };
@@ -1193,7 +1354,7 @@ mod tests {
     #[test]
     fn tool_catalog_reports_agent_role_registry_health_when_provider_exists() {
         let resources = ToolRuntimeResources {
-            agent_role_catalog_provider: Some(std::sync::Arc::new(|| {
+            agent_role_catalog_provider: Some(Arc::new(|| {
                 vec![
                     crate::AgentRoleCatalogEntry {
                         role_id: "coordinator".to_string(),

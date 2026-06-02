@@ -1671,6 +1671,11 @@ mod tests {
             serde_json::json!("skill_runtime")
         );
         assert_eq!(
+            capability_dependencies[3]["status"],
+            serde_json::json!("disabled"),
+            "core settings bootstrap should not hydrate external skill runtime diagnostics"
+        );
+        assert_eq!(
             capability_dependencies[3]["toolCount"],
             serde_json::json!(0)
         );
@@ -1681,6 +1686,11 @@ mod tests {
         assert_eq!(
             capability_dependencies[4]["name"],
             serde_json::json!("mcp_servers")
+        );
+        assert_eq!(
+            capability_dependencies[4]["status"],
+            serde_json::json!("disabled"),
+            "core settings bootstrap should not hydrate MCP diagnostics"
         );
         assert_eq!(
             capability_dependencies[4]["readyCount"],
