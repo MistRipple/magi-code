@@ -23,6 +23,7 @@ import {
   resolveAgentBindingContext,
   type AgentBindingContext,
 } from './agent-binding-context';
+import { normalizeToolRuntimeStatus } from '../shared/tool-catalog';
 
 
 const AGENT_BASE_URL_STORAGE_KEY = 'magi-agent-base-url';
@@ -196,7 +197,7 @@ function normalizeBuiltinTools(value: unknown): SettingsBuiltinTool[] {
       inputSensitivePolicy: inputSensitivePolicy === true,
       policySummary: typeof policySummary === 'string' ? policySummary : '',
       runtimeInternal: runtimeInternal === true,
-      runtimeStatus: typeof runtimeStatus === 'string' ? runtimeStatus : 'ready',
+      runtimeStatus: normalizeToolRuntimeStatus(runtimeStatus),
       runtimeWarnings: normalizeWarningMarkers(runtimeWarnings, 'runtime_warning'),
       schemaStatus: typeof schemaStatus === 'string' ? schemaStatus : 'ok',
       schemaWarnings: normalizeWarningMarkers(schemaWarnings, 'schema_warning'),

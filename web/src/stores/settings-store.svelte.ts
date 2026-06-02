@@ -55,6 +55,7 @@ import type { EnabledAgent } from "../stores/messages.svelte";
 import {
   resolveModelListFetchBlockReason,
 } from "../shared/model-governance";
+import { normalizeToolRuntimeStatus } from "../shared/tool-catalog";
 
 export type UrlMode = "standard" | "full";
 export type ReasoningEffort = "low" | "medium" | "high" | "xhigh";
@@ -2481,7 +2482,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
           inputSensitivePolicy: tool?.inputSensitivePolicy === true,
           policySummary: typeof tool.policySummary === "string" ? tool.policySummary : "",
           runtimeInternal: tool?.runtimeInternal === true,
-          runtimeStatus: typeof tool.runtimeStatus === "string" ? tool.runtimeStatus : "ready",
+          runtimeStatus: normalizeToolRuntimeStatus(tool.runtimeStatus),
           runtimeWarnings,
           schemaStatus: typeof tool.schemaStatus === "string" ? tool.schemaStatus : "ok",
           schemaWarnings,
