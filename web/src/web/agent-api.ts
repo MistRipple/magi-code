@@ -737,7 +737,7 @@ export function buildFilePreviewQuery(
       workspaceId: options.workspaceId,
       workspacePath: options.workspacePath,
     },
-    { includeSession: options.includeSession },
+    { includeSession: options.includeSession === true },
   );
 }
 

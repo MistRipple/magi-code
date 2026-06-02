@@ -10,6 +10,8 @@
     "build": "vite build --config vite.web.config.ts",
     "preview": "vite preview",
     "check": "svelte-check --tsconfig ./tsconfig.json",
+    "test": "npm run test:canonical && npm run test:transport && npm run test:agent-api",
+    "test:agent-api": "node scripts/agent-api-golden.mjs",
     "test:canonical": "node scripts/canonical-turn-golden.mjs",
     "test:transport": "node scripts/live-transport-golden.mjs"
   },
