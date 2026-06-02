@@ -140,6 +140,19 @@ impl AccessProfile {
     }
 }
 
+impl std::str::FromStr for AccessProfile {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim() {
+            "read_only" => Ok(Self::ReadOnly),
+            "restricted" => Ok(Self::Restricted),
+            "full_access" => Ok(Self::FullAccess),
+            _ => Err(()),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // TaskPolicy
 // ---------------------------------------------------------------------------

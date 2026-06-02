@@ -24,6 +24,11 @@
   import Icon from './Icon.svelte';
   import { generateId } from '../lib/utils';
   import { i18n } from '../stores/i18n.svelte';
+  import {
+    type AccessProfile,
+    readStoredAccessProfile,
+    writeStoredAccessProfile,
+  } from '../shared/access-profile';
 
   interface SelectedImage {
     id: string;
@@ -38,9 +43,6 @@
     description: string;
   }
 
-  type AccessProfile = 'read_only' | 'restricted' | 'full_access';
-
-  const ACCESS_PROFILE_STORAGE_KEY = 'magi-composer-access-profile';
   const accessProfileOptions: Array<{
     value: AccessProfile;
     labelKey: string;
@@ -503,30 +505,14 @@
     handleComposerInput();
   }
 
-  function normalizeAccessProfile(value: unknown): AccessProfile {
-    return value === 'read_only' || value === 'restricted' || value === 'full_access'
-      ? value
-      : 'restricted';
-  }
-
   function selectAccessProfile(profile: AccessProfile) {
     selectedAccessProfile = profile;
     accessProfilePickerOpen = false;
-    try {
-      window.localStorage.setItem(ACCESS_PROFILE_STORAGE_KEY, profile);
-    } catch {
-      // localStorage 不可用时，本轮内存态仍然生效。
-    }
+    writeStoredAccessProfile(profile);
   }
 
   onMount(() => {
-    try {
-      selectedAccessProfile = normalizeAccessProfile(
-        window.localStorage.getItem(ACCESS_PROFILE_STORAGE_KEY),
-      );
-    } catch {
-      selectedAccessProfile = 'restricted';
-    }
+    selectedAccessProfile = readStoredAccessProfile();
 
     function handleFillComposer(event: Event) {
       const text = (event as CustomEvent<{ text?: string }>).detail?.text;

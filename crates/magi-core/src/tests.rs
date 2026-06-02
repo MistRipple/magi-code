@@ -84,6 +84,23 @@ fn task_status_serialization_roundtrip() {
 }
 
 #[test]
+fn access_profile_parses_wire_values() {
+    assert_eq!(
+        "read_only".parse::<AccessProfile>(),
+        Ok(AccessProfile::ReadOnly)
+    );
+    assert_eq!(
+        "restricted".parse::<AccessProfile>(),
+        Ok(AccessProfile::Restricted)
+    );
+    assert_eq!(
+        "full_access".parse::<AccessProfile>(),
+        Ok(AccessProfile::FullAccess)
+    );
+    assert!("unknown".parse::<AccessProfile>().is_err());
+}
+
+#[test]
 fn task_serialization_roundtrip() {
     let task = Task {
         task_id: TaskId::new("task-1"),

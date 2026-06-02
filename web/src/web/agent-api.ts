@@ -24,6 +24,11 @@ import {
   type AgentBindingContext,
 } from './agent-binding-context';
 import { normalizeToolRuntimeStatus } from '../shared/tool-catalog';
+import {
+  type AccessProfile,
+  normalizeAccessProfile,
+  readStoredAccessProfile,
+} from '../shared/access-profile';
 
 
 const AGENT_BASE_URL_STORAGE_KEY = 'magi-agent-base-url';
@@ -1340,10 +1345,13 @@ export async function deleteAgentTask(taskId: string): Promise<Record<string, un
 }
 
 export async function getAgentSettingsBootstrap(
-  options: { scope?: 'core' | 'full' } = {},
+  options: { scope?: 'core' | 'full'; accessProfile?: AccessProfile | null } = {},
 ): Promise<AgentSettingsBootstrapSnapshot> {
   try {
-    const query = buildBoundQuery(options.scope === 'core' ? { scope: 'core' } : {});
+    const query = buildBoundQuery({
+      ...(options.scope === 'core' ? { scope: 'core' } : {}),
+      accessProfile: normalizeAccessProfile(options.accessProfile ?? readStoredAccessProfile()),
+    });
     const response = await getTransport().request(agentUrl('/api/settings/bootstrap', query));
     const payload = await parseAgentJson<Record<string, unknown>>(response, 'load settings bootstrap');
     return normalizeSettingsBootstrapPayload(payload);
@@ -1355,12 +1363,15 @@ export async function getAgentSettingsBootstrap(
   }
 }
 
-export async function loadAgentToolCatalogDiagnostics(): Promise<AgentToolCatalogDiagnosticsSnapshot> {
+export async function loadAgentToolCatalogDiagnostics(
+  options: { accessProfile?: AccessProfile | null } = {},
+): Promise<AgentToolCatalogDiagnosticsSnapshot> {
   try {
     const query = buildBoundQuery({
       includeExternal: 'true',
       includeMcpServers: 'true',
       includeAgentRoles: 'true',
+      accessProfile: normalizeAccessProfile(options.accessProfile ?? readStoredAccessProfile()),
     });
     const response = await getTransport().request(agentUrl('/api/tools/catalog', query));
     const payload = await parseAgentJson<Record<string, unknown>>(response, 'load tool catalog diagnostics');

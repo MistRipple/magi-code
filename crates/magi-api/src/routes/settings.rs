@@ -4,7 +4,7 @@ use axum::{
     routing::{get, post},
 };
 use magi_bridge_client::HttpModelBridgeProtocol;
-use magi_core::UtcMillis;
+use magi_core::{AccessProfile, UtcMillis};
 use magi_usage_authority::{
     SessionSummary, UsageAuthority, UsageCallRecordInput, UsageModelSnapshot, UsageTotals,
 };
@@ -12,6 +12,7 @@ use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
+use std::str::FromStr;
 
 use super::session_scope;
 use crate::{
@@ -43,6 +44,15 @@ fn parse_optional_query_string(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
+}
+
+fn parse_access_profile_query(query: &HashMap<String, String>) -> AccessProfile {
+    query
+        .get("accessProfile")
+        .or_else(|| query.get("access_profile"))
+        .map(String::as_str)
+        .and_then(|value| AccessProfile::from_str(value).ok())
+        .unwrap_or_default()
 }
 
 #[derive(Debug, Deserialize)]
@@ -642,7 +652,8 @@ async fn settings_bootstrap(
         workspace_id.as_deref(),
         workspace_path.as_deref(),
     )?;
-    let tool_context = scope.tool_context();
+    let mut tool_context = scope.tool_context();
+    tool_context.access_profile = parse_access_profile_query(&query);
     let mut snapshot = state.settings_snapshot_json_with_mcp_hydration_and_tool_context(
         hydrate_mcp_servers,
         &tool_context,
@@ -1480,6 +1491,7 @@ mod tests {
                 ("sessionId".to_string(), session_id.as_str().to_string()),
                 ("workspaceId".to_string(), workspace_id.to_string()),
                 ("workspacePath".to_string(), workspace_path.clone()),
+                ("accessProfile".to_string(), "full_access".to_string()),
             ])),
         )
         .await
@@ -1579,6 +1591,16 @@ mod tests {
             shell_exec["inputSensitivePolicy"],
             serde_json::json!(true),
             "settings bootstrap should distinguish input-sensitive invocation policy"
+        );
+        assert_eq!(
+            shell_exec["effectiveApprovalPolicy"],
+            serde_json::json!("ordinary_approval_skipped"),
+            "settings bootstrap should render tool policy under requested access profile"
+        );
+        assert_eq!(
+            shell_exec["accessProfileBehavior"],
+            serde_json::json!("full_access_skips_ordinary_approval"),
+            "settings bootstrap should keep access profile diagnostics aligned with composer mode"
         );
         assert_eq!(
             shell_exec["runtimeInternal"],

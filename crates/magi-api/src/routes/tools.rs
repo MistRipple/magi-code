@@ -3,7 +3,9 @@ use axum::{
     extract::{Query, State},
     routing::get,
 };
+use magi_core::AccessProfile;
 use serde::Deserialize;
+use std::str::FromStr;
 
 use super::session_scope;
 use crate::{errors::ApiError, state::ApiState};
@@ -31,6 +33,8 @@ struct ToolCatalogQuery {
     workspace_id: Option<String>,
     #[serde(default, alias = "workspace_path")]
     workspace_path: Option<String>,
+    #[serde(default, alias = "access_profile")]
+    access_profile: Option<String>,
 }
 
 async fn get_tool_catalog(
@@ -57,13 +61,19 @@ impl ToolCatalogQuery {
         &self,
         state: &ApiState,
     ) -> Result<magi_tool_runtime::ToolExecutionContext, ApiError> {
-        Ok(session_scope::resolve_optional_session_workspace_scope(
+        let mut context = session_scope::resolve_optional_session_workspace_scope(
             state,
             self.session_id.as_deref(),
             self.workspace_id.as_deref(),
             self.workspace_path.as_deref(),
         )?
-        .tool_context())
+        .tool_context();
+        context.access_profile = self
+            .access_profile
+            .as_deref()
+            .and_then(|value| AccessProfile::from_str(value).ok())
+            .unwrap_or_default();
+        Ok(context)
     }
 }
 
@@ -164,6 +174,32 @@ mod tests {
                 .expect("tools should be an array")
                 .iter()
                 .any(|tool| tool["name"] == "tool_catalog")
+        );
+    }
+
+    #[tokio::test]
+    async fn tools_catalog_route_applies_requested_access_profile() {
+        let app = Router::new()
+            .merge(routes())
+            .with_state(test_state_with_tool_registry());
+
+        let (status, body) = get_json(app, "/tools/catalog?accessProfile=full_access").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["current_access_profile"], "full_access");
+        let shell_exec = body["tools"]
+            .as_array()
+            .expect("tools should be an array")
+            .iter()
+            .find(|tool| tool["name"] == "shell_exec")
+            .expect("shell_exec should be listed");
+        assert_eq!(
+            shell_exec["effective_approval_policy"],
+            "ordinary_approval_skipped"
+        );
+        assert_eq!(
+            shell_exec["access_profile_behavior"],
+            "full_access_skips_ordinary_approval"
         );
     }
 

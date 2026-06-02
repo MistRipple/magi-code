@@ -176,6 +176,52 @@ try {
   }
 
   try {
+    let capturedSettingsBootstrapUrl = '';
+    binding.setAgentBindingContext({
+      workspaceId: 'workspace-query-golden',
+      workspacePath: '/tmp/workspace-query-golden',
+      sessionId: 'session-query-golden',
+    });
+    globalThis.fetch = async (url) => {
+      capturedSettingsBootstrapUrl = String(url);
+      return new Response(JSON.stringify({
+        workspaceId: 'workspace-query-golden',
+        workspacePath: '/tmp/workspace-query-golden',
+        sessionId: 'session-query-golden',
+        workerConfigs: {},
+        orchestratorConfig: {},
+        auxiliaryConfig: {},
+        userRulesConfig: {},
+        skillsConfig: {},
+        safeguardConfig: {},
+        repositories: [],
+        mcpServers: [],
+        builtinTools: [],
+        capabilityDependencies: [],
+        workerStatuses: {},
+        runtimeSettings: { locale: 'zh-CN' },
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    };
+    await agentApi.getAgentSettingsBootstrap({ scope: 'core', accessProfile: 'read_only' });
+    const settingsBootstrapQuery = new URL(capturedSettingsBootstrapUrl).searchParams;
+    assert.equal(settingsBootstrapQuery.get('scope'), 'core');
+    assert.equal(
+      settingsBootstrapQuery.get('accessProfile'),
+      'read_only',
+      'settings bootstrap must request tool diagnostics under the requested access profile',
+    );
+  } finally {
+    if (originalFetch === undefined) {
+      delete globalThis.fetch;
+    } else {
+      globalThis.fetch = originalFetch;
+    }
+  }
+
+  try {
     let capturedToolCatalogUrl = '';
     globalThis.fetch = async (url) => {
       capturedToolCatalogUrl = String(url);
@@ -236,10 +282,16 @@ try {
         headers: { 'content-type': 'application/json' },
       });
     };
-    const diagnostics = await agentApi.loadAgentToolCatalogDiagnostics();
+    const diagnostics = await agentApi.loadAgentToolCatalogDiagnostics({ accessProfile: 'full_access' });
     assert.ok(
       capturedToolCatalogUrl.includes('/api/tools/catalog'),
       'tool catalog diagnostics must call the backend catalog endpoint',
+    );
+    const toolCatalogQuery = new URL(capturedToolCatalogUrl).searchParams;
+    assert.equal(
+      toolCatalogQuery.get('accessProfile'),
+      'full_access',
+      'tool catalog diagnostics must use the requested access profile',
     );
     const shell = diagnostics.builtinTools.find((tool) => tool.name === 'shell_exec');
     assert.ok(shell, 'shell_exec should be normalized from tool catalog response');
