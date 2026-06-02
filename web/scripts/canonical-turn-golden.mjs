@@ -14,9 +14,10 @@ try {
   const bridgeRuntime = await server.ssrLoadModule('/src/shared/bridges/bridge-runtime.ts');
   installGoldenMemoryBridge(bridgeRuntime);
   const messagesStore = await server.ssrLoadModule('/src/stores/messages.svelte.ts');
+  const dataHandlers = await server.ssrLoadModule('/src/lib/data-message-handlers.ts');
   const timelineRenderItems = await server.ssrLoadModule('/src/lib/timeline-render-items.ts');
   const contract = await server.ssrLoadModule('/src/shared/bridges/rust-daemon-contract.ts');
-  runGoldenReplay(reducer, projection, messagesStore, timelineRenderItems, contract);
+  runGoldenReplay(reducer, projection, messagesStore, dataHandlers, timelineRenderItems, contract);
   console.log('canonical turn golden replay passed');
 } finally {
   await server.close();
@@ -48,7 +49,7 @@ function installGoldenMemoryBridge(bridgeRuntime) {
   });
 }
 
-function runGoldenReplay(reducer, projection, messagesStore, timelineRenderItems, contract) {
+function runGoldenReplay(reducer, projection, messagesStore, dataHandlers, timelineRenderItems, contract) {
   const cases = [
     acceptedFirstFrameCase(),
     ordinaryChatCase(),
@@ -88,6 +89,7 @@ function runGoldenReplay(reducer, projection, messagesStore, timelineRenderItems
   assertCrossSessionCanonicalEventIsRejected(reducer, projection);
   assertReplaceCanonicalTurnsFiltersForeignSessions(reducer);
   assertMessagesStoreRejectsForeignSessionProjection(reducer, projection, messagesStore);
+  assertMessagesStoreAdoptsLiveCanonicalEventForEmptySession(dataHandlers, messagesStore);
   assertTerminalLateUpsertIsIgnored(reducer, projection);
   assertTerminalLateTurnStartedIsIgnored(reducer, projection);
   assertFailedAssistantTextUsesPlainMessageShell(reducer, projection);
@@ -637,6 +639,71 @@ function assertMessagesStoreRejectsForeignSessionProjection(reducer, projection,
     projectionSignature(messagesStore.messagesState.canonicalTimelineProjection),
     before,
     'foreign session projection must not overwrite the active messages store projection',
+  );
+  messagesStore.setCurrentSessionId(null);
+}
+
+function assertMessagesStoreAdoptsLiveCanonicalEventForEmptySession(dataHandlers, messagesStore) {
+  messagesStore.messagesState.currentWorkspaceId = 'workspace-golden-live-adopt';
+  messagesStore.messagesState.currentWorkspacePath = '/tmp/workspace-golden-live-adopt';
+  messagesStore.setCurrentSessionId(null);
+  messagesStore.clearAllMessages({
+    persist: false,
+    resetTimelineView: true,
+    resetPanelState: true,
+    skipAntiLiftBack: true,
+  });
+
+  const c = baseCase(
+    'live-empty-session-image-adopt',
+    'session-golden-live-image-adopt',
+    'turn-golden-live-image-adopt',
+    11800,
+  );
+  const imageMetadata = {
+    images: [
+      {
+        name: 'live.png',
+        dataUrl: 'data:image/png;base64,AAA',
+      },
+    ],
+  };
+  const userItem = user(c, 1, '实时图片消息。');
+  userItem.metadata = imageMetadata;
+  const canonicalEvent = event(c, 1, 'turn_started', {
+    turn: turn(c, 'running', [userItem]),
+    item: userItem,
+  });
+
+  dataHandlers.handleUnifiedData({
+    id: 'golden-live-empty-session-canonical-event',
+    category: 'data',
+    type: 'system',
+    source: 'orchestrator',
+    agent: 'orchestrator',
+    lifecycle: 'completed',
+    blocks: [],
+    timestamp: c.turnSeq,
+    updatedAt: c.turnSeq,
+    data: {
+      dataType: 'sessionTurnCanonicalEventUpdated',
+      payload: {
+        sessionId: c.sessionId,
+        canonicalEvent,
+      },
+    },
+  });
+
+  assert.equal(
+    messagesStore.messagesState.currentSessionId,
+    c.sessionId,
+    'empty current session must adopt the live canonical event session',
+  );
+  const userArtifact = findArtifactByTurnItemId(messagesStore.messagesState.canonicalTimelineProjection, 'user-message');
+  assert.deepEqual(
+    userArtifact?.message.images,
+    imageMetadata.images,
+    'live canonical image must enter the message projection without requiring refresh',
   );
   messagesStore.setCurrentSessionId(null);
 }

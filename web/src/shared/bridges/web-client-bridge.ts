@@ -183,7 +183,7 @@ let recoveryAttempt = 0;
 let recoveryTimer: number | null = null;
 let recoveryInFlight: Promise<void> | null = null;
 let sessionSnapshotGeneration = 0;
-let externalSessionSummaryRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+let workspaceSessionSummaryRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 
 function invalidateSessionSnapshotRequests(): void {
   sessionSnapshotGeneration += 1;
@@ -1136,12 +1136,12 @@ function shouldApplyCurrentSessionRustEvent(event: RustEventEnvelope): boolean {
   return true;
 }
 
-function scheduleExternalSessionSummaryRefresh(reason: string): void {
-  if (externalSessionSummaryRefreshTimer) {
+function scheduleWorkspaceSessionSummaryRefresh(reason: string): void {
+  if (workspaceSessionSummaryRefreshTimer) {
     return;
   }
-  externalSessionSummaryRefreshTimer = setTimeout(() => {
-    externalSessionSummaryRefreshTimer = null;
+  workspaceSessionSummaryRefreshTimer = setTimeout(() => {
+    workspaceSessionSummaryRefreshTimer = null;
     void fetchBootstrap({ forceFresh: true }).catch((error) => {
       reportExpectedRecoveryFailure(
         i18n.t('bridge.action.syncMessages'),
@@ -1188,7 +1188,7 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
 
   if (!shouldApplyCurrentSessionRustEvent(event)) {
     if (shouldRefreshWorkspaceSessionSummary(eventType, event)) {
-      scheduleExternalSessionSummaryRefresh(`external_${eventType.replaceAll('.', '_')}`);
+      scheduleWorkspaceSessionSummaryRefresh(`external_${eventType.replaceAll('.', '_')}`);
     }
     return;
   }
@@ -1201,12 +1201,13 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
       || trimBridgeString(event.payload.workspaceId)
       || trimBridgeString(event.workspace_id)
       || currentWorkspaceId;
+    const acceptedCreatedSession = event.payload.created_session ?? event.payload.createdSession ?? false;
     if (acceptedSessionId && (!currentSessionId || currentSessionId === acceptedSessionId)) {
       persistWorkspaceBinding(acceptedWorkspaceId, currentWorkspacePath, acceptedSessionId);
       emitDataMessage('sessionTurnAccepted', {
         sessionId: acceptedSessionId,
         workspaceId: acceptedWorkspaceId,
-        createdSession: event.payload.created_session ?? event.payload.createdSession ?? false,
+        createdSession: acceptedCreatedSession,
         route: event.payload.route ?? (eventType === 'session.turn.task.accepted' ? 'task' : ''),
       });
     }
@@ -1221,6 +1222,9 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
     });
     if (canonicalEvent) {
       emitSessionTurnCanonicalEvent(canonicalEvent);
+    }
+    if (acceptedCreatedSession === true) {
+      scheduleWorkspaceSessionSummaryRefresh('created_session_accepted');
     }
   }
 
