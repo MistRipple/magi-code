@@ -175,6 +175,7 @@ let bridgeRecovering = false;
 let bootstrapInFlight: Promise<void> | null = null;
 let bootstrapInFlightBindingKey = '';
 let bootstrapRequestSeq = 0;
+let activeSessionSwitchBindingKey = '';
 let settingsBootstrapInFlight: Promise<void> | null = null;
 let settingsBootstrapInFlightBindingKey = '';
 let settingsBootstrapRequestSeq = 0;
@@ -186,6 +187,12 @@ let externalSessionSummaryRefreshTimer: ReturnType<typeof setTimeout> | null = n
 
 function invalidateSessionSnapshotRequests(): void {
   sessionSnapshotGeneration += 1;
+}
+
+function invalidateBootstrapRequests(): void {
+  bootstrapRequestSeq += 1;
+  bootstrapInFlight = null;
+  bootstrapInFlightBindingKey = '';
 }
 
 function clearActiveTurnInFlight(): void {
@@ -1579,6 +1586,9 @@ function isStaleSessionBindingError(
 }
 
 function isCurrentBootstrapRequest(bindingKey: string, requestSeq: number): boolean {
+  if (activeSessionSwitchBindingKey && bindingKey !== activeSessionSwitchBindingKey) {
+    return false;
+  }
   return requestSeq === bootstrapRequestSeq
     && bindingKey === bootstrapBindingKey(resolveWorkspaceQuery());
 }
@@ -2347,6 +2357,13 @@ async function switchSession(
   const targetWorkspacePath = typeof options.workspacePath === 'string' && options.workspacePath.trim()
     ? options.workspacePath.trim()
     : currentWorkspacePath;
+  const switchBindingKey = bootstrapBindingKey({
+    workspaceId: targetWorkspaceId,
+    workspacePath: targetWorkspacePath,
+    sessionId,
+  });
+  activeSessionSwitchBindingKey = switchBindingKey;
+  invalidateBootstrapRequests();
   messagesState.sessionHydrating = true;
   try {
     const response = await getTransport().request(agentUrl('/api/session/switch'), {
@@ -2367,6 +2384,9 @@ async function switchSession(
       workspacePath: targetWorkspacePath,
     });
   } finally {
+    if (activeSessionSwitchBindingKey === switchBindingKey) {
+      activeSessionSwitchBindingKey = '';
+    }
     messagesState.sessionHydrating = false;
   }
 }

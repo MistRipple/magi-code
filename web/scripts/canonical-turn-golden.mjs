@@ -3,7 +3,7 @@ import { createServer } from 'vite';
 
 const server = await createServer({
   root: process.cwd(),
-  configFile: false,
+  configFile: 'vite.web.config.ts',
   logLevel: 'silent',
   server: { middlewareMode: true },
 });
@@ -11,15 +11,44 @@ const server = await createServer({
 try {
   const reducer = await server.ssrLoadModule('/src/stores/turn-reducer.ts');
   const projection = await server.ssrLoadModule('/src/stores/turn-projection.ts');
+  const bridgeRuntime = await server.ssrLoadModule('/src/shared/bridges/bridge-runtime.ts');
+  installGoldenMemoryBridge(bridgeRuntime);
+  const messagesStore = await server.ssrLoadModule('/src/stores/messages.svelte.ts');
   const timelineRenderItems = await server.ssrLoadModule('/src/lib/timeline-render-items.ts');
   const contract = await server.ssrLoadModule('/src/shared/bridges/rust-daemon-contract.ts');
-  runGoldenReplay(reducer, projection, timelineRenderItems, contract);
+  runGoldenReplay(reducer, projection, messagesStore, timelineRenderItems, contract);
   console.log('canonical turn golden replay passed');
 } finally {
   await server.close();
 }
 
-function runGoldenReplay(reducer, projection, timelineRenderItems, contract) {
+function installGoldenMemoryBridge(bridgeRuntime) {
+  let bridgeState;
+  const listeners = new Set();
+  bridgeRuntime.setClientBridge({
+    kind: 'web',
+    postMessage() {},
+    onMessage(listener) {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
+    getState() {
+      return bridgeState;
+    },
+    setState(nextState) {
+      bridgeState = nextState;
+    },
+    getInitialSessionId() {
+      return '';
+    },
+    getInitialLocale() {
+      return 'zh-CN';
+    },
+    notifyReady() {},
+  });
+}
+
+function runGoldenReplay(reducer, projection, messagesStore, timelineRenderItems, contract) {
   const cases = [
     acceptedFirstFrameCase(),
     ordinaryChatCase(),
@@ -58,6 +87,7 @@ function runGoldenReplay(reducer, projection, timelineRenderItems, contract) {
   assertLocalPendingImageSurvivesRegularAcceptedTurn(reducer, projection);
   assertCrossSessionCanonicalEventIsRejected(reducer, projection);
   assertReplaceCanonicalTurnsFiltersForeignSessions(reducer);
+  assertMessagesStoreRejectsForeignSessionProjection(reducer, projection, messagesStore);
   assertTerminalLateUpsertIsIgnored(reducer, projection);
   assertTerminalLateTurnStartedIsIgnored(reducer, projection);
   assertFailedAssistantTextUsesPlainMessageShell(reducer, projection);
@@ -552,6 +582,61 @@ function assertReplaceCanonicalTurnsFiltersForeignSessions(reducer) {
     [active.sessionId],
     'bootstrap canonical turn replacement must keep only the requested session turns',
   );
+}
+
+function assertMessagesStoreRejectsForeignSessionProjection(reducer, projection, messagesStore) {
+  const active = baseCase(
+    'active-store-projection-scope',
+    'session-golden-store-active',
+    'turn-golden-store-active',
+    11600,
+  );
+  const foreign = baseCase(
+    'foreign-store-projection-scope',
+    'session-golden-store-foreign',
+    'turn-golden-store-foreign',
+    11700,
+  );
+  const activeProjection = projection.buildCanonicalTimelineProjection(reducer.replaceCanonicalTurns(active.sessionId, [
+    turn(active, 'completed', [
+      user(active, 1, '当前 store 会话内容。'),
+      assistantText(active, 2, 'assistant-store-active', '当前会话完成。', 'completed'),
+    ], { completedAt: 11650, responseDurationMs: 50 }),
+  ]));
+  const foreignProjection = projection.buildCanonicalTimelineProjection(reducer.replaceCanonicalTurns(foreign.sessionId, [
+    turn(foreign, 'completed', [
+      user(foreign, 1, '其他 store 会话内容。'),
+      assistantText(foreign, 2, 'assistant-store-foreign', '其他会话完成。', 'completed'),
+    ], { completedAt: 11750, responseDurationMs: 50 }),
+  ]));
+  assert.ok(activeProjection, 'active store projection should exist');
+  assert.ok(foreignProjection, 'foreign store projection should exist');
+
+  messagesStore.setCurrentSessionId(active.sessionId);
+  assert.equal(
+    messagesStore.setCanonicalTimelineProjection(activeProjection),
+    true,
+    'active session projection should be accepted by messages store',
+  );
+  const before = projectionSignature(messagesStore.messagesState.canonicalTimelineProjection);
+
+  const originalWarn = console.warn;
+  try {
+    console.warn = () => {};
+    assert.equal(
+      messagesStore.setCanonicalTimelineProjection(foreignProjection),
+      false,
+      'foreign session projection must be rejected by messages store',
+    );
+  } finally {
+    console.warn = originalWarn;
+  }
+  assert.deepEqual(
+    projectionSignature(messagesStore.messagesState.canonicalTimelineProjection),
+    before,
+    'foreign session projection must not overwrite the active messages store projection',
+  );
+  messagesStore.setCurrentSessionId(null);
 }
 
 function assertFailedAssistantTextUsesPlainMessageShell(reducer, projection) {

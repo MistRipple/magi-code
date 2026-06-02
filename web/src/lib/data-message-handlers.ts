@@ -893,10 +893,11 @@ function handleSessionTurnCanonicalEventUpdated(message: ClientBridgeMessage) {
   if (!sessionId || !canonicalEvent || canonicalEvent.sessionId !== sessionId) {
     return;
   }
-  adoptCurrentSessionIdForLiveTurn(sessionId);
+  if (!adoptCurrentSessionIdForLiveTurn(sessionId)) {
+    return;
+  }
   const projection = applyCanonicalTurnEvent(canonicalEvent);
-  if (projection) {
-    setCanonicalTimelineProjection(projection);
+  if (projection && setCanonicalTimelineProjection(projection)) {
     if (canonicalEvent.turn) {
       const processingState = deriveProcessingStateFromCanonicalTurns([canonicalEvent.turn], sessionId);
       applyAuthoritativeProcessingState(processingState);
@@ -917,8 +918,7 @@ function applyCanonicalTurnsSnapshot(sessionId: string, turns: unknown): boolean
   if (!projection) {
     return false;
   }
-  setCanonicalTimelineProjection(projection);
-  return true;
+  return setCanonicalTimelineProjection(projection);
 }
 
 function clearStaleSettingsBootstrapSnapshot(): void {

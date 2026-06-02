@@ -2206,8 +2206,17 @@ export function setSessionHistoryState(
   };
 }
 
-export function setCanonicalTimelineProjection(projection: SessionTimelineProjection) {
+export function setCanonicalTimelineProjection(projection: SessionTimelineProjection): boolean {
   const canonicalProjection = canonicalizeTimelineProjection(projection);
+  const projectionSessionId = normalizeSessionId(canonicalProjection.sessionId);
+  const currentSessionId = normalizeSessionId(messagesState.currentSessionId);
+  if (!projectionSessionId || !currentSessionId || projectionSessionId !== currentSessionId) {
+    console.warn('[messages-store] 忽略非当前会话的 canonical timeline projection', {
+      projectionSessionId,
+      currentSessionId,
+    });
+    return false;
+  }
   localTimelineTurnOrderSeqCounter = Math.max(
     localTimelineTurnOrderSeqCounter,
     maxTimelineTurnOrderSeqFromArtifacts(canonicalProjection.artifacts),
@@ -2215,6 +2224,7 @@ export function setCanonicalTimelineProjection(projection: SessionTimelineProjec
   messagesState.canonicalTimelineProjection = canonicalProjection;
   upsertSessionViewStateSnapshot(createSessionViewStateSnapshot(canonicalProjection.sessionId));
   saveWebviewState();
+  return true;
 }
 
 
