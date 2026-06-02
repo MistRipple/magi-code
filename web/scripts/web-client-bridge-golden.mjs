@@ -65,7 +65,7 @@ function installBrowserGlobals() {
   const target = new EventTarget();
   const storage = new MemoryStorage();
   const activeTimeouts = new Set();
-  const activeIntervals = new Set();
+  const activeIntervals = new Map();
   const trackedSetTimeout = (handler, timeout, ...args) => {
     const timeoutId = setTimeout(() => {
       activeTimeouts.delete(timeoutId);
@@ -80,7 +80,7 @@ function installBrowserGlobals() {
   };
   const trackedSetInterval = (handler, timeout, ...args) => {
     const interval = setInterval(handler, timeout, ...args);
-    activeIntervals.add(interval);
+    activeIntervals.set(interval, { handler, args });
     return interval;
   };
   const trackedClearInterval = (interval) => {
@@ -107,8 +107,13 @@ function installBrowserGlobals() {
       for (const timeoutId of Array.from(activeTimeouts)) {
         trackedClearTimeout(timeoutId);
       }
-      for (const interval of Array.from(activeIntervals)) {
+      for (const interval of Array.from(activeIntervals.keys())) {
         trackedClearInterval(interval);
+      }
+    },
+    __runGoldenIntervals() {
+      for (const { handler, args } of Array.from(activeIntervals.values())) {
+        handler(...args);
       }
     },
     addEventListener: target.addEventListener.bind(target),
@@ -557,6 +562,20 @@ try {
   assert.ok(
     window.location.href.includes(`sessionId=${encodeURIComponent(SESSION_ID)}`),
     'live accepted session must update the browser binding',
+  );
+  const streamCountBeforeActiveIdleCheck = FakeEventSource.instances.length;
+  const originalDateNowForActiveIdleCheck = Date.now;
+  try {
+    Date.now = () => originalDateNowForActiveIdleCheck() + 12_000;
+    window.__runGoldenIntervals();
+    await new Promise((resolve) => setTimeout(resolve, 30));
+  } finally {
+    Date.now = originalDateNowForActiveIdleCheck;
+  }
+  assert.equal(
+    FakeEventSource.instances.length,
+    streamCountBeforeActiveIdleCheck,
+    'active turn must not rebuild SSE after only two missed keep-alives on tunnel/mobile links',
   );
   await waitFor(
     () => messagesStore.messagesState.sessions.some((session) => session.id === SESSION_ID),
