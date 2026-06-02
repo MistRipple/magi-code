@@ -63,6 +63,43 @@ try {
     'explicit empty file preview session should keep workspace-only scope',
   );
 
+  const originalFetch = globalThis.fetch;
+  try {
+    let capturedKnowledgeUrl = '';
+    globalThis.fetch = async (url) => {
+      capturedKnowledgeUrl = String(url);
+      return new Response(JSON.stringify({
+        workspaceId: 'workspace-knowledge-override',
+        workspacePath: '/tmp/workspace-knowledge-override',
+        items: [],
+        codeIndex: null,
+        codeIndexStatus: { status: 'empty', reasonCode: 'no_indexable_files' },
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    };
+    await agentApi.getAgentProjectKnowledge({
+      workspaceId: 'workspace-knowledge-override',
+      workspacePath: '/tmp/workspace-knowledge-override',
+      sessionId: 'session-must-not-leak',
+    });
+    const capturedQuery = new URL(capturedKnowledgeUrl).searchParams;
+    assert.equal(capturedQuery.get('workspaceId'), 'workspace-knowledge-override');
+    assert.equal(capturedQuery.get('workspacePath'), '/tmp/workspace-knowledge-override');
+    assert.equal(
+      capturedQuery.has('sessionId'),
+      false,
+      'project knowledge must stay workspace-scoped even when an explicit session is present',
+    );
+  } finally {
+    if (originalFetch === undefined) {
+      delete globalThis.fetch;
+    } else {
+      globalThis.fetch = originalFetch;
+    }
+  }
+
   const originalWindow = globalThis.window;
   try {
     globalThis.window = {

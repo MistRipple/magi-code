@@ -350,7 +350,7 @@
           if (kind === 'learning') {
             patch.context = context;
           }
-          await updateAgentKnowledgeItem(editorId, patch);
+          await updateAgentKnowledgeItem(editorId, patch, knowledgeWorkspaceScope(request));
         } else {
           await addAgentKnowledgeItem({
             kind,
@@ -358,13 +358,14 @@
             content,
             tags,
             context: kind === 'learning' ? context : undefined,
-          });
+          }, knowledgeWorkspaceScope(request));
         }
       } else {
         if (editorId) {
           const updatePayload: { type: string; [key: string]: unknown } = {
             type: 'updateKnowledgeItem',
             knowledgeId: editorId,
+            ...knowledgeWorkspaceScope(request),
             content,
             tags,
           };
@@ -374,6 +375,7 @@
         } else {
           const addPayload: { type: string; [key: string]: unknown } = {
             type: 'addKnowledgeItem',
+            ...knowledgeWorkspaceScope(request),
             kind,
             content,
             tags,
@@ -509,6 +511,8 @@
   interface KnowledgeWorkspaceRequest {
     workspaceKey: string;
     workspaceGeneration: number;
+    workspaceId: string;
+    workspacePath: string;
   }
 
   interface KnowledgeLoadRequest extends KnowledgeWorkspaceRequest {
@@ -516,9 +520,20 @@
   }
 
   function currentKnowledgeWorkspaceRequest(): KnowledgeWorkspaceRequest {
+    const workspaceId = typeof appState.currentWorkspaceId === 'string' ? appState.currentWorkspaceId.trim() : '';
+    const workspacePath = typeof appState.currentWorkspacePath === 'string' ? appState.currentWorkspacePath.trim() : '';
     return {
-      workspaceKey: currentWorkspaceKey,
+      workspaceKey: `${workspaceId}::${workspacePath}`,
       workspaceGeneration: knowledgeWorkspaceGeneration,
+      workspaceId,
+      workspacePath,
+    };
+  }
+
+  function knowledgeWorkspaceScope(request: KnowledgeWorkspaceRequest): { workspaceId: string; workspacePath: string } {
+    return {
+      workspaceId: request.workspaceId,
+      workspacePath: request.workspacePath,
     };
   }
 
@@ -572,7 +587,7 @@
   }
 
   async function fetchKnowledgeViaApi(request: KnowledgeLoadRequest) {
-    const res = await getAgentProjectKnowledge();
+    const res = await getAgentProjectKnowledge(knowledgeWorkspaceScope(request));
     if (!isCurrentKnowledgeLoadRequest(request)) {
       return;
     }
@@ -592,7 +607,7 @@
       fetchKnowledgeViaApi(request)
         .catch((error) => handleKnowledgeLoadError(error, request));
     } else {
-      vscode.postMessage({ type: 'getProjectKnowledge' });
+      vscode.postMessage({ type: 'getProjectKnowledge', ...knowledgeWorkspaceScope(request) });
     }
   }
 
@@ -630,7 +645,7 @@
   function deleteKnowledgeEntry(id: string) {
     const request = currentKnowledgeWorkspaceRequest();
     if (isWebMode) {
-      deleteAgentKnowledgeItem(id)
+      deleteAgentKnowledgeItem(id, knowledgeWorkspaceScope(request))
         .then(() => {
           if (isCurrentKnowledgeWorkspaceRequest(request)) {
             refresh();
@@ -638,7 +653,7 @@
         })
         .catch((error) => handleKnowledgeMutationError(error, 'knowledge.toast.deleteFailed', request));
     } else {
-      vscode.postMessage({ type: 'deleteKnowledgeItem', knowledgeId: id });
+      vscode.postMessage({ type: 'deleteKnowledgeItem', knowledgeId: id, ...knowledgeWorkspaceScope(request) });
     }
   }
 
@@ -655,7 +670,7 @@
     showClearConfirm = false;
     isLoading = true;
     if (isWebMode) {
-      clearAgentProjectKnowledge()
+      clearAgentProjectKnowledge(knowledgeWorkspaceScope(request))
         .then(() => {
           if (isCurrentKnowledgeWorkspaceRequest(request)) {
             refresh();
@@ -663,7 +678,7 @@
         })
         .catch((error) => handleKnowledgeMutationError(error, 'knowledge.toast.clearFailed', request));
     } else {
-      vscode.postMessage({ type: 'clearProjectKnowledge' });
+      vscode.postMessage({ type: 'clearProjectKnowledge', ...knowledgeWorkspaceScope(request) });
     }
   }
 

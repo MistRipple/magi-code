@@ -39,6 +39,7 @@ import {
   getAgentExecutionStats,
   getAgentChangeDiff,
   getAgentFilePreview,
+  getAgentProjectKnowledge,
   getAgentSessionNotifications,
   continueAgentSession,
   interruptAgentSession,
@@ -2239,21 +2240,14 @@ async function dispatchRegistryAgents(): Promise<void> {
   }
 }
 
-async function dispatchProjectKnowledge(): Promise<void> {
-  const query = new URLSearchParams();
-  const requestWorkspaceId = currentWorkspaceId;
-  const requestWorkspacePath = currentWorkspacePath;
-  if (requestWorkspaceId) {
-    query.set('workspaceId', requestWorkspaceId);
-  }
-  if (requestWorkspacePath) {
-    query.set('workspacePath', requestWorkspacePath);
-  }
-  const response = await getTransport().request(agentUrl('/api/knowledge', query.toString()));
-  if (!response.ok) {
-    throw new Error(`project knowledge failed: ${response.status}`);
-  }
-  const payload = await response.json() as Record<string, unknown>;
+async function dispatchProjectKnowledge(scope: BridgeRequestScope = {}): Promise<void> {
+  const requestWorkspaceId = scope.workspaceId?.trim() || currentWorkspaceId;
+  const requestWorkspacePath = scope.workspacePath?.trim() || currentWorkspacePath;
+  const payload = await getAgentProjectKnowledge({
+    workspaceId: requestWorkspaceId,
+    workspacePath: requestWorkspacePath,
+    sessionId: '',
+  });
   const responseWorkspaceId = typeof payload.workspaceId === 'string' && payload.workspaceId.trim()
     ? payload.workspaceId.trim()
     : requestWorkspaceId;
@@ -2267,8 +2261,8 @@ async function dispatchProjectKnowledge(): Promise<void> {
   });
 }
 
-async function emitKnowledgePayload(): Promise<void> {
-  await dispatchProjectKnowledge();
+async function emitKnowledgePayload(scope: BridgeRequestScope = {}): Promise<void> {
+  await dispatchProjectKnowledge(scope);
 }
 
 async function dispatchSessionSnapshot(
@@ -3540,9 +3534,9 @@ async function updateAllSkills(): Promise<void> {
   );
 }
 
-async function clearProjectKnowledge(): Promise<void> {
-  await clearAgentProjectKnowledge();
-  await emitKnowledgePayload();
+async function clearProjectKnowledge(scope: BridgeRequestScope = {}): Promise<void> {
+  await clearAgentProjectKnowledge(scope);
+  await emitKnowledgePayload(scope);
   emitBridgeSuccessToast(
     i18n.t('settings.toast.action.clearProjectKnowledge'),
     i18n.t('settings.toast.projectKnowledgeCleared'),
@@ -4154,7 +4148,7 @@ export function createWebClientBridge(): ClientBridge {
           }
           return;
         case 'getProjectKnowledge':
-          void dispatchProjectKnowledge().catch((error) => {
+          void dispatchProjectKnowledge(requestScopeFromMessage(message, '')).catch((error) => {
             logKnowledgeOperationFailure(
               i18n.t('settings.toast.action.loadProjectKnowledge'),
               '[web-client-bridge] 项目知识加载失败:',
@@ -4164,7 +4158,7 @@ export function createWebClientBridge(): ClientBridge {
           });
           return;
         case 'clearProjectKnowledge':
-          void clearProjectKnowledge().catch((error) => {
+          void clearProjectKnowledge(requestScopeFromMessage(message, '')).catch((error) => {
             logKnowledgeOperationFailure(
               i18n.t('settings.toast.action.clearProjectKnowledge'),
               '[web-client-bridge] 清空项目知识失败:',
@@ -4177,6 +4171,7 @@ export function createWebClientBridge(): ClientBridge {
           const kind = typeof message.kind === 'string' ? message.kind : '';
           const content = typeof message.content === 'string' ? message.content : '';
           if ((kind === 'adr' || kind === 'faq' || kind === 'learning') && content) {
+            const scope = requestScopeFromMessage(message, '');
             const payload: AgentKnowledgeItemPayload = {
               kind,
               content,
@@ -4184,8 +4179,8 @@ export function createWebClientBridge(): ClientBridge {
               tags: Array.isArray(message.tags) ? (message.tags as string[]) : [],
               context: typeof message.context === 'string' ? message.context : undefined,
             };
-            void addAgentKnowledgeItem(payload).then(async () => {
-              await emitKnowledgePayload();
+            void addAgentKnowledgeItem(payload, scope).then(async () => {
+              await emitKnowledgePayload(scope);
               emitBridgeSuccessToast(i18n.t('bridge.action.addKnowledgeItem'), i18n.t('bridge.detail.knowledgeItemAdded'));
             }).catch((error) => {
               logKnowledgeOperationFailure(i18n.t('bridge.action.addKnowledgeItem'), '[web-client-bridge] 添加知识条目失败:', error, knowledgeAddFailureKey(kind));
@@ -4196,14 +4191,15 @@ export function createWebClientBridge(): ClientBridge {
         case 'updateKnowledgeItem': {
           const knowledgeId = typeof message.knowledgeId === 'string' ? message.knowledgeId.trim() : '';
           if (knowledgeId) {
+            const scope = requestScopeFromMessage(message, '');
             const patch: AgentKnowledgeItemPatch = {
               title: typeof message.title === 'string' ? message.title : undefined,
               content: typeof message.content === 'string' ? message.content : undefined,
               tags: Array.isArray(message.tags) ? (message.tags as string[]) : undefined,
               context: typeof message.context === 'string' ? message.context : undefined,
             };
-            void updateAgentKnowledgeItem(knowledgeId, patch).then(async () => {
-              await emitKnowledgePayload();
+            void updateAgentKnowledgeItem(knowledgeId, patch, scope).then(async () => {
+              await emitKnowledgePayload(scope);
               emitBridgeSuccessToast(i18n.t('bridge.action.updateKnowledgeItem'), i18n.t('bridge.detail.knowledgeItemUpdated'));
             }).catch((error) => {
               logKnowledgeOperationFailure(i18n.t('bridge.action.updateKnowledgeItem'), '[web-client-bridge] 更新知识条目失败:', error, 'knowledge.form.saveFailed');
@@ -4214,8 +4210,9 @@ export function createWebClientBridge(): ClientBridge {
         case 'deleteKnowledgeItem': {
           const knowledgeId = typeof message.knowledgeId === 'string' ? message.knowledgeId.trim() : '';
           if (knowledgeId) {
-            void deleteAgentKnowledgeItem(knowledgeId).then(async () => {
-              await emitKnowledgePayload();
+            const scope = requestScopeFromMessage(message, '');
+            void deleteAgentKnowledgeItem(knowledgeId, scope).then(async () => {
+              await emitKnowledgePayload(scope);
               emitBridgeSuccessToast(i18n.t('bridge.action.deleteKnowledgeItem'), i18n.t('bridge.detail.knowledgeItemDeleted'));
             }).catch((error) => {
               logKnowledgeOperationFailure(i18n.t('bridge.action.deleteKnowledgeItem'), '[web-client-bridge] 删除知识条目失败:', error, 'knowledge.toast.deleteFailed');

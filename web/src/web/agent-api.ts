@@ -1062,8 +1062,9 @@ async function postWorkspaceBoundJson<T>(
   pathname: string,
   payload: Record<string, unknown>,
   action: string,
+  bindingOverride?: Partial<AgentBindingContext>,
 ): Promise<T> {
-  return await postBoundJson<T>(pathname, payload, action, { sessionId: '' });
+  return await postBoundJson<T>(pathname, payload, action, { ...bindingOverride, sessionId: '' });
 }
 
 export async function deleteAgentSession(
@@ -1494,12 +1495,22 @@ export async function fetchAgentModelList(config: Record<string, unknown>, targe
   return await postWorkspaceBoundJson<FetchModelsResponseDto>('/api/settings/models/fetch', { config, target }, 'fetch model list');
 }
 
-export async function clearAgentProjectKnowledge(): Promise<AgentKnowledgeMutationPayload> {
-  return await postWorkspaceBoundJson<AgentKnowledgeMutationPayload>('/api/knowledge/clear', {}, 'clear project knowledge');
+export async function clearAgentProjectKnowledge(
+  bindingOverride?: Partial<AgentBindingContext>,
+): Promise<AgentKnowledgeMutationPayload> {
+  return await postWorkspaceBoundJson<AgentKnowledgeMutationPayload>(
+    '/api/knowledge/clear',
+    {},
+    'clear project knowledge',
+    bindingOverride,
+  );
 }
 
-export async function getAgentProjectKnowledge(): Promise<Record<string, unknown>> {
-  const response = await getTransport().request(agentUrl('/api/knowledge', buildWorkspaceBoundQuery({})));
+export async function getAgentProjectKnowledge(
+  bindingOverride?: Partial<AgentBindingContext>,
+): Promise<Record<string, unknown>> {
+  const query = buildBoundQueryWithOverride({}, bindingOverride, { includeSession: false });
+  const response = await getTransport().request(agentUrl('/api/knowledge', query));
   return await parseAgentJson<Record<string, unknown>>(response, 'load project knowledge');
 }
 
@@ -1520,41 +1531,63 @@ export interface AgentKnowledgeItemPatch {
   context?: string;
 }
 
-export async function listAgentKnowledgeItems(kind?: AgentKnowledgeKind): Promise<Record<string, unknown>> {
+export async function listAgentKnowledgeItems(
+  kind?: AgentKnowledgeKind,
+  bindingOverride?: Partial<AgentBindingContext>,
+): Promise<Record<string, unknown>> {
   const params: Record<string, string> = {};
   if (kind) params.kind = kind;
-  const response = await getTransport().request(agentUrl('/api/knowledge/items', buildWorkspaceBoundQuery(params)));
+  const query = buildBoundQueryWithOverride(params, bindingOverride, { includeSession: false });
+  const response = await getTransport().request(agentUrl('/api/knowledge/items', query));
   return await parseAgentJson<Record<string, unknown>>(response, 'list knowledge items');
 }
 
-export async function searchAgentKnowledgeItems(keyword: string, kind?: AgentKnowledgeKind): Promise<Record<string, unknown>> {
+export async function searchAgentKnowledgeItems(
+  keyword: string,
+  kind?: AgentKnowledgeKind,
+  bindingOverride?: Partial<AgentBindingContext>,
+): Promise<Record<string, unknown>> {
   const params: Record<string, string> = { q: keyword };
   if (kind) params.kind = kind;
-  const response = await getTransport().request(agentUrl('/api/knowledge/items/search', buildWorkspaceBoundQuery(params)));
+  const query = buildBoundQueryWithOverride(params, bindingOverride, { includeSession: false });
+  const response = await getTransport().request(agentUrl('/api/knowledge/items/search', query));
   return await parseAgentJson<Record<string, unknown>>(response, 'search knowledge items');
 }
 
-export async function addAgentKnowledgeItem(payload: AgentKnowledgeItemPayload): Promise<AgentKnowledgeMutationPayload> {
+export async function addAgentKnowledgeItem(
+  payload: AgentKnowledgeItemPayload,
+  bindingOverride?: Partial<AgentBindingContext>,
+): Promise<AgentKnowledgeMutationPayload> {
   return await postWorkspaceBoundJson<AgentKnowledgeMutationPayload>(
     '/api/knowledge/items',
     { ...payload },
     'add knowledge item',
+    bindingOverride,
   );
 }
 
-export async function updateAgentKnowledgeItem(knowledgeId: string, patch: AgentKnowledgeItemPatch): Promise<AgentKnowledgeMutationPayload> {
+export async function updateAgentKnowledgeItem(
+  knowledgeId: string,
+  patch: AgentKnowledgeItemPatch,
+  bindingOverride?: Partial<AgentBindingContext>,
+): Promise<AgentKnowledgeMutationPayload> {
   return await postWorkspaceBoundJson<AgentKnowledgeMutationPayload>(
     '/api/knowledge/items/update',
     { knowledgeId, ...patch },
     'update knowledge item',
+    bindingOverride,
   );
 }
 
-export async function deleteAgentKnowledgeItem(knowledgeId: string): Promise<AgentKnowledgeMutationPayload> {
+export async function deleteAgentKnowledgeItem(
+  knowledgeId: string,
+  bindingOverride?: Partial<AgentBindingContext>,
+): Promise<AgentKnowledgeMutationPayload> {
   return await postWorkspaceBoundJson<AgentKnowledgeMutationPayload>(
     '/api/knowledge/items/delete',
     { knowledgeId },
     'delete knowledge item',
+    bindingOverride,
   );
 }
 
