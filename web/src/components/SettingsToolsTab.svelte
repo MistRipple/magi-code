@@ -219,11 +219,14 @@
   }
 
   function getMCPServerSubtitle(server: any): string {
-    if (typeof server?.toolCount === 'number' && Number.isFinite(server.toolCount) && server.toolCount > 0) {
-      return i18n.t('settings.tools.mcpToolCount', { count: server.toolCount });
-    }
     if (server?.enabled === false) {
       return i18n.t('settings.tools.disabledLabel');
+    }
+    if (server?.health !== 'connected') {
+      return getMCPHealthLabel(server);
+    }
+    if (typeof server?.toolCount === 'number' && Number.isFinite(server.toolCount) && server.toolCount > 0) {
+      return i18n.t('settings.tools.mcpToolCount', { count: server.toolCount });
     }
     return getMCPHealthLabel(server);
   }
