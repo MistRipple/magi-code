@@ -177,15 +177,13 @@ fn build_session_turn_messages(
         Vec::new()
     };
     messages.append(&mut history);
-    if !messages.is_empty() {
-        messages.push(ChatMessage {
-            role: "system".to_string(),
-            content: Some(current_turn_context_priority_prompt()),
-            images: Vec::new(),
-            tool_calls: Vec::new(),
-            tool_call_id: None,
-        });
-    }
+    messages.push(ChatMessage {
+        role: "system".to_string(),
+        content: Some(current_turn_context_priority_prompt()),
+        images: Vec::new(),
+        tool_calls: Vec::new(),
+        tool_call_id: None,
+    });
     messages.push(ChatMessage {
         role: "user".to_string(),
         content: Some(prompt.to_string()),
@@ -1656,9 +1654,27 @@ mod tests {
 
         let messages = build_session_turn_messages(&store, &request, &request.prompt);
 
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].role, "user");
-        assert_eq!(messages[0].content.as_deref(), Some("解释一下当前状态"));
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.role.as_str())
+                .collect::<Vec<_>>(),
+            vec!["system", "user"]
+        );
+        assert!(
+            messages[0]
+                .content
+                .as_deref()
+                .is_some_and(|content| content.contains("上下文优先级"))
+        );
+        assert!(
+            !messages[0]
+                .content
+                .as_deref()
+                .unwrap_or_default()
+                .contains("/tmp/current-project")
+        );
+        assert_eq!(messages[1].content.as_deref(), Some("解释一下当前状态"));
     }
 
     #[test]
