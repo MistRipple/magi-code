@@ -3315,11 +3315,23 @@ mod tests {
             serde_json::from_str(&blocked.payload).expect("blocked payload json");
         assert_eq!(blocked_payload["tool"], "shell_exec");
         assert_eq!(blocked_payload["access_mode"], "explicit_write");
+        assert_eq!(blocked_payload["error_code"], "write_conflict");
         assert!(
             blocked_payload["error"]
                 .as_str()
                 .expect("blocked error")
                 .contains("并发写冲突")
+        );
+        assert!(blocked_payload.get("write_scope").is_none());
+        assert!(blocked_payload.get("conflicting_claim").is_none());
+        assert!(!blocked.payload.contains(root.to_string_lossy().as_ref()));
+        assert!(
+            blocked
+                .governance
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains(root.to_string_lossy().as_ref())),
+            "内部治理记录应保留冲突诊断"
         );
 
         drop(write_guard);
@@ -3393,12 +3405,15 @@ mod tests {
         assert_eq!(blocked.status, ExecutionResultStatus::Rejected);
         let blocked_payload: Value =
             serde_json::from_str(&blocked.payload).expect("blocked payload json");
+        assert_eq!(blocked_payload["error_code"], "write_conflict");
         assert!(
             blocked_payload["error"]
                 .as_str()
                 .expect("blocked error")
                 .contains("并发写冲突")
         );
+        assert!(blocked_payload.get("write_scope").is_none());
+        assert!(blocked_payload.get("conflicting_claim").is_none());
         assert!(!destination.exists());
 
         drop(write_guard);
@@ -3474,12 +3489,15 @@ mod tests {
         let blocked_payload: Value =
             serde_json::from_str(&blocked.payload).expect("blocked payload json");
         assert_eq!(blocked_payload["access_mode"], "maybe_write");
+        assert_eq!(blocked_payload["error_code"], "write_conflict");
         assert!(
             blocked_payload["error"]
                 .as_str()
                 .expect("blocked error")
                 .contains("并发写冲突")
         );
+        assert!(blocked_payload.get("write_scope").is_none());
+        assert!(blocked_payload.get("conflicting_claim").is_none());
 
         drop(write_guard);
     }
@@ -4283,7 +4301,17 @@ mod tests {
         );
         let err_output = blocked_result.unwrap_err();
         assert_eq!(err_output.status, ExecutionResultStatus::Rejected);
-        assert!(err_output.payload.contains("并发写冲突"));
+        let err_payload: Value =
+            serde_json::from_str(&err_output.payload).expect("conflict payload json");
+        assert_eq!(err_payload["error_code"], "write_conflict");
+        assert!(
+            err_payload["error"]
+                .as_str()
+                .expect("error")
+                .contains("并发写冲突")
+        );
+        assert!(err_payload.get("write_scope").is_none());
+        assert!(err_payload.get("conflicting_claim").is_none());
 
         // After dropping guard A, context B should succeed
         drop(guard);
@@ -4430,6 +4458,14 @@ mod tests {
             &deny_policy,
         );
         assert_eq!(denied_output.status, ExecutionResultStatus::Rejected);
+        let denied_payload: Value =
+            serde_json::from_str(&denied_output.payload).expect("policy payload json");
+        assert_eq!(denied_payload["tool"], BuiltinToolName::FileRead.as_str());
+        assert_eq!(denied_payload["status"], "rejected");
+        assert_eq!(denied_payload["error_code"], "tool_policy_rejected");
+        assert_eq!(denied_payload["error"], "该工具在当前上下文中不可用");
+        assert!(!denied_output.payload.contains("skill-x"));
+        assert!(!denied_output.payload.contains("skill runtime"));
         assert_eq!(
             denied_output.governance.outcome,
             GovernanceOutcome::Rejected
@@ -4458,6 +4494,8 @@ mod tests {
             &not_allowed_policy,
         );
         assert_eq!(not_allowed_output.status, ExecutionResultStatus::Rejected);
+        assert!(!not_allowed_output.payload.contains("skill-y"));
+        assert!(!not_allowed_output.payload.contains("skill runtime"));
 
         // Now do a successful one with default policy
         let ok_output = tool_registry.execute_with_policy(
@@ -4844,12 +4882,15 @@ mod tests {
         let blocked_payload: Value =
             serde_json::from_str(&blocked.payload).expect("blocked payload json");
         assert_eq!(blocked_payload["tool"], BuiltinToolName::FileWrite.as_str());
-        assert!(
-            blocked_payload["error"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("策略未授权访问路径")
+        assert_eq!(
+            blocked_payload["error_code"].as_str(),
+            Some("tool_policy_rejected")
         );
+        assert_eq!(
+            blocked_payload["error"].as_str(),
+            Some("该工具在当前上下文中不可用")
+        );
+        assert!(!blocked.payload.contains(outside.to_string_lossy().as_ref()));
 
         let allowed = exec_tool_with_context_and_policy(
             &registry,
@@ -4897,11 +4938,10 @@ mod tests {
         assert_eq!(output.governance.outcome, GovernanceOutcome::Rejected);
         let payload: Value = serde_json::from_str(&output.payload).expect("payload json");
         assert_eq!(payload["tool"], BuiltinToolName::ShellExec.as_str());
-        assert!(
-            payload["error"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("策略未授权访问路径")
+        assert_eq!(payload["error_code"].as_str(), Some("tool_policy_rejected"));
+        assert_eq!(
+            payload["error"].as_str(),
+            Some("该工具在当前上下文中不可用")
         );
     }
 
@@ -4934,11 +4974,10 @@ mod tests {
         assert_eq!(output.status, ExecutionResultStatus::Rejected);
         let payload: Value = serde_json::from_str(&output.payload).expect("payload json");
         assert_eq!(payload["tool"], BuiltinToolName::CodeSymbols.as_str());
-        assert!(
-            payload["error"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("策略未授权访问路径")
+        assert_eq!(payload["error_code"].as_str(), Some("tool_policy_rejected"));
+        assert_eq!(
+            payload["error"].as_str(),
+            Some("该工具在当前上下文中不可用")
         );
     }
 
@@ -6481,11 +6520,18 @@ mod tests {
         );
 
         assert_eq!(output.status, ExecutionResultStatus::Rejected);
+        let payload: Value = serde_json::from_str(&output.payload).expect("conflict payload json");
+        assert_eq!(payload["error_code"], "write_conflict");
         assert!(
-            output.payload.contains("并发写冲突"),
+            payload["error"]
+                .as_str()
+                .expect("error")
+                .contains("并发写冲突"),
             "file_write should be protected by the write guard, got {}",
             output.payload
         );
+        assert!(payload.get("write_scope").is_none());
+        assert!(payload.get("conflicting_claim").is_none());
     }
 
     #[test]

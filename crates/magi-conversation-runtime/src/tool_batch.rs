@@ -1963,11 +1963,26 @@ fn task_policy_decision_payload(
     reason: String,
     access_profile: Option<magi_core::AccessProfile>,
 ) -> ToolPreflightDecision {
+    let (error_code, public_error) = match status {
+        ExecutionResultStatus::NeedsApproval => {
+            ("tool_policy_needs_approval", "该工具需要批准后执行")
+        }
+        ExecutionResultStatus::Rejected => ("tool_policy_rejected", "该工具在当前访问模式下不可用"),
+        _ => ("tool_policy_failed", "该工具暂不可用"),
+    };
+    tracing::warn!(
+        tool_name,
+        status = %tool_execution_status_label(status),
+        access_profile = access_profile.map(|profile| profile.as_str()).unwrap_or_default(),
+        reason = %reason,
+        "tool preflight policy decision"
+    );
     ToolPreflightDecision {
         payload: serde_json::json!({
             "tool": tool_name,
             "status": tool_execution_status_label(status),
-            "error": reason,
+            "error_code": error_code,
+            "error": public_error,
             "access_profile": access_profile.map(|profile| profile.as_str()),
         })
         .to_string(),
@@ -2372,11 +2387,10 @@ mod tests {
         assert_eq!(decision.status, ExecutionResultStatus::Rejected);
         assert_eq!(payload["status"].as_str(), Some("rejected"));
         assert_eq!(payload["tool"].as_str(), Some("file_write"));
-        assert!(
-            payload["error"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("只读任务不允许执行写入工具")
+        assert_eq!(payload["error_code"].as_str(), Some("tool_policy_rejected"));
+        assert_eq!(
+            payload["error"].as_str(),
+            Some("该工具在当前访问模式下不可用")
         );
     }
 
@@ -2411,14 +2425,16 @@ mod tests {
             assert_eq!(decision.status, ExecutionResultStatus::Rejected);
             assert_eq!(payload["status"].as_str(), Some("rejected"));
             assert_eq!(payload["tool"].as_str(), Some(tool.as_str()));
-            assert!(
-                payload["error"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .contains("只读任务不允许执行写入工具"),
+            assert_eq!(
+                payload["error_code"].as_str(),
+                Some("tool_policy_rejected"),
                 "{} should be rejected as a write tool, got {}",
                 tool.as_str(),
                 decision.payload
+            );
+            assert_eq!(
+                payload["error"].as_str(),
+                Some("该工具在当前访问模式下不可用")
             );
         }
     }
@@ -2440,11 +2456,15 @@ mod tests {
             payload["tool"].as_str(),
             Some(BuiltinToolName::AgentSpawn.as_str())
         );
+        assert_eq!(payload["error_code"].as_str(), Some("tool_policy_rejected"));
+        assert_eq!(
+            payload["error"].as_str(),
+            Some("该工具在当前访问模式下不可用")
+        );
         assert!(
-            payload["error"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("当前任务阶段不允许调用工具")
+            !decision.payload.contains("当前任务阶段不允许调用工具"),
+            "公开 payload 不应泄漏内部任务策略原因: {}",
+            decision.payload
         );
     }
 
@@ -2521,11 +2541,10 @@ mod tests {
             parsed["tool"].as_str(),
             Some(BuiltinToolName::TodoWrite.as_str())
         );
-        assert!(
-            parsed["error"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("只读任务不允许执行写入工具")
+        assert_eq!(parsed["error_code"].as_str(), Some("tool_policy_rejected"));
+        assert_eq!(
+            parsed["error"].as_str(),
+            Some("该工具在当前访问模式下不可用")
         );
         assert!(
             todo_ledger.is_empty(),
@@ -2557,11 +2576,10 @@ mod tests {
         assert_eq!(decision.status, ExecutionResultStatus::Rejected);
         assert_eq!(payload["status"].as_str(), Some("rejected"));
         assert_eq!(payload["tool"].as_str(), Some("shell_exec"));
-        assert!(
-            payload["error"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("不能包含写入迹象")
+        assert_eq!(payload["error_code"].as_str(), Some("tool_policy_rejected"));
+        assert_eq!(
+            payload["error"].as_str(),
+            Some("该工具在当前访问模式下不可用")
         );
     }
 
@@ -2585,6 +2603,11 @@ mod tests {
 
         assert_eq!(decision.status, ExecutionResultStatus::NeedsApproval);
         assert_eq!(payload["status"].as_str(), Some("needs_approval"));
+        assert_eq!(
+            payload["error_code"].as_str(),
+            Some("tool_policy_needs_approval")
+        );
+        assert_eq!(payload["error"].as_str(), Some("该工具需要批准后执行"));
         assert_eq!(payload["access_profile"].as_str(), Some("restricted"));
     }
 
@@ -2647,11 +2670,15 @@ mod tests {
             serde_json::from_str(&decision.payload).expect("decision should be json");
 
         assert_eq!(decision.status, ExecutionResultStatus::Rejected);
+        assert_eq!(payload["error_code"].as_str(), Some("tool_policy_rejected"));
+        assert_eq!(
+            payload["error"].as_str(),
+            Some("该工具在当前访问模式下不可用")
+        );
         assert!(
-            payload["error"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("策略未授权访问路径")
+            !decision
+                .payload
+                .contains(outside_path.to_string_lossy().as_ref())
         );
     }
 
@@ -2729,12 +2756,19 @@ mod tests {
                 serde_json::from_str(&decision.payload).expect("decision should be json");
 
             assert_eq!(decision.status, ExecutionResultStatus::Rejected);
-            assert!(
-                payload["error"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .contains("策略未授权访问路径"),
+            assert_eq!(
+                payload["error_code"].as_str(),
+                Some("tool_policy_rejected"),
                 "unexpected payload: {payload}"
+            );
+            assert_eq!(
+                payload["error"].as_str(),
+                Some("该工具在当前访问模式下不可用")
+            );
+            assert!(
+                !decision
+                    .payload
+                    .contains(outside_path.to_string_lossy().as_ref())
             );
         }
     }
@@ -2778,12 +2812,19 @@ mod tests {
                 serde_json::from_str(&decision.payload).expect("decision should be json");
 
             assert_eq!(decision.status, ExecutionResultStatus::Rejected);
-            assert!(
-                payload["error"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .contains("策略未授权访问路径"),
+            assert_eq!(
+                payload["error_code"].as_str(),
+                Some("tool_policy_rejected"),
                 "unexpected payload: {payload}"
+            );
+            assert_eq!(
+                payload["error"].as_str(),
+                Some("该工具在当前访问模式下不可用")
+            );
+            assert!(
+                !decision
+                    .payload
+                    .contains(outside_path.to_string_lossy().as_ref())
             );
         }
     }
@@ -2832,12 +2873,14 @@ mod tests {
                 serde_json::from_str(&decision.payload).expect("decision should be json");
 
             assert_eq!(decision.status, ExecutionResultStatus::Rejected);
-            assert!(
-                payload["error"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .contains("策略未授权访问路径"),
+            assert_eq!(
+                payload["error_code"].as_str(),
+                Some("tool_policy_rejected"),
                 "unexpected payload: {payload}"
+            );
+            assert_eq!(
+                payload["error"].as_str(),
+                Some("该工具在当前访问模式下不可用")
             );
         }
     }
@@ -2904,11 +2947,10 @@ mod tests {
             serde_json::from_str(&decision.payload).expect("decision should be json");
 
         assert_eq!(decision.status, ExecutionResultStatus::Rejected);
-        assert!(
-            payload["error"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("策略未授权访问路径")
+        assert_eq!(payload["error_code"].as_str(), Some("tool_policy_rejected"));
+        assert_eq!(
+            payload["error"].as_str(),
+            Some("该工具在当前访问模式下不可用")
         );
     }
 
@@ -2932,11 +2974,10 @@ mod tests {
             serde_json::from_str(&decision.payload).expect("decision should be json");
 
         assert_eq!(decision.status, ExecutionResultStatus::Rejected);
-        assert!(
-            payload["error"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("策略拒绝访问路径")
+        assert_eq!(payload["error_code"].as_str(), Some("tool_policy_rejected"));
+        assert_eq!(
+            payload["error"].as_str(),
+            Some("该工具在当前访问模式下不可用")
         );
     }
 
@@ -3068,9 +3109,15 @@ mod tests {
             serde_json::from_str(&selected.payload).expect("decision should be json");
 
         assert_eq!(selected.status, ExecutionResultStatus::Rejected);
+        assert_eq!(payload["error_code"].as_str(), Some("tool_policy_rejected"));
         assert_eq!(
             payload["error"].as_str(),
-            Some("当前任务阶段不允许调用工具: shell_exec")
+            Some("该工具在当前访问模式下不可用")
+        );
+        assert!(
+            !selected.payload.contains("当前任务阶段不允许调用工具"),
+            "公开 payload 不应泄漏内部任务策略原因: {}",
+            selected.payload
         );
     }
 

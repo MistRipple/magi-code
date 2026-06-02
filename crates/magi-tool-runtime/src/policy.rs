@@ -13,6 +13,10 @@ use std::{
     sync::{Arc, RwLock},
 };
 
+const TOOL_POLICY_REJECTED_PUBLIC_ERROR: &str = "该工具在当前上下文中不可用";
+const TOOL_POLICY_NEEDS_APPROVAL_PUBLIC_ERROR: &str = "该工具需要批准后执行";
+const WRITE_CONFLICT_PUBLIC_ERROR: &str = "检测到并发写冲突，请稍后重试";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct WriteProtectionClaim {
     pub(crate) tool_call_id: ToolCallId,
@@ -63,7 +67,6 @@ impl ToolRegistry {
         {
             return Some(self.build_policy_rejection(
                 input,
-                &policy,
                 format!("skill runtime 已显式拒绝工具: {}", input.tool_name),
             ));
         }
@@ -76,7 +79,6 @@ impl ToolRegistry {
         {
             return Some(self.build_policy_rejection(
                 input,
-                &policy,
                 format!("skill runtime 未授权工具: {}", input.tool_name),
             ));
         }
@@ -84,7 +86,6 @@ impl ToolRegistry {
         if policy.allowed_tool_names.is_empty() {
             return Some(self.build_policy_rejection(
                 input,
-                &policy,
                 format!("skill runtime 未授权工具: {}", input.tool_name),
             ));
         }
@@ -95,17 +96,18 @@ impl ToolRegistry {
     pub(crate) fn build_policy_rejection(
         &self,
         input: &ToolExecutionInput,
-        policy: &ToolExecutionPolicy,
         reason: String,
     ) -> ToolExecutionOutput {
         ToolExecutionOutput {
             tool_call_id: input.tool_call_id.clone(),
             status: magi_core::ExecutionResultStatus::Rejected,
-            payload: if policy.source_skill_ids.is_empty() {
-                reason.clone()
-            } else {
-                format!("{} (skills={})", reason, policy.source_skill_ids.join(","))
-            },
+            payload: serde_json::json!({
+                "tool": input.tool_name,
+                "status": "rejected",
+                "error_code": "tool_policy_rejected",
+                "error": TOOL_POLICY_REJECTED_PUBLIC_ERROR,
+            })
+            .to_string(),
             governance: GovernanceDecision {
                 outcome: GovernanceOutcome::Rejected,
                 allowed: false,
@@ -437,7 +439,7 @@ impl ToolRegistry {
         conflict: WriteProtectionClaim,
     ) -> ToolExecutionOutput {
         let reason = format!(
-            "检测到并发写冲突: tool={} workspace={:?} session={:?} task={:?} cwd={:?} paths={}",
+            "检测到并发写冲突: tool={} workspace={:?} session={:?} task={:?} cwd={:?} paths={} conflict_tool_call={} conflict_workspace={:?} conflict_session={:?} conflict_task={:?} conflict_cwd={:?} conflict_paths={}",
             input.tool_name,
             scope.workspace_id.as_ref().map(ToString::to_string),
             scope.session_id.as_ref().map(ToString::to_string),
@@ -451,6 +453,26 @@ impl ToolRegistry {
                 .iter()
                 .map(|path| path.display().to_string())
                 .collect::<Vec<_>>()
+                .join(","),
+            conflict.tool_call_id,
+            conflict
+                .scope
+                .workspace_id
+                .as_ref()
+                .map(ToString::to_string),
+            conflict.scope.session_id.as_ref().map(ToString::to_string),
+            conflict.scope.task_id.as_ref().map(ToString::to_string),
+            conflict
+                .scope
+                .working_directory
+                .as_ref()
+                .map(|path| path.display().to_string()),
+            conflict
+                .scope
+                .paths
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
                 .join(",")
         );
         ToolExecutionOutput {
@@ -459,24 +481,9 @@ impl ToolRegistry {
             payload: serde_json::json!({
                 "tool": input.tool_name,
                 "status": "rejected",
-                "error": reason.clone(),
+                "error_code": "write_conflict",
+                "error": WRITE_CONFLICT_PUBLIC_ERROR,
                 "access_mode": access_mode.as_str(),
-                "write_scope": {
-                    "workspace_id": scope.workspace_id.as_ref().map(ToString::to_string),
-                    "session_id": scope.session_id.as_ref().map(ToString::to_string),
-                    "task_id": scope.task_id.as_ref().map(ToString::to_string),
-                    "working_directory": scope.working_directory.as_ref().map(|path| path.display().to_string()),
-                    "paths": scope.paths.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
-                },
-                "conflicting_claim": {
-                    "tool_call_id": conflict.tool_call_id.to_string(),
-                    "access_mode": conflict.access_mode.as_str(),
-                    "workspace_id": conflict.scope.workspace_id.as_ref().map(ToString::to_string),
-                    "session_id": conflict.scope.session_id.as_ref().map(ToString::to_string),
-                    "task_id": conflict.scope.task_id.as_ref().map(ToString::to_string),
-                    "working_directory": conflict.scope.working_directory.as_ref().map(|path| path.display().to_string()),
-                    "paths": conflict.scope.paths.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
-                }
             })
             .to_string(),
             governance: GovernanceDecision {
@@ -497,10 +504,26 @@ fn permission_decision_payload(
     reason: &str,
     access_profile: AccessProfile,
 ) -> String {
+    let (error_code, public_error) = if status == "needs_approval" {
+        (
+            "tool_policy_needs_approval",
+            TOOL_POLICY_NEEDS_APPROVAL_PUBLIC_ERROR,
+        )
+    } else {
+        ("tool_policy_rejected", TOOL_POLICY_REJECTED_PUBLIC_ERROR)
+    };
+    tracing::warn!(
+        tool_name,
+        status,
+        access_profile = access_profile.as_str(),
+        reason,
+        "tool registry policy decision"
+    );
     serde_json::json!({
         "tool": tool_name,
         "status": status,
-        "error": reason,
+        "error_code": error_code,
+        "error": public_error,
         "access_profile": access_profile.as_str(),
     })
     .to_string()

@@ -1635,10 +1635,13 @@ mod tests {
         );
 
         assert_eq!(status, ExecutionResultStatus::Rejected);
-        assert!(
-            payload.contains("skill runtime 未授权工具: file_read"),
-            "{payload}"
-        );
+        let parsed: serde_json::Value = serde_json::from_str(&payload).expect("payload json");
+        assert_eq!(parsed["tool"], "file_read");
+        assert_eq!(parsed["status"], "rejected");
+        assert_eq!(parsed["error_code"], "tool_policy_rejected");
+        assert_eq!(parsed["error"], "该工具在当前上下文中不可用");
+        assert!(!payload.contains("search-only"));
+        assert!(!payload.contains("skill runtime"));
     }
 
     #[test]
