@@ -80,12 +80,13 @@ pub fn execute_intent_with_drivers(
     tool_registry: &ToolRegistry,
     skill_dispatch_runtime: &SkillDispatchRuntime,
 ) -> WorkerExecutionTrace {
+    let tool_policy = intent.tool_policy.clone();
     let context = magi_tool_runtime::ToolExecutionContext {
         worker_id: Some(intent.worker_id.clone()),
         task_id: Some(intent.task_id.clone()),
         session_id: intent.session_id.clone(),
         workspace_id: intent.workspace_id.clone(),
-        access_profile: magi_core::AccessProfile::Restricted,
+        access_profile: tool_policy.effective_access_profile(),
         working_directory: None,
     };
 
@@ -115,7 +116,7 @@ pub fn execute_intent_with_drivers(
                 let output = tool_registry.execute_with_policy(
                     execution_input,
                     context.clone(),
-                    &magi_tool_runtime::ToolExecutionPolicy::default(),
+                    &tool_policy,
                 );
                 tool_invocations.push(WorkerToolInvocation {
                     worker_id: intent.worker_id.clone(),
@@ -178,12 +179,13 @@ pub fn execute_intent_step_with_drivers(
     tool_registry: &ToolRegistry,
     skill_dispatch_runtime: &SkillDispatchRuntime,
 ) -> Result<(WorkerExecutionTrace, WorkerExecutionCheckpointCursor, bool), WorkerExecutorFailure> {
+    let tool_policy = intent.tool_policy.clone();
     let context = magi_tool_runtime::ToolExecutionContext {
         worker_id: Some(intent.worker_id.clone()),
         task_id: Some(intent.task_id.clone()),
         session_id: intent.session_id.clone(),
         workspace_id: intent.workspace_id.clone(),
-        access_profile: magi_core::AccessProfile::Restricted,
+        access_profile: tool_policy.effective_access_profile(),
         working_directory: None,
     };
     let step = intent.steps.get(step_index).ok_or_else(|| {
@@ -212,11 +214,8 @@ pub fn execute_intent_step_with_drivers(
                 *approval_requirement,
                 *risk_level,
             );
-            let output = tool_registry.execute_with_policy(
-                execution_input,
-                context.clone(),
-                &magi_tool_runtime::ToolExecutionPolicy::default(),
-            );
+            let output =
+                tool_registry.execute_with_policy(execution_input, context.clone(), &tool_policy);
             tool_invocations.push(WorkerToolInvocation {
                 worker_id: intent.worker_id.clone(),
                 task_id: intent.task_id.clone(),

@@ -336,6 +336,7 @@ impl DeterministicWorkerExecutor {
             session_id: None,
             workspace_id: None,
             execution_profile: WorkerExecutionProfile::default(),
+            tool_policy: ToolExecutionPolicy::default(),
             steps: vec![
                 WorkerExecutionIntentStep::BuiltinToolInvocation {
                     tool_call_id: ToolCallId::new(format!("{prefix}-tool-1")),

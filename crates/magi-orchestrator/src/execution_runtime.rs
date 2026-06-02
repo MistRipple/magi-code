@@ -11,7 +11,7 @@ use magi_core::{
 use magi_event_bus::{EventCategory, EventContext};
 use magi_memory_store::MemoryStore;
 use magi_skill_runtime::SkillToolRuntimePlan;
-use magi_tool_runtime::{ToolExecutionContextQuery, ToolExecutionSummary};
+use magi_tool_runtime::{ToolExecutionContextQuery, ToolExecutionPolicy, ToolExecutionSummary};
 use magi_worker_runtime::{
     TaskExecutionSnapshot, WorkerExecutionIntent, WorkerExecutionReport, WorkerExecutorKind,
     WorkerLoopAction, WorkerSkillDispatchObservation, WorkerStage,
@@ -31,8 +31,16 @@ impl OrchestratedExecutionRuntime {
             "{}-{}-{}",
             target.mission_id, target.root_task_id, target.task_id
         );
-        let skill_plan =
+        let tool_policy = task
+            .policy_snapshot
+            .as_ref()
+            .map(ToolExecutionPolicy::from_task_policy)
+            .unwrap_or_default();
+        let mut skill_plan =
             skill_plan.unwrap_or_else(|| default_builtin_skill_plan("process_inspect"));
+        if let Some(policy) = task.policy_snapshot.as_ref() {
+            skill_plan.tool_policy.apply_task_policy(policy);
+        }
         let skill_tool_name = resolve_skill_tool_name(&skill_plan);
         let skill_route = if skill_plan.routing.requested_bridge_tool_names.is_empty()
             && skill_plan.bridge_dispatch_plan.bindings.is_empty()
@@ -60,6 +68,7 @@ impl OrchestratedExecutionRuntime {
             execution_profile: self
                 .service
                 .derive_execution_profile(&session_id, &workspace_id),
+            tool_policy,
             steps: vec![
                 magi_worker_runtime::WorkerExecutionIntentStep::BuiltinToolInvocation {
                     tool_call_id: magi_core::ToolCallId::new(format!("{prefix}-builtin-1")),

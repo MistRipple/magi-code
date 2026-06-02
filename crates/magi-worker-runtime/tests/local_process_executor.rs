@@ -64,6 +64,7 @@ fn local_process_executor_can_run_execute_chain() {
         session_id: None,
         workspace_id: None,
         execution_profile: WorkerExecutionProfile::default(),
+        tool_policy: ToolExecutionPolicy::default(),
         steps: vec![
             WorkerExecutionIntentStep::BuiltinToolInvocation {
                 tool_call_id: ToolCallId::new("local-tool-1".to_string()),
@@ -135,6 +136,7 @@ fn local_process_executor_resumes_from_checkpoint_without_replaying_completed_st
         session_id: None,
         workspace_id: None,
         execution_profile: WorkerExecutionProfile::default(),
+        tool_policy: ToolExecutionPolicy::default(),
         steps: vec![
             WorkerExecutionIntentStep::BuiltinToolInvocation {
                 tool_call_id: ToolCallId::new("resume-tool-1".to_string()),
@@ -363,6 +365,7 @@ fn local_process_executor_rejects_affinity_mismatch() {
             session_id: Some(SessionId::new("session-other")),
             workspace_id: Some(WorkspaceId::new("workspace-other")),
             execution_profile: WorkerExecutionProfile::default(),
+            tool_policy: ToolExecutionPolicy::default(),
             steps: vec![WorkerExecutionIntentStep::FinalReport(
                 WorkerExecutionFinalReport {
                     summary: "should not run".to_string(),
@@ -390,6 +393,7 @@ fn local_process_executor_rejects_missing_step_capability() {
             session_id: None,
             workspace_id: None,
             execution_profile: WorkerExecutionProfile::default(),
+            tool_policy: ToolExecutionPolicy::default(),
             steps: vec![
                 WorkerExecutionIntentStep::BuiltinToolInvocation {
                     tool_call_id: ToolCallId::new("missing-step-tool-1".to_string()),
@@ -451,6 +455,7 @@ fn worker_runtime_loop_rejects_missing_step_capability_before_fallback() {
         session_id: None,
         workspace_id: None,
         execution_profile: WorkerExecutionProfile::default(),
+        tool_policy: ToolExecutionPolicy::default(),
         steps: vec![
             WorkerExecutionIntentStep::BuiltinToolInvocation {
                 tool_call_id: ToolCallId::new("reject-tool-1".to_string()),
@@ -512,6 +517,7 @@ fn local_process_executor_reports_remote_business_failures() {
             session_id: None,
             workspace_id: None,
             execution_profile: WorkerExecutionProfile::default(),
+            tool_policy: ToolExecutionPolicy::default(),
             steps: Vec::new(),
         })
         .expect_err("empty execute intent should be rejected by remote business layer");
@@ -619,6 +625,7 @@ fn local_process_executor_rejects_missing_reusable_session_support() {
                 requested_process_model: Some(LocalProcessExecutorProcessModel::OneShotSubprocess),
                 requested_parallelism: 1,
             },
+            tool_policy: ToolExecutionPolicy::default(),
             steps: vec![WorkerExecutionIntentStep::FinalReport(
                 WorkerExecutionFinalReport {
                     summary: "should not run".to_string(),
@@ -654,6 +661,7 @@ fn local_process_executor_rejects_parallelism_overflow() {
                 requested_process_model: Some(LocalProcessExecutorProcessModel::OneShotSubprocess),
                 requested_parallelism: 2,
             },
+            tool_policy: ToolExecutionPolicy::default(),
             steps: vec![WorkerExecutionIntentStep::FinalReport(
                 WorkerExecutionFinalReport {
                     summary: "should not run".to_string(),
@@ -690,6 +698,7 @@ fn local_process_executor_rejects_binding_scope_mismatch() {
                 requested_process_model: Some(LocalProcessExecutorProcessModel::PersistentProcess),
                 requested_parallelism: 1,
             },
+            tool_policy: ToolExecutionPolicy::default(),
             steps: vec![WorkerExecutionIntentStep::FinalReport(
                 WorkerExecutionFinalReport {
                     summary: "should not run".to_string(),
@@ -738,6 +747,7 @@ fn local_process_executor_rejects_session_binding_without_session_context() {
                 requested_process_model: Some(LocalProcessExecutorProcessModel::PersistentProcess),
                 requested_parallelism: 1,
             },
+            tool_policy: ToolExecutionPolicy::default(),
             steps: vec![WorkerExecutionIntentStep::FinalReport(
                 WorkerExecutionFinalReport {
                     summary: "should not run".to_string(),
@@ -783,6 +793,7 @@ fn worker_runtime_records_active_lease_for_persistent_session_binding() {
             requested_process_model: Some(LocalProcessExecutorProcessModel::PersistentProcess),
             requested_parallelism: 1,
         },
+        tool_policy: ToolExecutionPolicy::default(),
         steps: vec![WorkerExecutionIntentStep::FinalReport(
             WorkerExecutionFinalReport {
                 summary: "persistent lease path".to_string(),
@@ -860,6 +871,7 @@ fn persistent_executor_reuses_same_lease_for_same_session_binding() {
             requested_process_model: Some(LocalProcessExecutorProcessModel::PersistentProcess),
             requested_parallelism: 1,
         },
+        tool_policy: ToolExecutionPolicy::default(),
         steps: vec![WorkerExecutionIntentStep::FinalReport(
             WorkerExecutionFinalReport {
                 summary: "reuse same session".to_string(),
@@ -918,6 +930,7 @@ fn persistent_executor_allocates_distinct_leases_for_distinct_session_bindings()
         session_id: Some(SessionId::new("session-a")),
         workspace_id: None,
         execution_profile: base_profile.clone(),
+        tool_policy: ToolExecutionPolicy::default(),
         steps: vec![WorkerExecutionIntentStep::FinalReport(
             WorkerExecutionFinalReport {
                 summary: "a".to_string(),
@@ -934,6 +947,7 @@ fn persistent_executor_allocates_distinct_leases_for_distinct_session_bindings()
         session_id: Some(SessionId::new("session-b")),
         workspace_id: None,
         execution_profile: base_profile,
+        tool_policy: ToolExecutionPolicy::default(),
         steps: vec![WorkerExecutionIntentStep::FinalReport(
             WorkerExecutionFinalReport {
                 summary: "b".to_string(),
@@ -979,6 +993,7 @@ fn persistent_executor_releases_lease_and_reallocates_on_next_request() {
             session_id: Some(SessionId::new("session-release")),
             workspace_id: None,
             execution_profile: profile,
+            tool_policy: ToolExecutionPolicy::default(),
             steps: vec![WorkerExecutionIntentStep::FinalReport(
                 WorkerExecutionFinalReport {
                     summary: "release".to_string(),
@@ -1039,6 +1054,7 @@ fn local_process_executor_can_run_review_through_subprocess() {
         session_id: None,
         workspace_id: None,
         execution_profile: WorkerExecutionProfile::default(),
+        tool_policy: ToolExecutionPolicy::default(),
         steps: vec![
             WorkerExecutionIntentStep::BuiltinToolInvocation {
                 tool_call_id: ToolCallId::new("review-tool-1".to_string()),
@@ -1075,6 +1091,7 @@ fn local_process_executor_can_run_verify_through_subprocess() {
         session_id: None,
         workspace_id: None,
         execution_profile: WorkerExecutionProfile::default(),
+        tool_policy: ToolExecutionPolicy::default(),
         steps: vec![
             WorkerExecutionIntentStep::BuiltinToolInvocation {
                 tool_call_id: ToolCallId::new("verify-tool-1".to_string()),
@@ -1112,6 +1129,7 @@ fn local_process_executor_can_run_repair_through_subprocess() {
         session_id: None,
         workspace_id: None,
         execution_profile: WorkerExecutionProfile::default(),
+        tool_policy: ToolExecutionPolicy::default(),
         steps: vec![
             WorkerExecutionIntentStep::BuiltinToolInvocation {
                 tool_call_id: ToolCallId::new("repair-tool-1".to_string()),
@@ -1148,6 +1166,7 @@ fn local_process_executor_review_verify_repair_with_prior_trace() {
         session_id: None,
         workspace_id: None,
         execution_profile: WorkerExecutionProfile::default(),
+        tool_policy: ToolExecutionPolicy::default(),
         steps: vec![WorkerExecutionIntentStep::FinalReport(
             WorkerExecutionFinalReport {
                 summary: "prior trace test".to_string(),
@@ -1199,6 +1218,7 @@ fn worker_runtime_loop_can_run_review_verify_repair_stages() {
         session_id: None,
         workspace_id: None,
         execution_profile: WorkerExecutionProfile::default(),
+        tool_policy: ToolExecutionPolicy::default(),
         steps: vec![WorkerExecutionIntentStep::FinalReport(
             WorkerExecutionFinalReport {
                 summary: "full lifecycle test".to_string(),

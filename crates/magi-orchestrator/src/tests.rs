@@ -1,8 +1,8 @@
 use super::*;
 use crate::task_store::TaskStore;
 use magi_core::{
-    RiskLevel, Task, TaskKind, TaskResultKind, TaskStatus, TerminationReason, ToolCallId,
-    VerificationStatus, WorkerId,
+    AccessProfile, RiskLevel, Task, TaskKind, TaskPolicy, TaskResultKind, TaskStatus, TaskTier,
+    TerminationReason, ToolCallId, VerificationStatus, WorkerId,
 };
 use magi_event_bus::InMemoryEventBus;
 use magi_governance::{DecisionPhase, GovernanceDecision, GovernanceService, WorkerControlKind};
@@ -95,6 +95,30 @@ fn seed_action_tasks(
         });
     }
     root_task_id
+}
+
+fn test_task_policy(
+    access_profile: AccessProfile,
+    command_mode: &str,
+    allowed_tools: Vec<String>,
+    denied_tools: Vec<String>,
+) -> TaskPolicy {
+    TaskPolicy {
+        autonomy_level: "assisted".to_string(),
+        access_profile,
+        allowed_tools,
+        denied_tools,
+        allowed_paths: vec!["/tmp/worker-allowed".to_string()],
+        denied_paths: vec!["/tmp/worker-denied".to_string()],
+        network_mode: "default".to_string(),
+        command_mode: command_mode.to_string(),
+        retry_limit: 0,
+        validation_profile: None,
+        checkpoint_mode: "none".to_string(),
+        task_tier: TaskTier::ExecutionChain,
+        background_allowed: false,
+        escalation_conditions: Vec::new(),
+    }
 }
 
 fn seed_task_hierarchy(
@@ -1072,6 +1096,96 @@ fn execution_runtime_can_run_dispatch_through_local_process_executor() {
     assert_eq!(result.overview.tool_summary.total_invocations, 1);
     assert_eq!(result.overview.skill_dispatch_summary.total_dispatches, 1);
     assert!(result.outcome.report.is_some());
+}
+
+#[test]
+fn execution_intent_inherits_task_tool_policy() {
+    let event_bus = Arc::new(InMemoryEventBus::new(64));
+    let service = OrchestratorService::new(Arc::clone(&event_bus));
+    let governance = Arc::new(GovernanceService::default());
+    let mut tool_registry = ToolRegistry::new(governance, Arc::clone(&event_bus));
+    tool_registry.register_default_builtins();
+    let skill_runtime = SkillDispatchRuntime::new(
+        tool_registry.clone(),
+        magi_bridge_client::BridgeDispatchRuntime::new(),
+    );
+    let worker_runtime = WorkerRuntime::new_compare(Arc::clone(&event_bus));
+    let (execution_runtime, task_store) = build_execution_runtime_with_task_store(
+        &service,
+        worker_runtime,
+        tool_registry,
+        skill_runtime,
+    );
+    let mission_id = MissionId::new("mission-worker-policy");
+    let task_id = TaskId::new("task-worker-policy");
+    seed_action_tasks(
+        &task_store,
+        &mission_id,
+        "mission",
+        &[(task_id.clone(), "task", TaskStatus::Pending)],
+    );
+    let mut task = task_store
+        .get_task(&task_id)
+        .expect("seeded task should exist");
+    task.policy_snapshot = Some(test_task_policy(
+        AccessProfile::FullAccess,
+        "read_only",
+        vec!["process_inspect".to_string()],
+        vec!["file_remove".to_string()],
+    ));
+    task_store.insert_task(task);
+
+    let intent = execution_runtime
+        .build_execution_intent(
+            &direct_execution_target(&mission_id, &task_id),
+            WorkerId::new("worker-policy"),
+            Some(SessionId::new("session-worker-policy")),
+            Some(WorkspaceId::new("workspace-worker-policy")),
+            None,
+        )
+        .expect("execution intent should build");
+
+    assert_eq!(intent.tool_policy.access_profile, AccessProfile::FullAccess);
+    assert_eq!(
+        intent.tool_policy.effective_access_profile(),
+        AccessProfile::ReadOnly
+    );
+    assert_eq!(
+        intent.tool_policy.allowed_tool_names,
+        vec!["process_inspect".to_string()]
+    );
+    assert_eq!(
+        intent.tool_policy.denied_tool_names,
+        vec!["file_remove".to_string()]
+    );
+    assert_eq!(
+        intent.tool_policy.allowed_paths,
+        vec!["/tmp/worker-allowed".to_string()]
+    );
+
+    let skill_policy = intent
+        .steps
+        .iter()
+        .find_map(|step| match step {
+            magi_worker_runtime::WorkerExecutionIntentStep::SkillDispatch { plan, .. } => {
+                Some(&plan.tool_policy)
+            }
+            _ => None,
+        })
+        .expect("intent should contain skill dispatch step");
+    assert_eq!(skill_policy.access_profile, AccessProfile::FullAccess);
+    assert_eq!(
+        skill_policy.effective_access_profile(),
+        AccessProfile::ReadOnly
+    );
+    assert_eq!(
+        skill_policy.allowed_tool_names,
+        vec!["process_inspect".to_string()]
+    );
+    assert_eq!(
+        skill_policy.denied_tool_names,
+        vec!["file_remove".to_string()]
+    );
 }
 
 #[derive(Clone)]

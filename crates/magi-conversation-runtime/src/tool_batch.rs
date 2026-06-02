@@ -1010,6 +1010,7 @@ fn agent_spawn_child_policy_snapshot(
     if access_mode == AgentSpawnAccessMode::ReadOnly
         || policy.command_mode.eq_ignore_ascii_case("read_only")
     {
+        policy.access_profile = magi_core::AccessProfile::ReadOnly;
         policy.command_mode = "read_only".to_string();
     } else if policy.command_mode.trim().is_empty() {
         policy.command_mode = "full".to_string();
@@ -2221,9 +2222,22 @@ mod tests {
         let child =
             agent_spawn_child_policy_snapshot(Some(&parent), AgentSpawnAccessMode::ReadOnly);
 
+        assert_eq!(child.access_profile, magi_core::AccessProfile::ReadOnly);
         assert_eq!(child.command_mode, "read_only");
         assert_eq!(child.network_mode, parent.network_mode);
         assert_eq!(child.task_tier, parent.task_tier);
+
+        let mut full_access_parent = default_agent_spawn_policy();
+        full_access_parent.access_profile = magi_core::AccessProfile::FullAccess;
+        let full_access_child = agent_spawn_child_policy_snapshot(
+            Some(&full_access_parent),
+            AgentSpawnAccessMode::ReadOnly,
+        );
+        assert_eq!(
+            full_access_child.access_profile,
+            magi_core::AccessProfile::ReadOnly
+        );
+        assert_eq!(full_access_child.command_mode, "read_only");
     }
 
     #[test]
@@ -2234,6 +2248,7 @@ mod tests {
         let child =
             agent_spawn_child_policy_snapshot(Some(&parent), AgentSpawnAccessMode::ReadWrite);
 
+        assert_eq!(child.access_profile, magi_core::AccessProfile::ReadOnly);
         assert_eq!(child.command_mode, "read_only");
     }
 

@@ -8,7 +8,7 @@ use magi_governance::{GovernanceDecision, GovernanceOutcome, ToolKind, WorkerCon
 use magi_skill_runtime::{
     SkillDispatchRoute, SkillDispatchRuntime, SkillDispatchStatus, SkillToolRuntimePlan,
 };
-use magi_tool_runtime::ToolRegistry;
+use magi_tool_runtime::{ToolExecutionPolicy, ToolRegistry};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, VecDeque},
@@ -129,6 +129,8 @@ pub struct WorkerExecutionIntent {
     pub session_id: Option<SessionId>,
     pub workspace_id: Option<WorkspaceId>,
     pub execution_profile: WorkerExecutionProfile,
+    #[serde(default)]
+    pub tool_policy: ToolExecutionPolicy,
     pub steps: Vec<WorkerExecutionIntentStep>,
 }
 
@@ -977,6 +979,7 @@ mod tests {
     use magi_governance::{
         DecisionPhase, GovernanceDecision, GovernanceService, WorkerControlRequest,
     };
+    use magi_tool_runtime::{BuiltinToolName, ToolExecutionContextQuery};
     use std::sync::Arc;
 
     fn worker_id(value: &str) -> WorkerId {
@@ -985,6 +988,61 @@ mod tests {
 
     fn task_id(value: &str) -> TaskId {
         TaskId::new(value.to_string())
+    }
+
+    #[test]
+    fn loopback_execution_uses_intent_tool_policy() {
+        let event_bus = Arc::new(InMemoryEventBus::new(32));
+        let governance = Arc::new(GovernanceService::default());
+        let mut tool_registry = ToolRegistry::new(governance, Arc::clone(&event_bus));
+        tool_registry.register_default_builtins();
+        let skill_dispatch_runtime = SkillDispatchRuntime::new(
+            tool_registry.clone(),
+            magi_bridge_client::BridgeDispatchRuntime::new(),
+        );
+        let worker_id = worker_id("worker-loopback-policy");
+        let task_id = task_id("task-loopback-policy");
+        let intent = WorkerExecutionIntent {
+            worker_id: worker_id.clone(),
+            task_id: task_id.clone(),
+            session_id: None,
+            workspace_id: None,
+            execution_profile: WorkerExecutionProfile::default(),
+            tool_policy: ToolExecutionPolicy {
+                access_profile: magi_core::AccessProfile::FullAccess,
+                ..ToolExecutionPolicy::default()
+            },
+            steps: vec![WorkerExecutionIntentStep::BuiltinToolInvocation {
+                tool_call_id: ToolCallId::new("tool-call-loopback-full-access-shell"),
+                tool_name: BuiltinToolName::ShellExec.as_str().to_string(),
+                tool_kind: ToolKind::Builtin,
+                input: serde_json::json!({
+                    "command": "printf loopback-full-access"
+                })
+                .to_string(),
+                approval_requirement: ApprovalRequirement::Required,
+                risk_level: RiskLevel::High,
+                status: ExecutionResultStatus::Succeeded,
+            }],
+        };
+
+        let trace = execute_intent_with_drivers(&intent, &tool_registry, &skill_dispatch_runtime);
+
+        assert_eq!(trace.tool_invocations.len(), 1);
+        assert_eq!(
+            trace.tool_invocations[0].status,
+            ExecutionResultStatus::Succeeded
+        );
+        let records = tool_registry.query_invocations(&ToolExecutionContextQuery {
+            worker_id: Some(worker_id),
+            task_id: Some(task_id),
+            ..ToolExecutionContextQuery::default()
+        });
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].context.access_profile,
+            magi_core::AccessProfile::FullAccess
+        );
     }
 
     #[derive(Clone)]
@@ -1143,6 +1201,7 @@ mod tests {
             session_id: None,
             workspace_id: None,
             execution_profile: WorkerExecutionProfile::default(),
+            tool_policy: ToolExecutionPolicy::default(),
             steps: vec![WorkerExecutionIntentStep::FinalReport(
                 WorkerExecutionFinalReport {
                     summary: "should be replaced by executor failure".to_string(),
@@ -1453,6 +1512,7 @@ mod tests {
             session_id: None,
             workspace_id: None,
             execution_profile: WorkerExecutionProfile::default(),
+            tool_policy: ToolExecutionPolicy::default(),
             steps: vec![
                 WorkerExecutionIntentStep::BuiltinToolInvocation {
                     tool_call_id: ToolCallId::new("call-intent-1".to_string()),
@@ -1521,6 +1581,7 @@ mod tests {
             session_id: None,
             workspace_id: None,
             execution_profile: WorkerExecutionProfile::default(),
+            tool_policy: ToolExecutionPolicy::default(),
             steps: vec![
                 WorkerExecutionIntentStep::BuiltinToolInvocation {
                     tool_call_id: ToolCallId::new("call-checkpoint-1".to_string()),

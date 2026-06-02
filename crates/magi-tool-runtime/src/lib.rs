@@ -1565,6 +1565,63 @@ pub struct ToolExecutionPolicy {
     pub command_mode: String,
 }
 
+impl ToolExecutionPolicy {
+    pub fn from_task_policy(policy: &magi_core::TaskPolicy) -> Self {
+        let mut tool_policy = Self::default();
+        tool_policy.apply_task_policy(policy);
+        tool_policy
+    }
+
+    pub fn apply_task_policy(&mut self, policy: &magi_core::TaskPolicy) {
+        self.access_profile = policy.access_profile;
+        self.allowed_paths = policy.allowed_paths.clone();
+        self.denied_paths = policy.denied_paths.clone();
+        self.command_mode = policy.command_mode.clone();
+        extend_unique(&mut self.denied_tool_names, &policy.denied_tools);
+        merge_allowed_tools(&mut self.allowed_tool_names, &policy.allowed_tools);
+    }
+
+    pub fn effective_access_profile(&self) -> magi_core::AccessProfile {
+        if self.command_mode.eq_ignore_ascii_case("read_only") {
+            magi_core::AccessProfile::ReadOnly
+        } else {
+            self.access_profile
+        }
+    }
+}
+
+fn extend_unique(target: &mut Vec<String>, values: &[String]) {
+    for value in values {
+        let canonical_value = canonical_tool_policy_name(value);
+        if !target
+            .iter()
+            .any(|existing| canonical_tool_policy_name(existing) == canonical_value)
+        {
+            target.push(value.clone());
+        }
+    }
+}
+
+fn merge_allowed_tools(target: &mut Vec<String>, values: &[String]) {
+    if values.is_empty() {
+        return;
+    }
+    if target.is_empty() {
+        target.extend(values.iter().cloned());
+        return;
+    }
+    target.retain(|tool_name| {
+        let canonical_tool_name = canonical_tool_policy_name(tool_name);
+        values
+            .iter()
+            .any(|value| canonical_tool_policy_name(value) == canonical_tool_name)
+    });
+}
+
+fn canonical_tool_policy_name(value: &str) -> String {
+    canonical_builtin_tool_name(value).unwrap_or_else(|| value.trim().to_string())
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ToolInvocationRecord {
     pub tool_call_id: ToolCallId,
@@ -1859,7 +1916,7 @@ impl ToolRegistry {
         policy: &ToolExecutionPolicy,
         allow_internal_builtin_surface: bool,
     ) -> ToolExecutionOutput {
-        context.access_profile = policy.access_profile;
+        context.access_profile = policy.effective_access_profile();
         if input.tool_kind == ToolKind::Builtin
             && let Some(canonical_name) = BuiltinToolName::from_str(input.tool_name.trim())
         {
@@ -4775,6 +4832,100 @@ mod tests {
             shell_exec["effective_approval_policy"],
             "ordinary_approval_skipped"
         );
+    }
+
+    #[test]
+    fn registry_reports_read_only_command_mode_as_effective_profile() {
+        let registry = make_registry();
+
+        let output = registry.execute_with_policy(
+            ToolExecutionInput::for_builtin_invocation(
+                ToolCallId::new("tc-tool-catalog-read-only-command"),
+                BuiltinToolName::ToolCatalog.as_str(),
+                "{}",
+            ),
+            ToolExecutionContext::default(),
+            &ToolExecutionPolicy {
+                access_profile: magi_core::AccessProfile::FullAccess,
+                command_mode: "read_only".to_string(),
+                ..ToolExecutionPolicy::default()
+            },
+        );
+
+        assert_eq!(output.status, ExecutionResultStatus::Succeeded);
+        let payload: Value = serde_json::from_str(&output.payload).expect("payload json");
+        assert_eq!(payload["current_access_profile"], "read_only");
+        let file_write = payload["tools"]
+            .as_array()
+            .expect("tools")
+            .iter()
+            .find(|tool| tool["name"] == BuiltinToolName::FileWrite.as_str())
+            .expect("file_write should be listed");
+        assert_eq!(file_write["effective_approval_policy"], "not_applicable");
+    }
+
+    #[test]
+    fn tool_execution_policy_applies_task_policy_without_losing_skill_scope() {
+        let mut policy = ToolExecutionPolicy {
+            access_profile: magi_core::AccessProfile::Restricted,
+            source_skill_ids: vec!["skill-a".to_string()],
+            allowed_tool_names: vec![
+                BuiltinToolName::FileRead.as_str().to_string(),
+                BuiltinToolName::SearchText.as_str().to_string(),
+            ],
+            denied_tool_names: vec![BuiltinToolName::FileRemove.as_str().to_string()],
+            ..ToolExecutionPolicy::default()
+        };
+        let task_policy = test_task_policy(
+            magi_core::AccessProfile::FullAccess,
+            vec![BuiltinToolName::FileRead.as_str().to_string()],
+            vec![BuiltinToolName::ShellExec.as_str().to_string()],
+        );
+
+        policy.apply_task_policy(&task_policy);
+
+        assert_eq!(policy.access_profile, magi_core::AccessProfile::FullAccess);
+        assert_eq!(
+            policy.allowed_tool_names,
+            vec![BuiltinToolName::FileRead.as_str().to_string()]
+        );
+        assert_eq!(
+            policy.denied_tool_names,
+            vec![
+                BuiltinToolName::FileRemove.as_str().to_string(),
+                BuiltinToolName::ShellExec.as_str().to_string()
+            ]
+        );
+        assert_eq!(policy.allowed_paths, vec!["/tmp/allowed".to_string()]);
+        assert_eq!(policy.denied_paths, vec!["/tmp/denied".to_string()]);
+        assert_eq!(policy.command_mode, "read_only");
+        assert_eq!(
+            policy.effective_access_profile(),
+            magi_core::AccessProfile::ReadOnly
+        );
+    }
+
+    fn test_task_policy(
+        access_profile: magi_core::AccessProfile,
+        allowed_tools: Vec<String>,
+        denied_tools: Vec<String>,
+    ) -> magi_core::TaskPolicy {
+        magi_core::TaskPolicy {
+            autonomy_level: "assisted".to_string(),
+            access_profile,
+            allowed_tools,
+            denied_tools,
+            allowed_paths: vec!["/tmp/allowed".to_string()],
+            denied_paths: vec!["/tmp/denied".to_string()],
+            network_mode: "default".to_string(),
+            command_mode: "read_only".to_string(),
+            retry_limit: 0,
+            validation_profile: None,
+            checkpoint_mode: "none".to_string(),
+            task_tier: magi_core::TaskTier::ExecutionChain,
+            background_allowed: false,
+            escalation_conditions: Vec::new(),
+        }
     }
 
     fn make_registry() -> ToolRegistry {
