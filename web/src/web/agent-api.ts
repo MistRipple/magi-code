@@ -761,17 +761,45 @@ function resolveBindingOverrideValue(
   return fallback;
 }
 
+function hasBindingOverrideKey(
+  bindingOverride: Partial<AgentBindingContext> | undefined,
+  key: keyof AgentBindingContext,
+): boolean {
+  return Boolean(
+    bindingOverride
+      && Object.prototype.hasOwnProperty.call(bindingOverride, key)
+      && bindingOverride[key] !== undefined,
+  );
+}
+
+function resolveBindingWithOverride(
+  bindingOverride?: Partial<AgentBindingContext>,
+): AgentBindingContext {
+  const resolvedBinding = resolveAgentBindingContext();
+  const hasWorkspaceId = hasBindingOverrideKey(bindingOverride, 'workspaceId');
+  const hasWorkspacePath = hasBindingOverrideKey(bindingOverride, 'workspacePath');
+  const hasWorkspaceOverride = hasWorkspaceId || hasWorkspacePath;
+  return {
+    workspaceId: hasWorkspaceId
+      ? resolveBindingOverrideValue(bindingOverride, 'workspaceId', '')
+      : (hasWorkspaceOverride ? '' : resolvedBinding.workspaceId),
+    workspacePath: hasWorkspacePath
+      ? resolveBindingOverrideValue(bindingOverride, 'workspacePath', '')
+      : (hasWorkspaceOverride ? '' : resolvedBinding.workspacePath),
+    sessionId: resolveBindingOverrideValue(
+      bindingOverride,
+      'sessionId',
+      hasWorkspaceOverride ? '' : resolvedBinding.sessionId,
+    ),
+  };
+}
+
 function buildBoundQueryWithOverride(
   extra: Record<string, string>,
   bindingOverride?: Partial<AgentBindingContext>,
   options: { includeSession?: boolean } = {},
 ): string {
-  const resolvedBinding = resolveAgentBindingContext();
-  const binding: AgentBindingContext = {
-    workspaceId: resolveBindingOverrideValue(bindingOverride, 'workspaceId', resolvedBinding.workspaceId),
-    workspacePath: resolveBindingOverrideValue(bindingOverride, 'workspacePath', resolvedBinding.workspacePath),
-    sessionId: resolveBindingOverrideValue(bindingOverride, 'sessionId', resolvedBinding.sessionId),
-  };
+  const binding = resolveBindingWithOverride(bindingOverride);
   const query = new URLSearchParams();
   if (binding.workspaceId) query.set('workspaceId', binding.workspaceId);
   if (binding.workspacePath) query.set('workspacePath', binding.workspacePath);
@@ -807,12 +835,7 @@ async function postBoundJson<T>(
   bindingOverride?: Partial<AgentBindingContext>,
 ): Promise<T> {
   try {
-    const resolvedBinding = resolveAgentBindingContext();
-    const binding: AgentBindingContext = {
-      workspaceId: resolveBindingOverrideValue(bindingOverride, 'workspaceId', resolvedBinding.workspaceId),
-      workspacePath: resolveBindingOverrideValue(bindingOverride, 'workspacePath', resolvedBinding.workspacePath),
-      sessionId: resolveBindingOverrideValue(bindingOverride, 'sessionId', resolvedBinding.sessionId),
-    };
+    const binding = resolveBindingWithOverride(bindingOverride);
     const response = await getTransport().request(agentUrl(pathname), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1178,12 +1201,7 @@ export async function submitSessionTurn(
   bindingOverride?: Partial<AgentBindingContext>,
 ): Promise<AgentSessionTurnResult> {
   try {
-    const resolvedBinding = resolveAgentBindingContext();
-    const binding: AgentBindingContext = {
-      workspaceId: resolveBindingOverrideValue(bindingOverride, 'workspaceId', resolvedBinding.workspaceId),
-      workspacePath: resolveBindingOverrideValue(bindingOverride, 'workspacePath', resolvedBinding.workspacePath),
-      sessionId: resolveBindingOverrideValue(bindingOverride, 'sessionId', resolvedBinding.sessionId),
-    };
+    const binding = resolveBindingWithOverride(bindingOverride);
     if (!binding.workspaceId) {
       throw new AgentApiError(400, 'workspaceId 不能为空', 'submit session turn');
     }

@@ -387,6 +387,33 @@ function trimBridgeString(value: unknown): string {
   return typeof value === 'string' ? value.trim() : '';
 }
 
+function hasBridgeField(source: object, key: string): boolean {
+  const record = source as Record<string, unknown>;
+  return Object.prototype.hasOwnProperty.call(record, key) && record[key] !== undefined;
+}
+
+function resolveWorkspaceScopeFromSource(
+  source: object,
+  fallback: { workspaceId: string; workspacePath: string } = {
+    workspaceId: currentWorkspaceId,
+    workspacePath: currentWorkspacePath,
+  },
+): { workspaceId: string; workspacePath: string; hasWorkspaceOverride: boolean } {
+  const record = source as Record<string, unknown>;
+  const hasWorkspaceId = hasBridgeField(source, 'workspaceId');
+  const hasWorkspacePath = hasBridgeField(source, 'workspacePath');
+  const hasWorkspaceOverride = hasWorkspaceId || hasWorkspacePath;
+  return {
+    workspaceId: hasWorkspaceId
+      ? trimBridgeString(record.workspaceId)
+      : (hasWorkspaceOverride ? '' : fallback.workspaceId),
+    workspacePath: hasWorkspacePath
+      ? trimBridgeString(record.workspacePath)
+      : (hasWorkspaceOverride ? '' : fallback.workspacePath),
+    hasWorkspaceOverride,
+  };
+}
+
 type BridgeRequestScope = {
   sessionId?: string;
   workspaceId?: string;
@@ -397,13 +424,14 @@ function requestScopeFromMessage(
   message: Record<string, unknown>,
   fallbackSessionId: string = currentSessionId,
 ): BridgeRequestScope {
+  const workspaceScope = resolveWorkspaceScopeFromSource(message);
   const scope: BridgeRequestScope = {
-    workspaceId: trimBridgeString(message.workspaceId) || currentWorkspaceId || undefined,
-    workspacePath: trimBridgeString(message.workspacePath) || currentWorkspacePath || undefined,
+    workspaceId: workspaceScope.workspaceId || undefined,
+    workspacePath: workspaceScope.workspacePath || undefined,
   };
-  if (Object.prototype.hasOwnProperty.call(message, 'sessionId')) {
+  if (hasBridgeField(message, 'sessionId')) {
     scope.sessionId = trimBridgeString(message.sessionId);
-  } else if (fallbackSessionId) {
+  } else if (!workspaceScope.hasWorkspaceOverride && fallbackSessionId) {
     scope.sessionId = fallbackSessionId;
   }
   return scope;
@@ -1822,9 +1850,10 @@ function normalizeBootstrapResponse(
   rawPayload: unknown,
   options: { workspaceId?: string; workspacePath?: string; sessionId?: string } = {},
 ): BootstrapPayload {
+  const workspaceScope = resolveWorkspaceScopeFromSource(options);
   return normalizeRustBootstrapPayload(rawPayload, {
-    workspaceId: options.workspaceId ?? currentWorkspaceId,
-    workspacePath: options.workspacePath ?? currentWorkspacePath,
+    workspaceId: workspaceScope.workspaceId,
+    workspacePath: workspaceScope.workspacePath,
     sessionId: options.sessionId,
   });
 }
@@ -2241,8 +2270,9 @@ async function dispatchRegistryAgents(): Promise<void> {
 }
 
 async function dispatchProjectKnowledge(scope: BridgeRequestScope = {}): Promise<void> {
-  const requestWorkspaceId = scope.workspaceId?.trim() || currentWorkspaceId;
-  const requestWorkspacePath = scope.workspacePath?.trim() || currentWorkspacePath;
+  const requestWorkspaceScope = resolveWorkspaceScopeFromSource(scope);
+  const requestWorkspaceId = requestWorkspaceScope.workspaceId;
+  const requestWorkspacePath = requestWorkspaceScope.workspacePath;
   const payload = await getAgentProjectKnowledge({
     workspaceId: requestWorkspaceId,
     workspacePath: requestWorkspacePath,
@@ -2331,12 +2361,9 @@ async function loadLatestSessionSnapshot(
   options: { workspaceId?: string; workspacePath?: string } = {},
 ): Promise<void> {
   const requestGeneration = ++sessionSnapshotGeneration;
-  const targetWorkspaceId = typeof options.workspaceId === 'string' && options.workspaceId.trim()
-    ? options.workspaceId.trim()
-    : currentWorkspaceId;
-  const targetWorkspacePath = typeof options.workspacePath === 'string' && options.workspacePath.trim()
-    ? options.workspacePath.trim()
-    : currentWorkspacePath;
+  const targetWorkspaceScope = resolveWorkspaceScopeFromSource(options);
+  const targetWorkspaceId = targetWorkspaceScope.workspaceId;
+  const targetWorkspacePath = targetWorkspaceScope.workspacePath;
   const rawPayload = await loadAgentSessionSnapshot(sessionId, {
     limit: SESSION_TIMELINE_PAGE_SIZE,
     workspaceId: targetWorkspaceId,
@@ -2359,12 +2386,9 @@ async function switchSession(
   sessionId: string,
   options: { workspaceId?: string; workspacePath?: string } = {},
 ): Promise<void> {
-  const targetWorkspaceId = typeof options.workspaceId === 'string' && options.workspaceId.trim()
-    ? options.workspaceId.trim()
-    : currentWorkspaceId;
-  const targetWorkspacePath = typeof options.workspacePath === 'string' && options.workspacePath.trim()
-    ? options.workspacePath.trim()
-    : currentWorkspacePath;
+  const targetWorkspaceScope = resolveWorkspaceScopeFromSource(options);
+  const targetWorkspaceId = targetWorkspaceScope.workspaceId;
+  const targetWorkspacePath = targetWorkspaceScope.workspacePath;
   const switchBindingKey = bootstrapBindingKey({
     workspaceId: targetWorkspaceId,
     workspacePath: targetWorkspacePath,
@@ -2614,16 +2638,17 @@ function bridgeRuntimeIsBusy(): boolean {
 }
 
 function enqueueFollowUpTurn(input: ExecuteTaskInput, normalizedText: string): void {
+  const workspaceScope = resolveWorkspaceScopeFromSource(input);
   const queued: QueuedMessage = {
     id: input.requestId || generateMessageId(),
     requestId: input.requestId,
     content: normalizedText || input.skillName || i18n.t('bridge.detail.followUpMessage'),
     text: input.text ?? null,
-    workspaceId: input.workspaceId ?? currentWorkspaceId,
-    workspacePath: input.workspacePath ?? currentWorkspacePath,
-    sessionId: Object.prototype.hasOwnProperty.call(input, 'sessionId')
+    workspaceId: workspaceScope.workspaceId,
+    workspacePath: workspaceScope.workspacePath,
+    sessionId: hasBridgeField(input, 'sessionId')
       ? trimBridgeString(input.sessionId)
-      : currentSessionId,
+      : (workspaceScope.hasWorkspaceOverride ? '' : currentSessionId),
     createdAt: Date.now(),
     skillName: input.skillName ?? null,
     accessProfile: input.accessProfile ?? null,
@@ -2695,15 +2720,12 @@ function restoreQueuedTurnToFront(queued: QueuedMessage): void {
 async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
   const text = typeof input.text === 'string' ? input.text : null;
   const normalizedText = text?.trim() || '';
-  const targetWorkspaceId = typeof input.workspaceId === 'string' && input.workspaceId.trim()
-    ? input.workspaceId.trim()
-    : currentWorkspaceId;
-  const targetWorkspacePath = typeof input.workspacePath === 'string' && input.workspacePath.trim()
-    ? input.workspacePath.trim()
-    : currentWorkspacePath;
-  const targetSessionId = Object.prototype.hasOwnProperty.call(input, 'sessionId')
+  const targetWorkspaceScope = resolveWorkspaceScopeFromSource(input);
+  const targetWorkspaceId = targetWorkspaceScope.workspaceId;
+  const targetWorkspacePath = targetWorkspaceScope.workspacePath;
+  const targetSessionId = hasBridgeField(input, 'sessionId')
     ? trimBridgeString(input.sessionId)
-    : currentSessionId;
+    : (targetWorkspaceScope.hasWorkspaceOverride ? '' : currentSessionId);
   const skillName = typeof input.skillName === 'string' && input.skillName.trim()
     ? input.skillName.trim()
     : null;
@@ -3858,9 +3880,8 @@ export function createWebClientBridge(): ClientBridge {
           });
           return;
         case 'newSession': {
-          const workspaceId = trimBridgeString(message.workspaceId) || currentWorkspaceId;
-          const workspacePath = trimBridgeString(message.workspacePath) || currentWorkspacePath;
-          dispatchWorkspaceSessionCleared(workspaceId, workspacePath);
+          const workspaceScope = resolveWorkspaceScopeFromSource(message);
+          dispatchWorkspaceSessionCleared(workspaceScope.workspaceId, workspaceScope.workspacePath);
           emitBridgeSuccessToast(
             i18n.t('bridge.action.newSession'),
             i18n.t('bridge.detail.newSessionPanelReady'),

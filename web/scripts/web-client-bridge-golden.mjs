@@ -3,6 +3,7 @@ import { createServer } from 'vite';
 
 const WORKSPACE_ID = 'workspace-bridge-live-adopt';
 const WORKSPACE_PATH = '/tmp/workspace-bridge-live-adopt';
+const PARTIAL_WORKSPACE_ID = 'workspace-bridge-partial-scope';
 const SESSION_ID = 'session-bridge-live-adopt';
 const TURN_ID = 'turn-bridge-live-adopt';
 const USER_ITEM_ID = 'user-bridge-live-adopt';
@@ -10,6 +11,7 @@ const ACCEPTED_AT = 1780390000000;
 let acceptedPublished = false;
 let summaryMessageCount = 1;
 let summaryUpdatedAt = ACCEPTED_AT;
+const capturedTurnBodies = [];
 
 class MemoryStorage {
   constructor() {
@@ -56,7 +58,20 @@ class FakeCustomEvent extends Event {
 function installBrowserGlobals() {
   const target = new EventTarget();
   const storage = new MemoryStorage();
+  const activeTimeouts = new Set();
   const activeIntervals = new Set();
+  const trackedSetTimeout = (handler, timeout, ...args) => {
+    const timeoutId = setTimeout(() => {
+      activeTimeouts.delete(timeoutId);
+      handler(...args);
+    }, timeout);
+    activeTimeouts.add(timeoutId);
+    return timeoutId;
+  };
+  const trackedClearTimeout = (timeoutId) => {
+    activeTimeouts.delete(timeoutId);
+    clearTimeout(timeoutId);
+  };
   const trackedSetInterval = (handler, timeout, ...args) => {
     const interval = setInterval(handler, timeout, ...args);
     activeIntervals.add(interval);
@@ -78,11 +93,14 @@ function installBrowserGlobals() {
       },
     },
     localStorage: storage,
-    setTimeout,
-    clearTimeout,
+    setTimeout: trackedSetTimeout,
+    clearTimeout: trackedClearTimeout,
     setInterval: trackedSetInterval,
     clearInterval: trackedClearInterval,
     __clearGoldenTimers() {
+      for (const timeoutId of Array.from(activeTimeouts)) {
+        trackedClearTimeout(timeoutId);
+      }
       for (const interval of Array.from(activeIntervals)) {
         trackedClearInterval(interval);
       }
@@ -179,10 +197,26 @@ function settingsBootstrapPayload() {
 }
 
 function installFetchStub() {
-  globalThis.fetch = async (url) => {
+  globalThis.fetch = async (url, init = {}) => {
     const parsed = new URL(String(url));
     if (parsed.pathname === '/health') {
       return new Response('ok', { status: 200 });
+    }
+    if (parsed.pathname === '/api/session/turn') {
+      capturedTurnBodies.push(JSON.parse(String(init.body || '{}')));
+      return jsonResponse({
+        sessionId: 'session-bridge-partial-scope',
+        entryId: 'timeline-bridge-partial-scope',
+        eventId: 'event-bridge-partial-scope',
+        acceptedAt: ACCEPTED_AT + capturedTurnBodies.length,
+        createdSession: false,
+        route: 'chat',
+        userMessageItemId: 'user-bridge-partial-scope',
+        canonicalSchemaVersion: null,
+        canonicalEventKind: null,
+        canonicalTurn: null,
+        canonicalItem: null,
+      });
     }
     if (parsed.pathname === '/bootstrap') {
       return jsonResponse(bootstrapPayload());
@@ -373,6 +407,25 @@ try {
   await waitFor(
     () => currentSessionSummary(messagesStore)?.messageCount === 2,
     'current-session message events must refresh the workspace session summary without waiting for a full page reload',
+  );
+
+  bridge.postMessage({
+    type: 'executeTask',
+    text: '验证 partial workspace scope',
+    workspaceId: PARTIAL_WORKSPACE_ID,
+    requestId: 'request-bridge-partial-scope',
+  });
+  await waitFor(() => capturedTurnBodies.length === 1, 'partial workspace submit must reach backend');
+  assert.equal(capturedTurnBodies[0].workspaceId, PARTIAL_WORKSPACE_ID);
+  assert.equal(
+    capturedTurnBodies[0].workspacePath,
+    null,
+    'workspaceId-only bridge submit must not inherit stale current workspacePath',
+  );
+  assert.equal(
+    capturedTurnBodies[0].sessionId,
+    null,
+    'workspaceId-only bridge submit must not inherit stale current sessionId',
   );
 
   console.log('web client bridge golden replay passed');

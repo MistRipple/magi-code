@@ -63,6 +63,40 @@ try {
     'explicit empty file preview session should keep workspace-only scope',
   );
 
+  const workspaceIdOnlyOverridePreviewQuery = new URLSearchParams(
+    agentApi.buildFilePreviewQuery('README.md', {
+      workspaceId: 'workspace-id-only-override',
+    }),
+  );
+  assert.equal(workspaceIdOnlyOverridePreviewQuery.get('workspaceId'), 'workspace-id-only-override');
+  assert.equal(
+    workspaceIdOnlyOverridePreviewQuery.has('workspacePath'),
+    false,
+    'workspaceId-only override must not inherit stale runtime workspacePath',
+  );
+  assert.equal(
+    workspaceIdOnlyOverridePreviewQuery.has('sessionId'),
+    false,
+    'workspaceId-only override must not inherit stale runtime sessionId',
+  );
+
+  const workspacePathOnlyOverridePreviewQuery = new URLSearchParams(
+    agentApi.buildFilePreviewQuery('README.md', {
+      workspacePath: '/tmp/workspace-path-only-override',
+    }),
+  );
+  assert.equal(workspacePathOnlyOverridePreviewQuery.get('workspacePath'), '/tmp/workspace-path-only-override');
+  assert.equal(
+    workspacePathOnlyOverridePreviewQuery.has('workspaceId'),
+    false,
+    'workspacePath-only override must not inherit stale runtime workspaceId',
+  );
+  assert.equal(
+    workspacePathOnlyOverridePreviewQuery.has('sessionId'),
+    false,
+    'workspacePath-only override must not inherit stale runtime sessionId',
+  );
+
   const originalFetch = globalThis.fetch;
   try {
     let capturedKnowledgeUrl = '';
