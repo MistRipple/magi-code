@@ -1153,9 +1153,13 @@ function scheduleWorkspaceSessionSummaryRefresh(reason: string): void {
   }, 300);
 }
 
-function shouldRefreshWorkspaceSessionSummary(eventType: string, event: RustEventEnvelope): boolean {
+function shouldRefreshExternalWorkspaceSessionSummary(eventType: string, event: RustEventEnvelope): boolean {
   return EXTERNAL_SESSION_SUMMARY_EVENTS.has(eventType)
     && eventTargetsDifferentSession(event);
+}
+
+function shouldRefreshCurrentWorkspaceSessionSummary(eventType: string): boolean {
+  return eventType === 'message.created';
 }
 
 const TURN_TERMINAL_EVENTS = new Set([
@@ -1187,7 +1191,7 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
   }
 
   if (!shouldApplyCurrentSessionRustEvent(event)) {
-    if (shouldRefreshWorkspaceSessionSummary(eventType, event)) {
+    if (shouldRefreshExternalWorkspaceSessionSummary(eventType, event)) {
       scheduleWorkspaceSessionSummaryRefresh(`external_${eventType.replaceAll('.', '_')}`);
     }
     return;
@@ -1272,6 +1276,10 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
       reportExpectedRecoveryFailure(i18n.t('bridge.action.refreshSessionTitle'), '[web-client-bridge] 会话标题更新后刷新失败:', error);
       scheduleRecovery('session_title_updated_refresh', error, true);
     });
+  }
+
+  if (shouldRefreshCurrentWorkspaceSessionSummary(eventType)) {
+    scheduleWorkspaceSessionSummaryRefresh(`current_${eventType.replaceAll('.', '_')}`);
   }
 
   // Notify listeners about task-domain SSE events so lightweight stores
@@ -1794,6 +1802,8 @@ function dispatchEmptyWorkspaceState(): void {
 function closeEventStream(): void {
   clearEventStreamOpenTimeout();
   stopEventStreamIdleCheck();
+  activeEventStreamOpenReject?.(new Error('事件流连接已关闭'));
+  activeEventStreamToken += 1;
   // SSE 断开后无法接收增量事件，结束活跃 turn 防护
   clearActiveTurnInFlight();
   if (activeSseConnection) {

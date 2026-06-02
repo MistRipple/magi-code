@@ -8,6 +8,8 @@ const TURN_ID = 'turn-bridge-live-adopt';
 const USER_ITEM_ID = 'user-bridge-live-adopt';
 const ACCEPTED_AT = 1780390000000;
 let acceptedPublished = false;
+let summaryMessageCount = 1;
+let summaryUpdatedAt = ACCEPTED_AT;
 
 class MemoryStorage {
   constructor() {
@@ -112,8 +114,8 @@ function bootstrapPayload() {
           sessionId: SESSION_ID,
           title: '桥接层实时会话',
           createdAt: ACCEPTED_AT,
-          updatedAt: ACCEPTED_AT,
-          messageCount: 1,
+          updatedAt: summaryUpdatedAt,
+          messageCount: summaryMessageCount,
           workspaceId: WORKSPACE_ID,
         },
       ]
@@ -255,6 +257,24 @@ function acceptedEnvelope() {
   };
 }
 
+function messageCreatedEnvelope() {
+  return {
+    event_id: `event-message-created-${summaryUpdatedAt}`,
+    event_type: 'message.created',
+    category: 'domain',
+    occurred_at: summaryUpdatedAt,
+    sequence: 3,
+    workspace_id: WORKSPACE_ID,
+    session_id: SESSION_ID,
+    payload: {
+      session_id: SESSION_ID,
+      workspace_id: WORKSPACE_ID,
+      role: 'user',
+      content: '同一会话远端追加消息。',
+    },
+  };
+}
+
 async function waitFor(predicate, label) {
   const deadline = Date.now() + 2000;
   while (Date.now() < deadline) {
@@ -268,6 +288,10 @@ async function waitFor(predicate, label) {
 
 function findArtifactByTurnItemId(projection, itemId) {
   return projection?.artifacts?.find((artifact) => artifact.message?.metadata?.turnItemId === itemId);
+}
+
+function currentSessionSummary(messagesStore) {
+  return messagesStore.messagesState.sessions.find((session) => session.id === SESSION_ID);
 }
 
 installBrowserGlobals();
@@ -301,7 +325,19 @@ try {
   );
   stream.onopen?.();
 
+  stream.onerror?.();
   stream.onmessage?.({ data: JSON.stringify(acceptedEnvelope()) });
+  assert.notEqual(
+    messagesStore.messagesState.currentSessionId,
+    SESSION_ID,
+    'closed stale SSE callbacks must not mutate the current workspace/session binding',
+  );
+
+  await waitFor(() => FakeEventSource.instances.length > 1, 'event stream recovery must reconnect after transport error');
+  const recoveredStream = FakeEventSource.instances.at(-1);
+  recoveredStream.onopen?.();
+
+  recoveredStream.onmessage?.({ data: JSON.stringify(acceptedEnvelope()) });
   acceptedPublished = true;
   await waitFor(
     () => messagesStore.messagesState.currentSessionId === SESSION_ID,
@@ -329,6 +365,14 @@ try {
   await waitFor(
     () => messagesStore.messagesState.sessions.some((session) => session.id === SESSION_ID),
     'created live session must refresh the workspace session summary',
+  );
+
+  summaryMessageCount = 2;
+  summaryUpdatedAt = ACCEPTED_AT + 1000;
+  recoveredStream.onmessage?.({ data: JSON.stringify(messageCreatedEnvelope()) });
+  await waitFor(
+    () => currentSessionSummary(messagesStore)?.messageCount === 2,
+    'current-session message events must refresh the workspace session summary without waiting for a full page reload',
   );
 
   console.log('web client bridge golden replay passed');
