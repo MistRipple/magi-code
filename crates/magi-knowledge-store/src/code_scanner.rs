@@ -287,6 +287,40 @@ pub(crate) fn code_index_summary_from_relative_files(
     }
 }
 
+pub(crate) fn code_index_file_for_relative_path(
+    workspace_root: &Path,
+    relative_path: &str,
+) -> Option<CodeIndexFile> {
+    scan_relative_file(workspace_root, relative_path).map(|file| CodeIndexFile {
+        path: file.path,
+        lines: Some(file.lines),
+        size: Some(file.size),
+    })
+}
+
+pub(crate) fn refresh_code_index_summary_metadata(
+    workspace_root: &Path,
+    summary: &mut CodeIndexSummary,
+) {
+    let files = summary
+        .files
+        .iter()
+        .map(|file| ScannedFile {
+            path: file.path.clone(),
+            language: detect_language(&file.path),
+            size: file.size.unwrap_or_default(),
+            lines: file.lines.unwrap_or_default(),
+        })
+        .collect::<Vec<_>>();
+
+    let mut tech_stack = Vec::new();
+    let mut entry_points = Vec::new();
+    detect_tech_stack(workspace_root, &files, &mut tech_stack);
+    detect_entry_points(&files, &mut entry_points);
+    summary.tech_stack = tech_stack;
+    summary.entry_points = entry_points;
+}
+
 pub(crate) fn code_index_ingestion_for_summary(
     workspace_root: &Path,
     summary: &CodeIndexSummary,

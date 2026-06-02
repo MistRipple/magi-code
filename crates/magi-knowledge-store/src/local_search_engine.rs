@@ -159,7 +159,7 @@ impl LocalSearchEngine {
     ) {
         self.indexed_files = files.to_vec();
         self.last_indexed = Some(last_indexed);
-        self.cached_code_index_summary = cached_summary;
+        self.cached_code_index_summary = cached_summary.map(Self::normalize_cached_summary);
 
         let restore_result = self.persistence.load();
         if let Some(snapshot) = restore_result {
@@ -390,7 +390,6 @@ impl LocalSearchEngine {
         self.apply_changed_file(&relative, &file_type);
         self.refresh_project_vocabulary_if_needed();
         self.bump_index_version();
-        self.save_index();
     }
 
     /// 按符号名查定义（goto_definition 的底层）。返回匹配的符号条目。
@@ -427,7 +426,6 @@ impl LocalSearchEngine {
         self.apply_changed_file(&relative, &file_type);
         self.refresh_project_vocabulary_if_needed();
         self.bump_index_version();
-        self.save_index();
     }
 
     pub fn on_file_deleted(&mut self, file_path: &str) {
@@ -440,7 +438,6 @@ impl LocalSearchEngine {
         self.apply_deleted_file(&relative);
         self.refresh_project_vocabulary_if_needed();
         self.bump_index_version();
-        self.save_index();
     }
 
     pub fn invalidate_cache(&mut self) {
@@ -595,7 +592,7 @@ impl LocalSearchEngine {
         self.record_recent_edit(relative_path);
         self.project_vocabulary_dirty = true;
         self.last_indexed = Some(now_millis());
-        self.cached_code_index_summary = None;
+        self.upsert_cached_summary_file(relative_path);
         self.search_cache.invalidate_by_file(relative_path);
     }
 
@@ -610,7 +607,66 @@ impl LocalSearchEngine {
         self.dependency_graph.remove_file(relative_path);
         self.search_cache.invalidate_by_file(relative_path);
         self.last_indexed = Some(now_millis());
-        self.cached_code_index_summary = None;
+        self.remove_cached_summary_file(relative_path);
+    }
+
+    fn upsert_cached_summary_file(&mut self, relative_path: &str) {
+        let Some(summary) = self.cached_code_index_summary.as_mut() else {
+            return;
+        };
+        let root = Path::new(&self.project_root);
+        let Some(file) =
+            crate::code_scanner::code_index_file_for_relative_path(root, relative_path)
+        else {
+            self.remove_cached_summary_file(relative_path);
+            return;
+        };
+
+        if let Some(index) = summary
+            .files
+            .iter()
+            .position(|file| file.path == relative_path)
+        {
+            summary.files[index] = file;
+        } else {
+            summary.files.push(file);
+        }
+        Self::normalize_cached_summary_files(summary);
+        if let Some(last_indexed) = self.last_indexed {
+            summary.last_indexed = last_indexed;
+        }
+        crate::code_scanner::refresh_code_index_summary_metadata(root, summary);
+    }
+
+    fn remove_cached_summary_file(&mut self, relative_path: &str) {
+        let Some(summary) = self.cached_code_index_summary.as_mut() else {
+            return;
+        };
+        summary.files.retain(|file| file.path != relative_path);
+        Self::normalize_cached_summary_files(summary);
+        if let Some(last_indexed) = self.last_indexed {
+            summary.last_indexed = last_indexed;
+        }
+        crate::code_scanner::refresh_code_index_summary_metadata(
+            Path::new(&self.project_root),
+            summary,
+        );
+    }
+
+    fn normalize_cached_summary(
+        mut summary: crate::code_scanner::CodeIndexSummary,
+    ) -> crate::code_scanner::CodeIndexSummary {
+        Self::normalize_cached_summary_files(&mut summary);
+        summary
+    }
+
+    fn normalize_cached_summary_files(summary: &mut crate::code_scanner::CodeIndexSummary) {
+        summary
+            .files
+            .sort_by(|left, right| left.path.cmp(&right.path));
+        summary
+            .files
+            .dedup_by(|left, right| left.path == right.path);
     }
 
     fn remove_stale_indexed_file(&mut self, relative_path: &str) {
@@ -624,7 +680,6 @@ impl LocalSearchEngine {
         self.apply_deleted_file(relative_path);
         self.refresh_project_vocabulary_if_needed();
         self.bump_index_version();
-        self.save_index();
     }
 
     fn ensure_indexed_file_record(
@@ -1182,16 +1237,20 @@ mod tests {
             root.to_string_lossy().as_ref(),
             SearchEngineConfig::default(),
         );
-        let initial_indexed_at = now_millis();
-        engine.build_index(
+        let initial_summary = crate::code_scanner::scan_workspace(&root)
+            .summary
+            .expect("initial workspace should have code index summary");
+        let initial_indexed_at = initial_summary.last_indexed;
+        engine.build_index_with_summary(
             &[("src/seed.rs".to_string(), "source".to_string())],
-            initial_indexed_at,
+            initial_summary,
         );
         assert_eq!(engine.get_stats().total_documents, 1);
         assert_eq!(
             engine.code_index_health().last_indexed,
             Some(initial_indexed_at)
         );
+        assert_eq!(engine.code_index_summary().files.len(), 1);
 
         std::fs::create_dir_all(root.join("target")).expect("create target");
         std::fs::write(
@@ -1209,6 +1268,11 @@ mod tests {
             1,
             "增量更新必须沿用全量扫描的忽略目录和扩展名规则"
         );
+        assert_eq!(
+            engine.code_index_summary().files.len(),
+            1,
+            "被过滤文件不应污染代码索引摘要"
+        );
 
         std::fs::write(
             root.join("src/added.rs"),
@@ -1217,12 +1281,47 @@ mod tests {
         .expect("write accepted file");
         engine.on_file_created(root.join("src/added.rs").to_string_lossy().as_ref());
         assert_eq!(engine.get_stats().total_documents, 2);
+        let summary_after_add = engine.code_index_summary();
+        assert_eq!(summary_after_add.files.len(), 2);
+        assert!(
+            summary_after_add
+                .files
+                .iter()
+                .any(|file| file.path == "src/added.rs" && file.lines == Some(1)),
+            "增量新增文件应同步进入代码索引摘要"
+        );
         assert!(
             engine
                 .search("accepted added symbol", SearchOptions::default())
                 .iter()
                 .any(|result| result.file_path == "src/added.rs"),
             "正常源码文件仍应被增量索引"
+        );
+
+        std::fs::write(
+            root.join("src/added.rs"),
+            "pub fn accepted_added_symbol() -> bool { true }\npub fn second_line() {}\n",
+        )
+        .expect("modify accepted file");
+        engine.on_file_changed(root.join("src/added.rs").to_string_lossy().as_ref());
+        assert!(
+            engine
+                .code_index_summary()
+                .files
+                .iter()
+                .any(|file| file.path == "src/added.rs" && file.lines == Some(2)),
+            "增量修改文件应同步刷新代码索引摘要"
+        );
+
+        std::fs::remove_file(root.join("src/added.rs")).expect("delete accepted file");
+        engine.on_file_deleted(root.join("src/added.rs").to_string_lossy().as_ref());
+        assert!(
+            engine
+                .code_index_summary()
+                .files
+                .iter()
+                .all(|file| file.path != "src/added.rs"),
+            "增量删除文件应同步移出代码索引摘要"
         );
 
         let _ = std::fs::remove_dir_all(&root);
