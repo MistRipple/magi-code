@@ -131,24 +131,33 @@ impl LocalSearchEngine {
 
         let restore_result = self.persistence.load();
         if let Some(snapshot) = restore_result {
-            let freshness = self.persistence.validate_freshness(
-                &self.project_root,
-                &snapshot,
-                &self.indexed_files,
-            );
+            if !snapshot_project_root_matches(&self.project_root, &snapshot.project_root) {
+                tracing::warn!(
+                    current_project_root = %self.project_root,
+                    snapshot_project_root = %snapshot.project_root,
+                    "local search index cache ignored because project root mismatched"
+                );
+                self.persistence.invalidate();
+            } else {
+                let freshness = self.persistence.validate_freshness(
+                    &self.project_root,
+                    &snapshot,
+                    &self.indexed_files,
+                );
 
-            let total_files = snapshot.file_manifest.len() + freshness.added.len();
-            if !IndexPersistence::should_full_rebuild(&freshness, total_files) {
-                if self.restore_from_snapshot(&snapshot, &freshness) {
-                    if let Some(ref ec) = snapshot.expansion_cache {
-                        self.query_expander.import_cache(ec.clone());
+                let total_files = snapshot.file_manifest.len() + freshness.added.len();
+                if !IndexPersistence::should_full_rebuild(&freshness, total_files) {
+                    if self.restore_from_snapshot(&snapshot, &freshness) {
+                        if let Some(ref ec) = snapshot.expansion_cache {
+                            self.query_expander.import_cache(ec.clone());
+                        }
+                        self.rebuild_tracked_file_states();
+                        self.refresh_project_vocabulary_if_needed();
+                        self.bump_index_version();
+                        self.is_ready = true;
+                        self.save_index();
+                        return;
                     }
-                    self.rebuild_tracked_file_states();
-                    self.refresh_project_vocabulary_if_needed();
-                    self.bump_index_version();
-                    self.is_ready = true;
-                    self.save_index();
-                    return;
                 }
             }
         }
@@ -978,6 +987,28 @@ fn classify_file_type_str(file_path: &str) -> &'static str {
     }
 }
 
+fn snapshot_project_root_matches(current_project_root: &str, snapshot_project_root: &str) -> bool {
+    let current_path = Path::new(current_project_root);
+    let snapshot_path = Path::new(snapshot_project_root);
+    match (
+        std::fs::canonicalize(current_path),
+        std::fs::canonicalize(snapshot_path),
+    ) {
+        (Ok(current), Ok(snapshot)) => current == snapshot,
+        _ => {
+            normalize_project_root_text(current_project_root)
+                == normalize_project_root_text(snapshot_project_root)
+        }
+    }
+}
+
+fn normalize_project_root_text(value: &str) -> String {
+    value
+        .trim()
+        .trim_end_matches(['/', '\\'])
+        .replace('\\', "/")
+}
+
 fn normalize_scope_hints(scopes: &[String]) -> Vec<String> {
     scopes
         .iter()
@@ -1173,5 +1204,104 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn index_cache_restore_rejects_mismatched_project_root() {
+        let root = std::env::temp_dir().join(format!(
+            "magi-local-search-root-mismatch-{}-{}",
+            std::process::id(),
+            now_millis()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).expect("create src");
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "pub fn freshrootmismatchprobe() -> bool { true }\n",
+        )
+        .expect("write source");
+
+        write_mismatched_project_root_cache(&root, "src/lib.rs");
+
+        let mut engine = LocalSearchEngine::new(
+            root.to_string_lossy().as_ref(),
+            SearchEngineConfig::default(),
+        );
+        engine.build_index(&[("src/lib.rs".to_string(), "source".to_string())]);
+
+        assert!(
+            engine
+                .search("freshrootmismatchprobe", SearchOptions::default())
+                .iter()
+                .any(|result| result.file_path == "src/lib.rs"),
+            "project_root 不匹配的缓存被丢弃后，应使用当前 workspace 文件重建索引"
+        );
+        assert!(
+            engine
+                .search("stalerootmismatchprobe", SearchOptions::default())
+                .is_empty(),
+            "project_root 不匹配的旧缓存不能污染当前 workspace 检索"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn write_mismatched_project_root_cache(root: &Path, file_path: &str) {
+        use crate::dependency_graph::DependencyGraphSnapshot;
+        use crate::index_persistence::{FileManifestEntry, PersistenceSnapshot};
+        use crate::inverted_index::InvertedIndexSnapshot;
+        use crate::symbol_index::SymbolIndexSnapshot;
+        use flate2::{Compression, write::GzEncoder};
+        use std::io::Write;
+
+        let full_path = root.join(file_path);
+        let meta = std::fs::metadata(&full_path).expect("source metadata");
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let snapshot = PersistenceSnapshot {
+            version: 1,
+            project_root: "/tmp/magi-different-project-root".to_string(),
+            created_at: now_millis(),
+            updated_at: now_millis(),
+            file_manifest: vec![(
+                file_path.to_string(),
+                FileManifestEntry {
+                    mtime,
+                    size: meta.len(),
+                    file_type: "source".to_string(),
+                },
+            )],
+            inverted_index: InvertedIndexSnapshot {
+                postings: vec![(
+                    "stalerootmismatchprobe".to_string(),
+                    vec![(file_path.to_string(), vec![0], 1)],
+                )],
+                doc_meta: vec![(file_path.to_string(), 1, Some(mtime))],
+                total_docs: 1,
+                avg_doc_len: 1.0,
+            },
+            symbol_index: SymbolIndexSnapshot {
+                symbols: Vec::new(),
+                file_symbols: Vec::new(),
+            },
+            dependency_graph: DependencyGraphSnapshot {
+                forward_deps: Vec::new(),
+                reverse_deps: Vec::new(),
+                edges: Vec::new(),
+                centrality_cache: Vec::new(),
+            },
+            expansion_cache: None,
+        };
+        let raw = serde_json::to_vec(&snapshot).expect("serialize snapshot");
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&raw).expect("write gzip");
+        let compressed = encoder.finish().expect("finish gzip");
+        let cache_dir = root.join(".magi").join("cache");
+        std::fs::create_dir_all(&cache_dir).expect("create cache dir");
+        std::fs::write(cache_dir.join("search-index.json.gz"), compressed).expect("write cache");
     }
 }
