@@ -1132,7 +1132,11 @@ async fn daemon_bootstrap_exports_session_action_context_summary_after_followup_
     let first_accepted_at = first_body["acceptedAt"]
         .as_u64()
         .expect("accepted_at should serialize as integer");
-    let expected_extraction_id = format!("extract-session-action-{first_accepted_at}");
+    let expected_extraction_id = format!(
+        "extract-session-action-{}-{first_accepted_at}-timeline-{}-{first_accepted_at}",
+        session_id.as_str(),
+        session_id.as_str()
+    );
     let first_root_task_id = first_body["rootTaskId"]
         .as_str()
         .expect("root_task_id should serialize as string");

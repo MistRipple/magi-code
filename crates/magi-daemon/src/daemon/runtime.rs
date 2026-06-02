@@ -2679,7 +2679,9 @@ mod tests {
         let second_root_task_id = second_body["rootTaskId"]
             .as_str()
             .expect("root_task_id should serialize as string");
-        let expected_extraction_id = format!("extract-session-action-{first_accepted_at}");
+        let expected_extraction_id = format!(
+            "extract-session-action-test-session-001-{first_accepted_at}-timeline-test-session-001-{first_accepted_at}"
+        );
 
         let second_execution_group =
             wait_for_execution_group(app.clone(), &second_mission_id, |entry| {
