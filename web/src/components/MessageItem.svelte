@@ -74,9 +74,13 @@
       !!b && typeof b === 'object' && 'type' in b
     )
   );
+  const isCanonicalMessage = $derived(message.metadata?.canonical === true);
   // 主线不承载运行时内部工具；这些 block 只能作为任务详情/运行时日志的投影。
   const presentationBlocks = $derived(
     safeBlocks.filter((block) => {
+      if (isCanonicalMessage) {
+        return true;
+      }
       if (block.type !== 'tool_call' && block.type !== 'tool_result') {
         return true;
       }

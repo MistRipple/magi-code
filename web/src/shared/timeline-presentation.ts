@@ -23,6 +23,10 @@ export interface TimelinePresentationMessageLike {
   metadata?: Record<string, unknown>;
 }
 
+function isCanonicalTimelineMessage(message: TimelinePresentationMessageLike): boolean {
+  return message.metadata?.canonical === true;
+}
+
 function extractToolBlockName(block: TimelinePresentationBlockLike | undefined | null): string {
   if (!block) {
     return '';
@@ -79,8 +83,9 @@ export function resolveTimelinePresentationKind(
   message: TimelinePresentationMessageLike,
 ): TimelinePresentationKind {
   if (hasToolBlock(message.blocks)) {
-    // 运行时内部工具不允许进入主线工具卡路径，应作为普通编排消息处理。
-    if (hasOnlyRuntimeInternalToolBlocks(message.blocks)) {
+    // canonical 消息已经由后端 visibility.renderable 决定是否进入时间线；
+    // 这里只保留 legacy 消息的运行时内部工具过滤。
+    if (!isCanonicalTimelineMessage(message) && hasOnlyRuntimeInternalToolBlocks(message.blocks)) {
       return 'message';
     }
     return 'tool';
