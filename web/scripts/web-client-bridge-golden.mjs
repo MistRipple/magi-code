@@ -9,6 +9,7 @@ const TURN_ID = 'turn-bridge-live-adopt';
 const USER_ITEM_ID = 'user-bridge-live-adopt';
 const ACCEPTED_AT = 1780390000000;
 let acceptedPublished = false;
+let terminalPublished = false;
 let summaryMessageCount = 1;
 let summaryUpdatedAt = ACCEPTED_AT;
 const capturedTurnBodies = [];
@@ -138,6 +139,7 @@ function bootstrapPayload() {
         },
       ]
     : [];
+  const canonicalTurns = terminalPublished ? [completedCanonicalTurn()] : [];
   return {
     workspace: {
       workspaceId: WORKSPACE_ID,
@@ -158,7 +160,7 @@ function bootstrapPayload() {
       pendingChanges: [],
       pendingChangesState: null,
     },
-    canonicalTurns: [],
+    canonicalTurns,
     notifications: {
       notifications: [],
     },
@@ -237,8 +239,8 @@ function installFetchStub() {
   };
 }
 
-function acceptedEnvelope() {
-  const imageMetadata = {
+function imageMetadata() {
+  return {
     images: [
       {
         name: 'bridge-live.png',
@@ -246,7 +248,10 @@ function acceptedEnvelope() {
       },
     ],
   };
-  const canonicalItem = {
+}
+
+function acceptedCanonicalUserItem() {
+  return {
     sessionId: SESSION_ID,
     turnId: TURN_ID,
     turnSeq: ACCEPTED_AT,
@@ -261,8 +266,48 @@ function acceptedEnvelope() {
     visibility: {
       renderable: true,
     },
-    metadata: imageMetadata,
+    metadata: imageMetadata(),
   };
+}
+
+function completedCanonicalAssistantItem() {
+  return {
+    sessionId: SESSION_ID,
+    turnId: TURN_ID,
+    turnSeq: ACCEPTED_AT,
+    itemId: 'assistant-bridge-live-terminal',
+    itemSeq: 2,
+    kind: 'assistant_text',
+    createdAt: ACCEPTED_AT,
+    status: 'completed',
+    updatedAt: ACCEPTED_AT + 2000,
+    content: '桥接层实时回复已完成。',
+    sourceThreadId: `thread-${SESSION_ID}`,
+    visibility: {
+      renderable: true,
+    },
+    metadata: {},
+  };
+}
+
+function completedCanonicalTurn() {
+  return {
+    sessionId: SESSION_ID,
+    turnId: TURN_ID,
+    turnSeq: ACCEPTED_AT,
+    acceptedAt: ACCEPTED_AT,
+    completedAt: ACCEPTED_AT + 2000,
+    status: 'completed',
+    responseDurationMs: 2000,
+    items: [
+      acceptedCanonicalUserItem(),
+      completedCanonicalAssistantItem(),
+    ],
+  };
+}
+
+function acceptedEnvelope() {
+  const canonicalItem = acceptedCanonicalUserItem();
   return {
     event_id: `event-session-turn-accepted-${ACCEPTED_AT}`,
     event_type: 'session.turn.accepted',
@@ -286,6 +331,30 @@ function acceptedEnvelope() {
         status: 'running',
         items: [canonicalItem],
       },
+      canonical_item: canonicalItem,
+    },
+  };
+}
+
+function completedEnvelope() {
+  const canonicalTurn = completedCanonicalTurn();
+  const canonicalItem = completedCanonicalAssistantItem();
+  return {
+    event_id: `event-session-turn-completed-${ACCEPTED_AT}`,
+    event_type: 'session.turn.completed',
+    category: 'domain',
+    occurred_at: ACCEPTED_AT + 2000,
+    sequence: 4,
+    workspace_id: WORKSPACE_ID,
+    session_id: SESSION_ID,
+    payload: {
+      session_id: SESSION_ID,
+      workspace_id: WORKSPACE_ID,
+      route: 'chat',
+      created_session: true,
+      canonical_schema_version: 'canonical-turn.v1',
+      canonical_event_kind: 'turn_completed',
+      canonical_turn: canonicalTurn,
       canonical_item: canonicalItem,
     },
   };
@@ -392,6 +461,11 @@ try {
     ],
     'live SSE accepted image must project into the message area without refresh',
   );
+  assert.equal(
+    messagesStore.messagesState.isProcessing,
+    true,
+    'running accepted canonical turn must mark the UI as processing',
+  );
   assert.ok(
     window.location.href.includes(`sessionId=${encodeURIComponent(SESSION_ID)}`),
     'live accepted session must update the browser binding',
@@ -407,6 +481,22 @@ try {
   await waitFor(
     () => currentSessionSummary(messagesStore)?.messageCount === 2,
     'current-session message events must refresh the workspace session summary without waiting for a full page reload',
+  );
+
+  terminalPublished = true;
+  recoveredStream.onmessage?.({ data: JSON.stringify(completedEnvelope()) });
+  await waitFor(
+    () => messagesStore.messagesState.isProcessing === false,
+    'terminal session turn event with canonical payload must settle processing without waiting for recovery',
+  );
+  const terminalArtifact = findArtifactByTurnItemId(
+    messagesStore.messagesState.canonicalTimelineProjection,
+    'assistant-bridge-live-terminal',
+  );
+  assert.equal(
+    terminalArtifact?.message?.isStreaming,
+    false,
+    'terminal session turn event must project the final assistant item as non-streaming',
   );
 
   bridge.postMessage({

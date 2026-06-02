@@ -1331,6 +1331,7 @@ fn spawn_regular_session_turn_execution(
             );
             return;
         }
+        let turn_id = execution_request.turn_id.clone();
         let outcome = dispatcher.execute_session_turn(execution_request);
         super::finalize_session_turn(&state, &session_id, outcome.is_ok());
         match outcome {
@@ -1350,11 +1351,13 @@ fn spawn_regular_session_turn_execution(
                     EventEnvelope::domain(
                         event_id,
                         "session.turn.completed",
-                        json!({
-                            "session_id": session_id.to_string(),
-                            "route": route,
-                            "created_session": created_session,
-                        }),
+                        session_turn_completed_event_payload(
+                            &state,
+                            &session_id,
+                            route,
+                            created_session,
+                            Some(&turn_id),
+                        ),
                     )
                     .with_context(EventContext {
                         session_id: Some(session_id.clone()),
@@ -1384,7 +1387,12 @@ fn spawn_regular_session_turn_execution(
                     EventEnvelope::domain(
                         event_id,
                         "session.turn.failed",
-                        session_turn_failed_event_payload(&session_id, route),
+                        session_turn_failed_event_payload_with_canonical(
+                            &state,
+                            &session_id,
+                            route,
+                            Some(&turn_id),
+                        ),
                     )
                     .with_context(EventContext {
                         session_id: Some(session_id),
@@ -1413,7 +1421,7 @@ fn publish_regular_session_turn_early_failed(
         EventEnvelope::domain(
             event_id,
             "session.turn.failed",
-            session_turn_failed_event_payload(session_id, route),
+            session_turn_failed_event_payload_with_canonical(state, session_id, route, None),
         )
         .with_context(EventContext {
             session_id: Some(session_id.clone()),
@@ -1421,6 +1429,77 @@ fn publish_regular_session_turn_early_failed(
             ..EventContext::default()
         }),
     );
+}
+
+fn session_turn_terminal_canonical_turn(
+    state: &ApiState,
+    session_id: &SessionId,
+    turn_id: Option<&str>,
+) -> Option<CanonicalTurn> {
+    state
+        .session_store
+        .canonical_turns_for_session(session_id)
+        .into_iter()
+        .filter(|turn| turn_id.is_none_or(|turn_id| turn.turn_id == turn_id))
+        .max_by(|left, right| {
+            left.turn_seq
+                .cmp(&right.turn_seq)
+                .then(left.turn_id.cmp(&right.turn_id))
+        })
+}
+
+fn append_terminal_canonical_payload(
+    payload: &mut serde_json::Value,
+    state: &ApiState,
+    session_id: &SessionId,
+    turn_id: Option<&str>,
+) {
+    let Some(canonical_turn) = session_turn_terminal_canonical_turn(state, session_id, turn_id)
+    else {
+        return;
+    };
+    if !canonical_turn.status.is_terminal() {
+        return;
+    }
+    let canonical_item = canonical_turn
+        .items
+        .iter()
+        .rev()
+        .find(|item| item.visibility.renderable && item.status.is_terminal())
+        .or_else(|| {
+            canonical_turn
+                .items
+                .iter()
+                .rev()
+                .find(|item| item.visibility.renderable)
+        })
+        .or_else(|| canonical_turn.items.last())
+        .cloned();
+    if let Some(object) = payload.as_object_mut() {
+        object.insert(
+            "canonical_schema_version".to_string(),
+            json!(CANONICAL_TURN_SCHEMA_VERSION),
+        );
+        object.insert("canonical_event_kind".to_string(), json!("turn_completed"));
+        object.insert("canonical_turn".to_string(), json!(canonical_turn));
+        object.insert("canonical_item".to_string(), json!(canonical_item));
+    }
+}
+
+fn session_turn_completed_event_payload(
+    state: &ApiState,
+    session_id: &SessionId,
+    route: SessionTurnRouteDto,
+    created_session: bool,
+    turn_id: Option<&str>,
+) -> serde_json::Value {
+    let mut payload = json!({
+        "session_id": session_id.to_string(),
+        "route": route,
+        "created_session": created_session,
+    });
+    append_terminal_canonical_payload(&mut payload, state, session_id, turn_id);
+    payload
 }
 
 fn session_turn_failed_event_payload(
@@ -1433,6 +1512,17 @@ fn session_turn_failed_event_payload(
         "error": "session_turn_failed",
         "error_code": "session_turn_failed",
     })
+}
+
+fn session_turn_failed_event_payload_with_canonical(
+    state: &ApiState,
+    session_id: &SessionId,
+    route: SessionTurnRouteDto,
+    turn_id: Option<&str>,
+) -> serde_json::Value {
+    let mut payload = session_turn_failed_event_payload(session_id, route);
+    append_terminal_canonical_payload(&mut payload, state, session_id, turn_id);
+    payload
 }
 
 fn publish_regular_session_turn_accepted_event(
@@ -1878,18 +1968,25 @@ async fn interrupt_session_turn(
 
     state.persist_session_state_checkpoint("session_turn_interrupted")?;
     let event_id = EventId::new(format!("event-session-turn-interrupt-{}", now.0));
+    let mut interrupt_payload = json!({
+        "session_id": session_id.to_string(),
+        "workspace_id": workspace_id.as_ref().map(ToString::to_string),
+        "turn_id": turn_id.clone(),
+        "interrupted": interrupted,
+        "cancelled_tool_process_count": cancelled_tool_process_count,
+        "requested_at": now.0,
+        "removed_timeline_entry_ids": streaming_entry_ids.clone(),
+    });
+    append_terminal_canonical_payload(
+        &mut interrupt_payload,
+        &state,
+        &session_id,
+        turn_id.as_deref(),
+    );
     let event = EventEnvelope::domain(
         event_id.clone(),
         "session.turn.interrupted",
-        json!({
-            "session_id": session_id.to_string(),
-            "workspace_id": workspace_id.as_ref().map(ToString::to_string),
-            "turn_id": turn_id.clone(),
-            "interrupted": interrupted,
-            "cancelled_tool_process_count": cancelled_tool_process_count,
-            "requested_at": now.0,
-            "removed_timeline_entry_ids": streaming_entry_ids.clone(),
-        }),
+        interrupt_payload,
     )
     .with_context(EventContext {
         session_id: Some(session_id.clone()),
@@ -2708,6 +2805,19 @@ mod tests {
         assert_eq!(failed_event.workspace_id.as_ref(), Some(&workspace_id));
         assert_eq!(failed_event.payload["session_id"], session_id.as_str());
         assert_eq!(failed_event.payload["route"], "chat");
+        assert_eq!(
+            failed_event.payload["canonical_schema_version"],
+            CANONICAL_TURN_SCHEMA_VERSION
+        );
+        assert_eq!(
+            failed_event.payload["canonical_event_kind"],
+            "turn_completed"
+        );
+        assert_eq!(
+            failed_event.payload["canonical_turn"]["turnId"],
+            "turn-early-failure"
+        );
+        assert_eq!(failed_event.payload["canonical_turn"]["status"], "failed");
     }
 
     async fn post_json(
@@ -3004,6 +3114,114 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "unexpected body: {body}");
         assert_eq!(body["sessionId"], session_id.as_str());
         assert_eq!(body["workspaceId"], workspace_id.as_str());
+    }
+
+    #[tokio::test]
+    async fn session_interrupt_publishes_terminal_canonical_payload() {
+        let state = test_state();
+        let workspace_id = register_workspace(
+            &state,
+            "workspace-interrupt-canonical",
+            "session-interrupt-canonical",
+        );
+        let session_id = SessionId::new("session-interrupt-canonical");
+        let accepted_at = UtcMillis(1777000000300);
+        state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "中断 canonical 会话",
+                Some(workspace_id.to_string()),
+            )
+            .expect("session should create");
+        let (_mission_id, orchestrator_thread_id) =
+            state
+                .session_store
+                .ensure_session_mission(&session_id, accepted_at, || {
+                    MissionId::new("mission-interrupt-canonical")
+                });
+        state
+            .session_store
+            .upsert_current_turn(
+                session_id.clone(),
+                ActiveExecutionTurn {
+                    turn_id: "turn-interrupt-canonical".to_string(),
+                    turn_seq: accepted_at.0 as u64,
+                    accepted_at,
+                    status: "running".to_string(),
+                    completed_at: None,
+                    user_message: Some("请生成一段长内容".to_string()),
+                    items: vec![ActiveExecutionTurnItem {
+                        item_id: "assistant-interrupt-canonical".to_string(),
+                        item_seq: 1,
+                        kind: "assistant_stream".to_string(),
+                        status: "running".to_string(),
+                        source: "orchestrator".to_string(),
+                        title: Some("生成回复".to_string()),
+                        content: Some("生成中".to_string()),
+                        task_id: None,
+                        worker_id: None,
+                        role_id: None,
+                        tool_call_id: None,
+                        tool_name: None,
+                        tool_status: None,
+                        tool_arguments: None,
+                        tool_result: None,
+                        tool_error: None,
+                        request_id: Some("request-interrupt-canonical".to_string()),
+                        user_message_id: Some("user-interrupt-canonical".to_string()),
+                        placeholder_message_id: Some("assistant-interrupt-canonical".to_string()),
+                        metadata: Default::default(),
+                        timeline_entry_id: None,
+                        source_thread_id: orchestrator_thread_id,
+                    }],
+                },
+            )
+            .expect("current turn should persist");
+
+        let (status, body) = post_json(
+            state.clone(),
+            "/session/interrupt",
+            serde_json::json!({
+                "workspaceId": workspace_id.as_str(),
+                "sessionId": session_id.as_str(),
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "unexpected body: {body}");
+        assert_eq!(body["interrupted"], true);
+        let interrupted_event = state
+            .event_bus
+            .snapshot()
+            .recent_events
+            .into_iter()
+            .find(|event| event.event_type == "session.turn.interrupted")
+            .expect("interrupted event should be published");
+        assert_eq!(
+            interrupted_event.payload["canonical_schema_version"],
+            CANONICAL_TURN_SCHEMA_VERSION
+        );
+        assert_eq!(
+            interrupted_event.payload["canonical_event_kind"],
+            "turn_completed"
+        );
+        assert_eq!(
+            interrupted_event.payload["canonical_turn"]["turnId"],
+            "turn-interrupt-canonical"
+        );
+        assert_eq!(
+            interrupted_event.payload["canonical_turn"]["status"],
+            "cancelled"
+        );
+        assert_eq!(
+            interrupted_event.payload["canonical_item"]["itemId"],
+            "assistant-interrupt-canonical"
+        );
+        assert_eq!(
+            interrupted_event.payload["canonical_item"]["status"],
+            "cancelled"
+        );
     }
 
     #[tokio::test]

@@ -1127,6 +1127,23 @@ function handleSessionTurnItemEvent(event: RustEventEnvelope): boolean {
   return true;
 }
 
+function emitCanonicalTurnEventFromRustEvent(event: RustEventEnvelope): boolean {
+  const canonicalEvent = parseCanonicalTurnEventPayload(event.payload, {
+    eventId: trimBridgeString(event.event_id),
+    eventSeq: typeof event.sequence === 'number' && Number.isFinite(event.sequence)
+      ? Math.floor(event.sequence)
+      : 0,
+    occurredAt: typeof event.occurred_at === 'number' && Number.isFinite(event.occurred_at)
+      ? Math.floor(event.occurred_at)
+      : Date.now(),
+  });
+  if (!canonicalEvent) {
+    return false;
+  }
+  emitSessionTurnCanonicalEvent(canonicalEvent);
+  return true;
+}
+
 function rustEventPayloadString(event: RustEventEnvelope, snakeKey: string, camelKey: string): string {
   return trimBridgeString(event.payload?.[snakeKey])
     || trimBridgeString(event.payload?.[camelKey]);
@@ -1287,6 +1304,7 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
   }
 
   if (TURN_TERMINAL_EVENTS.has(eventType)) {
+    emitCanonicalTurnEventFromRustEvent(event);
     clearActiveTurnInFlight();
     const terminalReason = eventType === 'session.turn.failed'
       ? 'session_turn_failed'
