@@ -41,7 +41,9 @@ use crate::{
     task_execution_registry::{SpawnedChildExecutionRequest, TaskExecutionRegistry},
     task_helpers::{task_can_see_builtin_tool, task_is_long_mission},
     tool_declared_paths::{append_result_declared_paths, derive_declared_paths},
-    tool_result_utils::{safety_gate_public_error, tool_execution_status_label},
+    tool_result_utils::{
+        safety_gate_public_error, tool_execution_failed_result, tool_execution_status_label,
+    },
 };
 use crate::{
     active_skill_tool_execution_policy, execute_skill_custom_tool, parse_skill_custom_tool_name,
@@ -171,34 +173,46 @@ pub fn execute_task_tool_call_batch(
                     if let Some(snapshot) = snapshot_session.as_deref() {
                         snapshot.before_tool(&hook_ctx);
                     }
-                    let result = execute_task_tool_call(
-                        event_bus,
-                        tool_registry,
-                        agent_role_registry,
-                        skill_runtime,
-                        skill_dispatch_runtime,
-                        skill_name,
-                        task_store,
-                        session_store,
-                        execution_registry,
-                        conversation_registry,
-                        spawn_graph,
-                        safety_gate,
-                        todo_ledger,
-                        project_memory,
-                        mission_charter,
-                        plan,
-                        knowledge_graph,
-                        validation_runner,
-                        checkpoint,
-                        human_checkpoint,
-                        task,
-                        session_id,
-                        workspace_id,
-                        workspace_root_path,
-                        worker_id,
-                        &tool_calls[tool_index],
-                    );
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        execute_task_tool_call(
+                            event_bus,
+                            tool_registry,
+                            agent_role_registry,
+                            skill_runtime,
+                            skill_dispatch_runtime,
+                            skill_name,
+                            task_store,
+                            session_store,
+                            execution_registry,
+                            conversation_registry,
+                            spawn_graph,
+                            safety_gate,
+                            todo_ledger,
+                            project_memory,
+                            mission_charter,
+                            plan,
+                            knowledge_graph,
+                            validation_runner,
+                            checkpoint,
+                            human_checkpoint,
+                            task,
+                            session_id,
+                            workspace_id,
+                            workspace_root_path,
+                            worker_id,
+                            &tool_calls[tool_index],
+                        )
+                    }))
+                    .unwrap_or_else(|_| {
+                        tracing::warn!(
+                            tool_name = %tool_calls[tool_index].function.name,
+                            tool_call_id = %tool_calls[tool_index].id,
+                            task_id = %task.task_id.as_str(),
+                            session_id = %session_id.as_str(),
+                            "task tool execution panicked"
+                        );
+                        tool_execution_failed_result(&tool_calls[tool_index].function.name)
+                    });
                     append_result_declared_paths(&mut hook_ctx.declared_paths, &result.0);
                     if let Some(snapshot) = snapshot_session.as_deref() {
                         snapshot.after_tool(&hook_ctx);
@@ -254,15 +268,16 @@ pub fn execute_task_tool_call_batch(
                                             )
                                         }),
                                     );
-                                    let result = match result {
-                                        Ok(result) => result,
-                                        Err(payload) => {
-                                            if let Some(snapshot) = snapshot_session.as_deref() {
-                                                snapshot.after_tool(&hook_ctx);
-                                            }
-                                            std::panic::resume_unwind(payload);
-                                        }
-                                    };
+                                    let result = result.unwrap_or_else(|_| {
+                                        tracing::warn!(
+                                            tool_name = %tool_call.function.name,
+                                            tool_call_id = %tool_call.id,
+                                            task_id = %task.task_id.as_str(),
+                                            session_id = %session_id.as_str(),
+                                            "task tool execution panicked"
+                                        );
+                                        tool_execution_failed_result(&tool_call.function.name)
+                                    });
                                     append_result_declared_paths(
                                         &mut hook_ctx.declared_paths,
                                         &result.0,
@@ -278,15 +293,14 @@ pub fn execute_task_tool_call_batch(
 
                     for (tool_index, handle) in handles {
                         let result = handle.join().unwrap_or_else(|_| {
-                            (
-                                serde_json::json!({
-                                    "tool": tool_calls[tool_index].function.name,
-                                    "status": "failed",
-                                    "error": "任务工具执行线程异常"
-                                })
-                                .to_string(),
-                                ExecutionResultStatus::Failed,
-                            )
+                            tracing::warn!(
+                                tool_name = %tool_calls[tool_index].function.name,
+                                tool_call_id = %tool_calls[tool_index].id,
+                                task_id = %task.task_id.as_str(),
+                                session_id = %session_id.as_str(),
+                                "task tool execution thread panicked"
+                            );
+                            tool_execution_failed_result(&tool_calls[tool_index].function.name)
                         });
                         results[tool_index] = Some(result);
                     }
@@ -310,15 +324,7 @@ pub fn execute_task_tool_call_batch(
         .enumerate()
         .map(|(tool_index, result)| {
             result.unwrap_or_else(|| {
-                (
-                    serde_json::json!({
-                        "tool": tool_calls[tool_index].function.name,
-                        "status": "failed",
-                        "error": "任务工具未产生执行结果"
-                    })
-                    .to_string(),
-                    ExecutionResultStatus::Failed,
-                )
+                tool_execution_failed_result(&tool_calls[tool_index].function.name)
             })
         })
         .collect()
@@ -2129,6 +2135,10 @@ mod tests {
         snapshot: Arc<SnapshotSession>,
     }
 
+    struct PanicBuiltinTool {
+        name: &'static str,
+    }
+
     impl SnapshotReconcileProbeTool {
         fn new(name: &'static str, snapshot: Arc<SnapshotSession>) -> Self {
             Self { name, snapshot }
@@ -2166,6 +2176,29 @@ mod tests {
                 "stdout": "snapshot reconciled"
             })
             .to_string()
+        }
+
+        fn spec(&self) -> magi_tool_runtime::BuiltinToolSpec {
+            magi_tool_runtime::BuiltinToolSpec {
+                name: self.name.to_string(),
+                risk_level: magi_core::RiskLevel::Low,
+                approval_requirement: magi_core::ApprovalRequirement::None,
+            }
+        }
+    }
+
+    impl magi_tool_runtime::BuiltinTool for PanicBuiltinTool {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        fn execute(
+            &self,
+            _input: &str,
+            _context: &ToolExecutionContext,
+            _resources: &magi_tool_runtime::ToolRuntimeResources,
+        ) -> String {
+            panic!("internal task tool panic detail must stay private")
         }
 
         fn spec(&self) -> magi_tool_runtime::BuiltinToolSpec {
@@ -3230,6 +3263,78 @@ mod tests {
         assert_eq!(result[0].1, ExecutionResultStatus::NeedsApproval);
         assert!(result[0].0.contains("高风险工具必须人工审批"));
         assert!(target.exists(), "需要审批的递归删除不能提前执行");
+    }
+
+    #[test]
+    fn task_serial_tool_panic_returns_terminal_public_failure() {
+        let event_bus = InMemoryEventBus::new(16);
+        let task_store = TaskStore::new();
+        let session_store = SessionStore::new();
+        let execution_registry = TaskExecutionRegistry::default();
+        let conversation_registry = ConversationRegistry::new();
+        let spawn_graph = Mutex::new(magi_spawn_graph::SpawnGraph::new());
+        let todo_ledger = magi_todo_ledger::TodoLedger::new();
+        let agent_role_registry = magi_agent_role::AgentRoleRegistry::load_default();
+        let mut tool_registry = ToolRegistry::new(
+            Arc::new(magi_governance::GovernanceService::default()),
+            Arc::new(InMemoryEventBus::new(8)),
+        );
+        tool_registry.register_builtin(Arc::new(PanicBuiltinTool {
+            name: "unstable_tool",
+        }));
+
+        let task = test_task("task-panic-tool", "task-panic-tool", None);
+        let session_id = SessionId::new("session-panic-tool");
+        let workspace_id = Some(WorkspaceId::new("workspace-panic-tool"));
+        let tool_call = ChatToolCall {
+            id: "call-panic-tool".to_string(),
+            kind: "function".to_string(),
+            function: ChatToolFunction {
+                name: "unstable_tool".to_string(),
+                arguments: "{}".to_string(),
+            },
+        };
+
+        let result = execute_task_tool_call_batch(
+            &event_bus,
+            Some(&tool_registry),
+            &agent_role_registry,
+            None,
+            None,
+            None,
+            &task_store,
+            &session_store,
+            &execution_registry,
+            &conversation_registry,
+            &spawn_graph,
+            None,
+            &todo_ledger,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &task,
+            &session_id,
+            &workspace_id,
+            None,
+            None,
+            &[tool_call],
+            None,
+            None,
+        );
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].1, ExecutionResultStatus::Failed);
+        let payload: serde_json::Value =
+            serde_json::from_str(&result[0].0).expect("panic result should be json");
+        assert_eq!(payload["status"], "failed");
+        assert_eq!(payload["error_code"], "tool_execution_failed");
+        assert_eq!(payload["error"], "工具执行失败，请稍后重试");
+        assert!(!result[0].0.contains("panic"));
+        assert!(!result[0].0.contains("线程"));
     }
 
     #[tokio::test(flavor = "multi_thread")]

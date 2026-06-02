@@ -4,6 +4,8 @@
 
 use magi_core::ExecutionResultStatus;
 
+pub const TOOL_EXECUTION_FAILED_PUBLIC_ERROR: &str = "工具执行失败，请稍后重试";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PublicToolError {
     pub error_code: &'static str,
@@ -35,6 +37,19 @@ pub fn safety_gate_public_error(status: ExecutionResultStatus) -> PublicToolErro
             error: "该操作暂不可用",
         },
     }
+}
+
+pub fn tool_execution_failed_result(tool_name: &str) -> (String, ExecutionResultStatus) {
+    (
+        serde_json::json!({
+            "tool": tool_name,
+            "status": "failed",
+            "error_code": "tool_execution_failed",
+            "error": TOOL_EXECUTION_FAILED_PUBLIC_ERROR,
+        })
+        .to_string(),
+        ExecutionResultStatus::Failed,
+    )
 }
 
 pub fn turn_item_status_for_tool_result(status: ExecutionResultStatus) -> &'static str {

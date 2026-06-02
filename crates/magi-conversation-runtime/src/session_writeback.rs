@@ -1,6 +1,7 @@
 use crate::tool_declared_paths::{append_result_declared_paths, derive_declared_paths};
 use crate::tool_result_utils::{
-    summarize_tool_result, tool_execution_status_label, turn_item_status_for_tool_result,
+    summarize_tool_result, tool_execution_failed_result, tool_execution_status_label,
+    turn_item_status_for_tool_result,
 };
 use crate::{
     SKILL_APPLY_TOOL_NAME, active_skill_tool_execution_policy, execute_skill_apply_from_runtime,
@@ -835,19 +836,30 @@ fn execute_session_turn_tool_call_batch(
                     if let Some(snapshot) = snapshot_session {
                         snapshot.before_tool(&hook_ctx);
                     }
-                    let result = execute_session_turn_tool_call(
-                        event_bus,
-                        tool_registry,
-                        skill_runtime,
-                        skill_dispatch_runtime,
-                        skill_name,
-                        safety_gate,
-                        &tool_calls[tool_index],
-                        session_id,
-                        workspace_id,
-                        workspace_root_path,
-                        access_profile,
-                    );
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        execute_session_turn_tool_call(
+                            event_bus,
+                            tool_registry,
+                            skill_runtime,
+                            skill_dispatch_runtime,
+                            skill_name,
+                            safety_gate,
+                            &tool_calls[tool_index],
+                            session_id,
+                            workspace_id,
+                            workspace_root_path,
+                            access_profile,
+                        )
+                    }))
+                    .unwrap_or_else(|_| {
+                        tracing::warn!(
+                            tool_name = %tool_calls[tool_index].function.name,
+                            tool_call_id = %tool_calls[tool_index].id,
+                            session_id = %session_id.as_str(),
+                            "session turn tool execution panicked"
+                        );
+                        tool_execution_failed_result(&tool_calls[tool_index].function.name)
+                    });
                     append_result_declared_paths(&mut hook_ctx.declared_paths, &result.0);
                     if let Some(snapshot) = snapshot_session {
                         snapshot.after_tool(&hook_ctx);
@@ -888,15 +900,15 @@ fn execute_session_turn_tool_call_batch(
                                             )
                                         }),
                                     );
-                                    let result = match result {
-                                        Ok(result) => result,
-                                        Err(payload) => {
-                                            if let Some(snapshot) = snapshot_session.as_deref() {
-                                                snapshot.after_tool(&hook_ctx);
-                                            }
-                                            std::panic::resume_unwind(payload);
-                                        }
-                                    };
+                                    let result = result.unwrap_or_else(|_| {
+                                        tracing::warn!(
+                                            tool_name = %tool_call.function.name,
+                                            tool_call_id = %tool_call.id,
+                                            session_id = %session_id.as_str(),
+                                            "session turn tool execution panicked"
+                                        );
+                                        tool_execution_failed_result(&tool_call.function.name)
+                                    });
                                     append_result_declared_paths(
                                         &mut hook_ctx.declared_paths,
                                         &result.0,
@@ -912,15 +924,13 @@ fn execute_session_turn_tool_call_batch(
 
                     for (tool_index, handle) in handles {
                         let result = handle.join().unwrap_or_else(|_| {
-                            (
-                                serde_json::json!({
-                                    "tool": tool_calls[tool_index].function.name,
-                                    "status": "failed",
-                                    "error": "工具执行线程异常"
-                                })
-                                .to_string(),
-                                ExecutionResultStatus::Failed,
-                            )
+                            tracing::warn!(
+                                tool_name = %tool_calls[tool_index].function.name,
+                                tool_call_id = %tool_calls[tool_index].id,
+                                session_id = %session_id.as_str(),
+                                "session turn tool execution thread panicked"
+                            );
+                            tool_execution_failed_result(&tool_calls[tool_index].function.name)
                         });
                         results[tool_index] = Some(result);
                     }
@@ -934,15 +944,7 @@ fn execute_session_turn_tool_call_batch(
         .enumerate()
         .map(|(tool_index, result)| {
             result.unwrap_or_else(|| {
-                (
-                    serde_json::json!({
-                        "tool": tool_calls[tool_index].function.name,
-                        "status": "failed",
-                        "error": "工具执行结果缺失"
-                    })
-                    .to_string(),
-                    ExecutionResultStatus::Failed,
-                )
+                tool_execution_failed_result(&tool_calls[tool_index].function.name)
             })
         })
         .collect()
@@ -1179,6 +1181,10 @@ mod tests {
         probe: Arc<ConcurrentToolProbe>,
     }
 
+    struct PanicBuiltinTool {
+        name: &'static str,
+    }
+
     struct SnapshotReconcileProbeTool {
         name: &'static str,
         snapshot: Arc<SnapshotSession>,
@@ -1214,6 +1220,29 @@ mod tests {
                 "input": input,
             })
             .to_string()
+        }
+
+        fn spec(&self) -> BuiltinToolSpec {
+            BuiltinToolSpec {
+                name: self.name.to_string(),
+                risk_level: RiskLevel::Low,
+                approval_requirement: ApprovalRequirement::None,
+            }
+        }
+    }
+
+    impl BuiltinTool for PanicBuiltinTool {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        fn execute(
+            &self,
+            _input: &str,
+            _context: &ToolExecutionContext,
+            _resources: &magi_tool_runtime::ToolRuntimeResources,
+        ) -> String {
+            panic!("internal panic detail must stay out of public tool output")
         }
 
         fn spec(&self) -> BuiltinToolSpec {
@@ -2356,6 +2385,115 @@ mod tests {
         let canonical_tool = canonical_item.tool.as_ref().expect("canonical tool");
         assert!(canonical_tool.result.is_some());
         assert!(canonical_tool.error.is_some());
+    }
+
+    #[test]
+    fn session_turn_serial_tool_panic_is_written_as_terminal_public_failure() {
+        let session_store = SessionStore::new();
+        let event_bus = InMemoryEventBus::new(32);
+        let session_id = SessionId::new("session-turn-panic-tool");
+        let workspace_id = Some(WorkspaceId::new("workspace-turn-panic-tool"));
+        session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "panic tool session",
+                workspace_id.as_ref().map(ToString::to_string),
+            )
+            .expect("session should be creatable");
+        session_store
+            .upsert_current_turn(
+                session_id.clone(),
+                ActiveExecutionTurn {
+                    turn_id: "turn-panic-tool".to_string(),
+                    turn_seq: 1,
+                    accepted_at: UtcMillis::now(),
+                    status: "running".to_string(),
+                    user_message: Some("执行会 panic 的串行工具".to_string()),
+                    items: Vec::new(),
+                    completed_at: None,
+                },
+            )
+            .expect("turn should be creatable");
+
+        let mut tool_registry = ToolRegistry::new(
+            Arc::new(GovernanceService::default()),
+            Arc::new(InMemoryEventBus::new(8)),
+        );
+        tool_registry.register_builtin(Arc::new(PanicBuiltinTool {
+            name: "unstable_tool",
+        }));
+        let tool_calls = vec![ChatToolCall {
+            id: "tool-call-panic".to_string(),
+            kind: "function".to_string(),
+            function: ChatToolFunction {
+                name: "unstable_tool".to_string(),
+                arguments: "{}".to_string(),
+            },
+        }];
+        let mut messages = Vec::new();
+
+        assert!(append_session_tool_call_items_batch(
+            &session_store,
+            &event_bus,
+            Some(&tool_registry),
+            None,
+            None,
+            None,
+            None,
+            &session_id,
+            &workspace_id,
+            None,
+            magi_core::AccessProfile::Restricted,
+            &tool_calls,
+            &mut messages,
+            None,
+            None,
+            &ThreadId::new("thread-panic-tool"),
+            None,
+            || true,
+        ));
+
+        let sidecar = session_store
+            .runtime_sidecar(&session_id)
+            .expect("sidecar should exist");
+        let turn = sidecar.current_turn.expect("turn should exist");
+        assert_eq!(
+            turn.items.len(),
+            1,
+            "running item must be replaced by result"
+        );
+        let item = turn.items.first().expect("tool item should exist");
+        assert_eq!(item.status, "failed");
+        assert_eq!(item.tool_status.as_deref(), Some("failed"));
+        let public_payload = item
+            .tool_result
+            .as_deref()
+            .expect("panic result should be written");
+        let payload: serde_json::Value =
+            serde_json::from_str(public_payload).expect("panic result should be json");
+        assert_eq!(payload["status"], "failed");
+        assert_eq!(payload["error_code"], "tool_execution_failed");
+        assert_eq!(payload["error"], "工具执行失败，请稍后重试");
+        assert!(!public_payload.contains("panic"));
+        assert!(!public_payload.contains("线程"));
+        assert_eq!(
+            messages
+                .first()
+                .and_then(|message| message.tool_call_id.as_deref()),
+            Some("tool-call-panic")
+        );
+
+        let canonical_turn = session_store
+            .canonical_turns_for_session(&session_id)
+            .into_iter()
+            .find(|turn| turn.turn_id == "turn-panic-tool")
+            .expect("canonical turn should be stored");
+        let canonical_item = canonical_turn
+            .items
+            .first()
+            .expect("canonical tool item should exist");
+        assert_eq!(canonical_item.status, CanonicalTurnItemStatus::Failed);
+        assert!(canonical_item.visibility.renderable);
     }
 
     #[tokio::test(flavor = "multi_thread")]
