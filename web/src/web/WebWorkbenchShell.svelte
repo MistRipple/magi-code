@@ -512,29 +512,17 @@
     }, 6000);
   }
 
-  function selectWorkspaceLocally(workspace: AgentWorkspaceSummary): void {
-    selectedWorkspaceId = workspace.workspaceId;
-    currentSessionId = null;
+  function prepareWorkspaceSwitchLocally(workspace: AgentWorkspaceSummary): void {
     clearPendingSessionSwitchState();
     expandedWorkspaceIds = {
       ...expandedWorkspaceIds,
       [workspace.workspaceId]: true,
     };
-    messagesState.currentWorkspaceId = workspace.workspaceId;
-    messagesState.currentWorkspacePath = workspace.rootPath;
-    setCurrentSessionId(null);
-    sessionsByWorkspace = {
-      ...sessionsByWorkspace,
-      [workspace.workspaceId]: [],
-    };
-    updateSessions([]);
-    syncBrowserSessionBinding(workspace.workspaceId, workspace.rootPath, null);
   }
 
   function openWorkspaceFromBackend(workspace: AgentWorkspaceSummary): void {
     beginPendingWorkspaceSwitch(workspace.workspaceId);
-    selectWorkspaceLocally(workspace);
-    requestWorkspaceBindingSync(workspace, null);
+    prepareWorkspaceSwitchLocally(workspace);
     messagesState.sessionHydrating = true;
     void (async () => {
       await refreshWorkspaceSessions(
@@ -560,28 +548,32 @@
     };
 
     const requestStillTargetsSelection = selectedWorkspaceId === requestedWorkspaceId
-      || selectedWorkspaceId === authoritativeWorkspaceId;
+      || selectedWorkspaceId === authoritativeWorkspaceId
+      || pendingWorkspaceSwitchId === requestedWorkspaceId
+      || pendingWorkspaceSwitchId === authoritativeWorkspaceId;
     if (
-      selectedWorkspaceId === requestedWorkspaceId
+      (selectedWorkspaceId === requestedWorkspaceId || pendingWorkspaceSwitchId === requestedWorkspaceId)
       && selectedWorkspaceId !== authoritativeWorkspaceId
       && workspaces.some((workspace) => workspace.workspaceId === authoritativeWorkspaceId)
     ) {
-      selectedWorkspaceId = authoritativeWorkspaceId;
+      if (pendingWorkspaceSwitchId === requestedWorkspaceId) {
+        pendingWorkspaceSwitchId = authoritativeWorkspaceId;
+      } else {
+        selectedWorkspaceId = authoritativeWorkspaceId;
+      }
       expandedWorkspaceIds = {
         ...expandedWorkspaceIds,
         [authoritativeWorkspaceId]: true,
       };
     }
     const isStillSelectedWorkspace = requestStillTargetsSelection
-      && selectedWorkspaceId === authoritativeWorkspaceId;
+      && (
+        selectedWorkspaceId === authoritativeWorkspaceId
+        || pendingWorkspaceSwitchId === requestedWorkspaceId
+        || pendingWorkspaceSwitchId === authoritativeWorkspaceId
+      );
     if (!isStillSelectedWorkspace) {
       return '';
-    }
-    if (
-      pendingWorkspaceSwitchId === requestedWorkspaceId
-      || pendingWorkspaceSwitchId === authoritativeWorkspaceId
-    ) {
-      clearPendingWorkspaceSwitchState();
     }
 
     const backendSelectedSessionId = typeof snapshot.sessionId === 'string' ? snapshot.sessionId.trim() : '';
@@ -589,16 +581,21 @@
       ? backendSelectedSessionId
       : '';
 
-    clearCurrentSessionBeforeWorkspaceChange(authoritativeWorkspaceId);
-    messagesState.currentWorkspaceId = authoritativeWorkspaceId;
-    messagesState.currentWorkspacePath = snapshot.workspace.rootPath;
-    updateSessions(snapshot.sessions);
-    currentSessionId = resolvedSessionId || null;
-    setCurrentSessionId(resolvedSessionId || null);
-    syncBrowserSessionBinding(authoritativeWorkspaceId, snapshot.workspace.rootPath, resolvedSessionId || null);
-    requestWorkspaceBindingSync(snapshot.workspace, resolvedSessionId || null);
     if (resolvedSessionId) {
-      getClientBridge().postMessage({ type: 'requestState' });
+      getClientBridge().postMessage({
+        type: 'switchSession',
+        sessionId: resolvedSessionId,
+        workspaceId: authoritativeWorkspaceId,
+        workspacePath: snapshot.workspace.rootPath,
+      });
+    } else {
+      syncBrowserSessionBinding(authoritativeWorkspaceId, snapshot.workspace.rootPath, null);
+      requestWorkspaceBindingSync(snapshot.workspace, null);
+      clearCurrentSessionBeforeWorkspaceChange(authoritativeWorkspaceId);
+      messagesState.currentWorkspaceId = authoritativeWorkspaceId;
+      messagesState.currentWorkspacePath = snapshot.workspace.rootPath;
+      updateSessions(snapshot.sessions);
+      setCurrentSessionId(null);
     }
     return resolvedSessionId;
   }
