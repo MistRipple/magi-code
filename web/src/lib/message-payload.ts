@@ -311,25 +311,25 @@ function adaptFlatToolCallBlock(block: Record<string, unknown>): import('../type
     case 'error': case 'failed': resolvedStatus = 'error'; break;
     default:
       if (standardizedStatus === 'success') resolvedStatus = 'success';
-      else if (['error', 'timeout', 'killed'].includes(standardizedStatus)) resolvedStatus = 'error';
-      else if (['blocked', 'rejected', 'aborted'].includes(standardizedStatus)) resolvedStatus = 'success';
+      else if (['error', 'timeout', 'killed', 'blocked', 'rejected', 'aborted'].includes(standardizedStatus)) resolvedStatus = 'error';
       else if (error) resolvedStatus = 'error';
       else if (output) resolvedStatus = 'success';
       else resolvedStatus = 'running';
   }
 
-  const standardizedHardError = ['error', 'timeout', 'killed'].includes(standardizedStatus);
+  const standardizedHardError = ['error', 'timeout', 'killed', 'blocked', 'rejected', 'aborted'].includes(standardizedStatus);
   const standardizedError = standardized && standardizedHardError
     ? (typeof standardized.message === 'string' ? standardized.message : undefined)
     : undefined;
+  const resolvedError = error || standardizedError || (resolvedStatus === 'error' ? output : undefined);
 
   return {
     id: typeof block.toolId === 'string' ? block.toolId : '',
     name: typeof block.toolName === 'string' ? block.toolName : 'Tool',
     arguments: parseToolInput(block.input),
     status: resolvedStatus,
-    result: output || undefined,
-    error: error || standardizedError || undefined,
+    result: resolvedStatus === 'error' ? undefined : (output || undefined),
+    error: resolvedError || undefined,
     standardized: standardized as import('../types/message').StandardizedToolResult | undefined,
     durationMs: typeof block.duration === 'number' && Number.isFinite(block.duration)
       ? Math.max(0, Math.floor(block.duration))
@@ -345,7 +345,8 @@ function adaptFlatToolResultBlock(block: Record<string, unknown>): import('../ty
   const rawContent = typeof block.content === 'string' ? block.content.trim() : '';
   const fallbackMessage = typeof standardized?.message === 'string' ? standardized.message.trim() : '';
   const resolvedContent = rawContent || fallbackMessage;
-  const isError = block.isError === true || ['error', 'timeout', 'killed'].includes(standardizedStatus);
+  const isError = block.isError === true
+    || ['error', 'timeout', 'killed', 'blocked', 'rejected', 'aborted'].includes(standardizedStatus);
 
   return {
     id: typeof block.toolCallId === 'string' ? block.toolCallId : '',

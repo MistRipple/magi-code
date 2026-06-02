@@ -115,6 +115,9 @@ function valueToDisplayText(value: unknown): string | undefined {
 }
 
 function buildToolBlock(tool: CanonicalToolCall, status: CanonicalTurnItemStatus): ContentBlock {
+  const toolStatus = statusToToolStatus(status);
+  const resultText = valueToDisplayText(tool.result);
+  const errorText = tool.error || (toolStatus === 'error' ? resultText : undefined);
   return {
     id: `tool_call:${tool.callId}`,
     type: 'tool_call',
@@ -123,9 +126,9 @@ function buildToolBlock(tool: CanonicalToolCall, status: CanonicalTurnItemStatus
       id: tool.callId,
       name: tool.name,
       arguments: toolArgumentsToRecord(tool.arguments),
-      status: statusToToolStatus(status),
-      result: valueToDisplayText(tool.result),
-      error: tool.error,
+      status: toolStatus,
+      result: toolStatus === 'error' ? undefined : resultText,
+      error: errorText,
     },
   };
 }

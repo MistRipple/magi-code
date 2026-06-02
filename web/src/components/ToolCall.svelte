@@ -694,6 +694,12 @@
       'tool_policy_missing_path',
       'tool_policy_path_not_allowed',
       'tool_policy_path_forbidden',
+      'tool_policy_rejected',
+      'tool_policy_failed',
+      'skill_tool_policy_rejected',
+      'skill_tool_policy_failed',
+      'tool_safety_rejected',
+      'tool_safety_failed',
     )) {
       return {
         category: 'policy',
@@ -726,6 +732,16 @@
       'file_write_save_failed',
       'file_edit_write_failed',
       'file_remove_apply_failed',
+      'write_conflict',
+      'file_write_failed',
+      'file_mkdir_failed',
+      'file_copy_failed',
+      'file_move_failed',
+      'file_patch_failed',
+      'file_remove_rejected',
+      'file_remove_failed',
+      'apply_patch_failed',
+      'view_image_failed',
     )) {
       return {
         category: 'workspace_write',
@@ -781,7 +797,16 @@
 
     // 用户权限拦截（Ask 模式弹窗拒绝 / 权限开关关闭）
     // 仅匹配 errorCode，不对 message 做子串匹配 — 'authorization' 在代码中过于常见，易误判
-    if (codeMatches('tool_blocked') || messageHead.includes('user denied tool authorization')) {
+    if (
+      codeMatches(
+        'tool_blocked',
+        'tool_policy_needs_approval',
+        'skill_tool_policy_needs_approval',
+        'skill_tool_needs_approval',
+        'tool_safety_needs_approval',
+      )
+      || messageHead.includes('user denied tool authorization')
+    ) {
       return {
         category: 'permission',
         categoryLabel: i18n.t('toolCall.errorDiagnosis.permission.categoryLabel'),

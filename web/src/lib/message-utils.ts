@@ -150,18 +150,22 @@ export function mapStandardBlocks(blocks: StandardContentBlock[]): ContentBlock[
         const standardizedStatus = (block.standardized?.status || '').toLowerCase();
         const standardizedHardError = standardizedStatus === 'error'
           || standardizedStatus === 'timeout'
-          || standardizedStatus === 'killed';
+          || standardizedStatus === 'killed'
+          || standardizedStatus === 'blocked'
+          || standardizedStatus === 'rejected'
+          || standardizedStatus === 'aborted';
         const standardizedError = block.standardized
           && standardizedHardError
           ? (block.standardized.message || undefined)
           : undefined;
+        const resolvedError = block.error || standardizedError || (toolStatus === 'error' ? block.output : undefined);
         const toolCall: ToolCall = {
           id: toolId,
           name: block.toolName,
           arguments: safeParseJson(block.input) || {},
           status: toolStatus,
-          result: block.output,
-          error: block.error || standardizedError,
+          result: toolStatus === 'error' ? undefined : block.output,
+          error: resolvedError,
           standardized: block.standardized,
           durationMs: typeof block.duration === 'number' && Number.isFinite(block.duration)
             ? Math.max(0, Math.floor(block.duration))
@@ -326,7 +330,7 @@ function mapToolStatus(
       case 'blocked':
       case 'rejected':
       case 'aborted':
-        return 'success';
+        return 'error';
       default:
         break;
     }
@@ -348,6 +352,9 @@ function mapToolResultStatus(
     case 'error':
     case 'timeout':
     case 'killed':
+    case 'blocked':
+    case 'rejected':
+    case 'aborted':
       return 'error';
     default:
       return 'success';

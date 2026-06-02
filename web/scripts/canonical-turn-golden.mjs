@@ -200,6 +200,7 @@ function projectionSignature(value) {
       status: toolCall?.status || (message.isStreaming ? 'running' : 'complete'),
       toolName: toolCall?.name,
       hasToolResult: Boolean(toolCall?.result),
+      hasToolError: Boolean(toolCall?.error),
     };
   });
 }
@@ -1145,10 +1146,17 @@ function signatureMessageWithStatus(kind, itemKind, itemSeq, content, status) {
     status,
     toolName: undefined,
     hasToolResult: false,
+    hasToolError: false,
   };
 }
 
-function signatureTool(itemSeq, toolName, status, hasToolResult = status === 'success' || status === 'error') {
+function signatureTool(
+  itemSeq,
+  toolName,
+  status,
+  hasToolResult = status === 'success',
+  hasToolError = status === 'error',
+) {
   return {
     kind: 'tool',
     itemKind: 'tool_call',
@@ -1157,5 +1165,6 @@ function signatureTool(itemSeq, toolName, status, hasToolResult = status === 'su
     status,
     toolName,
     hasToolResult,
+    hasToolError,
   };
 }
