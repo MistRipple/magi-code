@@ -748,6 +748,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn event_stream_delivers_same_workspace_live_events_to_multiple_subscribers() {
+        let state = test_state_with_event_capacity(8);
+        let workspace = workspace_id("workspace-multi-subscriber");
+        let other_workspace = workspace_id("workspace-multi-subscriber-other");
+        let mut first_stream = Box::pin(event_envelope_stream(
+            state.clone(),
+            Some(workspace.clone()),
+            None,
+            None,
+        ));
+        let mut second_stream = Box::pin(event_envelope_stream(
+            state.clone(),
+            Some(workspace.clone()),
+            None,
+            None,
+        ));
+
+        state
+            .event_bus
+            .publish(
+                EventEnvelope::domain(
+                    EventId::new("event-multi-subscriber-first"),
+                    "session.turn.item",
+                    json!({ "content": "first" }),
+                )
+                .with_context(EventContext {
+                    workspace_id: Some(workspace.clone()),
+                    ..EventContext::default()
+                }),
+            )
+            .expect("first workspace event should publish");
+        state
+            .event_bus
+            .publish(
+                EventEnvelope::domain(
+                    EventId::new("event-multi-subscriber-other"),
+                    "session.turn.item",
+                    json!({ "content": "other" }),
+                )
+                .with_context(EventContext {
+                    workspace_id: Some(other_workspace),
+                    ..EventContext::default()
+                }),
+            )
+            .expect("other workspace event should publish");
+        state
+            .event_bus
+            .publish(
+                EventEnvelope::domain(
+                    EventId::new("event-multi-subscriber-second"),
+                    "session.turn.item",
+                    json!({ "content": "second" }),
+                )
+                .with_context(EventContext {
+                    workspace_id: Some(workspace.clone()),
+                    ..EventContext::default()
+                }),
+            )
+            .expect("second workspace event should publish");
+
+        let first_seen = tokio::time::timeout(Duration::from_secs(1), first_stream.next())
+            .await
+            .expect("first subscriber should receive first event")
+            .expect("first subscriber stream should stay open");
+        let second_seen = tokio::time::timeout(Duration::from_secs(1), second_stream.next())
+            .await
+            .expect("second subscriber should receive first event")
+            .expect("second subscriber stream should stay open");
+        assert_eq!(first_seen.event_id.as_str(), "event-multi-subscriber-first");
+        assert_eq!(
+            second_seen.event_id.as_str(),
+            "event-multi-subscriber-first"
+        );
+
+        let first_next = tokio::time::timeout(Duration::from_secs(1), first_stream.next())
+            .await
+            .expect("first subscriber should skip other workspace and receive second event")
+            .expect("first subscriber stream should stay open");
+        let second_next = tokio::time::timeout(Duration::from_secs(1), second_stream.next())
+            .await
+            .expect("second subscriber should skip other workspace and receive second event")
+            .expect("second subscriber stream should stay open");
+        assert_eq!(first_next.event_id.as_str(), "event-multi-subscriber-second");
+        assert_eq!(
+            second_next.event_id.as_str(),
+            "event-multi-subscriber-second"
+        );
+    }
+
+    #[tokio::test]
     async fn event_stream_filters_snapshot_by_after_sequence_cursor() {
         let state = test_state_with_event_capacity(8);
         let workspace = workspace_id("workspace-after-sequence");
