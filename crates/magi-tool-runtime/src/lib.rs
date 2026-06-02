@@ -1655,8 +1655,6 @@ pub struct RuntimeCapabilityDependencyEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_status: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cache_error_code: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role_count: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spawnable_role_count: Option<usize>,

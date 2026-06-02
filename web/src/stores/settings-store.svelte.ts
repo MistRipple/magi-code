@@ -153,7 +153,6 @@ export interface CapabilityDependencyItem {
   fileCount?: number | null;
   lastIndexed?: number | null;
   cacheStatus?: string | null;
-  cacheErrorCode?: string | null;
   roleCount?: number | null;
   spawnableRoleCount?: number | null;
   snapshotActive?: boolean | null;
@@ -2504,7 +2503,6 @@ function createSettingsStore(props: { onClose?: () => void }) {
       const fileCount = readDependencyField(dependency, "fileCount", "file_count");
       const lastIndexed = readDependencyField(dependency, "lastIndexed", "last_indexed");
       const cacheStatus = readDependencyField(dependency, "cacheStatus", "cache_status");
-      const cacheErrorCode = readDependencyField(dependency, "cacheErrorCode", "cache_error_code");
       const roleCount = readDependencyField(dependency, "roleCount", "role_count");
       const spawnableRoleCount = readDependencyField(dependency, "spawnableRoleCount", "spawnable_role_count");
       const workspaceId = readDependencyField(dependency, "workspaceId", "workspace_id");
@@ -2533,7 +2531,6 @@ function createSettingsStore(props: { onClose?: () => void }) {
           ? lastIndexed
           : null,
         cacheStatus: typeof cacheStatus === "string" ? cacheStatus : null,
-        cacheErrorCode: typeof cacheErrorCode === "string" ? cacheErrorCode : null,
         roleCount: typeof roleCount === "number" && Number.isFinite(roleCount)
           ? roleCount
           : null,

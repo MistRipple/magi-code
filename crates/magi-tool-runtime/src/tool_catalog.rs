@@ -246,7 +246,6 @@ struct RuntimeHealth {
     workspace_code_index_file_count: Option<usize>,
     workspace_code_index_last_indexed: Option<u64>,
     workspace_code_index_cache_status: Option<String>,
-    workspace_code_index_cache_error_code: Option<String>,
     agent_role_registry_available: bool,
     agent_role_count: usize,
     spawnable_agent_role_count: usize,
@@ -273,7 +272,6 @@ impl RuntimeHealth {
             workspace_code_index_file_count,
             workspace_code_index_last_indexed,
             workspace_code_index_cache_status,
-            workspace_code_index_cache_error_code,
         ) = match (
             resources.knowledge_store.as_ref(),
             context.workspace_id.as_ref(),
@@ -290,12 +288,9 @@ impl RuntimeHealth {
                     stats
                         .as_ref()
                         .map(|stats| stats.index_cache_status.to_string()),
-                    stats
-                        .as_ref()
-                        .and_then(|stats| stats.index_cache_error_code.map(str::to_string)),
                 )
             }
-            _ => (false, None, None, None, None),
+            _ => (false, None, None, None),
         };
 
         Self {
@@ -305,7 +300,6 @@ impl RuntimeHealth {
             workspace_code_index_file_count,
             workspace_code_index_last_indexed,
             workspace_code_index_cache_status,
-            workspace_code_index_cache_error_code,
             agent_role_registry_available: resources.agent_role_catalog_provider.is_some(),
             agent_role_count: agent_roles.len(),
             spawnable_agent_role_count: agent_roles.iter().filter(|role| role.spawnable).count(),
@@ -406,7 +400,6 @@ impl RuntimeHealth {
                 "file_count": self.workspace_code_index_file_count,
                 "last_indexed": self.workspace_code_index_last_indexed,
                 "cache_status": self.workspace_code_index_cache_status,
-                "cache_error_code": self.workspace_code_index_cache_error_code,
                 "required_by": ["search_semantic", "code_symbols"],
             }),
             serde_json::json!({
@@ -755,7 +748,6 @@ mod tests {
                     file_count: None,
                     last_indexed: None,
                     cache_status: None,
-                    cache_error_code: None,
                     role_count: None,
                     spawnable_role_count: None,
                     snapshot_active: Some(false),
@@ -1041,10 +1033,7 @@ mod tests {
         assert_eq!(search_semantic["runtime_status"], "degraded");
         assert_eq!(workspace_code_index["status"], "degraded");
         assert_eq!(workspace_code_index["cache_status"], "degraded");
-        assert_eq!(
-            workspace_code_index["cache_error_code"],
-            "index_cache_save_failed"
-        );
+        assert!(workspace_code_index.get("cache_error_code").is_none());
 
         let _ = std::fs::remove_dir_all(root);
     }
