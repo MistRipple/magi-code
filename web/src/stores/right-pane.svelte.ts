@@ -16,6 +16,9 @@ export type RightPaneTabKind = 'agent' | 'code';
 /** Agent tab payload —— 代理 taskId，内容由 canonical projection 按 metadata.taskId 过滤投影 */
 export interface AgentTabPayload {
   taskId: string;
+  workspaceId?: string;
+  workspacePath?: string;
+  sessionId?: string;
 }
 
 /** Code tab payload —— filepath 必填；diff 存在时走 diff 视图，否则走单文件 viewer */
@@ -84,13 +87,13 @@ const EMPTY_SESSION_STATE: SessionPaneState = {
 };
 
 /** localStorage 持久化 key，带 schema 版本号方便后续演化 */
-const STORAGE_KEY = 'magi-right-pane-state.v2';
+const STORAGE_KEY = 'magi-right-pane-state.v3';
 /** 持久化 session 总数硬上限：超过后按 lastActivatedAt 倒序保留最近 N 个，防止长期使用膨胀 */
 const MAX_PERSISTED_SESSIONS = 50;
 const WORKSPACE_SCOPE_PREFIX = 'workspace:';
 
 interface PersistedShape {
-  version: 2;
+  version: 3;
   activeScopeKey: string;
   activeWorkspaceId: string;
   activeSessionId: string;
@@ -178,7 +181,7 @@ function loadPersisted(): void {
     const raw = window.localStorage.getItem(STORAGE_KEY);
     if (!raw) return;
     const parsed = JSON.parse(raw) as PersistedShape;
-    if (!parsed || parsed.version !== 2) return;
+    if (!parsed || parsed.version !== 3) return;
     const recovered: Record<string, SessionPaneState> = {};
     for (const [sid, state] of Object.entries(parsed.perSession ?? {})) {
       if (!state || !Array.isArray(state.openTabs)) continue;
@@ -215,7 +218,7 @@ function persistState(): void {
       kept = ranked.slice(0, MAX_PERSISTED_SESSIONS).map((x) => [x.sid, x.state]);
     }
     const slim: PersistedShape = {
-      version: 2,
+      version: 3,
       activeScopeKey: rightPaneState.activeScopeKey,
       activeWorkspaceId: rightPaneState.activeWorkspaceId,
       activeSessionId: rightPaneState.activeSessionId,
@@ -386,7 +389,12 @@ export function getRightPaneState(scopeKeyOrSessionId: string | null | undefined
 export function openAgentTab(
   sessionId: string | null | undefined,
   taskId: string | null | undefined,
-  options?: { label?: string; accentToken?: string | null; workspaceId?: string | null },
+  options?: {
+    label?: string;
+    accentToken?: string | null;
+    workspaceId?: string | null;
+    workspacePath?: string | null;
+  },
 ): void {
   const normalizedSession = normalizeSessionId(sessionId);
   if (!normalizedSession) {
@@ -409,7 +417,12 @@ export function openAgentTab(
   upsertTab(
     scopeKey,
     'agent',
-    { taskId: trimmedTaskId },
+    {
+      taskId: trimmedTaskId,
+      workspaceId,
+      workspacePath: typeof options?.workspacePath === 'string' ? options.workspacePath.trim() : undefined,
+      sessionId: normalizedSession,
+    },
     label,
     accentToken,
   );

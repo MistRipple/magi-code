@@ -12,7 +12,7 @@
   import { i18n } from '../stores/i18n.svelte';
   import { getCurrentSessionId, messagesState } from '../stores/messages.svelte';
   import { diagramSummary, parseToolDiagramPayload } from '../lib/diagram-payload';
-  import { openAgentTab, rightPaneState } from '../stores/right-pane.svelte';
+  import { openAgentTab } from '../stores/right-pane.svelte';
   import { getAgentVisualInfo } from '../lib/agent-colors';
   import { toolPayloadErrorCode } from '../lib/tool-error-payload';
 
@@ -481,9 +481,10 @@
   function openAgentSpawnTab(): void {
     const display = agentSpawnDisplay;
     if (!display || !display.childTaskId) return;
-    openAgentTab(getCurrentSessionId() || rightPaneState.activeSessionId, display.childTaskId, {
+    openAgentTab(filePreviewScope?.sessionId || getCurrentSessionId(), display.childTaskId, {
       label: display.title,
-      workspaceId: messagesState.currentWorkspaceId,
+      workspaceId: filePreviewScope?.workspaceId || messagesState.currentWorkspaceId,
+      workspacePath: filePreviewScope?.workspacePath || messagesState.currentWorkspacePath,
     });
   }
 

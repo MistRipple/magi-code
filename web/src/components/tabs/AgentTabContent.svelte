@@ -11,18 +11,53 @@
   interface Props {
     /** 代理 taskId —— 用于按 metadata.taskId 过滤 projection artifacts */
     taskId: string;
+    workspaceId?: string | null;
+    workspacePath?: string | null;
+    sessionId?: string | null;
   }
 
-  let { taskId }: Props = $props();
+  let {
+    taskId,
+    workspaceId = null,
+    workspacePath = null,
+    sessionId = null,
+  }: Props = $props();
 
   interface AgentAssignmentSummary {
     title: string;
     goal: string;
   }
 
+  function normalizeString(value: unknown): string {
+    return typeof value === 'string' ? value.trim() : '';
+  }
+
+  const scopedSessionId = $derived(normalizeString(sessionId));
+  const scopedWorkspaceId = $derived(normalizeString(workspaceId));
+  const scopedWorkspacePath = $derived(normalizeString(workspacePath));
+  const scopeMatchesCurrentSession = $derived.by(() => {
+    if (!scopedSessionId) {
+      return false;
+    }
+    if (normalizeString(messagesState.currentSessionId) !== scopedSessionId) {
+      return false;
+    }
+    return !scopedWorkspaceId || normalizeString(messagesState.currentWorkspaceId) === scopedWorkspaceId;
+  });
+  const scopedTimelineProjection = $derived.by(() => {
+    if (!scopeMatchesCurrentSession) {
+      return null;
+    }
+    const projection = messagesState.canonicalTimelineProjection;
+    if (!projection || normalizeString(projection.sessionId) !== scopedSessionId) {
+      return null;
+    }
+    return projection;
+  });
+
   const taskProjection = $derived(getTaskProjectionState(
-    messagesState.currentSessionId,
-    messagesState.currentWorkspaceId,
+    scopedSessionId,
+    scopedWorkspaceId,
   ));
 
   const projectionTask = $derived.by<TaskDto | null>(() => {
@@ -53,17 +88,13 @@
     }
   }
 
-  function normalizeString(value: unknown): string {
-    return typeof value === 'string' ? value.trim() : '';
-  }
-
   function spawnResultChildTaskId(block: ContentBlock): string {
     const result = parseJsonRecord(block.toolCall?.result);
     return normalizeString(result?.child_task_id ?? result?.childTaskId);
   }
 
   const spawnAssignment = $derived.by<AgentAssignmentSummary | null>(() => {
-    const projection = messagesState.canonicalTimelineProjection;
+    const projection = scopedTimelineProjection;
     if (!taskId || !projection) {
       return null;
     }
@@ -124,7 +155,7 @@
     if (typeof task?.created_at === 'number' && task.created_at > 0) {
       return task.created_at;
     }
-    const projection = messagesState.canonicalTimelineProjection;
+    const projection = scopedTimelineProjection;
     if (!taskId || !projection) {
       return Date.now();
     }
@@ -159,20 +190,21 @@
     return {
       key: `assignment:${taskId}`,
       message,
-      workspaceId: messagesState.currentWorkspaceId || undefined,
-      workspacePath: messagesState.currentWorkspacePath || undefined,
-      sessionId: messagesState.currentSessionId || undefined,
+      workspaceId: scopedWorkspaceId || undefined,
+      workspacePath: scopedWorkspacePath || undefined,
+      sessionId: scopedSessionId || undefined,
     };
   });
 
   const renderItems = $derived.by<TimelineRenderItem[]>(() => {
-    const projection = messagesState.canonicalTimelineProjection;
+    const projection = scopedTimelineProjection;
     if (!taskId || !projection) {
       return assignmentRenderItem ? [assignmentRenderItem] : [];
     }
     const items = buildTimelineRenderItems(projection, 'task', taskId, {
-      workspaceId: messagesState.currentWorkspaceId,
-      workspacePath: messagesState.currentWorkspacePath,
+      workspaceId: scopedWorkspaceId,
+      workspacePath: scopedWorkspacePath,
+      sessionId: scopedSessionId,
     });
     return assignmentRenderItem ? [assignmentRenderItem, ...items] : items;
   });

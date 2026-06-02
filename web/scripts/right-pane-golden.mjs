@@ -46,6 +46,35 @@ try {
   const sessionTab = sessionPane.openTabs.find((tab) => tab.kind === 'code');
   assert.equal(sessionTab?.payload.sessionId, 'session-edit');
 
+  rightPane.openAgentTab('session-agent', 'task-agent-1', {
+    workspaceId: 'workspace-agent',
+    workspacePath: '/tmp/workspace-agent',
+    label: '执行代理',
+  });
+  assert.equal(
+    rightPane.rightPaneState.activeScopeKey,
+    'workspace-agent\u0000session-agent',
+    'agent tab must use explicit workspace/session scope',
+  );
+  const agentPane = rightPane.getRightPaneState(rightPane.rightPaneState.activeScopeKey);
+  const agentTab = agentPane.openTabs.find((tab) => tab.kind === 'agent');
+  assert.equal(agentTab?.payload.sessionId, 'session-agent');
+  assert.equal(agentTab?.payload.workspaceId, 'workspace-agent');
+  assert.equal(agentTab?.payload.workspacePath, '/tmp/workspace-agent');
+
+  rightPane.openAgentTab('session-agent', 'task-agent-1', {
+    workspaceId: 'workspace-other',
+    label: '另一个工作区代理',
+  });
+  assert.equal(
+    rightPane.rightPaneState.activeScopeKey,
+    'workspace-other\u0000session-agent',
+    'same task id in another workspace must stay in a separate right-pane scope',
+  );
+  const otherAgentPane = rightPane.getRightPaneState(rightPane.rightPaneState.activeScopeKey);
+  const otherAgentTab = otherAgentPane.openTabs.find((tab) => tab.kind === 'agent');
+  assert.equal(otherAgentTab?.payload.workspaceId, 'workspace-other');
+
   console.log('right pane golden replay passed');
 } finally {
   await server.close();

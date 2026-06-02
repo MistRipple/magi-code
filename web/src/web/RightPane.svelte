@@ -584,7 +584,13 @@
         <span class="right-pane-meta-line">{i18n.t('rightPane.empty.hint')}</span>
       </div>
     {:else if activeTab.kind === 'agent'}
-      <AgentTabContent taskId={(activeTab.payload as AgentTabPayload).taskId} />
+      {@const agentPayload = activeTab.payload as AgentTabPayload}
+      <AgentTabContent
+        taskId={agentPayload.taskId}
+        workspaceId={agentPayload.workspaceId}
+        workspacePath={agentPayload.workspacePath}
+        sessionId={agentPayload.sessionId}
+      />
     {:else if previewLoading}
       <div class="right-pane-state">{i18n.t('web.filePreviewLoading')}</div>
     {:else if previewError}
