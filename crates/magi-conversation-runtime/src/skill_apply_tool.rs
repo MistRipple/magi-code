@@ -1,4 +1,4 @@
-use magi_bridge_client::{ChatToolDefinition, ChatToolFunctionDefinition};
+use magi_bridge_client::{BridgeBindingKind, ChatToolDefinition, ChatToolFunctionDefinition};
 use magi_core::ExecutionResultStatus;
 use magi_skill_runtime::SkillRuntime;
 
@@ -95,17 +95,14 @@ pub fn execute_skill_apply_from_runtime(
     };
     let skill_id = skill.skill_id.clone();
     let title = skill.title.clone();
-    let custom_tool_bindings = skill
+    let custom_tools = skill
         .custom_tool_bindings
         .iter()
         .map(|binding| {
             serde_json::json!({
-                "binding_id": binding.binding_id,
                 "tool_name": binding.tool_name,
                 "description": binding.description,
-                "bridge_kind": binding.bridge_kind,
-                "dispatch_action": binding.dispatch_action,
-                "bridge_target": binding.bridge_target,
+                "tool_type": skill_apply_custom_tool_type(binding.bridge_kind),
             })
         })
         .collect::<Vec<_>>();
@@ -117,7 +114,7 @@ pub fn execute_skill_apply_from_runtime(
             "title": skill.title,
             "instruction": skill.instruction,
             "allowed_tools": skill.allowed_tools,
-            "custom_tool_bindings": custom_tool_bindings,
+            "custom_tools": custom_tools,
             "metadata": {
                 "category": skill.metadata.category,
                 "tags": skill.metadata.tags,
@@ -128,6 +125,13 @@ pub fn execute_skill_apply_from_runtime(
         .to_string(),
         ExecutionResultStatus::Succeeded,
     )
+}
+
+fn skill_apply_custom_tool_type(bridge_kind: BridgeBindingKind) -> &'static str {
+    match bridge_kind {
+        BridgeBindingKind::Model => "model",
+        BridgeBindingKind::Mcp => "external",
+    }
 }
 
 fn skill_apply_failed(
@@ -153,7 +157,8 @@ fn skill_apply_failed(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use magi_skill_runtime::{SkillDefinition, SkillMetadata, SkillRegistry};
+    use magi_bridge_client::{BridgeBindingKind, BridgeDispatchAction};
+    use magi_skill_runtime::{CustomToolBinding, SkillDefinition, SkillMetadata, SkillRegistry};
 
     fn make_skill_runtime() -> SkillRuntime {
         let registry = SkillRegistry::new();
@@ -197,6 +202,52 @@ mod tests {
                 .unwrap()
                 .contains("产品稳定性")
         );
+    }
+
+    #[test]
+    fn skill_apply_returns_public_custom_tool_summary_without_binding_details() {
+        let registry = SkillRegistry::new();
+        registry.register(SkillDefinition {
+            skill_id: "ops-skill".to_string(),
+            title: "运维 Skill".to_string(),
+            instruction: "调用外接工具检查状态。".to_string(),
+            metadata: SkillMetadata {
+                category: "ops".to_string(),
+                tags: vec!["mcp".to_string()],
+            },
+            allowed_tools: vec![],
+            custom_tool_bindings: vec![CustomToolBinding {
+                binding_id: "secret-binding".to_string(),
+                tool_name: "status.check".to_string(),
+                description: "检查运行状态".to_string(),
+                bridge_kind: BridgeBindingKind::Mcp,
+                dispatch_action: BridgeDispatchAction::McpToolCall,
+                bridge_target: "server-secret-token".to_string(),
+            }],
+            prompt_priority: 50,
+        });
+        let runtime = SkillRuntime::new(registry);
+
+        let (payload, status) = execute_skill_apply_from_runtime(
+            &serde_json::json!({ "skill_name": "ops-skill" }).to_string(),
+            Some(&runtime),
+        );
+
+        assert_eq!(status, ExecutionResultStatus::Succeeded);
+        let parsed: serde_json::Value = serde_json::from_str(&payload).expect("payload json");
+        assert!(parsed.get("custom_tool_bindings").is_none());
+        let custom_tools = parsed["custom_tools"]
+            .as_array()
+            .expect("custom_tools should be an array");
+        assert_eq!(custom_tools.len(), 1);
+        assert_eq!(custom_tools[0]["tool_name"], "status.check");
+        assert_eq!(custom_tools[0]["description"], "检查运行状态");
+        assert_eq!(custom_tools[0]["tool_type"], "external");
+        assert!(custom_tools[0].get("binding_id").is_none());
+        assert!(custom_tools[0].get("bridge_target").is_none());
+        assert!(custom_tools[0].get("dispatch_action").is_none());
+        assert!(!payload.contains("secret-binding"));
+        assert!(!payload.contains("server-secret-token"));
     }
 
     #[test]

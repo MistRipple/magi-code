@@ -109,8 +109,10 @@ fn build_skill_custom_tool_definition(
         function: ChatToolFunctionDefinition {
             name: skill_custom_tool_surface_name(skill_name, binding),
             description: format!(
-                "{}（{} → {}，{}）",
-                binding.description, binding.tool_name, binding.bridge_target, binding.binding_id
+                "{}（{}，{}）",
+                binding.description,
+                binding.tool_name,
+                skill_custom_tool_bridge_label(binding.bridge_kind)
             ),
             parameters: serde_json::json!({
                 "type": "object",
@@ -123,6 +125,15 @@ fn build_skill_custom_tool_definition(
                 "required": ["payload"]
             }),
         },
+    }
+}
+
+fn skill_custom_tool_bridge_label(
+    bridge_kind: magi_bridge_client::BridgeBindingKind,
+) -> &'static str {
+    match bridge_kind {
+        magi_bridge_client::BridgeBindingKind::Model => "模型工具",
+        magi_bridge_client::BridgeBindingKind::Mcp => "外接工具",
     }
 }
 
@@ -632,6 +643,12 @@ mod tests {
             "模型工具名只能包含安全字符，实际: {tool_name}"
         );
         assert!(!tool_name.chars().any(|ch| matches!(ch, ':' | '/' | ' ')));
+        let description = definitions[0].function.description.as_str();
+        assert!(description.contains("调用审查工具"));
+        assert!(description.contains("mcp.review"));
+        assert!(description.contains("外接工具"));
+        assert!(!description.contains("mcp.review:loopback/server"));
+        assert!(!description.contains("loopback/server"));
         assert!(
             parse_skill_custom_tool_name(tool_name).is_some(),
             "规范化后的工具名仍应能被 runtime 解析"
