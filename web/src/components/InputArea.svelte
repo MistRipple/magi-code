@@ -83,8 +83,11 @@
 
   // 🔧 图片上传相关状态
   let selectedImages = $state<SelectedImage[]>([]);
+  let pendingImageReadCount = $state(0);
+  let sendPreparing = $state(false);
   const MAX_IMAGES = 5;  // 最多支持 5 张图片
   const MAX_IMAGE_SIZE = 10 * 1024 * 1024;  // 单张图片最大 10MB
+  const IMAGE_FILE_NAME_PATTERN = /\.(png|jpe?g|gif|webp|bmp|heic|heif)$/i;
 
   let stopLoading = $state(false);
   let enhanceLoading = $state(false);
@@ -163,14 +166,14 @@
     return i18n.t('input.send');
   });
   const sendDisabled = $derived.by(() => (
-    sessionInputLocked || isInteractionBlocking
+    sessionInputLocked || isInteractionBlocking || sendPreparing || pendingImageReadCount > 0
   ));
   // 按钮双态状态 - 使用 $derived 计算
   const hasContent = $derived.by(() => {
     if (inputValue.trim().length > 0) return true;
     // 执行中补充指令不支持图片，避免"有内容可发送"与实际能力不一致
     if (isSending) return false;
-    return selectedImages.length > 0;
+    return selectedImages.length > 0 || pendingImageReadCount > 0;
   });
 
   // bootstrap 是全局缓存，新会话/设置变更都会同步更新这里，所以输入框可以直接派生。
@@ -274,6 +277,96 @@
     selectedSkill = null;
     clearEnhanceSnapshot();
     closeSlashMenu();
+  }
+
+  let imageReadWaiters: Array<() => void> = [];
+
+  function notifyImageReadWaiters() {
+    if (pendingImageReadCount > 0 || imageReadWaiters.length === 0) return;
+    const waiters = imageReadWaiters;
+    imageReadWaiters = [];
+    for (const resolve of waiters) resolve();
+  }
+
+  function beginImageRead() {
+    pendingImageReadCount += 1;
+  }
+
+  function finishImageRead() {
+    pendingImageReadCount = Math.max(0, pendingImageReadCount - 1);
+    notifyImageReadWaiters();
+  }
+
+  function waitForPendingImageReads(): Promise<void> {
+    if (pendingImageReadCount === 0) return Promise.resolve();
+    return new Promise((resolve) => {
+      imageReadWaiters = [...imageReadWaiters, resolve];
+    });
+  }
+
+  function isClipboardImageFile(file: File, hintedType = ''): boolean {
+    const mediaType = (file.type || hintedType).toLowerCase();
+    if (mediaType.startsWith('image/')) return true;
+    return IMAGE_FILE_NAME_PATTERN.test(file.name);
+  }
+
+  function clipboardFileKey(file: File): string {
+    return [
+      file.name,
+      file.type,
+      file.size,
+      file.lastModified,
+    ].join(':');
+  }
+
+  function collectClipboardImageFiles(data: DataTransfer | null | undefined): File[] {
+    if (!data) return [];
+    const files: File[] = [];
+    const seen = new Set<string>();
+    const addFile = (file: File | null, hintedType = '') => {
+      if (!file || !isClipboardImageFile(file, hintedType)) return;
+      const key = clipboardFileKey(file);
+      if (seen.has(key)) return;
+      seen.add(key);
+      files.push(file);
+    };
+
+    for (const item of Array.from(data.items ?? [])) {
+      if (item.kind !== 'file') continue;
+      addFile(item.getAsFile(), item.type);
+    }
+    for (const file of Array.from(data.files ?? [])) {
+      addFile(file);
+    }
+    return files;
+  }
+
+  function readImageFileIntoComposer(file: File) {
+    beginImageRead();
+    const reader = new FileReader();
+    const imageName = file.name || i18n.t('input.pastedImage', {
+      index: selectedImages.length + pendingImageReadCount,
+    });
+    reader.onload = (event) => {
+      const dataUrl = event.target?.result;
+      if (typeof dataUrl !== 'string' || dataUrl.length === 0) return;
+      selectedImages = [...selectedImages, {
+        id: generateId(),
+        dataUrl,
+        name: imageName,
+      }];
+      addToast('success', i18n.t('input.imageAdded'));
+    };
+    reader.onerror = () => {
+      addToast('error', i18n.t('input.imageReadFailed'));
+    };
+    reader.onloadend = finishImageRead;
+    try {
+      reader.readAsDataURL(file);
+    } catch {
+      finishImageRead();
+      addToast('error', i18n.t('input.imageReadFailed'));
+    }
   }
 
   // contenteditable 编辑器辅助：以 inputValue 为唯一事实，DOM 仅作为渲染层。
@@ -561,41 +654,48 @@
   // 发送消息（支持图片附件）。
   // 空闲时直接执行；正在响应时自动进入排队，由 bridge 在当前轮结束后逐条提交。
   async function sendMessage() {
-    const rawContent = resolveComposerRawContent();
-    const normalizedContent = rawContent.trim();
-    if ((!normalizedContent && selectedImages.length === 0) || sessionInputLocked || isInteractionBlocking) return;
-    if (isSending && selectedImages.length > 0) {
-      addToast('warning', i18n.t('input.noImageDuringExecution'));
-      return;
+    if (sendPreparing) return;
+    sendPreparing = true;
+    try {
+      await waitForPendingImageReads();
+      const rawContent = resolveComposerRawContent();
+      const normalizedContent = rawContent.trim();
+      if ((!normalizedContent && selectedImages.length === 0) || sessionInputLocked || isInteractionBlocking) return;
+      if (isSending && selectedImages.length > 0) {
+        addToast('warning', i18n.t('input.noImageDuringExecution'));
+        return;
+      }
+
+      const submissionText = normalizedContent
+        ? rawContent
+        : (selectedImages.length > 0 ? i18n.t('input.analyzeImages') : null);
+      const submissionLength = submissionText?.length ?? 0;
+
+      if (submissionLength > MAX_INPUT_CHARS) {
+        addToast('warning', i18n.t('input.inputTooLong', { length: submissionLength, max: MAX_INPUT_CHARS }));
+        return;
+      }
+
+      const requestId = generateId();
+      vscode.postMessage({
+        type: 'executeTask',
+        text: submissionText,
+        requestId,
+        workspaceId: messagesState.currentWorkspaceId || undefined,
+        workspacePath: messagesState.currentWorkspacePath || undefined,
+        sessionId: messagesState.currentSessionId || '',
+        skillName: selectedSkill?.name ?? null,
+        accessProfile: selectedAccessProfile,
+        followUpMode: isSending ? 'queue' : undefined,
+        images: selectedImages.map((img) => ({
+          name: img.name,
+          dataUrl: img.dataUrl,
+        })),
+      });
+      clearComposerState();
+    } finally {
+      sendPreparing = false;
     }
-
-    const submissionText = normalizedContent
-      ? rawContent
-      : (selectedImages.length > 0 ? i18n.t('input.analyzeImages') : null);
-    const submissionLength = submissionText?.length ?? 0;
-
-    if (submissionLength > MAX_INPUT_CHARS) {
-      addToast('warning', i18n.t('input.inputTooLong', { length: submissionLength, max: MAX_INPUT_CHARS }));
-      return;
-    }
-
-    const requestId = generateId();
-    vscode.postMessage({
-      type: 'executeTask',
-      text: submissionText,
-      requestId,
-      workspaceId: messagesState.currentWorkspaceId || undefined,
-      workspacePath: messagesState.currentWorkspacePath || undefined,
-      sessionId: messagesState.currentSessionId || '',
-      skillName: selectedSkill?.name ?? null,
-      accessProfile: selectedAccessProfile,
-      followUpMode: isSending ? 'queue' : undefined,
-      images: selectedImages.map((img) => ({
-        name: img.name,
-        dataUrl: img.dataUrl,
-      })),
-    });
-    clearComposerState();
   }
 
   function insertNewlineAtCursor() {
@@ -740,49 +840,20 @@
 
   // 🔧 处理粘贴事件（支持图片粘贴 + 纯文本插入）
   function handlePaste(event: ClipboardEvent) {
-    const items = event.clipboardData?.items;
-    let hasImage = false;
-
-    if (items) {
-      for (const item of items) {
-        if (!item.type.startsWith('image/')) continue;
-        hasImage = true;
-
-        if (selectedImages.length >= MAX_IMAGES) {
+    const imageFiles = collectClipboardImageFiles(event.clipboardData);
+    if (imageFiles.length > 0) {
+      event.preventDefault();
+      for (const file of imageFiles) {
+        if (selectedImages.length + pendingImageReadCount >= MAX_IMAGES) {
           addToast('warning', i18n.t('input.maxImages', { max: MAX_IMAGES }));
           break;
         }
-
-        const file = item.getAsFile();
-        if (!file) continue;
-
         if (file.size > MAX_IMAGE_SIZE) {
           addToast('warning', i18n.t('input.imageTooLarge', { size: (file.size / 1024 / 1024).toFixed(1) }));
           continue;
         }
-
-        // 读取图片为 DataURL
-        const reader = new FileReader();
-        reader.onload = (e) => {
-          const dataUrl = e.target?.result as string;
-          if (dataUrl) {
-            selectedImages = [...selectedImages, {
-              id: generateId(),
-              dataUrl,
-              name: file.name || i18n.t('input.pastedImage', { index: selectedImages.length + 1 }),
-            }];
-            addToast('success', i18n.t('input.imageAdded'));
-          }
-        };
-        reader.onerror = () => {
-          addToast('error', i18n.t('input.imageReadFailed'));
-        };
-        reader.readAsDataURL(file);
+        readImageFileIntoComposer(file);
       }
-    }
-
-    if (hasImage) {
-      event.preventDefault();
       return;
     }
 
