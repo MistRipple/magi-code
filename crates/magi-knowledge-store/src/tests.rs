@@ -318,7 +318,6 @@ fn project_code_index_summary_is_scoped_by_workspace() {
 
     assert_eq!(summary_a.files[0].path, "src/a.rs");
     assert_eq!(summary_b.files[0].path, "src/b.rs");
-    assert!(store.code_index_summary().is_none());
 }
 
 #[test]

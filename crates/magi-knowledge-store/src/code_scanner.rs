@@ -1,4 +1,4 @@
-use crate::{CodeIndexIngestion, CodeIndexSource, KnowledgeStore};
+use crate::{CodeIndexIngestion, CodeIndexSource};
 use magi_core::UtcMillis;
 use std::collections::HashSet;
 use std::io::{Read, Seek, SeekFrom};
@@ -271,22 +271,6 @@ pub(crate) fn code_index_summary_from_relative_files(
         entry_points,
         last_indexed: UtcMillis::now().0,
     }
-}
-
-/// 将扫描结果摄取到知识存储中
-pub fn ingest_workspace_code_index(
-    store: &KnowledgeStore,
-    workspace_root: &Path,
-) -> CodeIndexScanOutcome {
-    let outcome = scan_workspace(workspace_root);
-    let Some(summary) = outcome.summary.as_ref() else {
-        store.delete_project_code_index();
-        return outcome;
-    };
-    if let Some(ingestion) = code_index_ingestion_for_summary(workspace_root, summary) {
-        store.ingest_code_index(ingestion);
-    }
-    outcome
 }
 
 pub(crate) fn code_index_ingestion_for_summary(

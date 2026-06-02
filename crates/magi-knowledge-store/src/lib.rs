@@ -499,22 +499,6 @@ impl KnowledgeStore {
         }
     }
 
-    /// 获取代码索引摘要（用于 API 返回前端所需格式）
-    pub fn code_index_summary(&self) -> Option<crate::code_scanner::CodeIndexSummary> {
-        let state = self
-            .state
-            .read()
-            .expect("knowledge store read lock poisoned");
-
-        let record = state.entries.values().find(|r| {
-            r.kind == KnowledgeKind::CodeIndex
-                && r.workspace_id.is_none()
-                && r.knowledge_id == PROJECT_CODE_INDEX_ID
-        })?;
-
-        serde_json::from_str(&record.content).ok()
-    }
-
     pub fn code_index_summary_for_workspace(
         &self,
         workspace_id: &WorkspaceId,
@@ -592,10 +576,6 @@ impl KnowledgeStore {
             });
         }
         self.delete(knowledge_id)
-    }
-
-    pub fn delete_project_code_index(&self) {
-        let _ = self.delete(PROJECT_CODE_INDEX_ID);
     }
 
     pub fn delete_code_index_for_workspace(&self, workspace_id: &WorkspaceId) {
