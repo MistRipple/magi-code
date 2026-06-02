@@ -953,6 +953,7 @@ fn execute_session_turn_tool_call(
                 task_id: None,
                 session_id: Some(session_id.clone()),
                 workspace_id: workspace_id.clone(),
+                access_profile,
                 working_directory: workspace_root_path.cloned(),
             },
             workspace_root_path
@@ -1001,6 +1002,7 @@ fn execute_session_turn_tool_call(
             task_id: None,
             session_id: Some(session_id.clone()),
             workspace_id: workspace_id.clone(),
+            access_profile: tool_policy.access_profile,
             working_directory: workspace_root_path.cloned(),
         },
         &tool_policy,

@@ -1303,6 +1303,8 @@ impl ApiState {
                     "name": tool.get("name").cloned().unwrap_or(serde_json::Value::Null),
                     "riskLevel": tool.get("risk_level").cloned().unwrap_or(serde_json::Value::String("low".to_string())),
                     "approvalRequirement": tool.get("approval_requirement").cloned().unwrap_or(serde_json::Value::String("none".to_string())),
+                    "effectiveApprovalPolicy": tool.get("effective_approval_policy").cloned().unwrap_or(serde_json::Value::String("none".to_string())),
+                    "accessProfileBehavior": tool.get("access_profile_behavior").cloned().unwrap_or(serde_json::Value::String("restricted_allowed".to_string())),
                     "accessMode": tool.get("access_mode").cloned().unwrap_or(serde_json::Value::String("read_only".to_string())),
                     "policyScope": tool.get("policy_scope").cloned().unwrap_or(serde_json::Value::String("fixed".to_string())),
                     "inputSensitivePolicy": tool.get("input_sensitive_policy").cloned().unwrap_or(serde_json::Value::Bool(false)),

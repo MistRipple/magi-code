@@ -1520,6 +1520,8 @@ pub struct ToolExecutionContext {
     pub task_id: Option<TaskId>,
     pub session_id: Option<SessionId>,
     pub workspace_id: Option<WorkspaceId>,
+    #[serde(default)]
+    pub access_profile: magi_core::AccessProfile,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_directory: Option<PathBuf>,
 }
@@ -1853,10 +1855,11 @@ impl ToolRegistry {
     fn execute_with_policy_for_surface(
         &self,
         mut input: ToolExecutionInput,
-        context: ToolExecutionContext,
+        mut context: ToolExecutionContext,
         policy: &ToolExecutionPolicy,
         allow_internal_builtin_surface: bool,
     ) -> ToolExecutionOutput {
+        context.access_profile = policy.access_profile;
         if input.tool_kind == ToolKind::Builtin
             && let Some(canonical_name) = BuiltinToolName::from_str(input.tool_name.trim())
         {
@@ -3076,6 +3079,7 @@ mod tests {
             task_id: Some(TaskId::new("task-shell-cancel")),
             session_id: Some(SessionId::new("session-shell-cancel")),
             workspace_id: Some(WorkspaceId::new("workspace-shell-cancel")),
+            access_profile: magi_core::AccessProfile::Restricted,
             working_directory: None,
         };
         let runner_registry = registry.clone();
@@ -3277,6 +3281,7 @@ mod tests {
             task_id: Some(TaskId::new("todo-write")),
             session_id: Some(SessionId::new("session-write")),
             workspace_id: Some(WorkspaceId::new("workspace-write")),
+            access_profile: magi_core::AccessProfile::Restricted,
             working_directory: None,
         };
         let guarded_input = ToolExecutionInput {
@@ -3358,6 +3363,7 @@ mod tests {
             task_id: Some(TaskId::new("copy-task")),
             session_id: Some(SessionId::new("session-copy-guard")),
             workspace_id: Some(WorkspaceId::new("workspace-copy-guard")),
+            access_profile: magi_core::AccessProfile::Restricted,
             working_directory: None,
         };
         let blocked_context = ToolExecutionContext {
@@ -3432,6 +3438,7 @@ mod tests {
             task_id: Some(TaskId::new("todo-a")),
             session_id: Some(SessionId::new("session-a")),
             workspace_id: Some(WorkspaceId::new("workspace-a")),
+            access_profile: magi_core::AccessProfile::Restricted,
             working_directory: None,
         };
         let other_context = ToolExecutionContext {
@@ -3439,6 +3446,7 @@ mod tests {
             task_id: Some(TaskId::new("todo-b")),
             session_id: Some(SessionId::new("session-b")),
             workspace_id: Some(WorkspaceId::new("workspace-b")),
+            access_profile: magi_core::AccessProfile::Restricted,
             working_directory: None,
         };
         let guarded_input = ToolExecutionInput {
@@ -3553,6 +3561,7 @@ mod tests {
             task_id: Some(TaskId::new("task-process-launch")),
             session_id: Some(SessionId::new("session-process-launch")),
             workspace_id: Some(WorkspaceId::new("workspace-process-launch")),
+            access_profile: magi_core::AccessProfile::Restricted,
             working_directory: None,
         };
 
@@ -3655,6 +3664,7 @@ mod tests {
             task_id: Some(TaskId::new("task-process-spawn-error")),
             session_id: Some(SessionId::new("session-process-spawn-error")),
             workspace_id: Some(WorkspaceId::new("workspace-process-spawn-error")),
+            access_profile: magi_core::AccessProfile::Restricted,
             working_directory: Some(root.clone()),
         };
 
@@ -3702,6 +3712,7 @@ mod tests {
             task_id: Some(TaskId::new("task-process-write-error")),
             session_id: Some(SessionId::new("session-process-write-error")),
             workspace_id: Some(WorkspaceId::new("workspace-process-write-error")),
+            access_profile: magi_core::AccessProfile::Restricted,
             working_directory: Some(root.clone()),
         };
 
@@ -3792,6 +3803,7 @@ mod tests {
             task_id: Some(TaskId::new("task-process-context")),
             session_id: Some(SessionId::new("session-process-context")),
             workspace_id: Some(WorkspaceId::new("workspace-process-context")),
+            access_profile: magi_core::AccessProfile::Restricted,
             working_directory: None,
         };
         let launch = tool_registry.execute_internal_builtin_with_policy(
@@ -3862,6 +3874,7 @@ mod tests {
             task_id: Some(TaskId::new("task-process-owner")),
             session_id: Some(SessionId::new("session-process-owner")),
             workspace_id: Some(WorkspaceId::new("workspace-process-shared")),
+            access_profile: magi_core::AccessProfile::Restricted,
             working_directory: None,
         };
         let workspace_only_context = ToolExecutionContext {
@@ -3869,6 +3882,7 @@ mod tests {
             task_id: Some(TaskId::new("task-process-workspace-only")),
             session_id: None,
             workspace_id: Some(WorkspaceId::new("workspace-process-shared")),
+            access_profile: magi_core::AccessProfile::Restricted,
             working_directory: None,
         };
         let other_session_context = ToolExecutionContext {
@@ -3876,6 +3890,7 @@ mod tests {
             task_id: Some(TaskId::new("task-process-other")),
             session_id: Some(SessionId::new("session-process-other")),
             workspace_id: Some(WorkspaceId::new("workspace-process-shared")),
+            access_profile: magi_core::AccessProfile::Restricted,
             working_directory: None,
         };
 
@@ -4142,6 +4157,7 @@ mod tests {
             task_id: Some(TaskId::new("todo-gov")),
             session_id: Some(SessionId::new("session-gov")),
             workspace_id: Some(WorkspaceId::new("workspace-gov")),
+            access_profile: magi_core::AccessProfile::Restricted,
             working_directory: None,
         };
 
@@ -4251,6 +4267,7 @@ mod tests {
             task_id: Some(TaskId::new("todo-path-a")),
             session_id: Some(SessionId::new("session-path-a")),
             workspace_id: None,
+            access_profile: magi_core::AccessProfile::Restricted,
             working_directory: None,
         };
         let input_a = ToolExecutionInput {
@@ -4278,6 +4295,7 @@ mod tests {
             task_id: Some(TaskId::new("todo-path-b")),
             session_id: Some(SessionId::new("session-path-a")),
             workspace_id: None,
+            access_profile: magi_core::AccessProfile::Restricted,
             working_directory: None,
         };
         let input_b = ToolExecutionInput {
@@ -4343,6 +4361,7 @@ mod tests {
             task_id: Some(TaskId::new("t1")),
             session_id: Some(SessionId::new("s1")),
             workspace_id: Some(WorkspaceId::new("ws1")),
+            access_profile: magi_core::AccessProfile::Restricted,
             working_directory: None,
         };
         let ctx_w2 = ToolExecutionContext {
@@ -4350,6 +4369,7 @@ mod tests {
             task_id: Some(TaskId::new("t2")),
             session_id: Some(SessionId::new("s1")),
             workspace_id: Some(WorkspaceId::new("ws1")),
+            access_profile: magi_core::AccessProfile::Restricted,
             working_directory: None,
         };
 
@@ -4561,6 +4581,7 @@ mod tests {
             task_id: Some(TaskId::new("td-chain")),
             session_id: Some(SessionId::new("ss-chain")),
             workspace_id: Some(WorkspaceId::new("ws-chain")),
+            access_profile: magi_core::AccessProfile::Restricted,
             working_directory: None,
         };
 
@@ -4722,6 +4743,38 @@ mod tests {
 
         assert_eq!(output.status, ExecutionResultStatus::Succeeded);
         assert_eq!(output.governance.outcome, GovernanceOutcome::Allowed);
+    }
+
+    #[test]
+    fn registry_applies_policy_access_profile_to_tool_catalog_context() {
+        let registry = make_registry();
+
+        let output = registry.execute_with_policy(
+            ToolExecutionInput::for_builtin_invocation(
+                ToolCallId::new("tc-tool-catalog-full-access"),
+                BuiltinToolName::ToolCatalog.as_str(),
+                "{}",
+            ),
+            ToolExecutionContext::default(),
+            &ToolExecutionPolicy {
+                access_profile: magi_core::AccessProfile::FullAccess,
+                ..ToolExecutionPolicy::default()
+            },
+        );
+
+        assert_eq!(output.status, ExecutionResultStatus::Succeeded);
+        let payload: Value = serde_json::from_str(&output.payload).expect("payload json");
+        assert_eq!(payload["current_access_profile"], "full_access");
+        let shell_exec = payload["tools"]
+            .as_array()
+            .expect("tools")
+            .iter()
+            .find(|tool| tool["name"] == BuiltinToolName::ShellExec.as_str())
+            .expect("shell_exec should be listed");
+        assert_eq!(
+            shell_exec["effective_approval_policy"],
+            "ordinary_approval_skipped"
+        );
     }
 
     fn make_registry() -> ToolRegistry {
@@ -6450,6 +6503,7 @@ mod tests {
             task_id: Some(TaskId::new("task-internal-process")),
             session_id: Some(SessionId::new("session-internal-process")),
             workspace_id: Some(WorkspaceId::new("workspace-internal-process")),
+            access_profile: magi_core::AccessProfile::Restricted,
             working_directory: None,
         };
 
@@ -6506,6 +6560,7 @@ mod tests {
             task_id: Some(TaskId::new("task-shell-background")),
             session_id: Some(SessionId::new("session-shell-background")),
             workspace_id: Some(WorkspaceId::new("workspace-shell-background")),
+            access_profile: magi_core::AccessProfile::Restricted,
             working_directory: None,
         };
 
@@ -6543,6 +6598,7 @@ mod tests {
             task_id: Some(TaskId::new("task-file-write-guard")),
             session_id: Some(SessionId::new("session-file-write-guard")),
             workspace_id: Some(WorkspaceId::new("workspace-file-write-guard")),
+            access_profile: magi_core::AccessProfile::Restricted,
             working_directory: None,
         };
         let held_input = ToolExecutionInput {

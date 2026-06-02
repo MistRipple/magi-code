@@ -1652,6 +1652,11 @@ fn execute_task_tool_call(
         return execute_skill_apply_from_runtime(&tool_call.function.arguments, skill_runtime);
     }
 
+    let access_profile = task
+        .policy_snapshot
+        .as_ref()
+        .map(|policy| policy.access_profile)
+        .unwrap_or_default();
     if let Some((tool_skill_name, binding_id)) =
         parse_skill_custom_tool_name(&tool_call.function.name)
     {
@@ -1669,6 +1674,7 @@ fn execute_task_tool_call(
                 task_id: Some(task.task_id.clone()),
                 session_id: Some(session_id.clone()),
                 workspace_id: workspace_id.clone(),
+                access_profile,
                 working_directory: workspace_root_path.cloned(),
             },
             workspace_root_path
@@ -1681,11 +1687,6 @@ fn execute_task_tool_call(
         return (rejection, ExecutionResultStatus::Failed);
     }
 
-    let access_profile = task
-        .policy_snapshot
-        .as_ref()
-        .map(|policy| policy.access_profile)
-        .unwrap_or_default();
     let mut tool_policy =
         active_skill_tool_execution_policy(access_profile, skill_runtime, skill_name);
     apply_task_policy_scope(&mut tool_policy, task.policy_snapshot.as_ref());
@@ -1700,6 +1701,7 @@ fn execute_task_tool_call(
             task_id: Some(task.task_id.clone()),
             session_id: Some(session_id.clone()),
             workspace_id: workspace_id.clone(),
+            access_profile: tool_policy.access_profile,
             working_directory: workspace_root_path.cloned(),
         },
         &tool_policy,

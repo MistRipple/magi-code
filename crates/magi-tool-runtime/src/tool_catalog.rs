@@ -83,6 +83,7 @@ pub(crate) fn build_tool_catalog_value(
         .unwrap_or_default();
     let runtime_health = RuntimeHealth::from_context(context, resources, &agent_roles);
     let mut runtime_warning_count = 0usize;
+    let access_profile = context.access_profile;
 
     for tool in BuiltinToolName::ALL {
         let is_public = tool.is_public_tool_surface();
@@ -112,6 +113,8 @@ pub(crate) fn build_tool_catalog_value(
             "policy_summary": policy_summary(tool),
             "risk_level": risk_level_label(tool),
             "approval_requirement": approval_requirement_label(tool),
+            "effective_approval_policy": effective_approval_policy_label(tool, access_profile),
+            "access_profile_behavior": access_profile_behavior_label(tool, access_profile),
             "schema_status": if schema_warnings.is_empty() { "ok" } else { "warning" },
             "schema_warnings": schema_warnings,
             "runtime_status": runtime_status.status,
@@ -176,6 +179,8 @@ pub(crate) fn build_tool_catalog_value(
         "tool": "tool_catalog",
         "status": "succeeded",
         "access_mode": BuiltinToolAccessMode::ReadOnly.as_str(),
+        "current_access_profile": access_profile.as_str(),
+        "approval_policy_summary": approval_policy_summary(access_profile),
         "summary": tool_catalog_summary(
             public_count,
             skill_tool_count,
@@ -562,6 +567,71 @@ fn approval_requirement_label(tool: BuiltinToolName) -> &'static str {
     }
 }
 
+fn approval_policy_summary(access_profile: magi_core::AccessProfile) -> &'static str {
+    match access_profile {
+        magi_core::AccessProfile::ReadOnly => {
+            "当前为只读分析模式：读、搜索、诊断类工具可用；写入和外部副作用工具不可用"
+        }
+        magi_core::AccessProfile::Restricted => {
+            "当前为受限执行模式：常规工作区操作可直接执行，高风险或输入敏感动作需要审批"
+        }
+        magi_core::AccessProfile::FullAccess => {
+            "当前为完全授权模式：普通工具审批会跳过；产品级硬阻断、任务约束和角色约束仍然生效"
+        }
+    }
+}
+
+fn effective_approval_policy_label(
+    tool: BuiltinToolName,
+    access_profile: magi_core::AccessProfile,
+) -> &'static str {
+    match access_profile {
+        magi_core::AccessProfile::ReadOnly if tool.is_write_operation() => "not_applicable",
+        magi_core::AccessProfile::ReadOnly => "none",
+        magi_core::AccessProfile::Restricted if tool.uses_input_sensitive_invocation_policy() => {
+            "input_sensitive"
+        }
+        magi_core::AccessProfile::Restricted => approval_requirement_label(tool),
+        magi_core::AccessProfile::FullAccess
+            if tool.uses_input_sensitive_invocation_policy()
+                || tool.default_approval_requirement()
+                    == magi_core::ApprovalRequirement::Required =>
+        {
+            "ordinary_approval_skipped"
+        }
+        magi_core::AccessProfile::FullAccess => "none",
+    }
+}
+
+fn access_profile_behavior_label(
+    tool: BuiltinToolName,
+    access_profile: magi_core::AccessProfile,
+) -> &'static str {
+    match access_profile {
+        magi_core::AccessProfile::ReadOnly if tool.is_write_operation() => {
+            "unavailable_in_read_only"
+        }
+        magi_core::AccessProfile::ReadOnly => "read_only_allowed",
+        magi_core::AccessProfile::Restricted if tool.uses_input_sensitive_invocation_policy() => {
+            "restricted_input_sensitive"
+        }
+        magi_core::AccessProfile::Restricted
+            if tool.default_approval_requirement() == magi_core::ApprovalRequirement::Required =>
+        {
+            "restricted_requires_approval"
+        }
+        magi_core::AccessProfile::Restricted => "restricted_allowed",
+        magi_core::AccessProfile::FullAccess
+            if tool.uses_input_sensitive_invocation_policy()
+                || tool.default_approval_requirement()
+                    == magi_core::ApprovalRequirement::Required =>
+        {
+            "full_access_skips_ordinary_approval"
+        }
+        magi_core::AccessProfile::FullAccess => "full_access_allowed",
+    }
+}
+
 fn schema_warnings(schema: &serde_json::Value) -> Vec<String> {
     let mut warnings = Vec::new();
     if schema.get("type").and_then(serde_json::Value::as_str) != Some("object") {
@@ -596,6 +666,14 @@ mod tests {
         let payload: serde_json::Value = serde_json::from_str(&output).expect("json output");
 
         assert_eq!(payload["status"], "succeeded");
+        assert_eq!(payload["current_access_profile"], "restricted");
+        assert!(
+            payload["approval_policy_summary"]
+                .as_str()
+                .expect("approval_policy_summary")
+                .contains("受限执行"),
+            "default tool catalog should explain restricted execution semantics"
+        );
         let summary = payload["summary"].as_str().expect("summary should be text");
         assert!(
             summary.starts_with("工具目录已更新："),
@@ -645,6 +723,11 @@ mod tests {
             .expect("shell_exec should be listed");
         assert_eq!(shell_exec["policy_scope"], "input_sensitive");
         assert_eq!(shell_exec["input_sensitive_policy"], true);
+        assert_eq!(shell_exec["effective_approval_policy"], "input_sensitive");
+        assert_eq!(
+            shell_exec["access_profile_behavior"],
+            "restricted_input_sensitive"
+        );
         assert!(
             shell_exec["policy_summary"]
                 .as_str()
@@ -711,6 +794,60 @@ mod tests {
             "agent_role_registry"
         );
         assert_eq!(payload["runtime_dependencies"][2]["status"], "unavailable");
+    }
+
+    #[test]
+    fn tool_catalog_reports_effective_access_profile_policy() {
+        let full_access_context = ToolExecutionContext {
+            access_profile: magi_core::AccessProfile::FullAccess,
+            ..ToolExecutionContext::default()
+        };
+        let full_access_output =
+            execute_tool_catalog("{}", &full_access_context, &ToolRuntimeResources::default());
+        let full_access_payload: serde_json::Value =
+            serde_json::from_str(&full_access_output).expect("json output");
+        assert_eq!(full_access_payload["current_access_profile"], "full_access");
+        assert!(
+            full_access_payload["approval_policy_summary"]
+                .as_str()
+                .expect("approval_policy_summary")
+                .contains("普通工具审批会跳过")
+        );
+        let shell_exec = full_access_payload["tools"]
+            .as_array()
+            .expect("tools")
+            .iter()
+            .find(|tool| tool["name"] == "shell_exec")
+            .expect("shell_exec should be listed");
+        assert_eq!(
+            shell_exec["effective_approval_policy"],
+            "ordinary_approval_skipped"
+        );
+        assert_eq!(
+            shell_exec["access_profile_behavior"],
+            "full_access_skips_ordinary_approval"
+        );
+
+        let read_only_context = ToolExecutionContext {
+            access_profile: magi_core::AccessProfile::ReadOnly,
+            ..ToolExecutionContext::default()
+        };
+        let read_only_output =
+            execute_tool_catalog("{}", &read_only_context, &ToolRuntimeResources::default());
+        let read_only_payload: serde_json::Value =
+            serde_json::from_str(&read_only_output).expect("json output");
+        assert_eq!(read_only_payload["current_access_profile"], "read_only");
+        let file_write = read_only_payload["tools"]
+            .as_array()
+            .expect("tools")
+            .iter()
+            .find(|tool| tool["name"] == "file_write")
+            .expect("file_write should be listed");
+        assert_eq!(file_write["effective_approval_policy"], "not_applicable");
+        assert_eq!(
+            file_write["access_profile_behavior"],
+            "unavailable_in_read_only"
+        );
     }
 
     #[test]
