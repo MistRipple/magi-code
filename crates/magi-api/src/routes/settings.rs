@@ -1211,11 +1211,19 @@ mod tests {
     use magi_governance::GovernanceService;
     use magi_session_store::SessionStore;
     use magi_snapshot::SnapshotManager;
-    use magi_tool_runtime::ToolRegistry;
+    use magi_tool_runtime::{
+        ExternalMcpServerCatalogEntry, ExternalToolCatalogSnapshot, ToolRegistry,
+    };
     use magi_workspace::WorkspaceStore;
     use std::sync::Arc;
 
     fn test_state() -> ApiState {
+        test_state_with_external_catalog_snapshot(None)
+    }
+
+    fn test_state_with_external_catalog_snapshot(
+        external_catalog_snapshot: Option<ExternalToolCatalogSnapshot>,
+    ) -> ApiState {
         let event_bus = Arc::new(InMemoryEventBus::new(32));
         let governance = Arc::new(GovernanceService::default());
         let workspace_store = Arc::new(WorkspaceStore::default());
@@ -1229,6 +1237,10 @@ mod tests {
             );
         let mut tool_registry = ToolRegistry::new(Arc::clone(&governance), Arc::clone(&event_bus))
             .with_runtime_capability_dependency_provider(runtime_capability_dependency_provider);
+        if let Some(snapshot) = external_catalog_snapshot {
+            tool_registry = tool_registry
+                .with_external_tool_catalog_provider(Arc::new(move || snapshot.clone()));
+        }
         tool_registry.register_default_builtins();
         ApiState::new(
             "magi-test",
@@ -1672,8 +1684,8 @@ mod tests {
         );
         assert_eq!(
             capability_dependencies[3]["status"],
-            serde_json::json!("disabled"),
-            "core settings bootstrap should not hydrate external skill runtime diagnostics"
+            serde_json::json!("unavailable"),
+            "full settings bootstrap should surface missing external skill runtime diagnostics"
         );
         assert_eq!(
             capability_dependencies[3]["toolCount"],
@@ -1689,8 +1701,8 @@ mod tests {
         );
         assert_eq!(
             capability_dependencies[4]["status"],
-            serde_json::json!("disabled"),
-            "core settings bootstrap should not hydrate MCP diagnostics"
+            serde_json::json!("unavailable"),
+            "full settings bootstrap should surface missing MCP diagnostics"
         );
         assert_eq!(
             capability_dependencies[4]["readyCount"],
@@ -2087,6 +2099,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn settings_bootstrap_full_scope_hydrates_external_capability_dependencies() {
+        let state = test_state_with_external_catalog_snapshot(Some(ExternalToolCatalogSnapshot {
+            skill_tools: Vec::new(),
+            mcp_servers: vec![ExternalMcpServerCatalogEntry {
+                server_id: "loopback-mcp".to_string(),
+                name: "loopback-mcp".to_string(),
+                enabled: true,
+                connected: false,
+                health: "disconnected".to_string(),
+                tool_count: Some(7),
+                error: None,
+            }],
+        }));
+        state.settings_store.set_section(
+            "mcpServers",
+            json!([
+                {
+                    "id": "loopback-mcp",
+                    "name": "loopback-mcp",
+                    "command": "npx",
+                    "enabled": true
+                }
+            ]),
+        );
+
+        let bootstrap = settings_bootstrap(State(state), Query(HashMap::new()))
+            .await
+            .expect("settings bootstrap should build")
+            .0;
+
+        assert_eq!(bootstrap["bootstrapScope"], json!("full"));
+        assert_eq!(bootstrap["mcpServersHydrated"], json!(true));
+        assert_eq!(bootstrap["mcpServers"][0]["connected"], json!(false));
+        assert_eq!(bootstrap["mcpServers"][0]["health"], json!("disconnected"));
+
+        let dependencies = bootstrap["capabilityDependencies"]
+            .as_array()
+            .expect("capability dependencies should be an array");
+        let mcp_dependency = dependencies
+            .iter()
+            .find(|dependency| dependency["name"] == json!("mcp_servers"))
+            .expect("mcp dependency should be listed");
+        assert_eq!(mcp_dependency["status"], json!("not_ready"));
+        assert_eq!(mcp_dependency["configuredCount"], json!(1));
+        assert_eq!(mcp_dependency["enabledCount"], json!(1));
+        assert_eq!(mcp_dependency["readyCount"], json!(0));
+        assert_eq!(mcp_dependency["enabledToolCount"], json!(7));
+        assert_eq!(mcp_dependency["readyToolCount"], json!(0));
+        assert_eq!(
+            mcp_dependency["toolCount"],
+            json!(0),
+            "toolCount must remain the currently usable MCP tool count"
+        );
+    }
+
+    #[tokio::test]
     async fn settings_bootstrap_core_scope_defers_mcp_hydration() {
         let state = test_state();
         let bootstrap = settings_bootstrap(
@@ -2099,6 +2167,18 @@ mod tests {
 
         assert_eq!(bootstrap["bootstrapScope"], json!("core"));
         assert_eq!(bootstrap["mcpServersHydrated"], json!(false));
+        let dependencies = bootstrap["capabilityDependencies"]
+            .as_array()
+            .expect("capability dependencies should be an array");
+        let mcp_dependency = dependencies
+            .iter()
+            .find(|dependency| dependency["name"] == json!("mcp_servers"))
+            .expect("mcp dependency should be listed");
+        assert_eq!(
+            mcp_dependency["status"],
+            json!("disabled"),
+            "core settings bootstrap should not hydrate MCP diagnostics"
+        );
     }
 
     #[test]

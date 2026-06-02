@@ -1261,7 +1261,7 @@ impl ApiState {
         if hydrate_mcp_servers {
             self.enrich_mcp_servers_with_connection_status(&mut snapshot);
         }
-        let tool_catalog = self.settings_tool_catalog_json(tool_context);
+        let tool_catalog = self.settings_tool_catalog_json(hydrate_mcp_servers, tool_context);
         let skills_config = public_skills_config_section(object_section(&snapshot, "skillsConfig"));
         let public_mcp_servers = public_mcp_servers_section(&snapshot);
         serde_json::json!({
@@ -1285,12 +1285,18 @@ impl ApiState {
         })
     }
 
-    fn settings_tool_catalog_json(&self, tool_context: &ToolExecutionContext) -> serde_json::Value {
-        self.tool_catalog_json(
-            r#"{"includeExternal":false,"includeMcpServers":false,"includeAgentRoles":false}"#,
-            tool_context,
-        )
-        .unwrap_or(serde_json::Value::Null)
+    fn settings_tool_catalog_json(
+        &self,
+        include_external_dependencies: bool,
+        tool_context: &ToolExecutionContext,
+    ) -> serde_json::Value {
+        let input = if include_external_dependencies {
+            r#"{"includeExternal":true,"includeMcpServers":true,"includeAgentRoles":false}"#
+        } else {
+            r#"{"includeExternal":false,"includeMcpServers":false,"includeAgentRoles":false}"#
+        };
+        self.tool_catalog_json(input, tool_context)
+            .unwrap_or(serde_json::Value::Null)
     }
 
     pub(crate) fn tool_catalog_json(
