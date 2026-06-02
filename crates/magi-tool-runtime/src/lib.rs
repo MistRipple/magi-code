@@ -124,6 +124,11 @@ pub enum BuiltinToolName {
     HumanCheckpointRequest,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RestrictedWriteProfilePolicy {
+    AutoAllowed,
+}
+
 impl BuiltinToolName {
     pub const ALL: [Self; 35] = [
         Self::FileRead,
@@ -338,6 +343,33 @@ impl BuiltinToolName {
         } else {
             BuiltinToolAccessMode::ReadOnly
         }
+    }
+
+    /// 受限访问模式下写工具在 AccessProfile 轴的策略。
+    ///
+    /// AutoAllowed 不是最终执行许可：输入敏感工具仍会继续经过
+    /// invocation policy / governance / SafetyGate 判定。
+    pub(crate) fn restricted_write_profile_policy(&self) -> Option<RestrictedWriteProfilePolicy> {
+        let policy = match self {
+            Self::FileWrite
+            | Self::FilePatch
+            | Self::ApplyPatch
+            | Self::FileRemove
+            | Self::FileMkdir
+            | Self::FileCopy
+            | Self::FileMove
+            | Self::AgentSpawn
+            | Self::TodoWrite
+            | Self::MemoryWrite
+            | Self::MissionCharterWrite
+            | Self::PlanWrite
+            | Self::KgWrite
+            | Self::ValidationRecord
+            | Self::Checkpoint
+            | Self::HumanCheckpointRequest => RestrictedWriteProfilePolicy::AutoAllowed,
+            _ => return None,
+        };
+        Some(policy)
     }
 
     fn captures_workspace_changes(&self) -> bool {
@@ -1307,11 +1339,56 @@ pub fn builtin_permission_engine() -> magi_permissions::PermissionEngine {
     for tool in BuiltinToolName::ALL {
         match tool.default_access_mode() {
             BuiltinToolAccessMode::ReadOnly => engine.register_read_only_tool(tool.as_str()),
-            BuiltinToolAccessMode::ExplicitWrite => engine.register_edit_tool(tool.as_str()),
+            BuiltinToolAccessMode::ExplicitWrite
+                if tool.restricted_write_profile_policy()
+                    == Some(RestrictedWriteProfilePolicy::AutoAllowed) =>
+            {
+                engine.register_restricted_auto_write_tool(tool.as_str());
+            }
             BuiltinToolAccessMode::MaybeWrite => {}
+            BuiltinToolAccessMode::ExplicitWrite => {}
         }
     }
     engine
+}
+
+pub(crate) const TOOL_POLICY_REJECTED_PUBLIC_ERROR: &str = "该工具在当前上下文中不可用";
+pub(crate) const TOOL_POLICY_NEEDS_APPROVAL_PUBLIC_ERROR: &str = "该工具需要批准后执行";
+
+pub(crate) fn tool_policy_decision_payload(
+    tool_name: &str,
+    status: ExecutionResultStatus,
+    reason: &str,
+    access_profile: AccessProfile,
+) -> String {
+    let (status_label, error_code, public_error) = match status {
+        ExecutionResultStatus::NeedsApproval => (
+            "needs_approval",
+            "tool_policy_needs_approval",
+            TOOL_POLICY_NEEDS_APPROVAL_PUBLIC_ERROR,
+        ),
+        ExecutionResultStatus::Rejected => (
+            "rejected",
+            "tool_policy_rejected",
+            TOOL_POLICY_REJECTED_PUBLIC_ERROR,
+        ),
+        _ => ("failed", "tool_policy_failed", "该工具暂不可用"),
+    };
+    tracing::warn!(
+        tool_name,
+        status = status_label,
+        access_profile = access_profile.as_str(),
+        reason,
+        "tool registry policy decision"
+    );
+    serde_json::json!({
+        "tool": tool_name,
+        "status": status_label,
+        "error_code": error_code,
+        "error": public_error,
+        "access_profile": access_profile.as_str(),
+    })
+    .to_string()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1432,18 +1509,12 @@ fn file_remove_invocation_policy(input: &str) -> BuiltinToolInvocationPolicy {
     else {
         return medium_risk_policy();
     };
-
-    if json_field_bool(&request, &["recursive", "force"]).unwrap_or(false) {
-        return high_risk_approval_policy();
-    }
-
     if json_field_string(&request, &["path", "file_path", "target_path"])
-        .is_some_and(|value| is_high_risk_remove_target(&value))
+        .is_none_or(|path| path.trim().is_empty())
     {
-        return high_risk_approval_policy();
+        return medium_risk_policy();
     }
-
-    medium_risk_policy()
+    high_risk_approval_policy()
 }
 
 fn json_field_string(
@@ -1469,10 +1540,6 @@ fn json_field_bool(
                 .or_else(|| value.as_str().and_then(|value| value.parse::<bool>().ok()))
         })
     })
-}
-
-fn is_high_risk_remove_target(path: &str) -> bool {
-    matches!(path.trim(), "/" | "." | ".." | "~")
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1956,17 +2023,21 @@ impl ToolRegistry {
         };
 
         let output = if !governance.allowed {
+            let status = if governance.requires_approval {
+                ExecutionResultStatus::NeedsApproval
+            } else {
+                ExecutionResultStatus::Rejected
+            };
+            let reason = governance.reason.as_deref().unwrap_or("工具调用被阻断");
             ToolExecutionOutput {
                 tool_call_id: input.tool_call_id.clone(),
-                status: if governance.requires_approval {
-                    ExecutionResultStatus::NeedsApproval
-                } else {
-                    ExecutionResultStatus::Rejected
-                },
-                payload: governance
-                    .reason
-                    .clone()
-                    .unwrap_or_else(|| "工具调用被阻断".to_string()),
+                status,
+                payload: tool_policy_decision_payload(
+                    &input.tool_name,
+                    status,
+                    reason,
+                    context.access_profile,
+                ),
                 governance,
             }
         } else {
@@ -5507,10 +5578,12 @@ mod tests {
         let file = root.join("del_me.txt");
         fs::write(&file, "bye").unwrap();
 
-        let output = exec_tool(
+        let output = exec_tool_with_context_and_policy(
             &registry,
             BuiltinToolName::FileRemove,
             &serde_json::json!({ "path": file.to_string_lossy() }).to_string(),
+            ToolExecutionContext::default(),
+            full_access_policy(),
         );
         assert_eq!(output.status, ExecutionResultStatus::Succeeded);
         assert!(!file.exists());
@@ -5519,10 +5592,12 @@ mod tests {
         fs::create_dir_all(subdir.join("child")).unwrap();
         fs::write(subdir.join("child").join("f.txt"), "x").unwrap();
 
-        let output2 = exec_tool(
+        let output2 = exec_tool_with_context_and_policy(
             &registry,
             BuiltinToolName::FileRemove,
             &serde_json::json!({ "path": subdir.to_string_lossy(), "recursive": true }).to_string(),
+            ToolExecutionContext::default(),
+            full_access_policy(),
         );
         assert_eq!(output2.status, ExecutionResultStatus::Succeeded);
         assert!(!subdir.exists());
@@ -5885,7 +5960,31 @@ mod tests {
     }
 
     #[test]
-    fn builtin_permission_engine_uses_builtin_access_modes() {
+    fn restricted_profile_write_policy_is_explicitly_classified() {
+        for tool in all_builtin_tools() {
+            if tool.is_write_operation() {
+                assert!(
+                    tool.restricted_write_profile_policy().is_some(),
+                    "{tool:?} 是写工具，必须显式声明受限模式策略"
+                );
+            }
+        }
+        assert_eq!(
+            BuiltinToolName::FileRemove.restricted_write_profile_policy(),
+            Some(RestrictedWriteProfilePolicy::AutoAllowed)
+        );
+        assert_eq!(
+            BuiltinToolName::ShellExec.restricted_write_profile_policy(),
+            None
+        );
+        assert_eq!(
+            BuiltinToolName::FileRead.restricted_write_profile_policy(),
+            None
+        );
+    }
+
+    #[test]
+    fn builtin_permission_engine_uses_restricted_write_policy() {
         let engine = builtin_permission_engine();
         let policy = magi_permissions::PermissionPolicy::default();
 
@@ -6603,11 +6702,14 @@ mod tests {
     }
 
     #[test]
-    fn builtin_invocation_policy_requires_approval_for_recursive_remove() {
+    fn builtin_invocation_policy_requires_approval_for_file_remove() {
         let single_file = BuiltinToolName::FileRemove
             .invocation_policy_for_input(&serde_json::json!({ "path": "tmp.txt" }).to_string());
-        assert_eq!(single_file.risk_level, RiskLevel::Medium);
-        assert_eq!(single_file.approval_requirement, ApprovalRequirement::None);
+        assert_eq!(single_file.risk_level, RiskLevel::High);
+        assert_eq!(
+            single_file.approval_requirement,
+            ApprovalRequirement::Required
+        );
 
         let recursive = BuiltinToolName::FileRemove.invocation_policy_for_input(
             &serde_json::json!({ "path": "target/tmp", "recursive": true }).to_string(),

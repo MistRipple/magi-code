@@ -2044,7 +2044,7 @@ mod tests {
     }
 
     #[test]
-    fn execute_session_turn_tool_call_applies_builtin_invocation_policy() {
+    fn execute_session_turn_tool_call_requires_approval_for_file_remove_in_restricted_profile() {
         let mut tool_registry = ToolRegistry::new(
             Arc::new(GovernanceService::default()),
             Arc::new(InMemoryEventBus::new(8)),
@@ -2052,17 +2052,15 @@ mod tests {
         tool_registry.register_default_builtins();
         let event_bus = InMemoryEventBus::new(8);
         let dir = tempfile::tempdir().expect("temp dir");
-        let target = dir.path().join("nested");
-        std::fs::create_dir_all(target.join("child")).expect("create nested dir");
-        std::fs::write(target.join("child").join("probe.txt"), "probe").expect("write probe");
+        let target = dir.path().join("probe.txt");
+        std::fs::write(&target, "probe").expect("write probe");
         let call = ChatToolCall {
-            id: "tool-call-recursive-remove".to_string(),
+            id: "tool-call-file-remove".to_string(),
             kind: "function".to_string(),
             function: ChatToolFunction {
                 name: "file_remove".to_string(),
                 arguments: serde_json::json!({
-                    "path": target.to_string_lossy(),
-                    "recursive": true
+                    "path": target.to_string_lossy()
                 })
                 .to_string(),
             },
@@ -2083,8 +2081,11 @@ mod tests {
         );
 
         assert_eq!(status, ExecutionResultStatus::NeedsApproval);
-        assert!(payload.contains("高风险工具必须人工审批"));
-        assert!(target.exists(), "需要审批的递归删除不能提前执行");
+        let parsed: serde_json::Value = serde_json::from_str(&payload).expect("payload json");
+        assert_eq!(parsed["tool"], "file_remove");
+        assert_eq!(parsed["status"], "needs_approval");
+        assert_eq!(parsed["error_code"], "tool_policy_needs_approval");
+        assert!(target.exists(), "需要审批的删除不能提前执行");
     }
 
     #[test]

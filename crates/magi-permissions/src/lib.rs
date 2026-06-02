@@ -119,7 +119,7 @@ impl PermissionPolicy {
 #[derive(Clone, Debug, Default)]
 pub struct PermissionEngine {
     read_only_tools: HashSet<&'static str>,
-    edit_tools: HashSet<&'static str>,
+    restricted_auto_write_tools: HashSet<&'static str>,
 }
 
 impl PermissionEngine {
@@ -127,16 +127,16 @@ impl PermissionEngine {
         self.read_only_tools.insert(name);
     }
 
-    pub fn register_edit_tool(&mut self, name: &'static str) {
-        self.edit_tools.insert(name);
+    pub fn register_restricted_auto_write_tool(&mut self, name: &'static str) {
+        self.restricted_auto_write_tools.insert(name);
     }
 
     pub fn is_read_only_tool(&self, name: &str) -> bool {
         self.read_only_tools.contains(name)
     }
 
-    pub fn is_edit_tool(&self, name: &str) -> bool {
-        self.edit_tools.contains(name)
+    pub fn is_restricted_auto_write_tool(&self, name: &str) -> bool {
+        self.restricted_auto_write_tools.contains(name)
     }
 
     /// 主判定入口。`policy` 一般来自当前 Task 的 policy snapshot。
@@ -186,9 +186,11 @@ impl PermissionEngine {
             };
         }
         match access_profile {
-            AccessProfile::Restricted if is_write_tool && !self.is_edit_tool(tool_name) => {
+            AccessProfile::Restricted
+                if is_write_tool && !self.is_restricted_auto_write_tool(tool_name) =>
+            {
                 Decision::NeedsApproval {
-                    reason: format!("受限执行仅自动放行编辑类写入，{tool_name} 需审批"),
+                    reason: format!("受限执行未自动授权写入工具：{tool_name}"),
                 }
             }
             _ => Decision::Allow,
@@ -580,9 +582,9 @@ mod tests {
     fn engine_with_test_tools() -> PermissionEngine {
         let mut engine = PermissionEngine::default();
         engine.register_read_only_tool("file_view");
-        engine.register_edit_tool("file_edit");
-        engine.register_edit_tool("file_write");
-        engine.register_edit_tool("apply_patch");
+        engine.register_restricted_auto_write_tool("file_edit");
+        engine.register_restricted_auto_write_tool("file_write");
+        engine.register_restricted_auto_write_tool("apply_patch");
         engine
     }
 
@@ -660,7 +662,7 @@ mod tests {
     }
 
     #[test]
-    fn restricted_profile_passes_edit_tool_blocks_shell() {
+    fn restricted_profile_passes_registered_write_tool_blocks_shell() {
         let engine = engine_with_test_tools();
         let policy = policy_empty();
         let edit_req = PermissionRequest::ToolInvocation {

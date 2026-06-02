@@ -3195,7 +3195,7 @@ mod tests {
     }
 
     #[test]
-    fn task_tool_call_applies_builtin_invocation_policy() {
+    fn task_tool_call_requires_approval_for_file_remove_in_restricted_profile() {
         let event_bus = InMemoryEventBus::new(16);
         let task_store = TaskStore::new();
         let session_store = SessionStore::new();
@@ -3210,20 +3210,18 @@ mod tests {
         );
         tool_registry.register_default_builtins();
         let dir = tempdir().expect("temp dir");
-        let target = dir.path().join("nested");
-        std::fs::create_dir_all(target.join("child")).expect("create nested dir");
-        std::fs::write(target.join("child").join("probe.txt"), "probe").expect("write probe");
-        let task = test_task("task-recursive-remove", "task-recursive-remove", None);
-        let session_id = SessionId::new("session-recursive-remove");
-        let workspace_id = Some(WorkspaceId::new("workspace-recursive-remove"));
+        let target = dir.path().join("probe.txt");
+        std::fs::write(&target, "probe").expect("write probe");
+        let task = test_task("task-file-remove", "task-file-remove", None);
+        let session_id = SessionId::new("session-file-remove");
+        let workspace_id = Some(WorkspaceId::new("workspace-file-remove"));
         let tool_call = ChatToolCall {
-            id: "call-recursive-remove".to_string(),
+            id: "call-file-remove".to_string(),
             kind: "function".to_string(),
             function: ChatToolFunction {
                 name: BuiltinToolName::FileRemove.as_str().to_string(),
                 arguments: serde_json::json!({
-                    "path": target.to_string_lossy(),
-                    "recursive": true
+                    "path": target.to_string_lossy()
                 })
                 .to_string(),
             },
@@ -3261,8 +3259,15 @@ mod tests {
         );
 
         assert_eq!(result[0].1, ExecutionResultStatus::NeedsApproval);
-        assert!(result[0].0.contains("高风险工具必须人工审批"));
-        assert!(target.exists(), "需要审批的递归删除不能提前执行");
+        let payload: serde_json::Value =
+            serde_json::from_str(&result[0].0).expect("policy payload should be json");
+        assert_eq!(payload["tool"].as_str(), Some("file_remove"));
+        assert_eq!(payload["status"].as_str(), Some("needs_approval"));
+        assert_eq!(
+            payload["error_code"].as_str(),
+            Some("tool_policy_needs_approval")
+        );
+        assert!(target.exists(), "需要审批的删除不能提前执行");
     }
 
     #[test]

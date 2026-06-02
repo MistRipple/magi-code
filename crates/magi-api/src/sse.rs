@@ -830,7 +830,10 @@ mod tests {
             .await
             .expect("second subscriber should skip other workspace and receive second event")
             .expect("second subscriber stream should stay open");
-        assert_eq!(first_next.event_id.as_str(), "event-multi-subscriber-second");
+        assert_eq!(
+            first_next.event_id.as_str(),
+            "event-multi-subscriber-second"
+        );
         assert_eq!(
             second_next.event_id.as_str(),
             "event-multi-subscriber-second"

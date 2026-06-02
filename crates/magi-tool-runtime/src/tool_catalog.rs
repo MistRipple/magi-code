@@ -594,7 +594,7 @@ fn policy_scope_label(tool: BuiltinToolName) -> &'static str {
 fn policy_summary(tool: BuiltinToolName) -> &'static str {
     match tool {
         BuiltinToolName::ShellExec => "按 action、access_mode 和命令写入迹象逐次判定风险与审批要求",
-        BuiltinToolName::FileRemove => "普通单文件删除为中风险；递归、force 或高危目标删除需要审批",
+        BuiltinToolName::FileRemove => "有效删除目标在受限访问模式下需要审批；参数缺失时由工具校验",
         _ => "使用工具默认风险与审批策略",
     }
 }
@@ -781,6 +781,19 @@ mod tests {
                 .expect("policy_summary")
                 .contains("逐次判定"),
             "input-sensitive tools should explain that runtime policy is decided per invocation"
+        );
+        let file_remove = payload["tools"]
+            .as_array()
+            .expect("tools")
+            .iter()
+            .find(|tool| tool["name"] == "file_remove")
+            .expect("file_remove should be listed");
+        assert_eq!(file_remove["policy_scope"], "input_sensitive");
+        assert_eq!(file_remove["input_sensitive_policy"], true);
+        assert_eq!(file_remove["effective_approval_policy"], "input_sensitive");
+        assert_eq!(
+            file_remove["access_profile_behavior"],
+            "restricted_input_sensitive"
         );
         let file_read = payload["tools"]
             .as_array()

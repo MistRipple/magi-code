@@ -1880,8 +1880,10 @@ mod tests {
     async fn get_file_content_rejects_workspace_mismatched_session_scope() {
         let root_a = unique_temp_dir("magi-changes-route-content-session-a");
         let root_b = unique_temp_dir("magi-changes-route-content-session-b");
-        fs::write(root_a.join("alpha.txt"), "alpha from workspace a\n").expect("alpha should write");
-        fs::write(root_b.join("alpha.txt"), "alpha from workspace b\n").expect("alpha should write");
+        fs::write(root_a.join("alpha.txt"), "alpha from workspace a\n")
+            .expect("alpha should write");
+        fs::write(root_b.join("alpha.txt"), "alpha from workspace b\n")
+            .expect("alpha should write");
         let state = build_state();
         state
             .workspace_registry

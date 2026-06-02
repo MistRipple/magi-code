@@ -3,6 +3,7 @@ use crate::{
     ToolExecutionPolicy, ToolRegistry, WriteProtectionScope,
     apply_patch::apply_patch_declared_paths_from_input,
     builtin::{field_string, parse_json_object, resolve_path_with_context},
+    tool_policy_decision_payload,
 };
 use magi_core::{AccessProfile, ExecutionResultStatus, ToolCallId, UtcMillis};
 use magi_governance::{DecisionPhase, GovernanceDecision, GovernanceOutcome};
@@ -13,8 +14,6 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-const TOOL_POLICY_REJECTED_PUBLIC_ERROR: &str = "该工具在当前上下文中不可用";
-const TOOL_POLICY_NEEDS_APPROVAL_PUBLIC_ERROR: &str = "该工具需要批准后执行";
 const WRITE_CONFLICT_PUBLIC_ERROR: &str = "检测到并发写冲突，请稍后重试";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -68,6 +67,7 @@ impl ToolRegistry {
             return Some(self.build_policy_rejection(
                 input,
                 format!("skill runtime 已显式拒绝工具: {}", input.tool_name),
+                policy.effective_access_profile(),
             ));
         }
 
@@ -80,6 +80,7 @@ impl ToolRegistry {
             return Some(self.build_policy_rejection(
                 input,
                 format!("skill runtime 未授权工具: {}", input.tool_name),
+                policy.effective_access_profile(),
             ));
         }
 
@@ -87,6 +88,7 @@ impl ToolRegistry {
             return Some(self.build_policy_rejection(
                 input,
                 format!("skill runtime 未授权工具: {}", input.tool_name),
+                policy.effective_access_profile(),
             ));
         }
 
@@ -97,17 +99,17 @@ impl ToolRegistry {
         &self,
         input: &ToolExecutionInput,
         reason: String,
+        access_profile: AccessProfile,
     ) -> ToolExecutionOutput {
         ToolExecutionOutput {
             tool_call_id: input.tool_call_id.clone(),
-            status: magi_core::ExecutionResultStatus::Rejected,
-            payload: serde_json::json!({
-                "tool": input.tool_name,
-                "status": "rejected",
-                "error_code": "tool_policy_rejected",
-                "error": TOOL_POLICY_REJECTED_PUBLIC_ERROR,
-            })
-            .to_string(),
+            status: ExecutionResultStatus::Rejected,
+            payload: tool_policy_decision_payload(
+                &input.tool_name,
+                ExecutionResultStatus::Rejected,
+                &reason,
+                access_profile,
+            ),
             governance: GovernanceDecision {
                 outcome: GovernanceOutcome::Rejected,
                 allowed: false,
@@ -249,9 +251,9 @@ impl ToolRegistry {
             magi_permissions::Decision::Deny { reason } => Some(ToolExecutionOutput {
                 tool_call_id: input.tool_call_id.clone(),
                 status: ExecutionResultStatus::Rejected,
-                payload: permission_decision_payload(
+                payload: tool_policy_decision_payload(
                     &input.tool_name,
-                    "rejected",
+                    ExecutionResultStatus::Rejected,
                     &reason,
                     access_profile,
                 ),
@@ -264,9 +266,9 @@ impl ToolRegistry {
             magi_permissions::Decision::NeedsApproval { reason } => Some(ToolExecutionOutput {
                 tool_call_id: input.tool_call_id.clone(),
                 status: ExecutionResultStatus::NeedsApproval,
-                payload: permission_decision_payload(
+                payload: tool_policy_decision_payload(
                     &input.tool_name,
-                    "needs_approval",
+                    ExecutionResultStatus::NeedsApproval,
                     &reason,
                     access_profile,
                 ),
@@ -496,37 +498,6 @@ impl ToolRegistry {
             },
         }
     }
-}
-
-fn permission_decision_payload(
-    tool_name: &str,
-    status: &str,
-    reason: &str,
-    access_profile: AccessProfile,
-) -> String {
-    let (error_code, public_error) = if status == "needs_approval" {
-        (
-            "tool_policy_needs_approval",
-            TOOL_POLICY_NEEDS_APPROVAL_PUBLIC_ERROR,
-        )
-    } else {
-        ("tool_policy_rejected", TOOL_POLICY_REJECTED_PUBLIC_ERROR)
-    };
-    tracing::warn!(
-        tool_name,
-        status,
-        access_profile = access_profile.as_str(),
-        reason,
-        "tool registry policy decision"
-    );
-    serde_json::json!({
-        "tool": tool_name,
-        "status": status,
-        "error_code": error_code,
-        "error": public_error,
-        "access_profile": access_profile.as_str(),
-    })
-    .to_string()
 }
 
 fn select_permission_axis_output(

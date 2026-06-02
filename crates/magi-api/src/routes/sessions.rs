@@ -3952,7 +3952,10 @@ mod tests {
             "invalid image error should be public and actionable: {body}"
         );
         assert!(
-            state.session_store.sessions_for_workspace(workspace_id.as_str()).is_empty(),
+            state
+                .session_store
+                .sessions_for_workspace(workspace_id.as_str())
+                .is_empty(),
             "invalid image request must not create a session or accepted turn"
         );
         assert!(
