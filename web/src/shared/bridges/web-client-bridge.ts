@@ -1927,8 +1927,14 @@ async function restoreBridgeState(reason: string, force = false): Promise<void> 
 
 function scheduleRecovery(reason: string, error?: unknown, immediate = false): void {
   emitRecoveringState(reason, error);
-  if (recoveryTimer !== null || recoveryInFlight) {
+  if (recoveryInFlight) {
     return;
+  }
+  if (recoveryTimer !== null) {
+    if (!immediate) {
+      return;
+    }
+    clearRecoveryTimer();
   }
   const delay = immediate
     ? 0

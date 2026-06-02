@@ -379,7 +379,11 @@ function messageCreatedEnvelope() {
 }
 
 async function waitFor(predicate, label) {
-  const deadline = Date.now() + 2000;
+  return waitForWithin(predicate, label, 2000);
+}
+
+async function waitForWithin(predicate, label, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (predicate()) {
       return;
@@ -435,8 +439,13 @@ try {
     SESSION_ID,
     'closed stale SSE callbacks must not mutate the current workspace/session binding',
   );
+  window.dispatchEvent(new Event('focus'));
 
-  await waitFor(() => FakeEventSource.instances.length > 1, 'event stream recovery must reconnect after transport error');
+  await waitForWithin(
+    () => FakeEventSource.instances.length > 1,
+    'immediate recovery trigger must preempt delayed SSE reconnect timer',
+    350,
+  );
   const recoveredStream = FakeEventSource.instances.at(-1);
   recoveredStream.onopen?.();
 
