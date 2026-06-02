@@ -71,6 +71,7 @@ function runGoldenReplay(reducer, projection, timelineRenderItems, contract) {
   assertBootstrapProcessingStateIgnoresForeignSessionRunningTurn(contract);
   assertBootstrapProcessingStateIgnoresTerminalCanonicalTurn(contract);
   assertBootstrapCarriesPendingChanges(contract);
+  assertBootstrapFiltersForeignWorkspaceSessions(contract);
 }
 
 function assertAgentSpawnToolCardStaysOnMainlineAndTaskTabsFilterByTaskId(reducer, projection, timelineRenderItems) {
@@ -809,6 +810,63 @@ function assertBootstrapCarriesPendingChanges(contract) {
     'bootstrap should expose snake_case pending_changes through AppState',
   );
   assert.equal(snakeCaseBootstrap.state.pendingChangesStateVersion, 7300);
+}
+
+function assertBootstrapFiltersForeignWorkspaceSessions(contract) {
+  const bootstrap = contract.normalizeRustBootstrapPayload({
+    generatedAt: 7400,
+    currentSession: {
+      sessionId: 'session-workspace-a',
+      workspaceId: 'workspace-a',
+      title: 'A',
+      createdAt: 7000,
+      updatedAt: 7400,
+    },
+    sessions: [
+      {
+        sessionId: 'session-workspace-a',
+        workspaceId: 'workspace-a',
+        title: 'A',
+        createdAt: 7000,
+        updatedAt: 7400,
+      },
+      {
+        sessionId: 'session-workspace-b',
+        workspaceId: 'workspace-b',
+        title: 'B',
+        createdAt: 7100,
+        updatedAt: 7300,
+      },
+      {
+        sessionId: 'session-legacy',
+        title: 'Legacy',
+        createdAt: 7100,
+        updatedAt: 7200,
+      },
+    ],
+    workspaces: [
+      { workspaceId: 'workspace-a', rootPath: '/tmp/workspace-a' },
+      { workspaceId: 'workspace-b', rootPath: '/tmp/workspace-b' },
+    ],
+  }, {
+    workspaceId: 'workspace-a',
+  });
+
+  assert.deepEqual(
+    bootstrap.sessions.map((session) => session.id),
+    ['session-workspace-a', 'session-legacy'],
+    'bootstrap must not expose sessions explicitly bound to a foreign workspace',
+  );
+  assert.equal(
+    bootstrap.sessions[0].workspaceId,
+    'workspace-a',
+    'bootstrap should keep session workspace scope for frontend guards',
+  );
+  assert.deepEqual(
+    bootstrap.state.sessions.map((session) => session.id),
+    bootstrap.sessions.map((session) => session.id),
+    'AppState sessions must use the same workspace-filtered list as bootstrap sessions',
+  );
 }
 
 function ordinaryChatCase() {

@@ -592,6 +592,7 @@ export interface SessionTimelineProjection {
 // 会话信息
 export interface Session {
   id: string;
+  workspaceId?: string;
   name?: string;  // 可选，未命名会话可能没有 name
   createdAt: number;
   updatedAt: number;

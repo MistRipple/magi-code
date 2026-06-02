@@ -48,6 +48,7 @@ export interface AgentWorkspaceSummary {
 
 export interface AgentSessionSummary {
   id: string;
+  workspaceId?: string;
   name?: string;
   createdAt: number;
   updatedAt: number;
@@ -90,6 +91,8 @@ interface RawAgentSessionSummary {
   id?: string;
   sessionId?: string;
   session_id?: string;
+  workspaceId?: string;
+  workspace_id?: string;
   name?: string | null;
   title?: string | null;
   createdAt?: number;
@@ -510,6 +513,7 @@ function findCachedWorkspaceSummary(workspaceId: string): AgentWorkspaceSummary 
 
 function normalizeSessionSummary(raw: RawAgentSessionSummary): AgentSessionSummary {
   const id = raw.id?.trim() || raw.sessionId?.trim() || raw.session_id?.trim() || '';
+  const workspaceId = raw.workspaceId?.trim() || raw.workspace_id?.trim() || '';
   const createdAt = raw.createdAt ?? raw.created_at ?? Date.now();
   const updatedAt = raw.updatedAt ?? raw.updated_at ?? createdAt;
   const name = raw.name?.trim() || raw.title?.trim() || undefined;
@@ -517,6 +521,7 @@ function normalizeSessionSummary(raw: RawAgentSessionSummary): AgentSessionSumma
   const messageCount = raw.messageCount ?? raw.message_count;
   return {
     id,
+    ...(workspaceId ? { workspaceId } : {}),
     name,
     createdAt,
     updatedAt,

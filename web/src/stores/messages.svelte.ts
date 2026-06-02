@@ -1550,8 +1550,13 @@ export function adoptCurrentSessionIdForLiveTurn(id: string | null | undefined):
 
 export function updateSessions(newSessions: Session[]) {
   const seen = new Set<string>();
+  const currentWorkspaceId = normalizeWorkspaceId(messagesState.currentWorkspaceId);
   messagesState.sessions = ensureArray<Session>(newSessions)
     .filter((session): session is Session => !!session && typeof session === 'object' && typeof session.id === 'string' && session.id.trim().length > 0)
+    .filter((session) => {
+      const sessionWorkspaceId = normalizeWorkspaceId(session.workspaceId);
+      return !currentWorkspaceId || !sessionWorkspaceId || sessionWorkspaceId === currentWorkspaceId;
+    })
     .filter((session) => {
       if (seen.has(session.id)) return false;
       seen.add(session.id);

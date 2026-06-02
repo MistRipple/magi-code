@@ -42,6 +42,7 @@ struct WorkspaceListResponse {
 #[serde(rename_all = "camelCase")]
 struct WorkspaceSessionDto {
     session_id: String,
+    workspace_id: String,
     title: String,
     status: String,
     created_at: u64,
@@ -264,6 +265,7 @@ async fn workspace_sessions(
         .iter()
         .map(|session| WorkspaceSessionDto {
             session_id: session.session_id.to_string(),
+            workspace_id: scoped_workspace_id.clone(),
             title: session.title.clone(),
             status: format!("{:?}", session.status),
             created_at: session.created_at.0,
@@ -539,6 +541,7 @@ mod tests {
             .expect("sessions should be an array");
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0]["sessionId"], "session-counted");
+        assert_eq!(sessions[0]["workspaceId"], "workspace-count");
         assert_eq!(sessions[0]["messageCount"], 2);
         assert!(sessions[0]["updatedAt"].as_u64().unwrap_or_default() > 0);
     }

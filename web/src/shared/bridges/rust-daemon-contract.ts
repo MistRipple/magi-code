@@ -534,6 +534,7 @@ function resolveEventWorkerId(event: RustEventEnvelope): string {
 function normalizeRustSessions(
   payload: RustBootstrapDto,
   generatedAt: number,
+  workspaceId: string,
 ): Session[] {
   if (!Array.isArray(payload.sessions)) {
     return [];
@@ -544,11 +545,17 @@ function normalizeRustSessions(
     if (!sessionId) {
       continue;
     }
+    const sessionWorkspaceId = normalizeString(session.workspaceId)
+      || normalizeString(session.workspace_id);
+    if (sessionWorkspaceId && workspaceId && sessionWorkspaceId !== workspaceId) {
+      continue;
+    }
     const createdAt = normalizeNumber(session.createdAt, generatedAt);
     const updatedAt = normalizeNumber(session.updatedAt, createdAt);
     const messageCount = normalizeNumber(session.messageCount, NaN);
     sessions.push({
       id: sessionId,
+      ...(sessionWorkspaceId ? { workspaceId: sessionWorkspaceId } : {}),
       name: normalizeString(session.title) || undefined,
       createdAt,
       updatedAt,
@@ -1343,12 +1350,12 @@ export function normalizeRustBootstrapPayload(
 ): BootstrapPayload {
   const payload = (rawPayload ?? {}) as RustBootstrapDto;
   const generatedAt = normalizeNumber(payload.generatedAt, Date.now());
-  const sessions = normalizeRustSessions(payload, generatedAt);
+  const workspace = resolveSelectedWorkspace(payload, options);
+  const sessions = normalizeRustSessions(payload, generatedAt, workspace.workspaceId);
   const selectedSessionId = normalizeString(payload.currentSession?.sessionId);
   const currentSession = selectedSessionId
     ? sessions.find((session) => session.id === selectedSessionId)
     : undefined;
-  const workspace = resolveSelectedWorkspace(payload, options);
   const normalizedEvents = Array.isArray(payload.recentEvents)
     ? payload.recentEvents.map((event) => normalizeEventEnvelope(event)).filter((event): event is RustEventEnvelope => event !== null)
     : [];
