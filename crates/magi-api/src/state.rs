@@ -1638,6 +1638,7 @@ fn normalize_settings_snapshot_sections(snapshot: &mut HashMap<String, serde_jso
 fn public_skills_config_section(value: serde_json::Value) -> serde_json::Value {
     let mut config = value.as_object().cloned().unwrap_or_default();
     if let Some(serde_json::Value::Array(skills)) = config.get_mut("instructionSkills") {
+        skills.retain(skill_loader::instruction_skill_source_available);
         for skill in skills {
             if let Some(object) = skill.as_object_mut() {
                 object.remove("directoryPath");
@@ -2172,13 +2173,26 @@ mod tests {
 
     #[test]
     fn public_skills_config_section_hides_directory_paths() {
+        let temp = tempfile::tempdir().expect("temp skill dir should create");
+        std::fs::write(
+            temp.path().join("SKILL.md"),
+            "# local-skill\n\n请输出 local-skill。\n",
+        )
+        .expect("skill markdown should write");
+        let missing_dir = temp.path().join("missing-skill");
         let public = public_skills_config_section(serde_json::json!({
             "instructionSkills": [
                 {
                     "name": "local-skill",
                     "skillId": "local-skill",
-                    "directoryPath": "/tmp/magi-private-skill-path",
+                    "directoryPath": temp.path().to_string_lossy().to_string(),
                     "description": "desc"
+                },
+                {
+                    "name": "missing-skill",
+                    "skillId": "missing-skill",
+                    "directoryPath": missing_dir.to_string_lossy().to_string(),
+                    "description": "stale"
                 }
             ],
             "customTools": [
@@ -2193,6 +2207,11 @@ mod tests {
             .expect("skill should stay object");
         assert_eq!(skill["name"], serde_json::json!("local-skill"));
         assert!(!skill.contains_key("directoryPath"));
+        assert_eq!(
+            public["instructionSkills"].as_array().map(Vec::len),
+            Some(1),
+            "unavailable local skills should not be exposed as selectable instructions"
+        );
         assert_eq!(public["customTools"][0]["name"], "custom-tool");
     }
 

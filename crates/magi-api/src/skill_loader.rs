@@ -16,13 +16,33 @@ const TOP_LEVEL_CUSTOM_TOOLS_SECTION: &str = "customTools";
 const TOP_LEVEL_INSTRUCTION_SKILLS_SECTION: &str = "skills";
 
 pub fn read_skill_instruction(dir_path: &Path) -> String {
+    read_available_skill_instruction(dir_path).unwrap_or_default()
+}
+
+pub fn read_available_skill_instruction(dir_path: &Path) -> Option<String> {
     for filename in ["prompt.md", "SKILL.md", "README.md"] {
         let path = dir_path.join(filename);
-        if path.exists() {
-            return fs::read_to_string(path).unwrap_or_default();
+        if path.is_file() {
+            let instruction = fs::read_to_string(path).ok()?;
+            if instruction.trim().is_empty() {
+                return None;
+            }
+            return Some(instruction);
         }
     }
-    String::new()
+    None
+}
+
+pub fn instruction_skill_source_available(skill: &Value) -> bool {
+    let Some(dir_path) = skill
+        .get("directoryPath")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return false;
+    };
+    read_available_skill_instruction(Path::new(dir_path)).is_some()
 }
 
 fn normalize_wrapped_section_value(value: &mut Value) {
@@ -307,7 +327,9 @@ fn build_skill_registry_from_config(config: &Map<String, Value>) -> SkillRegistr
             if let Some(skill_id) = skill_val.get("skillId").and_then(|v| v.as_str()) {
                 if let Some(dir_path) = skill_val.get("directoryPath").and_then(|v| v.as_str()) {
                     let skill_dir = PathBuf::from(dir_path);
-                    let instruction = read_skill_instruction(&skill_dir);
+                    let Some(instruction) = read_available_skill_instruction(&skill_dir) else {
+                        continue;
+                    };
 
                     let mut allowed_tools = Vec::new();
                     let mut custom_tool_bindings = Vec::new();
@@ -469,6 +491,57 @@ mod tests {
         assert!(plan.prompt_injections[0].body.contains("skill-loader-e2e"));
 
         std::fs::remove_dir_all(&skill_dir).expect("temp skill dir should be removed");
+    }
+
+    #[test]
+    fn load_skills_into_registry_skips_unavailable_instruction_skills() {
+        let valid_dir =
+            make_local_skill_dir("valid-skill", "# 可用 Skill\n\n请输出 available-skill。\n");
+        let empty_dir = unique_test_dir("empty-skill");
+        std::fs::create_dir_all(&empty_dir).expect("empty skill dir should be created");
+        std::fs::write(empty_dir.join("SKILL.md"), "   \n")
+            .expect("empty skill markdown should be written");
+        let missing_dir = unique_test_dir("missing-skill");
+
+        let store = SettingsStore::new();
+        store.set_section(
+            "skillsConfig",
+            serde_json::json!({
+                "instructionSkills": [
+                    {
+                        "skillId": "valid-skill",
+                        "name": "valid-skill",
+                        "directoryPath": valid_dir.to_string_lossy().to_string()
+                    },
+                    {
+                        "skillId": "empty-skill",
+                        "name": "empty-skill",
+                        "directoryPath": empty_dir.to_string_lossy().to_string()
+                    },
+                    {
+                        "skillId": "missing-skill",
+                        "name": "missing-skill",
+                        "directoryPath": missing_dir.to_string_lossy().to_string()
+                    }
+                ]
+            }),
+        );
+
+        let registry = load_skills_into_registry(&store);
+        let plan = registry.build_tool_runtime_plan(&SkillSelection {
+            skill_ids: vec![
+                "valid-skill".to_string(),
+                "empty-skill".to_string(),
+                "missing-skill".to_string(),
+            ],
+            requested_tools: vec![],
+        });
+
+        assert_eq!(plan.prompt_injections.len(), 1);
+        assert!(plan.prompt_injections[0].body.contains("available-skill"));
+
+        std::fs::remove_dir_all(&valid_dir).expect("valid temp skill dir should be removed");
+        std::fs::remove_dir_all(&empty_dir).expect("empty temp skill dir should be removed");
     }
 
     #[test]

@@ -824,10 +824,12 @@ async fn list_skills(State(state): State<ApiState>) -> Json<serde_json::Value> {
     let installed_skills = load_instruction_skills(&state);
     let installed_names: std::collections::HashSet<String> = installed_skills
         .iter()
+        .filter(|skill| skill_loader::instruction_skill_source_available(skill))
         .filter_map(|s| instruction_skill_name(s))
         .collect();
     let mut all_skills: Vec<serde_json::Value> = installed_skills
         .into_iter()
+        .filter(skill_loader::instruction_skill_source_available)
         .map(|skill| {
             let mut entry = skill.as_object().cloned().unwrap_or_default();
             entry.remove("directoryPath");
@@ -1432,7 +1434,8 @@ async fn get_instruction_skill_preview(
         .ok_or_else(|| ApiError::InvalidInput("技能源不可用，请重新导入该 Skill".to_string()))?;
 
     let dir = PathBuf::from(directory_path);
-    let instruction = skill_loader::read_skill_instruction(&dir);
+    let instruction = skill_loader::read_available_skill_instruction(&dir)
+        .ok_or_else(|| ApiError::InvalidInput("技能源不可用，请重新导入该 Skill".to_string()))?;
     let preview: String = instruction.chars().take(200).collect();
 
     Ok(Json(serde_json::json!({
@@ -1704,6 +1707,78 @@ mod tests {
         assert_scope_fields_absent(&stored);
         assert_scope_fields_absent(&stored["instructionSkills"][0]);
         assert_scope_fields_absent(&stored["customTools"][0]);
+    }
+
+    #[tokio::test]
+    async fn skill_library_filters_unavailable_local_instruction_skills() {
+        let state = test_state();
+        let valid_dir = tempfile::tempdir().expect("temp skill dir should create");
+        std::fs::write(
+            valid_dir.path().join("SKILL.md"),
+            "# valid-skill\n\n请输出 valid-skill。\n",
+        )
+        .expect("skill markdown should write");
+        let missing_dir = valid_dir.path().join("missing-skill");
+        state.settings_store.set_section(
+            "skillsConfig",
+            serde_json::json!({
+                "instructionSkills": [
+                    {
+                        "skillId": "valid-skill",
+                        "name": "valid-skill",
+                        "directoryPath": valid_dir.path().to_string_lossy().to_string()
+                    },
+                    {
+                        "skillId": "missing-skill",
+                        "name": "missing-skill",
+                        "directoryPath": missing_dir.to_string_lossy().to_string()
+                    }
+                ]
+            }),
+        );
+        let app = Router::new().merge(routes()).with_state(state);
+
+        let body = get_json(app, "/settings/skills/library").await;
+        let skills = body["skills"]
+            .as_array()
+            .expect("skills should be an array");
+
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0]["skillId"], serde_json::json!("valid-skill"));
+        assert_eq!(skills[0]["installed"], serde_json::json!(true));
+        assert!(skills[0].get("directoryPath").is_none());
+    }
+
+    #[tokio::test]
+    async fn instruction_skill_preview_rejects_unavailable_source() {
+        let state = test_state();
+        let missing_dir =
+            std::env::temp_dir().join(format!("magi-missing-skill-{}", epoch_ms_now()));
+        state.settings_store.set_section(
+            "skillsConfig",
+            serde_json::json!({
+                "instructionSkills": [
+                    {
+                        "skillId": "missing-skill",
+                        "name": "missing-skill",
+                        "directoryPath": missing_dir.to_string_lossy().to_string()
+                    }
+                ]
+            }),
+        );
+
+        let error = get_instruction_skill_preview(
+            State(state),
+            Query(HashMap::from([(
+                "skillId".to_string(),
+                "missing-skill".to_string(),
+            )])),
+        )
+        .await
+        .expect_err("missing skill source should be rejected");
+
+        assert_eq!(error.message(), "技能源不可用，请重新导入该 Skill");
+        assert!(!error.message().contains("magi-missing-skill"));
     }
 
     #[tokio::test]
