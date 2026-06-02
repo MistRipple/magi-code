@@ -1464,7 +1464,7 @@ impl ApiState {
         }
 
         for (_, orphan_state) in workspace_states {
-            global_state.append_state(orphan_state);
+            global_state.append_state_without_current(orphan_state);
         }
 
         let Some(state_root) = persistence.state_root() else {
@@ -2245,6 +2245,54 @@ mod tests {
         let persisted = std::fs::read_to_string(state_root.join("sessions.json"))
             .expect("global session durable state should be written");
         assert!(persisted.contains(session_id.as_str()));
+    }
+
+    #[test]
+    fn session_durable_persistence_keeps_orphan_workspace_sessions_without_current_pointer() {
+        let state_root = std::env::temp_dir().join(format!(
+            "magi-api-orphan-session-persistence-{}",
+            UtcMillis::now().0
+        ));
+        let event_bus = Arc::new(InMemoryEventBus::new(32));
+        let session_store = Arc::new(SessionStore::default());
+        let workspace_store = Arc::new(WorkspaceStore::default());
+        let governance = Arc::new(GovernanceService::default());
+        let session_id = SessionId::new("session-orphan-workspace-current");
+        session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "orphan workspace",
+                Some("workspace-missing-current".to_string()),
+            )
+            .expect("session should create");
+
+        let state = ApiState::new(
+            "magi-test",
+            event_bus,
+            session_store,
+            workspace_store,
+            governance,
+        )
+        .with_runtime_persistence(Arc::new(RuntimeStatePersistence::new(
+            state_root.join("sessions.json"),
+            state_root.join("workspaces.json"),
+            state_root.join("knowledge.json"),
+        )));
+
+        state
+            .persist_session_durable_state()
+            .expect("session durable state should persist");
+        let persisted = std::fs::read_to_string(state_root.join("sessions.json"))
+            .expect("global session durable state should be written");
+        let durable: magi_session_store::SessionDurableState =
+            serde_json::from_str(&persisted).expect("persisted session state should parse");
+
+        assert_eq!(durable.current_session_id, None);
+        assert!(durable.sessions.iter().any(|session| {
+            session.session_id == session_id
+                && session.workspace_id.as_deref() == Some("workspace-missing-current")
+        }));
+        let _ = std::fs::remove_dir_all(state_root);
     }
 
     #[test]

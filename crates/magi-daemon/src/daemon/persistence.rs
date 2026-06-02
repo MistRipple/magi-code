@@ -72,7 +72,7 @@ impl StateRepository {
                         self.save_workspace_session_state(root, &ws_state)?;
                     }
                 } else {
-                    global_state.append_state(workspace_state);
+                    global_state.append_state_without_current(workspace_state);
                 }
             }
             if global_state.is_empty() {
@@ -353,7 +353,7 @@ impl RuntimeSidecarPersistence {
         }
 
         for (_, orphan_state) in workspace_states {
-            global_state.append_state(orphan_state);
+            global_state.append_state_without_current(orphan_state);
         }
 
         let global_path = self.state_repository.session_durable_state_path();
@@ -508,7 +508,7 @@ mod tests {
     }
 
     #[test]
-    fn load_sessions_from_workspaces_keeps_unknown_workspace_sessions_in_global_state() {
+    fn load_sessions_from_workspaces_keeps_unknown_workspace_sessions_without_current_pointer() {
         let state_root = unique_temp_dir("magi-persistence-unknown-workspace");
         let repository = StateRepository::new(state_root.clone());
         let session_id = SessionId::new("session-unknown-workspace");
@@ -560,7 +560,7 @@ mod tests {
         assert_eq!(merged.sessions.len(), 1);
         assert_eq!(merged.timeline.len(), 1);
         assert_eq!(merged.notifications.len(), 1);
-        assert_eq!(merged.current_session_id, Some(session_id.clone()));
+        assert_eq!(merged.current_session_id, None);
 
         let global_state = repository
             .load_session_durable_state()
@@ -569,6 +569,7 @@ mod tests {
             session.session_id == session_id
                 && session.workspace_id.as_deref() == Some("workspace-missing")
         }));
+        assert_eq!(global_state.current_session_id, None);
 
         let _ = fs::remove_dir_all(state_root);
     }

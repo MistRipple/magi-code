@@ -749,8 +749,12 @@ impl SessionDurableState {
 
     pub fn append_state(&mut self, other: SessionDurableState) {
         if self.current_session_id.is_none() {
-            self.current_session_id = other.current_session_id;
+            self.current_session_id = other.current_session_id.clone();
         }
+        self.append_state_without_current(other);
+    }
+
+    pub fn append_state_without_current(&mut self, other: SessionDurableState) {
         self.sessions.extend(other.sessions);
         self.timeline.extend(other.timeline);
         self.canonical_turns.extend(other.canonical_turns);
