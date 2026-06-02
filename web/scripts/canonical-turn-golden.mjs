@@ -233,7 +233,7 @@ function assertUserImageMetadataProjectsToMessage(reducer, projection) {
   assert.ok(userArtifact, 'user image message artifact should exist');
   assert.deepEqual(
     userArtifact.message.images,
-    imageMetadata.images.map((image) => ({ dataUrl: image.dataUrl })),
+    imageMetadata.images,
     'user image metadata must project to first-class Message.images for MessageItem rendering',
   );
   assert.equal(
@@ -414,7 +414,7 @@ function assertLocalPendingImageSurvivesRegularAcceptedTurn(reducer, projection)
   let userArtifact = findArtifactByTurnItemId(projectionValue, requestMetadata.userMessageId);
   assert.deepEqual(
     userArtifact?.message.images,
-    imageMetadata.images.map((image) => ({ dataUrl: image.dataUrl })),
+    imageMetadata.images,
     'local pending image should enter Message.images immediately',
   );
 
@@ -428,7 +428,7 @@ function assertLocalPendingImageSurvivesRegularAcceptedTurn(reducer, projection)
   userArtifact = findArtifactByTurnItemId(projectionValue, requestMetadata.userMessageId);
   assert.deepEqual(
     userArtifact?.message.images,
-    imageMetadata.images.map((image) => ({ dataUrl: image.dataUrl })),
+    imageMetadata.images,
     'accepted canonical user-only turn should keep image thumbnails in the message area',
   );
 }

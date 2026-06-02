@@ -277,7 +277,7 @@
       <div class="user-images">
         {#each messageImages as img, i (`${message.id}-img-${i}`)}
           <button class="user-image-thumb" onclick={() => openImagePreview(img.dataUrl)} type="button" title={i18n.t('messageItem.imageClickTitle')}>
-            <img src={img.dataUrl} alt={i18n.t('messageItem.imageAlt', { index: i + 1 })} />
+            <img src={img.dataUrl} alt={img.name || i18n.t('messageItem.imageAlt', { index: i + 1 })} />
           </button>
         {/each}
       </div>

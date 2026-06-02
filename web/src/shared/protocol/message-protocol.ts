@@ -307,6 +307,11 @@ export interface DataPayload {
   payload: Record<string, unknown>;
 }
 
+export interface StandardMessageImage {
+  name?: string;
+  dataUrl: string;
+}
+
 export interface MessageMetadata {
   taskId?: string;
   executionGroupId?: string;
@@ -390,7 +395,7 @@ export interface MessageMetadata {
   placeholderMessageId?: string;
   sendingAnimation?: boolean;
   wasPlaceholder?: boolean;
-  images?: Array<{ dataUrl: string }>;
+  images?: StandardMessageImage[];
   isSupplementary?: boolean;
   toolCallId?: string;
   toolName?: string;

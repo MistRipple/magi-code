@@ -2,6 +2,7 @@ import type {
   AgentId,
   ContentBlock,
   Message,
+  MessageImage,
   SessionTimelineProjection,
   TimelineProjectionArtifact,
   TimelineProjectionRenderEntry,
@@ -200,7 +201,7 @@ function resolveItemContent(item: CanonicalTurnItem): string {
 
 function normalizeMessageImagesFromMetadata(
   metadata: Record<string, unknown> | undefined,
-): Message['images'] | undefined {
+): MessageImage[] | undefined {
   const images = metadata?.images;
   if (!Array.isArray(images)) {
     return undefined;
@@ -213,9 +214,16 @@ function normalizeMessageImagesFromMetadata(
     ))
     .map((image) => {
       const dataUrl = typeof image.dataUrl === 'string' ? image.dataUrl.trim() : '';
-      return dataUrl ? { dataUrl } : null;
+      if (!dataUrl) {
+        return null;
+      }
+      const name = typeof image.name === 'string' ? image.name.trim() : '';
+      return {
+        ...(name ? { name } : {}),
+        dataUrl,
+      };
     })
-    .filter((image): image is { dataUrl: string } => image !== null);
+    .filter((image): image is MessageImage => image !== null);
   return normalized.length > 0 ? normalized : undefined;
 }
 

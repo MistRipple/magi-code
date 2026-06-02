@@ -1,6 +1,7 @@
 import type {
   ContentBlock,
   Message,
+  MessageImage,
   MessageRole,
   MessageSource,
   MessageType,
@@ -149,7 +150,7 @@ function sanitizeMessageMetadata(
 function sanitizeMessageImages(
   images: unknown,
   errorPrefix: string,
-): Array<{ dataUrl: string }> | undefined {
+): MessageImage[] | undefined {
   if (images === undefined) {
     return undefined;
   }
@@ -163,7 +164,11 @@ function sanitizeMessageImages(
       if (!dataUrl) {
         throw new Error(`${errorPrefix} images.dataUrl 无效`);
       }
-      return { dataUrl };
+      const name = typeof item.name === 'string' ? item.name.trim() : '';
+      return {
+        ...(name ? { name } : {}),
+        dataUrl,
+      };
     });
   return normalized.length > 0 ? normalized : undefined;
 }

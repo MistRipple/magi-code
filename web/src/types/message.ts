@@ -265,6 +265,11 @@ export interface StandardizedToolResult {
   sourceId?: string;
 }
 
+export interface MessageImage {
+  name?: string;
+  dataUrl: string;
+}
+
 export interface ToolPolicyPayload {
   schemaVersion: 'tool-policy.v1';
   source: 'request' | 'mode' | 'skill' | 'composed';
@@ -509,7 +514,7 @@ export interface Message {
   type?: MessageType;         // 消息类型（notice = 系统通知）
   noticeType?: NoticeType;    // 通知类型（info/success/warning/error）
   /** 用户上传的图片（base64 Data URL 格式） */
-  images?: Array<{ dataUrl: string }>;
+  images?: MessageImage[];
   metadata?: {
     model?: string;
     tokens?: number;
