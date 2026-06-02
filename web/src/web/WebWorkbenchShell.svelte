@@ -155,10 +155,11 @@
     }
   }
 
-  function currentWorkspaceBinding(): { workspaceId: string; sessionId: string } {
+  function currentWorkspaceBinding(): { workspaceId: string; workspacePath: string; sessionId: string } {
     const binding = resolveAgentBindingContext();
     return {
       workspaceId: binding.workspaceId,
+      workspacePath: binding.workspacePath,
       sessionId: binding.sessionId,
     };
   }
@@ -194,6 +195,13 @@
     const requestedWorkspaceId = currentWorkspaceBinding().workspaceId;
     if (requestedWorkspaceId && nextWorkspaces.some((workspace) => workspace.workspaceId === requestedWorkspaceId)) {
       return requestedWorkspaceId;
+    }
+    const requestedWorkspacePath = currentWorkspaceBinding().workspacePath;
+    const requestedWorkspace = requestedWorkspacePath
+      ? nextWorkspaces.find((workspace) => workspace.rootPath?.trim() === requestedWorkspacePath)
+      : null;
+    if (requestedWorkspace) {
+      return requestedWorkspace.workspaceId;
     }
     return nextWorkspaces.find((workspace) => workspace.isActive)?.workspaceId
       || nextWorkspaces[0]?.workspaceId

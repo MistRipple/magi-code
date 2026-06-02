@@ -40,11 +40,21 @@ function readWindowBindingContext(): AgentBindingContext {
   };
 }
 
+function hasExplicitWorkspaceBinding(binding: AgentBindingContext): boolean {
+  return Boolean(binding.workspaceId || binding.workspacePath);
+}
+
 export function resolveAgentBindingContext(): AgentBindingContext {
+  const windowBinding = readWindowBindingContext();
+  if (hasExplicitWorkspaceBinding(windowBinding)) {
+    runtimeBindingInitialized = true;
+    runtimeBinding = windowBinding;
+    return { ...runtimeBinding };
+  }
   if (runtimeBindingInitialized) {
     return { ...runtimeBinding };
   }
-  return readWindowBindingContext();
+  return windowBinding;
 }
 
 export function seedAgentBindingContextFromWindow(): AgentBindingContext {

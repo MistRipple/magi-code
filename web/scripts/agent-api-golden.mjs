@@ -63,6 +63,47 @@ try {
     'explicit empty file preview session should keep workspace-only scope',
   );
 
+  const originalWindow = globalThis.window;
+  try {
+    globalThis.window = {
+      location: {
+        href: 'http://127.0.0.1:38123/web.html?workspacePath=%2Ftmp%2Fworkspace-from-url',
+      },
+    };
+    binding.setAgentBindingContext({
+      workspaceId: 'workspace-stale-runtime',
+      workspacePath: '/tmp/workspace-stale-runtime',
+      sessionId: 'session-stale-runtime',
+    });
+    const explicitUrlBinding = binding.resolveAgentBindingContext();
+    assert.equal(explicitUrlBinding.workspacePath, '/tmp/workspace-from-url');
+    assert.equal(explicitUrlBinding.workspaceId, '');
+    assert.equal(
+      explicitUrlBinding.sessionId,
+      '',
+      'explicit URL workspace without session must clear stale runtime session binding',
+    );
+    const explicitUrlPreviewQuery = new URLSearchParams(
+      agentApi.buildFilePreviewQuery('README.md'),
+    );
+    assert.equal(
+      explicitUrlPreviewQuery.get('workspacePath'),
+      '/tmp/workspace-from-url',
+      'explicit URL workspace must win over stale runtime binding for shared API queries',
+    );
+    assert.equal(
+      explicitUrlPreviewQuery.has('sessionId'),
+      false,
+      'workspace-only URL must not leak stale runtime sessionId into API queries',
+    );
+  } finally {
+    if (originalWindow === undefined) {
+      delete globalThis.window;
+    } else {
+      globalThis.window = originalWindow;
+    }
+  }
+
   console.log('agent api golden replay passed');
 } finally {
   await server.close();
