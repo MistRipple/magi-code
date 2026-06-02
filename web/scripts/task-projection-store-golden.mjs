@@ -134,6 +134,9 @@ try {
   taskStore.startAutoRefresh(60_000);
 
   assert.equal(projectionFetches.length, 1, 'initial projection fetch should run once');
+  await delay(1700);
+  const settledFetchCount = projectionFetches.length;
+  assert.equal(settledFetchCount, 2, 'settle refresh should run once after tracking starts');
 
   bridge.emit({
     type: 'rustTaskEvent',
@@ -146,8 +149,23 @@ try {
   await delay(380);
   assert.equal(
     projectionFetches.length,
-    1,
+    settledFetchCount,
     'task event for another session must not refresh the active projection',
+  );
+
+  bridge.emit({
+    type: 'rustTaskEvent',
+    eventType: 'task.status.changed',
+    workspaceId: 'workspace-task-projection-other',
+    sessionId: SESSION_ID,
+    rootTaskIds: [ROOT_TASK_ID],
+    payload: {},
+  });
+  await delay(380);
+  assert.equal(
+    projectionFetches.length,
+    settledFetchCount,
+    'task event for another workspace must not refresh the active projection',
   );
 
   bridge.emit({
@@ -161,7 +179,7 @@ try {
   await delay(380);
   assert.equal(
     projectionFetches.length,
-    1,
+    settledFetchCount,
     'task event for another root task must not refresh the active projection',
   );
 
@@ -176,7 +194,7 @@ try {
   await delay(380);
   assert.equal(
     projectionFetches.length,
-    2,
+    settledFetchCount + 1,
     'matching task event should refresh the active projection',
   );
 
