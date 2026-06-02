@@ -159,6 +159,9 @@
     return {
       key: `assignment:${taskId}`,
       message,
+      workspaceId: messagesState.currentWorkspaceId || undefined,
+      workspacePath: messagesState.currentWorkspacePath || undefined,
+      sessionId: messagesState.currentSessionId || undefined,
     };
   });
 
@@ -167,7 +170,10 @@
     if (!taskId || !projection) {
       return assignmentRenderItem ? [assignmentRenderItem] : [];
     }
-    const items = buildTimelineRenderItems(projection, 'task', taskId);
+    const items = buildTimelineRenderItems(projection, 'task', taskId, {
+      workspaceId: messagesState.currentWorkspaceId,
+      workspacePath: messagesState.currentWorkspacePath,
+    });
     return assignmentRenderItem ? [assignmentRenderItem, ...items] : items;
   });
 </script>

@@ -22,6 +22,11 @@
         ? buildTimelineRenderItems(
             messagesState.canonicalTimelineProjection,
             'thread',
+            undefined,
+            {
+              workspaceId: messagesState.currentWorkspaceId,
+              workspacePath: messagesState.currentWorkspacePath,
+            },
           )
         : []
   ));

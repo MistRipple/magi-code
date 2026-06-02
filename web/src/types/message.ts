@@ -578,6 +578,12 @@ export interface TimelineProjectionRenderEntry {
 export interface TimelineRenderItem {
   key: string;
   message: Message;
+  /** 当前渲染项所属 session。文件预览等动作必须使用该 scope，不能从全局当前会话猜测。 */
+  sessionId?: string;
+  /** 当前渲染项所属 workspace。 */
+  workspaceId?: string;
+  /** 当前渲染项所属 workspace 路径。 */
+  workspacePath?: string;
 }
 
 export interface SessionTimelineProjection {

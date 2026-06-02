@@ -11,12 +11,33 @@ export interface TimelinePanelView {
   messages: Message[];
 }
 
+export interface TimelineRenderScope {
+  workspaceId?: string | null;
+  workspacePath?: string | null;
+  sessionId?: string | null;
+}
+
 /**
  * 时间线显示上下文：
  * - `thread`：主对话区，渲染主线代理的 artifacts
  * - `task`：右侧 RightPane 代理 tab，按 `metadata.taskId` 过滤该代理自身的 artifacts
  */
 export type TimelineDisplayContext = 'thread' | 'task';
+
+function normalizeScopeValue(value: string | null | undefined): string | undefined {
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+function renderItemScope(
+  projection: SessionTimelineProjection,
+  scope: TimelineRenderScope = {},
+): Pick<TimelineRenderItem, 'sessionId' | 'workspaceId' | 'workspacePath'> {
+  return {
+    sessionId: normalizeScopeValue(scope.sessionId) ?? normalizeScopeValue(projection.sessionId),
+    workspaceId: normalizeScopeValue(scope.workspaceId),
+    workspacePath: normalizeScopeValue(scope.workspacePath),
+  };
+}
 
 function prepareRenderMessage(message: Message, displayContext: TimelineDisplayContext): Message {
   void displayContext;
@@ -46,8 +67,10 @@ function buildProjectionPanelView(
   projection: SessionTimelineProjection,
   displayContext: TimelineDisplayContext,
   taskId?: string,
+  scope: TimelineRenderScope = {},
 ): TimelinePanelView {
   const artifactById = buildProjectionArtifactLookup(projection);
+  const itemScope = renderItemScope(projection, scope);
   const items: TimelineRenderItem[] = [];
   const messages: Message[] = [];
 
@@ -56,7 +79,7 @@ function buildProjectionPanelView(
       const artifact = artifactById.get(entry.artifactId);
       if (!artifact?.message) continue;
       const message = prepareRenderMessage(artifact.message, displayContext);
-      items.push({ key: entry.entryId, message });
+      items.push({ key: entry.entryId, message, ...itemScope });
       messages.push(message);
     }
     return { items, messages };
@@ -71,7 +94,7 @@ function buildProjectionPanelView(
     if (artifactTaskId(artifact) !== targetTaskId) continue;
     if (!artifact.message) continue;
     const message = prepareRenderMessage(artifact.message, displayContext);
-    items.push({ key: `artifact:${artifact.artifactId}`, message });
+    items.push({ key: `artifact:${artifact.artifactId}`, message, ...itemScope });
     messages.push(message);
   }
   return { items, messages };
@@ -81,22 +104,25 @@ export function buildTimelinePanelMessages(
   projection: SessionTimelineProjection,
   displayContext: TimelineDisplayContext,
   taskId?: string,
+  scope: TimelineRenderScope = {},
 ): Message[] {
-  return buildProjectionPanelView(projection, displayContext, taskId).messages;
+  return buildProjectionPanelView(projection, displayContext, taskId, scope).messages;
 }
 
 export function buildTimelinePanelView(
   projection: SessionTimelineProjection,
   displayContext: TimelineDisplayContext,
   taskId?: string,
+  scope: TimelineRenderScope = {},
 ): TimelinePanelView {
-  return buildProjectionPanelView(projection, displayContext, taskId);
+  return buildProjectionPanelView(projection, displayContext, taskId, scope);
 }
 
 export function buildTimelineRenderItems(
   projection: SessionTimelineProjection,
   displayContext: TimelineDisplayContext,
   taskId?: string,
+  scope: TimelineRenderScope = {},
 ): TimelineRenderItem[] {
-  return buildProjectionPanelView(projection, displayContext, taskId).items;
+  return buildProjectionPanelView(projection, displayContext, taskId, scope).items;
 }

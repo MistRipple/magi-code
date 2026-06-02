@@ -614,9 +614,9 @@
           {readOnly}
           {displayContext}
           filePreviewScope={{
-            workspaceId: messagesState.currentWorkspaceId || undefined,
-            workspacePath: messagesState.currentWorkspacePath || undefined,
-            sessionId: messagesState.currentSessionId || undefined,
+            workspaceId: item.workspaceId || messagesState.currentWorkspaceId || undefined,
+            workspacePath: item.workspacePath || messagesState.currentWorkspacePath || undefined,
+            sessionId: item.sessionId || messagesState.currentSessionId || undefined,
           }}
           showStreamingIndicator={item.key === streamingIndicatorRenderKey}
           streamingElapsedSeconds={item.key === streamingIndicatorRenderKey ? elapsedSeconds : 0}
