@@ -438,6 +438,116 @@ fn workspace_code_index_builds_and_searches_real_symbols() {
 }
 
 #[test]
+fn workspace_code_search_does_not_cross_workspace_indexes() {
+    use crate::local_search_engine::SearchOptions;
+    use std::fs;
+
+    let base = std::env::temp_dir().join(format!(
+        "magi-ks-index-scope-test-{}-{}",
+        std::process::id(),
+        UtcMillis::now().0
+    ));
+    let _ = fs::remove_dir_all(&base);
+    let root_a = base.join("workspace-a");
+    let root_b = base.join("workspace-b");
+    fs::create_dir_all(root_a.join("src")).expect("create workspace a src");
+    fs::create_dir_all(root_b.join("src")).expect("create workspace b src");
+    fs::write(
+        root_a.join("src/alpha.rs"),
+        "pub fn exclusive_alpha_index_probe() -> bool { true }\n",
+    )
+    .expect("write workspace a source");
+    fs::write(
+        root_b.join("src/beta.rs"),
+        "pub fn exclusive_beta_index_probe() -> bool { true }\n",
+    )
+    .expect("write workspace b source");
+
+    let store = KnowledgeStore::new();
+    let workspace_a = WorkspaceId::new("ws-index-scope-a");
+    let workspace_b = WorkspaceId::new("ws-index-scope-b");
+
+    store.build_workspace_index(&workspace_a, &root_a);
+    store.build_workspace_index(&workspace_b, &root_b);
+    assert!(store.workspace_index_ready(&workspace_a));
+    assert!(store.workspace_index_ready(&workspace_b));
+
+    let alpha_results = store
+        .search_workspace_code(
+            &workspace_a,
+            "exclusive alpha index probe",
+            SearchOptions::default(),
+        )
+        .expect("workspace a engine ready");
+    assert!(
+        alpha_results
+            .iter()
+            .any(|result| result.file_path.contains("alpha.rs")),
+        "workspace a 应命中 alpha.rs，实际: {:?}",
+        alpha_results
+            .iter()
+            .map(|result| &result.file_path)
+            .collect::<Vec<_>>()
+    );
+
+    let beta_results_from_a = store
+        .search_workspace_code(
+            &workspace_a,
+            "exclusive beta index probe",
+            SearchOptions::default(),
+        )
+        .expect("workspace a engine ready");
+    assert!(
+        beta_results_from_a
+            .iter()
+            .all(|result| !result.file_path.contains("beta.rs")),
+        "workspace a 不应返回 workspace b 的 beta.rs，实际: {:?}",
+        beta_results_from_a
+            .iter()
+            .map(|result| &result.file_path)
+            .collect::<Vec<_>>()
+    );
+
+    let beta_results = store
+        .search_workspace_code(
+            &workspace_b,
+            "exclusive beta index probe",
+            SearchOptions::default(),
+        )
+        .expect("workspace b engine ready");
+    assert!(
+        beta_results
+            .iter()
+            .any(|result| result.file_path.contains("beta.rs")),
+        "workspace b 应命中 beta.rs，实际: {:?}",
+        beta_results
+            .iter()
+            .map(|result| &result.file_path)
+            .collect::<Vec<_>>()
+    );
+
+    let alpha_results_from_b = store
+        .search_workspace_code(
+            &workspace_b,
+            "exclusive alpha index probe",
+            SearchOptions::default(),
+        )
+        .expect("workspace b engine ready");
+    assert!(
+        alpha_results_from_b
+            .iter()
+            .all(|result| !result.file_path.contains("alpha.rs")),
+        "workspace b 不应返回 workspace a 的 alpha.rs，实际: {:?}",
+        alpha_results_from_b
+            .iter()
+            .map(|result| &result.file_path)
+            .collect::<Vec<_>>()
+    );
+
+    let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
 fn workspace_code_search_cache_respects_search_options() {
     use crate::local_search_engine::SearchOptions;
     use std::fs;

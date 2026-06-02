@@ -6618,6 +6618,106 @@ mod tests {
     }
 
     #[test]
+    fn search_semantic_uses_context_workspace_when_multiple_indexes_are_ready() {
+        let root_a = unique_temp_dir("magi-tool-search-scope-a");
+        let root_b = unique_temp_dir("magi-tool-search-scope-b");
+        fs::create_dir_all(root_a.join("src")).expect("create workspace a src");
+        fs::create_dir_all(root_b.join("src")).expect("create workspace b src");
+        fs::write(
+            root_a.join("src/alpha.rs"),
+            "pub fn exclusive_alpha_tool_probe() -> bool { true }\n",
+        )
+        .expect("write workspace a source");
+        fs::write(
+            root_b.join("src/beta.rs"),
+            "pub fn exclusive_beta_tool_probe() -> bool { true }\n",
+        )
+        .expect("write workspace b source");
+
+        let store = std::sync::Arc::new(magi_knowledge_store::KnowledgeStore::new());
+        let workspace_a = WorkspaceId::new("workspace-tool-search-scope-a");
+        let workspace_b = WorkspaceId::new("workspace-tool-search-scope-b");
+        store.build_workspace_index(&workspace_a, &root_a);
+        store.build_workspace_index(&workspace_b, &root_b);
+
+        let governance = Arc::new(GovernanceService::default());
+        let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(16));
+        let mut tool_registry =
+            ToolRegistry::new(governance, event_bus).with_knowledge_store(store);
+        tool_registry.register_default_builtins();
+
+        let output_from_a = tool_registry.execute_with_policy(
+            ToolExecutionInput {
+                tool_call_id: ToolCallId::new("tool-call-search-scope-a"),
+                tool_name: BuiltinToolName::SearchSemantic.as_str().to_string(),
+                tool_kind: ToolKind::Builtin,
+                input: serde_json::json!({ "query": "exclusive beta tool probe" }).to_string(),
+                approval_requirement: ApprovalRequirement::None,
+                risk_level: RiskLevel::Low,
+            },
+            ToolExecutionContext {
+                workspace_id: Some(workspace_a),
+                working_directory: Some(root_a.clone()),
+                ..ToolExecutionContext::default()
+            },
+            &ToolExecutionPolicy::default(),
+        );
+        assert_eq!(output_from_a.status, ExecutionResultStatus::Succeeded);
+        let payload_from_a: Value =
+            serde_json::from_str(&output_from_a.payload).expect("workspace a payload json");
+        assert_eq!(
+            payload_from_a["workspace_id"],
+            "workspace-tool-search-scope-a"
+        );
+        let results_from_a = payload_from_a["results"]
+            .as_array()
+            .expect("workspace a results array");
+        assert!(
+            results_from_a.iter().all(|result| !result["path"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("beta.rs")),
+            "workspace a 不应返回 workspace b 的 beta.rs，实际: {results_from_a:?}"
+        );
+
+        let output_from_b = tool_registry.execute_with_policy(
+            ToolExecutionInput {
+                tool_call_id: ToolCallId::new("tool-call-search-scope-b"),
+                tool_name: BuiltinToolName::SearchSemantic.as_str().to_string(),
+                tool_kind: ToolKind::Builtin,
+                input: serde_json::json!({ "query": "exclusive beta tool probe" }).to_string(),
+                approval_requirement: ApprovalRequirement::None,
+                risk_level: RiskLevel::Low,
+            },
+            ToolExecutionContext {
+                workspace_id: Some(workspace_b),
+                working_directory: Some(root_b.clone()),
+                ..ToolExecutionContext::default()
+            },
+            &ToolExecutionPolicy::default(),
+        );
+        assert_eq!(output_from_b.status, ExecutionResultStatus::Succeeded);
+        let payload_from_b: Value =
+            serde_json::from_str(&output_from_b.payload).expect("workspace b payload json");
+        assert_eq!(
+            payload_from_b["workspace_id"],
+            "workspace-tool-search-scope-b"
+        );
+        let results_from_b = payload_from_b["results"]
+            .as_array()
+            .expect("workspace b results array");
+        assert!(
+            results_from_b.iter().any(|result| result["path"]
+                .as_str()
+                .is_some_and(|path| path.contains("beta.rs"))),
+            "workspace b 应命中 beta.rs，实际: {results_from_b:?}"
+        );
+
+        let _ = fs::remove_dir_all(&root_a);
+        let _ = fs::remove_dir_all(&root_b);
+    }
+
+    #[test]
     fn search_semantic_does_not_fallback_to_text_scan() {
         let root = unique_temp_dir("magi-tool-search-no-scan");
         fs::create_dir_all(root.join("src")).expect("create src");
