@@ -14,7 +14,7 @@ use std::{
     process::{Child, Command, ExitStatus, Stdio},
     sync::{
         Arc, LazyLock, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -52,6 +52,7 @@ struct ActiveShellExec {
     workspace_id: Option<String>,
     task_id: Option<String>,
     child: Arc<Mutex<Child>>,
+    cancelled: Arc<AtomicBool>,
 }
 
 struct ShellExecOutput {
@@ -792,7 +793,7 @@ fn execute_shell_command_with_timeout(
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let child = Arc::new(Mutex::new(child));
-    let execution_id = register_active_shell_exec(context, &child);
+    let (execution_id, cancellation_requested) = register_active_shell_exec(context, &child);
     let stdout_reader = thread::spawn(move || read_child_pipe(stdout));
     let stderr_reader = thread::spawn(move || read_child_pipe(stderr));
     let started_at = Instant::now();
@@ -809,7 +810,9 @@ fn execute_shell_command_with_timeout(
         };
         match wait_state {
             Some(status) => {
-                if !active_shell_exec_is_registered(execution_id) {
+                if cancellation_requested.load(Ordering::SeqCst)
+                    || !active_shell_exec_is_registered(execution_id)
+                {
                     cancelled = true;
                 }
                 break Some(status);
@@ -818,9 +821,11 @@ fn execute_shell_command_with_timeout(
                 timed_out = true;
                 break terminate_shell_child(&child);
             }
-            None if !active_shell_exec_is_registered(execution_id) => {
+            None if cancellation_requested.load(Ordering::SeqCst)
+                || !active_shell_exec_is_registered(execution_id) =>
+            {
                 cancelled = true;
-                break child.lock().expect("shell child lock poisoned").wait().ok();
+                break terminate_shell_child(&child);
             }
             None => thread::sleep(Duration::from_millis(SHELL_TIMEOUT_POLL_MS)),
         }
@@ -838,8 +843,12 @@ fn execute_shell_command_with_timeout(
     })
 }
 
-fn register_active_shell_exec(context: &ToolExecutionContext, child: &Arc<Mutex<Child>>) -> u64 {
+fn register_active_shell_exec(
+    context: &ToolExecutionContext,
+    child: &Arc<Mutex<Child>>,
+) -> (u64, Arc<AtomicBool>) {
     let execution_id = SHELL_EXECUTION_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let cancelled = Arc::new(AtomicBool::new(false));
     let process = ActiveShellExec {
         execution_id,
         session_id: context
@@ -852,12 +861,13 @@ fn register_active_shell_exec(context: &ToolExecutionContext, child: &Arc<Mutex<
             .map(|id| id.as_str().to_string()),
         task_id: context.task_id.as_ref().map(|id| id.as_str().to_string()),
         child: Arc::clone(child),
+        cancelled: Arc::clone(&cancelled),
     };
     ACTIVE_SHELL_EXECUTIONS
         .lock()
         .expect("active shell execution lock poisoned")
         .insert(execution_id, process);
-    execution_id
+    (execution_id, cancelled)
 }
 
 fn unregister_active_shell_exec(execution_id: u64) {
@@ -913,7 +923,11 @@ pub(crate) fn cancel_active_shell_execs(query: &ToolExecutionContextQuery) -> us
             .collect::<Vec<_>>();
         execution_ids
             .into_iter()
-            .filter_map(|execution_id| table.remove(&execution_id))
+            .filter_map(|execution_id| {
+                let process = table.remove(&execution_id)?;
+                process.cancelled.store(true, Ordering::SeqCst);
+                Some(process)
+            })
             .collect::<Vec<_>>()
     };
     for process in &processes {
