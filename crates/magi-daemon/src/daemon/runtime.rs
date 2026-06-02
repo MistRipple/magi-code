@@ -36,7 +36,7 @@ use magi_core::{
 };
 use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
 use magi_governance::GovernanceService;
-use magi_knowledge_store::{KnowledgeStore, code_scanner::ingest_workspace_code_index};
+use magi_knowledge_store::KnowledgeStore;
 use magi_lifecycle_notice::{LifecycleNoticeRegistry, run_subscriber as run_lifecycle_subscriber};
 use magi_memory_store::MemoryStore;
 use magi_mission_metrics::MissionMetricsRegistry;
@@ -693,22 +693,11 @@ impl DaemonRuntime {
 
         // 引导阶段：代码索引与 workspace 绑定。进程内检索引擎不持久化，
         // daemon 每次启动都必须为所有已注册 workspace 重建，而不是只恢复 active workspace。
-        let registered_workspaces = workspace_store.workspaces();
         let mut synced_code_index = false;
-        if registered_workspaces.is_empty() {
-            if knowledge_store
-                .code_index_summary()
-                .is_none_or(|summary| summary.files.is_empty())
-            {
-                ingest_workspace_code_index(&knowledge_store, &config.bootstrap_workspace_root);
-                synced_code_index = true;
-            }
-        } else {
-            for workspace in &registered_workspaces {
-                let scan_root = PathBuf::from(workspace.root_path.as_str());
-                knowledge_store.build_workspace_index(&workspace.workspace_id, &scan_root);
-                synced_code_index = true;
-            }
+        for workspace in workspace_store.workspaces() {
+            let scan_root = PathBuf::from(workspace.root_path.as_str());
+            knowledge_store.build_workspace_index(&workspace.workspace_id, &scan_root);
+            synced_code_index = true;
         }
         if synced_code_index {
             let _ = state_repository.save_knowledge_state(&knowledge_store.export_state());
