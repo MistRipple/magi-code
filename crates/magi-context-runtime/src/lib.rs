@@ -51,7 +51,14 @@ pub struct SharedContextQuery {
 
 #[derive(Clone, Debug, Default)]
 pub struct SharedContextPool {
-    entries: Arc<RwLock<HashMap<String, SharedContextRecord>>>,
+    entries: Arc<RwLock<HashMap<SharedContextKey, SharedContextRecord>>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct SharedContextKey {
+    session_id: Option<SessionId>,
+    project_key: Option<String>,
+    item_id: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -78,7 +85,14 @@ pub struct FileSummaryQuery {
 
 #[derive(Clone, Debug, Default)]
 pub struct FileSummaryStore {
-    entries: Arc<RwLock<HashMap<String, FileSummaryRecord>>>,
+    entries: Arc<RwLock<HashMap<FileSummaryKey, FileSummaryRecord>>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct FileSummaryKey {
+    workspace_id: Option<WorkspaceId>,
+    project_key: Option<String>,
+    absolute_path: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -97,7 +111,13 @@ pub struct ProjectRecentTurnsQuery {
 
 #[derive(Clone, Debug, Default)]
 pub struct ProjectRecentTurnStore {
-    entries: Arc<RwLock<HashMap<String, ProjectRecentTurnRecord>>>,
+    entries: Arc<RwLock<HashMap<ProjectRecentTurnKey, ProjectRecentTurnRecord>>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ProjectRecentTurnKey {
+    project_key: String,
+    turn_id: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -312,7 +332,7 @@ impl SharedContextPool {
         self.entries
             .write()
             .expect("shared context pool write lock poisoned")
-            .insert(record.item.item_id.clone(), record);
+            .insert(SharedContextKey::from_record(&record), record);
     }
 
     pub fn query(&self, query: &SharedContextQuery) -> Vec<SharedContextRecord> {
@@ -338,22 +358,22 @@ impl SharedContextPool {
     }
 }
 
+impl SharedContextKey {
+    fn from_record(record: &SharedContextRecord) -> Self {
+        Self {
+            session_id: record.session_id.clone(),
+            project_key: record.project_key.clone(),
+            item_id: record.item.item_id.clone(),
+        }
+    }
+}
+
 impl FileSummaryStore {
     pub fn upsert(&self, record: FileSummaryRecord) {
-        let key = format!(
-            "{}::{}",
-            record
-                .workspace_id
-                .as_ref()
-                .map(ToString::to_string)
-                .or(record.project_key.clone())
-                .unwrap_or_else(|| "global".to_string()),
-            record.item.absolute_path
-        );
         self.entries
             .write()
             .expect("file summary store write lock poisoned")
-            .insert(key, record);
+            .insert(FileSummaryKey::from_record(&record), record);
     }
 
     pub fn query(&self, query: &FileSummaryQuery) -> Vec<FileSummaryRecord> {
@@ -381,6 +401,16 @@ impl FileSummaryStore {
             records.truncate(query.limit);
         }
         records
+    }
+}
+
+impl FileSummaryKey {
+    fn from_record(record: &FileSummaryRecord) -> Self {
+        Self {
+            workspace_id: record.workspace_id.clone(),
+            project_key: record.project_key.clone(),
+            absolute_path: record.item.absolute_path.clone(),
+        }
     }
 }
 
@@ -450,7 +480,7 @@ impl ProjectRecentTurnStore {
         self.entries
             .write()
             .expect("project recent turn store write lock poisoned")
-            .insert(record.turn_id.clone(), record);
+            .insert(ProjectRecentTurnKey::from_record(&record), record);
     }
 
     pub fn query(&self, query: &ProjectRecentTurnsQuery) -> Vec<ProjectRecentTurnRecord> {
@@ -473,6 +503,15 @@ impl ProjectRecentTurnStore {
             records.truncate(query.limit);
         }
         records
+    }
+}
+
+impl ProjectRecentTurnKey {
+    fn from_record(record: &ProjectRecentTurnRecord) -> Self {
+        Self {
+            project_key: record.project_key.clone(),
+            turn_id: record.turn_id.clone(),
+        }
     }
 }
 
@@ -1878,6 +1917,125 @@ mod tests {
         assert_eq!(
             file_paths,
             vec!["/repo/both.rs", "/repo/project.rs", "/repo/workspace.rs"]
+        );
+    }
+
+    #[test]
+    fn runtime_source_stores_keep_same_identity_separate_across_scopes() {
+        let session_a = SessionId::new("session-scope-key-a");
+        let session_b = SessionId::new("session-scope-key-b");
+        let workspace_a = WorkspaceId::new("workspace-scope-key-a");
+        let workspace_b = WorkspaceId::new("workspace-scope-key-b");
+        let project_a = "project-scope-key-a".to_string();
+        let project_b = "project-scope-key-b".to_string();
+
+        let shared_context_pool = SharedContextPool::default();
+        for (session_id, content) in [
+            (session_a.clone(), "session a context"),
+            (session_b.clone(), "session b context"),
+        ] {
+            shared_context_pool.upsert(SharedContextRecord {
+                item: SharedContextItem {
+                    item_id: "shared-same-id".to_string(),
+                    title: "same shared id".to_string(),
+                    content: content.to_string(),
+                },
+                session_id: Some(session_id),
+                project_key: Some(project_a.clone()),
+                updated_at: UtcMillis(10),
+            });
+        }
+
+        let session_a_shared = shared_context_pool.query(&SharedContextQuery {
+            session_id: Some(session_a),
+            project_key: Some(project_a.clone()),
+            limit: 10,
+        });
+        let session_b_shared = shared_context_pool.query(&SharedContextQuery {
+            session_id: Some(session_b),
+            project_key: Some(project_a.clone()),
+            limit: 10,
+        });
+        assert_eq!(session_a_shared.len(), 1);
+        assert_eq!(session_b_shared.len(), 1);
+        assert_eq!(session_a_shared[0].item.content, "session a context");
+        assert_eq!(session_b_shared[0].item.content, "session b context");
+
+        let file_summary_store = FileSummaryStore::default();
+        for (workspace_id, project_key, summary) in [
+            (
+                workspace_a.clone(),
+                project_a.clone(),
+                "workspace a summary",
+            ),
+            (
+                workspace_b.clone(),
+                project_a.clone(),
+                "workspace b summary",
+            ),
+            (workspace_a.clone(), project_b.clone(), "project b summary"),
+        ] {
+            file_summary_store.upsert(FileSummaryRecord {
+                item: FileSummaryItem {
+                    absolute_path: "/repo/src/lib.rs".to_string(),
+                    summary: summary.to_string(),
+                },
+                workspace_id: Some(workspace_id),
+                project_key: Some(project_key),
+                updated_at: UtcMillis(10),
+            });
+        }
+
+        let workspace_a_project_a_files = file_summary_store.query(&FileSummaryQuery {
+            workspace_id: Some(workspace_a),
+            project_key: Some(project_a.clone()),
+            path_prefix: None,
+            limit: 10,
+        });
+        let workspace_b_project_a_files = file_summary_store.query(&FileSummaryQuery {
+            workspace_id: Some(workspace_b),
+            project_key: Some(project_a),
+            path_prefix: None,
+            limit: 10,
+        });
+        assert_eq!(workspace_a_project_a_files.len(), 1);
+        assert_eq!(workspace_b_project_a_files.len(), 1);
+        assert_eq!(
+            workspace_a_project_a_files[0].item.summary,
+            "workspace a summary"
+        );
+        assert_eq!(
+            workspace_b_project_a_files[0].item.summary,
+            "workspace b summary"
+        );
+
+        let project_recent_turn_store = ProjectRecentTurnStore::default();
+        for (project_key, content) in [
+            ("project-recent-a".to_string(), "project a turn"),
+            ("project-recent-b".to_string(), "project b turn"),
+        ] {
+            project_recent_turn_store.upsert(ProjectRecentTurnRecord {
+                turn_id: "turn-same-id".to_string(),
+                project_key,
+                content: content.to_string(),
+                updated_at: UtcMillis(10),
+            });
+        }
+        assert_eq!(
+            project_recent_turn_store.query(&ProjectRecentTurnsQuery {
+                project_key: "project-recent-a".to_string(),
+                limit: 10,
+            })[0]
+                .content,
+            "project a turn"
+        );
+        assert_eq!(
+            project_recent_turn_store.query(&ProjectRecentTurnsQuery {
+                project_key: "project-recent-b".to_string(),
+                limit: 10,
+            })[0]
+                .content,
+            "project b turn"
         );
     }
 
