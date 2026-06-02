@@ -14,6 +14,11 @@
   import { diagramSummary, parseToolDiagramPayload } from '../lib/diagram-payload';
   import { openAgentTab } from '../stores/right-pane.svelte';
   import { getAgentVisualInfo } from '../lib/agent-colors';
+  import { parseToolIdentity } from '../lib/tool-identity';
+  import {
+    formatViewImageToolOutput,
+    parseViewImagePreview,
+  } from '../lib/view-image-preview';
   import {
     isStructuredToolErrorPayload,
     toolPayloadErrorCode,
@@ -60,51 +65,6 @@
   let userToggled = $state(false);
   let copySuccess = $state(false);
   let lastLoggedErrorSignature = $state('');
-
-  interface ParsedToolIdentity {
-    source: 'builtin' | 'mcp' | 'skill';
-    baseName: string;
-    qualifier?: string;
-    displayName: string;
-  }
-
-  function parseToolIdentity(toolName: string): ParsedToolIdentity {
-    if (typeof toolName !== 'string') {
-      return {
-        source: 'builtin',
-        baseName: '',
-        displayName: '',
-      };
-    }
-
-    const parts = toolName.split('__');
-    if (parts.length >= 3 && parts[0] === 'mcp') {
-      const qualifier = parts[1] || 'mcp';
-      const baseName = parts.slice(2).join('__') || toolName;
-      return {
-        source: 'mcp',
-        baseName,
-        qualifier,
-        displayName: `${baseName} · ${qualifier}`,
-      };
-    }
-    if (parts.length >= 3 && parts[0] === 'skill') {
-      const qualifier = parts[1] || 'skill';
-      const baseName = parts[2] || toolName;
-      return {
-        source: 'skill',
-        baseName,
-        qualifier,
-        displayName: `${baseName} · ${qualifier}`,
-      };
-    }
-
-    return {
-      source: 'builtin',
-      baseName: toolName,
-      displayName: toolName,
-    };
-  }
 
   const TOOL_DISPLAY_NAME_KEYS: Record<string, string> = {
     'tool_result': 'toolCall.displayName.default',
@@ -215,93 +175,10 @@
     }
   }
 
-  interface ViewImagePreview {
-    src: string;
-    path: string;
-    mime: string;
-    bytes: number | undefined;
-  }
-
-  function parseJsonObjectValue(content: unknown): Record<string, unknown> | null {
-    if (content && typeof content === 'object' && !Array.isArray(content)) {
-      return content as Record<string, unknown>;
-    }
-    if (typeof content !== 'string') {
-      return null;
-    }
-    const trimmed = content.trim();
-    if (!trimmed.startsWith('{')) {
-      return null;
-    }
-    try {
-      const parsed = JSON.parse(trimmed);
-      return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
-        ? parsed as Record<string, unknown>
-        : null;
-    } catch {
-      return null;
-    }
-  }
-
-  function isViewImageTool(toolName: string): boolean {
-    const parsed = parseToolIdentity(toolName);
-    return parsed.baseName === 'view_image' || parsed.baseName === 'image_view';
-  }
-
-  function parseViewImagePreview(toolName: string, content: unknown): ViewImagePreview | null {
-    if (!isViewImageTool(toolName)) return null;
-    const payload = parseJsonObjectValue(content);
-    if (!payload) return null;
-    const modelContent = Array.isArray(payload.model_content) ? payload.model_content : [];
-    for (const item of modelContent) {
-      if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
-      const source = (item as Record<string, unknown>).source;
-      if (!source || typeof source !== 'object' || Array.isArray(source)) continue;
-      const sourceObj = source as Record<string, unknown>;
-      const mediaType = typeof sourceObj.media_type === 'string'
-        ? sourceObj.media_type
-        : typeof sourceObj.mediaType === 'string'
-          ? sourceObj.mediaType
-          : '';
-      const data = typeof sourceObj.data === 'string' ? sourceObj.data : '';
-      if (!mediaType.startsWith('image/') || !data.trim()) continue;
-      const path = typeof payload.path === 'string' ? payload.path : '';
-      const bytes = typeof payload.bytes === 'number' ? payload.bytes : undefined;
-      return {
-        src: `data:${mediaType};base64,${data}`,
-        path,
-        mime: mediaType,
-        bytes,
-      };
-    }
-    return null;
-  }
-
-  function omitLargeImageData(value: unknown): unknown {
-    if (Array.isArray(value)) {
-      return value.map(omitLargeImageData);
-    }
-    if (!value || typeof value !== 'object') {
-      return value;
-    }
-    const object = value as Record<string, unknown>;
-    const next: Record<string, unknown> = {};
-    for (const [key, child] of Object.entries(object)) {
-      if (key === 'data' && typeof child === 'string' && child.length > 256) {
-        next[key] = `[base64 image data omitted: ${child.length} chars]`;
-      } else {
-        next[key] = omitLargeImageData(child);
-      }
-    }
-    return next;
-  }
-
   function formatToolOutput(toolName: string, content: unknown): string {
-    if (isViewImageTool(toolName)) {
-      const payload = parseJsonObjectValue(content);
-      if (payload) {
-        return JSON.stringify(omitLargeImageData(payload), null, 2);
-      }
+    const viewImageOutput = formatViewImageToolOutput(toolName, content);
+    if (viewImageOutput !== null) {
+      return viewImageOutput;
     }
     return formatContent(content);
   }

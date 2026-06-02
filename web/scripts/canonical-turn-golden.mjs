@@ -17,7 +17,8 @@ try {
   const dataHandlers = await server.ssrLoadModule('/src/lib/data-message-handlers.ts');
   const timelineRenderItems = await server.ssrLoadModule('/src/lib/timeline-render-items.ts');
   const contract = await server.ssrLoadModule('/src/shared/bridges/rust-daemon-contract.ts');
-  runGoldenReplay(reducer, projection, messagesStore, dataHandlers, timelineRenderItems, contract);
+  const viewImagePreview = await server.ssrLoadModule('/src/lib/view-image-preview.ts');
+  runGoldenReplay(reducer, projection, messagesStore, dataHandlers, timelineRenderItems, contract, viewImagePreview);
   console.log('canonical turn golden replay passed');
 } finally {
   await server.close();
@@ -49,7 +50,7 @@ function installGoldenMemoryBridge(bridgeRuntime) {
   });
 }
 
-function runGoldenReplay(reducer, projection, messagesStore, dataHandlers, timelineRenderItems, contract) {
+function runGoldenReplay(reducer, projection, messagesStore, dataHandlers, timelineRenderItems, contract, viewImagePreview) {
   const cases = [
     acceptedFirstFrameCase(),
     ordinaryChatCase(),
@@ -99,6 +100,7 @@ function runGoldenReplay(reducer, projection, messagesStore, dataHandlers, timel
   assertCancelledToolShowsTurnResponseDuration(reducer, projection);
   assertFailedToolWithoutAssistantShowsTurnResponseDuration(reducer, projection);
   assertUserImageMetadataProjectsToMessage(reducer, projection);
+  assertViewImageToolResultProjectsAsPreview(reducer, projection, viewImagePreview);
   assertAgentSpawnToolCardStaysOnMainlineAndTaskTabsFilterByTaskId(reducer, projection, timelineRenderItems);
   assertRuntimeInternalAgentWaitIsHiddenFromCanonicalMainline(reducer, projection, timelineRenderItems);
   assertParallelAgentSpawnUsesTaskIdTabs(reducer, projection, timelineRenderItems);
@@ -323,6 +325,81 @@ function assertUserImageMetadataProjectsToMessage(reducer, projection) {
     userArtifact.message.metadata?.images,
     undefined,
     'transport image metadata should not remain duplicated on projected message metadata',
+  );
+}
+
+function assertViewImageToolResultProjectsAsPreview(reducer, projection, viewImagePreview) {
+  const c = baseCase('view-image-tool-preview', 'session-golden-view-image', 'turn-golden-view-image', 9350);
+  const imageData = 'A'.repeat(300);
+  const viewImagePayload = {
+    tool: 'view_image',
+    status: 'succeeded',
+    access_mode: 'read_only',
+    path: '/tmp/pixel.png',
+    mime: 'image/png',
+    bytes: 68,
+    summary: '已读取图片 /tmp/pixel.png (mime=image/png, bytes=68)',
+    model_content: [
+      {
+        type: 'text',
+        text: '已读取图片 /tmp/pixel.png (mime=image/png, bytes=68)',
+      },
+      {
+        type: 'image',
+        source: {
+          type: 'base64',
+          media_type: 'image/png',
+          data: imageData,
+        },
+      },
+    ],
+  };
+  const toolItem = item(c, 1, 'tool-view-image', 'tool_call', 'completed', {
+    content: '命令执行成功: view_image',
+    title: 'view_image',
+    tool: {
+      callId: 'call-view-image',
+      name: 'view_image',
+      arguments: { path: '/tmp/pixel.png' },
+      result: viewImagePayload,
+    },
+  });
+  const state = reducer.replaceCanonicalTurns(c.sessionId, [
+    turn(c, 'completed', [toolItem], { completedAt: 9450, responseDurationMs: 100 }),
+  ]);
+  const projectionValue = projection.buildCanonicalTimelineProjection(state);
+  const toolArtifact = findArtifactByTurnItemId(projectionValue, 'tool-view-image');
+  assert.ok(toolArtifact, 'view_image tool artifact should exist');
+  const toolCall = toolArtifact.message.blocks?.find((block) => block.type === 'tool_call')?.toolCall;
+  assert.equal(toolCall?.name, 'view_image', 'view_image tool call should keep canonical tool name');
+  assert.equal(typeof toolCall?.result, 'string', 'canonical projection keeps ToolCall.result as display string');
+
+  const preview = viewImagePreview.parseViewImagePreview(toolCall.name, toolCall.result);
+  assert.deepEqual(
+    preview,
+    {
+      src: `data:image/png;base64,${imageData}`,
+      path: '/tmp/pixel.png',
+      mime: 'image/png',
+      bytes: 68,
+    },
+    'projected view_image result must remain parseable as an image preview',
+  );
+
+  const formatted = viewImagePreview.formatViewImageToolOutput(toolCall.name, toolCall.result);
+  assert.ok(formatted, 'view_image formatted output should exist');
+  assert.ok(
+    !formatted.includes(imageData),
+    'view_image text output must not expose raw base64 image data',
+  );
+  assert.ok(
+    formatted.includes('[base64 image data omitted: 300 chars]'),
+    'view_image text output should show an explicit base64 omission marker',
+  );
+  assert.equal(
+    viewImagePreview.isViewImageTool('mcp__local__view_image'),
+    true,
+    'MCP-qualified view_image names should use the same preview parser',
   );
 }
 
