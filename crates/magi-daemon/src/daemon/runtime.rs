@@ -214,16 +214,11 @@ fn external_mcp_server_catalog_entry(
     };
     let connected = enabled && connected_client.is_some();
     let tool_count = if enabled {
-        connected_client
-            .as_ref()
-            .and_then(|client| client.list_tools().ok().map(|tools| tools.len()))
-            .or_else(|| {
-                entry
-                    .get("toolCount")
-                    .or_else(|| entry.get("tool_count"))
-                    .and_then(serde_json::Value::as_u64)
-                    .map(|count| count as usize)
-            })
+        entry
+            .get("toolCount")
+            .or_else(|| entry.get("tool_count"))
+            .and_then(serde_json::Value::as_u64)
+            .map(|count| count as usize)
     } else {
         None
     };

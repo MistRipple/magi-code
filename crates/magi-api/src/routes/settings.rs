@@ -2027,6 +2027,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn settings_bootstrap_does_not_probe_unconnected_mcp_servers() {
+        let state = test_state();
+        state.settings_store.set_section(
+            "mcpServers",
+            json!([
+                {
+                    "id": "slow-or-missing-server",
+                    "command": "definitely-not-existing-magi-mcp-command",
+                    "enabled": true
+                }
+            ]),
+        );
+
+        let bootstrap = settings_bootstrap(State(state), Query(HashMap::new()))
+            .await
+            .expect("settings bootstrap should build")
+            .0;
+        let server = &bootstrap["mcpServers"][0];
+
+        assert_eq!(server["connected"], json!(false));
+        assert_eq!(server["health"], json!("disconnected"));
+        assert!(
+            server.get("error").is_none(),
+            "settings bootstrap must not synchronously probe MCP process health"
+        );
+    }
+
+    #[tokio::test]
     async fn settings_bootstrap_core_scope_defers_mcp_hydration() {
         let state = test_state();
         let bootstrap = settings_bootstrap(

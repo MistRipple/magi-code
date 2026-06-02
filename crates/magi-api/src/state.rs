@@ -1383,49 +1383,16 @@ impl ApiState {
             };
 
             if already_connected {
-                let pool = self
-                    .mcp_connections
-                    .read()
-                    .expect("mcp connections read lock poisoned");
-                if let Some(client) = pool.get(&server_id) {
-                    entry["connected"] = serde_json::json!(true);
-                    entry["health"] = serde_json::json!("connected");
-                    entry.as_object_mut().map(|m| m.remove("error"));
-                    if let Ok(tools) = client.list_tools() {
-                        entry["toolCount"] = serde_json::json!(tools.len());
-                    }
-                }
+                entry["connected"] = serde_json::json!(true);
+                entry["health"] = serde_json::json!("connected");
+                entry.as_object_mut().map(|m| m.remove("error"));
+            } else if build_mcp_config_from_entry(entry).is_some() {
+                entry["connected"] = serde_json::json!(false);
+                entry["health"] = serde_json::json!("disconnected");
             } else {
-                if let Some(config) = build_mcp_config_from_entry(entry) {
-                    let client = StdioMcpBridgeClient::new(config);
-                    match client.list_tools() {
-                        Ok(tools) => {
-                            entry["connected"] = serde_json::json!(true);
-                            entry["health"] = serde_json::json!("connected");
-                            entry["toolCount"] = serde_json::json!(tools.len());
-                            entry.as_object_mut().map(|m| m.remove("error"));
-                            let mut pool = self
-                                .mcp_connections
-                                .write()
-                                .expect("mcp connections write lock poisoned");
-                            pool.insert(server_id, Arc::new(client));
-                        }
-                        Err(err) => {
-                            tracing::warn!(
-                                server_id = %server_id,
-                                error = ?err,
-                                "MCP server health check failed"
-                            );
-                            entry["connected"] = serde_json::json!(false);
-                            entry["health"] = serde_json::json!("disconnected");
-                            entry["error"] = serde_json::json!("mcp_connection_failed");
-                        }
-                    }
-                } else {
-                    entry["connected"] = serde_json::json!(false);
-                    entry["health"] = serde_json::json!("disconnected");
-                    entry["error"] = serde_json::json!("mcp_invalid_config");
-                }
+                entry["connected"] = serde_json::json!(false);
+                entry["health"] = serde_json::json!("disconnected");
+                entry["error"] = serde_json::json!("mcp_invalid_config");
             }
         }
     }
@@ -2090,9 +2057,7 @@ mod tests {
         });
 
         let tools = state.builtin_tools_json(&catalog);
-        let tools = tools
-            .as_array()
-            .expect("builtin tools should be an array");
+        let tools = tools.as_array().expect("builtin tools should be an array");
 
         assert_eq!(tools[0]["runtimeStatus"], serde_json::json!("ready"));
         assert_eq!(tools[1]["runtimeStatus"], serde_json::json!("unknown"));
