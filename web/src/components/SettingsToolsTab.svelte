@@ -313,6 +313,8 @@
     configuredCount?: number | null;
     enabledCount?: number | null;
     readyCount?: number | null;
+    enabledToolCount?: number | null;
+    readyToolCount?: number | null;
     toolCount?: number | null;
   }): string {
     if (dependency.name === 'workspace_code_index' && typeof dependency.fileCount === 'number') {
@@ -397,6 +399,8 @@
     configuredCount?: number | null;
     enabledCount?: number | null;
     readyCount?: number | null;
+    enabledToolCount?: number | null;
+    readyToolCount?: number | null;
     toolCount?: number | null;
   }): string {
     const parts = [

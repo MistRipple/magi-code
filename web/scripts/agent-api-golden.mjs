@@ -218,7 +218,19 @@ try {
             schemaWarnings: [],
           },
         ],
-        runtime_dependencies: [],
+        runtime_dependencies: [
+          {
+            name: 'mcp_servers',
+            status: 'not_ready',
+            required_by: ['mcp custom tools'],
+            configured_count: 1,
+            enabled_count: 1,
+            ready_count: 0,
+            enabled_tool_count: 7,
+            ready_tool_count: 0,
+            tool_count: 0,
+          },
+        ],
       }), {
         status: 200,
         headers: { 'content-type': 'application/json' },
@@ -242,6 +254,15 @@ try {
     assert.ok(fileRead, 'file_read should be normalized from camelCase response');
     assert.equal(fileRead.effectiveApprovalPolicy, 'none');
     assert.equal(fileRead.accessProfileBehavior, 'restricted_allowed');
+    const mcpDependency = diagnostics.capabilityDependencies.find((dependency) => dependency.name === 'mcp_servers');
+    assert.ok(mcpDependency, 'MCP dependency should be normalized from tool catalog diagnostics');
+    assert.equal(mcpDependency.enabledToolCount, 7);
+    assert.equal(mcpDependency.readyToolCount, 0);
+    assert.equal(
+      mcpDependency.toolCount,
+      0,
+      'normalized MCP toolCount must mean currently usable tools',
+    );
   } finally {
     if (originalFetch === undefined) {
       delete globalThis.fetch;

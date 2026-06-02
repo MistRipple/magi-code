@@ -506,10 +506,16 @@ fn external_capability_dependencies(resources: &ToolRuntimeResources) -> Vec<ser
         .iter()
         .filter(|server| server.enabled && server.connected)
         .count();
-    let mcp_tool_count = external
+    let enabled_mcp_tool_count = external
         .mcp_servers
         .iter()
         .filter(|server| server.enabled)
+        .filter_map(|server| server.tool_count)
+        .sum::<usize>();
+    let ready_mcp_tool_count = external
+        .mcp_servers
+        .iter()
+        .filter(|server| server.enabled && server.connected)
         .filter_map(|server| server.tool_count)
         .sum::<usize>();
     let mcp_status = if enabled_mcp_count == 0 || ready_mcp_count == enabled_mcp_count {
@@ -533,7 +539,9 @@ fn external_capability_dependencies(resources: &ToolRuntimeResources) -> Vec<ser
             "configured_count": configured_mcp_count,
             "enabled_count": enabled_mcp_count,
             "ready_count": ready_mcp_count,
-            "tool_count": mcp_tool_count,
+            "enabled_tool_count": enabled_mcp_tool_count,
+            "ready_tool_count": ready_mcp_tool_count,
+            "tool_count": ready_mcp_tool_count,
         }),
     ]
 }
@@ -1033,6 +1041,8 @@ mod tests {
         assert_eq!(mcp_dependency["status"], "ready");
         assert_eq!(mcp_dependency["enabled_count"], 1);
         assert_eq!(mcp_dependency["ready_count"], 1);
+        assert_eq!(mcp_dependency["enabled_tool_count"], 1);
+        assert_eq!(mcp_dependency["ready_tool_count"], 1);
         assert_eq!(mcp_dependency["tool_count"], 1);
     }
 
@@ -1136,7 +1146,48 @@ mod tests {
         assert_eq!(mcp_dependency["configured_count"], 1);
         assert_eq!(mcp_dependency["enabled_count"], 0);
         assert_eq!(mcp_dependency["ready_count"], 0);
+        assert_eq!(mcp_dependency["enabled_tool_count"], 0);
+        assert_eq!(mcp_dependency["ready_tool_count"], 0);
         assert_eq!(mcp_dependency["tool_count"], 0);
+    }
+
+    #[test]
+    fn tool_catalog_counts_only_connected_mcp_tools_as_ready() {
+        let resources = ToolRuntimeResources {
+            external_tool_catalog_provider: Some(std::sync::Arc::new(|| {
+                ExternalToolCatalogSnapshot {
+                    skill_tools: Vec::new(),
+                    mcp_servers: vec![crate::ExternalMcpServerCatalogEntry {
+                        server_id: "disconnected-mcp".to_string(),
+                        name: "disconnected-mcp".to_string(),
+                        enabled: true,
+                        connected: false,
+                        health: "disconnected".to_string(),
+                        tool_count: Some(7),
+                        error: Some("mcp_connection_failed".to_string()),
+                    }],
+                }
+            })),
+            ..ToolRuntimeResources::default()
+        };
+        let output = execute_tool_catalog("{}", &ToolExecutionContext::default(), &resources);
+        let payload: serde_json::Value = serde_json::from_str(&output).expect("json output");
+        let mcp_dependency = payload["runtime_dependencies"]
+            .as_array()
+            .expect("runtime dependencies")
+            .iter()
+            .find(|dependency| dependency["name"] == "mcp_servers")
+            .expect("mcp dependency should be listed");
+
+        assert_eq!(mcp_dependency["status"], "not_ready");
+        assert_eq!(mcp_dependency["enabled_count"], 1);
+        assert_eq!(mcp_dependency["ready_count"], 0);
+        assert_eq!(mcp_dependency["enabled_tool_count"], 7);
+        assert_eq!(mcp_dependency["ready_tool_count"], 0);
+        assert_eq!(
+            mcp_dependency["tool_count"], 0,
+            "tool_count must mean currently usable MCP tools, not configured tools on disconnected servers"
+        );
     }
 
     #[test]

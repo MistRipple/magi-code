@@ -48,6 +48,8 @@ export interface SettingsCapabilityDependency {
   configuredCount?: number | null;
   enabledCount?: number | null;
   readyCount?: number | null;
+  enabledToolCount?: number | null;
+  readyToolCount?: number | null;
   toolCount?: number | null;
 }
 

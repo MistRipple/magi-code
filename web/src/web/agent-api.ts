@@ -240,6 +240,12 @@ function normalizeCapabilityDependencies(value: unknown): SettingsCapabilityDepe
       configuredCount: normalizeNullableNumber(record.configured_count ?? record.configuredCount),
       enabledCount: normalizeNullableNumber(record.enabled_count ?? record.enabledCount),
       readyCount: normalizeNullableNumber(record.ready_count ?? record.readyCount),
+      enabledToolCount: normalizeNullableNumber(
+        record.enabled_tool_count ?? record.enabledToolCount,
+      ),
+      readyToolCount: normalizeNullableNumber(
+        record.ready_tool_count ?? record.readyToolCount,
+      ),
       toolCount: normalizeNullableNumber(record.tool_count ?? record.toolCount),
     });
   }

@@ -1679,6 +1679,8 @@ fn normalize_capability_dependency_json(raw: &serde_json::Value) -> serde_json::
         "configuredCount": capability_dependency_field(raw, "configuredCount", "configured_count"),
         "enabledCount": capability_dependency_field(raw, "enabledCount", "enabled_count"),
         "readyCount": capability_dependency_field(raw, "readyCount", "ready_count"),
+        "enabledToolCount": capability_dependency_field(raw, "enabledToolCount", "enabled_tool_count"),
+        "readyToolCount": capability_dependency_field(raw, "readyToolCount", "ready_tool_count"),
         "toolCount": capability_dependency_field(raw, "toolCount", "tool_count"),
     })
 }
@@ -2602,5 +2604,30 @@ mod tests {
         assert_eq!(entry.snapshot_active, Some(false));
 
         let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[test]
+    fn capability_dependency_json_preserves_mcp_tool_count_semantics() {
+        let raw = serde_json::json!({
+            "name": "mcp_servers",
+            "status": "not_ready",
+            "required_by": ["mcp custom tools"],
+            "configured_count": 1,
+            "enabled_count": 1,
+            "ready_count": 0,
+            "enabled_tool_count": 7,
+            "ready_tool_count": 0,
+            "tool_count": 0,
+        });
+
+        let normalized = normalize_capability_dependency_json(&raw);
+
+        assert_eq!(normalized["enabledToolCount"], serde_json::json!(7));
+        assert_eq!(normalized["readyToolCount"], serde_json::json!(0));
+        assert_eq!(
+            normalized["toolCount"],
+            serde_json::json!(0),
+            "toolCount must remain the ready/usable tool count in settings bootstrap"
+        );
     }
 }
