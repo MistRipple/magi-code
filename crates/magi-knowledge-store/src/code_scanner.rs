@@ -30,6 +30,13 @@ const IGNORE_PATTERNS: &[&str] = &[
     ".nyc_output",
     ".magi",
     ".claude",
+    ".codex",
+    ".gemini",
+    ".ace-tool",
+    ".cursor",
+    ".windsurf",
+    ".mcp",
+    ".mcp.json",
 ];
 
 /// 入口文件检测模式
@@ -558,5 +565,104 @@ mod pathdiff {
         } else {
             Some(result)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        fs,
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    fn temp_workspace(name: &str) -> PathBuf {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be valid")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("{name}-{}-{suffix}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("temp workspace should create");
+        root
+    }
+
+    #[test]
+    fn indexable_path_excludes_agent_and_external_tool_artifacts() {
+        for path in [
+            ".ace-tool/index.json",
+            ".gemini/skills/apple-ui-review/SKILL.md",
+            ".codex/prompts/project.md",
+            ".cursor/rules/project.mdc",
+            ".windsurf/workflows/task.md",
+            ".mcp/server.json",
+            ".mcp.json",
+        ] {
+            assert!(!is_indexable_code_path(path), "{path} 不应进入项目代码索引");
+        }
+
+        assert!(is_indexable_code_path("src/lib.rs"));
+        assert!(is_indexable_code_path("docs/architecture.md"));
+    }
+
+    #[test]
+    fn scan_workspace_excludes_agent_and_external_tool_artifacts() {
+        let root = temp_workspace("magi-code-index-ignore-agent-artifacts");
+        fs::create_dir_all(root.join("src")).expect("src should create");
+        fs::write(root.join("src/lib.rs"), "pub fn product_code() {}\n")
+            .expect("source should write");
+
+        for path in [
+            ".ace-tool/index.json",
+            ".gemini/skills/apple-ui-review/SKILL.md",
+            ".codex/prompts/project.md",
+            ".cursor/rules/project.mdc",
+            ".windsurf/workflows/task.md",
+            ".mcp/server.json",
+            ".mcp.json",
+        ] {
+            let absolute = root.join(path);
+            if let Some(parent) = absolute.parent() {
+                fs::create_dir_all(parent).expect("artifact parent should create");
+            }
+            fs::write(&absolute, "tool runtime metadata\n").expect("artifact should write");
+        }
+
+        let outcome = scan_workspace(&root);
+        let summary = outcome.summary.expect("workspace should be indexed");
+        let paths = summary
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(paths, vec!["src/lib.rs"]);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn scan_workspace_with_only_agent_artifacts_is_empty() {
+        let root = temp_workspace("magi-code-index-ignore-only-artifacts");
+        fs::create_dir_all(root.join(".gemini/skills/example"))
+            .expect("artifact dir should create");
+        fs::write(
+            root.join(".gemini/skills/example/SKILL.md"),
+            "external skill\n",
+        )
+        .expect("skill file should write");
+        fs::write(root.join(".mcp.json"), "{}\n").expect("mcp config should write");
+
+        let outcome = scan_workspace(&root);
+
+        assert_eq!(outcome.status, CodeIndexScanStatus::Empty);
+        assert_eq!(
+            outcome.reason_code,
+            Some(CodeIndexScanReasonCode::NoIndexableFiles)
+        );
+        assert!(outcome.summary.is_none());
+
+        let _ = fs::remove_dir_all(root);
     }
 }
