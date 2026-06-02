@@ -37,6 +37,8 @@
       name: string;
       riskLevel: string;
       approvalRequirement: string;
+      effectiveApprovalPolicy: string;
+      accessProfileBehavior: string;
       accessMode: string;
       policyScope: string;
       inputSensitivePolicy: boolean;
@@ -159,11 +161,55 @@
     runtimeStatus: string;
     runtimeWarnings: string[];
     schemaWarnings: string[];
+    effectiveApprovalPolicy: string;
+    accessProfileBehavior: string;
   }): string {
     const parts = [getBuiltinToolRuntimeLabel(tool.runtimeStatus)];
+    parts.push(i18n.t('settings.tools.effectiveApprovalPolicy', {
+      policy: getBuiltinToolEffectiveApprovalLabel(tool.effectiveApprovalPolicy),
+    }));
+    parts.push(getBuiltinToolAccessProfileBehaviorLabel(tool.accessProfileBehavior));
     if (tool.runtimeWarnings.length > 0) parts.push(i18n.t('settings.tools.runtimeWarning'));
     if (tool.schemaWarnings.length > 0) parts.push(i18n.t('settings.tools.schemaWarning'));
     return parts.join('\n');
+  }
+
+  function getBuiltinToolEffectiveApprovalLabel(policy: string): string {
+    switch (policy) {
+      case 'input_sensitive':
+        return i18n.t('settings.tools.effectiveApproval.inputSensitive');
+      case 'required':
+        return i18n.t('settings.tools.effectiveApproval.required');
+      case 'ordinary_approval_skipped':
+        return i18n.t('settings.tools.effectiveApproval.ordinaryApprovalSkipped');
+      case 'not_applicable':
+        return i18n.t('settings.tools.effectiveApproval.notApplicable');
+      case 'none':
+        return i18n.t('settings.tools.effectiveApproval.none');
+      default:
+        return i18n.t('settings.tools.unknown');
+    }
+  }
+
+  function getBuiltinToolAccessProfileBehaviorLabel(behavior: string): string {
+    switch (behavior) {
+      case 'unavailable_in_read_only':
+        return i18n.t('settings.tools.accessProfileBehavior.unavailableInReadOnly');
+      case 'read_only_allowed':
+        return i18n.t('settings.tools.accessProfileBehavior.readOnlyAllowed');
+      case 'restricted_input_sensitive':
+        return i18n.t('settings.tools.accessProfileBehavior.restrictedInputSensitive');
+      case 'restricted_requires_approval':
+        return i18n.t('settings.tools.accessProfileBehavior.restrictedRequiresApproval');
+      case 'restricted_allowed':
+        return i18n.t('settings.tools.accessProfileBehavior.restrictedAllowed');
+      case 'full_access_skips_ordinary_approval':
+        return i18n.t('settings.tools.accessProfileBehavior.fullAccessSkipsOrdinaryApproval');
+      case 'full_access_allowed':
+        return i18n.t('settings.tools.accessProfileBehavior.fullAccessAllowed');
+      default:
+        return i18n.t('settings.tools.unknown');
+    }
   }
 
   function getBuiltinToolScopeLabel(tool: { runtimeInternal: boolean }): string {

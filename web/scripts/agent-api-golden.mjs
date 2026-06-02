@@ -175,6 +175,79 @@ try {
     }
   }
 
+  try {
+    let capturedToolCatalogUrl = '';
+    globalThis.fetch = async (url) => {
+      capturedToolCatalogUrl = String(url);
+      return new Response(JSON.stringify({
+        tools: [
+          {
+            name: 'shell_exec',
+            public: true,
+            risk_level: 'high',
+            approval_requirement: 'required',
+            effective_approval_policy: 'ordinary_approval_skipped',
+            access_profile_behavior: 'full_access_skips_ordinary_approval',
+            access_mode: 'explicit_write',
+            policy_scope: 'input_sensitive',
+            input_sensitive_policy: true,
+            policy_summary: '按输入判定',
+            runtime_internal: false,
+            runtime_status: 'ready',
+            runtime_warnings: ['raw dependency detail must become marker'],
+            schema_status: 'ok',
+            schema_warnings: [],
+          },
+          {
+            name: 'file_read',
+            public: true,
+            riskLevel: 'low',
+            approvalRequirement: 'none',
+            effectiveApprovalPolicy: 'none',
+            accessProfileBehavior: 'restricted_allowed',
+            accessMode: 'read_only',
+            policyScope: 'fixed',
+            inputSensitivePolicy: false,
+            policySummary: '默认策略',
+            runtimeInternal: false,
+            runtimeStatus: 'ready',
+            runtimeWarnings: [],
+            schemaStatus: 'ok',
+            schemaWarnings: [],
+          },
+        ],
+        runtime_dependencies: [],
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    };
+    const diagnostics = await agentApi.loadAgentToolCatalogDiagnostics();
+    assert.ok(
+      capturedToolCatalogUrl.includes('/api/tools/catalog'),
+      'tool catalog diagnostics must call the backend catalog endpoint',
+    );
+    const shell = diagnostics.builtinTools.find((tool) => tool.name === 'shell_exec');
+    assert.ok(shell, 'shell_exec should be normalized from tool catalog response');
+    assert.equal(shell.effectiveApprovalPolicy, 'ordinary_approval_skipped');
+    assert.equal(shell.accessProfileBehavior, 'full_access_skips_ordinary_approval');
+    assert.deepEqual(
+      shell.runtimeWarnings,
+      ['runtime_warning'],
+      'runtime warning details must stay marker-only after normalization',
+    );
+    const fileRead = diagnostics.builtinTools.find((tool) => tool.name === 'file_read');
+    assert.ok(fileRead, 'file_read should be normalized from camelCase response');
+    assert.equal(fileRead.effectiveApprovalPolicy, 'none');
+    assert.equal(fileRead.accessProfileBehavior, 'restricted_allowed');
+  } finally {
+    if (originalFetch === undefined) {
+      delete globalThis.fetch;
+    } else {
+      globalThis.fetch = originalFetch;
+    }
+  }
+
   console.log('agent api golden replay passed');
 } finally {
   await server.close();

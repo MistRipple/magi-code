@@ -19,6 +19,8 @@ export interface SettingsBuiltinTool {
   name: string;
   riskLevel?: string;
   approvalRequirement?: string;
+  effectiveApprovalPolicy?: string;
+  accessProfileBehavior?: string;
   accessMode?: 'read_only' | 'maybe_write' | 'explicit_write' | string;
   policyScope?: 'fixed' | 'input_sensitive' | string;
   inputSensitivePolicy?: boolean;

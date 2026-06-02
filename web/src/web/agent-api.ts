@@ -179,6 +179,8 @@ function normalizeBuiltinTools(value: unknown): SettingsBuiltinTool[] {
     if (!name) continue;
     const riskLevel = readRecordField(record, 'riskLevel', 'risk_level');
     const approvalRequirement = readRecordField(record, 'approvalRequirement', 'approval_requirement');
+    const effectiveApprovalPolicy = readRecordField(record, 'effectiveApprovalPolicy', 'effective_approval_policy');
+    const accessProfileBehavior = readRecordField(record, 'accessProfileBehavior', 'access_profile_behavior');
     const accessMode = readRecordField(record, 'accessMode', 'access_mode');
     const policyScope = readRecordField(record, 'policyScope', 'policy_scope');
     const inputSensitivePolicy = readRecordField(record, 'inputSensitivePolicy', 'input_sensitive_policy');
@@ -192,6 +194,8 @@ function normalizeBuiltinTools(value: unknown): SettingsBuiltinTool[] {
       name,
       riskLevel: typeof riskLevel === 'string' ? riskLevel : '',
       approvalRequirement: typeof approvalRequirement === 'string' ? approvalRequirement : '',
+      effectiveApprovalPolicy: typeof effectiveApprovalPolicy === 'string' ? effectiveApprovalPolicy : 'none',
+      accessProfileBehavior: typeof accessProfileBehavior === 'string' ? accessProfileBehavior : 'restricted_allowed',
       accessMode: typeof accessMode === 'string' ? accessMode : 'read_only',
       policyScope: typeof policyScope === 'string' ? policyScope : 'fixed',
       inputSensitivePolicy: inputSensitivePolicy === true,

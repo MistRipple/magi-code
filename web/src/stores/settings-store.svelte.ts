@@ -133,6 +133,8 @@ export interface BuiltinToolItem {
   name: string;
   riskLevel: string;
   approvalRequirement: string;
+  effectiveApprovalPolicy: string;
+  accessProfileBehavior: string;
   accessMode: string;
   policyScope: string;
   inputSensitivePolicy: boolean;
@@ -2477,6 +2479,8 @@ function createSettingsStore(props: { onClose?: () => void }) {
           name,
           riskLevel: typeof tool.riskLevel === "string" ? tool.riskLevel : "",
           approvalRequirement: typeof tool.approvalRequirement === "string" ? tool.approvalRequirement : "",
+          effectiveApprovalPolicy: typeof tool.effectiveApprovalPolicy === "string" ? tool.effectiveApprovalPolicy : "none",
+          accessProfileBehavior: typeof tool.accessProfileBehavior === "string" ? tool.accessProfileBehavior : "restricted_allowed",
           accessMode: typeof tool.accessMode === "string" ? tool.accessMode : "read_only",
           policyScope: typeof tool.policyScope === "string" ? tool.policyScope : "fixed",
           inputSensitivePolicy: tool?.inputSensitivePolicy === true,
