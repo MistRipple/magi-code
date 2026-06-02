@@ -52,7 +52,7 @@ use magi_tool_runtime::{
     ToolExecutionContextQuery, ToolRegistry,
 };
 use magi_workspace::WorkspaceStore;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -817,10 +817,30 @@ impl ApiState {
             self.workspace_registry.clone(),
         ));
         self.session_store.set_lifecycle_observer(observer.clone());
+        let registered_workspace_ids = self
+            .workspace_registry
+            .workspaces()
+            .into_iter()
+            .map(|workspace| workspace.workspace_id.to_string())
+            .collect::<HashSet<_>>();
+        let mut skipped_orphan_workspace_sessions = 0usize;
         for session in self.session_store.sessions() {
-            if session.status == SessionLifecycleStatus::Active {
-                observer.on_session_created(&session.session_id, session.workspace_id.as_deref());
+            if session.status != SessionLifecycleStatus::Active {
+                continue;
             }
+            if let Some(workspace_id) = session.workspace_id.as_deref()
+                && !registered_workspace_ids.contains(workspace_id)
+            {
+                skipped_orphan_workspace_sessions += 1;
+                continue;
+            }
+            observer.on_session_created(&session.session_id, session.workspace_id.as_deref());
+        }
+        if skipped_orphan_workspace_sessions > 0 {
+            tracing::warn!(
+                skipped_orphan_workspace_sessions,
+                "snapshot lifecycle: 启动重放跳过未注册 workspace 的历史 session"
+            );
         }
     }
 
@@ -2062,6 +2082,66 @@ mod tests {
         assert_eq!(tools[0]["runtimeStatus"], serde_json::json!("ready"));
         assert_eq!(tools[1]["runtimeStatus"], serde_json::json!("unknown"));
         assert_eq!(tools[2]["runtimeStatus"], serde_json::json!("unknown"));
+    }
+
+    #[tokio::test]
+    async fn snapshot_lifecycle_replay_skips_unregistered_workspace_sessions() {
+        let session_store = Arc::new(SessionStore::default());
+        let workspace_store = Arc::new(WorkspaceStore::default());
+        let governance = Arc::new(GovernanceService::default());
+        let event_bus = Arc::new(InMemoryEventBus::new(32));
+        let workspace_root =
+            std::env::temp_dir().join(format!("magi-api-snapshot-replay-{}", UtcMillis::now().0));
+        std::fs::create_dir_all(&workspace_root).expect("workspace root should create");
+        let registered_workspace_id = WorkspaceId::new("workspace-snapshot-replay-known");
+        workspace_store
+            .register(
+                registered_workspace_id.clone(),
+                AbsolutePath::new(workspace_root.to_string_lossy().as_ref()),
+            )
+            .expect("workspace should register");
+        let known_session_id = SessionId::new("session-snapshot-replay-known");
+        let orphan_session_id = SessionId::new("session-snapshot-replay-orphan");
+        session_store
+            .create_session_for_workspace(
+                known_session_id.clone(),
+                "known",
+                Some(registered_workspace_id.to_string()),
+            )
+            .expect("known session should create");
+        session_store
+            .create_session_for_workspace(
+                orphan_session_id.clone(),
+                "orphan",
+                Some("workspace-snapshot-replay-missing".to_string()),
+            )
+            .expect("orphan session should create");
+        let state = ApiState::new(
+            "magi-test",
+            event_bus,
+            session_store,
+            workspace_store,
+            governance,
+        );
+
+        state.install_snapshot_lifecycle_observer();
+        tokio::task::yield_now().await;
+
+        assert!(
+            state
+                .snapshot_manager
+                .get_session(known_session_id.as_str())
+                .is_some(),
+            "registered workspace session should replay into snapshot lifecycle"
+        );
+        assert!(
+            state
+                .snapshot_manager
+                .get_session(orphan_session_id.as_str())
+                .is_none(),
+            "unregistered workspace session should not start a stale snapshot lifecycle"
+        );
+        let _ = std::fs::remove_dir_all(workspace_root);
     }
 
     #[test]
