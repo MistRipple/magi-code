@@ -859,6 +859,15 @@ function snapshotHasTerminalTurnAtOrAfterLocalProjection(turns: CanonicalTurn[])
   ));
 }
 
+function hasCurrentCanonicalProjectionForSession(sessionId: string): boolean {
+  const projection = messagesState.canonicalTimelineProjection;
+  if (!projection || projection.sessionId !== sessionId) {
+    return false;
+  }
+  return ensureArray<TimelineProjectionArtifact>(projection.artifacts).length > 0
+    || ensureArray(projection.threadRenderEntries).length > 0;
+}
+
 function reconcileRequestBindingsFromAuthoritativeThread(sessionId: string): void {
   const currentSessionId = getState().currentSessionId || '';
   if (!sessionId || !currentSessionId || currentSessionId !== sessionId) {
@@ -1010,7 +1019,11 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
       const canonicalSessionTurns = canonicalTurnsForSession(sessionId, canonicalTurns);
       const terminalSnapshotCaughtUpLocalTurn = authoritativeSnapshotIsIdle
         && snapshotHasTerminalTurnAtOrAfterLocalProjection(canonicalSessionTurns);
-      const shouldApplyCanonicalSnapshot = !hadLiveTurnBeforeSnapshot || terminalSnapshotCaughtUpLocalTurn;
+      const hasBootstrapHistoryWithoutLocalProjection = canonicalSessionTurns.length > 0
+        && !hasCurrentCanonicalProjectionForSession(sessionId);
+      const shouldApplyCanonicalSnapshot = !hadLiveTurnBeforeSnapshot
+        || terminalSnapshotCaughtUpLocalTurn
+        || hasBootstrapHistoryWithoutLocalProjection;
       const preserveLocalTurnDuringStaleIdle = hadLiveTurnBeforeSnapshot
         && hadPendingLocalRequestBeforeSnapshot
         && authoritativeSnapshotIsIdle

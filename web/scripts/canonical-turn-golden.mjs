@@ -90,6 +90,7 @@ function runGoldenReplay(reducer, projection, messagesStore, dataHandlers, timel
   assertReplaceCanonicalTurnsFiltersForeignSessions(reducer);
   assertMessagesStoreRejectsForeignSessionProjection(reducer, projection, messagesStore);
   assertMessagesStoreAdoptsLiveCanonicalEventForEmptySession(dataHandlers, messagesStore);
+  assertSameSessionBootstrapAppliesAuthoritativeSnapshotWhenProjectionIsEmpty(dataHandlers, messagesStore);
   assertMessagesStoreSettlesProcessingFromLiveTerminalCanonicalEvent(dataHandlers, messagesStore);
   assertTerminalLateUpsertIsIgnored(reducer, projection);
   assertTerminalLateTurnStartedIsIgnored(reducer, projection);
@@ -705,6 +706,132 @@ function assertMessagesStoreAdoptsLiveCanonicalEventForEmptySession(dataHandlers
     userArtifact?.message.images,
     imageMetadata.images,
     'live canonical image must enter the message projection without requiring refresh',
+  );
+  messagesStore.setCurrentSessionId(null);
+}
+
+function assertSameSessionBootstrapAppliesAuthoritativeSnapshotWhenProjectionIsEmpty(dataHandlers, messagesStore) {
+  const workspaceId = 'workspace-golden-bootstrap-empty-projection';
+  const workspacePath = '/tmp/workspace-golden-bootstrap-empty-projection';
+  const c = baseCase(
+    'same-session-bootstrap-empty-projection',
+    'session-golden-bootstrap-empty-projection',
+    'turn-golden-bootstrap-empty-projection',
+    12000,
+  );
+  const imageMetadata = {
+    images: [
+      {
+        name: 'bootstrap.png',
+        dataUrl: 'data:image/png;base64,AAA',
+      },
+    ],
+  };
+  const userItem = user(c, 1, '启动恢复图片消息。');
+  userItem.metadata = imageMetadata;
+  const assistantFailed = assistantText(c, 2, 'assistant-bootstrap-failed', '模型服务暂时不可用，请稍后重试。', 'failed');
+  const canonicalTurn = turn(c, 'failed', [userItem, assistantFailed], {
+    completedAt: c.turnSeq + 100,
+    responseDurationMs: 100,
+  });
+  const sessions = [
+    {
+      id: c.sessionId,
+      sessionId: c.sessionId,
+      title: '启动恢复图片消息',
+      createdAt: c.turnSeq,
+      updatedAt: c.turnSeq + 100,
+      messageCount: 1,
+      workspaceId,
+    },
+  ];
+
+  messagesStore.messagesState.currentWorkspaceId = workspaceId;
+  messagesStore.messagesState.currentWorkspacePath = workspacePath;
+  messagesStore.setCurrentSessionId(c.sessionId);
+  messagesStore.clearAllMessages({
+    persist: false,
+    resetTimelineView: true,
+    resetPanelState: true,
+    skipAntiLiftBack: true,
+  });
+  messagesStore.addPendingRequest('request-bootstrap-empty-projection');
+  assert.equal(
+    messagesStore.messagesState.canonicalTimelineProjection,
+    null,
+    'same-session bootstrap repro starts with an empty canonical projection',
+  );
+  assert.equal(
+    messagesStore.messagesState.isProcessing,
+    true,
+    'same-session bootstrap repro keeps local processing active before authoritative snapshot',
+  );
+
+  dataHandlers.handleUnifiedData({
+    id: 'golden-same-session-bootstrap-empty-projection',
+    category: 'data',
+    type: 'system',
+    source: 'orchestrator',
+    agent: 'orchestrator',
+    lifecycle: 'completed',
+    blocks: [],
+    timestamp: c.turnSeq + 100,
+    updatedAt: c.turnSeq + 100,
+    data: {
+      dataType: 'sessionBootstrapLoaded',
+      payload: {
+        sessionId: c.sessionId,
+        workspace: {
+          workspaceId,
+          rootPath: workspacePath,
+        },
+        sessions,
+        state: {
+          currentSessionId: c.sessionId,
+          currentWorkspaceId: workspaceId,
+          currentWorkspacePath: workspacePath,
+          sessions,
+          isProcessing: false,
+          processingState: null,
+          messages: [],
+          edits: [],
+          changedFiles: [],
+          pendingChanges: [],
+          pendingChangesState: null,
+        },
+        canonicalTurns: [canonicalTurn],
+        notifications: {
+          notifications: [],
+        },
+        orchestratorRuntimeState: null,
+        hasMoreBefore: false,
+        beforeCursor: null,
+      },
+    },
+  });
+
+  const projectionValue = messagesStore.messagesState.canonicalTimelineProjection;
+  const userArtifact = findArtifactByTurnItemId(projectionValue, 'user-message');
+  assert.deepEqual(
+    userArtifact?.message.images,
+    imageMetadata.images,
+    'same-session bootstrap must project authoritative user images when local projection is empty',
+  );
+  const assistantArtifact = findArtifactByTurnItemId(projectionValue, 'assistant-bootstrap-failed');
+  assert.equal(
+    assistantArtifact?.message.content,
+    assistantFailed.content,
+    'same-session bootstrap must project terminal assistant content without requiring refresh',
+  );
+  assert.equal(
+    messagesStore.messagesState.isProcessing,
+    false,
+    'authoritative same-session bootstrap must settle processing after applying terminal snapshot',
+  );
+  assert.equal(
+    messagesStore.messagesState.pendingRequests.size,
+    0,
+    'authoritative same-session bootstrap must clear stale local pending request ids',
   );
   messagesStore.setCurrentSessionId(null);
 }
