@@ -1011,14 +1011,19 @@ async fn fetch_models(
 async fn session_stats(
     State(state): State<ApiState>,
     Query(query): Query<std::collections::HashMap<String, String>>,
-) -> Json<serde_json::Value> {
-    let workspace_id =
-        parse_optional_query_string(&query, "workspaceId", "workspace_id").unwrap_or_default();
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let workspace_id = session_scope::require_registered_workspace_binding(
+        &state,
+        parse_optional_query_string(&query, "workspaceId", "workspace_id").as_deref(),
+        parse_optional_query_string(&query, "workspacePath", "workspace_path").as_deref(),
+    )?
+    .workspace_id
+    .to_string();
     let session_id = parse_optional_query_string(&query, "sessionId", "session_id");
     let mut authority = usage_authority_from_model_usage_ledger(&state);
     if let Some(session_id) = session_id.as_deref() {
         let snapshot = authority.get_session_snapshot(&workspace_id, session_id);
-        Json(serde_json::json!({
+        Ok(Json(serde_json::json!({
             "scope": "session",
             "workspaceId": snapshot.workspace_id,
             "sessionId": snapshot.session_id,
@@ -1028,10 +1033,10 @@ async fn session_stats(
             "totals": usage_totals_json(&snapshot.totals),
             "items": snapshot.by_execution_binding.into_iter().map(usage_binding_item_json).collect::<Vec<_>>(),
             "models": snapshot.by_model_identity.into_iter().map(usage_model_item_json).collect::<Vec<_>>(),
-        }))
+        })))
     } else {
         let snapshot = authority.get_workspace_snapshot(&workspace_id);
-        Json(serde_json::json!({
+        Ok(Json(serde_json::json!({
             "scope": "workspace",
             "workspaceId": snapshot.workspace_id,
             "sessionId": serde_json::Value::Null,
@@ -1042,7 +1047,7 @@ async fn session_stats(
             "items": snapshot.by_execution_binding.into_iter().map(usage_binding_item_json).collect::<Vec<_>>(),
             "models": snapshot.by_model_identity.into_iter().map(usage_model_item_json).collect::<Vec<_>>(),
             "sessions": snapshot.by_session.into_iter().map(usage_session_summary_json).collect::<Vec<_>>(),
-        }))
+        })))
     }
 }
 
@@ -1132,13 +1137,25 @@ async fn reset_stats(
     State(state): State<ApiState>,
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let workspace_id = request
+    let workspace_id_value = request
         .get("workspaceId")
         .or_else(|| request.get("workspace_id"))
         .and_then(Value::as_str)
         .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("default-workspace");
+        .filter(|value| !value.is_empty());
+    let workspace_path_value = request
+        .get("workspacePath")
+        .or_else(|| request.get("workspace_path"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let workspace_id = session_scope::require_registered_workspace_binding(
+        &state,
+        workspace_id_value,
+        workspace_path_value,
+    )?
+    .workspace_id
+    .to_string();
     let session_id = request
         .get("sessionId")
         .or_else(|| request.get("session_id"))
@@ -1155,7 +1172,7 @@ async fn reset_stats(
             .workspace_id
             .as_ref()
             .map(ToString::to_string)
-            .is_none_or(|value| value == workspace_id);
+            .is_some_and(|value| value == workspace_id);
         let same_session = session_id.is_none_or(|session_id| {
             entry
                 .context
@@ -1211,6 +1228,64 @@ mod tests {
         )
         .with_snapshot_manager(snapshot_manager)
         .with_tool_registry(tool_registry)
+    }
+
+    fn register_test_workspace(state: &ApiState, workspace_id: &str) -> tempfile::TempDir {
+        let workspace_root = tempfile::Builder::new()
+            .prefix(&format!("magi-settings-{workspace_id}-"))
+            .tempdir()
+            .expect("workspace root should create");
+        let workspace_path = workspace_root.path().to_string_lossy().to_string();
+        state
+            .workspace_registry
+            .register(
+                WorkspaceId::new(workspace_id),
+                AbsolutePath::new(&workspace_path),
+            )
+            .expect("workspace should register");
+        workspace_root
+    }
+
+    fn model_usage_payload(
+        event_id: &str,
+        workspace_id: &str,
+        session_id: &str,
+        call_id: &str,
+        timestamp: u64,
+        input_tokens: u64,
+        output_tokens: u64,
+    ) -> Value {
+        serde_json::json!({
+            "workspaceId": workspace_id,
+            "sessionId": session_id,
+            "turnId": "turn-1",
+            "eventId": event_id,
+            "timestamp": timestamp,
+            "executionBinding": {
+                "templateId": "orchestrator",
+                "engineId": "orchestrator",
+                "bindingRevision": 0,
+                "role": "orchestrator"
+            },
+            "modelConfig": {
+                "provider": "openai",
+                "model": "gpt-4.1",
+                "baseUrl": "https://api.openai.com/v1",
+                "urlMode": "default"
+            },
+            "callIdentity": {
+                "callId": call_id,
+                "source": "orchestrator",
+                "phase": "planning"
+            },
+            "usage": {
+                "inputTokens": input_tokens,
+                "outputTokens": output_tokens,
+                "cacheReadTokens": 4,
+                "cacheWriteTokens": 3
+            },
+            "status": "success"
+        })
     }
 
     async fn anthropic_probe_stub(headers: HeaderMap, Json(payload): Json<Value>) -> Json<Value> {
@@ -2096,6 +2171,7 @@ mod tests {
     #[tokio::test]
     async fn session_stats_returns_frontend_stats_contract() {
         let state = test_state();
+        let _workspace_root = register_test_workspace(&state, "workspace-stats");
         let payload = session_stats(
             State(state),
             Query(HashMap::from([
@@ -2104,6 +2180,7 @@ mod tests {
             ])),
         )
         .await
+        .expect("session stats should build")
         .0;
 
         assert_eq!(payload["scope"], serde_json::json!("session"));
@@ -2119,37 +2196,16 @@ mod tests {
     #[tokio::test]
     async fn session_stats_uses_model_usage_ledger_as_authority() {
         let state = test_state();
-        let usage_payload = serde_json::json!({
-            "workspaceId": "workspace-stats",
-            "sessionId": "session-stats",
-            "turnId": "turn-1",
-            "eventId": "usage-model-1",
-            "timestamp": 101,
-            "executionBinding": {
-                "templateId": "orchestrator",
-                "engineId": "orchestrator",
-                "bindingRevision": 0,
-                "role": "orchestrator"
-            },
-            "modelConfig": {
-                "provider": "openai",
-                "model": "gpt-4.1",
-                "baseUrl": "https://api.openai.com/v1",
-                "urlMode": "default"
-            },
-            "callIdentity": {
-                "callId": "call-1",
-                "source": "orchestrator",
-                "phase": "planning"
-            },
-            "usage": {
-                "inputTokens": 12,
-                "outputTokens": 5,
-                "cacheReadTokens": 4,
-                "cacheWriteTokens": 3
-            },
-            "status": "success"
-        });
+        let _workspace_root = register_test_workspace(&state, "workspace-stats");
+        let usage_payload = model_usage_payload(
+            "usage-model-1",
+            "workspace-stats",
+            "session-stats",
+            "call-1",
+            101,
+            12,
+            5,
+        );
         state
             .event_bus
             .publish(
@@ -2174,6 +2230,7 @@ mod tests {
             ])),
         )
         .await
+        .expect("session stats should build")
         .0;
 
         assert_eq!(payload["totals"]["netInputTokens"], serde_json::json!(12));
@@ -2215,9 +2272,140 @@ mod tests {
             ])),
         )
         .await
+        .expect("session stats should build after reset")
         .0;
         assert_eq!(payload["totals"]["totalTokens"], serde_json::json!(0));
         assert_eq!(payload["items"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn session_stats_requires_registered_workspace_scope() {
+        let result = session_stats(
+            State(test_state()),
+            Query(HashMap::from([(
+                "sessionId".to_string(),
+                "session-stats".to_string(),
+            )])),
+        )
+        .await;
+
+        match result {
+            Err(ApiError::InvalidInput(message)) => {
+                assert_eq!(message, "workspaceId 不能为空");
+            }
+            other => panic!("unexpected session stats result: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn reset_stats_requires_registered_workspace_scope() {
+        let result = reset_stats(
+            State(test_state()),
+            Json(serde_json::json!({
+                "sessionId": "session-stats"
+            })),
+        )
+        .await;
+
+        match result {
+            Err(ApiError::InvalidInput(message)) => {
+                assert_eq!(message, "workspaceId 不能为空");
+            }
+            other => panic!("unexpected reset stats result: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn reset_stats_only_removes_usage_with_matching_workspace_context() {
+        let state = test_state();
+        let _workspace_root = register_test_workspace(&state, "workspace-stats");
+        for (event_id, context, input_tokens, output_tokens, call_id, timestamp) in [
+            (
+                "usage-scoped",
+                EventContext {
+                    workspace_id: Some(WorkspaceId::new("workspace-stats")),
+                    session_id: Some(SessionId::new("session-stats")),
+                    ..EventContext::default()
+                },
+                12,
+                5,
+                "call-scoped",
+                101,
+            ),
+            (
+                "usage-unscoped",
+                EventContext::default(),
+                30,
+                7,
+                "call-unscoped",
+                102,
+            ),
+        ] {
+            state
+                .event_bus
+                .publish(
+                    EventEnvelope::usage(
+                        EventId::new(event_id),
+                        "model.usage.recorded",
+                        model_usage_payload(
+                            event_id,
+                            "workspace-stats",
+                            "session-stats",
+                            call_id,
+                            timestamp,
+                            input_tokens,
+                            output_tokens,
+                        ),
+                    )
+                    .with_context(context),
+                )
+                .expect("publish model usage event");
+        }
+
+        let before_reset = session_stats(
+            State(state.clone()),
+            Query(HashMap::from([
+                ("workspaceId".to_string(), "workspace-stats".to_string()),
+                ("sessionId".to_string(), "session-stats".to_string()),
+            ])),
+        )
+        .await
+        .expect("session stats should build before reset")
+        .0;
+        assert_eq!(before_reset["totals"]["totalTokens"], serde_json::json!(54));
+
+        let _ = reset_stats(
+            State(state.clone()),
+            Json(serde_json::json!({
+                "workspaceId": "workspace-stats",
+                "sessionId": "session-stats"
+            })),
+        )
+        .await
+        .expect("reset stats should succeed");
+
+        let after_reset = session_stats(
+            State(state.clone()),
+            Query(HashMap::from([
+                ("workspaceId".to_string(), "workspace-stats".to_string()),
+                ("sessionId".to_string(), "session-stats".to_string()),
+            ])),
+        )
+        .await
+        .expect("session stats should build after reset")
+        .0;
+        assert_eq!(after_reset["totals"]["totalTokens"], serde_json::json!(37));
+
+        let ledger_snapshot = state.event_bus.audit_usage_ledger_snapshot();
+        assert_eq!(ledger_snapshot.usage_entries.len(), 1);
+        assert_eq!(ledger_snapshot.usage_entries[0].event_id, "usage-unscoped");
+        assert!(
+            ledger_snapshot.usage_entries[0]
+                .context
+                .workspace_id
+                .is_none(),
+            "reset must not treat missing event context as matching the current workspace"
+        );
     }
 
     #[tokio::test]
