@@ -292,18 +292,14 @@ impl RuntimeHealth {
         ) {
             (Some(_), Some(_)) if !workspace_root_available => (false, None, None, None),
             (Some(store), Some(workspace_id)) => {
-                let summary = store.code_index_summary_for_workspace(workspace_id);
-                let stats = store.workspace_index_stats(workspace_id);
-                (
-                    stats
-                        .as_ref()
-                        .is_some_and(|stats| stats.is_ready && stats.total_documents > 0),
-                    summary.as_ref().map(|summary| summary.files.len()),
-                    summary.as_ref().map(|summary| summary.last_indexed),
-                    stats
-                        .as_ref()
-                        .map(|stats| stats.index_cache_status.to_string()),
-                )
+                let health = store.workspace_code_index_health(workspace_id);
+                let ready = health.as_ref().is_some_and(|health| health.is_ready);
+                let file_count = health.as_ref().map(|health| health.file_count);
+                let last_indexed = health.as_ref().and_then(|health| health.last_indexed);
+                let cache_status = health
+                    .as_ref()
+                    .map(|health| health.cache_status.to_string());
+                (ready, file_count, last_indexed, cache_status)
             }
             _ => (false, None, None, None),
         };
@@ -1244,6 +1240,9 @@ mod tests {
             "workspace_code_index"
         );
         assert_eq!(payload["runtime_dependencies"][1]["status"], "ready");
+        assert_eq!(payload["runtime_dependencies"][1]["file_count"], 1);
+        assert!(payload["runtime_dependencies"][1]["last_indexed"].is_number());
+        assert_eq!(payload["runtime_dependencies"][1]["cache_status"], "ready");
 
         let _ = std::fs::remove_dir_all(root);
     }

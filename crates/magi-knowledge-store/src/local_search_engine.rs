@@ -77,6 +77,15 @@ pub struct SearchEngineStats {
     pub index_cache_error_code: Option<&'static str>,
 }
 
+#[derive(Clone, Debug)]
+pub struct WorkspaceCodeIndexHealth {
+    pub is_ready: bool,
+    pub file_count: usize,
+    pub last_indexed: Option<u64>,
+    pub cache_status: &'static str,
+    pub cache_error_code: Option<&'static str>,
+}
+
 pub struct LocalSearchEngine {
     project_root: String,
     inverted_index: InvertedIndex,
@@ -94,6 +103,7 @@ pub struct LocalSearchEngine {
     index_version: u64,
     index_cache_status: &'static str,
     index_cache_error_code: Option<&'static str>,
+    last_indexed: Option<u64>,
     project_vocabulary_dirty: bool,
     recent_edited_files: HashMap<String, u64>,
 }
@@ -117,6 +127,7 @@ impl LocalSearchEngine {
             index_version: 0,
             index_cache_status: INDEX_CACHE_STATUS_READY,
             index_cache_error_code: None,
+            last_indexed: None,
             project_vocabulary_dirty: true,
             recent_edited_files: HashMap::new(),
         }
@@ -126,8 +137,9 @@ impl LocalSearchEngine {
         self.is_ready
     }
 
-    pub fn build_index(&mut self, files: &[(String, String)]) {
+    pub fn build_index(&mut self, files: &[(String, String)], last_indexed: u64) {
         self.indexed_files = files.to_vec();
+        self.last_indexed = Some(last_indexed);
 
         let restore_result = self.persistence.load();
         if let Some(snapshot) = restore_result {
@@ -433,11 +445,26 @@ impl LocalSearchEngine {
         }
     }
 
+    pub fn code_index_health(&self) -> WorkspaceCodeIndexHealth {
+        let stats = self.get_stats();
+        WorkspaceCodeIndexHealth {
+            is_ready: stats.is_ready && stats.total_documents > 0,
+            file_count: stats.total_documents,
+            last_indexed: self.last_indexed,
+            cache_status: stats.index_cache_status,
+            cache_error_code: stats.index_cache_error_code,
+        }
+    }
+
     pub fn code_index_summary(&self) -> crate::code_scanner::CodeIndexSummary {
-        crate::code_scanner::code_index_summary_from_relative_files(
+        let mut summary = crate::code_scanner::code_index_summary_from_relative_files(
             Path::new(&self.project_root),
             &self.indexed_files,
-        )
+        );
+        if let Some(last_indexed) = self.last_indexed {
+            summary.last_indexed = last_indexed;
+        }
+        summary
     }
 
     fn full_build(&mut self, files: &[(String, String)]) {
@@ -543,6 +570,7 @@ impl LocalSearchEngine {
         self.update_tracked_file_state(relative_path);
         self.record_recent_edit(relative_path);
         self.project_vocabulary_dirty = true;
+        self.last_indexed = Some(now_millis());
         self.search_cache.invalidate_by_file(relative_path);
     }
 
@@ -556,6 +584,7 @@ impl LocalSearchEngine {
         self.symbol_index.remove_file(relative_path);
         self.dependency_graph.remove_file(relative_path);
         self.search_cache.invalidate_by_file(relative_path);
+        self.last_indexed = Some(now_millis());
     }
 
     fn remove_stale_indexed_file(&mut self, relative_path: &str) {
@@ -1127,8 +1156,16 @@ mod tests {
             root.to_string_lossy().as_ref(),
             SearchEngineConfig::default(),
         );
-        engine.build_index(&[("src/seed.rs".to_string(), "source".to_string())]);
+        let initial_indexed_at = now_millis();
+        engine.build_index(
+            &[("src/seed.rs".to_string(), "source".to_string())],
+            initial_indexed_at,
+        );
         assert_eq!(engine.get_stats().total_documents, 1);
+        assert_eq!(
+            engine.code_index_health().last_indexed,
+            Some(initial_indexed_at)
+        );
 
         std::fs::create_dir_all(root.join("target")).expect("create target");
         std::fs::write(
@@ -1185,7 +1222,10 @@ mod tests {
             root.to_string_lossy().as_ref(),
             SearchEngineConfig::default(),
         );
-        engine.build_index(&[("src/lib.rs".to_string(), "source".to_string())]);
+        engine.build_index(
+            &[("src/lib.rs".to_string(), "source".to_string())],
+            now_millis(),
+        );
         let stats = engine.get_stats();
 
         assert!(stats.is_ready);
@@ -1227,7 +1267,10 @@ mod tests {
             root.to_string_lossy().as_ref(),
             SearchEngineConfig::default(),
         );
-        engine.build_index(&[("src/lib.rs".to_string(), "source".to_string())]);
+        engine.build_index(
+            &[("src/lib.rs".to_string(), "source".to_string())],
+            now_millis(),
+        );
 
         assert!(
             engine

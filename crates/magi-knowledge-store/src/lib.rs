@@ -27,8 +27,8 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
 
-pub use local_search_engine::SearchEngineStats;
 use local_search_engine::{LocalSearchEngine, SearchEngineConfig, SearchOptions, SearchResult};
+pub use local_search_engine::{SearchEngineStats, WorkspaceCodeIndexHealth};
 
 use normalization::{normalize_code_index_ingestion, normalize_record};
 pub use source_model::{
@@ -204,7 +204,7 @@ impl KnowledgeStore {
 
         let mut engine =
             LocalSearchEngine::new(&root.to_string_lossy(), SearchEngineConfig::default());
-        engine.build_index(&files);
+        engine.build_index(&files, summary.last_indexed);
 
         self.search_engines
             .write()
@@ -348,6 +348,20 @@ impl KnowledgeStore {
             .cloned()?;
         let engine = engine.lock().expect("search engine mutex poisoned");
         Some(engine.get_stats())
+    }
+
+    pub fn workspace_code_index_health(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Option<WorkspaceCodeIndexHealth> {
+        let engine = self
+            .search_engines
+            .read()
+            .expect("knowledge store search engines read lock poisoned")
+            .get(workspace_id)
+            .cloned()?;
+        let engine = engine.lock().expect("search engine mutex poisoned");
+        Some(engine.code_index_health())
     }
 
     pub fn upsert(&self, record: KnowledgeRecord) {

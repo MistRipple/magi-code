@@ -321,6 +321,40 @@ fn project_code_index_summary_is_scoped_by_workspace() {
 }
 
 #[test]
+fn workspace_code_index_health_uses_runtime_index_metadata() {
+    let root = std::env::temp_dir().join(format!(
+        "magi-ks-index-health-{}-{}",
+        std::process::id(),
+        UtcMillis::now().0
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("src")).expect("create temp workspace");
+    std::fs::write(
+        root.join("src/lib.rs"),
+        "pub fn health_probe_symbol() -> bool { true }\n",
+    )
+    .expect("write source");
+
+    let store = KnowledgeStore::new();
+    let workspace_id = WorkspaceId::new("workspace-index-health");
+    let outcome = store.build_workspace_index(&workspace_id, &root);
+    let summary = outcome
+        .summary
+        .expect("workspace should produce code index");
+    let health = store
+        .workspace_code_index_health(&workspace_id)
+        .expect("runtime health should exist");
+
+    assert!(health.is_ready);
+    assert_eq!(health.file_count, 1);
+    assert_eq!(health.last_indexed, Some(summary.last_indexed));
+    assert_eq!(health.cache_status, "ready");
+    assert!(health.cache_error_code.is_none());
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn clear_workspace_and_delete_in_workspace_are_scoped() {
     let store = KnowledgeStore::new();
     let workspace_a = WorkspaceId::new("workspace-a");
