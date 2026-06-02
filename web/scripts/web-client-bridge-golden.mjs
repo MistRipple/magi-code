@@ -140,12 +140,13 @@ function bootstrapPayload() {
       ]
     : [];
   const canonicalTurns = terminalPublished ? [completedCanonicalTurn()] : [];
+  const currentSession = acceptedPublished ? sessions[0] : null;
   return {
     workspace: {
       workspaceId: WORKSPACE_ID,
       rootPath: WORKSPACE_PATH,
     },
-    sessionId: acceptedPublished ? SESSION_ID : '',
+    currentSession,
     sessions,
     state: {
       currentSessionId: acceptedPublished ? SESSION_ID : '',
@@ -378,6 +379,22 @@ function messageCreatedEnvelope() {
   };
 }
 
+function laggedEnvelope(sequence = 5) {
+  return {
+    event_id: `event-stream-lagged-${sequence}`,
+    event_type: 'event.stream.lagged',
+    category: 'system',
+    occurred_at: ACCEPTED_AT + 3000,
+    sequence,
+    workspace_id: WORKSPACE_ID,
+    payload: {
+      skipped: 7,
+      recovery: 'bootstrap',
+      reason: 'broadcast_lagged',
+    },
+  };
+}
+
 async function waitFor(predicate, label) {
   return waitForWithin(predicate, label, 2000);
 }
@@ -506,6 +523,45 @@ try {
     terminalArtifact?.message?.isStreaming,
     false,
     'terminal session turn event must project the final assistant item as non-streaming',
+  );
+
+  const streamCountBeforeLagged = FakeEventSource.instances.length;
+  const originalWarn = console.warn;
+  try {
+    console.warn = () => {};
+    recoveredStream.onmessage?.({ data: JSON.stringify(laggedEnvelope()) });
+    await waitForWithin(
+      () => FakeEventSource.instances.length > streamCountBeforeLagged,
+      'lagged SSE event must immediately rebuild the event stream through bootstrap recovery',
+      350,
+    );
+  } finally {
+    console.warn = originalWarn;
+  }
+  assert.equal(
+    recoveredStream.closed,
+    true,
+    'lagged SSE event must close the stale stream before recovery reconnects',
+  );
+  const laggedRecoveredStream = FakeEventSource.instances.at(-1);
+  laggedRecoveredStream.onopen?.();
+  await waitFor(
+    () => messagesStore.messagesState.currentSessionId === SESSION_ID,
+    'lagged recovery bootstrap must keep the current session binding',
+  );
+  const recoveredTerminalArtifact = findArtifactByTurnItemId(
+    messagesStore.messagesState.canonicalTimelineProjection,
+    'assistant-bridge-live-terminal',
+  );
+  assert.equal(
+    recoveredTerminalArtifact?.message?.content,
+    '桥接层实时回复已完成。',
+    'lagged recovery bootstrap must preserve the authoritative terminal transcript',
+  );
+  assert.equal(
+    messagesStore.messagesState.isProcessing,
+    false,
+    'lagged recovery bootstrap must keep processing settled after terminal transcript restore',
   );
 
   bridge.postMessage({
