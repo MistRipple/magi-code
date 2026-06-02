@@ -443,36 +443,26 @@ fn shared_context_scope_matches(query: &SharedContextQuery, record: &SharedConte
 }
 
 fn file_summary_scope_matches(query: &FileSummaryQuery, record: &FileSummaryRecord) -> bool {
-    let workspace_matches = query
-        .workspace_id
-        .as_ref()
-        .is_some_and(|workspace_id| record.workspace_id.as_ref() == Some(workspace_id));
-    let project_matches = query
-        .project_key
-        .as_ref()
-        .is_some_and(|project_key| record.project_key.as_ref() == Some(project_key));
-    let has_scope_query = query.workspace_id.is_some() || query.project_key.is_some();
+    if let Some(workspace_id) = query.workspace_id.as_ref() {
+        if record.workspace_id.as_ref() != Some(workspace_id) {
+            return false;
+        }
+        if let Some(project_key) = query.project_key.as_ref()
+            && record
+                .project_key
+                .as_ref()
+                .is_some_and(|record_project| record_project != project_key)
+        {
+            return false;
+        }
+        return true;
+    }
 
-    if !has_scope_query {
-        return record.workspace_id.is_none() && record.project_key.is_none();
+    if let Some(project_key) = query.project_key.as_ref() {
+        return record.workspace_id.is_none() && record.project_key.as_ref() == Some(project_key);
     }
-    if let Some(workspace_id) = query.workspace_id.as_ref()
-        && record
-            .workspace_id
-            .as_ref()
-            .is_some_and(|record_workspace| record_workspace != workspace_id)
-    {
-        return false;
-    }
-    if let Some(project_key) = query.project_key.as_ref()
-        && record
-            .project_key
-            .as_ref()
-            .is_some_and(|record_project| record_project != project_key)
-    {
-        return false;
-    }
-    workspace_matches || project_matches
+
+    record.workspace_id.is_none() && record.project_key.is_none()
 }
 
 impl ProjectRecentTurnStore {
@@ -1793,7 +1783,7 @@ mod tests {
     }
 
     #[test]
-    fn context_scope_queries_include_broader_project_records_without_session_leakage() {
+    fn context_scope_queries_keep_workspace_file_summaries_as_hard_boundary() {
         let session_id = SessionId::new("session-scope");
         let other_session_id = SessionId::new("session-scope-other");
         let workspace_id = WorkspaceId::new("workspace-scope");
@@ -1914,10 +1904,46 @@ mod tests {
             .iter()
             .map(|record| record.item.absolute_path.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(
-            file_paths,
-            vec!["/repo/both.rs", "/repo/project.rs", "/repo/workspace.rs"]
-        );
+        assert_eq!(file_paths, vec!["/repo/both.rs", "/repo/workspace.rs"]);
+    }
+
+    #[test]
+    fn project_only_file_summary_query_excludes_workspace_bound_records() {
+        let project_key = "project-file-summary-only".to_string();
+        let workspace_id = WorkspaceId::new("workspace-file-summary-only");
+        let file_summary_store = FileSummaryStore::default();
+
+        for (path, workspace_id, updated_at) in [
+            ("/repo/project-only.rs", None, UtcMillis(20)),
+            (
+                "/repo/workspace-bound.rs",
+                Some(workspace_id.clone()),
+                UtcMillis(30),
+            ),
+        ] {
+            file_summary_store.upsert(FileSummaryRecord {
+                item: FileSummaryItem {
+                    absolute_path: path.to_string(),
+                    summary: path.to_string(),
+                },
+                workspace_id,
+                project_key: Some(project_key.clone()),
+                updated_at,
+            });
+        }
+
+        let files = file_summary_store.query(&FileSummaryQuery {
+            workspace_id: None,
+            project_key: Some(project_key),
+            path_prefix: None,
+            limit: 10,
+        });
+        let file_paths = files
+            .iter()
+            .map(|record| record.item.absolute_path.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(file_paths, vec!["/repo/project-only.rs"]);
     }
 
     #[test]
