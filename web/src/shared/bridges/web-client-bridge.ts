@@ -2854,15 +2854,18 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
       sessionId: targetSessionId,
     });
 
+    const resolvedSessionId = typeof turnResult.sessionId === 'string' && turnResult.sessionId.trim()
+      ? turnResult.sessionId.trim()
+      : targetSessionId;
+    if (resolvedSessionId) {
+      persistWorkspaceBinding(targetWorkspaceId, targetWorkspacePath, resolvedSessionId);
+    }
     emitAcceptedCanonicalTurnFromResult(turnResult);
 
     const canonicalUserMessageId = turnResult.userMessageItemId || userMessageId;
     const canonicalTurnSeq = typeof turnResult.acceptedAt === 'number' && Number.isFinite(turnResult.acceptedAt)
       ? Math.max(1, Math.floor(turnResult.acceptedAt))
       : undefined;
-    const resolvedSessionId = typeof turnResult.sessionId === 'string' && turnResult.sessionId.trim()
-      ? turnResult.sessionId.trim()
-      : targetSessionId;
     updateRequestBinding(requestId, {
       userMessageId: canonicalUserMessageId,
       placeholderMessageId,
@@ -2871,9 +2874,6 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
     if (isQueuedDrainSubmission) {
       addPendingRequest(requestId);
       markMessageActive(placeholderMessageId);
-    }
-    if (resolvedSessionId) {
-      persistWorkspaceBinding(targetWorkspaceId, targetWorkspacePath, resolvedSessionId);
     }
     if (turnResult.createdSession && resolvedSessionId) {
       void fetchBootstrap({ forceFresh: true }).catch((error) => {
