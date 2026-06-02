@@ -177,8 +177,8 @@
    */
   function previewEntryPoint(filepath: string) {
     if (!filepath) return;
-    openCodeTab(messagesState.currentSessionId, filepath, {
-      sessionId: messagesState.currentSessionId ?? undefined,
+    openCodeTab(null, filepath, {
+      sessionId: '',
       workspaceId: messagesState.currentWorkspaceId ?? undefined,
       workspacePath: messagesState.currentWorkspacePath || undefined,
     });

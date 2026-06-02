@@ -848,7 +848,7 @@
       tailSummary?: string;
     } = {},
   ): boolean {
-    const sessionId = metadata.sessionId?.trim() || currentSessionId || '';
+    const sessionId = metadata.sessionId?.trim() || '';
     const workspaceId = metadata.workspaceId?.trim() || selectedWorkspace?.workspaceId?.trim() || selectedWorkspaceId.trim();
     const workspacePath = metadata.workspacePath?.trim() || selectedWorkspace?.rootPath?.trim() || '';
     if (!workspaceId || !workspacePath) {

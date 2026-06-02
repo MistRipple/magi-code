@@ -439,7 +439,10 @@ export function openCodeTab(
   if (!trimmedFilepath) {
     return;
   }
-  const normalizedSession = normalizeSessionId(options?.sessionId) || normalizeSessionId(sessionId);
+  const hasExplicitSessionScope = Object.prototype.hasOwnProperty.call(options ?? {}, 'sessionId');
+  const normalizedSession = hasExplicitSessionScope
+    ? normalizeSessionId(options?.sessionId)
+    : normalizeSessionId(sessionId);
   const workspaceId = normalizeWorkspaceId(options?.workspaceId)
     || (normalizedSession === rightPaneState.activeSessionId ? rightPaneState.activeWorkspaceId : '')
     || rightPaneState.activeWorkspaceId;
