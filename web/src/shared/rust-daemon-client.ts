@@ -20,7 +20,6 @@ import type {
   DiffResponseDto,
   EngineIdRequestDto,
   EnginesResponseDto,
-  EventEnvelope,
   FetchModelsRequestDto,
   FetchModelsResponseDto,
   FileContentResponseDto,
@@ -80,16 +79,6 @@ import type {
   WorkspacePickResponseDto,
   WorkspaceSessionsResponseDto,
 } from './rust-backend-types';
-
-export interface EventStreamHandlers {
-  onOpen?: () => void;
-  onEvent?: (event: EventEnvelope) => void;
-  onError?: (error: Error) => void;
-}
-
-export interface EventStreamProbeResult {
-  event: EventEnvelope;
-}
 
 function buildApiUrl(baseUrl: string, path: string): string {
   return new URL(path, baseUrl).toString();
@@ -616,98 +605,6 @@ export class RustDaemonClient {
     );
   }
 
-  public connectEvents(handlers: EventStreamHandlers): () => void {
-    const url = buildApiUrl(this.baseUrl, '/events');
-    const connection = getTransport().connectEventStream(url, {
-      onOpen() {
-        handlers.onOpen?.();
-      },
-      onMessage(data: string) {
-        try {
-          const payload = JSON.parse(data) as EventEnvelope;
-          handlers.onEvent?.(payload);
-        } catch (error) {
-          handlers.onError?.(
-            error instanceof Error ? error : new Error(String(error)),
-          );
-        }
-      },
-      onError() {
-        handlers.onError?.(new Error('事件流连接失败'));
-      },
-    });
-    return () => {
-      connection.close();
-    };
-  }
-
-  public async probeEventStream(
-    timeoutMs = 2_000,
-    options: { trigger?: () => Promise<unknown> } = {},
-  ): Promise<EventStreamProbeResult> {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => {
-      controller.abort();
-    }, timeoutMs);
-
-    try {
-      const response = await getTransport().request(buildApiUrl(this.baseUrl, '/events'), {
-        headers: {
-          Accept: 'text/event-stream',
-        },
-        signal: controller.signal,
-      });
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}: /events`);
-      }
-      if (!response.body) {
-        throw new Error('/events 响应缺少可读事件流 body');
-      }
-
-      if (options.trigger) {
-        await options.trigger();
-      }
-
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = '';
-
-      try {
-        for (;;) {
-          const parsedEvent = parseFirstEventEnvelope(buffer);
-          if (parsedEvent) {
-            return { event: parsedEvent };
-          }
-
-          const { done, value } = await reader.read();
-          if (done) {
-            break;
-          }
-          buffer += decoder.decode(value, { stream: true });
-        }
-      } finally {
-        try {
-          await reader.cancel();
-        } catch {
-          // Best-effort cleanup for the probe connection.
-        }
-      }
-
-      const parsedEvent = parseFirstEventEnvelope(buffer);
-      if (parsedEvent) {
-        return { event: parsedEvent };
-      }
-      throw new Error('/events 已连接，但未读取到可解析的事件');
-    } catch (error) {
-      if (controller.signal.aborted) {
-        throw new Error(`/events 在 ${timeoutMs}ms 内未返回可读事件`);
-      }
-      throw error;
-    } finally {
-      clearTimeout(timeoutId);
-    }
-  }
-
   private async getJson<T>(path: string): Promise<T> {
     return await fetchJsonUrl<T>(buildApiUrl(this.baseUrl, path));
   }
@@ -725,60 +622,4 @@ export class RustDaemonClient {
     }
     return await response.json() as T;
   }
-}
-
-function parseFirstEventEnvelope(buffer: string): EventEnvelope | null {
-  const normalizedBuffer = buffer.replace(/\r\n/g, '\n');
-  const blocks = normalizedBuffer.split('\n\n');
-  for (let index = 0; index < blocks.length - 1; index += 1) {
-    const block = blocks[index]?.trim();
-    if (!block) {
-      continue;
-    }
-    const eventEnvelope = parseEventEnvelopeBlock(block);
-    if (eventEnvelope) {
-      return eventEnvelope;
-    }
-  }
-  return null;
-}
-
-function parseEventEnvelopeBlock(block: string): EventEnvelope | null {
-  let eventId = '';
-  let eventType = '';
-  const dataLines: string[] = [];
-
-  for (const line of block.split('\n')) {
-    if (line.startsWith('id:')) {
-      eventId = line.slice(3).trimStart();
-      continue;
-    }
-    if (line.startsWith('event:')) {
-      eventType = line.slice(6).trimStart();
-      continue;
-    }
-    if (line.startsWith('data:')) {
-      dataLines.push(line.slice(5).trimStart());
-    }
-  }
-
-  if (dataLines.length === 0) {
-    return null;
-  }
-
-  const payload = JSON.parse(dataLines.join('\n')) as EventEnvelope;
-  if (!payload.event_id || !payload.event_type) {
-    throw new Error('SSE 事件载荷缺少 event_id 或 event_type');
-  }
-  if (eventId && payload.event_id !== eventId) {
-    throw new Error(
-      `SSE event id 不匹配: expected=${eventId}, actual=${payload.event_id}`,
-    );
-  }
-  if (eventType && payload.event_type !== eventType) {
-    throw new Error(
-      `SSE event type 不匹配: expected=${eventType}, actual=${payload.event_type}`,
-    );
-  }
-  return payload;
 }
