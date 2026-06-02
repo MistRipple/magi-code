@@ -3922,6 +3922,45 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn session_turn_rejects_invalid_image_payload_before_accepting_turn() {
+        let state = test_state();
+        let workspace_id =
+            register_workspace(&state, "workspace-invalid-image-turn", "invalid-image-turn");
+        let (status, body) = post_json(
+            state.clone(),
+            "/session/turn",
+            serde_json::json!({
+                "workspaceId": workspace_id.to_string(),
+                "text": "请分析这张图片",
+                "images": [{
+                    "name": "paste.txt",
+                    "dataUrl": "data:text/plain;base64,AAA"
+                }],
+                "requestId": "request-invalid-image-turn",
+                "userMessageId": "user-invalid-image-turn",
+                "placeholderMessageId": "assistant-invalid-image-turn"
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "unexpected body: {body}");
+        assert!(
+            body["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("图片输入无效")),
+            "invalid image error should be public and actionable: {body}"
+        );
+        assert!(
+            state.session_store.sessions_for_workspace(workspace_id.as_str()).is_empty(),
+            "invalid image request must not create a session or accepted turn"
+        );
+        assert!(
+            state.event_bus.snapshot().recent_events.is_empty(),
+            "invalid image request must not publish accepted turn events"
+        );
+    }
+
     /// §3.1 端到端验收：simple task 路径（chat 路由）
     ///
     /// 闸门属性：chat 路由进入 `submit_regular_session_turn` 后，
