@@ -213,7 +213,11 @@ async fn interrupt_task(
     let cancelled_tool_process_count = subtree_task_ids
         .iter()
         .map(|subtree_task_id| {
-            state.cancel_active_tool_executions(Some(&session_id), None, Some(subtree_task_id))
+            state.cancel_active_tool_executions(
+                Some(&session_id),
+                Some(&scope.workspace_id),
+                Some(subtree_task_id),
+            )
         })
         .sum::<usize>();
     for subtree_task_id in subtree_task_ids {

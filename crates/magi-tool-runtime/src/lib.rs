@@ -3253,6 +3253,61 @@ mod tests {
         assert_eq!(payload["cancelled"], true);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn shell_exec_cancel_active_scope_requires_matching_workspace() {
+        let registry = make_registry();
+        let context = ToolExecutionContext {
+            worker_id: None,
+            task_id: Some(TaskId::new("task-shell-cancel-workspace-scope")),
+            session_id: Some(SessionId::new("session-shell-cancel-workspace-scope")),
+            workspace_id: Some(WorkspaceId::new("workspace-shell-cancel-workspace-scope")),
+            access_profile: magi_core::AccessProfile::Restricted,
+            working_directory: None,
+        };
+        let runner_registry = registry.clone();
+        let runner_context = context.clone();
+        let runner = std::thread::spawn(move || {
+            runner_registry.execute_with_policy(
+                ToolExecutionInput {
+                    tool_call_id: ToolCallId::new("tool-call-shell-cancel-workspace-scope"),
+                    tool_name: BuiltinToolName::ShellExec.as_str().to_string(),
+                    tool_kind: ToolKind::Builtin,
+                    input: serde_json::json!({
+                        "command": "sleep 2",
+                        "timeout_ms": 5000
+                    })
+                    .to_string(),
+                    approval_requirement: ApprovalRequirement::None,
+                    risk_level: RiskLevel::Low,
+                },
+                runner_context,
+                &full_access_policy(),
+            )
+        });
+
+        std::thread::sleep(Duration::from_millis(150));
+        let wrong_workspace_cancelled =
+            registry.cancel_active_shell_execs(&ToolExecutionContextQuery {
+                session_id: context.session_id.clone(),
+                workspace_id: Some(WorkspaceId::new("workspace-shell-cancel-other")),
+                task_id: context.task_id.clone(),
+                worker_id: None,
+            });
+        assert_eq!(wrong_workspace_cancelled, 0);
+
+        let cancelled = registry.cancel_active_shell_execs(&ToolExecutionContextQuery {
+            session_id: context.session_id.clone(),
+            workspace_id: context.workspace_id.clone(),
+            task_id: context.task_id.clone(),
+            worker_id: None,
+        });
+        assert_eq!(cancelled, 1);
+
+        let output = runner.join().expect("shell execution thread should join");
+        assert_eq!(output.status, ExecutionResultStatus::Cancelled);
+    }
+
     #[test]
     fn shell_exec_rejects_blank_json_command() {
         let governance = Arc::new(GovernanceService::default());
