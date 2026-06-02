@@ -12,11 +12,12 @@ use crate::{
     },
     session_images::{SessionTurnImage, image_sources_from_metadata, session_turn_image_sources},
     session_writeback::{
-        SessionStatePersistCallback, append_session_tool_call_items_batch,
-        append_session_turn_error_item, append_session_turn_item, persist_session_state_checkpoint,
+        SessionStatePersistCallback, SessionTurnStreamPublishGate,
+        append_session_tool_call_items_batch, append_session_turn_error_item,
+        append_session_turn_item, persist_session_state_checkpoint,
         publish_current_session_turn_item_event, publish_session_turn_item_event,
-        publish_session_turn_item_event_with_stream_update, session_turn_item,
-        session_turn_stream_update, upsert_session_turn_item,
+        publish_session_turn_item_stream_event, session_turn_item, session_turn_stream_update,
+        upsert_session_turn_item,
     },
     settings_store::SettingsStore,
     usage_recording::{
@@ -539,6 +540,8 @@ fn stream_session_turn_round(
     let streamed_visible_content = std::cell::RefCell::new(String::new());
     let last_content_len = std::cell::Cell::new(0usize);
     let last_thinking_len = std::cell::Cell::new(0usize);
+    let stream_publish_gate = std::cell::RefCell::new(SessionTurnStreamPublishGate::default());
+    let thinking_publish_gate = std::cell::RefCell::new(SessionTurnStreamPublishGate::default());
     let writeback_aborted = std::cell::Cell::new(false);
     let on_delta = |delta: &ModelStreamingDelta| {
         if !request_turn_is_writable(session_store, request) {
@@ -568,13 +571,15 @@ fn stream_session_turn_round(
             apply_request_aliases(&mut item, request);
             if let Some(published) =
                 upsert_session_turn_item(session_store, &request.session_id, item)
+                && let Some(stream_update) = stream_update.as_ref()
             {
-                publish_session_turn_item_event_with_stream_update(
+                publish_session_turn_item_stream_event(
                     event_bus,
                     &request.session_id,
                     &request.workspace_id,
                     &published,
-                    stream_update.as_ref(),
+                    stream_update,
+                    &mut thinking_publish_gate.borrow_mut(),
                 );
             }
         }
@@ -617,13 +622,15 @@ fn stream_session_turn_round(
         );
         apply_request_aliases(&mut item, request);
         if let Some(published) = upsert_session_turn_item(session_store, &request.session_id, item)
+            && let Some(stream_update) = stream_update.as_ref()
         {
-            publish_session_turn_item_event_with_stream_update(
+            publish_session_turn_item_stream_event(
                 event_bus,
                 &request.session_id,
                 &request.workspace_id,
                 &published,
-                stream_update.as_ref(),
+                stream_update,
+                &mut stream_publish_gate.borrow_mut(),
             );
         }
     };

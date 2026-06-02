@@ -1,8 +1,9 @@
 use crate::session_writeback::{
-    SessionStatePersistCallback, SessionTurnStreamUpdate, append_session_turn_item_with_task_store,
-    persist_session_state_checkpoint, publish_current_session_turn_item_event,
-    publish_session_turn_item_event, publish_session_turn_item_event_with_stream_update,
-    session_turn_item, session_turn_stream_update, upsert_session_turn_item_with_task_store,
+    SessionStatePersistCallback, SessionTurnStreamPublishGate, SessionTurnStreamUpdate,
+    append_session_turn_item_with_task_store, persist_session_state_checkpoint,
+    publish_current_session_turn_item_event, publish_session_turn_item_event,
+    publish_session_turn_item_stream_event, session_turn_item, session_turn_stream_update,
+    upsert_session_turn_item_with_task_store,
 };
 use crate::task_execution_registry::TaskExecutionRegistry;
 use crate::task_helpers::task_is_long_mission;
@@ -999,6 +1000,9 @@ fn run_conversation_loop_inner(
         let streamed_thinking = std::cell::RefCell::new(String::new());
         let streamed_visible_content = std::cell::RefCell::new(String::new());
         let last_thinking_len = std::cell::Cell::new(0usize);
+        let stream_publish_gate = std::cell::RefCell::new(SessionTurnStreamPublishGate::default());
+        let thinking_publish_gate =
+            std::cell::RefCell::new(SessionTurnStreamPublishGate::default());
         let round_started_at = UtcMillis::now();
         let invocation_request = ModelInvocationRequest {
             provider: LOOPBACK_MODEL_PROVIDER.to_string(),
@@ -1024,6 +1028,7 @@ fn run_conversation_loop_inner(
                     &thinking_item_id,
                     &last_thinking_len,
                     &streamed_thinking,
+                    &thinking_publish_gate,
                     &turn_visibility,
                     &delta.thinking,
                 );
@@ -1038,6 +1043,7 @@ fn run_conversation_loop_inner(
                     (round == 0).then_some(stream_item_id.as_str()),
                     &turn_visibility,
                     &streamed_visible_content,
+                    &stream_publish_gate,
                     &delta.content,
                 );
             };
@@ -1126,6 +1132,7 @@ fn run_conversation_loop_inner(
                 "completed",
                 &thinking,
                 None,
+                &thinking_publish_gate,
             );
         }
         publish_model_usage_record(
@@ -2313,6 +2320,7 @@ fn publish_stream_delta(
     timeline_entry_id: Option<&str>,
     turn_visibility: &TaskTurnVisibility,
     streamed_visible_content: &std::cell::RefCell<String>,
+    publish_gate: &std::cell::RefCell<SessionTurnStreamPublishGate>,
     accumulated_text: &str,
 ) {
     let visible_text = normalize_model_stream_preview_content(accumulated_text);
@@ -2353,13 +2361,15 @@ fn publish_stream_delta(
     apply_task_worker_detail_visibility(&mut item, task, turn_visibility);
     if let Some(published) =
         upsert_session_turn_item_with_task_store(session_store, session_id, item, Some(task_store))
+        && let Some(stream_update) = stream_update.as_ref()
     {
-        publish_session_turn_item_event_with_stream_update(
+        publish_session_turn_item_stream_event(
             event_bus,
             session_id,
             workspace_id,
             &published,
-            stream_update.as_ref(),
+            stream_update,
+            &mut publish_gate.borrow_mut(),
         );
     }
 }
@@ -2374,6 +2384,7 @@ fn publish_task_thinking_delta(
     item_id: &str,
     last_sent_len: &std::cell::Cell<usize>,
     streamed_thinking: &std::cell::RefCell<String>,
+    publish_gate: &std::cell::RefCell<SessionTurnStreamPublishGate>,
     turn_visibility: &TaskTurnVisibility,
     accumulated_thinking: &str,
 ) {
@@ -2410,6 +2421,7 @@ fn publish_task_thinking_delta(
         "running",
         trimmed,
         stream_update.as_ref(),
+        publish_gate,
     );
 }
 
@@ -2425,6 +2437,7 @@ fn upsert_task_thinking_turn_item(
     status: &str,
     thinking: &str,
     stream_update: Option<&SessionTurnStreamUpdate>,
+    publish_gate: &std::cell::RefCell<SessionTurnStreamPublishGate>,
 ) {
     let trimmed = thinking.trim();
     if trimmed.is_empty() {
@@ -2442,13 +2455,18 @@ fn upsert_task_thinking_turn_item(
     if let Some(published) =
         upsert_session_turn_item_with_task_store(session_store, session_id, item, Some(task_store))
     {
-        publish_session_turn_item_event_with_stream_update(
-            event_bus,
-            session_id,
-            workspace_id,
-            &published,
-            stream_update,
-        );
+        if let Some(stream_update) = stream_update {
+            publish_session_turn_item_stream_event(
+                event_bus,
+                session_id,
+                workspace_id,
+                &published,
+                stream_update,
+                &mut publish_gate.borrow_mut(),
+            );
+        } else {
+            publish_session_turn_item_event(event_bus, session_id, workspace_id, &published);
+        }
     }
 }
 

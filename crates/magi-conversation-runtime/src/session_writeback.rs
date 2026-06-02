@@ -64,6 +64,40 @@ pub struct SessionTurnStreamUpdate {
     pub reset: bool,
 }
 
+const STREAM_ITEM_PUBLISH_MIN_INTERVAL_MS: u64 = 80;
+const STREAM_ITEM_PUBLISH_MIN_CHARS: usize = 24;
+
+#[derive(Clone, Debug, Default)]
+pub struct SessionTurnStreamPublishGate {
+    last_published_at: Option<UtcMillis>,
+    last_published_content_length: usize,
+}
+
+impl SessionTurnStreamPublishGate {
+    pub fn should_publish(&mut self, update: &SessionTurnStreamUpdate) -> bool {
+        self.should_publish_at(update, UtcMillis::now())
+    }
+
+    fn should_publish_at(&mut self, update: &SessionTurnStreamUpdate, now: UtcMillis) -> bool {
+        let should_publish = self.last_published_at.is_none()
+            || update.reset
+            || self.last_published_at.is_some_and(|last| {
+                now.0.saturating_sub(last.0) >= STREAM_ITEM_PUBLISH_MIN_INTERVAL_MS
+            })
+            || update
+                .content_length
+                .saturating_sub(self.last_published_content_length)
+                >= STREAM_ITEM_PUBLISH_MIN_CHARS;
+
+        if should_publish {
+            self.last_published_at = Some(now);
+            self.last_published_content_length = update.content_length;
+        }
+
+        should_publish
+    }
+}
+
 pub fn session_turn_stream_update(
     previous_content: &str,
     current_content: &str,
@@ -500,6 +534,26 @@ pub fn publish_session_turn_item_event_with_stream_update(
             session_id: Some(session_id.clone()),
             ..EventContext::default()
         }),
+    );
+}
+
+pub fn publish_session_turn_item_stream_event(
+    event_bus: &InMemoryEventBus,
+    session_id: &SessionId,
+    workspace_id: &Option<WorkspaceId>,
+    published: &PublishedSessionTurnItem,
+    stream_update: &SessionTurnStreamUpdate,
+    publish_gate: &mut SessionTurnStreamPublishGate,
+) {
+    if !publish_gate.should_publish(stream_update) {
+        return;
+    }
+    publish_session_turn_item_event_with_stream_update(
+        event_bus,
+        session_id,
+        workspace_id,
+        published,
+        Some(stream_update),
     );
 }
 
@@ -1055,6 +1109,48 @@ mod tests {
         assert!(reset.reset);
 
         assert!(session_turn_stream_update("same", "same").is_none());
+    }
+
+    #[test]
+    fn stream_publish_gate_keeps_first_frame_and_coalesces_bursts() {
+        let mut gate = SessionTurnStreamPublishGate::default();
+        let first = SessionTurnStreamUpdate {
+            delta: "a".to_string(),
+            content_length: 1,
+            reset: false,
+        };
+        assert!(gate.should_publish_at(&first, UtcMillis(1_000)));
+
+        let burst = SessionTurnStreamUpdate {
+            delta: "b".to_string(),
+            content_length: 2,
+            reset: false,
+        };
+        assert!(!gate.should_publish_at(&burst, UtcMillis(1_001)));
+
+        let enough_chars = SessionTurnStreamUpdate {
+            delta: "c".repeat(STREAM_ITEM_PUBLISH_MIN_CHARS),
+            content_length: STREAM_ITEM_PUBLISH_MIN_CHARS + 1,
+            reset: false,
+        };
+        assert!(gate.should_publish_at(&enough_chars, UtcMillis(1_002)));
+
+        let delayed = SessionTurnStreamUpdate {
+            delta: "d".to_string(),
+            content_length: STREAM_ITEM_PUBLISH_MIN_CHARS + 2,
+            reset: false,
+        };
+        assert!(gate.should_publish_at(
+            &delayed,
+            UtcMillis(1_002 + STREAM_ITEM_PUBLISH_MIN_INTERVAL_MS),
+        ));
+
+        let reset = SessionTurnStreamUpdate {
+            delta: "reset".to_string(),
+            content_length: 5,
+            reset: true,
+        };
+        assert!(gate.should_publish_at(&reset, UtcMillis(1_003)));
     }
 
     impl ConcurrentToolProbe {
