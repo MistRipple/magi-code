@@ -1656,18 +1656,6 @@ async function readAgentErrorPayload(response: Response): Promise<{ errorCode?: 
   }
 }
 
-function isStaleSessionBindingError(
-  status: number,
-  error: { errorCode?: string; message?: string },
-  requestedSessionId: string,
-): boolean {
-  return status === 400
-    && requestedSessionId.trim().length > 0
-    && error.errorCode === 'INPUT_INVALID'
-    && typeof error.message === 'string'
-    && error.message.includes('不属于 workspace');
-}
-
 function isCurrentBootstrapRequest(bindingKey: string, requestSeq: number): boolean {
   if (activeSessionSwitchBindingKey && bindingKey !== activeSessionSwitchBindingKey) {
     return false;
@@ -2159,13 +2147,6 @@ async function fetchBootstrap(
     let errorPayload: { errorCode?: string; message?: string } = {};
     if (!response.ok) {
       errorPayload = await readAgentErrorPayload(response);
-      if (isStaleSessionBindingError(response.status, errorPayload, requestBinding.sessionId)) {
-        effectiveBinding = { ...requestBinding, sessionId: '' };
-        response = await getTransport().request(agentUrl('/bootstrap', buildBootstrapQuery(effectiveBinding)));
-        if (!response.ok) {
-          errorPayload = await readAgentErrorPayload(response);
-        }
-      }
     }
     if (!response.ok) {
       if (response.status === 404) {
