@@ -162,6 +162,8 @@ export interface CapabilityDependencyItem {
   configuredCount?: number | null;
   enabledCount?: number | null;
   readyCount?: number | null;
+  enabledToolCount?: number | null;
+  readyToolCount?: number | null;
   toolCount?: number | null;
 }
 
@@ -2516,6 +2518,8 @@ function createSettingsStore(props: { onClose?: () => void }) {
       const configuredCount = readDependencyField(dependency, "configuredCount", "configured_count");
       const enabledCount = readDependencyField(dependency, "enabledCount", "enabled_count");
       const readyCount = readDependencyField(dependency, "readyCount", "ready_count");
+      const enabledToolCount = readDependencyField(dependency, "enabledToolCount", "enabled_tool_count");
+      const readyToolCount = readDependencyField(dependency, "readyToolCount", "ready_tool_count");
       const toolCount = readDependencyField(dependency, "toolCount", "tool_count");
       dependencies.push({
         name,
@@ -2553,6 +2557,12 @@ function createSettingsStore(props: { onClose?: () => void }) {
           : null,
         readyCount: typeof readyCount === "number" && Number.isFinite(readyCount)
           ? readyCount
+          : null,
+        enabledToolCount: typeof enabledToolCount === "number" && Number.isFinite(enabledToolCount)
+          ? enabledToolCount
+          : null,
+        readyToolCount: typeof readyToolCount === "number" && Number.isFinite(readyToolCount)
+          ? readyToolCount
           : null,
         toolCount: typeof toolCount === "number" && Number.isFinite(toolCount)
           ? toolCount
