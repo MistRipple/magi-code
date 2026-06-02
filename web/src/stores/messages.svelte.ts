@@ -50,6 +50,9 @@ import {
 import {
   normalizeMessagePayload,
 } from '../lib/message-payload';
+import {
+  clearCanonicalSessionTurns,
+} from './turn-store.svelte';
 import type { SettingsBootstrapSnapshot } from '../shared/settings-bootstrap';
 import type { RoleTemplate } from '../shared/types/role-templates';
 import type { AgentBinding, ModelEngine } from '../shared/types/registry-types';
@@ -1443,6 +1446,7 @@ export function setCurrentSessionId(id: string | null) {
     resetSessionScopedExecutionState();
     // 会话切换时消息内容以后端分页快照为唯一真相源。
     // 本地只恢复滚动/定位等轻量视图状态，避免旧 session 的主线或右侧面板内容短暂残留。
+    clearCanonicalSessionTurns(nextSessionId ?? undefined);
     messagesState.canonicalTimelineProjection = null;
     restoredSessionView = applySessionViewState(nextSessionId);
     if (!restoredSessionView) {
@@ -1466,6 +1470,7 @@ export function adoptCurrentSessionIdForLiveTurn(id: string | null | undefined):
   if (currentSessionId) {
     return false;
   }
+  clearCanonicalSessionTurns(nextSessionId);
   messagesState.currentSessionId = nextSessionId;
   messagesState.sessionHistory = {
     workspaceId: messagesState.currentWorkspaceId,

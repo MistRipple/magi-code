@@ -90,6 +90,7 @@ function runGoldenReplay(reducer, projection, messagesStore, dataHandlers, timel
   assertReplaceCanonicalTurnsFiltersForeignSessions(reducer);
   assertMessagesStoreRejectsForeignSessionProjection(reducer, projection, messagesStore);
   assertMessagesStoreAdoptsLiveCanonicalEventForEmptySession(dataHandlers, messagesStore);
+  assertMessagesStoreSettlesProcessingFromLiveTerminalCanonicalEvent(dataHandlers, messagesStore);
   assertTerminalLateUpsertIsIgnored(reducer, projection);
   assertTerminalLateTurnStartedIsIgnored(reducer, projection);
   assertFailedAssistantTextUsesPlainMessageShell(reducer, projection);
@@ -704,6 +705,101 @@ function assertMessagesStoreAdoptsLiveCanonicalEventForEmptySession(dataHandlers
     userArtifact?.message.images,
     imageMetadata.images,
     'live canonical image must enter the message projection without requiring refresh',
+  );
+  messagesStore.setCurrentSessionId(null);
+}
+
+function assertMessagesStoreSettlesProcessingFromLiveTerminalCanonicalEvent(dataHandlers, messagesStore) {
+  const c = baseCase(
+    'live-terminal-processing-settle',
+    'session-golden-live-terminal-settle',
+    'turn-golden-live-terminal-settle',
+    11900,
+  );
+  const requestMetadata = {
+    requestId: 'request-live-terminal-settle',
+    userMessageId: 'user-live-terminal-settle',
+    placeholderMessageId: 'assistant-live-terminal-settle',
+  };
+  const userItem = user(c, 1, '请完成处理态收敛验证。');
+  userItem.itemId = requestMetadata.userMessageId;
+  userItem.metadata = requestMetadata;
+  const runningAssistant = assistantPlaceholderText(c, 2, requestMetadata.placeholderMessageId, 'running');
+  runningAssistant.metadata = requestMetadata;
+  const completedAssistant = assistantText(c, 2, requestMetadata.placeholderMessageId, '处理态已收敛。', 'completed');
+  completedAssistant.metadata = requestMetadata;
+
+  messagesStore.messagesState.currentWorkspaceId = 'workspace-golden-live-terminal-settle';
+  messagesStore.messagesState.currentWorkspacePath = '/tmp/workspace-golden-live-terminal-settle';
+  messagesStore.setCurrentSessionId(c.sessionId);
+  messagesStore.clearAllMessages({
+    persist: false,
+    resetTimelineView: true,
+    resetPanelState: true,
+    skipAntiLiftBack: true,
+  });
+  messagesStore.addPendingRequest(requestMetadata.requestId);
+
+  dataHandlers.handleUnifiedData({
+    id: 'golden-live-running-canonical-event',
+    category: 'data',
+    type: 'system',
+    source: 'orchestrator',
+    agent: 'orchestrator',
+    lifecycle: 'completed',
+    blocks: [],
+    timestamp: c.turnSeq,
+    updatedAt: c.turnSeq,
+    data: {
+      dataType: 'sessionTurnCanonicalEventUpdated',
+      payload: {
+        sessionId: c.sessionId,
+        canonicalEvent: event(c, 1, 'turn_item_upsert', {
+          turn: turn(c, 'running', [userItem, runningAssistant]),
+          item: runningAssistant,
+        }),
+      },
+    },
+  });
+  assert.equal(
+    messagesStore.messagesState.isProcessing,
+    true,
+    'running canonical event should keep processing state active',
+  );
+
+  dataHandlers.handleUnifiedData({
+    id: 'golden-live-terminal-canonical-event',
+    category: 'data',
+    type: 'system',
+    source: 'orchestrator',
+    agent: 'orchestrator',
+    lifecycle: 'completed',
+    blocks: [],
+    timestamp: c.turnSeq + 1,
+    updatedAt: c.turnSeq + 1,
+    data: {
+      dataType: 'sessionTurnCanonicalEventUpdated',
+      payload: {
+        sessionId: c.sessionId,
+        canonicalEvent: event(c, 2, 'turn_completed', {
+          turn: turn(c, 'completed', [userItem, completedAssistant], {
+            completedAt: c.turnSeq + 100,
+            responseDurationMs: 100,
+          }),
+          item: completedAssistant,
+        }),
+      },
+    },
+  });
+  assert.equal(
+    messagesStore.messagesState.isProcessing,
+    false,
+    'terminal canonical event must settle processing state immediately',
+  );
+  assert.equal(
+    messagesStore.messagesState.pendingRequests.size,
+    0,
+    'terminal canonical event must clear pending request ids',
   );
   messagesStore.setCurrentSessionId(null);
 }
