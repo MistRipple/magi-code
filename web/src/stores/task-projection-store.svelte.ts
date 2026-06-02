@@ -8,6 +8,9 @@
  */
 
 import type {
+  ClientBridgeMessage,
+} from '../shared/bridges/client-bridge';
+import type {
   TaskProjectionDto,
   TaskStatus,
 } from '../shared/rust-backend-types';
@@ -147,11 +150,69 @@ function trackedSessionStates(): InternalSessionTaskProjectionState[] {
   return activeState?.rootTaskId ? [activeState] : [];
 }
 
-async function refreshTrackedSessions(): Promise<void> {
-  const sessions = trackedSessionStates();
+function bridgeStringValue(value: unknown): string {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function bridgeRecordValue(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+}
+
+function bridgePayloadString(
+  payload: Record<string, unknown>,
+  snakeKey: string,
+  camelKey: string,
+): string {
+  return bridgeStringValue(payload[snakeKey]) || bridgeStringValue(payload[camelKey]);
+}
+
+function taskEventRootTaskIds(message: ClientBridgeMessage): Set<string> {
+  const payload = bridgeRecordValue(message.payload);
+  const values = [
+    ...(Array.isArray(message.rootTaskIds) ? message.rootTaskIds.map(bridgeStringValue) : []),
+    bridgeStringValue(message.rootTaskId),
+    bridgePayloadString(payload, 'root_task_id', 'rootTaskId'),
+    bridgePayloadString(payload, 'old_root_task_id', 'oldRootTaskId'),
+    bridgePayloadString(payload, 'new_root_task_id', 'newRootTaskId'),
+  ].filter(Boolean);
+  return new Set(values);
+}
+
+function taskEventMatchesState(
+  message: ClientBridgeMessage,
+  state: InternalSessionTaskProjectionState,
+): boolean {
+  const payload = bridgeRecordValue(message.payload);
+  const eventWorkspaceId = bridgeStringValue(message.workspaceId)
+    || bridgePayloadString(payload, 'workspace_id', 'workspaceId');
+  if (eventWorkspaceId && state.workspaceId && eventWorkspaceId !== state.workspaceId) {
+    return false;
+  }
+
+  const eventSessionId = bridgeStringValue(message.sessionId)
+    || bridgePayloadString(payload, 'session_id', 'sessionId');
+  if (eventSessionId && eventSessionId !== state.sessionId) {
+    return false;
+  }
+
+  const rootTaskIds = taskEventRootTaskIds(message);
+  if (rootTaskIds.size > 0 && state.rootTaskId && !rootTaskIds.has(state.rootTaskId)) {
+    return false;
+  }
+
+  return true;
+}
+
+async function refreshSessions(sessions: InternalSessionTaskProjectionState[]): Promise<void> {
   await Promise.all(sessions.map((state) => (
     refreshTaskProjection(state.sessionId, state.workspaceId, state.workspacePath)
   )));
+}
+
+async function refreshTrackedSessions(): Promise<void> {
+  await refreshSessions(trackedSessionStates());
 }
 
 export function getTaskProjectionState(
@@ -325,8 +386,12 @@ function connectToSSE(): void {
     if (activeSessions.length === 0) {
       return;
     }
+    const matchingSessions = activeSessions.filter((state) => taskEventMatchesState(message, state));
+    if (matchingSessions.length === 0) {
+      return;
+    }
     let hasLoadingSession = false;
-    for (const state of activeSessions) {
+    for (const state of matchingSessions) {
       if (state.loading) {
         state.refreshAfterLoad = true;
         hasLoadingSession = true;
@@ -340,7 +405,7 @@ function connectToSSE(): void {
     }
     sseDebounceTimer = setTimeout(() => {
       sseDebounceTimer = null;
-      void refreshTrackedSessions();
+      void refreshSessions(matchingSessions);
     }, SSE_DEBOUNCE_MS);
   });
 }

@@ -1159,6 +1159,20 @@ function rustEventSessionId(event: RustEventEnvelope): string {
     || rustEventPayloadString(event, 'session_id', 'sessionId');
 }
 
+function rustEventTaskId(event: RustEventEnvelope): string {
+  return trimBridgeString(event.task_id)
+    || rustEventPayloadString(event, 'task_id', 'taskId');
+}
+
+function rustTaskEventRootTaskIds(event: RustEventEnvelope): string[] {
+  const candidates = [
+    rustEventPayloadString(event, 'root_task_id', 'rootTaskId'),
+    rustEventPayloadString(event, 'old_root_task_id', 'oldRootTaskId'),
+    rustEventPayloadString(event, 'new_root_task_id', 'newRootTaskId'),
+  ];
+  return Array.from(new Set(candidates.filter((value) => value.length > 0)));
+}
+
 function eventMatchesCurrentWorkspace(event: RustEventEnvelope): boolean {
   const eventWorkspaceId = rustEventWorkspaceId(event);
   if (eventWorkspaceId && currentWorkspaceId && eventWorkspaceId !== currentWorkspaceId) {
@@ -1335,7 +1349,15 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
     || eventType.startsWith('mission.')
     || eventType.startsWith('assignment.');
   if (isTaskProjectionRelevantEvent) {
-    emitMessage({ type: 'rustTaskEvent', eventType, payload: event.payload ?? {} } as ClientBridgeMessage);
+    emitMessage({
+      type: 'rustTaskEvent',
+      eventType,
+      payload: event.payload ?? {},
+      workspaceId: rustEventWorkspaceId(event),
+      sessionId: rustEventSessionId(event),
+      taskId: rustEventTaskId(event),
+      rootTaskIds: rustTaskEventRootTaskIds(event),
+    } as ClientBridgeMessage);
 
     if (eventType === 'task.status.changed' && event.payload) {
       emitDataMessage('taskStatusChanged', {
