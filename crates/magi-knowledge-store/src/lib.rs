@@ -204,7 +204,7 @@ impl KnowledgeStore {
 
         let mut engine =
             LocalSearchEngine::new(&root.to_string_lossy(), SearchEngineConfig::default());
-        engine.build_index(&files, summary.last_indexed);
+        engine.build_index_with_summary(&files, summary.clone());
 
         self.search_engines
             .write()
@@ -552,7 +552,7 @@ impl KnowledgeStore {
             .expect("knowledge store search engines read lock poisoned")
             .get(workspace_id)
             .cloned()?;
-        let engine = engine.lock().expect("search engine mutex poisoned");
+        let mut engine = engine.lock().expect("search engine mutex poisoned");
         engine.is_ready().then(|| engine.code_index_summary())
     }
 

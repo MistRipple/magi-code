@@ -104,6 +104,7 @@ pub struct LocalSearchEngine {
     index_cache_status: &'static str,
     index_cache_error_code: Option<&'static str>,
     last_indexed: Option<u64>,
+    cached_code_index_summary: Option<crate::code_scanner::CodeIndexSummary>,
     project_vocabulary_dirty: bool,
     recent_edited_files: HashMap<String, u64>,
 }
@@ -128,6 +129,7 @@ impl LocalSearchEngine {
             index_cache_status: INDEX_CACHE_STATUS_READY,
             index_cache_error_code: None,
             last_indexed: None,
+            cached_code_index_summary: None,
             project_vocabulary_dirty: true,
             recent_edited_files: HashMap::new(),
         }
@@ -138,8 +140,26 @@ impl LocalSearchEngine {
     }
 
     pub fn build_index(&mut self, files: &[(String, String)], last_indexed: u64) {
+        self.build_index_inner(files, last_indexed, None);
+    }
+
+    pub fn build_index_with_summary(
+        &mut self,
+        files: &[(String, String)],
+        summary: crate::code_scanner::CodeIndexSummary,
+    ) {
+        self.build_index_inner(files, summary.last_indexed, Some(summary));
+    }
+
+    fn build_index_inner(
+        &mut self,
+        files: &[(String, String)],
+        last_indexed: u64,
+        cached_summary: Option<crate::code_scanner::CodeIndexSummary>,
+    ) {
         self.indexed_files = files.to_vec();
         self.last_indexed = Some(last_indexed);
+        self.cached_code_index_summary = cached_summary;
 
         let restore_result = self.persistence.load();
         if let Some(snapshot) = restore_result {
@@ -456,7 +476,10 @@ impl LocalSearchEngine {
         }
     }
 
-    pub fn code_index_summary(&self) -> crate::code_scanner::CodeIndexSummary {
+    pub fn code_index_summary(&mut self) -> crate::code_scanner::CodeIndexSummary {
+        if let Some(summary) = self.cached_code_index_summary.clone() {
+            return summary;
+        }
         let mut summary = crate::code_scanner::code_index_summary_from_relative_files(
             Path::new(&self.project_root),
             &self.indexed_files,
@@ -464,6 +487,7 @@ impl LocalSearchEngine {
         if let Some(last_indexed) = self.last_indexed {
             summary.last_indexed = last_indexed;
         }
+        self.cached_code_index_summary = Some(summary.clone());
         summary
     }
 
@@ -571,6 +595,7 @@ impl LocalSearchEngine {
         self.record_recent_edit(relative_path);
         self.project_vocabulary_dirty = true;
         self.last_indexed = Some(now_millis());
+        self.cached_code_index_summary = None;
         self.search_cache.invalidate_by_file(relative_path);
     }
 
@@ -585,6 +610,7 @@ impl LocalSearchEngine {
         self.dependency_graph.remove_file(relative_path);
         self.search_cache.invalidate_by_file(relative_path);
         self.last_indexed = Some(now_millis());
+        self.cached_code_index_summary = None;
     }
 
     fn remove_stale_indexed_file(&mut self, relative_path: &str) {
