@@ -41,7 +41,7 @@ use crate::{
     task_execution_registry::{SpawnedChildExecutionRequest, TaskExecutionRegistry},
     task_helpers::{task_can_see_builtin_tool, task_is_long_mission},
     tool_declared_paths::{append_result_declared_paths, derive_declared_paths},
-    tool_result_utils::tool_execution_status_label,
+    tool_result_utils::{safety_gate_public_error, tool_execution_status_label},
 };
 use crate::{
     active_skill_tool_execution_policy, execute_skill_custom_tool, parse_skill_custom_tool_name,
@@ -2049,16 +2049,22 @@ fn safety_gate_decision_payload(
     pattern: String,
     reason: String,
 ) -> ToolPreflightDecision {
+    let public_error = safety_gate_public_error(status);
+    tracing::warn!(
+        tool_name,
+        status = %tool_execution_status_label(status),
+        category = category.as_str(),
+        action = action.as_str(),
+        pattern = %pattern,
+        reason = %reason,
+        "tool preflight safety gate decision"
+    );
     ToolPreflightDecision {
         payload: serde_json::json!({
             "tool": tool_name,
             "status": tool_execution_status_label(status),
-            "error": reason,
-            "safety_gate": {
-                "category": category.as_str(),
-                "pattern": pattern,
-                "action": action.as_str(),
-            },
+            "error_code": public_error.error_code,
+            "error": public_error.error,
         })
         .to_string(),
         status,
@@ -3000,7 +3006,17 @@ mod tests {
 
         assert_eq!(decision.status, ExecutionResultStatus::NeedsApproval);
         assert_eq!(payload["status"].as_str(), Some("needs_approval"));
-        assert_eq!(payload["safety_gate"]["category"].as_str(), Some("custom"));
+        assert_eq!(
+            payload["error_code"].as_str(),
+            Some("tool_safety_needs_approval")
+        );
+        assert_eq!(
+            payload["error"].as_str(),
+            Some("该操作触发安全防护，需要批准后执行")
+        );
+        assert!(payload.get("safety_gate").is_none());
+        assert!(!decision.payload.contains("deploy-prod"));
+        assert!(!decision.payload.contains("custom"));
     }
 
     #[test]
@@ -3039,6 +3055,12 @@ mod tests {
         .expect("hard block must reject even in full access");
 
         assert_eq!(decision.status, ExecutionResultStatus::Rejected);
+        let payload: serde_json::Value =
+            serde_json::from_str(&decision.payload).expect("decision should be json");
+        assert_eq!(payload["error_code"].as_str(), Some("tool_safety_rejected"));
+        assert_eq!(payload["error"].as_str(), Some("该操作已被安全防护阻止"));
+        assert!(payload.get("safety_gate").is_none());
+        assert!(!decision.payload.contains("destroy-everything"));
     }
 
     #[test]
@@ -3072,10 +3094,11 @@ mod tests {
             serde_json::from_str(&selected.payload).expect("decision should be json");
 
         assert_eq!(selected.status, ExecutionResultStatus::Rejected);
-        assert_eq!(
-            payload["safety_gate"]["action"].as_str(),
-            Some("hard_block")
-        );
+        assert_eq!(payload["error_code"].as_str(), Some("tool_safety_rejected"));
+        assert_eq!(payload["error"].as_str(), Some("该操作已被安全防护阻止"));
+        assert!(payload.get("safety_gate").is_none());
+        assert!(!selected.payload.contains("destroy-everything"));
+        assert!(!selected.payload.contains("hard_block"));
     }
 
     #[test]

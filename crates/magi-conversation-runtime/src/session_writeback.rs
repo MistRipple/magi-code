@@ -1585,7 +1585,12 @@ mod tests {
         assert_eq!(status, ExecutionResultStatus::Rejected);
         let parsed: serde_json::Value = serde_json::from_str(&payload).expect("payload json");
         assert_eq!(parsed["status"], "rejected");
-        assert_eq!(parsed["safety_gate"]["action"], "hard_block");
+        assert_eq!(parsed["error_code"], "tool_safety_rejected");
+        assert_eq!(parsed["error"], "该操作已被安全防护阻止");
+        assert_eq!(parsed.get("safety_gate"), None);
+        assert!(!payload.contains("rm -rf"));
+        assert!(!payload.contains("bulk_delete"));
+        assert!(!payload.contains("hard_block"));
         assert!(mcp_calls.lock().expect("mcp calls lock").is_empty());
     }
 
@@ -1860,7 +1865,11 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&payload).expect("payload json");
         assert_eq!(parsed["tool"], "shell_exec");
         assert_eq!(parsed["status"], "needs_approval");
-        assert_eq!(parsed["safety_gate"]["pattern"], "rm -rf");
+        assert_eq!(parsed["error_code"], "tool_safety_needs_approval");
+        assert_eq!(parsed["error"], "该操作触发安全防护，需要批准后执行");
+        assert_eq!(parsed.get("safety_gate"), None);
+        assert!(!payload.contains("rm -rf"));
+        assert!(!payload.contains("bulk_delete"));
     }
 
     #[test]

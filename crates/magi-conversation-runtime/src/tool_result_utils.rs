@@ -4,6 +4,12 @@
 
 use magi_core::ExecutionResultStatus;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PublicToolError {
+    pub error_code: &'static str,
+    pub error: &'static str,
+}
+
 pub fn tool_execution_status_label(status: ExecutionResultStatus) -> &'static str {
     match status {
         ExecutionResultStatus::Succeeded => "succeeded",
@@ -11,6 +17,23 @@ pub fn tool_execution_status_label(status: ExecutionResultStatus) -> &'static st
         ExecutionResultStatus::Rejected => "rejected",
         ExecutionResultStatus::NeedsApproval => "needs_approval",
         ExecutionResultStatus::Cancelled => "cancelled",
+    }
+}
+
+pub fn safety_gate_public_error(status: ExecutionResultStatus) -> PublicToolError {
+    match status {
+        ExecutionResultStatus::NeedsApproval => PublicToolError {
+            error_code: "tool_safety_needs_approval",
+            error: "该操作触发安全防护，需要批准后执行",
+        },
+        ExecutionResultStatus::Rejected => PublicToolError {
+            error_code: "tool_safety_rejected",
+            error: "该操作已被安全防护阻止",
+        },
+        _ => PublicToolError {
+            error_code: "tool_safety_failed",
+            error: "该操作暂不可用",
+        },
     }
 }
 

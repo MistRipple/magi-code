@@ -8,6 +8,8 @@ use magi_skill_runtime::{
 use magi_tool_runtime::{ToolExecutionContext, ToolExecutionPolicy};
 use serde_json::Value;
 
+use crate::tool_result_utils::{safety_gate_public_error, tool_execution_status_label};
+
 const SKILL_CUSTOM_TOOL_PREFIX: &str = "skill";
 const SKILL_TOOL_UNAVAILABLE_PUBLIC_ERROR: &str = "Skill 工具暂不可用，请稍后重试";
 const SKILL_TOOL_CONFIG_PUBLIC_ERROR: &str = "Skill 工具配置不可用，请重新加载该 Skill";
@@ -544,23 +546,25 @@ fn custom_tool_safety_payload(
     pattern: String,
     reason: String,
 ) -> (String, ExecutionResultStatus) {
+    let status_label = tool_execution_status_label(status);
+    let public_error = safety_gate_public_error(status);
+    tracing::warn!(
+        tool_name,
+        skill_name,
+        status = status_label,
+        category = category.as_str(),
+        action = action.as_str(),
+        pattern = %pattern,
+        reason = %reason,
+        "skill custom tool safety gate decision"
+    );
     (
         serde_json::json!({
             "tool": tool_name,
-            "status": match status {
-                ExecutionResultStatus::Succeeded => "succeeded",
-                ExecutionResultStatus::Failed => "failed",
-                ExecutionResultStatus::Rejected => "rejected",
-                ExecutionResultStatus::NeedsApproval => "needs_approval",
-                ExecutionResultStatus::Cancelled => "cancelled",
-            },
+            "status": status_label,
             "skill_name": skill_name,
-            "error": reason,
-            "safety_gate": {
-                "category": category.as_str(),
-                "pattern": pattern,
-                "action": action.as_str(),
-            },
+            "error_code": public_error.error_code,
+            "error": public_error.error,
         })
         .to_string(),
         status,
@@ -910,6 +914,72 @@ mod tests {
         assert_eq!(parsed["error"], SKILL_TOOL_POLICY_PUBLIC_ERROR);
         assert_eq!(parsed.get("bridge_target"), None);
         assert_eq!(parsed.get("bridge_kind"), None);
+    }
+
+    #[test]
+    fn custom_skill_tool_safety_gate_uses_public_error() {
+        let registry = SkillRegistry::new();
+        registry.register(SkillDefinition {
+            skill_id: "mcp-skill".to_string(),
+            title: "MCP Skill".to_string(),
+            instruction: "调用外接能力。".to_string(),
+            metadata: SkillMetadata {
+                category: "integration".to_string(),
+                tags: vec!["mcp".to_string()],
+            },
+            allowed_tools: vec![],
+            custom_tool_bindings: vec![CustomToolBinding {
+                binding_id: "inspect".to_string(),
+                tool_name: "echo.inspect".to_string(),
+                description: "检查输入".to_string(),
+                bridge_kind: BridgeBindingKind::Mcp,
+                dispatch_action: BridgeDispatchAction::McpToolCall,
+                bridge_target: "loopback-mcp".to_string(),
+            }],
+            prompt_priority: 50,
+        });
+        let skill_runtime = SkillRuntime::new(registry);
+        let dispatch_runtime = dispatch_runtime();
+        let safety_gate =
+            magi_safety_gate::SafetyGate::new(vec![magi_safety_gate::SafetyRule::with_action(
+                "rm -rf",
+                magi_safety_gate::SafetyCategory::BulkDelete,
+                magi_safety_gate::SafetyAction::HardBlock,
+            )]);
+
+        let (payload, status) = execute_skill_custom_tool(
+            &ChatToolCall {
+                id: "skill-tool-call-safety".to_string(),
+                kind: "function".to_string(),
+                function: ChatToolFunction {
+                    name: "skill__mcp-skill__inspect".to_string(),
+                    arguments:
+                        serde_json::json!({ "payload": r#"{"command":"rm -rf /tmp/demo"}"# })
+                            .to_string(),
+                },
+            },
+            "mcp-skill",
+            "inspect",
+            Some("mcp-skill"),
+            tool_execution_policy_scope(AccessProfile::FullAccess, "", &[], &[]),
+            Some(&safety_gate),
+            Some(&skill_runtime),
+            Some(&dispatch_runtime),
+            ToolExecutionContext::default(),
+            None,
+        );
+
+        assert_eq!(status, ExecutionResultStatus::Rejected);
+        let parsed: Value = serde_json::from_str(&payload).expect("payload should be json");
+        assert_eq!(parsed["status"], "rejected");
+        assert_eq!(parsed["tool"], "skill__mcp-skill__inspect");
+        assert_eq!(parsed["error_code"], "tool_safety_rejected");
+        assert_eq!(parsed["error"], "该操作已被安全防护阻止");
+        assert_eq!(parsed.get("safety_gate"), None);
+        assert!(!payload.contains("rm -rf"));
+        assert!(!payload.contains("bulk_delete"));
+        assert!(!payload.contains("hard_block"));
+        assert!(!payload.contains("loopback-mcp"));
     }
 
     #[test]
