@@ -153,7 +153,7 @@ async fn get_diff(
     Query(query): Query<DiffQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // 没有 sessionId 时不再回退到 git diff —— 全局变更视图已不再属于本系统职责。
-    let (diff, binding, pending_changes_state) = match query
+    let (diff, binding, pending_changes_state, file_detail) = match query
         .session_id
         .as_deref()
         .map(str::trim)
@@ -180,14 +180,23 @@ async fn get_diff(
                 pending.len(),
                 None,
             );
-            let diff = match query.file_path.as_deref() {
+            let (diff, file_detail) = match query.file_path.as_deref() {
                 Some(fp) => {
                     let rel = safe_relative_path(fp)?;
-                    pending
-                        .iter()
-                        .find(|c| c.path == rel)
+                    let change = pending.iter().find(|c| c.path == rel);
+                    let diff = change
                         .and_then(|c| c.unified_diff.clone())
-                        .unwrap_or_default()
+                        .unwrap_or_default();
+                    let file_detail = change.map(|change| {
+                        let current_path = scope.workspace_root.join(&change.path);
+                        serde_json::json!({
+                            "originalContent": change.original_content.clone(),
+                            "currentContent": change.preview_content.clone(),
+                            "currentAbsolutePath": workspace_path_string(&current_path),
+                            "currentExists": current_path.is_file(),
+                        })
+                    });
+                    (diff, file_detail)
                 }
                 None => {
                     let exec_group = query
@@ -197,7 +206,7 @@ async fn get_diff(
                         .filter(|value| !value.is_empty())
                         .map(|s| s.to_string())
                         .unwrap_or_else(|| scope.execution_group_id.clone());
-                    pending
+                    let diff = pending
                         .iter()
                         .filter(|c| {
                             c.execution_group_id
@@ -207,10 +216,16 @@ async fn get_diff(
                         })
                         .filter_map(|c| c.unified_diff.clone())
                         .collect::<Vec<_>>()
-                        .join("\n")
+                        .join("\n");
+                    (diff, None)
                 }
             };
-            (diff, session_scope_binding(&scope), pending_state)
+            (
+                diff,
+                session_scope_binding(&scope),
+                pending_state,
+                file_detail,
+            )
         }
         None => {
             // 无 session 调用：仅做一次 workspace 校验，统一返回空 diff，
@@ -232,6 +247,7 @@ async fn get_diff(
                 String::new(),
                 workspace_scope_binding(&scope),
                 pending_state,
+                None,
             )
         }
     };
@@ -244,6 +260,11 @@ async fn get_diff(
         && let Some(binding) = binding.as_object()
     {
         object.extend(binding.clone());
+    }
+    if let Some(object) = payload.as_object_mut()
+        && let Some(detail) = file_detail.and_then(|value| value.as_object().cloned())
+    {
+        object.extend(detail);
     }
     Ok(Json(payload))
 }
@@ -1516,6 +1537,11 @@ mod tests {
             diff.contains("+alpha changed"),
             "diff should contain new line marker: {}",
             diff
+        );
+        assert_eq!(payload["originalContent"], serde_json::json!("alpha\n"));
+        assert_eq!(
+            payload["currentContent"],
+            serde_json::json!("alpha changed\n")
         );
     }
 

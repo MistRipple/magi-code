@@ -63,8 +63,11 @@ pub struct PendingChangeDto {
     pub r#type: String,
     pub additions: usize,
     pub deletions: usize,
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub diff: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub original_content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub preview_content: Option<String>,
     pub preview_absolute_path: String,
     pub preview_can_open_workspace_file: bool,
@@ -314,8 +317,7 @@ fn convert_pending(scope: &SessionChangeScope, change: PendingChange) -> Pending
         ChangeKind::Added | ChangeKind::Modified | ChangeKind::Renamed
     ) && absolute_path.is_file();
 
-    let unified_diff = change.unified_diff.clone().unwrap_or_default();
-    let (additions, deletions) = count_diff_lines(&unified_diff);
+    let (additions, deletions) = count_diff_lines(change.unified_diff.as_deref().unwrap_or(""));
     let r#type = change_kind_to_string(change.change_kind);
     let content_kind = content_kind_to_string(change.content_kind);
     let source_kind = source_kind_to_string(change.source);
@@ -330,9 +332,9 @@ fn convert_pending(scope: &SessionChangeScope, change: PendingChange) -> Pending
         r#type,
         additions,
         deletions,
-        diff: unified_diff,
-        original_content: change.original_content,
-        preview_content: change.preview_content,
+        diff: String::new(),
+        original_content: None,
+        preview_content: None,
         preview_absolute_path: absolute_path.to_string_lossy().to_string(),
         preview_can_open_workspace_file,
         content_kind,
@@ -773,6 +775,50 @@ mod tests {
         let value = serde_json::to_value(dto).expect("pending change dto should serialize");
         assert_eq!(value["hasError"], serde_json::json!(true));
         assert!(value.get("error").is_none());
+    }
+
+    #[test]
+    fn pending_change_summary_omits_heavy_payload() {
+        let scope = SessionChangeScope {
+            session_id: SessionId::new("session-change-summary"),
+            workspace_id: WorkspaceId::new("workspace-change-summary"),
+            workspace_root: unique_temp_dir("magi-change-projection-summary"),
+            execution_group_id: "execution-summary".to_string(),
+            contributors: Vec::new(),
+        };
+        let dto = convert_pending(
+            &scope,
+            PendingChange {
+                path: "summary.txt".to_string(),
+                change_kind: ChangeKind::Modified,
+                old_path: None,
+                source: SourceKind::Tool,
+                tool_call_id: None,
+                worker_id: None,
+                execution_group_id: None,
+                content_kind: ContentKind::Text,
+                size: 16,
+                mime: Some("text/plain".to_string()),
+                error: None,
+                symlink_target: None,
+                original_content: Some("old\n".to_string()),
+                preview_content: Some("new\n".to_string()),
+                head_summary: None,
+                tail_summary: None,
+                unified_diff: Some("@@ -1 +1 @@\n-old\n+new\n".to_string()),
+                timestamp_ms: 1,
+            },
+        );
+
+        assert_eq!(dto.additions, 1);
+        assert_eq!(dto.deletions, 1);
+        assert!(dto.diff.is_empty());
+        assert!(dto.original_content.is_none());
+        assert!(dto.preview_content.is_none());
+        let value = serde_json::to_value(dto).expect("summary dto should serialize");
+        assert!(value.get("diff").is_none());
+        assert!(value.get("originalContent").is_none());
+        assert!(value.get("previewContent").is_none());
     }
 
     #[test]

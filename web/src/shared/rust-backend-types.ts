@@ -1193,6 +1193,10 @@ export interface DiffResponseDto {
   workspaceId: string;
   workspacePath: string;
   executionGroupId?: string | null;
+  originalContent?: string | null;
+  currentContent?: string | null;
+  currentAbsolutePath?: string | null;
+  currentExists?: boolean;
   pendingChangesState?: unknown;
 }
 

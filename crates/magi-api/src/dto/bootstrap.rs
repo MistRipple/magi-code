@@ -950,6 +950,64 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn bootstrap_pending_changes_uses_summary_payload() {
+        let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(32));
+        let session_store = Arc::new(SessionStore::default());
+        let workspace_store = Arc::new(WorkspaceStore::default());
+        let governance = Arc::new(GovernanceService::default());
+        let workspace_root = std::env::temp_dir().join(format!(
+            "magi-bootstrap-pending-summary-{}",
+            UtcMillis::now().0
+        ));
+        fs::create_dir_all(&workspace_root).expect("workspace root should create");
+        fs::write(workspace_root.join("alpha.txt"), "alpha\n").expect("baseline file should write");
+        workspace_store
+            .register(
+                WorkspaceId::new("workspace-pending-summary"),
+                AbsolutePath::new(workspace_root.to_string_lossy().to_string()),
+            )
+            .expect("workspace should register");
+        let state = ApiState::new(
+            "magi",
+            event_bus,
+            session_store.clone(),
+            workspace_store,
+            governance,
+        );
+
+        let session_id = SessionId::new("session-pending-summary");
+        session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "Pending Summary",
+                Some("workspace-pending-summary".to_string()),
+            )
+            .expect("session should be creatable");
+        let snapshot = state
+            .snapshot_manager
+            .start_session(session_id.as_str().to_string(), workspace_root.clone())
+            .await
+            .expect("snapshot should start");
+        fs::write(workspace_root.join("alpha.txt"), "alpha changed\n")
+            .expect("changed file should write");
+        snapshot.reconcile().expect("snapshot should reconcile");
+
+        let bootstrap = BootstrapDto::from_state_with_selected_session(&state, Some(&session_id))
+            .expect("bootstrap should build");
+
+        assert_eq!(bootstrap.pending_changes.len(), 1);
+        let change = &bootstrap.pending_changes[0];
+        assert_eq!(change.file_path, "alpha.txt");
+        assert_eq!(change.additions, 1);
+        assert_eq!(change.deletions, 1);
+        assert!(change.diff.is_empty());
+        assert!(change.original_content.is_none());
+        assert!(change.preview_content.is_none());
+
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
     #[test]
     fn bootstrap_marks_pending_changes_not_ready_when_snapshot_session_is_missing() {
         let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(32));

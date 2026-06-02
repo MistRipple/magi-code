@@ -403,8 +403,8 @@ export interface AgentChangeDiffPayload {
   executionGroupId?: string | null;
   additions?: number;
   deletions?: number;
-  originalContent?: string;
-  currentContent?: string;
+  originalContent?: string | null;
+  currentContent?: string | null;
   currentAbsolutePath?: string;
   currentExists?: boolean;
   pendingChangesState?: unknown;

@@ -7,7 +7,7 @@
   import type { IconName } from '../lib/icons';
   import Icon from './Icon.svelte';
   import { i18n } from '../stores/i18n.svelte';
-  import { isWebAgentMode } from '../web/agent-api';
+  import { getAgentChangeDiff, isWebAgentMode } from '../web/agent-api';
 
   const appState = getState();
   const isWebMode = isWebAgentMode();
@@ -128,13 +128,48 @@
     return null;
   }
 
+  function hasInlineChangeDetail(edit: Edit): boolean {
+    return (
+      (typeof edit.diff === 'string' && edit.diff.trim().length > 0)
+      || (typeof edit.previewContent === 'string' && edit.previewContent.length > 0)
+      || (typeof edit.originalContent === 'string' && edit.originalContent.length > 0)
+    );
+  }
+
+  async function loadChangeDetail(edit: Edit, scope: ReturnType<typeof editScope>): Promise<Edit> {
+    if (hasInlineChangeDetail(edit)) {
+      return edit;
+    }
+    if (edit.contentKind && edit.contentKind !== 'text' && edit.contentKind !== 'large_text') {
+      return edit;
+    }
+    try {
+      const detail = await getAgentChangeDiff(edit.filePath, scope);
+      return {
+        ...edit,
+        diff: typeof detail.diff === 'string' ? detail.diff : edit.diff,
+        originalContent:
+          typeof detail.originalContent === 'string'
+            ? detail.originalContent
+            : edit.originalContent,
+        previewContent:
+          typeof detail.currentContent === 'string'
+            ? detail.currentContent
+            : edit.previewContent,
+      };
+    } catch (error) {
+      console.warn('[EditsPanel] change detail load failed:', error);
+      return edit;
+    }
+  }
+
   /**
    * 点击文件行：
    * - Web 模式：把变更推到全局右侧 RightPane 的 code tab（携带 diff 与文件元信息），由 RightPane 负责展示与切换
    * - VS Code host：沿用 host 的 diff 编辑器（postMessage 给 extension）
    * EditsPanel 自身不再承担 diff 预览职责，避免与 RightPane 双轨实现
    */
-  function viewDiff(edit: Edit) {
+  async function viewDiff(edit: Edit) {
     if (!isWebMode) {
       vscode.postMessage({
         type: 'viewDiff',
@@ -158,19 +193,20 @@
       return;
     }
     const scope = editScope(edit);
-    openCodeTab(scope.sessionId, edit.filePath, {
+    const detail = await loadChangeDetail(edit, scope);
+    openCodeTab(scope.sessionId, detail.filePath, {
       ...scope,
-      diff: synthesizeDiff(edit),
+      diff: synthesizeDiff(detail),
       content:
-        typeof edit.previewContent === 'string' && edit.previewContent.length > 0
-          ? edit.previewContent
-          : (typeof edit.originalContent === 'string' ? edit.originalContent : null),
-      contentKind: edit.contentKind,
-      size: edit.size,
-      mime: edit.mime,
-      symlinkTarget: edit.symlinkTarget,
-      headSummary: edit.headSummary,
-      tailSummary: edit.tailSummary,
+        typeof detail.previewContent === 'string' && detail.previewContent.length > 0
+          ? detail.previewContent
+          : (typeof detail.originalContent === 'string' ? detail.originalContent : null),
+      contentKind: detail.contentKind,
+      size: detail.size,
+      mime: detail.mime,
+      symlinkTarget: detail.symlinkTarget,
+      headSummary: detail.headSummary,
+      tailSummary: detail.tailSummary,
     });
   }
 
