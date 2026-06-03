@@ -60,6 +60,9 @@ export interface SessionTurnResponseDto {
   executionChainRef?: string | null;
   /** 后端生成的用户消息 turnItemId，前端应使用此 ID 创建 canonical 节点 */
   userMessageItemId?: string | null;
+  queued?: boolean;
+  queueId?: string | null;
+  queuePosition?: number | null;
   /** 仅在 supplement_context 路由下返回：本次入栈的 mailbox signal ID。 */
   signalRef?: string | null;
   /** 仅在 supplement_context 路由下返回：被投递的任务 ID。 */

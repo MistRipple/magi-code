@@ -18,14 +18,18 @@ pub fn finalize_background_session_task_turn_if_root_completed(
     root_task_id: &TaskId,
 ) -> bool {
     let persist_session_state = session_state_persist_callback(state);
-    magi_conversation_runtime::session_turn_finalize::finalize_background_session_task_turn_if_root_completed(
+    let finalized = magi_conversation_runtime::session_turn_finalize::finalize_background_session_task_turn_if_root_completed(
         state.session_store.as_ref(),
         &state.event_bus,
         state.task_store(),
         session_id,
         root_task_id,
         Some(persist_session_state.as_ref()),
-    )
+    );
+    if finalized {
+        schedule_next_queued_session_turn(state, session_id);
+    }
+    finalized
 }
 
 pub fn finalize_background_session_task_turn_if_root_terminal(
@@ -35,7 +39,7 @@ pub fn finalize_background_session_task_turn_if_root_terminal(
     runner_status: &str,
 ) -> bool {
     let persist_session_state = session_state_persist_callback(state);
-    magi_conversation_runtime::session_turn_finalize::finalize_background_session_task_turn_if_root_terminal(
+    let finalized = magi_conversation_runtime::session_turn_finalize::finalize_background_session_task_turn_if_root_terminal(
         state.session_store.as_ref(),
         &state.event_bus,
         state.task_store(),
@@ -43,7 +47,23 @@ pub fn finalize_background_session_task_turn_if_root_terminal(
         root_task_id,
         runner_status,
         Some(persist_session_state.as_ref()),
-    )
+    );
+    if finalized {
+        schedule_next_queued_session_turn(state, session_id);
+    }
+    finalized
+}
+
+fn schedule_next_queued_session_turn(state: &ApiState, session_id: &SessionId) {
+    let workspace_id = state
+        .session_store
+        .execution_ownership(session_id)
+        .and_then(|ownership| ownership.workspace_id);
+    crate::routes::sessions::schedule_next_queued_regular_session_turn(
+        state.clone(),
+        session_id.clone(),
+        workspace_id,
+    );
 }
 
 pub fn reconcile_terminal_session_task_turns(state: &ApiState) -> usize {

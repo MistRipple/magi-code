@@ -139,6 +139,11 @@ pub struct SessionTurnResponseDto {
     pub execution_chain_ref: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_message_item_id: Option<String>,
+    pub queued: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queue_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queue_position: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub canonical_schema_version: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -179,6 +184,9 @@ impl SessionTurnResponseDto {
             action_task_id: action_task_id.map(|task_id| task_id.to_string()),
             execution_chain_ref,
             user_message_item_id,
+            queued: false,
+            queue_id: None,
+            queue_position: None,
             canonical_schema_version: None,
             canonical_event_kind: None,
             canonical_turn: None,
@@ -186,6 +194,13 @@ impl SessionTurnResponseDto {
             signal_ref: None,
             target_task_id: None,
         }
+    }
+
+    pub fn with_queued(mut self, queue_id: String, queue_position: usize) -> Self {
+        self.queued = true;
+        self.queue_id = Some(queue_id);
+        self.queue_position = Some(queue_position);
+        self
     }
 
     pub fn with_supplement_signal(mut self, signal_ref: String, target_task_id: String) -> Self {

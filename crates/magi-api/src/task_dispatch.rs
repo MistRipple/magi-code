@@ -14,9 +14,8 @@ pub fn submit_dispatch_submission(
     state: &ApiState,
     request: DispatchSubmissionRequest,
 ) -> Result<DispatchSubmissionAccepted, ApiError> {
-    ensure_dispatch_submission_acceptance_available(&state.session_store, &request).map_err(
-        |error| ApiError::internal_assembly("检查任务派发接受条件失败", error.message()),
-    )?;
+    ensure_dispatch_submission_acceptance_available(&state.session_store, &request)
+        .map_err(dispatch_accept_error_to_api_error)?;
     let task_store = state
         .task_store()
         .ok_or_else(|| ApiError::internal_assembly("构建任务派发运行时", "task_store 未配置"))?;

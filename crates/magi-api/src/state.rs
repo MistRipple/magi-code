@@ -3,7 +3,8 @@ use crate::dto::{
     BridgeCutoverSmokeSnapshotProvider, BridgePreflightProvider, BridgePreflightSnapshotDto,
     BridgePreflightSnapshotProvider, BridgeProbeSnapshotProvider, BridgeServicesSnapshotDto,
     BridgeSnapshotProvider, DirectHttpModelProbeConfig, HealthDto, MissionAggregateExport,
-    RuntimeReadModelDto, ServiceInfo, VersionHandshakeDto, runtime_read_model_dto,
+    RuntimeReadModelDto, ServiceInfo, SessionTurnRequestDto, SessionTurnRouteDto,
+    VersionHandshakeDto, runtime_read_model_dto,
 };
 use crate::errors::ApiError;
 use crate::mcp_config::{
@@ -23,6 +24,7 @@ use magi_bridge_client::{
 };
 use magi_conversation_runtime::{
     ConversationRegistry,
+    session_images::SessionTurnImage,
     task_execution_dispatcher::{ExecutionPipeline, LlmTaskDispatcher},
     task_execution_registry::TaskExecutionRegistry,
     task_runner::TaskRunner,
@@ -32,7 +34,7 @@ use magi_conversation_runtime::{
     },
 };
 use magi_core::{
-    SessionId, SessionLifecycleStatus, TaskId, TaskStatus, UtcMillis, WorkspaceId,
+    SessionId, SessionLifecycleStatus, TaskId, TaskStatus, TaskTier, UtcMillis, WorkspaceId,
     WorkspaceRootPath,
 };
 use magi_event_bus::InMemoryEventBus;
@@ -52,7 +54,7 @@ use magi_tool_runtime::{
     ToolExecutionContextQuery, ToolRegistry,
 };
 use magi_workspace::WorkspaceStore;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -76,6 +78,39 @@ pub struct RunnerHandle {
 
 type RunnerTerminalObserver = Arc<dyn Fn(TaskId, Option<SessionId>, String) + Send + Sync>;
 pub type SessionStateCheckpointPersist = Arc<dyn Fn(&str) -> Result<(), ApiError> + Send + Sync>;
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct SessionTurnQueueKey {
+    session_id: SessionId,
+    workspace_id: Option<WorkspaceId>,
+}
+
+impl SessionTurnQueueKey {
+    fn new(session_id: &SessionId, workspace_id: Option<&WorkspaceId>) -> Self {
+        Self {
+            session_id: session_id.clone(),
+            workspace_id: workspace_id.cloned(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct QueuedRegularSessionTurn {
+    pub request: SessionTurnRequestDto,
+    pub images: Vec<SessionTurnImage>,
+    pub requested_workspace_id: WorkspaceId,
+    pub accepted_at: UtcMillis,
+    pub route: SessionTurnRouteDto,
+    pub task_title: Option<String>,
+    pub execution_goal: Option<String>,
+    pub task_tier: TaskTier,
+    pub tool_intent: Option<String>,
+    pub forced_tool_name: Option<String>,
+    pub required_tool_chain: Vec<String>,
+    pub session_id: SessionId,
+    pub workspace_id: Option<WorkspaceId>,
+    pub queue_id: String,
+}
 
 pub(crate) fn session_has_user_content(session: &SessionRecord) -> bool {
     session.message_count.unwrap_or(0) > 0
@@ -561,6 +596,8 @@ pub struct ApiState {
     /// 任务系统 — L5：父子任务关系图，作为 task_dispatch 中
     /// "parent_task_id 散落查询"的统一上层。同一进程共享。
     pub spawn_graph: Arc<Mutex<magi_spawn_graph::SpawnGraph>>,
+    session_turn_queue:
+        Arc<Mutex<HashMap<SessionTurnQueueKey, VecDeque<QueuedRegularSessionTurn>>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -807,6 +844,7 @@ impl ApiState {
             conversation_registry: Arc::new(ConversationRegistry::new()),
             agent_role_registry: Arc::new(magi_agent_role::AgentRoleRegistry::load_default()),
             spawn_graph: Arc::new(Mutex::new(magi_spawn_graph::SpawnGraph::new())),
+            session_turn_queue: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1564,6 +1602,49 @@ impl ApiState {
 
     pub fn session_turn_dispatcher(&self) -> Option<&Arc<LlmTaskDispatcher>> {
         self.session_turn_dispatcher.as_ref()
+    }
+
+    pub(crate) fn enqueue_regular_session_turn(&self, turn: QueuedRegularSessionTurn) -> usize {
+        let key = SessionTurnQueueKey::new(&turn.session_id, turn.workspace_id.as_ref());
+        let mut queues = self
+            .session_turn_queue
+            .lock()
+            .expect("session turn queue lock poisoned");
+        let queue = queues.entry(key).or_default();
+        queue.push_back(turn);
+        queue.len()
+    }
+
+    pub(crate) fn pop_next_regular_session_turn(
+        &self,
+        session_id: &SessionId,
+        workspace_id: Option<&WorkspaceId>,
+    ) -> Option<QueuedRegularSessionTurn> {
+        let key = SessionTurnQueueKey::new(session_id, workspace_id);
+        let mut queues = self
+            .session_turn_queue
+            .lock()
+            .expect("session turn queue lock poisoned");
+        let queue = queues.get_mut(&key)?;
+        let next = queue.pop_front();
+        if queue.is_empty() {
+            queues.remove(&key);
+        }
+        next
+    }
+
+    pub(crate) fn clear_regular_session_turn_queue(
+        &self,
+        session_id: &SessionId,
+        workspace_id: Option<&WorkspaceId>,
+    ) -> usize {
+        let key = SessionTurnQueueKey::new(session_id, workspace_id);
+        self.session_turn_queue
+            .lock()
+            .expect("session turn queue lock poisoned")
+            .remove(&key)
+            .map(|queue| queue.len())
+            .unwrap_or(0)
     }
 
     pub fn with_model_bridge_client(mut self, client: Arc<dyn ModelBridgeClient>) -> Self {

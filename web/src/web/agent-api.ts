@@ -435,6 +435,9 @@ export interface AgentSessionTurnResult {
   executionChainRef?: string | null;
   /** 后端生成的 canonical 用户消息 item ID。 */
   userMessageItemId?: string | null;
+  queued?: boolean;
+  queueId?: string | null;
+  queuePosition?: number | null;
   canonicalSchemaVersion?: string | null;
   canonicalEventKind?: string | null;
   canonicalTurn?: CanonicalTurn | null;
@@ -1269,6 +1272,9 @@ export async function submitSessionTurn(
       actionTaskId?: string | null;
       executionChainRef?: string | null;
       userMessageItemId?: string | null;
+      queued?: boolean;
+      queueId?: string | null;
+      queuePosition?: number | null;
       canonicalSchemaVersion?: string | null;
       canonicalEventKind?: string | null;
       canonicalTurn?: CanonicalTurn | null;
@@ -1292,6 +1298,13 @@ export async function submitSessionTurn(
         : null,
       userMessageItemId: typeof raw.userMessageItemId === 'string' && raw.userMessageItemId.trim()
         ? raw.userMessageItemId.trim()
+        : null,
+      queued: raw.queued === true,
+      queueId: typeof raw.queueId === 'string' && raw.queueId.trim()
+        ? raw.queueId.trim()
+        : null,
+      queuePosition: typeof raw.queuePosition === 'number' && Number.isFinite(raw.queuePosition)
+        ? Math.max(1, Math.floor(raw.queuePosition))
         : null,
       canonicalSchemaVersion: typeof raw.canonicalSchemaVersion === 'string' && raw.canonicalSchemaVersion.trim()
         ? raw.canonicalSchemaVersion.trim()

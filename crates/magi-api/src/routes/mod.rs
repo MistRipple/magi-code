@@ -5,7 +5,7 @@ mod knowledge;
 mod mcp_skills_repos;
 mod messages;
 mod session_scope;
-mod sessions;
+pub(crate) mod sessions;
 pub(crate) mod settings;
 mod tasks_interaction;
 mod tasks_projection;
@@ -55,8 +55,9 @@ use conversation_bridge::{
     begin_session_turn, finalize_session_turn, ingest_user_input_to_conversation,
 };
 use dispatch_flow::{
-    accept_session_task_submission, append_dispatch_assistant_message,
-    dispatch_accepted_canonical_event, finalize_session_task_dispatch, resolve_dispatch_session,
+    accept_session_task_submission, accept_session_task_submission_at,
+    append_dispatch_assistant_message, dispatch_accepted_canonical_event,
+    finalize_session_task_dispatch, resolve_dispatch_session,
 };
 
 pub fn build_router(state: ApiState) -> Router {

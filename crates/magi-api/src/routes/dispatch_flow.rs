@@ -31,6 +31,29 @@ pub(super) async fn accept_session_task_submission(
     execution_goal: Option<String>,
     task_tier: TaskTier,
 ) -> Result<(DispatchSubmissionAccepted, EventId), ApiError> {
+    accept_session_task_submission_at(
+        state,
+        request,
+        images,
+        workspace_id,
+        task_title,
+        execution_goal,
+        task_tier,
+        monotonic_accepted_at(),
+    )
+    .await
+}
+
+pub(super) async fn accept_session_task_submission_at(
+    state: &ApiState,
+    request: &SessionTurnRequestDto,
+    images: Vec<SessionTurnImage>,
+    workspace_id: WorkspaceId,
+    task_title: Option<String>,
+    execution_goal: Option<String>,
+    task_tier: TaskTier,
+    accepted_at: UtcMillis,
+) -> Result<(DispatchSubmissionAccepted, EventId), ApiError> {
     let trimmed_text = request.trimmed_text();
     let message = request.timeline_message(trimmed_text.as_deref());
     let mission_title = task_title
@@ -58,6 +81,7 @@ pub(super) async fn accept_session_task_submission(
         None,
         images,
         request,
+        accepted_at,
     )
     .await
 }
@@ -75,8 +99,8 @@ async fn execute_dispatch_submission(
     target_role: Option<String>,
     images: Vec<SessionTurnImage>,
     request: &SessionTurnRequestDto,
+    accepted_at: UtcMillis,
 ) -> Result<(DispatchSubmissionAccepted, EventId), ApiError> {
-    let accepted_at = monotonic_accepted_at();
     let placeholder_title = crate::session_title::NEW_SESSION_PLACEHOLDER_TITLE;
     let (session_id, created_session, workspace_id) = resolve_dispatch_session(
         state,
@@ -88,7 +112,6 @@ async fn execute_dispatch_submission(
     state
         .ensure_snapshot_session_for_workspace_id(&session_id, &workspace_id)
         .await?;
-    let signal = ingest_user_input_to_conversation(state, &session_id, request, accepted_at);
     let user_timeline_entry_id = format!("timeline-{}-{}", session_id, accepted_at.0);
     let action_task_title = format_action_task_title(&mission_title);
 
@@ -108,12 +131,13 @@ async fn execute_dispatch_submission(
         access_profile: request.requested_access_profile(),
         skill_name,
         target_role,
-        request_id: signal.request_id.clone(),
-        user_message_id: signal.user_message_id.clone(),
-        placeholder_message_id: signal.placeholder_message_id.clone(),
+        request_id: request.request_id(),
+        user_message_id: request.user_message_id(),
+        placeholder_message_id: request.placeholder_message_id(),
     };
     let accepted = submit_dispatch_submission(state, dispatch)?;
     state.persist_session_state_checkpoint("session_task_turn_accepted")?;
+    ingest_user_input_to_conversation(state, &session_id, request, accepted_at);
     publish_session_user_message_event(
         state,
         &session_id,
