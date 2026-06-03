@@ -99,7 +99,9 @@ fn map_dispatch_error_status(error: &SkillDispatchError) -> SkillDispatchStatus 
             | BridgeClientError::MissingClient { .. }
             | BridgeClientError::MissingBinding { .. }
             | BridgeClientError::MissingWorkingDirectory { .. } => SkillDispatchStatus::Rejected,
-            BridgeClientError::CallFailed { .. } => SkillDispatchStatus::Failed,
+            BridgeClientError::CallFailed { .. } | BridgeClientError::HttpStatusFailed { .. } => {
+                SkillDispatchStatus::Failed
+            }
         },
     }
 }

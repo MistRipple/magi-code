@@ -1,14 +1,7 @@
 import assert from 'node:assert/strict';
-import { createServer } from 'vite';
+import { withGoldenViteServer } from './golden-vite.mjs';
 
-const server = await createServer({
-  root: process.cwd(),
-  configFile: false,
-  logLevel: 'silent',
-  server: { middlewareMode: true },
-});
-
-try {
+await withGoldenViteServer(async (server) => {
   const toolErrors = await server.ssrLoadModule('/src/lib/tool-error-payload.ts');
 
   assert.equal(
@@ -54,6 +47,4 @@ try {
   );
 
   console.log('tool error payload golden replay passed');
-} finally {
-  await server.close();
-}
+});

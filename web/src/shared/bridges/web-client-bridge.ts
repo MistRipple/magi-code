@@ -6,6 +6,7 @@ import {
   loadAgentSessionSnapshot,
   probeReachableAgentBaseUrl,
   resolveAgentBaseUrl,
+  isPublicTunnelAccess,
 } from '../../web/agent-api';
 import {
   clearAgentBindingContext,
@@ -184,6 +185,8 @@ let recoveryAttempt = 0;
 let recoveryTimer: number | null = null;
 let recoveryInFlight: Promise<void> | null = null;
 let recoveryInFlightBindingKey = '';
+let eventStreamSnapshotRefreshInFlight: Promise<void> | null = null;
+let eventStreamSnapshotRefreshBindingKey = '';
 let sessionSnapshotGeneration = 0;
 let workspaceSessionSummaryRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -213,6 +216,9 @@ const EVENT_STREAM_KEEP_ALIVE_INTERVAL_MS = 5_000;
 const EVENT_STREAM_IDLE_MISSED_KEEPALIVES = 6;
 const EVENT_STREAM_IDLE_TIMEOUT_MS = EVENT_STREAM_KEEP_ALIVE_INTERVAL_MS * EVENT_STREAM_IDLE_MISSED_KEEPALIVES;
 const EVENT_STREAM_IDLE_CHECK_INTERVAL_MS = 5_000;
+const EVENT_STREAM_TUNNEL_BUSY_REFRESH_INTERVAL_MS = 2_000;
+const EVENT_STREAM_TUNNEL_IDLE_TIMEOUT_MS = 30_000;
+const EVENT_STREAM_TUNNEL_IDLE_CHECK_INTERVAL_MS = 1_000;
 const EXTERNAL_SESSION_SUMMARY_EVENTS = new Set([
   'session.turn.accepted',
   'session.turn.task.accepted',
@@ -725,7 +731,41 @@ function markEventStreamActive(): void {
 }
 
 function currentEventStreamIdleTimeoutMs(): number {
+  if (isPublicTunnelAccess()) {
+    return EVENT_STREAM_TUNNEL_IDLE_TIMEOUT_MS;
+  }
   return EVENT_STREAM_IDLE_TIMEOUT_MS;
+}
+
+function currentEventStreamIdleCheckIntervalMs(): number {
+  if (isPublicTunnelAccess()) {
+    return EVENT_STREAM_TUNNEL_IDLE_CHECK_INTERVAL_MS;
+  }
+  return EVENT_STREAM_IDLE_CHECK_INTERVAL_MS;
+}
+
+function refreshBootstrapForSilentEventStream(reason: string, error: Error): void {
+  const refreshBindingKey = bootstrapBindingKey(resolveWorkspaceQuery());
+  if (
+    eventStreamSnapshotRefreshInFlight
+    && eventStreamSnapshotRefreshBindingKey === refreshBindingKey
+  ) {
+    return;
+  }
+  eventStreamSnapshotRefreshBindingKey = refreshBindingKey;
+  const request = fetchBootstrap({
+    forceFresh: true,
+    forceEventStreamReconnect: false,
+    refreshSettingsBootstrapOnBindingChange: false,
+  }).catch((refreshError) => {
+    scheduleRecovery(reason, refreshError || error, true);
+  }).finally(() => {
+    if (eventStreamSnapshotRefreshInFlight === request) {
+      eventStreamSnapshotRefreshInFlight = null;
+      eventStreamSnapshotRefreshBindingKey = '';
+    }
+  });
+  eventStreamSnapshotRefreshInFlight = request;
 }
 
 function stopEventStreamIdleCheck(): void {
@@ -749,6 +789,20 @@ function startEventStreamIdleCheck(): void {
       return;
     }
     const idleMs = Date.now() - lastEventStreamActivityAt;
+    const isTunnelAccess = isPublicTunnelAccess();
+    const runtimeBusy = bridgeRuntimeIsBusy();
+    if (
+      isTunnelAccess
+      && runtimeBusy
+      && idleMs >= EVENT_STREAM_TUNNEL_BUSY_REFRESH_INTERVAL_MS
+    ) {
+      markEventStreamActive();
+      refreshBootstrapForSilentEventStream(
+        'event_stream_tunnel_busy_snapshot',
+        new Error(`Tunnel SSE 静默刷新：${Math.round(idleMs / 1000)}s`),
+      );
+      return;
+    }
     const timeoutMs = currentEventStreamIdleTimeoutMs();
     if (idleMs < timeoutMs) {
       return;
@@ -757,12 +811,14 @@ function startEventStreamIdleCheck(): void {
     // 重置活跃时间戳避免 recovery 调度期间重复触发，由 recovery 完成后的 ensureEventStream
     // 重新建连或 closeEventStream 停止检测。
     markEventStreamActive();
-    scheduleRecovery(
-      bridgeRuntimeIsBusy() ? 'event_stream_active_idle' : 'event_stream_idle',
-      new Error(`SSE 静默超时：${Math.round(idleMs / 1000)}s`),
-      true,
-    );
-  }, EVENT_STREAM_IDLE_CHECK_INTERVAL_MS);
+    const reason = runtimeBusy ? 'event_stream_active_idle' : 'event_stream_idle';
+    const error = new Error(`SSE 静默超时：${Math.round(idleMs / 1000)}s`);
+    if (isTunnelAccess) {
+      refreshBootstrapForSilentEventStream(reason, error);
+      return;
+    }
+    scheduleRecovery(reason, error, true);
+  }, currentEventStreamIdleCheckIntervalMs());
 }
 
 function ensureWindowListener(): void {

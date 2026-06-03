@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { createServer } from 'vite';
+import { withGoldenViteServer } from './golden-vite.mjs';
 
 globalThis.$state = (value) => value;
 globalThis.$derived = (value) => (typeof value === 'function' ? value() : value);
@@ -116,14 +116,7 @@ installBrowserGlobals();
 const projectionFetches = [];
 installFetchStub(projectionFetches);
 
-const server = await createServer({
-  root: process.cwd(),
-  configFile: false,
-  logLevel: 'silent',
-  server: { middlewareMode: true },
-});
-
-try {
+await withGoldenViteServer(async (server) => {
   const bridgeRuntime = await server.ssrLoadModule('/src/shared/bridges/bridge-runtime.ts');
   const taskStore = await server.ssrLoadModule('/src/stores/task-projection-store.svelte.ts');
   const bridge = createBridge();
@@ -200,6 +193,4 @@ try {
 
   taskStore.stopAutoRefresh();
   console.log('task projection store golden replay passed');
-} finally {
-  await server.close();
-}
+});

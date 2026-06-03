@@ -1,16 +1,9 @@
 import assert from 'node:assert/strict';
-import { createServer } from 'vite';
+import { withGoldenViteServer } from './golden-vite.mjs';
 
 globalThis.$state = (value) => value;
 
-const server = await createServer({
-  root: process.cwd(),
-  configFile: false,
-  logLevel: 'silent',
-  server: { middlewareMode: true },
-});
-
-try {
+await withGoldenViteServer(async (server) => {
   const rightPane = await server.ssrLoadModule('/src/stores/right-pane.svelte.ts');
 
   rightPane.activateRightPaneSession('workspace-active', 'session-active');
@@ -76,6 +69,4 @@ try {
   assert.equal(otherAgentTab?.payload.workspaceId, 'workspace-other');
 
   console.log('right pane golden replay passed');
-} finally {
-  await server.close();
-}
+});

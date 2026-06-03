@@ -1,14 +1,7 @@
 import assert from 'node:assert/strict';
-import { createServer } from 'vite';
+import { withGoldenViteServer } from './golden-vite.mjs';
 
-const server = await createServer({
-  root: process.cwd(),
-  configFile: 'vite.web.config.ts',
-  logLevel: 'silent',
-  server: { middlewareMode: true },
-});
-
-try {
+await withGoldenViteServer(async (server) => {
   const reducer = await server.ssrLoadModule('/src/stores/turn-reducer.ts');
   const projection = await server.ssrLoadModule('/src/stores/turn-projection.ts');
   const bridgeRuntime = await server.ssrLoadModule('/src/shared/bridges/bridge-runtime.ts');
@@ -20,9 +13,7 @@ try {
   const viewImagePreview = await server.ssrLoadModule('/src/lib/view-image-preview.ts');
   runGoldenReplay(reducer, projection, messagesStore, dataHandlers, timelineRenderItems, contract, viewImagePreview);
   console.log('canonical turn golden replay passed');
-} finally {
-  await server.close();
-}
+}, { configFile: 'vite.web.config.ts' });
 
 function installGoldenMemoryBridge(bridgeRuntime) {
   let bridgeState;

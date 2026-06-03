@@ -704,6 +704,12 @@ function getTunnelToken(): string | null {
   return new URL(window.location.href).searchParams.get('tunnel_token');
 }
 
+export function isPublicTunnelAccess(): boolean {
+  if (typeof window === 'undefined') return false;
+  const currentUrl = new URL(window.location.href);
+  return Boolean(currentUrl.searchParams.get('tunnel_token'));
+}
+
 /**
  * 将 tunnel_token 附加到已有的 query string 上（如果存在）。
  */

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { createServer } from 'vite';
+import { withGoldenViteServer } from './golden-vite.mjs';
 
 class FakeEventSource {
   static CONNECTING = 0;
@@ -25,14 +25,7 @@ class FakeEventSource {
 
 globalThis.EventSource = FakeEventSource;
 
-const server = await createServer({
-  root: process.cwd(),
-  configFile: false,
-  logLevel: 'silent',
-  server: { middlewareMode: true },
-});
-
-try {
+await withGoldenViteServer(async (server) => {
   const transportModule = await server.ssrLoadModule('/src/shared/transport.ts');
   const transport = transportModule.getTransport();
   let openCount = 0;
@@ -80,6 +73,4 @@ try {
   );
 
   console.log('live transport golden replay passed');
-} finally {
-  await server.close();
-}
+});

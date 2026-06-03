@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { createServer } from 'vite';
+import { withGoldenViteServer } from './golden-vite.mjs';
 
 const WORKSPACE_ID = 'workspace-bridge-live-adopt';
 const WORKSPACE_PATH = '/tmp/workspace-bridge-live-adopt';
@@ -488,14 +488,8 @@ function deferred() {
 installBrowserGlobals();
 installFetchStub();
 
-const server = await createServer({
-  root: process.cwd(),
-  configFile: 'vite.web.config.ts',
-  logLevel: 'silent',
-  server: { middlewareMode: true },
-});
-
-try {
+await withGoldenViteServer(async (server) => {
+  try {
   const bridgeRuntime = await server.ssrLoadModule('/src/shared/bridges/bridge-runtime.ts');
   const bridgeModule = await server.ssrLoadModule('/src/shared/bridges/web-client-bridge.ts');
   const messageHandler = await server.ssrLoadModule('/src/lib/message-handler.ts');
@@ -794,5 +788,5 @@ try {
   console.log('web client bridge golden replay passed');
 } finally {
   window.__clearGoldenTimers?.();
-  await server.close();
 }
+}, { configFile: 'vite.web.config.ts' });

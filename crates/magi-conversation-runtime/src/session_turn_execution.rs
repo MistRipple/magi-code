@@ -5,12 +5,15 @@
 //! 等方式桥接到 `ApiError` 枚举。
 
 use crate::{
-    model_error::{provider_empty_assistant_response_error, public_model_invocation_error_message},
+    model_error::{
+        provider_empty_assistant_response_error, public_model_image_invocation_error_message,
+        public_model_invocation_error_message,
+    },
     prompt_utils::{
         current_turn_context_priority_prompt, normalize_model_stream_preview_content,
         normalize_model_visible_content, workspace_context_system_prompt,
     },
-    session_images::{SessionTurnImage, image_sources_from_metadata, session_turn_image_sources},
+    session_images::{SessionTurnImage, session_turn_image_sources},
     session_writeback::{
         SessionStatePersistCallback, SessionTurnStreamPublishGate,
         append_session_tool_call_items_batch, append_session_turn_error_item,
@@ -157,11 +160,7 @@ fn build_session_turn_messages(
                     Some(ChatMessage {
                         role: role.to_string(),
                         content: Some(content),
-                        images: if item.kind == CanonicalTurnItemKind::UserMessage {
-                            image_sources_from_metadata(&item.metadata)
-                        } else {
-                            Vec::new()
-                        },
+                        images: Vec::new(),
                         tool_calls: Vec::new(),
                         tool_call_id: None,
                     })
@@ -301,7 +300,7 @@ pub fn run_session_turn_execution(
                 if !request_turn_is_writable(session_store, &request) {
                     return Ok(SessionTurnExecutionOutput::interrupted());
                 }
-                let public_error = public_model_invocation_error_message(&error);
+                let public_error = public_session_turn_model_error(&request, &error);
                 append_session_turn_error_item(
                     event_bus,
                     session_store,
@@ -368,7 +367,7 @@ pub fn run_session_turn_execution(
         if !request_turn_is_writable(session_store, &request) {
             return Ok(SessionTurnExecutionOutput::interrupted());
         }
-        let failure_reason = provider_empty_assistant_response_error(had_tool_calls);
+        let failure_reason = public_session_turn_empty_response_error(&request, had_tool_calls);
         append_session_turn_error_item(
             event_bus,
             session_store,
@@ -400,6 +399,23 @@ pub fn run_session_turn_execution(
     );
 
     Ok(SessionTurnExecutionOutput::completed(final_content))
+}
+
+fn public_session_turn_model_error(request: &SessionTurnExecutionRequest, error: &str) -> String {
+    if !request.images.is_empty() {
+        return public_model_image_invocation_error_message(error);
+    }
+    public_model_invocation_error_message(error)
+}
+
+fn public_session_turn_empty_response_error(
+    request: &SessionTurnExecutionRequest,
+    after_tool_calls: bool,
+) -> String {
+    if !request.images.is_empty() {
+        return public_model_image_invocation_error_message("empty stream response");
+    }
+    provider_empty_assistant_response_error(after_tool_calls)
 }
 
 struct SessionTurnRoundRuntime<'a> {
@@ -652,7 +668,7 @@ fn stream_session_turn_round(
             },
             &on_delta,
         )
-        .map_err(|error| public_model_invocation_error_message(&error.to_string()))?;
+        .map_err(|error| error.to_string())?;
     let parsed = response.parse_chat_payload();
     publish_model_usage_record(
         event_bus,
@@ -967,7 +983,7 @@ fn append_final_item(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use magi_bridge_client::{BridgeClientError, BridgeResponse};
+    use magi_bridge_client::{BridgeClientError, BridgeErrorLayer, BridgeResponse};
     use magi_core::SessionLifecycleStatus;
     use magi_session_store::{
         ActiveExecutionTurn, CanonicalTurn, CanonicalTurnItem, CanonicalTurnItemKind,
@@ -1006,6 +1022,31 @@ mod tests {
                 content: self.delta_content.clone(),
                 thinking: String::new(),
             });
+            self.invoke(request)
+        }
+    }
+
+    struct FailingModelBridgeClient {
+        message: String,
+    }
+
+    impl ModelBridgeClient for FailingModelBridgeClient {
+        fn invoke(
+            &self,
+            _request: ModelInvocationRequest,
+        ) -> Result<BridgeResponse, BridgeClientError> {
+            Err(BridgeClientError::CallFailed {
+                layer: BridgeErrorLayer::RemoteBusiness,
+                code: Some(-32007),
+                message: self.message.clone(),
+            })
+        }
+
+        fn invoke_streaming(
+            &self,
+            request: ModelInvocationRequest,
+            _on_delta: &dyn Fn(&ModelStreamingDelta),
+        ) -> Result<BridgeResponse, BridgeClientError> {
             self.invoke(request)
         }
     }
@@ -1224,6 +1265,96 @@ mod tests {
     }
 
     #[test]
+    fn image_session_turn_streaming_error_uses_image_capability_message() {
+        let session_id = SessionId::new("session-image-error-layer");
+        let store = SessionStore::new();
+        store
+            .create_session(session_id.clone(), "image error layer")
+            .expect("session should be creatable");
+        let (_mission_id, orchestrator_thread_id) =
+            store.ensure_session_mission(&session_id, ts(920), || {
+                magi_core::MissionId::new("mission-image-error-layer")
+            });
+        store
+            .upsert_current_turn(
+                session_id.clone(),
+                ActiveExecutionTurn {
+                    turn_id: "turn-image-error-layer".to_string(),
+                    turn_seq: 1,
+                    accepted_at: ts(1_000),
+                    completed_at: None,
+                    status: "running".to_string(),
+                    user_message: Some("请识别这张图片".to_string()),
+                    items: vec![session_turn_item(
+                        "user_message",
+                        "completed",
+                        None,
+                        Some("请识别这张图片".to_string()),
+                        Some("user-image-error-layer".to_string()),
+                        orchestrator_thread_id,
+                    )],
+                },
+            )
+            .expect("current turn should be stored");
+        let client = FailingModelBridgeClient {
+            message: "provider response invalid: empty stream response".to_string(),
+        };
+        let event_bus = InMemoryEventBus::new(16);
+        let request = SessionTurnExecutionRequest {
+            session_id: session_id.clone(),
+            turn_id: "turn-image-error-layer".to_string(),
+            workspace_id: None,
+            prompt: "请识别这张图片".to_string(),
+            images: vec![
+                SessionTurnImage::from_data_url("smoke.png", "data:image/png;base64,iVBORw0KGgo=")
+                    .expect("image should parse"),
+            ],
+            use_tools: false,
+            access_profile: AccessProfile::Restricted,
+            skill_name: None,
+            request_id: None,
+            user_message_id: None,
+            placeholder_message_id: None,
+            forced_tool_name: None,
+            required_tool_chain: Vec::new(),
+            workspace_root_path: None,
+        };
+
+        let error = match run_session_turn_execution(SessionTurnExecutionRuntime {
+            client: &client,
+            event_bus: &event_bus,
+            session_store: &store,
+            settings_store: None,
+            safety_gate: None,
+            tool_registry: None,
+            skill_runtime: None,
+            skill_dispatch_runtime: None,
+            skill_name: None,
+            snapshot_manager: None,
+            request,
+            prompt: "请识别这张图片".to_string(),
+            tools: None,
+            persist_session_state: None,
+        }) {
+            Ok(_) => panic!("image provider empty stream should fail"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error,
+            crate::model_error::PUBLIC_MODEL_IMAGE_INVOCATION_FAILURE_MESSAGE
+        );
+        let turn = store
+            .runtime_sidecar(&session_id)
+            .and_then(|sidecar| sidecar.current_turn)
+            .expect("failed turn should remain visible");
+        assert_eq!(turn.status, "failed");
+        assert!(turn.items.iter().any(|item| {
+            item.kind == "assistant_error" && item.content.as_deref() == Some(error.as_str())
+        }));
+    }
+
+    #[test]
     fn stream_session_turn_round_reuses_accepted_assistant_placeholder() {
         // 验证流式首段 assistant text 用 request.placeholder_message_id 作为 item_id。
         // 历史方案曾在 accept 阶段把 placeholder 以 item_seq=2 预占进 turn.items，
@@ -1415,7 +1546,13 @@ mod tests {
                         worker: None,
                         source_thread_id: magi_core::ThreadId::new("thread-test-orchestrator"),
                         visibility: CanonicalTurnVisibility::default(),
-                        metadata: HashMap::new(),
+                        metadata: HashMap::from([(
+                            "images".to_string(),
+                            serde_json::json!([{
+                                "name": "previous.png",
+                                "dataUrl": "data:image/png;base64,AAA"
+                            }]),
+                        )]),
                     },
                     CanonicalTurnItem {
                         session_id: session_id.clone(),
@@ -1502,6 +1639,10 @@ mod tests {
             .map(|message| message.content.as_deref().unwrap_or(""))
             .collect::<Vec<_>>();
         assert_eq!(contents[0], "请用一句话回答：2+3 等于几？");
+        assert!(
+            messages[0].images.is_empty(),
+            "历史图片只能作为会话记录展示，不能重复进入后续文本 turn 的模型上下文"
+        );
         assert_eq!(contents[1], "2+3 等于 5。");
         assert!(contents[2].contains("本轮用户原始输入"));
         assert!(contents[2].contains("只能作为参考证据"));

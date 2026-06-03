@@ -1,17 +1,10 @@
 import assert from 'node:assert/strict';
-import { createServer } from 'vite';
+import { withGoldenViteServer } from './golden-vite.mjs';
 
 globalThis.$state = (value) => value;
 globalThis.$derived = (value) => value;
 
-const server = await createServer({
-  root: process.cwd(),
-  configFile: false,
-  logLevel: 'silent',
-  server: { middlewareMode: true },
-});
-
-try {
+await withGoldenViteServer(async (server) => {
   const binding = await server.ssrLoadModule('/src/web/agent-binding-context.ts');
   const agentApi = await server.ssrLoadModule('/src/web/agent-api.ts');
 
@@ -324,6 +317,4 @@ try {
   }
 
   console.log('agent api golden replay passed');
-} finally {
-  await server.close();
-}
+});

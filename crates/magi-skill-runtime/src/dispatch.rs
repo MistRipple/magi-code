@@ -324,7 +324,9 @@ fn bridge_error_output(
         | BridgeClientError::MissingClient { .. }
         | BridgeClientError::MissingBinding { .. }
         | BridgeClientError::MissingWorkingDirectory { .. } => ExecutionResultStatus::Rejected,
-        BridgeClientError::CallFailed { .. } => ExecutionResultStatus::Failed,
+        BridgeClientError::CallFailed { .. } | BridgeClientError::HttpStatusFailed { .. } => {
+            ExecutionResultStatus::Failed
+        }
     };
     tracing::warn!(
         tool_name = %input.tool_name,
@@ -360,7 +362,8 @@ fn bridge_public_error(error: &BridgeClientError) -> (&'static str, &'static str
             EXTERNAL_TOOL_CONFIG_UNAVAILABLE_CODE,
             EXTERNAL_TOOL_CONFIG_PUBLIC_ERROR,
         ),
-        BridgeClientError::CallFailed { layer, .. } => match layer {
+        BridgeClientError::CallFailed { layer, .. }
+        | BridgeClientError::HttpStatusFailed { layer, .. } => match layer {
             magi_bridge_client::BridgeErrorLayer::Transport => (
                 EXTERNAL_TOOL_TRANSPORT_FAILED_CODE,
                 EXTERNAL_TOOL_TRANSPORT_PUBLIC_ERROR,

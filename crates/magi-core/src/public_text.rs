@@ -71,11 +71,18 @@ fn is_sensitive_key(key: &str) -> bool {
             | "apikey"
             | "authorization"
             | "access_token"
+            | "auth_token"
             | "refresh_token"
+            | "id_token"
+            | "session_token"
             | "token"
             | "secret"
             | "client_secret"
+            | "private_key"
             | "password"
+            | "credential"
+            | "credentials"
+            | "x-api-key"
     )
 }
 
@@ -86,12 +93,13 @@ fn redact_sensitive_text(value: &str) -> String {
 }
 
 fn redact_bearer_tokens(value: &str) -> String {
+    const BEARER_PREFIX: &str = "bearer ";
     let mut redacted = String::with_capacity(value.len());
     let mut remaining = value;
-    while let Some(pos) = remaining.find("Bearer ") {
-        redacted.push_str(&remaining[..pos + "Bearer ".len()]);
+    while let Some(pos) = find_ascii_case_insensitive(remaining, BEARER_PREFIX) {
+        redacted.push_str(&remaining[..pos + BEARER_PREFIX.len()]);
         redacted.push_str(PUBLIC_REDACTED_VALUE);
-        let after = &remaining[pos + "Bearer ".len()..];
+        let after = &remaining[pos + BEARER_PREFIX.len()..];
         let token_end = after
             .char_indices()
             .find(|(_, ch)| is_value_delimiter(*ch))
@@ -101,6 +109,13 @@ fn redact_bearer_tokens(value: &str) -> String {
     }
     redacted.push_str(remaining);
     redacted
+}
+
+fn find_ascii_case_insensitive(value: &str, needle: &str) -> Option<usize> {
+    value
+        .as_bytes()
+        .windows(needle.len())
+        .position(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
 }
 
 fn redact_prefixed_tokens(value: &str) -> String {
@@ -134,7 +149,7 @@ fn redact_absolute_paths(value: &str) -> String {
         let Some(ch) = value[index..].chars().next() else {
             break;
         };
-        if ch == '/' && starts_sensitive_absolute_path(&value[index..]) {
+        if starts_sensitive_absolute_path(&value[index..]) {
             redacted.push_str(PUBLIC_REDACTED_PATH);
             let path_end = value[index..]
                 .char_indices()
@@ -152,10 +167,21 @@ fn redact_absolute_paths(value: &str) -> String {
 
 fn starts_sensitive_absolute_path(value: &str) -> bool {
     value.starts_with("/Users/")
+        || value.starts_with("/home/")
+        || value.starts_with("/root/")
         || value.starts_with("/private/")
         || value.starts_with("/var/folders/")
         || value.starts_with("/tmp/")
         || value.starts_with("/Volumes/")
+        || starts_windows_absolute_path(value)
+}
+
+fn starts_windows_absolute_path(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/')
 }
 
 fn is_value_delimiter(ch: char) -> bool {
@@ -191,10 +217,12 @@ mod tests {
     #[test]
     fn public_runtime_text_redacts_sensitive_json_fields_paths_and_tokens() {
         let public = public_runtime_text(
-            r#"{"api_key":"sk-live-secret","message":"failed at /Users/xie/.magi/token with Bearer abcdef","nested":{"password":"hidden"}}"#,
+            r#"{"api_key":"sk-live-secret","x-api-key":"raw-key","private_key":"raw-private","message":"failed at /Users/xie/.magi/token with Bearer abcdef","nested":{"password":"hidden"}}"#,
         );
 
         assert!(public.contains(r#""api_key":"[redacted]""#));
+        assert!(public.contains(r#""x-api-key":"[redacted]""#));
+        assert!(public.contains(r#""private_key":"[redacted]""#));
         assert!(public.contains(r#""password":"[redacted]""#));
         assert!(public.contains(PUBLIC_REDACTED_PATH));
         assert!(public.contains("Bearer [redacted]"));
@@ -202,22 +230,34 @@ mod tests {
         assert!(!public.contains("/Users/xie"));
         assert!(!public.contains("abcdef"));
         assert!(!public.contains("hidden"));
+        assert!(!public.contains("raw-key"));
+        assert!(!public.contains("raw-private"));
     }
 
     #[test]
     fn public_runtime_summary_redacts_and_normalizes_plain_text() {
         let public = public_runtime_summary(Some(
-            "provider rejected token sk-test-secret\nat /private/tmp/magi/config with Bearer abcdef",
+            "provider rejected token sk-test-secret\nat /private/tmp/magi/config and /home/xie/.magi with bearer abcdef",
         ))
         .expect("summary should be public");
 
         assert!(public.contains("sk-[redacted]"));
         assert!(public.contains(PUBLIC_REDACTED_PATH));
-        assert!(public.contains("Bearer [redacted]"));
+        assert!(public.contains("bearer [redacted]"));
         assert!(!public.contains("sk-test-secret"));
         assert!(!public.contains("/private/tmp"));
+        assert!(!public.contains("/home/xie"));
         assert!(!public.contains("abcdef"));
         assert!(!public.contains('\n'));
+    }
+
+    #[test]
+    fn public_runtime_text_redacts_windows_absolute_paths() {
+        let public = public_runtime_text(r#"{"message":"failed at C:\\Users\\xie\\.magi\\token"}"#);
+
+        assert!(public.contains(PUBLIC_REDACTED_PATH));
+        assert!(!public.contains("C:\\Users"));
+        assert!(!public.contains(".magi"));
     }
 
     #[test]

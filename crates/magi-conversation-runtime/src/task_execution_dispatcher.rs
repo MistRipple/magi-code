@@ -95,6 +95,12 @@ impl FailoverModelBridgeClient {
                     BridgeErrorLayer::Transport | BridgeErrorLayer::Protocol
                 )
             }
+            BridgeClientError::HttpStatusFailed { layer, .. } => {
+                matches!(
+                    layer,
+                    BridgeErrorLayer::Transport | BridgeErrorLayer::Protocol
+                )
+            }
             _ => false,
         }
     }

@@ -102,6 +102,7 @@ pub(crate) fn build_tool_catalog_value(
         schema_warning_count += schema_warnings.len();
         let runtime_status = runtime_health.tool_status(tool);
         runtime_warning_count += runtime_status.warnings.len();
+        let policy_view = tool_catalog_policy_view(tool, access_profile);
 
         let mut item = serde_json::json!({
             "name": tool.as_str(),
@@ -109,13 +110,13 @@ pub(crate) fn build_tool_catalog_value(
             "public": is_public,
             "runtime_internal": tool.is_runtime_internal_tool_call(),
             "access_mode": access_mode_for_tool(tool).as_str(),
-            "policy_scope": policy_scope_label(tool),
-            "input_sensitive_policy": tool.uses_input_sensitive_invocation_policy(),
-            "policy_summary": policy_summary(tool),
+            "policy_scope": policy_view.policy_scope,
+            "input_sensitive_policy": policy_view.input_sensitive_policy,
+            "policy_summary": policy_view.policy_summary,
             "risk_level": risk_level_label(tool),
             "approval_requirement": approval_requirement_label(tool),
-            "effective_approval_policy": effective_approval_policy_label(tool, access_profile),
-            "access_profile_behavior": access_profile_behavior_label(tool, access_profile),
+            "effective_approval_policy": policy_view.effective_approval_policy,
+            "access_profile_behavior": policy_view.access_profile_behavior,
             "schema_status": if schema_warnings.is_empty() { "ok" } else { "warning" },
             "schema_warnings": schema_warnings,
             "runtime_status": runtime_status.status,
@@ -622,6 +623,28 @@ fn access_mode_for_tool(tool: BuiltinToolName) -> BuiltinToolAccessMode {
     tool.default_access_mode()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ToolCatalogPolicyView {
+    policy_scope: &'static str,
+    input_sensitive_policy: bool,
+    policy_summary: &'static str,
+    effective_approval_policy: &'static str,
+    access_profile_behavior: &'static str,
+}
+
+fn tool_catalog_policy_view(
+    tool: BuiltinToolName,
+    access_profile: magi_core::AccessProfile,
+) -> ToolCatalogPolicyView {
+    ToolCatalogPolicyView {
+        policy_scope: policy_scope_label(tool),
+        input_sensitive_policy: tool.uses_input_sensitive_invocation_policy(),
+        policy_summary: policy_summary(tool),
+        effective_approval_policy: effective_approval_policy_label(tool, access_profile),
+        access_profile_behavior: access_profile_behavior_label(tool, access_profile),
+    }
+}
+
 fn policy_scope_label(tool: BuiltinToolName) -> &'static str {
     if tool.uses_input_sensitive_invocation_policy() {
         "input_sensitive"
@@ -953,6 +976,91 @@ mod tests {
             file_write["access_profile_behavior"],
             "unavailable_in_read_only"
         );
+    }
+
+    #[test]
+    fn tool_catalog_policy_view_matches_builtin_policy_axes_for_all_tools() {
+        for access_profile in [
+            magi_core::AccessProfile::ReadOnly,
+            magi_core::AccessProfile::Restricted,
+            magi_core::AccessProfile::FullAccess,
+        ] {
+            let context = ToolExecutionContext {
+                access_profile,
+                ..ToolExecutionContext::default()
+            };
+            let payload: serde_json::Value = serde_json::from_str(&execute_tool_catalog(
+                r#"{"include_internal":true}"#,
+                &context,
+                &ToolRuntimeResources::default(),
+            ))
+            .expect("catalog output should be json");
+            let tools = payload["tools"].as_array().expect("tools");
+
+            for builtin in BuiltinToolName::ALL {
+                let tool = tools
+                    .iter()
+                    .find(|tool| tool["name"] == builtin.as_str())
+                    .unwrap_or_else(|| panic!("{} should be listed", builtin.as_str()));
+                let expected_input_sensitive = builtin.uses_input_sensitive_invocation_policy();
+                assert_eq!(
+                    tool["policy_scope"],
+                    if expected_input_sensitive {
+                        "input_sensitive"
+                    } else {
+                        "fixed"
+                    },
+                    "{} policy_scope should match input-sensitive axis",
+                    builtin.as_str()
+                );
+                assert_eq!(
+                    tool["input_sensitive_policy"],
+                    expected_input_sensitive,
+                    "{} input_sensitive_policy should match builtin policy",
+                    builtin.as_str()
+                );
+
+                let (expected_approval, expected_behavior) = match access_profile {
+                    magi_core::AccessProfile::ReadOnly if builtin.is_write_operation() => {
+                        ("not_applicable", "unavailable_in_read_only")
+                    }
+                    magi_core::AccessProfile::ReadOnly => ("none", "read_only_allowed"),
+                    magi_core::AccessProfile::Restricted if expected_input_sensitive => {
+                        ("input_sensitive", "restricted_input_sensitive")
+                    }
+                    magi_core::AccessProfile::Restricted
+                        if builtin.default_approval_requirement()
+                            == magi_core::ApprovalRequirement::Required =>
+                    {
+                        ("required", "restricted_requires_approval")
+                    }
+                    magi_core::AccessProfile::Restricted => ("none", "restricted_allowed"),
+                    magi_core::AccessProfile::FullAccess
+                        if expected_input_sensitive
+                            || builtin.default_approval_requirement()
+                                == magi_core::ApprovalRequirement::Required =>
+                    {
+                        (
+                            "ordinary_approval_skipped",
+                            "full_access_skips_ordinary_approval",
+                        )
+                    }
+                    magi_core::AccessProfile::FullAccess => ("none", "full_access_allowed"),
+                };
+                assert_eq!(
+                    tool["effective_approval_policy"],
+                    expected_approval,
+                    "{} effective_approval_policy should match access profile",
+                    builtin.as_str()
+                );
+                assert_eq!(
+                    tool["access_profile_behavior"],
+                    expected_behavior,
+                    "{} access_profile_behavior should match access profile",
+                    builtin.as_str()
+                );
+            }
+        }
     }
 
     #[test]

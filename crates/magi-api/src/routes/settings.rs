@@ -3,7 +3,10 @@ use axum::{
     extract::{Query, State},
     routing::{get, post},
 };
-use magi_bridge_client::HttpModelBridgeProtocol;
+use magi_bridge_client::{
+    BridgeClientError, BridgeErrorLayer, HttpModelBridgeProtocol, ModelBridgeClient,
+    ModelInvocationRequest,
+};
 use magi_core::{AccessProfile, UtcMillis};
 use magi_usage_authority::{
     SessionSummary, UsageAuthority, UsageCallRecordInput, UsageModelSnapshot, UsageTotals,
@@ -130,60 +133,25 @@ fn parse_connection_probe_config(request: Value) -> Result<NormalizedModelConfig
     Ok(normalized)
 }
 
-async fn execute_connection_probe(
-    config: &NormalizedModelConfig,
-) -> Result<(u16, Value), ApiError> {
-    // 探针不再维护双轨 body builder：直接借用 HttpModelBridgeClient::build_probe_request
-    // 作为唯一事实源，保证 reasoning_effort、Anthropic thinking 等字段与生产链路完全一致。
+async fn execute_connection_probe(config: &NormalizedModelConfig) -> Result<(), ApiError> {
     let client = config
         .to_http_model_client("__probe__")
         .ok_or_else(|| ApiError::InvalidInput("模型配置缺少 baseUrl".to_string()))?;
-    let (url, body, extra_headers) = client.build_probe_request().map_err(|error| {
-        tracing::warn!(error = %error, "model connection probe request build failed");
-        ApiError::InvalidInput("模型请求配置无效".to_string())
-    })?;
-
-    let mut headers = HeaderMap::new();
-    headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
-    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    for (name, value) in extra_headers {
-        let header_name = HeaderName::try_from(name.as_str())
-            .map_err(|_| ApiError::InvalidInput(format!("探针请求包含非法 header 名: {name}")))?;
-        let header_value = HeaderValue::from_str(&value)
-            .map_err(|_| ApiError::InvalidInput(format!("探针请求包含非法 header 值: {name}")))?;
-        headers.insert(header_name, header_value);
-    }
-
-    let response = reqwest::Client::new()
-        .post(url)
-        .headers(headers)
-        .json(&body)
-        .send()
+    let request = ModelInvocationRequest {
+        provider: "probe".to_string(),
+        prompt: "ping".to_string(),
+        messages: None,
+        tools: None,
+        tool_choice: None,
+    };
+    tokio::task::spawn_blocking(move || client.invoke_streaming(request, &|_| {}))
         .await
         .map_err(|error| {
-            tracing::warn!(error = %error, "model connection probe transport failed");
-            ApiError::InvalidInput(model_transport_error_message(&error).to_string())
-        })?;
-    let status = response.status().as_u16();
-    if !(200..300).contains(&status) {
-        return Ok((status, Value::Null));
-    }
-    let payload: Value = response.json().await.map_err(|error| {
-        tracing::warn!(error = %error, "model connection probe response parse failed");
-        ApiError::InvalidInput("模型响应格式异常".to_string())
-    })?;
-
-    Ok((status, payload))
-}
-
-fn model_transport_error_message(error: &reqwest::Error) -> &'static str {
-    if error.is_timeout() {
-        return "模型连接超时";
-    }
-    if error.is_connect() {
-        return "模型服务连接失败";
-    }
-    "模型连接测试失败"
+            tracing::warn!(error = %error, "model streaming connection probe thread failed");
+            ApiError::InvalidInput("模型连接测试失败".to_string())
+        })?
+        .map(|_| ())
+        .map_err(model_bridge_probe_error)
 }
 
 fn model_http_status_error_message(status: u16) -> &'static str {
@@ -197,14 +165,34 @@ fn model_http_status_error_message(status: u16) -> &'static str {
     }
 }
 
+fn model_transport_error_message(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        return "模型连接超时";
+    }
+    if error.is_connect() {
+        return "模型服务连接失败";
+    }
+    "模型连接测试失败"
+}
+
+fn model_bridge_probe_error(error: BridgeClientError) -> ApiError {
+    let raw = error.to_string();
+    tracing::warn!(error = %raw, "model streaming connection probe failed");
+    if let Some(status) = error.http_status() {
+        return ApiError::InvalidInput(model_http_status_error_message(status).to_string());
+    }
+    match error.layer() {
+        Some(BridgeErrorLayer::Transport) => ApiError::InvalidInput("模型服务连接失败".to_string()),
+        Some(BridgeErrorLayer::Protocol) => ApiError::InvalidInput("模型请求配置无效".to_string()),
+        Some(BridgeErrorLayer::RemoteBusiness) | None => {
+            ApiError::InvalidInput("模型服务暂不可用".to_string())
+        }
+    }
+}
+
 async fn probe_connection_response(request: Value) -> Result<Json<Value>, ApiError> {
     let config = parse_connection_probe_config(request)?;
-    let (status, _payload) = execute_connection_probe(&config).await?;
-    if !(200..300).contains(&status) {
-        return Err(ApiError::InvalidInput(
-            model_http_status_error_message(status).to_string(),
-        ));
-    }
+    execute_connection_probe(&config).await?;
 
     Ok(Json(json!({
         "success": true,
@@ -1311,7 +1299,10 @@ mod tests {
         })
     }
 
-    async fn anthropic_probe_stub(headers: HeaderMap, Json(payload): Json<Value>) -> Json<Value> {
+    async fn anthropic_probe_stub(
+        headers: HeaderMap,
+        Json(payload): Json<Value>,
+    ) -> impl axum::response::IntoResponse {
         assert_eq!(
             headers
                 .get("x-api-key")
@@ -1326,17 +1317,18 @@ mod tests {
         );
         assert_eq!(payload["model"], json!("claude-sonnet-test"));
         assert_eq!(payload["messages"][0]["content"], json!("ping"));
-        Json(json!({
-            "id": "msg_test",
-            "type": "message",
-            "role": "assistant",
-            "content": [{ "type": "text", "text": "pong" }],
-            "stop_reason": "end_turn",
-            "usage": {
-                "input_tokens": 1,
-                "output_tokens": 1
-            }
-        }))
+        (
+            StatusCode::OK,
+            [(CONTENT_TYPE, "text/event-stream")],
+            concat!(
+                "event: content_block_start\n",
+                "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"pong\"}}\n\n",
+                "event: message_delta\n",
+                "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n",
+                "event: message_stop\n",
+                "data: {\"type\":\"message_stop\"}\n\n",
+            ),
+        )
     }
 
     async fn rejected_probe_stub() -> (StatusCode, Json<Value>) {
@@ -1387,12 +1379,9 @@ mod tests {
             }),
             "openai",
         );
-        let (status, payload) = execute_connection_probe(&config)
+        execute_connection_probe(&config)
             .await
             .expect("anthropic probe should succeed");
-
-        assert_eq!(status, 200);
-        assert_eq!(payload["content"][0]["text"], json!("pong"));
         server.abort();
     }
 

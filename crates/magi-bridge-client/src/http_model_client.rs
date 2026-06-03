@@ -176,11 +176,11 @@ impl HttpModelBridgeClient {
             .body
     }
 
-    /// 构造一次「最小可用」探针请求（用于连接测试）。
+    /// 构造一次「最小可用」非流式请求（仅用于请求体装配单元测试）。
     ///
-    /// 与生产链路共用 [`build_http_request`](Self::build_http_request)：
-    /// - reasoning_effort、协议路由、认证头、Anthropic thinking 等约束完全一致；
-    /// - 探针 body 与真实推理 body 走同一份字段集，永远不会因双轨实现漂移。
+    /// 生产连接测试必须走 [`ModelBridgeClient::invoke_streaming`]，保证与真实会话
+    /// 的流式协议一致；这里不能再作为设置页可用性探针入口。
+    #[cfg(test)]
     pub fn build_probe_request(
         &self,
     ) -> Result<(String, serde_json::Value, Vec<(String, String)>), BridgeClientError> {
@@ -673,27 +673,7 @@ impl ModelBridgeClient for HttpModelBridgeClient {
         )?;
 
         if !(200..300).contains(&status) {
-            // Attempt to extract OpenAI-style error details
-            if let Ok(error_envelope) =
-                serde_json::from_str::<OpenAiCompatibleErrorEnvelope>(&response_body)
-            {
-                return Err(BridgeClientError::CallFailed {
-                    layer: BridgeErrorLayer::RemoteBusiness,
-                    code: Some(-32006),
-                    message: format!(
-                        "provider rejected request: {} (http_status={status})",
-                        error_envelope.error.message
-                    ),
-                });
-            }
-            return Err(BridgeClientError::CallFailed {
-                layer: BridgeErrorLayer::RemoteBusiness,
-                code: Some(-32006),
-                message: format!(
-                    "provider rejected request: http_status={status}, body={}",
-                    truncate_body(&response_body)
-                ),
-            });
+            return Err(provider_http_status_error(status, &response_body));
         }
 
         let payload = self.parse_success_payload(&response_body)?;
@@ -726,26 +706,7 @@ impl ModelBridgeClient for HttpModelBridgeClient {
         )?;
 
         if !(200..300).contains(&status) {
-            if let Ok(error_envelope) =
-                serde_json::from_str::<OpenAiCompatibleErrorEnvelope>(&response_body)
-            {
-                return Err(BridgeClientError::CallFailed {
-                    layer: BridgeErrorLayer::RemoteBusiness,
-                    code: Some(-32006),
-                    message: format!(
-                        "provider rejected request: {} (http_status={status})",
-                        error_envelope.error.message
-                    ),
-                });
-            }
-            return Err(BridgeClientError::CallFailed {
-                layer: BridgeErrorLayer::RemoteBusiness,
-                code: Some(-32006),
-                message: format!(
-                    "provider rejected request: http_status={status}, body={}",
-                    truncate_body(&response_body)
-                ),
-            });
+            return Err(provider_http_status_error(status, &response_body));
         }
 
         // 流式路径的 response_body 已经是 BridgeResponse payload 格式，
@@ -1004,25 +965,6 @@ where
 {
     Option::<Vec<OpenAiCompatibleToolCall>>::deserialize(deserializer)
         .map(|tool_calls| tool_calls.unwrap_or_default())
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenAiCompatibleErrorEnvelope {
-    error: OpenAiCompatibleErrorBody,
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenAiCompatibleErrorBody {
-    message: String,
-    #[serde(default)]
-    #[allow(dead_code)]
-    r#type: Option<String>,
-    #[serde(default)]
-    #[allow(dead_code)]
-    code: Option<serde_json::Value>,
-    #[serde(default)]
-    #[allow(dead_code)]
-    param: Option<serde_json::Value>,
 }
 
 fn read_non_empty_env(key: &str) -> Option<String> {
@@ -1321,6 +1263,23 @@ fn provider_non_sse_stream_message(body: &str) -> String {
         "provider response invalid: expected event stream, body={}",
         truncate_body(body)
     )
+}
+
+fn provider_http_status_error(status: u16, response_body: &str) -> BridgeClientError {
+    let message = if let Some(message) = provider_error_message(response_body) {
+        format!("provider rejected request: {message}")
+    } else {
+        format!(
+            "provider rejected request: body={}",
+            truncate_body(response_body)
+        )
+    };
+    BridgeClientError::HttpStatusFailed {
+        layer: BridgeErrorLayer::RemoteBusiness,
+        code: Some(-32006),
+        http_status: status,
+        message,
+    }
 }
 
 #[cfg(test)]
@@ -1775,6 +1734,20 @@ mod tests {
             }
             other => panic!("unexpected error variant: {other:?}"),
         }
+    }
+
+    #[test]
+    fn http_status_error_exposes_structured_status() {
+        let error = provider_http_status_error(
+            429,
+            r#"{"error":{"message":"rate limited","type":"rate_limit"}}"#,
+        );
+
+        assert_eq!(error.layer(), Some(BridgeErrorLayer::RemoteBusiness));
+        assert_eq!(error.code(), Some(-32006));
+        assert_eq!(error.http_status(), Some(429));
+        assert!(error.to_string().contains("rate limited"));
+        assert!(error.to_string().contains("http_status=429"));
     }
 
     #[test]

@@ -317,6 +317,13 @@ pub enum BridgeClientError {
         code: Option<i64>,
         message: String,
     },
+    #[error("桥接调用失败[{layer:?}]: {message} (http_status={http_status})")]
+    HttpStatusFailed {
+        layer: BridgeErrorLayer,
+        code: Option<i64>,
+        http_status: u16,
+        message: String,
+    },
     #[error("无效的宿主桥接目标: binding={binding_id}, target={bridge_target}")]
     InvalidBindingTarget {
         binding_id: String,
@@ -342,6 +349,7 @@ impl BridgeClientError {
     pub fn layer(&self) -> Option<BridgeErrorLayer> {
         match self {
             Self::CallFailed { layer, .. } => Some(*layer),
+            Self::HttpStatusFailed { layer, .. } => Some(*layer),
             Self::InvalidBindingTarget { .. }
             | Self::IncompatibleBindingAction { .. }
             | Self::MissingClient { .. }
@@ -353,7 +361,20 @@ impl BridgeClientError {
     pub fn code(&self) -> Option<i64> {
         match self {
             Self::CallFailed { code, .. } => *code,
+            Self::HttpStatusFailed { code, .. } => *code,
             Self::InvalidBindingTarget { .. }
+            | Self::IncompatibleBindingAction { .. }
+            | Self::MissingClient { .. }
+            | Self::MissingBinding { .. }
+            | Self::MissingWorkingDirectory { .. } => None,
+        }
+    }
+
+    pub fn http_status(&self) -> Option<u16> {
+        match self {
+            Self::HttpStatusFailed { http_status, .. } => Some(*http_status),
+            Self::CallFailed { .. }
+            | Self::InvalidBindingTarget { .. }
             | Self::IncompatibleBindingAction { .. }
             | Self::MissingClient { .. }
             | Self::MissingBinding { .. }
