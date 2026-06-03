@@ -5,6 +5,8 @@
 use magi_core::ExecutionResultStatus;
 
 pub const TOOL_EXECUTION_FAILED_PUBLIC_ERROR: &str = "工具执行失败，请稍后重试";
+pub const TOOL_SAFETY_NEEDS_APPROVAL_PUBLIC_ERROR: &str =
+    "安全防护已在受限访问下拦截该操作，请切换为完全访问权限后重试";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PublicToolError {
@@ -26,7 +28,7 @@ pub fn safety_gate_public_error(status: ExecutionResultStatus) -> PublicToolErro
     match status {
         ExecutionResultStatus::NeedsApproval => PublicToolError {
             error_code: "tool_safety_needs_approval",
-            error: "该操作触发安全防护，需要批准后执行",
+            error: TOOL_SAFETY_NEEDS_APPROVAL_PUBLIC_ERROR,
         },
         ExecutionResultStatus::Rejected => PublicToolError {
             error_code: "tool_safety_rejected",
@@ -107,9 +109,9 @@ pub fn infer_tool_call_status(result: &str) -> &'static str {
         "denied",
         "forbidden",
         "not allowed",
-        "requires approval",
-        "needs approval",
-        "人工审批",
+        "risk policy blocked",
+        "restricted access blocked",
+        "风险策略拦截",
         "已被拒绝",
         "被拒绝",
         "被阻断",
@@ -142,6 +144,27 @@ pub fn summarize_tool_result(result: &str) -> String {
         end -= 1;
     }
     format!("{}…", &result[..end])
+}
+
+pub fn model_visible_tool_result(result: &str, status: ExecutionResultStatus) -> String {
+    if matches!(status, ExecutionResultStatus::Succeeded) {
+        return result.to_string();
+    }
+
+    let structured_public_error = serde_json::from_str::<serde_json::Value>(result)
+        .ok()
+        .and_then(|value| value.as_object().cloned())
+        .is_some_and(|payload| {
+            payload.contains_key("error_code")
+                || payload.contains_key("summary")
+                || payload.contains_key("message")
+                || payload.contains_key("error")
+        });
+    if structured_public_error {
+        return summarize_tool_result(result);
+    }
+
+    result.to_string()
 }
 
 #[cfg(test)]
@@ -182,7 +205,7 @@ mod tests {
             "success"
         );
         assert_eq!(
-            infer_tool_call_status("高风险工具必须人工审批: shell_exec"),
+            infer_tool_call_status("高风险工具已被当前风险策略拦截: shell_exec"),
             "error"
         );
     }
@@ -202,5 +225,25 @@ mod tests {
 
         assert_eq!(summary.chars().count(), 121);
         assert!(summary.ends_with('…'));
+    }
+
+    #[test]
+    fn model_visible_tool_result_keeps_success_payload() {
+        let result = r#"{"status":"succeeded","stdout":"ok"}"#;
+
+        assert_eq!(
+            model_visible_tool_result(result, ExecutionResultStatus::Succeeded),
+            result
+        );
+    }
+
+    #[test]
+    fn model_visible_tool_result_summarizes_structured_error() {
+        let result = r#"{"status":"needs_approval","error_code":"tool_policy_needs_approval","error":"受限访问已拦截该操作，请切换为完全访问权限后重试"}"#;
+
+        assert_eq!(
+            model_visible_tool_result(result, ExecutionResultStatus::NeedsApproval),
+            "受限访问已拦截该操作，请切换为完全访问权限后重试"
+        );
     }
 }

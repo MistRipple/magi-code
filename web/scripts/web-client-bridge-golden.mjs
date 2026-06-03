@@ -489,7 +489,6 @@ installBrowserGlobals();
 installFetchStub();
 
 await withGoldenViteServer(async (server) => {
-  try {
   const bridgeRuntime = await server.ssrLoadModule('/src/shared/bridges/bridge-runtime.ts');
   const bridgeModule = await server.ssrLoadModule('/src/shared/bridges/web-client-bridge.ts');
   const messageHandler = await server.ssrLoadModule('/src/lib/message-handler.ts');
@@ -786,7 +785,7 @@ await withGoldenViteServer(async (server) => {
   workspaceListPayload = null;
 
   console.log('web client bridge golden replay passed');
-} finally {
-  window.__clearGoldenTimers?.();
-}
-}, { configFile: 'vite.web.config.ts' });
+}, {
+  configFile: 'vite.web.config.ts',
+  cleanup: () => window.__clearGoldenTimers?.(),
+});

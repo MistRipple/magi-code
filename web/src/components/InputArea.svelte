@@ -26,6 +26,7 @@
   import { i18n } from '../stores/i18n.svelte';
   import {
     type AccessProfile,
+    isAccessProfile,
     readStoredAccessProfile,
     writeStoredAccessProfile,
   } from '../shared/access-profile';
@@ -615,6 +616,14 @@
       inputValue = text;
       queueMicrotask(focusEditor);
     }
+    function handleSetAccessProfile(event: Event) {
+      const profile = (event as CustomEvent<{ profile?: unknown }>).detail?.profile;
+      if (!isAccessProfile(profile)) return;
+      selectAccessProfile(profile);
+      addToast('success', i18n.t('input.access.switched', {
+        mode: i18n.t(accessProfileOptions.find((option) => option.value === profile)?.labelKey ?? 'input.access.restricted'),
+      }));
+    }
     function handleAccessProfileOutsidePointerDown(event: PointerEvent) {
       if (!accessProfilePickerOpen) return;
       const target = event.target;
@@ -622,9 +631,11 @@
       accessProfilePickerOpen = false;
     }
     window.addEventListener('magi:fillComposer', handleFillComposer as EventListener);
+    window.addEventListener('magi:setAccessProfile', handleSetAccessProfile as EventListener);
     document.addEventListener('pointerdown', handleAccessProfileOutsidePointerDown, true);
     return () => {
       window.removeEventListener('magi:fillComposer', handleFillComposer as EventListener);
+      window.removeEventListener('magi:setAccessProfile', handleSetAccessProfile as EventListener);
       document.removeEventListener('pointerdown', handleAccessProfileOutsidePointerDown, true);
     };
   });

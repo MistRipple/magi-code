@@ -2904,11 +2904,20 @@ function createSettingsStore(props: { onClose?: () => void }) {
     get orchConfig() {
       return orchConfig;
     },
+    set orchConfig(v) {
+      orchConfig = v;
+    },
     get compConfig() {
       return compConfig;
     },
+    set compConfig(v) {
+      compConfig = v;
+    },
     get workerConfigs() {
       return workerConfigs;
+    },
+    set workerConfigs(v) {
+      workerConfigs = v;
     },
     get workerModelTabs() {
       return workerModelTabs;

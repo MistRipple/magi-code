@@ -1,10 +1,16 @@
 <script lang="ts">
   import { untrack } from 'svelte';
   import Icon from './Icon.svelte';
+  import AccessProfileSwitchAction from './AccessProfileSwitchAction.svelte';
   import { parseLeadingJson } from '../lib/terminal-utils';
   import { i18n } from '../stores/i18n.svelte';
   import type { ToolCall, TerminalSessionBlock } from '../types/message';
-  import { publicToolPayloadMessage, toolPayloadStatus } from '../lib/tool-error-payload';
+  import {
+    isAccessModeApprovalErrorPayload,
+    isStructuredToolErrorPayload,
+    publicToolPayloadMessage,
+    toolPayloadStatus,
+  } from '../lib/tool-error-payload';
 
   interface Props {
     toolCall?: ToolCall;
@@ -147,12 +153,18 @@
   const displayOutput = $derived.by(() => {
     const fromTerminal = terminal?.output;
     if (typeof fromTerminal === 'string' && fromTerminal.length > 0) {
+      if (isStructuredToolErrorPayload(fromTerminal)) {
+        return '';
+      }
       return formatOutput(fromTerminal);
     }
     if (parsedResult) {
       return '';
     }
     const raw = typeof toolCall?.result === 'string' ? toolCall.result : '';
+    if (isStructuredToolErrorPayload(raw)) {
+      return '';
+    }
     return formatOutput(raw);
   });
 
@@ -247,8 +259,25 @@
   const publicErrorText = $derived(
     publicToolPayloadMessage(parsedErrorResult)
     || publicToolPayloadMessage(parsedResult)
+    || publicToolPayloadMessage(terminal?.output)
+    || publicToolPayloadMessage(toolCall?.error)
+    || publicToolPayloadMessage(toolCall?.result)
   );
-  const errorText = $derived(terminal?.error || structuredErrorText(parsedErrorResult) || toolCall?.error || '');
+  const shouldOfferFullAccessSwitch = $derived(
+    isAccessModeApprovalErrorPayload(parsedErrorResult)
+    || isAccessModeApprovalErrorPayload(parsedResult)
+    || isAccessModeApprovalErrorPayload(terminal?.output)
+    || isAccessModeApprovalErrorPayload(toolCall?.error)
+    || isAccessModeApprovalErrorPayload(toolCall?.result)
+  );
+  const errorText = $derived(
+    terminal?.error
+    || publicToolPayloadMessage(terminal?.output)
+    || structuredErrorText(parsedErrorResult)
+    || publicToolPayloadMessage(toolCall?.error)
+    || toolCall?.error
+    || ''
+  );
   const showErrorHint = $derived.by(() => {
     const normalizedError = normalizeDisplayText(publicErrorText || errorText);
     if (!normalizedError) {
@@ -430,6 +459,10 @@
 
         {#if showErrorHint}
           <div class="terminal-error">{i18n.t('terminalSession.error')}: {publicErrorText || i18n.t('terminalSession.errorHint')}</div>
+        {/if}
+        {#if shouldOfferFullAccessSwitch}
+          <div class="terminal-hint">{i18n.t('toolCall.errorDiagnosis.permission.hint')}</div>
+          <AccessProfileSwitchAction />
         {/if}
 
         <div class="terminal-footer">

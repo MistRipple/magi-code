@@ -603,6 +603,8 @@ export interface Session {
   createdAt: number;
   updatedAt: number;
   messageCount?: number;
+  isRunning?: boolean;
+  runningTaskCount?: number;
   preview?: string;  // 会话预览
   messages?: { id: string; role: string; content: string }[];
   notifications?: {

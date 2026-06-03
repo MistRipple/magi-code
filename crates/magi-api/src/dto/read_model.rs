@@ -2,9 +2,9 @@ use magi_core::{
     MissionLifecyclePhase, TaskId, TaskStatus, public_runtime_summary, public_runtime_text,
 };
 use magi_event_bus::{
-    AuditUsageLedgerStatus, ExecutionGroupRuntimeSummaryEntry, MissionMetricsSummary,
-    RecoveryActivityStage, RecoveryDiagnosticSummaryEntry, RuntimeLedgerSummary,
-    RuntimeReadModelInput, SessionRuntimeBranchSummaryEntry, SessionRuntimeSummaryEntry,
+    ExecutionGroupRuntimeSummaryEntry, MissionMetricsSummary, RecoveryActivityStage,
+    RecoveryDiagnosticSummaryEntry, RuntimeLedgerSummary, RuntimeReadModelInput,
+    SessionRuntimeBranchSummaryEntry, SessionRuntimeSummaryEntry,
     SessionRuntimeTurnItemSummaryEntry, SessionRuntimeTurnSummaryEntry,
     WorkspaceRuntimeSummaryEntry,
 };
@@ -13,6 +13,9 @@ use magi_orchestrator::task_store::TaskStore;
 use magi_session_store::{SessionExecutionSidecarStatus, SessionRuntimeSidecarExport};
 use magi_workspace::{RecoveryStatus, WorkspaceRecoverySidecarExport};
 use std::collections::HashMap;
+
+#[cfg(test)]
+use magi_event_bus::AuditUsageLedgerStatus;
 
 /// Mission §1.4 聚合根派生属性的快照,用于从 `AppState` 收集后注入读模型 DTO。
 ///
@@ -46,7 +49,7 @@ pub fn runtime_read_model_dto(
     runtime_read_model
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub fn ledger_dto(status: AuditUsageLedgerStatus) -> AuditUsageLedgerDto {
     RuntimeLedgerSummary::from(status)
 }

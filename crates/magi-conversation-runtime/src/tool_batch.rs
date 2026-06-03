@@ -66,6 +66,8 @@ const AGENT_WAIT_DEFAULT_TIMEOUT_MS: u64 = 300_000;
 const AGENT_WAIT_MIN_TIMEOUT_MS: u64 = 1_000;
 const AGENT_WAIT_MAX_TIMEOUT_MS: u64 = 1_800_000;
 const TOOL_VISIBILITY_REJECTED_PUBLIC_ERROR: &str = "该工具在当前任务角色或阶段下不可用";
+const TOOL_POLICY_NEEDS_APPROVAL_PUBLIC_ERROR: &str =
+    "受限访问已拦截该操作，请切换为完全访问权限后重试";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AgentSpawnAccessMode {
@@ -1758,7 +1760,7 @@ fn task_tool_preflight_decision(
         workspace_root_path,
     );
     // S8：SafetyGate 语义判定。它和 TaskPolicy 都属于执行前判定：
-    // HardBlock 必须压过普通审批，TaskPolicy 的 Rejected 也不能被 SafetyGate
+    // HardBlock 必须压过常规风险拦截，TaskPolicy 的 Rejected 也不能被 SafetyGate
     // 的 NeedsApproval 降级。
     let access_profile = task
         .policy_snapshot
@@ -1967,9 +1969,10 @@ fn task_policy_decision_payload(
     access_profile: Option<magi_core::AccessProfile>,
 ) -> ToolPreflightDecision {
     let (error_code, public_error) = match status {
-        ExecutionResultStatus::NeedsApproval => {
-            ("tool_policy_needs_approval", "该工具需要批准后执行")
-        }
+        ExecutionResultStatus::NeedsApproval => (
+            "tool_policy_needs_approval",
+            TOOL_POLICY_NEEDS_APPROVAL_PUBLIC_ERROR,
+        ),
         ExecutionResultStatus::Rejected => ("tool_policy_rejected", "该工具在当前访问模式下不可用"),
         _ => ("tool_policy_failed", "该工具暂不可用"),
     };
@@ -2021,7 +2024,7 @@ fn task_tool_visibility_decision_payload(
 }
 
 /// S8：SafetyGate 的 HardBlock / RequireApprovalInRestricted 都是执行前判定。
-/// HardBlock 代表禁止执行；RequireApprovalInRestricted 代表受限模式下保留待审批语义。
+/// HardBlock 代表禁止执行；RequireApprovalInRestricted 代表受限模式拦截、完全访问审计放行。
 pub(crate) fn safety_gate_tool_decision(
     gate: &magi_safety_gate::SafetyGate,
     access_profile: magi_core::AccessProfile,
@@ -2065,7 +2068,7 @@ pub(crate) fn safety_gate_tool_decision(
                 category,
                 magi_safety_gate::SafetyAction::RequireApprovalInRestricted,
                 pattern,
-                format!("{reason}；只读分析模式不支持通过审批升级执行"),
+                format!("{reason}；只读分析模式不支持升级访问模式执行"),
             )),
         },
     }
@@ -2684,7 +2687,10 @@ mod tests {
             payload["error_code"].as_str(),
             Some("tool_policy_needs_approval")
         );
-        assert_eq!(payload["error"].as_str(), Some("该工具需要批准后执行"));
+        assert_eq!(
+            payload["error"].as_str(),
+            Some("受限访问已拦截该操作，请切换为完全访问权限后重试")
+        );
         assert_eq!(payload["access_profile"].as_str(), Some("restricted"));
     }
 
@@ -3083,7 +3089,7 @@ mod tests {
         );
         assert_eq!(
             payload["error"].as_str(),
-            Some("该操作触发安全防护，需要批准后执行")
+            Some("安全防护已在受限访问下拦截该操作，请切换为完全访问权限后重试")
         );
         assert!(payload.get("safety_gate").is_none());
         assert!(!decision.payload.contains("deploy-prod"));
@@ -3288,7 +3294,7 @@ mod tests {
             payload["error_code"].as_str(),
             Some("tool_policy_needs_approval")
         );
-        assert!(target.exists(), "需要审批的删除不能提前执行");
+        assert!(target.exists(), "受限访问拦截的删除不能提前执行");
     }
 
     #[test]

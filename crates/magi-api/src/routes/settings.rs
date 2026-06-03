@@ -68,7 +68,7 @@ struct FetchModelsRequest {
 fn parse_fetch_models_config(
     request: FetchModelsRequest,
 ) -> Result<(NormalizedModelConfig, String), ApiError> {
-    let config = NormalizedModelConfig::from_settings_value(&request.config, "openai");
+    let config = NormalizedModelConfig::from_settings_value(&request.config);
     config.require_base_url().map_err(ApiError::InvalidInput)?;
     config.require_api_key().map_err(ApiError::InvalidInput)?;
     config
@@ -122,7 +122,7 @@ fn parse_model_ids(payload: &Value) -> Vec<String> {
 
 fn parse_connection_probe_config(request: Value) -> Result<NormalizedModelConfig, ApiError> {
     let config = unwrap_settings_section_request(&request);
-    let normalized = NormalizedModelConfig::from_settings_value(&config, "openai");
+    let normalized = NormalizedModelConfig::from_settings_value(&config);
     normalized
         .require_base_url()
         .map_err(ApiError::InvalidInput)?;
@@ -1369,16 +1369,13 @@ mod tests {
                 .expect("stub server should run");
         });
 
-        let config = NormalizedModelConfig::from_settings_value(
-            &json!({
-                "provider": "anthropic",
-                "baseUrl": base_url,
-                "apiKey": "test-key",
-                "model": "claude-sonnet-test",
-                "urlMode": "standard"
-            }),
-            "openai",
-        );
+        let config = NormalizedModelConfig::from_settings_value(&json!({
+            "provider": "anthropic",
+            "baseUrl": base_url,
+            "apiKey": "test-key",
+            "model": "claude-sonnet-test",
+            "urlMode": "standard"
+        }));
         execute_connection_probe(&config)
             .await
             .expect("anthropic probe should succeed");
@@ -1595,12 +1592,12 @@ mod tests {
         );
         assert_eq!(
             shell_exec["effectiveApprovalPolicy"],
-            serde_json::json!("ordinary_approval_skipped"),
+            serde_json::json!("regular_risk_block_skipped"),
             "settings bootstrap should render tool policy under requested access profile"
         );
         assert_eq!(
             shell_exec["accessProfileBehavior"],
-            serde_json::json!("full_access_skips_ordinary_approval"),
+            serde_json::json!("full_access_skips_regular_risk_blocks"),
             "settings bootstrap should keep access profile diagnostics aligned with composer mode"
         );
         assert_eq!(

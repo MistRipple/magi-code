@@ -121,12 +121,12 @@ fn default_task_tier() -> TaskTier {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AccessProfile {
-    /// 只读分析：允许读、搜索、诊断；写入和外部副作用直接拒绝，不升级审批。
+    /// 只读分析：允许读、搜索、诊断；写入和外部副作用直接拒绝，不升级访问模式。
     ReadOnly,
-    /// 受限执行：默认模式；常规 workspace 操作自动执行，高风险动作进入审批。
+    /// 受限执行：默认模式；常规 workspace 操作自动执行，高风险动作直接拦截。
     #[default]
     Restricted,
-    /// 完全授权：不走普通审批；产品级硬阻断和任务/角色约束仍然生效。
+    /// 完全授权：跳过常规风险拦截；产品级硬阻断和任务/角色约束仍然生效。
     FullAccess,
 }
 

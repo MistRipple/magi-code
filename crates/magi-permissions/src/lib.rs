@@ -12,11 +12,11 @@
 //!   * `PathAccess` — 按目录读/写 scope
 //!   * `ShellCommand` — 按 shell 参数推断读/写性质
 //! - 访问模式来自 `TaskPolicy.access_profile`。引擎本身无状态，便于跨线程复用。
-//! - 引擎不直接处理用户审批弹窗；它只输出 `Decision`（Allow / Deny / NeedsApproval），
-//!   交给上层（SafetyGate / governance 服务 / UI）决定怎么呈现。
+//! - 引擎不直接处理 UI 呈现；它只输出 `Decision`（Allow / Deny / NeedsApproval），
+//!   交给上层（SafetyGate / governance 服务 / UI）统一解释为受限拦截或放行。
 //!
-//! 与既有 magi-governance 的关系：governance 关注"审批流转 / 风险打分"，
-//! 即"已经判定 NeedsApproval 之后由谁审批、怎么记录"；permissions 关注
+//! 与既有 magi-governance 的关系：governance 关注"风险打分 / 拦截记录"，
+//! 即"已经判定 NeedsApproval 之后如何记录与呈现"；permissions 关注
 //! "在调用前根据规则给出 Allow/Deny/NeedsApproval"。两者职责互不重叠。
 
 use magi_core::AccessProfile;
@@ -54,9 +54,9 @@ pub enum PathAccessKind {
 }
 
 /// 引擎判定结果。三态：
-/// - Allow：放行，不需要审批
+/// - Allow：放行
 /// - Deny：拒绝，附带原因（用于上抛模型 / 写入 turn item）
-/// - NeedsApproval：未被规则裁定，需要 governance / 用户介入
+/// - NeedsApproval：受限模式下需要由上层按风险策略拦截
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Decision {
     Allow,

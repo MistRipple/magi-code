@@ -1027,7 +1027,6 @@ export function applyAuthoritativeProcessingState(input: AppState['processingSta
     messagesState.pendingRequests = new Set();
     messagesState.activeMessageIds = new Set();
     messagesState.thinkingStartAt = null;
-    sealAllStreamingMessages();
     updateProcessingState();
     return;
   }
@@ -1065,7 +1064,6 @@ export function applyAuthoritativeProcessingState(input: AppState['processingSta
       || Date.now();
   } else {
     messagesState.thinkingStartAt = null;
-    sealAllStreamingMessages();
   }
   messagesState.isProcessing = nextIsProcessing;
 }
@@ -1339,18 +1337,12 @@ export function setOrchestratorRuntimeState(input: OrchestratorRuntimeState | nu
     return;
   }
   messagesState.orchestratorRuntimeState = next;
-  if (runtimeStateIsTerminal(next)) {
-    sealAllStreamingMessages();
-  }
   updateProcessingState();
 }
 
 export function replaceOrchestratorRuntimeState(input: OrchestratorRuntimeState | null): void {
   const next = normalizeOrchestratorRuntimeState(input);
   messagesState.orchestratorRuntimeState = next;
-  if (runtimeStateIsTerminal(next)) {
-    sealAllStreamingMessages();
-  }
   updateProcessingState();
 }
 
@@ -1563,20 +1555,8 @@ export function setAppState(nextState: AppState | null) {
   }
 }
 
-// setMissionPlan removed — old Mission/Assignment incremental handlers superseded by Task Projection.
-
 // 防回抬冷却期（ms）：forced idle 后的短暂窗口内，拒绝任何来源的 processing=true
 const ANTI_LIFT_BACK_COOLDOWN_MS = 2000;
-
-// Worker 执行状态操作
-function runtimeStateIsTerminal(runtimeState: OrchestratorRuntimeState | null): boolean {
-  const status = runtimeState?.status;
-  return status === 'idle'
-    || status === 'blocked'
-    || status === 'completed'
-    || status === 'failed'
-    || status === 'cancelled';
-}
 
 function updateProcessingState() {
   // 单一事实源：后端权威 backendProcessing + 本地乐观 pendingRequests。
@@ -1646,9 +1626,6 @@ export function clearPendingRequest(id: string) {
     const next = new Set(messagesState.pendingRequests);
     next.delete(id);
     messagesState.pendingRequests = next;
-    if (next.size === 0 && !messagesState.backendProcessing && !timelineHasStreamingMessage()) {
-      sealAllStreamingMessages();
-    }
     updateProcessingState();
   }
 }
@@ -1668,7 +1645,6 @@ export function settleAuthoritativeIdleState() {
   messagesState.pendingRequests = new Set();
   messagesState.activeMessageIds = new Set();
   messagesState.thinkingStartAt = null;
-  sealAllStreamingMessages();
   updateProcessingState();
 }
 
@@ -1700,11 +1676,6 @@ export function clearProcessingState(options?: {
 export function settleProcessingForManualInteraction() {
   clearPendingInteractions();
   clearProcessingState();
-}
-
-export function sealAllStreamingMessages() {
-  // 主线终态只允许由 canonical turn/item 更新。这里保留为空操作，
-  // 用于兼容处理态收敛调用点，避免前端本地反向改写聊天事实。
 }
 
 /** 获取后端处理状态（用于时序判断） */
@@ -1873,14 +1844,24 @@ export function addToast(type: string, message: string, title?: string, options?
       actionRequired: policy.actionRequired,
       duration: policy.duration,
     };
-    // 超过上限时丢弃最旧的非 actionRequired toast
-    let nextToasts = [...toasts, toast];
+    const duplicateIndex = toasts.findIndex((item) => (
+      item.type === toast.type
+      && item.title === toast.title
+      && item.message === toast.message
+      && item.category === toast.category
+      && item.source === toast.source
+    ));
+    const baseToasts = duplicateIndex >= 0
+      ? toasts.filter((_, index) => index !== duplicateIndex)
+      : toasts;
+    // 超过上限时优先丢弃最旧的非 actionRequired toast；若全是关键错误，也必须保持硬上限。
+    let nextToasts = [...baseToasts, toast];
     while (nextToasts.length > MAX_VISIBLE_TOASTS) {
       const discardIndex = nextToasts.findIndex((t) => !t.actionRequired);
       if (discardIndex >= 0) {
         nextToasts.splice(discardIndex, 1);
       } else {
-        break; // 全部都是 actionRequired，不丢弃
+        nextToasts.shift();
       }
     }
     toasts = nextToasts;

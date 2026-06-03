@@ -88,21 +88,10 @@ impl FailoverModelBridgeClient {
     }
 
     fn should_failover(error: &BridgeClientError) -> bool {
-        match error {
-            BridgeClientError::CallFailed { layer, .. } => {
-                matches!(
-                    layer,
-                    BridgeErrorLayer::Transport | BridgeErrorLayer::Protocol
-                )
-            }
-            BridgeClientError::HttpStatusFailed { layer, .. } => {
-                matches!(
-                    layer,
-                    BridgeErrorLayer::Transport | BridgeErrorLayer::Protocol
-                )
-            }
-            _ => false,
-        }
+        matches!(
+            error.layer(),
+            Some(BridgeErrorLayer::Transport | BridgeErrorLayer::Protocol)
+        )
     }
 }
 
@@ -333,7 +322,7 @@ fn build_client_from_section(
     section: &str,
 ) -> Option<Arc<dyn ModelBridgeClient>> {
     let config = settings_store.get_section(section);
-    let normalized = NormalizedModelConfig::from_settings_value(&config, "openai");
+    let normalized = NormalizedModelConfig::from_settings_value(&config);
     normalized
         .to_http_model_client("gpt-4")
         .map(|client| Arc::new(client) as Arc<dyn ModelBridgeClient>)
@@ -1807,7 +1796,7 @@ fn safeguard_rule_prompt_line(pattern: &str, action: magi_safety_gate::SafetyAct
             format!("- [阻断] {pattern}：任何访问模式下都不得执行，也不得请求用户批准后绕过。")
         }
         magi_safety_gate::SafetyAction::RequireApprovalInRestricted => format!(
-            "- [受限需审批] {pattern}：受限访问下必须等待用户批准；完全访问下按当前授权执行并保留风险说明。"
+            "- [受限拦截] {pattern}：受限访问下会被拦截且不会执行；完全访问下按当前授权执行并保留风险说明。"
         ),
         magi_safety_gate::SafetyAction::AuditOnly => {
             format!("- [审计] {pattern}：允许执行，但需要保持风险意识并如实说明影响。")
@@ -2908,7 +2897,7 @@ mod tests {
         );
         assert!(
             prompt.contains(
-                "- [受限需审批] custom approval command：受限访问下必须等待用户批准；完全访问下按当前授权执行并保留风险说明。"
+                "- [受限拦截] custom approval command：受限访问下会被拦截且不会执行；完全访问下按当前授权执行并保留风险说明。"
             ),
             "RequireApprovalInRestricted 必须表达访问模式差异"
         );

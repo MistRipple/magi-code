@@ -44,7 +44,10 @@ impl GovernanceService {
             ApprovalAction::RequiresManualApproval => GovernanceDecision::needs_approval(
                 DecisionPhase::ApprovalPolicy,
                 self.thresholds.manual_approval_risk,
-                Some(format!("高风险工具必须人工审批: {}", request.tool_name)),
+                Some(format!(
+                    "高风险工具已被当前风险策略拦截: {}",
+                    request.tool_name
+                )),
             ),
             ApprovalAction::AutoAllowed => GovernanceDecision::allowed(
                 DecisionPhase::ToolPolicy,
@@ -160,7 +163,7 @@ impl GovernanceService {
                     request
                         .reason
                         .clone()
-                        .unwrap_or_else(|| "worker 控制动作需要人工审批".to_string()),
+                        .unwrap_or_else(|| "worker 控制动作已被当前风险策略拦截".to_string()),
                 ),
             );
         }

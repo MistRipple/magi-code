@@ -1,7 +1,7 @@
 use crate::tool_declared_paths::{append_result_declared_paths, derive_declared_paths};
 use crate::tool_result_utils::{
-    summarize_tool_result, tool_execution_failed_result, tool_execution_status_label,
-    turn_item_status_for_tool_result,
+    model_visible_tool_result, summarize_tool_result, tool_execution_failed_result,
+    tool_execution_status_label, turn_item_status_for_tool_result,
 };
 use crate::{
     SKILL_APPLY_TOOL_NAME, active_skill_tool_execution_policy, execute_skill_apply_from_runtime,
@@ -753,7 +753,7 @@ pub fn append_session_tool_call_items_batch(
         );
         messages.push(ChatMessage {
             role: "tool".to_string(),
-            content: Some(tool_result),
+            content: Some(model_visible_tool_result(&tool_result, tool_status)),
             images: Vec::new(),
             tool_calls: Vec::new(),
             tool_call_id: Some(tool_call.id.clone()),
@@ -1634,7 +1634,10 @@ mod tests {
         assert_eq!(parsed["status"], "needs_approval");
         assert_eq!(parsed["tool"], "skill__code-review__review-mcp");
         assert_eq!(parsed["error_code"], "skill_tool_needs_approval");
-        assert_eq!(parsed["error"], "Skill 工具需要批准后执行");
+        assert_eq!(
+            parsed["error"],
+            "受限访问已拦截该 Skill 工具，请切换为完全访问权限后重试"
+        );
         assert_eq!(parsed.get("bridge_kind"), None);
         assert_eq!(parsed.get("bridge_target"), None);
         assert_eq!(parsed.get("risk_level"), None);
@@ -1904,7 +1907,7 @@ mod tests {
         assert_eq!(status, ExecutionResultStatus::NeedsApproval);
         assert!(
             !target.exists(),
-            "受限模式下写类 shell 需要审批，不能提前执行"
+            "受限模式下写类 shell 被拦截，不能提前执行"
         );
         let parsed: serde_json::Value = serde_json::from_str(&payload).expect("payload json");
         assert_eq!(parsed["tool"], "shell_exec");
@@ -1993,7 +1996,10 @@ mod tests {
         assert_eq!(parsed["tool"], "shell_exec");
         assert_eq!(parsed["status"], "needs_approval");
         assert_eq!(parsed["error_code"], "tool_safety_needs_approval");
-        assert_eq!(parsed["error"], "该操作触发安全防护，需要批准后执行");
+        assert_eq!(
+            parsed["error"],
+            "安全防护已在受限访问下拦截该操作，请切换为完全访问权限后重试"
+        );
         assert_eq!(parsed.get("safety_gate"), None);
         assert!(!payload.contains("rm -rf"));
         assert!(!payload.contains("bulk_delete"));
@@ -2085,7 +2091,7 @@ mod tests {
         assert_eq!(parsed["tool"], "file_remove");
         assert_eq!(parsed["status"], "needs_approval");
         assert_eq!(parsed["error_code"], "tool_policy_needs_approval");
-        assert!(target.exists(), "需要审批的删除不能提前执行");
+        assert!(target.exists(), "受限访问拦截的删除不能提前执行");
     }
 
     #[test]
@@ -2357,7 +2363,7 @@ mod tests {
             || true,
         );
 
-        assert!(!target.exists(), "需要审批的工具调用不能提前执行");
+        assert!(!target.exists(), "受限访问拦截的工具调用不能提前执行");
         let sidecar = session_store
             .runtime_sidecar(&session_id)
             .expect("sidecar should exist");
@@ -2365,12 +2371,18 @@ mod tests {
         let item = turn.items.first().expect("tool item should exist");
         assert_eq!(item.status, "failed");
         assert_eq!(item.tool_status.as_deref(), Some("needs_approval"));
-        assert!(item.tool_error.is_some(), "需要审批必须作为错误槽写回");
+        assert!(item.tool_error.is_some(), "受限访问拦截必须作为错误槽写回");
         assert_eq!(
             messages
                 .first()
                 .and_then(|message| message.tool_call_id.as_deref()),
             Some("tool-call-approval-shell")
+        );
+        assert_eq!(
+            messages
+                .first()
+                .and_then(|message| message.content.as_deref()),
+            Some("受限访问已拦截该操作，请切换为完全访问权限后重试")
         );
 
         let canonical_turn = session_store

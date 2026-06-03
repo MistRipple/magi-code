@@ -11,6 +11,7 @@ export async function withGoldenViteServer(callback, options = {}) {
   try {
     return await callback(server);
   } finally {
+    await options.cleanup?.();
     await server.close();
   }
 }

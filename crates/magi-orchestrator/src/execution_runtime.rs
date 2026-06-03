@@ -116,7 +116,7 @@ impl OrchestratedExecutionRuntime {
         })
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub(crate) fn execute_dispatch(
         &self,
         target: TaskExecutionTarget,

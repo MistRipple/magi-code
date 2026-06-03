@@ -2555,13 +2555,15 @@ mod tests {
             .expect_err("rejected request should return error");
 
         match error {
-            BridgeClientError::CallFailed {
+            BridgeClientError::HttpStatusFailed {
                 layer,
                 code,
+                http_status,
                 message,
             } => {
                 assert_eq!(layer, BridgeErrorLayer::RemoteBusiness);
                 assert_eq!(code, Some(-32006));
+                assert_eq!(http_status, 400);
                 assert!(message.contains("bad request"), "message was: {message}");
             }
             other => panic!("unexpected error: {other:?}"),

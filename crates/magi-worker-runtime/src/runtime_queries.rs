@@ -388,7 +388,7 @@ fn public_worker_governance_reason(
 ) -> String {
     match decision.outcome {
         GovernanceOutcome::Allowed => "worker 控制动作已通过治理检查".to_string(),
-        GovernanceOutcome::NeedsApproval => "worker 控制动作需要人工审批".to_string(),
+        GovernanceOutcome::NeedsApproval => "worker 控制动作已被当前风险策略拦截".to_string(),
         GovernanceOutcome::Blocked => "worker 控制动作被治理阻断".to_string(),
         GovernanceOutcome::Rejected => match action {
             WorkerControlKind::RepairRetry => "修复重试不满足执行条件".to_string(),

@@ -9,8 +9,8 @@ use crate::task_execution_registry::TaskExecutionRegistry;
 use crate::task_helpers::task_is_long_mission;
 use crate::task_runner_bridge::TaskOutcome;
 use crate::tool_result_utils::{
-    infer_tool_call_status, summarize_tool_result, tool_execution_status_label,
-    turn_item_status_for_tool_result,
+    infer_tool_call_status, model_visible_tool_result, summarize_tool_result,
+    tool_execution_status_label, turn_item_status_for_tool_result,
 };
 use crate::{
     ConversationRegistry, MailboxAuthor, MailboxItem, MailboxKind, RoundOutcome,
@@ -1381,7 +1381,7 @@ fn run_conversation_loop_inner(
             tool_call_records.push(tool_call_record(tool_call, &result));
             messages.push(ChatMessage {
                 role: "tool".to_string(),
-                content: Some(result),
+                content: Some(model_visible_tool_result(&result, tool_status)),
                 images: Vec::new(),
                 tool_calls: Vec::new(),
                 tool_call_id: Some(tool_call.id.clone()),

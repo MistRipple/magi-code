@@ -264,7 +264,7 @@ impl RuntimeMaintenance {
         ));
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub(crate) fn enter_maintenance_mode(&self, reason: impl Into<String>) {
         let mut state = self
             .state
@@ -277,7 +277,7 @@ impl RuntimeMaintenance {
         state.mode_reason = Some(reason.into());
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub(crate) fn request_graceful_shutdown(&self, reason: impl Into<String>) {
         let mut state = self
             .state

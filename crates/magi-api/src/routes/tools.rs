@@ -195,11 +195,11 @@ mod tests {
             .expect("shell_exec should be listed");
         assert_eq!(
             shell_exec["effective_approval_policy"],
-            "ordinary_approval_skipped"
+            "regular_risk_block_skipped"
         );
         assert_eq!(
             shell_exec["access_profile_behavior"],
-            "full_access_skips_ordinary_approval"
+            "full_access_skips_regular_risk_blocks"
         );
     }
 

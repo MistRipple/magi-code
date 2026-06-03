@@ -2,7 +2,7 @@ use crate::{
     SkillDispatchError, SkillDispatchInput, SkillDispatchObservation, SkillDispatchResult,
     SkillDispatchRoute, SkillDispatchStatus,
 };
-use magi_bridge_client::{BridgeBindingReference, BridgeClientError};
+use magi_bridge_client::BridgeBindingReference;
 use magi_core::ExecutionResultStatus;
 
 pub(crate) fn build_dispatch_observation(
@@ -93,15 +93,12 @@ fn map_dispatch_error_status(error: &SkillDispatchError) -> SkillDispatchStatus 
         SkillDispatchError::UnknownRequestedTool { .. }
         | SkillDispatchError::AmbiguousBridgeBinding { .. }
         | SkillDispatchError::MissingBridgeBinding { .. } => SkillDispatchStatus::Rejected,
-        SkillDispatchError::Bridge(error) => match error {
-            BridgeClientError::InvalidBindingTarget { .. }
-            | BridgeClientError::IncompatibleBindingAction { .. }
-            | BridgeClientError::MissingClient { .. }
-            | BridgeClientError::MissingBinding { .. }
-            | BridgeClientError::MissingWorkingDirectory { .. } => SkillDispatchStatus::Rejected,
-            BridgeClientError::CallFailed { .. } | BridgeClientError::HttpStatusFailed { .. } => {
+        SkillDispatchError::Bridge(error) => {
+            if error.layer().is_some() {
                 SkillDispatchStatus::Failed
+            } else {
+                SkillDispatchStatus::Rejected
             }
-        },
+        }
     }
 }

@@ -189,7 +189,7 @@ fn external_binding_policy_labels(
 ) -> (&'static str, &'static str, &'static str) {
     match bridge_kind {
         magi_bridge_client::BridgeBindingKind::Mcp => {
-            ("restricted_requires_approval", "high", "required")
+            ("restricted_blocks_high_risk", "high", "required")
         }
         magi_bridge_client::BridgeBindingKind::Model => ("access_profile_inherited", "low", "none"),
     }
@@ -1838,7 +1838,7 @@ mod tests {
 
         assert_eq!(tool.bridge_kind, "mcp");
         assert_eq!(tool.dispatch_action, "mcp_tool_call");
-        assert_eq!(tool.access_profile_behavior, "restricted_requires_approval");
+        assert_eq!(tool.access_profile_behavior, "restricted_blocks_high_risk");
         assert_eq!(tool.approval_requirement, "required");
     }
 

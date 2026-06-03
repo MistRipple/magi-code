@@ -89,10 +89,9 @@ pub struct RoleEngineModelConfig {
 impl NormalizedModelConfig {
     /// 从 settings JSON 构造归一化模型配置。
     ///
-    /// `_default_provider` 参数仅为保持上层调用方签名兼容，实际不再参与逻辑——
     /// provider 完全由归一化后的 `urlMode + baseUrl + model` 推断。历史配置里的
     /// `provider` / `openaiProtocol` / `protocolEndpoint` 字段会被静默忽略。
-    pub fn from_settings_value(value: &Value, _default_provider: &str) -> Self {
+    pub fn from_settings_value(value: &Value) -> Self {
         let url_mode_label =
             string_field(value, "urlMode").unwrap_or_else(|| "standard".to_string());
         Self {
@@ -255,7 +254,7 @@ pub fn configured_role_engine_model_config(
             binding.engine_id
         )
     })?;
-    let config = NormalizedModelConfig::from_settings_value(&engine_llm, "openai");
+    let config = NormalizedModelConfig::from_settings_value(&engine_llm);
     config.require_base_url().map_err(|error| {
         format!(
             "角色 {role_id} 的模型引擎 {} 配置无效：{error}",
@@ -368,15 +367,12 @@ mod tests {
 
     #[test]
     fn standard_mode_v1_suffix_infers_openai_chat() {
-        let config = NormalizedModelConfig::from_settings_value(
-            &json!({
-                "baseUrl": "https://api.deepseek.com/v1",
-                "apiKey": "sk-test",
-                "model": "deepseek-chat",
-                "urlMode": "standard"
-            }),
-            "openai",
-        );
+        let config = NormalizedModelConfig::from_settings_value(&json!({
+            "baseUrl": "https://api.deepseek.com/v1",
+            "apiKey": "sk-test",
+            "model": "deepseek-chat",
+            "urlMode": "standard"
+        }));
         assert_eq!(
             config.inferred_protocol(),
             HttpModelBridgeProtocol::ChatCompletions
@@ -386,15 +382,12 @@ mod tests {
 
     #[test]
     fn standard_mode_without_v1_suffix_uses_openai_chat() {
-        let config = NormalizedModelConfig::from_settings_value(
-            &json!({
-                "baseUrl": "https://gateway.example.com",
-                "apiKey": "sk-test",
-                "model": "gateway-model",
-                "urlMode": "standard"
-            }),
-            "openai",
-        );
+        let config = NormalizedModelConfig::from_settings_value(&json!({
+            "baseUrl": "https://gateway.example.com",
+            "apiKey": "sk-test",
+            "model": "gateway-model",
+            "urlMode": "standard"
+        }));
         assert_eq!(
             config.inferred_protocol(),
             HttpModelBridgeProtocol::ChatCompletions
@@ -404,15 +397,12 @@ mod tests {
 
     #[test]
     fn standard_mode_claude_model_infers_anthropic_messages() {
-        let config = NormalizedModelConfig::from_settings_value(
-            &json!({
-                "baseUrl": "https://gateway.example.com",
-                "apiKey": "sk-test",
-                "model": "kiro-claude-sonnet-4-6",
-                "urlMode": "standard"
-            }),
-            "openai",
-        );
+        let config = NormalizedModelConfig::from_settings_value(&json!({
+            "baseUrl": "https://gateway.example.com",
+            "apiKey": "sk-test",
+            "model": "kiro-claude-sonnet-4-6",
+            "urlMode": "standard"
+        }));
         assert_eq!(
             config.inferred_protocol(),
             HttpModelBridgeProtocol::AnthropicMessages
@@ -423,24 +413,18 @@ mod tests {
     #[test]
     fn same_base_url_routes_by_model_family() {
         let base = "https://gateway.example.com";
-        let claude_config = NormalizedModelConfig::from_settings_value(
-            &json!({
-                "baseUrl": base,
-                "apiKey": "sk-test",
-                "model": "claude-opus-4-5",
-                "urlMode": "standard"
-            }),
-            "openai",
-        );
-        let gpt_config = NormalizedModelConfig::from_settings_value(
-            &json!({
-                "baseUrl": base,
-                "apiKey": "sk-test",
-                "model": "gpt-5",
-                "urlMode": "standard"
-            }),
-            "openai",
-        );
+        let claude_config = NormalizedModelConfig::from_settings_value(&json!({
+            "baseUrl": base,
+            "apiKey": "sk-test",
+            "model": "claude-opus-4-5",
+            "urlMode": "standard"
+        }));
+        let gpt_config = NormalizedModelConfig::from_settings_value(&json!({
+            "baseUrl": base,
+            "apiKey": "sk-test",
+            "model": "gpt-5",
+            "urlMode": "standard"
+        }));
 
         assert_eq!(
             claude_config.inferred_protocol(),
@@ -454,15 +438,12 @@ mod tests {
 
     #[test]
     fn full_mode_messages_suffix_infers_anthropic() {
-        let config = NormalizedModelConfig::from_settings_value(
-            &json!({
-                "baseUrl": "https://proxy.example.com/v1/messages",
-                "apiKey": "sk-test",
-                "model": "claude-sonnet",
-                "urlMode": "full"
-            }),
-            "openai",
-        );
+        let config = NormalizedModelConfig::from_settings_value(&json!({
+            "baseUrl": "https://proxy.example.com/v1/messages",
+            "apiKey": "sk-test",
+            "model": "claude-sonnet",
+            "urlMode": "full"
+        }));
         assert_eq!(
             config.inferred_protocol(),
             HttpModelBridgeProtocol::AnthropicMessages
@@ -472,15 +453,12 @@ mod tests {
 
     #[test]
     fn full_mode_chat_completions_suffix_infers_openai() {
-        let config = NormalizedModelConfig::from_settings_value(
-            &json!({
-                "baseUrl": "https://proxy.example.com/v1/chat/completions",
-                "apiKey": "sk-test",
-                "model": "gpt-4",
-                "urlMode": "full"
-            }),
-            "openai",
-        );
+        let config = NormalizedModelConfig::from_settings_value(&json!({
+            "baseUrl": "https://proxy.example.com/v1/chat/completions",
+            "apiKey": "sk-test",
+            "model": "gpt-4",
+            "urlMode": "full"
+        }));
         assert_eq!(
             config.inferred_protocol(),
             HttpModelBridgeProtocol::ChatCompletions
@@ -490,15 +468,12 @@ mod tests {
 
     #[test]
     fn trailing_slash_does_not_affect_v1_inference() {
-        let config = NormalizedModelConfig::from_settings_value(
-            &json!({
-                "baseUrl": "https://api.deepseek.com/v1/",
-                "apiKey": "sk-test",
-                "model": "deepseek-chat",
-                "urlMode": "standard"
-            }),
-            "openai",
-        );
+        let config = NormalizedModelConfig::from_settings_value(&json!({
+            "baseUrl": "https://api.deepseek.com/v1/",
+            "apiKey": "sk-test",
+            "model": "deepseek-chat",
+            "urlMode": "standard"
+        }));
         assert_eq!(
             config.inferred_protocol(),
             HttpModelBridgeProtocol::ChatCompletions
@@ -507,17 +482,14 @@ mod tests {
 
     #[test]
     fn legacy_provider_and_protocol_fields_are_ignored() {
-        let config = NormalizedModelConfig::from_settings_value(
-            &json!({
-                "provider": "anthropic",
-                "openaiProtocol": "responses",
-                "baseUrl": "https://api.deepseek.com/v1",
-                "apiKey": "sk-test",
-                "model": "deepseek-chat",
-                "urlMode": "standard"
-            }),
-            "anthropic",
-        );
+        let config = NormalizedModelConfig::from_settings_value(&json!({
+            "provider": "anthropic",
+            "openaiProtocol": "responses",
+            "baseUrl": "https://api.deepseek.com/v1",
+            "apiKey": "sk-test",
+            "model": "deepseek-chat",
+            "urlMode": "standard"
+        }));
         assert_eq!(
             config.inferred_protocol(),
             HttpModelBridgeProtocol::ChatCompletions
@@ -527,14 +499,11 @@ mod tests {
 
     #[test]
     fn normalized_model_config_preserves_openai_fetch_models_contract() {
-        let config = NormalizedModelConfig::from_settings_value(
-            &json!({
-                "baseUrl": "http://127.0.0.1:8320/v1",
-                "apiKey": "test-key",
-                "urlMode": "standard"
-            }),
-            "openai",
-        );
+        let config = NormalizedModelConfig::from_settings_value(&json!({
+            "baseUrl": "http://127.0.0.1:8320/v1",
+            "apiKey": "test-key",
+            "urlMode": "standard"
+        }));
 
         assert_eq!(config.provider(), "openai");
         assert_eq!(
@@ -553,14 +522,11 @@ mod tests {
 
     #[test]
     fn standard_root_base_url_uses_openai_compatible_models_listing() {
-        let config = NormalizedModelConfig::from_settings_value(
-            &json!({
-                "baseUrl": "https://api.anthropic.com",
-                "apiKey": "test-key",
-                "urlMode": "standard"
-            }),
-            "openai",
-        );
+        let config = NormalizedModelConfig::from_settings_value(&json!({
+            "baseUrl": "https://api.anthropic.com",
+            "apiKey": "test-key",
+            "urlMode": "standard"
+        }));
 
         assert_eq!(
             config.inferred_protocol(),
@@ -577,14 +543,11 @@ mod tests {
 
     #[test]
     fn full_mode_rejects_models_listing() {
-        let config = NormalizedModelConfig::from_settings_value(
-            &json!({
-                "baseUrl": "http://127.0.0.1:8320/v1/chat/completions",
-                "apiKey": "test-key",
-                "urlMode": "full"
-            }),
-            "openai",
-        );
+        let config = NormalizedModelConfig::from_settings_value(&json!({
+            "baseUrl": "http://127.0.0.1:8320/v1/chat/completions",
+            "apiKey": "test-key",
+            "urlMode": "full"
+        }));
 
         let error = config
             .models_list_url()
@@ -594,14 +557,11 @@ mod tests {
 
     #[test]
     fn usage_llm_config_drops_legacy_protocol_field() {
-        let config = NormalizedModelConfig::from_settings_value(
-            &json!({
-                "baseUrl": "https://example.test/v1",
-                "model": "gpt-test",
-                "urlMode": "standard"
-            }),
-            "openai",
-        );
+        let config = NormalizedModelConfig::from_settings_value(&json!({
+            "baseUrl": "https://example.test/v1",
+            "model": "gpt-test",
+            "urlMode": "standard"
+        }));
 
         let usage = config.to_usage_llm_config().expect("usage config");
         assert_eq!(usage.provider, "openai");
@@ -611,15 +571,12 @@ mod tests {
 
     #[test]
     fn http_client_uses_inferred_protocol() {
-        let config = NormalizedModelConfig::from_settings_value(
-            &json!({
-                "baseUrl": "https://api.deepseek.com/v1",
-                "apiKey": "test-key",
-                "model": "deepseek-chat",
-                "urlMode": "standard"
-            }),
-            "openai",
-        );
+        let config = NormalizedModelConfig::from_settings_value(&json!({
+            "baseUrl": "https://api.deepseek.com/v1",
+            "apiKey": "test-key",
+            "model": "deepseek-chat",
+            "urlMode": "standard"
+        }));
 
         assert!(config.to_http_model_client("gpt-4").is_some());
         assert_eq!(
@@ -630,15 +587,12 @@ mod tests {
 
     #[test]
     fn http_client_uses_anthropic_for_standard_claude_model() {
-        let config = NormalizedModelConfig::from_settings_value(
-            &json!({
-                "baseUrl": "https://api.anthropic.com",
-                "apiKey": "test-key",
-                "model": "claude-sonnet",
-                "urlMode": "standard"
-            }),
-            "openai",
-        );
+        let config = NormalizedModelConfig::from_settings_value(&json!({
+            "baseUrl": "https://api.anthropic.com",
+            "apiKey": "test-key",
+            "model": "claude-sonnet",
+            "urlMode": "standard"
+        }));
 
         assert!(config.to_http_model_client("gpt-4").is_some());
         assert_eq!(
@@ -649,15 +603,12 @@ mod tests {
 
     #[test]
     fn full_mode_path_overrides_claude_model_name() {
-        let config = NormalizedModelConfig::from_settings_value(
-            &json!({
-                "baseUrl": "https://openai-compatible.example.com/v1/chat/completions",
-                "apiKey": "test-key",
-                "model": "claude-sonnet",
-                "urlMode": "full"
-            }),
-            "openai",
-        );
+        let config = NormalizedModelConfig::from_settings_value(&json!({
+            "baseUrl": "https://openai-compatible.example.com/v1/chat/completions",
+            "apiKey": "test-key",
+            "model": "claude-sonnet",
+            "urlMode": "full"
+        }));
 
         assert!(config.to_http_model_client("gpt-4").is_some());
         assert_eq!(

@@ -59,6 +59,8 @@ export interface AgentSessionSummary {
   createdAt: number;
   updatedAt: number;
   messageCount?: number;
+  isRunning?: boolean;
+  runningTaskCount?: number;
   preview?: string;
 }
 
@@ -107,6 +109,10 @@ interface RawAgentSessionSummary {
   updated_at?: number;
   messageCount?: number;
   message_count?: number;
+  isRunning?: boolean;
+  is_running?: boolean;
+  runningTaskCount?: number;
+  running_task_count?: number;
   preview?: string | null;
 }
 
@@ -535,6 +541,8 @@ function normalizeSessionSummary(raw: RawAgentSessionSummary): AgentSessionSumma
   const name = raw.name?.trim() || raw.title?.trim() || undefined;
   const preview = raw.preview?.trim() || undefined;
   const messageCount = raw.messageCount ?? raw.message_count;
+  const runningTaskCount = raw.runningTaskCount ?? raw.running_task_count;
+  const isRunning = raw.isRunning ?? raw.is_running;
   return {
     id,
     ...(workspaceId ? { workspaceId } : {}),
@@ -542,6 +550,8 @@ function normalizeSessionSummary(raw: RawAgentSessionSummary): AgentSessionSumma
     createdAt,
     updatedAt,
     ...(typeof messageCount === 'number' ? { messageCount } : {}),
+    ...(typeof isRunning === 'boolean' ? { isRunning } : {}),
+    ...(typeof runningTaskCount === 'number' ? { runningTaskCount: Math.max(0, Math.floor(runningTaskCount)) } : {}),
     ...(preview ? { preview } : {}),
   };
 }

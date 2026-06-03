@@ -16,7 +16,6 @@ import {
   updateRequestBinding,
   addPendingRequest,
   settleProcessingForManualInteraction,
-  sealAllStreamingMessages,
 } from '../stores/messages.svelte';
 import type { StandardMessage } from '../shared/protocol/message-protocol';
 import { MessageType, MessageCategory } from '../shared/protocol/message-protocol';
@@ -113,7 +112,6 @@ let activeBridgeInstance: ClientBridge | null = null;
 
 export function initMessageHandler(bridge: ClientBridge = getClientBridge()) {
   if (activeBridgeInstance === bridge && activeBridgeListenerCleanup) {
-    console.log('[MessageHandler] 消息处理器已初始化，跳过重复绑定');
     return;
   }
   if (activeBridgeListenerCleanup) {
@@ -122,7 +120,6 @@ export function initMessageHandler(bridge: ClientBridge = getClientBridge()) {
   }
   activeBridgeInstance = bridge;
   activeBridgeListenerCleanup = bridge.onMessage(handleMessage);
-  console.log('[MessageHandler] 消息处理器已初始化');
 }
 
 let lastAppliedEventSeq = 0;
@@ -302,7 +299,6 @@ function shouldProcessByEventSeq(message: ClientBridgeMessage): boolean {
 function handleUnhandledMessageError(error: unknown, message?: ClientBridgeMessage): void {
   console.error('[MessageHandler] 处理消息时发生未捕获异常:', error, message);
   // 统一降级策略：消息处理崩溃后立即收敛前端运行态，避免用户看到“持续执行但无输出”假象。
-  sealAllStreamingMessages();
   settleProcessingForManualInteraction();
 
   const detail = error instanceof Error ? error.message.trim() : String(error || '').trim();

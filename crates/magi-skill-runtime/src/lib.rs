@@ -783,7 +783,7 @@ mod tests {
             Ok(SkillDispatchResult::Builtin { ref output })
                 if output.status == magi_core::ExecutionResultStatus::NeedsApproval
         ));
-        assert!(target.exists(), "需要审批的递归删除不能提前执行");
+        assert!(target.exists(), "受限拦截的递归删除不能提前执行");
     }
 
     #[test]

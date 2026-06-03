@@ -56,7 +56,6 @@
   let currentSessionId = $state<string | null>(null);
   let pendingSessionSwitchId = $state<string | null>(null);
   let pendingSessionSwitchWorkspaceId = $state<string | null>(null);
-  let pendingWorkspaceSwitchId = $state<string | null>(null);
   let sessionsByWorkspace = $state<Record<string, Session[]>>({});
   let loadingWorkspaceIds = $state<Record<string, boolean>>({});
   let expandedWorkspaceIds = $state<Record<string, boolean>>(readInitialExpandedWorkspaces());
@@ -79,7 +78,6 @@
   let previewPanelWidth = $state<number | null>(null);
   let isPreviewPanelResizing = $state(false);
   let pendingSessionSwitchTimer: ReturnType<typeof setTimeout> | null = null;
-  let pendingWorkspaceSwitchTimer: ReturnType<typeof setTimeout> | null = null;
   let workspaceSessionRequestSeq = 0;
   const workspaceSessionRequestSeqByWorkspace = new Map<string, number>();
 
@@ -216,9 +214,6 @@
     if (!authoritativeWorkspaceId) {
       return;
     }
-    if (pendingWorkspaceSwitchId && pendingWorkspaceSwitchId !== authoritativeWorkspaceId) {
-      return;
-    }
     const currentSessions = Array.isArray(messagesState.sessions) ? messagesState.sessions : [];
     const existingSessions = sessionsByWorkspace[authoritativeWorkspaceId] ?? [];
     const sessionsChanged = existingSessions.length !== currentSessions.length
@@ -228,7 +223,9 @@
           || session.id !== next.id
           || session.name !== next.name
           || session.updatedAt !== next.updatedAt
-          || session.messageCount !== next.messageCount;
+          || session.messageCount !== next.messageCount
+          || session.isRunning !== next.isRunning
+          || session.runningTaskCount !== next.runningTaskCount;
       });
     if (sessionsChanged) {
       sessionsByWorkspace = {
@@ -246,17 +243,11 @@
       return;
     }
     const bootstrapSessionId = currentBootstrapSessionIdForWorkspace(authoritativeWorkspaceId);
-    if (pendingWorkspaceSwitchId && pendingWorkspaceSwitchId !== authoritativeWorkspaceId) {
-      return;
-    }
     if (
       pendingSessionSwitchId
       && (pendingSessionSwitchId !== bootstrapSessionId || pendingSessionSwitchWorkspaceId !== authoritativeWorkspaceId)
     ) {
       return;
-    }
-    if (pendingWorkspaceSwitchId === authoritativeWorkspaceId) {
-      clearPendingWorkspaceSwitchState();
     }
     if (selectedWorkspaceId === authoritativeWorkspaceId) {
       return;
@@ -346,6 +337,18 @@
 
   function getWorkspaceSessionList(workspaceId: string): Session[] {
     return (sessionsByWorkspace[workspaceId] ?? []).filter((session) => !isInternalSession(session));
+  }
+
+  function isSessionRunning(workspaceId: string, session: Session): boolean {
+    const runningTaskCount = typeof session.runningTaskCount === 'number'
+      ? session.runningTaskCount
+      : 0;
+    if (session.isRunning === true || runningTaskCount > 0) {
+      return true;
+    }
+    return workspaceId === selectedWorkspaceId
+      && session.id === currentSessionId
+      && messagesState.isProcessing === true;
   }
 
   function isInternalSession(session: Session): boolean {
@@ -479,14 +482,6 @@
     messagesState.sessionHydrating = false;
   }
 
-  function clearPendingWorkspaceSwitchState(): void {
-    if (pendingWorkspaceSwitchTimer) {
-      clearTimeout(pendingWorkspaceSwitchTimer);
-      pendingWorkspaceSwitchTimer = null;
-    }
-    pendingWorkspaceSwitchId = null;
-  }
-
   function invalidateWorkspaceSessionRequests(workspaceId?: string): void {
     const normalizedWorkspaceId = workspaceId?.trim() || '';
     if (normalizedWorkspaceId) {
@@ -494,43 +489,6 @@
       return;
     }
     workspaceSessionRequestSeqByWorkspace.clear();
-  }
-
-  function beginPendingWorkspaceSwitch(workspaceId: string): void {
-    pendingWorkspaceSwitchId = workspaceId;
-    loadingWorkspaceIds = { ...loadingWorkspaceIds, [workspaceId]: true };
-    if (pendingWorkspaceSwitchTimer) {
-      clearTimeout(pendingWorkspaceSwitchTimer);
-    }
-    pendingWorkspaceSwitchTimer = setTimeout(() => {
-      if (pendingWorkspaceSwitchId !== workspaceId) {
-        return;
-      }
-      clearPendingWorkspaceSwitchState();
-      loadingWorkspaceIds = { ...loadingWorkspaceIds, [workspaceId]: false };
-      messagesState.sessionHydrating = false;
-    }, 6000);
-  }
-
-  function prepareWorkspaceSwitchLocally(workspace: AgentWorkspaceSummary): void {
-    clearPendingSessionSwitchState();
-    expandedWorkspaceIds = {
-      ...expandedWorkspaceIds,
-      [workspace.workspaceId]: true,
-    };
-  }
-
-  function openWorkspaceFromBackend(workspace: AgentWorkspaceSummary): void {
-    beginPendingWorkspaceSwitch(workspace.workspaceId);
-    prepareWorkspaceSwitchLocally(workspace);
-    messagesState.sessionHydrating = true;
-    void (async () => {
-      await refreshWorkspaceSessions(
-        workspace.workspaceId,
-        preferredSessionIdForWorkspace(workspace.workspaceId),
-        workspace.rootPath,
-      );
-    })();
   }
 
   function applyWorkspaceSessionsSnapshot(
@@ -548,30 +506,20 @@
     };
 
     const requestStillTargetsSelection = selectedWorkspaceId === requestedWorkspaceId
-      || selectedWorkspaceId === authoritativeWorkspaceId
-      || pendingWorkspaceSwitchId === requestedWorkspaceId
-      || pendingWorkspaceSwitchId === authoritativeWorkspaceId;
+      || selectedWorkspaceId === authoritativeWorkspaceId;
     if (
-      (selectedWorkspaceId === requestedWorkspaceId || pendingWorkspaceSwitchId === requestedWorkspaceId)
+      selectedWorkspaceId === requestedWorkspaceId
       && selectedWorkspaceId !== authoritativeWorkspaceId
       && workspaces.some((workspace) => workspace.workspaceId === authoritativeWorkspaceId)
     ) {
-      if (pendingWorkspaceSwitchId === requestedWorkspaceId) {
-        pendingWorkspaceSwitchId = authoritativeWorkspaceId;
-      } else {
-        selectedWorkspaceId = authoritativeWorkspaceId;
-      }
+      selectedWorkspaceId = authoritativeWorkspaceId;
       expandedWorkspaceIds = {
         ...expandedWorkspaceIds,
         [authoritativeWorkspaceId]: true,
       };
     }
     const isStillSelectedWorkspace = requestStillTargetsSelection
-      && (
-        selectedWorkspaceId === authoritativeWorkspaceId
-        || pendingWorkspaceSwitchId === requestedWorkspaceId
-        || pendingWorkspaceSwitchId === authoritativeWorkspaceId
-      );
+      && selectedWorkspaceId === authoritativeWorkspaceId;
     if (!isStillSelectedWorkspace) {
       return '';
     }
@@ -900,6 +848,33 @@
     }
   }
 
+  async function loadWorkspaceSessionsForSidebar(workspace: AgentWorkspaceSummary): Promise<void> {
+    const requestedWorkspaceId = workspace.workspaceId.trim();
+    if (!requestedWorkspaceId) {
+      return;
+    }
+    const requestSeq = ++workspaceSessionRequestSeq;
+    workspaceSessionRequestSeqByWorkspace.set(requestedWorkspaceId, requestSeq);
+    loadingWorkspaceIds = { ...loadingWorkspaceIds, [requestedWorkspaceId]: true };
+    try {
+      const snapshot = await getWorkspaceSessions(requestedWorkspaceId, '', workspace.rootPath);
+      if (workspaceSessionRequestSeqByWorkspace.get(requestedWorkspaceId) !== requestSeq) {
+        return;
+      }
+      sessionsByWorkspace = {
+        ...sessionsByWorkspace,
+        [requestedWorkspaceId]: snapshot.sessions,
+      };
+    } catch (error) {
+      notifyWorkbenchError(i18n.t('web.action.loadWorkspaceSessions'), error);
+    } finally {
+      if (workspaceSessionRequestSeqByWorkspace.get(requestedWorkspaceId) === requestSeq) {
+        workspaceSessionRequestSeqByWorkspace.delete(requestedWorkspaceId);
+        loadingWorkspaceIds = { ...loadingWorkspaceIds, [requestedWorkspaceId]: false };
+      }
+    }
+  }
+
   async function refreshWorkspaces(): Promise<void> {
     loading = true;
     loadError = '';
@@ -1063,23 +1038,12 @@
 
   function toggleWorkspaceExpansion(workspace: AgentWorkspaceSummary): void {
     const isExpanded = !!expandedWorkspaceIds[workspace.workspaceId];
-    if (selectedWorkspaceId !== workspace.workspaceId) {
-      openWorkspaceFromBackend(workspace);
-      return;
-    }
     expandedWorkspaceIds = {
       ...expandedWorkspaceIds,
       [workspace.workspaceId]: !isExpanded,
     };
     if (!isExpanded && getWorkspaceSessionList(workspace.workspaceId).length === 0) {
-      void (async () => {
-        try {
-          await refreshWorkspaceSessions(workspace.workspaceId, '', workspace.rootPath);
-        } catch (error) {
-          console.warn('[WebWorkbenchShell] refresh workspace sessions failed:', error);
-          loadError = i18n.t('web.workspaceUnavailable');
-        }
-      })();
+      void loadWorkspaceSessionsForSidebar(workspace);
     }
   }
 
@@ -1445,6 +1409,7 @@
                     {:else}
                       <div class="session-list session-list--nested">
                         {#each getWorkspaceSessionList(workspace.workspaceId) as session (session.id)}
+                          {@const sessionRunning = isSessionRunning(workspace.workspaceId, session)}
                           <div class="session-row" class:active={session.id === currentSessionId && workspace.workspaceId === selectedWorkspaceId}>
                             <button
                               type="button"
@@ -1456,6 +1421,7 @@
                               title={session.name || i18n.t('header.unnamedSession')}
                               onclick={() => switchSession(workspace, session.id)}
                             >
+                              <span class="session-running-dot" class:active={sessionRunning} aria-hidden="true"></span>
                               <span class="session-name">{session.name || i18n.t('header.unnamedSession')}</span>
                               <span class="session-meta">
                                 <span class="session-msg-count" title={i18n.t('header.messageCount', { count: session.messageCount ?? 0 })}>{session.messageCount ?? 0}</span>
@@ -2160,6 +2126,38 @@
 
   .session-item:disabled {
     cursor: default;
+  }
+
+  .session-running-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: var(--radius-full);
+    background: var(--info);
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--info) 45%, transparent);
+    opacity: 0;
+    flex-shrink: 0;
+  }
+
+  .session-running-dot.active {
+    opacity: 1;
+    animation: session-running-pulse 1.4s ease-in-out infinite;
+  }
+
+  @keyframes session-running-pulse {
+    0%, 100% {
+      transform: scale(0.82);
+      box-shadow: 0 0 0 0 color-mix(in srgb, var(--info) 42%, transparent);
+    }
+    50% {
+      transform: scale(1);
+      box-shadow: 0 0 0 5px color-mix(in srgb, var(--info) 0%, transparent);
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .session-running-dot.active {
+      animation: none;
+    }
   }
 
   .session-name {

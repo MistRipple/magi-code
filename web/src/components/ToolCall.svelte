@@ -4,6 +4,7 @@
   import FileSpan from './FileSpan.svelte';
   import DiagramRenderer from './DiagramRenderer.svelte';
   import MarkdownContent from './MarkdownContent.svelte';
+  import AccessProfileSwitchAction from './AccessProfileSwitchAction.svelte';
   import type { FilePreviewScope } from '../lib/file-reference';
   import { vscode } from '../lib/vscode-bridge';
   import { extractLeadingJson } from '../lib/terminal-utils';
@@ -20,7 +21,10 @@
     parseViewImagePreview,
   } from '../lib/view-image-preview';
   import {
+    ACCESS_MODE_APPROVAL_ERROR_CODES,
+    isAccessModeApprovalErrorPayload,
     isStructuredToolErrorPayload,
+    publicToolPayloadMessage,
     toolPayloadErrorCode,
     toolPayloadStatus,
   } from '../lib/tool-error-payload';
@@ -385,6 +389,10 @@
     if (!outputIsStructuredError) {
       return '';
     }
+    const publicMessage = publicToolPayloadMessage(output);
+    if (publicMessage) {
+      return publicMessage;
+    }
     const errorCode = toolPayloadErrorCode(output);
     const payloadStatus = toolPayloadStatus(output);
     return JSON.stringify({
@@ -557,16 +565,25 @@
     return /^#{1,4}\s|^\|.+\|$|^\s*[-*]\s|^\s*\d+\.\s|^>\s|^---$|```|\*\*[^*]+\*\*/m.test(outputText);
   });
 
-  function detectErrorDiagnosis(errorText?: string, toolResult?: StandardizedToolResult): ErrorDiagnosis | null {
-    const rawMessage = `${toolResult?.message || ''}\n${errorText || ''}`.trim();
-    if (!rawMessage) return null;
-
-    const errorCode = (
+  function toolErrorCodeForDiagnosis(errorText?: string, toolResult?: StandardizedToolResult): string {
+    return (
       toolResult?.errorCode
       || toolPayloadErrorCode(errorText)
       || toolPayloadErrorCode(toolResult?.message)
       || ''
     ).toLowerCase();
+  }
+
+  function isAccessModeApprovalError(errorText?: string, toolResult?: StandardizedToolResult): boolean {
+    const errorCode = toolErrorCodeForDiagnosis(errorText, toolResult);
+    return ACCESS_MODE_APPROVAL_ERROR_CODES.some((pattern) => errorCode.includes(pattern));
+  }
+
+  function detectErrorDiagnosis(errorText?: string, toolResult?: StandardizedToolResult): ErrorDiagnosis | null {
+    const rawMessage = `${toolResult?.message || ''}\n${errorText || ''}`.trim();
+    if (!rawMessage) return null;
+
+    const errorCode = toolErrorCodeForDiagnosis(errorText, toolResult);
     // 只取消息前 300 字符做关键词匹配，避免工具输出正文中的常见词（如 authorization、timeout）
     // 导致误分类。后端结构化错误前缀（如 "Tool blocked:", "Command rejected:"）都在开头。
     const messageHead = rawMessage.slice(0, 300).toLowerCase();
@@ -703,11 +720,7 @@
     if (
       codeMatches(
         'tool_blocked',
-        'tool_policy_needs_approval',
-        'skill_tool_policy_needs_approval',
-        'skill_tool_needs_approval',
-        'external_tool_needs_approval',
-        'tool_safety_needs_approval',
+        ...ACCESS_MODE_APPROVAL_ERROR_CODES,
       )
       || messageHead.includes('user denied tool authorization')
     ) {
@@ -730,7 +743,22 @@
   }
 
   const errorDiagnosis = $derived.by(() => detectErrorDiagnosis(errorForDiagnosis, standardized));
-  const publicErrorMessage = $derived(errorDiagnosis?.message || i18n.t('toolCall.errorDiagnosis.runtime.message'));
+  const shouldOfferFullAccessSwitch = $derived.by(() =>
+    isAccessModeApprovalError(errorForDiagnosis, standardized)
+    || isAccessModeApprovalErrorPayload(output)
+    || isAccessModeApprovalErrorPayload(error)
+    || isAccessModeApprovalErrorPayload(standardized?.message)
+  );
+  const publicPayloadErrorMessage = $derived(
+    publicToolPayloadMessage(output)
+    || publicToolPayloadMessage(error)
+    || publicToolPayloadMessage(standardized?.message)
+  );
+  const publicErrorMessage = $derived(
+    publicPayloadErrorMessage
+    || errorDiagnosis?.message
+    || i18n.t('toolCall.errorDiagnosis.runtime.message')
+  );
 
   $effect(() => {
     if (!hasError) {
@@ -1028,6 +1056,9 @@
               <div class="section-content error-content">{publicErrorMessage}</div>
               {#if errorDiagnosis}
                 <div class="error-hint">{errorDiagnosis.hint}</div>
+              {/if}
+              {#if shouldOfferFullAccessSwitch}
+                <AccessProfileSwitchAction />
               {/if}
             </div>
           {/if}

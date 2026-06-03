@@ -1434,23 +1434,35 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
   }
 }
 
-function emitBridgeErrorToast(action: string, _error: unknown): void {
+function emitBridgeErrorToast(
+  action: string,
+  _error: unknown,
+  options: {
+    persistToCenter?: boolean;
+    actionRequired?: boolean;
+    countUnread?: boolean;
+    duration?: number;
+  } = {},
+): void {
   const normalizedAction = action.trim() || i18n.t('bridge.toast.defaultAction');
   const content = i18n.t('bridge.toast.actionFailed', { action: normalizedAction });
   const now = Date.now();
+  const persistToCenter = options.persistToCenter ?? true;
+  const actionRequired = options.actionRequired ?? true;
+  const countUnread = options.countUnread ?? persistToCenter;
   const message = createNotifyMessage(
     content,
     'error',
     `web-bridge:${normalizedAction}`,
-    undefined,
+    options.duration,
     {
       title: i18n.t('bridge.toast.requestFailedTitle'),
       displayMode: 'toast',
       category: 'incident',
       source: 'bridge-runtime',
-      actionRequired: true,
-      persistToCenter: true,
-      countUnread: true,
+      actionRequired,
+      persistToCenter,
+      countUnread,
     },
     {
       id: `web-bridge-error-${now}`,
@@ -1566,6 +1578,37 @@ function reportExpectedRecoveryFailure(action: string, logLabel: string, error: 
     return;
   }
   logBridgeOperationFailure(action, logLabel, error);
+}
+
+const NOTIFICATION_OPERATION_FAILURE_TOAST_DEBOUNCE_MS = 8_000;
+let lastNotificationOperationFailureToastAt = 0;
+
+function reportNotificationOperationFailure(
+  action: string,
+  logLabel: string,
+  error: unknown,
+  options: { suppressToast?: boolean } = {},
+): void {
+  if (options.suppressToast && isExpectedRecoveryBridgeFailure(error)) {
+    return;
+  }
+  if (isBridgeRecoveringOrUnavailable() && isExpectedRecoveryBridgeFailure(error)) {
+    return;
+  }
+  const now = Date.now();
+  if (now - lastNotificationOperationFailureToastAt < NOTIFICATION_OPERATION_FAILURE_TOAST_DEBOUNCE_MS) {
+    return;
+  }
+  lastNotificationOperationFailureToastAt = now;
+  console.warn(logLabel, error);
+  if (options.suppressToast) {
+    return;
+  }
+  emitBridgeErrorToast(action, error, {
+    persistToCenter: false,
+    actionRequired: false,
+    countUnread: false,
+  });
 }
 
 function handleEventStreamParseFailure(data: string, error: unknown): void {
@@ -2621,7 +2664,6 @@ function initTaskTracking(
   workspaceId = currentWorkspaceId,
   workspacePath = currentWorkspacePath,
 ): void {
-  console.info('[web-client-bridge] Initializing task tracking for session/root task:', { sessionId, rootTaskId, workspaceId });
   activateTaskProjectionSession(sessionId, workspaceId, workspacePath);
   const currentState = getTaskProjectionState(sessionId, workspaceId);
   if (currentState.rootTaskId && currentState.rootTaskId !== rootTaskId) {
@@ -2656,7 +2698,6 @@ export async function autoConnectTaskTracking(
     if (currentState.rootTaskId === preferredRootTaskId) {
       return;
     }
-    console.info('[web-client-bridge] Auto-connecting task tracking from bootstrap root task:', preferredRootTaskId);
     initTaskTracking(sessionId, preferredRootTaskId, workspaceId, workspacePath);
     return;
   }
@@ -2692,11 +2733,6 @@ export async function autoConnectTaskTracking(
       if (currentState.rootTaskId === rootTaskId) {
         return;
       }
-      console.info('[web-client-bridge] Auto-connecting task tracking via active task:', {
-        sessionId,
-        taskId,
-        rootTaskId,
-      });
       initTaskTracking(sessionId, rootTaskId, workspaceId, workspacePath);
       return;
     }
@@ -3993,7 +4029,7 @@ export function createWebClientBridge(): ClientBridge {
             if (scope) {
               void loadSessionNotifications(scope).catch((error) => {
                 if (isSessionMissingError(error)) return;
-                reportExpectedRecoveryFailure(i18n.t('bridge.action.loadNotifications'), '[web-client-bridge] 加载通知失败:', error);
+                reportNotificationOperationFailure(i18n.t('bridge.action.loadNotifications'), '[web-client-bridge] 加载通知失败:', error);
               });
             }
           }
@@ -4004,7 +4040,9 @@ export function createWebClientBridge(): ClientBridge {
             if (scope) {
               void appendSessionNotification(scope, message.notification as Record<string, unknown>).catch((error) => {
                 if (isSessionMissingError(error)) return;
-                reportExpectedRecoveryFailure(i18n.t('bridge.action.writeNotification'), '[web-client-bridge] 写入通知失败:', error);
+                reportNotificationOperationFailure(i18n.t('bridge.action.writeNotification'), '[web-client-bridge] 写入通知失败:', error, {
+                  suppressToast: true,
+                });
               });
             }
           }
@@ -4015,7 +4053,7 @@ export function createWebClientBridge(): ClientBridge {
             if (scope) {
               void markAllNotificationsRead(scope).catch((error) => {
                 if (isSessionMissingError(error)) return;
-                reportExpectedRecoveryFailure(i18n.t('bridge.action.markNotificationsRead'), '[web-client-bridge] 标记通知已读失败:', error);
+                reportNotificationOperationFailure(i18n.t('bridge.action.markNotificationsRead'), '[web-client-bridge] 标记通知已读失败:', error);
               });
             }
           }
@@ -4026,7 +4064,7 @@ export function createWebClientBridge(): ClientBridge {
             if (scope) {
               void clearAllNotifications(scope).catch((error) => {
                 if (isSessionMissingError(error)) return;
-                reportExpectedRecoveryFailure(i18n.t('bridge.action.clearNotifications'), '[web-client-bridge] 清空通知失败:', error);
+                reportNotificationOperationFailure(i18n.t('bridge.action.clearNotifications'), '[web-client-bridge] 清空通知失败:', error);
               });
             }
           }
@@ -4037,7 +4075,7 @@ export function createWebClientBridge(): ClientBridge {
             if (scope) {
               void removeNotification(scope, message.notificationId).catch((error) => {
                 if (isSessionMissingError(error)) return;
-                reportExpectedRecoveryFailure(i18n.t('bridge.action.removeNotification'), '[web-client-bridge] 删除通知失败:', error);
+                reportNotificationOperationFailure(i18n.t('bridge.action.removeNotification'), '[web-client-bridge] 删除通知失败:', error);
               });
             }
           }
@@ -4380,7 +4418,6 @@ export function createWebClientBridge(): ClientBridge {
           return;
         case 'login':
         case 'logout':
-          console.info(`[web-client-bridge] Web 端忽略本地鉴权消息: ${message.type}`);
           return;
         case 'uiError':
           console.error('[web-client-bridge] UI 错误上报:', {
@@ -4390,13 +4427,11 @@ export function createWebClientBridge(): ClientBridge {
           });
           return;
         case 'selectWorker':
-          console.info('[web-client-bridge] Web 端代理选择由前端本地视图状态自行处理。');
           return;
         case 'toggleBuiltInTool':
-          console.info('[web-client-bridge] 内置工具由运行时固定管理，已忽略切换请求。');
           return;
         default:
-          console.log('[web-client-bridge] 未接入的消息已忽略:', message.type);
+          return;
       }
     },
     onMessage(listener: (message: ClientBridgeMessage) => void): () => void {

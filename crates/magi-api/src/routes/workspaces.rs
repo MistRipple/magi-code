@@ -48,6 +48,8 @@ struct WorkspaceSessionDto {
     created_at: u64,
     updated_at: u64,
     message_count: usize,
+    is_running: bool,
+    running_task_count: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -263,14 +265,20 @@ async fn workspace_sessions(
     let scoped_sessions = state
         .session_records_for_workspace(Some(scoped_workspace_id.as_str()))
         .iter()
-        .map(|session| WorkspaceSessionDto {
-            session_id: session.session_id.to_string(),
-            workspace_id: scoped_workspace_id.clone(),
-            title: session.title.clone(),
-            status: format!("{:?}", session.status),
-            created_at: session.created_at.0,
-            updated_at: session.updated_at.0,
-            message_count: session.message_count.unwrap_or(0),
+        .map(|session| {
+            let sidecar = state.session_store.runtime_sidecar(&session.session_id);
+            let running_task_count = workspace_session_running_task_count(sidecar.as_ref());
+            WorkspaceSessionDto {
+                session_id: session.session_id.to_string(),
+                workspace_id: scoped_workspace_id.clone(),
+                title: session.title.clone(),
+                status: format!("{:?}", session.status),
+                created_at: session.created_at.0,
+                updated_at: session.updated_at.0,
+                message_count: session.message_count.unwrap_or(0),
+                is_running: running_task_count > 0,
+                running_task_count,
+            }
         })
         .collect::<Vec<_>>();
 
@@ -300,6 +308,71 @@ async fn workspace_sessions(
     }))
 }
 
+fn workspace_session_running_task_count(
+    sidecar: Option<&magi_session_store::SessionRuntimeSidecar>,
+) -> usize {
+    let Some(turn) = sidecar.and_then(workspace_session_current_turn) else {
+        return 0;
+    };
+    if current_turn_status_is_terminal(&turn.status) {
+        return 0;
+    }
+    turn.items
+        .iter()
+        .filter(|item| {
+            current_turn_item_status_is_active(&item.status)
+                || item
+                    .tool_status
+                    .as_deref()
+                    .is_some_and(current_turn_item_status_is_active)
+        })
+        .count()
+        .max(1)
+}
+
+fn workspace_session_current_turn(
+    sidecar: &magi_session_store::SessionRuntimeSidecar,
+) -> Option<&magi_session_store::ActiveExecutionTurn> {
+    sidecar.current_turn.as_ref().or_else(|| {
+        sidecar
+            .active_execution_chain
+            .as_ref()
+            .and_then(|chain| chain.current_turn.as_ref())
+    })
+}
+
+fn current_turn_status_is_terminal(status: &str) -> bool {
+    matches!(
+        status.trim().to_ascii_lowercase().as_str(),
+        "completed"
+            | "complete"
+            | "succeeded"
+            | "success"
+            | "failed"
+            | "error"
+            | "blocked"
+            | "cancelled"
+            | "canceled"
+            | "killed"
+    )
+}
+
+fn current_turn_item_status_is_active(status: &str) -> bool {
+    matches!(
+        status.trim().to_ascii_lowercase().as_str(),
+        "pending"
+            | "queued"
+            | "running"
+            | "started"
+            | "streaming"
+            | "blocked"
+            | "awaiting_approval"
+            | "review_required"
+            | "repairing"
+            | "verifying"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -312,8 +385,9 @@ mod tests {
     use magi_event_bus::InMemoryEventBus;
     use magi_governance::GovernanceService;
     use magi_session_store::{
-        SessionDurableState, SessionExecutionSidecarStatus, SessionExecutionSidecarStoreState,
-        SessionRecord, SessionRuntimeSidecar, SessionStore, TimelineEntryKind,
+        ActiveExecutionTurn, SessionDurableState, SessionExecutionSidecarStatus,
+        SessionExecutionSidecarStoreState, SessionRecord, SessionRuntimeSidecar, SessionStore,
+        TimelineEntryKind,
     };
     use magi_workspace::WorkspaceStore;
     use std::{fs, sync::Arc, time::Duration};
@@ -543,7 +617,73 @@ mod tests {
         assert_eq!(sessions[0]["sessionId"], "session-counted");
         assert_eq!(sessions[0]["workspaceId"], "workspace-count");
         assert_eq!(sessions[0]["messageCount"], 2);
+        assert_eq!(sessions[0]["isRunning"], false);
+        assert_eq!(sessions[0]["runningTaskCount"], 0);
         assert!(sessions[0]["updatedAt"].as_u64().unwrap_or_default() > 0);
+    }
+
+    #[tokio::test]
+    async fn workspace_sessions_marks_non_terminal_current_turn_running() {
+        let state = test_state();
+        let workspace_id = WorkspaceId::new("workspace-running-session");
+        state
+            .workspace_registry
+            .register(
+                workspace_id.clone(),
+                AbsolutePath::new("/tmp/magi-workspace-running-session"),
+            )
+            .expect("workspace should register");
+
+        let session_id = SessionId::new("session-running");
+        state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "运行中的会话",
+                Some(workspace_id.to_string()),
+            )
+            .expect("session should create");
+        state.session_store.append_timeline_entry(
+            session_id.clone(),
+            TimelineEntryKind::UserMessage,
+            "触发运行态",
+        );
+        state
+            .session_store
+            .upsert_current_turn(
+                session_id.clone(),
+                ActiveExecutionTurn {
+                    turn_id: "turn-running".to_string(),
+                    turn_seq: 1,
+                    accepted_at: UtcMillis::now(),
+                    completed_at: None,
+                    status: "running".to_string(),
+                    user_message: Some("触发运行态".to_string()),
+                    items: Vec::new(),
+                },
+            )
+            .expect("current turn should upsert");
+
+        let response = routes()
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/workspaces/sessions?workspaceId=workspace-running-session&sessionId=session-running")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = read_json_response(response).await;
+        let sessions = payload["sessions"]
+            .as_array()
+            .expect("sessions should be an array");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0]["sessionId"], "session-running");
+        assert_eq!(sessions[0]["isRunning"], true);
+        assert_eq!(sessions[0]["runningTaskCount"], 1);
     }
 
     #[tokio::test]

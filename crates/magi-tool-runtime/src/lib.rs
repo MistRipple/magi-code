@@ -1353,7 +1353,8 @@ pub fn builtin_permission_engine() -> magi_permissions::PermissionEngine {
 }
 
 pub(crate) const TOOL_POLICY_REJECTED_PUBLIC_ERROR: &str = "该工具在当前上下文中不可用";
-pub(crate) const TOOL_POLICY_NEEDS_APPROVAL_PUBLIC_ERROR: &str = "该工具需要批准后执行";
+pub(crate) const TOOL_POLICY_NEEDS_APPROVAL_PUBLIC_ERROR: &str =
+    "受限访问已拦截该操作，请切换为完全访问权限后重试";
 
 pub(crate) fn tool_policy_decision_payload(
     tool_name: &str,
@@ -2011,7 +2012,7 @@ impl ToolRegistry {
             GovernanceDecision::allowed(
                 DecisionPhase::ApprovalPolicy,
                 input.risk_level,
-                Some("完全授权模式跳过普通工具审批".to_string()),
+                Some("完全授权模式跳过常规风险拦截".to_string()),
             )
         } else {
             self.governance
@@ -2162,7 +2163,7 @@ impl ToolRegistry {
             return GovernanceDecision::allowed(
                 DecisionPhase::ApprovalPolicy,
                 request.risk_level,
-                Some("完全授权模式跳过普通工具审批".to_string()),
+                Some("完全授权模式跳过常规风险拦截".to_string()),
             );
         }
         self.governance.evaluate_tool_request(request)
@@ -4957,7 +4958,7 @@ mod tests {
             .expect("shell_exec should be listed");
         assert_eq!(
             shell_exec["effective_approval_policy"],
-            "ordinary_approval_skipped"
+            "regular_risk_block_skipped"
         );
     }
 

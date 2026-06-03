@@ -221,14 +221,14 @@ fn usage_model_config_for_binding(
         if let Some(config) = workers
             .get(&binding.engine_id)
             .or_else(|| workers.get(&binding.template_id))
-            .map(|value| NormalizedModelConfig::from_settings_value(value, "openai"))
+            .map(|value| NormalizedModelConfig::from_settings_value(value))
             .and_then(|config| config.to_usage_llm_config())
         {
             return Some(config);
         }
     }
     let orchestrator = store.get_section("orchestrator");
-    NormalizedModelConfig::from_settings_value(&orchestrator, "openai").to_usage_llm_config()
+    NormalizedModelConfig::from_settings_value(&orchestrator).to_usage_llm_config()
 }
 
 fn usage_tokens_from_payload(usage: Option<&serde_json::Value>) -> Option<UsageTokenInput> {

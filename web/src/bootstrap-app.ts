@@ -64,7 +64,6 @@ export function bootstrapApp(
   }
   if (initialSessionId) {
     setCurrentSessionId(initialSessionId);
-    console.log('[Bootstrap] 初始 sessionId:', initialSessionId);
   }
 
   initializeState();

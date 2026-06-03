@@ -601,12 +601,12 @@ fn effective_external_skill_tools_for_access_profile(
                     tool.approval_requirement = "not_applicable".to_string();
                 }
                 magi_core::AccessProfile::Restricted => {
-                    tool.access_profile_behavior = "restricted_requires_approval".to_string();
+                    tool.access_profile_behavior = "restricted_blocks_high_risk".to_string();
                     tool.approval_requirement = "required".to_string();
                 }
                 magi_core::AccessProfile::FullAccess => {
                     tool.access_profile_behavior =
-                        "full_access_skips_ordinary_approval".to_string();
+                        "full_access_skips_regular_risk_blocks".to_string();
                     tool.approval_requirement = "none".to_string();
                 }
             }
@@ -655,9 +655,9 @@ fn policy_scope_label(tool: BuiltinToolName) -> &'static str {
 
 fn policy_summary(tool: BuiltinToolName) -> &'static str {
     match tool {
-        BuiltinToolName::ShellExec => "按 action、access_mode 和命令写入迹象逐次判定风险与审批要求",
-        BuiltinToolName::FileRemove => "有效删除目标在受限访问模式下需要审批；参数缺失时由工具校验",
-        _ => "使用工具默认风险与审批策略",
+        BuiltinToolName::ShellExec => "按 action、access_mode 和命令写入迹象逐次判定风险与受限拦截",
+        BuiltinToolName::FileRemove => "有效删除目标在受限访问模式下会被拦截；参数缺失时由工具校验",
+        _ => "使用工具默认风险策略",
     }
 }
 
@@ -682,10 +682,10 @@ fn approval_policy_summary(access_profile: magi_core::AccessProfile) -> &'static
             "当前为只读分析模式：读、搜索、诊断类工具可用；写入和外部副作用工具不可用"
         }
         magi_core::AccessProfile::Restricted => {
-            "当前为受限执行模式：常规工作区操作可直接执行，高风险或输入敏感动作需要审批"
+            "当前为受限执行模式：常规工作区操作可直接执行，高风险或输入敏感动作会被拦截"
         }
         magi_core::AccessProfile::FullAccess => {
-            "当前为完全授权模式：普通工具审批会跳过；产品级硬阻断、任务约束和角色约束仍然生效"
+            "当前为完全授权模式：常规风险拦截会跳过；产品级硬阻断、任务约束和角色约束仍然生效"
         }
     }
 }
@@ -706,7 +706,7 @@ fn effective_approval_policy_label(
                 || tool.default_approval_requirement()
                     == magi_core::ApprovalRequirement::Required =>
         {
-            "ordinary_approval_skipped"
+            "regular_risk_block_skipped"
         }
         magi_core::AccessProfile::FullAccess => "none",
     }
@@ -727,7 +727,7 @@ fn access_profile_behavior_label(
         magi_core::AccessProfile::Restricted
             if tool.default_approval_requirement() == magi_core::ApprovalRequirement::Required =>
         {
-            "restricted_requires_approval"
+            "restricted_blocks_high_risk"
         }
         magi_core::AccessProfile::Restricted => "restricted_allowed",
         magi_core::AccessProfile::FullAccess
@@ -735,7 +735,7 @@ fn access_profile_behavior_label(
                 || tool.default_approval_requirement()
                     == magi_core::ApprovalRequirement::Required =>
         {
-            "full_access_skips_ordinary_approval"
+            "full_access_skips_regular_risk_blocks"
         }
         magi_core::AccessProfile::FullAccess => "full_access_allowed",
     }
@@ -939,7 +939,7 @@ mod tests {
             full_access_payload["approval_policy_summary"]
                 .as_str()
                 .expect("approval_policy_summary")
-                .contains("普通工具审批会跳过")
+                .contains("常规风险拦截会跳过")
         );
         let shell_exec = full_access_payload["tools"]
             .as_array()
@@ -949,11 +949,11 @@ mod tests {
             .expect("shell_exec should be listed");
         assert_eq!(
             shell_exec["effective_approval_policy"],
-            "ordinary_approval_skipped"
+            "regular_risk_block_skipped"
         );
         assert_eq!(
             shell_exec["access_profile_behavior"],
-            "full_access_skips_ordinary_approval"
+            "full_access_skips_regular_risk_blocks"
         );
 
         let read_only_context = ToolExecutionContext {
@@ -1032,7 +1032,7 @@ mod tests {
                         if builtin.default_approval_requirement()
                             == magi_core::ApprovalRequirement::Required =>
                     {
-                        ("required", "restricted_requires_approval")
+                        ("required", "restricted_blocks_high_risk")
                     }
                     magi_core::AccessProfile::Restricted => ("none", "restricted_allowed"),
                     magi_core::AccessProfile::FullAccess
@@ -1041,8 +1041,8 @@ mod tests {
                                 == magi_core::ApprovalRequirement::Required =>
                     {
                         (
-                            "ordinary_approval_skipped",
-                            "full_access_skips_ordinary_approval",
+                            "regular_risk_block_skipped",
+                            "full_access_skips_regular_risk_blocks",
                         )
                     }
                     magi_core::AccessProfile::FullAccess => ("none", "full_access_allowed"),
@@ -1143,7 +1143,7 @@ mod tests {
                     bridge_kind: "Mcp".to_string(),
                     dispatch_action: "McpToolCall".to_string(),
                     bridge_target: "loopback-mcp".to_string(),
-                    access_profile_behavior: "restricted_requires_approval".to_string(),
+                    access_profile_behavior: "restricted_blocks_high_risk".to_string(),
                     risk_level: "high".to_string(),
                     approval_requirement: "required".to_string(),
                     status: "available".to_string(),
@@ -1208,7 +1208,7 @@ mod tests {
                         bridge_kind: "Mcp".to_string(),
                         dispatch_action: "McpToolCall".to_string(),
                         bridge_target: "slow-mcp".to_string(),
-                        access_profile_behavior: "restricted_requires_approval".to_string(),
+                        access_profile_behavior: "restricted_blocks_high_risk".to_string(),
                         risk_level: "high".to_string(),
                         approval_requirement: "required".to_string(),
                         status: "available".to_string(),
@@ -1275,7 +1275,7 @@ mod tests {
                         bridge_kind: "Mcp".to_string(),
                         dispatch_action: "McpToolCall".to_string(),
                         bridge_target: "loopback-mcp".to_string(),
-                        access_profile_behavior: "restricted_requires_approval".to_string(),
+                        access_profile_behavior: "restricted_blocks_high_risk".to_string(),
                         risk_level: "high".to_string(),
                         approval_requirement: "required".to_string(),
                         status: "available".to_string(),
@@ -1334,7 +1334,7 @@ mod tests {
                     bridge_kind: "Mcp".to_string(),
                     dispatch_action: "McpToolCall".to_string(),
                     bridge_target: "loopback-mcp".to_string(),
-                    access_profile_behavior: "restricted_requires_approval".to_string(),
+                    access_profile_behavior: "restricted_blocks_high_risk".to_string(),
                     risk_level: "high".to_string(),
                     approval_requirement: "required".to_string(),
                     status: "available".to_string(),
@@ -1377,7 +1377,7 @@ mod tests {
         assert_eq!(full_access_payload["skill_tools"][0]["status"], "available");
         assert_eq!(
             full_access_payload["skill_tools"][0]["access_profile_behavior"],
-            "full_access_skips_ordinary_approval"
+            "full_access_skips_regular_risk_blocks"
         );
         assert_eq!(
             full_access_payload["skill_tools"][0]["approval_requirement"],

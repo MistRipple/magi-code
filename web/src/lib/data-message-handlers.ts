@@ -23,7 +23,6 @@ import {
   listRequestBindings,
   clearAllRequestBindings,
   clearProcessingState,
-  sealAllStreamingMessages,
   setOrchestratorRuntimeState,
   replaceOrchestratorRuntimeState,
   applyAuthoritativeProcessingState,
@@ -358,9 +357,6 @@ function handleStateUpdate(
   // 处理状态现在只接受后端 processingState 快照或显式 control 终态。
   // 不再使用裸 isRunning/isProcessing 布尔值猜测运行态，避免异步 stateUpdate 把旧状态抬回前端。
 
-  if (state.recovered === true) {
-    sealAllStreamingMessages();
-  }
 }
 
 export function handleUnifiedControlMessage(standard: StandardMessage) {
@@ -502,8 +498,6 @@ export function handleUnifiedData(standard: StandardMessage) {
       // 这里不再保留兜底抬升路径，避免处理态出现双真相源。
       if (isProcessing === false && transitionKind === 'forced') {
         clearProcessingState();
-        // forced idle 代表“全局终态已确认”，需要同步封口残留流式内容，避免 UI 仍显示执行中动画。
-        sealAllStreamingMessages();
       }
       const source = payload.source as string | undefined;
       const agent = payload.agent as string | undefined;
@@ -611,9 +605,6 @@ export function handleUnifiedData(standard: StandardMessage) {
     case 'clarificationRequest':
       handleClarificationRequest(asMessage(payload));
       break;
-
-    // missionPlanned / assignmentPlanned / assignmentStarted / assignmentCompleted
-    // handlers removed — old Mission/Assignment model superseded by Task Projection.
 
     case 'settingsBootstrapLoaded':
       handleSettingsBootstrapLoaded(asMessage(payload));
@@ -1213,14 +1204,6 @@ function handleOrchestratorRuntimeState(message: ClientBridgeMessage) {
 function handleClarificationRequest(_message: ClientBridgeMessage) {
   addToast('info', i18n.t('messageHandler.autoSkipClarification'));
 }
-
-
-
-
-// handleMissionPlanned, handleAssignmentPlanned, handleAssignmentStarted,
-// handleAssignmentCompleted, updateAssignmentPlan — removed.
-// Old Mission/Assignment incremental handlers superseded by Task Projection model.
-
 /**
  * 处理代理状态更新消息
  * 将检测到的模型状态同步到全局 store，供设置和执行状态共用

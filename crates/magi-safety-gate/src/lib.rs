@@ -59,7 +59,7 @@ impl SafetyCategory {
         }
     }
 
-    /// 内置高危类别默认在受限执行下审批，custom 也默认审批。
+    /// 内置高危类别默认在受限执行下拦截，custom 也默认走同一策略。
     /// 真正不可接受的模式必须在规则上显式声明 HardBlock。
     pub fn default_action(self) -> SafetyAction {
         SafetyAction::RequireApprovalInRestricted
@@ -128,7 +128,7 @@ impl SafetyRule {
 pub enum SafetyAction {
     /// 任何访问模式下都拒绝。
     HardBlock,
-    /// 受限执行下需要批准；完全授权下允许但应审计。
+    /// 受限执行下拦截；完全授权下允许但应审计。
     #[default]
     RequireApprovalInRestricted,
     /// 允许执行，仅记录风险。

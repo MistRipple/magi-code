@@ -1301,7 +1301,7 @@ fn handle_mcp_request(
     registry.handle(method, request)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn handle_mcp_call(
     request: LocalProcessBridgeRequest,
 ) -> Result<Value, LocalProcessBridgeRpcError> {

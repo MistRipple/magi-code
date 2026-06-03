@@ -78,7 +78,7 @@
   }
 
   .tab-item::after {
-    display: none; /* 移除旧版下划线 */
+    display: none;
   }
 
   .tab-item:hover {
