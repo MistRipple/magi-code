@@ -18,6 +18,7 @@ yarn-error.log*
 .pnpm-debug.log*
 
 # --- Project Specific ---
+/dist/
 /tmp/
 /.magi/
 *.log

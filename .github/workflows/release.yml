@@ -1,0 +1,107 @@
+name: 发布构建
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build-web:
+    name: 构建前端资源
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: 安装前端依赖
+        run: npm --prefix web ci
+
+      - name: 构建前端
+        run: npm --prefix web run build
+
+      - name: 上传前端资源
+        uses: actions/upload-artifact@v4
+        with:
+          name: magi-web-dist
+          path: web/dist
+          if-no-files-found: error
+
+  package-unix:
+    name: 打包 ${{ matrix.platform }}
+    needs: build-web
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos
+            runner: macos-latest
+          - platform: linux
+            runner: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 下载前端资源
+        uses: actions/download-artifact@v4
+        with:
+          name: magi-web-dist
+          path: web/dist
+
+      - name: 安装 Rust
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+
+      - name: 构建 daemon
+        run: cargo build --release -p magi-daemon-app --locked
+
+      - name: 打包产物
+        run: bash scripts/package/package-unix.sh ${{ matrix.platform }}
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: magi-${{ matrix.platform }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  package-windows:
+    name: 打包 windows
+    needs: build-web
+    runs-on: windows-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 下载前端资源
+        uses: actions/download-artifact@v4
+        with:
+          name: magi-web-dist
+          path: web/dist
+
+      - name: 安装 Rust
+        run: rustup toolchain install stable --profile minimal; rustup default stable
+
+      - name: 构建 daemon
+        run: cargo build --release -p magi-daemon-app --locked
+
+      - name: 打包产物
+        shell: pwsh
+        run: ./scripts/package/package-windows.ps1
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: magi-windows
+          path: dist/*.zip
+          if-no-files-found: error

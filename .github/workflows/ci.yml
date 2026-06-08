@@ -1,0 +1,40 @@
+name: 持续集成
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: 检查与测试
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: 安装前端依赖
+        run: npm --prefix web ci
+
+      - name: 前端类型检查
+        run: npm --prefix web run check
+
+      - name: 前端契约测试
+        run: npm --prefix web run test
+
+      - name: 安装 Rust
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+
+      - name: Rust 编译检查
+        run: cargo check -p magi-daemon-app --locked

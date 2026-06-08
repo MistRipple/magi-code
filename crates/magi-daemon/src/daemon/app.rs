@@ -11,7 +11,7 @@ use axum::{
 };
 use std::{
     env,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Stdio,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -641,12 +641,42 @@ fn resolve_web_dist_root() -> Option<PathBuf> {
         }
     }
 
+    for candidate in packaged_web_dist_candidates() {
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+
     let repo_default = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../web/dist");
     if repo_default.exists() {
         return Some(repo_default);
     }
 
     None
+}
+
+fn packaged_web_dist_candidates() -> Vec<PathBuf> {
+    let Ok(executable_path) = env::current_exe() else {
+        return Vec::new();
+    };
+    let Some(executable_dir) = executable_path.parent() else {
+        return Vec::new();
+    };
+    packaged_web_dist_candidates_for_executable_dir(executable_dir)
+}
+
+fn packaged_web_dist_candidates_for_executable_dir(executable_dir: &Path) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    candidates.push(executable_dir.join("resources/web/dist"));
+    candidates.push(executable_dir.join("../resources/web/dist"));
+    candidates.push(executable_dir.join("../Resources/web/dist"));
+
+    if let Some(parent) = executable_dir.parent() {
+        candidates.push(parent.join("resources/web/dist"));
+        candidates.push(parent.join("Resources/web/dist"));
+    }
+
+    candidates
 }
 
 #[cfg(test)]
@@ -678,5 +708,17 @@ mod tests {
         assert!(is_vite_dev_asset_path("/node_modules/.vite/deps/chunk.js"));
         assert!(!is_vite_dev_asset_path("/api/lan-access"));
         assert!(!is_vite_dev_asset_path("/health"));
+    }
+
+    #[test]
+    fn packaged_web_dist_candidates_cover_common_bundle_layouts() {
+        let executable_dir = Path::new("/opt/magi/bin");
+        let candidates = packaged_web_dist_candidates_for_executable_dir(executable_dir);
+
+        assert!(candidates.contains(&PathBuf::from("/opt/magi/bin/resources/web/dist")));
+        assert!(candidates.contains(&PathBuf::from("/opt/magi/bin/../resources/web/dist")));
+        assert!(candidates.contains(&PathBuf::from("/opt/magi/bin/../Resources/web/dist")));
+        assert!(candidates.contains(&PathBuf::from("/opt/magi/resources/web/dist")));
+        assert!(candidates.contains(&PathBuf::from("/opt/magi/Resources/web/dist")));
     }
 }
