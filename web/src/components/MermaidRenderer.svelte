@@ -4,6 +4,7 @@
   import Icon from './Icon.svelte';
   import { i18n } from '../stores/i18n.svelte';
   import { sanitizeSvgContent } from '../shared/svg-sanitizer';
+  import { mermaidRenderSourceCandidates, normalizeMermaidSource } from '../lib/mermaid-source';
 
   // Props
   interface Props {
@@ -27,17 +28,6 @@
 
   // 生成唯一 ID
   const getUniqueId = () => `mermaid-${Date.now()}-${Math.random().toString(36).substring(2, 11)}`;
-
-  function normalizeMermaidSource(source: string): string {
-    let normalized = source.trim();
-    if (!normalized) return '';
-    let previous = '';
-    while (previous !== normalized) {
-      previous = normalized;
-      normalized = normalized.replace(/([A-Za-z0-9_\]\})\u4e00-\u9fff])\s*[.。．]\s*$/u, '$1');
-    }
-    return normalized;
-  }
 
   function isUnsupportedMindmapSource(source: string): boolean {
     return /^\s*mindmap(?:\s|\n|$)/i.test(source);
@@ -188,8 +178,21 @@
     }
 
     try {
-      const diagramId = getUniqueId();
-      const { svg } = await mermaid.render(diagramId, currentCode);
+      const candidates = mermaidRenderSourceCandidates(currentCode);
+      let svg = '';
+      let lastError: unknown = null;
+      for (const candidate of candidates) {
+        try {
+          const rendered = await mermaid.render(getUniqueId(), candidate);
+          svg = rendered.svg;
+          break;
+        } catch (candidateError) {
+          lastError = candidateError;
+        }
+      }
+      if (!svg) {
+        throw lastError ?? new Error(i18n.t('diagramRenderer.renderFailed'));
+      }
       if (token !== renderToken) return;
       const sanitizedSvg = sanitizeSvgContent(svg);
       if (!sanitizedSvg) {
