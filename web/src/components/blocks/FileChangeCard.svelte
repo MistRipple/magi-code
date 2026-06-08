@@ -1,5 +1,4 @@
 <script lang="ts">
-  import hljs from 'highlight.js';
   import type { ContentBlock } from '../../types/message';
   import Icon from '../Icon.svelte';
   import FileSpan from '../FileSpan.svelte';
@@ -7,15 +6,10 @@
   import { i18n } from '../../stores/i18n.svelte';
   import { openCodeTab } from '../../stores/right-pane.svelte';
   import { messagesState } from '../../stores/messages.svelte';
+  import DiffCodeBlock from './DiffCodeBlock.svelte';
 
   interface Props {
     block: ContentBlock;
-  }
-
-  /** 解析后的 diff 行 */
-  interface DiffLine {
-    type: 'add' | 'delete' | 'context';
-    content: string;
   }
 
   let { block }: Props = $props();
@@ -48,37 +42,7 @@
     }
   });
 
-  /** 从文件路径推断 hljs 语言标识 */
-  const EXT_LANG_MAP: Record<string, string> = {
-    ts: 'typescript', tsx: 'typescript', js: 'javascript', jsx: 'javascript',
-    py: 'python', rb: 'ruby', go: 'go', rs: 'rust', java: 'java',
-    cpp: 'cpp', c: 'c', cs: 'csharp', kt: 'kotlin', swift: 'swift',
-    html: 'xml', vue: 'xml', svelte: 'xml', xml: 'xml', svg: 'xml',
-    css: 'css', scss: 'scss', less: 'less',
-    json: 'json', yaml: 'yaml', yml: 'yaml', toml: 'ini',
-    md: 'markdown', sh: 'bash', bash: 'bash', zsh: 'bash',
-    sql: 'sql', graphql: 'graphql', dockerfile: 'dockerfile',
-  };
-
-  const diffLanguage = $derived.by(() => {
-    if (!change?.filePath) return '';
-    const ext = change.filePath.split('.').pop()?.toLowerCase() ?? '';
-    return EXT_LANG_MAP[ext] ?? '';
-  });
-
-  /** 解析 unified diff 文本为结构化行数据（过滤 hunk 头信息） */
-  const diffLines = $derived.by((): DiffLine[] => {
-    if (!change?.diff) return [];
-    return change.diff.split('\n')
-      .filter(line => !line.startsWith('---') && !line.startsWith('+++') && !line.startsWith('@@'))
-      .map(line => {
-        if (line.startsWith('+')) return { type: 'add' as const, content: line.slice(1) };
-        if (line.startsWith('-')) return { type: 'delete' as const, content: line.slice(1) };
-        return { type: 'context' as const, content: line.startsWith(' ') ? line.slice(1) : line };
-      });
-  });
-
-  const hasDiff = $derived(diffLines.length > 0);
+  const hasDiff = $derived(typeof change?.diff === 'string' && change.diff.trim().length > 0);
 
   const emptyDiffNote = $derived.by(() => {
     if (!change) return i18n.t('fileChangeCard.noDiff');
@@ -89,32 +53,6 @@
     }
     return i18n.t('fileChangeCard.noTextChange');
   });
-
-  /** 对代码行做 hljs 语法高亮，返回 HTML 字符串数组（与 diffLines 一一对应） */
-  const highlightedLines = $derived.by((): string[] => {
-    if (!diffLines.length) return [];
-    const lang = diffLanguage;
-    const hasLang = lang && hljs.getLanguage(lang);
-    if (!hasLang) {
-      return diffLines.map(l => escapeHtml(l.content));
-    }
-    const codeTexts = diffLines.map(l => l.content);
-    try {
-      const fullHighlighted = hljs.highlight(codeTexts.join('\n'), { language: lang }).value;
-      return fullHighlighted.split('\n');
-    } catch {
-      return codeTexts.map(t => escapeHtml(t));
-    }
-  });
-
-  function escapeHtml(str: string): string {
-    return str
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;')
-      .replace(/'/g, '&#039;');
-  }
 
   const additionsCount = $derived.by(() =>
     change && typeof change.additions === 'number' && change.additions > 0 ? change.additions : 0
@@ -263,14 +201,7 @@
             {/if}
           </div>
         {:else if hasDiff}
-          <div class="diff-container">
-            {#each diffLines as line, i}
-              <div class="diff-line {line.type}">
-                <span class="diff-prefix">{line.type === 'add' ? '+' : line.type === 'delete' ? '-' : ' '}</span>
-                <span class="diff-content">{@html highlightedLines[i] ?? ''}</span>
-              </div>
-            {/each}
-          </div>
+          <DiffCodeBlock diff={change.diff} ariaLabel={change.filePath} />
         {:else}
           <div class="empty-diff-note">
             {emptyDiffNote}
@@ -462,64 +393,4 @@
     to { opacity: 1; transform: translateY(0); }
   }
 
-  /* Diff 内容 */
-  .diff-container {
-    font-family: var(--font-mono);
-    font-size: var(--text-xs, 11px);
-    line-height: 1.5;
-    overflow-x: hidden;
-    max-height: min(60vh, 640px);
-    overflow-y: auto;
-  }
-
-  .diff-line {
-    display: grid;
-    grid-template-columns: 20px minmax(0, 1fr);
-    align-items: start;
-    min-width: 0;
-    min-height: 20px;
-    padding: 0 var(--space-3, 12px);
-  }
-
-  .diff-prefix {
-    text-align: center;
-    user-select: none;
-  }
-
-  .diff-content {
-    min-width: 0;
-    padding-left: var(--space-2, 8px);
-    background: transparent !important;
-    border: none !important;
-    box-shadow: none !important;
-    overflow-wrap: anywhere;
-    white-space: pre-wrap;
-  }
-
-  /* 行类型着色 */
-  .diff-line.add {
-    background: color-mix(in oklab, var(--success) 15%, transparent);
-    color: var(--foreground);
-  }
-  .diff-line.add .diff-prefix { color: var(--success); }
-
-  .diff-line.delete {
-    background: color-mix(in oklab, var(--error) 15%, transparent);
-    color: var(--foreground);
-  }
-  .diff-line.delete .diff-prefix { color: var(--error); }
-
-  .diff-line.context {
-    color: var(--foreground-muted);
-  }
-
-  :global(.theme-light) .diff-line.add,
-  :global(:root.theme-light) .diff-line.add {
-    background: #dafbe1;
-  }
-
-  :global(.theme-light) .diff-line.delete,
-  :global(:root.theme-light) .diff-line.delete {
-    background: #ffeef0;
-  }
 </style>

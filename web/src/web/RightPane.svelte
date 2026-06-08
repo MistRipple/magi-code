@@ -3,6 +3,7 @@
   import { onMount } from 'svelte';
   import Icon from '../components/Icon.svelte';
   import MarkdownContent from '../components/MarkdownContent.svelte';
+  import DiffCodeBlock from '../components/blocks/DiffCodeBlock.svelte';
   import AgentTabContent from '../components/tabs/AgentTabContent.svelte';
   import { i18n } from '../stores/i18n.svelte';
   import {
@@ -21,7 +22,12 @@
     type CodeTabPayload,
     type AgentTabPayload,
   } from '../stores/right-pane.svelte';
-  import { getAgentFilePreview, agentUrl, buildFilePreviewQuery } from './agent-api';
+  import {
+    getAgentChangeDiff,
+    getAgentFilePreview,
+    agentUrl,
+    buildFilePreviewQuery,
+  } from './agent-api';
 
   interface Props {
     workspaceRoot: string;
@@ -45,6 +51,12 @@
   let fetchingFlags = $state<Record<string, boolean>>({});
   /** filepath → 拉取出错时的错误信息 */
   let fetchErrors = $state<Record<string, string>>({});
+  /** filepath → 异步加载的变更 diff（用于刷新恢复后的变更 tab） */
+  let fetchedDiffs = $state<Record<string, string>>({});
+  /** filepath → diff loading 标记 */
+  let fetchingDiffFlags = $state<Record<string, boolean>>({});
+  /** filepath → diff 拉取出错时的错误信息 */
+  let fetchDiffErrors = $state<Record<string, string>>({});
 
   // 工作区内容变更（如切分支）后，清空已拉取的文件内容缓存，触发 $effect 按新分支重新拉取。
   onMount(() => {
@@ -52,6 +64,9 @@
       fetchedContents = {};
       fetchErrors = {};
       fetchingFlags = {};
+      fetchedDiffs = {};
+      fetchDiffErrors = {};
+      fetchingDiffFlags = {};
     };
     window.addEventListener('magi:workspaceContentChanged', handleWorkspaceContentChanged);
     return () => window.removeEventListener('magi:workspaceContentChanged', handleWorkspaceContentChanged);
@@ -75,6 +90,10 @@
   const activeContentKind = $derived(activeCodePayload?.contentKind ?? 'text');
   const explicitContent = $derived(activeCodePayload?.content ?? null);
   const explicitDiff = $derived(activeCodePayload?.diff ?? null);
+  const activeWantsDiff = $derived(Boolean(
+    activeCodePayload?.isChangeDiff
+      && (activeContentKind === 'text' || activeContentKind === 'large_text')
+  ));
   const activeFilePreviewQuery = $derived.by(() => {
     if (!activeFilePath) return '';
     return buildFilePreviewQuery(activeFilePath, {
@@ -95,6 +114,7 @@
     if (!cacheKey) return;
     if (typeof explicitContent === 'string') return; // 已经有内容
     if (typeof explicitDiff === 'string' && explicitDiff.trim().length > 0) return; // diff 模式
+    if (activeWantsDiff) return; // 变更 tab 缺 diff 时由 changes/diff 恢复，不退化成源码预览
     if (activeContentKind !== 'text') return; // 非文本类不拉取
     if (isWordFile(filepath) || isKnownBinaryFile(filepath)) return;
     if (typeof fetchedContents[cacheKey] === 'string') return; // 已成功拉过
@@ -120,8 +140,49 @@
     })();
   });
 
-  const previewLoading = $derived(Boolean(activeContentCacheKey && fetchingFlags[activeContentCacheKey]));
-  const previewError = $derived(activeContentCacheKey ? (fetchErrors[activeContentCacheKey] || '') : '');
+  // 刷新恢复后的变更 tab 不持久化大 diff；这里只保留轻量意图，然后按权威接口重取。
+  $effect(() => {
+    const filepath = activeFilePath;
+    const cacheKey = activeContentCacheKey;
+    if (!filepath) return;
+    if (!cacheKey) return;
+    if (!activeWantsDiff) return;
+    if (typeof explicitDiff === 'string' && explicitDiff.trim().length > 0) return;
+    if (typeof fetchedDiffs[cacheKey] === 'string') return;
+    if (typeof fetchDiffErrors[cacheKey] === 'string' && fetchDiffErrors[cacheKey].length > 0) return;
+    if (fetchingDiffFlags[cacheKey]) return;
+
+    fetchingDiffFlags = { ...fetchingDiffFlags, [cacheKey]: true };
+    fetchDiffErrors = { ...fetchDiffErrors, [cacheKey]: '' };
+    (async () => {
+      try {
+        const payload = await getAgentChangeDiff(filepath, {
+          sessionId: activeCodePayload?.sessionId,
+          workspaceId: activeCodePayload?.workspaceId,
+          workspacePath: activeCodePayload?.workspacePath,
+        });
+        fetchedDiffs = { ...fetchedDiffs, [cacheKey]: payload.diff || '' };
+      } catch (error) {
+        console.warn('[RightPane] change diff load failed:', error);
+        fetchDiffErrors = { ...fetchDiffErrors, [cacheKey]: i18n.t('web.filePreviewError') };
+      } finally {
+        fetchingDiffFlags = { ...fetchingDiffFlags, [cacheKey]: false };
+      }
+    })();
+  });
+
+  const previewLoading = $derived.by(() => {
+    if (!activeContentCacheKey) return false;
+    return Boolean(activeWantsDiff
+      ? fetchingDiffFlags[activeContentCacheKey]
+      : fetchingFlags[activeContentCacheKey]);
+  });
+  const previewError = $derived.by(() => {
+    if (!activeContentCacheKey) return '';
+    return activeWantsDiff
+      ? (fetchDiffErrors[activeContentCacheKey] || '')
+      : (fetchErrors[activeContentCacheKey] || '');
+  });
   /** 最终用于渲染的内容：优先 store 显式 content，其次异步拉取结果 */
   const previewContent = $derived.by<string | null>(() => {
     if (typeof explicitContent === 'string') return explicitContent;
@@ -129,29 +190,7 @@
     return fetchedContents[activeContentCacheKey] ?? null;
   });
 
-  // ============ Diff 渲染（hunk-aware：单列行号 + 类代码块外观） ============
-  interface DiffLine {
-    type: 'add' | 'delete' | 'context';
-    content: string;
-    /**
-     * 用于左侧 gutter 的显示行号：
-     * - context / add：取 new 文件行号
-     * - delete：取 old 文件行号
-     * 这样所有行号都在同一列对齐，避免双列错开；context 行只显示一个行号。
-     */
-    displayLine: number;
-  }
-
-  interface DiffHunk {
-    /** raw hunk header (如 "@@ -1,7 +1,8 @@ ..."); 用于 tooltip / 显示 */
-    header: string;
-    /** 解析自 header 的旧文件起始行 */
-    oldStart: number;
-    /** 解析自 header 的新文件起始行 */
-    newStart: number;
-    lines: DiffLine[];
-  }
-
+  // ============ 代码高亮 ============
   const EXT_LANG_MAP: Record<string, string> = {
     ts: 'typescript', tsx: 'typescript', js: 'javascript', jsx: 'javascript',
     py: 'python', rb: 'ruby', go: 'go', rs: 'rust', java: 'java',
@@ -163,7 +202,7 @@
     sql: 'sql', graphql: 'graphql', dockerfile: 'dockerfile',
   };
 
-  const diffLanguage = $derived.by(() => {
+  const fileLanguage = $derived.by(() => {
     if (!activeFilePath) return '';
     const ext = activeFilePath.split('.').pop()?.toLowerCase() ?? '';
     return EXT_LANG_MAP[ext] ?? '';
@@ -178,71 +217,16 @@
       .replace(/'/g, '&#039;');
   }
 
-  /**
-   * Unified diff 解析：按 @@ hunk 边界切分，逐行推算 old/new 行号。
-   * - 文件头（---, +++）忽略
-   * - @@ -a,b +c,d @@ 头解析出起始行号；缺省 b/d 时视为 1
-   * - 每个 hunk 内：context 同步递增两侧；'-' 仅递增 old；'+' 仅递增 new
-   */
-  const diffHunks = $derived.by<DiffHunk[]>(() => {
-    if (typeof explicitDiff !== 'string' || explicitDiff.trim().length === 0) return [];
-    const hunkHeaderRe = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/;
-    const hunks: DiffHunk[] = [];
-    let current: DiffHunk | null = null;
-    let oldCursor = 0;
-    let newCursor = 0;
-    for (const raw of explicitDiff.split('\n')) {
-      if (raw.startsWith('---') || raw.startsWith('+++')) continue;
-      const m = hunkHeaderRe.exec(raw);
-      if (m) {
-        oldCursor = parseInt(m[1], 10) || 0;
-        newCursor = parseInt(m[3], 10) || 0;
-        current = { header: raw, oldStart: oldCursor, newStart: newCursor, lines: [] };
-        hunks.push(current);
-        continue;
-      }
-      if (!current) continue; // 没有 hunk 头之前的杂行直接丢
-      if (raw.startsWith('+')) {
-        current.lines.push({ type: 'add', content: raw.slice(1), displayLine: newCursor });
-        newCursor += 1;
-      } else if (raw.startsWith('-')) {
-        current.lines.push({ type: 'delete', content: raw.slice(1), displayLine: oldCursor });
-        oldCursor += 1;
-      } else {
-        // context: 以空格起始或空行；old==new，取任一即可
-        current.lines.push({
-          type: 'context',
-          content: raw.startsWith(' ') ? raw.slice(1) : raw,
-          displayLine: newCursor,
-        });
-        oldCursor += 1;
-        newCursor += 1;
-      }
+  const diffCode = $derived.by(() => {
+    if (typeof explicitDiff === 'string' && explicitDiff.trim().length > 0) {
+      return explicitDiff.trimEnd();
     }
-    return hunks;
+    if (activeWantsDiff && activeContentCacheKey && typeof fetchedDiffs[activeContentCacheKey] === 'string') {
+      return fetchedDiffs[activeContentCacheKey].trimEnd();
+    }
+    return '';
   });
-
-  const hasDiff = $derived(diffHunks.some((h) => h.lines.length > 0));
-
-  /**
-   * 对每个 hunk 做整段语法高亮（保持跨行 token 不被截断），
-   * 返回 hunkIndex → 该 hunk 各行的 HTML 数组。
-   */
-  const highlightedHunkLines = $derived.by<string[][]>(() => {
-    if (diffHunks.length === 0) return [];
-    const lang = diffLanguage;
-    const useHljs = lang && hljs.getLanguage(lang);
-    return diffHunks.map((hunk) => {
-      if (hunk.lines.length === 0) return [];
-      if (!useHljs) return hunk.lines.map((l) => escapeHtml(l.content));
-      try {
-        const joined = hunk.lines.map((l) => l.content).join('\n');
-        return hljs.highlight(joined, { language: lang }).value.split('\n');
-      } catch {
-        return hunk.lines.map((l) => escapeHtml(l.content));
-      }
-    });
-  });
+  const hasDiff = $derived(diffCode.trim().length > 0);
 
   // ============ 文件类型派生 ============
   const displayPath = $derived(getDisplayPath(activeFilePath, workspaceRoot));
@@ -348,7 +332,7 @@
   const sourceLines = $derived.by<string[]>(() => {
     const lines = truncatedContent.split('\n');
     if (lines.length === 0) return [];
-    const lang = diffLanguage;
+    const lang = fileLanguage;
     const useHljs = lang && hljs.getLanguage(lang);
     if (!useHljs) return lines.map(escapeHtml);
     try {
@@ -673,20 +657,7 @@
       </div>
     {:else if hasDiff}
       <div class="right-pane-diff" aria-label={displayPath}>
-        {#each diffHunks as hunk, hi (hi)}
-          {#if hi > 0}
-            <div class="right-pane-diff-hunk-sep" aria-hidden="true"></div>
-          {/if}
-          <div class="right-pane-diff-hunk">
-            <div class="right-pane-diff-hunk-header" title={hunk.header}>{hunk.header}</div>
-            {#each hunk.lines as line, li (li)}
-              <div class="right-pane-diff-row {line.type}">
-                <span class="right-pane-diff-gutter" aria-hidden="true">{line.displayLine}</span>
-                <code class="right-pane-diff-content">{@html highlightedHunkLines[hi]?.[li] ?? ''}</code>
-              </div>
-            {/each}
-          </div>
-        {/each}
+        <DiffCodeBlock diff={diffCode} ariaLabel={displayPath} fill={true} />
       </div>
     {:else if !hasContent}
       <div class="right-pane-state">{i18n.t('edits.preview.empty')}</div>
@@ -966,97 +937,14 @@
     white-space: pre-wrap;
   }
 
-  /* ============ Diff 视图（单列行号 + 代码块外观） ============ */
+  /* ============ Diff 视图（与对话区共享 DiffCodeBlock） ============ */
   .right-pane-diff {
+    display: flex;
     min-height: 0;
     flex: 1;
-    overflow: auto;
+    overflow: hidden;
     padding: var(--space-4);
     background: transparent;
-    color: var(--foreground);
-    font-family: var(--font-mono);
-    font-size: var(--text-xs);
-    line-height: 1.6;
-  }
-
-  .right-pane-diff-hunk {
-    display: flex;
-    flex-direction: column;
-    background: var(--surface-1);
-    border: 1px solid var(--border-subtle);
-    border-radius: var(--radius-md, 8px);
-    overflow: hidden;
-  }
-
-  .right-pane-diff-hunk-header {
-    padding: 4px var(--space-3) 4px 56px;
-    color: var(--foreground-muted);
-    font-size: var(--text-2xs);
-    background: color-mix(in srgb, var(--surface-2) 60%, transparent);
-    border-bottom: 1px solid var(--border-subtle);
-    opacity: 0.85;
-    user-select: none;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .right-pane-diff-hunk-sep {
-    height: var(--space-3);
-  }
-
-  .right-pane-diff-row {
-    display: grid;
-    grid-template-columns: 48px minmax(0, 1fr);
-    align-items: start;
-    min-height: 20px;
-  }
-
-  .right-pane-diff-gutter {
-    padding: 0 8px 0 4px;
-    color: var(--foreground-muted);
-    font-variant-numeric: tabular-nums;
-    font-size: var(--text-2xs);
-    opacity: 0.5;
-    text-align: right;
-    user-select: none;
-    overflow: hidden;
-  }
-
-  .right-pane-diff-content {
-    min-width: 0;
-    padding: 0 var(--space-3) 0 var(--space-2);
-    background: transparent !important;
-    border: none !important;
-    box-shadow: none !important;
-    color: inherit;
-    font: inherit;
-    overflow-wrap: anywhere;
-    tab-size: 2;
-    white-space: pre-wrap;
-  }
-
-  .right-pane-diff-row.add {
-    background: color-mix(in oklab, var(--success) 15%, transparent);
-  }
-  .right-pane-diff-row.add .right-pane-diff-gutter { color: var(--success); opacity: 0.85; }
-
-  .right-pane-diff-row.delete {
-    background: color-mix(in oklab, var(--error) 15%, transparent);
-  }
-  .right-pane-diff-row.delete .right-pane-diff-gutter { color: var(--error); opacity: 0.85; }
-
-  .right-pane-diff-row.context { color: var(--foreground-muted); }
-
-  :global(body.vscode-light) .right-pane-diff-row.add,
-  :global(body.theme-light) .right-pane-diff-row.add,
-  :global(:root.theme-light) .right-pane-diff-row.add {
-    background: #dafbe1;
-  }
-  :global(body.vscode-light) .right-pane-diff-row.delete,
-  :global(body.theme-light) .right-pane-diff-row.delete,
-  :global(:root.theme-light) .right-pane-diff-row.delete {
-    background: #ffeef0;
   }
 
   .right-pane-markdown {

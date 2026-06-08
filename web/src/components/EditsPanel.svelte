@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { getCurrentSessionId, getState, messagesState } from '../stores/messages.svelte';
+  import { getCurrentSessionId, messagesState } from '../stores/messages.svelte';
   import { vscode } from '../lib/vscode-bridge';
   import { ensureArray } from '../lib/utils';
   import { openCodeTab } from '../stores/right-pane.svelte';
@@ -9,10 +9,9 @@
   import { i18n } from '../stores/i18n.svelte';
   import { getAgentChangeDiff, isWebAgentMode } from '../web/agent-api';
 
-  const appState = getState();
   const isWebMode = isWebAgentMode();
 
-  const edits = $derived(ensureArray(appState.edits) as Edit[]);
+  const edits = $derived(ensureArray(messagesState.edits) as Edit[]);
 
   // ─── 按执行分组分组 ───
   // 最新执行分组 ID：取 edits 列表中最后一个有 executionGroupId 的值（后端已按 timestamp 排序）
@@ -61,35 +60,55 @@
     };
   }
 
+  function normalizeScopePart(value?: string | null): string {
+    return typeof value === 'string' ? value.trim() : '';
+  }
+
+  function scopeMatchesActiveChangeMutation(scope: ReturnType<typeof editScope>): boolean {
+    const status = messagesState.changeMutationStatus;
+    if (!status?.isMutating) {
+      return false;
+    }
+    const statusSessionId = normalizeScopePart(status.sessionId);
+    const statusWorkspaceId = normalizeScopePart(status.workspaceId);
+    const statusWorkspacePath = normalizeScopePart(status.workspacePath);
+    const scopeSessionId = normalizeScopePart(scope.sessionId);
+    const scopeWorkspaceId = normalizeScopePart(scope.workspaceId);
+    const scopeWorkspacePath = normalizeScopePart(scope.workspacePath);
+    if (statusSessionId && scopeSessionId && statusSessionId !== scopeSessionId) return false;
+    if (statusWorkspaceId && scopeWorkspaceId && statusWorkspaceId !== scopeWorkspaceId) return false;
+    if (statusWorkspacePath && scopeWorkspacePath && statusWorkspacePath !== scopeWorkspacePath) return false;
+    return Boolean(statusSessionId || statusWorkspaceId || statusWorkspacePath);
+  }
+
+  const changeMutationPending = $derived.by(() => (
+    scopeMatchesActiveChangeMutation(editScope(currentRoundEdits[0] ?? stagedEdits[0] ?? edits[0]))
+  ));
+
   function approveChange(edit: Edit) {
+    if (changeMutationPending) return;
     vscode.postMessage({ type: 'approveChange', filePath: edit.filePath, ...editScope(edit) });
   }
   function revertChange(edit: Edit) {
+    if (changeMutationPending) return;
     vscode.postMessage({ type: 'revertChange', filePath: edit.filePath, ...editScope(edit) });
   }
 
-  let pendingBatch = $state<'approveAll' | 'revertAll' | 'revertRound' | null>(null);
   function approveAllChanges() {
-    if (pendingBatch || edits.length === 0) return;
-    pendingBatch = 'approveAll';
+    if (changeMutationPending || edits.length === 0) return;
     vscode.postMessage({ type: 'approveAllChanges', ...editScope(currentRoundEdits[0] ?? stagedEdits[0]) });
-    setTimeout(() => { pendingBatch = null; }, 1500);
   }
   function revertAllChanges() {
-    if (pendingBatch || edits.length === 0) return;
-    pendingBatch = 'revertAll';
+    if (changeMutationPending || edits.length === 0) return;
     vscode.postMessage({ type: 'revertAllChanges', ...editScope(currentRoundEdits[0] ?? stagedEdits[0]) });
-    setTimeout(() => { pendingBatch = null; }, 1500);
   }
   function revertCurrentRound() {
-    if (pendingBatch || !latestExecutionGroupId) return;
-    pendingBatch = 'revertRound';
+    if (changeMutationPending || !latestExecutionGroupId) return;
     vscode.postMessage({
       type: 'revertExecutionGroup',
       executionGroupId: latestExecutionGroupId,
       ...editScope(currentRoundEdits[0]),
     });
-    setTimeout(() => { pendingBatch = null; }, 1500);
   }
 
   function editTitle(edit: Edit): string {
@@ -194,9 +213,11 @@
     }
     const scope = editScope(edit);
     const detail = await loadChangeDetail(edit, scope);
+    const diff = synthesizeDiff(detail);
     openCodeTab(scope.sessionId, detail.filePath, {
       ...scope,
-      diff: synthesizeDiff(detail),
+      diff,
+      isChangeDiff: Boolean(diff),
       content:
         typeof detail.previewContent === 'string' && detail.previewContent.length > 0
           ? detail.previewContent
@@ -295,10 +316,10 @@
       {/if}
     </div>
     <div class="file-actions">
-      <button class="action-icon approve" title={i18n.t('edits.actions.approveChange')} onclick={(e) => { e.stopPropagation(); approveChange(edit); }}>
+      <button class="action-icon approve" type="button" disabled={changeMutationPending} title={i18n.t('edits.actions.approveChange')} onclick={(e) => { e.stopPropagation(); approveChange(edit); }}>
         <Icon name="check" size={14} />
       </button>
-      <button class="action-icon revert" title={i18n.t('edits.actions.revertChange')} onclick={(e) => { e.stopPropagation(); revertChange(edit); }}>
+      <button class="action-icon revert" type="button" disabled={changeMutationPending} title={i18n.t('edits.actions.revertChange')} onclick={(e) => { e.stopPropagation(); revertChange(edit); }}>
         <Icon name="undo" size={14} />
       </button>
     </div>
@@ -319,7 +340,7 @@
           <button
             type="button"
             class="toolbar-btn approve"
-            disabled={!!pendingBatch}
+            disabled={changeMutationPending}
             title={i18n.t('edits.actions.approveAllTitle')}
             onclick={approveAllChanges}
           >
@@ -329,7 +350,7 @@
           <button
             type="button"
             class="toolbar-btn revert"
-            disabled={!!pendingBatch}
+            disabled={changeMutationPending}
             title={i18n.t('edits.actions.revertAllTitle')}
             onclick={revertAllChanges}
           >
@@ -362,7 +383,7 @@
               <button
                 type="button"
                 class="group-action"
-                disabled={!!pendingBatch}
+                disabled={changeMutationPending}
                 title={i18n.t('edits.group.revertRoundTitle')}
                 onclick={revertCurrentRound}
               >
@@ -727,14 +748,19 @@
     transition: background var(--transition-fast), color var(--transition-fast), border-color var(--transition-fast);
   }
 
-  .action-icon:hover {
+  .action-icon:hover:not(:disabled) {
     border-color: var(--edits-card-border);
     background: var(--surface-hover);
     color: var(--foreground);
   }
 
-  .action-icon.approve:hover { color: var(--success); }
-  .action-icon.revert:hover { color: var(--error); }
+  .action-icon:disabled {
+    cursor: not-allowed;
+    opacity: 0.45;
+  }
+
+  .action-icon.approve:hover:not(:disabled) { color: var(--success); }
+  .action-icon.revert:hover:not(:disabled) { color: var(--error); }
 
   @media (hover: none) {
     .file-actions {

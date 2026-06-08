@@ -100,7 +100,6 @@
   const SHELL_PADDING = 8;
   const MIN_CONTENT_WIDTH = 620;
   const VIEWPORT_MOBILE_BREAKPOINT = 900;
-  const VIEWPORT_PREVIEW_OVERLAY_BREAKPOINT = 1340;
 
   const selectedWorkspace = $derived(
     workspaces.find((workspace) => workspace.workspaceId === selectedWorkspaceId) ?? null
@@ -139,9 +138,7 @@
     if (!tab || tab.kind !== 'code') return '';
     return (tab.payload as CodeTabPayload).filepath;
   });
-  const previewIsOverlay = $derived(
-    rightPaneVisible && viewportWidth > 0 && viewportWidth <= VIEWPORT_PREVIEW_OVERLAY_BREAKPOINT,
-  );
+  const previewIsOverlay = $derived(rightPaneVisible && sidebarIsDrawer);
 
   function currentBootstrapWorkspaceId(): string {
     return typeof messagesState.currentWorkspaceId === 'string'
@@ -539,6 +536,13 @@
       : '';
 
     if (resolvedSessionId) {
+      const bootstrapSessionId = currentBootstrapSessionIdForWorkspace(authoritativeWorkspaceId);
+      if (bootstrapSessionId === resolvedSessionId) {
+        currentSessionId = resolvedSessionId;
+        updateSessions(snapshot.sessions);
+        syncBrowserSessionBinding(authoritativeWorkspaceId, snapshot.workspace.rootPath, resolvedSessionId);
+        return resolvedSessionId;
+      }
       getClientBridge().postMessage({
         type: 'switchSession',
         sessionId: resolvedSessionId,
@@ -2302,7 +2306,7 @@
   }
 
   .workbench-body--with-preview {
-    grid-template-columns: minmax(620px, 1fr) 8px minmax(320px, var(--preview-panel-width, 320px));
+    grid-template-columns: minmax(0, 1fr) 8px minmax(320px, var(--preview-panel-width, 320px));
   }
 
   .workbench-app-pane {
@@ -2408,7 +2412,7 @@
     display: none;
   }
 
-  /* 预览覆盖模式：right-pane 浮在主区上方，占满 workbench-body */
+  /* 手机抽屉视口才使用覆盖模式；桌面/平板必须保持左右分栏，避免可见列表被右栏命中层覆盖。 */
   .web-workbench-shell--preview-overlay :global(.right-pane) {
     position: absolute;
     inset: 0;

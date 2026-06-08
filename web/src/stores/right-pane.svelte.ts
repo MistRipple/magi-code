@@ -29,6 +29,8 @@ export interface CodeTabPayload {
   sessionId?: string;
   /** 可选：unified diff 文本；存在时优先走 diff 视图 */
   diff?: string | null;
+  /** 该 tab 来自变更记录；刷新恢复时用权威 changes/diff 接口重取 diff，不持久化大文本 */
+  isChangeDiff?: boolean;
   /** 可选：单文件源码；不存在时 RightPane 异步拉取 */
   content?: string | null;
   /** 可选：语言提示，用于语法高亮（按扩展名兜底） */
@@ -164,6 +166,7 @@ function sanitizeTabForPersist(tab: RightPaneTab): RightPaneTab {
     workspaceId: payload.workspaceId,
     workspacePath: payload.workspacePath,
     sessionId: payload.sessionId,
+    isChangeDiff: payload.isChangeDiff,
     language: payload.language ?? null,
     contentKind: payload.contentKind,
     size: payload.size,
@@ -435,6 +438,7 @@ export function openCodeTab(
   options?: {
     label?: string;
     diff?: string | null;
+    isChangeDiff?: boolean;
     content?: string | null;
     language?: string | null;
     workspaceId?: string;
@@ -476,6 +480,7 @@ export function openCodeTab(
       workspacePath: options?.workspacePath,
       sessionId: normalizedSession || undefined,
       diff: options?.diff ?? null,
+      isChangeDiff: options?.isChangeDiff,
       content: options?.content ?? null,
       language: options?.language ?? null,
       contentKind: options?.contentKind,
