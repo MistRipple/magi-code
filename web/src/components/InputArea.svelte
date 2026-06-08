@@ -30,6 +30,12 @@
     readStoredAccessProfile,
     writeStoredAccessProfile,
   } from '../shared/access-profile';
+  import {
+    composerWorkspaceState,
+    resolveComposerWorkspace,
+    selectComposerDraftWorkspace,
+    type ComposerWorkspaceOption,
+  } from '../stores/composer-workspace.svelte';
 
   interface SelectedImage {
     id: string;
@@ -115,6 +121,8 @@
   let branchIsRepo = $state(false);
   let branchAdditions = $state(0);
   let branchDeletions = $state(0);
+  let branchRequestSeq = 0;
+  let workspacePickerOpen = $state(false);
   let accessProfilePickerOpen = $state(false);
   let selectedAccessProfile = $state<AccessProfile>('restricted');
   const currentPickerModel = $derived.by(() => readOrchestratorModel());
@@ -135,6 +143,11 @@
   const currentSessionId = $derived(messagesState.currentSessionId);
   const currentWorkspaceId = $derived(messagesState.currentWorkspaceId);
   const currentWorkspacePath = $derived(messagesState.currentWorkspacePath);
+  const isDraftSession = $derived.by(() => !currentSessionId?.trim());
+  const composerWorkspace = $derived.by(() => (
+    resolveComposerWorkspace(currentWorkspaceId, currentWorkspacePath, isDraftSession)
+  ));
+  const workspaceOptions = $derived.by(() => composerWorkspaceState.workspaces);
   const taskProjection = $derived(getTaskProjectionState(currentSessionId, currentWorkspaceId));
 
   const shouldInterruptTaskProjectionFromComposer = $derived.by(() => {
@@ -605,6 +618,52 @@
     writeStoredAccessProfile(profile);
   }
 
+  function workspaceBinding(workspace: ComposerWorkspaceOption | null): { workspaceId?: string; workspacePath?: string } {
+    if (!workspace) return {};
+    return {
+      workspaceId: workspace.workspaceId,
+      workspacePath: workspace.rootPath,
+    };
+  }
+
+  function workspaceKey(workspace: ComposerWorkspaceOption | null): string {
+    if (!workspace) return '';
+    return `${workspace.workspaceId}::${workspace.rootPath}`;
+  }
+
+  function composerWorkspaceLabel(workspace: ComposerWorkspaceOption | null): string {
+    if (!workspace) return i18n.t('input.workspace.select');
+    return workspace.name || workspace.rootPath;
+  }
+
+  function composerWorkspaceTitle(workspace: ComposerWorkspaceOption | null): string {
+    if (!workspace) return i18n.t('input.workspace.required');
+    return `${i18n.t('input.workspace.title')}: ${workspace.rootPath}`;
+  }
+
+  function workspaceButtonLabel(workspace: ComposerWorkspaceOption | null): string {
+    if (workspace) return composerWorkspaceLabel(workspace);
+    return isDraftSession ? i18n.t('input.workspace.select') : i18n.t('input.workspace.title');
+  }
+
+  function workspaceButtonTitle(workspace: ComposerWorkspaceOption | null): string {
+    if (isDraftSession) return composerWorkspaceTitle(workspace);
+    if (!workspace) return i18n.t('input.workspace.lockedPending');
+    return i18n.t('input.workspace.locked', { name: composerWorkspaceLabel(workspace) });
+  }
+
+  function selectWorkspace(workspaceId: string) {
+    if (!isDraftSession || sessionInputLocked || isInteractionBlocking) return;
+    const workspace = selectComposerDraftWorkspace(workspaceId);
+    if (!workspace) return;
+    workspacePickerOpen = false;
+    void refreshBranchState();
+  }
+
+  function resolveSubmissionWorkspace(): ComposerWorkspaceOption | null {
+    return resolveComposerWorkspace(currentWorkspaceId, currentWorkspacePath, isDraftSession);
+  }
+
   onMount(() => {
     selectedAccessProfile = readStoredAccessProfile();
 
@@ -624,34 +683,41 @@
         mode: i18n.t(accessProfileOptions.find((option) => option.value === profile)?.labelKey ?? 'input.access.restricted'),
       }));
     }
-    function handleAccessProfileOutsidePointerDown(event: PointerEvent) {
-      if (!accessProfilePickerOpen) return;
+    function handlePickerOutsidePointerDown(event: PointerEvent) {
       const target = event.target;
-      if (target instanceof Element && target.closest('.ia-access-wrap')) return;
-      accessProfilePickerOpen = false;
+      if (workspacePickerOpen && !(target instanceof Element && target.closest('.ia-workspace-wrap'))) {
+        workspacePickerOpen = false;
+      }
+      if (accessProfilePickerOpen && !(target instanceof Element && target.closest('.ia-access-wrap'))) {
+        accessProfilePickerOpen = false;
+      }
     }
     window.addEventListener('magi:fillComposer', handleFillComposer as EventListener);
     window.addEventListener('magi:setAccessProfile', handleSetAccessProfile as EventListener);
-    document.addEventListener('pointerdown', handleAccessProfileOutsidePointerDown, true);
+    document.addEventListener('pointerdown', handlePickerOutsidePointerDown, true);
     return () => {
       window.removeEventListener('magi:fillComposer', handleFillComposer as EventListener);
       window.removeEventListener('magi:setAccessProfile', handleSetAccessProfile as EventListener);
-      document.removeEventListener('pointerdown', handleAccessProfileOutsidePointerDown, true);
+      document.removeEventListener('pointerdown', handlePickerOutsidePointerDown, true);
     };
   });
 
-  // 分支状态随工作区 reactive 重查：currentWorkspacePath 由 SSE 异步 hydrate，
-  // 切换 workspace / session 也会变。监听它而非只在 onMount 查一次——否则首屏
-  // hydrate 慢于 onMount 时，分支查询发空 path 失败后 branchIsRepo 被永久置死，
-  // 表现为分支入口"时有时无"。path 为空则不查（等 hydrate），非空才查。
+  // 分支状态随 composer 工作区 reactive 重查：草稿态允许用户先选工作区再首发，
+  // 因此不能只读后端当前绑定。监听 composerWorkspace 可避免草稿态显示旧分支。
+  // path 为空则不查（等 hydrate / 工作区列表），非空才查。
   $effect(() => {
-    const workspacePath = messagesState.currentWorkspacePath;
+    const workspacePath = composerWorkspace?.rootPath;
     // 读 currentSessionId 建立依赖：切会话也重查（分支状态与工作树绑定）。
     void currentSessionId;
     if (typeof workspacePath !== 'string' || !workspacePath.trim()) {
+      branchRequestSeq += 1;
       branchIsRepo = false;
+      branchLoading = false;
+      branchError = null;
       return;
     }
+    branchLoading = false;
+    branchError = null;
     void refreshBranchState();
   });
 
@@ -687,14 +753,20 @@
         return;
       }
 
+      const targetWorkspace = resolveSubmissionWorkspace();
+      if (!targetWorkspace) {
+        addToast('warning', i18n.t('input.workspace.required'));
+        return;
+      }
+
       const requestId = generateId();
       vscode.postMessage({
         type: 'executeTask',
         text: submissionText,
         requestId,
-        workspaceId: messagesState.currentWorkspaceId || undefined,
-        workspacePath: messagesState.currentWorkspacePath || undefined,
-        sessionId: messagesState.currentSessionId || '',
+        workspaceId: targetWorkspace.workspaceId,
+        workspacePath: targetWorkspace.rootPath,
+        sessionId: isDraftSession ? '' : (messagesState.currentSessionId || ''),
         skillName: selectedSkill?.name ?? null,
         accessProfile: selectedAccessProfile,
         followUpMode: isSending ? 'queue' : undefined,
@@ -1040,9 +1112,19 @@
   }
 
   async function refreshBranchState() {
+    const requestSeq = ++branchRequestSeq;
+    const requestWorkspace = composerWorkspace;
+    const requestWorkspaceKey = workspaceKey(requestWorkspace);
     try {
-      applyBranchResult(await fetchWorkspaceBranches());
+      const result = await fetchWorkspaceBranches(workspaceBinding(requestWorkspace));
+      if (requestSeq !== branchRequestSeq || workspaceKey(composerWorkspace) !== requestWorkspaceKey) {
+        return;
+      }
+      applyBranchResult(result);
     } catch (error) {
+      if (requestSeq !== branchRequestSeq || workspaceKey(composerWorkspace) !== requestWorkspaceKey) {
+        return;
+      }
       // 拉取失败时静默隐藏入口，不打扰用户（git 能力是增强项，非核心链路）。
       branchIsRepo = false;
       console.warn('[InputArea] 拉取工作区分支失败:', error);
@@ -1061,15 +1143,27 @@
   }
 
   async function loadBranches() {
+    const requestSeq = ++branchRequestSeq;
+    const requestWorkspace = composerWorkspace;
+    const requestWorkspaceKey = workspaceKey(requestWorkspace);
     branchLoading = true;
     branchError = null;
     try {
-      applyBranchResult(await fetchWorkspaceBranches());
+      const result = await fetchWorkspaceBranches(workspaceBinding(requestWorkspace));
+      if (requestSeq !== branchRequestSeq || workspaceKey(composerWorkspace) !== requestWorkspaceKey) {
+        return;
+      }
+      applyBranchResult(result);
     } catch (error) {
+      if (requestSeq !== branchRequestSeq || workspaceKey(composerWorkspace) !== requestWorkspaceKey) {
+        return;
+      }
       console.warn('[InputArea] 读取工作区分支失败:', error);
       branchError = i18n.t('input.branch.loadFailed');
     } finally {
-      branchLoading = false;
+      if (requestSeq === branchRequestSeq) {
+        branchLoading = false;
+      }
     }
   }
 
@@ -1084,8 +1178,13 @@
     }
     branchSwitching = target;
     branchError = null;
+    const requestWorkspace = composerWorkspace;
+    const requestWorkspaceKey = workspaceKey(requestWorkspace);
     try {
-      const result = await checkoutWorkspaceBranch(target);
+      const result = await checkoutWorkspaceBranch(target, workspaceBinding(requestWorkspace));
+      if (workspaceKey(composerWorkspace) !== requestWorkspaceKey) {
+        return;
+      }
       if (result.ok) {
         currentBranch = result.currentBranch ?? target;
         addToast('success', i18n.t('input.branch.switched', { branch: currentBranch }));
@@ -1335,6 +1434,52 @@
 
     <div class="ia-actions">
       <div class="ia-left">
+        <div class="ia-picker-wrap ia-workspace-wrap">
+          <button
+            type="button"
+            class="ia-workspace-btn"
+            class:active={workspacePickerOpen}
+            class:configured={composerWorkspace !== null}
+            class:locked={!isDraftSession}
+            onclick={() => {
+              if (isDraftSession && workspaceOptions.length > 0) {
+                workspacePickerOpen = !workspacePickerOpen;
+              }
+            }}
+            disabled={workspaceOptions.length === 0 || sessionInputLocked || isInteractionBlocking}
+            title={workspaceButtonTitle(composerWorkspace)}
+            aria-expanded={workspacePickerOpen}
+            aria-disabled={!isDraftSession || sessionInputLocked || isInteractionBlocking}
+          >
+            <Icon name="folder" size={12} />
+            <span class="ia-workspace-btn-label">{workspaceButtonLabel(composerWorkspace)}</span>
+          </button>
+          {#if workspacePickerOpen}
+            <!-- svelte-ignore a11y_click_events_have_key_events -->
+            <!-- svelte-ignore a11y_no_static_element_interactions -->
+            <div class="ia-popover-backdrop" onclick={() => (workspacePickerOpen = false)}></div>
+            <div class="ia-picker-popover ia-workspace-popover" role="menu">
+              <div class="ia-picker-header">{i18n.t('input.workspace.title')}</div>
+              {#if workspaceOptions.length === 0}
+                <div class="ia-picker-status">{i18n.t('input.workspace.empty')}</div>
+              {:else}
+                <div class="ia-picker-list">
+                  {#each workspaceOptions as workspace (workspace.workspaceId)}
+                    <button
+                      type="button"
+                      class="ia-picker-item"
+                      class:selected={composerWorkspace?.workspaceId === workspace.workspaceId}
+                      onclick={() => selectWorkspace(workspace.workspaceId)}
+                    >
+                      <span class="ia-picker-item-label">{workspace.name}</span>
+                      <span class="ia-picker-item-desc">{workspace.rootPath}</span>
+                    </button>
+                  {/each}
+                </div>
+              {/if}
+            </div>
+          {/if}
+        </div>
         {#if branchIsRepo}
           <div class="ia-picker-wrap">
             <button
@@ -1776,6 +1921,13 @@
     white-space: nowrap;
     word-break: keep-all;
   }
+  .ia-workspace-wrap {
+    max-width: 190px;
+  }
+  .ia-workspace-popover {
+    right: auto;
+    left: 0;
+  }
   .ia-picker-btn {
     display: inline-flex;
     align-items: center;
@@ -1815,6 +1967,7 @@
     min-width: 0;
     max-width: 130px;
   }
+  .ia-workspace-btn,
   .ia-branch-btn {
     display: inline-flex;
     align-items: center;
@@ -1831,17 +1984,29 @@
     cursor: pointer;
     transition: all var(--transition-fast);
   }
+  .ia-workspace-btn:hover:not(:disabled),
   .ia-branch-btn:hover:not(:disabled) {
     background: color-mix(in srgb, var(--primary) 12%, transparent);
     border-color: color-mix(in srgb, var(--primary) 38%, transparent);
     color: var(--primary);
   }
+  .ia-workspace-btn:disabled,
   .ia-branch-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .ia-workspace-btn.active,
   .ia-branch-btn.active {
     background: color-mix(in srgb, var(--primary) 14%, transparent);
     border-color: color-mix(in srgb, var(--primary) 42%, transparent);
     color: var(--primary);
   }
+  .ia-workspace-btn.configured {
+    background: color-mix(in srgb, var(--primary) 12%, transparent);
+    border-color: color-mix(in srgb, var(--primary) 36%, transparent);
+    color: var(--primary);
+  }
+  .ia-workspace-btn.locked {
+    cursor: default;
+  }
+  .ia-workspace-btn-label,
   .ia-branch-btn-label {
     flex: 0 1 auto;
     overflow: hidden;
@@ -2312,7 +2477,7 @@
     }
 
     .ia-left {
-      flex: 0 1 min(112px, 38vw);
+      flex: 0 1 min(156px, 42vw);
       width: auto;
       min-width: 0;
     }
@@ -2330,13 +2495,22 @@
       gap: 4px;
     }
 
+    .ia-workspace-wrap,
+    .ia-left > .ia-picker-wrap {
+      flex: 1 1 0;
+      min-width: 0;
+    }
+
+    .ia-workspace-btn,
     .ia-branch-btn {
       width: 100%;
       max-width: 100%;
     }
 
+    .ia-workspace-btn-label,
     .ia-branch-btn-label {
       min-width: 34px;
+      max-width: 100%;
     }
 
     .ia-access-wrap {

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, untrack } from 'svelte';
   import App from '../App.svelte';
   import { setWebSidebarContext } from './sidebar-context';
   import Icon from '../components/Icon.svelte';
@@ -41,6 +41,7 @@
     setRightPaneCollapsed,
     type CodeTabPayload,
   } from '../stores/right-pane.svelte';
+  import { syncComposerWorkspaces } from '../stores/composer-workspace.svelte';
 
   // 这两个 storage key 必须先于下方 `$state` 初始化器声明——它们被
   // readInitialExpandedWorkspaces / readInitialSidebarMode 在 $state 初始化时读取，
@@ -110,6 +111,14 @@
       ? (sessionsByWorkspace[selectedWorkspaceId] ?? []).find((session) => session.id === currentSessionId) ?? null
       : null
   );
+
+  $effect(() => {
+    const nextWorkspaces = workspaces;
+    const nextSelectedWorkspaceId = selectedWorkspaceId;
+    untrack(() => {
+      syncComposerWorkspaces(nextWorkspaces, nextSelectedWorkspaceId);
+    });
+  });
 
   const shellLayoutStyle = $derived([
     sidebarWidth ? `--sidebar-width: ${sidebarWidth}px` : '',
@@ -889,12 +898,12 @@
       selectedWorkspaceId = resolveBackendWorkspaceSelection(next);
       if (selectedWorkspaceId) {
         expandedWorkspaceIds = { [selectedWorkspaceId]: true };
+        void refreshWorkspaceSessions(
+          selectedWorkspaceId,
+          preferredSessionIdForWorkspace(selectedWorkspaceId),
+          workspacePathForId(selectedWorkspaceId),
+        );
       }
-      await refreshWorkspaceSessions(
-        selectedWorkspaceId,
-        preferredSessionIdForWorkspace(selectedWorkspaceId),
-        workspacePathForId(selectedWorkspaceId),
-      );
     } catch (error) {
       loadError = i18n.t('web.workspaceUnavailable');
       notifyWorkbenchError(i18n.t('web.action.loadWorkspaceList'), error);
@@ -2129,34 +2138,63 @@
   }
 
   .session-running-dot {
-    width: 7px;
-    height: 7px;
+    position: relative;
+    width: 12px;
+    height: 12px;
     border-radius: var(--radius-full);
-    background: var(--info);
-    box-shadow: 0 0 0 0 color-mix(in srgb, var(--info) 45%, transparent);
+    background: transparent;
     opacity: 0;
     flex-shrink: 0;
   }
 
   .session-running-dot.active {
     opacity: 1;
-    animation: session-running-pulse 1.4s ease-in-out infinite;
   }
 
-  @keyframes session-running-pulse {
-    0%, 100% {
-      transform: scale(0.82);
-      box-shadow: 0 0 0 0 color-mix(in srgb, var(--info) 42%, transparent);
+  .session-running-dot.active::before,
+  .session-running-dot.active::after {
+    content: '';
+    position: absolute;
+    inset: 50% auto auto 50%;
+    border-radius: var(--radius-full);
+    transform: translate(-50%, -50%);
+    pointer-events: none;
+  }
+
+  .session-running-dot.active::before {
+    width: 6px;
+    height: 6px;
+    background: var(--info);
+    box-shadow: 0 0 8px color-mix(in srgb, var(--info) 58%, transparent);
+  }
+
+  .session-running-dot.active::after {
+    width: 6px;
+    height: 6px;
+    border: 1px solid color-mix(in srgb, var(--info) 52%, transparent);
+    animation: session-running-breath 1.65s ease-out infinite;
+  }
+
+  @keyframes session-running-breath {
+    0% {
+      opacity: 0.85;
+      transform: translate(-50%, -50%) scale(0.75);
     }
-    50% {
-      transform: scale(1);
-      box-shadow: 0 0 0 5px color-mix(in srgb, var(--info) 0%, transparent);
+    70% {
+      opacity: 0;
+      transform: translate(-50%, -50%) scale(2.15);
+    }
+    100% {
+      opacity: 0;
+      transform: translate(-50%, -50%) scale(2.15);
     }
   }
 
   @media (prefers-reduced-motion: reduce) {
-    .session-running-dot.active {
+    .session-running-dot.active::after {
       animation: none;
+      opacity: 0.32;
+      transform: translate(-50%, -50%) scale(1.65);
     }
   }
 

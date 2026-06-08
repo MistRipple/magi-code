@@ -41,23 +41,18 @@
     return segments.length > 0 ? segments[segments.length - 1] : cleaned;
   });
 
-  // 只有“已有当前会话且该会话为空”时才禁止重复新建；未绑定 session 的工作区草稿态允许新建。
-  const hasCurrentWorkspace = $derived.by(() => Boolean(
-    messagesState.currentWorkspaceId?.trim() || messagesState.currentWorkspacePath?.trim()
-  ));
+  // 只有“已有当前会话且该会话为空”时才禁止重复新建；草稿态不要求先绑定工作区。
   const hasCurrentSession = $derived.by(() => Boolean(messagesState.currentSessionId?.trim()));
   const isCurrentSessionEmpty = $derived(
     ensureArray(appState.threadMessages).length === 0
   );
   const newSessionDisabled = $derived(
-    messagesState.sessionHydrating || !hasCurrentWorkspace || (hasCurrentSession && isCurrentSessionEmpty)
+    messagesState.sessionHydrating || (hasCurrentSession && isCurrentSessionEmpty)
   );
   const newSessionTitle = $derived(
     messagesState.sessionHydrating
       ? '正在打开新会话面板'
-      : (!hasCurrentWorkspace
-        ? i18n.t('web.unselectedWorkspace')
-        : (hasCurrentSession && isCurrentSessionEmpty ? i18n.t('header.currentSessionEmpty') : i18n.t('header.newSession')))
+      : (hasCurrentSession && isCurrentSessionEmpty ? i18n.t('header.currentSessionEmpty') : i18n.t('header.newSession'))
   );
 
   // 导出当前会话为 Markdown 文件
@@ -91,8 +86,6 @@
     });
     vscode.postMessage({
       type: 'newSession',
-      workspaceId: messagesState.currentWorkspaceId || undefined,
-      workspacePath: messagesState.currentWorkspacePath || undefined,
     });
   }
 

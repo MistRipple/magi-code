@@ -134,6 +134,54 @@
       .join(' ');
   }
 
+  const INTERNAL_REDACTED_DISPLAY_VALUES = new Set(['[path]', '[redacted]']);
+
+  function normalizeToolDisplayText(value: unknown): string {
+    if (typeof value !== 'string') return '';
+    const trimmed = value.trim();
+    return INTERNAL_REDACTED_DISPLAY_VALUES.has(trimmed.toLowerCase()) ? '' : trimmed;
+  }
+
+  function firstToolDisplayText(...values: unknown[]): string {
+    for (const value of values) {
+      const normalized = normalizeToolDisplayText(value);
+      if (normalized) return normalized;
+    }
+    return '';
+  }
+
+  function sanitizeToolDisplayPayload(value: unknown): unknown {
+    if (typeof value === 'string') {
+      return normalizeToolDisplayText(value) || undefined;
+    }
+    if (Array.isArray(value)) {
+      const items = value
+        .map((item) => sanitizeToolDisplayPayload(item))
+        .filter((item) => item !== undefined);
+      return items.length > 0 ? items : undefined;
+    }
+    if (value && typeof value === 'object') {
+      const entries = Object.entries(value as Record<string, unknown>)
+        .map(([key, entryValue]) => [key, sanitizeToolDisplayPayload(entryValue)] as const)
+        .filter(([, entryValue]) => entryValue !== undefined);
+      return entries.length > 0 ? Object.fromEntries(entries) : undefined;
+    }
+    return value;
+  }
+
+  function hasInternalRedactedDisplayValue(value: unknown): boolean {
+    if (typeof value === 'string') {
+      return INTERNAL_REDACTED_DISPLAY_VALUES.has(value.trim().toLowerCase());
+    }
+    if (Array.isArray(value)) {
+      return value.some(hasInternalRedactedDisplayValue);
+    }
+    if (value && typeof value === 'object') {
+      return Object.values(value as Record<string, unknown>).some(hasInternalRedactedDisplayValue);
+    }
+    return false;
+  }
+
   $effect(() => {
     if (status === lastStatus) {
       return;
@@ -185,6 +233,15 @@
       return viewImageOutput;
     }
     return formatContent(content);
+  }
+
+  function formatToolInput(content: unknown): string {
+    if (content === null || content === undefined) return '';
+    const sanitized = sanitizeToolDisplayPayload(content);
+    if (sanitized === undefined) {
+      return hasInternalRedactedDisplayValue(content) ? i18n.t('toolCall.redactedInput') : '';
+    }
+    return formatContent(sanitized);
   }
 
   // 获取工具图标（基于当前项目实际工具名）
@@ -380,7 +437,8 @@
   const isHeaderOpenableTool = $derived(name === 'file_view' || name === 'view');
 
   // 检查是否有内容
-  const hasInput = $derived(!!input && !!formatContent(input));
+  const inputText = $derived(formatToolInput(input));
+  const hasInput = $derived(!!inputText);
   const outputIsStructuredError = $derived(isStructuredToolErrorPayload(output));
   const imagePreview = $derived(outputIsStructuredError ? null : parseViewImagePreview(name, output));
   const outputText = $derived(outputIsStructuredError ? '' : formatToolOutput(name, output));
@@ -454,7 +512,7 @@
     }
     switch (toolName) {
       case 'shell_exec':
-        return typeof args.command === 'string' ? args.command : '';
+        return normalizeToolDisplayText(args.command);
       case 'file_view':
       case 'file_create':
       case 'file_edit':
@@ -466,74 +524,72 @@
       case 'file_patch':
       case 'apply_patch':
       case 'list_files': {
-        const p = typeof args.path === 'string' ? args.path
-          : typeof args.file_path === 'string' ? args.file_path
-          : typeof args.image_path === 'string' ? args.image_path
-          : '';
-        return p;
+        return firstToolDisplayText(args.path, args.file_path, args.image_path);
       }
       case 'code_search_regex':
       case 'search_text':
-        return typeof args.pattern === 'string' ? args.pattern
-          : typeof args.query === 'string' ? args.query : '';
+        return firstToolDisplayText(args.pattern, args.query);
       case 'code_search_semantic':
       case 'search_semantic':
       case 'project_knowledge_query':
       case 'knowledge_query':
-        return typeof args.query === 'string' ? args.query : '';
+        return normalizeToolDisplayText(args.query);
       case 'skill_apply':
-        return typeof args.skill_name === 'string' ? args.skill_name : '';
+        return normalizeToolDisplayText(args.skill_name);
       case 'read_file':
       case 'write_file':
       case 'edit_file':
       case 'delete_file':
-        return typeof args.path === 'string' ? args.path : '';
+        return normalizeToolDisplayText(args.path);
       case 'file_remove': {
         const paths = args.paths;
         if (Array.isArray(paths) && paths.length > 0) {
-          return paths.length === 1 ? String(paths[0]) : i18n.t('toolCall.fileRemoveSummary', { firstFile: paths[0], count: paths.length });
+          const displayPaths = paths
+            .map((path) => normalizeToolDisplayText(path))
+            .filter(Boolean);
+          if (displayPaths.length === 0) return '';
+          return displayPaths.length === 1
+            ? displayPaths[0]
+            : i18n.t('toolCall.fileRemoveSummary', { firstFile: displayPaths[0], count: displayPaths.length });
         }
-        return typeof args.path === 'string' ? args.path : '';
+        return normalizeToolDisplayText(args.path);
       }
       case 'web_fetch':
-        return typeof args.url === 'string' ? args.url : '';
+        return normalizeToolDisplayText(args.url);
       case 'web_search':
-        return typeof args.query === 'string' ? args.query : '';
+        return normalizeToolDisplayText(args.query);
       case 'diagram_render':
-        return typeof args.title === 'string' ? args.title : '';
+        return normalizeToolDisplayText(args.title);
       case 'code_intel_query': {
-        const action = typeof args.action === 'string' ? args.action : '';
-        const fp = typeof args.filePath === 'string' ? args.filePath : '';
+        const action = normalizeToolDisplayText(args.action);
+        const fp = normalizeToolDisplayText(args.filePath);
         return action && fp ? `${action} ${fp}` : action || fp;
       }
       case 'process_inspect':
-        return typeof args.pid === 'number' ? String(args.pid) : typeof args.pid === 'string' ? args.pid : '';
+        return typeof args.pid === 'number' ? String(args.pid) : normalizeToolDisplayText(args.pid);
       case 'diff_preview':
         return '';
       case 'file_mkdir':
-        return typeof args.path === 'string' ? args.path : '';
+        return normalizeToolDisplayText(args.path);
       case 'file_copy':
       case 'file_move': {
-        const source = typeof args.source === 'string' ? args.source : '';
-        const destination = typeof args.destination === 'string' ? args.destination : '';
+        const source = normalizeToolDisplayText(args.source);
+        const destination = normalizeToolDisplayText(args.destination);
         return source && destination ? `${source} → ${destination}` : source || destination;
       }
       case 'code_symbols': {
-        const action = typeof args.action === 'string' ? args.action : '';
-        const symbolName = typeof args.name === 'string' ? args.name : '';
-        const p = typeof args.path === 'string' ? args.path : '';
+        const action = normalizeToolDisplayText(args.action);
+        const symbolName = normalizeToolDisplayText(args.name);
+        const p = normalizeToolDisplayText(args.path);
         return [action, symbolName || p].filter(Boolean).join(' ');
       }
       case 'agent_wait': {
         const taskIds = Array.isArray(args.task_ids) ? args.task_ids : [];
-        return taskIds.map(String).filter(Boolean).join(', ');
+        return taskIds.map((taskId) => normalizeToolDisplayText(String(taskId))).filter(Boolean).join(', ');
       }
       default:
         // MCP 或其他未知工具：尝试提取常见字段
-        return (typeof args.command === 'string' ? args.command : '')
-          || (typeof args.path === 'string' ? args.path : '')
-          || (typeof args.query === 'string' ? args.query : '')
-          || (typeof args.url === 'string' ? args.url : '');
+        return firstToolDisplayText(args.command, args.path, args.query, args.url);
     }
   }
 
@@ -800,15 +856,15 @@
   // 从工具参数中提取文件路径（目录模式下返回 undefined，不支持点击跳转）
   const toolFilepath = $derived.by(() => {
     if (isDirectoryView) return undefined;
-    if (filepath) return filepath;
+    const explicitFilepath = normalizeToolDisplayText(filepath);
+    if (explicitFilepath) return explicitFilepath;
     if (!input || typeof input !== 'object') return undefined;
     const args = input as Record<string, unknown>;
 
     const pathCandidates = [args.path, args.filepath, args.filePath];
     for (const candidate of pathCandidates) {
-      if (typeof candidate === 'string' && candidate.trim().length > 0) {
-        return candidate.trim();
-      }
+      const normalized = normalizeToolDisplayText(candidate);
+      if (normalized) return normalized;
     }
 
     return undefined;
@@ -964,7 +1020,7 @@
               <div class="section-header">
                 <span class="section-label">{i18n.t('toolCall.section.input')}</span>
               </div>
-              <pre class="section-content">{formatContent(input)}</pre>
+              <pre class="section-content">{inputText}</pre>
             </div>
           {/if}
 

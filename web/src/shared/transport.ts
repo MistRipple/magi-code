@@ -184,6 +184,24 @@ declare const acquireVsCodeApi: undefined | (() => HostApi);
 let transport: AgentTransport | null = null;
 let hostApiHandle: HostApi | null = null;
 
+function isHttpAgentWebEntry(): boolean {
+  if (typeof window === 'undefined') {
+    return false;
+  }
+  const currentUrl = new URL(window.location.href);
+  if (!currentUrl.protocol.startsWith('http')) {
+    return false;
+  }
+  return currentUrl.pathname === '/'
+    || currentUrl.pathname === '/web.html'
+    || currentUrl.pathname.startsWith('/assets/')
+    || typeof (window as unknown as { __AGENT_BASE_URL__?: unknown }).__AGENT_BASE_URL__ === 'string';
+}
+
+export function shouldUseHostProxyTransport(): boolean {
+  return typeof acquireVsCodeApi === 'function' && !isHttpAgentWebEntry();
+}
+
 /**
  * 初始化传输层。在应用启动时调用一次。
  * 自动检测运行环境并选择对应的传输策略。
@@ -193,8 +211,9 @@ let hostApiHandle: HostApi | null = null;
  */
 export function initTransport(): void {
   if (transport) return;
-  if (typeof acquireVsCodeApi === 'function') {
-    hostApiHandle = acquireVsCodeApi();
+  const acquireHostApi = typeof acquireVsCodeApi === 'function' ? acquireVsCodeApi : null;
+  if (acquireHostApi && !isHttpAgentWebEntry()) {
+    hostApiHandle = acquireHostApi();
     transport = createHostProxyTransport(hostApiHandle);
   } else {
     transport = createDirectTransport();

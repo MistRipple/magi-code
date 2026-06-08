@@ -595,7 +595,7 @@ function collectAgentBaseUrlCandidates(): string[] {
 }
 
 async function isReachableAgentBaseUrl(baseUrl: string): Promise<boolean> {
-  const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  const controller = typeof AbortController === 'function' ? new AbortController() : null;
   const timer = controller
     ? window.setTimeout(() => controller.abort(), AGENT_PROBE_TIMEOUT_MS)
     : null;
@@ -1466,8 +1466,10 @@ export interface WorkspaceBranchesResult {
   deletions: number;
 }
 
-export async function fetchWorkspaceBranches(): Promise<WorkspaceBranchesResult> {
-  return await postWorkspaceBoundJson<WorkspaceBranchesResult>('/api/workspace/vcs/branches', {}, 'fetch workspace branches');
+export async function fetchWorkspaceBranches(
+  bindingOverride?: Partial<AgentBindingContext>,
+): Promise<WorkspaceBranchesResult> {
+  return await postWorkspaceBoundJson<WorkspaceBranchesResult>('/api/workspace/vcs/branches', {}, 'fetch workspace branches', bindingOverride);
 }
 
 export interface CheckoutBranchResult {
@@ -1476,8 +1478,11 @@ export interface CheckoutBranchResult {
   error?: string;
 }
 
-export async function checkoutWorkspaceBranch(branch: string): Promise<CheckoutBranchResult> {
-  return await postWorkspaceBoundJson<CheckoutBranchResult>('/api/workspace/vcs/checkout', { branch }, 'checkout workspace branch');
+export async function checkoutWorkspaceBranch(
+  branch: string,
+  bindingOverride?: Partial<AgentBindingContext>,
+): Promise<CheckoutBranchResult> {
+  return await postWorkspaceBoundJson<CheckoutBranchResult>('/api/workspace/vcs/checkout', { branch }, 'checkout workspace branch', bindingOverride);
 }
 
 export async function updateAgentRuntimeSetting(key: string, value: unknown): Promise<AgentRuntimeSettings> {

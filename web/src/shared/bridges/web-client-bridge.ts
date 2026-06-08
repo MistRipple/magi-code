@@ -666,7 +666,9 @@ function isExpectedRecoveryBridgeFailure(error: unknown): boolean {
     || detail.includes('network error')
     || detail.includes('connection refused')
     || detail.includes('bootstrap failed: 500')
-    || detail.includes('local agent');
+    || detail.includes('local agent')
+    || detail.includes('magi 暂时无法连接')
+    || detail.includes('当前页面暂时无法连接 magi');
 }
 
 function emitForcedProcessingIdle(reason: string, extra?: Record<string, unknown>): void {

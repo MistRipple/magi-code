@@ -56,6 +56,7 @@ import {
 import type { SettingsBootstrapSnapshot } from '../shared/settings-bootstrap';
 import type { RoleTemplate } from '../shared/types/role-templates';
 import type { AgentBinding, ModelEngine } from '../shared/types/registry-types';
+import { shouldUseHostProxyTransport } from '../shared/transport';
 
 interface SettingsRegistrySnapshot {
   roleTemplates: RoleTemplate[];
@@ -152,10 +153,7 @@ export const messagesState = $state({
   } as AutoScrollConfig,
 });
 
-const IS_HOSTED_WEBVIEW = (
-  typeof globalThis !== 'undefined'
-  && typeof (globalThis as { acquireVsCodeApi?: unknown }).acquireVsCodeApi === 'function'
-);
+const IS_HOSTED_WEBVIEW = shouldUseHostProxyTransport();
 
 const MAX_PERSISTED_ARRAY_LENGTH = 10000;
 const WEBVIEW_STATE_SAVE_DEBOUNCE_MS = 120;
