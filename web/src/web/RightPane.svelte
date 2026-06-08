@@ -78,14 +78,23 @@
   });
 
   const activeFilePath = $derived(activeCodePayload?.filepath ?? '');
-  const activeContentCacheKey = $derived.by(() => {
-    if (!activeFilePath) return '';
+  function codePayloadCacheKey(payload: CodeTabPayload | null | undefined): string {
+    if (!payload?.filepath) return '';
     return [
-      activeCodePayload?.workspaceId ?? '',
-      activeCodePayload?.workspacePath ?? '',
-      activeCodePayload?.sessionId ?? '',
-      activeFilePath,
+      payload.workspaceId ?? '',
+      payload.workspacePath ?? '',
+      payload.sessionId ?? '',
+      payload.filepath,
     ].join('::');
+  }
+
+  function pruneRecord<T>(record: Record<string, T>, retainedKeys: Set<string>): Record<string, T> {
+    const entries = Object.entries(record).filter(([key]) => retainedKeys.has(key));
+    return entries.length === Object.keys(record).length ? record : Object.fromEntries(entries);
+  }
+
+  const activeContentCacheKey = $derived.by(() => {
+    return codePayloadCacheKey(activeCodePayload);
   });
   const activeContentKind = $derived(activeCodePayload?.contentKind ?? 'text');
   const explicitContent = $derived(activeCodePayload?.content ?? null);
@@ -101,6 +110,22 @@
       workspaceId: activeCodePayload?.workspaceId,
       workspacePath: activeCodePayload?.workspacePath,
     });
+  });
+
+  // 右栏 tab 有上限，异步内容缓存也必须跟随当前 tab 集合裁剪，避免长期预览不同文件后常驻增长。
+  $effect(() => {
+    const retainedKeys = new Set<string>();
+    for (const tab of openTabs) {
+      if (tab.kind !== 'code') continue;
+      const key = codePayloadCacheKey(tab.payload as CodeTabPayload);
+      if (key) retainedKeys.add(key);
+    }
+    fetchedContents = pruneRecord(fetchedContents, retainedKeys);
+    fetchErrors = pruneRecord(fetchErrors, retainedKeys);
+    fetchingFlags = pruneRecord(fetchingFlags, retainedKeys);
+    fetchedDiffs = pruneRecord(fetchedDiffs, retainedKeys);
+    fetchDiffErrors = pruneRecord(fetchDiffErrors, retainedKeys);
+    fetchingDiffFlags = pruneRecord(fetchingDiffFlags, retainedKeys);
   });
 
   /**

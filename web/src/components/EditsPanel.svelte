@@ -218,10 +218,13 @@
       ...scope,
       diff,
       isChangeDiff: Boolean(diff),
-      content:
-        typeof detail.previewContent === 'string' && detail.previewContent.length > 0
-          ? detail.previewContent
-          : (typeof detail.originalContent === 'string' ? detail.originalContent : null),
+      content: diff
+        ? null
+        : (
+          typeof detail.previewContent === 'string' && detail.previewContent.length > 0
+            ? detail.previewContent
+            : (typeof detail.originalContent === 'string' ? detail.originalContent : null)
+        ),
       contentKind: detail.contentKind,
       size: detail.size,
       mime: detail.mime,
