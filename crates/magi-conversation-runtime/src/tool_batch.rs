@@ -2664,6 +2664,29 @@ mod tests {
     }
 
     #[test]
+    fn full_access_policy_allows_read_only_shell_dev_null_probe() {
+        let mut task = test_task(
+            "task-full-access-shell-dev-null",
+            "task-full-access-shell-dev-null",
+            None,
+        );
+        let mut policy = default_agent_spawn_policy();
+        policy.access_profile = magi_core::AccessProfile::FullAccess;
+        task.policy_snapshot = Some(policy);
+
+        let decision = task_policy_tool_decision(
+            &task,
+            BuiltinToolName::ShellExec.as_str(),
+            r#"{"command":"if command -v rg >/dev/null 2>&1; then rg --files; fi","access_mode":"read_only"}"#,
+        );
+
+        assert!(
+            decision.is_none(),
+            "full_access 下只读探测丢弃输出到 /dev/null 不应被 preflight 拒绝"
+        );
+    }
+
+    #[test]
     fn human_checkpoint_policy_marks_write_shell_as_needs_approval() {
         let mut task = test_task(
             "task-human-approval-shell",

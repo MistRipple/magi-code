@@ -15,6 +15,8 @@ import type {
 } from '../shared/protocol/canonical-turn';
 import { isCanonicalTerminalStatus } from '../shared/protocol/canonical-turn';
 import type { CanonicalTurnReducerState } from './turn-reducer';
+import { coerceToolArgumentsRecord } from '../lib/tool-call-display';
+import { buildCanonicalToolFileChangeBlocks } from '../lib/canonical-tool-file-change';
 
 /**
  * 单个 turn 的「呈现层」预计算结果。
@@ -95,12 +97,6 @@ function statusToToolStatus(status: CanonicalTurnItemStatus): 'pending' | 'runni
   return 'pending';
 }
 
-function toolArgumentsToRecord(value: unknown): Record<string, unknown> {
-  return value && typeof value === 'object' && !Array.isArray(value)
-    ? value as Record<string, unknown>
-    : {};
-}
-
 function valueToDisplayText(value: unknown): string | undefined {
   if (value === undefined || value === null) {
     return undefined;
@@ -126,7 +122,7 @@ function buildToolBlock(tool: CanonicalToolCall, status: CanonicalTurnItemStatus
     toolCall: {
       id: tool.callId,
       name: tool.name,
-      arguments: toolArgumentsToRecord(tool.arguments),
+      arguments: coerceToolArgumentsRecord(tool.arguments),
       status: toolStatus,
       result: toolStatus === 'error' ? undefined : resultText,
       error: errorText,
@@ -136,6 +132,17 @@ function buildToolBlock(tool: CanonicalToolCall, status: CanonicalTurnItemStatus
 
 function buildMessageBlocks(item: CanonicalTurnItem, content: string): ContentBlock[] | undefined {
   if (item.kind === 'tool_call' && item.tool) {
+    const fileChangeBlocks = buildCanonicalToolFileChangeBlocks({
+      blockIdBase: item.tool.callId,
+      sessionId: item.sessionId,
+      toolName: item.tool.name,
+      arguments: item.tool.arguments,
+      result: item.tool.result,
+      status: statusToToolStatus(item.status),
+    });
+    if (fileChangeBlocks.length > 0) {
+      return fileChangeBlocks;
+    }
     return [buildToolBlock(item.tool, item.status)];
   }
   if (item.kind === 'assistant_thinking') {

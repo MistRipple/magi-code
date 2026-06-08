@@ -18,6 +18,10 @@ let summaryUpdatedAt = ACCEPTED_AT;
 let workspaceListPayload = null;
 const capturedTurnBodies = [];
 const bootstrapInterceptors = [];
+const bridgeMutationRequests = [];
+const bridgeMutationInterceptors = [];
+let messagesSnapshotRequestCount = 0;
+let switchSessionRequestCount = 0;
 
 class MemoryStorage {
   constructor() {
@@ -222,6 +226,31 @@ function scopedBootstrapPayload(workspaceId, workspacePath, sessionId, title) {
   };
 }
 
+function scopedBootstrapPayloadWithPendingChange(workspaceId, workspacePath, sessionId, title) {
+  return {
+    ...scopedBootstrapPayload(workspaceId, workspacePath, sessionId, title),
+    pendingChanges: [
+      {
+        sessionId,
+        workspaceId,
+        workspacePath,
+        filePath: 'app.js',
+        snapshotId: `session:${sessionId}:app.js`,
+        updatedAt: ACCEPTED_AT + 3000,
+        type: 'modify',
+        additions: 1,
+        deletions: 1,
+        contentKind: 'text',
+        sourceKind: 'tool',
+      },
+    ],
+    pendingChangesState: {
+      status: 'ready',
+      pendingCount: 1,
+    },
+  };
+}
+
 function settingsBootstrapPayload() {
   return {
     workspaceId: WORKSPACE_ID,
@@ -270,6 +299,51 @@ function installFetchStub() {
         canonicalTurn: null,
         canonicalItem: null,
       });
+    }
+    if (parsed.pathname === '/api/session/switch') {
+      switchSessionRequestCount += 1;
+      return jsonResponse({
+        sessionId: SESSION_ID,
+        currentSession: {
+          sessionId: SESSION_ID,
+          title: '桥接层实时会话',
+          createdAt: ACCEPTED_AT,
+          updatedAt: summaryUpdatedAt,
+          messageCount: summaryMessageCount,
+          workspaceId: WORKSPACE_ID,
+        },
+      });
+    }
+    if (parsed.pathname === '/api/messages') {
+      messagesSnapshotRequestCount += 1;
+      return jsonResponse({
+        generatedAt: ACCEPTED_AT,
+        currentSession: null,
+        sessions: [],
+        timeline: [],
+        canonicalTurns: [],
+        notifications: [],
+        sessionId: SESSION_ID,
+        hasMoreBefore: false,
+        beforeCursor: null,
+      });
+    }
+    if (
+      parsed.pathname === '/api/changes/approve'
+      || parsed.pathname === '/api/changes/revert'
+      || parsed.pathname === '/api/changes/approve-all'
+      || parsed.pathname === '/api/changes/revert-all'
+      || parsed.pathname === '/api/changes/revert-execution-group'
+    ) {
+      bridgeMutationRequests.push({
+        pathname: parsed.pathname,
+        body: init.body ? JSON.parse(String(init.body)) : null,
+      });
+      const interceptor = bridgeMutationInterceptors.shift();
+      if (interceptor) {
+        return interceptor(parsed, init);
+      }
+      return jsonResponse({ ok: true });
     }
     if (parsed.pathname === '/bootstrap') {
       const interceptor = bootstrapInterceptors.shift();
@@ -636,6 +710,165 @@ await withGoldenViteServer(async (server) => {
     messagesStore.messagesState.isProcessing,
     false,
     'lagged recovery bootstrap must keep processing settled after terminal transcript restore',
+  );
+
+  const switchBootstrapRequests = [];
+  bootstrapInterceptors.push((parsed) => {
+    switchBootstrapRequests.push(parsed);
+    return jsonResponse(scopedBootstrapPayloadWithPendingChange(
+      WORKSPACE_ID,
+      WORKSPACE_PATH,
+      SESSION_ID,
+      '切换后带变更会话',
+    ));
+  });
+  const messagesSnapshotBeforeSwitch = messagesSnapshotRequestCount;
+  bridge.postMessage({
+    type: 'switchSession',
+    sessionId: SESSION_ID,
+    workspaceId: WORKSPACE_ID,
+    workspacePath: WORKSPACE_PATH,
+  });
+  await waitFor(
+    () => switchBootstrapRequests.length === 1,
+    'switchSession must restore from authoritative bootstrap',
+  );
+  assert.equal(
+    messagesSnapshotRequestCount,
+    messagesSnapshotBeforeSwitch,
+    'switchSession must not restore from /api/messages partial snapshot',
+  );
+  assert.equal(
+    messagesStore.messagesState.edits.length,
+    1,
+    'switchSession bootstrap must preserve pending changes in edits panel state',
+  );
+
+  const blockedMutation = deferred();
+  const duplicateMutationBootstrap = deferred();
+  const duplicateMutationBootstrapRequests = [];
+  const mutationRequestsBeforeDedupe = bridgeMutationRequests.length;
+  bridgeMutationInterceptors.push(() => blockedMutation.promise.then(() => jsonResponse({ ok: true })));
+  bootstrapInterceptors.push((parsed) => {
+    duplicateMutationBootstrapRequests.push(parsed);
+    return duplicateMutationBootstrap.promise.then(() => jsonResponse(scopedBootstrapPayloadWithPendingChange(
+      WORKSPACE_ID,
+      WORKSPACE_PATH,
+      SESSION_ID,
+      '重复操作后快照',
+    )));
+  });
+  bridge.postMessage({
+    type: 'approveChange',
+    filePath: 'app.js',
+    workspaceId: WORKSPACE_ID,
+    workspacePath: WORKSPACE_PATH,
+    sessionId: SESSION_ID,
+  });
+  await waitFor(
+    () => bridgeMutationRequests.length === mutationRequestsBeforeDedupe + 1,
+    'first change mutation must reach backend',
+  );
+  await waitFor(
+    () => messagesStore.messagesState.changeMutationStatus?.isMutating === true
+      && messagesStore.messagesState.changeMutationStatus?.sessionId === SESSION_ID
+      && messagesStore.messagesState.changeMutationStatus?.workspaceId === WORKSPACE_ID,
+    'change mutation start must be reflected in the message store',
+  );
+  bridge.postMessage({
+    type: 'approveChange',
+    filePath: 'app.js',
+    workspaceId: WORKSPACE_ID,
+    workspacePath: WORKSPACE_PATH,
+    sessionId: SESSION_ID,
+  });
+  bridge.postMessage({
+    type: 'revertAllChanges',
+    workspaceId: WORKSPACE_ID,
+    workspacePath: WORKSPACE_PATH,
+    sessionId: SESSION_ID,
+  });
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(
+    bridgeMutationRequests.length,
+    mutationRequestsBeforeDedupe + 1,
+    'in-flight change mutation must suppress duplicate and overlapping mutations for the same scope',
+  );
+  assert.equal(
+    messagesStore.messagesState.changeMutationStatus?.isMutating,
+    true,
+    'deduped change mutations must keep the original in-flight status active',
+  );
+  blockedMutation.resolve();
+  await waitFor(
+    () => duplicateMutationBootstrapRequests.length === 1,
+    'finished change mutation must refresh authoritative bootstrap once',
+  );
+  duplicateMutationBootstrap.resolve();
+  await waitFor(
+    () => messagesStore.messagesState.changeMutationStatus === null,
+    'change mutation status must clear after the authoritative bootstrap refresh completes',
+  );
+  const mutationRequestsAfterDedupeCompletion = bridgeMutationRequests.length;
+  bridge.postMessage({
+    type: 'revertChange',
+    filePath: 'app.js',
+    workspaceId: WORKSPACE_ID,
+    workspacePath: WORKSPACE_PATH,
+    sessionId: SESSION_ID,
+  });
+  await waitFor(
+    () => bridgeMutationRequests.length === mutationRequestsAfterDedupeCompletion + 1,
+    'change mutation scope lock must be released after the authoritative bootstrap refresh completes',
+  );
+  await waitFor(
+    () => messagesStore.messagesState.changeMutationStatus === null,
+    'subsequent change mutation must also clear its status after refresh',
+  );
+
+  const slowBootstrap = deferred();
+  const freshBootstrap = deferred();
+  const mutationBootstrapRequests = [];
+  bootstrapInterceptors.push((parsed) => {
+    mutationBootstrapRequests.push(parsed);
+    return slowBootstrap.promise.then(() => jsonResponse(scopedBootstrapPayloadWithPendingChange(
+      WORKSPACE_ID,
+      WORKSPACE_PATH,
+      SESSION_ID,
+      '旧飞行中快照',
+    )));
+  });
+  bridge.postMessage({ type: 'requestState' });
+  await waitFor(
+    () => mutationBootstrapRequests.length === 1,
+    'mutation setup must start an in-flight bootstrap request',
+  );
+  bootstrapInterceptors.push((parsed) => {
+    mutationBootstrapRequests.push(parsed);
+    return freshBootstrap.promise.then(() => jsonResponse(scopedBootstrapPayload(
+      WORKSPACE_ID,
+      WORKSPACE_PATH,
+      SESSION_ID,
+      '批准后新快照',
+    )));
+  });
+  bridge.postMessage({
+    type: 'approveChange',
+    filePath: 'app.js',
+    workspaceId: WORKSPACE_ID,
+    workspacePath: WORKSPACE_PATH,
+    sessionId: SESSION_ID,
+  });
+  await waitFor(
+    () => bridgeMutationRequests.some((request) => request.pathname === '/api/changes/approve')
+      && mutationBootstrapRequests.length === 2,
+    'approveChange must start a fresh bootstrap instead of reusing a stale in-flight request',
+  );
+  freshBootstrap.resolve();
+  slowBootstrap.resolve();
+  await waitFor(
+    () => messagesStore.messagesState.edits.length === 0,
+    'approveChange fresh bootstrap must clear accepted pending changes',
   );
 
   bridge.postMessage({

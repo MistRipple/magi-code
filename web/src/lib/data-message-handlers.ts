@@ -38,6 +38,7 @@ import {
   setSessionHistoryState,
   messagesState,
   hasActiveLocalTimelineTurn,
+  setChangeMutationStatus,
 } from '../stores/messages.svelte';
 import type {
   AppState, Message, Session,
@@ -598,6 +599,16 @@ export function handleUnifiedData(standard: StandardMessage) {
       applySessionNotificationsStatus(payload);
       break;
 
+    case 'changeMutationStatus':
+      setChangeMutationStatus({
+        isMutating: payload.isMutating === true,
+        sessionId: typeof payload.sessionId === 'string' ? payload.sessionId : null,
+        workspaceId: typeof payload.workspaceId === 'string' ? payload.workspaceId : null,
+        workspacePath: typeof payload.workspacePath === 'string' ? payload.workspacePath : null,
+        updatedAt: typeof payload.updatedAt === 'number' ? payload.updatedAt : undefined,
+      });
+      break;
+
     case 'orchestratorRuntimeState':
       handleOrchestratorRuntimeState(asMessage(payload));
       break;
@@ -724,7 +735,6 @@ function handleEmptyWorkspaceStateLoaded(message: ClientBridgeMessage) {
       currentWorkspacePath: workspacePath,
       pendingChanges: [],
       tasks: [],
-      edits: [],
       isProcessing: false,
       processingState: null,
     });

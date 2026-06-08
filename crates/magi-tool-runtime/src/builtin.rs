@@ -532,6 +532,7 @@ fn execute_shell_exec(input: &str, context: &ToolExecutionContext) -> String {
     let shell = request
         .as_ref()
         .and_then(|object| field_string(object, &["shell"]))
+        .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(default_shell_binary);
     let timeout_ms = request
         .as_ref()
@@ -1016,6 +1017,7 @@ fn execute_process_launch_with_surface(
     let shell = request
         .as_ref()
         .and_then(|object| field_string(object, &["shell"]))
+        .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(default_shell_binary);
 
     let mut child = match Command::new(&shell)

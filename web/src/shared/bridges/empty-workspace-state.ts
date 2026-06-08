@@ -4,7 +4,6 @@ export interface EmptyWorkspaceAppStatePayload {
   processingState: null;
   pendingChanges: [];
   pendingChangesState: null;
-  edits: [];
   pendingChangesStateVersion: number;
   stateUpdatedAt: number;
   recovered: false;
@@ -19,7 +18,6 @@ export function buildEmptyWorkspaceAppState(now: number): EmptyWorkspaceAppState
     processingState: null,
     pendingChanges: [],
     pendingChangesState: null,
-    edits: [],
     pendingChangesStateVersion: 0,
     stateUpdatedAt: now,
     recovered: false,

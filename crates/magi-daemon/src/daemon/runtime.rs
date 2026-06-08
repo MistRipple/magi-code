@@ -686,18 +686,6 @@ impl DaemonRuntime {
             &event_bus,
         );
 
-        // 引导阶段：代码索引与 workspace 绑定。进程内检索引擎不持久化，
-        // daemon 每次启动都必须为所有已注册 workspace 重建，而不是只恢复 active workspace。
-        let mut synced_code_index = false;
-        for workspace in workspace_store.workspaces() {
-            let scan_root = PathBuf::from(workspace.root_path.as_str());
-            knowledge_store.build_workspace_index(&workspace.workspace_id, &scan_root);
-            synced_code_index = true;
-        }
-        if synced_code_index {
-            let _ = state_repository.save_knowledge_state(&knowledge_store.export_state());
-        }
-
         let runtime_maintenance = RuntimeMaintenance::new(
             RuntimeMaintenanceConfig::default(),
             event_bus.clone(),
@@ -2254,7 +2242,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restore_rebuilds_code_index_for_all_registered_workspaces() {
+    async fn restore_defers_code_index_rebuild_for_registered_workspaces() {
         let state_root = temp_state_root("multi-workspace-code-index");
         let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root.clone());
         let secondary_root = state_root.join("secondary-workspace");
@@ -2294,12 +2282,12 @@ mod tests {
         };
 
         let restored = DaemonRuntime::restore(&config)
-            .expect("runtime restore should rebuild indexes for every registered workspace");
+            .expect("runtime restore should not block on code index rebuild");
         assert!(
-            restored
+            !restored
                 .knowledge_store
                 .workspace_index_ready(&WorkspaceId::new(&secondary_workspace_id)),
-            "non-active registered workspace search index should be rebuilt after daemon restart"
+            "daemon restore must not synchronously rebuild every registered workspace index"
         );
 
         let bootstrap = get_json(
@@ -2313,7 +2301,20 @@ mod tests {
             .iter()
             .find(|dependency| dependency["name"] == "workspace_code_index")
             .expect("workspace_code_index dependency should be exposed");
-        assert_eq!(workspace_code_index["status"], "ready");
+        assert_eq!(workspace_code_index["status"], "not_ready");
+
+        let knowledge = get_json(
+            restored.router("daemon-test".to_string()),
+            &format!("/api/knowledge?workspaceId={secondary_workspace_id}"),
+        )
+        .await;
+        assert_eq!(knowledge["codeIndexStatus"]["status"], "indexed");
+        assert!(
+            restored
+                .knowledge_store
+                .workspace_index_ready(&WorkspaceId::new(&secondary_workspace_id)),
+            "knowledge endpoint should lazily rebuild the requested workspace index"
+        );
     }
 
     async fn post_json(app: axum::Router, path: &str, body: Value) -> (StatusCode, Value) {

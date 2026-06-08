@@ -148,6 +148,12 @@ mod tests {
                 .expect("description")
                 .contains("read_only")
         );
+        assert!(
+            access_mode["description"]
+                .as_str()
+                .expect("description")
+                .contains("临时文件")
+        );
     }
 
     #[test]

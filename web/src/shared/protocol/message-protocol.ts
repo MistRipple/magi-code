@@ -73,6 +73,7 @@ export type NotifyCategory = 'incident' | 'audit' | 'feedback';
  * 数据消息类型
  */
 export type DataMessageType =
+  | 'changeMutationStatus'
   | 'clarificationRequest'
   | 'auxiliaryConnectionTestResult'
   | 'customToolAdded'

@@ -1,4 +1,4 @@
-use magi_core::public_runtime_text;
+use magi_core::{PUBLIC_REDACTED_PATH, public_runtime_text};
 use magi_event_bus::EventEnvelope;
 use magi_session_store::{CanonicalTurn, CanonicalTurnItem};
 use serde::{Serialize, de::DeserializeOwned};
@@ -59,19 +59,34 @@ fn public_canonical_turn_item_in_place(item: &mut CanonicalTurnItem) {
     let Some(tool) = item.tool.as_mut() else {
         return;
     };
-    tool.arguments = tool.arguments.take().and_then(public_canonical_tool_value);
-    tool.result = tool.result.take().and_then(public_canonical_tool_value);
+    let tool_name = tool.name.clone();
+    tool.arguments = tool
+        .arguments
+        .take()
+        .and_then(|value| public_canonical_tool_value(value, true, Some(&tool_name)));
+    tool.result = tool
+        .result
+        .take()
+        .and_then(|value| public_canonical_tool_value(value, false, None));
     tool.error = public_canonical_tool_text(tool.error.take());
 }
 
-fn public_canonical_tool_value(value: Value) -> Option<Value> {
+fn public_canonical_tool_value(
+    value: Value,
+    preserve_raw_path_string: bool,
+    tool_name: Option<&str>,
+) -> Option<Value> {
+    let original = value.clone();
     let public = public_runtime_text(&value.to_string());
     if public.is_empty() {
         return None;
     }
-    serde_json::from_str(&public)
+    let mut public_value = serde_json::from_str(&public)
         .ok()
-        .or_else(|| Some(Value::String(public)))
+        .or_else(|| Some(Value::String(public)))?;
+    preserve_public_tool_path_labels(&original, &mut public_value, preserve_raw_path_string);
+    preserve_public_apply_patch_path_labels(tool_name, &original, &mut public_value);
+    Some(public_value)
 }
 
 fn public_canonical_tool_text(value: Option<String>) -> Option<String> {
@@ -133,6 +148,169 @@ fn public_runtime_tool_text_value(value: &mut Value) {
     } else {
         *value = Value::String(public);
     }
+}
+
+fn preserve_public_tool_path_labels(
+    original: &Value,
+    public: &mut Value,
+    preserve_raw_path_string: bool,
+) {
+    match (original, public) {
+        (Value::Object(original_object), Value::Object(public_object)) => {
+            for (key, public_value) in public_object {
+                let Some(original_value) = original_object.get(key) else {
+                    continue;
+                };
+                if is_tool_path_label_key(key) {
+                    preserve_public_tool_path_label_value(original_value, public_value);
+                } else {
+                    preserve_public_tool_path_labels(original_value, public_value, false);
+                }
+            }
+        }
+        (Value::Array(original_items), Value::Array(public_items)) => {
+            for (original_item, public_item) in original_items.iter().zip(public_items.iter_mut()) {
+                preserve_public_tool_path_labels(original_item, public_item, false);
+            }
+        }
+        (Value::String(original_text), public_value) if preserve_raw_path_string => {
+            if public_value == PUBLIC_REDACTED_PATH {
+                if let Some(label) = public_path_label(original_text) {
+                    *public_value = Value::String(label);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn preserve_public_tool_path_label_value(original: &Value, public: &mut Value) {
+    match (original, public) {
+        (Value::String(original_text), Value::String(public_text))
+            if public_text == PUBLIC_REDACTED_PATH =>
+        {
+            if let Some(label) = public_path_label(original_text) {
+                *public_text = label;
+            }
+        }
+        (Value::Array(original_items), Value::Array(public_items)) => {
+            for (original_item, public_item) in original_items.iter().zip(public_items.iter_mut()) {
+                preserve_public_tool_path_label_value(original_item, public_item);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn preserve_public_apply_patch_path_labels(
+    tool_name: Option<&str>,
+    original: &Value,
+    public: &mut Value,
+) {
+    if tool_name != Some("apply_patch") {
+        return;
+    }
+    match (original, public) {
+        (Value::Object(original_object), Value::Object(public_object)) => {
+            for key in ["patch", "input", "text"] {
+                let (Some(Value::String(original_patch)), Some(Value::String(public_patch))) =
+                    (original_object.get(key), public_object.get_mut(key))
+                else {
+                    continue;
+                };
+                *public_patch = public_apply_patch_text(original_patch, public_patch);
+                break;
+            }
+        }
+        (Value::String(original_patch), Value::String(public_patch)) => {
+            *public_patch = public_apply_patch_text(original_patch, public_patch);
+        }
+        _ => {}
+    }
+}
+
+fn public_apply_patch_text(original_patch: &str, public_patch: &str) -> String {
+    let original_lines = original_patch.lines().collect::<Vec<_>>();
+    let mut public_lines = public_patch.lines().map(str::to_string).collect::<Vec<_>>();
+    if original_lines.len() != public_lines.len() {
+        return public_patch.to_string();
+    }
+
+    for (index, original_line) in original_lines.iter().enumerate() {
+        let Some((prefix, original_path)) = apply_patch_path_header(original_line) else {
+            continue;
+        };
+        let Some(label) = public_path_label(original_path) else {
+            continue;
+        };
+        public_lines[index] = format!("{prefix}{label}");
+    }
+    public_lines.join("\n")
+}
+
+fn apply_patch_path_header(line: &str) -> Option<(&'static str, &str)> {
+    for prefix in [
+        "*** Add File: ",
+        "*** Delete File: ",
+        "*** Update File: ",
+        "*** Move to: ",
+    ] {
+        if let Some(path) = line.strip_prefix(prefix) {
+            return Some((prefix, path));
+        }
+    }
+    None
+}
+
+fn is_tool_path_label_key(key: &str) -> bool {
+    matches!(
+        key.to_ascii_lowercase().as_str(),
+        "path"
+            | "filepath"
+            | "file_path"
+            | "imagepath"
+            | "image_path"
+            | "dirpath"
+            | "dir_path"
+            | "targetpath"
+            | "target_path"
+            | "source"
+            | "sourcepath"
+            | "source_path"
+            | "destination"
+            | "destinationpath"
+            | "destination_path"
+            | "changed_paths"
+            | "changedpaths"
+            | "file_paths"
+            | "filepaths"
+            | "target_paths"
+            | "targetpaths"
+    )
+}
+
+fn public_path_label(path: &str) -> Option<String> {
+    let trimmed = path.trim().trim_end_matches(['/', '\\']);
+    if trimmed.is_empty() {
+        return None;
+    }
+    if is_absolute_path_label(trimmed) {
+        return trimmed
+            .rsplit(['/', '\\'])
+            .find(|segment| !segment.is_empty())
+            .map(str::to_string);
+    }
+    Some(trimmed.to_string())
+}
+
+fn is_absolute_path_label(path: &str) -> bool {
+    path.starts_with('/')
+        || path.starts_with("\\\\")
+        || path.as_bytes().get(0..3).is_some_and(|prefix| {
+            prefix[0].is_ascii_alphabetic()
+                && prefix[1] == b':'
+                && (prefix[2] == b'\\' || prefix[2] == b'/')
+        })
 }
 
 #[cfg(test)]
@@ -228,7 +406,8 @@ mod tests {
         let public = public_event_envelope(event);
         let payload_text = public.payload.to_string();
 
-        assert!(!payload_text.contains("secret.txt"));
+        assert!(!payload_text.contains("/Users/xie/code/TEST/secret.txt"));
+        assert!(payload_text.contains("secret.txt"));
         assert!(!payload_text.contains("raw.txt"));
         assert!(!payload_text.contains("summary.txt"));
         assert!(!payload_text.contains("/private/tmp"));
@@ -238,7 +417,11 @@ mod tests {
         assert!(!payload_text.contains("summary-error"));
         assert_eq!(
             public.payload["canonical_turn"]["items"][0]["tool"]["arguments"]["path"],
-            json!("[path]")
+            json!("secret.txt")
+        );
+        assert_eq!(
+            public.payload["canonical_item"]["tool"]["arguments"]["path"],
+            json!("secret.txt")
         );
         assert_eq!(
             public.payload["canonical_item"]["tool"]["arguments"]["token"],
@@ -259,6 +442,56 @@ mod tests {
         assert_eq!(
             public.payload["item"]["content"],
             json!("工具卡片保留 /Users/xie/code/plain-text")
+        );
+    }
+
+    #[test]
+    fn public_canonical_apply_patch_keeps_safe_patch_file_headers() {
+        let mut item = canonical_tool_item();
+        let tool = item.tool.as_mut().expect("tool should exist");
+        tool.name = "apply_patch".to_string();
+        let patch_text = [
+            "*** Begin Patch",
+            "*** Update File: /Users/xie/code/vibecode-test/index.html",
+            "@@",
+            "-<div>old</div>",
+            "+<div>new</div>",
+            "*** Update File: /Users/xie/code/vibecode-test/styles.css",
+            "@@",
+            "-.old { color: red; }",
+            "+.new { color: blue; }",
+            "+/* sk-live-secret /private/tmp/magi */",
+            "*** End Patch",
+        ]
+        .join("\n");
+        tool.arguments = Some(json!({
+            "patch": patch_text
+        }));
+        tool.result = Some(json!({
+            "status": "succeeded",
+            "changed_paths": [
+                "/Users/xie/code/vibecode-test/index.html",
+                "/Users/xie/code/vibecode-test/styles.css"
+            ],
+        }));
+
+        let public = public_canonical_turn_item(item);
+        let tool = public.tool.expect("public tool should exist");
+        let patch = tool.arguments.expect("arguments should exist")["patch"]
+            .as_str()
+            .expect("patch should stay string")
+            .to_string();
+
+        assert!(patch.contains("*** Update File: index.html"));
+        assert!(patch.contains("*** Update File: styles.css"));
+        assert!(patch.contains("+.new { color: blue; }"));
+        assert!(!patch.contains("/Users/xie"));
+        assert!(!patch.contains("/private/tmp"));
+        assert!(!patch.contains("live-secret"));
+        assert!(patch.contains("sk-[redacted]"));
+        assert_eq!(
+            tool.result.expect("result should exist")["changed_paths"],
+            json!(["index.html", "styles.css"])
         );
     }
 }

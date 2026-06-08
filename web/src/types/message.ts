@@ -760,6 +760,14 @@ export interface Edit {
   executionGroupId?: string;
 }
 
+export interface ChangeMutationStatus {
+  isMutating: boolean;
+  sessionId?: string | null;
+  workspaceId?: string | null;
+  workspacePath?: string | null;
+  updatedAt?: number;
+}
+
 // Toast 通知
 export type ToastType = 'info' | 'success' | 'warning' | 'error';
 
@@ -809,7 +817,6 @@ export interface AppState {
   pendingChanges?: unknown[];
   pendingChangesState?: unknown;
   locale?: LocaleCode;
-  edits?: Edit[];
   pendingChangesStateVersion?: number;
   toasts?: Toast[];
   stateUpdatedAt?: number;

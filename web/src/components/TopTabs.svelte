@@ -1,6 +1,6 @@
 <script lang="ts">
   import { i18n } from '../stores/i18n.svelte';
-  import { getState } from '../stores/messages.svelte';
+  import { messagesState } from '../stores/messages.svelte';
   import { getTaskProjectionState } from '../stores/task-projection-store.svelte';
   import { ensureArray } from '../lib/utils';
 
@@ -11,9 +11,8 @@
 
   let { activeTopTab, onTabChange }: Props = $props();
 
-  const appState = getState();
-  const currentSessionId = $derived(appState.currentSessionId);
-  const currentWorkspaceId = $derived(appState.currentWorkspaceId);
+  const currentSessionId = $derived(messagesState.currentSessionId);
+  const currentWorkspaceId = $derived(messagesState.currentWorkspaceId);
   const taskProjection = $derived(getTaskProjectionState(currentSessionId, currentWorkspaceId));
 
   // 任务和变更的徽章数量
@@ -28,7 +27,7 @@
     const ids = new Set<string>(projection.failed_tasks ?? []);
     return ids.size;
   });
-  const editsBadge = $derived(ensureArray(appState.edits).length);
+  const editsBadge = $derived(ensureArray(messagesState.edits).length);
 </script>
 
 <div class="tab-bar tab-bar--top">

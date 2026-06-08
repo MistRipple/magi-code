@@ -28,6 +28,13 @@
     toolPayloadErrorCode,
     toolPayloadStatus,
   } from '../lib/tool-error-payload';
+  import {
+    firstToolDisplayText,
+    hasInternalRedactedDisplayValue,
+    normalizeToolDisplayText,
+    resolveToolCardTarget,
+    sanitizeToolDisplayPayload,
+  } from '../lib/tool-call-display';
 
   interface ErrorDiagnosis {
     category: 'model_input' | 'context_stale' | 'permission' | 'role_constraint' | 'policy' | 'model_output' | 'workspace_write' | 'runtime';
@@ -132,54 +139,6 @@
     return parts
       .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
       .join(' ');
-  }
-
-  const INTERNAL_REDACTED_DISPLAY_VALUES = new Set(['[path]', '[redacted]']);
-
-  function normalizeToolDisplayText(value: unknown): string {
-    if (typeof value !== 'string') return '';
-    const trimmed = value.trim();
-    return INTERNAL_REDACTED_DISPLAY_VALUES.has(trimmed.toLowerCase()) ? '' : trimmed;
-  }
-
-  function firstToolDisplayText(...values: unknown[]): string {
-    for (const value of values) {
-      const normalized = normalizeToolDisplayText(value);
-      if (normalized) return normalized;
-    }
-    return '';
-  }
-
-  function sanitizeToolDisplayPayload(value: unknown): unknown {
-    if (typeof value === 'string') {
-      return normalizeToolDisplayText(value) || undefined;
-    }
-    if (Array.isArray(value)) {
-      const items = value
-        .map((item) => sanitizeToolDisplayPayload(item))
-        .filter((item) => item !== undefined);
-      return items.length > 0 ? items : undefined;
-    }
-    if (value && typeof value === 'object') {
-      const entries = Object.entries(value as Record<string, unknown>)
-        .map(([key, entryValue]) => [key, sanitizeToolDisplayPayload(entryValue)] as const)
-        .filter(([, entryValue]) => entryValue !== undefined);
-      return entries.length > 0 ? Object.fromEntries(entries) : undefined;
-    }
-    return value;
-  }
-
-  function hasInternalRedactedDisplayValue(value: unknown): boolean {
-    if (typeof value === 'string') {
-      return INTERNAL_REDACTED_DISPLAY_VALUES.has(value.trim().toLowerCase());
-    }
-    if (Array.isArray(value)) {
-      return value.some(hasInternalRedactedDisplayValue);
-    }
-    if (value && typeof value === 'object') {
-      return Object.values(value as Record<string, unknown>).some(hasInternalRedactedDisplayValue);
-    }
-    return false;
   }
 
   $effect(() => {
@@ -609,7 +568,30 @@
       ? (isDirectoryView ? i18n.t('toolCall.displayName.viewDirectory') : i18n.t('toolCall.displayName.viewFile'))
       : getToolDisplayName(name)
   );
-  const toolSummary = $derived(diagramPayload ? diagramSummary(diagramPayload) : getToolSummary(name, input));
+  const toolCardTarget = $derived(resolveToolCardTarget({
+    toolName: name,
+    input,
+    output,
+    explicitFilepath: filepath,
+    directoryView: isDirectoryView,
+  }));
+  const toolTargetSummary = $derived.by(() => {
+    if (toolCardTarget.primaryPath || toolCardTarget.paths.length === 0) {
+      return '';
+    }
+    const [firstPath, ...restPaths] = toolCardTarget.paths;
+    return restPaths.length === 0
+      ? firstPath
+      : i18n.t('toolCall.multipleFilesSummary', {
+        firstFile: firstPath,
+        count: toolCardTarget.paths.length,
+      });
+  });
+  const toolSummary = $derived(
+    diagramPayload
+      ? diagramSummary(diagramPayload)
+      : toolTargetSummary || getToolSummary(name, input)
+  );
 
   // 判断输出内容是否包含 markdown 格式（标题、表格、列表等）
   const isToolOutputStreaming = $derived(status === 'running' || status === 'pending');
@@ -853,22 +835,8 @@
     }
   }
 
-  // 从工具参数中提取文件路径（目录模式下返回 undefined，不支持点击跳转）
-  const toolFilepath = $derived.by(() => {
-    if (isDirectoryView) return undefined;
-    const explicitFilepath = normalizeToolDisplayText(filepath);
-    if (explicitFilepath) return explicitFilepath;
-    if (!input || typeof input !== 'object') return undefined;
-    const args = input as Record<string, unknown>;
-
-    const pathCandidates = [args.path, args.filepath, args.filePath];
-    for (const candidate of pathCandidates) {
-      const normalized = normalizeToolDisplayText(candidate);
-      if (normalized) return normalized;
-    }
-
-    return undefined;
-  });
+  // 从统一目标解析结果中提取可点击文件；多文件/目录模式只展示摘要，避免误打开。
+  const toolFilepath = $derived(toolCardTarget.primaryPath);
 
   // 处理文件点击
   function handleOpenFile() {

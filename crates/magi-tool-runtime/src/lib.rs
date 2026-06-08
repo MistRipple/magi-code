@@ -809,7 +809,7 @@ impl BuiltinToolName {
                     "max_bytes": { "type": "integer", "description": "action=read 时 stdout / stderr 预览最多读取的字节数" },
                     "access_mode": {
                         "type": "string",
-                        "description": "声明命令访问模式：read_only / maybe_write / explicit_write。ls、cat、grep、git status、git diff、不会改文件的测试等只读探查请用 read_only。只读探测中“文件不存在/无匹配”属于可汇报结果时，命令必须用 if/else、|| true 或末尾 true 保证整体退出码为 0，避免把可恢复探测误判为任务失败。",
+                        "description": "声明命令访问模式：read_only / maybe_write / explicit_write。ls、cat、grep、git status、git diff、不会改文件的测试等只读探查请用 read_only。read_only 必须实际不写文件：不得创建、修改、删除文件，不得把输出重定向到普通文件或临时文件（如 > /tmp/...、>> file），不得使用 tee、touch、mktemp、rm、mv、cp 等写类操作；仅允许在条件探测中把输出丢弃到 /dev/null。需要 scratch 文件、缓存结果或任何写入时必须声明 maybe_write 或 explicit_write，或改用管道/标准输出完成验证。只读探测中“文件不存在/无匹配”属于可汇报结果时，命令必须用 if/else、|| true 或末尾 true 保证整体退出码为 0，避免把可恢复探测误判为任务失败。",
                         "enum": ["read_only", "maybe_write", "explicit_write"]
                     },
                     "background": { "type": "boolean", "description": "在后台启动而不阻塞等待完成" }
@@ -2797,6 +2797,29 @@ mod tests {
         assert_eq!(payload["access_mode"], "maybe_write");
         assert_eq!(payload["stdout"], "hello");
 
+        let empty_shell_output = tool_registry.execute_with_policy(
+            ToolExecutionInput {
+                tool_call_id: ToolCallId::new("tool-call-shell-empty-shell"),
+                tool_name: BuiltinToolName::ShellExec.as_str().to_string(),
+                tool_kind: ToolKind::Builtin,
+                input: serde_json::json!({
+                    "command": "printf empty-shell-ok",
+                    "shell": "",
+                    "access_mode": "read_only",
+                })
+                .to_string(),
+                approval_requirement: ApprovalRequirement::None,
+                risk_level: RiskLevel::Low,
+            },
+            ToolExecutionContext::default(),
+            &full_access_policy(),
+        );
+
+        assert_eq!(empty_shell_output.status, ExecutionResultStatus::Succeeded);
+        let empty_shell_payload: Value =
+            serde_json::from_str(&empty_shell_output.payload).expect("payload json");
+        assert_eq!(empty_shell_payload["stdout"], "empty-shell-ok");
+
         let blocked = tool_registry.execute_with_policy(
             ToolExecutionInput {
                 tool_call_id: ToolCallId::new("tool-call-shell-blocked"),
@@ -2885,6 +2908,37 @@ mod tests {
         assert_eq!(payload["tool"], "shell_exec");
         assert_eq!(payload["status"], "rejected");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn shell_exec_read_only_allows_dev_null_probe_redirection() {
+        let governance = Arc::new(GovernanceService::default());
+        let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(16));
+        let mut tool_registry = ToolRegistry::new(governance, event_bus);
+        tool_registry.register_default_builtins();
+
+        let output = tool_registry.execute_with_policy(
+            ToolExecutionInput {
+                tool_call_id: ToolCallId::new("tool-call-shell-dev-null-redirection"),
+                tool_name: BuiltinToolName::ShellExec.as_str().to_string(),
+                tool_kind: ToolKind::Builtin,
+                input: serde_json::json!({
+                    "command": "if command -v sh >/dev/null 2>&1; then printf dev-null-ok; fi",
+                    "access_mode": "read_only"
+                })
+                .to_string(),
+                approval_requirement: ApprovalRequirement::None,
+                risk_level: RiskLevel::Low,
+            },
+            ToolExecutionContext::default(),
+            &full_access_policy(),
+        );
+
+        assert_eq!(output.status, ExecutionResultStatus::Succeeded);
+        let payload: Value = serde_json::from_str(&output.payload).expect("payload json");
+        assert_eq!(payload["tool"], "shell_exec");
+        assert_eq!(payload["status"], "succeeded");
+        assert_eq!(payload["stdout"], "dev-null-ok");
     }
 
     #[test]
@@ -6746,6 +6800,20 @@ mod tests {
                 tool.as_str()
             );
         }
+    }
+
+    #[test]
+    fn shell_exec_schema_warns_against_read_only_temp_writes() {
+        let schema = BuiltinToolName::ShellExec.parameters_schema();
+        let description = schema["properties"]["access_mode"]["description"]
+            .as_str()
+            .expect("access_mode description");
+
+        assert!(description.contains("read_only"));
+        assert!(description.contains("临时文件"));
+        assert!(description.contains("重定向到普通文件"));
+        assert!(description.contains("maybe_write"));
+        assert!(description.contains("explicit_write"));
     }
 
     #[test]

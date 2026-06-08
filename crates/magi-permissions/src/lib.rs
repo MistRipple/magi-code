@@ -371,7 +371,7 @@ fn json_has_any(object: &serde_json::Map<String, serde_json::Value>, keys: &[&st
 
 fn shell_command_has_write_indicator(command: &str) -> bool {
     let tokens = shell_command_tokens(command);
-    shell_command_has_unquoted_redirection(command)
+    shell_command_has_unsafe_unquoted_output_redirection(command)
         || tokens
             .iter()
             .any(|token| shell_token_is_write_indicator(token))
@@ -379,27 +379,82 @@ fn shell_command_has_write_indicator(command: &str) -> bool {
         || shell_tokens_include_mutating_git(&tokens)
 }
 
-fn shell_command_has_unquoted_redirection(command: &str) -> bool {
+fn shell_command_has_unsafe_unquoted_output_redirection(command: &str) -> bool {
     let mut single_quoted = false;
     let mut double_quoted = false;
     let mut escaped = false;
-    for ch in command.chars() {
+    let chars: Vec<char> = command.chars().collect();
+    let mut index = 0usize;
+    while index < chars.len() {
+        let ch = chars[index];
         if escaped {
             escaped = false;
+            index += 1;
             continue;
         }
         if ch == '\\' {
             escaped = true;
+            index += 1;
             continue;
         }
         match ch {
             '\'' if !double_quoted => single_quoted = !single_quoted,
             '"' if !single_quoted => double_quoted = !double_quoted,
-            '>' if !single_quoted && !double_quoted => return true,
+            '>' if !single_quoted && !double_quoted => {
+                if output_redirection_targets_safe_sink(&chars, index) {
+                    index += 1;
+                    continue;
+                }
+                return true;
+            }
             _ => {}
         }
+        index += 1;
     }
     false
+}
+
+fn output_redirection_targets_safe_sink(chars: &[char], redirect_index: usize) -> bool {
+    let mut index = redirect_index + 1;
+    if chars.get(index) == Some(&'>') || chars.get(index) == Some(&'|') {
+        index += 1;
+    }
+    while chars.get(index).is_some_and(|ch| ch.is_whitespace()) {
+        index += 1;
+    }
+    if chars.get(index) == Some(&'&') {
+        index += 1;
+        let start = index;
+        while chars
+            .get(index)
+            .is_some_and(|ch| ch.is_ascii_digit() || *ch == '-')
+        {
+            index += 1;
+        }
+        return index > start && redirection_word_boundary(chars.get(index));
+    }
+
+    let start = index;
+    while chars
+        .get(index)
+        .is_some_and(|ch| !ch.is_whitespace() && !matches!(*ch, ';' | '|' | '&' | '(' | ')'))
+    {
+        index += 1;
+    }
+    if index == start {
+        return false;
+    }
+    let target: String = chars[start..index].iter().collect();
+    redirection_target_is_dev_null(&target)
+}
+
+fn redirection_word_boundary(ch: Option<&char>) -> bool {
+    ch.is_none_or(|ch| ch.is_whitespace() || matches!(*ch, ';' | '|' | '&' | '(' | ')'))
+}
+
+fn redirection_target_is_dev_null(target: &str) -> bool {
+    let trimmed = target.trim_matches(|ch| matches!(ch, '"' | '\''));
+    trimmed == "/dev/null"
 }
 
 fn shell_command_tokens(command: &str) -> Vec<String> {
@@ -768,6 +823,26 @@ mod tests {
             engine
                 .decide(&req, &policy, AccessProfile::Restricted)
                 .is_deny()
+        );
+    }
+
+    #[test]
+    fn shell_read_only_declaration_allows_dev_null_redirection() {
+        let engine = engine_with_test_tools();
+        let policy = policy_empty();
+        let args = r#"{"command":"if command -v rg >/dev/null 2>&1; then rg --files; fi","access_mode":"read_only"}"#;
+        let req = PermissionRequest::ShellCommand {
+            arguments_json: args,
+        };
+
+        assert!(PermissionEngine::shell_arguments_request_read_only(args));
+        assert_eq!(
+            engine.decide(&req, &policy, AccessProfile::FullAccess),
+            Decision::Allow
+        );
+        assert_eq!(
+            engine.decide(&req, &policy, AccessProfile::Restricted),
+            Decision::Allow
         );
     }
 

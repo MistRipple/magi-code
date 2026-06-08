@@ -12,7 +12,6 @@ import type {
   SessionNotificationItemDto,
   SessionNotificationSnapshotDto,
   SessionNotificationsResponseDto,
-  MessagesResponseDto,
   FetchModelsResponseDto,
   EnhancePromptRequestDto,
   SkillsLibraryResponseDto,
@@ -1076,38 +1075,6 @@ export async function getWorkspaceSessions(
       sessionId: payload.sessionId?.trim() || '',
       sessions,
     };
-  } catch (error) {
-    if (error instanceof TypeError) {
-      throw new Error(i18n.t('bridge.agentUnreachable'));
-    }
-    throw error;
-  }
-}
-
-export async function loadAgentSessionSnapshot(
-  sessionId: string,
-  options: { limit?: number; beforeCursor?: string; workspaceId: string; workspacePath?: string },
-): Promise<MessagesResponseDto> {
-  try {
-    const binding = resolveAgentBindingContext();
-    const workspaceId = options.workspaceId.trim() || binding.workspaceId;
-    const workspacePath = options.workspacePath?.trim() || binding.workspacePath;
-    if (!workspaceId) {
-      throw new Error('workspaceId 不能为空');
-    }
-    const query = new URLSearchParams({
-      sessionId: sessionId.trim(),
-      workspaceId,
-      limit: String(options.limit ?? 50),
-    });
-    if (workspacePath) {
-      query.set('workspacePath', workspacePath);
-    }
-    if (options.beforeCursor?.trim()) {
-      query.set('beforeCursor', options.beforeCursor.trim());
-    }
-    const response = await getTransport().request(agentUrl('/api/messages', query.toString()));
-    return await parseAgentJson<MessagesResponseDto>(response, 'load session snapshot');
   } catch (error) {
     if (error instanceof TypeError) {
       throw new Error(i18n.t('bridge.agentUnreachable'));

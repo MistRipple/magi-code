@@ -25,8 +25,8 @@ use crate::{
 use crate::{
     model_error::{provider_empty_assistant_response_error, public_model_invocation_error_message},
     prompt_utils::{
-        current_turn_context_priority_prompt, normalize_model_stream_preview_content,
-        normalize_model_visible_content, workspace_context_system_prompt,
+        current_turn_context_priority_prompt, normalize_model_visible_content,
+        workspace_context_system_prompt,
     },
     session_images::{SessionTurnImage, session_turn_image_sources},
     settings_store::SettingsStore,
@@ -44,7 +44,7 @@ use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
 use magi_orchestrator::{ExecutionContextSummary, task_store::TaskStore};
 use magi_session_store::{
     SessionStore, ThreadChatImageSource, ThreadChatMessage, ThreadChatToolCall,
-    ThreadChatToolFunction, TimelineEntryKind,
+    ThreadChatToolFunction,
 };
 use magi_tool_runtime::ToolRegistry;
 use magi_usage_authority::UsageCallStatus;
@@ -998,9 +998,7 @@ fn run_conversation_loop_inner(
         let stream_item_id = task_stream_item_id(task_id, round, streaming_entry_id);
         last_stream_item_id = Some(stream_item_id.clone());
         let streamed_thinking = std::cell::RefCell::new(String::new());
-        let streamed_visible_content = std::cell::RefCell::new(String::new());
         let last_thinking_len = std::cell::Cell::new(0usize);
-        let stream_publish_gate = std::cell::RefCell::new(SessionTurnStreamPublishGate::default());
         let thinking_publish_gate =
             std::cell::RefCell::new(SessionTurnStreamPublishGate::default());
         let round_started_at = UtcMillis::now();
@@ -1032,20 +1030,10 @@ fn run_conversation_loop_inner(
                     &turn_visibility,
                     &delta.thinking,
                 );
-                publish_stream_delta(
-                    event_bus,
-                    session_store,
-                    task_store,
-                    task,
-                    session_id,
-                    workspace_id,
-                    &stream_item_id,
-                    (round == 0).then_some(stream_item_id.as_str()),
-                    &turn_visibility,
-                    &streamed_visible_content,
-                    &stream_publish_gate,
-                    &delta.content,
-                );
+                // 任务循环中的中间轮次通常会伴随工具调用。上游模型或代理网关有时会把
+                // reasoning 摘要放进 content 字段；这里不把任务循环流式正文直接暴露给用户，
+                // 只在最终无工具调用轮次落 assistant_final。
+                let _ = (&stream_item_id, &delta.content);
             };
 
             match client.invoke_streaming(invocation_request, &on_delta) {
@@ -1108,6 +1096,7 @@ fn run_conversation_loop_inner(
         };
 
         let parsed = response.parse_chat_payload();
+        let round_has_tool_calls = !parsed.tool_calls.is_empty();
         let final_thinking = parsed
             .thinking
             .as_deref()
@@ -1118,6 +1107,17 @@ fn run_conversation_loop_inner(
                 let thinking = streamed_thinking.borrow();
                 let trimmed = thinking.trim();
                 (!trimmed.is_empty()).then(|| trimmed.to_string())
+            })
+            .or_else(|| {
+                if !round_has_tool_calls {
+                    return None;
+                }
+                parsed
+                    .content
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|content| !content.is_empty())
+                    .map(ToOwned::to_owned)
             });
         if let Some(thinking) = final_thinking {
             upsert_task_thinking_turn_item(
@@ -1159,10 +1159,15 @@ fn run_conversation_loop_inner(
             );
         }
 
-        if let Some(ref content) = parsed.content {
+        let assistant_history_content = if round_has_tool_calls {
+            None
+        } else {
+            parsed.content.clone()
+        };
+        if !round_has_tool_calls && let Some(ref content) = parsed.content {
             final_content = content.clone();
         }
-        if !parsed.tool_calls.is_empty() {
+        if round_has_tool_calls {
             had_tool_calls = true;
         }
 
@@ -1173,7 +1178,7 @@ fn run_conversation_loop_inner(
             ) {
                 messages.push(ChatMessage {
                     role: "assistant".to_string(),
-                    content: parsed.content.clone(),
+                    content: assistant_history_content.clone(),
                     images: Vec::new(),
                     tool_calls: Vec::new(),
                     tool_call_id: None,
@@ -1200,7 +1205,7 @@ fn run_conversation_loop_inner(
             ) {
                 messages.push(ChatMessage {
                     role: "assistant".to_string(),
-                    content: parsed.content.clone(),
+                    content: assistant_history_content.clone(),
                     images: Vec::new(),
                     tool_calls: Vec::new(),
                     tool_call_id: None,
@@ -1219,7 +1224,7 @@ fn run_conversation_loop_inner(
             {
                 messages.push(ChatMessage {
                     role: "assistant".to_string(),
-                    content: parsed.content.clone(),
+                    content: assistant_history_content.clone(),
                     images: Vec::new(),
                     tool_calls: Vec::new(),
                     tool_call_id: None,
@@ -1239,7 +1244,7 @@ fn run_conversation_loop_inner(
             ) {
                 messages.push(ChatMessage {
                     role: "assistant".to_string(),
-                    content: parsed.content.clone(),
+                    content: assistant_history_content.clone(),
                     images: Vec::new(),
                     tool_calls: Vec::new(),
                     tool_call_id: None,
@@ -1266,7 +1271,7 @@ fn run_conversation_loop_inner(
         ) {
             messages.push(ChatMessage {
                 role: "assistant".to_string(),
-                content: parsed.content.clone(),
+                content: assistant_history_content.clone(),
                 images: Vec::new(),
                 tool_calls: parsed.tool_calls.clone(),
                 tool_call_id: None,
@@ -1283,7 +1288,7 @@ fn run_conversation_loop_inner(
 
         messages.push(ChatMessage {
             role: "assistant".to_string(),
-            content: parsed.content.clone(),
+            content: assistant_history_content.clone(),
             images: Vec::new(),
             tool_calls: parsed.tool_calls.clone(),
             tool_call_id: None,
@@ -2309,71 +2314,6 @@ fn publish_task_llm_started(
     );
 }
 
-fn publish_stream_delta(
-    event_bus: &InMemoryEventBus,
-    session_store: &SessionStore,
-    task_store: &TaskStore,
-    task: &magi_core::Task,
-    session_id: &SessionId,
-    workspace_id: &Option<WorkspaceId>,
-    item_id: &str,
-    timeline_entry_id: Option<&str>,
-    turn_visibility: &TaskTurnVisibility,
-    streamed_visible_content: &std::cell::RefCell<String>,
-    publish_gate: &std::cell::RefCell<SessionTurnStreamPublishGate>,
-    accumulated_text: &str,
-) {
-    let visible_text = normalize_model_stream_preview_content(accumulated_text);
-    if visible_text.trim().is_empty() {
-        return;
-    }
-    let stream_update = {
-        let previous = streamed_visible_content.borrow();
-        let update = session_turn_stream_update(&previous, &visible_text);
-        if update.is_none() {
-            return;
-        }
-        update
-    };
-    {
-        let mut previous = streamed_visible_content.borrow_mut();
-        previous.clear();
-        previous.push_str(&visible_text);
-    }
-    if let Some(timeline_entry_id) = timeline_entry_id.filter(|_| turn_visibility.is_mainline()) {
-        session_store.upsert_timeline_entry(
-            session_id.clone(),
-            timeline_entry_id,
-            TimelineEntryKind::AssistantMessage,
-            &visible_text,
-        );
-    }
-    let mut item = session_turn_item(
-        "assistant_stream",
-        "running",
-        Some("生成回复".to_string()),
-        Some(visible_text),
-        Some(item_id.to_string()),
-        turn_visibility.thread_id().clone(),
-    );
-    // 子任务流式文本归 task 详情，主线靠父代理的 agent_spawn ToolCall 卡片呈现进度，
-    // 不再让同一条流式内容同时污染主线与详情页。
-    apply_task_worker_detail_visibility(&mut item, task, turn_visibility);
-    if let Some(published) =
-        upsert_session_turn_item_with_task_store(session_store, session_id, item, Some(task_store))
-        && let Some(stream_update) = stream_update.as_ref()
-    {
-        publish_session_turn_item_stream_event(
-            event_bus,
-            session_id,
-            workspace_id,
-            &published,
-            stream_update,
-            &mut publish_gate.borrow_mut(),
-        );
-    }
-}
-
 fn publish_task_thinking_delta(
     event_bus: &InMemoryEventBus,
     session_store: &SessionStore,
@@ -2717,6 +2657,9 @@ mod tests {
     struct TaskToolBatchModelBridgeClient {
         invoke_count: AtomicUsize,
     }
+    struct TaskToolContentThenFinalModelBridgeClient {
+        invoke_count: AtomicUsize,
+    }
 
     struct FailingTaskModelBridgeClient;
     struct StaticTaskFinalModelBridgeClient {
@@ -2803,6 +2746,77 @@ mod tests {
             if self.invoke_count.load(Ordering::SeqCst) > 0 {
                 on_delta(&ModelStreamingDelta {
                     content: "任务工具调用完成".to_string(),
+                    thinking: String::new(),
+                });
+            }
+            self.invoke(request)
+        }
+    }
+
+    impl ModelBridgeClient for TaskToolContentThenFinalModelBridgeClient {
+        fn invoke(
+            &self,
+            request: ModelInvocationRequest,
+        ) -> Result<BridgeResponse, BridgeClientError> {
+            let index = self.invoke_count.fetch_add(1, Ordering::SeqCst);
+            let payload = if index == 0 {
+                serde_json::json!({
+                    "content": "Considering file reading approach before calling tools.",
+                    "finish_reason": "tool_calls",
+                    "tool_calls": [
+                        {
+                            "id": "task-tool-leak-probe",
+                            "type": "function",
+                            "function": {
+                                "name": "shell_exec",
+                                "arguments": serde_json::json!({
+                                    "command": "printf leak-probe",
+                                    "access_mode": "read_only"
+                                }).to_string()
+                            }
+                        }
+                    ]
+                })
+            } else {
+                let assistant_messages = request
+                    .messages
+                    .as_ref()
+                    .expect("工具响应轮次必须携带消息上下文")
+                    .iter()
+                    .filter(|message| message.role == "assistant")
+                    .collect::<Vec<_>>();
+                let tool_round_message = assistant_messages
+                    .iter()
+                    .find(|message| {
+                        message
+                            .tool_calls
+                            .iter()
+                            .any(|tool_call| tool_call.id == "task-tool-leak-probe")
+                    })
+                    .expect("工具调用轮次必须写入 assistant tool_calls");
+                assert_eq!(
+                    tool_round_message.content, None,
+                    "工具轮 content 不能写进下一轮模型历史"
+                );
+                serde_json::json!({
+                    "content": "最终回复：文件检查完成。",
+                    "finish_reason": "stop"
+                })
+            };
+            Ok(BridgeResponse {
+                ok: true,
+                payload: payload.to_string(),
+            })
+        }
+
+        fn invoke_streaming(
+            &self,
+            request: ModelInvocationRequest,
+            on_delta: &dyn Fn(&ModelStreamingDelta),
+        ) -> Result<BridgeResponse, BridgeClientError> {
+            if self.invoke_count.load(Ordering::SeqCst) == 0 {
+                on_delta(&ModelStreamingDelta {
+                    content: "Considering file reading approach".to_string(),
                     thinking: String::new(),
                 });
             }
@@ -4790,6 +4804,170 @@ mod tests {
         assert!(
             terminal_error_event.payload["current_turn"]["response_duration_ms"].is_number(),
             "terminal error event must carry backend duration for live UI"
+        );
+    }
+
+    #[test]
+    fn conversation_loop_tool_round_content_is_thinking_not_visible_text() {
+        let session_store = SessionStore::new();
+        let event_bus = InMemoryEventBus::new(64);
+        let session_id = SessionId::new("session-task-tool-content");
+        let workspace_id = Some(WorkspaceId::new("workspace-task-tool-content"));
+        let task_id = TaskId::new("task-tool-content");
+        session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "task tool content session",
+                workspace_id.as_ref().map(ToString::to_string),
+            )
+            .expect("session should be creatable");
+        let task_store = TaskStore::new();
+        let task = make_task_loop_test_task(task_id.as_str());
+        task_store.insert_task(task.clone());
+        let now = UtcMillis::now();
+        let (_, orchestrator_thread_id) =
+            session_store.ensure_session_mission(&session_id, now, || task.mission_id.clone());
+        session_store
+            .upsert_current_turn(
+                session_id.clone(),
+                ActiveExecutionTurn {
+                    turn_id: "turn-task-tool-content".to_string(),
+                    turn_seq: 1,
+                    accepted_at: UtcMillis::now(),
+                    status: "running".to_string(),
+                    user_message: Some("验证工具轮正文归属".to_string()),
+                    items: Vec::new(),
+                    completed_at: None,
+                },
+            )
+            .expect("turn should be creatable");
+
+        let worker_id = WorkerId::new("worker-task-tool-content");
+        let lease = task_store
+            .grant_lease(
+                &task.task_id,
+                &task.root_task_id,
+                &worker_id,
+                "executor",
+                60_000,
+            )
+            .expect("lease should be granted");
+        let probe = Arc::new(ConcurrentTaskToolProbe::new(Duration::from_millis(0)));
+        let tool_event_bus = Arc::new(InMemoryEventBus::new(8));
+        let mut tool_registry = ToolRegistry::new(
+            Arc::new(GovernanceService::default()),
+            Arc::clone(&tool_event_bus),
+        );
+        tool_registry.register_builtin(Arc::new(ProbeTaskBuiltinTool::new(
+            "shell_exec",
+            Arc::clone(&probe),
+        )));
+        let client = TaskToolContentThenFinalModelBridgeClient {
+            invoke_count: AtomicUsize::new(0),
+        };
+        let usage_binding = crate::usage_recording::session_turn_model_usage_binding(true);
+
+        let (outcome, _) = run_conversation_loop(ConversationLoopRequest {
+            client: &client,
+            event_bus: &event_bus,
+            session_store: &session_store,
+            settings_store: None,
+            tool_registry: Some(&tool_registry),
+            skill_runtime: None,
+            skill_dispatch_runtime: None,
+            skill_name: None,
+            task_store: &task_store,
+            execution_registry: &TaskExecutionRegistry::default(),
+            conversation_registry: &ConversationRegistry::new(),
+            agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
+            spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
+            safety_gate: None,
+            todo_ledger: &magi_todo_ledger::TodoLedger::new(),
+            project_memory: None,
+            mission_charter: None,
+            plan: None,
+            mission_workspace: None,
+            knowledge_graph: None,
+            validation_runner: None,
+            checkpoint: None,
+            human_checkpoint: None,
+            mission_metrics: None,
+            task: &task,
+            task_id: &task.task_id,
+            lease_id: &lease.lease_id,
+            session_id: &session_id,
+            workspace_id: &workspace_id,
+            prompt: "请先检查文件再给最终答复".to_string(),
+            images: Vec::new(),
+            tools: None,
+            usage_binding: &usage_binding,
+            streaming_entry_id: Some("timeline-streaming-task-tool-content"),
+            is_sidechain: false,
+            worker_id: None,
+            thread_id: &orchestrator_thread_id,
+            context_summary: None,
+            system_prompt: None,
+            workspace_root_path: None,
+            snapshot_session: None,
+            execution_group_id: None,
+            persist_session_state: None,
+        });
+
+        let output_refs = match outcome {
+            TaskOutcome::Completed { output_refs } => output_refs,
+            other => panic!("task loop should complete, got {other:?}"),
+        };
+        assert!(
+            output_refs[0].contains("最终回复：文件检查完成。"),
+            "最终输出必须来自无工具调用轮次"
+        );
+
+        let leaked_content = "Considering file reading approach";
+        let turn = session_store
+            .runtime_sidecar(&session_id)
+            .and_then(|sidecar| sidecar.current_turn)
+            .expect("turn should exist");
+        assert!(
+            turn.items.iter().any(|item| {
+                item.kind == "assistant_thinking"
+                    && item
+                        .content
+                        .as_deref()
+                        .is_some_and(|content| content.contains(leaked_content))
+            }),
+            "工具轮 content 只能沉淀为 thinking，便于审计和调试"
+        );
+        assert!(
+            turn.items.iter().all(|item| {
+                let is_visible_text =
+                    matches!(item.kind.as_str(), "assistant_stream" | "assistant_final");
+                !is_visible_text
+                    || item
+                        .content
+                        .as_deref()
+                        .is_none_or(|content| !content.contains(leaked_content))
+            }),
+            "工具轮 content 不能成为用户可见 assistant 文本"
+        );
+        assert!(
+            session_store
+                .timeline_for_session(&session_id)
+                .iter()
+                .all(|entry| !entry.message.contains(leaked_content)),
+            "工具轮 content 不能写入主线 timeline"
+        );
+        assert!(
+            session_store
+                .thread_message_history(&orchestrator_thread_id)
+                .iter()
+                .filter(|message| message.role == "assistant")
+                .all(|message| {
+                    message
+                        .content
+                        .as_deref()
+                        .is_none_or(|content| !content.contains(leaked_content))
+                }),
+            "工具轮 content 不能污染后续模型历史"
         );
     }
 

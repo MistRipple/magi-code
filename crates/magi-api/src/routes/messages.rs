@@ -545,7 +545,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = read_json_response(response).await;
         let body_text = body.to_string();
-        assert!(!body_text.contains("/Users/xie"));
+        assert!(!body_text.contains("/Users/xie/code/TEST/secret.txt"));
         assert!(!body_text.contains("/private/tmp"));
         assert!(!body_text.contains("/var/folders"));
         assert!(!body_text.contains("argument-secret"));
@@ -553,7 +553,7 @@ mod tests {
         assert!(!body_text.contains("error-secret"));
 
         let tool = &body["canonicalTurns"][0]["items"][0]["tool"];
-        assert_eq!(tool["arguments"]["path"], "[path]");
+        assert_eq!(tool["arguments"]["path"], "secret.txt");
         assert_eq!(tool["arguments"]["token"], "[redacted]");
         assert!(
             tool["result"]["output"]

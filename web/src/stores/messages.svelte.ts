@@ -26,6 +26,7 @@ import type {
   OrchestratorRuntimeState,
   SessionNotificationRecord,
   Edit,
+  ChangeMutationStatus,
 } from '../types/message';
 import { vscode } from '../lib/vscode-bridge';
 import { ensureArray } from '../lib/utils';
@@ -137,6 +138,8 @@ export const messagesState = $state({
 
   // 后端下发的完整状态
   appState: null as AppState | null,
+  edits: [] as Edit[],
+  changeMutationStatus: null as ChangeMutationStatus | null,
   orchestratorRuntimeState: null as OrchestratorRuntimeState | null,
   settingsBootstrapSnapshot: null as SettingsBootstrapSnapshot | null,
   settingsRegistrySnapshot: null as SettingsRegistrySnapshot | null,
@@ -483,8 +486,7 @@ function isValidPersistedArray(value: unknown, max: number): value is unknown[] 
   return true;
 }
 
-// 新增状态：变更、阶段、Toast、模型状态
-let edits = $state<Edit[]>([]);
+// 新增状态：阶段、Toast、模型状态
 // 统一 Worker 运行态（唯一权威来源）
 // 当前主线以 authoritative projection 为准，仅叠加尚未被后端接纳的本地乐观节点。
 
@@ -1103,6 +1105,36 @@ export function setEnabledAgents(agents: EnabledAgent[]) {
   enabledAgents = agents;
 }
 
+function normalizeOptionalStatusString(value: unknown): string | null {
+  return typeof value === 'string' && value.trim() ? value.trim() : null;
+}
+
+export function setChangeMutationStatus(status: ChangeMutationStatus | null): void {
+  if (!status?.isMutating) {
+    messagesState.changeMutationStatus = null;
+    return;
+  }
+  messagesState.changeMutationStatus = {
+    isMutating: true,
+    sessionId: normalizeOptionalStatusString(status.sessionId),
+    workspaceId: normalizeOptionalStatusString(status.workspaceId),
+    workspacePath: normalizeOptionalStatusString(status.workspacePath),
+    updatedAt: typeof status.updatedAt === 'number' && Number.isFinite(status.updatedAt)
+      ? status.updatedAt
+      : Date.now(),
+  };
+}
+
+function syncEditsFromAppState(nextState: AppState | null): void {
+  if (!nextState) {
+    messagesState.edits = [];
+    return;
+  }
+  if (Array.isArray(nextState.pendingChanges)) {
+    messagesState.edits = ensureArray<Edit>(nextState.pendingChanges);
+  }
+}
+
 // ============ getState() 仅用于现有调用方（Svelte 5 迁移中）============
 // ⚠️ 注意：此函数返回的对象无法被 Svelte 5 正确追踪
 // 建议使用上面的独立 getter 函数或直接使用 messagesState
@@ -1124,14 +1156,15 @@ export function getState() {
     get thinkingStartAt() { return messagesState.thinkingStartAt; },
     get processingActor() { return messagesState.processingActor; },
     get appState() { return messagesState.appState; },
+    get changeMutationStatus() { return messagesState.changeMutationStatus; },
     get settingsBootstrapSnapshot() { return messagesState.settingsBootstrapSnapshot; },
     set settingsBootstrapSnapshot(v) { messagesState.settingsBootstrapSnapshot = v; },
     get settingsRegistrySnapshot() { return messagesState.settingsRegistrySnapshot; },
     set settingsRegistrySnapshot(v) { messagesState.settingsRegistrySnapshot = v; },
     get scrollPositions() { return messagesState.scrollPositions; },
     get autoScrollEnabled() { return messagesState.autoScrollEnabled; },
-    get edits() { return edits; },
-    set edits(v) { edits = v; },
+    get edits() { return messagesState.edits; },
+    set edits(v) { messagesState.edits = ensureArray<Edit>(v); },
     get orchestratorRuntimeState() { return messagesState.orchestratorRuntimeState; },
     set orchestratorRuntimeState(v) { setOrchestratorRuntimeState(v); },
     get toasts() { return toasts; },
@@ -1266,7 +1299,7 @@ function applySessionViewState(sessionId: string | null | undefined): boolean {
 }
 
 function resetSessionScopedExecutionState(): void {
-  edits = [];
+  messagesState.edits = [];
   messagesState.orchestratorRuntimeState = null;
   if (messagesState.appState) {
     messagesState.appState = {
@@ -1546,9 +1579,11 @@ export function setProcessingActor(source: string, agent?: string) {
 
 export function setAppState(nextState: AppState | null) {
   if (nextState) {
+    syncEditsFromAppState(nextState);
     messagesState.appState = nextState;
     messagesState.bootstrapped = true;
   } else {
+    syncEditsFromAppState(null);
     messagesState.appState = null;
   }
 }

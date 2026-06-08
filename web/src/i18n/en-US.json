@@ -1258,6 +1258,7 @@
   "toolCall.copyOutput": "Copy output",
   "toolCall.duration": "Duration:",
   "toolCall.fileRemoveSummary": "{firstFile} and {count} files",
+  "toolCall.multipleFilesSummary": "{firstFile} and {count} files",
   "toolCall.agentSpawn.defaultTitle": "Agent",
   "toolCall.agentSpawn.viewDetails": "View details",
   "toolCall.agentSpawn.dispatching": "Dispatching...",

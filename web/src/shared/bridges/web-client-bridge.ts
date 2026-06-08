@@ -3,7 +3,6 @@ import {
   agentUrl,
   dispatchAgentConnectionEvent,
   getAgentSettingsBootstrap,
-  loadAgentSessionSnapshot,
   probeReachableAgentBaseUrl,
   resolveAgentBaseUrl,
   isPublicTunnelAccess,
@@ -187,12 +186,8 @@ let recoveryInFlight: Promise<void> | null = null;
 let recoveryInFlightBindingKey = '';
 let eventStreamSnapshotRefreshInFlight: Promise<void> | null = null;
 let eventStreamSnapshotRefreshBindingKey = '';
-let sessionSnapshotGeneration = 0;
 let workspaceSessionSummaryRefreshTimer: ReturnType<typeof setTimeout> | null = null;
-
-function invalidateSessionSnapshotRequests(): void {
-  sessionSnapshotGeneration += 1;
-}
+const inFlightChangeMutationScopes = new Set<string>();
 
 function invalidateBootstrapRequests(): void {
   bootstrapRequestSeq += 1;
@@ -228,7 +223,6 @@ const EXTERNAL_SESSION_SUMMARY_EVENTS = new Set([
   'session.title.updated',
   'message.created',
 ]);
-const SESSION_TIMELINE_PAGE_SIZE = 50;
 const WEBVIEW_STATE_STORAGE_KEY = 'webview-state';
 const WEBVIEW_STATE_WRITE_INTERVAL_MS = 1200;
 const WEBVIEW_STATE_MAX_BYTES = 1_500_000;
@@ -441,6 +435,39 @@ function requestScopeFromMessage(
     scope.sessionId = fallbackSessionId;
   }
   return scope;
+}
+
+function changeMutationScopeKey(scope: BridgeRequestScope): string {
+  return JSON.stringify({
+    sessionId: scope.sessionId?.trim() || '',
+    workspaceId: scope.workspaceId?.trim() || '',
+    workspacePath: scope.workspacePath?.trim() || '',
+  });
+}
+
+function emitChangeMutationStatus(scope: BridgeRequestScope, isMutating: boolean): void {
+  emitDataMessage('changeMutationStatus', {
+    isMutating,
+    sessionId: scope.sessionId?.trim() || null,
+    workspaceId: scope.workspaceId?.trim() || null,
+    workspacePath: scope.workspacePath?.trim() || null,
+    updatedAt: Date.now(),
+  });
+}
+
+async function runChangeMutationOnce(scope: BridgeRequestScope, operation: () => Promise<void>): Promise<void> {
+  const scopeKey = changeMutationScopeKey(scope);
+  if (inFlightChangeMutationScopes.has(scopeKey)) {
+    return;
+  }
+  inFlightChangeMutationScopes.add(scopeKey);
+  emitChangeMutationStatus(scope, true);
+  try {
+    await operation();
+  } finally {
+    inFlightChangeMutationScopes.delete(scopeKey);
+    emitChangeMutationStatus(scope, false);
+  }
 }
 
 function asBridgeRecord(value: unknown): Record<string, unknown> | null {
@@ -1817,9 +1844,6 @@ function persistWorkspaceBinding(workspaceId: string, workspacePath: string, ses
     normalizedWorkspacePath,
     incomingSessionId,
   );
-  if (settingsBindingChanged) {
-    invalidateSessionSnapshotRequests();
-  }
   currentWorkspaceId = normalizedWorkspaceId;
   currentWorkspacePath = normalizedWorkspacePath;
   currentSessionId = incomingSessionId;
@@ -1869,9 +1893,6 @@ function clearWorkspaceSessionBinding(workspaceId: string, workspacePath: string
     normalizedWorkspacePath,
     '',
   );
-  if (settingsBindingChanged) {
-    invalidateSessionSnapshotRequests();
-  }
   currentWorkspaceId = normalizedWorkspaceId;
   currentWorkspacePath = normalizedWorkspacePath;
   currentSessionId = '';
@@ -1924,7 +1945,6 @@ function dispatchWorkspaceSessionCleared(workspaceId: string, workspacePath: str
 
 function clearPersistedWorkspaceBinding(): void {
   clearSettingsBootstrapCache();
-  invalidateSessionSnapshotRequests();
   currentWorkspaceId = '';
   currentWorkspacePath = '';
   currentSessionId = '';
@@ -2433,93 +2453,6 @@ async function emitKnowledgePayload(scope: BridgeRequestScope = {}): Promise<voi
   await dispatchProjectKnowledge(scope);
 }
 
-async function dispatchSessionSnapshot(
-  rawPayload: unknown,
-  options: {
-    sessionId: string;
-    workspaceId?: string;
-    workspacePath?: string;
-    forceEventStreamReconnect?: boolean;
-  },
-): Promise<void> {
-  const previousSessionId = currentSessionId;
-  const payload = normalizeBootstrapResponse(rawPayload, {
-    sessionId: options.sessionId,
-    workspaceId: options.workspaceId,
-    workspacePath: options.workspacePath,
-  });
-  const settingsBindingChanged = persistWorkspaceBinding(
-    payload.workspace.workspaceId,
-    payload.workspace.rootPath,
-    payload.sessionId,
-  );
-  updateEventStreamCursorFromBootstrap(payload);
-  activateTaskProjectionSession(payload.sessionId, payload.workspace.workspaceId, payload.workspace.rootPath);
-  const taskTrackingHints = extractBootstrapTaskTrackingHints(payload, rawPayload);
-  if (previousSessionId && payload.sessionId && previousSessionId !== payload.sessionId) {
-    clearCurrentInterruptTaskId();
-  }
-  reconcileCurrentInterruptTaskId(taskTrackingHints.activeTaskIds);
-  if (!taskTrackingHints.rootTaskId && taskTrackingHints.activeTaskIds.length === 0) {
-    clearTaskProjection(payload.sessionId, undefined, payload.workspace.workspaceId);
-  }
-  emitDataMessage('sessionBootstrapLoaded', {
-    ...payload,
-    hasMoreBefore: false,
-    beforeCursor: null,
-  } as Record<string, unknown>);
-  void ensureEventStream({
-    forceReconnect: options.forceEventStreamReconnect === true,
-    waitUntilOpen: false,
-  }).catch((error) => {
-    reportExpectedRecoveryFailure(i18n.t('bridge.action.connectEventStream'), '[web-client-bridge] 会话快照后事件流连接失败:', error);
-    scheduleRecovery('session_snapshot_event_stream_connect', error, true);
-  });
-  if (taskTrackingHints.rootTaskId || taskTrackingHints.activeTaskIds.length > 0) {
-    void autoConnectTaskTracking(
-      payload.sessionId,
-      taskTrackingHints.activeTaskIds,
-      taskTrackingHints.rootTaskId,
-      payload.workspace.workspaceId,
-      payload.workspace.rootPath,
-    ).catch((error) => {
-      console.warn('[web-client-bridge] Auto-connect task tracking on session snapshot failed (non-critical):', error);
-    });
-  }
-  if ((payload.state as { isProcessing?: boolean } | undefined)?.isProcessing !== true) {
-    scheduleQueuedTurnDrain('session_snapshot_idle');
-  }
-  if (settingsBindingChanged) {
-    refreshSettingsBootstrapForCurrentWorkspace('session_snapshot_binding_changed');
-  }
-}
-
-async function loadLatestSessionSnapshot(
-  sessionId: string,
-  options: { workspaceId?: string; workspacePath?: string } = {},
-): Promise<void> {
-  const requestGeneration = ++sessionSnapshotGeneration;
-  const targetWorkspaceScope = resolveWorkspaceScopeFromSource(options);
-  const targetWorkspaceId = targetWorkspaceScope.workspaceId;
-  const targetWorkspacePath = targetWorkspaceScope.workspacePath;
-  const rawPayload = await loadAgentSessionSnapshot(sessionId, {
-    limit: SESSION_TIMELINE_PAGE_SIZE,
-    workspaceId: targetWorkspaceId,
-    workspacePath: targetWorkspacePath,
-  });
-  if (requestGeneration !== sessionSnapshotGeneration) {
-    return;
-  }
-  const forceEventStreamReconnect = targetWorkspaceId !== currentWorkspaceId
-    || targetWorkspacePath !== currentWorkspacePath;
-  await dispatchSessionSnapshot(rawPayload, {
-    sessionId,
-    workspaceId: targetWorkspaceId,
-    workspacePath: targetWorkspacePath,
-    forceEventStreamReconnect,
-  });
-}
-
 async function switchSession(
   sessionId: string,
   options: { workspaceId?: string; workspacePath?: string } = {},
@@ -2536,6 +2469,8 @@ async function switchSession(
   invalidateBootstrapRequests();
   messagesState.sessionHydrating = true;
   try {
+    const forceEventStreamReconnect = targetWorkspaceId !== currentWorkspaceId
+      || targetWorkspacePath !== currentWorkspacePath;
     const response = await getTransport().request(agentUrl('/api/session/switch'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -2549,10 +2484,15 @@ async function switchSession(
       throw new Error(`switch session failed: ${response.status}`);
     }
     await response.json();
-    await loadLatestSessionSnapshot(sessionId, {
-      workspaceId: targetWorkspaceId,
-      workspacePath: targetWorkspacePath,
+    const settingsBindingChanged = persistWorkspaceBinding(targetWorkspaceId, targetWorkspacePath, sessionId);
+    await fetchBootstrap({
+      forceFresh: true,
+      forceEventStreamReconnect,
+      refreshSettingsBootstrapOnBindingChange: !settingsBindingChanged,
     });
+    if (settingsBindingChanged) {
+      refreshSettingsBootstrapForCurrentWorkspace('session_switch_binding_changed');
+    }
   } finally {
     if (activeSessionSwitchBindingKey === switchBindingKey) {
       activeSessionSwitchBindingKey = '';
@@ -4247,8 +4187,11 @@ export function createWebClientBridge(): ClientBridge {
           return;
         case 'approveChange':
           if (typeof message.filePath === 'string' && message.filePath.trim()) {
-            void approveAgentChange(message.filePath, requestScopeFromMessage(message)).then(async () => {
-              await fetchBootstrap();
+            const scope = requestScopeFromMessage(message);
+            const filePath = message.filePath.trim();
+            void runChangeMutationOnce(scope, async () => {
+              await approveAgentChange(filePath, scope);
+              await fetchBootstrap({ forceFresh: true });
               emitBridgeSuccessToast(i18n.t('bridge.action.approveChange'), i18n.t('toast.changeApproved'));
             }).catch((error) => {
               logBridgeOperationFailure(i18n.t('bridge.action.approveChange'), '[web-client-bridge] 批准变更失败:', error);
@@ -4257,8 +4200,11 @@ export function createWebClientBridge(): ClientBridge {
           return;
         case 'revertChange':
           if (typeof message.filePath === 'string' && message.filePath.trim()) {
-            void revertAgentChange(message.filePath, requestScopeFromMessage(message)).then(async () => {
-              await fetchBootstrap();
+            const scope = requestScopeFromMessage(message);
+            const filePath = message.filePath.trim();
+            void runChangeMutationOnce(scope, async () => {
+              await revertAgentChange(filePath, scope);
+              await fetchBootstrap({ forceFresh: true });
               emitBridgeSuccessToast(i18n.t('bridge.action.revertChange'), i18n.t('toast.changeReverted'));
             }).catch((error) => {
               logBridgeOperationFailure(i18n.t('bridge.action.revertChange'), '[web-client-bridge] 还原变更失败:', error);
@@ -4266,28 +4212,39 @@ export function createWebClientBridge(): ClientBridge {
           }
           return;
         case 'approveAllChanges':
-          void approveAllAgentChanges(requestScopeFromMessage(message)).then(async () => {
-            await fetchBootstrap();
-            emitBridgeSuccessToast(i18n.t('bridge.action.approveAllChanges'), i18n.t('bridge.detail.allChangesApproved'));
-          }).catch((error) => {
-            logBridgeOperationFailure(i18n.t('bridge.action.approveAllChanges'), '[web-client-bridge] 批准全部变更失败:', error);
-          });
+          {
+            const scope = requestScopeFromMessage(message);
+            void runChangeMutationOnce(scope, async () => {
+              await approveAllAgentChanges(scope);
+              await fetchBootstrap({ forceFresh: true });
+              emitBridgeSuccessToast(i18n.t('bridge.action.approveAllChanges'), i18n.t('bridge.detail.allChangesApproved'));
+            }).catch((error) => {
+              logBridgeOperationFailure(i18n.t('bridge.action.approveAllChanges'), '[web-client-bridge] 批准全部变更失败:', error);
+            });
+          }
           return;
         case 'revertAllChanges':
-          void revertAllAgentChanges(requestScopeFromMessage(message)).then(async () => {
-            await fetchBootstrap();
-            emitBridgeSuccessToast(i18n.t('bridge.action.revertAllChanges'), i18n.t('bridge.detail.allChangesReverted'));
-          }).catch((error) => {
-            logBridgeOperationFailure(i18n.t('bridge.action.revertAllChanges'), '[web-client-bridge] 还原全部变更失败:', error);
-          });
+          {
+            const scope = requestScopeFromMessage(message);
+            void runChangeMutationOnce(scope, async () => {
+              await revertAllAgentChanges(scope);
+              await fetchBootstrap({ forceFresh: true });
+              emitBridgeSuccessToast(i18n.t('bridge.action.revertAllChanges'), i18n.t('bridge.detail.allChangesReverted'));
+            }).catch((error) => {
+              logBridgeOperationFailure(i18n.t('bridge.action.revertAllChanges'), '[web-client-bridge] 还原全部变更失败:', error);
+            });
+          }
           return;
         case 'revertExecutionGroup':
           if (typeof message.executionGroupId === 'string' && message.executionGroupId.trim()) {
-            void revertAgentExecutionGroupChanges(
-              message.executionGroupId,
-              requestScopeFromMessage(message),
-            ).then(async () => {
-              await fetchBootstrap();
+            const scope = requestScopeFromMessage(message);
+            const executionGroupId = message.executionGroupId.trim();
+            void runChangeMutationOnce(scope, async () => {
+              await revertAgentExecutionGroupChanges(
+                executionGroupId,
+                scope,
+              );
+              await fetchBootstrap({ forceFresh: true });
               emitBridgeSuccessToast(
                 i18n.t('bridge.action.revertExecutionGroup'),
                 i18n.t('bridge.detail.executionGroupReverted'),

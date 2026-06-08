@@ -1258,6 +1258,7 @@
   "toolCall.copyOutput": "复制输出",
   "toolCall.duration": "耗时:",
   "toolCall.fileRemoveSummary": "{firstFile} 等 {count} 个文件",
+  "toolCall.multipleFilesSummary": "{firstFile} 等 {count} 个文件",
   "toolCall.agentSpawn.defaultTitle": "代理",
   "toolCall.agentSpawn.viewDetails": "查看详情",
   "toolCall.agentSpawn.dispatching": "派发中...",

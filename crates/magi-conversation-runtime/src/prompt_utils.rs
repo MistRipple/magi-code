@@ -187,6 +187,10 @@ mod tests {
         assert!(prompt.contains("rev-parse --is-inside-work-tree"));
         assert!(prompt.contains("NOT_GIT_WORKTREE"));
         assert!(prompt.contains("access_mode=read_only"));
+        assert!(prompt.contains("不得写临时文件"));
+        assert!(prompt.contains("不得把输出重定向到普通文件或临时文件"));
+        assert!(prompt.contains("maybe_write"));
+        assert!(prompt.contains("explicit_write"));
         assert!(prompt.contains("不要继续重复 Git 状态命令"));
     }
 
