@@ -4,7 +4,9 @@ use crate::change_log::ChangeLog;
 use crate::error::{SnapshotError, SnapshotResult};
 use crate::scan::{SnapshotPathFilter, read_file_meta, read_large_text_summary, walk_workspace};
 use crate::tool_hook::{ToolHook, ToolHookCtx};
-use crate::types::{ChangeEvent, ChangeKind, ContentKind, FileMeta, PendingChange, SourceKind};
+use crate::types::{
+    ChangeEvent, ChangeKind, ContentKind, FileMeta, PendingChange, SourceKind, SymlinkTargetKind,
+};
 use crate::watcher::{DebouncedEvent, DebouncedKind, FsWatcher};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -578,9 +580,9 @@ impl SnapshotSession {
                                 .map_err(|e| SnapshotError::io(parent, e))?;
                         }
                         if std::fs::symlink_metadata(&abs).is_ok() {
-                            std::fs::remove_file(&abs).map_err(|e| SnapshotError::io(&abs, e))?;
+                            remove_file_or_symlink(&abs).map_err(|e| SnapshotError::io(&abs, e))?;
                         }
-                        std::os::unix::fs::symlink(&target.target, &abs)
+                        restore_symlink(&target.target, target.target_kind, &abs)
                             .map_err(|e| SnapshotError::io(&abs, e))?;
                         applied += 1;
                     }
@@ -593,7 +595,7 @@ impl SnapshotSession {
                 },
                 None => {
                     if std::fs::symlink_metadata(&abs).is_ok() {
-                        std::fs::remove_file(&abs).map_err(|e| SnapshotError::io(&abs, e))?;
+                        remove_file_or_symlink(&abs).map_err(|e| SnapshotError::io(&abs, e))?;
                         applied += 1;
                     }
                 }
@@ -824,6 +826,71 @@ fn unified_diff_text(path: &str, old: &str, new: &str) -> String {
     ));
     output.extend(body);
     output.join("\n")
+}
+
+fn remove_file_or_symlink(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(file_error) => {
+            #[cfg(windows)]
+            {
+                if std::fs::symlink_metadata(path)
+                    .map(|meta| meta.file_type().is_symlink())
+                    .unwrap_or(false)
+                {
+                    return std::fs::remove_dir(path).map_err(|_| file_error);
+                }
+            }
+            Err(file_error)
+        }
+    }
+}
+
+#[cfg(unix)]
+fn restore_symlink(
+    target: &str,
+    _target_kind: SymlinkTargetKind,
+    link_path: &Path,
+) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link_path)
+}
+
+#[cfg(windows)]
+fn restore_symlink(
+    target: &str,
+    target_kind: SymlinkTargetKind,
+    link_path: &Path,
+) -> std::io::Result<()> {
+    let target_path = Path::new(target);
+    let resolved_kind = match target_kind {
+        SymlinkTargetKind::File | SymlinkTargetKind::Directory => target_kind,
+        SymlinkTargetKind::Unknown => infer_existing_symlink_target_kind(target_path, link_path),
+    };
+
+    match resolved_kind {
+        SymlinkTargetKind::Directory => std::os::windows::fs::symlink_dir(target_path, link_path),
+        SymlinkTargetKind::File | SymlinkTargetKind::Unknown => {
+            std::os::windows::fs::symlink_file(target_path, link_path)
+        }
+    }
+}
+
+#[cfg(windows)]
+fn infer_existing_symlink_target_kind(target: &Path, link_path: &Path) -> SymlinkTargetKind {
+    let resolved_target = if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        link_path
+            .parent()
+            .unwrap_or_else(|| Path::new(""))
+            .join(target)
+    };
+
+    match std::fs::metadata(resolved_target) {
+        Ok(meta) if meta.is_dir() => SymlinkTargetKind::Directory,
+        Ok(meta) if meta.is_file() => SymlinkTargetKind::File,
+        Ok(_) | Err(_) => SymlinkTargetKind::Unknown,
+    }
 }
 
 #[cfg(test)]

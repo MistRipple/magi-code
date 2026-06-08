@@ -11,6 +11,16 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tempfile::tempdir;
 
+#[cfg(unix)]
+fn create_file_symlink(target: &std::path::Path, link: &std::path::Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(windows)]
+fn create_file_symlink(target: &std::path::Path, link: &std::path::Path) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_file(target, link)
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn baseline_scan_records_existing_files() {
     let dir = tempdir().unwrap();
@@ -348,6 +358,7 @@ async fn binary_file_does_not_inline_content() {
     assert!(img.size > 0);
 }
 
+#[cfg(any(unix, windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn symlink_recorded_with_target_only() {
     let dir = tempdir().unwrap();
@@ -357,7 +368,15 @@ async fn symlink_recorded_with_target_only() {
     let mgr = SnapshotManager::new();
     let session = mgr.start_session("s9".into(), root.clone()).await.unwrap();
 
-    std::os::unix::fs::symlink(root.join("real.txt"), root.join("link.txt")).unwrap();
+    if let Err(error) = create_file_symlink(&root.join("real.txt"), &root.join("link.txt")) {
+        #[cfg(windows)]
+        {
+            eprintln!("skip symlink test on Windows without symlink privilege: {error}");
+            return;
+        }
+        #[cfg(unix)]
+        panic!("create file symlink failed: {error}");
+    }
     session.reconcile().unwrap();
 
     let pending = session.pending_changes().unwrap();

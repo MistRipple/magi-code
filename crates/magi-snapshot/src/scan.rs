@@ -2,7 +2,7 @@ use crate::blob_store::BlobStore;
 use crate::error::{SnapshotError, SnapshotResult};
 use crate::types::{
     BINARY_BLOB_LIMIT, ContentKind, FileMeta, LARGE_TEXT_SUMMARY_BYTES, SymlinkInfo,
-    TEXT_BLOB_LIMIT,
+    SymlinkTargetKind, TEXT_BLOB_LIMIT,
 };
 use ignore::{WalkBuilder, gitignore::Gitignore};
 use std::fs;
@@ -108,6 +108,7 @@ pub fn read_file_meta(
         let target = fs::read_link(abs_path)
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default();
+        let target_kind = symlink_target_kind(abs_path);
         return Ok(FileMeta {
             path: rel,
             content_kind: ContentKind::Symlink,
@@ -115,7 +116,10 @@ pub fn read_file_meta(
             mime: None,
             blob_hash: None,
             mtime_ms: mtime_ms(&lstat),
-            symlink: Some(SymlinkInfo { target }),
+            symlink: Some(SymlinkInfo {
+                target,
+                target_kind,
+            }),
             error: None,
         });
     }
@@ -413,6 +417,14 @@ fn read_probe(path: &Path, size: u64) -> SnapshotResult<Vec<u8>> {
     let n = f.read(&mut buf).unwrap_or(0);
     buf.truncate(n);
     Ok(buf)
+}
+
+fn symlink_target_kind(abs_path: &Path) -> SymlinkTargetKind {
+    match fs::metadata(abs_path) {
+        Ok(meta) if meta.is_dir() => SymlinkTargetKind::Directory,
+        Ok(meta) if meta.is_file() => SymlinkTargetKind::File,
+        Ok(_) | Err(_) => SymlinkTargetKind::Unknown,
+    }
 }
 
 fn mtime_ms(metadata: &std::fs::Metadata) -> Option<u64> {

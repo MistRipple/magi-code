@@ -36,6 +36,17 @@ pub enum ChangeKind {
 #[serde(rename_all = "camelCase")]
 pub struct SymlinkInfo {
     pub target: String,
+    #[serde(default)]
+    pub target_kind: SymlinkTargetKind,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SymlinkTargetKind {
+    File,
+    Directory,
+    #[default]
+    Unknown,
 }
 
 /// 单个文件在 baseline 与 ChangeLog 中的元信息。
@@ -96,4 +107,18 @@ pub struct PendingChange {
     pub tail_summary: Option<String>,
     pub unified_diff: Option<String>,
     pub timestamp_ms: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SymlinkInfo, SymlinkTargetKind};
+
+    #[test]
+    fn symlink_info_defaults_missing_target_kind_for_existing_indexes() {
+        let info: SymlinkInfo =
+            serde_json::from_str(r#"{"target":"real.txt"}"#).expect("legacy symlink json");
+
+        assert_eq!(info.target, "real.txt");
+        assert_eq!(info.target_kind, SymlinkTargetKind::Unknown);
+    }
 }
