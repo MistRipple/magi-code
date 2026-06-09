@@ -294,18 +294,42 @@ jobs:
             fi
             echo "## 版本线说明"
             echo
-            echo "- 1.x：VS Code 插件版，以编辑器插件作为主要入口。"
-            echo "- 2.x：Web + VSCodeX 双版本，开始同时覆盖浏览器入口和编辑器协同入口。"
-            echo "- 3.x：Rust 重构后的纯 Web 版，面向多端 Web 使用，支持局域网访问和 Tunnel 模式。"
+            echo "- 1.x：VS Code 插件版，核心体验绑定编辑器侧边栏和插件生命周期。"
+            echo "- 2.x：Web + VSCodeX 双版本，在编辑器入口之外补充 Web 客户端，并通过 Local Agent 连接本地能力。"
+            echo "- 3.x：Rust 重构后的独立本地 Web 应用，Magi 自身就是完整产品入口，不再把 VS Code 插件或 Node Local Agent 作为主要承载形态。"
+            echo
+            echo "## 3.x 版本定位"
+            echo
+            echo "3.x 不是 2.x 的界面搬迁，而是把 Magi 从“插件 + 本地代理”的组合形态，升级为一个独立运行、浏览器访问、多端协同的本地 AI 编程工作台。用户启动的是 Magi 应用本身，应用内部负责托管 UI、API、事件流、工具运行时、会话状态和本地文件能力。"
             echo
             echo "## 3.x 重点优势"
             echo
-            echo "- 单一 Rust 本地运行时：UI、API、SSE、工具执行、会话状态和文件能力统一由本地应用托管。"
-            echo "- 纯 Web 多端入口：桌面、手机和平板都可以通过浏览器访问同一个本地 Magi，不再绑定某个编辑器窗口。"
-            echo "- 多端实时协同：同一 workspace/session 的消息、运行状态和会话更新会通过 Web 通道同步到已打开页面。"
-            echo "- Tunnel 模式：可把本地 Magi 暴露给移动端或外部网络临时访问，适合手机参与查看和操作。"
-            echo "- 产品化桌面分发：macOS 使用 dmg + Magi.app，Linux 使用 AppImage，Windows 使用 Magi.exe。"
-            echo "- 更完整的本地能力底座：内置工具、权限审批、文件快照、变更展示、本地索引、知识库、MCP、Skill 和 subagent 都收敛到统一运行时。"
+            echo "### 独立产品入口"
+            echo
+            echo "- 不再依赖 VS Code 插件作为主入口：即使不打开编辑器，也可以直接启动 Magi 并进入 Web 工作台。"
+            echo "- 不再把前端和 Local Agent 当成用户需要理解的两套东西：桌面包启动后由 Magi 自己托管 UI、API、SSE 和运行时。"
+            echo "- macOS、Linux、Windows 都按桌面软件方式分发：macOS 是 dmg + Magi.app，Linux 是 AppImage，Windows 是 Magi.exe。"
+            echo
+            echo "### 多端 Web 与移动场景"
+            echo
+            echo "- 纯 Web 入口让桌面、手机、平板都能访问同一个本地 Magi，同一个 workspace/session 可以跨页面持续查看。"
+            echo "- 局域网访问适合在电脑运行 Magi、手机或其他设备查看响应、切换会话和观察长任务进度。"
+            echo "- Tunnel 模式适合把本地 Magi 临时暴露给外部网络，在移动网络或异地设备上继续查看和操作。"
+            echo "- 多端同步不再是附加能力，而是 3.x 的主路径：会话、消息、运行状态和事件流按 Web 多端体验设计。"
+            echo
+            echo "### Rust 本地运行时"
+            echo
+            echo "- 统一的 Rust daemon 承担本地状态、事件总线、SSE 推送、工具调度、文件访问和前端静态资源托管。"
+            echo "- 相比 2.x 的 Web + Local Agent 组合，3.x 的运行边界更清晰，用户只需要启动一个 Magi 应用。"
+            echo "- workspace/session 由后端作为权威来源管理，减少前端猜测当前工作区或会话带来的错配风险。"
+            echo "- 浏览器断开后，后台任务仍由本地运行时继续处理；重新打开页面后通过持久化会话和消息恢复当前状态。"
+            echo
+            echo "### 更完整的 AI 编程底座"
+            echo
+            echo "- 内置工具、权限审批、只读/受限/完全访问模式、安全防护、文件快照和变更展示统一纳入产品运行时。"
+            echo "- 本地索引、上下文、知识库、项目记忆、MCP、Skill、subagent 等能力不再只是散落能力，而是围绕同一个会话和 workspace 组合使用。"
+            echo "- 工具调用、文件查看、文件编辑、diff、变更面板和任务状态都面向 Web 产品体验重新收敛，减少“能用但不好用”的断点。"
+            echo "- 对长任务、多 session、多 workspace、多端同时打开等场景做了更完整的状态同步、恢复和隔离设计。"
             echo
             echo "## $change_title"
             echo
