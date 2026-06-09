@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="Magi">
+  <rect width="256" height="256" rx="56" fill="#10151f"/>
+  <path d="M58 180V76h30l40 54 40-54h30v104h-30v-59l-34 45h-12l-34-45v59H58Z" fill="#f3f7fb"/>
+  <path d="M44 50h168v18H44V50Zm0 138h168v18H44v-18Z" fill="#4fd1c5"/>
+</svg>

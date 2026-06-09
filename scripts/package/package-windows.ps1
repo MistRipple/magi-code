@@ -59,6 +59,34 @@ if (-not (Test-Path (Join-Path $PackageDir "Magi.exe") -PathType Leaf)) {
   throw "产品包缺少 Magi.exe 入口：$(Join-Path $PackageDir "Magi.exe")"
 }
 
+function Get-PeSubsystem {
+  param([string]$Path)
+
+  $Bytes = [System.IO.File]::ReadAllBytes($Path)
+  if ($Bytes.Length -lt 0x80) {
+    throw "PE 文件过短：$Path"
+  }
+
+  $PeOffset = [BitConverter]::ToInt32($Bytes, 0x3c)
+  if ($PeOffset -lt 0 -or $PeOffset + 92 -ge $Bytes.Length) {
+    throw "PE 头偏移非法：$Path"
+  }
+
+  if ($Bytes[$PeOffset] -ne 0x50 -or $Bytes[$PeOffset + 1] -ne 0x45 -or $Bytes[$PeOffset + 2] -ne 0 -or $Bytes[$PeOffset + 3] -ne 0) {
+    throw "PE 签名非法：$Path"
+  }
+
+  $OptionalHeaderOffset = $PeOffset + 24
+  return [BitConverter]::ToUInt16($Bytes, $OptionalHeaderOffset + 68)
+}
+
+$MagiExe = Join-Path $PackageDir "Magi.exe"
+$WindowsGuiSubsystem = 2
+$Subsystem = Get-PeSubsystem $MagiExe
+if ($Subsystem -ne $WindowsGuiSubsystem) {
+  throw "Magi.exe 必须使用 Windows GUI 子系统，当前子系统值：$Subsystem"
+}
+
 if (-not (Test-Path (Join-Path $PackageDir "resources/web/dist/web.html") -PathType Leaf)) {
   throw "产品包缺少内置 UI 入口：$(Join-Path $PackageDir "resources/web/dist/web.html")"
 }

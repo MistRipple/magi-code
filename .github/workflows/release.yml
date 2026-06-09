@@ -47,8 +47,10 @@ jobs:
         include:
           - platform: macos
             runner: macos-latest
+            artifact_glob: dist/*.dmg
           - platform: linux
             runner: ubuntu-latest
+            artifact_glob: dist/*.AppImage
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
@@ -71,23 +73,55 @@ jobs:
       - name: 校验产品包结构
         run: |
           set -euo pipefail
-          archive="$(find dist -maxdepth 1 -name '*.tar.gz' -print -quit)"
-          test -n "$archive"
-          entries="$(mktemp)"
-          tar -tzf "$archive" > "$entries"
-          grep -Eq '^[^/]+/Magi$' "$entries"
-          grep -Eq '^[^/]+/resources/web/dist/web.html$' "$entries"
-          if grep -Eq 'magi-daemon-app|start-magi' "$entries"; then
-            echo "产品包暴露了技术入口" >&2
+          shopt -s nullglob
+          platform="${{ matrix.platform }}"
+
+          if [ "$platform" = "macos" ]; then
+            assets=(dist/*-macos-*.dmg)
+            apps=(dist/*-macos-*/Magi.app)
+            if [ "${#assets[@]}" -ne 1 ]; then
+              echo "macOS dmg 数量异常：${#assets[@]}" >&2
+              exit 1
+            fi
+            if [ "${#apps[@]}" -ne 1 ]; then
+              echo "macOS app bundle 数量异常：${#apps[@]}" >&2
+              exit 1
+            fi
+            test -x "${apps[0]}/Contents/MacOS/Magi"
+            test -f "${apps[0]}/Contents/Resources/web/dist/web.html"
+            if find "${apps[0]}" \( -name 'magi-daemon-app*' -o -name 'start-magi*' \) | grep -q .; then
+              echo "Magi.app 暴露了技术入口" >&2
+              exit 1
+            fi
+          elif [ "$platform" = "linux" ]; then
+            assets=(dist/*-linux-*.AppImage)
+            appdirs=(dist/*-linux-*/Magi.AppDir)
+            if [ "${#assets[@]}" -ne 1 ]; then
+              echo "Linux AppImage 数量异常：${#assets[@]}" >&2
+              exit 1
+            fi
+            if [ "${#appdirs[@]}" -ne 1 ]; then
+              echo "Linux AppDir 数量异常：${#appdirs[@]}" >&2
+              exit 1
+            fi
+            test -x "${assets[0]}"
+            test -x "${appdirs[0]}/AppRun"
+            test -x "${appdirs[0]}/usr/bin/Magi"
+            test -f "${appdirs[0]}/usr/share/magi/web/dist/web.html"
+            if find "${appdirs[0]}" \( -name 'magi-daemon-app*' -o -name 'start-magi*' \) | grep -q .; then
+              echo "Linux AppDir 暴露了技术入口" >&2
+              exit 1
+            fi
+          else
+            echo "不支持的平台：$platform" >&2
             exit 1
           fi
-          rm -f "$entries"
 
       - name: 上传产物
         uses: actions/upload-artifact@v4
         with:
           name: magi-${{ matrix.platform }}
-          path: dist/*.tar.gz
+          path: ${{ matrix.artifact_glob }}
           if-no-files-found: error
 
   package-windows:
@@ -167,11 +201,11 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist/release-assets
-          find dist/artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec cp {} dist/release-assets/ \;
+          find dist/artifacts -type f \( -name '*.dmg' -o -name '*.AppImage' -o -name '*.zip' \) -exec cp {} dist/release-assets/ \;
 
           shopt -s nullglob
-          macos_assets=(dist/release-assets/*-macos-*.tar.gz)
-          linux_assets=(dist/release-assets/*-linux-*.tar.gz)
+          macos_assets=(dist/release-assets/*-macos-*.dmg)
+          linux_assets=(dist/release-assets/*-linux-*.AppImage)
           windows_assets=(dist/release-assets/*-windows-*.zip)
 
           if [ "${#macos_assets[@]}" -ne 1 ]; then
@@ -187,28 +221,17 @@ jobs:
             exit 1
           fi
 
-          check_unix_archive() {
-            local archive="$1"
-            local entries
-            entries="$(mktemp)"
-            tar -tzf "$archive" > "$entries"
-            grep -Eq '^[^/]+/Magi$' "$entries"
-            grep -Eq '^[^/]+/resources/web/dist/web.html$' "$entries"
-            if grep -Eq 'magi-daemon-app|start-magi' "$entries"; then
-              echo "产品包暴露了技术入口：$archive" >&2
-              exit 1
-            fi
-            rm -f "$entries"
-          }
-
-          check_unix_archive "${macos_assets[0]}"
-          check_unix_archive "${linux_assets[0]}"
+          test -s "${macos_assets[0]}"
+          test -s "${linux_assets[0]}"
 
           windows_entries="$(mktemp)"
           unzip -Z1 "${windows_assets[0]}" | tr '\\' '/' | sed 's/\r$//' > "$windows_entries"
           grep -Eq '^[^/]+/Magi\.exe$' "$windows_entries"
           grep -Eq '^[^/]+/resources/web/dist/web\.html$' "$windows_entries"
-          ! grep -Eq 'magi-daemon-app|start-magi' "$windows_entries"
+          if grep -Eq 'magi-daemon-app|start-magi' "$windows_entries"; then
+            echo "Windows 产品包暴露了技术入口" >&2
+            exit 1
+          fi
 
           ls -lh dist/release-assets
 
@@ -238,8 +261,8 @@ jobs:
             echo "- 本次发布没有检测到新的提交摘要。" > dist/release-changes.md
           fi
 
-          macos_asset="$(basename "$(find dist/release-assets -maxdepth 1 -name '*-macos-*.tar.gz' -print -quit)")"
-          linux_asset="$(basename "$(find dist/release-assets -maxdepth 1 -name '*-linux-*.tar.gz' -print -quit)")"
+          macos_asset="$(basename "$(find dist/release-assets -maxdepth 1 -name '*-macos-*.dmg' -print -quit)")"
+          linux_asset="$(basename "$(find dist/release-assets -maxdepth 1 -name '*-linux-*.AppImage' -print -quit)")"
           windows_asset="$(basename "$(find dist/release-assets -maxdepth 1 -name '*-windows-*.zip' -print -quit)")"
 
           {
@@ -255,10 +278,11 @@ jobs:
             echo
             echo "## 运行方式"
             echo
-            echo "Magi 是本地一体化应用。解压后直接启动："
+            echo "Magi 是本地一体化应用。下载对应平台的软件包后启动："
             echo
-            echo "- macOS / Linux：\`Magi\`"
-            echo "- Windows：\`Magi.exe\`"
+            echo "- macOS：打开 dmg 后启动 \`Magi.app\`"
+            echo "- Linux：给 AppImage 赋予执行权限后启动"
+            echo "- Windows：解压 zip 后启动 \`Magi.exe\`"
             echo
             echo "应用会自行托管内置 UI、API、SSE、工具运行时和会话状态；不要把包内实现理解成传统前后端分离部署。"
             echo
