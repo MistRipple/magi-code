@@ -21,7 +21,7 @@ fn protocol_serialize_handshake_request() {
 #[test]
 fn protocol_serialize_handshake_response() {
     let msg = AgentToClientMessage::HandshakeResponse {
-        agent_version: "0.1.0".to_string(),
+        agent_version: env!("CARGO_PKG_VERSION").to_string(),
         capabilities: AgentCapabilities::default(),
     };
     let json = serde_json::to_string(&msg).unwrap();
