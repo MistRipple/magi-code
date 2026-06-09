@@ -73,9 +73,15 @@ jobs:
           set -euo pipefail
           archive="$(find dist -maxdepth 1 -name '*.tar.gz' -print -quit)"
           test -n "$archive"
-          tar -tzf "$archive" | grep -Eq '^[^/]+/Magi$'
-          tar -tzf "$archive" | grep -Eq '^[^/]+/resources/web/dist/web.html$'
-          ! tar -tzf "$archive" | grep -Eq 'magi-daemon-app|start-magi'
+          entries="$(mktemp)"
+          tar -tzf "$archive" > "$entries"
+          grep -Eq '^[^/]+/Magi$' "$entries"
+          grep -Eq '^[^/]+/resources/web/dist/web.html$' "$entries"
+          if grep -Eq 'magi-daemon-app|start-magi' "$entries"; then
+            echo "产品包暴露了技术入口" >&2
+            exit 1
+          fi
+          rm -f "$entries"
 
       - name: 上传产物
         uses: actions/upload-artifact@v4
@@ -181,11 +187,22 @@ jobs:
             exit 1
           fi
 
-          for archive in "${macos_assets[0]}" "${linux_assets[0]}"; do
-            tar -tzf "$archive" | grep -Eq '^[^/]+/Magi$'
-            tar -tzf "$archive" | grep -Eq '^[^/]+/resources/web/dist/web.html$'
-            ! tar -tzf "$archive" | grep -Eq 'magi-daemon-app|start-magi'
-          done
+          check_unix_archive() {
+            local archive="$1"
+            local entries
+            entries="$(mktemp)"
+            tar -tzf "$archive" > "$entries"
+            grep -Eq '^[^/]+/Magi$' "$entries"
+            grep -Eq '^[^/]+/resources/web/dist/web.html$' "$entries"
+            if grep -Eq 'magi-daemon-app|start-magi' "$entries"; then
+              echo "产品包暴露了技术入口：$archive" >&2
+              exit 1
+            fi
+            rm -f "$entries"
+          }
+
+          check_unix_archive "${macos_assets[0]}"
+          check_unix_archive "${linux_assets[0]}"
 
           windows_entries="$(mktemp)"
           unzip -Z1 "${windows_assets[0]}" | tr '\\' '/' | sed 's/\r$//' > "$windows_entries"
