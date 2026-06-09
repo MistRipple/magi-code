@@ -44,6 +44,21 @@ cp -R "$WEB_DIST" "$PACKAGE_DIR/resources/web/dist"
 
 chmod +x "$PACKAGE_DIR/Magi"
 
+if [ ! -x "$PACKAGE_DIR/Magi" ]; then
+  echo "产品包缺少 Magi 入口：$PACKAGE_DIR/Magi" >&2
+  exit 1
+fi
+
+if [ ! -f "$PACKAGE_DIR/resources/web/dist/web.html" ]; then
+  echo "产品包缺少内置 UI 入口：$PACKAGE_DIR/resources/web/dist/web.html" >&2
+  exit 1
+fi
+
+if find "$PACKAGE_DIR" -name 'magi-daemon-app*' -o -name 'start-magi*' | grep -q .; then
+  echo "产品包不能暴露 magi-daemon-app 或 start-magi 技术入口。" >&2
+  exit 1
+fi
+
 mkdir -p "$DIST_DIR"
 tar -C "$DIST_DIR" -czf "$DIST_DIR/$PACKAGE_NAME.tar.gz" "$PACKAGE_NAME"
 echo "已生成 $DIST_DIR/$PACKAGE_NAME.tar.gz"

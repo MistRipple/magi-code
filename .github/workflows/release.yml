@@ -7,7 +7,7 @@ on:
       - "v*"
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build-web:
@@ -68,6 +68,15 @@ jobs:
       - name: 打包产物
         run: bash scripts/package/package-unix.sh ${{ matrix.platform }}
 
+      - name: 校验产品包结构
+        run: |
+          set -euo pipefail
+          archive="$(find dist -maxdepth 1 -name '*.tar.gz' -print -quit)"
+          test -n "$archive"
+          tar -tzf "$archive" | grep -Eq '^[^/]+/Magi$'
+          tar -tzf "$archive" | grep -Eq '^[^/]+/resources/web/dist/web.html$'
+          ! tar -tzf "$archive" | grep -Eq 'magi-daemon-app|start-magi'
+
       - name: 上传产物
         uses: actions/upload-artifact@v4
         with:
@@ -99,9 +108,162 @@ jobs:
         shell: pwsh
         run: ./scripts/package/package-windows.ps1
 
+      - name: 校验产品包结构
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $archive = Get-ChildItem dist -Filter *.zip | Select-Object -First 1
+          if (-not $archive) { throw "缺少 Windows 产品包 zip" }
+          $entries = & tar -tf $archive.FullName
+          if (-not ($entries -match '^[^/]+/Magi\.exe$')) { throw "产品包缺少 Magi.exe 入口" }
+          if (-not ($entries -match '^[^/]+/resources/web/dist/web\.html$')) { throw "产品包缺少内置 UI 入口" }
+          if ($entries -match 'magi-daemon-app|start-magi') { throw "产品包暴露了技术入口" }
+
       - name: 上传产物
         uses: actions/upload-artifact@v4
         with:
           name: magi-windows
           path: dist/*.zip
           if-no-files-found: error
+
+  publish-release:
+    name: 发布 GitHub Release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs:
+      - package-unix
+      - package-windows
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 下载 macOS 产物
+        uses: actions/download-artifact@v4
+        with:
+          name: magi-macos
+          path: dist/artifacts/magi-macos
+
+      - name: 下载 Linux 产物
+        uses: actions/download-artifact@v4
+        with:
+          name: magi-linux
+          path: dist/artifacts/magi-linux
+
+      - name: 下载 Windows 产物
+        uses: actions/download-artifact@v4
+        with:
+          name: magi-windows
+          path: dist/artifacts/magi-windows
+
+      - name: 收集并校验发布文件
+        run: |
+          set -euo pipefail
+          mkdir -p dist/release-assets
+          find dist/artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec cp {} dist/release-assets/ \;
+
+          shopt -s nullglob
+          macos_assets=(dist/release-assets/*-macos-*.tar.gz)
+          linux_assets=(dist/release-assets/*-linux-*.tar.gz)
+          windows_assets=(dist/release-assets/*-windows-*.zip)
+
+          if [ "${#macos_assets[@]}" -ne 1 ]; then
+            echo "macOS 发布文件数量异常：${#macos_assets[@]}" >&2
+            exit 1
+          fi
+          if [ "${#linux_assets[@]}" -ne 1 ]; then
+            echo "Linux 发布文件数量异常：${#linux_assets[@]}" >&2
+            exit 1
+          fi
+          if [ "${#windows_assets[@]}" -ne 1 ]; then
+            echo "Windows 发布文件数量异常：${#windows_assets[@]}" >&2
+            exit 1
+          fi
+
+          for archive in "${macos_assets[0]}" "${linux_assets[0]}"; do
+            tar -tzf "$archive" | grep -Eq '^[^/]+/Magi$'
+            tar -tzf "$archive" | grep -Eq '^[^/]+/resources/web/dist/web.html$'
+            ! tar -tzf "$archive" | grep -Eq 'magi-daemon-app|start-magi'
+          done
+
+          windows_entries="$(mktemp)"
+          unzip -Z1 "${windows_assets[0]}" | tr '\\' '/' | sed 's/\r$//' > "$windows_entries"
+          grep -Eq '^[^/]+/Magi\.exe$' "$windows_entries"
+          grep -Eq '^[^/]+/resources/web/dist/web\.html$' "$windows_entries"
+          ! grep -Eq 'magi-daemon-app|start-magi' "$windows_entries"
+
+          ls -lh dist/release-assets
+
+      - name: 生成发布说明
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          commit="${GITHUB_SHA}"
+          generated_at="$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+
+          release_kind="正式版"
+          if [[ "$tag" =~ (test|alpha|beta|rc) ]]; then
+            release_kind="测试版"
+          fi
+
+          previous_tag="$(git describe --tags --abbrev=0 "${commit}^" 2>/dev/null || true)"
+          if [ -n "$previous_tag" ]; then
+            change_range="$previous_tag..$commit"
+            change_title="自 $previous_tag 以来的变更"
+            git log --pretty='- %s (%h)' "$change_range" > dist/release-changes.md
+          else
+            change_title="最近变更"
+            git log --pretty='- %s (%h)' -n 50 "$commit" > dist/release-changes.md
+          fi
+
+          if [ ! -s dist/release-changes.md ]; then
+            echo "- 本次发布没有检测到新的提交摘要。" > dist/release-changes.md
+          fi
+
+          macos_asset="$(basename "$(find dist/release-assets -maxdepth 1 -name '*-macos-*.tar.gz' -print -quit)")"
+          linux_asset="$(basename "$(find dist/release-assets -maxdepth 1 -name '*-linux-*.tar.gz' -print -quit)")"
+          windows_asset="$(basename "$(find dist/release-assets -maxdepth 1 -name '*-windows-*.zip' -print -quit)")"
+
+          {
+            echo "# Magi $tag"
+            echo
+            echo "版本类型：$release_kind"
+            echo
+            echo "## 下载"
+            echo
+            echo "- macOS：\`$macos_asset\`"
+            echo "- Linux：\`$linux_asset\`"
+            echo "- Windows：\`$windows_asset\`"
+            echo
+            echo "## 运行方式"
+            echo
+            echo "Magi 是本地一体化应用。解压后直接启动："
+            echo
+            echo "- macOS / Linux：\`Magi\`"
+            echo "- Windows：\`Magi.exe\`"
+            echo
+            echo "应用会自行托管内置 UI、API、SSE、工具运行时和会话状态；不要把包内实现理解成传统前后端分离部署。"
+            echo
+            echo "## $change_title"
+            echo
+            cat dist/release-changes.md
+            echo
+            echo "## 构建信息"
+            echo
+            echo "- Tag：\`$tag\`"
+            echo "- Commit：\`$commit\`"
+            echo "- 生成时间：$generated_at"
+          } > dist/release-notes.md
+
+          cat dist/release-notes.md
+
+      - name: 创建 Release 并上传产物
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Magi ${{ github.ref_name }}
+          body_path: dist/release-notes.md
+          prerelease: ${{ contains(github.ref_name, 'test') || contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc') }}
+          files: dist/release-assets/*
+          fail_on_unmatched_files: true

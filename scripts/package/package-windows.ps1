@@ -55,6 +55,21 @@ New-Item -ItemType Directory -Force -Path (Join-Path $PackageDir "resources/web"
 Copy-Item $Binary (Join-Path $PackageDir "Magi.exe")
 Copy-Item $WebDist (Join-Path $PackageDir "resources/web/dist") -Recurse
 
+if (-not (Test-Path (Join-Path $PackageDir "Magi.exe") -PathType Leaf)) {
+  throw "产品包缺少 Magi.exe 入口：$(Join-Path $PackageDir "Magi.exe")"
+}
+
+if (-not (Test-Path (Join-Path $PackageDir "resources/web/dist/web.html") -PathType Leaf)) {
+  throw "产品包缺少内置 UI 入口：$(Join-Path $PackageDir "resources/web/dist/web.html")"
+}
+
+$ForbiddenEntries = Get-ChildItem $PackageDir -Recurse -Force |
+  Where-Object { $_.Name -like "magi-daemon-app*" -or $_.Name -like "start-magi*" }
+if ($ForbiddenEntries) {
+  $ForbiddenNames = ($ForbiddenEntries | ForEach-Object { $_.FullName }) -join ", "
+  throw "产品包不能暴露 magi-daemon-app 或 start-magi 技术入口：$ForbiddenNames"
+}
+
 $ZipPath = Join-Path $DistDir "$PackageName.zip"
 Remove-Item $ZipPath -Force -ErrorAction SilentlyContinue
 Compress-Archive -Path $PackageDir -DestinationPath $ZipPath
