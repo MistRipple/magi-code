@@ -50,26 +50,10 @@ $PackageName = "magi-$Version-$Platform-$Arch"
 $PackageDir = Join-Path $DistDir $PackageName
 
 Remove-Item $PackageDir -Recurse -Force -ErrorAction SilentlyContinue
-New-Item -ItemType Directory -Force -Path (Join-Path $PackageDir "bin") | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $PackageDir "resources/web") | Out-Null
 
-Copy-Item $Binary (Join-Path $PackageDir "bin/magi-daemon-app.exe")
+Copy-Item $Binary (Join-Path $PackageDir "Magi.exe")
 Copy-Item $WebDist (Join-Path $PackageDir "resources/web/dist") -Recurse
-
-$StartScript = @'
-$ErrorActionPreference = "Stop"
-
-$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$PackageRoot = Resolve-Path (Join-Path $ScriptDir "..")
-if ([string]::IsNullOrWhiteSpace($env:MAGI_WEB_DIST_ROOT)) {
-  $env:MAGI_WEB_DIST_ROOT = Join-Path $PackageRoot "resources/web/dist"
-}
-
-& (Join-Path $ScriptDir "magi-daemon-app.exe") @args
-exit $LASTEXITCODE
-'@
-
-Set-Content -Path (Join-Path $PackageDir "bin/start-magi.ps1") -Value $StartScript -Encoding UTF8
 
 $ZipPath = Join-Path $DistDir "$PackageName.zip"
 Remove-Item $ZipPath -Force -ErrorAction SilentlyContinue

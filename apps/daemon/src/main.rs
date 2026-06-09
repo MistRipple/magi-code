@@ -32,6 +32,29 @@ fn read_port() -> Result<u16, Box<dyn std::error::Error>> {
         .map_err(|error| format!("invalid MAGI_PORT `{raw_port}`: {error}").into())
 }
 
+fn read_env_flag(name: &str) -> Option<bool> {
+    let raw = read_env(name)?;
+    match raw.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+fn should_open_browser() -> bool {
+    read_env_flag("MAGI_OPEN_BROWSER").unwrap_or_else(is_product_entry_executable)
+}
+
+fn is_product_entry_executable() -> bool {
+    env::current_exe()
+        .ok()
+        .and_then(|path| {
+            path.file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned())
+        })
+        .is_some_and(|stem| stem.eq_ignore_ascii_case("magi"))
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
@@ -53,7 +76,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     runtime_state_manager.write_runtime_state(pid, Some(&host), port);
     runtime_state_manager.write_pid(pid);
 
-    let config = DaemonConfig::new(host, port, service_name, state_root);
+    let config = DaemonConfig::new(host, port, service_name, state_root)
+        .with_open_browser(should_open_browser());
     let daemon = Daemon::new(config);
     let result = daemon.run().await;
 

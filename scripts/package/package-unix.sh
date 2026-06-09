@@ -37,22 +37,12 @@ PACKAGE_NAME="magi-${VERSION}-${PLATFORM}-${ARCH}"
 PACKAGE_DIR="$DIST_DIR/$PACKAGE_NAME"
 
 rm -rf "$PACKAGE_DIR"
-mkdir -p "$PACKAGE_DIR/bin" "$PACKAGE_DIR/resources/web"
+mkdir -p "$PACKAGE_DIR/resources/web"
 
-cp "$BINARY" "$PACKAGE_DIR/bin/magi-daemon-app"
+cp "$BINARY" "$PACKAGE_DIR/Magi"
 cp -R "$WEB_DIST" "$PACKAGE_DIR/resources/web/dist"
 
-cat >"$PACKAGE_DIR/bin/start-magi" <<'SCRIPT'
-#!/usr/bin/env bash
-set -euo pipefail
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PACKAGE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-export MAGI_WEB_DIST_ROOT="${MAGI_WEB_DIST_ROOT:-$PACKAGE_ROOT/resources/web/dist}"
-exec "$SCRIPT_DIR/magi-daemon-app" "$@"
-SCRIPT
-
-chmod +x "$PACKAGE_DIR/bin/start-magi" "$PACKAGE_DIR/bin/magi-daemon-app"
+chmod +x "$PACKAGE_DIR/Magi"
 
 mkdir -p "$DIST_DIR"
 tar -C "$DIST_DIR" -czf "$DIST_DIR/$PACKAGE_NAME.tar.gz" "$PACKAGE_NAME"

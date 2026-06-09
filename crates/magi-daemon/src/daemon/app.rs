@@ -12,7 +12,7 @@ use axum::{
 use std::{
     env,
     path::{Path, PathBuf},
-    process::Stdio,
+    process::{Command as StdCommand, Stdio},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -51,6 +51,7 @@ impl Daemon {
 
         let frontend = resolve_frontend_mode(&self.config).await?;
         let listener = TcpListener::bind(self.config.socket_addr()?).await?;
+        let frontend_entry_available = frontend.entry_available();
         let app =
             build_application_router(runtime.router(self.config.service_name.clone()), &frontend);
         info!(
@@ -59,6 +60,12 @@ impl Daemon {
             port = self.config.port,
             "Rust 影子后端已启动"
         );
+        if self.config.open_browser && frontend_entry_available {
+            let url = web_entry_url(&self.config);
+            if let Err(error) = open_browser(&url) {
+                warn!(error = %error, url = %url, "打开 Magi 界面失败");
+            }
+        }
         let _frontend_guard = frontend;
         axum::serve(listener, app).await?;
         Ok(())
@@ -67,7 +74,22 @@ impl Daemon {
 
 enum FrontendMode {
     Dev(WebDevServer),
-    Static,
+    Static(Option<StaticWebAssets>),
+}
+
+impl FrontendMode {
+    fn entry_available(&self) -> bool {
+        match self {
+            FrontendMode::Dev(_) => true,
+            FrontendMode::Static(assets) => assets.is_some(),
+        }
+    }
+}
+
+struct StaticWebAssets {
+    web_html_path: PathBuf,
+    assets_dir: PathBuf,
+    web_dist_root: PathBuf,
 }
 
 #[derive(Clone)]
@@ -217,7 +239,7 @@ impl Drop for WebDevServerInner {
 
 async fn resolve_frontend_mode(config: &DaemonConfig) -> Result<FrontendMode, DaemonError> {
     if !env_flag_enabled(WEB_DEV_ENABLED_ENV) {
-        return Ok(FrontendMode::Static);
+        return Ok(FrontendMode::Static(resolve_static_web_assets()));
     }
 
     let host =
@@ -304,41 +326,72 @@ fn build_application_router(api_router: Router, frontend: &FrontendMode) -> Rout
             }));
     }
 
-    let Some(web_dist_root) = resolve_web_dist_root() else {
-        warn!("未找到 web/dist 构建产物，daemon 仅提供 API 路由");
+    let FrontendMode::Static(static_assets) = frontend else {
+        unreachable!("dev frontend handled above");
+    };
+
+    let Some(static_assets) = static_assets else {
         return api_router;
     };
 
-    let web_html_path = web_dist_root.join("web.html");
-    let assets_dir = web_dist_root.join("assets");
-
-    if !web_html_path.is_file() {
-        warn!(
-            path = %web_html_path.display(),
-            "web/dist 中缺少 web.html，daemon 仅提供 API 路由"
-        );
-        return api_router;
-    }
-
     let mut app = Router::new()
         .route("/", get(|| async { Redirect::temporary("/web.html") }))
-        .route_service("/web.html", ServeFile::new(web_html_path.clone()))
+        .route_service(
+            "/web.html",
+            ServeFile::new(static_assets.web_html_path.clone()),
+        )
         .merge(api_router);
 
-    if assets_dir.is_dir() {
-        app = app.nest_service("/assets", ServeDir::new(assets_dir));
+    if static_assets.assets_dir.is_dir() {
+        app = app.nest_service("/assets", ServeDir::new(static_assets.assets_dir.clone()));
     } else {
         warn!(
-            path = %assets_dir.display(),
+            path = %static_assets.assets_dir.display(),
             "web/dist 中缺少 assets 目录，静态资源可能无法完整加载"
         );
     }
 
     info!(
-        web_dist_root = %web_dist_root.display(),
+        web_dist_root = %static_assets.web_dist_root.display(),
         "Rust daemon 已接入 web 构建产物，启用单端口入口"
     );
     app
+}
+
+fn web_entry_url(config: &DaemonConfig) -> String {
+    format!(
+        "http://{}:{}/web.html",
+        browser_host(&config.host),
+        config.port
+    )
+}
+
+fn open_browser(url: &str) -> std::io::Result<()> {
+    let mut command = browser_open_command(url);
+    command.spawn().map(|_| ())
+}
+
+fn browser_open_command(url: &str) -> StdCommand {
+    #[cfg(target_os = "macos")]
+    {
+        let mut command = StdCommand::new("open");
+        command.arg(url);
+        command
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let mut command = StdCommand::new("cmd");
+        command.args(["/C", "start", "", url]);
+        command
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let mut command = StdCommand::new("xdg-open");
+        command.arg(url);
+        command
+    }
 }
 
 fn build_web_dev_html(vite_origin: &str, agent_origin: &str) -> String {
@@ -653,6 +706,30 @@ fn resolve_web_dist_root() -> Option<PathBuf> {
     }
 
     None
+}
+
+fn resolve_static_web_assets() -> Option<StaticWebAssets> {
+    let Some(web_dist_root) = resolve_web_dist_root() else {
+        warn!("未找到 web/dist 构建产物，daemon 仅提供 API 路由");
+        return None;
+    };
+
+    let web_html_path = web_dist_root.join("web.html");
+    let assets_dir = web_dist_root.join("assets");
+
+    if !web_html_path.is_file() {
+        warn!(
+            path = %web_html_path.display(),
+            "web/dist 中缺少 web.html，daemon 仅提供 API 路由"
+        );
+        return None;
+    }
+
+    Some(StaticWebAssets {
+        web_html_path,
+        assets_dir,
+        web_dist_root,
+    })
 }
 
 fn packaged_web_dist_candidates() -> Vec<PathBuf> {
