@@ -37,4 +37,8 @@ restart_fixed_port() {
 restart_fixed_port
 
 cd "$ROOT_DIR"
+# 先编译 bridge loopback 二进制，daemon 运行时通过子进程方式拉起它们。
+# cargo clean 后只编译 magi-daemon-app 会导致 bridge 可执行文件缺失。
+cargo build -p magi-bridge-client --bins
+
 exec env MAGI_WEB_DEV="${MAGI_WEB_DEV:-1}" MAGI_PORT="$PORT" cargo run -p magi-daemon-app
