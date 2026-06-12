@@ -294,7 +294,7 @@ async fn get_project_knowledge(
         query.workspace_id.as_deref(),
         query.workspace_path.as_deref(),
     )?;
-    let scan_outcome = ensure_workspace_code_index(&state, &workspace_id)?;
+    let scan_outcome = ensure_workspace_code_index(&state, &workspace_id).await?;
 
     let kq = KnowledgeQuery {
         kind: None,
@@ -338,7 +338,7 @@ async fn get_project_knowledge(
     })))
 }
 
-fn ensure_workspace_code_index(
+async fn ensure_workspace_code_index(
     state: &ApiState,
     workspace_id: &WorkspaceId,
 ) -> Result<CodeIndexScanOutcome, ApiError> {
@@ -364,9 +364,16 @@ fn ensure_workspace_code_index(
         return Ok(CodeIndexScanOutcome::indexed_existing());
     }
 
-    let outcome = state
-        .knowledge_store
-        .build_workspace_index(workspace_id, &workspace_root);
+    // 索引缺失时在 spawn_blocking 中构建，避免阻塞 tokio async runtime。
+    let state_clone = state.clone();
+    let workspace_id_clone = workspace_id.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        state_clone
+            .knowledge_store
+            .build_workspace_index(&workspace_id_clone, &workspace_root)
+    })
+    .await
+    .map_err(|e| ApiError::internal_assembly("代码索引构建任务失败", e))?;
     state.persist_knowledge_state_for_api()?;
     if had_index_summary && outcome.summary.is_some() {
         Ok(CodeIndexScanOutcome::indexed_existing())

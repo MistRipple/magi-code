@@ -90,11 +90,18 @@ async fn register_workspace(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let canonical_path = canonical_workspace_path(&request.path)?;
     let path = magi_core::AbsolutePath::new(canonical_path.to_string_lossy().to_string());
+
+    // 已注册过的 workspace：复用已有记录，仍异步刷新索引。
     if let Some(workspace) = registered_workspace_for_path(&state, &canonical_path) {
-        state
-            .knowledge_store
-            .build_workspace_index(&workspace.workspace_id, &canonical_path);
-        state.persist_knowledge_state_for_api()?;
+        let workspace_id = workspace.workspace_id.clone();
+        let state_clone = state.clone();
+        let path_clone = canonical_path.clone();
+        tokio::task::spawn_blocking(move || {
+            state_clone
+                .knowledge_store
+                .build_workspace_index(&workspace_id, &path_clone);
+            let _ = state_clone.persist_knowledge_state_for_api();
+        });
         return Ok(Json(serde_json::json!({
             "workspaceId": workspace.workspace_id.to_string(),
             "registered": false,
@@ -102,6 +109,7 @@ async fn register_workspace(
         })));
     }
 
+    // 新 workspace：先同步完成注册（快），再异步构建索引。
     let workspace_id = new_workspace_id();
     match state
         .workspace_registry
@@ -109,11 +117,17 @@ async fn register_workspace(
     {
         Ok(_) => {}
         Err(error) => {
+            // 并发竞态：另一个请求先注册了同一路径。
             if let Some(workspace) = registered_workspace_for_path(&state, &canonical_path) {
-                state
-                    .knowledge_store
-                    .build_workspace_index(&workspace.workspace_id, &canonical_path);
-                state.persist_knowledge_state_for_api()?;
+                let wid = workspace.workspace_id.clone();
+                let state_clone = state.clone();
+                let path_clone = canonical_path.clone();
+                tokio::task::spawn_blocking(move || {
+                    state_clone
+                        .knowledge_store
+                        .build_workspace_index(&wid, &path_clone);
+                    let _ = state_clone.persist_knowledge_state_for_api();
+                });
                 return Ok(Json(serde_json::json!({
                     "workspaceId": workspace.workspace_id.to_string(),
                     "registered": false,
@@ -123,11 +137,18 @@ async fn register_workspace(
             return Err(ApiError::internal_assembly("工作区注册失败", error));
         }
     }
-    state
-        .knowledge_store
-        .build_workspace_index(&workspace_id, &canonical_path);
+
+    // 先持久化 workspace 注册状态（快），索引放到后台不阻塞响应。
     state.persist_workspace_durable_state_for_api()?;
-    state.persist_knowledge_state_for_api()?;
+    let state_clone = state.clone();
+    let wid = workspace_id.clone();
+    let path_clone = canonical_path.clone();
+    tokio::task::spawn_blocking(move || {
+        state_clone
+            .knowledge_store
+            .build_workspace_index(&wid, &path_clone);
+        let _ = state_clone.persist_knowledge_state_for_api();
+    });
     Ok(Json(serde_json::json!({
         "workspaceId": workspace_id.to_string(),
         "registered": true
@@ -477,10 +498,23 @@ mod tests {
                 .as_str()
                 .expect("workspaceId should exist"),
         );
-        let code_index = state
-            .knowledge_store
-            .code_index_summary_for_workspace(&workspace_id)
-            .expect("registered workspace should have a code index");
+        // 索引在 spawn_blocking 中异步构建，轮询等待完成。
+        let code_index = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            async {
+                loop {
+                    if let Some(summary) = state
+                        .knowledge_store
+                        .code_index_summary_for_workspace(&workspace_id)
+                    {
+                        return summary;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            },
+        )
+        .await
+        .expect("code index should be built within timeout");
 
         assert!(
             code_index
