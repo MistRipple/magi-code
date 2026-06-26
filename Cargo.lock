@@ -973,34 +973,22 @@ dependencies = [
  "futures-util",
  "magi-agent-role",
  "magi-bridge-client",
- "magi-checkpoint",
- "magi-context-runtime",
  "magi-conversation-runtime",
  "magi-core",
  "magi-event-bus",
  "magi-governance",
- "magi-human-checkpoint",
- "magi-knowledge-graph",
  "magi-knowledge-store",
  "magi-memory-store",
  "magi-mission",
- "magi-mission-charter",
  "magi-mission-metrics",
- "magi-mission-workspace",
  "magi-orchestrator",
- "magi-permissions",
- "magi-plan",
- "magi-project-memory",
  "magi-safety-gate",
  "magi-session-store",
  "magi-skill-runtime",
  "magi-snapshot",
  "magi-spawn-graph",
- "magi-todo-ledger",
  "magi-tool-runtime",
  "magi-usage-authority",
- "magi-validation-runner",
- "magi-worker-runtime",
  "magi-workspace",
  "reqwest",
  "serde",
@@ -1038,7 +1026,6 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror",
- "tracing",
 ]
 
 [[package]]
@@ -1185,7 +1172,6 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror",
- "tracing",
 ]
 
 [[package]]
@@ -1198,7 +1184,6 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror",
- "tracing",
 ]
 
 [[package]]
@@ -1229,7 +1214,6 @@ dependencies = [
  "magi-event-bus",
  "serde",
  "serde_json",
- "thiserror",
  "tokio",
  "tracing",
 ]
@@ -1270,7 +1254,6 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror",
- "tracing",
 ]
 
 [[package]]
@@ -1279,7 +1262,6 @@ version = "3.0.0"
 dependencies = [
  "magi-core",
  "serde",
- "serde_json",
  "tempfile",
  "thiserror",
 ]
@@ -1290,10 +1272,8 @@ version = "3.0.0"
 dependencies = [
  "magi-core",
  "serde",
- "serde_json",
  "tempfile",
  "thiserror",
- "tracing",
 ]
 
 [[package]]
@@ -1308,12 +1288,9 @@ dependencies = [
  "magi-governance",
  "magi-knowledge-store",
  "magi-memory-store",
- "magi-session-store",
  "magi-skill-runtime",
  "magi-tool-runtime",
  "magi-worker-runtime",
- "magi-workspace",
- "regex",
  "serde",
  "serde_json",
  "tempfile",
@@ -1327,7 +1304,6 @@ dependencies = [
  "magi-core",
  "serde",
  "serde_json",
- "thiserror",
 ]
 
 [[package]]
@@ -1341,7 +1317,6 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror",
- "tracing",
 ]
 
 [[package]]
@@ -1374,7 +1349,6 @@ dependencies = [
  "magi-tool-runtime",
  "serde",
  "serde_json",
- "thiserror",
 ]
 
 [[package]]
@@ -1412,7 +1386,6 @@ name = "magi-spawn-graph"
 version = "3.0.0"
 dependencies = [
  "magi-core",
- "serde",
  "thiserror",
 ]
 
@@ -1451,7 +1424,6 @@ version = "3.0.0"
 dependencies = [
  "magi-core",
  "serde",
- "serde_json",
  "sha2",
  "url",
 ]
@@ -1466,7 +1438,6 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror",
- "tracing",
 ]
 
 [[package]]

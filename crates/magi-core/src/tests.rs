@@ -42,10 +42,7 @@ fn path_value_objects_provide_consistent_accessors() {
     assert_eq!(workspace_root.to_string(), "/tmp/workspace");
     assert_eq!(worktree_root.to_string(), "/tmp/worktree");
 }
-
-// ---------------------------------------------------------------------------
-// Task domain type tests
-// ---------------------------------------------------------------------------
+// --- Task domain type tests
 
 use crate::task::*;
 use crate::{LeaseId, MissionId, TaskId, UtcMillis};

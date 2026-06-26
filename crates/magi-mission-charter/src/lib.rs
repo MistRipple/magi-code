@@ -42,10 +42,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 use thiserror::Error;
-
-// ---------------------------------------------------------------------------
-// MissionCharter
-// ---------------------------------------------------------------------------
+// --- MissionCharter
 
 /// Charter 生命周期状态。
 ///
@@ -113,10 +110,7 @@ impl MissionCharter {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Errors
-// ---------------------------------------------------------------------------
+// --- Errors
 
 #[derive(Debug, Error)]
 pub enum MissionCharterError {
@@ -214,10 +208,7 @@ pub fn validate_charter(charter: &MissionCharter) -> Result<(), MissionCharterEr
     }
     Ok(())
 }
-
-// ---------------------------------------------------------------------------
-// Store
-// ---------------------------------------------------------------------------
+// --- Store
 
 /// 单 workspace 范围的 mission charter 存储：负责 `~/.magi/projects/{slug}/missions/` 下
 /// 所有 mission 的 charter.md 读写。
@@ -325,10 +316,7 @@ impl MissionCharterStore {
         Ok(Some(out))
     }
 }
-
-// ---------------------------------------------------------------------------
-// Registry: 按 workspace_root 缓存 store
-// ---------------------------------------------------------------------------
+// --- Registry: 按 workspace_root 缓存 store
 
 pub struct MissionCharterRegistry {
     inner: RwLock<HashMap<String, Arc<MissionCharterStore>>>,
@@ -383,10 +371,7 @@ impl Default for MissionCharterRegistry {
         Self::new()
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tool argument parsing
-// ---------------------------------------------------------------------------
+// --- Tool argument parsing
 
 /// `mission_charter_write` 工具入参形态。
 #[derive(Debug)]
@@ -579,10 +564,7 @@ pub fn apply_charter_update(
     *charter = next;
     Ok(changed)
 }
-
-// ---------------------------------------------------------------------------
-// 序列化 / 反序列化（frontmatter + markdown body）
-// ---------------------------------------------------------------------------
+// --- 序列化 / 反序列化（frontmatter + markdown body）
 
 fn render_charter(charter: &MissionCharter) -> String {
     let mut out = String::new();
@@ -765,10 +747,7 @@ fn parse_bullets(section: &str) -> Vec<String> {
         })
         .collect()
 }
-
-// ---------------------------------------------------------------------------
-// 工具
-// ---------------------------------------------------------------------------
+// --- 工具
 
 fn dirs_home() -> Result<PathBuf, MissionCharterError> {
     let home = std::env::var_os("HOME")
@@ -776,10 +755,7 @@ fn dirs_home() -> Result<PathBuf, MissionCharterError> {
         .ok_or(MissionCharterError::HomeDirUnavailable)?;
     Ok(PathBuf::from(home).join(".magi"))
 }
-
-// ---------------------------------------------------------------------------
-// Tool entry：`mission_charter_write` 工具执行体
-// ---------------------------------------------------------------------------
+// --- Tool entry：`mission_charter_write` 工具执行体
 
 /// S11 工具下沉：把 `mission_charter_write` 完整执行体收口在本 crate。
 /// `store: None` 表示当前 task 未绑定 workspace，直接失败。首次写入必须同时
@@ -1033,10 +1009,7 @@ pub fn execute_mission_charter_write_tool(
     );
     (payload.to_string(), ExecutionResultStatus::Succeeded)
 }
-
-// ---------------------------------------------------------------------------
-// tests
-// ---------------------------------------------------------------------------
+// --- tests
 
 #[cfg(test)]
 mod tests {

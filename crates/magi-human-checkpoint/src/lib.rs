@@ -27,10 +27,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 use thiserror::Error;
-
-// ---------------------------------------------------------------------------
-// Status / Decision
-// ---------------------------------------------------------------------------
+// --- Status / Decision
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -79,10 +76,7 @@ impl HumanCheckpointDecision {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// HumanCheckpoint
-// ---------------------------------------------------------------------------
+// --- HumanCheckpoint
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HumanCheckpoint {
@@ -148,10 +142,7 @@ impl HumanCheckpointLog {
         self.entries.iter().filter(|e| e.status.is_pending())
     }
 }
-
-// ---------------------------------------------------------------------------
-// Errors
-// ---------------------------------------------------------------------------
+// --- Errors
 
 #[derive(Debug, Error)]
 pub enum HumanCheckpointError {
@@ -173,10 +164,7 @@ pub enum HumanCheckpointError {
         source: io::Error,
     },
 }
-
-// ---------------------------------------------------------------------------
-// Store
-// ---------------------------------------------------------------------------
+// --- Store
 
 pub struct HumanCheckpointStore {
     root: PathBuf,
@@ -388,10 +376,7 @@ impl HumanCheckpointStore {
         Ok(Some(out))
     }
 }
-
-// ---------------------------------------------------------------------------
-// Registry
-// ---------------------------------------------------------------------------
+// --- Registry
 
 pub struct HumanCheckpointRegistry {
     inner: RwLock<HashMap<String, Arc<HumanCheckpointStore>>>,
@@ -442,10 +427,7 @@ impl HumanCheckpointRegistry {
         Ok(arc)
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tool argument parsing
-// ---------------------------------------------------------------------------
+// --- Tool argument parsing
 
 #[derive(Debug)]
 pub struct HumanCheckpointRequestArgs {
@@ -518,10 +500,7 @@ pub fn append_human_checkpoint_request(
     log.updated_at = now;
     sequence
 }
-
-// ---------------------------------------------------------------------------
-// 序列化 / 反序列化（frontmatter + JSON-lines body）
-// ---------------------------------------------------------------------------
+// --- 序列化 / 反序列化（frontmatter + JSON-lines body）
 
 fn render_log(log: &HumanCheckpointLog) -> String {
     let mut out = String::new();
@@ -618,10 +597,7 @@ fn parse_log(raw: &str) -> Result<HumanCheckpointLog, HumanCheckpointError> {
         updated_at,
     })
 }
-
-// ---------------------------------------------------------------------------
-// helpers
-// ---------------------------------------------------------------------------
+// --- helpers
 
 fn dirs_home() -> Result<PathBuf, HumanCheckpointError> {
     let base = std::env::var_os("HOME")
@@ -629,10 +605,7 @@ fn dirs_home() -> Result<PathBuf, HumanCheckpointError> {
         .ok_or(HumanCheckpointError::HomeDirUnavailable)?;
     Ok(base.join(".magi"))
 }
-
-// ---------------------------------------------------------------------------
-// Orchestration tool entry：human_checkpoint_request
-// ---------------------------------------------------------------------------
+// --- Orchestration tool entry：human_checkpoint_request
 
 /// S17：`human_checkpoint_request` 工具实现。append-only 写入 mission 维度的
 /// `human_checkpoints.md`，状态为 Pending；resolve 由 operator 侧另起 API 调用。
@@ -759,10 +732,7 @@ pub fn execute_human_checkpoint_request_tool(
     );
     (payload.to_string(), ExecutionResultStatus::Succeeded)
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
+// --- Tests
 
 #[cfg(test)]
 mod tests {

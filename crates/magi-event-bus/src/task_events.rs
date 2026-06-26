@@ -1,32 +1,24 @@
 use crate::EventEnvelope;
 use magi_core::{EventId, UtcMillis};
 use serde_json::json;
+// --- Task submission lifecycle
 
-// ---------------------------------------------------------------------------
-// Task submission lifecycle
-// ---------------------------------------------------------------------------
 pub const TASK_SUBMISSION_CREATED: &str = "task.submission.created";
+// --- Task status transitions
 
-// ---------------------------------------------------------------------------
-// Task status transitions
-// ---------------------------------------------------------------------------
 pub const TASK_STATUS_CHANGED: &str = "task.status.changed";
 pub const TASK_RUNNING: &str = "task.running";
 pub const TASK_COMPLETED: &str = "task.completed";
 pub const TASK_FAILED: &str = "task.failed";
 pub const TASK_KILLED: &str = "task.killed";
+// --- Lease lifecycle
 
-// ---------------------------------------------------------------------------
-// Lease lifecycle
-// ---------------------------------------------------------------------------
 pub const LEASE_GRANTED: &str = "task.lease.granted";
 pub const LEASE_COMPLETED: &str = "task.lease.completed";
 pub const LEASE_EXPIRED: &str = "task.lease.expired";
 pub const LEASE_REVOKED: &str = "task.lease.revoked";
+// --- Checkpoint
 
-// ---------------------------------------------------------------------------
-// Checkpoint
-// ---------------------------------------------------------------------------
 pub const CHECKPOINT_SAVED: &str = "task.checkpoint.saved";
 pub const CHECKPOINT_RESTORED: &str = "task.checkpoint.restored";
 
@@ -38,10 +30,7 @@ pub const MISSION_RESUMED_FROM_RECOVERY: &str = "mission.resumed.from_recovery";
 pub const MISSION_HUMAN_CHECKPOINT_APPROVED: &str = "mission.human_checkpoint.resolved.approved";
 pub const MISSION_HUMAN_CHECKPOINT_REJECTED: &str = "mission.human_checkpoint.resolved.rejected";
 pub const MISSION_PLAN_STEP_COMPLETED: &str = "mission.plan_step.completed";
-
-// ---------------------------------------------------------------------------
-// Helper functions — build properly structured EventEnvelope instances
-// ---------------------------------------------------------------------------
+// --- Helper functions — build properly structured EventEnvelope instances
 
 /// Create a domain event for a task status transition.
 pub fn task_status_changed_event(

@@ -26,10 +26,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 use thiserror::Error;
-
-// ---------------------------------------------------------------------------
-// CheckpointKind
-// ---------------------------------------------------------------------------
+// --- CheckpointKind
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -76,10 +73,7 @@ impl CheckpointKind {
         )
     }
 }
-
-// ---------------------------------------------------------------------------
-// ConversationCheckpoint / Checkpoint
-// ---------------------------------------------------------------------------
+// --- ConversationCheckpoint / Checkpoint
 
 /// 单个 Conversation 在 Checkpoint 时刻的恢复指针。模型只需要看到 session_id /
 /// recovery_ref 这两个真正用于"重启时找回 active chain"的字段。
@@ -239,10 +233,7 @@ impl CheckpointLog {
             .unwrap_or(1)
     }
 }
-
-// ---------------------------------------------------------------------------
-// Errors
-// ---------------------------------------------------------------------------
+// --- Errors
 
 #[derive(Debug, Error)]
 pub enum CheckpointError {
@@ -266,10 +257,7 @@ pub enum CheckpointError {
         source: io::Error,
     },
 }
-
-// ---------------------------------------------------------------------------
-// Store
-// ---------------------------------------------------------------------------
+// --- Store
 
 pub struct CheckpointStore {
     root: PathBuf,
@@ -383,10 +371,7 @@ impl CheckpointStore {
         Ok(Some(out))
     }
 }
-
-// ---------------------------------------------------------------------------
-// Registry
-// ---------------------------------------------------------------------------
+// --- Registry
 
 /// 进程级缓存，按 workspace_root 聚合 CheckpointStore。HOME 不可用时退到
 /// `$TMPDIR/magi-checkpoint`，与同 Tier 其它 crate 行为一致。
@@ -439,10 +424,7 @@ impl CheckpointRegistry {
         Ok(arc)
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tool argument parsing
-// ---------------------------------------------------------------------------
+// --- Tool argument parsing
 
 #[derive(Debug)]
 pub struct CheckpointCreateArgs {
@@ -588,10 +570,7 @@ pub fn append_checkpoint(
     log.updated_at = now;
     Ok(sequence)
 }
-
-// ---------------------------------------------------------------------------
-// 序列化 / 反序列化（frontmatter + JSON-lines body）
-// ---------------------------------------------------------------------------
+// --- 序列化 / 反序列化（frontmatter + JSON-lines body）
 
 fn render_log(log: &CheckpointLog) -> String {
     let mut out = String::new();
@@ -675,10 +654,7 @@ fn parse_log(raw: &str) -> Result<CheckpointLog, CheckpointError> {
         updated_at,
     })
 }
-
-// ---------------------------------------------------------------------------
-// helpers
-// ---------------------------------------------------------------------------
+// --- helpers
 
 fn dirs_home() -> Result<PathBuf, CheckpointError> {
     let base = std::env::var_os("HOME")
@@ -686,10 +662,7 @@ fn dirs_home() -> Result<PathBuf, CheckpointError> {
         .ok_or(CheckpointError::HomeDirUnavailable)?;
     Ok(base.join(".magi"))
 }
-
-// ---------------------------------------------------------------------------
-// Orchestration tool entry：checkpoint_create
-// ---------------------------------------------------------------------------
+// --- Orchestration tool entry：checkpoint_create
 
 /// S16：`checkpoint_create` 工具实现。append-only 写入 mission 维度的
 /// `checkpoints.md`，并通过 `task.checkpoint.appended` 域事件广播给观察者。
@@ -834,10 +807,7 @@ pub fn execute_checkpoint_create_tool(
     );
     (payload.to_string(), ExecutionResultStatus::Succeeded)
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
+// --- Tests
 
 #[cfg(test)]
 mod tests {

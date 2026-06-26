@@ -941,10 +941,7 @@ pub struct SessionProjectionInput {
     pub canonical_turns: Vec<CanonicalTurn>,
     pub notifications: Vec<NotificationRecord>,
 }
-
-// ---------------------------------------------------------------------------
-// P6 Thread 原语（Y 方案）
-// ---------------------------------------------------------------------------
+// --- P6 Thread 原语（Y 方案）
 
 /// Thread 的生命周期状态。
 ///

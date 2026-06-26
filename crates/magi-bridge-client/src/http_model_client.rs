@@ -761,10 +761,7 @@ impl HttpModelBridgeClient {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// OpenAI response types -- mirrors model_loopback.rs for consistency
-// ---------------------------------------------------------------------------
+// --- OpenAI response types -- mirrors model_loopback.rs for consistency
 
 #[derive(Debug, Deserialize)]
 struct OpenAiCompatibleChatCompletionEnvelope {

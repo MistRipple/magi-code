@@ -26,10 +26,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 use thiserror::Error;
-
-// ---------------------------------------------------------------------------
-// ValidationKind / ValidationOutcome
-// ---------------------------------------------------------------------------
+// --- ValidationKind / ValidationOutcome
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -91,10 +88,7 @@ impl ValidationOutcome {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// ValidationRecord / ValidationReport
-// ---------------------------------------------------------------------------
+// --- ValidationRecord / ValidationReport
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ValidationRecord {
@@ -152,10 +146,7 @@ impl ValidationReport {
         saw_pass
     }
 }
-
-// ---------------------------------------------------------------------------
-// Errors
-// ---------------------------------------------------------------------------
+// --- Errors
 
 #[derive(Debug, Error)]
 pub enum ValidationError {
@@ -170,10 +161,7 @@ pub enum ValidationError {
         source: io::Error,
     },
 }
-
-// ---------------------------------------------------------------------------
-// Store
-// ---------------------------------------------------------------------------
+// --- Store
 
 pub struct ValidationStore {
     root: PathBuf,
@@ -281,10 +269,7 @@ impl ValidationStore {
         Ok(Some(out))
     }
 }
-
-// ---------------------------------------------------------------------------
-// Registry
-// ---------------------------------------------------------------------------
+// --- Registry
 
 /// 进程级缓存，按 workspace_root 聚合 ValidationStore。HOME 不可用时退到
 /// `$TMPDIR/magi-validation-runner`，与同 Tier 其它 crate 行为一致。
@@ -337,10 +322,7 @@ impl ValidationRunnerRegistry {
         Ok(arc)
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tool argument parsing
-// ---------------------------------------------------------------------------
+// --- Tool argument parsing
 
 #[derive(Debug)]
 pub struct ValidationRecordArgs {
@@ -446,10 +428,7 @@ pub fn apply_validation_record(
     report.updated_at = now;
     true
 }
-
-// ---------------------------------------------------------------------------
-// 序列化 / 反序列化（frontmatter + JSON-lines body）
-// ---------------------------------------------------------------------------
+// --- 序列化 / 反序列化（frontmatter + JSON-lines body）
 
 fn render_report(report: &ValidationReport) -> String {
     let mut out = String::new();
@@ -533,10 +512,7 @@ fn parse_report(raw: &str) -> Result<ValidationReport, ValidationError> {
         updated_at,
     })
 }
-
-// ---------------------------------------------------------------------------
-// helpers
-// ---------------------------------------------------------------------------
+// --- helpers
 
 fn dirs_home() -> Result<PathBuf, ValidationError> {
     let base = std::env::var_os("HOME")
@@ -544,10 +520,7 @@ fn dirs_home() -> Result<PathBuf, ValidationError> {
         .ok_or(ValidationError::HomeDirUnavailable)?;
     Ok(base.join(".magi"))
 }
-
-// ---------------------------------------------------------------------------
-// Tool entry：`validation_record` 工具执行体
-// ---------------------------------------------------------------------------
+// --- Tool entry：`validation_record` 工具执行体
 
 /// S15 工具下沉：`validation_record` 完整执行体收口在本 crate。`(plan_step_id, kind)`
 /// 唯一，重复写入按 upsert 处理并 bump version。
@@ -671,10 +644,7 @@ pub fn execute_validation_record_tool(
     );
     (payload.to_string(), ExecutionResultStatus::Succeeded)
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
+// --- Tests
 
 #[cfg(test)]
 mod tests {

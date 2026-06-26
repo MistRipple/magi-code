@@ -7,7 +7,6 @@ edition.workspace = true
 # sidecar 文件：`<magi_home>/projects/<slug>/missions/<mission_id>/metrics.md`。
 [dependencies]
 serde.workspace = true
-serde_json.workspace = true
 thiserror.workspace = true
 magi-core = { path = "../magi-core" }
 

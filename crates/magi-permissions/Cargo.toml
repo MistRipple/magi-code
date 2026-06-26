@@ -7,4 +7,3 @@ edition.workspace = true
 magi-core = { path = "../magi-core" }
 serde.workspace = true
 serde_json.workspace = true
-thiserror.workspace = true

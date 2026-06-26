@@ -22,10 +22,7 @@
 use magi_core::AccessProfile;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-
-// ---------------------------------------------------------------------------
-// PermissionRequest / Decision
-// ---------------------------------------------------------------------------
+// --- PermissionRequest / Decision
 
 /// 三个维度的调用请求。caller 在工具调用前构造，引擎据此判定。
 #[derive(Clone, Debug)]
@@ -78,10 +75,7 @@ impl Decision {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// PermissionPolicy（Task / Mission 维度的具体规则集）
-// ---------------------------------------------------------------------------
+// --- PermissionPolicy（Task / Mission 维度的具体规则集）
 
 /// 单条权限策略快照：直接由 `magi_core::TaskPolicy` 映射而来，引擎不持久化
 /// 自己的规则，只在 decide 时按需读。
@@ -110,10 +104,7 @@ impl PermissionPolicy {
         self.command_mode.eq_ignore_ascii_case("read_only")
     }
 }
-
-// ---------------------------------------------------------------------------
-// PermissionEngine
-// ---------------------------------------------------------------------------
+// --- PermissionEngine
 
 /// 进程内单例：注入到 dispatch 入口。引擎本身无可变状态，可任意 clone。
 #[derive(Clone, Debug, Default)]

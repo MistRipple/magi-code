@@ -21,10 +21,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 use thiserror::Error;
-
-// ---------------------------------------------------------------------------
-// MemoryKind / MemoryEntry
-// ---------------------------------------------------------------------------
+// --- MemoryKind / MemoryEntry
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -69,10 +66,7 @@ pub struct MemoryEntry {
     /// 正文 markdown。
     pub body: String,
 }
-
-// ---------------------------------------------------------------------------
-// Errors
-// ---------------------------------------------------------------------------
+// --- Errors
 
 #[derive(Debug, Error)]
 pub enum ProjectMemoryError {
@@ -92,10 +86,7 @@ pub enum ProjectMemoryError {
         source: io::Error,
     },
 }
-
-// ---------------------------------------------------------------------------
-// ProjectMemoryStore
-// ---------------------------------------------------------------------------
+// --- ProjectMemoryStore
 
 /// 单一项目的 memory 仓库，绑定 `~/.magi/projects/{slug}/memory/` 物理目录。
 /// 读写操作直落文件系统：单 process 内通过 `ProjectMemoryRegistry` 共享同一实例
@@ -308,10 +299,7 @@ impl ProjectMemoryStore {
         fs::write(&path, out).map_err(|source| ProjectMemoryError::Io { path, source })
     }
 }
-
-// ---------------------------------------------------------------------------
-// Registry
-// ---------------------------------------------------------------------------
+// --- Registry
 
 /// 同 process 内复用 store 实例的注册表。key = workspace_root 字符串。
 pub struct ProjectMemoryRegistry {
@@ -360,10 +348,7 @@ impl ProjectMemoryRegistry {
         Ok(arc)
     }
 }
-
-// ---------------------------------------------------------------------------
-// memory_write tool 参数解析
-// ---------------------------------------------------------------------------
+// --- memory_write tool 参数解析
 
 #[derive(Debug, Error)]
 pub enum MemoryWriteError {
@@ -469,10 +454,7 @@ pub fn parse_memory_write_arguments(raw: &str) -> Result<MemoryWriteAction, Memo
         other => Err(MemoryWriteError::UnknownAction(other.to_string())),
     }
 }
-
-// ---------------------------------------------------------------------------
-// helpers
-// ---------------------------------------------------------------------------
+// --- helpers
 
 fn magi_home_dir() -> Result<PathBuf, ProjectMemoryError> {
     dirs::home_dir()
@@ -561,10 +543,7 @@ fn parse_entry(file_stem: &str, raw: &str) -> Result<MemoryEntry, ProjectMemoryE
         body,
     })
 }
-
-// ---------------------------------------------------------------------------
-// Tool entry：`memory_write` 工具执行体
-// ---------------------------------------------------------------------------
+// --- Tool entry：`memory_write` 工具执行体
 
 /// S10 工具下沉：把 `memory_write` 完整执行体收口在本 crate，conversation_loop
 /// 不再持有该业务。`store: Option<...>` 仍由调用方按 workspace 绑定决定是否注入；
@@ -693,10 +672,7 @@ pub fn execute_memory_write_tool(
     );
     (payload.to_string(), status)
 }
-
-// ---------------------------------------------------------------------------
-// tests
-// ---------------------------------------------------------------------------
+// --- tests
 
 #[cfg(test)]
 mod tests {

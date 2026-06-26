@@ -23,10 +23,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 use thiserror::Error;
-
-// ---------------------------------------------------------------------------
-// KnowledgeFact
-// ---------------------------------------------------------------------------
+// --- KnowledgeFact
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -93,10 +90,7 @@ impl KnowledgeGraph {
         self.facts.iter_mut().find(|f| f.kind == kind && f.id == id)
     }
 }
-
-// ---------------------------------------------------------------------------
-// Errors
-// ---------------------------------------------------------------------------
+// --- Errors
 
 #[derive(Debug, Error)]
 pub enum KnowledgeGraphError {
@@ -111,10 +105,7 @@ pub enum KnowledgeGraphError {
         source: io::Error,
     },
 }
-
-// ---------------------------------------------------------------------------
-// Store
-// ---------------------------------------------------------------------------
+// --- Store
 
 pub struct KnowledgeGraphStore {
     root: PathBuf,
@@ -220,10 +211,7 @@ impl KnowledgeGraphStore {
         Ok(Some(out))
     }
 }
-
-// ---------------------------------------------------------------------------
-// Registry
-// ---------------------------------------------------------------------------
+// --- Registry
 
 /// 进程级缓存，按 workspace_root 聚合 KnowledgeGraphStore。
 /// HOME 不可用时退到 `$TMPDIR/magi-knowledge-graph`，与同 Tier 其它 crate 行为一致。
@@ -271,10 +259,7 @@ impl KnowledgeGraphRegistry {
         Ok(arc)
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tool argument parsing
-// ---------------------------------------------------------------------------
+// --- Tool argument parsing
 
 #[derive(Debug)]
 pub struct KnowledgeWriteArgs {
@@ -405,10 +390,8 @@ pub fn apply_kg_update(
     graph.updated_at = now;
     true
 }
+// --- 序列化 / 反序列化（frontmatter + JSON-lines body）
 
-// ---------------------------------------------------------------------------
-// 序列化 / 反序列化（frontmatter + JSON-lines body）
-// ---------------------------------------------------------------------------
 //
 // 事实表是结构化的，不适合像 charter / plan 那样用 markdown 列表表达——一旦多字段
 // 就会出现解析歧义。这里用 frontmatter 描述 mission 维度，body 每行一条 JSON，
@@ -507,10 +490,7 @@ fn parse_graph(raw: &str) -> Result<KnowledgeGraph, KnowledgeGraphError> {
         updated_at,
     })
 }
-
-// ---------------------------------------------------------------------------
-// helpers
-// ---------------------------------------------------------------------------
+// --- helpers
 
 fn dirs_home() -> Result<PathBuf, KnowledgeGraphError> {
     let base = std::env::var_os("HOME")
@@ -518,10 +498,7 @@ fn dirs_home() -> Result<PathBuf, KnowledgeGraphError> {
         .ok_or(KnowledgeGraphError::HomeDirUnavailable)?;
     Ok(base.join(".magi"))
 }
-
-// ---------------------------------------------------------------------------
-// Tool entry：`kg_write` 工具执行体
-// ---------------------------------------------------------------------------
+// --- Tool entry：`kg_write` 工具执行体
 
 /// S14 工具下沉：`kg_write` 完整执行体收口在本 crate。`store: None` 表示当前
 /// task 未绑定 workspace，直接失败。
@@ -639,10 +616,7 @@ pub fn execute_kg_write_tool(
     );
     (payload.to_string(), ExecutionResultStatus::Succeeded)
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
+// --- Tests
 
 #[cfg(test)]
 mod tests {

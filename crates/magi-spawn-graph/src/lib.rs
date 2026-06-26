@@ -36,10 +36,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use magi_core::ids::TaskId;
 use magi_core::task::{Task, TaskKind, TaskStatus};
 use magi_core::value_objects::UtcMillis;
-
-// ---------------------------------------------------------------------------
-// SpawnEdge / SpawnEdgeStatus
-// ---------------------------------------------------------------------------
+// --- SpawnEdge / SpawnEdgeStatus
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SpawnEdgeStatus {
@@ -64,10 +61,7 @@ pub struct SpawnGraphRebuildReport {
     pub closed_edges: usize,
     pub skipped_edges: usize,
 }
-
-// ---------------------------------------------------------------------------
-// SpawnGraphLimits
-// ---------------------------------------------------------------------------
+// --- SpawnGraphLimits
 
 /// 安全阀：限制深度与扇出，防止 agent 自己 spawn 自己导致无限派生。
 #[derive(Clone, Copy, Debug)]
@@ -86,10 +80,7 @@ impl Default for SpawnGraphLimits {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Errors
-// ---------------------------------------------------------------------------
+// --- Errors
 
 #[derive(Debug, thiserror::Error)]
 pub enum SpawnGraphError {
@@ -108,10 +99,7 @@ pub enum SpawnGraphError {
     #[error("child {child} not found in graph")]
     UnknownChild { child: TaskId },
 }
-
-// ---------------------------------------------------------------------------
-// SpawnGraph
-// ---------------------------------------------------------------------------
+// --- SpawnGraph
 
 /// 父子拓扑表。结构本身不持有 Conversation/Mailbox 引用，只回答"谁是谁的父亲"
 /// 这一纯拓扑问题。Caller 决定怎么把回执投递到对应 Mailbox。

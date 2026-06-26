@@ -2123,10 +2123,7 @@ fn execution_sidecar_flush_hook_only_persists_dirty_sidecars() {
             .expect("clean sidecar flush should be skipped")
     );
 }
-
-// ---------------------------------------------------------------------------
-// P6a Thread registry tests
-// ---------------------------------------------------------------------------
+// --- P6a Thread registry tests
 
 fn sample_thread(
     thread_id: &str,

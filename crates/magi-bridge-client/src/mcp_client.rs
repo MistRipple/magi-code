@@ -356,10 +356,7 @@ pub struct McpToolInfo {
     #[serde(default, rename = "inputSchema")]
     pub input_schema: Option<Value>,
 }
-
-// ---------------------------------------------------------------------------
-// Internal helpers
-// ---------------------------------------------------------------------------
+// --- Internal helpers
 
 fn send_json(writer: &mut impl Write, value: &Value) -> Result<(), BridgeClientError> {
     let json = serde_json::to_string(value).map_err(|error| BridgeClientError::CallFailed {

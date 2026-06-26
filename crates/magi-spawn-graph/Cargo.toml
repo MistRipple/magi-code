@@ -5,5 +5,4 @@ edition.workspace = true
 
 [dependencies]
 magi-core = { path = "../magi-core" }
-serde.workspace = true
 thiserror.workspace = true

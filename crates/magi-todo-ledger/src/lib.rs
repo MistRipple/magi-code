@@ -17,10 +17,7 @@ use std::{
     collections::HashMap,
     sync::{Arc, RwLock},
 };
-
-// ---------------------------------------------------------------------------
-// TodoStatus / TodoItem
-// ---------------------------------------------------------------------------
+// --- TodoStatus / TodoItem
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -78,10 +75,7 @@ impl TodoItem {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// TodoLedger（per-session 实例）
-// ---------------------------------------------------------------------------
+// --- TodoLedger（per-session 实例）
 
 /// 单 session 的 todo 列表。`todo_write` 用入参整体替换；外部读者通过 `snapshot`
 /// 拿到一份只读复制。线程安全：内部 `RwLock`，并发场景下读多写少。
@@ -145,10 +139,7 @@ impl TodoLedger {
         Some(lines.join("\n"))
     }
 }
-
-// ---------------------------------------------------------------------------
-// TodoLedgerRegistry（session → ledger）
-// ---------------------------------------------------------------------------
+// --- TodoLedgerRegistry（session → ledger）
 
 /// 进程内 session→ledger 索引。`LlmTaskDispatcher` 注入一份 `Arc<TodoLedgerRegistry>`，
 /// 每个 conversation_loop 在自己 session 下取 ledger。
@@ -203,10 +194,7 @@ impl TodoLedgerRegistry {
         guard.remove(session_id);
     }
 }
-
-// ---------------------------------------------------------------------------
-// 入参解析（`todo_write` 工具的 arguments JSON）
-// ---------------------------------------------------------------------------
+// --- 入参解析（`todo_write` 工具的 arguments JSON）
 
 /// `todo_write` 调用入参形如：
 /// ```json
@@ -266,10 +254,7 @@ pub enum TodoWriteError {
     #[error("todo_write arguments.todos 必须是数组")]
     TodosNotArray,
 }
-
-// ---------------------------------------------------------------------------
-// Tool entry：`todo_write` 工具执行体
-// ---------------------------------------------------------------------------
+// --- Tool entry：`todo_write` 工具执行体
 
 /// S9 工具下沉：把 `todo_write` 的完整执行体收口在本 crate，conversation_loop
 /// 不再持有这段业务，由 crate 自身承担实现。
@@ -333,10 +318,7 @@ pub fn execute_todo_write_tool(
         ),
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
+// --- Tests
 
 #[cfg(test)]
 mod tests {

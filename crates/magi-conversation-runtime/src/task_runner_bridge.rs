@@ -34,10 +34,7 @@ pub enum TaskDispatchGateDecision {
 }
 
 pub type TaskDispatchGate = dyn Fn(&Task) -> Result<TaskDispatchGateDecision, String> + Send + Sync;
-
-// ---------------------------------------------------------------------------
-// Dispatch callback trait
-// ---------------------------------------------------------------------------
+// --- Dispatch callback trait
 
 /// Trait for dispatching a matched task to a worker for execution.
 ///
@@ -47,10 +44,7 @@ pub type TaskDispatchGate = dyn Fn(&Task) -> Result<TaskDispatchGateDecision, St
 pub trait TaskDispatcher: Send + Sync {
     fn dispatch(&self, task: &Task, worker: &WorkerInfo, lease: &TaskLease) -> Result<(), String>;
 }
-
-// ---------------------------------------------------------------------------
-// Result receiver trait
-// ---------------------------------------------------------------------------
+// --- Result receiver trait
 
 /// The outcome of a single task execution, reported back to the Runner.
 #[derive(Clone, Debug)]
@@ -76,10 +70,7 @@ pub enum TaskOutcome {
 pub trait TaskResultReceiver: Send + Sync {
     fn poll_results(&self) -> Vec<TaskResult>;
 }
-
-// ---------------------------------------------------------------------------
-// Event-based result receiver
-// ---------------------------------------------------------------------------
+// --- Event-based result receiver
 
 /// A result receiver that collects results pushed externally (e.g. from a
 /// `StatusChangeCallback` on the TaskStore) and returns them when polled.

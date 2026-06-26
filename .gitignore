@@ -20,6 +20,7 @@ yarn-error.log*
 # --- Project Specific ---
 /dist/
 /tmp/
+/_temp/
 /.magi/
 *.log
 *.pid

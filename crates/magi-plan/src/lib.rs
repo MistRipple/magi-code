@@ -38,10 +38,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 use thiserror::Error;
-
-// ---------------------------------------------------------------------------
-// Plan / PlanStep
-// ---------------------------------------------------------------------------
+// --- Plan / PlanStep
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -102,10 +99,7 @@ impl Plan {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Errors
-// ---------------------------------------------------------------------------
+// --- Errors
 
 #[derive(Debug, Error)]
 pub enum PlanError {
@@ -127,10 +121,7 @@ pub enum PlanError {
     )]
     ValidationEvidenceMissing { step_id: String },
 }
-
-// ---------------------------------------------------------------------------
-// Store
-// ---------------------------------------------------------------------------
+// --- Store
 
 pub struct PlanStore {
     root: PathBuf,
@@ -221,10 +212,7 @@ impl PlanStore {
         Ok(Some(out))
     }
 }
-
-// ---------------------------------------------------------------------------
-// Registry
-// ---------------------------------------------------------------------------
+// --- Registry
 
 /// 进程级缓存，按 workspace_root 聚合 PlanStore。失败时回退到 `$TMPDIR/magi-plan`，
 /// 避免 home 目录不可写导致整路径不可用。
@@ -272,10 +260,7 @@ impl PlanRegistry {
         Ok(arc)
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tool argument parsing
-// ---------------------------------------------------------------------------
+// --- Tool argument parsing
 
 #[derive(Debug)]
 pub struct PlanWriteArgs {
@@ -305,7 +290,7 @@ pub fn parse_plan_write_arguments(raw: &serde_json::Value) -> Result<PlanWriteAr
         })?;
     if arr.is_empty() {
         return Err(PlanError::InvalidPlan {
-            reason: "steps 至少需要一项；若想清空 plan 请改用 plan_clear 工具（暂未实现）"
+            reason: "steps 至少需要一项；plan_write 总是整表替换当前计划，不支持空计划。若某步骤已废弃，请保留它并将 status 置为 cancelled，而不是清空 steps。"
                 .to_string(),
         });
     }
@@ -482,10 +467,7 @@ pub fn apply_plan_update(
         newly_completed_steps,
     })
 }
-
-// ---------------------------------------------------------------------------
-// 序列化 / 反序列化（frontmatter + markdown body）
-// ---------------------------------------------------------------------------
+// --- 序列化 / 反序列化（frontmatter + markdown body）
 
 fn render_plan(plan: &Plan) -> String {
     let mut out = String::new();
@@ -630,10 +612,7 @@ fn parse_plan(raw: &str) -> Result<Plan, PlanError> {
         updated_at,
     })
 }
-
-// ---------------------------------------------------------------------------
-// helpers
-// ---------------------------------------------------------------------------
+// --- helpers
 
 fn dirs_home() -> Result<PathBuf, PlanError> {
     // 与 ProjectMemory / MissionCharter 共用 ~/.magi 作为 magi 主目录根。
@@ -642,10 +621,7 @@ fn dirs_home() -> Result<PathBuf, PlanError> {
         .ok_or(PlanError::HomeDirUnavailable)?;
     Ok(base.join(".magi"))
 }
-
-// ---------------------------------------------------------------------------
-// Tool entry：`plan_write` 工具执行体
-// ---------------------------------------------------------------------------
+// --- Tool entry：`plan_write` 工具执行体
 
 /// S12 工具下沉：`plan_write` 完整执行体收口在本 crate。`store: None` 表示当前
 /// task 未绑定 workspace，直接失败。空 plan 自动创建后再 apply 更新。
@@ -838,10 +814,7 @@ pub fn execute_plan_write_tool(
     }
     (payload.to_string(), ExecutionResultStatus::Succeeded)
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
+// --- Tests
 
 #[cfg(test)]
 mod tests {
@@ -908,7 +881,11 @@ mod tests {
     fn parse_plan_write_arguments_rejects_empty_steps() {
         let err = parse_plan_write_arguments(&serde_json::json!({ "steps": [] })).unwrap_err();
         match err {
-            PlanError::InvalidPlan { reason } => assert!(reason.contains("至少需要一项")),
+            PlanError::InvalidPlan { reason } => {
+                assert!(reason.contains("至少需要一项"));
+                // 文案不得再引用不存在的 plan_clear 工具
+                assert!(!reason.contains("plan_clear"));
+            }
             other => panic!("unexpected error: {other:?}"),
         }
     }

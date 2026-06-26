@@ -17,10 +17,7 @@
 //!   上层 ToolPreflight 统一决定，SafetyGate 本身不持有用户授权状态。
 
 use serde::{Deserialize, Serialize};
-
-// ---------------------------------------------------------------------------
-// SafetyCategory / SafetyRule
-// ---------------------------------------------------------------------------
+// --- SafetyCategory / SafetyRule
 
 /// 规则分类。分类用于审计和默认动作推导，真正裁决由 `SafetyAction` 表达。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -118,10 +115,7 @@ impl SafetyRule {
             .contains(&pattern.to_ascii_lowercase())
     }
 }
-
-// ---------------------------------------------------------------------------
-// Decision
-// ---------------------------------------------------------------------------
+// --- Decision
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -196,10 +190,7 @@ impl SafetyDecision {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// SafetyGate
-// ---------------------------------------------------------------------------
+// --- SafetyGate
 
 /// 进程内单例：依据当前 settings 中的 safeguardConfig.rules 构造一次，
 /// 每次工具调用前 evaluate。无可变状态，可 clone 任意分发。
@@ -365,10 +356,7 @@ pub fn builtin_rules() -> Vec<SafetyRule> {
         .map(|(pattern, category)| SafetyRule::new(*pattern, *category))
         .collect()
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
+// --- Tests
 
 #[cfg(test)]
 mod tests {

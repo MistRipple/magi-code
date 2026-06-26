@@ -280,10 +280,7 @@ fn enumerate_resumable_missions_returns_empty_when_root_absent() {
     let ids = enumerate_resumable_missions(h.workspace(), h.home()).unwrap();
     assert!(ids.is_empty());
 }
-
-// ---------------------------------------------------------------------------
-// lifecycle_phase 派生
-// ---------------------------------------------------------------------------
+// --- lifecycle_phase 派生
 
 impl Harness {
     fn write_charter_frozen(&self, mission_id: &MissionId) {

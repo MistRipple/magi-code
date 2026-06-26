@@ -112,10 +112,7 @@ pub enum TaskTier {
 fn default_task_tier() -> TaskTier {
     TaskTier::ExecutionChain
 }
-
-// ---------------------------------------------------------------------------
-// AccessProfile
-// ---------------------------------------------------------------------------
+// --- AccessProfile
 
 /// 产品级访问模式。它是用户可理解的主权限心智，运行期只从这个枚举读取权限。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -152,10 +149,7 @@ impl std::str::FromStr for AccessProfile {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// TaskPolicy
-// ---------------------------------------------------------------------------
+// --- TaskPolicy
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TaskPolicy {
@@ -184,10 +178,7 @@ pub enum TaskRuntimePayload {
     #[default]
     None,
 }
-
-// ---------------------------------------------------------------------------
-// Task
-// ---------------------------------------------------------------------------
+// --- Task
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Task {
@@ -241,10 +232,7 @@ impl Task {
         self.executor_binding_str("exclusive_scope")
     }
 }
-
-// ---------------------------------------------------------------------------
-// TaskProjection (view contract)
-// ---------------------------------------------------------------------------
+// --- TaskProjection (view contract)
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TaskProjection {
