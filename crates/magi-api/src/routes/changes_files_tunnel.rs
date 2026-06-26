@@ -887,14 +887,25 @@ fn score_lan_candidate(iface: &str, addr: &str) -> i32 {
         score += 30;
     } else if addr.starts_with("10.") {
         score += 20;
-    } else if addr.starts_with("172.") {
+    } else if addr_in_172_private_range(addr) {
         score += 10;
-    }
-    // 简化判断
-    else {
+    } else {
+        // 既非 RFC1918 私网，也非链路本地，多半是公网/异常地址，降权。
         score -= 20;
     }
     score
+}
+
+/// 判断地址是否落在 `172.16.0.0/12`（即第二段 16..=31）私网区间。
+/// `starts_with("172.")` 会把公网 `172.0`/`172.32` 等也误判为私网，故按段精确比较。
+fn addr_in_172_private_range(addr: &str) -> bool {
+    let Some(rest) = addr.strip_prefix("172.") else {
+        return false;
+    };
+    let Some(second_octet) = rest.split('.').next() else {
+        return false;
+    };
+    matches!(second_octet.parse::<u8>(), Ok(16..=31))
 }
 
 fn fallback_udp_ip() -> String {
@@ -1040,6 +1051,22 @@ mod tests {
     use tower::ServiceExt;
 
     static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+    #[test]
+    fn score_lan_candidate_172_private_range_is_octet_accurate() {
+        // 172.16.0.0/12 内的地址按私网加分。
+        assert!(score_lan_candidate("en0", "172.16.0.1") > 0);
+        assert!(score_lan_candidate("en0", "172.31.255.254") > 0);
+        // 区间外的 172. 公网地址不应被当作私网，应落入降权分支。
+        assert!(score_lan_candidate("en0", "172.15.0.1") < score_lan_candidate("en0", "172.16.0.1"));
+        assert!(score_lan_candidate("en0", "172.32.0.1") < score_lan_candidate("en0", "172.16.0.1"));
+        // 直接验证段判定函数边界。
+        assert!(addr_in_172_private_range("172.16.0.0"));
+        assert!(addr_in_172_private_range("172.31.0.0"));
+        assert!(!addr_in_172_private_range("172.15.0.0"));
+        assert!(!addr_in_172_private_range("172.32.0.0"));
+        assert!(!addr_in_172_private_range("172.abc"));
+    }
 
     fn unique_temp_dir(prefix: &str) -> PathBuf {
         let unique = TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
