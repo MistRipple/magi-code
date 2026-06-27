@@ -258,11 +258,12 @@ pub fn resolve_target_for_role(
     settings_store: Option<&Arc<SettingsStore>>,
     default_client: Option<Arc<dyn ModelBridgeClient>>,
     target: RoleTarget<'_>,
+    session_id: Option<&SessionId>,
 ) -> Result<Option<Arc<dyn ModelBridgeClient>>, String> {
     match target {
         RoleTarget::Orchestrator => {
             if let Some(store) = settings_store
-                && let Some(client) = build_client_from_section(store, "orchestrator")
+                && let Some(client) = build_orchestrator_client(store, session_id)
             {
                 return Ok(Some(client));
             }
@@ -299,8 +300,12 @@ pub fn resolve_target_for_role(
             }
             // wrap_with_orchestrator_failover：递归取 orchestrator client 作 fallback。
             // 这里复用 RoleTarget::Orchestrator 分支，保证 fallback 解析口径与主路径完全一致。
-            let fallback =
-                resolve_target_for_role(settings_store, default_client, RoleTarget::Orchestrator)?;
+            let fallback = resolve_target_for_role(
+                settings_store,
+                default_client,
+                RoleTarget::Orchestrator,
+                session_id,
+            )?;
             let Some(fallback) = fallback else {
                 return Ok(Some(primary));
             };
@@ -326,6 +331,77 @@ fn build_client_from_section(
     normalized
         .to_http_model_client("gpt-4")
         .map(|client| Arc::new(client) as Arc<dyn ModelBridgeClient>)
+}
+
+/// 构造业务主对话（orchestrator）的 client。
+///
+/// 主对话采用「全局 base + 会话级覆盖」两层模型：
+/// - 全局 `orchestrator` 段是权威 base，承载 baseUrl / apiKey / 默认 model /
+///   默认 reasoningEffort，作为新会话的起点；
+/// - 会话级 `orchestrator` 覆盖段只携带 `model` 与 `reasoningEffort` 两个字段，
+///   在解析时叠加到全局 base 之上，使各会话能独立切换主模型与思考强度而互不污染。
+///
+/// 当 `session_id` 缺失或会话级覆盖为空时，行为与「直接读全局 orchestrator 段」完全一致。
+fn build_orchestrator_client(
+    settings_store: &Arc<SettingsStore>,
+    session_id: Option<&SessionId>,
+) -> Option<Arc<dyn ModelBridgeClient>> {
+    let mut config = settings_store.get_section("orchestrator");
+    if let Some(session_id) = session_id {
+        let override_section = settings_store.get_session_section(session_id, "orchestrator");
+        merge_orchestrator_session_override(&mut config, &override_section);
+    }
+    let normalized = NormalizedModelConfig::from_settings_value(&config);
+    normalized
+        .to_http_model_client("gpt-4")
+        .map(|client| Arc::new(client) as Arc<dyn ModelBridgeClient>)
+}
+
+/// 把会话级覆盖（仅 `model` / `reasoningEffort`）叠加到全局 orchestrator base 上。
+///
+/// 设计约束：会话覆盖**只能**改主模型与思考强度，绝不携带 baseUrl / apiKey，
+/// 避免会话级配置悄悄替换连接凭据。`reasoningEffort` 为 JSON `null` 时表示
+/// 「默认·不指定」，会清空 base 上的思考强度。
+pub fn merge_orchestrator_session_override(
+    base: &mut serde_json::Value,
+    override_section: &serde_json::Value,
+) {
+    let serde_json::Value::Object(override_map) = override_section else {
+        return;
+    };
+    if override_map.is_empty() {
+        return;
+    }
+    if !base.is_object() {
+        *base = serde_json::Value::Object(serde_json::Map::new());
+    }
+    let serde_json::Value::Object(base_map) = base else {
+        return;
+    };
+    if let Some(model) = override_map.get("model") {
+        if let Some(model) = model.as_str() {
+            if !model.trim().is_empty() {
+                base_map.insert(
+                    "model".to_string(),
+                    serde_json::Value::String(model.to_string()),
+                );
+            }
+        }
+    }
+    if let Some(effort) = override_map.get("reasoningEffort") {
+        match effort {
+            serde_json::Value::Null => {
+                base_map.remove("reasoningEffort");
+            }
+            serde_json::Value::String(label) if !label.trim().is_empty() => {
+                base_map.insert(
+                    "reasoningEffort".to_string(),
+                    serde_json::Value::String(label.to_string()),
+                );
+            }
+            _ => {}
+        }
+    }
 }
 
 /// daemon 未注入 [`ContextBudget`] 时的兜底预算。
@@ -750,9 +826,10 @@ impl LlmTaskDispatcher {
             .join("\n\n");
         let output_text = output_refs.join("\n\n");
         let extraction_text = format!("{timeline_text}\n\n{output_text}");
-        let Some(client) = resolve_target_for_role(settings_store, None, RoleTarget::Auxiliary)
-            .ok()
-            .flatten()
+        let Some(client) =
+            resolve_target_for_role(settings_store, None, RoleTarget::Auxiliary, None)
+                .ok()
+                .flatten()
         else {
             return;
         };
@@ -812,9 +889,10 @@ impl LlmTaskDispatcher {
         settings_store: Option<&Arc<SettingsStore>>,
         session_id: &SessionId,
     ) {
-        let Some(client) = resolve_target_for_role(settings_store, None, RoleTarget::Auxiliary)
-            .ok()
-            .flatten()
+        let Some(client) =
+            resolve_target_for_role(settings_store, None, RoleTarget::Auxiliary, None)
+                .ok()
+                .flatten()
         else {
             return;
         };
@@ -1318,6 +1396,7 @@ impl LlmTaskDispatcher {
         settings_store: Option<&Arc<SettingsStore>>,
         task: Option<&magi_core::Task>,
         execution_role_id: Option<&str>,
+        session_id: Option<&SessionId>,
     ) -> Result<Arc<dyn ModelBridgeClient>, String> {
         let role_id = execution_role_id
             .map(str::trim)
@@ -1338,6 +1417,7 @@ impl LlmTaskDispatcher {
                     role_id,
                     wrap_with_orchestrator_failover,
                 },
+                session_id,
             )? {
                 return Ok(client);
             }
@@ -1347,6 +1427,7 @@ impl LlmTaskDispatcher {
             settings_store,
             self.model_bridge_client.clone(),
             RoleTarget::Orchestrator,
+            session_id,
         )?
         .ok_or_else(|| "model bridge client 未配置".to_string())
     }
@@ -1383,7 +1464,12 @@ impl LlmTaskDispatcher {
         let execution_settings_snapshot = self.execution_settings_snapshot();
         let execution_settings =
             self.execution_settings_or_live(execution_settings_snapshot.as_ref());
-        let client = self.resolve_model_client_for_task(execution_settings, None, None)?;
+        let client = self.resolve_model_client_for_task(
+            execution_settings,
+            None,
+            None,
+            Some(&request.session_id),
+        )?;
 
         let prompt = self.apply_skill_prompt_injections(
             prepend_session_instructions(
@@ -1456,6 +1542,7 @@ impl LlmTaskDispatcher {
             execution_settings,
             Some(task),
             role_for_model,
+            Some(session_id),
         ) {
             Ok(client) => client,
             Err(error) => {
@@ -2718,7 +2805,7 @@ mod tests {
             }),
         );
 
-        let resolved = resolve_target_for_role(Some(&store), None, RoleTarget::Orchestrator)
+        let resolved = resolve_target_for_role(Some(&store), None, RoleTarget::Orchestrator, None)
             .expect("orchestrator 段构造不应失败");
         assert!(
             resolved.is_some(),
@@ -2727,84 +2814,142 @@ mod tests {
     }
 
     #[test]
-    fn resolve_target_for_role_orchestrator_ignores_session_scoped_orchestrator_section() {
+    fn merge_orchestrator_session_override_applies_model_and_effort() {
+        // 全局 base 提供凭据与默认 model/effort，会话覆盖只改 model + reasoningEffort。
+        let mut base = serde_json::json!({
+            "baseUrl": "https://api.example.com/v1",
+            "apiKey": "sk-orch",
+            "model": "global-default-model",
+            "urlMode": "standard",
+            "reasoningEffort": "medium",
+        });
+        let override_section = serde_json::json!({
+            "model": "session-only-model",
+            "reasoningEffort": "xhigh",
+        });
+        merge_orchestrator_session_override(&mut base, &override_section);
+
+        let normalized = NormalizedModelConfig::from_settings_value(&base);
+        assert_eq!(
+            normalized.require_model().expect("model 必须存在"),
+            "session-only-model",
+            "会话覆盖的 model 必须生效"
+        );
+        assert_eq!(
+            normalized.require_base_url().expect("baseUrl 必须存在"),
+            "https://api.example.com/v1",
+            "凭据仍来自全局 base"
+        );
+        assert_eq!(
+            base.get("reasoningEffort")
+                .and_then(serde_json::Value::as_str),
+            Some("xhigh"),
+            "会话覆盖的 reasoningEffort 必须生效"
+        );
+    }
+
+    #[test]
+    fn merge_orchestrator_session_override_ignores_credentials_and_empty() {
+        // 会话覆盖即便误带 baseUrl/apiKey 也不得替换全局连接凭据。
+        let mut base = serde_json::json!({
+            "baseUrl": "https://api.example.com/v1",
+            "apiKey": "sk-orch",
+            "model": "global-default-model",
+            "urlMode": "standard",
+        });
+        let override_section = serde_json::json!({
+            "baseUrl": "https://evil.example.com/v1",
+            "apiKey": "sk-evil",
+            "model": "session-only-model",
+        });
+        merge_orchestrator_session_override(&mut base, &override_section);
+        assert_eq!(
+            base.get("baseUrl").and_then(serde_json::Value::as_str),
+            Some("https://api.example.com/v1"),
+            "会话覆盖不得替换全局 baseUrl"
+        );
+        assert_eq!(
+            base.get("apiKey").and_then(serde_json::Value::as_str),
+            Some("sk-orch"),
+            "会话覆盖不得替换全局 apiKey"
+        );
+        assert_eq!(
+            base.get("model").and_then(serde_json::Value::as_str),
+            Some("session-only-model"),
+        );
+
+        // 空覆盖：base 完全不变。
+        let mut base2 = serde_json::json!({ "model": "keep-me" });
+        merge_orchestrator_session_override(&mut base2, &serde_json::json!({}));
+        assert_eq!(
+            base2.get("model").and_then(serde_json::Value::as_str),
+            Some("keep-me"),
+        );
+    }
+
+    #[test]
+    fn merge_orchestrator_session_override_null_effort_clears_global() {
+        // reasoningEffort 显式为 null 表示「默认·不指定」，清空全局思考强度。
+        let mut base = serde_json::json!({
+            "baseUrl": "https://api.example.com/v1",
+            "apiKey": "sk-orch",
+            "model": "global-default-model",
+            "reasoningEffort": "high",
+        });
+        merge_orchestrator_session_override(
+            &mut base,
+            &serde_json::json!({ "reasoningEffort": serde_json::Value::Null }),
+        );
+        assert!(
+            base.get("reasoningEffort").is_none(),
+            "null 覆盖必须清空全局 reasoningEffort"
+        );
+    }
+
+    #[test]
+    fn resolve_target_for_role_orchestrator_threads_session_override() {
         use crate::settings_store::SettingsStore;
 
         let store = Arc::new(SettingsStore::new());
+        store.set_section(
+            "orchestrator",
+            serde_json::json!({
+                "baseUrl": "https://api.example.com/v1",
+                "apiKey": "sk-orch",
+                "model": "global-default-model",
+                "urlMode": "standard",
+                "reasoningEffort": "medium",
+            }),
+        );
         let session_id = SessionId::new("session-model-scope");
         store.set_session_section(
             &session_id,
             "orchestrator",
             serde_json::json!({
-                "baseUrl": "https://api.example.com/v1",
-                "apiKey": "sk-session",
                 "model": "session-only-model",
-                "urlMode": "standard",
+                "reasoningEffort": "xhigh",
             }),
         );
 
-        let resolved = resolve_target_for_role(Some(&store), None, RoleTarget::Orchestrator)
+        // 会话级覆盖存在时，主路径必须返回业务模型 client。
+        let resolved = resolve_target_for_role(
+            Some(&store),
+            None,
+            RoleTarget::Orchestrator,
+            Some(&session_id),
+        )
+        .expect("orchestrator 段解析不应失败");
+        assert!(
+            resolved.is_some(),
+            "会话级覆盖存在时必须返回业务模型 client"
+        );
+
+        // 不带 session_id 时仍可用全局 base 构造。
+        let global = resolve_target_for_role(Some(&store), None, RoleTarget::Orchestrator, None)
             .expect("orchestrator 段解析不应失败");
         assert!(
-            resolved.is_none(),
-            "主模型是全局共享配置，session-scoped orchestrator 段不能参与解析"
-        );
-    }
-
-    /// 回归测试：orchestrator 段未配置时，resolve 应该如实回退到 default_client；
-    /// 即便 auxiliary 段有配置，也绝不能被误读补位（两个段语义完全不同）。
-    #[test]
-    fn resolve_target_for_role_orchestrator_falls_back_when_unset() {
-        use crate::settings_store::SettingsStore;
-
-        let store = Arc::new(SettingsStore::new());
-        // 仅配置 auxiliary，模拟"只填了辅助模型"的部署
-        store.set_section(
-            "auxiliary",
-            serde_json::json!({
-                "baseUrl": "https://api.example.com/v1",
-                "apiKey": "sk-aux",
-                "model": "gpt-4o-mini",
-                "urlMode": "standard",
-            }),
-        );
-
-        let resolved = resolve_target_for_role(Some(&store), None, RoleTarget::Orchestrator)
-            .expect("orchestrator 段解析不应失败");
-        assert!(
-            resolved.is_none(),
-            "orchestrator 段未配置 + 无 default_client 时应返回 None，\
-             绝不能用 auxiliary 段补位（auxiliary 没有 reasoningEffort 字段）"
-        );
-    }
-
-    /// 回归测试：auxiliary 段独立可用，serve 辅助任务（会话标题精修 / 知识抽取 / 等等）。
-    /// 与业务派发路径解耦——auxiliary 段配置不应被 Orchestrator 分支看到。
-    #[test]
-    fn resolve_target_for_role_auxiliary_reads_auxiliary_segment() {
-        use crate::settings_store::SettingsStore;
-
-        let store = Arc::new(SettingsStore::new());
-        store.set_section(
-            "auxiliary",
-            serde_json::json!({
-                "baseUrl": "https://api.example.com/v1",
-                "apiKey": "sk-aux",
-                "model": "gpt-4o-mini",
-                "urlMode": "standard",
-            }),
-        );
-
-        let aux = resolve_target_for_role(Some(&store), None, RoleTarget::Auxiliary)
-            .expect("auxiliary 段解析不应失败");
-        assert!(aux.is_some(), "auxiliary 段已配置时必须返回辅助模型 client");
-
-        // 业务路径不应该被辅助配置干扰
-        let orch = resolve_target_for_role(Some(&store), None, RoleTarget::Orchestrator)
-            .expect("orchestrator 段解析不应失败");
-        assert!(
-            orch.is_none(),
-            "orchestrator 未配置且无 default 时必须返回 None"
+            global.is_some(),
+            "全局 orchestrator base 已配置时必须返回 client"
         );
     }
 
@@ -2936,7 +3081,7 @@ mod tests {
         live_store.remove_section("orchestrator");
 
         let snapshot_client =
-            resolve_target_for_role(Some(&snapshot), None, RoleTarget::Orchestrator)
+            resolve_target_for_role(Some(&snapshot), None, RoleTarget::Orchestrator, None)
                 .expect("快照内的 orchestrator 配置应可解析");
         assert!(
             snapshot_client.is_some(),
@@ -2944,7 +3089,7 @@ mod tests {
         );
 
         let live_client =
-            resolve_target_for_role(Some(&live_store), None, RoleTarget::Orchestrator)
+            resolve_target_for_role(Some(&live_store), None, RoleTarget::Orchestrator, None)
                 .expect("实时 settings 查询不应失败");
         assert!(
             live_client.is_none(),

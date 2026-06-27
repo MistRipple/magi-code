@@ -63,6 +63,8 @@ export interface SettingsBootstrapPayload {
   sessionId?: string | null;
   workerConfigs: Record<string, unknown>;
   orchestratorConfig: Record<string, unknown>;
+  orchestratorSessionConfig?: Record<string, unknown>;
+  effectiveOrchestratorConfig?: Record<string, unknown>;
   auxiliaryConfig: Record<string, unknown>;
   userRulesConfig: Record<string, unknown>;
   skillsConfig: Record<string, unknown>;

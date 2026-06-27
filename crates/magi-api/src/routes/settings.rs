@@ -7,6 +7,7 @@ use magi_bridge_client::{
     BridgeClientError, BridgeErrorLayer, HttpModelBridgeProtocol, ModelBridgeClient,
     ModelInvocationRequest,
 };
+use magi_conversation_runtime::task_execution_dispatcher::merge_orchestrator_session_override;
 use magi_core::{AccessProfile, UtcMillis};
 use magi_usage_authority::{
     SessionSummary, UsageAuthority, UsageCallRecordInput, UsageModelSnapshot, UsageTotals,
@@ -33,6 +34,46 @@ fn unwrap_settings_section_request(request: &serde_json::Value) -> serde_json::V
 
 fn scoped_settings_section_request(request: &serde_json::Value) -> serde_json::Value {
     without_scope_binding_fields(unwrap_settings_section_request(request))
+}
+
+fn orchestrator_session_override_request(request: &serde_json::Value) -> Result<Value, ApiError> {
+    let config = unwrap_settings_section_request(request);
+    let Some(config) = config.as_object() else {
+        return Err(ApiError::InvalidInput(
+            "会话主模型配置必须是对象".to_string(),
+        ));
+    };
+
+    let mut override_config = Map::new();
+    if let Some(model) = config.get("model").and_then(Value::as_str).map(str::trim)
+        && !model.is_empty()
+    {
+        override_config.insert("model".to_string(), Value::String(model.to_string()));
+    }
+    if config.contains_key("reasoningEffort") {
+        match config.get("reasoningEffort") {
+            Some(Value::Null) => {
+                override_config.insert("reasoningEffort".to_string(), Value::Null);
+            }
+            Some(Value::String(value)) => {
+                let value = value.trim();
+                if !matches!(value, "low" | "medium" | "high" | "xhigh") {
+                    return Err(ApiError::InvalidInput("reasoningEffort 无效".to_string()));
+                }
+                override_config.insert(
+                    "reasoningEffort".to_string(),
+                    Value::String(value.to_string()),
+                );
+            }
+            Some(_) => {
+                return Err(ApiError::InvalidInput(
+                    "reasoningEffort 必须是字符串".to_string(),
+                ));
+            }
+            None => {}
+        }
+    }
+    Ok(Value::Object(override_config))
 }
 
 fn parse_optional_query_string(
@@ -211,6 +252,10 @@ pub fn routes() -> Router<ApiState> {
         .route(
             "/settings/orchestrator/save",
             post(save_orchestrator_config),
+        )
+        .route(
+            "/settings/orchestrator/session/save",
+            post(save_orchestrator_session_config),
         )
         .route(
             "/settings/orchestrator/test",
@@ -647,6 +692,36 @@ async fn settings_bootstrap(
         &tool_context,
     );
     if let Some(object) = snapshot.as_object_mut() {
+        if let Some(session_id) = scope.session_id() {
+            let mut effective_orchestrator_config = object
+                .get("orchestratorConfig")
+                .cloned()
+                .unwrap_or(Value::Null);
+            let session_orchestrator_config = state
+                .settings_store
+                .get_session_section(session_id, "orchestrator");
+            merge_orchestrator_session_override(
+                &mut effective_orchestrator_config,
+                &session_orchestrator_config,
+            );
+            object.insert(
+                "orchestratorSessionConfig".to_string(),
+                session_orchestrator_config,
+            );
+            object.insert(
+                "effectiveOrchestratorConfig".to_string(),
+                effective_orchestrator_config,
+            );
+        } else {
+            object.insert("orchestratorSessionConfig".to_string(), json!({}));
+            object.insert(
+                "effectiveOrchestratorConfig".to_string(),
+                object
+                    .get("orchestratorConfig")
+                    .cloned()
+                    .unwrap_or_else(|| json!({})),
+            );
+        }
         object.insert(
             "workspaceId".to_string(),
             Value::String(scope.workspace_id_string()),
@@ -746,6 +821,56 @@ async fn save_orchestrator_config(
         .settings_store
         .set_section("orchestrator", scoped_settings_section_request(&request));
     Ok(Json(serde_json::json!({ "saved": true })))
+}
+
+async fn save_orchestrator_session_config(
+    State(state): State<ApiState>,
+    Json(request): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let session_id = request
+        .get("sessionId")
+        .or_else(|| request.get("session_id"))
+        .and_then(Value::as_str);
+    let workspace_id = request
+        .get("workspaceId")
+        .or_else(|| request.get("workspace_id"))
+        .and_then(Value::as_str);
+    let workspace_path = request
+        .get("workspacePath")
+        .or_else(|| request.get("workspace_path"))
+        .and_then(Value::as_str);
+    let scope = session_scope::require_session_workspace_scope(
+        &state,
+        session_id,
+        workspace_id,
+        workspace_path,
+        "保存会话主模型配置",
+    )?;
+    let override_config = orchestrator_session_override_request(&request)?;
+    if override_config
+        .as_object()
+        .is_none_or(|config| config.is_empty())
+    {
+        state
+            .settings_store
+            .remove_session_section(&scope.session_id, "orchestrator");
+    } else {
+        state.settings_store.set_session_section(
+            &scope.session_id,
+            "orchestrator",
+            override_config.clone(),
+        );
+    }
+
+    let mut effective_config = state.settings_store.get_section("orchestrator");
+    merge_orchestrator_session_override(&mut effective_config, &override_config);
+    Ok(Json(serde_json::json!({
+        "saved": true,
+        "sessionId": scope.session_id.to_string(),
+        "workspaceId": scope.workspace_id.to_string(),
+        "orchestratorSessionConfig": override_config,
+        "effectiveOrchestratorConfig": effective_config,
+    })))
 }
 
 async fn test_orchestrator_connection(
@@ -1197,7 +1322,7 @@ mod tests {
     use magi_core::{AbsolutePath, EventId, SessionId, WorkspaceId};
     use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
     use magi_governance::GovernanceService;
-    use magi_session_store::SessionStore;
+    use magi_session_store::{SessionRecord, SessionStore};
     use magi_snapshot::SnapshotManager;
     use magi_tool_runtime::{
         ExternalMcpServerCatalogEntry, ExternalToolCatalogSnapshot, ToolRegistry,
@@ -1255,6 +1380,34 @@ mod tests {
             )
             .expect("workspace should register");
         workspace_root
+    }
+
+    fn test_session_record(
+        session_id: &SessionId,
+        workspace_id: &str,
+        title: &str,
+    ) -> SessionRecord {
+        let now = UtcMillis::now();
+        SessionRecord {
+            session_id: session_id.clone(),
+            title: title.to_string(),
+            status: magi_core::SessionLifecycleStatus::Active,
+            created_at: now,
+            updated_at: now,
+            message_count: None,
+            workspace_id: Some(workspace_id.to_string()),
+        }
+    }
+
+    fn seed_session(state: &ApiState, session: SessionRecord) {
+        state
+            .session_store
+            .create_session_for_workspace(
+                session.session_id.clone(),
+                session.title,
+                session.workspace_id,
+            )
+            .expect("test session should create");
     }
 
     fn model_usage_payload(
@@ -2225,6 +2378,130 @@ mod tests {
                 .get_session_section(&SessionId::new("session-a"), "orchestrator")
                 .is_null(),
             "主模型不支持按 session 保存，保存接口只能写全局 orchestrator 段"
+        );
+    }
+
+    #[tokio::test]
+    async fn save_orchestrator_session_config_writes_only_session_override() {
+        let state = test_state();
+        let _workspace = register_test_workspace(&state, "workspace-session-model");
+        let session_id = SessionId::new("session-model-override");
+        seed_session(
+            &state,
+            test_session_record(&session_id, "workspace-session-model", "会话模型覆盖"),
+        );
+        state.settings_store.set_section(
+            "orchestrator",
+            json!({
+                "baseUrl": "https://api.example.com/v1",
+                "apiKey": "sk-global",
+                "model": "global-main-model",
+                "reasoningEffort": "medium"
+            }),
+        );
+
+        let response = save_orchestrator_session_config(
+            State(state.clone()),
+            Json(json!({
+                "sessionId": session_id.as_str(),
+                "workspaceId": "workspace-session-model",
+                "config": {
+                    "baseUrl": "https://malicious.example.com/v1",
+                    "apiKey": "sk-session-should-drop",
+                    "model": "session-main-model",
+                    "reasoningEffort": "high"
+                }
+            })),
+        )
+        .await
+        .expect("session orchestrator override should save")
+        .0;
+
+        assert_eq!(response["saved"], json!(true));
+        let global = state.settings_store.get_section("orchestrator");
+        assert_eq!(global["model"], json!("global-main-model"));
+        assert_eq!(global["reasoningEffort"], json!("medium"));
+        let saved = state
+            .settings_store
+            .get_session_section(&session_id, "orchestrator");
+        assert_eq!(saved["model"], json!("session-main-model"));
+        assert_eq!(saved["reasoningEffort"], json!("high"));
+        assert!(
+            saved.get("baseUrl").is_none() && saved.get("apiKey").is_none(),
+            "会话覆盖不得持久化连接凭据"
+        );
+        assert_eq!(
+            response["effectiveOrchestratorConfig"]["baseUrl"],
+            json!("https://api.example.com/v1")
+        );
+        assert_eq!(
+            response["effectiveOrchestratorConfig"]["model"],
+            json!("session-main-model")
+        );
+    }
+
+    #[tokio::test]
+    async fn settings_bootstrap_returns_effective_orchestrator_config_for_session() {
+        let state = test_state();
+        let _workspace = register_test_workspace(&state, "workspace-bootstrap-session-model");
+        let session_id = SessionId::new("session-bootstrap-model-override");
+        seed_session(
+            &state,
+            test_session_record(
+                &session_id,
+                "workspace-bootstrap-session-model",
+                "会话有效主模型",
+            ),
+        );
+        state.settings_store.set_section(
+            "orchestrator",
+            json!({
+                "baseUrl": "https://api.example.com/v1",
+                "apiKey": "sk-global",
+                "model": "global-main-model",
+                "reasoningEffort": "medium"
+            }),
+        );
+        state.settings_store.set_session_section(
+            &session_id,
+            "orchestrator",
+            json!({
+                "model": "session-main-model",
+                "reasoningEffort": "xhigh"
+            }),
+        );
+
+        let bootstrap = settings_bootstrap(
+            State(state.clone()),
+            Query(HashMap::from([
+                (
+                    "workspaceId".to_string(),
+                    "workspace-bootstrap-session-model".to_string(),
+                ),
+                ("sessionId".to_string(), session_id.as_str().to_string()),
+            ])),
+        )
+        .await
+        .expect("settings bootstrap should build")
+        .0;
+
+        assert_eq!(
+            bootstrap["orchestratorConfig"]["model"],
+            json!("global-main-model"),
+            "设置页仍应看到全局默认主模型"
+        );
+        assert_eq!(
+            bootstrap["orchestratorSessionConfig"]["model"],
+            json!("session-main-model")
+        );
+        assert_eq!(
+            bootstrap["effectiveOrchestratorConfig"]["model"],
+            json!("session-main-model"),
+            "输入区应读取会话有效主模型"
+        );
+        assert_eq!(
+            bootstrap["effectiveOrchestratorConfig"]["reasoningEffort"],
+            json!("xhigh")
         );
     }
 

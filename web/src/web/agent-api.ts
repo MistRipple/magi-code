@@ -293,6 +293,10 @@ function normalizeSettingsBootstrapPayload(
           )
     ) as Record<string, unknown>,
     orchestratorConfig: normalizeSettingsSectionConfig(payload.orchestratorConfig ?? payload.orchestrator),
+    orchestratorSessionConfig: normalizeSettingsSectionConfig(payload.orchestratorSessionConfig),
+    effectiveOrchestratorConfig: normalizeSettingsSectionConfig(
+      payload.effectiveOrchestratorConfig ?? payload.orchestratorConfig ?? payload.orchestrator,
+    ),
     auxiliaryConfig: normalizeSettingsSectionConfig(payload.auxiliaryConfig ?? payload.auxiliary),
     userRulesConfig: normalizeSettingsSectionConfig(payload.userRulesConfig ?? payload.userRules),
     skillsConfig: normalizeSettingsSectionConfig(payload.skillsConfig ?? payload.skills),
@@ -1471,6 +1475,18 @@ export async function saveAgentUserRules(data: Record<string, unknown>): Promise
 
 export async function saveAgentOrchestratorConfig(config: Record<string, unknown>): Promise<Record<string, unknown>> {
   return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/orchestrator/save', config, 'save orchestrator config');
+}
+
+export async function saveAgentOrchestratorSessionConfig(
+  config: Record<string, unknown>,
+  bindingOverride?: Partial<AgentBindingContext>,
+): Promise<Record<string, unknown>> {
+  return await postBoundJson<Record<string, unknown>>(
+    '/api/settings/orchestrator/session/save',
+    { config },
+    'save session orchestrator config',
+    bindingOverride,
+  );
 }
 
 export async function saveAgentAuxiliaryConfig(config: Record<string, unknown>): Promise<Record<string, unknown>> {

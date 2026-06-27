@@ -157,6 +157,10 @@ impl SettingsStore {
         self.set_section(&session_section_key(session_id, section), value);
     }
 
+    pub fn remove_session_section(&self, session_id: &SessionId, section: &str) {
+        self.remove_section(&session_section_key(session_id, section));
+    }
+
     pub fn remove_section_entry(&self, section: &str, key: &str) {
         let mut sections = self.sections.write().unwrap();
         if let Some(Value::Object(map)) = sections.get_mut(section) {

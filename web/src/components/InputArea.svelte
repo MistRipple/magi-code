@@ -15,7 +15,7 @@
     fetchAgentModelList,
     getAgentSettingsBootstrap,
     resolveAgentBaseUrl,
-    saveAgentOrchestratorConfig,
+    saveAgentOrchestratorSessionConfig,
     fetchWorkspaceBranches,
     checkoutWorkspaceBranch,
     type AgentSettingsBootstrapSnapshot,
@@ -49,6 +49,18 @@
     name: string;
     description: string;
   }
+
+  type ReasoningEffort = 'low' | 'medium' | 'high' | 'xhigh';
+
+  const reasoningOptions: Array<{
+    value: ReasoningEffort;
+    labelKey: string;
+  }> = [
+    { value: 'low', labelKey: 'input.mainModelPicker.reasoning.low' },
+    { value: 'medium', labelKey: 'input.mainModelPicker.reasoning.medium' },
+    { value: 'high', labelKey: 'input.mainModelPicker.reasoning.high' },
+    { value: 'xhigh', labelKey: 'input.mainModelPicker.reasoning.xhigh' },
+  ];
 
   const accessProfileOptions: Array<{
     value: AccessProfile;
@@ -102,10 +114,11 @@
   let enhanceResultPrompt = $state<string | null>(null);
 
   // 主线模型 picker：弹窗状态 + 模型列表惰性拉取。
-  // 选中后直接写回全局 orchestrator 配置，后续所有会话轮次都读取同一份持久化配置。
+  // 选中后只写当前会话 orchestrator 覆盖段；全局配置仍是新会话默认值和连接凭据来源。
   let pickerOpen = $state(false);
   let pickerLoading = $state(false);
   let pickerSavingModel = $state<string | null>(null);
+  let pickerSavingReasoning = $state<ReasoningEffort | null>(null);
   let pickerModels = $state<string[]>([]);
   let pickerError = $state<string | null>(null);
   let pickerLoadedOnce = false;
@@ -126,6 +139,8 @@
   let accessProfilePickerOpen = $state(false);
   let selectedAccessProfile = $state<AccessProfile>('restricted');
   const currentPickerModel = $derived.by(() => readOrchestratorModel());
+  const currentPickerReasoningEffort = $derived.by(() => readOrchestratorReasoningEffort());
+  const currentPickerReasoningLabel = $derived.by(() => reasoningEffortLabel(currentPickerReasoningEffort));
   const currentAccessProfileOption = $derived.by(() => (
     accessProfileOptions.find((option) => option.value === selectedAccessProfile)
     ?? accessProfileOptions[1]
@@ -977,10 +992,57 @@
     return orchestratorConfig as Record<string, unknown>;
   }
 
+  function getEffectiveOrchestratorConfigSnapshot(): Record<string, unknown> | null {
+    const snapshot = messagesState.settingsBootstrapSnapshot;
+    if (!settingsBootstrapMatchesCurrentWorkspace(snapshot)) {
+      return null;
+    }
+    const effectiveConfig = snapshot?.effectiveOrchestratorConfig;
+    if (effectiveConfig && typeof effectiveConfig === 'object' && !Array.isArray(effectiveConfig)) {
+      return effectiveConfig as Record<string, unknown>;
+    }
+    return getOrchestratorConfigSnapshot();
+  }
+
+  function getOrchestratorSessionConfigSnapshot(): Record<string, unknown> {
+    const snapshot = messagesState.settingsBootstrapSnapshot;
+    if (!settingsBootstrapMatchesCurrentWorkspace(snapshot)) {
+      return {};
+    }
+    const sessionConfig = snapshot?.orchestratorSessionConfig;
+    if (!sessionConfig || typeof sessionConfig !== 'object' || Array.isArray(sessionConfig)) {
+      return {};
+    }
+    return sessionConfig as Record<string, unknown>;
+  }
+
   function readOrchestratorModel(): string {
-    const config = getOrchestratorConfigSnapshot();
+    const config = getEffectiveOrchestratorConfigSnapshot();
     const model = config?.model;
     return typeof model === 'string' ? model.trim() : '';
+  }
+
+  function normalizeReasoningEffort(value: unknown): ReasoningEffort | null {
+    return value === 'low' || value === 'medium' || value === 'high' || value === 'xhigh'
+      ? value
+      : null;
+  }
+
+  function readOrchestratorReasoningEffort(): ReasoningEffort | null {
+    const config = getEffectiveOrchestratorConfigSnapshot();
+    return normalizeReasoningEffort(config?.reasoningEffort);
+  }
+
+  function reasoningEffortLabel(value: ReasoningEffort | null): string {
+    if (!value) return '';
+    const match = reasoningOptions.find((option) => option.value === value);
+    return match ? i18n.t(match.labelKey) : '';
+  }
+
+  function objectRecord(value: unknown): Record<string, unknown> {
+    return value && typeof value === 'object' && !Array.isArray(value)
+      ? value as Record<string, unknown>
+      : {};
   }
 
   function getAuxiliaryConfigSnapshot(): Record<string, unknown> | null {
@@ -1010,17 +1072,21 @@
     enhanceResultPrompt = null;
   }
 
-  function applyLocalOrchestratorConfig(config: Record<string, unknown>) {
+  function applyLocalOrchestratorSessionConfig(
+    sessionConfig: Record<string, unknown>,
+    effectiveConfig: Record<string, unknown>,
+  ) {
     const snapshot = messagesState.settingsBootstrapSnapshot;
     if (!snapshot || !settingsBootstrapMatchesCurrentWorkspace(snapshot)) return;
     messagesState.settingsBootstrapSnapshot = {
       ...snapshot,
-      orchestratorConfig: { ...config },
+      orchestratorSessionConfig: { ...sessionConfig },
+      effectiveOrchestratorConfig: { ...effectiveConfig },
     } as AgentSettingsBootstrapSnapshot;
   }
 
   async function refreshPickerSettingsSnapshot() {
-    const latest = await getAgentSettingsBootstrap({ scope: 'core' });
+    const latest = await getAgentSettingsBootstrap({ scope: 'core', accessProfile: selectedAccessProfile });
     if (!settingsBootstrapMatchesCurrentWorkspace(latest)) {
       return;
     }
@@ -1028,8 +1094,7 @@
   }
 
   // 主线模型 picker：打开 / 关闭 + 模型列表惰性拉取。
-  // 数据源：messagesState.settingsBootstrapSnapshot.orchestratorConfig，
-  // 复用现有 /api/settings/models/fetch 和 /api/settings/orchestrator/save 端点。
+  // 模型列表读取全局 orchestrator 连接配置；保存只写当前会话覆盖段。
   async function togglePicker() {
     if (pickerOpen) {
       pickerOpen = false;
@@ -1070,21 +1135,28 @@
       pickerOpen = false;
       return;
     }
-    const currentConfig = getOrchestratorConfigSnapshot();
-    if (!currentConfig) {
-      pickerError = i18n.t('input.modelPickerSaveNotReady');
+    const sessionId = currentSessionId?.trim() || '';
+    if (!sessionId) {
+      pickerError = i18n.t('input.modelPickerSessionRequired');
       return;
     }
 
     pickerSavingModel = normalizedModel;
     pickerError = null;
-    const nextConfig = {
-      ...currentConfig,
+    const nextSessionConfig = {
+      ...getOrchestratorSessionConfigSnapshot(),
       model: normalizedModel,
     };
     try {
-      await saveAgentOrchestratorConfig(nextConfig);
-      applyLocalOrchestratorConfig(nextConfig);
+      const saved = await saveAgentOrchestratorSessionConfig(nextSessionConfig, {
+        sessionId,
+        workspaceId: currentWorkspaceId?.trim() || undefined,
+        workspacePath: currentWorkspacePath?.trim() || undefined,
+      });
+      applyLocalOrchestratorSessionConfig(
+        objectRecord(saved.orchestratorSessionConfig),
+        objectRecord(saved.effectiveOrchestratorConfig),
+      );
       try {
         await refreshPickerSettingsSnapshot();
       } catch (error) {
@@ -1099,6 +1171,41 @@
       addToast('error', pickerError);
     } finally {
       pickerSavingModel = null;
+    }
+  }
+
+  async function selectPickerReasoningEffort(value: ReasoningEffort) {
+    const sessionId = currentSessionId?.trim() || '';
+    if (!sessionId) {
+      pickerError = i18n.t('input.modelPickerSessionRequired');
+      return;
+    }
+    if (value === currentPickerReasoningEffort) {
+      return;
+    }
+    pickerSavingReasoning = value;
+    pickerError = null;
+    const nextSessionConfig = {
+      ...getOrchestratorSessionConfigSnapshot(),
+      reasoningEffort: value,
+    };
+    try {
+      const saved = await saveAgentOrchestratorSessionConfig(nextSessionConfig, {
+        sessionId,
+        workspaceId: currentWorkspaceId?.trim() || undefined,
+        workspacePath: currentWorkspacePath?.trim() || undefined,
+      });
+      applyLocalOrchestratorSessionConfig(
+        objectRecord(saved.orchestratorSessionConfig),
+        objectRecord(saved.effectiveOrchestratorConfig),
+      );
+      addToast('success', i18n.t('input.reasoningSwitched', { level: reasoningEffortLabel(value) }));
+    } catch (error) {
+      console.warn('[InputArea] 保存主线思考强度失败:', error);
+      pickerError = i18n.t('input.reasoningSaveFailed');
+      addToast('error', pickerError);
+    } finally {
+      pickerSavingReasoning = null;
     }
   }
 
@@ -1582,57 +1689,86 @@
         <div class="ia-picker-wrap ia-model-wrap">
           <button
             type="button"
-            class="ia-picker-btn"
+            class="ia-picker-btn ia-model-btn"
             class:active={pickerOpen}
             class:configured={currentPickerModel !== ''}
             onclick={togglePicker}
-            disabled={sessionInputLocked || isInteractionBlocking || pickerSavingModel !== null}
+            disabled={sessionInputLocked || isInteractionBlocking || pickerSavingModel !== null || pickerSavingReasoning !== null}
             title={currentPickerModel
               ? i18n.t('input.mainModelPicker.titleConfigured', { model: currentPickerModel })
               : i18n.t('input.mainModelPicker.titleEmpty')}
             aria-expanded={pickerOpen}
           >
+            <Icon name={pickerSavingModel || pickerSavingReasoning ? 'loader' : 'circleOutline'} size={12} class={pickerSavingModel || pickerSavingReasoning ? 'spinning' : ''} />
             <span class="ia-picker-btn-label">{currentPickerModel || i18n.t('input.mainModelPicker.buttonEmpty')}</span>
+            {#if currentPickerReasoningLabel}
+              <span class="ia-model-effort">{currentPickerReasoningLabel}</span>
+            {/if}
+            <Icon name="chevron-down" size={10} />
           </button>
           {#if pickerOpen}
             <!-- svelte-ignore a11y_click_events_have_key_events -->
             <!-- svelte-ignore a11y_no_static_element_interactions -->
             <div class="ia-popover-backdrop" onclick={() => (pickerOpen = false)}></div>
-            <div class="ia-picker-popover" role="menu">
-              <div class="ia-picker-header">{i18n.t('input.mainModelPicker.header')}</div>
-              {#if pickerLoading}
-                <div class="ia-picker-status">{i18n.t('input.mainModelPicker.loading')}</div>
-              {:else if pickerError}
-                <div class="ia-picker-status ia-picker-status-error">
-                  {pickerError}
-                  <button
-                    type="button"
-                    class="ia-picker-retry"
-                    onclick={() => { pickerError = null; loadPickerModels(); }}
-                  >{i18n.t('input.mainModelPicker.retry')}</button>
-                </div>
-              {:else if pickerModels.length === 0}
-                <div class="ia-picker-status">{i18n.t('input.mainModelPicker.empty')}</div>
-              {:else}
-                <div class="ia-picker-list">
-                  {#each pickerModels as model (model)}
+            <div class="ia-session-model-popover" role="menu">
+              <div class="ia-effort-section">
+                <div class="ia-picker-header">{i18n.t('input.mainModelPicker.reasoning.header')}</div>
+                <div class="ia-effort-strip">
+                  {#each reasoningOptions as option (option.labelKey)}
                     <button
                       type="button"
-                      class="ia-picker-item"
-                      class:selected={currentPickerModel === model}
-                      onclick={() => void selectPickerModel(model)}
-                      disabled={pickerSavingModel !== null}
+                      class="ia-effort-option"
+                      class:selected={currentPickerReasoningEffort === option.value}
+                      onclick={() => void selectPickerReasoningEffort(option.value)}
+                      disabled={pickerSavingReasoning !== null || pickerSavingModel !== null}
                     >
-                      <span class="ia-picker-item-label">{model}</span>
-                      {#if pickerSavingModel === model}
-                        <span class="ia-picker-item-desc">{i18n.t('input.mainModelPicker.saving')}</span>
-                      {:else if currentPickerModel === model}
-                        <span class="ia-picker-item-desc">{i18n.t('input.mainModelPicker.current')}</span>
+                      <span>{i18n.t(option.labelKey)}</span>
+                      {#if pickerSavingReasoning === option.value}
+                        <Icon name="loader" size={12} class="spinning" />
                       {/if}
                     </button>
                   {/each}
                 </div>
-              {/if}
+              </div>
+              <div class="ia-picker-divider"></div>
+              <div class="ia-model-list-section">
+                <div class="ia-section-header-row">
+                  <div class="ia-picker-header">{i18n.t('input.mainModelPicker.header')}</div>
+                </div>
+                {#if pickerLoading}
+                  <div class="ia-picker-status">{i18n.t('input.mainModelPicker.loading')}</div>
+                {:else if pickerError}
+                  <div class="ia-picker-status ia-picker-status-error">
+                    {pickerError}
+                    <button
+                      type="button"
+                      class="ia-picker-retry"
+                      onclick={() => { pickerError = null; loadPickerModels(); }}
+                    >{i18n.t('input.mainModelPicker.retry')}</button>
+                  </div>
+                {:else if pickerModels.length === 0}
+                  <div class="ia-picker-status">{i18n.t('input.mainModelPicker.empty')}</div>
+                {:else}
+                  <div class="ia-picker-list">
+                    {#each pickerModels as model (model)}
+                      <button
+                        type="button"
+                        class="ia-picker-item ia-picker-row"
+                        class:selected={currentPickerModel === model}
+                        onclick={() => void selectPickerModel(model)}
+                        disabled={pickerSavingModel !== null || pickerSavingReasoning !== null}
+                      >
+                        <span class="ia-picker-item-label">{model}</span>
+                        {#if pickerSavingModel === model}
+                          <Icon name="loader" size={12} class="spinning" />
+                        {:else if currentPickerModel === model}
+                          <span class="ia-picker-check">✓</span>
+                        {/if}
+                      </button>
+                    {/each}
+                  </div>
+                {/if}
+              </div>
             </div>
           {/if}
         </div>
@@ -1967,6 +2103,30 @@
     min-width: 0;
     max-width: 130px;
   }
+  .ia-model-btn {
+    max-width: 230px;
+    background: color-mix(in srgb, var(--primary) 16%, transparent);
+    border-color: color-mix(in srgb, var(--primary) 50%, transparent);
+    color: color-mix(in srgb, var(--primary) 62%, white);
+    gap: 6px;
+  }
+  .ia-model-btn .ia-picker-btn-label {
+    max-width: 132px;
+    color: color-mix(in srgb, var(--primary) 44%, white);
+  }
+  .ia-model-effort {
+    flex: 0 0 auto;
+    display: inline-flex;
+    align-items: center;
+    height: 16px;
+    padding: 0 6px;
+    border-radius: var(--radius-full);
+    background: color-mix(in srgb, var(--primary) 28%, transparent);
+    color: color-mix(in srgb, var(--primary) 54%, white);
+    font-size: 10px;
+    line-height: 16px;
+    white-space: nowrap;
+  }
   .ia-workspace-btn,
   .ia-branch-btn {
     display: inline-flex;
@@ -2048,6 +2208,85 @@
     border-radius: var(--radius-md);
     box-shadow: 0 14px 40px rgba(0, 0, 0, 0.45), 0 2px 8px rgba(0, 0, 0, 0.22);
   }
+  .ia-session-model-popover {
+    position: absolute;
+    bottom: calc(100% + 6px);
+    right: 0;
+    z-index: 31;
+    display: flex;
+    flex-direction: column;
+    width: min(280px, calc(100vw - 24px));
+    max-height: 420px;
+    padding: 8px;
+    background: color-mix(in srgb, var(--background) 100%, white 8%);
+    backdrop-filter: blur(18px);
+    -webkit-backdrop-filter: blur(18px);
+    border: 1px solid color-mix(in srgb, var(--border) 70%, var(--foreground) 30%);
+    border-radius: var(--radius-md);
+    box-shadow: 0 16px 44px rgba(0, 0, 0, 0.5), 0 2px 8px rgba(0, 0, 0, 0.22);
+  }
+  .ia-effort-section {
+    flex: 0 0 auto;
+  }
+  .ia-effort-strip {
+    display: flex;
+    gap: 4px;
+    padding: 2px 0 0;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+  .ia-effort-strip::-webkit-scrollbar {
+    display: none;
+  }
+  .ia-effort-option {
+    flex: 1 0 auto;
+    min-width: 42px;
+    height: 26px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0 6px;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: var(--radius-sm, 6px);
+    color: var(--foreground);
+    font-size: 12px;
+    cursor: pointer;
+    transition: background var(--transition-fast), border-color var(--transition-fast), color var(--transition-fast);
+  }
+  .ia-effort-option:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--primary) 10%, transparent);
+  }
+  .ia-effort-option.selected {
+    background: color-mix(in srgb, var(--primary) 16%, transparent);
+    border-color: color-mix(in srgb, var(--primary) 34%, transparent);
+    color: var(--primary);
+  }
+  .ia-effort-option:disabled {
+    cursor: wait;
+    opacity: 0.72;
+  }
+  .ia-model-list-section {
+    min-height: 0;
+    overflow-y: auto;
+  }
+  .ia-model-list-section::-webkit-scrollbar {
+    width: 8px;
+  }
+  .ia-model-list-section::-webkit-scrollbar-thumb {
+    background: var(--border);
+    border-radius: 8px;
+  }
+  .ia-section-header-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+  }
+  .ia-section-header-row .ia-picker-header {
+    margin-bottom: 0;
+    border-bottom: none;
+  }
   .ia-picker-popover.ia-access-popover {
     box-sizing: border-box;
     width: max-content;
@@ -2087,10 +2326,34 @@
     background: color-mix(in srgb, var(--primary) 16%, transparent);
     color: var(--primary);
   }
+  .ia-picker-item.ia-picker-row {
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+  }
   .ia-picker-item-label {
     font-size: 12px;
     font-weight: var(--font-medium, 500);
     word-break: break-all;
+  }
+  .ia-picker-row .ia-picker-item-label {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    word-break: normal;
+    min-width: 0;
+  }
+  .ia-picker-check {
+    flex: 0 0 auto;
+    color: var(--primary);
+    font-size: 13px;
+    line-height: 1;
+  }
+  .ia-picker-divider {
+    height: 1px;
+    margin: 5px 6px;
+    background: var(--border-subtle);
   }
   .ia-picker-item-desc {
     font-size: 11px;
