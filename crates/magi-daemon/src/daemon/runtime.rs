@@ -686,6 +686,22 @@ impl DaemonRuntime {
             &event_bus,
         );
 
+        // 引导阶段只为**活动** workspace 同步重建进程内检索引擎：检索引擎不持久化，
+        // 活动 workspace 是用户回到 daemon 后立即要查询的对象，必须在 restore 返回前就绪。
+        // 其余已注册 workspace 延后到首次通过 /api/knowledge 访问时懒重建
+        // （ensure_workspace_code_index），避免大工作区在启动期集中扫描造成服务卡死。
+        if let Some(active_workspace_id) = workspace_store.active_workspace_id() {
+            if let Some(active_workspace) = workspace_store
+                .workspaces()
+                .into_iter()
+                .find(|workspace| workspace.workspace_id == active_workspace_id)
+            {
+                let scan_root = PathBuf::from(active_workspace.root_path.as_str());
+                knowledge_store.build_workspace_index(&active_workspace_id, &scan_root);
+                let _ = state_repository.save_knowledge_state(&knowledge_store.export_state());
+            }
+        }
+
         let runtime_maintenance = RuntimeMaintenance::new(
             RuntimeMaintenanceConfig::default(),
             event_bus.clone(),
@@ -2272,12 +2288,21 @@ mod tests {
                 .as_str()
                 .expect("registered workspace id")
                 .to_string();
-            assert!(
-                runtime
-                    .knowledge_store
-                    .workspace_index_ready(&WorkspaceId::new(&workspace_id)),
-                "newly registered workspace should build an in-process search index"
-            );
+            // register 把索引构建放到后台 spawn_blocking（见 workspaces.rs，
+            // 修复大工作区注册阻塞服务），故注册返回后轮询等待索引就绪。
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    if runtime
+                        .knowledge_store
+                        .workspace_index_ready(&WorkspaceId::new(&workspace_id))
+                    {
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("newly registered workspace should build an in-process search index");
             workspace_id
         };
 

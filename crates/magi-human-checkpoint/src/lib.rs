@@ -216,7 +216,8 @@ impl HumanCheckpointStore {
             })?;
         }
         let rendered = render_log(log);
-        fs::write(&path, rendered).map_err(|source| HumanCheckpointError::Io { path, source })
+        magi_core::fs_atomic::write_atomic(&path, rendered)
+            .map_err(|source| HumanCheckpointError::Io { path, source })
     }
 
     /// 是否有任何 pending 条目。若有，调用方必须阻止新的 agent_spawn / dispatch。

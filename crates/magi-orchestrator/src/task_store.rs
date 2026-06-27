@@ -11,7 +11,6 @@ use std::sync::{Condvar, Mutex, RwLock};
 use std::time::Duration;
 
 static LEASE_COUNTER: AtomicU64 = AtomicU64::new(1);
-static CHECKPOINT_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TaskLease {
@@ -1208,16 +1207,7 @@ impl TaskStore {
         let data = self.checkpoint();
         let content = serde_json::to_vec_pretty(&data)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-        let temp_path = path.with_extension(format!(
-            "json.{}.{}.tmp",
-            std::process::id(),
-            CHECKPOINT_COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::write(&temp_path, content)?;
-        if let Err(error) = std::fs::rename(&temp_path, path) {
-            let _ = std::fs::remove_file(&temp_path);
-            return Err(error);
-        }
+        magi_core::fs_atomic::write_atomic(path, content)?;
         Ok(())
     }
 

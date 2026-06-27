@@ -211,7 +211,8 @@ impl ValidationStore {
             })?;
         }
         let rendered = render_report(report);
-        fs::write(&path, rendered).map_err(|source| ValidationError::Io { path, source })
+        magi_core::fs_atomic::write_atomic(&path, rendered)
+            .map_err(|source| ValidationError::Io { path, source })
     }
 
     /// 为 system prompt 渲染 Validation 段落。空报告返回 None，避免噪音注入。

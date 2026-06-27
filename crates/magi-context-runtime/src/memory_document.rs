@@ -103,7 +103,6 @@ impl MemoryContent {
 }
 
 pub struct MemoryDocument {
-    session_id: String,
     file_path: PathBuf,
     content: MemoryContent,
     dirty: bool,
@@ -113,7 +112,6 @@ impl MemoryDocument {
     pub fn new(session_id: &str, session_name: &str, storage_path: &Path) -> Self {
         let file_path = storage_path.join(session_id).join("memory.json");
         Self {
-            session_id: session_id.to_string(),
             file_path,
             content: MemoryContent::new(session_id, session_name),
             dirty: false,
@@ -147,13 +145,8 @@ impl MemoryDocument {
         let payload =
             serde_json::to_string_pretty(&self.content).map_err(|e| format!("序列化失败: {e}"))?;
 
-        let tmp_path = dir.join(format!(
-            ".memory-{}-{}.tmp",
-            self.session_id,
-            std::process::id()
-        ));
-        fs::write(&tmp_path, &payload).map_err(|e| format!("写入临时文件失败: {e}"))?;
-        fs::rename(&tmp_path, &self.file_path).map_err(|e| format!("原子重命名失败: {e}"))?;
+        magi_core::fs_atomic::write_atomic(&self.file_path, payload)
+            .map_err(|e| format!("原子写入 memory 文件失败: {e}"))?;
 
         self.dirty = false;
         Ok(())

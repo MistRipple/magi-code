@@ -1348,7 +1348,12 @@ async fn submit_regular_session_turn(
             workspace_id: workspace_id.clone(),
             prompt,
             images,
-            use_tools: matches!(decision.route, SessionTurnRouteDto::Execute),
+            // 范式：常规对话 turn 一律是带工具的 agent。读操作由 Restricted profile
+            // 直接放行，写操作走下游 safety gate 拦截，由模型在循环内自行决定是否调用工具。
+            // 这里不再用入口关键词分类（Chat vs Execute）决定能否碰工具：那会把"用户说人话
+            // 却没命中动作词"的请求关进纯文本死区，连读代码都做不到。Task/LongMission 仍需
+            // 显式信号升级，不受此处影响。
+            use_tools: true,
             access_profile: request.requested_access_profile(),
             skill_name: request.skill_name.clone(),
             request_id: request_id.clone(),

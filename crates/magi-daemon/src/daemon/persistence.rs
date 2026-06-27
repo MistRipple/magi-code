@@ -208,6 +208,10 @@ impl StateRepository {
         self.read_json_or_default(self.knowledge_state_path())
     }
 
+    pub(crate) fn save_knowledge_state(&self, state: &KnowledgeState) -> Result<(), DaemonError> {
+        self.write_json_atomically(self.knowledge_state_path(), state)
+    }
+
     fn read_json_or_default<T>(&self, path: PathBuf) -> Result<T, DaemonError>
     where
         T: Default + for<'de> serde::Deserialize<'de>,
@@ -294,10 +298,8 @@ impl StateRepository {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let temp_path = temp_path_for(&path);
         let content = serde_json::to_vec_pretty(value)?;
-        fs::write(&temp_path, content)?;
-        fs::rename(temp_path, path)?;
+        magi_core::fs_atomic::write_atomic(&path, content)?;
         Ok(())
     }
 }
@@ -394,23 +396,6 @@ impl RuntimeSidecarPersistence {
             self.state_repository.save_session_sidecars(state)
         })
     }
-}
-
-fn temp_path_for(path: &Path) -> PathBuf {
-    let mut file_name = path
-        .file_name()
-        .map(|name| name.to_string_lossy().to_string())
-        .unwrap_or_else(|| "state.json".to_string());
-    let unique_suffix = format!(
-        ".{}.{}.tmp",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or_default()
-    );
-    file_name.push_str(&unique_suffix);
-    path.with_file_name(file_name)
 }
 
 fn stale_backup_path(path: &Path) -> PathBuf {

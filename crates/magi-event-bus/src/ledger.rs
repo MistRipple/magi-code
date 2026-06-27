@@ -4,7 +4,6 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
     fs,
-    io::Write,
     path::{Path, PathBuf},
 };
 use thiserror::Error;
@@ -114,17 +113,7 @@ impl AuditUsageLedgerSnapshot {
         }
 
         let json = self.export_json()?;
-        let temp_path = ledger_temp_path(path);
-        {
-            let mut file = fs::File::create(&temp_path)?;
-            file.write_all(json.as_bytes())?;
-            file.sync_all()?;
-        }
-
-        if path.exists() {
-            fs::remove_file(path)?;
-        }
-        fs::rename(temp_path, path)?;
+        magi_core::fs_atomic::write_atomic(path, json.as_bytes())?;
         Ok(())
     }
 
@@ -194,15 +183,6 @@ fn normalize_entries(entries: &mut Vec<AuditUsageLedgerEntry>) {
             .cmp(&right.sequence)
             .then(left.event_id.cmp(&right.event_id))
     });
-}
-
-fn ledger_temp_path(path: &Path) -> std::path::PathBuf {
-    let mut file_name = path
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "audit-usage-ledger.json".to_string());
-    file_name.push_str(&format!(".{}.tmp", UtcMillis::now().0));
-    path.with_file_name(file_name)
 }
 
 #[cfg(test)]

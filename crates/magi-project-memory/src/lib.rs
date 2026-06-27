@@ -154,9 +154,11 @@ impl ProjectMemoryStore {
         let _guard = self.lock.write().expect("ProjectMemoryStore lock poisoned");
         let path = self.entry_path(&entry.file_stem);
         let body = render_entry(entry);
-        fs::write(&path, body).map_err(|source| ProjectMemoryError::Io {
-            path: path.clone(),
-            source,
+        magi_core::fs_atomic::write_atomic(&path, body).map_err(|source| {
+            ProjectMemoryError::Io {
+                path: path.clone(),
+                source,
+            }
         })?;
         self.rewrite_index_locked()?;
         Ok(())
@@ -296,7 +298,8 @@ impl ProjectMemoryStore {
                 description = entry.description,
             ));
         }
-        fs::write(&path, out).map_err(|source| ProjectMemoryError::Io { path, source })
+        magi_core::fs_atomic::write_atomic(&path, out)
+            .map_err(|source| ProjectMemoryError::Io { path, source })
     }
 }
 // --- Registry

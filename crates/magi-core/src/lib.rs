@@ -1,5 +1,6 @@
 pub mod errors;
 pub mod execution;
+pub mod fs_atomic;
 pub mod ids;
 pub mod paths;
 pub mod public_text;

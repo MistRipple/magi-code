@@ -185,16 +185,8 @@ impl MissionMetricsStore {
             })?;
         }
         let rendered = render_metrics(metrics);
-        let tmp_path = path.with_extension("md.tmp");
-        fs::write(&tmp_path, rendered).map_err(|source| MissionMetricsError::Io {
-            path: tmp_path.clone(),
-            source,
-        })?;
-        fs::rename(&tmp_path, &path).map_err(|source| MissionMetricsError::Io {
-            path: path.clone(),
-            source,
-        })?;
-        Ok(())
+        magi_core::fs_atomic::write_atomic(&path, rendered)
+            .map_err(|source| MissionMetricsError::Io { path, source })
     }
 }
 

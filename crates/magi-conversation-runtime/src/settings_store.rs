@@ -97,9 +97,7 @@ impl SettingsStore {
         let sections = self.sections.read().unwrap();
         let content = serde_json::to_vec_pretty(&*sections)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-        let temp_path = temp_path_for(path);
-        fs::write(&temp_path, content)?;
-        fs::rename(temp_path, path)?;
+        magi_core::fs_atomic::write_atomic(path, content)?;
         Ok(())
     }
 
@@ -279,16 +277,6 @@ impl SettingsStore {
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect()
     }
-}
-
-/// 生成临时文件路径，用于原子写入
-fn temp_path_for(path: &PathBuf) -> PathBuf {
-    let mut file_name = path
-        .file_name()
-        .map(|name| name.to_string_lossy().to_string())
-        .unwrap_or_else(|| "settings.json".to_string());
-    file_name.push_str(".tmp");
-    path.with_file_name(file_name)
 }
 
 fn session_section_key(session_id: &SessionId, section: &str) -> String {

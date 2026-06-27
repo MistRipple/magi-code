@@ -69,6 +69,7 @@ pub(crate) fn refine_new_session_title_and_publish(
             Some(&state.settings_store),
             None,
             magi_conversation_runtime::task_execution_dispatcher::RoleTarget::Auxiliary,
+            None,
         )
         .ok()
         .flatten()

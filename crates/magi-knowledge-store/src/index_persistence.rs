@@ -70,7 +70,7 @@ impl IndexPersistence {
 
         let compressed = compress_gzip(json_str.as_bytes())?;
 
-        fs::write(&self.cache_file_path, &compressed)
+        magi_core::fs_atomic::write_atomic(&self.cache_file_path, &compressed)
             .map_err(|e| format!("write failed: {}", e))?;
 
         if self.legacy_cache_file_path.exists() {

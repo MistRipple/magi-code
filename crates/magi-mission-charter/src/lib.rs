@@ -264,7 +264,8 @@ impl MissionCharterStore {
             })?;
         }
         let rendered = render_charter(charter);
-        fs::write(&path, rendered).map_err(|source| MissionCharterError::Io { path, source })
+        magi_core::fs_atomic::write_atomic(&path, rendered)
+            .map_err(|source| MissionCharterError::Io { path, source })
     }
 
     /// 为 system prompt 渲染 charter 段落。返回 None 表示尚未建立 charter。

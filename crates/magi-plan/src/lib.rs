@@ -168,7 +168,8 @@ impl PlanStore {
             })?;
         }
         let rendered = render_plan(plan);
-        fs::write(&path, rendered).map_err(|source| PlanError::Io { path, source })
+        magi_core::fs_atomic::write_atomic(&path, rendered)
+            .map_err(|source| PlanError::Io { path, source })
     }
 
     pub fn render_for_prompt(&self, mission_id: &MissionId) -> Result<Option<String>, PlanError> {

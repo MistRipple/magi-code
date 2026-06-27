@@ -155,7 +155,8 @@ impl KnowledgeGraphStore {
             })?;
         }
         let rendered = render_graph(graph);
-        fs::write(&path, rendered).map_err(|source| KnowledgeGraphError::Io { path, source })
+        magi_core::fs_atomic::write_atomic(&path, rendered)
+            .map_err(|source| KnowledgeGraphError::Io { path, source })
     }
 
     /// 为 system prompt 渲染 KG 段落。空 KG 返回 None，不噪音注入。

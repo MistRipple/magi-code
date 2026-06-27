@@ -608,7 +608,6 @@ pub struct RuntimeStatePersistence {
     write_lock: Arc<Mutex<()>>,
 }
 
-static RUNTIME_PERSISTENCE_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 const SESSION_PERSISTENCE_PUBLIC_ERROR: &str = "会话状态暂不可保存，请稍后重试";
 const WORKSPACE_PERSISTENCE_PUBLIC_ERROR: &str = "工作区状态暂不可保存，请稍后重试";
 const KNOWLEDGE_PERSISTENCE_PUBLIC_ERROR: &str = "知识库状态暂不可保存，请稍后重试";
@@ -643,13 +642,10 @@ impl RuntimeStatePersistence {
             fs::create_dir_all(parent)
                 .map_err(|error| ApiError::internal_assembly("创建运行态持久化目录失败", error))?;
         }
-        let temp_path = temp_path_for(path);
         let payload = serde_json::to_vec_pretty(value)
             .map_err(|error| ApiError::internal_assembly("序列化运行态持久化数据失败", error))?;
-        fs::write(&temp_path, payload)
-            .map_err(|error| ApiError::internal_assembly("写入运行态持久化临时文件失败", error))?;
-        fs::rename(&temp_path, path)
-            .map_err(|error| ApiError::internal_assembly("提交运行态持久化文件失败", error))?;
+        magi_core::fs_atomic::write_atomic(path, payload)
+            .map_err(|error| ApiError::internal_assembly("写入运行态持久化文件失败", error))?;
         Ok(())
     }
 
@@ -660,16 +656,6 @@ impl RuntimeStatePersistence {
     fn save_knowledge_store(&self, store: &KnowledgeStore) -> Result<(), ApiError> {
         self.save_json(&self.knowledge_path, &store.export_state())
     }
-}
-
-fn temp_path_for(path: &Path) -> PathBuf {
-    let mut file_name = path
-        .file_name()
-        .map(|name| name.to_string_lossy().to_string())
-        .unwrap_or_else(|| "runtime-state.json".to_string());
-    let nonce = RUNTIME_PERSISTENCE_TEMP_COUNTER.fetch_add(1, Ordering::SeqCst);
-    file_name.push_str(&format!(".{nonce}.tmp"));
-    path.with_file_name(file_name)
 }
 
 fn public_runtime_persistence_error(

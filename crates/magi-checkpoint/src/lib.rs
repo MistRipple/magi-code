@@ -304,7 +304,8 @@ impl CheckpointStore {
             })?;
         }
         let rendered = render_log(log);
-        fs::write(&path, rendered).map_err(|source| CheckpointError::Io { path, source })
+        magi_core::fs_atomic::write_atomic(&path, rendered)
+            .map_err(|source| CheckpointError::Io { path, source })
     }
 
     /// 为 system prompt 渲染最近若干 Checkpoint。空日志返回 None。
