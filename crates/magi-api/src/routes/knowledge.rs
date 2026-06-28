@@ -172,11 +172,11 @@ fn new_knowledge_id(prefix: &str) -> String {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct KnowledgeWorkspaceRequest {
-    #[serde(default, alias = "workspace_id")]
+    #[serde(default)]
     workspace_id: Option<String>,
-    #[serde(default, alias = "workspace_path")]
+    #[serde(default)]
     workspace_path: Option<String>,
 }
 
@@ -195,12 +195,12 @@ async fn clear_knowledge(
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct KnowledgeItemsQuery {
     kind: Option<KnowledgeKindParam>,
-    #[serde(default, alias = "workspace_id")]
+    #[serde(default)]
     workspace_id: Option<String>,
-    #[serde(default, alias = "workspace_path")]
+    #[serde(default)]
     workspace_path: Option<String>,
 }
 
@@ -235,12 +235,12 @@ async fn list_knowledge_items(
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct KnowledgeSearchQuery {
     kind: Option<KnowledgeKindParam>,
-    #[serde(default, alias = "workspace_id")]
+    #[serde(default)]
     workspace_id: Option<String>,
-    #[serde(default, alias = "workspace_path")]
+    #[serde(default)]
     workspace_path: Option<String>,
     q: Option<String>,
 }
@@ -399,12 +399,12 @@ fn code_index_status_json(
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct AddKnowledgeItemRequest {
     kind: KnowledgeKindParam,
-    #[serde(default, alias = "workspace_id")]
+    #[serde(default)]
     workspace_id: Option<String>,
-    #[serde(default, alias = "workspace_path")]
+    #[serde(default)]
     workspace_path: Option<String>,
     #[serde(default)]
     title: Option<String>,
@@ -475,11 +475,11 @@ async fn add_knowledge_item(
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct UpdateKnowledgeItemRequest {
-    #[serde(default, alias = "workspace_id")]
+    #[serde(default)]
     workspace_id: Option<String>,
-    #[serde(default, alias = "workspace_path")]
+    #[serde(default)]
     workspace_path: Option<String>,
     knowledge_id: String,
     #[serde(default)]
@@ -545,11 +545,11 @@ async fn update_knowledge_item(
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct DeleteKnowledgeItemRequest {
-    #[serde(default, alias = "workspace_id")]
+    #[serde(default)]
     workspace_id: Option<String>,
-    #[serde(default, alias = "workspace_path")]
+    #[serde(default)]
     workspace_path: Option<String>,
     knowledge_id: String,
 }
@@ -671,6 +671,32 @@ mod tests {
         assert_ne!(first, second);
         assert!(first.starts_with("learning-"));
         assert!(second.starts_with("learning-"));
+    }
+
+    #[test]
+    fn knowledge_requests_reject_legacy_snake_case_fields() {
+        serde_json::from_value::<KnowledgeWorkspaceRequest>(serde_json::json!({
+            "workspace_id": "workspace-knowledge"
+        }))
+        .expect_err("knowledge workspace request 不得继续接受 snake_case 请求字段");
+
+        serde_json::from_value::<AddKnowledgeItemRequest>(serde_json::json!({
+            "kind": "learning",
+            "workspace_path": "/tmp/magi-knowledge",
+            "content": "legacy payload"
+        }))
+        .expect_err("knowledge mutation request 不得继续接受 snake_case 请求字段");
+
+        let request = serde_json::from_value::<AddKnowledgeItemRequest>(serde_json::json!({
+            "kind": "learning",
+            "workspacePath": "/tmp/magi-knowledge",
+            "content": "canonical payload"
+        }))
+        .expect("canonical camelCase knowledge request");
+        assert_eq!(
+            request.workspace_path.as_deref(),
+            Some("/tmp/magi-knowledge")
+        );
     }
 
     #[tokio::test]

@@ -68,12 +68,12 @@ pub fn routes() -> Router<ApiState> {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct DeleteSessionRequest {
     session_id: String,
-    #[serde(default, alias = "workspace_id")]
+    #[serde(default)]
     workspace_id: Option<String>,
-    #[serde(default, alias = "workspace_path")]
+    #[serde(default)]
     workspace_path: Option<String>,
 }
 
@@ -1953,12 +1953,12 @@ fn publish_session_turn_continue_event(
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SwitchSessionRequest {
     session_id: String,
-    #[serde(default, alias = "workspace_id")]
+    #[serde(default)]
     workspace_id: Option<String>,
-    #[serde(default, alias = "workspace_path")]
+    #[serde(default)]
     workspace_path: Option<String>,
 }
 
@@ -1973,21 +1973,18 @@ impl SwitchSessionRequest {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ContinueSessionRequest {
     session_id: String,
-    #[serde(default, alias = "workspace_id")]
+    #[serde(default)]
     workspace_id: Option<String>,
-    #[serde(default, alias = "workspace_path")]
+    #[serde(default)]
     workspace_path: Option<String>,
     prompt_text: Option<String>,
     #[serde(default)]
     requested_agent_ids: Vec<String>,
-    #[serde(alias = "request_id")]
     request_id: Option<String>,
-    #[serde(alias = "user_message_id")]
     user_message_id: Option<String>,
-    #[serde(alias = "placeholder_message_id")]
     placeholder_message_id: Option<String>,
 }
 
@@ -2002,12 +1999,12 @@ impl ContinueSessionRequest {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct InterruptSessionTurnRequest {
     session_id: Option<String>,
-    #[serde(default, alias = "workspace_id")]
+    #[serde(default)]
     workspace_id: Option<String>,
-    #[serde(default, alias = "workspace_path")]
+    #[serde(default)]
     workspace_path: Option<String>,
 }
 
@@ -2552,13 +2549,13 @@ async fn delete_session(
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RenameSessionRequest {
     session_id: String,
     name: String,
-    #[serde(default, alias = "workspace_id")]
+    #[serde(default)]
     workspace_id: Option<String>,
-    #[serde(default, alias = "workspace_path")]
+    #[serde(default)]
     workspace_path: Option<String>,
 }
 
@@ -2595,12 +2592,12 @@ async fn rename_session(
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CloseSessionRequest {
     session_id: String,
-    #[serde(default, alias = "workspace_id")]
+    #[serde(default)]
     workspace_id: Option<String>,
-    #[serde(default, alias = "workspace_path")]
+    #[serde(default)]
     workspace_path: Option<String>,
 }
 
@@ -2641,12 +2638,12 @@ async fn close_session(
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct NotificationsQuery {
     session_id: Option<String>,
-    #[serde(default, alias = "workspace_id")]
+    #[serde(default)]
     workspace_id: Option<String>,
-    #[serde(default, alias = "workspace_path")]
+    #[serde(default)]
     workspace_path: Option<String>,
 }
 
@@ -2683,12 +2680,12 @@ async fn get_notifications(
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct NotificationScopeRequest {
     session_id: Option<String>,
-    #[serde(default, alias = "workspace_id")]
+    #[serde(default)]
     workspace_id: Option<String>,
-    #[serde(default, alias = "workspace_path")]
+    #[serde(default)]
     workspace_path: Option<String>,
 }
 
@@ -2707,12 +2704,12 @@ impl NotificationScopeRequest {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct AppendNotificationRequest {
     session_id: Option<String>,
-    #[serde(default, alias = "workspace_id")]
+    #[serde(default)]
     workspace_id: Option<String>,
-    #[serde(default, alias = "workspace_path")]
+    #[serde(default)]
     workspace_path: Option<String>,
     notification_id: Option<String>,
     kind: Option<String>,
@@ -2837,12 +2834,12 @@ async fn mark_all_notifications_read(
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ClearNotificationsRequest {
     session_id: Option<String>,
-    #[serde(default, alias = "workspace_id")]
+    #[serde(default)]
     workspace_id: Option<String>,
-    #[serde(default, alias = "workspace_path")]
+    #[serde(default)]
     workspace_path: Option<String>,
 }
 
@@ -2883,12 +2880,12 @@ async fn clear_notifications(
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RemoveNotificationRequest {
     session_id: Option<String>,
-    #[serde(default, alias = "workspace_id")]
+    #[serde(default)]
     workspace_id: Option<String>,
-    #[serde(default, alias = "workspace_path")]
+    #[serde(default)]
     workspace_path: Option<String>,
     notification_id: String,
 }
@@ -3186,6 +3183,44 @@ mod tests {
             supplement_context: false,
             target_task_id: None,
         }
+    }
+
+    #[test]
+    fn session_turn_request_rejects_legacy_snake_case_fields() {
+        serde_json::from_value::<SessionTurnRequestDto>(serde_json::json!({
+            "workspace_id": "workspace-turn",
+            "session_id": "session-turn",
+            "request_id": "request-turn",
+            "text": "legacy turn"
+        }))
+        .expect_err("session turn request 不得继续接受 snake_case 请求字段");
+
+        serde_json::from_value::<SessionTurnRequestDto>(serde_json::json!({
+            "workspaceId": "workspace-turn",
+            "sessionId": "session-turn",
+            "requestId": "request-turn",
+            "images": [{
+                "name": "a.png",
+                "data_url": "data:image/png;base64,AA=="
+            }],
+            "text": "legacy image field"
+        }))
+        .expect_err("session turn image 不得继续接受 data_url 请求字段");
+
+        let request = serde_json::from_value::<SessionTurnRequestDto>(serde_json::json!({
+            "workspaceId": "workspace-turn",
+            "sessionId": "session-turn",
+            "requestId": "request-turn",
+            "images": [{
+                "name": "a.png",
+                "dataUrl": "data:image/png;base64,AA=="
+            }],
+            "text": "canonical turn"
+        }))
+        .expect("canonical camelCase session turn request");
+        assert_eq!(request.workspace_id.as_deref(), Some("workspace-turn"));
+        assert_eq!(request.request_id.as_deref(), Some("request-turn"));
+        assert_eq!(request.images[0].data_url, "data:image/png;base64,AA==");
     }
 
     fn test_root_task(task_id: &str, mission_id: &str) -> Task {

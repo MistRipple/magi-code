@@ -18,12 +18,12 @@ pub fn routes() -> Router<ApiState> {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct MessagesQuery {
     session_id: Option<String>,
-    #[serde(default, alias = "workspace_id")]
+    #[serde(default)]
     workspace_id: Option<String>,
-    #[serde(default, alias = "workspace_path")]
+    #[serde(default)]
     workspace_path: Option<String>,
     limit: Option<usize>,
     before_cursor: Option<String>,

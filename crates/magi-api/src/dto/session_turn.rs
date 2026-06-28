@@ -4,42 +4,35 @@ use magi_session_store::{CANONICAL_TURN_SCHEMA_VERSION, CanonicalTurn, Canonical
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SessionTurnImageDto {
     pub name: String,
-    #[serde(alias = "data_url")]
     pub data_url: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SessionTurnRequestDto {
-    #[serde(alias = "session_id")]
     pub session_id: Option<String>,
-    #[serde(alias = "workspace_id")]
     pub workspace_id: Option<String>,
-    #[serde(default, alias = "workspace_path")]
+    #[serde(default)]
     pub workspace_path: Option<String>,
     pub text: Option<String>,
-    #[serde(alias = "skill_name")]
     pub skill_name: Option<String>,
     #[serde(default)]
     pub images: Vec<SessionTurnImageDto>,
-    #[serde(default, alias = "access_profile")]
+    #[serde(default)]
     pub access_profile: Option<AccessProfile>,
-    #[serde(alias = "request_id")]
     pub request_id: Option<String>,
-    #[serde(alias = "user_message_id")]
     pub user_message_id: Option<String>,
-    #[serde(alias = "placeholder_message_id")]
     pub placeholder_message_id: Option<String>,
     /// 当为 true 时，本次输入直接作为运行时 followup 信号投递到目标任务 Mailbox，
     /// 不进入分类器，也不创建新任务。
-    #[serde(default, alias = "supplement_context")]
+    #[serde(default)]
     pub supplement_context: bool,
     /// 当 `supplement_context` 为 true 时，可选指定投递到哪个任务；
     /// 缺省投递到当前 mission 的 root task。
-    #[serde(default, alias = "target_task_id")]
+    #[serde(default)]
     pub target_task_id: Option<String>,
 }
 

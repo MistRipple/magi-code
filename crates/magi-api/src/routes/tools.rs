@@ -15,25 +15,25 @@ pub fn routes() -> Router<ApiState> {
 }
 
 #[derive(Debug, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ToolCatalogQuery {
-    #[serde(default, alias = "include_internal")]
+    #[serde(default)]
     include_internal: Option<bool>,
-    #[serde(default, alias = "include_schema")]
+    #[serde(default)]
     include_schema: Option<bool>,
-    #[serde(default, alias = "include_external")]
+    #[serde(default)]
     include_external: Option<bool>,
-    #[serde(default, alias = "include_mcp_servers")]
+    #[serde(default)]
     include_mcp_servers: Option<bool>,
-    #[serde(default, alias = "include_agent_roles")]
+    #[serde(default)]
     include_agent_roles: Option<bool>,
-    #[serde(default, alias = "session_id")]
+    #[serde(default)]
     session_id: Option<String>,
-    #[serde(default, alias = "workspace_id")]
+    #[serde(default)]
     workspace_id: Option<String>,
-    #[serde(default, alias = "workspace_path")]
+    #[serde(default)]
     workspace_path: Option<String>,
-    #[serde(default, alias = "access_profile")]
+    #[serde(default)]
     access_profile: Option<String>,
 }
 
@@ -137,6 +137,23 @@ mod tests {
             )
         });
         (status, body)
+    }
+
+    #[test]
+    fn tool_catalog_query_rejects_legacy_snake_case_fields() {
+        serde_json::from_value::<ToolCatalogQuery>(serde_json::json!({
+            "include_internal": true,
+            "workspace_id": "workspace-tools"
+        }))
+        .expect_err("tools catalog query 不得继续接受 snake_case 请求字段");
+
+        let query = serde_json::from_value::<ToolCatalogQuery>(serde_json::json!({
+            "includeInternal": true,
+            "workspaceId": "workspace-tools"
+        }))
+        .expect("canonical camelCase tools query");
+        assert_eq!(query.include_internal, Some(true));
+        assert_eq!(query.workspace_id.as_deref(), Some("workspace-tools"));
     }
 
     #[tokio::test]

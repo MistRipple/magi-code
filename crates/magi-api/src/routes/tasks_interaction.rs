@@ -151,12 +151,12 @@ fn require_session_historical_task(
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct TaskIdRequest {
     task_id: String,
     session_id: Option<String>,
     workspace_id: Option<String>,
-    #[serde(default, alias = "workspace_path")]
+    #[serde(default)]
     workspace_path: Option<String>,
 }
 

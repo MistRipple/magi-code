@@ -229,12 +229,10 @@ async fn pick_workspace(State(state): State<ApiState>) -> Json<serde_json::Value
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct WorkspaceSessionsQuery {
-    #[serde(rename = "workspaceId", alias = "workspace_id")]
     workspace_id: Option<String>,
-    #[serde(rename = "workspacePath", alias = "workspace_path")]
     workspace_path: Option<String>,
-    #[serde(rename = "sessionId", alias = "session_id")]
     session_id: Option<String>,
 }
 

@@ -41,11 +41,11 @@ fn require_task_store(
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SessionScopedTaskQuery {
     session_id: Option<String>,
     workspace_id: Option<String>,
-    #[serde(default, alias = "workspace_path")]
+    #[serde(default)]
     workspace_path: Option<String>,
     limit: Option<usize>,
 }

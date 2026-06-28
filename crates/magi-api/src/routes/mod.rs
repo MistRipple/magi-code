@@ -96,12 +96,10 @@ async fn health(State(state): State<ApiState>) -> Json<HealthDto> {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct BootstrapQuery {
-    #[serde(rename = "sessionId", alias = "session_id")]
     session_id: Option<String>,
-    #[serde(rename = "workspaceId", alias = "workspace_id")]
     workspace_id: Option<String>,
-    #[serde(rename = "workspacePath", alias = "workspace_path")]
     workspace_path: Option<String>,
 }
 
@@ -208,14 +206,11 @@ async fn version(State(state): State<ApiState>) -> Json<VersionHandshakeDto> {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct EventStreamQuery {
-    #[serde(rename = "workspaceId", alias = "workspace_id")]
     workspace_id: Option<String>,
-    #[serde(rename = "workspacePath", alias = "workspace_path")]
     workspace_path: Option<String>,
-    #[serde(rename = "sessionId", alias = "session_id")]
     session_id: Option<String>,
-    #[serde(rename = "afterSequence", alias = "after_sequence")]
     after_sequence: Option<u64>,
 }
 
