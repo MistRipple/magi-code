@@ -112,18 +112,35 @@ fn orchestrator_session_override_request(request: &serde_json::Value) -> Result<
     Ok(Value::Object(override_config))
 }
 
-fn parse_optional_query_string(
-    query: &HashMap<String, String>,
-    camel_key: &str,
-    snake_key: &str,
-) -> Option<String> {
+fn parse_optional_query_string(query: &HashMap<String, String>, key: &str) -> Option<String> {
     query
-        .get(camel_key)
-        .or_else(|| query.get(snake_key))
+        .get(key)
         .map(String::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
+}
+
+fn reject_deprecated_scope_query_fields(query: &HashMap<String, String>) -> Result<(), ApiError> {
+    for key in ["session_id", "workspace_id", "workspace_path"] {
+        if query.contains_key(key) {
+            return Err(ApiError::InvalidInput(format!(
+                "{key} 已废弃，请使用 camelCase scope 字段"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn reject_deprecated_scope_body_fields(request: &Value) -> Result<(), ApiError> {
+    for key in ["session_id", "workspace_id", "workspace_path"] {
+        if request.get(key).is_some() {
+            return Err(ApiError::InvalidInput(format!(
+                "{key} 已废弃，请使用 camelCase scope 字段"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn parse_access_profile_query(query: &HashMap<String, String>) -> AccessProfile {
@@ -769,13 +786,14 @@ async fn settings_bootstrap(
     State(state): State<ApiState>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    reject_deprecated_scope_query_fields(&query)?;
     let hydrate_mcp_servers = query
         .get("scope")
         .map(|value| value.trim())
         .is_none_or(|scope| scope != "core");
-    let session_id = parse_optional_query_string(&query, "sessionId", "session_id");
-    let workspace_id = parse_optional_query_string(&query, "workspaceId", "workspace_id");
-    let workspace_path = parse_optional_query_string(&query, "workspacePath", "workspace_path");
+    let session_id = parse_optional_query_string(&query, "sessionId");
+    let workspace_id = parse_optional_query_string(&query, "workspaceId");
+    let workspace_path = parse_optional_query_string(&query, "workspacePath");
     let scope = session_scope::resolve_optional_session_workspace_scope(
         &state,
         session_id.as_deref(),
@@ -932,17 +950,15 @@ async fn save_orchestrator_session_config(
     State(state): State<ApiState>,
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    reject_deprecated_scope_body_fields(&request)?;
     let session_id = request
         .get("sessionId")
-        .or_else(|| request.get("session_id"))
         .and_then(Value::as_str);
     let workspace_id = request
         .get("workspaceId")
-        .or_else(|| request.get("workspace_id"))
         .and_then(Value::as_str);
     let workspace_path = request
         .get("workspacePath")
-        .or_else(|| request.get("workspace_path"))
         .and_then(Value::as_str);
     let scope = session_scope::require_session_workspace_scope(
         &state,
@@ -1224,14 +1240,15 @@ async fn session_stats(
     State(state): State<ApiState>,
     Query(query): Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    reject_deprecated_scope_query_fields(&query)?;
     let workspace_id = session_scope::require_registered_workspace_binding(
         &state,
-        parse_optional_query_string(&query, "workspaceId", "workspace_id").as_deref(),
-        parse_optional_query_string(&query, "workspacePath", "workspace_path").as_deref(),
+        parse_optional_query_string(&query, "workspaceId").as_deref(),
+        parse_optional_query_string(&query, "workspacePath").as_deref(),
     )?
     .workspace_id
     .to_string();
-    let session_id = parse_optional_query_string(&query, "sessionId", "session_id");
+    let session_id = parse_optional_query_string(&query, "sessionId");
     let mut authority = usage_authority_from_model_usage_ledger(&state);
     if let Some(session_id) = session_id.as_deref() {
         let snapshot = authority.get_session_snapshot(&workspace_id, session_id);
@@ -1349,15 +1366,14 @@ async fn reset_stats(
     State(state): State<ApiState>,
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    reject_deprecated_scope_body_fields(&request)?;
     let workspace_id_value = request
         .get("workspaceId")
-        .or_else(|| request.get("workspace_id"))
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty());
     let workspace_path_value = request
         .get("workspacePath")
-        .or_else(|| request.get("workspace_path"))
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty());
@@ -1370,7 +1386,6 @@ async fn reset_stats(
     .to_string();
     let session_id = request
         .get("sessionId")
-        .or_else(|| request.get("session_id"))
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty());
@@ -2039,6 +2054,56 @@ mod tests {
 
         assert_eq!(bootstrap["workspaceId"], json!(workspace_id.as_str()));
         assert_eq!(bootstrap["workspacePath"], json!(workspace_path));
+    }
+
+    #[tokio::test]
+    async fn settings_scope_rejects_deprecated_snake_case_fields() {
+        let bootstrap_result = settings_bootstrap(
+            State(test_state()),
+            Query(HashMap::from([(
+                "session_id".to_string(),
+                "session-old".to_string(),
+            )])),
+        )
+        .await;
+        assert_deprecated_scope_field_error(bootstrap_result, "session_id");
+
+        let stats_result = session_stats(
+            State(test_state()),
+            Query(HashMap::from([(
+                "workspace_id".to_string(),
+                "workspace-old".to_string(),
+            )])),
+        )
+        .await;
+        assert_deprecated_scope_field_error(stats_result, "workspace_id");
+
+        let reset_result = reset_stats(
+            State(test_state()),
+            Json(json!({ "workspace_path": "/tmp/old" })),
+        )
+        .await;
+        assert_deprecated_scope_field_error(reset_result, "workspace_path");
+
+        let session_save_result = save_orchestrator_session_config(
+            State(test_state()),
+            Json(json!({ "session_id": "session-old" })),
+        )
+        .await;
+        assert_deprecated_scope_field_error(session_save_result, "session_id");
+    }
+
+    fn assert_deprecated_scope_field_error<T: std::fmt::Debug>(
+        result: Result<Json<T>, ApiError>,
+        expected_field: &str,
+    ) {
+        match result {
+            Err(ApiError::InvalidInput(message)) => {
+                assert!(message.contains(expected_field), "{message}");
+                assert!(message.contains("已废弃"), "{message}");
+            }
+            other => panic!("expected deprecated scope field error, got {other:?}"),
+        }
     }
 
     #[tokio::test]

@@ -659,7 +659,7 @@ pub fn tool_path_access_requests(
                 workspace_root_path,
             );
         }
-        crate::BuiltinToolName::SearchText | crate::BuiltinToolName::CodeSymbols => {
+        crate::BuiltinToolName::SearchText => {
             push_tool_path_fields(
                 &mut paths,
                 object,
@@ -678,6 +678,9 @@ pub fn tool_path_access_requests(
                 read,
                 workspace_root_path,
             );
+        }
+        crate::BuiltinToolName::CodeSymbols => {
+            push_tool_path_fields(&mut paths, object, &["path"], read, workspace_root_path);
         }
         crate::BuiltinToolName::ShellExec => {
             let shell_kind =

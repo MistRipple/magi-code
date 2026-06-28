@@ -27,7 +27,7 @@ pub fn routes() -> Router<ApiState> {
 #[serde(rename_all = "camelCase")]
 struct WorkspaceDto {
     workspace_id: String,
-    path: String,
+    root_path: String,
     name: Option<String>,
     is_active: bool,
 }
@@ -69,7 +69,7 @@ async fn list_workspaces(State(state): State<ApiState>) -> Json<WorkspaceListRes
             let active_id = state.workspace_registry.active_workspace_id();
             WorkspaceDto {
                 workspace_id: w.workspace_id.to_string(),
-                path: w.root_path.to_string(),
+                root_path: w.root_path.to_string(),
                 name: w.name.clone(),
                 is_active: active_id.as_ref() == Some(&w.workspace_id),
             }
@@ -221,7 +221,7 @@ async fn pick_workspace(State(state): State<ApiState>) -> Json<serde_json::Value
     Json(serde_json::json!({
         "workspaces": workspaces.iter().map(|w| serde_json::json!({
             "workspaceId": w.workspace_id.to_string(),
-            "path": w.root_path.to_string(),
+            "rootPath": w.root_path.to_string(),
             "name": w.name.clone(),
             "isActive": active_id.as_ref() == Some(&w.workspace_id),
         })).collect::<Vec<_>>(),
@@ -275,7 +275,7 @@ async fn workspace_sessions(
     let active_id = state.workspace_registry.active_workspace_id();
     let workspace_dto = WorkspaceDto {
         workspace_id: workspace.workspace_id.to_string(),
-        path: workspace.root_path.to_string(),
+        root_path: workspace.root_path.to_string(),
         name: workspace.name.clone(),
         is_active: active_id.as_ref() == Some(&workspace.workspace_id),
     };
@@ -766,7 +766,7 @@ mod tests {
         let payload = read_json_response(response).await;
         assert_eq!(payload["workspace"]["workspaceId"], workspace_id.as_str());
         assert_eq!(
-            payload["workspace"]["path"],
+            payload["workspace"]["rootPath"],
             root.to_string_lossy().as_ref()
         );
         assert_eq!(payload["sessionId"], "session-path-bound");

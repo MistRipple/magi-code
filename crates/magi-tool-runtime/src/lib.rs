@@ -976,8 +976,8 @@ impl BuiltinToolName {
                         "enum": ["definition", "goto_definition", "file_symbols", "list_file_symbols"],
                         "description": "definition/goto_definition：按符号名查定义；file_symbols/list_file_symbols：列出某文件的全部符号"
                     },
-                    "name": { "type": "string", "description": "action=definition/goto_definition 时的符号名（函数/类/接口/类型等）；也兼容 symbol/query 字段" },
-                    "path": { "type": "string", "description": "action=file_symbols/list_file_symbols 时的文件路径（相对工作区根）；也兼容 file/file_path/filePath/filepath 字段" },
+                    "name": { "type": "string", "description": "action=definition/goto_definition 时的符号名（函数/类/接口/类型等）" },
+                    "path": { "type": "string", "description": "action=file_symbols/list_file_symbols 时的文件路径（相对工作区根）" },
                     "limit": { "type": "integer", "description": "definition 最多返回多少个匹配（默认 20）" }
                 },
                 "required": ["action"]
@@ -5410,7 +5410,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_applies_path_policy_to_code_symbols_file_path_alias() {
+    fn registry_applies_path_policy_to_code_symbols_path() {
         let workspace = unique_temp_dir("magi-tool-runtime-code-symbols-policy-workspace");
         let outside = unique_temp_dir("magi-tool-runtime-code-symbols-policy-outside");
         let registry = make_registry();
@@ -5421,7 +5421,7 @@ mod tests {
                 BuiltinToolName::CodeSymbols.as_str(),
                 serde_json::json!({
                     "action": "list_file_symbols",
-                    "filePath": outside.join("src/auth.rs").to_string_lossy()
+                    "path": outside.join("src/auth.rs").to_string_lossy()
                 })
                 .to_string(),
             ),
@@ -7484,15 +7484,14 @@ mod tests {
             "工作区内绝对路径必须归一化到符号索引使用的相对路径"
         );
 
-        // 兼容常见动作与字段别名，避免模型因不同命名习惯调用失败。
-        let alias = tool_registry.execute_with_policy(
+        let action_alias = tool_registry.execute_with_policy(
             ToolExecutionInput {
                 tool_call_id: ToolCallId::new("tc-list-alias"),
                 tool_name: BuiltinToolName::CodeSymbols.as_str().to_string(),
                 tool_kind: ToolKind::Builtin,
                 input: serde_json::json!({
                     "action": "list_file_symbols",
-                    "filePath": "src/auth.rs"
+                    "path": "src/auth.rs"
                 })
                 .to_string(),
                 approval_requirement: ApprovalRequirement::None,
@@ -7501,8 +7500,9 @@ mod tests {
             context.clone(),
             &ToolExecutionPolicy::default(),
         );
-        assert_eq!(alias.status, ExecutionResultStatus::Succeeded);
-        let alias_payload: Value = serde_json::from_str(&alias.payload).expect("alias json");
+        assert_eq!(action_alias.status, ExecutionResultStatus::Succeeded);
+        let alias_payload: Value =
+            serde_json::from_str(&action_alias.payload).expect("action alias json");
         assert_eq!(alias_payload["action"], "file_symbols");
         assert_eq!(
             alias_payload["returned_matches"],
@@ -7516,13 +7516,13 @@ mod tests {
                 tool_kind: ToolKind::Builtin,
                 input: serde_json::json!({
                     "action": "goto_definition",
-                    "query": "Session"
+                    "name": "Session"
                 })
                 .to_string(),
                 approval_requirement: ApprovalRequirement::None,
                 risk_level: RiskLevel::Low,
             },
-            context,
+            context.clone(),
             &ToolExecutionPolicy::default(),
         );
         assert_eq!(goto.status, ExecutionResultStatus::Succeeded);
@@ -7537,6 +7537,28 @@ mod tests {
             "goto_definition alias 应命中 Session，实际: {}",
             goto_payload["results"]
         );
+
+        for input in [
+            serde_json::json!({ "action": "definition", "query": "Session" }),
+            serde_json::json!({ "action": "definition", "symbol": "Session" }),
+            serde_json::json!({ "action": "file_symbols", "filePath": "src/auth.rs" }),
+            serde_json::json!({ "action": "file_symbols", "file_path": "src/auth.rs" }),
+            serde_json::json!({ "action": "file_symbols", "file": "src/auth.rs" }),
+        ] {
+            let rejected = tool_registry.execute_with_policy(
+                ToolExecutionInput {
+                    tool_call_id: ToolCallId::new("tc-code-symbols-reject-legacy-field"),
+                    tool_name: BuiltinToolName::CodeSymbols.as_str().to_string(),
+                    tool_kind: ToolKind::Builtin,
+                    input: input.to_string(),
+                    approval_requirement: ApprovalRequirement::None,
+                    risk_level: RiskLevel::Low,
+                },
+                context.clone(),
+                &ToolExecutionPolicy::default(),
+            );
+            assert_eq!(rejected.status, ExecutionResultStatus::Failed);
+        }
 
         let _ = fs::remove_dir_all(&root);
     }

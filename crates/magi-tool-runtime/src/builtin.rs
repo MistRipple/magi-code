@@ -3093,7 +3093,7 @@ fn execute_code_symbols(
         "definition" | "goto_definition" => {
             let Some(name) = request
                 .as_ref()
-                .and_then(|obj| field_string(obj, &["name", "symbol", "query"]))
+                .and_then(|obj| field_string(obj, &["name"]))
             else {
                 return builtin_error("code_symbols", "action=definition 需要 name 字段");
             };
@@ -3119,9 +3119,10 @@ fn execute_code_symbols(
             .to_string()
         }
         "file_symbols" | "list_file_symbols" => {
-            let Some(path) = request.as_ref().and_then(|obj| {
-                field_string(obj, &["path", "file", "file_path", "filePath", "filepath"])
-            }) else {
+            let Some(path) = request
+                .as_ref()
+                .and_then(|obj| field_string(obj, &["path"]))
+            else {
                 return builtin_error("code_symbols", "action=file_symbols 需要 path 字段");
             };
             let path = normalize_code_symbols_file_path(&path, context);

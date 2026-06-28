@@ -85,33 +85,22 @@ export interface AgentWorkspacePickResult {
 
 interface RawAgentWorkspaceSummary {
   workspaceId?: string;
-  workspace_id?: string;
-  path?: string;
   rootPath?: string;
-  root_path?: string;
   name?: string | null;
   isActive?: boolean;
-  is_active?: boolean;
 }
 
 interface RawAgentSessionSummary {
   id?: string;
   sessionId?: string;
-  session_id?: string;
   workspaceId?: string;
-  workspace_id?: string;
   name?: string | null;
   title?: string | null;
   createdAt?: number;
-  created_at?: number;
   updatedAt?: number;
-  updated_at?: number;
   messageCount?: number;
-  message_count?: number;
   isRunning?: boolean;
-  is_running?: boolean;
   runningTaskCount?: number;
-  running_task_count?: number;
   preview?: string | null;
 }
 
@@ -276,9 +265,9 @@ function normalizeSettingsBootstrapPayload(
   ) as SettingsRuntimeSnapshot;
 
   return {
-    workspaceId: normalizeBindingString(payload.workspaceId ?? payload.workspace_id),
-    workspacePath: normalizeBindingString(payload.workspacePath ?? payload.workspace_path),
-    sessionId: normalizeBindingString(payload.sessionId ?? payload.session_id),
+    workspaceId: normalizeBindingString(payload.workspaceId),
+    workspacePath: normalizeBindingString(payload.workspacePath),
+    sessionId: normalizeBindingString(payload.sessionId),
     workerConfigs: (
       payload.workerConfigs
       && typeof payload.workerConfigs === 'object'
@@ -509,13 +498,13 @@ function deriveWorkspaceName(rootPath: string, workspaceId: string): string {
 }
 
 function normalizeWorkspaceSummary(raw: RawAgentWorkspaceSummary): AgentWorkspaceSummary {
-  const workspaceId = raw.workspaceId?.trim() || raw.workspace_id?.trim() || '';
-  const rootPath = raw.rootPath?.trim() || raw.root_path?.trim() || raw.path?.trim() || '';
+  const workspaceId = raw.workspaceId?.trim() || '';
+  const rootPath = raw.rootPath?.trim() || '';
   return {
     workspaceId,
     rootPath,
     name: deriveWorkspaceName(rootPath, workspaceId),
-    isActive: raw.isActive === true || raw.is_active === true,
+    isActive: raw.isActive === true,
   };
 }
 
@@ -534,15 +523,15 @@ function findCachedWorkspaceSummary(workspaceId: string): AgentWorkspaceSummary 
 }
 
 function normalizeSessionSummary(raw: RawAgentSessionSummary): AgentSessionSummary {
-  const id = raw.id?.trim() || raw.sessionId?.trim() || raw.session_id?.trim() || '';
-  const workspaceId = raw.workspaceId?.trim() || raw.workspace_id?.trim() || '';
-  const createdAt = raw.createdAt ?? raw.created_at ?? Date.now();
-  const updatedAt = raw.updatedAt ?? raw.updated_at ?? createdAt;
+  const id = raw.id?.trim() || raw.sessionId?.trim() || '';
+  const workspaceId = raw.workspaceId?.trim() || '';
+  const createdAt = raw.createdAt ?? Date.now();
+  const updatedAt = raw.updatedAt ?? createdAt;
   const name = raw.name?.trim() || raw.title?.trim() || undefined;
   const preview = raw.preview?.trim() || undefined;
-  const messageCount = raw.messageCount ?? raw.message_count;
-  const runningTaskCount = raw.runningTaskCount ?? raw.running_task_count;
-  const isRunning = raw.isRunning ?? raw.is_running;
+  const messageCount = raw.messageCount;
+  const runningTaskCount = raw.runningTaskCount;
+  const isRunning = raw.isRunning;
   return {
     id,
     ...(workspaceId ? { workspaceId } : {}),

@@ -46,7 +46,6 @@ export interface RustEventEnvelope {
 interface RustBootstrapSessionRecord {
   sessionId?: string;
   workspaceId?: string | null;
-  workspace_id?: string | null;
   title?: string | null;
   createdAt?: number;
   updatedAt?: number;
@@ -321,16 +320,12 @@ interface RustBootstrapDto {
   sessions?: RustBootstrapSessionRecord[];
   timeline?: RustTimelineEntry[];
   canonicalTurns?: unknown[];
-  canonical_turns?: unknown[];
   pendingChanges?: unknown[];
-  pending_changes?: unknown[];
   pendingChangesState?: unknown;
-  pending_changes_state?: unknown;
   workspaces?: RustBootstrapWorkspaceRecord[];
   runtimeReadModel?: RustRuntimeReadModelDto;
   notifications?: RustNotificationRecord[];
   eventStreamNextSequence?: number;
-  event_stream_next_sequence?: number;
   recentEvents?: RustEventEnvelope[];
   agent?: {
     runtimeEpoch?: string;
@@ -579,8 +574,7 @@ function normalizeRustSessions(
     if (!sessionId) {
       continue;
     }
-    const sessionWorkspaceId = normalizeString(session.workspaceId)
-      || normalizeString(session.workspace_id);
+    const sessionWorkspaceId = normalizeString(session.workspaceId);
     if (sessionWorkspaceId && workspaceId && sessionWorkspaceId !== workspaceId) {
       continue;
     }
@@ -614,8 +608,7 @@ function resolveSelectedWorkspace(
 ): { workspaceId: string; rootPath: string; name: string } {
   const requestedWorkspaceId = normalizeString(options.workspaceId);
   const requestedWorkspacePath = normalizeString(options.workspacePath);
-  const currentSessionWorkspaceId = normalizeString(payload.currentSession?.workspaceId)
-    || normalizeString(payload.currentSession?.workspace_id);
+  const currentSessionWorkspaceId = normalizeString(payload.currentSession?.workspaceId);
   const workspaces = Array.isArray(payload.workspaces) ? payload.workspaces : [];
   const selectedWorkspace = workspaces.find((workspace) => (
     requestedWorkspacePath && normalizeString(workspace.rootPath) === requestedWorkspacePath
@@ -1437,9 +1430,7 @@ export function normalizeRustBootstrapPayload(
     : [];
   const rawCanonicalTurns = Array.isArray(payload.canonicalTurns)
     ? payload.canonicalTurns
-    : Array.isArray(payload.canonical_turns)
-      ? payload.canonical_turns
-      : [];
+    : [];
   const canonicalTurns = rawCanonicalTurns
     .map(normalizeCanonicalTurn)
     .filter((turn): turn is CanonicalTurn => Boolean(turn));
@@ -1455,10 +1446,8 @@ export function normalizeRustBootstrapPayload(
   );
   const pendingChanges = Array.isArray(payload.pendingChanges)
     ? payload.pendingChanges
-    : Array.isArray(payload.pending_changes)
-      ? payload.pending_changes
-      : [];
-  const pendingChangesState = payload.pendingChangesState ?? payload.pending_changes_state ?? null;
+    : [];
+  const pendingChangesState = payload.pendingChangesState ?? null;
   const state: AppState = {
     ...buildEmptyWorkspaceAppState(generatedAt),
     sessions,
@@ -1485,10 +1474,7 @@ export function normalizeRustBootstrapPayload(
     sessions,
     state,
     canonicalTurns,
-    eventStreamNextSequence: normalizeNumber(
-      payload.eventStreamNextSequence ?? payload.event_stream_next_sequence,
-      0,
-    ),
+    eventStreamNextSequence: normalizeNumber(payload.eventStreamNextSequence, 0),
     notifications: currentSession?.id
         ? {
           sessionId: currentSession.id,

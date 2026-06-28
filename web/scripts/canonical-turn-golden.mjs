@@ -1443,30 +1443,6 @@ function assertBootstrapCarriesPendingChanges(contract) {
   );
   assert.equal(camelCaseBootstrap.state.pendingChangesStateVersion, 7200);
 
-  const snakeCaseBootstrap = contract.normalizeRustBootstrapPayload({
-    generatedAt: 7300,
-    currentSession: { sessionId: 'session-bootstrap-pending', title: 'pending', createdAt: 7000, updatedAt: 7300 },
-    sessions: [{ sessionId: 'session-bootstrap-pending', title: 'pending', createdAt: 7000, updatedAt: 7300 }],
-    workspaces: [{ workspaceId: 'workspace-bootstrap-pending', rootPath: '/tmp/bootstrap-pending' }],
-    pending_changes: [
-      {
-        filePath: 'modified.txt',
-        snapshotId: 'session:session-bootstrap-pending:modified.txt',
-        type: 'modify',
-        additions: 1,
-        deletions: 1,
-      },
-    ],
-  }, {
-    workspaceId: 'workspace-bootstrap-pending',
-    sessionId: 'session-bootstrap-pending',
-  });
-  assert.deepEqual(
-    snakeCaseBootstrap.state.pendingChanges?.map((change) => change.filePath),
-    ['modified.txt'],
-    'bootstrap should expose snake_case pending_changes through AppState',
-  );
-  assert.equal(snakeCaseBootstrap.state.pendingChangesStateVersion, 7300);
 }
 
 function assertBootstrapFiltersForeignWorkspaceSessions(contract) {
