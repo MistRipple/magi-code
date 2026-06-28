@@ -80,8 +80,6 @@
   const TOOL_DISPLAY_NAME_KEYS: Record<string, string> = {
     'tool_result': 'toolCall.displayName.default',
     'skill_apply': 'toolCall.displayName.skillApply',
-    'code_intel_query': 'toolCall.displayName.codeSymbols',
-    'list_files': 'toolCall.displayName.listFiles',
     'shell_exec': 'toolCall.displayName.shell',
     'file_read': 'toolCall.displayName.fileView',
     'view_image': 'toolCall.displayName.viewImage',
@@ -223,7 +221,6 @@
       'web_fetch': 'globe',
       'diagram_render': 'git-branch',
       'skill_apply': 'skill',
-      'code_intel_query': 'search',
       'shell_exec': 'terminal',
       'file_read': 'eye',
       'file_write': 'file-plus',
@@ -373,7 +370,7 @@
 
 
   // 目录/文件只读工具：只需紧凑 header
-  const isCompactReadOnlyTool = $derived(name === 'file_read' || name === 'list_files');
+  const isCompactReadOnlyTool = $derived(name === 'file_read');
   // 仅 view 类工具支持点击整行 header 打开文件
   const isHeaderOpenableTool = $derived(name === 'file_read' || name === 'view');
 
@@ -458,8 +455,7 @@
       case 'view_image':
       case 'file_write':
       case 'file_patch':
-      case 'apply_patch':
-      case 'list_files': {
+      case 'apply_patch': {
         return firstToolDisplayText(args.path, args.file_path, args.image_path);
       }
       case 'search_text':
@@ -469,11 +465,6 @@
         return normalizeToolDisplayText(args.query);
       case 'skill_apply':
         return normalizeToolDisplayText(args.skill_name);
-      case 'read_file':
-      case 'write_file':
-      case 'edit_file':
-      case 'delete_file':
-        return normalizeToolDisplayText(args.path);
       case 'file_remove': {
         const paths = args.paths;
         if (Array.isArray(paths) && paths.length > 0) {
@@ -493,11 +484,6 @@
         return normalizeToolDisplayText(args.query);
       case 'diagram_render':
         return normalizeToolDisplayText(args.title);
-      case 'code_intel_query': {
-        const action = normalizeToolDisplayText(args.action);
-        const fp = normalizeToolDisplayText(args.filePath);
-        return action && fp ? `${action} ${fp}` : action || fp;
-      }
       case 'process_inspect':
         return typeof args.pid === 'number' ? String(args.pid) : normalizeToolDisplayText(args.pid);
       case 'diff_preview':
@@ -1072,7 +1058,7 @@
     margin-top: var(--space-2);
   }
 
-  /* 只读查看工具（file_read / list_files）：紧凑但有卡片背景 */
+  /* 只读查看工具（file_read）：紧凑但有卡片背景 */
   .tool-call.compact-readonly {
     margin-top: var(--space-2);
   }
