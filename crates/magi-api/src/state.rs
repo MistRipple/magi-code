@@ -1496,7 +1496,7 @@ impl ApiState {
         };
 
         let durable = self.session_store.durable_state();
-        let (mut global_state, mut workspace_states) = durable.partition_by_workspace();
+        let (global_state, mut workspace_states) = durable.partition_by_workspace();
         let workspaces = self.workspace_registry.workspaces();
         for workspace in &workspaces {
             let ws_id = workspace.workspace_id.to_string();
@@ -1506,8 +1506,15 @@ impl ApiState {
             persistence.save_json(&session_path, &ws_state)?;
         }
 
-        for (_, orphan_state) in workspace_states {
-            global_state.append_state_without_current(orphan_state);
+        let orphan_session_count: usize = workspace_states
+            .values()
+            .map(|state| state.sessions.len())
+            .sum();
+        if orphan_session_count > 0 {
+            tracing::warn!(
+                orphan_session_count,
+                "跳过未注册 workspace 的会话持久化；workspace 绑定会话必须写入对应工作区状态"
+            );
         }
 
         let Some(state_root) = persistence.state_root() else {
@@ -2362,7 +2369,7 @@ mod tests {
     }
 
     #[test]
-    fn session_durable_persistence_keeps_orphan_workspace_sessions_without_current_pointer() {
+    fn session_durable_persistence_drops_orphan_workspace_sessions() {
         let state_root = std::env::temp_dir().join(format!(
             "magi-api-orphan-session-persistence-{}",
             UtcMillis::now().0
@@ -2396,16 +2403,10 @@ mod tests {
         state
             .persist_session_durable_state()
             .expect("session durable state should persist");
-        let persisted = std::fs::read_to_string(state_root.join("sessions.json"))
-            .expect("global session durable state should be written");
-        let durable: magi_session_store::SessionDurableState =
-            serde_json::from_str(&persisted).expect("persisted session state should parse");
-
-        assert_eq!(durable.current_session_id, None);
-        assert!(durable.sessions.iter().any(|session| {
-            session.session_id == session_id
-                && session.workspace_id.as_deref() == Some("workspace-missing-current")
-        }));
+        assert!(
+            !state_root.join("sessions.json").exists(),
+            "未注册 workspace 的绑定会话不能写回全局 sessions.json"
+        );
         let _ = std::fs::remove_dir_all(state_root);
     }
 

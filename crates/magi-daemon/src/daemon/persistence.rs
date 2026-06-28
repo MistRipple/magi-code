@@ -43,18 +43,18 @@ impl StateRepository {
     }
 
     /// 遍历所有工作区加载会话，合并为统一的 SessionDurableState。
-    /// 如果全局 sessions.json 仍存在（旧数据），执行一次性迁移后删除。
+    /// 全局 sessions.json 只承载未绑定 workspace 的会话；workspace 绑定会话必须归属到
+    /// 对应工作区的 .magi/sessions.json，找不到注册工作区时不再回灌到主状态。
     pub(crate) fn load_sessions_from_workspaces(
         &self,
         workspace_roots: &[(String, PathBuf)],
     ) -> Result<SessionDurableState, DaemonError> {
         let global_path = self.session_durable_state_path();
 
-        // 迁移：旧全局文件里如果仍携带 workspace 绑定会话，则分发回各工作区；
-        // 未绑定工作区的会话继续保留在全局 sessions.json。
         if global_path.exists() {
             let legacy = self.load_session_durable_state()?;
-            let (mut global_state, workspace_states) = legacy.partition_by_workspace();
+            let (global_state, workspace_states) = legacy.partition_by_workspace();
+            let mut orphan_session_count = 0usize;
             for (workspace_id, workspace_state) in workspace_states {
                 if let Some((_, root)) = workspace_roots.iter().find(|(id, _)| id == &workspace_id)
                 {
@@ -72,8 +72,14 @@ impl StateRepository {
                         self.save_workspace_session_state(root, &ws_state)?;
                     }
                 } else {
-                    global_state.append_state_without_current(workspace_state);
+                    orphan_session_count += workspace_state.sessions.len();
                 }
+            }
+            if orphan_session_count > 0 {
+                warn!(
+                    orphan_session_count,
+                    "丢弃全局 sessions.json 中无法绑定到注册 workspace 的孤儿会话"
+                );
             }
             if global_state.is_empty() {
                 let _ = fs::remove_file(&global_path);
@@ -278,7 +284,7 @@ impl RuntimeSidecarPersistence {
 
     fn save_session_durable_state(&self) -> Result<(), DaemonError> {
         let durable = self.session_store.durable_state();
-        let (mut global_state, mut workspace_states) = durable.partition_by_workspace();
+        let (global_state, mut workspace_states) = durable.partition_by_workspace();
         for workspace in self.workspace_store.workspaces() {
             let workspace_id = workspace.workspace_id.to_string();
             let workspace_state = workspace_states.remove(&workspace_id).unwrap_or_default();
@@ -288,8 +294,15 @@ impl RuntimeSidecarPersistence {
             )?;
         }
 
-        for (_, orphan_state) in workspace_states {
-            global_state.append_state_without_current(orphan_state);
+        let orphan_session_count: usize = workspace_states
+            .values()
+            .map(|state| state.sessions.len())
+            .sum();
+        if orphan_session_count > 0 {
+            warn!(
+                orphan_session_count,
+                "跳过未注册 workspace 的会话持久化；workspace 绑定会话必须写入对应工作区状态"
+            );
         }
 
         let global_path = self.state_repository.session_durable_state_path();
@@ -427,7 +440,7 @@ mod tests {
     }
 
     #[test]
-    fn load_sessions_from_workspaces_keeps_unknown_workspace_sessions_without_current_pointer() {
+    fn load_sessions_from_workspaces_drops_unknown_workspace_sessions() {
         let state_root = unique_temp_dir("magi-persistence-unknown-workspace");
         let repository = StateRepository::new(state_root.clone());
         let session_id = SessionId::new("session-unknown-workspace");
@@ -474,21 +487,17 @@ mod tests {
 
         let merged = repository
             .load_sessions_from_workspaces(&[])
-            .expect("unknown workspace sessions should stay readable");
+            .expect("unknown workspace sessions should be discarded");
 
-        assert_eq!(merged.sessions.len(), 1);
-        assert_eq!(merged.timeline.len(), 1);
-        assert_eq!(merged.notifications.len(), 1);
+        assert!(merged.sessions.is_empty());
+        assert!(merged.timeline.is_empty());
+        assert!(merged.notifications.is_empty());
         assert_eq!(merged.current_session_id, None);
 
-        let global_state = repository
-            .load_session_durable_state()
-            .expect("unknown workspace sessions should persist globally");
-        assert!(global_state.sessions.iter().any(|session| {
-            session.session_id == session_id
-                && session.workspace_id.as_deref() == Some("workspace-missing")
-        }));
-        assert_eq!(global_state.current_session_id, None);
+        assert!(
+            !repository.session_durable_state_path().exists(),
+            "全局 sessions.json 不能继续保留 workspace-bound 孤儿会话"
+        );
 
         let _ = fs::remove_dir_all(state_root);
     }
