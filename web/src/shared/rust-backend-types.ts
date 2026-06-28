@@ -32,7 +32,6 @@ export interface SessionTurnRequestDto {
   sessionId?: string | null;
   workspaceId: string;
   workspacePath?: string | null;
-  workspace_path?: string | null;
   text?: string | null;
   skillName?: string | null;
   images: SessionTurnImageDto[];
@@ -107,7 +106,6 @@ export interface TaskArchiveResponseDto {
 export interface SessionInterruptRequestDto {
   workspaceId: string;
   workspacePath?: string | null;
-  workspace_path?: string | null;
   sessionId: string;
 }
 
@@ -811,34 +809,26 @@ export interface BootstrapDto {
 export interface SessionDeleteRequestDto {
   sessionId: string;
   workspaceId?: string | null;
-  workspace_id?: string | null;
   workspacePath?: string | null;
-  workspace_path?: string | null;
 }
 
 export interface SessionRenameRequestDto {
   sessionId: string;
   name: string;
   workspaceId?: string | null;
-  workspace_id?: string | null;
   workspacePath?: string | null;
-  workspace_path?: string | null;
 }
 
 export interface SessionCloseRequestDto {
   sessionId: string;
   workspaceId?: string | null;
-  workspace_id?: string | null;
   workspacePath?: string | null;
-  workspace_path?: string | null;
 }
 
 export interface SessionContinueRequestDto {
   sessionId: string;
   workspaceId: string;
-  workspace_id?: string | null;
   workspacePath?: string | null;
-  workspace_path?: string | null;
   promptText?: string | null;
   requestedAgentIds?: string[];
   requestId?: string | null;
@@ -895,14 +885,12 @@ export interface SessionNotificationsResponseDto {
 export interface ClearNotificationsRequestDto {
   workspaceId: string;
   workspacePath?: string | null;
-  workspace_path?: string | null;
   sessionId: string;
 }
 
 export interface RemoveNotificationRequestDto {
   workspaceId: string;
   workspacePath?: string | null;
-  workspace_path?: string | null;
   sessionId: string;
   notificationId: string;
 }
@@ -910,7 +898,6 @@ export interface RemoveNotificationRequestDto {
 export interface AppendNotificationRequestDto {
   workspaceId: string;
   workspacePath?: string | null;
-  workspace_path?: string | null;
   sessionId: string;
   notificationId?: string | null;
   kind?: 'incident' | 'audit' | 'center' | 'toast' | string | null;

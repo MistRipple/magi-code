@@ -243,10 +243,23 @@ function scopedBootstrapPayloadWithPendingChange(workspaceId, workspacePath, ses
         contentKind: 'text',
         sourceKind: 'tool',
       },
+      {
+        session_id: 'legacy-session-scope',
+        workspace_id: 'legacy-workspace-scope',
+        workspace_path: '/tmp/legacy-workspace-scope',
+        filePath: 'legacy-scope.js',
+        snapshotId: 'legacy:legacy-scope.js',
+        updatedAt: ACCEPTED_AT + 3001,
+        type: 'modify',
+        additions: 1,
+        deletions: 0,
+        contentKind: 'text',
+        sourceKind: 'tool',
+      },
     ],
     pendingChangesState: {
       status: 'ready',
-      pendingCount: 1,
+      pendingCount: 2,
     },
   };
 }
@@ -740,8 +753,24 @@ await withGoldenViteServer(async (server) => {
   );
   assert.equal(
     messagesStore.messagesState.edits.length,
-    1,
+    2,
     'switchSession bootstrap must preserve pending changes in edits panel state',
+  );
+  const legacyScopeEdit = messagesStore.messagesState.edits.find((edit) => edit.filePath === 'legacy-scope.js');
+  assert.equal(
+    legacyScopeEdit?.sessionId,
+    undefined,
+    'pendingChanges must not derive session scope from legacy snake_case fields',
+  );
+  assert.equal(
+    legacyScopeEdit?.workspaceId,
+    undefined,
+    'pendingChanges must not derive workspace scope from legacy snake_case fields',
+  );
+  assert.equal(
+    legacyScopeEdit?.workspacePath,
+    undefined,
+    'pendingChanges must not derive workspace path from legacy snake_case fields',
   );
 
   const blockedMutation = deferred();

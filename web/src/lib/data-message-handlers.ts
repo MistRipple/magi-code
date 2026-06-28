@@ -209,11 +209,6 @@ function normalizeIncomingEdits(state: AppState): Edit[] {
   return ensureArray(state.pendingChanges)
     .filter((change): change is Edit => !!change && typeof change === 'object' && typeof (change as Edit).filePath === 'string' && !!(change as Edit).filePath)
     .map((change) => {
-      const rawChange = change as Edit & {
-        session_id?: unknown;
-        workspace_id?: unknown;
-        workspace_path?: unknown;
-      };
       let inferredType = change.type;
       if (!inferredType) {
         const adds = change.additions ?? 0;
@@ -223,9 +218,9 @@ function normalizeIncomingEdits(state: AppState): Edit[] {
         else inferredType = 'modify';
       }
       return {
-        sessionId: normalizeOptionalEditString(change.sessionId, rawChange.session_id),
-        workspaceId: normalizeOptionalEditString(change.workspaceId, rawChange.workspace_id),
-        workspacePath: normalizeOptionalEditString(change.workspacePath, rawChange.workspace_path),
+        sessionId: normalizeOptionalEditString(change.sessionId),
+        workspaceId: normalizeOptionalEditString(change.workspaceId),
+        workspacePath: normalizeOptionalEditString(change.workspacePath),
         filePath: change.filePath,
         oldPath: change.oldPath,
         snapshotId: change.snapshotId,
