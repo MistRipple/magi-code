@@ -49,7 +49,6 @@ impl FreshnessResult {
 
 pub struct IndexPersistence {
     cache_file_path: PathBuf,
-    legacy_cache_file_path: PathBuf,
 }
 
 impl IndexPersistence {
@@ -57,7 +56,6 @@ impl IndexPersistence {
         let base = Path::new(project_root).join(".magi").join("cache");
         Self {
             cache_file_path: base.join("search-index.json.gz"),
-            legacy_cache_file_path: base.join("search-index.json"),
         }
     }
 
@@ -73,22 +71,15 @@ impl IndexPersistence {
         magi_core::fs_atomic::write_atomic(&self.cache_file_path, &compressed)
             .map_err(|e| format!("write failed: {}", e))?;
 
-        if self.legacy_cache_file_path.exists() {
-            let _ = fs::remove_file(&self.legacy_cache_file_path);
-        }
-
         Ok(())
     }
 
     pub fn load(&self) -> Option<PersistenceSnapshot> {
-        let raw = if self.cache_file_path.exists() {
-            let compressed = fs::read(&self.cache_file_path).ok()?;
-            decompress_gzip(&compressed).ok()?
-        } else if self.legacy_cache_file_path.exists() {
-            fs::read(&self.legacy_cache_file_path).ok()?
-        } else {
+        if !self.cache_file_path.exists() {
             return None;
-        };
+        }
+        let compressed = fs::read(&self.cache_file_path).ok()?;
+        let raw = decompress_gzip(&compressed).ok()?;
 
         let snapshot: PersistenceSnapshot = serde_json::from_slice(&raw).ok()?;
 
@@ -189,10 +180,8 @@ impl IndexPersistence {
     }
 
     pub fn invalidate(&self) {
-        for path in [&self.cache_file_path, &self.legacy_cache_file_path] {
-            if path.exists() {
-                let _ = fs::remove_file(path);
-            }
+        if self.cache_file_path.exists() {
+            let _ = fs::remove_file(&self.cache_file_path);
         }
     }
 }

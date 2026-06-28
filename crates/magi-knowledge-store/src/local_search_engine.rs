@@ -1408,7 +1408,7 @@ mod tests {
             engine
                 .search("stalerootmismatchprobe", SearchOptions::default())
                 .is_empty(),
-            "project_root 不匹配的旧缓存不能污染当前 workspace 检索"
+            "project_root 不匹配的陈旧缓存不能污染当前 workspace 检索"
         );
 
         let _ = std::fs::remove_dir_all(&root);
