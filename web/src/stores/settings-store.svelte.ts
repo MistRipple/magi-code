@@ -2371,9 +2371,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
     if (!configs) {
       return;
     }
-    // 以后端返回的 workerConfigs 为准重建，保留未保存引擎的前端暂存。
-    // 注意：legacy 配置中的 provider / openaiProtocol / protocolEndpoint
-    // 字段不再参与协议派生（后端已统一由 urlMode/baseUrl/model 推断），此处直接忽略。
+    // 以后端返回的当前协议 workerConfigs 为准重建，保留未保存引擎的前端暂存。
     const next: Record<string, any> = {};
     for (const [worker, config] of Object.entries(configs)) {
       if (config) {
@@ -2399,7 +2397,6 @@ function createSettingsStore(props: { onClose?: () => void }) {
     if (!config) {
       return;
     }
-    // legacy provider/openaiProtocol/protocolEndpoint 字段静默忽略
     orchConfig = createInteractiveConfig({
       baseUrl: config.baseUrl || "",
       urlMode: normalizeUrlMode(config.urlMode),
@@ -2413,7 +2410,6 @@ function createSettingsStore(props: { onClose?: () => void }) {
     if (!config) {
       return;
     }
-    // legacy provider/openaiProtocol/protocolEndpoint 字段静默忽略
     compConfig = createAuxiliaryConfig({
       baseUrl: config.baseUrl || "",
       urlMode: normalizeUrlMode(config.urlMode),

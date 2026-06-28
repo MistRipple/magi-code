@@ -221,14 +221,33 @@ fn usage_model_config_for_binding(
         if let Some(config) = workers
             .get(&binding.engine_id)
             .or_else(|| workers.get(&binding.template_id))
-            .map(|value| NormalizedModelConfig::from_settings_value(value))
+            .and_then(
+                |value| match NormalizedModelConfig::from_settings_value(value) {
+                    Ok(config) => Some(config),
+                    Err(error) => {
+                        tracing::warn!(
+                            role = %binding.template_id,
+                            engine = %binding.engine_id,
+                            error = %error,
+                            "worker 模型配置无效，跳过用量身份归因"
+                        );
+                        None
+                    }
+                },
+            )
             .and_then(|config| config.to_usage_llm_config())
         {
             return Some(config);
         }
     }
     let orchestrator = store.get_section("orchestrator");
-    NormalizedModelConfig::from_settings_value(&orchestrator).to_usage_llm_config()
+    match NormalizedModelConfig::from_settings_value(&orchestrator) {
+        Ok(config) => config.to_usage_llm_config(),
+        Err(error) => {
+            tracing::warn!(error = %error, "orchestrator 模型配置无效，跳过用量身份归因");
+            None
+        }
+    }
 }
 
 fn usage_tokens_from_payload(usage: Option<&serde_json::Value>) -> Option<UsageTokenInput> {

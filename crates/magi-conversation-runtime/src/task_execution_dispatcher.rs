@@ -253,7 +253,7 @@ pub enum RoleTarget<'a> {
 /// 返回 `Result<Option<Arc<dyn ModelBridgeClient>>, String>`：
 /// - `Ok(Some(client))`：成功解析出 client；
 /// - `Ok(None)`：目标未配置（按 target 含义视作正常的"跳过"或"继承"信号）；
-/// - `Err(msg)`：仅 Agent 路径下 engine 绑定存在但配置非法时返回，调用方应失败。
+/// - `Err(msg)`：配置存在但字段非法时返回，调用方应失败，避免 fallback 掩盖坏配置。
 pub fn resolve_target_for_role(
     settings_store: Option<&Arc<SettingsStore>>,
     default_client: Option<Arc<dyn ModelBridgeClient>>,
@@ -263,7 +263,7 @@ pub fn resolve_target_for_role(
     match target {
         RoleTarget::Orchestrator => {
             if let Some(store) = settings_store
-                && let Some(client) = build_orchestrator_client(store, session_id)
+                && let Some(client) = build_orchestrator_client(store, session_id)?
             {
                 return Ok(Some(client));
             }
@@ -273,7 +273,7 @@ pub fn resolve_target_for_role(
             let Some(store) = settings_store else {
                 return Ok(None);
             };
-            Ok(build_client_from_section(store, "auxiliary"))
+            build_client_from_section(store, "auxiliary")
         }
         RoleTarget::Agent {
             role_id,
@@ -322,12 +322,13 @@ pub fn resolve_target_for_role(
 fn build_client_from_section(
     settings_store: &Arc<SettingsStore>,
     section: &str,
-) -> Option<Arc<dyn ModelBridgeClient>> {
+) -> Result<Option<Arc<dyn ModelBridgeClient>>, String> {
     let config = settings_store.get_section(section);
-    let normalized = NormalizedModelConfig::from_settings_value(&config);
-    normalized
+    let normalized = NormalizedModelConfig::from_settings_value(&config)
+        .map_err(|error| format!("{section} 模型配置无效：{error}"))?;
+    Ok(normalized
         .to_http_model_client()
-        .map(|client| Arc::new(client) as Arc<dyn ModelBridgeClient>)
+        .map(|client| Arc::new(client) as Arc<dyn ModelBridgeClient>))
 }
 
 /// 构造业务主对话（orchestrator）的 client。
@@ -341,17 +342,18 @@ fn build_client_from_section(
 fn build_orchestrator_client(
     settings_store: &Arc<SettingsStore>,
     session_id: Option<&SessionId>,
-) -> Option<Arc<dyn ModelBridgeClient>> {
+) -> Result<Option<Arc<dyn ModelBridgeClient>>, String> {
     let mut config = settings_store.get_section("orchestrator");
     strip_orchestrator_session_owned_fields(&mut config);
     if let Some(session_id) = session_id {
         let override_section = settings_store.get_session_section(session_id, "orchestrator");
         merge_orchestrator_session_override(&mut config, &override_section);
     }
-    let normalized = NormalizedModelConfig::from_settings_value(&config);
-    normalized
+    let normalized = NormalizedModelConfig::from_settings_value(&config)
+        .map_err(|error| format!("orchestrator 模型配置无效：{error}"))?;
+    Ok(normalized
         .to_http_model_client()
-        .map(|client| Arc::new(client) as Arc<dyn ModelBridgeClient>)
+        .map(|client| Arc::new(client) as Arc<dyn ModelBridgeClient>))
 }
 
 pub fn strip_orchestrator_session_owned_fields(base: &mut serde_json::Value) {
@@ -2894,7 +2896,8 @@ mod tests {
         });
         merge_orchestrator_session_override(&mut base, &override_section);
 
-        let normalized = NormalizedModelConfig::from_settings_value(&base);
+        let normalized = NormalizedModelConfig::from_settings_value(&base)
+            .expect("合并后的模型配置应符合当前协议");
         assert_eq!(
             normalized.require_model().expect("model 必须存在"),
             "session-only-model",

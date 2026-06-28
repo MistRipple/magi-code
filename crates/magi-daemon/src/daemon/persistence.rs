@@ -121,14 +121,7 @@ impl StateRepository {
     pub(crate) fn load_session_sidecars(
         &self,
     ) -> Result<SessionExecutionSidecarStoreState, DaemonError> {
-        let path = self.session_sidecars_path();
-        if path.exists() {
-            return self.read_json_or_default(path);
-        }
-        self.read_json_with_required_field_or_default(
-            self.session_durable_state_path(),
-            "runtime_sidecars",
-        )
+        self.read_json_or_default(self.session_sidecars_path())
     }
 
     pub(crate) fn save_session_sidecars(
@@ -175,14 +168,7 @@ impl StateRepository {
     pub(crate) fn load_workspace_recovery_sidecars(
         &self,
     ) -> Result<WorkspaceRecoverySidecarStoreState, DaemonError> {
-        let path = self.workspace_recovery_sidecars_path();
-        if path.exists() {
-            return self.read_json_or_default(path);
-        }
-        self.read_json_with_required_field_or_default(
-            self.state_root.join("workspaces.json"),
-            "recovery_handles",
-        )
+        self.read_json_or_default(self.workspace_recovery_sidecars_path())
     }
 
     pub(crate) fn save_workspace_recovery_sidecars(
@@ -216,26 +202,10 @@ impl StateRepository {
     where
         T: Default + for<'de> serde::Deserialize<'de>,
     {
-        self.read_json_or_default_with_legacy(path, None)
-    }
-
-    fn read_json_or_default_with_legacy<T>(
-        &self,
-        path: PathBuf,
-        legacy_required_field: Option<&str>,
-    ) -> Result<T, DaemonError>
-    where
-        T: Default + for<'de> serde::Deserialize<'de>,
-    {
-        match legacy_required_field {
-            Some(field_name) => self.read_json_with_required_field_or_default(path, field_name),
-            None => {
-                if !path.exists() {
-                    return Ok(T::default());
-                }
-                self.read_json_value_or_default(path)
-            }
+        if !path.exists() {
+            return Ok(T::default());
         }
+        self.read_json_value_or_default(path)
     }
 
     fn read_json_value_or_default<T>(&self, path: PathBuf) -> Result<T, DaemonError>
@@ -257,38 +227,6 @@ impl StateRepository {
                 Ok(T::default())
             }
         }
-    }
-
-    fn read_json_with_required_field_or_default<T>(
-        &self,
-        path: PathBuf,
-        field_name: &str,
-    ) -> Result<T, DaemonError>
-    where
-        T: Default + for<'de> serde::Deserialize<'de>,
-    {
-        if !path.exists() {
-            return Ok(T::default());
-        }
-        let content = fs::read_to_string(&path)?;
-        let value: serde_json::Value = match serde_json::from_str(&content) {
-            Ok(value) => value,
-            Err(error) => {
-                let backup_path = stale_backup_path(&path);
-                warn!(
-                    path = %path.display(),
-                    backup_path = %backup_path.display(),
-                    error = %error,
-                    "影子状态文件与当前 schema 不兼容，已转存并回退到默认状态"
-                );
-                fs::rename(&path, &backup_path)?;
-                return Ok(T::default());
-            }
-        };
-        if value.get(field_name).is_none() {
-            return Ok(T::default());
-        }
-        serde_json::from_value(value).map_err(DaemonError::from)
     }
 
     fn write_json_atomically<T>(&self, path: PathBuf, value: &T) -> Result<(), DaemonError>
@@ -638,11 +576,11 @@ mod tests {
     }
 
     #[test]
-    fn load_session_sidecars_does_not_treat_current_global_session_file_as_legacy_sidecars() {
-        let state_root = unique_temp_dir("magi-persistence-session-sidecar-legacy-guard");
+    fn load_session_sidecars_ignores_session_durable_state_without_sidecar_file() {
+        let state_root = unique_temp_dir("magi-persistence-session-sidecar-missing");
         let repository = StateRepository::new(state_root.clone());
         let now = UtcMillis::now();
-        let session_id = SessionId::new("session-no-legacy-sidecar");
+        let session_id = SessionId::new("session-no-sidecar-file");
 
         repository
             .save_session_durable_state(&SessionDurableState {
@@ -664,7 +602,7 @@ mod tests {
 
         let sidecars = repository
             .load_session_sidecars()
-            .expect("current global session file should not be parsed as legacy sidecars");
+            .expect("session sidecar loader should read only the sidecar file");
         assert!(sidecars.runtime_sidecars.is_empty());
         assert!(repository.session_durable_state_path().exists());
 

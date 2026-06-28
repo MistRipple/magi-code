@@ -284,23 +284,17 @@ function normalizeSettingsBootstrapPayload(
       && typeof payload.workerConfigs === 'object'
       && !Array.isArray(payload.workerConfigs)
         ? payload.workerConfigs
-        : (
-            payload.workers
-            && typeof payload.workers === 'object'
-            && !Array.isArray(payload.workers)
-              ? payload.workers
-              : {}
-          )
+        : {}
     ) as Record<string, unknown>,
-    orchestratorConfig: normalizeSettingsSectionConfig(payload.orchestratorConfig ?? payload.orchestrator),
+    orchestratorConfig: normalizeSettingsSectionConfig(payload.orchestratorConfig),
     orchestratorSessionConfig: normalizeSettingsSectionConfig(payload.orchestratorSessionConfig),
     effectiveOrchestratorConfig: normalizeSettingsSectionConfig(
-      payload.effectiveOrchestratorConfig ?? payload.orchestratorConfig ?? payload.orchestrator,
+      payload.effectiveOrchestratorConfig ?? payload.orchestratorConfig,
     ),
-    auxiliaryConfig: normalizeSettingsSectionConfig(payload.auxiliaryConfig ?? payload.auxiliary),
-    userRulesConfig: normalizeSettingsSectionConfig(payload.userRulesConfig ?? payload.userRules),
-    skillsConfig: normalizeSettingsSectionConfig(payload.skillsConfig ?? payload.skills),
-    safeguardConfig: normalizeSettingsSectionConfig(payload.safeguardConfig ?? payload.safeguard),
+    auxiliaryConfig: normalizeSettingsSectionConfig(payload.auxiliaryConfig),
+    userRulesConfig: normalizeSettingsSectionConfig(payload.userRulesConfig),
+    skillsConfig: normalizeSettingsSectionConfig(payload.skillsConfig),
+    safeguardConfig: normalizeSettingsSectionConfig(payload.safeguardConfig),
     repositories: Array.isArray(payload.repositories) ? payload.repositories : [],
     mcpServers: Array.isArray(payload.mcpServers) ? payload.mcpServers : [],
     builtinTools: normalizeBuiltinTools(payload.builtinTools),

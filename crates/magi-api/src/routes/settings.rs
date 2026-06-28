@@ -22,8 +22,13 @@ use std::str::FromStr;
 
 use super::session_scope;
 use crate::{
-    errors::ApiError, model_config::NormalizedModelConfig,
-    scope_binding::without_scope_binding_fields, state::ApiState,
+    errors::ApiError,
+    model_config::{
+        DEPRECATED_MODEL_CONFIG_FIELDS, NormalizedModelConfig,
+        reject_deprecated_model_config_fields,
+    },
+    scope_binding::without_scope_binding_fields,
+    state::ApiState,
 };
 
 fn unwrap_settings_section_request(request: &serde_json::Value) -> serde_json::Value {
@@ -38,17 +43,37 @@ fn scoped_settings_section_request(request: &serde_json::Value) -> serde_json::V
     without_scope_binding_fields(unwrap_settings_section_request(request))
 }
 
-fn orchestrator_connection_section_request(request: &serde_json::Value) -> serde_json::Value {
-    let mut config = scoped_settings_section_request(request);
-    if let Some(map) = config.as_object_mut() {
-        map.remove("model");
-        map.remove("reasoningEffort");
+fn model_settings_section_request(
+    request: &serde_json::Value,
+) -> Result<serde_json::Value, ApiError> {
+    let config = scoped_settings_section_request(request);
+    reject_deprecated_model_config_fields(&config).map_err(ApiError::InvalidInput)?;
+    Ok(config)
+}
+
+fn clean_deprecated_model_config_fields(mut config: Value) -> Value {
+    if let Some(object) = config.as_object_mut() {
+        for field in DEPRECATED_MODEL_CONFIG_FIELDS {
+            object.remove(*field);
+        }
     }
     config
 }
 
+fn orchestrator_connection_section_request(
+    request: &serde_json::Value,
+) -> Result<serde_json::Value, ApiError> {
+    let mut config = model_settings_section_request(request)?;
+    if let Some(map) = config.as_object_mut() {
+        map.remove("model");
+        map.remove("reasoningEffort");
+    }
+    Ok(config)
+}
+
 fn orchestrator_session_override_request(request: &serde_json::Value) -> Result<Value, ApiError> {
     let config = unwrap_settings_section_request(request);
+    reject_deprecated_model_config_fields(&config).map_err(ApiError::InvalidInput)?;
     let Some(config) = config.as_object() else {
         return Err(ApiError::InvalidInput(
             "会话主模型配置必须是对象".to_string(),
@@ -120,7 +145,8 @@ struct FetchModelsRequest {
 fn parse_fetch_models_config(
     request: FetchModelsRequest,
 ) -> Result<(NormalizedModelConfig, String), ApiError> {
-    let config = NormalizedModelConfig::from_settings_value(&request.config);
+    let config = NormalizedModelConfig::from_settings_value(&request.config)
+        .map_err(ApiError::InvalidInput)?;
     config.require_base_url().map_err(ApiError::InvalidInput)?;
     config.require_api_key().map_err(ApiError::InvalidInput)?;
     config
@@ -174,7 +200,8 @@ fn parse_model_ids(payload: &Value) -> Vec<String> {
 
 fn parse_connection_probe_config(request: Value) -> Result<NormalizedModelConfig, ApiError> {
     let config = unwrap_settings_section_request(&request);
-    let normalized = NormalizedModelConfig::from_settings_value(&config);
+    let normalized =
+        NormalizedModelConfig::from_settings_value(&config).map_err(ApiError::InvalidInput)?;
     normalized
         .require_base_url()
         .map_err(ApiError::InvalidInput)?;
@@ -480,10 +507,8 @@ fn default_agent_binding(template_id: &str, order: usize) -> Value {
 }
 
 fn normalize_engine_entry(entry: &Value) -> Option<Value> {
-    let raw = entry.get("engine").unwrap_or(entry);
-    let engine_id = raw
+    let engine_id = entry
         .get("id")
-        .or_else(|| raw.get("engineId"))
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())?;
@@ -492,7 +517,8 @@ fn normalize_engine_entry(entry: &Value) -> Option<Value> {
     normalized.insert(
         "displayName".to_string(),
         Value::String(
-            raw.get("displayName")
+            entry
+                .get("displayName")
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
@@ -502,11 +528,14 @@ fn normalize_engine_entry(entry: &Value) -> Option<Value> {
     );
     normalized.insert(
         "llm".to_string(),
-        raw.get("llm")
-            .cloned()
-            .unwrap_or_else(|| Value::Object(Map::new())),
+        clean_deprecated_model_config_fields(
+            entry
+                .get("llm")
+                .cloned()
+                .unwrap_or_else(|| Value::Object(Map::new())),
+        ),
     );
-    if let Some(runtime) = raw.get("runtime").cloned() {
+    if let Some(runtime) = entry.get("runtime").cloned() {
         normalized.insert("runtime".to_string(), runtime);
     }
     Some(Value::Object(normalized))
@@ -546,7 +575,10 @@ fn normalize_worker_model_config_entries(raw_workers: &Value) -> HashMap<String,
         if worker_id.is_empty() {
             continue;
         }
-        normalized.insert(worker_id.to_string(), worker_config.clone());
+        normalized.insert(
+            worker_id.to_string(),
+            clean_deprecated_model_config_fields(worker_config.clone()),
+        );
     }
     normalized
 }
@@ -593,8 +625,7 @@ fn normalize_agent_override_entry(
     template_ids: &HashSet<String>,
     order_map: &HashMap<String, usize>,
 ) -> Option<Value> {
-    let raw = entry.get("agent").unwrap_or(entry);
-    let template_id = raw
+    let template_id = entry
         .get("templateId")
         .and_then(Value::as_str)
         .map(str::trim)
@@ -603,16 +634,14 @@ fn normalize_agent_override_entry(
         return None;
     }
     // `engineId` 是「继承 vs 显式」的唯一字段：空串 = 继承编排模型，非空 = 显式绑定到 engine。
-    // 历史载荷里的 `modelSource` 枚举（"orchestrator"/"engine"）在 normalize 阶段直接丢弃，
-    // 不再作为二级判定项——避免「modelSource=engine 但 engineId 空」这类矛盾态。
-    let engine_id = raw
+    let engine_id = entry
         .get("engineId")
         .and_then(Value::as_str)
         .map(str::trim)
         .unwrap_or("")
         .to_string();
     let order = order_map.get(template_id).copied().unwrap_or(0);
-    let binding_revision = raw
+    let binding_revision = entry
         .get("bindingRevision")
         .and_then(Value::as_u64)
         .unwrap_or(0);
@@ -626,10 +655,10 @@ fn normalize_agent_override_entry(
     normalized.insert("bindingRevision".to_string(), Value::from(binding_revision));
     normalized.insert("order".to_string(), Value::from(order as u64));
 
-    if let Some(ui_overrides) = raw.get("uiOverrides").cloned() {
+    if let Some(ui_overrides) = entry.get("uiOverrides").cloned() {
         normalized.insert("uiOverrides".to_string(), ui_overrides);
     }
-    if let Some(profile_overrides) = raw.get("profileOverrides").cloned() {
+    if let Some(profile_overrides) = entry.get("profileOverrides").cloned() {
         normalized.insert("profileOverrides".to_string(), profile_overrides);
     }
 
@@ -849,20 +878,22 @@ async fn save_worker_config(
     let worker_config = request.get("config");
 
     if let (Some(worker_id), Some(worker_config)) = (worker_id, worker_config) {
+        let worker_config = without_scope_binding_fields(worker_config.clone());
+        reject_deprecated_model_config_fields(&worker_config).map_err(ApiError::InvalidInput)?;
         let mut workers = state
             .settings_store
             .get_section("workers")
             .as_object()
             .cloned()
             .unwrap_or_default();
-        workers.insert(worker_id.to_string(), worker_config.clone());
+        workers.insert(worker_id.to_string(), worker_config);
         state
             .settings_store
             .set_section("workers", serde_json::Value::Object(workers));
     } else {
         state
             .settings_store
-            .set_section("workers", scoped_settings_section_request(&request));
+            .set_section("workers", model_settings_section_request(&request)?);
     }
     Ok(Json(serde_json::json!({ "saved": true })))
 }
@@ -892,7 +923,7 @@ async fn save_orchestrator_config(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     state.settings_store.set_section(
         "orchestrator",
-        orchestrator_connection_section_request(&request),
+        orchestrator_connection_section_request(&request)?,
     );
     Ok(Json(serde_json::json!({ "saved": true })))
 }
@@ -953,7 +984,8 @@ async fn test_orchestrator_connection(
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let config = unwrap_settings_section_request(&request);
-    let normalized = NormalizedModelConfig::from_settings_value(&config);
+    let normalized =
+        NormalizedModelConfig::from_settings_value(&config).map_err(ApiError::InvalidInput)?;
     normalized
         .require_base_url()
         .map_err(ApiError::InvalidInput)?;
@@ -973,7 +1005,7 @@ async fn save_auxiliary_config(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     state
         .settings_store
-        .set_section("auxiliary", scoped_settings_section_request(&request));
+        .set_section("auxiliary", model_settings_section_request(&request)?);
     Ok(Json(serde_json::json!({ "saved": true })))
 }
 
@@ -1025,6 +1057,14 @@ async fn upsert_engine(
     State(state): State<ApiState>,
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    if request.get("engine").is_some() || request.get("engineId").is_some() {
+        return Err(ApiError::InvalidInput(
+            "引擎配置必须使用顶层 id/displayName/llm 字段".to_string(),
+        ));
+    }
+    if let Some(llm) = request.get("llm") {
+        reject_deprecated_model_config_fields(llm).map_err(ApiError::InvalidInput)?;
+    }
     let normalized = normalize_engine_entry(&request)
         .ok_or_else(|| ApiError::InvalidInput("引擎配置缺少有效的 id".to_string()))?;
     let engine_id = normalized
@@ -1059,7 +1099,7 @@ async fn remove_engine(
         .unwrap_or_default();
     state
         .settings_store
-        .remove_array_entry("engines", "engineId", engine_id);
+        .remove_array_entry("engines", "id", engine_id);
     let mut engines = load_registry_engines(&state);
     engines.retain(|entry| {
         entry
@@ -1085,6 +1125,11 @@ async fn upsert_agent(
     State(state): State<ApiState>,
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    if request.get("agent").is_some() || request.get("modelSource").is_some() {
+        return Err(ApiError::InvalidInput(
+            "角色绑定必须使用顶层 templateId/engineId 字段".to_string(),
+        ));
+    }
     let template_ids = builtin_template_ids();
     let order_map = builtin_template_order_map();
     let normalized = normalize_agent_override_entry(&request, &template_ids, &order_map)
@@ -1566,12 +1611,12 @@ mod tests {
         });
 
         let config = NormalizedModelConfig::from_settings_value(&json!({
-            "provider": "anthropic",
             "baseUrl": base_url,
             "apiKey": "test-key",
             "model": "claude-sonnet-test",
             "urlMode": "standard"
-        }));
+        }))
+        .expect("模型配置应符合当前协议");
         execute_connection_probe(&config)
             .await
             .expect("anthropic probe should succeed");
@@ -1595,7 +1640,6 @@ mod tests {
         });
 
         let result = probe_connection_response(json!({
-            "provider": "openai",
             "baseUrl": base_url,
             "apiKey": "test-key",
             "model": "gpt-test",
@@ -1634,7 +1678,6 @@ mod tests {
             State(test_state()),
             Json(FetchModelsRequest {
                 config: json!({
-                    "provider": "openai",
                     "baseUrl": base_url,
                     "apiKey": "test-key",
                     "model": "gpt-test",
@@ -2048,7 +2091,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn settings_bootstrap_preserves_anthropic_model_providers() {
+    async fn settings_bootstrap_removes_deprecated_model_provider_fields() {
         let state = test_state();
         state.settings_store.set_section(
             "orchestrator",
@@ -2089,17 +2132,20 @@ mod tests {
             .expect("settings bootstrap should build")
             .0;
 
-        assert_eq!(
-            bootstrap["orchestratorConfig"]["provider"],
-            json!("anthropic")
+        assert!(bootstrap["orchestratorConfig"].get("provider").is_none());
+        assert!(
+            bootstrap["workerConfigs"]["sonnet-worker"]
+                .get("provider")
+                .is_none()
+        );
+        assert!(
+            bootstrap["registryEngines"][0]["llm"]
+                .get("provider")
+                .is_none()
         );
         assert_eq!(
-            bootstrap["workerConfigs"]["sonnet-worker"]["provider"],
-            json!("anthropic")
-        );
-        assert_eq!(
-            bootstrap["registryEngines"][0]["llm"]["provider"],
-            json!("anthropic")
+            bootstrap["workerConfigs"]["sonnet-worker"]["model"],
+            json!("claude-worker-test")
         );
     }
 
@@ -2137,19 +2183,24 @@ mod tests {
             .0;
 
         assert_eq!(
-            bootstrap["registryEngines"][0]["llm"]["provider"],
-            json!("anthropic")
-        );
-        assert_eq!(
             bootstrap["registryEngines"][0]["llm"]["model"],
             json!("claude-worker-test")
         );
+        assert!(
+            bootstrap["registryEngines"][0]["llm"]
+                .get("provider")
+                .is_none()
+        );
         let persisted_engines = state.settings_store.get_section("engines");
-        assert_eq!(persisted_engines[0]["llm"]["provider"], json!("anthropic"));
+        assert!(persisted_engines[0]["llm"].get("provider").is_none());
+        assert_eq!(
+            persisted_engines[0]["llm"]["model"],
+            json!("claude-worker-test")
+        );
     }
 
     #[test]
-    fn normalize_engine_entry_preserves_supported_model_provider() {
+    fn normalize_engine_entry_removes_deprecated_model_provider() {
         let normalized = normalize_engine_entry(&json!({
             "id": "sonnet-4-5",
             "displayName": "sonnet-4.5",
@@ -2162,11 +2213,84 @@ mod tests {
         }))
         .expect("engine should normalize");
 
-        assert_eq!(normalized["llm"]["provider"], json!("anthropic"));
+        assert!(normalized["llm"].get("provider").is_none());
         assert_eq!(
             normalized["llm"]["model"],
             json!("kiro-claude-sonnet-4-5-agentic")
         );
+    }
+
+    #[tokio::test]
+    async fn registry_engine_upsert_rejects_legacy_engine_wrappers() {
+        let state = test_state();
+        let result = upsert_engine(
+            State(state.clone()),
+            Json(json!({
+                "engine": {
+                    "id": "legacy-wrapper",
+                    "llm": {}
+                }
+            })),
+        )
+        .await;
+        match result {
+            Err(ApiError::InvalidInput(message)) => {
+                assert!(message.contains("顶层 id/displayName/llm"));
+            }
+            other => panic!("expected invalid input, got {other:?}"),
+        }
+
+        let result = upsert_engine(
+            State(state),
+            Json(json!({
+                "engineId": "legacy-engine-id",
+                "llm": {}
+            })),
+        )
+        .await;
+        match result {
+            Err(ApiError::InvalidInput(message)) => {
+                assert!(message.contains("顶层 id/displayName/llm"));
+            }
+            other => panic!("expected invalid input, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn registry_agent_upsert_rejects_legacy_wrapper_and_model_source() {
+        let state = test_state();
+        let result = upsert_agent(
+            State(state.clone()),
+            Json(json!({
+                "agent": {
+                    "templateId": "reviewer",
+                    "engineId": ""
+                }
+            })),
+        )
+        .await;
+        match result {
+            Err(ApiError::InvalidInput(message)) => {
+                assert!(message.contains("顶层 templateId/engineId"));
+            }
+            other => panic!("expected invalid input, got {other:?}"),
+        }
+
+        let result = upsert_agent(
+            State(state),
+            Json(json!({
+                "templateId": "reviewer",
+                "modelSource": "engine",
+                "engineId": ""
+            })),
+        )
+        .await;
+        match result {
+            Err(ApiError::InvalidInput(message)) => {
+                assert!(message.contains("顶层 templateId/engineId"));
+            }
+            other => panic!("expected invalid input, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -2393,6 +2517,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn model_settings_section_request_rejects_deprecated_provider_field() {
+        let error = model_settings_section_request(&json!({
+            "config": {
+                "provider": "openai",
+                "baseUrl": "https://api.example.com/v1",
+                "apiKey": "sk-test",
+                "model": "gpt-test"
+            }
+        }))
+        .expect_err("模型配置保存入口必须拒绝 provider 输入字段");
+
+        match error {
+            ApiError::InvalidInput(message) => {
+                assert!(message.contains("provider"));
+            }
+            other => panic!("expected invalid input, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn save_orchestrator_config_writes_only_global_connection() {
         let state = test_state();
@@ -2612,6 +2756,27 @@ mod tests {
         match error {
             ApiError::InvalidInput(message) => {
                 assert!(message.contains("完整路径模式下不支持自动获取模型列表"));
+            }
+            other => panic!("expected invalid input, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fetch_models_config_rejects_deprecated_model_provider_field() {
+        let error = parse_fetch_models_config(FetchModelsRequest {
+            config: serde_json::json!({
+                "provider": "openai",
+                "baseUrl": "http://127.0.0.1:8320/v1",
+                "apiKey": "test-key",
+                "urlMode": "standard"
+            }),
+            target: "orch".to_string(),
+        })
+        .expect_err("fetch models config should reject deprecated provider input");
+
+        match error {
+            ApiError::InvalidInput(message) => {
+                assert!(message.contains("provider"));
             }
             other => panic!("expected invalid input, got {other:?}"),
         }

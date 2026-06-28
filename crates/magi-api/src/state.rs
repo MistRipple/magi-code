@@ -1705,7 +1705,6 @@ fn normalize_settings_snapshot_sections(snapshot: &mut HashMap<String, serde_jso
         "auxiliary",
         "auxiliaryConfig",
         "userRulesConfig",
-        "safeguard",
         "safeguardConfig",
     ] {
         if let Some(value) = snapshot.get_mut(key) {
@@ -1715,10 +1714,32 @@ fn normalize_settings_snapshot_sections(snapshot: &mut HashMap<String, serde_jso
     skill_loader::normalize_skills_config_sections(snapshot);
     seed_user_rules_config(snapshot);
     normalize_workers_section(snapshot);
+    strip_deprecated_model_fields_from_section(snapshot, "orchestrator");
+    strip_deprecated_model_fields_from_section(snapshot, "orchestratorConfig");
+    strip_deprecated_model_fields_from_section(snapshot, "auxiliary");
+    strip_deprecated_model_fields_from_section(snapshot, "auxiliaryConfig");
     normalize_mcp_servers_section(snapshot);
     seed_default_safeguard_rules(snapshot);
     normalize_safeguard_config_section(snapshot);
     alias_snapshot_keys(snapshot);
+}
+
+fn strip_deprecated_model_fields(value: &mut serde_json::Value) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    for field in magi_conversation_runtime::model_config::DEPRECATED_MODEL_CONFIG_FIELDS {
+        object.remove(*field);
+    }
+}
+
+fn strip_deprecated_model_fields_from_section(
+    snapshot: &mut HashMap<String, serde_json::Value>,
+    key: &str,
+) {
+    if let Some(value) = snapshot.get_mut(key) {
+        strip_deprecated_model_fields(value);
+    }
 }
 
 fn public_skills_config_section(value: serde_json::Value) -> serde_json::Value {
@@ -1948,10 +1969,7 @@ fn builtin_safeguard_rules() -> Vec<serde_json::Value> {
 
 fn seed_default_safeguard_rules(snapshot: &mut HashMap<String, serde_json::Value>) {
     if !snapshot.contains_key("safeguardConfig") {
-        let legacy = snapshot
-            .remove("safeguard")
-            .unwrap_or(serde_json::json!({}));
-        snapshot.insert("safeguardConfig".to_string(), legacy);
+        snapshot.insert("safeguardConfig".to_string(), serde_json::json!({}));
     }
 
     let safeguard = snapshot
@@ -1986,7 +2004,7 @@ fn normalize_workers_section(snapshot: &mut HashMap<String, serde_json::Value>) 
     let Some(workers) = snapshot.get_mut("workers") else {
         return;
     };
-    let Some(object) = workers.as_object() else {
+    let Some(object) = workers.as_object_mut() else {
         return;
     };
     let worker_id = object
@@ -1998,6 +2016,15 @@ fn normalize_workers_section(snapshot: &mut HashMap<String, serde_json::Value>) 
     let worker_config = object.get("config").cloned();
     if let (Some(worker_id), Some(worker_config)) = (worker_id, worker_config) {
         *workers = serde_json::json!({ worker_id: worker_config });
+        if let Some(normalized_object) = workers.as_object_mut() {
+            for config in normalized_object.values_mut() {
+                strip_deprecated_model_fields(config);
+            }
+        }
+        return;
+    }
+    for config in object.values_mut() {
+        strip_deprecated_model_fields(config);
     }
 }
 
