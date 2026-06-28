@@ -792,8 +792,6 @@ impl BuiltinToolName {
                     },
                     "terminal_id": { "type": "integer", "description": "background=true 返回的受管终端 / 进程 ID；action=read/write/kill 时必填" },
                     "input": { "type": "string", "description": "action=write 时写入后台进程 stdin 的文本" },
-                    "content": { "type": "string", "description": "input 的别名" },
-                    "text": { "type": "string", "description": "input 的别名" },
                     "max_bytes": { "type": "integer", "description": "action=read 时 stdout / stderr 预览最多读取的字节数" },
                     "access_mode": {
                         "type": "string",
@@ -825,9 +823,7 @@ impl BuiltinToolName {
                 "type": "object",
                 "properties": {
                     "terminal_id": { "type": "integer", "description": "受管终端 / 进程 ID" },
-                    "input": { "type": "string", "description": "要写入进程 stdin 的文本" },
-                    "content": { "type": "string", "description": "input 的别名" },
-                    "text": { "type": "string", "description": "input 的别名" }
+                    "input": { "type": "string", "description": "要写入进程 stdin 的文本" }
                 },
                 "required": ["terminal_id"]
             }),
@@ -848,8 +844,6 @@ impl BuiltinToolName {
                 "properties": {
                     "pid": { "type": "integer", "description": "要检查的进程 ID" },
                     "query": { "type": "string", "description": "进程名或搜索关键词" },
-                    "name": { "type": "string", "description": "query 的别名" },
-                    "pattern": { "type": "string", "description": "query 的别名" },
                     "limit": { "type": "integer", "description": "最大匹配条数" }
                 },
                 "required": []
@@ -862,13 +856,7 @@ impl BuiltinToolName {
                     "before_path": { "type": "string", "description": "原始文件路径" },
                     "after_path": { "type": "string", "description": "更新后文件路径" },
                     "before_label": { "type": "string", "description": "原始侧的标签" },
-                    "after_label": { "type": "string", "description": "更新侧的标签" },
-                    "left": { "type": "string", "description": "before 的别名" },
-                    "right": { "type": "string", "description": "after 的别名" },
-                    "left_path": { "type": "string", "description": "before_path 的别名" },
-                    "right_path": { "type": "string", "description": "after_path 的别名" },
-                    "left_label": { "type": "string", "description": "before_label 的别名" },
-                    "right_label": { "type": "string", "description": "after_label 的别名" }
+                    "after_label": { "type": "string", "description": "更新侧的标签" }
                 },
                 "required": []
             }),
@@ -1452,31 +1440,27 @@ fn shell_exec_invocation_policy(input: &str) -> BuiltinToolInvocationPolicy {
         return medium_risk_policy();
     };
 
-    let action = json_field_string(&request, &["action", "operation", "op"])
-        .map(|value| value.trim().to_ascii_lowercase());
-    let has_terminal_id = request
-        .get("terminal_id")
-        .or_else(|| request.get("terminalId"))
-        .or_else(|| request.get("id"))
-        .is_some();
-    let has_command = json_field_string(&request, &["command", "script", "line"])
-        .is_some_and(|value| !value.trim().is_empty());
+    let action =
+        json_field_string(&request, &["action"]).map(|value| value.trim().to_ascii_lowercase());
+    let has_terminal_id = request.get("terminal_id").is_some();
+    let has_command =
+        json_field_string(&request, &["command"]).is_some_and(|value| !value.trim().is_empty());
 
     match action.as_deref() {
         None if has_terminal_id && !has_command => return low_risk_policy(),
-        Some("read" | "poll" | "status" | "list" | "ls") => return low_risk_policy(),
-        Some("write" | "stdin" | "send" | "kill" | "stop" | "terminate" | "cancel") => {
+        Some("read" | "list") => return low_risk_policy(),
+        Some("write" | "kill") => {
             return medium_risk_policy();
         }
-        Some("run" | "exec" | "command") | None => {}
+        Some("run") | None => {}
         Some(_) => return medium_risk_policy(),
     }
 
-    if json_field_bool(&request, &["background", "long_running", "longRunning"]).unwrap_or(false) {
+    if json_field_bool(&request, &["background"]).unwrap_or(false) {
         return medium_risk_policy();
     }
 
-    match json_field_string(&request, &["access_mode", "write_mode", "intent"])
+    match json_field_string(&request, &["access_mode"])
         .and_then(|value| BuiltinToolAccessMode::from_str(&value))
     {
         Some(BuiltinToolAccessMode::ReadOnly)
@@ -6801,6 +6785,126 @@ mod tests {
                 tool.as_str()
             );
         }
+    }
+
+    #[test]
+    fn public_tool_schemas_do_not_expose_legacy_argument_aliases() {
+        let cases = [
+            (
+                BuiltinToolName::ShellExec,
+                &[
+                    "script",
+                    "line",
+                    "operation",
+                    "op",
+                    "long_running",
+                    "longRunning",
+                    "write_mode",
+                    "intent",
+                    "working_directory",
+                    "workdir",
+                    "content",
+                    "text",
+                ][..],
+            ),
+            (
+                BuiltinToolName::ProcessWrite,
+                &["terminalId", "id", "content", "text"][..],
+            ),
+            (
+                BuiltinToolName::ProcessInspect,
+                &["process_id", "name", "pattern", "max_results"][..],
+            ),
+            (
+                BuiltinToolName::DiffPreview,
+                &[
+                    "left",
+                    "right",
+                    "left_path",
+                    "right_path",
+                    "left_label",
+                    "right_label",
+                ][..],
+            ),
+            (
+                BuiltinToolName::SearchText,
+                &["text", "needle", "path", "workspace", "max_results"][..],
+            ),
+            (BuiltinToolName::WebSearch, &["q", "search"][..]),
+            (BuiltinToolName::WebFetch, &["href", "link"][..]),
+            (BuiltinToolName::DiagramRender, &["code"][..]),
+        ];
+
+        for (tool, forbidden_fields) in cases {
+            let schema = tool.parameters_schema();
+            let properties = schema["properties"].as_object().expect("schema properties");
+            for field in forbidden_fields {
+                assert!(
+                    !properties.contains_key(*field),
+                    "{} schema must not expose legacy field {}",
+                    tool.as_str(),
+                    field
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn public_tools_reject_legacy_argument_aliases_at_runtime() {
+        let registry = make_registry();
+        let failures = [
+            (
+                BuiltinToolName::SearchText,
+                serde_json::json!({ "root": ".", "text": "needle" }),
+                "缺少搜索关键词",
+            ),
+            (
+                BuiltinToolName::WebSearch,
+                serde_json::json!({ "q": "magi" }),
+                "缺少搜索关键词 query",
+            ),
+            (
+                BuiltinToolName::WebFetch,
+                serde_json::json!({ "href": "http://127.0.0.1" }),
+                "缺少 URL",
+            ),
+            (
+                BuiltinToolName::DiagramRender,
+                serde_json::json!({ "kind": "mermaid", "code": "graph TD\nA-->B" }),
+                "该图表源码格式需要 source 字段",
+            ),
+            (
+                BuiltinToolName::DiffPreview,
+                serde_json::json!({ "left": "a", "right": "b" }),
+                "差异预览需要 before/after 文本或路径",
+            ),
+        ];
+
+        for (tool, input, expected_error) in failures {
+            let output = exec_tool(&registry, tool, &input.to_string());
+            assert_eq!(output.status, ExecutionResultStatus::Failed, "{tool:?}");
+            assert!(
+                output.payload.contains(expected_error),
+                "{} should reject legacy alias input with '{}', payload: {}",
+                tool.as_str(),
+                expected_error,
+                output.payload
+            );
+        }
+
+        let process_alias = exec_tool(
+            &registry,
+            BuiltinToolName::ProcessInspect,
+            &serde_json::json!({ "process_id": 1 }).to_string(),
+        );
+        assert_eq!(process_alias.status, ExecutionResultStatus::Failed);
+        assert!(
+            process_alias
+                .payload
+                .contains("process_inspect 只接受 pid/query/limit 字段"),
+            "process_inspect should reject process_id alias, payload: {}",
+            process_alias.payload
+        );
     }
 
     #[test]

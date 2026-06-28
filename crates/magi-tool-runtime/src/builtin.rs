@@ -401,7 +401,7 @@ fn execute_search_text(input: &str, context: &ToolExecutionContext) -> String {
     let query = match required_string_or_raw(
         input,
         request.as_ref(),
-        &["query", "text", "needle"],
+        &["query"],
         "search_text",
         "缺少搜索关键词",
     ) {
@@ -410,7 +410,7 @@ fn execute_search_text(input: &str, context: &ToolExecutionContext) -> String {
     };
     let root_input = request
         .as_ref()
-        .and_then(|object| field_string(object, &["root", "path", "workspace"]))
+        .and_then(|object| field_string(object, &["root"]))
         .unwrap_or_else(|| ".".to_string());
     let root = match resolve_path_with_context(&root_input, context) {
         Ok(path) => path,
@@ -420,7 +420,7 @@ fn execute_search_text(input: &str, context: &ToolExecutionContext) -> String {
     };
     let limit = request
         .as_ref()
-        .and_then(|object| field_usize(object, &["limit", "max_results"]))
+        .and_then(|object| field_usize(object, &["limit"]))
         .unwrap_or(20)
         .clamp(1, 500);
     let case_sensitive = request
@@ -476,7 +476,7 @@ fn execute_shell_exec(input: &str, context: &ToolExecutionContext) -> String {
     let command = match required_string_or_raw(
         input,
         request.as_ref(),
-        &["command", "script", "line"],
+        &["command"],
         "shell_exec",
         "缺少 shell 命令",
     ) {
@@ -485,7 +485,7 @@ fn execute_shell_exec(input: &str, context: &ToolExecutionContext) -> String {
     };
     if request
         .as_ref()
-        .and_then(|object| field_bool(object, &["background", "long_running", "longRunning"]))
+        .and_then(|object| field_bool(object, &["background"]))
         .unwrap_or(false)
     {
         return execute_process_launch_with_surface(
@@ -498,7 +498,7 @@ fn execute_shell_exec(input: &str, context: &ToolExecutionContext) -> String {
     let access_mode = request
         .as_ref()
         .and_then(|object| {
-            field_string(object, &["access_mode", "write_mode", "intent"])
+            field_string(object, &["access_mode"])
                 .and_then(|value| BuiltinToolAccessMode::from_str(&value))
         })
         .unwrap_or(BuiltinToolAccessMode::MaybeWrite);
@@ -512,7 +512,7 @@ fn execute_shell_exec(input: &str, context: &ToolExecutionContext) -> String {
     }
     let cwd_input = request
         .as_ref()
-        .and_then(|object| field_string(object, &["cwd", "working_directory", "workdir"]));
+        .and_then(|object| field_string(object, &["cwd"]));
     let cwd = match cwd_input {
         Some(value) => match resolve_path_with_context(&value, context) {
             Ok(path) => path,
@@ -604,20 +604,19 @@ fn execute_shell_exec_background_action(
     context: &ToolExecutionContext,
 ) -> Option<String> {
     let request = request?;
-    let action = field_string(request, &["action", "operation", "op"])
-        .map(|value| value.trim().to_ascii_lowercase());
-    let has_terminal_id = field_usize(request, &["terminal_id", "terminalId", "id"]).is_some();
-    let has_command = field_string(request, &["command", "script", "line"])
-        .is_some_and(|value| !value.trim().is_empty());
+    let action = field_string(request, &["action"]).map(|value| value.trim().to_ascii_lowercase());
+    let has_terminal_id = field_usize(request, &["terminal_id"]).is_some();
+    let has_command =
+        field_string(request, &["command"]).is_some_and(|value| !value.trim().is_empty());
 
     let mode = match action.as_deref() {
         None if has_terminal_id && !has_command => "read",
         None => return None,
-        Some("run" | "exec" | "command") => return None,
-        Some("read" | "poll" | "status") => "read",
-        Some("write" | "stdin" | "send") => "write",
-        Some("kill" | "stop" | "terminate" | "cancel") => "kill",
-        Some("list" | "ls") => "list",
+        Some("run") => return None,
+        Some("read") => "read",
+        Some("write") => "write",
+        Some("kill") => "kill",
+        Some("list") => "list",
         Some(other) => {
             return Some(builtin_error(
                 "shell_exec",
@@ -985,7 +984,7 @@ fn execute_process_launch_with_surface(
     let command = match required_string_or_raw(
         input,
         request.as_ref(),
-        &["command", "script", "line"],
+        &["command"],
         surface_tool,
         "缺少 shell 命令",
     ) {
@@ -997,7 +996,7 @@ fn execute_process_launch_with_surface(
     }
     let cwd_input = request
         .as_ref()
-        .and_then(|object| field_string(object, &["cwd", "working_directory", "workdir"]));
+        .and_then(|object| field_string(object, &["cwd"]));
     let cwd = match cwd_input {
         Some(value) => match resolve_path_with_context(&value, context) {
             Ok(path) => path,
@@ -1094,13 +1093,13 @@ fn execute_process_read_with_surface(
         Some(request) => request,
         None => return builtin_error(surface_tool, "输入必须为 JSON 对象，包含 terminal_id"),
     };
-    let Some(terminal_id) = field_usize(&request, &["terminal_id", "terminalId", "id"]) else {
+    let Some(terminal_id) = field_usize(&request, &["terminal_id"]) else {
         return builtin_error(surface_tool, "缺少 terminal_id");
     };
     if let Some(error) = require_process_context(surface_tool, context) {
         return error;
     }
-    let max_bytes = field_usize(&request, &["max_bytes", "preview_bytes", "limit"])
+    let max_bytes = field_usize(&request, &["max_bytes"])
         .unwrap_or(12_000)
         .clamp(512, 200_000);
 
@@ -1160,13 +1159,13 @@ fn execute_process_write_with_surface(
         Some(request) => request,
         None => return builtin_error(surface_tool, "输入必须为 JSON 对象，包含 terminal_id"),
     };
-    let Some(terminal_id) = field_usize(&request, &["terminal_id", "terminalId", "id"]) else {
+    let Some(terminal_id) = field_usize(&request, &["terminal_id"]) else {
         return builtin_error(surface_tool, "缺少 terminal_id");
     };
     if let Some(error) = require_process_context(surface_tool, context) {
         return error;
     }
-    let content = field_string(&request, &["input", "content", "text"]).unwrap_or_default();
+    let content = field_string(&request, &["input"]).unwrap_or_default();
     let mut table = PROCESS_TABLE.lock().expect("process table lock poisoned");
     let Some(process) = table.get_mut(&(terminal_id as u64)) else {
         return builtin_error(surface_tool, format!("进程不存在: {terminal_id}"));
@@ -1213,7 +1212,7 @@ fn execute_process_kill_with_surface(
         Some(request) => request,
         None => return builtin_error(surface_tool, "输入必须为 JSON 对象，包含 terminal_id"),
     };
-    let Some(terminal_id) = field_usize(&request, &["terminal_id", "terminalId", "id"]) else {
+    let Some(terminal_id) = field_usize(&request, &["terminal_id"]) else {
         return builtin_error(surface_tool, "缺少 terminal_id");
     };
     if let Some(error) = require_process_context(surface_tool, context) {
@@ -1347,9 +1346,19 @@ fn tail_utf8(bytes: &[u8], max_bytes: usize) -> String {
 fn execute_process_inspect(input: &str) -> String {
     let request = parse_json_object(input);
     let raw_trimmed = input.trim();
+    if request.as_ref().is_some_and(|object| {
+        ["process_id", "name", "pattern", "max_results"]
+            .iter()
+            .any(|key| object.contains_key(*key))
+    }) {
+        return builtin_error(
+            "process_inspect",
+            "process_inspect 只接受 pid/query/limit 字段",
+        );
+    }
     let query = request
         .as_ref()
-        .and_then(|object| field_string(object, &["query", "name", "pattern"]))
+        .and_then(|object| field_string(object, &["query"]))
         .or_else(|| {
             if request.is_none() && !raw_trimmed.is_empty() && raw_trimmed.parse::<u32>().is_err() {
                 Some(raw_trimmed.to_string())
@@ -1359,7 +1368,7 @@ fn execute_process_inspect(input: &str) -> String {
         });
     let pid = request
         .as_ref()
-        .and_then(|object| field_usize(object, &["pid", "process_id"]))
+        .and_then(|object| field_usize(object, &["pid"]))
         .map(|pid| pid as u32)
         .or_else(|| {
             if query.is_some() {
@@ -1371,7 +1380,7 @@ fn execute_process_inspect(input: &str) -> String {
         .unwrap_or_else(std::process::id);
     let limit = request
         .as_ref()
-        .and_then(|object| field_usize(object, &["limit", "max_results"]))
+        .and_then(|object| field_usize(object, &["limit"]))
         .unwrap_or(20)
         .clamp(1, 100);
 
@@ -1449,13 +1458,16 @@ fn execute_process_inspect(input: &str) -> String {
 fn execute_diff_preview(input: &str) -> String {
     let request = parse_json_object(input);
     let parsed = if let Some(object) = request {
-        let before_path = field_string(&object, &["before_path", "left_path"]);
-        let after_path = field_string(&object, &["after_path", "right_path"]);
-        let before = field_string(&object, &["before", "left"]);
-        let after = field_string(&object, &["after", "right"]);
-        let before_label = field_string(&object, &["before_label", "left_label"])
+        let before_path = field_string(&object, &["before_path"]);
+        let after_path = field_string(&object, &["after_path"]);
+        let before = field_string(&object, &["before"]);
+        let after = field_string(&object, &["after"]);
+        if before_path.is_none() && after_path.is_none() && before.is_none() && after.is_none() {
+            return builtin_error("diff_preview", "差异预览需要 before/after 文本或路径");
+        }
+        let before_label = field_string(&object, &["before_label"])
             .unwrap_or_else(|| before_path.clone().unwrap_or_else(|| "before".to_string()));
-        let after_label = field_string(&object, &["after_label", "right_label"])
+        let after_label = field_string(&object, &["after_label"])
             .unwrap_or_else(|| after_path.clone().unwrap_or_else(|| "after".to_string()));
         (
             before_path,
@@ -2532,7 +2544,7 @@ fn execute_web_search(input: &str) -> String {
     let query = match required_string_or_raw(
         input,
         request.as_ref(),
-        &["query", "q", "search"],
+        &["query"],
         "web_search",
         "缺少搜索关键词 query",
     ) {
@@ -2669,16 +2681,11 @@ fn decode_html_entities(text: &str) -> String {
 
 fn execute_web_fetch(input: &str) -> String {
     let request = parse_json_object(input);
-    let url = match required_string_or_raw(
-        input,
-        request.as_ref(),
-        &["url", "href", "link"],
-        "web_fetch",
-        "缺少 URL",
-    ) {
-        Ok(value) => value,
-        Err(error) => return error,
-    };
+    let url =
+        match required_string_or_raw(input, request.as_ref(), &["url"], "web_fetch", "缺少 URL") {
+            Ok(value) => value,
+            Err(error) => return error,
+        };
 
     let prompt = request
         .as_ref()
@@ -2904,7 +2911,7 @@ fn execute_diagram_render(input: &str) -> String {
 
     match kind {
         "mermaid" => {
-            let source = match field_string(&request, &["source", "code"]) {
+            let source = match field_string(&request, &["source"]) {
                 Some(value) if !value.trim().is_empty() => value.trim().to_string(),
                 _ => return builtin_error("diagram_render", "该图表源码格式需要 source 字段"),
             };
@@ -2928,7 +2935,7 @@ fn execute_diagram_render(input: &str) -> String {
             payload["summary"] = serde_json::json!(format!("已生成图表数据（{}）", diagram_type));
         }
         "dot" => {
-            let source = match field_string(&request, &["source", "code"]) {
+            let source = match field_string(&request, &["source"]) {
                 Some(value) if !value.trim().is_empty() => value.trim().to_string(),
                 _ => return builtin_error("diagram_render", "该图表源码格式需要 source 字段"),
             };
@@ -3099,7 +3106,7 @@ fn execute_code_symbols(
             };
             let limit = request
                 .as_ref()
-                .and_then(|obj| field_usize(obj, &["limit", "max_results"]))
+                .and_then(|obj| field_usize(obj, &["limit"]))
                 .unwrap_or(20)
                 .clamp(1, 100);
             let Some(symbols) = store.find_symbol_definitions(workspace_id, &name, limit) else {
@@ -3200,7 +3207,7 @@ fn execute_search_semantic(
 
     let limit = request
         .as_ref()
-        .and_then(|obj| field_usize(obj, &["limit", "max_results"]))
+        .and_then(|obj| field_usize(obj, &["limit"]))
         .unwrap_or(10)
         .clamp(1, 50);
 
@@ -3267,7 +3274,7 @@ fn execute_knowledge_query(
     let query = match required_string_or_raw(
         input,
         request.as_ref(),
-        &["query", "q"],
+        &["query"],
         "knowledge_query",
         "缺少 query 字段",
     ) {
@@ -3292,7 +3299,7 @@ fn execute_knowledge_query(
     let tags = parse_knowledge_tags(request.as_ref());
     let limit = request
         .as_ref()
-        .and_then(|obj| field_usize(obj, &["limit", "max_results"]))
+        .and_then(|obj| field_usize(obj, &["limit"]))
         .unwrap_or(10)
         .clamp(1, 50);
 

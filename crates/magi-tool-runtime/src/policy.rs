@@ -136,7 +136,7 @@ impl ToolRegistry {
 
     pub(crate) fn parse_requested_access_mode(&self, input: &str) -> Option<BuiltinToolAccessMode> {
         parse_json_object(input).and_then(|object| {
-            field_string(&object, &["access_mode", "write_mode", "intent"])
+            field_string(&object, &["access_mode"])
                 .and_then(|value| BuiltinToolAccessMode::from_str(&value))
         })
     }
@@ -348,16 +348,7 @@ impl ToolRegistry {
         }
 
         if let Some(object) = &request {
-            for key in [
-                "path",
-                "source",
-                "destination",
-                "cwd",
-                "working_directory",
-                "workingDirectory",
-                "workdir",
-                "root",
-            ] {
+            for key in ["path", "source", "destination", "cwd", "root"] {
                 if let Some(value) = field_string(object, &[key]) {
                     if let Ok(path) = resolve_path_with_context(&value, context) {
                         paths.push(normalize_path_for_lock(&path));
@@ -372,7 +363,7 @@ impl ToolRegistry {
         let working_directory = if input.tool_name == crate::BuiltinToolName::ShellExec.as_str() {
             request
                 .as_ref()
-                .and_then(|object| field_string(object, &["cwd", "working_directory", "workdir"]))
+                .and_then(|object| field_string(object, &["cwd"]))
                 .map(|value| {
                     resolve_path_with_context(&value, context)
                         .map(|path| normalize_path_for_lock(&path))
@@ -647,37 +638,20 @@ pub fn tool_path_access_requests(
             push_tool_path_fields(
                 &mut paths,
                 object,
-                &["before_path", "beforePath", "left_path", "leftPath"],
+                &["before_path"],
                 read,
                 workspace_root_path,
             );
             push_tool_path_fields(
                 &mut paths,
                 object,
-                &["after_path", "afterPath", "right_path", "rightPath"],
+                &["after_path"],
                 read,
                 workspace_root_path,
             );
         }
         crate::BuiltinToolName::SearchText => {
-            push_tool_path_fields(
-                &mut paths,
-                object,
-                &[
-                    "path",
-                    "file_path",
-                    "filePath",
-                    "filepath",
-                    "file",
-                    "root",
-                    "cwd",
-                    "working_directory",
-                    "workingDirectory",
-                    "workdir",
-                ],
-                read,
-                workspace_root_path,
-            );
+            push_tool_path_fields(&mut paths, object, &["root"], read, workspace_root_path);
         }
         crate::BuiltinToolName::CodeSymbols => {
             push_tool_path_fields(&mut paths, object, &["path"], read, workspace_root_path);
@@ -693,7 +667,7 @@ pub fn tool_path_access_requests(
             push_tool_path_fields(
                 &mut paths,
                 object,
-                &["cwd", "working_directory", "workingDirectory", "workdir"],
+                &["cwd"],
                 shell_kind,
                 workspace_root_path,
             );
@@ -713,13 +687,7 @@ pub fn tool_path_access_requests(
             }
         }
         crate::BuiltinToolName::ProcessLaunch => {
-            push_tool_path_fields(
-                &mut paths,
-                object,
-                &["cwd", "working_directory", "workingDirectory", "workdir"],
-                write,
-                workspace_root_path,
-            );
+            push_tool_path_fields(&mut paths, object, &["cwd"], write, workspace_root_path);
             if paths.is_empty()
                 && let Some(root) = workspace_root_path
             {
@@ -742,7 +710,7 @@ fn shell_exec_uses_working_directory(
     let Some(object) = object else {
         return !arguments.trim().is_empty();
     };
-    object_has_non_empty_string(object, &["command", "script", "line"])
+    object_has_non_empty_string(object, &["command"])
 }
 
 fn object_has_non_empty_string(object: &serde_json::Map<String, Value>, keys: &[&str]) -> bool {

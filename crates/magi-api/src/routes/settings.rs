@@ -951,15 +951,9 @@ async fn save_orchestrator_session_config(
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     reject_deprecated_scope_body_fields(&request)?;
-    let session_id = request
-        .get("sessionId")
-        .and_then(Value::as_str);
-    let workspace_id = request
-        .get("workspaceId")
-        .and_then(Value::as_str);
-    let workspace_path = request
-        .get("workspacePath")
-        .and_then(Value::as_str);
+    let session_id = request.get("sessionId").and_then(Value::as_str);
+    let workspace_id = request.get("workspaceId").and_then(Value::as_str);
+    let workspace_path = request.get("workspacePath").and_then(Value::as_str);
     let scope = session_scope::require_session_workspace_scope(
         &state,
         session_id,
