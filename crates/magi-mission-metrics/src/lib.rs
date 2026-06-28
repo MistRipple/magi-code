@@ -373,17 +373,12 @@ pub struct MissionMetricsRegistry {
 }
 
 impl MissionMetricsRegistry {
-    /// 不可失败：home 解析失败时回退到 `$TMPDIR/magi-mission-metrics`，
-    /// 保证 dispatcher 构造不被 IO 状态阻塞。
     pub fn new() -> Self {
-        let home = dirs_home().unwrap_or_else(|| std::env::temp_dir().join("magi-mission-metrics"));
-        Self {
-            inner: RwLock::new(HashMap::new()),
-            home,
-        }
+        Self::with_home(dirs_home().expect("HOME 目录不可用，无法定位 Magi 状态根"))
     }
 
     pub fn with_home(home: PathBuf) -> Self {
+        let _ = fs::create_dir_all(&home);
         Self {
             inner: RwLock::new(HashMap::new()),
             home,

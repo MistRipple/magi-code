@@ -39,7 +39,6 @@ use magi_governance::GovernanceService;
 use magi_knowledge_store::KnowledgeStore;
 use magi_lifecycle_notice::{LifecycleNoticeRegistry, run_subscriber as run_lifecycle_subscriber};
 use magi_memory_store::MemoryStore;
-use magi_mission_metrics::MissionMetricsRegistry;
 use magi_orchestrator::{ExecutionContextConfig, OrchestratorService, task_store::TaskStore};
 use magi_session_store::{SessionExecutionSidecarStatus, SessionRuntimeSidecar, SessionStore};
 use magi_skill_runtime::SkillDispatchRuntime;
@@ -1062,7 +1061,6 @@ impl DaemonRuntime {
             lifecycle_notice_registry.clone(),
             self.event_bus.clone(),
         ));
-        let mission_metrics_registry = Arc::new(MissionMetricsRegistry::new());
         let llm_task_dispatcher = Arc::new(
             llm_task_dispatcher
                 .with_model_bridge_client(business_model_client.clone())
@@ -1079,8 +1077,7 @@ impl DaemonRuntime {
                 .with_conversation_registry(state.conversation_registry.clone())
                 .with_agent_role_registry(state.agent_role_registry.clone())
                 .with_mission_state_root(self.state_root.clone())
-                .with_lifecycle_notices(lifecycle_notice_registry)
-                .with_mission_metrics_registry(mission_metrics_registry),
+                .with_lifecycle_notices(lifecycle_notice_registry),
         );
         let session_turn_dispatcher = llm_task_dispatcher.clone();
         let human_checkpoint_registry_for_dispatch_gate =

@@ -244,14 +244,8 @@ mod tests {
     }
 
     #[test]
-    fn builtin_tool_definition_keeps_alias_name_with_canonical_schema() {
-        let definition = public_builtin_tool_definition("file_view").expect("public alias");
-
-        assert_eq!(definition.function.name, "file_view");
-        assert_eq!(
-            definition.function.description,
-            BuiltinToolName::FileRead.description()
-        );
+    fn builtin_tool_definition_rejects_non_canonical_alias() {
+        assert!(public_builtin_tool_definition("file_view").is_none());
     }
 
     #[test]

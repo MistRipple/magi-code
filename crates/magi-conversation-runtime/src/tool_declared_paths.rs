@@ -20,8 +20,7 @@ pub(crate) fn derive_declared_paths(tool_call: &ChatToolCall) -> Vec<PathBuf> {
     };
     let mut paths: Vec<PathBuf> = Vec::new();
     match tool_name {
-        "file_write" | "file_patch" | "file_remove" | "file_mkdir" | "file_create"
-        | "file_edit" => {
+        "file_write" | "file_patch" | "file_remove" | "file_mkdir" => {
             if let Some(path) = arguments.get("path").and_then(Value::as_str) {
                 paths.push(PathBuf::from(path));
             }

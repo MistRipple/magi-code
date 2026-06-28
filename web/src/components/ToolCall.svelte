@@ -79,15 +79,7 @@
 
   const TOOL_DISPLAY_NAME_KEYS: Record<string, string> = {
     'tool_result': 'toolCall.displayName.default',
-    'file_view': 'toolCall.displayName.fileView',
-    'image_view': 'toolCall.displayName.viewImage',
-    'file_create': 'toolCall.displayName.fileCreate',
-    'file_edit': 'toolCall.displayName.fileEdit',
-    'file_insert': 'toolCall.displayName.fileInsert',
-    'code_search_regex': 'toolCall.displayName.grepSearch',
-    'code_search_semantic': 'toolCall.displayName.codebaseRetrieval',
     'skill_apply': 'toolCall.displayName.skillApply',
-    'project_knowledge_query': 'toolCall.displayName.knowledgeQuery',
     'code_intel_query': 'toolCall.displayName.codeSymbols',
     'list_files': 'toolCall.displayName.listFiles',
     'shell_exec': 'toolCall.displayName.shell',
@@ -225,23 +217,13 @@
     const baseToolName = parsedTool.baseName;
 
     const iconMap: Record<string, IconName> = {
-      // ToolManager 内置工具（前端别名）
-      'file_view': 'eye',
-      'file_create': 'file-plus',
-      'file_edit': 'pencil',
-      'file_insert': 'plus',
       'view_image': 'eye',
-      'image_view': 'eye',
-      'code_search_regex': 'search',
       'file_remove': 'trash',
       'web_search': 'search',
       'web_fetch': 'globe',
       'diagram_render': 'git-branch',
-      'code_search_semantic': 'search',
       'skill_apply': 'skill',
-      'project_knowledge_query': 'question',
       'code_intel_query': 'search',
-      // 后端规范名（LLM 工具调用使用的名称）
       'shell_exec': 'terminal',
       'file_read': 'eye',
       'file_write': 'file-plus',
@@ -299,7 +281,7 @@
 
   // 文件变更工具：diff 面板由 FileChangeCard 展示，ToolCall 仅渲染紧凑 header
   const isFileMutationTool = $derived(
-    name === 'file_edit' || name === 'file_create' || name === 'file_insert' || name === 'file_remove'
+    name === 'file_patch' || name === 'file_write' || name === 'apply_patch' || name === 'file_remove'
   );
   const isCompactMutation = $derived(isFileMutationTool && (status === 'running' || status === 'pending'));
 
@@ -391,9 +373,9 @@
 
 
   // 目录/文件只读工具：只需紧凑 header
-  const isCompactReadOnlyTool = $derived(name === 'file_view' || name === 'list_files');
+  const isCompactReadOnlyTool = $derived(name === 'file_read' || name === 'list_files');
   // 仅 view 类工具支持点击整行 header 打开文件
-  const isHeaderOpenableTool = $derived(name === 'file_view' || name === 'view');
+  const isHeaderOpenableTool = $derived(name === 'file_read' || name === 'view');
 
   // 检查是否有内容
   const inputText = $derived(formatToolInput(input));
@@ -472,25 +454,17 @@
     switch (toolName) {
       case 'shell_exec':
         return normalizeToolDisplayText(args.command);
-      case 'file_view':
-      case 'file_create':
-      case 'file_edit':
-      case 'file_insert':
       case 'file_read':
       case 'view_image':
-      case 'image_view':
       case 'file_write':
       case 'file_patch':
       case 'apply_patch':
       case 'list_files': {
         return firstToolDisplayText(args.path, args.file_path, args.image_path);
       }
-      case 'code_search_regex':
       case 'search_text':
         return firstToolDisplayText(args.pattern, args.query);
-      case 'code_search_semantic':
       case 'search_semantic':
-      case 'project_knowledge_query':
       case 'knowledge_query':
         return normalizeToolDisplayText(args.query);
       case 'skill_apply':
@@ -552,9 +526,9 @@
     }
   }
 
-  // 判断 file_view 是否为目录查看模式
+  // 判断 file_read 是否为目录查看模式
   const isDirectoryView = $derived.by(() => {
-    if (name !== 'file_view' && name !== 'file_read') return false;
+    if (name !== 'file_read') return false;
     if (!input || typeof input !== 'object') return false;
     const args = input as Record<string, unknown>;
     if (args.type === 'directory') return true;
@@ -564,7 +538,7 @@
 
   const toolIcon = $derived(getToolIcon(name));
   const toolDisplayName = $derived(
-    name === 'file_view'
+    name === 'file_read'
       ? (isDirectoryView ? i18n.t('toolCall.displayName.viewDirectory') : i18n.t('toolCall.displayName.viewFile'))
       : getToolDisplayName(name)
   );
@@ -669,26 +643,8 @@
     }
 
     if (matches(
-      'file_edit_model_output_invalid',
-      'file_edit_model_output_truncated',
-      'file_edit_model_empty_response',
-      'file_edit_model_timeout',
-      'file_edit_model_service_error',
-      'file_edit_generation_failed',
-    )) {
-      return {
-        category: 'model_output',
-        categoryLabel: i18n.t('toolCall.errorDiagnosis.modelOutput.categoryLabel'),
-        ownerLabel: i18n.t('toolCall.errorDiagnosis.modelOutput.ownerLabel'),
-        message: i18n.t('toolCall.errorDiagnosis.modelOutput.message'),
-        hint: i18n.t('toolCall.errorDiagnosis.modelOutput.hint'),
-      };
-    }
-
-    if (matches(
       'file_write_apply_failed',
       'file_write_save_failed',
-      'file_edit_write_failed',
       'file_remove_apply_failed',
       'write_conflict',
       'file_write_failed',
@@ -711,9 +667,6 @@
     }
 
     if (matches(
-      'file_create_invalid_args',
-      'file_edit_invalid_args',
-      'file_insert_invalid_args',
       'file_remove_invalid_args',
       'file_path_required',
       'file_path_outside_workspace',
@@ -1119,7 +1072,7 @@
     margin-top: var(--space-2);
   }
 
-  /* 只读查看工具（file_view / list_files）：紧凑但有卡片背景 */
+  /* 只读查看工具（file_read / list_files）：紧凑但有卡片背景 */
   .tool-call.compact-readonly {
     margin-top: var(--space-2);
   }

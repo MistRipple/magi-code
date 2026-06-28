@@ -246,17 +246,17 @@ impl BuiltinToolName {
 
     pub fn from_str(name: &str) -> Option<Self> {
         match name {
-            "file_read" | "file_view" => Some(Self::FileRead),
-            "view_image" | "image_view" => Some(Self::ViewImage),
-            "file_write" | "file_create" => Some(Self::FileWrite),
-            "file_patch" | "file_edit" | "file_insert" => Some(Self::FilePatch),
+            "file_read" => Some(Self::FileRead),
+            "view_image" => Some(Self::ViewImage),
+            "file_write" => Some(Self::FileWrite),
+            "file_patch" => Some(Self::FilePatch),
             "apply_patch" => Some(Self::ApplyPatch),
             "file_remove" => Some(Self::FileRemove),
             "file_mkdir" => Some(Self::FileMkdir),
             "file_copy" => Some(Self::FileCopy),
             "file_move" => Some(Self::FileMove),
-            "search_text" | "code_search_regex" => Some(Self::SearchText),
-            "search_semantic" | "code_search_semantic" => Some(Self::SearchSemantic),
+            "search_text" => Some(Self::SearchText),
+            "search_semantic" => Some(Self::SearchSemantic),
             "shell_exec" => Some(Self::ShellExec),
             "process_launch" => Some(Self::ProcessLaunch),
             "process_read" => Some(Self::ProcessRead),
@@ -268,31 +268,19 @@ impl BuiltinToolName {
             "web_search" => Some(Self::WebSearch),
             "web_fetch" => Some(Self::WebFetch),
             "diagram_render" => Some(Self::DiagramRender),
-            "knowledge_query" | "project_knowledge_query" => Some(Self::KnowledgeQuery),
-            "code_symbols" | "symbol_nav" | "goto_definition" | "list_file_symbols" => {
-                Some(Self::CodeSymbols)
-            }
-            "tool_catalog" | "tool_diagnostics" | "builtin_tools" | "builtin_tool_catalog" => {
-                Some(Self::ToolCatalog)
-            }
-            "agent_spawn" | "agent" | "spawn_agent" => Some(Self::AgentSpawn),
-            "agent_wait" | "wait_agent" => Some(Self::AgentWait),
-            "todo_write" | "todowrite" | "todo" => Some(Self::TodoWrite),
-            "memory_write" | "memorywrite" | "memory" => Some(Self::MemoryWrite),
-            "mission_charter_write" | "missioncharterwrite" | "mission_charter" => {
-                Some(Self::MissionCharterWrite)
-            }
-            "plan_write" | "planwrite" | "plan" => Some(Self::PlanWrite),
-            "kg_write" | "kgwrite" | "knowledge_write" | "knowledge_graph_write" => {
-                Some(Self::KgWrite)
-            }
-            "validation_record" | "validationrecord" | "validation_write" | "validation" => {
-                Some(Self::ValidationRecord)
-            }
-            "checkpoint_create" | "checkpoint" | "snapshot" => Some(Self::Checkpoint),
-            "human_checkpoint_request" | "human_checkpoint" | "human_review" => {
-                Some(Self::HumanCheckpointRequest)
-            }
+            "knowledge_query" => Some(Self::KnowledgeQuery),
+            "code_symbols" => Some(Self::CodeSymbols),
+            "tool_catalog" => Some(Self::ToolCatalog),
+            "agent_spawn" => Some(Self::AgentSpawn),
+            "agent_wait" => Some(Self::AgentWait),
+            "todo_write" => Some(Self::TodoWrite),
+            "memory_write" => Some(Self::MemoryWrite),
+            "mission_charter_write" => Some(Self::MissionCharterWrite),
+            "plan_write" => Some(Self::PlanWrite),
+            "kg_write" => Some(Self::KgWrite),
+            "validation_record" => Some(Self::ValidationRecord),
+            "checkpoint_create" => Some(Self::Checkpoint),
+            "human_checkpoint_request" => Some(Self::HumanCheckpointRequest),
             _ => None,
         }
     }
@@ -6045,28 +6033,25 @@ mod tests {
     }
 
     #[test]
-    fn from_str_handles_ts_compatible_aliases() {
-        let aliases = [
-            ("file_view", BuiltinToolName::FileRead),
-            ("image_view", BuiltinToolName::ViewImage),
-            ("file_create", BuiltinToolName::FileWrite),
-            ("file_edit", BuiltinToolName::FilePatch),
-            ("file_insert", BuiltinToolName::FilePatch),
-            ("file_remove", BuiltinToolName::FileRemove),
-            ("code_search_regex", BuiltinToolName::SearchText),
-            ("code_search_semantic", BuiltinToolName::SearchSemantic),
-            ("web_search", BuiltinToolName::WebSearch),
-            ("web_fetch", BuiltinToolName::WebFetch),
-            ("project_knowledge_query", BuiltinToolName::KnowledgeQuery),
-            ("tool_diagnostics", BuiltinToolName::ToolCatalog),
-        ];
-        for (alias, expected) in &aliases {
-            assert_eq!(
-                BuiltinToolName::from_str(alias),
-                Some(*expected),
-                "TS alias {} should resolve",
-                alias
-            );
+    fn from_str_rejects_non_canonical_aliases() {
+        for alias in [
+            "file_view",
+            "image_view",
+            "file_create",
+            "file_edit",
+            "file_insert",
+            "code_search_regex",
+            "code_search_semantic",
+            "project_knowledge_query",
+            "tool_diagnostics",
+            "spawn_agent",
+            "todowrite",
+            "todo",
+            "memory",
+            "plan",
+            "snapshot",
+        ] {
+            assert_eq!(BuiltinToolName::from_str(alias), None);
         }
         assert_eq!(BuiltinToolName::from_str("nonexistent_tool"), None);
         assert_eq!(BuiltinToolName::from_str("mermaid_diagram"), None);
@@ -6085,15 +6070,13 @@ mod tests {
     }
 
     #[test]
-    fn canonical_builtin_tool_name_uses_builtin_aliases() {
+    fn canonical_builtin_tool_name_accepts_only_canonical_names() {
         assert_eq!(
-            canonical_builtin_tool_name("file_edit"),
+            canonical_builtin_tool_name("file_patch"),
             Some("file_patch".to_string())
         );
-        assert_eq!(
-            canonical_builtin_tool_name("tool_diagnostics"),
-            Some("tool_catalog".to_string())
-        );
+        assert_eq!(canonical_builtin_tool_name("file_edit"), None);
+        assert_eq!(canonical_builtin_tool_name("tool_diagnostics"), None);
         assert_eq!(canonical_builtin_tool_name("unknown_tool"), None);
     }
 
@@ -6913,15 +6896,15 @@ mod tests {
     }
 
     #[test]
-    fn builtin_execution_input_canonicalizes_alias_and_applies_invocation_policy() {
-        let file_view = ToolExecutionInput::for_builtin_invocation(
-            ToolCallId::new("tool-call-file-view"),
-            "file_view",
+    fn builtin_execution_input_keeps_canonical_name_and_applies_invocation_policy() {
+        let file_read = ToolExecutionInput::for_builtin_invocation(
+            ToolCallId::new("tool-call-file-read"),
+            "file_read",
             "/tmp/example.txt",
         );
-        assert_eq!(file_view.tool_name, BuiltinToolName::FileRead.as_str());
-        assert_eq!(file_view.risk_level, RiskLevel::Low);
-        assert_eq!(file_view.approval_requirement, ApprovalRequirement::None);
+        assert_eq!(file_read.tool_name, BuiltinToolName::FileRead.as_str());
+        assert_eq!(file_read.risk_level, RiskLevel::Low);
+        assert_eq!(file_read.approval_requirement, ApprovalRequirement::None);
 
         let recursive_remove = ToolExecutionInput::for_builtin_invocation(
             ToolCallId::new("tool-call-file-remove"),

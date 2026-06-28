@@ -28,10 +28,7 @@ interface ApplyPatchOperation {
 
 const FILE_MUTATION_TOOLS = new Set([
   'file_write',
-  'file_create',
   'file_patch',
-  'file_edit',
-  'file_insert',
   'apply_patch',
   'file_remove',
 ]);
@@ -56,7 +53,7 @@ export function buildCanonicalToolFileChangeBlocks(input: FileChangeProjectionIn
     return [];
   }
 
-  if (input.toolName === 'file_patch' || input.toolName === 'file_edit' || input.toolName === 'file_insert') {
+  if (input.toolName === 'file_patch') {
     const patches = textPatchesFromFilePatchArgs(args);
     return [fileChangeBlock(input, 0, {
       filePath,
@@ -67,9 +64,9 @@ export function buildCanonicalToolFileChangeBlocks(input: FileChangeProjectionIn
     })];
   }
 
-  if (input.toolName === 'file_write' || input.toolName === 'file_create') {
+  if (input.toolName === 'file_write') {
     const content = firstString(args.content, args.text, args.data);
-    const created = readBoolean(result?.created) ?? input.toolName === 'file_create';
+    const created = readBoolean(result?.created) ?? false;
     const additions = content ? countPatchLines(content) : 0;
     return [fileChangeBlock(input, 0, {
       filePath,

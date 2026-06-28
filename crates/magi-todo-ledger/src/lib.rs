@@ -29,11 +29,12 @@ pub enum TodoStatus {
 }
 
 impl TodoStatus {
-    pub fn parse(raw: &str) -> Self {
+    pub fn parse(raw: &str) -> Result<Self, TodoWriteError> {
         match raw.trim().to_ascii_lowercase().as_str() {
-            "in_progress" | "in-progress" | "inprogress" => Self::InProgress,
-            "completed" | "complete" | "done" => Self::Completed,
-            _ => Self::Pending,
+            "pending" => Ok(Self::Pending),
+            "in_progress" => Ok(Self::InProgress),
+            "completed" => Ok(Self::Completed),
+            _ => Err(TodoWriteError::InvalidStatus(raw.to_string())),
         }
     }
 
@@ -200,7 +201,7 @@ impl TodoLedgerRegistry {
 /// ```json
 /// { "todos": [ { "content": "...", "activeForm": "...", "status": "pending" }, ... ] }
 /// ```
-/// 容错：忽略缺字段或非法 status；空 `todos` 数组等价于"清空 ledger"。
+/// 空 `todos` 数组等价于"清空 ledger"。坏 entry 直接返回错误，避免模型输出问题被静默写成假进度。
 pub fn parse_todo_write_arguments(arguments_json: &str) -> Result<Vec<TodoItem>, TodoWriteError> {
     let value: serde_json::Value = serde_json::from_str(arguments_json)
         .map_err(|err| TodoWriteError::InvalidJson(err.to_string()))?;
@@ -209,38 +210,60 @@ pub fn parse_todo_write_arguments(arguments_json: &str) -> Result<Vec<TodoItem>,
         .ok_or(TodoWriteError::MissingTodosField)?;
     let array = todos.as_array().ok_or(TodoWriteError::TodosNotArray)?;
     let mut items = Vec::with_capacity(array.len());
-    for entry in array {
-        let object = match entry.as_object() {
-            Some(obj) => obj,
-            None => continue,
-        };
+    let mut in_progress_count = 0usize;
+    for (index, entry) in array.iter().enumerate() {
+        let object = entry
+            .as_object()
+            .ok_or(TodoWriteError::TodoEntryNotObject(index))?;
         let content = object
             .get("content")
             .and_then(serde_json::Value::as_str)
-            .unwrap_or("")
+            .ok_or(TodoWriteError::MissingTodoField {
+                index,
+                field: "content",
+            })?
             .trim()
             .to_string();
         if content.is_empty() {
-            continue;
+            return Err(TodoWriteError::BlankTodoField {
+                index,
+                field: "content",
+            });
         }
-        // 兼容 camelCase 与 snake_case 两种写法。
         let active_form = object
             .get("activeForm")
-            .or_else(|| object.get("active_form"))
             .and_then(serde_json::Value::as_str)
-            .unwrap_or("")
+            .ok_or(TodoWriteError::MissingTodoField {
+                index,
+                field: "activeForm",
+            })?
             .trim()
             .to_string();
+        if active_form.is_empty() {
+            return Err(TodoWriteError::BlankTodoField {
+                index,
+                field: "activeForm",
+            });
+        }
         let status = object
             .get("status")
             .and_then(serde_json::Value::as_str)
-            .map(TodoStatus::parse)
-            .unwrap_or(TodoStatus::Pending);
+            .ok_or(TodoWriteError::MissingTodoField {
+                index,
+                field: "status",
+            })
+            .and_then(TodoStatus::parse)?;
+        if status == TodoStatus::InProgress {
+            in_progress_count += 1;
+        }
         items.push(TodoItem {
             content,
             active_form,
             status,
         });
+    }
+    if in_progress_count > 1 {
+        return Err(TodoWriteError::MultipleInProgressTodos);
     }
     Ok(items)
 }
@@ -253,6 +276,16 @@ pub enum TodoWriteError {
     MissingTodosField,
     #[error("todo_write arguments.todos 必须是数组")]
     TodosNotArray,
+    #[error("todo_write arguments.todos[{0}] 必须是对象")]
+    TodoEntryNotObject(usize),
+    #[error("todo_write arguments.todos[{index}] 缺少 {field} 字段")]
+    MissingTodoField { index: usize, field: &'static str },
+    #[error("todo_write arguments.todos[{index}].{field} 不能为空")]
+    BlankTodoField { index: usize, field: &'static str },
+    #[error("todo_write status 非法: {0}，只允许 pending / in_progress / completed")]
+    InvalidStatus(String),
+    #[error("todo_write 只允许一个 todo 处于 in_progress")]
+    MultipleInProgressTodos,
 }
 // --- Tool entry：`todo_write` 工具执行体
 
@@ -386,35 +419,87 @@ mod tests {
     }
 
     #[test]
-    fn parse_arguments_handles_camel_case() {
+    fn parse_arguments_accepts_schema_shape() {
         let raw = serde_json::json!({
             "todos": [
                 { "content": "step 1", "activeForm": "doing step 1", "status": "pending" },
-                { "content": "step 2", "activeForm": "doing step 2", "status": "in_progress" },
+                { "content": "step 2", "activeForm": "doing step 2", "status": "completed" },
             ]
         })
         .to_string();
         let items = parse_todo_write_arguments(&raw).unwrap();
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].status, TodoStatus::Pending);
-        assert_eq!(items[1].status, TodoStatus::InProgress);
+        assert_eq!(items[1].status, TodoStatus::Completed);
         assert_eq!(items[1].active_form, "doing step 2");
     }
 
     #[test]
-    fn parse_arguments_skips_blank_and_invalid_status() {
+    fn parse_arguments_rejects_blank_content() {
         let raw = serde_json::json!({
             "todos": [
                 { "content": "  ", "status": "pending" },
-                { "content": "ok", "status": "garbage" },
-                "not-an-object",
             ]
         })
         .to_string();
-        let items = parse_todo_write_arguments(&raw).unwrap();
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].content, "ok");
-        assert_eq!(items[0].status, TodoStatus::Pending); // 非法 status → fallback
+        let err = parse_todo_write_arguments(&raw).unwrap_err();
+        assert_eq!(
+            err,
+            TodoWriteError::BlankTodoField {
+                index: 0,
+                field: "content"
+            }
+        );
+    }
+
+    #[test]
+    fn parse_arguments_rejects_invalid_status() {
+        let raw = serde_json::json!({
+            "todos": [
+                { "content": "ok", "activeForm": "doing ok", "status": "garbage" },
+            ]
+        })
+        .to_string();
+        let err = parse_todo_write_arguments(&raw).unwrap_err();
+        assert_eq!(err, TodoWriteError::InvalidStatus("garbage".to_string()));
+    }
+
+    #[test]
+    fn parse_arguments_rejects_non_object_entry() {
+        let raw = serde_json::json!({ "todos": ["not-an-object"] }).to_string();
+        let err = parse_todo_write_arguments(&raw).unwrap_err();
+        assert_eq!(err, TodoWriteError::TodoEntryNotObject(0));
+    }
+
+    #[test]
+    fn parse_arguments_rejects_missing_active_form() {
+        let raw = serde_json::json!({
+            "todos": [
+                { "content": "ok", "status": "pending" },
+            ]
+        })
+        .to_string();
+        let err = parse_todo_write_arguments(&raw).unwrap_err();
+        assert_eq!(
+            err,
+            TodoWriteError::MissingTodoField {
+                index: 0,
+                field: "activeForm"
+            }
+        );
+    }
+
+    #[test]
+    fn parse_arguments_rejects_multiple_in_progress_items() {
+        let raw = serde_json::json!({
+            "todos": [
+                { "content": "step 1", "activeForm": "doing step 1", "status": "in_progress" },
+                { "content": "step 2", "activeForm": "doing step 2", "status": "in_progress" },
+            ]
+        })
+        .to_string();
+        let err = parse_todo_write_arguments(&raw).unwrap_err();
+        assert_eq!(err, TodoWriteError::MultipleInProgressTodos);
     }
 
     #[test]

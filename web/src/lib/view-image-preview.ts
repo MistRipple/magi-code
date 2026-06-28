@@ -9,7 +9,7 @@ export interface ViewImagePreview {
 
 export function isViewImageTool(toolName: string): boolean {
   const parsed = parseToolIdentity(toolName);
-  return parsed.baseName === 'view_image' || parsed.baseName === 'image_view';
+  return parsed.baseName === 'view_image';
 }
 
 export function parseViewImagePreview(toolName: string, content: unknown): ViewImagePreview | null {

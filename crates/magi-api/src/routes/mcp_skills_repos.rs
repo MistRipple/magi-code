@@ -965,7 +965,7 @@ async fn install_skill(
         .runtime_persistence()
         .and_then(|p| p.state_root())
         .map(|root| root.join("skills_cache"))
-        .unwrap_or_else(|| std::env::temp_dir().join("magi_skills_cache"));
+        .ok_or_else(|| ApiError::InvalidInput(SKILL_CACHE_PUBLIC_ERROR.to_string()))?;
 
     let target_dir = cache_dir.join(skill_id.replace('/', "_"));
 

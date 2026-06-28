@@ -28,14 +28,9 @@ const CHANGED_PATH_KEYS = [
 
 const APPLY_PATCH_TEXT_KEYS = ['patch', 'input', 'text'];
 const SINGLE_FILE_TOOLS = new Set([
-  'file_view',
   'file_read',
   'view_image',
-  'image_view',
-  'file_create',
   'file_write',
-  'file_edit',
-  'file_insert',
   'file_patch',
   'file_mkdir',
 ]);

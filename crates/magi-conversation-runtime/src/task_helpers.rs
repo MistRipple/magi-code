@@ -559,15 +559,6 @@ pub fn public_builtin_tool_reference_aliases() -> Vec<(&'static str, &'static st
             aliases.push((name, name));
         }
     }
-    aliases.extend([
-        ("file_view", "file_read"),
-        ("file_create", "file_write"),
-        ("file_edit", "file_patch"),
-        ("file_insert", "file_patch"),
-        ("code_search_regex", "search_text"),
-        ("code_search_semantic", "search_semantic"),
-        ("project_knowledge_query", "knowledge_query"),
-    ]);
     aliases
 }
 

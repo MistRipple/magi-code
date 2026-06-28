@@ -4108,12 +4108,12 @@ mod tests {
             "allowed_tools 白名单不含 agent_spawn 时不能继续强制模型调用"
         );
 
-        policy.allowed_tools = vec!["spawn_agent".to_string()];
+        policy.allowed_tools = vec!["agent_spawn".to_string()];
         task.policy_snapshot = Some(policy);
         assert!(
             agent_spawn_requirement_recovery_prompt(&task, &task_store, &[], &[], None, None)
                 .is_some(),
-            "agent_spawn 别名进入白名单时仍应视为可达"
+            "agent_spawn canonical name 进入白名单时应视为可达"
         );
     }
 

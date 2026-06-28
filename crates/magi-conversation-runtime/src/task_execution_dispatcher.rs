@@ -633,8 +633,12 @@ impl LlmTaskDispatcher {
         self.checkpoint_registry = Arc::new(magi_checkpoint::CheckpointRegistry::with_magi_home(
             magi_home.clone(),
         ));
-        self.human_checkpoint_registry =
-            Arc::new(magi_human_checkpoint::HumanCheckpointRegistry::with_magi_home(magi_home));
+        self.human_checkpoint_registry = Arc::new(
+            magi_human_checkpoint::HumanCheckpointRegistry::with_magi_home(magi_home.clone()),
+        );
+        self.mission_metrics_registry = Arc::new(
+            magi_mission_metrics::MissionMetricsRegistry::with_home(magi_home),
+        );
         self
     }
 
