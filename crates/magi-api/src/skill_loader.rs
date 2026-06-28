@@ -76,16 +76,6 @@ fn normalize_skills_config_entries(config: &mut Map<String, Value>) {
     }
 }
 
-fn ensure_array_entry_mut<'a>(map: &'a mut Map<String, Value>, key: &str) -> &'a mut Vec<Value> {
-    let value = map
-        .entry(key.to_string())
-        .or_insert_with(|| Value::Array(Vec::new()));
-    if !value.is_array() {
-        *value = Value::Array(Vec::new());
-    }
-    value.as_array_mut().expect("array value just inserted")
-}
-
 fn normalize_token(value: &str) -> String {
     value
         .chars()
@@ -166,101 +156,6 @@ fn parse_custom_tool_bindings(value: &Value) -> Vec<CustomToolBinding> {
         .collect()
 }
 
-fn migrate_top_level_custom_tools_into_skills_config(
-    config: &mut Map<String, Value>,
-    top_level_custom_tools: Option<Value>,
-) {
-    let top_level_custom_tools = top_level_custom_tools
-        .and_then(|value| value.as_array().cloned())
-        .unwrap_or_default();
-    if top_level_custom_tools.is_empty() {
-        return;
-    }
-    let custom_tools_array = ensure_array_entry_mut(config, TOP_LEVEL_CUSTOM_TOOLS_SECTION);
-    for entry in top_level_custom_tools {
-        let Some(mut object) = entry.as_object().cloned() else {
-            continue;
-        };
-        let tool_name = object
-            .get("name")
-            .and_then(|value| value.as_str())
-            .or_else(|| object.get("toolName").and_then(|value| value.as_str()))
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or_default()
-            .to_string();
-        if tool_name.is_empty() {
-            continue;
-        }
-        object.insert("name".to_string(), serde_json::json!(tool_name));
-        object.insert("toolName".to_string(), serde_json::json!(tool_name));
-        if let Some(position) = custom_tools_array.iter().position(|item| {
-            ["toolName", "name"].iter().any(|field| {
-                item.get(*field)
-                    .and_then(|value| value.as_str())
-                    .is_some_and(|value| value == tool_name)
-            })
-        }) {
-            custom_tools_array[position] = Value::Object(object);
-        } else {
-            custom_tools_array.push(Value::Object(object));
-        }
-    }
-}
-
-fn migrate_top_level_instruction_skills_into_skills_config(
-    config: &mut Map<String, Value>,
-    top_level_skills: Option<Value>,
-) {
-    let top_level_skills = top_level_skills
-        .and_then(|value| value.as_array().cloned())
-        .unwrap_or_default();
-    if top_level_skills.is_empty() {
-        return;
-    }
-    let instruction_skills_array = ensure_array_entry_mut(config, "instructionSkills");
-    for entry in top_level_skills {
-        let Some(mut object) = entry.as_object().cloned() else {
-            continue;
-        };
-        let skill_name = object
-            .get("name")
-            .and_then(|value| value.as_str())
-            .or_else(|| object.get("skillName").and_then(|value| value.as_str()))
-            .or_else(|| object.get("skillId").and_then(|value| value.as_str()))
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or_default()
-            .to_string();
-        if skill_name.is_empty() {
-            continue;
-        }
-        object.insert("name".to_string(), serde_json::json!(skill_name));
-        object.insert("skillName".to_string(), serde_json::json!(skill_name));
-        object.insert("skillId".to_string(), serde_json::json!(skill_name));
-        if object
-            .get("fullName")
-            .and_then(|value| value.as_str())
-            .map(str::trim)
-            .unwrap_or_default()
-            .is_empty()
-        {
-            object.insert("fullName".to_string(), serde_json::json!(skill_name));
-        }
-        if let Some(position) = instruction_skills_array.iter().position(|item| {
-            ["skillId", "skillName", "name"].iter().any(|field| {
-                item.get(*field)
-                    .and_then(|value| value.as_str())
-                    .is_some_and(|value| value == skill_name)
-            })
-        }) {
-            instruction_skills_array[position] = Value::Object(object);
-        } else {
-            instruction_skills_array.push(Value::Object(object));
-        }
-    }
-}
-
 fn canonical_skills_config_from_snapshot(
     snapshot: &mut HashMap<String, Value>,
 ) -> Map<String, Value> {
@@ -268,14 +163,8 @@ fn canonical_skills_config_from_snapshot(
         .remove(SKILLS_CONFIG_SECTION)
         .map(normalize_skills_config_value)
         .unwrap_or_default();
-    migrate_top_level_custom_tools_into_skills_config(
-        &mut config,
-        snapshot.remove(TOP_LEVEL_CUSTOM_TOOLS_SECTION),
-    );
-    migrate_top_level_instruction_skills_into_skills_config(
-        &mut config,
-        snapshot.remove(TOP_LEVEL_INSTRUCTION_SKILLS_SECTION),
-    );
+    snapshot.remove(TOP_LEVEL_CUSTOM_TOOLS_SECTION);
+    snapshot.remove(TOP_LEVEL_INSTRUCTION_SKILLS_SECTION);
     normalize_skills_config_entries(&mut config);
     config
 }
@@ -421,16 +310,18 @@ mod tests {
     }
 
     #[test]
-    fn normalize_skills_config_sections_merges_legacy_sections_into_canonical_config() {
-        let skill_dir =
-            make_local_skill_dir("legacy-merge", "# 合并测试\n\n请输出 legacy-skill。\n");
+    fn normalize_skills_config_sections_discards_obsolete_top_level_sections() {
+        let skill_dir = make_local_skill_dir(
+            "obsolete-top-level",
+            "# 合并测试\n\n请输出 obsolete-skill。\n",
+        );
         let mut snapshot = HashMap::from([
             (
                 "skills".to_string(),
                 serde_json::json!([
                     {
-                        "skillId": "legacy-skill",
-                        "name": "legacy-skill",
+                        "skillId": "obsolete-skill",
+                        "name": "obsolete-skill",
                         "directoryPath": skill_dir.to_string_lossy().to_string()
                     }
                 ]),
@@ -439,8 +330,8 @@ mod tests {
                 "customTools".to_string(),
                 serde_json::json!([
                     {
-                        "name": "legacy-tool",
-                        "bindingId": "legacy-tool"
+                        "name": "obsolete-tool",
+                        "bindingId": "obsolete-tool"
                     }
                 ]),
             ),
@@ -450,14 +341,7 @@ mod tests {
 
         assert!(snapshot.get("skills").is_none());
         assert!(snapshot.get("customTools").is_none());
-        assert_eq!(
-            snapshot["skillsConfig"]["instructionSkills"][0]["skillId"],
-            serde_json::json!("legacy-skill")
-        );
-        assert_eq!(
-            snapshot["skillsConfig"]["customTools"][0]["name"],
-            serde_json::json!("legacy-tool")
-        );
+        assert_eq!(snapshot["skillsConfig"], serde_json::json!({}));
 
         std::fs::remove_dir_all(&skill_dir).expect("temp skill dir should be removed");
     }
@@ -611,7 +495,7 @@ mod tests {
     }
 
     #[test]
-    fn build_skill_runtime_from_settings_canonicalizes_legacy_sections() {
+    fn build_skill_runtime_from_settings_does_not_load_obsolete_top_level_sections() {
         let skill_dir = make_local_skill_dir(
             "runtime-build",
             "# Runtime build\n\n请输出 runtime-build。\n",
@@ -630,7 +514,7 @@ mod tests {
 
         let runtime = build_skill_runtime_from_settings(&store);
         let registry = runtime.registry();
-        assert!(registry.get("runtime-skill").is_some());
+        assert!(registry.get("runtime-skill").is_none());
         assert!(store.get("skills").is_none());
         assert!(store.get("skillsConfig").is_some());
 
@@ -683,12 +567,15 @@ mod tests {
     }
 
     #[test]
-    fn save_skills_config_object_canonicalizes_wrapped_input_and_removes_legacy_sections() {
+    fn save_skills_config_object_canonicalizes_wrapped_input_and_removes_obsolete_sections() {
         let store = SettingsStore::new();
-        store.set_section("skills", serde_json::json!([{ "skillId": "legacy-skill" }]));
+        store.set_section(
+            "skills",
+            serde_json::json!([{ "skillId": "obsolete-skill" }]),
+        );
         store.set_section(
             "customTools",
-            serde_json::json!([{ "name": "legacy-tool" }]),
+            serde_json::json!([{ "name": "obsolete-tool" }]),
         );
 
         save_skills_config_object(

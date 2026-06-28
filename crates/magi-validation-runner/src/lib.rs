@@ -51,12 +51,12 @@ impl ValidationKind {
         }
     }
 
-    pub fn from_str_lenient(s: &str) -> Option<Self> {
-        match s.trim().to_lowercase().as_str() {
-            "test_suite" | "test" | "tests" | "unit" | "unit_test" => Some(Self::TestSuite),
-            "type_check" | "typecheck" | "types" | "lint" => Some(Self::TypeCheck),
-            "integration_smoke" | "integration" | "smoke" | "e2e" => Some(Self::IntegrationSmoke),
-            "benchmark" | "bench" | "perf" => Some(Self::Benchmark),
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "test_suite" => Some(Self::TestSuite),
+            "type_check" => Some(Self::TypeCheck),
+            "integration_smoke" => Some(Self::IntegrationSmoke),
+            "benchmark" => Some(Self::Benchmark),
             _ => None,
         }
     }
@@ -79,11 +79,11 @@ impl ValidationOutcome {
         }
     }
 
-    pub fn from_str_lenient(s: &str) -> Option<Self> {
-        match s.trim().to_lowercase().as_str() {
-            "pass" | "passed" | "ok" | "success" => Some(Self::Pass),
-            "fail" | "failed" | "error" | "ng" => Some(Self::Fail),
-            "skip" | "skipped" | "n/a" | "na" => Some(Self::Skipped),
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "pass" => Some(Self::Pass),
+            "fail" => Some(Self::Fail),
+            "skipped" => Some(Self::Skipped),
             _ => None,
         }
     }
@@ -311,13 +311,7 @@ impl ValidationRunnerRegistry {
         {
             return Ok(store.clone());
         }
-        let store = match ValidationStore::open(workspace_root) {
-            Ok(store) => store,
-            Err(ValidationError::HomeDirUnavailable) => {
-                ValidationStore::open_with_home(&self.magi_home, workspace_root)?
-            }
-            Err(err) => return Err(err),
-        };
+        let store = ValidationStore::open_with_home(&self.magi_home, workspace_root)?;
         let arc = Arc::new(store);
         self.inner
             .write()
@@ -365,21 +359,20 @@ pub fn parse_validation_record_arguments(
                 reason: "缺少 kind 字段（test_suite/type_check/integration_smoke/benchmark）"
                     .to_string(),
             })?;
-    let kind = ValidationKind::from_str_lenient(kind_raw).ok_or_else(|| {
-        ValidationError::InvalidRecord {
-            reason: format!("kind 非法：{kind_raw}"),
-        }
+    let kind = ValidationKind::parse(kind_raw).ok_or_else(|| ValidationError::InvalidRecord {
+        reason: format!(
+            "kind 非法：{kind_raw}，只允许 test_suite / type_check / integration_smoke / benchmark"
+        ),
     })?;
     let outcome_raw = obj.get("outcome").and_then(|v| v.as_str()).ok_or_else(|| {
         ValidationError::InvalidRecord {
             reason: "缺少 outcome 字段（pass/fail/skipped）".to_string(),
         }
     })?;
-    let outcome = ValidationOutcome::from_str_lenient(outcome_raw).ok_or_else(|| {
-        ValidationError::InvalidRecord {
-            reason: format!("outcome 非法：{outcome_raw}"),
-        }
-    })?;
+    let outcome =
+        ValidationOutcome::parse(outcome_raw).ok_or_else(|| ValidationError::InvalidRecord {
+            reason: format!("outcome 非法：{outcome_raw}，只允许 pass / fail / skipped"),
+        })?;
     let command = obj
         .get("command")
         .and_then(|v| v.as_str())
@@ -471,9 +464,11 @@ fn parse_report(raw: &str) -> Result<ValidationReport, ValidationError> {
         if line.is_empty() {
             continue;
         }
-        let Some((key, value)) = line.split_once(':') else {
-            continue;
-        };
+        let (key, value) = line
+            .split_once(':')
+            .ok_or_else(|| ValidationError::InvalidRecord {
+                reason: format!("frontmatter 行非法：{line}"),
+            })?;
         let value = value.trim();
         match key.trim() {
             "mission_id" => mission_id = Some(MissionId::new(value.to_string())),
@@ -493,8 +488,12 @@ fn parse_report(raw: &str) -> Result<ValidationReport, ValidationError> {
     let mission_id = mission_id.ok_or_else(|| ValidationError::InvalidRecord {
         reason: "mission_id 缺失".to_string(),
     })?;
-    let created_at = UtcMillis(created_at.unwrap_or(0));
-    let updated_at = UtcMillis(updated_at.unwrap_or(created_at.0));
+    let created_at = UtcMillis(created_at.ok_or_else(|| ValidationError::InvalidRecord {
+        reason: "created_at 缺失".to_string(),
+    })?);
+    let updated_at = UtcMillis(updated_at.ok_or_else(|| ValidationError::InvalidRecord {
+        reason: "updated_at 缺失".to_string(),
+    })?);
 
     let mut records = Vec::new();
     for line in body.lines() {
@@ -806,10 +805,26 @@ mod tests {
         .expect_err("非法 outcome 必须报错");
         assert!(matches!(err, ValidationError::InvalidRecord { .. }));
 
+        let err = parse_validation_record_arguments(&serde_json::json!({
+            "plan_step_id": "s1",
+            "kind": "integration",
+            "outcome": "pass"
+        }))
+        .expect_err("kind 别名必须报错");
+        assert!(matches!(err, ValidationError::InvalidRecord { .. }));
+
+        let err = parse_validation_record_arguments(&serde_json::json!({
+            "plan_step_id": "s1",
+            "kind": "integration_smoke",
+            "outcome": "passed"
+        }))
+        .expect_err("outcome 别名必须报错");
+        assert!(matches!(err, ValidationError::InvalidRecord { .. }));
+
         let ok = parse_validation_record_arguments(&serde_json::json!({
             "plan_step_id": "  s1  ",
-            "kind": "integration",
-            "outcome": "passed",
+            "kind": "integration_smoke",
+            "outcome": "pass",
             "command": "npm run e2e",
             "evidence": "all green"
         }))

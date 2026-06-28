@@ -59,12 +59,12 @@ impl PlanStepStatus {
         }
     }
 
-    pub fn from_str_lenient(s: &str) -> Option<Self> {
-        match s.trim().to_lowercase().as_str() {
-            "pending" | "todo" => Some(Self::Pending),
-            "in_progress" | "doing" | "active" => Some(Self::InProgress),
-            "completed" | "done" => Some(Self::Completed),
-            "cancelled" | "canceled" | "abandoned" => Some(Self::Cancelled),
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "pending" => Some(Self::Pending),
+            "in_progress" => Some(Self::InProgress),
+            "completed" => Some(Self::Completed),
+            "cancelled" => Some(Self::Cancelled),
             _ => None,
         }
     }
@@ -249,13 +249,7 @@ impl PlanRegistry {
         if let Some(store) = self.inner.read().expect("plan registry poisoned").get(&key) {
             return Ok(store.clone());
         }
-        let store = match PlanStore::open(workspace_root) {
-            Ok(store) => store,
-            Err(PlanError::HomeDirUnavailable) => {
-                PlanStore::open_with_home(&self.magi_home, workspace_root)?
-            }
-            Err(err) => return Err(err),
-        };
+        let store = PlanStore::open_with_home(&self.magi_home, workspace_root)?;
         let arc = Arc::new(store);
         self.inner
             .write()
@@ -329,14 +323,19 @@ pub fn parse_plan_write_arguments(raw: &serde_json::Value) -> Result<PlanWriteAr
                 reason: format!("steps[{idx}].content 不能为空"),
             });
         }
-        let status = match step_obj.get("status").and_then(|v| v.as_str()) {
-            Some(s) => {
-                PlanStepStatus::from_str_lenient(s).ok_or_else(|| PlanError::InvalidPlan {
-                    reason: format!("steps[{idx}].status 非法：{s}"),
-                })?
-            }
-            None => PlanStepStatus::Pending,
-        };
+        let status = step_obj
+            .get("status")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| PlanError::InvalidPlan {
+                reason: format!("steps[{idx}].status 缺失"),
+            })
+            .and_then(|s| {
+                PlanStepStatus::parse(s).ok_or_else(|| PlanError::InvalidPlan {
+                    reason: format!(
+                        "steps[{idx}].status 非法：{s}，只允许 pending / in_progress / completed / cancelled"
+                    ),
+                })
+            })?;
         let depends_on = match step_obj.get("depends_on") {
             Some(serde_json::Value::Null) | None => Vec::new(),
             Some(serde_json::Value::Array(items)) => {
@@ -345,6 +344,12 @@ pub fn parse_plan_write_arguments(raw: &serde_json::Value) -> Result<PlanWriteAr
                     let dep = item.as_str().ok_or_else(|| PlanError::InvalidPlan {
                         reason: format!("steps[{idx}].depends_on[{j}] 必须为字符串"),
                     })?;
+                    let dep = dep.trim();
+                    if dep.is_empty() {
+                        return Err(PlanError::InvalidPlan {
+                            reason: format!("steps[{idx}].depends_on[{j}] 不能为空"),
+                        });
+                    }
                     out.push(dep.to_string());
                 }
                 out
@@ -368,8 +373,15 @@ pub fn parse_plan_write_arguments(raw: &serde_json::Value) -> Result<PlanWriteAr
         });
     }
 
-    // 校验 depends_on 全部指向 plan 内部已知 id（依赖图必须封闭）。
-    let known_ids: std::collections::HashSet<&str> = steps.iter().map(|s| s.id.as_str()).collect();
+    // 校验 step id 唯一，且 depends_on 全部指向 plan 内部已知 id（依赖图必须封闭）。
+    let mut known_ids = std::collections::HashSet::new();
+    for step in &steps {
+        if !known_ids.insert(step.id.as_str()) {
+            return Err(PlanError::InvalidPlan {
+                reason: format!("step id 重复：{}", step.id),
+            });
+        }
+    }
     for step in &steps {
         for dep in &step.depends_on {
             if !known_ids.contains(dep.as_str()) {
@@ -548,8 +560,12 @@ fn parse_plan(raw: &str) -> Result<Plan, PlanError> {
     let mission_id = mission_id.ok_or_else(|| PlanError::InvalidPlan {
         reason: "mission_id 缺失".to_string(),
     })?;
-    let created_at = UtcMillis(created_at.unwrap_or(0));
-    let updated_at = UtcMillis(updated_at.unwrap_or(created_at.0));
+    let created_at = UtcMillis(created_at.ok_or_else(|| PlanError::InvalidPlan {
+        reason: "created_at 缺失".to_string(),
+    })?);
+    let updated_at = UtcMillis(updated_at.ok_or_else(|| PlanError::InvalidPlan {
+        reason: "updated_at 缺失".to_string(),
+    })?);
 
     let mut steps: Vec<PlanStep> = Vec::new();
     let mut current: Option<PlanStep> = None;
@@ -572,8 +588,10 @@ fn parse_plan(raw: &str) -> Result<Plan, PlanError> {
             let after_id = after_id.trim_start();
             let status = if let Some(end) = after_id.find(')') {
                 let inner = &after_id[1..end];
-                PlanStepStatus::from_str_lenient(inner).ok_or_else(|| PlanError::InvalidPlan {
-                    reason: format!("step 状态非法：{inner}"),
+                PlanStepStatus::parse(inner).ok_or_else(|| PlanError::InvalidPlan {
+                    reason: format!(
+                        "step 状态非法：{inner}，只允许 pending / in_progress / completed / cancelled"
+                    ),
                 })?
             } else {
                 return Err(PlanError::InvalidPlan {
@@ -920,6 +938,7 @@ mod tests {
             "steps": [{
                 "id": "s1",
                 "content": "x",
+                "status": "pending",
                 "depends_on": ["s1"]
             }]
         }))
@@ -931,12 +950,45 @@ mod tests {
     }
 
     #[test]
-    fn parse_plan_write_arguments_defaults_status_to_pending() {
-        let args = parse_plan_write_arguments(&serde_json::json!({
+    fn parse_plan_write_arguments_requires_status() {
+        let err = parse_plan_write_arguments(&serde_json::json!({
             "steps": [{ "id": "s1", "content": "x" }]
         }))
-        .expect("parse");
-        assert_eq!(args.steps[0].status, PlanStepStatus::Pending);
+        .unwrap_err();
+        match err {
+            PlanError::InvalidPlan { reason } => assert!(reason.contains("status 缺失")),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_plan_write_arguments_rejects_status_aliases() {
+        let err = parse_plan_write_arguments(&serde_json::json!({
+            "steps": [{ "id": "s1", "content": "x", "status": "done" }]
+        }))
+        .unwrap_err();
+        match err {
+            PlanError::InvalidPlan { reason } => {
+                assert!(reason.contains("status 非法"));
+                assert!(reason.contains("pending / in_progress / completed / cancelled"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_plan_write_arguments_rejects_duplicate_step_ids() {
+        let err = parse_plan_write_arguments(&serde_json::json!({
+            "steps": [
+                { "id": "s1", "content": "x", "status": "pending" },
+                { "id": "s1", "content": "y", "status": "pending" }
+            ]
+        }))
+        .unwrap_err();
+        match err {
+            PlanError::InvalidPlan { reason } => assert!(reason.contains("step id 重复：s1")),
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 
     #[test]

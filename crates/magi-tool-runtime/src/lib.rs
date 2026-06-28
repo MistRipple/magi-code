@@ -1140,7 +1140,7 @@ impl BuiltinToolName {
                                 "status": {
                                     "type": "string",
                                     "enum": ["pending", "in_progress", "completed", "cancelled"],
-                                    "description": "步骤状态；省略时默认 'pending'。"
+                                    "description": "步骤状态，必须显式提供。"
                                 },
                                 "depends_on": {
                                     "type": "array",
@@ -1152,7 +1152,7 @@ impl BuiltinToolName {
                                     "description": "本步骤的可选理由或备注。"
                                 }
                             },
-                            "required": ["id", "content"]
+                            "required": ["id", "content", "status"]
                         }
                     }
                 },
