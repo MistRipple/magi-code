@@ -62,18 +62,6 @@ pub fn routes() -> Router<ApiState> {
         .route("/settings/skills/update-all", post(update_all_skills))
 }
 
-fn unwrap_request_value<'a>(
-    request: &'a serde_json::Value,
-    keys: &[&str],
-) -> &'a serde_json::Value {
-    for key in keys {
-        if let Some(value) = request.get(*key) {
-            return value;
-        }
-    }
-    request
-}
-
 fn load_skills_config_object(state: &ApiState) -> serde_json::Map<String, serde_json::Value> {
     skill_loader::skills_config_object(&state.settings_store)
 }
@@ -111,18 +99,18 @@ fn persist_instruction_skills(state: &ApiState, instruction_skills: Vec<serde_js
 fn normalize_instruction_skill_entry(
     request: &serde_json::Value,
 ) -> Result<serde_json::Value, ApiError> {
-    let raw = unwrap_request_value(request, &["skill", "updates"]);
-    let skill_id = raw
+    if request.get("skill").is_some() || request.get("updates").is_some() {
+        return Err(ApiError::InvalidInput(
+            "Skill 安装请求必须使用顶层 skillId，不能包裹在 skill/updates 中".to_string(),
+        ));
+    }
+    let skill_id = request
         .get("skillId")
         .and_then(|value| value.as_str())
-        .or_else(|| raw.get("skillName").and_then(|value| value.as_str()))
-        .or_else(|| raw.get("name").and_then(|value| value.as_str()))
-        .or_else(|| request.get("skillId").and_then(|value| value.as_str()))
-        .or_else(|| request.get("skillName").and_then(|value| value.as_str()))
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| ApiError::InvalidInput("skillId 不能为空".to_string()))?;
-    let mut entry = raw.as_object().cloned().unwrap_or_default();
+    let mut entry = request.as_object().cloned().unwrap_or_default();
     strip_scope_binding_fields_from_map(&mut entry);
     entry.insert("name".to_string(), serde_json::json!(skill_id));
     entry.insert("skillName".to_string(), serde_json::json!(skill_id));
@@ -344,24 +332,42 @@ fn read_local_skill_metadata(dir: &std::path::Path) -> LocalSkillMetadata {
     }
 }
 
-fn normalize_repository_entry(request: &serde_json::Value) -> Result<serde_json::Value, ApiError> {
-    let raw = unwrap_request_value(request, &["repository", "updates"]);
-    let repository_url = raw
+fn normalize_repository_entry(
+    request: &serde_json::Value,
+    allow_updates: bool,
+) -> Result<serde_json::Value, ApiError> {
+    if request.get("repository").is_some() {
+        return Err(ApiError::InvalidInput(
+            "仓库配置必须使用顶层 url/repositoryId，不能包裹在 repository 中".to_string(),
+        ));
+    }
+    if request.get("updates").is_some() && !allow_updates {
+        return Err(ApiError::InvalidInput(
+            "新增仓库必须使用顶层 url，不能包裹在 updates 中".to_string(),
+        ));
+    }
+    let mut entry = request.as_object().cloned().unwrap_or_default();
+    if let Some(updates) = request.get("updates").and_then(|value| value.as_object()) {
+        for (key, value) in updates {
+            entry.insert(key.clone(), value.clone());
+        }
+    }
+    let repository_url = entry
         .get("url")
         .and_then(|value| value.as_str())
-        .or_else(|| request.get("url").and_then(|value| value.as_str()))
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    let repository_id = raw
-        .get("repositoryId")
-        .and_then(|value| value.as_str())
-        .or_else(|| request.get("repositoryId").and_then(|value| value.as_str()))
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .or(repository_url)
+        .map(ToOwned::to_owned);
+    let repository_id = request
+        .get("repositoryId")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| repository_url.clone())
         .ok_or_else(|| ApiError::InvalidInput("repositoryId 或 url 不能为空".to_string()))?;
-    let mut entry = raw.as_object().cloned().unwrap_or_default();
     strip_scope_binding_fields_from_map(&mut entry);
+    entry.remove("updates");
     entry.insert("repositoryId".to_string(), serde_json::json!(repository_id));
     if entry
         .get("url")
@@ -744,7 +750,7 @@ async fn add_repository(
     State(state): State<ApiState>,
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let normalized = normalize_repository_entry(&request)?;
+    let normalized = normalize_repository_entry(&request, false)?;
     state
         .settings_store
         .upsert_array_entry("repositories", "repositoryId", &normalized);
@@ -755,7 +761,7 @@ async fn update_repository(
     State(state): State<ApiState>,
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let normalized = normalize_repository_entry(&request)?;
+    let normalized = normalize_repository_entry(&request, true)?;
     state
         .settings_store
         .upsert_array_entry("repositories", "repositoryId", &normalized);
@@ -1063,8 +1069,12 @@ async fn add_custom_tool(
     State(state): State<ApiState>,
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let raw = unwrap_request_value(&request, &["tool"]);
-    let mut entry = raw.as_object().cloned().unwrap_or_default();
+    if request.get("tool").is_some() {
+        return Err(ApiError::InvalidInput(
+            "自定义工具必须作为顶层对象提交，不能包裹在 tool 中".to_string(),
+        ));
+    }
+    let mut entry = request.as_object().cloned().unwrap_or_default();
     strip_scope_binding_fields_from_map(&mut entry);
     let tool_name = entry
         .get("name")
@@ -1667,6 +1677,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn repository_add_rejects_wrapped_requests() {
+        for payload in [
+            serde_json::json!({
+                "repository": {
+                    "url": "https://github.com/example/skills"
+                }
+            }),
+            serde_json::json!({
+                "updates": {
+                    "url": "https://github.com/example/skills"
+                }
+            }),
+        ] {
+            let app = Router::new().merge(routes()).with_state(test_state());
+
+            let (status, body) =
+                post_json_with_status(app, "/settings/repositories/add", payload).await;
+
+            assert_eq!(status, StatusCode::BAD_REQUEST, "unexpected body: {body}");
+            let message = body["message"].as_str().unwrap_or_default();
+            assert!(
+                message.contains("不能包裹在 repository 中")
+                    || message.contains("不能包裹在 updates 中"),
+                "unexpected body: {body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn repository_update_accepts_top_level_id_and_updates_patch() {
+        let state = test_state();
+        let app = Router::new().merge(routes()).with_state(state.clone());
+
+        let body = post_json(
+            app,
+            "/settings/repositories/update",
+            serde_json::json!({
+                "repositoryId": "https://github.com/example/skills",
+                "updates": {
+                    "url": "https://github.com/example/skills-renamed"
+                }
+            }),
+        )
+        .await;
+
+        assert_eq!(body["updated"], true);
+        let stored = state.settings_store.get_section("repositories");
+        assert_eq!(
+            stored[0]["repositoryId"],
+            serde_json::json!("https://github.com/example/skills")
+        );
+        assert_eq!(
+            stored[0]["url"],
+            serde_json::json!("https://github.com/example/skills-renamed")
+        );
+        assert!(stored[0].get("updates").is_none());
+    }
+
+    #[tokio::test]
     async fn repository_list_cleans_legacy_scope_fields() {
         let state = test_state();
         state.settings_store.set_section(
@@ -1701,6 +1770,33 @@ mod tests {
         .expect("skill should normalize");
 
         assert_scope_fields_absent(&normalized);
+    }
+
+    #[tokio::test]
+    async fn install_skill_rejects_wrapped_requests() {
+        for wrapper in ["skill", "updates"] {
+            let app = Router::new().merge(routes()).with_state(test_state());
+
+            let (status, body) = post_json_with_status(
+                app,
+                "/settings/skills/install",
+                serde_json::json!({
+                    wrapper: {
+                        "skillId": "example/skill"
+                    }
+                }),
+            )
+            .await;
+
+            assert_eq!(status, StatusCode::BAD_REQUEST, "unexpected body: {body}");
+            assert!(
+                body["message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("不能包裹在 skill/updates 中"),
+                "unexpected body: {body}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1864,6 +1960,31 @@ mod tests {
         assert_eq!(body["added"], true);
         let stored = state.settings_store.get_section("skillsConfig");
         assert_scope_fields_absent(&stored["customTools"][0]);
+    }
+
+    #[tokio::test]
+    async fn custom_tool_add_rejects_tool_wrapper() {
+        let app = Router::new().merge(routes()).with_state(test_state());
+
+        let (status, body) = post_json_with_status(
+            app,
+            "/settings/skills/custom-tool/add",
+            serde_json::json!({
+                "tool": {
+                    "name": "example-tool"
+                }
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "unexpected body: {body}");
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("不能包裹在 tool 中"),
+            "unexpected body: {body}"
+        );
     }
 
     #[tokio::test]
