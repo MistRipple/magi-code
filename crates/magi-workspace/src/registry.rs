@@ -446,8 +446,8 @@ mod tests {
     }
 
     #[test]
-    fn legacy_top_level_recovery_handles_deserialize() {
-        let payload = json!({
+    fn recovery_handles_reject_legacy_snake_case_fields() {
+        let legacy_payload = json!({
             "active_workspace_id": null,
             "workspaces": [],
             "worktree_allocations": [],
@@ -472,14 +472,42 @@ mod tests {
             }]
         });
 
-        let state: WorkspaceStoreState =
-            serde_json::from_value(payload).expect("legacy payload should deserialize");
+        serde_json::from_value::<WorkspaceStoreState>(legacy_payload)
+            .expect_err("legacy recovery handle snake_case 字段必须拒绝");
+
+        let canonical_payload = json!({
+            "active_workspace_id": null,
+            "workspaces": [],
+            "worktree_allocations": [],
+            "snapshots": [],
+            "recovery_handles": [{
+                "recoveryId": "recovery-canonical",
+                "workspaceId": "workspace-canonical",
+                "ownership": {
+                    "session_id": null,
+                    "workspace_id": "workspace-canonical",
+                    "mission_id": null,
+                    "task_id": null,
+                    "worker_id": null,
+                    "execution_chain_ref": "chain-canonical"
+                },
+                "snapshotId": "snapshot-canonical",
+                "diagnosticSummary": "canonical",
+                "status": "Ready",
+                "createdAt": 1,
+                "updatedAt": 2,
+                "consumedAt": null
+            }]
+        });
+
+        let state: WorkspaceStoreState = serde_json::from_value(canonical_payload)
+            .expect("canonical payload should deserialize");
         let handle = state
             .recovery_sidecar_store
             .recovery_handles
             .first()
             .expect("recovery handle should exist");
-        assert_eq!(handle.recovery_id, "recovery-legacy");
+        assert_eq!(handle.recovery_id, "recovery-canonical");
         assert_eq!(handle.status, RecoveryStatus::Ready);
     }
 

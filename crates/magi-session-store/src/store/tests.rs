@@ -172,7 +172,7 @@ fn sessions_for_workspace_returns_user_message_count() {
 }
 
 #[test]
-fn session_sidecar_store_keeps_status_and_recovery_alias() {
+fn session_sidecar_store_keeps_status_and_recovery_export() {
     let store = SessionStore::new();
     let session_id = SessionId::new("session-1");
     store
@@ -1106,8 +1106,8 @@ fn append_current_turn_item_with_timeline_entry_does_not_write_timeline_without_
 }
 
 #[test]
-fn legacy_recovery_ref_json_deserializes() {
-    let payload = json!({
+fn sidecar_rejects_legacy_recovery_ref_json() {
+    let legacy_payload = json!({
         "current_session_id": null,
         "sessions": [],
         "timeline": [],
@@ -1127,13 +1127,37 @@ fn legacy_recovery_ref_json_deserializes() {
         }]
     });
 
-    let state: SessionStoreState = serde_json::from_value(payload).expect("legacy payload");
+    serde_json::from_value::<SessionStoreState>(legacy_payload)
+        .expect_err("legacy recovery_ref 字段必须拒绝，避免恢复链路静默丢失 recovery_id");
+
+    let canonical_payload = json!({
+        "current_session_id": null,
+        "sessions": [],
+        "timeline": [],
+        "notifications": [],
+        "runtime_sidecars": [{
+            "session_id": "session-canonical",
+            "ownership": {
+                "session_id": "session-canonical",
+                "workspace_id": null,
+                "mission_id": null,
+                "task_id": null,
+                "worker_id": null,
+                "execution_chain_ref": "chain-canonical"
+            },
+            "recovery_id": "recovery-canonical",
+            "updated_at": 1
+        }]
+    });
+
+    let state: SessionStoreState =
+        serde_json::from_value(canonical_payload).expect("canonical payload");
     let sidecar = state
         .execution_sidecar_store
         .runtime_sidecars
         .first()
         .expect("sidecar should exist");
-    assert_eq!(sidecar.recovery_id.as_deref(), Some("recovery-legacy"));
+    assert_eq!(sidecar.recovery_id.as_deref(), Some("recovery-canonical"));
     assert_eq!(sidecar.status, SessionExecutionSidecarStatus::Detached);
 }
 

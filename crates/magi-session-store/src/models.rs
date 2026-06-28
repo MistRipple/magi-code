@@ -511,10 +511,11 @@ impl ActiveExecutionChain {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SessionRuntimeSidecar {
     pub session_id: SessionId,
     pub ownership: ExecutionOwnership,
-    #[serde(default, alias = "recovery_ref")]
+    #[serde(default)]
     pub recovery_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_turn: Option<ActiveExecutionTurn>,
@@ -528,13 +529,11 @@ pub struct SessionRuntimeSidecar {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionRuntimeSidecarExport {
     pub session_id: SessionId,
-    #[serde(alias = "status")]
     pub current_status: SessionExecutionSidecarStatus,
-    #[serde(alias = "updated_at")]
     pub last_update: UtcMillis,
     pub ownership: ExecutionOwnership,
     pub execution_chain_ref: Option<String>,
-    #[serde(default, alias = "recovery_id")]
+    #[serde(default)]
     pub recovery_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_turn: Option<ActiveExecutionTurn>,

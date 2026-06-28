@@ -53,23 +53,16 @@ pub enum RecoveryStatus {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RecoveryHandle {
-    #[serde(alias = "recovery_id")]
     pub recovery_id: String,
-    #[serde(alias = "workspace_id")]
     pub workspace_id: WorkspaceId,
     pub ownership: ExecutionOwnership,
-    #[serde(alias = "snapshot_id")]
     pub snapshot_id: String,
-    #[serde(alias = "diagnostic_summary")]
     pub diagnostic_summary: Option<String>,
     pub status: RecoveryStatus,
-    #[serde(alias = "created_at")]
     pub created_at: UtcMillis,
-    #[serde(alias = "updated_at")]
     pub updated_at: UtcMillis,
-    #[serde(alias = "consumed_at")]
     pub consumed_at: Option<UtcMillis>,
 }
 
@@ -77,9 +70,7 @@ pub struct RecoveryHandle {
 pub struct WorkspaceRecoverySidecarExport {
     pub recovery_ref: String,
     pub workspace_id: WorkspaceId,
-    #[serde(alias = "status")]
     pub current_status: RecoveryStatus,
-    #[serde(alias = "updated_at")]
     pub last_update: UtcMillis,
     pub ownership: ExecutionOwnership,
     pub execution_chain_ref: Option<String>,
