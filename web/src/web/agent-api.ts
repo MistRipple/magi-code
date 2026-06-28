@@ -1127,17 +1127,6 @@ export async function closeAgentSession(
   );
 }
 
-export async function saveAgentCurrentSession(
-  bindingOverride?: Partial<AgentBindingContext>,
-): Promise<AgentBootstrapSnapshot> {
-  return await postBoundJson<AgentBootstrapSnapshot>(
-    '/api/session/save',
-    {},
-    'save current session',
-    bindingOverride,
-  );
-}
-
 export async function getAgentSessionNotifications(scope: AgentNotificationScope): Promise<AgentSessionNotificationsPayload> {
   const query = buildBoundQueryWithOverride({}, createNotificationBindingOverride(scope));
   const response = await getTransport().request(agentUrl('/api/session/notifications', query));

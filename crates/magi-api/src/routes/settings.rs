@@ -2150,6 +2150,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn settings_bootstrap_ignores_persisted_public_alias_sections() {
+        let state = test_state();
+        state.settings_store.set_section(
+            "orchestrator",
+            json!({
+                "baseUrl": "https://api.current.example/v1",
+                "apiKey": "sk-current",
+                "model": "current-main",
+                "urlMode": "standard"
+            }),
+        );
+        state.settings_store.set_section(
+            "orchestratorConfig",
+            json!({
+                "baseUrl": "https://api.alias.example/v1",
+                "apiKey": "sk-alias",
+                "model": "alias-main",
+                "urlMode": "standard"
+            }),
+        );
+        state.settings_store.set_section(
+            "workerConfigs",
+            json!({
+                "alias-worker": {
+                    "baseUrl": "https://api.alias.example/v1",
+                    "model": "alias-worker"
+                }
+            }),
+        );
+        state.settings_store.set_section(
+            "auxiliaryConfig",
+            json!({
+                "baseUrl": "https://api.alias.example/v1",
+                "model": "alias-aux"
+            }),
+        );
+
+        let bootstrap = settings_bootstrap(State(state), Query(HashMap::new()))
+            .await
+            .expect("settings bootstrap should build")
+            .0;
+
+        assert_eq!(
+            bootstrap["orchestratorConfig"]["baseUrl"],
+            json!("https://api.current.example/v1")
+        );
+        assert_eq!(
+            bootstrap["orchestratorConfig"]["model"],
+            json!("current-main")
+        );
+        assert!(
+            bootstrap["workerConfigs"]
+                .as_object()
+                .expect("workerConfigs should be an object")
+                .is_empty(),
+            "public alias workerConfigs must not be treated as persisted worker settings"
+        );
+        assert!(
+            bootstrap["auxiliaryConfig"]
+                .as_object()
+                .expect("auxiliaryConfig should be an object")
+                .is_empty(),
+            "public alias auxiliaryConfig must not be treated as persisted auxiliary settings"
+        );
+    }
+
+    #[tokio::test]
     async fn settings_bootstrap_aligns_registry_engine_llm_from_worker_config() {
         let state = test_state();
         state.settings_store.set_section(

@@ -2542,9 +2542,15 @@ async fn orchestrator_settings_save_stays_global_when_session_scope_is_supplied(
         serde_json::from_str(&settings_payload).expect("settings should be valid json");
     let orchestrator = settings_json
         .get("orchestrator")
-        .or_else(|| settings_json.get("orchestratorConfig"))
         .expect("orchestrator section should persist");
-    assert_eq!(orchestrator["model"], "global-main-model");
+    assert_eq!(
+        orchestrator["baseUrl"], "https://api.example.com/v1",
+        "global orchestrator settings should keep connection credentials"
+    );
+    assert!(
+        orchestrator.get("model").is_none(),
+        "main model selection is session-owned and must not persist in global settings"
+    );
     assert!(
         !settings_payload.contains("__session__")
             && !settings_payload.contains("session-scoped-should-not-save"),

@@ -55,7 +55,6 @@ import {
   removeAgentInstalledSkill,
   renameAgentSession,
   resetAgentExecutionStats,
-  saveAgentCurrentSession,
   saveAgentAuxiliaryConfig,
   saveAgentOrchestratorConfig,
   saveAgentUserRules,
@@ -2537,19 +2536,6 @@ async function closeSession(sessionId: string, scope: BridgeRequestScope = {}): 
   emitBridgeSuccessToast(i18n.t('bridge.action.closeSession'), i18n.t('bridge.detail.sessionClosed'));
 }
 
-async function saveCurrentSession(scope: BridgeRequestScope = {}): Promise<void> {
-  const payload = await saveAgentCurrentSession(scope);
-  await dispatchBootstrap(
-    normalizeBootstrapResponse(payload, { sessionId: currentSessionId || '' }),
-    { rawPayload: payload },
-  );
-  emitBridgeSuccessToast(
-    i18n.t('bridge.action.saveSession'),
-    i18n.t('bridge.detail.currentSessionSaved'),
-    { displayMode: 'notification_center' },
-  );
-}
-
 async function ensureFreshLiveBridge(reason: string): Promise<void> {
   hydrateCanonicalWorkspaceBinding();
   const hasWorkspaceBinding = Boolean(currentWorkspaceId || currentWorkspacePath);
@@ -3969,11 +3955,6 @@ export function createWebClientBridge(): ClientBridge {
           );
           return;
         }
-        case 'saveCurrentSession':
-          void saveCurrentSession(requestScopeFromMessage(message)).catch((error) => {
-            logBridgeOperationFailure(i18n.t('bridge.action.saveSession'), '[web-client-bridge] 保存当前会话失败:', error);
-          });
-          return;
         case 'loadSessionNotifications':
           {
             const scope = resolveNotificationOperationScope(message);

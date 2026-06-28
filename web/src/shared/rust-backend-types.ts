@@ -833,14 +833,6 @@ export interface SessionCloseRequestDto {
   workspace_path?: string | null;
 }
 
-export interface SessionSaveRequestDto {
-  sessionId?: string | null;
-  workspaceId?: string | null;
-  workspace_id?: string | null;
-  workspacePath?: string | null;
-  workspace_path?: string | null;
-}
-
 export interface SessionContinueRequestDto {
   sessionId: string;
   workspaceId: string;

@@ -54,7 +54,6 @@ pub fn routes() -> Router<ApiState> {
         .route("/session/delete", post(delete_session))
         .route("/session/rename", post(rename_session))
         .route("/session/close", post(close_session))
-        .route("/session/save", post(save_session))
         .route("/session/notifications", get(get_notifications))
         .route(
             "/session/notifications/append",
@@ -1975,30 +1974,6 @@ impl SwitchSessionRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct SaveSessionRequest {
-    session_id: Option<String>,
-    #[serde(default, alias = "workspace_id")]
-    workspace_id: Option<String>,
-    #[serde(default, alias = "workspace_path")]
-    workspace_path: Option<String>,
-}
-
-impl SaveSessionRequest {
-    fn requested_session_id(&self) -> Option<SessionId> {
-        parse_requested_session_id(self.session_id.as_deref())
-    }
-
-    fn requested_workspace_id(&self) -> Option<&str> {
-        trimmed_non_empty(self.workspace_id.as_deref())
-    }
-
-    fn requested_workspace_path(&self) -> Option<&str> {
-        trimmed_non_empty(self.workspace_path.as_deref())
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct ContinueSessionRequest {
     session_id: String,
     #[serde(default, alias = "workspace_id")]
@@ -2662,28 +2637,6 @@ async fn close_session(
     Ok(Json(state.bootstrap_dto_for_workspace_session(
         Some(workspace_id.as_str()),
         None,
-    )?))
-}
-
-async fn save_session(
-    State(state): State<ApiState>,
-    Json(request): Json<SaveSessionRequest>,
-) -> Result<Json<BootstrapDto>, ApiError> {
-    let workspace_id = require_request_workspace_id(
-        &state,
-        request.requested_workspace_id(),
-        request.requested_workspace_path(),
-    )?;
-    let selected_session_id = if let Some(session_id) = request.requested_session_id() {
-        require_session_record_in_workspace(&state, &session_id, Some(workspace_id.as_str()))?;
-        Some(session_id)
-    } else {
-        None
-    };
-    state.persist_session_durable_state_for_api()?;
-    Ok(Json(state.bootstrap_dto_for_workspace_session(
-        Some(workspace_id.as_str()),
-        selected_session_id.as_ref(),
     )?))
 }
 
@@ -5285,116 +5238,6 @@ mod tests {
 
         assert_eq!(status, StatusCode::OK, "unexpected body: {body}");
         assert_eq!(body["sessionId"], session_id.as_str());
-    }
-
-    #[tokio::test]
-    async fn save_session_returns_workspace_scoped_bootstrap() {
-        let state = test_state();
-        let selected_root = unique_temp_dir("session-save-scoped-a");
-        let foreign_root = unique_temp_dir("session-save-scoped-b");
-        state
-            .workspace_registry
-            .register(
-                WorkspaceId::new("workspace-a"),
-                AbsolutePath::new(selected_root.display().to_string()),
-            )
-            .expect("workspace a should register");
-        state
-            .workspace_registry
-            .register(
-                WorkspaceId::new("workspace-b"),
-                AbsolutePath::new(foreign_root.display().to_string()),
-            )
-            .expect("workspace b should register");
-        let selected_session_id = SessionId::new("session-save-scoped-a");
-        let foreign_session_id = SessionId::new("session-save-scoped-b");
-        state
-            .session_store
-            .create_session_for_workspace(
-                selected_session_id.clone(),
-                "保存 A",
-                Some("workspace-a".to_string()),
-            )
-            .expect("session should create");
-        state
-            .session_store
-            .create_session_for_workspace(
-                foreign_session_id,
-                "外部 B",
-                Some("workspace-b".to_string()),
-            )
-            .expect("session should create");
-        // bootstrap 现在按"会话是否有用户消息"过滤——补一条用户消息让 selected_session_id 在响应中可见
-        state.session_store.append_timeline_entry(
-            selected_session_id.clone(),
-            TimelineEntryKind::UserMessage,
-            "hello",
-        );
-        state
-            .snapshot_manager
-            .start_session(selected_session_id.as_str().to_string(), selected_root)
-            .await
-            .expect("snapshot session should start");
-
-        let (status, body) = post_json(
-            state,
-            "/session/save",
-            serde_json::json!({
-                "workspaceId": "workspace-a",
-                "sessionId": selected_session_id.as_str(),
-            }),
-        )
-        .await;
-
-        assert_eq!(status, StatusCode::OK, "unexpected body: {body}");
-        assert_eq!(
-            body["currentSession"]["sessionId"]
-                .as_str()
-                .unwrap_or_default(),
-            selected_session_id.as_str()
-        );
-        let session_ids = body["sessions"]
-            .as_array()
-            .expect("sessions should be array")
-            .iter()
-            .map(|session| session["sessionId"].as_str().unwrap_or_default())
-            .collect::<Vec<_>>();
-        assert_eq!(session_ids, vec![selected_session_id.as_str()]);
-    }
-
-    #[tokio::test]
-    async fn save_session_rejects_workspace_mismatched_session() {
-        let state = test_state();
-        register_workspace(&state, "workspace-a", "save-mismatch-a");
-        register_workspace(&state, "workspace-b", "save-mismatch-b");
-        let session_id = SessionId::new("session-save-workspace-a");
-        state
-            .session_store
-            .create_session_for_workspace(
-                session_id.clone(),
-                "保存 workspace A",
-                Some("workspace-a".to_string()),
-            )
-            .expect("session should create");
-
-        let (status, body) = post_json(
-            state,
-            "/session/save",
-            serde_json::json!({
-                "workspaceId": "workspace-b",
-                "sessionId": session_id.as_str(),
-            }),
-        )
-        .await;
-
-        assert_eq!(status, StatusCode::BAD_REQUEST, "unexpected body: {body}");
-        assert!(
-            body["message"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("不属于 workspace workspace-b"),
-            "unexpected body: {body}"
-        );
     }
 
     #[tokio::test]

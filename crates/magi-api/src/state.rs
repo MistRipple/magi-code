@@ -1302,9 +1302,9 @@ impl ApiState {
         let skills_config = public_skills_config_section(object_section(&snapshot, "skillsConfig"));
         let public_mcp_servers = public_mcp_servers_section(&snapshot);
         serde_json::json!({
-            "workerConfigs": object_section(&snapshot, "workerConfigs"),
-            "orchestratorConfig": object_section(&snapshot, "orchestratorConfig"),
-            "auxiliaryConfig": object_section(&snapshot, "auxiliaryConfig"),
+            "workerConfigs": object_section(&snapshot, "workers"),
+            "orchestratorConfig": object_section(&snapshot, "orchestrator"),
+            "auxiliaryConfig": object_section(&snapshot, "auxiliary"),
             "userRulesConfig": object_section(&snapshot, "userRulesConfig"),
             "skillsConfig": skills_config,
             "safeguardConfig": object_section(&snapshot, "safeguardConfig"),
@@ -1701,9 +1701,7 @@ impl ApiState {
 fn normalize_settings_snapshot_sections(snapshot: &mut HashMap<String, serde_json::Value>) {
     for key in [
         "orchestrator",
-        "orchestratorConfig",
         "auxiliary",
-        "auxiliaryConfig",
         "userRulesConfig",
         "safeguardConfig",
     ] {
@@ -1715,13 +1713,10 @@ fn normalize_settings_snapshot_sections(snapshot: &mut HashMap<String, serde_jso
     seed_user_rules_config(snapshot);
     normalize_workers_section(snapshot);
     strip_deprecated_model_fields_from_section(snapshot, "orchestrator");
-    strip_deprecated_model_fields_from_section(snapshot, "orchestratorConfig");
     strip_deprecated_model_fields_from_section(snapshot, "auxiliary");
-    strip_deprecated_model_fields_from_section(snapshot, "auxiliaryConfig");
     normalize_mcp_servers_section(snapshot);
     seed_default_safeguard_rules(snapshot);
     normalize_safeguard_config_section(snapshot);
-    alias_snapshot_keys(snapshot);
 }
 
 fn strip_deprecated_model_fields(value: &mut serde_json::Value) {
@@ -1753,21 +1748,6 @@ fn public_skills_config_section(value: serde_json::Value) -> serde_json::Value {
         }
     }
     serde_json::Value::Object(config)
-}
-
-fn alias_snapshot_keys(snapshot: &mut HashMap<String, serde_json::Value>) {
-    let aliases: &[(&str, &str)] = &[
-        ("workers", "workerConfigs"),
-        ("orchestrator", "orchestratorConfig"),
-        ("auxiliary", "auxiliaryConfig"),
-    ];
-    for (from, to) in aliases {
-        if !snapshot.contains_key(*to) {
-            if let Some(value) = snapshot.get(*from).cloned() {
-                snapshot.insert(to.to_string(), value);
-            }
-        }
-    }
 }
 
 fn normalize_capability_dependency_json(raw: &serde_json::Value) -> serde_json::Value {

@@ -59,7 +59,6 @@ import type {
   SessionInterruptResponseDto,
   SessionNotificationsResponseDto,
   SessionRenameRequestDto,
-  SessionSaveRequestDto,
   SessionStatsResponseDto,
   SessionTurnRequestDto,
   SessionTurnResponseDto,
@@ -181,12 +180,6 @@ export class RustDaemonClient {
     request: SessionCloseRequestDto,
   ): Promise<BootstrapDto> {
     return this.postJson<BootstrapDto>('/api/session/close', request);
-  }
-
-  public async saveSession(
-    request: SessionSaveRequestDto,
-  ): Promise<BootstrapDto> {
-    return this.postJson<BootstrapDto>('/api/session/save', request);
   }
 
   public async fetchNotifications(
