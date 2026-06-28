@@ -24,7 +24,8 @@ pub use read_model::{
     RuntimeDiagnosticSummary, RuntimeExecutorSummary, RuntimeLedgerReadinessSummary,
     RuntimeLedgerSummary, RuntimeMaintenanceSummary, RuntimeMetaSummary, RuntimeOperationsSummary,
     RuntimeOverviewSummary, RuntimeReadModelInput, RuntimeSectionOrderingRule,
-    RuntimeWorkQueueSummary, SessionRuntimeBranchSummaryEntry, SessionRuntimeSummaryEntry,
-    SessionRuntimeTurnItemSummaryEntry, SessionRuntimeTurnSummaryEntry, TaskRuntimeSummaryEntry,
-    ToolRuntimeSummaryEntry, WorkerRuntimeSummaryEntry, WorkspaceRuntimeSummaryEntry,
+    RuntimeWorkQueueSummary, SessionRuntimeBranchSummaryEntry, SessionRuntimeBudgetEntry,
+    SessionRuntimeSummaryEntry, SessionRuntimeTurnItemSummaryEntry, SessionRuntimeTurnSummaryEntry,
+    SessionRuntimeUsageObservation, TaskRuntimeSummaryEntry, ToolRuntimeSummaryEntry,
+    WorkerRuntimeSummaryEntry, WorkspaceRuntimeSummaryEntry, latest_usage_observations_from_ledger,
 };

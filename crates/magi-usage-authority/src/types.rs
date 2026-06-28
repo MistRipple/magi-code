@@ -89,6 +89,8 @@ pub struct UsageEventUsageDelta {
     pub raw_input_tokens: u64,
     pub raw_output_tokens: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_window_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_read_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_write_tokens: Option<u64>,
@@ -278,6 +280,8 @@ impl WorkspaceUsageSnapshot {
 pub struct UsageTokenInput {
     pub input_tokens: u64,
     pub output_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_tokens: Option<u64>,
     #[serde(default)]
     pub cache_read_tokens: Option<u64>,
     #[serde(default)]

@@ -49,6 +49,7 @@ fn make_call_record_input(
         usage: UsageTokenInput {
             input_tokens,
             output_tokens,
+            total_tokens: None,
             cache_read_tokens: Some(100),
             cache_write_tokens: Some(50),
             cache_read_included_in_input: false,
@@ -63,6 +64,7 @@ fn test_normalize_usage_delta() {
     let delta = UsageEventUsageDelta {
         raw_input_tokens: 1000,
         raw_output_tokens: 500,
+        context_window_tokens: None,
         cache_read_tokens: Some(200),
         cache_write_tokens: Some(100),
         cache_read_included_in_input: false,
@@ -82,6 +84,7 @@ fn test_normalize_usage_delta_subtracts_included_cache_read() {
     let delta = UsageEventUsageDelta {
         raw_input_tokens: 1000,
         raw_output_tokens: 500,
+        context_window_tokens: None,
         cache_read_tokens: Some(200),
         cache_write_tokens: Some(100),
         cache_read_included_in_input: true,
@@ -96,6 +99,7 @@ fn test_normalize_zero_cache() {
     let delta = UsageEventUsageDelta {
         raw_input_tokens: 500,
         raw_output_tokens: 300,
+        context_window_tokens: None,
         cache_read_tokens: None,
         cache_write_tokens: None,
         cache_read_included_in_input: false,
@@ -275,6 +279,7 @@ fn test_rebuild_session_from_events() {
             usage_delta: Some(UsageEventUsageDelta {
                 raw_input_tokens: 500,
                 raw_output_tokens: 200,
+                context_window_tokens: None,
                 cache_read_tokens: None,
                 cache_write_tokens: None,
                 cache_read_included_in_input: false,
@@ -303,6 +308,7 @@ fn test_rebuild_session_from_events() {
             usage_delta: Some(UsageEventUsageDelta {
                 raw_input_tokens: 300,
                 raw_output_tokens: 100,
+                context_window_tokens: None,
                 cache_read_tokens: None,
                 cache_write_tokens: None,
                 cache_read_included_in_input: false,
@@ -418,6 +424,7 @@ fn test_session_reset_rebuilds_from_events() {
             usage_delta: Some(UsageEventUsageDelta {
                 raw_input_tokens: 500,
                 raw_output_tokens: 200,
+                context_window_tokens: None,
                 cache_read_tokens: None,
                 cache_write_tokens: None,
                 cache_read_included_in_input: false,
@@ -463,6 +470,7 @@ fn test_session_reset_rebuilds_from_events() {
             usage_delta: Some(UsageEventUsageDelta {
                 raw_input_tokens: 300,
                 raw_output_tokens: 100,
+                context_window_tokens: None,
                 cache_read_tokens: None,
                 cache_write_tokens: None,
                 cache_read_included_in_input: false,

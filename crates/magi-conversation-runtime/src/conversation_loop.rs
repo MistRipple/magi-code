@@ -40,14 +40,19 @@ use magi_core::{
     AccessProfile, EventId, ExecutionResultStatus, LeaseId, SessionId, Task, TaskId, TaskStatus,
     ThreadId, UtcMillis, WorkspaceId,
 };
-use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
+use magi_event_bus::{
+    EventContext, EventEnvelope, InMemoryEventBus, SessionRuntimeUsageObservation,
+    latest_usage_observations_from_ledger,
+};
 use magi_orchestrator::{ExecutionContextSummary, task_store::TaskStore};
 use magi_session_store::{
     SessionStore, ThreadChatImageSource, ThreadChatMessage, ThreadChatToolCall,
     ThreadChatToolFunction,
 };
 use magi_tool_runtime::ToolRegistry;
-use magi_usage_authority::UsageCallStatus;
+use magi_usage_authority::{
+    AUTO_COMPACT_PERCENT, DEFAULT_CONTEXT_WINDOW, UsageCallStatus, resolve_context_window,
+};
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::PathBuf,
@@ -209,8 +214,8 @@ fn chat_message_to_thread_chat_message(message: &ChatMessage) -> ThreadChatMessa
     }
 }
 
-const THREAD_HISTORY_COMPACT_THRESHOLD_TOKENS: usize = 18_000;
 const THREAD_HISTORY_COMPACT_TARGET_TOKENS: usize = 8_000;
+const THREAD_HISTORY_ESTIMATED_PREFILL_COMPACT_PERCENT: i64 = 90;
 const THREAD_HISTORY_RECENT_MESSAGE_TARGET: usize = 12;
 const THREAD_HISTORY_RECENT_MESSAGE_FLOOR: usize = 8;
 const THREAD_HISTORY_SUMMARY_EXCERPT_LIMIT: usize = 16;
@@ -240,6 +245,76 @@ fn estimate_thread_message_tokens(message: &ThreadChatMessage) -> usize {
 
 fn estimate_thread_history_tokens(history: &[ThreadChatMessage]) -> usize {
     history.iter().map(estimate_thread_message_tokens).sum()
+}
+
+#[derive(Clone, Debug)]
+enum ThreadHistoryCompactionDecision {
+    ContextWindowPressure {
+        tokens_used: u64,
+        token_limit: u64,
+        threshold_tokens: u64,
+        resolved_model: Option<String>,
+    },
+    EstimatedPrefill {
+        estimated_tokens: usize,
+        threshold_tokens: usize,
+    },
+}
+
+impl ThreadHistoryCompactionDecision {
+    fn reason_label(&self) -> &'static str {
+        match self {
+            ThreadHistoryCompactionDecision::ContextWindowPressure { .. } => {
+                "context_window_pressure"
+            }
+            ThreadHistoryCompactionDecision::EstimatedPrefill { .. } => "estimated_prefill",
+        }
+    }
+}
+
+fn latest_session_usage_observation(
+    event_bus: &InMemoryEventBus,
+    session_id: &SessionId,
+) -> Option<SessionRuntimeUsageObservation> {
+    let snapshot = event_bus.audit_usage_ledger_snapshot();
+    latest_usage_observations_from_ledger(&snapshot.usage_entries).remove(&session_id.to_string())
+}
+
+fn thread_history_compaction_decision(
+    history: &[ThreadChatMessage],
+    usage_observation: Option<&SessionRuntimeUsageObservation>,
+) -> Option<ThreadHistoryCompactionDecision> {
+    let estimated_tokens = estimate_thread_history_tokens(history);
+    if estimated_tokens <= THREAD_HISTORY_COMPACT_TARGET_TOKENS {
+        return None;
+    }
+
+    if let Some(observation) = usage_observation {
+        let context_window =
+            resolve_context_window(observation.resolved_model.as_deref().unwrap_or(""));
+        let threshold_tokens =
+            (context_window.saturating_mul(AUTO_COMPACT_PERCENT) / 100).max(1) as u64;
+        if observation.context_window_tokens >= threshold_tokens {
+            return Some(ThreadHistoryCompactionDecision::ContextWindowPressure {
+                tokens_used: observation.context_window_tokens,
+                token_limit: context_window.max(0) as u64,
+                threshold_tokens,
+                resolved_model: observation.resolved_model.clone(),
+            });
+        }
+        return None;
+    }
+
+    let threshold_tokens = (DEFAULT_CONTEXT_WINDOW
+        .saturating_mul(THREAD_HISTORY_ESTIMATED_PREFILL_COMPACT_PERCENT)
+        / 100)
+        .max(1) as usize;
+    (estimated_tokens >= threshold_tokens).then_some(
+        ThreadHistoryCompactionDecision::EstimatedPrefill {
+            estimated_tokens,
+            threshold_tokens,
+        },
+    )
 }
 
 fn truncate_for_thread_summary(value: &str, max_chars: usize) -> String {
@@ -422,9 +497,16 @@ fn build_thread_history_compaction_message(
 
 fn compact_thread_history_if_needed(
     history: &[ThreadChatMessage],
+    decision: &ThreadHistoryCompactionDecision,
 ) -> Option<Vec<ThreadChatMessage>> {
     let original_tokens = estimate_thread_history_tokens(history);
-    if original_tokens < THREAD_HISTORY_COMPACT_THRESHOLD_TOKENS {
+    if original_tokens <= THREAD_HISTORY_COMPACT_TARGET_TOKENS {
+        tracing::debug!(
+            reason = decision.reason_label(),
+            original_tokens,
+            target_tokens = THREAD_HISTORY_COMPACT_TARGET_TOKENS,
+            "thread 历史已低于压缩目标，跳过重复压缩"
+        );
         return None;
     }
     let split = choose_thread_history_compaction_split(history)?;
@@ -443,28 +525,79 @@ fn compact_thread_history_if_needed(
 }
 
 fn compact_and_replace_thread_history(
+    event_bus: &InMemoryEventBus,
     session_store: &SessionStore,
+    session_id: &SessionId,
     thread_id: &ThreadId,
     history: Vec<ThreadChatMessage>,
     phase: &'static str,
 ) -> Vec<ThreadChatMessage> {
     let original_count = history.len();
     let original_tokens = estimate_thread_history_tokens(&history);
-    let Some(compacted) = compact_thread_history_if_needed(&history) else {
+    let usage_observation = latest_session_usage_observation(event_bus, session_id);
+    let Some(decision) = thread_history_compaction_decision(&history, usage_observation.as_ref())
+    else {
+        tracing::debug!(
+            thread_id = %thread_id,
+            session_id = %session_id,
+            phase,
+            original_count,
+            original_tokens,
+            last_context_window_tokens = usage_observation
+                .as_ref()
+                .map(|observation| observation.context_window_tokens),
+            "thread 历史未达到上下文压缩阈值"
+        );
+        return history;
+    };
+    let Some(compacted) = compact_thread_history_if_needed(&history, &decision) else {
         return history;
     };
     let compacted_count = compacted.len();
     let compacted_tokens = estimate_thread_history_tokens(&compacted);
     session_store.replace_thread_messages(thread_id, compacted.clone(), UtcMillis::now());
-    tracing::info!(
-        thread_id = %thread_id,
-        phase,
-        original_count,
-        compacted_count,
-        original_tokens,
-        compacted_tokens,
-        "thread 历史已压缩并替换"
-    );
+    match &decision {
+        ThreadHistoryCompactionDecision::ContextWindowPressure {
+            tokens_used,
+            token_limit,
+            threshold_tokens,
+            resolved_model,
+        } => {
+            tracing::info!(
+                thread_id = %thread_id,
+                session_id = %session_id,
+                phase,
+                reason = decision.reason_label(),
+                original_count,
+                compacted_count,
+                original_tokens,
+                compacted_tokens,
+                tokens_used,
+                token_limit,
+                threshold_tokens,
+                resolved_model = resolved_model.as_deref().unwrap_or(""),
+                "thread 历史已按最近一次上下文窗口压力压缩并替换"
+            );
+        }
+        ThreadHistoryCompactionDecision::EstimatedPrefill {
+            estimated_tokens,
+            threshold_tokens,
+        } => {
+            tracing::info!(
+                thread_id = %thread_id,
+                session_id = %session_id,
+                phase,
+                reason = decision.reason_label(),
+                original_count,
+                compacted_count,
+                original_tokens,
+                compacted_tokens,
+                estimated_tokens,
+                threshold_tokens,
+                "thread 历史已按冷启动估算压力压缩并替换"
+            );
+        }
+    }
     compacted
 }
 
@@ -907,7 +1040,9 @@ fn run_conversation_loop_inner(
     // 为单 task 独占，因此这里不能出现同 role 的历史 task 对话。历史超出水位线时
     // 直接替换为「摘要 + 最近完整消息」，下一轮不再读到旧结构。
     let thread_history_snapshot = compact_and_replace_thread_history(
+        event_bus,
         session_store,
+        session_id,
         thread_id,
         session_store.thread_message_history(thread_id),
         "pre_turn",
@@ -1619,7 +1754,9 @@ fn run_conversation_loop_inner(
     });
     session_store.append_thread_messages(thread_id, turn_messages, UtcMillis::now());
     let _ = compact_and_replace_thread_history(
+        event_bus,
         session_store,
+        session_id,
         thread_id,
         session_store.thread_message_history(thread_id),
         "post_turn",
@@ -2677,6 +2814,83 @@ mod tests {
     struct CapturingPromptModelBridgeClient {
         content: &'static str,
         messages: Mutex<Vec<ChatMessage>>,
+    }
+
+    fn test_thread_message(role: &str, content: impl Into<String>) -> ThreadChatMessage {
+        ThreadChatMessage {
+            role: role.to_string(),
+            content: Some(content.into()),
+            images: Vec::new(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        }
+    }
+
+    fn repeated_thread_history(
+        message_count: usize,
+        chars_per_message: usize,
+    ) -> Vec<ThreadChatMessage> {
+        (0..message_count)
+            .map(|index| {
+                test_thread_message(
+                    if index % 2 == 0 { "user" } else { "assistant" },
+                    "x".repeat(chars_per_message),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn thread_history_compaction_uses_last_context_window_usage_as_authority() {
+        let history = repeated_thread_history(40, 1_000);
+        let low_usage = SessionRuntimeUsageObservation {
+            context_window_tokens: 20_000,
+            resolved_model: Some("gpt-5-codex".to_string()),
+            observed_at: Some(UtcMillis(1)),
+        };
+        assert!(thread_history_compaction_decision(&history, Some(&low_usage)).is_none());
+
+        let high_usage = SessionRuntimeUsageObservation {
+            context_window_tokens: 245_000,
+            resolved_model: Some("gpt-5-codex".to_string()),
+            observed_at: Some(UtcMillis(2)),
+        };
+        let decision = thread_history_compaction_decision(&history, Some(&high_usage))
+            .expect("high context usage should trigger compaction");
+        match decision {
+            ThreadHistoryCompactionDecision::ContextWindowPressure {
+                tokens_used,
+                token_limit,
+                threshold_tokens,
+                resolved_model,
+            } => {
+                assert_eq!(tokens_used, 245_000);
+                assert_eq!(token_limit, 272_000);
+                assert_eq!(threshold_tokens, 244_800);
+                assert_eq!(resolved_model.as_deref(), Some("gpt-5-codex"));
+            }
+            other => panic!("expected context pressure decision, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn thread_history_compaction_uses_estimated_prefill_only_without_usage() {
+        let normal_history = repeated_thread_history(40, 1_000);
+        assert!(thread_history_compaction_decision(&normal_history, None).is_none());
+
+        let huge_history = repeated_thread_history(1_000, 1_000);
+        let decision = thread_history_compaction_decision(&huge_history, None)
+            .expect("huge cold-start history should trigger estimated prefill compaction");
+        match decision {
+            ThreadHistoryCompactionDecision::EstimatedPrefill {
+                estimated_tokens,
+                threshold_tokens,
+            } => {
+                assert!(estimated_tokens >= threshold_tokens);
+                assert_eq!(threshold_tokens, 230_400);
+            }
+            other => panic!("expected estimated prefill decision, got {other:?}"),
+        }
     }
 
     impl ModelBridgeClient for TaskToolBatchModelBridgeClient {

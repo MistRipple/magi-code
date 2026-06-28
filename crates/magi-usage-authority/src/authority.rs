@@ -90,6 +90,7 @@ impl UsageAuthority {
             usage_delta: Some(UsageEventUsageDelta {
                 raw_input_tokens: input.usage.input_tokens,
                 raw_output_tokens: input.usage.output_tokens,
+                context_window_tokens: input.usage.total_tokens,
                 cache_read_tokens: input.usage.cache_read_tokens,
                 cache_write_tokens: input.usage.cache_write_tokens,
                 cache_read_included_in_input: input.usage.cache_read_included_in_input,

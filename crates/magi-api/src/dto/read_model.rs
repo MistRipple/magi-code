@@ -4,15 +4,16 @@ use magi_core::{
 use magi_event_bus::{
     ExecutionGroupRuntimeSummaryEntry, MissionMetricsSummary, RecoveryActivityStage,
     RecoveryDiagnosticSummaryEntry, RuntimeLedgerSummary, RuntimeReadModelInput,
-    SessionRuntimeBranchSummaryEntry, SessionRuntimeSummaryEntry,
+    SessionRuntimeBranchSummaryEntry, SessionRuntimeBudgetEntry, SessionRuntimeSummaryEntry,
     SessionRuntimeTurnItemSummaryEntry, SessionRuntimeTurnSummaryEntry,
-    WorkspaceRuntimeSummaryEntry,
+    SessionRuntimeUsageObservation, WorkspaceRuntimeSummaryEntry,
 };
 use magi_mission_metrics::MissionMetrics;
 use magi_orchestrator::task_store::TaskStore;
 use magi_session_store::{SessionExecutionSidecarStatus, SessionRuntimeSidecarExport};
+use magi_usage_authority::{evaluate_context_budget, resolve_context_window};
 use magi_workspace::{RecoveryStatus, WorkspaceRecoverySidecarExport};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 #[cfg(test)]
 use magi_event_bus::AuditUsageLedgerStatus;
@@ -32,6 +33,7 @@ pub struct MissionAggregateExport {
 pub type RuntimeReadModelDto = RuntimeReadModelInput;
 pub type AuditUsageLedgerDto = RuntimeLedgerSummary;
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn runtime_read_model_dto(
     runtime_read_model: RuntimeReadModelInput,
     session_sidecar_exports: &[SessionRuntimeSidecarExport],
@@ -40,18 +42,97 @@ pub fn runtime_read_model_dto(
     task_store: Option<&TaskStore>,
     mission_aggregate_exports: &[MissionAggregateExport],
 ) -> RuntimeReadModelDto {
+    runtime_read_model_dto_with_usage(
+        runtime_read_model,
+        session_sidecar_exports,
+        workspace_sidecar_exports,
+        audit_usage_ledger,
+        task_store,
+        mission_aggregate_exports,
+        &BTreeMap::new(),
+    )
+}
+
+/// 与 [`runtime_read_model_dto`] 相同,但额外接收一份从持久化用量账本回放出的
+/// 每会话用量观测值。
+///
+/// 重启容错:守护进程重启后,event-bus 的 `recent_events` 缓冲区为空,实时投影
+/// 无法为按 sidecar 重建的会话填充 `usage_observation`,预算因此整体丢失。生产
+/// 装配路径用 `latest_usage_observations_from_ledger` 从已恢复账本算出
+/// `ledger_usage_observations`,在 sidecar 合并之后、预算计算之前回填,使重启
+/// 前后的 `budget` 口径一致。
+#[allow(clippy::too_many_arguments)]
+pub fn runtime_read_model_dto_with_usage(
+    runtime_read_model: RuntimeReadModelInput,
+    session_sidecar_exports: &[SessionRuntimeSidecarExport],
+    workspace_sidecar_exports: &[WorkspaceRecoverySidecarExport],
+    audit_usage_ledger: AuditUsageLedgerDto,
+    task_store: Option<&TaskStore>,
+    mission_aggregate_exports: &[MissionAggregateExport],
+    ledger_usage_observations: &BTreeMap<String, SessionRuntimeUsageObservation>,
+) -> RuntimeReadModelDto {
     let mut runtime_read_model = runtime_read_model;
     merge_session_sidecars(&mut runtime_read_model, session_sidecar_exports, task_store);
     merge_workspace_sidecars(&mut runtime_read_model, workspace_sidecar_exports);
     merge_mission_aggregates(&mut runtime_read_model, mission_aggregate_exports);
+    backfill_session_usage_observations(&mut runtime_read_model, ledger_usage_observations);
+    merge_session_budgets(&mut runtime_read_model);
     prune_terminal_runtime_live_ids(&mut runtime_read_model);
     runtime_read_model.meta.ledger = audit_usage_ledger;
     runtime_read_model
 }
 
+/// 仅当实时投影未提供观测值时,用账本回放结果回填会话的 `usage_observation`。
+///
+/// 反孤儿:实时 `model.usage.recorded` 事件优先(其负载与重启后账本同源同口径),
+/// 账本只补齐重启后缺失的会话,避免覆盖更新的实时观测。
+fn backfill_session_usage_observations(
+    runtime_read_model: &mut RuntimeReadModelInput,
+    ledger_usage_observations: &BTreeMap<String, SessionRuntimeUsageObservation>,
+) {
+    if ledger_usage_observations.is_empty() {
+        return;
+    }
+    for session in &mut runtime_read_model.details.sessions {
+        if session.usage_observation.is_some() {
+            continue;
+        }
+        if let Some(observation) = ledger_usage_observations.get(&session.session_id) {
+            session.usage_observation = Some(observation.clone());
+        }
+    }
+}
+
 #[cfg(test)]
 pub fn ledger_dto(status: AuditUsageLedgerStatus) -> AuditUsageLedgerDto {
     RuntimeLedgerSummary::from(status)
+}
+
+/// 为每个会话计算上下文预算快照。
+///
+/// 反孤儿：event-bus 仅采集当前上下文窗口 token 与解析模型名（`usage_observation`），
+/// 窗口推断与告警分级是 usage-authority 的责任，所以在 DTO 装配层
+/// 用 `resolve_context_window` + `evaluate_context_budget` 填充 `budget`。没有
+/// 观测值的会话保持 `budget == None`。
+fn merge_session_budgets(runtime_read_model: &mut RuntimeReadModelInput) {
+    for session in &mut runtime_read_model.details.sessions {
+        let Some(observation) = session.usage_observation.as_ref() else {
+            session.budget = None;
+            continue;
+        };
+        let resolved_model = observation.resolved_model.as_deref().unwrap_or("");
+        let context_window = resolve_context_window(resolved_model);
+        let budget =
+            evaluate_context_budget(observation.context_window_tokens as i64, context_window);
+        session.budget = Some(SessionRuntimeBudgetEntry {
+            token_used: budget.tokens_used.max(0) as u64,
+            remaining_tokens: budget.remaining_tokens.max(0) as u64,
+            token_limit: budget.context_window.max(0) as u64,
+            percent_remaining: budget.percent_remaining,
+            usage_ratio: budget.usage_ratio,
+            warning_level: budget.warning_level.as_str().to_string(),
+        });
+    }
 }
 
 fn merge_session_sidecars(
@@ -735,6 +816,7 @@ mod tests {
     use super::*;
     use magi_core::{ExecutionOwnership, SessionId, ThreadId, UtcMillis, WorkspaceId};
     use magi_event_bus::RUNTIME_LEDGER_PERSIST_ERROR_SUMMARY;
+    use magi_event_bus::SessionRuntimeUsageObservation;
 
     #[test]
     fn runtime_read_model_merges_sidecars_and_ledger_summary() {
@@ -2146,6 +2228,151 @@ mod tests {
         assert_eq!(
             entry.lifecycle_phase.as_deref(),
             Some("all_steps_completed")
+        );
+    }
+
+    #[test]
+    fn runtime_read_model_fills_session_budget_from_usage_observation() {
+        let mut input = RuntimeReadModelInput::default();
+        input.details.sessions.push(SessionRuntimeSummaryEntry {
+            session_id: "session-budget".to_string(),
+            usage_observation: Some(SessionRuntimeUsageObservation {
+                context_window_tokens: 136_000,
+                resolved_model: Some("gpt-5-codex".to_string()),
+                observed_at: Some(UtcMillis(1)),
+            }),
+            ..SessionRuntimeSummaryEntry::default()
+        });
+        // 没有观测值的会话保持 budget == None。
+        input.details.sessions.push(SessionRuntimeSummaryEntry {
+            session_id: "session-no-usage".to_string(),
+            ..SessionRuntimeSummaryEntry::default()
+        });
+
+        let dto = runtime_read_model_dto(
+            input,
+            &[],
+            &[],
+            ledger_dto(AuditUsageLedgerStatus {
+                schema_version: "audit-usage-ledger-v1".to_string(),
+                next_sequence: 1,
+                audit_count: 0,
+                usage_count: 0,
+                persistence_path: None,
+                last_persist_error: None,
+            }),
+            None,
+            &[],
+        );
+
+        let with_usage = dto
+            .details
+            .sessions
+            .iter()
+            .find(|entry| entry.session_id == "session-budget")
+            .expect("session with usage should exist");
+        let budget = with_usage
+            .budget
+            .as_ref()
+            .expect("budget should be derived from usage observation");
+        // gpt-5-codex 解析窗口 272k。
+        assert_eq!(budget.token_limit, 272_000);
+        assert_eq!(budget.token_used, 136_000);
+        assert_eq!(budget.remaining_tokens, 136_000);
+        assert!(budget.usage_ratio > 0.0 && budget.usage_ratio < 1.0);
+        assert!(!budget.warning_level.is_empty());
+
+        let without_usage = dto
+            .details
+            .sessions
+            .iter()
+            .find(|entry| entry.session_id == "session-no-usage")
+            .expect("session without usage should exist");
+        assert!(without_usage.budget.is_none());
+    }
+
+    #[test]
+    fn ledger_usage_observations_backfill_budget_after_restart() {
+        // 重启场景:event-bus recent_events 为空,会话按 sidecar 重建,实时投影没有
+        // usage_observation。账本回放出的观测值应回填并恢复 budget。
+        let mut input = RuntimeReadModelInput::default();
+        input.details.sessions.push(SessionRuntimeSummaryEntry {
+            session_id: "session-restored".to_string(),
+            ..SessionRuntimeSummaryEntry::default()
+        });
+        // 已有实时观测的会话:账本不得覆盖更新的实时值。
+        input.details.sessions.push(SessionRuntimeSummaryEntry {
+            session_id: "session-live".to_string(),
+            usage_observation: Some(SessionRuntimeUsageObservation {
+                context_window_tokens: 136_000,
+                resolved_model: Some("gpt-5-codex".to_string()),
+                observed_at: Some(UtcMillis(2)),
+            }),
+            ..SessionRuntimeSummaryEntry::default()
+        });
+
+        let mut ledger_observations = BTreeMap::new();
+        ledger_observations.insert(
+            "session-restored".to_string(),
+            SessionRuntimeUsageObservation {
+                context_window_tokens: 68_000,
+                resolved_model: Some("gpt-5-codex".to_string()),
+                observed_at: Some(UtcMillis(1)),
+            },
+        );
+        // 账本里这条更旧/更小,不应覆盖 session-live 的实时观测。
+        ledger_observations.insert(
+            "session-live".to_string(),
+            SessionRuntimeUsageObservation {
+                context_window_tokens: 1_000,
+                resolved_model: Some("gpt-5-codex".to_string()),
+                observed_at: Some(UtcMillis(1)),
+            },
+        );
+
+        let dto = runtime_read_model_dto_with_usage(
+            input,
+            &[],
+            &[],
+            ledger_dto(AuditUsageLedgerStatus {
+                schema_version: "audit-usage-ledger-v1".to_string(),
+                next_sequence: 1,
+                audit_count: 0,
+                usage_count: 2,
+                persistence_path: None,
+                last_persist_error: None,
+            }),
+            None,
+            &[],
+            &ledger_observations,
+        );
+
+        let restored = dto
+            .details
+            .sessions
+            .iter()
+            .find(|entry| entry.session_id == "session-restored")
+            .expect("restored session should exist");
+        let budget = restored
+            .budget
+            .as_ref()
+            .expect("budget should be backfilled from ledger observation");
+        assert_eq!(budget.token_limit, 272_000);
+        assert_eq!(budget.token_used, 68_000);
+
+        // 实时观测优先:仍按 136_000 计算,而非账本里的 1_000。
+        let live = dto
+            .details
+            .sessions
+            .iter()
+            .find(|entry| entry.session_id == "session-live")
+            .expect("live session should exist");
+        assert_eq!(
+            live.budget
+                .as_ref()
+                .expect("live budget should exist")
+                .token_used,
+            136_000
         );
     }
 }

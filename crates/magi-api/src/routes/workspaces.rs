@@ -499,20 +499,17 @@ mod tests {
                 .expect("workspaceId should exist"),
         );
         // 索引在 spawn_blocking 中异步构建，轮询等待完成。
-        let code_index = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            async {
-                loop {
-                    if let Some(summary) = state
-                        .knowledge_store
-                        .code_index_summary_for_workspace(&workspace_id)
-                    {
-                        return summary;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let code_index = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(summary) = state
+                    .knowledge_store
+                    .code_index_summary_for_workspace(&workspace_id)
+                {
+                    return summary;
                 }
-            },
-        )
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
         .await
         .expect("code index should be built within timeout");
 

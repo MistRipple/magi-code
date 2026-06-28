@@ -26,7 +26,7 @@ impl Default for AdapterConfig {
         Self {
             max_rounds: 50,
             max_tokens_per_round: Some(4096),
-            context_window: 128_000,
+            context_window: 256_000,
             buffer_tokens: 13_000,
             enable_summary_hijack_guard: true,
         }

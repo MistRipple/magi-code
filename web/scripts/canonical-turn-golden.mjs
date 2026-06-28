@@ -83,6 +83,7 @@ function runGoldenReplay(reducer, projection, messagesStore, dataHandlers, timel
   assertMessagesStoreRejectsForeignSessionProjection(reducer, projection, messagesStore);
   assertMessagesStoreAdoptsLiveCanonicalEventForEmptySession(dataHandlers, messagesStore);
   assertSameSessionBootstrapAppliesAuthoritativeSnapshotWhenProjectionIsEmpty(dataHandlers, messagesStore);
+  assertSameSessionStaleIdleBootstrapPreservesActiveTurn(dataHandlers, messagesStore);
   assertMessagesStoreSettlesProcessingFromLiveTerminalCanonicalEvent(dataHandlers, messagesStore);
   assertTerminalLateUpsertIsIgnored(reducer, projection);
   assertTerminalLateTurnStartedIsIgnored(reducer, projection);
@@ -907,6 +908,96 @@ function assertSameSessionBootstrapAppliesAuthoritativeSnapshotWhenProjectionIsE
     0,
     'authoritative same-session bootstrap must clear stale local pending request ids',
   );
+  messagesStore.setCurrentSessionId(null);
+}
+
+function assertSameSessionStaleIdleBootstrapPreservesActiveTurn(dataHandlers, messagesStore) {
+  const workspaceId = 'workspace-golden-stale-idle-bootstrap';
+  const workspacePath = '/tmp/workspace-golden-stale-idle-bootstrap';
+  const sessionId = 'session-golden-stale-idle-bootstrap';
+  const requestId = 'request-stale-idle-bootstrap';
+  const sessions = [
+    {
+      id: sessionId,
+      title: '活跃轮次',
+      createdAt: 10_000,
+      updatedAt: 10_000,
+      messageCount: 0,
+      workspaceId,
+    },
+  ];
+
+  messagesStore.messagesState.currentWorkspaceId = workspaceId;
+  messagesStore.messagesState.currentWorkspacePath = workspacePath;
+  messagesStore.setCurrentSessionId(sessionId);
+  messagesStore.clearAllMessages({
+    persist: false,
+    resetTimelineView: true,
+    resetPanelState: true,
+    skipAntiLiftBack: true,
+  });
+  messagesStore.addPendingRequest(requestId);
+  assert.equal(
+    messagesStore.messagesState.isProcessing,
+    true,
+    'stale idle bootstrap repro starts with an active local turn',
+  );
+
+  dataHandlers.handleUnifiedData({
+    id: 'golden-stale-idle-bootstrap',
+    category: 'data',
+    type: 'system',
+    source: 'orchestrator',
+    agent: 'orchestrator',
+    lifecycle: 'completed',
+    blocks: [],
+    timestamp: 10_001,
+    updatedAt: 10_001,
+    data: {
+      dataType: 'sessionBootstrapLoaded',
+      payload: {
+        sessionId,
+        workspace: {
+          workspaceId,
+          rootPath: workspacePath,
+        },
+        sessions,
+        state: {
+          currentSessionId: sessionId,
+          currentWorkspaceId: workspaceId,
+          currentWorkspacePath: workspacePath,
+          sessions,
+          isProcessing: false,
+          processingState: null,
+          messages: [],
+          edits: [],
+          changedFiles: [],
+          pendingChanges: [],
+          pendingChangesState: null,
+        },
+        canonicalTurns: [],
+        notifications: {
+          notifications: [],
+        },
+        orchestratorRuntimeState: null,
+        hasMoreBefore: false,
+        beforeCursor: null,
+      },
+    },
+  });
+
+  assert.equal(
+    messagesStore.messagesState.pendingRequests.has(requestId),
+    true,
+    'stale idle bootstrap without terminal turn must not clear the active request',
+  );
+  assert.equal(
+    messagesStore.messagesState.isProcessing,
+    true,
+    'stale idle bootstrap without terminal turn must not interrupt the active conversation flow',
+  );
+  messagesStore.clearProcessingState({ skipAntiLiftBack: true });
+  messagesStore.clearAllRequestBindings();
   messagesStore.setCurrentSessionId(null);
 }
 

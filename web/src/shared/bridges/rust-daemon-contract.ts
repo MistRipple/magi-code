@@ -154,6 +154,16 @@ interface RustSessionRuntimeSummary {
   active_branches?: RustSessionRuntimeBranchSummary[];
   current_turn?: RustSessionRuntimeTurnSummary | null;
   turn_items?: RustSessionRuntimeTurnItemSummary[];
+  budget?: RustSessionRuntimeBudget | null;
+}
+
+interface RustSessionRuntimeBudget {
+  token_used?: number;
+  remaining_tokens?: number;
+  token_limit?: number;
+  percent_remaining?: number;
+  usage_ratio?: number;
+  warning_level?: string;
 }
 
 interface RustSessionRuntimeTurnSummary {
@@ -477,7 +487,31 @@ function normalizeSessionRuntimeEntries(
         : [],
       current_turn: normalizeRuntimeTurnSummary(entry.current_turn),
       turn_items: normalizeRuntimeTurnItems(entry.turn_items),
+      budget: normalizeRuntimeBudget(entry.budget),
     }));
+}
+
+function normalizeRuntimeBudget(raw: unknown): RustSessionRuntimeBudget | undefined {
+  const record = normalizeObjectRecord(raw);
+  if (!record) {
+    return undefined;
+  }
+  const tokenLimit = typeof record.token_limit === 'number' ? Math.floor(record.token_limit) : undefined;
+  if (tokenLimit === undefined) {
+    return undefined;
+  }
+  return {
+    token_used: typeof record.token_used === 'number' ? Math.floor(record.token_used) : undefined,
+    remaining_tokens: typeof record.remaining_tokens === 'number'
+      ? Math.floor(record.remaining_tokens)
+      : undefined,
+    token_limit: tokenLimit,
+    percent_remaining: typeof record.percent_remaining === 'number'
+      ? Math.floor(record.percent_remaining)
+      : undefined,
+    usage_ratio: typeof record.usage_ratio === 'number' ? record.usage_ratio : undefined,
+    warning_level: normalizeString(record.warning_level) || undefined,
+  };
 }
 
 function normalizeEventEnvelope(raw: unknown): RustEventEnvelope | null {
@@ -1209,6 +1243,45 @@ function deriveOpsView(
   };
 }
 
+type OrchestratorRuntimeSnapshotState = NonNullable<OrchestratorRuntimeState['runtimeSnapshot']>;
+type BudgetWarningLevel = NonNullable<NonNullable<OrchestratorRuntimeSnapshotState['budgetState']>['warningLevel']>;
+
+function normalizeBudgetWarningLevel(value: string | undefined): BudgetWarningLevel | undefined {
+  switch (value) {
+    case 'normal':
+    case 'notice':
+    case 'warning':
+    case 'danger':
+      return value;
+    default:
+      return undefined;
+  }
+}
+
+/**
+ * 从后端 session.budget 装配上下文预算快照。
+ *
+ * 后端 usage-authority 已在 DTO 层算好 token 占用、剩余与告警分级，这里只做
+ * 字段映射；没有 budget 的会话返回 null，面板据此隐藏预算卡片。
+ */
+function buildRuntimeSnapshot(
+  activeSession: RustSessionRuntimeSummary | undefined,
+): OrchestratorRuntimeSnapshotState | null {
+  const budget = activeSession?.budget;
+  if (!budget || typeof budget.token_limit !== 'number') {
+    return null;
+  }
+  return {
+    budgetState: {
+      tokenUsed: budget.token_used,
+      remainingTokens: budget.remaining_tokens,
+      tokenLimit: budget.token_limit,
+      usageRatio: budget.usage_ratio,
+      warningLevel: normalizeBudgetWarningLevel(budget.warning_level),
+    },
+  };
+}
+
 function deriveRuntimeState(
   runtimeReadModel: RustRuntimeReadModelDto | undefined,
   assignments: OrchestrationRuntimeAssignmentSummary[],
@@ -1291,7 +1364,7 @@ function deriveRuntimeState(
         }
       : undefined,
     opsView,
-    runtimeSnapshot: null,
+    runtimeSnapshot: buildRuntimeSnapshot(activeSession),
     runtimeDecisionTrace: [],
   };
 }

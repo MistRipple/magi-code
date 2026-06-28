@@ -22,6 +22,7 @@
     settingsBootstrapMatchesCurrentWorkspace,
   } from '../web/agent-api';
   import Icon from './Icon.svelte';
+  import ContextUsageRing from './ContextUsageRing.svelte';
   import { generateId } from '../lib/utils';
   import { i18n } from '../stores/i18n.svelte';
   import {
@@ -135,12 +136,19 @@
   let branchAdditions = $state(0);
   let branchDeletions = $state(0);
   let branchRequestSeq = 0;
+  let settingsBootstrapRefreshKey = '';
+  let settingsBootstrapRefreshSeq = 0;
   let workspacePickerOpen = $state(false);
   let accessProfilePickerOpen = $state(false);
   let selectedAccessProfile = $state<AccessProfile>('restricted');
   const currentPickerModel = $derived.by(() => readOrchestratorModel());
   const currentPickerReasoningEffort = $derived.by(() => readOrchestratorReasoningEffort());
   const currentPickerReasoningLabel = $derived.by(() => reasoningEffortLabel(currentPickerReasoningEffort));
+  // 上下文用量圆环数据：直接取 orchestrator runtime 快照里的 budgetState。
+  // 无活动会话或快照缺失时为 null，圆环组件会渲染占位态。
+  const contextBudgetState = $derived.by(() => (
+    messagesState.orchestratorRuntimeState?.runtimeSnapshot?.budgetState ?? null
+  ));
   const currentAccessProfileOption = $derived.by(() => (
     accessProfileOptions.find((option) => option.value === selectedAccessProfile)
     ?? accessProfileOptions[1]
@@ -734,6 +742,35 @@
     branchLoading = false;
     branchError = null;
     void refreshBranchState();
+  });
+
+  // 新建会话/切换会话后，URL 与 session store 会先变更，settings bootstrap 可能仍是
+  // 旧 session 绑定。输入区的模型按钮依赖 session 级有效配置，必须在绑定不匹配时刷新。
+  $effect(() => {
+    const workspaceId = currentWorkspaceId?.trim() || '';
+    const workspacePath = currentWorkspacePath?.trim() || '';
+    const sessionId = currentSessionId?.trim() || '';
+    const refreshKey = `${workspaceId}|${workspacePath}|${sessionId}|${selectedAccessProfile}`;
+    if (!workspaceId && !workspacePath) return;
+    if (
+      messagesState.settingsBootstrapSnapshot
+      && settingsBootstrapMatchesCurrentWorkspace(messagesState.settingsBootstrapSnapshot)
+    ) {
+      settingsBootstrapRefreshKey = refreshKey;
+      return;
+    }
+    if (settingsBootstrapRefreshKey === refreshKey) return;
+    settingsBootstrapRefreshKey = refreshKey;
+    const seq = ++settingsBootstrapRefreshSeq;
+    getAgentSettingsBootstrap({ scope: 'core', accessProfile: selectedAccessProfile })
+      .then((latest) => {
+        if (seq !== settingsBootstrapRefreshSeq) return;
+        if (!settingsBootstrapMatchesCurrentWorkspace(latest)) return;
+        messagesState.settingsBootstrapSnapshot = latest;
+      })
+      .catch((error) => {
+        console.warn('[InputArea] 会话绑定变化后刷新设置快照失败:', error);
+      });
   });
 
   function resolveComposerRawContent(): string {
@@ -1686,6 +1723,15 @@
             </div>
           {/if}
         </div>
+        <span class="ia-toolbar-divider" aria-hidden="true"></span>
+        <ContextUsageRing
+          usageRatio={contextBudgetState?.usageRatio ?? null}
+          tokenUsed={contextBudgetState?.tokenUsed ?? null}
+          remainingTokens={contextBudgetState?.remainingTokens ?? null}
+          tokenLimit={contextBudgetState?.tokenLimit ?? null}
+          warningLevel={contextBudgetState?.warningLevel ?? null}
+        />
+        <span class="ia-toolbar-divider" aria-hidden="true"></span>
         <div class="ia-picker-wrap ia-model-wrap">
           <button
             type="button"
@@ -1699,7 +1745,6 @@
               : i18n.t('input.mainModelPicker.titleEmpty')}
             aria-expanded={pickerOpen}
           >
-            <Icon name={pickerSavingModel || pickerSavingReasoning ? 'loader' : 'circleOutline'} size={12} class={pickerSavingModel || pickerSavingReasoning ? 'spinning' : ''} />
             <span class="ia-picker-btn-label">{currentPickerModel || i18n.t('input.mainModelPicker.buttonEmpty')}</span>
             {#if currentPickerReasoningLabel}
               <span class="ia-model-effort">{currentPickerReasoningLabel}</span>
@@ -1977,6 +2022,13 @@
   .ia-right {
     flex-wrap: nowrap;
     justify-content: flex-end;
+  }
+
+  .ia-toolbar-divider {
+    width: 1px;
+    height: 16px;
+    background: var(--border);
+    flex-shrink: 0;
   }
 
   /* 发送按钮：圆形 */

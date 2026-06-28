@@ -343,6 +343,37 @@ pub struct SessionRuntimeTurnItemSummaryEntry {
     pub source_thread_id: String,
 }
 
+/// 会话最近一次模型请求的上下文窗口观测值。
+///
+/// 由 `from_events` 从 `model.usage.recorded` 事件提取,仅保留计算上下文预算
+/// 所需的原始口径(当前请求的上下文窗口 token 与解析模型名)。事件总线本身不
+/// 计算窗口大小,装配 DTO 的 `magi-api` 层会用 `magi-usage-authority` 把该
+/// 观测值转换为带窗口与告警级别的 [`SessionRuntimeBudgetEntry`]。
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct SessionRuntimeUsageObservation {
+    /// 最近一次成功请求返回的当前上下文窗口占用 token。
+    pub context_window_tokens: u64,
+    /// 该次请求解析出的模型名,用于推断上下文窗口大小。
+    pub resolved_model: Option<String>,
+    /// 观测对应的事件时间戳。
+    pub observed_at: Option<UtcMillis>,
+}
+
+/// 会话上下文预算快照,由 `magi-api` 装配 DTO 时填充。
+///
+/// 字段口径与前端 `runtimeSnapshot.budgetState` 对齐:`token_used` 为当前
+/// 上下文窗口占用,`token_limit` 为解析窗口,`usage_ratio` 为占用率,
+/// `warning_level` 为稳定字符串告警级别。
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct SessionRuntimeBudgetEntry {
+    pub token_used: u64,
+    pub remaining_tokens: u64,
+    pub token_limit: u64,
+    pub percent_remaining: i64,
+    pub usage_ratio: f64,
+    pub warning_level: String,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct SessionRuntimeSummaryEntry {
     pub session_id: String,
@@ -368,6 +399,10 @@ pub struct SessionRuntimeSummaryEntry {
     pub active_branches: Vec<SessionRuntimeBranchSummaryEntry>,
     pub current_turn: Option<SessionRuntimeTurnSummaryEntry>,
     pub turn_items: Vec<SessionRuntimeTurnItemSummaryEntry>,
+    /// 最近一次模型请求的上下文窗口观测值（由 model.usage.recorded 提取）。
+    pub usage_observation: Option<SessionRuntimeUsageObservation>,
+    /// 上下文预算快照，由 magi-api 装配 DTO 时用 usage-authority 计算填充。
+    pub budget: Option<SessionRuntimeBudgetEntry>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -1086,6 +1121,9 @@ impl RuntimeReadModelInput {
                     session_entry.recovery_event_count += 1;
                 }
                 session_entry.latest_event_type = Some(event.event_type.clone());
+                if let Some(observation) = usage_observation_from_event(event) {
+                    session_entry.usage_observation = Some(observation);
+                }
                 collect_unique_option_string(
                     &mut session_entry.active_execution_group_ids,
                     resolved_mission_id.clone(),
@@ -2164,6 +2202,105 @@ fn infer_worker_stage(event: &EventEnvelope) -> Option<String> {
         .map(|value| value.to_ascii_lowercase())
 }
 
+/// 从 `model.usage.recorded` 事件提取上下文窗口观测值。
+///
+/// payload 是 camelCase 序列化的 `UsageCallRecordInput`。仅采集成功调用
+/// （`status == "success"`）的当前请求上下文窗口 token 与解析模型名，
+/// 窗口大小的推断交由 magi-api 装配层完成。
+fn usage_observation_from_event(event: &EventEnvelope) -> Option<SessionRuntimeUsageObservation> {
+    usage_observation_from_payload(&event.event_type, &event.payload)
+}
+
+/// 从 `model.usage.recorded` 负载提取上下文窗口观测值。
+///
+/// 反孤儿:既服务于实时 `recent_events` 投影,也服务于守护进程重启后从
+/// 审计/用量账本回放的路径(`latest_usage_observations_from_ledger`),两条
+/// 路径共用同一口径,避免重启前后预算计算出现漂移。
+///
+/// 口径对齐 Codex:展示用的上下文窗口占用取最近一次模型调用返回的
+/// `totalTokens`；没有显式 total 时用 raw input + raw output。这里不扣
+/// cache read,因为缓存命中仍然占用模型上下文窗口,只是不按同样价格计费。
+fn usage_observation_from_payload(
+    event_type: &str,
+    payload: &serde_json::Value,
+) -> Option<SessionRuntimeUsageObservation> {
+    if event_type != "model.usage.recorded" {
+        return None;
+    }
+    if payload.get("status").and_then(|value| value.as_str()) != Some("success") {
+        return None;
+    }
+    let usage = payload.get("usage")?;
+    let input_tokens = usage
+        .get("inputTokens")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let output_tokens = usage
+        .get("outputTokens")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let total_tokens = usage
+        .get("totalTokens")
+        .or_else(|| usage.get("total_tokens"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let context_window_tokens = if total_tokens > 0 {
+        total_tokens
+    } else {
+        input_tokens.saturating_add(output_tokens)
+    };
+    if context_window_tokens == 0 {
+        return None;
+    }
+    let resolved_model = payload
+        .get("modelConfig")
+        .and_then(|config| config.get("model"))
+        .and_then(|value| value.as_str())
+        .map(str::to_string);
+    let observed_at = payload
+        .get("timestamp")
+        .and_then(serde_json::Value::as_u64)
+        .map(UtcMillis);
+    Some(SessionRuntimeUsageObservation {
+        context_window_tokens,
+        resolved_model,
+        observed_at,
+    })
+}
+
+/// 从已恢复的审计/用量账本条目重建每会话最近一次用量观测值。
+///
+/// 反孤儿/重启容错:守护进程重启后实时 `recent_events` 缓冲区从空开始,
+/// `model.usage.recorded` 事件只存在于持久化的用量账本中。读模型按 sidecar
+/// 重建会话条目却拿不到观测值,导致预算整体丢失。此函数按账本顺序(`sequence`)
+/// 回放,保留每个会话的最后一次成功观测,供 DTO 装配层回填 `usage_observation`
+/// 后再计算预算。
+pub fn latest_usage_observations_from_ledger(
+    usage_entries: &[crate::AuditUsageLedgerEntry],
+) -> BTreeMap<String, SessionRuntimeUsageObservation> {
+    let mut latest: BTreeMap<String, (u64, SessionRuntimeUsageObservation)> = BTreeMap::new();
+    for entry in usage_entries {
+        let Some(session_id) = entry.context.session_id.as_ref() else {
+            continue;
+        };
+        let Some(observation) = usage_observation_from_payload(&entry.event_type, &entry.payload)
+        else {
+            continue;
+        };
+        let session_id = session_id.to_string();
+        match latest.get(&session_id) {
+            Some((existing_sequence, _)) if *existing_sequence >= entry.sequence => {}
+            _ => {
+                latest.insert(session_id, (entry.sequence, observation));
+            }
+        }
+    }
+    latest
+        .into_iter()
+        .map(|(session_id, (_, observation))| (session_id, observation))
+        .collect()
+}
+
 fn nested_usize_field(value: &serde_json::Value, key: &str) -> usize {
     value
         .get(key)
@@ -2664,5 +2801,153 @@ mod tests {
             .find(|entry| entry.mission_id == "mission-1")
             .expect("mission runtime entry should exist");
         assert_eq!(mission.current_status.as_deref(), Some("succeeded"));
+    }
+
+    #[test]
+    fn model_usage_recorded_records_session_usage_observation() {
+        let mut usage_event = EventEnvelope::audit(
+            EventId::new("event-model-usage-recorded"),
+            "model.usage.recorded",
+            json!({
+                "status": "success",
+                "usage": {
+                    "inputTokens": 12_000,
+                    "outputTokens": 3_000,
+                    "cacheReadTokens": 2_000,
+                    "cacheReadIncludedInInput": true
+                },
+                "modelConfig": { "model": "gpt-5-codex" },
+                "timestamp": 1_700_000_000_000_u64
+            }),
+        )
+        .with_context(EventContext {
+            session_id: Some(SessionId::new("session-usage")),
+            ..EventContext::default()
+        });
+        usage_event.sequence = 1;
+
+        let read_model = RuntimeReadModelInput::from_events(&[usage_event]);
+        let session = read_model
+            .details
+            .sessions
+            .iter()
+            .find(|entry| entry.session_id == "session-usage")
+            .expect("session runtime entry should exist");
+        let observation = session
+            .usage_observation
+            .as_ref()
+            .expect("usage observation should be recorded");
+
+        // 上下文窗口占用按 raw input + output,cache read 仍占窗口,不能按费用口径扣减。
+        assert_eq!(observation.context_window_tokens, 15_000);
+        assert_eq!(observation.resolved_model.as_deref(), Some("gpt-5-codex"));
+        assert_eq!(observation.observed_at, Some(UtcMillis(1_700_000_000_000)));
+        // event-bus 不计算窗口/告警,budget 留给 magi-api 装配。
+        assert!(session.budget.is_none());
+    }
+
+    #[test]
+    fn model_usage_recorded_prefers_total_tokens_for_context_window() {
+        let mut usage_event = EventEnvelope::audit(
+            EventId::new("event-model-usage-total-tokens"),
+            "model.usage.recorded",
+            json!({
+                "status": "success",
+                "usage": {
+                    "inputTokens": 12_000,
+                    "outputTokens": 3_000,
+                    "totalTokens": 18_000
+                },
+                "modelConfig": { "model": "gpt-5-codex" },
+                "timestamp": 1_700_000_000_000_u64
+            }),
+        )
+        .with_context(EventContext {
+            session_id: Some(SessionId::new("session-usage-total")),
+            ..EventContext::default()
+        });
+        usage_event.sequence = 1;
+
+        let read_model = RuntimeReadModelInput::from_events(&[usage_event]);
+        let observation = read_model
+            .details
+            .sessions
+            .iter()
+            .find(|entry| entry.session_id == "session-usage-total")
+            .and_then(|entry| entry.usage_observation.as_ref())
+            .expect("usage observation should be recorded");
+
+        assert_eq!(observation.context_window_tokens, 18_000);
+    }
+
+    fn usage_ledger_entry(
+        session_id: &str,
+        sequence: u64,
+        input_tokens: u64,
+        output_tokens: u64,
+        model: &str,
+        timestamp: u64,
+    ) -> crate::AuditUsageLedgerEntry {
+        crate::AuditUsageLedgerEntry {
+            event_id: format!("event-{session_id}-{sequence}"),
+            event_type: "model.usage.recorded".to_string(),
+            occurred_at: UtcMillis(timestamp),
+            sequence,
+            context: EventContext {
+                session_id: Some(SessionId::new(session_id)),
+                ..EventContext::default()
+            },
+            payload: json!({
+                "status": "success",
+                "usage": {
+                    "inputTokens": input_tokens,
+                    "outputTokens": output_tokens
+                },
+                "modelConfig": { "model": model },
+                "timestamp": timestamp
+            }),
+        }
+    }
+
+    #[test]
+    fn latest_usage_observations_from_ledger_keeps_highest_sequence_per_session() {
+        // 同一会话两条用量条目,乱序输入;应保留 sequence 更大的那条。
+        // 另含一条无 session 上下文与一条非 usage 事件,均应被忽略。
+        let mut noise = EventEnvelope::audit(
+            EventId::new("event-non-usage"),
+            "session.activity.recorded",
+            json!({ "status": "success" }),
+        );
+        noise.sequence = 99;
+        let noise_entry = crate::AuditUsageLedgerEntry {
+            event_id: "event-non-usage".to_string(),
+            event_type: "session.activity.recorded".to_string(),
+            occurred_at: UtcMillis(1_000),
+            sequence: 99,
+            context: EventContext {
+                session_id: Some(SessionId::new("session-a")),
+                ..EventContext::default()
+            },
+            payload: json!({ "status": "success" }),
+        };
+        let mut orphan = usage_ledger_entry("session-b", 5, 1_000, 0, "gpt-5-codex", 10);
+        orphan.context.session_id = None;
+
+        let entries = vec![
+            usage_ledger_entry("session-a", 7, 20_000, 1_000, "gpt-5-codex", 700),
+            usage_ledger_entry("session-a", 3, 5_000, 500, "gpt-5-codex", 300),
+            noise_entry,
+            orphan,
+        ];
+
+        let observations = latest_usage_observations_from_ledger(&entries);
+
+        assert_eq!(observations.len(), 1);
+        let observation = observations
+            .get("session-a")
+            .expect("session-a observation should be present");
+        // sequence 7 wins:20_000 input + 1_000 output.
+        assert_eq!(observation.context_window_tokens, 21_000);
+        assert_eq!(observation.observed_at, Some(UtcMillis(700)));
     }
 }

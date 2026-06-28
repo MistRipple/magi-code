@@ -1051,6 +1051,36 @@ mod tests {
         }
     }
 
+    struct StreamingThenFailingModelBridgeClient {
+        delta_content: String,
+        message: String,
+    }
+
+    impl ModelBridgeClient for StreamingThenFailingModelBridgeClient {
+        fn invoke(
+            &self,
+            _request: ModelInvocationRequest,
+        ) -> Result<BridgeResponse, BridgeClientError> {
+            Err(BridgeClientError::CallFailed {
+                layer: BridgeErrorLayer::RemoteBusiness,
+                code: Some(-32007),
+                message: self.message.clone(),
+            })
+        }
+
+        fn invoke_streaming(
+            &self,
+            request: ModelInvocationRequest,
+            on_delta: &dyn Fn(&ModelStreamingDelta),
+        ) -> Result<BridgeResponse, BridgeClientError> {
+            on_delta(&ModelStreamingDelta {
+                content: self.delta_content.clone(),
+                thinking: String::new(),
+            });
+            self.invoke(request)
+        }
+    }
+
     #[test]
     fn forced_tool_choice_only_applies_to_available_first_round_tool() {
         let request = SessionTurnExecutionRequest {
@@ -1262,6 +1292,100 @@ mod tests {
         assert!(turn.items.iter().any(|item| {
             item.kind == "assistant_error" && item.content.as_deref() == Some(error.as_str())
         }));
+    }
+
+    #[test]
+    fn partial_stream_failure_marks_turn_failed_instead_of_completed() {
+        let session_id = SessionId::new("session-partial-stream-failure");
+        let store = SessionStore::new();
+        store
+            .create_session(session_id.clone(), "partial stream failure")
+            .expect("session should be creatable");
+        let (_mission_id, orchestrator_thread_id) =
+            store.ensure_session_mission(&session_id, ts(915), || {
+                magi_core::MissionId::new("mission-partial-stream-failure")
+            });
+        store
+            .upsert_current_turn(
+                session_id.clone(),
+                ActiveExecutionTurn {
+                    turn_id: "turn-partial-stream-failure".to_string(),
+                    turn_seq: 1,
+                    accepted_at: ts(1_000),
+                    completed_at: None,
+                    status: "running".to_string(),
+                    user_message: Some("请输出长回复".to_string()),
+                    items: vec![session_turn_item(
+                        "user_message",
+                        "completed",
+                        None,
+                        Some("请输出长回复".to_string()),
+                        Some("user-partial-stream-failure".to_string()),
+                        orchestrator_thread_id,
+                    )],
+                },
+            )
+            .expect("current turn should be stored");
+        let client = StreamingThenFailingModelBridgeClient {
+            delta_content: "这是一段半截输出".to_string(),
+            message:
+                "provider response invalid: incomplete stream response: missing terminal SSE event"
+                    .to_string(),
+        };
+        let event_bus = InMemoryEventBus::new(16);
+        let request = SessionTurnExecutionRequest {
+            session_id: session_id.clone(),
+            turn_id: "turn-partial-stream-failure".to_string(),
+            workspace_id: None,
+            prompt: "请输出长回复".to_string(),
+            images: Vec::new(),
+            use_tools: false,
+            access_profile: AccessProfile::Restricted,
+            skill_name: None,
+            request_id: None,
+            user_message_id: None,
+            placeholder_message_id: None,
+            forced_tool_name: None,
+            required_tool_chain: Vec::new(),
+            workspace_root_path: None,
+        };
+
+        let error = match run_session_turn_execution(SessionTurnExecutionRuntime {
+            client: &client,
+            event_bus: &event_bus,
+            session_store: &store,
+            settings_store: None,
+            safety_gate: None,
+            tool_registry: None,
+            skill_runtime: None,
+            skill_dispatch_runtime: None,
+            skill_name: None,
+            snapshot_manager: None,
+            request,
+            prompt: "请输出长回复".to_string(),
+            tools: None,
+            persist_session_state: None,
+        }) {
+            Ok(_) => panic!("incomplete stream should fail the turn"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error, "模型服务暂时不可用，请稍后重试。");
+        let turn = store
+            .runtime_sidecar(&session_id)
+            .and_then(|sidecar| sidecar.current_turn)
+            .expect("failed turn should remain visible");
+        assert_eq!(turn.status, "failed");
+        assert!(turn.items.iter().any(|item| {
+            item.kind == "assistant_error" && item.content.as_deref() == Some(error.as_str())
+        }));
+        assert!(
+            !turn
+                .items
+                .iter()
+                .any(|item| item.kind == "assistant_stream" && item.status == "completed"),
+            "半截流失败后不能把 assistant_stream 结算为 completed"
+        );
     }
 
     #[test]

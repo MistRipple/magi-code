@@ -2,14 +2,17 @@ use crate::{
     change_projection::{PendingChangeDto, PendingChangesStateDto},
     dto::{
         AuditUsageLedgerDto, BridgePreflightSnapshotDto, BridgeServicesSnapshotDto,
-        MissionAggregateExport, RuntimeReadModelDto, ServiceInfo, runtime_read_model_dto,
+        MissionAggregateExport, RuntimeReadModelDto, ServiceInfo,
+        runtime_read_model_dto_with_usage,
     },
     errors::ApiError,
     public_canonical::{public_canonical_turn, public_event_envelope},
     state::ApiState,
 };
 use magi_core::{SessionId, UtcMillis};
-use magi_event_bus::{EventEnvelope, EventStreamSnapshot, RuntimeReadModelInput};
+use magi_event_bus::{
+    EventEnvelope, EventStreamSnapshot, RuntimeReadModelInput, SessionRuntimeUsageObservation,
+};
 use magi_session_store::{
     CanonicalTurn, NotificationRecord, SessionProjectionInput, SessionRecord,
     SessionRuntimeSidecarExport, TimelineEntry,
@@ -19,6 +22,7 @@ use magi_workspace::{
     WorkspaceRecoverySidecarExport,
 };
 use serde::Serialize;
+use std::collections::BTreeMap;
 
 const BOOTSTRAP_TIMELINE_PAGE_SIZE: usize = 50;
 const BOOTSTRAP_RECENT_EVENT_PAGE_SIZE: usize = 200;
@@ -78,7 +82,7 @@ impl BootstrapDto {
         state: &ApiState,
         session_projection: SessionProjectionInput,
     ) -> Result<Self, ApiError> {
-        let mut dto = Self::from_projection(
+        let mut dto = Self::from_projection_with_usage(
             state.runtime_epoch().to_string(),
             state.service_info.clone(),
             session_projection,
@@ -92,6 +96,7 @@ impl BootstrapDto {
             state.bridge_preflight_dto(),
             state.task_store(),
             state.collect_mission_aggregate_exports(),
+            &state.ledger_usage_observations(),
         );
         if let Some(current_session) = dto.current_session.as_ref() {
             let pending_projection =
@@ -123,6 +128,43 @@ impl BootstrapDto {
         task_store: Option<&magi_orchestrator::task_store::TaskStore>,
         mission_aggregate_exports: Vec<MissionAggregateExport>,
     ) -> Self {
+        Self::from_projection_with_usage(
+            runtime_epoch,
+            service,
+            session_projection,
+            workspace_projection,
+            session_sidecar_exports,
+            workspace_sidecar_exports,
+            event_snapshot,
+            runtime_read_model,
+            audit_usage_ledger,
+            bridge_services,
+            bridge_preflight,
+            task_store,
+            mission_aggregate_exports,
+            &BTreeMap::new(),
+        )
+    }
+
+    /// 与 [`BootstrapDto::from_projection`] 相同,但额外接收一份从持久化用量账本
+    /// 回放出的每会话用量观测值,在装配运行时读模型时用于回填重启后缺失的预算。
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_projection_with_usage(
+        runtime_epoch: String,
+        service: ServiceInfo,
+        session_projection: SessionProjectionInput,
+        workspace_projection: WorkspaceProjectionInput,
+        session_sidecar_exports: Vec<SessionRuntimeSidecarExport>,
+        workspace_sidecar_exports: Vec<WorkspaceRecoverySidecarExport>,
+        event_snapshot: EventStreamSnapshot,
+        runtime_read_model: RuntimeReadModelInput,
+        audit_usage_ledger: AuditUsageLedgerDto,
+        bridge_services: BridgeServicesSnapshotDto,
+        bridge_preflight: BridgePreflightSnapshotDto,
+        task_store: Option<&magi_orchestrator::task_store::TaskStore>,
+        mission_aggregate_exports: Vec<MissionAggregateExport>,
+        ledger_usage_observations: &BTreeMap<String, SessionRuntimeUsageObservation>,
+    ) -> Self {
         let current_session =
             session_projection
                 .current_session_id
@@ -134,13 +176,14 @@ impl BootstrapDto {
                         .find(|session| &session.session_id == session_id)
                         .cloned()
                 });
-        let runtime_read_model = runtime_read_model_dto(
+        let runtime_read_model = runtime_read_model_dto_with_usage(
             runtime_read_model,
             &session_sidecar_exports,
             &workspace_sidecar_exports,
             audit_usage_ledger.clone(),
             task_store,
             &mission_aggregate_exports,
+            ledger_usage_observations,
         );
 
         let mut dto = Self {

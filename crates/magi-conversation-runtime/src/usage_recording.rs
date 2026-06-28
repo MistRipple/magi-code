@@ -288,6 +288,7 @@ fn usage_tokens_from_payload(usage: Option<&serde_json::Value>) -> Option<UsageT
     Some(UsageTokenInput {
         input_tokens,
         output_tokens,
+        total_tokens: (total_tokens > 0).then_some(total_tokens),
         cache_read_tokens: included_cache_read_tokens.or(explicit_cache_read_tokens),
         cache_write_tokens: usage_u64_field(
             usage,
@@ -360,12 +361,14 @@ mod tests {
         let usage = usage_tokens_from_payload(Some(&json!({
             "input_tokens": 11,
             "output_tokens": 13,
+            "total_tokens": 31,
             "input_tokens_details": { "cached_tokens": 4 }
         })))
         .expect("usage tokens");
 
         assert_eq!(usage.input_tokens, 11);
         assert_eq!(usage.output_tokens, 13);
+        assert_eq!(usage.total_tokens, Some(31));
         assert_eq!(usage.cache_read_tokens, Some(4));
         assert!(usage.cache_read_included_in_input);
     }

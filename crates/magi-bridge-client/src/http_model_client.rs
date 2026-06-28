@@ -564,6 +564,7 @@ fn streaming_http_io(
     let mut last_content_delta_len = 0usize;
     let mut last_thinking_delta_len = 0usize;
     let mut saw_sse_event = false;
+    let mut saw_protocol_terminal = false;
     let mut raw_response = String::new();
 
     'stream_read: loop {
@@ -596,6 +597,13 @@ fn streaming_http_io(
             // OpenAI Chat Completions SSE 以 [DONE] 作为协议终止信号；不能继续等底层 TCP EOF。
             // 部分 tunnel / 代理会延迟关闭连接，继续读取会导致 UI 在内容完整后仍长时间显示响应中。
             if sse_event.data.trim() == "[DONE]" {
+                saw_protocol_terminal = true;
+                break 'stream_read;
+            }
+            if provider_family == ProviderFamily::Anthropic
+                && sse_event.event_type.as_deref() == Some("message_stop")
+            {
+                saw_protocol_terminal = true;
                 break 'stream_read;
             }
 
@@ -629,6 +637,16 @@ fn streaming_http_io(
             layer: BridgeErrorLayer::RemoteBusiness,
             code: Some(-32007),
             message: provider_non_sse_stream_message(&raw_response),
+        });
+    }
+
+    if !saw_protocol_terminal && !accumulator.saw_terminal() {
+        return Err(BridgeClientError::CallFailed {
+            layer: BridgeErrorLayer::RemoteBusiness,
+            code: Some(-32007),
+            message:
+                "provider response invalid: incomplete stream response: missing terminal SSE event"
+                    .to_string(),
         });
     }
 
@@ -2087,6 +2105,166 @@ mod tests {
         let body: serde_json::Value =
             serde_json::from_str(&recorded.body).expect("body should be json");
         assert_eq!(body["stream"], true);
+    }
+
+    #[test]
+    fn streaming_openai_partial_eof_without_terminal_event_is_error() {
+        let server = spawn_mock_server_with_response_text(
+            200,
+            "text/event-stream",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"半截回复\"},\"finish_reason\":null}]}\n\n"
+                .to_string(),
+        );
+
+        let client = HttpModelBridgeClient::new(
+            server.address.clone(),
+            Some("sk-test-key".to_string()),
+            "gpt-4.1-mini".to_string(),
+        );
+        let deltas = std::cell::RefCell::new(Vec::new());
+
+        let error = client
+            .invoke_streaming(
+                ModelInvocationRequest {
+                    provider: "openai-compatible".to_string(),
+                    prompt: "hello".to_string(),
+                    messages: None,
+                    tools: None,
+                    tool_choice: None,
+                },
+                &|delta| deltas.borrow_mut().push(delta.content.clone()),
+            )
+            .expect_err("缺少 [DONE]/finish_reason 的提前 EOF 不能被当成正常完成");
+
+        assert!(
+            error
+                .to_string()
+                .contains("incomplete stream response: missing terminal SSE event")
+        );
+        assert_eq!(deltas.into_inner(), vec!["半截回复".to_string()]);
+    }
+
+    #[test]
+    fn streaming_openai_finish_reason_without_done_marker_is_complete() {
+        let server = spawn_mock_server_with_response_text(
+            200,
+            "text/event-stream",
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"完整回复\"},\"finish_reason\":null}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            )
+            .to_string(),
+        );
+
+        let client = HttpModelBridgeClient::new(
+            server.address.clone(),
+            Some("sk-test-key".to_string()),
+            "gpt-4.1-mini".to_string(),
+        );
+
+        let response = client
+            .invoke_streaming(
+                ModelInvocationRequest {
+                    provider: "openai-compatible".to_string(),
+                    prompt: "hello".to_string(),
+                    messages: None,
+                    tools: None,
+                    tool_choice: None,
+                },
+                &|_| {},
+            )
+            .expect("finish_reason 已经证明 OpenAI 流完整");
+
+        let payload: serde_json::Value =
+            serde_json::from_str(&response.payload).expect("payload should be json");
+        assert_eq!(payload["content"], "完整回复");
+        assert_eq!(payload["finish_reason"], "stop");
+    }
+
+    #[test]
+    fn streaming_anthropic_partial_eof_without_message_stop_is_error() {
+        let server = spawn_mock_server_with_response_text(
+            200,
+            "text/event-stream",
+            concat!(
+                "event: message_start\ndata: {\"message\":{\"usage\":{\"input_tokens\":5,\"output_tokens\":0}}}\n\n",
+                "event: content_block_start\ndata: {\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+                "event: content_block_delta\ndata: {\"delta\":{\"type\":\"text_delta\",\"text\":\"半截 Claude 回复\"}}\n\n",
+                "event: content_block_stop\ndata: {\"index\":0}\n\n",
+            )
+            .to_string(),
+        );
+
+        let client = HttpModelBridgeClient::new_with_protocol(
+            server.address.clone(),
+            Some("sk-ant-test".to_string()),
+            "claude-sonnet-test".to_string(),
+            HttpModelBridgeProtocol::AnthropicMessages,
+            None,
+        );
+        let deltas = std::cell::RefCell::new(Vec::new());
+
+        let error = client
+            .invoke_streaming(
+                ModelInvocationRequest {
+                    provider: "anthropic".to_string(),
+                    prompt: "hello".to_string(),
+                    messages: None,
+                    tools: None,
+                    tool_choice: None,
+                },
+                &|delta| deltas.borrow_mut().push(delta.content.clone()),
+            )
+            .expect_err("缺少 message_stop/stop_reason 的 Anthropic 提前 EOF 不能完成 turn");
+
+        assert!(
+            error
+                .to_string()
+                .contains("incomplete stream response: missing terminal SSE event")
+        );
+        assert_eq!(deltas.into_inner(), vec!["半截 Claude 回复".to_string()]);
+    }
+
+    #[test]
+    fn streaming_anthropic_message_stop_marks_stream_complete() {
+        let server = spawn_mock_server_with_response_text(
+            200,
+            "text/event-stream",
+            concat!(
+                "event: message_start\ndata: {\"message\":{\"usage\":{\"input_tokens\":5,\"output_tokens\":0}}}\n\n",
+                "event: content_block_start\ndata: {\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+                "event: content_block_delta\ndata: {\"delta\":{\"type\":\"text_delta\",\"text\":\"完整 Claude 回复\"}}\n\n",
+                "event: content_block_stop\ndata: {\"index\":0}\n\n",
+                "event: message_stop\ndata: {}\n\n",
+            )
+            .to_string(),
+        );
+
+        let client = HttpModelBridgeClient::new_with_protocol(
+            server.address.clone(),
+            Some("sk-ant-test".to_string()),
+            "claude-sonnet-test".to_string(),
+            HttpModelBridgeProtocol::AnthropicMessages,
+            None,
+        );
+
+        let response = client
+            .invoke_streaming(
+                ModelInvocationRequest {
+                    provider: "anthropic".to_string(),
+                    prompt: "hello".to_string(),
+                    messages: None,
+                    tools: None,
+                    tool_choice: None,
+                },
+                &|_| {},
+            )
+            .expect("message_stop 已经证明 Anthropic 流完整");
+
+        let payload: serde_json::Value =
+            serde_json::from_str(&response.payload).expect("payload should be json");
+        assert_eq!(payload["content"], "完整 Claude 回复");
+        assert_eq!(payload["finish_reason"], "end_turn");
     }
 
     #[test]

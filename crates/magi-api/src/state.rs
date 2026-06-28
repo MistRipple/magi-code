@@ -4,7 +4,7 @@ use crate::dto::{
     BridgePreflightSnapshotProvider, BridgeProbeSnapshotProvider, BridgeServicesSnapshotDto,
     BridgeSnapshotProvider, DirectHttpModelProbeConfig, HealthDto, MissionAggregateExport,
     RuntimeReadModelDto, ServiceInfo, SessionTurnRequestDto, SessionTurnRouteDto,
-    VersionHandshakeDto, runtime_read_model_dto,
+    VersionHandshakeDto, runtime_read_model_dto_with_usage,
 };
 use crate::errors::ApiError;
 use crate::mcp_config::{
@@ -37,7 +37,7 @@ use magi_core::{
     SessionId, SessionLifecycleStatus, TaskId, TaskStatus, TaskTier, UtcMillis, WorkspaceId,
     WorkspaceRootPath,
 };
-use magi_event_bus::InMemoryEventBus;
+use magi_event_bus::{InMemoryEventBus, latest_usage_observations_from_ledger};
 use magi_governance::GovernanceService;
 use magi_knowledge_store::KnowledgeStore;
 use magi_memory_store::MemoryStore;
@@ -1157,14 +1157,27 @@ impl ApiState {
 
     pub fn runtime_read_model_dto(&self) -> RuntimeReadModelDto {
         let mission_aggregate_exports = self.collect_mission_aggregate_exports();
-        runtime_read_model_dto(
+        runtime_read_model_dto_with_usage(
             self.event_bus.runtime_read_model_input(),
             &self.session_store.execution_sidecar_exports(),
             &self.workspace_registry.recovery_sidecar_exports(),
             self.audit_usage_ledger_dto(),
             self.task_store(),
             &mission_aggregate_exports,
+            &self.ledger_usage_observations(),
         )
+    }
+
+    /// 从已恢复的审计/用量账本回放每会话最近一次用量观测值。
+    ///
+    /// 重启容错:守护进程重启后 event-bus 的 `recent_events` 缓冲区为空,只有持久化
+    /// 账本里仍保有 `model.usage.recorded`。DTO 装配用这份观测值回填按 sidecar 重建
+    /// 的会话,使预算在重启后不至于整体丢失。
+    pub fn ledger_usage_observations(
+        &self,
+    ) -> std::collections::BTreeMap<String, magi_event_bus::SessionRuntimeUsageObservation> {
+        let snapshot = self.event_bus.audit_usage_ledger_snapshot();
+        latest_usage_observations_from_ledger(&snapshot.usage_entries)
     }
 
     /// 跨 workspace 枚举所有可恢复 mission,组装派生属性导出。

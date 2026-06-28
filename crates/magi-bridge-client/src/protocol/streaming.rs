@@ -318,7 +318,15 @@ fn parse_anthropic_stream_event(event_type: Option<&str>, data: &str) -> Vec<Llm
             }
             chunks
         }
-        Some("message_stop") | Some("ping") | Some("error") => Vec::new(),
+        Some("message_stop") => vec![LlmStreamChunk {
+            kind: LlmStreamChunkType::ContentEnd,
+            content: None,
+            tool_call: None,
+            thinking: None,
+            usage: None,
+            stop_reason: None,
+        }],
+        Some("ping") | Some("error") => Vec::new(),
         _ => Vec::new(),
     }
 }
@@ -351,6 +359,7 @@ pub struct StreamAccumulator {
     active_tool_calls: Vec<ActiveToolCall>,
     usage: LlmUsage,
     stop_reason: Option<String>,
+    terminal: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -375,7 +384,10 @@ impl StreamAccumulator {
             LlmStreamChunkType::ContentEnd => {
                 // 捕获 stop_reason（来自 OpenAI finish_reason 或 Anthropic message_delta）
                 if let Some(ref reason) = chunk.stop_reason {
-                    self.stop_reason = Some(reason.clone());
+                    self.terminal = true;
+                    if self.stop_reason.is_none() {
+                        self.stop_reason = Some(reason.clone());
+                    }
                 }
             }
             LlmStreamChunkType::ToolCallStart => {
@@ -498,6 +510,10 @@ impl StreamAccumulator {
 
     pub fn pending_tool_call_count(&self) -> usize {
         self.active_tool_calls.len()
+    }
+
+    pub fn saw_terminal(&self) -> bool {
+        self.terminal
     }
 }
 
@@ -706,9 +722,12 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_stream_ignores_ping_and_stop() {
+    fn anthropic_stream_ignores_ping_and_marks_message_stop() {
         assert!(parse_anthropic_stream_event(Some("ping"), "{}").is_empty());
-        assert!(parse_anthropic_stream_event(Some("message_stop"), "{}").is_empty());
+        let chunks = parse_anthropic_stream_event(Some("message_stop"), "{}");
+        assert_eq!(chunks.len(), 1);
+        assert!(matches!(chunks[0].kind, LlmStreamChunkType::ContentEnd));
+        assert!(chunks[0].stop_reason.is_none());
     }
 
     #[test]
@@ -732,6 +751,7 @@ mod tests {
         });
 
         assert_eq!(acc.accumulated_content(), "Hello world");
+        assert!(!acc.saw_terminal());
         let result = acc.finalize();
         assert_eq!(result.content, "Hello world");
         assert!(result.tool_calls.is_empty());
@@ -782,6 +802,7 @@ mod tests {
         });
 
         assert_eq!(acc.pending_tool_call_count(), 1);
+        assert!(!acc.saw_terminal());
         let result = acc.finalize();
         assert_eq!(result.tool_calls.len(), 1);
         assert_eq!(result.tool_calls[0].id, "call_1");
@@ -873,6 +894,7 @@ mod tests {
             acc.apply_all(&chunks);
         }
 
+        assert!(acc.saw_terminal());
         let result = acc.finalize();
         assert_eq!(result.content, "Hi there");
         assert!(result.tool_calls.is_empty());
