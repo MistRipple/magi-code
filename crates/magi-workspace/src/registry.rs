@@ -512,6 +512,78 @@ mod tests {
     }
 
     #[test]
+    fn durable_records_reject_legacy_snake_case_fields() {
+        let legacy_payload = json!({
+            "active_workspace_id": "workspace-legacy-record",
+            "workspaces": [{
+                "workspace_id": "workspace-legacy-record",
+                "name": "legacy workspace",
+                "root_path": "/Users/xie/code/legacy",
+                "worktree_root": null,
+                "status": "Registered",
+                "created_at": 1,
+                "updated_at": 2
+            }],
+            "worktree_allocations": [],
+            "snapshots": [{
+                "snapshot_id": "snapshot-legacy",
+                "workspace_id": "workspace-legacy-record",
+                "ownership": {
+                    "session_id": null,
+                    "workspace_id": "workspace-legacy-record",
+                    "mission_id": null,
+                    "task_id": null,
+                    "worker_id": null,
+                    "execution_chain_ref": null
+                },
+                "label": "legacy snapshot",
+                "created_at": 3
+            }],
+            "recovery_handles": []
+        });
+
+        serde_json::from_value::<WorkspaceStoreState>(legacy_payload)
+            .expect_err("workspace 持久化 record 不得继续接受 legacy snake_case 字段");
+
+        let canonical_payload = json!({
+            "active_workspace_id": "workspace-canonical-record",
+            "workspaces": [{
+                "workspaceId": "workspace-canonical-record",
+                "name": "canonical workspace",
+                "rootPath": "/Users/xie/code/canonical",
+                "worktreeRoot": null,
+                "status": "Registered",
+                "createdAt": 1,
+                "updatedAt": 2
+            }],
+            "worktree_allocations": [],
+            "snapshots": [{
+                "snapshotId": "snapshot-canonical",
+                "workspaceId": "workspace-canonical-record",
+                "ownership": {
+                    "session_id": null,
+                    "workspace_id": "workspace-canonical-record",
+                    "mission_id": null,
+                    "task_id": null,
+                    "worker_id": null,
+                    "execution_chain_ref": null
+                },
+                "label": "canonical snapshot",
+                "createdAt": 3
+            }],
+            "recovery_handles": []
+        });
+
+        let state: WorkspaceStoreState =
+            serde_json::from_value(canonical_payload).expect("canonical durable records");
+        assert_eq!(
+            state.workspaces[0].workspace_id.as_str(),
+            "workspace-canonical-record"
+        );
+        assert_eq!(state.snapshots[0].snapshot_id, "snapshot-canonical");
+    }
+
+    #[test]
     fn register_rejects_duplicate_root_path_with_different_workspace_id() {
         let store = WorkspaceStore::new();
         store

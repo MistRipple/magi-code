@@ -16,27 +16,16 @@ pub enum SessionExecutionSidecarStatus {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SessionRecord {
-    #[serde(alias = "session_id")]
     pub session_id: SessionId,
     pub title: String,
     pub status: SessionLifecycleStatus,
-    #[serde(alias = "created_at")]
     pub created_at: UtcMillis,
-    #[serde(alias = "updated_at")]
     pub updated_at: UtcMillis,
-    #[serde(
-        default,
-        alias = "message_count",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message_count: Option<usize>,
-    #[serde(
-        default,
-        alias = "workspace_id",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<String>,
 }
 
@@ -661,15 +650,12 @@ pub enum TimelineEntryKind {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TimelineEntry {
-    #[serde(alias = "entry_id")]
     pub entry_id: String,
-    #[serde(alias = "session_id")]
     pub session_id: SessionId,
     pub kind: TimelineEntryKind,
     pub message: String,
-    #[serde(alias = "occurred_at")]
     pub occurred_at: UtcMillis,
 }
 
@@ -682,11 +668,9 @@ pub fn timeline_entry_visible_text(message: &str) -> Option<String> {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct NotificationRecord {
-    #[serde(alias = "notification_id")]
     pub notification_id: String,
-    #[serde(alias = "session_id")]
     pub session_id: SessionId,
     pub kind: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -696,7 +680,6 @@ pub struct NotificationRecord {
     pub message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
-    #[serde(alias = "created_at")]
     pub created_at: UtcMillis,
     pub handled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]

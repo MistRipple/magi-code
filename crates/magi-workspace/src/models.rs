@@ -5,19 +5,14 @@ use magi_core::{
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WorkspaceRecord {
-    #[serde(alias = "workspace_id")]
     pub workspace_id: WorkspaceId,
     pub name: Option<String>,
-    #[serde(alias = "root_path")]
     pub root_path: AbsolutePath,
-    #[serde(alias = "worktree_root")]
     pub worktree_root: Option<AbsolutePath>,
     pub status: WorkspaceLifecycleStatus,
-    #[serde(alias = "created_at")]
     pub created_at: UtcMillis,
-    #[serde(alias = "updated_at")]
     pub updated_at: UtcMillis,
 }
 
@@ -33,15 +28,12 @@ pub struct WorktreeAllocation {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SnapshotRecord {
-    #[serde(alias = "snapshot_id")]
     pub snapshot_id: String,
-    #[serde(alias = "workspace_id")]
     pub workspace_id: WorkspaceId,
     pub ownership: ExecutionOwnership,
     pub label: String,
-    #[serde(alias = "created_at")]
     pub created_at: UtcMillis,
 }
 

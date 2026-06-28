@@ -1162,6 +1162,82 @@ fn sidecar_rejects_legacy_recovery_ref_json() {
 }
 
 #[test]
+fn durable_records_reject_legacy_snake_case_fields() {
+    let legacy_payload = json!({
+        "current_session_id": "session-legacy-record",
+        "sessions": [{
+            "session_id": "session-legacy-record",
+            "title": "legacy session",
+            "status": "Active",
+            "created_at": 1,
+            "updated_at": 2,
+            "message_count": 1,
+            "workspace_id": "workspace-legacy"
+        }],
+        "timeline": [{
+            "entry_id": "entry-legacy",
+            "session_id": "session-legacy-record",
+            "kind": "UserMessage",
+            "message": "legacy",
+            "occurred_at": 3
+        }],
+        "runtime_sidecars": [],
+        "notifications": [{
+            "notification_id": "notification-legacy",
+            "session_id": "session-legacy-record",
+            "kind": "info",
+            "message": "legacy notification",
+            "created_at": 4,
+            "handled": false
+        }]
+    });
+
+    serde_json::from_value::<SessionStoreState>(legacy_payload)
+        .expect_err("session 持久化外层 record 不得继续接受 legacy snake_case 字段");
+
+    let canonical_payload = json!({
+        "current_session_id": "session-canonical-record",
+        "sessions": [{
+            "sessionId": "session-canonical-record",
+            "title": "canonical session",
+            "status": "Active",
+            "createdAt": 1,
+            "updatedAt": 2,
+            "messageCount": 1,
+            "workspaceId": "workspace-canonical"
+        }],
+        "timeline": [{
+            "entryId": "entry-canonical",
+            "sessionId": "session-canonical-record",
+            "kind": "UserMessage",
+            "message": "canonical",
+            "occurredAt": 3
+        }],
+        "runtime_sidecars": [],
+        "notifications": [{
+            "notificationId": "notification-canonical",
+            "sessionId": "session-canonical-record",
+            "kind": "info",
+            "message": "canonical notification",
+            "createdAt": 4,
+            "handled": false
+        }]
+    });
+
+    let state: SessionStoreState =
+        serde_json::from_value(canonical_payload).expect("canonical durable records");
+    assert_eq!(
+        state.sessions[0].session_id.as_str(),
+        "session-canonical-record"
+    );
+    assert_eq!(state.timeline[0].entry_id, "entry-canonical");
+    assert_eq!(
+        state.notifications[0].notification_id,
+        "notification-canonical"
+    );
+}
+
+#[test]
 fn persisted_parts_round_trip_preserves_sidecars() {
     let store = SessionStore::new();
     let session_id = SessionId::new("session-persisted");
