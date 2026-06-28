@@ -430,7 +430,9 @@ impl LlmTaskDispatcher {
         execution_registry: TaskExecutionRegistry,
         result_receiver: Arc<EventBasedResultReceiver>,
         spawn_graph: Arc<std::sync::Mutex<magi_spawn_graph::SpawnGraph>>,
+        mission_state_root: PathBuf,
     ) -> Self {
+        let mission_state_root = mission_state_root;
         Self {
             event_bus,
             pipeline,
@@ -453,22 +455,42 @@ impl LlmTaskDispatcher {
             agent_role_registry: None,
             spawn_graph,
             todo_ledger_registry: Arc::new(magi_todo_ledger::TodoLedgerRegistry::new()),
-            project_memory_registry: Arc::new(magi_project_memory::ProjectMemoryRegistry::new()),
-            mission_charter_registry: Arc::new(magi_mission_charter::MissionCharterRegistry::new()),
-            plan_registry: Arc::new(magi_plan::PlanRegistry::new()),
+            project_memory_registry: Arc::new(
+                magi_project_memory::ProjectMemoryRegistry::with_home(mission_state_root.clone()),
+            ),
+            mission_charter_registry: Arc::new(
+                magi_mission_charter::MissionCharterRegistry::with_home(mission_state_root.clone()),
+            ),
+            plan_registry: Arc::new(magi_plan::PlanRegistry::with_magi_home(
+                mission_state_root.clone(),
+            )),
             mission_workspace_registry: Arc::new(
-                magi_mission_workspace::MissionWorkspaceRegistry::new(),
+                magi_mission_workspace::MissionWorkspaceRegistry::with_magi_home(
+                    mission_state_root.clone(),
+                ),
             ),
-            knowledge_graph_registry: Arc::new(magi_knowledge_graph::KnowledgeGraphRegistry::new()),
+            knowledge_graph_registry: Arc::new(
+                magi_knowledge_graph::KnowledgeGraphRegistry::with_magi_home(
+                    mission_state_root.clone(),
+                ),
+            ),
             validation_runner_registry: Arc::new(
-                magi_validation_runner::ValidationRunnerRegistry::new(),
+                magi_validation_runner::ValidationRunnerRegistry::with_magi_home(
+                    mission_state_root.clone(),
+                ),
             ),
-            checkpoint_registry: Arc::new(magi_checkpoint::CheckpointRegistry::new()),
+            checkpoint_registry: Arc::new(magi_checkpoint::CheckpointRegistry::with_magi_home(
+                mission_state_root.clone(),
+            )),
             human_checkpoint_registry: Arc::new(
-                magi_human_checkpoint::HumanCheckpointRegistry::new(),
+                magi_human_checkpoint::HumanCheckpointRegistry::with_magi_home(
+                    mission_state_root.clone(),
+                ),
             ),
             lifecycle_notices: None,
-            mission_metrics_registry: Arc::new(MissionMetricsRegistry::new()),
+            mission_metrics_registry: Arc::new(MissionMetricsRegistry::with_home(
+                mission_state_root,
+            )),
         }
     }
 
@@ -2229,9 +2251,16 @@ mod tests {
             TaskExecutionRegistry::default(),
             Arc::new(EventBasedResultReceiver::new()),
             Arc::new(std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new())),
+            test_mission_state_root("dispatcher-default-tool-surface"),
         )
         .with_tool_registry(tool_registry)
         .with_agent_role_registry(Arc::new(magi_agent_role::AgentRoleRegistry::load_default()))
+    }
+
+    fn test_mission_state_root(label: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("magi-{label}-{}", UtcMillis::now().0));
+        std::fs::create_dir_all(&root).expect("test mission state root should create");
+        root
     }
 
     #[test]

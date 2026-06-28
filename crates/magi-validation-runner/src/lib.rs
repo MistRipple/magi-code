@@ -13,7 +13,7 @@
 //! 真正去跑 cargo test / tsc / smoke 的活，由 Validation 任务通过 shell_exec 等基础
 //! 工具完成；本 crate 不替它跑命令，只回填结论——保持职责单一、与 Plan 解耦。
 //!
-//! 物理存储：`~/.magi/projects/{slug}/missions/{mission_id}/validation.md`。
+//! 物理存储：`{magi_home}/projects/{slug}/missions/{mission_id}/validation.md`。
 //! 单 mission 单文档，frontmatter 描述元信息，body 用 JSON-lines 记录每条 record。
 //! 这样既可 grep / diff，又能 round-trip 无损——与同 Tier 的 KnowledgeGraph 同构。
 
@@ -150,8 +150,6 @@ impl ValidationReport {
 
 #[derive(Debug, Error)]
 pub enum ValidationError {
-    #[error("无法解析 home 目录")]
-    HomeDirUnavailable,
     #[error("validation 数据缺失或非法：{reason}")]
     InvalidRecord { reason: String },
     #[error("validation IO 失败 (path={path}): {source}")]
@@ -168,11 +166,6 @@ pub struct ValidationStore {
 }
 
 impl ValidationStore {
-    pub fn open(workspace_root: &WorkspaceRootPath) -> Result<Self, ValidationError> {
-        let home = dirs_home()?;
-        Self::open_with_home(&home, workspace_root)
-    }
-
     pub fn open_with_home(
         magi_home: &Path,
         workspace_root: &WorkspaceRootPath,
@@ -278,17 +271,7 @@ pub struct ValidationRunnerRegistry {
     magi_home: PathBuf,
 }
 
-impl Default for ValidationRunnerRegistry {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl ValidationRunnerRegistry {
-    pub fn new() -> Self {
-        Self::with_magi_home(dirs_home().expect("HOME 目录不可用，无法定位 Magi 状态根"))
-    }
-
     pub fn with_magi_home(magi_home: impl Into<PathBuf>) -> Self {
         let magi_home = magi_home.into();
         let _ = fs::create_dir_all(&magi_home);
@@ -514,14 +497,6 @@ fn parse_report(raw: &str) -> Result<ValidationReport, ValidationError> {
         created_at,
         updated_at,
     })
-}
-// --- helpers
-
-fn dirs_home() -> Result<PathBuf, ValidationError> {
-    let base = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or(ValidationError::HomeDirUnavailable)?;
-    Ok(base.join(".magi"))
 }
 // --- Tool entry：`validation_record` 工具执行体
 

@@ -1324,7 +1324,6 @@ dependencies = [
 name = "magi-project-memory"
 version = "3.0.0"
 dependencies = [
- "dirs",
  "magi-core",
  "magi-event-bus",
  "serde",

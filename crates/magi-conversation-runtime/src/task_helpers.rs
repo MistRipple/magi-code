@@ -471,8 +471,8 @@ pub fn task_required_tool_chain(
     }
     let normalized = task.goal.to_ascii_lowercase();
     let mut matches: Vec<(&'static str, usize)> = Vec::new();
-    for (alias, canonical_name) in public_builtin_tool_reference_aliases() {
-        let Some(position) = tool_reference_position(&normalized, alias) else {
+    for canonical_name in public_builtin_tool_references() {
+        let Some(position) = tool_reference_position(&normalized, canonical_name) else {
             continue;
         };
         if let Some((_, existing_position)) =
@@ -551,15 +551,14 @@ fn push_first_semantic_match(
     matches.push((tool_name, position));
 }
 
-pub fn public_builtin_tool_reference_aliases() -> Vec<(&'static str, &'static str)> {
-    let mut aliases = Vec::new();
+pub fn public_builtin_tool_references() -> Vec<&'static str> {
+    let mut references = Vec::new();
     for tool in BuiltinToolName::ALL {
         if tool.is_public_tool_surface() && !tool.is_runtime_internal_tool_call() {
-            let name = tool.as_str();
-            aliases.push((name, name));
+            references.push(tool.as_str());
         }
     }
-    aliases
+    references
 }
 
 pub fn tool_reference_position(text: &str, tool_name: &str) -> Option<usize> {

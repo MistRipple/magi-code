@@ -13,7 +13,7 @@
 //! Checkpoint 是**append-only**：每次创建都是新的不可变记录，绝不就地修改历史 Checkpoint
 //! ——否则"恢复到 Tn"的语义会被悄悄改写。版本不在单条 record 上递增，而在序号上累积。
 //!
-//! 物理存储：`~/.magi/projects/{slug}/missions/{mission_id}/checkpoints.md`。
+//! 物理存储：`{magi_home}/projects/{slug}/missions/{mission_id}/checkpoints.md`。
 //! 单 mission 单文档，frontmatter 描述元信息，body 用 JSON-lines 记录每个 Checkpoint。
 //! 这样既可 grep / diff，又能 round-trip 无损——与同 Tier 的 ValidationReport / KG 同构。
 
@@ -235,8 +235,6 @@ impl CheckpointLog {
 
 #[derive(Debug, Error)]
 pub enum CheckpointError {
-    #[error("无法解析 home 目录")]
-    HomeDirUnavailable,
     #[error("checkpoint 数据缺失或非法：{reason}")]
     InvalidRecord { reason: String },
     /// §1.4「恢复集不完整时必须显式失败」：试图把恢复关键 kind
@@ -373,17 +371,7 @@ pub struct CheckpointRegistry {
     magi_home: PathBuf,
 }
 
-impl Default for CheckpointRegistry {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl CheckpointRegistry {
-    pub fn new() -> Self {
-        Self::with_magi_home(dirs_home().expect("HOME 目录不可用，无法定位 Magi 状态根"))
-    }
-
     pub fn with_magi_home(magi_home: impl Into<PathBuf>) -> Self {
         let magi_home = magi_home.into();
         let _ = fs::create_dir_all(&magi_home);
@@ -648,14 +636,6 @@ fn parse_log(raw: &str) -> Result<CheckpointLog, CheckpointError> {
         created_at,
         updated_at,
     })
-}
-// --- helpers
-
-fn dirs_home() -> Result<PathBuf, CheckpointError> {
-    let base = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or(CheckpointError::HomeDirUnavailable)?;
-    Ok(base.join(".magi"))
 }
 // --- Orchestration tool entry：checkpoint_create
 

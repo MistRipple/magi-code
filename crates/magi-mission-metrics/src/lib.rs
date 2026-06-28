@@ -373,10 +373,6 @@ pub struct MissionMetricsRegistry {
 }
 
 impl MissionMetricsRegistry {
-    pub fn new() -> Self {
-        Self::with_home(dirs_home().expect("HOME 目录不可用，无法定位 Magi 状态根"))
-    }
-
     pub fn with_home(home: PathBuf) -> Self {
         let _ = fs::create_dir_all(&home);
         Self {
@@ -407,18 +403,6 @@ impl MissionMetricsRegistry {
             .insert(key, arc.clone());
         Ok(arc)
     }
-}
-
-impl Default for MissionMetricsRegistry {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-fn dirs_home() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(|h| PathBuf::from(h).join(".magi"))
 }
 
 #[cfg(test)]

@@ -1,7 +1,7 @@
 //! 任务系统 L17 — Mission Workspace.
 //!
 //! C 档 Mission 独占的工作目录。落在
-//! `~/.magi/projects/{slug}/missions/{mission_id}/workspace/` 下，包含：
+//! `{magi_home}/projects/{slug}/missions/{mission_id}/workspace/` 下，包含：
 //!
 //! - `artifacts/` — Mission 过程中产出的中间/最终交付物
 //! - `logs/` — Mission 跨进程的日志归档
@@ -29,8 +29,6 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum MissionWorkspaceError {
-    #[error("HOME 目录不可用，无法定位 ~/.magi/projects/.../missions/.../workspace")]
-    HomeDirUnavailable,
     #[error("mission workspace 路径 {path} 读写失败: {source}")]
     Io {
         path: PathBuf,
@@ -53,11 +51,6 @@ pub struct MissionWorkspaceStore {
 }
 
 impl MissionWorkspaceStore {
-    pub fn open(workspace_root: &WorkspaceRootPath) -> Result<Self, MissionWorkspaceError> {
-        let home = dirs_home()?;
-        Self::open_with_home(&home, workspace_root)
-    }
-
     pub fn open_with_home(
         magi_home: &Path,
         workspace_root: &WorkspaceRootPath,
@@ -138,17 +131,7 @@ pub struct MissionWorkspaceRegistry {
     magi_home: PathBuf,
 }
 
-impl Default for MissionWorkspaceRegistry {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl MissionWorkspaceRegistry {
-    pub fn new() -> Self {
-        Self::with_magi_home(dirs_home().expect("HOME 目录不可用，无法定位 Magi 状态根"))
-    }
-
     pub fn with_magi_home(magi_home: impl Into<PathBuf>) -> Self {
         let magi_home = magi_home.into();
         let _ = fs::create_dir_all(&magi_home);
@@ -171,13 +154,7 @@ impl MissionWorkspaceRegistry {
         {
             return Ok(store.clone());
         }
-        let store = match MissionWorkspaceStore::open(workspace_root) {
-            Ok(store) => store,
-            Err(MissionWorkspaceError::HomeDirUnavailable) => {
-                MissionWorkspaceStore::open_with_home(&self.magi_home, workspace_root)?
-            }
-            Err(err) => return Err(err),
-        };
+        let store = MissionWorkspaceStore::open_with_home(&self.magi_home, workspace_root)?;
         let arc = Arc::new(store);
         self.inner
             .write()
@@ -185,13 +162,6 @@ impl MissionWorkspaceRegistry {
             .insert(key, arc.clone());
         Ok(arc)
     }
-}
-
-fn dirs_home() -> Result<PathBuf, MissionWorkspaceError> {
-    let base = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or(MissionWorkspaceError::HomeDirUnavailable)?;
-    Ok(base.join(".magi"))
 }
 
 #[cfg(test)]

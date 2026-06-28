@@ -15,7 +15,7 @@
 //! HumanCheckpoint **可以**被 resolve 改写一次（pending → approved/rejected），但
 //! 一旦 resolve 完成就不再允许再次修改——保留"为什么停、谁批的、何时批的"的审计链。
 //!
-//! 物理存储：`~/.magi/projects/{slug}/missions/{mission_id}/human_checkpoints.md`。
+//! 物理存储：`{magi_home}/projects/{slug}/missions/{mission_id}/human_checkpoints.md`。
 //! 单 mission 单文档，frontmatter 描述元信息，body 用 JSON-lines 记录每条请求。
 
 use magi_core::{MissionId, UtcMillis, WorkspaceRootPath};
@@ -138,8 +138,6 @@ impl HumanCheckpointLog {
 
 #[derive(Debug, Error)]
 pub enum HumanCheckpointError {
-    #[error("无法解析 home 目录")]
-    HomeDirUnavailable,
     #[error("human_checkpoint 数据缺失或非法：{reason}")]
     InvalidRecord { reason: String },
     #[error("human_checkpoint #{sequence} 不存在")]
@@ -371,17 +369,7 @@ pub struct HumanCheckpointRegistry {
     magi_home: PathBuf,
 }
 
-impl Default for HumanCheckpointRegistry {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl HumanCheckpointRegistry {
-    pub fn new() -> Self {
-        Self::with_magi_home(dirs_home().expect("HOME 目录不可用，无法定位 Magi 状态根"))
-    }
-
     pub fn with_magi_home(magi_home: impl Into<PathBuf>) -> Self {
         let magi_home = magi_home.into();
         let _ = fs::create_dir_all(&magi_home);
@@ -592,14 +580,6 @@ fn parse_log(raw: &str) -> Result<HumanCheckpointLog, HumanCheckpointError> {
         created_at,
         updated_at,
     })
-}
-// --- helpers
-
-fn dirs_home() -> Result<PathBuf, HumanCheckpointError> {
-    let base = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or(HumanCheckpointError::HomeDirUnavailable)?;
-    Ok(base.join(".magi"))
 }
 // --- Orchestration tool entry：human_checkpoint_request
 

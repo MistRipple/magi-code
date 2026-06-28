@@ -4,7 +4,7 @@
 //! 把"为什么做、做到什么程度算完、有什么硬约束"沉淀为可读 markdown 文件，
 //! 后续每轮 Turn 自动注入 orchestrator system prompt，避免长对话偏题。
 //!
-//! 物理存储：`~/.magi/projects/{slug}/missions/{mission_id}/charter.md`。
+//! 物理存储：`{magi_home}/projects/{slug}/missions/{mission_id}/charter.md`。
 //! - 与 ProjectMemory 共用同一个 slug 派生策略（绝对路径 `/` → `-`）。
 //! - 与 mission 同生命周期，mission 结束后保留作为"已交付契约"档案。
 //!
@@ -114,8 +114,6 @@ impl MissionCharter {
 
 #[derive(Debug, Error)]
 pub enum MissionCharterError {
-    #[error("无法解析 home 目录")]
-    HomeDirUnavailable,
     #[error("charter 数据缺失或非法：{reason}")]
     InvalidCharter { reason: String },
     /// frozen 后写入未绑定 approval 或 approval 不可用。
@@ -210,18 +208,13 @@ pub fn validate_charter(charter: &MissionCharter) -> Result<(), MissionCharterEr
 }
 // --- Store
 
-/// 单 workspace 范围的 mission charter 存储：负责 `~/.magi/projects/{slug}/missions/` 下
+/// 单 workspace 范围的 mission charter 存储：负责 `{magi_home}/projects/{slug}/missions/` 下
 /// 所有 mission 的 charter.md 读写。
 pub struct MissionCharterStore {
     root: PathBuf,
 }
 
 impl MissionCharterStore {
-    pub fn open(workspace_root: &WorkspaceRootPath) -> Result<Self, MissionCharterError> {
-        let home = dirs_home()?;
-        Self::open_with_home(&home, workspace_root)
-    }
-
     pub fn open_with_home(
         magi_home: &Path,
         workspace_root: &WorkspaceRootPath,
@@ -325,10 +318,6 @@ pub struct MissionCharterRegistry {
 }
 
 impl MissionCharterRegistry {
-    pub fn new() -> Self {
-        Self::with_home(dirs_home().expect("HOME 目录不可用，无法定位 Magi 状态根"))
-    }
-
     pub fn with_home(home: PathBuf) -> Self {
         let _ = fs::create_dir_all(&home);
         Self {
@@ -361,11 +350,6 @@ impl MissionCharterRegistry {
     }
 }
 
-impl Default for MissionCharterRegistry {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 // --- Tool argument parsing
 
 /// `mission_charter_write` 工具入参形态。
@@ -741,14 +725,6 @@ fn parse_bullets(section: &str) -> Vec<String> {
             }
         })
         .collect()
-}
-// --- 工具
-
-fn dirs_home() -> Result<PathBuf, MissionCharterError> {
-    let home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .ok_or(MissionCharterError::HomeDirUnavailable)?;
-    Ok(PathBuf::from(home).join(".magi"))
 }
 // --- Tool entry：`mission_charter_write` 工具执行体
 

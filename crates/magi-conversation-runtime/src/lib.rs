@@ -59,7 +59,7 @@ pub use task_helpers::{
     deterministic_execution_tool_validation_content, deterministic_planning_content,
     deterministic_planning_validation_content, deterministic_task_final_content, extract_task_goal,
     forced_task_tool_choice_for_round, is_execution_tool_validation, is_planning_no_tool_action,
-    is_planning_text_validation, is_tool_reference_boundary, public_builtin_tool_reference_aliases,
+    is_planning_text_validation, is_tool_reference_boundary, public_builtin_tool_references,
     record_completed_required_tools, required_tool_chain_is_complete,
     required_tool_chain_recovery_prompt, task_required_tool_chain, task_tool_failure_reason,
     task_turn_visibility, tool_call_round_limit, tool_reference_position,

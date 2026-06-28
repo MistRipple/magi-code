@@ -8,7 +8,7 @@ use magi_conversation_runtime::session_turn_execution::{
 };
 use magi_conversation_runtime::session_writeback::publish_current_session_turn_item_event;
 use magi_conversation_runtime::{
-    MailboxAuthor, MailboxKind, RuntimeSignal, public_builtin_tool_reference_aliases,
+    MailboxAuthor, MailboxKind, RuntimeSignal, public_builtin_tool_references,
     task_execution_registry::TaskExecutionPlan, tool_reference_position,
 };
 use magi_core::TaskStatus;
@@ -567,12 +567,6 @@ fn local_session_turn_intent_decision(
     request: &SessionTurnRequestDto,
     has_recoverable_chain: bool,
 ) -> SessionTurnIntentDecision {
-    let skill_name = request
-        .skill_name
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("");
     let requests_explicit_task_or_agent =
         session_turn_requests_explicit_task_or_agent_mode(request);
     let requests_simple_execution = session_turn_requests_simple_execution_by_local_rules(request)
@@ -580,7 +574,6 @@ fn local_session_turn_intent_decision(
     let route = if has_recoverable_chain && session_turn_requests_continue_existing_task(request) {
         SessionTurnRouteDto::Continue
     } else if requests_explicit_task_or_agent
-        || !skill_name.is_empty()
         || (session_turn_requests_task_by_local_rules(request) && !requests_simple_execution)
     {
         SessionTurnRouteDto::Task
@@ -1093,8 +1086,8 @@ fn session_turn_requested_public_builtin_tools(
 ) -> Option<RequestedBuiltinTools> {
     let normalized = request.trimmed_text()?.to_ascii_lowercase();
     let mut matches: Vec<(&'static str, usize)> = Vec::new();
-    for (alias, canonical_name) in public_builtin_tool_reference_aliases() {
-        let Some(position) = tool_reference_position(&normalized, alias) else {
+    for canonical_name in public_builtin_tool_references() {
+        let Some(position) = tool_reference_position(&normalized, canonical_name) else {
             continue;
         };
         if let Some((_, existing_position)) =
@@ -1151,7 +1144,6 @@ fn session_turn_task_route_has_creation_evidence(decision: &SessionTurnIntentDec
             | "implementation_or_fix"
             | "requires_structured_execution"
             | "image_task"
-            | "skill_task"
     ) {
         return false;
     }
@@ -3411,6 +3403,70 @@ mod tests {
         assert!(matches!(decision.route, SessionTurnRouteDto::Task));
     }
 
+    #[test]
+    fn instruction_skill_alone_stays_on_regular_chat_route() {
+        let state = test_state();
+        let mut request = session_turn_request("");
+        request.skill_name = Some("huashu-design".to_string());
+
+        let decision = decide_session_turn_with_task_planner(&state, &request)
+            .expect("instruction skill should not require task projection");
+
+        assert!(matches!(decision.route, SessionTurnRouteDto::Chat));
+        assert_eq!(decision.reason_code.as_deref(), Some("plain_chat"));
+        assert!(
+            decision.task_evidence.is_empty(),
+            "instruction skill 只是 turn 上下文，不是任务创建证据"
+        );
+    }
+
+    #[test]
+    fn instruction_skill_with_plain_text_does_not_create_task_projection() {
+        let state = test_state();
+        let mut request = session_turn_request("帮我润色这段说明");
+        request.skill_name = Some("talk-normal".to_string());
+
+        let decision = decide_session_turn_with_task_planner(&state, &request)
+            .expect("plain instruction skill turn should route");
+
+        assert!(matches!(decision.route, SessionTurnRouteDto::Chat));
+        assert!(decision.execution_goal.is_none());
+        assert!(decision.task_evidence.is_empty());
+    }
+
+    #[test]
+    fn instruction_skill_keeps_workspace_inspection_on_execute_route() {
+        let state = test_state();
+        let mut request = session_turn_request("分析当前项目");
+        request.skill_name = Some("cn-engineering-standard".to_string());
+
+        let decision = decide_session_turn_with_task_planner(&state, &request)
+            .expect("workspace inspection with skill should route to executable chat turn");
+
+        assert!(matches!(decision.route, SessionTurnRouteDto::Execute));
+        assert_eq!(
+            decision.reason_code.as_deref(),
+            Some("workspace_inspection_request")
+        );
+        assert!(decision.execution_goal.is_none());
+        assert!(decision.task_evidence.is_empty());
+    }
+
+    #[test]
+    fn instruction_skill_with_explicit_task_text_still_uses_task_route() {
+        let state = test_state();
+        let mut request = session_turn_request("以任务模式修复登录问题，完成后运行测试");
+        request.skill_name = Some("cn-engineering-standard".to_string());
+
+        let decision = decide_session_turn_with_task_planner(&state, &request)
+            .expect("explicit task text should still create task projection");
+
+        assert!(matches!(decision.route, SessionTurnRouteDto::Task));
+        assert_eq!(decision.task_tier, TaskTier::ExecutionChain);
+        assert!(decision.execution_goal.is_some());
+        assert!(!decision.task_evidence.is_empty());
+    }
+
     #[tokio::test]
     async fn session_turn_rejects_missing_workspace_scope() {
         let (status, body) = post_json(
@@ -3992,12 +4048,26 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_public_builtin_alias_to_canonical_tool() {
-        let request = session_turn_request("请调用 file_view 工具查看 /tmp/a.txt");
+    fn normalizes_canonical_public_builtin_tool_to_forced_execution() {
+        let request = session_turn_request("请调用 file_read 工具查看 /tmp/a.txt");
         let decision = normalize_session_turn_decision(classifier_chat_decision(), &request);
 
         assert!(matches!(decision.route, SessionTurnRouteDto::Execute));
         assert_eq!(decision.forced_tool_name.as_deref(), Some("file_read"));
+    }
+
+    #[test]
+    fn legacy_public_builtin_alias_does_not_force_execution() {
+        let request = session_turn_request("请调用 file_view 工具查看 /tmp/a.txt");
+        let decision = normalize_session_turn_decision(classifier_chat_decision(), &request);
+
+        assert!(matches!(decision.route, SessionTurnRouteDto::Chat));
+        assert!(decision.forced_tool_name.is_none());
+        assert!(decision.required_tool_chain.is_empty());
+        assert!(
+            decision.tool_intent.is_none(),
+            "会话路由层不应恢复旧工具别名到 canonical 工具名"
+        );
     }
 
     #[test]

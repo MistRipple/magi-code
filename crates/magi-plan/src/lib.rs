@@ -9,7 +9,7 @@
 //! - Plan 是计划，按澄清/复盘节奏变更，跨 session 共享；
 //! - TodoLedger 是临时清单，session 内可任意改写。
 //!
-//! 物理存储：`~/.magi/projects/{slug}/missions/{mission_id}/plan.md`，
+//! 物理存储：`{magi_home}/projects/{slug}/missions/{mission_id}/plan.md`，
 //! 与 Charter 在同一目录，共享同一 workspace slug 派生策略。
 //!
 //! 落盘格式（frontmatter + body）：
@@ -103,8 +103,6 @@ impl Plan {
 
 #[derive(Debug, Error)]
 pub enum PlanError {
-    #[error("无法解析 home 目录")]
-    HomeDirUnavailable,
     #[error("plan 数据缺失或非法：{reason}")]
     InvalidPlan { reason: String },
     #[error("plan IO 失败 (path={path}): {source}")]
@@ -128,11 +126,6 @@ pub struct PlanStore {
 }
 
 impl PlanStore {
-    pub fn open(workspace_root: &WorkspaceRootPath) -> Result<Self, PlanError> {
-        let home = dirs_home()?;
-        Self::open_with_home(&home, workspace_root)
-    }
-
     pub fn open_with_home(
         magi_home: &Path,
         workspace_root: &WorkspaceRootPath,
@@ -221,17 +214,7 @@ pub struct PlanRegistry {
     magi_home: PathBuf,
 }
 
-impl Default for PlanRegistry {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl PlanRegistry {
-    pub fn new() -> Self {
-        Self::with_magi_home(dirs_home().expect("HOME 目录不可用，无法定位 Magi 状态根"))
-    }
-
     pub fn with_magi_home(magi_home: impl Into<PathBuf>) -> Self {
         let magi_home = magi_home.into();
         let _ = fs::create_dir_all(&magi_home);
@@ -633,15 +616,6 @@ fn parse_plan(raw: &str) -> Result<Plan, PlanError> {
         created_at,
         updated_at,
     })
-}
-// --- helpers
-
-fn dirs_home() -> Result<PathBuf, PlanError> {
-    // 与 ProjectMemory / MissionCharter 共用 ~/.magi 作为 magi 主目录根。
-    let base = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or(PlanError::HomeDirUnavailable)?;
-    Ok(base.join(".magi"))
 }
 // --- Tool entry：`plan_write` 工具执行体
 

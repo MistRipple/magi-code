@@ -8,7 +8,7 @@
 //! 三张表共享同一 mission 维度，写入时按 (kind, id) upsert；删除走 `tombstoned` 字段，
 //! 不做硬删除——KG 是事实档案，历史结论本身就是 Mission 的资产。
 //!
-//! 物理存储：`~/.magi/projects/{slug}/missions/{mission_id}/knowledge.md`。
+//! 物理存储：`{magi_home}/projects/{slug}/missions/{mission_id}/knowledge.md`。
 //! 单 mission 单文档，frontmatter 记录元信息，body 用 `## Symbols / Decisions / Risks` 分节。
 //!
 //! 与同 Tier 的 Plan / Charter / Workspace 共享同一 slug 派生策略，方便 Checkpoint
@@ -94,8 +94,6 @@ impl KnowledgeGraph {
 
 #[derive(Debug, Error)]
 pub enum KnowledgeGraphError {
-    #[error("无法解析 home 目录")]
-    HomeDirUnavailable,
     #[error("kg 数据缺失或非法：{reason}")]
     InvalidKnowledge { reason: String },
     #[error("kg IO 失败 (path={path}): {source}")]
@@ -215,17 +213,7 @@ pub struct KnowledgeGraphRegistry {
     magi_home: PathBuf,
 }
 
-impl Default for KnowledgeGraphRegistry {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl KnowledgeGraphRegistry {
-    pub fn new() -> Self {
-        Self::with_magi_home(dirs_home().expect("HOME 目录不可用，无法定位 Magi 状态根"))
-    }
-
     pub fn with_magi_home(magi_home: impl Into<PathBuf>) -> Self {
         let magi_home = magi_home.into();
         let _ = fs::create_dir_all(&magi_home);
@@ -499,14 +487,6 @@ fn parse_graph(raw: &str) -> Result<KnowledgeGraph, KnowledgeGraphError> {
         created_at,
         updated_at,
     })
-}
-// --- helpers
-
-fn dirs_home() -> Result<PathBuf, KnowledgeGraphError> {
-    let base = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or(KnowledgeGraphError::HomeDirUnavailable)?;
-    Ok(base.join(".magi"))
 }
 // --- Tool entry：`kg_write` 工具执行体
 

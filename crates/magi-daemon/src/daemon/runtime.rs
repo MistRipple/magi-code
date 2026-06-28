@@ -1055,6 +1055,7 @@ impl DaemonRuntime {
             state.task_execution_registry().clone(),
             runner_result_receiver.clone(),
             state.spawn_graph.clone(),
+            self.state_root.clone(),
         );
         let lifecycle_notice_registry = Arc::new(LifecycleNoticeRegistry::new());
         tokio::spawn(run_lifecycle_subscriber(
@@ -1076,7 +1077,6 @@ impl DaemonRuntime {
                 .with_snapshot_manager(state.snapshot_manager.clone())
                 .with_conversation_registry(state.conversation_registry.clone())
                 .with_agent_role_registry(state.agent_role_registry.clone())
-                .with_mission_state_root(self.state_root.clone())
                 .with_lifecycle_notices(lifecycle_notice_registry),
         );
         let session_turn_dispatcher = llm_task_dispatcher.clone();
