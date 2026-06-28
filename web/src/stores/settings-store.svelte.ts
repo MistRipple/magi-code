@@ -2507,72 +2507,56 @@ function createSettingsStore(props: { onClose?: () => void }) {
 
   function applyCapabilityDependenciesPayload(dependenciesPayload: unknown): void {
     const dependencies: CapabilityDependencyItem[] = [];
-    const readDependencyField = (dependency: any, camelKey: string, snakeKey: string): unknown =>
-      dependency?.[camelKey] ?? dependency?.[snakeKey];
     for (const dependency of ensureArray<any>(dependenciesPayload)) {
       const name = typeof dependency?.name === "string" ? dependency.name.trim() : "";
       if (!name) {
         continue;
       }
-      const fileCount = readDependencyField(dependency, "fileCount", "file_count");
-      const lastIndexed = readDependencyField(dependency, "lastIndexed", "last_indexed");
-      const cacheStatus = readDependencyField(dependency, "cacheStatus", "cache_status");
-      const roleCount = readDependencyField(dependency, "roleCount", "role_count");
-      const spawnableRoleCount = readDependencyField(dependency, "spawnableRoleCount", "spawnable_role_count");
-      const workspaceId = readDependencyField(dependency, "workspaceId", "workspace_id");
-      const sessionId = readDependencyField(dependency, "sessionId", "session_id");
-      const snapshotActive = readDependencyField(dependency, "snapshotActive", "snapshot_active");
-      const configuredCount = readDependencyField(dependency, "configuredCount", "configured_count");
-      const enabledCount = readDependencyField(dependency, "enabledCount", "enabled_count");
-      const readyCount = readDependencyField(dependency, "readyCount", "ready_count");
-      const enabledToolCount = readDependencyField(dependency, "enabledToolCount", "enabled_tool_count");
-      const readyToolCount = readDependencyField(dependency, "readyToolCount", "ready_tool_count");
-      const toolCount = readDependencyField(dependency, "toolCount", "tool_count");
       dependencies.push({
         name,
         status: typeof dependency?.status === "string" ? dependency.status : "unknown",
-        requiredBy: ensureArray<string>(readDependencyField(dependency, "requiredBy", "required_by"))
+        requiredBy: ensureArray<string>(dependency?.requiredBy)
           .filter((tool): tool is string => typeof tool === "string" && tool.trim().length > 0)
           .map((tool) => tool.trim()),
-        workspaceId: typeof workspaceId === "string"
-          ? workspaceId
+        workspaceId: typeof dependency?.workspaceId === "string"
+          ? dependency.workspaceId
           : null,
-        sessionId: typeof sessionId === "string"
-          ? sessionId
+        sessionId: typeof dependency?.sessionId === "string"
+          ? dependency.sessionId
           : null,
-        fileCount: typeof fileCount === "number" && Number.isFinite(fileCount)
-          ? fileCount
+        fileCount: typeof dependency?.fileCount === "number" && Number.isFinite(dependency.fileCount)
+          ? dependency.fileCount
           : null,
-        lastIndexed: typeof lastIndexed === "number" && Number.isFinite(lastIndexed)
-          ? lastIndexed
+        lastIndexed: typeof dependency?.lastIndexed === "number" && Number.isFinite(dependency.lastIndexed)
+          ? dependency.lastIndexed
           : null,
-        cacheStatus: typeof cacheStatus === "string" ? cacheStatus : null,
-        roleCount: typeof roleCount === "number" && Number.isFinite(roleCount)
-          ? roleCount
+        cacheStatus: typeof dependency?.cacheStatus === "string" ? dependency.cacheStatus : null,
+        roleCount: typeof dependency?.roleCount === "number" && Number.isFinite(dependency.roleCount)
+          ? dependency.roleCount
           : null,
-        spawnableRoleCount: typeof spawnableRoleCount === "number" && Number.isFinite(spawnableRoleCount)
-          ? spawnableRoleCount
+        spawnableRoleCount: typeof dependency?.spawnableRoleCount === "number" && Number.isFinite(dependency.spawnableRoleCount)
+          ? dependency.spawnableRoleCount
           : null,
-        snapshotActive: typeof snapshotActive === "boolean"
-          ? snapshotActive
+        snapshotActive: typeof dependency?.snapshotActive === "boolean"
+          ? dependency.snapshotActive
           : null,
-        configuredCount: typeof configuredCount === "number" && Number.isFinite(configuredCount)
-          ? configuredCount
+        configuredCount: typeof dependency?.configuredCount === "number" && Number.isFinite(dependency.configuredCount)
+          ? dependency.configuredCount
           : null,
-        enabledCount: typeof enabledCount === "number" && Number.isFinite(enabledCount)
-          ? enabledCount
+        enabledCount: typeof dependency?.enabledCount === "number" && Number.isFinite(dependency.enabledCount)
+          ? dependency.enabledCount
           : null,
-        readyCount: typeof readyCount === "number" && Number.isFinite(readyCount)
-          ? readyCount
+        readyCount: typeof dependency?.readyCount === "number" && Number.isFinite(dependency.readyCount)
+          ? dependency.readyCount
           : null,
-        enabledToolCount: typeof enabledToolCount === "number" && Number.isFinite(enabledToolCount)
-          ? enabledToolCount
+        enabledToolCount: typeof dependency?.enabledToolCount === "number" && Number.isFinite(dependency.enabledToolCount)
+          ? dependency.enabledToolCount
           : null,
-        readyToolCount: typeof readyToolCount === "number" && Number.isFinite(readyToolCount)
-          ? readyToolCount
+        readyToolCount: typeof dependency?.readyToolCount === "number" && Number.isFinite(dependency.readyToolCount)
+          ? dependency.readyToolCount
           : null,
-        toolCount: typeof toolCount === "number" && Number.isFinite(toolCount)
-          ? toolCount
+        toolCount: typeof dependency?.toolCount === "number" && Number.isFinite(dependency.toolCount)
+          ? dependency.toolCount
           : null,
       });
     }
