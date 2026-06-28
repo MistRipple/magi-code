@@ -185,7 +185,7 @@ function normalizeCanonicalToolCall(value: unknown): CanonicalToolCall | undefin
   if (!record) {
     return undefined;
   }
-  const callId = readString(record, 'callId', 'call_id');
+  const callId = readString(record, 'callId');
   const name = readString(record, 'name');
   if (!callId || !name) {
     return undefined;
@@ -206,9 +206,9 @@ function normalizeCanonicalWorkerRef(value: unknown): CanonicalWorkerRef | undef
     return undefined;
   }
   const worker: CanonicalWorkerRef = {
-    ...(readString(record, 'taskId', 'task_id') ? { taskId: readString(record, 'taskId', 'task_id') } : {}),
-    ...(readString(record, 'workerId', 'worker_id') ? { workerId: readString(record, 'workerId', 'worker_id') } : {}),
-    ...(readString(record, 'roleId', 'role_id') ? { roleId: readString(record, 'roleId', 'role_id') } : {}),
+    ...(readString(record, 'taskId') ? { taskId: readString(record, 'taskId') } : {}),
+    ...(readString(record, 'workerId') ? { workerId: readString(record, 'workerId') } : {}),
+    ...(readString(record, 'roleId') ? { roleId: readString(record, 'roleId') } : {}),
     ...(readString(record, 'title') ? { title: readString(record, 'title') } : {}),
   };
   return Object.keys(worker).length > 0 ? worker : undefined;
@@ -241,16 +241,16 @@ export function normalizeCanonicalTurnItem(value: unknown): CanonicalTurnItem | 
   if (!record) {
     return undefined;
   }
-  const sessionId = readString(record, 'sessionId', 'session_id');
-  const turnId = readString(record, 'turnId', 'turn_id');
-  const itemId = readString(record, 'itemId', 'item_id');
+  const sessionId = readString(record, 'sessionId');
+  const turnId = readString(record, 'turnId');
+  const itemId = readString(record, 'itemId');
   const kind = readItemKind(readString(record, 'kind'));
   const status = readStatus(readString(record, 'status'));
-  const turnSeq = readNumber(record, 'turnSeq', 'turn_seq');
-  const itemSeq = readNumber(record, 'itemSeq', 'item_seq');
-  const createdAt = readNumber(record, 'createdAt', 'created_at');
-  const updatedAt = readNumber(record, 'updatedAt', 'updated_at') ?? createdAt;
-  const sourceThreadId = readString(record, 'sourceThreadId', 'source_thread_id');
+  const turnSeq = readNumber(record, 'turnSeq');
+  const itemSeq = readNumber(record, 'itemSeq');
+  const createdAt = readNumber(record, 'createdAt');
+  const updatedAt = readNumber(record, 'updatedAt') ?? createdAt;
+  const sourceThreadId = readString(record, 'sourceThreadId');
   if (!sessionId || !turnId || !itemId || !kind || !status || turnSeq === undefined || itemSeq === undefined || createdAt === undefined || updatedAt === undefined || !sourceThreadId) {
     return undefined;
   }
@@ -269,7 +269,7 @@ export function normalizeCanonicalTurnItem(value: unknown): CanonicalTurnItem | 
     kind,
     createdAt,
     status,
-    ...(readNumber(record, 'itemVersion', 'item_version') !== undefined ? { itemVersion: readNumber(record, 'itemVersion', 'item_version') } : {}),
+    ...(readNumber(record, 'itemVersion') !== undefined ? { itemVersion: readNumber(record, 'itemVersion') } : {}),
     updatedAt,
     ...(title ? { title } : {}),
     ...(content !== undefined ? { content } : {}),
@@ -287,16 +287,16 @@ export function normalizeCanonicalTurn(value: unknown): CanonicalTurn | undefine
   if (!record) {
     return undefined;
   }
-  const sessionId = readString(record, 'sessionId', 'session_id');
-  const turnId = readString(record, 'turnId', 'turn_id');
-  const turnSeq = readNumber(record, 'turnSeq', 'turn_seq');
-  const acceptedAt = readNumber(record, 'acceptedAt', 'accepted_at');
+  const sessionId = readString(record, 'sessionId');
+  const turnId = readString(record, 'turnId');
+  const turnSeq = readNumber(record, 'turnSeq');
+  const acceptedAt = readNumber(record, 'acceptedAt');
   const status = readStatus(readString(record, 'status'));
   if (!sessionId || !turnId || turnSeq === undefined || acceptedAt === undefined || !status) {
     return undefined;
   }
-  const completedAt = readNumber(record, 'completedAt', 'completed_at');
-  const responseDurationMs = readNumber(record, 'responseDurationMs', 'response_duration_ms');
+  const completedAt = readNumber(record, 'completedAt');
+  const responseDurationMs = readNumber(record, 'responseDurationMs');
   const metadata = readRecord(record.metadata) || undefined;
   const items = Array.isArray(record.items)
     ? record.items

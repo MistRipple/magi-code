@@ -11,7 +11,8 @@ await withGoldenViteServer(async (server) => {
   const timelineRenderItems = await server.ssrLoadModule('/src/lib/timeline-render-items.ts');
   const contract = await server.ssrLoadModule('/src/shared/bridges/rust-daemon-contract.ts');
   const viewImagePreview = await server.ssrLoadModule('/src/lib/view-image-preview.ts');
-  runGoldenReplay(reducer, projection, messagesStore, dataHandlers, timelineRenderItems, contract, viewImagePreview);
+  const canonicalProtocol = await server.ssrLoadModule('/src/shared/protocol/canonical-turn.ts');
+  runGoldenReplay(reducer, projection, messagesStore, dataHandlers, timelineRenderItems, contract, viewImagePreview, canonicalProtocol);
   console.log('canonical turn golden replay passed');
 }, { configFile: 'vite.web.config.ts' });
 
@@ -41,7 +42,7 @@ function installGoldenMemoryBridge(bridgeRuntime) {
   });
 }
 
-function runGoldenReplay(reducer, projection, messagesStore, dataHandlers, timelineRenderItems, contract, viewImagePreview) {
+function runGoldenReplay(reducer, projection, messagesStore, dataHandlers, timelineRenderItems, contract, viewImagePreview, canonicalProtocol) {
   const cases = [
     acceptedFirstFrameCase(),
     ordinaryChatCase(),
@@ -103,6 +104,42 @@ function runGoldenReplay(reducer, projection, messagesStore, dataHandlers, timel
   assertBootstrapFiltersForeignWorkspaceSessions(contract);
   assertBootstrapExplicitWorkspaceWinsOverForeignCurrentSession(contract);
   assertMessagesStoreClearsLocalPendingFromAuthoritativeIdle(messagesStore);
+  assertCanonicalTurnModelRejectsSnakeCase(canonicalProtocol);
+}
+
+function assertCanonicalTurnModelRejectsSnakeCase(canonicalProtocol) {
+  const snakeItem = {
+    session_id: 'session-snake-rejected',
+    turn_id: 'turn-snake-rejected',
+    turn_seq: 1,
+    item_id: 'item-snake-rejected',
+    item_seq: 1,
+    kind: 'assistant_text',
+    created_at: 1780390000000,
+    updated_at: 1780390000000,
+    status: 'completed',
+    source_thread_id: 'thread-snake-rejected',
+    visibility: { renderable: true },
+  };
+  const snakeTurn = {
+    session_id: 'session-snake-rejected',
+    turn_id: 'turn-snake-rejected',
+    turn_seq: 1,
+    accepted_at: 1780390000000,
+    status: 'completed',
+    items: [snakeItem],
+  };
+
+  assert.equal(
+    canonicalProtocol.normalizeCanonicalTurnItem(snakeItem),
+    undefined,
+    'canonical item model must not accept snake_case fields',
+  );
+  assert.equal(
+    canonicalProtocol.normalizeCanonicalTurn(snakeTurn),
+    undefined,
+    'canonical turn model must not accept snake_case fields',
+  );
 }
 
 function assertAgentSpawnToolCardStaysOnMainlineAndTaskTabsFilterByTaskId(reducer, projection, timelineRenderItems) {
