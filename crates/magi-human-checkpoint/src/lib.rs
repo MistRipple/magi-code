@@ -61,14 +61,6 @@ pub enum HumanCheckpointDecision {
 }
 
 impl HumanCheckpointDecision {
-    pub fn from_str_lenient(s: &str) -> Option<Self> {
-        match s.trim().to_lowercase().as_str() {
-            "approve" | "approved" | "ok" | "pass" => Some(Self::Approve),
-            "reject" | "rejected" | "deny" | "fail" => Some(Self::Reject),
-            _ => None,
-        }
-    }
-
     pub fn target_status(self) -> HumanCheckpointStatus {
         match self {
             Self::Approve => HumanCheckpointStatus::Approved,
@@ -171,11 +163,6 @@ pub struct HumanCheckpointStore {
 }
 
 impl HumanCheckpointStore {
-    pub fn open(workspace_root: &WorkspaceRootPath) -> Result<Self, HumanCheckpointError> {
-        let home = dirs_home()?;
-        Self::open_with_home(&home, workspace_root)
-    }
-
     pub fn open_with_home(
         magi_home: &Path,
         workspace_root: &WorkspaceRootPath,
@@ -417,13 +404,7 @@ impl HumanCheckpointRegistry {
         {
             return Ok(store.clone());
         }
-        let store = match HumanCheckpointStore::open(workspace_root) {
-            Ok(store) => store,
-            Err(HumanCheckpointError::HomeDirUnavailable) => {
-                HumanCheckpointStore::open_with_home(&self.magi_home, workspace_root)?
-            }
-            Err(err) => return Err(err),
-        };
+        let store = HumanCheckpointStore::open_with_home(&self.magi_home, workspace_root)?;
         let arc = Arc::new(store);
         self.inner
             .write()
@@ -548,9 +529,11 @@ fn parse_log(raw: &str) -> Result<HumanCheckpointLog, HumanCheckpointError> {
         if line.is_empty() {
             continue;
         }
-        let Some((key, value)) = line.split_once(':') else {
-            continue;
-        };
+        let (key, value) =
+            line.split_once(':')
+                .ok_or_else(|| HumanCheckpointError::InvalidRecord {
+                    reason: format!("frontmatter 行非法：{line}"),
+                })?;
         let value = value.trim();
         match key.trim() {
             "mission_id" => mission_id = Some(MissionId::new(value.to_string())),
@@ -580,8 +563,16 @@ fn parse_log(raw: &str) -> Result<HumanCheckpointLog, HumanCheckpointError> {
     let mission_id = mission_id.ok_or_else(|| HumanCheckpointError::InvalidRecord {
         reason: "mission_id 缺失".to_string(),
     })?;
-    let created_at = UtcMillis(created_at.unwrap_or(0));
-    let updated_at = UtcMillis(updated_at.unwrap_or(created_at.0));
+    let created_at = UtcMillis(
+        created_at.ok_or_else(|| HumanCheckpointError::InvalidRecord {
+            reason: "created_at 缺失".to_string(),
+        })?,
+    );
+    let updated_at = UtcMillis(
+        updated_at.ok_or_else(|| HumanCheckpointError::InvalidRecord {
+            reason: "updated_at 缺失".to_string(),
+        })?,
+    );
 
     let mut entries = Vec::new();
     for line in body.lines() {
@@ -833,6 +824,36 @@ mod tests {
         assert_eq!(ok.prompt_to_human, "please review");
         assert_eq!(ok.label.as_deref(), Some("lbl"));
         assert_eq!(ok.context.as_deref(), Some("ctx"));
+    }
+
+    #[test]
+    fn parse_log_rejects_incomplete_frontmatter() {
+        let missing_updated_at = "\
+---
+mission_id: mission-hc-test
+created_at: 1
+entry_count: 0
+pending_count: 0
+---
+
+## HumanCheckpoints
+";
+        let err = parse_log(missing_updated_at).expect_err("updated_at 缺失必须失败");
+        assert!(matches!(err, HumanCheckpointError::InvalidRecord { .. }));
+
+        let invalid_frontmatter = "\
+---
+mission_id: mission-hc-test
+created_at
+updated_at: 2
+entry_count: 0
+pending_count: 0
+---
+
+## HumanCheckpoints
+";
+        let err = parse_log(invalid_frontmatter).expect_err("非法 frontmatter 行必须失败");
+        assert!(matches!(err, HumanCheckpointError::InvalidRecord { .. }));
     }
 
     #[test]

@@ -42,11 +42,11 @@ impl KnowledgeKind {
         }
     }
 
-    pub fn from_str_lenient(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_lowercase().as_str() {
-            "symbol" | "symbols" | "code" => Some(Self::Symbol),
-            "decision" | "decisions" => Some(Self::Decision),
-            "risk" | "risks" | "hazard" => Some(Self::Risk),
+            "symbol" => Some(Self::Symbol),
+            "decision" => Some(Self::Decision),
+            "risk" => Some(Self::Risk),
             _ => None,
         }
     }
@@ -112,11 +112,6 @@ pub struct KnowledgeGraphStore {
 }
 
 impl KnowledgeGraphStore {
-    pub fn open(workspace_root: &WorkspaceRootPath) -> Result<Self, KnowledgeGraphError> {
-        let home = dirs_home()?;
-        Self::open_with_home(&home, workspace_root)
-    }
-
     pub fn open_with_home(
         magi_home: &Path,
         workspace_root: &WorkspaceRootPath,
@@ -248,13 +243,7 @@ impl KnowledgeGraphRegistry {
         if let Some(store) = self.inner.read().expect("kg registry poisoned").get(&key) {
             return Ok(store.clone());
         }
-        let store = match KnowledgeGraphStore::open(workspace_root) {
-            Ok(store) => store,
-            Err(KnowledgeGraphError::HomeDirUnavailable) => {
-                KnowledgeGraphStore::open_with_home(&self.magi_home, workspace_root)?
-            }
-            Err(err) => return Err(err),
-        };
+        let store = KnowledgeGraphStore::open_with_home(&self.magi_home, workspace_root)?;
         let arc = Arc::new(store);
         self.inner
             .write()
@@ -288,11 +277,10 @@ pub fn parse_kg_write_arguments(
             reason: "缺少 kind 字段（symbol/decision/risk）".to_string(),
         }
     })?;
-    let kind = KnowledgeKind::from_str_lenient(kind_raw).ok_or_else(|| {
-        KnowledgeGraphError::InvalidKnowledge {
+    let kind =
+        KnowledgeKind::parse(kind_raw).ok_or_else(|| KnowledgeGraphError::InvalidKnowledge {
             reason: format!("kind 非法：{kind_raw}"),
-        }
-    })?;
+        })?;
     let id = obj
         .get("id")
         .and_then(|v| v.as_str())
@@ -334,7 +322,13 @@ pub fn parse_kg_write_arguments(
                     .ok_or_else(|| KnowledgeGraphError::InvalidKnowledge {
                         reason: format!("tags[{idx}] 必须为字符串"),
                     })?;
-                out.push(s.to_string());
+                let tag = s.trim().to_string();
+                if tag.is_empty() {
+                    return Err(KnowledgeGraphError::InvalidKnowledge {
+                        reason: format!("tags[{idx}] 不能为空字符串"),
+                    });
+                }
+                out.push(tag);
             }
             out
         }
@@ -439,9 +433,11 @@ fn parse_graph(raw: &str) -> Result<KnowledgeGraph, KnowledgeGraphError> {
         if line.is_empty() {
             continue;
         }
-        let Some((key, value)) = line.split_once(':') else {
-            continue;
-        };
+        let (key, value) =
+            line.split_once(':')
+                .ok_or_else(|| KnowledgeGraphError::InvalidKnowledge {
+                    reason: format!("frontmatter 行非法：{line}"),
+                })?;
         let value = value.trim();
         match key.trim() {
             "mission_id" => mission_id = Some(MissionId::new(value.to_string())),
@@ -471,8 +467,18 @@ fn parse_graph(raw: &str) -> Result<KnowledgeGraph, KnowledgeGraphError> {
     let mission_id = mission_id.ok_or_else(|| KnowledgeGraphError::InvalidKnowledge {
         reason: "mission_id 缺失".to_string(),
     })?;
-    let created_at = UtcMillis(created_at.unwrap_or(0));
-    let updated_at = UtcMillis(updated_at.unwrap_or(created_at.0));
+    let created_at =
+        UtcMillis(
+            created_at.ok_or_else(|| KnowledgeGraphError::InvalidKnowledge {
+                reason: "created_at 缺失".to_string(),
+            })?,
+        );
+    let updated_at =
+        UtcMillis(
+            updated_at.ok_or_else(|| KnowledgeGraphError::InvalidKnowledge {
+                reason: "updated_at 缺失".to_string(),
+            })?,
+        );
 
     let mut facts = Vec::new();
     for line in body.lines() {
@@ -737,6 +743,38 @@ mod tests {
     }
 
     #[test]
+    fn parse_kg_write_args_rejects_legacy_kind_aliases_and_empty_tags() {
+        for legacy in ["symbols", "code", "decisions", "risks", "hazard"] {
+            let err = parse_kg_write_arguments(
+                &serde_json::json!({"kind": legacy, "id": "x", "content": "y"}),
+            )
+            .expect_err("legacy kind 别名必须拒绝");
+            assert!(
+                matches!(err, KnowledgeGraphError::InvalidKnowledge { .. }),
+                "unexpected error for {legacy}: {err}"
+            );
+        }
+
+        let err = parse_kg_write_arguments(&serde_json::json!({
+            "kind": "risk",
+            "id": "r-1",
+            "content": "依赖 JVM GC",
+            "tags": ["high", "  "],
+        }))
+        .expect_err("空 tag 必须拒绝");
+        assert!(matches!(err, KnowledgeGraphError::InvalidKnowledge { .. }));
+
+        let ok = parse_kg_write_arguments(&serde_json::json!({
+            "kind": "risk",
+            "id": "r-1",
+            "content": "依赖 JVM GC",
+            "tags": [" high ", "infra"],
+        }))
+        .expect("tag 应 trim 后入库");
+        assert_eq!(ok.tags, vec!["high", "infra"]);
+    }
+
+    #[test]
     fn render_and_parse_round_trip() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let ws_root = make_workspace_root(tmp.path());
@@ -767,6 +805,34 @@ mod tests {
         assert_eq!(loaded.mission_id, mid);
         assert_eq!(loaded.created_at.0, 1000);
         assert_eq!(loaded.updated_at.0, 1100);
+    }
+
+    #[test]
+    fn parse_graph_rejects_incomplete_frontmatter() {
+        let missing_updated_at = "\
+---
+mission_id: mission-kg-test
+created_at: 1
+fact_count: 0
+---
+
+## Facts
+";
+        let err = parse_graph(missing_updated_at).expect_err("updated_at 缺失必须失败");
+        assert!(matches!(err, KnowledgeGraphError::InvalidKnowledge { .. }));
+
+        let invalid_frontmatter = "\
+---
+mission_id: mission-kg-test
+created_at: 1
+updated_at
+fact_count: 0
+---
+
+## Facts
+";
+        let err = parse_graph(invalid_frontmatter).expect_err("非法 frontmatter 行必须失败");
+        assert!(matches!(err, KnowledgeGraphError::InvalidKnowledge { .. }));
     }
 
     #[test]

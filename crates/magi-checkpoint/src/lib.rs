@@ -51,14 +51,12 @@ impl CheckpointKind {
         }
     }
 
-    pub fn from_str_lenient(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_lowercase().as_str() {
-            "process_restart" | "restart" | "shutdown" => Some(Self::ProcessRestart),
-            "context_compaction" | "compaction" | "compact" => Some(Self::ContextCompaction),
-            "phase_transition" | "phase" | "stage_transition" | "stage" => {
-                Some(Self::PhaseTransition)
-            }
-            "manual" | "user" | "adhoc" | "ad_hoc" => Some(Self::Manual),
+            "process_restart" => Some(Self::ProcessRestart),
+            "context_compaction" => Some(Self::ContextCompaction),
+            "phase_transition" => Some(Self::PhaseTransition),
+            "manual" => Some(Self::Manual),
             _ => None,
         }
     }
@@ -264,11 +262,6 @@ pub struct CheckpointStore {
 }
 
 impl CheckpointStore {
-    pub fn open(workspace_root: &WorkspaceRootPath) -> Result<Self, CheckpointError> {
-        let home = dirs_home()?;
-        Self::open_with_home(&home, workspace_root)
-    }
-
     pub fn open_with_home(
         magi_home: &Path,
         workspace_root: &WorkspaceRootPath,
@@ -413,13 +406,7 @@ impl CheckpointRegistry {
         {
             return Ok(store.clone());
         }
-        let store = match CheckpointStore::open(workspace_root) {
-            Ok(store) => store,
-            Err(CheckpointError::HomeDirUnavailable) => {
-                CheckpointStore::open_with_home(&self.magi_home, workspace_root)?
-            }
-            Err(err) => return Err(err),
-        };
+        let store = CheckpointStore::open_with_home(&self.magi_home, workspace_root)?;
         let arc = Arc::new(store);
         self.inner
             .write()
@@ -457,10 +444,8 @@ pub fn parse_checkpoint_create_arguments(
                     "缺少 kind 字段（process_restart/context_compaction/phase_transition/manual）"
                         .to_string(),
             })?;
-    let kind = CheckpointKind::from_str_lenient(kind_raw).ok_or_else(|| {
-        CheckpointError::InvalidRecord {
-            reason: format!("kind 非法：{kind_raw}"),
-        }
+    let kind = CheckpointKind::parse(kind_raw).ok_or_else(|| CheckpointError::InvalidRecord {
+        reason: format!("kind 非法：{kind_raw}"),
     })?;
     let label = obj
         .get("label")
@@ -613,9 +598,11 @@ fn parse_log(raw: &str) -> Result<CheckpointLog, CheckpointError> {
         if line.is_empty() {
             continue;
         }
-        let Some((key, value)) = line.split_once(':') else {
-            continue;
-        };
+        let (key, value) = line
+            .split_once(':')
+            .ok_or_else(|| CheckpointError::InvalidRecord {
+                reason: format!("frontmatter 行非法：{line}"),
+            })?;
         let value = value.trim();
         match key.trim() {
             "mission_id" => mission_id = Some(MissionId::new(value.to_string())),
@@ -635,8 +622,12 @@ fn parse_log(raw: &str) -> Result<CheckpointLog, CheckpointError> {
     let mission_id = mission_id.ok_or_else(|| CheckpointError::InvalidRecord {
         reason: "mission_id 缺失".to_string(),
     })?;
-    let created_at = UtcMillis(created_at.unwrap_or(0));
-    let updated_at = UtcMillis(updated_at.unwrap_or(created_at.0));
+    let created_at = UtcMillis(created_at.ok_or_else(|| CheckpointError::InvalidRecord {
+        reason: "created_at 缺失".to_string(),
+    })?);
+    let updated_at = UtcMillis(updated_at.ok_or_else(|| CheckpointError::InvalidRecord {
+        reason: "updated_at 缺失".to_string(),
+    })?);
 
     let mut checkpoints = Vec::new();
     for line in body.lines() {
@@ -968,7 +959,7 @@ mod tests {
         assert!(matches!(err, CheckpointError::InvalidRecord { .. }));
 
         let ok = parse_checkpoint_create_arguments(&serde_json::json!({
-            "kind": "compact",
+            "kind": "context_compaction",
             "label": "before LLM compaction",
             "plan_version": 4,
             "kg_fact_count": 12,
@@ -1000,6 +991,18 @@ mod tests {
         );
         assert_eq!(ok.open_conversations[0].turn_cursor, Some(9));
         assert_eq!(ok.notes.as_deref(), Some("saved before resume"));
+    }
+
+    #[test]
+    fn parse_args_rejects_legacy_kind_aliases() {
+        for legacy in ["restart", "shutdown", "compact", "stage", "user", "adhoc"] {
+            let err = parse_checkpoint_create_arguments(&serde_json::json!({"kind": legacy}))
+                .expect_err("legacy kind 别名必须拒绝");
+            assert!(
+                matches!(err, CheckpointError::InvalidRecord { .. }),
+                "unexpected error for {legacy}: {err}"
+            );
+        }
     }
 
     #[test]
@@ -1058,6 +1061,34 @@ mod tests {
         let conv0 = &reloaded.checkpoints[0].open_conversations[0];
         assert_eq!(conv0.session_id.as_str(), "conv-1");
         assert_eq!(conv0.recovery_ref.as_deref(), Some("rec-1"));
+    }
+
+    #[test]
+    fn parse_log_rejects_incomplete_frontmatter() {
+        let missing_created_at = "\
+---
+mission_id: mission-checkpoint-test
+updated_at: 2
+checkpoint_count: 0
+---
+
+## Checkpoints
+";
+        let err = parse_log(missing_created_at).expect_err("created_at 缺失必须失败");
+        assert!(matches!(err, CheckpointError::InvalidRecord { .. }));
+
+        let invalid_frontmatter = "\
+---
+mission_id: mission-checkpoint-test
+created_at
+updated_at: 2
+checkpoint_count: 0
+---
+
+## Checkpoints
+";
+        let err = parse_log(invalid_frontmatter).expect_err("非法 frontmatter 行必须失败");
+        assert!(matches!(err, CheckpointError::InvalidRecord { .. }));
     }
 
     #[test]
