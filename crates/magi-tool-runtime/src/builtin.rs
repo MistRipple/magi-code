@@ -212,19 +212,17 @@ pub(crate) fn field_string(
     })
 }
 
-fn required_string_or_raw(
-    input: &str,
+fn required_string_field(
     request: Option<&serde_json::Map<String, Value>>,
     keys: &[&str],
     tool: &str,
     missing_message: &str,
 ) -> Result<String, String> {
-    let value = match request {
-        Some(object) => field_string(object, keys).unwrap_or_default(),
-        None => input.trim().to_string(),
-    }
-    .trim()
-    .to_string();
+    let value = request
+        .and_then(|object| field_string(object, keys))
+        .unwrap_or_default()
+        .trim()
+        .to_string();
     if value.is_empty() {
         return Err(builtin_error(tool, missing_message));
     }
@@ -398,8 +396,7 @@ fn execute_file_read(input: &str, context: &ToolExecutionContext) -> String {
 
 fn execute_search_text(input: &str, context: &ToolExecutionContext) -> String {
     let request = parse_json_object(input);
-    let query = match required_string_or_raw(
-        input,
+    let query = match required_string_field(
         request.as_ref(),
         &["query"],
         "search_text",
@@ -473,8 +470,7 @@ fn execute_shell_exec(input: &str, context: &ToolExecutionContext) -> String {
     if let Some(payload) = execute_shell_exec_background_action(input, request.as_ref(), context) {
         return payload;
     }
-    let command = match required_string_or_raw(
-        input,
+    let command = match required_string_field(
         request.as_ref(),
         &["command"],
         "shell_exec",
@@ -981,8 +977,7 @@ fn execute_process_launch_with_surface(
     mode: Option<&str>,
 ) -> String {
     let request = parse_json_object(input);
-    let command = match required_string_or_raw(
-        input,
+    let command = match required_string_field(
         request.as_ref(),
         &["command"],
         surface_tool,
@@ -1345,7 +1340,6 @@ fn tail_utf8(bytes: &[u8], max_bytes: usize) -> String {
 
 fn execute_process_inspect(input: &str) -> String {
     let request = parse_json_object(input);
-    let raw_trimmed = input.trim();
     if request.as_ref().is_some_and(|object| {
         ["process_id", "name", "pattern", "max_results"]
             .iter()
@@ -1356,27 +1350,16 @@ fn execute_process_inspect(input: &str) -> String {
             "process_inspect 只接受 pid/query/limit 字段",
         );
     }
+    if request.is_none() {
+        return builtin_error("process_inspect", "输入必须为 JSON 对象");
+    }
     let query = request
         .as_ref()
-        .and_then(|object| field_string(object, &["query"]))
-        .or_else(|| {
-            if request.is_none() && !raw_trimmed.is_empty() && raw_trimmed.parse::<u32>().is_err() {
-                Some(raw_trimmed.to_string())
-            } else {
-                None
-            }
-        });
+        .and_then(|object| field_string(object, &["query"]));
     let pid = request
         .as_ref()
         .and_then(|object| field_usize(object, &["pid"]))
         .map(|pid| pid as u32)
-        .or_else(|| {
-            if query.is_some() {
-                None
-            } else {
-                raw_trimmed.parse::<u32>().ok()
-            }
-        })
         .unwrap_or_else(std::process::id);
     let limit = request
         .as_ref()
@@ -1477,33 +1460,8 @@ fn execute_diff_preview(input: &str) -> String {
             before_label,
             after_label,
         )
-    } else if let Some((before, after)) = input.split_once("\n---\n") {
-        (
-            None,
-            None,
-            Some(before.to_string()),
-            Some(after.to_string()),
-            "before".to_string(),
-            "after".to_string(),
-        )
-    } else if let Some((before, after)) = input.split_once("|||") {
-        (
-            None,
-            None,
-            Some(before.to_string()),
-            Some(after.to_string()),
-            "before".to_string(),
-            "after".to_string(),
-        )
     } else {
-        (
-            None,
-            None,
-            Some(String::new()),
-            Some(input.to_string()),
-            "before".to_string(),
-            "after".to_string(),
-        )
+        return builtin_error("diff_preview", "输入必须为 JSON 对象");
     };
 
     let (before_path, after_path, before, after, before_label, after_label) = parsed;
@@ -2541,8 +2499,7 @@ fn execute_file_move(input: &str, context: &ToolExecutionContext) -> String {
 
 fn execute_web_search(input: &str) -> String {
     let request = parse_json_object(input);
-    let query = match required_string_or_raw(
-        input,
+    let query = match required_string_field(
         request.as_ref(),
         &["query"],
         "web_search",
@@ -2681,11 +2638,10 @@ fn decode_html_entities(text: &str) -> String {
 
 fn execute_web_fetch(input: &str) -> String {
     let request = parse_json_object(input);
-    let url =
-        match required_string_or_raw(input, request.as_ref(), &["url"], "web_fetch", "缺少 URL") {
-            Ok(value) => value,
-            Err(error) => return error,
-        };
+    let url = match required_string_field(request.as_ref(), &["url"], "web_fetch", "缺少 URL") {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
 
     let prompt = request
         .as_ref()
@@ -3194,8 +3150,7 @@ fn execute_search_semantic(
     resources: &ToolRuntimeResources,
 ) -> String {
     let request = parse_json_object(input);
-    let query = match required_string_or_raw(
-        input,
+    let query = match required_string_field(
         request.as_ref(),
         &["query"],
         "search_semantic",
@@ -3271,8 +3226,7 @@ fn execute_knowledge_query(
     resources: &ToolRuntimeResources,
 ) -> String {
     let request = parse_json_object(input);
-    let query = match required_string_or_raw(
-        input,
+    let query = match required_string_field(
         request.as_ref(),
         &["query"],
         "knowledge_query",

@@ -2689,7 +2689,7 @@ mod tests {
                 tool_call_id: ToolCallId::new("tool-call-usage"),
                 tool_name: BuiltinToolName::FileRead.as_str().to_string(),
                 tool_kind: ToolKind::Builtin,
-                input: "/tmp/nonexistent".to_string(),
+                input: serde_json::json!({ "path": "/tmp/nonexistent" }).to_string(),
                 approval_requirement: ApprovalRequirement::None,
                 risk_level: RiskLevel::Low,
             },
@@ -2772,7 +2772,7 @@ mod tests {
                 tool_call_id: ToolCallId::new("tool-call-shell"),
                 tool_name: BuiltinToolName::ShellExec.as_str().to_string(),
                 tool_kind: ToolKind::Builtin,
-                input: "printf hello".to_string(),
+                input: serde_json::json!({ "command": "printf hello" }).to_string(),
                 approval_requirement: ApprovalRequirement::None,
                 risk_level: RiskLevel::Low,
             },
@@ -2814,7 +2814,7 @@ mod tests {
                 tool_call_id: ToolCallId::new("tool-call-shell-blocked"),
                 tool_name: BuiltinToolName::ShellExec.as_str().to_string(),
                 tool_kind: ToolKind::Builtin,
-                input: "printf blocked".to_string(),
+                input: serde_json::json!({ "command": "printf blocked" }).to_string(),
                 approval_requirement: ApprovalRequirement::Required,
                 risk_level: RiskLevel::High,
             },
@@ -3751,7 +3751,7 @@ mod tests {
                 tool_call_id: ToolCallId::new("tool-call-process"),
                 tool_name: BuiltinToolName::ProcessInspect.as_str().to_string(),
                 tool_kind: ToolKind::Builtin,
-                input: current_pid.to_string(),
+                input: serde_json::json!({ "pid": current_pid }).to_string(),
                 approval_requirement: ApprovalRequirement::None,
                 risk_level: RiskLevel::Low,
             },
@@ -4410,7 +4410,7 @@ mod tests {
                 tool_call_id: ToolCallId::new("tc-gov-blocked"),
                 tool_name: BuiltinToolName::ShellExec.as_str().to_string(),
                 tool_kind: ToolKind::Builtin,
-                input: "printf blocked".to_string(),
+                input: serde_json::json!({ "command": "printf blocked" }).to_string(),
                 approval_requirement: ApprovalRequirement::Required,
                 risk_level: RiskLevel::High,
             },
@@ -4849,7 +4849,7 @@ mod tests {
                 tool_call_id: ToolCallId::new("chain-3-blocked"),
                 tool_name: BuiltinToolName::ShellExec.as_str().to_string(),
                 tool_kind: ToolKind::Builtin,
-                input: "rm -rf /".to_string(),
+                input: serde_json::json!({ "command": "rm -rf /" }).to_string(),
                 approval_requirement: ApprovalRequirement::Required,
                 risk_level: RiskLevel::High,
             },
@@ -4962,7 +4962,7 @@ mod tests {
                 tool_call_id: ToolCallId::new("tc-full-access-shell"),
                 tool_name: BuiltinToolName::ShellExec.as_str().to_string(),
                 tool_kind: ToolKind::Builtin,
-                input: "printf full-access".to_string(),
+                input: serde_json::json!({ "command": "printf full-access" }).to_string(),
                 approval_requirement: ApprovalRequirement::Required,
                 risk_level: RiskLevel::High,
             },
@@ -6908,6 +6908,64 @@ mod tests {
     }
 
     #[test]
+    fn builtin_object_tools_reject_raw_string_inputs_at_runtime() {
+        let registry = make_registry();
+        let failures = [
+            (BuiltinToolName::SearchText, "needle", "缺少搜索关键词"),
+            (
+                BuiltinToolName::ShellExec,
+                "printf hello",
+                "缺少 shell 命令",
+            ),
+            (
+                BuiltinToolName::ProcessInspect,
+                "12345",
+                "输入必须为 JSON 对象",
+            ),
+            (
+                BuiltinToolName::DiffPreview,
+                "before\n---\nafter",
+                "输入必须为 JSON 对象",
+            ),
+            (BuiltinToolName::WebSearch, "magi", "缺少搜索关键词 query"),
+            (BuiltinToolName::WebFetch, "http://127.0.0.1", "缺少 URL"),
+            (
+                BuiltinToolName::SearchSemantic,
+                "code search",
+                "缺少 query 字段",
+            ),
+            (
+                BuiltinToolName::KnowledgeQuery,
+                "project memory",
+                "缺少 query 字段",
+            ),
+        ];
+
+        for (tool, input, expected_error) in failures {
+            let policy = if tool == BuiltinToolName::ShellExec {
+                full_access_policy()
+            } else {
+                ToolExecutionPolicy::default()
+            };
+            let output = exec_tool_with_context_and_policy(
+                &registry,
+                tool,
+                input,
+                ToolExecutionContext::default(),
+                policy,
+            );
+            assert_eq!(output.status, ExecutionResultStatus::Failed, "{tool:?}");
+            assert!(
+                output.payload.contains(expected_error),
+                "{} should reject raw string input with '{}', payload: {}",
+                tool.as_str(),
+                expected_error,
+                output.payload
+            );
+        }
+    }
+
+    #[test]
     fn shell_exec_schema_warns_against_read_only_temp_writes() {
         let schema = BuiltinToolName::ShellExec.parameters_schema();
         let description = schema["properties"]["access_mode"]["description"]
@@ -6992,9 +7050,12 @@ mod tests {
             ApprovalRequirement::None
         );
 
-        let raw_shell = BuiltinToolName::ShellExec.invocation_policy_for_input("cargo test");
-        assert_eq!(raw_shell.risk_level, RiskLevel::Medium);
-        assert_eq!(raw_shell.approval_requirement, ApprovalRequirement::None);
+        let non_json_shell = BuiltinToolName::ShellExec.invocation_policy_for_input("cargo test");
+        assert_eq!(non_json_shell.risk_level, RiskLevel::Medium);
+        assert_eq!(
+            non_json_shell.approval_requirement,
+            ApprovalRequirement::None
+        );
     }
 
     #[test]
