@@ -374,11 +374,10 @@ impl CheckpointStore {
 }
 // --- Registry
 
-/// 进程级缓存，按 workspace_root 聚合 CheckpointStore。HOME 不可用时退到
-/// `$TMPDIR/magi-checkpoint`，与同 Tier 其它 crate 行为一致。
+/// 进程级缓存，按 workspace_root 聚合 CheckpointStore。
 pub struct CheckpointRegistry {
     inner: RwLock<HashMap<String, Arc<CheckpointStore>>>,
-    fallback_home: PathBuf,
+    magi_home: PathBuf,
 }
 
 impl Default for CheckpointRegistry {
@@ -389,11 +388,15 @@ impl Default for CheckpointRegistry {
 
 impl CheckpointRegistry {
     pub fn new() -> Self {
-        let fallback_home = std::env::temp_dir().join("magi-checkpoint");
-        let _ = fs::create_dir_all(&fallback_home);
+        Self::with_magi_home(dirs_home().expect("HOME 目录不可用，无法定位 Magi 状态根"))
+    }
+
+    pub fn with_magi_home(magi_home: impl Into<PathBuf>) -> Self {
+        let magi_home = magi_home.into();
+        let _ = fs::create_dir_all(&magi_home);
         Self {
             inner: RwLock::new(HashMap::new()),
-            fallback_home,
+            magi_home,
         }
     }
 
@@ -413,7 +416,7 @@ impl CheckpointRegistry {
         let store = match CheckpointStore::open(workspace_root) {
             Ok(store) => store,
             Err(CheckpointError::HomeDirUnavailable) => {
-                CheckpointStore::open_with_home(&self.fallback_home, workspace_root)?
+                CheckpointStore::open_with_home(&self.magi_home, workspace_root)?
             }
             Err(err) => return Err(err),
         };
@@ -1108,12 +1111,8 @@ mod tests {
     #[test]
     fn registry_caches_store_by_workspace_root() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let registry = CheckpointRegistry::new();
+        let registry = CheckpointRegistry::with_magi_home(tmp.path());
         let ws = WorkspaceRootPath::new(format!("{}/sample", tmp.path().display()));
-        // 在 sandbox 下 HOME 通常不可写，强制走 fallback。
-        unsafe {
-            std::env::remove_var("HOME");
-        }
         let s1 = registry.get_or_open(&ws).expect("open 1");
         let s2 = registry.get_or_open(&ws).expect("open 2");
         assert!(Arc::ptr_eq(&s1, &s2));

@@ -14,8 +14,8 @@ use crate::{
     public_builtin_tool_definitions,
     session_images::SessionTurnImage,
     session_turn_execution::{
-        BUSINESS_MODEL_PROVIDER, SessionTurnExecutionOutput, SessionTurnExecutionRequest,
-        SessionTurnExecutionRuntime, run_session_turn_execution,
+        BUSINESS_MODEL_PROVIDER, SessionTurnExecutionError, SessionTurnExecutionOutput,
+        SessionTurnExecutionRequest, SessionTurnExecutionRuntime, run_session_turn_execution,
     },
     session_turn_finalize::{format_dependency_task_context, format_task_ref_list},
     session_writeback::SessionStatePersistCallback,
@@ -285,15 +285,12 @@ pub fn resolve_target_for_role(
             let Some(role_model) = configured_role_engine_model_config(store, role_id)? else {
                 return Ok(None);
             };
-            let primary = role_model
-                .config
-                .to_http_model_client("gpt-4")
-                .ok_or_else(|| {
-                    format!(
-                        "角色 {} 的模型引擎 {} 缺少可用 HTTP 模型配置",
-                        role_model.template_id, role_model.engine_id
-                    )
-                })?;
+            let primary = role_model.config.to_http_model_client().ok_or_else(|| {
+                format!(
+                    "角色 {} 的模型引擎 {} 缺少可用 HTTP 模型配置",
+                    role_model.template_id, role_model.engine_id
+                )
+            })?;
             let primary = Arc::new(primary) as Arc<dyn ModelBridgeClient>;
             if !wrap_with_orchestrator_failover {
                 return Ok(Some(primary));
@@ -329,32 +326,39 @@ fn build_client_from_section(
     let config = settings_store.get_section(section);
     let normalized = NormalizedModelConfig::from_settings_value(&config);
     normalized
-        .to_http_model_client("gpt-4")
+        .to_http_model_client()
         .map(|client| Arc::new(client) as Arc<dyn ModelBridgeClient>)
 }
 
 /// 构造业务主对话（orchestrator）的 client。
 ///
-/// 主对话采用「全局 base + 会话级覆盖」两层模型：
-/// - 全局 `orchestrator` 段是权威 base，承载 baseUrl / apiKey / 默认 model /
-///   默认 reasoningEffort，作为新会话的起点；
+/// 主对话采用「全局连接 base + 会话级模型覆盖」两层模型：
+/// - 全局 `orchestrator` 段是权威连接 base，只承载 baseUrl / apiKey / urlMode；
 /// - 会话级 `orchestrator` 覆盖段只携带 `model` 与 `reasoningEffort` 两个字段，
 ///   在解析时叠加到全局 base 之上，使各会话能独立切换主模型与思考强度而互不污染。
 ///
-/// 当 `session_id` 缺失或会话级覆盖为空时，行为与「直接读全局 orchestrator 段」完全一致。
+/// 当 `session_id` 缺失或会话级覆盖为空时，不构造主对话 client，避免隐藏默认模型。
 fn build_orchestrator_client(
     settings_store: &Arc<SettingsStore>,
     session_id: Option<&SessionId>,
 ) -> Option<Arc<dyn ModelBridgeClient>> {
     let mut config = settings_store.get_section("orchestrator");
+    strip_orchestrator_session_owned_fields(&mut config);
     if let Some(session_id) = session_id {
         let override_section = settings_store.get_session_section(session_id, "orchestrator");
         merge_orchestrator_session_override(&mut config, &override_section);
     }
     let normalized = NormalizedModelConfig::from_settings_value(&config);
     normalized
-        .to_http_model_client("gpt-4")
+        .to_http_model_client()
         .map(|client| Arc::new(client) as Arc<dyn ModelBridgeClient>)
+}
+
+pub fn strip_orchestrator_session_owned_fields(base: &mut serde_json::Value) {
+    if let serde_json::Value::Object(base_map) = base {
+        base_map.remove("model");
+        base_map.remove("reasoningEffort");
+    }
 }
 
 /// 把会话级覆盖（仅 `model` / `reasoningEffort`）叠加到全局 orchestrator base 上。
@@ -607,6 +611,31 @@ impl LlmTaskDispatcher {
 
     pub fn mission_charter_registry(&self) -> Arc<magi_mission_charter::MissionCharterRegistry> {
         self.mission_charter_registry.clone()
+    }
+
+    pub fn with_mission_state_root(mut self, magi_home: PathBuf) -> Self {
+        self.project_memory_registry = Arc::new(
+            magi_project_memory::ProjectMemoryRegistry::with_home(magi_home.clone()),
+        );
+        self.mission_charter_registry = Arc::new(
+            magi_mission_charter::MissionCharterRegistry::with_home(magi_home.clone()),
+        );
+        self.plan_registry = Arc::new(magi_plan::PlanRegistry::with_magi_home(magi_home.clone()));
+        self.mission_workspace_registry = Arc::new(
+            magi_mission_workspace::MissionWorkspaceRegistry::with_magi_home(magi_home.clone()),
+        );
+        self.knowledge_graph_registry = Arc::new(
+            magi_knowledge_graph::KnowledgeGraphRegistry::with_magi_home(magi_home.clone()),
+        );
+        self.validation_runner_registry = Arc::new(
+            magi_validation_runner::ValidationRunnerRegistry::with_magi_home(magi_home.clone()),
+        );
+        self.checkpoint_registry = Arc::new(magi_checkpoint::CheckpointRegistry::with_magi_home(
+            magi_home.clone(),
+        ));
+        self.human_checkpoint_registry =
+            Arc::new(magi_human_checkpoint::HumanCheckpointRegistry::with_magi_home(magi_home));
+        self
     }
 
     pub fn with_plan_registry(mut self, registry: Arc<magi_plan::PlanRegistry>) -> Self {
@@ -1460,16 +1489,23 @@ impl LlmTaskDispatcher {
     pub fn execute_session_turn(
         &self,
         request: SessionTurnExecutionRequest,
-    ) -> Result<SessionTurnExecutionOutput, String> {
+    ) -> Result<SessionTurnExecutionOutput, SessionTurnExecutionError> {
         let execution_settings_snapshot = self.execution_settings_snapshot();
         let execution_settings =
             self.execution_settings_or_live(execution_settings_snapshot.as_ref());
-        let client = self.resolve_model_client_for_task(
-            execution_settings,
-            None,
-            None,
-            Some(&request.session_id),
-        )?;
+        let client = self
+            .resolve_model_client_for_task(
+                execution_settings,
+                None,
+                None,
+                Some(&request.session_id),
+            )
+            .map_err(|_| SessionTurnExecutionError {
+                reason:
+                    crate::session_turn_execution::SessionTurnFailureReason::ModelInvocationFailed,
+                public_message: crate::model_error::PUBLIC_MODEL_INVOCATION_FAILURE_MESSAGE
+                    .to_string(),
+            })?;
 
         let prompt = self.apply_skill_prompt_injections(
             prepend_session_instructions(
@@ -2785,12 +2821,8 @@ mod tests {
         assert!(parse_session_memory_slices(raw).is_none());
     }
 
-    /// 回归测试：用户在前端「主对话/编排模型」面板设置 reasoningEffort 后，
-    /// `resolve_target_for_role(.., RoleTarget::Orchestrator)` 必须返回 orchestrator 段
-    /// 构造的 client，而不是默默退回 default_client（旧 bug：读 auxiliary 段，导致
-    /// reasoningEffort 丢失）。
     #[test]
-    fn resolve_target_for_role_orchestrator_reads_orchestrator_segment() {
+    fn resolve_target_for_role_orchestrator_requires_session_model_override() {
         use crate::settings_store::SettingsStore;
 
         let store = Arc::new(SettingsStore::new());
@@ -2808,14 +2840,14 @@ mod tests {
         let resolved = resolve_target_for_role(Some(&store), None, RoleTarget::Orchestrator, None)
             .expect("orchestrator 段构造不应失败");
         assert!(
-            resolved.is_some(),
-            "orchestrator 段已配置时必须返回业务模型 client"
+            resolved.is_none(),
+            "全局 orchestrator 只承载连接配置，旧 model/reasoningEffort 不得生成主对话 client"
         );
     }
 
     #[test]
     fn merge_orchestrator_session_override_applies_model_and_effort() {
-        // 全局 base 提供凭据与默认 model/effort，会话覆盖只改 model + reasoningEffort。
+        // 全局 base 只提供连接凭据，会话覆盖提供 model + reasoningEffort。
         let mut base = serde_json::json!({
             "baseUrl": "https://api.example.com/v1",
             "apiKey": "sk-orch",
@@ -2944,12 +2976,12 @@ mod tests {
             "会话级覆盖存在时必须返回业务模型 client"
         );
 
-        // 不带 session_id 时仍可用全局 base 构造。
+        // 不带 session_id 时不能使用全局旧模型字段构造。
         let global = resolve_target_for_role(Some(&store), None, RoleTarget::Orchestrator, None)
             .expect("orchestrator 段解析不应失败");
         assert!(
-            global.is_some(),
-            "全局 orchestrator base 已配置时必须返回 client"
+            global.is_none(),
+            "全局 orchestrator base 不得返回隐藏默认模型 client"
         );
     }
 
@@ -3076,21 +3108,38 @@ mod tests {
                 "urlMode": "standard",
             }),
         );
+        let session_id = SessionId::new("session-snapshot-model");
+        live_store.set_session_section(
+            &session_id,
+            "orchestrator",
+            serde_json::json!({
+                "model": "model-snapshot",
+            }),
+        );
         let snapshot = Arc::new(live_store.execution_snapshot());
 
         live_store.remove_section("orchestrator");
+        live_store.remove_session_section(&session_id, "orchestrator");
 
-        let snapshot_client =
-            resolve_target_for_role(Some(&snapshot), None, RoleTarget::Orchestrator, None)
-                .expect("快照内的 orchestrator 配置应可解析");
+        let snapshot_client = resolve_target_for_role(
+            Some(&snapshot),
+            None,
+            RoleTarget::Orchestrator,
+            Some(&session_id),
+        )
+        .expect("快照内的 orchestrator 配置应可解析");
         assert!(
             snapshot_client.is_some(),
-            "执行快照必须保留任务接受时的模型配置"
+            "执行快照必须保留任务接受时的会话模型配置"
         );
 
-        let live_client =
-            resolve_target_for_role(Some(&live_store), None, RoleTarget::Orchestrator, None)
-                .expect("实时 settings 查询不应失败");
+        let live_client = resolve_target_for_role(
+            Some(&live_store),
+            None,
+            RoleTarget::Orchestrator,
+            Some(&session_id),
+        )
+        .expect("实时 settings 查询不应失败");
         assert!(
             live_client.is_none(),
             "实时 settings 已删除 orchestrator，不应影响既有执行快照"

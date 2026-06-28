@@ -10,6 +10,7 @@
     statusKey,
     config = $bindable(),
     keyVisible = $bindable(),
+    showModelField = true,
     showAdvancedOptions = true,
     description = null,
     saveStatus,
@@ -31,6 +32,7 @@
     statusKey: string;
     config: any;
     keyVisible: Record<string, boolean>;
+    showModelField?: boolean;
     showAdvancedOptions?: boolean;
     description?: string | null;
     saveStatus: Record<string, string>;
@@ -114,7 +116,7 @@
   const showSavedLabel = $derived(currentSaveStatus === 'saved' && !isDirty);
   const resolvedProtocol = $derived(resolveModelApiProtocol(config));
   const showResolvedProtocol = $derived(
-    Boolean(String(config.model || '').trim()) || config.urlMode === 'full',
+    showModelField && (Boolean(String(config.model || '').trim()) || config.urlMode === 'full'),
   );
 
   function handleModelListAction(event: MouseEvent) {
@@ -203,64 +205,66 @@
       </div>
     </div>
 
-    <div class="llm-config-field">
-      <div class="llm-config-label-row">
-        <label class="llm-config-label">{i18n.t('settings.model.field.model')}</label>
-        {#if showResolvedProtocol}
-          <span
-            class="model-protocol-chip"
-            title={i18n.t('settings.model.protocolHint')}
-          >
-            {i18n.t('settings.model.protocolResolved', {
-              protocol: resolvedProtocol === 'anthropic_messages'
-                ? i18n.t('settings.model.protocol.anthropic')
-                : i18n.t('settings.model.protocol.openai'),
-            })}
-          </span>
-        {/if}
-      </div>
-      <div class="model-combobox" bind:this={comboboxEl}>
-        <input
-          type="text"
-          class="llm-config-input"
-          bind:value={config.model}
-          onfocus={(e) => {
-            if ((modelLists[statusKey]?.length ?? 0) > 0) openModelDropdown(statusKey, e.currentTarget);
-          }}
-        />
-        <button
-          class="model-fetch-btn"
-          onclick={handleModelListAction}
-          aria-label={modelListActionTitle()}
-          title={modelListActionTitle()}
-        >
-          {#if fetchingModels[statusKey]}
-            <Icon name="refresh" size={12} />
-          {:else if (modelLists[statusKey]?.length ?? 0) > 0}
-            <Icon name="chevron-down" size={12} />
-          {:else}
-            <Icon name="download" size={12} />
+    {#if showModelField}
+      <div class="llm-config-field">
+        <div class="llm-config-label-row">
+          <label class="llm-config-label">{i18n.t('settings.model.field.model')}</label>
+          {#if showResolvedProtocol}
+            <span
+              class="model-protocol-chip"
+              title={i18n.t('settings.model.protocolHint')}
+            >
+              {i18n.t('settings.model.protocolResolved', {
+                protocol: resolvedProtocol === 'anthropic_messages'
+                  ? i18n.t('settings.model.protocol.anthropic')
+                  : i18n.t('settings.model.protocol.openai'),
+              })}
+            </span>
           {/if}
-        </button>
-        {#if modelDropdownOpen[statusKey] && (modelLists[statusKey]?.length ?? 0) > 0}
-          <div
-            bind:this={dropdownEl}
-            class="model-dropdown"
-            style="top: {dropdownPosition.top}px; left: {dropdownPosition.left}px; width: {dropdownPosition.width}px;"
+        </div>
+        <div class="model-combobox" bind:this={comboboxEl}>
+          <input
+            type="text"
+            class="llm-config-input"
+            bind:value={config.model}
+            onfocus={(e) => {
+              if ((modelLists[statusKey]?.length ?? 0) > 0) openModelDropdown(statusKey, e.currentTarget);
+            }}
+          />
+          <button
+            class="model-fetch-btn"
+            onclick={handleModelListAction}
+            aria-label={modelListActionTitle()}
+            title={modelListActionTitle()}
           >
-            {#each modelLists[statusKey] as m}
-              <button
-                class="model-dropdown-item"
-                class:selected={config.model === m}
-                onclick={() => { selectModel(statusKey, m); markUserEdited(); }}
-              >
-                {m}
-              </button>
-            {/each}
-          </div>
-        {/if}
+            {#if fetchingModels[statusKey]}
+              <Icon name="refresh" size={12} />
+            {:else if (modelLists[statusKey]?.length ?? 0) > 0}
+              <Icon name="chevron-down" size={12} />
+            {:else}
+              <Icon name="download" size={12} />
+            {/if}
+          </button>
+          {#if modelDropdownOpen[statusKey] && (modelLists[statusKey]?.length ?? 0) > 0}
+            <div
+              bind:this={dropdownEl}
+              class="model-dropdown"
+              style="top: {dropdownPosition.top}px; left: {dropdownPosition.left}px; width: {dropdownPosition.width}px;"
+            >
+              {#each modelLists[statusKey] as m}
+                <button
+                  class="model-dropdown-item"
+                  class:selected={config.model === m}
+                  onclick={() => { selectModel(statusKey, m); markUserEdited(); }}
+                >
+                  {m}
+                </button>
+              {/each}
+            </div>
+          {/if}
+        </div>
       </div>
-    </div>
+    {/if}
 
     {#if showAdvancedOptions}
       <div class="llm-config-field">

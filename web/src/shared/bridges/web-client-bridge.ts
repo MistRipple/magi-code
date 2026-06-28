@@ -1403,14 +1403,23 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
   if (TURN_TERMINAL_EVENTS.has(eventType)) {
     emitCanonicalTurnEventFromRustEvent(event);
     clearActiveTurnInFlight();
+    const terminalErrorCode = trimBridgeString(event.payload?.error_code)
+      || trimBridgeString(event.payload?.errorCode);
+    const terminalPublicMessage = trimBridgeString(event.payload?.public_message)
+      || trimBridgeString(event.payload?.publicMessage)
+      || trimBridgeString(event.payload?.error);
     const terminalReason = eventType === 'session.turn.failed'
-      ? 'session_turn_failed'
+      ? (terminalErrorCode || 'session_turn_failed_without_reason')
       : eventType === 'session.turn.interrupted'
         ? 'session_turn_interrupted'
         : 'session_turn_completed';
     emitForcedProcessingIdle(
       terminalReason,
-      { eventType },
+      {
+        eventType,
+        ...(terminalErrorCode ? { errorCode: terminalErrorCode } : {}),
+        ...(terminalPublicMessage ? { publicMessage: terminalPublicMessage } : {}),
+      },
     );
     refreshBootstrapAfterTerminalTurn(terminalReason);
   }

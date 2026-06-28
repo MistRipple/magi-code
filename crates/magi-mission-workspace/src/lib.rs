@@ -135,7 +135,7 @@ impl MissionWorkspaceStore {
 /// 进程级 MissionWorkspaceStore 缓存，按 workspace_root 聚合。
 pub struct MissionWorkspaceRegistry {
     inner: RwLock<HashMap<String, Arc<MissionWorkspaceStore>>>,
-    fallback_home: PathBuf,
+    magi_home: PathBuf,
 }
 
 impl Default for MissionWorkspaceRegistry {
@@ -146,11 +146,15 @@ impl Default for MissionWorkspaceRegistry {
 
 impl MissionWorkspaceRegistry {
     pub fn new() -> Self {
-        let fallback_home = std::env::temp_dir().join("magi-mission-workspace");
-        let _ = fs::create_dir_all(&fallback_home);
+        Self::with_magi_home(dirs_home().expect("HOME 目录不可用，无法定位 Magi 状态根"))
+    }
+
+    pub fn with_magi_home(magi_home: impl Into<PathBuf>) -> Self {
+        let magi_home = magi_home.into();
+        let _ = fs::create_dir_all(&magi_home);
         Self {
             inner: RwLock::new(HashMap::new()),
-            fallback_home,
+            magi_home,
         }
     }
 
@@ -170,7 +174,7 @@ impl MissionWorkspaceRegistry {
         let store = match MissionWorkspaceStore::open(workspace_root) {
             Ok(store) => store,
             Err(MissionWorkspaceError::HomeDirUnavailable) => {
-                MissionWorkspaceStore::open_with_home(&self.fallback_home, workspace_root)?
+                MissionWorkspaceStore::open_with_home(&self.magi_home, workspace_root)?
             }
             Err(err) => return Err(err),
         };
@@ -260,20 +264,10 @@ mod tests {
     fn registry_caches_store_by_workspace_root() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let ws_root = make_workspace_root(tmp.path());
-        let registry = MissionWorkspaceRegistry::new();
-        // 通过外部环境强制走主路径会污染用户家目录；这里直接验证 fallback 路径下的复用。
-        // 把 HOME 设为不存在的字符串，让 open() 走 fallback_home。
-        let orig_home = std::env::var_os("HOME");
-        // SAFETY: 测试单线程串行运行；恢复时再写回。
-        unsafe { std::env::remove_var("HOME") };
+        let registry = MissionWorkspaceRegistry::with_magi_home(tmp.path());
 
         let a = registry.get_or_open(&ws_root).expect("first open");
         let b = registry.get_or_open(&ws_root).expect("second open");
         assert!(Arc::ptr_eq(&a, &b), "同 workspace_root 必须共享同一 store");
-
-        // restore HOME
-        if let Some(value) = orig_home {
-            unsafe { std::env::set_var("HOME", value) };
-        }
     }
 }

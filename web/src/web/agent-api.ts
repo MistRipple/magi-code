@@ -1433,6 +1433,20 @@ export interface WorkspaceBranchesResult {
   isRepo: boolean;
   currentBranch: string | null;
   branches: string[];
+  status: WorkspaceVcsStatus | null;
+}
+
+export interface WorkspaceVcsStatus {
+  upstream?: string | null;
+  ahead: number;
+  behind: number;
+  hasUncommitted: boolean;
+  staged: number;
+  unstaged: number;
+  untracked: number;
+  conflicted: number;
+  renamed: number;
+  deleted: number;
   additions: number;
   deletions: number;
 }

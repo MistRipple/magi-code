@@ -215,11 +215,10 @@ impl PlanStore {
 }
 // --- Registry
 
-/// 进程级缓存，按 workspace_root 聚合 PlanStore。失败时回退到 `$TMPDIR/magi-plan`，
-/// 避免 home 目录不可写导致整路径不可用。
+/// 进程级缓存，按 workspace_root 聚合 PlanStore。
 pub struct PlanRegistry {
     inner: RwLock<HashMap<String, Arc<PlanStore>>>,
-    fallback_home: PathBuf,
+    magi_home: PathBuf,
 }
 
 impl Default for PlanRegistry {
@@ -230,11 +229,15 @@ impl Default for PlanRegistry {
 
 impl PlanRegistry {
     pub fn new() -> Self {
-        let fallback_home = std::env::temp_dir().join("magi-plan");
-        let _ = fs::create_dir_all(&fallback_home);
+        Self::with_magi_home(dirs_home().expect("HOME 目录不可用，无法定位 Magi 状态根"))
+    }
+
+    pub fn with_magi_home(magi_home: impl Into<PathBuf>) -> Self {
+        let magi_home = magi_home.into();
+        let _ = fs::create_dir_all(&magi_home);
         Self {
             inner: RwLock::new(HashMap::new()),
-            fallback_home,
+            magi_home,
         }
     }
 
@@ -249,7 +252,7 @@ impl PlanRegistry {
         let store = match PlanStore::open(workspace_root) {
             Ok(store) => store,
             Err(PlanError::HomeDirUnavailable) => {
-                PlanStore::open_with_home(&self.fallback_home, workspace_root)?
+                PlanStore::open_with_home(&self.magi_home, workspace_root)?
             }
             Err(err) => return Err(err),
         };

@@ -37,7 +37,7 @@ use magi_session_store::{CanonicalTurnItemKind, SessionStore};
 use magi_snapshot::SnapshotManager;
 use magi_tool_runtime::ToolRegistry;
 use magi_usage_authority::UsageCallStatus;
-use std::{path::PathBuf, sync::Arc};
+use std::{fmt, path::PathBuf, sync::Arc};
 
 const BASE_TOOL_CALL_ROUNDS: usize = 16;
 const MAX_TOOL_CALL_ROUNDS: usize = 32;
@@ -81,6 +81,59 @@ impl SessionTurnExecutionOutput {
         }
     }
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionTurnFailureReason {
+    ModelInvocationFailed,
+    ModelStreamInterrupted,
+    ModelEmptyResponse,
+    ModelEmptyResponseAfterTools,
+    ModelImageInvocationFailed,
+    RuntimeInvalidState,
+}
+
+impl SessionTurnFailureReason {
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::ModelInvocationFailed => "model_invocation_failed",
+            Self::ModelStreamInterrupted => "model_stream_interrupted",
+            Self::ModelEmptyResponse => "model_empty_response",
+            Self::ModelEmptyResponseAfterTools => "model_empty_response_after_tools",
+            Self::ModelImageInvocationFailed => "model_image_invocation_failed",
+            Self::RuntimeInvalidState => "session_turn_runtime_invalid_state",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionTurnExecutionError {
+    pub reason: SessionTurnFailureReason,
+    pub public_message: String,
+}
+
+impl SessionTurnExecutionError {
+    fn new(reason: SessionTurnFailureReason, public_message: impl Into<String>) -> Self {
+        Self {
+            reason,
+            public_message: public_message.into(),
+        }
+    }
+
+    fn runtime_invalid_state() -> Self {
+        Self::new(
+            SessionTurnFailureReason::RuntimeInvalidState,
+            "对话运行状态异常，请重新发送。",
+        )
+    }
+}
+
+impl fmt::Display for SessionTurnExecutionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.public_message)
+    }
+}
+
+impl std::error::Error for SessionTurnExecutionError {}
 
 fn apply_request_aliases(
     item: &mut magi_session_store::ActiveExecutionTurnItem,
@@ -232,7 +285,7 @@ pub struct SessionTurnExecutionRuntime<'a> {
 
 pub fn run_session_turn_execution(
     runtime: SessionTurnExecutionRuntime<'_>,
-) -> Result<SessionTurnExecutionOutput, String> {
+) -> Result<SessionTurnExecutionOutput, SessionTurnExecutionError> {
     let SessionTurnExecutionRuntime {
         client,
         event_bus,
@@ -258,9 +311,7 @@ pub fn run_session_turn_execution(
     let orchestrator_thread_id = session_store
         .orchestrator_thread_for_session(&request.session_id)
         .map(|thread| thread.thread_id)
-        .ok_or_else(|| {
-            "orchestrator thread 缺失：session 必须先经历 ensure_session_mission".to_string()
-        })?;
+        .ok_or_else(SessionTurnExecutionError::runtime_invalid_state)?;
 
     let mut messages = build_session_turn_messages(session_store, &request, &prompt);
     let mut final_content: Option<String> = None;
@@ -300,7 +351,7 @@ pub fn run_session_turn_execution(
                 if !request_turn_is_writable(session_store, &request) {
                     return Ok(SessionTurnExecutionOutput::interrupted());
                 }
-                let public_error = public_session_turn_model_error(&request, &error);
+                let execution_error = session_turn_model_error(&request, &error);
                 append_session_turn_error_item(
                     event_bus,
                     session_store,
@@ -310,12 +361,12 @@ pub fn run_session_turn_execution(
                     request.request_id.as_deref(),
                     request.user_message_id.as_deref(),
                     request.placeholder_message_id.as_deref(),
-                    &public_error,
+                    &execution_error.public_message,
                     main_timeline_entry_id.as_deref(),
                     orchestrator_thread_id.clone(),
                     persist_session_state,
                 );
-                return Err(public_error);
+                return Err(execution_error);
             }
         };
         if streamed_content.interrupted || !request_turn_is_writable(session_store, &request) {
@@ -367,7 +418,7 @@ pub fn run_session_turn_execution(
         if !request_turn_is_writable(session_store, &request) {
             return Ok(SessionTurnExecutionOutput::interrupted());
         }
-        let failure_reason = public_session_turn_empty_response_error(&request, had_tool_calls);
+        let failure = session_turn_empty_response_error(&request, had_tool_calls);
         append_session_turn_error_item(
             event_bus,
             session_store,
@@ -377,12 +428,12 @@ pub fn run_session_turn_execution(
             request.request_id.as_deref(),
             request.user_message_id.as_deref(),
             request.placeholder_message_id.as_deref(),
-            &failure_reason,
+            &failure.public_message,
             main_timeline_entry_id.as_deref(),
             orchestrator_thread_id.clone(),
             persist_session_state,
         );
-        return Err(failure_reason);
+        return Err(failure);
     };
     if !request_turn_is_writable(session_store, &request) {
         return Ok(SessionTurnExecutionOutput::interrupted());
@@ -401,21 +452,52 @@ pub fn run_session_turn_execution(
     Ok(SessionTurnExecutionOutput::completed(final_content))
 }
 
-fn public_session_turn_model_error(request: &SessionTurnExecutionRequest, error: &str) -> String {
+fn session_turn_model_error(
+    request: &SessionTurnExecutionRequest,
+    error: &str,
+) -> SessionTurnExecutionError {
     if !request.images.is_empty() {
-        return public_model_image_invocation_error_message(error);
+        return SessionTurnExecutionError::new(
+            SessionTurnFailureReason::ModelImageInvocationFailed,
+            public_model_image_invocation_error_message(error),
+        );
     }
-    public_model_invocation_error_message(error)
+    let reason = if model_error_is_stream_interruption(error) {
+        SessionTurnFailureReason::ModelStreamInterrupted
+    } else {
+        SessionTurnFailureReason::ModelInvocationFailed
+    };
+    SessionTurnExecutionError::new(reason, public_model_invocation_error_message(error))
 }
 
-fn public_session_turn_empty_response_error(
+fn session_turn_empty_response_error(
     request: &SessionTurnExecutionRequest,
     after_tool_calls: bool,
-) -> String {
+) -> SessionTurnExecutionError {
     if !request.images.is_empty() {
-        return public_model_image_invocation_error_message("empty stream response");
+        return SessionTurnExecutionError::new(
+            SessionTurnFailureReason::ModelImageInvocationFailed,
+            public_model_image_invocation_error_message("empty stream response"),
+        );
     }
-    provider_empty_assistant_response_error(after_tool_calls)
+    let reason = if after_tool_calls {
+        SessionTurnFailureReason::ModelEmptyResponseAfterTools
+    } else {
+        SessionTurnFailureReason::ModelEmptyResponse
+    };
+    SessionTurnExecutionError::new(
+        reason,
+        provider_empty_assistant_response_error(after_tool_calls),
+    )
+}
+
+fn model_error_is_stream_interruption(error: &str) -> bool {
+    let normalized = error.to_ascii_lowercase();
+    normalized.contains("incomplete stream")
+        || normalized.contains("missing terminal")
+        || normalized.contains("stream interrupted")
+        || normalized.contains("stream closed")
+        || normalized.contains("unexpected eof")
 }
 
 struct SessionTurnRoundRuntime<'a> {
@@ -1283,14 +1365,16 @@ mod tests {
             Err(error) => error,
         };
 
-        assert_eq!(error, "模型服务暂时不可用，请稍后重试。");
+        assert_eq!(error.reason, SessionTurnFailureReason::ModelEmptyResponse);
+        assert_eq!(error.public_message, "模型服务暂时不可用，请稍后重试。");
         let turn = store
             .runtime_sidecar(&session_id)
             .and_then(|sidecar| sidecar.current_turn)
             .expect("failed turn should remain visible");
         assert_eq!(turn.status, "failed");
         assert!(turn.items.iter().any(|item| {
-            item.kind == "assistant_error" && item.content.as_deref() == Some(error.as_str())
+            item.kind == "assistant_error"
+                && item.content.as_deref() == Some(error.public_message.as_str())
         }));
     }
 
@@ -1370,14 +1454,19 @@ mod tests {
             Err(error) => error,
         };
 
-        assert_eq!(error, "模型服务暂时不可用，请稍后重试。");
+        assert_eq!(
+            error.reason,
+            SessionTurnFailureReason::ModelStreamInterrupted
+        );
+        assert_eq!(error.public_message, "模型服务暂时不可用，请稍后重试。");
         let turn = store
             .runtime_sidecar(&session_id)
             .and_then(|sidecar| sidecar.current_turn)
             .expect("failed turn should remain visible");
         assert_eq!(turn.status, "failed");
         assert!(turn.items.iter().any(|item| {
-            item.kind == "assistant_error" && item.content.as_deref() == Some(error.as_str())
+            item.kind == "assistant_error"
+                && item.content.as_deref() == Some(error.public_message.as_str())
         }));
         assert!(
             !turn
@@ -1465,8 +1554,12 @@ mod tests {
         };
 
         assert_eq!(
-            error,
+            error.public_message,
             crate::model_error::PUBLIC_MODEL_IMAGE_INVOCATION_FAILURE_MESSAGE
+        );
+        assert_eq!(
+            error.reason,
+            SessionTurnFailureReason::ModelImageInvocationFailed
         );
         let turn = store
             .runtime_sidecar(&session_id)
@@ -1474,7 +1567,8 @@ mod tests {
             .expect("failed turn should remain visible");
         assert_eq!(turn.status, "failed");
         assert!(turn.items.iter().any(|item| {
-            item.kind == "assistant_error" && item.content.as_deref() == Some(error.as_str())
+            item.kind == "assistant_error"
+                && item.content.as_deref() == Some(error.public_message.as_str())
         }));
     }
 

@@ -272,11 +272,10 @@ impl ValidationStore {
 }
 // --- Registry
 
-/// 进程级缓存，按 workspace_root 聚合 ValidationStore。HOME 不可用时退到
-/// `$TMPDIR/magi-validation-runner`，与同 Tier 其它 crate 行为一致。
+/// 进程级缓存，按 workspace_root 聚合 ValidationStore。
 pub struct ValidationRunnerRegistry {
     inner: RwLock<HashMap<String, Arc<ValidationStore>>>,
-    fallback_home: PathBuf,
+    magi_home: PathBuf,
 }
 
 impl Default for ValidationRunnerRegistry {
@@ -287,11 +286,15 @@ impl Default for ValidationRunnerRegistry {
 
 impl ValidationRunnerRegistry {
     pub fn new() -> Self {
-        let fallback_home = std::env::temp_dir().join("magi-validation-runner");
-        let _ = fs::create_dir_all(&fallback_home);
+        Self::with_magi_home(dirs_home().expect("HOME 目录不可用，无法定位 Magi 状态根"))
+    }
+
+    pub fn with_magi_home(magi_home: impl Into<PathBuf>) -> Self {
+        let magi_home = magi_home.into();
+        let _ = fs::create_dir_all(&magi_home);
         Self {
             inner: RwLock::new(HashMap::new()),
-            fallback_home,
+            magi_home,
         }
     }
 
@@ -311,7 +314,7 @@ impl ValidationRunnerRegistry {
         let store = match ValidationStore::open(workspace_root) {
             Ok(store) => store,
             Err(ValidationError::HomeDirUnavailable) => {
-                ValidationStore::open_with_home(&self.fallback_home, workspace_root)?
+                ValidationStore::open_with_home(&self.magi_home, workspace_root)?
             }
             Err(err) => return Err(err),
         };
@@ -909,17 +912,10 @@ mod tests {
     fn registry_caches_store_by_workspace_root() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let ws_root = WorkspaceRootPath::new(tmp.path().to_string_lossy().to_string());
-        let registry = ValidationRunnerRegistry::new();
-        let orig_home = std::env::var_os("HOME");
-        // SAFETY: 测试单线程串行执行；末尾恢复 HOME，确保 sandbox 下走 fallback。
-        unsafe { std::env::remove_var("HOME") };
+        let registry = ValidationRunnerRegistry::with_magi_home(tmp.path());
 
         let s1 = registry.get_or_open(&ws_root).expect("first open");
         let s2 = registry.get_or_open(&ws_root).expect("second open");
         assert!(Arc::ptr_eq(&s1, &s2), "同 root 必须命中缓存返回同一 Arc");
-
-        if let Some(orig) = orig_home {
-            unsafe { std::env::set_var("HOME", orig) };
-        }
     }
 }

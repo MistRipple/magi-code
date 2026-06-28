@@ -7,7 +7,9 @@ use magi_bridge_client::{
     BridgeClientError, BridgeErrorLayer, HttpModelBridgeProtocol, ModelBridgeClient,
     ModelInvocationRequest,
 };
-use magi_conversation_runtime::task_execution_dispatcher::merge_orchestrator_session_override;
+use magi_conversation_runtime::task_execution_dispatcher::{
+    merge_orchestrator_session_override, strip_orchestrator_session_owned_fields,
+};
 use magi_core::{AccessProfile, UtcMillis};
 use magi_usage_authority::{
     SessionSummary, UsageAuthority, UsageCallRecordInput, UsageModelSnapshot, UsageTotals,
@@ -34,6 +36,15 @@ fn unwrap_settings_section_request(request: &serde_json::Value) -> serde_json::V
 
 fn scoped_settings_section_request(request: &serde_json::Value) -> serde_json::Value {
     without_scope_binding_fields(unwrap_settings_section_request(request))
+}
+
+fn orchestrator_connection_section_request(request: &serde_json::Value) -> serde_json::Value {
+    let mut config = scoped_settings_section_request(request);
+    if let Some(map) = config.as_object_mut() {
+        map.remove("model");
+        map.remove("reasoningEffort");
+    }
+    config
 }
 
 fn orchestrator_session_override_request(request: &serde_json::Value) -> Result<Value, ApiError> {
@@ -176,8 +187,8 @@ fn parse_connection_probe_config(request: Value) -> Result<NormalizedModelConfig
 
 async fn execute_connection_probe(config: &NormalizedModelConfig) -> Result<(), ApiError> {
     let client = config
-        .to_http_model_client("__probe__")
-        .ok_or_else(|| ApiError::InvalidInput("模型配置缺少 baseUrl".to_string()))?;
+        .to_http_model_client()
+        .ok_or_else(|| ApiError::InvalidInput("模型配置缺少 model".to_string()))?;
     let request = ModelInvocationRequest {
         provider: "probe".to_string(),
         prompt: "ping".to_string(),
@@ -193,6 +204,63 @@ async fn execute_connection_probe(config: &NormalizedModelConfig) -> Result<(), 
         })?
         .map(|_| ())
         .map_err(model_bridge_probe_error)
+}
+
+async fn fetch_model_ids_for_config(
+    config: &NormalizedModelConfig,
+) -> Result<Vec<String>, ApiError> {
+    let url = config.models_list_url().map_err(ApiError::InvalidInput)?;
+    let api_key = config.require_api_key().map_err(ApiError::InvalidInput)?;
+    let mut headers = HeaderMap::new();
+    headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    match config.inferred_protocol() {
+        HttpModelBridgeProtocol::ChatCompletions => {
+            let auth_value = HeaderValue::from_str(&format!("Bearer {}", api_key))
+                .map_err(|_| ApiError::InvalidInput("apiKey 包含非法字符".to_string()))?;
+            headers.insert(AUTHORIZATION, auth_value);
+        }
+        HttpModelBridgeProtocol::AnthropicMessages => {
+            let key_value = HeaderValue::from_str(&api_key)
+                .map_err(|_| ApiError::InvalidInput("apiKey 包含非法字符".to_string()))?;
+            headers.insert(HeaderName::from_static("x-api-key"), key_value);
+            headers.insert(
+                HeaderName::from_static("anthropic-version"),
+                HeaderValue::from_static("2023-06-01"),
+            );
+        }
+    }
+
+    let response = reqwest::Client::new()
+        .get(url)
+        .headers(headers)
+        .send()
+        .await
+        .map_err(|error| {
+            tracing::warn!(error = %error, "model list request transport failed");
+            ApiError::InvalidInput(model_transport_error_message(&error).to_string())
+        })?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(ApiError::InvalidInput(
+            model_http_status_error_message(status.as_u16()).to_string(),
+        ));
+    }
+    let payload: Value = response.json().await.map_err(|error| {
+        tracing::warn!(error = %error, "model list response parse failed");
+        ApiError::InvalidInput("模型列表响应格式异常".to_string())
+    })?;
+    Ok(parse_model_ids(&payload))
+}
+
+async fn execute_model_catalog_probe(config: &NormalizedModelConfig) -> Result<(), ApiError> {
+    let models = fetch_model_ids_for_config(config).await?;
+    if models.is_empty() {
+        return Err(ApiError::InvalidInput(
+            "该 API 不支持模型列表查询，请在会话中手动填写模型名".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn model_http_status_error_message(status: u16) -> &'static str {
@@ -697,6 +765,7 @@ async fn settings_bootstrap(
                 .get("orchestratorConfig")
                 .cloned()
                 .unwrap_or(Value::Null);
+            strip_orchestrator_session_owned_fields(&mut effective_orchestrator_config);
             let session_orchestrator_config = state
                 .settings_store
                 .get_session_section(session_id, "orchestrator");
@@ -719,6 +788,10 @@ async fn settings_bootstrap(
                 object
                     .get("orchestratorConfig")
                     .cloned()
+                    .map(|mut value| {
+                        strip_orchestrator_session_owned_fields(&mut value);
+                        value
+                    })
                     .unwrap_or_else(|| json!({})),
             );
         }
@@ -817,9 +890,10 @@ async fn save_orchestrator_config(
     State(state): State<ApiState>,
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    state
-        .settings_store
-        .set_section("orchestrator", scoped_settings_section_request(&request));
+    state.settings_store.set_section(
+        "orchestrator",
+        orchestrator_connection_section_request(&request),
+    );
     Ok(Json(serde_json::json!({ "saved": true })))
 }
 
@@ -863,6 +937,7 @@ async fn save_orchestrator_session_config(
     }
 
     let mut effective_config = state.settings_store.get_section("orchestrator");
+    strip_orchestrator_session_owned_fields(&mut effective_config);
     merge_orchestrator_session_override(&mut effective_config, &override_config);
     Ok(Json(serde_json::json!({
         "saved": true,
@@ -877,7 +952,19 @@ async fn test_orchestrator_connection(
     State(_state): State<ApiState>,
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    probe_connection_response(request).await
+    let config = unwrap_settings_section_request(&request);
+    let normalized = NormalizedModelConfig::from_settings_value(&config);
+    normalized
+        .require_base_url()
+        .map_err(ApiError::InvalidInput)?;
+    normalized
+        .require_api_key()
+        .map_err(ApiError::InvalidInput)?;
+    execute_model_catalog_probe(&normalized).await?;
+    Ok(Json(json!({
+        "success": true,
+        "message": "连接测试成功"
+    })))
 }
 
 async fn save_auxiliary_config(
@@ -1072,52 +1159,8 @@ async fn fetch_models(
     Json(request): Json<FetchModelsRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let (config, target) = parse_fetch_models_config(request)?;
-    let url = config.models_list_url().map_err(ApiError::InvalidInput)?;
     let now = UtcMillis::now();
-    let api_key = config.require_api_key().map_err(ApiError::InvalidInput)?;
-    let mut headers = HeaderMap::new();
-    headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
-    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    // 认证 header 按推断协议选：OpenAI 兼容端点用 Bearer，Anthropic 兼容端点用 x-api-key + anthropic-version。
-    // /v1/models 路径在两边都是合法端点，只有 header 是认证语义的分歧点。
-    match config.inferred_protocol() {
-        HttpModelBridgeProtocol::ChatCompletions => {
-            let auth_value = HeaderValue::from_str(&format!("Bearer {}", api_key))
-                .map_err(|_| ApiError::InvalidInput("apiKey 包含非法字符".to_string()))?;
-            headers.insert(AUTHORIZATION, auth_value);
-        }
-        HttpModelBridgeProtocol::AnthropicMessages => {
-            let key_value = HeaderValue::from_str(&api_key)
-                .map_err(|_| ApiError::InvalidInput("apiKey 包含非法字符".to_string()))?;
-            headers.insert(HeaderName::from_static("x-api-key"), key_value);
-            headers.insert(
-                HeaderName::from_static("anthropic-version"),
-                HeaderValue::from_static("2023-06-01"),
-            );
-        }
-    }
-
-    let response = reqwest::Client::new()
-        .get(url)
-        .headers(headers)
-        .send()
-        .await
-        .map_err(|error| {
-            tracing::warn!(error = %error, "model list request transport failed");
-            ApiError::InvalidInput(model_transport_error_message(&error).to_string())
-        })?;
-    let status = response.status();
-    if !status.is_success() {
-        return Err(ApiError::InvalidInput(
-            model_http_status_error_message(status.as_u16()).to_string(),
-        ));
-    }
-    let payload: Value = response.json().await.map_err(|error| {
-        tracing::warn!(error = %error, "model list response parse failed");
-        ApiError::InvalidInput("模型列表响应格式异常".to_string())
-    })?;
-
-    let models = parse_model_ids(&payload);
+    let models = fetch_model_ids_for_config(&config).await?;
     if models.is_empty() {
         return Err(ApiError::InvalidInput(
             "该 API 不支持模型列表查询，请手动填写模型名".to_string(),
@@ -2351,7 +2394,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn save_orchestrator_config_ignores_session_scope_and_writes_global_main_model() {
+    async fn save_orchestrator_config_writes_only_global_connection() {
         let state = test_state();
         let _ = save_orchestrator_config(
             State(state.clone()),
@@ -2360,6 +2403,7 @@ mod tests {
                     "baseUrl": "https://api.example.com/v1",
                     "apiKey": "sk-global",
                     "model": "global-main-model",
+                    "reasoningEffort": "high",
                     "sessionId": "session-a",
                     "workspaceId": "workspace-a"
                 }
@@ -2369,7 +2413,10 @@ mod tests {
         .expect("orchestrator config should save");
 
         let saved = state.settings_store.get_section("orchestrator");
-        assert_eq!(saved["model"], json!("global-main-model"));
+        assert_eq!(saved["baseUrl"], json!("https://api.example.com/v1"));
+        assert_eq!(saved["apiKey"], json!("sk-global"));
+        assert!(saved.get("model").is_none());
+        assert!(saved.get("reasoningEffort").is_none());
         assert!(saved.get("sessionId").is_none());
         assert!(saved.get("workspaceId").is_none());
         assert!(
@@ -2377,7 +2424,7 @@ mod tests {
                 .settings_store
                 .get_session_section(&SessionId::new("session-a"), "orchestrator")
                 .is_null(),
-            "主模型不支持按 session 保存，保存接口只能写全局 orchestrator 段"
+            "全局连接保存接口不得写会话模型覆盖"
         );
     }
 
@@ -2419,8 +2466,8 @@ mod tests {
 
         assert_eq!(response["saved"], json!(true));
         let global = state.settings_store.get_section("orchestrator");
-        assert_eq!(global["model"], json!("global-main-model"));
-        assert_eq!(global["reasoningEffort"], json!("medium"));
+        assert_eq!(global["baseUrl"], json!("https://api.example.com/v1"));
+        assert_eq!(global["apiKey"], json!("sk-global"));
         let saved = state
             .settings_store
             .get_session_section(&session_id, "orchestrator");
@@ -2485,10 +2532,9 @@ mod tests {
         .expect("settings bootstrap should build")
         .0;
 
-        assert_eq!(
-            bootstrap["orchestratorConfig"]["model"],
-            json!("global-main-model"),
-            "设置页仍应看到全局默认主模型"
+        assert!(
+            bootstrap["effectiveOrchestratorConfig"]["model"] != json!("global-main-model"),
+            "全局旧主模型不得进入会话有效配置"
         );
         assert_eq!(
             bootstrap["orchestratorSessionConfig"]["model"],

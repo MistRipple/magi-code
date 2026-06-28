@@ -381,7 +381,7 @@ impl HumanCheckpointStore {
 
 pub struct HumanCheckpointRegistry {
     inner: RwLock<HashMap<String, Arc<HumanCheckpointStore>>>,
-    fallback_home: PathBuf,
+    magi_home: PathBuf,
 }
 
 impl Default for HumanCheckpointRegistry {
@@ -392,11 +392,15 @@ impl Default for HumanCheckpointRegistry {
 
 impl HumanCheckpointRegistry {
     pub fn new() -> Self {
-        let fallback_home = std::env::temp_dir().join("magi-human-checkpoint");
-        let _ = fs::create_dir_all(&fallback_home);
+        Self::with_magi_home(dirs_home().expect("HOME 目录不可用，无法定位 Magi 状态根"))
+    }
+
+    pub fn with_magi_home(magi_home: impl Into<PathBuf>) -> Self {
+        let magi_home = magi_home.into();
+        let _ = fs::create_dir_all(&magi_home);
         Self {
             inner: RwLock::new(HashMap::new()),
-            fallback_home,
+            magi_home,
         }
     }
 
@@ -416,7 +420,7 @@ impl HumanCheckpointRegistry {
         let store = match HumanCheckpointStore::open(workspace_root) {
             Ok(store) => store,
             Err(HumanCheckpointError::HomeDirUnavailable) => {
-                HumanCheckpointStore::open_with_home(&self.fallback_home, workspace_root)?
+                HumanCheckpointStore::open_with_home(&self.magi_home, workspace_root)?
             }
             Err(err) => return Err(err),
         };
@@ -889,11 +893,8 @@ mod tests {
     #[test]
     fn registry_caches_store_by_workspace_root() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let registry = HumanCheckpointRegistry::new();
+        let registry = HumanCheckpointRegistry::with_magi_home(tmp.path());
         let ws = WorkspaceRootPath::new(format!("{}/sample", tmp.path().display()));
-        unsafe {
-            std::env::remove_var("HOME");
-        }
         let s1 = registry.get_or_open(&ws).expect("open 1");
         let s2 = registry.get_or_open(&ws).expect("open 2");
         assert!(Arc::ptr_eq(&s1, &s2));

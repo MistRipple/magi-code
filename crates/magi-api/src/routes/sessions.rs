@@ -3,7 +3,9 @@ use axum::{
     extract::{Query, State},
     routing::{get, post},
 };
-use magi_conversation_runtime::session_turn_execution::SessionTurnExecutionRequest;
+use magi_conversation_runtime::session_turn_execution::{
+    SessionTurnExecutionRequest, SessionTurnFailureReason,
+};
 use magi_conversation_runtime::session_writeback::publish_current_session_turn_item_event;
 use magi_conversation_runtime::{
     MailboxAuthor, MailboxKind, RuntimeSignal, public_builtin_tool_reference_aliases,
@@ -1419,6 +1421,7 @@ fn spawn_regular_session_turn_execution(
                     workspace_id.clone(),
                     accepted_at,
                     route,
+                    SessionTurnFailedReason::DispatcherUnavailable,
                 );
                 schedule_next_queued_regular_session_turn(state, session_id, workspace_id);
                 return;
@@ -1437,6 +1440,7 @@ fn spawn_regular_session_turn_execution(
                 workspace_id.clone(),
                 accepted_at,
                 route,
+                SessionTurnFailedReason::ActiveTurnConflict,
             );
             schedule_next_queued_regular_session_turn(state, session_id, workspace_id);
             return;
@@ -1504,6 +1508,7 @@ fn spawn_regular_session_turn_execution(
                             &session_id,
                             route,
                             Some(&turn_id),
+                            SessionTurnFailedReason::Execution(error.reason),
                         ),
                     )
                     .with_context(EventContext {
@@ -1656,6 +1661,7 @@ fn publish_regular_session_turn_early_failed(
     workspace_id: Option<WorkspaceId>,
     accepted_at: UtcMillis,
     route: SessionTurnRouteDto,
+    reason: SessionTurnFailedReason,
 ) {
     let _ = state
         .session_store
@@ -1666,7 +1672,9 @@ fn publish_regular_session_turn_early_failed(
         EventEnvelope::domain(
             event_id,
             "session.turn.failed",
-            session_turn_failed_event_payload_with_canonical(state, session_id, route, None),
+            session_turn_failed_event_payload_with_canonical(
+                state, session_id, route, None, reason,
+            ),
         )
         .with_context(EventContext {
             session_id: Some(session_id.clone()),
@@ -1747,15 +1755,46 @@ fn session_turn_completed_event_payload(
     payload
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionTurnFailedReason {
+    DispatcherUnavailable,
+    ActiveTurnConflict,
+    Execution(SessionTurnFailureReason),
+}
+
+impl SessionTurnFailedReason {
+    fn code(self) -> &'static str {
+        match self {
+            Self::DispatcherUnavailable => "session_turn_dispatcher_unavailable",
+            Self::ActiveTurnConflict => "session_turn_active_turn_conflict",
+            Self::Execution(reason) => reason.code(),
+        }
+    }
+
+    fn public_message(self) -> &'static str {
+        match self {
+            Self::DispatcherUnavailable | Self::ActiveTurnConflict => {
+                "对话运行状态异常，请重新发送。"
+            }
+            Self::Execution(SessionTurnFailureReason::RuntimeInvalidState) => {
+                "对话运行状态异常，请重新发送。"
+            }
+            Self::Execution(_) => "模型服务暂时不可用，请稍后重试。",
+        }
+    }
+}
+
 fn session_turn_failed_event_payload(
     session_id: &SessionId,
     route: SessionTurnRouteDto,
+    reason: SessionTurnFailedReason,
 ) -> serde_json::Value {
     json!({
         "session_id": session_id.to_string(),
         "route": route,
-        "error": "session_turn_failed",
-        "error_code": "session_turn_failed",
+        "error": reason.public_message(),
+        "error_code": reason.code(),
+        "public_message": reason.public_message(),
     })
 }
 
@@ -1764,8 +1803,9 @@ fn session_turn_failed_event_payload_with_canonical(
     session_id: &SessionId,
     route: SessionTurnRouteDto,
     turn_id: Option<&str>,
+    reason: SessionTurnFailedReason,
 ) -> serde_json::Value {
-    let mut payload = session_turn_failed_event_payload(session_id, route);
+    let mut payload = session_turn_failed_event_payload(session_id, route, reason);
     append_terminal_canonical_payload(&mut payload, state, session_id, turn_id);
     payload
 }
@@ -3066,11 +3106,16 @@ mod tests {
         let payload = session_turn_failed_event_payload(
             &SessionId::new("session-failed-redaction"),
             SessionTurnRouteDto::Chat,
+            SessionTurnFailedReason::Execution(SessionTurnFailureReason::ModelStreamInterrupted),
         );
 
         assert_eq!(payload["session_id"], json!("session-failed-redaction"));
-        assert_eq!(payload["error"], json!("session_turn_failed"));
-        assert_eq!(payload["error_code"], json!("session_turn_failed"));
+        assert_eq!(payload["error"], json!("模型服务暂时不可用，请稍后重试。"));
+        assert_eq!(payload["error_code"], json!("model_stream_interrupted"));
+        assert_eq!(
+            payload["public_message"],
+            json!("模型服务暂时不可用，请稍后重试。")
+        );
         assert!(
             !payload
                 .to_string()
@@ -3115,6 +3160,7 @@ mod tests {
             Some(workspace_id.clone()),
             accepted_at,
             SessionTurnRouteDto::Chat,
+            SessionTurnFailedReason::DispatcherUnavailable,
         );
 
         let current_turn = state
@@ -3134,6 +3180,10 @@ mod tests {
         assert_eq!(failed_event.workspace_id.as_ref(), Some(&workspace_id));
         assert_eq!(failed_event.payload["session_id"], session_id.as_str());
         assert_eq!(failed_event.payload["route"], "chat");
+        assert_eq!(
+            failed_event.payload["error_code"],
+            "session_turn_dispatcher_unavailable"
+        );
         assert_eq!(
             failed_event.payload["canonical_schema_version"],
             CANONICAL_TURN_SCHEMA_VERSION

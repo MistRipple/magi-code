@@ -365,6 +365,17 @@ function createSettingsStore(props: { onClose?: () => void }) {
     };
   }
 
+  function buildOrchestratorConnectionConfigPayload(
+    config: InteractiveModelFormConfig,
+  ): BaseModelConfigPayload {
+    return {
+      baseUrl: config.baseUrl,
+      urlMode: config.urlMode,
+      apiKey: config.apiKey,
+      model: "",
+    };
+  }
+
   function buildWorkerModelConfigPayload(
     config: WorkerModelFormConfig,
   ): WorkerModelConfigPayload {
@@ -1614,7 +1625,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
         await loadRegistryData();
       } else if (target === "orch") {
         await saveAgentOrchestratorConfig(
-          buildInteractiveModelConfigPayload(orchConfig),
+          buildOrchestratorConnectionConfigPayload(orchConfig),
         );
       } else if (target === "comp") {
         await saveAgentAuxiliaryConfig(buildBaseModelConfigPayload(compConfig));

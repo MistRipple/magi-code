@@ -288,7 +288,8 @@
             statusKey="orch"
             bind:config={orchConfig}
             bind:keyVisible
-            showAdvancedOptions={true}
+            showModelField={false}
+            showAdvancedOptions={false}
             description={i18n.t('settings.model.orchestratorDesc')}
             {saveStatus}
             {testStatus}
@@ -377,9 +378,6 @@
             ></span>
             <div class="engine-label-text">
               <span class="engine-name">{i18n.t('settings.model.orchestratorModel')}</span>
-              {#if orchConfig?.model}
-                <span class="engine-model-tag">{orchConfig.model}</span>
-              {/if}
             </div>
           </div>
           <div class="engine-consumers">

@@ -13,7 +13,7 @@
 
   const edits = $derived(ensureArray(messagesState.edits) as Edit[]);
 
-  // ─── 按执行分组分组 ───
+  // ─── 按执行分组展示 ───
   // 最新执行分组 ID：取 edits 列表中最后一个有 executionGroupId 的值（后端已按 timestamp 排序）
   const latestExecutionGroupId = $derived.by(() => {
     if (edits.length === 0) return null;
@@ -23,18 +23,15 @@
     return null;
   });
 
-  // 本轮变更
   const currentRoundEdits = $derived(
     latestExecutionGroupId ? edits.filter(e => e.executionGroupId === latestExecutionGroupId) : []
   );
 
-  // 统一暂存（非本轮）
-  const stagedEdits = $derived(
+  const earlierPendingEdits = $derived(
     latestExecutionGroupId ? edits.filter(e => e.executionGroupId !== latestExecutionGroupId) : edits
   );
 
-  // 是否有两组分组（只有同时存在统一暂存和本轮变更才分组显示）
-  const hasGroups = $derived(stagedEdits.length > 0 && currentRoundEdits.length > 0);
+  const hasGroups = $derived(earlierPendingEdits.length > 0 && currentRoundEdits.length > 0);
 
   // 拆分文件名和目录
   function splitPath(filePath: string): { dir: string; name: string } {
@@ -82,7 +79,7 @@
   }
 
   const changeMutationPending = $derived.by(() => (
-    scopeMatchesActiveChangeMutation(editScope(currentRoundEdits[0] ?? stagedEdits[0] ?? edits[0]))
+    scopeMatchesActiveChangeMutation(editScope(currentRoundEdits[0] ?? earlierPendingEdits[0] ?? edits[0]))
   ));
 
   function approveChange(edit: Edit) {
@@ -96,11 +93,11 @@
 
   function approveAllChanges() {
     if (changeMutationPending || edits.length === 0) return;
-    vscode.postMessage({ type: 'approveAllChanges', ...editScope(currentRoundEdits[0] ?? stagedEdits[0]) });
+    vscode.postMessage({ type: 'approveAllChanges', ...editScope(currentRoundEdits[0] ?? earlierPendingEdits[0]) });
   }
   function revertAllChanges() {
     if (changeMutationPending || edits.length === 0) return;
-    vscode.postMessage({ type: 'revertAllChanges', ...editScope(currentRoundEdits[0] ?? stagedEdits[0]) });
+    vscode.postMessage({ type: 'revertAllChanges', ...editScope(currentRoundEdits[0] ?? earlierPendingEdits[0]) });
   }
   function revertCurrentRound() {
     if (changeMutationPending || !latestExecutionGroupId) return;
@@ -366,11 +363,11 @@
       {#if hasGroups}
         <div class="group-section">
           <div class="group-header">
-            <span class="group-label">{i18n.t('edits.group.staged')}</span>
-            <span class="group-count">{i18n.t('edits.group.stagedCount', { count: stagedEdits.length })}</span>
+            <span class="group-label">{i18n.t('edits.group.earlierPending')}</span>
+            <span class="group-count">{i18n.t('edits.group.earlierPendingCount', { count: earlierPendingEdits.length })}</span>
           </div>
           <div class="file-list">
-            {#each stagedEdits as edit (getEditKey(edit))}
+            {#each earlierPendingEdits as edit (getEditKey(edit))}
               {@render fileRow(edit)}
             {/each}
           </div>

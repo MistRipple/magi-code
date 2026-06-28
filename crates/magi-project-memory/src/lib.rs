@@ -311,18 +311,12 @@ pub struct ProjectMemoryRegistry {
 }
 
 impl ProjectMemoryRegistry {
-    /// 解析 magi home（`~/.magi`）；解析失败时回退到 `$TMPDIR/magi-project-memory`
-    /// 以保证 dispatcher 在 CI / 沙箱环境下仍可构造。生产环境总是命中 `~/.magi`。
     pub fn new() -> Self {
-        let magi_home =
-            magi_home_dir().unwrap_or_else(|_| std::env::temp_dir().join("magi-project-memory"));
-        Self {
-            inner: RwLock::new(HashMap::new()),
-            magi_home,
-        }
+        Self::with_home(magi_home_dir().expect("HOME 目录不可用，无法定位 Magi 状态根"))
     }
 
     pub fn with_home(magi_home: PathBuf) -> Self {
+        let _ = fs::create_dir_all(&magi_home);
         Self {
             inner: RwLock::new(HashMap::new()),
             magi_home,

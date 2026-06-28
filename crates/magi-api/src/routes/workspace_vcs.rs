@@ -1,7 +1,7 @@
 //! 工作区 Git 版本控制端点。
 //!
-//! 仅覆盖主对话输入框左下角分支切换器所需的最小能力：
-//! 读取当前分支 / 本地分支列表，以及切换到已有本地分支。
+//! 覆盖主对话输入框左下角 Git 入口所需能力：
+//! 读取当前分支 / 本地分支列表 / 工作区状态，以及切换到已有本地分支。
 //! 底层直接调用系统 `git` CLI，与用户终端行为一致；不引入 git2/libgit2。
 
 use axum::{Json, Router, extract::State, routing::post};
@@ -42,9 +42,23 @@ struct BranchesResponse {
     is_repo: bool,
     current_branch: Option<String>,
     branches: Vec<String>,
-    /// 未提交改动的新增行数（git diff HEAD，含已暂存+未暂存）。
+    status: Option<WorkspaceVcsStatus>,
+}
+
+#[derive(Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceVcsStatus {
+    upstream: Option<String>,
+    ahead: u64,
+    behind: u64,
+    has_uncommitted: bool,
+    staged: u64,
+    unstaged: u64,
+    untracked: u64,
+    conflicted: u64,
+    renamed: u64,
+    deleted: u64,
     additions: u64,
-    /// 未提交改动的删除行数。
     deletions: u64,
 }
 
@@ -87,8 +101,41 @@ async fn current_branch(workspace_path: &str) -> Option<String> {
     }
 }
 
+async fn current_upstream(workspace_path: &str) -> Option<String> {
+    match run_git(
+        workspace_path,
+        &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+    )
+    .await
+    {
+        Ok((true, stdout, _)) if !stdout.is_empty() => Some(stdout),
+        _ => None,
+    }
+}
+
+async fn ahead_behind(workspace_path: &str) -> (u64, u64) {
+    let Ok((true, stdout, _)) = run_git(
+        workspace_path,
+        &["rev-list", "--left-right", "--count", "@{u}...HEAD"],
+    )
+    .await
+    else {
+        return (0, 0);
+    };
+    let mut parts = stdout.split_whitespace();
+    let behind = parts
+        .next()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    let ahead = parts
+        .next()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    (ahead, behind)
+}
+
 /// 统计未提交改动的新增/删除行数（git diff HEAD --numstat，含已暂存+未暂存）。
-/// 二进制文件 numstat 以 `-` 占位，按 0 行处理。失败时返回 (0, 0)，不阻断分支查询。
+/// 二进制文件 numstat 以 `-` 占位，按 0 行处理。
 async fn uncommitted_diff_stat(workspace_path: &str) -> (u64, u64) {
     let Ok((true, stdout, _)) = run_git(workspace_path, &["diff", "HEAD", "--numstat"]).await
     else {
@@ -106,6 +153,63 @@ async fn uncommitted_diff_stat(workspace_path: &str) -> (u64, u64) {
     (additions, deletions)
 }
 
+fn is_conflicted_status(index_status: char, worktree_status: char) -> bool {
+    matches!(
+        (index_status, worktree_status),
+        ('D', 'D') | ('A', 'U') | ('U', 'D') | ('U', 'A') | ('D', 'U') | ('A', 'A') | ('U', 'U')
+    )
+}
+
+fn apply_porcelain_status_line(status: &mut WorkspaceVcsStatus, line: &str) {
+    let mut chars = line.chars();
+    let index_status = chars.next().unwrap_or(' ');
+    let worktree_status = chars.next().unwrap_or(' ');
+    if matches!((index_status, worktree_status), ('?', '?') | ('!', '!')) {
+        if (index_status, worktree_status) == ('?', '?') {
+            status.untracked += 1;
+        }
+        return;
+    }
+    if index_status != ' ' {
+        status.staged += 1;
+    }
+    if worktree_status != ' ' {
+        status.unstaged += 1;
+    }
+    if is_conflicted_status(index_status, worktree_status) {
+        status.conflicted += 1;
+    }
+    if index_status == 'R' || worktree_status == 'R' {
+        status.renamed += 1;
+    }
+    if index_status == 'D' || worktree_status == 'D' {
+        status.deleted += 1;
+    }
+}
+
+async fn workspace_vcs_status(workspace_path: &str) -> WorkspaceVcsStatus {
+    let mut status = WorkspaceVcsStatus {
+        upstream: current_upstream(workspace_path).await,
+        ..WorkspaceVcsStatus::default()
+    };
+    let (ahead, behind) = ahead_behind(workspace_path).await;
+    status.ahead = ahead;
+    status.behind = behind;
+    if let Ok((true, stdout, _)) = run_git(workspace_path, &["status", "--porcelain"]).await {
+        for line in stdout.lines() {
+            if line.len() >= 2 {
+                apply_porcelain_status_line(&mut status, line);
+            }
+        }
+    }
+    let (additions, deletions) = uncommitted_diff_stat(workspace_path).await;
+    status.additions = additions;
+    status.deletions = deletions;
+    status.has_uncommitted =
+        status.staged > 0 || status.unstaged > 0 || status.untracked > 0 || status.conflicted > 0;
+    status
+}
+
 async fn list_branches(
     State(state): State<ApiState>,
     Json(request): Json<BranchesRequest>,
@@ -120,8 +224,7 @@ async fn list_branches(
             is_repo: false,
             current_branch: None,
             branches: Vec::new(),
-            additions: 0,
-            deletions: 0,
+            status: None,
         }));
     }
 
@@ -139,14 +242,14 @@ async fn list_branches(
         .map(ToOwned::to_owned)
         .collect();
 
-    let (additions, deletions) = uncommitted_diff_stat(workspace_path).await;
+    let current_branch = current_branch(workspace_path).await;
+    let status = workspace_vcs_status(workspace_path).await;
 
     Ok(Json(BranchesResponse {
         is_repo: true,
-        current_branch: current_branch(workspace_path).await,
+        current_branch,
         branches,
-        additions,
-        deletions,
+        status: Some(status),
     }))
 }
 
@@ -181,4 +284,42 @@ async fn checkout_branch(
         current_branch: current_branch(workspace_path).await,
         error: None,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn porcelain_status_counts_git_worktree_states() {
+        let mut status = WorkspaceVcsStatus::default();
+        for line in [
+            "M  staged.txt",
+            " M unstaged.txt",
+            "MM both.txt",
+            "?? new.txt",
+            "R  old.txt -> new.txt",
+            " D removed.txt",
+            "UU conflicted.txt",
+        ] {
+            apply_porcelain_status_line(&mut status, line);
+        }
+
+        assert_eq!(status.staged, 4);
+        assert_eq!(status.unstaged, 4);
+        assert_eq!(status.untracked, 1);
+        assert_eq!(status.renamed, 1);
+        assert_eq!(status.deleted, 1);
+        assert_eq!(status.conflicted, 1);
+    }
+
+    #[test]
+    fn porcelain_status_ignores_ignored_files() {
+        let mut status = WorkspaceVcsStatus::default();
+        apply_porcelain_status_line(&mut status, "!! target/debug");
+
+        assert_eq!(status.staged, 0);
+        assert_eq!(status.unstaged, 0);
+        assert_eq!(status.untracked, 0);
+    }
 }

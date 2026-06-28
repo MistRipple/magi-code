@@ -215,10 +215,9 @@ impl KnowledgeGraphStore {
 // --- Registry
 
 /// 进程级缓存，按 workspace_root 聚合 KnowledgeGraphStore。
-/// HOME 不可用时退到 `$TMPDIR/magi-knowledge-graph`，与同 Tier 其它 crate 行为一致。
 pub struct KnowledgeGraphRegistry {
     inner: RwLock<HashMap<String, Arc<KnowledgeGraphStore>>>,
-    fallback_home: PathBuf,
+    magi_home: PathBuf,
 }
 
 impl Default for KnowledgeGraphRegistry {
@@ -229,11 +228,15 @@ impl Default for KnowledgeGraphRegistry {
 
 impl KnowledgeGraphRegistry {
     pub fn new() -> Self {
-        let fallback_home = std::env::temp_dir().join("magi-knowledge-graph");
-        let _ = fs::create_dir_all(&fallback_home);
+        Self::with_magi_home(dirs_home().expect("HOME 目录不可用，无法定位 Magi 状态根"))
+    }
+
+    pub fn with_magi_home(magi_home: impl Into<PathBuf>) -> Self {
+        let magi_home = magi_home.into();
+        let _ = fs::create_dir_all(&magi_home);
         Self {
             inner: RwLock::new(HashMap::new()),
-            fallback_home,
+            magi_home,
         }
     }
 
@@ -248,7 +251,7 @@ impl KnowledgeGraphRegistry {
         let store = match KnowledgeGraphStore::open(workspace_root) {
             Ok(store) => store,
             Err(KnowledgeGraphError::HomeDirUnavailable) => {
-                KnowledgeGraphStore::open_with_home(&self.fallback_home, workspace_root)?
+                KnowledgeGraphStore::open_with_home(&self.magi_home, workspace_root)?
             }
             Err(err) => return Err(err),
         };
@@ -828,17 +831,10 @@ mod tests {
     fn registry_caches_store_by_workspace_root() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let ws_root = make_workspace_root(tmp.path());
-        let registry = KnowledgeGraphRegistry::new();
-        let orig_home = std::env::var_os("HOME");
-        // SAFETY: 测试单线程串行，结束时恢复。
-        unsafe { std::env::remove_var("HOME") };
+        let registry = KnowledgeGraphRegistry::with_magi_home(tmp.path());
 
         let a = registry.get_or_open(&ws_root).expect("first open");
         let b = registry.get_or_open(&ws_root).expect("second open");
         assert!(Arc::ptr_eq(&a, &b), "同 workspace_root 必须共享同一 store");
-
-        if let Some(value) = orig_home {
-            unsafe { std::env::set_var("HOME", value) };
-        }
     }
 }

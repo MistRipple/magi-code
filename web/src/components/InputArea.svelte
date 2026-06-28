@@ -19,6 +19,7 @@
     fetchWorkspaceBranches,
     checkoutWorkspaceBranch,
     type AgentSettingsBootstrapSnapshot,
+    type WorkspaceVcsStatus,
     settingsBootstrapMatchesCurrentWorkspace,
   } from '../web/agent-api';
   import Icon from './Icon.svelte';
@@ -133,8 +134,7 @@
   let currentBranch = $state<string | null>(null);
   let branchError = $state<string | null>(null);
   let branchIsRepo = $state(false);
-  let branchAdditions = $state(0);
-  let branchDeletions = $state(0);
+  let branchStatus = $state<WorkspaceVcsStatus | null>(null);
   let branchRequestSeq = 0;
   let settingsBootstrapRefreshKey = '';
   let settingsBootstrapRefreshSeq = 0;
@@ -142,6 +142,7 @@
   let accessProfilePickerOpen = $state(false);
   let selectedAccessProfile = $state<AccessProfile>('restricted');
   const currentPickerModel = $derived.by(() => readOrchestratorModel());
+  const mainModelReady = $derived.by(() => currentPickerModel.trim().length > 0);
   const currentPickerReasoningEffort = $derived.by(() => readOrchestratorReasoningEffort());
   const currentPickerReasoningLabel = $derived.by(() => reasoningEffortLabel(currentPickerReasoningEffort));
   // 上下文用量圆环数据：直接取 orchestrator runtime 快照里的 budgetState。
@@ -200,10 +201,13 @@
     if (isSending) {
       return i18n.t('input.followUp.queueTitle');
     }
+    if (!mainModelReady) {
+      return i18n.t('input.mainModelRequired');
+    }
     return i18n.t('input.send');
   });
   const sendDisabled = $derived.by(() => (
-    sessionInputLocked || isInteractionBlocking || sendPreparing || pendingImageReadCount > 0
+    sessionInputLocked || isInteractionBlocking || sendPreparing || pendingImageReadCount > 0 || !mainModelReady
   ));
   // 按钮双态状态 - 使用 $derived 计算
   const hasContent = $derived.by(() => {
@@ -1247,12 +1251,36 @@
   }
 
   // 初次拉取分支状态：决定左下角分支入口是否显示，以及当前分支文案。
-  function applyBranchResult(result: { isRepo: boolean; currentBranch: string | null; branches: string[]; additions: number; deletions: number }) {
+  function applyBranchResult(result: { isRepo: boolean; currentBranch: string | null; branches: string[]; status: WorkspaceVcsStatus | null }) {
     branchIsRepo = result.isRepo;
     currentBranch = result.currentBranch;
     branches = result.branches;
-    branchAdditions = result.additions ?? 0;
-    branchDeletions = result.deletions ?? 0;
+    branchStatus = result.status;
+  }
+
+  function branchStatusItems(status: WorkspaceVcsStatus | null): string[] {
+    if (!status) return [];
+    const items: string[] = [];
+    if (status.staged > 0) items.push(i18n.t('input.branch.status.staged', { count: status.staged }));
+    if (status.unstaged > 0) items.push(i18n.t('input.branch.status.unstaged', { count: status.unstaged }));
+    if (status.untracked > 0) items.push(i18n.t('input.branch.status.untracked', { count: status.untracked }));
+    if (status.conflicted > 0) items.push(i18n.t('input.branch.status.conflicted', { count: status.conflicted }));
+    if (status.ahead > 0 || status.behind > 0) {
+      items.push(i18n.t('input.branch.status.aheadBehind', { ahead: status.ahead, behind: status.behind }));
+    }
+    return items;
+  }
+
+  function branchStatusTitle(): string {
+    const branch = currentBranch || '—';
+    const items = branchStatusItems(branchStatus);
+    if (branchStatus?.additions || branchStatus?.deletions) {
+      items.push(i18n.t('input.branch.status.diffstat', {
+        additions: branchStatus.additions,
+        deletions: branchStatus.deletions,
+      }));
+    }
+    return `${i18n.t('input.branch.title')}: ${branch}${items.length > 0 ? ` · ${items.join(' · ')}` : ` · ${i18n.t('input.branch.status.clean')}`}`;
   }
 
   async function refreshBranchState() {
@@ -1632,14 +1660,25 @@
               class:active={branchPickerOpen}
               onclick={toggleBranchPicker}
               disabled={branchSwitching !== null || sessionInputLocked || isInteractionBlocking}
-              title={`${i18n.t('input.branch.title')}: ${currentBranch || '—'}`}
+              title={branchStatusTitle()}
               aria-expanded={branchPickerOpen}
             >
               <span class="ia-branch-btn-label">{currentBranch || '—'}</span>
-              {#if branchAdditions > 0 || branchDeletions > 0}
+              {#if branchStatus?.conflicted}
+                <span class="ia-branch-alert">!{branchStatus.conflicted}</span>
+              {/if}
+              {#if branchStatus?.additions || branchStatus?.deletions}
                 <span class="ia-branch-diffstat">
-                  <span class="ia-branch-add">+{branchAdditions}</span>
-                  <span class="ia-branch-del">-{branchDeletions}</span>
+                  <span class="ia-branch-add">+{branchStatus?.additions ?? 0}</span>
+                  <span class="ia-branch-del">-{branchStatus?.deletions ?? 0}</span>
+                </span>
+              {/if}
+              {#if branchStatus?.untracked}
+                <span class="ia-branch-untracked">?{branchStatus.untracked}</span>
+              {/if}
+              {#if branchStatus?.ahead || branchStatus?.behind}
+                <span class="ia-branch-sync">
+                  {#if branchStatus?.ahead}↑{branchStatus.ahead}{/if}{#if branchStatus?.behind}↓{branchStatus.behind}{/if}
                 </span>
               {/if}
             </button>
@@ -1649,6 +1688,33 @@
               <div class="ia-popover-backdrop" onclick={() => (branchPickerOpen = false)}></div>
               <div class="ia-picker-popover ia-branch-popover" role="menu">
                 <div class="ia-picker-header">{i18n.t('input.branch.title')}</div>
+                {#if branchStatus}
+                  <div class="ia-branch-status-panel">
+                    <div class="ia-branch-status-main">
+                      {#if branchStatus.hasUncommitted}
+                        {i18n.t('input.branch.status.dirty')}
+                      {:else}
+                        {i18n.t('input.branch.status.clean')}
+                      {/if}
+                    </div>
+                    {#if branchStatus.upstream}
+                      <div class="ia-branch-status-sub">{i18n.t('input.branch.status.upstream', { upstream: branchStatus.upstream })}</div>
+                    {/if}
+                    {#if branchStatusItems(branchStatus).length > 0}
+                      <div class="ia-branch-status-grid">
+                        {#each branchStatusItems(branchStatus) as item (item)}
+                          <span>{item}</span>
+                        {/each}
+                      </div>
+                    {/if}
+                    {#if branchStatus.additions > 0 || branchStatus.deletions > 0}
+                      <div class="ia-branch-status-diff">
+                        <span class="ia-branch-add">+{branchStatus.additions}</span>
+                        <span class="ia-branch-del">-{branchStatus.deletions}</span>
+                      </div>
+                    {/if}
+                  </div>
+                {/if}
                 {#if branchLoading}
                   <div class="ia-picker-status">{i18n.t('input.branch.loading')}</div>
                 {:else if branchError}
@@ -2239,10 +2305,62 @@
   }
   .ia-branch-add { color: var(--success, #2ea043); }
   .ia-branch-del { color: var(--danger, #f85149); }
+  .ia-branch-alert,
+  .ia-branch-untracked,
+  .ia-branch-sync {
+    flex: 0 0 auto;
+    font-size: 10px;
+    font-weight: 650;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+  .ia-branch-alert { color: var(--danger, #f85149); }
+  .ia-branch-untracked { color: color-mix(in srgb, var(--warning, #d29922) 92%, white 8%); }
+  .ia-branch-sync { color: var(--foreground-muted); }
   /* 分支 picker 位于左下角，popover 锚定到左侧（覆盖模型 picker 的 right:0）。 */
   .ia-branch-popover {
     right: auto;
     left: 0;
+  }
+  .ia-branch-status-panel {
+    margin: 4px 0 8px;
+    padding: 8px;
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-sm);
+    background: color-mix(in srgb, var(--surface) 78%, transparent);
+  }
+  .ia-branch-status-main {
+    font-size: 12px;
+    font-weight: 650;
+    color: var(--foreground);
+  }
+  .ia-branch-status-sub {
+    margin-top: 3px;
+    font-size: 10px;
+    color: var(--foreground-muted);
+  }
+  .ia-branch-status-grid {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 5px;
+    margin-top: 7px;
+  }
+  .ia-branch-status-grid span {
+    padding: 2px 6px;
+    border-radius: var(--radius-xs);
+    background: color-mix(in srgb, var(--foreground) 8%, transparent);
+    color: var(--foreground-muted);
+    font-size: 10px;
+    line-height: 14px;
+    white-space: nowrap;
+  }
+  .ia-branch-status-diff {
+    display: flex;
+    gap: 8px;
+    margin-top: 7px;
+    font-size: 11px;
+    font-weight: 650;
+    font-variant-numeric: tabular-nums;
   }
   .ia-picker-popover {
     position: absolute;

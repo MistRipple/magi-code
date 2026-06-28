@@ -171,17 +171,17 @@ impl NormalizedModelConfig {
         }
     }
 
-    pub fn to_http_model_client(&self, default_model: &str) -> Option<HttpModelBridgeClient> {
+    pub fn to_http_model_client(&self) -> Option<HttpModelBridgeClient> {
         let base_url = self.http_client_base_url()?;
-        let model = self
-            .model
-            .clone()
-            .unwrap_or_else(|| default_model.to_string());
+        let model = self.model.as_deref()?.trim();
+        if model.is_empty() {
+            return None;
+        }
         let protocol = self.inferred_protocol_for_model(Some(&model));
         Some(HttpModelBridgeClient::new_with_protocol(
             base_url,
             self.api_key.clone(),
-            model,
+            model.to_string(),
             protocol,
             self.reasoning_effort
                 .map(ModelReasoningEffort::to_usage_reasoning_effort),
@@ -578,7 +578,7 @@ mod tests {
             "urlMode": "standard"
         }));
 
-        assert!(config.to_http_model_client("gpt-4").is_some());
+        assert!(config.to_http_model_client().is_some());
         assert_eq!(
             config.inferred_protocol(),
             HttpModelBridgeProtocol::ChatCompletions
@@ -594,7 +594,7 @@ mod tests {
             "urlMode": "standard"
         }));
 
-        assert!(config.to_http_model_client("gpt-4").is_some());
+        assert!(config.to_http_model_client().is_some());
         assert_eq!(
             config.inferred_protocol(),
             HttpModelBridgeProtocol::AnthropicMessages
@@ -610,7 +610,7 @@ mod tests {
             "urlMode": "full"
         }));
 
-        assert!(config.to_http_model_client("gpt-4").is_some());
+        assert!(config.to_http_model_client().is_some());
         assert_eq!(
             config.inferred_protocol(),
             HttpModelBridgeProtocol::ChatCompletions

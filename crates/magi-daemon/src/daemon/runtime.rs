@@ -1078,6 +1078,7 @@ impl DaemonRuntime {
                 .with_snapshot_manager(state.snapshot_manager.clone())
                 .with_conversation_registry(state.conversation_registry.clone())
                 .with_agent_role_registry(state.agent_role_registry.clone())
+                .with_mission_state_root(self.state_root.clone())
                 .with_lifecycle_notices(lifecycle_notice_registry)
                 .with_mission_metrics_registry(mission_metrics_registry),
         );

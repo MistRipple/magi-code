@@ -6,7 +6,6 @@
   import NotificationCenter from './NotificationCenter.svelte';
   import LanAccessPanel from './LanAccessPanel.svelte';
   import { i18n } from '../stores/i18n.svelte';
-  import { buildSessionMarkdownExport, downloadMarkdown } from '../lib/session-export';
   import { getWebSidebarContext } from '../web/sidebar-context';
   import {
     rightPaneState,
@@ -53,25 +52,6 @@
     messagesState.sessionHydrating
       ? '正在打开新会话面板'
       : (hasCurrentSession && isCurrentSessionEmpty ? i18n.t('header.currentSessionEmpty') : i18n.t('header.newSession'))
-  );
-
-  // 导出当前会话为 Markdown 文件
-  function exportSession() {
-    const payload = buildSessionMarkdownExport();
-    if (!payload) {
-      addToast('warning', i18n.t('header.exportEmpty'));
-      return;
-    }
-    try {
-      downloadMarkdown(payload);
-      addToast('success', i18n.t('header.exportSuccess', { count: payload.messageCount }));
-    } catch (error) {
-      console.warn('[Header] export session failed:', error);
-      addToast('error', i18n.t('header.exportFailed'));
-    }
-  }
-  const exportDisabled = $derived(
-    !messagesState.currentSessionId || ensureArray(appState.threadMessages).length === 0,
   );
 
   // 新建会话
@@ -126,15 +106,6 @@
   <div class="header-actions">
     <button class="btn-icon btn-icon--sm" onclick={newSession} title={newSessionTitle} disabled={newSessionDisabled}>
       <Icon name="plus" size={14} />
-    </button>
-    <button
-      class="btn-icon btn-icon--sm"
-      onclick={exportSession}
-      disabled={exportDisabled}
-      title={i18n.t('header.exportSession')}
-      aria-label={i18n.t('header.exportSession')}
-    >
-      <Icon name="download" size={14} />
     </button>
     <div class="lan-access-wrapper">
       <button
