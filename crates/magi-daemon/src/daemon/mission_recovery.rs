@@ -103,30 +103,26 @@ fn recover_single_mission(
     }
 
     for conversation in &head.open_conversations {
-        // 优先 execution_chain_ref，否则 recovery_ref——两者都是 Checkpoint 写端
-        // 接受的恢复指针（writer 已经保证至少有一个）。
-        let recovery_ref = conversation
-            .recovery_ref
-            .clone()
-            .or_else(|| conversation.execution_chain_ref.clone());
-        let Some(recovery_ref) = recovery_ref else {
-            // 不应到达：写端 `IncompleteRecoverySet::ConversationPointerMissing` 已拒绝。
+        let Some(recovery_ref) = conversation.recovery_ref.clone() else {
             warn!(
                 workspace_id = %workspace_id,
                 mission_id = %mission_id,
                 session_id = %conversation.session_id,
-                "open conversation 缺 recovery_ref 与 execution_chain_ref，写端契约异常",
+                "open conversation 缺 recovery_ref，无法回灌可消费的恢复入口",
             );
             continue;
         };
 
-        write_back_recovery_ref(
+        let attached = write_back_recovery_ref(
             session_store,
             &conversation.session_id,
             recovery_ref.clone(),
             workspace_id,
             mission_id,
         );
+        if !attached {
+            continue;
+        }
 
         publish_mission_resumed_event(
             event_bus,
@@ -143,9 +139,9 @@ fn recover_single_mission(
 
 /// 把 recovery_ref 写回对应 session 的 runtime_sidecar。
 ///
-/// `attach_recovery_ref` 要求 runtime_sidecar 已存在；不存在时返回 `NotFound`。
 /// 在 bootstrap 场景下"sidecar 缺失"是合法状态——例如 mission 数据来自其它环境
-/// 拷贝，或对应 session 已被显式清理。这种情况只 warn，不伪造 sidecar：
+/// 拷贝，或对应 session 已被显式清理。这种情况只 warn，不伪造 sidecar，也不发布
+/// `mission.resumed.from_recovery`，避免 UI 把"发现恢复点"误读成"已经恢复"：
 /// **不要为了避免错误而绕过约束**（cn-engineering-standard：禁止补丁式兼容）。
 fn write_back_recovery_ref(
     session_store: &SessionStore,
@@ -153,7 +149,7 @@ fn write_back_recovery_ref(
     recovery_ref: String,
     workspace_id: &magi_core::WorkspaceId,
     mission_id: &MissionId,
-) {
+) -> bool {
     if session_store.runtime_sidecar(session_id).is_none() {
         warn!(
             workspace_id = %workspace_id,
@@ -161,7 +157,7 @@ fn write_back_recovery_ref(
             session_id = %session_id,
             "session runtime_sidecar 不存在，跳过 recovery_ref 回灌；session 下次真正加载时再恢复",
         );
-        return;
+        return false;
     }
 
     if let Err(err) = session_store.attach_recovery_ref(session_id, Some(recovery_ref)) {
@@ -172,7 +168,9 @@ fn write_back_recovery_ref(
             error = %err,
             "回灌 recovery_ref 失败",
         );
+        return false;
     }
+    true
 }
 
 fn publish_mission_resumed_event(
@@ -378,7 +376,7 @@ mod tests {
     }
 
     #[test]
-    fn mission_without_sidecar_publishes_event_but_does_not_fabricate_sidecar() {
+    fn mission_without_sidecar_does_not_publish_resumed_event_or_fabricate_sidecar() {
         let tmp = TempDir::new().unwrap();
         let home = tmp.path();
         let workspace_root_str = "/Users/test/proj-orphan";
@@ -397,20 +395,19 @@ mod tests {
 
         recover_missions_at_bootstrap(home, &session_store, &workspace_store, &event_bus);
 
-        // sidecar 不存在时仍会发布事件（事件代表"我们感知到了恢复点"），
-        // 但 recovery_ref 不会被回灌（不存在的东西无法 attach）。
-        // 这里我们断言：没有 sidecar 被悄悄伪造出来。
         let sid = SessionId::new(session_id_str);
         assert!(session_store.runtime_sidecar(&sid).is_none());
 
-        // 事件仍然发布：read model / UI 可以据此提醒用户"有可恢复 mission 但缺会话"。
         let snapshot = event_bus.snapshot();
         let resumed: Vec<_> = snapshot
             .recent_events
             .iter()
             .filter(|e| e.event_type == magi_event_bus::task_events::MISSION_RESUMED_FROM_RECOVERY)
             .collect();
-        assert_eq!(resumed.len(), 1);
+        assert!(
+            resumed.is_empty(),
+            "没有实际回灌 recovery_ref 时不能发布已恢复事件"
+        );
     }
 
     #[test]
