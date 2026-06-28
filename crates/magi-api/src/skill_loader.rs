@@ -45,19 +45,8 @@ pub fn instruction_skill_source_available(skill: &Value) -> bool {
     read_available_skill_instruction(Path::new(dir_path)).is_some()
 }
 
-fn normalize_wrapped_section_value(value: &mut Value) {
-    let Some(object) = value.as_object() else {
-        return;
-    };
-    let nested = object.get("config").or_else(|| object.get("data")).cloned();
-    if let Some(nested) = nested {
-        *value = nested;
-    }
-}
-
 fn normalize_skills_config_value(value: Value) -> Map<String, Value> {
     let mut value = value;
-    normalize_wrapped_section_value(&mut value);
     strip_scope_binding_fields(&mut value);
     let mut config = value.as_object().cloned().unwrap_or_default();
     normalize_skills_config_entries(&mut config);
@@ -567,7 +556,7 @@ mod tests {
     }
 
     #[test]
-    fn save_skills_config_object_canonicalizes_wrapped_input_and_removes_obsolete_sections() {
+    fn save_skills_config_object_removes_obsolete_sections_without_loading_them() {
         let store = SettingsStore::new();
         store.set_section(
             "skills",
@@ -581,18 +570,16 @@ mod tests {
         save_skills_config_object(
             &store,
             serde_json::json!({
-                "config": {
-                    "instructionSkills": [
-                        {
-                            "skillId": "saved-skill",
-                            "name": "saved-skill"
-                        }
-                    ]
-                }
+                "instructionSkills": [
+                    {
+                        "skillId": "saved-skill",
+                        "name": "saved-skill"
+                    }
+                ]
             })
             .as_object()
             .cloned()
-            .expect("wrapped config should be an object"),
+            .expect("skills config should be an object"),
         );
 
         assert!(store.get("skills").is_none());

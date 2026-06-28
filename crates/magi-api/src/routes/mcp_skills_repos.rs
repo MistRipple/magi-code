@@ -1046,8 +1046,15 @@ async fn save_skills_config(
     State(state): State<ApiState>,
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let section = unwrap_request_value(&request, &["config"]).clone();
-    let config = section.as_object().cloned().unwrap_or_default();
+    if request.get("config").is_some() || request.get("data").is_some() {
+        return Err(ApiError::InvalidInput(
+            "skillsConfig 必须作为顶层对象提交，不能包裹在 config/data 中".to_string(),
+        ));
+    }
+    let config = request
+        .as_object()
+        .cloned()
+        .ok_or_else(|| ApiError::InvalidInput("skillsConfig 必须是对象".to_string()))?;
     persist_skills_config_object(&state, config);
     Ok(Json(serde_json::json!({ "saved": true })))
 }
@@ -1488,6 +1495,30 @@ mod tests {
         serde_json::from_slice(&bytes).expect("response should be json")
     }
 
+    async fn post_json_with_status(
+        app: Router,
+        path: &str,
+        payload: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body should read");
+        let body = serde_json::from_slice(&bytes).expect("response should be json");
+        (status, body)
+    }
+
     async fn get_json(app: Router, path: &str) -> serde_json::Value {
         let response = app
             .oneshot(
@@ -1707,6 +1738,38 @@ mod tests {
         assert_scope_fields_absent(&stored);
         assert_scope_fields_absent(&stored["instructionSkills"][0]);
         assert_scope_fields_absent(&stored["customTools"][0]);
+    }
+
+    #[tokio::test]
+    async fn skills_config_save_rejects_config_data_wrappers() {
+        for wrapper in ["config", "data"] {
+            let state = test_state();
+            let app = Router::new().merge(routes()).with_state(state);
+
+            let (status, body) = post_json_with_status(
+                app,
+                "/settings/skills/config/save",
+                serde_json::json!({
+                    wrapper: {
+                        "instructionSkills": [
+                            {
+                                "skillId": "wrapped-skill"
+                            }
+                        ]
+                    }
+                }),
+            )
+            .await;
+
+            assert_eq!(status, StatusCode::BAD_REQUEST, "unexpected body: {body}");
+            assert!(
+                body["message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("不能包裹在 config/data 中"),
+                "unexpected body: {body}"
+            );
+        }
     }
 
     #[tokio::test]
