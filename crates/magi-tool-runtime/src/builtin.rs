@@ -290,21 +290,19 @@ pub(crate) fn resolve_path_with_context(
 }
 
 fn execute_file_read(input: &str, context: &ToolExecutionContext) -> String {
-    let request = parse_json_object(input);
-    let path_input = match required_string_or_raw(
-        input,
-        request.as_ref(),
-        &["path", "file_path", "filePath"],
-        "file_read",
-        "缺少文件路径",
-    ) {
-        Ok(value) => value,
-        Err(error) => return error,
+    let request = match parse_json_object(input) {
+        Some(obj) => obj,
+        None => return builtin_error("file_read", "输入必须为 JSON 对象，包含 path 字段"),
+    };
+    let path_input = match field_string(&request, &["path"]) {
+        Some(value) if !value.trim().is_empty() => value,
+        _ => return builtin_error("file_read", "缺少 path 字段"),
     };
 
     let max_bytes = request
-        .as_ref()
-        .and_then(|object| field_usize(object, &["max_bytes", "preview_bytes"]))
+        .get("max_bytes")
+        .and_then(Value::as_u64)
+        .map(|value| value as usize)
         .unwrap_or(64 * 1024)
         .max(1);
 
@@ -1889,11 +1887,11 @@ fn execute_file_write(input: &str, context: &ToolExecutionContext) -> String {
         }
     };
 
-    let path_input = match field_string(&request, &["path", "file_path", "filePath"]) {
+    let path_input = match field_string(&request, &["path"]) {
         Some(p) => p,
         None => return builtin_error("file_write", "缺少 path 字段"),
     };
-    let content = match field_string(&request, &["content", "text", "data"]) {
+    let content = match field_string(&request, &["content"]) {
         Some(c) => c,
         None => return builtin_error("file_write", "缺少 content 字段"),
     };
@@ -1905,8 +1903,14 @@ fn execute_file_write(input: &str, context: &ToolExecutionContext) -> String {
         }
     };
 
-    let overwrite = field_bool(&request, &["overwrite", "force"]).unwrap_or(true);
-    let create_dirs = field_bool(&request, &["create_dirs", "mkdir"]).unwrap_or(true);
+    let overwrite = request
+        .get("overwrite")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let create_dirs = request
+        .get("create_dirs")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
     let existed_before = path.exists();
 
     if existed_before && !overwrite {
@@ -1964,7 +1968,7 @@ fn execute_file_patch(input: &str, context: &ToolExecutionContext) -> String {
         None => return builtin_error("file_patch", "输入必须为 JSON 对象"),
     };
 
-    let path_input = match field_string(&request, &["path", "file_path", "filePath"]) {
+    let path_input = match field_string(&request, &["path"]) {
         Some(p) => p,
         None => return builtin_error("file_patch", "缺少 path 字段"),
     };
@@ -1994,14 +1998,8 @@ fn execute_file_patch(input: &str, context: &ToolExecutionContext) -> String {
         .map(|arr| {
             arr.iter()
                 .filter_map(|p| {
-                    let old = p
-                        .get("old_string")
-                        .or_else(|| p.get("old"))
-                        .and_then(Value::as_str)?;
-                    let new = p
-                        .get("new_string")
-                        .or_else(|| p.get("new"))
-                        .and_then(Value::as_str)?;
+                    let old = p.get("old_string").and_then(Value::as_str)?;
+                    let new = p.get("new_string").and_then(Value::as_str)?;
                     Some((old.to_string(), new.to_string()))
                 })
                 .collect()
@@ -2010,8 +2008,8 @@ fn execute_file_patch(input: &str, context: &ToolExecutionContext) -> String {
     let patches: Vec<(String, String)> = if !patches_from_array.is_empty() {
         patches_from_array
     } else if let (Some(old), Some(new)) = (
-        field_string(&request, &["old_string", "old"]),
-        field_string(&request, &["new_string", "new"]),
+        field_string(&request, &["old_string"]),
+        field_string(&request, &["new_string"]),
     ) {
         vec![(old, new)]
     } else {
@@ -2091,16 +2089,13 @@ fn execute_file_patch(input: &str, context: &ToolExecutionContext) -> String {
 }
 
 fn execute_file_remove(input: &str, context: &ToolExecutionContext) -> String {
-    let request = parse_json_object(input);
-    let path_input = match required_string_or_raw(
-        input,
-        request.as_ref(),
-        &["path", "file_path", "filePath"],
-        "file_remove",
-        "缺少文件路径",
-    ) {
-        Ok(value) => value,
-        Err(error) => return error,
+    let request = match parse_json_object(input) {
+        Some(obj) => obj,
+        None => return builtin_error("file_remove", "输入必须为 JSON 对象，包含 path 字段"),
+    };
+    let path_input = match field_string(&request, &["path"]) {
+        Some(value) if !value.trim().is_empty() => value,
+        _ => return builtin_error("file_remove", "缺少 path 字段"),
     };
 
     let path = match resolve_path_with_context(&path_input, context) {
@@ -2111,8 +2106,8 @@ fn execute_file_remove(input: &str, context: &ToolExecutionContext) -> String {
     };
 
     let recursive = request
-        .as_ref()
-        .and_then(|obj| field_bool(obj, &["recursive", "force"]))
+        .get("recursive")
+        .and_then(Value::as_bool)
         .unwrap_or(false);
 
     if !path.exists() {
@@ -2222,16 +2217,13 @@ fn is_filesystem_root(path: &Path) -> bool {
 }
 
 fn execute_file_mkdir(input: &str, context: &ToolExecutionContext) -> String {
-    let request = parse_json_object(input);
-    let path_input = match required_string_or_raw(
-        input,
-        request.as_ref(),
-        &["path", "file_path", "filePath", "dir_path", "dirPath"],
-        "file_mkdir",
-        "缺少目录路径",
-    ) {
-        Ok(value) => value,
-        Err(error) => return error,
+    let request = match parse_json_object(input) {
+        Some(obj) => obj,
+        None => return builtin_error("file_mkdir", "输入必须为 JSON 对象，包含 path 字段"),
+    };
+    let path_input = match field_string(&request, &["path"]) {
+        Some(value) if !value.trim().is_empty() => value,
+        _ => return builtin_error("file_mkdir", "缺少 path 字段"),
     };
 
     let path = match resolve_path_with_context(&path_input, context) {
@@ -2293,26 +2285,11 @@ fn execute_file_copy(input: &str, context: &ToolExecutionContext) -> String {
         }
     };
 
-    let src_input = match field_string(
-        &request,
-        &["source", "src", "from", "source_path", "sourcePath"],
-    ) {
+    let src_input = match field_string(&request, &["source"]) {
         Some(p) => p,
         None => return builtin_error("file_copy", "缺少 source 字段"),
     };
-    let dst_input = match field_string(
-        &request,
-        &[
-            "destination",
-            "dst",
-            "dest",
-            "to",
-            "destination_path",
-            "destinationPath",
-            "target_path",
-            "targetPath",
-        ],
-    ) {
+    let dst_input = match field_string(&request, &["destination"]) {
         Some(p) => p,
         None => return builtin_error("file_copy", "缺少 destination 字段"),
     };
@@ -2330,7 +2307,10 @@ fn execute_file_copy(input: &str, context: &ToolExecutionContext) -> String {
         }
     };
 
-    let overwrite = field_bool(&request, &["overwrite", "force"]).unwrap_or(false);
+    let overwrite = request
+        .get("overwrite")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
 
     if !src.exists() {
         tracing::warn!(
@@ -2423,26 +2403,11 @@ fn execute_file_move(input: &str, context: &ToolExecutionContext) -> String {
         }
     };
 
-    let src_input = match field_string(
-        &request,
-        &["source", "src", "from", "source_path", "sourcePath"],
-    ) {
+    let src_input = match field_string(&request, &["source"]) {
         Some(p) => p,
         None => return builtin_error("file_move", "缺少 source 字段"),
     };
-    let dst_input = match field_string(
-        &request,
-        &[
-            "destination",
-            "dst",
-            "dest",
-            "to",
-            "destination_path",
-            "destinationPath",
-            "target_path",
-            "targetPath",
-        ],
-    ) {
+    let dst_input = match field_string(&request, &["destination"]) {
         Some(p) => p,
         None => return builtin_error("file_move", "缺少 destination 字段"),
     };
@@ -2460,7 +2425,10 @@ fn execute_file_move(input: &str, context: &ToolExecutionContext) -> String {
         }
     };
 
-    let overwrite = field_bool(&request, &["overwrite", "force"]).unwrap_or(false);
+    let overwrite = request
+        .get("overwrite")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
 
     if !src.exists() {
         tracing::warn!(

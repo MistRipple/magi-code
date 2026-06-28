@@ -1498,9 +1498,7 @@ fn file_remove_invocation_policy(input: &str) -> BuiltinToolInvocationPolicy {
     else {
         return medium_risk_policy();
     };
-    if json_field_string(&request, &["path", "file_path", "target_path"])
-        .is_none_or(|path| path.trim().is_empty())
-    {
+    if json_field_string(&request, &["path"]).is_none_or(|path| path.trim().is_empty()) {
         return medium_risk_policy();
     }
     high_risk_approval_policy()
@@ -2575,7 +2573,7 @@ mod tests {
     }
 
     #[test]
-    fn file_read_supports_raw_path_and_directory_listing() {
+    fn file_read_uses_schema_path_and_directory_listing() {
         let root = unique_temp_dir("magi-tool-file-read");
         let file_path = root.join("hello.txt");
         fs::write(&file_path, "hello\nworld").expect("write file");
@@ -2590,7 +2588,7 @@ mod tests {
                 tool_call_id: ToolCallId::new("tool-call-file-read"),
                 tool_name: BuiltinToolName::FileRead.as_str().to_string(),
                 tool_kind: ToolKind::Builtin,
-                input: file_path.to_string_lossy().to_string(),
+                input: serde_json::json!({ "path": file_path.to_string_lossy() }).to_string(),
                 approval_requirement: ApprovalRequirement::None,
                 risk_level: RiskLevel::Low,
             },
@@ -2633,6 +2631,25 @@ mod tests {
             serde_json::from_str(&dir_output.payload).expect("dir payload json");
         assert_eq!(dir_payload["mode"], "directory");
         assert_eq!(dir_payload["entries"].as_array().expect("entries").len(), 1);
+    }
+
+    #[test]
+    fn file_read_rejects_raw_path_input() {
+        let root = unique_temp_dir("magi-tool-file-read-raw-rejected");
+        let file_path = root.join("hello.txt");
+        fs::write(&file_path, "hello").expect("write file");
+        let registry = make_registry();
+
+        let output = exec_tool(
+            &registry,
+            BuiltinToolName::FileRead,
+            file_path.to_string_lossy().as_ref(),
+        );
+
+        assert_eq!(output.status, ExecutionResultStatus::Failed);
+        let payload: Value = serde_json::from_str(&output.payload).unwrap();
+        assert_eq!(payload["tool"], BuiltinToolName::FileRead.as_str());
+        assert_eq!(payload["error"], "输入必须为 JSON 对象，包含 path 字段");
     }
 
     #[test]
@@ -3383,11 +3400,11 @@ mod tests {
         tool_registry.register_default_builtins();
 
         let cases = [
-            ("file_read", "缺少文件路径"),
+            ("file_read", "缺少 path 字段"),
             ("search_text", "缺少搜索关键词"),
             ("shell_exec", "缺少 shell 命令"),
-            ("file_remove", "缺少文件路径"),
-            ("file_mkdir", "缺少目录路径"),
+            ("file_remove", "缺少 path 字段"),
+            ("file_mkdir", "缺少 path 字段"),
             ("web_search", "缺少搜索关键词 query"),
             ("web_fetch", "缺少 URL"),
             ("search_semantic", "缺少 query 字段"),
@@ -3460,7 +3477,7 @@ mod tests {
                 tool_call_id: ToolCallId::new("tool-call-context-file-read"),
                 tool_name: BuiltinToolName::FileRead.as_str().to_string(),
                 tool_kind: ToolKind::Builtin,
-                input: "marker.txt".to_string(),
+                input: serde_json::json!({ "path": "marker.txt" }).to_string(),
                 approval_requirement: ApprovalRequirement::None,
                 risk_level: RiskLevel::Low,
             },
@@ -3574,7 +3591,7 @@ mod tests {
     }
 
     #[test]
-    fn write_guard_tracks_file_copy_camel_case_destination_alias() {
+    fn write_guard_tracks_file_copy_destination_path() {
         let root = unique_temp_dir("magi-tool-copy-write-guard");
         let source = root.join("source.txt");
         let destination = root.join("target.txt");
@@ -3602,8 +3619,8 @@ mod tests {
             tool_name: BuiltinToolName::FileCopy.as_str().to_string(),
             tool_kind: ToolKind::Builtin,
             input: serde_json::json!({
-                "sourcePath": source.to_string_lossy(),
-                "destinationPath": destination.to_string_lossy()
+                "source": source.to_string_lossy(),
+                "destination": destination.to_string_lossy()
             })
             .to_string(),
             approval_requirement: ApprovalRequirement::None,
@@ -3625,7 +3642,7 @@ mod tests {
                 tool_name: BuiltinToolName::FileWrite.as_str().to_string(),
                 tool_kind: ToolKind::Builtin,
                 input: serde_json::json!({
-                    "filePath": destination.to_string_lossy(),
+                    "path": destination.to_string_lossy(),
                     "content": "blocked"
                 })
                 .to_string(),
@@ -4342,7 +4359,7 @@ mod tests {
                 tool_call_id: ToolCallId::new("tool-call-usage"),
                 tool_name: BuiltinToolName::FileRead.as_str().to_string(),
                 tool_kind: ToolKind::Builtin,
-                input: missing_path.to_string_lossy().to_string(),
+                input: serde_json::json!({ "path": missing_path.to_string_lossy() }).to_string(),
                 approval_requirement: ApprovalRequirement::None,
                 risk_level: RiskLevel::Low,
             },
@@ -4393,7 +4410,7 @@ mod tests {
                 tool_call_id: ToolCallId::new("tc-gov-ok"),
                 tool_name: BuiltinToolName::FileRead.as_str().to_string(),
                 tool_kind: ToolKind::Builtin,
-                input: file_path.to_string_lossy().to_string(),
+                input: serde_json::json!({ "path": file_path.to_string_lossy() }).to_string(),
                 approval_requirement: ApprovalRequirement::None,
                 risk_level: RiskLevel::Low,
             },
@@ -4428,7 +4445,9 @@ mod tests {
                 tool_call_id: ToolCallId::new("tc-gov-fail"),
                 tool_name: BuiltinToolName::FileRead.as_str().to_string(),
                 tool_kind: ToolKind::Builtin,
-                input: root.join("no-such-file.txt").to_string_lossy().to_string(),
+                input:
+                    serde_json::json!({ "path": root.join("no-such-file.txt").to_string_lossy() })
+                        .to_string(),
                 approval_requirement: ApprovalRequirement::None,
                 risk_level: RiskLevel::Low,
             },
@@ -4607,7 +4626,7 @@ mod tests {
                     tool_call_id: ToolCallId::new(format!("tc-q-w1-{}", i)),
                     tool_name: BuiltinToolName::FileRead.as_str().to_string(),
                     tool_kind: ToolKind::Builtin,
-                    input: file.to_string_lossy().to_string(),
+                    input: serde_json::json!({ "path": file.to_string_lossy() }).to_string(),
                     approval_requirement: ApprovalRequirement::None,
                     risk_level: RiskLevel::Low,
                 },
@@ -4621,7 +4640,7 @@ mod tests {
                 tool_call_id: ToolCallId::new("tc-q-w2-0"),
                 tool_name: BuiltinToolName::FileRead.as_str().to_string(),
                 tool_kind: ToolKind::Builtin,
-                input: file.to_string_lossy().to_string(),
+                input: serde_json::json!({ "path": file.to_string_lossy() }).to_string(),
                 approval_requirement: ApprovalRequirement::None,
                 risk_level: RiskLevel::Low,
             },
@@ -4700,7 +4719,7 @@ mod tests {
                 tool_call_id: ToolCallId::new("tc-policy-denied"),
                 tool_name: BuiltinToolName::FileRead.as_str().to_string(),
                 tool_kind: ToolKind::Builtin,
-                input: file.to_string_lossy().to_string(),
+                input: serde_json::json!({ "path": file.to_string_lossy() }).to_string(),
                 approval_requirement: ApprovalRequirement::None,
                 risk_level: RiskLevel::Low,
             },
@@ -4736,7 +4755,7 @@ mod tests {
                 tool_call_id: ToolCallId::new("tc-policy-not-allowed"),
                 tool_name: BuiltinToolName::FileRead.as_str().to_string(),
                 tool_kind: ToolKind::Builtin,
-                input: file.to_string_lossy().to_string(),
+                input: serde_json::json!({ "path": file.to_string_lossy() }).to_string(),
                 approval_requirement: ApprovalRequirement::None,
                 risk_level: RiskLevel::Low,
             },
@@ -4753,7 +4772,7 @@ mod tests {
                 tool_call_id: ToolCallId::new("tc-policy-ok"),
                 tool_name: BuiltinToolName::FileRead.as_str().to_string(),
                 tool_kind: ToolKind::Builtin,
-                input: file.to_string_lossy().to_string(),
+                input: serde_json::json!({ "path": file.to_string_lossy() }).to_string(),
                 approval_requirement: ApprovalRequirement::None,
                 risk_level: RiskLevel::Low,
             },
@@ -4818,7 +4837,7 @@ mod tests {
                 tool_call_id: ToolCallId::new("chain-1-ok"),
                 tool_name: BuiltinToolName::FileRead.as_str().to_string(),
                 tool_kind: ToolKind::Builtin,
-                input: file.to_string_lossy().to_string(),
+                input: serde_json::json!({ "path": file.to_string_lossy() }).to_string(),
                 approval_requirement: ApprovalRequirement::None,
                 risk_level: RiskLevel::Low,
             },
@@ -4860,7 +4879,9 @@ mod tests {
                 tool_call_id: ToolCallId::new("chain-4-fail"),
                 tool_name: BuiltinToolName::FileRead.as_str().to_string(),
                 tool_kind: ToolKind::Builtin,
-                input: root.join("nonexistent.txt").to_string_lossy().to_string(),
+                input:
+                    serde_json::json!({ "path": root.join("nonexistent.txt").to_string_lossy() })
+                        .to_string(),
                 approval_requirement: ApprovalRequirement::None,
                 risk_level: RiskLevel::Low,
             },
@@ -4874,7 +4895,7 @@ mod tests {
                 tool_call_id: ToolCallId::new("chain-5-policy"),
                 tool_name: BuiltinToolName::FileRead.as_str().to_string(),
                 tool_kind: ToolKind::Builtin,
-                input: file.to_string_lossy().to_string(),
+                input: serde_json::json!({ "path": file.to_string_lossy() }).to_string(),
                 approval_requirement: ApprovalRequirement::None,
                 risk_level: RiskLevel::Low,
             },
@@ -5463,13 +5484,12 @@ mod tests {
     }
 
     #[test]
-    fn file_tools_accept_camel_case_path_aliases() {
+    fn file_tools_reject_non_schema_path_aliases() {
         let root = unique_temp_dir("magi-tool-file-aliases");
         let registry = make_registry();
         let file = root.join("alias.txt");
-        let copy = root.join("alias-copy.txt");
-        let moved = root.join("alias-moved.txt");
         let dir = root.join("alias-dir").join("nested");
+        fs::write(&file, "canonical content").expect("write source");
 
         let write = exec_tool(
             &registry,
@@ -5480,47 +5500,45 @@ mod tests {
             })
             .to_string(),
         );
-        assert_eq!(write.status, ExecutionResultStatus::Succeeded);
+        assert_eq!(write.status, ExecutionResultStatus::Failed);
 
         let read = exec_tool(
             &registry,
             BuiltinToolName::FileRead,
             &serde_json::json!({ "filePath": file.to_string_lossy() }).to_string(),
         );
-        assert_eq!(read.status, ExecutionResultStatus::Succeeded);
+        assert_eq!(read.status, ExecutionResultStatus::Failed);
 
         let mkdir = exec_tool(
             &registry,
             BuiltinToolName::FileMkdir,
             &serde_json::json!({ "dirPath": dir.to_string_lossy() }).to_string(),
         );
-        assert_eq!(mkdir.status, ExecutionResultStatus::Succeeded);
-        assert!(dir.is_dir());
+        assert_eq!(mkdir.status, ExecutionResultStatus::Failed);
+        assert!(!dir.exists());
 
         let copied = exec_tool(
             &registry,
             BuiltinToolName::FileCopy,
             &serde_json::json!({
                 "sourcePath": file.to_string_lossy(),
-                "destinationPath": copy.to_string_lossy()
+                "destinationPath": root.join("alias-copy.txt").to_string_lossy()
             })
             .to_string(),
         );
-        assert_eq!(copied.status, ExecutionResultStatus::Succeeded);
-        assert_eq!(fs::read_to_string(&copy).unwrap(), "alias content");
+        assert_eq!(copied.status, ExecutionResultStatus::Failed);
 
         let moved_output = exec_tool(
             &registry,
             BuiltinToolName::FileMove,
             &serde_json::json!({
-                "sourcePath": copy.to_string_lossy(),
-                "destinationPath": moved.to_string_lossy()
+                "sourcePath": file.to_string_lossy(),
+                "destinationPath": root.join("alias-moved.txt").to_string_lossy()
             })
             .to_string(),
         );
-        assert_eq!(moved_output.status, ExecutionResultStatus::Succeeded);
-        assert!(!copy.exists());
-        assert_eq!(fs::read_to_string(&moved).unwrap(), "alias content");
+        assert_eq!(moved_output.status, ExecutionResultStatus::Failed);
+        assert_eq!(fs::read_to_string(&file).unwrap(), "canonical content");
     }
 
     #[test]

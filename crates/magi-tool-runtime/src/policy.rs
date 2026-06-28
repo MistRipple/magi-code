@@ -350,23 +350,8 @@ impl ToolRegistry {
         if let Some(object) = &request {
             for key in [
                 "path",
-                "file_path",
-                "filePath",
-                "dir_path",
-                "dirPath",
                 "source",
-                "src",
-                "from",
-                "source_path",
-                "sourcePath",
                 "destination",
-                "dst",
-                "dest",
-                "to",
-                "destination_path",
-                "destinationPath",
-                "target_path",
-                "targetPath",
                 "cwd",
                 "working_directory",
                 "workingDirectory",
@@ -376,18 +361,6 @@ impl ToolRegistry {
                 if let Some(value) = field_string(object, &[key]) {
                     if let Ok(path) = resolve_path_with_context(&value, context) {
                         paths.push(normalize_path_for_lock(&path));
-                    }
-                }
-            }
-
-            for key in ["paths", "file_paths", "target_paths"] {
-                if let Some(values) = object.get(key).and_then(Value::as_array) {
-                    for value in values {
-                        if let Some(path_value) = value.as_str() {
-                            if let Ok(path) = resolve_path_with_context(path_value, context) {
-                                paths.push(normalize_path_for_lock(&path));
-                            }
-                        }
                     }
                 }
             }
@@ -640,81 +613,32 @@ pub fn tool_path_access_requests(
 
     match tool {
         crate::BuiltinToolName::FileRead | crate::BuiltinToolName::ViewImage => {
-            push_tool_path_fields(
-                &mut paths,
-                object,
-                &["path", "file_path", "filePath", "image_path", "imagePath"],
-                read,
-                workspace_root_path,
-            );
-            push_raw_path_argument(&mut paths, object, arguments, read, workspace_root_path);
+            push_tool_path_fields(&mut paths, object, &["path"], read, workspace_root_path);
         }
         crate::BuiltinToolName::FileWrite
         | crate::BuiltinToolName::FilePatch
         | crate::BuiltinToolName::FileRemove => {
-            push_tool_path_fields(
-                &mut paths,
-                object,
-                &["path", "file_path", "filePath"],
-                write,
-                workspace_root_path,
-            );
+            push_tool_path_fields(&mut paths, object, &["path"], write, workspace_root_path);
         }
         crate::BuiltinToolName::FileMkdir => {
-            push_tool_path_fields(
-                &mut paths,
-                object,
-                &["path", "file_path", "filePath", "dir_path", "dirPath"],
-                write,
-                workspace_root_path,
-            );
+            push_tool_path_fields(&mut paths, object, &["path"], write, workspace_root_path);
         }
         crate::BuiltinToolName::FileCopy => {
+            push_tool_path_fields(&mut paths, object, &["source"], read, workspace_root_path);
             push_tool_path_fields(
                 &mut paths,
                 object,
-                &["source", "src", "from", "source_path", "sourcePath"],
-                read,
-                workspace_root_path,
-            );
-            push_tool_path_fields(
-                &mut paths,
-                object,
-                &[
-                    "destination",
-                    "dst",
-                    "dest",
-                    "to",
-                    "destination_path",
-                    "destinationPath",
-                    "target_path",
-                    "targetPath",
-                ],
+                &["destination"],
                 write,
                 workspace_root_path,
             );
         }
         crate::BuiltinToolName::FileMove => {
+            push_tool_path_fields(&mut paths, object, &["source"], write, workspace_root_path);
             push_tool_path_fields(
                 &mut paths,
                 object,
-                &["source", "src", "from", "source_path", "sourcePath"],
-                write,
-                workspace_root_path,
-            );
-            push_tool_path_fields(
-                &mut paths,
-                object,
-                &[
-                    "destination",
-                    "dst",
-                    "dest",
-                    "to",
-                    "destination_path",
-                    "destinationPath",
-                    "target_path",
-                    "targetPath",
-                ],
+                &["destination"],
                 write,
                 workspace_root_path,
             );
@@ -850,26 +774,6 @@ fn push_tool_path_fields(
             });
         }
     }
-}
-
-fn push_raw_path_argument(
-    paths: &mut Vec<ToolPathAccessRequest>,
-    object: Option<&serde_json::Map<String, Value>>,
-    arguments: &str,
-    kind: magi_permissions::PathAccessKind,
-    workspace_root_path: Option<&Path>,
-) {
-    if object.is_some() {
-        return;
-    }
-    let path = arguments.trim();
-    if path.is_empty() {
-        return;
-    }
-    paths.push(ToolPathAccessRequest {
-        absolute_path: resolve_tool_path(path, workspace_root_path),
-        kind,
-    });
 }
 
 fn dedup_path_accesses(paths: Vec<ToolPathAccessRequest>) -> Vec<ToolPathAccessRequest> {

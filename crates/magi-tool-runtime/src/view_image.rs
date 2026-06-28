@@ -15,13 +15,13 @@ const IMAGE_ACCESS_PUBLIC_ERROR: &str = "图片不可读取或不存在";
 
 pub(crate) fn execute_view_image(input: &str, context: &ToolExecutionContext) -> String {
     let request = parse_json_object(input);
-    let path_value = match requested_path(input, request.as_ref()) {
+    let path_value = match requested_path(request.as_ref()) {
         Ok(path) => path,
         Err(error) => return view_image_error(error),
     };
     let max_bytes = request
         .as_ref()
-        .and_then(|object| field_u64(object, &["max_bytes", "maxBytes"]))
+        .and_then(|object| field_u64(object, &["max_bytes"]))
         .unwrap_or(DEFAULT_MAX_IMAGE_BYTES)
         .min(HARD_MAX_IMAGE_BYTES);
 
@@ -93,31 +93,20 @@ pub(crate) fn execute_view_image(input: &str, context: &ToolExecutionContext) ->
     .to_string()
 }
 
-fn requested_path(
-    input: &str,
-    request: Option<&serde_json::Map<String, Value>>,
-) -> Result<String, String> {
+fn requested_path(request: Option<&serde_json::Map<String, Value>>) -> Result<String, String> {
     let value = match request {
-        Some(object) => field_string(
-            object,
-            &["path", "file_path", "filePath", "image_path", "imagePath"],
-        ),
-        None => Some(input.trim().to_string()),
+        Some(object) => field_string(object, &["path"]),
+        None => None,
     }
     .map(|value| value.trim().to_string())
     .filter(|value| !value.is_empty());
 
-    value.ok_or_else(|| "view_image 需要 path 字段或原始路径字符串".to_string())
+    value.ok_or_else(|| "view_image 需要 path 字段".to_string())
 }
 
 fn field_u64(object: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<u64> {
-    keys.iter().find_map(|key| {
-        object.get(*key).and_then(|value| {
-            value
-                .as_u64()
-                .or_else(|| value.as_str().and_then(|value| value.parse::<u64>().ok()))
-        })
-    })
+    keys.iter()
+        .find_map(|key| object.get(*key).and_then(Value::as_u64))
 }
 
 fn detect_supported_image_mime(bytes: &[u8]) -> Option<&'static str> {
@@ -220,7 +209,7 @@ mod tests {
     }
 
     #[test]
-    fn view_image_accepts_camel_case_path_alias() {
+    fn view_image_rejects_non_schema_path_alias() {
         let root = unique_temp_dir("magi-view-image-file-path");
         fs::write(root.join("pixel.png"), ONE_BY_ONE_PNG).expect("write png");
 
@@ -230,8 +219,8 @@ mod tests {
         );
         let payload: Value = serde_json::from_str(&output).expect("json output");
 
-        assert_eq!(payload["status"], "succeeded");
-        assert_eq!(payload["mime"], "image/png");
+        assert_eq!(payload["status"], "failed");
+        assert_eq!(payload["error"], "view_image 需要 path 字段");
     }
 
     #[test]
@@ -239,7 +228,10 @@ mod tests {
         let root = unique_temp_dir("magi-view-image-invalid");
         fs::write(root.join("not-image.txt"), b"hello").expect("write text");
 
-        let output = execute_view_image("not-image.txt", &context(root));
+        let output = execute_view_image(
+            &serde_json::json!({ "path": "not-image.txt" }).to_string(),
+            &context(root),
+        );
         let payload: Value = serde_json::from_str(&output).expect("json output");
 
         assert_eq!(payload["status"], "failed");
@@ -258,7 +250,10 @@ mod tests {
     fn view_image_hides_file_access_details() {
         let root = unique_temp_dir("magi-view-image-missing");
 
-        let output = execute_view_image("missing.png", &context(root));
+        let output = execute_view_image(
+            &serde_json::json!({ "path": "missing.png" }).to_string(),
+            &context(root),
+        );
         let payload: Value = serde_json::from_str(&output).expect("json output");
 
         assert_eq!(payload["status"], "failed");
