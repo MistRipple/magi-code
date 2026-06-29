@@ -124,6 +124,7 @@ export interface MCPServer {
 }
 
 export interface SkillItem {
+  skillId: string;
   name: string;
   description: string;
   source: "custom" | "instruction";
@@ -2095,7 +2096,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
       );
 
       if (localSkill) {
-        const localSkillId = localSkill.localSkillId || localSkill.fullName || localSkill.name;
+        const localSkillId = localSkill.localSkillId;
         if (!localSkillScanRootPath || !localSkillId) {
           localSkillInstallError = i18n.t(
             "settings.skillLibrary.localImportFailed",
@@ -2121,7 +2122,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
           notifySettingsSuccess(i18n.t("settings.toast.localSkillInstalled"));
         }
       } else {
-        // Remote skill: install via normal endpoint
+        // 远程 Skill 通过标准安装入口写入 skillId。
         const result = await installAgentSkill(skillFullName);
         installingSkills.delete(skillFullName);
         installingSkills = new Set(installingSkills);
@@ -2132,7 +2133,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
             typeof libPayload.failedRepositoryCount === "number" && Number.isFinite(libPayload.failedRepositoryCount)
               ? libPayload.failedRepositoryCount
               : 0;
-          // Preserve local entries
+          // 刷新远程列表时保留当前本地扫描结果。
           const localEntries = librarySkills.filter((s) => s.repositoryId === "__local__");
           librarySkills = [
             ...skillsList.map((s: any) => ({
@@ -2226,8 +2227,8 @@ function createSettingsStore(props: { onClose?: () => void }) {
       }
       localSkillScanRootPath = path;
       const localEntries: LibrarySkill[] = scannedSkills.map((s: any) => ({
-        name: s.name || s.skillName || "",
-        fullName: s.fullName || s.name || s.skillName || "",
+        name: s.name || s.skillId || "",
+        fullName: s.fullName || s.name || s.skillId || "",
         description: s.description || "",
         author: "",
         version: "",
@@ -2237,7 +2238,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
         repositoryName: i18n.t("settings.skillLibrary.localDirectory"),
         installed: false,
         icon: "",
-        localSkillId: s.localSkillId || s.skillId || s.skillName || s.name || "",
+        localSkillId: s.localSkillId || s.skillId || "",
       }));
       librarySkills = [
         ...librarySkills.filter((s) => s.repositoryId !== "__local__"),
@@ -2280,7 +2281,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
       i18n.t(confirmKey, { name: skill.name }),
       async () => {
         try {
-          await removeAgentInstalledSkill(skill.name, skill.source);
+          await removeAgentInstalledSkill(skill.skillId, skill.source);
           const payload = await fetchCurrentSettingsBootstrap();
           if (payload) {
             applySkillsConfig(payload.skillsConfig);
@@ -2587,6 +2588,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
       for (const tool of config.customTools) {
         skillList.push({
           name: tool.name,
+          skillId: tool.name,
           description: tool.description || "",
           source: "custom",
         });
@@ -2595,7 +2597,8 @@ function createSettingsStore(props: { onClose?: () => void }) {
     if (Array.isArray(config?.instructionSkills)) {
       for (const skill of config.instructionSkills) {
         skillList.push({
-          name: skill.name,
+          skillId: skill.skillId,
+          name: skill.name || skill.skillId,
           description: skill.description || "",
           source: "instruction",
         });

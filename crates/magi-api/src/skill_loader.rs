@@ -57,13 +57,40 @@ fn normalize_skills_config_entries(config: &mut Map<String, Value>) {
         .get_mut("instructionSkills")
         .and_then(Value::as_array_mut)
     {
-        for entry in entries {
-            strip_scope_binding_fields(entry);
-        }
+        normalize_instruction_skill_entries(entries);
     }
     if let Some(entries) = config.get_mut("customTools").and_then(Value::as_array_mut) {
         normalize_custom_tool_entries(entries);
     }
+}
+
+fn normalize_instruction_skill_entries(entries: &mut Vec<Value>) {
+    entries.retain_mut(|entry| {
+        strip_scope_binding_fields(entry);
+        let Some(object) = entry.as_object_mut() else {
+            return false;
+        };
+        object.remove("skillName");
+        let Some(skill_id) = object
+            .get("skillId")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+        else {
+            return false;
+        };
+        if object
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or_default()
+            .is_empty()
+        {
+            object.insert("name".to_string(), Value::String(skill_id));
+        }
+        true
+    });
 }
 
 fn normalize_custom_tool_entries(entries: &mut Vec<Value>) {
@@ -619,9 +646,14 @@ mod tests {
                 "instructionSkills": [
                     {
                         "skillId": "saved-skill",
+                        "skillName": "legacy-saved-skill",
                         "workspaceId": "workspace-old",
                         "session_id": "session-old"
-                    }
+                    },
+                    {
+                        "skillName": "legacy-skill-name-only"
+                    },
+                    "invalid-instruction-skill"
                 ],
                 "customTools": [
                     {
@@ -653,6 +685,22 @@ mod tests {
         }
         assert!(saved["instructionSkills"][0].get("workspaceId").is_none());
         assert!(saved["instructionSkills"][0].get("session_id").is_none());
+        assert_eq!(
+            saved["instructionSkills"]
+                .as_array()
+                .expect("instructionSkills should be array")
+                .len(),
+            1
+        );
+        assert_eq!(
+            saved["instructionSkills"][0]["skillId"],
+            serde_json::json!("saved-skill")
+        );
+        assert_eq!(
+            saved["instructionSkills"][0]["name"],
+            serde_json::json!("saved-skill")
+        );
+        assert!(saved["instructionSkills"][0].get("skillName").is_none());
         assert_eq!(
             saved["customTools"]
                 .as_array()

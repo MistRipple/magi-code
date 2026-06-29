@@ -112,9 +112,8 @@ fn normalize_instruction_skill_entry(
         .ok_or_else(|| ApiError::InvalidInput("skillId 不能为空".to_string()))?;
     let mut entry = request.as_object().cloned().unwrap_or_default();
     strip_scope_binding_fields_from_map(&mut entry);
-    entry.insert("name".to_string(), serde_json::json!(skill_id));
-    entry.insert("skillName".to_string(), serde_json::json!(skill_id));
     entry.insert("skillId".to_string(), serde_json::json!(skill_id));
+    entry.insert("name".to_string(), serde_json::json!(skill_id));
     if entry
         .get("fullName")
         .and_then(|value| value.as_str())
@@ -152,7 +151,6 @@ fn build_local_instruction_skill_entry(
     let description = read_local_skill_description(dir);
     Ok(serde_json::json!({
         "name": skill_name,
-        "skillName": skill_name,
         "skillId": skill_name,
         "fullName": skill_name,
         "directoryPath": directory_path,
@@ -229,28 +227,25 @@ fn remove_instruction_skill_from_list(
 ) -> bool {
     let before_len = instruction_skills.len();
     instruction_skills.retain(|item| {
-        !["skillName", "name", "skillId"].iter().any(|field| {
-            item.get(*field)
-                .and_then(|value| value.as_str())
-                .is_some_and(|value| value == skill_name)
-        })
+        item.get("skillId")
+            .and_then(|value| value.as_str())
+            .is_none_or(|value| value != skill_name)
     });
     instruction_skills.len() != before_len
 }
 
-fn instruction_skill_name(item: &serde_json::Value) -> Option<String> {
-    ["skillName", "name", "skillId"]
-        .iter()
-        .find_map(|field| item.get(*field).and_then(|value| value.as_str()))
-        .map(|value| value.to_string())
+fn instruction_skill_id(item: &serde_json::Value) -> Option<String> {
+    item.get("skillId")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 fn instruction_skill_matches(item: &serde_json::Value, skill_name: &str) -> bool {
-    ["skillName", "name", "skillId"].iter().any(|field| {
-        item.get(*field)
-            .and_then(|value| value.as_str())
-            .is_some_and(|value| value == skill_name)
-    })
+    item.get("skillId")
+        .and_then(|value| value.as_str())
+        .is_some_and(|value| value == skill_name)
 }
 
 fn normalize_local_instruction_skill_request_path(
@@ -268,9 +263,9 @@ fn normalize_local_instruction_skill_request_path(
 fn normalize_local_instruction_skill_request_skill_id(
     request: &serde_json::Value,
 ) -> Option<String> {
-    ["skillId", "skillName", "name"]
-        .iter()
-        .find_map(|field| request.get(*field).and_then(|value| value.as_str()))
+    request
+        .get("skillId")
+        .and_then(|value| value.as_str())
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
@@ -280,8 +275,8 @@ fn public_local_instruction_skill_entry(entry: &serde_json::Value) -> serde_json
     let mut obj = entry.as_object().cloned().unwrap_or_default();
     obj.remove("directoryPath");
     if !obj.contains_key("localSkillId") {
-        if let Some(skill_name) = instruction_skill_name(entry) {
-            obj.insert("localSkillId".to_string(), serde_json::json!(skill_name));
+        if let Some(skill_id) = instruction_skill_id(entry) {
+            obj.insert("localSkillId".to_string(), serde_json::json!(skill_id));
         }
     }
     serde_json::Value::Object(obj)
@@ -828,10 +823,10 @@ async fn refresh_repository(
 
 async fn list_skills(State(state): State<ApiState>) -> Json<serde_json::Value> {
     let installed_skills = load_instruction_skills(&state);
-    let installed_names: std::collections::HashSet<String> = installed_skills
+    let installed_skill_ids: std::collections::HashSet<String> = installed_skills
         .iter()
         .filter(|skill| skill_loader::instruction_skill_source_available(skill))
-        .filter_map(|s| instruction_skill_name(s))
+        .filter_map(instruction_skill_id)
         .collect();
     let mut all_skills: Vec<serde_json::Value> = installed_skills
         .into_iter()
@@ -862,17 +857,12 @@ async fn list_skills(State(state): State<ApiState>) -> Json<serde_json::Value> {
         match fetch_github_repo_skills(repo_url).await {
             Ok(remote) => {
                 for mut rs in remote {
-                    let nm = rs
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_string();
                     let fl = rs
                         .get("fullName")
                         .and_then(|v| v.as_str())
                         .unwrap_or_default()
                         .to_string();
-                    let inst = installed_names.contains(&nm) || installed_names.contains(&fl);
+                    let inst = installed_skill_ids.contains(&fl);
                     if let Some(o) = rs.as_object_mut() {
                         o.insert("installed".into(), serde_json::json!(inst));
                         o.insert("repositoryId".into(), serde_json::json!(repo_id));
@@ -949,7 +939,7 @@ async fn fetch_github_repo_skills(repo_url: &str) -> Result<Vec<serde_json::Valu
             .unwrap_or_default();
         if t == "dir" && !n.starts_with('.') {
             let full = format!("{}/{}", path, n);
-            skills.push(serde_json::json!({"name": n, "skillName": n, "skillId": full, "fullName": full, "source": "repository"}));
+            skills.push(serde_json::json!({"name": n, "skillId": full, "fullName": full, "source": "repository"}));
         }
     }
     Ok(skills)
@@ -987,11 +977,7 @@ async fn install_skill(
     }
 
     let mut instruction_skills = load_instruction_skills(&state);
-    upsert_named_object_array_entry(
-        &mut instruction_skills,
-        normalized,
-        &["skillId", "skillName", "name"],
-    );
+    upsert_named_object_array_entry(&mut instruction_skills, normalized, &["skillId"]);
     persist_instruction_skills(&state, instruction_skills);
     Ok(Json(serde_json::json!({ "installed": true })))
 }
@@ -1019,11 +1005,7 @@ async fn install_local_skill(
 
     let mut instruction_skills = load_instruction_skills(&state);
     for entry in &entries {
-        upsert_named_object_array_entry(
-            &mut instruction_skills,
-            entry.clone(),
-            &["skillId", "skillName", "name"],
-        );
+        upsert_named_object_array_entry(&mut instruction_skills, entry.clone(), &["skillId"]);
     }
     persist_instruction_skills(&state, instruction_skills);
 
@@ -1115,12 +1097,12 @@ async fn remove_installed_skill(
         .ok_or_else(|| {
             ApiError::InvalidInput("source 必须为 'custom' 或 'instruction'".to_string())
         })?;
-    let name = request
-        .get("skillName")
+    let skill_id = request
+        .get("skillId")
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|v| !v.is_empty())
-        .ok_or_else(|| ApiError::InvalidInput("skillName 不能为空".to_string()))?;
+        .ok_or_else(|| ApiError::InvalidInput("skillId 不能为空".to_string()))?;
     match source {
         "custom" => {
             let mut config = load_skills_config_object(&state);
@@ -1131,7 +1113,7 @@ async fn remove_installed_skill(
             custom_tools.retain(|item| {
                 item.get("name")
                     .and_then(|value| value.as_str())
-                    .is_none_or(|value| value != name)
+                    .is_none_or(|value| value != skill_id)
             });
             config.insert(
                 "customTools".to_string(),
@@ -1141,25 +1123,25 @@ async fn remove_installed_skill(
             Ok(Json(serde_json::json!({
                 "removed": true,
                 "source": "custom",
-                "skillName": name,
+                "skillId": skill_id,
             })))
         }
         "instruction" => {
             let mut instruction_skills = load_instruction_skills(&state);
-            let removed_skill_name = instruction_skills
+            let removed_skill_id = instruction_skills
                 .iter()
-                .find(|item| instruction_skill_matches(item, name))
-                .and_then(instruction_skill_name)
-                .unwrap_or_else(|| name.to_string());
-            let removed = remove_instruction_skill_from_list(&mut instruction_skills, name);
+                .find(|item| instruction_skill_matches(item, skill_id))
+                .and_then(instruction_skill_id)
+                .unwrap_or_else(|| skill_id.to_string());
+            let removed = remove_instruction_skill_from_list(&mut instruction_skills, skill_id);
             if !removed {
-                return Err(ApiError::not_found("技能未安装", name));
+                return Err(ApiError::not_found("技能未安装", skill_id));
             }
             persist_instruction_skills(&state, instruction_skills);
             Ok(Json(serde_json::json!({
                 "removed": true,
                 "source": "instruction",
-                "skillName": removed_skill_name,
+                "skillId": removed_skill_id,
             })))
         }
         other => Err(ApiError::InvalidInput(format!(
@@ -1172,25 +1154,20 @@ async fn update_skill(
     State(state): State<ApiState>,
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let skill_name = request
-        .get("skillName")
+    let skill_id = request
+        .get("skillId")
         .and_then(|v| v.as_str())
-        .or_else(|| request.get("skillId").and_then(|v| v.as_str()))
         .map(str::trim)
         .filter(|v| !v.is_empty())
-        .ok_or_else(|| ApiError::InvalidInput("skillName 不能为空".to_string()))?;
+        .ok_or_else(|| ApiError::InvalidInput("skillId 不能为空".to_string()))?;
 
     let mut instruction_skills = load_instruction_skills(&state);
-    let position = instruction_skills.iter().position(|item| {
-        ["skillName", "name", "skillId"].iter().any(|field| {
-            item.get(*field)
-                .and_then(|v| v.as_str())
-                .is_some_and(|v| v == skill_name)
-        })
-    });
+    let position = instruction_skills
+        .iter()
+        .position(|item| instruction_skill_matches(item, skill_id));
 
     let Some(pos) = position else {
-        return Err(ApiError::not_found("技能未安装", skill_name));
+        return Err(ApiError::not_found("技能未安装", skill_id));
     };
 
     let skill = &instruction_skills[pos];
@@ -1425,8 +1402,6 @@ async fn get_instruction_skill_preview(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let skill_id = params
         .get("skillId")
-        .or_else(|| params.get("skillName"))
-        .or_else(|| params.get("name"))
         .map(|value| value.trim())
         .filter(|value| !value.is_empty())
         .ok_or_else(|| ApiError::InvalidInput("skillId 不能为空".to_string()))?;
@@ -1825,6 +1800,9 @@ mod tests {
         .expect("skill should normalize");
 
         assert_scope_fields_absent(&normalized);
+        assert_eq!(normalized["skillId"], serde_json::json!("example/skill"));
+        assert_eq!(normalized["name"], serde_json::json!("example/skill"));
+        assert!(normalized.get("skillName").is_none());
     }
 
     #[tokio::test]
@@ -1869,8 +1847,12 @@ mod tests {
                 "instructionSkills": [
                     {
                         "skillId": "example/skill",
+                        "skillName": "legacy-skill-name",
                         "workspaceId": "workspace-old",
                         "session_id": "session-old"
+                    },
+                    {
+                        "skillName": "legacy-skill-name-only"
                     }
                 ],
                 "customTools": [
@@ -1889,6 +1871,15 @@ mod tests {
         assert_scope_fields_absent(&stored);
         assert_scope_fields_absent(&stored["instructionSkills"][0]);
         assert_scope_fields_absent(&stored["customTools"][0]);
+        assert_eq!(
+            stored["instructionSkills"].as_array().map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            stored["instructionSkills"][0]["skillId"],
+            serde_json::json!("example/skill")
+        );
+        assert!(stored["instructionSkills"][0].get("skillName").is_none());
     }
 
     #[tokio::test]
@@ -1996,6 +1987,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn instruction_skill_operations_reject_legacy_name_fields() {
+        let app = Router::new().merge(routes()).with_state(test_state());
+
+        let (update_status, update_body) = post_json_with_status(
+            app,
+            "/settings/skills/update",
+            serde_json::json!({ "skillName": "legacy-skill" }),
+        )
+        .await;
+        assert_eq!(
+            update_status,
+            StatusCode::BAD_REQUEST,
+            "unexpected body: {update_body}"
+        );
+        assert!(
+            update_body["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("skillId 不能为空"),
+            "unexpected body: {update_body}"
+        );
+
+        let preview_error = get_instruction_skill_preview(
+            State(test_state()),
+            Query(HashMap::from([(
+                "skillName".to_string(),
+                "legacy-skill".to_string(),
+            )])),
+        )
+        .await
+        .expect_err("legacy preview key should be rejected");
+        assert_eq!(preview_error.message(), "skillId 不能为空");
+    }
+
+    #[tokio::test]
     async fn custom_tool_add_strips_workspace_session_scope_fields() {
         let state = test_state();
         let app = Router::new().merge(routes()).with_state(state.clone());
@@ -2071,7 +2097,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn custom_tool_remove_requires_skill_name_contract() {
+    async fn installed_skill_remove_requires_skill_id_contract() {
         for payload in [
             serde_json::json!({
                 "source": "custom",
@@ -2080,6 +2106,14 @@ mod tests {
             serde_json::json!({
                 "source": "custom",
                 "name": "legacy-tool"
+            }),
+            serde_json::json!({
+                "source": "instruction",
+                "skillName": "legacy-skill"
+            }),
+            serde_json::json!({
+                "source": "instruction",
+                "name": "legacy-skill"
             }),
         ] {
             let app = Router::new().merge(routes()).with_state(test_state());
@@ -2092,7 +2126,7 @@ mod tests {
                 body["message"]
                     .as_str()
                     .unwrap_or_default()
-                    .contains("skillName 不能为空"),
+                    .contains("skillId 不能为空"),
                 "unexpected body: {body}"
             );
         }

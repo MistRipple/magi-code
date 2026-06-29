@@ -3586,10 +3586,10 @@ async function addCustomTool(tool: Record<string, unknown>): Promise<void> {
 }
 
 async function removeInstalledSkill(
-  skillName: string,
+  skillId: string,
   source: 'custom' | 'instruction',
 ): Promise<void> {
-  const payload = await removeAgentInstalledSkill(skillName, source);
+  const payload = await removeAgentInstalledSkill(skillId, source);
   const messageType = source === 'custom' ? 'customToolRemoved' : 'instructionSkillRemoved';
   emitDataMessage(messageType, payload);
   await dispatchSettingsBootstrap(true);
@@ -3602,8 +3602,8 @@ async function removeInstalledSkill(
   emitBridgeSuccessToast(action, detail);
 }
 
-async function updateSkill(skillName: string): Promise<void> {
-  const payload = await updateAgentSkill(skillName);
+async function updateSkill(skillId: string): Promise<void> {
+  const payload = await updateAgentSkill(skillId);
   emitDataMessage('skillUpdated', payload);
   await dispatchSettingsBootstrap(true);
   emitBridgeSuccessToast(
@@ -3900,20 +3900,20 @@ export function createWebClientBridge(): ClientBridge {
           });
           return;
         case 'removeInstalledSkill': {
-          const skillName = typeof message.skillName === 'string'
-            ? message.skillName
+          const skillId = typeof message.skillId === 'string'
+            ? message.skillId
             : '';
           const source = message.source === 'custom' || message.source === 'instruction'
             ? message.source
             : null;
-          if (skillName.trim() && source) {
+          if (skillId.trim() && source) {
             const action = source === 'custom'
               ? i18n.t('settings.toast.action.deleteCustomTool')
               : i18n.t('settings.toast.action.deleteInstructionSkill');
             const logLabel = source === 'custom'
               ? '[web-client-bridge] 删除自定义工具失败:'
               : '[web-client-bridge] 删除 Skill 失败:';
-            void removeInstalledSkill(skillName, source).catch((error) => {
+            void removeInstalledSkill(skillId, source).catch((error) => {
               logBridgeOperationFailure(
                 action,
                 logLabel,
@@ -3924,8 +3924,8 @@ export function createWebClientBridge(): ClientBridge {
           return;
         }
         case 'updateSkill':
-          if (typeof message.skillName === 'string' && message.skillName.trim()) {
-            void updateSkill(message.skillName).catch((error) => {
+          if (typeof message.skillId === 'string' && message.skillId.trim()) {
+            void updateSkill(message.skillId).catch((error) => {
               logBridgeOperationFailure(
                 i18n.t('settings.toast.action.updateSkill'),
                 '[web-client-bridge] 更新技能失败:',
