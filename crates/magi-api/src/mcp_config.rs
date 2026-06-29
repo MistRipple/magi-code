@@ -5,13 +5,6 @@ use std::{collections::BTreeMap, path::PathBuf};
 
 pub(crate) const REDACTED_MCP_ENV_VALUE: &str = "********";
 
-fn unwrap_mcp_server_payload<'a>(request: &'a Value) -> &'a Value {
-    request
-        .get("server")
-        .or_else(|| request.get("updates"))
-        .unwrap_or(request)
-}
-
 pub fn mcp_server_entry_id(entry: &Value) -> Option<&str> {
     entry
         .get("id")
@@ -22,8 +15,10 @@ pub fn mcp_server_entry_id(entry: &Value) -> Option<&str> {
 }
 
 pub fn normalize_mcp_server_snapshot_entry(entry: &Value) -> Option<Value> {
-    let raw = unwrap_mcp_server_payload(entry);
-    let mut object = raw.as_object().cloned()?;
+    if entry.get("server").is_some() || entry.get("updates").is_some() {
+        return None;
+    }
+    let mut object = entry.as_object().cloned()?;
     let server_id = object
         .get("id")
         .and_then(Value::as_str)
@@ -65,6 +60,11 @@ pub fn normalize_mcp_server_snapshot_entry(entry: &Value) -> Option<Value> {
 }
 
 pub(crate) fn normalize_mcp_server_request_entry(request: &Value) -> Result<Value, ApiError> {
+    if request.get("server").is_some() || request.get("updates").is_some() {
+        return Err(ApiError::InvalidInput(
+            "MCP server 配置必须作为顶层对象提交，不能包裹在 server/updates 中".to_string(),
+        ));
+    }
     let normalized = normalize_mcp_server_snapshot_entry(request)
         .ok_or_else(|| ApiError::InvalidInput("serverId 不能为空".to_string()))?;
     let command = normalized
@@ -201,15 +201,33 @@ mod tests {
     }
 
     #[test]
+    fn request_normalization_rejects_wrapped_server_payloads() {
+        for wrapper in ["server", "updates"] {
+            let error = normalize_mcp_server_request_entry(&serde_json::json!({
+                wrapper: {
+                    "id": "stdio-server",
+                    "command": "npx"
+                }
+            }))
+            .expect_err("MCP server request wrappers must not remain accepted");
+
+            match error {
+                ApiError::InvalidInput(message) => {
+                    assert!(message.contains("server/updates"));
+                }
+                other => panic!("unexpected error: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn snapshot_normalization_keeps_invalid_server_visible_with_canonical_id() {
         let entry = normalize_mcp_server_snapshot_entry(&serde_json::json!({
-            "server": {
-                "serverId": " legacy ",
-                "url": "https://example.test/mcp",
-                "workspace_id": "workspace-old",
-                "workspace_path": "/tmp/old",
-                "session_id": "session-old"
-            }
+            "serverId": " legacy ",
+            "url": "https://example.test/mcp",
+            "workspace_id": "workspace-old",
+            "workspace_path": "/tmp/old",
+            "session_id": "session-old"
         }))
         .expect("entry with id should remain visible");
 
@@ -225,17 +243,31 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_normalization_filters_wrapped_server_payloads() {
+        for wrapper in ["server", "updates"] {
+            assert!(
+                normalize_mcp_server_snapshot_entry(&serde_json::json!({
+                    wrapper: {
+                        "serverId": "legacy",
+                        "command": "npx"
+                    }
+                }))
+                .is_none(),
+                "{wrapper} wrapper must not be restored from persisted MCP settings"
+            );
+        }
+    }
+
+    #[test]
     fn config_builder_uses_same_normalization() {
         let config = build_mcp_config_from_entry(&serde_json::json!({
-            "server": {
-                "serverId": "stdio-server",
-                "command": " npx ",
-                "args": ["-y", "@modelcontextprotocol/server-filesystem"],
-                "workingDirectory": " /tmp ",
-                "env": {
-                    "A": "1",
-                    "IGNORED": 2
-                }
+            "serverId": "stdio-server",
+            "command": " npx ",
+            "args": ["-y", "@modelcontextprotocol/server-filesystem"],
+            "workingDirectory": " /tmp ",
+            "env": {
+                "A": "1",
+                "IGNORED": 2
             }
         }))
         .expect("config should build");

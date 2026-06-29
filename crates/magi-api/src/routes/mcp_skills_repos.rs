@@ -1645,6 +1645,67 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn mcp_server_save_rejects_wrapped_requests() {
+        for (path, wrapper) in [
+            ("/settings/mcp/add", "server"),
+            ("/settings/mcp/add", "updates"),
+            ("/settings/mcp/update", "server"),
+            ("/settings/mcp/update", "updates"),
+        ] {
+            let app = Router::new().merge(routes()).with_state(test_state());
+
+            let (status, body) = post_json_with_status(
+                app,
+                path,
+                serde_json::json!({
+                    wrapper: {
+                        "id": "wrapped-server",
+                        "command": "node"
+                    }
+                }),
+            )
+            .await;
+
+            assert_eq!(status, StatusCode::BAD_REQUEST, "unexpected body: {body}");
+            assert!(
+                body["message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("不能包裹在 server/updates 中"),
+                "unexpected body: {body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_server_list_filters_legacy_wrapped_entries() {
+        let state = test_state();
+        state.settings_store.set_section(
+            "mcpServers",
+            serde_json::json!([
+                {
+                    "server": {
+                        "id": "wrapped-server",
+                        "command": "node"
+                    }
+                },
+                {
+                    "id": "canonical-server",
+                    "command": "node",
+                    "enabled": false
+                }
+            ]),
+        );
+        let app = Router::new().merge(routes()).with_state(state);
+
+        let body = get_json(app, "/settings/mcp").await;
+        let servers = body["servers"].as_array().expect("servers should be array");
+
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0]["id"], serde_json::json!("canonical-server"));
+    }
+
     fn assert_scope_fields_absent(value: &serde_json::Value) {
         for key in SCOPE_BINDING_FIELDS {
             assert!(
