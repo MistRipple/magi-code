@@ -919,6 +919,38 @@ await withGoldenViteServer(async (server) => {
     'workspaceId-only bridge submit must not inherit stale current sessionId',
   );
 
+  const staleUrlBootstrapRequests = [];
+  bridge.postMessage({
+    type: 'workspaceBindingChanged',
+    workspaceId: WORKSPACE_ID,
+    workspacePath: WORKSPACE_PATH,
+    sessionId: '',
+  });
+  await waitFor(
+    () => !messagesStore.messagesState.currentSessionId,
+    'workspace-scoped authoritative binding must clear current session before stale URL guard',
+  );
+  window.location.href = `http://127.0.0.1:38123/web.html?workspaceId=${encodeURIComponent(WORKSPACE_ID)}&workspacePath=${encodeURIComponent(WORKSPACE_PATH)}&sessionId=session-stale-url`;
+  bootstrapInterceptors.push((parsed) => {
+    staleUrlBootstrapRequests.push(parsed);
+    return jsonResponse(scopedBootstrapPayload(
+      WORKSPACE_ID,
+      WORKSPACE_PATH,
+      SESSION_ID,
+      'stale URL guard bootstrap',
+    ));
+  });
+  bridge.postMessage({ type: 'requestState' });
+  await waitFor(
+    () => staleUrlBootstrapRequests.length === 1,
+    'stale URL guard must issue a bootstrap request',
+  );
+  assert.equal(
+    staleUrlBootstrapRequests[0].searchParams.has('sessionId'),
+    false,
+    'authoritative workspace-only binding must not let stale URL sessionId re-enter bootstrap',
+  );
+
   const originalRaceWarn = console.warn;
   try {
     console.warn = () => {};

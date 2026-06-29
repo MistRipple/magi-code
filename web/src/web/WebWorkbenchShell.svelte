@@ -183,6 +183,9 @@
     if (bootstrapSessionId) {
       return bootstrapSessionId;
     }
+    if (messagesState.bootstrapped) {
+      return '';
+    }
     const binding = currentWorkspaceBinding();
     return binding.workspaceId === workspaceId ? binding.sessionId : '';
   }
@@ -440,7 +443,7 @@
     const nextUrl = new URL(window.location.href);
 
     if (!normalizedWorkspaceId || !normalizedWorkspacePath) {
-      clearAgentBindingContext();
+      clearAgentBindingContext({ authoritative: true });
       nextUrl.searchParams.delete('workspaceId');
       nextUrl.searchParams.delete('workspacePath');
       nextUrl.searchParams.delete('sessionId');
@@ -454,6 +457,8 @@
       workspaceId: normalizedWorkspaceId,
       workspacePath: normalizedWorkspacePath,
       sessionId: normalizedSessionId,
+    }, {
+      authoritative: true,
     });
     nextUrl.searchParams.set('workspaceId', normalizedWorkspaceId);
     nextUrl.searchParams.set('workspacePath', normalizedWorkspacePath);

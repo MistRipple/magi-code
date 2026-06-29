@@ -185,6 +185,7 @@ let recoveryInFlight: Promise<void> | null = null;
 let recoveryInFlightBindingKey = '';
 let eventStreamSnapshotRefreshInFlight: Promise<void> | null = null;
 let eventStreamSnapshotRefreshBindingKey = '';
+let initialWindowBindingHydrated = false;
 let workspaceSessionSummaryRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 const inFlightChangeMutationScopes = new Set<string>();
 
@@ -1674,6 +1675,10 @@ function resolveWorkspaceQuery(): { workspaceId: string; workspacePath: string; 
 }
 
 function hydrateCanonicalWorkspaceBinding(): void {
+  if (initialWindowBindingHydrated) {
+    return;
+  }
+  initialWindowBindingHydrated = true;
   const binding = seedAgentBindingContextFromWindow();
   currentWorkspaceId = binding.workspaceId;
   currentWorkspacePath = binding.workspacePath;
@@ -1859,6 +1864,8 @@ function persistWorkspaceBinding(workspaceId: string, workspacePath: string, ses
     workspaceId: normalizedWorkspaceId,
     workspacePath: normalizedWorkspacePath,
     sessionId: incomingSessionId,
+  }, {
+    authoritative: true,
   });
 
   const currentUrl = getCurrentUrl();
@@ -1908,6 +1915,8 @@ function clearWorkspaceSessionBinding(workspaceId: string, workspacePath: string
     workspaceId: normalizedWorkspaceId,
     workspacePath: normalizedWorkspacePath,
     sessionId: '',
+  }, {
+    authoritative: true,
   });
   clearCurrentInterruptTaskId();
   clearTaskProjection();
@@ -1956,7 +1965,7 @@ function clearPersistedWorkspaceBinding(): void {
   currentWorkspaceId = '';
   currentWorkspacePath = '';
   currentSessionId = '';
-  clearAgentBindingContext();
+  clearAgentBindingContext({ authoritative: true });
   clearCurrentInterruptTaskId();
   clearTaskProjection();
   const currentUrl = getCurrentUrl();

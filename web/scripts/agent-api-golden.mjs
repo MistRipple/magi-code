@@ -160,6 +160,31 @@ await withGoldenViteServer(async (server) => {
       false,
       'workspace-only URL must not leak stale runtime sessionId into API queries',
     );
+
+    binding.setAgentBindingContext({
+      workspaceId: 'workspace-authoritative',
+      workspacePath: '/tmp/workspace-authoritative',
+      sessionId: '',
+    }, {
+      authoritative: true,
+    });
+    globalThis.window.location.href = 'http://127.0.0.1:38123/web.html?workspaceId=workspace-authoritative&workspacePath=%2Ftmp%2Fworkspace-authoritative&sessionId=session-stale-url';
+    const authoritativeBinding = binding.resolveAgentBindingContext();
+    assert.equal(authoritativeBinding.workspaceId, 'workspace-authoritative');
+    assert.equal(authoritativeBinding.workspacePath, '/tmp/workspace-authoritative');
+    assert.equal(
+      authoritativeBinding.sessionId,
+      '',
+      'authoritative backend binding must ignore stale URL sessionId after bootstrap clears current session',
+    );
+    const authoritativePreviewQuery = new URLSearchParams(
+      agentApi.buildFilePreviewQuery('README.md', { includeSession: true }),
+    );
+    assert.equal(
+      authoritativePreviewQuery.has('sessionId'),
+      false,
+      'shared API queries must not revive stale URL sessionId after backend binding becomes authoritative',
+    );
   } finally {
     if (originalWindow === undefined) {
       delete globalThis.window;

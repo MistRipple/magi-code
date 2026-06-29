@@ -5,11 +5,16 @@ export interface AgentBindingContext {
 }
 
 let runtimeBindingInitialized = false;
+let runtimeBindingAuthoritative = false;
 let runtimeBinding: AgentBindingContext = {
   workspaceId: '',
   workspacePath: '',
   sessionId: '',
 };
+
+interface AgentBindingContextOptions {
+  authoritative?: boolean;
+}
 
 function normalizeBindingValue(value: string | null | undefined): string {
   return typeof value === 'string' ? value.trim() : '';
@@ -45,9 +50,13 @@ function hasExplicitWorkspaceBinding(binding: AgentBindingContext): boolean {
 }
 
 export function resolveAgentBindingContext(): AgentBindingContext {
+  if (runtimeBindingInitialized && runtimeBindingAuthoritative) {
+    return { ...runtimeBinding };
+  }
   const windowBinding = readWindowBindingContext();
   if (hasExplicitWorkspaceBinding(windowBinding)) {
     runtimeBindingInitialized = true;
+    runtimeBindingAuthoritative = false;
     runtimeBinding = windowBinding;
     return { ...runtimeBinding };
   }
@@ -61,8 +70,12 @@ export function seedAgentBindingContextFromWindow(): AgentBindingContext {
   return setAgentBindingContext(readWindowBindingContext());
 }
 
-export function setAgentBindingContext(binding: Partial<AgentBindingContext>): AgentBindingContext {
+export function setAgentBindingContext(
+  binding: Partial<AgentBindingContext>,
+  options: AgentBindingContextOptions = {},
+): AgentBindingContext {
   runtimeBindingInitialized = true;
+  runtimeBindingAuthoritative = options.authoritative === true;
   runtimeBinding = {
     workspaceId: normalizeBindingValue(binding.workspaceId),
     workspacePath: normalizeBindingValue(binding.workspacePath),
@@ -71,10 +84,10 @@ export function setAgentBindingContext(binding: Partial<AgentBindingContext>): A
   return { ...runtimeBinding };
 }
 
-export function clearAgentBindingContext(): AgentBindingContext {
+export function clearAgentBindingContext(options: AgentBindingContextOptions = {}): AgentBindingContext {
   return setAgentBindingContext({
     workspaceId: '',
     workspacePath: '',
     sessionId: '',
-  });
+  }, options);
 }
