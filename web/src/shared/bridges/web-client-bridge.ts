@@ -3902,9 +3902,7 @@ export function createWebClientBridge(): ClientBridge {
         case 'removeInstalledSkill': {
           const skillName = typeof message.skillName === 'string'
             ? message.skillName
-            : typeof message.toolName === 'string'
-              ? message.toolName
-              : '';
+            : '';
           const source = message.source === 'custom' || message.source === 'instruction'
             ? message.source
             : null;

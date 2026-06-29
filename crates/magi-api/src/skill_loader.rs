@@ -53,14 +53,32 @@ fn normalize_skills_config_value(value: Value) -> Map<String, Value> {
 
 fn normalize_skills_config_entries(config: &mut Map<String, Value>) {
     strip_scope_binding_fields_from_map(config);
-    for key in ["instructionSkills", "customTools"] {
-        let Some(entries) = config.get_mut(key).and_then(Value::as_array_mut) else {
-            continue;
-        };
+    if let Some(entries) = config
+        .get_mut("instructionSkills")
+        .and_then(Value::as_array_mut)
+    {
         for entry in entries {
             strip_scope_binding_fields(entry);
         }
     }
+    if let Some(entries) = config.get_mut("customTools").and_then(Value::as_array_mut) {
+        normalize_custom_tool_entries(entries);
+    }
+}
+
+fn normalize_custom_tool_entries(entries: &mut Vec<Value>) {
+    entries.retain_mut(|entry| {
+        strip_scope_binding_fields(entry);
+        let Some(object) = entry.as_object_mut() else {
+            return false;
+        };
+        object.remove("toolName");
+        object
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .is_some_and(|name| !name.is_empty())
+    });
 }
 
 fn normalize_token(value: &str) -> String {
@@ -608,9 +626,14 @@ mod tests {
                 "customTools": [
                     {
                         "name": "saved-tool",
+                        "toolName": "legacy-saved-tool",
                         "workspacePath": "/tmp/old",
                         "sessionId": "session-old"
-                    }
+                    },
+                    {
+                        "toolName": "legacy-tool-name-only"
+                    },
+                    "invalid-custom-tool"
                 ]
             })
             .as_object()
@@ -630,6 +653,18 @@ mod tests {
         }
         assert!(saved["instructionSkills"][0].get("workspaceId").is_none());
         assert!(saved["instructionSkills"][0].get("session_id").is_none());
+        assert_eq!(
+            saved["customTools"]
+                .as_array()
+                .expect("customTools should be array")
+                .len(),
+            1
+        );
+        assert_eq!(
+            saved["customTools"][0]["name"],
+            serde_json::json!("saved-tool")
+        );
+        assert!(saved["customTools"][0].get("toolName").is_none());
         assert!(saved["customTools"][0].get("workspacePath").is_none());
         assert!(saved["customTools"][0].get("sessionId").is_none());
     }

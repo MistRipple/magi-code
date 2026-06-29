@@ -1079,13 +1079,11 @@ async fn add_custom_tool(
     let tool_name = entry
         .get("name")
         .and_then(|v| v.as_str())
-        .or_else(|| entry.get("toolName").and_then(|v| v.as_str()))
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| ApiError::InvalidInput("toolName 不能为空".to_string()))?
+        .ok_or_else(|| ApiError::InvalidInput("name 不能为空".to_string()))?
         .to_string();
     entry.insert("name".to_string(), serde_json::json!(tool_name));
-    entry.insert("toolName".to_string(), serde_json::json!(tool_name));
 
     let mut config = load_skills_config_object(&state);
     let mut custom_tools = config
@@ -1095,7 +1093,7 @@ async fn add_custom_tool(
     upsert_named_object_array_entry(
         &mut custom_tools,
         serde_json::Value::Object(entry),
-        &["toolName", "name"],
+        &["name"],
     );
     config.insert(
         "customTools".to_string(),
@@ -1119,8 +1117,6 @@ async fn remove_installed_skill(
         })?;
     let name = request
         .get("skillName")
-        .or_else(|| request.get("toolName"))
-        .or_else(|| request.get("name"))
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|v| !v.is_empty())
@@ -1133,11 +1129,9 @@ async fn remove_installed_skill(
                 .and_then(|value| value.as_array().cloned())
                 .unwrap_or_default();
             custom_tools.retain(|item| {
-                !["toolName", "name"].iter().any(|field| {
-                    item.get(*field)
-                        .and_then(|value| value.as_str())
-                        .is_some_and(|value| value == name)
-                })
+                item.get("name")
+                    .and_then(|value| value.as_str())
+                    .is_none_or(|value| value != name)
             });
             config.insert(
                 "customTools".to_string(),
@@ -2021,6 +2015,11 @@ mod tests {
         assert_eq!(body["added"], true);
         let stored = state.settings_store.get_section("skillsConfig");
         assert_scope_fields_absent(&stored["customTools"][0]);
+        assert_eq!(
+            stored["customTools"][0]["name"],
+            serde_json::json!("example-tool")
+        );
+        assert!(stored["customTools"][0].get("toolName").is_none());
     }
 
     #[tokio::test]
@@ -2046,6 +2045,57 @@ mod tests {
                 .contains("不能包裹在 tool 中"),
             "unexpected body: {body}"
         );
+    }
+
+    #[tokio::test]
+    async fn custom_tool_add_rejects_legacy_tool_name_field() {
+        let app = Router::new().merge(routes()).with_state(test_state());
+
+        let (status, body) = post_json_with_status(
+            app,
+            "/settings/skills/custom-tool/add",
+            serde_json::json!({
+                "toolName": "legacy-tool-name"
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "unexpected body: {body}");
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("name 不能为空"),
+            "unexpected body: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_tool_remove_requires_skill_name_contract() {
+        for payload in [
+            serde_json::json!({
+                "source": "custom",
+                "toolName": "legacy-tool"
+            }),
+            serde_json::json!({
+                "source": "custom",
+                "name": "legacy-tool"
+            }),
+        ] {
+            let app = Router::new().merge(routes()).with_state(test_state());
+
+            let (status, body) =
+                post_json_with_status(app, "/settings/skills/remove", payload).await;
+
+            assert_eq!(status, StatusCode::BAD_REQUEST, "unexpected body: {body}");
+            assert!(
+                body["message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("skillName 不能为空"),
+                "unexpected body: {body}"
+            );
+        }
     }
 
     #[tokio::test]
