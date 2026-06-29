@@ -7,6 +7,6 @@ edition.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-magi-agent = { path = "../../crates/magi-agent" }
+magi-runtime-state = { path = "../../crates/magi-runtime-state" }
 magi-daemon = { path = "../../crates/magi-daemon" }
 dirs = "6"

@@ -1,17 +1,14 @@
 //! 任务系统 — usage recording helpers。
 //!
-//! 复用内部的 `model_config::NormalizedModelConfig` 与
-//! `settings_store::SettingsStore`。
+//! 复用内部的 `model_config::NormalizedModelConfig` 与独立设置域。
 
-use crate::{
-    model_config::{NormalizedModelConfig, configured_role_engine_model_config},
-    settings_store::SettingsStore,
-};
+use crate::model_config::{NormalizedModelConfig, configured_role_engine_model_config};
 use magi_core::{EventId, MissionId, MissionLifecyclePhase, SessionId, UtcMillis, WorkspaceId};
 use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
 use magi_mission_metrics::{MissionMetricsStore, TurnUsage};
 use magi_orchestrator::task_worker_catalog::WorkerInfo;
 use magi_session_store::SessionStore;
+use magi_settings_store::SettingsStore;
 use magi_usage_authority::{
     ExecutionBindingIdentity, LlmConfig, UsageCallIdentity, UsageCallRecordInput, UsageCallStatus,
     UsagePhase, UsageSourceRole, UsageTokenInput,

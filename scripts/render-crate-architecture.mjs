@@ -1,0 +1,717 @@
+#!/usr/bin/env node
+import { execFileSync } from 'node:child_process';
+import { existsSync, mkdirSync, readFileSync, watch, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const root = dirname(dirname(fileURLToPath(import.meta.url)));
+const output = join(root, 'docs', 'architecture.html');
+const args = new Set(process.argv.slice(2));
+const mode = {
+  check: args.has('--check'),
+  help: args.has('--help') || args.has('-h'),
+  watch: args.has('--watch'),
+};
+
+const GROUP_ORDER = ['base', 'bus', 'storage', 'exec', 'mission', 'api'];
+const GROUP_LABEL = {
+  base: '基础层',
+  bus: '总线/治理/桥接',
+  storage: '存储与上下文',
+  exec: '编排与执行',
+  mission: 'Mission/计划/校验',
+  api: '接口与组装',
+};
+
+const CRATE_META = {
+  'magi-agent-role': ['exec', 'AgentRole：角色定义、注册表与文件加载'],
+  'magi-api': ['api', 'HTTP / 路由、MCP 配置、session 标题'],
+  'magi-bridge-client': ['bus', 'LLM 桥接客户端：适配器、决策引擎、最终文本策略'],
+  'magi-checkpoint': ['mission', 'Checkpoint：mission 级可恢复快照点'],
+  'magi-context-runtime': ['storage', '分层记忆、共享上下文池'],
+  'magi-conversation-runtime': ['api', '对话运行时：主线对话、任务分派与上下文聚合'],
+  'magi-core': ['base', '地基：错误、ID、路径、原子写、执行原语、公开文本'],
+  'magi-daemon': ['api', '把全部子系统组装成可运行 daemon'],
+  'magi-daemon-app': ['api', '二进制入口（apps/daemon）'],
+  'magi-event-bus': ['bus', '事件总线与事件账本（EventEnvelope / Ledger）'],
+  'magi-governance': ['bus', '审批 / 决策请求模型'],
+  'magi-human-checkpoint': ['mission', 'HumanCheckpoint：mission 级人审挂起点'],
+  'magi-knowledge-graph': ['storage', 'L18 KnowledgeGraph：mission 进程累积的知识'],
+  'magi-knowledge-store': ['storage', '本地代码检索引擎：扫描、分词、倒排索引、依赖图'],
+  'magi-lifecycle-notice': ['mission', 'mission 生命周期事件桥接进下一轮 prompt'],
+  'magi-memory-store': ['storage', '记忆存储'],
+  'magi-mission': ['mission', 'Mission 聚合恢复入口'],
+  'magi-mission-charter': ['mission', 'L15 MissionCharter：mission 宪章契约'],
+  'magi-mission-metrics': ['mission', 'mission 记账：turn、token、wall-clock'],
+  'magi-mission-workspace': ['mission', 'L17 Mission Workspace'],
+  'magi-orchestrator': ['exec', '任务编排核心：任务存储、worker 目录、风险与校验策略'],
+  'magi-permissions': ['bus', 'L7 工具 / 目录 / 命令三维权限与访问模式'],
+  'magi-plan': ['mission', 'L16 Plan：mission 执行计划工件'],
+  'magi-project-memory': ['storage', 'L14 跨 session / conversation 的项目记忆'],
+  'magi-runtime-state': ['base', 'daemon 运行态发现：pid、baseUrl、客户端 lease'],
+  'magi-safety-gate': ['base', 'L12 高危操作语义判定层'],
+  'magi-settings-store': ['storage', '设置真相源：模型、工具、技能、MCP 与 session 覆盖配置'],
+  'magi-session-store': ['storage', '会话生命周期与持久化'],
+  'magi-skill-runtime': ['exec', '技能运行时'],
+  'magi-snapshot': ['base', 'workspace 文件变更账本'],
+  'magi-spawn-graph': ['exec', 'L5 SpawnGraph：父子 agent spawn 拓扑'],
+  'magi-todo-ledger': ['mission', 'L13 TodoLedger：session 范围 todo'],
+  'magi-tool-runtime': ['exec', '工具执行运行时'],
+  'magi-usage-authority': ['bus', 'token 计费、上下文窗口、模型身份、用量账本'],
+  'magi-validation-runner': ['mission', 'ValidationRunner：节点是否真做完'],
+  'magi-worker-runtime': ['exec', 'worker 执行运行时'],
+  'magi-workspace': ['storage', '工作区注册表与模型'],
+};
+
+const BUSINESS_FLOW = [
+  {
+    id: 'entry',
+    title: '入口与工作区绑定',
+    desc: '前端只提交用户意图、workspaceId、session hint；daemon/api 负责把请求绑定到后端权威 workspace 与 session。',
+    crates: ['magi-daemon-app', 'magi-runtime-state', 'magi-daemon', 'magi-api', 'magi-workspace'],
+    risk: 'URL sessionId 只能是 bootstrap hint，不能反向覆盖后端权威会话。',
+  },
+  {
+    id: 'session',
+    title: '会话权威与模型策略',
+    desc: 'settings-store 是模型与能力配置真相源；session-store 保存会话生命周期；usage-authority 统一模型身份、上下文窗口与 token 用量。',
+    crates: ['magi-settings-store', 'magi-session-store', 'magi-usage-authority', 'magi-conversation-runtime', 'magi-bridge-client'],
+    risk: '全局主模型不能污染已有会话；上下文统计必须跟随压缩后真实窗口更新。',
+  },
+  {
+    id: 'conversation',
+    title: '主线对话运行时',
+    desc: 'conversation-runtime 聚合上下文、知识、模型桥接和流式输出，是 vibecode 主对话的主路径。',
+    crates: ['magi-conversation-runtime', 'magi-context-runtime', 'magi-memory-store', 'magi-knowledge-store'],
+    risk: '对话不能被 silent stop 吃掉；终止原因必须结构化回传。',
+  },
+  {
+    id: 'routing',
+    title: '任务识别与分派',
+    desc: '对话意图被提升为计划、任务或子 agent 工作；orchestrator 决定执行角色，worker-runtime 承接实际执行。',
+    crates: ['magi-orchestrator', 'magi-agent-role', 'magi-worker-runtime', 'magi-spawn-graph', 'magi-plan'],
+    risk: '显式绑定的任务模型失败必须可见，不能静默 failover 到编排模型。',
+  },
+  {
+    id: 'capability',
+    title: '工具、Skills、MCP 执行',
+    desc: 'tool-runtime 承接内置工具/MCP；skill-runtime 承接 instruction skill；permissions/governance/safety-gate 处理边界与审批。',
+    crates: ['magi-tool-runtime', 'magi-skill-runtime', 'magi-permissions', 'magi-governance', 'magi-safety-gate'],
+    risk: '公开工具只接受 canonical 名称；设置合同不保留旧 wrapper、别名和双路径。',
+  },
+  {
+    id: 'closure',
+    title: '状态、验证与恢复闭环',
+    desc: '执行结果进入 snapshot、mission、checkpoint、validation、event bus 和项目记忆，支撑恢复、审计和下一轮上下文。',
+    crates: ['magi-snapshot', 'magi-mission', 'magi-checkpoint', 'magi-human-checkpoint', 'magi-validation-runner', 'magi-event-bus', 'magi-project-memory', 'magi-knowledge-graph'],
+    risk: 'mission 状态根必须统一注入，不能回落到 HOME/tmp 隐式落点。',
+  },
+];
+
+function readMetadata() {
+  const raw = execFileSync('cargo', ['metadata', '--format-version=1', '--no-deps'], {
+    cwd: root,
+    encoding: 'utf8',
+  });
+  return JSON.parse(raw);
+}
+
+function buildGraph(metadata) {
+  const workspaceIds = new Set(metadata.workspace_members);
+  const packages = metadata.packages
+    .filter((pkg) => workspaceIds.has(pkg.id))
+    .sort((a, b) => a.name.localeCompare(b.name));
+  const packageByName = new Map(packages.map((pkg) => [pkg.name, pkg]));
+  const internalNames = new Set(packageByName.keys());
+  const edges = [];
+
+  for (const pkg of packages) {
+    for (const dep of pkg.dependencies) {
+      if (dep.kind === null && dep.path && internalNames.has(dep.name)) {
+        edges.push([pkg.name, dep.name]);
+      }
+    }
+  }
+  edges.sort(([a1, b1], [a2, b2]) => a1.localeCompare(a2) || b1.localeCompare(b2));
+
+  const deps = new Map(packages.map((pkg) => [pkg.name, []]));
+  for (const [from, to] of edges) deps.get(from).push(to);
+
+  const layers = new Map();
+  const visiting = new Set();
+  function depth(name) {
+    if (layers.has(name)) return layers.get(name);
+    if (visiting.has(name)) throw new Error(`内部 crate 依赖存在环：${name}`);
+    visiting.add(name);
+    const d = deps.get(name);
+    const value = d.length === 0 ? 0 : Math.max(...d.map((dep) => depth(dep))) + 1;
+    visiting.delete(name);
+    layers.set(name, value);
+    return value;
+  }
+  for (const pkg of packages) depth(pkg.name);
+
+  const nodes = packages.map((pkg) => {
+    const [group, desc] = CRATE_META[pkg.name] || ['base', '未归类 crate'];
+    return {
+      id: pkg.name,
+      group,
+      desc,
+      layer: layers.get(pkg.name),
+      path: pkg.manifest_path.replace(`${root}/`, '').replace('/Cargo.toml', ''),
+    };
+  });
+
+  return { nodes, edges, groupOrder: GROUP_ORDER, groupLabel: GROUP_LABEL };
+}
+
+function renderHtml(data) {
+  const json = JSON.stringify(data);
+  const flowJson = JSON.stringify(BUSINESS_FLOW);
+  const maxDepth = Math.max(...data.nodes.map((node) => node.layer));
+  return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>magi-rust 后端 crate 架构图</title>
+<style>
+  :root {
+    --bg: #0f1419;
+    --panel: #161b22;
+    --line: #2a323d;
+    --text: #e6edf3;
+    --muted: #8b98a5;
+    --edge: #39424e;
+    --edge-up: #4f9dff;
+    --edge-down: #ff8c42;
+    --g-base: #5b8def;
+    --g-bus: #18a999;
+    --g-storage: #c9a227;
+    --g-exec: #d9534f;
+    --g-mission: #9b6dd6;
+    --g-api: #e0699b;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, "PingFang SC", "Segoe UI", sans-serif;
+  }
+  header {
+    min-height: 56px;
+    padding: 14px 18px;
+    border-bottom: 1px solid var(--line);
+    display: flex;
+    align-items: baseline;
+    gap: 16px;
+    flex-wrap: wrap;
+  }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  header .meta { color: var(--muted); font-size: 12px; }
+  .view-toggle {
+    display: inline-flex;
+    gap: 2px;
+    padding: 2px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: rgba(255,255,255,.03);
+  }
+  .view-toggle button {
+    border: 0;
+    border-radius: 6px;
+    padding: 5px 10px;
+    background: transparent;
+    color: var(--muted);
+    font: inherit;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .view-toggle button.active { background: var(--panel); color: var(--text); }
+  .legend { display: flex; gap: 14px; flex-wrap: wrap; margin-left: auto; font-size: 12px; }
+  .legend.hidden { display: none; }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); }
+  .legend i { width: 11px; height: 11px; border-radius: 3px; display: inline-block; }
+  .view { width: 100%; height: calc(100% - 56px); }
+  .view.hidden { display: none; }
+  .flow {
+    overflow: auto;
+    padding: 24px 28px 70px;
+  }
+  .flow-grid {
+    min-width: 1480px;
+    display: grid;
+    grid-template-columns: repeat(6, minmax(210px, 1fr));
+    gap: 18px;
+    align-items: stretch;
+  }
+  .flow-card {
+    position: relative;
+    min-height: 300px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: linear-gradient(180deg, rgba(255,255,255,.035), rgba(255,255,255,.015));
+    padding: 14px;
+  }
+  .flow-card::after {
+    content: "";
+    position: absolute;
+    top: 44px;
+    right: -18px;
+    width: 18px;
+    border-top: 1px solid #53606e;
+  }
+  .flow-card:last-child::after { display: none; }
+  .flow-step {
+    width: 28px;
+    height: 28px;
+    display: grid;
+    place-items: center;
+    border-radius: 50%;
+    color: var(--bg);
+    background: var(--text);
+    font-size: 12px;
+    font-weight: 700;
+    margin-bottom: 12px;
+  }
+  .flow-card h2 { margin: 0 0 9px; font-size: 15px; font-weight: 650; letter-spacing: 0; }
+  .flow-card p { margin: 0; color: #b7c2cd; font-size: 12.5px; line-height: 1.62; }
+  .flow-crates {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 14px;
+  }
+  .flow-crates span {
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    padding: 3px 7px;
+    color: var(--text);
+    background: rgba(91,141,239,.12);
+    font-size: 11px;
+    white-space: nowrap;
+  }
+  .flow-risk {
+    margin-top: 16px;
+    border-top: 1px solid var(--line);
+    padding-top: 11px;
+    color: var(--muted);
+    font-size: 12px;
+    line-height: 1.55;
+  }
+  .flow-rails {
+    min-width: 1480px;
+    margin-top: 18px;
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 18px;
+  }
+  .rail {
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 12px 14px;
+    background: rgba(24,169,153,.08);
+  }
+  .rail b { display: block; font-size: 13px; margin-bottom: 5px; }
+  .rail span { display: block; color: var(--muted); font-size: 12px; line-height: 1.5; }
+  .wrap { position: relative; width: 100%; height: 100%; overflow: auto; }
+  svg { display: block; }
+  .col-title { fill: var(--muted); font-size: 12px; font-weight: 600; letter-spacing: .04em; }
+  .node rect { rx: 7; ry: 7; stroke-width: 1.5; cursor: pointer; }
+  .node text.name { fill: var(--text); font-size: 12.5px; font-weight: 600; pointer-events: none; }
+  .node text.layer { fill: var(--bg); font-size: 10px; font-weight: 700; pointer-events: none; }
+  .node.dim { opacity: .14; }
+  .node.active rect:first-child { stroke-width: 2.8; filter: drop-shadow(0 0 8px rgba(230,237,243,.22)); }
+  .edge { fill: none; stroke: var(--edge); stroke-width: 1.1; opacity: .5; }
+  .edge.dim { opacity: .05; }
+  .edge.up { stroke: var(--edge-up); stroke-width: 2; opacity: .95; }
+  .edge.down { stroke: var(--edge-down); stroke-width: 2; opacity: .95; }
+  .tip {
+    position: fixed;
+    pointer-events: none;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 9px 11px;
+    max-width: 340px;
+    font-size: 12.5px;
+    line-height: 1.5;
+    box-shadow: 0 8px 28px rgba(0,0,0,.5);
+    display: none;
+    z-index: 10;
+  }
+  .tip b { color: var(--text); }
+  .tip .d { color: var(--muted); margin-top: 4px; }
+  .tip .c { color: var(--muted); margin-top: 6px; font-size: 11.5px; }
+  .hint {
+    position: fixed;
+    left: 18px;
+    bottom: 14px;
+    color: var(--muted);
+    font-size: 12px;
+    background: rgba(15,20,25,.88);
+    padding: 6px 10px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+  }
+  .hint.hidden { display: none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>magi-rust 后端 crate 架构</h1>
+  <div class="view-toggle" role="tablist" aria-label="架构视图">
+    <button class="active" type="button" data-view="flow" role="tab" aria-selected="true">业务主链路</button>
+    <button type="button" data-view="deps" role="tab" aria-selected="false">Cargo 依赖图</button>
+  </div>
+  <span class="meta" id="meta"></span>
+  <div class="legend" id="legend"></div>
+</header>
+<section class="view flow" id="flowView"></section>
+<section class="view hidden" id="depsView"><div class="wrap"><svg id="svg"></svg></div></section>
+<div class="tip" id="tip"></div>
+<div class="hint hidden" id="hint">点击 crate：蓝色=它依赖的上游，橙色=依赖它的下游 · 点击空白复位 · 悬浮看职责</div>
+<script>
+const DATA = ${json};
+const FLOW = ${flowJson};
+const MAX_DEPTH = ${maxDepth};
+const groupColor = { base:'--g-base', bus:'--g-bus', storage:'--g-storage', exec:'--g-exec', mission:'--g-mission', api:'--g-api' };
+const css = (key) => getComputedStyle(document.documentElement).getPropertyValue(key).trim();
+const meta = document.getElementById('meta');
+const flowView = document.getElementById('flowView');
+const depsView = document.getElementById('depsView');
+const hint = document.getElementById('hint');
+const legend = document.getElementById('legend');
+
+function renderFlow() {
+  const grid = document.createElement('div');
+  grid.className = 'flow-grid';
+  FLOW.forEach((step, index) => {
+    const card = document.createElement('article');
+    card.className = 'flow-card';
+    card.innerHTML = \`
+      <div class="flow-step">\${index + 1}</div>
+      <h2>\${step.title}</h2>
+      <p>\${step.desc}</p>
+      <div class="flow-crates">\${step.crates.map((crate) => \`<span>\${crate}</span>\`).join('')}</div>
+      <div class="flow-risk"><b>边界：</b>\${step.risk}</div>
+    \`;
+    grid.appendChild(card);
+  });
+
+  const rails = document.createElement('div');
+  rails.className = 'flow-rails';
+  rails.innerHTML = \`
+    <div class="rail"><b>横切治理</b><span>permissions / governance / safety-gate 贯穿工具、命令、目录访问和高危操作。</span></div>
+    <div class="rail"><b>可观测账本</b><span>event-bus / mission-metrics / usage-authority 记录事件、token、窗口和执行进度。</span></div>
+    <div class="rail"><b>恢复能力</b><span>snapshot / checkpoint / human-checkpoint / validation-runner 支撑中断恢复和完成性校验。</span></div>
+  \`;
+  flowView.appendChild(grid);
+  flowView.appendChild(rails);
+}
+
+function setView(view) {
+  const isDeps = view === 'deps';
+  flowView.classList.toggle('hidden', isDeps);
+  depsView.classList.toggle('hidden', !isDeps);
+  hint.classList.toggle('hidden', !isDeps);
+  legend.classList.toggle('hidden', !isDeps);
+  meta.textContent = isDeps
+    ? \`\${DATA.nodes.length} crate · \${DATA.edges.length} 条内部依赖 · 最大深度 \${MAX_DEPTH} · 数据来自 cargo metadata\`
+    : \`\${FLOW.length} 段业务主链路 · \${DATA.nodes.length} crate · \${DATA.edges.length} 条内部依赖事实底图\`;
+  document.querySelectorAll('.view-toggle button').forEach((button) => {
+    const active = button.dataset.view === view;
+    button.classList.toggle('active', active);
+    button.setAttribute('aria-selected', String(active));
+  });
+}
+document.querySelectorAll('.view-toggle button').forEach((button) => {
+  button.addEventListener('click', () => setView(button.dataset.view));
+});
+renderFlow();
+
+const NS = 'http://www.w3.org/2000/svg';
+const COLW = 210, NODEH = 34, VGAP = 14, PADX = 40, PADY = 58, COLGAP = 66;
+
+const byLayer = {};
+DATA.nodes.forEach((node) => { (byLayer[node.layer] = byLayer[node.layer] || []).push(node); });
+const layers = Object.keys(byLayer).map(Number).sort((a, b) => a - b);
+const groupRank = {};
+DATA.groupOrder.forEach((group, index) => { groupRank[group] = index; });
+const pos = {};
+let maxRows = 0;
+layers.forEach((layer, columnIndex) => {
+  const column = byLayer[layer].sort((a, b) => groupRank[a.group] - groupRank[b.group] || a.id.localeCompare(b.id));
+  maxRows = Math.max(maxRows, column.length);
+  column.forEach((node, rowIndex) => {
+    pos[node.id] = { x: PADX + columnIndex * (COLW + COLGAP), y: PADY + rowIndex * (NODEH + VGAP) };
+  });
+});
+
+const svg = document.getElementById('svg');
+const width = PADX * 2 + layers.length * (COLW + COLGAP);
+const height = PADY + maxRows * (NODEH + VGAP) + 30;
+svg.setAttribute('width', width);
+svg.setAttribute('height', height);
+svg.setAttribute('viewBox', \`0 0 \${width} \${height}\`);
+
+layers.forEach((layer, columnIndex) => {
+  const title = document.createElementNS(NS, 'text');
+  title.setAttribute('x', PADX + columnIndex * (COLW + COLGAP) + COLW / 2);
+  title.setAttribute('y', 34);
+  title.setAttribute('text-anchor', 'middle');
+  title.setAttribute('class', 'col-title');
+  title.textContent = 'depth ' + layer;
+  svg.appendChild(title);
+});
+
+const edgeEls = [];
+const gEdges = document.createElementNS(NS, 'g');
+svg.appendChild(gEdges);
+DATA.edges.forEach(([from, to]) => {
+  if (!pos[from] || !pos[to]) return;
+  const a = pos[from], b = pos[to];
+  const x1 = a.x, y1 = a.y + NODEH / 2;
+  const x2 = b.x + COLW, y2 = b.y + NODEH / 2;
+  const mid = (x1 + x2) / 2;
+  const path = document.createElementNS(NS, 'path');
+  path.setAttribute('d', \`M\${x1},\${y1} C\${mid},\${y1} \${mid},\${y2} \${x2},\${y2}\`);
+  path.setAttribute('class', 'edge');
+  path.dataset.from = from;
+  path.dataset.to = to;
+  gEdges.appendChild(path);
+  edgeEls.push(path);
+});
+
+const nodeEls = {};
+const gNodes = document.createElementNS(NS, 'g');
+svg.appendChild(gNodes);
+DATA.nodes.forEach((node) => {
+  const p = pos[node.id];
+  const group = document.createElementNS(NS, 'g');
+  group.setAttribute('class', 'node');
+  group.setAttribute('transform', \`translate(\${p.x},\${p.y})\`);
+  group.dataset.id = node.id;
+  const color = css(groupColor[node.group]);
+
+  const body = document.createElementNS(NS, 'rect');
+  body.setAttribute('width', COLW);
+  body.setAttribute('height', NODEH);
+  body.setAttribute('fill', color + '22');
+  body.setAttribute('stroke', color);
+  group.appendChild(body);
+
+  const badge = document.createElementNS(NS, 'rect');
+  badge.setAttribute('width', 22);
+  badge.setAttribute('height', NODEH);
+  badge.setAttribute('fill', color);
+  badge.setAttribute('rx', 7);
+  badge.setAttribute('ry', 7);
+  group.appendChild(badge);
+
+  const layer = document.createElementNS(NS, 'text');
+  layer.setAttribute('class', 'layer');
+  layer.setAttribute('x', 11);
+  layer.setAttribute('y', NODEH / 2 + 3.5);
+  layer.setAttribute('text-anchor', 'middle');
+  layer.textContent = node.layer;
+  group.appendChild(layer);
+
+  const name = document.createElementNS(NS, 'text');
+  name.setAttribute('class', 'name');
+  name.setAttribute('x', 30);
+  name.setAttribute('y', NODEH / 2 + 4.5);
+  name.textContent = node.id.replace('magi-', '');
+  group.appendChild(name);
+
+  gNodes.appendChild(group);
+  nodeEls[node.id] = group;
+  group.addEventListener('click', (event) => {
+    event.stopPropagation();
+    focusNode(node.id);
+  });
+  group.addEventListener('mousemove', (event) => showTip(event, node));
+  group.addEventListener('mouseleave', hideTip);
+});
+
+const upstream = {}, downstream = {};
+DATA.nodes.forEach((node) => {
+  upstream[node.id] = new Set();
+  downstream[node.id] = new Set();
+});
+DATA.edges.forEach(([from, to]) => {
+  upstream[from].add(to);
+  downstream[to].add(from);
+});
+function reach(start, map) {
+  const seen = new Set();
+  const stack = [...map[start]];
+  while (stack.length) {
+    const current = stack.pop();
+    if (seen.has(current)) continue;
+    seen.add(current);
+    for (const next of map[current] || []) stack.push(next);
+  }
+  return seen;
+}
+
+let active = null;
+function focusNode(id) {
+  if (active === id) {
+    resetFocus();
+    return;
+  }
+  active = id;
+  const ups = reach(id, upstream);
+  const downs = reach(id, downstream);
+  const keep = new Set([id, ...ups, ...downs]);
+
+  DATA.nodes.forEach((node) => {
+    nodeEls[node.id].classList.toggle('active', node.id === id);
+    nodeEls[node.id].classList.toggle('dim', !keep.has(node.id));
+  });
+  edgeEls.forEach((path) => {
+    const from = path.dataset.from, to = path.dataset.to;
+    path.classList.remove('up', 'down', 'dim');
+    if ((from === id && ups.has(to)) || (ups.has(from) && ups.has(to))) {
+      path.classList.add('up');
+    } else if ((to === id && downs.has(from)) || (downs.has(from) && downs.has(to))) {
+      path.classList.add('down');
+    } else {
+      path.classList.add('dim');
+    }
+  });
+}
+
+function resetFocus() {
+  active = null;
+  DATA.nodes.forEach((node) => nodeEls[node.id].classList.remove('active', 'dim'));
+  edgeEls.forEach((path) => path.classList.remove('up', 'down', 'dim'));
+}
+document.querySelector('.wrap').addEventListener('click', resetFocus);
+
+const tip = document.getElementById('tip');
+function showTip(event, node) {
+  tip.innerHTML = \`<b>\${node.id}</b><div class="d">\${node.desc || '—'}</div>\` +
+    \`<div class="c">\${node.path} · depth \${node.layer} · 依赖 \${upstream[node.id].size} 个 · 被 \${downstream[node.id].size} 个依赖</div>\`;
+  tip.style.display = 'block';
+  const pad = 14;
+  let x = event.clientX + pad, y = event.clientY + pad;
+  const rect = tip.getBoundingClientRect();
+  if (x + rect.width > innerWidth) x = event.clientX - rect.width - pad;
+  if (y + rect.height > innerHeight) y = event.clientY - rect.height - pad;
+  tip.style.left = x + 'px';
+  tip.style.top = y + 'px';
+}
+function hideTip() {
+  tip.style.display = 'none';
+}
+
+DATA.groupOrder.forEach((group) => {
+  const item = document.createElement('span');
+  item.innerHTML = \`<i style="background:\${css(groupColor[group])}"></i>\${DATA.groupLabel[group]}\`;
+  legend.appendChild(item);
+});
+setView('flow');
+</script>
+</body>
+</html>
+`;
+}
+
+function renderCurrent() {
+  const metadata = readMetadata();
+  const graph = buildGraph(metadata);
+  const html = renderHtml(graph);
+  return { graph, html, metadata };
+}
+
+function writeCurrent() {
+  const { graph, html, metadata } = renderCurrent();
+  mkdirSync(dirname(output), { recursive: true });
+  writeFileSync(output, html, 'utf8');
+  console.log(`已生成 ${output}`);
+  console.log(`${graph.nodes.length} crate, ${graph.edges.length} 条内部依赖`);
+  return { graph, metadata };
+}
+
+function checkCurrent() {
+  const { html } = renderCurrent();
+  if (!existsSync(output)) {
+    console.error(`架构图不存在：${output}`);
+    process.exitCode = 1;
+    return;
+  }
+  const current = readFileSync(output, 'utf8');
+  if (current !== html) {
+    console.error('架构图已过期，请执行 scripts/render-crate-architecture.mjs 重新生成。');
+    process.exitCode = 1;
+    return;
+  }
+  console.log('架构图与当前 Cargo workspace 一致。');
+}
+
+function manifestPaths(metadata) {
+  return metadata.packages
+    .filter((pkg) => metadata.workspace_members.includes(pkg.id))
+    .map((pkg) => pkg.manifest_path)
+    .sort();
+}
+
+function watchCurrent() {
+  let timer;
+  let watchers = [];
+
+  function closeWatchers() {
+    for (const watcher of watchers) watcher.close();
+    watchers = [];
+  }
+
+  function armWatchers(metadata) {
+    closeWatchers();
+    const paths = new Set([join(root, 'Cargo.toml'), ...manifestPaths(metadata)]);
+    for (const manifest of paths) {
+      watchers.push(watch(manifest, { persistent: true }, () => {
+        clearTimeout(timer);
+        timer = setTimeout(regenerate, 150);
+      }));
+    }
+  }
+
+  function regenerate() {
+    try {
+      const { graph, metadata } = writeCurrent();
+      armWatchers(metadata);
+      console.log(`监听中：${manifestPaths(metadata).length + 1} 个 Cargo.toml，Ctrl+C 退出。`);
+      return graph;
+    } catch (error) {
+      console.error(`生成失败：${error.message}`);
+      return null;
+    }
+  }
+
+  regenerate();
+  process.on('SIGINT', () => {
+    closeWatchers();
+    process.exit(0);
+  });
+}
+
+function printHelp() {
+  console.log(`用法：
+  scripts/render-crate-architecture.mjs          重新生成 docs/architecture.html
+  scripts/render-crate-architecture.mjs --check  检查架构图是否与当前 Cargo workspace 一致
+  scripts/render-crate-architecture.mjs --watch  按需监听 Cargo.toml 变化并自动重新生成`);
+}
+
+if (mode.help) {
+  printHelp();
+} else if (mode.check) {
+  checkCurrent();
+} else if (mode.watch) {
+  watchCurrent();
+} else {
+  writeCurrent();
+}

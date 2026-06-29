@@ -15,12 +15,12 @@
 //! 把整个 mission 目录整体快照。
 
 use magi_core::{MissionId, UtcMillis, WorkspaceRootPath};
+use magi_mission_artifact::{MissionArtifactIo, MissionArtifactRegistry, MissionArtifactStore};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
-    fs, io,
+    io,
     path::{Path, PathBuf},
-    sync::{Arc, RwLock},
+    sync::Arc,
 };
 use thiserror::Error;
 // --- KnowledgeFact
@@ -103,10 +103,19 @@ pub enum KnowledgeGraphError {
         source: io::Error,
     },
 }
+impl From<MissionArtifactIo> for KnowledgeGraphError {
+    fn from(error: MissionArtifactIo) -> Self {
+        Self::Io {
+            path: error.path,
+            source: error.source,
+        }
+    }
+}
+
 // --- Store
 
 pub struct KnowledgeGraphStore {
-    root: PathBuf,
+    artifact: MissionArtifactStore,
 }
 
 impl KnowledgeGraphStore {
@@ -114,42 +123,30 @@ impl KnowledgeGraphStore {
         magi_home: &Path,
         workspace_root: &WorkspaceRootPath,
     ) -> Result<Self, KnowledgeGraphError> {
-        let root = magi_core::paths::missions_root(magi_home, workspace_root);
-        fs::create_dir_all(&root).map_err(|source| KnowledgeGraphError::Io {
-            path: root.clone(),
-            source,
-        })?;
-        Ok(Self { root })
-    }
-
-    fn graph_path(&self, mission_id: &MissionId) -> PathBuf {
-        self.root.join(mission_id.as_str()).join("knowledge.md")
+        Ok(Self {
+            artifact: MissionArtifactStore::open_with_home(
+                magi_home,
+                workspace_root,
+                "knowledge.md",
+            )?,
+        })
     }
 
     pub fn load(
         &self,
         mission_id: &MissionId,
     ) -> Result<Option<KnowledgeGraph>, KnowledgeGraphError> {
-        let path = self.graph_path(mission_id);
-        let raw = match fs::read_to_string(&path) {
-            Ok(s) => s,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(source) => return Err(KnowledgeGraphError::Io { path, source }),
+        let Some(raw) = self.artifact.load_text(mission_id)? else {
+            return Ok(None);
         };
         parse_graph(&raw).map(Some)
     }
 
     pub fn save(&self, graph: &KnowledgeGraph) -> Result<(), KnowledgeGraphError> {
-        let path = self.graph_path(&graph.mission_id);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|source| KnowledgeGraphError::Io {
-                path: parent.to_path_buf(),
-                source,
-            })?;
-        }
         let rendered = render_graph(graph);
-        magi_core::fs_atomic::write_atomic(&path, rendered)
-            .map_err(|source| KnowledgeGraphError::Io { path, source })
+        self.artifact
+            .save_text(&graph.mission_id, rendered)
+            .map_err(Into::into)
     }
 
     /// 为 system prompt 渲染 KG 段落。空 KG 返回 None，不噪音注入。
@@ -209,17 +206,13 @@ impl KnowledgeGraphStore {
 
 /// 进程级缓存，按 workspace_root 聚合 KnowledgeGraphStore。
 pub struct KnowledgeGraphRegistry {
-    inner: RwLock<HashMap<String, Arc<KnowledgeGraphStore>>>,
-    magi_home: PathBuf,
+    inner: MissionArtifactRegistry<KnowledgeGraphStore>,
 }
 
 impl KnowledgeGraphRegistry {
     pub fn with_magi_home(magi_home: impl Into<PathBuf>) -> Self {
-        let magi_home = magi_home.into();
-        let _ = fs::create_dir_all(&magi_home);
         Self {
-            inner: RwLock::new(HashMap::new()),
-            magi_home,
+            inner: MissionArtifactRegistry::with_magi_home(magi_home),
         }
     }
 
@@ -227,19 +220,11 @@ impl KnowledgeGraphRegistry {
         &self,
         workspace_root: &WorkspaceRootPath,
     ) -> Result<Arc<KnowledgeGraphStore>, KnowledgeGraphError> {
-        let key = workspace_root.as_str().to_string();
-        if let Some(store) = self.inner.read().expect("kg registry poisoned").get(&key) {
-            return Ok(store.clone());
-        }
-        let store = KnowledgeGraphStore::open_with_home(&self.magi_home, workspace_root)?;
-        let arc = Arc::new(store);
         self.inner
-            .write()
-            .expect("kg registry poisoned")
-            .insert(key, arc.clone());
-        Ok(arc)
+            .get_or_open(workspace_root, KnowledgeGraphStore::open_with_home)
     }
 }
+
 // --- Tool argument parsing
 
 #[derive(Debug)]

@@ -26,6 +26,7 @@ magi-memory-store = { path = "../magi-memory-store" }
 magi-mission = { path = "../magi-mission" }
 magi-orchestrator = { path = "../magi-orchestrator" }
 magi-session-store = { path = "../magi-session-store" }
+magi-settings-store = { path = "../magi-settings-store" }
 magi-skill-runtime = { path = "../magi-skill-runtime" }
 magi-snapshot = { path = "../magi-snapshot" }
 magi-spawn-graph = { path = "../magi-spawn-graph" }

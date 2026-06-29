@@ -24,7 +24,6 @@ use magi_conversation_runtime::{
     session_turn_finalize::{
         current_turn_status_is_terminal, publish_task_status_turn_item_for_active_sessions,
     },
-    settings_store::SettingsStore,
     task_execution_dispatcher::LlmTaskDispatcher,
     task_execution_registry::TaskExecutionPlan,
     task_runner_bridge::{
@@ -42,6 +41,7 @@ use magi_lifecycle_notice::{LifecycleNoticeRegistry, run_subscriber as run_lifec
 use magi_memory_store::MemoryStore;
 use magi_orchestrator::{ExecutionContextConfig, OrchestratorService, task_store::TaskStore};
 use magi_session_store::{SessionExecutionSidecarStatus, SessionRuntimeSidecar, SessionStore};
+use magi_settings_store::SettingsStore;
 use magi_skill_runtime::SkillDispatchRuntime;
 use magi_snapshot::SnapshotManager;
 use magi_tool_runtime::{
@@ -1688,7 +1688,6 @@ mod tests {
     use magi_bridge_client::{
         BridgeResponse, McpBridgeClient, McpServerConfig, McpToolCallRequest, StdioMcpBridgeClient,
     };
-    use magi_conversation_runtime::settings_store::SettingsStore;
     use magi_core::{
         MissionId, SessionId, Task, TaskId, TaskKind, TaskRuntimePayload, TaskStatus, ThreadId,
         UtcMillis, WorkerId, WorkspaceId,
@@ -1699,6 +1698,7 @@ mod tests {
         ActiveExecutionBranch, ActiveExecutionChain, ActiveExecutionDispatchContext,
         ActiveExecutionTurn, SessionStore,
     };
+    use magi_settings_store::SettingsStore;
     use serde_json::{Value, json};
     use std::{
         collections::{BTreeMap, HashMap},
@@ -1827,7 +1827,7 @@ mod tests {
             prompt_priority: 50,
         });
         let provider = super::build_external_tool_catalog_provider(
-            std::sync::Arc::new(super::SettingsStore::default()),
+            std::sync::Arc::new(SettingsStore::default()),
             std::sync::Arc::new(magi_skill_runtime::SkillRuntime::new(registry)),
             std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         );

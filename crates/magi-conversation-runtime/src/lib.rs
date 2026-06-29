@@ -23,7 +23,6 @@ pub mod session_thread;
 pub mod session_turn_execution;
 pub mod session_turn_finalize;
 pub mod session_writeback;
-pub mod settings_store;
 mod skill_apply_tool;
 mod skill_custom_tool_surface;
 pub mod task_execution_dispatcher;

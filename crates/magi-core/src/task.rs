@@ -178,6 +178,59 @@ pub enum TaskRuntimePayload {
     #[default]
     None,
 }
+
+/// 任务执行器绑定合同。
+///
+/// 这是任务分派、子 agent spawn、任务恢复之间共享的稳定结构。字段为空表示未绑定，
+/// 不再允许调用方写入任意 JSON 字段形成隐式协议。
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TaskExecutorBinding {
+    pub target_role: Option<String>,
+    pub parallelism_group: Option<String>,
+    pub exclusive_scope: Option<String>,
+    pub active_skill_id: Option<String>,
+}
+
+impl TaskExecutorBinding {
+    pub fn for_role(role: impl Into<String>) -> Self {
+        Self {
+            target_role: normalized_string(role.into()),
+            ..Self::default()
+        }
+    }
+
+    pub fn with_parallelism_group(mut self, group: Option<String>) -> Self {
+        self.parallelism_group = normalized_optional_string(group);
+        self
+    }
+
+    pub fn with_exclusive_scope(mut self, scope: Option<String>) -> Self {
+        self.exclusive_scope = normalized_optional_string(scope);
+        self
+    }
+
+    pub fn with_active_skill_id(mut self, skill_id: Option<String>) -> Self {
+        self.active_skill_id = normalized_optional_string(skill_id);
+        self
+    }
+
+    fn target_role(&self) -> Option<&str> {
+        normalized_str_ref(self.target_role.as_deref())
+    }
+
+    fn parallelism_group(&self) -> Option<&str> {
+        normalized_str_ref(self.parallelism_group.as_deref())
+    }
+
+    fn exclusive_scope(&self) -> Option<&str> {
+        normalized_str_ref(self.exclusive_scope.as_deref())
+    }
+
+    fn active_skill_id(&self) -> Option<&str> {
+        normalized_str_ref(self.active_skill_id.as_deref())
+    }
+}
 // --- Task
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -193,9 +246,7 @@ pub struct Task {
     pub dependency_ids: Vec<TaskId>,
     pub required_children: Vec<TaskId>,
     pub policy_snapshot: Option<TaskPolicy>,
-    /// Executor routing metadata stored as JSON to keep runtime-specific binding shapes
-    /// out of magi-core.
-    pub executor_binding: Option<serde_json::Value>,
+    pub executor_binding: Option<TaskExecutorBinding>,
     pub knowledge_refs: Vec<String>,
     pub workspace_scope: Option<String>,
     pub write_scope: Option<String>,
@@ -211,29 +262,50 @@ pub struct Task {
 }
 
 impl Task {
-    fn executor_binding_str(&self, key: &str) -> Option<&str> {
+    pub fn executor_binding_target_role(&self) -> Option<&str> {
         self.executor_binding
             .as_ref()
-            .and_then(|binding| binding.get(key))
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-    }
-
-    pub fn executor_binding_target_role(&self) -> Option<&str> {
-        self.executor_binding_str("target_role")
+            .and_then(TaskExecutorBinding::target_role)
     }
 
     pub fn executor_binding_parallelism_group(&self) -> Option<&str> {
-        self.executor_binding_str("parallelism_group")
+        self.executor_binding
+            .as_ref()
+            .and_then(TaskExecutorBinding::parallelism_group)
     }
 
     pub fn executor_binding_exclusive_scope(&self) -> Option<&str> {
-        self.executor_binding_str("exclusive_scope")
+        self.executor_binding
+            .as_ref()
+            .and_then(TaskExecutorBinding::exclusive_scope)
     }
 
     pub fn executor_binding_active_skill_id(&self) -> Option<&str> {
-        self.executor_binding_str("active_skill_id")
+        self.executor_binding
+            .as_ref()
+            .and_then(TaskExecutorBinding::active_skill_id)
+    }
+}
+
+fn normalized_optional_string(value: Option<String>) -> Option<String> {
+    value.and_then(normalized_string)
+}
+
+fn normalized_string(value: impl AsRef<str>) -> Option<String> {
+    let trimmed = value.as_ref().trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn normalized_str_ref(value: Option<&str>) -> Option<&str> {
+    let trimmed = value?.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
     }
 }
 // --- TaskProjection (view contract)

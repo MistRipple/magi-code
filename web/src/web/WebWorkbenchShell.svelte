@@ -20,7 +20,7 @@
     type WebThemePreference,
   } from './theme';
   import {
-    AGENT_CONNECTION_EVENT,
+    RUNTIME_CONNECTION_EVENT,
     getWorkspaceSessions,
     listAgentWorkspaces,
     registerAgentWorkspace,
@@ -1286,12 +1286,12 @@
     };
     window.addEventListener('resize', handleResize);
     window.addEventListener('magi:previewFile', handlePreviewFile as EventListener);
-    window.addEventListener(AGENT_CONNECTION_EVENT, handleAgentConnection as EventListener);
+    window.addEventListener(RUNTIME_CONNECTION_EVENT, handleAgentConnection as EventListener);
     void refreshWorkspaces();
     return () => {
       window.removeEventListener('resize', handleResize);
       window.removeEventListener('magi:previewFile', handlePreviewFile as EventListener);
-      window.removeEventListener(AGENT_CONNECTION_EVENT, handleAgentConnection as EventListener);
+      window.removeEventListener(RUNTIME_CONNECTION_EVENT, handleAgentConnection as EventListener);
       if (resizeRaf !== null) {
         cancelAnimationFrame(resizeRaf);
       }

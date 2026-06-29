@@ -1,5 +1,5 @@
 [package]
-name = "magi-agent"
+name = "magi-runtime-state"
 version.workspace = true
 edition.workspace = true
 

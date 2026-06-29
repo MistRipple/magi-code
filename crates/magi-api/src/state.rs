@@ -24,7 +24,6 @@ use magi_bridge_client::{
 use magi_conversation_runtime::{
     ConversationRegistry,
     session_images::SessionTurnImage,
-    settings_store::SettingsStore,
     task_execution_dispatcher::{ExecutionPipeline, LlmTaskDispatcher},
     task_execution_registry::TaskExecutionRegistry,
     task_runner::TaskRunner,
@@ -48,6 +47,7 @@ use magi_orchestrator::{
     task_worker_catalog::{WorkerInfo, build_worker_catalog_for_roles},
 };
 use magi_session_store::{SessionLifecycleObserver, SessionRecord, SessionStore};
+use magi_settings_store::SettingsStore;
 use magi_snapshot::{SnapshotManager, SnapshotSession};
 use magi_tool_runtime::{
     RuntimeCapabilityDependencyEntry, RuntimeCapabilityDependencyProvider, ToolExecutionContext,
@@ -2151,9 +2151,7 @@ mod tests {
         let store = Arc::new(TaskStore::new());
         let mut task = task_with_status("task-custom-agent-role", TaskStatus::Pending);
         task.root_task_id = task.task_id.clone();
-        task.executor_binding = Some(serde_json::json!({
-            "target_role": "auditor",
-        }));
+        task.executor_binding = Some(magi_core::TaskExecutorBinding::for_role("auditor"));
         let root_task_id = task.root_task_id.clone();
         store.insert_task(task);
 

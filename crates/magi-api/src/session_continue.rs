@@ -13,12 +13,12 @@ use magi_conversation_runtime::{
         apply_chain_recovery_if_needed, release_resumed_branch_path,
         sync_branch_checkpoint_to_worker_runtime,
     },
-    settings_store::SettingsStore,
     task_execution_registry::TaskExecutionPlan,
 };
 use magi_core::{ExecutionOwnership, SessionId, TaskExecutionTarget, TaskStatus, WorkerId};
 use magi_orchestrator::ExecutionWritebackPlans;
 use magi_session_store::{ActiveExecutionBranch, ActiveExecutionChain};
+use magi_settings_store::SettingsStore;
 use std::sync::Arc;
 
 // 对 routes/sessions.rs 暴露继续会话所需的 runtime 数据载体与判定函数。

@@ -19,7 +19,6 @@ use crate::{
     },
     session_turn_finalize::{format_dependency_task_context, format_task_ref_list},
     session_writeback::SessionStatePersistCallback,
-    settings_store::SettingsStore,
     skill_apply_tool_definition,
     task_execution_registry::{TaskExecutionPlan, TaskExecutionRegistry},
     task_helpers::{task_can_see_builtin_tool, task_is_long_mission, task_role_id},
@@ -45,6 +44,7 @@ use magi_orchestrator::{
     OrchestratorService, task_worker_catalog::WorkerInfo,
 };
 use magi_session_store::{SessionStore, TimelineEntryKind, timeline_entry_visible_text};
+use magi_settings_store::SettingsStore;
 use magi_tool_runtime::{BuiltinToolName, ToolRegistry};
 use magi_workspace::WorkspaceStore;
 use std::{path::PathBuf, sync::Arc};
@@ -2089,9 +2089,7 @@ mod tests {
                 background_allowed,
                 escalation_conditions: Vec::new(),
             }),
-            executor_binding: Some(serde_json::json!({
-                "target_role": role,
-            })),
+            executor_binding: Some(magi_core::TaskExecutorBinding::for_role(role)),
             knowledge_refs: Vec::new(),
             workspace_scope: None,
             write_scope: None,
@@ -2738,7 +2736,7 @@ mod tests {
 
     #[test]
     fn resolve_target_for_role_orchestrator_requires_session_model_override() {
-        use crate::settings_store::SettingsStore;
+        use magi_settings_store::SettingsStore;
 
         let store = Arc::new(SettingsStore::new());
         store.set_section(
@@ -2856,7 +2854,7 @@ mod tests {
 
     #[test]
     fn resolve_target_for_role_orchestrator_threads_session_override() {
-        use crate::settings_store::SettingsStore;
+        use magi_settings_store::SettingsStore;
 
         let store = Arc::new(SettingsStore::new());
         store.set_section(
@@ -2903,7 +2901,7 @@ mod tests {
 
     #[test]
     fn build_safety_gate_honors_settings_override_for_builtin_rules() {
-        use crate::settings_store::SettingsStore;
+        use magi_settings_store::SettingsStore;
 
         let dispatcher = dispatcher_with_default_tool_surface();
         let store = Arc::new(SettingsStore::new());
@@ -2942,7 +2940,7 @@ mod tests {
 
     #[test]
     fn resolve_safeguard_prompt_renders_runtime_rule_actions() {
-        use crate::settings_store::SettingsStore;
+        use magi_settings_store::SettingsStore;
 
         let dispatcher = dispatcher_with_default_tool_surface();
         let store = Arc::new(SettingsStore::new());
@@ -3012,7 +3010,7 @@ mod tests {
 
     #[test]
     fn resolve_target_for_role_reads_execution_snapshot_not_live_settings() {
-        use crate::settings_store::SettingsStore;
+        use magi_settings_store::SettingsStore;
 
         let live_store = Arc::new(SettingsStore::new());
         live_store.set_section(

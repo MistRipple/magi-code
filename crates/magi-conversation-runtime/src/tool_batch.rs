@@ -21,8 +21,8 @@ use magi_bridge_client::{
 };
 use magi_core::{
     AccessProfile, EventId, ExecutionResultStatus, SessionId, TASK_RUNTIME_FAILURE_PUBLIC_OUTPUT,
-    TaskId, TaskKind, TaskPolicy, TaskStatus, TaskTier, ToolCallId, UtcMillis, WorkspaceId,
-    public_task_output_refs, task_output_ref_is_internal_runtime_failure,
+    TaskExecutorBinding, TaskId, TaskKind, TaskPolicy, TaskStatus, TaskTier, ToolCallId, UtcMillis,
+    WorkspaceId, public_task_output_refs, task_output_ref_is_internal_runtime_failure,
 };
 use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
 use magi_orchestrator::task_store::TaskStore;
@@ -608,16 +608,14 @@ fn execute_coordinator_tool(
                 dependency_ids: child_dependency_ids,
                 required_children: Vec::new(),
                 policy_snapshot: Some(child_policy_snapshot),
-                executor_binding: Some(serde_json::json!({
-                    "target_role": role,
-                    "access_mode": access_mode.as_str(),
-                    "capability_requirements": [],
-                    "parallelism_group": parsed
-                        .get("parallelism_group")
-                        .and_then(|v| v.as_str()),
-                    "exclusive_scope": null,
-                    "worker_selector": null,
-                })),
+                executor_binding: Some(
+                    TaskExecutorBinding::for_role(&role).with_parallelism_group(
+                        parsed
+                            .get("parallelism_group")
+                            .and_then(|value| value.as_str())
+                            .map(str::to_string),
+                    ),
+                ),
                 knowledge_refs: Vec::new(),
                 workspace_scope: task.workspace_scope.clone(),
                 write_scope: task.write_scope.clone(),
@@ -1100,12 +1098,7 @@ fn enqueue_agent_assignment_message(
     role: &str,
     now: UtcMillis,
 ) {
-    let access_mode = child
-        .executor_binding
-        .as_ref()
-        .and_then(|binding| binding.get("access_mode"))
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("read_write");
+    let access_mode = task_policy_access_mode(child.policy_snapshot.as_ref()).as_str();
     let child_conversation =
         conversation_registry.conversation_for_task(session_id, &child.task_id);
     child_conversation
@@ -1128,6 +1121,17 @@ fn enqueue_agent_assignment_message(
             }),
             enqueued_at: now,
         });
+}
+
+fn task_policy_access_mode(policy: Option<&TaskPolicy>) -> AgentSpawnAccessMode {
+    if policy
+        .map(|policy| policy.access_profile == AccessProfile::ReadOnly)
+        .unwrap_or(false)
+    {
+        AgentSpawnAccessMode::ReadOnly
+    } else {
+        AgentSpawnAccessMode::ReadWrite
+    }
 }
 
 fn execute_agent_wait(
@@ -2140,9 +2144,7 @@ mod tests {
     }
 
     fn coordinator_task(mut task: Task) -> Task {
-        task.executor_binding = Some(serde_json::json!({
-            "target_role": "coordinator",
-        }));
+        task.executor_binding = Some(TaskExecutorBinding::for_role("coordinator"));
         task
     }
 
@@ -2834,20 +2836,20 @@ mod tests {
                 BuiltinToolName::FileCopy,
                 serde_json::json!({
                     "source": "src/input.txt",
-                    "dest": outside_path.display().to_string()
+                    "destination": outside_path.display().to_string()
                 }),
             ),
             (
                 BuiltinToolName::FileMove,
                 serde_json::json!({
-                    "from": outside_path.display().to_string(),
-                    "to": "src/output.txt"
+                    "source": outside_path.display().to_string(),
+                    "destination": "src/output.txt"
                 }),
             ),
             (
                 BuiltinToolName::FileMkdir,
                 serde_json::json!({
-                    "dir_path": outside_path.display().to_string()
+                    "path": outside_path.display().to_string()
                 }),
             ),
         ] {
@@ -2898,13 +2900,16 @@ mod tests {
             (
                 BuiltinToolName::ViewImage,
                 serde_json::json!({
-                    "imagePath": outside_path.display().to_string()
+                    "path": outside_path.display().to_string()
                 })
                 .to_string(),
             ),
             (
                 BuiltinToolName::FileRead,
-                outside_path.display().to_string(),
+                serde_json::json!({
+                    "path": outside_path.display().to_string()
+                })
+                .to_string(),
             ),
         ] {
             let decision = task_policy_tool_decision_with_workspace_root(
@@ -3830,9 +3835,7 @@ mod tests {
         child.status = TaskStatus::Completed;
         child.title = "目录探索".to_string();
         child.goal = "列出目录并汇报".to_string();
-        child.executor_binding = Some(serde_json::json!({
-            "target_role": "explorer",
-        }));
+        child.executor_binding = Some(TaskExecutorBinding::for_role("explorer"));
         child.output_refs = vec![
             serde_json::json!({
                 "blocks": [
@@ -4023,9 +4026,7 @@ mod tests {
         child.status = TaskStatus::Failed;
         child.title = "配置审查代理".to_string();
         child.goal = "检查模型配置是否可用".to_string();
-        child.executor_binding = Some(serde_json::json!({
-            "target_role": "reviewer",
-        }));
+        child.executor_binding = Some(TaskExecutorBinding::for_role("reviewer"));
         child.output_refs = vec!["provider transport failed: connection refused".to_string()];
         task_store.insert_task(child);
 
@@ -4081,9 +4082,7 @@ mod tests {
         child.status = TaskStatus::Failed;
         child.title = "冒烟测试代理".to_string();
         child.goal = "运行冒烟测试并报告失败原因".to_string();
-        child.executor_binding = Some(serde_json::json!({
-            "target_role": "tester",
-        }));
+        child.executor_binding = Some(TaskExecutorBinding::for_role("tester"));
         child.output_refs = vec!["测试失败：断言不匹配".to_string()];
         task_store.insert_task(child);
 
@@ -4124,9 +4123,7 @@ mod tests {
         child.status = TaskStatus::Failed;
         child.title = "验证代理".to_string();
         child.goal = "运行验证并报告失败原因".to_string();
-        child.executor_binding = Some(serde_json::json!({
-            "target_role": "tester",
-        }));
+        child.executor_binding = Some(TaskExecutorBinding::for_role("tester"));
         child.output_refs = vec![
             "测试失败：断言不匹配".to_string(),
             "provider transport failed: connection refused".to_string(),

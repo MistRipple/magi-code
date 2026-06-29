@@ -17,9 +17,10 @@ use magi_core::{
 };
 use magi_orchestrator::{ExecutionWritebackPlans, task_store::TaskStore};
 use magi_session_store::{ActiveExecutionBranch, SessionStore};
+use magi_settings_store::SettingsStore;
 use magi_spawn_graph::SpawnGraph;
 
-use crate::{session_images::SessionTurnImage, session_thread, settings_store::SettingsStore};
+use crate::{session_images::SessionTurnImage, session_thread};
 
 #[derive(Clone, Debug)]
 pub enum TaskExecutionPlan {
@@ -275,7 +276,7 @@ mod tests {
 
     #[test]
     fn spawned_local_agent_child_registration_is_atomic_runtime_source() {
-        use crate::settings_store::SettingsStore;
+        use magi_settings_store::SettingsStore;
 
         let task_store = TaskStore::new();
         let spawn_graph = Mutex::new(SpawnGraph::new());

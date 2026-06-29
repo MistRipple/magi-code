@@ -13,7 +13,7 @@
   import { activateRightPaneSession } from './stores/right-pane.svelte';
   import { i18n } from './stores/i18n.svelte';
   import {
-    AGENT_CONNECTION_EVENT,
+    RUNTIME_CONNECTION_EVENT,
     type AgentConnectionEventDetail,
   } from './web/agent-api';
 
@@ -56,9 +56,9 @@
         bootstrapConnectionFailed = true;
       }
     };
-    window.addEventListener(AGENT_CONNECTION_EVENT, handleAgentConnection as EventListener);
+    window.addEventListener(RUNTIME_CONNECTION_EVENT, handleAgentConnection as EventListener);
     return () => {
-      window.removeEventListener(AGENT_CONNECTION_EVENT, handleAgentConnection as EventListener);
+      window.removeEventListener(RUNTIME_CONNECTION_EVENT, handleAgentConnection as EventListener);
     };
   });
 

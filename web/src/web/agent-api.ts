@@ -30,11 +30,25 @@ import {
 } from '../shared/access-profile';
 
 
-const AGENT_BASE_URL_STORAGE_KEY = 'magi-agent-base-url';
+export const RUNTIME_BASE_URL_STORAGE_KEY = 'magi-runtime-base-url';
+const LEGACY_AGENT_BASE_URL_STORAGE_KEY = 'magi-agent-base-url';
 const AGENT_PROBE_TIMEOUT_MS = 1500;
 let cachedWorkspaceSummaries: AgentWorkspaceSummary[] = [];
 
-export const AGENT_CONNECTION_EVENT = 'magi-agent-connection';
+export const RUNTIME_CONNECTION_EVENT = 'magi-runtime-connection';
+
+function clearLegacyAgentRuntimeStorage(): void {
+  if (typeof window === 'undefined') {
+    return;
+  }
+  try {
+    window.localStorage.removeItem(LEGACY_AGENT_BASE_URL_STORAGE_KEY);
+  } catch (error) {
+    console.warn(`[agent-api] 清理旧运行态 localStorage 失败(${LEGACY_AGENT_BASE_URL_STORAGE_KEY})`, error);
+  }
+}
+
+clearLegacyAgentRuntimeStorage();
 
 export interface AgentConnectionEventDetail {
   status: 'connected' | 'recovering';
@@ -440,11 +454,11 @@ function persistAgentBaseUrl(baseUrl: string): void {
   if (typeof window === 'undefined' || !baseUrl.trim()) {
     return;
   }
-  safeWriteLocalStorage(AGENT_BASE_URL_STORAGE_KEY, baseUrl.trim());
+  safeWriteLocalStorage(RUNTIME_BASE_URL_STORAGE_KEY, baseUrl.trim());
 }
 
 function getStoredAgentBaseUrl(): string {
-  return safeReadLocalStorage(AGENT_BASE_URL_STORAGE_KEY);
+  return safeReadLocalStorage(RUNTIME_BASE_URL_STORAGE_KEY);
 }
 
 function deriveWorkspaceName(rootPath: string, workspaceId: string): string {
@@ -574,7 +588,7 @@ export function dispatchAgentConnectionEvent(detail: AgentConnectionEventDetail)
   if (typeof window === 'undefined') {
     return;
   }
-  window.dispatchEvent(new CustomEvent<AgentConnectionEventDetail>(AGENT_CONNECTION_EVENT, { detail }));
+  window.dispatchEvent(new CustomEvent<AgentConnectionEventDetail>(RUNTIME_CONNECTION_EVENT, { detail }));
 }
 
 async function parseAgentJson<T>(response: Response, action: string): Promise<T> {

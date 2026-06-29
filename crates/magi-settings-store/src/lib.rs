@@ -15,6 +15,8 @@ const PUBLIC_RESPONSE_ALIAS_SECTIONS: &[&str] = &[
     "registryEngines",
     "registryAgents",
 ];
+pub const DEPRECATED_MODEL_CONFIG_FIELDS: &[&str] =
+    &["provider", "openaiProtocol", "protocolEndpoint"];
 
 #[derive(Debug)]
 pub struct SettingsStore {
@@ -322,7 +324,7 @@ fn remove_deprecated_model_fields(value: &mut Value) -> bool {
         return false;
     };
     let mut changed = false;
-    for field in crate::model_config::DEPRECATED_MODEL_CONFIG_FIELDS {
+    for field in DEPRECATED_MODEL_CONFIG_FIELDS {
         changed |= object.remove(*field).is_some();
     }
     changed

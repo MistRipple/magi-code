@@ -126,13 +126,10 @@ fn task_serialization_roundtrip() {
             background_allowed: false,
             escalation_conditions: vec!["high_risk".to_string()],
         }),
-        executor_binding: Some(serde_json::json!({
-            "target_role": "developer",
-            "capability_requirements": ["rust"],
-            "parallelism_group": "group-a",
-            "exclusive_scope": null,
-            "worker_selector": null,
-        })),
+        executor_binding: Some(
+            crate::TaskExecutorBinding::for_role("developer")
+                .with_parallelism_group(Some("group-a".to_string())),
+        ),
         knowledge_refs: Vec::new(),
         workspace_scope: Some("/workspace".to_string()),
         write_scope: Some("/workspace/src".to_string()),

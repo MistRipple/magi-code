@@ -391,10 +391,11 @@ async fn restart_task(
 mod tests {
     use super::*;
     use magi_core::{
-        AccessProfile, MissionId, Task, TaskKind, TaskPolicy, TaskRuntimePayload, TaskStatus,
+        AccessProfile, MissionId, Task, TaskExecutorBinding, TaskKind, TaskPolicy,
+        TaskRuntimePayload, TaskStatus,
     };
 
-    fn terminal_root_task_with_binding(binding: serde_json::Value) -> Task {
+    fn terminal_root_task_with_binding(binding: TaskExecutorBinding) -> Task {
         Task {
             task_id: TaskId::new("task-root-restart-skill"),
             mission_id: MissionId::new("mission-restart-skill"),
@@ -438,11 +439,10 @@ mod tests {
 
     #[test]
     fn restart_uses_active_skill_id_not_legacy_skill_name_binding() {
-        let task = terminal_root_task_with_binding(serde_json::json!({
-            "target_role": "reviewer",
-            "active_skill_id": "code-review",
-            "skill_name": "legacy-skill"
-        }));
+        let task = terminal_root_task_with_binding(
+            TaskExecutorBinding::for_role("reviewer")
+                .with_active_skill_id(Some("code-review".to_string())),
+        );
 
         assert_eq!(
             restart_active_skill_id(&task).as_deref(),

@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 magi-core = { path = "../magi-core" }
 magi-event-bus = { path = "../magi-event-bus" }
+magi-mission-artifact = { path = "../magi-mission-artifact" }
 # Plan completion gate（不变式 7）：把 step 标记为 completed 必须满足
 # ValidationReport.step_is_passing。Plan→Validation 单向依赖，不引入循环。
 magi-validation-runner = { path = "../magi-validation-runner" }

@@ -11,7 +11,7 @@ use magi_agent_role::AgentRoleRegistry;
 use magi_bridge_client::ModelBridgeClient;
 use magi_core::{
     AccessProfile, DomainError, ExecutionOwnership, MissionId, SessionId, TaskExecutionTarget,
-    TaskId, TaskKind, TaskStatus, TaskTier, UtcMillis, WorkerId, WorkspaceId,
+    TaskExecutorBinding, TaskId, TaskKind, TaskStatus, TaskTier, UtcMillis, WorkerId, WorkspaceId,
 };
 use magi_event_bus::{EventContext, InMemoryEventBus, task_events};
 use magi_orchestrator::{
@@ -26,8 +26,8 @@ use magi_spawn_graph::SpawnGraph;
 use crate::session_thread;
 
 use crate::session_images::SessionTurnImage;
-use crate::settings_store::SettingsStore;
 use crate::task_execution_registry::{TaskExecutionPlan, TaskExecutionRegistry};
+use magi_settings_store::SettingsStore;
 
 pub struct DispatchSubmissionGraph {
     pub root_task_id: TaskId,
@@ -218,24 +218,8 @@ fn make_dispatch_task(
     task_tier: TaskTier,
     access_profile: AccessProfile,
 ) -> magi_core::Task {
-    let active_skill_id = active_skill_id
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    let mut executor_binding = serde_json::json!({
-        "target_role": target_role,
-        "capability_requirements": [],
-        "parallelism_group": null,
-        "exclusive_scope": null,
-        "worker_selector": null,
-    });
-    if let (Some(active_skill_id), Some(binding)) =
-        (active_skill_id, executor_binding.as_object_mut())
-    {
-        binding.insert(
-            "active_skill_id".to_string(),
-            serde_json::Value::String(active_skill_id.to_string()),
-        );
-    }
+    let executor_binding = TaskExecutorBinding::for_role(target_role)
+        .with_active_skill_id(active_skill_id.map(str::to_string));
 
     magi_core::Task {
         task_id: task_id.clone(),
@@ -790,9 +774,9 @@ mod tests {
             action_task
                 .executor_binding
                 .as_ref()
-                .and_then(|binding| binding.get("skill_name")),
-            None,
-            "Task executor_binding 不再写入旧 skill_name 字段"
+                .and_then(|binding| binding.active_skill_id.as_deref()),
+            Some("code-review"),
+            "Task executor_binding 已类型化，不能再写入旧 skill_name 字段"
         );
     }
 

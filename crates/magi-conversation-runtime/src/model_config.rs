@@ -13,11 +13,9 @@
 //! 字段和推断结果形成双事实源。
 
 use magi_bridge_client::{HttpModelBridgeClient, HttpModelBridgeProtocol};
+use magi_settings_store::DEPRECATED_MODEL_CONFIG_FIELDS;
 use magi_usage_authority::{LlmConfig, ReasoningEffort, UrlMode};
 use serde_json::Value;
-
-pub const DEPRECATED_MODEL_CONFIG_FIELDS: &[&str] =
-    &["provider", "openaiProtocol", "protocolEndpoint"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ModelUrlMode {
@@ -254,7 +252,7 @@ pub fn reject_deprecated_model_config_fields(value: &Value) -> Result<(), String
 }
 
 pub fn configured_role_engine_model_config(
-    settings_store: &crate::settings_store::SettingsStore,
+    settings_store: &magi_settings_store::SettingsStore,
     role_id: &str,
 ) -> Result<Option<RoleEngineModelConfig>, String> {
     let role_id = role_id.trim();
@@ -301,7 +299,7 @@ struct RoleEngineBinding {
 }
 
 fn role_engine_binding(
-    settings_store: &crate::settings_store::SettingsStore,
+    settings_store: &magi_settings_store::SettingsStore,
     role_id: &str,
 ) -> Option<RoleEngineBinding> {
     let agents = settings_store.get_section("agents");
@@ -332,7 +330,7 @@ fn role_engine_binding(
 }
 
 fn engine_llm_config(
-    settings_store: &crate::settings_store::SettingsStore,
+    settings_store: &magi_settings_store::SettingsStore,
     engine_id: &str,
 ) -> Option<Value> {
     let engine_id = engine_id.trim();
@@ -641,7 +639,7 @@ mod tests {
 
     #[test]
     fn role_engine_model_config_resolves_agent_binding() {
-        let store = crate::settings_store::SettingsStore::new();
+        let store = magi_settings_store::SettingsStore::new();
         store.set_section(
             "agents",
             json!([{
@@ -681,7 +679,7 @@ mod tests {
 
     #[test]
     fn role_engine_model_config_returns_none_for_orchestrator_inheritance() {
-        let store = crate::settings_store::SettingsStore::new();
+        let store = magi_settings_store::SettingsStore::new();
         store.set_section(
             "agents",
             json!([{

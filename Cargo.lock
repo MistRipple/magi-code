@@ -946,14 +946,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 
 [[package]]
-name = "magi-agent"
-version = "3.0.0"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "magi-agent-role"
 version = "3.0.0"
 dependencies = [
@@ -984,6 +976,7 @@ dependencies = [
  "magi-orchestrator",
  "magi-safety-gate",
  "magi-session-store",
+ "magi-settings-store",
  "magi-skill-runtime",
  "magi-snapshot",
  "magi-spawn-graph",
@@ -1022,6 +1015,7 @@ version = "3.0.0"
 dependencies = [
  "magi-core",
  "magi-event-bus",
+ "magi-mission-artifact",
  "serde",
  "serde_json",
  "tempfile",
@@ -1066,6 +1060,7 @@ dependencies = [
  "magi-project-memory",
  "magi-safety-gate",
  "magi-session-store",
+ "magi-settings-store",
  "magi-skill-runtime",
  "magi-snapshot",
  "magi-spawn-graph",
@@ -1114,6 +1109,7 @@ dependencies = [
  "magi-orchestrator",
  "magi-plan",
  "magi-session-store",
+ "magi-settings-store",
  "magi-skill-runtime",
  "magi-snapshot",
  "magi-spawn-graph",
@@ -1136,8 +1132,8 @@ name = "magi-daemon-app"
 version = "3.0.0"
 dependencies = [
  "dirs",
- "magi-agent",
  "magi-daemon",
+ "magi-runtime-state",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -1168,6 +1164,7 @@ version = "3.0.0"
 dependencies = [
  "magi-core",
  "magi-event-bus",
+ "magi-mission-artifact",
  "serde",
  "serde_json",
  "tempfile",
@@ -1180,6 +1177,7 @@ version = "3.0.0"
 dependencies = [
  "magi-core",
  "magi-event-bus",
+ "magi-mission-artifact",
  "serde",
  "serde_json",
  "tempfile",
@@ -1244,12 +1242,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "magi-mission-artifact"
+version = "3.0.0"
+dependencies = [
+ "magi-core",
+]
+
+[[package]]
 name = "magi-mission-charter"
 version = "3.0.0"
 dependencies = [
  "magi-core",
  "magi-event-bus",
  "magi-human-checkpoint",
+ "magi-mission-artifact",
  "serde",
  "serde_json",
  "tempfile",
@@ -1312,6 +1318,7 @@ version = "3.0.0"
 dependencies = [
  "magi-core",
  "magi-event-bus",
+ "magi-mission-artifact",
  "magi-validation-runner",
  "serde",
  "serde_json",
@@ -1333,6 +1340,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "magi-runtime-state"
+version = "3.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "magi-safety-gate"
 version = "3.0.0"
 dependencies = [
@@ -1348,6 +1363,15 @@ dependencies = [
  "magi-tool-runtime",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "magi-settings-store"
+version = "3.0.0"
+dependencies = [
+ "magi-core",
+ "serde_json",
+ "tracing",
 ]
 
 [[package]]
@@ -1433,6 +1457,7 @@ version = "3.0.0"
 dependencies = [
  "magi-core",
  "magi-event-bus",
+ "magi-mission-artifact",
  "serde",
  "serde_json",
  "tempfile",

@@ -1,0 +1,7 @@
+[package]
+name = "magi-mission-artifact"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+magi-core = { path = "../magi-core" }

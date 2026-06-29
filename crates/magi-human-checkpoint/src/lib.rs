@@ -19,12 +19,12 @@
 //! 单 mission 单文档，frontmatter 描述元信息，body 用 JSON-lines 记录每条请求。
 
 use magi_core::{MissionId, UtcMillis, WorkspaceRootPath};
+use magi_mission_artifact::{MissionArtifactIo, MissionArtifactRegistry, MissionArtifactStore};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
-    fs, io,
+    io,
     path::{Path, PathBuf},
-    sync::{Arc, RwLock},
+    sync::Arc,
 };
 use thiserror::Error;
 // --- Status / Decision
@@ -154,10 +154,19 @@ pub enum HumanCheckpointError {
         source: io::Error,
     },
 }
+impl From<MissionArtifactIo> for HumanCheckpointError {
+    fn from(error: MissionArtifactIo) -> Self {
+        Self::Io {
+            path: error.path,
+            source: error.source,
+        }
+    }
+}
+
 // --- Store
 
 pub struct HumanCheckpointStore {
-    root: PathBuf,
+    artifact: MissionArtifactStore,
 }
 
 impl HumanCheckpointStore {
@@ -165,44 +174,30 @@ impl HumanCheckpointStore {
         magi_home: &Path,
         workspace_root: &WorkspaceRootPath,
     ) -> Result<Self, HumanCheckpointError> {
-        let root = magi_core::paths::missions_root(magi_home, workspace_root);
-        fs::create_dir_all(&root).map_err(|source| HumanCheckpointError::Io {
-            path: root.clone(),
-            source,
-        })?;
-        Ok(Self { root })
-    }
-
-    fn log_path(&self, mission_id: &MissionId) -> PathBuf {
-        self.root
-            .join(mission_id.as_str())
-            .join("human_checkpoints.md")
+        Ok(Self {
+            artifact: MissionArtifactStore::open_with_home(
+                magi_home,
+                workspace_root,
+                "human_checkpoints.md",
+            )?,
+        })
     }
 
     pub fn load(
         &self,
         mission_id: &MissionId,
     ) -> Result<Option<HumanCheckpointLog>, HumanCheckpointError> {
-        let path = self.log_path(mission_id);
-        let raw = match fs::read_to_string(&path) {
-            Ok(s) => s,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(source) => return Err(HumanCheckpointError::Io { path, source }),
+        let Some(raw) = self.artifact.load_text(mission_id)? else {
+            return Ok(None);
         };
         parse_log(&raw).map(Some)
     }
 
     pub fn save(&self, log: &HumanCheckpointLog) -> Result<(), HumanCheckpointError> {
-        let path = self.log_path(&log.mission_id);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|source| HumanCheckpointError::Io {
-                path: parent.to_path_buf(),
-                source,
-            })?;
-        }
         let rendered = render_log(log);
-        magi_core::fs_atomic::write_atomic(&path, rendered)
-            .map_err(|source| HumanCheckpointError::Io { path, source })
+        self.artifact
+            .save_text(&log.mission_id, rendered)
+            .map_err(Into::into)
     }
 
     /// 是否有任何 pending 条目。若有，调用方必须阻止新的 agent_spawn / dispatch。
@@ -365,17 +360,13 @@ impl HumanCheckpointStore {
 // --- Registry
 
 pub struct HumanCheckpointRegistry {
-    inner: RwLock<HashMap<String, Arc<HumanCheckpointStore>>>,
-    magi_home: PathBuf,
+    inner: MissionArtifactRegistry<HumanCheckpointStore>,
 }
 
 impl HumanCheckpointRegistry {
     pub fn with_magi_home(magi_home: impl Into<PathBuf>) -> Self {
-        let magi_home = magi_home.into();
-        let _ = fs::create_dir_all(&magi_home);
         Self {
-            inner: RwLock::new(HashMap::new()),
-            magi_home,
+            inner: MissionArtifactRegistry::with_magi_home(magi_home),
         }
     }
 
@@ -383,24 +374,11 @@ impl HumanCheckpointRegistry {
         &self,
         workspace_root: &WorkspaceRootPath,
     ) -> Result<Arc<HumanCheckpointStore>, HumanCheckpointError> {
-        let key = workspace_root.as_str().to_string();
-        if let Some(store) = self
-            .inner
-            .read()
-            .expect("human_checkpoint registry poisoned")
-            .get(&key)
-        {
-            return Ok(store.clone());
-        }
-        let store = HumanCheckpointStore::open_with_home(&self.magi_home, workspace_root)?;
-        let arc = Arc::new(store);
         self.inner
-            .write()
-            .expect("human_checkpoint registry poisoned")
-            .insert(key, arc.clone());
-        Ok(arc)
+            .get_or_open(workspace_root, HumanCheckpointStore::open_with_home)
     }
 }
+
 // --- Tool argument parsing
 
 #[derive(Debug)]

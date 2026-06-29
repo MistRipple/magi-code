@@ -1238,7 +1238,7 @@ async fn download_github_skill(
     target_dir: &std::path::Path,
 ) -> Result<(), ApiError> {
     let client = reqwest::Client::builder()
-        .user_agent("magi-agent")
+        .user_agent("magi-runtime")
         .build()
         .map_err(|e| skill_download_error(skill_id, "构建 Skill 下载客户端失败", e))?;
 

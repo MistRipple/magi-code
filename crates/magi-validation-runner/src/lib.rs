@@ -18,12 +18,13 @@
 //! 这样既可 grep / diff，又能 round-trip 无损——与同 Tier 的 KnowledgeGraph 同构。
 
 use magi_core::{MissionId, UtcMillis, WorkspaceRootPath};
+use magi_mission_artifact::{MissionArtifactIo, MissionArtifactRegistry, MissionArtifactStore};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
-    fs, io,
+    io,
     path::{Path, PathBuf},
-    sync::{Arc, RwLock},
+    sync::Arc,
 };
 use thiserror::Error;
 // --- ValidationKind / ValidationOutcome
@@ -159,10 +160,19 @@ pub enum ValidationError {
         source: io::Error,
     },
 }
+impl From<MissionArtifactIo> for ValidationError {
+    fn from(error: MissionArtifactIo) -> Self {
+        Self::Io {
+            path: error.path,
+            source: error.source,
+        }
+    }
+}
+
 // --- Store
 
 pub struct ValidationStore {
-    root: PathBuf,
+    artifact: MissionArtifactStore,
 }
 
 impl ValidationStore {
@@ -170,42 +180,30 @@ impl ValidationStore {
         magi_home: &Path,
         workspace_root: &WorkspaceRootPath,
     ) -> Result<Self, ValidationError> {
-        let root = magi_core::paths::missions_root(magi_home, workspace_root);
-        fs::create_dir_all(&root).map_err(|source| ValidationError::Io {
-            path: root.clone(),
-            source,
-        })?;
-        Ok(Self { root })
-    }
-
-    fn report_path(&self, mission_id: &MissionId) -> PathBuf {
-        self.root.join(mission_id.as_str()).join("validation.md")
+        Ok(Self {
+            artifact: MissionArtifactStore::open_with_home(
+                magi_home,
+                workspace_root,
+                "validation.md",
+            )?,
+        })
     }
 
     pub fn load(
         &self,
         mission_id: &MissionId,
     ) -> Result<Option<ValidationReport>, ValidationError> {
-        let path = self.report_path(mission_id);
-        let raw = match fs::read_to_string(&path) {
-            Ok(s) => s,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(source) => return Err(ValidationError::Io { path, source }),
+        let Some(raw) = self.artifact.load_text(mission_id)? else {
+            return Ok(None);
         };
         parse_report(&raw).map(Some)
     }
 
     pub fn save(&self, report: &ValidationReport) -> Result<(), ValidationError> {
-        let path = self.report_path(&report.mission_id);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|source| ValidationError::Io {
-                path: parent.to_path_buf(),
-                source,
-            })?;
-        }
         let rendered = render_report(report);
-        magi_core::fs_atomic::write_atomic(&path, rendered)
-            .map_err(|source| ValidationError::Io { path, source })
+        self.artifact
+            .save_text(&report.mission_id, rendered)
+            .map_err(Into::into)
     }
 
     /// 为 system prompt 渲染 Validation 段落。空报告返回 None，避免噪音注入。
@@ -267,17 +265,13 @@ impl ValidationStore {
 
 /// 进程级缓存，按 workspace_root 聚合 ValidationStore。
 pub struct ValidationRunnerRegistry {
-    inner: RwLock<HashMap<String, Arc<ValidationStore>>>,
-    magi_home: PathBuf,
+    inner: MissionArtifactRegistry<ValidationStore>,
 }
 
 impl ValidationRunnerRegistry {
     pub fn with_magi_home(magi_home: impl Into<PathBuf>) -> Self {
-        let magi_home = magi_home.into();
-        let _ = fs::create_dir_all(&magi_home);
         Self {
-            inner: RwLock::new(HashMap::new()),
-            magi_home,
+            inner: MissionArtifactRegistry::with_magi_home(magi_home),
         }
     }
 
@@ -285,24 +279,11 @@ impl ValidationRunnerRegistry {
         &self,
         workspace_root: &WorkspaceRootPath,
     ) -> Result<Arc<ValidationStore>, ValidationError> {
-        let key = workspace_root.as_str().to_string();
-        if let Some(store) = self
-            .inner
-            .read()
-            .expect("validation registry poisoned")
-            .get(&key)
-        {
-            return Ok(store.clone());
-        }
-        let store = ValidationStore::open_with_home(&self.magi_home, workspace_root)?;
-        let arc = Arc::new(store);
         self.inner
-            .write()
-            .expect("validation registry poisoned")
-            .insert(key, arc.clone());
-        Ok(arc)
+            .get_or_open(workspace_root, ValidationStore::open_with_home)
     }
 }
+
 // --- Tool argument parsing
 
 #[derive(Debug)]

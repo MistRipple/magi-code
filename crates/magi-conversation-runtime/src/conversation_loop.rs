@@ -29,7 +29,6 @@ use crate::{
         workspace_context_system_prompt,
     },
     session_images::{SessionTurnImage, session_turn_image_sources},
-    settings_store::SettingsStore,
     usage_recording::{ModelUsageBinding, publish_model_usage_record, record_mission_turn},
 };
 use magi_bridge_client::{
@@ -49,6 +48,7 @@ use magi_session_store::{
     SessionStore, ThreadChatImageSource, ThreadChatMessage, ThreadChatToolCall,
     ThreadChatToolFunction,
 };
+use magi_settings_store::SettingsStore;
 use magi_tool_runtime::ToolRegistry;
 use magi_usage_authority::{
     AUTO_COMPACT_PERCENT, DEFAULT_CONTEXT_WINDOW, UsageCallStatus, resolve_context_window,
@@ -3365,9 +3365,7 @@ mod tests {
             background_allowed: true,
             escalation_conditions: Vec::new(),
         });
-        task.executor_binding = Some(serde_json::json!({
-            "target_role": "coordinator",
-        }));
+        task.executor_binding = Some(magi_core::TaskExecutorBinding::for_role("coordinator"));
 
         assert!(
             task_required_tool_chain(&task, Some(&registry)).is_empty(),
@@ -4235,9 +4233,7 @@ mod tests {
             background_allowed: true,
             escalation_conditions: Vec::new(),
         });
-        task.executor_binding = Some(serde_json::json!({
-            "target_role": "coordinator",
-        }));
+        task.executor_binding = Some(magi_core::TaskExecutorBinding::for_role("coordinator"));
         task_store.insert_task(task.clone());
         let spawn_call = ChatToolCall {
             id: "call-long-mission-spawn-before-plan".to_string(),

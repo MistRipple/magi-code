@@ -5,6 +5,7 @@ import {
   getAgentSettingsBootstrap,
   probeReachableAgentBaseUrl,
   resolveAgentBaseUrl,
+  RUNTIME_BASE_URL_STORAGE_KEY,
   isPublicTunnelAccess,
 } from '../../web/agent-api';
 import {
@@ -870,11 +871,11 @@ function ensureWindowListener(): void {
     emitMessage(message);
   });
   window.addEventListener('storage', (event) => {
-    if (event.key !== 'magi-agent-base-url') {
+    if (event.key !== RUNTIME_BASE_URL_STORAGE_KEY) {
       return;
     }
     closeEventStream();
-    scheduleRecovery('agent_base_url_changed', undefined, true);
+    scheduleRecovery('runtime_base_url_changed', undefined, true);
   });
   window.addEventListener('pagehide', () => {
     flushPersistedWebviewState();

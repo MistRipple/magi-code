@@ -22,7 +22,6 @@ use crate::{
         publish_session_turn_item_stream_event, session_turn_item, session_turn_stream_update,
         upsert_session_turn_item,
     },
-    settings_store::SettingsStore,
     usage_recording::{
         ModelUsageBinding, publish_model_usage_record, session_turn_model_usage_binding,
     },
@@ -34,6 +33,7 @@ use magi_bridge_client::{
 use magi_core::{AccessProfile, SessionId, UtcMillis, WorkspaceId};
 use magi_event_bus::InMemoryEventBus;
 use magi_session_store::{CanonicalTurnItemKind, SessionStore};
+use magi_settings_store::SettingsStore;
 use magi_snapshot::SnapshotManager;
 use magi_tool_runtime::ToolRegistry;
 use magi_usage_authority::UsageCallStatus;
