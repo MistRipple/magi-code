@@ -26,10 +26,7 @@ use crate::{
     task_runner_bridge::{EventBasedResultReceiver, TaskDispatcher, TaskOutcome, TaskResult},
     usage_recording::{ModelUsageBinding, model_usage_binding_for_worker_with_settings},
 };
-use magi_bridge_client::{
-    BridgeClientError, BridgeErrorLayer, BridgeResponse, ChatToolDefinition, ModelBridgeClient,
-    ModelInvocationRequest, ModelStreamingDelta,
-};
+use magi_bridge_client::{ChatToolDefinition, ModelBridgeClient, ModelInvocationRequest};
 use magi_context_runtime::{
     ContextBudget, ContextRuntime, ExecutionContextAssemblyRequest, ExecutionContextClues,
     RecentTurnSource,
@@ -50,99 +47,13 @@ use magi_orchestrator::{
 use magi_session_store::{SessionStore, TimelineEntryKind, timeline_entry_visible_text};
 use magi_tool_runtime::{BuiltinToolName, ToolRegistry};
 use magi_workspace::WorkspaceStore;
-use std::{
-    path::PathBuf,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-};
+use std::{path::PathBuf, sync::Arc};
 
 #[derive(Clone)]
 pub struct ExecutionPipeline {
     pub orchestrator: OrchestratorService,
     pub execution_runtime: OrchestratedExecutionRuntime,
     pub memory_store: MemoryStore,
-}
-
-struct FailoverModelBridgeClient {
-    primary: Arc<dyn ModelBridgeClient>,
-    fallback: Arc<dyn ModelBridgeClient>,
-    role_id: String,
-    engine_id: String,
-}
-
-impl FailoverModelBridgeClient {
-    fn new(
-        primary: Arc<dyn ModelBridgeClient>,
-        fallback: Arc<dyn ModelBridgeClient>,
-        role_id: impl Into<String>,
-        engine_id: impl Into<String>,
-    ) -> Self {
-        Self {
-            primary,
-            fallback,
-            role_id: role_id.into(),
-            engine_id: engine_id.into(),
-        }
-    }
-
-    fn should_failover(error: &BridgeClientError) -> bool {
-        matches!(
-            error.layer(),
-            Some(BridgeErrorLayer::Transport | BridgeErrorLayer::Protocol)
-        )
-    }
-}
-
-impl ModelBridgeClient for FailoverModelBridgeClient {
-    fn invoke(&self, request: ModelInvocationRequest) -> Result<BridgeResponse, BridgeClientError> {
-        match self.primary.invoke(request.clone()) {
-            Ok(response) => Ok(response),
-            Err(error) if Self::should_failover(&error) => {
-                tracing::warn!(
-                    role_id = %self.role_id,
-                    engine_id = %self.engine_id,
-                    error = %error,
-                    "角色专属模型不可用，使用编排模型继续执行代理任务"
-                );
-                self.fallback.invoke(request)
-            }
-            Err(error) => Err(error),
-        }
-    }
-
-    fn invoke_streaming(
-        &self,
-        request: ModelInvocationRequest,
-        on_delta: &dyn Fn(&ModelStreamingDelta),
-    ) -> Result<BridgeResponse, BridgeClientError> {
-        let emitted_delta = AtomicBool::new(false);
-        let guarded_delta = |delta: &ModelStreamingDelta| {
-            if !delta.content.is_empty() || !delta.thinking.is_empty() {
-                emitted_delta.store(true, Ordering::SeqCst);
-            }
-            on_delta(delta);
-        };
-        match self
-            .primary
-            .invoke_streaming(request.clone(), &guarded_delta)
-        {
-            Ok(response) => Ok(response),
-            Err(error)
-                if Self::should_failover(&error) && !emitted_delta.load(Ordering::SeqCst) =>
-            {
-                tracing::warn!(
-                    role_id = %self.role_id,
-                    engine_id = %self.engine_id,
-                    error = %error,
-                    "角色专属流式模型不可用，使用编排模型继续执行代理任务"
-                );
-                self.fallback.invoke_streaming(request, on_delta)
-            }
-            Err(error) => Err(error),
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -231,23 +142,19 @@ pub struct LlmTaskDispatcher {
 ///   Prompt 增强等"低价值/低延迟敏感"任务。未配置时返回 `None`，调用方静默跳过。
 /// - [`RoleTarget::Agent`]：代理角色，按 `agents[*]` 段查 `engineId` 绑定，
 ///   再从 `engines[*]` 段取 llm 配置。未绑定 engine（继承 orchestrator 模式）时
-///   返回 `None`，调用方应回退到 orchestrator。
-///   `wrap_with_orchestrator_failover = true` 时，primary 调用失败将自动降级到
-///   orchestrator client（保证代理任务在 agent 模型故障时仍可继续）。
+///   返回 `None`，调用方应明确继承 orchestrator；已绑定 engine 时只使用该 engine，
+///   调用失败必须暴露为该角色模型失败，不能隐藏切换到其它模型。
 #[derive(Clone, Copy, Debug)]
 pub enum RoleTarget<'a> {
     Orchestrator,
     Auxiliary,
-    Agent {
-        role_id: &'a str,
-        wrap_with_orchestrator_failover: bool,
-    },
+    Agent { role_id: &'a str },
 }
 
 /// 角色模型客户端解析的**单一入口**。
 ///
 /// 三段配置（orchestrator / auxiliary / agents+engines）的读取、归一化、HTTP client
-/// 构造、必要时的 Failover 包装全部收敛到此函数；调用方按 [`RoleTarget`] 表达意图，
+/// 构造全部收敛到此函数；调用方按 [`RoleTarget`] 表达意图，
 /// 不再各自重复"读 settings → normalize → build client"的样板。
 ///
 /// 返回 `Result<Option<Arc<dyn ModelBridgeClient>>, String>`：
@@ -275,10 +182,7 @@ pub fn resolve_target_for_role(
             };
             build_client_from_section(store, "auxiliary")
         }
-        RoleTarget::Agent {
-            role_id,
-            wrap_with_orchestrator_failover,
-        } => {
+        RoleTarget::Agent { role_id } => {
             let Some(store) = settings_store else {
                 return Ok(None);
             };
@@ -292,26 +196,7 @@ pub fn resolve_target_for_role(
                 )
             })?;
             let primary = Arc::new(primary) as Arc<dyn ModelBridgeClient>;
-            if !wrap_with_orchestrator_failover {
-                return Ok(Some(primary));
-            }
-            // wrap_with_orchestrator_failover：递归取 orchestrator client 作 fallback。
-            // 这里复用 RoleTarget::Orchestrator 分支，保证 fallback 解析口径与主路径完全一致。
-            let fallback = resolve_target_for_role(
-                settings_store,
-                default_client,
-                RoleTarget::Orchestrator,
-                session_id,
-            )?;
-            let Some(fallback) = fallback else {
-                return Ok(Some(primary));
-            };
-            Ok(Some(Arc::new(FailoverModelBridgeClient::new(
-                primary,
-                fallback,
-                role_model.template_id,
-                role_model.engine_id,
-            )) as Arc<dyn ModelBridgeClient>))
+            Ok(Some(primary))
         }
     }
 }
@@ -1461,19 +1346,14 @@ impl LlmTaskDispatcher {
             .or_else(|| task.and_then(|task| task_role_id(Some(task))));
 
         // 有 role_id 时走 RoleTarget::Agent，让 resolve_target_for_role 统一处理:
-        //   - 角色未配置 engineId → Ok(None) → 降级到 orchestrator
-        //   - 角色已配置且本任务有父任务 → 自动用 FailoverModelBridgeClient 包 orchestrator
+        //   - 角色未配置 engineId → Ok(None) → 显式继承 orchestrator
+        //   - 角色已配置 engineId → 只使用该角色模型，失败直接暴露
         // 无 role_id（顶层会话调用）或角色未配置 → 直接走 orchestrator。
         if let Some(role_id) = role_id {
-            let wrap_with_orchestrator_failover =
-                task.and_then(|task| task.parent_task_id.as_ref()).is_some();
             if let Some(client) = resolve_target_for_role(
                 settings_store,
                 self.model_bridge_client.clone(),
-                RoleTarget::Agent {
-                    role_id,
-                    wrap_with_orchestrator_failover,
-                },
+                RoleTarget::Agent { role_id },
                 session_id,
             )? {
                 return Ok(client);
