@@ -2586,20 +2586,31 @@ function createSettingsStore(props: { onClose?: () => void }) {
     const skillList: SkillItem[] = [];
     if (Array.isArray(config?.customTools)) {
       for (const tool of config.customTools) {
+        const name = typeof tool?.name === "string" && tool.name.trim()
+          ? tool.name.trim()
+          : "";
+        if (!name) continue;
         skillList.push({
-          name: tool.name,
-          skillId: tool.name,
-          description: tool.description || "",
+          name,
+          skillId: name,
+          description: typeof tool.description === "string" ? tool.description : "",
           source: "custom",
         });
       }
     }
     if (Array.isArray(config?.instructionSkills)) {
       for (const skill of config.instructionSkills) {
+        const skillId = typeof skill?.skillId === "string" && skill.skillId.trim()
+          ? skill.skillId.trim()
+          : "";
+        if (!skillId) continue;
+        const name = typeof skill.name === "string" && skill.name.trim()
+          ? skill.name.trim()
+          : skillId;
         skillList.push({
-          skillId: skill.skillId,
-          name: skill.name || skill.skillId,
-          description: skill.description || "",
+          skillId,
+          name,
+          description: typeof skill.description === "string" ? skill.description : "",
           source: "instruction",
         });
       }

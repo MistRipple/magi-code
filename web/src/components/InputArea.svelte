@@ -48,6 +48,7 @@
   // 输入框可识别的 instruction skill。来源：bootstrap 中的 skillsConfig.instructionSkills，
   // 这一组才是 `/` 唤起的指令型技能，与 customTools（已注册到工具表）的语义不同。
   interface SkillOption {
+    skillId: string;
     name: string;
     description: string;
   }
@@ -228,16 +229,15 @@
     for (const entry of raw) {
       if (!entry || typeof entry !== 'object') continue;
       const obj = entry as Record<string, unknown>;
-      const name = (() => {
-        for (const key of ['name', 'skillName', 'skillId', 'fullName']) {
-          const val = obj[key];
-          if (typeof val === 'string' && val.trim()) return val.trim();
-        }
-        return '';
-      })();
-      if (!name) continue;
+      const skillId = typeof obj.skillId === 'string' && obj.skillId.trim()
+        ? obj.skillId.trim()
+        : '';
+      if (!skillId) continue;
+      const name = typeof obj.name === 'string' && obj.name.trim()
+        ? obj.name.trim()
+        : skillId;
       const description = typeof obj.description === 'string' ? obj.description : '';
-      out.push({ name, description });
+      out.push({ skillId, name, description });
     }
     return out;
   });
@@ -288,27 +288,27 @@
     if (!slashMenuOpen) return;
     const active = filteredSkills[slashHighlightIndex];
     if (!active) return;
-    const skillName = active.name;
-    if (skillPreviewCache[skillName] !== undefined) return;
-    if (skillPreviewLoading[skillName]) return;
-    skillPreviewLoading[skillName] = true;
+    const skillId = active.skillId;
+    if (skillPreviewCache[skillId] !== undefined) return;
+    if (skillPreviewLoading[skillId]) return;
+    skillPreviewLoading[skillId] = true;
     const base = resolveAgentBaseUrl();
-    const url = `${base.replace(/\/$/, '')}/api/settings/skills/instruction-preview?skillId=${encodeURIComponent(skillName)}`;
+    const url = `${base.replace(/\/$/, '')}/api/settings/skills/instruction-preview?skillId=${encodeURIComponent(skillId)}`;
     fetch(url)
       .then(async (resp) => {
         if (!resp.ok) {
-          skillPreviewCache[skillName] = '';
+          skillPreviewCache[skillId] = '';
           return;
         }
         const data = await resp.json();
         const preview = typeof data?.preview === 'string' ? data.preview : '';
-        skillPreviewCache[skillName] = preview;
+        skillPreviewCache[skillId] = preview;
       })
       .catch(() => {
-        skillPreviewCache[skillName] = '';
+        skillPreviewCache[skillId] = '';
       })
       .finally(() => {
-        skillPreviewLoading[skillName] = false;
+        skillPreviewLoading[skillId] = false;
       });
   });
 
@@ -823,7 +823,7 @@
         workspaceId: targetWorkspace.workspaceId,
         workspacePath: targetWorkspace.rootPath,
         sessionId: isDraftSession ? '' : (messagesState.currentSessionId || ''),
-        skillName: selectedSkill?.name ?? null,
+        skillName: selectedSkill?.skillId ?? null,
         accessProfile: selectedAccessProfile,
         followUpMode: isSending ? 'queue' : undefined,
         images: selectedImages.map((img) => ({
@@ -1425,7 +1425,7 @@
     try {
       const result = await enhanceAgentPrompt({
         prompt: normalizedDraft,
-        skillName: selectedSkill?.name?.trim() || null,
+        skillName: selectedSkill?.skillId?.trim() || null,
         skillDescription: selectedSkill?.description?.trim() || null,
       });
       const next = unwrapEnhancedPromptPayload(result?.enhancedPrompt ?? '');
@@ -1557,7 +1557,7 @@
     {#if slashMenuOpen}
       <div class="ia-slash-popover" role="listbox" aria-label={i18n.t('input.useSkill')}>
         <div class="ia-slash-list" bind:this={slashListEl}>
-          {#each filteredSkills as skill, index (skill.name)}
+          {#each filteredSkills as skill, index (skill.skillId)}
             <button
               type="button"
               role="option"
@@ -1572,13 +1572,13 @@
           {/each}
         </div>
         {#if filteredSkills[slashHighlightIndex]}
-          {@const activeName = filteredSkills[slashHighlightIndex].name}
-          {@const previewText = skillPreviewCache[activeName]}
+          {@const activeSkillId = filteredSkills[slashHighlightIndex].skillId}
+          {@const previewText = skillPreviewCache[activeSkillId]}
           {#if previewText !== undefined && previewText !== ''}
             <div class="ia-slash-tooltip" style="top: {slashTooltipTop}px">
               {previewText}
             </div>
-          {:else if skillPreviewLoading[activeName]}
+          {:else if skillPreviewLoading[activeSkillId]}
             <div class="ia-slash-tooltip ia-slash-tooltip-loading" style="top: {slashTooltipTop}px">
               …
             </div>
