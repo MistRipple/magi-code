@@ -16,7 +16,6 @@ use crate::routes::settings::{
     resolve_registry_agents,
 };
 use crate::scope_binding::strip_scope_binding_fields;
-use crate::settings_store::SettingsStore;
 use crate::skill_loader;
 use magi_bridge_client::{
     BridgeServerKind, BridgeTransport, JsonRpcBridgeServerProbeClient, ModelBridgeClient,
@@ -25,6 +24,7 @@ use magi_bridge_client::{
 use magi_conversation_runtime::{
     ConversationRegistry,
     session_images::SessionTurnImage,
+    settings_store::SettingsStore,
     task_execution_dispatcher::{ExecutionPipeline, LlmTaskDispatcher},
     task_execution_registry::TaskExecutionRegistry,
     task_runner::TaskRunner,
@@ -1715,14 +1715,9 @@ impl ApiState {
 }
 
 fn normalize_settings_snapshot_sections(snapshot: &mut HashMap<String, serde_json::Value>) {
-    for key in [
-        "orchestrator",
-        "auxiliary",
-        "userRulesConfig",
-        "safeguardConfig",
-    ] {
+    for key in ["orchestrator", "auxiliary", "safeguardConfig"] {
         if let Some(value) = snapshot.get_mut(key) {
-            normalize_wrapped_section_value(value);
+            strip_scope_binding_fields(value);
         }
     }
     skill_loader::normalize_skills_config_sections(snapshot);
@@ -1989,20 +1984,10 @@ fn runtime_settings_from_snapshot(
     })
 }
 
-fn normalize_wrapped_section_value(value: &mut serde_json::Value) {
-    if let Some(object) = value.as_object() {
-        let nested = object.get("config").or_else(|| object.get("data")).cloned();
-        if let Some(nested) = nested {
-            *value = nested;
-        }
-    }
-    strip_scope_binding_fields(value);
-}
-
 fn seed_user_rules_config(snapshot: &mut HashMap<String, serde_json::Value>) {
+    snapshot.remove("userRulesConfig");
     let raw = snapshot
-        .remove("userRulesConfig")
-        .or_else(|| snapshot.remove("userRules"))
+        .remove("userRules")
         .unwrap_or_else(|| serde_json::json!({}));
     snapshot.insert(
         "userRulesConfig".to_string(),
@@ -2011,7 +1996,7 @@ fn seed_user_rules_config(snapshot: &mut HashMap<String, serde_json::Value>) {
 }
 
 fn normalize_user_rules_config_value(mut value: serde_json::Value) -> serde_json::Value {
-    normalize_wrapped_section_value(&mut value);
+    strip_scope_binding_fields(&mut value);
     match value {
         serde_json::Value::String(user_rules) => serde_json::json!({ "userRules": user_rules }),
         serde_json::Value::Object(_) => value,
@@ -2020,7 +2005,7 @@ fn normalize_user_rules_config_value(mut value: serde_json::Value) -> serde_json
 }
 
 pub(crate) fn normalize_safeguard_config_value(mut value: serde_json::Value) -> serde_json::Value {
-    normalize_wrapped_section_value(&mut value);
+    strip_scope_binding_fields(&mut value);
     let mut object = match value {
         serde_json::Value::Object(object) => object,
         _ => serde_json::Map::new(),
@@ -2108,22 +2093,6 @@ fn normalize_workers_section(snapshot: &mut HashMap<String, serde_json::Value>) 
     let Some(object) = workers.as_object_mut() else {
         return;
     };
-    let worker_id = object
-        .get("worker")
-        .and_then(|value| value.as_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned);
-    let worker_config = object.get("config").cloned();
-    if let (Some(worker_id), Some(worker_config)) = (worker_id, worker_config) {
-        *workers = serde_json::json!({ worker_id: worker_config });
-        if let Some(normalized_object) = workers.as_object_mut() {
-            for config in normalized_object.values_mut() {
-                strip_deprecated_model_fields(config);
-            }
-        }
-        return;
-    }
     for config in object.values_mut() {
         strip_deprecated_model_fields(config);
     }

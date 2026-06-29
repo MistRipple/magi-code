@@ -31,22 +31,32 @@ use crate::{
     state::ApiState,
 };
 
-fn unwrap_settings_section_request(request: &serde_json::Value) -> serde_json::Value {
-    request
+fn unwrap_settings_section_request(
+    request: &serde_json::Value,
+) -> Result<serde_json::Value, ApiError> {
+    if request.get("data").is_some() {
+        return Err(ApiError::InvalidInput(
+            "data 设置包装已废弃，请使用 config 或直接提交设置对象".to_string(),
+        ));
+    }
+    Ok(request
         .get("config")
-        .or_else(|| request.get("data"))
         .cloned()
-        .unwrap_or_else(|| request.clone())
+        .unwrap_or_else(|| request.clone()))
 }
 
-fn scoped_settings_section_request(request: &serde_json::Value) -> serde_json::Value {
-    without_scope_binding_fields(unwrap_settings_section_request(request))
+fn scoped_settings_section_request(
+    request: &serde_json::Value,
+) -> Result<serde_json::Value, ApiError> {
+    Ok(without_scope_binding_fields(
+        unwrap_settings_section_request(request)?,
+    ))
 }
 
 fn model_settings_section_request(
     request: &serde_json::Value,
 ) -> Result<serde_json::Value, ApiError> {
-    let config = scoped_settings_section_request(request);
+    let config = scoped_settings_section_request(request)?;
     reject_deprecated_model_config_fields(&config).map_err(ApiError::InvalidInput)?;
     Ok(config)
 }
@@ -72,7 +82,7 @@ fn orchestrator_connection_section_request(
 }
 
 fn orchestrator_session_override_request(request: &serde_json::Value) -> Result<Value, ApiError> {
-    let config = unwrap_settings_section_request(request);
+    let config = unwrap_settings_section_request(request)?;
     reject_deprecated_model_config_fields(&config).map_err(ApiError::InvalidInput)?;
     let Some(config) = config.as_object() else {
         return Err(ApiError::InvalidInput(
@@ -122,10 +132,15 @@ fn parse_optional_query_string(query: &HashMap<String, String>, key: &str) -> Op
 }
 
 fn reject_deprecated_scope_query_fields(query: &HashMap<String, String>) -> Result<(), ApiError> {
-    for key in ["session_id", "workspace_id", "workspace_path"] {
+    for key in [
+        "session_id",
+        "workspace_id",
+        "workspace_path",
+        "access_profile",
+    ] {
         if query.contains_key(key) {
             return Err(ApiError::InvalidInput(format!(
-                "{key} 已废弃，请使用 camelCase scope 字段"
+                "{key} 已废弃，请使用 camelCase 查询字段"
             )));
         }
     }
@@ -146,7 +161,6 @@ fn reject_deprecated_scope_body_fields(request: &Value) -> Result<(), ApiError> 
 fn parse_access_profile_query(query: &HashMap<String, String>) -> AccessProfile {
     query
         .get("accessProfile")
-        .or_else(|| query.get("access_profile"))
         .map(String::as_str)
         .and_then(|value| AccessProfile::from_str(value).ok())
         .unwrap_or_default()
@@ -216,7 +230,7 @@ fn parse_model_ids(payload: &Value) -> Vec<String> {
 }
 
 fn parse_connection_probe_config(request: Value) -> Result<NormalizedModelConfig, ApiError> {
-    let config = unwrap_settings_section_request(&request);
+    let config = unwrap_settings_section_request(&request)?;
     let normalized =
         NormalizedModelConfig::from_settings_value(&config).map_err(ApiError::InvalidInput)?;
     normalized
@@ -993,7 +1007,7 @@ async fn test_orchestrator_connection(
     State(_state): State<ApiState>,
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let config = unwrap_settings_section_request(&request);
+    let config = unwrap_settings_section_request(&request)?;
     let normalized =
         NormalizedModelConfig::from_settings_value(&config).map_err(ApiError::InvalidInput)?;
     normalized
@@ -1032,7 +1046,7 @@ async fn save_user_rules(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     state
         .settings_store
-        .set_section("userRules", scoped_settings_section_request(&request));
+        .set_section("userRules", scoped_settings_section_request(&request)?);
     Ok(Json(serde_json::json!({ "saved": true })))
 }
 
@@ -1041,7 +1055,7 @@ async fn save_safeguard_config(
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let normalized =
-        crate::state::normalize_safeguard_config_value(scoped_settings_section_request(&request));
+        crate::state::normalize_safeguard_config_value(scoped_settings_section_request(&request)?);
     state
         .settings_store
         .set_section("safeguardConfig", normalized);
@@ -2062,6 +2076,16 @@ mod tests {
         .await;
         assert_deprecated_scope_field_error(bootstrap_result, "session_id");
 
+        let access_profile_result = settings_bootstrap(
+            State(test_state()),
+            Query(HashMap::from([(
+                "access_profile".to_string(),
+                "full_access".to_string(),
+            )])),
+        )
+        .await;
+        assert_deprecated_scope_field_error(access_profile_result, "access_profile");
+
         let stats_result = session_stats(
             State(test_state()),
             Query(HashMap::from([(
@@ -2625,7 +2649,8 @@ mod tests {
                 "sessionId": "session-a",
                 "session_id": "session-b"
             }
-        }));
+        }))
+        .expect("config wrapper should be accepted");
 
         assert_eq!(cleaned["provider"], json!("openai"));
         for key in [
@@ -2640,6 +2665,23 @@ mod tests {
                 cleaned.get(key).is_none(),
                 "{key} should not be persisted in settings sections"
             );
+        }
+    }
+
+    #[test]
+    fn scoped_settings_section_request_rejects_deprecated_data_wrapper() {
+        let error = scoped_settings_section_request(&json!({
+            "data": {
+                "baseUrl": "https://api.example.com/v1"
+            }
+        }))
+        .expect_err("data wrapper must not remain a settings input path");
+
+        match error {
+            ApiError::InvalidInput(message) => {
+                assert!(message.contains("data"));
+            }
+            other => panic!("expected invalid input, got {other:?}"),
         }
     }
 

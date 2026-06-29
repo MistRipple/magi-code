@@ -1,8 +1,6 @@
-use crate::{
-    scope_binding::{strip_scope_binding_fields, strip_scope_binding_fields_from_map},
-    settings_store::SettingsStore,
-};
+use crate::scope_binding::{strip_scope_binding_fields, strip_scope_binding_fields_from_map};
 use magi_bridge_client::{BridgeBindingKind, BridgeDispatchAction};
+use magi_conversation_runtime::settings_store::SettingsStore;
 use magi_skill_runtime::{
     CustomToolBinding, SkillDefinition, SkillMetadata, SkillRegistry, SkillRuntime,
 };

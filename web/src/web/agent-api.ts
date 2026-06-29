@@ -116,16 +116,7 @@ function normalizeSettingsSectionConfig(value: unknown): Record<string, unknown>
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     return {};
   }
-  const record = value as Record<string, unknown>;
-  const nestedConfig = record.config;
-  if (nestedConfig && typeof nestedConfig === 'object' && !Array.isArray(nestedConfig)) {
-    return nestedConfig as Record<string, unknown>;
-  }
-  const nestedData = record.data;
-  if (nestedData && typeof nestedData === 'object' && !Array.isArray(nestedData)) {
-    return nestedData as Record<string, unknown>;
-  }
-  return record;
+  return value as Record<string, unknown>;
 }
 
 function normalizeMcpServerConfig(server: Record<string, unknown>): Record<string, unknown> {
@@ -235,9 +226,7 @@ function normalizeSettingsBootstrapPayload(
     && typeof payload.runtimeSettings === 'object'
     && !Array.isArray(payload.runtimeSettings)
       ? payload.runtimeSettings
-      : {
-          locale: typeof payload.locale === 'string' ? payload.locale : 'zh-CN',
-        }
+      : { locale: 'zh-CN' }
   ) as SettingsRuntimeSnapshot;
 
   return {
@@ -253,9 +242,7 @@ function normalizeSettingsBootstrapPayload(
     ) as Record<string, unknown>,
     orchestratorConfig: normalizeSettingsSectionConfig(payload.orchestratorConfig),
     orchestratorSessionConfig: normalizeSettingsSectionConfig(payload.orchestratorSessionConfig),
-    effectiveOrchestratorConfig: normalizeSettingsSectionConfig(
-      payload.effectiveOrchestratorConfig ?? payload.orchestratorConfig,
-    ),
+    effectiveOrchestratorConfig: normalizeSettingsSectionConfig(payload.effectiveOrchestratorConfig),
     auxiliaryConfig: normalizeSettingsSectionConfig(payload.auxiliaryConfig),
     userRulesConfig: normalizeSettingsSectionConfig(payload.userRulesConfig),
     skillsConfig: normalizeSettingsSectionConfig(payload.skillsConfig),
@@ -273,12 +260,8 @@ function normalizeSettingsBootstrapPayload(
     ) as SettingsBootstrapPayload['workerStatuses'],
     runtimeSettings,
     roleTemplates: Array.isArray(payload.roleTemplates) ? payload.roleTemplates : undefined,
-    registryEngines: Array.isArray(payload.registryEngines)
-      ? payload.registryEngines
-      : (Array.isArray(payload.engines) ? payload.engines : undefined),
-    registryAgents: Array.isArray(payload.registryAgents)
-      ? payload.registryAgents
-      : (Array.isArray(payload.agents) ? payload.agents : undefined),
+    registryEngines: Array.isArray(payload.registryEngines) ? payload.registryEngines : undefined,
+    registryAgents: Array.isArray(payload.registryAgents) ? payload.registryAgents : undefined,
     bootstrapScope: payload.bootstrapScope === 'core' ? 'core' : 'full',
     mcpServersHydrated: payload.mcpServersHydrated !== false,
   };

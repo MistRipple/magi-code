@@ -8,7 +8,7 @@ use super::{
 };
 use magi_api::{
     ApiError, ApiState, DirectHttpModelProbeConfig, RunnerManager, RuntimeStatePersistence,
-    SettingsStore, build_router, build_runtime_capability_dependency_provider,
+    build_router, build_runtime_capability_dependency_provider,
     mcp_config::{build_mcp_config_from_entry, mcp_server_entry_enabled, mcp_server_entry_id},
 };
 use magi_bridge_client::{
@@ -24,6 +24,7 @@ use magi_conversation_runtime::{
     session_turn_finalize::{
         current_turn_status_is_terminal, publish_task_status_turn_item_for_active_sessions,
     },
+    settings_store::SettingsStore,
     task_execution_dispatcher::LlmTaskDispatcher,
     task_execution_registry::TaskExecutionPlan,
     task_runner_bridge::{
@@ -1684,10 +1685,10 @@ mod tests {
         body::{Body, to_bytes},
         http::{Request, StatusCode},
     };
-    use magi_api::SettingsStore;
     use magi_bridge_client::{
         BridgeResponse, McpBridgeClient, McpServerConfig, McpToolCallRequest, StdioMcpBridgeClient,
     };
+    use magi_conversation_runtime::settings_store::SettingsStore;
     use magi_core::{
         MissionId, SessionId, Task, TaskId, TaskKind, TaskRuntimePayload, TaskStatus, ThreadId,
         UtcMillis, WorkerId, WorkspaceId,

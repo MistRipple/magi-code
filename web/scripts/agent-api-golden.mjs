@@ -183,6 +183,8 @@ await withGoldenViteServer(async (server) => {
         sessionId: 'session-query-golden',
         workerConfigs: {},
         orchestratorConfig: {},
+        orchestratorSessionConfig: {},
+        effectiveOrchestratorConfig: {},
         auxiliaryConfig: {},
         userRulesConfig: {},
         skillsConfig: {},
@@ -193,6 +195,9 @@ await withGoldenViteServer(async (server) => {
         capabilityDependencies: [],
         workerStatuses: {},
         runtimeSettings: { locale: 'zh-CN' },
+        roleTemplates: [],
+        registryEngines: [],
+        registryAgents: [],
       }), {
         status: 200,
         headers: { 'content-type': 'application/json' },
