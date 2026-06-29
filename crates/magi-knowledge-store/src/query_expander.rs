@@ -140,7 +140,10 @@ impl QueryExpander {
         if let Some(result) = self.parse_structured_response(content) {
             return result;
         }
-        self.fallback_parse_tokens(content)
+        LlmExpandResult {
+            tokens: Vec::new(),
+            weight_hints: None,
+        }
     }
 
     pub fn get_cached_llm_result(&self, query: &str) -> Option<&LlmExpandCacheEntry> {
@@ -291,20 +294,6 @@ impl QueryExpander {
             tokens,
             weight_hints,
         })
-    }
-
-    fn fallback_parse_tokens(&self, content: &str) -> LlmExpandResult {
-        let ident_re = Regex::new(r"^[a-zA-Z_$][a-zA-Z0-9_$]*$").unwrap();
-        let tokens: Vec<String> = content
-            .lines()
-            .map(|l| l.trim())
-            .filter(|l| l.len() >= 2 && l.len() <= 60 && ident_re.is_match(l))
-            .map(|l| l.to_lowercase())
-            .collect();
-        LlmExpandResult {
-            tokens,
-            weight_hints: None,
-        }
     }
 
     fn split_camel_case(&self, s: &str) -> Vec<String> {
@@ -611,12 +600,12 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_llm_fallback() {
+    fn test_parse_llm_rejects_unstructured_response() {
         let expander = QueryExpander::new();
         let response = "handleAuth\nloginUser\n123\n";
         let result = expander.parse_llm_response(response);
-        assert!(result.tokens.contains(&"handleauth".to_string()));
-        assert!(result.tokens.contains(&"loginuser".to_string()));
+        assert!(result.tokens.is_empty());
+        assert!(result.weight_hints.is_none());
     }
 
     #[test]

@@ -649,7 +649,7 @@ impl DaemonRuntime {
             })
             .collect();
 
-        // 从各工作区 .magi/sessions.json 加载会话（含迁移旧全局 sessions.json）
+        // 从全局未绑定会话和各工作区 .magi/sessions.json 加载会话。
         let session_durable = state_repository.load_sessions_from_workspaces(&workspace_roots)?;
         let session_store = Arc::new(SessionStore::from_persisted_parts(
             session_durable,

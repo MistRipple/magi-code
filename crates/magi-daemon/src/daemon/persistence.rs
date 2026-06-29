@@ -42,54 +42,41 @@ impl StateRepository {
         }
     }
 
-    /// 遍历所有工作区加载会话，合并为统一的 SessionDurableState。
-    /// 全局 sessions.json 只承载未绑定 workspace 的会话；workspace 绑定会话必须归属到
-    /// 对应工作区的 .magi/sessions.json，找不到注册工作区时不再回灌到主状态。
-    pub(crate) fn load_sessions_from_workspaces(
-        &self,
-        workspace_roots: &[(String, PathBuf)],
-    ) -> Result<SessionDurableState, DaemonError> {
-        let global_path = self.session_durable_state_path();
+    fn load_global_session_state(&self) -> Result<SessionDurableState, DaemonError> {
+        let path = self.session_durable_state_path();
+        if !path.exists() {
+            return Ok(SessionDurableState::default());
+        }
 
-        if global_path.exists() {
-            let legacy = self.load_session_durable_state()?;
-            let (global_state, workspace_states) = legacy.partition_by_workspace();
-            let mut orphan_session_count = 0usize;
-            for (workspace_id, workspace_state) in workspace_states {
-                if let Some((_, root)) = workspace_roots.iter().find(|(id, _)| id == &workspace_id)
-                {
-                    let mut ws_state = self.load_workspace_session_state(root)?;
-                    if !workspace_state.sessions.is_empty() {
-                        ws_state.sessions.extend(workspace_state.sessions);
-                        ws_state.timeline.extend(workspace_state.timeline);
-                        ws_state
-                            .canonical_turns
-                            .extend(workspace_state.canonical_turns);
-                        ws_state.notifications.extend(workspace_state.notifications);
-                        if ws_state.current_session_id.is_none() {
-                            ws_state.current_session_id = workspace_state.current_session_id;
-                        }
-                        self.save_workspace_session_state(root, &ws_state)?;
-                    }
-                } else {
-                    orphan_session_count += workspace_state.sessions.len();
-                }
-            }
-            if orphan_session_count > 0 {
-                warn!(
-                    orphan_session_count,
-                    "丢弃全局 sessions.json 中无法绑定到注册 workspace 的孤儿会话"
-                );
-            }
+        let durable = self.load_session_durable_state()?;
+        let (global_state, workspace_states) = durable.partition_by_workspace();
+        let rejected_workspace_session_count: usize = workspace_states
+            .values()
+            .map(|state| state.sessions.len())
+            .sum();
+        if rejected_workspace_session_count > 0 {
+            warn!(
+                rejected_workspace_session_count,
+                "清理全局 sessions.json 中错误归属的 workspace 会话；workspace 会话必须只从工作区 .magi/sessions.json 加载"
+            );
             if global_state.is_empty() {
-                let _ = fs::remove_file(&global_path);
+                let _ = fs::remove_file(&path);
             } else {
                 self.save_session_durable_state(&global_state)?;
             }
         }
+        Ok(global_state)
+    }
 
+    /// 遍历所有工作区加载会话，合并为统一的 SessionDurableState。
+    /// 全局 sessions.json 只承载未绑定 workspace 的会话；workspace 绑定会话必须归属到
+    /// 对应工作区的 .magi/sessions.json。
+    pub(crate) fn load_sessions_from_workspaces(
+        &self,
+        workspace_roots: &[(String, PathBuf)],
+    ) -> Result<SessionDurableState, DaemonError> {
         // 从全局未绑定会话 + 各工作区 .magi/sessions.json 合并加载
-        let mut merged = self.load_session_durable_state()?;
+        let mut merged = self.load_global_session_state()?;
         for (_, root_path) in workspace_roots {
             let ws_state = self.load_workspace_session_state(root_path)?;
             merged.sessions.extend(ws_state.sessions);
@@ -440,7 +427,7 @@ mod tests {
     }
 
     #[test]
-    fn load_sessions_from_workspaces_drops_unknown_workspace_sessions() {
+    fn load_sessions_from_workspaces_cleans_workspace_bound_sessions_from_global_state() {
         let state_root = unique_temp_dir("magi-persistence-unknown-workspace");
         let repository = StateRepository::new(state_root.clone());
         let session_id = SessionId::new("session-unknown-workspace");
@@ -483,11 +470,11 @@ mod tests {
                     duration: None,
                 }],
             })
-            .expect("legacy global session state should save");
+            .expect("invalid global session state should save");
 
         let merged = repository
             .load_sessions_from_workspaces(&[])
-            .expect("unknown workspace sessions should be discarded");
+            .expect("workspace-bound global sessions should be discarded");
 
         assert!(merged.sessions.is_empty());
         assert!(merged.timeline.is_empty());
@@ -500,6 +487,65 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn load_sessions_from_workspaces_does_not_migrate_global_workspace_sessions() {
+        let state_root = unique_temp_dir("magi-persistence-no-global-migration");
+        let workspace_root = unique_temp_dir("magi-persistence-no-global-migration-workspace");
+        let repository = StateRepository::new(state_root.clone());
+        let session_id = SessionId::new("session-global-workspace-bound");
+        let now = UtcMillis::now();
+
+        repository
+            .save_session_durable_state(&SessionDurableState {
+                current_session_id: Some(session_id.clone()),
+                sessions: vec![SessionRecord {
+                    session_id: session_id.clone(),
+                    title: "全局旧布局工作区会话".to_string(),
+                    status: SessionLifecycleStatus::Active,
+                    created_at: now,
+                    updated_at: now,
+                    message_count: Some(1),
+                    workspace_id: Some("workspace-registered".to_string()),
+                }],
+                timeline: vec![TimelineEntry {
+                    entry_id: "timeline-global-workspace-bound".to_string(),
+                    session_id: session_id.clone(),
+                    kind: TimelineEntryKind::UserMessage,
+                    message: "全局旧布局消息".to_string(),
+                    occurred_at: now,
+                }],
+                canonical_turns: vec![],
+                notifications: vec![],
+            })
+            .expect("invalid global session state should save");
+
+        let merged = repository
+            .load_sessions_from_workspaces(&[(
+                "workspace-registered".to_string(),
+                workspace_root.clone(),
+            )])
+            .expect("registered workspace must not receive global workspace-bound sessions");
+        assert!(
+            merged.sessions.is_empty(),
+            "workspace-bound sessions in global state must not be loaded"
+        );
+
+        let workspace_state = repository
+            .load_workspace_session_state(&workspace_root)
+            .expect("workspace session state should load");
+        assert!(
+            workspace_state.sessions.is_empty(),
+            "旧全局布局不能迁移写入工作区 sessions.json"
+        );
+        assert!(
+            !repository.session_durable_state_path().exists(),
+            "清理后不能继续保留只包含 workspace-bound 会话的全局 sessions.json"
+        );
+
+        let _ = fs::remove_dir_all(state_root);
+        let _ = fs::remove_dir_all(workspace_root);
     }
 
     #[test]
