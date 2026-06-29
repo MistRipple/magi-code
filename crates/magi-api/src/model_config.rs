@@ -4,5 +4,5 @@
 //! `.map_err(ApiError::InvalidInput)` 桥接。
 
 pub(crate) use magi_conversation_runtime::model_config::{
-    DEPRECATED_MODEL_CONFIG_FIELDS, NormalizedModelConfig, reject_deprecated_model_config_fields,
+    NormalizedModelConfig, reject_deprecated_model_config_fields,
 };

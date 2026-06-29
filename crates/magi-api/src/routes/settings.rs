@@ -23,10 +23,7 @@ use std::str::FromStr;
 use super::session_scope;
 use crate::{
     errors::ApiError,
-    model_config::{
-        DEPRECATED_MODEL_CONFIG_FIELDS, NormalizedModelConfig,
-        reject_deprecated_model_config_fields,
-    },
+    model_config::{NormalizedModelConfig, reject_deprecated_model_config_fields},
     scope_binding::without_scope_binding_fields,
     state::ApiState,
 };
@@ -59,15 +56,6 @@ fn model_settings_section_request(
     let config = scoped_settings_section_request(request)?;
     reject_deprecated_model_config_fields(&config).map_err(ApiError::InvalidInput)?;
     Ok(config)
-}
-
-fn clean_deprecated_model_config_fields(mut config: Value) -> Value {
-    if let Some(object) = config.as_object_mut() {
-        for field in DEPRECATED_MODEL_CONFIG_FIELDS {
-            object.remove(*field);
-        }
-    }
-    config
 }
 
 fn orchestrator_connection_section_request(
@@ -559,12 +547,10 @@ fn normalize_engine_entry(entry: &Value) -> Option<Value> {
     );
     normalized.insert(
         "llm".to_string(),
-        clean_deprecated_model_config_fields(
-            entry
-                .get("llm")
-                .cloned()
-                .unwrap_or_else(|| Value::Object(Map::new())),
-        ),
+        entry
+            .get("llm")
+            .cloned()
+            .unwrap_or_else(|| Value::Object(Map::new())),
     );
     if let Some(runtime) = entry.get("runtime").cloned() {
         normalized.insert("runtime".to_string(), runtime);
@@ -606,10 +592,7 @@ fn normalize_worker_model_config_entries(raw_workers: &Value) -> HashMap<String,
         if worker_id.is_empty() {
             continue;
         }
-        normalized.insert(
-            worker_id.to_string(),
-            clean_deprecated_model_config_fields(worker_config.clone()),
-        );
+        normalized.insert(worker_id.to_string(), worker_config.clone());
     }
     normalized
 }
@@ -2350,12 +2333,11 @@ mod tests {
     }
 
     #[test]
-    fn normalize_engine_entry_removes_deprecated_model_provider() {
+    fn normalize_engine_entry_keeps_canonical_model_config() {
         let normalized = normalize_engine_entry(&json!({
             "id": "sonnet-4-5",
             "displayName": "sonnet-4.5",
             "llm": {
-                "provider": "anthropic",
                 "baseUrl": "http://localhost:8317/",
                 "model": "kiro-claude-sonnet-4-5-agentic",
                 "urlMode": "standard"
@@ -2363,7 +2345,10 @@ mod tests {
         }))
         .expect("engine should normalize");
 
-        assert!(normalized["llm"].get("provider").is_none());
+        assert_eq!(
+            normalized["llm"]["baseUrl"],
+            json!("http://localhost:8317/")
+        );
         assert_eq!(
             normalized["llm"]["model"],
             json!("kiro-claude-sonnet-4-5-agentic")
@@ -2463,18 +2448,13 @@ mod tests {
         let servers = bootstrap["mcpServers"]
             .as_array()
             .expect("mcpServers should be an array");
-        assert_eq!(servers.len(), 2);
+        assert_eq!(servers.len(), 1);
         assert!(
             servers
                 .iter()
                 .all(|server| server["id"].as_str().is_some_and(|id| !id.is_empty())),
             "bootstrap must not expose MCP server entries without id"
         );
-        assert!(servers.iter().any(|server| {
-            server["id"] == json!("wrapped-server")
-                && server["serverId"] == json!("wrapped-server")
-                && server["name"] == json!("wrapped-server")
-        }));
         assert!(servers.iter().any(|server| {
             server["id"] == json!("valid-server") && server["serverId"] == json!("valid-server")
         }));

@@ -7,6 +7,14 @@ use std::sync::RwLock;
 use tracing::warn;
 
 const SESSION_SECTION_PREFIX: &str = "__session__:";
+const PUBLIC_RESPONSE_ALIAS_SECTIONS: &[&str] = &[
+    "workerConfigs",
+    "orchestratorConfig",
+    "auxiliaryConfig",
+    "userRulesConfig",
+    "registryEngines",
+    "registryAgents",
+];
 
 #[derive(Debug)]
 pub struct SettingsStore {
@@ -70,9 +78,14 @@ impl SettingsStore {
         }
         let content = fs::read_to_string(path)?;
         match serde_json::from_str::<HashMap<String, Value>>(&content) {
-            Ok(data) => {
+            Ok(mut data) => {
+                let changed = canonicalize_settings_sections(&mut data);
                 let mut sections = self.sections.write().unwrap();
                 *sections = data;
+                drop(sections);
+                if changed {
+                    self.save_to_disk()?;
+                }
             }
             Err(error) => {
                 warn!(
@@ -115,6 +128,12 @@ impl SettingsStore {
     }
 
     pub fn set(&self, key: &str, value: Value) {
+        if is_public_response_alias_section(key) {
+            self.remove_section(key);
+            return;
+        }
+        let mut value = value;
+        canonicalize_settings_section_value(key, &mut value);
         {
             let mut sections = self.sections.write().unwrap();
             sections.insert(key.to_string(), value);
@@ -132,6 +151,12 @@ impl SettingsStore {
     }
 
     pub fn set_section(&self, section: &str, value: Value) {
+        if is_public_response_alias_section(section) {
+            self.remove_section(section);
+            return;
+        }
+        let mut value = value;
+        canonicalize_settings_section_value(section, &mut value);
         {
             let mut sections = self.sections.write().unwrap();
             sections.insert(section.to_string(), value);
@@ -174,19 +199,18 @@ impl SettingsStore {
             .entry(section.to_string())
             .or_insert_with(|| Value::Array(vec![]));
         if let Value::Array(items) = arr {
-            let id_str = Self::extract_id_str(entry, id_field);
-            if let Some(id_val) = id_str {
-                if let Some(pos) = items
-                    .iter()
-                    .position(|item| Self::extract_id_str(item, id_field) == Some(id_val))
-                {
-                    items[pos] = entry.clone();
-                    drop(sections);
-                    self.auto_persist();
-                    return;
-                }
+            let Some(id_val) = Self::extract_id_str(entry, id_field) else {
+                return;
+            };
+            if let Some(pos) = items
+                .iter()
+                .position(|item| Self::extract_id_str(item, id_field) == Some(id_val))
+            {
+                items[pos] = entry.clone();
+            } else {
+                items.push(entry.clone());
             }
-            items.push(entry.clone());
+            canonicalize_settings_section_value(section, arr);
         }
         drop(sections);
         self.auto_persist();
@@ -222,45 +246,6 @@ impl SettingsStore {
             return Some(s);
         }
 
-        if let Some(server) = item.get("server") {
-            if let Some(s) = server.get(primary_field).and_then(|v| v.as_str()) {
-                return Some(s);
-            }
-            if let Some(s) = server.get("id").and_then(|v| v.as_str()) {
-                return Some(s);
-            }
-            if let Some(s) = server.get("serverId").and_then(|v| v.as_str()) {
-                return Some(s);
-            }
-        }
-        if let Some(engine) = item.get("engine") {
-            if let Some(s) = engine.get(primary_field).and_then(|v| v.as_str()) {
-                return Some(s);
-            }
-            if let Some(s) = engine.get("id").and_then(|v| v.as_str()) {
-                return Some(s);
-            }
-            if let Some(s) = engine.get("engineId").and_then(|v| v.as_str()) {
-                return Some(s);
-            }
-        }
-        if let Some(agent) = item.get("agent") {
-            if let Some(s) = agent.get(primary_field).and_then(|v| v.as_str()) {
-                return Some(s);
-            }
-            if let Some(s) = agent.get("id").and_then(|v| v.as_str()) {
-                return Some(s);
-            }
-        }
-        if let Some(llm) = item.get("llm") {
-            if let Some(s) = llm.get(primary_field).and_then(|v| v.as_str()) {
-                return Some(s);
-            }
-            if let Some(s) = llm.get("id").and_then(|v| v.as_str()) {
-                return Some(s);
-            }
-        }
-
         None
     }
 
@@ -277,6 +262,70 @@ impl SettingsStore {
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect()
     }
+}
+
+fn canonicalize_settings_sections(sections: &mut HashMap<String, Value>) -> bool {
+    let mut changed = false;
+    for section in PUBLIC_RESPONSE_ALIAS_SECTIONS {
+        changed |= sections.remove(*section).is_some();
+    }
+    for (section, value) in sections.iter_mut() {
+        changed |= canonicalize_settings_section_value(section, value);
+    }
+    changed
+}
+
+fn is_public_response_alias_section(section: &str) -> bool {
+    PUBLIC_RESPONSE_ALIAS_SECTIONS.contains(&section)
+}
+
+fn canonicalize_settings_section_value(section: &str, value: &mut Value) -> bool {
+    if matches!(section, "orchestrator" | "auxiliary")
+        || (is_session_section_key(section)
+            && (section.ends_with(":orchestrator") || section.ends_with(":auxiliary")))
+    {
+        return remove_deprecated_model_fields(value);
+    }
+    match section {
+        "workers" => normalize_workers_section(value),
+        "engines" => normalize_engines_section(value),
+        _ => false,
+    }
+}
+
+fn normalize_workers_section(value: &mut Value) -> bool {
+    let Some(workers) = value.as_object_mut() else {
+        return false;
+    };
+    let mut changed = false;
+    for config in workers.values_mut() {
+        changed |= remove_deprecated_model_fields(config);
+    }
+    changed
+}
+
+fn normalize_engines_section(value: &mut Value) -> bool {
+    let Some(engines) = value.as_array_mut() else {
+        return false;
+    };
+    let mut changed = false;
+    for engine in engines {
+        if let Some(llm) = engine.get_mut("llm") {
+            changed |= remove_deprecated_model_fields(llm);
+        }
+    }
+    changed
+}
+
+fn remove_deprecated_model_fields(value: &mut Value) -> bool {
+    let Some(object) = value.as_object_mut() else {
+        return false;
+    };
+    let mut changed = false;
+    for field in crate::model_config::DEPRECATED_MODEL_CONFIG_FIELDS {
+        changed |= object.remove(*field).is_some();
+    }
+    changed
 }
 
 fn session_section_key(session_id: &SessionId, section: &str) -> String {
@@ -395,6 +444,132 @@ mod tests {
         store2.load_from_disk().unwrap();
         assert_eq!(store2.get_section("engines"), json!([]));
         assert_eq!(store2.get_section("config"), json!({}));
+    }
+
+    #[test]
+    fn load_from_disk_canonicalizes_model_sections_and_public_aliases() {
+        let dir = std::env::temp_dir().join(format!(
+            "magi-settings-test-canonicalize-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&json!({
+                "orchestrator": {
+                    "provider": "anthropic",
+                    "openaiProtocol": "responses",
+                    "protocolEndpoint": "/v1/responses",
+                    "baseUrl": "https://api.example.com",
+                    "model": "main"
+                },
+                "workers": {
+                    "reviewer": {
+                        "provider": "openai",
+                        "baseUrl": "https://api.example.com",
+                        "model": "worker"
+                    }
+                },
+                "engines": [{
+                    "id": "reviewer",
+                    "llm": {
+                        "provider": "openai",
+                        "baseUrl": "https://api.example.com",
+                        "model": "worker"
+                    }
+                }],
+                "orchestratorConfig": { "model": "alias-main" },
+                "workerConfigs": { "alias-worker": { "model": "alias" } },
+                "registryEngines": []
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let store = SettingsStore::with_persistence_path(path.clone());
+        store.load_from_disk().unwrap();
+
+        assert!(store.get_section("orchestrator").get("provider").is_none());
+        assert!(
+            store
+                .get_section("orchestrator")
+                .get("openaiProtocol")
+                .is_none()
+        );
+        assert!(
+            store.get_section("workers")["reviewer"]
+                .get("provider")
+                .is_none()
+        );
+        assert!(
+            store.get_section("engines")[0]["llm"]
+                .get("provider")
+                .is_none()
+        );
+        assert_eq!(store.get_section("orchestratorConfig"), Value::Null);
+        assert_eq!(store.get_section("workerConfigs"), Value::Null);
+        assert_eq!(store.get_section("registryEngines"), Value::Null);
+
+        let persisted: HashMap<String, Value> =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(!persisted.contains_key("orchestratorConfig"));
+        assert!(!persisted.contains_key("workerConfigs"));
+        assert!(!persisted.contains_key("registryEngines"));
+        assert!(
+            persisted["orchestrator"]
+                .as_object()
+                .unwrap()
+                .get("provider")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn array_upsert_uses_only_top_level_canonical_ids() {
+        let store = SettingsStore::new();
+        store.upsert_array_entry(
+            "engines",
+            "id",
+            &json!({
+                "id": "reviewer",
+                "llm": {
+                    "provider": "openai",
+                    "model": "old-worker"
+                }
+            }),
+        );
+        store.upsert_array_entry(
+            "engines",
+            "id",
+            &json!({
+                "engine": {
+                    "id": "reviewer"
+                },
+                "llm": {
+                    "model": "wrapped-worker"
+                }
+            }),
+        );
+        store.upsert_array_entry(
+            "engines",
+            "id",
+            &json!({
+                "id": "reviewer",
+                "llm": {
+                    "model": "current-worker"
+                }
+            }),
+        );
+
+        let engines = store.get_section("engines");
+        let engines = engines.as_array().expect("engines should be array");
+        assert_eq!(engines.len(), 1);
+        assert_eq!(engines[0]["llm"]["model"], json!("current-worker"));
+        assert!(engines[0]["llm"].get("provider").is_none());
     }
 
     #[test]

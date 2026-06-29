@@ -1722,30 +1722,9 @@ fn normalize_settings_snapshot_sections(snapshot: &mut HashMap<String, serde_jso
     }
     skill_loader::normalize_skills_config_sections(snapshot);
     seed_user_rules_config(snapshot);
-    normalize_workers_section(snapshot);
-    strip_deprecated_model_fields_from_section(snapshot, "orchestrator");
-    strip_deprecated_model_fields_from_section(snapshot, "auxiliary");
     normalize_mcp_servers_section(snapshot);
     seed_default_safeguard_rules(snapshot);
     normalize_safeguard_config_section(snapshot);
-}
-
-fn strip_deprecated_model_fields(value: &mut serde_json::Value) {
-    let Some(object) = value.as_object_mut() else {
-        return;
-    };
-    for field in magi_conversation_runtime::model_config::DEPRECATED_MODEL_CONFIG_FIELDS {
-        object.remove(*field);
-    }
-}
-
-fn strip_deprecated_model_fields_from_section(
-    snapshot: &mut HashMap<String, serde_json::Value>,
-    key: &str,
-) {
-    if let Some(value) = snapshot.get_mut(key) {
-        strip_deprecated_model_fields(value);
-    }
 }
 
 fn public_skills_config_section(value: serde_json::Value) -> serde_json::Value {
@@ -2084,18 +2063,6 @@ fn seed_default_safeguard_rules(snapshot: &mut HashMap<String, serde_json::Value
     let mut all_rules = builtin_safeguard_rules();
     all_rules.extend(existing_rules);
     safeguard["rules"] = serde_json::Value::Array(all_rules);
-}
-
-fn normalize_workers_section(snapshot: &mut HashMap<String, serde_json::Value>) {
-    let Some(workers) = snapshot.get_mut("workers") else {
-        return;
-    };
-    let Some(object) = workers.as_object_mut() else {
-        return;
-    };
-    for config in object.values_mut() {
-        strip_deprecated_model_fields(config);
-    }
 }
 
 fn normalize_mcp_servers_section(snapshot: &mut HashMap<String, serde_json::Value>) {
