@@ -1111,7 +1111,6 @@ dependencies = [
  "magi-memory-store",
  "magi-mission",
  "magi-mission-charter",
- "magi-mission-metrics",
  "magi-orchestrator",
  "magi-plan",
  "magi-session-store",

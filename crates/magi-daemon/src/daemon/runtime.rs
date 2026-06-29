@@ -2088,31 +2088,31 @@ mod tests {
 
         assert_eq!(catalog["tool"], "tool_catalog");
         assert_eq!(catalog["status"], "succeeded");
-        assert_eq!(catalog["external_catalog_status"], "available");
-        assert_eq!(catalog["agent_role_catalog_status"], "available");
+        assert_eq!(catalog["externalCatalogStatus"], "available");
+        assert_eq!(catalog["agentRoleCatalogStatus"], "available");
         assert!(
-            catalog["spawnable_agent_role_count"]
+            catalog["spawnableAgentRoleCount"]
                 .as_u64()
                 .expect("spawnable agent role count should serialize")
                 > 0,
             "daemon tool catalog should expose agent_spawn-capable roles"
         );
-        let workspace_code_index = catalog["runtime_dependencies"]
+        let workspace_code_index = catalog["runtimeDependencies"]
             .as_array()
             .expect("runtime dependencies should be an array")
             .iter()
             .find(|dependency| dependency["name"] == "workspace_code_index")
             .expect("workspace_code_index dependency should be exposed");
-        assert_eq!(workspace_code_index["workspace_id"], "test-workspace-001");
+        assert_eq!(workspace_code_index["workspaceId"], "test-workspace-001");
         assert_eq!(workspace_code_index["status"], "ready");
-        let context_runtime = catalog["runtime_dependencies"]
+        let context_runtime = catalog["runtimeDependencies"]
             .as_array()
             .expect("runtime dependencies should be an array")
             .iter()
             .find(|dependency| dependency["name"] == "context_runtime")
             .expect("context_runtime dependency should be exposed");
-        assert_eq!(context_runtime["workspace_id"], "test-workspace-001");
-        assert_eq!(context_runtime["session_id"], "test-session-001");
+        assert_eq!(context_runtime["workspaceId"], "test-workspace-001");
+        assert_eq!(context_runtime["sessionId"], "test-session-001");
         assert_eq!(context_runtime["status"], "ready");
         let process_launch = catalog["tools"]
             .as_array()
@@ -2121,7 +2121,7 @@ mod tests {
             .find(|tool| tool["name"] == "process_launch")
             .expect("includeInternal=true should expose process_launch");
         assert_eq!(process_launch["public"], false);
-        assert_eq!(process_launch["parameters_schema"]["type"], "object");
+        assert_eq!(process_launch["parametersSchema"]["type"], "object");
     }
 
     #[tokio::test]
@@ -2642,7 +2642,7 @@ mod tests {
             "/api/session/turn",
             json!({
                 "sessionId": "test-session-001",
-                "text": "remember parser constraint",
+                "text": "修复 parser constraint 记忆问题，完成后运行测试并汇总验证结果",
                 "skillName": "refactor",
                 "images": [],
                 "workspaceId": active_workspace_id.to_string(),
@@ -2687,7 +2687,7 @@ mod tests {
             "/api/session/turn",
             json!({
                 "sessionId": "test-session-001",
-                "text": "follow up parser work",
+                "text": "修复 parser 后续工作问题，完成后运行测试并汇总验证结果",
                 "skillName": "refactor",
                 "images": [],
                 "workspaceId": active_workspace_id.to_string(),
@@ -2838,7 +2838,7 @@ mod tests {
             "/api/session/turn",
             json!({
                 "sessionId": "test-session-001",
-                "text": "seed recovery route state",
+                "text": "修复 recovery route 初始状态问题，完成后运行测试并汇总验证结果",
                 "skillName": "refactor",
                 "images": [],
                 "workspaceId": active_workspace_id.to_string(),
@@ -2921,7 +2921,7 @@ mod tests {
             "/api/session/turn",
             json!({
                 "sessionId": "test-session-001",
-                "text": "consume recovery memory",
+                "text": "修复 recovery memory 消费问题，完成后运行测试并汇总验证结果",
                 "skillName": "refactor",
                 "images": [],
                 "workspaceId": workspace_id.to_string(),

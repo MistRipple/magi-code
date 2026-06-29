@@ -942,11 +942,11 @@ async fn daemon_runtime_recovery_preflight_executes_and_followup_router_dispatch
         app.clone(),
         "/api/session/turn",
         json!({
-            "session_id": session_id.to_string(),
-            "text": "follow up recovery task",
-            "skill_name": "resume",
+            "sessionId": session_id.to_string(),
+            "text": "修复恢复任务后续问题，完成后运行测试并汇总验证结果",
+            "skillName": "resume",
             "images": [],
-            "workspace_id": workspace_id.to_string(),
+            "workspaceId": workspace_id.to_string(),
         }),
     )
     .await;
@@ -1025,11 +1025,11 @@ async fn daemon_bootstrap_exports_session_action_context_summary_after_followup_
         app.clone(),
         "/api/session/turn",
         json!({
-            "session_id": "test-session-bootstrap",
-            "text": "Route parser refresh",
-            "skill_name": "refactor",
+            "sessionId": "test-session-bootstrap",
+            "text": "修复路由解析刷新问题，完成后运行测试并汇总验证结果",
+            "skillName": "refactor",
             "images": [],
-            "workspace_id": active_workspace_id.to_string(),
+            "workspaceId": active_workspace_id.to_string(),
         }),
     )
     .await;
@@ -1063,11 +1063,11 @@ async fn daemon_bootstrap_exports_session_action_context_summary_after_followup_
         app.clone(),
         "/api/session/turn",
         json!({
-            "session_id": "test-session-bootstrap",
-            "text": "Route parser refresh followup",
-            "skill_name": "refactor",
+            "sessionId": "test-session-bootstrap",
+            "text": "继续修复路由解析刷新后续问题，完成后运行测试并汇总验证结果",
+            "skillName": "refactor",
             "images": [],
-            "workspace_id": active_workspace_id.to_string(),
+            "workspaceId": active_workspace_id.to_string(),
         }),
     )
     .await;
@@ -1146,11 +1146,11 @@ async fn daemon_bootstrap_exports_recovery_context_after_resume_and_followup_dis
         app.clone(),
         "/api/session/turn",
         json!({
-            "session_id": "test-session-bootstrap-recovery",
-            "text": "seed bootstrap recovery state",
-            "skill_name": "resume",
+            "sessionId": "test-session-bootstrap-recovery",
+            "text": "修复 bootstrap 恢复状态初始化问题，完成后运行测试并汇总验证结果",
+            "skillName": "resume",
             "images": [],
-            "workspace_id": active_workspace_id.to_string(),
+            "workspaceId": active_workspace_id.to_string(),
         }),
     )
     .await;
@@ -1262,11 +1262,11 @@ async fn daemon_bootstrap_exports_recovery_context_after_resume_and_followup_dis
         app.clone(),
         "/api/session/turn",
         json!({
-            "session_id": "test-session-bootstrap-recovery",
-            "text": "consume resumed bootstrap memory",
-            "skill_name": "resume",
+            "sessionId": "test-session-bootstrap-recovery",
+            "text": "修复 resumed bootstrap memory 消费问题，完成后运行测试并汇总验证结果",
+            "skillName": "resume",
             "images": [],
-            "workspace_id": workspace_id.to_string(),
+            "workspaceId": workspace_id.to_string(),
         }),
     )
     .await;
@@ -2273,10 +2273,10 @@ async fn session_turn_live_events_reach_multiple_subscribers() {
         "/api/session/turn",
         json!({
             "text": "multi subscriber live event",
-            "workspace_id": DEFAULT_TEST_WORKSPACE_ID,
-            "request_id": "request-multi-subscriber-live",
-            "user_message_id": "user-multi-subscriber-live",
-            "placeholder_message_id": "placeholder-multi-subscriber-live",
+            "workspaceId": DEFAULT_TEST_WORKSPACE_ID,
+            "requestId": "request-multi-subscriber-live",
+            "userMessageId": "user-multi-subscriber-live",
+            "placeholderMessageId": "placeholder-multi-subscriber-live",
         }),
     )
     .await;
@@ -2339,10 +2339,10 @@ async fn session_turn_persists_without_live_subscriber_and_recovers_after_restar
         "/api/session/turn",
         json!({
             "text": "no subscriber persistence",
-            "workspace_id": "test-workspace-001",
-            "request_id": "request-no-subscriber-recovery",
-            "user_message_id": "user-no-subscriber-recovery",
-            "placeholder_message_id": "placeholder-no-subscriber-recovery",
+            "workspaceId": "test-workspace-001",
+            "requestId": "request-no-subscriber-recovery",
+            "userMessageId": "user-no-subscriber-recovery",
+            "placeholderMessageId": "placeholder-no-subscriber-recovery",
         }),
     )
     .await;
@@ -2442,10 +2442,10 @@ async fn workspace_sessions_and_events_stay_workspace_scoped() {
         "/api/session/turn",
         json!({
             "text": "workspace two isolated message",
-            "workspace_id": second_workspace_id.clone(),
-            "request_id": "request-workspace-two-isolated",
-            "user_message_id": "user-workspace-two-isolated",
-            "placeholder_message_id": "placeholder-workspace-two-isolated",
+            "workspaceId": second_workspace_id.clone(),
+            "requestId": "request-workspace-two-isolated",
+            "userMessageId": "user-workspace-two-isolated",
+            "placeholderMessageId": "placeholder-workspace-two-isolated",
         }),
     )
     .await;
@@ -2570,10 +2570,10 @@ async fn session_action_happy_path_creates_tasks_and_records_timeline_messages()
         app.clone(),
         "/api/session/turn",
         json!({
-            "text": "Hello integration test",
-            "skill_name": "code",
+            "text": "修复集成测试消息链路问题，完成后运行测试并汇总验证结果",
+            "skillName": "code",
             "images": [],
-            "workspace_id": "test-workspace-001",
+            "workspaceId": "test-workspace-001",
         }),
     )
     .await;
@@ -2626,7 +2626,7 @@ async fn session_action_happy_path_creates_tasks_and_records_timeline_messages()
         user_msg["message"]
             .as_str()
             .unwrap()
-            .contains("Hello integration test"),
+            .contains("修复集成测试消息链路问题"),
         "user message should contain original text"
     );
 
@@ -2670,10 +2670,10 @@ async fn session_action_messages_survive_runtime_restart_and_preserve_message_co
         app.clone(),
         "/api/session/turn",
         json!({
-            "text": "Restart persistence verification",
-            "skill_name": "code",
+            "text": "修复重启持久化验证问题，完成后运行测试并汇总验证结果",
+            "skillName": "code",
             "images": [],
-            "workspace_id": DEFAULT_TEST_WORKSPACE_ID,
+            "workspaceId": DEFAULT_TEST_WORKSPACE_ID,
         }),
     )
     .await;
@@ -2866,10 +2866,10 @@ async fn session_continue_survives_runtime_restart_with_same_chain_and_worker_br
         app.clone(),
         "/api/session/turn",
         json!({
-            "text": "Restart continue verification",
-            "skill_name": "refactor",
+            "text": "修复重启继续执行链路问题，完成后运行测试并汇总验证结果",
+            "skillName": "refactor",
             "images": [],
-            "workspace_id": DEFAULT_TEST_WORKSPACE_ID,
+            "workspaceId": DEFAULT_TEST_WORKSPACE_ID,
         }),
     )
     .await;
@@ -3290,10 +3290,10 @@ async fn workspace_bound_session_continue_survives_runtime_restart() {
         app.clone(),
         "/api/session/turn",
         json!({
-            "text": "Workspace-bound session restart verification",
-            "skill_name": "refactor",
+            "text": "修复工作区绑定会话重启恢复问题，完成后运行测试并汇总验证结果",
+            "skillName": "refactor",
             "images": [],
-            "workspace_id": DEFAULT_TEST_WORKSPACE_ID,
+            "workspaceId": DEFAULT_TEST_WORKSPACE_ID,
         }),
     )
     .await;
@@ -3453,11 +3453,11 @@ async fn session_action_publishes_domain_event_on_event_bus() {
         app.clone(),
         "/api/session/turn",
         json!({
-            "session_id": "session-e2e-events",
-            "text": "event bus test",
-            "skill_name": "code",
+            "sessionId": "session-e2e-events",
+            "text": "修复事件总线任务事件发布问题，完成后运行测试并汇总验证结果",
+            "skillName": "code",
             "images": [],
-            "workspace_id": active_workspace_id.to_string(),
+            "workspaceId": active_workspace_id.to_string(),
         }),
     )
     .await;
@@ -3505,10 +3505,10 @@ async fn sequential_session_actions_share_session_and_accumulate_messages() {
         app.clone(),
         "/api/session/turn",
         json!({
-            "text": "first action",
-            "skill_name": "refactor",
+            "text": "修复连续会话第一阶段问题，完成后运行测试并汇总验证结果",
+            "skillName": "refactor",
             "images": [],
-            "workspace_id": DEFAULT_TEST_WORKSPACE_ID,
+            "workspaceId": DEFAULT_TEST_WORKSPACE_ID,
         }),
     )
     .await;
@@ -3532,11 +3532,11 @@ async fn sequential_session_actions_share_session_and_accumulate_messages() {
         app.clone(),
         "/api/session/turn",
         json!({
-            "session_id": session_id,
-            "text": "second action",
-            "skill_name": "refactor",
+            "sessionId": session_id,
+            "text": "修复连续会话第二阶段问题，完成后运行测试并汇总验证结果",
+            "skillName": "refactor",
             "images": [],
-            "workspace_id": DEFAULT_TEST_WORKSPACE_ID,
+            "workspaceId": DEFAULT_TEST_WORKSPACE_ID,
         }),
     )
     .await;
