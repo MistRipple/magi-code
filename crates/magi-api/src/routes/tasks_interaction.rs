@@ -179,6 +179,12 @@ fn ensure_terminal_root_action(
     Ok(root_task)
 }
 
+fn restart_active_skill_id(root_task: &magi_core::Task) -> Option<String> {
+    root_task
+        .executor_binding_active_skill_id()
+        .map(str::to_string)
+}
+
 /// 中断当前任务投影：只终止原执行树，继续操作统一走 `/api/session/continue`。
 async fn interrupt_task(
     State(state): State<ApiState>,
@@ -309,12 +315,7 @@ async fn restart_task(
         workspace_id: Some(scope.workspace_id.to_string()),
         workspace_path: Some(scope.workspace_path.clone()),
         text: Some(restart_text),
-        skill_name: root_task
-            .executor_binding
-            .as_ref()
-            .and_then(|binding| binding.get("skill_name"))
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string),
+        skill_name: restart_active_skill_id(&root_task),
         images: Vec::new(),
         access_profile: root_task
             .policy_snapshot
@@ -384,6 +385,70 @@ async fn restart_task(
         "workspaceId": scope.workspace_id.to_string(),
         "workspacePath": scope.workspace_path,
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use magi_core::{
+        AccessProfile, MissionId, Task, TaskKind, TaskPolicy, TaskRuntimePayload, TaskStatus,
+    };
+
+    fn terminal_root_task_with_binding(binding: serde_json::Value) -> Task {
+        Task {
+            task_id: TaskId::new("task-root-restart-skill"),
+            mission_id: MissionId::new("mission-restart-skill"),
+            root_task_id: TaskId::new("task-root-restart-skill"),
+            parent_task_id: None,
+            kind: TaskKind::LocalAgent,
+            title: "重启 skill 任务".to_string(),
+            goal: "重启时保留 active skill".to_string(),
+            status: TaskStatus::Completed,
+            dependency_ids: Vec::new(),
+            required_children: Vec::new(),
+            policy_snapshot: Some(TaskPolicy {
+                autonomy_level: "Autonomous".to_string(),
+                access_profile: AccessProfile::Restricted,
+                allowed_tools: Vec::new(),
+                denied_tools: Vec::new(),
+                allowed_paths: Vec::new(),
+                denied_paths: Vec::new(),
+                network_mode: "full".to_string(),
+                command_mode: "full".to_string(),
+                retry_limit: 1,
+                validation_profile: None,
+                checkpoint_mode: "turn".to_string(),
+                task_tier: TaskTier::ExecutionChain,
+                background_allowed: false,
+                escalation_conditions: Vec::new(),
+            }),
+            executor_binding: Some(binding),
+            knowledge_refs: Vec::new(),
+            workspace_scope: None,
+            write_scope: None,
+            input_refs: Vec::new(),
+            output_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            retry_count: 0,
+            runtime_payload: TaskRuntimePayload::None,
+            created_at: UtcMillis(1),
+            updated_at: UtcMillis(2),
+        }
+    }
+
+    #[test]
+    fn restart_uses_active_skill_id_not_legacy_skill_name_binding() {
+        let task = terminal_root_task_with_binding(serde_json::json!({
+            "target_role": "reviewer",
+            "active_skill_id": "code-review",
+            "skill_name": "legacy-skill"
+        }));
+
+        assert_eq!(
+            restart_active_skill_id(&task).as_deref(),
+            Some("code-review")
+        );
+    }
 }
 
 /// 从任务面板归档当前 root 任务：只移除会话当前执行链指针，不删除 TaskStore 历史。

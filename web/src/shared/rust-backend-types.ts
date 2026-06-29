@@ -1314,6 +1314,7 @@ export type TaskStatus =
 
 export interface ExecutorBindingDto {
   target_role: string;
+  active_skill_id?: string | null;
   capability_requirements: string[];
   parallelism_group?: string | null;
   exclusive_scope?: string | null;

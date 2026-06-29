@@ -231,6 +231,10 @@ impl Task {
     pub fn executor_binding_exclusive_scope(&self) -> Option<&str> {
         self.executor_binding_str("exclusive_scope")
     }
+
+    pub fn executor_binding_active_skill_id(&self) -> Option<&str> {
+        self.executor_binding_str("active_skill_id")
+    }
 }
 // --- TaskProjection (view contract)
 

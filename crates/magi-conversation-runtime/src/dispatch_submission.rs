@@ -214,9 +214,29 @@ fn make_dispatch_task(
     goal: String,
     now: UtcMillis,
     target_role: &str,
+    active_skill_id: Option<&str>,
     task_tier: TaskTier,
     access_profile: AccessProfile,
 ) -> magi_core::Task {
+    let active_skill_id = active_skill_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let mut executor_binding = serde_json::json!({
+        "target_role": target_role,
+        "capability_requirements": [],
+        "parallelism_group": null,
+        "exclusive_scope": null,
+        "worker_selector": null,
+    });
+    if let (Some(active_skill_id), Some(binding)) =
+        (active_skill_id, executor_binding.as_object_mut())
+    {
+        binding.insert(
+            "active_skill_id".to_string(),
+            serde_json::Value::String(active_skill_id.to_string()),
+        );
+    }
+
     magi_core::Task {
         task_id: task_id.clone(),
         mission_id,
@@ -229,13 +249,7 @@ fn make_dispatch_task(
         dependency_ids: Vec::new(),
         required_children: Vec::new(),
         policy_snapshot: Some(build_task_policy(task_tier, access_profile)),
-        executor_binding: Some(serde_json::json!({
-            "target_role": target_role,
-            "capability_requirements": [],
-            "parallelism_group": null,
-            "exclusive_scope": null,
-            "worker_selector": null,
-        })),
+        executor_binding: Some(executor_binding),
         knowledge_refs: Vec::new(),
         workspace_scope: None,
         write_scope: None,
@@ -323,6 +337,7 @@ pub fn run_dispatch_submission(
         task_goal_text.clone(),
         now,
         target_role,
+        request.skill_name.as_deref(),
         request.task_tier,
         request.access_profile,
     );
@@ -711,6 +726,73 @@ mod tests {
         assert!(
             chain.current_turn.is_some(),
             "ActiveExecutionChain 必须带 current_turn，作为运行期 lane 调度入口",
+        );
+    }
+
+    #[test]
+    fn dispatch_submission_persists_active_skill_id_on_action_task() {
+        let session_store = SessionStore::new();
+        let task_store = TaskStore::new();
+        let execution_registry = TaskExecutionRegistry::default();
+        let event_bus = InMemoryEventBus::new(16);
+        let agent_role_registry = AgentRoleRegistry::load_default();
+        let spawn_graph = Mutex::new(SpawnGraph::new());
+        let session_id = SessionId::new("session-dispatch-active-skill");
+
+        session_store
+            .create_session(session_id.clone(), "dispatch active skill")
+            .expect("session should be creatable");
+
+        let request = DispatchSubmissionRequest {
+            accepted_at: UtcMillis(3_500),
+            session_id,
+            workspace_id: Some(WorkspaceId::new("workspace-dispatch-active-skill")),
+            entry_id: "timeline-dispatch-active-skill".to_string(),
+            timeline_message: "使用代码审查 skill 检查当前改动".to_string(),
+            images: Vec::new(),
+            created_session: false,
+            mission_title: "代码审查".to_string(),
+            task_title: "代码审查".to_string(),
+            trimmed_text: Some("使用代码审查 skill 检查当前改动".to_string()),
+            execution_goal: Some("检查当前改动并给出问题列表".to_string()),
+            task_tier: TaskTier::ExecutionChain,
+            access_profile: AccessProfile::Restricted,
+            skill_name: Some("code-review".to_string()),
+            target_role: Some("reviewer".to_string()),
+            request_id: None,
+            user_message_id: None,
+            placeholder_message_id: None,
+        };
+        let runtime = DispatchSubmissionRuntime {
+            session_store: &session_store,
+            task_store: &task_store,
+            execution_registry: &execution_registry,
+            event_bus: &event_bus,
+            agent_role_registry: &agent_role_registry,
+            spawn_graph: &spawn_graph,
+            model_bridge_client: None,
+            settings_store: None,
+            workspace_root_path: None,
+        };
+
+        let graph = run_dispatch_submission(&runtime, &request)
+            .expect("dispatch submission should build graph");
+        let action_task = task_store
+            .get_task(&graph.action_task_id)
+            .expect("action task should be persisted in TaskStore");
+
+        assert_eq!(
+            action_task.executor_binding_active_skill_id(),
+            Some("code-review"),
+            "active skill 必须进入 Task executor_binding，任务重跑才能恢复同一 skill 上下文"
+        );
+        assert_eq!(
+            action_task
+                .executor_binding
+                .as_ref()
+                .and_then(|binding| binding.get("skill_name")),
+            None,
+            "Task executor_binding 不再写入旧 skill_name 字段"
         );
     }
 
