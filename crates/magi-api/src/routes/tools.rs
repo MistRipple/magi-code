@@ -43,7 +43,9 @@ async fn get_tool_catalog(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let context = query.tool_context(&state)?;
     let input = query.catalog_input();
-    Ok(Json(state.tool_catalog_json(&input.to_string(), &context)?))
+    Ok(Json(
+        state.public_tool_catalog_json(&input.to_string(), &context)?,
+    ))
 }
 
 impl ToolCatalogQuery {
@@ -178,11 +180,11 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["tool"], "tool_catalog");
         assert_eq!(body["status"], "succeeded");
-        assert_eq!(body["builtin_total"], 35);
-        assert_eq!(body["external_catalog_status"], "unavailable");
-        assert_eq!(body["agent_role_catalog_status"], "unavailable");
+        assert_eq!(body["builtinTotal"], 35);
+        assert_eq!(body["externalCatalogStatus"], "unavailable");
+        assert_eq!(body["agentRoleCatalogStatus"], "unavailable");
         assert_eq!(
-            body["runtime_dependencies"][1]["workspace_id"],
+            body["runtimeDependencies"][1]["workspaceId"],
             "workspace-tools"
         );
         assert!(
@@ -203,7 +205,7 @@ mod tests {
         let (status, body) = get_json(app, "/tools/catalog?accessProfile=full_access").await;
 
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["current_access_profile"], "full_access");
+        assert_eq!(body["currentAccessProfile"], "full_access");
         let shell_exec = body["tools"]
             .as_array()
             .expect("tools should be an array")
@@ -211,11 +213,11 @@ mod tests {
             .find(|tool| tool["name"] == "shell_exec")
             .expect("shell_exec should be listed");
         assert_eq!(
-            shell_exec["effective_approval_policy"],
+            shell_exec["effectiveApprovalPolicy"],
             "regular_risk_block_skipped"
         );
         assert_eq!(
-            shell_exec["access_profile_behavior"],
+            shell_exec["accessProfileBehavior"],
             "full_access_skips_regular_risk_blocks"
         );
     }
@@ -240,7 +242,7 @@ mod tests {
             .find(|tool| tool["name"] == "process_launch")
             .expect("internal tool should be present when requested");
         assert_eq!(process_launch["public"], false);
-        assert_eq!(process_launch["parameters_schema"]["type"], "object");
+        assert_eq!(process_launch["parametersSchema"]["type"], "object");
     }
 
     #[tokio::test]
@@ -310,7 +312,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["status"], "succeeded");
         assert_eq!(
-            body["runtime_dependencies"][1]["workspace_id"],
+            body["runtimeDependencies"][1]["workspaceId"],
             "workspace-tools"
         );
     }

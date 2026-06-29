@@ -157,10 +157,6 @@ function normalizeRequiredBy(value: unknown): string[] {
     .map((item) => item.trim());
 }
 
-function readRecordField(record: Record<string, unknown>, camelKey: string, snakeKey: string): unknown {
-  return record[camelKey] ?? record[snakeKey];
-}
-
 function normalizeWarningMarkers(value: unknown, marker: string): string[] {
   if (!Array.isArray(value)) return [];
   return value
@@ -176,34 +172,21 @@ function normalizeBuiltinTools(value: unknown): SettingsBuiltinTool[] {
     const record = entry as Record<string, unknown>;
     const name = typeof record.name === 'string' ? record.name.trim() : '';
     if (!name) continue;
-    const riskLevel = readRecordField(record, 'riskLevel', 'risk_level');
-    const approvalRequirement = readRecordField(record, 'approvalRequirement', 'approval_requirement');
-    const effectiveApprovalPolicy = readRecordField(record, 'effectiveApprovalPolicy', 'effective_approval_policy');
-    const accessProfileBehavior = readRecordField(record, 'accessProfileBehavior', 'access_profile_behavior');
-    const accessMode = readRecordField(record, 'accessMode', 'access_mode');
-    const policyScope = readRecordField(record, 'policyScope', 'policy_scope');
-    const inputSensitivePolicy = readRecordField(record, 'inputSensitivePolicy', 'input_sensitive_policy');
-    const policySummary = readRecordField(record, 'policySummary', 'policy_summary');
-    const runtimeInternal = readRecordField(record, 'runtimeInternal', 'runtime_internal');
-    const runtimeStatus = readRecordField(record, 'runtimeStatus', 'runtime_status');
-    const runtimeWarnings = readRecordField(record, 'runtimeWarnings', 'runtime_warnings');
-    const schemaStatus = readRecordField(record, 'schemaStatus', 'schema_status');
-    const schemaWarnings = readRecordField(record, 'schemaWarnings', 'schema_warnings');
     tools.push({
       name,
-      riskLevel: typeof riskLevel === 'string' ? riskLevel : '',
-      approvalRequirement: typeof approvalRequirement === 'string' ? approvalRequirement : '',
-      effectiveApprovalPolicy: typeof effectiveApprovalPolicy === 'string' ? effectiveApprovalPolicy : 'none',
-      accessProfileBehavior: typeof accessProfileBehavior === 'string' ? accessProfileBehavior : 'restricted_allowed',
-      accessMode: typeof accessMode === 'string' ? accessMode : 'read_only',
-      policyScope: typeof policyScope === 'string' ? policyScope : 'fixed',
-      inputSensitivePolicy: inputSensitivePolicy === true,
-      policySummary: typeof policySummary === 'string' ? policySummary : '',
-      runtimeInternal: runtimeInternal === true,
-      runtimeStatus: normalizeToolRuntimeStatus(runtimeStatus),
-      runtimeWarnings: normalizeWarningMarkers(runtimeWarnings, 'runtime_warning'),
-      schemaStatus: typeof schemaStatus === 'string' ? schemaStatus : 'ok',
-      schemaWarnings: normalizeWarningMarkers(schemaWarnings, 'schema_warning'),
+      riskLevel: typeof record.riskLevel === 'string' ? record.riskLevel : '',
+      approvalRequirement: typeof record.approvalRequirement === 'string' ? record.approvalRequirement : '',
+      effectiveApprovalPolicy: typeof record.effectiveApprovalPolicy === 'string' ? record.effectiveApprovalPolicy : 'none',
+      accessProfileBehavior: typeof record.accessProfileBehavior === 'string' ? record.accessProfileBehavior : 'restricted_allowed',
+      accessMode: typeof record.accessMode === 'string' ? record.accessMode : 'read_only',
+      policyScope: typeof record.policyScope === 'string' ? record.policyScope : 'fixed',
+      inputSensitivePolicy: record.inputSensitivePolicy === true,
+      policySummary: typeof record.policySummary === 'string' ? record.policySummary : '',
+      runtimeInternal: record.runtimeInternal === true,
+      runtimeStatus: normalizeToolRuntimeStatus(record.runtimeStatus),
+      runtimeWarnings: normalizeWarningMarkers(record.runtimeWarnings, 'runtime_warning'),
+      schemaStatus: typeof record.schemaStatus === 'string' ? record.schemaStatus : 'ok',
+      schemaWarnings: normalizeWarningMarkers(record.schemaWarnings, 'schema_warning'),
       enabled: record.enabled !== false,
     });
   }
@@ -221,31 +204,24 @@ function normalizeCapabilityDependencies(value: unknown): SettingsCapabilityDepe
     const status = typeof record.status === 'string' && record.status.trim()
       ? record.status.trim()
       : 'unknown';
-    const snapshotActive = record.snapshot_active ?? record.snapshotActive;
     dependencies.push({
       name,
       status,
-      requiredBy: normalizeRequiredBy(record.required_by ?? record.requiredBy),
-      workspaceId: normalizeNullableString(record.workspace_id ?? record.workspaceId),
-      sessionId: normalizeNullableString(record.session_id ?? record.sessionId),
-      fileCount: normalizeNullableNumber(record.file_count ?? record.fileCount),
-      lastIndexed: normalizeNullableNumber(record.last_indexed ?? record.lastIndexed),
-      cacheStatus: normalizeNullableString(record.cache_status ?? record.cacheStatus),
-      roleCount: normalizeNullableNumber(record.role_count ?? record.roleCount),
-      spawnableRoleCount: normalizeNullableNumber(
-        record.spawnable_role_count ?? record.spawnableRoleCount,
-      ),
-      snapshotActive: typeof snapshotActive === 'boolean' ? snapshotActive : null,
-      configuredCount: normalizeNullableNumber(record.configured_count ?? record.configuredCount),
-      enabledCount: normalizeNullableNumber(record.enabled_count ?? record.enabledCount),
-      readyCount: normalizeNullableNumber(record.ready_count ?? record.readyCount),
-      enabledToolCount: normalizeNullableNumber(
-        record.enabled_tool_count ?? record.enabledToolCount,
-      ),
-      readyToolCount: normalizeNullableNumber(
-        record.ready_tool_count ?? record.readyToolCount,
-      ),
-      toolCount: normalizeNullableNumber(record.tool_count ?? record.toolCount),
+      requiredBy: normalizeRequiredBy(record.requiredBy),
+      workspaceId: normalizeNullableString(record.workspaceId),
+      sessionId: normalizeNullableString(record.sessionId),
+      fileCount: normalizeNullableNumber(record.fileCount),
+      lastIndexed: normalizeNullableNumber(record.lastIndexed),
+      cacheStatus: normalizeNullableString(record.cacheStatus),
+      roleCount: normalizeNullableNumber(record.roleCount),
+      spawnableRoleCount: normalizeNullableNumber(record.spawnableRoleCount),
+      snapshotActive: typeof record.snapshotActive === 'boolean' ? record.snapshotActive : null,
+      configuredCount: normalizeNullableNumber(record.configuredCount),
+      enabledCount: normalizeNullableNumber(record.enabledCount),
+      readyCount: normalizeNullableNumber(record.readyCount),
+      enabledToolCount: normalizeNullableNumber(record.enabledToolCount),
+      readyToolCount: normalizeNullableNumber(record.readyToolCount),
+      toolCount: normalizeNullableNumber(record.toolCount),
     });
   }
   return dependencies;
@@ -1359,9 +1335,7 @@ export async function loadAgentToolCatalogDiagnostics(
       : [];
     return {
       builtinTools: normalizeBuiltinTools(rawBuiltinTools),
-      capabilityDependencies: normalizeCapabilityDependencies(
-        payload.runtime_dependencies ?? payload.runtimeDependencies,
-      ),
+      capabilityDependencies: normalizeCapabilityDependencies(payload.runtimeDependencies),
     };
   } catch (error) {
     if (error instanceof TypeError) {

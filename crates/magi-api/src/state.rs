@@ -1347,6 +1347,15 @@ impl ApiState {
         Ok(registry.tool_catalog_value(input, tool_context))
     }
 
+    pub(crate) fn public_tool_catalog_json(
+        &self,
+        input: &str,
+        tool_context: &ToolExecutionContext,
+    ) -> Result<serde_json::Value, ApiError> {
+        self.tool_catalog_json(input, tool_context)
+            .map(|catalog| public_tool_catalog_response_json(&catalog))
+    }
+
     fn builtin_tools_json(&self, tool_catalog: &serde_json::Value) -> serde_json::Value {
         if tool_catalog.is_null() {
             return serde_json::Value::Array(Vec::new());
@@ -1761,22 +1770,131 @@ fn normalize_capability_dependency_json(raw: &serde_json::Value) -> serde_json::
     serde_json::json!({
         "name": raw.get("name").cloned().unwrap_or(serde_json::Value::Null),
         "status": raw.get("status").cloned().unwrap_or(serde_json::Value::String("unknown".to_string())),
-        "requiredBy": capability_dependency_field(raw, "requiredBy", "required_by")
+        "requiredBy": capability_dependency_field(raw, "required_by")
             .unwrap_or_else(|| serde_json::json!([])),
-        "workspaceId": capability_dependency_field(raw, "workspaceId", "workspace_id"),
-        "sessionId": capability_dependency_field(raw, "sessionId", "session_id"),
-        "fileCount": capability_dependency_field(raw, "fileCount", "file_count"),
-        "lastIndexed": capability_dependency_field(raw, "lastIndexed", "last_indexed"),
-        "cacheStatus": capability_dependency_field(raw, "cacheStatus", "cache_status"),
-        "roleCount": capability_dependency_field(raw, "roleCount", "role_count"),
-        "spawnableRoleCount": capability_dependency_field(raw, "spawnableRoleCount", "spawnable_role_count"),
-        "snapshotActive": capability_dependency_field(raw, "snapshotActive", "snapshot_active"),
-        "configuredCount": capability_dependency_field(raw, "configuredCount", "configured_count"),
-        "enabledCount": capability_dependency_field(raw, "enabledCount", "enabled_count"),
-        "readyCount": capability_dependency_field(raw, "readyCount", "ready_count"),
-        "enabledToolCount": capability_dependency_field(raw, "enabledToolCount", "enabled_tool_count"),
-        "readyToolCount": capability_dependency_field(raw, "readyToolCount", "ready_tool_count"),
-        "toolCount": capability_dependency_field(raw, "toolCount", "tool_count"),
+        "workspaceId": capability_dependency_field(raw, "workspace_id"),
+        "sessionId": capability_dependency_field(raw, "session_id"),
+        "fileCount": capability_dependency_field(raw, "file_count"),
+        "lastIndexed": capability_dependency_field(raw, "last_indexed"),
+        "cacheStatus": capability_dependency_field(raw, "cache_status"),
+        "roleCount": capability_dependency_field(raw, "role_count"),
+        "spawnableRoleCount": capability_dependency_field(raw, "spawnable_role_count"),
+        "snapshotActive": capability_dependency_field(raw, "snapshot_active"),
+        "configuredCount": capability_dependency_field(raw, "configured_count"),
+        "enabledCount": capability_dependency_field(raw, "enabled_count"),
+        "readyCount": capability_dependency_field(raw, "ready_count"),
+        "enabledToolCount": capability_dependency_field(raw, "enabled_tool_count"),
+        "readyToolCount": capability_dependency_field(raw, "ready_tool_count"),
+        "toolCount": capability_dependency_field(raw, "tool_count"),
+    })
+}
+
+fn normalize_public_tool_catalog_item_json(raw: &serde_json::Value) -> serde_json::Value {
+    let mut item = serde_json::json!({
+        "name": raw.get("name").cloned().unwrap_or(serde_json::Value::Null),
+        "category": raw.get("category").cloned().unwrap_or(serde_json::Value::Null),
+        "public": raw.get("public").cloned().unwrap_or(serde_json::Value::Bool(false)),
+        "runtimeInternal": raw.get("runtime_internal").cloned().unwrap_or(serde_json::Value::Bool(false)),
+        "accessMode": raw.get("access_mode").cloned().unwrap_or(serde_json::Value::String("read_only".to_string())),
+        "policyScope": raw.get("policy_scope").cloned().unwrap_or(serde_json::Value::String("fixed".to_string())),
+        "inputSensitivePolicy": raw.get("input_sensitive_policy").cloned().unwrap_or(serde_json::Value::Bool(false)),
+        "policySummary": raw.get("policy_summary").cloned().unwrap_or(serde_json::Value::String("使用工具默认风险策略".to_string())),
+        "riskLevel": raw.get("risk_level").cloned().unwrap_or(serde_json::Value::String("low".to_string())),
+        "approvalRequirement": raw.get("approval_requirement").cloned().unwrap_or(serde_json::Value::String("none".to_string())),
+        "effectiveApprovalPolicy": raw.get("effective_approval_policy").cloned().unwrap_or(serde_json::Value::String("none".to_string())),
+        "accessProfileBehavior": raw.get("access_profile_behavior").cloned().unwrap_or(serde_json::Value::String("restricted_allowed".to_string())),
+        "schemaStatus": raw.get("schema_status").cloned().unwrap_or(serde_json::Value::String("ok".to_string())),
+        "schemaWarnings": raw.get("schema_warnings").cloned().unwrap_or_else(|| serde_json::json!([])),
+        "runtimeStatus": normalize_tool_runtime_status(raw.get("runtime_status")),
+        "runtimeWarnings": raw.get("runtime_warnings").cloned().unwrap_or_else(|| serde_json::json!([])),
+    });
+    if let Some(schema) = raw.get("parameters_schema") {
+        item["parametersSchema"] = schema.clone();
+    }
+    item
+}
+
+fn normalize_public_skill_tool_json(raw: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "source": raw.get("source").cloned().unwrap_or(serde_json::Value::Null),
+        "skillId": raw.get("skill_id").cloned().unwrap_or(serde_json::Value::Null),
+        "bindingId": raw.get("binding_id").cloned().unwrap_or(serde_json::Value::Null),
+        "name": raw.get("name").cloned().unwrap_or(serde_json::Value::Null),
+        "description": raw.get("description").cloned().unwrap_or(serde_json::Value::String(String::new())),
+        "bridgeKind": raw.get("bridge_kind").cloned().unwrap_or(serde_json::Value::String(String::new())),
+        "dispatchAction": raw.get("dispatch_action").cloned().unwrap_or(serde_json::Value::String(String::new())),
+        "bridgeTarget": raw.get("bridge_target").cloned().unwrap_or(serde_json::Value::String(String::new())),
+        "accessProfileBehavior": raw.get("access_profile_behavior").cloned().unwrap_or(serde_json::Value::String("restricted_allowed".to_string())),
+        "riskLevel": raw.get("risk_level").cloned().unwrap_or(serde_json::Value::String("low".to_string())),
+        "approvalRequirement": raw.get("approval_requirement").cloned().unwrap_or(serde_json::Value::String("none".to_string())),
+        "status": raw.get("status").cloned().unwrap_or(serde_json::Value::String("unavailable".to_string())),
+    })
+}
+
+fn normalize_public_mcp_server_catalog_json(raw: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "serverId": raw.get("server_id").cloned().unwrap_or(serde_json::Value::Null),
+        "name": raw.get("name").cloned().unwrap_or(serde_json::Value::Null),
+        "enabled": raw.get("enabled").cloned().unwrap_or(serde_json::Value::Bool(false)),
+        "connected": raw.get("connected").cloned().unwrap_or(serde_json::Value::Bool(false)),
+        "health": raw.get("health").cloned().unwrap_or(serde_json::Value::String("unknown".to_string())),
+        "toolCount": raw.get("tool_count").cloned().unwrap_or(serde_json::Value::Null),
+        "error": raw.get("error").cloned().unwrap_or(serde_json::Value::Null),
+    })
+}
+
+fn normalize_public_agent_role_catalog_json(raw: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "roleId": raw.get("role_id").cloned().unwrap_or(serde_json::Value::Null),
+        "spawnable": raw.get("spawnable").cloned().unwrap_or(serde_json::Value::Bool(false)),
+        "coordinatorMode": raw.get("coordinator_mode").cloned().unwrap_or(serde_json::Value::Bool(false)),
+        "supportedKinds": raw.get("supported_kinds").cloned().unwrap_or_else(|| serde_json::json!([])),
+        "parallelismLimit": raw.get("parallelism_limit").cloned().unwrap_or(serde_json::Value::Null),
+        "status": raw.get("status").cloned().unwrap_or(serde_json::Value::String("unknown".to_string())),
+    })
+}
+
+fn public_tool_catalog_array(
+    raw: &serde_json::Value,
+    source_key: &str,
+    item_mapper: fn(&serde_json::Value) -> serde_json::Value,
+) -> serde_json::Value {
+    let items = raw
+        .get(source_key)
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(item_mapper)
+        .collect::<Vec<_>>();
+    serde_json::Value::Array(items)
+}
+
+fn public_tool_catalog_response_json(raw: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "tool": raw.get("tool").cloned().unwrap_or(serde_json::Value::String("tool_catalog".to_string())),
+        "status": raw.get("status").cloned().unwrap_or(serde_json::Value::String("succeeded".to_string())),
+        "catalogAccessMode": raw.get("catalog_access_mode").cloned().unwrap_or(serde_json::Value::String("read_only".to_string())),
+        "currentAccessProfile": raw.get("current_access_profile").cloned().unwrap_or(serde_json::Value::String("restricted".to_string())),
+        "approvalPolicySummary": raw.get("approval_policy_summary").cloned().unwrap_or(serde_json::Value::String(String::new())),
+        "summary": raw.get("summary").cloned().unwrap_or(serde_json::Value::String(String::new())),
+        "total": raw.get("total").cloned().unwrap_or(serde_json::Value::Number(0.into())),
+        "builtinTotal": raw.get("builtin_total").cloned().unwrap_or(serde_json::Value::Number(0.into())),
+        "publicCount": raw.get("public_count").cloned().unwrap_or(serde_json::Value::Number(0.into())),
+        "internalCount": raw.get("internal_count").cloned().unwrap_or(serde_json::Value::Number(0.into())),
+        "schemaWarningCount": raw.get("schema_warning_count").cloned().unwrap_or(serde_json::Value::Number(0.into())),
+        "runtimeWarningCount": raw.get("runtime_warning_count").cloned().unwrap_or(serde_json::Value::Number(0.into())),
+        "runtimeDependencies": public_tool_catalog_array(raw, "runtime_dependencies", normalize_capability_dependency_json),
+        "externalCatalogStatus": raw.get("external_catalog_status").cloned().unwrap_or(serde_json::Value::String("unavailable".to_string())),
+        "skillToolCount": raw.get("skill_tool_count").cloned().unwrap_or(serde_json::Value::Number(0.into())),
+        "mcpServerCount": raw.get("mcp_server_count").cloned().unwrap_or(serde_json::Value::Number(0.into())),
+        "connectedMcpServerCount": raw.get("connected_mcp_server_count").cloned().unwrap_or(serde_json::Value::Number(0.into())),
+        "agentRoleCatalogStatus": raw.get("agent_role_catalog_status").cloned().unwrap_or(serde_json::Value::String("unavailable".to_string())),
+        "agentRoleCount": raw.get("agent_role_count").cloned().unwrap_or(serde_json::Value::Number(0.into())),
+        "spawnableAgentRoleCount": raw.get("spawnable_agent_role_count").cloned().unwrap_or(serde_json::Value::Number(0.into())),
+        "tools": public_tool_catalog_array(raw, "tools", normalize_public_tool_catalog_item_json),
+        "skillTools": public_tool_catalog_array(raw, "skill_tools", normalize_public_skill_tool_json),
+        "mcpServers": public_tool_catalog_array(raw, "mcp_servers", normalize_public_mcp_server_catalog_json),
+        "agentRoles": public_tool_catalog_array(raw, "agent_roles", normalize_public_agent_role_catalog_json),
     })
 }
 
@@ -1817,13 +1935,9 @@ fn normalize_tool_runtime_status(value: Option<&serde_json::Value>) -> serde_jso
 
 fn capability_dependency_field(
     raw: &serde_json::Value,
-    camel_key: &str,
     snake_key: &str,
 ) -> Option<serde_json::Value> {
-    raw.get(camel_key)
-        .or_else(|| raw.get(snake_key))
-        .cloned()
-        .filter(|value| !value.is_null())
+    raw.get(snake_key).cloned().filter(|value| !value.is_null())
 }
 
 fn object_section(snapshot: &HashMap<String, serde_json::Value>, key: &str) -> serde_json::Value {
@@ -2742,5 +2856,101 @@ mod tests {
             serde_json::json!(0),
             "toolCount must remain the ready/usable tool count in settings bootstrap"
         );
+    }
+
+    #[test]
+    fn public_tool_catalog_response_uses_camel_case_boundary() {
+        let raw = serde_json::json!({
+            "tool": "tool_catalog",
+            "status": "succeeded",
+            "catalog_access_mode": "read_only",
+            "current_access_profile": "full_access",
+            "runtime_dependencies": [{
+                "name": "mcp_servers",
+                "status": "ready",
+                "required_by": ["mcp custom tools"],
+                "enabled_tool_count": 2,
+                "tool_count": 2
+            }],
+            "tools": [{
+                "name": "shell_exec",
+                "category": "builtin",
+                "public": true,
+                "runtime_internal": false,
+                "access_mode": "explicit_write",
+                "policy_scope": "input_sensitive",
+                "input_sensitive_policy": true,
+                "policy_summary": "summary",
+                "risk_level": "high",
+                "approval_requirement": "required",
+                "effective_approval_policy": "none",
+                "access_profile_behavior": "full_access_allowed",
+                "schema_status": "ok",
+                "schema_warnings": [],
+                "runtime_status": "ready",
+                "runtime_warnings": [],
+                "parameters_schema": {"type": "object", "properties": {"old_string": {"type": "string"}}}
+            }],
+            "skill_tools": [{
+                "source": "skill",
+                "skill_id": "skill-1",
+                "binding_id": "binding-1",
+                "name": "skill.tool",
+                "description": "tool",
+                "bridge_kind": "skill",
+                "dispatch_action": "run",
+                "bridge_target": "skill-1",
+                "access_profile_behavior": "restricted_allowed",
+                "risk_level": "low",
+                "approval_requirement": "none",
+                "status": "available"
+            }],
+            "mcp_servers": [{
+                "server_id": "mcp-1",
+                "name": "mcp",
+                "enabled": true,
+                "connected": true,
+                "health": "connected",
+                "tool_count": 3,
+                "error": null
+            }],
+            "agent_roles": [{
+                "role_id": "executor",
+                "spawnable": true,
+                "coordinator_mode": false,
+                "supported_kinds": ["local_agent"],
+                "parallelism_limit": 2,
+                "status": "ready"
+            }]
+        });
+
+        let public = public_tool_catalog_response_json(&raw);
+
+        assert!(public.get("runtime_dependencies").is_none());
+        assert!(public.get("catalog_access_mode").is_none());
+        assert_eq!(public["catalogAccessMode"], serde_json::json!("read_only"));
+        assert_eq!(
+            public["currentAccessProfile"],
+            serde_json::json!("full_access")
+        );
+        assert_eq!(
+            public["runtimeDependencies"][0]["requiredBy"][0],
+            "mcp custom tools"
+        );
+        assert_eq!(public["runtimeDependencies"][0]["enabledToolCount"], 2);
+        assert_eq!(public["tools"][0]["effectiveApprovalPolicy"], "none");
+        assert_eq!(
+            public["tools"][0]["parametersSchema"]["properties"]["old_string"]["type"],
+            "string"
+        );
+        assert_eq!(public["skillTools"][0]["skillId"], "skill-1");
+        assert_eq!(
+            public["skillTools"][0]["accessProfileBehavior"],
+            "restricted_allowed"
+        );
+        assert_eq!(public["mcpServers"][0]["serverId"], "mcp-1");
+        assert_eq!(public["mcpServers"][0]["toolCount"], 3);
+        assert_eq!(public["agentRoles"][0]["roleId"], "executor");
+        assert_eq!(public["agentRoles"][0]["parallelismLimit"], 2);
     }
 }
