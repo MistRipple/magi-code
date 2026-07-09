@@ -25,6 +25,42 @@ function publishProjection(): SessionTimelineProjection | null {
   return turnStoreState.projection;
 }
 
+function remapSourceThreadId(value: string, previousSessionId: string, nextSessionId: string): string {
+  if (!value) {
+    return value;
+  }
+  return value.includes(previousSessionId) ? value.replaceAll(previousSessionId, nextSessionId) : value;
+}
+
+export function rebindCanonicalSessionTurns(
+  previousSessionId: string,
+  nextSessionId: string,
+): SessionTimelineProjection | null {
+  const previous = normalizeSessionId(previousSessionId);
+  const next = normalizeSessionId(nextSessionId);
+  if (!previous || !next || previous === next) {
+    return turnStoreState.projection;
+  }
+  if (turnStoreState.reducer.sessionId !== previous) {
+    return turnStoreState.projection;
+  }
+  turnStoreState.reducer = {
+    ...turnStoreState.reducer,
+    sessionId: next,
+    turns: turnStoreState.reducer.turns.map((turn) => ({
+      ...turn,
+      sessionId: next,
+      items: turn.items.map((item) => ({
+        ...item,
+        sessionId: next,
+        sourceThreadId: remapSourceThreadId(item.sourceThreadId, previous, next),
+      })),
+    })),
+  };
+  turnStoreState.lastError = null;
+  return publishProjection();
+}
+
 export function applyCanonicalTurnEvent(event: CanonicalTurnEvent): SessionTimelineProjection | null {
   const result = reduceCanonicalTurnEvent(turnStoreState.reducer, event);
   if (result.error) {

@@ -36,6 +36,7 @@ export interface SessionTurnRequestDto {
   skillName?: string | null;
   images: SessionTurnImageDto[];
   accessProfile?: 'read_only' | 'restricted' | 'full_access' | null;
+  orchestratorSessionConfig?: Record<string, unknown> | null;
   requestId?: string | null;
   userMessageId?: string | null;
   placeholderMessageId?: string | null;
@@ -1365,6 +1366,35 @@ export interface TaskDto {
   updated_at: number;
 }
 
+export interface AgentProjectionResultDto {
+  finalText: string;
+  outputRefCount: number;
+  truncated: boolean;
+}
+
+export interface AgentProjectionDto {
+  taskId: string;
+  parentTaskId: string;
+  rootTaskId: string;
+  displayName: string;
+  goal: string;
+  role: string;
+  engineId?: string | null;
+  model?: string | null;
+  modelSource: 'engine' | 'inherited_orchestrator' | 'unconfigured' | string;
+  status: TaskStatus;
+  statusLabel: string;
+  lifecycle: 'queued' | 'running' | 'completed' | 'failed' | 'killed' | 'degraded' | string;
+  accessMode: 'read_only' | 'restricted' | 'full_access' | string;
+  parallelismGroup?: string | null;
+  workerId?: string | null;
+  threadId?: string | null;
+  executionChainRef?: string | null;
+  startedAt: number;
+  updatedAt: number;
+  result?: AgentProjectionResultDto | null;
+}
+
 export interface ProgressSummaryDto {
   total_tasks: number;
   pending_tasks: number;
@@ -1395,6 +1425,7 @@ export interface TaskProjectionDto {
   runner_status: 'pending' | 'idle' | 'running' | 'completed' | 'error' | 'killed';
   has_recoverable_chain: boolean;
   recoverable_branch_count: number;
+  agents: AgentProjectionDto[];
 }
 
 export interface SessionTaskHistoryItemDto {

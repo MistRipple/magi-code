@@ -129,7 +129,8 @@ fn redact_prefixed_tokens(value: &str) -> String {
             .find(|(_, ch)| !is_token_char(*ch))
             .map(|(idx, _)| start + idx)
             .unwrap_or(value.len());
-        if token_end > start + 3 {
+        let token_body_len = token_end.saturating_sub(start + 3);
+        if token_body_len >= 8 && is_token_start_boundary(value, start) {
             redacted.push_str("sk-");
             redacted.push_str(PUBLIC_REDACTED_VALUE);
             index = token_end;
@@ -140,6 +141,16 @@ fn redact_prefixed_tokens(value: &str) -> String {
     }
     redacted.push_str(&value[index..]);
     redacted
+}
+
+fn is_token_start_boundary(value: &str, start: usize) -> bool {
+    if start == 0 {
+        return true;
+    }
+    value[..start]
+        .chars()
+        .next_back()
+        .map_or(true, |ch| !is_token_char(ch))
 }
 
 fn redact_absolute_paths(value: &str) -> String {
@@ -232,6 +243,18 @@ mod tests {
         assert!(!public.contains("hidden"));
         assert!(!public.contains("raw-key"));
         assert!(!public.contains("raw-private"));
+    }
+
+    #[test]
+    fn public_runtime_text_preserves_task_ids_with_task_spawn_prefix() {
+        let public = public_runtime_text(
+            r#"{"child_task_id":"task-spawn-task-local-agent-1783524657851-1783524669760-0","worker_id":"worker-spawn-task-local-agent-1783524657851"}"#,
+        );
+
+        assert!(public.contains("task-spawn-task-local-agent-1783524657851-1783524669760-0"));
+        assert!(public.contains("worker-spawn-task-local-agent-1783524657851"));
+        assert!(!public.contains("task-[redacted]"));
+        assert!(!public.contains("worker-spawn-task-[redacted]"));
     }
 
     #[test]

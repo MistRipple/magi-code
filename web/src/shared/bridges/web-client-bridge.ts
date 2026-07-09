@@ -131,9 +131,11 @@ import {
   messagesState,
   allocateTurnOrderSeq,
   addPendingRequest,
+  adoptAcceptedSessionIdForLocalTurn,
   clearRequestBinding,
   createRequestBinding,
   markMessageActive,
+  setCurrentSessionId,
   setQueuedMessages,
   updateRequestBinding,
 } from '../../stores/messages.svelte';
@@ -154,6 +156,12 @@ const QUEUE_DRAIN_DELAY_MS = 120;
 const QUEUE_DRAIN_BUSY_RETRY_MS = 1000;
 let queueDrainTimer: ReturnType<typeof setTimeout> | null = null;
 let queueDrainActive = false;
+
+function localOptimisticSessionIdForRequest(requestId: string): string {
+  const safeRequestId = requestId.replace(/[^A-Za-z0-9_-]/g, '-');
+  return `session-local-${safeRequestId}`;
+}
+
 /** 传输层维护的 SSE 连接句柄（统一管理 Web EventSource 和宿主代理两种模式） */
 let activeSseConnection: SseConnection | null = null;
 let activeEventStreamKey = '';
@@ -419,6 +427,7 @@ type BridgeRequestScope = {
   sessionId?: string;
   workspaceId?: string;
   workspacePath?: string;
+  knowledgeRequestId?: string;
 };
 
 function requestScopeFromMessage(
@@ -2449,6 +2458,7 @@ async function dispatchProjectKnowledge(scope: BridgeRequestScope = {}): Promise
   const requestWorkspaceScope = resolveWorkspaceScopeFromSource(scope);
   const requestWorkspaceId = requestWorkspaceScope.workspaceId;
   const requestWorkspacePath = requestWorkspaceScope.workspacePath;
+  const knowledgeRequestId = trimBridgeString(scope.knowledgeRequestId);
   const payload = await getAgentProjectKnowledge({
     workspaceId: requestWorkspaceId,
     workspacePath: requestWorkspacePath,
@@ -2462,6 +2472,7 @@ async function dispatchProjectKnowledge(scope: BridgeRequestScope = {}): Promise
     : requestWorkspacePath;
   emitDataMessage('projectKnowledgeLoaded', {
     ...payload,
+    ...(knowledgeRequestId ? { knowledgeRequestId } : {}),
     workspaceId: responseWorkspaceId,
     workspacePath: responseWorkspacePath,
   });
@@ -2696,6 +2707,7 @@ interface ExecuteTaskInput {
   requestId?: string;
   skillName?: string | null;
   accessProfile?: 'read_only' | 'restricted' | 'full_access' | null;
+  orchestratorSessionConfig?: Record<string, unknown> | null;
   followUpMode?: 'queue';
   images: Array<{
     name: string;
@@ -2832,6 +2844,8 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
   const placeholderMessageId = `assistant-placeholder-${requestId}`;
   const turnOrderSeq = allocateTurnOrderSeq();
   const requestCreatedAt = Date.now();
+  const optimisticSessionId = targetSessionId || localOptimisticSessionIdForRequest(requestId);
+  const usesLocalOptimisticSession = !targetSessionId;
 
   createRequestBinding({
     requestId,
@@ -2848,20 +2862,21 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
     startedAt: requestCreatedAt,
     pendingRequestIds: [requestId],
   });
-  if (!isQueuedDrainSubmission) {
-    addPendingRequest(requestId);
-    markMessageActive(placeholderMessageId);
-    emitLocalPendingCanonicalTurn({
-      sessionId: targetSessionId,
-      requestId,
-      userMessageId,
-      placeholderMessageId,
-      text: normalizedText,
-      images,
-      turnSeq: turnOrderSeq,
-      createdAt: requestCreatedAt,
-    });
+  addPendingRequest(requestId, { resetAntiLiftBack: true });
+  markMessageActive(placeholderMessageId);
+  if (usesLocalOptimisticSession) {
+    setCurrentSessionId(optimisticSessionId);
   }
+  emitLocalPendingCanonicalTurn({
+    sessionId: optimisticSessionId,
+    requestId,
+    userMessageId,
+    placeholderMessageId,
+    text: normalizedText,
+    images,
+    turnSeq: turnOrderSeq,
+    createdAt: requestCreatedAt,
+  });
 
   try {
     if (
@@ -2884,6 +2899,7 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
       skillName,
       images,
       accessProfile: input.accessProfile ?? null,
+      orchestratorSessionConfig: input.orchestratorSessionConfig ?? null,
       requestId,
       userMessageId,
       placeholderMessageId,
@@ -2896,6 +2912,9 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
     const resolvedSessionId = typeof turnResult.sessionId === 'string' && turnResult.sessionId.trim()
       ? turnResult.sessionId.trim()
       : targetSessionId;
+    if (usesLocalOptimisticSession && resolvedSessionId) {
+      adoptAcceptedSessionIdForLocalTurn(optimisticSessionId, resolvedSessionId);
+    }
     if (resolvedSessionId) {
       persistWorkspaceBinding(targetWorkspaceId, targetWorkspacePath, resolvedSessionId);
     }
@@ -2910,10 +2929,6 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
       placeholderMessageId,
       ...(typeof canonicalTurnSeq === 'number' ? { turnSeq: canonicalTurnSeq } : {}),
     });
-    if (isQueuedDrainSubmission) {
-      addPendingRequest(requestId);
-      markMessageActive(placeholderMessageId);
-    }
     if (turnResult.createdSession && resolvedSessionId) {
       void fetchBootstrap({ forceFresh: true }).catch((error) => {
         reportExpectedRecoveryFailure(
@@ -2951,20 +2966,18 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
     clearCurrentInterruptTaskId();
     console.error('[web-client-bridge] 执行任务失败:', error);
     const errorText = i18n.t('bridge.detail.messageSendFailed');
-    if (!isQueuedDrainSubmission) {
-      emitLocalPendingCanonicalTurnFailed({
-        sessionId: targetSessionId,
-        requestId,
-        userMessageId,
-        placeholderMessageId,
-        text: normalizedText,
-        images,
-        turnSeq: turnOrderSeq,
-        createdAt: requestCreatedAt,
-        failedAt: Date.now(),
-        error: errorText,
-      });
-    }
+    emitLocalPendingCanonicalTurnFailed({
+      sessionId: optimisticSessionId,
+      requestId,
+      userMessageId,
+      placeholderMessageId,
+      text: normalizedText,
+      images,
+      turnSeq: turnOrderSeq,
+      createdAt: requestCreatedAt,
+      failedAt: Date.now(),
+      error: errorText,
+    });
     clearRequestBinding(requestId);
     emitBridgeErrorToast(i18n.t('bridge.action.sendMessage'), error);
     emitForcedProcessingIdle('execute_task_failed', {
@@ -2975,7 +2988,7 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
       closeEventStream();
       scheduleRecovery('execute_task_failed', error, true);
     }
-    return false;
+    return !isQueuedDrainSubmission ? false : true;
   }
 }
 
@@ -4038,6 +4051,11 @@ export function createWebClientBridge(): ClientBridge {
                 || message.accessProfile === 'full_access'
                 ? message.accessProfile
                 : null,
+              orchestratorSessionConfig: message.orchestratorSessionConfig
+                && typeof message.orchestratorSessionConfig === 'object'
+                && !Array.isArray(message.orchestratorSessionConfig)
+                ? message.orchestratorSessionConfig as Record<string, unknown>
+                : null,
               followUpMode: message.followUpMode === 'queue' ? 'queue' : undefined,
               images: Array.isArray(message.images)
                 ? message.images as Array<{ name: string; dataUrl: string }>
@@ -4257,7 +4275,10 @@ export function createWebClientBridge(): ClientBridge {
           }
           return;
         case 'getProjectKnowledge':
-          void dispatchProjectKnowledge(requestScopeFromMessage(message, '')).catch((error) => {
+          void dispatchProjectKnowledge({
+            ...requestScopeFromMessage(message, ''),
+            knowledgeRequestId: trimBridgeString(message.knowledgeRequestId),
+          }).catch((error) => {
             logKnowledgeOperationFailure(
               i18n.t('settings.toast.action.loadProjectKnowledge'),
               '[web-client-bridge] 项目知识加载失败:',

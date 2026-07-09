@@ -37,7 +37,26 @@ const IGNORE_PATTERNS: &[&str] = &[
     ".windsurf",
     ".mcp",
     ".mcp.json",
+    ".venv",
+    "venv",
+    "env",
+    "vendor",
+    "third_party",
+    "external",
+    "deps",
+    "managed_components",
+    ".gradle",
+    ".dart_tool",
+    ".terraform",
+    "DerivedData",
+    "Pods",
 ];
+
+/// 单文件超过该阈值时跳过代码索引。
+///
+/// 知识库概览需要的是项目源码结构，不应因为锁文件、生成产物或供应商源码中的
+/// 巨型 JSON/Markdown/YAML 文件拖住整个 UI 加载。
+const MAX_INDEXED_FILE_BYTES: u64 = 1_048_576;
 
 /// 入口文件检测模式
 const ENTRY_PATTERNS: &[&str] = &[
@@ -366,13 +385,23 @@ fn scan_directory(root: &Path, current: &Path, files: &mut Vec<ScannedFile>) {
             continue;
         }
 
-        if path.is_dir() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
+
+        if file_type.is_dir() {
             scan_directory(root, &path, files);
-        } else if path.is_file() {
+        } else if file_type.is_file() {
             if let Some(relative) = pathdiff::diff_paths(&path, root) {
                 let rel_str = relative.to_string_lossy().replace('\\', "/");
                 if is_indexable_code_path(&rel_str) {
                     if let Ok(metadata) = std::fs::metadata(&path) {
+                        if metadata.len() > MAX_INDEXED_FILE_BYTES {
+                            continue;
+                        }
                         let size = metadata.len();
                         let lines = count_lines(&path);
                         let language = detect_language(&rel_str);
@@ -396,6 +425,9 @@ fn scan_relative_file(root: &Path, relative_path: &str) -> Option<ScannedFile> {
     let path = root.join(relative_path);
     let metadata = std::fs::metadata(&path).ok()?;
     if !metadata.is_file() {
+        return None;
+    }
+    if metadata.len() > MAX_INDEXED_FILE_BYTES {
         return None;
     }
     Some(ScannedFile {
@@ -632,6 +664,17 @@ mod tests {
             ".windsurf/workflows/task.md",
             ".mcp/server.json",
             ".mcp.json",
+            ".venv/lib/python/site-packages/pkg/module.py",
+            "vendor/reference/server.py",
+            "third_party/library/index.ts",
+            "external/sdk/client.ts",
+            "deps/generated/bindings.h",
+            "firmware/managed_components/component/include/api.h",
+            ".gradle/cache/build.gradle",
+            ".dart_tool/package_config.json",
+            ".terraform/modules/main.tf.json",
+            "DerivedData/Build/Products/app.json",
+            "Pods/AFNetworking/AFNetworking.h",
         ] {
             assert!(!is_indexable_code_path(path), "{path} 不应进入项目代码索引");
         }
@@ -696,6 +739,46 @@ mod tests {
             Some(CodeIndexScanReasonCode::NoIndexableFiles)
         );
         assert!(outcome.summary.is_none());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn scan_workspace_excludes_dependency_vendor_and_large_files() {
+        let root = temp_workspace("magi-code-index-ignore-dependencies");
+        fs::create_dir_all(root.join("src")).expect("src should create");
+        fs::write(root.join("src/main.py"), "print('product')\n").expect("source should write");
+
+        for path in [
+            ".venv/lib/python/site-packages/pkg/module.py",
+            "vendor/reference/server.py",
+            "third_party/library/index.ts",
+            "external/sdk/client.ts",
+            "deps/generated/bindings.h",
+            "firmware/managed_components/component/include/api.h",
+            "Pods/AFNetworking/AFNetworking.h",
+        ] {
+            let absolute = root.join(path);
+            if let Some(parent) = absolute.parent() {
+                fs::create_dir_all(parent).expect("dependency parent should create");
+            }
+            fs::write(&absolute, "dependency code\n").expect("dependency should write");
+        }
+        fs::write(
+            root.join("src/huge.json"),
+            "x".repeat((MAX_INDEXED_FILE_BYTES + 1) as usize),
+        )
+        .expect("large file should write");
+
+        let outcome = scan_workspace(&root);
+        let summary = outcome.summary.expect("workspace should be indexed");
+        let paths = summary
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(paths, vec!["src/main.py"]);
 
         let _ = fs::remove_dir_all(root);
     }

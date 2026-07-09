@@ -7,10 +7,7 @@ use magi_bridge_client::{
     BridgeClientError, BridgeErrorLayer, HttpModelBridgeProtocol, ModelBridgeClient,
     ModelInvocationRequest,
 };
-use magi_conversation_runtime::task_execution_dispatcher::{
-    merge_orchestrator_session_override, strip_orchestrator_session_owned_fields,
-};
-use magi_core::{AccessProfile, UtcMillis};
+use magi_core::{AccessProfile, SessionId, UtcMillis};
 use magi_usage_authority::{
     SessionSummary, UsageAuthority, UsageCallRecordInput, UsageModelSnapshot, UsageTotals,
 };
@@ -23,7 +20,10 @@ use std::str::FromStr;
 use super::session_scope;
 use crate::{
     errors::ApiError,
-    model_config::{NormalizedModelConfig, reject_deprecated_model_config_fields},
+    model_config::{
+        NormalizedModelConfig, merge_orchestrator_session_override,
+        reject_deprecated_model_config_fields, strip_orchestrator_session_owned_fields,
+    },
     scope_binding::without_scope_binding_fields,
     state::ApiState,
 };
@@ -69,7 +69,9 @@ fn orchestrator_connection_section_request(
     Ok(config)
 }
 
-fn orchestrator_session_override_request(request: &serde_json::Value) -> Result<Value, ApiError> {
+pub(super) fn orchestrator_session_override_request(
+    request: &serde_json::Value,
+) -> Result<Value, ApiError> {
     let config = unwrap_settings_section_request(request)?;
     reject_deprecated_model_config_fields(&config).map_err(ApiError::InvalidInput)?;
     let Some(config) = config.as_object() else {
@@ -108,6 +110,38 @@ fn orchestrator_session_override_request(request: &serde_json::Value) -> Result<
         }
     }
     Ok(Value::Object(override_config))
+}
+
+pub(super) fn save_orchestrator_session_override_for_session(
+    state: &ApiState,
+    session_id: &SessionId,
+    config: &Value,
+) -> Result<Option<Value>, ApiError> {
+    let request = json!({ "config": config });
+    let override_config = orchestrator_session_override_request(&request)?;
+    let Some(override_fields) = override_config.as_object() else {
+        return Ok(None);
+    };
+    if override_fields.is_empty() {
+        return Ok(None);
+    }
+
+    let mut next_config = state
+        .settings_store
+        .get_session_section(session_id, "orchestrator");
+    if !next_config.is_object() {
+        next_config = json!({});
+    }
+    let next_fields = next_config
+        .as_object_mut()
+        .expect("session orchestrator config should be object");
+    for (key, value) in override_fields {
+        next_fields.insert(key.clone(), value.clone());
+    }
+    state
+        .settings_store
+        .set_session_section(session_id, "orchestrator", next_config.clone());
+    Ok(Some(next_config))
 }
 
 fn parse_optional_query_string(query: &HashMap<String, String>, key: &str) -> Option<String> {

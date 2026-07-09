@@ -6,10 +6,14 @@ use crate::{
     ConversationRegistry, SKILL_APPLY_TOOL_NAME, active_skill_tool_execution_policy,
     build_skill_custom_tool_definitions,
     conversation_loop::{self, ConversationLoopRequest},
-    model_config::{NormalizedModelConfig, configured_role_engine_model_config},
+    model_config::{
+        NormalizedModelConfig, configured_role_engine_model_config,
+        resolve_orchestrator_model_config,
+    },
     prompt_utils::{
         CURRENT_TASK_PRIORITY_NOTE, REFERENCE_CONTEXT_PRIORITY_NOTE, SKILL_PROMPT_PRIORITY_NOTE,
-        prepend_session_instructions,
+        prepend_session_instructions, root_multi_agent_mode_prompt,
+        subagent_multi_agent_mode_prompt,
     },
     public_builtin_tool_definitions,
     session_images::SessionTurnImage,
@@ -21,7 +25,9 @@ use crate::{
     session_writeback::SessionStatePersistCallback,
     skill_apply_tool_definition,
     task_execution_registry::{TaskExecutionPlan, TaskExecutionRegistry},
-    task_helpers::{task_can_see_builtin_tool, task_is_long_mission, task_role_id},
+    task_helpers::{
+        task_can_see_builtin_tool, task_is_coordinator, task_is_long_mission, task_role_id,
+    },
     task_runner_bridge::{EventBasedResultReceiver, TaskDispatcher, TaskOutcome, TaskResult},
     usage_recording::{ModelUsageBinding, model_usage_binding_for_worker_with_settings},
 };
@@ -228,71 +234,10 @@ fn build_orchestrator_client(
     settings_store: &Arc<SettingsStore>,
     session_id: Option<&SessionId>,
 ) -> Result<Option<Arc<dyn ModelBridgeClient>>, String> {
-    let mut config = settings_store.get_section("orchestrator");
-    strip_orchestrator_session_owned_fields(&mut config);
-    if let Some(session_id) = session_id {
-        let override_section = settings_store.get_session_section(session_id, "orchestrator");
-        merge_orchestrator_session_override(&mut config, &override_section);
-    }
-    let normalized = NormalizedModelConfig::from_settings_value(&config)
-        .map_err(|error| format!("orchestrator 模型配置无效：{error}"))?;
+    let normalized = resolve_orchestrator_model_config(settings_store, session_id)?;
     Ok(normalized
         .to_http_model_client()
         .map(|client| Arc::new(client) as Arc<dyn ModelBridgeClient>))
-}
-
-pub fn strip_orchestrator_session_owned_fields(base: &mut serde_json::Value) {
-    if let serde_json::Value::Object(base_map) = base {
-        base_map.remove("model");
-        base_map.remove("reasoningEffort");
-    }
-}
-
-/// 把会话级覆盖（仅 `model` / `reasoningEffort`）叠加到全局 orchestrator base 上。
-///
-/// 设计约束：会话覆盖**只能**改主模型与思考强度，绝不携带 baseUrl / apiKey，
-/// 避免会话级配置悄悄替换连接凭据。`reasoningEffort` 为 JSON `null` 时表示
-/// 「默认·不指定」，会清空 base 上的思考强度。
-pub fn merge_orchestrator_session_override(
-    base: &mut serde_json::Value,
-    override_section: &serde_json::Value,
-) {
-    let serde_json::Value::Object(override_map) = override_section else {
-        return;
-    };
-    if override_map.is_empty() {
-        return;
-    }
-    if !base.is_object() {
-        *base = serde_json::Value::Object(serde_json::Map::new());
-    }
-    let serde_json::Value::Object(base_map) = base else {
-        return;
-    };
-    if let Some(model) = override_map.get("model") {
-        if let Some(model) = model.as_str() {
-            if !model.trim().is_empty() {
-                base_map.insert(
-                    "model".to_string(),
-                    serde_json::Value::String(model.to_string()),
-                );
-            }
-        }
-    }
-    if let Some(effort) = override_map.get("reasoningEffort") {
-        match effort {
-            serde_json::Value::Null => {
-                base_map.remove("reasoningEffort");
-            }
-            serde_json::Value::String(label) if !label.trim().is_empty() => {
-                base_map.insert(
-                    "reasoningEffort".to_string(),
-                    serde_json::Value::String(label.to_string()),
-                );
-            }
-            _ => {}
-        }
-    }
 }
 
 /// daemon 未注入 [`ContextBudget`] 时的兜底预算。
@@ -1083,15 +1028,29 @@ impl LlmTaskDispatcher {
         if parts.is_empty() && task.kind != TaskKind::LocalAgent {
             return parts;
         }
-        parts.insert(0, CURRENT_TASK_PRIORITY_NOTE.to_string());
+        let mut ordered_parts = vec![CURRENT_TASK_PRIORITY_NOTE.to_string()];
+        if let Some(mode_prompt) = self.multi_agent_mode_prompt_for_task(task) {
+            ordered_parts.push(mode_prompt);
+        }
         if task.kind == TaskKind::LocalAgent {
-            parts.insert(
-                1,
+            ordered_parts.push(
                 "[validation-rule] 只验证本任务 dependency/input 指向的当前执行产出；不得把历史经验、知识库记录或其他会话目标当成本次交付对象。"
                     .to_string(),
             );
         }
-        parts
+        ordered_parts.extend(parts);
+        ordered_parts
+    }
+
+    fn multi_agent_mode_prompt_for_task(&self, task: &magi_core::Task) -> Option<String> {
+        if task.kind != TaskKind::LocalAgent {
+            return None;
+        }
+        let registry = self.agent_role_registry.as_deref();
+        if task_is_coordinator(Some(task), registry) {
+            return Some(root_multi_agent_mode_prompt());
+        }
+        Some(subagent_multi_agent_mode_prompt())
     }
 
     fn assemble_prompt(
@@ -2057,6 +2016,7 @@ fn title_from_learning_content(content: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model_config::merge_orchestrator_session_override;
     use magi_core::{MissionId, Task, TaskPolicy, TaskRuntimePayload, TaskTier};
 
     fn task_with_role(role: &str, task_tier: TaskTier) -> Task {
@@ -2340,6 +2300,38 @@ mod tests {
             Some(&registry),
             BuiltinToolName::AgentWait
         ));
+    }
+
+    #[test]
+    fn assemble_prompt_injects_codex_style_multi_agent_mode_by_role() {
+        let dispatcher = dispatcher_with_default_tool_surface();
+        let session_id = SessionId::new("session-multi-agent-mode");
+        let workspace_id = None;
+
+        let coordinator_task = task_with_role("coordinator", TaskTier::ExecutionChain);
+        let (coordinator_prompt, _) =
+            dispatcher.assemble_prompt(None, &coordinator_task, &session_id, &workspace_id);
+        assert!(
+            coordinator_prompt.contains("多代理模式（root coordinator 必须遵守）"),
+            "root coordinator prompt 必须包含多代理触发策略: {coordinator_prompt}"
+        );
+        assert!(
+            coordinator_prompt.contains("用户明确要求 subagent")
+                && coordinator_prompt.contains("必须通过 agent_spawn 创建真实代理"),
+            "明确 subagent 请求必须被约束为真实 agent_spawn"
+        );
+
+        let worker_task = task_with_role("executor", TaskTier::ExecutionChain);
+        let (worker_prompt, _) =
+            dispatcher.assemble_prompt(None, &worker_task, &session_id, &workspace_id);
+        assert!(
+            worker_prompt.contains("子代理模式（worker 必须遵守）"),
+            "worker prompt 必须说明自身不能继续分派"
+        );
+        assert!(
+            !worker_prompt.contains("多代理模式（root coordinator 必须遵守）"),
+            "worker prompt 不能收到 root coordinator 派发策略"
+        );
     }
 
     #[test]

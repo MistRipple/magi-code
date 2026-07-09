@@ -2225,6 +2225,10 @@ fn agent_spawn_required_by_task(task: &Task) -> bool {
         return true;
     }
 
+    if contains_explicit_agent_mode(&text, &lowered) {
+        return true;
+    }
+
     let mentions_agent = text.contains("代理")
         || lowered.contains("agent")
         || contains_any(
@@ -2252,6 +2256,8 @@ fn agent_spawn_required_by_task(task: &Task) -> bool {
         && contains_any(
             &text,
             &[
+                "使用子代理模式",
+                "使用多代理模式",
                 "使用代理完成",
                 "使用代理处理",
                 "使用代理执行",
@@ -2276,6 +2282,28 @@ fn agent_spawn_required_by_task(task: &Task) -> bool {
         ],
     );
     has_chinese_dispatch_verb || has_english_dispatch_verb
+}
+
+fn contains_explicit_agent_mode(text: &str, lowered: &str) -> bool {
+    let compact_text = text
+        .chars()
+        .filter(|ch| !matches!(ch, ' ' | '-' | '_' | '\t' | '\n' | '\r'))
+        .collect::<String>();
+    let compact_lowered = lowered
+        .chars()
+        .filter(|ch| !matches!(ch, ' ' | '-' | '_' | '\t' | '\n' | '\r'))
+        .collect::<String>();
+    contains_any(
+        &compact_text,
+        &[
+            "subagent模式",
+            "子代理模式",
+            "子agent模式",
+            "多代理模式",
+            "多agent模式",
+            "multiagent模式",
+        ],
+    ) || contains_any(&compact_lowered, &["subagentmode", "multiagentmode"])
 }
 
 fn agent_spawn_was_attempted(tool_call_records: &[serde_json::Value]) -> bool {
@@ -4028,6 +4056,38 @@ mod tests {
                 assert!(error.contains("代理契约"));
             }
             other => panic!("明确要求代理时不能直接 final，got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn explicit_subagent_mode_blocks_final_until_agent_spawn_is_attempted() {
+        let mut task = make_task_loop_test_task("task-subagent-mode-required-final");
+        task.goal = "使用 subagent 模式检查当前项目结构和配置风险，代理完成后再汇总。".to_string();
+
+        let outcome = run_static_task_final(&task, "我直接在主线完成检查。");
+
+        match outcome {
+            TaskOutcome::Failed { error } => {
+                assert!(error.contains("agent_spawn"));
+                assert!(error.contains("代理契约"));
+            }
+            other => panic!("subagent 模式不能被主线 final 冒充，got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mixed_chinese_english_agent_mode_blocks_final_until_agent_spawn_is_attempted() {
+        let mut task = make_task_loop_test_task("task-mixed-agent-mode-required-final");
+        task.goal = "使用子 agent 模式检查当前项目结构和配置风险，代理完成后再汇总。".to_string();
+
+        let outcome = run_static_task_final(&task, "我直接在主线完成检查。");
+
+        match outcome {
+            TaskOutcome::Failed { error } => {
+                assert!(error.contains("agent_spawn"));
+                assert!(error.contains("代理契约"));
+            }
+            other => panic!("子 agent 模式不能被主线 final 冒充，got {other:?}"),
         }
     }
 

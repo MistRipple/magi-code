@@ -13,6 +13,7 @@
 //! 字段和推断结果形成双事实源。
 
 use magi_bridge_client::{HttpModelBridgeClient, HttpModelBridgeProtocol};
+use magi_core::SessionId;
 use magi_settings_store::DEPRECATED_MODEL_CONFIG_FIELDS;
 use magi_usage_authority::{LlmConfig, ReasoningEffort, UrlMode};
 use serde_json::Value;
@@ -290,6 +291,74 @@ pub fn configured_role_engine_model_config(
         binding_revision: binding.binding_revision,
         config,
     }))
+}
+
+pub fn resolve_orchestrator_model_config(
+    settings_store: &magi_settings_store::SettingsStore,
+    session_id: Option<&SessionId>,
+) -> Result<NormalizedModelConfig, String> {
+    let mut config = settings_store.get_section("orchestrator");
+    strip_orchestrator_session_owned_fields(&mut config);
+    if let Some(session_id) = session_id {
+        let override_section = settings_store.get_session_section(session_id, "orchestrator");
+        merge_orchestrator_session_override(&mut config, &override_section);
+    }
+    NormalizedModelConfig::from_settings_value(&config)
+        .map_err(|error| format!("orchestrator 模型配置无效：{error}"))
+}
+
+pub fn strip_orchestrator_session_owned_fields(base: &mut serde_json::Value) {
+    if let serde_json::Value::Object(base_map) = base {
+        base_map.remove("model");
+        base_map.remove("reasoningEffort");
+    }
+}
+
+/// 把会话级覆盖（仅 `model` / `reasoningEffort`）叠加到全局 orchestrator base 上。
+///
+/// 设计约束：会话覆盖**只能**改主模型与思考强度，绝不携带 baseUrl / apiKey，
+/// 避免会话级配置悄悄替换连接凭据。`reasoningEffort` 为 JSON `null` 时表示
+/// 「默认·不指定」，会清空 base 上的思考强度。
+pub fn merge_orchestrator_session_override(
+    base: &mut serde_json::Value,
+    override_section: &serde_json::Value,
+) {
+    let serde_json::Value::Object(override_map) = override_section else {
+        return;
+    };
+    if override_map.is_empty() {
+        return;
+    }
+    if !base.is_object() {
+        *base = serde_json::Value::Object(serde_json::Map::new());
+    }
+    let serde_json::Value::Object(base_map) = base else {
+        return;
+    };
+    if let Some(model) = override_map.get("model") {
+        if let Some(model) = model.as_str() {
+            if !model.trim().is_empty() {
+                base_map.insert(
+                    "model".to_string(),
+                    serde_json::Value::String(model.trim().to_string()),
+                );
+            }
+        }
+    }
+    if override_map.contains_key("reasoningEffort") {
+        match override_map.get("reasoningEffort") {
+            Some(serde_json::Value::String(value)) if !value.trim().is_empty() => {
+                base_map.insert(
+                    "reasoningEffort".to_string(),
+                    serde_json::Value::String(value.trim().to_string()),
+                );
+            }
+            Some(serde_json::Value::Null) => {
+                base_map.remove("reasoningEffort");
+            }
+            _ => {}
+        }
+    }
 }
 
 struct RoleEngineBinding {

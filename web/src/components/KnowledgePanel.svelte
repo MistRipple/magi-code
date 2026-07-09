@@ -76,6 +76,8 @@
   let lastWorkspaceKey = $state('');
   let knowledgeWorkspaceGeneration = 0;
   let knowledgeLoadRequestSeq = 0;
+  let activeKnowledgeLoadRequestId = $state('');
+  let knowledgeLoadTimeout: ReturnType<typeof setTimeout> | null = null;
   let loadError = $state('');
   let codeIndex = $state<CodeIndex | null>(null);
   let codeIndexStatus = $state<CodeIndexStatus | null>(null);
@@ -417,6 +419,31 @@
     closeEditor();
   }
 
+  function clearKnowledgeLoadTimeout() {
+    if (knowledgeLoadTimeout) {
+      clearTimeout(knowledgeLoadTimeout);
+      knowledgeLoadTimeout = null;
+    }
+  }
+
+  function finishKnowledgeLoad() {
+    activeKnowledgeLoadRequestId = '';
+    clearKnowledgeLoadTimeout();
+  }
+
+  function scheduleKnowledgeLoadTimeout(request: KnowledgeLoadRequest) {
+    clearKnowledgeLoadTimeout();
+    knowledgeLoadTimeout = setTimeout(() => {
+      if (!isCurrentKnowledgeLoadRequest(request) || activeKnowledgeLoadRequestId !== request.requestId) {
+        return;
+      }
+      clearKnowledgeContent();
+      loadError = i18n.t('knowledge.toast.loadFailed');
+      isLoading = false;
+      finishKnowledgeLoad();
+    }, 30_000);
+  }
+
   function applyKnowledgePayload(payload: Record<string, unknown> | null | undefined): boolean {
     if (!payloadMatchesCurrentWorkspace(payload)) {
       return false;
@@ -465,6 +492,7 @@
       : null;
     loadError = '';
     isLoading = false;
+    finishKnowledgeLoad();
     return true;
   }
 
@@ -517,6 +545,7 @@
 
   interface KnowledgeLoadRequest extends KnowledgeWorkspaceRequest {
     loadSeq: number;
+    requestId: string;
   }
 
   function currentKnowledgeWorkspaceRequest(): KnowledgeWorkspaceRequest {
@@ -538,9 +567,11 @@
   }
 
   function nextKnowledgeLoadRequest(): KnowledgeLoadRequest {
+    const loadSeq = ++knowledgeLoadRequestSeq;
     return {
       ...currentKnowledgeWorkspaceRequest(),
-      loadSeq: ++knowledgeLoadRequestSeq,
+      loadSeq,
+      requestId: `knowledge-load-${Date.now()}-${loadSeq}`,
     };
   }
 
@@ -561,6 +592,7 @@
     console.warn('[KnowledgePanel] load project knowledge failed:', error);
     loadError = i18n.t('knowledge.toast.loadFailed');
     isLoading = false;
+    finishKnowledgeLoad();
   }
 
   function handleKnowledgeMutationError(error: unknown, messageKey: string, request: KnowledgeWorkspaceRequest) {
@@ -570,6 +602,7 @@
     console.warn('[KnowledgePanel] project knowledge mutation failed:', error);
     loadError = i18n.t(messageKey);
     isLoading = false;
+    finishKnowledgeLoad();
   }
 
   function resolvePayloadWorkspaceKey(payload: Record<string, unknown> | null | undefined): string {
@@ -593,6 +626,7 @@
     }
     if (!applyKnowledgePayload(res)) {
       isLoading = false;
+      finishKnowledgeLoad();
       return;
     }
     refreshSettingsAfterKnowledgePayload();
@@ -602,12 +636,18 @@
     const request = nextKnowledgeLoadRequest();
     hasRequestedKnowledge = true;
     isLoading = true;
+    activeKnowledgeLoadRequestId = request.requestId;
+    scheduleKnowledgeLoadTimeout(request);
     loadError = '';
     if (isWebMode) {
       fetchKnowledgeViaApi(request)
         .catch((error) => handleKnowledgeLoadError(error, request));
     } else {
-      vscode.postMessage({ type: 'getProjectKnowledge', ...knowledgeWorkspaceScope(request) });
+      vscode.postMessage({
+        type: 'getProjectKnowledge',
+        knowledgeRequestId: request.requestId,
+        ...knowledgeWorkspaceScope(request),
+      });
     }
   }
 
@@ -692,6 +732,7 @@
     knowledgeLoadRequestSeq += 1;
     hasRequestedKnowledge = false;
     isLoading = false;
+    finishKnowledgeLoad();
     loadError = '';
     clearKnowledgeContent();
     if (isKnowledgeActive) {
@@ -715,12 +756,23 @@
       if (standard.data.dataType !== 'projectKnowledgeLoaded') return;
 
       const payload = standard.data.payload as Record<string, unknown>;
+      const payloadRequestId = typeof payload.knowledgeRequestId === 'string' ? payload.knowledgeRequestId.trim() : '';
+      if (payloadRequestId && payloadRequestId !== activeKnowledgeLoadRequestId) {
+        return;
+      }
       if (applyKnowledgePayload(payload)) {
         refreshSettingsAfterKnowledgePayload();
+      } else if (!payloadRequestId || payloadRequestId === activeKnowledgeLoadRequestId) {
+        loadError = i18n.t('knowledge.toast.loadFailed');
+        isLoading = false;
+        finishKnowledgeLoad();
       }
     });
 
-    return () => unsubscribe();
+    return () => {
+      clearKnowledgeLoadTimeout();
+      unsubscribe();
+    };
   });
 </script>
 

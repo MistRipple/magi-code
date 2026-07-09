@@ -55,6 +55,32 @@ await withGoldenViteServer(async (server) => {
   assert.equal(agentTab?.payload.workspaceId, 'workspace-agent');
   assert.equal(agentTab?.payload.workspacePath, '/tmp/workspace-agent');
 
+  rightPane.openAgentTab('session-agent', 'task-agent-2', {
+    workspaceId: 'workspace-agent',
+    workspacePath: '/tmp/workspace-agent',
+    label: '审查代理',
+    accentToken: '#10b981',
+  });
+  const parallelAgentPane = rightPane.getRightPaneState(rightPane.rightPaneState.activeScopeKey);
+  assert.deepEqual(
+    parallelAgentPane.openTabs
+      .filter((tab) => tab.kind === 'agent')
+      .map((tab) => tab.id),
+    ['agent:task-agent-1', 'agent:task-agent-2'],
+    'parallel agent cards must open incremental taskId tabs in the same session scope',
+  );
+  assert.equal(
+    parallelAgentPane.activeTabId,
+    'agent:task-agent-2',
+    'clicking the second agent should activate it without replacing the first tab',
+  );
+  const secondAgentTab = parallelAgentPane.openTabs.find((tab) => tab.id === 'agent:task-agent-2');
+  assert.equal(
+    secondAgentTab?.accentToken,
+    '#10b981',
+    'agent tab should preserve the visual accent passed by the spawn card',
+  );
+
   rightPane.openAgentTab('session-agent', 'task-agent-1', {
     workspaceId: 'workspace-other',
     label: '另一个工作区代理',

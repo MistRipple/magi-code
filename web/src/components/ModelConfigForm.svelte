@@ -184,6 +184,7 @@
   <div
     class="llm-config-field-row credentials-row"
     class:has-level={showAdvancedOptions}
+    class:key-only={!showModelField && !showAdvancedOptions}
   >
     <div class="llm-config-field">
       <label class="llm-config-label">{i18n.t('settings.model.field.apiKey')}</label>
@@ -207,21 +208,7 @@
 
     {#if showModelField}
       <div class="llm-config-field">
-        <div class="llm-config-label-row">
-          <label class="llm-config-label">{i18n.t('settings.model.field.model')}</label>
-          {#if showResolvedProtocol}
-            <span
-              class="model-protocol-chip"
-              title={i18n.t('settings.model.protocolHint')}
-            >
-              {i18n.t('settings.model.protocolResolved', {
-                protocol: resolvedProtocol === 'anthropic_messages'
-                  ? i18n.t('settings.model.protocol.anthropic')
-                  : i18n.t('settings.model.protocol.openai'),
-              })}
-            </span>
-          {/if}
-        </div>
+        <label class="llm-config-label">{i18n.t('settings.model.field.model')}</label>
         <div class="model-combobox" bind:this={comboboxEl}>
           <input
             type="text"
@@ -263,6 +250,21 @@
             </div>
           {/if}
         </div>
+        {#if showResolvedProtocol}
+          <div
+            class="model-protocol-inline"
+            title={i18n.t('settings.model.protocolHint')}
+          >
+            <Icon name="info" size={12} />
+            <span>
+              {i18n.t('settings.model.protocolResolved', {
+                protocol: resolvedProtocol === 'anthropic_messages'
+                  ? i18n.t('settings.model.protocol.anthropic')
+                  : i18n.t('settings.model.protocol.openai'),
+              })}
+            </span>
+          </div>
+        {/if}
       </div>
     {/if}
 
@@ -366,6 +368,9 @@
   .llm-config-field-row.credentials-row.has-level {
     grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 96px;
   }
+  .llm-config-field-row.credentials-row.key-only {
+    grid-template-columns: minmax(0, 1fr);
+  }
   .llm-config-field-row.url-mode-row {
     grid-template-columns: minmax(0, 1fr) 180px;
     align-items: end;
@@ -374,29 +379,6 @@
   .llm-config-label {
     font-size: var(--text-sm);
     color: var(--foreground-muted);
-  }
-
-  .llm-config-label-row {
-    min-width: 0;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: var(--space-2);
-  }
-
-  .model-protocol-chip {
-    min-width: 0;
-    max-width: 160px;
-    padding: 1px 7px;
-    border: 1px solid var(--border);
-    border-radius: var(--radius-full);
-    color: var(--foreground-muted);
-    background: var(--surface-2);
-    font-size: var(--text-xs);
-    line-height: 1.5;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
   }
 
   .llm-config-field--compact {
@@ -526,6 +508,25 @@
     color: var(--foreground);
   }
 
+  .model-protocol-inline {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    min-width: 0;
+    align-self: flex-start;
+    max-width: 100%;
+    color: var(--foreground-muted);
+    font-size: var(--text-xs);
+    line-height: 1.35;
+  }
+
+  .model-protocol-inline span {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
   .model-dropdown {
     position: fixed;
     z-index: var(--z-popover);
@@ -623,6 +624,7 @@
     .llm-config-field-row,
     .llm-config-field-row.credentials-row,
     .llm-config-field-row.credentials-row.has-level,
+    .llm-config-field-row.credentials-row.key-only,
     .llm-config-field-row.url-mode-row {
       grid-template-columns: 1fr;
     }
@@ -651,6 +653,7 @@
     .llm-config-field-row,
     .llm-config-field-row.credentials-row,
     .llm-config-field-row.credentials-row.has-level,
+    .llm-config-field-row.credentials-row.key-only,
     .llm-config-field-row.url-mode-row {
       grid-template-columns: 1fr;
     }

@@ -56,7 +56,7 @@ export interface RightPaneTab {
   kind: RightPaneTabKind;
   /** Tab 标题（如代理名称 / 文件名）；展示用，可后续更新 */
   label: string;
-  /** 强调色 token 名（如 'color-claude'）；null 表示无强调色 */
+  /** 强调色，可传 CSS 颜色值或 token 名（如 'color-claude'）；null 表示无强调色 */
   accentToken: string | null;
   payload: RightPaneTabPayload;
   /** LRU 淘汰参考时间戳（performance.now 或 Date.now，递增即可） */
@@ -177,6 +177,20 @@ function sanitizeTabForPersist(tab: RightPaneTab): RightPaneTab {
   return { ...tab, payload: slim };
 }
 
+function isRestorableTab(tab: RightPaneTab): boolean {
+  if (!tab || typeof tab.id !== 'string') {
+    return false;
+  }
+  if (tab.kind === 'agent') {
+    const taskId = (tab.payload as AgentTabPayload | undefined)?.taskId?.trim() || '';
+    return Boolean(taskId) && !taskId.includes('[redacted]');
+  }
+  if (tab.kind === 'code') {
+    return Boolean((tab.payload as CodeTabPayload | undefined)?.filepath?.trim());
+  }
+  return false;
+}
+
 /** 从 localStorage 恢复 perSession + activeSessionId；解析/版本不符则静默回退到空状态 */
 function loadPersisted(): void {
   if (typeof window === 'undefined') return;
@@ -188,10 +202,15 @@ function loadPersisted(): void {
     const recovered: Record<string, SessionPaneState> = {};
     for (const [sid, state] of Object.entries(parsed.perSession ?? {})) {
       if (!state || !Array.isArray(state.openTabs)) continue;
+      const openTabs = state.openTabs.filter(isRestorableTab);
+      const activeTabId = typeof state.activeTabId === 'string'
+        && openTabs.some((tab) => tab.id === state.activeTabId)
+        ? state.activeTabId
+        : openTabs[0]?.id ?? null;
       recovered[sid] = {
-        openTabs: state.openTabs,
-        activeTabId: typeof state.activeTabId === 'string' ? state.activeTabId : null,
-        collapsed: Boolean(state.collapsed),
+        openTabs,
+        activeTabId,
+        collapsed: openTabs.length === 0 ? true : Boolean(state.collapsed),
       };
     }
     rightPaneState.perSession = recovered;

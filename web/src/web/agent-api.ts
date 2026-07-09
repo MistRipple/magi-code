@@ -1143,6 +1143,7 @@ export async function submitSessionTurn(
     skillName?: string | null;
     images: AgentSessionTurnImagePayload[];
     accessProfile?: 'read_only' | 'restricted' | 'full_access' | null;
+    orchestratorSessionConfig?: Record<string, unknown> | null;
     requestId?: string | null;
     userMessageId?: string | null;
     placeholderMessageId?: string | null;
@@ -1175,6 +1176,7 @@ export async function submitSessionTurn(
           name: image.name,
           dataUrl: image.dataUrl,
         })),
+        orchestratorSessionConfig: payload.orchestratorSessionConfig ?? null,
       }),
     });
     const raw = await parseAgentJson<{

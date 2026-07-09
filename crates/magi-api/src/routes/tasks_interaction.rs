@@ -321,6 +321,7 @@ async fn restart_task(
             .policy_snapshot
             .as_ref()
             .map(|policy| policy.access_profile),
+        orchestrator_session_config: None,
         request_id: None,
         user_message_id: None,
         placeholder_message_id: None,

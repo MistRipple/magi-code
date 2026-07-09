@@ -52,8 +52,29 @@ pub const REFERENCE_CONTEXT_PRIORITY_NOTE: &str = "[reference-rule] 以下 [refe
 /// 安全防护。该常量集中在 prompt_utils，避免不同注入点维护互相漂移的文案。
 pub const SKILL_PROMPT_PRIORITY_NOTE: &str = "Skill 指令说明：以下内容来自用户选择的 Skill，用于补充执行方式与工具使用约束；低于本轮用户输入、当前会话事实、当前 task 目标与安全防护，发生冲突时以后者为准。";
 
+pub const ROOT_MULTI_AGENT_MODE_RULE: &str = "\
+多代理模式（root coordinator 必须遵守）：\n\
+1. 不要启动代理，除非用户、本仓 AGENTS.md 或当前 Skill 明确要求 subagent、代理分派、并行协作或多角色处理。\n\
+2. 一旦用户明确要求 subagent / 子代理 / 多代理 / 派发代理，就必须通过 agent_spawn 创建真实代理；不得用主线直接读取、shell_exec 或口头总结冒充代理执行。\n\
+3. 多个互相独立的代理任务应在同一轮发起多次 agent_spawn 并行启动；需要结果时再用 agent_wait 汇总。\n\
+4. root coordinator 保留主线推进职责：只把边界清晰、可并行、需要专项视角或独立复核的工作交给代理。";
+
+pub const SUBAGENT_MULTI_AGENT_MODE_RULE: &str = "\
+子代理模式（worker 必须遵守）：\n\
+1. 你是被 root coordinator 派发的 worker，只完成当前 agent_spawn goal。\n\
+2. 不要继续创建代理，也不要把任务再分派给其他 worker。\n\
+3. 如需更多上下文或遇到阻塞，直接在最终答复中说明缺口与证据。";
+
 pub fn current_turn_context_priority_prompt() -> String {
     CURRENT_TURN_CONTEXT_PRIORITY_RULE.to_string()
+}
+
+pub fn root_multi_agent_mode_prompt() -> String {
+    ROOT_MULTI_AGENT_MODE_RULE.to_string()
+}
+
+pub fn subagent_multi_agent_mode_prompt() -> String {
+    SUBAGENT_MULTI_AGENT_MODE_RULE.to_string()
 }
 
 pub fn prepend_session_instructions(

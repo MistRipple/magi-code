@@ -53,6 +53,7 @@ import {
 } from '../lib/message-payload';
 import {
   clearCanonicalSessionTurns,
+  rebindCanonicalSessionTurns,
 } from './turn-store.svelte';
 import type { SettingsBootstrapSnapshot } from '../shared/settings-bootstrap';
 import type { RoleTemplate } from '../shared/types/role-templates';
@@ -1508,6 +1509,38 @@ export function adoptCurrentSessionIdForLiveTurn(id: string | null | undefined):
   return true;
 }
 
+export function adoptAcceptedSessionIdForLocalTurn(
+  localSessionId: string | null | undefined,
+  acceptedSessionId: string | null | undefined,
+): boolean {
+  const previousSessionId = normalizeSessionId(localSessionId);
+  const nextSessionId = normalizeSessionId(acceptedSessionId);
+  if (!previousSessionId || !nextSessionId) {
+    return false;
+  }
+  if (previousSessionId === nextSessionId) {
+    return true;
+  }
+  if (normalizeSessionId(messagesState.currentSessionId) !== previousSessionId) {
+    return false;
+  }
+  messagesState.currentSessionId = nextSessionId;
+  messagesState.sessionHistory = {
+    workspaceId: messagesState.currentWorkspaceId,
+    sessionId: nextSessionId,
+    hasMoreBefore: false,
+    beforeCursor: null,
+    isLoadingBefore: false,
+  };
+  const reboundProjection = rebindCanonicalSessionTurns(previousSessionId, nextSessionId);
+  if (reboundProjection) {
+    messagesState.canonicalTimelineProjection = reboundProjection;
+  }
+  syncNotificationsFromSession(nextSessionId);
+  saveWebviewState();
+  return true;
+}
+
 export function updateSessions(newSessions: Session[]) {
   const seen = new Set<string>();
   const currentWorkspaceId = normalizeWorkspaceId(messagesState.currentWorkspaceId);
@@ -1643,8 +1676,11 @@ export function markMessageComplete(id: string) {
   clearRetryRuntime(id);
 }
 
-export function addPendingRequest(id: string) {
+export function addPendingRequest(id: string, options?: { resetAntiLiftBack?: boolean }) {
   if (!id) return;
+  if (options?.resetAntiLiftBack) {
+    messagesState.lastForcedIdleAt = null;
+  }
   if (!messagesState.pendingRequests.has(id)) {
     const next = new Set(messagesState.pendingRequests);
     next.add(id);

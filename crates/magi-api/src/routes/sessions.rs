@@ -788,6 +788,7 @@ fn session_turn_requests_task_by_local_rules(request: &SessionTurnRequestDto) ->
     ]
     .iter()
     .any(|marker| normalized.contains(marker))
+        || normalized_contains_explicit_agent_mode(&normalized)
         || normalized_contains_agent_dispatch_request(&normalized)
 }
 
@@ -1054,6 +1055,7 @@ fn session_turn_requests_explicit_task_or_agent_mode(request: &SessionTurnReques
         || normalized.contains("任务编排")
         || normalized.contains("任务模式完成")
         || normalized.contains("以任务模式")
+        || normalized_contains_explicit_agent_mode(&normalized)
         || normalized.contains("派发代理")
         || normalized.contains("分派代理")
         || normalized.contains("分配代理")
@@ -1067,7 +1069,29 @@ fn session_turn_requests_explicit_task_or_agent_mode(request: &SessionTurnReques
         || normalized_contains_agent_dispatch_request(&normalized)
 }
 
+fn normalized_contains_explicit_agent_mode(normalized: &str) -> bool {
+    let compact = normalized
+        .chars()
+        .filter(|ch| !matches!(ch, ' ' | '-' | '_' | '\t' | '\n' | '\r'))
+        .collect::<String>();
+    [
+        "subagent模式",
+        "subagentmode",
+        "子代理模式",
+        "子agent模式",
+        "多代理模式",
+        "多agent模式",
+        "multiagent模式",
+        "multiagentmode",
+    ]
+    .iter()
+    .any(|marker| compact.contains(marker))
+}
+
 fn normalized_contains_agent_dispatch_request(normalized: &str) -> bool {
+    if normalized_contains_explicit_agent_mode(normalized) {
+        return true;
+    }
     let has_agent_target = normalized.contains("代理") || normalized.contains("agent");
     let has_dispatch_verb = ["派发", "分派", "分配", "启动", "创建", "调用", "spawn"]
         .iter()
@@ -1216,6 +1240,7 @@ async fn submit_regular_session_turn(
         placeholder_title,
         accepted_at,
     )?;
+    apply_turn_orchestrator_session_override(&state, &request, &session_id)?;
     let workspace_root_path = state
         .workspace_root_path(&workspace_id)
         .map(|path| path.display().to_string());
@@ -1387,6 +1412,18 @@ async fn submit_regular_session_turn(
         accepted_canonical_turn,
         accepted_canonical_item,
     ))
+}
+
+fn apply_turn_orchestrator_session_override(
+    state: &ApiState,
+    request: &SessionTurnRequestDto,
+    session_id: &SessionId,
+) -> Result<(), ApiError> {
+    let Some(config) = request.orchestrator_session_config.as_ref() else {
+        return Ok(());
+    };
+    super::settings::save_orchestrator_session_override_for_session(state, session_id, config)?;
+    Ok(())
 }
 
 fn spawn_regular_session_turn_execution(
@@ -3177,6 +3214,7 @@ mod tests {
             skill_name: None,
             images: Vec::new(),
             access_profile: None,
+            orchestrator_session_config: None,
             request_id: None,
             user_message_id: None,
             placeholder_message_id: None,
@@ -4167,6 +4205,32 @@ mod tests {
     }
 
     #[test]
+    fn explicit_subagent_mode_request_is_task_even_without_dispatch_verb() {
+        for text in [
+            "使用 subagent 模式检查当前项目并汇总风险。",
+            "使用子 agent 模式检查当前项目并汇总风险。",
+            "以子代理模式处理这个问题，完成后汇总。",
+            "以多 agent 模式处理这个问题，完成后汇总。",
+            "use subagent mode to inspect this project and summarize risks.",
+        ] {
+            let request = session_turn_request(text);
+            let decision = normalize_session_turn_decision(classifier_chat_decision(), &request);
+
+            assert!(
+                matches!(decision.route, SessionTurnRouteDto::Task),
+                "subagent 模式入口必须创建任务投影: {text}"
+            );
+            assert_eq!(decision.task_tier, TaskTier::ExecutionChain);
+            assert_eq!(
+                decision.reason_code.as_deref(),
+                Some("explicit_task_request")
+            );
+            assert!(decision.execution_goal.is_some());
+            assert!(!decision.task_evidence.is_empty());
+        }
+    }
+
+    #[test]
     fn explicit_complex_agent_request_preserves_raw_user_goal_as_execution_goal() {
         let raw_goal = "【具体任务推进验收】请以复杂任务模式完成，必须由代理在当前工作区创建文件 task-system-e2e.md，文件内容必须包含三行：title: task concrete progress、marker: TASK_E2E、status: completed。创建后代理必须读取该文件验证内容。";
         let request = session_turn_request(raw_goal);
@@ -4371,6 +4435,7 @@ mod tests {
                 skill_name: None,
                 images: Vec::new(),
                 access_profile: None,
+                orchestrator_session_config: None,
                 request_id: Some("request-canonical-first-frame".to_string()),
                 user_message_id: Some("user-canonical-first-frame".to_string()),
                 placeholder_message_id: Some("assistant-canonical-first-frame".to_string()),
@@ -4431,6 +4496,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn regular_session_turn_applies_draft_orchestrator_config_before_execution() {
+        let state = test_state();
+        let workspace_id = register_workspace(
+            &state,
+            "workspace-draft-orchestrator-model",
+            "draft-orchestrator-model",
+        );
+        let response = submit_regular_session_turn(
+            state.clone(),
+            SessionTurnRequestDto {
+                session_id: None,
+                workspace_id: Some(workspace_id.to_string()),
+                workspace_path: None,
+                text: Some("验证草稿会话主模型配置".to_string()),
+                skill_name: None,
+                images: Vec::new(),
+                access_profile: None,
+                orchestrator_session_config: Some(json!({
+                    "model": "gpt-session-draft",
+                    "reasoningEffort": "high",
+                })),
+                request_id: Some("request-draft-orchestrator-model".to_string()),
+                user_message_id: Some("user-draft-orchestrator-model".to_string()),
+                placeholder_message_id: Some("assistant-draft-orchestrator-model".to_string()),
+                supplement_context: false,
+                target_task_id: None,
+            },
+            Vec::new(),
+            workspace_id,
+            UtcMillis(1_777_000_010_000),
+            classifier_chat_decision(),
+        )
+        .await
+        .expect("draft turn should accept");
+
+        let session_id = SessionId::new(&response.session_id);
+        let session_config = state
+            .settings_store
+            .get_session_section(&session_id, "orchestrator");
+        assert_eq!(session_config["model"], json!("gpt-session-draft"));
+        assert_eq!(session_config["reasoningEffort"], json!("high"));
+    }
+
+    #[tokio::test]
     async fn regular_session_turn_accept_persists_user_image_metadata() {
         let state = test_state();
         let workspace_id = register_workspace(&state, "workspace-image-turn", "image-turn");
@@ -4445,6 +4554,7 @@ mod tests {
                 data_url: "data:image/png;base64,AAA".to_string(),
             }],
             access_profile: None,
+            orchestrator_session_config: None,
             request_id: Some("request-image-turn".to_string()),
             user_message_id: Some("user-image-turn".to_string()),
             placeholder_message_id: Some("assistant-image-turn".to_string()),
@@ -4558,6 +4668,7 @@ mod tests {
                 skill_name: None,
                 images: Vec::new(),
                 access_profile: None,
+                orchestrator_session_config: None,
                 request_id: Some("request-queued-turn".to_string()),
                 user_message_id: Some("user-queued-turn".to_string()),
                 placeholder_message_id: Some("assistant-queued-turn".to_string()),
@@ -4684,6 +4795,7 @@ mod tests {
                 skill_name: None,
                 images: Vec::new(),
                 access_profile: None,
+                orchestrator_session_config: None,
                 request_id: Some("request-queue-a".to_string()),
                 user_message_id: Some("user-queue-a".to_string()),
                 placeholder_message_id: Some("assistant-queue-a".to_string()),
@@ -4707,6 +4819,7 @@ mod tests {
                 skill_name: None,
                 images: Vec::new(),
                 access_profile: None,
+                orchestrator_session_config: None,
                 request_id: Some("request-queue-b".to_string()),
                 user_message_id: Some("user-queue-b".to_string()),
                 placeholder_message_id: Some("assistant-queue-b".to_string()),
@@ -4933,6 +5046,7 @@ mod tests {
             skill_name: None,
             images: Vec::new(),
             access_profile: None,
+            orchestrator_session_config: None,
             request_id: Some("request-simple-chat".to_string()),
             user_message_id: Some("user-simple-chat".to_string()),
             placeholder_message_id: Some("assistant-simple-chat".to_string()),
@@ -4991,6 +5105,7 @@ mod tests {
             skill_name: None,
             images: Vec::new(),
             access_profile: None,
+            orchestrator_session_config: None,
             request_id: Some("request-simple-execute".to_string()),
             user_message_id: Some("user-simple-execute".to_string()),
             placeholder_message_id: Some("assistant-simple-execute".to_string()),

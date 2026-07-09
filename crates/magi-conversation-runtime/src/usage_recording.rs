@@ -2,7 +2,9 @@
 //!
 //! 复用内部的 `model_config::NormalizedModelConfig` 与独立设置域。
 
-use crate::model_config::{NormalizedModelConfig, configured_role_engine_model_config};
+use crate::model_config::{
+    NormalizedModelConfig, configured_role_engine_model_config, resolve_orchestrator_model_config,
+};
 use magi_core::{EventId, MissionId, MissionLifecyclePhase, SessionId, UtcMillis, WorkspaceId};
 use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
 use magi_mission_metrics::{MissionMetricsStore, TurnUsage};
@@ -91,7 +93,8 @@ pub fn publish_model_usage_record(
     let Some(usage) = usage_tokens_from_payload(usage) else {
         return;
     };
-    let Some(model_config) = usage_model_config_for_binding(settings_store, binding) else {
+    let Some(model_config) = usage_model_config_for_binding(settings_store, binding, session_id)
+    else {
         tracing::warn!(
             template_id = binding.template_id,
             engine_id = binding.engine_id,
@@ -206,6 +209,7 @@ pub fn record_mission_turn(
 fn usage_model_config_for_binding(
     settings_store: Option<&Arc<SettingsStore>>,
     binding: &ModelUsageBinding,
+    session_id: &SessionId,
 ) -> Option<LlmConfig> {
     let store = settings_store?;
     if matches!(binding.role, UsageSourceRole::Worker) {
@@ -237,8 +241,7 @@ fn usage_model_config_for_binding(
             return Some(config);
         }
     }
-    let orchestrator = store.get_section("orchestrator");
-    match NormalizedModelConfig::from_settings_value(&orchestrator) {
+    match resolve_orchestrator_model_config(store, Some(session_id)) {
         Ok(config) => config.to_usage_llm_config(),
         Err(error) => {
             tracing::warn!(error = %error, "orchestrator 模型配置无效，跳过用量身份归因");
@@ -444,12 +447,20 @@ mod tests {
         let event_bus = InMemoryEventBus::new(8);
         let session_store = SessionStore::new();
         let settings_store = Arc::new(SettingsStore::new());
+        let session_id = SessionId::new("session-1");
         settings_store.set_section(
             "orchestrator",
             json!({
                 "baseUrl": "https://example.test",
-                "model": "gpt-test",
                 "provider": "openai-compatible"
+            }),
+        );
+        settings_store.set_session_section(
+            &session_id,
+            "orchestrator",
+            json!({
+                "model": "gpt-session-test",
+                "reasoningEffort": "high"
             }),
         );
         let binding = session_turn_model_usage_binding(true);
@@ -459,7 +470,7 @@ mod tests {
             &event_bus,
             &session_store,
             Some(&settings_store),
-            &SessionId::new("session-1"),
+            &session_id,
             &workspace_id,
             &binding,
             "call-1".to_string(),
@@ -484,6 +495,14 @@ mod tests {
             snapshot.recent_events[0].payload["workspaceId"],
             json!("workspace-1")
         );
+        assert_eq!(
+            snapshot.recent_events[0].payload["modelConfig"]["model"],
+            json!("gpt-session-test")
+        );
+        assert_eq!(
+            snapshot.recent_events[0].payload["modelConfig"]["reasoningEffort"],
+            json!("high")
+        );
     }
 
     #[test]
@@ -491,12 +510,19 @@ mod tests {
         let event_bus = InMemoryEventBus::new(8);
         let session_store = SessionStore::new();
         let settings_store = Arc::new(SettingsStore::new());
+        let session_id = SessionId::new("session-1");
         settings_store.set_section(
             "orchestrator",
             json!({
                 "baseUrl": "https://example.test",
-                "model": "gpt-test",
                 "provider": "openai-compatible"
+            }),
+        );
+        settings_store.set_session_section(
+            &session_id,
+            "orchestrator",
+            json!({
+                "model": "gpt-session-test"
             }),
         );
         let binding = session_turn_model_usage_binding(true);
@@ -505,7 +531,7 @@ mod tests {
             &event_bus,
             &session_store,
             Some(&settings_store),
-            &SessionId::new("session-1"),
+            &session_id,
             &None,
             &binding,
             "call-1".to_string(),

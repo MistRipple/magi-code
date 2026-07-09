@@ -2,6 +2,7 @@ use magi_conversation_runtime::session_images::SessionTurnImage;
 use magi_core::{AccessProfile, EventId, SessionId, TaskId, UtcMillis};
 use magi_session_store::{CANONICAL_TURN_SCHEMA_VERSION, CanonicalTurn, CanonicalTurnItem};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -23,6 +24,8 @@ pub struct SessionTurnRequestDto {
     pub images: Vec<SessionTurnImageDto>,
     #[serde(default)]
     pub access_profile: Option<AccessProfile>,
+    #[serde(default)]
+    pub orchestrator_session_config: Option<Value>,
     pub request_id: Option<String>,
     pub user_message_id: Option<String>,
     pub placeholder_message_id: Option<String>,
@@ -248,6 +251,7 @@ mod tests {
             skill_name: None,
             images: Vec::new(),
             access_profile: None,
+            orchestrator_session_config: None,
             request_id: None,
             user_message_id: None,
             placeholder_message_id: None,

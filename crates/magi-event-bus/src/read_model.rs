@@ -2220,6 +2220,9 @@ fn usage_observation_from_event(event: &EventEnvelope) -> Option<SessionRuntimeU
 /// 口径对齐 Codex:展示用的上下文窗口占用取最近一次模型调用返回的
 /// `totalTokens`；没有显式 total 时用 raw input + raw output。这里不扣
 /// cache read,因为缓存命中仍然占用模型上下文窗口,只是不按同样价格计费。
+///
+/// 输入区圆环展示主线 orchestrator 的上下文窗口。worker / auxiliary 的模型
+/// 调用仍进入审计账本与任务指标,但不能覆盖主线会话窗口统计。
 fn usage_observation_from_payload(
     event_type: &str,
     payload: &serde_json::Value,
@@ -2228,6 +2231,9 @@ fn usage_observation_from_payload(
         return None;
     }
     if payload.get("status").and_then(|value| value.as_str()) != Some("success") {
+        return None;
+    }
+    if !is_orchestrator_usage_payload(payload) {
         return None;
     }
     let usage = payload.get("usage")?;
@@ -2268,6 +2274,14 @@ fn usage_observation_from_payload(
     })
 }
 
+fn is_orchestrator_usage_payload(payload: &serde_json::Value) -> bool {
+    payload
+        .get("executionBinding")
+        .and_then(|binding| binding.get("role"))
+        .and_then(serde_json::Value::as_str)
+        == Some("orchestrator")
+}
+
 /// 从已恢复的审计/用量账本条目重建每会话最近一次用量观测值。
 ///
 /// 反孤儿/重启容错:守护进程重启后实时 `recent_events` 缓冲区从空开始,
@@ -2278,7 +2292,8 @@ fn usage_observation_from_payload(
 pub fn latest_usage_observations_from_ledger(
     usage_entries: &[crate::AuditUsageLedgerEntry],
 ) -> BTreeMap<String, SessionRuntimeUsageObservation> {
-    let mut latest: BTreeMap<String, (u64, SessionRuntimeUsageObservation)> = BTreeMap::new();
+    let mut latest: BTreeMap<String, ((u64, u64), SessionRuntimeUsageObservation)> =
+        BTreeMap::new();
     for entry in usage_entries {
         let Some(session_id) = entry.context.session_id.as_ref() else {
             continue;
@@ -2287,11 +2302,15 @@ pub fn latest_usage_observations_from_ledger(
         else {
             continue;
         };
+        let ordering_key = (
+            observation.observed_at.map(|value| value.0).unwrap_or(0),
+            entry.sequence,
+        );
         let session_id = session_id.to_string();
         match latest.get(&session_id) {
-            Some((existing_sequence, _)) if *existing_sequence >= entry.sequence => {}
+            Some((existing_key, _)) if *existing_key >= ordering_key => {}
             _ => {
-                latest.insert(session_id, (entry.sequence, observation));
+                latest.insert(session_id, (ordering_key, observation));
             }
         }
     }
@@ -2816,6 +2835,7 @@ mod tests {
                     "cacheReadTokens": 2_000,
                     "cacheReadIncludedInInput": true
                 },
+                "executionBinding": { "role": "orchestrator" },
                 "modelConfig": { "model": "gpt-5-codex" },
                 "timestamp": 1_700_000_000_000_u64
             }),
@@ -2858,6 +2878,7 @@ mod tests {
                     "outputTokens": 3_000,
                     "totalTokens": 18_000
                 },
+                "executionBinding": { "role": "orchestrator" },
                 "modelConfig": { "model": "gpt-5-codex" },
                 "timestamp": 1_700_000_000_000_u64
             }),
@@ -2878,6 +2899,61 @@ mod tests {
             .expect("usage observation should be recorded");
 
         assert_eq!(observation.context_window_tokens, 18_000);
+    }
+
+    #[test]
+    fn model_usage_recorded_ignores_worker_usage_for_session_context_ring() {
+        let mut orchestrator_event = EventEnvelope::audit(
+            EventId::new("event-orchestrator-usage"),
+            "model.usage.recorded",
+            json!({
+                "status": "success",
+                "usage": {
+                    "inputTokens": 20_000,
+                    "outputTokens": 1_000
+                },
+                "executionBinding": { "role": "orchestrator" },
+                "modelConfig": { "model": "gpt-5-codex" },
+                "timestamp": 700_u64
+            }),
+        )
+        .with_context(EventContext {
+            session_id: Some(SessionId::new("session-role-filter")),
+            ..EventContext::default()
+        });
+        orchestrator_event.sequence = 1;
+
+        let mut worker_event = EventEnvelope::audit(
+            EventId::new("event-worker-usage"),
+            "model.usage.recorded",
+            json!({
+                "status": "success",
+                "usage": {
+                    "inputTokens": 99_000,
+                    "outputTokens": 9_000
+                },
+                "executionBinding": { "role": "worker" },
+                "modelConfig": { "model": "gpt-5-codex" },
+                "timestamp": 900_u64
+            }),
+        )
+        .with_context(EventContext {
+            session_id: Some(SessionId::new("session-role-filter")),
+            ..EventContext::default()
+        });
+        worker_event.sequence = 2;
+
+        let read_model = RuntimeReadModelInput::from_events(&[orchestrator_event, worker_event]);
+        let observation = read_model
+            .details
+            .sessions
+            .iter()
+            .find(|entry| entry.session_id == "session-role-filter")
+            .and_then(|entry| entry.usage_observation.as_ref())
+            .expect("orchestrator usage observation should be retained");
+
+        assert_eq!(observation.context_window_tokens, 21_000);
+        assert_eq!(observation.observed_at, Some(UtcMillis(700)));
     }
 
     fn usage_ledger_entry(
@@ -2903,6 +2979,7 @@ mod tests {
                     "inputTokens": input_tokens,
                     "outputTokens": output_tokens
                 },
+                "executionBinding": { "role": "orchestrator" },
                 "modelConfig": { "model": model },
                 "timestamp": timestamp
             }),
@@ -2910,8 +2987,8 @@ mod tests {
     }
 
     #[test]
-    fn latest_usage_observations_from_ledger_keeps_highest_sequence_per_session() {
-        // 同一会话两条用量条目,乱序输入;应保留 sequence 更大的那条。
+    fn latest_usage_observations_from_ledger_keeps_latest_observed_usage_per_session() {
+        // 同一会话两条用量条目,乱序输入;应保留 timestamp 更新的那条。
         // 另含一条无 session 上下文与一条非 usage 事件,均应被忽略。
         let mut noise = EventEnvelope::audit(
             EventId::new("event-non-usage"),
@@ -2946,7 +3023,43 @@ mod tests {
         let observation = observations
             .get("session-a")
             .expect("session-a observation should be present");
-        // sequence 7 wins:20_000 input + 1_000 output.
+        // timestamp 700 wins:20_000 input + 1_000 output.
+        assert_eq!(observation.context_window_tokens, 21_000);
+        assert_eq!(observation.observed_at, Some(UtcMillis(700)));
+    }
+
+    #[test]
+    fn latest_usage_observations_from_ledger_survives_sequence_reset_after_restart() {
+        let entries = vec![
+            usage_ledger_entry("session-a", 5_216, 6_000, 480, "gpt-5.5", 1_782_654_948_746),
+            usage_ledger_entry("session-a", 93, 7_000, 72, "gpt-5.5", 1_783_502_851_661),
+        ];
+
+        let observations = latest_usage_observations_from_ledger(&entries);
+        let observation = observations
+            .get("session-a")
+            .expect("session-a observation should be present");
+
+        assert_eq!(observation.context_window_tokens, 7_072);
+        assert_eq!(observation.observed_at, Some(UtcMillis(1_783_502_851_661)));
+    }
+
+    #[test]
+    fn latest_usage_observations_from_ledger_ignores_newer_worker_usage() {
+        let mut worker_entry =
+            usage_ledger_entry("session-a", 8, 99_000, 1_000, "gpt-5-codex", 800);
+        worker_entry.payload["executionBinding"]["role"] = json!("worker");
+
+        let entries = vec![
+            usage_ledger_entry("session-a", 7, 20_000, 1_000, "gpt-5-codex", 700),
+            worker_entry,
+        ];
+
+        let observations = latest_usage_observations_from_ledger(&entries);
+        let observation = observations
+            .get("session-a")
+            .expect("orchestrator observation should be present");
+
         assert_eq!(observation.context_window_tokens, 21_000);
         assert_eq!(observation.observed_at, Some(UtcMillis(700)));
     }

@@ -9,10 +9,11 @@ await withGoldenViteServer(async (server) => {
   const messagesStore = await server.ssrLoadModule('/src/stores/messages.svelte.ts');
   const dataHandlers = await server.ssrLoadModule('/src/lib/data-message-handlers.ts');
   const timelineRenderItems = await server.ssrLoadModule('/src/lib/timeline-render-items.ts');
+  const agentOutput = await server.ssrLoadModule('/src/lib/agent-output.ts');
   const contract = await server.ssrLoadModule('/src/shared/bridges/rust-daemon-contract.ts');
   const viewImagePreview = await server.ssrLoadModule('/src/lib/view-image-preview.ts');
   const canonicalProtocol = await server.ssrLoadModule('/src/shared/protocol/canonical-turn.ts');
-  runGoldenReplay(reducer, projection, messagesStore, dataHandlers, timelineRenderItems, contract, viewImagePreview, canonicalProtocol);
+  runGoldenReplay(reducer, projection, messagesStore, dataHandlers, timelineRenderItems, agentOutput, contract, viewImagePreview, canonicalProtocol);
   console.log('canonical turn golden replay passed');
 }, { configFile: 'vite.web.config.ts' });
 
@@ -42,7 +43,7 @@ function installGoldenMemoryBridge(bridgeRuntime) {
   });
 }
 
-function runGoldenReplay(reducer, projection, messagesStore, dataHandlers, timelineRenderItems, contract, viewImagePreview, canonicalProtocol) {
+function runGoldenReplay(reducer, projection, messagesStore, dataHandlers, timelineRenderItems, agentOutput, contract, viewImagePreview, canonicalProtocol) {
   const cases = [
     acceptedFirstFrameCase(),
     ordinaryChatCase(),
@@ -97,6 +98,7 @@ function runGoldenReplay(reducer, projection, messagesStore, dataHandlers, timel
   assertAgentSpawnToolCardStaysOnMainlineAndTaskTabsFilterByTaskId(reducer, projection, timelineRenderItems);
   assertRuntimeInternalAgentWaitIsHiddenFromCanonicalMainline(reducer, projection, timelineRenderItems);
   assertParallelAgentSpawnUsesTaskIdTabs(reducer, projection, timelineRenderItems);
+  assertAgentTerminalOutputExtractsFinalText(agentOutput);
   assertBootstrapProcessingStateFromRunningCanonicalTurn(contract);
   assertBootstrapProcessingStateIgnoresForeignSessionRunningTurn(contract);
   assertBootstrapProcessingStateIgnoresTerminalCanonicalTurn(contract);
@@ -105,6 +107,44 @@ function runGoldenReplay(reducer, projection, messagesStore, dataHandlers, timel
   assertBootstrapExplicitWorkspaceWinsOverForeignCurrentSession(contract);
   assertMessagesStoreClearsLocalPendingFromAuthoritativeIdle(messagesStore);
   assertCanonicalTurnModelRejectsSnakeCase(canonicalProtocol);
+}
+
+function assertAgentTerminalOutputExtractsFinalText(agentOutput) {
+  const task = {
+    output_refs: [
+      JSON.stringify({
+        blocks: [
+          { type: 'tool_call', content: 'shell_exec: ok' },
+          { type: 'text', content: '代理完成：发现知识库索引卡住在加载态。' },
+        ],
+      }),
+    ],
+  };
+  assert.deepEqual(
+    agentOutput.agentTerminalOutput(task),
+    {
+      text: '代理完成：发现知识库索引卡住在加载态。',
+      sourceRefIndex: 0,
+      truncated: false,
+    },
+    'agent tab should render the terminal final_text from task output refs',
+  );
+
+  const toolOnly = {
+    output_refs: [
+      JSON.stringify({
+        blocks: [
+          { type: 'tool_call', content: 'shell_exec: ok' },
+          { type: 'text', content: '' },
+        ],
+      }),
+    ],
+  };
+  assert.equal(
+    agentOutput.agentTerminalOutput(toolOnly),
+    null,
+    'tool-only JSON output refs must not leak raw transport JSON into the agent tab',
+  );
 }
 
 function assertCanonicalTurnModelRejectsSnakeCase(canonicalProtocol) {

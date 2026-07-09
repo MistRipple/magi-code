@@ -109,6 +109,13 @@ async fn execute_dispatch_submission(
         placeholder_title,
         accepted_at,
     )?;
+    if let Some(config) = request.orchestrator_session_config.as_ref() {
+        super::settings::save_orchestrator_session_override_for_session(
+            state,
+            &session_id,
+            config,
+        )?;
+    }
     state
         .ensure_snapshot_session_for_workspace_id(&session_id, &workspace_id)
         .await?;

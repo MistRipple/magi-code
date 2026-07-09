@@ -125,6 +125,8 @@
   let pickerModels = $state<string[]>([]);
   let pickerError = $state<string | null>(null);
   let pickerLoadedOnce = false;
+  let pickerModelsConfigKey = '';
+  let draftOrchestratorSessionConfig = $state<Record<string, unknown>>({});
 
   // Git 分支切换器：仅在工作区是 git 仓库时显示。分支信息为即时查询的瞬态状态，
   // 不进持久化 store；切换失败只展示稳定提示，原始错误保留在控制台日志。
@@ -748,6 +750,30 @@
     void refreshBranchState();
   });
 
+  $effect(() => {
+    const orchestratorConfig = getOrchestratorConfigSnapshot();
+    const configKey = orchestratorModelListConfigKey(orchestratorConfig);
+    if (!configKey) {
+      pickerModels = [];
+      pickerModelsConfigKey = '';
+      pickerLoadedOnce = false;
+      pickerError = null;
+      return;
+    }
+    if (pickerModelsConfigKey && pickerModelsConfigKey !== configKey) {
+      pickerModels = [];
+      pickerModelsConfigKey = '';
+      pickerLoadedOnce = false;
+      pickerError = null;
+      if (isDraftSession) {
+        draftOrchestratorSessionConfig = {};
+      }
+    }
+    if (!pickerLoadedOnce && !pickerLoading) {
+      void loadPickerModels();
+    }
+  });
+
   // 新建会话/切换会话后，URL 与 session store 会先变更，settings bootstrap 可能仍是
   // 旧 session 绑定。输入区的模型按钮依赖 session 级有效配置，必须在绑定不匹配时刷新。
   $effect(() => {
@@ -825,6 +851,7 @@
         sessionId: isDraftSession ? '' : (messagesState.currentSessionId || ''),
         skillName: selectedSkill?.skillId ?? null,
         accessProfile: selectedAccessProfile,
+        orchestratorSessionConfig: getTurnOrchestratorSessionConfigPayload(),
         followUpMode: isSending ? 'queue' : undefined,
         images: selectedImages.map((img) => ({
           name: img.name,
@@ -1057,7 +1084,23 @@
     return sessionConfig as Record<string, unknown>;
   }
 
+  function getCurrentOrchestratorSessionConfigSnapshot(): Record<string, unknown> {
+    if (isDraftSession) {
+      return draftOrchestratorSessionConfig;
+    }
+    return getOrchestratorSessionConfigSnapshot();
+  }
+
+  function getTurnOrchestratorSessionConfigPayload(): Record<string, unknown> | null {
+    const config = getCurrentOrchestratorSessionConfigSnapshot();
+    return Object.keys(config).length > 0 ? { ...config } : null;
+  }
+
   function readOrchestratorModel(): string {
+    const sessionModel = getCurrentOrchestratorSessionConfigSnapshot().model;
+    if (typeof sessionModel === 'string' && sessionModel.trim()) {
+      return sessionModel.trim();
+    }
     const config = getEffectiveOrchestratorConfigSnapshot();
     const model = config?.model;
     return typeof model === 'string' ? model.trim() : '';
@@ -1070,6 +1113,10 @@
   }
 
   function readOrchestratorReasoningEffort(): ReasoningEffort | null {
+    const sessionEffort = normalizeReasoningEffort(
+      getCurrentOrchestratorSessionConfigSnapshot().reasoningEffort,
+    );
+    if (sessionEffort) return sessionEffort;
     const config = getEffectiveOrchestratorConfigSnapshot();
     return normalizeReasoningEffort(config?.reasoningEffort);
   }
@@ -1084,6 +1131,21 @@
     return value && typeof value === 'object' && !Array.isArray(value)
       ? value as Record<string, unknown>
       : {};
+  }
+
+  function orchestratorModelListConfigKey(config: Record<string, unknown> | null): string {
+    if (!config) return '';
+    const baseUrl = typeof config.baseUrl === 'string' ? config.baseUrl.trim() : '';
+    const apiKey = typeof config.apiKey === 'string' ? config.apiKey.trim() : '';
+    const urlMode = typeof config.urlMode === 'string' ? config.urlMode.trim() : '';
+    return JSON.stringify({ baseUrl, apiKey, urlMode });
+  }
+
+  function applyDraftOrchestratorSessionPatch(patch: Record<string, unknown>) {
+    draftOrchestratorSessionConfig = {
+      ...draftOrchestratorSessionConfig,
+      ...patch,
+    };
   }
 
   function getAuxiliaryConfigSnapshot(): Record<string, unknown> | null {
@@ -1153,6 +1215,10 @@
       pickerLoading = false;
       return;
     }
+    const configKey = orchestratorModelListConfigKey(orchestratorConfig);
+    if (pickerLoadedOnce && pickerModelsConfigKey === configKey && pickerModels.length > 0) {
+      return;
+    }
     pickerLoading = true;
     pickerError = null;
     try {
@@ -1161,7 +1227,12 @@
         'orch',
       );
       pickerModels = Array.isArray(payload.models) ? payload.models : [];
+      pickerModelsConfigKey = configKey;
       pickerLoadedOnce = true;
+      const firstModel = pickerModels.find((model) => model.trim().length > 0)?.trim() ?? '';
+      if (firstModel && !currentPickerModel.trim()) {
+        applyDraftOrchestratorSessionPatch({ model: firstModel });
+      }
     } catch (error) {
       console.warn('[InputArea] 拉取主线模型列表失败:', error);
       pickerError = i18n.t('input.modelListLoadFailed');
@@ -1178,10 +1249,11 @@
     }
     const sessionId = currentSessionId?.trim() || '';
     if (!sessionId) {
-      pickerError = i18n.t('input.modelPickerSessionRequired');
+      applyDraftOrchestratorSessionPatch({ model: normalizedModel });
+      pickerError = null;
+      pickerOpen = false;
       return;
     }
-
     pickerSavingModel = normalizedModel;
     pickerError = null;
     const nextSessionConfig = {
@@ -1218,7 +1290,8 @@
   async function selectPickerReasoningEffort(value: ReasoningEffort) {
     const sessionId = currentSessionId?.trim() || '';
     if (!sessionId) {
-      pickerError = i18n.t('input.modelPickerSessionRequired');
+      applyDraftOrchestratorSessionPatch({ reasoningEffort: value });
+      pickerError = null;
       return;
     }
     if (value === currentPickerReasoningEffort) {
@@ -2223,14 +2296,22 @@
   }
   .ia-model-btn {
     max-width: 230px;
-    background: color-mix(in srgb, var(--primary) 16%, transparent);
-    border-color: color-mix(in srgb, var(--primary) 50%, transparent);
-    color: color-mix(in srgb, var(--primary) 62%, white);
     gap: 6px;
+  }
+  .ia-model-btn:hover:not(:disabled),
+  .ia-model-btn.active {
+    background: color-mix(in srgb, var(--primary) 12%, transparent);
+    border-color: color-mix(in srgb, var(--primary) 38%, transparent);
+    color: var(--primary);
+  }
+  .ia-model-btn.configured {
+    background: color-mix(in srgb, var(--primary) 12%, transparent);
+    border-color: color-mix(in srgb, var(--primary) 36%, transparent);
+    color: var(--primary);
   }
   .ia-model-btn .ia-picker-btn-label {
     max-width: 132px;
-    color: color-mix(in srgb, var(--primary) 44%, white);
+    color: inherit;
   }
   .ia-model-effort {
     flex: 0 0 auto;
@@ -2239,10 +2320,11 @@
     height: 16px;
     padding: 0 6px;
     border-radius: var(--radius-full);
-    background: color-mix(in srgb, var(--primary) 28%, transparent);
-    color: color-mix(in srgb, var(--primary) 54%, white);
+    background: color-mix(in srgb, var(--primary) 12%, transparent);
+    color: inherit;
     font-size: 10px;
     line-height: 16px;
+    font-weight: 650;
     white-space: nowrap;
   }
   .ia-workspace-btn,

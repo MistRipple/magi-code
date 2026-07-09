@@ -1646,7 +1646,6 @@ function createSettingsStore(props: { onClose?: () => void }) {
 
     // 保存后强制拉取最新 bootstrap，避免先套用旧快照导致 tab 闪回。
     await requestSettingsBootstrap(true);
-    await testModelConnection(target, target === "worker" ? key : undefined);
   }
 
   function confirmInputDialog() {

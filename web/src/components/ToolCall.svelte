@@ -363,6 +363,7 @@
     if (!display || !display.childTaskId) return;
     openAgentTab(filePreviewScope?.sessionId || getCurrentSessionId(), display.childTaskId, {
       label: display.title,
+      accentToken: agentSpawnRoleVisual?.color ?? null,
       workspaceId: filePreviewScope?.workspaceId || messagesState.currentWorkspaceId,
       workspacePath: filePreviewScope?.workspacePath || messagesState.currentWorkspacePath,
     });

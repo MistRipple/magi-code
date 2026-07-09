@@ -20,6 +20,7 @@ const capturedTurnBodies = [];
 const bootstrapInterceptors = [];
 const bridgeMutationRequests = [];
 const bridgeMutationInterceptors = [];
+const sessionTurnInterceptors = [];
 let messagesSnapshotRequestCount = 0;
 let switchSessionRequestCount = 0;
 
@@ -298,7 +299,12 @@ function installFetchStub() {
       return new Response('ok', { status: 200 });
     }
     if (parsed.pathname === '/api/session/turn') {
-      capturedTurnBodies.push(JSON.parse(String(init.body || '{}')));
+      const body = JSON.parse(String(init.body || '{}'));
+      capturedTurnBodies.push(body);
+      const interceptor = sessionTurnInterceptors.shift();
+      if (interceptor) {
+        return interceptor(parsed, init, body);
+      }
       return jsonResponse({
         sessionId: 'session-bridge-partial-scope',
         entryId: 'timeline-bridge-partial-scope',
@@ -558,6 +564,10 @@ function findArtifactByTurnItemId(projection, itemId) {
   return projection?.artifacts?.find((artifact) => artifact.message?.metadata?.turnItemId === itemId);
 }
 
+function findArtifactByRequestId(projection, requestId) {
+  return projection?.artifacts?.find((artifact) => artifact.message?.metadata?.requestId === requestId);
+}
+
 function currentSessionSummary(messagesStore) {
   return messagesStore.messagesState.sessions.find((session) => session.id === SESSION_ID);
 }
@@ -685,6 +695,55 @@ await withGoldenViteServer(async (server) => {
     false,
     'terminal session turn event must project the final assistant item as non-streaming',
   );
+
+  const queuedTurnAccepted = deferred();
+  sessionTurnInterceptors.push(() => queuedTurnAccepted.promise);
+  messagesStore.addPendingRequest('busy-before-queued-follow-up');
+  bridge.postMessage({
+    type: 'executeTask',
+    text: '排队消息必须在出队提交时立刻进入主线。',
+    requestId: 'request-queued-immediate-feedback',
+    workspaceId: WORKSPACE_ID,
+    workspacePath: WORKSPACE_PATH,
+    sessionId: SESSION_ID,
+    followUpMode: 'queue',
+  });
+  await waitFor(
+    () => messagesStore.messagesState.queuedMessages.some((message) => message.requestId === 'request-queued-immediate-feedback'),
+    'busy follow-up must enter the queued message list immediately',
+  );
+  messagesStore.clearPendingRequest('busy-before-queued-follow-up');
+  await waitFor(
+    () => capturedTurnBodies.some((body) => body.requestId === 'request-queued-immediate-feedback'),
+    'queued follow-up must submit after the active turn is idle',
+  );
+  assert.ok(
+    findArtifactByRequestId(
+      messagesStore.messagesState.canonicalTimelineProjection,
+      'request-queued-immediate-feedback',
+    ),
+    'queued follow-up must become a local pending turn before /api/session/turn resolves',
+  );
+  assert.equal(
+    messagesStore.messagesState.isProcessing,
+    true,
+    'queued follow-up local pending turn must mark the UI as processing before backend accepted response',
+  );
+  queuedTurnAccepted.resolve(jsonResponse({
+    sessionId: SESSION_ID,
+    entryId: 'timeline-queued-immediate-feedback',
+    eventId: 'event-queued-immediate-feedback',
+    acceptedAt: ACCEPTED_AT + 2500,
+    createdSession: false,
+    route: 'chat',
+    userMessageItemId: 'user-queued-immediate-feedback',
+    canonicalSchemaVersion: null,
+    canonicalEventKind: null,
+    canonicalTurn: null,
+    canonicalItem: null,
+  }));
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  messagesStore.clearPendingRequest('request-queued-immediate-feedback');
 
   const streamCountBeforeLagged = FakeEventSource.instances.length;
   const originalWarn = console.warn;
@@ -906,15 +965,19 @@ await withGoldenViteServer(async (server) => {
     workspaceId: PARTIAL_WORKSPACE_ID,
     requestId: 'request-bridge-partial-scope',
   });
-  await waitFor(() => capturedTurnBodies.length === 1, 'partial workspace submit must reach backend');
-  assert.equal(capturedTurnBodies[0].workspaceId, PARTIAL_WORKSPACE_ID);
+  await waitFor(
+    () => capturedTurnBodies.some((body) => body.requestId === 'request-bridge-partial-scope'),
+    'partial workspace submit must reach backend',
+  );
+  const partialWorkspaceBody = capturedTurnBodies.find((body) => body.requestId === 'request-bridge-partial-scope');
+  assert.equal(partialWorkspaceBody.workspaceId, PARTIAL_WORKSPACE_ID);
   assert.equal(
-    capturedTurnBodies[0].workspacePath,
+    partialWorkspaceBody.workspacePath,
     null,
     'workspaceId-only bridge submit must not inherit stale current workspacePath',
   );
   assert.equal(
-    capturedTurnBodies[0].sessionId,
+    partialWorkspaceBody.sessionId,
     null,
     'workspaceId-only bridge submit must not inherit stale current sessionId',
   );
@@ -950,6 +1013,56 @@ await withGoldenViteServer(async (server) => {
     false,
     'authoritative workspace-only binding must not let stale URL sessionId re-enter bootstrap',
   );
+
+  const firstTurnAccepted = deferred();
+  sessionTurnInterceptors.push(() => firstTurnAccepted.promise);
+  bridge.postMessage({
+    type: 'executeTask',
+    text: '首条消息必须立刻进入主线。',
+    requestId: 'request-first-turn-immediate-feedback',
+    workspaceId: WORKSPACE_ID,
+    workspacePath: WORKSPACE_PATH,
+    sessionId: '',
+  });
+  await waitFor(
+    () => capturedTurnBodies.some((body) => body.requestId === 'request-first-turn-immediate-feedback'),
+    'first turn submit must reach backend',
+  );
+  const firstTurnBody = capturedTurnBodies.find((body) => body.requestId === 'request-first-turn-immediate-feedback');
+  assert.equal(
+    firstTurnBody.sessionId,
+    null,
+    'first turn optimistic session must not be sent as a real backend sessionId',
+  );
+  assert.ok(
+    messagesStore.messagesState.currentSessionId?.startsWith('session-local-request-first-turn-immediate-feedback'),
+    'first turn must create a local-only session binding before backend accepted response',
+  );
+  assert.ok(
+    findArtifactByRequestId(
+      messagesStore.messagesState.canonicalTimelineProjection,
+      'request-first-turn-immediate-feedback',
+    ),
+    'first turn must become a local pending turn before /api/session/turn resolves',
+  );
+  firstTurnAccepted.resolve(jsonResponse({
+    sessionId: SESSION_ID,
+    entryId: 'timeline-first-turn-immediate-feedback',
+    eventId: 'event-first-turn-immediate-feedback',
+    acceptedAt: ACCEPTED_AT + 2600,
+    createdSession: true,
+    route: 'chat',
+    userMessageItemId: 'user-first-turn-immediate-feedback',
+    canonicalSchemaVersion: null,
+    canonicalEventKind: null,
+    canonicalTurn: null,
+    canonicalItem: null,
+  }));
+  await waitFor(
+    () => messagesStore.messagesState.currentSessionId === SESSION_ID,
+    'first turn accepted response must replace the local-only session binding with the real session',
+  );
+  messagesStore.clearPendingRequest('request-first-turn-immediate-feedback');
 
   const originalRaceWarn = console.warn;
   try {

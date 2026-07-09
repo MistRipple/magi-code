@@ -170,24 +170,37 @@ impl InMemoryEventBus {
 
     pub fn import_audit_usage_ledger_json(&self, value: &str) -> Result<(), AuditUsageLedgerError> {
         let snapshot = AuditUsageLedgerSnapshot::import_json(value)?;
+        let next_sequence = snapshot.next_sequence;
         let mut ledger = self
             .audit_usage_ledger
             .write()
             .expect("event bus audit/usage ledger write lock poisoned");
         *ledger = snapshot;
+        self.advance_sequence_from_ledger(next_sequence);
         self.clear_audit_usage_ledger_error();
         self.mark_audit_usage_ledger_clean(None);
         Ok(())
     }
 
     pub fn import_audit_usage_ledger_snapshot(&self, snapshot: AuditUsageLedgerSnapshot) {
+        let snapshot = snapshot.normalize();
+        let next_sequence = snapshot.next_sequence;
         let mut ledger = self
             .audit_usage_ledger
             .write()
             .expect("event bus audit/usage ledger write lock poisoned");
-        *ledger = snapshot.normalize();
+        *ledger = snapshot;
+        self.advance_sequence_from_ledger(next_sequence);
         self.clear_audit_usage_ledger_error();
         self.mark_audit_usage_ledger_clean(None);
+    }
+
+    fn advance_sequence_from_ledger(&self, next_sequence: u64) {
+        if next_sequence == 0 {
+            return;
+        }
+        self.sequence
+            .fetch_max(next_sequence.saturating_sub(1), Ordering::SeqCst);
     }
 
     pub fn reset_audit_usage_ledger(&self) {
@@ -540,6 +553,32 @@ mod tests {
                 .blocking_issue_count,
             runtime_ledger.cutover_readiness.blocking_issue_count
         );
+    }
+
+    #[test]
+    fn 恢复账本后新事件序号必须延续账本序号() {
+        let original = InMemoryEventBus::new(8);
+        original
+            .publish(event(EventCategory::Usage, "ledger.usage.before", 1))
+            .expect("publish original usage event");
+        let restored_snapshot = original.audit_usage_ledger_snapshot();
+        assert_eq!(restored_snapshot.next_sequence, 2);
+
+        let restored = InMemoryEventBus::new(8);
+        restored.import_audit_usage_ledger_snapshot(restored_snapshot);
+        let next_sequence = restored
+            .publish(event(EventCategory::Usage, "ledger.usage.after", 0))
+            .expect("publish restored usage event");
+
+        assert_eq!(next_sequence, 2);
+        let ledger = restored.audit_usage_ledger_snapshot();
+        let sequences = ledger
+            .usage_entries
+            .iter()
+            .map(|entry| entry.sequence)
+            .collect::<Vec<_>>();
+        assert_eq!(sequences, vec![1, 2]);
+        assert_eq!(ledger.next_sequence, 3);
     }
 
     #[test]

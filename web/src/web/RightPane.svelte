@@ -379,7 +379,19 @@
 
   function tabAccent(tab: RightPaneTab): string {
     if (tab.kind === 'agent') {
-      return tab.accentToken ? `var(--${tab.accentToken})` : 'var(--accent)';
+      const accent = tab.accentToken?.trim();
+      if (!accent) return 'var(--accent)';
+      if (
+        accent.startsWith('var(')
+        || accent.startsWith('#')
+        || accent.startsWith('rgb(')
+        || accent.startsWith('rgba(')
+        || accent.startsWith('hsl(')
+        || accent.startsWith('hsla(')
+      ) {
+        return accent;
+      }
+      return `var(--${accent})`;
     }
     return 'var(--info)';
   }
