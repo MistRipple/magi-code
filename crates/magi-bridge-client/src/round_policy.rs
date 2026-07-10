@@ -5,7 +5,7 @@ use crate::orchestrator_termination::{OrchestratorTerminationReason, Termination
 
 // ============================================================================
 // Prompt templates · 通过 `include_str!` 在编译期内联到二进制，
-// 运行时只做 `{{key}}` 字符串替换（与 magi-lifecycle-notice 同一 pattern）。
+// 运行时只做 `{{key}}` 字符串替换，保持模板渲染边界简单且可审计。
 //
 // 为什么不用 format!：模板里大量 JSON / 角括号 / Markdown 字面量包含 `{` `}`，
 // 与 format! 的 `{{` `}}` escape 互相干扰；引入 handlebars 对 11 个简单模板

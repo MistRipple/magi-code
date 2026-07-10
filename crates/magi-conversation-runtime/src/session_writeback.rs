@@ -3,12 +3,14 @@ use crate::tool_result_utils::{
     model_visible_tool_result, summarize_tool_result, tool_execution_failed_result,
     tool_execution_status_label, turn_item_status_for_tool_result,
 };
+use crate::tool_surface_state::activated_skill_id_from_tool_result;
 use crate::{
     SKILL_APPLY_TOOL_NAME, active_skill_tool_execution_policy, execute_skill_apply_from_runtime,
     execute_skill_custom_tool, internal_builtin_tool_rejection_payload,
     parse_skill_custom_tool_name,
     tool_batch::{
-        access_profile_tool_decision, safety_gate_tool_decision, select_preflight_decision,
+        access_profile_tool_decision, execute_goal_tool, safety_gate_tool_decision,
+        select_preflight_decision,
     },
     tool_execution_policy_scope,
 };
@@ -63,6 +65,13 @@ pub struct SessionTurnStreamUpdate {
     pub delta: String,
     pub content_length: usize,
     pub reset: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SessionToolCallBatchOutcome {
+    pub completed: bool,
+    pub succeeded_tool_names: Vec<String>,
+    pub activated_skill_id: Option<String>,
 }
 
 const STREAM_ITEM_PUBLISH_MIN_INTERVAL_MS: u64 = 80;
@@ -305,6 +314,9 @@ fn canonical_item_renderable(
     kind: CanonicalTurnItemKind,
     status: CanonicalTurnItemStatus,
 ) -> bool {
+    if let Some(renderable) = item.requested_renderable() {
+        return renderable;
+    }
     if kind == CanonicalTurnItemKind::ToolCall
         && item
             .tool_name
@@ -658,7 +670,8 @@ fn to_turn_item_summary(
     }
 }
 
-pub fn append_session_tool_call_items_batch(
+#[cfg(test)]
+fn append_session_tool_call_items_batch(
     session_store: &SessionStore,
     event_bus: &InMemoryEventBus,
     tool_registry: Option<&ToolRegistry>,
@@ -677,10 +690,58 @@ pub fn append_session_tool_call_items_batch(
     source_thread_id: &ThreadId,
     persist_session_state: Option<&SessionStatePersistCallback>,
     write_allowed: impl Fn() -> bool,
-) -> bool {
+) -> SessionToolCallBatchOutcome {
+    let todo_ledger = crate::test_todo_ledger("test-todo-ledger");
+    let mission_id = magi_core::MissionId::new(format!("mission-{session_id}"));
+    append_session_tool_call_items_batch_with_context(
+        session_store,
+        event_bus,
+        tool_registry,
+        skill_runtime,
+        skill_dispatch_runtime,
+        skill_name,
+        safety_gate,
+        &todo_ledger,
+        &mission_id,
+        session_id,
+        workspace_id,
+        workspace_root_path,
+        access_profile,
+        tool_calls,
+        messages,
+        snapshot_session,
+        execution_group_id,
+        source_thread_id,
+        persist_session_state,
+        write_allowed,
+    )
+}
+
+pub fn append_session_tool_call_items_batch_with_context(
+    session_store: &SessionStore,
+    event_bus: &InMemoryEventBus,
+    tool_registry: Option<&ToolRegistry>,
+    skill_runtime: Option<&SkillRuntime>,
+    skill_dispatch_runtime: Option<&SkillDispatchRuntime>,
+    skill_name: Option<&str>,
+    safety_gate: Option<&magi_safety_gate::SafetyGate>,
+    todo_ledger: &magi_todo_ledger::TodoLedger,
+    mission_id: &magi_core::MissionId,
+    session_id: &SessionId,
+    workspace_id: &Option<WorkspaceId>,
+    workspace_root_path: Option<PathBuf>,
+    access_profile: magi_core::AccessProfile,
+    tool_calls: &[ChatToolCall],
+    messages: &mut Vec<ChatMessage>,
+    snapshot_session: Option<Arc<SnapshotSession>>,
+    execution_group_id: Option<String>,
+    source_thread_id: &ThreadId,
+    persist_session_state: Option<&SessionStatePersistCallback>,
+    write_allowed: impl Fn() -> bool,
+) -> SessionToolCallBatchOutcome {
     for tool_call in tool_calls {
         if !write_allowed() {
-            return false;
+            return SessionToolCallBatchOutcome::default();
         }
         let mut started_item = session_turn_item(
             "tool_call_started",
@@ -711,12 +772,15 @@ pub fn append_session_tool_call_items_batch(
         .collect();
 
     let tool_results = execute_session_turn_tool_call_batch(
+        session_store,
         event_bus,
         tool_registry,
         skill_runtime,
         skill_dispatch_runtime,
         skill_name,
         safety_gate,
+        todo_ledger,
+        mission_id,
         tool_calls,
         session_id,
         workspace_id,
@@ -736,9 +800,16 @@ pub fn append_session_tool_call_items_batch(
         );
     }
 
+    let mut succeeded_tool_names = Vec::new();
+    let mut activated_skill_id = None;
     for (tool_call, (tool_result, tool_status)) in tool_calls.iter().zip(tool_results.into_iter()) {
         if !write_allowed() {
-            return false;
+            return SessionToolCallBatchOutcome::default();
+        }
+        if is_session_goal_write_tool(&tool_call.function.name)
+            && matches!(tool_status, ExecutionResultStatus::Succeeded)
+        {
+            persist_session_state_checkpoint(persist_session_state, "session_goal_tool");
         }
         upsert_session_tool_call_result_item(
             session_store,
@@ -758,8 +829,20 @@ pub fn append_session_tool_call_items_batch(
             tool_calls: Vec::new(),
             tool_call_id: Some(tool_call.id.clone()),
         });
+        if matches!(tool_status, ExecutionResultStatus::Succeeded) {
+            succeeded_tool_names.push(tool_call.function.name.clone());
+        }
+        if let Some(skill_id) =
+            activated_skill_id_from_tool_result(&tool_call.function.name, &tool_result, tool_status)
+        {
+            activated_skill_id = Some(skill_id);
+        }
     }
-    true
+    SessionToolCallBatchOutcome {
+        completed: true,
+        succeeded_tool_names,
+        activated_skill_id,
+    }
 }
 
 fn upsert_session_tool_call_result_item(
@@ -798,12 +881,15 @@ fn upsert_session_tool_call_result_item(
 }
 
 fn execute_session_turn_tool_call_batch(
+    session_store: &SessionStore,
     event_bus: &InMemoryEventBus,
     tool_registry: Option<&ToolRegistry>,
     skill_runtime: Option<&SkillRuntime>,
     skill_dispatch_runtime: Option<&SkillDispatchRuntime>,
     skill_name: Option<&str>,
     safety_gate: Option<&magi_safety_gate::SafetyGate>,
+    todo_ledger: &magi_todo_ledger::TodoLedger,
+    mission_id: &magi_core::MissionId,
     tool_calls: &[ChatToolCall],
     session_id: &SessionId,
     workspace_id: &Option<WorkspaceId>,
@@ -837,13 +923,16 @@ fn execute_session_turn_tool_call_batch(
                         snapshot.before_tool(&hook_ctx);
                     }
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        execute_session_turn_tool_call(
+                        execute_session_turn_tool_call_scoped(
+                            session_store,
                             event_bus,
                             tool_registry,
                             skill_runtime,
                             skill_dispatch_runtime,
                             skill_name,
                             safety_gate,
+                            todo_ledger,
+                            mission_id,
                             &tool_calls[tool_index],
                             session_id,
                             workspace_id,
@@ -885,13 +974,16 @@ fn execute_session_turn_tool_call_batch(
                                     }
                                     let result = std::panic::catch_unwind(
                                         std::panic::AssertUnwindSafe(|| {
-                                            execute_session_turn_tool_call(
+                                            execute_session_turn_tool_call_scoped(
+                                                session_store,
                                                 event_bus,
                                                 tool_registry,
                                                 skill_runtime,
                                                 skill_dispatch_runtime,
                                                 skill_name,
                                                 safety_gate,
+                                                todo_ledger,
+                                                mission_id,
                                                 tool_call,
                                                 session_id,
                                                 workspace_id,
@@ -950,7 +1042,9 @@ fn execute_session_turn_tool_call_batch(
         .collect()
 }
 
+#[cfg(test)]
 fn execute_session_turn_tool_call(
+    session_store: &SessionStore,
     event_bus: &InMemoryEventBus,
     tool_registry: Option<&ToolRegistry>,
     skill_runtime: Option<&SkillRuntime>,
@@ -963,6 +1057,85 @@ fn execute_session_turn_tool_call(
     workspace_root_path: Option<&PathBuf>,
     access_profile: magi_core::AccessProfile,
 ) -> (String, ExecutionResultStatus) {
+    let todo_ledger = crate::test_todo_ledger("test-todo-ledger");
+    let mission_id = magi_core::MissionId::new(format!("mission-{session_id}"));
+    execute_session_turn_tool_call_scoped(
+        session_store,
+        event_bus,
+        tool_registry,
+        skill_runtime,
+        skill_dispatch_runtime,
+        skill_name,
+        safety_gate,
+        &todo_ledger,
+        &mission_id,
+        tool_call,
+        session_id,
+        workspace_id,
+        workspace_root_path,
+        access_profile,
+    )
+}
+
+fn execute_session_turn_tool_call_scoped(
+    session_store: &SessionStore,
+    event_bus: &InMemoryEventBus,
+    tool_registry: Option<&ToolRegistry>,
+    skill_runtime: Option<&SkillRuntime>,
+    skill_dispatch_runtime: Option<&SkillDispatchRuntime>,
+    skill_name: Option<&str>,
+    safety_gate: Option<&magi_safety_gate::SafetyGate>,
+    todo_ledger: &magi_todo_ledger::TodoLedger,
+    mission_id: &magi_core::MissionId,
+    tool_call: &ChatToolCall,
+    session_id: &SessionId,
+    workspace_id: &Option<WorkspaceId>,
+    workspace_root_path: Option<&PathBuf>,
+    access_profile: magi_core::AccessProfile,
+) -> (String, ExecutionResultStatus) {
+    if let Some(canonical) = BuiltinToolName::from_str(tool_call.function.name.as_str())
+        && matches!(
+            canonical,
+            BuiltinToolName::GetGoal | BuiltinToolName::CreateGoal | BuiltinToolName::UpdateGoal
+        )
+    {
+        let Some(thread_id) = session_store
+            .orchestrator_thread_for_session(session_id)
+            .map(|thread| thread.thread_id)
+        else {
+            return (
+                serde_json::json!({
+                    "tool": canonical.as_str(),
+                    "status": "failed",
+                    "error": "当前会话缺少主线 thread，无法执行 goal 工具",
+                })
+                .to_string(),
+                ExecutionResultStatus::Failed,
+            );
+        };
+        return execute_goal_tool(
+            session_store,
+            session_id,
+            thread_id,
+            canonical,
+            &tool_call.function.arguments,
+        );
+    }
+
+    if matches!(
+        BuiltinToolName::from_str(tool_call.function.name.as_str()),
+        Some(BuiltinToolName::TodoWrite)
+    ) {
+        return magi_todo_ledger::execute_session_todo_write_tool(
+            event_bus,
+            todo_ledger,
+            session_id,
+            workspace_id.as_ref(),
+            mission_id,
+            &tool_call.function.arguments,
+        );
+    }
+
     let Some(registry) = tool_registry else {
         return (
             serde_json::json!({ "error": "tool registry not available" }).to_string(),
@@ -1018,6 +1191,23 @@ fn execute_session_turn_tool_call(
         );
     }
 
+    if let Some(result) =
+        registry.execute_external_mcp_tool(&tool_call.function.name, &tool_call.function.arguments)
+    {
+        if access_profile == magi_core::AccessProfile::ReadOnly {
+            return (
+                serde_json::json!({
+                    "tool": tool_call.function.name,
+                    "status": "failed",
+                    "error": "只读访问模式不允许调用 MCP 工具",
+                })
+                .to_string(),
+                ExecutionResultStatus::Failed,
+            );
+        }
+        return result;
+    }
+
     if let Some(rejection) = internal_builtin_tool_rejection_payload(&tool_call.function.name) {
         return (rejection, ExecutionResultStatus::Failed);
     }
@@ -1064,6 +1254,15 @@ fn execute_session_turn_tool_call(
         &tool_policy,
     );
     (output.payload, output.status)
+}
+
+fn is_session_goal_write_tool(tool_name: &str) -> bool {
+    BuiltinToolName::from_str(tool_name).is_some_and(|tool| {
+        matches!(
+            tool,
+            BuiltinToolName::CreateGoal | BuiltinToolName::UpdateGoal
+        )
+    })
 }
 
 #[cfg(test)]
@@ -1380,6 +1579,38 @@ mod tests {
     }
 
     #[test]
+    fn canonical_turn_respects_explicit_non_renderable_model_output() {
+        let session_id = SessionId::new("session-hidden-goal-progress");
+        let thread_id = ThreadId::new("thread-hidden-goal-progress");
+        let now = UtcMillis::now();
+        let mut item = session_turn_item(
+            "assistant_final",
+            "completed",
+            Some("最终回复".to_string()),
+            Some("目标仍在推进".to_string()),
+            Some("turn-item-hidden-goal-progress".to_string()),
+            thread_id,
+        );
+        item.metadata
+            .insert("renderable".to_string(), serde_json::Value::Bool(false));
+        let turn = ActiveExecutionTurn {
+            turn_id: "turn-hidden-goal-progress".to_string(),
+            turn_seq: 1,
+            accepted_at: now,
+            completed_at: Some(now),
+            status: "completed".to_string(),
+            user_message: None,
+            items: vec![item.clone()],
+        };
+
+        let canonical = to_canonical_turn_item(&session_id, &turn, &item)
+            .expect("目标中间输出应保留在 canonical 审计记录");
+
+        assert!(!canonical.visibility.renderable);
+        assert_eq!(canonical.content.as_deref(), Some("目标仍在推进"));
+    }
+
+    #[test]
     fn canonical_turn_keeps_agent_spawn_tool_call_renderable() {
         let session_id = SessionId::new("session-agent-spawn-visible");
         let thread_id = ThreadId::new("thread-agent-spawn-visible");
@@ -1435,6 +1666,7 @@ mod tests {
         };
 
         let (_, status) = execute_session_turn_tool_call(
+            &SessionStore::new(),
             &event_bus,
             None,
             None,
@@ -1463,6 +1695,7 @@ mod tests {
                 category: "quality".to_string(),
                 tags: vec!["review".to_string()],
             },
+            restrict_standard_tools: true,
             allowed_tools: vec![],
             custom_tool_bindings: vec![],
             prompt_priority: 50,
@@ -1483,6 +1716,7 @@ mod tests {
         };
 
         let (payload, status) = execute_session_turn_tool_call(
+            &SessionStore::new(),
             &event_bus,
             Some(&tool_registry),
             Some(&skill_runtime),
@@ -1503,6 +1737,63 @@ mod tests {
     }
 
     #[test]
+    fn execute_session_turn_tool_call_routes_live_mcp_tool_through_registry() {
+        let event_bus = InMemoryEventBus::new(8);
+        let tool_registry = ToolRegistry::new(
+            Arc::new(GovernanceService::default()),
+            Arc::new(InMemoryEventBus::new(8)),
+        )
+        .with_external_tool_catalog_provider(Arc::new(|| {
+            magi_tool_runtime::ExternalToolCatalogSnapshot {
+                mcp_tools: vec![magi_tool_runtime::ExternalMcpToolCatalogEntry {
+                    server_id: "repo-tools".to_string(),
+                    server_name: "Repository Tools".to_string(),
+                    model_tool_name: "mcp__repo-tools__inspect".to_string(),
+                    tool_name: "inspect".to_string(),
+                    description: "Inspect repository".to_string(),
+                    input_schema: serde_json::json!({ "type": "object", "properties": {} }),
+                }],
+                ..magi_tool_runtime::ExternalToolCatalogSnapshot::default()
+            }
+        }))
+        .with_external_mcp_tool_executor(Arc::new(|server_id, tool_name, arguments| {
+            assert_eq!(server_id, "repo-tools");
+            assert_eq!(tool_name, "inspect");
+            assert_eq!(arguments, "{}");
+            (
+                serde_json::json!({ "status": "succeeded", "files": 3 }).to_string(),
+                ExecutionResultStatus::Succeeded,
+            )
+        }));
+        let call = ChatToolCall {
+            id: "tool-call-live-mcp".to_string(),
+            kind: "function".to_string(),
+            function: ChatToolFunction {
+                name: "mcp__repo-tools__inspect".to_string(),
+                arguments: "{}".to_string(),
+            },
+        };
+
+        let (payload, status) = execute_session_turn_tool_call(
+            &SessionStore::new(),
+            &event_bus,
+            Some(&tool_registry),
+            None,
+            None,
+            None,
+            None,
+            &call,
+            &SessionId::new("session-live-mcp"),
+            &None,
+            None,
+            magi_core::AccessProfile::Restricted,
+        );
+
+        assert_eq!(status, ExecutionResultStatus::Succeeded);
+        assert!(payload.contains("\"files\":3"));
+    }
+
+    #[test]
     fn execute_session_turn_tool_call_dispatches_custom_skill_binding() {
         let registry = SkillRegistry::new();
         registry.register(SkillDefinition {
@@ -1513,6 +1804,7 @@ mod tests {
                 category: "quality".to_string(),
                 tags: vec!["review".to_string()],
             },
+            restrict_standard_tools: true,
             allowed_tools: vec![],
             custom_tool_bindings: vec![magi_skill_runtime::CustomToolBinding {
                 binding_id: "review-mcp".to_string(),
@@ -1546,6 +1838,7 @@ mod tests {
         };
 
         let (payload, status) = execute_session_turn_tool_call(
+            &SessionStore::new(),
             &event_bus,
             Some(&tool_registry),
             Some(&skill_runtime),
@@ -1583,6 +1876,7 @@ mod tests {
                 category: "quality".to_string(),
                 tags: vec!["review".to_string()],
             },
+            restrict_standard_tools: true,
             allowed_tools: vec![],
             custom_tool_bindings: vec![magi_skill_runtime::CustomToolBinding {
                 binding_id: "review-mcp".to_string(),
@@ -1616,6 +1910,7 @@ mod tests {
         };
 
         let (payload, status) = execute_session_turn_tool_call(
+            &SessionStore::new(),
             &event_bus,
             Some(&tool_registry),
             Some(&skill_runtime),
@@ -1659,6 +1954,7 @@ mod tests {
                 category: "ops".to_string(),
                 tags: vec!["mcp".to_string()],
             },
+            restrict_standard_tools: true,
             allowed_tools: vec![],
             custom_tool_bindings: vec![magi_skill_runtime::CustomToolBinding {
                 binding_id: "shell-mcp-binding".to_string(),
@@ -1699,6 +1995,7 @@ mod tests {
         };
 
         let (payload, status) = execute_session_turn_tool_call(
+            &SessionStore::new(),
             &event_bus,
             Some(&tool_registry),
             Some(&skill_runtime),
@@ -1735,6 +2032,7 @@ mod tests {
                 category: "quality".to_string(),
                 tags: vec!["search".to_string()],
             },
+            restrict_standard_tools: true,
             allowed_tools: vec!["search_text".to_string()],
             custom_tool_bindings: vec![],
             prompt_priority: 50,
@@ -1756,6 +2054,7 @@ mod tests {
         };
 
         let (payload, status) = execute_session_turn_tool_call(
+            &SessionStore::new(),
             &event_bus,
             Some(&tool_registry),
             Some(&skill_runtime),
@@ -1796,6 +2095,7 @@ mod tests {
         };
 
         let (payload, status) = execute_session_turn_tool_call(
+            &SessionStore::new(),
             &event_bus,
             Some(&tool_registry),
             None,
@@ -1846,6 +2146,7 @@ mod tests {
         };
 
         let (payload, status) = execute_session_turn_tool_call(
+            &SessionStore::new(),
             &event_bus,
             Some(&tool_registry),
             None,
@@ -1891,6 +2192,7 @@ mod tests {
         };
 
         let (payload, status) = execute_session_turn_tool_call(
+            &SessionStore::new(),
             &event_bus,
             Some(&tool_registry),
             None,
@@ -1937,6 +2239,7 @@ mod tests {
         };
 
         let (payload, status) = execute_session_turn_tool_call(
+            &SessionStore::new(),
             &event_bus,
             Some(&tool_registry),
             None,
@@ -1978,6 +2281,7 @@ mod tests {
         };
 
         let (payload, status) = execute_session_turn_tool_call(
+            &SessionStore::new(),
             &event_bus,
             Some(&tool_registry),
             None,
@@ -2031,6 +2335,7 @@ mod tests {
         };
 
         let (payload, status) = execute_session_turn_tool_call(
+            &SessionStore::new(),
             &event_bus,
             Some(&tool_registry),
             None,
@@ -2073,6 +2378,7 @@ mod tests {
         };
 
         let (payload, status) = execute_session_turn_tool_call(
+            &SessionStore::new(),
             &event_bus,
             Some(&tool_registry),
             None,
@@ -2294,6 +2600,358 @@ mod tests {
     }
 
     #[test]
+    fn session_goal_tools_write_goal_state_and_request_persistence() {
+        let session_store = SessionStore::new();
+        let event_bus = InMemoryEventBus::new(32);
+        let session_id = SessionId::new("session-goal-tool-writeback");
+        let workspace_id = Some(WorkspaceId::new("workspace-goal-tool-writeback"));
+        session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "goal writeback session",
+                workspace_id.as_ref().map(ToString::to_string),
+            )
+            .expect("session should be creatable");
+        let (_, thread_id) =
+            session_store.ensure_session_mission(&session_id, UtcMillis::now(), || {
+                MissionId::new("mission-goal-tool-writeback")
+            });
+        session_store
+            .upsert_current_turn(
+                session_id.clone(),
+                ActiveExecutionTurn {
+                    turn_id: "turn-goal-tool-writeback".to_string(),
+                    turn_seq: 1,
+                    accepted_at: UtcMillis::now(),
+                    status: "running".to_string(),
+                    user_message: Some("创建并完成目标".to_string()),
+                    items: Vec::new(),
+                    completed_at: None,
+                },
+            )
+            .expect("turn should be creatable");
+        let checkpoints = Arc::new(Mutex::new(Vec::<String>::new()));
+        let checkpoints_for_callback = Arc::clone(&checkpoints);
+        let persist = move |checkpoint: &str| {
+            checkpoints_for_callback
+                .lock()
+                .expect("checkpoint lock")
+                .push(checkpoint.to_string());
+        };
+        let mut messages = Vec::new();
+        let create_call = ChatToolCall {
+            id: "tool-call-create-goal".to_string(),
+            kind: "function".to_string(),
+            function: ChatToolFunction {
+                name: BuiltinToolName::CreateGoal.as_str().to_string(),
+                arguments: serde_json::json!({
+                    "objective": "验证 goal 工具写回"
+                })
+                .to_string(),
+            },
+        };
+
+        assert!(
+            append_session_tool_call_items_batch(
+                &session_store,
+                &event_bus,
+                None,
+                None,
+                None,
+                None,
+                None,
+                &session_id,
+                &workspace_id,
+                None,
+                magi_core::AccessProfile::Restricted,
+                &[create_call],
+                &mut messages,
+                None,
+                None,
+                &thread_id,
+                Some(&persist),
+                || true,
+            )
+            .completed
+        );
+
+        let created_goal = session_store
+            .active_goal(&session_id)
+            .expect("create_goal should create an active session goal");
+        assert_eq!(created_goal.objective, "验证 goal 工具写回");
+        assert_eq!(created_goal.token_budget, None);
+        assert_eq!(session_store.durable_state().goals.len(), 1);
+        assert!(
+            checkpoints
+                .lock()
+                .expect("checkpoint lock")
+                .iter()
+                .any(|checkpoint| checkpoint == "session_goal_tool"),
+            "create_goal 成功后必须立即请求 durable state 持久化"
+        );
+
+        let update_call = ChatToolCall {
+            id: "tool-call-update-goal".to_string(),
+            kind: "function".to_string(),
+            function: ChatToolFunction {
+                name: BuiltinToolName::UpdateGoal.as_str().to_string(),
+                arguments: serde_json::json!({
+                    "goal_id": created_goal.goal_id,
+                    "status": "complete"
+                })
+                .to_string(),
+            },
+        };
+
+        assert!(
+            append_session_tool_call_items_batch(
+                &session_store,
+                &event_bus,
+                None,
+                None,
+                None,
+                None,
+                None,
+                &session_id,
+                &workspace_id,
+                None,
+                magi_core::AccessProfile::Restricted,
+                &[update_call],
+                &mut messages,
+                None,
+                None,
+                &thread_id,
+                Some(&persist),
+                || true,
+            )
+            .completed
+        );
+
+        let updated_goal = session_store
+            .current_goal(&session_id)
+            .expect("update_goal should keep current goal readable");
+        assert_eq!(
+            updated_goal.status,
+            magi_session_store::GoalStatus::Complete
+        );
+        assert_eq!(
+            session_store.durable_state().goals[0].status,
+            updated_goal.status
+        );
+        assert!(
+            checkpoints
+                .lock()
+                .expect("checkpoint lock")
+                .iter()
+                .filter(|checkpoint| checkpoint.as_str() == "session_goal_tool")
+                .count()
+                >= 2,
+            "create_goal 和 update_goal 成功后都必须请求 durable state 持久化"
+        );
+    }
+
+    #[test]
+    fn session_turn_todo_write_uses_shared_ledger_and_only_reports_success() {
+        let session_store = SessionStore::new();
+        let event_bus = InMemoryEventBus::new(32);
+        let session_id = SessionId::new("session-mainline-todo-write");
+        let workspace_id = Some(WorkspaceId::new("workspace-mainline-todo-write"));
+        session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "mainline todo write",
+                workspace_id.as_ref().map(ToString::to_string),
+            )
+            .expect("session should be creatable");
+        let (mission_id, thread_id) =
+            session_store.ensure_session_mission(&session_id, UtcMillis::now(), || {
+                MissionId::new("mission-mainline-todo-write")
+            });
+        session_store
+            .upsert_current_turn(
+                session_id.clone(),
+                ActiveExecutionTurn {
+                    turn_id: "turn-mainline-todo-write".to_string(),
+                    turn_seq: 1,
+                    accepted_at: UtcMillis::now(),
+                    status: "running".to_string(),
+                    user_message: Some("写入任务清单".to_string()),
+                    items: Vec::new(),
+                    completed_at: None,
+                },
+            )
+            .expect("turn should be creatable");
+        let todo_ledger = crate::test_todo_ledger("test-todo-ledger");
+        let mut messages = Vec::new();
+        let valid_call = ChatToolCall {
+            id: "tool-call-mainline-todo-valid".to_string(),
+            kind: "function".to_string(),
+            function: ChatToolFunction {
+                name: BuiltinToolName::TodoWrite.as_str().to_string(),
+                arguments: serde_json::json!({
+                    "todos": [
+                        {"content": "完成第一项", "activeForm": "正在完成第一项", "status": "completed"},
+                        {"content": "推进第二项", "activeForm": "正在推进第二项", "status": "in_progress"}
+                    ]
+                })
+                .to_string(),
+            },
+        };
+
+        let valid_outcome = append_session_tool_call_items_batch_with_context(
+            &session_store,
+            &event_bus,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &todo_ledger,
+            &mission_id,
+            &session_id,
+            &workspace_id,
+            None,
+            magi_core::AccessProfile::Restricted,
+            &[valid_call],
+            &mut messages,
+            None,
+            None,
+            &thread_id,
+            None,
+            || true,
+        );
+
+        assert!(valid_outcome.completed);
+        assert_eq!(valid_outcome.succeeded_tool_names, vec!["todo_write"]);
+        assert_eq!(todo_ledger.snapshot().len(), 2);
+
+        let invalid_call = ChatToolCall {
+            id: "tool-call-mainline-todo-invalid".to_string(),
+            kind: "function".to_string(),
+            function: ChatToolFunction {
+                name: BuiltinToolName::TodoWrite.as_str().to_string(),
+                arguments: serde_json::json!({
+                    "todos": [
+                        {"content": "错误状态", "activeForm": "正在写入错误状态", "status": "unknown"}
+                    ]
+                })
+                .to_string(),
+            },
+        };
+        let invalid_outcome = append_session_tool_call_items_batch_with_context(
+            &session_store,
+            &event_bus,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &todo_ledger,
+            &mission_id,
+            &session_id,
+            &workspace_id,
+            None,
+            magi_core::AccessProfile::Restricted,
+            &[invalid_call],
+            &mut messages,
+            None,
+            None,
+            &thread_id,
+            None,
+            || true,
+        );
+
+        assert!(invalid_outcome.completed);
+        assert!(invalid_outcome.succeeded_tool_names.is_empty());
+        assert_eq!(todo_ledger.snapshot().len(), 2);
+    }
+
+    #[test]
+    fn session_tool_batch_reports_canonical_skill_activation_to_next_model_round() {
+        let session_store = SessionStore::new();
+        let event_bus = InMemoryEventBus::new(16);
+        let session_id = SessionId::new("session-skill-activation");
+        session_store
+            .create_session(session_id.clone(), "skill activation")
+            .expect("session should be creatable");
+        let (mission_id, thread_id) =
+            session_store.ensure_session_mission(&session_id, UtcMillis::now(), || {
+                MissionId::new("mission-skill-activation")
+            });
+        session_store
+            .upsert_current_turn(
+                session_id.clone(),
+                ActiveExecutionTurn {
+                    turn_id: "turn-skill-activation".to_string(),
+                    turn_seq: 1,
+                    accepted_at: UtcMillis::now(),
+                    status: "running".to_string(),
+                    user_message: Some("使用 code-review".to_string()),
+                    items: Vec::new(),
+                    completed_at: None,
+                },
+            )
+            .expect("turn should be creatable");
+        let skill_registry = SkillRegistry::new();
+        skill_registry.register(SkillDefinition {
+            skill_id: "owner/repo/skills/code-review".to_string(),
+            title: "代码审查".to_string(),
+            instruction: "检查稳定性。".to_string(),
+            metadata: SkillMetadata {
+                category: "quality".to_string(),
+                tags: vec![],
+            },
+            restrict_standard_tools: true,
+            allowed_tools: vec!["file_read".to_string()],
+            custom_tool_bindings: vec![],
+            prompt_priority: 50,
+        });
+        let skill_runtime = SkillRuntime::new(skill_registry);
+        let tool_registry = ToolRegistry::new(
+            Arc::new(GovernanceService::default()),
+            Arc::new(InMemoryEventBus::new(8)),
+        );
+        let todo_ledger = crate::test_todo_ledger("skill-activation-ledger");
+        let mut messages = Vec::new();
+        let call = ChatToolCall {
+            id: "tool-call-skill-activation".to_string(),
+            kind: "function".to_string(),
+            function: ChatToolFunction {
+                name: SKILL_APPLY_TOOL_NAME.to_string(),
+                arguments: serde_json::json!({ "skill_name": "code-review" }).to_string(),
+            },
+        };
+
+        let outcome = append_session_tool_call_items_batch_with_context(
+            &session_store,
+            &event_bus,
+            Some(&tool_registry),
+            Some(&skill_runtime),
+            None,
+            None,
+            None,
+            &todo_ledger,
+            &mission_id,
+            &session_id,
+            &None,
+            None,
+            magi_core::AccessProfile::Restricted,
+            &[call],
+            &mut messages,
+            None,
+            None,
+            &thread_id,
+            None,
+            || true,
+        );
+
+        assert_eq!(
+            outcome.activated_skill_id.as_deref(),
+            Some("owner/repo/skills/code-review")
+        );
+    }
+
+    #[test]
     fn session_turn_approval_required_tool_is_terminal_error_item() {
         let session_store = SessionStore::new();
         let event_bus = InMemoryEventBus::new(32);
@@ -2445,26 +3103,29 @@ mod tests {
         }];
         let mut messages = Vec::new();
 
-        assert!(append_session_tool_call_items_batch(
-            &session_store,
-            &event_bus,
-            Some(&tool_registry),
-            None,
-            None,
-            None,
-            None,
-            &session_id,
-            &workspace_id,
-            None,
-            magi_core::AccessProfile::Restricted,
-            &tool_calls,
-            &mut messages,
-            None,
-            None,
-            &ThreadId::new("thread-panic-tool"),
-            None,
-            || true,
-        ));
+        assert!(
+            append_session_tool_call_items_batch(
+                &session_store,
+                &event_bus,
+                Some(&tool_registry),
+                None,
+                None,
+                None,
+                None,
+                &session_id,
+                &workspace_id,
+                None,
+                magi_core::AccessProfile::Restricted,
+                &tool_calls,
+                &mut messages,
+                None,
+                None,
+                &ThreadId::new("thread-panic-tool"),
+                None,
+                || true,
+            )
+            .completed
+        );
 
         let sidecar = session_store
             .runtime_sidecar(&session_id)

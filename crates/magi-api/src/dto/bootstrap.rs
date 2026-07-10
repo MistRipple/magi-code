@@ -2,8 +2,7 @@ use crate::{
     change_projection::{PendingChangeDto, PendingChangesStateDto},
     dto::{
         AuditUsageLedgerDto, BridgePreflightSnapshotDto, BridgeServicesSnapshotDto,
-        MissionAggregateExport, RuntimeReadModelDto, ServiceInfo,
-        runtime_read_model_dto_with_usage,
+        RuntimeReadModelDto, ServiceInfo, runtime_read_model_dto_with_usage,
     },
     errors::ApiError,
     public_canonical::{public_canonical_turn, public_event_envelope},
@@ -22,6 +21,7 @@ use magi_workspace::{
     WorkspaceRecoverySidecarExport,
 };
 use serde::Serialize;
+use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 
 const BOOTSTRAP_TIMELINE_PAGE_SIZE: usize = 50;
@@ -95,7 +95,6 @@ impl BootstrapDto {
             state.bridge_services_dto(),
             state.bridge_preflight_dto(),
             state.task_store(),
-            state.collect_mission_aggregate_exports(),
             &state.ledger_usage_observations(),
         );
         if let Some(current_session) = dto.current_session.as_ref() {
@@ -126,7 +125,6 @@ impl BootstrapDto {
         bridge_services: BridgeServicesSnapshotDto,
         bridge_preflight: BridgePreflightSnapshotDto,
         task_store: Option<&magi_orchestrator::task_store::TaskStore>,
-        mission_aggregate_exports: Vec<MissionAggregateExport>,
     ) -> Self {
         Self::from_projection_with_usage(
             runtime_epoch,
@@ -141,7 +139,6 @@ impl BootstrapDto {
             bridge_services,
             bridge_preflight,
             task_store,
-            mission_aggregate_exports,
             &BTreeMap::new(),
         )
     }
@@ -162,7 +159,6 @@ impl BootstrapDto {
         bridge_services: BridgeServicesSnapshotDto,
         bridge_preflight: BridgePreflightSnapshotDto,
         task_store: Option<&magi_orchestrator::task_store::TaskStore>,
-        mission_aggregate_exports: Vec<MissionAggregateExport>,
         ledger_usage_observations: &BTreeMap<String, SessionRuntimeUsageObservation>,
     ) -> Self {
         let current_session =
@@ -182,7 +178,6 @@ impl BootstrapDto {
             &workspace_sidecar_exports,
             audit_usage_ledger.clone(),
             task_store,
-            &mission_aggregate_exports,
             ledger_usage_observations,
         );
 
@@ -196,7 +191,8 @@ impl BootstrapDto {
             canonical_turns: session_projection
                 .canonical_turns
                 .into_iter()
-                .map(public_canonical_turn)
+                .map(public_bootstrap_canonical_turn)
+                .filter(|turn| !turn.items.is_empty())
                 .collect(),
             workspaces: workspace_projection.workspaces,
             snapshots: workspace_projection.snapshots,
@@ -211,6 +207,7 @@ impl BootstrapDto {
                 .recent_events
                 .into_iter()
                 .map(public_event_envelope)
+                .map(public_bootstrap_event_envelope)
                 .collect(),
             has_more_before: false,
             before_cursor: None,
@@ -339,6 +336,59 @@ impl BootstrapDto {
     }
 }
 
+fn public_bootstrap_canonical_turn(turn: CanonicalTurn) -> CanonicalTurn {
+    let mut turn = public_canonical_turn(turn);
+    retain_bootstrap_canonical_items(&mut turn);
+    turn
+}
+
+fn retain_bootstrap_canonical_items(turn: &mut CanonicalTurn) {
+    turn.items.retain(|item| {
+        item.worker
+            .as_ref()
+            .and_then(|worker| worker.worker_id.as_ref())
+            .is_none()
+    });
+}
+
+fn public_bootstrap_event_envelope(mut event: EventEnvelope) -> EventEnvelope {
+    prune_bootstrap_event_payload(&mut event.payload);
+    event
+}
+
+fn prune_bootstrap_event_payload(payload: &mut Value) {
+    let Value::Object(object) = payload else {
+        return;
+    };
+    prune_bootstrap_canonical_field(object, "canonical_turn");
+    prune_bootstrap_canonical_field(object, "canonicalTurn");
+    object.remove("turn_items");
+    object.remove("turnItems");
+}
+
+fn prune_bootstrap_canonical_field(object: &mut Map<String, Value>, key: &str) {
+    let Some(value) = object.get_mut(key) else {
+        return;
+    };
+    if value.is_null() {
+        return;
+    }
+    let Ok(mut turn) = serde_json::from_value::<CanonicalTurn>(value.clone()) else {
+        object.remove(key);
+        return;
+    };
+    retain_bootstrap_canonical_items(&mut turn);
+    if turn.items.is_empty() {
+        object.remove(key);
+        return;
+    }
+    if let Ok(next_value) = serde_json::to_value(turn) {
+        *value = next_value;
+    } else {
+        object.remove(key);
+    }
+}
+
 fn select_session_projection(
     mut session_projection: SessionProjectionInput,
     requested_session_id: Option<&SessionId>,
@@ -358,9 +408,12 @@ fn select_session_projection(
         session_projection
             .canonical_turns
             .retain(|turn| turn.session_id == *requested_session_id);
-        session_projection
-            .notifications
-            .retain(|notification| notification.session_id == *requested_session_id);
+        session_projection.notifications.retain(|notification| {
+            matches!(
+                notification.scope,
+                magi_session_store::NotificationScope::App
+            ) || notification.session_id.as_ref() == Some(requested_session_id)
+        });
     }
     session_projection
 }
@@ -370,8 +423,8 @@ mod tests {
     use super::*;
     use crate::dto::ledger_dto;
     use magi_core::{
-        AbsolutePath, EventId, ExecutionOwnership, SessionId, SessionLifecycleStatus, ThreadId,
-        UtcMillis, WorkspaceId,
+        AbsolutePath, EventId, ExecutionOwnership, SessionId, SessionLifecycleStatus, TaskId,
+        ThreadId, UtcMillis, WorkerId, WorkspaceId,
     };
     use magi_event_bus::{
         AuditUsageLedgerStatus, RUNTIME_LEDGER_PERSIST_ERROR_SUMMARY, RuntimeExecutorSummary,
@@ -380,7 +433,8 @@ mod tests {
     use magi_governance::GovernanceService;
     use magi_session_store::SessionStore;
     use magi_session_store::{
-        ActiveExecutionTurn, ActiveExecutionTurnItem, CanonicalTurn, CanonicalTurnStatus,
+        ActiveExecutionTurn, ActiveExecutionTurnItem, CanonicalTurn, CanonicalTurnItem,
+        CanonicalTurnItemKind, CanonicalTurnItemStatus, CanonicalTurnStatus, CanonicalWorkerRef,
         SessionExecutionSidecarStatus,
     };
     use magi_workspace::{RecoveryStatus, WorkspaceStore};
@@ -464,6 +518,35 @@ mod tests {
                 timeline_entry_id: None,
                 source_thread_id: ThreadId::new("thread-test-orchestrator"),
             }],
+        }
+    }
+
+    fn canonical_item(
+        session_id: &SessionId,
+        turn_id: &str,
+        item_seq: usize,
+        worker: Option<CanonicalWorkerRef>,
+    ) -> CanonicalTurnItem {
+        let now = UtcMillis::now();
+        CanonicalTurnItem {
+            session_id: session_id.clone(),
+            turn_id: turn_id.to_string(),
+            turn_seq: 1,
+            item_id: format!("item-{item_seq}"),
+            item_seq,
+            kind: CanonicalTurnItemKind::AssistantText,
+            created_at: now,
+            status: CanonicalTurnItemStatus::Completed,
+            item_version: None,
+            updated_at: now,
+            title: None,
+            content: Some(format!("content-{item_seq}")),
+            blocks: Vec::new(),
+            tool: None,
+            worker,
+            source_thread_id: ThreadId::new("thread-bootstrap-test"),
+            visibility: Default::default(),
+            metadata: Default::default(),
         }
     }
 
@@ -552,7 +635,6 @@ mod tests {
             BridgeServicesSnapshotDto::default(),
             BridgePreflightSnapshotDto::default(),
             None,
-            Vec::new(),
         );
 
         assert_eq!(bootstrap.runtime_read_model.details.sessions.len(), 1);
@@ -668,13 +750,12 @@ mod tests {
             BridgeServicesSnapshotDto::default(),
             BridgePreflightSnapshotDto::default(),
             None,
-            Vec::new(),
         );
 
         assert_eq!(bootstrap.event_stream_next_sequence, 3);
         assert_eq!(bootstrap.recent_events.len(), 1);
         assert_eq!(bootstrap.recent_events[0].event_type, "task.created");
-        assert_eq!(bootstrap.canonical_turns.len(), 1);
+        assert!(bootstrap.canonical_turns.is_empty());
         assert_eq!(bootstrap.runtime_read_model.details.sessions.len(), 1);
         let session = &bootstrap.runtime_read_model.details.sessions[0];
         assert_eq!(session.session_id, "session-current");
@@ -689,6 +770,91 @@ mod tests {
                 .active_recovery_ids
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn bootstrap首屏只保留主线canonical并裁掉事件重型回放() {
+        let session_id = SessionId::new("session-bootstrap-mainline-only");
+        let now = UtcMillis::now();
+        let turn_id = "canonical-turn-mainline";
+        let canonical_turn = CanonicalTurn {
+            session_id: session_id.clone(),
+            turn_id: turn_id.to_string(),
+            turn_seq: 1,
+            accepted_at: now,
+            completed_at: Some(now),
+            status: CanonicalTurnStatus::Completed,
+            response_duration_ms: Some(1),
+            usage: None,
+            items: vec![
+                canonical_item(&session_id, turn_id, 1, None),
+                canonical_item(
+                    &session_id,
+                    turn_id,
+                    2,
+                    Some(CanonicalWorkerRef {
+                        task_id: Some(TaskId::new("task-child")),
+                        worker_id: Some(WorkerId::new("worker-child")),
+                        role_id: Some("executor".to_string()),
+                        title: Some("shell_exec".to_string()),
+                    }),
+                ),
+            ],
+            metadata: Default::default(),
+        };
+        let event_snapshot = EventStreamSnapshot {
+            next_sequence: 9,
+            recent_events: vec![
+                EventEnvelope::domain(
+                    EventId::new("message-heavy"),
+                    "message.created",
+                    json!({
+                        "root_task_id": "task-root",
+                        "turn_items": [{"tool_result": "large worker payload"}],
+                        "canonical_turn": canonical_turn.clone(),
+                    }),
+                )
+                .with_context(magi_event_bus::EventContext {
+                    session_id: Some(session_id.clone()),
+                    ..magi_event_bus::EventContext::default()
+                }),
+            ],
+        };
+
+        let bootstrap = BootstrapDto::from_projection(
+            runtime_epoch(),
+            service_info(),
+            SessionProjectionInput {
+                current_session_id: Some(session_id.clone()),
+                sessions: vec![session_record(session_id.as_str())],
+                timeline: Vec::new(),
+                canonical_turns: vec![canonical_turn],
+                notifications: Vec::new(),
+            },
+            empty_workspace_projection(),
+            Vec::new(),
+            Vec::new(),
+            event_snapshot,
+            RuntimeReadModelInput::default(),
+            AuditUsageLedgerDto::default(),
+            BridgeServicesSnapshotDto::default(),
+            BridgePreflightSnapshotDto::default(),
+            None,
+        );
+
+        assert_eq!(bootstrap.canonical_turns.len(), 1);
+        assert_eq!(bootstrap.canonical_turns[0].items.len(), 1);
+        assert!(bootstrap.canonical_turns[0].items[0].worker.is_none());
+        let event_payload = &bootstrap.recent_events[0].payload;
+        assert!(event_payload.get("turn_items").is_none());
+        assert_eq!(
+            event_payload["canonical_turn"]["items"]
+                .as_array()
+                .expect("canonical turn items should remain")
+                .len(),
+            1
+        );
+        assert_eq!(event_payload["root_task_id"], json!("task-root"));
     }
 
     #[test]
@@ -713,7 +879,6 @@ mod tests {
             BridgeServicesSnapshotDto::default(),
             BridgePreflightSnapshotDto::default(),
             None,
-            Vec::new(),
         );
 
         assert_eq!(
@@ -758,7 +923,6 @@ mod tests {
             BridgeServicesSnapshotDto::default(),
             BridgePreflightSnapshotDto::default(),
             None,
-            Vec::new(),
         );
 
         assert_eq!(
@@ -811,7 +975,6 @@ mod tests {
             BridgeServicesSnapshotDto::default(),
             BridgePreflightSnapshotDto::default(),
             None,
-            Vec::new(),
         );
 
         assert_eq!(
@@ -862,7 +1025,6 @@ mod tests {
             BridgeServicesSnapshotDto::default(),
             BridgePreflightSnapshotDto::default(),
             None,
-            Vec::new(),
         );
 
         assert_eq!(bootstrap.audit_usage_ledger.next_sequence, 12);
@@ -871,7 +1033,7 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_from_state_with_selected_session_filters_timeline_and_notifications() {
+    fn bootstrap_from_state_with_selected_session_keeps_app_and_selected_session_incidents() {
         let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(32));
         let session_store = Arc::new(SessionStore::default());
         let workspace_store = Arc::new(WorkspaceStore::default());
@@ -887,10 +1049,18 @@ mod tests {
         let session_a = SessionId::new("session-a");
         let session_b = SessionId::new("session-b");
         session_store
-            .create_session(session_a.clone(), "Session A")
+            .create_session_for_workspace(
+                session_a.clone(),
+                "Session A",
+                Some("workspace-a".to_string()),
+            )
             .expect("session a should be creatable");
         session_store
-            .create_session(session_b.clone(), "Session B")
+            .create_session_for_workspace(
+                session_b.clone(),
+                "Session B",
+                Some("workspace-a".to_string()),
+            )
             .expect("session b should be creatable");
         session_store.append_timeline_entry(
             session_a.clone(),
@@ -902,8 +1072,48 @@ mod tests {
             magi_session_store::TimelineEntryKind::UserMessage,
             "message-b",
         );
-        session_store.append_notification(session_a.clone(), "notification-a", "toast", "notify-a");
-        session_store.append_notification(session_b.clone(), "notification-b", "toast", "notify-b");
+        for (notification_id, scope, session_id, message) in [
+            (
+                "notification-app",
+                magi_session_store::NotificationScope::App,
+                None,
+                "notify-app",
+            ),
+            (
+                "notification-a",
+                magi_session_store::NotificationScope::Session,
+                Some(session_a.clone()),
+                "notify-a",
+            ),
+            (
+                "notification-b",
+                magi_session_store::NotificationScope::Session,
+                Some(session_b.clone()),
+                "notify-b",
+            ),
+        ] {
+            session_store
+                .append_incident_record(NotificationRecord {
+                    notification_id: notification_id.to_string(),
+                    scope,
+                    workspace_id: (scope == magi_session_store::NotificationScope::Session)
+                        .then(|| "workspace-a".to_string()),
+                    session_id,
+                    kind: "incident".to_string(),
+                    level: Some("error".to_string()),
+                    title: None,
+                    message: message.to_string(),
+                    source: Some("test".to_string()),
+                    created_at: UtcMillis::now(),
+                    handled: false,
+                    action_required: true,
+                    count_unread: true,
+                    fingerprint: notification_id.to_string(),
+                    occurrence_count: 1,
+                    resolved: false,
+                })
+                .expect("incident should append");
+        }
 
         let bootstrap = BootstrapDto::from_state_with_selected_session(&state, Some(&session_a))
             .expect("bootstrap should build");
@@ -921,12 +1131,7 @@ mod tests {
                 .iter()
                 .all(|entry| entry.session_id == session_a)
         );
-        assert!(
-            bootstrap
-                .notifications
-                .iter()
-                .all(|notification| notification.session_id == session_a)
-        );
+        assert_eq!(bootstrap.notifications.len(), 2);
         assert!(
             bootstrap
                 .timeline
@@ -944,6 +1149,12 @@ mod tests {
                 .notifications
                 .iter()
                 .any(|notification| notification.message == "notify-a")
+        );
+        assert!(
+            bootstrap
+                .notifications
+                .iter()
+                .any(|notification| notification.message == "notify-app")
         );
         assert!(
             bootstrap

@@ -548,8 +548,26 @@ fn pending_terminal_synthesis_finalizes_on_max() {
 
 #[test]
 fn tool_concurrency_read_only_safe() {
-    assert!(crate::tool_concurrency::is_concurrency_safe("file_view"));
+    assert!(crate::tool_concurrency::is_concurrency_safe("file_read"));
+    assert!(crate::tool_concurrency::is_concurrency_safe("view_image"));
+    assert!(crate::tool_concurrency::is_concurrency_safe("diff_preview"));
+    assert!(crate::tool_concurrency::is_concurrency_safe("search_text"));
+    assert!(crate::tool_concurrency::is_concurrency_safe(
+        "search_semantic"
+    ));
+    assert!(crate::tool_concurrency::is_concurrency_safe(
+        "knowledge_query"
+    ));
+    assert!(crate::tool_concurrency::is_concurrency_safe("code_symbols"));
+    assert!(crate::tool_concurrency::is_concurrency_safe("tool_catalog"));
     assert!(crate::tool_concurrency::is_concurrency_safe("web_search"));
+    assert!(!crate::tool_concurrency::is_concurrency_safe("file_view"));
+    assert!(!crate::tool_concurrency::is_concurrency_safe(
+        "code_search_regex"
+    ));
+    assert!(!crate::tool_concurrency::is_concurrency_safe(
+        "project_knowledge_query"
+    ));
     assert!(!crate::tool_concurrency::is_concurrency_safe("shell_exec"));
     assert!(!crate::tool_concurrency::is_concurrency_safe(
         "process_launch"
@@ -566,10 +584,10 @@ fn tool_concurrency_read_only_safe() {
 #[test]
 fn tool_concurrency_partition_mixed() {
     let tools = [
-        "file_view",
-        "file_view",
-        "file_edit",
-        "code_search_regex",
+        "file_read",
+        "search_text",
+        "file_write",
+        "search_semantic",
         "shell_exec",
     ];
     let batches = crate::tool_concurrency::partition_tool_calls(&tools);
@@ -646,6 +664,29 @@ fn tool_concurrency_does_not_trust_read_only_shell_with_write_redirection() {
         crate::tool_concurrency::ToolBatchKind::Serial
     ));
     assert_eq!(batches[1].tool_indices, vec![1]);
+}
+
+#[test]
+fn tool_concurrency_keeps_agent_spawn_serial() {
+    let tools = ["agent_spawn", "agent_spawn", "file_read"];
+    let batches = crate::tool_concurrency::partition_tool_calls(&tools);
+
+    assert_eq!(batches.len(), 3);
+    assert!(matches!(
+        batches[0].kind,
+        crate::tool_concurrency::ToolBatchKind::Serial
+    ));
+    assert_eq!(batches[0].tool_indices, vec![0]);
+    assert!(matches!(
+        batches[1].kind,
+        crate::tool_concurrency::ToolBatchKind::Serial
+    ));
+    assert_eq!(batches[1].tool_indices, vec![1]);
+    assert!(matches!(
+        batches[2].kind,
+        crate::tool_concurrency::ToolBatchKind::Concurrent
+    ));
+    assert_eq!(batches[2].tool_indices, vec![2]);
 }
 
 struct SleepingToolExecutor {
@@ -816,7 +857,7 @@ fn sanitize_tool_order_preserves_valid_pairs() {
             role: "assistant".into(),
             content: LlmMessageContent::Blocks(vec![LlmContentBlock::ToolUse {
                 id: "t1".into(),
-                name: "file_view".into(),
+                name: "file_read".into(),
                 input: serde_json::json!({}),
             }]),
         },

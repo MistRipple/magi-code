@@ -459,6 +459,12 @@ export interface OrchestratorRuntimeSnapshot {
     usageRatio?: number;
     warningLevel?: 'normal' | 'notice' | 'warning' | 'danger';
     errorRate?: number;
+    lastCompactionAt?: number;
+    lastCompactionReason?: string;
+    originalTokenEstimate?: number;
+    compactedTokenEstimate?: number;
+    originalMessageCount?: number;
+    compactedMessageCount?: number;
   };
   cacheState?: {
     mode?: 'disabled' | 'unsupported' | 'cache_control' | 'cache_editing';
@@ -609,7 +615,7 @@ export interface Session {
   messages?: { id: string; role: string; content: string }[];
   notifications?: {
     lastUpdatedAt: number;
-    records: SessionNotificationRecord[];
+    records: IncidentNotificationRecord[];
   };
 }
 
@@ -631,6 +637,7 @@ export interface QueuedMessage {
   text?: string | null;
   createdAt: number;
   skillName?: string | null;
+  goalMode?: boolean;
   accessProfile?: 'read_only' | 'restricted' | 'full_access' | null;
   images?: QueuedMessageImage[];
 }
@@ -642,7 +649,7 @@ export interface ProcessingActor {
 }
 
 // Tab 类型（动态架构下扩展 tab 为任意 string）
-export type TabType = 'thread' | string | 'settings' | 'knowledge' | 'tasks' | 'edits';
+export type TabType = 'thread' | string | 'settings' | 'knowledge' | 'edits';
 
 // 滚动位置映射（动态 key：thread + agent:${taskId} / code:${filepath}）
 export interface ScrollPositions {
@@ -751,6 +758,7 @@ export interface Edit {
   mime?: string;
   sourceKind?: EditSourceKind;
   hasError?: boolean;
+  revertible?: boolean;
   symlinkTarget?: string;
   headSummary?: string;
   tailSummary?: string;
@@ -779,33 +787,23 @@ export interface Toast {
   duration?: number;
 }
 
-export interface PersistedNotification {
-  id: string;
-  type: string;
-  title?: string;
-  message: string;
-  category: 'incident' | 'audit';
-  source?: string;
-  actionRequired?: boolean;
-  countUnread: boolean;
-  timestamp: number;
-  read: boolean;
-}
-
-export interface SessionNotificationRecord {
+export interface IncidentNotificationRecord {
   notificationId: string;
-  kind: 'toast' | 'center' | 'incident' | 'audit';
+  kind: 'incident';
+  scope: 'app' | 'workspace' | 'session';
   level: string;
   title?: string;
   message: string;
   source?: string;
+  workspaceId?: string;
+  sessionId?: string;
   createdAt: number;
   read: boolean;
-  persistToCenter: boolean;
+  handled: boolean;
+  resolved: boolean;
   actionRequired: boolean;
   countUnread: boolean;
-  displayMode?: 'auto' | 'toast' | 'notification_center' | 'silent';
-  duration?: number;
+  occurrenceCount: number;
 }
 
 // 应用状态（后端下发的完整状态）

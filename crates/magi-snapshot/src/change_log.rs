@@ -1,3 +1,4 @@
+use crate::blob_store::write_atomic;
 use crate::error::{SnapshotError, SnapshotResult};
 use crate::types::ChangeEvent;
 use std::fs::{self, File, OpenOptions};
@@ -47,11 +48,15 @@ impl ChangeLog {
 
     /// 全量读取所有完整事件行。
     pub fn read_all(&self) -> SnapshotResult<Vec<ChangeEvent>> {
-        let f = File::open(&self.path).map_err(|e| SnapshotError::io(&self.path, e))?;
+        Self::read_path(&self.path)
+    }
+
+    pub(crate) fn read_path(path: &Path) -> SnapshotResult<Vec<ChangeEvent>> {
+        let f = File::open(path).map_err(|e| SnapshotError::io(path, e))?;
         let reader = BufReader::new(f);
         let mut events = Vec::new();
         for line in reader.lines() {
-            let line = line.map_err(|e| SnapshotError::io(&self.path, e))?;
+            let line = line.map_err(|e| SnapshotError::io(path, e))?;
             if line.trim().is_empty() {
                 continue;
             }
@@ -59,7 +64,7 @@ impl ChangeLog {
                 Ok(ev) => events.push(ev),
                 Err(err) => {
                     tracing::warn!(
-                        path = %self.path.display(),
+                        path = %path.display(),
                         line_len = line.len(),
                         error = %err,
                         "discarding corrupt change_log line"
@@ -68,6 +73,15 @@ impl ChangeLog {
             }
         }
         Ok(events)
+    }
+
+    pub(crate) fn rewrite(path: &Path, events: &[ChangeEvent]) -> SnapshotResult<()> {
+        let mut payload = Vec::new();
+        for event in events {
+            payload.extend(serde_json::to_vec(event)?);
+            payload.push(b'\n');
+        }
+        write_atomic(path, &payload)
     }
 
     pub fn path(&self) -> &Path {

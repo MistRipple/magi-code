@@ -11,7 +11,7 @@ import type {
   OrchestrationRuntimeTimelineEntry,
   OrchestratorRuntimeState,
   Session,
-  SessionNotificationRecord,
+  IncidentNotificationRecord,
   SubTaskItem,
 } from '../../types/message';
 import { buildEmptyWorkspaceAppState } from './empty-workspace-state';
@@ -59,11 +59,20 @@ interface RustBootstrapWorkspaceRecord {
 
 interface RustNotificationRecord {
   notificationId?: string;
-  sessionId?: string;
+  scope?: string;
+  workspaceId?: string | null;
+  sessionId?: string | null;
   kind?: string;
+  level?: string | null;
+  title?: string | null;
   message?: string;
+  source?: string | null;
   createdAt?: number;
   handled?: boolean;
+  actionRequired?: boolean;
+  countUnread?: boolean;
+  occurrenceCount?: number;
+  resolved?: boolean;
 }
 
 interface RustTimelineEntry {
@@ -154,6 +163,7 @@ interface RustSessionRuntimeSummary {
   current_turn?: RustSessionRuntimeTurnSummary | null;
   turn_items?: RustSessionRuntimeTurnItemSummary[];
   budget?: RustSessionRuntimeBudget | null;
+  context_compaction?: RustSessionRuntimeContextCompaction | null;
 }
 
 interface RustSessionRuntimeBudget {
@@ -163,6 +173,20 @@ interface RustSessionRuntimeBudget {
   percent_remaining?: number;
   usage_ratio?: number;
   warning_level?: string;
+}
+
+interface RustSessionRuntimeContextCompaction {
+  reason?: string;
+  phase?: string | null;
+  original_message_count?: number;
+  compacted_message_count?: number;
+  original_token_estimate?: number;
+  compacted_token_estimate?: number;
+  context_window_tokens?: number | null;
+  token_limit?: number | null;
+  threshold_tokens?: number | null;
+  resolved_model?: string | null;
+  compacted_at?: number | null;
 }
 
 interface RustSessionRuntimeTurnSummary {
@@ -338,11 +362,6 @@ interface RustTimelinePageDto {
   beforeCursor?: string | null;
 }
 
-interface NormalizedNotificationEntry {
-  sessionId: string;
-  record: SessionNotificationRecord;
-}
-
 function normalizeString(value: unknown): string {
   return typeof value === 'string' ? value.trim() : '';
 }
@@ -483,7 +502,44 @@ function normalizeSessionRuntimeEntries(
       current_turn: normalizeRuntimeTurnSummary(entry.current_turn),
       turn_items: normalizeRuntimeTurnItems(entry.turn_items),
       budget: normalizeRuntimeBudget(entry.budget),
+      context_compaction: normalizeRuntimeContextCompaction(entry.context_compaction),
     }));
+}
+
+function normalizeRuntimeContextCompaction(raw: unknown): RustSessionRuntimeContextCompaction | undefined {
+  const record = normalizeObjectRecord(raw);
+  if (!record) {
+    return undefined;
+  }
+  const reason = normalizeString(record.reason);
+  if (!reason) {
+    return undefined;
+  }
+  return {
+    reason,
+    phase: normalizeString(record.phase) || undefined,
+    original_message_count: typeof record.original_message_count === 'number'
+      ? Math.floor(record.original_message_count)
+      : undefined,
+    compacted_message_count: typeof record.compacted_message_count === 'number'
+      ? Math.floor(record.compacted_message_count)
+      : undefined,
+    original_token_estimate: typeof record.original_token_estimate === 'number'
+      ? Math.floor(record.original_token_estimate)
+      : undefined,
+    compacted_token_estimate: typeof record.compacted_token_estimate === 'number'
+      ? Math.floor(record.compacted_token_estimate)
+      : undefined,
+    context_window_tokens: typeof record.context_window_tokens === 'number'
+      ? Math.floor(record.context_window_tokens)
+      : undefined,
+    token_limit: typeof record.token_limit === 'number' ? Math.floor(record.token_limit) : undefined,
+    threshold_tokens: typeof record.threshold_tokens === 'number'
+      ? Math.floor(record.threshold_tokens)
+      : undefined,
+    resolved_model: normalizeString(record.resolved_model) || undefined,
+    compacted_at: typeof record.compacted_at === 'number' ? Math.floor(record.compacted_at) : undefined,
+  };
 }
 
 function normalizeRuntimeBudget(raw: unknown): RustSessionRuntimeBudget | undefined {
@@ -1264,6 +1320,7 @@ function buildRuntimeSnapshot(
   if (!budget || typeof budget.token_limit !== 'number') {
     return null;
   }
+  const compaction = activeSession?.context_compaction;
   return {
     budgetState: {
       tokenUsed: budget.token_used,
@@ -1271,6 +1328,12 @@ function buildRuntimeSnapshot(
       tokenLimit: budget.token_limit,
       usageRatio: budget.usage_ratio,
       warningLevel: normalizeBudgetWarningLevel(budget.warning_level),
+      lastCompactionAt: compaction?.compacted_at ?? undefined,
+      lastCompactionReason: compaction?.reason ?? undefined,
+      originalTokenEstimate: compaction?.original_token_estimate ?? undefined,
+      compactedTokenEstimate: compaction?.compacted_token_estimate ?? undefined,
+      originalMessageCount: compaction?.original_message_count ?? undefined,
+      compactedMessageCount: compaction?.compacted_message_count ?? undefined,
     },
   };
 }
@@ -1362,40 +1425,40 @@ function deriveRuntimeState(
   };
 }
 
-function normalizeNotificationKind(kind: string): SessionNotificationRecord['kind'] {
-  if (kind === 'incident' || kind === 'audit' || kind === 'center') {
-    return kind;
-  }
-  return 'toast';
-}
-
 function normalizeNotifications(
   notifications: RustNotificationRecord[] | undefined,
-): NormalizedNotificationEntry[] {
+): IncidentNotificationRecord[] {
   if (!Array.isArray(notifications)) {
     return [];
   }
-  const normalized: NormalizedNotificationEntry[] = [];
+  const normalized: IncidentNotificationRecord[] = [];
   for (const notification of notifications) {
     const notificationId = normalizeString(notification.notificationId);
-    const sessionId = normalizeString(notification.sessionId);
     const message = normalizeString(notification.message);
-    if (!notificationId || !sessionId || !message) {
+    const scope = normalizeString(notification.scope);
+    if (!notificationId || !message || notification.kind !== 'incident') {
+      continue;
+    }
+    if (scope !== 'app' && scope !== 'workspace' && scope !== 'session') {
       continue;
     }
     normalized.push({
-      sessionId,
-      record: {
-        notificationId,
-        kind: normalizeNotificationKind(normalizeString(notification.kind)),
-        level: 'info',
-        message,
-        createdAt: normalizeNumber(notification.createdAt, Date.now()),
-        read: Boolean(notification.handled),
-        persistToCenter: true,
-        actionRequired: false,
-        countUnread: !notification.handled,
-      },
+      notificationId,
+      kind: 'incident',
+      scope,
+      level: normalizeString(notification.level) || 'error',
+      title: normalizeString(notification.title) || undefined,
+      message,
+      source: normalizeString(notification.source) || undefined,
+      workspaceId: normalizeString(notification.workspaceId) || undefined,
+      sessionId: normalizeString(notification.sessionId) || undefined,
+      createdAt: normalizeNumber(notification.createdAt, Date.now()),
+      read: Boolean(notification.handled),
+      handled: Boolean(notification.handled),
+      resolved: Boolean(notification.resolved),
+      actionRequired: notification.actionRequired !== false,
+      countUnread: notification.countUnread !== false,
+      occurrenceCount: Math.max(1, normalizeNumber(notification.occurrenceCount, 1)),
     });
   }
   return normalized;
@@ -1475,14 +1538,13 @@ export function normalizeRustBootstrapPayload(
     state,
     canonicalTurns,
     eventStreamNextSequence: normalizeNumber(payload.eventStreamNextSequence, 0),
-    notifications: currentSession?.id
+    notifications: workspace.workspaceId
         ? {
-          sessionId: currentSession.id,
+          workspaceId: workspace.workspaceId,
+          sessionId: currentSession?.id || undefined,
           notifications: {
             lastUpdatedAt: generatedAt,
-            records: normalizedNotifications
-              .filter((item) => item.sessionId === currentSession.id)
-              .map((item) => item.record),
+            records: normalizedNotifications,
           },
         }
       : undefined,

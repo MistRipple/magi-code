@@ -22,6 +22,8 @@ use magi_spawn_graph::SpawnGraph;
 
 use crate::{session_images::SessionTurnImage, session_thread};
 
+pub const MAX_ACTIVE_AGENT_BRANCHES_PER_SESSION: usize = 4;
+
 #[derive(Clone, Debug)]
 pub enum TaskExecutionPlan {
     Dispatch {
@@ -64,11 +66,32 @@ pub struct SpawnedChildExecutionRequest<'a> {
     pub now: UtcMillis,
 }
 
+#[derive(Debug)]
 pub struct SpawnedChildExecution {
     pub worker_id: WorkerId,
     pub thread_id: ThreadId,
     pub execution_chain_ref: String,
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SpawnedChildExecutionError {
+    CapacityExceeded { active: usize, limit: usize },
+    InvalidState(String),
+}
+
+impl std::fmt::Display for SpawnedChildExecutionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CapacityExceeded { active, limit } => write!(
+                f,
+                "当前会话已达到多代理并发上限：最多 {limit} 条活跃执行分支（含主线），当前 {active} 条"
+            ),
+            Self::InvalidState(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for SpawnedChildExecutionError {}
 
 #[derive(Clone, Default)]
 pub struct TaskExecutionRegistry {
@@ -98,10 +121,75 @@ impl TaskExecutionRegistry {
             .cloned()
     }
 
+    /// 删除一个 session 拥有的全部执行计划，并返回被删除的 TaskId，供上层同步
+    /// 清理 TaskStore 与 SpawnGraph。
+    pub fn remove_session(&self, session_id: &SessionId) -> Vec<TaskId> {
+        let mut plans = self
+            .plans
+            .write()
+            .expect("task execution registry write lock poisoned");
+        let removed = plans
+            .iter()
+            .filter_map(|(task_id, plan)| match plan {
+                TaskExecutionPlan::Dispatch {
+                    session_id: candidate,
+                    ..
+                } if candidate == session_id => Some(task_id.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for task_id in &removed {
+            plans.remove(task_id);
+        }
+        removed
+    }
+
+    pub fn update_active_skill(
+        &self,
+        task_id: &TaskId,
+        session_store: &SessionStore,
+        session_id: &SessionId,
+        skill_id: String,
+    ) -> Result<(), String> {
+        if self.get(task_id).is_none() {
+            return Err(format!("任务 {task_id} 缺少执行计划，无法记录 Skill 激活"));
+        }
+        let mut chain = session_store
+            .active_execution_chain(session_id)
+            .ok_or_else(|| format!("会话 {session_id} 缺少活跃执行链"))?;
+        let branch = chain
+            .branches
+            .iter_mut()
+            .find(|branch| &branch.task_id == task_id)
+            .ok_or_else(|| format!("任务 {task_id} 不在当前执行链分支中"))?;
+        branch.skill_name = Some(skill_id.clone());
+        if &chain.root_task_id == task_id {
+            chain.dispatch_context.skill_name = Some(skill_id.clone());
+        }
+        chain.normalize();
+        session_store
+            .upsert_active_execution_chain(session_id.clone(), chain)
+            .map_err(|error| error.to_string())?;
+
+        let mut plans = self
+            .plans
+            .write()
+            .expect("task execution registry write lock poisoned");
+        let plan = plans
+            .get_mut(task_id)
+            .ok_or_else(|| format!("任务 {task_id} 执行计划在更新期间消失"))?;
+        match plan {
+            TaskExecutionPlan::Dispatch { skill_name, .. } => {
+                *skill_name = Some(skill_id);
+            }
+        }
+        Ok(())
+    }
+
     pub fn register_spawned_local_agent_child(
         &self,
         request: SpawnedChildExecutionRequest<'_>,
-    ) -> Result<SpawnedChildExecution, String> {
+    ) -> Result<SpawnedChildExecution, SpawnedChildExecutionError> {
         let SpawnedChildExecutionRequest {
             task_store,
             spawn_graph,
@@ -114,34 +202,53 @@ impl TaskExecutionRegistry {
         } = request;
         let mut chain = session_store
             .active_execution_chain(session_id)
-            .ok_or_else(|| "agent_spawn 需要当前会话存在活跃执行链".to_string())?;
+            .ok_or_else(|| {
+                SpawnedChildExecutionError::InvalidState(
+                    "agent_spawn 需要当前会话存在活跃执行链".to_string(),
+                )
+            })?;
         if chain.mission_id != child_task.mission_id
             || chain.root_task_id != child_task.root_task_id
         {
-            return Err(format!(
+            return Err(SpawnedChildExecutionError::InvalidState(format!(
                 "agent_spawn 子任务不属于当前执行链: mission/root {}:{} != {}:{}",
                 child_task.mission_id,
                 child_task.root_task_id,
                 chain.mission_id,
                 chain.root_task_id
-            ));
+            )));
         }
         let parent_task_id = child_task.parent_task_id.clone().ok_or_else(|| {
-            format!(
+            SpawnedChildExecutionError::InvalidState(format!(
                 "agent_spawn 子任务 {} 缺少 parent_task_id",
                 child_task.task_id
-            )
+            ))
         })?;
+        let active_branch_count = active_execution_branch_count(task_store, &chain);
+        if active_branch_count >= MAX_ACTIVE_AGENT_BRANCHES_PER_SESSION {
+            return Err(SpawnedChildExecutionError::CapacityExceeded {
+                active: active_branch_count,
+                limit: MAX_ACTIVE_AGENT_BRANCHES_PER_SESSION,
+            });
+        }
         spawn_graph
             .lock()
-            .map_err(|err| format!("SpawnGraph mutex poisoned: {err}"))?
+            .map_err(|err| {
+                SpawnedChildExecutionError::InvalidState(format!(
+                    "SpawnGraph mutex poisoned: {err}"
+                ))
+            })?
             .add_edge(
                 parent_task_id.clone(),
                 child_task.task_id.clone(),
                 child_task.kind,
                 std::time::SystemTime::now(),
             )
-            .map_err(|error| format!("agent_spawn 注册 SpawnGraph 边失败: {error}"))?;
+            .map_err(|error| {
+                SpawnedChildExecutionError::InvalidState(format!(
+                    "agent_spawn 注册 SpawnGraph 边失败: {error}"
+                ))
+            })?;
         let worker_id = WorkerId::new(format!("worker-spawn-{}", child_task.task_id.as_str()));
         let thread_id = session_thread::ensure_thread_for_role(
             session_store,
@@ -152,6 +259,10 @@ impl TaskExecutionRegistry {
             &child_task.task_id,
             now,
         );
+        let parent_plan = self.get(&parent_task_id);
+        let inherited_skill_name = parent_plan.as_ref().and_then(|plan| match plan {
+            TaskExecutionPlan::Dispatch { skill_name, .. } => skill_name.clone(),
+        });
         let branch = ActiveExecutionBranch {
             task_id: child_task.task_id.clone(),
             worker_id: worker_id.clone(),
@@ -165,7 +276,7 @@ impl TaskExecutionRegistry {
             resume_mode: Some("stage-restart".to_string()),
             resume_token: None,
             use_tools: true,
-            skill_name: None,
+            skill_name: inherited_skill_name.clone(),
             is_primary: false,
             thread_id: thread_id.clone(),
         };
@@ -190,11 +301,11 @@ impl TaskExecutionRegistry {
         chain.normalize();
         session_store
             .upsert_active_execution_chain(session_id.clone(), chain)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| SpawnedChildExecutionError::InvalidState(error.to_string()))?;
 
-        let execution_settings_snapshot = self
-            .get(&parent_task_id)
-            .and_then(|plan| plan.execution_settings_snapshot());
+        let execution_settings_snapshot = parent_plan
+            .as_ref()
+            .and_then(TaskExecutionPlan::execution_settings_snapshot);
 
         self.insert(
             child_task.task_id.clone(),
@@ -222,7 +333,7 @@ impl TaskExecutionRegistry {
                 },
                 writebacks: ExecutionWritebackPlans::default(),
                 use_tools: true,
-                skill_name: None,
+                skill_name: inherited_skill_name,
                 images: Vec::new(),
                 execution_settings_snapshot,
             },
@@ -235,6 +346,27 @@ impl TaskExecutionRegistry {
             execution_chain_ref,
         })
     }
+}
+
+fn active_execution_branch_count(
+    task_store: &TaskStore,
+    chain: &magi_session_store::ActiveExecutionChain,
+) -> usize {
+    chain
+        .branches
+        .iter()
+        .filter(|branch| {
+            task_store
+                .get_task(&branch.task_id)
+                .map(|task| {
+                    matches!(
+                        task.status,
+                        magi_core::TaskStatus::Pending | magi_core::TaskStatus::Running
+                    )
+                })
+                .unwrap_or(true)
+        })
+        .count()
 }
 
 #[cfg(test)]
@@ -362,6 +494,14 @@ mod tests {
                 execution_settings_snapshot: Some(parent_settings_snapshot.clone()),
             },
         );
+        registry
+            .update_active_skill(
+                &root_task_id,
+                &session_store,
+                &session_id,
+                "code-review".to_string(),
+            )
+            .expect("dynamic parent skill activation should update runtime ownership");
 
         let child = test_task("task-child", root_task_id.as_str(), &mission_id);
         let registered = registry
@@ -400,6 +540,7 @@ mod tests {
                 workspace_id: plan_workspace_id,
                 is_primary,
                 use_tools,
+                skill_name,
                 execution_settings_snapshot,
                 ..
             } => {
@@ -408,6 +549,7 @@ mod tests {
                 assert_eq!(plan_workspace_id, workspace_id);
                 assert!(!is_primary);
                 assert!(use_tools);
+                assert_eq!(skill_name.as_deref(), Some("code-review"));
                 assert!(
                     execution_settings_snapshot
                         .as_ref()
@@ -428,7 +570,173 @@ mod tests {
             })
             .expect("child branch should exist");
         assert_eq!(child_branch.thread_id, registered.thread_id);
+        assert_eq!(child_branch.skill_name.as_deref(), Some("code-review"));
         assert!(chain.active_branch_task_ids.contains(&child.task_id));
         assert!(chain.active_worker_bindings.contains(&registered.worker_id));
+    }
+
+    #[test]
+    fn remove_session_drops_every_execution_plan_owned_by_session() {
+        let registry = TaskExecutionRegistry::default();
+        let session_a = SessionId::new("session-a");
+        let session_b = SessionId::new("session-b");
+        let mission_id = MissionId::new("mission-registry-cleanup");
+        for (task_id, session_id) in [
+            (TaskId::new("task-a-root"), session_a.clone()),
+            (TaskId::new("task-a-child"), session_a.clone()),
+            (TaskId::new("task-b-root"), session_b.clone()),
+        ] {
+            registry.insert(
+                task_id.clone(),
+                TaskExecutionPlan::Dispatch {
+                    target: magi_core::TaskExecutionTarget {
+                        mission_id: mission_id.clone(),
+                        root_task_id: task_id.clone(),
+                        task_id,
+                        requested_worker_id: None,
+                        recovery_id: None,
+                        execution_chain_ref: None,
+                    },
+                    worker_id: WorkerId::new("worker-registry-cleanup"),
+                    thread_id: ThreadId::new("thread-registry-cleanup"),
+                    is_primary: true,
+                    session_id,
+                    workspace_id: None,
+                    ownership: ExecutionOwnership::default(),
+                    writebacks: ExecutionWritebackPlans::default(),
+                    use_tools: true,
+                    skill_name: None,
+                    images: Vec::new(),
+                    execution_settings_snapshot: None,
+                },
+            );
+        }
+
+        let removed = registry.remove_session(&session_a);
+
+        assert_eq!(removed.len(), 2);
+        assert!(registry.get(&TaskId::new("task-a-root")).is_none());
+        assert!(registry.get(&TaskId::new("task-a-child")).is_none());
+        assert!(registry.get(&TaskId::new("task-b-root")).is_some());
+    }
+
+    #[test]
+    fn spawned_local_agent_child_registration_enforces_session_branch_capacity() {
+        let task_store = TaskStore::new();
+        let spawn_graph = Mutex::new(SpawnGraph::new());
+        let session_store = SessionStore::new();
+        let registry = TaskExecutionRegistry::default();
+        let session_id = SessionId::new("session-agent-capacity");
+        let workspace_id = Some(WorkspaceId::new("workspace-agent-capacity"));
+        let mission_id = MissionId::new("mission-agent-capacity");
+        let root_task_id = TaskId::new("task-root-capacity");
+        let parent_worker_id = WorkerId::new("worker-parent-capacity");
+        let now = UtcMillis(20_000);
+        let _ = session_store.ensure_session_mission(&session_id, now, || mission_id.clone());
+        session_store
+            .upsert_active_execution_chain(
+                session_id.clone(),
+                ActiveExecutionChain {
+                    session_id: session_id.clone(),
+                    mission_id: mission_id.clone(),
+                    root_task_id: root_task_id.clone(),
+                    execution_chain_ref: "chain-agent-capacity".to_string(),
+                    workspace_id: workspace_id.clone(),
+                    active_branch_task_ids: vec![root_task_id.clone()],
+                    active_worker_bindings: vec![parent_worker_id.clone()],
+                    branches: vec![ActiveExecutionBranch {
+                        task_id: root_task_id.clone(),
+                        worker_id: parent_worker_id,
+                        stage: "execute".to_string(),
+                        lease_id: None,
+                        execution_intent_ref: None,
+                        binding_lifecycle: None,
+                        checkpoint_stage: Some("execute".to_string()),
+                        next_step_index: Some(0),
+                        checkpoint_at: Some(now),
+                        resume_mode: Some("stage-restart".to_string()),
+                        resume_token: None,
+                        use_tools: true,
+                        skill_name: None,
+                        is_primary: true,
+                        thread_id: ThreadId::new("thread-agent-capacity-parent"),
+                    }],
+                    recovery_ref: None,
+                    dispatch_context: ActiveExecutionDispatchContext {
+                        accepted_at: now,
+                        entry_id: "timeline-agent-capacity".to_string(),
+                        trimmed_text: Some("spawn children".to_string()),
+                        skill_name: None,
+                    },
+                    current_turn: Some(ActiveExecutionTurn {
+                        turn_id: "turn-agent-capacity".to_string(),
+                        turn_seq: 1,
+                        accepted_at: now,
+                        completed_at: None,
+                        status: "running".to_string(),
+                        user_message: Some("spawn children".to_string()),
+                        items: Vec::new(),
+                    }),
+                },
+            )
+            .expect("active chain should be accepted");
+
+        for index in 0..3 {
+            let child = test_task(
+                &format!("task-child-capacity-{index}"),
+                root_task_id.as_str(),
+                &mission_id,
+            );
+            registry
+                .register_spawned_local_agent_child(SpawnedChildExecutionRequest {
+                    task_store: &task_store,
+                    spawn_graph: &spawn_graph,
+                    session_store: &session_store,
+                    child_task: &child,
+                    session_id: &session_id,
+                    workspace_id: &workspace_id,
+                    role: "executor",
+                    now: UtcMillis(now.0 + index as u64 + 1),
+                })
+                .expect("前三个子代理应允许创建");
+        }
+
+        let overflow_child = test_task(
+            "task-child-capacity-overflow",
+            root_task_id.as_str(),
+            &mission_id,
+        );
+        let error = registry
+            .register_spawned_local_agent_child(SpawnedChildExecutionRequest {
+                task_store: &task_store,
+                spawn_graph: &spawn_graph,
+                session_store: &session_store,
+                child_task: &overflow_child,
+                session_id: &session_id,
+                workspace_id: &workspace_id,
+                role: "executor",
+                now: UtcMillis(now.0 + 10),
+            })
+            .expect_err("第四个并发子代理应被容量上限拒绝");
+
+        assert_eq!(
+            error,
+            SpawnedChildExecutionError::CapacityExceeded {
+                active: MAX_ACTIVE_AGENT_BRANCHES_PER_SESSION,
+                limit: MAX_ACTIVE_AGENT_BRANCHES_PER_SESSION,
+            }
+        );
+        assert!(
+            task_store.get_task(&overflow_child.task_id).is_none(),
+            "被容量拒绝的子代理不能写入 task_store"
+        );
+        assert!(
+            spawn_graph
+                .lock()
+                .expect("spawn graph lock should be available")
+                .parent_of(&overflow_child.task_id)
+                .is_none(),
+            "被容量拒绝的子代理不能写入 spawn_graph"
+        );
     }
 }

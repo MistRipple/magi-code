@@ -11,8 +11,6 @@ export interface ResolvedNotificationPresentation {
   category: NotifyCategory;
   source: string;
   actionRequired: boolean;
-  persistToCenter: boolean;
-  countUnread: boolean;
   title?: string;
   duration?: number;
 }
@@ -23,22 +21,21 @@ function normalizeNotifyLevel(level: string | undefined): NotifyLevel {
 
 function normalizeNotifyDisplayMode(
   displayMode: NotifyDisplayMode | undefined,
-  level: NotifyLevel,
-): Exclude<NotifyDisplayMode, 'auto'> {
-  if (displayMode === 'toast' || displayMode === 'notification_center' || displayMode === 'silent') {
+): 'toast' | 'silent' {
+  if (displayMode === 'toast' || displayMode === 'silent') {
     return displayMode;
   }
-  return level === 'error' ? 'toast' : 'notification_center';
+  return 'toast';
 }
 
 function normalizeNotifyCategory(
   category: NotifyCategory | undefined,
   level: NotifyLevel,
 ): NotifyCategory {
-  if (category === 'incident' || category === 'audit' || category === 'feedback') {
+  if (category === 'incident' || category === 'feedback') {
     return category;
   }
-  return level === 'error' ? 'incident' : 'audit';
+  return level === 'error' ? 'incident' : 'feedback';
 }
 
 export function resolveNotificationPresentation(
@@ -47,21 +44,15 @@ export function resolveNotificationPresentation(
 ): ResolvedNotificationPresentation {
   const level = normalizeNotifyLevel(notify?.level);
   const category = normalizeNotifyCategory(notify?.category, level);
-  const displayMode = normalizeNotifyDisplayMode(notify?.displayMode, level);
+  const displayMode = normalizeNotifyDisplayMode(notify?.displayMode);
   const source = typeof notify?.source === 'string' && notify.source.trim().length > 0
     ? notify.source.trim()
     : (typeof fallbackSource === 'string' && fallbackSource.trim().length > 0
       ? fallbackSource.trim()
       : 'model-runtime');
-  const persistToCenter = typeof notify?.persistToCenter === 'boolean'
-    ? notify.persistToCenter
-    : category !== 'feedback';
   const actionRequired = typeof notify?.actionRequired === 'boolean'
     ? notify.actionRequired
     : category === 'incident';
-  const countUnread = persistToCenter
-    ? (typeof notify?.countUnread === 'boolean' ? notify.countUnread : category === 'incident')
-    : false;
 
   return {
     level,
@@ -69,15 +60,7 @@ export function resolveNotificationPresentation(
     category,
     source,
     actionRequired,
-    persistToCenter,
-    countUnread,
     title: typeof notify?.title === 'string' ? notify.title : undefined,
     duration: typeof notify?.duration === 'number' ? notify.duration : undefined,
   };
-}
-
-export function shouldPersistNotificationRecord(
-  presentation: Pick<ResolvedNotificationPresentation, 'persistToCenter' | 'category'>,
-): boolean {
-  return presentation.persistToCenter && presentation.category !== 'feedback';
 }

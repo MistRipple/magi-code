@@ -391,6 +391,58 @@ fn clear_workspace_and_delete_in_workspace_are_scoped() {
     assert!(store.get("kb-b").is_none());
 }
 
+#[test]
+fn clear_workspace_cancels_active_index_build_until_worker_finishes() {
+    let store = KnowledgeStore::new();
+    let workspace_id = WorkspaceId::new("workspace-cancel-index-build");
+    let root = std::env::temp_dir().join(format!(
+        "magi-knowledge-cancel-build-{}-{}",
+        std::process::id(),
+        UtcMillis::now().0
+    ));
+    std::fs::create_dir_all(root.join("src")).expect("create temp workspace");
+    std::fs::write(root.join("src/lib.rs"), "pub fn stale_build() {}\n").expect("write source");
+
+    assert!(store.begin_workspace_index_build(&workspace_id));
+    store.clear_workspace(&workspace_id);
+    assert!(
+        store.workspace_index_building(&workspace_id),
+        "clear must keep the active worker occupied until it reaches its completion boundary"
+    );
+    store.build_workspace_index(&workspace_id, &root);
+    store.upsert(KnowledgeRecord {
+        knowledge_id: "knowledge-after-clear".to_string(),
+        kind: KnowledgeKind::Learning,
+        title: "Knowledge after clear".to_string(),
+        content: "This record was created after the clear request.".to_string(),
+        tags: vec![],
+        workspace_id: Some(workspace_id.clone()),
+        source_ref: None,
+        updated_at: UtcMillis::now(),
+    });
+    assert!(
+        store
+            .code_index_summary_for_workspace(&workspace_id)
+            .is_some()
+    );
+    assert!(
+        store.finish_workspace_index_build(&workspace_id),
+        "the worker completion must report that its derived result should be discarded"
+    );
+    assert!(!store.workspace_index_building(&workspace_id));
+    assert!(
+        store
+            .code_index_summary_for_workspace(&workspace_id)
+            .is_none()
+    );
+    assert!(
+        store.get("knowledge-after-clear").is_some(),
+        "discarding a cancelled derived index must preserve knowledge created after clear"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
 fn project_code_index_summary(path: &str, updated_at: UtcMillis) -> CodeIndexIngestion {
     let summary = CodeIndexSummary {
         files: vec![CodeIndexFile {

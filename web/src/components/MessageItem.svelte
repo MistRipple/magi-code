@@ -75,7 +75,7 @@
     )
   );
   const isCanonicalMessage = $derived(message.metadata?.canonical === true);
-  // 主线不承载运行时内部工具；这些 block 只能作为任务详情/运行时日志的投影。
+  // 主线不承载运行时内部工具；这些 block 只能作为代理运行日志投影。
   const presentationBlocks = $derived(
     safeBlocks.filter((block) => {
       if (isCanonicalMessage) {
@@ -528,7 +528,7 @@
     transition: border-color 0.2s ease, box-shadow 0.2s ease;
   }
 
-  /* 主角色连续消息紧凑间距（orchestrator 在主对话区，代理在任务详情中） */
+  /* 主角色连续消息紧凑间距（orchestrator 在主对话区，代理在右侧 tab 中） */
   .message-item.assistant.plain-shell:not(.inline-guest) {
     margin-top: calc(-1 * var(--space-2));
   }

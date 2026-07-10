@@ -533,7 +533,7 @@ fn execution_overview_exports_context_consumption_into_runtime_read_model() {
 }
 
 #[test]
-fn task_projection_aggregates_governance_summaries_by_layer() {
+fn agent_run_projection_aggregates_governance_summaries_by_layer() {
     let event_bus = Arc::new(InMemoryEventBus::new(16));
     let service = OrchestratorService::new(event_bus);
     let task_store = TaskStore::new();
@@ -2417,4 +2417,46 @@ mod auto_learning_tests {
             .unwrap_or_default()
             .as_millis() as u64
     }
+}
+
+#[test]
+fn task_store_remove_mission_removes_tasks_leases_and_checkpoints_once() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let task_store = TaskStore::new();
+    let mission_id = MissionId::new("mission-delete");
+    let root_task_id = TaskId::new("task-root-delete");
+    let child_task_id = TaskId::new("task-child-delete");
+    seed_action_tasks(
+        &task_store,
+        &mission_id,
+        "delete mission",
+        &[(child_task_id.clone(), "child", TaskStatus::Running)],
+    );
+    task_store
+        .grant_lease(
+            &child_task_id,
+            &root_task_id,
+            &WorkerId::new("worker-delete"),
+            "executor",
+            60_000,
+        )
+        .expect("lease should be granted");
+    let checkpoint_count = Arc::new(AtomicUsize::new(0));
+    let observed_checkpoint_count = checkpoint_count.clone();
+    task_store.set_checkpoint_callback(Box::new(move |_| {
+        observed_checkpoint_count.fetch_add(1, Ordering::SeqCst);
+    }));
+
+    let removed = task_store.remove_tasks_by_mission(&mission_id);
+
+    assert_eq!(removed.len(), 2);
+    assert!(task_store.get_tasks_by_mission(&mission_id).is_empty());
+    assert!(task_store.get_task(&root_task_id).is_none());
+    assert!(task_store.get_task(&child_task_id).is_none());
+    assert_eq!(
+        task_store.checkpoint()["leases"].as_array().unwrap().len(),
+        0
+    );
+    assert_eq!(checkpoint_count.load(Ordering::SeqCst), 1);
 }

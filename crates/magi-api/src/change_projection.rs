@@ -79,6 +79,7 @@ pub struct PendingChangeDto {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub old_path: Option<String>,
     pub has_error: bool,
+    pub revertible: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub symlink_target: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -346,6 +347,7 @@ fn convert_pending(scope: &SessionChangeScope, change: PendingChange) -> Pending
             .error
             .as_deref()
             .is_some_and(|error| !error.trim().is_empty()),
+        revertible: change.revertible,
         symlink_target: change.symlink_target,
         head_summary: change.head_summary,
         tail_summary: change.tail_summary,
@@ -761,6 +763,7 @@ mod tests {
                 size: 0,
                 mime: None,
                 error: Some("read failed: permission denied".to_string()),
+                revertible: false,
                 symlink_target: None,
                 original_content: None,
                 preview_content: None,
@@ -800,6 +803,7 @@ mod tests {
                 size: 16,
                 mime: Some("text/plain".to_string()),
                 error: None,
+                revertible: true,
                 symlink_target: None,
                 original_content: Some("old\n".to_string()),
                 preview_content: Some("new\n".to_string()),

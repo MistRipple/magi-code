@@ -113,6 +113,7 @@ impl SnapshotManager {
             .cloned()
             .ok_or_else(|| SnapshotError::SessionNotFound(session_id.to_string()))?;
         session.archive().await;
+        session.release_runtime_blob_ownership()?;
         // 从内存映射移除，下次 start_session 会从磁盘恢复。
         self.sessions
             .write()

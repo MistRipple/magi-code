@@ -254,10 +254,12 @@ fn build_skill_registry_from_config(config: &Map<String, Value>) -> SkillRegistr
 
                     let mut allowed_tools = Vec::new();
                     let mut custom_tool_bindings = Vec::new();
+                    let mut restrict_standard_tools = false;
 
                     let config_path = skill_dir.join("config.json");
                     if let Ok(content) = fs::read_to_string(config_path) {
                         if let Ok(parsed) = serde_json::from_str::<Value>(&content) {
+                            restrict_standard_tools = parsed.get("allowed_tools").is_some();
                             if let Some(allowed) =
                                 parsed.get("allowed_tools").and_then(|v| v.as_array())
                             {
@@ -289,6 +291,7 @@ fn build_skill_registry_from_config(config: &Map<String, Value>) -> SkillRegistr
                             category: "local".to_string(),
                             tags: vec![],
                         },
+                        restrict_standard_tools,
                         allowed_tools,
                         custom_tool_bindings,
                         prompt_priority: 50,
@@ -339,6 +342,37 @@ mod tests {
         std::fs::write(skill_dir.join("SKILL.md"), skill_body)
             .expect("skill markdown should be written");
         skill_dir
+    }
+
+    #[test]
+    fn instruction_skill_without_tool_config_inherits_standard_tool_surface() {
+        let skill_dir = make_local_skill_dir(
+            "inherit-standard-tools",
+            "# Prompt Only Skill\n\n先取证，再回答。\n",
+        );
+        let store = SettingsStore::default();
+        store.set_section(
+            SKILLS_CONFIG_SECTION,
+            serde_json::json!({
+                "instructionSkills": [{
+                    "skillId": "prompt-only",
+                    "name": "Prompt Only",
+                    "directoryPath": skill_dir.to_string_lossy().to_string()
+                }]
+            }),
+        );
+
+        let runtime = build_skill_runtime_from_settings(&store);
+        let plan = runtime.build_tool_runtime_plan(SkillSelection {
+            skill_ids: vec!["prompt-only".to_string()],
+            requested_tools: Vec::new(),
+        });
+
+        assert!(
+            plan.tool_policy.source_skill_ids.is_empty(),
+            "未声明 allowed_tools 的 instruction Skill 不应创建标准工具白名单"
+        );
+        std::fs::remove_dir_all(&skill_dir).expect("skill dir should be removed");
     }
 
     #[test]

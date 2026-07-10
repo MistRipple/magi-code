@@ -25,10 +25,9 @@ use crate::{
     session_writeback::SessionStatePersistCallback,
     skill_apply_tool_definition,
     task_execution_registry::{TaskExecutionPlan, TaskExecutionRegistry},
-    task_helpers::{
-        task_can_see_builtin_tool, task_is_coordinator, task_is_long_mission, task_role_id,
-    },
+    task_helpers::{task_can_see_builtin_tool, task_is_coordinator, task_role_id},
     task_runner_bridge::{EventBasedResultReceiver, TaskDispatcher, TaskOutcome, TaskResult},
+    tool_surface_state::refresh_live_mcp_tool_definitions,
     usage_recording::{ModelUsageBinding, model_usage_binding_for_worker_with_settings},
 };
 use magi_bridge_client::{ChatToolDefinition, ModelBridgeClient, ModelInvocationRequest};
@@ -37,12 +36,11 @@ use magi_context_runtime::{
     RecentTurnSource,
 };
 use magi_core::{
-    AccessProfile, EventId, ExecutionOwnership, LeaseId, MissionId, SessionId, TaskId, TaskKind,
-    UtcMillis, WorkerId, WorkspaceId,
+    AccessProfile, EventId, ExecutionOwnership, LeaseId, SessionId, TaskId, TaskKind, UtcMillis,
+    WorkerId, WorkspaceId,
 };
 use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
 use magi_knowledge_store::{KnowledgeKind, KnowledgeRecord, KnowledgeStore};
-use magi_lifecycle_notice::LifecycleNoticeRegistry;
 use magi_memory_store::{ExtractedMemory, MemoryExtractionApplyRequest, MemoryLayer, MemoryStore};
 use magi_mission_metrics::MissionMetricsRegistry;
 use magi_orchestrator::{
@@ -91,47 +89,10 @@ pub struct LlmTaskDispatcher {
     /// 任务系统 — L5：父子任务拓扑图。S7 协调器工具 agent_spawn
     /// 需要在 conversation_loop 中读写。设计为构造期必填，避免运行期再做空检查。
     spawn_graph: Arc<std::sync::Mutex<magi_spawn_graph::SpawnGraph>>,
-    /// 任务系统 — L13：session 维度的 TodoLedger 索引。S9 中模型通过
-    /// `todo_write` 工具往这里写分解 + 进度；下一轮 Turn 起始时把快照注入 system prompt。
-    todo_ledger_registry: Arc<magi_todo_ledger::TodoLedgerRegistry>,
     /// 任务系统 — L14：workspace 维度的 ProjectMemory 索引。S10 中模型通过
     /// `memory_write` 工具新增/删除项目记忆条目；每次 Turn 起始把 MEMORY.md 视图注入
     /// system prompt，跨 conversation 复用。
     project_memory_registry: Arc<magi_project_memory::ProjectMemoryRegistry>,
-    /// 任务系统 — Tier 4 / L15：workspace 维度的 MissionCharter 索引。S11 中模型
-    /// 通过 `mission_charter_write` 工具增量更新 mission 宪章；每次 Turn 起始把当前
-    /// mission 的 charter 注入 system prompt，跨 conversation 锚定目标契约。
-    mission_charter_registry: Arc<magi_mission_charter::MissionCharterRegistry>,
-    /// 任务系统 — Tier 4 / L16：workspace 维度的 Plan 索引。S12 中模型通过
-    /// `plan_write` 工具整体替换 mission.plan.steps；每次 Turn 起始把当前 plan
-    /// 注入 system prompt，长链路推进时保留计划上下文。
-    plan_registry: Arc<magi_plan::PlanRegistry>,
-    /// 任务系统 — Tier 4 / L17：workspace 维度的 MissionWorkspace 索引。S13
-    /// 中每个 Mission 拥有独占的 artifacts/logs/memory 目录骨架；Turn 起始时把目录
-    /// 路径注入 system prompt，让 agent 把产物落在 mission 内而不是无主目录。
-    mission_workspace_registry: Arc<magi_mission_workspace::MissionWorkspaceRegistry>,
-    /// 任务系统 — Tier 4 / L18：workspace 维度的 KnowledgeGraph 索引。S14
-    /// 中每个 Mission 累积"已知事实"（symbols / decisions / risks）；Turn 起始时把
-    /// live facts 注入 system prompt，避免长 mission 中模型重新讨论已经达成的结论。
-    knowledge_graph_registry: Arc<magi_knowledge_graph::KnowledgeGraphRegistry>,
-    /// 任务系统 — Tier 4 / L19：workspace 维度的 ValidationRunner 索引。S15
-    /// 中每个 Mission 在 Plan 节点上挂载验证记录（test_suite / type_check /
-    /// integration_smoke / benchmark）；Coordinator 判定 Plan 节点完成的硬门槛
-    /// 是：至少 1 条 Pass，且当前无 Fail。
-    validation_runner_registry: Arc<magi_validation_runner::ValidationRunnerRegistry>,
-    /// 任务系统 — Tier 4 / L20：workspace 维度的 Checkpoint 索引。S16 中每个
-    /// Mission 维护一份 append-only 的检查点日志（process_restart / context_compaction
-    /// / phase_transition / manual），让事后能定位到“恢复到 Tn”所需要的最小语义快照。
-    checkpoint_registry: Arc<magi_checkpoint::CheckpointRegistry>,
-    /// 任务系统 — Tier 4 / L21：workspace 维度的 HumanCheckpoint 索引。S17 中
-    /// orchestrator 通过 human_checkpoint_request 申请人工审核点；pending 存在时
-    /// runtime 会拒绝 agent_spawn 并暂停新的 leaf dispatch。
-    human_checkpoint_registry: Arc<magi_human_checkpoint::HumanCheckpointRegistry>,
-    /// codex goal 桥：mission 生命周期通知（recovery / 人审 resolve / plan step
-    /// 完成）按 mission 维度排队，dispatcher 在装配 prompt 时 `pending_notice`
-    /// 拉一段，由 `prepend_session_instructions` 用 `<system-reminder>` 包装注入。
-    /// 可选——daemon bootstrap 没接线时为 None，行为退回到不注入。
-    lifecycle_notices: Option<Arc<LifecycleNoticeRegistry>>,
     /// codex goal 桥：mission 维度记账 registry。dispatch 时按 workspace 拿对应
     /// store，conversation_loop 中每轮 LLM 调用后调用一次 `record_mission_turn`
     /// 累加 token / 时间。daemon bootstrap 未注入时为 `None`，行为退回到不记账。
@@ -286,40 +247,9 @@ impl LlmTaskDispatcher {
             conversation_registry: None,
             agent_role_registry: None,
             spawn_graph,
-            todo_ledger_registry: Arc::new(magi_todo_ledger::TodoLedgerRegistry::new()),
             project_memory_registry: Arc::new(
                 magi_project_memory::ProjectMemoryRegistry::with_home(mission_state_root.clone()),
             ),
-            mission_charter_registry: Arc::new(
-                magi_mission_charter::MissionCharterRegistry::with_home(mission_state_root.clone()),
-            ),
-            plan_registry: Arc::new(magi_plan::PlanRegistry::with_magi_home(
-                mission_state_root.clone(),
-            )),
-            mission_workspace_registry: Arc::new(
-                magi_mission_workspace::MissionWorkspaceRegistry::with_magi_home(
-                    mission_state_root.clone(),
-                ),
-            ),
-            knowledge_graph_registry: Arc::new(
-                magi_knowledge_graph::KnowledgeGraphRegistry::with_magi_home(
-                    mission_state_root.clone(),
-                ),
-            ),
-            validation_runner_registry: Arc::new(
-                magi_validation_runner::ValidationRunnerRegistry::with_magi_home(
-                    mission_state_root.clone(),
-                ),
-            ),
-            checkpoint_registry: Arc::new(magi_checkpoint::CheckpointRegistry::with_magi_home(
-                mission_state_root.clone(),
-            )),
-            human_checkpoint_registry: Arc::new(
-                magi_human_checkpoint::HumanCheckpointRegistry::with_magi_home(
-                    mission_state_root.clone(),
-                ),
-            ),
-            lifecycle_notices: None,
             mission_metrics_registry: Arc::new(MissionMetricsRegistry::with_home(
                 mission_state_root,
             )),
@@ -384,6 +314,19 @@ impl LlmTaskDispatcher {
         self
     }
 
+    fn resolve_registered_skill_id(&self, requested: Option<&str>) -> Option<String> {
+        let requested = requested?.trim();
+        if requested.is_empty() {
+            return None;
+        }
+        let runtime = self.skill_runtime.as_ref()?;
+        match runtime.registry().resolve_skill_id(requested) {
+            magi_skill_runtime::SkillIdResolution::Found(skill_id) => Some(skill_id),
+            magi_skill_runtime::SkillIdResolution::NotFound
+            | magi_skill_runtime::SkillIdResolution::Ambiguous(_) => None,
+        }
+    }
+
     pub fn with_skill_dispatch_runtime(
         mut self,
         runtime: Arc<magi_skill_runtime::SkillDispatchRuntime>,
@@ -402,11 +345,6 @@ impl LlmTaskDispatcher {
         self
     }
 
-    pub fn with_lifecycle_notices(mut self, registry: Arc<LifecycleNoticeRegistry>) -> Self {
-        self.lifecycle_notices = Some(registry);
-        self
-    }
-
     pub fn with_mission_metrics_registry(mut self, registry: Arc<MissionMetricsRegistry>) -> Self {
         self.mission_metrics_registry = registry;
         self
@@ -416,31 +354,12 @@ impl LlmTaskDispatcher {
         self.mission_metrics_registry.clone()
     }
 
-    /// 给定 mission，取一段当前应注入下轮 prompt 的"生命周期通知"。无注册表 / 无通知时返回 None。
-    fn lifecycle_notice_for_mission(&self, mission_id: &MissionId) -> Option<String> {
-        self.lifecycle_notices
-            .as_ref()
-            .and_then(|reg| reg.pending_notice(mission_id))
-    }
-
     pub fn with_agent_role_registry(
         mut self,
         registry: Arc<magi_agent_role::AgentRoleRegistry>,
     ) -> Self {
         self.agent_role_registry = Some(registry);
         self
-    }
-
-    pub fn with_todo_ledger_registry(
-        mut self,
-        registry: Arc<magi_todo_ledger::TodoLedgerRegistry>,
-    ) -> Self {
-        self.todo_ledger_registry = registry;
-        self
-    }
-
-    pub fn todo_ledger_registry(&self) -> Arc<magi_todo_ledger::TodoLedgerRegistry> {
-        self.todo_ledger_registry.clone()
     }
 
     pub fn with_project_memory_registry(
@@ -453,120 +372,6 @@ impl LlmTaskDispatcher {
 
     pub fn project_memory_registry(&self) -> Arc<magi_project_memory::ProjectMemoryRegistry> {
         self.project_memory_registry.clone()
-    }
-
-    pub fn with_mission_charter_registry(
-        mut self,
-        registry: Arc<magi_mission_charter::MissionCharterRegistry>,
-    ) -> Self {
-        self.mission_charter_registry = registry;
-        self
-    }
-
-    pub fn mission_charter_registry(&self) -> Arc<magi_mission_charter::MissionCharterRegistry> {
-        self.mission_charter_registry.clone()
-    }
-
-    pub fn with_mission_state_root(mut self, magi_home: PathBuf) -> Self {
-        self.project_memory_registry = Arc::new(
-            magi_project_memory::ProjectMemoryRegistry::with_home(magi_home.clone()),
-        );
-        self.mission_charter_registry = Arc::new(
-            magi_mission_charter::MissionCharterRegistry::with_home(magi_home.clone()),
-        );
-        self.plan_registry = Arc::new(magi_plan::PlanRegistry::with_magi_home(magi_home.clone()));
-        self.mission_workspace_registry = Arc::new(
-            magi_mission_workspace::MissionWorkspaceRegistry::with_magi_home(magi_home.clone()),
-        );
-        self.knowledge_graph_registry = Arc::new(
-            magi_knowledge_graph::KnowledgeGraphRegistry::with_magi_home(magi_home.clone()),
-        );
-        self.validation_runner_registry = Arc::new(
-            magi_validation_runner::ValidationRunnerRegistry::with_magi_home(magi_home.clone()),
-        );
-        self.checkpoint_registry = Arc::new(magi_checkpoint::CheckpointRegistry::with_magi_home(
-            magi_home.clone(),
-        ));
-        self.human_checkpoint_registry = Arc::new(
-            magi_human_checkpoint::HumanCheckpointRegistry::with_magi_home(magi_home.clone()),
-        );
-        self.mission_metrics_registry = Arc::new(
-            magi_mission_metrics::MissionMetricsRegistry::with_home(magi_home),
-        );
-        self
-    }
-
-    pub fn with_plan_registry(mut self, registry: Arc<magi_plan::PlanRegistry>) -> Self {
-        self.plan_registry = registry;
-        self
-    }
-
-    pub fn plan_registry(&self) -> Arc<magi_plan::PlanRegistry> {
-        self.plan_registry.clone()
-    }
-
-    pub fn with_mission_workspace_registry(
-        mut self,
-        registry: Arc<magi_mission_workspace::MissionWorkspaceRegistry>,
-    ) -> Self {
-        self.mission_workspace_registry = registry;
-        self
-    }
-
-    pub fn mission_workspace_registry(
-        &self,
-    ) -> Arc<magi_mission_workspace::MissionWorkspaceRegistry> {
-        self.mission_workspace_registry.clone()
-    }
-
-    pub fn with_knowledge_graph_registry(
-        mut self,
-        registry: Arc<magi_knowledge_graph::KnowledgeGraphRegistry>,
-    ) -> Self {
-        self.knowledge_graph_registry = registry;
-        self
-    }
-
-    pub fn knowledge_graph_registry(&self) -> Arc<magi_knowledge_graph::KnowledgeGraphRegistry> {
-        self.knowledge_graph_registry.clone()
-    }
-
-    pub fn with_validation_runner_registry(
-        mut self,
-        registry: Arc<magi_validation_runner::ValidationRunnerRegistry>,
-    ) -> Self {
-        self.validation_runner_registry = registry;
-        self
-    }
-
-    pub fn validation_runner_registry(
-        &self,
-    ) -> Arc<magi_validation_runner::ValidationRunnerRegistry> {
-        self.validation_runner_registry.clone()
-    }
-
-    pub fn with_checkpoint_registry(
-        mut self,
-        registry: Arc<magi_checkpoint::CheckpointRegistry>,
-    ) -> Self {
-        self.checkpoint_registry = registry;
-        self
-    }
-
-    pub fn checkpoint_registry(&self) -> Arc<magi_checkpoint::CheckpointRegistry> {
-        self.checkpoint_registry.clone()
-    }
-
-    pub fn with_human_checkpoint_registry(
-        mut self,
-        registry: Arc<magi_human_checkpoint::HumanCheckpointRegistry>,
-    ) -> Self {
-        self.human_checkpoint_registry = registry;
-        self
-    }
-
-    pub fn human_checkpoint_registry(&self) -> Arc<magi_human_checkpoint::HumanCheckpointRegistry> {
-        self.human_checkpoint_registry.clone()
     }
 
     fn publish_task_dispatched_event(
@@ -631,13 +436,7 @@ impl LlmTaskDispatcher {
         system_prompt: Option<String>,
         execution_settings_snapshot: Option<Arc<SettingsStore>>,
     ) {
-        // 仅在有 writebacks 时（即主 action task）才生成 streaming entry_id。
-        // sub-task 的 writebacks 为空，不需要在 timeline 中创建流式条目。
-        let streaming_entry_id = if writebacks.is_empty() {
-            None
-        } else {
-            Some(format!("timeline-streaming-{}", task.task_id))
-        };
+        let streaming_entry_id = task_streaming_entry_id(task);
         let (outcome, context_summary) = self.invoke_llm_with_tools(
             task,
             task_id,
@@ -648,7 +447,7 @@ impl LlmTaskDispatcher {
             skill_name,
             images,
             &usage_binding,
-            streaming_entry_id.as_deref(),
+            Some(streaming_entry_id.as_str()),
             is_sidechain,
             Some(&worker_id),
             Some(worker_role.as_str()),
@@ -939,6 +738,7 @@ impl LlmTaskDispatcher {
             .filter(|definition| {
                 BuiltinToolName::from_str(definition.function.name.as_str()).is_some_and(|tool| {
                     task_can_see_builtin_tool(task, self.agent_role_registry.as_deref(), tool)
+                        && (task.is_some() || session_turn_can_execute_builtin_tool(tool))
                         && builtin_tool_visible_in_access_profile(tool, tool_surface_access_profile)
                 })
             })
@@ -951,8 +751,12 @@ impl LlmTaskDispatcher {
             })
             .filter(|definition| definition.function.name != SKILL_APPLY_TOOL_NAME)
             .collect::<Vec<_>>();
-        if self.skill_runtime.is_some() {
-            definitions.push(skill_apply_tool_definition());
+        if self.skill_runtime.is_some() && skill_name.is_none() {
+            definitions.push(skill_apply_tool_definition(
+                self.skill_runtime
+                    .as_deref()
+                    .expect("skill runtime checked above"),
+            ));
         }
         if let (Some(skill_name), Some(skill_runtime)) = (skill_name, self.skill_runtime.as_ref()) {
             let plan = skill_runtime.build_tool_runtime_plan(magi_skill_runtime::SkillSelection {
@@ -965,8 +769,78 @@ impl LlmTaskDispatcher {
                 tool_surface_access_profile,
             ));
         }
-        definitions
+        let task_policy = task.and_then(|task| task.policy_snapshot.as_ref());
+        refresh_live_mcp_tool_definitions(
+            definitions,
+            &registry,
+            self.skill_runtime.as_deref(),
+            skill_name,
+            tool_surface_access_profile,
+            task_policy
+                .filter(|policy| !policy.allowed_tools.is_empty())
+                .map(|policy| policy.allowed_tools.as_slice()),
+            task_policy
+                .map(|policy| policy.denied_tools.as_slice())
+                .unwrap_or_default(),
+        )
     }
+
+    fn build_session_turn_tool_definitions(
+        &self,
+        skill_name: Option<&str>,
+        access_profile: AccessProfile,
+        goal_turn_mode: crate::session_turn_execution::SessionGoalTurnMode,
+    ) -> Vec<ChatToolDefinition> {
+        let mut definitions = self.build_tool_definitions(None, skill_name, access_profile);
+        if goal_turn_mode.is_goal_driven()
+            && let Some(registry) = self.tool_registry.as_ref()
+        {
+            for definition in public_builtin_tool_definitions(registry)
+                .into_iter()
+                .filter(|definition| {
+                    BuiltinToolName::from_str(definition.function.name.as_str()).is_some_and(
+                        |tool| {
+                            is_session_goal_tool(tool)
+                                && builtin_tool_visible_in_access_profile(tool, access_profile)
+                        },
+                    )
+                })
+            {
+                if definitions
+                    .iter()
+                    .all(|existing| existing.function.name != definition.function.name)
+                {
+                    definitions.push(definition);
+                }
+            }
+        }
+        session_goal_tool_surface(definitions, goal_turn_mode)
+    }
+}
+
+fn is_session_goal_tool(tool: BuiltinToolName) -> bool {
+    matches!(
+        tool,
+        BuiltinToolName::GetGoal
+            | BuiltinToolName::CreateGoal
+            | BuiltinToolName::UpdateGoal
+            | BuiltinToolName::TodoWrite
+    )
+}
+
+fn session_turn_can_execute_builtin_tool(tool: BuiltinToolName) -> bool {
+    !tool.is_runtime_internal_tool_call()
+        || matches!(
+            tool,
+            BuiltinToolName::GetGoal
+                | BuiltinToolName::CreateGoal
+                | BuiltinToolName::UpdateGoal
+                | BuiltinToolName::TodoWrite
+        )
+}
+
+fn task_streaming_entry_id(task: &magi_core::Task) -> String {
+    format!("timeline-streaming-{}", task.task_id)
 }
 
 fn tool_surface_access_profile(
@@ -1067,7 +941,6 @@ impl LlmTaskDispatcher {
         };
         let user_rules_prefix = self.resolve_user_rules_prompt(settings_store);
         let safeguard_prefix = self.resolve_safeguard_prompt(settings_store);
-        let lifecycle_notice = self.lifecycle_notice_for_mission(&task.mission_id);
         let task_fact_context_parts = self.task_fact_context_parts(task);
 
         let Some(ref ctx_runtime) = self.context_runtime else {
@@ -1076,7 +949,6 @@ impl LlmTaskDispatcher {
                     prepend_session_instructions(
                         user_rules_prefix.as_deref(),
                         safeguard_prefix.as_deref(),
-                        lifecycle_notice.as_deref(),
                         &base_prompt,
                     ),
                     None,
@@ -1087,7 +959,6 @@ impl LlmTaskDispatcher {
                 prepend_session_instructions(
                     user_rules_prefix.as_deref(),
                     safeguard_prefix.as_deref(),
-                    lifecycle_notice.as_deref(),
                     &format!("--- Context ---\n{ctx_text}\n--- Task ---\n{base_prompt}"),
                 ),
                 None,
@@ -1105,7 +976,6 @@ impl LlmTaskDispatcher {
                 prepend_session_instructions(
                     user_rules_prefix.as_deref(),
                     safeguard_prefix.as_deref(),
-                    lifecycle_notice.as_deref(),
                     &prompt,
                 ),
                 None,
@@ -1139,7 +1009,6 @@ impl LlmTaskDispatcher {
                 prepend_session_instructions(
                     user_rules_prefix.as_deref(),
                     safeguard_prefix.as_deref(),
-                    lifecycle_notice.as_deref(),
                     &base_prompt,
                 ),
                 Some(context_summary),
@@ -1188,7 +1057,6 @@ impl LlmTaskDispatcher {
             prepend_session_instructions(
                 user_rules_prefix.as_deref(),
                 safeguard_prefix.as_deref(),
-                lifecycle_notice.as_deref(),
                 &format!("--- Context ---\n{ctx_text}\n--- Task ---\n{base_prompt}"),
             ),
             Some(context_summary),
@@ -1374,38 +1242,43 @@ impl LlmTaskDispatcher {
                     .to_string(),
             })?;
 
+        let active_skill_name = self.resolve_registered_skill_id(request.skill_name.as_deref());
         let prompt = self.apply_skill_prompt_injections(
             prepend_session_instructions(
                 self.resolve_user_rules_prompt(execution_settings)
                     .as_deref(),
                 self.resolve_safeguard_prompt(execution_settings).as_deref(),
-                None,
                 &request.prompt,
             ),
-            request.skill_name.as_deref(),
+            active_skill_name.as_deref(),
         );
 
         let tools = if request.use_tools {
-            let tool_defs = self.build_tool_definitions(
-                None,
-                request.skill_name.as_deref(),
+            let tool_defs = self.build_session_turn_tool_definitions(
+                active_skill_name.as_deref(),
                 request.access_profile,
+                request.goal_turn_mode,
             );
             (!tool_defs.is_empty()).then_some(tool_defs)
         } else {
             None
         };
         let safety_gate = self.build_safety_gate(execution_settings);
+        let todo_ledger = magi_todo_ledger::TodoLedger::new(
+            self.session_store.clone(),
+            request.session_id.clone(),
+        );
         run_session_turn_execution(SessionTurnExecutionRuntime {
             client: client.as_ref(),
             event_bus: self.event_bus.as_ref(),
             session_store: self.session_store.as_ref(),
+            todo_ledger: &todo_ledger,
             settings_store: execution_settings,
             safety_gate: safety_gate.as_ref(),
             tool_registry: self.tool_registry.as_ref(),
             skill_runtime: self.skill_runtime.as_deref(),
             skill_dispatch_runtime: self.skill_dispatch_runtime.as_deref(),
-            skill_name: request.skill_name.clone(),
+            skill_name: active_skill_name,
             snapshot_manager: self.snapshot_manager.as_ref(),
             request,
             prompt,
@@ -1459,6 +1332,7 @@ impl LlmTaskDispatcher {
             }
         };
 
+        let skill_name = self.resolve_registered_skill_id(skill_name.as_deref());
         let (prompt, context_summary) =
             self.assemble_prompt(execution_settings, task, session_id, workspace_id);
         let prompt = self.apply_skill_prompt_injections(prompt, skill_name.as_deref());
@@ -1490,8 +1364,8 @@ impl LlmTaskDispatcher {
             .as_ref()
             .expect("LlmTaskDispatcher 缺少 AgentRoleRegistry，无法解析 task→role");
         let safety_gate = self.build_safety_gate(execution_settings);
-        let todo_ledger = self.todo_ledger_registry.get_or_create(session_id);
-        let long_mission_context_enabled = task_is_long_mission(Some(task));
+        let todo_ledger =
+            magi_todo_ledger::TodoLedger::new(self.session_store.clone(), session_id.clone());
         let project_memory = workspace_root_path.as_ref().and_then(|path| {
             let workspace_root = magi_core::WorkspaceRootPath::new(path.to_string_lossy());
             match self.project_memory_registry.get_or_open(&workspace_root) {
@@ -1502,104 +1376,6 @@ impl LlmTaskDispatcher {
                 }
             }
         });
-        let mission_charter = if long_mission_context_enabled {
-            workspace_root_path.as_ref().and_then(|path| {
-                let workspace_root = magi_core::WorkspaceRootPath::new(path.to_string_lossy());
-                match self.mission_charter_registry.get_or_open(&workspace_root) {
-                    Ok(store) => Some(store),
-                    Err(err) => {
-                        tracing::warn!(error = %err, workspace_root = %path.display(), "MissionCharter: 打开失败，本次 Turn 不注入 mission 宪章");
-                        None
-                    }
-                }
-            })
-        } else {
-            None
-        };
-        let plan = if long_mission_context_enabled {
-            workspace_root_path.as_ref().and_then(|path| {
-                let workspace_root = magi_core::WorkspaceRootPath::new(path.to_string_lossy());
-                match self.plan_registry.get_or_open(&workspace_root) {
-                    Ok(store) => Some(store),
-                    Err(err) => {
-                        tracing::warn!(error = %err, workspace_root = %path.display(), "Plan: 打开失败，本次 Turn 不注入 mission 计划");
-                        None
-                    }
-                }
-            })
-        } else {
-            None
-        };
-        let mission_workspace = if long_mission_context_enabled {
-            workspace_root_path.as_ref().and_then(|path| {
-                let workspace_root = magi_core::WorkspaceRootPath::new(path.to_string_lossy());
-                match self.mission_workspace_registry.get_or_open(&workspace_root) {
-                    Ok(store) => Some(store),
-                    Err(err) => {
-                        tracing::warn!(error = %err, workspace_root = %path.display(), "MissionWorkspace: 打开失败，本次 Turn 不注入工作目录视图");
-                        None
-                    }
-                }
-            })
-        } else {
-            None
-        };
-        let knowledge_graph = if long_mission_context_enabled {
-            workspace_root_path.as_ref().and_then(|path| {
-                let workspace_root = magi_core::WorkspaceRootPath::new(path.to_string_lossy());
-                match self.knowledge_graph_registry.get_or_open(&workspace_root) {
-                    Ok(store) => Some(store),
-                    Err(err) => {
-                        tracing::warn!(error = %err, workspace_root = %path.display(), "KnowledgeGraph: 打开失败，本次 Turn 不注入 mission KG");
-                        None
-                    }
-                }
-            })
-        } else {
-            None
-        };
-        let validation_runner = if long_mission_context_enabled {
-            workspace_root_path.as_ref().and_then(|path| {
-                let workspace_root = magi_core::WorkspaceRootPath::new(path.to_string_lossy());
-                match self.validation_runner_registry.get_or_open(&workspace_root) {
-                    Ok(store) => Some(store),
-                    Err(err) => {
-                        tracing::warn!(error = %err, workspace_root = %path.display(), "ValidationRunner: 打开失败，本次 Turn 不注入验证结果");
-                        None
-                    }
-                }
-            })
-        } else {
-            None
-        };
-        let checkpoint = if long_mission_context_enabled {
-            workspace_root_path.as_ref().and_then(|path| {
-                let workspace_root = magi_core::WorkspaceRootPath::new(path.to_string_lossy());
-                match self.checkpoint_registry.get_or_open(&workspace_root) {
-                    Ok(store) => Some(store),
-                    Err(err) => {
-                        tracing::warn!(error = %err, workspace_root = %path.display(), "Checkpoint: 打开失败，本次 Turn 不注入检查点日志");
-                        None
-                    }
-                }
-            })
-        } else {
-            None
-        };
-        let human_checkpoint = if long_mission_context_enabled {
-            workspace_root_path.as_ref().and_then(|path| {
-                let workspace_root = magi_core::WorkspaceRootPath::new(path.to_string_lossy());
-                match self.human_checkpoint_registry.get_or_open(&workspace_root) {
-                    Ok(store) => Some(store),
-                    Err(err) => {
-                        tracing::warn!(error = %err, workspace_root = %path.display(), "HumanCheckpoint: 打开失败，本次 Turn 不注入审核摘要；长任务继续派发会被 runtime 拦截");
-                        None
-                    }
-                }
-            })
-        } else {
-            None
-        };
         let mission_metrics = if let Some(path) = workspace_root_path.as_ref() {
             let workspace_root = magi_core::WorkspaceRootPath::new(path.to_string_lossy());
             match self.mission_metrics_registry.get_or_open(&workspace_root) {
@@ -1636,15 +1412,8 @@ impl LlmTaskDispatcher {
             agent_role_registry: agent_role_registry.as_ref(),
             spawn_graph: self.spawn_graph.as_ref(),
             safety_gate: safety_gate.as_ref(),
-            todo_ledger: todo_ledger.as_ref(),
+            todo_ledger: &todo_ledger,
             project_memory: project_memory.as_deref(),
-            mission_charter: mission_charter.as_deref(),
-            plan: plan.as_deref(),
-            mission_workspace: mission_workspace.as_deref(),
-            knowledge_graph: knowledge_graph.as_deref(),
-            validation_runner: validation_runner.as_deref(),
-            checkpoint: checkpoint.as_deref(),
-            human_checkpoint: human_checkpoint.as_deref(),
             mission_metrics: mission_metrics.as_ref(),
             task,
             task_id,
@@ -1748,6 +1517,16 @@ impl LlmTaskDispatcher {
 
         Ok(())
     }
+}
+
+fn session_goal_tool_surface(
+    mut definitions: Vec<ChatToolDefinition>,
+    goal_turn_mode: crate::session_turn_execution::SessionGoalTurnMode,
+) -> Vec<ChatToolDefinition> {
+    if !goal_turn_mode.allows_goal_creation() {
+        definitions.retain(|definition| definition.function.name != "create_goal");
+    }
+    definitions
 }
 
 fn recent_turn_source_label(source: RecentTurnSource) -> &'static str {
@@ -2021,7 +1800,7 @@ mod tests {
 
     fn task_with_role(role: &str, task_tier: TaskTier) -> Task {
         let now = UtcMillis(1_000);
-        let background_allowed = task_tier == TaskTier::LongMission;
+        let background_allowed = false;
         Task {
             task_id: TaskId::new(format!("task-{role}")),
             mission_id: MissionId::new("mission-tool-scope"),
@@ -2104,6 +1883,16 @@ mod tests {
     }
 
     #[test]
+    fn subagent_task_has_own_streaming_entry_without_writebacks() {
+        let worker_task = task_with_role("executor", TaskTier::ExecutionChain);
+
+        assert_eq!(
+            task_streaming_entry_id(&worker_task),
+            format!("timeline-streaming-{}", worker_task.task_id)
+        );
+    }
+
+    #[test]
     fn assemble_prompt_injects_runtime_turns_and_file_summaries_as_references() {
         let session_id = SessionId::new("session-context-prompt");
         let workspace_id = WorkspaceId::new("workspace-context-prompt");
@@ -2127,6 +1916,8 @@ mod tests {
             }],
             notifications: vec![],
             canonical_turns: vec![],
+            goals: vec![],
+            todo_lists: vec![],
             thread_registry: vec![],
             execution_sidecar_store: magi_session_store::SessionExecutionSidecarStoreState {
                 runtime_sidecars: vec![],
@@ -2243,7 +2034,6 @@ mod tests {
         let registry = magi_agent_role::AgentRoleRegistry::load_default();
         let worker_task = task_with_role("executor", TaskTier::ExecutionChain);
         let coordinator_task = task_with_role("coordinator", TaskTier::ExecutionChain);
-        let long_mission_task = task_with_role("coordinator", TaskTier::LongMission);
 
         assert!(!task_can_see_builtin_tool(
             Some(&worker_task),
@@ -2254,11 +2044,6 @@ mod tests {
             Some(&worker_task),
             Some(&registry),
             BuiltinToolName::AgentWait
-        ));
-        assert!(!task_can_see_builtin_tool(
-            Some(&worker_task),
-            Some(&registry),
-            BuiltinToolName::PlanWrite
         ));
         assert!(task_can_see_builtin_tool(
             Some(&coordinator_task),
@@ -2275,20 +2060,15 @@ mod tests {
             Some(&registry),
             BuiltinToolName::MemoryWrite
         ));
-        assert!(!task_can_see_builtin_tool(
+        assert!(task_can_see_builtin_tool(
             Some(&coordinator_task),
             Some(&registry),
-            BuiltinToolName::PlanWrite
+            BuiltinToolName::CreateGoal
         ));
-        assert!(task_can_see_builtin_tool(
-            Some(&long_mission_task),
+        assert!(!task_can_see_builtin_tool(
+            Some(&worker_task),
             Some(&registry),
-            BuiltinToolName::PlanWrite
-        ));
-        assert!(task_can_see_builtin_tool(
-            Some(&long_mission_task),
-            Some(&registry),
-            BuiltinToolName::HumanCheckpointRequest
+            BuiltinToolName::CreateGoal
         ));
         assert!(!task_can_see_builtin_tool(
             None,
@@ -2299,6 +2079,15 @@ mod tests {
             None,
             Some(&registry),
             BuiltinToolName::AgentWait
+        ));
+        assert!(
+            task_can_see_builtin_tool(None, Some(&registry), BuiltinToolName::CreateGoal),
+            "主线 session turn 没有 Task 包装时也必须能调用 Goal 工具"
+        );
+        assert!(task_can_see_builtin_tool(
+            None,
+            Some(&registry),
+            BuiltinToolName::UpdateGoal
         ));
     }
 
@@ -2335,65 +2124,9 @@ mod tests {
     }
 
     #[test]
-    fn long_mission_coordinator_builds_full_orchestration_tool_surface() {
-        let dispatcher = dispatcher_with_default_tool_surface();
-        let long_mission_task = task_with_role("coordinator", TaskTier::LongMission);
-        let execution_task = task_with_role("coordinator", TaskTier::ExecutionChain);
-        let worker_task = task_with_role("executor", TaskTier::ExecutionChain);
-
-        let long_mission_names = dispatcher
-            .build_tool_definitions(
-                Some(&long_mission_task),
-                None,
-                magi_core::AccessProfile::Restricted,
-            )
-            .into_iter()
-            .map(|definition| definition.function.name)
-            .collect::<Vec<_>>();
-        for expected in [
-            "mission_charter_write",
-            "plan_write",
-            "agent_spawn",
-            "agent_wait",
-            "validation_record",
-            "checkpoint_create",
-        ] {
-            assert!(
-                long_mission_names.iter().any(|name| name == expected),
-                "LongMission coordinator must expose {expected}; got {long_mission_names:?}"
-            );
-        }
-
-        let execution_names = dispatcher
-            .build_tool_definitions(
-                Some(&execution_task),
-                None,
-                magi_core::AccessProfile::Restricted,
-            )
-            .into_iter()
-            .map(|definition| definition.function.name)
-            .collect::<Vec<_>>();
-        assert!(execution_names.iter().any(|name| name == "agent_spawn"));
-        assert!(execution_names.iter().any(|name| name == "agent_wait"));
-        assert!(!execution_names.iter().any(|name| name == "plan_write"));
-
-        let worker_names = dispatcher
-            .build_tool_definitions(
-                Some(&worker_task),
-                None,
-                magi_core::AccessProfile::Restricted,
-            )
-            .into_iter()
-            .map(|definition| definition.function.name)
-            .collect::<Vec<_>>();
-        assert!(!worker_names.iter().any(|name| name == "agent_spawn"));
-        assert!(!worker_names.iter().any(|name| name == "plan_write"));
-    }
-
-    #[test]
     fn read_only_tool_surface_hides_write_tools_before_model_call() {
         let dispatcher = dispatcher_with_default_tool_surface();
-        let mut task = task_with_role("coordinator", TaskTier::LongMission);
+        let mut task = task_with_role("coordinator", TaskTier::ExecutionChain);
         task.policy_snapshot
             .as_mut()
             .expect("policy")
@@ -2415,12 +2148,6 @@ mod tests {
             "file_move",
             "agent_spawn",
             "memory_write",
-            "mission_charter_write",
-            "plan_write",
-            "kg_write",
-            "validation_record",
-            "checkpoint_create",
-            "human_checkpoint_request",
         ] {
             assert!(
                 !names.iter().any(|name| name == hidden),
@@ -2451,9 +2178,61 @@ mod tests {
     }
 
     #[test]
+    fn session_tool_surface_only_exposes_runtime_internal_tools_it_can_execute() {
+        let dispatcher = dispatcher_with_default_tool_surface();
+
+        let names = dispatcher
+            .build_tool_definitions(None, None, magi_core::AccessProfile::Restricted)
+            .into_iter()
+            .map(|definition| definition.function.name)
+            .collect::<Vec<_>>();
+
+        for expected in ["get_goal", "create_goal", "update_goal", "todo_write"] {
+            assert!(
+                names.iter().any(|name| name == expected),
+                "session 主线必须暴露可执行的内部工具 {expected}: {names:?}"
+            );
+        }
+        for hidden in ["agent_spawn", "agent_wait", "memory_write"] {
+            assert!(
+                !names.iter().any(|name| name == hidden),
+                "session 主线不能暴露当前执行入口不可达的内部工具 {hidden}: {names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn goal_continuation_tool_surface_cannot_create_a_second_goal() {
+        let dispatcher = dispatcher_with_default_tool_surface();
+        let definitions =
+            dispatcher.build_tool_definitions(None, None, magi_core::AccessProfile::Restricted);
+
+        let continuation_names = session_goal_tool_surface(
+            definitions.clone(),
+            crate::session_turn_execution::SessionGoalTurnMode::Continuation,
+        )
+        .into_iter()
+        .map(|definition| definition.function.name)
+        .collect::<Vec<_>>();
+        assert!(!continuation_names.iter().any(|name| name == "create_goal"));
+        for expected in ["get_goal", "update_goal", "todo_write"] {
+            assert!(continuation_names.iter().any(|name| name == expected));
+        }
+
+        let start_names = session_goal_tool_surface(
+            definitions,
+            crate::session_turn_execution::SessionGoalTurnMode::Start,
+        )
+        .into_iter()
+        .map(|definition| definition.function.name)
+        .collect::<Vec<_>>();
+        assert!(start_names.iter().any(|name| name == "create_goal"));
+    }
+
+    #[test]
     fn read_only_command_mode_hides_write_tools_even_with_full_access_profile() {
         let dispatcher = dispatcher_with_default_tool_surface();
-        let mut task = task_with_role("coordinator", TaskTier::LongMission);
+        let mut task = task_with_role("coordinator", TaskTier::ExecutionChain);
         let policy = task.policy_snapshot.as_mut().expect("policy");
         policy.access_profile = magi_core::AccessProfile::FullAccess;
         policy.command_mode = "read_only".to_string();
@@ -2481,6 +2260,7 @@ mod tests {
                     category: "quality".to_string(),
                     tags: vec!["review".to_string()],
                 },
+                restrict_standard_tools: true,
                 allowed_tools: vec![],
                 custom_tool_bindings: vec![magi_skill_runtime::CustomToolBinding {
                     binding_id: "review-mcp".to_string(),
@@ -2512,7 +2292,7 @@ mod tests {
                 .any(|name| name == "skill__code-review__review-mcp"),
             "active skill custom binding should surface as callable tool"
         );
-        assert!(names.iter().any(|name| name == SKILL_APPLY_TOOL_NAME));
+        assert!(!names.iter().any(|name| name == SKILL_APPLY_TOOL_NAME));
         assert!(
             !names.iter().any(|name| name == "file_read"),
             "active skill 没有声明 allowed_tools 时不应暴露普通内置工具"
@@ -2520,6 +2300,198 @@ mod tests {
         assert!(
             !names.iter().any(|name| name == "shell_exec"),
             "active skill 没有声明 allowed_tools 时不应暴露 shell_exec"
+        );
+    }
+
+    #[test]
+    fn goal_mode_keeps_goal_tools_available_with_restrictive_active_skill() {
+        let dispatcher = dispatcher_with_default_tool_surface().with_skill_runtime(Arc::new({
+            let registry = magi_skill_runtime::SkillRegistry::new();
+            registry.register(magi_skill_runtime::SkillDefinition {
+                skill_id: "goal-method".to_string(),
+                title: "目标执行方法".to_string(),
+                instruction: "按该方法推进目标。".to_string(),
+                metadata: magi_skill_runtime::SkillMetadata {
+                    category: "workflow".to_string(),
+                    tags: vec!["goal".to_string()],
+                },
+                restrict_standard_tools: true,
+                allowed_tools: vec![],
+                custom_tool_bindings: vec![],
+                prompt_priority: 50,
+            });
+            magi_skill_runtime::SkillRuntime::new(registry)
+        }));
+
+        let names = dispatcher
+            .build_session_turn_tool_definitions(
+                Some("goal-method"),
+                magi_core::AccessProfile::Restricted,
+                crate::session_turn_execution::SessionGoalTurnMode::Start,
+            )
+            .into_iter()
+            .map(|definition| definition.function.name)
+            .collect::<Vec<_>>();
+
+        for expected in ["get_goal", "create_goal", "update_goal", "todo_write"] {
+            assert!(
+                names.iter().any(|name| name == expected),
+                "Goal + Skill 联合引用必须保留目标生命周期工具 {expected}: {names:?}"
+            );
+        }
+        assert!(!names.iter().any(|name| name == SKILL_APPLY_TOOL_NAME));
+        assert!(!names.iter().any(|name| name == "file_read"));
+    }
+
+    #[test]
+    fn active_skill_is_injected_directly_without_reexposing_skill_apply() {
+        let dispatcher = dispatcher_with_default_tool_surface().with_skill_runtime(Arc::new({
+            let registry = magi_skill_runtime::SkillRegistry::new();
+            registry.register(magi_skill_runtime::SkillDefinition {
+                skill_id: "direct-skill".to_string(),
+                title: "直接 Skill".to_string(),
+                instruction: "直接注入。".to_string(),
+                metadata: magi_skill_runtime::SkillMetadata {
+                    category: "workflow".to_string(),
+                    tags: vec![],
+                },
+                restrict_standard_tools: false,
+                allowed_tools: vec![],
+                custom_tool_bindings: vec![],
+                prompt_priority: 50,
+            });
+            magi_skill_runtime::SkillRuntime::new(registry)
+        }));
+
+        let names = dispatcher
+            .build_tool_definitions(
+                None,
+                Some("direct-skill"),
+                magi_core::AccessProfile::Restricted,
+            )
+            .into_iter()
+            .map(|definition| definition.function.name)
+            .collect::<Vec<_>>();
+
+        assert!(!names.iter().any(|name| name == SKILL_APPLY_TOOL_NAME));
+        assert!(
+            names.iter().any(|name| name == "file_read"),
+            "未声明 allowed_tools 的 prompt-only Skill 应继承标准只读工具"
+        );
+    }
+
+    #[test]
+    fn live_mcp_tools_are_exposed_on_the_model_tool_surface() {
+        let mut dispatcher = dispatcher_with_default_tool_surface();
+        let registry = dispatcher
+            .tool_registry
+            .take()
+            .expect("test dispatcher should own a tool registry")
+            .with_external_tool_catalog_provider(Arc::new(|| {
+                magi_tool_runtime::ExternalToolCatalogSnapshot {
+                    mcp_tools: vec![magi_tool_runtime::ExternalMcpToolCatalogEntry {
+                        server_id: "repo-tools".to_string(),
+                        server_name: "Repository Tools".to_string(),
+                        model_tool_name: "mcp__repo-tools__inspect".to_string(),
+                        tool_name: "inspect".to_string(),
+                        description: "Inspect repository".to_string(),
+                        input_schema: serde_json::json!({
+                            "type": "object",
+                            "properties": { "path": { "type": "string" } }
+                        }),
+                    }],
+                    ..magi_tool_runtime::ExternalToolCatalogSnapshot::default()
+                }
+            }));
+        dispatcher.tool_registry = Some(registry);
+
+        let definitions =
+            dispatcher.build_tool_definitions(None, None, magi_core::AccessProfile::Restricted);
+        let mcp = definitions
+            .iter()
+            .find(|definition| definition.function.name == "mcp__repo-tools__inspect")
+            .expect("实时 MCP 工具必须进入模型工具面");
+        assert_eq!(mcp.function.description, "Inspect repository");
+        assert_eq!(mcp.function.parameters["type"], "object");
+    }
+
+    #[test]
+    fn prompt_only_skill_keeps_live_mcp_tools() {
+        let mut dispatcher = dispatcher_with_default_tool_surface();
+        let registry = dispatcher
+            .tool_registry
+            .take()
+            .expect("test dispatcher should own a tool registry")
+            .with_external_tool_catalog_provider(Arc::new(|| {
+                magi_tool_runtime::ExternalToolCatalogSnapshot {
+                    mcp_tools: vec![magi_tool_runtime::ExternalMcpToolCatalogEntry {
+                        server_id: "repo-tools".to_string(),
+                        server_name: "Repository Tools".to_string(),
+                        model_tool_name: "mcp__repo-tools__inspect".to_string(),
+                        tool_name: "inspect".to_string(),
+                        description: "Inspect repository".to_string(),
+                        input_schema: serde_json::json!({ "type": "object" }),
+                    }],
+                    ..magi_tool_runtime::ExternalToolCatalogSnapshot::default()
+                }
+            }));
+        dispatcher.tool_registry = Some(registry);
+        dispatcher = dispatcher.with_skill_runtime(Arc::new({
+            let registry = magi_skill_runtime::SkillRegistry::new();
+            registry.register(magi_skill_runtime::SkillDefinition {
+                skill_id: "prompt-only".to_string(),
+                title: "Prompt Only".to_string(),
+                instruction: "先取证，再回答。".to_string(),
+                metadata: magi_skill_runtime::SkillMetadata {
+                    category: "workflow".to_string(),
+                    tags: vec![],
+                },
+                restrict_standard_tools: false,
+                allowed_tools: vec![],
+                custom_tool_bindings: vec![],
+                prompt_priority: 50,
+            });
+            magi_skill_runtime::SkillRuntime::new(registry)
+        }));
+
+        let names = dispatcher
+            .build_tool_definitions(
+                None,
+                Some("prompt-only"),
+                magi_core::AccessProfile::Restricted,
+            )
+            .into_iter()
+            .map(|definition| definition.function.name)
+            .collect::<Vec<_>>();
+
+        assert!(names.iter().any(|name| name == "file_read"));
+        assert!(names.iter().any(|name| name == "mcp__repo-tools__inspect"));
+        assert!(!names.iter().any(|name| name == SKILL_APPLY_TOOL_NAME));
+    }
+
+    #[test]
+    fn selected_skill_short_name_resolves_before_prompt_and_tool_surface_build() {
+        let dispatcher = dispatcher_with_default_tool_surface().with_skill_runtime(Arc::new({
+            let registry = magi_skill_runtime::SkillRegistry::new();
+            registry.register(magi_skill_runtime::SkillDefinition {
+                skill_id: "owner/repo/skills/code-review".to_string(),
+                title: "代码审查".to_string(),
+                instruction: "检查稳定性。".to_string(),
+                metadata: magi_skill_runtime::SkillMetadata {
+                    category: "quality".to_string(),
+                    tags: vec![],
+                },
+                restrict_standard_tools: true,
+                allowed_tools: vec!["file_read".to_string()],
+                custom_tool_bindings: vec![],
+                prompt_priority: 50,
+            });
+            magi_skill_runtime::SkillRuntime::new(registry)
+        }));
+
+        assert_eq!(
+            dispatcher.resolve_registered_skill_id(Some("code-review")),
+            Some("owner/repo/skills/code-review".to_string())
         );
     }
 
@@ -2535,6 +2507,7 @@ mod tests {
                     category: "quality".to_string(),
                     tags: vec!["mixed".to_string()],
                 },
+                restrict_standard_tools: true,
                 allowed_tools: vec![],
                 custom_tool_bindings: vec![
                     magi_skill_runtime::CustomToolBinding {
@@ -2600,6 +2573,7 @@ mod tests {
                     category: "quality".to_string(),
                     tags: vec!["read".to_string()],
                 },
+                restrict_standard_tools: true,
                 allowed_tools: vec!["file_read".to_string()],
                 custom_tool_bindings: vec![],
                 prompt_priority: 50,
@@ -2619,7 +2593,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(names.iter().any(|name| name == "file_read"));
-        assert!(names.iter().any(|name| name == SKILL_APPLY_TOOL_NAME));
+        assert!(!names.iter().any(|name| name == SKILL_APPLY_TOOL_NAME));
         assert!(!names.iter().any(|name| name == "search_text"));
         assert!(!names.iter().any(|name| name == "shell_exec"));
         assert!(!names.iter().any(|name| name == "agent_spawn"));

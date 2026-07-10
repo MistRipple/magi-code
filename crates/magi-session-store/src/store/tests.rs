@@ -2,12 +2,13 @@ use super::*;
 use crate::models::{
     ActiveExecutionBranch, ActiveExecutionChain, ActiveExecutionDispatchContext,
     ActiveExecutionTurn, ActiveExecutionTurnItem, CanonicalTurnStatus, ExecutionThread,
-    ExecutionThreadStatus, SessionExecutionSidecarStatus, SessionSidecarFlushReason,
+    ExecutionThreadStatus, GoalStatus, NotificationRecord, NotificationScope, SessionDurableState,
+    SessionExecutionSidecarStatus, SessionExecutionSidecarStoreState, SessionSidecarFlushReason,
     SessionStoreState,
 };
 use magi_core::{
     ExecutionOwnership, MissionId, RecoveryResumeInput, SessionId, TaskExecutionTarget, TaskId,
-    ThreadId, UtcMillis, WorkerId, WorkspaceId,
+    ThreadId, TodoItem, TodoStatus, UtcMillis, WorkerId, WorkspaceId,
 };
 use serde_json::json;
 use std::{thread, time::Duration};
@@ -139,6 +140,123 @@ fn append_timeline_entry_updates_session_timestamp_and_user_message_count() {
         session.updated_at.0 > created.updated_at.0,
         "追加时间线后应该刷新会话更新时间"
     );
+}
+
+#[test]
+fn goal_store_rejects_second_unfinished_goal_for_same_session() {
+    let store = SessionStore::new();
+    let session_id = SessionId::new("session-goal-singleton");
+    store
+        .create_session(session_id.clone(), "goal singleton")
+        .expect("session should be creatable");
+
+    let first = store
+        .create_goal(
+            session_id.clone(),
+            ThreadId::new("thread-main"),
+            "完成项目级重构",
+            Some(1_000),
+        )
+        .expect("first goal should be creatable");
+    assert_eq!(first.status, GoalStatus::Active);
+
+    let err = store
+        .create_goal(
+            session_id.clone(),
+            ThreadId::new("thread-main"),
+            "另一个未结束目标",
+            None,
+        )
+        .expect_err("second unfinished goal must be rejected");
+    assert!(matches!(err, DomainError::InvalidState { .. }));
+
+    let completed = store
+        .update_goal_status(&session_id, &first.goal_id, GoalStatus::Complete)
+        .expect("goal can be completed");
+    assert_eq!(completed.status, GoalStatus::Complete);
+    store
+        .create_goal(
+            session_id,
+            ThreadId::new("thread-main"),
+            "完成下一阶段",
+            None,
+        )
+        .expect("new goal after terminal status should be allowed");
+}
+
+#[test]
+fn todo_list_is_session_scoped_and_survives_durable_restore() {
+    let store = SessionStore::new();
+    let session_a = SessionId::new("session-todo-a");
+    let session_b = SessionId::new("session-todo-b");
+    store
+        .create_session(session_a.clone(), "todo a")
+        .expect("session a should create");
+    store
+        .create_session(session_b.clone(), "todo b")
+        .expect("session b should create");
+    store
+        .replace_todo_items(
+            &session_a,
+            vec![TodoItem::new(
+                "验证持久化",
+                "正在验证持久化",
+                TodoStatus::InProgress,
+            )],
+        )
+        .expect("todo list should write");
+
+    let restored = SessionStore::from_persisted_parts(
+        store.durable_state(),
+        SessionExecutionSidecarStoreState::default(),
+    );
+    assert_eq!(restored.todo_items(&session_a).len(), 1);
+    assert_eq!(restored.todo_items(&session_a)[0].content, "验证持久化");
+    assert!(restored.todo_items(&session_b).is_empty());
+}
+
+#[test]
+fn goal_accounting_budget_limits_active_goal_without_cross_session_leakage() {
+    let store = SessionStore::new();
+    let session_a = SessionId::new("session-goal-a");
+    let session_b = SessionId::new("session-goal-b");
+    store
+        .create_session(session_a.clone(), "goal a")
+        .expect("session a should be creatable");
+    store
+        .create_session(session_b.clone(), "goal b")
+        .expect("session b should be creatable");
+
+    let goal_a = store
+        .create_goal(
+            session_a.clone(),
+            ThreadId::new("thread-a"),
+            "分析并修复 A",
+            Some(10),
+        )
+        .expect("goal a should be creatable");
+    let goal_b = store
+        .create_goal(
+            session_b.clone(),
+            ThreadId::new("thread-b"),
+            "分析并修复 B",
+            Some(100),
+        )
+        .expect("goal b should be creatable");
+
+    let limited = store
+        .account_goal_progress(&session_a, &goal_a.goal_id, 11, 3)
+        .expect("accounting should update goal a");
+    assert_eq!(limited.status, GoalStatus::BudgetLimited);
+    assert_eq!(limited.tokens_used, 11);
+    assert_eq!(limited.time_used_seconds, 3);
+
+    let untouched_b = store
+        .current_goal(&session_b)
+        .expect("session b goal should still exist");
+    assert_eq!(untouched_b.goal_id, goal_b.goal_id);
+    assert_eq!(untouched_b.status, GoalStatus::Active);
+    assert_eq!(untouched_b.tokens_used, 0);
 }
 
 #[test]
@@ -1276,6 +1394,108 @@ fn persisted_parts_round_trip_preserves_sidecars() {
 }
 
 #[test]
+fn incident_notifications_are_aggregated_by_scope_and_audits_are_removed() {
+    fn incident(
+        id: &str,
+        scope: NotificationScope,
+        workspace_id: Option<&str>,
+        session_id: Option<&str>,
+    ) -> NotificationRecord {
+        NotificationRecord {
+            notification_id: id.to_string(),
+            session_id: session_id.map(SessionId::new),
+            workspace_id: workspace_id.map(str::to_string),
+            scope,
+            kind: "incident".to_string(),
+            level: Some("error".to_string()),
+            title: None,
+            message: id.to_string(),
+            source: Some("test".to_string()),
+            created_at: UtcMillis(10),
+            handled: false,
+            action_required: true,
+            count_unread: true,
+            fingerprint: format!("fingerprint-{id}"),
+            occurrence_count: 1,
+            resolved: false,
+        }
+    }
+
+    let session_id = SessionId::new("session-notification-scope");
+    let durable = SessionDurableState {
+        notifications: vec![
+            incident("app-incident", NotificationScope::App, None, None),
+            incident(
+                "workspace-incident",
+                NotificationScope::Workspace,
+                Some("workspace-a"),
+                None,
+            ),
+            incident(
+                "session-incident",
+                NotificationScope::Session,
+                Some("workspace-a"),
+                Some(session_id.as_str()),
+            ),
+            NotificationRecord {
+                kind: "audit".to_string(),
+                ..incident(
+                    "legacy-audit",
+                    NotificationScope::Session,
+                    Some("workspace-a"),
+                    Some(session_id.as_str()),
+                )
+            },
+        ],
+        ..SessionDurableState::default()
+    };
+    let store =
+        SessionStore::from_persisted_parts(durable, SessionExecutionSidecarStoreState::default());
+
+    let records = store.notifications_for_context("workspace-a", Some(&session_id));
+    assert_eq!(records.len(), 3);
+    assert!(
+        records
+            .iter()
+            .any(|item| item.notification_id == "app-incident")
+    );
+    assert!(
+        records
+            .iter()
+            .any(|item| item.notification_id == "workspace-incident")
+    );
+    assert!(
+        records
+            .iter()
+            .any(|item| item.notification_id == "session-incident")
+    );
+    assert!(
+        store
+            .notifications()
+            .iter()
+            .all(|item| item.kind == "incident")
+    );
+    assert!(
+        store
+            .notifications_for_context("workspace-b", Some(&session_id))
+            .iter()
+            .all(|item| item.notification_id != "session-incident"),
+        "session incident must not cross workspace boundaries"
+    );
+
+    store
+        .resolve_notification_for_context("workspace-a", Some(&session_id), "session-incident")
+        .expect("session incident should resolve in its context");
+    let resolved = store
+        .notifications_for_context("workspace-a", Some(&session_id))
+        .into_iter()
+        .find(|item| item.notification_id == "session-incident")
+        .expect("resolved incident should remain visible");
+    assert!(resolved.resolved);
+    assert!(resolved.handled);
+}
+
+#[test]
 fn execution_sidecar_flush_metadata_tracks_recovery_apply_and_resume() {
     let store = SessionStore::new();
     let session_id = SessionId::new("session-metadata");
@@ -2178,6 +2398,68 @@ fn delete_session_cleans_up_sidecar_and_marks_dirty() {
         metadata_post.last_dirty_reason,
         Some(SessionSidecarFlushReason::DeleteSession)
     );
+}
+
+#[test]
+fn delete_session_removes_canonical_turns_and_execution_threads() {
+    let store = SessionStore::new();
+    let session_id = SessionId::new("session-delete-runtime-history");
+    let mission_id = MissionId::new("mission-delete-runtime-history");
+    store
+        .create_session(session_id.clone(), "Delete Runtime History")
+        .expect("session should be creatable");
+    store.ensure_session_mission(&session_id, UtcMillis(10), || mission_id);
+    store
+        .upsert_current_turn(
+            session_id.clone(),
+            test_turn("turn-delete-runtime-history", "completed", 11),
+        )
+        .expect("canonical turn should persist");
+
+    assert_eq!(store.thread_registry_snapshot(&session_id).len(), 1);
+    assert_eq!(store.canonical_turns_for_session(&session_id).len(), 1);
+
+    store
+        .delete_session(&session_id)
+        .expect("delete should succeed");
+
+    assert!(store.thread_registry_snapshot(&session_id).is_empty());
+    assert!(store.canonical_turns_for_session(&session_id).is_empty());
+    assert!(
+        store
+            .durable_state()
+            .canonical_turns
+            .iter()
+            .all(|turn| turn.session_id != session_id)
+    );
+}
+
+#[test]
+fn execution_task_ids_are_recoverable_from_durable_canonical_turns() {
+    let store = SessionStore::new();
+    let session_id = SessionId::new("session-durable-task-ids");
+    let task_id = TaskId::new("task-durable-task-ids");
+    store
+        .create_session(session_id.clone(), "Durable Task Ids")
+        .expect("session should be creatable");
+    let mut turn = test_turn("turn-durable-task-ids", "completed", 20);
+    let mut item = test_turn_item("item-durable-task-ids", "task item");
+    item.task_id = Some(task_id.clone());
+    turn.items.push(item);
+    store
+        .upsert_current_turn(session_id.clone(), turn)
+        .expect("canonical turn should persist");
+
+    let restored = SessionStore::from_persisted_parts(
+        store.durable_state(),
+        SessionExecutionSidecarStoreState::default(),
+    );
+
+    assert_eq!(
+        restored.execution_task_ids_for_session(&session_id),
+        vec![task_id]
+    );
+    assert!(restored.thread_registry_snapshot(&session_id).is_empty());
 }
 
 #[test]

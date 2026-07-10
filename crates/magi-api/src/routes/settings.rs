@@ -1033,7 +1033,11 @@ async fn test_orchestrator_connection(
     normalized
         .require_api_key()
         .map_err(ApiError::InvalidInput)?;
-    execute_model_catalog_probe(&normalized).await?;
+    if normalized.require_model().is_ok() {
+        execute_connection_probe(&normalized).await?;
+    } else {
+        execute_model_catalog_probe(&normalized).await?;
+    }
     Ok(Json(json!({
         "success": true,
         "message": "连接测试成功"
@@ -1634,6 +1638,14 @@ mod tests {
         )
     }
 
+    async fn successful_models_stub() -> Json<Value> {
+        Json(json!({
+            "data": [
+                { "id": "gpt-test" }
+            ]
+        }))
+    }
+
     #[tokio::test]
     async fn connection_probe_supports_anthropic_messages_api() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1694,6 +1706,75 @@ mod tests {
                 assert!(!message.contains("/Users/xie"));
             }
             other => panic!("unexpected probe result: {:?}", other),
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn orchestrator_test_without_model_uses_catalog_probe() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("stub listener should bind");
+        let base_url = format!(
+            "http://{}",
+            listener.local_addr().expect("stub addr should exist")
+        );
+        let app = Router::new().route("/v1/models", get(successful_models_stub));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("stub server should run");
+        });
+
+        let result = test_orchestrator_connection(
+            State(test_state()),
+            Json(json!({
+                "config": {
+                    "baseUrl": base_url,
+                    "apiKey": "test-key",
+                    "urlMode": "standard"
+                }
+            })),
+        )
+        .await;
+
+        let _ =
+            result.expect("orchestrator connection-only probe should pass through model catalog");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn orchestrator_test_with_model_uses_real_invocation_probe() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("stub listener should bind");
+        let base_url = format!(
+            "http://{}",
+            listener.local_addr().expect("stub addr should exist")
+        );
+        let app = Router::new().route("/v1/chat/completions", post(rejected_probe_stub));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("stub server should run");
+        });
+
+        let result = test_orchestrator_connection(
+            State(test_state()),
+            Json(json!({
+                "config": {
+                    "baseUrl": base_url,
+                    "apiKey": "test-key",
+                    "model": "gpt-test",
+                    "urlMode": "standard"
+                }
+            })),
+        )
+        .await;
+
+        match result {
+            Err(ApiError::InvalidInput(message)) => assert_eq!(message, "模型鉴权失败"),
+            other => panic!("unexpected orchestrator probe result: {:?}", other),
         }
         server.abort();
     }
@@ -1807,7 +1888,7 @@ mod tests {
         let builtin_tools = bootstrap["builtinTools"]
             .as_array()
             .expect("builtin tools should be an array");
-        assert_eq!(builtin_tools.len(), 30);
+        assert_eq!(builtin_tools.len(), 27);
         let builtin_names: Vec<_> = builtin_tools
             .iter()
             .map(|tool| tool["name"].as_str().expect("tool name"))
@@ -1835,16 +1916,13 @@ mod tests {
                 "knowledge_query",
                 "code_symbols",
                 "tool_catalog",
+                "get_goal",
+                "create_goal",
+                "update_goal",
                 "agent_spawn",
                 "agent_wait",
                 "todo_write",
                 "memory_write",
-                "mission_charter_write",
-                "plan_write",
-                "kg_write",
-                "validation_record",
-                "checkpoint_create",
-                "human_checkpoint_request",
             ],
             "bootstrap must expose one canonical public builtin surface in a stable order"
         );
@@ -2296,9 +2374,9 @@ mod tests {
             bootstrap["orchestratorConfig"]["baseUrl"],
             json!("https://api.current.example/v1")
         );
-        assert_eq!(
-            bootstrap["orchestratorConfig"]["model"],
-            json!("current-main")
+        assert!(
+            bootstrap["orchestratorConfig"].get("model").is_none(),
+            "全局 orchestratorConfig 只暴露连接配置，不暴露会话主模型"
         );
         assert!(
             bootstrap["workerConfigs"]
@@ -2581,6 +2659,7 @@ mod tests {
                 tool_count: Some(7),
                 error: None,
             }],
+            mcp_tools: Vec::new(),
         }));
         state.settings_store.set_section(
             "mcpServers",

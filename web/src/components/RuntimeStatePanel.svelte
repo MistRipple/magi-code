@@ -10,6 +10,13 @@
   import Icon from './Icon.svelte';
   import type { IconName } from '../lib/icons';
   import { i18n } from '../stores/i18n.svelte';
+  import {
+    resolveRuntimeTaskProgress,
+    shouldShowRuntimeBudget,
+    shouldShowRuntimeCache,
+    shouldShowRuntimePanel,
+    shouldShowRuntimePhase,
+  } from '../lib/runtime-state-panel';
 
   interface Props {
     runtimeState: OrchestratorRuntimeState | null;
@@ -41,6 +48,7 @@
     processingStartedAt = null,
   }: Props = $props();
   let isPanelExpanded = $state(false);
+  let technicalDetailsExpanded = $state(false);
   let panelRef: HTMLElement | undefined = $state();
   type DiagnosticsSectionKey = 'timeline' | 'stateDiff' | 'decisionTrace' | null;
   let expandedSection = $state<DiagnosticsSectionKey>(null);
@@ -59,11 +67,13 @@
         return;
       }
       isPanelExpanded = false;
+      technicalDetailsExpanded = false;
       expandedSection = null;
     }
     function handleKeydown(event: KeyboardEvent): void {
       if (event.key === 'Escape') {
         isPanelExpanded = false;
+        technicalDetailsExpanded = false;
         expandedSection = null;
       }
     }
@@ -172,10 +182,7 @@
     if (!runtimeState) {
       return [] as Array<{ label: string; value: string }>;
     }
-    const entries: Array<{ label: string; value: string }> = [
-      { label: i18n.t('runtimeState.summary.phase'), value: formatRuntimePhase(runtimeState.phase) },
-      { label: i18n.t('runtimeState.summary.lastEventAt'), value: formatDateTime(runtimeState.lastEventAt) },
-    ];
+    const entries: Array<{ label: string; value: string }> = [];
     if (executionGroupSummary?.title) {
       entries.unshift({
         label: i18n.t('runtimeState.summary.executionGroup'),
@@ -380,17 +387,28 @@
     }
   });
 
-  // 任务进度计算
-  const taskProgress = $derived.by(() => {
-    const snap = runtimeState?.runtimeSnapshot;
-    if (!snap) return null;
-    const total = snap.requiredTotal ?? 0;
-    const failed = snap.failedRequired ?? 0;
-    const running = snap.runningOrPendingRequired ?? 0;
-    const completed = Math.max(0, total - failed - running);
-    const percent = total > 0 ? Math.round((completed / total) * 100) : 0;
-    return { completed, failed, running, total, percent };
+  const taskProgress = $derived(resolveRuntimeTaskProgress(runtimeState?.runtimeSnapshot));
+  const visibleMetrics = $derived.by(() => {
+    const snapshot = runtimeState?.runtimeSnapshot;
+    if (!snapshot) return false;
+    return Boolean(
+      (taskProgress && taskProgress.total > 0)
+      || ((snapshot.reviewState?.total ?? 0) > 0)
+      || ((snapshot.blockerState?.open ?? 0) > 0)
+      || ((snapshot.blockerState?.externalWaitOpen ?? 0) > 0)
+      || shouldShowRuntimeBudget(snapshot.budgetState?.warningLevel)
+      || shouldShowRuntimeCache(snapshot.cacheState?.health),
+    );
   });
+  const panelVisible = $derived(shouldShowRuntimePanel({
+    status: effectiveStatus,
+    isProcessing: canonicalProcessingActive,
+    assignmentCount: assignmentSummaries.length,
+  }));
+  const phaseVisible = $derived(shouldShowRuntimePhase(effectiveStatus, effectivePhase));
+  const technicalDetailsAvailable = $derived(
+    recentTimeline.length > 0 || recentStateDiffs.length > 0 || recentTrace.length > 0,
+  );
 
   function formatTimestamp(timestamp: number): string {
     if (!Number.isFinite(timestamp)) return '--';
@@ -1081,6 +1099,7 @@
   function togglePanel(): void {
     isPanelExpanded = !isPanelExpanded;
     if (!isPanelExpanded) {
+      technicalDetailsExpanded = false;
       expandedSection = null;
     }
   }
@@ -1090,7 +1109,7 @@
   }
 </script>
 
-{#if runtimeState || canonicalProcessingActive}
+{#if panelVisible}
   <section bind:this={panelRef} class="runtime-diagnostics runtime-diagnostics--{statusModifier}">
     <button
       type="button"
@@ -1103,7 +1122,15 @@
       <Icon name={statusIcon} size={13} class="summary__icon" />
       <span class="summary__title">{i18n.t('runtimeState.title')}</span>
       <span class="summary__badge summary__badge--{statusModifier}">{statusLabel}</span>
-      <span class="summary__phase">{formatRuntimePhase(effectivePhase)}</span>
+      {#if phaseVisible}
+        <span class="summary__phase">{formatRuntimePhase(effectivePhase)}</span>
+      {/if}
+      {#if taskProgress && taskProgress.total > 0}
+        <span class="summary__meta">{taskProgress.completed}/{taskProgress.total}</span>
+      {/if}
+      {#if assignmentSummaries.length > 0}
+        <span class="summary__meta">{i18n.t('runtimeState.summary.agentCount', { count: assignmentSummaries.length })}</span>
+      {/if}
       {#if summaryTimeLabel}
         <span class="summary__time">{summaryTimeLabel}</span>
       {/if}
@@ -1124,7 +1151,7 @@
         </div>
       {/if}
 
-      {#if runtimeState?.runtimeSnapshot}
+      {#if runtimeState?.runtimeSnapshot && visibleMetrics}
         {@const snap = runtimeState.runtimeSnapshot}
         <div class="metrics-grid">
           {#if taskProgress && taskProgress.total > 0}
@@ -1143,7 +1170,7 @@
             </div>
           {/if}
 
-          {#if snap.reviewState}
+          {#if snap.reviewState && (snap.reviewState.total ?? 0) > 0}
             <div class="metric-card">
               <div class="metric-card__header">
                 <Icon name="check-circle" size={12} class="metric-card__icon" />
@@ -1163,7 +1190,7 @@
             </div>
           {/if}
 
-          {#if snap.blockerState}
+          {#if snap.blockerState && ((snap.blockerState.open ?? 0) > 0 || (snap.blockerState.externalWaitOpen ?? 0) > 0)}
             <div class="metric-card">
               <div class="metric-card__header">
                 <Icon name={(snap.blockerState.open ?? 0) > 0 ? 'alert-triangle' : 'check-circle'} size={12} class="metric-card__icon" />
@@ -1183,7 +1210,7 @@
             </div>
           {/if}
 
-          {#if snap.budgetState}
+          {#if snap.budgetState && shouldShowRuntimeBudget(snap.budgetState.warningLevel)}
             <div class="metric-card">
               <div class="metric-card__header">
                 <Icon name="clock" size={12} class="metric-card__icon" />
@@ -1230,7 +1257,7 @@
             </div>
           {/if}
 
-          {#if snap.cacheState}
+          {#if snap.cacheState && shouldShowRuntimeCache(snap.cacheState.health)}
             <div class="metric-card">
               <div class="metric-card__header">
                 <Icon name="database" size={12} class="metric-card__icon" />
@@ -1284,26 +1311,43 @@
         </div>
       {/if}
 
-      <div class="runtime-diagnostics__block">
+      {#if assignmentSummaries.length > 0}
+      <div class="runtime-diagnostics__block runtime-diagnostics__block--assignments">
         <div class="runtime-diagnostics__label">{i18n.t('runtimeDiagnostics.assignmentTitle')}</div>
-        {#if assignmentSummaries.length > 0}
-          <div class="runtime-diagnostics__ops-list">
-            {#each assignmentSummaries as item}
-              <div class="runtime-diagnostics__ops-item">
-                <div class="runtime-diagnostics__ops-title-row">
-                  <span class="runtime-diagnostics__ops-title">{item.title}</span>
-                      <span class="runtime-diagnostics__ops-time">{formatAssignmentMeta(item)}</span>
-                    </div>
-                    <div class="runtime-diagnostics__ops-sub">{formatAssignmentRuntimeSummary(item)}</div>
-                  </div>
-                {/each}
+        <div class="runtime-diagnostics__ops-list">
+          {#each assignmentSummaries as item}
+            <div class="runtime-diagnostics__ops-item">
+              <div class="runtime-diagnostics__ops-title-row">
+                <span class="runtime-diagnostics__ops-title">{item.title}</span>
+                <span class="runtime-diagnostics__ops-time">{formatAssignmentMeta(item)}</span>
               </div>
-        {:else}
-          <div class="runtime-diagnostics__empty">{i18n.t('runtimeDiagnostics.noAssignments')}</div>
-        {/if}
+              <div class="runtime-diagnostics__ops-sub">{formatAssignmentRuntimeSummary(item)}</div>
+            </div>
+          {/each}
+        </div>
       </div>
+      {/if}
 
-      {#if recentTimeline.length > 0 || recentStateDiffs.length > 0 || recentTrace.length > 0}
+      {#if technicalDetailsAvailable}
+      <section class="runtime-diagnostics__technical">
+        <button
+          type="button"
+          class="runtime-diagnostics__technical-summary"
+          aria-expanded={technicalDetailsExpanded}
+          onclick={() => {
+            technicalDetailsExpanded = !technicalDetailsExpanded;
+            if (!technicalDetailsExpanded) expandedSection = null;
+          }}
+        >
+          <span class="runtime-diagnostics__section-title">
+            <Icon name={technicalDetailsExpanded ? 'chevron-down' : 'chevron-right'} size={12} />
+            <span>{i18n.t('runtimeDiagnostics.technicalDetails')}</span>
+          </span>
+          <span class="runtime-diagnostics__section-count">
+            {recentTimeline.length + recentStateDiffs.length + recentTrace.length}
+          </span>
+        </button>
+        {#if technicalDetailsExpanded}
       <div class="runtime-diagnostics__section-stack">
         {#if recentTimeline.length > 0}
         <section class="runtime-diagnostics__section-toggle">
@@ -1424,6 +1468,8 @@
         </section>
         {/if}
       </div>
+        {/if}
+      </section>
       {/if}
 
       {#if runtimeState?.status === 'failed' && (failureReason || failureErrors.length > 0)}
@@ -1521,13 +1567,13 @@
 
 <style>
   .runtime-diagnostics {
-    margin: 8px 12px 0;
+    margin: 6px 12px 0;
     border: 1px solid var(--vscode-editorWidget-border, var(--border));
-    border-radius: 10px;
+    border-radius: 8px;
     background: var(--vscode-editorWidget-background, var(--surface-2));
     color: var(--vscode-foreground, var(--foreground));
     overflow: visible;
-    border-left: 3px solid var(--vscode-editorWidget-border, var(--border));
+    border-left: 2px solid var(--vscode-editorWidget-border, var(--border));
     position: relative;
     z-index: 12;
   }
@@ -1545,17 +1591,18 @@
   .runtime-diagnostics__summary-button {
     width: 100%;
     cursor: pointer;
-    padding: 11px 14px;
+    min-height: 34px;
+    padding: 7px 10px;
     font-size: 12px;
     user-select: none;
     display: flex;
     align-items: center;
-    gap: 8px;
+    gap: 6px;
     border: 0;
     background: transparent;
     color: inherit;
     text-align: left;
-    border-radius: 10px;
+    border-radius: 8px;
   }
 
   .runtime-diagnostics__summary-button:hover {
@@ -1579,7 +1626,7 @@
   }
 
   .summary__title {
-    font-weight: 500;
+    font-weight: 600;
   }
 
   .summary__badge {
@@ -1624,8 +1671,16 @@
 
   .summary__phase {
     font-size: 11px;
-    opacity: 0.65;
-    font-family: var(--vscode-editor-font-family, monospace);
+    opacity: 0.72;
+  }
+
+  .summary__meta {
+    padding-left: 6px;
+    border-left: 1px solid var(--border-subtle);
+    color: var(--foreground-muted);
+    font-size: 10px;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
   }
 
   .summary__time {
@@ -1641,14 +1696,14 @@
     left: -1px;
     right: -1px;
     z-index: 24;
-    padding: 14px;
+    padding: 6px 12px 10px;
     display: flex;
     flex-direction: column;
-    gap: 14px;
-    max-height: min(70vh, 680px);
+    gap: 0;
+    max-height: min(60vh, 560px);
     overflow-y: auto;
     border: 1px solid var(--vscode-editorWidget-border, var(--border));
-    border-radius: 10px;
+    border-radius: 8px;
     background: color-mix(in srgb, var(--vscode-editorWidget-background, var(--surface-2)) 96%, black 4%);
     box-shadow: 0 14px 36px rgba(0, 0, 0, 0.34);
     backdrop-filter: blur(10px);
@@ -1658,13 +1713,13 @@
   .metrics-grid {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
-    gap: 8px;
+    gap: 0 14px;
+    padding: 4px 0 8px;
+    border-bottom: 1px solid var(--border-subtle);
   }
 
   .metric-card {
-    padding: 8px;
-    border-radius: 6px;
-    background: var(--vscode-editor-background, var(--assistant-message-bg));
+    padding: 7px 0;
     display: flex;
     flex-direction: column;
     gap: 4px;
@@ -1765,14 +1820,18 @@
   .runtime-diagnostics__block {
     display: flex;
     flex-direction: column;
-    gap: 6px;
-    padding: 12px;
-    border-radius: 10px;
-    background: color-mix(in srgb, var(--vscode-editor-background, var(--assistant-message-bg)) 88%, transparent);
-    border: 1px solid color-mix(in srgb, var(--vscode-editorWidget-border, var(--border)) 92%, transparent);
+    gap: 5px;
+    padding: 9px 0;
+    border: 0;
+    border-bottom: 1px solid var(--border-subtle);
+    border-radius: 0;
+    background: transparent;
   }
 
   .runtime-diagnostics__block--failure {
+    margin: 8px 0;
+    padding: 9px 10px;
+    border-radius: 6px;
     border: 1px solid color-mix(in srgb, var(--error) 28%, transparent);
     background: color-mix(in srgb, var(--vscode-editorError-foreground, var(--error)) 8%, transparent);
   }
@@ -1810,13 +1869,11 @@
   .runtime-diagnostics__kv-grid {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-    gap: 8px;
+    gap: 6px 18px;
   }
 
   .runtime-diagnostics__kv-item {
-    padding: 8px;
-    border-radius: 6px;
-    background: var(--vscode-editor-background, var(--assistant-message-bg));
+    padding: 2px 0;
     display: flex;
     flex-direction: column;
     gap: 4px;
@@ -1839,13 +1896,12 @@
   .runtime-diagnostics__ops-list {
     display: flex;
     flex-direction: column;
-    gap: 6px;
+    gap: 0;
   }
 
   .runtime-diagnostics__ops-item {
-    padding: 8px;
-    border-radius: 6px;
-    background: var(--vscode-editor-background, var(--assistant-message-bg));
+    padding: 7px 0;
+    border-top: 1px solid color-mix(in srgb, var(--border-subtle) 72%, transparent);
     display: flex;
     flex-direction: column;
     gap: 4px;
@@ -1887,13 +1943,36 @@
   .runtime-diagnostics__section-stack {
     display: flex;
     flex-direction: column;
-    gap: 10px;
+    gap: 0;
+  }
+
+  .runtime-diagnostics__technical {
+    border-bottom: 1px solid var(--border-subtle);
+  }
+
+  .runtime-diagnostics__technical-summary {
+    width: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 9px 0;
+    border: 0;
+    background: transparent;
+    color: inherit;
+    cursor: pointer;
+    font-size: 11px;
+  }
+
+  .runtime-diagnostics__technical-summary:hover {
+    color: var(--primary);
   }
 
   .runtime-diagnostics__section-toggle {
-    border: 1px solid var(--vscode-editorWidget-border, var(--border));
-    border-radius: 10px;
-    background: color-mix(in srgb, var(--vscode-editor-background, var(--assistant-message-bg)) 88%, transparent);
+    border: 0;
+    border-top: 1px solid color-mix(in srgb, var(--border-subtle) 72%, transparent);
+    border-radius: 0;
+    background: transparent;
     overflow: hidden;
   }
 
@@ -1904,7 +1983,7 @@
     align-items: center;
     justify-content: space-between;
     gap: 8px;
-    padding: 11px 14px;
+    padding: 8px 0;
     font-size: 12px;
     font-weight: 500;
     border: 0;
@@ -1919,7 +1998,7 @@
 
   .runtime-diagnostics__section-summary--expanded {
     border-bottom: 1px solid var(--vscode-editorWidget-border, var(--border));
-    background: color-mix(in srgb, var(--vscode-editor-background, var(--assistant-message-bg)) 74%, transparent);
+    background: transparent;
   }
 
   .runtime-diagnostics__section-title {
@@ -1942,8 +2021,8 @@
   }
 
   .runtime-diagnostics__section-body {
-    padding: 12px 14px 14px;
-    background: color-mix(in srgb, var(--vscode-editorWidget-background, var(--surface-2)) 95%, transparent);
+    padding: 4px 0 9px;
+    background: transparent;
   }
 
   .trace-list {
@@ -2049,27 +2128,25 @@
 
   @media (max-width: 640px) {
     .runtime-diagnostics {
-      margin: 8px 8px 0;
+      margin: 6px 8px 0;
     }
 
     .runtime-diagnostics__summary-button {
-      padding: 10px 12px;
+      padding: 7px 9px;
       gap: 6px;
-      align-items: flex-start;
+      flex-wrap: wrap;
     }
 
     .summary__time {
-      width: 100%;
-      margin-left: 0;
-      padding-left: 21px;
+      display: none;
     }
 
     .runtime-diagnostics__content {
       left: 0;
       right: 0;
-      padding: 12px;
-      max-height: min(72vh, 560px);
-      gap: 12px;
+      padding: 5px 10px 8px;
+      max-height: min(52vh, 420px);
+      gap: 0;
     }
 
     .metrics-grid,
@@ -2088,7 +2165,7 @@
     }
 
     .runtime-diagnostics__section-summary {
-      padding: 10px 12px;
+      padding: 8px 0;
       align-items: flex-start;
     }
 

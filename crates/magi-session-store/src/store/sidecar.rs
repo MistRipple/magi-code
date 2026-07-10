@@ -229,6 +229,9 @@ fn current_turn_item_renderable(
     kind: CanonicalTurnItemKind,
     status: CanonicalTurnItemStatus,
 ) -> bool {
+    if let Some(renderable) = item.requested_renderable() {
+        return renderable;
+    }
     if kind == CanonicalTurnItemKind::ToolCall
         && item
             .tool_name
@@ -2015,6 +2018,10 @@ impl SessionStore {
     where
         F: FnOnce(&SessionExecutionSidecarStoreState) -> Result<(), E>,
     {
+        let _flush_guard = self
+            .sidecar_flush_lock
+            .lock()
+            .expect("session sidecar flush lock poisoned");
         let version = {
             let flush_state = self
                 .sidecar_flush_state

@@ -11,6 +11,23 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tempfile::tempdir;
 
+fn regular_file_count(root: &std::path::Path) -> usize {
+    if !root.exists() {
+        return 0;
+    }
+    fs::read_dir(root)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .map(|path| {
+            if path.is_dir() {
+                regular_file_count(&path)
+            } else {
+                usize::from(path.is_file())
+            }
+        })
+        .sum()
+}
+
 #[cfg(unix)]
 fn create_file_symlink(target: &std::path::Path, link: &std::path::Path) -> std::io::Result<()> {
     std::os::unix::fs::symlink(target, link)
@@ -471,4 +488,273 @@ async fn reconcile_catches_missed_events() {
     let pending = session.pending_changes().unwrap();
     assert!(pending.iter().any(|c| c.path == "missed.txt"));
     assert!(pending.iter().any(|c| c.path == "init.txt"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn restart_reconciles_files_changed_while_session_was_offline() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    fs::write(root.join("tracked.txt"), "before").unwrap();
+
+    {
+        let mgr = SnapshotManager::new();
+        let session = mgr
+            .start_session("s-restart-reconcile".into(), root.clone())
+            .await
+            .unwrap();
+        session.archive().await;
+    }
+
+    fs::write(root.join("tracked.txt"), "after").unwrap();
+    fs::write(root.join("offline-added.txt"), "added while offline").unwrap();
+
+    let restarted = SnapshotManager::new();
+    let session = restarted
+        .start_session("s-restart-reconcile".into(), root.clone())
+        .await
+        .unwrap();
+    let pending = session.pending_changes().unwrap();
+
+    assert!(
+        pending.iter().any(|change| {
+            change.path == "tracked.txt" && change.change_kind == ChangeKind::Modified
+        }),
+        "restart must reconcile modifications that happened while the watcher was offline"
+    );
+    assert!(
+        pending.iter().any(|change| {
+            change.path == "offline-added.txt" && change.change_kind == ChangeKind::Added
+        }),
+        "restart must reconcile files added while the watcher was offline"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn restart_migrates_legacy_baseline_hashes_without_false_changes() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    fs::write(root.join("small.txt"), "stable baseline").unwrap();
+    fs::write(root.join("large.txt"), vec![b'a'; 5 * 1024 * 1024 + 1]).unwrap();
+
+    {
+        let mgr = SnapshotManager::new();
+        let session = mgr
+            .start_session("s-legacy-baseline".into(), root.clone())
+            .await
+            .unwrap();
+        session.archive().await;
+    }
+
+    let baseline_path = root.join(".magi/snapshots/index/s-legacy-baseline/baseline.json");
+    let mut baseline: serde_json::Value =
+        serde_json::from_slice(&fs::read(&baseline_path).unwrap()).unwrap();
+    for entry in baseline["entries"].as_object_mut().unwrap().values_mut() {
+        entry.as_object_mut().unwrap().remove("contentHash");
+    }
+    fs::write(
+        &baseline_path,
+        serde_json::to_vec_pretty(&baseline).unwrap(),
+    )
+    .unwrap();
+
+    let restarted = SnapshotManager::new();
+    let session = restarted
+        .start_session("s-legacy-baseline".into(), root.clone())
+        .await
+        .unwrap();
+    assert!(
+        session.pending_changes().unwrap().is_empty(),
+        "legacy baseline migration must not report unchanged files as pending changes"
+    );
+
+    let migrated: serde_json::Value =
+        serde_json::from_slice(&fs::read(&baseline_path).unwrap()).unwrap();
+    let entries = migrated["entries"].as_object().unwrap();
+    assert_eq!(
+        entries["small.txt"]["contentHash"], entries["small.txt"]["blobHash"],
+        "blob-backed legacy entries must reuse the authoritative blob hash"
+    );
+    assert!(
+        entries["large.txt"]["contentHash"]
+            .as_str()
+            .is_some_and(|hash| !hash.is_empty()),
+        "unchanged large legacy entries must receive a persisted content hash"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn restart_migrates_legacy_event_hashes_without_duplicate_events() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    fs::write(root.join("tracked.txt"), "baseline").unwrap();
+
+    {
+        let mgr = SnapshotManager::new();
+        let session = mgr
+            .start_session("s-legacy-events".into(), root.clone())
+            .await
+            .unwrap();
+        fs::write(root.join("tracked.txt"), "changed").unwrap();
+        session.reconcile().unwrap();
+        session.archive().await;
+    }
+
+    let session_dir = root.join(".magi/snapshots/index/s-legacy-events");
+    let baseline_path = session_dir.join("baseline.json");
+    let mut baseline: serde_json::Value =
+        serde_json::from_slice(&fs::read(&baseline_path).unwrap()).unwrap();
+    for entry in baseline["entries"].as_object_mut().unwrap().values_mut() {
+        entry.as_object_mut().unwrap().remove("contentHash");
+    }
+    fs::write(
+        &baseline_path,
+        serde_json::to_vec_pretty(&baseline).unwrap(),
+    )
+    .unwrap();
+
+    let events_path = session_dir.join("events.log");
+    let mut events = fs::read_to_string(&events_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    for event in &mut events {
+        for field in ["before", "after"] {
+            if let Some(meta) = event[field].as_object_mut() {
+                meta.remove("contentHash");
+            }
+        }
+    }
+    fs::write(
+        &events_path,
+        events
+            .iter()
+            .map(|event| serde_json::to_string(event).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n",
+    )
+    .unwrap();
+    let event_count_before_restart = events.len();
+
+    let restarted = SnapshotManager::new();
+    let session = restarted
+        .start_session("s-legacy-events".into(), root.clone())
+        .await
+        .unwrap();
+    let pending = session.pending_changes().unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].path, "tracked.txt");
+
+    let migrated_events = fs::read_to_string(&events_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        migrated_events.len(),
+        event_count_before_restart,
+        "legacy event migration must not append a duplicate reconcile event"
+    );
+    assert!(
+        migrated_events.iter().all(|event| {
+            ["before", "after"].into_iter().all(|field| {
+                event[field].is_null()
+                    || event[field]["blobHash"].is_null()
+                    || event[field]["contentHash"] == event[field]["blobHash"]
+            })
+        }),
+        "blob-backed legacy event metadata must be persisted with content hashes"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn repeated_reconcile_does_not_leak_unowned_blobs_after_session_drop() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    fs::write(root.join("stable.txt"), "stable content").unwrap();
+
+    let mgr = SnapshotManager::new();
+    let session = mgr
+        .start_session("s-reconcile-refcount".into(), root.clone())
+        .await
+        .unwrap();
+    session.reconcile().unwrap();
+    session.reconcile().unwrap();
+
+    let blobs_root = root.join(".magi/snapshots/blobs");
+    assert!(regular_file_count(&blobs_root) > 0);
+    mgr.drop_session("s-reconcile-refcount").await.unwrap();
+    assert_eq!(
+        regular_file_count(&blobs_root),
+        0,
+        "dropping the last session owner must remove all baseline/current blobs"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn restarted_shared_blob_survives_until_every_session_releases_it() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    fs::write(root.join("shared.txt"), "shared baseline").unwrap();
+
+    {
+        let mgr = SnapshotManager::new();
+        mgr.start_session("s-shared-a".into(), root.clone())
+            .await
+            .unwrap();
+        mgr.start_session("s-shared-b".into(), root.clone())
+            .await
+            .unwrap();
+    }
+
+    let restarted = SnapshotManager::new();
+    restarted
+        .start_session("s-shared-a".into(), root.clone())
+        .await
+        .unwrap();
+    let session_b = restarted
+        .start_session("s-shared-b".into(), root.clone())
+        .await
+        .unwrap();
+
+    restarted.drop_session("s-shared-a").await.unwrap();
+    fs::write(root.join("shared.txt"), "changed by remaining session").unwrap();
+    session_b.reconcile().unwrap();
+    session_b.revert(&["shared.txt".into()]).unwrap();
+
+    assert_eq!(
+        fs::read_to_string(root.join("shared.txt")).unwrap(),
+        "shared baseline",
+        "one restarted session must not delete a blob still owned by another session"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn revert_preflight_rejects_unrestorable_batch_without_partial_writes() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    fs::write(root.join("a-small.txt"), "small baseline").unwrap();
+    fs::write(root.join("z-large.txt"), vec![b'a'; 5 * 1024 * 1024 + 1]).unwrap();
+
+    let mgr = SnapshotManager::new();
+    let session = mgr
+        .start_session("s-revert-preflight".into(), root.clone())
+        .await
+        .unwrap();
+
+    fs::write(root.join("a-small.txt"), "small changed").unwrap();
+    fs::write(root.join("z-large.txt"), vec![b'b'; 5 * 1024 * 1024 + 1]).unwrap();
+    session.reconcile().unwrap();
+
+    let result = session.revert(&["a-small.txt".into(), "z-large.txt".into()]);
+    assert!(
+        result.is_err(),
+        "large text without a baseline blob must reject revert"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("a-small.txt")).unwrap(),
+        "small changed",
+        "revert must preflight the whole batch before touching any file"
+    );
 }

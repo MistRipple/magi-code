@@ -13,6 +13,9 @@
     remainingTokens?: number | null;
     tokenLimit?: number | null;
     warningLevel?: ContextRingTone | null;
+    lastCompactionReason?: string | null;
+    originalTokenEstimate?: number | null;
+    compactedTokenEstimate?: number | null;
   }
 
   let {
@@ -21,6 +24,9 @@
     remainingTokens = null,
     tokenLimit = null,
     warningLevel = null,
+    lastCompactionReason = null,
+    originalTokenEstimate = null,
+    compactedTokenEstimate = null,
   }: Props = $props();
 
   // 上下文窗口占用率圆环：只负责统计详情，不承载模型切换行为。
@@ -30,6 +36,9 @@
     remainingTokens,
     tokenLimit,
     warningLevel,
+    lastCompactionReason,
+    originalTokenEstimate,
+    compactedTokenEstimate,
   });
 
   const view = $derived(resolveRingView(input));
@@ -194,7 +203,8 @@
     display: flex;
     flex-direction: column;
     gap: 8px;
-    width: min(220px, calc(100vw - 24px));
+    width: max-content;
+    max-width: min(220px, calc(100vw - 24px));
     padding: 10px;
     border: 1px solid var(--border);
     border-radius: var(--radius-md);

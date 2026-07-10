@@ -4,7 +4,7 @@ use crate::{
     ExecutionOverview, ExecutionRuntimeSnapshot, ExecutionSkillDispatchSummary,
     TaskGovernanceSummary, TaskSkillDispatchSummary,
 };
-use magi_core::{AssignmentId, MissionId, Task, TaskId, TaskProjection};
+use magi_core::{AgentRunProjection, AssignmentId, MissionId, Task, TaskId};
 use magi_skill_runtime::{SkillDispatchRoute, SkillDispatchStatus};
 use magi_tool_runtime::ToolExecutionSummary;
 use magi_worker_runtime::{
@@ -135,7 +135,7 @@ pub(crate) fn build_execution_overview_payload(overview: &ExecutionOverview) -> 
 }
 
 pub(crate) fn build_runtime_snapshot_from_projection(
-    projection: &TaskProjection,
+    projection: &AgentRunProjection,
     total_assignments: usize,
 ) -> ExecutionRuntimeSnapshot {
     ExecutionRuntimeSnapshot {
@@ -157,7 +157,7 @@ pub(crate) fn build_execution_overview_from_task_projection(
     governance_observations: &[WorkerGovernanceObservation],
     context_summary: Option<ExecutionContextSummary>,
 ) -> Option<ExecutionOverview> {
-    let projection = task_store.build_projection(root_task_id)?;
+    let projection = task_store.build_agent_run_projection(root_task_id)?;
     let subtree_tasks = collect_subtree_tasks(task_store, root_task_id);
     let assignment_roots = collect_assignment_roots(task_store, &projection.root_task);
     let assignment_governance_summaries = build_assignment_governance_summaries_from_tasks(

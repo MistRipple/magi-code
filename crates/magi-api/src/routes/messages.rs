@@ -4,7 +4,7 @@ use axum::{
     routing::get,
 };
 use magi_core::UtcMillis;
-use magi_session_store::{CanonicalTurn, NotificationRecord, SessionRecord, TimelineEntry};
+use magi_session_store::{CanonicalTurn, SessionRecord, TimelineEntry};
 use serde::{Deserialize, Serialize};
 
 use super::session_scope::{
@@ -38,7 +38,6 @@ struct MessagesResponseDto {
     timeline: Vec<TimelineEntry>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     canonical_turns: Vec<CanonicalTurn>,
-    notifications: Vec<NotificationRecord>,
     session_id: String,
     has_more_before: bool,
     before_cursor: Option<String>,
@@ -100,7 +99,6 @@ async fn get_messages(
         sessions,
         timeline: page,
         canonical_turns,
-        notifications: state.session_store.notifications_for_session(&session_id),
         session_id: session_id.to_string(),
         has_more_before: start > 0,
         before_cursor,
@@ -319,6 +317,8 @@ mod tests {
                 timeline: Vec::new(),
                 canonical_turns: Vec::new(),
                 notifications: Vec::new(),
+                goals: Vec::new(),
+                todo_lists: Vec::new(),
             },
             SessionExecutionSidecarStoreState {
                 runtime_sidecars: vec![SessionRuntimeSidecar {

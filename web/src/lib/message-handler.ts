@@ -10,13 +10,13 @@ import type { ClientBridge, ClientBridgeMessage } from '../shared/bridges/client
 import { getClientBridge } from '../shared/bridges/bridge-runtime';
 import {
   getState,
-  addToast,
   getRequestBinding,
   createRequestBinding,
   updateRequestBinding,
   addPendingRequest,
   settleProcessingForManualInteraction,
 } from '../stores/messages.svelte';
+import { reportIncident } from './notifications';
 import type { StandardMessage } from '../shared/protocol/message-protocol';
 import { MessageType, MessageCategory } from '../shared/protocol/message-protocol';
 import {
@@ -314,17 +314,11 @@ function handleUnhandledMessageError(error: unknown, message?: ClientBridgeMessa
   }
   lastUnhandledMessageErrorSignature = signature;
   lastUnhandledMessageErrorAt = now;
-  addToast(
-    'error',
-    i18n.t('messageHandler.syncError'),
-    undefined,
-    {
-      category: 'incident',
-      source: 'message-handler',
-      actionRequired: true,
-      persistToCenter: true,
-    },
-  );
+  reportIncident(i18n.t('messageHandler.syncError'), {
+    scope: 'app',
+    source: 'message-handler',
+    fingerprint: signature,
+  });
 }
 
 

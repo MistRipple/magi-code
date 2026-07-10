@@ -14,6 +14,7 @@
   import { getCurrentSessionId, messagesState } from '../stores/messages.svelte';
   import { diagramSummary, parseToolDiagramPayload } from '../lib/diagram-payload';
   import { openAgentTab } from '../stores/right-pane.svelte';
+  import { getAgentRunState } from '../stores/agent-run-store.svelte';
   import { getAgentVisualInfo } from '../lib/agent-colors';
   import { parseToolIdentity } from '../lib/tool-identity';
   import {
@@ -104,12 +105,6 @@
     'agent_wait': 'toolCall.displayName.agentWait',
     'todo_write': 'toolCall.displayName.todoWrite',
     'memory_write': 'toolCall.displayName.memoryWrite',
-    'mission_charter_write': 'toolCall.displayName.missionCharterWrite',
-    'plan_write': 'toolCall.displayName.planWrite',
-    'kg_write': 'toolCall.displayName.kgWrite',
-    'validation_record': 'toolCall.displayName.validationRecord',
-    'checkpoint_create': 'toolCall.displayName.checkpointCreate',
-    'human_checkpoint_request': 'toolCall.displayName.humanCheckpointRequest',
   };
 
   function toolDisplayNameI18nKey(name: string): string {
@@ -240,12 +235,6 @@
       'agent_wait': 'hourglass',
       'todo_write': 'list',
       'memory_write': 'database',
-      'mission_charter_write': 'document',
-      'plan_write': 'list',
-      'kg_write': 'git-branch',
-      'validation_record': 'check-circle',
-      'checkpoint_create': 'shield',
-      'human_checkpoint_request': 'profile',
     };
 
     if (iconMap[baseToolName]) {
@@ -265,15 +254,21 @@
     return 'tool';
   }
 
-  // 状态信息
-  const statusInfo = $derived.by(() => {
+  type VisualToolStatus = 'pending' | 'running' | 'success' | 'error';
+
+  function visualStatusInfo(value: VisualToolStatus): { class: string } {
     const map: Record<string, { class: string }> = {
       pending: { class: 'pending' },
       running: { class: 'running' },
       success: { class: 'success' },
       error: { class: 'error' },
     };
-    return map[status] || { class: 'success' };
+    return map[value] || { class: 'success' };
+  }
+
+  // 状态信息
+  const statusInfo = $derived.by(() => {
+    return visualStatusInfo(status);
   });
 
   // 文件变更工具：diff 面板由 FileChangeCard 展示，ToolCall 仅渲染紧凑 header
@@ -358,8 +353,40 @@
     return getAgentVisualInfo(role);
   });
 
-  function openAgentSpawnTab(): void {
-    const display = agentSpawnDisplay;
+  const agentProjectionTask = $derived.by(() => {
+    const childTaskId = agentSpawnDisplay?.childTaskId;
+    if (!childTaskId) return null;
+    const projectionState = getAgentRunState(
+      filePreviewScope?.sessionId || getCurrentSessionId(),
+      filePreviewScope?.workspaceId || messagesState.currentWorkspaceId,
+    );
+    const projection = projectionState.projection;
+    if (!projection) return null;
+    const agent = projection.agents.find((item) => item.agentRunId === childTaskId);
+    const task = projection.tasks.find((item) => item.task_id === childTaskId);
+    return { agent, task };
+  });
+
+  const agentSpawnVisualStatus = $derived.by((): VisualToolStatus => {
+    const projectionStatus = agentProjectionTask?.agent?.status || agentProjectionTask?.task?.status;
+    if (projectionStatus === 'pending') return 'pending';
+    if (projectionStatus === 'running') return 'running';
+    if (projectionStatus === 'failed' || projectionStatus === 'killed') return 'error';
+    if (projectionStatus === 'completed') return 'success';
+    if (agentSpawnDisplay?.outcome === 'failed' || agentSpawnDisplay?.outcome === 'killed') return 'error';
+    if (agentSpawnDisplay?.outcome === 'succeeded' || agentSpawnDisplay?.outcome === 'degraded') return 'success';
+    return status;
+  });
+
+  const agentSpawnStatusInfo = $derived(visualStatusInfo(agentSpawnVisualStatus));
+  const agentSpawnFailed = $derived(
+    agentSpawnVisualStatus === 'error'
+    || agentSpawnDisplay?.outcome === 'failed'
+    || agentSpawnDisplay?.outcome === 'killed'
+  );
+  const agentSpawnRunning = $derived(agentSpawnVisualStatus === 'running' || agentSpawnVisualStatus === 'pending');
+
+  function openAgentSpawnTab(display: AgentSpawnDisplay | null): void {
     if (!display || !display.childTaskId) return;
     openAgentTab(filePreviewScope?.sessionId || getCurrentSessionId(), display.childTaskId, {
       label: display.title,
@@ -680,8 +707,6 @@
     if (matches(
       'orchestrator',
       'agent_spawn delegation',
-      'orchestrator cannot execute tools in long mission',
-      'Long Mission 下主模型不可直接执行',
       '请通过 agent_spawn 委派给代理',
     )) {
       return {
@@ -834,15 +859,15 @@
 {#if isAgentSpawn && agentSpawnDisplay}
   {@const display = agentSpawnDisplay}
   {@const canOpen = !!display.childTaskId}
-  {@const isRunning = status === 'running' || status === 'pending'}
   <button
     type="button"
-    class="agent-spawn-card status-{statusInfo.class}"
+    class="agent-spawn-card status-{agentSpawnStatusInfo.class}"
     class:clickable={canOpen}
     disabled={!canOpen}
-    onclick={canOpen ? openAgentSpawnTab : undefined}
+    onclick={canOpen ? () => openAgentSpawnTab(display) : undefined}
     data-tool-name="agent_spawn"
     data-tool-call-id={id || undefined}
+    data-agent-task-id={display.childTaskId || undefined}
   >
     <span class="agent-spawn-icon">
       <Icon name={agentSpawnRoleVisual?.icon ?? 'bot'} size={16} />
@@ -859,13 +884,13 @@
           </span>
         {/if}
       </span>
-      {#if display.error && (display.outcome === 'degraded' || display.outcome === 'failed' || display.outcome === 'killed')}
+      {#if agentSpawnFailed}
         <span class="agent-spawn-error">{i18n.t('toolCall.agentSpawn.failed')}</span>
       {/if}
     </span>
     <span class="agent-spawn-meta">
-      <span class="tool-status status-{statusInfo.class}">
-        {#if isRunning}
+      <span class="tool-status status-{agentSpawnStatusInfo.class}">
+        {#if agentSpawnRunning}
           <span class="status-dot pulsing"></span>
         {:else}
           <span class="status-dot"></span>
@@ -876,7 +901,7 @@
           {i18n.t('toolCall.agentSpawn.viewDetails')}
           <Icon name="chevron-right" size={12} />
         </span>
-      {:else if isRunning}
+      {:else if agentSpawnRunning}
         <span class="agent-spawn-cta agent-spawn-cta-pending">{i18n.t('toolCall.agentSpawn.dispatching')}</span>
       {/if}
     </span>

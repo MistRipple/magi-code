@@ -70,6 +70,24 @@ impl ConversationRegistry {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// 删除 session 主对话及其全部 task 对话。会话删除后这些内存态不能继续存活，
+    /// 否则 Mailbox 与 Turn 状态会成为无法再访问的孤儿。
+    pub fn remove_session(&self, session_id: &SessionId) -> usize {
+        let mut guard = self
+            .inner
+            .lock()
+            .expect("ConversationRegistry mutex poisoned");
+        let before = guard.len();
+        guard.retain(|key, _| match key {
+            ConversationKey::Session(candidate) => candidate != session_id,
+            ConversationKey::Task {
+                session_id: candidate,
+                ..
+            } => candidate != session_id,
+        });
+        before.saturating_sub(guard.len())
+    }
 }
 
 #[cfg(test)]
@@ -120,5 +138,19 @@ mod tests {
         assert!(!Arc::ptr_eq(&root, &task_a));
         assert!(!Arc::ptr_eq(&task_a, &task_b));
         assert_eq!(registry.len(), 3);
+    }
+
+    #[test]
+    fn remove_session_drops_session_and_task_conversations() {
+        let registry = ConversationRegistry::new();
+        let session_a = SessionId::new("session-a");
+        let session_b = SessionId::new("session-b");
+        registry.conversation_for(&session_a);
+        registry.conversation_for_task(&session_a, &TaskId::new("task-a"));
+        registry.conversation_for(&session_b);
+
+        assert_eq!(registry.remove_session(&session_a), 2);
+        assert_eq!(registry.len(), 1);
+        assert_eq!(registry.remove_session(&session_a), 0);
     }
 }

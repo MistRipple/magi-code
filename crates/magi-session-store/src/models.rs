@@ -1,6 +1,6 @@
 use magi_core::{
-    DomainError, DomainResult, ExecutionOwnership, LeaseId, MissionId, SessionId,
-    SessionLifecycleStatus, TaskId, ThreadId, UtcMillis, WorkerId, WorkspaceId,
+    DomainError, DomainResult, ExecutionOwnership, GoalId, LeaseId, MissionId, SessionId,
+    SessionLifecycleStatus, TaskId, ThreadId, TodoItem, UtcMillis, WorkerId, WorkspaceId,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -426,6 +426,12 @@ pub struct ActiveExecutionTurnItem {
     pub source_thread_id: ThreadId,
 }
 
+impl ActiveExecutionTurnItem {
+    pub fn requested_renderable(&self) -> Option<bool> {
+        self.metadata.get("renderable").and_then(Value::as_bool)
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ActiveExecutionTurn {
@@ -667,11 +673,34 @@ pub fn timeline_entry_visible_text(message: &str) -> Option<String> {
     Some(trimmed.to_string())
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub enum NotificationScope {
+    App,
+    Workspace,
+    Session,
+}
+
+impl Default for NotificationScope {
+    fn default() -> Self {
+        Self::Session
+    }
+}
+
+fn default_notification_occurrence_count() -> u32 {
+    1
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct NotificationRecord {
     pub notification_id: String,
-    pub session_id: SessionId,
+    #[serde(default)]
+    pub scope: NotificationScope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionId>,
     pub kind: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub level: Option<String>,
@@ -682,16 +711,108 @@ pub struct NotificationRecord {
     pub source: Option<String>,
     pub created_at: UtcMillis,
     pub handled: bool,
+    #[serde(default = "default_true")]
+    pub action_required: bool,
+    #[serde(default = "default_true")]
+    pub count_unread: bool,
+    #[serde(default)]
+    pub fingerprint: String,
+    #[serde(default = "default_notification_occurrence_count")]
+    pub occurrence_count: u32,
+    #[serde(default)]
+    pub resolved: bool,
+}
+
+impl NotificationRecord {
+    pub fn is_incident(&self) -> bool {
+        self.kind == "incident"
+    }
+
+    pub fn normalize_incident(&mut self) {
+        self.kind = "incident".to_string();
+        self.occurrence_count = self.occurrence_count.max(1);
+        if self.fingerprint.trim().is_empty() {
+            self.fingerprint = format!(
+                "{}:{}:{}",
+                self.source.as_deref().unwrap_or("system"),
+                self.level.as_deref().unwrap_or("error"),
+                self.message.trim()
+            );
+        }
+        match self.scope {
+            NotificationScope::App => {
+                self.workspace_id = None;
+                self.session_id = None;
+            }
+            NotificationScope::Workspace => {
+                self.session_id = None;
+            }
+            NotificationScope::Session => {}
+        }
+    }
+
+    pub fn visible_in_context(&self, workspace_id: &str, session_id: Option<&SessionId>) -> bool {
+        if !self.is_incident() {
+            return false;
+        }
+        match self.scope {
+            NotificationScope::App => true,
+            NotificationScope::Workspace => self.workspace_id.as_deref() == Some(workspace_id),
+            NotificationScope::Session => {
+                self.workspace_id.as_deref() == Some(workspace_id)
+                    && self.session_id.as_ref() == session_id
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalStatus {
+    Active,
+    Paused,
+    Blocked,
+    UsageLimited,
+    BudgetLimited,
+    Complete,
+    Cleared,
+}
+
+impl GoalStatus {
+    pub fn is_unfinished(self) -> bool {
+        matches!(
+            self,
+            Self::Active | Self::Paused | Self::Blocked | Self::UsageLimited | Self::BudgetLimited
+        )
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SessionGoal {
+    pub goal_id: GoalId,
+    pub session_id: SessionId,
+    pub thread_id: ThreadId,
+    pub objective: String,
+    pub status: GoalStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub persist_to_center: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub action_required: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub count_unread: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub display_mode: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub duration: Option<u64>,
+    pub token_budget: Option<u64>,
+    #[serde(default)]
+    pub tokens_used: u64,
+    #[serde(default)]
+    pub time_used_seconds: u64,
+    #[serde(default)]
+    pub consecutive_failure_turns: u32,
+    pub created_at: UtcMillis,
+    pub updated_at: UtcMillis,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SessionTodoList {
+    pub session_id: SessionId,
+    pub items: Vec<TodoItem>,
+    pub updated_at: UtcMillis,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -702,6 +823,10 @@ pub struct SessionStoreState {
     #[serde(default)]
     pub canonical_turns: Vec<CanonicalTurn>,
     pub notifications: Vec<NotificationRecord>,
+    #[serde(default)]
+    pub goals: Vec<SessionGoal>,
+    #[serde(default)]
+    pub todo_lists: Vec<SessionTodoList>,
     #[serde(default, flatten)]
     pub execution_sidecar_store: SessionExecutionSidecarStoreState,
     /// P6 Thread 原语注册表：按 session 聚合 `ExecutionThread`。orchestrator thread
@@ -718,6 +843,10 @@ pub struct SessionDurableState {
     #[serde(default)]
     pub canonical_turns: Vec<CanonicalTurn>,
     pub notifications: Vec<NotificationRecord>,
+    #[serde(default)]
+    pub goals: Vec<SessionGoal>,
+    #[serde(default)]
+    pub todo_lists: Vec<SessionTodoList>,
 }
 
 impl SessionDurableState {
@@ -727,6 +856,8 @@ impl SessionDurableState {
             && self.timeline.is_empty()
             && self.canonical_turns.is_empty()
             && self.notifications.is_empty()
+            && self.goals.is_empty()
+            && self.todo_lists.is_empty()
     }
 
     pub fn append_state(&mut self, other: SessionDurableState) {
@@ -741,6 +872,8 @@ impl SessionDurableState {
         self.timeline.extend(other.timeline);
         self.canonical_turns.extend(other.canonical_turns);
         self.notifications.extend(other.notifications);
+        self.goals.extend(other.goals);
+        self.todo_lists.extend(other.todo_lists);
     }
 
     pub fn partition_by_workspace(
@@ -781,6 +914,8 @@ impl SessionDurableState {
                     timeline: Vec::new(),
                     canonical_turns: Vec::new(),
                     notifications: Vec::new(),
+                    goals: Vec::new(),
+                    todo_lists: Vec::new(),
                 },
             );
         }
@@ -794,6 +929,8 @@ impl SessionDurableState {
             timeline: Vec::new(),
             canonical_turns: Vec::new(),
             notifications: Vec::new(),
+            goals: Vec::new(),
+            todo_lists: Vec::new(),
         };
 
         for entry in &self.timeline {
@@ -830,18 +967,69 @@ impl SessionDurableState {
             }
         }
 
-        for notification in &self.notifications {
-            if global_session_ids.contains(&notification.session_id) {
-                global_state.notifications.push(notification.clone());
+        for notification in self.notifications.iter().filter(|item| item.is_incident()) {
+            match notification.scope {
+                NotificationScope::App => global_state.notifications.push(notification.clone()),
+                NotificationScope::Workspace => {
+                    if let Some(workspace_id) = notification.workspace_id.as_deref() {
+                        workspace_states
+                            .entry(workspace_id.to_string())
+                            .or_default()
+                            .notifications
+                            .push(notification.clone());
+                    }
+                }
+                NotificationScope::Session => {
+                    let Some(session_id) = notification.session_id.as_ref() else {
+                        continue;
+                    };
+                    if global_session_ids.contains(session_id) {
+                        global_state.notifications.push(notification.clone());
+                        continue;
+                    }
+                    for (workspace_id, session_ids) in &workspace_session_ids {
+                        if session_ids.contains(session_id) {
+                            workspace_states
+                                .get_mut(workspace_id)
+                                .expect("workspace durable state should exist")
+                                .notifications
+                                .push(notification.clone());
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        for goal in &self.goals {
+            if global_session_ids.contains(&goal.session_id) {
+                global_state.goals.push(goal.clone());
                 continue;
             }
             for (workspace_id, session_ids) in &workspace_session_ids {
-                if session_ids.contains(&notification.session_id) {
+                if session_ids.contains(&goal.session_id) {
                     workspace_states
                         .get_mut(workspace_id)
                         .expect("workspace durable state should exist")
-                        .notifications
-                        .push(notification.clone());
+                        .goals
+                        .push(goal.clone());
+                    break;
+                }
+            }
+        }
+
+        for todo_list in &self.todo_lists {
+            if global_session_ids.contains(&todo_list.session_id) {
+                global_state.todo_lists.push(todo_list.clone());
+                continue;
+            }
+            for (workspace_id, session_ids) in &workspace_session_ids {
+                if session_ids.contains(&todo_list.session_id) {
+                    workspace_states
+                        .get_mut(workspace_id)
+                        .expect("workspace durable state should exist")
+                        .todo_lists
+                        .push(todo_list.clone());
                     break;
                 }
             }
@@ -893,12 +1081,22 @@ impl SessionStoreState {
                 .cmp(&right.turn_seq)
                 .then_with(|| left.turn_id.cmp(&right.turn_id))
         });
+        let mut notifications = durable_state
+            .notifications
+            .into_iter()
+            .filter(NotificationRecord::is_incident)
+            .collect::<Vec<_>>();
+        for notification in &mut notifications {
+            notification.normalize_incident();
+        }
         Self {
             current_session_id: durable_state.current_session_id,
             sessions: durable_state.sessions,
             timeline,
             canonical_turns,
-            notifications: durable_state.notifications,
+            notifications,
+            goals: durable_state.goals,
+            todo_lists: durable_state.todo_lists,
             execution_sidecar_store,
             thread_registry: Vec::new(),
         }
@@ -911,6 +1109,8 @@ impl SessionStoreState {
             timeline: self.timeline.clone(),
             canonical_turns: self.canonical_turns.clone(),
             notifications: self.notifications.clone(),
+            goals: self.goals.clone(),
+            todo_lists: self.todo_lists.clone(),
         }
     }
 }

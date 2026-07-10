@@ -97,14 +97,15 @@ pub fn resolve_context_window(resolved_model: &str) -> i64 {
         return 128_000;
     }
 
-    // DeepSeek:reasoner/chat 当前为 128k。
-    if model.starts_with("deepseek") {
-        return 128_000;
-    }
-
-    // Qwen / GLM / Kimi 等长上下文兼容模型,保守取 128k。
-    if model.starts_with("qwen") || model.starts_with("glm") || model.starts_with("kimi") {
-        return 128_000;
+    // OpenAI 兼容代理经常只返回模型名,不返回精确窗口元数据。DeepSeek / Qwen /
+    // GLM / Kimi 等第三方或本地兼容模型不要按名称臆测 128k,统一走 Magi 的
+    // 默认上下文窗口,与 bridge adapter 保持同一产品口径。
+    if model.starts_with("deepseek")
+        || model.starts_with("qwen")
+        || model.starts_with("glm")
+        || model.starts_with("kimi")
+    {
+        return DEFAULT_CONTEXT_WINDOW;
     }
 
     // Gemini 家族:1.5/2.x 至少 1M,这里取保守的 1M。
@@ -187,7 +188,11 @@ mod tests {
         assert_eq!(resolve_context_window("gpt-4o"), 128_000);
         assert_eq!(resolve_context_window("gpt-4.1"), 1_000_000);
         assert_eq!(resolve_context_window("gemini-2.0-pro"), 1_000_000);
-        assert_eq!(resolve_context_window("deepseek-reasoner"), 128_000);
+        assert_eq!(
+            resolve_context_window("deepseek-reasoner"),
+            DEFAULT_CONTEXT_WINDOW
+        );
+        assert_eq!(resolve_context_window("glm-5.2"), DEFAULT_CONTEXT_WINDOW);
     }
 
     #[test]

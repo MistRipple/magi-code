@@ -228,25 +228,7 @@ fn loopback_classifier_response(prompt: &str) -> Option<String> {
     } else {
         None
     };
-    let task_tier = if route == "task"
-        && contains_any(
-            &user_text,
-            &[
-                "复杂任务",
-                "深度任务",
-                "长期任务",
-                "跨多轮",
-                "多阶段",
-                "可恢复",
-                "人审",
-                "审计",
-                "long mission",
-            ],
-        ) {
-        "long_mission"
-    } else {
-        "execution_chain"
-    };
+    let task_tier = "execution_chain";
     let tool_intent = (route == "execute").then(|| user_text.to_string());
     let arguments = json!({
         "route": route,
@@ -263,7 +245,7 @@ fn loopback_classifier_response(prompt: &str) -> Option<String> {
         },
         "routeReason": match route {
             "task" => "用户请求需要结构化任务执行",
-            "execute" => "用户请求需要工具执行但不需要任务投影",
+            "execute" => "用户请求需要工具执行但不需要代理运行记录",
             "continue" => "用户要求继续且存在可恢复链",
             _ => "普通对话",
         },
@@ -326,7 +308,7 @@ fn contains_any(value: &str, needles: &[&str]) -> bool {
 }
 
 fn loopback_decomposition_response(prompt: &str) -> Option<String> {
-    if !prompt.starts_with("任务投影规划器。") {
+    if !prompt.starts_with("代理运行规划器。") {
         return None;
     }
     let goal = loopback_task_goal(prompt);
@@ -1452,7 +1434,7 @@ mod tests {
 
     #[test]
     fn loopback_visible_prompt_builds_deep_plan_from_current_goal() {
-        let prompt = "任务投影规划器。\n请只调用 create_task_plan 工具输出结构化计划，不要返回自然语言正文。\n任务目标：SUPERPOWERS-PLAN：只做只读检查并最终回复 OK-SUPERPOWERS-PLAN";
+        let prompt = "代理运行规划器。\n请只调用 create_task_plan 工具输出结构化计划，不要返回自然语言正文。\n任务目标：SUPERPOWERS-PLAN：只做只读检查并最终回复 OK-SUPERPOWERS-PLAN";
 
         let visible = super::loopback_visible_prompt(prompt);
         let parsed: Value = serde_json::from_str(&visible).expect("deep plan should be json");
@@ -1472,7 +1454,7 @@ mod tests {
 
     #[test]
     fn loopback_visible_prompt_keeps_sequential_batches_as_phases() {
-        let prompt = "任务投影规划器。\n请只调用 create_task_plan 工具输出结构化计划，不要返回自然语言正文。\n任务目标：第一批任务先执行 printf BATCH_ONE_DONE_NEXT_BATCH；当第一批结果包含 NEXT_BATCH 后继续推进；第二批任务执行 printf BATCH_TWO_DONE_FINAL；第二批完成后交付。";
+        let prompt = "代理运行规划器。\n请只调用 create_task_plan 工具输出结构化计划，不要返回自然语言正文。\n任务目标：第一批任务先执行 printf BATCH_ONE_DONE_NEXT_BATCH；当第一批结果包含 NEXT_BATCH 后继续推进；第二批任务执行 printf BATCH_TWO_DONE_FINAL；第二批完成后交付。";
 
         let visible = super::loopback_visible_prompt(prompt);
         let parsed: Value = serde_json::from_str(&visible).expect("deep plan should be json");
@@ -1520,7 +1502,7 @@ mod tests {
     }
 
     #[test]
-    fn loopback_classifier_keeps_multiline_user_text() {
+    fn loopback_classifier_keeps_multiline_user_text_on_execution_chain() {
         let prompt = "Session Turn 编排分类器\n\
             请只调用 classify_session_turn 工具，输出本轮 route。\n\
             userText=【全流程验收】请以复杂任务模式完成。\n\
@@ -1544,7 +1526,7 @@ mod tests {
         .expect("arguments should parse");
 
         assert_eq!(args["route"], "task");
-        assert_eq!(args["taskTier"], "long_mission");
+        assert_eq!(args["taskTier"], "execution_chain");
         let goal = args["executionGoal"].as_str().expect("goal should be text");
         assert!(goal.contains("FLOW_TASK_SHELL_OK"));
         assert!(goal.contains("FLOW_TASK_DONE"));

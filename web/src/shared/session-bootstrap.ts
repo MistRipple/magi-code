@@ -7,7 +7,8 @@ export interface SessionBootstrapSnapshot {
   sessions: unknown[];
   state: unknown;
   notifications?: {
-    sessionId: string;
+    workspaceId: string;
+    sessionId?: string;
     notifications: unknown;
   };
   orchestratorRuntimeState?: unknown;

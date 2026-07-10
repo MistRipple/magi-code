@@ -26,6 +26,236 @@ pub enum TaskStatus {
     Killed,
 }
 
+/// 会话目标推进清单的状态。Todo 是 session 内的执行锚点，随会话持久化，
+/// 不承担独立项目管理生命周期。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TodoStatus {
+    #[default]
+    Pending,
+    InProgress,
+    Completed,
+}
+
+impl TodoStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::InProgress => "in_progress",
+            Self::Completed => "completed",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TodoItem {
+    pub content: String,
+    pub active_form: String,
+    pub status: TodoStatus,
+}
+
+impl TodoItem {
+    pub fn new(
+        content: impl Into<String>,
+        active_form: impl Into<String>,
+        status: TodoStatus,
+    ) -> Self {
+        Self {
+            content: content.into(),
+            active_form: active_form.into(),
+            status,
+        }
+    }
+}
+
+/// 判断用户文本是否明确要求主线创建子代理。
+///
+/// 只接受未被否定词修饰的代理模式、代理工具或派发动作。这样“不要创建子代理”不会
+/// 因同时包含“创建”和“子代理”而被误判为强制派发；“创建两个子代理，但子代理不能
+/// 再创建更多子代理”仍会由前半句正确触发主线派发。
+pub fn text_requires_agent_spawn(text: &str) -> bool {
+    let lowered = text.to_ascii_lowercase();
+    let compact = lowered
+        .chars()
+        .filter(|ch| !matches!(ch, ' ' | '-' | '_' | '\t' | '\n' | '\r'))
+        .collect::<String>();
+
+    for marker in [
+        "agent_spawn",
+        "subagent模式",
+        "子代理模式",
+        "子agent模式",
+        "多代理模式",
+        "多agent模式",
+        "multiagent模式",
+        "subagentmode",
+        "multiagentmode",
+        "使用多个代理",
+        "使用两个代理",
+        "使用多代理",
+        "代理执行",
+        "代理完成",
+        "代理处理",
+        "代理检查",
+        "代理审查",
+    ] {
+        let haystack = if marker.contains("模式") || marker.ends_with("mode") {
+            &compact
+        } else {
+            &lowered
+        };
+        if contains_non_negated_marker(haystack, marker) {
+            return true;
+        }
+    }
+
+    for verb in [
+        "启动", "派发", "分派", "分配", "调用", "创建", "拉起", "开启", "使用",
+    ] {
+        if action_targets_agent(&lowered, verb, &["子代理", "代理", "agent", "subagent"]) {
+            return true;
+        }
+    }
+    for verb in ["spawn", "start", "launch", "dispatch", "assign", "use"] {
+        if action_targets_agent(
+            &lowered,
+            verb,
+            &["agent", "agents", "subagent", "subagents"],
+        ) {
+            return true;
+        }
+    }
+    false
+}
+
+/// 判断用户是否明确禁止主线创建子代理。若同一输入中另有明确的正向派发要求，
+/// 正向要求优先，避免把“主线创建两个代理，但 worker 不能继续创建代理”误判为禁用。
+pub fn text_prohibits_agent_spawn(text: &str) -> bool {
+    if text_requires_agent_spawn(text) {
+        return false;
+    }
+    let lowered = text.to_ascii_lowercase();
+    for verb in [
+        "启动", "派发", "分派", "分配", "调用", "创建", "拉起", "开启", "使用",
+    ] {
+        if negated_action_targets_agent(&lowered, verb, &["子代理", "代理", "agent", "subagent"])
+        {
+            return true;
+        }
+    }
+    for verb in ["spawn", "start", "launch", "dispatch", "assign", "use"] {
+        if negated_action_targets_agent(
+            &lowered,
+            verb,
+            &["agent", "agents", "subagent", "subagents"],
+        ) {
+            return true;
+        }
+    }
+    false
+}
+
+fn contains_non_negated_marker(text: &str, marker: &str) -> bool {
+    text.match_indices(marker).any(|(index, _)| {
+        !prefix_negates_action(text, index) && !prefix_frames_action_as_discussion(text, index)
+    })
+}
+
+fn action_targets_agent(text: &str, verb: &str, targets: &[&str]) -> bool {
+    text.match_indices(verb).any(|(index, _)| {
+        if prefix_negates_action(text, index) || prefix_frames_action_as_discussion(text, index) {
+            return false;
+        }
+        let suffix = text[index + verb.len()..]
+            .chars()
+            .take(20)
+            .collect::<String>();
+        targets.iter().any(|target| suffix.contains(target))
+    })
+}
+
+fn prefix_frames_action_as_discussion(text: &str, action_index: usize) -> bool {
+    let prefix = text[..action_index]
+        .chars()
+        .rev()
+        .take(16)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    let trimmed = prefix.trim_end();
+    [
+        "如何",
+        "怎么",
+        "怎样",
+        "什么时候",
+        "何时",
+        "是否",
+        "为什么",
+        "介绍",
+        "说明",
+        "解释",
+        "讨论",
+        "分析",
+        "how to",
+        "when to",
+        "whether to",
+        "why",
+        "explain",
+        "describe",
+        "discuss",
+    ]
+    .iter()
+    .any(|framing| trimmed.contains(framing))
+}
+
+fn negated_action_targets_agent(text: &str, verb: &str, targets: &[&str]) -> bool {
+    text.match_indices(verb).any(|(index, _)| {
+        if !prefix_negates_action(text, index) {
+            return false;
+        }
+        let suffix = text[index + verb.len()..]
+            .chars()
+            .take(20)
+            .collect::<String>();
+        targets.iter().any(|target| suffix.contains(target))
+    })
+}
+
+fn prefix_negates_action(text: &str, action_index: usize) -> bool {
+    let prefix = text[..action_index]
+        .chars()
+        .rev()
+        .take(10)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    let trimmed = prefix.trim_end();
+    if trimmed.ends_with('不') || trimmed.ends_with('未') {
+        return true;
+    }
+    [
+        "不要",
+        "禁止",
+        "无需",
+        "不需要",
+        "不必",
+        "不得",
+        "不能",
+        "不可",
+        "别",
+        "no ",
+        "without ",
+        "do not ",
+        "don't ",
+        "never ",
+    ]
+    .iter()
+    .any(|negation| prefix.contains(negation))
+}
+
 pub const TASK_RUNTIME_FAILURE_PUBLIC_OUTPUT: &str = "任务运行失败，详情已记录在日志中。";
 
 pub fn task_output_ref_is_internal_runtime_failure(output_ref: &str) -> bool {
@@ -97,16 +327,12 @@ fn contains_any(value: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| value.contains(needle))
 }
 
-/// 任务系统：任务复杂度分层。
-///
-/// 简单任务不进入 Task，因此这里仅表达进入任务系统后的两类路径：
-/// - `ExecutionChain`：中等任务，启用任务链与可选 coordinator；
-/// - `LongMission`：复杂任务，额外启用 Mission/Plan/Validation/Checkpoint/HumanCheckpoint。
+/// 任务系统的内部运行形态。长期工作由 Session Goal 持续推进，进入任务调度的
+/// 内容统一使用 ExecutionChain，避免目标与旧治理链形成双重生命周期。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskTier {
     ExecutionChain,
-    LongMission,
 }
 
 fn default_task_tier() -> TaskTier {
@@ -308,10 +534,10 @@ fn normalized_str_ref(value: Option<&str>) -> Option<&str> {
         Some(trimmed)
     }
 }
-// --- TaskProjection (view contract)
+// --- AgentRunProjection (view contract)
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct TaskProjection {
+pub struct AgentRunProjection {
     pub root_task: Task,
     pub tasks: Vec<Task>,
     pub running_tasks: Vec<TaskId>,
@@ -378,5 +604,37 @@ mod tests {
             public_task_output_refs(TaskStatus::Completed, &output_refs),
             output_refs
         );
+    }
+
+    #[test]
+    fn agent_spawn_intent_respects_negation_and_nested_worker_constraint() {
+        assert!(!text_requires_agent_spawn(
+            "请执行 sleep 2，完成后只回复标记，不要创建子代理。"
+        ));
+        assert!(text_prohibits_agent_spawn(
+            "请执行 sleep 2，完成后只回复标记，不要创建子代理。"
+        ));
+        assert!(text_prohibits_agent_spawn("直接执行，不创建子代理。"));
+        assert!(!text_requires_agent_spawn(
+            "do not use agents; run the command directly"
+        ));
+        assert!(text_requires_agent_spawn(
+            "请启动两个子代理并行检查；子代理不能创建更多子代理。"
+        ));
+        assert!(!text_prohibits_agent_spawn(
+            "请启动两个子代理并行检查；子代理不能创建更多子代理。"
+        ));
+        assert!(text_requires_agent_spawn(
+            "必须分别调用 agent_spawn 创建两个子代理并等待结果。"
+        ));
+        assert!(!text_requires_agent_spawn(
+            "请说明主模型和代理的职责边界，以及什么时候应该使用代理。"
+        ));
+        assert!(!text_requires_agent_spawn(
+            "请解释 agent_spawn 的参数和使用场景。"
+        ));
+        assert!(!text_requires_agent_spawn(
+            "how to use agents effectively in a coding task?"
+        ));
     }
 }

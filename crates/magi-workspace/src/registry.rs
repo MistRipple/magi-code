@@ -1151,7 +1151,7 @@ mod tests {
             snapshot.snapshot_id,
             "recovery-public-recovery",
             Some(
-                "resume failed at /Users/xie/.magi/recovery.json with Bearer abcdef and sk-secret"
+                "resume failed at /Users/xie/.magi/recovery.json with Bearer abcdef and sk-secret-token"
                     .to_string(),
             ),
         );
@@ -1179,7 +1179,7 @@ mod tests {
             assert!(public_summary.contains("sk-[redacted]"));
             assert!(!public_summary.contains("/Users/xie"));
             assert!(!public_summary.contains("abcdef"));
-            assert!(!public_summary.contains("sk-secret"));
+            assert!(!public_summary.contains("sk-secret-token"));
         }
     }
 

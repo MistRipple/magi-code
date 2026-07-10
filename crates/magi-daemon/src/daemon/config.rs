@@ -8,8 +8,6 @@ pub struct DaemonConfig {
     pub port: u16,
     pub service_name: String,
     pub state_root: PathBuf,
-    pub bootstrap_workspace_root: PathBuf,
-    pub bootstrap_worktree_root: PathBuf,
     pub open_browser: bool,
 }
 
@@ -25,8 +23,6 @@ impl DaemonConfig {
             host: host.into(),
             port,
             service_name: service_name.into(),
-            bootstrap_workspace_root: state_root.join("bootstrap/workspace"),
-            bootstrap_worktree_root: state_root.join("bootstrap/worktrees/test-worktree-001"),
             state_root,
             open_browser: false,
         }

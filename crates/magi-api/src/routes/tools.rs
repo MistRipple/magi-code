@@ -180,7 +180,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["tool"], "tool_catalog");
         assert_eq!(body["status"], "succeeded");
-        assert_eq!(body["builtinTotal"], 35);
+        assert_eq!(body["builtinTotal"], 32);
         assert_eq!(body["externalCatalogStatus"], "unavailable");
         assert_eq!(body["agentRoleCatalogStatus"], "unavailable");
         assert_eq!(

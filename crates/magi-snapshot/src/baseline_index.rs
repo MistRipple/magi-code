@@ -114,6 +114,7 @@ mod tests {
             size: 12,
             mime: None,
             blob_hash: Some("deadbeef".into()),
+            content_hash: Some("deadbeef".into()),
             mtime_ms: Some(0),
             symlink: None,
             error: None,

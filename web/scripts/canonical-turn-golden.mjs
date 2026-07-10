@@ -106,6 +106,7 @@ function runGoldenReplay(reducer, projection, messagesStore, dataHandlers, timel
   assertBootstrapFiltersForeignWorkspaceSessions(contract);
   assertBootstrapExplicitWorkspaceWinsOverForeignCurrentSession(contract);
   assertMessagesStoreClearsLocalPendingFromAuthoritativeIdle(messagesStore);
+  assertSessionSwitchClearsExecutionState(messagesStore);
   assertCanonicalTurnModelRejectsSnakeCase(canonicalProtocol);
 }
 
@@ -1237,6 +1238,56 @@ function assertMessagesStoreClearsLocalPendingFromAuthoritativeIdle(messagesStor
     messagesStore.messagesState.pendingRequests.has('request-binding-clear'),
     false,
     'clearing a request binding must also clear its pending request',
+  );
+
+  messagesStore.setCurrentSessionId(null);
+}
+
+function assertSessionSwitchClearsExecutionState(messagesStore) {
+  messagesStore.messagesState.currentWorkspaceId = 'workspace-golden-session-switch';
+  messagesStore.messagesState.currentWorkspacePath = '/tmp/workspace-golden-session-switch';
+  messagesStore.setCurrentSessionId('session-golden-running-a');
+  messagesStore.clearAllMessages({
+    persist: false,
+    resetTimelineView: true,
+    resetPanelState: true,
+    skipAntiLiftBack: true,
+  });
+  messagesStore.messagesState.backendProcessing = true;
+  messagesStore.messagesState.activeMessageIds = new Set(['assistant-running-a']);
+  messagesStore.messagesState.thinkingStartAt = 12_000;
+  messagesStore.addPendingRequest('request-running-a');
+  assert.equal(
+    messagesStore.messagesState.isProcessing,
+    true,
+    'session switch repro starts with a running source session',
+  );
+
+  messagesStore.setCurrentSessionId('session-golden-draft-b');
+  assert.equal(
+    messagesStore.messagesState.backendProcessing,
+    false,
+    'switching session must clear source-session backend processing',
+  );
+  assert.equal(
+    messagesStore.messagesState.pendingRequests.size,
+    0,
+    'switching session must clear source-session pending requests',
+  );
+  assert.equal(
+    messagesStore.messagesState.activeMessageIds.size,
+    0,
+    'switching session must clear source-session active messages',
+  );
+  assert.equal(
+    messagesStore.messagesState.thinkingStartAt,
+    null,
+    'switching session must clear source-session thinking timer',
+  );
+  assert.equal(
+    messagesStore.messagesState.isProcessing,
+    false,
+    'draft target session must not inherit the source session running state',
   );
 
   messagesStore.setCurrentSessionId(null);

@@ -423,7 +423,7 @@
     wasActive = active;
   });
 
-  // 外部触发的消息定位（例如：任务面板点击历史计划，穿透定位到对应对话轮次）
+  // 外部触发的消息定位（例如：目标面板点击历史计划，穿透定位到对应对话轮次）
   $effect(() => {
     const jumpNonce = messagesState.messageJump.nonce;
     void jumpNonce;

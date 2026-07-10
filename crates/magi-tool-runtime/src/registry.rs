@@ -1,8 +1,9 @@
 use crate::{
     AgentRoleCatalogProvider, BuiltinTool, BuiltinToolAccessMode, BuiltinToolName, BuiltinToolSpec,
-    ExternalToolCatalogProvider, RuntimeCapabilityDependencyProvider, ToolExecutionContext,
-    ToolExecutionContextQuery, ToolExecutionInput, ToolExecutionOutput, ToolExecutionPolicy,
-    ToolExecutionSummary, ToolInvocationRecord, ToolRuntimeResources,
+    ExternalMcpToolExecutor, ExternalToolCatalogProvider, ExternalToolCatalogSnapshot,
+    RuntimeCapabilityDependencyProvider, ToolExecutionContext, ToolExecutionContextQuery,
+    ToolExecutionInput, ToolExecutionOutput, ToolExecutionPolicy, ToolExecutionSummary,
+    ToolInvocationRecord, ToolRuntimeResources,
     builtin::{self, NormalizedBuiltinTool, infer_execution_status},
     is_public_builtin_tool_surface,
     policy::WriteProtectionClaim,
@@ -58,6 +59,33 @@ impl ToolRegistry {
     ) -> Self {
         self.runtime_resources.external_tool_catalog_provider = Some(provider);
         self
+    }
+
+    pub fn with_external_mcp_tool_executor(mut self, executor: ExternalMcpToolExecutor) -> Self {
+        self.runtime_resources.external_mcp_tool_executor = Some(executor);
+        self
+    }
+
+    pub fn external_tool_catalog_snapshot(&self) -> ExternalToolCatalogSnapshot {
+        self.runtime_resources
+            .external_tool_catalog_provider
+            .as_ref()
+            .map(|provider| provider())
+            .unwrap_or_default()
+    }
+
+    pub fn execute_external_mcp_tool(
+        &self,
+        model_tool_name: &str,
+        arguments: &str,
+    ) -> Option<(String, ExecutionResultStatus)> {
+        let executor = self.runtime_resources.external_mcp_tool_executor.as_ref()?;
+        let binding = self
+            .external_tool_catalog_snapshot()
+            .mcp_tools
+            .into_iter()
+            .find(|tool| tool.model_tool_name == model_tool_name)?;
+        Some(executor(&binding.server_id, &binding.tool_name, arguments))
     }
 
     pub fn with_agent_role_catalog_provider(mut self, provider: AgentRoleCatalogProvider) -> Self {

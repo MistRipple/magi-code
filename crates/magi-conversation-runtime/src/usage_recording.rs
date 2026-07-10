@@ -5,7 +5,7 @@
 use crate::model_config::{
     NormalizedModelConfig, configured_role_engine_model_config, resolve_orchestrator_model_config,
 };
-use magi_core::{EventId, MissionId, MissionLifecyclePhase, SessionId, UtcMillis, WorkspaceId};
+use magi_core::{EventId, MissionId, SessionId, UtcMillis, WorkspaceId};
 use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
 use magi_mission_metrics::{MissionMetricsStore, TurnUsage};
 use magi_orchestrator::task_worker_catalog::WorkerInfo;
@@ -169,6 +169,36 @@ pub fn publish_model_usage_record(
     );
 }
 
+pub fn account_active_goal_turn(
+    session_store: &SessionStore,
+    session_id: &SessionId,
+    usage: Option<&serde_json::Value>,
+    elapsed_seconds_delta: u64,
+) {
+    let Some(tokens) = usage_tokens_from_payload(usage) else {
+        return;
+    };
+    let Some(goal) = session_store.active_goal(session_id) else {
+        return;
+    };
+    let token_delta = tokens
+        .total_tokens
+        .unwrap_or_else(|| tokens.input_tokens.saturating_add(tokens.output_tokens));
+    if let Err(error) = session_store.account_goal_progress(
+        session_id,
+        &goal.goal_id,
+        token_delta,
+        elapsed_seconds_delta,
+    ) {
+        tracing::warn!(
+            error = %error,
+            session_id = %session_id,
+            goal_id = %goal.goal_id,
+            "Goal 记账失败，已跳过本轮用量"
+        );
+    }
+}
+
 fn current_turn_id(session_store: &SessionStore, session_id: &SessionId) -> Option<String> {
     session_store
         .runtime_sidecar(session_id)
@@ -182,14 +212,12 @@ fn current_turn_id(session_store: &SessionStore, session_id: &SessionId) -> Opti
 /// 累加到 mission-scoped `metrics.md` sidecar。设计上：
 /// - 与 `publish_model_usage_record` 共享 `usage_tokens_from_payload`，保证 token 口径一致；
 /// - 写入失败仅 `warn!`，不阻断主轮次（accounting 出错绝不影响对话）；
-/// - phase 由调用方按需传入，缺省 `None` 表示尚未判定。
 pub fn record_mission_turn(
     store: &MissionMetricsStore,
     mission_id: &MissionId,
     usage: Option<&serde_json::Value>,
     started_at: UtcMillis,
     finished_at: UtcMillis,
-    phase: Option<MissionLifecyclePhase>,
 ) {
     let Some(tokens) = usage_tokens_from_payload(usage) else {
         return;
@@ -199,7 +227,6 @@ pub fn record_mission_turn(
         completion_tokens: tokens.output_tokens,
         started_at,
         finished_at,
-        phase,
     };
     if let Err(error) = store.record_turn(mission_id, turn_usage) {
         tracing::warn!(?error, mission_id = %mission_id, "mission metrics 写入失败，已跳过本轮记账");
@@ -341,8 +368,9 @@ fn usage_bool_field(usage: &serde_json::Value, keys: &[&str]) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use magi_core::ThreadId;
     use magi_event_bus::InMemoryEventBus;
-    use magi_session_store::SessionStore;
+    use magi_session_store::{GoalStatus, SessionStore};
     use magi_usage_authority::UsageCallStatus;
     use serde_json::json;
 
@@ -356,6 +384,41 @@ mod tests {
         assert!(matches!(planning.role, UsageSourceRole::Orchestrator));
         assert!(matches!(planning.phase, UsagePhase::Planning));
         assert!(matches!(execution.phase, UsagePhase::Execution));
+    }
+
+    #[test]
+    fn account_active_goal_turn_uses_usage_payload_and_budget_limits_goal() {
+        let session_store = SessionStore::new();
+        let session_id = SessionId::new("session-goal-accounting");
+        session_store
+            .create_session(session_id.clone(), "goal accounting")
+            .expect("session should be creatable");
+        let goal = session_store
+            .create_goal(
+                session_id.clone(),
+                ThreadId::new("thread-goal-accounting"),
+                "完成目标记账",
+                Some(12),
+            )
+            .expect("goal should be creatable");
+
+        account_active_goal_turn(
+            &session_store,
+            &session_id,
+            Some(&json!({
+                "prompt_tokens": 5,
+                "completion_tokens": 8,
+            })),
+            2,
+        );
+
+        let updated = session_store
+            .current_goal(&session_id)
+            .expect("goal should remain readable");
+        assert_eq!(updated.goal_id, goal.goal_id);
+        assert_eq!(updated.tokens_used, 13);
+        assert_eq!(updated.time_used_seconds, 2);
+        assert_eq!(updated.status, GoalStatus::BudgetLimited);
     }
 
     #[test]

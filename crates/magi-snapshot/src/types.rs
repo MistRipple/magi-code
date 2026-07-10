@@ -32,7 +32,7 @@ pub enum ChangeKind {
     Renamed,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SymlinkInfo {
     pub target: String,
@@ -61,6 +61,8 @@ pub struct FileMeta {
     pub size: u64,
     pub mime: Option<String>,
     pub blob_hash: Option<String>,
+    #[serde(default)]
+    pub content_hash: Option<String>,
     pub mtime_ms: Option<u64>,
     pub symlink: Option<SymlinkInfo>,
     pub error: Option<String>,
@@ -97,6 +99,7 @@ pub struct PendingChange {
     pub size: u64,
     pub mime: Option<String>,
     pub error: Option<String>,
+    pub revertible: bool,
     pub symlink_target: Option<String>,
     /// 仅当 content_kind == Text 时才包含完整原文（来自 baseline blob）。
     pub original_content: Option<String>,

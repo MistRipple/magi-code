@@ -374,6 +374,14 @@ function installFetchStub() {
     if (parsed.pathname === '/api/workspaces' && Array.isArray(workspaceListPayload)) {
       return jsonResponse({ workspaces: workspaceListPayload });
     }
+    if (parsed.pathname === '/api/workspaces/sessions') {
+      const payload = bootstrapPayload();
+      return jsonResponse({
+        workspace: payload.workspace,
+        sessionId: payload.currentSession?.sessionId || '',
+        sessions: payload.sessions,
+      });
+    }
     if (parsed.pathname === '/api/settings/bootstrap') {
       return jsonResponse(settingsBootstrapPayload());
     }
@@ -706,6 +714,7 @@ await withGoldenViteServer(async (server) => {
     workspaceId: WORKSPACE_ID,
     workspacePath: WORKSPACE_PATH,
     sessionId: SESSION_ID,
+    goalMode: true,
     followUpMode: 'queue',
   });
   await waitFor(
@@ -716,6 +725,12 @@ await withGoldenViteServer(async (server) => {
   await waitFor(
     () => capturedTurnBodies.some((body) => body.requestId === 'request-queued-immediate-feedback'),
     'queued follow-up must submit after the active turn is idle',
+  );
+  const queuedGoalBody = capturedTurnBodies.find((body) => body.requestId === 'request-queued-immediate-feedback');
+  assert.equal(
+    queuedGoalBody.goalMode,
+    true,
+    'queued follow-up must preserve the structured goal mode flag',
   );
   assert.ok(
     findArtifactByRequestId(
@@ -831,6 +846,47 @@ await withGoldenViteServer(async (server) => {
     undefined,
     'pendingChanges must not derive workspace path from legacy snake_case fields',
   );
+
+  const editsBeforeLiveRefresh = structuredClone(messagesStore.messagesState.edits);
+  const currentChangesVersion = messagesStore.messagesState.appState?.pendingChangesStateVersion ?? 0;
+  const foreignRefreshApplied = messagesStore.applyPendingChangesProjection({
+    generatedAt: currentChangesVersion + 1,
+    sessionId: 'session-foreign-changes-refresh',
+    workspaceId: WORKSPACE_ID,
+    pendingChanges: [],
+    pendingChangesState: { status: 'ready', pendingCount: 0 },
+  });
+  assert.equal(foreignRefreshApplied, false, 'live changes refresh must reject a foreign session');
+  assert.equal(messagesStore.messagesState.edits.length, 2);
+
+  const liveRefreshApplied = messagesStore.applyPendingChangesProjection({
+    generatedAt: currentChangesVersion + 1,
+    sessionId: SESSION_ID,
+    workspaceId: WORKSPACE_ID,
+    pendingChanges: [{
+      sessionId: SESSION_ID,
+      workspaceId: WORKSPACE_ID,
+      workspacePath: WORKSPACE_PATH,
+      filePath: 'watcher-refresh.ts',
+      type: 'add',
+      additions: 1,
+      deletions: 0,
+      revertible: true,
+    }],
+    pendingChangesState: { status: 'ready', pendingCount: 1 },
+  });
+  assert.equal(liveRefreshApplied, true, 'live changes refresh must update the active session');
+  assert.deepEqual(
+    messagesStore.messagesState.edits.map((edit) => edit.filePath),
+    ['watcher-refresh.ts'],
+  );
+  messagesStore.applyPendingChangesProjection({
+    generatedAt: currentChangesVersion + 2,
+    sessionId: SESSION_ID,
+    workspaceId: WORKSPACE_ID,
+    pendingChanges: editsBeforeLiveRefresh,
+    pendingChangesState: { status: 'ready', pendingCount: editsBeforeLiveRefresh.length },
+  });
 
   const blockedMutation = deferred();
   const duplicateMutationBootstrap = deferred();
@@ -1120,6 +1176,29 @@ await withGoldenViteServer(async (server) => {
   } finally {
     console.warn = originalRaceWarn;
   }
+
+  const missingSessionId = 'session-bridge-explicitly-missing';
+  bridge.postMessage({
+    type: 'workspaceBindingChanged',
+    workspaceId: WORKSPACE_ID,
+    workspacePath: WORKSPACE_PATH,
+    sessionId: missingSessionId,
+  });
+  bootstrapInterceptors.push(() => new Response(
+    JSON.stringify({ message: `session 不存在: ${missingSessionId}` }),
+    { status: 404, headers: { 'content-type': 'application/json' } },
+  ));
+  bridge.postMessage({ type: 'requestState' });
+  await waitFor(
+    () => messagesStore.messagesState.currentWorkspaceId === WORKSPACE_ID
+      && !messagesStore.messagesState.currentSessionId,
+    'unknown explicit session bootstrap must keep workspace but clear the invalid session binding',
+  );
+  assert.equal(
+    window.location.href.includes('sessionId='),
+    false,
+    'unknown explicit session bootstrap must remove the invalid session from URL',
+  );
 
   workspaceListPayload = [];
   const staleEmptyBootstrap = deferred();

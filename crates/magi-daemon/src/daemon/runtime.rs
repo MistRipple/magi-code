@@ -1,9 +1,7 @@
 use super::{
-    bootstrap::bootstrap_state,
     config::{DaemonConfig, DaemonError},
     events::publish_ledger_status_event,
     maintenance::{RuntimeMaintenance, RuntimeMaintenanceConfig},
-    mission_recovery,
     persistence::{RuntimeSidecarPersistence, StateRepository},
 };
 use magi_api::{
@@ -14,8 +12,7 @@ use magi_api::{
 use magi_bridge_client::{
     BridgeBindingKind, BridgeClientError, BridgeDispatchRuntime, BridgeResponse, BridgeServerKind,
     BridgeTransport, HttpModelBridgeClient, HttpModelBridgeProtocol, JsonRpcMcpBridgeClient,
-    JsonRpcModelBridgeClient, JsonRpcStdioTransport, McpBridgeClient, McpToolCallRequest,
-    StdioMcpBridgeClient,
+    JsonRpcStdioTransport, McpBridgeClient, McpToolCallRequest, StdioMcpBridgeClient,
 };
 use magi_context_runtime::{
     ContextBudget, ContextRuntime, FileSummaryStore, ProjectRecentTurnStore, SharedContextPool,
@@ -25,19 +22,12 @@ use magi_conversation_runtime::{
         current_turn_status_is_terminal, publish_task_status_turn_item_for_active_sessions,
     },
     task_execution_dispatcher::LlmTaskDispatcher,
-    task_execution_registry::TaskExecutionPlan,
-    task_runner_bridge::{
-        EventBasedResultReceiver, TaskDispatchGateDecision, TaskOutcome, TaskResult,
-    },
+    task_runner_bridge::{EventBasedResultReceiver, TaskOutcome, TaskResult},
 };
-use magi_core::{
-    EventId, ExecutionOwnership, LeaseId, SessionId, TaskStatus, TaskTier, UtcMillis,
-    WorkspaceRootPath,
-};
+use magi_core::{EventId, ExecutionOwnership, LeaseId, SessionId, TaskStatus, UtcMillis};
 use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
 use magi_governance::GovernanceService;
 use magi_knowledge_store::KnowledgeStore;
-use magi_lifecycle_notice::{LifecycleNoticeRegistry, run_subscriber as run_lifecycle_subscriber};
 use magi_memory_store::MemoryStore;
 use magi_orchestrator::{ExecutionContextConfig, OrchestratorService, task_store::TaskStore};
 use magi_session_store::{SessionExecutionSidecarStatus, SessionRuntimeSidecar, SessionStore};
@@ -46,8 +36,9 @@ use magi_skill_runtime::SkillDispatchRuntime;
 use magi_snapshot::SnapshotManager;
 use magi_tool_runtime::{
     AgentRoleCatalogEntry, AgentRoleCatalogProvider, ExternalMcpServerCatalogEntry,
-    ExternalToolCatalogEntry, ExternalToolCatalogProvider, ExternalToolCatalogSnapshot,
-    ToolRegistry,
+    ExternalMcpToolCatalogEntry, ExternalMcpToolExecutor, ExternalToolCatalogEntry,
+    ExternalToolCatalogProvider, ExternalToolCatalogSnapshot, ToolRegistry,
+    external_mcp_model_tool_name,
 };
 use magi_worker_runtime::WorkerRuntime;
 use magi_workspace::WorkspaceStore;
@@ -105,21 +96,92 @@ fn build_external_tool_catalog_provider(
                 .then_with(|| left.binding_id.cmp(&right.binding_id))
         });
 
-        let settings_snapshot = settings_store.public_snapshot();
-        let mcp_servers = settings_snapshot
-            .get("mcpServers")
-            .and_then(serde_json::Value::as_array)
-            .map(|servers| {
-                servers
-                    .iter()
-                    .filter_map(|entry| external_mcp_server_catalog_entry(entry, &mcp_connections))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+        let mut mcp_servers = Vec::new();
+        let mut mcp_tools = Vec::new();
+        let settings_snapshot = settings_store.get_section("mcpServers");
+        for entry in settings_snapshot
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(magi_api::mcp_config::normalize_mcp_server_snapshot_entry)
+        {
+            if let Some((server, tools)) =
+                external_mcp_server_catalog_snapshot(&entry, &mcp_connections)
+            {
+                mcp_servers.push(server);
+                mcp_tools.extend(tools);
+            }
+        }
+        mcp_servers.sort_by(|left, right| left.server_id.cmp(&right.server_id));
+        mcp_tools.sort_by(|left, right| left.model_tool_name.cmp(&right.model_tool_name));
 
         ExternalToolCatalogSnapshot {
             skill_tools,
             mcp_servers,
+            mcp_tools,
+        }
+    })
+}
+
+fn build_external_mcp_tool_executor(
+    settings_store: Arc<SettingsStore>,
+    mcp_connections: Arc<RwLock<HashMap<String, Arc<StdioMcpBridgeClient>>>>,
+) -> ExternalMcpToolExecutor {
+    Arc::new(move |server_id, tool_name, arguments| {
+        let entry = settings_store
+            .get_section("mcpServers")
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(magi_api::mcp_config::normalize_mcp_server_snapshot_entry)
+            .find(|entry| mcp_entry_matches_target(entry, server_id));
+        let Some(entry) = entry else {
+            return (
+                serde_json::json!({
+                    "tool": external_mcp_model_tool_name(server_id, tool_name),
+                    "status": "failed",
+                    "error": "MCP 服务未配置或已移除",
+                })
+                .to_string(),
+                magi_core::ExecutionResultStatus::Failed,
+            );
+        };
+        let client = match mcp_client_for_settings_entry(&entry, &mcp_connections) {
+            Ok(client) => client,
+            Err(error) => {
+                return (
+                    serde_json::json!({
+                        "tool": external_mcp_model_tool_name(server_id, tool_name),
+                        "status": "failed",
+                        "error": error,
+                    })
+                    .to_string(),
+                    magi_core::ExecutionResultStatus::Failed,
+                );
+            }
+        };
+        match client.call_tool(McpToolCallRequest {
+            server_name: server_id.to_string(),
+            tool_name: tool_name.to_string(),
+            input: arguments.to_string(),
+        }) {
+            Ok(response) => (
+                response.payload,
+                if response.ok {
+                    magi_core::ExecutionResultStatus::Succeeded
+                } else {
+                    magi_core::ExecutionResultStatus::Failed
+                },
+            ),
+            Err(error) => (
+                serde_json::json!({
+                    "tool": external_mcp_model_tool_name(server_id, tool_name),
+                    "status": "failed",
+                    "error": error.to_string(),
+                })
+                .to_string(),
+                magi_core::ExecutionResultStatus::Failed,
+            ),
         }
     })
 }
@@ -195,10 +257,21 @@ fn external_binding_policy_labels(
     }
 }
 
+#[cfg(test)]
 fn external_mcp_server_catalog_entry(
     entry: &serde_json::Value,
     mcp_connections: &Arc<RwLock<HashMap<String, Arc<StdioMcpBridgeClient>>>>,
 ) -> Option<ExternalMcpServerCatalogEntry> {
+    external_mcp_server_catalog_snapshot(entry, mcp_connections).map(|(server, _)| server)
+}
+
+fn external_mcp_server_catalog_snapshot(
+    entry: &serde_json::Value,
+    mcp_connections: &Arc<RwLock<HashMap<String, Arc<StdioMcpBridgeClient>>>>,
+) -> Option<(
+    ExternalMcpServerCatalogEntry,
+    Vec<ExternalMcpToolCatalogEntry>,
+)> {
     let server_id = read_json_string(entry, &["id", "serverId", "name"])?;
     let name =
         read_json_string(entry, &["name", "serverName"]).unwrap_or_else(|| server_id.clone());
@@ -206,22 +279,15 @@ fn external_mcp_server_catalog_entry(
         .get("enabled")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(true);
-    let connected_client = {
-        let pool = mcp_connections
-            .read()
-            .expect("mcp connections read lock poisoned");
-        pool.get(&server_id).cloned()
-    };
-    let connected = enabled && connected_client.is_some();
-    let tool_count = if enabled {
-        entry
-            .get("toolCount")
-            .or_else(|| entry.get("tool_count"))
-            .and_then(serde_json::Value::as_u64)
-            .map(|count| count as usize)
-    } else {
-        None
-    };
+    let live_tools = enabled.then(|| {
+        mcp_client_for_settings_entry(entry, mcp_connections)
+            .and_then(|client| client.list_tools().map_err(|error| error.to_string()))
+    });
+    let connected = enabled && live_tools.as_ref().is_some_and(Result::is_ok);
+    let tool_count = live_tools
+        .as_ref()
+        .and_then(|result| result.as_ref().ok())
+        .map(Vec::len);
     let health = if !enabled {
         "disabled"
     } else if connected {
@@ -229,19 +295,73 @@ fn external_mcp_server_catalog_entry(
     } else {
         "disconnected"
     };
-    Some(ExternalMcpServerCatalogEntry {
-        server_id,
-        name,
-        enabled,
-        connected,
-        health: health.to_string(),
-        tool_count,
-        error: if enabled {
-            external_mcp_error_marker(entry)
-        } else {
-            None
+    let tools = live_tools
+        .as_ref()
+        .and_then(|result| result.as_ref().ok())
+        .into_iter()
+        .flatten()
+        .map(|tool| ExternalMcpToolCatalogEntry {
+            server_id: server_id.clone(),
+            server_name: name.clone(),
+            model_tool_name: external_mcp_model_tool_name(&server_id, &tool.name),
+            tool_name: tool.name.clone(),
+            description: tool.description.clone().unwrap_or_default(),
+            input_schema: tool
+                .input_schema
+                .clone()
+                .unwrap_or_else(|| serde_json::json!({ "type": "object", "properties": {} })),
+        })
+        .collect::<Vec<_>>();
+    Some((
+        ExternalMcpServerCatalogEntry {
+            server_id,
+            name,
+            enabled,
+            connected,
+            health: health.to_string(),
+            tool_count,
+            error: if enabled && live_tools.as_ref().is_some_and(Result::is_err) {
+                Some("mcp_connection_failed".to_string())
+            } else if enabled {
+                external_mcp_error_marker(entry)
+            } else {
+                None
+            },
         },
-    })
+        tools,
+    ))
+}
+
+fn mcp_client_for_settings_entry(
+    entry: &serde_json::Value,
+    mcp_connections: &Arc<RwLock<HashMap<String, Arc<StdioMcpBridgeClient>>>>,
+) -> Result<Arc<StdioMcpBridgeClient>, String> {
+    let server_id = mcp_server_entry_id(entry)
+        .map(str::to_string)
+        .ok_or_else(|| "MCP 服务缺少稳定 ID".to_string())?;
+    if !mcp_server_entry_enabled(entry) {
+        mcp_connections
+            .write()
+            .expect("mcp connections write lock poisoned")
+            .remove(&server_id);
+        return Err(format!("MCP server {server_id} is disabled"));
+    }
+    if let Some(client) = mcp_connections
+        .read()
+        .expect("mcp connections read lock poisoned")
+        .get(&server_id)
+        .cloned()
+    {
+        return Ok(client);
+    }
+    let config = build_mcp_config_from_entry(entry)
+        .ok_or_else(|| format!("MCP server {server_id} config is incomplete"))?;
+    let client = Arc::new(StdioMcpBridgeClient::new(config));
+    mcp_connections
+        .write()
+        .expect("mcp connections write lock poisoned")
+        .insert(server_id, client.clone());
+    Ok(client)
 }
 
 fn external_mcp_error_marker(entry: &serde_json::Value) -> Option<String> {
@@ -283,47 +403,11 @@ impl SettingsBackedMcpBridgeClient {
 
     fn client_for_entry(
         &self,
-        server_id: &str,
+        _server_id: &str,
         entry: &serde_json::Value,
     ) -> Result<Arc<StdioMcpBridgeClient>, BridgeClientError> {
-        if !mcp_server_entry_enabled(entry) {
-            self.remove_connection(server_id);
-            return Err(mcp_config_unavailable_error(format!(
-                "MCP server {server_id} is disabled"
-            )));
-        }
-        if let Some(client) = self.connected_client(server_id) {
-            return Ok(client);
-        }
-
-        let config = build_mcp_config_from_entry(entry).ok_or_else(|| {
-            mcp_config_unavailable_error(format!("MCP server {server_id} config is incomplete"))
-        })?;
-        let client = Arc::new(StdioMcpBridgeClient::new(config));
-        {
-            let mut pool = self
-                .mcp_connections
-                .write()
-                .expect("mcp connections write lock poisoned");
-            pool.insert(server_id.to_string(), client.clone());
-        }
-        Ok(client)
-    }
-
-    fn connected_client(&self, server_id: &str) -> Option<Arc<StdioMcpBridgeClient>> {
-        let pool = self
-            .mcp_connections
-            .read()
-            .expect("mcp connections read lock poisoned");
-        pool.get(server_id).cloned()
-    }
-
-    fn remove_connection(&self, server_id: &str) {
-        let mut pool = self
-            .mcp_connections
-            .write()
-            .expect("mcp connections write lock poisoned");
-        pool.remove(server_id);
+        mcp_client_for_settings_entry(entry, &self.mcp_connections)
+            .map_err(mcp_config_unavailable_error)
     }
 }
 
@@ -393,7 +477,8 @@ impl UnavailableBusinessModelBridgeClient {
             layer: magi_bridge_client::BridgeErrorLayer::RemoteBusiness,
             code: Some(-32004),
             message:
-                "业务模型桥未配置：请在设置面板「模型 · 主对话/编排模型」中填入 baseUrl / apiKey / model，\
+                "业务模型桥未配置：请在设置面板「模型 · 主对话/编排模型」中填入 baseUrl / apiKey，\
+                 并在会话输入区选择当前会话主模型，\
                  或退回到环境变量 MAGI_OPENAI_COMPAT_BASE_URL / MAGI_OPENAI_COMPAT_API_KEY / MAGI_OPENAI_COMPAT_MODEL 作为兜底。\
                  settings.json 的 auxiliary 段仅用于辅助模型（会话标题精修 / 知识抽取 / 会话记忆 / Prompt 增强），不参与业务派发。"
                     .to_string(),
@@ -491,7 +576,7 @@ impl magi_bridge_client::ModelBridgeClient for StaticTestModelBridgeClient {
         if let Some(payload) = classifier_payload_for_prompt(&request.prompt) {
             return Ok(magi_bridge_client::BridgeResponse { ok: true, payload });
         }
-        if request.prompt.contains("任务投影规划器") {
+        if request.prompt.contains("代理运行规划器") {
             return Ok(magi_bridge_client::BridgeResponse {
                 ok: true,
                 payload: serde_json::json!({
@@ -572,20 +657,7 @@ fn classifier_payload_for_prompt(prompt: &str) -> Option<String> {
     } else {
         "chat"
     };
-    let task_tier = if route == "task"
-        && (user_text.contains("复杂任务")
-            || user_text.contains("深度任务")
-            || user_text.contains("长期任务")
-            || user_text.contains("跨多轮")
-            || user_text.contains("多阶段")
-            || user_text.contains("可恢复")
-            || user_text.contains("人审")
-            || user_text.contains("审计"))
-    {
-        "long_mission"
-    } else {
-        "execution_chain"
-    };
+    let task_tier = "execution_chain";
     let arguments = serde_json::json!({
         "route": route,
         "taskTitle": (route == "task").then_some("模型判定任务"),
@@ -669,39 +741,12 @@ impl DaemonRuntime {
         );
 
         Self::restore_ledger(&state_repository, &event_bus)?;
-        Self::bootstrap_runtime_state(
-            config,
+        Self::persist_initial_runtime_state(
             &state_repository,
             &runtime_persistence,
             &session_store,
             &workspace_store,
         )?;
-        // 任务系统 §1.4 Phase B：bootstrap 完成后扫描所有 workspace 的可恢复
-        // Mission，把 Checkpoint 里的 recovery_ref 回灌到对应 session sidecar，并发布
-        // `mission.resumed.from_recovery` 事件。单个 mission 失败不影响其它恢复。
-        mission_recovery::recover_missions_at_bootstrap(
-            &config.state_root,
-            &session_store,
-            &workspace_store,
-            &event_bus,
-        );
-
-        // 引导阶段只为**活动** workspace 同步重建进程内检索引擎：检索引擎不持久化，
-        // 活动 workspace 是用户回到 daemon 后立即要查询的对象，必须在 restore 返回前就绪。
-        // 其余已注册 workspace 延后到首次通过 /api/knowledge 访问时懒重建
-        // （ensure_workspace_code_index），避免大工作区在启动期集中扫描造成服务卡死。
-        if let Some(active_workspace_id) = workspace_store.active_workspace_id() {
-            if let Some(active_workspace) = workspace_store
-                .workspaces()
-                .into_iter()
-                .find(|workspace| workspace.workspace_id == active_workspace_id)
-            {
-                let scan_root = PathBuf::from(active_workspace.root_path.as_str());
-                knowledge_store.build_workspace_index(&active_workspace_id, &scan_root);
-                let _ = state_repository.save_knowledge_state(&knowledge_store.export_state());
-            }
-        }
-
         let runtime_maintenance = RuntimeMaintenance::new(
             RuntimeMaintenanceConfig::default(),
             event_bus.clone(),
@@ -724,10 +769,152 @@ impl DaemonRuntime {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn restore_with_test_fixture(config: &DaemonConfig) -> Result<Self, DaemonError> {
+        let runtime = Self::restore(config)?;
+        if !runtime.workspace_store.is_empty() {
+            return Ok(runtime);
+        }
+
+        let session_id = SessionId::new("test-session-001");
+        let workspace_id = magi_core::WorkspaceId::new("test-workspace-001");
+        let workspace_root = config.state_root.join("test-workspace");
+        let worktree_root = config.state_root.join("test-worktrees/test-worktree-001");
+        std::fs::create_dir_all(&workspace_root)?;
+
+        runtime
+            .session_store
+            .create_session(session_id.clone(), "Runtime test session")
+            .map_err(|error| DaemonError::internal(format!("创建测试会话失败: {error}")))?;
+        runtime
+            .workspace_store
+            .register(
+                workspace_id.clone(),
+                magi_core::AbsolutePath::new(workspace_root.to_string_lossy().to_string()),
+            )
+            .map_err(|error| DaemonError::internal(format!("注册测试工作区失败: {error}")))?;
+        runtime
+            .workspace_store
+            .activate(&workspace_id)
+            .map_err(|error| DaemonError::internal(format!("激活测试工作区失败: {error}")))?;
+
+        let ownership = ExecutionOwnership {
+            session_id: Some(session_id.clone()),
+            workspace_id: Some(workspace_id.clone()),
+            execution_chain_ref: Some("test-execution-chain-001".to_string()),
+            ..ExecutionOwnership::default()
+        };
+        runtime
+            .workspace_store
+            .assign_worktree_root_for_execution(
+                &workspace_id,
+                ownership.clone(),
+                magi_core::AbsolutePath::new(worktree_root.to_string_lossy().to_string()),
+            )
+            .map_err(|error| DaemonError::internal(format!("分配测试 worktree 失败: {error}")))?;
+        let snapshot = runtime.workspace_store.append_execution_snapshot(
+            workspace_id.clone(),
+            ownership.clone(),
+            "snapshot-bootstrap",
+            "测试工作区初始快照",
+        );
+        let recovery = runtime.workspace_store.prepare_recovery_entry(
+            workspace_id,
+            ownership.clone(),
+            snapshot.snapshot_id,
+            "recovery-bootstrap",
+            Some("测试恢复入口".to_string()),
+        );
+        runtime
+            .session_store
+            .bind_execution_ownership(session_id.clone(), ownership);
+        runtime
+            .session_store
+            .attach_recovery_ref(&session_id, Some(recovery.recovery_id))
+            .map_err(|error| DaemonError::internal(format!("绑定测试恢复入口失败: {error}")))?;
+
+        let state_repository = StateRepository::new(config.state_root.clone());
+        let runtime_persistence = RuntimeSidecarPersistence::new(
+            state_repository.clone(),
+            runtime.session_store.clone(),
+            runtime.workspace_store.clone(),
+            runtime.worker_runtime.clone(),
+        );
+        Self::persist_initial_runtime_state(
+            &state_repository,
+            &runtime_persistence,
+            &runtime.session_store,
+            &runtime.workspace_store,
+        )?;
+        Ok(runtime)
+    }
+
     pub(crate) fn start_background_tasks(&self) {
         let runtime_maintenance = self.runtime_maintenance.clone();
         tokio::spawn(async move {
             runtime_maintenance.run_loop().await;
+        });
+
+        let Some(active_workspace_id) = self.workspace_store.active_workspace_id() else {
+            return;
+        };
+        let Some(active_workspace) = self
+            .workspace_store
+            .workspaces()
+            .into_iter()
+            .find(|workspace| workspace.workspace_id == active_workspace_id)
+        else {
+            return;
+        };
+        if !self
+            .knowledge_store
+            .begin_workspace_index_build(&active_workspace_id)
+        {
+            return;
+        }
+        let knowledge_store = self.knowledge_store.clone();
+        let state_repository = StateRepository::new(self.state_root.clone());
+        let scan_root = PathBuf::from(active_workspace.root_path.as_str());
+        tokio::spawn(async move {
+            let build_store = knowledge_store.clone();
+            let build_workspace_id = active_workspace_id.clone();
+            let build_result = tokio::task::spawn_blocking(move || {
+                build_store.build_workspace_index(&build_workspace_id, &scan_root)
+            })
+            .await;
+            let cancelled_before_persist =
+                knowledge_store.workspace_index_build_cancelled(&active_workspace_id);
+            match build_result {
+                Ok(_) => {
+                    if !cancelled_before_persist
+                        && let Err(error) =
+                            state_repository.save_knowledge_state(&knowledge_store.export_state())
+                    {
+                        warn!(
+                            workspace_id = %active_workspace_id,
+                            error = %error,
+                            "活动工作区代码索引持久化失败"
+                        );
+                    }
+                }
+                Err(error) => {
+                    warn!(
+                        workspace_id = %active_workspace_id,
+                        error = %error,
+                        "活动工作区代码索引后台构建任务失败"
+                    );
+                }
+            }
+            if knowledge_store.finish_workspace_index_build(&active_workspace_id)
+                && let Err(error) =
+                    state_repository.save_knowledge_state(&knowledge_store.export_state())
+            {
+                warn!(
+                    workspace_id = %active_workspace_id,
+                    error = %error,
+                    "已取消的活动工作区代码索引清理结果持久化失败"
+                );
+            }
         });
     }
 
@@ -776,6 +963,8 @@ impl DaemonRuntime {
             app_skill_runtime.clone(),
             mcp_connections.clone(),
         );
+        let external_mcp_tool_executor =
+            build_external_mcp_tool_executor(settings_store.clone(), mcp_connections.clone());
         let agent_role_catalog_provider =
             build_agent_role_catalog_provider(agent_role_registry.clone());
         let snapshot_manager = Arc::new(SnapshotManager::new());
@@ -797,6 +986,7 @@ impl DaemonRuntime {
         let mut tool_registry = ToolRegistry::new(self.governance.clone(), self.event_bus.clone())
             .with_knowledge_store(self.knowledge_store.clone())
             .with_external_tool_catalog_provider(external_tool_catalog_provider)
+            .with_external_mcp_tool_executor(external_mcp_tool_executor)
             .with_agent_role_catalog_provider(agent_role_catalog_provider)
             .with_runtime_capability_dependency_provider(runtime_capability_dependency_provider);
         tool_registry.register_default_builtins();
@@ -838,15 +1028,16 @@ impl DaemonRuntime {
                             bridge_env,
                         ))
                     } else {
-                        if !orchestrator_settings_is_configured(
-                            &settings_store.get_section("orchestrator"),
-                        ) {
-                            warn!(
-                                state_root = %self.state_root.display(),
-                                "业务模型桥未配置，已退化为本地 loopback（仅用于开发/测试，生产请配置主模型或 MAGI_OPENAI_COMPAT_BASE_URL）"
-                            );
-                        }
-                        Arc::new(JsonRpcModelBridgeClient::new(model_transport.clone()))
+                        warn!(
+                            state_root = %self.state_root.display(),
+                            orchestrator_configured = orchestrator_settings_is_configured(
+                                &settings_store.get_section("orchestrator"),
+                            ),
+                            "业务模型默认桥未配置真实 HTTP client；真实会话将优先解析会话/设置中的主模型配置，仍缺失时返回可操作配置错误。loopback-model 仅保留用于桥探测/冒烟，不参与业务流式对话"
+                        );
+                        Arc::new(UnavailableBusinessModelBridgeClient::new(
+                            self.state_root.clone(),
+                        ))
                     }
                 }
             };
@@ -1058,11 +1249,6 @@ impl DaemonRuntime {
             state.spawn_graph.clone(),
             self.state_root.clone(),
         );
-        let lifecycle_notice_registry = Arc::new(LifecycleNoticeRegistry::new());
-        tokio::spawn(run_lifecycle_subscriber(
-            lifecycle_notice_registry.clone(),
-            self.event_bus.clone(),
-        ));
         let llm_task_dispatcher = Arc::new(
             llm_task_dispatcher
                 .with_model_bridge_client(business_model_client.clone())
@@ -1077,14 +1263,9 @@ impl DaemonRuntime {
                 .with_skill_runtime(app_skill_runtime)
                 .with_snapshot_manager(state.snapshot_manager.clone())
                 .with_conversation_registry(state.conversation_registry.clone())
-                .with_agent_role_registry(state.agent_role_registry.clone())
-                .with_lifecycle_notices(lifecycle_notice_registry),
+                .with_agent_role_registry(state.agent_role_registry.clone()),
         );
         let session_turn_dispatcher = llm_task_dispatcher.clone();
-        let human_checkpoint_registry_for_dispatch_gate =
-            llm_task_dispatcher.human_checkpoint_registry();
-        let workspace_registry_for_dispatch_gate = state.workspace_registry.clone();
-        let task_execution_registry_for_dispatch_gate = state.task_execution_registry().clone();
         let runner_manager = RunnerManager::with_dispatcher_and_worker_catalog(
             Arc::clone(&task_store),
             Arc::new(move || state_for_task_workers.task_worker_catalog()),
@@ -1092,59 +1273,6 @@ impl DaemonRuntime {
             runner_result_receiver,
         )
         .with_agent_role_registry(state.agent_role_registry.clone())
-        .with_dispatch_gate(Arc::new(move |task| {
-            if !task
-                .policy_snapshot
-                .as_ref()
-                .is_some_and(|policy| policy.task_tier == TaskTier::LongMission)
-            {
-                return Ok(TaskDispatchGateDecision::Allow);
-            }
-            let workspace_id = match task_execution_registry_for_dispatch_gate.get(&task.task_id) {
-                Some(TaskExecutionPlan::Dispatch {
-                    workspace_id: Some(workspace_id),
-                    ..
-                }) => workspace_id,
-                Some(TaskExecutionPlan::Dispatch {
-                    workspace_id: None, ..
-                }) => {
-                    return Err(format!(
-                        "long mission task {} 缺少 workspace_id，无法检查 HumanCheckpoint",
-                        task.task_id
-                    ));
-                }
-                None => {
-                    return Err(format!(
-                        "long mission task {} 缺少执行计划，无法检查 HumanCheckpoint",
-                        task.task_id
-                    ));
-                }
-            };
-            let workspace_root = workspace_registry_for_dispatch_gate
-                .workspaces()
-                .into_iter()
-                .find(|workspace| workspace.workspace_id == workspace_id)
-                .map(|workspace| WorkspaceRootPath::new(workspace.root_path.as_str()))
-                .ok_or_else(|| {
-                    format!(
-                        "workspace {} 不存在，无法检查 HumanCheckpoint",
-                        workspace_id
-                    )
-                })?;
-            let store = human_checkpoint_registry_for_dispatch_gate
-                .get_or_open(&workspace_root)
-                .map_err(|error| format!("打开 HumanCheckpointStore 失败: {error}"))?;
-            if store
-                .has_pending(&task.mission_id)
-                .map_err(|error| format!("读取 HumanCheckpoint pending 状态失败: {error}"))?
-            {
-                return Ok(TaskDispatchGateDecision::Blocked(format!(
-                    "mission {} 存在 pending HumanCheckpoint，operator resolve 前禁止派发新任务",
-                    task.mission_id
-                )));
-            }
-            Ok(TaskDispatchGateDecision::Allow)
-        }))
         .with_checkpoint_path(task_store_checkpoint_path)
         .with_terminal_observer(move |root_task_id, session_id, status| {
             let Some(session_id) = session_id else {
@@ -1396,57 +1524,29 @@ impl DaemonRuntime {
         Ok(())
     }
 
-    fn bootstrap_runtime_state(
-        config: &DaemonConfig,
+    fn persist_initial_runtime_state(
         state_repository: &StateRepository,
         runtime_persistence: &RuntimeSidecarPersistence,
         session_store: &Arc<SessionStore>,
         workspace_store: &Arc<WorkspaceStore>,
     ) -> Result<(), DaemonError> {
-        bootstrap_state(
-            session_store,
-            workspace_store,
-            &config.bootstrap_workspace_root,
-            &config.bootstrap_worktree_root,
-        );
-        // 会话保存到各工作区的 .magi/sessions.json，不再写全局路径
         let durable = session_store.durable_state();
+        let (global_state, mut workspace_states) = durable.partition_by_workspace();
         for workspace in workspace_store.workspaces() {
             let root = std::path::PathBuf::from(workspace.root_path.as_str());
             let ws_id = workspace.workspace_id.to_string();
-            let ws_sessions: Vec<_> = durable
-                .sessions
-                .iter()
-                .filter(|s| s.workspace_id.as_deref() == Some(&ws_id))
-                .cloned()
-                .collect();
-            let session_ids = ws_sessions
-                .iter()
-                .map(|session| session.session_id.clone())
-                .collect::<HashSet<_>>();
-            let ws_state = magi_session_store::SessionDurableState {
-                sessions: ws_sessions,
-                current_session_id: durable.current_session_id.clone(),
-                timeline: durable
-                    .timeline
-                    .iter()
-                    .filter(|entry| session_ids.contains(&entry.session_id))
-                    .cloned()
-                    .collect(),
-                canonical_turns: durable
-                    .canonical_turns
-                    .iter()
-                    .filter(|turn| session_ids.contains(&turn.session_id))
-                    .cloned()
-                    .collect(),
-                notifications: durable
-                    .notifications
-                    .iter()
-                    .filter(|notification| session_ids.contains(&notification.session_id))
-                    .cloned()
-                    .collect(),
-            };
+            let ws_state = workspace_states.remove(&ws_id).unwrap_or_default();
             state_repository.save_workspace_session_state(&root, &ws_state)?;
+        }
+        if global_state.is_empty() {
+            let global_path = state_repository.session_durable_state_path();
+            match std::fs::remove_file(global_path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        } else {
+            state_repository.save_session_durable_state(&global_state)?;
         }
         state_repository.save_workspace_durable_state(&workspace_store.durable_state())?;
         runtime_persistence.flush_runtime_sidecars()?;
@@ -1508,9 +1608,7 @@ impl DaemonRuntime {
         };
         let mut section = serde_json::json!({
             "baseUrl": config.base_url,
-            "model": config.model,
-            "urlMode": "standard",
-            "reasoningEffort": "medium"
+            "urlMode": "standard"
         });
         if let Some(api_key) = config.api_key {
             section["apiKey"] = serde_json::Value::String(api_key);
@@ -1678,19 +1776,20 @@ fn task_matches_runtime_sidecar(sidecar: &SessionRuntimeSidecar, task: &magi_cor
 mod tests {
     use super::{
         DaemonRuntime, SettingsBackedMcpBridgeClient, build_agent_role_catalog_provider,
-        publish_task_status_changed_event,
+        external_mcp_server_catalog_entry, publish_task_status_changed_event,
     };
-    use crate::daemon::config::DaemonConfig;
+    use crate::daemon::{config::DaemonConfig, persistence::StateRepository};
     use axum::{
         body::{Body, to_bytes},
         http::{Request, StatusCode},
     };
     use magi_bridge_client::{
-        BridgeResponse, McpBridgeClient, McpServerConfig, McpToolCallRequest, StdioMcpBridgeClient,
+        BridgeClientError, BridgeResponse, McpBridgeClient, McpServerConfig, McpToolCallRequest,
+        ModelInvocationRequest, StdioMcpBridgeClient,
     };
     use magi_core::{
-        MissionId, SessionId, Task, TaskId, TaskKind, TaskRuntimePayload, TaskStatus, ThreadId,
-        UtcMillis, WorkerId, WorkspaceId,
+        AbsolutePath, MissionId, SessionId, Task, TaskId, TaskKind, TaskRuntimePayload, TaskStatus,
+        ThreadId, UtcMillis, WorkerId, WorkspaceId,
     };
     use magi_event_bus::AuditUsageLedgerSnapshot;
     use magi_orchestrator::task_store::TaskStore;
@@ -1699,6 +1798,7 @@ mod tests {
         ActiveExecutionTurn, SessionStore,
     };
     use magi_settings_store::SettingsStore;
+    use magi_workspace::WorkspaceStore;
     use serde_json::{Value, json};
     use std::{
         collections::{BTreeMap, HashMap},
@@ -1706,13 +1806,96 @@ mod tests {
         io::{Read, Write},
         net::{TcpListener, TcpStream},
         path::PathBuf,
-        sync::{Arc, Mutex, RwLock, mpsc},
+        sync::{Arc, Mutex, MutexGuard, RwLock, mpsc},
         thread::{self, JoinHandle},
         time::{Duration, Instant},
     };
     use tower::util::ServiceExt;
 
     const BACKGROUND_TEST_TIMEOUT: Duration = Duration::from_secs(30);
+    const OPENAI_COMPAT_ENV_KEYS: [&str; 3] = [
+        "MAGI_OPENAI_COMPAT_BASE_URL",
+        "MAGI_OPENAI_COMPAT_API_KEY",
+        "MAGI_OPENAI_COMPAT_MODEL",
+    ];
+    static OPENAI_COMPAT_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn external_mcp_catalog_uses_live_tool_list_instead_of_saved_count() {
+        let script = r#"
+while IFS= read -r line; do
+    method=$(echo "$line" | grep -o '"method":"[^"]*"' | head -1 | cut -d'"' -f4)
+    id=$(echo "$line" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+    case "$method" in
+        initialize)
+            printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"mock-mcp","version":"0.1.0"}}}\n' "$id"
+            ;;
+        notifications/initialized)
+            ;;
+        tools/list)
+            printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"repo.inspect","description":"Inspect repository","inputSchema":{"type":"object","properties":{}}}]}}\n' "$id"
+            ;;
+    esac
+done
+"#;
+        let client = Arc::new(StdioMcpBridgeClient::new(McpServerConfig::new(
+            "sh",
+            vec!["-c".to_string(), script.to_string()],
+        )));
+        let connections = Arc::new(RwLock::new(HashMap::from([(
+            "mock-mcp".to_string(),
+            client,
+        )])));
+
+        let entry = external_mcp_server_catalog_entry(
+            &json!({
+                "id": "mock-mcp",
+                "name": "Mock MCP",
+                "enabled": true,
+                "toolCount": 0
+            }),
+            &connections,
+        )
+        .expect("catalog entry should exist");
+
+        assert_eq!(entry.tool_count, Some(1));
+    }
+
+    struct OpenAiCompatEnvGuard {
+        saved: Vec<(&'static str, Option<String>)>,
+        _guard: MutexGuard<'static, ()>,
+    }
+
+    impl OpenAiCompatEnvGuard {
+        fn unset() -> Self {
+            let guard = OPENAI_COMPAT_ENV_LOCK
+                .lock()
+                .expect("openai compat env mutex should lock");
+            let saved = OPENAI_COMPAT_ENV_KEYS
+                .iter()
+                .map(|key| (*key, std::env::var(key).ok()))
+                .collect::<Vec<_>>();
+            for key in OPENAI_COMPAT_ENV_KEYS {
+                unsafe { std::env::remove_var(key) };
+            }
+            Self {
+                saved,
+                _guard: guard,
+            }
+        }
+    }
+
+    impl Drop for OpenAiCompatEnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in &self.saved {
+                if let Some(value) = value {
+                    unsafe { std::env::set_var(key, value) };
+                } else {
+                    unsafe { std::env::remove_var(key) };
+                }
+            }
+        }
+    }
 
     #[derive(Default)]
     struct RecordingMcpClient {
@@ -1742,6 +1925,46 @@ mod tests {
         ));
         fs::create_dir_all(&root).expect("temp state root should be creatable");
         root
+    }
+
+    fn test_workspace_root(config: &DaemonConfig) -> PathBuf {
+        config.state_root.join("test-workspace")
+    }
+
+    fn seed_registered_test_workspace(config: &DaemonConfig, session_id: Option<&str>) {
+        let workspace_root = test_workspace_root(config);
+        fs::create_dir_all(&workspace_root).expect("test workspace should be creatable");
+
+        let workspace_store = WorkspaceStore::new();
+        let workspace_id = WorkspaceId::new("test-workspace-001");
+        workspace_store
+            .register(
+                workspace_id.clone(),
+                AbsolutePath::new(workspace_root.to_string_lossy().to_string()),
+            )
+            .expect("test workspace should be registrable");
+        workspace_store
+            .activate(&workspace_id)
+            .expect("test workspace should be activatable");
+
+        let repository = StateRepository::new(config.state_root.clone());
+        repository
+            .save_workspace_durable_state(&workspace_store.durable_state())
+            .expect("test workspace state should persist");
+
+        if let Some(session_id) = session_id {
+            let session_store = SessionStore::new();
+            session_store
+                .create_session_for_workspace(
+                    SessionId::new(session_id),
+                    "runtime test session".to_string(),
+                    Some(workspace_id.to_string()),
+                )
+                .expect("test session should be creatable");
+            repository
+                .save_workspace_session_state(&workspace_root, &session_store.durable_state())
+                .expect("test session state should persist");
+        }
     }
 
     fn spawn_graph_restore_task(
@@ -1815,6 +2038,7 @@ mod tests {
                 category: "test".to_string(),
                 tags: Vec::new(),
             },
+            restrict_standard_tools: true,
             allowed_tools: Vec::new(),
             custom_tool_bindings: vec![magi_skill_runtime::CustomToolBinding {
                 binding_id: "catalog-binding".to_string(),
@@ -2071,17 +2295,34 @@ mod tests {
     async fn daemon_tools_catalog_route_exposes_runtime_catalog() {
         let state_root = temp_state_root("tools-catalog-route");
         let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
-        fs::create_dir_all(config.bootstrap_workspace_root.join("src"))
+        let workspace_root = test_workspace_root(&config);
+        fs::create_dir_all(workspace_root.join("src"))
             .expect("bootstrap workspace source directory should be creatable");
         fs::write(
-            config.bootstrap_workspace_root.join("src/lib.rs"),
+            workspace_root.join("src/lib.rs"),
             "pub fn tool_catalog_route_probe() -> bool { true }\n",
         )
         .expect("bootstrap workspace source file should be writable");
-        let runtime =
-            DaemonRuntime::restore(&config).expect("runtime restore should bootstrap state");
+        seed_registered_test_workspace(&config, Some("test-session-001"));
+        let runtime = DaemonRuntime::restore(&config).expect("runtime restore should load state");
+        let app = runtime.router("daemon-test".to_string());
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let _ =
+                    get_json(app.clone(), "/api/knowledge?workspaceId=test-workspace-001").await;
+                if runtime
+                    .knowledge_store
+                    .workspace_index_ready(&WorkspaceId::new("test-workspace-001"))
+                {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("tool catalog test workspace index should become ready");
         let catalog = get_json(
-            runtime.router("daemon-test".to_string()),
+            app,
             "/api/tools/catalog?workspaceId=test-workspace-001&sessionId=test-session-001&includeInternal=true&includeSchema=true",
         )
         .await;
@@ -2163,21 +2404,20 @@ mod tests {
     }
 
     #[test]
-    fn restore_bootstraps_empty_state_and_persists_runtime_files() {
+    fn restore_keeps_empty_state_and_persists_runtime_files() {
         let state_root = temp_state_root("bootstrap");
         let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root.clone());
-        let workspace_root = config.bootstrap_workspace_root.clone();
 
         let runtime =
-            DaemonRuntime::restore(&config).expect("runtime restore should bootstrap empty state");
+            DaemonRuntime::restore(&config).expect("runtime restore should keep empty state");
 
-        assert!(runtime.session_store.current_session().is_some());
-        assert_eq!(runtime.workspace_store.snapshots().len(), 1);
-        assert!(workspace_root.join(".magi").join("sessions.json").exists());
+        assert!(runtime.session_store.current_session().is_none());
+        assert!(runtime.workspace_store.workspaces().is_empty());
+        assert!(runtime.workspace_store.snapshots().is_empty());
         assert!(!state_root.join("sessions.json").exists());
         assert!(state_root.join("workspaces.json").exists());
-        assert!(state_root.join("session-sidecars.json").exists());
-        assert!(state_root.join("workspace-recovery-sidecars.json").exists());
+        assert!(!state_root.join("session-sidecars.json").exists());
+        assert!(!state_root.join("workspace-recovery-sidecars.json").exists());
         assert!(state_root.join("audit-usage-ledger.json").exists());
 
         let ledger = serde_json::from_slice::<AuditUsageLedgerSnapshot>(
@@ -2193,7 +2433,7 @@ mod tests {
     async fn knowledge_endpoint_returns_code_index_after_bootstrap_scan() {
         let state_root = temp_state_root("knowledge-code-index");
         let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root.clone());
-        let workspace_root = config.bootstrap_workspace_root.clone();
+        let workspace_root = test_workspace_root(&config);
 
         // 在引导工作区中创建模拟源文件，供代码扫描器发现
         fs::create_dir_all(workspace_root.join("src")).unwrap();
@@ -2213,10 +2453,25 @@ mod tests {
         )
         .unwrap();
 
+        seed_registered_test_workspace(&config, None);
         let runtime = DaemonRuntime::restore(&config)
-            .expect("runtime restore should bootstrap and scan code");
+            .expect("runtime restore should load the registered workspace");
 
-        // 验证知识存储中有代码索引摘要
+        let app = runtime.router("daemon-test".to_string());
+        let knowledge = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let knowledge =
+                    get_json(app.clone(), "/api/knowledge?workspaceId=test-workspace-001").await;
+                if knowledge["codeIndexStatus"]["status"] == "indexed" {
+                    return knowledge;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("knowledge endpoint should finish lazy index rebuild");
+
+        // 知识接口按需建立索引，完成后存储中应存在同一份摘要。
         let summary = runtime
             .knowledge_store
             .code_index_summary_for_workspace(&WorkspaceId::new("test-workspace-001"))
@@ -2234,9 +2489,6 @@ mod tests {
             "entry points should detect main.rs"
         );
 
-        // 通过 API 路由验证返回结构
-        let app = runtime.router("daemon-test".to_string());
-        let knowledge = get_json(app, "/api/knowledge?workspaceId=test-workspace-001").await;
         assert!(
             knowledge.get("codeIndex").is_some_and(|v| !v.is_null()),
             "API should return non-null codeIndex"
@@ -2327,11 +2579,22 @@ mod tests {
             .expect("workspace_code_index dependency should be exposed");
         assert_eq!(workspace_code_index["status"], "not_ready");
 
-        let knowledge = get_json(
-            restored.router("daemon-test".to_string()),
-            &format!("/api/knowledge?workspaceId={secondary_workspace_id}"),
-        )
-        .await;
+        let app = restored.router("daemon-test".to_string());
+        let knowledge = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let knowledge = get_json(
+                    app.clone(),
+                    &format!("/api/knowledge?workspaceId={secondary_workspace_id}"),
+                )
+                .await;
+                if knowledge["codeIndexStatus"]["status"] == "indexed" {
+                    return knowledge;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("knowledge endpoint should finish lazy index rebuild");
         assert_eq!(knowledge["codeIndexStatus"]["status"], "indexed");
         assert!(
             restored
@@ -2383,7 +2646,7 @@ mod tests {
         .expect("response should be valid json")
     }
 
-    async fn get_task_projection(
+    async fn get_agent_run_projection(
         app: axum::Router,
         root_task_id: &str,
         session_id: &str,
@@ -2392,13 +2655,13 @@ mod tests {
         get_json(
             app,
             &format!(
-                "/api/tasks/projection/{root_task_id}?workspaceId={workspace_id}&sessionId={session_id}"
+                "/api/agent-runs/projection/{root_task_id}?workspaceId={workspace_id}&sessionId={session_id}"
             ),
         )
         .await
     }
 
-    async fn wait_for_task_projection_completed(
+    async fn wait_for_agent_run_projection_completed(
         app: axum::Router,
         root_task_id: &str,
         session_id: &str,
@@ -2407,7 +2670,7 @@ mod tests {
         let deadline = Instant::now() + BACKGROUND_TEST_TIMEOUT;
         loop {
             let projection =
-                get_task_projection(app.clone(), root_task_id, session_id, workspace_id).await;
+                get_agent_run_projection(app.clone(), root_task_id, session_id, workspace_id).await;
             let total_tasks = projection["progress_summary"]["total_tasks"]
                 .as_u64()
                 .unwrap_or(0);
@@ -2454,7 +2717,7 @@ mod tests {
         }
     }
 
-    fn assert_completed_two_task_projection(projection: &Value) {
+    fn assert_completed_two_agent_run_projection(projection: &Value) {
         let total_tasks = projection["progress_summary"]["total_tasks"]
             .as_u64()
             .expect("total_tasks should serialize as integer");
@@ -2464,7 +2727,7 @@ mod tests {
         // ExecutionChain：单 worker 任务只产出 1 个 root task；coordinator 才会扩展为多任务。
         assert!(
             total_tasks >= 1,
-            "task projection should include the root task"
+            "agent run projection should include the root task"
         );
         assert_eq!(completed_tasks, total_tasks);
         assert_eq!(projection["progress_summary"]["failed_tasks"], 0);
@@ -2615,8 +2878,8 @@ mod tests {
     async fn router_session_action_auto_extraction_is_consumed_on_followup_dispatch() {
         let state_root = temp_state_root("router-session-action");
         let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
-        let runtime =
-            DaemonRuntime::restore(&config).expect("runtime restore should bootstrap empty state");
+        seed_registered_test_workspace(&config, None);
+        let runtime = DaemonRuntime::restore(&config).expect("runtime restore should load state");
         let (app, state) = runtime.router_with_state_for_tests("daemon-test".to_string());
         let active_workspace_id = state
             .workspace_registry
@@ -2673,14 +2936,14 @@ mod tests {
                 .len(),
             0
         );
-        let first_projection = wait_for_task_projection_completed(
+        let first_projection = wait_for_agent_run_projection_completed(
             app.clone(),
             first_root_task_id,
             "test-session-001",
             active_workspace_id.as_str(),
         )
         .await;
-        assert_completed_two_task_projection(&first_projection);
+        assert_completed_two_agent_run_projection(&first_projection);
 
         let (status, second_body) = post_json(
             app.clone(),
@@ -2719,22 +2982,22 @@ mod tests {
             second_execution_group["context_memory_extraction_refs"],
             json!([expected_extraction_id])
         );
-        let second_projection = wait_for_task_projection_completed(
+        let second_projection = wait_for_agent_run_projection_completed(
             app,
             second_root_task_id,
             "test-session-001",
             active_workspace_id.as_str(),
         )
         .await;
-        assert_completed_two_task_projection(&second_projection);
+        assert_completed_two_agent_run_projection(&second_projection);
     }
 
     #[tokio::test]
     async fn router_regular_session_turn_uses_daemon_session_turn_dispatcher() {
         let state_root = temp_state_root("router-regular-session-turn");
         let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
-        let runtime =
-            DaemonRuntime::restore(&config).expect("runtime restore should bootstrap empty state");
+        seed_registered_test_workspace(&config, None);
+        let runtime = DaemonRuntime::restore(&config).expect("runtime restore should load state");
         let (app, state) = runtime.router_with_state_for_tests("daemon-test".to_string());
         let active_workspace_id = state
             .workspace_registry
@@ -2792,7 +3055,7 @@ mod tests {
                         .as_array()
                         .expect("tasks should be an array")
                         .is_empty(),
-                    "regular chat turn must not create task projection"
+                    "regular chat turn must not create agent run projection"
                 );
                 break;
             }
@@ -2811,8 +3074,8 @@ mod tests {
     async fn router_recovery_resume_writeback_is_consumed_on_followup_dispatch() {
         let state_root = temp_state_root("router-recovery-resume");
         let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
-        let runtime =
-            DaemonRuntime::restore(&config).expect("runtime restore should bootstrap empty state");
+        seed_registered_test_workspace(&config, None);
+        let runtime = DaemonRuntime::restore(&config).expect("runtime restore should load state");
         let (app, state) = runtime.router_with_state_for_tests("daemon-test".to_string());
         let active_workspace_id = state
             .workspace_registry
@@ -2970,8 +3233,8 @@ mod tests {
 
         let state_root = temp_state_root("router-bridge-services");
         let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
-        let runtime =
-            DaemonRuntime::restore(&config).expect("runtime restore should bootstrap empty state");
+        let runtime = DaemonRuntime::restore_with_test_fixture(&config)
+            .expect("runtime restore should load explicit test fixture");
         let app = runtime.router("daemon-test".to_string());
 
         let snapshot = get_json(app, "/bridges/services").await;
@@ -3016,6 +3279,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn daemon_business_model_without_real_config_reports_configuration_error() {
+        let _env = OpenAiCompatEnvGuard::unset();
+        let state_root = temp_state_root("business-model-unavailable");
+        let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
+        let runtime = DaemonRuntime::restore_with_test_fixture(&config)
+            .expect("runtime restore should load explicit test fixture");
+        let (_app, state) =
+            runtime.router_with_bridge_env_for_tests("daemon-test".to_string(), &[]);
+        let client = state
+            .model_bridge_client()
+            .expect("daemon should always wire a business model client");
+
+        let err = client
+            .invoke_streaming(
+                ModelInvocationRequest {
+                    provider: "magi-business-model".to_string(),
+                    prompt: "hello".to_string(),
+                    messages: None,
+                    tools: None,
+                    tool_choice: None,
+                },
+                &|_| {},
+            )
+            .expect_err("unconfigured business model should fail before JSON-RPC loopback");
+
+        let BridgeClientError::CallFailed { layer, message, .. } = err else {
+            panic!("unexpected business model error shape: {err:?}");
+        };
+        assert_eq!(layer, magi_bridge_client::BridgeErrorLayer::RemoteBusiness);
+        assert!(
+            message.contains("业务模型桥未配置"),
+            "error should guide model configuration, got: {message}"
+        );
+        assert!(
+            !message.contains("JsonRpcModelBridgeClient"),
+            "business chat must not surface JSON-RPC loopback streaming errors: {message}"
+        );
+    }
+
+    #[tokio::test]
     async fn daemon_router_bridge_preflight_executes_loopback_model_and_mcp_smokes() {
         for binary_name in ["model_bridge_loopback", "mcp_bridge_loopback"] {
             let path = test_bridge_binary_path(binary_name);
@@ -3028,8 +3331,8 @@ mod tests {
 
         let state_root = temp_state_root("router-bridge-preflight");
         let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
-        let runtime =
-            DaemonRuntime::restore(&config).expect("runtime restore should bootstrap empty state");
+        let runtime = DaemonRuntime::restore_with_test_fixture(&config)
+            .expect("runtime restore should load explicit test fixture");
         let app = runtime.router("daemon-test".to_string());
         let services_snapshot = get_json(app.clone(), "/bridges/services").await;
 
@@ -3115,8 +3418,8 @@ mod tests {
 
         let state_root = temp_state_root("router-bridge-cutover");
         let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
-        let runtime =
-            DaemonRuntime::restore(&config).expect("runtime restore should bootstrap empty state");
+        let runtime = DaemonRuntime::restore_with_test_fixture(&config)
+            .expect("runtime restore should load explicit test fixture");
         let app = runtime.router("daemon-test".to_string());
         let services_snapshot = get_json(app.clone(), "/bridges/services").await;
         let snapshot = get_json(app, "/bridges/cutover-smoke").await;
@@ -3375,8 +3678,8 @@ mod tests {
 
         let state_root = temp_state_root("router-bridge-cutover-env");
         let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
-        let runtime =
-            DaemonRuntime::restore(&config).expect("runtime restore should bootstrap empty state");
+        let runtime = DaemonRuntime::restore_with_test_fixture(&config)
+            .expect("runtime restore should load explicit test fixture");
         let (app, _) = runtime.router_with_bridge_env_for_tests(
             "daemon-test".to_string(),
             &[
@@ -3462,8 +3765,8 @@ mod tests {
     async fn daemon_router_settings_bootstrap_exposes_env_seeded_orchestrator_config() {
         let state_root = temp_state_root("router-settings-bootstrap-env-model");
         let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
-        let runtime =
-            DaemonRuntime::restore(&config).expect("runtime restore should bootstrap empty state");
+        let runtime = DaemonRuntime::restore_with_test_fixture(&config)
+            .expect("runtime restore should load explicit test fixture");
         let (app, state) = runtime.router_with_bridge_env_for_tests(
             "daemon-test".to_string(),
             &[
@@ -3480,11 +3783,17 @@ mod tests {
             json!("http://127.0.0.1:8317/v1")
         );
         assert_eq!(bootstrap["orchestratorConfig"]["apiKey"], json!("test-key"));
-        assert_eq!(bootstrap["orchestratorConfig"]["model"], json!("gpt-test"));
-        assert_eq!(
-            state.settings_store.get_section("orchestrator")["model"],
-            json!("gpt-test"),
-            "环境模型必须在启动期进入 settings store，避免前端另走一条配置读取链路"
+        assert!(
+            bootstrap["orchestratorConfig"].get("model").is_none(),
+            "全局主模型设置只暴露连接配置，具体模型归会话级选择"
+        );
+        assert!(
+            state
+                .settings_store
+                .get_section("orchestrator")
+                .get("model")
+                .is_none(),
+            "环境变量模型只用于直连桥兜底，不得写入全局设置"
         );
     }
 
@@ -3513,8 +3822,8 @@ mod tests {
 
         let state_root = temp_state_root("router-bridge-cutover-env-failure");
         let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
-        let runtime =
-            DaemonRuntime::restore(&config).expect("runtime restore should bootstrap empty state");
+        let runtime = DaemonRuntime::restore_with_test_fixture(&config)
+            .expect("runtime restore should load explicit test fixture");
         let (app, _) = runtime.router_with_bridge_env_for_tests(
             "daemon-test".to_string(),
             &[
@@ -3628,8 +3937,8 @@ mod tests {
 
         let state_root = temp_state_root("router-bridge-cutover-env-degraded-provider");
         let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
-        let runtime =
-            DaemonRuntime::restore(&config).expect("runtime restore should bootstrap empty state");
+        let runtime = DaemonRuntime::restore_with_test_fixture(&config)
+            .expect("runtime restore should load explicit test fixture");
         let (app, _) = runtime.router_with_bridge_env_for_tests(
             "daemon-test".to_string(),
             &[
@@ -3736,8 +4045,8 @@ mod tests {
 
         let state_root = temp_state_root("router-bridge-cutover-env-invalid-response");
         let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
-        let runtime =
-            DaemonRuntime::restore(&config).expect("runtime restore should bootstrap empty state");
+        let runtime = DaemonRuntime::restore_with_test_fixture(&config)
+            .expect("runtime restore should load explicit test fixture");
         let (app, _) = runtime.router_with_bridge_env_for_tests(
             "daemon-test".to_string(),
             &[
@@ -3861,8 +4170,8 @@ mod tests {
 
         let state_root = temp_state_root("router-bridge-cutover-env-fallback-only");
         let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
-        let runtime =
-            DaemonRuntime::restore(&config).expect("runtime restore should bootstrap empty state");
+        let runtime = DaemonRuntime::restore_with_test_fixture(&config)
+            .expect("runtime restore should load explicit test fixture");
         let (app, _) = runtime.router_with_bridge_env_for_tests(
             "daemon-test".to_string(),
             &[
@@ -3981,8 +4290,8 @@ mod tests {
 
         let state_root = temp_state_root("router-bridge-cutover-env-unavailable");
         let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
-        let runtime =
-            DaemonRuntime::restore(&config).expect("runtime restore should bootstrap empty state");
+        let runtime = DaemonRuntime::restore_with_test_fixture(&config)
+            .expect("runtime restore should load explicit test fixture");
         let (app, _) = runtime.router_with_bridge_env_for_tests(
             "daemon-test".to_string(),
             &[
@@ -4093,8 +4402,8 @@ mod tests {
 
         let state_root = temp_state_root("router-bridge-cutover-env-transport-failure");
         let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
-        let runtime =
-            DaemonRuntime::restore(&config).expect("runtime restore should bootstrap empty state");
+        let runtime = DaemonRuntime::restore_with_test_fixture(&config)
+            .expect("runtime restore should load explicit test fixture");
         let (app, _) = runtime.router_with_bridge_env_for_tests(
             "daemon-test".to_string(),
             &[
@@ -4189,8 +4498,8 @@ mod tests {
     async fn daemon_router_bridge_routes_do_not_touch_execution_state() {
         let state_root = temp_state_root("router-bridge-guard");
         let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
-        let runtime =
-            DaemonRuntime::restore(&config).expect("runtime restore should bootstrap empty state");
+        let runtime = DaemonRuntime::restore_with_test_fixture(&config)
+            .expect("runtime restore should load explicit test fixture");
         let (app, state) = runtime.router_with_state_for_tests("daemon-test".to_string());
 
         let before_runtime_read_model = serde_json::to_value(state.runtime_read_model_dto())
@@ -4244,8 +4553,8 @@ mod tests {
 
         let state_root = temp_state_root("router-bootstrap-bridges");
         let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
-        let runtime =
-            DaemonRuntime::restore(&config).expect("runtime restore should bootstrap empty state");
+        let runtime = DaemonRuntime::restore_with_test_fixture(&config)
+            .expect("runtime restore should load explicit test fixture");
         let app = runtime.router("daemon-test".to_string());
 
         let bootstrap = get_json(app.clone(), "/bootstrap").await;

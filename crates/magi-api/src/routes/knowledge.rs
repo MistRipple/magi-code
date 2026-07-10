@@ -22,6 +22,7 @@ use crate::{errors::ApiError, state::ApiState};
 pub fn routes() -> Router<ApiState> {
     Router::new()
         .route("/knowledge", get(get_project_knowledge))
+        .route("/knowledge/reindex", post(reindex_knowledge))
         .route("/knowledge/clear", post(clear_knowledge))
         .route(
             "/knowledge/items",
@@ -294,7 +295,7 @@ async fn get_project_knowledge(
         query.workspace_id.as_deref(),
         query.workspace_path.as_deref(),
     )?;
-    let scan_outcome = ensure_workspace_code_index(&state, &workspace_id).await?;
+    let index_load_state = ensure_workspace_code_index(&state, &workspace_id)?;
 
     let kq = KnowledgeQuery {
         kind: None,
@@ -314,7 +315,7 @@ async fn get_project_knowledge(
     let code_index_summary = state
         .knowledge_store
         .code_index_summary_for_workspace(&workspace_id);
-    let code_index_status = code_index_status_json(code_index_summary.as_ref(), &scan_outcome);
+    let code_index_status = code_index_status_json(code_index_summary.as_ref(), &index_load_state);
     let code_index = code_index_summary
         .map(|summary| {
             serde_json::json!({
@@ -338,10 +339,15 @@ async fn get_project_knowledge(
     })))
 }
 
-async fn ensure_workspace_code_index(
+enum WorkspaceCodeIndexLoadState {
+    Ready(CodeIndexScanOutcome),
+    Indexing,
+}
+
+fn ensure_workspace_code_index(
     state: &ApiState,
     workspace_id: &WorkspaceId,
-) -> Result<CodeIndexScanOutcome, ApiError> {
+) -> Result<WorkspaceCodeIndexLoadState, ApiError> {
     let Some(workspace) = state
         .workspace_registry
         .workspaces()
@@ -352,50 +358,128 @@ async fn ensure_workspace_code_index(
     };
     let workspace_root = PathBuf::from(workspace.root_path.as_str());
 
-    let had_index_summary = state
-        .knowledge_store
-        .code_index_summary_for_workspace(workspace_id)
-        .is_some_and(|summary| !summary.files.is_empty());
-    let workspace_root_available = workspace_root_scan_failure(&workspace_root).is_none();
-    if workspace_root_available
-        && had_index_summary
-        && state.knowledge_store.workspace_index_ready(workspace_id)
-    {
-        return Ok(CodeIndexScanOutcome::indexed_existing());
+    if workspace_root_scan_failure(&workspace_root).is_some() {
+        let outcome = state
+            .knowledge_store
+            .build_workspace_index(workspace_id, &workspace_root);
+        state.persist_knowledge_state_for_api()?;
+        return Ok(WorkspaceCodeIndexLoadState::Ready(outcome));
+    }
+    if state.knowledge_store.workspace_index_building(workspace_id) {
+        return Ok(WorkspaceCodeIndexLoadState::Indexing);
+    }
+    if state.knowledge_store.workspace_index_ready(workspace_id) {
+        return Ok(WorkspaceCodeIndexLoadState::Ready(
+            CodeIndexScanOutcome::indexed_existing(),
+        ));
+    }
+    if let Some(outcome) = state.knowledge_store.workspace_index_outcome(workspace_id) {
+        return Ok(WorkspaceCodeIndexLoadState::Ready(outcome));
     }
 
-    // 索引缺失时在 spawn_blocking 中构建，避免阻塞 tokio async runtime。
-    let state_clone = state.clone();
-    let workspace_id_clone = workspace_id.clone();
-    let outcome = tokio::task::spawn_blocking(move || {
-        state_clone
-            .knowledge_store
-            .build_workspace_index(&workspace_id_clone, &workspace_root)
-    })
-    .await
-    .map_err(|e| ApiError::internal_assembly("代码索引构建任务失败", e))?;
-    state.persist_knowledge_state_for_api()?;
-    if had_index_summary && outcome.summary.is_some() {
-        Ok(CodeIndexScanOutcome::indexed_existing())
-    } else {
-        Ok(outcome)
-    }
+    schedule_workspace_code_index(state.clone(), workspace_id.clone(), workspace_root);
+    Ok(WorkspaceCodeIndexLoadState::Indexing)
 }
 
 fn code_index_status_json(
     summary: Option<&CodeIndexSummary>,
-    scan_outcome: &CodeIndexScanOutcome,
+    load_state: &WorkspaceCodeIndexLoadState,
 ) -> serde_json::Value {
+    if matches!(load_state, WorkspaceCodeIndexLoadState::Indexing) {
+        return serde_json::json!({
+            "status": "indexing",
+            "reasonCode": serde_json::Value::Null,
+        });
+    }
     if summary.is_some_and(|summary| !summary.files.is_empty()) {
         return serde_json::json!({
             "status": CodeIndexScanStatus::Indexed.as_str(),
             "reasonCode": serde_json::Value::Null,
         });
     }
+    let WorkspaceCodeIndexLoadState::Ready(scan_outcome) = load_state else {
+        unreachable!("indexing state should return before scan outcome projection")
+    };
     serde_json::json!({
         "status": scan_outcome.status.as_str(),
         "reasonCode": scan_outcome.reason_code.as_ref().map(|reason| reason.as_str()),
     })
+}
+
+pub(crate) fn schedule_workspace_code_index(
+    state: ApiState,
+    workspace_id: WorkspaceId,
+    workspace_root: PathBuf,
+) -> bool {
+    if !state
+        .knowledge_store
+        .begin_workspace_index_build(&workspace_id)
+    {
+        return false;
+    }
+
+    tokio::spawn(async move {
+        let build_state = state.clone();
+        let build_workspace_id = workspace_id.clone();
+        let build_result = tokio::task::spawn_blocking(move || {
+            build_state
+                .knowledge_store
+                .build_workspace_index(&build_workspace_id, &workspace_root)
+        })
+        .await;
+        let cancelled_before_persist = state
+            .knowledge_store
+            .workspace_index_build_cancelled(&workspace_id);
+        match build_result {
+            Ok(_) => {
+                if !cancelled_before_persist && let Err(error) = state.persist_knowledge_state() {
+                    tracing::warn!(
+                        workspace_id = %workspace_id,
+                        error = ?error,
+                        "后台代码索引持久化失败"
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    workspace_id = %workspace_id,
+                    error = %error,
+                    "后台代码索引构建任务失败"
+                );
+            }
+        }
+        if state
+            .knowledge_store
+            .finish_workspace_index_build(&workspace_id)
+            && let Err(error) = state.persist_knowledge_state()
+        {
+            tracing::warn!(
+                workspace_id = %workspace_id,
+                error = ?error,
+                "已取消的后台代码索引清理结果持久化失败"
+            );
+        }
+    });
+    true
+}
+
+async fn reindex_knowledge(
+    State(state): State<ApiState>,
+    Json(request): Json<KnowledgeWorkspaceRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (workspace_id, workspace_path) = require_registered_workspace_binding(
+        &state,
+        request.workspace_id.as_deref(),
+        request.workspace_path.as_deref(),
+    )?;
+    let scheduled =
+        schedule_workspace_code_index(state, workspace_id.clone(), PathBuf::from(&workspace_path));
+    Ok(Json(serde_json::json!({
+        "accepted": scheduled,
+        "workspaceId": workspace_id.as_str(),
+        "workspacePath": workspace_path,
+        "status": "indexing",
+    })))
 }
 
 #[derive(Debug, Deserialize)]
@@ -663,6 +747,16 @@ mod tests {
         );
     }
 
+    async fn wait_for_index_build(state: &ApiState, workspace_id: &WorkspaceId) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while state.knowledge_store.workspace_index_building(workspace_id) {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("background code index build should finish");
+    }
+
     #[test]
     fn new_knowledge_id_keeps_same_millisecond_writes_unique() {
         let first = new_knowledge_id("learning");
@@ -844,7 +938,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn project_knowledge_lazily_indexes_registered_workspace_when_missing() {
+    async fn project_knowledge_schedules_missing_index_without_blocking_response() {
         let state = state_with_knowledge_store(KnowledgeStore::new());
         let workspace_id = WorkspaceId::new("workspace-lazy-index");
         let root =
@@ -872,21 +966,33 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         let payload = read_json(response).await;
-        let files = payload["codeIndex"]["files"]
-            .as_array()
-            .expect("code index files should exist");
+        assert!(payload["codeIndex"].is_null());
+        assert_eq!(payload["codeIndexStatus"]["status"], "indexing");
 
+        wait_for_index_build(&state, &workspace_id).await;
+        assert!(state.knowledge_store.workspace_index_ready(&workspace_id));
+
+        let ready_response = routes()
+            .with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/knowledge?workspaceId=workspace-lazy-index")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("ready route should respond");
+        let ready_payload = read_json(ready_response).await;
+        let files = ready_payload["codeIndex"]["files"]
+            .as_array()
+            .expect("code index files should exist after background build");
         assert!(
             files
                 .iter()
                 .any(|file| file["path"].as_str() == Some("src/main.rs")),
-            "knowledge endpoint should index the requested registered workspace"
+            "background index should include the workspace source file"
         );
-        assert_eq!(payload["codeIndexStatus"]["status"], "indexed");
-        assert!(
-            state.knowledge_store.workspace_index_ready(&workspace_id),
-            "knowledge endpoint should keep the local search engine aligned with the code index summary"
-        );
+        assert_eq!(ready_payload["codeIndexStatus"]["status"], "indexed");
     }
 
     #[tokio::test]
@@ -920,7 +1026,21 @@ mod tests {
 
         assert_eq!(first_response.status(), StatusCode::OK);
         let first_payload = read_json(first_response).await;
-        assert_eq!(first_payload["codeIndexStatus"]["status"], "indexed");
+        assert_eq!(first_payload["codeIndexStatus"]["status"], "indexing");
+        wait_for_index_build(&state, &workspace_id).await;
+
+        let ready_response = routes()
+            .with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/knowledge?workspaceId=workspace-stale-ready-index")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("ready route should respond");
+        let ready_payload = read_json(ready_response).await;
+        assert_eq!(ready_payload["codeIndexStatus"]["status"], "indexed");
         assert!(
             state.knowledge_store.workspace_index_ready(&workspace_id),
             "initial request should build a ready runtime index"
@@ -989,6 +1109,21 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         let payload = read_json(response).await;
+
+        assert_eq!(payload["codeIndexStatus"]["status"], "indexing");
+        wait_for_index_build(&state, &workspace_id).await;
+
+        let settled_response = routes()
+            .with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/knowledge?workspaceId=workspace-empty-index")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("settled route should respond");
+        let payload = read_json(settled_response).await;
 
         assert!(payload["codeIndex"].is_null());
         assert_eq!(payload["codeIndexStatus"]["status"], "empty");

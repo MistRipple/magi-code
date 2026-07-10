@@ -971,7 +971,6 @@ dependencies = [
  "magi-governance",
  "magi-knowledge-store",
  "magi-memory-store",
- "magi-mission",
  "magi-mission-metrics",
  "magi-orchestrator",
  "magi-safety-gate",
@@ -980,8 +979,10 @@ dependencies = [
  "magi-skill-runtime",
  "magi-snapshot",
  "magi-spawn-graph",
+ "magi-todo-ledger",
  "magi-tool-runtime",
  "magi-usage-authority",
+ "magi-worker-runtime",
  "magi-workspace",
  "reqwest",
  "serde",
@@ -1010,19 +1011,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "magi-checkpoint"
-version = "3.0.0"
-dependencies = [
- "magi-core",
- "magi-event-bus",
- "magi-mission-artifact",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
-]
-
-[[package]]
 name = "magi-context-runtime"
 version = "3.0.0"
 dependencies = [
@@ -1041,22 +1029,15 @@ dependencies = [
  "insta",
  "magi-agent-role",
  "magi-bridge-client",
- "magi-checkpoint",
  "magi-context-runtime",
  "magi-core",
  "magi-event-bus",
  "magi-governance",
- "magi-human-checkpoint",
- "magi-knowledge-graph",
  "magi-knowledge-store",
- "magi-lifecycle-notice",
  "magi-memory-store",
- "magi-mission-charter",
  "magi-mission-metrics",
- "magi-mission-workspace",
  "magi-orchestrator",
  "magi-permissions",
- "magi-plan",
  "magi-project-memory",
  "magi-safety-gate",
  "magi-session-store",
@@ -1067,7 +1048,6 @@ dependencies = [
  "magi-todo-ledger",
  "magi-tool-runtime",
  "magi-usage-authority",
- "magi-validation-runner",
  "magi-worker-runtime",
  "magi-workspace",
  "serde",
@@ -1095,19 +1075,14 @@ dependencies = [
  "magi-agent-role",
  "magi-api",
  "magi-bridge-client",
- "magi-checkpoint",
  "magi-context-runtime",
  "magi-conversation-runtime",
  "magi-core",
  "magi-event-bus",
  "magi-governance",
  "magi-knowledge-store",
- "magi-lifecycle-notice",
  "magi-memory-store",
- "magi-mission",
- "magi-mission-charter",
  "magi-orchestrator",
- "magi-plan",
  "magi-session-store",
  "magi-settings-store",
  "magi-skill-runtime",
@@ -1159,32 +1134,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "magi-human-checkpoint"
-version = "3.0.0"
-dependencies = [
- "magi-core",
- "magi-event-bus",
- "magi-mission-artifact",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
-]
-
-[[package]]
-name = "magi-knowledge-graph"
-version = "3.0.0"
-dependencies = [
- "magi-core",
- "magi-event-bus",
- "magi-mission-artifact",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
-]
-
-[[package]]
 name = "magi-knowledge-store"
 version = "3.0.0"
 dependencies = [
@@ -1205,18 +1154,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "magi-lifecycle-notice"
-version = "3.0.0"
-dependencies = [
- "magi-core",
- "magi-event-bus",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "magi-memory-store"
 version = "3.0.0"
 dependencies = [
@@ -1225,55 +1162,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "magi-mission"
-version = "3.0.0"
-dependencies = [
- "magi-checkpoint",
- "magi-core",
- "magi-human-checkpoint",
- "magi-knowledge-graph",
- "magi-mission-charter",
- "magi-mission-metrics",
- "magi-mission-workspace",
- "magi-plan",
- "magi-validation-runner",
- "tempfile",
- "thiserror",
-]
-
-[[package]]
-name = "magi-mission-artifact"
-version = "3.0.0"
-dependencies = [
- "magi-core",
-]
-
-[[package]]
-name = "magi-mission-charter"
-version = "3.0.0"
-dependencies = [
- "magi-core",
- "magi-event-bus",
- "magi-human-checkpoint",
- "magi-mission-artifact",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
-]
-
-[[package]]
 name = "magi-mission-metrics"
-version = "3.0.0"
-dependencies = [
- "magi-core",
- "serde",
- "tempfile",
- "thiserror",
-]
-
-[[package]]
-name = "magi-mission-workspace"
 version = "3.0.0"
 dependencies = [
  "magi-core",
@@ -1310,20 +1199,6 @@ dependencies = [
  "magi-core",
  "serde",
  "serde_json",
-]
-
-[[package]]
-name = "magi-plan"
-version = "3.0.0"
-dependencies = [
- "magi-core",
- "magi-event-bus",
- "magi-mission-artifact",
- "magi-validation-runner",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
 ]
 
 [[package]]
@@ -1418,6 +1293,7 @@ version = "3.0.0"
 dependencies = [
  "magi-core",
  "magi-event-bus",
+ "magi-session-store",
  "serde",
  "serde_json",
  "thiserror",
@@ -1449,19 +1325,6 @@ dependencies = [
  "serde",
  "sha2",
  "url",
-]
-
-[[package]]
-name = "magi-validation-runner"
-version = "3.0.0"
-dependencies = [
- "magi-core",
- "magi-event-bus",
- "magi-mission-artifact",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
 ]
 
 [[package]]

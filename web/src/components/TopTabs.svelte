@@ -1,48 +1,21 @@
 <script lang="ts">
   import { i18n } from '../stores/i18n.svelte';
   import { messagesState } from '../stores/messages.svelte';
-  import { getTaskProjectionState } from '../stores/task-projection-store.svelte';
   import { ensureArray } from '../lib/utils';
 
   interface Props {
-    activeTopTab: 'thread' | 'tasks' | 'edits' | 'knowledge';
-    onTabChange: (tab: 'thread' | 'tasks' | 'edits' | 'knowledge') => void;
+    activeTopTab: 'thread' | 'edits' | 'knowledge';
+    onTabChange: (tab: 'thread' | 'edits' | 'knowledge') => void;
   }
 
   let { activeTopTab, onTabChange }: Props = $props();
 
-  const currentSessionId = $derived(messagesState.currentSessionId);
-  const currentWorkspaceId = $derived(messagesState.currentWorkspaceId);
-  const taskProjection = $derived(getTaskProjectionState(currentSessionId, currentWorkspaceId));
-
-  // 任务和变更的徽章数量
-  const tasksBadge = $derived.by(() => {
-    const projection = taskProjection.projection;
-    return projection?.progress_summary?.total_tasks ?? 0;
-  });
-  // 失败任务优先级高于总数显示。
-  const attentionCount = $derived.by(() => {
-    const projection = taskProjection.projection;
-    if (!projection) return 0;
-    const ids = new Set<string>(projection.failed_tasks ?? []);
-    return ids.size;
-  });
   const editsBadge = $derived(ensureArray(messagesState.edits).length);
 </script>
 
 <div class="tab-bar tab-bar--top">
   <button class="tab-item" class:active={activeTopTab === 'thread'} onclick={() => onTabChange('thread')}>
     {i18n.t('topTabs.thread')}
-  </button>
-  <button class="tab-item" class:active={activeTopTab === 'tasks'} onclick={() => onTabChange('tasks')}>
-    {i18n.t('topTabs.tasks')}
-    {#if attentionCount > 0}
-      <span class="badge badge--warning" title={i18n.t('topTabs.attentionTitle', { count: attentionCount })}>
-        {attentionCount}
-      </span>
-    {:else if tasksBadge > 0}
-      <span class="badge {activeTopTab === 'tasks' ? 'badge--primary' : 'badge--muted'}">{tasksBadge}</span>
-    {/if}
   </button>
   <button class="tab-item" class:active={activeTopTab === 'edits'} onclick={() => onTabChange('edits')}>
     {i18n.t('topTabs.edits')}
@@ -100,11 +73,6 @@
   .badge--primary {
     background: var(--primary);
     color: var(--primary-foreground);
-  }
-
-  .badge--warning {
-    background: var(--warning, #f59e0b);
-    color: #fff;
   }
 
   @media (max-width: 768px) {

@@ -6,7 +6,10 @@ use crate::types::{
 };
 use ignore::{WalkBuilder, gitignore::Gitignore};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
+
+use sha2::{Digest, Sha256};
 
 /// 默认黑名单：非 git workspace 时强制排除的目录。
 const DEFAULT_EXCLUDES: &[&str] = &[
@@ -97,6 +100,7 @@ pub fn read_file_meta(
                 size: 0,
                 mime: None,
                 blob_hash: None,
+                content_hash: None,
                 mtime_ms: None,
                 symlink: None,
                 error: Some(format!("symlink_metadata failed: {e}")),
@@ -115,6 +119,7 @@ pub fn read_file_meta(
             size: lstat.len(),
             mime: None,
             blob_hash: None,
+            content_hash: None,
             mtime_ms: mtime_ms(&lstat),
             symlink: Some(SymlinkInfo {
                 target,
@@ -131,6 +136,7 @@ pub fn read_file_meta(
             size: lstat.len(),
             mime: None,
             blob_hash: None,
+            content_hash: None,
             mtime_ms: mtime_ms(&lstat),
             symlink: None,
             error: None,
@@ -149,6 +155,7 @@ pub fn read_file_meta(
                 size,
                 mime: guess_mime(abs_path),
                 blob_hash: None,
+                content_hash: Some(hash_file(abs_path)?),
                 mtime_ms: mtime_ms(&lstat),
                 symlink: None,
                 error: None,
@@ -163,6 +170,7 @@ pub fn read_file_meta(
                     size,
                     mime: guess_mime(abs_path),
                     blob_hash: None,
+                    content_hash: None,
                     mtime_ms: mtime_ms(&lstat),
                     symlink: None,
                     error: Some(format!("read failed: {e}")),
@@ -175,6 +183,7 @@ pub fn read_file_meta(
             content_kind: ContentKind::Binary,
             size,
             mime: guess_mime(abs_path),
+            content_hash: Some(hash.clone()),
             blob_hash: Some(hash),
             mtime_ms: mtime_ms(&lstat),
             symlink: None,
@@ -190,6 +199,7 @@ pub fn read_file_meta(
             size,
             mime: guess_mime(abs_path),
             blob_hash: None,
+            content_hash: Some(hash_file(abs_path)?),
             mtime_ms: mtime_ms(&lstat),
             symlink: None,
             error: None,
@@ -204,6 +214,7 @@ pub fn read_file_meta(
                 size,
                 mime: guess_mime(abs_path),
                 blob_hash: None,
+                content_hash: None,
                 mtime_ms: mtime_ms(&lstat),
                 symlink: None,
                 error: Some(format!("read failed: {e}")),
@@ -216,11 +227,33 @@ pub fn read_file_meta(
         content_kind: ContentKind::Text,
         size,
         mime: guess_mime(abs_path),
+        content_hash: Some(hash.clone()),
         blob_hash: Some(hash),
         mtime_ms: mtime_ms(&lstat),
         symlink: None,
         error: None,
     })
+}
+
+pub(crate) fn hash_file(path: &Path) -> SnapshotResult<String> {
+    let mut file = fs::File::open(path).map_err(|error| SnapshotError::io(path, error))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| SnapshotError::io(path, error))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let digest = hasher.finalize();
+    let mut output = String::with_capacity(32);
+    for byte in &digest[..16] {
+        output.push_str(&format!("{byte:02x}"));
+    }
+    Ok(output)
 }
 
 /// 读取大文件头/尾摘要（每端 64 KB），用于 LargeText 前端展示。
@@ -427,7 +460,7 @@ fn symlink_target_kind(abs_path: &Path) -> SymlinkTargetKind {
     }
 }
 
-fn mtime_ms(metadata: &std::fs::Metadata) -> Option<u64> {
+pub(crate) fn mtime_ms(metadata: &std::fs::Metadata) -> Option<u64> {
     metadata
         .modified()
         .ok()

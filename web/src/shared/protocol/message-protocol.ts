@@ -66,8 +66,8 @@ export enum ControlMessageType {
 }
 
 export type NotifyLevel = 'info' | 'success' | 'warning' | 'error';
-export type NotifyDisplayMode = 'auto' | 'toast' | 'notification_center' | 'silent';
-export type NotifyCategory = 'incident' | 'audit' | 'feedback';
+export type NotifyDisplayMode = 'auto' | 'toast' | 'silent';
+export type NotifyCategory = 'incident' | 'feedback';
 
 /**
  * 数据消息类型
@@ -106,8 +106,8 @@ export type DataMessageType =
   | 'sessionBootstrapLoaded'
   | 'sessionTurnAccepted'
   | 'sessionTurnCanonicalEventUpdated'
-  | 'sessionNotificationsLoaded'
-  | 'sessionNotificationsStatus'
+  | 'notificationsLoaded'
+  | 'notificationsStatus'
   | 'sessionsUpdated'
   | 'skillInstalled'
   | 'skillInstallFailed'
@@ -293,8 +293,6 @@ export interface NotifyPresentation {
   category?: NotifyCategory;
   source?: string;
   actionRequired?: boolean;
-  persistToCenter?: boolean;
-  countUnread?: boolean;
   title?: string;
 }
 

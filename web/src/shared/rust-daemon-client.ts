@@ -13,10 +13,13 @@ import type {
   BootstrapDto,
   BridgePreflightSnapshotDto,
   BridgeServicesSnapshotDto,
-  ClearNotificationsRequestDto,
+  NotificationContextRequestDto,
   ConnectionTestResponseDto,
+  CurrentGoalResponseDto,
+  GoalActionRequestDto,
+  GoalMutationResponseDto,
+  GoalUpdateRequestDto,
   DeletedResponseDto,
-  DeliveryPackageDto,
   DiffResponseDto,
   EngineIdRequestDto,
   EnginesResponseDto,
@@ -54,10 +57,9 @@ import type {
   SessionContinueResponseDto,
   SessionCloseRequestDto,
   SessionDeleteRequestDto,
-  SessionTaskHistoryResponseDto,
   SessionInterruptRequestDto,
   SessionInterruptResponseDto,
-  SessionNotificationsResponseDto,
+  NotificationsResponseDto,
   SessionRenameRequestDto,
   SessionStatsResponseDto,
   SessionTurnRequestDto,
@@ -68,9 +70,8 @@ import type {
   SkillsLibraryResponseDto,
   SkillUpdateResponseDto,
   TaskArchiveResponseDto,
-  TaskDto,
   TaskInterruptResponseDto,
-  TaskProjectionDto,
+  AgentRunProjectionDto,
   TaskRestartResponseDto,
   UpdatedResponseDto,
   VersionHandshakeDto,
@@ -144,22 +145,22 @@ export class RustDaemonClient {
     return this.postJson<SessionInterruptResponseDto>('/api/session/interrupt', request);
   }
 
-  public async interruptTask(
+  public async interruptAgentRun(
     request: unknown,
   ): Promise<TaskInterruptResponseDto> {
-    return this.postJson<TaskInterruptResponseDto>('/api/task/interrupt', request);
+    return this.postJson<TaskInterruptResponseDto>('/api/agent-runs/interrupt', request);
   }
 
-  public async restartTask(
+  public async restartAgentRun(
     request: unknown,
   ): Promise<TaskRestartResponseDto> {
-    return this.postJson<TaskRestartResponseDto>('/api/task/restart', request);
+    return this.postJson<TaskRestartResponseDto>('/api/agent-runs/restart', request);
   }
 
-  public async archiveTask(
+  public async archiveAgentRun(
     request: unknown,
   ): Promise<TaskArchiveResponseDto> {
-    return this.postJson<TaskArchiveResponseDto>('/api/task/archive', request);
+    return this.postJson<TaskArchiveResponseDto>('/api/agent-runs/archive', request);
   }
 
   // ─── Session management ───────────────────────────────────────────
@@ -183,43 +184,52 @@ export class RustDaemonClient {
   }
 
   public async fetchNotifications(
-    sessionId: string,
     workspaceId: string,
     workspacePath?: string,
-  ): Promise<SessionNotificationsResponseDto> {
+    sessionId?: string,
+  ): Promise<NotificationsResponseDto> {
     const params = new URLSearchParams();
     params.set('workspaceId', workspaceId);
     if (workspacePath) params.set('workspacePath', workspacePath);
-    params.set('sessionId', sessionId);
+    if (sessionId) params.set('sessionId', sessionId);
     const query = params.toString();
-    return this.getJson<SessionNotificationsResponseDto>(
-      `/api/session/notifications${query ? `?${query}` : ''}`,
+    return this.getJson<NotificationsResponseDto>(
+      `/api/notifications${query ? `?${query}` : ''}`,
     );
   }
 
   public async markAllNotificationsRead(
-    request: ClearNotificationsRequestDto,
-  ): Promise<SessionNotificationsResponseDto> {
-    return this.postJson<SessionNotificationsResponseDto>(
-      '/api/session/notifications/mark-all-read',
+    request: NotificationContextRequestDto,
+  ): Promise<NotificationsResponseDto> {
+    return this.postJson<NotificationsResponseDto>(
+      '/api/notifications/mark-all-read',
       request,
     );
   }
 
   public async clearNotifications(
-    request: ClearNotificationsRequestDto,
-  ): Promise<SessionNotificationsResponseDto> {
-    return this.postJson<SessionNotificationsResponseDto>(
-      '/api/session/notifications/clear',
+    request: NotificationContextRequestDto,
+  ): Promise<NotificationsResponseDto> {
+    return this.postJson<NotificationsResponseDto>(
+      '/api/notifications/clear',
       request,
     );
   }
 
   public async removeNotification(
     request: RemoveNotificationRequestDto,
-  ): Promise<SessionNotificationsResponseDto> {
-    return this.postJson<SessionNotificationsResponseDto>(
-      '/api/session/notifications/remove',
+  ): Promise<NotificationsResponseDto> {
+    return this.postJson<NotificationsResponseDto>(
+      '/api/notifications/remove',
+      request,
+    );
+  }
+
+  public async resolveNotification(
+    request: RemoveNotificationRequestDto,
+  ): Promise<NotificationsResponseDto> {
+    return this.postJson<NotificationsResponseDto>(
+      '/api/notifications/resolve',
       request,
     );
   }
@@ -533,68 +543,58 @@ export class RustDaemonClient {
     );
   }
 
-  // ─── Task Projection ───────────────────────────────────────────────
+  // ─── Goal / Agent Run Projection ───────────────────────────────────
 
-  public async getTaskProjection(
+  public async getCurrentGoal(
+    sessionId: string,
+    workspaceId?: string,
+    workspacePath?: string,
+  ): Promise<CurrentGoalResponseDto> {
+    const query = new URLSearchParams();
+    query.set('sessionId', sessionId);
+    if (workspaceId) query.set('workspaceId', workspaceId);
+    if (workspacePath) query.set('workspacePath', workspacePath);
+    return this.getJson<CurrentGoalResponseDto>(
+      `/api/goals/current?${query.toString()}`,
+    );
+  }
+
+  public async updateCurrentGoal(
+    request: GoalUpdateRequestDto,
+  ): Promise<GoalMutationResponseDto> {
+    return this.postJson<GoalMutationResponseDto>('/api/goals/current/update', request);
+  }
+
+  public async pauseCurrentGoal(
+    request: GoalActionRequestDto,
+  ): Promise<GoalMutationResponseDto> {
+    return this.postJson<GoalMutationResponseDto>('/api/goals/current/pause', request);
+  }
+
+  public async resumeCurrentGoal(
+    request: GoalActionRequestDto,
+  ): Promise<GoalMutationResponseDto> {
+    return this.postJson<GoalMutationResponseDto>('/api/goals/current/resume', request);
+  }
+
+  public async clearCurrentGoal(
+    request: GoalActionRequestDto,
+  ): Promise<GoalMutationResponseDto> {
+    return this.postJson<GoalMutationResponseDto>('/api/goals/current/clear', request);
+  }
+
+  public async getAgentRunProjection(
     rootTaskId: string,
     sessionId: string,
     workspaceId?: string,
     workspacePath?: string,
-  ): Promise<TaskProjectionDto> {
+  ): Promise<AgentRunProjectionDto> {
     const query = new URLSearchParams();
     query.set('sessionId', sessionId);
     if (workspaceId) query.set('workspaceId', workspaceId);
     if (workspacePath) query.set('workspacePath', workspacePath);
-    return this.getJson<TaskProjectionDto>(
-      `/api/tasks/projection/${encodeURIComponent(rootTaskId)}?${query.toString()}`,
-    );
-  }
-
-  public async getSessionTaskHistory(
-    sessionId: string,
-    limit?: number,
-    workspaceId?: string,
-    workspacePath?: string,
-  ): Promise<SessionTaskHistoryResponseDto> {
-    const query = new URLSearchParams();
-    query.set('sessionId', sessionId);
-    if (workspaceId) query.set('workspaceId', workspaceId);
-    if (workspacePath) query.set('workspacePath', workspacePath);
-    if (limit !== undefined) {
-      query.set('limit', String(limit));
-    }
-    return this.getJson<SessionTaskHistoryResponseDto>(
-      `/api/tasks/session-history?${query.toString()}`,
-    );
-  }
-
-  public async getTask(
-    taskId: string,
-    sessionId: string,
-    workspaceId?: string,
-    workspacePath?: string,
-  ): Promise<TaskDto> {
-    const query = new URLSearchParams();
-    query.set('sessionId', sessionId);
-    if (workspaceId) query.set('workspaceId', workspaceId);
-    if (workspacePath) query.set('workspacePath', workspacePath);
-    return this.getJson<TaskDto>(
-      `/api/tasks/${encodeURIComponent(taskId)}?${query.toString()}`,
-    );
-  }
-
-  public async getDeliveryPackage(
-    rootTaskId: string,
-    sessionId: string,
-    workspaceId?: string,
-    workspacePath?: string,
-  ): Promise<DeliveryPackageDto> {
-    const query = new URLSearchParams();
-    query.set('sessionId', sessionId);
-    if (workspaceId) query.set('workspaceId', workspaceId);
-    if (workspacePath) query.set('workspacePath', workspacePath);
-    return this.getJson<DeliveryPackageDto>(
-      `/api/tasks/${encodeURIComponent(rootTaskId)}/delivery-package?${query.toString()}`,
+    return this.getJson<AgentRunProjectionDto>(
+      `/api/agent-runs/projection/${encodeURIComponent(rootTaskId)}?${query.toString()}`,
     );
   }
 

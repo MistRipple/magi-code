@@ -9,9 +9,9 @@ import type {
   SettingsRuntimeSnapshot,
 } from '../shared/settings-bootstrap';
 import type {
-  SessionNotificationItemDto,
-  SessionNotificationSnapshotDto,
-  SessionNotificationsResponseDto,
+  IncidentNotificationItemDto,
+  NotificationCenterSnapshotDto,
+  NotificationsResponseDto,
   FetchModelsResponseDto,
   EnhancePromptRequestDto,
   SkillsLibraryResponseDto,
@@ -81,7 +81,7 @@ export interface AgentBootstrapSnapshot {
   workspace: AgentWorkspaceSummary;
   sessionId: string;
   session: AgentSessionSummary;
-  notifications?: AgentSessionNotificationsPayload;
+  notifications?: AgentNotificationsPayload;
   sessions: AgentSessionSummary[];
 }
 
@@ -329,13 +329,10 @@ export interface AgentExecutionStatsPayload {
   items: AgentExecutionStatsItem[];
 }
 
-// Migrated to canonical types from rust-backend-types.ts:
-//   AgentSessionNotificationRecord  → SessionNotificationItemDto
-//   AgentSessionNotificationSnapshot → SessionNotificationSnapshotDto
-//   AgentSessionNotificationsPayload → SessionNotificationsResponseDto
-export type AgentSessionNotificationRecord = SessionNotificationItemDto;
-export type AgentSessionNotificationSnapshot = SessionNotificationSnapshotDto;
-export type AgentSessionNotificationsPayload = SessionNotificationsResponseDto;
+// 通知中心直接复用 Rust incident 契约，前端不再维护旧会话通知镜像类型。
+export type AgentIncidentNotificationRecord = IncidentNotificationItemDto;
+export type AgentNotificationCenterSnapshot = NotificationCenterSnapshotDto;
+export type AgentNotificationsPayload = NotificationsResponseDto;
 
 
 export interface AgentKnowledgeMutationPayload {
@@ -387,7 +384,7 @@ export interface AgentSessionTurnResult {
   acceptedAt: number;
   createdSession: boolean;
   route: 'chat' | 'execute' | 'task' | 'continue' | 'supplement_context';
-  /** Root task ID when the backend created a task projection for this action. */
+  /** Root task ID when the backend created an agent run for this action. */
   rootTaskId?: string | null;
   /** 当前轮次实际执行的 action task ID。 */
   actionTaskId?: string | null;
@@ -424,7 +421,7 @@ export class AgentApiError extends Error {
 export interface AgentNotificationScope {
   workspaceId: string;
   workspacePath?: string;
-  sessionId: string;
+  sessionId?: string;
 }
 
 function safeReadLocalStorage(key: string): string {
@@ -759,11 +756,17 @@ function hasBindingOverrideKey(
   bindingOverride: Partial<AgentBindingContext> | undefined,
   key: keyof AgentBindingContext,
 ): boolean {
-  return Boolean(
-    bindingOverride
-      && Object.prototype.hasOwnProperty.call(bindingOverride, key)
-      && bindingOverride[key] !== undefined,
-  );
+  if (!bindingOverride || !Object.prototype.hasOwnProperty.call(bindingOverride, key)) {
+    return false;
+  }
+  const value = bindingOverride[key];
+  if (value === undefined) {
+    return false;
+  }
+  if (key !== 'sessionId' && typeof value === 'string' && value.trim() === '') {
+    return false;
+  }
+  return true;
 }
 
 function resolveBindingWithOverride(
@@ -807,11 +810,8 @@ function buildBoundQueryWithOverride(
 }
 
 function createNotificationBindingOverride(scope: AgentNotificationScope): Partial<AgentBindingContext> {
-  const sessionId = scope.sessionId.trim();
+  const sessionId = scope.sessionId?.trim() || '';
   const workspaceId = scope.workspaceId.trim();
-  if (!sessionId) {
-    throw new AgentApiError(400, 'sessionId 不能为空', 'resolve notification scope');
-  }
   if (!workspaceId) {
     throw new AgentApiError(400, 'workspaceId 不能为空', 'resolve notification scope');
   }
@@ -822,21 +822,25 @@ function createNotificationBindingOverride(scope: AgentNotificationScope): Parti
   };
 }
 
-async function postBoundJson<T>(
+async function postJsonWithBinding<T>(
   pathname: string,
   payload: Record<string, unknown>,
   action: string,
   bindingOverride?: Partial<AgentBindingContext>,
+  includeSession = true,
 ): Promise<T> {
   try {
     const binding = resolveBindingWithOverride(bindingOverride);
+    const bindingPayload = {
+      ...(binding.workspaceId ? { workspaceId: binding.workspaceId } : {}),
+      ...(binding.workspacePath ? { workspacePath: binding.workspacePath } : {}),
+      ...(includeSession && binding.sessionId ? { sessionId: binding.sessionId } : {}),
+    };
     const response = await getTransport().request(agentUrl(pathname), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        workspaceId: binding.workspaceId,
-        workspacePath: binding.workspacePath,
-        sessionId: binding.sessionId,
+        ...bindingPayload,
         ...payload,
       }),
     });
@@ -847,6 +851,15 @@ async function postBoundJson<T>(
     }
     throw error;
   }
+}
+
+async function postBoundJson<T>(
+  pathname: string,
+  payload: Record<string, unknown>,
+  action: string,
+  bindingOverride?: Partial<AgentBindingContext>,
+): Promise<T> {
+  return await postJsonWithBinding<T>(pathname, payload, action, bindingOverride, true);
 }
 
 export async function listAgentWorkspaces(): Promise<AgentWorkspaceSummary[]> {
@@ -1049,7 +1062,7 @@ async function postWorkspaceBoundJson<T>(
   action: string,
   bindingOverride?: Partial<AgentBindingContext>,
 ): Promise<T> {
-  return await postBoundJson<T>(pathname, payload, action, { ...bindingOverride, sessionId: '' });
+  return await postJsonWithBinding<T>(pathname, payload, action, bindingOverride, false);
 }
 
 export async function deleteAgentSession(
@@ -1089,36 +1102,36 @@ export async function closeAgentSession(
   );
 }
 
-export async function getAgentSessionNotifications(scope: AgentNotificationScope): Promise<AgentSessionNotificationsPayload> {
+export async function getAgentNotifications(scope: AgentNotificationScope): Promise<AgentNotificationsPayload> {
   const query = buildBoundQueryWithOverride({}, createNotificationBindingOverride(scope));
-  const response = await getTransport().request(agentUrl('/api/session/notifications', query));
-  return await parseAgentJson<AgentSessionNotificationsPayload>(response, 'load session notifications');
+  const response = await getTransport().request(agentUrl('/api/notifications', query));
+  return await parseAgentJson<AgentNotificationsPayload>(response, 'load notifications');
 }
 
-export async function appendAgentNotification(
-  notification: Record<string, unknown>,
+export async function reportAgentIncident(
+  incident: Record<string, unknown>,
   scope: AgentNotificationScope,
-): Promise<AgentSessionNotificationsPayload> {
-  return await postBoundJson<AgentSessionNotificationsPayload>(
-    '/api/session/notifications/append',
-    { ...notification },
-    'append notification',
+): Promise<AgentNotificationsPayload> {
+  return await postBoundJson<AgentNotificationsPayload>(
+    '/api/notifications/report',
+    { ...incident },
+    'report incident',
     createNotificationBindingOverride(scope),
   );
 }
 
-export async function markAllAgentNotificationsRead(scope: AgentNotificationScope): Promise<AgentSessionNotificationsPayload> {
-  return await postBoundJson<AgentSessionNotificationsPayload>(
-    '/api/session/notifications/mark-all-read',
+export async function markAllAgentNotificationsRead(scope: AgentNotificationScope): Promise<AgentNotificationsPayload> {
+  return await postBoundJson<AgentNotificationsPayload>(
+    '/api/notifications/mark-all-read',
     {},
     'mark all notifications read',
     createNotificationBindingOverride(scope),
   );
 }
 
-export async function clearAgentNotifications(scope: AgentNotificationScope): Promise<AgentSessionNotificationsPayload> {
-  return await postBoundJson<AgentSessionNotificationsPayload>(
-    '/api/session/notifications/clear',
+export async function clearAgentNotifications(scope: AgentNotificationScope): Promise<AgentNotificationsPayload> {
+  return await postBoundJson<AgentNotificationsPayload>(
+    '/api/notifications/clear',
     {},
     'clear notifications',
     createNotificationBindingOverride(scope),
@@ -1128,11 +1141,23 @@ export async function clearAgentNotifications(scope: AgentNotificationScope): Pr
 export async function removeAgentNotification(
   notificationId: string,
   scope: AgentNotificationScope,
-): Promise<AgentSessionNotificationsPayload> {
-  return await postBoundJson<AgentSessionNotificationsPayload>(
-    '/api/session/notifications/remove',
+): Promise<AgentNotificationsPayload> {
+  return await postBoundJson<AgentNotificationsPayload>(
+    '/api/notifications/remove',
     { notificationId },
     'remove notification',
+    createNotificationBindingOverride(scope),
+  );
+}
+
+export async function resolveAgentNotification(
+  notificationId: string,
+  scope: AgentNotificationScope,
+): Promise<AgentNotificationsPayload> {
+  return await postBoundJson<AgentNotificationsPayload>(
+    '/api/notifications/resolve',
+    { notificationId },
+    'resolve notification',
     createNotificationBindingOverride(scope),
   );
 }
@@ -1141,6 +1166,7 @@ export async function submitSessionTurn(
   payload: {
     text?: string | null;
     skillName?: string | null;
+    goalMode?: boolean;
     images: AgentSessionTurnImagePayload[];
     accessProfile?: 'read_only' | 'restricted' | 'full_access' | null;
     orchestratorSessionConfig?: Record<string, unknown> | null;
@@ -1166,6 +1192,7 @@ export async function submitSessionTurn(
         workspacePath: binding.workspacePath || null,
         text: payload.text ?? null,
         skillName: payload.skillName ?? null,
+        goalMode: payload.goalMode === true,
         accessProfile: payload.accessProfile ?? null,
         requestId: payload.requestId ?? null,
         userMessageId: payload.userMessageId ?? null,
@@ -1248,7 +1275,7 @@ export async function submitSessionTurn(
 export async function interruptAgentTask(
   payload: { taskId: string },
 ): Promise<Record<string, unknown>> {
-  return await postBoundJson<Record<string, unknown>>('/api/task/interrupt', payload, 'interrupt task');
+  return await postBoundJson<Record<string, unknown>>('/api/agent-runs/interrupt', payload, 'interrupt agent run');
 }
 
 export async function interruptAgentSession(
@@ -1265,14 +1292,6 @@ export async function interruptAgentSession(
   );
 }
 
-export async function clearAgentAllTasks(): Promise<Record<string, unknown>> {
-  return await postBoundJson<Record<string, unknown>>('/api/task/clear-all', {}, 'clear all tasks');
-}
-
-export async function startAgentTask(taskId: string): Promise<Record<string, unknown>> {
-  return await postBoundJson<Record<string, unknown>>('/api/task/start', { taskId }, 'start task');
-}
-
 export async function continueAgentSession(
   sessionId: string,
 ): Promise<Record<string, unknown>> {
@@ -1285,10 +1304,6 @@ export async function continueAgentSession(
     { sessionId: normalizedSessionId },
     'continue session',
   );
-}
-
-export async function deleteAgentTask(taskId: string): Promise<Record<string, unknown>> {
-  return await postBoundJson<Record<string, unknown>>('/api/task/delete', { taskId }, 'delete task');
 }
 
 export async function getAgentSettingsBootstrap(
@@ -1530,6 +1545,17 @@ export async function getAgentProjectKnowledge(
   return await parseAgentJson<Record<string, unknown>>(response, 'load project knowledge');
 }
 
+export async function reindexAgentProjectKnowledge(
+  bindingOverride?: Partial<AgentBindingContext>,
+): Promise<Record<string, unknown>> {
+  return await postWorkspaceBoundJson<Record<string, unknown>>(
+    '/api/knowledge/reindex',
+    {},
+    'reindex project knowledge',
+    bindingOverride,
+  );
+}
+
 export type AgentKnowledgeKind = 'adr' | 'faq' | 'learning';
 
 export interface AgentKnowledgeItemPayload {
@@ -1724,6 +1750,30 @@ export async function updateAgentSkill(skillId: string): Promise<Record<string, 
 
 export async function updateAllAgentSkills(): Promise<Record<string, unknown>> {
   return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/skills/update-all', {}, 'update all skills');
+}
+
+export interface AgentPendingChangesPayload {
+  generatedAt: number;
+  sessionId: string;
+  workspaceId: string;
+  workspacePath: string;
+  pendingChanges: unknown[];
+  pendingChangesState: unknown;
+}
+
+export async function getAgentPendingChanges(
+  options: { sessionId?: string; workspaceId?: string; workspacePath?: string } = {},
+): Promise<AgentPendingChangesPayload> {
+  try {
+    const query = buildBoundQueryWithOverride({}, options);
+    const response = await getTransport().request(agentUrl('/api/changes', query));
+    return await parseAgentJson<AgentPendingChangesPayload>(response, 'load pending changes');
+  } catch (error) {
+    if (error instanceof TypeError) {
+      throw new Error(i18n.t('bridge.agentUnreachable'));
+    }
+    throw error;
+  }
 }
 
 export async function getAgentChangeDiff(

@@ -134,7 +134,7 @@ pub fn runtime_terminal_evidence_ref(branch: &ActiveExecutionBranch) -> String {
 
 /// 收敛 chain 中所有"已经在 worker runtime 里跑到 Finish 但 task_store 还停留在
 /// 非终态"的 branch：把它们落盘成 `TaskStatus::Completed/Failed/Cancelled`。
-/// 用于 `tasks_interaction::interrupt_task` 与 `continue_execution_chain` 的入口护栏。
+/// 用于会话中断与执行链续跑入口的统一护栏。
 ///
 /// `Result::Err(String)`：上层 magi-api 用
 /// `.map_err(|msg| ApiError::internal_assembly("收敛代理终态失败", msg))` 桥回 ApiError。

@@ -93,8 +93,15 @@ await withGoldenViteServer(async (server) => {
   const originalFetch = globalThis.fetch;
   try {
     let capturedKnowledgeUrl = '';
-    globalThis.fetch = async (url) => {
+    const capturedKnowledgePosts = [];
+    globalThis.fetch = async (url, init) => {
       capturedKnowledgeUrl = String(url);
+      if (init?.method === 'POST') {
+        capturedKnowledgePosts.push({
+          url: String(url),
+          body: JSON.parse(String(init.body)),
+        });
+      }
       return new Response(JSON.stringify({
         workspaceId: 'workspace-knowledge-override',
         workspacePath: '/tmp/workspace-knowledge-override',
@@ -119,6 +126,66 @@ await withGoldenViteServer(async (server) => {
       false,
       'project knowledge must stay workspace-scoped even when an explicit session is present',
     );
+
+    capturedKnowledgeUrl = '';
+    await agentApi.getAgentProjectKnowledge({
+      workspaceId: '',
+      workspacePath: '',
+    });
+    const emptyOverrideQuery = new URL(capturedKnowledgeUrl).searchParams;
+    assert.equal(
+      emptyOverrideQuery.get('workspaceId'),
+      'workspace-query-golden',
+      'empty knowledge workspace override must fall back to the active workspace binding',
+    );
+    assert.equal(
+      emptyOverrideQuery.get('workspacePath'),
+      '/tmp/workspace-query-golden',
+      'empty knowledge workspace override must not erase the active workspace path',
+    );
+
+    await agentApi.reindexAgentProjectKnowledge({
+      workspaceId: 'workspace-knowledge-override',
+      workspacePath: '/tmp/workspace-knowledge-override',
+      sessionId: 'session-must-not-leak',
+    });
+    await agentApi.clearAgentProjectKnowledge({
+      workspaceId: 'workspace-knowledge-override',
+      workspacePath: '/tmp/workspace-knowledge-override',
+      sessionId: 'session-must-not-leak',
+    });
+    assert.deepEqual(
+      capturedKnowledgePosts,
+      [
+        {
+          url: 'http://127.0.0.1:38123/api/knowledge/reindex',
+          body: {
+            workspaceId: 'workspace-knowledge-override',
+            workspacePath: '/tmp/workspace-knowledge-override',
+          },
+        },
+        {
+          url: 'http://127.0.0.1:38123/api/knowledge/clear',
+          body: {
+            workspaceId: 'workspace-knowledge-override',
+            workspacePath: '/tmp/workspace-knowledge-override',
+          },
+        },
+      ],
+      'workspace-scoped knowledge mutations must never send a session binding',
+    );
+
+    capturedKnowledgeUrl = '';
+    await agentApi.getAgentPendingChanges({
+      workspaceId: 'workspace-knowledge-override',
+      workspacePath: '/tmp/workspace-knowledge-override',
+      sessionId: 'session-changes-refresh',
+    });
+    const changesUrl = new URL(capturedKnowledgeUrl);
+    assert.equal(changesUrl.pathname, '/api/changes');
+    assert.equal(changesUrl.searchParams.get('workspaceId'), 'workspace-knowledge-override');
+    assert.equal(changesUrl.searchParams.get('workspacePath'), '/tmp/workspace-knowledge-override');
+    assert.equal(changesUrl.searchParams.get('sessionId'), 'session-changes-refresh');
   } finally {
     if (originalFetch === undefined) {
       delete globalThis.fetch;
@@ -338,6 +405,58 @@ await withGoldenViteServer(async (server) => {
       0,
       'normalized MCP toolCount must mean currently usable tools',
     );
+  } finally {
+    if (originalFetch === undefined) {
+      delete globalThis.fetch;
+    } else {
+      globalThis.fetch = originalFetch;
+    }
+  }
+
+  try {
+    const notificationRequests = [];
+    globalThis.fetch = async (url, init = {}) => {
+      notificationRequests.push({
+        url: String(url),
+        method: init.method || 'GET',
+        body: init.body ? JSON.parse(String(init.body)) : null,
+      });
+      return new Response(JSON.stringify({
+        workspaceId: 'workspace-query-golden',
+        sessionId: null,
+        notifications: { lastUpdatedAt: 1, records: [] },
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    };
+
+    await agentApi.getAgentNotifications({
+      workspaceId: 'workspace-query-golden',
+      workspacePath: '/tmp/workspace-query-golden',
+    });
+    await agentApi.reportAgentIncident({
+      scope: 'workspace',
+      level: 'error',
+      message: '索引服务失败',
+      source: 'knowledge-runtime',
+    }, {
+      workspaceId: 'workspace-query-golden',
+      workspacePath: '/tmp/workspace-query-golden',
+    });
+
+    const loadRequest = notificationRequests[0];
+    const loadUrl = new URL(loadRequest.url);
+    assert.equal(loadUrl.pathname, '/api/notifications');
+    assert.equal(loadUrl.searchParams.get('workspaceId'), 'workspace-query-golden');
+    assert.equal(loadUrl.searchParams.has('sessionId'), false);
+
+    const reportRequest = notificationRequests[1];
+    assert.equal(new URL(reportRequest.url).pathname, '/api/notifications/report');
+    assert.equal(reportRequest.method, 'POST');
+    assert.equal(reportRequest.body.scope, 'workspace');
+    assert.equal(reportRequest.body.message, '索引服务失败');
+    assert.equal(reportRequest.body.sessionId, undefined);
   } finally {
     if (originalFetch === undefined) {
       delete globalThis.fetch;

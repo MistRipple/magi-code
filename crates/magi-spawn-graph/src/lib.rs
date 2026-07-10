@@ -11,7 +11,8 @@
 //!   创建/关闭时间戳。一条边 = 一次 spawn 行为。
 //! - **回执路由**：子节点完成（status=Closed）后通过 `mark_closed` 标记；上层
 //!   调用 `parent_of(child)` 找回父任务。代理终态结果不旁路回写父 turn，
-//!   父任务需要结果时通过 `agent_wait` 从 TaskStore 收集。
+//!   父任务需要结果时通过 `agent_wait` 从对应 thread transcript 收集，TaskStore
+//!   只提供任务状态与旧历史输出。
 //! - **级联停止**：`open_descendants(root)` 一次返回所有未关闭的子孙节点，
 //!   交给 caller 逐个取消（SpawnGraph 不直接调度任务，只提供拓扑）。
 //! - **限制**：`enforce_limits` 在 `add_edge` 时检查 max_depth / max_fanout，
@@ -277,6 +278,25 @@ impl SpawnGraph {
     /// 测试 / 诊断辅助：返回当前所有边的克隆。
     pub fn all_edges(&self) -> Vec<SpawnEdge> {
         self.edges.values().cloned().collect()
+    }
+
+    /// 删除一组任务关联的全部拓扑边及父索引。TaskStore 是持久化事实源，
+    /// 会话删除后 SpawnGraph 必须同步回收，不能保留指向已删除 Task 的运行期边。
+    pub fn remove_tasks(&mut self, task_ids: &HashSet<TaskId>) -> usize {
+        if task_ids.is_empty() {
+            return 0;
+        }
+        let before = self.edges.len();
+        self.edges
+            .retain(|child, edge| !task_ids.contains(child) && !task_ids.contains(&edge.parent));
+        self.children.retain(|parent, children| {
+            if task_ids.contains(parent) {
+                return false;
+            }
+            children.retain(|child| self.edges.contains_key(child));
+            !children.is_empty()
+        });
+        before.saturating_sub(self.edges.len())
     }
 
     /// 从持久化 TaskStore 的 parent_task_id 重建进程内 SpawnGraph。
@@ -565,5 +585,23 @@ mod tests {
         assert_eq!(report.restored_edges, 0);
         assert_eq!(report.skipped_edges, 1);
         assert!(graph.parent_of(&tid("orphan")).is_none());
+    }
+
+    #[test]
+    fn remove_tasks_drops_edges_and_parent_indexes() {
+        let mut graph = SpawnGraph::new();
+        graph
+            .add_edge(tid("root-a"), tid("child-a"), TaskKind::LocalAgent, now())
+            .unwrap();
+        graph
+            .add_edge(tid("root-b"), tid("child-b"), TaskKind::LocalAgent, now())
+            .unwrap();
+
+        let removed = graph.remove_tasks(&HashSet::from([tid("root-a"), tid("child-a")]));
+
+        assert_eq!(removed, 1);
+        assert!(graph.edge_for(&tid("child-a")).is_none());
+        assert!(graph.children_of(&tid("root-a")).is_empty());
+        assert_eq!(graph.parent_of(&tid("child-b")), Some(&tid("root-b")));
     }
 }

@@ -1,15 +1,14 @@
-import {
-  addToast,
-  type ToastOptions,
-} from '../stores/messages.svelte';
+import { reportIncident, showFeedback, type FeedbackOptions } from './notifications';
+import type { IncidentScope } from './notification-policy';
 
 export interface ActionFeedbackOptions<T> {
   actionLabel: string;
   successMessage?: string | ((result: T) => string | undefined);
   successTitle?: string;
-  successToast?: ToastOptions;
+  successToast?: FeedbackOptions;
   errorTitle?: string;
-  errorToast?: ToastOptions;
+  errorToast?: FeedbackOptions;
+  incidentScope?: IncidentScope;
   onError?: (errorMessage: string, error: unknown) => void | Promise<void>;
 }
 
@@ -32,38 +31,22 @@ export async function runActionWithFeedback<T>(
 ): Promise<T | null> {
   try {
     const result = await action();
-    addToast(
-      'success',
-      resolveSuccessMessage(result, options),
-      options.successTitle,
-      {
-        category: 'audit',
-        source: 'web-action',
-        actionRequired: false,
-        persistToCenter: true,
-        countUnread: false,
-        displayMode: 'toast',
-        ...(options.successToast || {}),
-      },
-    );
+    showFeedback('success', resolveSuccessMessage(result, options), {
+      title: options.successTitle,
+      source: 'web-action',
+      ...(options.successToast || {}),
+    });
     return result;
   } catch (error) {
     const errorMessage = `${options.actionLabel}失败`;
     await options.onError?.(errorMessage, error);
-    addToast(
-      'error',
-      errorMessage,
-      options.errorTitle,
-      {
-        category: 'incident',
-        source: 'web-action',
-        actionRequired: true,
-        persistToCenter: true,
-        countUnread: true,
-        displayMode: 'toast',
-        ...(options.errorToast || {}),
-      },
-    );
+    reportIncident(errorMessage, {
+      scope: options.incidentScope || 'workspace',
+      title: options.errorTitle,
+      source: options.errorToast?.source || 'web-action',
+      duration: options.errorToast?.duration,
+      fingerprint: `web-action:${options.actionLabel}`,
+    });
     return null;
   }
 }

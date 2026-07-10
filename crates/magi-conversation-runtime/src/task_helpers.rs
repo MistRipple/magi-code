@@ -5,7 +5,7 @@
 //! 的 publish/upsert helper 都不放在本模块。
 
 use magi_bridge_client::{ChatToolChoice, ChatToolDefinition};
-use magi_core::{Task, TaskKind, TaskTier, ThreadId, WorkerId};
+use magi_core::{Task, TaskKind, ThreadId, WorkerId};
 use magi_orchestrator::task_worker_catalog::default_task_role_for_kind;
 use magi_orchestrator::{task_store::TaskStore, task_worker_catalog::resolve_task_role};
 use magi_session_store::ActiveExecutionTurnItem;
@@ -26,15 +26,10 @@ pub(crate) fn is_orchestration_builtin_tool(tool: BuiltinToolName) -> bool {
     )
 }
 
-pub(crate) fn is_long_mission_builtin_tool(tool: BuiltinToolName) -> bool {
+pub(crate) fn is_goal_builtin_tool(tool: BuiltinToolName) -> bool {
     matches!(
         tool,
-        BuiltinToolName::MissionCharterWrite
-            | BuiltinToolName::PlanWrite
-            | BuiltinToolName::KgWrite
-            | BuiltinToolName::ValidationRecord
-            | BuiltinToolName::Checkpoint
-            | BuiltinToolName::HumanCheckpointRequest
+        BuiltinToolName::GetGoal | BuiltinToolName::CreateGoal | BuiltinToolName::UpdateGoal
     )
 }
 
@@ -56,18 +51,16 @@ pub(crate) fn task_is_coordinator(
         .is_some_and(|role| role.coordinator_mode)
 }
 
-pub(crate) fn task_is_long_mission(task: Option<&Task>) -> bool {
-    task.and_then(|task| task.policy_snapshot.as_ref())
-        .is_some_and(|policy| policy.task_tier == TaskTier::LongMission)
-}
-
 pub(crate) fn task_can_see_builtin_tool(
     task: Option<&Task>,
     registry: Option<&magi_agent_role::AgentRoleRegistry>,
     tool: BuiltinToolName,
 ) -> bool {
-    if is_long_mission_builtin_tool(tool) {
-        return task_is_coordinator(task, registry) && task_is_long_mission(task);
+    if is_goal_builtin_tool(tool) {
+        return task.is_none() || task_is_coordinator(task, registry);
+    }
+    if matches!(tool, BuiltinToolName::TodoWrite) && task.is_none() {
+        return true;
     }
     if is_orchestration_builtin_tool(tool) {
         return task_is_coordinator(task, registry);

@@ -371,42 +371,46 @@
 
       <div class="engine-usage-list">
         <div class="engine-usage-row engine-usage-row--system">
-          <div class="engine-label">
+          <div class="engine-avatar engine-avatar--primary" aria-hidden="true">
+            <Icon name="chat" size={15} />
             <span
               class="model-status-dot {getStatusClass(resolveModelConfigTabStatus('orch', modelStatuses))}"
               title={getStatusText(resolveModelConfigTabStatus('orch', modelStatuses))}
             ></span>
-            <div class="engine-label-text">
-              <span class="engine-name">{i18n.t('settings.model.orchestratorModel')}</span>
-            </div>
           </div>
-          <div class="engine-consumers">
+          <div class="engine-identity">
+            <span class="engine-name">{i18n.t('settings.model.orchestratorModel')}</span>
+            <span class="engine-model-tag">{i18n.t('settings.model.sessionModelSelection')}</span>
+          </div>
+          <div class="engine-consumers engine-consumers--stacked">
+            <span class="engine-system-note">{i18n.t('settings.model.orchestratorSystemUsage')}</span>
             {#if inheritedConsumers.length > 0}
-              {#each inheritedConsumers as agent (agent.templateId)}
-                {@const color = getAgentColor(agent.templateId)}
-                <span
-                  class="consumer-chip"
-                  style="background: {color.muted}; color: {color.color}"
-                >{resolveTemplateDisplayName(agent.templateId)}</span>
-              {/each}
-            {:else}
-              <span class="engine-empty">{i18n.t('settings.model.engineNoConsumer')}</span>
+              <div class="consumer-chip-list">
+                {#each inheritedConsumers as agent (agent.templateId)}
+                  {@const color = getAgentColor(agent.templateId)}
+                  <span
+                    class="consumer-chip"
+                    style="background: {color.muted}; color: {color.color}"
+                  >{resolveTemplateDisplayName(agent.templateId)}</span>
+                {/each}
+              </div>
             {/if}
           </div>
         </div>
 
         <div class="engine-usage-row engine-usage-row--system">
-          <div class="engine-label">
+          <div class="engine-avatar engine-avatar--auxiliary" aria-hidden="true">
+            <Icon name="sparkles" size={15} />
             <span
               class="model-status-dot {getStatusClass(resolveModelConfigTabStatus('comp', modelStatuses))}"
               title={getStatusText(resolveModelConfigTabStatus('comp', modelStatuses))}
             ></span>
-            <div class="engine-label-text">
-              <span class="engine-name">{i18n.t('settings.model.auxiliaryModel')}</span>
-              {#if compConfig?.model}
-                <span class="engine-model-tag">{compConfig.model}</span>
-              {/if}
-            </div>
+          </div>
+          <div class="engine-identity">
+            <span class="engine-name">{i18n.t('settings.model.auxiliaryModel')}</span>
+            {#if compConfig?.model}
+              <span class="engine-model-tag">{compConfig.model}</span>
+            {/if}
           </div>
           <div class="engine-consumers">
             <span class="engine-system-note">{i18n.t('settings.model.auxiliarySystemUsage')}</span>
@@ -414,14 +418,18 @@
         </div>
 
         {#if workerModelTabs.length > 0}
-          <div class="engine-usage-divider"></div>
           {#each workerModelTabs as workerId (workerId)}
             {@const consumers = consumersOf(workerId)}
             {@const workerStatus = resolveModelConfigTabStatus(workerId, modelStatuses)}
             {@const indicatorVariant = resolveAgentIndicatorVariant(workerStatus)}
             {@const workerColor = getAgentColor(workerId)}
             <div class="engine-usage-row">
-              <div class="engine-label">
+              <div
+                class="engine-avatar"
+                style="background: {workerColor.muted}; color: {workerColor.color}"
+                aria-hidden="true"
+              >
+                <Icon name="bot" size={15} />
                 <span
                   class="worker-dot"
                   class:brand={indicatorVariant === 'brand'}
@@ -431,12 +439,12 @@
                   style="--worker-brand-color: {workerColor.color}"
                   title={getStatusText(workerStatus)}
                 ></span>
-                <div class="engine-label-text">
-                  <span class="engine-name">{getWorkerDisplayName(workerId)}</span>
-                  {#if workerConfigs[workerId]?.model}
-                    <span class="engine-model-tag">{workerConfigs[workerId].model}</span>
-                  {/if}
-                </div>
+              </div>
+              <div class="engine-identity">
+                <span class="engine-name">{getWorkerDisplayName(workerId)}</span>
+                {#if workerConfigs[workerId]?.model}
+                  <span class="engine-model-tag">{workerConfigs[workerId].model}</span>
+                {/if}
               </div>
               <div class="engine-consumers">
                 {#if consumers.length > 0}
@@ -629,10 +637,10 @@
     gap: var(--space-4);
   }
 
-  /* 老的全局 model-status-dot 给概览区继续用 */
+  /* 概览列表内的连接状态 */
   .model-status-dot {
-    width: 8px;
-    height: 8px;
+    width: 7px;
+    height: 7px;
     border-radius: var(--radius-full);
     background: var(--foreground-muted);
     flex-shrink: 0;
@@ -644,8 +652,8 @@
   .model-status-dot.disabled { background: var(--foreground-subtle, #94a3b8); }
 
   .worker-dot {
-    width: 8px;
-    height: 8px;
+    width: 7px;
+    height: 7px;
     border-radius: var(--radius-full);
     flex-shrink: 0;
     background: var(--foreground-subtle, #94a3b8);
@@ -690,62 +698,68 @@
   .engine-usage-list {
     display: flex;
     flex-direction: column;
-    gap: var(--space-2);
-    background: var(--surface-2);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-md, 10px);
-    padding: var(--space-3) var(--space-4);
+    background: var(--ind-bg-control, var(--surface-2));
+    border: 1px solid var(--ind-border-control, var(--border));
+    border-radius: 8px;
+    overflow: hidden;
   }
   .engine-usage-row {
     display: grid;
-    grid-template-columns: minmax(0, 220px) minmax(0, 1fr);
-    gap: var(--space-3);
-    align-items: flex-start;
-    padding: 6px 0;
+    grid-template-columns: 34px minmax(130px, 176px) minmax(0, 1fr);
+    column-gap: 12px;
+    align-items: center;
+    padding: 12px 14px;
   }
   .engine-usage-row + .engine-usage-row {
-    border-top: 1px dashed var(--border);
-    padding-top: var(--space-2);
+    border-top: 1px solid var(--ind-border-separator, var(--border-subtle, var(--border)));
   }
-  .engine-usage-divider {
-    height: 1px;
-    background: var(--border);
-    margin: 4px 0;
-    opacity: 0.7;
+  .engine-avatar {
+    position: relative;
+    width: 34px;
+    height: 34px;
+    border-radius: 8px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--ind-foreground-secondary, var(--foreground));
+    background: var(--ind-bg-control-hover, var(--surface-3));
+    box-shadow: inset 0 0 0 1px color-mix(in srgb, currentColor 10%, transparent);
   }
-  .engine-usage-divider + .engine-usage-row {
-    border-top: none;
-    padding-top: 0;
+  .engine-avatar--primary {
+    color: var(--ind-tab-accent, var(--info));
+    background: color-mix(in srgb, var(--ind-tab-accent, var(--info)) 11%, var(--ind-bg-control, var(--surface-2)));
   }
-  .engine-label {
-    display: flex;
-    align-items: flex-start;
-    gap: 8px;
-    min-width: 0;
-    padding-top: 2px;
+  .engine-avatar--auxiliary {
+    color: var(--ind-foreground-secondary, var(--foreground));
   }
-  .engine-label-text {
+  .engine-avatar > .model-status-dot,
+  .engine-avatar > .worker-dot {
+    position: absolute;
+    right: -2px;
+    bottom: -2px;
+    border: 2px solid var(--ind-bg-control, var(--surface-2));
+    box-sizing: content-box;
+  }
+  .engine-identity {
     display: flex;
     flex-direction: column;
-    gap: 4px;
+    gap: 2px;
     min-width: 0;
-    flex: 1;
   }
   .engine-name {
     font-size: var(--text-sm);
-    font-weight: var(--font-medium);
-    color: var(--foreground);
+    font-weight: 600;
+    color: var(--ind-foreground, var(--foreground));
+    line-height: 1.35;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
   }
   .engine-model-tag {
     font-size: var(--text-xs);
-    color: var(--foreground-muted);
-    background: var(--surface-3);
-    padding: 1px 6px;
-    border-radius: var(--radius-sm);
+    color: var(--ind-foreground-soft, var(--foreground-muted));
     font-family: var(--font-mono, ui-monospace, SFMono-Regular, monospace);
+    line-height: 1.35;
     max-width: 100%;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -757,31 +771,52 @@
     flex-wrap: wrap;
     gap: 6px;
     align-items: center;
+    align-content: center;
     min-width: 0;
+  }
+  .engine-consumers--stacked {
+    flex-direction: column;
+    flex-wrap: nowrap;
+    align-items: flex-start;
+    gap: 8px;
+  }
+  .consumer-chip-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    align-items: center;
   }
   .consumer-chip {
     display: inline-flex;
     align-items: center;
-    height: 22px;
-    padding: 0 10px;
+    min-height: 22px;
+    padding: 3px 9px;
     border-radius: var(--radius-full);
     font-size: var(--text-xs);
     font-weight: var(--font-medium);
     white-space: nowrap;
     line-height: 1;
+    box-shadow: inset 0 0 0 1px color-mix(in srgb, currentColor 10%, transparent);
   }
   .engine-empty,
   .engine-system-note {
     font-size: var(--text-xs);
-    color: var(--foreground-subtle, var(--foreground-muted));
-    font-style: italic;
+    color: var(--ind-foreground-muted, var(--foreground-muted));
+    line-height: 1.5;
   }
 
   @container settings-model (max-width: 640px) {
     .role-tab--worker .role-tab-delete { opacity: 1; }
     .engine-usage-row {
-      grid-template-columns: 1fr;
-      gap: var(--space-2);
+      grid-template-columns: 34px minmax(0, 1fr);
+      column-gap: 12px;
+      row-gap: 8px;
+      align-items: center;
+    }
+    .engine-avatar { grid-row: 1 / span 2; align-self: start; }
+    .engine-identity { grid-column: 2; }
+    .engine-consumers {
+      grid-column: 2;
     }
   }
 

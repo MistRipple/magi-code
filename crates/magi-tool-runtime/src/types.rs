@@ -175,6 +175,8 @@ pub struct ToolExecutionSummary {
 
 pub type ExternalToolCatalogProvider =
     Arc<dyn Fn() -> ExternalToolCatalogSnapshot + Send + Sync + 'static>;
+pub type ExternalMcpToolExecutor =
+    Arc<dyn Fn(&str, &str, &str) -> (String, ExecutionResultStatus) + Send + Sync + 'static>;
 pub type AgentRoleCatalogProvider =
     Arc<dyn Fn() -> Vec<AgentRoleCatalogEntry> + Send + Sync + 'static>;
 pub type RuntimeCapabilityDependencyProvider = Arc<
@@ -185,6 +187,55 @@ pub type RuntimeCapabilityDependencyProvider = Arc<
 pub struct ExternalToolCatalogSnapshot {
     pub skill_tools: Vec<ExternalToolCatalogEntry>,
     pub mcp_servers: Vec<ExternalMcpServerCatalogEntry>,
+    pub mcp_tools: Vec<ExternalMcpToolCatalogEntry>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ExternalMcpToolCatalogEntry {
+    pub server_id: String,
+    pub server_name: String,
+    pub model_tool_name: String,
+    pub tool_name: String,
+    pub description: String,
+    pub input_schema: serde_json::Value,
+}
+
+pub fn external_mcp_model_tool_name(server_id: &str, tool_name: &str) -> String {
+    fn segment(value: &str) -> String {
+        let normalized = value
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-') {
+                    ch
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>();
+        let normalized = normalized.trim_matches('_');
+        if normalized.is_empty() {
+            "unnamed".to_string()
+        } else {
+            normalized.to_string()
+        }
+    }
+
+    let server = segment(server_id);
+    let tool = segment(tool_name);
+    let full = format!("mcp__{server}__{tool}");
+    if full.len() <= 64 {
+        return full;
+    }
+
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in format!("{server_id}\0{tool_name}").bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    let suffix = format!("__{hash:08x}");
+    let max_prefix_len = 64usize.saturating_sub(suffix.len());
+    let prefix = full.chars().take(max_prefix_len).collect::<String>();
+    format!("{prefix}{suffix}")
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -264,6 +315,7 @@ pub struct RuntimeCapabilityDependencyEntry {
 pub struct ToolRuntimeResources {
     pub knowledge_store: Option<Arc<magi_knowledge_store::KnowledgeStore>>,
     pub external_tool_catalog_provider: Option<ExternalToolCatalogProvider>,
+    pub external_mcp_tool_executor: Option<ExternalMcpToolExecutor>,
     pub agent_role_catalog_provider: Option<AgentRoleCatalogProvider>,
     pub runtime_capability_dependency_provider: Option<RuntimeCapabilityDependencyProvider>,
 }

@@ -24,12 +24,15 @@ import type {
   ModelStatusMap,
   QueuedMessage,
   OrchestratorRuntimeState,
-  SessionNotificationRecord,
   Edit,
   ChangeMutationStatus,
 } from '../types/message';
 import { vscode } from '../lib/vscode-bridge';
 import { ensureArray } from '../lib/utils';
+import {
+  normalizeIncidentRecords,
+  type NormalizedIncidentRecord,
+} from '../lib/notification-policy';
 
 import {
   buildTimelinePanelMessages,
@@ -66,7 +69,7 @@ interface SettingsRegistrySnapshot {
   registryAgents: AgentBinding[];
 }
 
-type NotificationCenterOperation = 'load' | 'append' | 'mark-read' | 'clear' | 'remove';
+type NotificationCenterOperation = 'load' | 'report' | 'mark-read' | 'clear' | 'resolve' | 'remove';
 
 export interface NotificationCenterStatus {
   isLoading: boolean;
@@ -76,9 +79,9 @@ export interface NotificationCenterStatus {
 }
 
 interface NotificationOperationScope {
-  sessionId: string;
   workspaceId: string;
   workspacePath: string;
+  sessionId?: string;
 }
 
 // ============ 状态定义 ============
@@ -325,6 +328,7 @@ function normalizeQueuedMessageList(value: unknown): QueuedMessage[] {
       skillName: typeof item.skillName === 'string' && item.skillName.trim()
         ? item.skillName.trim()
         : null,
+      goalMode: item.goalMode === true,
       accessProfile: item.accessProfile === 'read_only'
         || item.accessProfile === 'restricted'
         || item.accessProfile === 'full_access'
@@ -480,13 +484,6 @@ function getCurrentPanelScrollAnchor(panel: ScrollPanelKey): ScrollAnchor {
   return normalizeScrollAnchor(messagesState.scrollAnchors[panel]);
 }
 
-function isValidPersistedArray(value: unknown, max: number): value is unknown[] {
-  if (!Array.isArray(value)) return false;
-  const length = value.length;
-  if (!Number.isFinite(length) || length < 0 || length > max) return false;
-  return true;
-}
-
 // 新增状态：阶段、Toast、模型状态
 // 统一 Worker 运行态（唯一权威来源）
 // 当前主线以 authoritative projection 为准，仅叠加尚未被后端接纳的本地乐观节点。
@@ -503,17 +500,9 @@ const messageProjection = $derived.by(() => {
   };
 });
 
-export type ToastCategory = 'incident' | 'audit' | 'feedback';
-export type NotificationCategory = 'incident' | 'audit';
-export type ToastDisplayMode = 'toast' | 'notification_center' | 'silent';
-
 export interface ToastOptions {
-  category?: ToastCategory;
   source?: string;
   actionRequired?: boolean;
-  persistToCenter?: boolean;
-  countUnread?: boolean;
-  displayMode?: ToastDisplayMode;
   duration?: number;
 }
 
@@ -522,7 +511,6 @@ interface ToastRecord {
   type: string;
   title?: string;
   message: string;
-  category: ToastCategory;
   source?: string;
   actionRequired?: boolean;
   duration?: number;
@@ -530,24 +518,12 @@ interface ToastRecord {
 
 let toasts = $state<ToastRecord[]>([]);
 
-// 通知历史（持久化在会话内，不自动消失）
-export interface Notification {
-  id: string;
-  type: string;
-  title?: string;
-  message: string;
-  category: NotificationCategory;
-  source?: string;
-  actionRequired?: boolean;
-  countUnread: boolean;
-  timestamp: number;
-  read: boolean;
-}
-const MAX_NOTIFICATIONS_PER_SESSION = 200;
+export type Notification = NormalizedIncidentRecord;
+const MAX_NOTIFICATIONS_PER_CONTEXT = 200;
 
 let notifications = $state<Notification[]>([]);
 let unreadNotificationCount = $state(0);
-let notificationsBySessionScope = $state<Record<string, Notification[]>>({});
+let notificationsByContext = $state<Record<string, Notification[]>>({});
 
 let modelStatus = $state<ModelStatusMap>({
   orchestrator: { status: 'checking' },
@@ -587,67 +563,6 @@ function resolveMessageSortTimestamp(message: Pick<Message, 'timestamp' | 'metad
 
 function normalizeProjectionRestoredMessage(message: Message): Message {
   return normalizeMessagePayload(message, '[MessagesStore] 投影消息');
-}
-
-function normalizeSessionNotificationRecord(raw: unknown): Notification | null {
-  if (!raw || typeof raw !== 'object') return null;
-  const item = raw as Record<string, unknown>;
-  const id = typeof item.notificationId === 'string' ? item.notificationId.trim() : '';
-  if (!id) return null;
-  const type = typeof item.level === 'string' ? item.level : 'info';
-  const message = typeof item.message === 'string' ? item.message : '';
-  if (!message) return null;
-  const category = item.kind === 'incident'
-    ? 'incident'
-    : 'audit';
-  const persistToCenter = item.persistToCenter !== false;
-  if (!persistToCenter) {
-    return null;
-  }
-  const timestamp = typeof item.createdAt === 'number' && Number.isFinite(item.createdAt)
-    ? item.createdAt
-    : Date.now();
-  const read = typeof item.read === 'boolean'
-    ? item.read
-    : Boolean(item.handled);
-  const countUnread = typeof item.countUnread === 'boolean'
-    ? item.countUnread
-    : category === 'incident';
-  const title = typeof item.title === 'string' ? item.title : undefined;
-  const source = typeof item.source === 'string' ? item.source : undefined;
-  const actionRequired = typeof item.actionRequired === 'boolean' ? item.actionRequired : undefined;
-  return {
-    id,
-    type,
-    title,
-    message,
-    category,
-    source,
-    actionRequired,
-    countUnread,
-    timestamp,
-    read,
-  };
-}
-
-function normalizeSessionNotificationList(raw: unknown): Notification[] {
-  if (!isValidPersistedArray(raw, MAX_PERSISTED_ARRAY_LENGTH)) {
-    return [];
-  }
-  const seen = new Set<string>();
-  const normalized: Notification[] = [];
-  for (const item of raw) {
-    const next = normalizeSessionNotificationRecord(item);
-    if (!next || seen.has(next.id)) {
-      continue;
-    }
-    seen.add(next.id);
-    normalized.push(next);
-    if (normalized.length >= MAX_NOTIFICATIONS_PER_SESSION) {
-      break;
-    }
-  }
-  return normalized;
 }
 
 function resolveTimelineCardId(message: Message): string | undefined {
@@ -739,7 +654,7 @@ function buildProjectionRenderEntriesFromArtifacts(
 
   for (const artifact of artifacts) {
     if (artifact.taskId) {
-      // 代理 artifacts 仅在 RightPane task tab 内按 metadata.taskId 过滤呈现，主时间线不收纳
+      // 代理 artifacts 仅在 RightPane agent run tab 内按 metadata.taskId 过滤呈现，主时间线不收纳
       continue;
     }
     const artifactMetadata = resolveMessageMetadataRecord(artifact.message);
@@ -1126,6 +1041,47 @@ export function setChangeMutationStatus(status: ChangeMutationStatus | null): vo
   };
 }
 
+export function applyPendingChangesProjection(payload: {
+  generatedAt?: number;
+  sessionId?: string;
+  workspaceId?: string;
+  pendingChanges?: unknown[];
+  pendingChangesState?: unknown;
+}): boolean {
+  const sessionId = normalizeOptionalStatusString(payload.sessionId);
+  const workspaceId = normalizeOptionalStatusString(payload.workspaceId);
+  if (!sessionId || sessionId !== normalizeOptionalStatusString(messagesState.currentSessionId)) {
+    return false;
+  }
+  if (workspaceId && workspaceId !== normalizeOptionalStatusString(messagesState.currentWorkspaceId)) {
+    return false;
+  }
+
+  const generatedAt = typeof payload.generatedAt === 'number' && Number.isFinite(payload.generatedAt)
+    ? payload.generatedAt
+    : 0;
+  const currentVersion = typeof messagesState.appState?.pendingChangesStateVersion === 'number'
+    ? messagesState.appState.pendingChangesStateVersion
+    : 0;
+  if (generatedAt < currentVersion) {
+    return false;
+  }
+
+  const pendingChanges = ensureArray<Edit>(payload.pendingChanges).filter((change) => (
+    !!change && typeof change.filePath === 'string' && change.filePath.trim().length > 0
+  ));
+  messagesState.edits = pendingChanges;
+  if (messagesState.appState) {
+    messagesState.appState = {
+      ...messagesState.appState,
+      pendingChanges,
+      pendingChangesState: payload.pendingChangesState ?? null,
+      pendingChangesStateVersion: generatedAt,
+    };
+  }
+  return true;
+}
+
 function syncEditsFromAppState(nextState: AppState | null): void {
   if (!nextState) {
     messagesState.edits = [];
@@ -1302,6 +1258,12 @@ function applySessionViewState(sessionId: string | null | undefined): boolean {
 function resetSessionScopedExecutionState(): void {
   messagesState.edits = [];
   messagesState.orchestratorRuntimeState = null;
+  messagesState.backendProcessing = false;
+  messagesState.pendingRequests = new Set();
+  messagesState.activeMessageIds = new Set();
+  messagesState.thinkingStartAt = null;
+  messagesState.isProcessing = false;
+  messagesState.lastForcedIdleAt = null;
   if (messagesState.appState) {
     messagesState.appState = {
       ...messagesState.appState,
@@ -1478,7 +1440,7 @@ export function setCurrentSessionId(id: string | null) {
     }
     restoreQueuedMessagesForSession(nextSessionId);
   }
-  syncNotificationsFromSession(nextSessionId);
+  syncNotificationsFromContext(nextSessionId);
   saveWebviewState();
 }
 
@@ -1504,7 +1466,7 @@ export function adoptCurrentSessionIdForLiveTurn(id: string | null | undefined):
     isLoadingBefore: false,
   };
   resetNotificationCenterStatus();
-  syncNotificationsFromSession(nextSessionId);
+  syncNotificationsFromContext(nextSessionId);
   saveWebviewState();
   return true;
 }
@@ -1536,7 +1498,7 @@ export function adoptAcceptedSessionIdForLocalTurn(
   if (reboundProjection) {
     messagesState.canonicalTimelineProjection = reboundProjection;
   }
-  syncNotificationsFromSession(nextSessionId);
+  syncNotificationsFromContext(nextSessionId);
   saveWebviewState();
   return true;
 }
@@ -1766,15 +1728,6 @@ function recomputeUnreadNotificationCount() {
   unreadNotificationCount = notifications.filter((n) => n.countUnread && !n.read).length;
 }
 
-function resolveNotificationSessionId(sessionId: string | null | undefined): string {
-  const normalized = typeof sessionId === 'string' ? sessionId.trim() : '';
-  return normalized;
-}
-
-function getCurrentNotificationSessionId(): string {
-  return resolveNotificationSessionId(messagesState.currentSessionId);
-}
-
 function resolveNotificationWorkspaceId(workspaceId: string | null | undefined): string {
   return typeof workspaceId === 'string' ? workspaceId.trim() : '';
 }
@@ -1783,29 +1736,28 @@ function getCurrentNotificationWorkspaceId(): string {
   return resolveNotificationWorkspaceId(messagesState.currentWorkspaceId);
 }
 
-function createNotificationScopeKey(
+function createNotificationContextKey(
   workspaceId: string | null | undefined,
   sessionId: string | null | undefined,
 ): string {
-  const normalizedSessionId = resolveNotificationSessionId(sessionId);
-  if (!normalizedSessionId) {
+  const normalizedWorkspaceId = resolveNotificationWorkspaceId(workspaceId);
+  if (!normalizedWorkspaceId) {
     return '';
   }
-  const normalizedWorkspaceId = resolveNotificationWorkspaceId(workspaceId);
-  return normalizedWorkspaceId
-    ? `${normalizedWorkspaceId}\u0000${normalizedSessionId}`
-    : `session:${normalizedSessionId}`;
+  const normalizedSessionId = typeof sessionId === 'string' ? sessionId.trim() : '';
+  return `${normalizedWorkspaceId}\u0000${normalizedSessionId || '*'}`;
 }
 
-function notificationScopeMatchesCurrentSession(
-  sessionId: string,
+function notificationContextMatchesCurrent(
+  sessionId: string | null | undefined,
   workspaceId: string | null | undefined,
 ): boolean {
-  const normalizedSessionId = resolveNotificationSessionId(sessionId);
-  if (!normalizedSessionId || normalizedSessionId !== getCurrentNotificationSessionId()) {
-    return false;
-  }
-  return resolveNotificationWorkspaceId(workspaceId) === getCurrentNotificationWorkspaceId();
+  const normalizedSessionId = typeof sessionId === 'string' ? sessionId.trim() : '';
+  const currentSessionId = typeof messagesState.currentSessionId === 'string'
+    ? messagesState.currentSessionId.trim()
+    : '';
+  return resolveNotificationWorkspaceId(workspaceId) === getCurrentNotificationWorkspaceId()
+    && normalizedSessionId === currentSessionId;
 }
 
 function createNotificationCenterIdleStatus(): NotificationCenterStatus {
@@ -1822,77 +1774,48 @@ function resetNotificationCenterStatus(): void {
 }
 
 function getCurrentNotificationOperationScope(): NotificationOperationScope | null {
-  const sessionId = getCurrentNotificationSessionId();
   const workspaceId = getCurrentNotificationWorkspaceId();
-  if (!sessionId || !workspaceId) {
+  if (!workspaceId) {
     return null;
   }
+  const sessionId = typeof messagesState.currentSessionId === 'string'
+    ? messagesState.currentSessionId.trim()
+    : '';
   return {
-    sessionId,
     workspaceId,
     workspacePath: typeof messagesState.currentWorkspacePath === 'string'
       ? messagesState.currentWorkspacePath.trim()
       : '',
+    ...(sessionId ? { sessionId } : {}),
   };
 }
 
 function applyNotificationList(nextList: Notification[]): Notification[] {
-  const trimmed = nextList.slice(0, MAX_NOTIFICATIONS_PER_SESSION);
+  const trimmed = nextList.slice(0, MAX_NOTIFICATIONS_PER_CONTEXT);
   notifications = trimmed;
   recomputeUnreadNotificationCount();
   return trimmed;
 }
 
-function syncNotificationsFromSession(sessionId: string | null | undefined): void {
-  const scopeKey = createNotificationScopeKey(messagesState.currentWorkspaceId, sessionId);
-  const list = scopeKey ? ensureArray<Notification>(notificationsBySessionScope[scopeKey]) : [];
+function syncNotificationsFromContext(sessionId: string | null | undefined): void {
+  const scopeKey = createNotificationContextKey(messagesState.currentWorkspaceId, sessionId);
+  const list = scopeKey ? ensureArray<Notification>(notificationsByContext[scopeKey]) : [];
   applyNotificationList(list);
 }
 
-function replaceSessionNotificationList(
-  sessionId: string,
+function replaceNotificationContextList(
+  sessionId: string | null | undefined,
   workspaceId: string | null | undefined,
   nextList: Notification[],
 ): void {
-  const normalizedSessionId = resolveNotificationSessionId(sessionId);
-  if (!normalizedSessionId) {
-    return;
-  }
-  const scopeKey = createNotificationScopeKey(workspaceId, normalizedSessionId);
+  const scopeKey = createNotificationContextKey(workspaceId, sessionId);
   if (!scopeKey) {
     return;
   }
-  const next = nextList.slice(0, MAX_NOTIFICATIONS_PER_SESSION);
-  notificationsBySessionScope = {
-    ...notificationsBySessionScope,
+  const next = nextList.slice(0, MAX_NOTIFICATIONS_PER_CONTEXT);
+  notificationsByContext = {
+    ...notificationsByContext,
     [scopeKey]: next,
-  };
-}
-
-function resolveToastPolicy(options?: ToastOptions): {
-  category: ToastCategory;
-  persistToCenter: boolean;
-  countUnread: boolean;
-  source?: string;
-  actionRequired?: boolean;
-  displayMode: ToastDisplayMode;
-  duration?: number;
-} {
-  const category = options?.category ?? 'feedback';
-  const defaultPersistToCenter = false;
-  const persistToCenter = options?.persistToCenter ?? defaultPersistToCenter;
-  const defaultCountUnread = category === 'incident';
-  const countUnread = persistToCenter ? (options?.countUnread ?? defaultCountUnread) : false;
-  const actionRequired = options?.actionRequired ?? (category === 'incident');
-  const displayMode = options?.displayMode ?? 'toast';
-  return {
-    category,
-    persistToCenter,
-    countUnread,
-    source: options?.source,
-    actionRequired,
-    displayMode,
-    duration: options?.duration,
   };
 }
 
@@ -1900,69 +1823,35 @@ function resolveToastPolicy(options?: ToastOptions): {
 const MAX_VISIBLE_TOASTS = 5;
 
 export function addToast(type: string, message: string, title?: string, options?: ToastOptions) {
-  const policy = resolveToastPolicy(options);
   const id = `toast_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-  if (policy.displayMode === 'toast') {
-    const toast: ToastRecord = {
-      id,
-      type,
-      title,
-      message,
-      category: policy.category,
-      source: policy.source,
-      actionRequired: policy.actionRequired,
-      duration: policy.duration,
-    };
-    const duplicateIndex = toasts.findIndex((item) => (
-      item.type === toast.type
-      && item.title === toast.title
-      && item.message === toast.message
-      && item.category === toast.category
-      && item.source === toast.source
-    ));
-    const baseToasts = duplicateIndex >= 0
-      ? toasts.filter((_, index) => index !== duplicateIndex)
-      : toasts;
-    // 超过上限时优先丢弃最旧的非 actionRequired toast；若全是关键错误，也必须保持硬上限。
-    let nextToasts = [...baseToasts, toast];
-    while (nextToasts.length > MAX_VISIBLE_TOASTS) {
-      const discardIndex = nextToasts.findIndex((t) => !t.actionRequired);
-      if (discardIndex >= 0) {
-        nextToasts.splice(discardIndex, 1);
-      } else {
-        nextToasts.shift();
-      }
+  const toast: ToastRecord = {
+    id,
+    type,
+    title,
+    message,
+    source: options?.source,
+    actionRequired: options?.actionRequired,
+    duration: options?.duration,
+  };
+  const duplicateIndex = toasts.findIndex((item) => (
+    item.type === toast.type
+    && item.title === toast.title
+    && item.message === toast.message
+    && item.source === toast.source
+  ));
+  const baseToasts = duplicateIndex >= 0
+    ? toasts.filter((_, index) => index !== duplicateIndex)
+    : toasts;
+  let nextToasts = [...baseToasts, toast];
+  while (nextToasts.length > MAX_VISIBLE_TOASTS) {
+    const discardIndex = nextToasts.findIndex((item) => !item.actionRequired);
+    if (discardIndex >= 0) {
+      nextToasts.splice(discardIndex, 1);
+    } else {
+      nextToasts.shift();
     }
-    toasts = nextToasts;
   }
-
-  if (policy.displayMode === 'silent' || !policy.persistToCenter || policy.category === 'feedback') {
-    return;
-  }
-
-  // 仅归档高价值通知到通知历史
-  const notificationCategory: NotificationCategory = policy.category === 'incident' ? 'incident' : 'audit';
-  const scope = getCurrentNotificationOperationScope();
-  if (!scope) {
-    return;
-  }
-  vscode.postMessage({
-    type: 'appendSessionNotification',
-    ...scope,
-    notification: {
-      notificationId: id,
-      kind: notificationCategory,
-      level: type,
-      title,
-      message,
-      source: policy.source,
-      persistToCenter: true,
-      actionRequired: policy.actionRequired,
-      countUnread: policy.countUnread,
-      displayMode: policy.displayMode,
-      duration: policy.duration,
-    },
-  });
+  toasts = nextToasts;
 }
 
 export function getNotifications() {
@@ -1985,12 +1874,12 @@ export function removeToast(id: string) {
   toasts = toasts.filter((toast) => toast.id !== normalizedId);
 }
 
-export function loadSessionNotifications() {
+export function loadNotifications() {
   const scope = getCurrentNotificationOperationScope();
   if (!scope) {
     return;
   }
-  vscode.postMessage({ type: 'loadSessionNotifications', ...scope });
+  vscode.postMessage({ type: 'loadNotifications', ...scope });
 }
 
 export function markAllNotificationsRead() {
@@ -2021,40 +1910,49 @@ export function removeNotification(id: string) {
   vscode.postMessage({ type: 'removeNotification', notificationId: normalizedId, ...scope });
 }
 
-export function applySessionNotifications(
-  sessionId: string,
-  rawNotifications: { records?: SessionNotificationRecord[] } | unknown,
-  workspaceId?: string | null,
-): void {
-  const normalizedSessionId = resolveNotificationSessionId(sessionId);
-  if (!notificationScopeMatchesCurrentSession(normalizedSessionId, workspaceId)) {
+export function resolveNotification(id: string) {
+  const normalizedId = typeof id === 'string' ? id.trim() : '';
+  if (!normalizedId) {
     return;
   }
-  const normalized = normalizeSessionNotificationList(
+  const scope = getCurrentNotificationOperationScope();
+  if (!scope) {
+    return;
+  }
+  vscode.postMessage({ type: 'resolveNotification', notificationId: normalizedId, ...scope });
+}
+
+export function applyNotificationsSnapshot(
+  sessionId: string | null | undefined,
+  rawNotifications: { records?: unknown[] } | unknown,
+  workspaceId?: string | null,
+): void {
+  if (!notificationContextMatchesCurrent(sessionId, workspaceId)) {
+    return;
+  }
+  const normalized = normalizeIncidentRecords(
     rawNotifications && typeof rawNotifications === 'object'
       ? (rawNotifications as { records?: unknown }).records
       : undefined,
   );
-  replaceSessionNotificationList(normalizedSessionId, workspaceId, normalized);
+  replaceNotificationContextList(sessionId, workspaceId, normalized);
   applyNotificationList(normalized);
 }
 
-export function applySessionNotificationsStatus(rawStatus: unknown): void {
+export function applyNotificationsStatus(rawStatus: unknown): void {
   if (!rawStatus || typeof rawStatus !== 'object' || Array.isArray(rawStatus)) {
     return;
   }
   const status = rawStatus as Record<string, unknown>;
-  const statusSessionId = resolveNotificationSessionId(
-    typeof status.sessionId === 'string' ? status.sessionId : null,
-  );
+  const statusSessionId = typeof status.sessionId === 'string' ? status.sessionId.trim() : '';
   const statusWorkspaceId = resolveNotificationWorkspaceId(
     typeof status.workspaceId === 'string' ? status.workspaceId : null,
   );
-  if (!notificationScopeMatchesCurrentSession(statusSessionId, statusWorkspaceId)) {
+  if (!notificationContextMatchesCurrent(statusSessionId, statusWorkspaceId)) {
     return;
   }
   const operation = typeof status.operation === 'string'
-    && ['load', 'append', 'mark-read', 'clear', 'remove'].includes(status.operation)
+    && ['load', 'report', 'mark-read', 'clear', 'resolve', 'remove'].includes(status.operation)
     ? status.operation as NotificationCenterOperation
     : null;
   messagesState.notificationCenter = {
@@ -2235,9 +2133,9 @@ export function initializeState() {
       resetPanelScrollRuntimeState();
     }
     restoreQueuedMessagesForSession(explicitSessionId);
-    notificationsBySessionScope = {};
+    notificationsByContext = {};
     messagesState.orchestratorRuntimeState = null;
-    syncNotificationsFromSession(messagesState.currentSessionId);
+    syncNotificationsFromContext(messagesState.currentSessionId);
 
     // 启动恢复：workspace/session 列表与激活会话只以后端 bootstrap 为唯一真相源。
     // 浏览器本地持久化只保留按 session 归档的轻量视图状态，

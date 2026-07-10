@@ -1,22 +1,47 @@
 use magi_bridge_client::{BridgeBindingKind, ChatToolDefinition, ChatToolFunctionDefinition};
 use magi_core::ExecutionResultStatus;
-use magi_skill_runtime::SkillRuntime;
+use magi_skill_runtime::{SkillIdResolution, SkillRuntime};
 
 pub const SKILL_APPLY_TOOL_NAME: &str = "skill_apply";
 
-const SKILL_APPLY_TOOL_DESCRIPTION: &str =
-    "Load and apply a named skill for specialized task execution";
+const SKILL_APPLY_TOOL_DESCRIPTION: &str = "Load and activate one registered skill for the current turn. Use the canonical ID or a unique short name from the list below.";
 const SKILL_APPLY_UNAVAILABLE_PUBLIC_ERROR: &str = "Skill 能力暂不可用，请稍后重试";
 const SKILL_APPLY_INVALID_ARGUMENTS_PUBLIC_ERROR: &str = "Skill 调用参数不可用，请重新选择 Skill";
 const SKILL_APPLY_MISSING_NAME_PUBLIC_ERROR: &str = "缺少要应用的 Skill 名称";
 const SKILL_APPLY_NOT_FOUND_PUBLIC_ERROR: &str = "未找到已注册的 Skill";
+const SKILL_APPLY_AMBIGUOUS_PUBLIC_ERROR: &str = "Skill 短名称不唯一，请选择完整名称";
 
-pub fn skill_apply_tool_definition() -> ChatToolDefinition {
+pub fn skill_apply_tool_definition(skill_runtime: &SkillRuntime) -> ChatToolDefinition {
+    let mut available_lines = skill_runtime
+        .registry()
+        .list()
+        .into_iter()
+        .map(|skill| {
+            let short_name = skill
+                .skill_id
+                .rsplit('/')
+                .next()
+                .unwrap_or(skill.skill_id.as_str());
+            format!(
+                "- {short_name} | {} | {} | {}",
+                skill.skill_id, skill.title, skill.metadata.category
+            )
+        })
+        .collect::<Vec<_>>();
+    available_lines.sort();
+    let description = if available_lines.is_empty() {
+        format!("{SKILL_APPLY_TOOL_DESCRIPTION}\nNo registered skills are currently available.")
+    } else {
+        format!(
+            "{SKILL_APPLY_TOOL_DESCRIPTION}\nAvailable skills:\n{}",
+            available_lines.join("\n")
+        )
+    };
     ChatToolDefinition {
         kind: "function".to_string(),
         function: ChatToolFunctionDefinition {
             name: SKILL_APPLY_TOOL_NAME.to_string(),
-            description: SKILL_APPLY_TOOL_DESCRIPTION.to_string(),
+            description,
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -85,14 +110,28 @@ pub fn execute_skill_apply_from_runtime(
         .into_iter()
         .map(|skill| skill.skill_id)
         .collect::<Vec<_>>();
-    let Some(skill) = registry.get(skill_name) else {
-        return skill_apply_failed(
-            "skill_apply_not_found",
-            SKILL_APPLY_NOT_FOUND_PUBLIC_ERROR,
-            Some(skill_name),
-            available_skills,
-        );
+    let canonical_skill_id = match registry.resolve_skill_id(skill_name) {
+        SkillIdResolution::Found(skill_id) => skill_id,
+        SkillIdResolution::NotFound => {
+            return skill_apply_failed(
+                "skill_apply_not_found",
+                SKILL_APPLY_NOT_FOUND_PUBLIC_ERROR,
+                Some(skill_name),
+                available_skills,
+            );
+        }
+        SkillIdResolution::Ambiguous(matches) => {
+            return skill_apply_failed(
+                "skill_apply_ambiguous",
+                SKILL_APPLY_AMBIGUOUS_PUBLIC_ERROR,
+                Some(skill_name),
+                matches,
+            );
+        }
     };
+    let skill = registry
+        .get(&canonical_skill_id)
+        .expect("resolved skill id must exist in registry");
     let skill_id = skill.skill_id.clone();
     let title = skill.title.clone();
     let custom_tools = skill
@@ -170,6 +209,7 @@ mod tests {
                 category: "quality".to_string(),
                 tags: vec!["review".to_string()],
             },
+            restrict_standard_tools: true,
             allowed_tools: vec!["file_read".to_string()],
             custom_tool_bindings: vec![],
             prompt_priority: 50,
@@ -205,6 +245,67 @@ mod tests {
     }
 
     #[test]
+    fn skill_apply_definition_exposes_registered_ids_short_names_and_titles() {
+        let registry = SkillRegistry::new();
+        registry.register(SkillDefinition {
+            skill_id: "stellarlinkco/myclaude/skills/code-review".to_string(),
+            title: "代码审查".to_string(),
+            instruction: "检查代码。".to_string(),
+            metadata: SkillMetadata {
+                category: "quality".to_string(),
+                tags: vec![],
+            },
+            restrict_standard_tools: true,
+            allowed_tools: vec![],
+            custom_tool_bindings: vec![],
+            prompt_priority: 50,
+        });
+        let runtime = SkillRuntime::new(registry);
+
+        let definition = skill_apply_tool_definition(&runtime);
+
+        assert!(definition.function.description.contains("code-review"));
+        assert!(
+            definition
+                .function
+                .description
+                .contains("stellarlinkco/myclaude/skills/code-review")
+        );
+        assert!(definition.function.description.contains("代码审查"));
+    }
+
+    #[test]
+    fn skill_apply_resolves_unique_short_name_to_canonical_skill_id() {
+        let registry = SkillRegistry::new();
+        registry.register(SkillDefinition {
+            skill_id: "stellarlinkco/myclaude/skills/talk-normal".to_string(),
+            title: "自然表达".to_string(),
+            instruction: "保持简洁自然。".to_string(),
+            metadata: SkillMetadata {
+                category: "writing".to_string(),
+                tags: vec!["style".to_string()],
+            },
+            restrict_standard_tools: true,
+            allowed_tools: vec![],
+            custom_tool_bindings: vec![],
+            prompt_priority: 50,
+        });
+        let runtime = SkillRuntime::new(registry);
+
+        let (payload, status) = execute_skill_apply_from_runtime(
+            &serde_json::json!({ "skill_name": "talk-normal" }).to_string(),
+            Some(&runtime),
+        );
+
+        assert_eq!(status, ExecutionResultStatus::Succeeded);
+        let parsed: serde_json::Value = serde_json::from_str(&payload).expect("payload json");
+        assert_eq!(
+            parsed["skill_name"],
+            "stellarlinkco/myclaude/skills/talk-normal"
+        );
+    }
+
+    #[test]
     fn skill_apply_returns_public_custom_tool_summary_without_binding_details() {
         let registry = SkillRegistry::new();
         registry.register(SkillDefinition {
@@ -215,6 +316,7 @@ mod tests {
                 category: "ops".to_string(),
                 tags: vec!["mcp".to_string()],
             },
+            restrict_standard_tools: true,
             allowed_tools: vec![],
             custom_tool_bindings: vec![CustomToolBinding {
                 binding_id: "secret-binding".to_string(),

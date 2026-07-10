@@ -5,7 +5,7 @@ use crate::{
 use magi_core::UtcMillis;
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc, RwLock,
+    Arc, Mutex, RwLock,
     atomic::{AtomicU64, Ordering},
 };
 use thiserror::Error;
@@ -27,6 +27,7 @@ pub struct InMemoryEventBus {
     audit_usage_ledger_last_error: Arc<RwLock<Option<String>>>,
     audit_usage_ledger_pending_flush: Arc<RwLock<bool>>,
     audit_usage_ledger_last_persisted_at: Arc<RwLock<Option<UtcMillis>>>,
+    audit_usage_ledger_persist_lock: Arc<Mutex<()>>,
     retain_limit: usize,
 }
 
@@ -42,6 +43,7 @@ impl InMemoryEventBus {
             audit_usage_ledger_last_error: Arc::new(RwLock::new(None)),
             audit_usage_ledger_pending_flush: Arc::new(RwLock::new(false)),
             audit_usage_ledger_last_persisted_at: Arc::new(RwLock::new(None)),
+            audit_usage_ledger_persist_lock: Arc::new(Mutex::new(())),
             retain_limit: capacity,
         }
     }
@@ -253,6 +255,10 @@ impl InMemoryEventBus {
     }
 
     fn persist_audit_usage_ledger_if_configured(&self) -> Result<(), AuditUsageLedgerError> {
+        let _persist_guard = self
+            .audit_usage_ledger_persist_lock
+            .lock()
+            .expect("event bus audit/usage ledger persist lock poisoned");
         let Some(path) = self
             .audit_usage_ledger_path
             .read()

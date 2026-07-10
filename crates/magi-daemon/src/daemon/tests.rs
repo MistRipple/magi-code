@@ -68,6 +68,46 @@ fn test_sidecar_persistence_with_worker_runtime(
     RuntimeSidecarPersistence::new(repository, session_store, workspace_store, worker_runtime)
 }
 
+#[test]
+fn workspace_session_loader_preserves_goals() {
+    let state_root = temp_state_root("workspace-goal-load");
+    let workspace_root = temp_state_root("workspace-goal-load-root");
+    let repository = StateRepository::new(state_root);
+    let session_store = SessionStore::default();
+    let workspace_id = WorkspaceId::new("workspace-goal-load");
+    let session_id = SessionId::new("session-goal-load");
+    session_store
+        .create_session_for_workspace(
+            session_id.clone(),
+            "goal load",
+            Some(workspace_id.to_string()),
+        )
+        .expect("workspace session should create");
+    let goal = session_store
+        .create_goal(
+            session_id.clone(),
+            ThreadId::new("thread-goal-load"),
+            "恢复工作区目标",
+            Some(256_000),
+        )
+        .expect("goal should create");
+    let (_global_state, workspace_states) = session_store.durable_state().partition_by_workspace();
+    let workspace_state = workspace_states
+        .get(workspace_id.as_str())
+        .expect("workspace state should contain session");
+    repository
+        .save_workspace_session_state(&workspace_root, workspace_state)
+        .expect("workspace session state should save");
+
+    let loaded = repository
+        .load_sessions_from_workspaces(&[(workspace_id.to_string(), workspace_root)])
+        .expect("workspace sessions should load");
+
+    assert_eq!(loaded.goals.len(), 1);
+    assert_eq!(loaded.goals[0].goal_id, goal.goal_id);
+    assert_eq!(loaded.goals[0].objective, "恢复工作区目标");
+}
+
 async fn post_json(app: axum::Router, path: &str, body: Value) -> (StatusCode, Value) {
     let response = app
         .oneshot(
@@ -140,7 +180,7 @@ fn event_payload_contains_request_id(event: &EventEnvelope, request_id: &str) ->
     event.payload.to_string().contains(request_id)
 }
 
-async fn get_task_projection(
+async fn get_agent_run_projection(
     app: axum::Router,
     root_task_id: &str,
     session_id: &str,
@@ -149,13 +189,13 @@ async fn get_task_projection(
     get_json(
         app,
         &format!(
-            "/api/tasks/projection/{root_task_id}?workspaceId={workspace_id}&sessionId={session_id}"
+            "/api/agent-runs/projection/{root_task_id}?workspaceId={workspace_id}&sessionId={session_id}"
         ),
     )
     .await
 }
 
-async fn wait_for_task_projection_completed(
+async fn wait_for_agent_run_projection_completed(
     app: axum::Router,
     root_task_id: &str,
     session_id: &str,
@@ -164,7 +204,7 @@ async fn wait_for_task_projection_completed(
     let deadline = Instant::now() + BACKGROUND_TASK_PROJECTION_TIMEOUT;
     loop {
         let projection =
-            get_task_projection(app.clone(), root_task_id, session_id, workspace_id).await;
+            get_agent_run_projection(app.clone(), root_task_id, session_id, workspace_id).await;
         let total_tasks = projection["progress_summary"]["total_tasks"]
             .as_u64()
             .unwrap_or(0);
@@ -212,7 +252,7 @@ async fn wait_for_execution_group(
     }
 }
 
-fn assert_completed_two_task_projection(projection: &Value) {
+fn assert_completed_two_agent_run_projection(projection: &Value) {
     let total_tasks = projection["progress_summary"]["total_tasks"]
         .as_u64()
         .expect("total_tasks should serialize as integer");
@@ -222,11 +262,11 @@ fn assert_completed_two_task_projection(projection: &Value) {
     // ExecutionChain：单 worker 任务只产出 1 个 root task；coordinator 才会扩展为多任务。
     assert!(
         total_tasks >= 1,
-        "task projection should include the root task"
+        "agent run projection should include the root task"
     );
     assert_eq!(
         completed_tasks, total_tasks,
-        "task projection should be fully completed, got summary={:?}, root_status={}, tasks={:?}",
+        "agent run projection should be fully completed, got summary={:?}, root_status={}, tasks={:?}",
         projection["progress_summary"], projection["root_task"]["status"], projection["tasks"]
     );
     assert_eq!(projection["progress_summary"]["failed_tasks"], 0);
@@ -712,8 +752,8 @@ async fn daemon_runtime_recovery_preflight_executes_and_followup_router_dispatch
  {
     let state_root = temp_state_root("router-recovery-preflight");
     let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
-    let runtime =
-        DaemonRuntime::restore(&config).expect("runtime restore should bootstrap empty state");
+    let runtime = DaemonRuntime::restore_with_test_fixture(&config)
+        .expect("runtime restore should load explicit test fixture");
     let (app, state) = runtime.router_with_state_for_tests("daemon-test".to_string());
     let pipeline = state
         .execution_pipeline()
@@ -990,22 +1030,22 @@ async fn daemon_runtime_recovery_preflight_executes_and_followup_router_dispatch
             .iter()
             .any(|value| value == &expected_extraction_id)
     );
-    let followup_projection = wait_for_task_projection_completed(
+    let followup_projection = wait_for_agent_run_projection_completed(
         app,
         followup_root_task_id,
         session_id.as_str(),
         workspace_id.as_str(),
     )
     .await;
-    assert_completed_two_task_projection(&followup_projection);
+    assert_completed_two_agent_run_projection(&followup_projection);
 }
 
 #[tokio::test]
 async fn daemon_bootstrap_exports_session_action_context_summary_after_followup_dispatch() {
     let state_root = temp_state_root("router-bootstrap-context-summary");
     let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
-    let runtime =
-        DaemonRuntime::restore(&config).expect("runtime restore should bootstrap empty state");
+    let runtime = DaemonRuntime::restore_with_test_fixture(&config)
+        .expect("runtime restore should load explicit test fixture");
     let (app, state) = runtime.router_with_state_for_tests("daemon-test".to_string());
     let session_id = SessionId::new("test-session-bootstrap");
     let active_workspace_id = state
@@ -1050,14 +1090,14 @@ async fn daemon_bootstrap_exports_session_action_context_summary_after_followup_
     let first_root_task_id = first_body["rootTaskId"]
         .as_str()
         .expect("root_task_id should serialize as string");
-    let first_projection = wait_for_task_projection_completed(
+    let first_projection = wait_for_agent_run_projection_completed(
         app.clone(),
         first_root_task_id,
         session_id.as_str(),
         active_workspace_id.as_str(),
     )
     .await;
-    assert_completed_two_task_projection(&first_projection);
+    assert_completed_two_agent_run_projection(&first_projection);
 
     let (status, second_body) = post_json(
         app.clone(),
@@ -1094,14 +1134,14 @@ async fn daemon_bootstrap_exports_session_action_context_summary_after_followup_
         second_execution_group["context_memory_extraction_refs"],
         json!([expected_extraction_id])
     );
-    let second_projection = wait_for_task_projection_completed(
+    let second_projection = wait_for_agent_run_projection_completed(
         app.clone(),
         second_root_task_id,
         session_id.as_str(),
         active_workspace_id.as_str(),
     )
     .await;
-    assert_completed_two_task_projection(&second_projection);
+    assert_completed_two_agent_run_projection(&second_projection);
     let bootstrap = get_json(app.clone(), "/bootstrap").await;
     let bootstrap_execution_group = bootstrap["runtimeReadModel"]["details"]["execution_groups"]
         .as_array()
@@ -1125,8 +1165,8 @@ async fn daemon_bootstrap_exports_session_action_context_summary_after_followup_
 async fn daemon_bootstrap_exports_recovery_context_after_resume_and_followup_dispatch() {
     let state_root = temp_state_root("router-bootstrap-recovery-context");
     let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
-    let runtime =
-        DaemonRuntime::restore(&config).expect("runtime restore should bootstrap empty state");
+    let runtime = DaemonRuntime::restore_with_test_fixture(&config)
+        .expect("runtime restore should load explicit test fixture");
     let (app, state) = runtime.router_with_state_for_tests("daemon-test".to_string());
     let session_id = magi_core::SessionId::new("test-session-bootstrap-recovery");
     let active_workspace_id = state
@@ -1224,14 +1264,14 @@ async fn daemon_bootstrap_exports_recovery_context_after_resume_and_followup_dis
     assert_eq!(recovery_body["sessionId"], session_id.to_string());
 
     let expected_extraction_id = "extract-session-continue-recovery-bootstrap-route";
-    let seed_projection = wait_for_task_projection_completed(
+    let seed_projection = wait_for_agent_run_projection_completed(
         app.clone(),
         &seed_root_task_id,
         session_id.as_str(),
         workspace_id.as_str(),
     )
     .await;
-    assert_completed_two_task_projection(&seed_projection);
+    assert_completed_two_agent_run_projection(&seed_projection);
     let after_resume_read_model = get_json(app.clone(), "/runtime/read-model").await;
     let after_resume_bootstrap = get_json(app.clone(), "/bootstrap").await;
     assert_eq!(
@@ -1305,14 +1345,14 @@ async fn daemon_bootstrap_exports_recovery_context_after_resume_and_followup_dis
             .any(|value| value == expected_extraction_id),
         "bootstrap followup execution group should include recovery extraction ref, got {extraction_refs:?}"
     );
-    let followup_projection = wait_for_task_projection_completed(
+    let followup_projection = wait_for_agent_run_projection_completed(
         app.clone(),
         followup_root_task_id,
         session_id.as_str(),
         workspace_id.as_str(),
     )
     .await;
-    assert_completed_two_task_projection(&followup_projection);
+    assert_completed_two_agent_run_projection(&followup_projection);
     let bootstrap = get_json(app.clone(), "/bootstrap").await;
     let bootstrap_execution_group = bootstrap["runtimeReadModel"]["details"]["execution_groups"]
         .as_array()
@@ -2261,8 +2301,8 @@ fn graceful_shutdown_marks_runtime_status_complete_after_final_tick() {
 async fn session_turn_live_events_reach_multiple_subscribers() {
     let state_root = temp_state_root("e2e-session-live-event-subscribers");
     let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
-    let runtime =
-        DaemonRuntime::restore(&config).expect("runtime restore should bootstrap empty state");
+    let runtime = DaemonRuntime::restore_with_test_fixture(&config)
+        .expect("runtime restore should load explicit test fixture");
     let (app, state) = runtime.router_with_state_for_tests("daemon-test".to_string());
 
     let mut first_receiver = state.event_bus.subscribe();
@@ -2331,8 +2371,8 @@ async fn session_turn_persists_without_live_subscriber_and_recovers_after_restar
     let state_root = temp_state_root("e2e-session-no-subscriber-recovery");
     let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root.clone());
 
-    let runtime =
-        DaemonRuntime::restore(&config).expect("runtime restore should bootstrap empty state");
+    let runtime = DaemonRuntime::restore_with_test_fixture(&config)
+        .expect("runtime restore should load explicit test fixture");
     let (app, _state) = runtime.router_with_state_for_tests("daemon-test".to_string());
     let (status, body) = post_json(
         app.clone(),
@@ -2357,8 +2397,7 @@ async fn session_turn_persists_without_live_subscriber_and_recovers_after_restar
         .to_string();
 
     let workspace_sessions_path = state_root
-        .join("bootstrap")
-        .join("workspace")
+        .join("test-workspace")
         .join(".magi")
         .join("sessions.json");
     let durable_payload = fs::read_to_string(&workspace_sessions_path)
@@ -2417,8 +2456,8 @@ async fn workspace_sessions_and_events_stay_workspace_scoped() {
     let state_root = temp_state_root("e2e-workspace-session-isolation");
     let second_workspace_root = temp_state_root("e2e-workspace-session-isolation-second");
     let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root.clone());
-    let runtime =
-        DaemonRuntime::restore(&config).expect("runtime restore should bootstrap empty state");
+    let runtime = DaemonRuntime::restore_with_test_fixture(&config)
+        .expect("runtime restore should load explicit test fixture");
     let (app, state) = runtime.router_with_state_for_tests("daemon-test".to_string());
 
     let (register_status, register_body) = post_json(
@@ -2511,8 +2550,8 @@ async fn workspace_sessions_and_events_stay_workspace_scoped() {
 async fn orchestrator_settings_save_stays_global_when_session_scope_is_supplied() {
     let state_root = temp_state_root("e2e-orchestrator-global-settings");
     let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root.clone());
-    let runtime =
-        DaemonRuntime::restore(&config).expect("runtime restore should bootstrap empty state");
+    let runtime = DaemonRuntime::restore_with_test_fixture(&config)
+        .expect("runtime restore should load explicit test fixture");
     let (app, _state) = runtime.router_with_state_for_tests("daemon-test".to_string());
 
     let (status, body) = post_json(
@@ -2562,8 +2601,8 @@ async fn orchestrator_settings_save_stays_global_when_session_scope_is_supplied(
 async fn session_action_happy_path_creates_tasks_and_records_timeline_messages() {
     let state_root = temp_state_root("e2e-session-action-messages");
     let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
-    let runtime =
-        DaemonRuntime::restore(&config).expect("runtime restore should bootstrap empty state");
+    let runtime = DaemonRuntime::restore_with_test_fixture(&config)
+        .expect("runtime restore should load explicit test fixture");
     let (app, _state) = runtime.router_with_state_for_tests("daemon-test".to_string());
 
     let (status, body) = post_json(
@@ -2597,14 +2636,14 @@ async fn session_action_happy_path_creates_tasks_and_records_timeline_messages()
     let root_task_id = body["rootTaskId"]
         .as_str()
         .expect("root_task_id should serialize as string");
-    let projection = wait_for_task_projection_completed(
+    let projection = wait_for_agent_run_projection_completed(
         app.clone(),
         root_task_id,
         session_id,
         DEFAULT_TEST_WORKSPACE_ID,
     )
     .await;
-    assert_completed_two_task_projection(&projection);
+    assert_completed_two_agent_run_projection(&projection);
 
     let messages_page = get_json(
         app.clone(),
@@ -2662,8 +2701,8 @@ async fn session_action_messages_survive_runtime_restart_and_preserve_message_co
     let state_root = temp_state_root("e2e-session-action-restart-count");
     let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root.clone());
 
-    let runtime = DaemonRuntime::restore(&config)
-        .expect("first runtime restore should bootstrap empty state");
+    let runtime = DaemonRuntime::restore_with_test_fixture(&config)
+        .expect("first runtime restore should load explicit test fixture");
     let (app, _state) = runtime.router_with_state_for_tests("daemon-test".to_string());
 
     let (status, body) = post_json(
@@ -2858,8 +2897,8 @@ async fn session_continue_survives_runtime_restart_with_same_chain_and_worker_br
     let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root.clone());
     let repository = StateRepository::new(state_root.clone());
 
-    let runtime = DaemonRuntime::restore(&config)
-        .expect("first runtime restore should bootstrap empty state");
+    let runtime = DaemonRuntime::restore_with_test_fixture(&config)
+        .expect("first runtime restore should load explicit test fixture");
     let (app, state) = runtime.router_with_state_for_tests("daemon-test".to_string());
 
     let (status, body) = post_json(
@@ -3281,8 +3320,8 @@ async fn workspace_bound_session_continue_survives_runtime_restart() {
     let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root.clone());
     let repository = StateRepository::new(state_root.clone());
 
-    let runtime = DaemonRuntime::restore(&config)
-        .expect("first runtime restore should bootstrap empty state");
+    let runtime = DaemonRuntime::restore_with_test_fixture(&config)
+        .expect("first runtime restore should load explicit test fixture");
     let (app, state) = runtime.router_with_state_for_tests("daemon-test".to_string());
 
     // 不预先创建 session：直接发 turn，让 dispatch 在显式 workspace 下创建会话。
@@ -3358,7 +3397,7 @@ async fn workspace_bound_session_continue_survives_runtime_restart() {
     );
 
     let workspace_session_state = repository
-        .load_workspace_session_state(&config.bootstrap_workspace_root)
+        .load_workspace_session_state(&state_root.join("test-workspace"))
         .expect("workspace session durable state should reload");
     assert!(
         workspace_session_state.sessions.iter().any(|session| {
@@ -3433,8 +3472,8 @@ async fn workspace_bound_session_continue_survives_runtime_restart() {
 async fn session_action_publishes_domain_event_on_event_bus() {
     let state_root = temp_state_root("e2e-session-action-events");
     let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
-    let runtime =
-        DaemonRuntime::restore(&config).expect("runtime restore should bootstrap empty state");
+    let runtime = DaemonRuntime::restore_with_test_fixture(&config)
+        .expect("runtime restore should load explicit test fixture");
     let (app, state) = runtime.router_with_state_for_tests("daemon-test".to_string());
     let active_workspace_id = state
         .workspace_registry
@@ -3497,8 +3536,8 @@ async fn session_action_publishes_domain_event_on_event_bus() {
 async fn sequential_session_actions_share_session_and_accumulate_messages() {
     let state_root = temp_state_root("e2e-sequential-actions");
     let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
-    let runtime =
-        DaemonRuntime::restore(&config).expect("runtime restore should bootstrap empty state");
+    let runtime = DaemonRuntime::restore_with_test_fixture(&config)
+        .expect("runtime restore should load explicit test fixture");
     let (app, _state) = runtime.router_with_state_for_tests("daemon-test".to_string());
 
     let (status, first_body) = post_json(
@@ -3519,14 +3558,14 @@ async fn sequential_session_actions_share_session_and_accumulate_messages() {
         .as_str()
         .expect("first root task id should serialize as string")
         .to_string();
-    let first_projection = wait_for_task_projection_completed(
+    let first_projection = wait_for_agent_run_projection_completed(
         app.clone(),
         &first_root_task_id,
         &session_id,
         DEFAULT_TEST_WORKSPACE_ID,
     )
     .await;
-    assert_completed_two_task_projection(&first_projection);
+    assert_completed_two_agent_run_projection(&first_projection);
 
     let (status, second_body) = post_json(
         app.clone(),
@@ -3546,14 +3585,14 @@ async fn sequential_session_actions_share_session_and_accumulate_messages() {
         .as_str()
         .expect("second root task id should serialize as string")
         .to_string();
-    let second_projection = wait_for_task_projection_completed(
+    let second_projection = wait_for_agent_run_projection_completed(
         app.clone(),
         &second_root_task_id,
         &session_id,
         DEFAULT_TEST_WORKSPACE_ID,
     )
     .await;
-    assert_completed_two_task_projection(&second_projection);
+    assert_completed_two_agent_run_projection(&second_projection);
 
     let messages_page = get_json(
         app.clone(),

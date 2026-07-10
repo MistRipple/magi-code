@@ -21,6 +21,8 @@ pub struct SessionTurnRequestDto {
     pub text: Option<String>,
     pub skill_name: Option<String>,
     #[serde(default)]
+    pub goal_mode: bool,
+    #[serde(default)]
     pub images: Vec<SessionTurnImageDto>,
     #[serde(default)]
     pub access_profile: Option<AccessProfile>,
@@ -82,9 +84,6 @@ impl SessionTurnRequestDto {
     pub fn timeline_message(&self, trimmed_text: Option<&str>) -> String {
         let mut message_lines = Vec::new();
 
-        if let Some(skill_name) = trimmed_non_empty(self.skill_name.as_deref()) {
-            message_lines.push(format!("/{skill_name}"));
-        }
         if let Some(text) = trimmed_text {
             message_lines.push(text.to_string());
         }
@@ -249,6 +248,7 @@ mod tests {
             workspace_path: None,
             text: Some("请分析项目".to_string()),
             skill_name: None,
+            goal_mode: false,
             images: Vec::new(),
             access_profile: None,
             orchestrator_session_config: None,
@@ -277,6 +277,34 @@ mod tests {
         assert_eq!(
             request.requested_access_profile(),
             magi_core::AccessProfile::FullAccess
+        );
+    }
+
+    #[test]
+    fn session_turn_request_accepts_structured_goal_mode() {
+        let request: SessionTurnRequestDto = serde_json::from_value(serde_json::json!({
+            "text": "完成当前产品稳定性验收",
+            "images": [],
+            "goalMode": true
+        }))
+        .expect("request should parse structured goal mode");
+
+        assert!(request.goal_mode);
+    }
+
+    #[test]
+    fn timeline_message_keeps_control_fields_out_of_user_content() {
+        let request: SessionTurnRequestDto = serde_json::from_value(serde_json::json!({
+            "text": "完成稳定性验收",
+            "skillName": "cn-engineering-standard",
+            "goalMode": true,
+            "images": []
+        }))
+        .expect("combined goal and skill request should parse");
+
+        assert_eq!(
+            request.timeline_message(request.trimmed_text().as_deref()),
+            "完成稳定性验收"
         );
     }
 }

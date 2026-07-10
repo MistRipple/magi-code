@@ -617,6 +617,7 @@ mod tests {
                 category: "review".to_string(),
                 tags: vec![],
             },
+            restrict_standard_tools: true,
             allowed_tools: vec![],
             custom_tool_bindings: vec![CustomToolBinding {
                 binding_id: "mcp.review:loopback/server".to_string(),
@@ -674,6 +675,7 @@ mod tests {
                 category: "review".to_string(),
                 tags: vec![],
             },
+            restrict_standard_tools: true,
             allowed_tools: vec![],
             custom_tool_bindings: vec![CustomToolBinding {
                 binding_id: "mcp__review".to_string(),
@@ -718,6 +720,7 @@ mod tests {
                 category: "integration".to_string(),
                 tags: vec!["model".to_string()],
             },
+            restrict_standard_tools: true,
             allowed_tools: vec![],
             custom_tool_bindings: vec![CustomToolBinding {
                 binding_id: "ask.model:openai".to_string(),
@@ -875,6 +878,7 @@ mod tests {
                 category: "integration".to_string(),
                 tags: vec!["mcp".to_string()],
             },
+            restrict_standard_tools: true,
             allowed_tools: vec![],
             custom_tool_bindings: vec![CustomToolBinding {
                 binding_id: "inspect".to_string(),
@@ -930,6 +934,7 @@ mod tests {
                 category: "integration".to_string(),
                 tags: vec!["mcp".to_string()],
             },
+            restrict_standard_tools: true,
             allowed_tools: vec![],
             custom_tool_bindings: vec![CustomToolBinding {
                 binding_id: "inspect".to_string(),
@@ -988,6 +993,7 @@ mod tests {
                 category: "integration".to_string(),
                 tags: vec!["mcp".to_string()],
             },
+            restrict_standard_tools: true,
             allowed_tools: vec![],
             custom_tool_bindings: vec![CustomToolBinding {
                 binding_id: "inspect".to_string(),
@@ -1054,6 +1060,7 @@ mod tests {
                 category: "integration".to_string(),
                 tags: vec!["mcp".to_string()],
             },
+            restrict_standard_tools: true,
             allowed_tools: vec![],
             custom_tool_bindings: vec![CustomToolBinding {
                 binding_id: "inspect".to_string(),
@@ -1121,6 +1128,7 @@ mod tests {
                 category: "integration".to_string(),
                 tags: vec!["model".to_string()],
             },
+            restrict_standard_tools: true,
             allowed_tools: vec![],
             custom_tool_bindings: vec![CustomToolBinding {
                 binding_id: "ask".to_string(),

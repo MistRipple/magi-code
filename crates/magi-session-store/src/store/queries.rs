@@ -5,6 +5,7 @@ use crate::models::{
     SessionRuntimeSidecar, SessionRuntimeSidecarExport, SessionSidecarFlushMetadata, TimelineEntry,
 };
 use magi_core::{ExecutionOwnership, SessionId};
+use std::collections::HashSet;
 
 impl SessionStore {
     pub fn export_state(&self) -> crate::models::SessionStoreState {
@@ -65,6 +66,41 @@ impl SessionStore {
         session_ids.sort_by(|left, right| left.as_str().cmp(right.as_str()));
         session_ids.dedup();
         session_ids
+    }
+
+    /// 汇总 session 历史与当前运行态引用过的全部 TaskId。canonical turn 是持久化事实，
+    /// 因此 daemon 重启后即使进程内 thread registry 已清空，删除会话仍能定位任务树。
+    pub fn execution_task_ids_for_session(&self, session_id: &SessionId) -> Vec<magi_core::TaskId> {
+        let state = self.state.read().expect("session state read lock poisoned");
+        let mut task_ids = HashSet::new();
+        for turn in state
+            .canonical_turns
+            .iter()
+            .filter(|turn| &turn.session_id == session_id)
+        {
+            task_ids.extend(
+                turn.items
+                    .iter()
+                    .filter_map(|item| item.worker.as_ref()?.task_id.clone()),
+            );
+        }
+        for thread in state
+            .thread_registry
+            .iter()
+            .filter(|thread| &thread.session_id == session_id)
+        {
+            task_ids.extend(thread.handled_task_ids.iter().cloned());
+        }
+        if let Some(sidecar) = state.execution_sidecar_store.runtime_sidecar(session_id) {
+            task_ids.extend(sidecar.ownership.task_id.iter().cloned());
+            if let Some(chain) = sidecar.active_execution_chain.as_ref() {
+                task_ids.insert(chain.root_task_id.clone());
+                task_ids.extend(chain.branches.iter().map(|branch| branch.task_id.clone()));
+            }
+        }
+        let mut task_ids = task_ids.into_iter().collect::<Vec<_>>();
+        task_ids.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        task_ids
     }
 
     pub fn current_session(&self) -> Option<SessionRecord> {
@@ -181,21 +217,26 @@ impl SessionStore {
         notifications
     }
 
-    pub fn notifications_for_session(&self, session_id: &SessionId) -> Vec<NotificationRecord> {
+    pub fn notifications_for_context(
+        &self,
+        workspace_id: &str,
+        session_id: Option<&SessionId>,
+    ) -> Vec<NotificationRecord> {
         let mut notifications = self
             .state
             .read()
             .expect("session state read lock poisoned")
             .notifications
             .iter()
-            .filter(|notification| &notification.session_id == session_id)
+            .filter(|notification| notification.visible_in_context(workspace_id, session_id))
             .cloned()
             .collect::<Vec<_>>();
         notifications.sort_by(|left, right| {
-            left.created_at
+            right
+                .created_at
                 .0
-                .cmp(&right.created_at.0)
-                .then_with(|| left.notification_id.cmp(&right.notification_id))
+                .cmp(&left.created_at.0)
+                .then_with(|| right.notification_id.cmp(&left.notification_id))
         });
         notifications
     }

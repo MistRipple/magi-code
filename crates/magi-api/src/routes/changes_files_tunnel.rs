@@ -13,6 +13,7 @@ use std::sync::Arc;
 use magi_bridge_client::ModelInvocationRequest;
 use magi_conversation_runtime::session_turn_execution::BUSINESS_MODEL_PROVIDER;
 use magi_conversation_runtime::task_execution_dispatcher::{RoleTarget, resolve_target_for_role};
+use magi_core::UtcMillis;
 use magi_snapshot::SnapshotSession;
 
 use super::session_scope::{
@@ -21,9 +22,9 @@ use super::session_scope::{
 };
 use crate::{
     change_projection::{
-        SessionChangeScope, WorkspaceChangeScope, pending_changes_state,
-        resolve_session_change_scope, resolve_workspace_change_scope, safe_relative_path,
-        safe_workspace_path,
+        SessionChangeScope, WorkspaceChangeScope, collect_session_pending_changes_with_state,
+        pending_changes_state, resolve_session_change_scope, resolve_workspace_change_scope,
+        safe_relative_path, safe_workspace_path,
     },
     errors::ApiError,
     state::ApiState,
@@ -32,6 +33,7 @@ use crate::{
 
 pub fn routes() -> Router<ApiState> {
     Router::new()
+        .route("/changes", get(list_changes))
         .route("/changes/diff", get(get_diff))
         .route("/changes/approve", post(approve_change))
         .route("/changes/revert", post(revert_change))
@@ -137,6 +139,42 @@ fn resolve_session_change_scope_from_request(
 }
 
 // ─── Changes ────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ChangesQuery {
+    session_id: Option<String>,
+    workspace_id: Option<String>,
+    workspace_path: Option<String>,
+}
+
+async fn list_changes(
+    State(state): State<ApiState>,
+    Query(query): Query<ChangesQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let session_id = parse_session_id(query.session_id.as_deref())?;
+    let scope = resolve_session_change_scope_from_request(
+        &state,
+        &session_id,
+        query.workspace_id.as_deref(),
+        query.workspace_path.as_deref(),
+        None,
+    )?;
+    require_snapshot_session(&state, &scope).await?;
+    let projection = collect_session_pending_changes_with_state(
+        &state,
+        &scope.session_id,
+        Some(scope.workspace_id.as_str()),
+    )?;
+    Ok(Json(serde_json::json!({
+        "generatedAt": UtcMillis::now().0,
+        "sessionId": scope.session_id.as_str(),
+        "workspaceId": scope.workspace_id.as_str(),
+        "workspacePath": workspace_path_string(&scope.workspace_root),
+        "pendingChanges": projection.pending_changes,
+        "pendingChangesState": projection.state,
+    })))
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1577,6 +1615,45 @@ mod tests {
             payload["currentContent"],
             serde_json::json!("alpha changed\n")
         );
+    }
+
+    #[tokio::test]
+    async fn list_changes_returns_current_session_projection() {
+        let state = build_state();
+        let root = unique_temp_dir("magi-changes-route-list");
+        fs::write(root.join("alpha.txt"), "alpha\n").expect("alpha should write");
+        let snap = register_workspace_and_snapshot(
+            &state,
+            "ws-list-changes",
+            "sess-list-changes",
+            &root,
+            None,
+        )
+        .await;
+        fs::write(root.join("alpha.txt"), "alpha changed\n").expect("alpha modify");
+        snap.reconcile().expect("reconcile should succeed");
+
+        let response = routes()
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/changes?sessionId=sess-list-changes&workspaceId=ws-list-changes")
+                    .method("GET")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = read_json_response(response).await;
+        assert_eq!(payload["sessionId"], "sess-list-changes");
+        assert_eq!(payload["workspaceId"], "ws-list-changes");
+        assert_eq!(payload["pendingChangesState"]["status"], "ready");
+        assert_eq!(payload["pendingChangesState"]["pendingCount"], 1);
+        assert_eq!(payload["pendingChanges"][0]["filePath"], "alpha.txt");
+        assert_eq!(payload["pendingChanges"][0]["type"], "modify");
+        assert!(payload["generatedAt"].as_u64().is_some());
     }
 
     #[tokio::test]

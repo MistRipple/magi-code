@@ -160,30 +160,6 @@ pub struct ExecutionGroupRuntimeSummaryEntry {
     pub context_provenance_linked_memory_count: usize,
     pub latest_event_type: Option<String>,
     pub current_status: Option<String>,
-    /// Mission 当前生命周期阶段（snake_case，源自 `MissionLifecyclePhase::as_str()`）。
-    /// 仅当 `MissionAggregate::lifecycle_phase()` 派生成功时填充；charter-draft 等
-    /// 未通过恢复集校验的 mission 会被读端 warn-and-skip，此字段保持 `None`。
-    pub lifecycle_phase: Option<String>,
-    /// Mission 维度累计 metrics 快照（turn / token / wall-clock）。
-    /// 第一次 `record_turn` 之前为 `None`；前端可据此区分"尚未派发"与"已派发但零开销"。
-    pub metrics: Option<MissionMetricsSummary>,
-}
-
-/// `MissionMetrics` 在读模型 DTO 上的轻量镜像。
-///
-/// 注意此结构**居住在 magi-event-bus**：它是 read-model 的字段，不能反向依赖
-/// `magi-mission-metrics`。`magi-api` 的 merger 负责 `MissionMetrics →
-/// MissionMetricsSummary` 的字段拷贝。
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MissionMetricsSummary {
-    pub turn_count: u64,
-    pub total_prompt_tokens: u64,
-    pub total_completion_tokens: u64,
-    pub total_tokens: u64,
-    pub wall_clock_millis: u64,
-    pub first_turn_started_at: Option<UtcMillis>,
-    pub last_turn_finished_at: Option<UtcMillis>,
-    pub last_lifecycle_phase: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -374,6 +350,26 @@ pub struct SessionRuntimeBudgetEntry {
     pub warning_level: String,
 }
 
+/// 会话最近一次上下文压缩记录。
+///
+/// 这是面向产品可见性的结构化摘要：conversation runtime 完成真实历史替换后
+/// 发布 `session.context.compacted`，读模型只保留最近一次，前端据此解释上下文
+/// 圆环在自动压缩后的状态变化。
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct SessionRuntimeContextCompactionEntry {
+    pub reason: String,
+    pub phase: Option<String>,
+    pub original_message_count: u64,
+    pub compacted_message_count: u64,
+    pub original_token_estimate: u64,
+    pub compacted_token_estimate: u64,
+    pub context_window_tokens: Option<u64>,
+    pub token_limit: Option<u64>,
+    pub threshold_tokens: Option<u64>,
+    pub resolved_model: Option<String>,
+    pub compacted_at: Option<UtcMillis>,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct SessionRuntimeSummaryEntry {
     pub session_id: String,
@@ -403,6 +399,8 @@ pub struct SessionRuntimeSummaryEntry {
     pub usage_observation: Option<SessionRuntimeUsageObservation>,
     /// 上下文预算快照，由 magi-api 装配 DTO 时用 usage-authority 计算填充。
     pub budget: Option<SessionRuntimeBudgetEntry>,
+    /// 最近一次上下文压缩记录。
+    pub context_compaction: Option<SessionRuntimeContextCompactionEntry>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -1123,6 +1121,9 @@ impl RuntimeReadModelInput {
                 session_entry.latest_event_type = Some(event.event_type.clone());
                 if let Some(observation) = usage_observation_from_event(event) {
                     session_entry.usage_observation = Some(observation);
+                }
+                if let Some(compaction) = context_compaction_from_event(event) {
+                    session_entry.context_compaction = Some(compaction);
                 }
                 collect_unique_option_string(
                     &mut session_entry.active_execution_group_ids,
@@ -2211,6 +2212,64 @@ fn usage_observation_from_event(event: &EventEnvelope) -> Option<SessionRuntimeU
     usage_observation_from_payload(&event.event_type, &event.payload)
 }
 
+fn context_compaction_from_event(
+    event: &EventEnvelope,
+) -> Option<SessionRuntimeContextCompactionEntry> {
+    if event.event_type != "session.context.compacted" {
+        return None;
+    }
+    let payload = &event.payload;
+    let reason = payload
+        .get("reason")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+    let compacted_at = payload
+        .get("compacted_at")
+        .and_then(serde_json::Value::as_u64)
+        .map(UtcMillis)
+        .or(Some(event.occurred_at));
+
+    Some(SessionRuntimeContextCompactionEntry {
+        reason,
+        phase: payload
+            .get("phase")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        original_message_count: payload
+            .get("original_message_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        compacted_message_count: payload
+            .get("compacted_message_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        original_token_estimate: payload
+            .get("original_token_estimate")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        compacted_token_estimate: payload
+            .get("compacted_token_estimate")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        context_window_tokens: payload
+            .get("context_window_tokens")
+            .and_then(serde_json::Value::as_u64),
+        token_limit: payload
+            .get("token_limit")
+            .and_then(serde_json::Value::as_u64),
+        threshold_tokens: payload
+            .get("threshold_tokens")
+            .and_then(serde_json::Value::as_u64),
+        resolved_model: payload
+            .get("resolved_model")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string),
+        compacted_at,
+    })
+}
+
 /// 从 `model.usage.recorded` 负载提取上下文窗口观测值。
 ///
 /// 反孤儿:既服务于实时 `recent_events` 投影,也服务于守护进程重启后从
@@ -2899,6 +2958,53 @@ mod tests {
             .expect("usage observation should be recorded");
 
         assert_eq!(observation.context_window_tokens, 18_000);
+    }
+
+    #[test]
+    fn session_context_compacted_records_latest_session_compaction() {
+        let mut compacted_event = EventEnvelope::domain(
+            EventId::new("event-session-context-compacted"),
+            "session.context.compacted",
+            json!({
+                "reason": "context_window_pressure",
+                "phase": "turn_start",
+                "original_message_count": 42,
+                "compacted_message_count": 9,
+                "original_token_estimate": 180_000,
+                "compacted_token_estimate": 36_000,
+                "context_window_tokens": 245_000,
+                "token_limit": 272_000,
+                "threshold_tokens": 244_800,
+                "resolved_model": "gpt-5-codex",
+                "compacted_at": 1_700_000_000_002_u64
+            }),
+        )
+        .with_context(EventContext {
+            session_id: Some(SessionId::new("session-compacted")),
+            ..EventContext::default()
+        });
+        compacted_event.sequence = 1;
+
+        let read_model = RuntimeReadModelInput::from_events(&[compacted_event]);
+        let compaction = read_model
+            .details
+            .sessions
+            .iter()
+            .find(|entry| entry.session_id == "session-compacted")
+            .and_then(|entry| entry.context_compaction.as_ref())
+            .expect("session compaction summary should be recorded");
+
+        assert_eq!(compaction.reason, "context_window_pressure");
+        assert_eq!(compaction.phase.as_deref(), Some("turn_start"));
+        assert_eq!(compaction.original_message_count, 42);
+        assert_eq!(compaction.compacted_message_count, 9);
+        assert_eq!(compaction.original_token_estimate, 180_000);
+        assert_eq!(compaction.compacted_token_estimate, 36_000);
+        assert_eq!(compaction.context_window_tokens, Some(245_000));
+        assert_eq!(compaction.token_limit, Some(272_000));
+        assert_eq!(compaction.threshold_tokens, Some(244_800));
+        assert_eq!(compaction.resolved_model.as_deref(), Some("gpt-5-codex"));
+        assert_eq!(compaction.compacted_at, Some(UtcMillis(1_700_000_000_002)));
     }
 
     #[test]

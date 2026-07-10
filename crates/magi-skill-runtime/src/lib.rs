@@ -47,6 +47,8 @@ pub struct SkillDefinition {
     pub title: String,
     pub instruction: String,
     pub metadata: SkillMetadata,
+    #[serde(default)]
+    pub restrict_standard_tools: bool,
     pub allowed_tools: Vec<String>,
     pub custom_tool_bindings: Vec<CustomToolBinding>,
     pub prompt_priority: u32,
@@ -193,6 +195,13 @@ pub struct SkillRuntime {
     registry: SkillRegistry,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SkillIdResolution {
+    Found(String),
+    NotFound,
+    Ambiguous(Vec<String>),
+}
+
 impl SkillRegistry {
     pub fn new() -> Self {
         Self::default()
@@ -232,9 +241,43 @@ impl SkillRegistry {
         skills
     }
 
+    pub fn resolve_skill_id(&self, requested: &str) -> SkillIdResolution {
+        let requested = requested.trim();
+        if requested.is_empty() {
+            return SkillIdResolution::NotFound;
+        }
+        if self.get(requested).is_some() {
+            return SkillIdResolution::Found(requested.to_string());
+        }
+
+        let requested_normalized = requested.to_ascii_lowercase();
+        let mut matches = self
+            .list()
+            .into_iter()
+            .filter(|skill| {
+                let skill_id = skill.skill_id.trim();
+                let short_name = skill_id.rsplit('/').next().unwrap_or(skill_id);
+                short_name.eq_ignore_ascii_case(&requested_normalized)
+                    || skill
+                        .title
+                        .trim()
+                        .eq_ignore_ascii_case(&requested_normalized)
+            })
+            .map(|skill| skill.skill_id)
+            .collect::<Vec<_>>();
+        matches.sort();
+        matches.dedup();
+        match matches.as_slice() {
+            [skill_id] => SkillIdResolution::Found(skill_id.clone()),
+            [] => SkillIdResolution::NotFound,
+            _ => SkillIdResolution::Ambiguous(matches),
+        }
+    }
+
     pub fn is_tool_allowed(&self, skill_id: &str, tool_name: &str) -> bool {
         self.get(skill_id).is_some_and(|skill| {
-            skill.allowed_tools.iter().any(|tool| tool == tool_name)
+            !skill.restrict_standard_tools
+                || skill.allowed_tools.iter().any(|tool| tool == tool_name)
                 || skill
                     .custom_tool_bindings
                     .iter()
@@ -289,6 +332,11 @@ impl SkillRegistry {
     }
 
     pub fn build_tool_runtime_plan(&self, selection: &SkillSelection) -> SkillToolRuntimePlan {
+        let restrict_standard_tools = selection
+            .skill_ids
+            .iter()
+            .filter_map(|skill_id| self.get(skill_id))
+            .any(|skill| skill.restrict_standard_tools);
         let resolved = self.resolve_context(selection);
         let mut routing = routing::classify_requested_tools(
             &selection.requested_tools,
@@ -329,9 +377,15 @@ impl SkillRegistry {
             skill_ids: resolved.skill_ids.clone(),
             tool_policy: ToolExecutionPolicy {
                 access_profile: magi_core::AccessProfile::Restricted,
-                source_skill_ids: resolved.skill_ids.clone(),
-                allowed_tool_names: allowed_builtin_tools,
-                denied_tool_names: denied_builtin_tools,
+                source_skill_ids: restrict_standard_tools
+                    .then_some(resolved.skill_ids.clone())
+                    .unwrap_or_default(),
+                allowed_tool_names: restrict_standard_tools
+                    .then_some(allowed_builtin_tools)
+                    .unwrap_or_default(),
+                denied_tool_names: restrict_standard_tools
+                    .then_some(denied_builtin_tools)
+                    .unwrap_or_default(),
                 ..ToolExecutionPolicy::default()
             },
             routing: routing.clone(),
@@ -364,13 +418,16 @@ impl SkillRuntime {
     }
 
     pub fn is_tool_allowed(&self, skill_ids: &[String], tool_name: &str) -> bool {
-        self.resolve(SkillSelection {
+        let plan = self.build_tool_runtime_plan(SkillSelection {
             skill_ids: skill_ids.to_vec(),
             requested_tools: vec![tool_name.to_string()],
-        })
-        .allowed_tools
-        .iter()
-        .any(|tool| tool == tool_name)
+        });
+        plan.tool_policy.source_skill_ids.is_empty()
+            || plan
+                .tool_policy
+                .allowed_tool_names
+                .iter()
+                .any(|tool| tool == tool_name)
     }
 }
 
@@ -647,6 +704,7 @@ mod tests {
                 category: "general".to_string(),
                 tags: vec!["tag".to_string()],
             },
+            restrict_standard_tools: true,
             allowed_tools: vec!["file_read".to_string()],
             custom_tool_bindings: vec![],
             prompt_priority: 10,
@@ -695,6 +753,7 @@ mod tests {
                 category: "general".to_string(),
                 tags: vec!["tag".to_string()],
             },
+            restrict_standard_tools: true,
             allowed_tools: vec!["file_read".to_string()],
             custom_tool_bindings: vec![],
             prompt_priority: 10,
@@ -747,6 +806,7 @@ mod tests {
                 category: "general".to_string(),
                 tags: vec!["tag".to_string()],
             },
+            restrict_standard_tools: true,
             allowed_tools: vec!["file_remove".to_string()],
             custom_tool_bindings: vec![],
             prompt_priority: 10,
@@ -802,6 +862,7 @@ mod tests {
                 category: "general".to_string(),
                 tags: vec!["tag".to_string()],
             },
+            restrict_standard_tools: true,
             allowed_tools: vec!["cwd_echo".to_string()],
             custom_tool_bindings: vec![],
             prompt_priority: 10,
@@ -851,6 +912,7 @@ mod tests {
                 category: "general".to_string(),
                 tags: vec!["tag".to_string()],
             },
+            restrict_standard_tools: true,
             allowed_tools: vec![],
             custom_tool_bindings: vec![CustomToolBinding {
                 binding_id: "binding-b".to_string(),
@@ -909,6 +971,7 @@ mod tests {
                 category: "general".to_string(),
                 tags: vec!["mcp".to_string()],
             },
+            restrict_standard_tools: true,
             allowed_tools: vec![],
             custom_tool_bindings: vec![CustomToolBinding {
                 binding_id: "binding-mcp".to_string(),
@@ -992,6 +1055,7 @@ mod tests {
                 category: "general".to_string(),
                 tags: vec!["mcp".to_string()],
             },
+            restrict_standard_tools: true,
             allowed_tools: vec![],
             custom_tool_bindings: vec![CustomToolBinding {
                 binding_id: "binding-mcp-read-only".to_string(),
@@ -1069,6 +1133,7 @@ mod tests {
                 category: "general".to_string(),
                 tags: vec!["mcp".to_string()],
             },
+            restrict_standard_tools: true,
             allowed_tools: vec![],
             custom_tool_bindings: vec![CustomToolBinding {
                 binding_id: "binding-mcp-full".to_string(),
@@ -1138,6 +1203,7 @@ mod tests {
                 category: "general".to_string(),
                 tags: vec!["mcp".to_string()],
             },
+            restrict_standard_tools: true,
             allowed_tools: vec![],
             custom_tool_bindings: vec![CustomToolBinding {
                 binding_id: "binding-mcp-effective-read-only".to_string(),
@@ -1215,6 +1281,7 @@ mod tests {
                 category: "general".to_string(),
                 tags: vec!["tag".to_string()],
             },
+            restrict_standard_tools: true,
             allowed_tools: vec![],
             custom_tool_bindings: vec![CustomToolBinding {
                 binding_id: "binding-c".to_string(),
@@ -1306,6 +1373,7 @@ mod tests {
                 category: "general".to_string(),
                 tags: vec!["tag".to_string()],
             },
+            restrict_standard_tools: true,
             allowed_tools: vec![],
             custom_tool_bindings: vec![CustomToolBinding {
                 binding_id: "business-failure".to_string(),
@@ -1377,6 +1445,7 @@ mod tests {
                 category: "general".to_string(),
                 tags: vec![],
             },
+            restrict_standard_tools: true,
             allowed_tools: vec!["file_read".to_string()],
             custom_tool_bindings: vec![],
             prompt_priority: 10,
@@ -1433,6 +1502,7 @@ mod tests {
                 category: "general".to_string(),
                 tags: vec![],
             },
+            restrict_standard_tools: true,
             allowed_tools: vec![],
             custom_tool_bindings: vec![
                 CustomToolBinding {
@@ -1508,6 +1578,7 @@ mod tests {
                 category: "general".to_string(),
                 tags: vec![],
             },
+            restrict_standard_tools: true,
             allowed_tools: vec![],
             custom_tool_bindings: vec![CustomToolBinding {
                 binding_id: "binding-exists".to_string(),
@@ -1574,6 +1645,7 @@ mod tests {
                 category: "general".to_string(),
                 tags: vec![],
             },
+            restrict_standard_tools: true,
             allowed_tools: vec!["file_read".to_string()],
             custom_tool_bindings: vec![],
             prompt_priority: 10,
@@ -1655,6 +1727,7 @@ mod tests {
                 category: "general".to_string(),
                 tags: vec![],
             },
+            restrict_standard_tools: true,
             allowed_tools: vec!["file_read".to_string()],
             custom_tool_bindings: vec![CustomToolBinding {
                 binding_id: "binding-mixed".to_string(),
@@ -1793,6 +1866,7 @@ mod tests {
                 category: "general".to_string(),
                 tags: vec![],
             },
+            restrict_standard_tools: true,
             allowed_tools: vec!["file_read".to_string()],
             custom_tool_bindings: vec![CustomToolBinding {
                 binding_id: "binding-obs".to_string(),

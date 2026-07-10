@@ -6,11 +6,14 @@ use crate::session_writeback::{
     upsert_session_turn_item_with_task_store,
 };
 use crate::task_execution_registry::TaskExecutionRegistry;
-use crate::task_helpers::task_is_long_mission;
 use crate::task_runner_bridge::TaskOutcome;
 use crate::tool_result_utils::{
     infer_tool_call_status, model_visible_tool_result, summarize_tool_result,
     tool_execution_status_label, turn_item_status_for_tool_result,
+};
+use crate::tool_surface_state::{
+    activate_skill_tool_definitions, activated_skill_id_from_tool_result,
+    refresh_live_mcp_tool_definitions,
 };
 use crate::{
     ConversationRegistry, MailboxAuthor, MailboxItem, MailboxKind, RoundOutcome,
@@ -25,11 +28,15 @@ use crate::{
 use crate::{
     model_error::{provider_empty_assistant_response_error, public_model_invocation_error_message},
     prompt_utils::{
-        current_turn_context_priority_prompt, normalize_model_visible_content,
-        workspace_context_system_prompt,
+        PromptFragmentKind, current_turn_context_priority_prompt,
+        normalize_model_stream_preview_content, normalize_model_visible_content,
+        render_prompt_fragment, system_prompt_fragment_message, workspace_context_system_prompt,
     },
     session_images::{SessionTurnImage, session_turn_image_sources},
-    usage_recording::{ModelUsageBinding, publish_model_usage_record, record_mission_turn},
+    usage_recording::{
+        ModelUsageBinding, account_active_goal_turn, publish_model_usage_record,
+        record_mission_turn,
+    },
 };
 use magi_bridge_client::{
     ChatMessage, ChatToolCall, ChatToolDefinition, LOOPBACK_MODEL_PROVIDER, ModelBridgeClient,
@@ -90,32 +97,6 @@ pub struct ConversationLoopRequest<'a> {
     /// 不绑定 workspace（极少数 orchestration-only 场景），此时不注入 prompt、
     /// 也不允许 `memory_write` 工具调用成功。
     pub project_memory: Option<&'a magi_project_memory::ProjectMemoryStore>,
-    /// 任务系统 — Tier 4 / L15：当前 workspace 的 MissionCharter 索引。`None` 表示
-    /// 当前 task 不绑定 workspace（极少数 orchestration-only 场景），此时不注入 prompt、
-    /// 也不允许 `mission_charter_write` 工具调用成功。
-    pub mission_charter: Option<&'a magi_mission_charter::MissionCharterStore>,
-    /// 任务系统 — Tier 4 / L16：当前 workspace 的 Plan 索引。`None` 表示当前 task
-    /// 不绑定 workspace；此时不注入 prompt，也不允许 `plan_write` 工具调用成功。
-    pub plan: Option<&'a magi_plan::PlanStore>,
-    /// 任务系统 — Tier 4 / L17：当前 workspace 的 MissionWorkspace 索引。`None`
-    /// 表示当前 task 不绑定 workspace；此时不注入工作目录视图。
-    pub mission_workspace: Option<&'a magi_mission_workspace::MissionWorkspaceStore>,
-    /// 任务系统 — Tier 4 / L18：当前 workspace 的 KnowledgeGraph 索引。`None`
-    /// 表示当前 task 不绑定 workspace；此时不注入 KG 视图，也不允许 `kg_write` 工具落盘。
-    pub knowledge_graph: Option<&'a magi_knowledge_graph::KnowledgeGraphStore>,
-    /// 任务系统 — Tier 4 / L19：当前 workspace 的 ValidationRunner 索引。`None`
-    /// 表示当前 task 不绑定 workspace；此时不注入验证摘要，也不允许 `validation_record`
-    /// 工具落盘。Coordinator 凭这里的 Pass/Fail 判定 Plan 节点是否真完成。
-    pub validation_runner: Option<&'a magi_validation_runner::ValidationStore>,
-    /// 任务系统 — Tier 4 / L20：当前 workspace 的 Checkpoint 索引。`None`
-    /// 表示当前 task 不绑定 workspace；此时不注入最近检查点列表，也不允许
-    /// `checkpoint_create` 工具落盘。append-only 语义，仅追加不修改。
-    pub checkpoint: Option<&'a magi_checkpoint::CheckpointStore>,
-    /// 任务系统 — Tier 4 / L21：当前 workspace 的 HumanCheckpoint 索引。`None`
-    /// 表示当前 task 不绑定 workspace 或长任务 store 打开失败；此时不注入人工审核点摘要，
-    /// 也不允许 `human_checkpoint_request` 工具落盘。长任务缺少 store 时，agent_spawn
-    /// 会在工具层失败，避免绕过 pending 检查。
-    pub human_checkpoint: Option<&'a magi_human_checkpoint::HumanCheckpointStore>,
     /// codex goal 桥：mission 维度记账 sidecar 句柄。`None` 表示当前 task 未绑定
     /// workspace 或 dispatcher 未注入 metrics（旧路径回退），此时不做记账写入。
     /// 设计上每轮 LLM 调用后调用一次 `record_mission_turn`，与 `publish_model_usage_record`
@@ -466,24 +447,27 @@ fn build_thread_history_compaction_message(
         .collect::<Vec<_>>()
         .join("\n");
 
-    let content = format!(
-        "[context_compaction]\n\
+    let content = render_prompt_fragment(
+        PromptFragmentKind::ThreadHistoryBoundary,
+        format!(
+            "[context_compaction]\n\
 这是 Magi 自动生成的当前 thread 早期历史摘要，用于替代已压缩的完整消息。它是历史事实；如果它与后续保留的完整消息冲突，以后续完整消息为准。\n\
 压缩范围：{} 条消息；压缩前估算 token：{}；角色分布：{}。\n\
 关键历史摘录：\n{}\n\
 [/context_compaction]",
-        compacted_prefix.len(),
-        original_tokens,
-        if role_summary.is_empty() {
-            "无".to_string()
-        } else {
-            role_summary
-        },
-        if excerpts.is_empty() {
-            "- 无".to_string()
-        } else {
-            excerpts
-        }
+            compacted_prefix.len(),
+            original_tokens,
+            if role_summary.is_empty() {
+                "无".to_string()
+            } else {
+                role_summary
+            },
+            if excerpts.is_empty() {
+                "- 无".to_string()
+            } else {
+                excerpts
+            }
+        ),
     );
 
     ThreadChatMessage {
@@ -556,6 +540,19 @@ fn compact_and_replace_thread_history(
     let compacted_count = compacted.len();
     let compacted_tokens = estimate_thread_history_tokens(&compacted);
     session_store.replace_thread_messages(thread_id, compacted.clone(), UtcMillis::now());
+    let compacted_at = UtcMillis::now();
+    let mut context_payload = serde_json::json!({
+        "title": "上下文已自动压缩",
+        "thread_id": thread_id.to_string(),
+        "session_id": session_id.to_string(),
+        "phase": phase,
+        "reason": decision.reason_label(),
+        "original_message_count": original_count,
+        "compacted_message_count": compacted_count,
+        "original_token_estimate": original_tokens,
+        "compacted_token_estimate": compacted_tokens,
+        "compacted_at": compacted_at.0,
+    });
     match &decision {
         ThreadHistoryCompactionDecision::ContextWindowPressure {
             tokens_used,
@@ -563,6 +560,21 @@ fn compact_and_replace_thread_history(
             threshold_tokens,
             resolved_model,
         } => {
+            if let Some(payload) = context_payload.as_object_mut() {
+                payload.insert(
+                    "context_window_tokens".to_string(),
+                    serde_json::json!(*tokens_used),
+                );
+                payload.insert("token_limit".to_string(), serde_json::json!(*token_limit));
+                payload.insert(
+                    "threshold_tokens".to_string(),
+                    serde_json::json!(*threshold_tokens),
+                );
+                payload.insert(
+                    "resolved_model".to_string(),
+                    serde_json::json!(resolved_model.as_deref().unwrap_or("")),
+                );
+            }
             tracing::info!(
                 thread_id = %thread_id,
                 session_id = %session_id,
@@ -583,6 +595,20 @@ fn compact_and_replace_thread_history(
             estimated_tokens,
             threshold_tokens,
         } => {
+            if let Some(payload) = context_payload.as_object_mut() {
+                payload.insert(
+                    "context_window_tokens".to_string(),
+                    serde_json::json!(*estimated_tokens as u64),
+                );
+                payload.insert(
+                    "token_limit".to_string(),
+                    serde_json::json!(DEFAULT_CONTEXT_WINDOW.max(0) as u64),
+                );
+                payload.insert(
+                    "threshold_tokens".to_string(),
+                    serde_json::json!(*threshold_tokens as u64),
+                );
+            }
             tracing::info!(
                 thread_id = %thread_id,
                 session_id = %session_id,
@@ -598,6 +624,20 @@ fn compact_and_replace_thread_history(
             );
         }
     }
+    let _ = event_bus.publish(
+        EventEnvelope::domain(
+            EventId::new(format!(
+                "event-session-context-compacted-{}",
+                compacted_at.0
+            )),
+            "session.context.compacted",
+            context_payload,
+        )
+        .with_context(EventContext {
+            session_id: Some(session_id.clone()),
+            ..EventContext::default()
+        }),
+    );
     compacted
 }
 
@@ -718,13 +758,6 @@ fn run_conversation_loop_inner(
         safety_gate,
         todo_ledger,
         project_memory,
-        mission_charter,
-        plan,
-        mission_workspace,
-        knowledge_graph,
-        validation_runner,
-        checkpoint,
-        human_checkpoint,
         mission_metrics,
         task,
         task_id,
@@ -749,7 +782,7 @@ fn run_conversation_loop_inner(
 
     let mut messages = Vec::new();
     // ===================================================================
-    // 17 段 prompt 装配 · 缓存边界 (Phase 3.2)
+    // Prompt 装配 · 缓存边界
     // -------------------------------------------------------------------
     // S-ID 是逻辑标识（外部 dispatcher / docs 交叉引用稳定），下方
     // **emission order 按 LLM prompt 缓存友好度重排**：STATIC → SEMI-STATIC
@@ -759,19 +792,12 @@ fn run_conversation_loop_inner(
     //   Tier A · STATIC      —— 同一角色 / workspace / mission 多轮内不变
     //     S1   角色 / agent role 系统提示  (assemble_prompt 上游产出)
     //     S8b  Workspace 根目录上下文
-    //     S13  Mission Workspace 路径
     //
-    //   Tier B · SEMI-STATIC —— 同一 mission 跨轮通常稳定，偶有更新
+    //   Tier B · SEMI-STATIC —— 同一项目跨轮通常稳定，偶有更新
     //     S10  ProjectMemory 索引
-    //     S11  MissionCharter
     //
     //   Tier C · DYNAMIC     —— 每轮都可能变化
     //     S9   TodoLedger 快照
-    //     S12  Plan
-    //     S14  KnowledgeGraph
-    //     S15  ValidationRunner
-    //     S16  Checkpoint
-    //     S17  HumanCheckpoint
     //     Mailbox 待处理消息
     //     Thread 历史 (append-only — 前缀稳定，append 不破前缀缓存)
     //     本轮 user 输入 (S2-S8 由 assemble_prompt 预拼装)
@@ -784,7 +810,7 @@ fn run_conversation_loop_inner(
     //   S4 task_fact_context
     //   S5 skill prompt injections (apply_skill_prompt_injections)
     //   S6 用户规则 (settings.userRules)
-    //   S7 生命周期通知 (`<system-reminder>` 包装)
+    //   S7 安全规则
     //   S8 SafetyGate 危险模式
     //  S2-S8 进 `prompt` 用户消息，位于运行时尾部。
     // ===================================================================
@@ -792,49 +818,20 @@ fn run_conversation_loop_inner(
     // -------- Tier A · STATIC --------
     // [CACHE: STATIC] S1 · 角色 / agent role 系统提示。
     if let Some(system) = system_prompt {
-        messages.push(ChatMessage {
-            role: "system".to_string(),
-            content: Some(system),
-            images: Vec::new(),
-            tool_calls: Vec::new(),
-            tool_call_id: None,
-        });
+        messages.push(system_prompt_fragment_message(
+            PromptFragmentKind::Role,
+            system,
+        ));
     }
     // [CACHE: STATIC] S8b · Workspace 根目录上下文。
     // 引导模型把"当前项目 / current repo"等措辞默认对齐到该 workspace；
     // 并强制 Git 状态命令前必须先做 NOT_GIT_WORKTREE 探测。
     if let Some(root_path) = workspace_root_path.as_ref() {
-        messages.push(ChatMessage {
-            role: "system".to_string(),
-            content: Some(workspace_context_system_prompt(
-                &root_path.display().to_string(),
-            )),
-            images: Vec::new(),
-            tool_calls: Vec::new(),
-            tool_call_id: None,
-        });
+        messages.push(system_prompt_fragment_message(
+            PromptFragmentKind::WorkspaceContext,
+            workspace_context_system_prompt(&root_path.display().to_string()),
+        ));
     }
-    // [CACHE: STATIC] S13 · Mission Workspace 路径。
-    // 告知 agent 当前 mission 独占的 artifacts/logs/memory 目录，
-    // 引导其把产物落在 mission 内，避免散落到用户主目录或随机临时目录。
-    // 路径自 mission 创建后不变，因此前移到 STATIC 层。
-    if let Some(store) = mission_workspace {
-        match store.render_for_prompt(&task.mission_id) {
-            Ok(rendered) => {
-                messages.push(ChatMessage {
-                    role: "system".to_string(),
-                    content: Some(rendered),
-                    images: Vec::new(),
-                    tool_calls: Vec::new(),
-                    tool_call_id: None,
-                });
-            }
-            Err(err) => {
-                tracing::warn!(error = %err, "MissionWorkspace: 渲染 prompt 失败，本轮跳过");
-            }
-        }
-    }
-
     // ---- Cache breakpoint · STATIC → NON-STATIC ----
     // 上面 Tier A 三段同一角色 / workspace / mission 多轮不变，是 prompt
     // 缓存命中的真正受益面。这里插入一条 boundary 标记消息，下游
@@ -872,13 +869,10 @@ fn run_conversation_loop_inner(
         };
         match rendered {
             Ok(Some(rendered)) => {
-                messages.push(ChatMessage {
-                    role: "system".to_string(),
-                    content: Some(rendered),
-                    images: Vec::new(),
-                    tool_calls: Vec::new(),
-                    tool_call_id: None,
-                });
+                messages.push(system_prompt_fragment_message(
+                    PromptFragmentKind::ProjectMemory,
+                    rendered,
+                ));
             }
             Ok(None) => {}
             Err(err) => {
@@ -886,154 +880,23 @@ fn run_conversation_loop_inner(
             }
         }
     }
-    // [CACHE: SEMI-STATIC] S11 · MissionCharter。
-    // 当前 mission 的"宪章"（goal / 成功标准 / 约束）作为长效锚点，
-    // 长对话或多 Turn 时让 orchestrator 不会偏离最初承诺。mission 创建时
-    // 锚定，仅在显式编辑后变化。
-    if let Some(store) = mission_charter {
-        match store.render_for_prompt(&task.mission_id) {
-            Ok(Some(rendered)) => {
-                messages.push(ChatMessage {
-                    role: "system".to_string(),
-                    content: Some(rendered),
-                    images: Vec::new(),
-                    tool_calls: Vec::new(),
-                    tool_call_id: None,
-                });
-            }
-            Ok(None) => {}
-            Err(err) => {
-                tracing::warn!(error = %err, "MissionCharter: 渲染 prompt 失败，本轮跳过");
-            }
-        }
-    }
-
     // -------- Tier C · DYNAMIC --------
     // [CACHE: DYNAMIC] S9 · TodoLedger 快照。
     // 本 session 模型在之前轮次写过 todo_write 时，这里把当前列表渲染进 system prompt，
     // 让本轮 Turn 起点自动看到分解 + 进度。每轮 todo_write 后变化。
     if let Some(rendered) = todo_ledger.render_for_prompt() {
-        messages.push(ChatMessage {
-            role: "system".to_string(),
-            content: Some(rendered),
-            images: Vec::new(),
-            tool_calls: Vec::new(),
-            tool_call_id: None,
-        });
-    }
-    // [CACHE: DYNAMIC] S12 · Plan。
-    // 当前 mission 的执行计划（steps + 状态 + 依赖）让 orchestrator 在多 Turn
-    // 推进时持续看到"下一步是什么、上一步是否做完"，避免漂移。Plan step 状态
-    // 切换会触发变化。
-    if let Some(store) = plan {
-        match store.render_for_prompt(&task.mission_id) {
-            Ok(Some(rendered)) => {
-                messages.push(ChatMessage {
-                    role: "system".to_string(),
-                    content: Some(rendered),
-                    images: Vec::new(),
-                    tool_calls: Vec::new(),
-                    tool_call_id: None,
-                });
-            }
-            Ok(None) => {}
-            Err(err) => {
-                tracing::warn!(error = %err, "Plan: 渲染 prompt 失败，本轮跳过");
-            }
-        }
-    }
-    // [CACHE: DYNAMIC] S14 · KnowledgeGraph。
-    // 把 mission 已经累积的 symbols / decisions / risks 摊在系统提示里，
-    // 避免长 mission 跨多个 Conversation 时模型重新讨论已经达成的结论。
-    if let Some(store) = knowledge_graph {
-        match store.render_for_prompt(&task.mission_id) {
-            Ok(Some(rendered)) => {
-                messages.push(ChatMessage {
-                    role: "system".to_string(),
-                    content: Some(rendered),
-                    images: Vec::new(),
-                    tool_calls: Vec::new(),
-                    tool_call_id: None,
-                });
-            }
-            Ok(None) => {}
-            Err(err) => {
-                tracing::warn!(error = %err, "KnowledgeGraph: 渲染 prompt 失败，本轮跳过");
-            }
-        }
-    }
-    // [CACHE: DYNAMIC] S15 · ValidationRunner。
-    // 把 mission 当前的 Plan 节点验证结果（test_suite / type_check /
-    // integration_smoke / benchmark 的 pass/fail/skipped）摊在系统提示里，
-    // 让模型在判断"Plan 节点是否真完成"时直接看到验证证据，而不是凭印象口头声明。
-    if let Some(store) = validation_runner {
-        match store.render_for_prompt(&task.mission_id) {
-            Ok(Some(rendered)) => {
-                messages.push(ChatMessage {
-                    role: "system".to_string(),
-                    content: Some(rendered),
-                    images: Vec::new(),
-                    tool_calls: Vec::new(),
-                    tool_call_id: None,
-                });
-            }
-            Ok(None) => {}
-            Err(err) => {
-                tracing::warn!(error = %err, "ValidationRunner: 渲染 prompt 失败，本轮跳过");
-            }
-        }
-    }
-    // [CACHE: DYNAMIC] S16 · Checkpoint。
-    // 把当前 mission 最近若干检查点摊在系统提示里，让模型在跨进程重启 /
-    // context 压缩 / phase 切换之后能定位"上次落到哪一步"，决定是否需要从某个
-    // checkpoint 重新拉起 mission。
-    if let Some(store) = checkpoint {
-        match store.render_for_prompt(&task.mission_id) {
-            Ok(Some(rendered)) => {
-                messages.push(ChatMessage {
-                    role: "system".to_string(),
-                    content: Some(rendered),
-                    images: Vec::new(),
-                    tool_calls: Vec::new(),
-                    tool_call_id: None,
-                });
-            }
-            Ok(None) => {}
-            Err(err) => {
-                tracing::warn!(error = %err, "Checkpoint: 渲染 prompt 失败，本轮跳过");
-            }
-        }
-    }
-    // [CACHE: DYNAMIC] S17 · HumanCheckpoint。
-    // 把当前 mission 待解决的人工审核点与最近若干已解决项摊在系统提示里；
-    // 真正的 pending 硬约束由 agent_spawn 拦截与 TaskRunner gate 执行。
-    if let Some(store) = human_checkpoint {
-        match store.render_for_prompt(&task.mission_id) {
-            Ok(Some(rendered)) => {
-                messages.push(ChatMessage {
-                    role: "system".to_string(),
-                    content: Some(rendered),
-                    images: Vec::new(),
-                    tool_calls: Vec::new(),
-                    tool_call_id: None,
-                });
-            }
-            Ok(None) => {}
-            Err(err) => {
-                tracing::warn!(error = %err, "HumanCheckpoint: 渲染 prompt 失败，本轮跳过");
-            }
-        }
+        messages.push(system_prompt_fragment_message(
+            PromptFragmentKind::TodoLedger,
+            rendered,
+        ));
     }
     // [CACHE: DYNAMIC] Runtime tail · Mailbox 待处理消息。
     // 来自 user / system / 代理回执的跨 task 投递；按 Conversation 层渲染。
     if let Some(rendered) = render_mailbox_items_for_prompt(&pending_mailbox_items) {
-        messages.push(ChatMessage {
-            role: "system".to_string(),
-            content: Some(rendered),
-            images: Vec::new(),
-            tool_calls: Vec::new(),
-            tool_call_id: None,
-        });
+        messages.push(system_prompt_fragment_message(
+            PromptFragmentKind::Mailbox,
+            rendered,
+        ));
     }
     // [CACHE: APPEND-ONLY] Runtime tail · Thread 历史。
     // P6b：只读取当前 thread 内部已经持久化的运行时输入 / 恢复记录。worker thread
@@ -1051,24 +914,15 @@ fn run_conversation_loop_inner(
         for history_msg in &thread_history_snapshot {
             messages.push(thread_chat_message_to_chat_message(history_msg));
         }
-        messages.push(ChatMessage {
-            role: "system".to_string(),
-            content: Some(
-                "以上是当前 thread 在本 task 启动前已有的运行时输入或恢复记录。下面的用户消息是本次执行的当前任务事实，必须以当前任务为准。"
-                    .to_string(),
-            ),
-            images: Vec::new(),
-            tool_calls: Vec::new(),
-            tool_call_id: None,
-        });
+        messages.push(system_prompt_fragment_message(
+            PromptFragmentKind::ThreadHistoryBoundary,
+            "以上是当前 thread 在本 task 启动前已有的运行时输入或恢复记录。下面的用户消息是本次执行的当前任务事实，必须以当前任务为准。",
+        ));
     }
-    messages.push(ChatMessage {
-        role: "system".to_string(),
-        content: Some(current_turn_context_priority_prompt()),
-        images: Vec::new(),
-        tool_calls: Vec::new(),
-        tool_call_id: None,
-    });
+    messages.push(system_prompt_fragment_message(
+        PromptFragmentKind::CurrentTurnPriority,
+        current_turn_context_priority_prompt(),
+    ));
     // [CACHE: DYNAMIC] Runtime tail · 本轮 user 输入。
     // 含 assemble_prompt 预拼装的 S2-S8（base task + 上下文 + skill 注入 +
     // 用户规则 + lifecycle reminder + safeguard），每轮都重新生成。
@@ -1091,6 +945,8 @@ fn run_conversation_loop_inner(
     );
 
     let mut final_content = String::new();
+    let mut active_skill_name = skill_name;
+    let mut active_tools = tools.unwrap_or_default();
     let mut tool_call_records: Vec<serde_json::Value> = Vec::new();
     let mut unresolved_tool_failures: Vec<(String, String)> = Vec::new();
     let required_tool_chain = task_required_tool_chain(task, Some(agent_role_registry));
@@ -1129,11 +985,37 @@ fn run_conversation_loop_inner(
 
     let tool_call_round_limit = tool_call_round_limit(&required_tool_chain);
     for round in 0..tool_call_round_limit {
+        if let Some(registry) = tool_registry {
+            let policy = task.policy_snapshot.as_ref();
+            let access_profile = policy
+                .map(|policy| policy.access_profile)
+                .unwrap_or_default();
+            let allowed_tools = policy
+                .filter(|policy| !policy.allowed_tools.is_empty())
+                .map(|policy| policy.allowed_tools.as_slice());
+            let denied_tools = policy
+                .map(|policy| policy.denied_tools.as_slice())
+                .unwrap_or_default();
+            active_tools = refresh_live_mcp_tool_definitions(
+                active_tools,
+                registry,
+                skill_runtime,
+                active_skill_name.as_deref(),
+                access_profile,
+                allowed_tools,
+                denied_tools,
+            );
+        }
+        let round_tools = (!active_tools.is_empty()).then_some(active_tools.clone());
         let thinking_item_id = format!("turn-item-assistant-thinking-{task_id}-{round}");
         let stream_item_id = task_stream_item_id(task_id, round, streaming_entry_id);
         last_stream_item_id = Some(stream_item_id.clone());
+        let streamed_content = std::cell::RefCell::new(String::new());
+        let streamed_visible_content = std::cell::RefCell::new(String::new());
         let streamed_thinking = std::cell::RefCell::new(String::new());
+        let last_content_len = std::cell::Cell::new(0usize);
         let last_thinking_len = std::cell::Cell::new(0usize);
+        let stream_publish_gate = std::cell::RefCell::new(SessionTurnStreamPublishGate::default());
         let thinking_publish_gate =
             std::cell::RefCell::new(SessionTurnStreamPublishGate::default());
         let round_started_at = UtcMillis::now();
@@ -1141,10 +1023,10 @@ fn run_conversation_loop_inner(
             provider: LOOPBACK_MODEL_PROVIDER.to_string(),
             prompt: prompt.clone(),
             messages: Some(messages.clone()),
-            tools: tools.clone(),
+            tools: round_tools.clone(),
             tool_choice: forced_task_tool_choice_for_round(
                 &required_tool_chain,
-                tools.as_ref(),
+                round_tools.as_ref(),
                 &completed_required_tool_names,
             ),
         };
@@ -1165,10 +1047,21 @@ fn run_conversation_loop_inner(
                     &turn_visibility,
                     &delta.thinking,
                 );
-                // 任务循环中的中间轮次通常会伴随工具调用。上游模型或代理网关有时会把
-                // reasoning 摘要放进 content 字段；这里不把任务循环流式正文直接暴露给用户，
-                // 只在最终无工具调用轮次落 assistant_final。
-                let _ = (&stream_item_id, &delta.content);
+                publish_task_content_delta(
+                    event_bus,
+                    session_store,
+                    task_store,
+                    task,
+                    session_id,
+                    workspace_id,
+                    &stream_item_id,
+                    &last_content_len,
+                    &streamed_content,
+                    &streamed_visible_content,
+                    &stream_publish_gate,
+                    &turn_visibility,
+                    &delta.content,
+                );
             };
 
             match client.invoke_streaming(invocation_request, &on_delta) {
@@ -1242,17 +1135,6 @@ fn run_conversation_loop_inner(
                 let thinking = streamed_thinking.borrow();
                 let trimmed = thinking.trim();
                 (!trimmed.is_empty()).then(|| trimmed.to_string())
-            })
-            .or_else(|| {
-                if !round_has_tool_calls {
-                    return None;
-                }
-                parsed
-                    .content
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|content| !content.is_empty())
-                    .map(ToOwned::to_owned)
             });
         if let Some(thinking) = final_thinking {
             upsert_task_thinking_turn_item(
@@ -1270,6 +1152,34 @@ fn run_conversation_loop_inner(
                 &thinking_publish_gate,
             );
         }
+        let streamed_content = streamed_content.into_inner();
+        let streamed_visible_content = streamed_visible_content.into_inner();
+        let parsed_visible_content = parsed
+            .content
+            .as_deref()
+            .map(normalize_model_stream_preview_content)
+            .filter(|content| !content.trim().is_empty());
+        let completed_stream_content = if !streamed_visible_content.trim().is_empty() {
+            Some(streamed_visible_content.clone())
+        } else {
+            parsed_visible_content.clone()
+        };
+        if let Some(completed_stream_content) = completed_stream_content.as_ref() {
+            upsert_task_stream_turn_item(
+                event_bus,
+                session_store,
+                task_store,
+                task,
+                session_id,
+                workspace_id,
+                &stream_item_id,
+                &turn_visibility,
+                "completed",
+                completed_stream_content,
+                None,
+                &stream_publish_gate,
+            );
+        }
         publish_model_usage_record(
             event_bus,
             session_store,
@@ -1283,6 +1193,15 @@ fn run_conversation_loop_inner(
             Some(lease_id.to_string()),
             None,
         );
+        account_active_goal_turn(
+            session_store,
+            session_id,
+            parsed.usage.as_ref(),
+            UtcMillis::now()
+                .0
+                .saturating_sub(round_started_at.0)
+                .saturating_div(1000),
+        );
         if let Some(metrics_store) = mission_metrics {
             record_mission_turn(
                 metrics_store.as_ref(),
@@ -1290,17 +1209,14 @@ fn run_conversation_loop_inner(
                 parsed.usage.as_ref(),
                 round_started_at,
                 UtcMillis::now(),
-                None,
             );
         }
 
-        let assistant_history_content = if round_has_tool_calls {
-            None
-        } else {
-            parsed.content.clone()
-        };
+        let assistant_history_content = parsed.content.clone();
         if !round_has_tool_calls && let Some(ref content) = parsed.content {
             final_content = content.clone();
+        } else if !round_has_tool_calls && !streamed_content.trim().is_empty() {
+            final_content = streamed_content.clone();
         }
         if round_has_tool_calls {
             had_tool_calls = true;
@@ -1330,14 +1246,9 @@ fn run_conversation_loop_inner(
                 });
                 continue;
             }
-            if let Some(recovery_prompt) = agent_spawn_requirement_recovery_prompt(
-                task,
-                task_store,
-                &tool_call_records,
-                &[],
-                mission_charter,
-                plan,
-            ) {
+            if let Some(recovery_prompt) =
+                agent_spawn_requirement_recovery_prompt(task, task_store, &tool_call_records, &[])
+            {
                 messages.push(ChatMessage {
                     role: "assistant".to_string(),
                     content: assistant_history_content.clone(),
@@ -1401,23 +1312,12 @@ fn run_conversation_loop_inner(
             task_store,
             &tool_call_records,
             &parsed.tool_calls,
-            mission_charter,
-            plan,
         ) {
-            messages.push(ChatMessage {
-                role: "assistant".to_string(),
-                content: assistant_history_content.clone(),
-                images: Vec::new(),
-                tool_calls: parsed.tool_calls.clone(),
-                tool_call_id: None,
-            });
-            messages.push(ChatMessage {
-                role: "user".to_string(),
-                content: Some(recovery_prompt),
-                images: Vec::new(),
-                tool_calls: Vec::new(),
-                tool_call_id: None,
-            });
+            append_unexecuted_tool_recovery_messages(
+                &mut messages,
+                assistant_history_content.clone(),
+                recovery_prompt,
+            );
             continue;
         }
 
@@ -1448,7 +1348,7 @@ fn run_conversation_loop_inner(
             agent_role_registry,
             skill_runtime,
             skill_dispatch_runtime,
-            skill_name.as_deref(),
+            active_skill_name.as_deref(),
             task_store,
             session_store,
             execution_registry,
@@ -1457,12 +1357,6 @@ fn run_conversation_loop_inner(
             safety_gate,
             todo_ledger,
             project_memory,
-            mission_charter,
-            plan,
-            knowledge_graph,
-            validation_runner,
-            checkpoint,
-            human_checkpoint,
             task,
             session_id,
             workspace_id,
@@ -1475,6 +1369,7 @@ fn run_conversation_loop_inner(
 
         let mut completed_tool_names_this_round = Vec::new();
         let mut content_requirement_failures = Vec::new();
+        let mut activated_skill_this_round = None;
         for (tool_call, (result, tool_status)) in parsed.tool_calls.iter().zip(tool_results) {
             upsert_task_tool_call_result_turn_item(
                 event_bus,
@@ -1490,7 +1385,9 @@ fn run_conversation_loop_inner(
                 persist_session_state,
             );
             let canonical_tool_name = canonical_tool_call_name(&tool_call.function.name);
-            if !matches!(tool_status, ExecutionResultStatus::Succeeded) {
+            if !matches!(tool_status, ExecutionResultStatus::Succeeded)
+                && !tool_result_is_recoverable_coordination_signal(&result)
+            {
                 let failure_summary = format!(
                     "{}: {}",
                     tool_call.function.name,
@@ -1519,6 +1416,11 @@ fn run_conversation_loop_inner(
                 }
             }
             tool_call_records.push(tool_call_record(tool_call, &result));
+            if let Some(skill_id) =
+                activated_skill_id_from_tool_result(&tool_call.function.name, &result, tool_status)
+            {
+                activated_skill_this_round = Some(skill_id);
+            }
             messages.push(ChatMessage {
                 role: "tool".to_string(),
                 content: Some(model_visible_tool_result(&result, tool_status)),
@@ -1526,6 +1428,52 @@ fn run_conversation_loop_inner(
                 tool_calls: Vec::new(),
                 tool_call_id: Some(tool_call.id.clone()),
             });
+        }
+        if let Some(skill_id) = activated_skill_this_round
+            && active_skill_name.as_deref() != Some(skill_id.as_str())
+            && let Some(runtime) = skill_runtime
+        {
+            let access_profile = task
+                .policy_snapshot
+                .as_ref()
+                .map(|policy| policy.access_profile)
+                .unwrap_or_default();
+            active_tools = activate_skill_tool_definitions(
+                active_tools,
+                runtime,
+                &skill_id,
+                access_profile,
+                &[],
+            );
+            active_skill_name = Some(skill_id.clone());
+            if let Err(error) = execution_registry.update_active_skill(
+                task_id,
+                session_store,
+                session_id,
+                skill_id.clone(),
+            ) {
+                tracing::warn!(
+                    task_id = %task_id,
+                    session_id = %session_id,
+                    skill_id,
+                    error,
+                    "动态 Skill 已用于当前轮，但执行链状态同步失败"
+                );
+            }
+            if let Some(skill) = runtime.registry().get(&skill_id) {
+                messages.push(ChatMessage {
+                    role: "system".to_string(),
+                    content: Some(format!(
+                        "--- Skill: {} ---\n{}\n{}",
+                        skill.title,
+                        crate::prompt_utils::SKILL_PROMPT_PRIORITY_NOTE,
+                        skill.instruction
+                    )),
+                    images: Vec::new(),
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                });
+            }
         }
         record_completed_required_tools(
             &mut completed_required_tool_names,
@@ -1571,14 +1519,9 @@ fn run_conversation_loop_inner(
         );
     }
 
-    if let Some(recovery_prompt) = agent_spawn_requirement_recovery_prompt(
-        task,
-        task_store,
-        &tool_call_records,
-        &[],
-        mission_charter,
-        plan,
-    ) {
+    if let Some(recovery_prompt) =
+        agent_spawn_requirement_recovery_prompt(task, task_store, &tool_call_records, &[])
+    {
         append_task_error_turn_item(
             event_bus,
             session_store,
@@ -2081,8 +2024,6 @@ fn agent_spawn_requirement_recovery_prompt(
     task_store: &TaskStore,
     tool_call_records: &[serde_json::Value],
     proposed_tool_calls: &[ChatToolCall],
-    mission_charter: Option<&magi_mission_charter::MissionCharterStore>,
-    plan: Option<&magi_plan::PlanStore>,
 ) -> Option<String> {
     if !agent_spawn_required_by_task(task) {
         return None;
@@ -2096,31 +2037,6 @@ fn agent_spawn_requirement_recovery_prompt(
     if agent_spawn_was_attempted(tool_call_records) {
         return None;
     }
-    if task_is_long_mission(Some(task)) {
-        let governance_ready =
-            long_mission_governance_prerequisites_available(task, mission_charter, plan);
-        if !proposed_tool_calls.is_empty() {
-            let proposed_names = proposed_tool_calls
-                .iter()
-                .map(|tool_call| canonical_tool_call_name(&tool_call.function.name))
-                .collect::<Vec<_>>();
-            if proposed_names
-                .iter()
-                .all(|name| long_mission_governance_tool_can_precede_agent_spawn(name))
-            {
-                return None;
-            }
-            if proposed_names.iter().all(|name| name == "agent_spawn") && governance_ready {
-                return None;
-            }
-            if proposed_names.iter().any(|name| name == "agent_spawn") && !governance_ready {
-                return Some(long_mission_agent_spawn_prerequisite_prompt());
-            }
-        }
-        if !governance_ready {
-            return Some(long_mission_agent_spawn_prerequisite_prompt());
-        }
-    }
     if !proposed_tool_calls.is_empty()
         && proposed_tool_calls
             .iter()
@@ -2133,6 +2049,29 @@ fn agent_spawn_requirement_recovery_prompt(
         "用户已经明确要求启动或派发代理。本轮必须调用 agent_spawn 履行代理契约；不要把主线 shell_exec、file_read 或直接总结冒充为代理执行结果。若需要多个代理，应在同一轮发起多次 agent_spawn 并为每个代理写清 display_name、role、goal 与 access_mode。"
             .to_string(),
     )
+}
+
+fn append_unexecuted_tool_recovery_messages(
+    messages: &mut Vec<ChatMessage>,
+    assistant_content: Option<String>,
+    recovery_prompt: String,
+) {
+    // 这条分支明确拒绝执行模型上一轮提出的工具调用。未执行的 function call
+    // 不能进入下一轮历史，否则 OpenAI/Responses 兼容服务会要求不存在的 tool output。
+    messages.push(ChatMessage {
+        role: "assistant".to_string(),
+        content: assistant_content,
+        images: Vec::new(),
+        tool_calls: Vec::new(),
+        tool_call_id: None,
+    });
+    messages.push(ChatMessage {
+        role: "user".to_string(),
+        content: Some(recovery_prompt),
+        images: Vec::new(),
+        tool_calls: Vec::new(),
+        tool_call_id: None,
+    });
 }
 
 fn agent_spawn_requirement_is_policy_reachable(task: &Task) -> bool {
@@ -2159,151 +2098,11 @@ fn agent_spawn_requirement_is_policy_reachable(task: &Task) -> bool {
             .any(|tool| canonical_tool_call_name(tool) == "agent_spawn")
 }
 
-fn long_mission_governance_prerequisites_available(
-    task: &Task,
-    mission_charter: Option<&magi_mission_charter::MissionCharterStore>,
-    plan: Option<&magi_plan::PlanStore>,
-) -> bool {
-    let Some(mission_charter) = mission_charter else {
-        return false;
-    };
-    if !matches!(mission_charter.load(&task.mission_id), Ok(Some(_))) {
-        return false;
-    }
-    let Some(plan) = plan else {
-        return false;
-    };
-    matches!(plan.load(&task.mission_id), Ok(Some(plan)) if !plan.steps.is_empty())
-}
-
-fn long_mission_governance_tool_can_precede_agent_spawn(tool_name: &str) -> bool {
-    matches!(
-        tool_name,
-        "mission_charter_write"
-            | "plan_write"
-            | "todo_write"
-            | "memory_write"
-            | "kg_write"
-            | "human_checkpoint_request"
-    )
-}
-
-fn long_mission_agent_spawn_prerequisite_prompt() -> String {
-    "用户已经明确要求启动或派发代理，但当前任务是 LongMission：必须先调用 mission_charter_write 建立 mission 契约，再调用 plan_write 写入非空执行计划，然后才能 agent_spawn。不要用 todo_write 替代 mission plan；不要在 charter/plan 前派发代理。".to_string()
-}
-
 fn agent_spawn_required_by_task(task: &Task) -> bool {
     if task.parent_task_id.is_some() {
         return false;
     }
-    let text = format!("{} {}", task.title, task.goal);
-    let lowered = text.to_ascii_lowercase();
-    if contains_any(
-        &text,
-        &[
-            "不要启动代理",
-            "不要使用代理",
-            "不需要代理",
-            "无需代理",
-            "不要派发代理",
-        ],
-    ) || contains_any(
-        &lowered,
-        &[
-            "no agent",
-            "no agents",
-            "without agent",
-            "without agents",
-            "do not use agent",
-            "don't use agent",
-        ],
-    ) {
-        return false;
-    }
-
-    if lowered.contains("agent_spawn") {
-        return true;
-    }
-
-    if contains_explicit_agent_mode(&text, &lowered) {
-        return true;
-    }
-
-    let mentions_agent = text.contains("代理")
-        || lowered.contains("agent")
-        || contains_any(
-            &lowered,
-            &["explorer", "reviewer", "architect", "executor", "tester"],
-        )
-        || contains_any(
-            &text,
-            &[
-                "探索工程师",
-                "评审工程师",
-                "架构师",
-                "执行工程师",
-                "测试工程师",
-            ],
-        );
-    if !mentions_agent {
-        return false;
-    }
-
-    let has_chinese_dispatch_verb = contains_any(
-        &text,
-        &["启动", "派发", "分配", "调用", "创建", "拉起", "开启"],
-    ) || (text.contains("使用")
-        && contains_any(
-            &text,
-            &[
-                "使用子代理模式",
-                "使用多代理模式",
-                "使用代理完成",
-                "使用代理处理",
-                "使用代理执行",
-                "使用代理验证",
-                "使用代理检查",
-                "使用代理审查",
-                "使用多个代理",
-                "使用两个代理",
-                "使用多代理",
-            ],
-        ));
-    let has_english_dispatch_verb = contains_any(
-        &lowered,
-        &[
-            "spawn",
-            "start",
-            "launch",
-            "dispatch",
-            "assign",
-            "use agent to",
-            "use agents to",
-        ],
-    );
-    has_chinese_dispatch_verb || has_english_dispatch_verb
-}
-
-fn contains_explicit_agent_mode(text: &str, lowered: &str) -> bool {
-    let compact_text = text
-        .chars()
-        .filter(|ch| !matches!(ch, ' ' | '-' | '_' | '\t' | '\n' | '\r'))
-        .collect::<String>();
-    let compact_lowered = lowered
-        .chars()
-        .filter(|ch| !matches!(ch, ' ' | '-' | '_' | '\t' | '\n' | '\r'))
-        .collect::<String>();
-    contains_any(
-        &compact_text,
-        &[
-            "subagent模式",
-            "子代理模式",
-            "子agent模式",
-            "多代理模式",
-            "多agent模式",
-            "multiagent模式",
-        ],
-    ) || contains_any(&compact_lowered, &["subagentmode", "multiagentmode"])
+    magi_core::text_requires_agent_spawn(&format!("{} {}", task.title, task.goal))
 }
 
 fn agent_spawn_was_attempted(tool_call_records: &[serde_json::Value]) -> bool {
@@ -2361,10 +2160,6 @@ fn collected_agent_wait_child_ids(tool_call_records: &[serde_json::Value]) -> BT
     collected
 }
 
-fn contains_any(value: &str, needles: &[&str]) -> bool {
-    needles.iter().any(|needle| value.contains(needle))
-}
-
 fn task_required_content_literals(task: &Task) -> Vec<String> {
     if task.kind != magi_core::TaskKind::LocalAgent {
         return Vec::new();
@@ -2414,6 +2209,18 @@ fn tool_result_content_field(tool_result: &str) -> Option<String> {
                 .and_then(serde_json::Value::as_str)
                 .map(ToOwned::to_owned)
         })
+}
+
+fn tool_result_is_recoverable_coordination_signal(result: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(result)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("error_code")
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned)
+        })
+        .is_some_and(|code| code == "agent_spawn_capacity_exceeded")
 }
 
 fn task_has_validation_gate(task: &Task) -> bool {
@@ -2552,6 +2359,108 @@ fn upsert_task_thinking_turn_item(
         "assistant_thinking",
         status,
         Some("模型思考".to_string()),
+        Some(trimmed.to_string()),
+        Some(item_id.to_string()),
+        turn_visibility.thread_id().clone(),
+    );
+    apply_task_worker_detail_visibility(&mut item, task, turn_visibility);
+    if let Some(published) =
+        upsert_session_turn_item_with_task_store(session_store, session_id, item, Some(task_store))
+    {
+        if let Some(stream_update) = stream_update {
+            publish_session_turn_item_stream_event(
+                event_bus,
+                session_id,
+                workspace_id,
+                &published,
+                stream_update,
+                &mut publish_gate.borrow_mut(),
+            );
+        } else {
+            publish_session_turn_item_event(event_bus, session_id, workspace_id, &published);
+        }
+    }
+}
+
+fn publish_task_content_delta(
+    event_bus: &InMemoryEventBus,
+    session_store: &SessionStore,
+    task_store: &TaskStore,
+    task: &magi_core::Task,
+    session_id: &SessionId,
+    workspace_id: &Option<WorkspaceId>,
+    item_id: &str,
+    last_sent_len: &std::cell::Cell<usize>,
+    streamed_content: &std::cell::RefCell<String>,
+    streamed_visible_content: &std::cell::RefCell<String>,
+    publish_gate: &std::cell::RefCell<SessionTurnStreamPublishGate>,
+    turn_visibility: &TaskTurnVisibility,
+    accumulated_content: &str,
+) {
+    if accumulated_content.len() <= last_sent_len.get() {
+        return;
+    }
+    last_sent_len.set(accumulated_content.len());
+    {
+        let mut content = streamed_content.borrow_mut();
+        content.clear();
+        content.push_str(accumulated_content);
+    }
+    let visible_content = normalize_model_stream_preview_content(accumulated_content);
+    if visible_content.trim().is_empty() {
+        return;
+    }
+    let stream_update = {
+        let previous = streamed_visible_content.borrow();
+        let update = session_turn_stream_update(previous.as_str(), &visible_content);
+        if update.is_none() {
+            return;
+        }
+        update
+    };
+    {
+        let mut current_visible = streamed_visible_content.borrow_mut();
+        current_visible.clear();
+        current_visible.push_str(&visible_content);
+    }
+    upsert_task_stream_turn_item(
+        event_bus,
+        session_store,
+        task_store,
+        task,
+        session_id,
+        workspace_id,
+        item_id,
+        turn_visibility,
+        "running",
+        &visible_content,
+        stream_update.as_ref(),
+        publish_gate,
+    );
+}
+
+fn upsert_task_stream_turn_item(
+    event_bus: &InMemoryEventBus,
+    session_store: &SessionStore,
+    task_store: &TaskStore,
+    task: &magi_core::Task,
+    session_id: &SessionId,
+    workspace_id: &Option<WorkspaceId>,
+    item_id: &str,
+    turn_visibility: &TaskTurnVisibility,
+    status: &str,
+    content: &str,
+    stream_update: Option<&SessionTurnStreamUpdate>,
+    publish_gate: &std::cell::RefCell<SessionTurnStreamPublishGate>,
+) {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let mut item = session_turn_item(
+        "assistant_stream",
+        status,
+        Some("生成回复".to_string()),
         Some(trimmed.to_string()),
         Some(item_id.to_string()),
         turn_visibility.thread_id().clone(),
@@ -2985,9 +2894,14 @@ mod tests {
             request: ModelInvocationRequest,
             on_delta: &dyn Fn(&ModelStreamingDelta),
         ) -> Result<BridgeResponse, BridgeClientError> {
-            if self.invoke_count.load(Ordering::SeqCst) > 0 {
+            if self.invoke_count.load(Ordering::SeqCst) == 0 {
                 on_delta(&ModelStreamingDelta {
-                    content: "任务工具调用完成".to_string(),
+                    content: "Considering file reading approach before calling tools.".to_string(),
+                    thinking: String::new(),
+                });
+            } else {
+                on_delta(&ModelStreamingDelta {
+                    content: "最终回复：文件检查完成。".to_string(),
                     thinking: String::new(),
                 });
             }
@@ -3037,8 +2951,9 @@ mod tests {
                     })
                     .expect("工具调用轮次必须写入 assistant tool_calls");
                 assert_eq!(
-                    tool_round_message.content, None,
-                    "工具轮 content 不能写进下一轮模型历史"
+                    tool_round_message.content.as_deref(),
+                    Some("Considering file reading approach before calling tools."),
+                    "子代理任务循环必须像主对话一样保留带工具调用 assistant 消息的正文"
                 );
                 serde_json::json!({
                     "content": "最终回复：文件检查完成。",
@@ -3320,8 +3235,8 @@ mod tests {
             retry_limit: 1,
             validation_profile: Some("required".to_string()),
             checkpoint_mode: "task_or_phase".to_string(),
-            task_tier: TaskTier::LongMission,
-            background_allowed: true,
+            task_tier: TaskTier::ExecutionChain,
+            background_allowed: false,
             escalation_conditions: Vec::new(),
         });
 
@@ -3360,8 +3275,8 @@ mod tests {
             retry_limit: 1,
             validation_profile: Some("required".to_string()),
             checkpoint_mode: "task_or_phase".to_string(),
-            task_tier: TaskTier::LongMission,
-            background_allowed: true,
+            task_tier: TaskTier::ExecutionChain,
+            background_allowed: false,
             escalation_conditions: Vec::new(),
         });
 
@@ -3375,8 +3290,7 @@ mod tests {
     fn coordinator_task_does_not_convert_orchestration_goal_to_forced_tool_chain() {
         let registry = magi_agent_role::AgentRoleRegistry::load_default();
         let mut task = make_task_loop_test_task("task-coordinator-required-tool-chain");
-        task.goal = "LongMission：先 mission_charter_write，再 plan_write，然后两轮 agent_spawn + agent_wait，最后 validation_record 和 checkpoint_create。"
-            .to_string();
+        task.goal = "先启动两轮 agent_spawn + agent_wait，再汇总各代理结果。".to_string();
         task.policy_snapshot = Some(magi_core::TaskPolicy {
             autonomy_level: "Autonomous".to_string(),
             access_profile: magi_core::AccessProfile::Restricted,
@@ -3389,8 +3303,8 @@ mod tests {
             retry_limit: 1,
             validation_profile: Some("required".to_string()),
             checkpoint_mode: "task_or_phase".to_string(),
-            task_tier: TaskTier::LongMission,
-            background_allowed: true,
+            task_tier: TaskTier::ExecutionChain,
+            background_allowed: false,
             escalation_conditions: Vec::new(),
         });
         task.executor_binding = Some(magi_core::TaskExecutorBinding::for_role("coordinator"));
@@ -3490,8 +3404,8 @@ mod tests {
             retry_limit: 1,
             validation_profile: Some("required".to_string()),
             checkpoint_mode: "task_or_phase".to_string(),
-            task_tier: TaskTier::LongMission,
-            background_allowed: true,
+            task_tier: TaskTier::ExecutionChain,
+            background_allowed: false,
             escalation_conditions: Vec::new(),
         });
         let planning_content =
@@ -3755,15 +3669,8 @@ mod tests {
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
             spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
             safety_gate: None,
-            todo_ledger: &magi_todo_ledger::TodoLedger::new(),
+            todo_ledger: &crate::test_todo_ledger("test-todo-ledger"),
             project_memory: None,
-            mission_charter: None,
-            plan: None,
-            mission_workspace: None,
-            knowledge_graph: None,
-            validation_runner: None,
-            checkpoint: None,
-            human_checkpoint: None,
             mission_metrics: None,
             task,
             task_id: &task.task_id,
@@ -3834,15 +3741,8 @@ mod tests {
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
             spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
             safety_gate: None,
-            todo_ledger: &magi_todo_ledger::TodoLedger::new(),
+            todo_ledger: &crate::test_todo_ledger("test-todo-ledger"),
             project_memory: None,
-            mission_charter: None,
-            plan: None,
-            mission_workspace: None,
-            knowledge_graph: None,
-            validation_runner: None,
-            checkpoint: None,
-            human_checkpoint: None,
             mission_metrics: None,
             task: &task,
             task_id: &task.task_id,
@@ -4144,16 +4044,14 @@ mod tests {
         };
         task.policy_snapshot = Some(policy.clone());
         assert!(
-            agent_spawn_requirement_recovery_prompt(&task, &task_store, &[], &[], None, None)
-                .is_some(),
+            agent_spawn_requirement_recovery_prompt(&task, &task_store, &[], &[]).is_some(),
             "agent_spawn 可达时仍应保护明确代理契约"
         );
 
         policy.denied_tools = vec!["agent_spawn".to_string()];
         task.policy_snapshot = Some(policy.clone());
         assert!(
-            agent_spawn_requirement_recovery_prompt(&task, &task_store, &[], &[], None, None)
-                .is_none(),
+            agent_spawn_requirement_recovery_prompt(&task, &task_store, &[], &[]).is_none(),
             "策略显式拒绝 agent_spawn 时不能继续强制模型调用"
         );
 
@@ -4161,16 +4059,14 @@ mod tests {
         policy.allowed_tools = vec!["file_read".to_string()];
         task.policy_snapshot = Some(policy.clone());
         assert!(
-            agent_spawn_requirement_recovery_prompt(&task, &task_store, &[], &[], None, None)
-                .is_none(),
+            agent_spawn_requirement_recovery_prompt(&task, &task_store, &[], &[]).is_none(),
             "allowed_tools 白名单不含 agent_spawn 时不能继续强制模型调用"
         );
 
         policy.allowed_tools = vec!["agent_spawn".to_string()];
         task.policy_snapshot = Some(policy);
         assert!(
-            agent_spawn_requirement_recovery_prompt(&task, &task_store, &[], &[], None, None)
-                .is_some(),
+            agent_spawn_requirement_recovery_prompt(&task, &task_store, &[], &[]).is_some(),
             "agent_spawn canonical name 进入白名单时应视为可达"
         );
     }
@@ -4222,28 +4118,34 @@ mod tests {
         };
 
         assert!(
-            agent_spawn_requirement_recovery_prompt(
-                &task,
-                &task_store,
-                &[],
-                &[shell_call],
-                None,
-                None
-            )
-            .is_some(),
+            agent_spawn_requirement_recovery_prompt(&task, &task_store, &[], &[shell_call])
+                .is_some(),
             "明确要求代理时，主线工具不能冒充代理契约"
         );
         assert!(
-            agent_spawn_requirement_recovery_prompt(
-                &task,
-                &task_store,
-                &[],
-                &[spawn_call],
-                None,
-                None
-            )
-            .is_none(),
+            agent_spawn_requirement_recovery_prompt(&task, &task_store, &[], &[spawn_call])
+                .is_none(),
             "同一轮真正发起 agent_spawn 时允许进入工具执行"
+        );
+
+        let mut recovery_messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: Some(task.goal.clone()),
+            images: Vec::new(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        }];
+        append_unexecuted_tool_recovery_messages(
+            &mut recovery_messages,
+            Some("我先直接读取目录。".to_string()),
+            "必须创建真实子代理。".to_string(),
+        );
+        assert_eq!(recovery_messages.len(), 3);
+        assert_eq!(recovery_messages[1].role, "assistant");
+        assert!(recovery_messages[1].tool_calls.is_empty());
+        assert_eq!(
+            recovery_messages[2].content.as_deref(),
+            Some("必须创建真实子代理。")
         );
 
         let attempted_spawn_record = serde_json::json!({
@@ -4264,82 +4166,9 @@ mod tests {
                 &task_store,
                 &[attempted_spawn_record],
                 &[],
-                None,
-                None
             )
             .is_none(),
             "agent_spawn 已尝试但不可用时，后续允许模型按工具结果改派或主线接管"
-        );
-    }
-
-    #[test]
-    fn long_mission_agent_request_requires_governance_before_spawn() {
-        let task_store = TaskStore::new();
-        let mut task = make_task_loop_test_task("task-long-mission-agent-prerequisite");
-        task.goal = "LongMission：先建立治理记录，再启动两个代理并行验证。".to_string();
-        task.policy_snapshot = Some(magi_core::TaskPolicy {
-            autonomy_level: "Autonomous".to_string(),
-            access_profile: magi_core::AccessProfile::Restricted,
-            allowed_tools: Vec::new(),
-            denied_tools: Vec::new(),
-            allowed_paths: Vec::new(),
-            denied_paths: Vec::new(),
-            network_mode: "full".to_string(),
-            command_mode: "full".to_string(),
-            retry_limit: 1,
-            validation_profile: Some("required".to_string()),
-            checkpoint_mode: "task_or_phase".to_string(),
-            task_tier: TaskTier::LongMission,
-            background_allowed: true,
-            escalation_conditions: Vec::new(),
-        });
-        task.executor_binding = Some(magi_core::TaskExecutorBinding::for_role("coordinator"));
-        task_store.insert_task(task.clone());
-        let spawn_call = ChatToolCall {
-            id: "call-long-mission-spawn-before-plan".to_string(),
-            kind: "function".to_string(),
-            function: magi_bridge_client::ChatToolFunction {
-                name: "agent_spawn".to_string(),
-                arguments: serde_json::json!({
-                    "role": "explorer",
-                    "display_name": "目录调查代理",
-                    "goal": "检查目录",
-                    "access_mode": "read_only"
-                })
-                .to_string(),
-            },
-        };
-        let charter_call = ChatToolCall {
-            id: "call-long-mission-charter-first".to_string(),
-            kind: "function".to_string(),
-            function: magi_bridge_client::ChatToolFunction {
-                name: "mission_charter_write".to_string(),
-                arguments: "{}".to_string(),
-            },
-        };
-
-        let prompt = agent_spawn_requirement_recovery_prompt(
-            &task,
-            &task_store,
-            &[],
-            &[spawn_call],
-            None,
-            None,
-        )
-        .expect("LongMission 缺少 charter/plan 时不允许先 agent_spawn");
-        assert!(prompt.contains("mission_charter_write"));
-        assert!(prompt.contains("plan_write"));
-        assert!(
-            agent_spawn_requirement_recovery_prompt(
-                &task,
-                &task_store,
-                &[],
-                &[charter_call],
-                None,
-                None
-            )
-            .is_none(),
-            "LongMission 前置治理工具不能被 agent_spawn 硬约束拦截"
         );
     }
 
@@ -4351,9 +4180,21 @@ mod tests {
         task_store.insert_task(task.clone());
 
         assert!(
-            agent_spawn_requirement_recovery_prompt(&task, &task_store, &[], &[], None, None)
-                .is_none(),
+            agent_spawn_requirement_recovery_prompt(&task, &task_store, &[], &[]).is_none(),
             "普通任务不应被代理硬约束误伤"
+        );
+    }
+
+    #[test]
+    fn explicit_no_subagent_instruction_does_not_force_agent_spawn() {
+        let task_store = TaskStore::new();
+        let mut task = make_task_loop_test_task("task-explicit-no-subagent");
+        task.goal = "请执行 sleep 2 后只回复标记，不要创建子代理，不要修改文件。".to_string();
+        task_store.insert_task(task.clone());
+
+        assert!(
+            agent_spawn_requirement_recovery_prompt(&task, &task_store, &[], &[]).is_none(),
+            "否定的子代理指令不能反向变成 agent_spawn 强约束"
         );
     }
 
@@ -4403,15 +4244,8 @@ mod tests {
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
             spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
             safety_gate: None,
-            todo_ledger: &magi_todo_ledger::TodoLedger::new(),
+            todo_ledger: &crate::test_todo_ledger("test-todo-ledger"),
             project_memory: None,
-            mission_charter: None,
-            plan: None,
-            mission_workspace: None,
-            knowledge_graph: None,
-            validation_runner: None,
-            checkpoint: None,
-            human_checkpoint: None,
             mission_metrics: None,
             task: &task,
             task_id: &task.task_id,
@@ -4497,15 +4331,8 @@ mod tests {
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
             spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
             safety_gate: None,
-            todo_ledger: &magi_todo_ledger::TodoLedger::new(),
+            todo_ledger: &crate::test_todo_ledger("test-todo-ledger"),
             project_memory: None,
-            mission_charter: None,
-            plan: None,
-            mission_workspace: None,
-            knowledge_graph: None,
-            validation_runner: None,
-            checkpoint: None,
-            human_checkpoint: None,
             mission_metrics: None,
             task: &task,
             task_id: &task.task_id,
@@ -4538,6 +4365,33 @@ mod tests {
             }
             other => panic!("recovered tool failure should complete action task, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn agent_spawn_capacity_signal_is_recoverable_coordination_feedback() {
+        let capacity_signal = serde_json::json!({
+            "tool": "agent_spawn",
+            "status": "rejected",
+            "error_code": "agent_spawn_capacity_exceeded",
+            "error": "当前会话已达到多代理并发上限",
+            "instruction": "请先用 agent_wait 收集已启动代理结果",
+        })
+        .to_string();
+        let safety_rejection = serde_json::json!({
+            "tool": "shell_exec",
+            "status": "rejected",
+            "error_code": "tool_safety_rejected",
+            "error": "该操作已被安全防护阻止",
+        })
+        .to_string();
+
+        assert!(tool_result_is_recoverable_coordination_signal(
+            &capacity_signal
+        ));
+        assert!(!tool_result_is_recoverable_coordination_signal(
+            &safety_rejection
+        ));
+        assert!(!tool_result_is_recoverable_coordination_signal("not json"));
     }
 
     #[test]
@@ -4639,12 +4493,14 @@ mod tests {
                 body: "旧内容".to_string(),
             })
             .expect("project memory entry should save");
-        let todo_ledger = magi_todo_ledger::TodoLedger::new();
-        todo_ledger.replace(vec![magi_todo_ledger::TodoItem::new(
-            "继续旧任务 OLD_REFERENCE_RESULT",
-            "正在继续旧任务",
-            magi_todo_ledger::TodoStatus::Pending,
-        )]);
+        let todo_ledger = crate::test_todo_ledger("test-todo-ledger");
+        todo_ledger
+            .replace(vec![magi_todo_ledger::TodoItem::new(
+                "继续旧任务 OLD_REFERENCE_RESULT",
+                "正在继续旧任务",
+                magi_todo_ledger::TodoStatus::Pending,
+            )])
+            .expect("todo fixture should write");
 
         let client = CapturingPromptModelBridgeClient::new("CURRENT_TASK_RESULT");
         let prompt =
@@ -4668,13 +4524,6 @@ mod tests {
             safety_gate: None,
             todo_ledger: &todo_ledger,
             project_memory: Some(&project_memory),
-            mission_charter: None,
-            plan: None,
-            mission_workspace: None,
-            knowledge_graph: None,
-            validation_runner: None,
-            checkpoint: None,
-            human_checkpoint: None,
             mission_metrics: None,
             task: &task,
             task_id: &task.task_id,
@@ -4968,15 +4817,8 @@ mod tests {
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
             spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
             safety_gate: None,
-            todo_ledger: &magi_todo_ledger::TodoLedger::new(),
+            todo_ledger: &crate::test_todo_ledger("test-todo-ledger"),
             project_memory: None,
-            mission_charter: None,
-            plan: None,
-            mission_workspace: None,
-            knowledge_graph: None,
-            validation_runner: None,
-            checkpoint: None,
-            human_checkpoint: None,
             mission_metrics: None,
             task: &task,
             task_id: &task.task_id,
@@ -5078,7 +4920,7 @@ mod tests {
     }
 
     #[test]
-    fn conversation_loop_tool_round_content_is_thinking_not_visible_text() {
+    fn conversation_loop_streams_tool_round_content_like_main_chat() {
         let session_store = SessionStore::new();
         let event_bus = InMemoryEventBus::new(64);
         let session_id = SessionId::new("session-task-tool-content");
@@ -5152,15 +4994,8 @@ mod tests {
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
             spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
             safety_gate: None,
-            todo_ledger: &magi_todo_ledger::TodoLedger::new(),
+            todo_ledger: &crate::test_todo_ledger("test-todo-ledger"),
             project_memory: None,
-            mission_charter: None,
-            plan: None,
-            mission_workspace: None,
-            knowledge_graph: None,
-            validation_runner: None,
-            checkpoint: None,
-            human_checkpoint: None,
             mission_metrics: None,
             task: &task,
             task_id: &task.task_id,
@@ -5199,45 +5034,41 @@ mod tests {
             .expect("turn should exist");
         assert!(
             turn.items.iter().any(|item| {
-                item.kind == "assistant_thinking"
+                item.kind == "assistant_stream"
+                    && item.status == "completed"
                     && item
                         .content
                         .as_deref()
                         .is_some_and(|content| content.contains(leaked_content))
             }),
-            "工具轮 content 只能沉淀为 thinking，便于审计和调试"
+            "工具轮正文必须像主对话一样成为可见 assistant 流式文本"
         );
         assert!(
             turn.items.iter().all(|item| {
-                let is_visible_text =
-                    matches!(item.kind.as_str(), "assistant_stream" | "assistant_final");
-                !is_visible_text
+                item.kind != "assistant_thinking"
                     || item
                         .content
                         .as_deref()
                         .is_none_or(|content| !content.contains(leaked_content))
             }),
-            "工具轮 content 不能成为用户可见 assistant 文本"
-        );
-        assert!(
-            session_store
-                .timeline_for_session(&session_id)
-                .iter()
-                .all(|entry| !entry.message.contains(leaked_content)),
-            "工具轮 content 不能写入主线 timeline"
+            "工具轮正文不再伪装成 thinking，避免同一内容双轨呈现"
         );
         assert!(
             session_store
                 .thread_message_history(&orchestrator_thread_id)
                 .iter()
                 .filter(|message| message.role == "assistant")
-                .all(|message| {
+                .any(|message| {
                     message
                         .content
                         .as_deref()
-                        .is_none_or(|content| !content.contains(leaked_content))
+                        .is_some_and(|content| content.contains(leaked_content))
+                        && message
+                            .tool_calls
+                            .iter()
+                            .any(|tool_call| tool_call.id == "task-tool-leak-probe")
                 }),
-            "工具轮 content 不能污染后续模型历史"
+            "带工具调用的 assistant 正文必须进入 thread 历史，保持下一轮模型上下文与主对话一致"
         );
     }
 
@@ -5340,15 +5171,8 @@ mod tests {
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
             spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
             safety_gate: None,
-            todo_ledger: &magi_todo_ledger::TodoLedger::new(),
+            todo_ledger: &crate::test_todo_ledger("test-todo-ledger"),
             project_memory: None,
-            mission_charter: None,
-            plan: None,
-            mission_workspace: None,
-            knowledge_graph: None,
-            validation_runner: None,
-            checkpoint: None,
-            human_checkpoint: None,
             mission_metrics: None,
             task: &task,
             task_id: &task.task_id,
@@ -5404,13 +5228,14 @@ mod tests {
         assert_eq!(
             turn.items
                 .iter()
-                .map(|item| (item.kind.as_str(), item.tool_call_id.as_deref()))
+                .filter(|item| item.kind == "tool_call_result")
+                .map(|item| item.tool_call_id.as_deref())
                 .collect::<Vec<_>>(),
-            vec![
-                ("tool_call_result", Some("task-tool-shell-a")),
-                ("tool_call_result", Some("task-tool-shell-b")),
-                ("assistant_final", None),
-            ]
+            vec![Some("task-tool-shell-a"), Some("task-tool-shell-b")]
+        );
+        assert!(
+            turn.items.iter().any(|item| item.kind == "assistant_final"),
+            "worker 最终回复必须沉淀为 assistant_final"
         );
         assert!(
             session_store
@@ -5429,6 +5254,25 @@ mod tests {
             invoked_events.iter().all(|event| event.payload["worker_id"]
                 == serde_json::Value::String(worker_id.to_string())),
             "worker 工具事件必须携带执行 worker，供代理详情和 runtime 归属使用"
+        );
+        let lifecycle_started = tool_events
+            .iter()
+            .filter(|event| event.event_type == "tool.call.started")
+            .collect::<Vec<_>>();
+        let lifecycle_finished = tool_events
+            .iter()
+            .filter(|event| event.event_type == "tool.call.finished")
+            .collect::<Vec<_>>();
+        assert_eq!(lifecycle_started.len(), 2);
+        assert_eq!(lifecycle_finished.len(), 2);
+        assert!(
+            lifecycle_finished
+                .iter()
+                .all(|event| event.payload["worker_id"]
+                    == serde_json::Value::String(worker_id.to_string())
+                    && event.payload["lifecycle"]["status"]
+                        == serde_json::Value::String("succeeded".to_string())),
+            "统一工具生命周期事件必须携带 worker 与终态，供 UI 和调试链路使用"
         );
         let runtime_tool_events = tool_event_bus.snapshot().recent_events;
         assert!(

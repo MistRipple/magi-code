@@ -1,6 +1,6 @@
 use magi_core::{
-    AccessProfile, DomainError, DomainResult, LeaseId, MissionId, ProgressSummary, Task, TaskId,
-    TaskKind, TaskPolicy, TaskProjection, TaskStatus, TaskTier, UtcMillis, WorkerId,
+    AccessProfile, AgentRunProjection, DomainError, DomainResult, LeaseId, MissionId,
+    ProgressSummary, Task, TaskId, TaskKind, TaskPolicy, TaskStatus, TaskTier, UtcMillis, WorkerId,
 };
 use magi_worker_runtime::WorkerRuntimeDurableSnapshot;
 use serde::{Deserialize, Serialize};
@@ -40,7 +40,7 @@ pub enum TaskLeaseState {
 /// publish an event).
 pub type StatusChangeCallback = Box<dyn Fn(&TaskId, TaskStatus, TaskStatus, Task) + Send + Sync>;
 
-/// 任务投影的内存存储，维护任务、租约及其索引。
+/// 任务调度的内存存储，维护任务、租约及其索引。
 pub struct TaskStore {
     tasks: RwLock<HashMap<TaskId, Task>>,
     leases: RwLock<HashMap<LeaseId, TaskLease>>,
@@ -76,39 +76,6 @@ fn default_frozen_policy() -> TaskPolicy {
         background_allowed: false,
         escalation_conditions: Vec::new(),
     }
-}
-
-fn output_ref_is_file_change(output_ref: &str) -> bool {
-    let trimmed = output_ref.trim();
-    if trimmed.is_empty()
-        || trimmed.starts_with('{')
-        || trimmed.starts_with('[')
-        || trimmed.contains('\n')
-        || trimmed.contains('\r')
-    {
-        return false;
-    }
-    let lower = trimmed.to_ascii_lowercase();
-    if lower.starts_with("evidence://")
-        || lower.starts_with("test://")
-        || lower.starts_with("tool://")
-        || lower.starts_with("http://")
-        || lower.starts_with("https://")
-    {
-        return false;
-    }
-    if lower.starts_with("file:") || lower.starts_with("diff:") {
-        return true;
-    }
-    let path = Path::new(trimmed);
-    (trimmed.contains('/') || trimmed.contains('\\'))
-        && path
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| {
-                let extension = extension.trim();
-                !extension.is_empty() && extension.len() <= 16
-            })
 }
 
 fn child_index_from_tasks(tasks: &HashMap<TaskId, Task>) -> HashMap<TaskId, Vec<TaskId>> {
@@ -558,15 +525,14 @@ impl TaskStore {
             if let Ok(mut mission_index) = self.mission_index.write() {
                 if let Some(ids) = mission_index.get_mut(&task.mission_id) {
                     ids.retain(|id| id != task_id);
-                }
-            }
-            // Revoke any active leases for this task
-            if let Ok(mut leases) = self.leases.write() {
-                for lease in leases.values_mut() {
-                    if lease.task_id == *task_id && lease.lease_status == TaskLeaseState::Active {
-                        lease.lease_status = TaskLeaseState::Revoked;
+                    if ids.is_empty() {
+                        mission_index.remove(&task.mission_id);
                     }
                 }
+            }
+            // 任务已物理删除，关联租约也必须物理删除，不能留下无主租约。
+            if let Ok(mut leases) = self.leases.write() {
+                leases.retain(|_, lease| lease.task_id != *task_id);
             }
             if let Ok(mut tasks) = self.tasks.write() {
                 let now = UtcMillis::now();
@@ -577,8 +543,64 @@ impl TaskStore {
                     }
                 }
             }
+            self.notify_status_change();
+            self.fire_checkpoint();
         }
 
+        removed
+    }
+
+    /// 删除一个 mission 的全部任务、租约和索引。批量删除只触发一次 checkpoint，
+    /// 确保持久化文件不会在任务树半删状态下被观察到。
+    pub fn remove_tasks_by_mission(&self, mission_id: &MissionId) -> Vec<Task> {
+        let task_ids = {
+            let mut mission_index = self
+                .mission_index
+                .write()
+                .expect("mission_index write lock poisoned");
+            mission_index.remove(mission_id).unwrap_or_default()
+        };
+        if task_ids.is_empty() {
+            return Vec::new();
+        }
+        let task_id_set = task_ids.iter().cloned().collect::<HashSet<_>>();
+        let removed = {
+            let mut tasks = self.tasks.write().expect("tasks write lock poisoned");
+            let mut removed = task_ids
+                .iter()
+                .filter_map(|task_id| tasks.remove(task_id))
+                .collect::<Vec<_>>();
+            let now = UtcMillis::now();
+            for task in tasks.values_mut() {
+                let dependency_len = task.dependency_ids.len();
+                let required_child_len = task.required_children.len();
+                task.dependency_ids
+                    .retain(|task_id| !task_id_set.contains(task_id));
+                task.required_children
+                    .retain(|task_id| !task_id_set.contains(task_id));
+                if dependency_len != task.dependency_ids.len()
+                    || required_child_len != task.required_children.len()
+                {
+                    task.updated_at = now;
+                }
+            }
+            removed.sort_by(|left, right| {
+                left.created_at
+                    .cmp(&right.created_at)
+                    .then_with(|| left.task_id.as_str().cmp(right.task_id.as_str()))
+            });
+            removed
+        };
+        self.leases
+            .write()
+            .expect("leases write lock poisoned")
+            .retain(|_, lease| {
+                !task_id_set.contains(&lease.task_id) && !task_id_set.contains(&lease.root_task_id)
+            });
+        if !removed.is_empty() {
+            self.notify_status_change();
+            self.fire_checkpoint();
+        }
         removed
     }
 
@@ -617,8 +639,8 @@ impl TaskStore {
             .unwrap_or_default()
     }
 
-    /// 构建任务投影视图。
-    pub fn build_projection(&self, root_task_id: &TaskId) -> Option<TaskProjection> {
+    /// 构建代理运行视图。
+    pub fn build_agent_run_projection(&self, root_task_id: &TaskId) -> Option<AgentRunProjection> {
         let tasks = self.tasks.read().expect("tasks read lock poisoned");
         let children = child_index_from_tasks(&tasks);
 
@@ -707,15 +729,7 @@ impl TaskStore {
             root_task.status
         };
 
-        let execution_mode = match root_task
-            .policy_snapshot
-            .as_ref()
-            .map(|policy| policy.task_tier)
-            .unwrap_or(TaskTier::ExecutionChain)
-        {
-            TaskTier::ExecutionChain => "execution_chain".to_string(),
-            TaskTier::LongMission => "long_mission".to_string(),
-        };
+        let execution_mode = "execution_chain".to_string();
         let runner_status = match aggregate_status {
             TaskStatus::Running => "running".to_string(),
             TaskStatus::Completed => "completed".to_string(),
@@ -744,7 +758,7 @@ impl TaskStore {
             }
         };
 
-        Some(TaskProjection {
+        Some(AgentRunProjection {
             root_task,
             tasks: projection_tasks,
             running_tasks,
@@ -768,84 +782,6 @@ impl TaskStore {
             has_recoverable_chain: false,
             recoverable_branch_count: 0,
         })
-    }
-
-    /// 聚合交付包：从 TaskProjection 和已完成任务中提取
-    /// 目标、范围、变更、证据、核验结果等交付摘要。
-    pub fn build_delivery_package(&self, root_task_id: &TaskId) -> Option<serde_json::Value> {
-        let projection = self.build_projection(root_task_id)?;
-        let active_tasks: Vec<&Task> = projection
-            .tasks
-            .iter()
-            .filter(|task| task.status != TaskStatus::Killed)
-            .collect();
-
-        let completed_tasks: Vec<&Task> = active_tasks
-            .iter()
-            .copied()
-            .filter(|t| t.status == TaskStatus::Completed)
-            .collect();
-
-        let mut file_changes: Vec<String> = Vec::new();
-        let mut evidence_list: Vec<String> = Vec::new();
-        let mut verification_results: Vec<serde_json::Value> = Vec::new();
-        let mut execution_records: Vec<serde_json::Value> = Vec::new();
-
-        for task in &active_tasks {
-            for output in &task.output_refs {
-                if output_ref_is_file_change(output) && !file_changes.contains(output) {
-                    file_changes.push(output.clone());
-                }
-            }
-            for evidence in &task.evidence_refs {
-                if !evidence_list.contains(evidence) {
-                    evidence_list.push(evidence.clone());
-                }
-            }
-            if task.kind == TaskKind::LocalAgent && task.status == TaskStatus::Completed {
-                verification_results.push(serde_json::json!({
-                    "task_id": task.task_id.to_string(),
-                    "title": task.title,
-                    "result": "passed",
-                    "evidence": task.evidence_refs,
-                }));
-            }
-            if task.kind == TaskKind::LocalAgent && task.status == TaskStatus::Completed {
-                execution_records.push(serde_json::json!({
-                    "task_id": task.task_id.to_string(),
-                    "title": task.title,
-                    "goal": task.goal,
-                    "evidence": task.evidence_refs,
-                }));
-            }
-        }
-
-        let remaining_risks: Vec<String> = active_tasks
-            .iter()
-            .filter(|t| t.status == TaskStatus::Failed || t.status == TaskStatus::Pending)
-            .map(|t| format!("{}: {:?} - {}", t.task_id, t.status, t.title))
-            .collect();
-
-        Some(serde_json::json!({
-            "goal": projection.root_task.goal,
-            "scope": projection.root_task.workspace_scope,
-            "execution_mode": projection.execution_mode,
-            "aggregate_status": projection.aggregate_status,
-            "progress": {
-                "total": projection.progress_summary.total_tasks,
-                "completed": projection.progress_summary.settled_tasks,
-                "failed": projection.progress_summary.failed_tasks,
-                "running": projection.progress_summary.running_tasks,
-                "pending": projection.progress_summary.pending_tasks,
-                "killed": projection.progress_summary.killed_tasks,
-            },
-            "file_changes": file_changes,
-            "evidence_list": evidence_list,
-            "verification_results": verification_results,
-            "execution_records": execution_records,
-            "remaining_risks": remaining_risks,
-            "completed_task_count": completed_tasks.len(),
-        }))
     }
 
     /// 创建执行租约。

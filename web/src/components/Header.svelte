@@ -1,5 +1,6 @@
 <script lang="ts">
-  import { addToast, getState, messagesState } from '../stores/messages.svelte';
+  import { getState, messagesState } from '../stores/messages.svelte';
+  import { showFeedback } from '../lib/notifications';
   import { ensureArray } from '../lib/utils';
   import { vscode } from '../lib/vscode-bridge';
   import Icon from './Icon.svelte';
@@ -56,12 +57,8 @@
 
   // 新建会话
   function newSession() {
-    addToast('info', '正在打开新会话面板...', undefined, {
-      category: 'feedback',
+    showFeedback('info', '正在打开新会话面板...', {
       source: 'session-management',
-      persistToCenter: false,
-      countUnread: false,
-      displayMode: 'notification_center',
       duration: 1800,
     });
     vscode.postMessage({

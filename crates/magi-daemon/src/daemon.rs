@@ -1,9 +1,7 @@
 mod app;
-mod bootstrap;
 mod config;
 mod events;
 mod maintenance;
-mod mission_recovery;
 mod persistence;
 mod runtime;
 mod types;

@@ -13,6 +13,10 @@ await withGoldenViteServer(async (server) => {
       'input.contextRing.usage': `已用 ${params?.value}`,
       'input.contextRing.remaining': `剩余 ${params?.value}`,
       'input.contextRing.limit': `窗口 ${params?.value}`,
+      'input.contextRing.compaction': `最近压缩 ${params?.reason} ${params?.before}->${params?.after}`,
+      'input.contextRing.compactionReason.contextWindowPressure': '窗口压力',
+      'input.contextRing.compactionReason.estimatedPrefill': '预填估算',
+      'input.contextRing.compactionReason.unknown': '自动',
     };
     return map[key] ?? key;
   };
@@ -253,6 +257,19 @@ await withGoldenViteServer(async (server) => {
                 usage_ratio: 0.25,
                 warning_level: 'notice',
               },
+              context_compaction: {
+                reason: 'context_window_pressure',
+                phase: 'turn_start',
+                original_message_count: 42,
+                compacted_message_count: 9,
+                original_token_estimate: 180_000,
+                compacted_token_estimate: 36_000,
+                context_window_tokens: 245_000,
+                token_limit: 272_000,
+                threshold_tokens: 244_800,
+                resolved_model: 'gpt-5-codex',
+                compacted_at: 1_780_000_000_002,
+              },
             },
           ],
           assignments: [],
@@ -270,8 +287,39 @@ await withGoldenViteServer(async (server) => {
         tokenLimit: 272_000,
         usageRatio: 0.25,
         warningLevel: 'notice',
+        lastCompactionAt: 1_780_000_000_002,
+        lastCompactionReason: 'context_window_pressure',
+        originalTokenEstimate: 180_000,
+        compactedTokenEstimate: 36_000,
+        originalMessageCount: 42,
+        compactedMessageCount: 9,
       },
       'bootstrap budget must become the active session runtime snapshot budgetState',
+    );
+  }
+
+  // 场景 11：压缩摘要进入 tooltip/详情，但不改变占比计算。
+  {
+    const input = {
+      usageRatio: 0.25,
+      tokenUsed: 68_000,
+      remainingTokens: 204_000,
+      tokenLimit: 272_000,
+      lastCompactionReason: 'context_window_pressure',
+      originalTokenEstimate: 180_000,
+      compactedTokenEstimate: 36_000,
+    };
+    const view = ring.resolveRingView(input);
+    assert.equal(view.percentText, '25', 'compaction metadata must not change usage ratio');
+    assert.deepEqual(
+      ring.buildRingDetailItems(input, t).at(-1),
+      { key: 'compaction', text: '最近压缩 窗口压力 180.0k->36.0k' },
+      'detail popover includes the latest compaction summary',
+    );
+    assert.equal(
+      ring.buildRingTooltip(input, t),
+      '上下文 25% · 已用 68.0k · 剩余 204.0k · 窗口 272.0k · 最近压缩 窗口压力 180.0k->36.0k',
+      'tooltip includes compaction as explanatory metadata',
     );
   }
 

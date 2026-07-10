@@ -7,6 +7,7 @@
   import { runActionWithFeedback } from '../lib/action-feedback';
   import type { IconName } from '../lib/icons';
   import { addToast, messagesState, setCurrentSessionId, updateSessions } from '../stores/messages.svelte';
+  import { reportIncident } from '../lib/notifications';
   import { getClientBridge } from '../shared/bridges/bridge-runtime';
   import { i18n } from '../stores/i18n.svelte';
   import type { EditContentKind, Session } from '../types/message';
@@ -300,17 +301,31 @@
     const bootstrapSessionId = typeof messagesState.currentSessionId === 'string'
       ? messagesState.currentSessionId.trim()
       : '';
+    const workspace = workspaces.find((item) => item.workspaceId === selectedWorkspaceId) ?? null;
     if (bootstrapSessionId === currentSessionId) {
+      const hasLoadedSessionList = Object.prototype.hasOwnProperty.call(
+        sessionsByWorkspace,
+        authoritativeWorkspaceId,
+      );
+      if (
+        !bootstrapSessionId
+        && workspace
+        && !hasLoadedSessionList
+        && !loadingWorkspaceIds[authoritativeWorkspaceId]
+      ) {
+        void loadWorkspaceSessionsForSidebar(workspace);
+      }
       return;
     }
-    const workspace = workspaces.find((item) => item.workspaceId === selectedWorkspaceId) ?? null;
 
     if (!bootstrapSessionId) {
       // bootstrap 清空（删除/关闭/新建当前会话）→ 同步清空本地指针 + URL 参数
+      invalidateWorkspaceSessionRequests(authoritativeWorkspaceId);
       currentSessionId = '';
       clearPendingSessionSwitchState();
       if (workspace) {
         syncBrowserSessionBinding(workspace.workspaceId, workspace.rootPath, null);
+        void loadWorkspaceSessionsForSidebar(workspace);
       }
       return;
     }
@@ -337,6 +352,12 @@
     const workspaceId = selectedWorkspaceId.trim();
     const authoritativeWorkspaceId = currentBootstrapWorkspaceId();
     if (authoritativeWorkspaceId && authoritativeWorkspaceId !== workspaceId) {
+      return;
+    }
+    if (
+      !Object.prototype.hasOwnProperty.call(sessionsByWorkspace, workspaceId)
+      || loadingWorkspaceIds[workspaceId]
+    ) {
       return;
     }
     const workspacePath = selectedWorkspace?.rootPath?.trim() || '';
@@ -568,13 +589,10 @@
 
   function notifyWorkbenchError(actionLabel: string, error: unknown): void {
     console.warn(`[WebWorkbenchShell] ${actionLabel} failed:`, error);
-    addToast('error', i18n.t('web.workbenchActionFailed', { action: actionLabel }), undefined, {
-      category: 'incident',
+    reportIncident(i18n.t('web.workbenchActionFailed', { action: actionLabel }), {
+      scope: 'workspace',
       source: 'web-workbench',
-      actionRequired: true,
-      persistToCenter: true,
-      countUnread: true,
-      displayMode: 'toast',
+      fingerprint: `web-workbench:${actionLabel}`,
     });
   }
 
@@ -907,11 +925,18 @@
       selectedWorkspaceId = resolveBackendWorkspaceSelection(next);
       if (selectedWorkspaceId) {
         expandedWorkspaceIds = { [selectedWorkspaceId]: true };
-        void refreshWorkspaceSessions(
-          selectedWorkspaceId,
-          preferredSessionIdForWorkspace(selectedWorkspaceId),
-          workspacePathForId(selectedWorkspaceId),
-        );
+        const selectedWorkspace = next.find((workspace) => workspace.workspaceId === selectedWorkspaceId);
+        const preserveDraftSession = messagesState.bootstrapped
+          && !currentBootstrapSessionIdForWorkspace(selectedWorkspaceId);
+        if (preserveDraftSession && selectedWorkspace) {
+          void loadWorkspaceSessionsForSidebar(selectedWorkspace);
+        } else {
+          void refreshWorkspaceSessions(
+            selectedWorkspaceId,
+            preferredSessionIdForWorkspace(selectedWorkspaceId),
+            workspacePathForId(selectedWorkspaceId),
+          );
+        }
       }
     } catch (error) {
       loadError = i18n.t('web.workspaceUnavailable');
@@ -1089,11 +1114,7 @@
       }
     }, 6000);
     addToast('info', i18n.t('web.sessionSwitching', { name: nextSessionName }), undefined, {
-      category: 'feedback',
       source: 'session-management',
-      persistToCenter: false,
-      countUnread: false,
-      displayMode: 'toast',
       duration: 1800,
     });
     getClientBridge().postMessage({
@@ -1125,11 +1146,7 @@
     const { workspace, session } = pendingDeleteSession;
     const displayName = session.name || i18n.t('header.unnamedSession');
     addToast('info', i18n.t('web.sessionDeleting', { name: displayName }), undefined, {
-      category: 'feedback',
       source: 'session-management',
-      persistToCenter: false,
-      countUnread: false,
-      displayMode: 'toast',
       duration: 1800,
     });
     getClientBridge().postMessage({

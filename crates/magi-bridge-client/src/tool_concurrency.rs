@@ -1,28 +1,9 @@
-use std::collections::HashSet;
-
 const MAX_CONCURRENT: usize = 10;
 
 #[derive(Clone, Copy, Debug)]
 pub struct ToolConcurrencyInput<'a> {
     pub tool_name: &'a str,
     pub arguments: Option<&'a serde_json::Value>,
-}
-
-fn concurrent_safe_tools() -> HashSet<&'static str> {
-    [
-        "file_view",
-        "code_search_regex",
-        "web_search",
-        "web_fetch",
-        "diagram_render",
-        "code_search_semantic",
-        "project_knowledge_query",
-        // agent_spawn 只创建代理并投递初始任务消息；同一轮多次调用代表并发启动
-        // 多个独立代理，互相独立无共享写入，并发安全。
-        "agent_spawn",
-    ]
-    .into_iter()
-    .collect()
 }
 
 pub fn is_concurrency_safe(tool_name: &str) -> bool {
@@ -40,7 +21,20 @@ pub fn is_concurrency_safe_call(input: &ToolConcurrencyInput<'_>) -> bool {
             )
         });
     }
-    concurrent_safe_tools().contains(input.tool_name)
+    matches!(
+        input.tool_name,
+        "file_read"
+            | "view_image"
+            | "search_text"
+            | "search_semantic"
+            | "web_search"
+            | "web_fetch"
+            | "diagram_render"
+            | "knowledge_query"
+            | "code_symbols"
+            | "tool_catalog"
+            | "diff_preview"
+    )
 }
 
 fn is_shell_like_tool(tool_name: &str) -> bool {

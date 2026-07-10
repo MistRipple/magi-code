@@ -146,8 +146,8 @@ pub(crate) fn build_tool_catalog_value(
     };
     let runtime_dependencies =
         runtime_health.dependencies_json(context, resources, external_dependency_source);
-    let (raw_skill_tools, external_mcp_servers) = external_catalog
-        .map(|catalog| (catalog.skill_tools, catalog.mcp_servers))
+    let (raw_skill_tools, external_mcp_servers, external_mcp_tools) = external_catalog
+        .map(|catalog| (catalog.skill_tools, catalog.mcp_servers, catalog.mcp_tools))
         .unwrap_or_default();
     let skill_tools =
         effective_external_skill_tools_for_access_profile(raw_skill_tools, access_profile);
@@ -205,7 +205,7 @@ pub(crate) fn build_tool_catalog_value(
             schema_warning_count,
             runtime_warning_count,
         ),
-        "total": tools.len() + skill_tool_count,
+        "total": tools.len() + skill_tool_count + external_mcp_tools.len(),
         "builtin_total": BuiltinToolName::ALL.len(),
         "public_count": public_count,
         "internal_count": internal_count,
@@ -216,6 +216,7 @@ pub(crate) fn build_tool_catalog_value(
         "skill_tool_count": skill_tool_count,
         "mcp_server_count": mcp_server_count,
         "connected_mcp_server_count": connected_mcp_server_count,
+        "mcp_tool_count": external_mcp_tools.len(),
         "agent_role_catalog_status": agent_role_catalog_status,
         "agent_role_count": agent_role_count,
         "spawnable_agent_role_count": spawnable_agent_role_count,
@@ -227,6 +228,11 @@ pub(crate) fn build_tool_catalog_value(
         },
         "mcp_servers": if include_external && include_mcp_servers {
             serde_json::to_value(external_mcp_servers).unwrap_or_else(|_| serde_json::json!([]))
+        } else {
+            serde_json::json!([])
+        },
+        "mcp_tools": if include_external && include_mcp_servers {
+            serde_json::to_value(external_mcp_tools).unwrap_or_else(|_| serde_json::json!([]))
         } else {
             serde_json::json!([])
         },
@@ -1157,6 +1163,7 @@ mod tests {
                     tool_count: Some(1),
                     error: None,
                 }],
+                mcp_tools: Vec::new(),
             })),
             ..ToolRuntimeResources::default()
         };
@@ -1222,6 +1229,7 @@ mod tests {
                         tool_count: Some(1),
                         error: None,
                     }],
+                    mcp_tools: Vec::new(),
                 }
             })),
             ..ToolRuntimeResources::default()
@@ -1289,6 +1297,7 @@ mod tests {
                         tool_count: Some(1),
                         error: None,
                     }],
+                    mcp_tools: Vec::new(),
                 }
             })),
             ..ToolRuntimeResources::default()
@@ -1340,6 +1349,7 @@ mod tests {
                     status: "available".to_string(),
                 }],
                 mcp_servers: Vec::new(),
+                mcp_tools: Vec::new(),
             })),
             ..ToolRuntimeResources::default()
         };
@@ -1399,6 +1409,7 @@ mod tests {
                     tool_count: Some(3),
                     error: Some("mcp_connection_failed".to_string()),
                 }],
+                mcp_tools: Vec::new(),
             })),
             ..ToolRuntimeResources::default()
         };
@@ -1436,6 +1447,7 @@ mod tests {
                     tool_count: Some(7),
                     error: Some("mcp_connection_failed".to_string()),
                 }],
+                mcp_tools: Vec::new(),
             })),
             ..ToolRuntimeResources::default()
         };

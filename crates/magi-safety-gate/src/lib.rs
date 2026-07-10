@@ -405,7 +405,7 @@ mod tests {
     fn non_shell_tools_are_passthrough() {
         let gate = SafetyGate::with_builtin_defaults();
         let args = serde_json::json!({ "command": "rm -rf /" }).to_string();
-        assert_eq!(gate.evaluate("file_view", &args), SafetyDecision::Allow);
+        assert_eq!(gate.evaluate("file_read", &args), SafetyDecision::Allow);
     }
 
     #[test]

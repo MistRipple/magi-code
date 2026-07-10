@@ -3,7 +3,6 @@
   import Header from './components/Header.svelte';
   import TopTabs from './components/TopTabs.svelte';
   import ThreadPanel from './components/ThreadPanel.svelte';
-  import TasksPanel from './components/TasksPanel.svelte';
   import EditsPanel from './components/EditsPanel.svelte';
   import KnowledgePanel from './components/KnowledgePanel.svelte';
   import SettingsPanel from './components/SettingsPanel.svelte';
@@ -17,11 +16,11 @@
     type AgentConnectionEventDetail,
   } from './web/agent-api';
 
-  type TopTabType = 'thread' | 'tasks' | 'edits' | 'knowledge';
+  type TopTabType = 'thread' | 'edits' | 'knowledge';
 
   // 安全获取顶部 Tab（映射非顶部 Tab 到默认值）
   const currentTopTab = $derived<TopTabType>(
-    ['thread', 'tasks', 'edits', 'knowledge'].includes(messagesState.currentTopTab as string)
+    ['thread', 'edits', 'knowledge'].includes(messagesState.currentTopTab as string)
       ? (messagesState.currentTopTab as TopTabType)
       : 'thread'
   );
@@ -101,11 +100,6 @@
     {/if}
     <div class="top-tab-pane" class:active={currentTopTab === 'thread'}>
       <ThreadPanel isTopActive={currentTopTab === 'thread'} />
-    </div>
-    <div class="top-tab-pane" class:active={currentTopTab === 'tasks'}>
-      {#if currentTopTab === 'tasks'}
-        <TasksPanel />
-      {/if}
     </div>
     <div class="top-tab-pane" class:active={currentTopTab === 'edits'}>
       {#if currentTopTab === 'edits'}

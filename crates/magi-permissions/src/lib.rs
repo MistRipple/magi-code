@@ -627,8 +627,8 @@ mod tests {
 
     fn engine_with_test_tools() -> PermissionEngine {
         let mut engine = PermissionEngine::default();
-        engine.register_read_only_tool("file_view");
-        engine.register_restricted_auto_write_tool("file_edit");
+        engine.register_read_only_tool("file_read");
+        engine.register_restricted_auto_write_tool("file_patch");
         engine.register_restricted_auto_write_tool("file_write");
         engine.register_restricted_auto_write_tool("apply_patch");
         engine
@@ -649,7 +649,7 @@ mod tests {
         let engine = engine_with_test_tools();
         let policy = policy_read_only();
         let req = PermissionRequest::ToolInvocation {
-            tool_name: "file_edit",
+            tool_name: "file_patch",
             is_write_tool: true,
         };
         let decision = engine.decide(&req, &policy, AccessProfile::FullAccess);
@@ -660,10 +660,10 @@ mod tests {
     fn denied_tool_takes_precedence_over_allow_list() {
         let engine = engine_with_test_tools();
         let mut policy = policy_empty();
-        policy.denied_tools.insert("file_edit".to_string());
-        policy.allowed_tools.insert("file_edit".to_string());
+        policy.denied_tools.insert("file_patch".to_string());
+        policy.allowed_tools.insert("file_patch".to_string());
         let req = PermissionRequest::ToolInvocation {
-            tool_name: "file_edit",
+            tool_name: "file_patch",
             is_write_tool: true,
         };
         let decision = engine.decide(&req, &policy, AccessProfile::Restricted);
@@ -674,9 +674,9 @@ mod tests {
     fn allow_list_excludes_unlisted_tool() {
         let engine = engine_with_test_tools();
         let mut policy = policy_empty();
-        policy.allowed_tools.insert("file_view".to_string());
+        policy.allowed_tools.insert("file_read".to_string());
         let req = PermissionRequest::ToolInvocation {
-            tool_name: "file_edit",
+            tool_name: "file_patch",
             is_write_tool: true,
         };
         let decision = engine.decide(&req, &policy, AccessProfile::Restricted);
@@ -688,7 +688,7 @@ mod tests {
         let engine = engine_with_test_tools();
         let policy = policy_read_only();
         let req = PermissionRequest::ToolInvocation {
-            tool_name: "file_edit",
+            tool_name: "file_patch",
             is_write_tool: true,
         };
         let decision = engine.decide(&req, &policy, AccessProfile::Restricted);
@@ -700,7 +700,7 @@ mod tests {
         let engine = engine_with_test_tools();
         let policy = policy_empty();
         let req = PermissionRequest::ToolInvocation {
-            tool_name: "file_edit",
+            tool_name: "file_patch",
             is_write_tool: true,
         };
         let decision = engine.decide(&req, &policy, AccessProfile::ReadOnly);
@@ -712,7 +712,7 @@ mod tests {
         let engine = engine_with_test_tools();
         let policy = policy_empty();
         let edit_req = PermissionRequest::ToolInvocation {
-            tool_name: "file_edit",
+            tool_name: "file_patch",
             is_write_tool: true,
         };
         assert_eq!(
@@ -919,8 +919,8 @@ mod tests {
     #[test]
     fn registered_read_only_tools_recognised() {
         let engine = engine_with_test_tools();
-        assert!(engine.is_read_only_tool("file_view"));
-        assert!(!engine.is_read_only_tool("file_edit"));
+        assert!(engine.is_read_only_tool("file_read"));
+        assert!(!engine.is_read_only_tool("file_patch"));
     }
 
     #[test]

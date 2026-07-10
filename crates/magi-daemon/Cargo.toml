@@ -21,9 +21,7 @@ magi-conversation-runtime = { path = "../magi-conversation-runtime" }
 magi-event-bus = { path = "../magi-event-bus" }
 magi-governance = { path = "../magi-governance" }
 magi-knowledge-store = { path = "../magi-knowledge-store" }
-magi-lifecycle-notice = { path = "../magi-lifecycle-notice" }
 magi-memory-store = { path = "../magi-memory-store" }
-magi-mission = { path = "../magi-mission" }
 magi-orchestrator = { path = "../magi-orchestrator" }
 magi-session-store = { path = "../magi-session-store" }
 magi-settings-store = { path = "../magi-settings-store" }
@@ -37,6 +35,3 @@ magi-workspace = { path = "../magi-workspace" }
 [dev-dependencies]
 tower = { version = "0.5.3", features = ["util"] }
 tempfile = "3"
-magi-checkpoint = { path = "../magi-checkpoint" }
-magi-mission-charter = { path = "../magi-mission-charter" }
-magi-plan = { path = "../magi-plan" }

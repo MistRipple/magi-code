@@ -34,6 +34,7 @@ export interface SessionTurnRequestDto {
   workspacePath?: string | null;
   text?: string | null;
   skillName?: string | null;
+  goalMode?: boolean;
   images: SessionTurnImageDto[];
   accessProfile?: 'read_only' | 'restricted' | 'full_access' | null;
   orchestratorSessionConfig?: Record<string, unknown> | null;
@@ -53,7 +54,7 @@ export interface SessionTurnResponseDto {
   acceptedAt: number;
   createdSession: boolean;
   route: SessionTurnRouteDto;
-  /** Root task ID when the backend created a task projection for this action. */
+  /** Root task ID when the backend created an agent run for this action. */
   rootTaskId?: string | null;
   /** 当前轮次实际执行的 action task ID。 */
   actionTaskId?: string | null;
@@ -151,14 +152,7 @@ export interface WorkspaceDto {
   updatedAt: number;
 }
 
-export interface NotificationDto {
-  notificationId: string;
-  sessionId: string;
-  kind: string;
-  message: string;
-  createdAt: number;
-  handled: boolean;
-}
+export type NotificationDto = IncidentNotificationItemDto;
 
 export interface ExecutionOwnershipDto {
   session_id?: string | null;
@@ -498,17 +492,6 @@ export interface RuntimeOverviewDto {
   diagnostics: RuntimeDiagnosticSummaryDto;
 }
 
-export interface MissionMetricsSummaryDto {
-  turn_count: number;
-  total_prompt_tokens: number;
-  total_completion_tokens: number;
-  total_tokens: number;
-  wall_clock_millis: number;
-  first_turn_started_at?: number | null;
-  last_turn_finished_at?: number | null;
-  last_lifecycle_phase?: string | null;
-}
-
 export interface ExecutionGroupRuntimeSummaryDto {
   mission_id: string;
   event_count: number;
@@ -544,8 +527,6 @@ export interface ExecutionGroupRuntimeSummaryDto {
   context_provenance_linked_memory_count: number;
   latest_event_type?: string | null;
   current_status?: string | null;
-  lifecycle_phase?: string | null;
-  metrics?: MissionMetricsSummaryDto | null;
 }
 
 export interface TaskRuntimeSummaryDto {
@@ -855,68 +836,64 @@ export interface SessionSelectionResponseDto {
   currentSession?: SessionDto | null;
 }
 
-export interface SessionNotificationItemDto {
+export type IncidentScopeDto = 'app' | 'workspace' | 'session';
+
+export interface IncidentNotificationItemDto {
   notificationId: string;
   message: string;
-  kind: string;
+  kind: 'incident';
+  scope: IncidentScopeDto;
   level: string;
   title?: string | null;
   source?: string | null;
+  workspaceId?: string | null;
+  sessionId?: string | null;
   handled: boolean;
   read: boolean;
+  resolved: boolean;
   createdAt: number;
-  persistToCenter: boolean;
   actionRequired: boolean;
   countUnread: boolean;
-  displayMode?: 'toast' | 'notification_center' | 'silent' | null;
-  duration?: number | null;
+  occurrenceCount: number;
 }
 
-export interface SessionNotificationSnapshotDto {
+export interface NotificationCenterSnapshotDto {
   lastUpdatedAt: number;
-  records: SessionNotificationItemDto[];
+  records: IncidentNotificationItemDto[];
 }
 
-export interface SessionNotificationsResponseDto {
-  sessionId: string;
-  workspaceId?: string | null;
-  notifications: SessionNotificationSnapshotDto;
+export interface NotificationsResponseDto {
+  workspaceId: string;
+  sessionId?: string | null;
+  notifications: NotificationCenterSnapshotDto;
 }
 
-export interface ClearNotificationsRequestDto {
+export interface NotificationContextRequestDto {
   workspaceId: string;
   workspacePath?: string | null;
-  sessionId: string;
+  sessionId?: string | null;
 }
 
-export interface RemoveNotificationRequestDto {
-  workspaceId: string;
-  workspacePath?: string | null;
-  sessionId: string;
+export interface RemoveNotificationRequestDto extends NotificationContextRequestDto {
   notificationId: string;
 }
 
-export interface AppendNotificationRequestDto {
-  workspaceId: string;
-  workspacePath?: string | null;
-  sessionId: string;
+export interface ReportIncidentRequestDto extends NotificationContextRequestDto {
   notificationId?: string | null;
-  kind?: 'incident' | 'audit' | 'center' | 'toast' | string | null;
+  scope: IncidentScopeDto;
   level?: string | null;
   title?: string | null;
   message: string;
   source?: string | null;
-  persistToCenter?: boolean | null;
   actionRequired?: boolean | null;
-  countUnread?: boolean | null;
-  displayMode?: 'toast' | 'notification_center' | 'silent' | null;
-  duration?: number | null;
+  fingerprint?: string | null;
 }
 
-export type MarkAllNotificationsReadResponseDto = SessionNotificationsResponseDto;
-export type ClearNotificationsResponseDto = SessionNotificationsResponseDto;
-export type RemoveNotificationResponseDto = SessionNotificationsResponseDto;
-export type AppendNotificationResponseDto = SessionNotificationsResponseDto;
+export type MarkAllNotificationsReadResponseDto = NotificationsResponseDto;
+export type ClearNotificationsResponseDto = NotificationsResponseDto;
+export type RemoveNotificationResponseDto = NotificationsResponseDto;
+export type ResolveNotificationResponseDto = NotificationsResponseDto;
+export type ReportIncidentResponseDto = NotificationsResponseDto;
 
 // ─── Workspace management endpoints ─────────────────────────────────
 
@@ -1296,7 +1273,7 @@ export interface MessagesResponseDto {
   beforeCursor?: string | null;
 }
 
-// ─── Task Projection types (magi-core::task) ────────────────────────
+// ─── Agent Run types (magi-core::task) ────────────────────────
 
 export type TaskKind =
   | 'local_agent'
@@ -1334,7 +1311,7 @@ export interface TaskPolicyDto {
   retry_limit: number;
   validation_profile?: string | null;
   checkpoint_mode: string;
-  task_tier: 'execution_chain' | 'long_mission';
+  task_tier: 'execution_chain';
   background_allowed: boolean;
   escalation_conditions: string[];
 }
@@ -1372,8 +1349,63 @@ export interface AgentProjectionResultDto {
   truncated: boolean;
 }
 
+export type GoalStatus =
+  | 'active'
+  | 'paused'
+  | 'blocked'
+  | 'usage_limited'
+  | 'budget_limited'
+  | 'complete'
+  | 'cleared';
+
+export interface SessionGoalDto {
+  goalId: string;
+  sessionId: string;
+  threadId: string;
+  objective: string;
+  status: GoalStatus;
+  tokenBudget?: number | null;
+  tokensUsed: number;
+  timeUsedSeconds: number;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export type GoalTodoStatus = 'pending' | 'in_progress' | 'completed';
+
+export interface GoalTodoItemDto {
+  content: string;
+  activeForm: string;
+  status: GoalTodoStatus;
+}
+
+export interface CurrentGoalResponseDto {
+  sessionId: string;
+  workspaceId: string;
+  workspacePath: string;
+  goal?: SessionGoalDto | null;
+  todoItems: GoalTodoItemDto[];
+}
+
+export interface GoalActionRequestDto {
+  sessionId?: string;
+  workspaceId?: string;
+  workspacePath?: string;
+}
+
+export interface GoalUpdateRequestDto extends GoalActionRequestDto {
+  objective: string;
+}
+
+export interface GoalMutationResponseDto {
+  sessionId: string;
+  workspaceId: string;
+  workspacePath: string;
+  goal?: SessionGoalDto | null;
+}
+
 export interface AgentProjectionDto {
-  taskId: string;
+  agentRunId: string;
   parentTaskId: string;
   rootTaskId: string;
   displayName: string;
@@ -1405,9 +1437,9 @@ export interface ProgressSummaryDto {
   settled_tasks: number;
 }
 
-export type TaskExecutionModeDto = 'session_turn' | 'execution_chain' | 'long_mission';
+export type TaskExecutionModeDto = 'session_turn' | 'execution_chain';
 
-export interface TaskProjectionDto {
+export interface AgentRunProjectionDto {
   sessionId: string;
   workspaceId: string;
   workspacePath: string;
@@ -1426,62 +1458,4 @@ export interface TaskProjectionDto {
   has_recoverable_chain: boolean;
   recoverable_branch_count: number;
   agents: AgentProjectionDto[];
-}
-
-export interface SessionTaskHistoryItemDto {
-  rootTask: TaskDto;
-  runnerStatus: 'pending' | 'idle' | 'running' | 'completed' | 'error' | 'killed';
-  displayStatus: string;
-  executionMode: TaskExecutionModeDto;
-  active: boolean;
-  archived: boolean;
-  restartable: boolean;
-  updatedAt: number;
-}
-
-export interface SessionTaskHistoryResponseDto {
-  sessionId: string;
-  workspaceId: string;
-  workspacePath: string;
-  items: SessionTaskHistoryItemDto[];
-}
-
-export interface DeliveryPackageProgressDto {
-  total: number;
-  completed: number;
-  failed: number;
-  running: number;
-  pending: number;
-  killed: number;
-}
-
-export interface DeliveryPackageVerificationResultDto {
-  task_id: string;
-  title: string;
-  result: string;
-  evidence: string[];
-}
-
-export interface DeliveryPackageExecutionRecordDto {
-  task_id: string;
-  title: string;
-  goal: string;
-  evidence: string[];
-}
-
-export interface DeliveryPackageDto {
-  sessionId: string;
-  workspaceId: string;
-  workspacePath: string;
-  goal: string;
-  scope?: string | null;
-  execution_mode: TaskExecutionModeDto;
-  aggregate_status: string;
-  progress: DeliveryPackageProgressDto;
-  file_changes: string[];
-  evidence_list: string[];
-  verification_results: DeliveryPackageVerificationResultDto[];
-  execution_records: DeliveryPackageExecutionRecordDto[];
-  remaining_risks: string[];
-  completed_task_count: number;
 }

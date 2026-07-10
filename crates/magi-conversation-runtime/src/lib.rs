@@ -15,7 +15,6 @@ pub mod execution_chain_recovery;
 mod mailbox;
 pub mod model_config;
 mod model_error;
-pub mod prompt_reminder;
 pub mod prompt_utils;
 mod registry;
 pub mod session_images;
@@ -33,6 +32,7 @@ pub mod task_runner_bridge;
 pub mod tool_batch;
 mod tool_declared_paths;
 pub mod tool_result_utils;
+mod tool_surface_state;
 mod turn;
 pub mod usage_recording;
 
@@ -66,3 +66,13 @@ pub use task_helpers::{
 };
 pub use tool_batch::execute_task_tool_call_batch;
 pub use turn::{Turn, TurnState, TurnTransitionError};
+
+#[cfg(test)]
+pub(crate) fn test_todo_ledger(name: &str) -> magi_todo_ledger::TodoLedger {
+    let store = std::sync::Arc::new(magi_session_store::SessionStore::new());
+    let session_id = magi_core::SessionId::new(name);
+    store
+        .create_session(session_id.clone(), name)
+        .expect("test todo session should create");
+    magi_todo_ledger::TodoLedger::new(store, session_id)
+}

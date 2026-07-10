@@ -8,7 +8,7 @@
     messagesState,
     removeQueuedMessage,
   } from '../stores/messages.svelte';
-  import { getTaskProjectionState, refreshTaskProjection } from '../stores/task-projection-store.svelte';
+  import { getAgentRunState, refreshAgentRunProjection } from '../stores/agent-run-store.svelte';
   import { RustDaemonClient } from '../shared/rust-daemon-client';
   import {
     enhanceAgentPrompt,
@@ -38,6 +38,13 @@
     selectComposerDraftWorkspace,
     type ComposerWorkspaceOption,
   } from '../stores/composer-workspace.svelte';
+  import {
+    buildSlashCommands,
+    filterSlashCommands,
+    resolveSlashTrigger,
+    type SlashCommand,
+    type SlashSkillOption,
+  } from '../lib/slash-commands';
 
   interface SelectedImage {
     id: string;
@@ -47,11 +54,7 @@
 
   // 输入框可识别的 instruction skill。来源：bootstrap 中的 skillsConfig.instructionSkills，
   // 这一组才是 `/` 唤起的指令型技能，与 customTools（已注册到工具表）的语义不同。
-  interface SkillOption {
-    skillId: string;
-    name: string;
-    description: string;
-  }
+  type SkillOption = SlashSkillOption;
 
   type ReasoningEffort = 'low' | 'medium' | 'high' | 'xhigh';
 
@@ -68,35 +71,39 @@
   const accessProfileOptions: Array<{
     value: AccessProfile;
     labelKey: string;
+    descriptionKey: string;
+    icon: 'eye' | 'shield' | 'zap';
   }> = [
     {
       value: 'read_only',
       labelKey: 'input.access.readOnly',
+      descriptionKey: 'input.access.readOnlyDescription',
+      icon: 'eye',
     },
     {
       value: 'restricted',
       labelKey: 'input.access.restricted',
+      descriptionKey: 'input.access.restrictedDescription',
+      icon: 'shield',
     },
     {
       value: 'full_access',
       labelKey: 'input.access.fullAccess',
+      descriptionKey: 'input.access.fullAccessDescription',
+      icon: 'zap',
     },
   ];
 
   // 输入内容
   let inputValue = $state('');
 
-  // 斜杠唤起的技能选择面板状态
+  // 斜杠快捷引用：Goal 决定持续推进生命周期，Skill 决定本轮执行方法，两者可同时引用。
+  let selectedGoalMode = $state(false);
   let selectedSkill = $state<SkillOption | null>(null);
   let slashTriggerStart = $state<number | null>(null);
   let slashFilter = $state('');
   let slashHighlightIndex = $state(0);
   let slashListEl = $state<HTMLDivElement | null>(null);
-  let slashTooltipTop = $state(0);
-  // 技能详情预览（API 拉取 prompt.md / SKILL.md 内容，截断 200 字）。
-  // 仅在 hover/高亮时按需懒拉，避免 bootstrap 体积膨胀；同一会话内复用。
-  let skillPreviewCache = $state<Record<string, string>>({});
-  let skillPreviewLoading = $state<Record<string, boolean>>({});
 
   // 拖动调整大小相关
   let inputHeight = $state(120); // 默认高度增加到 120px
@@ -171,16 +178,30 @@
   const currentWorkspaceId = $derived(messagesState.currentWorkspaceId);
   const currentWorkspacePath = $derived(messagesState.currentWorkspacePath);
   const isDraftSession = $derived.by(() => !currentSessionId?.trim());
+  let composerReferenceScopeKey = '';
   const composerWorkspace = $derived.by(() => (
     resolveComposerWorkspace(currentWorkspaceId, currentWorkspacePath, isDraftSession)
   ));
   const workspaceOptions = $derived.by(() => composerWorkspaceState.workspaces);
-  const taskProjection = $derived(getTaskProjectionState(currentSessionId, currentWorkspaceId));
+  const agentRunState = $derived(getAgentRunState(currentSessionId, currentWorkspaceId));
 
-  const shouldInterruptTaskProjectionFromComposer = $derived.by(() => {
-    const projection = taskProjection.projection;
+  $effect(() => {
+    const nextScopeKey = `${currentWorkspaceId ?? ''}\u0000${currentSessionId ?? ''}`;
+    if (!composerReferenceScopeKey) {
+      composerReferenceScopeKey = nextScopeKey;
+      return;
+    }
+    if (nextScopeKey === composerReferenceScopeKey) return;
+    composerReferenceScopeKey = nextScopeKey;
+    selectedGoalMode = false;
+    selectedSkill = null;
+    closeSlashMenu();
+  });
+
+  const shouldInterruptAgentRunFromComposer = $derived.by(() => {
+    const projection = agentRunState.projection;
     const sessionId = currentSessionId?.trim();
-    const rootTaskId = projection?.root_task.task_id ?? taskProjection.rootTaskId;
+    const rootTaskId = projection?.root_task.task_id ?? agentRunState.rootTaskId;
     if (!projection || !sessionId || !rootTaskId) return false;
     return projection.runner_status === 'running';
   });
@@ -188,11 +209,7 @@
     messagesState.sessionHydrating
   ));
 
-  // 发送/停止态只认 store 内已经收敛好的 isProcessing：
-  // 该字段已收敛为 backendProcessing | pendingRequests 的单一事实源，
-  // 不再叠加 orchestrator runtimeState / canonical projection / activeMessageIds，
-  // 避免历史会话里的陈旧工具卡片把空闲会话抬回执行态。
-  const isSending = $derived(messagesState.isProcessing);
+  const isSending = $derived.by(() => messagesState.isProcessing || shouldInterruptAgentRunFromComposer);
   const activeInteraction = $derived.by(() => getActiveInteractionType());
   const isInteractionBlocking = $derived.by(() => Boolean(activeInteraction));
   const queuedMessages = $derived.by(() => getQueuedMessages());
@@ -244,34 +261,26 @@
     return out;
   });
 
-  function fuzzyMatch(text: string, query: string): boolean {
-    if (!query) return true;
-    let qi = 0;
-    for (let i = 0; i < text.length && qi < query.length; i++) {
-      if (text[i] === query[qi]) qi++;
-    }
-    return qi === query.length;
-  }
+  const slashCommands = $derived.by<SlashCommand[]>(() => buildSlashCommands(availableSkills, {
+    name: i18n.t('input.goalMode.name'),
+    description: i18n.t('input.goalMode.description'),
+  }));
 
-  const filteredSkills = $derived.by<SkillOption[]>(() => {
+  const filteredSlashCommands = $derived.by<SlashCommand[]>(() => {
     if (slashTriggerStart === null) return [];
-    const filter = slashFilter.trim().toLowerCase();
-    const list = availableSkills;
-    if (!filter) return list;
-    return list.filter((skill) => {
-      const name = skill.name.toLowerCase();
-      const desc = skill.description.toLowerCase();
-      return fuzzyMatch(name, filter) || name.includes(filter) || desc.includes(filter);
-    });
+    return filterSlashCommands(slashCommands, slashFilter).filter((command) => (
+      command.kind === 'goal'
+        ? !selectedGoalMode
+        : command.id !== selectedSkill?.skillId
+    ));
   });
 
-  const slashMenuOpen = $derived(slashTriggerStart !== null && filteredSkills.length > 0);
+  const slashMenuOpen = $derived(slashTriggerStart !== null && filteredSlashCommands.length > 0);
 
-  // 跟随高亮项更新 tooltip 的纵向偏移；列表与 tooltip 都挂在 popover 上，
-  // 鼠标 hover / 键盘上下键改动 slashHighlightIndex 都会触发这次重算。
+  // 鼠标 hover 或键盘导航切换高亮项时，确保当前选项始终处于可见区域。
   $effect(() => {
     void slashHighlightIndex;
-    void filteredSkills;
+    void filteredSlashCommands;
     if (!slashMenuOpen) return;
     queueMicrotask(() => {
       const list = slashListEl;
@@ -279,44 +288,14 @@
       const items = list.querySelectorAll<HTMLElement>('.ia-slash-item');
       const active = items[slashHighlightIndex];
       if (!active) return;
-      slashTooltipTop = active.offsetTop;
       active.scrollIntoView({ block: 'nearest' });
     });
-  });
-
-  // 高亮项变化时，按需从后端拉取技能正文预览（prompt.md/SKILL.md 前 200 字）。
-  // 缓存 key 为技能名；空字符串视为 "已尝试但内容为空"，避免重复请求。
-  $effect(() => {
-    if (!slashMenuOpen) return;
-    const active = filteredSkills[slashHighlightIndex];
-    if (!active) return;
-    const skillId = active.skillId;
-    if (skillPreviewCache[skillId] !== undefined) return;
-    if (skillPreviewLoading[skillId]) return;
-    skillPreviewLoading[skillId] = true;
-    const base = resolveAgentBaseUrl();
-    const url = `${base.replace(/\/$/, '')}/api/settings/skills/instruction-preview?skillId=${encodeURIComponent(skillId)}`;
-    fetch(url)
-      .then(async (resp) => {
-        if (!resp.ok) {
-          skillPreviewCache[skillId] = '';
-          return;
-        }
-        const data = await resp.json();
-        const preview = typeof data?.preview === 'string' ? data.preview : '';
-        skillPreviewCache[skillId] = preview;
-      })
-      .catch(() => {
-        skillPreviewCache[skillId] = '';
-      })
-      .finally(() => {
-        skillPreviewLoading[skillId] = false;
-      });
   });
 
   function clearComposerState() {
     inputValue = '';
     selectedImages = [];
+    selectedGoalMode = false;
     selectedSkill = null;
     clearEnhanceSnapshot();
     closeSlashMenu();
@@ -563,43 +542,32 @@
   }
 
   // 仅在光标前是行首或空白时认定 `/` 是触发字符，避免 URL/路径里的斜杠误触。
-  function recomputeSlashState() {
+  function recomputeSlashState(
+    value = readEditorText(),
+    cursor = getEditorCaretOffset(),
+  ) {
     if (!inputTextareaEl) {
       closeSlashMenu();
       return;
     }
-    const cursor = getEditorCaretOffset();
-    const value = readEditorText();
-    if (cursor === 0) {
+    const trigger = resolveSlashTrigger(value, cursor);
+    if (!trigger) {
       closeSlashMenu();
       return;
     }
-    let i = cursor - 1;
-    let triggerAt: number | null = null;
-    while (i >= 0) {
-      const ch = value[i];
-      if (ch === '/') {
-        const prev = i > 0 ? value[i - 1] : '';
-        const isLineStart = i === 0 || prev === '\n' || prev === ' ' || prev === '\t';
-        triggerAt = isLineStart ? i : null;
-        break;
-      }
-      if (ch === ' ' || ch === '\n' || ch === '\t') break;
-      i--;
-    }
-    if (triggerAt === null) {
-      closeSlashMenu();
-      return;
-    }
-    slashTriggerStart = triggerAt;
-    slashFilter = value.slice(triggerAt + 1, cursor);
-    if (slashHighlightIndex >= filteredSkills.length) {
+    slashTriggerStart = trigger.triggerStart;
+    slashFilter = trigger.filter;
+    if (slashHighlightIndex >= filteredSlashCommands.length) {
       slashHighlightIndex = 0;
     }
   }
 
-  function commitSkill(skill: SkillOption) {
-    selectedSkill = skill;
+  function commitSlashCommand(command: SlashCommand) {
+    if (command.kind === 'goal') {
+      selectedGoalMode = true;
+    } else {
+      selectedSkill = command.skill;
+    }
     if (inputTextareaEl && slashTriggerStart !== null) {
       const cursor = getEditorCaretOffset();
       const value = readEditorText();
@@ -612,6 +580,11 @@
     closeSlashMenu();
   }
 
+  function removeGoalMode() {
+    selectedGoalMode = false;
+    queueMicrotask(focusEditor);
+  }
+
   function removeSelectedSkill() {
     selectedSkill = null;
     queueMicrotask(focusEditor);
@@ -620,16 +593,26 @@
   function handleComposerInput() {
     if (isComposing) return;
     if (!inputTextareaEl) return;
-    const offset = getEditorCaretOffset();
     const text = readEditorText();
-    inputTextareaEl.innerHTML = buildHighlightedHtml(text);
-    setEditorCaretOffset(offset);
     inputValue = text;
-    recomputeSlashState();
+    // 原生 input 事件内立即替换 contenteditable 的文本节点会把光标重置到开头。
+    // 等当前输入事件完成后，再基于稳定的 DOM/selection 同步高亮和快捷命令状态。
+    queueMicrotask(() => {
+      if (!inputTextareaEl || isComposing) return;
+      const currentText = readEditorText();
+      const offset = getEditorCaretOffset();
+      const highlightedHtml = buildHighlightedHtml(currentText);
+      if (inputTextareaEl.innerHTML !== highlightedHtml) {
+        inputTextareaEl.innerHTML = highlightedHtml;
+        setEditorCaretOffset(offset);
+      }
+      if (inputValue !== currentText) inputValue = currentText;
+      recomputeSlashState(currentText, offset);
+    });
   }
 
   function handleComposerSelectionChange() {
-    if (slashTriggerStart !== null) recomputeSlashState();
+    recomputeSlashState();
   }
 
   function handleCompositionStart() {
@@ -850,9 +833,10 @@
         workspacePath: targetWorkspace.rootPath,
         sessionId: isDraftSession ? '' : (messagesState.currentSessionId || ''),
         skillName: selectedSkill?.skillId ?? null,
+        goalMode: selectedGoalMode,
         accessProfile: selectedAccessProfile,
         orchestratorSessionConfig: getTurnOrchestratorSessionConfigPayload(),
-        followUpMode: isSending ? 'queue' : undefined,
+        followUpMode: !isDraftSession && isSending ? 'queue' : undefined,
         images: selectedImages.map((img) => ({
           name: img.name,
           dataUrl: img.dataUrl,
@@ -886,12 +870,12 @@
       if (!event.isComposing && event.keyCode !== 229) {
         if (event.key === 'ArrowDown') {
           event.preventDefault();
-          slashHighlightIndex = (slashHighlightIndex + 1) % filteredSkills.length;
+          slashHighlightIndex = (slashHighlightIndex + 1) % filteredSlashCommands.length;
           return;
         }
         if (event.key === 'ArrowUp') {
           event.preventDefault();
-          slashHighlightIndex = (slashHighlightIndex - 1 + filteredSkills.length) % filteredSkills.length;
+          slashHighlightIndex = (slashHighlightIndex - 1 + filteredSlashCommands.length) % filteredSlashCommands.length;
           return;
         }
         if (event.key === 'Escape') {
@@ -901,8 +885,8 @@
         }
         if (event.key === 'Tab' || isEnterKey(event)) {
           event.preventDefault();
-          const chosen = filteredSkills[slashHighlightIndex] ?? filteredSkills[0];
-          if (chosen) commitSkill(chosen);
+          const chosen = filteredSlashCommands[slashHighlightIndex] ?? filteredSlashCommands[0];
+          if (chosen) commitSlashCommand(chosen);
           return;
         }
       }
@@ -929,24 +913,24 @@
     }
   }
 
-  // 任务投影运行时，输入框停止入口与任务面板共用同一条可恢复中断链路。
+  // 代理运行运行时，输入框停止入口与目标面板共用同一条可恢复中断链路。
   async function stopTask() {
     if (stopLoading) return;
     stopLoading = true;
     try {
-      if (shouldInterruptTaskProjectionFromComposer) {
-        const projection = taskProjection.projection;
+      if (shouldInterruptAgentRunFromComposer) {
+        const projection = agentRunState.projection;
         const sessionId = currentSessionId?.trim();
-        const rootTaskId = projection?.root_task.task_id ?? taskProjection.rootTaskId;
+        const rootTaskId = projection?.root_task.task_id ?? agentRunState.rootTaskId;
         if (sessionId && rootTaskId) {
           const client = new RustDaemonClient(resolveAgentBaseUrl());
-          await client.interruptTask({
+          await client.interruptAgentRun({
             taskId: rootTaskId,
             sessionId,
             workspaceId: currentWorkspaceId?.trim() || undefined,
             workspacePath: currentWorkspacePath?.trim() || undefined,
           });
-          await refreshTaskProjection(
+          await refreshAgentRunProjection(
             sessionId,
             currentWorkspaceId?.trim() || undefined,
             currentWorkspacePath?.trim() || undefined,
@@ -1093,7 +1077,12 @@
 
   function getTurnOrchestratorSessionConfigPayload(): Record<string, unknown> | null {
     const config = getCurrentOrchestratorSessionConfigSnapshot();
-    return Object.keys(config).length > 0 ? { ...config } : null;
+    const model = readOrchestratorModel();
+    const nextConfig = {
+      ...config,
+      ...(typeof config.model === 'string' && config.model.trim() ? {} : (model ? { model } : {})),
+    };
+    return Object.keys(nextConfig).length > 0 ? nextConfig : null;
   }
 
   function readOrchestratorModel(): string {
@@ -1103,7 +1092,10 @@
     }
     const config = getEffectiveOrchestratorConfigSnapshot();
     const model = config?.model;
-    return typeof model === 'string' ? model.trim() : '';
+    if (typeof model === 'string' && model.trim()) {
+      return model.trim();
+    }
+    return getFirstAvailablePickerModel();
   }
 
   function normalizeReasoningEffort(value: unknown): ReasoningEffort | null {
@@ -1146,6 +1138,10 @@
       ...draftOrchestratorSessionConfig,
       ...patch,
     };
+  }
+
+  function getFirstAvailablePickerModel(): string {
+    return pickerModels.find((model) => model.trim().length > 0)?.trim() ?? '';
   }
 
   function getAuxiliaryConfigSnapshot(): Record<string, unknown> | null {
@@ -1229,10 +1225,6 @@
       pickerModels = Array.isArray(payload.models) ? payload.models : [];
       pickerModelsConfigKey = configKey;
       pickerLoadedOnce = true;
-      const firstModel = pickerModels.find((model) => model.trim().length > 0)?.trim() ?? '';
-      if (firstModel && !currentPickerModel.trim()) {
-        applyDraftOrchestratorSessionPatch({ model: firstModel });
-      }
     } catch (error) {
       console.warn('[InputArea] 拉取主线模型列表失败:', error);
       pickerError = i18n.t('input.modelListLoadFailed');
@@ -1579,24 +1571,43 @@
     <!-- svelte-ignore a11y_no_static_element_interactions -->
     <div class="ia-resize" onmousedown={startResize}></div>
 
-    <!-- 已选技能：显示为可移除的 chip，避免污染用户输入正文 -->
-    {#if selectedSkill}
-      <div class="ia-skill-chip-row">
-        <span class="ia-skill-chip" title={selectedSkill.description}>
-          <span class="ia-skill-chip-label">/{selectedSkill.name}</span>
-          {#if selectedSkill.description}
-            <span class="ia-skill-chip-desc">{selectedSkill.description}</span>
-          {/if}
-          <button
-            type="button"
-            class="ia-skill-chip-remove"
-            onclick={removeSelectedSkill}
-            title={i18n.t('input.removeSkill')}
-            aria-label={i18n.t('input.removeSkill')}
-          >
-            <Icon name="close" size={10} />
-          </button>
-        </span>
+    <!-- 快捷引用保持结构化状态，不把 /goal 或 Skill 名称注入用户正文。 -->
+    {#if selectedGoalMode || selectedSkill}
+      <div class="ia-reference-chip-row">
+        {#if selectedGoalMode}
+          <span class="ia-reference-chip ia-reference-chip-goal" title={i18n.t('input.goalMode.description')}>
+            <Icon name="infinity" size={11} />
+            <span class="ia-reference-chip-label">/goal</span>
+            <span class="ia-reference-chip-desc">{i18n.t('input.goalMode.name')}</span>
+            <button
+              type="button"
+              class="ia-reference-chip-remove"
+              onclick={removeGoalMode}
+              title={i18n.t('input.removeGoalMode')}
+              aria-label={i18n.t('input.removeGoalMode')}
+            >
+              <Icon name="close" size={10} />
+            </button>
+          </span>
+        {/if}
+        {#if selectedSkill}
+          <span class="ia-skill-chip" title={selectedSkill.description}>
+            <Icon name="skill" size={11} />
+            <span class="ia-reference-chip-label">/{selectedSkill.name}</span>
+            {#if selectedSkill.description}
+              <span class="ia-reference-chip-desc">{selectedSkill.description}</span>
+            {/if}
+            <button
+              type="button"
+              class="ia-reference-chip-remove"
+              onclick={removeSelectedSkill}
+              title={i18n.t('input.removeSkill')}
+              aria-label={i18n.t('input.removeSkill')}
+            >
+              <Icon name="close" size={10} />
+            </button>
+          </span>
+        {/if}
       </div>
     {/if}
 
@@ -1612,8 +1623,10 @@
       tabindex={sessionInputLocked || isInteractionBlocking ? -1 : 0}
       aria-multiline="true"
       aria-disabled={sessionInputLocked || isInteractionBlocking}
-      data-placeholder={selectedSkill
-        ? i18n.t('input.placeholderWithSkill', { skillName: selectedSkill.name })
+      data-placeholder={selectedGoalMode
+        ? i18n.t('input.placeholderWithGoal')
+        : selectedSkill
+          ? i18n.t('input.placeholderWithSkill', { skillName: selectedSkill.name })
         : selectedImages.length > 0
           ? i18n.t('input.placeholderWithImages')
           : i18n.t('input.placeholderDefault')}
@@ -1628,9 +1641,16 @@
     ></div>
 
     {#if slashMenuOpen}
-      <div class="ia-slash-popover" role="listbox" aria-label={i18n.t('input.useSkill')}>
+      <div class="ia-slash-popover" role="listbox" aria-label={i18n.t('input.slash.label')}>
         <div class="ia-slash-list" bind:this={slashListEl}>
-          {#each filteredSkills as skill, index (skill.skillId)}
+          {#each filteredSlashCommands as command, index (`${command.kind}:${command.id}`)}
+            {#if index === 0 || filteredSlashCommands[index - 1]?.kind !== command.kind}
+              <div class="ia-slash-group-label">
+                {command.kind === 'goal'
+                  ? i18n.t('input.slash.modeGroup')
+                  : i18n.t('input.slash.skillGroup')}
+              </div>
+            {/if}
             <button
               type="button"
               role="option"
@@ -1638,25 +1658,20 @@
               class="ia-slash-item"
               class:active={index === slashHighlightIndex}
               onmouseenter={() => (slashHighlightIndex = index)}
-              onmousedown={(e) => { e.preventDefault(); commitSkill(skill); }}
+              onmousedown={(e) => { e.preventDefault(); commitSlashCommand(command); }}
             >
-              <span class="ia-slash-item-label">{skill.name}</span>
+              <span class="ia-slash-item-icon" class:goal={command.kind === 'goal'}>
+                <Icon name={command.kind === 'goal' ? 'infinity' : 'skill'} size={12} />
+              </span>
+              <span class="ia-slash-item-content">
+                <span class="ia-slash-item-label">/{command.kind === 'goal' ? 'goal' : command.name}</span>
+                {#if command.description}
+                  <span class="ia-slash-item-description">{command.description}</span>
+                {/if}
+              </span>
             </button>
           {/each}
         </div>
-        {#if filteredSkills[slashHighlightIndex]}
-          {@const activeSkillId = filteredSkills[slashHighlightIndex].skillId}
-          {@const previewText = skillPreviewCache[activeSkillId]}
-          {#if previewText !== undefined && previewText !== ''}
-            <div class="ia-slash-tooltip" style="top: {slashTooltipTop}px">
-              {previewText}
-            </div>
-          {:else if skillPreviewLoading[activeSkillId]}
-            <div class="ia-slash-tooltip ia-slash-tooltip-loading" style="top: {slashTooltipTop}px">
-              …
-            </div>
-          {/if}
-        {/if}
       </div>
     {/if}
 
@@ -1828,50 +1843,68 @@
       </div>
 
       <div class="ia-right">
-        <div class="ia-picker-wrap ia-access-wrap">
-          <button
-            type="button"
-            class="ia-picker-btn ia-access-btn"
-            class:active={accessProfilePickerOpen}
-            onclick={() => (accessProfilePickerOpen = !accessProfilePickerOpen)}
-            disabled={sessionInputLocked || isInteractionBlocking}
-            title={`${i18n.t('input.access.title')}: ${i18n.t(currentAccessProfileOption.labelKey)}`}
-            aria-expanded={accessProfilePickerOpen}
-            aria-label={i18n.t('input.access.title')}
-          >
-            <span class="ia-access-btn-label">{i18n.t(currentAccessProfileOption.labelKey)}</span>
-          </button>
-          {#if accessProfilePickerOpen}
-            <!-- svelte-ignore a11y_click_events_have_key_events -->
-            <!-- svelte-ignore a11y_no_static_element_interactions -->
-            <div class="ia-popover-backdrop" onclick={() => (accessProfilePickerOpen = false)}></div>
-            <div class="ia-picker-popover ia-access-popover" role="menu">
-              <div class="ia-picker-header">{i18n.t('input.access.title')}</div>
-              <div class="ia-picker-list">
-                {#each accessProfileOptions as option (option.value)}
-                  <button
-                    type="button"
-                    class="ia-picker-item"
-                    class:selected={selectedAccessProfile === option.value}
-                    onclick={() => selectAccessProfile(option.value)}
-                  >
-                    <span class="ia-picker-item-label">{i18n.t(option.labelKey)}</span>
-                  </button>
-                {/each}
+        <div class="ia-runtime-controls">
+          <div class="ia-picker-wrap ia-access-wrap">
+            <button
+              type="button"
+              class="ia-picker-btn ia-access-btn ia-access-btn--{selectedAccessProfile}"
+              class:active={accessProfilePickerOpen}
+              onclick={() => (accessProfilePickerOpen = !accessProfilePickerOpen)}
+              disabled={sessionInputLocked || isInteractionBlocking}
+              title={`${i18n.t('input.access.title')}: ${i18n.t(currentAccessProfileOption.labelKey)}。${i18n.t(currentAccessProfileOption.descriptionKey)}`}
+              aria-expanded={accessProfilePickerOpen}
+              aria-label={i18n.t('input.access.title')}
+            >
+              <Icon name={currentAccessProfileOption.icon} size={12} />
+              <span class="ia-access-btn-label">{i18n.t(currentAccessProfileOption.labelKey)}</span>
+            </button>
+            {#if accessProfilePickerOpen}
+              <!-- svelte-ignore a11y_click_events_have_key_events -->
+              <!-- svelte-ignore a11y_no_static_element_interactions -->
+              <div class="ia-popover-backdrop" onclick={() => (accessProfilePickerOpen = false)}></div>
+              <div class="ia-picker-popover ia-access-popover" role="menu">
+                <div class="ia-picker-header">{i18n.t('input.access.title')}</div>
+                <div class="ia-picker-list">
+                  {#each accessProfileOptions as option (option.value)}
+                    <button
+                      type="button"
+                      class="ia-picker-item ia-access-option ia-access-option--{option.value}"
+                      class:selected={selectedAccessProfile === option.value}
+                      onclick={() => selectAccessProfile(option.value)}
+                      role="menuitemradio"
+                      aria-checked={selectedAccessProfile === option.value}
+                    >
+                      <span class="ia-access-option-icon"><Icon name={option.icon} size={14} /></span>
+                      <span class="ia-access-option-copy">
+                        <span class="ia-access-option-heading">
+                          <span class="ia-picker-item-label">{i18n.t(option.labelKey)}</span>
+                          {#if option.value === 'restricted'}
+                            <span class="ia-access-recommended">{i18n.t('input.access.recommended')}</span>
+                          {/if}
+                        </span>
+                        <span class="ia-picker-item-desc">{i18n.t(option.descriptionKey)}</span>
+                      </span>
+                    </button>
+                  {/each}
+                </div>
               </div>
-            </div>
-          {/if}
+            {/if}
+          </div>
+          <span class="ia-toolbar-divider" aria-hidden="true"></span>
+          <ContextUsageRing
+            usageRatio={contextBudgetState?.usageRatio ?? null}
+            tokenUsed={contextBudgetState?.tokenUsed ?? null}
+            remainingTokens={contextBudgetState?.remainingTokens ?? null}
+            tokenLimit={contextBudgetState?.tokenLimit ?? null}
+            warningLevel={contextBudgetState?.warningLevel ?? null}
+            lastCompactionReason={contextBudgetState?.lastCompactionReason ?? null}
+            originalTokenEstimate={contextBudgetState?.originalTokenEstimate ?? null}
+            compactedTokenEstimate={contextBudgetState?.compactedTokenEstimate ?? null}
+          />
         </div>
-        <span class="ia-toolbar-divider" aria-hidden="true"></span>
-        <ContextUsageRing
-          usageRatio={contextBudgetState?.usageRatio ?? null}
-          tokenUsed={contextBudgetState?.tokenUsed ?? null}
-          remainingTokens={contextBudgetState?.remainingTokens ?? null}
-          tokenLimit={contextBudgetState?.tokenLimit ?? null}
-          warningLevel={contextBudgetState?.warningLevel ?? null}
-        />
-        <span class="ia-toolbar-divider" aria-hidden="true"></span>
-        <div class="ia-picker-wrap ia-model-wrap">
+        <div class="ia-submit-controls">
+          <span class="ia-toolbar-divider" aria-hidden="true"></span>
+          <div class="ia-picker-wrap ia-model-wrap">
           <button
             type="button"
             class="ia-picker-btn ia-model-btn"
@@ -1955,8 +1988,8 @@
               </div>
             </div>
           {/if}
-        </div>
-        <button
+          </div>
+          <button
           type="button"
           class="ia-enhance"
           class:loading={enhanceLoading}
@@ -1967,7 +2000,7 @@
         >
           <Icon name={enhanceLoading ? 'loader' : 'enhance'} size={14} class={enhanceLoading ? 'spinning' : ''} />
         </button>
-        {#if hasEnhanceSnapshot}
+          {#if hasEnhanceSnapshot}
           <button
             type="button"
             class="ia-enhance ia-enhance-restore"
@@ -1978,8 +2011,8 @@
           >
             <Icon name="undo" size={14} />
           </button>
-        {/if}
-        {#if isSending}
+          {/if}
+          {#if isSending}
           {#if hasContent}
             <button
               class="ia-send ready"
@@ -1996,11 +2029,11 @@
             data-testid="input-stop-button"
             onclick={stopTask}
             disabled={stopLoading}
-            title={shouldInterruptTaskProjectionFromComposer ? i18n.t('input.stopTaskTitle') : i18n.t('input.stop')}
+            title={shouldInterruptAgentRunFromComposer ? i18n.t('input.stopTaskTitle') : i18n.t('input.stop')}
           >
             <Icon name={stopLoading ? 'loader' : 'stop'} size={14} class={stopLoading ? 'spinning' : ''} />
           </button>
-        {:else if hasContent}
+          {:else if hasContent}
           <!-- 空闲且有内容：显示发送按钮 -->
           <button
             class="ia-send ready"
@@ -2011,7 +2044,7 @@
           >
             <Icon name="send" size={14} />
           </button>
-        {:else}
+          {:else}
           <!-- 无内容 + 空闲：显示禁用的发送按钮 -->
           <button
             class="ia-send"
@@ -2020,7 +2053,8 @@
           >
             <Icon name="send" size={14} />
           </button>
-        {/if}
+          {/if}
+        </div>
       </div>
     </div>
   </div>
@@ -2043,6 +2077,7 @@
     backdrop-filter: blur(20px);
     -webkit-backdrop-filter: blur(20px);
     position: relative;
+    z-index: 1;
   }
 
   .ia-wrapper {
@@ -2151,7 +2186,8 @@
     min-width: 0;
   }
 
-  .ia-left, .ia-right {
+  .ia-left, .ia-right,
+  .ia-runtime-controls, .ia-submit-controls {
     display: flex;
     align-items: center;
     gap: 4px;
@@ -2244,9 +2280,19 @@
     min-width: 0;
     max-width: 112px;
   }
-  .ia-access-popover .ia-picker-item-label {
-    white-space: nowrap;
-    word-break: keep-all;
+  .ia-access-btn :global(svg) {
+    flex: 0 0 auto;
+  }
+  .ia-access-btn--read_only {
+    color: var(--foreground-muted);
+  }
+  .ia-access-btn--restricted {
+    border-color: color-mix(in srgb, var(--primary) 34%, var(--border-subtle));
+    color: var(--primary);
+  }
+  .ia-access-btn--full_access {
+    border-color: color-mix(in srgb, var(--warning) 38%, var(--border-subtle));
+    color: color-mix(in srgb, var(--warning) 82%, var(--foreground));
   }
   .ia-workspace-wrap {
     max-width: 190px;
@@ -2541,9 +2587,97 @@
   }
   .ia-picker-popover.ia-access-popover {
     box-sizing: border-box;
-    width: max-content;
-    min-width: 112px;
-    max-width: 132px;
+    width: min(248px, calc(100vw - 20px));
+    min-width: min(224px, calc(100vw - 20px));
+    max-width: 248px;
+    padding: 5px;
+  }
+  .ia-access-popover .ia-picker-list {
+    gap: 2px;
+    margin-top: 0;
+    padding-top: 1px;
+    border-top: 0;
+  }
+  .ia-access-popover .ia-picker-header {
+    margin: 0;
+    padding: 1px 6px 4px;
+    border-bottom: 0;
+    font-size: 10px;
+    line-height: 16px;
+  }
+  .ia-picker-item.ia-access-option {
+    display: grid;
+    grid-template-columns: 22px minmax(0, 1fr);
+    align-items: center;
+    gap: 7px;
+    min-height: 42px;
+    padding: 5px 7px;
+    border: 1px solid transparent;
+    transition:
+      background var(--transition-fast),
+      border-color var(--transition-fast),
+      color var(--transition-fast);
+  }
+  .ia-access-option-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 22px;
+    height: 22px;
+    border-radius: 5px;
+    background: color-mix(in srgb, var(--foreground-muted) 8%, transparent);
+    color: var(--foreground-muted);
+  }
+  .ia-access-option--restricted .ia-access-option-icon {
+    background: color-mix(in srgb, var(--primary) 12%, transparent);
+    color: var(--primary);
+  }
+  .ia-access-option--full_access .ia-access-option-icon {
+    background: color-mix(in srgb, var(--warning) 13%, transparent);
+    color: color-mix(in srgb, var(--warning) 84%, var(--foreground));
+  }
+  .ia-access-option-copy {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    min-width: 0;
+  }
+  .ia-access-option-heading {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    min-width: 0;
+  }
+  .ia-access-option .ia-picker-item-label {
+    white-space: nowrap;
+    word-break: normal;
+    font-size: 11px;
+    line-height: 15px;
+  }
+  .ia-access-option .ia-picker-item-desc {
+    font-size: 10px;
+    line-height: 1.25;
+    overflow-wrap: break-word;
+  }
+  .ia-access-recommended {
+    flex: 0 0 auto;
+    padding: 0 4px;
+    border-radius: 4px;
+    background: color-mix(in srgb, var(--primary) 12%, transparent);
+    color: var(--primary);
+    font-size: 8px;
+    font-weight: var(--font-semibold);
+    line-height: 13px;
+  }
+  .ia-picker-item.ia-access-option.selected {
+    border-color: color-mix(in srgb, var(--primary) 28%, transparent);
+    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--primary) 5%, transparent);
+  }
+  .ia-picker-item.ia-access-option--full_access.selected {
+    background: color-mix(in srgb, var(--warning) 10%, transparent);
+    border-color: color-mix(in srgb, var(--warning) 28%, transparent);
+    color: var(--foreground);
+    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--warning) 4%, transparent);
   }
   .ia-picker-header {
     font-size: 11px;
@@ -2650,13 +2784,15 @@
     color: var(--primary);
   }
 
-  /* 斜杠技能选择：chip + 列表 + 预览 */
-  .ia-skill-chip-row {
+  /* 斜杠快捷引用：Goal 与 Skill 共用一套稳定的结构化展示。 */
+  .ia-reference-chip-row {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     gap: 6px;
     padding: 6px var(--space-3) 0;
   }
+  .ia-reference-chip,
   .ia-skill-chip {
     display: inline-flex;
     align-items: center;
@@ -2670,11 +2806,16 @@
     font-size: 12px;
     line-height: 1.2;
   }
-  .ia-skill-chip-label {
+  .ia-reference-chip-goal {
+    background: color-mix(in srgb, var(--success) 12%, transparent);
+    border-color: color-mix(in srgb, var(--success) 34%, transparent);
+    color: color-mix(in srgb, var(--success) 82%, var(--foreground));
+  }
+  .ia-reference-chip-label {
     font-weight: var(--font-medium, 500);
     white-space: nowrap;
   }
-  .ia-skill-chip-desc {
+  .ia-reference-chip-desc {
     color: color-mix(in srgb, var(--primary) 72%, var(--foreground-muted));
     font-size: 11px;
     max-width: 220px;
@@ -2682,7 +2823,10 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  .ia-skill-chip-remove {
+  .ia-reference-chip-goal .ia-reference-chip-desc {
+    color: color-mix(in srgb, var(--success) 64%, var(--foreground-muted));
+  }
+  .ia-reference-chip-remove {
     display: inline-flex;
     align-items: center;
     justify-content: center;
@@ -2696,7 +2840,7 @@
     cursor: pointer;
     transition: background var(--transition-fast);
   }
-  .ia-skill-chip-remove:hover {
+  .ia-reference-chip-remove:hover {
     background: color-mix(in srgb, var(--primary) 24%, transparent);
   }
 
@@ -2705,7 +2849,7 @@
     bottom: calc(100% + 6px);
     left: 8px;
     z-index: 31;
-    width: 240px;
+    width: min(300px, calc(100% - 16px));
     max-height: 320px;
     padding: 6px;
     background: color-mix(in srgb, var(--background) 100%, white 6%);
@@ -2722,11 +2866,21 @@
     max-height: 308px;
     overflow-y: auto;
   }
+  .ia-slash-group-label {
+    padding: 6px 9px 4px;
+    color: var(--foreground-muted);
+    font-size: 10px;
+    font-weight: 600;
+    line-height: 1;
+    text-transform: uppercase;
+  }
   .ia-slash-item {
     display: flex;
     align-items: center;
     width: 100%;
-    padding: 7px 10px;
+    gap: 8px;
+    min-height: 44px;
+    padding: 7px 9px;
     background: transparent;
     border: none;
     border-radius: var(--radius-sm, 6px);
@@ -2741,33 +2895,40 @@
     background: color-mix(in srgb, var(--foreground) 10%, transparent);
     color: var(--foreground);
   }
+  .ia-slash-item-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 24px;
+    height: 24px;
+    flex: 0 0 24px;
+    border-radius: var(--radius-sm);
+    color: var(--primary);
+    background: color-mix(in srgb, var(--primary) 12%, transparent);
+  }
+  .ia-slash-item-icon.goal {
+    color: color-mix(in srgb, var(--success) 82%, var(--foreground));
+    background: color-mix(in srgb, var(--success) 12%, transparent);
+  }
+  .ia-slash-item-content {
+    display: flex;
+    min-width: 0;
+    flex: 1;
+    flex-direction: column;
+    gap: 2px;
+  }
   .ia-slash-item-label {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  /* 鼠标 hover / 键盘选择时跟随展示的描述卡片，跟随 .active 项的 offsetTop */
-  .ia-slash-tooltip {
-    position: absolute;
-    left: calc(100% + 8px);
-    max-width: 360px;
-    min-width: 220px;
-    padding: 10px 12px;
-    background: color-mix(in srgb, var(--background) 100%, var(--foreground) 4%);
-    color: var(--foreground);
-    border: 1px solid color-mix(in srgb, var(--border) 80%, var(--foreground) 20%);
-    border-radius: var(--radius-md);
-    font-size: 12px;
-    line-height: 1.5;
-    white-space: pre-wrap;
-    word-break: break-word;
-    box-shadow: 0 12px 32px color-mix(in srgb, var(--foreground) 18%, transparent);
-    pointer-events: none;
-  }
-  .ia-slash-tooltip-loading {
+  .ia-slash-item-description {
     color: var(--foreground-muted);
-    font-style: italic;
-    min-width: 80px;
+    font-size: 11px;
+    line-height: 1.3;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   /* 图片预览 */
@@ -2984,16 +3145,19 @@
     }
 
     .ia-actions {
-      flex-wrap: nowrap;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      grid-template-areas:
+        "scope runtime"
+        "submit submit";
       align-items: center;
-      justify-content: space-between;
-      gap: 4px;
-      padding: 4px 6px;
+      gap: 3px 6px;
+      padding: 4px 6px 6px;
     }
 
     .ia-left {
-      flex: 0 1 min(156px, 42vw);
-      width: auto;
+      grid-area: scope;
+      width: 100%;
       min-width: 0;
     }
 
@@ -3002,12 +3166,24 @@
     }
 
     .ia-right {
-      flex: 1 1 auto;
-      width: auto;
-      min-width: 0;
-      flex-wrap: nowrap;
-      justify-content: flex-end;
+      display: contents;
+    }
+
+    .ia-runtime-controls {
+      grid-area: runtime;
+      justify-self: end;
+      gap: 3px;
+    }
+
+    .ia-submit-controls {
+      grid-area: submit;
+      width: 100%;
       gap: 4px;
+    }
+
+    .ia-runtime-controls .ia-toolbar-divider,
+    .ia-submit-controls .ia-toolbar-divider {
+      display: none;
     }
 
     .ia-workspace-wrap,
@@ -3033,15 +3209,33 @@
       max-width: 86px;
     }
 
-    .ia-model-wrap {
-      flex: 0 1 auto;
-      max-width: min(144px, 40vw);
+    .ia-access-popover {
+      position: fixed;
+      right: 10px;
+      bottom: calc(76px + env(safe-area-inset-bottom));
+      left: auto;
+      width: min(248px, calc(100vw - 20px));
+      min-width: 0;
     }
 
-    .ia-access-wrap .ia-picker-btn,
-    .ia-model-wrap .ia-picker-btn {
+    .ia-model-wrap {
+      flex: 1 1 auto;
+      max-width: none;
+    }
+
+    .ia-access-wrap .ia-picker-btn {
       width: auto;
       max-width: 100%;
+    }
+
+    .ia-model-wrap .ia-picker-btn {
+      width: 100%;
+      max-width: 100%;
+      justify-content: flex-start;
+    }
+
+    .ia-model-wrap .ia-picker-btn :global(svg) {
+      margin-left: auto;
     }
 
     .ia-access-btn-label {
@@ -3064,6 +3258,14 @@
     .ia-picker-popover {
       width: min(280px, calc(100vw - 24px));
       max-height: min(360px, 56vh);
+    }
+
+    .ia-session-model-popover {
+      position: fixed;
+      right: 10px;
+      bottom: calc(48px + env(safe-area-inset-bottom));
+      left: auto;
+      width: min(280px, calc(100vw - 20px));
     }
   }
 

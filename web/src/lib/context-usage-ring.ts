@@ -10,6 +10,9 @@ export interface ContextRingInput {
   remainingTokens?: number | null;
   tokenLimit?: number | null;
   warningLevel?: ContextRingTone | string | null;
+  lastCompactionReason?: string | null;
+  originalTokenEstimate?: number | null;
+  compactedTokenEstimate?: number | null;
 }
 
 export interface ContextRingGeometry {
@@ -28,7 +31,7 @@ export interface ContextRingView {
 }
 
 export interface ContextRingDetailItem {
-  key: 'usage' | 'remaining' | 'limit';
+  key: 'usage' | 'remaining' | 'limit' | 'compaction';
   text: string;
 }
 
@@ -117,11 +120,22 @@ export function resolveRingView(
 
 type Translate = (key: string, params?: Record<string, string | number>) => string;
 
+export function formatCompactionReason(reason: string | null | undefined, t: Translate): string {
+  switch (reason) {
+    case 'context_window_pressure':
+      return t('input.contextRing.compactionReason.contextWindowPressure');
+    case 'estimated_prefill':
+      return t('input.contextRing.compactionReason.estimatedPrefill');
+    default:
+      return t('input.contextRing.compactionReason.unknown');
+  }
+}
+
 export function buildRingDetailItems(input: ContextRingInput, t: Translate): ContextRingDetailItem[] {
   if (!hasUsageData(resolveEffectiveUsageRatio(input))) {
     return [];
   }
-  return [
+  const items: ContextRingDetailItem[] = [
     { key: 'usage', text: t('input.contextRing.usage', { value: formatRingTokens(input.tokenUsed) }) },
     {
       key: 'remaining',
@@ -129,6 +143,20 @@ export function buildRingDetailItems(input: ContextRingInput, t: Translate): Con
     },
     { key: 'limit', text: t('input.contextRing.limit', { value: formatRingTokens(input.tokenLimit) }) },
   ];
+  if (
+    input.lastCompactionReason
+    || (input.originalTokenEstimate != null && Number.isFinite(input.originalTokenEstimate))
+    || (input.compactedTokenEstimate != null && Number.isFinite(input.compactedTokenEstimate))
+  ) {
+    const reason = formatCompactionReason(input.lastCompactionReason, t);
+    const before = formatRingTokens(input.originalTokenEstimate);
+    const after = formatRingTokens(input.compactedTokenEstimate);
+    items.push({
+      key: 'compaction',
+      text: t('input.contextRing.compaction', { reason, before, after }),
+    });
+  }
+  return items;
 }
 
 export function buildRingTooltip(input: ContextRingInput, t: Translate): string {

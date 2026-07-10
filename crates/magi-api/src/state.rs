@@ -2,9 +2,9 @@ use crate::dto::{
     AuditUsageLedgerDto, BootstrapDto, BridgeCutoverSmokeProvider, BridgeCutoverSmokeSnapshotDto,
     BridgeCutoverSmokeSnapshotProvider, BridgePreflightProvider, BridgePreflightSnapshotDto,
     BridgePreflightSnapshotProvider, BridgeProbeSnapshotProvider, BridgeServicesSnapshotDto,
-    BridgeSnapshotProvider, DirectHttpModelProbeConfig, HealthDto, MissionAggregateExport,
-    RuntimeReadModelDto, ServiceInfo, SessionTurnRequestDto, SessionTurnRouteDto,
-    VersionHandshakeDto, runtime_read_model_dto_with_usage,
+    BridgeSnapshotProvider, DirectHttpModelProbeConfig, HealthDto, RuntimeReadModelDto,
+    ServiceInfo, SessionTurnRequestDto, SessionTurnRouteDto, VersionHandshakeDto,
+    runtime_read_model_dto_with_usage,
 };
 use crate::errors::ApiError;
 use crate::mcp_config::{
@@ -34,13 +34,11 @@ use magi_conversation_runtime::{
 };
 use magi_core::{
     SessionId, SessionLifecycleStatus, TaskId, TaskStatus, TaskTier, UtcMillis, WorkspaceId,
-    WorkspaceRootPath,
 };
 use magi_event_bus::{InMemoryEventBus, latest_usage_observations_from_ledger};
 use magi_governance::GovernanceService;
 use magi_knowledge_store::KnowledgeStore;
 use magi_memory_store::MemoryStore;
-use magi_mission::{enumerate_resumable_missions, resume_mission};
 use magi_orchestrator::{
     OrchestratedExecutionRuntime, OrchestratorService,
     task_store::TaskStore,
@@ -74,6 +72,9 @@ pub struct RunnerHandle {
     pub status: Arc<Mutex<String>>,
     /// Last error message, if any.
     pub last_error: Arc<Mutex<Option<String>>>,
+    /// 后台循环的 join handle。会话删除必须等待循环退出后才能清理 TaskStore，
+    /// 防止 in-flight runner 在删除完成后反写已回收任务。
+    join_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 type RunnerTerminalObserver = Arc<dyn Fn(TaskId, Option<SessionId>, String) + Send + Sync>;
@@ -245,6 +246,7 @@ impl RunnerManager {
             cycle_count: Arc::new(AtomicU64::new(0)),
             status: Arc::new(Mutex::new("running".to_string())),
             last_error: Arc::new(Mutex::new(None)),
+            join_handle: Mutex::new(None),
         });
 
         runners.insert(root_task_id.to_string(), Arc::clone(&handle));
@@ -263,7 +265,7 @@ impl RunnerManager {
         let bg_task_store = Arc::clone(&self.task_store);
         let bg_checkpoint_path = self.checkpoint_path.clone();
         let terminal_observer = self.terminal_observer.clone();
-        tokio::spawn(async move {
+        let join_handle = tokio::spawn(async move {
             let mut stalled_streak = 0u32;
             let max_stalled_streak = 20u32;
             loop {
@@ -411,6 +413,10 @@ impl RunnerManager {
                 }
             }
         });
+        *handle
+            .join_handle
+            .lock()
+            .expect("runner join handle lock should hold") = Some(join_handle);
 
         Ok(handle)
     }
@@ -419,11 +425,11 @@ impl RunnerManager {
     pub fn stop(&self, root_task_id: &str) -> Result<(), RunnerStopError> {
         let runners = self.runners.lock().expect("runners lock should hold");
         let handle = runners.get(root_task_id).ok_or(RunnerStopError::NotFound)?;
-        let mut status = handle.status.lock().expect("status lock should hold");
-        if *status != "running" {
+        if !handle.active.load(Ordering::Relaxed) {
             return Err(RunnerStopError::NotRunning);
         }
         handle.cancel.store(true, Ordering::Relaxed);
+        let mut status = handle.status.lock().expect("status lock should hold");
         *status = "killed".to_string();
         Ok(())
     }
@@ -443,7 +449,7 @@ impl RunnerManager {
 
     /// Cancel all runners bound to the given session and remove the binding.
     /// Called when a session is closed.
-    pub fn unbind_session(&self, session_id: &SessionId) {
+    pub async fn unbind_session(&self, session_id: &SessionId) -> usize {
         let root_task_ids = {
             let mut index = self
                 .session_runner_index
@@ -451,9 +457,35 @@ impl RunnerManager {
                 .expect("session_runner_index lock should hold");
             index.remove(session_id).unwrap_or_default()
         };
-        for root_task_id in root_task_ids {
-            let _ = self.stop(&root_task_id);
+        let mut joins = Vec::new();
+        {
+            let runners = self.runners.lock().expect("runners lock should hold");
+            for root_task_id in &root_task_ids {
+                let Some(handle) = runners.get(root_task_id) else {
+                    continue;
+                };
+                handle.cancel.store(true, Ordering::Relaxed);
+                if handle.active.load(Ordering::Relaxed) {
+                    *handle.status.lock().expect("status lock should hold") = "killed".to_string();
+                }
+                if let Some(join) = handle
+                    .join_handle
+                    .lock()
+                    .expect("runner join handle lock should hold")
+                    .take()
+                {
+                    joins.push(join);
+                }
+            }
         }
+        for join in joins {
+            let _ = join.await;
+        }
+        let mut runners = self.runners.lock().expect("runners lock should hold");
+        for root_task_id in &root_task_ids {
+            runners.remove(root_task_id);
+        }
+        root_task_ids.len()
     }
 
     /// Get the status of a runner.
@@ -1066,14 +1098,13 @@ impl ApiState {
             projection
                 .canonical_turns
                 .retain(|turn| turn.session_id == *session_id);
-            projection
-                .notifications
-                .retain(|notification| notification.session_id == *session_id);
         } else {
             projection.timeline.clear();
             projection.canonical_turns.clear();
-            projection.notifications.clear();
         }
+        projection.notifications = self
+            .session_store
+            .notifications_for_context(ws_id, selected_session_id.as_ref());
         BootstrapDto::from_state_with_session_projection(self, projection)
     }
 
@@ -1156,14 +1187,12 @@ impl ApiState {
     }
 
     pub fn runtime_read_model_dto(&self) -> RuntimeReadModelDto {
-        let mission_aggregate_exports = self.collect_mission_aggregate_exports();
         runtime_read_model_dto_with_usage(
             self.event_bus.runtime_read_model_input(),
             &self.session_store.execution_sidecar_exports(),
             &self.workspace_registry.recovery_sidecar_exports(),
             self.audit_usage_ledger_dto(),
             self.task_store(),
-            &mission_aggregate_exports,
             &self.ledger_usage_observations(),
         )
     }
@@ -1178,69 +1207,6 @@ impl ApiState {
     ) -> std::collections::BTreeMap<String, magi_event_bus::SessionRuntimeUsageObservation> {
         let snapshot = self.event_bus.audit_usage_ledger_snapshot();
         latest_usage_observations_from_ledger(&snapshot.usage_entries)
-    }
-
-    /// 跨 workspace 枚举所有可恢复 mission,组装派生属性导出。
-    ///
-    /// 反孤儿:`MissionAggregate::lifecycle_phase()` / `metrics()` 在 Phase A
-    /// 落地后必须有真实消费方,本函数是 read-model 路径上的入口。
-    ///
-    /// 单点失败容错:任一 mission resume 失败(charter-draft、checkpoint 缺失等)
-    /// `warn-and-skip` 而非整体 503;debug 级日志避免污染 ops 视图。
-    pub(crate) fn collect_mission_aggregate_exports(&self) -> Vec<MissionAggregateExport> {
-        let Some(magi_home) = self
-            .runtime_persistence
-            .as_ref()
-            .and_then(|p| p.state_root().map(|r| r.to_path_buf()))
-        else {
-            return Vec::new();
-        };
-        let mut out = Vec::new();
-        for workspace in self.workspace_registry.workspaces() {
-            let workspace_root = WorkspaceRootPath::from(workspace.root_path.as_str());
-            let mids = match enumerate_resumable_missions(&workspace_root, &magi_home) {
-                Ok(v) => v,
-                Err(err) => {
-                    tracing::warn!(
-                        workspace = %workspace.root_path.as_str(),
-                        error = %err,
-                        "enumerate_resumable_missions 失败,跳过此 workspace"
-                    );
-                    continue;
-                }
-            };
-            for mid in mids {
-                let aggregate = match resume_mission(&mid, &workspace_root, &magi_home) {
-                    Ok(a) => a,
-                    Err(err) => {
-                        tracing::debug!(
-                            mission_id = %mid.as_str(),
-                            error = %err,
-                            "resume_mission 跳过(charter-draft 等预期错误)"
-                        );
-                        continue;
-                    }
-                };
-                let lifecycle_phase = match aggregate.lifecycle_phase() {
-                    Ok(p) => p,
-                    Err(err) => {
-                        tracing::debug!(
-                            mission_id = %mid.as_str(),
-                            error = %err,
-                            "lifecycle_phase 计算失败,跳过"
-                        );
-                        continue;
-                    }
-                };
-                let metrics = aggregate.metrics().ok().flatten();
-                out.push(MissionAggregateExport {
-                    mission_id: mid.as_str().to_string(),
-                    lifecycle_phase,
-                    metrics,
-                });
-            }
-        }
-        out
     }
 
     pub fn audit_usage_ledger_dto(&self) -> AuditUsageLedgerDto {
@@ -1648,6 +1614,20 @@ impl ApiState {
         next
     }
 
+    pub(crate) fn queued_regular_session_turn_count(
+        &self,
+        session_id: &SessionId,
+        workspace_id: Option<&WorkspaceId>,
+    ) -> usize {
+        let key = SessionTurnQueueKey::new(session_id, workspace_id);
+        self.session_turn_queue
+            .lock()
+            .expect("session turn queue lock poisoned")
+            .get(&key)
+            .map(VecDeque::len)
+            .unwrap_or(0)
+    }
+
     pub(crate) fn clear_regular_session_turn_queue(
         &self,
         session_id: &SessionId,
@@ -1660,6 +1640,93 @@ impl ApiState {
             .remove(&key)
             .map(|queue| queue.len())
             .unwrap_or(0)
+    }
+
+    /// 删除 session 时清空该 session 的全部队列键。不能只按当前 workspace 键删除，
+    /// 否则历史错误绑定或无 workspace 的排队消息会成为孤儿。
+    pub(crate) fn clear_all_regular_session_turn_queues(&self, session_id: &SessionId) -> usize {
+        let mut queues = self
+            .session_turn_queue
+            .lock()
+            .expect("session turn queue lock poisoned");
+        let mut removed = 0usize;
+        queues.retain(|key, queue| {
+            if &key.session_id == session_id {
+                removed = removed.saturating_add(queue.len());
+                false
+            } else {
+                true
+            }
+        });
+        removed
+    }
+
+    /// 会话删除的唯一资源回收入口。先停止并等待后台 runner，再删除所有运行态与
+    /// 持久化事实，最后删除 SessionStore 主记录，避免任何组件保留孤儿状态。
+    pub async fn delete_session_and_resources(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<(), ApiError> {
+        if let Some(manager) = self.runner_manager() {
+            manager.unbind_session(session_id).await;
+        }
+        self.clear_all_regular_session_turn_queues(session_id);
+
+        let mut mission_ids = HashSet::new();
+        if let Some(thread) = self
+            .session_store
+            .orchestrator_thread_for_session(session_id)
+        {
+            mission_ids.insert(thread.mission_id);
+        }
+        if let Some(ownership) = self.session_store.execution_ownership(session_id)
+            && let Some(mission_id) = ownership.mission_id
+        {
+            mission_ids.insert(mission_id);
+        }
+        if let Some(sidecar) = self.session_store.runtime_sidecar(session_id)
+            && let Some(chain) = sidecar.active_execution_chain
+        {
+            mission_ids.insert(chain.mission_id);
+        }
+
+        let mut task_ids = self
+            .session_store
+            .execution_task_ids_for_session(session_id)
+            .into_iter()
+            .collect::<HashSet<_>>();
+        task_ids.extend(
+            self.task_execution_registry
+                .remove_session(session_id)
+                .into_iter(),
+        );
+        if let Some(task_store) = self.task_store() {
+            for task_id in task_ids.clone() {
+                if let Some(task) = task_store.get_task(&task_id) {
+                    mission_ids.insert(task.mission_id);
+                }
+            }
+            for mission_id in mission_ids {
+                task_ids.extend(
+                    task_store
+                        .remove_tasks_by_mission(&mission_id)
+                        .into_iter()
+                        .map(|task| task.task_id),
+                );
+            }
+            for task_id in task_ids.clone() {
+                let _ = task_store.remove_task(&task_id);
+            }
+        }
+        self.spawn_graph
+            .lock()
+            .map_err(|error| ApiError::internal_assembly("清理会话 SpawnGraph 失败", error))?
+            .remove_tasks(&task_ids);
+        self.conversation_registry.remove_session(session_id);
+        self.settings_store.remove_session(session_id);
+        self.session_store
+            .delete_session(session_id)
+            .map_err(|error| ApiError::internal_assembly("删除会话失败", error))
     }
 
     pub fn with_model_bridge_client(mut self, client: Arc<dyn ModelBridgeClient>) -> Self {
@@ -1718,6 +1785,9 @@ fn normalize_settings_snapshot_sections(snapshot: &mut HashMap<String, serde_jso
     for key in ["orchestrator", "auxiliary", "safeguardConfig"] {
         if let Some(value) = snapshot.get_mut(key) {
             strip_scope_binding_fields(value);
+            if key == "orchestrator" {
+                strip_orchestrator_session_owned_fields(value);
+            }
         }
     }
     skill_loader::normalize_skills_config_sections(snapshot);
@@ -1725,6 +1795,14 @@ fn normalize_settings_snapshot_sections(snapshot: &mut HashMap<String, serde_jso
     normalize_mcp_servers_section(snapshot);
     seed_default_safeguard_rules(snapshot);
     normalize_safeguard_config_section(snapshot);
+}
+
+fn strip_orchestrator_session_owned_fields(value: &mut serde_json::Value) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    object.remove("model");
+    object.remove("reasoningEffort");
 }
 
 fn public_skills_config_section(value: serde_json::Value) -> serde_json::Value {
@@ -1817,6 +1895,17 @@ fn normalize_public_mcp_server_catalog_json(raw: &serde_json::Value) -> serde_js
     })
 }
 
+fn normalize_public_mcp_tool_catalog_json(raw: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "serverId": raw.get("server_id").cloned().unwrap_or(serde_json::Value::Null),
+        "serverName": raw.get("server_name").cloned().unwrap_or(serde_json::Value::Null),
+        "modelToolName": raw.get("model_tool_name").cloned().unwrap_or(serde_json::Value::Null),
+        "toolName": raw.get("tool_name").cloned().unwrap_or(serde_json::Value::Null),
+        "description": raw.get("description").cloned().unwrap_or(serde_json::Value::String(String::new())),
+        "inputSchema": raw.get("input_schema").cloned().unwrap_or_else(|| serde_json::json!({ "type": "object", "properties": {} })),
+    })
+}
+
 fn normalize_public_agent_role_catalog_json(raw: &serde_json::Value) -> serde_json::Value {
     serde_json::json!({
         "roleId": raw.get("role_id").cloned().unwrap_or(serde_json::Value::Null),
@@ -1862,12 +1951,14 @@ fn public_tool_catalog_response_json(raw: &serde_json::Value) -> serde_json::Val
         "skillToolCount": raw.get("skill_tool_count").cloned().unwrap_or(serde_json::Value::Number(0.into())),
         "mcpServerCount": raw.get("mcp_server_count").cloned().unwrap_or(serde_json::Value::Number(0.into())),
         "connectedMcpServerCount": raw.get("connected_mcp_server_count").cloned().unwrap_or(serde_json::Value::Number(0.into())),
+        "mcpToolCount": raw.get("mcp_tool_count").cloned().unwrap_or(serde_json::Value::Number(0.into())),
         "agentRoleCatalogStatus": raw.get("agent_role_catalog_status").cloned().unwrap_or(serde_json::Value::String("unavailable".to_string())),
         "agentRoleCount": raw.get("agent_role_count").cloned().unwrap_or(serde_json::Value::Number(0.into())),
         "spawnableAgentRoleCount": raw.get("spawnable_agent_role_count").cloned().unwrap_or(serde_json::Value::Number(0.into())),
         "tools": public_tool_catalog_array(raw, "tools", normalize_public_tool_catalog_item_json),
         "skillTools": public_tool_catalog_array(raw, "skill_tools", normalize_public_skill_tool_json),
         "mcpServers": public_tool_catalog_array(raw, "mcp_servers", normalize_public_mcp_server_catalog_json),
+        "mcpTools": public_tool_catalog_array(raw, "mcp_tools", normalize_public_mcp_tool_catalog_json),
         "agentRoles": public_tool_catalog_array(raw, "agent_roles", normalize_public_agent_role_catalog_json),
     })
 }
@@ -2197,6 +2288,46 @@ mod tests {
                 .as_deref(),
             Some("auditor")
         );
+    }
+
+    #[tokio::test]
+    async fn unbind_session_waits_for_blocked_runner_and_removes_handle() {
+        let store = Arc::new(TaskStore::new());
+        let manager = RunnerManager::with_dispatcher_and_worker_catalog(
+            store,
+            Arc::new(Vec::new),
+            Arc::new(RecordingDispatcher {
+                observed_role: Arc::new(Mutex::new(None)),
+            }),
+            Arc::new(EventBasedResultReceiver::new()),
+        );
+        let session_id = SessionId::new("session-blocked-runner-cleanup");
+        let root_task_id = "task-blocked-runner-cleanup";
+        let cancel = Arc::new(AtomicBool::new(false));
+        let active = Arc::new(AtomicBool::new(true));
+        let background_cancel = cancel.clone();
+        let background_active = active.clone();
+        let join_handle = tokio::spawn(async move {
+            while !background_cancel.load(Ordering::Relaxed) {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            background_active.store(false, Ordering::Relaxed);
+        });
+        manager.runners.lock().expect("runners should lock").insert(
+            root_task_id.to_string(),
+            Arc::new(RunnerHandle {
+                cancel,
+                active,
+                cycle_count: Arc::new(AtomicU64::new(0)),
+                status: Arc::new(Mutex::new("blocked".to_string())),
+                last_error: Arc::new(Mutex::new(Some("等待输入".to_string()))),
+                join_handle: Mutex::new(Some(join_handle)),
+            }),
+        );
+        manager.bind_session(session_id.clone(), root_task_id);
+
+        assert_eq!(manager.unbind_session(&session_id).await, 1);
+        assert!(manager.status(root_task_id).is_none());
     }
 
     #[test]

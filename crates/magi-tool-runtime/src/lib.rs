@@ -21,12 +21,14 @@ pub use policy::{
     normalize_tool_policy_paths, tool_path_access_requests,
 };
 pub use registry::ToolRegistry;
+pub use types::external_mcp_model_tool_name;
 pub use types::{
     AgentRoleCatalogEntry, AgentRoleCatalogProvider, BuiltinTool, ExternalMcpServerCatalogEntry,
-    ExternalToolCatalogEntry, ExternalToolCatalogProvider, ExternalToolCatalogSnapshot,
-    RuntimeCapabilityDependencyEntry, RuntimeCapabilityDependencyProvider, ToolExecutionContext,
-    ToolExecutionContextQuery, ToolExecutionInput, ToolExecutionOutput, ToolExecutionPolicy,
-    ToolExecutionSummary, ToolInvocationRecord, ToolRuntimeResources, WriteProtectionScope,
+    ExternalMcpToolCatalogEntry, ExternalMcpToolExecutor, ExternalToolCatalogEntry,
+    ExternalToolCatalogProvider, ExternalToolCatalogSnapshot, RuntimeCapabilityDependencyEntry,
+    RuntimeCapabilityDependencyProvider, ToolExecutionContext, ToolExecutionContextQuery,
+    ToolExecutionInput, ToolExecutionOutput, ToolExecutionPolicy, ToolExecutionSummary,
+    ToolInvocationRecord, ToolRuntimeResources, WriteProtectionScope,
 };
 
 #[cfg(test)]

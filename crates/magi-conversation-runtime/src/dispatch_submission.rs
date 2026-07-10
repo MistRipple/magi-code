@@ -155,55 +155,11 @@ fn build_task_policy(task_tier: TaskTier, access_profile: AccessProfile) -> magi
         network_mode: "full".to_string(),
         command_mode: "full".to_string(),
         retry_limit: 1,
-        validation_profile: matches!(task_tier, TaskTier::LongMission)
-            .then_some("Required".to_string()),
-        checkpoint_mode: if matches!(task_tier, TaskTier::LongMission) {
-            "task_or_phase".to_string()
-        } else {
-            "turn".to_string()
-        },
+        validation_profile: None,
+        checkpoint_mode: "turn".to_string(),
         task_tier,
-        background_allowed: matches!(task_tier, TaskTier::LongMission),
-        escalation_conditions: if matches!(task_tier, TaskTier::LongMission) {
-            vec!["human_checkpoint".to_string()]
-        } else {
-            Vec::new()
-        },
-    }
-}
-
-fn infer_dispatch_task_role(skill_name: Option<&str>, task_tier: TaskTier) -> &'static str {
-    // agent_spawn / agent_wait 都是 coordinator 工具，主线入口任务（用户从聊天框发出的 turn）
-    // 必须由 coordinator role 承接，否则 `task_can_see_builtin_tool` 会把 agent_spawn /
-    // agent_wait / TodoWrite / MemoryWrite 全部判为不可见，模型在运行期看不到协调器工具——再没有任何
-    // 后续路径能补救。LongMission / ExecutionChain 在这一点上同构：主线入口都是协调器。
-    //
-    // 代理（executor / reviewer / tester / explorer / architect）由 `execute_coordinator_tool`
-    // 通过 agent_spawn 子派发显式创建，不走本函数；本函数只决定**主线入口**的默认 role。
-    if matches!(task_tier, TaskTier::LongMission) {
-        return "coordinator";
-    }
-    let Some(skill_name) = skill_name.map(str::trim).filter(|value| !value.is_empty()) else {
-        return "coordinator";
-    };
-    let skill = skill_name.to_ascii_lowercase();
-    if skill.contains("review") || skill.contains("audit") {
-        "reviewer"
-    } else if skill.contains("test") || skill.contains("qa") || skill.contains("verify") {
-        "tester"
-    } else if skill.contains("debug")
-        || skill.contains("fix")
-        || skill.contains("bug")
-        || skill.contains("explore")
-        || skill.contains("investigate")
-        || skill.contains("doc")
-    {
-        "explorer"
-    } else if skill.contains("arch") || skill.contains("design") {
-        "architect"
-    } else {
-        // 所有具体落地（前/后端/数据/运维/安全/集成）统一收敛到 executor
-        "executor"
+        background_allowed: false,
+        escalation_conditions: Vec::new(),
     }
 }
 
@@ -289,29 +245,15 @@ pub fn run_dispatch_submission(
     let act_task_id = TaskId::new(format!("task-local-agent-{}", accepted_at.0));
 
     let task_goal_text = execution_goal.to_string();
-    let target_role = request.target_role.as_deref().unwrap_or_else(|| {
-        infer_dispatch_task_role(request.skill_name.as_deref(), request.task_tier)
-    });
+    // Skill 是本轮方法上下文，不是角色路由信号。聊天框进入的主线任务必须保留 coordinator
+    // 权限面，具体 worker role 只能由显式 target_role 或后续 agent_spawn 决定。
+    let target_role = request.target_role.as_deref().unwrap_or("coordinator");
     if !runtime
         .agent_role_registry
         .role_supports_task_kind(target_role, TaskKind::LocalAgent)
     {
         return Err(DispatchSubmissionRunError::InvalidInput(format!(
             "role {target_role} 不支持 local_agent 任务"
-        )));
-    }
-    // LongMission 与 coordinator role 必须共生：long-mission 工具可见性 gate
-    // (`task_can_see_builtin_tool`) 同时要求 tier=LongMission + coordinator_mode。
-    // 显式传入非 coordinator role 又指定 LongMission 是契约自相矛盾，必须从源头拒绝，
-    // 而不是放行后让模型在运行期看不到工具再失败。
-    if matches!(request.task_tier, TaskTier::LongMission)
-        && !runtime
-            .agent_role_registry
-            .get(target_role)
-            .is_some_and(|role| role.coordinator_mode)
-    {
-        return Err(DispatchSubmissionRunError::InvalidInput(format!(
-            "LongMission 必须由 coordinator_mode role 承接，但显式指定了 role {target_role}"
         )));
     }
     let task = make_dispatch_task(
@@ -613,25 +555,16 @@ mod tests {
         );
     }
 
-    /// 任务系统 §3.2 验收：中等单 root task 走 ExecutionChain 路径，
-    /// **不**进入 Long-Mission 层。
+    /// 任务系统验收：所有 action task 统一走 ExecutionChain 路径。
     ///
     /// 验收点：
     /// - route 已是 task（由 classifier 决定，本处不重测）；
     /// - dispatch 创建 action task 并落入 TaskStore；
-    /// - `policy_snapshot.task_tier == ExecutionChain`——下游 Charter/Plan/KG/
-    ///   Validation/Checkpoint/HumanCheckpoint 写端入口据 tier 判定是否启用；
+    /// - `policy_snapshot.task_tier == ExecutionChain`；
     /// - 同步产生 ActiveExecutionChain，让运行期具备可观察的执行链。
     ///
-    /// 注：Task #117 之后所有 tier 的 dispatch 都由 `runner_manager.start` 后台
-    /// 驱动，tier 字段只决定 Charter/Plan/KG/Validation/Checkpoint/HumanCheckpoint
-    /// 这 7 件套是否启用，不再决定调度模型本身。
-    ///
-    /// 反证："不启用 Long-Mission 层"的关键 invariant 是 task tier——一旦 tier 是
-    /// ExecutionChain，§3.4 的 Charter/Plan/KG/Validation/Checkpoint/HumanCheckpoint
-    /// 写端入口（`runner_manager` 内）就不会被触达。tier 字段是单源真相。
     #[test]
-    fn execution_chain_dispatch_creates_action_task_with_chain_tier_and_skips_long_mission() {
+    fn execution_chain_dispatch_creates_action_task_with_chain_tier() {
         let session_store = SessionStore::new();
         let task_store = TaskStore::new();
         let execution_registry = TaskExecutionRegistry::default();
@@ -689,13 +622,7 @@ mod tests {
         assert_eq!(
             policy.task_tier,
             TaskTier::ExecutionChain,
-            "§3.2: action task tier 必须是 ExecutionChain（非 LongMission），\
-             否则 runner 内部会错误激活 LongMission 7 件套写入入口",
-        );
-        assert_ne!(
-            policy.task_tier,
-            TaskTier::LongMission,
-            "§3.2 反证：ExecutionChain 路径的 task 绝不应被记为 LongMission tier",
+            "action task tier 必须统一为 ExecutionChain",
         );
         assert_eq!(
             policy.access_profile,
@@ -710,6 +637,70 @@ mod tests {
         assert!(
             chain.current_turn.is_some(),
             "ActiveExecutionChain 必须带 current_turn，作为运行期 lane 调度入口",
+        );
+    }
+
+    #[test]
+    fn selected_skill_does_not_reassign_mainline_coordinator_role() {
+        let session_store = SessionStore::new();
+        let task_store = TaskStore::new();
+        let execution_registry = TaskExecutionRegistry::default();
+        let event_bus = InMemoryEventBus::new(16);
+        let agent_role_registry = AgentRoleRegistry::load_default();
+        let spawn_graph = Mutex::new(SpawnGraph::new());
+        let session_id = SessionId::new("session-dispatch-skill-mainline-role");
+
+        session_store
+            .create_session(session_id.clone(), "dispatch skill mainline role")
+            .expect("session should be creatable");
+
+        let request = DispatchSubmissionRequest {
+            accepted_at: UtcMillis(3_250),
+            session_id,
+            workspace_id: Some(WorkspaceId::new("workspace-dispatch-skill-mainline-role")),
+            entry_id: "timeline-dispatch-skill-mainline-role".to_string(),
+            timeline_message: "使用 browser Skill 创建 explorer 子代理".to_string(),
+            images: Vec::new(),
+            created_session: false,
+            mission_title: "Skill 子代理继承".to_string(),
+            task_title: "Skill 子代理继承".to_string(),
+            trimmed_text: Some("使用 browser Skill 创建 explorer 子代理".to_string()),
+            execution_goal: Some("创建 explorer 子代理并等待结果".to_string()),
+            task_tier: TaskTier::ExecutionChain,
+            access_profile: AccessProfile::FullAccess,
+            skill_name: Some("stellarlinkco/myclaude/skills/browser".to_string()),
+            target_role: None,
+            request_id: None,
+            user_message_id: None,
+            placeholder_message_id: None,
+        };
+        let runtime = DispatchSubmissionRuntime {
+            session_store: &session_store,
+            task_store: &task_store,
+            execution_registry: &execution_registry,
+            event_bus: &event_bus,
+            agent_role_registry: &agent_role_registry,
+            spawn_graph: &spawn_graph,
+            model_bridge_client: None,
+            settings_store: None,
+            workspace_root_path: None,
+        };
+
+        let graph = run_dispatch_submission(&runtime, &request)
+            .expect("dispatch submission should build graph");
+        let action_task = task_store
+            .get_task(&graph.action_task_id)
+            .expect("action task should be persisted in TaskStore");
+
+        assert_eq!(
+            action_task.executor_binding_target_role(),
+            Some("coordinator"),
+            "Skill 只决定本轮执行方法，不能把主线入口降级为不能创建子代理的 worker role"
+        );
+        assert_eq!(
+            action_task.executor_binding_active_skill_id(),
+            Some("stellarlinkco/myclaude/skills/browser"),
+            "主线保持 coordinator 时仍必须保留完整 Skill ID"
         );
     }
 
@@ -777,208 +768,6 @@ mod tests {
                 .and_then(|binding| binding.active_skill_id.as_deref()),
             Some("code-review"),
             "Task executor_binding 已类型化，不能再写入旧 skill_name 字段"
-        );
-    }
-
-    /// 任务系统 §3.4 验收：复杂 Mission 走 LongMission 路径——dispatch 把
-    /// action task 的 `policy_snapshot` 写成 LongMission 形态，runner 据此在
-    /// 内部启用 Charter / Plan / Workspace / KG / Validation / Checkpoint /
-    /// HumanCheckpoint 7 件套的写入与编排。
-    ///
-    /// 这里覆盖的是 §3.4 的**路由前置条件**，是端到端链路的单点真相：
-    /// - `policy_snapshot.task_tier == LongMission`——下游 runner / dispatcher
-    ///   根据该字段决定是否激活 LongMission 7 件套写端入口；
-    /// - `validation_profile == Some("Required")`——P3 Validation gate 的入口；
-    /// - `checkpoint_mode == "task_or_phase"`——§1.4 复杂任务 checkpoint 节奏；
-    /// - `background_allowed == true`——LongMission 才允许的长跑后台执行；
-    /// - `escalation_conditions` 含 `"human_checkpoint"`——§1.5 HumanCheckpoint 阻塞钩。
-    ///
-    /// 注：Task #117 后所有 tier 的 dispatch 都由后台 `runner_manager.start` 驱动，
-    /// tier 字段只决定 7 件套写端是否启用，不再决定调度模型本身。
-    ///
-    /// §3.4 其余 invariant 由各自专属测试覆盖、本测不重复：
-    /// - Charter 写入：`magi_mission_charter::*` + `tool_batch::*` 中
-    ///   `MissionCharterWrite` 工具拦截路径；
-    /// - Plan + Validation gate：`magi_plan::apply_plan_update` 单测；
-    /// - Checkpoint 恢复集与读端聚合：`magi-checkpoint` + `magi-mission` 单测 +
-    ///   `magi-mission::contract_round_trip` 集成测试；
-    /// - 进程重启恢复：`magi_daemon::daemon::mission_recovery::*` 单测；
-    /// - pending HumanCheckpoint 阻断 spawn：`agent_spawn_rejects_when_human_
-    ///   checkpoint_is_pending`（`tool_batch.rs` 单测）。
-    #[test]
-    fn long_mission_dispatch_writes_policy_snapshot_that_routes_to_runner_manager() {
-        let session_store = SessionStore::new();
-        let task_store = TaskStore::new();
-        let execution_registry = TaskExecutionRegistry::default();
-        let event_bus = InMemoryEventBus::new(16);
-        let agent_role_registry = AgentRoleRegistry::load_default();
-        let spawn_graph = Mutex::new(SpawnGraph::new());
-        let session_id = SessionId::new("session-long-mission-tier");
-
-        session_store
-            .create_session(session_id.clone(), "long mission tier")
-            .expect("session should be creatable");
-
-        let request = DispatchSubmissionRequest {
-            accepted_at: UtcMillis(4_000),
-            session_id: session_id.clone(),
-            workspace_id: Some(WorkspaceId::new("workspace-long-mission")),
-            entry_id: "timeline-long-mission".to_string(),
-            timeline_message: "跨多阶段重构：拆模块、迁数据、灰度切换".to_string(),
-            images: Vec::new(),
-            created_session: false,
-            mission_title: "复杂重构 mission".to_string(),
-            task_title: "复杂重构 mission".to_string(),
-            trimmed_text: Some("跨多阶段重构：拆模块、迁数据、灰度切换".to_string()),
-            execution_goal: Some("完成跨多阶段重构并保留每阶段可恢复的 checkpoint".to_string()),
-            task_tier: TaskTier::LongMission,
-            access_profile: AccessProfile::Restricted,
-            skill_name: None,
-            target_role: Some("coordinator".to_string()),
-            request_id: None,
-            user_message_id: None,
-            placeholder_message_id: None,
-        };
-        let runtime = DispatchSubmissionRuntime {
-            session_store: &session_store,
-            task_store: &task_store,
-            execution_registry: &execution_registry,
-            event_bus: &event_bus,
-            agent_role_registry: &agent_role_registry,
-            spawn_graph: &spawn_graph,
-            model_bridge_client: None,
-            settings_store: None,
-            workspace_root_path: None,
-        };
-
-        let graph = run_dispatch_submission(&runtime, &request)
-            .expect("long mission dispatch should build graph");
-
-        let action_task = task_store
-            .get_task(&graph.action_task_id)
-            .expect("action task should be persisted in TaskStore");
-        let policy = action_task
-            .policy_snapshot
-            .as_ref()
-            .expect("dispatch 必须给 long mission action task 写入 policy_snapshot");
-
-        assert_eq!(
-            policy.task_tier,
-            TaskTier::LongMission,
-            "§3.4 路由前置：action task tier 必须是 LongMission，\
-             否则 runner 内部不会激活 LongMission 7 件套写入入口",
-        );
-        assert_eq!(
-            policy.validation_profile.as_deref(),
-            Some("Required"),
-            "§3.4 + §1.3：LongMission 必须开启 Required 校验档位，是 Plan completion gate 的入口",
-        );
-        assert_eq!(
-            policy.checkpoint_mode, "task_or_phase",
-            "§3.4 + §1.4：LongMission 必须使用 task_or_phase checkpoint 节奏，\
-             与单 turn 任务的 turn-level checkpoint 区分",
-        );
-        assert!(
-            policy.background_allowed,
-            "§3.4：LongMission 必须允许后台执行（长跑 mission 不能阻塞 chat session）",
-        );
-        assert!(
-            policy
-                .escalation_conditions
-                .iter()
-                .any(|c| c == "human_checkpoint"),
-            "§3.4 + §1.5：LongMission 必须把 human_checkpoint 列为 escalation 条件，\
-             否则 runner 不知道何时阻塞等待人审：实际 {:?}",
-            policy.escalation_conditions,
-        );
-
-        // 对称反证：LongMission 路径**也**必须产出 ActiveExecutionChain，让恢复 / 看板能感知；
-        // 运行期由 runner_manager 接管驱动，但 chain 状态仍是单源真相。
-        let chain = graph
-            .active_execution_chain
-            .as_ref()
-            .expect("LongMission 路径仍须产出 ActiveExecutionChain（供恢复链路消费）");
-        assert!(
-            chain.current_turn.is_some(),
-            "ActiveExecutionChain 必须带 current_turn，作为 mission 首轮的 lane 入口",
-        );
-
-        // §3.4 子契约：dispatch 必须把 LongMission 行动任务交给 coordinator role 承接，
-        // 否则 long-mission 工具可见性 gate 会屏蔽 Charter/Plan/Checkpoint 工具。
-        let executor_role = action_task
-            .executor_binding_target_role()
-            .expect("LongMission action task 必须写入 executor_binding.target_role");
-        let executor_role_entry = agent_role_registry
-            .get(executor_role)
-            .expect("LongMission action task 的 target_role 必须能在 registry 中查到");
-        assert!(
-            executor_role_entry.coordinator_mode,
-            "§3.4：LongMission action task 必须由 coordinator_mode role 承接\
-             （long-mission 工具可见性 gate 同时要求 tier=LongMission + coordinator_mode），\
-             实际 role={executor_role}",
-        );
-    }
-
-    /// §3.4 反证：显式把 LongMission action task 指定给非 coordinator role 是契约
-    /// 自相矛盾——`task_can_see_builtin_tool` 必然否决 Charter/Plan/Checkpoint，
-    /// runner 必失败。从源头拒绝，不放行错误配置。
-    #[test]
-    fn long_mission_dispatch_rejects_non_coordinator_target_role() {
-        let session_store = SessionStore::new();
-        let task_store = TaskStore::new();
-        let execution_registry = TaskExecutionRegistry::default();
-        let event_bus = InMemoryEventBus::new(16);
-        let agent_role_registry = AgentRoleRegistry::load_default();
-        let spawn_graph = Mutex::new(SpawnGraph::new());
-        let session_id = SessionId::new("session-long-mission-bad-role");
-
-        session_store
-            .create_session(session_id.clone(), "long mission bad role")
-            .expect("session should be creatable");
-
-        let request = DispatchSubmissionRequest {
-            accepted_at: UtcMillis(5_000),
-            session_id,
-            workspace_id: Some(WorkspaceId::new("workspace-long-mission-bad-role")),
-            entry_id: "timeline-long-mission-bad-role".to_string(),
-            timeline_message: "复杂任务模式：跨多阶段重构".to_string(),
-            images: Vec::new(),
-            created_session: false,
-            mission_title: "重构 mission".to_string(),
-            task_title: "重构 mission".to_string(),
-            trimmed_text: Some("复杂任务模式：跨多阶段重构".to_string()),
-            execution_goal: Some("跨多阶段重构".to_string()),
-            task_tier: TaskTier::LongMission,
-            access_profile: AccessProfile::Restricted,
-            skill_name: None,
-            target_role: Some("executor".to_string()),
-            request_id: None,
-            user_message_id: None,
-            placeholder_message_id: None,
-        };
-        let runtime = DispatchSubmissionRuntime {
-            session_store: &session_store,
-            task_store: &task_store,
-            execution_registry: &execution_registry,
-            event_bus: &event_bus,
-            agent_role_registry: &agent_role_registry,
-            spawn_graph: &spawn_graph,
-            model_bridge_client: None,
-            settings_store: None,
-            workspace_root_path: None,
-        };
-
-        let err = run_dispatch_submission(&runtime, &request);
-        let message = match err {
-            Err(DispatchSubmissionRunError::InvalidInput(msg)) => msg,
-            Ok(_) => {
-                panic!("非 coordinator role 配 LongMission tier 必须被 dispatch 拒绝，但放行了")
-            }
-            Err(other) => panic!("期待 InvalidInput，实际 {other:?}"),
-        };
-        assert!(
-            message.contains("LongMission") && message.contains("coordinator_mode"),
-            "错误消息必须明确指向 LongMission + coordinator_mode 契约：{message}",
         );
     }
 }

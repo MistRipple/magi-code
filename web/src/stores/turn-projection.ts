@@ -333,7 +333,7 @@ function buildMessage(
       ...(roleId ? { roleId } : {}),
       // sourceThreadId 保留为底层审计事实；UI tab 路由只看 metadata.taskId。
       ...(item.sourceThreadId ? { sourceThreadId: item.sourceThreadId } : {}),
-      // metadata.taskId 是 RightPane task tab 按代理过滤 timeline 的唯一信号。
+      // metadata.taskId 是 RightPane agent run tab 按代理过滤 timeline 的唯一信号。
       ...(taskId ? { taskId } : {}),
       toolCallId: item.tool?.callId,
       toolName: item.tool?.name,
@@ -593,7 +593,7 @@ export function buildCanonicalTimelineProjection(state: CanonicalTurnReducerStat
     .filter((artifact): artifact is TimelineProjectionArtifact => Boolean(artifact))
     .sort(compareArtifacts));
   // 主时间线只承接 root agent artifacts；
-  // 代理 artifacts 由 RightPane task tab 按 metadata.taskId 过滤呈现。
+  // 代理 artifacts 由 RightPane agent run tab 按 metadata.taskId 过滤呈现。
   const threadRenderEntries = artifacts
     .filter((artifact) => !artifact.taskId)
     .map(renderEntry);

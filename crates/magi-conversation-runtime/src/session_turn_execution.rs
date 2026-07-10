@@ -10,20 +10,23 @@ use crate::{
         public_model_invocation_error_message,
     },
     prompt_utils::{
-        current_turn_context_priority_prompt, normalize_model_stream_preview_content,
-        normalize_model_visible_content, workspace_context_system_prompt,
+        PromptFragmentKind, current_turn_context_priority_prompt,
+        normalize_model_stream_preview_content, normalize_model_visible_content,
+        system_prompt_fragment_message, workspace_context_system_prompt,
     },
     session_images::{SessionTurnImage, session_turn_image_sources},
     session_writeback::{
         SessionStatePersistCallback, SessionTurnStreamPublishGate,
-        append_session_tool_call_items_batch, append_session_turn_error_item,
+        append_session_tool_call_items_batch_with_context, append_session_turn_error_item,
         append_session_turn_item, persist_session_state_checkpoint,
         publish_current_session_turn_item_event, publish_session_turn_item_event,
         publish_session_turn_item_stream_event, session_turn_item, session_turn_stream_update,
         upsert_session_turn_item,
     },
+    tool_surface_state::{activate_skill_tool_definitions, refresh_live_mcp_tool_definitions},
     usage_recording::{
-        ModelUsageBinding, publish_model_usage_record, session_turn_model_usage_binding,
+        ModelUsageBinding, account_active_goal_turn, publish_model_usage_record,
+        session_turn_model_usage_binding,
     },
 };
 use magi_bridge_client::{
@@ -44,6 +47,24 @@ const MAX_TOOL_CALL_ROUNDS: usize = 32;
 const MAX_SESSION_CONTEXT_MESSAGES: usize = 12;
 pub const BUSINESS_MODEL_PROVIDER: &str = "openai-compatible";
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SessionGoalTurnMode {
+    #[default]
+    None,
+    Start,
+    Continuation,
+}
+
+impl SessionGoalTurnMode {
+    pub fn is_goal_driven(self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    pub fn allows_goal_creation(self) -> bool {
+        !matches!(self, Self::Continuation)
+    }
+}
+
 pub struct SessionTurnExecutionRequest {
     pub session_id: SessionId,
     pub turn_id: String,
@@ -58,6 +79,7 @@ pub struct SessionTurnExecutionRequest {
     pub placeholder_message_id: Option<String>,
     pub forced_tool_name: Option<String>,
     pub required_tool_chain: Vec<String>,
+    pub goal_turn_mode: SessionGoalTurnMode,
     pub workspace_root_path: Option<String>,
 }
 
@@ -142,6 +164,16 @@ fn apply_request_aliases(
     item.request_id = request.request_id.clone();
     item.user_message_id = request.user_message_id.clone();
     item.placeholder_message_id = request.placeholder_message_id.clone();
+}
+
+fn apply_goal_turn_intermediate_visibility(
+    item: &mut magi_session_store::ActiveExecutionTurnItem,
+    request: &SessionTurnExecutionRequest,
+) {
+    if request.goal_turn_mode.is_goal_driven() {
+        item.metadata
+            .insert("renderable".to_string(), serde_json::Value::Bool(false));
+    }
 }
 
 fn current_turn_status_is_writable(status: &str) -> bool {
@@ -230,13 +262,10 @@ fn build_session_turn_messages(
         Vec::new()
     };
     messages.append(&mut history);
-    messages.push(ChatMessage {
-        role: "system".to_string(),
-        content: Some(current_turn_context_priority_prompt()),
-        images: Vec::new(),
-        tool_calls: Vec::new(),
-        tool_call_id: None,
-    });
+    messages.push(system_prompt_fragment_message(
+        PromptFragmentKind::CurrentTurnPriority,
+        current_turn_context_priority_prompt(),
+    ));
     messages.push(ChatMessage {
         role: "user".to_string(),
         content: Some(prompt.to_string()),
@@ -257,19 +286,17 @@ fn workspace_context_messages(request: &SessionTurnExecutionRequest) -> Vec<Chat
         return Vec::new();
     };
 
-    vec![ChatMessage {
-        role: "system".to_string(),
-        content: Some(workspace_context_system_prompt(root_path)),
-        images: Vec::new(),
-        tool_calls: Vec::new(),
-        tool_call_id: None,
-    }]
+    vec![system_prompt_fragment_message(
+        PromptFragmentKind::WorkspaceContext,
+        workspace_context_system_prompt(root_path),
+    )]
 }
 
 pub struct SessionTurnExecutionRuntime<'a> {
     pub client: &'a dyn ModelBridgeClient,
     pub event_bus: &'a InMemoryEventBus,
     pub session_store: &'a SessionStore,
+    pub todo_ledger: &'a magi_todo_ledger::TodoLedger,
     pub settings_store: Option<&'a Arc<SettingsStore>>,
     pub safety_gate: Option<&'a magi_safety_gate::SafetyGate>,
     pub tool_registry: Option<&'a ToolRegistry>,
@@ -290,6 +317,7 @@ pub fn run_session_turn_execution(
         client,
         event_bus,
         session_store,
+        todo_ledger,
         settings_store,
         safety_gate,
         tool_registry,
@@ -308,43 +336,62 @@ pub fn run_session_turn_execution(
     }
 
     // session 一生一 mission：session turn 执行必须在已注册的 orchestrator thread 上。
-    let orchestrator_thread_id = session_store
+    let orchestrator_thread = session_store
         .orchestrator_thread_for_session(&request.session_id)
-        .map(|thread| thread.thread_id)
         .ok_or_else(SessionTurnExecutionError::runtime_invalid_state)?;
+    let orchestrator_thread_id = orchestrator_thread.thread_id;
+    let orchestrator_mission_id = orchestrator_thread.mission_id;
 
     let mut messages = build_session_turn_messages(session_store, &request, &prompt);
     let mut final_content: Option<String> = None;
     let mut final_item_id: Option<String> = None;
     let mut main_timeline_entry_id: Option<String> = None;
     let mut had_tool_calls = false;
+    let mut active_skill_name = skill_name;
+    let mut active_tools = tools.unwrap_or_default();
     let mut completed_required_tool_names: Vec<String> = Vec::new();
     let usage_binding = session_turn_model_usage_binding(request.use_tools);
 
     let tool_call_round_limit = tool_call_round_limit(&request.required_tool_chain);
     for round in 0..tool_call_round_limit {
+        if request.use_tools
+            && let Some(registry) = tool_registry
+        {
+            active_tools = refresh_live_mcp_tool_definitions(
+                active_tools,
+                registry,
+                skill_runtime,
+                active_skill_name.as_deref(),
+                request.access_profile,
+                None,
+                &[],
+            );
+        }
+        let round_tools = (!active_tools.is_empty()).then_some(active_tools.clone());
         let streamed_content = match stream_session_turn_round(
             SessionTurnRoundRuntime {
                 client,
                 event_bus,
                 session_store,
+                todo_ledger,
                 settings_store,
                 safety_gate,
                 snapshot_manager,
                 request: &request,
                 usage_binding: &usage_binding,
                 prompt: &prompt,
-                tools: tools.clone(),
+                tools: round_tools,
                 messages: &mut messages,
                 completed_required_tool_names: &completed_required_tool_names,
                 round,
                 orchestrator_thread_id: &orchestrator_thread_id,
+                orchestrator_mission_id: &orchestrator_mission_id,
                 persist_session_state,
             },
             tool_registry,
             skill_runtime,
             skill_dispatch_runtime,
-            skill_name.as_deref(),
+            active_skill_name.as_deref(),
         ) {
             Ok(output) => output,
             Err(error) => {
@@ -381,6 +428,39 @@ pub fn run_session_turn_execution(
             &request.required_tool_chain,
             &streamed_content.tool_call_names,
         );
+
+        if let Some(skill_id) = streamed_content.activated_skill_id.as_deref()
+            && active_skill_name.as_deref() != Some(skill_id)
+            && let Some(runtime) = skill_runtime
+        {
+            let preserved_goal_tools = if request.goal_turn_mode.is_goal_driven() {
+                ["get_goal", "create_goal", "update_goal", "todo_write"].as_slice()
+            } else {
+                [].as_slice()
+            };
+            active_tools = activate_skill_tool_definitions(
+                active_tools,
+                runtime,
+                skill_id,
+                request.access_profile,
+                preserved_goal_tools,
+            );
+            active_skill_name = Some(skill_id.to_string());
+            if let Some(skill) = runtime.registry().get(skill_id) {
+                messages.push(ChatMessage {
+                    role: "system".to_string(),
+                    content: Some(format!(
+                        "--- Skill: {} ---\n{}\n{}",
+                        skill.title,
+                        crate::prompt_utils::SKILL_PROMPT_PRIORITY_NOTE,
+                        skill.instruction
+                    )),
+                    images: Vec::new(),
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                });
+            }
+        }
 
         if let Some(content) = streamed_content.final_content {
             if !required_tool_chain_is_complete(
@@ -504,6 +584,7 @@ struct SessionTurnRoundRuntime<'a> {
     client: &'a dyn ModelBridgeClient,
     event_bus: &'a InMemoryEventBus,
     session_store: &'a SessionStore,
+    todo_ledger: &'a magi_todo_ledger::TodoLedger,
     settings_store: Option<&'a Arc<SettingsStore>>,
     safety_gate: Option<&'a magi_safety_gate::SafetyGate>,
     snapshot_manager: Option<&'a Arc<SnapshotManager>>,
@@ -516,6 +597,7 @@ struct SessionTurnRoundRuntime<'a> {
     round: usize,
     /// session 主线 thread：该 turn 内所有 session_turn_item 的 source_thread_id。
     orchestrator_thread_id: &'a magi_core::ThreadId,
+    orchestrator_mission_id: &'a magi_core::MissionId,
     persist_session_state: Option<&'a SessionStatePersistCallback>,
 }
 
@@ -525,6 +607,7 @@ struct SessionTurnRoundOutput {
     timeline_entry_id: Option<String>,
     encountered_tool_calls: bool,
     tool_call_names: Vec<String>,
+    activated_skill_id: Option<String>,
     interrupted: bool,
 }
 
@@ -598,6 +681,7 @@ fn stream_session_turn_round(
         client,
         event_bus,
         session_store,
+        todo_ledger,
         settings_store,
         safety_gate,
         snapshot_manager,
@@ -609,6 +693,7 @@ fn stream_session_turn_round(
         completed_required_tool_names,
         round,
         orchestrator_thread_id,
+        orchestrator_mission_id,
         persist_session_state,
     } = runtime;
 
@@ -739,6 +824,7 @@ fn stream_session_turn_round(
         round,
         completed_required_tool_names,
     );
+    let round_started_at = UtcMillis::now();
     let response = client
         .invoke_streaming(
             ModelInvocationRequest {
@@ -765,6 +851,15 @@ fn stream_session_turn_round(
         None,
         None,
     );
+    account_active_goal_turn(
+        session_store,
+        &request.session_id,
+        parsed.usage.as_ref(),
+        UtcMillis::now()
+            .0
+            .saturating_sub(round_started_at.0)
+            .saturating_div(1000),
+    );
     let timeline_entry_id = None;
     if writeback_aborted.get() || !request_turn_is_writable(session_store, request) {
         return Ok(SessionTurnRoundOutput {
@@ -773,6 +868,7 @@ fn stream_session_turn_round(
             timeline_entry_id: timeline_entry_id.clone(),
             encountered_tool_calls: false,
             tool_call_names: Vec::new(),
+            activated_skill_id: None,
             interrupted: true,
         });
     }
@@ -793,6 +889,7 @@ fn stream_session_turn_round(
                 timeline_entry_id: timeline_entry_id.clone(),
                 encountered_tool_calls: false,
                 tool_call_names: Vec::new(),
+                activated_skill_id: None,
                 interrupted: true,
             });
         }
@@ -805,6 +902,7 @@ fn stream_session_turn_round(
             orchestrator_thread_id.clone(),
         );
         apply_request_aliases(&mut thinking_item, request);
+        apply_goal_turn_intermediate_visibility(&mut thinking_item, request);
         if let Some(published) =
             upsert_session_turn_item(session_store, &request.session_id, thinking_item)
         {
@@ -838,6 +936,7 @@ fn stream_session_turn_round(
                 timeline_entry_id: timeline_entry_id.clone(),
                 encountered_tool_calls: false,
                 tool_call_names: Vec::new(),
+                activated_skill_id: None,
                 interrupted: true,
             });
         }
@@ -850,6 +949,7 @@ fn stream_session_turn_round(
             orchestrator_thread_id.clone(),
         );
         apply_request_aliases(&mut stream_item, request);
+        apply_goal_turn_intermediate_visibility(&mut stream_item, request);
         if let Some(published) =
             upsert_session_turn_item(session_store, &request.session_id, stream_item)
         {
@@ -878,6 +978,7 @@ fn stream_session_turn_round(
                 timeline_entry_id: timeline_entry_id.clone(),
                 encountered_tool_calls: false,
                 tool_call_names: Vec::new(),
+                activated_skill_id: None,
                 interrupted: true,
             });
         }
@@ -900,7 +1001,7 @@ fn stream_session_turn_round(
             .and_then(|ownership| ownership.mission_id)
             .map(|mid| mid.to_string())
             .unwrap_or_else(|| format!("session:{}", request.session_id));
-        append_session_tool_call_items_batch(
+        let tool_batch = append_session_tool_call_items_batch_with_context(
             session_store,
             event_bus,
             tool_registry,
@@ -908,6 +1009,8 @@ fn stream_session_turn_round(
             skill_dispatch_runtime,
             skill_name.as_deref(),
             safety_gate,
+            todo_ledger,
+            orchestrator_mission_id,
             &request.session_id,
             &request.workspace_id,
             request.workspace_root_path.as_deref().map(PathBuf::from),
@@ -927,6 +1030,7 @@ fn stream_session_turn_round(
                 timeline_entry_id: timeline_entry_id.clone(),
                 encountered_tool_calls: false,
                 tool_call_names: Vec::new(),
+                activated_skill_id: None,
                 interrupted: true,
             });
         }
@@ -935,11 +1039,8 @@ fn stream_session_turn_round(
             final_item_id: None,
             timeline_entry_id: timeline_entry_id.clone(),
             encountered_tool_calls: true,
-            tool_call_names: parsed
-                .tool_calls
-                .iter()
-                .map(|call| call.function.name.clone())
-                .collect(),
+            tool_call_names: tool_batch.succeeded_tool_names,
+            activated_skill_id: tool_batch.activated_skill_id,
             interrupted: false,
         });
     }
@@ -962,6 +1063,7 @@ fn stream_session_turn_round(
         timeline_entry_id,
         encountered_tool_calls: false,
         tool_call_names: Vec::new(),
+        activated_skill_id: None,
         interrupted: false,
     })
 }
@@ -970,25 +1072,14 @@ fn forced_tool_choice_for_round(
     request: &SessionTurnExecutionRequest,
     tools: Option<&Vec<ChatToolDefinition>>,
     round: usize,
-    completed_required_tool_names: &[String],
+    _completed_required_tool_names: &[String],
 ) -> Option<ChatToolChoice> {
     if !request.use_tools {
         return None;
     }
-    let forced_tool_name = request
-        .required_tool_chain
-        .iter()
-        .find(|tool_name| {
-            !completed_required_tool_names
-                .iter()
-                .any(|completed| completed == *tool_name)
-        })
-        .map(String::as_str)
-        .or_else(|| {
-            (round == 0)
-                .then(|| request.forced_tool_name.as_deref())
-                .flatten()
-        })?
+    let forced_tool_name = (round == 0)
+        .then(|| request.forced_tool_name.as_deref())
+        .flatten()?
         .trim();
     if forced_tool_name.is_empty() {
         return None;
@@ -1026,6 +1117,13 @@ fn append_final_item(
         final_item.timeline_entry_id = Some(timeline_entry_id.to_string());
     }
     apply_request_aliases(&mut final_item, request);
+    if request.goal_turn_mode.is_goal_driven()
+        && session_store.active_goal(&request.session_id).is_some()
+    {
+        final_item
+            .metadata
+            .insert("renderable".to_string(), serde_json::Value::Bool(false));
+    }
     let final_item_id = final_item.item_id.clone();
     if has_requested_final_item_id {
         if let Some(published) =
@@ -1179,6 +1277,7 @@ mod tests {
             placeholder_message_id: None,
             forced_tool_name: Some("diagram_render".to_string()),
             required_tool_chain: Vec::new(),
+            goal_turn_mode: SessionGoalTurnMode::None,
             workspace_root_path: None,
         };
         let tools = vec![ChatToolDefinition {
@@ -1201,7 +1300,7 @@ mod tests {
     }
 
     #[test]
-    fn required_tool_chain_forces_next_missing_tool_each_round() {
+    fn required_tool_chain_uses_recovery_without_provider_specific_forcing() {
         let request = SessionTurnExecutionRequest {
             session_id: SessionId::new("session-required-tool-chain"),
             turn_id: "turn-required-tool-chain".to_string(),
@@ -1220,6 +1319,7 @@ mod tests {
                 "file_write".to_string(),
                 "file_read".to_string(),
             ],
+            goal_turn_mode: SessionGoalTurnMode::None,
             workspace_root_path: None,
         };
         let tools = ["shell_exec", "file_write", "file_read"]
@@ -1234,31 +1334,17 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let first = forced_tool_choice_for_round(&request, Some(&tools), 0, &[])
-            .expect("first missing tool should be forced");
-        assert_eq!(first.function.name, "shell_exec");
-        let second =
+        assert!(forced_tool_choice_for_round(&request, Some(&tools), 0, &[]).is_none());
+        assert!(
             forced_tool_choice_for_round(&request, Some(&tools), 1, &["shell_exec".to_string()])
-                .expect("second missing tool should be forced");
-        assert_eq!(second.function.name, "file_write");
-        let third = forced_tool_choice_for_round(
-            &request,
-            Some(&tools),
-            2,
-            &["shell_exec".to_string(), "file_write".to_string()],
-        )
-        .expect("third missing tool should be forced");
-        assert_eq!(third.function.name, "file_read");
+                .is_none()
+        );
         assert!(
             forced_tool_choice_for_round(
                 &request,
                 Some(&tools),
-                3,
-                &[
-                    "shell_exec".to_string(),
-                    "file_write".to_string(),
-                    "file_read".to_string()
-                ],
+                2,
+                &["shell_exec".to_string(), "file_write".to_string()],
             )
             .is_none()
         );
@@ -1342,6 +1428,7 @@ mod tests {
             placeholder_message_id: None,
             forced_tool_name: None,
             required_tool_chain: Vec::new(),
+            goal_turn_mode: SessionGoalTurnMode::None,
             workspace_root_path: None,
         };
 
@@ -1349,6 +1436,7 @@ mod tests {
             client: &client,
             event_bus: &event_bus,
             session_store: &store,
+            todo_ledger: &crate::test_todo_ledger("test-todo-ledger"),
             settings_store: None,
             safety_gate: None,
             tool_registry: None,
@@ -1431,6 +1519,7 @@ mod tests {
             placeholder_message_id: None,
             forced_tool_name: None,
             required_tool_chain: Vec::new(),
+            goal_turn_mode: SessionGoalTurnMode::None,
             workspace_root_path: None,
         };
 
@@ -1438,6 +1527,7 @@ mod tests {
             client: &client,
             event_bus: &event_bus,
             session_store: &store,
+            todo_ledger: &crate::test_todo_ledger("test-todo-ledger"),
             settings_store: None,
             safety_gate: None,
             tool_registry: None,
@@ -1530,6 +1620,7 @@ mod tests {
             placeholder_message_id: None,
             forced_tool_name: None,
             required_tool_chain: Vec::new(),
+            goal_turn_mode: SessionGoalTurnMode::None,
             workspace_root_path: None,
         };
 
@@ -1537,6 +1628,7 @@ mod tests {
             client: &client,
             event_bus: &event_bus,
             session_store: &store,
+            todo_ledger: &crate::test_todo_ledger("test-todo-ledger"),
             settings_store: None,
             safety_gate: None,
             tool_registry: None,
@@ -1582,7 +1674,7 @@ mod tests {
         store
             .create_session(session_id.clone(), "placeholder reuse")
             .expect("session should be creatable");
-        let (_mission_id, orchestrator_thread_id) =
+        let (mission_id, orchestrator_thread_id) =
             store.ensure_session_mission(&session_id, ts(900), || {
                 magi_core::MissionId::new("mission-placeholder-reuse")
             });
@@ -1628,6 +1720,7 @@ mod tests {
             placeholder_message_id: Some("assistant-placeholder-reuse".to_string()),
             forced_tool_name: None,
             required_tool_chain: Vec::new(),
+            goal_turn_mode: SessionGoalTurnMode::None,
             workspace_root_path: None,
         };
         let usage_binding = session_turn_model_usage_binding(false);
@@ -1644,6 +1737,7 @@ mod tests {
                 client: &client,
                 event_bus: &event_bus,
                 session_store: &store,
+                todo_ledger: &crate::test_todo_ledger("test-todo-ledger"),
                 settings_store: None,
                 safety_gate: None,
                 request: &request,
@@ -1655,6 +1749,7 @@ mod tests {
                 snapshot_manager: None,
                 round: 0,
                 orchestrator_thread_id: &orchestrator_thread_id,
+                orchestrator_mission_id: &mission_id,
                 persist_session_state: None,
             },
             None,
@@ -1796,6 +1891,8 @@ mod tests {
                 metadata: HashMap::new(),
             }],
             notifications: Vec::new(),
+            goals: Vec::new(),
+            todo_lists: Vec::new(),
             execution_sidecar_store: Default::default(),
             thread_registry: vec![ExecutionThread {
                 thread_id: magi_core::ThreadId::new("thread-test-orchestrator"),
@@ -1841,6 +1938,7 @@ mod tests {
             placeholder_message_id: None,
             forced_tool_name: None,
             required_tool_chain: Vec::new(),
+            goal_turn_mode: SessionGoalTurnMode::None,
             workspace_root_path: None,
         };
         let messages = build_session_turn_messages(&store, &request, &request.prompt);
@@ -1905,6 +2003,7 @@ mod tests {
             placeholder_message_id: None,
             forced_tool_name: None,
             required_tool_chain: Vec::new(),
+            goal_turn_mode: SessionGoalTurnMode::None,
             workspace_root_path: Some("/tmp/current-project".to_string()),
         };
 
@@ -1967,6 +2066,7 @@ mod tests {
             placeholder_message_id: None,
             forced_tool_name: None,
             required_tool_chain: Vec::new(),
+            goal_turn_mode: SessionGoalTurnMode::None,
             workspace_root_path: None,
         };
 
@@ -2015,6 +2115,7 @@ mod tests {
             placeholder_message_id: None,
             forced_tool_name: None,
             required_tool_chain: Vec::new(),
+            goal_turn_mode: SessionGoalTurnMode::None,
             workspace_root_path: Some("/tmp/current-project".to_string()),
         };
 
@@ -2083,6 +2184,7 @@ mod tests {
             placeholder_message_id: Some("placeholder-post-tool-final-item".to_string()),
             forced_tool_name: None,
             required_tool_chain: Vec::new(),
+            goal_turn_mode: SessionGoalTurnMode::None,
             workspace_root_path: None,
         };
 
@@ -2215,6 +2317,7 @@ mod tests {
             placeholder_message_id: Some("placeholder-terminal-duration".to_string()),
             forced_tool_name: None,
             required_tool_chain: Vec::new(),
+            goal_turn_mode: SessionGoalTurnMode::None,
             workspace_root_path: None,
         };
 

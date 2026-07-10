@@ -3551,20 +3551,17 @@ fn is_write_operation_identifies_correct_tools() {
         BuiltinToolName::FileCopy,
         BuiltinToolName::FileMove,
         BuiltinToolName::AgentSpawn,
+        BuiltinToolName::CreateGoal,
+        BuiltinToolName::UpdateGoal,
         BuiltinToolName::TodoWrite,
         BuiltinToolName::MemoryWrite,
-        BuiltinToolName::MissionCharterWrite,
-        BuiltinToolName::PlanWrite,
-        BuiltinToolName::KgWrite,
-        BuiltinToolName::ValidationRecord,
-        BuiltinToolName::Checkpoint,
-        BuiltinToolName::HumanCheckpointRequest,
     ];
     let non_write = [
         BuiltinToolName::FileRead,
         BuiltinToolName::ViewImage,
         BuiltinToolName::SearchText,
         BuiltinToolName::ShellExec,
+        BuiltinToolName::GetGoal,
         BuiltinToolName::AgentWait,
         BuiltinToolName::WebSearch,
         BuiltinToolName::DiffPreview,
@@ -4008,6 +4005,10 @@ fn web_tools_are_read_only() {
         registry.builtin_access_mode(BuiltinToolName::ToolCatalog.as_str()),
         Some(BuiltinToolAccessMode::ReadOnly)
     );
+    assert_eq!(
+        registry.builtin_access_mode(BuiltinToolName::GetGoal.as_str()),
+        Some(BuiltinToolAccessMode::ReadOnly)
+    );
 }
 
 #[test]
@@ -4183,16 +4184,13 @@ fn public_builtin_specs_exclude_shell_internal_process_tools() {
             "knowledge_query",
             "code_symbols",
             "tool_catalog",
+            "get_goal",
+            "create_goal",
+            "update_goal",
             "agent_spawn",
             "agent_wait",
             "todo_write",
             "memory_write",
-            "mission_charter_write",
-            "plan_write",
-            "kg_write",
-            "validation_record",
-            "checkpoint_create",
-            "human_checkpoint_request",
         ],
         "public builtin specs must remain the single canonical tool surface"
     );
@@ -4756,23 +4754,19 @@ fn builtin_access_mode_reports_write_tools_correctly() {
         Some(BuiltinToolAccessMode::ExplicitWrite)
     );
     assert_eq!(
+        registry.builtin_access_mode(BuiltinToolName::CreateGoal.as_str()),
+        Some(BuiltinToolAccessMode::ExplicitWrite)
+    );
+    assert_eq!(
+        registry.builtin_access_mode(BuiltinToolName::UpdateGoal.as_str()),
+        Some(BuiltinToolAccessMode::ExplicitWrite)
+    );
+    assert_eq!(
         registry.builtin_access_mode(BuiltinToolName::TodoWrite.as_str()),
         Some(BuiltinToolAccessMode::ExplicitWrite)
     );
     assert_eq!(
         registry.builtin_access_mode(BuiltinToolName::MemoryWrite.as_str()),
-        Some(BuiltinToolAccessMode::ExplicitWrite)
-    );
-    assert_eq!(
-        registry.builtin_access_mode(BuiltinToolName::PlanWrite.as_str()),
-        Some(BuiltinToolAccessMode::ExplicitWrite)
-    );
-    assert_eq!(
-        registry.builtin_access_mode(BuiltinToolName::KgWrite.as_str()),
-        Some(BuiltinToolAccessMode::ExplicitWrite)
-    );
-    assert_eq!(
-        registry.builtin_access_mode(BuiltinToolName::HumanCheckpointRequest.as_str()),
         Some(BuiltinToolAccessMode::ExplicitWrite)
     );
     assert_eq!(
@@ -4842,6 +4836,44 @@ fn search_semantic_uses_workspace_local_index() {
     );
 
     let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn external_mcp_tool_surface_and_execution_share_one_registry_snapshot() {
+    let governance = Arc::new(GovernanceService::default());
+    let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(16));
+    let registry = ToolRegistry::new(governance, event_bus)
+        .with_external_tool_catalog_provider(Arc::new(|| ExternalToolCatalogSnapshot {
+            mcp_tools: vec![ExternalMcpToolCatalogEntry {
+                server_id: "repo-tools".to_string(),
+                server_name: "Repository Tools".to_string(),
+                model_tool_name: "mcp__repo_tools__inspect".to_string(),
+                tool_name: "inspect".to_string(),
+                description: "Inspect repository".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": { "path": { "type": "string" } }
+                }),
+            }],
+            ..ExternalToolCatalogSnapshot::default()
+        }))
+        .with_external_mcp_tool_executor(Arc::new(|server_id, tool_name, arguments| {
+            assert_eq!(server_id, "repo-tools");
+            assert_eq!(tool_name, "inspect");
+            assert_eq!(arguments, r#"{"path":"src"}"#);
+            (
+                serde_json::json!({ "status": "succeeded", "files": 3 }).to_string(),
+                ExecutionResultStatus::Succeeded,
+            )
+        }));
+
+    let snapshot = registry.external_tool_catalog_snapshot();
+    assert_eq!(snapshot.mcp_tools.len(), 1);
+    let result = registry
+        .execute_external_mcp_tool("mcp__repo_tools__inspect", r#"{"path":"src"}"#)
+        .expect("model-visible MCP tool should execute through the same snapshot");
+    assert_eq!(result.1, ExecutionResultStatus::Succeeded);
+    assert!(result.0.contains("\"files\":3"));
 }
 
 #[test]

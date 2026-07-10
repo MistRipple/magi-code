@@ -28,7 +28,8 @@ pub enum MailboxAuthor {
 /// Mailbox 信号类型。运行时信号统一按这个枚举分类。
 ///
 /// 注：代理初始任务、追问、系统 followup 等都统一进入 Conversation
-/// mailbox；代理终态结果由 agent_wait 从 TaskStore 读取。
+/// mailbox；代理终态结果由 agent_wait 从对应 thread transcript 读取，TaskStore
+/// 仅保留调度状态与历史 output_refs。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum MailboxKind {

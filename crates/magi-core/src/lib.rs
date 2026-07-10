@@ -14,8 +14,8 @@ mod tests;
 pub use errors::{DomainError, DomainResult};
 pub use execution::{ExecutionOwnership, RecoveryResumeInput, TaskExecutionTarget};
 pub use ids::{
-    AssignmentId, EventId, LeaseId, MissionId, SessionId, TaskId, ThreadId, ToolCallId, WorkerId,
-    WorkspaceId,
+    AssignmentId, EventId, GoalId, LeaseId, MissionId, SessionId, TaskId, ThreadId, ToolCallId,
+    WorkerId, WorkspaceId,
 };
 pub use public_text::{
     PUBLIC_REDACTED_PATH, PUBLIC_REDACTED_VALUE, PUBLIC_RUNTIME_SUMMARY_MAX_CHARS,
@@ -23,13 +23,13 @@ pub use public_text::{
 };
 pub use status::{
     ApprovalRequirement, AssignmentLifecycleStatus, DispatchReason, ExecutionResultStatus,
-    MissionLifecyclePhase, MissionLifecycleStatus, RiskLevel, SessionLifecycleStatus,
-    TaskResultKind, TerminationReason, VerificationStatus, WorkerLifecycleStatus,
-    WorkspaceLifecycleStatus,
+    MissionLifecycleStatus, RiskLevel, SessionLifecycleStatus, TaskResultKind, TerminationReason,
+    VerificationStatus, WorkerLifecycleStatus, WorkspaceLifecycleStatus,
 };
 pub use task::{
-    AccessProfile, ProgressSummary, TASK_RUNTIME_FAILURE_PUBLIC_OUTPUT, Task, TaskExecutorBinding,
-    TaskKind, TaskPolicy, TaskProjection, TaskRuntimePayload, TaskStatus, TaskTier,
-    public_task_output_refs, task_output_ref_is_internal_runtime_failure,
+    AccessProfile, AgentRunProjection, ProgressSummary, TASK_RUNTIME_FAILURE_PUBLIC_OUTPUT, Task,
+    TaskExecutorBinding, TaskKind, TaskPolicy, TaskRuntimePayload, TaskStatus, TaskTier, TodoItem,
+    TodoStatus, public_task_output_refs, task_output_ref_is_internal_runtime_failure,
+    text_prohibits_agent_spawn, text_requires_agent_spawn,
 };
 pub use value_objects::{AbsolutePath, UtcMillis, WorkspaceRootPath, WorktreeRootPath};

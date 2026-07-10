@@ -14,6 +14,7 @@
     deleteAgentKnowledgeItem,
     getAgentProjectKnowledge,
     isWebAgentMode,
+    reindexAgentProjectKnowledge,
     updateAgentKnowledgeItem,
   } from '../web/agent-api';
 
@@ -24,7 +25,7 @@
     entryPoints?: string[];
   }
 
-  type CodeIndexStatusValue = 'indexed' | 'empty' | 'failed';
+  type CodeIndexStatusValue = 'indexing' | 'indexed' | 'empty' | 'failed';
   type CodeIndexReasonCode =
     | 'workspace_missing'
     | 'workspace_not_directory'
@@ -78,6 +79,7 @@
   let knowledgeLoadRequestSeq = 0;
   let activeKnowledgeLoadRequestId = $state('');
   let knowledgeLoadTimeout: ReturnType<typeof setTimeout> | null = null;
+  let knowledgeIndexPollTimeout: ReturnType<typeof setTimeout> | null = null;
   let loadError = $state('');
   let codeIndex = $state<CodeIndex | null>(null);
   let codeIndexStatus = $state<CodeIndexStatus | null>(null);
@@ -119,9 +121,11 @@
   );
   const codeIndexNotice = $derived.by(() => {
     if (!codeIndexStatus || codeIndexStatus.status === 'indexed') return null;
-    const title = codeIndexStatus.status === 'failed'
-      ? i18n.t('knowledge.overview.indexFailed')
-      : i18n.t('knowledge.overview.indexEmpty');
+    const title = codeIndexStatus.status === 'indexing'
+      ? i18n.t('knowledge.overview.indexing')
+      : codeIndexStatus.status === 'failed'
+        ? i18n.t('knowledge.overview.indexFailed')
+        : i18n.t('knowledge.overview.indexEmpty');
     const hint = codeIndexNoticeHint(codeIndexStatus);
     return { title, hint, status: codeIndexStatus.status };
   });
@@ -426,6 +430,28 @@
     }
   }
 
+  function clearKnowledgeIndexPollTimeout() {
+    if (knowledgeIndexPollTimeout) {
+      clearTimeout(knowledgeIndexPollTimeout);
+      knowledgeIndexPollTimeout = null;
+    }
+  }
+
+  function scheduleKnowledgeIndexPoll() {
+    clearKnowledgeIndexPollTimeout();
+    if (!isKnowledgeActive || codeIndexStatus?.status !== 'indexing') {
+      return;
+    }
+    const request = currentKnowledgeWorkspaceRequest();
+    knowledgeIndexPollTimeout = setTimeout(() => {
+      knowledgeIndexPollTimeout = null;
+      if (!isCurrentKnowledgeWorkspaceRequest(request) || !isKnowledgeActive) {
+        return;
+      }
+      requestKnowledgeLoad(false, true);
+    }, 750);
+  }
+
   function finishKnowledgeLoad() {
     activeKnowledgeLoadRequestId = '';
     clearKnowledgeLoadTimeout();
@@ -493,6 +519,7 @@
     loadError = '';
     isLoading = false;
     finishKnowledgeLoad();
+    scheduleKnowledgeIndexPoll();
     return true;
   }
 
@@ -500,7 +527,7 @@
     if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
     const record = value as Record<string, unknown>;
     const status = typeof record.status === 'string' ? record.status : '';
-    if (status !== 'indexed' && status !== 'empty' && status !== 'failed') return null;
+    if (status !== 'indexing' && status !== 'indexed' && status !== 'empty' && status !== 'failed') return null;
     const reasonCode = normalizeCodeIndexReasonCode(record.reasonCode);
     return { status, reasonCode };
   }
@@ -519,6 +546,9 @@
   }
 
   function codeIndexNoticeHint(status: CodeIndexStatus): string {
+    if (status.status === 'indexing') {
+      return i18n.t('knowledge.overview.indexingHint');
+    }
     if (status.reasonCode === 'no_indexable_files') {
       return i18n.t('knowledge.overview.indexEmptyNoIndexableFiles');
     }
@@ -619,7 +649,10 @@
     vscode.postMessage({ type: 'loadSettingsBootstrap', force: true });
   }
 
-  async function fetchKnowledgeViaApi(request: KnowledgeLoadRequest) {
+  async function fetchKnowledgeViaApi(request: KnowledgeLoadRequest, reindex: boolean) {
+    if (reindex) {
+      await reindexAgentProjectKnowledge(knowledgeWorkspaceScope(request));
+    }
     const res = await getAgentProjectKnowledge(knowledgeWorkspaceScope(request));
     if (!isCurrentKnowledgeLoadRequest(request)) {
       return;
@@ -632,19 +665,22 @@
     refreshSettingsAfterKnowledgePayload();
   }
 
-  function requestKnowledgeLoad() {
+  function requestKnowledgeLoad(reindex = false, background = false) {
     const request = nextKnowledgeLoadRequest();
+    clearKnowledgeIndexPollTimeout();
     hasRequestedKnowledge = true;
-    isLoading = true;
+    if (!background) {
+      isLoading = true;
+    }
     activeKnowledgeLoadRequestId = request.requestId;
     scheduleKnowledgeLoadTimeout(request);
     loadError = '';
     if (isWebMode) {
-      fetchKnowledgeViaApi(request)
+      fetchKnowledgeViaApi(request, reindex)
         .catch((error) => handleKnowledgeLoadError(error, request));
     } else {
       vscode.postMessage({
-        type: 'getProjectKnowledge',
+        type: reindex ? 'reindexProjectKnowledge' : 'getProjectKnowledge',
         knowledgeRequestId: request.requestId,
         ...knowledgeWorkspaceScope(request),
       });
@@ -652,7 +688,7 @@
   }
 
   function refresh() {
-    requestKnowledgeLoad();
+    requestKnowledgeLoad(true);
   }
 
   function toggleAdr(adr: ADR) {
@@ -733,6 +769,7 @@
     hasRequestedKnowledge = false;
     isLoading = false;
     finishKnowledgeLoad();
+    clearKnowledgeIndexPollTimeout();
     loadError = '';
     clearKnowledgeContent();
     if (isKnowledgeActive) {
@@ -771,6 +808,7 @@
 
     return () => {
       clearKnowledgeLoadTimeout();
+      clearKnowledgeIndexPollTimeout();
       unsubscribe();
     };
   });

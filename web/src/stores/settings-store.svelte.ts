@@ -5,7 +5,7 @@ import { MessageCategory } from "../shared/protocol/message-protocol";
 import { ensureArray } from "../lib/utils";
 import { aggregateUsageStatsForDisplay } from "../lib/usage-stats-aggregation";
 import { i18n } from "./i18n.svelte";
-import { addToast } from "../stores/messages.svelte";
+import { reportIncident, showFeedback } from "../lib/notifications";
 import {
   type AgentSettingsBootstrapSnapshot,
   addAgentMcpServer,
@@ -168,49 +168,22 @@ export interface CapabilityDependencyItem {
   toolCount?: number | null;
 }
 
-function notifySettingsSuccess(
-  message: string,
-  options: {
-    displayMode?: "toast" | "notification_center";
-  } = {},
-): void {
-  addToast("success", message, undefined, {
-    category: "audit",
-    source: "settings-panel",
-    actionRequired: false,
-    persistToCenter: true,
-    countUnread: false,
-    displayMode: options.displayMode || "toast",
-  });
+function notifySettingsSuccess(message: string): void {
+  showFeedback("success", message, { source: "settings-panel" });
 }
 
 function notifySettingsInfo(message: string): void {
-  addToast("info", message, undefined, {
-    category: "audit",
-    source: "settings-panel",
-    actionRequired: false,
-    persistToCenter: true,
-    countUnread: false,
-    displayMode: "toast",
-  });
+  showFeedback("info", message, { source: "settings-panel" });
 }
 
 function notifySettingsError(actionLabel: string, error: unknown): void {
   console.warn(`[SettingsPanel] ${actionLabel} failed:`, error);
   const message = i18n.t("settings.toast.actionFailed", { action: actionLabel });
-  addToast(
-    "error",
-    message,
-    undefined,
-    {
-      category: "incident",
-      source: "settings-panel",
-      actionRequired: true,
-      persistToCenter: true,
-      countUnread: true,
-      displayMode: "toast",
-    },
-  );
+  reportIncident(message, {
+    scope: "app",
+    source: "settings-panel",
+    fingerprint: `settings:${actionLabel}`,
+  });
 }
 
 export interface Repository {
@@ -792,6 +765,15 @@ function createSettingsStore(props: { onClose?: () => void }) {
     );
   }
 
+  function hasUsableConnectionConfig(
+    config: Partial<BaseModelFormConfig> | undefined,
+  ): boolean {
+    if (!config) {
+      return false;
+    }
+    return Boolean(config.baseUrl?.trim() && config.apiKey?.trim());
+  }
+
   function inferModelErrorStatus(error: unknown): {
     status:
       | "error"
@@ -890,7 +872,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
     const orchestratorModel = orchConfig.model?.trim() || undefined;
     const incomingOrchestrator = resolveIncoming("orchestrator", orchestratorModel);
     next.orchestrator = incomingOrchestrator || {
-      status: hasUsableModelConfig(orchConfig) ? "configured" : "not_configured",
+      status: hasUsableConnectionConfig(orchConfig) ? "configured" : "not_configured",
       model: orchestratorModel,
     };
 
@@ -956,7 +938,11 @@ function createSettingsStore(props: { onClose?: () => void }) {
           : compConfig;
     const model = config?.model?.trim() || undefined;
 
-    if (!hasUsableModelConfig(config)) {
+    const hasUsableConfig =
+      target === "orch"
+        ? hasUsableConnectionConfig(config)
+        : hasUsableModelConfig(config);
+    if (!hasUsableConfig) {
       return {
         key: statusKey,
         value: { status: "not_configured", model },
@@ -971,7 +957,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
         );
       } else if (target === "orch") {
         await testAgentOrchestratorConnection(
-          buildInteractiveModelConfigPayload(config as InteractiveModelFormConfig),
+          buildOrchestratorConnectionConfigPayload(config as InteractiveModelFormConfig),
         );
       } else {
         await testAgentAuxiliaryConnection(
@@ -1083,6 +1069,13 @@ function createSettingsStore(props: { onClose?: () => void }) {
   ): Promise<AgentSettingsBootstrapSnapshot | null> {
     const payload = await getAgentSettingsBootstrap(options);
     return settingsBootstrapMatchesCurrentWorkspace(payload) ? payload : null;
+  }
+
+  function applyFreshSettingsBootstrapPayload(
+    payload: AgentSettingsBootstrapSnapshot,
+  ): void {
+    appState.settingsBootstrapSnapshot = payload;
+    applySettingsBootstrapPayload(payload, { allowLocaleHydration: false });
   }
 
   async function refreshSettingsBootstrapFromApi(scope: SettingsBootstrapScope = "core"): Promise<void> {
@@ -1285,9 +1278,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
       const result = await upsertAgentRegistryBinding(updated);
       registryAgents = result;
       syncEnabledAgentsToStore();
-      notifySettingsSuccess(i18n.t("settings.toast.roleBindingUpdated"), {
-        displayMode: "notification_center",
-      });
+      notifySettingsSuccess(i18n.t("settings.toast.roleBindingUpdated"));
     } catch (e) {
       console.error("[SettingsPanel] 更新角色引擎失败:", e);
       notifySettingsError(i18n.t("settings.toast.action.updateRoleBinding"), e);
@@ -1475,10 +1466,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
       };
       testStatus[statusKey] =
         result.value.status === "connected" ? "success" : "error";
-      notifySettingsSuccess(
-        i18n.t("settings.toast.connectionTestCompleted"),
-        { displayMode: "notification_center" },
-      );
+      notifySettingsSuccess(i18n.t("settings.toast.connectionTestCompleted"));
     } catch (e) {
       console.error("[SettingsPanel] 连接测试失败:", e);
       testStatus[statusKey] = "error";
@@ -1534,7 +1522,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
         target === "worker"
           ? buildWorkerModelConfigPayload(config as WorkerModelFormConfig)
           : target === "orch"
-            ? buildInteractiveModelConfigPayload(config as InteractiveModelFormConfig)
+            ? buildOrchestratorConnectionConfigPayload(config as InteractiveModelFormConfig)
             : buildBaseModelConfigPayload(config as BaseModelFormConfig);
       const result = await fetchAgentModelList(payload, key);
       fetchingModels[key] = false;
@@ -1546,9 +1534,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
           modelDropdownOpen[key] = true;
           modelDropdownOpen = { ...modelDropdownOpen };
         }
-        notifySettingsSuccess(i18n.t("settings.toast.modelListRefreshed"), {
-          displayMode: "notification_center",
-        });
+        notifySettingsSuccess(i18n.t("settings.toast.modelListRefreshed"));
       }
     } catch (e) {
       console.error("[SettingsPanel] 获取模型列表失败:", e);
@@ -1560,7 +1546,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
 
   function selectModel(target: string, model: string) {
     if (target === "orch") {
-      orchConfig.model = model;
+      return;
     } else if (target === "comp") {
       compConfig.model = model;
     } else if (workerConfigs[target]) {
@@ -1888,10 +1874,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
             applyMcpServersPayload((result as any).servers);
           }
           if (loaded) {
-            notifySettingsSuccess(
-              i18n.t("settings.toast.mcpToolListLoaded"),
-              { displayMode: "notification_center" },
-            );
+            notifySettingsSuccess(i18n.t("settings.toast.mcpToolListLoaded"));
           }
         } catch (e) {
           console.error("[SettingsPanel] 获取 MCP 工具列表失败:", e);
@@ -1917,9 +1900,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
         applyMcpServersPayload((result as any).servers);
       }
       if (refreshed) {
-        notifySettingsSuccess(i18n.t("settings.toast.mcpToolsRefreshed"), {
-          displayMode: "notification_center",
-        });
+        notifySettingsSuccess(i18n.t("settings.toast.mcpToolsRefreshed"));
       }
     } catch (e) {
       console.error("[SettingsPanel] 刷新 MCP 工具失败:", e);
@@ -2116,7 +2097,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
           );
           const bootstrapPayload = await fetchCurrentSettingsBootstrap();
           if (bootstrapPayload) {
-            applySkillsConfig(bootstrapPayload.skillsConfig);
+            applyFreshSettingsBootstrapPayload(bootstrapPayload);
           }
           notifySettingsSuccess(i18n.t("settings.toast.localSkillInstalled"));
         }
@@ -2152,7 +2133,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
           ];
           const bootstrapPayload = await fetchCurrentSettingsBootstrap();
           if (bootstrapPayload) {
-            applySkillsConfig(bootstrapPayload.skillsConfig);
+            applyFreshSettingsBootstrapPayload(bootstrapPayload);
           }
           notifySettingsSuccess(i18n.t("settings.toast.skillInstalled"));
         }
@@ -2185,7 +2166,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
           localSkillInstallError = "";
           const bootstrapPayload = await fetchCurrentSettingsBootstrap();
           if (bootstrapPayload) {
-            applySkillsConfig(bootstrapPayload.skillsConfig);
+            applyFreshSettingsBootstrapPayload(bootstrapPayload);
           }
           showSkillLibraryDialogState = false;
           notifySettingsSuccess(i18n.t("settings.toast.localSkillInstalled"));
@@ -2283,7 +2264,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
           await removeAgentInstalledSkill(skill.skillId, skill.source);
           const payload = await fetchCurrentSettingsBootstrap();
           if (payload) {
-            applySkillsConfig(payload.skillsConfig);
+            applyFreshSettingsBootstrapPayload(payload);
           }
           notifySettingsSuccess(successText);
         } catch (e) {
@@ -2401,8 +2382,8 @@ function createSettingsStore(props: { onClose?: () => void }) {
       baseUrl: config.baseUrl || "",
       urlMode: normalizeUrlMode(config.urlMode),
       apiKey: config.apiKey || "",
-      model: config.model || "",
-      reasoningEffort: config.reasoningEffort || "medium",
+      model: "",
+      reasoningEffort: "medium",
     });
   }
 

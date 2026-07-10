@@ -26,7 +26,7 @@ impl StateRepository {
     }
 
     pub(crate) fn load_session_durable_state(&self) -> Result<SessionDurableState, DaemonError> {
-        self.read_json_or_default(self.session_durable_state_path())
+        self.read_session_durable_state_or_default(self.session_durable_state_path())
     }
 
     /// 从指定工作区的 .magi/sessions.json 加载会话
@@ -36,7 +36,7 @@ impl StateRepository {
     ) -> Result<SessionDurableState, DaemonError> {
         let path = workspace_root.join(".magi").join("sessions.json");
         if path.exists() {
-            self.read_json_or_default(path)
+            self.read_session_durable_state_or_default(path)
         } else {
             Ok(SessionDurableState::default())
         }
@@ -83,6 +83,8 @@ impl StateRepository {
             merged.timeline.extend(ws_state.timeline);
             merged.canonical_turns.extend(ws_state.canonical_turns);
             merged.notifications.extend(ws_state.notifications);
+            merged.goals.extend(ws_state.goals);
+            merged.todo_lists.extend(ws_state.todo_lists);
             if merged.current_session_id.is_none() {
                 merged.current_session_id = ws_state.current_session_id;
             }
@@ -201,6 +203,35 @@ impl StateRepository {
         self.read_json_value_or_default(path)
     }
 
+    fn read_session_durable_state_or_default(
+        &self,
+        path: PathBuf,
+    ) -> Result<SessionDurableState, DaemonError> {
+        if !path.exists() {
+            return Ok(SessionDurableState::default());
+        }
+        self.read_json_value_or_default(path)
+    }
+
+    fn backup_stale_json<T>(
+        &self,
+        path: PathBuf,
+        error: serde_json::Error,
+    ) -> Result<T, DaemonError>
+    where
+        T: Default,
+    {
+        let backup_path = stale_backup_path(&path);
+        warn!(
+            path = %path.display(),
+            backup_path = %backup_path.display(),
+            error = %error,
+            "影子状态文件与当前 schema 不兼容，已转存并回退到默认状态"
+        );
+        fs::rename(&path, &backup_path)?;
+        Ok(T::default())
+    }
+
     fn read_json_value_or_default<T>(&self, path: PathBuf) -> Result<T, DaemonError>
     where
         T: Default + for<'de> serde::Deserialize<'de>,
@@ -208,17 +239,7 @@ impl StateRepository {
         let content = fs::read_to_string(&path)?;
         match serde_json::from_str(&content) {
             Ok(value) => Ok(value),
-            Err(error) => {
-                let backup_path = stale_backup_path(&path);
-                warn!(
-                    path = %path.display(),
-                    backup_path = %backup_path.display(),
-                    error = %error,
-                    "影子状态文件与当前 schema 不兼容，已转存并回退到默认状态"
-                );
-                fs::rename(&path, &backup_path)?;
-                Ok(T::default())
-            }
+            Err(error) => self.backup_stale_json(path, error),
         }
     }
 
@@ -348,9 +369,10 @@ fn stale_backup_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use magi_core::{SessionId, SessionLifecycleStatus, UtcMillis};
+    use magi_core::{SessionId, SessionLifecycleStatus, TodoItem, TodoStatus, UtcMillis};
     use magi_session_store::{
-        NotificationRecord, SessionDurableState, SessionRecord, TimelineEntry, TimelineEntryKind,
+        NotificationRecord, NotificationScope, SessionDurableState, SessionRecord, SessionTodoList,
+        TimelineEntry, TimelineEntryKind,
     };
 
     fn unique_temp_dir(prefix: &str) -> PathBuf {
@@ -361,6 +383,33 @@ mod tests {
         ));
         fs::create_dir_all(&path).expect("temp dir should create");
         path
+    }
+
+    fn session_incident(
+        notification_id: &str,
+        workspace_id: &str,
+        session_id: &SessionId,
+        message: &str,
+        created_at: UtcMillis,
+    ) -> NotificationRecord {
+        NotificationRecord {
+            notification_id: notification_id.to_string(),
+            scope: NotificationScope::Session,
+            workspace_id: Some(workspace_id.to_string()),
+            session_id: Some(session_id.clone()),
+            kind: "incident".to_string(),
+            level: Some("error".to_string()),
+            title: None,
+            message: message.to_string(),
+            source: Some("test".to_string()),
+            created_at,
+            handled: false,
+            action_required: true,
+            count_unread: true,
+            fingerprint: notification_id.to_string(),
+            occurrence_count: 1,
+            resolved: false,
+        }
     }
 
     #[test]
@@ -389,21 +438,22 @@ mod tests {
                 occurred_at: now,
             }],
             canonical_turns: vec![],
-            notifications: vec![NotificationRecord {
-                notification_id: "notification-persisted".to_string(),
+            notifications: vec![session_incident(
+                "notification-persisted",
+                "workspace-persisted",
+                &session_id,
+                "恢复后的异常",
+                now,
+            )],
+            goals: vec![],
+            todo_lists: vec![SessionTodoList {
                 session_id: session_id.clone(),
-                kind: "info".to_string(),
-                level: None,
-                title: None,
-                message: "恢复后的通知".to_string(),
-                source: None,
-                created_at: now,
-                handled: false,
-                persist_to_center: Some(true),
-                action_required: None,
-                count_unread: None,
-                display_mode: None,
-                duration: None,
+                items: vec![TodoItem::new(
+                    "恢复目标任务清单",
+                    "正在恢复目标任务清单",
+                    TodoStatus::InProgress,
+                )],
+                updated_at: now,
             }],
         };
         repository
@@ -420,6 +470,8 @@ mod tests {
         assert_eq!(merged.sessions.len(), 1);
         assert_eq!(merged.timeline.len(), 1);
         assert_eq!(merged.notifications.len(), 1);
+        assert_eq!(merged.todo_lists.len(), 1);
+        assert_eq!(merged.todo_lists[0].items[0].content, "恢复目标任务清单");
         assert_eq!(merged.current_session_id, Some(session_id));
 
         let _ = fs::remove_dir_all(state_root);
@@ -453,22 +505,15 @@ mod tests {
                     occurred_at: now,
                 }],
                 canonical_turns: vec![],
-                notifications: vec![NotificationRecord {
-                    notification_id: "notification-unknown-workspace".to_string(),
-                    session_id: session_id.clone(),
-                    kind: "incident".to_string(),
-                    level: None,
-                    title: None,
-                    message: "未知工作区通知".to_string(),
-                    source: None,
-                    created_at: now,
-                    handled: false,
-                    persist_to_center: Some(true),
-                    action_required: None,
-                    count_unread: None,
-                    display_mode: None,
-                    duration: None,
-                }],
+                notifications: vec![session_incident(
+                    "notification-unknown-workspace",
+                    "workspace-missing",
+                    &session_id,
+                    "未知工作区异常",
+                    now,
+                )],
+                goals: vec![],
+                todo_lists: vec![],
             })
             .expect("invalid global session state should save");
 
@@ -518,6 +563,8 @@ mod tests {
                 }],
                 canonical_turns: vec![],
                 notifications: vec![],
+                goals: vec![],
+                todo_lists: vec![],
             })
             .expect("invalid global session state should save");
 
@@ -578,6 +625,8 @@ mod tests {
                 }],
                 canonical_turns: vec![],
                 notifications: vec![],
+                goals: vec![],
+                todo_lists: vec![],
             })
             .expect("global session durable state should save");
 
@@ -604,6 +653,8 @@ mod tests {
                     }],
                     canonical_turns: vec![],
                     notifications: vec![],
+                    goals: vec![],
+                    todo_lists: vec![],
                 },
             )
             .expect("workspace session durable state should save");
@@ -652,6 +703,8 @@ mod tests {
                 timeline: vec![],
                 canonical_turns: vec![],
                 notifications: vec![],
+                goals: vec![],
+                todo_lists: vec![],
             })
             .expect("global session durable state should save");
 

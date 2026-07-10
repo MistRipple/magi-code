@@ -15,7 +15,6 @@ import {
   clearPendingInteractions,
   clearAllMessages,
   setCanonicalTimelineProjection,
-  addToast,
   clearPendingRequest,
   setProcessingActor,
   getRequestBinding,
@@ -31,8 +30,8 @@ import {
   getTimelineProjectionMessageById,
   settleProcessingAfterResponseCompletion,
   settleAuthoritativeIdleState,
-  applySessionNotifications,
-  applySessionNotificationsStatus,
+  applyNotificationsSnapshot,
+  applyNotificationsStatus,
   batchWebviewStatePersistence,
   setEnabledAgents,
   setSessionHistoryState,
@@ -40,6 +39,8 @@ import {
   hasActiveLocalTimelineTurn,
   setChangeMutationStatus,
 } from '../stores/messages.svelte';
+import { reportIncident, showFeedback } from './notifications';
+import type { IncidentScope } from './notification-policy';
 import type {
   AppState, Message, Session,
   Edit,
@@ -238,6 +239,7 @@ function normalizeIncomingEdits(state: AppState): Edit[] {
         mime: change.mime,
         sourceKind: change.sourceKind,
         hasError: change.hasError === true,
+        revertible: change.revertible === true,
         symlinkTarget: change.symlinkTarget,
         headSummary: change.headSummary,
         tailSummary: change.tailSummary,
@@ -399,10 +401,11 @@ export function handleUnifiedControlMessage(standard: StandardMessage) {
         }
       }
 
-      addToast(toastLevel, finalReason, undefined, {
-        category: 'incident',
+      reportIncident(finalReason, {
+        scope: 'session',
+        level: toastLevel,
         source: modelOriginIssue ? 'model-runtime' : 'task-runtime',
-        actionRequired: true,
+        fingerprint: modelOriginIssue ? 'model-request-rejected' : 'task-request-rejected',
       });
       break;
     }
@@ -454,13 +457,29 @@ export function handleUnifiedNotify(standard: StandardMessage) {
     return;
   }
   const presentation = resolveNotificationPresentation(notify, 'model-runtime');
-  addToast(presentation.level, content, presentation.title, {
-    category: presentation.category,
+  if (presentation.displayMode === 'silent') {
+    return;
+  }
+  if (presentation.category === 'incident') {
+    const scope: IncidentScope = messagesState.currentSessionId
+      ? 'session'
+      : messagesState.currentWorkspaceId
+        ? 'workspace'
+        : 'app';
+    reportIncident(content, {
+      scope,
+      level: presentation.level === 'warning' ? 'warning' : 'error',
+      title: presentation.title,
+      source: presentation.source,
+      actionRequired: presentation.actionRequired,
+      duration: presentation.duration,
+      fingerprint: `${presentation.source}:${content}`,
+    });
+    return;
+  }
+  showFeedback(presentation.level, content, {
+    title: presentation.title,
     source: presentation.source,
-    actionRequired: presentation.actionRequired,
-    persistToCenter: presentation.persistToCenter,
-    countUnread: presentation.countUnread,
-    displayMode: presentation.displayMode,
     duration: presentation.duration,
   });
 }
@@ -582,16 +601,16 @@ export function handleUnifiedData(standard: StandardMessage) {
       }));
       break;
 
-    case 'sessionNotificationsLoaded':
-      handleSessionNotificationsLoaded(asMessage({
+    case 'notificationsLoaded':
+      handleNotificationsLoaded(asMessage({
         sessionId: payload.sessionId,
         workspaceId: payload.workspaceId,
         notifications: payload.notifications,
       }));
       break;
 
-    case 'sessionNotificationsStatus':
-      applySessionNotificationsStatus(payload);
+    case 'notificationsStatus':
+      applyNotificationsStatus(payload);
       break;
 
     case 'changeMutationStatus':
@@ -661,12 +680,12 @@ export function handleUnifiedData(standard: StandardMessage) {
       const title = typeof payload.title === 'string' && payload.title.trim() ? payload.title.trim() : '';
       const label = title || i18n.t('messageHandler.taskDefaultLabel');
 
-      // 当前只弹出失败态，完成态由任务面板和时间线自然呈现，避免重复通知。
+      // 当前只弹出失败态，完成态由目标面板和时间线自然呈现，避免重复通知。
       if (newStatus === 'Failed') {
-        addToast('error', i18n.t('messageHandler.taskFailedNotification', { label }), undefined, {
-          category: 'incident',
+        reportIncident(i18n.t('messageHandler.taskFailedNotification', { label }), {
+          scope: 'session',
           source: 'task-runtime',
-          actionRequired: true,
+          fingerprint: `task-failed:${label}`,
         });
       }
       break;
@@ -992,6 +1011,9 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
         processingState: null,
       });
       setOrchestratorRuntimeState(null);
+      if (snapshot.notifications) {
+        applyNotificationsSnapshot(null, snapshot.notifications.notifications, workspaceId);
+      }
     });
     return;
   }
@@ -1046,7 +1068,7 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
       }
 
       if (snapshot.notifications) {
-        applySessionNotifications(sessionId, snapshot.notifications.notifications, workspaceId);
+        applyNotificationsSnapshot(sessionId, snapshot.notifications.notifications, workspaceId);
       }
       setSessionHistoryState(sessionId, {
         workspaceId,
@@ -1106,7 +1128,7 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
       (snapshot.orchestratorRuntimeState as OrchestratorRuntimeState | null | undefined) ?? null,
     );
     if (snapshot.notifications) {
-      applySessionNotifications(sessionId, snapshot.notifications.notifications, workspaceId);
+      applyNotificationsSnapshot(sessionId, snapshot.notifications.notifications, workspaceId);
     }
     setSessionHistoryState(sessionId, {
       workspaceId,
@@ -1118,13 +1140,13 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
   });
 }
 
-function handleSessionNotificationsLoaded(message: ClientBridgeMessage) {
+function handleNotificationsLoaded(message: ClientBridgeMessage) {
   const sessionId = typeof message.sessionId === 'string' ? message.sessionId : '';
   const workspaceId = typeof message.workspaceId === 'string' ? message.workspaceId : '';
-  if (!sessionId) {
+  if (!workspaceId) {
     return;
   }
-  applySessionNotifications(sessionId, message.notifications, workspaceId);
+  applyNotificationsSnapshot(sessionId, message.notifications, workspaceId);
 }
 
 
@@ -1207,7 +1229,7 @@ function handleOrchestratorRuntimeState(message: ClientBridgeMessage) {
 }
 
 function handleClarificationRequest(_message: ClientBridgeMessage) {
-  addToast('info', i18n.t('messageHandler.autoSkipClarification'));
+  showFeedback('info', i18n.t('messageHandler.autoSkipClarification'));
 }
 /**
  * 处理代理状态更新消息

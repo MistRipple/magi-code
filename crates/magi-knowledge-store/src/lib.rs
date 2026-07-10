@@ -125,6 +125,8 @@ pub struct KnowledgeStore {
     state: Arc<RwLock<KnowledgeState>>,
     search_engines: WorkspaceSearchEngines,
     watchers: WorkspaceWatchers,
+    index_builds: Arc<Mutex<HashMap<WorkspaceId, bool>>>,
+    index_outcomes: Arc<RwLock<HashMap<WorkspaceId, code_scanner::CodeIndexScanOutcome>>>,
 }
 
 impl std::fmt::Debug for KnowledgeStore {
@@ -162,6 +164,8 @@ impl KnowledgeStore {
             state: Arc::new(RwLock::new(state)),
             search_engines: Arc::default(),
             watchers: Arc::default(),
+            index_builds: Arc::default(),
+            index_outcomes: Arc::default(),
         }
     }
 
@@ -191,6 +195,7 @@ impl KnowledgeStore {
         let outcome = code_scanner::scan_workspace(&root);
         let Some(summary) = outcome.summary.as_ref() else {
             self.delete_code_index_for_workspace(workspace_id);
+            self.record_workspace_index_outcome(workspace_id, outcome.clone());
             return outcome;
         };
         if let Some(ingestion) = code_scanner::code_index_ingestion_for_summary(&root, summary) {
@@ -214,7 +219,71 @@ impl KnowledgeStore {
         // 与索引构建原子地起文件监听：变更去抖后转发到增量更新。
         // 收敛 daemon 启动与 API 注册两条路径——所有 build 调用点自动获得 watcher。
         self.spawn_watcher(workspace_id, &root);
+        self.record_workspace_index_outcome(workspace_id, outcome.clone());
         outcome
+    }
+
+    pub fn begin_workspace_index_build(&self, workspace_id: &WorkspaceId) -> bool {
+        let mut builds = self
+            .index_builds
+            .lock()
+            .expect("knowledge store index builds lock poisoned");
+        if builds.contains_key(workspace_id) {
+            return false;
+        }
+        builds.insert(workspace_id.clone(), false);
+        true
+    }
+
+    pub fn finish_workspace_index_build(&self, workspace_id: &WorkspaceId) -> bool {
+        let discard_result = self
+            .index_builds
+            .lock()
+            .expect("knowledge store index builds lock poisoned")
+            .remove(workspace_id)
+            .unwrap_or(false);
+        if discard_result {
+            self.delete_code_index_for_workspace(workspace_id);
+        }
+        discard_result
+    }
+
+    pub fn workspace_index_building(&self, workspace_id: &WorkspaceId) -> bool {
+        self.index_builds
+            .lock()
+            .expect("knowledge store index builds lock poisoned")
+            .contains_key(workspace_id)
+    }
+
+    pub fn workspace_index_build_cancelled(&self, workspace_id: &WorkspaceId) -> bool {
+        self.index_builds
+            .lock()
+            .expect("knowledge store index builds lock poisoned")
+            .get(workspace_id)
+            .copied()
+            .unwrap_or(false)
+    }
+
+    pub fn workspace_index_outcome(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Option<code_scanner::CodeIndexScanOutcome> {
+        self.index_outcomes
+            .read()
+            .expect("knowledge store index outcomes read lock poisoned")
+            .get(workspace_id)
+            .cloned()
+    }
+
+    fn record_workspace_index_outcome(
+        &self,
+        workspace_id: &WorkspaceId,
+        outcome: code_scanner::CodeIndexScanOutcome,
+    ) {
+        self.index_outcomes
+            .write()
+            .expect("knowledge store index outcomes write lock poisoned")
+            .insert(workspace_id.clone(), outcome);
     }
 
     /// 为指定 workspace 起文件监听，把去抖后的变更转发到代码索引增量更新。
@@ -595,6 +664,10 @@ impl KnowledgeStore {
     pub fn delete_code_index_for_workspace(&self, workspace_id: &WorkspaceId) {
         let _ = self.delete(&workspace_project_code_index_id(workspace_id));
         self.clear_workspace_index_runtime(workspace_id);
+        self.index_outcomes
+            .write()
+            .expect("knowledge store index outcomes write lock poisoned")
+            .remove(workspace_id);
     }
 
     pub fn clear(&self) {
@@ -615,6 +688,18 @@ impl KnowledgeStore {
             .write()
             .expect("knowledge store watchers write lock poisoned")
             .clear();
+        for cancelled in self
+            .index_builds
+            .lock()
+            .expect("knowledge store index builds lock poisoned")
+            .values_mut()
+        {
+            *cancelled = true;
+        }
+        self.index_outcomes
+            .write()
+            .expect("knowledge store index outcomes write lock poisoned")
+            .clear();
     }
 
     pub fn clear_workspace(&self, workspace_id: &WorkspaceId) {
@@ -628,6 +713,18 @@ impl KnowledgeStore {
             let _ = self.delete(&knowledge_id);
         }
         self.clear_workspace_index_runtime(workspace_id);
+        if let Some(cancelled) = self
+            .index_builds
+            .lock()
+            .expect("knowledge store index builds lock poisoned")
+            .get_mut(workspace_id)
+        {
+            *cancelled = true;
+        }
+        self.index_outcomes
+            .write()
+            .expect("knowledge store index outcomes write lock poisoned")
+            .remove(workspace_id);
     }
 }
 

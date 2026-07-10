@@ -7,8 +7,7 @@
 //!   未来格式漂移导致静默错读。
 //! - **存在性即可选**：metrics.md 在第一次记账前不存在，`load` 返回 `Ok(None)`；
 //!   `record_turn` 自动 create-or-update。
-//! - **反孤儿**：[`magi_mission::MissionAggregate::metrics`] 通过本 crate
-//!   读取，保证读端在 §1.4 聚合根上有显式调用方。
+//! - **现役用途**：为任务执行保留 mission 维度的 turn、token 和耗时累计。
 //!
 //! 文件格式（v1）——YAML 风格 frontmatter + 空 body：
 //! ```text
@@ -22,7 +21,6 @@
 //! first_turn_started_at: 1715000000000
 //! last_turn_finished_at: 1715000540000
 //! wall_clock_millis: 540000
-//! last_lifecycle_phase: executing
 //! ---
 //! ```
 //!
@@ -34,7 +32,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
-use magi_core::{MissionId, MissionLifecyclePhase, UtcMillis, WorkspaceRootPath};
+use magi_core::{MissionId, UtcMillis, WorkspaceRootPath};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -53,7 +51,6 @@ pub struct MissionMetrics {
     pub first_turn_started_at: Option<UtcMillis>,
     pub last_turn_finished_at: Option<UtcMillis>,
     pub wall_clock_millis: u64,
-    pub last_lifecycle_phase: Option<MissionLifecyclePhase>,
 }
 
 impl MissionMetrics {
@@ -68,7 +65,6 @@ impl MissionMetrics {
             first_turn_started_at: None,
             last_turn_finished_at: None,
             wall_clock_millis: 0,
-            last_lifecycle_phase: None,
         }
     }
 
@@ -89,7 +85,6 @@ impl MissionMetrics {
         self.last_turn_finished_at = Some(usage.finished_at);
         let delta = usage.finished_at.0.saturating_sub(usage.started_at.0);
         self.wall_clock_millis = self.wall_clock_millis.saturating_add(delta);
-        self.last_lifecycle_phase = usage.phase;
     }
 }
 
@@ -100,7 +95,6 @@ pub struct TurnUsage {
     pub completion_tokens: u64,
     pub started_at: UtcMillis,
     pub finished_at: UtcMillis,
-    pub phase: Option<MissionLifecyclePhase>,
 }
 
 #[derive(Debug, Error)]
@@ -223,13 +217,6 @@ fn render_metrics(metrics: &MissionMetrics) -> String {
         "wall_clock_millis: {}\n",
         metrics.wall_clock_millis
     ));
-    out.push_str(&format!(
-        "last_lifecycle_phase: {}\n",
-        metrics
-            .last_lifecycle_phase
-            .map(|p| p.as_str().to_string())
-            .unwrap_or_else(|| "null".to_string())
-    ));
     out.push_str("---\n");
     out
 }
@@ -259,7 +246,6 @@ fn parse_metrics(path: &Path, raw: &str) -> Result<MissionMetrics, MissionMetric
     let mut first_turn_started_at: Option<UtcMillis> = None;
     let mut last_turn_finished_at: Option<UtcMillis> = None;
     let mut wall_clock_millis: u64 = 0;
-    let mut last_lifecycle_phase: Option<MissionLifecyclePhase> = None;
 
     for line in inner.lines() {
         let line = line.trim();
@@ -294,9 +280,6 @@ fn parse_metrics(path: &Path, raw: &str) -> Result<MissionMetrics, MissionMetric
                 last_turn_finished_at = parse_opt_millis(path, key, value)?;
             }
             "wall_clock_millis" => wall_clock_millis = parse_u64(path, key, value)?,
-            "last_lifecycle_phase" => {
-                last_lifecycle_phase = parse_opt_phase(path, value)?;
-            }
             _ => {}
         }
     }
@@ -320,7 +303,6 @@ fn parse_metrics(path: &Path, raw: &str) -> Result<MissionMetrics, MissionMetric
         first_turn_started_at,
         last_turn_finished_at,
         wall_clock_millis,
-        last_lifecycle_phase,
     })
 }
 
@@ -342,31 +324,10 @@ fn parse_opt_millis(
     Ok(Some(UtcMillis(parse_u64(path, key, value)?)))
 }
 
-fn parse_opt_phase(
-    path: &Path,
-    value: &str,
-) -> Result<Option<MissionLifecyclePhase>, MissionMetricsError> {
-    Ok(match value {
-        "null" => None,
-        "charter_draft" => Some(MissionLifecyclePhase::CharterDraft),
-        "awaiting_human_checkpoint" => Some(MissionLifecyclePhase::AwaitingHumanCheckpoint),
-        "plan_ready" => Some(MissionLifecyclePhase::PlanReady),
-        "executing" => Some(MissionLifecyclePhase::Executing),
-        "all_steps_completed" => Some(MissionLifecyclePhase::AllStepsCompleted),
-        other => {
-            return Err(MissionMetricsError::ParseError {
-                path: path.to_path_buf(),
-                reason: format!("未知 last_lifecycle_phase: {other}"),
-            });
-        }
-    })
-}
-
 /// 跨 workspace 复用 `MissionMetricsStore` 的轻量缓存。
 ///
-/// 与 `MissionCharterRegistry` 等同构：daemon bootstrap 构造一次后通过
-/// builder 注入 dispatcher，dispatch 路径用 `get_or_open` 拿到 per-workspace
-/// 的 store 写入。
+/// daemon bootstrap 构造一次后通过 builder 注入 dispatcher，dispatch 路径用
+/// `get_or_open` 拿到 per-workspace 的 store 写入。
 pub struct MissionMetricsRegistry {
     inner: RwLock<HashMap<String, Arc<MissionMetricsStore>>>,
     home: PathBuf,
@@ -436,7 +397,6 @@ mod tests {
                     completion_tokens: 30,
                     started_at: UtcMillis(1_000),
                     finished_at: UtcMillis(1_500),
-                    phase: Some(MissionLifecyclePhase::Executing),
                 },
             )
             .unwrap();
@@ -453,7 +413,6 @@ mod tests {
                     completion_tokens: 20,
                     started_at: UtcMillis(2_000),
                     finished_at: UtcMillis(2_300),
-                    phase: Some(MissionLifecyclePhase::AllStepsCompleted),
                 },
             )
             .unwrap();
@@ -464,11 +423,6 @@ mod tests {
         assert_eq!(second.wall_clock_millis, 800);
         assert_eq!(second.first_turn_started_at, Some(UtcMillis(1_000)));
         assert_eq!(second.last_turn_finished_at, Some(UtcMillis(2_300)));
-        assert_eq!(
-            second.last_lifecycle_phase,
-            Some(MissionLifecyclePhase::AllStepsCompleted)
-        );
-
         let reloaded = store.load(&mid).unwrap().unwrap();
         assert_eq!(reloaded, second);
     }
@@ -479,7 +433,7 @@ mod tests {
         let mid = MissionId::new("M-3");
         let path = store.file_path(&mid);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let raw = "---\nschema_version: 999\nmission_id: M-3\nturn_count: 0\ntotal_prompt_tokens: 0\ntotal_completion_tokens: 0\ntotal_tokens: 0\nfirst_turn_started_at: null\nlast_turn_finished_at: null\nwall_clock_millis: 0\nlast_lifecycle_phase: null\n---\n";
+        let raw = "---\nschema_version: 999\nmission_id: M-3\nturn_count: 0\ntotal_prompt_tokens: 0\ntotal_completion_tokens: 0\ntotal_tokens: 0\nfirst_turn_started_at: null\nlast_turn_finished_at: null\nwall_clock_millis: 0\n---\n";
         std::fs::write(&path, raw).unwrap();
         let err = store.load(&mid).unwrap_err();
         assert!(matches!(
@@ -504,7 +458,6 @@ mod tests {
                     completion_tokens: 1,
                     started_at: UtcMillis(10),
                     finished_at: UtcMillis(20),
-                    phase: None,
                 },
             )
             .unwrap();

@@ -607,7 +607,7 @@
     {:else if activeTab.kind === 'agent'}
       {@const agentPayload = activeTab.payload as AgentTabPayload}
       <AgentTabContent
-        taskId={agentPayload.taskId}
+        agentRunId={agentPayload.agentRunId}
         workspaceId={agentPayload.workspaceId}
         workspacePath={agentPayload.workspacePath}
         sessionId={agentPayload.sessionId}

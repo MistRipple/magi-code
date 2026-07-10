@@ -20,7 +20,7 @@ export interface TimelineRenderScope {
 /**
  * 时间线显示上下文：
  * - `thread`：主对话区，渲染主线代理的 artifacts
- * - `task`：右侧 RightPane 代理 tab，按 `metadata.taskId` 过滤该代理自身的 artifacts
+ * - `task`：右侧 RightPane 代理运行 tab，按 `metadata.taskId` 过滤该代理自身的 artifacts
  */
 export type TimelineDisplayContext = 'thread' | 'task';
 
@@ -85,7 +85,7 @@ function buildProjectionPanelView(
     return { items, messages };
   }
 
-  // `task` 上下文：按 metadata.taskId 过滤所有 artifacts（保留 projection.artifacts 原序）。
+  // `task` 上下文（代理运行）：按 metadata.taskId 过滤所有 artifacts（保留 projection.artifacts 原序）。
   const targetTaskId = typeof taskId === 'string' ? taskId.trim() : '';
   if (!targetTaskId) {
     return { items, messages };

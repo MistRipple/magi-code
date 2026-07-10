@@ -544,6 +544,8 @@ mod tests {
             }],
             notifications: vec![],
             canonical_turns: vec![],
+            goals: vec![],
+            todo_lists: vec![],
             thread_registry: vec![],
             execution_sidecar_store: SessionExecutionSidecarStoreState {
                 runtime_sidecars: vec![],
@@ -721,6 +723,8 @@ mod tests {
                 .collect(),
             notifications: vec![],
             canonical_turns: vec![],
+            goals: vec![],
+            todo_lists: vec![],
             thread_registry: vec![],
             execution_sidecar_store: SessionExecutionSidecarStoreState {
                 runtime_sidecars: vec![],
@@ -970,6 +974,8 @@ mod tests {
             }],
             notifications: vec![],
             canonical_turns: vec![],
+            goals: vec![],
+            todo_lists: vec![],
             thread_registry: vec![],
             execution_sidecar_store: SessionExecutionSidecarStoreState {
                 runtime_sidecars: vec![],
@@ -1522,6 +1528,8 @@ mod tests {
             ],
             notifications: vec![],
             canonical_turns: vec![],
+            goals: vec![],
+            todo_lists: vec![],
             thread_registry: vec![],
             execution_sidecar_store: SessionExecutionSidecarStoreState {
                 runtime_sidecars: vec![],
@@ -1703,6 +1711,8 @@ mod tests {
                 timeline: vec![],
                 notifications: vec![],
                 canonical_turns: vec![],
+                goals: vec![],
+                todo_lists: vec![],
                 thread_registry: vec![],
                 execution_sidecar_store: SessionExecutionSidecarStoreState {
                     runtime_sidecars: vec![],

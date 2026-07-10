@@ -39,6 +39,13 @@ pub enum BuiltinToolName {
     // ── 工具目录 / 健康诊断 ──
     /// 列出当前内置工具目录、访问模式、风险等级与 schema 健康状态。
     ToolCatalog,
+    // ── Goal 目标模式（会话级一等产品实体）──
+    /// 读取当前会话的目标状态、预算与记账信息。
+    GetGoal,
+    /// 创建当前会话的主动目标。一个会话同一时间只能存在一个未结束目标。
+    CreateGoal,
+    /// 将当前会话目标标记为完成或阻塞；暂停、预算限制等由系统状态控制。
+    UpdateGoal,
     // ── 协调器（任务系统 L10，仅 coordinator_mode 角色可见）──
     /// 派发新的代理执行子任务。该工具只创建代理并投递初始任务消息；
     /// 后续由 agent_wait 收集代理终态结果。
@@ -54,45 +61,6 @@ pub enum BuiltinToolName {
     /// `~/.magi/projects/{slug}/memory/`，跨 conversation 自动加载到 system prompt。
     /// 由 orchestration 层拦截，不进入 ToolRegistry。
     MemoryWrite,
-    // ── Mission 宪章（任务系统 Tier 4 / L15）──
-    /// 增量写入当前 mission 的 charter（title / goal / success_criteria /
-    /// constraints / stakeholders）。物理存储在
-    /// `~/.magi/projects/{slug}/missions/{mission_id}/charter.md`。
-    /// 由 orchestration 层拦截，不进入 ToolRegistry。
-    MissionCharterWrite,
-    // ── Mission 执行计划（任务系统 Tier 4 / L16）──
-    /// 整体替换当前 mission 的 plan.steps（id / content / status / depends_on / notes）。
-    /// 物理存储在 `~/.magi/projects/{slug}/missions/{mission_id}/plan.md`，
-    /// 每次 Turn 起始把当前 plan 自动注入 orchestrator system prompt。
-    /// 由 orchestration 层拦截，不进入 ToolRegistry。
-    PlanWrite,
-    // ── Mission KnowledgeGraph（任务系统 Tier 4 / L18）──
-    /// 按 (kind, id) upsert 当前 mission 的 KnowledgeGraph 事实（symbol / decision / risk）。
-    /// 物理存储在 `~/.magi/projects/{slug}/missions/{mission_id}/knowledge.md`，
-    /// 每次 Turn 起始把当前 KG 自动注入 orchestrator system prompt。
-    /// 由 orchestration 层拦截，不进入 ToolRegistry。
-    KgWrite,
-    // ── Mission ValidationRunner（任务系统 Tier 4 / L19）──
-    /// 把单条验证结果（test_suite / type_check / integration_smoke / benchmark）按
-    /// (plan_step_id, kind) upsert 进当前 mission 的 ValidationReport。
-    /// 物理存储在 `~/.magi/projects/{slug}/missions/{mission_id}/validation.md`，
-    /// 每次 Turn 起始把当前 Validation 现状自动注入 orchestrator system prompt。
-    /// 由 orchestration 层拦截，不进入 ToolRegistry。
-    ValidationRecord,
-    // ── Mission Checkpoint（任务系统 Tier 4 / L20）──
-    /// Append-only 写入一条 mission 级检查点（process_restart / context_compaction /
-    /// phase_transition / manual），用于事后恢复 mission 状态。
-    /// 物理存储在 `~/.magi/projects/{slug}/missions/{mission_id}/checkpoints.md`，
-    /// 每次 Turn 起始把最新若干检查点自动注入 orchestrator system prompt。
-    /// 由 orchestration 层拦截，不进入 ToolRegistry。
-    Checkpoint,
-    // ── Mission HumanCheckpoint（任务系统 Tier 4 / L21）──
-    /// 由 orchestrator 申请的人工审核点，在 operator 给出 approve / reject 之前
-    /// mission 会进入 awaiting_human 状态。
-    /// 物理存储在 `~/.magi/projects/{slug}/missions/{mission_id}/human_checkpoints.md`，
-    /// 每次 Turn 起始把当前待解决与最近若干已解决记录注入 orchestrator system prompt。
-    /// 由 orchestration 层拦截，不进入 ToolRegistry。
-    HumanCheckpointRequest,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -101,7 +69,7 @@ pub(crate) enum RestrictedWriteProfilePolicy {
 }
 
 impl BuiltinToolName {
-    pub const ALL: [Self; 35] = [
+    pub const ALL: [Self; 32] = [
         Self::FileRead,
         Self::ViewImage,
         Self::FileWrite,
@@ -127,16 +95,13 @@ impl BuiltinToolName {
         Self::KnowledgeQuery,
         Self::CodeSymbols,
         Self::ToolCatalog,
+        Self::GetGoal,
+        Self::CreateGoal,
+        Self::UpdateGoal,
         Self::AgentSpawn,
         Self::AgentWait,
         Self::TodoWrite,
         Self::MemoryWrite,
-        Self::MissionCharterWrite,
-        Self::PlanWrite,
-        Self::KgWrite,
-        Self::ValidationRecord,
-        Self::Checkpoint,
-        Self::HumanCheckpointRequest,
     ];
 
     pub fn as_str(&self) -> &'static str {
@@ -166,16 +131,13 @@ impl BuiltinToolName {
             Self::KnowledgeQuery => "knowledge_query",
             Self::CodeSymbols => "code_symbols",
             Self::ToolCatalog => "tool_catalog",
+            Self::GetGoal => "get_goal",
+            Self::CreateGoal => "create_goal",
+            Self::UpdateGoal => "update_goal",
             Self::AgentSpawn => "agent_spawn",
             Self::AgentWait => "agent_wait",
             Self::TodoWrite => "todo_write",
             Self::MemoryWrite => "memory_write",
-            Self::MissionCharterWrite => "mission_charter_write",
-            Self::PlanWrite => "plan_write",
-            Self::KgWrite => "kg_write",
-            Self::ValidationRecord => "validation_record",
-            Self::Checkpoint => "checkpoint_create",
-            Self::HumanCheckpointRequest => "human_checkpoint_request",
         }
     }
 
@@ -203,15 +165,10 @@ impl BuiltinToolName {
             Self::DiagramRender => "visualization",
             Self::KnowledgeQuery => "knowledge",
             Self::ToolCatalog => "tooling",
+            Self::GetGoal | Self::CreateGoal | Self::UpdateGoal => "session_goal",
             Self::AgentSpawn | Self::AgentWait => "agent_coordination",
             Self::TodoWrite => "session_state",
             Self::MemoryWrite => "project_memory",
-            Self::MissionCharterWrite
-            | Self::PlanWrite
-            | Self::KgWrite
-            | Self::ValidationRecord
-            | Self::Checkpoint
-            | Self::HumanCheckpointRequest => "mission_governance",
         }
     }
 
@@ -242,16 +199,13 @@ impl BuiltinToolName {
             "knowledge_query" => Some(Self::KnowledgeQuery),
             "code_symbols" => Some(Self::CodeSymbols),
             "tool_catalog" => Some(Self::ToolCatalog),
+            "get_goal" => Some(Self::GetGoal),
+            "create_goal" => Some(Self::CreateGoal),
+            "update_goal" => Some(Self::UpdateGoal),
             "agent_spawn" => Some(Self::AgentSpawn),
             "agent_wait" => Some(Self::AgentWait),
             "todo_write" => Some(Self::TodoWrite),
             "memory_write" => Some(Self::MemoryWrite),
-            "mission_charter_write" => Some(Self::MissionCharterWrite),
-            "plan_write" => Some(Self::PlanWrite),
-            "kg_write" => Some(Self::KgWrite),
-            "validation_record" => Some(Self::ValidationRecord),
-            "checkpoint_create" => Some(Self::Checkpoint),
-            "human_checkpoint_request" => Some(Self::HumanCheckpointRequest),
             _ => None,
         }
     }
@@ -267,14 +221,10 @@ impl BuiltinToolName {
                 | Self::FileCopy
                 | Self::FileMove
                 | Self::AgentSpawn
+                | Self::CreateGoal
+                | Self::UpdateGoal
                 | Self::TodoWrite
                 | Self::MemoryWrite
-                | Self::MissionCharterWrite
-                | Self::PlanWrite
-                | Self::KgWrite
-                | Self::ValidationRecord
-                | Self::Checkpoint
-                | Self::HumanCheckpointRequest
         )
     }
 
@@ -318,14 +268,10 @@ impl BuiltinToolName {
             | Self::FileCopy
             | Self::FileMove
             | Self::AgentSpawn
+            | Self::CreateGoal
+            | Self::UpdateGoal
             | Self::TodoWrite
-            | Self::MemoryWrite
-            | Self::MissionCharterWrite
-            | Self::PlanWrite
-            | Self::KgWrite
-            | Self::ValidationRecord
-            | Self::Checkpoint
-            | Self::HumanCheckpointRequest => RestrictedWriteProfilePolicy::AutoAllowed,
+            | Self::MemoryWrite => RestrictedWriteProfilePolicy::AutoAllowed,
             _ => return None,
         };
         Some(policy)
@@ -356,14 +302,11 @@ impl BuiltinToolName {
                 | Self::ProcessList
                 | Self::AgentSpawn
                 | Self::AgentWait
+                | Self::GetGoal
+                | Self::CreateGoal
+                | Self::UpdateGoal
                 | Self::TodoWrite
                 | Self::MemoryWrite
-                | Self::MissionCharterWrite
-                | Self::PlanWrite
-                | Self::KgWrite
-                | Self::ValidationRecord
-                | Self::Checkpoint
-                | Self::HumanCheckpointRequest
         )
     }
 
@@ -387,15 +330,12 @@ impl BuiltinToolName {
             | Self::KnowledgeQuery
             | Self::CodeSymbols
             | Self::ToolCatalog
+            | Self::GetGoal
+            | Self::CreateGoal
+            | Self::UpdateGoal
             | Self::AgentWait
             | Self::TodoWrite
-            | Self::MemoryWrite
-            | Self::MissionCharterWrite
-            | Self::PlanWrite
-            | Self::KgWrite
-            | Self::ValidationRecord
-            | Self::Checkpoint
-            | Self::HumanCheckpointRequest => RiskLevel::Low,
+            | Self::MemoryWrite => RiskLevel::Low,
             Self::FileWrite
             | Self::FilePatch
             | Self::ApplyPatch
@@ -549,6 +489,15 @@ impl BuiltinToolName {
                 - 内置工具读取 BuiltinToolName::ALL 单一注册源\n\
                 - 外接工具只读取 daemon 注入的 skill/MCP 运行时快照，不扫描文件系统"
             }
+            Self::GetGoal => {
+                "读取当前会话的 Goal 状态、预算和累计用量。用于长目标推进前确认当前目标是否仍 active，或在继续执行前判断是否已 complete / blocked / budget_limited。"
+            }
+            Self::CreateGoal => {
+                "为当前会话创建一个主动 Goal。Goal 是用户长期目标的一等产品实体，负责跨多轮自动推进、预算记账和终止状态；同一会话同一时间只能存在一个未结束 Goal。"
+            }
+            Self::UpdateGoal => {
+                "更新当前会话 Goal 的终态。模型只能把目标标记为 complete 或 blocked；pause、budget_limited、usage_limited 由用户或系统控制，不能由模型伪造。"
+            }
             Self::AgentSpawn => {
                 "向已注册的代理角色派发一个子任务（architect / executor / reviewer 等）。该工具只创建代理并投递初始任务消息，立即返回代理 task_id；后续使用 agent_wait 收集代理终态结果。若返回 status=degraded，表示代理当前不可用，父代理必须改派其他可用角色或由主线继续完成，不能直接停止任务。\n\n\
                 # 何时用\n\
@@ -560,6 +509,9 @@ impl BuiltinToolName {
                 - 主线可以直接分析、读写文件、运行命令和验证；不要把 1-3 步即可完成的任务强行派发代理\n\
                 - 代理适合处理边界清晰、可并行、不阻塞主线下一步的专项任务\n\
                 - 代理运行中，主线应继续推进不重叠工作；不要空等，也不要重复做已经委派的同一件事\n\n\
+                # 并发上限\n\
+                - 当前会话最多 4 条活跃执行分支（含主线），因此同一时刻最多 3 个子代理\n\
+                - 如果需要超过 3 个子代理，先派发一批并 agent_wait 收集结果，再继续派发下一批\n\n\
                 # 权限模式\n\
                 - access_mode 必须表达本次代理是否允许写入：read_only 禁止写文件和写类 shell；read_write 按父任务策略允许必要写入\n\
                 - 用户要求只读、审查、探索、方案分析、风险验证时使用 read_only\n\
@@ -616,24 +568,6 @@ impl BuiltinToolName {
             }
             Self::MemoryWrite => {
                 "对当前工作区的 ProjectMemory 条目进行写入或删除。Memory 文件存于 ~/.magi/projects/<slug>/memory/，每次新会话开始时自动加载到系统提示。使用 action: save 进行 upsert（覆盖同 file_stem 的文件），action: delete 删除条目。Memory 类别：user / feedback / project / reference。"
-            }
-            Self::MissionCharterWrite => {
-                "增量更新当前 mission 的章程（title / goal / success_criteria / constraints / stakeholders）。章程持久化在 ~/.magi/projects/<slug>/missions/<mission_id>/charter.md，会自动注入到 orchestrator 的提示词。至少提供一个字段；未提供的字段保持不变。"
-            }
-            Self::PlanWrite => {
-                "用一份完整的步骤列表替换当前 mission 的执行计划。每个 step 包含：id（稳定标识）、content（一行描述）、status（pending / in_progress / completed / cancelled）、depends_on（可选的依赖 step id 列表）、notes（可选）。计划持久化在 ~/.magi/projects/<slug>/missions/<mission_id>/plan.md 并自动注入 orchestrator 提示词。用于起草、演进、跟踪 mission 的多步策略。每次调用整体覆盖——请把想保留的全部 step 都传进来。"
-            }
-            Self::KgWrite => {
-                "向 mission 的 KnowledgeGraph 写入一条事实。Kind：'symbol'（代码 / 模块索引——哪些类与接口已经迁移、各自负责什么）、'decision'（架构或权衡决策，例如为什么选 SQLAlchemy 而非 Tortoise）、'risk'（执行中发现的隐患或注意点）。同一 (kind, id) 会覆盖旧事实并提升版本；设 'tombstoned': true 可在保留历史的前提下退役一条事实。KG 持久化在 ~/.magi/projects/<slug>/missions/<mission_id>/knowledge.md 并自动注入 orchestrator 提示词。"
-            }
-            Self::ValidationRecord => {
-                "为某个 Plan step 记录一次验证结果。Kind：'test_suite'（单元 / 集成测试）、'type_check'（tsc / mypy / cargo check）、'integration_smoke'（跨进程或端到端冒烟）、'benchmark'（性能 / 负载）。Outcome：'pass' / 'fail' / 'skipped'。一次验证命令跑完后立即调用——Coordinator 要求每个 Plan step 至少有一次 Pass 且无未解决的 Fail 才能算完成。同一 (plan_step_id, kind) 会覆盖并提升版本。验证结果持久化在 ~/.magi/projects/<slug>/missions/<mission_id>/validation.md 并自动注入 orchestrator 提示词。"
-            }
-            Self::Checkpoint => {
-                "为当前 mission 追加一条 Checkpoint 记录。Kind：'process_restart'（daemon 重启前后的状态记录）、'context_compaction'（对话刚被压缩，保留恢复指针）、'phase_transition'（一个主要 plan 阶段刚结束 / 开始）、'manual'（运维主动触发的安全网）。Checkpoint 仅追加；每条记录抓取一份 plan_version / kg_fact_count / workspace_commit / open conversations 的快照，未来某轮可以基于它推断如何恢复。持久化在 ~/.magi/projects/<slug>/missions/<mission_id>/checkpoints.md；最近几条会自动注入 orchestrator 提示词。"
-            }
-            Self::HumanCheckpointRequest => {
-                "请求人工评审 checkpoint，并在运维批准或拒绝前暂停自主推进。用于高风险边界：不可逆操作、含糊的权衡、大规模删除、生产部署、任何需要人工判断的环节。必填：plan_step_id（触发请求的 Plan step）与 prompt_to_human（请运维处理的问题或决策）。可选：label（短标题）与 context（自由格式补充信息）。请求后不要再对该 mission 派发新工作；解决后再恢复。持久化在 ~/.magi/projects/<slug>/missions/<mission_id>/human_checkpoints.md；待处理 + 最近已处理条目会自动注入 orchestrator 提示词。"
             }
         }
     }
@@ -952,6 +886,40 @@ impl BuiltinToolName {
                 },
                 "required": []
             }),
+            Self::GetGoal => serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "required": []
+            }),
+            Self::CreateGoal => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "objective": {
+                        "type": "string",
+                        "description": "用户要持续推进的完整目标。应保留用户给出的核心交付要求、边界和完成标准。"
+                    },
+                    "token_budget": {
+                        "type": "integer",
+                        "description": "可选 token 预算。只有用户原文明确给出 token 预算数值时才填写；未给出时必须省略。禁止自行臆造 1000、4096 等预算；预算值必须至少 16000。"
+                    }
+                },
+                "required": ["objective"]
+            }),
+            Self::UpdateGoal => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "goal_id": {
+                        "type": "string",
+                        "description": "可选。省略时更新当前会话最新 active goal。"
+                    },
+                    "status": {
+                        "type": "string",
+                        "enum": ["complete", "blocked"],
+                        "description": "模型只能提交 complete 或 blocked。pause / budget_limited / usage_limited 由用户或系统控制。"
+                    }
+                },
+                "required": ["status"]
+            }),
             Self::AgentSpawn => serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -1049,217 +1017,6 @@ impl BuiltinToolName {
                     }
                 },
                 "required": ["action", "file_stem"]
-            }),
-            Self::MissionCharterWrite => serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "title": {
-                        "type": "string",
-                        "description": "描述本 mission 交付什么的简短标题。"
-                    },
-                    "goal": {
-                        "type": "string",
-                        "description": "完整阐述用户意图，以及 mission 承诺达成的结果。"
-                    },
-                    "success_criteria": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "可验证的条目，定义 mission 何时算完成。"
-                    },
-                    "constraints": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "限定 mission 边界的硬约束（范围 / 技术 / 时间 / 策略）。"
-                    },
-                    "stakeholders": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "需要被尊重的相关人或角色。"
-                    }
-                },
-                "required": []
-            }),
-            Self::PlanWrite => serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "steps": {
-                        "type": "array",
-                        "description": "完整有序的计划步骤列表。每次调用整表替换现有计划。",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "id": {
-                                    "type": "string",
-                                    "description": "稳定标识符（如 's1'、'audit-deps'）。供 depends_on 引用。"
-                                },
-                                "content": {
-                                    "type": "string",
-                                    "description": "本步骤目标的一行描述。"
-                                },
-                                "status": {
-                                    "type": "string",
-                                    "enum": ["pending", "in_progress", "completed", "cancelled"],
-                                    "description": "步骤状态，必须显式提供。"
-                                },
-                                "depends_on": {
-                                    "type": "array",
-                                    "items": { "type": "string" },
-                                    "description": "可选的依赖步骤 id 列表，所有 id 必须在 steps 中存在。"
-                                },
-                                "notes": {
-                                    "type": "string",
-                                    "description": "本步骤的可选理由或备注。"
-                                }
-                            },
-                            "required": ["id", "content", "status"]
-                        }
-                    }
-                },
-                "required": ["steps"]
-            }),
-            Self::KgWrite => serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "kind": {
-                        "type": "string",
-                        "enum": ["symbol", "decision", "risk"],
-                        "description": "事实分类。'symbol' 用于代码/模块事实；'decision' 用于 ADR 风格的决策；'risk' 用于需要关注的隐患或约束。"
-                    },
-                    "id": {
-                        "type": "string",
-                        "description": "分类内的稳定 id。复用同一 (kind, id) 会覆盖旧事实并提升版本号。"
-                    },
-                    "content": {
-                        "type": "string",
-                        "description": "用一至几句话陈述该事实。"
-                    },
-                    "reference": {
-                        "type": "string",
-                        "description": "可选指针：文件路径、URL、ADR id 等事实来源。"
-                    },
-                    "tags": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "可选的自由标签，便于后续检索/过滤。"
-                    },
-                    "tombstoned": {
-                        "type": "boolean",
-                        "description": "置为 true 表示废弃。被废弃的事实仍保留在磁盘上，但不再注入 prompt。"
-                    }
-                },
-                "required": ["kind", "id", "content"]
-            }),
-            Self::ValidationRecord => serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "plan_step_id": {
-                        "type": "string",
-                        "description": "本次验证覆盖的 Plan 步骤 id，必须匹配当前 mission plan.md 中的某个步骤。"
-                    },
-                    "kind": {
-                        "type": "string",
-                        "enum": ["test_suite", "type_check", "integration_smoke", "benchmark"],
-                        "description": "验证类型：单元/集成测试、静态类型检查、端到端冒烟、性能基准。"
-                    },
-                    "outcome": {
-                        "type": "string",
-                        "enum": ["pass", "fail", "skipped"],
-                        "description": "验证结果。一个 Plan 步骤至少有一次 pass 且没有未解决的 fail 时才算完成。"
-                    },
-                    "command": {
-                        "type": "string",
-                        "description": "可选：产生本次结果的命令行（如 'cargo test -p magi-api'），便于后续复现。"
-                    },
-                    "evidence": {
-                        "type": "string",
-                        "description": "可选：本次运行的简短摘要（通过用例数、失败断言、性能数值等）——保持 diff 友好。"
-                    }
-                },
-                "required": ["plan_step_id", "kind", "outcome"]
-            }),
-            Self::Checkpoint => serde_json::json!({
-                "type": "object",
-                "description": "追加一条 Mission 检查点记录。恢复类型（process_restart / context_compaction / phase_transition）必须携带非空的 workspace_commit，且 open_conversations 中的每一项都必须指向 recovery_ref 或 execution_chain_ref ——不完整的恢复集会被拒绝。",
-                "properties": {
-                    "kind": {
-                        "type": "string",
-                        "enum": ["process_restart", "context_compaction", "phase_transition", "manual"],
-                        "description": "检查点分类。process_restart = daemon 重启边界；context_compaction = 会话刚被压缩；phase_transition = 一个 Plan 阶段边界；manual = 操作者触发（只有 manual 允许跳过恢复集）。"
-                    },
-                    "label": {
-                        "type": "string",
-                        "description": "简短可读的标签，方便后续读者快速挑选正确的检查点。"
-                    },
-                    "plan_version": {
-                        "type": "integer",
-                        "description": "可选：本检查点捕获的 plan 版本号（恢复时可与当前 plan diff）。"
-                    },
-                    "kg_fact_count": {
-                        "type": "integer",
-                        "description": "可选：本检查点处 mission KG 事实总数。"
-                    },
-                    "workspace_commit": {
-                        "type": "string",
-                        "description": "本检查点捕获的 workspace VCS commit / ref。恢复类型必填；仅 kind=manual 时可选。"
-                    },
-                    "open_conversations": {
-                        "type": "array",
-                        "description": "session 恢复指针列表。每项必须包含 session_id 以及 recovery_ref / execution_chain_ref 至少其一，使运行时能在重启后重建活跃 ExecutionChain / mailbox。",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "session_id": {
-                                    "type": "string",
-                                    "description": "需要可恢复 ExecutionChain 的会话标识。"
-                                },
-                                "recovery_ref": {
-                                    "type": "string",
-                                    "description": "指向 session-store 恢复 sidecar（Conversation/Mailbox 快照）的指针。recovery_ref 与 execution_chain_ref 至少存在其一。"
-                                },
-                                "execution_chain_ref": {
-                                    "type": "string",
-                                    "description": "指向活跃 ExecutionChain 日志的指针，便于恢复后重建当前任务链。"
-                                },
-                                "turn_cursor": {
-                                    "type": "integer",
-                                    "description": "可选：最后应用的轮次游标——用于检测 checkpoint 与恢复 sidecar 之间的漂移。"
-                                },
-                                "pending_mailbox": {
-                                    "type": "integer",
-                                    "description": "可选：仍未处理的 mailbox 条目数——帮助操作者判断恢复是否安全。"
-                                }
-                            },
-                            "required": ["session_id"]
-                        }
-                    },
-                    "notes": {
-                        "type": "string",
-                        "description": "可选的自由备注（例如为何记录此检查点、恢复时需注意什么）。"
-                    }
-                },
-                "required": ["kind"]
-            }),
-            Self::HumanCheckpointRequest => serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "plan_step_id": {
-                        "type": "string",
-                        "description": "触发本请求的 Plan 步骤标识（必须匹配已有的 plan 步骤 id）。"
-                    },
-                    "prompt_to_human": {
-                        "type": "string",
-                        "description": "需要操作者解决的问题或决策。请明确：可选项、权衡、以及当前语境下 'approve' 与 'reject' 各自意味着什么。"
-                    },
-                    "label": {
-                        "type": "string",
-                        "description": "可选的短标题，与待决请求一起展示在操作者面板上。"
-                    },
-                    "context": {
-                        "type": "string",
-                        "description": "可选的自由补充上下文（链接、片段、前置决策等），供操作者参考。"
-                    }
-                },
-                "required": ["plan_step_id", "prompt_to_human"]
             }),
         }
     }

@@ -20,16 +20,14 @@ import {
   approveAgentChange,
   approveAllAgentChanges,
   addAgentKnowledgeItem,
-  appendAgentNotification,
+  reportAgentIncident,
   addAgentCustomTool,
   addAgentMcpServer,
   addAgentRepository,
   clearAgentNotifications,
   clearAgentProjectKnowledge,
-  clearAgentAllTasks,
   closeAgentSession,
   connectAgentMcpServer,
-  deleteAgentTask,
   deleteAgentSession,
   deleteAgentKnowledgeItem,
   deleteAgentMcpServer,
@@ -41,7 +39,8 @@ import {
   getAgentChangeDiff,
   getAgentFilePreview,
   getAgentProjectKnowledge,
-  getAgentSessionNotifications,
+  getAgentNotifications,
+  getWorkspaceSessions,
   continueAgentSession,
   interruptAgentSession,
   interruptAgentTask,
@@ -52,7 +51,9 @@ import {
   markAllAgentNotificationsRead,
   refreshAgentMcpTools,
   refreshAgentRepository,
+  reindexAgentProjectKnowledge,
   removeAgentNotification,
+  resolveAgentNotification,
   removeAgentInstalledSkill,
   renameAgentSession,
   resetAgentExecutionStats,
@@ -69,7 +70,6 @@ import {
   testAgentAuxiliaryConnection,
   testAgentOrchestratorConnection,
   testAgentWorkerConnection,
-  startAgentTask,
   updateAgentKnowledgeItem,
   updateAgentMcpServer,
   updateAgentRepository,
@@ -117,14 +117,14 @@ import {
 } from '../protocol/canonical-turn';
 import type { SseConnection } from '../transport';
 import {
-  activateTaskProjectionSession,
-  fetchTaskProjection,
-  startAutoRefresh as startTaskAutoRefresh,
-  getTaskProjectionState,
-  clearTaskProjection,
-} from '../../stores/task-projection-store.svelte';
+  activateAgentRunSession,
+  fetchAgentRunProjection,
+  startAutoRefresh as startAgentRunAutoRefresh,
+  getAgentRunState,
+  clearAgentRunProjection,
+} from '../../stores/agent-run-store.svelte';
+import { refreshCurrentGoal } from '../../stores/goal-store.svelte';
 import { sanitizeSvgContent } from '../svg-sanitizer';
-import { RustDaemonClient } from '../rust-daemon-client';
 import {
   dequeueQueuedMessage,
   enqueueQueuedMessage,
@@ -143,6 +143,8 @@ import { resolveModelListFetchBlockReason } from '../model-governance';
 import type { QueuedMessage } from '../../types/message';
 
 const listeners: Set<(message: ClientBridgeMessage) => void> = new Set();
+const pendingBridgeMessages: ClientBridgeMessage[] = [];
+const MAX_PENDING_BRIDGE_MESSAGES = 64;
 let bridgeListenerRegistered = false;
 let currentWorkspaceId = '';
 let currentWorkspacePath = '';
@@ -495,7 +497,7 @@ function normalizeBridgeStringArray(value: unknown): string[] {
     : [];
 }
 
-interface BootstrapTaskTrackingHints {
+interface BootstrapAgentRunTrackingHints {
   rootTaskId: string;
   activeTaskIds: string[];
 }
@@ -531,7 +533,7 @@ function reconcileCurrentInterruptTaskId(activeTaskIds: string[]): void {
   }
 }
 
-function extractBootstrapTaskTrackingHints(payload: BootstrapPayload, rawPayload: unknown): BootstrapTaskTrackingHints {
+function extractBootstrapAgentRunTrackingHints(payload: BootstrapPayload, rawPayload: unknown): BootstrapAgentRunTrackingHints {
   const rawBootstrap = asBridgeRecord(rawPayload);
   const expectedSessionId = trimBridgeString(payload.sessionId);
 
@@ -970,6 +972,13 @@ function emitMessage(message: ClientBridgeMessage): void {
    }
    return; // runtimeEpoch 是内部控制消息，不广播给前端组件
  }
+  if (listeners.size === 0) {
+    pendingBridgeMessages.push(message);
+    if (pendingBridgeMessages.length > MAX_PENDING_BRIDGE_MESSAGES) {
+      pendingBridgeMessages.splice(0, pendingBridgeMessages.length - MAX_PENDING_BRIDGE_MESSAGES);
+    }
+    return;
+  }
   listeners.forEach((listener) => {
     try {
       listener(message);
@@ -1404,7 +1413,7 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
           setCurrentInterruptTaskId(acceptedActionTaskId);
         }
         if (acceptedRootTaskId) {
-          initTaskTracking(acceptedSessionId, acceptedRootTaskId, currentWorkspaceId, currentWorkspacePath);
+          initAgentRunTracking(acceptedSessionId, acceptedRootTaskId, currentWorkspaceId, currentWorkspacePath);
         }
       }
     }
@@ -1446,11 +1455,11 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
   }
 
   // Notify listeners about task-domain SSE events so lightweight stores
-  // (e.g. task-projection-store) can react without waiting for a full bootstrap refresh.
-  const isTaskProjectionRelevantEvent = eventType.startsWith('task.')
+  // (e.g. agent-run-store) can react without waiting for a full bootstrap refresh.
+  const isAgentRunRelevantEvent = eventType.startsWith('task.')
     || eventType.startsWith('mission.')
     || eventType.startsWith('assignment.');
-  if (isTaskProjectionRelevantEvent) {
+  if (isAgentRunRelevantEvent) {
     emitMessage({
       type: 'rustTaskEvent',
       eventType,
@@ -1473,6 +1482,13 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
     }
   }
 
+  if (eventType.startsWith('session.turn.')) {
+    const sessionId = rustEventSessionId(event) || currentSessionId;
+    if (sessionId) {
+      void refreshCurrentGoal(sessionId, currentWorkspaceId, currentWorkspacePath);
+    }
+  }
+
   if (eventType.startsWith('message.') && event.payload) {
     emitDataMessage('messageCreated', {
       sessionId: event.payload.session_id ?? event.payload.sessionId ?? '',
@@ -1486,18 +1502,16 @@ function emitBridgeErrorToast(
   action: string,
   _error: unknown,
   options: {
-    persistToCenter?: boolean;
+    reportIncident?: boolean;
     actionRequired?: boolean;
-    countUnread?: boolean;
     duration?: number;
   } = {},
 ): void {
   const normalizedAction = action.trim() || i18n.t('bridge.toast.defaultAction');
   const content = i18n.t('bridge.toast.actionFailed', { action: normalizedAction });
   const now = Date.now();
-  const persistToCenter = options.persistToCenter ?? true;
+  const incident = options.reportIncident !== false;
   const actionRequired = options.actionRequired ?? true;
-  const countUnread = options.countUnread ?? persistToCenter;
   const message = createNotifyMessage(
     content,
     'error',
@@ -1506,11 +1520,9 @@ function emitBridgeErrorToast(
     {
       title: i18n.t('bridge.toast.requestFailedTitle'),
       displayMode: 'toast',
-      category: 'incident',
+      category: incident ? 'incident' : 'feedback',
       source: 'bridge-runtime',
       actionRequired,
-      persistToCenter,
-      countUnread,
     },
     {
       id: `web-bridge-error-${now}`,
@@ -1524,9 +1536,6 @@ function emitBridgeErrorToast(
 function emitBridgeSuccessToast(
   action: string,
   detail?: string,
-  options: {
-    displayMode?: 'toast' | 'notification_center';
-  } = {},
 ): void {
   const normalizedAction = action.trim() || i18n.t('bridge.toast.defaultAction');
   const content = detail?.trim() || i18n.t('bridge.toast.actionSucceeded', {
@@ -1540,12 +1549,10 @@ function emitBridgeSuccessToast(
     undefined,
     {
       title: i18n.t('bridge.toast.operationCompletedTitle'),
-      displayMode: options.displayMode || 'toast',
-      category: 'audit',
+      displayMode: 'toast',
+      category: 'feedback',
       source: 'bridge-runtime',
       actionRequired: false,
-      persistToCenter: true,
-      countUnread: false,
     },
     {
       id: `web-bridge-success-${now}`,
@@ -1559,9 +1566,6 @@ function emitBridgeSuccessToast(
 function emitBridgeInfoToast(
   action: string,
   detail: string,
-  options: {
-    displayMode?: 'toast' | 'notification_center';
-  } = {},
 ): void {
   const normalizedAction = action.trim() || i18n.t('bridge.toast.defaultInfoAction');
   const content = detail.trim() || normalizedAction;
@@ -1573,12 +1577,10 @@ function emitBridgeInfoToast(
     undefined,
     {
       title: i18n.t('bridge.toast.infoTitle'),
-      displayMode: options.displayMode || 'toast',
-      category: 'audit',
+      displayMode: 'toast',
+      category: 'feedback',
       source: 'bridge-runtime',
       actionRequired: false,
-      persistToCenter: true,
-      countUnread: false,
     },
     {
       id: `web-bridge-info-${now}`,
@@ -1653,9 +1655,8 @@ function reportNotificationOperationFailure(
     return;
   }
   emitBridgeErrorToast(action, error, {
-    persistToCenter: false,
+    reportIncident: false,
     actionRequired: false,
-    countUnread: false,
   });
 }
 
@@ -1811,6 +1812,23 @@ function isCurrentBootstrapRequest(bindingKey: string, requestSeq: number): bool
     && bindingKey === bootstrapBindingKey(resolveWorkspaceQuery());
 }
 
+function bootstrapRequestCanClearMissingSession(
+  requestBinding: { workspaceId: string; workspacePath: string; sessionId: string },
+  requestSeq: number,
+): boolean {
+  if (requestSeq !== bootstrapRequestSeq) {
+    return false;
+  }
+  const currentBinding = resolveWorkspaceQuery();
+  const sameWorkspace = requestBinding.workspaceId
+    ? currentBinding.workspaceId === requestBinding.workspaceId
+    : currentBinding.workspacePath === requestBinding.workspacePath;
+  if (!sameWorkspace) {
+    return false;
+  }
+  return !currentBinding.sessionId || currentBinding.sessionId === requestBinding.sessionId;
+}
+
 function settingsBootstrapBindingKey(
   workspaceId = currentWorkspaceId,
   workspacePath = currentWorkspacePath,
@@ -1929,7 +1947,7 @@ function clearWorkspaceSessionBinding(workspaceId: string, workspacePath: string
     authoritative: true,
   });
   clearCurrentInterruptTaskId();
-  clearTaskProjection();
+  clearAgentRunProjection();
   if (queueDrainTimer) {
     clearTimeout(queueDrainTimer);
     queueDrainTimer = null;
@@ -1977,7 +1995,7 @@ function clearPersistedWorkspaceBinding(): void {
   currentSessionId = '';
   clearAgentBindingContext({ authoritative: true });
   clearCurrentInterruptTaskId();
-  clearTaskProjection();
+  clearAgentRunProjection();
   const currentUrl = getCurrentUrl();
   if (!currentUrl) {
     return;
@@ -2224,14 +2242,14 @@ async function dispatchBootstrap(
     payload.sessionId,
   );
   updateEventStreamCursorFromBootstrap(payload);
-  activateTaskProjectionSession(payload.sessionId, payload.workspace.workspaceId, payload.workspace.rootPath);
-  const taskTrackingHints = extractBootstrapTaskTrackingHints(payload, options.rawPayload);
+  activateAgentRunSession(payload.sessionId, payload.workspace.workspaceId, payload.workspace.rootPath);
+  const agentRunTrackingHints = extractBootstrapAgentRunTrackingHints(payload, options.rawPayload);
   if (previousSessionId && payload.sessionId && previousSessionId !== payload.sessionId) {
     clearCurrentInterruptTaskId();
   }
-  reconcileCurrentInterruptTaskId(taskTrackingHints.activeTaskIds);
-  if (!taskTrackingHints.rootTaskId && taskTrackingHints.activeTaskIds.length === 0) {
-    clearTaskProjection(payload.sessionId, undefined, payload.workspace.workspaceId);
+  reconcileCurrentInterruptTaskId(agentRunTrackingHints.activeTaskIds);
+  if (!agentRunTrackingHints.rootTaskId && agentRunTrackingHints.activeTaskIds.length === 0) {
+    clearAgentRunProjection(payload.sessionId, undefined, payload.workspace.workspaceId);
   }
   emitDataMessage('sessionBootstrapLoaded', {
     ...payload,
@@ -2248,15 +2266,15 @@ async function dispatchBootstrap(
   // 并行加载 Registry agents（fire-and-forget，不阻断 bootstrap）
   dispatchRegistryAgents();
 
-  if (taskTrackingHints.rootTaskId || taskTrackingHints.activeTaskIds.length > 0) {
-    void autoConnectTaskTracking(
+  if (agentRunTrackingHints.rootTaskId || agentRunTrackingHints.activeTaskIds.length > 0) {
+    void autoConnectAgentRunTracking(
       payload.sessionId,
-      taskTrackingHints.activeTaskIds,
-      taskTrackingHints.rootTaskId,
+      agentRunTrackingHints.activeTaskIds,
+      agentRunTrackingHints.rootTaskId,
       payload.workspace.workspaceId,
       payload.workspace.rootPath,
     ).catch((error) => {
-      console.warn('[web-client-bridge] Auto-connect task tracking on bootstrap failed (non-critical):', error);
+      console.warn('[web-client-bridge] Auto-connect agent-run tracking on bootstrap failed (non-critical):', error);
     });
   }
   if ((payload.state as { isProcessing?: boolean } | undefined)?.isProcessing !== true) {
@@ -2294,6 +2312,36 @@ async function fetchBootstrap(
     }
     if (!response.ok) {
       if (response.status === 404) {
+        const explicitSessionMissing = Boolean(effectiveBinding.sessionId)
+          && /(?:session|会话)/i.test(errorPayload.message || '');
+        if (explicitSessionMissing) {
+          if (!bootstrapRequestCanClearMissingSession(effectiveBinding, requestSeq)) {
+            return;
+          }
+          dispatchWorkspaceSessionCleared(
+            effectiveBinding.workspaceId,
+            effectiveBinding.workspacePath,
+          );
+          try {
+            const snapshot = await getWorkspaceSessions(
+              effectiveBinding.workspaceId,
+              '',
+              effectiveBinding.workspacePath,
+            );
+            const currentBinding = resolveWorkspaceQuery();
+            if (
+              !currentBinding.sessionId
+              && currentBinding.workspaceId === effectiveBinding.workspaceId
+            ) {
+              emitDataMessage('sessionsUpdated', {
+                sessions: snapshot.sessions,
+              });
+            }
+          } catch (error) {
+            console.warn('[web-client-bridge] 无效会话清理后刷新会话列表失败:', error);
+          }
+          return;
+        }
         const workspaces = await listAgentWorkspaces();
         if (workspaces.length === 0) {
           if (!isCurrentBootstrapRequest(requestBindingKey, requestSeq)) {
@@ -2609,39 +2657,38 @@ async function warmLiveBridgeForSubmission(reason: string): Promise<void> {
   });
 }
 
-// ─── Task tracking helpers ────────────────────────────────────────────
+// ─── Agent-run tracking helpers ───────────────────────────────────────
 
 /**
- * Initialize task-projection-store tracking for a root task ID.
+ * Initialize agent-run-store tracking for an agent-run root id.
  * Fetches the initial projection and starts auto-refresh + SSE subscription.
  * Defensive: logs warnings on failure but never breaks the caller.
  */
-function initTaskTracking(
+function initAgentRunTracking(
   sessionId: string,
   rootTaskId: string,
   workspaceId = currentWorkspaceId,
   workspacePath = currentWorkspacePath,
 ): void {
-  activateTaskProjectionSession(sessionId, workspaceId, workspacePath);
-  const currentState = getTaskProjectionState(sessionId, workspaceId);
+  activateAgentRunSession(sessionId, workspaceId, workspacePath);
+  const currentState = getAgentRunState(sessionId, workspaceId);
   if (currentState.rootTaskId && currentState.rootTaskId !== rootTaskId) {
-    clearTaskProjection(sessionId, undefined, workspaceId);
+    clearAgentRunProjection(sessionId, undefined, workspaceId);
   }
-  fetchTaskProjection(sessionId, rootTaskId, workspaceId, workspacePath)
+  fetchAgentRunProjection(sessionId, rootTaskId, workspaceId, workspacePath)
     .then(() => {
-      startTaskAutoRefresh();
+      startAgentRunAutoRefresh();
     })
     .catch((error) => {
-      console.warn('[web-client-bridge] Failed to initialize task tracking (non-critical):', error);
+      console.warn('[web-client-bridge] Failed to initialize agent-run tracking (non-critical):', error);
     });
 }
 
 /**
- * Auto-detect active root tasks from session runtime state and start tracking.
- * Called during bootstrap dispatch to reconnect task tracking on session load/switch.
- * Uses active_task_ids from the bootstrap runtime read model to resolve root tasks.
+ * Auto-detect the active agent-run root from session runtime state and start tracking.
+ * Called during bootstrap dispatch to reconnect agent-run tracking on session load/switch.
  */
-export async function autoConnectTaskTracking(
+export async function autoConnectAgentRunTracking(
   sessionId: string,
   activeTaskIds: string[],
   preferredRootTaskId = '',
@@ -2651,12 +2698,12 @@ export async function autoConnectTaskTracking(
   if (!sessionId || sessionId !== currentSessionId || workspaceId !== currentWorkspaceId) {
     return;
   }
-  const currentState = getTaskProjectionState(sessionId, workspaceId);
+  const currentState = getAgentRunState(sessionId, workspaceId);
   if (preferredRootTaskId) {
     if (currentState.rootTaskId === preferredRootTaskId) {
       return;
     }
-    initTaskTracking(sessionId, preferredRootTaskId, workspaceId, workspacePath);
+    initAgentRunTracking(sessionId, preferredRootTaskId, workspaceId, workspacePath);
     return;
   }
 
@@ -2664,38 +2711,8 @@ export async function autoConnectTaskTracking(
     return;
   }
 
-  if (!activeTaskIds || activeTaskIds.length === 0) {
-    return;
-  }
-
-  try {
-    const client = new RustDaemonClient(resolveAgentBaseUrl());
-    const inspectedRootTaskIds = new Set<string>();
-    for (const taskId of activeTaskIds) {
-      let task;
-      try {
-        task = await client.getTask(taskId, sessionId, workspaceId, workspacePath);
-      } catch {
-        continue;
-      }
-      if (sessionId !== currentSessionId || workspaceId !== currentWorkspaceId) {
-        return;
-      }
-      const rootTaskId = typeof task.root_task_id === 'string' && task.root_task_id.trim()
-        ? task.root_task_id.trim()
-        : task.task_id;
-      if (!rootTaskId || inspectedRootTaskIds.has(rootTaskId)) {
-        continue;
-      }
-      inspectedRootTaskIds.add(rootTaskId);
-      if (currentState.rootTaskId === rootTaskId) {
-        return;
-      }
-      initTaskTracking(sessionId, rootTaskId, workspaceId, workspacePath);
-      return;
-    }
-  } catch (error) {
-    console.warn('[web-client-bridge] Auto-connect task tracking failed (non-critical):', error);
+  if (activeTaskIds && activeTaskIds.length > 0) {
+    console.warn('[web-client-bridge] active agent-run root missing; skip agent-run tracking bootstrap');
   }
 }
 
@@ -2706,6 +2723,7 @@ interface ExecuteTaskInput {
   sessionId?: string;
   requestId?: string;
   skillName?: string | null;
+  goalMode?: boolean;
   accessProfile?: 'read_only' | 'restricted' | 'full_access' | null;
   orchestratorSessionConfig?: Record<string, unknown> | null;
   followUpMode?: 'queue';
@@ -2739,6 +2757,7 @@ function enqueueFollowUpTurn(input: ExecuteTaskInput, normalizedText: string): v
       : (workspaceScope.hasWorkspaceOverride ? '' : currentSessionId),
     createdAt: Date.now(),
     skillName: input.skillName ?? null,
+    goalMode: input.goalMode === true,
     accessProfile: input.accessProfile ?? null,
     images: input.images,
   };
@@ -2780,6 +2799,7 @@ async function drainQueuedTurns(reason: string): Promise<void> {
       workspacePath: next.workspacePath,
       sessionId: next.sessionId,
       skillName: next.skillName ?? null,
+      goalMode: next.goalMode === true,
       accessProfile: next.accessProfile ?? null,
       images: next.images ?? [],
     });
@@ -2897,6 +2917,7 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
     const turnResult = await submitSessionTurn({
       text,
       skillName,
+      goalMode: input.goalMode === true,
       images,
       accessProfile: input.accessProfile ?? null,
       orchestratorSessionConfig: input.orchestratorSessionConfig ?? null,
@@ -2947,13 +2968,12 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
     emitBridgeSuccessToast(
       i18n.t('bridge.action.sendMessage'),
       successMessage,
-      { displayMode: 'notification_center' },
     );
 
     setCurrentInterruptTaskId(turnResult.actionTaskId || '');
     const rootTaskId = turnResult.rootTaskId;
     if (rootTaskId && resolvedSessionId) {
-      initTaskTracking(resolvedSessionId, rootTaskId, targetWorkspaceId, targetWorkspacePath);
+      initAgentRunTracking(resolvedSessionId, rootTaskId, targetWorkspaceId, targetWorkspacePath);
     }
 
     // 确保 SSE 连接存活以接收增量事件
@@ -3026,28 +3046,6 @@ async function interruptTask(): Promise<void> {
   }
 }
 
-async function clearAllTasks(): Promise<void> {
-  await clearAgentAllTasks();
-}
-
-async function startTask(taskId: string): Promise<void> {
-  try {
-    await ensureFreshLiveBridge('start_task_preflight');
-    await startAgentTask(taskId);
-  } catch (error) {
-    console.error('[web-client-bridge] 启动任务失败:', error);
-    emitBridgeErrorToast(i18n.t('bridge.action.startTask'), error);
-    emitForcedProcessingIdle('start_task_failed', {
-      error: normalizeErrorMessage(error),
-      taskId,
-    });
-    if (shouldRecoverFromBridgeError(error)) {
-      closeEventStream();
-      scheduleRecovery('start_task_failed', error, true);
-    }
-  }
-}
-
 async function continueSessionExecution(): Promise<void> {
   if (!currentSessionId) {
     emitBridgeErrorToast(
@@ -3071,10 +3069,6 @@ async function continueSessionExecution(): Promise<void> {
       scheduleRecovery('continue_session_failed', error, true);
     }
   }
-}
-
-async function deleteTask(taskId: string): Promise<void> {
-  await deleteAgentTask(taskId);
 }
 
 function escapePreviewHtml(content: string): string {
@@ -3209,12 +3203,12 @@ async function updateSetting(key: string, value: unknown): Promise<void> {
   }
 }
 
-type NotificationCenterOperation = 'load' | 'append' | 'mark-read' | 'clear' | 'remove';
+type NotificationCenterOperation = 'load' | 'report' | 'mark-read' | 'clear' | 'resolve' | 'remove';
 
 interface NotificationOperationScope {
-  sessionId: string;
   workspaceId: string;
   workspacePath: string;
+  sessionId?: string;
 }
 
 async function resetExecutionStats(): Promise<void> {
@@ -3222,26 +3216,26 @@ async function resetExecutionStats(): Promise<void> {
   await dispatchExecutionStats();
 }
 
-function resolveNotificationOperationScope(message: ClientBridgeMessage): NotificationOperationScope | null {
+function resolveNotificationOperationScope(message: Record<string, unknown>): NotificationOperationScope | null {
   const sessionId = trimBridgeString(message.sessionId);
   const workspaceId = trimBridgeString(message.workspaceId);
-  if (!sessionId || !workspaceId) {
+  if (!workspaceId) {
     return null;
   }
   return {
-    sessionId,
     workspaceId,
     workspacePath: trimBridgeString(message.workspacePath),
+    ...(sessionId ? { sessionId } : {}),
   };
 }
 
-function emitSessionNotificationsStatus(
+function emitNotificationsStatus(
   operation: NotificationCenterOperation,
   scope: NotificationOperationScope,
   isLoading: boolean,
   error?: unknown,
 ): void {
-  emitDataMessage('sessionNotificationsStatus', {
+  emitDataMessage('notificationsStatus', {
     sessionId: scope.sessionId,
     workspaceId: scope.workspaceId,
     workspacePath: scope.workspacePath,
@@ -3257,29 +3251,29 @@ async function runNotificationOperation(
   scope: NotificationOperationScope,
   task: (scope: NotificationOperationScope) => Promise<Record<string, unknown>>,
 ): Promise<void> {
-  emitSessionNotificationsStatus(operation, scope, true);
+  emitNotificationsStatus(operation, scope, true);
   try {
     const payload = await task(scope);
-    emitDataMessage('sessionNotificationsLoaded', payload);
-    emitSessionNotificationsStatus(operation, scope, false);
+    emitDataMessage('notificationsLoaded', payload);
+    emitNotificationsStatus(operation, scope, false);
   } catch (error) {
-    emitSessionNotificationsStatus(operation, scope, false, error);
+    emitNotificationsStatus(operation, scope, false, error);
     throw error;
   }
 }
 
-async function loadSessionNotifications(scope: NotificationOperationScope): Promise<void> {
+async function loadNotifications(scope: NotificationOperationScope): Promise<void> {
   await runNotificationOperation('load', scope, async (operationScope) => (
-    await getAgentSessionNotifications(operationScope) as unknown as Record<string, unknown>
+    await getAgentNotifications(operationScope) as unknown as Record<string, unknown>
   ));
 }
 
-async function appendSessionNotification(
+async function reportIncident(
   scope: NotificationOperationScope,
-  notification: Record<string, unknown>,
+  incident: Record<string, unknown>,
 ): Promise<void> {
-  await runNotificationOperation('append', scope, async (operationScope) => (
-    await appendAgentNotification(notification, operationScope) as unknown as Record<string, unknown>
+  await runNotificationOperation('report', scope, async (operationScope) => (
+    await reportAgentIncident(incident, operationScope) as unknown as Record<string, unknown>
   ));
 }
 
@@ -3301,6 +3295,12 @@ async function removeNotification(scope: NotificationOperationScope, notificatio
   ));
 }
 
+async function resolveNotification(scope: NotificationOperationScope, notificationId: string): Promise<void> {
+  await runNotificationOperation('resolve', scope, async (operationScope) => (
+    await resolveAgentNotification(notificationId, operationScope) as unknown as Record<string, unknown>
+  ));
+}
+
 async function saveWorkerConfig(worker: string, config: Record<string, unknown>): Promise<void> {
   await saveAgentWorkerConfig(worker, config);
   clearSettingsBootstrapCache();
@@ -3308,7 +3308,6 @@ async function saveWorkerConfig(worker: string, config: Record<string, unknown>)
   emitBridgeSuccessToast(
     i18n.t('settings.toast.action.saveWorkerConfig'),
     i18n.t('settings.toast.workerConfigSaved', { worker }),
-    { displayMode: 'notification_center' },
   );
 }
 
@@ -3318,7 +3317,6 @@ async function saveUserRules(data: Record<string, unknown>): Promise<void> {
   emitBridgeSuccessToast(
     i18n.t('settings.toast.action.saveUserRules'),
     i18n.t('settings.toast.userRulesSaved'),
-    { displayMode: 'notification_center' },
   );
 }
 
@@ -3329,7 +3327,6 @@ async function saveOrchestratorConfig(config: Record<string, unknown>): Promise<
   emitBridgeSuccessToast(
     i18n.t('settings.toast.action.saveOrchestratorConfig'),
     i18n.t('settings.toast.orchestratorConfigSaved'),
-    { displayMode: 'notification_center' },
   );
 }
 
@@ -3340,7 +3337,6 @@ async function saveAuxiliaryConfig(config: Record<string, unknown>): Promise<voi
   emitBridgeSuccessToast(
     i18n.t('settings.toast.action.saveAuxiliaryConfig'),
     i18n.t('settings.toast.auxiliaryConfigSaved'),
-    { displayMode: 'notification_center' },
   );
 }
 
@@ -3351,7 +3347,6 @@ async function saveSafeguardConfig(config: Record<string, unknown>): Promise<voi
   emitBridgeSuccessToast(
     i18n.t('settings.toast.action.saveSafeguardConfig'),
     i18n.t('settings.toast.safeguardConfigSaved'),
-    { displayMode: 'notification_center' },
   );
 }
 
@@ -3361,7 +3356,6 @@ async function testWorkerConnection(worker: string, config: Record<string, unkno
   emitBridgeSuccessToast(
     i18n.t('settings.toast.action.testWorkerConnection'),
     i18n.t('settings.toast.workerConnectionTestCompleted', { worker }),
-    { displayMode: 'notification_center' },
   );
 }
 
@@ -3371,7 +3365,6 @@ async function testOrchestratorConnection(config: Record<string, unknown>): Prom
   emitBridgeSuccessToast(
     i18n.t('settings.toast.action.testOrchestratorConnection'),
     i18n.t('settings.toast.orchestratorConnectionTestCompleted'),
-    { displayMode: 'notification_center' },
   );
 }
 
@@ -3381,7 +3374,6 @@ async function testAuxiliaryConnection(config: Record<string, unknown>): Promise
   emitBridgeSuccessToast(
     i18n.t('settings.toast.action.testAuxiliaryConnection'),
     i18n.t('settings.toast.auxiliaryConnectionTestCompleted'),
-    { displayMode: 'notification_center' },
   );
 }
 
@@ -3401,7 +3393,6 @@ async function fetchModelList(config: Record<string, unknown>, target: string): 
   emitBridgeSuccessToast(
     i18n.t('settings.toast.action.fetchModelList'),
     i18n.t('settings.toast.modelListRefreshedForTarget', { target }),
-    { displayMode: 'notification_center' },
   );
 }
 
@@ -3445,7 +3436,6 @@ async function getMcpServerTools(serverId: string): Promise<void> {
   emitBridgeSuccessToast(
     i18n.t('settings.toast.action.loadMcpToolList'),
     i18n.t('settings.toast.mcpToolListLoaded'),
-    { displayMode: 'notification_center' },
   );
 }
 
@@ -3459,7 +3449,6 @@ async function refreshMcpTools(serverId: string): Promise<void> {
   emitBridgeSuccessToast(
     i18n.t('settings.toast.action.refreshMcpTools'),
     i18n.t('settings.toast.mcpToolsRefreshed'),
-    { displayMode: 'notification_center' },
   );
 }
 
@@ -3473,7 +3462,6 @@ async function connectMcpServer(serverId: string): Promise<void> {
   emitBridgeSuccessToast(
     i18n.t('settings.toast.action.connectMcpServer'),
     i18n.t('settings.toast.mcpServerConnected'),
-    { displayMode: 'notification_center' },
   );
 }
 
@@ -3483,7 +3471,6 @@ async function disconnectMcpServer(serverId: string): Promise<void> {
   emitBridgeSuccessToast(
     i18n.t('settings.toast.action.disconnectMcpServer'),
     i18n.t('settings.toast.mcpServerDisconnected'),
-    { displayMode: 'notification_center' },
   );
 }
 
@@ -3523,7 +3510,6 @@ async function refreshRepository(repositoryId: string): Promise<void> {
   emitBridgeSuccessToast(
     i18n.t('settings.toast.action.refreshRepository'),
     i18n.t('settings.toast.repositoryRefreshed'),
-    { displayMode: 'notification_center' },
   );
 }
 
@@ -3536,7 +3522,6 @@ async function loadSkillLibrary(): Promise<void> {
   emitBridgeSuccessToast(
     i18n.t('settings.toast.action.loadSkillLibrary'),
     i18n.t('settings.toast.skillLibraryLoaded'),
-    { displayMode: 'notification_center' },
   );
 }
 
@@ -3594,7 +3579,6 @@ async function saveSkillsConfig(config: Record<string, unknown>): Promise<void> 
   emitBridgeSuccessToast(
     i18n.t('settings.toast.action.saveSkillConfig'),
     i18n.t('settings.toast.skillConfigSaved'),
-    { displayMode: 'notification_center' },
   );
 }
 
@@ -3972,28 +3956,28 @@ export function createWebClientBridge(): ClientBridge {
           emitBridgeSuccessToast(
             i18n.t('bridge.action.newSession'),
             i18n.t('bridge.detail.newSessionPanelReady'),
-            { displayMode: 'notification_center' },
           );
           return;
         }
-        case 'loadSessionNotifications':
+        case 'loadNotifications':
           {
             const scope = resolveNotificationOperationScope(message);
             if (scope) {
-              void loadSessionNotifications(scope).catch((error) => {
+              void loadNotifications(scope).catch((error) => {
                 if (isSessionMissingError(error)) return;
                 reportNotificationOperationFailure(i18n.t('bridge.action.loadNotifications'), '[web-client-bridge] 加载通知失败:', error);
               });
             }
           }
           return;
-        case 'appendSessionNotification':
-          if (message.notification && typeof message.notification === 'object') {
-            const scope = resolveNotificationOperationScope(message);
+        case 'reportIncident':
+          if (message.incident && typeof message.incident === 'object') {
+            const incident = message.incident as Record<string, unknown>;
+            const scope = resolveNotificationOperationScope(incident);
             if (scope) {
-              void appendSessionNotification(scope, message.notification as Record<string, unknown>).catch((error) => {
+              void reportIncident(scope, incident).catch((error) => {
                 if (isSessionMissingError(error)) return;
-                reportNotificationOperationFailure(i18n.t('bridge.action.writeNotification'), '[web-client-bridge] 写入通知失败:', error, {
+                reportNotificationOperationFailure(i18n.t('bridge.action.writeNotification'), '[web-client-bridge] 记录异常失败:', error, {
                   suppressToast: true,
                 });
               });
@@ -4033,6 +4017,17 @@ export function createWebClientBridge(): ClientBridge {
             }
           }
           return;
+        case 'resolveNotification':
+          if (typeof message.notificationId === 'string' && message.notificationId.trim()) {
+            const scope = resolveNotificationOperationScope(message);
+            if (scope) {
+              void resolveNotification(scope, message.notificationId).catch((error) => {
+                if (isSessionMissingError(error)) return;
+                reportNotificationOperationFailure(i18n.t('bridge.action.removeNotification'), '[web-client-bridge] 解决通知失败:', error);
+              });
+            }
+          }
+          return;
         case 'executeTask':
           if (
             (typeof message.text === 'string' && message.text.trim())
@@ -4046,6 +4041,7 @@ export function createWebClientBridge(): ClientBridge {
               sessionId: typeof message.sessionId === 'string' ? message.sessionId : undefined,
               requestId: typeof message.requestId === 'string' ? message.requestId : undefined,
               skillName: typeof message.skillName === 'string' ? message.skillName : null,
+              goalMode: message.goalMode === true,
               accessProfile: message.accessProfile === 'read_only'
                 || message.accessProfile === 'restricted'
                 || message.accessProfile === 'full_access'
@@ -4068,23 +4064,6 @@ export function createWebClientBridge(): ClientBridge {
           return;
         case 'continueTask':
           void continueSessionExecution();
-          return;
-        case 'startTask':
-          if (typeof message.taskId === 'string' && message.taskId.trim()) {
-            void startTask(message.taskId);
-          }
-          return;
-        case 'deleteTask':
-          if (typeof message.taskId === 'string' && message.taskId.trim()) {
-            void deleteTask(message.taskId).catch((error) => {
-              logBridgeOperationFailure(i18n.t('bridge.action.deleteTask'), '[web-client-bridge] 删除任务失败:', error);
-            });
-          }
-          return;
-        case 'clearAllTasks':
-          void clearAllTasks().catch((error) => {
-            logBridgeOperationFailure(i18n.t('bridge.action.clearTasks'), '[web-client-bridge] 清空任务失败:', error);
-          });
           return;
         case 'switchSession':
           if (typeof message.sessionId === 'string' && message.sessionId.trim()) {
@@ -4287,6 +4266,23 @@ export function createWebClientBridge(): ClientBridge {
             );
           });
           return;
+        case 'reindexProjectKnowledge': {
+          const scope = {
+            ...requestScopeFromMessage(message, ''),
+            knowledgeRequestId: trimBridgeString(message.knowledgeRequestId),
+          };
+          void reindexAgentProjectKnowledge(scope)
+            .then(() => dispatchProjectKnowledge(scope))
+            .catch((error) => {
+              logKnowledgeOperationFailure(
+                i18n.t('settings.toast.action.loadProjectKnowledge'),
+                '[web-client-bridge] 项目知识重建失败:',
+                error,
+                'knowledge.toast.loadFailed',
+              );
+            });
+          return;
+        }
         case 'clearProjectKnowledge':
           void clearProjectKnowledge(requestScopeFromMessage(message, '')).catch((error) => {
             logKnowledgeOperationFailure(
@@ -4414,6 +4410,14 @@ export function createWebClientBridge(): ClientBridge {
     },
     onMessage(listener: (message: ClientBridgeMessage) => void): () => void {
       listeners.add(listener);
+      const pending = pendingBridgeMessages.splice(0);
+      for (const message of pending) {
+        try {
+          listener(message);
+        } catch (error) {
+          console.error('[web-client-bridge] 补发启动消息失败:', error);
+        }
+      }
       return () => listeners.delete(listener);
     },
     getState<T>(): T | undefined {

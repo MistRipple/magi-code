@@ -186,6 +186,22 @@ impl SettingsStore {
         self.remove_section(&session_section_key(session_id, section));
     }
 
+    /// 删除一个 session 拥有的全部设置 section。会话级模型与推理强度属于会话，
+    /// 不能在会话删除后继续留在全局 settings 文件中。
+    pub fn remove_session(&self, session_id: &SessionId) -> usize {
+        let prefix = format!("{SESSION_SECTION_PREFIX}{}:", session_id.as_str());
+        let removed = {
+            let mut sections = self.sections.write().unwrap();
+            let before = sections.len();
+            sections.retain(|key, _| !key.starts_with(&prefix));
+            before.saturating_sub(sections.len())
+        };
+        if removed > 0 {
+            self.auto_persist();
+        }
+        removed
+    }
+
     pub fn remove_section_entry(&self, section: &str, key: &str) {
         let mut sections = self.sections.write().unwrap();
         if let Some(Value::Object(map)) = sections.get_mut(section) {
@@ -282,9 +298,14 @@ fn is_public_response_alias_section(section: &str) -> bool {
 }
 
 fn canonicalize_settings_section_value(section: &str, value: &mut Value) -> bool {
-    if matches!(section, "orchestrator" | "auxiliary")
-        || (is_session_section_key(section)
-            && (section.ends_with(":orchestrator") || section.ends_with(":auxiliary")))
+    if section == "orchestrator" {
+        return canonicalize_global_orchestrator_section(value);
+    }
+    if is_session_section_key(section) && section.ends_with(":orchestrator") {
+        return canonicalize_session_orchestrator_section(value);
+    }
+    if section == "auxiliary"
+        || (is_session_section_key(section) && section.ends_with(":auxiliary"))
     {
         return remove_deprecated_model_fields(value);
     }
@@ -293,6 +314,31 @@ fn canonicalize_settings_section_value(section: &str, value: &mut Value) -> bool
         "engines" => normalize_engines_section(value),
         _ => false,
     }
+}
+
+fn canonicalize_global_orchestrator_section(value: &mut Value) -> bool {
+    let mut changed = remove_deprecated_model_fields(value);
+    let Some(object) = value.as_object_mut() else {
+        return changed;
+    };
+    changed |= object.remove("model").is_some();
+    changed |= object.remove("reasoningEffort").is_some();
+    changed
+}
+
+fn canonicalize_session_orchestrator_section(value: &mut Value) -> bool {
+    let Some(object) = value.as_object_mut() else {
+        return false;
+    };
+    let mut changed = false;
+    object.retain(|key, _| {
+        let keep = matches!(key.as_str(), "model" | "reasoningEffort");
+        if !keep {
+            changed = true;
+        }
+        keep
+    });
+    changed
 }
 
 fn normalize_workers_section(value: &mut Value) -> bool {
@@ -407,14 +453,12 @@ mod tests {
             snapshot.get_section("orchestrator"),
             json!({
                 "baseUrl": "https://old.example.com/v1",
-                "model": "model-old",
             })
         );
         assert_eq!(
             store.get_section("orchestrator"),
             json!({
                 "baseUrl": "https://new.example.com/v1",
-                "model": "model-new",
             })
         );
     }
@@ -467,7 +511,8 @@ mod tests {
                     "openaiProtocol": "responses",
                     "protocolEndpoint": "/v1/responses",
                     "baseUrl": "https://api.example.com",
-                    "model": "main"
+                    "model": "main",
+                    "reasoningEffort": "high"
                 },
                 "workers": {
                     "reviewer": {
@@ -528,6 +573,46 @@ mod tests {
                 .get("provider")
                 .is_none()
         );
+        assert!(
+            persisted["orchestrator"]
+                .as_object()
+                .unwrap()
+                .get("model")
+                .is_none()
+        );
+        assert!(
+            persisted["orchestrator"]
+                .as_object()
+                .unwrap()
+                .get("reasoningEffort")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn session_orchestrator_section_keeps_only_session_owned_fields() {
+        let store = SettingsStore::new();
+        let session_id = SessionId::new("session-main-model");
+        store.set_session_section(
+            &session_id,
+            "orchestrator",
+            json!({
+                "baseUrl": "https://api.example.com/v1",
+                "apiKey": "sk-session-should-not-own",
+                "urlMode": "standard",
+                "model": "session-main",
+                "reasoningEffort": "xhigh",
+                "provider": "openai"
+            }),
+        );
+
+        let section = store.get_session_section(&session_id, "orchestrator");
+        assert_eq!(section["model"], json!("session-main"));
+        assert_eq!(section["reasoningEffort"], json!("xhigh"));
+        assert!(section.get("baseUrl").is_none());
+        assert!(section.get("apiKey").is_none());
+        assert!(section.get("urlMode").is_none());
+        assert!(section.get("provider").is_none());
     }
 
     #[test]
@@ -597,5 +682,29 @@ mod tests {
         assert_eq!(snapshot.get("workers"), Some(&json!({"primary": "gpu-0"})));
         assert!(!snapshot.contains_key("__session__:session-a:userRules"));
         assert!(!snapshot.contains_key("__session__:session-b:userRules"));
+    }
+
+    #[test]
+    fn remove_session_drops_all_session_owned_sections() {
+        let store = SettingsStore::new();
+        let session_a = SessionId::new("session-a");
+        let session_b = SessionId::new("session-b");
+        store.set_session_section(&session_a, "orchestrator", json!({"model": "model-a"}));
+        store.set_session_section(&session_a, "userRules", json!({"userRules": "A"}));
+        store.set_session_section(&session_b, "orchestrator", json!({"model": "model-b"}));
+
+        assert_eq!(store.remove_session(&session_a), 2);
+        assert_eq!(
+            store.get_session_section(&session_a, "orchestrator"),
+            Value::Null
+        );
+        assert_eq!(
+            store.get_session_section(&session_a, "userRules"),
+            Value::Null
+        );
+        assert_eq!(
+            store.get_session_section(&session_b, "orchestrator")["model"],
+            json!("model-b")
+        );
     }
 }

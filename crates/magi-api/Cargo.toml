@@ -24,11 +24,11 @@ magi-event-bus = { path = "../magi-event-bus" }
 magi-governance = { path = "../magi-governance" }
 magi-knowledge-store = { path = "../magi-knowledge-store" }
 magi-memory-store = { path = "../magi-memory-store" }
-magi-mission = { path = "../magi-mission" }
 magi-orchestrator = { path = "../magi-orchestrator" }
 magi-session-store = { path = "../magi-session-store" }
 magi-settings-store = { path = "../magi-settings-store" }
 magi-snapshot = { path = "../magi-snapshot" }
+magi-todo-ledger = { path = "../magi-todo-ledger" }
 magi-tool-runtime = { path = "../magi-tool-runtime" }
 magi-usage-authority = { path = "../magi-usage-authority" }
 magi-workspace = { path = "../magi-workspace" }
@@ -38,4 +38,5 @@ dirs = "6"
 [dev-dependencies]
 tower = { version = "0.5.3", features = ["util"] }
 magi-skill-runtime = { path = "../magi-skill-runtime" }
+magi-worker-runtime = { path = "../magi-worker-runtime" }
 tempfile = "3"

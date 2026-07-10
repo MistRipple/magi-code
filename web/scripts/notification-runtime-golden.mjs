@@ -1,0 +1,70 @@
+import assert from 'node:assert/strict';
+import { withGoldenViteServer } from './golden-vite.mjs';
+
+globalThis.$state = (value) => value;
+globalThis.$derived = (value) => (typeof value === 'function' ? value() : value);
+globalThis.$derived.by = (fn) => fn();
+
+await withGoldenViteServer(async (server) => {
+  const posted = [];
+  const bridgeRuntime = await server.ssrLoadModule('/src/shared/bridges/bridge-runtime.ts');
+  bridgeRuntime.setClientBridge({
+    kind: 'web',
+    postMessage(message) { posted.push(message); },
+    onMessage() { return () => {}; },
+    getState() { return undefined; },
+    setState() {},
+    getInitialSessionId() { return ''; },
+    getInitialLocale() { return 'zh-CN'; },
+    notifyReady() {},
+  });
+
+  const store = await server.ssrLoadModule('/src/stores/messages.svelte.ts');
+  const notifications = await server.ssrLoadModule('/src/lib/notifications.ts');
+
+  store.messagesState.currentWorkspaceId = 'workspace-notification-runtime';
+  store.messagesState.currentWorkspacePath = '/tmp/workspace-notification-runtime';
+  store.messagesState.currentSessionId = 'session-notification-runtime';
+
+  notifications.showFeedback('success', '配置已保存', { source: 'settings-panel' });
+  assert.equal(posted.length, 0, 'normal feedback must never persist to the notification center');
+  assert.equal(store.getToasts().length, 1);
+
+  assert.equal(notifications.reportIncident('模型请求失败', {
+    scope: 'workspace',
+    source: 'model-runtime',
+    fingerprint: 'model-request-failed',
+  }), true);
+  assert.equal(posted.length, 1);
+  assert.equal(posted[0].type, 'reportIncident');
+  assert.equal(posted[0].incident.scope, 'workspace');
+  assert.equal(posted[0].incident.workspaceId, 'workspace-notification-runtime');
+  assert.equal(posted[0].incident.sessionId, 'session-notification-runtime');
+
+  store.applyNotificationsSnapshot('session-notification-runtime', {
+    records: [{
+      notificationId: 'incident-runtime-1',
+      kind: 'incident',
+      scope: 'workspace',
+      level: 'error',
+      message: '模型请求失败',
+      workspaceId: 'workspace-notification-runtime',
+      createdAt: 10,
+      read: false,
+      handled: false,
+      resolved: false,
+      actionRequired: true,
+      countUnread: true,
+      occurrenceCount: 3,
+    }],
+  }, 'workspace-notification-runtime');
+  assert.equal(store.getNotifications().length, 1);
+  assert.equal(store.getUnreadNotificationCount(), 1);
+  assert.equal(store.getNotifications()[0].occurrenceCount, 3);
+
+  store.resolveNotification('incident-runtime-1');
+  assert.equal(posted[1].type, 'resolveNotification');
+  assert.equal(posted[1].notificationId, 'incident-runtime-1');
+
+  console.log('notification runtime golden passed');
+});

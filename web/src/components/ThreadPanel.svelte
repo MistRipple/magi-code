@@ -9,6 +9,7 @@
   import MessageList from './MessageList.svelte';
   import InputArea from './InputArea.svelte';
   import RuntimeStatePanel from './RuntimeStatePanel.svelte';
+  import GoalRunDrawers from './GoalRunDrawers.svelte';
 
   interface Props {
     isTopActive?: boolean;
@@ -42,6 +43,8 @@
   <div class="main-content">
     <MessageList renderItems={threadRenderItems} isActive={isTopActive} />
   </div>
+
+  <GoalRunDrawers />
 
   <!-- 输入区域 -->
   <InputArea />

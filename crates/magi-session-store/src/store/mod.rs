@@ -1,3 +1,4 @@
+mod goals;
 mod queries;
 mod sidecar;
 
@@ -6,11 +7,13 @@ mod tests;
 
 use crate::lifecycle::SessionLifecycleObserver;
 use crate::models::{
-    NotificationRecord, SessionDurableState, SessionExecutionSidecarStoreState, SessionRecord,
-    SessionSidecarFlushReason, SessionStoreState, TimelineEntry, TimelineEntryKind,
+    NotificationRecord, NotificationScope, SessionDurableState, SessionExecutionSidecarStoreState,
+    SessionRecord, SessionSidecarFlushReason, SessionStoreState, TimelineEntry, TimelineEntryKind,
 };
-use magi_core::{DomainError, DomainResult, SessionId, SessionLifecycleStatus, UtcMillis};
-use std::sync::{Arc, RwLock};
+use magi_core::{
+    DomainError, DomainResult, SessionId, SessionLifecycleStatus, TodoItem, UtcMillis,
+};
+use std::sync::{Arc, Mutex, RwLock};
 
 /// orchestrator 主线 thread 的稳定 role 标识。
 ///
@@ -34,6 +37,7 @@ struct SidecarFlushState {
 pub struct SessionStore {
     state: Arc<RwLock<SessionStoreState>>,
     sidecar_flush_state: Arc<RwLock<SidecarFlushState>>,
+    sidecar_flush_lock: Arc<Mutex<()>>,
     lifecycle_observer: Arc<RwLock<Option<Arc<dyn SessionLifecycleObserver>>>>,
 }
 
@@ -100,6 +104,7 @@ impl Default for SessionStore {
         Self {
             state: Arc::new(RwLock::new(SessionStoreState::default())),
             sidecar_flush_state: Arc::new(RwLock::new(SidecarFlushState::default())),
+            sidecar_flush_lock: Arc::new(Mutex::new(())),
             lifecycle_observer: Arc::new(RwLock::new(None)),
         }
     }
@@ -114,6 +119,7 @@ impl SessionStore {
         Self {
             state: Arc::new(RwLock::new(state)),
             sidecar_flush_state: Arc::new(RwLock::new(SidecarFlushState::default())),
+            sidecar_flush_lock: Arc::new(Mutex::new(())),
             lifecycle_observer: Arc::new(RwLock::new(None)),
         }
     }
@@ -317,7 +323,17 @@ impl SessionStore {
             .retain(|entry| &entry.session_id != session_id);
         state
             .notifications
-            .retain(|notification| &notification.session_id != session_id);
+            .retain(|notification| notification.session_id.as_ref() != Some(session_id));
+        state
+            .canonical_turns
+            .retain(|turn| &turn.session_id != session_id);
+        state.goals.retain(|goal| &goal.session_id != session_id);
+        state
+            .todo_lists
+            .retain(|todo_list| &todo_list.session_id != session_id);
+        state
+            .thread_registry
+            .retain(|thread| &thread.session_id != session_id);
         let removed_sidecar = state
             .execution_sidecar_store
             .runtime_sidecar(session_id)
@@ -340,6 +356,62 @@ impl SessionStore {
             observer.on_session_deleted(session_id);
         }
         Ok(())
+    }
+
+    pub fn replace_todo_items(
+        &self,
+        session_id: &SessionId,
+        items: Vec<TodoItem>,
+    ) -> DomainResult<Vec<TodoItem>> {
+        let mut state = self
+            .state
+            .write()
+            .expect("session state write lock poisoned");
+        if !state
+            .sessions
+            .iter()
+            .any(|session| &session.session_id == session_id)
+        {
+            return Err(DomainError::NotFound { entity: "session" });
+        }
+        let now = UtcMillis::now();
+        if items.is_empty() {
+            state
+                .todo_lists
+                .retain(|todo_list| &todo_list.session_id != session_id);
+        } else if let Some(todo_list) = state
+            .todo_lists
+            .iter_mut()
+            .find(|todo_list| &todo_list.session_id == session_id)
+        {
+            todo_list.items = items.clone();
+            todo_list.updated_at = now;
+        } else {
+            state.todo_lists.push(crate::models::SessionTodoList {
+                session_id: session_id.clone(),
+                items: items.clone(),
+                updated_at: now,
+            });
+        }
+        if let Some(session) = state
+            .sessions
+            .iter_mut()
+            .find(|session| &session.session_id == session_id)
+        {
+            session.updated_at = now;
+        }
+        Ok(items)
+    }
+
+    pub fn todo_items(&self, session_id: &SessionId) -> Vec<TodoItem> {
+        self.state
+            .read()
+            .expect("session state read lock poisoned")
+            .todo_lists
+            .iter()
+            .find(|todo_list| &todo_list.session_id == session_id)
+            .map(|todo_list| todo_list.items.clone())
+            .unwrap_or_default()
     }
 
     pub fn switch_session(&self, session_id: &SessionId) -> DomainResult<()> {
@@ -455,84 +527,55 @@ impl SessionStore {
         before_len != state.timeline.len()
     }
 
-    pub fn append_notification(
+    pub fn append_incident_record(&self, mut notification: NotificationRecord) -> DomainResult<()> {
+        notification.normalize_incident();
+        match notification.scope {
+            NotificationScope::App => {}
+            NotificationScope::Workspace if notification.workspace_id.is_none() => {
+                return Err(DomainError::Validation {
+                    message: "workspace incident requires workspace_id".to_string(),
+                });
+            }
+            NotificationScope::Session
+                if notification.workspace_id.is_none() || notification.session_id.is_none() =>
+            {
+                return Err(DomainError::Validation {
+                    message: "session incident requires workspace_id and session_id".to_string(),
+                });
+            }
+            NotificationScope::Workspace | NotificationScope::Session => {}
+        }
+        let mut state = self
+            .state
+            .write()
+            .expect("session state write lock poisoned");
+        if let Some(existing) = state.notifications.iter_mut().find(|existing| {
+            !existing.resolved
+                && existing.fingerprint == notification.fingerprint
+                && existing.scope == notification.scope
+                && existing.workspace_id == notification.workspace_id
+                && existing.session_id == notification.session_id
+        }) {
+            existing.message = notification.message;
+            existing.title = notification.title;
+            existing.level = notification.level;
+            existing.source = notification.source;
+            existing.created_at = notification.created_at;
+            existing.handled = false;
+            existing.count_unread = true;
+            existing.action_required = notification.action_required;
+            existing.occurrence_count = existing.occurrence_count.saturating_add(1);
+            return Ok(());
+        }
+        state.notifications.push(notification);
+        Ok(())
+    }
+
+    pub fn clear_notifications_for_context(
         &self,
-        session_id: SessionId,
-        notification_id: impl Into<String>,
-        kind: impl Into<String>,
-        message: impl Into<String>,
-    ) {
-        self.append_notification_record(NotificationRecord {
-            notification_id: notification_id.into(),
-            session_id: session_id.clone(),
-            kind: kind.into(),
-            level: None,
-            title: None,
-            message: message.into(),
-            source: None,
-            created_at: UtcMillis::now(),
-            handled: false,
-            persist_to_center: Some(true),
-            action_required: None,
-            count_unread: None,
-            display_mode: None,
-            duration: None,
-        });
-    }
-
-    pub fn append_notification_record(&self, notification: NotificationRecord) {
-        let session_id = notification.session_id.clone();
-        let mut state = self
-            .state
-            .write()
-            .expect("session state write lock poisoned");
-        state.notifications.push(notification.clone());
-        let entry_id = unique_timeline_entry_id(
-            &state.timeline,
-            format!("timeline-notification-{}", notification.notification_id),
-        );
-        state.timeline.push(TimelineEntry {
-            entry_id,
-            session_id,
-            kind: TimelineEntryKind::NotificationPublished,
-            message: format!("通知已生成: {}", notification.kind),
-            occurred_at: notification.created_at,
-        });
-    }
-
-    pub fn mark_notification_handled(&self, notification_id: &str) -> DomainResult<()> {
-        let mut state = self
-            .state
-            .write()
-            .expect("session state write lock poisoned");
-        let notification = state
-            .notifications
-            .iter_mut()
-            .find(|notification| notification.notification_id == notification_id)
-            .ok_or(DomainError::NotFound {
-                entity: "notification",
-            })?;
-        notification.handled = true;
-        Ok(())
-    }
-
-    pub fn remove_notification(&self, notification_id: &str) -> DomainResult<()> {
-        let mut state = self
-            .state
-            .write()
-            .expect("session state write lock poisoned");
-        let removed = state
-            .notifications
-            .iter()
-            .position(|notification| notification.notification_id == notification_id)
-            .ok_or(DomainError::NotFound {
-                entity: "notification",
-            })?;
-        state.notifications.remove(removed);
-        Ok(())
-    }
-
-    pub fn clear_notifications_for_session(&self, session_id: &SessionId) -> usize {
+        workspace_id: &str,
+        session_id: Option<&SessionId>,
+    ) -> usize {
         let mut state = self
             .state
             .write()
@@ -540,11 +583,15 @@ impl SessionStore {
         let before = state.notifications.len();
         state
             .notifications
-            .retain(|notification| &notification.session_id != session_id);
+            .retain(|notification| !notification.visible_in_context(workspace_id, session_id));
         before.saturating_sub(state.notifications.len())
     }
 
-    pub fn mark_notifications_handled_for_session(&self, session_id: &SessionId) {
+    pub fn mark_notifications_handled_for_context(
+        &self,
+        workspace_id: &str,
+        session_id: Option<&SessionId>,
+    ) {
         let mut state = self
             .state
             .write()
@@ -552,15 +599,17 @@ impl SessionStore {
         for notification in state
             .notifications
             .iter_mut()
-            .filter(|notification| &notification.session_id == session_id)
+            .filter(|notification| notification.visible_in_context(workspace_id, session_id))
         {
             notification.handled = true;
+            notification.count_unread = false;
         }
     }
 
-    pub fn remove_notification_for_session(
+    pub fn remove_notification_for_context(
         &self,
-        session_id: &SessionId,
+        workspace_id: &str,
+        session_id: Option<&SessionId>,
         notification_id: &str,
     ) -> DomainResult<()> {
         let mut state = self
@@ -571,13 +620,39 @@ impl SessionStore {
             .notifications
             .iter()
             .position(|notification| {
-                &notification.session_id == session_id
+                notification.visible_in_context(workspace_id, session_id)
                     && notification.notification_id == notification_id
             })
             .ok_or(DomainError::NotFound {
                 entity: "notification",
             })?;
         state.notifications.remove(removed);
+        Ok(())
+    }
+
+    pub fn resolve_notification_for_context(
+        &self,
+        workspace_id: &str,
+        session_id: Option<&SessionId>,
+        notification_id: &str,
+    ) -> DomainResult<()> {
+        let mut state = self
+            .state
+            .write()
+            .expect("session state write lock poisoned");
+        let notification = state
+            .notifications
+            .iter_mut()
+            .find(|notification| {
+                notification.notification_id == notification_id
+                    && notification.visible_in_context(workspace_id, session_id)
+            })
+            .ok_or(DomainError::NotFound {
+                entity: "notification",
+            })?;
+        notification.resolved = true;
+        notification.handled = true;
+        notification.count_unread = false;
         Ok(())
     }
 }

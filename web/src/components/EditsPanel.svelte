@@ -1,5 +1,9 @@
 <script lang="ts">
-  import { getCurrentSessionId, messagesState } from '../stores/messages.svelte';
+  import {
+    applyPendingChangesProjection,
+    getCurrentSessionId,
+    messagesState,
+  } from '../stores/messages.svelte';
   import { vscode } from '../lib/vscode-bridge';
   import { ensureArray } from '../lib/utils';
   import { openCodeTab } from '../stores/right-pane.svelte';
@@ -7,9 +11,14 @@
   import type { IconName } from '../lib/icons';
   import Icon from './Icon.svelte';
   import { i18n } from '../stores/i18n.svelte';
-  import { getAgentChangeDiff, isWebAgentMode } from '../web/agent-api';
+  import {
+    getAgentChangeDiff,
+    getAgentPendingChanges,
+    isWebAgentMode,
+  } from '../web/agent-api';
 
   const isWebMode = isWebAgentMode();
+  const changeRefreshIntervalMs = 1000;
 
   const edits = $derived(ensureArray(messagesState.edits) as Edit[]);
 
@@ -32,6 +41,10 @@
   );
 
   const hasGroups = $derived(earlierPendingEdits.length > 0 && currentRoundEdits.length > 0);
+  const allEditsRevertible = $derived(edits.every((edit) => edit.revertible === true));
+  const currentRoundRevertible = $derived(
+    currentRoundEdits.length > 0 && currentRoundEdits.every((edit) => edit.revertible === true)
+  );
 
   // 拆分文件名和目录
   function splitPath(filePath: string): { dir: string; name: string } {
@@ -82,12 +95,54 @@
     scopeMatchesActiveChangeMutation(editScope(currentRoundEdits[0] ?? earlierPendingEdits[0] ?? edits[0]))
   ));
 
+  $effect(() => {
+    const sessionId = messagesState.currentSessionId?.trim() || '';
+    const workspaceId = messagesState.currentWorkspaceId?.trim() || '';
+    const workspacePath = messagesState.currentWorkspacePath?.trim() || '';
+    if (!isWebMode || !sessionId || (!workspaceId && !workspacePath)) {
+      return;
+    }
+
+    let disposed = false;
+    let inFlight = false;
+    let errorReported = false;
+    const refresh = async () => {
+      if (disposed || inFlight || messagesState.changeMutationStatus?.isMutating) {
+        return;
+      }
+      inFlight = true;
+      try {
+        const payload = await getAgentPendingChanges({ sessionId, workspaceId, workspacePath });
+        if (!disposed) {
+          applyPendingChangesProjection(payload);
+        }
+        errorReported = false;
+      } catch (error) {
+        if (!disposed && !errorReported) {
+          console.warn('[EditsPanel] 刷新变更列表失败:', error);
+          errorReported = true;
+        }
+      } finally {
+        inFlight = false;
+      }
+    };
+
+    void refresh();
+    const timer = window.setInterval(() => {
+      void refresh();
+    }, changeRefreshIntervalMs);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
+  });
+
   function approveChange(edit: Edit) {
     if (changeMutationPending) return;
     vscode.postMessage({ type: 'approveChange', filePath: edit.filePath, ...editScope(edit) });
   }
   function revertChange(edit: Edit) {
-    if (changeMutationPending) return;
+    if (changeMutationPending || edit.revertible !== true) return;
     vscode.postMessage({ type: 'revertChange', filePath: edit.filePath, ...editScope(edit) });
   }
 
@@ -96,11 +151,11 @@
     vscode.postMessage({ type: 'approveAllChanges', ...editScope(currentRoundEdits[0] ?? earlierPendingEdits[0]) });
   }
   function revertAllChanges() {
-    if (changeMutationPending || edits.length === 0) return;
+    if (changeMutationPending || edits.length === 0 || !allEditsRevertible) return;
     vscode.postMessage({ type: 'revertAllChanges', ...editScope(currentRoundEdits[0] ?? earlierPendingEdits[0]) });
   }
   function revertCurrentRound() {
-    if (changeMutationPending || !latestExecutionGroupId) return;
+    if (changeMutationPending || !latestExecutionGroupId || !currentRoundRevertible) return;
     vscode.postMessage({
       type: 'revertExecutionGroup',
       executionGroupId: latestExecutionGroupId,
@@ -319,7 +374,7 @@
       <button class="action-icon approve" type="button" disabled={changeMutationPending} title={i18n.t('edits.actions.approveChange')} onclick={(e) => { e.stopPropagation(); approveChange(edit); }}>
         <Icon name="check" size={14} />
       </button>
-      <button class="action-icon revert" type="button" disabled={changeMutationPending} title={i18n.t('edits.actions.revertChange')} onclick={(e) => { e.stopPropagation(); revertChange(edit); }}>
+      <button class="action-icon revert" type="button" disabled={changeMutationPending || edit.revertible !== true} title={edit.revertible === true ? i18n.t('edits.actions.revertChange') : i18n.t('edits.actions.revertUnavailable')} onclick={(e) => { e.stopPropagation(); revertChange(edit); }}>
         <Icon name="undo" size={14} />
       </button>
     </div>
@@ -350,8 +405,8 @@
           <button
             type="button"
             class="toolbar-btn revert"
-            disabled={changeMutationPending}
-            title={i18n.t('edits.actions.revertAllTitle')}
+            disabled={changeMutationPending || !allEditsRevertible}
+            title={allEditsRevertible ? i18n.t('edits.actions.revertAllTitle') : i18n.t('edits.actions.revertUnavailable')}
             onclick={revertAllChanges}
           >
             <Icon name="undo" size={13} />
@@ -383,8 +438,8 @@
               <button
                 type="button"
                 class="group-action"
-                disabled={changeMutationPending}
-                title={i18n.t('edits.group.revertRoundTitle')}
+                disabled={changeMutationPending || !currentRoundRevertible}
+                title={currentRoundRevertible ? i18n.t('edits.group.revertRoundTitle') : i18n.t('edits.actions.revertUnavailable')}
                 onclick={revertCurrentRound}
               >
                 <Icon name="undo" size={12} />

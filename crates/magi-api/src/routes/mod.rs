@@ -1,14 +1,15 @@
+mod agent_run_actions;
+mod agent_runs;
 mod changes_files_tunnel;
 mod conversation_bridge;
 mod dispatch_flow;
+mod goals;
 mod knowledge;
 mod mcp_skills_repos;
 mod messages;
 mod session_scope;
 pub(crate) mod sessions;
 pub(crate) mod settings;
-mod tasks_interaction;
-mod tasks_projection;
 mod tools;
 mod workspace_vcs;
 mod workspaces;
@@ -65,12 +66,13 @@ pub fn build_router(state: ApiState) -> Router {
         .merge(workspaces::routes())
         .merge(workspace_vcs::routes())
         .merge(sessions::routes())
+        .merge(goals::routes())
         .merge(knowledge::routes())
         .merge(settings::routes())
         .merge(mcp_skills_repos::routes())
         .merge(changes_files_tunnel::routes())
-        .merge(tasks_interaction::routes())
-        .merge(tasks_projection::routes())
+        .merge(agent_run_actions::routes())
+        .merge(agent_runs::routes())
         .merge(tools::routes())
         .merge(messages::routes())
         .layer(middleware::from_fn(
@@ -133,15 +135,17 @@ fn resolve_bootstrap_scope(
     let requested_session_id = trimmed_query_param(query.session_id.as_deref()).map(SessionId::new);
 
     if let Some(workspace_id) = requested_workspace_id {
-        let session_id = requested_session_id.and_then(|session_id| {
-            state
-                .session_store
-                .session(&session_id)
-                .and_then(|session| {
-                    (state.session_workspace_id(&session).as_ref() == Some(&workspace_id))
-                        .then_some(session_id)
-                })
-        });
+        let session_id = match requested_session_id {
+            Some(session_id) => {
+                let session = state
+                    .session_store
+                    .session(&session_id)
+                    .ok_or_else(|| ApiError::not_found("session 不存在", session_id.as_str()))?;
+                (state.session_workspace_id(&session).as_ref() == Some(&workspace_id))
+                    .then_some(session_id)
+            }
+            None => None,
+        };
         return Ok(BootstrapScope {
             workspace_id: Some(workspace_id.to_string()),
             session_id,
@@ -353,6 +357,39 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_workspace_resolution_rejects_unknown_explicit_session() {
+        let state = test_state();
+        let workspace_id = WorkspaceId::new("workspace-bootstrap-unknown-session");
+        state
+            .workspace_registry
+            .register(
+                workspace_id.clone(),
+                AbsolutePath::new("/tmp/magi-bootstrap-unknown-session"),
+            )
+            .expect("workspace should register");
+
+        let result = resolve_bootstrap_scope(
+            &state,
+            &BootstrapQuery {
+                workspace_id: Some(workspace_id.to_string()),
+                workspace_path: None,
+                session_id: Some("session-bootstrap-missing".to_string()),
+            },
+        );
+
+        match result {
+            Err(ApiError::NotFound(message)) => {
+                assert!(
+                    message.contains("session 不存在")
+                        && message.contains("session-bootstrap-missing"),
+                    "unknown session error should stay explicit: {message}"
+                );
+            }
+            other => panic!("unknown explicit session should not fall back: {other:?}"),
+        }
+    }
+
+    #[test]
     fn bootstrap_workspace_resolution_uses_session_workspace_without_explicit_workspace() {
         let state = test_state();
         let workspace_b = WorkspaceId::new("workspace-bootstrap-session-deeplink");
@@ -496,6 +533,36 @@ mod tests {
                 .map(|session| session["workspaceId"].as_str())
                 .collect::<Vec<_>>(),
             vec![Some(workspace_a.as_str())]
+        );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_route_rejects_unknown_explicit_session_scope() {
+        let state = test_state();
+        let workspace_id = WorkspaceId::new("workspace-bootstrap-route-unknown-session");
+        state
+            .workspace_registry
+            .register(
+                workspace_id.clone(),
+                AbsolutePath::new("/tmp/magi-bootstrap-route-unknown-session"),
+            )
+            .expect("workspace should register");
+        let app = build_router(state);
+
+        let (status, body) = get_json(
+            app,
+            &format!(
+                "/bootstrap?workspaceId={}&sessionId=session-bootstrap-route-missing",
+                workspace_id
+            ),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(
+            body["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("session 不存在"))
         );
     }
 

@@ -29,17 +29,10 @@ const RUNTIME_INTERNAL_TOOLS = new Set<string>([
   'submit_review',
   'read_instructions',
   'governance_handshake',
-  // 任务系统 协调 / 长任务工具：这些是模型侧内部协议，不进入用户可见时间线。
-  // agent_spawn 除外：它是父代理主线上的代理创建 ToolCall 卡片。
+  // 现役任务状态工具不进入用户可见时间线。
   'agent_wait',
   'todo_write',
   'memory_write',
-  'mission_charter_write',
-  'plan_write',
-  'kg_write',
-  'validation_record',
-  'checkpoint_create',
-  'human_checkpoint_request',
   // 后端 builtin shell 内部能力（模型不可调用，仅在 shell_exec 内部走子进程协议）
   'process_launch',
   'process_read',

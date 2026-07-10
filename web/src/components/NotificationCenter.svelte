@@ -3,10 +3,11 @@
     getNotifications,
     getUnreadNotificationCount,
     getNotificationCenterStatus,
-    loadSessionNotifications,
+    loadNotifications,
     markAllNotificationsRead,
     clearAllNotifications,
     removeNotification,
+    resolveNotification,
     messagesState,
     type Notification,
   } from '../stores/messages.svelte';
@@ -14,28 +15,27 @@
   import { i18n } from '../stores/i18n.svelte';
 
   let panelOpen = $state(false);
-  let activeFilter = $state<'all' | 'incident' | 'audit'>('all');
+  let activeFilter = $state<'all' | 'unresolved' | 'resolved'>('all');
 
   const notifications = $derived.by(() => getNotifications() as Notification[]);
   const unreadCount = $derived.by(() => getUnreadNotificationCount() as number);
   const notificationStatus = $derived.by(() => getNotificationCenterStatus());
-  const hasCurrentSession = $derived.by(() => (
-    typeof messagesState.currentSessionId === 'string'
-    && messagesState.currentSessionId.trim().length > 0
-  ));
+  const hasWorkspace = $derived(Boolean(messagesState.currentWorkspaceId?.trim()));
   const filteredNotifications = $derived.by(() => (
     activeFilter === 'all'
       ? notifications
-      : notifications.filter((notif) => notif.category === activeFilter)
+      : notifications.filter((notif) => (
+        activeFilter === 'resolved' ? notif.resolved : !notif.resolved
+      ))
   ));
 
   function togglePanel() {
     panelOpen = !panelOpen;
-    if (panelOpen && messagesState.bootstrapped && hasCurrentSession) {
+    if (panelOpen && messagesState.bootstrapped && hasWorkspace) {
       if (unreadCount > 0) {
         markAllNotificationsRead();
       } else {
-        loadSessionNotifications();
+        loadNotifications();
       }
     }
   }
@@ -45,17 +45,24 @@
   }
 
   function handleClearAll() {
-    if (!messagesState.bootstrapped || !hasCurrentSession) {
+    if (!messagesState.bootstrapped || !hasWorkspace) {
       return;
     }
     clearAllNotifications();
   }
 
   function handleRemove(id: string) {
-    if (!messagesState.bootstrapped || !hasCurrentSession) {
+    if (!messagesState.bootstrapped || !hasWorkspace) {
       return;
     }
     removeNotification(id);
+  }
+
+  function handleResolve(id: string) {
+    if (!messagesState.bootstrapped || !hasWorkspace) {
+      return;
+    }
+    resolveNotification(id);
   }
 
   function formatTime(timestamp: number): string {
@@ -63,9 +70,8 @@
     return d.toLocaleTimeString(i18n.locale, { hour: '2-digit', minute: '2-digit', second: '2-digit' });
   }
 
-  function getCategoryLabel(category: 'incident' | 'audit'): string {
-    if (category === 'incident') return i18n.t('notification.categoryIncident');
-    return i18n.t('notification.categoryAudit');
+  function getScopeLabel(scope: Notification['scope']): string {
+    return i18n.t(`notification.scope.${scope}`);
   }
 
   function getTypeIcon(type: string): 'check' | 'close' | 'warning' | 'info' {
@@ -113,11 +119,11 @@
           <button class="filter-btn" class:active={activeFilter === 'all'} onclick={() => activeFilter = 'all'}>
             {i18n.t('notification.filterAll')}
           </button>
-          <button class="filter-btn" class:active={activeFilter === 'incident'} onclick={() => activeFilter = 'incident'}>
-            {i18n.t('notification.filterIncident')}
+          <button class="filter-btn" class:active={activeFilter === 'unresolved'} onclick={() => activeFilter = 'unresolved'}>
+            {i18n.t('notification.filterUnresolved')}
           </button>
-          <button class="filter-btn" class:active={activeFilter === 'audit'} onclick={() => activeFilter = 'audit'}>
-            {i18n.t('notification.filterAudit')}
+          <button class="filter-btn" class:active={activeFilter === 'resolved'} onclick={() => activeFilter = 'resolved'}>
+            {i18n.t('notification.filterResolved')}
           </button>
         </div>
       {/if}
@@ -145,7 +151,7 @@
             </div>
           {/if}
           {#each filteredNotifications as notif (notif.id)}
-            <div class="notification-item type-{notif.type}">
+            <div class="notification-item type-{notif.type}" class:resolved={notif.resolved}>
               <div class="notif-icon">
                 <Icon name={getTypeIcon(notif.type)} size={14} />
               </div>
@@ -155,18 +161,33 @@
                 {/if}
                 <div class="notif-message">{notif.message}</div>
                 <div class="notif-meta">
-                  <span class="notif-category">{getCategoryLabel(notif.category)}</span>
+                  <span class="notif-scope">{getScopeLabel(notif.scope)}</span>
+                  {#if notif.occurrenceCount > 1}
+                    <span class="notif-count">{i18n.t('notification.occurrences', { count: notif.occurrenceCount })}</span>
+                  {/if}
                   <span class="notif-time">{formatTime(notif.timestamp)}</span>
                 </div>
               </div>
-              <button
-                class="notif-remove"
-                onclick={() => handleRemove(notif.id)}
-                title={i18n.t('notification.removeTitle')}
-                disabled={notificationStatus.isLoading}
-              >
-                <Icon name="close" size={10} />
-              </button>
+              <div class="notif-actions">
+                {#if !notif.resolved}
+                  <button
+                    class="notif-action"
+                    onclick={() => handleResolve(notif.id)}
+                    title={i18n.t('notification.resolveTitle')}
+                    disabled={notificationStatus.isLoading}
+                  >
+                    <Icon name="check" size={11} />
+                  </button>
+                {/if}
+                <button
+                  class="notif-action"
+                  onclick={() => handleRemove(notif.id)}
+                  title={i18n.t('notification.removeTitle')}
+                  disabled={notificationStatus.isLoading}
+                >
+                  <Icon name="close" size={10} />
+                </button>
+              </div>
             </div>
           {/each}
         {/if}
@@ -213,8 +234,8 @@
     top: 100%;
     right: 0;
     margin-top: var(--space-2, 4px);
-    width: 320px;
-    max-height: 400px;
+    width: min(320px, calc(100vw - 24px));
+    max-height: min(420px, calc(100vh - 72px));
     background: var(--dropdown-bg);
     border: 1px solid var(--border);
     border-radius: var(--radius-md, 6px);
@@ -354,6 +375,10 @@
     background: var(--surface-hover);
   }
 
+  .notification-item.resolved {
+    opacity: 0.68;
+  }
+
   .notif-icon {
     flex-shrink: 0;
     width: 18px;
@@ -396,14 +421,13 @@
     margin-top: 4px;
   }
 
-  .notif-category {
+  .notif-scope,
+  .notif-count {
     font-size: 10px;
     color: var(--foreground-muted);
     border: 1px solid var(--border);
-    border-radius: 999px;
+    border-radius: var(--radius-sm, 4px);
     padding: 1px 6px;
-    text-transform: uppercase;
-    letter-spacing: 0.3px;
   }
 
   .notif-time {
@@ -411,7 +435,13 @@
     color: var(--foreground-muted);
   }
 
-  .notif-remove {
+  .notif-actions {
+    display: flex;
+    flex-shrink: 0;
+    gap: 2px;
+  }
+
+  .notif-action {
     flex-shrink: 0;
     width: 18px;
     height: 18px;
@@ -424,20 +454,20 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    opacity: 0;
+    opacity: 0.65;
     transition: all var(--transition-fast, 0.15s);
   }
 
-  .notification-item:hover .notif-remove {
+  .notification-item:hover .notif-action {
     opacity: 1;
   }
 
-  .notif-remove:hover {
+  .notif-action:hover {
     background: var(--surface-hover);
     color: var(--foreground);
   }
 
-  .notif-remove:disabled {
+  .notif-action:disabled {
     cursor: default;
     opacity: 0.45;
   }

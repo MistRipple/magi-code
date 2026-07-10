@@ -2,7 +2,10 @@ use crate::baseline_index::{BaselineIndex, RefsIndex, baseline_path, refs_path};
 use crate::blob_store::BlobStore;
 use crate::change_log::ChangeLog;
 use crate::error::{SnapshotError, SnapshotResult};
-use crate::scan::{SnapshotPathFilter, read_file_meta, read_large_text_summary, walk_workspace};
+use crate::scan::{
+    SnapshotPathFilter, hash_file, mtime_ms, read_file_meta, read_large_text_summary,
+    walk_workspace,
+};
 use crate::tool_hook::{ToolHook, ToolHookCtx};
 use crate::types::{
     ChangeEvent, ChangeKind, ContentKind, FileMeta, PendingChange, SourceKind, SymlinkTargetKind,
@@ -64,7 +67,11 @@ impl SnapshotSession {
 
         let baseline = BaselineIndex::load(&baseline_path(&session_dir))?;
         let refs = RefsIndex::load(&refs_path(&session_dir))?;
-        let events = Arc::new(ChangeLog::open(session_dir.join("events.log"))?);
+        let events_path = session_dir.join("events.log");
+        if !baseline.is_empty() {
+            migrate_change_log_content_hashes(&workspace_root, &events_path)?;
+        }
+        let events = Arc::new(ChangeLog::open(events_path)?);
 
         let session = Arc::new(Self {
             session_id,
@@ -81,7 +88,7 @@ impl SnapshotSession {
             _watcher: tokio::sync::Mutex::new(None),
         });
 
-        // baseline 不存在时（首次启动），后台扫描并填充。
+        // baseline 不存在时（首次启动），执行首次扫描并填充。
         let needs_initial_scan = session
             .baseline
             .read()
@@ -90,7 +97,10 @@ impl SnapshotSession {
         if needs_initial_scan {
             session.run_initial_scan(respect_gitignore)?;
         } else {
+            session.migrate_loaded_baseline_content_hashes()?;
             session.replay_events_into_current()?;
+            session.retain_loaded_blob_ownership();
+            session.reconcile()?;
         }
 
         // 启动 watcher。
@@ -122,13 +132,7 @@ impl SnapshotSession {
     /// 删除 session：停 watcher、清 baseline/events/refs、释放 blob 引用。
     pub async fn drop_session(&self) -> SnapshotResult<()> {
         self.archive().await;
-        let baseline = self.baseline.read().expect("baseline poisoned");
-        for meta in baseline.entries.values() {
-            if let Some(h) = &meta.blob_hash {
-                self.blobs.release(h)?;
-            }
-        }
-        drop(baseline);
+        self.release_runtime_blob_ownership()?;
         if self.session_dir.exists() {
             std::fs::remove_dir_all(&self.session_dir)
                 .map_err(|e| SnapshotError::io(&self.session_dir, e))?;
@@ -156,6 +160,9 @@ impl SnapshotSession {
             }
         }
         baseline.save(&baseline_path(&self.session_dir))?;
+        for meta in baseline.entries.values() {
+            self.retain_meta_blob(meta);
+        }
         let mut current = self.current.write().expect("current poisoned");
         *current = baseline.entries.clone().into_iter().collect();
         let mut guard = self.baseline.write().expect("baseline poisoned");
@@ -193,6 +200,60 @@ impl SnapshotSession {
 
         *self.current.write().expect("current poisoned") = current;
         *self.last_event.write().expect("last_event poisoned") = last_event;
+        Ok(())
+    }
+
+    fn migrate_loaded_baseline_content_hashes(&self) -> SnapshotResult<()> {
+        let mut baseline = self.baseline.write().expect("baseline poisoned");
+        let mut migrated = false;
+
+        for meta in baseline.entries.values_mut() {
+            migrated |= migrate_file_meta_content_hash(&self.workspace_root, meta)?;
+        }
+
+        if migrated {
+            baseline.save(&baseline_path(&self.session_dir))?;
+        }
+        Ok(())
+    }
+
+    fn retain_loaded_blob_ownership(&self) {
+        let baseline = self.baseline.read().expect("baseline poisoned");
+        for meta in baseline.entries.values() {
+            self.retain_meta_blob(meta);
+        }
+        drop(baseline);
+
+        let current = self.current.read().expect("current poisoned");
+        for meta in current.values() {
+            self.retain_meta_blob(meta);
+        }
+    }
+
+    pub(crate) fn release_runtime_blob_ownership(&self) -> SnapshotResult<()> {
+        let baseline = self.baseline.read().expect("baseline poisoned");
+        for meta in baseline.entries.values() {
+            self.release_meta_blob(meta)?;
+        }
+        drop(baseline);
+
+        let current = self.current.read().expect("current poisoned");
+        for meta in current.values() {
+            self.release_meta_blob(meta)?;
+        }
+        Ok(())
+    }
+
+    fn retain_meta_blob(&self, meta: &FileMeta) {
+        if let Some(hash) = &meta.blob_hash {
+            self.blobs.retain(hash, 1);
+        }
+    }
+
+    fn release_meta_blob(&self, meta: &FileMeta) -> SnapshotResult<()> {
+        if let Some(hash) = &meta.blob_hash {
+            self.blobs.release(hash)?;
+        }
         Ok(())
     }
 
@@ -238,6 +299,7 @@ impl SnapshotSession {
             .map(|b| meta_unchanged(b, &meta))
             .unwrap_or(false);
         if unchanged {
+            self.release_meta_blob(&meta)?;
             return Ok(());
         }
 
@@ -259,11 +321,18 @@ impl SnapshotSession {
             after: Some(meta.clone()),
         };
 
-        self.events.append(&event)?;
-        self.current
+        if let Err(error) = self.events.append(&event) {
+            self.release_meta_blob(&meta)?;
+            return Err(error);
+        }
+        let replaced = self
+            .current
             .write()
             .expect("current poisoned")
             .insert(path_key.clone(), meta);
+        if let Some(previous) = replaced.as_ref() {
+            self.release_meta_blob(previous)?;
+        }
         self.last_event
             .write()
             .expect("last_event poisoned")
@@ -281,7 +350,12 @@ impl SnapshotSession {
             Ok(r) => r.to_string_lossy().replace('\\', "/"),
             Err(_) => return Ok(()),
         };
-        let before = self.current.write().expect("current poisoned").remove(&rel);
+        let before = self
+            .current
+            .read()
+            .expect("current poisoned")
+            .get(&rel)
+            .cloned();
         let event = ChangeEvent {
             event_id: new_event_id(),
             timestamp_ms: now_ms(),
@@ -294,6 +368,10 @@ impl SnapshotSession {
             after: None,
         };
         self.events.append(&event)?;
+        let removed = self.current.write().expect("current poisoned").remove(&rel);
+        if let Some(previous) = removed.as_ref() {
+            self.release_meta_blob(previous)?;
+        }
         self.last_event
             .write()
             .expect("last_event poisoned")
@@ -443,6 +521,12 @@ impl SnapshotSession {
         let size = primary_meta.size;
         let mime = primary_meta.mime.clone();
         let error = primary_meta.error.clone();
+        let revertible = match change_kind {
+            ChangeKind::Added => true,
+            ChangeKind::Modified | ChangeKind::Deleted | ChangeKind::Renamed => {
+                base.is_some_and(meta_can_restore)
+            }
+        };
         let symlink_target = primary_meta.symlink.as_ref().map(|s| s.target.clone());
 
         let mut original_content: Option<String> = None;
@@ -492,6 +576,7 @@ impl SnapshotSession {
             size,
             mime,
             error,
+            revertible,
             symlink_target,
             original_content,
             preview_content,
@@ -549,6 +634,25 @@ impl SnapshotSession {
 
     /// 把 paths 还原到 baseline 状态。
     pub fn revert(&self, paths: &[String]) -> SnapshotResult<usize> {
+        let pending = self.pending_changes()?;
+        let unrestorable = paths
+            .iter()
+            .filter_map(|path| {
+                pending
+                    .iter()
+                    .find(|change| {
+                        change.path == *path || change.old_path.as_deref() == Some(path.as_str())
+                    })
+                    .filter(|change| !change.revertible)
+                    .map(|change| change.path.clone())
+            })
+            .collect::<Vec<_>>();
+        if !unrestorable.is_empty() {
+            return Err(SnapshotError::Internal(format!(
+                "snapshot baseline content unavailable for: {}",
+                unrestorable.join(", ")
+            )));
+        }
         let paths = self.expand_rename_pairs(paths)?;
         let baseline = self.baseline.read().expect("baseline poisoned");
         let mut applied = 0usize;
@@ -676,6 +780,59 @@ impl ToolHook for SnapshotSession {
     }
 }
 
+fn migrate_change_log_content_hashes(
+    workspace_root: &Path,
+    events_path: &Path,
+) -> SnapshotResult<()> {
+    if !events_path.exists() {
+        return Ok(());
+    }
+    let mut events = ChangeLog::read_path(events_path)?;
+    let mut migrated = false;
+    for event in &mut events {
+        for meta in [event.before.as_mut(), event.after.as_mut()]
+            .into_iter()
+            .flatten()
+        {
+            migrated |= migrate_file_meta_content_hash(workspace_root, meta)?;
+        }
+    }
+    if migrated {
+        ChangeLog::rewrite(events_path, &events)?;
+    }
+    Ok(())
+}
+
+fn migrate_file_meta_content_hash(
+    workspace_root: &Path,
+    meta: &mut FileMeta,
+) -> SnapshotResult<bool> {
+    if meta.content_hash.is_some() {
+        return Ok(false);
+    }
+    if let Some(blob_hash) = meta.blob_hash.as_ref() {
+        meta.content_hash = Some(blob_hash.clone());
+        return Ok(true);
+    }
+    if !matches!(
+        meta.content_kind,
+        ContentKind::LargeText | ContentKind::Binary
+    ) || meta.error.is_some()
+    {
+        return Ok(false);
+    }
+
+    let path = workspace_root.join(&meta.path);
+    let Ok(metadata) = std::fs::metadata(&path) else {
+        return Ok(false);
+    };
+    if !metadata.is_file() || metadata.len() != meta.size || mtime_ms(&metadata) != meta.mtime_ms {
+        return Ok(false);
+    }
+    meta.content_hash = Some(hash_file(&path)?);
+    Ok(true)
+}
+
 fn collapse_renames(
     pending: Vec<PendingChange>,
     baseline: &BTreeMap<String, FileMeta>,
@@ -733,6 +890,7 @@ fn collapse_renames(
         if let Some(renamed) = pending[added_index].as_mut() {
             renamed.change_kind = ChangeKind::Renamed;
             renamed.old_path = Some(deleted.path);
+            renamed.revertible = renamed.revertible && deleted.revertible;
         }
     }
 
@@ -758,7 +916,17 @@ fn meta_unchanged(a: &FileMeta, b: &FileMeta) -> bool {
         && a.content_kind == b.content_kind
         && a.size == b.size
         && a.blob_hash == b.blob_hash
+        && a.content_hash == b.content_hash
+        && a.symlink == b.symlink
         && a.error == b.error
+}
+
+fn meta_can_restore(meta: &FileMeta) -> bool {
+    match meta.content_kind {
+        ContentKind::Text | ContentKind::Binary => meta.blob_hash.is_some(),
+        ContentKind::Symlink => meta.symlink.is_some(),
+        ContentKind::LargeText | ContentKind::Special => false,
+    }
 }
 
 fn now_ms() -> u64 {

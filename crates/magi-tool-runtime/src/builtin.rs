@@ -141,18 +141,13 @@ impl BuiltinTool for NormalizedBuiltinTool {
             BuiltinToolName::KnowledgeQuery => execute_knowledge_query(input, context, resources),
             BuiltinToolName::CodeSymbols => execute_code_symbols(input, context, resources),
             BuiltinToolName::ToolCatalog => execute_tool_catalog(input, context, resources),
+            BuiltinToolName::GetGoal
+            | BuiltinToolName::CreateGoal
+            | BuiltinToolName::UpdateGoal => execute_orchestration_only(self.name, input),
             BuiltinToolName::AgentSpawn
             | BuiltinToolName::AgentWait
             | BuiltinToolName::TodoWrite
-            | BuiltinToolName::MemoryWrite
-            | BuiltinToolName::MissionCharterWrite
-            | BuiltinToolName::PlanWrite
-            | BuiltinToolName::KgWrite
-            | BuiltinToolName::ValidationRecord
-            | BuiltinToolName::Checkpoint
-            | BuiltinToolName::HumanCheckpointRequest => {
-                execute_orchestration_only(self.name, input)
-            }
+            | BuiltinToolName::MemoryWrite => execute_orchestration_only(self.name, input),
         }
     }
 
