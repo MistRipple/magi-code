@@ -150,7 +150,7 @@ fn is_token_start_boundary(value: &str, start: usize) -> bool {
     value[..start]
         .chars()
         .next_back()
-        .map_or(true, |ch| !is_token_char(ch))
+        .is_none_or(|ch| !is_token_char(ch))
 }
 
 fn redact_absolute_paths(value: &str) -> String {

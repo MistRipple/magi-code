@@ -247,7 +247,7 @@ impl CodeTokenizer {
 
         if identifier.contains('_') || identifier.contains('-') {
             let parts: Vec<&str> = identifier
-                .split(|c: char| c == '_' || c == '-')
+                .split(['_', '-'])
                 .filter(|p| p.len() >= 2)
                 .collect();
             for part in &parts {

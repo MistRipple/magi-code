@@ -157,25 +157,26 @@ impl MissionSharedContextPool {
                 if e.mission_id != mission_id {
                     return false;
                 }
-                if let Some(expires) = e.expires_at {
-                    if expires < now {
-                        return false;
-                    }
+                if let Some(expires) = e.expires_at
+                    && expires < now
+                {
+                    return false;
                 }
-                if let Some(min_imp) = options.min_importance {
-                    if e.importance < min_imp {
-                        return false;
-                    }
+                if let Some(min_imp) = options.min_importance
+                    && e.importance < min_imp
+                {
+                    return false;
                 }
-                if let Some(ref tags) = options.subscribed_tags {
-                    if !tags.is_empty() && !e.tags.iter().any(|t| tags.contains(t)) {
-                        return false;
-                    }
+                if let Some(ref tags) = options.subscribed_tags
+                    && !tags.is_empty()
+                    && !e.tags.iter().any(|t| tags.contains(t))
+                {
+                    return false;
                 }
-                if let Some(ref excludes) = options.exclude_sources {
-                    if excludes.contains(&e.source) {
-                        return false;
-                    }
+                if let Some(ref excludes) = options.exclude_sources
+                    && excludes.contains(&e.source)
+                {
+                    return false;
                 }
                 true
             })
@@ -211,7 +212,7 @@ impl MissionSharedContextPool {
         let mut entries: Vec<&SharedContextEntry> = ids
             .iter()
             .filter_map(|id| self.entries.get(id))
-            .filter(|e| e.expires_at.map_or(true, |exp| exp >= now))
+            .filter(|e| e.expires_at.is_none_or(|exp| exp >= now))
             .collect();
         entries.sort_by(|a, b| b.importance.cmp(&a.importance));
         entries
@@ -247,7 +248,7 @@ impl MissionSharedContextPool {
         let expired: Vec<String> = self
             .entries
             .iter()
-            .filter(|(_, e)| e.expires_at.map_or(false, |exp| exp < now))
+            .filter(|(_, e)| e.expires_at.is_some_and(|exp| exp < now))
             .map(|(id, _)| id.clone())
             .collect();
         let count = expired.len();

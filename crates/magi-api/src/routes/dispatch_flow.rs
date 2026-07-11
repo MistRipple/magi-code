@@ -34,26 +34,40 @@ pub(super) async fn accept_session_task_submission(
     accept_session_task_submission_at(
         state,
         request,
-        images,
-        workspace_id,
-        task_title,
-        execution_goal,
-        task_tier,
-        monotonic_accepted_at(),
+        SessionTaskSubmissionInput {
+            images,
+            workspace_id,
+            task_title,
+            execution_goal,
+            task_tier,
+            accepted_at: monotonic_accepted_at(),
+        },
     )
     .await
+}
+
+pub(super) struct SessionTaskSubmissionInput {
+    pub images: Vec<SessionTurnImage>,
+    pub workspace_id: WorkspaceId,
+    pub task_title: Option<String>,
+    pub execution_goal: Option<String>,
+    pub task_tier: TaskTier,
+    pub accepted_at: UtcMillis,
 }
 
 pub(super) async fn accept_session_task_submission_at(
     state: &ApiState,
     request: &SessionTurnRequestDto,
-    images: Vec<SessionTurnImage>,
-    workspace_id: WorkspaceId,
-    task_title: Option<String>,
-    execution_goal: Option<String>,
-    task_tier: TaskTier,
-    accepted_at: UtcMillis,
+    input: SessionTaskSubmissionInput,
 ) -> Result<(DispatchSubmissionAccepted, EventId), ApiError> {
+    let SessionTaskSubmissionInput {
+        images,
+        workspace_id,
+        task_title,
+        execution_goal,
+        task_tier,
+        accepted_at,
+    } = input;
     let trimmed_text = request.trimmed_text();
     let message = request.timeline_message(trimmed_text.as_deref());
     let mission_title = task_title
@@ -70,24 +84,25 @@ pub(super) async fn accept_session_task_submission_at(
 
     execute_dispatch_submission(
         state,
-        request.requested_session_id(),
-        workspace_id,
-        mission_title,
-        message,
-        trimmed_text,
-        execution_goal,
-        task_tier,
-        request.skill_name.clone(),
-        None,
-        images,
-        request,
-        accepted_at,
+        ExecuteDispatchSubmissionInput {
+            requested_session_id: request.requested_session_id(),
+            requested_workspace_id: workspace_id,
+            mission_title,
+            message,
+            trimmed_text,
+            execution_goal,
+            task_tier,
+            skill_name: request.skill_name.clone(),
+            target_role: None,
+            images,
+            request,
+            accepted_at,
+        },
     )
     .await
 }
 
-async fn execute_dispatch_submission(
-    state: &ApiState,
+struct ExecuteDispatchSubmissionInput<'a> {
     requested_session_id: Option<SessionId>,
     requested_workspace_id: WorkspaceId,
     mission_title: String,
@@ -98,9 +113,28 @@ async fn execute_dispatch_submission(
     skill_name: Option<String>,
     target_role: Option<String>,
     images: Vec<SessionTurnImage>,
-    request: &SessionTurnRequestDto,
+    request: &'a SessionTurnRequestDto,
     accepted_at: UtcMillis,
+}
+
+async fn execute_dispatch_submission(
+    state: &ApiState,
+    input: ExecuteDispatchSubmissionInput<'_>,
 ) -> Result<(DispatchSubmissionAccepted, EventId), ApiError> {
+    let ExecuteDispatchSubmissionInput {
+        requested_session_id,
+        requested_workspace_id,
+        mission_title,
+        message,
+        trimmed_text,
+        execution_goal,
+        task_tier,
+        skill_name,
+        target_role,
+        images,
+        request,
+        accepted_at,
+    } = input;
     let placeholder_title = crate::session_title::NEW_SESSION_PLACEHOLDER_TITLE;
     let (session_id, created_session, workspace_id) = resolve_dispatch_session(
         state,
@@ -234,144 +268,6 @@ fn format_action_task_title(mission_title: &str) -> String {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{format_action_task_title, resolve_dispatch_session};
-    use crate::state::ApiState;
-    use magi_core::{AbsolutePath, SessionId, UtcMillis, WorkspaceId};
-    use magi_event_bus::InMemoryEventBus;
-    use magi_governance::GovernanceService;
-    use magi_session_store::{SessionStore, TimelineEntryKind};
-    use magi_workspace::WorkspaceStore;
-    use std::sync::Arc;
-
-    fn test_state() -> ApiState {
-        ApiState::new(
-            "magi-test",
-            Arc::new(InMemoryEventBus::new(32)),
-            Arc::new(SessionStore::default()),
-            Arc::new(WorkspaceStore::default()),
-            Arc::new(GovernanceService::default()),
-        )
-    }
-
-    #[test]
-    fn action_task_title_does_not_repeat_execute_prefix() {
-        assert_eq!(
-            format_action_task_title("执行: 批量检查 README"),
-            "执行: 批量检查 README"
-        );
-        assert_eq!(
-            format_action_task_title("批量检查 README"),
-            "执行: 批量检查 README"
-        );
-    }
-
-    #[test]
-    fn resolve_dispatch_session_ignores_empty_current_session_without_explicit_session() {
-        let state = test_state();
-        let workspace_id = WorkspaceId::new("workspace-dispatch-empty-current");
-        state
-            .workspace_registry
-            .register(
-                workspace_id.clone(),
-                AbsolutePath::new("/tmp/magi-dispatch-empty-current"),
-            )
-            .expect("workspace should register");
-        let empty_session_id = SessionId::new("session-empty-current");
-        state
-            .session_store
-            .create_session_for_workspace(
-                empty_session_id.clone(),
-                "空白会话",
-                Some(workspace_id.to_string()),
-            )
-            .expect("empty session should create");
-
-        let (resolved_session_id, created_session, resolved_workspace_id) =
-            resolve_dispatch_session(
-                &state,
-                None,
-                Some(workspace_id.clone()),
-                "真实首条消息",
-                UtcMillis::now(),
-            )
-            .expect("dispatch session should resolve");
-
-        assert_ne!(resolved_session_id, empty_session_id);
-        assert!(created_session);
-        assert_eq!(resolved_workspace_id, Some(workspace_id));
-    }
-
-    #[test]
-    fn resolve_dispatch_session_uses_turn_accept_time_for_new_session_creation() {
-        let state = test_state();
-        let workspace_id = WorkspaceId::new("workspace-dispatch-accepted-at");
-        state
-            .workspace_registry
-            .register(
-                workspace_id.clone(),
-                AbsolutePath::new("/tmp/magi-dispatch-accepted-at"),
-            )
-            .expect("workspace should register");
-        let accepted_at = UtcMillis(1_779_700_000_000);
-
-        let (resolved_session_id, created_session, _) =
-            resolve_dispatch_session(&state, None, Some(workspace_id), "新会话", accepted_at)
-                .expect("dispatch session should resolve");
-
-        let session = state
-            .session_store
-            .session(&resolved_session_id)
-            .expect("created session should exist");
-        assert!(created_session);
-        assert_eq!(session.created_at, accepted_at);
-        assert_eq!(session.updated_at, accepted_at);
-    }
-
-    #[test]
-    fn resolve_dispatch_session_creates_new_without_explicit_session_even_when_current_has_history()
-    {
-        let state = test_state();
-        let workspace_id = WorkspaceId::new("workspace-dispatch-current-history");
-        state
-            .workspace_registry
-            .register(
-                workspace_id.clone(),
-                AbsolutePath::new("/tmp/magi-dispatch-current-history"),
-            )
-            .expect("workspace should register");
-        let session_id = SessionId::new("session-current-history");
-        state
-            .session_store
-            .create_session_for_workspace(
-                session_id.clone(),
-                "已有历史",
-                Some(workspace_id.to_string()),
-            )
-            .expect("session should create");
-        state.session_store.append_timeline_entry(
-            session_id.clone(),
-            TimelineEntryKind::UserMessage,
-            "已有用户消息",
-        );
-
-        let (resolved_session_id, created_session, resolved_workspace_id) =
-            resolve_dispatch_session(
-                &state,
-                None,
-                Some(workspace_id.clone()),
-                "后续消息",
-                UtcMillis::now(),
-            )
-            .expect("dispatch session should resolve");
-
-        assert_ne!(resolved_session_id, session_id);
-        assert!(created_session);
-        assert_eq!(resolved_workspace_id, Some(workspace_id));
-    }
-}
-
 fn publish_session_turn_task_accepted_event(
     state: &ApiState,
     request: &SessionTurnRequestDto,
@@ -417,10 +313,7 @@ fn publish_session_turn_task_accepted_event(
         workspace_id,
         ..EventContext::default()
     });
-    state
-        .event_bus
-        .publish(event)
-        .map_err(|err| ApiError::event_publish_failed("事件发布失败", err))?;
+    state.event_bus.publish(event);
     Ok(event_id)
 }
 
@@ -594,4 +487,142 @@ fn assistant_final_from_turn(
         })
         .max_by_key(|(item_seq, _, _)| *item_seq)
         .map(|(_, content, item_id)| (content, item_id))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{format_action_task_title, resolve_dispatch_session};
+    use crate::state::ApiState;
+    use magi_core::{AbsolutePath, SessionId, UtcMillis, WorkspaceId};
+    use magi_event_bus::InMemoryEventBus;
+    use magi_governance::GovernanceService;
+    use magi_session_store::{SessionStore, TimelineEntryKind};
+    use magi_workspace::WorkspaceStore;
+    use std::sync::Arc;
+
+    fn test_state() -> ApiState {
+        ApiState::new(
+            "magi-test",
+            Arc::new(InMemoryEventBus::new(32)),
+            Arc::new(SessionStore::default()),
+            Arc::new(WorkspaceStore::default()),
+            Arc::new(GovernanceService::default()),
+        )
+    }
+
+    #[test]
+    fn action_task_title_does_not_repeat_execute_prefix() {
+        assert_eq!(
+            format_action_task_title("执行: 批量检查 README"),
+            "执行: 批量检查 README"
+        );
+        assert_eq!(
+            format_action_task_title("批量检查 README"),
+            "执行: 批量检查 README"
+        );
+    }
+
+    #[test]
+    fn resolve_dispatch_session_ignores_empty_current_session_without_explicit_session() {
+        let state = test_state();
+        let workspace_id = WorkspaceId::new("workspace-dispatch-empty-current");
+        state
+            .workspace_registry
+            .register(
+                workspace_id.clone(),
+                AbsolutePath::new("/tmp/magi-dispatch-empty-current"),
+            )
+            .expect("workspace should register");
+        let empty_session_id = SessionId::new("session-empty-current");
+        state
+            .session_store
+            .create_session_for_workspace(
+                empty_session_id.clone(),
+                "空白会话",
+                Some(workspace_id.to_string()),
+            )
+            .expect("empty session should create");
+
+        let (resolved_session_id, created_session, resolved_workspace_id) =
+            resolve_dispatch_session(
+                &state,
+                None,
+                Some(workspace_id.clone()),
+                "真实首条消息",
+                UtcMillis::now(),
+            )
+            .expect("dispatch session should resolve");
+
+        assert_ne!(resolved_session_id, empty_session_id);
+        assert!(created_session);
+        assert_eq!(resolved_workspace_id, Some(workspace_id));
+    }
+
+    #[test]
+    fn resolve_dispatch_session_uses_turn_accept_time_for_new_session_creation() {
+        let state = test_state();
+        let workspace_id = WorkspaceId::new("workspace-dispatch-accepted-at");
+        state
+            .workspace_registry
+            .register(
+                workspace_id.clone(),
+                AbsolutePath::new("/tmp/magi-dispatch-accepted-at"),
+            )
+            .expect("workspace should register");
+        let accepted_at = UtcMillis(1_779_700_000_000);
+
+        let (resolved_session_id, created_session, _) =
+            resolve_dispatch_session(&state, None, Some(workspace_id), "新会话", accepted_at)
+                .expect("dispatch session should resolve");
+
+        let session = state
+            .session_store
+            .session(&resolved_session_id)
+            .expect("created session should exist");
+        assert!(created_session);
+        assert_eq!(session.created_at, accepted_at);
+        assert_eq!(session.updated_at, accepted_at);
+    }
+
+    #[test]
+    fn resolve_dispatch_session_creates_new_without_explicit_session_even_when_current_has_history()
+    {
+        let state = test_state();
+        let workspace_id = WorkspaceId::new("workspace-dispatch-current-history");
+        state
+            .workspace_registry
+            .register(
+                workspace_id.clone(),
+                AbsolutePath::new("/tmp/magi-dispatch-current-history"),
+            )
+            .expect("workspace should register");
+        let session_id = SessionId::new("session-current-history");
+        state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "已有历史",
+                Some(workspace_id.to_string()),
+            )
+            .expect("session should create");
+        state.session_store.append_timeline_entry(
+            session_id.clone(),
+            TimelineEntryKind::UserMessage,
+            "已有用户消息",
+        );
+
+        let (resolved_session_id, created_session, resolved_workspace_id) =
+            resolve_dispatch_session(
+                &state,
+                None,
+                Some(workspace_id.clone()),
+                "后续消息",
+                UtcMillis::now(),
+            )
+            .expect("dispatch session should resolve");
+
+        assert_ne!(resolved_session_id, session_id);
+        assert!(created_session);
+        assert_eq!(resolved_workspace_id, Some(workspace_id));
+    }
 }

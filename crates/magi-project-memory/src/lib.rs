@@ -376,9 +376,7 @@ pub enum MemoryWriteAction {
 /// ```
 pub fn parse_memory_write_arguments(raw: &str) -> Result<MemoryWriteAction, MemoryWriteError> {
     let value: serde_json::Value = serde_json::from_str(raw)?;
-    let obj = value
-        .as_object()
-        .ok_or_else(|| MemoryWriteError::MissingAction)?;
+    let obj = value.as_object().ok_or(MemoryWriteError::MissingAction)?;
     let action = obj
         .get("action")
         .and_then(|v| v.as_str())

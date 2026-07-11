@@ -26,6 +26,17 @@ pub struct ModelUsageBinding {
     phase: UsagePhase,
 }
 
+pub struct ModelUsageRecordInput<'a> {
+    pub session_id: &'a SessionId,
+    pub workspace_id: &'a Option<WorkspaceId>,
+    pub binding: &'a ModelUsageBinding,
+    pub call_id: String,
+    pub usage: Option<&'a serde_json::Value>,
+    pub status: UsageCallStatus,
+    pub assignment_id: Option<String>,
+    pub error_code: Option<String>,
+}
+
 pub fn session_turn_model_usage_binding(use_tools: bool) -> ModelUsageBinding {
     ModelUsageBinding {
         template_id: "orchestrator".to_string(),
@@ -81,15 +92,18 @@ pub fn publish_model_usage_record(
     event_bus: &InMemoryEventBus,
     session_store: &SessionStore,
     settings_store: Option<&Arc<SettingsStore>>,
-    session_id: &SessionId,
-    workspace_id: &Option<WorkspaceId>,
-    binding: &ModelUsageBinding,
-    call_id: String,
-    usage: Option<&serde_json::Value>,
-    status: UsageCallStatus,
-    assignment_id: Option<String>,
-    error_code: Option<String>,
+    input: ModelUsageRecordInput<'_>,
 ) {
+    let ModelUsageRecordInput {
+        session_id,
+        workspace_id,
+        binding,
+        call_id,
+        usage,
+        status,
+        assignment_id,
+        error_code,
+    } = input;
     let Some(usage) = usage_tokens_from_payload(usage) else {
         return;
     };
@@ -533,14 +547,16 @@ mod tests {
             &event_bus,
             &session_store,
             Some(&settings_store),
-            &session_id,
-            &workspace_id,
-            &binding,
-            "call-1".to_string(),
-            Some(&json!({"prompt_tokens": 3, "completion_tokens": 7})),
-            UsageCallStatus::Success,
-            Some("assignment-1".to_string()),
-            None,
+            ModelUsageRecordInput {
+                session_id: &session_id,
+                workspace_id: &workspace_id,
+                binding: &binding,
+                call_id: "call-1".to_string(),
+                usage: Some(&json!({"prompt_tokens": 3, "completion_tokens": 7})),
+                status: UsageCallStatus::Success,
+                assignment_id: Some("assignment-1".to_string()),
+                error_code: None,
+            },
         );
 
         let snapshot = event_bus.snapshot();
@@ -594,14 +610,16 @@ mod tests {
             &event_bus,
             &session_store,
             Some(&settings_store),
-            &session_id,
-            &None,
-            &binding,
-            "call-1".to_string(),
-            Some(&json!({"prompt_tokens": 3, "completion_tokens": 7})),
-            UsageCallStatus::Success,
-            Some("assignment-1".to_string()),
-            None,
+            ModelUsageRecordInput {
+                session_id: &session_id,
+                workspace_id: &None,
+                binding: &binding,
+                call_id: "call-1".to_string(),
+                usage: Some(&json!({"prompt_tokens": 3, "completion_tokens": 7})),
+                status: UsageCallStatus::Success,
+                assignment_id: Some("assignment-1".to_string()),
+                error_code: None,
+            },
         );
 
         assert!(

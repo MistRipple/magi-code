@@ -952,11 +952,7 @@ mod tests {
                 mission_id: mission_id.clone(),
                 root_task_id: root_task_id.clone(),
                 parent_task_id,
-                kind: if task_id == &root_task_id {
-                    magi_core::TaskKind::LocalAgent
-                } else {
-                    magi_core::TaskKind::LocalAgent
-                },
+                kind: magi_core::TaskKind::LocalAgent,
                 title: task_id.to_string(),
                 goal: task_id.to_string(),
                 status,

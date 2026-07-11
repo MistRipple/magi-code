@@ -394,25 +394,25 @@ fn scan_directory(root: &Path, current: &Path, files: &mut Vec<ScannedFile>) {
 
         if file_type.is_dir() {
             scan_directory(root, &path, files);
-        } else if file_type.is_file() {
-            if let Some(relative) = pathdiff::diff_paths(&path, root) {
-                let rel_str = relative.to_string_lossy().replace('\\', "/");
-                if is_indexable_code_path(&rel_str) {
-                    if let Ok(metadata) = std::fs::metadata(&path) {
-                        if metadata.len() > MAX_INDEXED_FILE_BYTES {
-                            continue;
-                        }
-                        let size = metadata.len();
-                        let lines = count_lines(&path);
-                        let language = detect_language(&rel_str);
-                        files.push(ScannedFile {
-                            path: rel_str,
-                            language,
-                            size,
-                            lines,
-                        });
-                    }
+        } else if file_type.is_file()
+            && let Some(relative) = pathdiff::diff_paths(&path, root)
+        {
+            let rel_str = relative.to_string_lossy().replace('\\', "/");
+            if is_indexable_code_path(&rel_str)
+                && let Ok(metadata) = std::fs::metadata(&path)
+            {
+                if metadata.len() > MAX_INDEXED_FILE_BYTES {
+                    continue;
                 }
+                let size = metadata.len();
+                let lines = count_lines(&path);
+                let language = detect_language(&rel_str);
+                files.push(ScannedFile {
+                    path: rel_str,
+                    language,
+                    size,
+                    lines,
+                });
             }
         }
     }
@@ -439,7 +439,7 @@ fn scan_relative_file(root: &Path, relative_path: &str) -> Option<ScannedFile> {
 }
 
 fn should_ignore(name: &str) -> bool {
-    IGNORE_PATTERNS.iter().any(|pattern| name == *pattern)
+    IGNORE_PATTERNS.contains(&name)
 }
 
 /// 判定相对路径是否应进入本地代码索引。
@@ -551,37 +551,37 @@ fn detect_tech_stack(root: &Path, files: &[ScannedFile], tech_stack: &mut Vec<St
 
     // 从所有被索引的 package.json 中读取框架和工具，覆盖 monorepo / 多子项目结构
     for package_json in package_json_paths {
-        if let Ok(content) = std::fs::read_to_string(&package_json) {
-            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) {
-                let deps = value.get("dependencies").and_then(|d| d.as_object());
-                let dev_deps = value.get("devDependencies").and_then(|d| d.as_object());
+        if let Ok(content) = std::fs::read_to_string(&package_json)
+            && let Ok(value) = serde_json::from_str::<serde_json::Value>(&content)
+        {
+            let deps = value.get("dependencies").and_then(|d| d.as_object());
+            let dev_deps = value.get("devDependencies").and_then(|d| d.as_object());
 
-                let all_deps: HashSet<String> = deps
-                    .into_iter()
-                    .chain(dev_deps.into_iter())
-                    .flat_map(|m| m.keys().cloned())
-                    .collect();
+            let all_deps: HashSet<String> = deps
+                .into_iter()
+                .chain(dev_deps.into_iter())
+                .flat_map(|m| m.keys().cloned())
+                .collect();
 
-                for &(dep, name) in FRAMEWORK_DEPS {
-                    if all_deps.contains(dep) {
-                        seen.insert(name.to_string());
-                    }
+            for &(dep, name) in FRAMEWORK_DEPS {
+                if all_deps.contains(dep) {
+                    seen.insert(name.to_string());
                 }
-                for &(dep, name) in BUILD_TOOL_DEPS {
-                    if all_deps.contains(dep) {
-                        seen.insert(name.to_string());
-                    }
+            }
+            for &(dep, name) in BUILD_TOOL_DEPS {
+                if all_deps.contains(dep) {
+                    seen.insert(name.to_string());
                 }
-                for &(dep, name) in TEST_DEPS {
-                    if all_deps.contains(dep) {
-                        seen.insert(name.to_string());
-                    }
+            }
+            for &(dep, name) in TEST_DEPS {
+                if all_deps.contains(dep) {
+                    seen.insert(name.to_string());
                 }
+            }
 
-                // npm scripts 中有 build → 标记 npm scripts
-                if value.get("scripts").and_then(|s| s.get("build")).is_some() {
-                    seen.insert("npm scripts".to_string());
-                }
+            // npm scripts 中有 build → 标记 npm scripts
+            if value.get("scripts").and_then(|s| s.get("build")).is_some() {
+                seen.insert("npm scripts".to_string());
             }
         }
     }

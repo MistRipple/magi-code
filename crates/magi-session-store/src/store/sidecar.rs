@@ -1,16 +1,16 @@
 use super::ORCHESTRATOR_ROLE_ID;
 use super::SessionStore;
 use crate::models::{
-    ActiveExecutionChain, ActiveExecutionTurn, ActiveExecutionTurnItem, CanonicalToolCall,
-    CanonicalTurn, CanonicalTurnItem, CanonicalTurnItemKind, CanonicalTurnItemStatus,
-    CanonicalTurnStatus, CanonicalTurnVisibility, CanonicalWorkerRef, ExecutionThread,
-    ExecutionThreadStatus, SessionExecutionSidecarStatus, SessionExecutionSidecarStoreState,
-    SessionRuntimeSidecar, SessionSidecarFlushReason, SessionStoreState, ThreadChatMessage,
-    ThreadVisibility, TimelineEntry, TimelineEntryKind,
+    ActiveExecutionBranchSnapshotUpdate, ActiveExecutionChain, ActiveExecutionTurn,
+    ActiveExecutionTurnItem, CanonicalToolCall, CanonicalTurn, CanonicalTurnItem,
+    CanonicalTurnItemKind, CanonicalTurnItemStatus, CanonicalTurnStatus, CanonicalTurnVisibility,
+    CanonicalWorkerRef, ExecutionThread, ExecutionThreadStatus, SessionExecutionSidecarStatus,
+    SessionExecutionSidecarStoreState, SessionRuntimeSidecar, SessionSidecarFlushReason,
+    SessionStoreState, ThreadChatMessage, ThreadVisibility, TimelineEntry, TimelineEntryKind,
 };
 use magi_core::{
-    DomainError, DomainResult, ExecutionOwnership, LeaseId, MissionId, RecoveryResumeInput,
-    SessionId, TaskExecutionTarget, TaskId, ThreadId, UtcMillis, WorkerId,
+    DomainError, DomainResult, ExecutionOwnership, MissionId, RecoveryResumeInput, SessionId,
+    TaskExecutionTarget, TaskId, ThreadId, UtcMillis, WorkerId,
 };
 use magi_tool_runtime::BuiltinToolName;
 use serde_json::Value;
@@ -236,7 +236,7 @@ fn current_turn_item_renderable(
         && item
             .tool_name
             .as_deref()
-            .and_then(BuiltinToolName::from_str)
+            .and_then(BuiltinToolName::from_name)
             .is_some_and(|tool| !tool.is_session_timeline_renderable_tool_call())
     {
         return false;
@@ -1428,18 +1428,21 @@ impl SessionStore {
 
     pub fn update_active_execution_branch_snapshot(
         &self,
-        task_id: &TaskId,
-        worker_id: WorkerId,
-        stage: String,
-        lease_id: Option<LeaseId>,
-        execution_intent_ref: Option<String>,
-        binding_lifecycle: Option<String>,
-        checkpoint_stage: Option<String>,
-        next_step_index: Option<usize>,
-        checkpoint_at: Option<UtcMillis>,
-        resume_mode: Option<String>,
-        resume_token: Option<String>,
+        update: ActiveExecutionBranchSnapshotUpdate,
     ) -> DomainResult<Option<SessionRuntimeSidecar>> {
+        let ActiveExecutionBranchSnapshotUpdate {
+            task_id,
+            worker_id,
+            stage,
+            lease_id,
+            execution_intent_ref,
+            binding_lifecycle,
+            checkpoint_stage,
+            next_step_index,
+            checkpoint_at,
+            resume_mode,
+            resume_token,
+        } = update;
         let updated = {
             let mut state = self
                 .state
@@ -1453,7 +1456,7 @@ impl SessionStore {
                     let Some(branch) = chain
                         .branches
                         .iter_mut()
-                        .find(|branch| &branch.task_id == task_id)
+                        .find(|branch| branch.task_id == task_id)
                     else {
                         continue;
                     };

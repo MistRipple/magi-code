@@ -503,11 +503,11 @@ pub fn sanitize_tool_order(messages: &[LlmMessage]) -> Vec<LlmMessage> {
         let normalized = preferred
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
-        if let Some(ref id) = normalized {
-            if !used.contains(id) {
-                used.insert(id.clone());
-                return id.clone();
-            }
+        if let Some(ref id) = normalized
+            && !used.contains(id)
+        {
+            used.insert(id.clone());
+            return id.clone();
         }
         loop {
             let candidate = format!("magi_tool_{}", *seq);
@@ -529,8 +529,8 @@ pub fn sanitize_tool_order(messages: &[LlmMessage]) -> Vec<LlmMessage> {
             let next = messages.get(i + 1);
             let prev = cleaned.last();
 
-            let valid_next = next.map_or(false, |n| is_tool_result_user(n));
-            let valid_prev = prev.map_or(false, |p: &LlmMessage| p.role == "user");
+            let valid_next = next.is_some_and(&is_tool_result_user);
+            let valid_prev = prev.is_some_and(|p: &LlmMessage| p.role == "user");
 
             if !valid_next || !valid_prev {
                 i += 1;
@@ -643,7 +643,7 @@ pub fn sanitize_tool_order(messages: &[LlmMessage]) -> Vec<LlmMessage> {
 
         if is_tool_result_user(msg) {
             let prev = cleaned.last();
-            if prev.map_or(true, |p| !has_tool_use(p)) {
+            if prev.is_none_or(|p| !has_tool_use(p)) {
                 if let LlmMessageContent::Blocks(blocks) = &msg.content {
                     let retained: Vec<LlmContentBlock> = blocks
                         .iter()

@@ -19,6 +19,7 @@ fn list_uses_deterministic_tie_breaker() {
         tags: vec!["tag".to_string()],
         workspace_id: None,
         source_ref: Some("ref-b".to_string()),
+        created_at: updated_at,
         updated_at,
     });
     store.upsert(KnowledgeRecord {
@@ -29,6 +30,7 @@ fn list_uses_deterministic_tie_breaker() {
         tags: vec!["tag".to_string()],
         workspace_id: None,
         source_ref: Some("ref-a".to_string()),
+        created_at: updated_at,
         updated_at,
     });
 
@@ -39,6 +41,34 @@ fn list_uses_deterministic_tie_breaker() {
         .collect::<Vec<_>>();
 
     assert_eq!(knowledge_ids, vec!["kb-a".to_string(), "kb-b".to_string()]);
+}
+
+#[test]
+fn upsert_preserves_original_creation_time() {
+    let store = KnowledgeStore::new();
+    let base = KnowledgeRecord {
+        knowledge_id: "kb-created-at".to_string(),
+        kind: KnowledgeKind::Learning,
+        title: "Initial".to_string(),
+        content: "initial".to_string(),
+        tags: vec![],
+        workspace_id: None,
+        source_ref: None,
+        created_at: UtcMillis(10),
+        updated_at: UtcMillis(10),
+    };
+    store.upsert(base.clone());
+    store.upsert(KnowledgeRecord {
+        title: "Updated".to_string(),
+        content: "updated".to_string(),
+        created_at: UtcMillis(20),
+        updated_at: UtcMillis(20),
+        ..base
+    });
+
+    let record = store.get("kb-created-at").expect("record should exist");
+    assert_eq!(record.created_at, UtcMillis(10));
+    assert_eq!(record.updated_at, UtcMillis(20));
 }
 
 #[test]
@@ -100,6 +130,7 @@ fn query_and_governed_output_close_the_code_index_loop() {
         tags: vec!["faq".to_string()],
         workspace_id: None,
         source_ref: None,
+        created_at: UtcMillis(50),
         updated_at: UtcMillis(50),
     });
 
@@ -182,6 +213,7 @@ fn plain_upsert_overwrites_old_code_index_sidecars() {
         tags: vec!["faq".to_string()],
         workspace_id: None,
         source_ref: None,
+        created_at: UtcMillis(200),
         updated_at: UtcMillis(200),
     });
 
@@ -258,6 +290,7 @@ fn query_filters_records_by_workspace_id() {
         tags: vec!["faq".to_string()],
         workspace_id: Some(workspace_a.clone()),
         source_ref: None,
+        created_at: UtcMillis(1),
         updated_at: UtcMillis(1),
     });
     store.upsert(KnowledgeRecord {
@@ -268,6 +301,7 @@ fn query_filters_records_by_workspace_id() {
         tags: vec!["faq".to_string()],
         workspace_id: Some(workspace_b.clone()),
         source_ref: None,
+        created_at: UtcMillis(2),
         updated_at: UtcMillis(2),
     });
     store.upsert(KnowledgeRecord {
@@ -278,6 +312,7 @@ fn query_filters_records_by_workspace_id() {
         tags: vec!["faq".to_string()],
         workspace_id: None,
         source_ref: None,
+        created_at: UtcMillis(3),
         updated_at: UtcMillis(3),
     });
 
@@ -368,6 +403,7 @@ fn clear_workspace_and_delete_in_workspace_are_scoped() {
         tags: vec![],
         workspace_id: Some(workspace_a.clone()),
         source_ref: None,
+        created_at: UtcMillis(1),
         updated_at: UtcMillis(1),
     });
     store.upsert(KnowledgeRecord {
@@ -378,6 +414,7 @@ fn clear_workspace_and_delete_in_workspace_are_scoped() {
         tags: vec![],
         workspace_id: Some(workspace_b.clone()),
         source_ref: None,
+        created_at: UtcMillis(2),
         updated_at: UtcMillis(2),
     });
 
@@ -418,6 +455,7 @@ fn clear_workspace_cancels_active_index_build_until_worker_finishes() {
         tags: vec![],
         workspace_id: Some(workspace_id.clone()),
         source_ref: None,
+        created_at: UtcMillis::now(),
         updated_at: UtcMillis::now(),
     });
     assert!(

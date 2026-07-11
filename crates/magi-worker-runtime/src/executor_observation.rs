@@ -148,7 +148,7 @@ impl WorkerRuntime {
                     .or_else(|| existing.and_then(|snapshot| snapshot.binding_lifecycle)),
                 checkpoint_cursor: existing
                     .and_then(|snapshot| snapshot.checkpoint_cursor.clone())
-                    .or_else(|| {
+                    .or({
                         Some(crate::WorkerExecutionCheckpointCursor {
                             checkpoint_stage: requested_stage,
                             next_step_index: 0,

@@ -26,7 +26,7 @@ impl ToolExecutionInput {
         let input = input.into();
         let requested_tool_name = requested_tool_name.as_ref().trim();
         let (tool_name, invocation_policy) =
-            if let Some(tool) = crate::BuiltinToolName::from_str(requested_tool_name) {
+            if let Some(tool) = crate::BuiltinToolName::from_name(requested_tool_name) {
                 (
                     tool.as_str().to_string(),
                     tool.invocation_policy_for_input(&input),

@@ -1,9 +1,10 @@
 use crate::{
-    SkillDispatchSummary, WorkerCheckpointResumeMode, WorkerExecutionCheckpointCursor,
-    WorkerExecutionFinalReport, WorkerExecutionIntent, WorkerExecutionProgress,
-    WorkerExecutionReport, WorkerExecutionTrace, WorkerExecutorFailure, WorkerGovernanceSummary,
-    WorkerLoopAction, WorkerLoopEntry, WorkerLoopOutcome, WorkerLoopOutcomeKind, WorkerRecord,
-    WorkerRuntime, WorkerRuntimeLoop, WorkerStage, execute_intent_step_with_drivers,
+    SkillDispatchSummary, WorkerBranchCheckpointState, WorkerCheckpointResumeMode,
+    WorkerExecutionCheckpointCursor, WorkerExecutionFinalReport, WorkerExecutionIntent,
+    WorkerExecutionProgress, WorkerExecutionReport, WorkerExecutionTrace, WorkerExecutorFailure,
+    WorkerGovernanceSummary, WorkerLoopAction, WorkerLoopEntry, WorkerLoopOutcome,
+    WorkerLoopOutcomeKind, WorkerRecord, WorkerRuntime, WorkerRuntimeLoop, WorkerStage,
+    execute_intent_step_with_drivers,
 };
 use magi_core::{TaskResultKind, TerminationReason, UtcMillis, VerificationStatus};
 use magi_governance::{GovernanceDecision, GovernanceOutcome, WorkerControlKind};
@@ -160,8 +161,6 @@ impl WorkerRuntimeLoop {
                         Some(public_decision.clone()),
                         completed_at,
                         WorkerLoopOutcomeKind::NeedsApproval,
-                        None,
-                        None,
                         public_decision.reason.clone(),
                     );
                 }
@@ -172,8 +171,6 @@ impl WorkerRuntimeLoop {
                         Some(public_decision.clone()),
                         completed_at,
                         WorkerLoopOutcomeKind::Blocked,
-                        None,
-                        None,
                         public_decision.reason.clone(),
                     );
                 }
@@ -184,8 +181,6 @@ impl WorkerRuntimeLoop {
                         Some(public_decision.clone()),
                         completed_at,
                         WorkerLoopOutcomeKind::Rejected,
-                        None,
-                        None,
                         public_decision.reason.clone(),
                     );
                 }
@@ -307,10 +302,12 @@ impl WorkerRuntimeLoop {
                         &task_id,
                         &worker_id,
                         WorkerStage::Execute,
-                        None,
-                        Some(format!("worker-intent-{}", intent.task_id)),
-                        Some(intent.execution_profile.binding_lifecycle),
-                        Some(checkpoint_cursor.clone()),
+                        WorkerBranchCheckpointState {
+                            lease_id: None,
+                            execution_intent_ref: Some(format!("worker-intent-{}", intent.task_id)),
+                            binding_lifecycle: Some(intent.execution_profile.binding_lifecycle),
+                            checkpoint_cursor: Some(checkpoint_cursor.clone()),
+                        },
                     );
                 }
 
@@ -354,16 +351,18 @@ impl WorkerRuntimeLoop {
                         "worker missing current task or not registered",
                     );
                 }
-                let report = self.runtime.append_report(
-                    worker_id.clone(),
-                    task_id,
-                    WorkerStage::Finish,
-                    trace.final_report.summary,
-                    trace.final_report.result_kind,
-                    trace.final_report.termination_reason,
-                    trace.final_report.verification_status,
-                );
-                self.outcome(
+                let report = self
+                    .runtime
+                    .append_report(crate::reporting::WorkerReportInput {
+                        worker_id: worker_id.clone(),
+                        task_id,
+                        stage: WorkerStage::Finish,
+                        summary: trace.final_report.summary,
+                        result_kind: trace.final_report.result_kind,
+                        termination_reason: trace.final_report.termination_reason,
+                        verification_status: trace.final_report.verification_status,
+                    });
+                Self::outcome(
                     sequence,
                     action,
                     public_governance_decision.clone(),
@@ -433,7 +432,7 @@ impl WorkerRuntimeLoop {
                     );
                 }
                 let report = self.runtime.record_review_note(&worker_id, summary);
-                self.outcome(
+                Self::outcome(
                     sequence,
                     action,
                     public_governance_decision.clone(),
@@ -509,7 +508,7 @@ impl WorkerRuntimeLoop {
                 let report =
                     self.runtime
                         .record_verification(&worker_id, verification_status, summary);
-                self.outcome(
+                Self::outcome(
                     sequence,
                     action,
                     public_governance_decision.clone(),
@@ -579,7 +578,7 @@ impl WorkerRuntimeLoop {
                     );
                 }
                 let report = self.runtime.record_repair_note(&worker_id, summary);
-                self.outcome(
+                Self::outcome(
                     sequence,
                     action,
                     public_governance_decision.clone(),
@@ -651,7 +650,7 @@ impl WorkerRuntimeLoop {
                 let report = self
                     .runtime
                     .record_repair_note(&worker_id, format!("repair retry: {summary}"));
-                self.outcome(
+                Self::outcome(
                     sequence,
                     action,
                     public_governance_decision.clone(),
@@ -679,7 +678,7 @@ impl WorkerRuntimeLoop {
                 let report =
                     self.runtime
                         .latest_report_for(&worker_id, &task_id, WorkerStage::Finish);
-                self.outcome(
+                Self::outcome(
                     sequence,
                     action,
                     public_governance_decision.clone(),
@@ -707,7 +706,7 @@ impl WorkerRuntimeLoop {
                 let report =
                     self.runtime
                         .latest_report_for(&worker_id, &task_id, WorkerStage::Finish);
-                self.outcome(
+                Self::outcome(
                     sequence,
                     action,
                     public_governance_decision.clone(),
@@ -748,7 +747,6 @@ impl WorkerRuntimeLoop {
     }
 
     fn outcome(
-        &self,
         sequence: usize,
         action: WorkerLoopAction,
         governance_decision: Option<GovernanceDecision>,
@@ -781,7 +779,7 @@ impl WorkerRuntimeLoop {
         completed_at: UtcMillis,
         rejection_reason: impl Into<String>,
     ) -> WorkerLoopOutcome {
-        self.outcome(
+        Self::outcome(
             sequence,
             action,
             governance_decision,
@@ -803,8 +801,6 @@ impl WorkerRuntimeLoop {
         governance_decision: Option<GovernanceDecision>,
         completed_at: UtcMillis,
         kind: WorkerLoopOutcomeKind,
-        worker: Option<WorkerRecord>,
-        report: Option<WorkerExecutionReport>,
         rejection_reason: Option<String>,
     ) -> WorkerLoopOutcome {
         WorkerLoopOutcome {
@@ -812,8 +808,8 @@ impl WorkerRuntimeLoop {
             action,
             kind,
             governance_decision,
-            worker,
-            report,
+            worker: None,
+            report: None,
             rejection_reason,
             completed_at,
         }

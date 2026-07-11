@@ -234,10 +234,10 @@ impl RunnerManager {
             .ok_or(RunnerStartError::NotFound)?;
 
         let mut runners = self.runners.lock().expect("runners lock should hold");
-        if let Some(existing) = runners.get(root_task_id) {
-            if existing.active.load(Ordering::Relaxed) {
-                return Err(RunnerStartError::AlreadyRunning);
-            }
+        if let Some(existing) = runners.get(root_task_id)
+            && existing.active.load(Ordering::Relaxed)
+        {
+            return Err(RunnerStartError::AlreadyRunning);
         }
 
         let handle = Arc::new(RunnerHandle {
@@ -287,13 +287,13 @@ impl RunnerManager {
                                 match policy.checkpoint_mode.as_str() {
                                     "turn" => true,
                                     "task_or_phase" => task_runner.take_checkpoint_signal(),
-                                    _ => cycle % CHECKPOINT_INTERVAL_CYCLES == 0,
+                                    _ => cycle.is_multiple_of(CHECKPOINT_INTERVAL_CYCLES),
                                 }
                             } else {
-                                cycle % CHECKPOINT_INTERVAL_CYCLES == 0
+                                cycle.is_multiple_of(CHECKPOINT_INTERVAL_CYCLES)
                             }
                         } else {
-                            cycle % CHECKPOINT_INTERVAL_CYCLES == 0
+                            cycle.is_multiple_of(CHECKPOINT_INTERVAL_CYCLES)
                         };
                     if should_checkpoint {
                         let _ = bg_task_store.checkpoint_to_file(path);
@@ -1156,13 +1156,12 @@ impl ApiState {
         if let Some(workspace_id) = self.workspace_id_for_root_path(requested_workspace_path) {
             return Some(workspace_id);
         }
-        if let Some(workspace_id) = requested_workspace_id {
-            if self
+        if let Some(workspace_id) = requested_workspace_id
+            && self
                 .workspace_root_path(&Some(workspace_id.clone()))
                 .is_some()
-            {
-                return Some(workspace_id);
-            }
+        {
+            return Some(workspace_id);
         }
         None
     }
@@ -1332,7 +1331,6 @@ impl ApiState {
             .into_iter()
             .flatten()
             .filter(|tool| tool.get("public").and_then(serde_json::Value::as_bool) == Some(true))
-            .into_iter()
             .map(|tool| {
                 serde_json::json!({
                     "name": tool.get("name").cloned().unwrap_or(serde_json::Value::Null),

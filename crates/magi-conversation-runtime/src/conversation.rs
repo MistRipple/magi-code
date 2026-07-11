@@ -74,10 +74,10 @@ impl Conversation {
 
     /// 开启一个新的 Turn——违反"同 Conversation 不并发"不变式时返回错误。
     pub fn begin_turn(&mut self) -> Result<(), BeginTurnError> {
-        if let Some(turn) = &self.current_turn {
-            if !turn.is_terminal() {
-                return Err(BeginTurnError::TurnAlreadyActive(turn.state()));
-            }
+        if let Some(turn) = &self.current_turn
+            && !turn.is_terminal()
+        {
+            return Err(BeginTurnError::TurnAlreadyActive(turn.state()));
         }
         self.current_turn = Some(Turn::new());
         Ok(())

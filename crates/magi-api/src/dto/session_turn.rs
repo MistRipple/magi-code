@@ -155,19 +155,33 @@ pub struct SessionTurnResponseDto {
     pub target_task_id: Option<String>,
 }
 
+pub struct SessionTurnResponseInput {
+    pub session_id: SessionId,
+    pub entry_id: String,
+    pub event_id: EventId,
+    pub accepted_at: UtcMillis,
+    pub created_session: bool,
+    pub route: SessionTurnRouteDto,
+    pub root_task_id: Option<TaskId>,
+    pub action_task_id: Option<TaskId>,
+    pub execution_chain_ref: Option<String>,
+    pub user_message_item_id: Option<String>,
+}
+
 impl SessionTurnResponseDto {
-    pub fn new(
-        session_id: SessionId,
-        entry_id: String,
-        event_id: EventId,
-        accepted_at: UtcMillis,
-        created_session: bool,
-        route: SessionTurnRouteDto,
-        root_task_id: Option<TaskId>,
-        action_task_id: Option<TaskId>,
-        execution_chain_ref: Option<String>,
-        user_message_item_id: Option<String>,
-    ) -> Self {
+    pub fn new(input: SessionTurnResponseInput) -> Self {
+        let SessionTurnResponseInput {
+            session_id,
+            entry_id,
+            event_id,
+            accepted_at,
+            created_session,
+            route,
+            root_task_id,
+            action_task_id,
+            execution_chain_ref,
+            user_message_item_id,
+        } = input;
         Self {
             session_id: session_id.to_string(),
             entry_id,

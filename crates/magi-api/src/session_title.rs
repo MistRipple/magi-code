@@ -120,14 +120,7 @@ pub(crate) fn refine_new_session_title_and_publish(
         workspace_id,
         ..EventContext::default()
     });
-    if let Err(error) = state.event_bus.publish(event) {
-        tracing::warn!(
-            session_id = %session_id,
-            ?error,
-            "辅助模型会话标题更新事件发布失败"
-        );
-        return false;
-    }
+    state.event_bus.publish(event);
     true
 }
 
@@ -343,7 +336,7 @@ mod tests {
     #[test]
     fn normalize_title_rejects_empty_and_oversize() {
         assert!(normalize_title("   ").is_none());
-        let too_long: String = std::iter::repeat('字').take(TITLE_MAX_CHARS + 1).collect();
+        let too_long: String = std::iter::repeat_n('字', TITLE_MAX_CHARS + 1).collect();
         assert!(normalize_title(&too_long).is_none());
     }
 

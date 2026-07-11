@@ -92,6 +92,12 @@ pub struct EventBasedResultReceiver {
     seen: Mutex<HashSet<TaskId>>,
 }
 
+impl Default for EventBasedResultReceiver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl EventBasedResultReceiver {
     pub fn new() -> Self {
         Self {

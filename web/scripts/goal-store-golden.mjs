@@ -8,6 +8,8 @@ globalThis.$derived.by = (fn) => fn();
 const WORKSPACE_ID = 'workspace-goal-store-golden';
 const WORKSPACE_PATH = '/tmp/workspace-goal-store-golden';
 const SESSION_ID = 'session-goal-store-golden';
+const SLOW_SESSION_ID = 'session-goal-store-slow';
+let releaseSlowGoalRequest = null;
 
 function installBrowserGlobals() {
   globalThis.window = {
@@ -36,6 +38,11 @@ globalThis.fetch = async (url) => {
   const parsed = new URL(String(url));
   fetches.push(parsed);
   if (parsed.pathname === '/api/goals/current') {
+    if (parsed.searchParams.get('sessionId') === SLOW_SESSION_ID) {
+      await new Promise((resolve) => {
+        releaseSlowGoalRequest = resolve;
+      });
+    }
     return jsonResponse({
       sessionId: parsed.searchParams.get('sessionId'),
       workspaceId: parsed.searchParams.get('workspaceId'),
@@ -94,5 +101,25 @@ await withGoldenViteServer(async (server) => {
     null,
     'goal state must not fall back to same session id from another workspace',
   );
+
+  const firstSlowRefresh = goalStore.refreshCurrentGoal(
+    SLOW_SESSION_ID,
+    WORKSPACE_ID,
+    WORKSPACE_PATH,
+  );
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const secondSlowRefresh = goalStore.refreshCurrentGoal(
+    SLOW_SESSION_ID,
+    WORKSPACE_ID,
+    WORKSPACE_PATH,
+  );
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(
+    fetches.filter((url) => url.searchParams.get('sessionId') === SLOW_SESSION_ID).length,
+    1,
+    'overlapping goal refreshes must share one in-flight request',
+  );
+  releaseSlowGoalRequest();
+  await Promise.all([firstSlowRefresh, secondSlowRefresh]);
   console.log('goal store golden passed');
 });

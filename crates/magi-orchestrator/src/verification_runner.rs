@@ -243,43 +243,43 @@ impl VerificationRunner {
     pub fn get_error_details(&self, result: &VerificationResult) -> String {
         let mut details = Vec::new();
 
-        if let Some(ref cr) = result.compile_result {
-            if !cr.success {
-                details.push(format!(
-                    "编译错误:\n{}",
-                    cr.error.as_deref().unwrap_or(&cr.output)
-                ));
-            }
+        if let Some(ref cr) = result.compile_result
+            && !cr.success
+        {
+            details.push(format!(
+                "编译错误:\n{}",
+                cr.error.as_deref().unwrap_or(&cr.output)
+            ));
         }
 
-        if let Some(ref ir) = result.ide_result {
-            if !ir.success {
-                let error_lines: Vec<String> = ir
-                    .details
-                    .iter()
-                    .filter(|d| d.severity == DiagnosticSeverity::Error)
-                    .map(|d| format!("  {}:{}: {}", d.file, d.line, d.message))
-                    .collect();
-                details.push(format!("IDE 错误:\n{}", error_lines.join("\n")));
-            }
+        if let Some(ref ir) = result.ide_result
+            && !ir.success
+        {
+            let error_lines: Vec<String> = ir
+                .details
+                .iter()
+                .filter(|d| d.severity == DiagnosticSeverity::Error)
+                .map(|d| format!("  {}:{}: {}", d.file, d.line, d.message))
+                .collect();
+            details.push(format!("IDE 错误:\n{}", error_lines.join("\n")));
         }
 
-        if let Some(ref lr) = result.lint_result {
-            if !lr.success {
-                details.push(format!(
-                    "Lint 错误:\n{}",
-                    lr.error.as_deref().unwrap_or(&lr.output)
-                ));
-            }
+        if let Some(ref lr) = result.lint_result
+            && !lr.success
+        {
+            details.push(format!(
+                "Lint 错误:\n{}",
+                lr.error.as_deref().unwrap_or(&lr.output)
+            ));
         }
 
-        if let Some(ref tr) = result.test_result {
-            if !tr.success {
-                details.push(format!(
-                    "测试错误:\n{}",
-                    tr.error.as_deref().unwrap_or(&tr.output)
-                ));
-            }
+        if let Some(ref tr) = result.test_result
+            && !tr.success
+        {
+            details.push(format!(
+                "测试错误:\n{}",
+                tr.error.as_deref().unwrap_or(&tr.output)
+            ));
         }
 
         details.join("\n\n")

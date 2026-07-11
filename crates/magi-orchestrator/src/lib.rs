@@ -15,7 +15,7 @@ pub mod verification_runner;
 use magi_bridge_client::BridgeBindingDispatchPlan;
 use magi_context_runtime::{ContextAssemblyResult, ContextBudget, ContextRuntime};
 use magi_core::{
-    AssignmentId, EventId, MissionId, SessionId, TaskExecutionTarget, TaskId, UtcMillis,
+    AssignmentId, EventId, MissionId, SessionId, TaskExecutionTarget, TaskId, UtcMillis, WorkerId,
     WorkspaceId,
 };
 use magi_event_bus::{EventCategory, EventContext, EventEnvelope, InMemoryEventBus};
@@ -24,8 +24,7 @@ use magi_tool_runtime::{ToolExecutionPolicy, ToolExecutionSummary, ToolRegistry}
 use magi_worker_runtime::{
     SkillDispatchSummary, WorkerExecutionBindingScope, WorkerExecutionIntent,
     WorkerExecutionProfile, WorkerExecutionReusePolicy, WorkerExecutorRequest,
-    WorkerGovernanceObservation, WorkerGovernanceSummary, WorkerLoopOutcome, WorkerRuntime,
-    WorkerRuntimeSummary, WorkerSkillDispatchObservation, WorkerStage,
+    WorkerGovernanceSummary, WorkerLoopOutcome, WorkerRuntime, WorkerRuntimeSummary, WorkerStage,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -301,6 +300,16 @@ pub struct DispatchExecutionResult {
     pub overview: ExecutionOverview,
 }
 
+pub struct DispatchWritebackRequest {
+    pub target: TaskExecutionTarget,
+    pub worker_id: WorkerId,
+    pub session_id: Option<SessionId>,
+    pub workspace_id: Option<WorkspaceId>,
+    pub skill_plan: Option<SkillToolRuntimePlan>,
+    pub memory_store: magi_memory_store::MemoryStore,
+    pub writebacks: ExecutionWritebackPlans,
+}
+
 impl OrchestratorService {
     pub fn new(event_bus: Arc<InMemoryEventBus>) -> Self {
         Self { event_bus }
@@ -395,25 +404,13 @@ impl OrchestratorService {
     pub(crate) fn build_execution_overview_from_task_projection(
         &self,
         task_store: &task_store::TaskStore,
-        target: &TaskExecutionTarget,
-        session_id: Option<SessionId>,
-        workspace_id: Option<WorkspaceId>,
-        worker_summary: WorkerRuntimeSummary,
-        tool_summary: ToolExecutionSummary,
-        skill_dispatch_observations: &[WorkerSkillDispatchObservation],
-        governance_observations: &[WorkerGovernanceObservation],
-        context_summary: Option<ExecutionContextSummary>,
+        input: execution_overview::ExecutionOverviewProjectionInput<'_>,
     ) -> Option<ExecutionOverview> {
-        let overview = execution_overview::build_execution_overview_from_task_projection(
-            task_store,
-            &target.root_task_id,
-            &target.mission_id,
-            worker_summary,
-            tool_summary,
-            skill_dispatch_observations,
-            governance_observations,
-            context_summary,
-        )?;
+        let session_id = input.session_id.clone();
+        let workspace_id = input.workspace_id.clone();
+        let root_task_id = input.target.root_task_id.clone();
+        let overview =
+            execution_overview::build_execution_overview_from_task_projection(task_store, input)?;
         self.publish_with_category(
             "mission.execution.overview",
             EventCategory::Audit,
@@ -421,7 +418,7 @@ impl OrchestratorService {
                 workspace_id: workspace_id.clone(),
                 session_id: session_id.clone(),
                 mission_id: Some(overview.runtime_snapshot.mission_id.clone()),
-                task_id: Some(target.root_task_id.clone()),
+                task_id: Some(root_task_id),
                 ..EventContext::default()
             },
             scoped_execution_payload(

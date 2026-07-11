@@ -110,7 +110,7 @@ pub struct WorkspaceRecoverySidecarStoreState {
 }
 
 impl WorkspaceRecoverySidecarStoreState {
-    fn sort_recovery_handles(recovery_handles: &mut Vec<RecoveryHandle>) {
+    fn sort_recovery_handles(recovery_handles: &mut [RecoveryHandle]) {
         recovery_handles.sort_by(|left, right| {
             left.workspace_id
                 .as_str()

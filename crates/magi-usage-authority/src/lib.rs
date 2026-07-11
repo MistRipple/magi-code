@@ -22,5 +22,5 @@ pub use ledger_store::InMemoryLedgerStore;
 pub use model_identity::build_model_resolution_identity;
 pub use query_service::UsageQueryService;
 pub use reducer::{rebuild_session_snapshot_from_events, rebuild_workspace_snapshot_from_sessions};
-pub use runtime_recorder::RuntimeRecorder;
+pub use runtime_recorder::{RuntimeCallRecordInput, RuntimeRecorder};
 pub use types::*;

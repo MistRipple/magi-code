@@ -22,7 +22,9 @@ use magi_spawn_graph::SpawnGraph;
 
 use crate::{session_images::SessionTurnImage, session_thread};
 
-pub const MAX_ACTIVE_AGENT_BRANCHES_PER_SESSION: usize = 4;
+pub const DEFAULT_MAX_ACTIVE_AGENT_BRANCHES_PER_SESSION: usize = 4;
+const MIN_ACTIVE_AGENT_BRANCHES_PER_SESSION: usize = 2;
+const MAX_CONFIGURED_ACTIVE_AGENT_BRANCHES_PER_SESSION: usize = 16;
 
 #[derive(Clone, Debug)]
 pub enum TaskExecutionPlan {
@@ -52,6 +54,23 @@ impl TaskExecutionPlan {
                 ..
             } => execution_settings_snapshot.clone(),
         }
+    }
+
+    fn max_active_agent_branches(&self) -> usize {
+        self.execution_settings_snapshot()
+            .and_then(|settings| {
+                settings
+                    .get_section("orchestrator")
+                    .get("maxActiveAgentBranches")
+                    .and_then(serde_json::Value::as_u64)
+            })
+            .map(|limit| {
+                (limit as usize).clamp(
+                    MIN_ACTIVE_AGENT_BRANCHES_PER_SESSION,
+                    MAX_CONFIGURED_ACTIVE_AGENT_BRANCHES_PER_SESSION,
+                )
+            })
+            .unwrap_or(DEFAULT_MAX_ACTIVE_AGENT_BRANCHES_PER_SESSION)
     }
 }
 
@@ -224,11 +243,15 @@ impl TaskExecutionRegistry {
                 child_task.task_id
             ))
         })?;
+        let max_active_branches = self
+            .get(&parent_task_id)
+            .map(|plan| plan.max_active_agent_branches())
+            .unwrap_or(DEFAULT_MAX_ACTIVE_AGENT_BRANCHES_PER_SESSION);
         let active_branch_count = active_execution_branch_count(task_store, &chain);
-        if active_branch_count >= MAX_ACTIVE_AGENT_BRANCHES_PER_SESSION {
+        if active_branch_count >= max_active_branches {
             return Err(SpawnedChildExecutionError::CapacityExceeded {
                 active: active_branch_count,
-                limit: MAX_ACTIVE_AGENT_BRANCHES_PER_SESSION,
+                limit: max_active_branches,
             });
         }
         spawn_graph
@@ -469,7 +492,12 @@ mod tests {
             )
             .expect("active chain should be accepted");
 
-        let parent_settings_snapshot = Arc::new(SettingsStore::new().execution_snapshot());
+        let parent_settings = SettingsStore::new();
+        parent_settings.set_section(
+            "orchestrator",
+            serde_json::json!({ "maxActiveAgentBranches": 6 }),
+        );
+        let parent_settings_snapshot = Arc::new(parent_settings.execution_snapshot());
         registry.insert(
             root_task_id.clone(),
             TaskExecutionPlan::Dispatch {
@@ -533,6 +561,7 @@ mod tests {
         let plan = registry
             .get(&child.task_id)
             .expect("child execution plan should be registered atomically");
+        assert_eq!(plan.max_active_agent_branches(), 6);
         match plan {
             TaskExecutionPlan::Dispatch {
                 thread_id,
@@ -722,8 +751,8 @@ mod tests {
         assert_eq!(
             error,
             SpawnedChildExecutionError::CapacityExceeded {
-                active: MAX_ACTIVE_AGENT_BRANCHES_PER_SESSION,
-                limit: MAX_ACTIVE_AGENT_BRANCHES_PER_SESSION,
+                active: DEFAULT_MAX_ACTIVE_AGENT_BRANCHES_PER_SESSION,
+                limit: DEFAULT_MAX_ACTIVE_AGENT_BRANCHES_PER_SESSION,
             }
         );
         assert!(

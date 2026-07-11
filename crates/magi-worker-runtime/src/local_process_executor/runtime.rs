@@ -116,10 +116,10 @@ impl LocalProcessWorkerExecutor {
                         "final-report" | "final" => Some(WorkerExecutionStepKind::FinalReport),
                         _ => None,
                     };
-                    if let Some(kind) = kind {
-                        if !kinds.contains(&kind) {
-                            kinds.push(kind);
-                        }
+                    if let Some(kind) = kind
+                        && !kinds.contains(&kind)
+                    {
+                        kinds.push(kind);
                     }
                 }
                 if kinds.is_empty() {
@@ -198,12 +198,11 @@ impl LocalProcessWorkerExecutor {
         };
 
         let binding_key = Self::binding_key_for_request(request)?;
-        if capability.descriptor.reuse_scope != WorkerExecutionBindingScope::None
+        if let Some(binding_key) = binding_key
+            && capability.descriptor.reuse_scope != WorkerExecutionBindingScope::None
             && request.requested_execution_profile.binding_scope
                 == capability.descriptor.reuse_scope
-            && binding_key.is_some()
         {
-            let binding_key = binding_key.expect("binding key checked above");
             let binding_suffix = binding_key.replace(':', "-");
             capability.descriptor.executor_lease_id = Some(
                 capability

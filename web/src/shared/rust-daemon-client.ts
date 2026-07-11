@@ -84,8 +84,8 @@ function buildApiUrl(baseUrl: string, path: string): string {
   return new URL(path, baseUrl).toString();
 }
 
-async function fetchJsonUrl<T>(url: string): Promise<T> {
-  const response = await getTransport().request(url);
+async function fetchJsonUrl<T>(url: string, signal?: AbortSignal): Promise<T> {
+  const response = await getTransport().request(url, signal ? { signal } : undefined);
   if (!response.ok) {
     throw new Error(`HTTP ${response.status}: ${url}`);
   }
@@ -549,6 +549,7 @@ export class RustDaemonClient {
     sessionId: string,
     workspaceId?: string,
     workspacePath?: string,
+    signal?: AbortSignal,
   ): Promise<CurrentGoalResponseDto> {
     const query = new URLSearchParams();
     query.set('sessionId', sessionId);
@@ -556,6 +557,7 @@ export class RustDaemonClient {
     if (workspacePath) query.set('workspacePath', workspacePath);
     return this.getJson<CurrentGoalResponseDto>(
       `/api/goals/current?${query.toString()}`,
+      signal,
     );
   }
 
@@ -588,6 +590,7 @@ export class RustDaemonClient {
     sessionId: string,
     workspaceId?: string,
     workspacePath?: string,
+    signal?: AbortSignal,
   ): Promise<AgentRunProjectionDto> {
     const query = new URLSearchParams();
     query.set('sessionId', sessionId);
@@ -595,11 +598,12 @@ export class RustDaemonClient {
     if (workspacePath) query.set('workspacePath', workspacePath);
     return this.getJson<AgentRunProjectionDto>(
       `/api/agent-runs/projection/${encodeURIComponent(rootTaskId)}?${query.toString()}`,
+      signal,
     );
   }
 
-  private async getJson<T>(path: string): Promise<T> {
-    return await fetchJsonUrl<T>(buildApiUrl(this.baseUrl, path));
+  private async getJson<T>(path: string, signal?: AbortSignal): Promise<T> {
+    return await fetchJsonUrl<T>(buildApiUrl(this.baseUrl, path), signal);
   }
 
   private async postJson<T>(path: string, body: unknown): Promise<T> {

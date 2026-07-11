@@ -16,16 +16,28 @@ pub(crate) struct BudgetedContextSelection {
     pub truncations: Vec<TruncationRecord>,
 }
 
+pub(super) struct ContextSelectionInput {
+    pub recent_turns: Vec<RecentTurnRecord>,
+    pub recent_turns_summary: RecentTurnsResolutionSummary,
+    pub knowledge_query: KnowledgeQuery,
+    pub memory_query: MemoryQuery,
+    pub shared_context: Vec<SharedContextItem>,
+    pub file_summaries: Vec<FileSummaryItem>,
+}
+
 pub(super) fn assemble_budgeted_selection(
     runtime: &ContextRuntime,
     budget: &ContextBudget,
-    recent_turns: Vec<RecentTurnRecord>,
-    recent_turns_summary: RecentTurnsResolutionSummary,
-    knowledge_query: KnowledgeQuery,
-    memory_query: MemoryQuery,
-    shared_context: Vec<SharedContextItem>,
-    file_summaries: Vec<FileSummaryItem>,
+    input: ContextSelectionInput,
 ) -> BudgetedContextSelection {
+    let ContextSelectionInput {
+        recent_turns,
+        recent_turns_summary,
+        knowledge_query,
+        memory_query,
+        shared_context,
+        file_summaries,
+    } = input;
     let (selected_recent_turns, turns_truncation) =
         select_limited(recent_turns, budget.max_turns, "recent_turns");
     let recent_turns_summary =

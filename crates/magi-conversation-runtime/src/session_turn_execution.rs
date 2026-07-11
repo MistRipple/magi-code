@@ -402,16 +402,18 @@ pub fn run_session_turn_execution(
                 append_session_turn_error_item(
                     event_bus,
                     session_store,
-                    &request.session_id,
-                    &request.workspace_id,
-                    None,
-                    request.request_id.as_deref(),
-                    request.user_message_id.as_deref(),
-                    request.placeholder_message_id.as_deref(),
-                    &execution_error.public_message,
-                    main_timeline_entry_id.as_deref(),
-                    orchestrator_thread_id.clone(),
-                    persist_session_state,
+                    crate::session_writeback::SessionTurnErrorInput {
+                        session_id: &request.session_id,
+                        workspace_id: &request.workspace_id,
+                        task_id: None,
+                        request_id: request.request_id.as_deref(),
+                        user_message_id: request.user_message_id.as_deref(),
+                        placeholder_message_id: request.placeholder_message_id.as_deref(),
+                        error_text: &execution_error.public_message,
+                        streaming_entry_id: main_timeline_entry_id.as_deref(),
+                        source_thread_id: orchestrator_thread_id.clone(),
+                        persist_session_state,
+                    },
                 );
                 return Err(execution_error);
             }
@@ -502,16 +504,18 @@ pub fn run_session_turn_execution(
         append_session_turn_error_item(
             event_bus,
             session_store,
-            &request.session_id,
-            &request.workspace_id,
-            None,
-            request.request_id.as_deref(),
-            request.user_message_id.as_deref(),
-            request.placeholder_message_id.as_deref(),
-            &failure.public_message,
-            main_timeline_entry_id.as_deref(),
-            orchestrator_thread_id.clone(),
-            persist_session_state,
+            crate::session_writeback::SessionTurnErrorInput {
+                session_id: &request.session_id,
+                workspace_id: &request.workspace_id,
+                task_id: None,
+                request_id: request.request_id.as_deref(),
+                user_message_id: request.user_message_id.as_deref(),
+                placeholder_message_id: request.placeholder_message_id.as_deref(),
+                error_text: &failure.public_message,
+                streaming_entry_id: main_timeline_entry_id.as_deref(),
+                source_thread_id: orchestrator_thread_id.clone(),
+                persist_session_state,
+            },
         );
         return Err(failure);
     };
@@ -522,9 +526,11 @@ pub fn run_session_turn_execution(
         event_bus,
         session_store,
         &request,
-        &final_content,
-        final_item_id.as_deref(),
-        main_timeline_entry_id.as_deref(),
+        FinalItemInput {
+            content: &final_content,
+            item_id: final_item_id.as_deref(),
+            timeline_entry_id: main_timeline_entry_id.as_deref(),
+        },
         &orchestrator_thread_id,
         persist_session_state,
     );
@@ -842,14 +848,16 @@ fn stream_session_turn_round(
         event_bus,
         session_store,
         settings_store,
-        &request.session_id,
-        &request.workspace_id,
-        usage_binding,
-        format!("session-turn-{round}-{}", UtcMillis::now().0),
-        parsed.usage.as_ref(),
-        UsageCallStatus::Success,
-        None,
-        None,
+        crate::usage_recording::ModelUsageRecordInput {
+            session_id: &request.session_id,
+            workspace_id: &request.workspace_id,
+            binding: usage_binding,
+            call_id: format!("session-turn-{round}-{}", UtcMillis::now().0),
+            usage: parsed.usage.as_ref(),
+            status: UsageCallStatus::Success,
+            assignment_id: None,
+            error_code: None,
+        },
     );
     account_active_goal_turn(
         session_store,
@@ -1002,25 +1010,27 @@ fn stream_session_turn_round(
             .map(|mid| mid.to_string())
             .unwrap_or_else(|| format!("session:{}", request.session_id));
         let tool_batch = append_session_tool_call_items_batch_with_context(
-            session_store,
-            event_bus,
-            tool_registry,
-            skill_runtime,
-            skill_dispatch_runtime,
-            skill_name.as_deref(),
-            safety_gate,
-            todo_ledger,
-            orchestrator_mission_id,
-            &request.session_id,
-            &request.workspace_id,
-            request.workspace_root_path.as_deref().map(PathBuf::from),
-            request.access_profile,
+            crate::session_writeback::SessionToolCallBatchContext {
+                session_store,
+                event_bus,
+                tool_registry,
+                skill_runtime,
+                skill_dispatch_runtime,
+                skill_name,
+                safety_gate,
+                todo_ledger,
+                mission_id: orchestrator_mission_id,
+                session_id: &request.session_id,
+                workspace_id: &request.workspace_id,
+                workspace_root_path: request.workspace_root_path.as_deref().map(PathBuf::from),
+                access_profile: request.access_profile,
+                snapshot_session,
+                execution_group_id: Some(execution_group_id),
+                source_thread_id: orchestrator_thread_id,
+                persist_session_state,
+            },
             &parsed.tool_calls,
             messages,
-            snapshot_session,
-            Some(execution_group_id),
-            orchestrator_thread_id,
-            persist_session_state,
             || request_turn_is_writable(session_store, request),
         );
         if !request_turn_is_writable(session_store, request) {
@@ -1078,7 +1088,7 @@ fn forced_tool_choice_for_round(
         return None;
     }
     let forced_tool_name = (round == 0)
-        .then(|| request.forced_tool_name.as_deref())
+        .then_some(request.forced_tool_name.as_deref())
         .flatten()?
         .trim();
     if forced_tool_name.is_empty() {
@@ -1094,16 +1104,25 @@ fn forced_tool_choice_for_round(
     tool_is_available.then(|| ChatToolChoice::force_function(forced_tool_name))
 }
 
+struct FinalItemInput<'a> {
+    content: &'a str,
+    item_id: Option<&'a str>,
+    timeline_entry_id: Option<&'a str>,
+}
+
 fn append_final_item(
     event_bus: &InMemoryEventBus,
     session_store: &SessionStore,
     request: &SessionTurnExecutionRequest,
-    final_content: &str,
-    final_item_id: Option<&str>,
-    timeline_entry_id: Option<&str>,
+    input: FinalItemInput<'_>,
     orchestrator_thread_id: &magi_core::ThreadId,
     persist_session_state: Option<&SessionStatePersistCallback>,
 ) {
+    let FinalItemInput {
+        content: final_content,
+        item_id: final_item_id,
+        timeline_entry_id,
+    } = input;
     let has_requested_final_item_id = final_item_id.is_some();
     let mut final_item = session_turn_item(
         "assistant_final",
@@ -2214,9 +2233,11 @@ mod tests {
             &event_bus,
             &store,
             &request,
-            "最终答案来自工具后轮次。",
-            Some("turn-item-assistant-stream-post-tool"),
-            Some("turn-item-assistant-stream-main"),
+            FinalItemInput {
+                content: "最终答案来自工具后轮次。",
+                item_id: Some("turn-item-assistant-stream-post-tool"),
+                timeline_entry_id: Some("turn-item-assistant-stream-main"),
+            },
             &orchestrator_thread_id,
             None,
         );
@@ -2325,9 +2346,11 @@ mod tests {
             &event_bus,
             &store,
             &request,
-            "最终回复",
-            None,
-            None,
+            FinalItemInput {
+                content: "最终回复",
+                item_id: None,
+                timeline_entry_id: None,
+            },
             &orchestrator_thread_id,
             None,
         );

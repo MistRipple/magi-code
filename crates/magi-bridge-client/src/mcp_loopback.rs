@@ -721,16 +721,15 @@ impl McpServerRegistry {
             .ok()
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
-        if let Some(default_server) = self.default_server_preference.as_deref() {
-            if !self
+        if let Some(default_server) = self.default_server_preference.as_deref()
+            && !self
                 .servers
                 .iter()
                 .any(|server| server.matches_requested_server(default_server))
-            {
-                self.config_issues.push(format!(
-                    "default server target {default_server} does not match any registered server"
-                ));
-            }
+        {
+            self.config_issues.push(format!(
+                "default server target {default_server} does not match any registered server"
+            ));
         }
 
         for enabled_server in parse_list_env(MCP_MANAGER_ENABLED_SERVERS_ENV) {
@@ -1010,10 +1009,10 @@ impl McpServerRegistry {
     }
 
     fn default_server_descriptor(&self) -> Option<&McpServerDescriptor> {
-        if let Some(preferred_server) = self.configured_default_server() {
-            if preferred_server.is_routable() {
-                return Some(preferred_server);
-            }
+        if let Some(preferred_server) = self.configured_default_server()
+            && preferred_server.is_routable()
+        {
+            return Some(preferred_server);
         }
         self.servers.iter().find(|server| server.is_routable())
     }

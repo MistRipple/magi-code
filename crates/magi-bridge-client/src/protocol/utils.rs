@@ -238,16 +238,16 @@ pub fn convert_messages_to_anthropic(messages: &[LlmMessage]) -> Vec<Value> {
                 LlmMessageContent::Blocks(blocks) => {
                     let parts: Vec<Value> = blocks
                         .iter()
-                        .filter_map(|block| match block {
+                        .map(|block| match block {
                             LlmContentBlock::Text { text } => {
-                                Some(json!({"type": "text", "text": text}))
+                                json!({"type": "text", "text": text})
                             }
-                            LlmContentBlock::ToolUse { id, name, input } => Some(json!({
+                            LlmContentBlock::ToolUse { id, name, input } => json!({
                                 "type": "tool_use",
                                 "id": id,
                                 "name": name,
                                 "input": input,
-                            })),
+                            }),
                             LlmContentBlock::ToolResult {
                                 tool_use_id,
                                 content,
@@ -273,21 +273,21 @@ pub fn convert_messages_to_anthropic(messages: &[LlmMessage]) -> Vec<Value> {
                                     }));
                                     json!(parts)
                                 };
-                                Some(json!({
+                                json!({
                                     "type": "tool_result",
                                     "tool_use_id": tool_use_id,
                                     "content": content,
                                     "is_error": is_error,
-                                }))
+                                })
                             }
-                            LlmContentBlock::Image { source } => Some(json!({
+                            LlmContentBlock::Image { source } => json!({
                                 "type": "image",
                                 "source": {
                                     "type": source.kind,
                                     "media_type": source.media_type,
                                     "data": source.data,
                                 }
-                            })),
+                            }),
                         })
                         .collect();
                     json!(parts)

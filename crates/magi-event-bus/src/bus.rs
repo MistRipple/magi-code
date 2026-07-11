@@ -8,14 +8,7 @@ use std::sync::{
     Arc, Mutex, RwLock,
     atomic::{AtomicU64, Ordering},
 };
-use thiserror::Error;
 use tokio::sync::broadcast;
-
-#[derive(Debug, Error)]
-pub enum EventBusError {
-    #[error("事件总线发送失败: {0}")]
-    Send(#[from] broadcast::error::SendError<EventEnvelope>),
-}
 
 #[derive(Clone, Debug)]
 pub struct InMemoryEventBus {
@@ -48,7 +41,7 @@ impl InMemoryEventBus {
         }
     }
 
-    pub fn publish(&self, mut event: EventEnvelope) -> Result<u64, EventBusError> {
+    pub fn publish(&self, mut event: EventEnvelope) -> u64 {
         let mut recent_events = self
             .recent_events
             .write()
@@ -77,7 +70,7 @@ impl InMemoryEventBus {
         // Event retention and ledger updates are already committed above. The absence of a
         // live stream subscriber should not make the bus fail closed for normal API writes.
         let _ = self.sender.send(event);
-        Ok(sequence)
+        sequence
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<EventEnvelope> {
@@ -371,9 +364,7 @@ mod tests {
     fn no_live_subscriber_does_not_block_event_publish() {
         let bus = InMemoryEventBus::new(8);
 
-        let sequence = bus
-            .publish(event(EventCategory::Domain, "system.test.write", 1))
-            .expect("publish should succeed without subscribers");
+        let sequence = bus.publish(event(EventCategory::Domain, "system.test.write", 1));
 
         assert_eq!(sequence, 1);
         assert_eq!(bus.snapshot().recent_events.len(), 1);
@@ -382,12 +373,10 @@ mod tests {
     #[test]
     fn snapshot_and_subscribe_delivers_events_after_snapshot() {
         let bus = InMemoryEventBus::new(8);
-        bus.publish(event(EventCategory::Domain, "event.before", 1))
-            .expect("publish before snapshot");
+        bus.publish(event(EventCategory::Domain, "event.before", 1));
 
         let (snapshot, mut receiver) = bus.snapshot_and_subscribe();
-        bus.publish(event(EventCategory::Domain, "event.after", 2))
-            .expect("publish after snapshot");
+        bus.publish(event(EventCategory::Domain, "event.after", 2));
 
         assert_eq!(snapshot.recent_events.len(), 1);
         assert_eq!(snapshot.recent_events[0].event_type, "event.before");
@@ -398,8 +387,7 @@ mod tests {
     #[test]
     fn snapshot_and_subscribe_receives_publish_blocked_by_snapshot_reader() {
         let bus = InMemoryEventBus::new(8);
-        bus.publish(event(EventCategory::Domain, "event.before", 1))
-            .expect("publish before snapshot");
+        bus.publish(event(EventCategory::Domain, "event.before", 1));
         let read_guard = bus
             .recent_events
             .read()
@@ -407,9 +395,7 @@ mod tests {
         let (snapshot, mut receiver) = bus.snapshot_and_subscribe();
         let publish_bus = bus.clone();
         let publish_thread = thread::spawn(move || {
-            publish_bus
-                .publish(event(EventCategory::Domain, "event.inflight", 2))
-                .expect("blocked publish should complete after snapshot subscribes")
+            publish_bus.publish(event(EventCategory::Domain, "event.inflight", 2))
         });
         thread::sleep(Duration::from_millis(20));
 
@@ -419,7 +405,7 @@ mod tests {
         drop(read_guard);
         let sequence = publish_thread
             .join()
-            .expect("publish thread should not panic");
+            .expect("publish thread should complete after snapshot subscribes");
         assert_eq!(sequence, 2);
         let live_event = receiver
             .try_recv()
@@ -441,10 +427,8 @@ mod tests {
         let path = base.join("audit-usage-ledger.json");
 
         bus.set_audit_usage_ledger_persistence(path.clone());
-        bus.publish(event(EventCategory::Audit, "ledger.audit.recorded", 1))
-            .expect("publish audit event");
-        bus.publish(event(EventCategory::Usage, "ledger.usage.recorded", 2))
-            .expect("publish usage event");
+        bus.publish(event(EventCategory::Audit, "ledger.audit.recorded", 1));
+        bus.publish(event(EventCategory::Usage, "ledger.usage.recorded", 2));
 
         let restored = AuditUsageLedgerSnapshot::load_from_path(&path).expect("restore ledger");
         let status = bus.audit_usage_ledger_status();
@@ -499,8 +483,7 @@ mod tests {
         let path = blocker.join("audit-usage-ledger.json");
 
         bus.set_audit_usage_ledger_persistence(path);
-        bus.publish(event(EventCategory::Audit, "ledger.audit.recorded", 1))
-            .expect("publish audit event");
+        bus.publish(event(EventCategory::Audit, "ledger.audit.recorded", 1));
 
         let status = bus.audit_usage_ledger_status();
         let runtime_ledger = bus.runtime_ledger_summary();
@@ -564,17 +547,13 @@ mod tests {
     #[test]
     fn 恢复账本后新事件序号必须延续账本序号() {
         let original = InMemoryEventBus::new(8);
-        original
-            .publish(event(EventCategory::Usage, "ledger.usage.before", 1))
-            .expect("publish original usage event");
+        original.publish(event(EventCategory::Usage, "ledger.usage.before", 1));
         let restored_snapshot = original.audit_usage_ledger_snapshot();
         assert_eq!(restored_snapshot.next_sequence, 2);
 
         let restored = InMemoryEventBus::new(8);
         restored.import_audit_usage_ledger_snapshot(restored_snapshot);
-        let next_sequence = restored
-            .publish(event(EventCategory::Usage, "ledger.usage.after", 0))
-            .expect("publish restored usage event");
+        let next_sequence = restored.publish(event(EventCategory::Usage, "ledger.usage.after", 0));
 
         assert_eq!(next_sequence, 2);
         let ledger = restored.audit_usage_ledger_snapshot();
@@ -602,8 +581,7 @@ mod tests {
         let path = blocker.join("audit-usage-ledger.json");
 
         bus.set_audit_usage_ledger_persistence(path);
-        bus.publish(event(EventCategory::Usage, "ledger.usage.recorded", 1))
-            .expect("publish usage event");
+        bus.publish(event(EventCategory::Usage, "ledger.usage.recorded", 1));
 
         let status = bus.audit_usage_ledger_status();
         let runtime_ledger = bus.runtime_ledger_summary();
@@ -709,8 +687,7 @@ mod tests {
                 "refresh_ledger_when_unhealthy": true,
                 "refresh_ledger_when_never_persisted": true
             }),
-        ))
-        .expect("publish maintenance event");
+        ));
 
         let read_model = bus.runtime_read_model_input();
         assert_eq!(
@@ -786,8 +763,7 @@ mod tests {
                 "health_detail": "loopback ready",
                 "observed_at": 777777
             }),
-        ))
-        .expect("publish executor observation event");
+        ));
 
         let read_model = bus.runtime_read_model_input();
         assert_eq!(read_model.overview.activity.executor_event_count, 1);
@@ -939,8 +915,7 @@ mod tests {
                 "health_detail": "executor is warming up",
                 "observed_at": 777777
             }),
-        ))
-        .expect("publish degraded executor observation");
+        ));
         bus.publish(EventEnvelope::audit(
             magi_core::EventId::new("executor-observed-unavailable"),
             "worker.executor.observed",
@@ -954,8 +929,7 @@ mod tests {
                 "failure_message": "spawn failed",
                 "observed_at": 888888
             }),
-        ))
-        .expect("publish unavailable executor observation");
+        ));
 
         let read_model = bus.runtime_read_model_input();
         assert_eq!(read_model.overview.diagnostics.degraded_executor_count, 1);
@@ -1019,8 +993,7 @@ mod tests {
                 "health_detail": "ready for one-shot execution",
                 "observed_at": 999999
             }),
-        ))
-        .expect("publish one-shot executor observation");
+        ));
 
         let read_model = bus.runtime_read_model_input();
         assert!(read_model.meta.executor.is_ready);
@@ -1082,8 +1055,7 @@ mod tests {
                 "health_detail": "persistent executor is releasing lease",
                 "observed_at": 1111111
             }),
-        ))
-        .expect("publish persistent executor observation");
+        ));
 
         let read_model = bus.runtime_read_model_input();
         assert!(!read_model.meta.executor.is_ready);

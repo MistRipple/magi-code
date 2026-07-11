@@ -377,15 +377,21 @@ impl SkillRegistry {
             skill_ids: resolved.skill_ids.clone(),
             tool_policy: ToolExecutionPolicy {
                 access_profile: magi_core::AccessProfile::Restricted,
-                source_skill_ids: restrict_standard_tools
-                    .then_some(resolved.skill_ids.clone())
-                    .unwrap_or_default(),
-                allowed_tool_names: restrict_standard_tools
-                    .then_some(allowed_builtin_tools)
-                    .unwrap_or_default(),
-                denied_tool_names: restrict_standard_tools
-                    .then_some(denied_builtin_tools)
-                    .unwrap_or_default(),
+                source_skill_ids: if restrict_standard_tools {
+                    resolved.skill_ids.clone()
+                } else {
+                    Default::default()
+                },
+                allowed_tool_names: if restrict_standard_tools {
+                    allowed_builtin_tools
+                } else {
+                    Default::default()
+                },
+                denied_tool_names: if restrict_standard_tools {
+                    denied_builtin_tools
+                } else {
+                    Default::default()
+                },
                 ..ToolExecutionPolicy::default()
             },
             routing: routing.clone(),
@@ -927,7 +933,7 @@ mod tests {
 
         let runtime = SkillDispatchRuntime::new(
             tool_registry,
-            BridgeDispatchRuntime::new().with_model_client(Arc::new(TestModelClient::default())),
+            BridgeDispatchRuntime::new().with_model_client(Arc::new(TestModelClient)),
         );
         let plan = skill_registry.build_tool_runtime_plan(&SkillSelection {
             skill_ids: vec!["skill-b".to_string()],
@@ -1296,7 +1302,7 @@ mod tests {
 
         let runtime = SkillDispatchRuntime::new(
             tool_registry.clone(),
-            BridgeDispatchRuntime::new().with_model_client(Arc::new(FailingModelClient::default())),
+            BridgeDispatchRuntime::new().with_model_client(Arc::new(FailingModelClient)),
         );
         let plan = skill_registry.build_tool_runtime_plan(&SkillSelection {
             skill_ids: vec!["skill-c".to_string()],
@@ -1527,7 +1533,7 @@ mod tests {
 
         let runtime = SkillDispatchRuntime::new(
             tool_registry,
-            BridgeDispatchRuntime::new().with_model_client(Arc::new(TestModelClient::default())),
+            BridgeDispatchRuntime::new().with_model_client(Arc::new(TestModelClient)),
         );
         let plan = skill_registry.build_tool_runtime_plan(&SkillSelection {
             skill_ids: vec!["skill-ambig".to_string()],
@@ -1593,7 +1599,7 @@ mod tests {
 
         let runtime = SkillDispatchRuntime::new(
             tool_registry,
-            BridgeDispatchRuntime::new().with_model_client(Arc::new(TestModelClient::default())),
+            BridgeDispatchRuntime::new().with_model_client(Arc::new(TestModelClient)),
         );
         let plan = skill_registry.build_tool_runtime_plan(&SkillSelection {
             skill_ids: vec!["skill-miss".to_string()],
@@ -1742,7 +1748,7 @@ mod tests {
 
         let runtime = SkillDispatchRuntime::new(
             tool_registry,
-            BridgeDispatchRuntime::new().with_model_client(Arc::new(TestModelClient::default())),
+            BridgeDispatchRuntime::new().with_model_client(Arc::new(TestModelClient)),
         );
         let plan = skill_registry.build_tool_runtime_plan(&SkillSelection {
             skill_ids: vec!["skill-mixed".to_string()],
@@ -1881,7 +1887,7 @@ mod tests {
 
         let runtime = SkillDispatchRuntime::new(
             tool_registry,
-            BridgeDispatchRuntime::new().with_model_client(Arc::new(TestModelClient::default())),
+            BridgeDispatchRuntime::new().with_model_client(Arc::new(TestModelClient)),
         );
         let plan = skill_registry.build_tool_runtime_plan(&SkillSelection {
             skill_ids: vec!["skill-obs".to_string()],

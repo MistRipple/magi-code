@@ -119,13 +119,12 @@ impl ProviderAdapter for AnthropicMessagesAdapter {
             body["temperature"] = json!(temperature);
         }
 
-        if let Some(ref tools) = params.tools {
-            if !tools.is_empty() {
-                body["tools"] = json!(serialize_anthropic_tool_definitions(tools));
-                if let Some(ref tc) = params.tool_choice {
-                    body["tool_choice"] =
-                        serde_json::to_value(tc).unwrap_or(json!({"type": "auto"}));
-                }
+        if let Some(ref tools) = params.tools
+            && !tools.is_empty()
+        {
+            body["tools"] = json!(serialize_anthropic_tool_definitions(tools));
+            if let Some(ref tc) = params.tool_choice {
+                body["tool_choice"] = serde_json::to_value(tc).unwrap_or(json!({"type": "auto"}));
             }
         }
         if let Some(stream) = params.stream {

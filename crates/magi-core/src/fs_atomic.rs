@@ -76,10 +76,9 @@ pub fn write_atomic(path: &Path, contents: impl AsRef<[u8]>) -> io::Result<()> {
     if let Some(parent) = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
+        && let Ok(dir) = File::open(parent)
     {
-        if let Ok(dir) = File::open(parent) {
-            let _ = dir.sync_all();
-        }
+        let _ = dir.sync_all();
     }
     Ok(())
 }

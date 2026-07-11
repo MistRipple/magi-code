@@ -2258,6 +2258,7 @@ done
                     args: Vec::new(),
                     working_directory: None,
                     env: BTreeMap::new(),
+                    request_timeout: std::time::Duration::from_secs(30),
                 })),
             );
         let client =
@@ -2705,10 +2706,9 @@ done
                         .iter()
                         .find(|entry| entry["mission_id"] == mission_id)
                 })
+                && (is_ready(group) || Instant::now() >= deadline)
             {
-                if is_ready(group) || Instant::now() >= deadline {
-                    return group.clone();
-                }
+                return group.clone();
             }
             if Instant::now() >= deadline {
                 panic!("execution group {mission_id} did not appear before timeout");

@@ -42,11 +42,11 @@ export interface AgentTransport {
 function createDirectTransport(): AgentTransport {
   return {
     request(url: string, init?: RequestInit): Promise<Response> {
-      return fetch(url, init);
+      return fetch(withPublicTunnelToken(url), init);
     },
     connectEventStream(url: string, handlers: SseHandlers): SseConnection {
       let closedByClient = false;
-      const stream = new EventSource(url);
+      const stream = new EventSource(withPublicTunnelToken(url));
       stream.onopen = () => handlers.onOpen();
       stream.onmessage = (event) => handlers.onMessage(event.data);
       stream.onerror = () => {
@@ -62,6 +62,19 @@ function createDirectTransport(): AgentTransport {
       };
     },
   };
+}
+
+function withPublicTunnelToken(url: string): string {
+  if (typeof window === 'undefined') return url;
+  const pageUrl = new URL(window.location.href);
+  const token = pageUrl.searchParams.get('tunnel_token');
+  if (!token) return url;
+  const requestUrl = new URL(url, pageUrl.origin);
+  if (requestUrl.origin !== pageUrl.origin) return requestUrl.toString();
+  if (!requestUrl.searchParams.has('tunnel_token')) {
+    requestUrl.searchParams.set('tunnel_token', token);
+  }
+  return requestUrl.toString();
 }
 
 // ============================================

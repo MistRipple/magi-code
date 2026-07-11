@@ -664,37 +664,16 @@ export function resolveAgentBaseUrl(): string {
   return getStoredAgentBaseUrl() || getDefaultAgentBaseUrl();
 }
 
-/**
- * 从当前页面 URL 提取 tunnel_token（用户通过隧道公网链接访问时自带）。
- * 本地访问时返回 null。
- */
-function getTunnelToken(): string | null {
-  if (typeof window === 'undefined') return null;
-  return new URL(window.location.href).searchParams.get('tunnel_token');
-}
-
 export function isPublicTunnelAccess(): boolean {
   if (typeof window === 'undefined') return false;
   const currentUrl = new URL(window.location.href);
   return Boolean(currentUrl.searchParams.get('tunnel_token'));
 }
 
-/**
- * 将 tunnel_token 附加到已有的 query string 上（如果存在）。
- */
-function appendTokenToQuery(query: string): string {
-  const token = getTunnelToken();
-  if (!token) return query;
-  const sep = query ? '&' : '';
-  return `${query}${sep}tunnel_token=${encodeURIComponent(token)}`;
-}
-
-/**
- * 构造完整的 Agent API URL = baseUrl + pathname + 可选 query + tunnel_token。
- */
+/** 构造完整的 Agent API URL；公网凭据由统一传输层附加。 */
 export function agentUrl(pathname: string, query?: string): string {
   const base = resolveAgentBaseUrl();
-  const q = appendTokenToQuery(query || '');
+  const q = query || '';
   return q ? `${base}${pathname}?${q}` : `${base}${pathname}`;
 }
 

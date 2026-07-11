@@ -39,6 +39,7 @@ pub enum TaskLeaseState {
 /// after the status change. Implementations should be lightweight (e.g.
 /// publish an event).
 pub type StatusChangeCallback = Box<dyn Fn(&TaskId, TaskStatus, TaskStatus, Task) + Send + Sync>;
+pub type CheckpointCallback = Box<dyn Fn(&TaskStore) + Send + Sync>;
 
 /// 任务调度的内存存储，维护任务、租约及其索引。
 pub struct TaskStore {
@@ -54,7 +55,7 @@ pub struct TaskStore {
     on_status_change: Mutex<Option<StatusChangeCallback>>,
     /// Optional callback fired on every successful status change for checkpoint
     /// persistence (design 6.8).
-    on_checkpoint: Mutex<Option<Box<dyn Fn(&TaskStore) + Send + Sync>>>,
+    on_checkpoint: Mutex<Option<CheckpointCallback>>,
     status_change_version: Mutex<u64>,
     status_change_signal: Condvar,
 }
@@ -258,11 +259,11 @@ impl TaskStore {
 
         if was_required {
             let mut tasks = self.tasks.write().expect("tasks write lock poisoned");
-            if let Some(parent) = tasks.get_mut(new_parent_id) {
-                if !parent.required_children.iter().any(|id| id == task_id) {
-                    parent.required_children.push(task_id.clone());
-                    parent.updated_at = UtcMillis::now();
-                }
+            if let Some(parent) = tasks.get_mut(new_parent_id)
+                && !parent.required_children.iter().any(|id| id == task_id)
+            {
+                parent.required_children.push(task_id.clone());
+                parent.updated_at = UtcMillis::now();
             }
         }
 
@@ -311,10 +312,11 @@ impl TaskStore {
             });
         }
         // G9: Policy freeze — snapshot policy on Draft→Ready transition.
-        if old_status == TaskStatus::Pending && new_status == TaskStatus::Pending {
-            if task.policy_snapshot.is_none() {
-                task.policy_snapshot = Some(default_frozen_policy());
-            }
+        if old_status == TaskStatus::Pending
+            && new_status == TaskStatus::Pending
+            && task.policy_snapshot.is_none()
+        {
+            task.policy_snapshot = Some(default_frozen_policy());
         }
         task.status = new_status;
         task.updated_at = UtcMillis::now();
@@ -522,12 +524,12 @@ impl TaskStore {
 
         if let Some(ref task) = removed {
             // Remove from mission index
-            if let Ok(mut mission_index) = self.mission_index.write() {
-                if let Some(ids) = mission_index.get_mut(&task.mission_id) {
-                    ids.retain(|id| id != task_id);
-                    if ids.is_empty() {
-                        mission_index.remove(&task.mission_id);
-                    }
+            if let Ok(mut mission_index) = self.mission_index.write()
+                && let Some(ids) = mission_index.get_mut(&task.mission_id)
+            {
+                ids.retain(|id| id != task_id);
+                if ids.is_empty() {
+                    mission_index.remove(&task.mission_id);
                 }
             }
             // 任务已物理删除，关联租约也必须物理删除，不能留下无主租约。
@@ -845,11 +847,12 @@ impl TaskStore {
     /// 标记活跃租约为已完成。找不到匹配的活跃租约时返回 false。
     pub fn complete_lease(&self, task_id: &TaskId, lease_id: &LeaseId) -> bool {
         let mut leases = self.leases.write().expect("leases write lock poisoned");
-        if let Some(lease) = leases.get_mut(lease_id) {
-            if lease.task_id == *task_id && lease.lease_status == TaskLeaseState::Active {
-                lease.lease_status = TaskLeaseState::Completed;
-                return true;
-            }
+        if let Some(lease) = leases.get_mut(lease_id)
+            && lease.task_id == *task_id
+            && lease.lease_status == TaskLeaseState::Active
+        {
+            lease.lease_status = TaskLeaseState::Completed;
+            return true;
         }
         false
     }
@@ -857,11 +860,12 @@ impl TaskStore {
     /// 撤销活跃租约。
     pub fn revoke_lease(&self, task_id: &TaskId, lease_id: &LeaseId) -> bool {
         let mut leases = self.leases.write().expect("leases write lock poisoned");
-        if let Some(lease) = leases.get_mut(lease_id) {
-            if lease.task_id == *task_id && lease.lease_status == TaskLeaseState::Active {
-                lease.lease_status = TaskLeaseState::Revoked;
-                return true;
-            }
+        if let Some(lease) = leases.get_mut(lease_id)
+            && lease.task_id == *task_id
+            && lease.lease_status == TaskLeaseState::Active
+        {
+            lease.lease_status = TaskLeaseState::Revoked;
+            return true;
         }
         false
     }
@@ -869,14 +873,15 @@ impl TaskStore {
     /// 更新活跃租约的心跳时间。
     pub fn heartbeat_lease(&self, task_id: &TaskId, lease_id: &LeaseId) -> bool {
         let mut leases = self.leases.write().expect("leases write lock poisoned");
-        if let Some(lease) = leases.get_mut(lease_id) {
-            if lease.task_id == *task_id && lease.lease_status == TaskLeaseState::Active {
-                let now = UtcMillis::now();
-                let lease_ttl_ms = lease.expires_at.0.saturating_sub(lease.granted_at.0);
-                lease.heartbeat_at = now;
-                lease.expires_at = UtcMillis(now.0 + lease_ttl_ms);
-                return true;
-            }
+        if let Some(lease) = leases.get_mut(lease_id)
+            && lease.task_id == *task_id
+            && lease.lease_status == TaskLeaseState::Active
+        {
+            let now = UtcMillis::now();
+            let lease_ttl_ms = lease.expires_at.0.saturating_sub(lease.granted_at.0);
+            lease.heartbeat_at = now;
+            lease.expires_at = UtcMillis(now.0 + lease_ttl_ms);
+            return true;
         }
         false
     }
@@ -971,10 +976,10 @@ impl TaskStore {
                 let Some(task) = self.get_task(&task_id) else {
                     continue;
                 };
-                if matches!(task.status, TaskStatus::Pending | TaskStatus::Running) {
-                    if self.update_status(&task_id, TaskStatus::Failed).is_ok() {
-                        failed_count += 1;
-                    }
+                if matches!(task.status, TaskStatus::Pending | TaskStatus::Running)
+                    && self.update_status(&task_id, TaskStatus::Failed).is_ok()
+                {
+                    failed_count += 1;
                 }
             }
         }
@@ -1111,17 +1116,16 @@ impl TaskStore {
     /// legal parent-child kind relationships.
     pub fn insert_task_validated(&self, task: Task) -> DomainResult<()> {
         // Validate parent-child kind hierarchy.
-        if let Some(ref parent_id) = task.parent_task_id {
-            if let Some(parent) = self.get_task(parent_id) {
-                if !is_valid_parent_child_kind(parent.kind, task.kind) {
-                    return Err(DomainError::InvalidState {
-                        message: format!(
-                            "非法父子关系: {:?} 不能包含 {:?} 子节点",
-                            parent.kind, task.kind
-                        ),
-                    });
-                }
-            }
+        if let Some(ref parent_id) = task.parent_task_id
+            && let Some(parent) = self.get_task(parent_id)
+            && !is_valid_parent_child_kind(parent.kind, task.kind)
+        {
+            return Err(DomainError::InvalidState {
+                message: format!(
+                    "非法父子关系: {:?} 不能包含 {:?} 子节点",
+                    parent.kind, task.kind
+                ),
+            });
         }
         // Check for dependency cycles.
         for dep_id in &task.dependency_ids {
@@ -1141,8 +1145,7 @@ impl TaskStore {
             std::fs::create_dir_all(parent)?;
         }
         let data = self.checkpoint();
-        let content = serde_json::to_vec_pretty(&data)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let content = serde_json::to_vec_pretty(&data).map_err(std::io::Error::other)?;
         magi_core::fs_atomic::write_atomic(path, content)?;
         Ok(())
     }

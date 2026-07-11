@@ -110,18 +110,17 @@ impl SettingsStore {
             fs::create_dir_all(parent)?;
         }
         let sections = self.sections.read().unwrap();
-        let content = serde_json::to_vec_pretty(&*sections)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let content = serde_json::to_vec_pretty(&*sections).map_err(std::io::Error::other)?;
         magi_core::fs_atomic::write_atomic(path, content)?;
         Ok(())
     }
 
     /// 自动持久化：写操作后静默保存，失败仅打印警告
     fn auto_persist(&self) {
-        if self.persistence_path.is_some() {
-            if let Err(error) = self.save_to_disk() {
-                warn!(error = %error, "设置自动持久化失败");
-            }
+        if self.persistence_path.is_some()
+            && let Err(error) = self.save_to_disk()
+        {
+            warn!(error = %error, "设置自动持久化失败");
         }
     }
 

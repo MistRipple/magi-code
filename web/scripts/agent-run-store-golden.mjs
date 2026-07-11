@@ -13,6 +13,10 @@ const SESSION_ID_B = 'session-agent-run-golden-b';
 const ROOT_TASK_ID_B = 'task-root-agent-run-golden-b';
 const STALE_SESSION_ID = 'session-agent-run-stale';
 const STALE_ROOT_TASK_ID = 'task-root-agent-run-stale';
+const SLOW_SESSION_ID = 'session-agent-run-slow';
+const SLOW_ROOT_TASK_ID = 'task-root-agent-run-slow';
+let releaseSlowProjection = null;
+let hasDelayedSlowProjection = false;
 
 class MemoryStorage {
   constructor() {
@@ -80,6 +84,12 @@ function installFetchStub(fetches, terminalAgentRunRootIds) {
       const rootTaskId = decodeURIComponent(parsed.pathname.split('/').pop() || '');
       if (terminalAgentRunRootIds.has(rootTaskId)) {
         return new Response('not found', { status: 404 });
+      }
+      if (rootTaskId === SLOW_ROOT_TASK_ID && !hasDelayedSlowProjection) {
+        hasDelayedSlowProjection = true;
+        await new Promise((resolve) => {
+          releaseSlowProjection = resolve;
+        });
       }
       return jsonResponse(projectionPayload(rootTaskId));
     }
@@ -261,6 +271,29 @@ await withGoldenViteServer(async (server) => {
     staleFetchCount,
     'retired stale session must not keep polling after terminal projection miss',
   );
+
+  const firstSlowProjection = agentRunStore.fetchAgentRunProjection(
+    SLOW_SESSION_ID,
+    SLOW_ROOT_TASK_ID,
+    WORKSPACE_ID,
+    WORKSPACE_PATH,
+  );
+  await delay(0);
+  const secondSlowProjection = agentRunStore.fetchAgentRunProjection(
+    SLOW_SESSION_ID,
+    SLOW_ROOT_TASK_ID,
+    WORKSPACE_ID,
+    WORKSPACE_PATH,
+  );
+  await delay(0);
+  assert.equal(
+    agentRunFetches.filter((url) => url.pathname.endsWith(SLOW_ROOT_TASK_ID)).length,
+    1,
+    'overlapping agent projection refreshes must not issue duplicate requests',
+  );
+  releaseSlowProjection();
+  await Promise.all([firstSlowProjection, secondSlowProjection]);
+  await delay(50);
 
   agentRunStore.stopAutoRefresh();
   console.log('agent run store golden replay passed');

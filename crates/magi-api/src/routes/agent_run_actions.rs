@@ -267,10 +267,7 @@ async fn interrupt_task(
         task_id: Some(root_task_id.clone()),
         ..EventContext::default()
     });
-    state
-        .event_bus
-        .publish(event)
-        .map_err(|err| ApiError::event_publish_failed("中断事件发布失败", err))?;
+    state.event_bus.publish(event);
 
     Ok(Json(json!({
         "interrupted": true,
@@ -304,12 +301,11 @@ async fn restart_task(
     )?;
     let session_id = scope.session_id.clone();
     let root_task = ensure_terminal_root_action(&state, &task.root_task_id, "重新执行")?;
-    let restart_text = root_task
-        .goal
-        .trim()
-        .is_empty()
-        .then(|| root_task.title.trim().to_string())
-        .unwrap_or_else(|| root_task.goal.trim().to_string());
+    let restart_text = if root_task.goal.trim().is_empty() {
+        root_task.title.trim().to_string()
+    } else {
+        root_task.goal.trim().to_string()
+    };
     let restart_request = SessionTurnRequestDto {
         session_id: Some(session_id.to_string()),
         workspace_id: Some(scope.workspace_id.to_string()),
@@ -368,10 +364,7 @@ async fn restart_task(
         task_id: Some(accepted.root_task_id.clone()),
         ..EventContext::default()
     });
-    state
-        .event_bus
-        .publish(event)
-        .map_err(|err| ApiError::event_publish_failed("重开事件发布失败", err))?;
+    state.event_bus.publish(event);
 
     Ok(Json(json!({
         "restarted": true,
@@ -383,6 +376,63 @@ async fn restart_task(
         "rootTaskId": accepted.root_task_id.to_string(),
         "actionTaskId": accepted.action_task_id.to_string(),
         "executionChainRef": execution_chain_ref,
+        "requestedAt": now.0,
+        "workspaceId": scope.workspace_id.to_string(),
+        "workspacePath": scope.workspace_path,
+    })))
+}
+
+/// 从目标面板归档当前 root 任务：只移除会话当前执行链指针，不删除 TaskStore 历史。
+async fn archive_task(
+    State(state): State<ApiState>,
+    Json(request): Json<TaskIdRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let now = UtcMillis::now();
+    let task_id = request.task_id.trim();
+    if task_id.is_empty() {
+        return Err(ApiError::InvalidInput("taskId 不能为空".to_string()));
+    }
+    let (scope, task) = require_session_owned_task(
+        &state,
+        request.session_id.as_deref(),
+        request.workspace_id.as_deref(),
+        request.workspace_path.as_deref(),
+        task_id,
+    )?;
+    let session_id = scope.session_id.clone();
+    let root_task = ensure_terminal_root_action(&state, &task.root_task_id, "从面板移除")?;
+    state
+        .session_store
+        .archive_active_execution_chain(&session_id, &root_task.task_id)
+        .map_err(|error| ApiError::internal_assembly("归档任务失败", error))?;
+    state.persist_runtime_durable_state_for_api()?;
+
+    let event_id = EventId::new(format!("event-task-archive-{}", now.0));
+    let event = EventEnvelope::domain(
+        event_id.clone(),
+        "task.archive.requested",
+        json!({
+            "taskId": task_id,
+            "rootTaskId": root_task.task_id.to_string(),
+            "sessionId": session_id.to_string(),
+            "workspaceId": scope.workspace_id.to_string(),
+            "requestedAt": now.0,
+        }),
+    )
+    .with_context(EventContext {
+        workspace_id: Some(scope.workspace_id.clone()),
+        session_id: Some(session_id.clone()),
+        mission_id: Some(root_task.mission_id.clone()),
+        task_id: Some(root_task.task_id.clone()),
+        ..EventContext::default()
+    });
+    state.event_bus.publish(event);
+
+    Ok(Json(json!({
+        "archived": true,
+        "sessionId": session_id.to_string(),
+        "rootTaskId": root_task.task_id.to_string(),
+        "eventId": event_id.to_string(),
         "requestedAt": now.0,
         "workspaceId": scope.workspace_id.to_string(),
         "workspacePath": scope.workspace_path,
@@ -451,64 +501,4 @@ mod tests {
             Some("code-review")
         );
     }
-}
-
-/// 从目标面板归档当前 root 任务：只移除会话当前执行链指针，不删除 TaskStore 历史。
-async fn archive_task(
-    State(state): State<ApiState>,
-    Json(request): Json<TaskIdRequest>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let now = UtcMillis::now();
-    let task_id = request.task_id.trim();
-    if task_id.is_empty() {
-        return Err(ApiError::InvalidInput("taskId 不能为空".to_string()));
-    }
-    let (scope, task) = require_session_owned_task(
-        &state,
-        request.session_id.as_deref(),
-        request.workspace_id.as_deref(),
-        request.workspace_path.as_deref(),
-        task_id,
-    )?;
-    let session_id = scope.session_id.clone();
-    let root_task = ensure_terminal_root_action(&state, &task.root_task_id, "从面板移除")?;
-    state
-        .session_store
-        .archive_active_execution_chain(&session_id, &root_task.task_id)
-        .map_err(|error| ApiError::internal_assembly("归档任务失败", error))?;
-    state.persist_runtime_durable_state_for_api()?;
-
-    let event_id = EventId::new(format!("event-task-archive-{}", now.0));
-    let event = EventEnvelope::domain(
-        event_id.clone(),
-        "task.archive.requested",
-        json!({
-            "taskId": task_id,
-            "rootTaskId": root_task.task_id.to_string(),
-            "sessionId": session_id.to_string(),
-            "workspaceId": scope.workspace_id.to_string(),
-            "requestedAt": now.0,
-        }),
-    )
-    .with_context(EventContext {
-        workspace_id: Some(scope.workspace_id.clone()),
-        session_id: Some(session_id.clone()),
-        mission_id: Some(root_task.mission_id.clone()),
-        task_id: Some(root_task.task_id.clone()),
-        ..EventContext::default()
-    });
-    state
-        .event_bus
-        .publish(event)
-        .map_err(|err| ApiError::event_publish_failed("归档事件发布失败", err))?;
-
-    Ok(Json(json!({
-        "archived": true,
-        "sessionId": session_id.to_string(),
-        "rootTaskId": root_task.task_id.to_string(),
-        "eventId": event_id.to_string(),
-        "requestedAt": now.0,
-        "workspaceId": scope.workspace_id.to_string(),
-        "workspacePath": scope.workspace_path,
-    })))
 }

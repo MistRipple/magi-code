@@ -290,9 +290,7 @@ mod tests {
         ];
 
         for event in &events {
-            let sequence = bus
-                .publish(event.clone())
-                .expect("publish task event should succeed");
+            let sequence = bus.publish(event.clone());
             assert!(sequence > 0);
         }
 

@@ -77,7 +77,7 @@ impl WorkspaceStore {
             .expect("workspace sidecar flush state write lock poisoned")
     }
 
-    pub(super) fn sort_worktree_allocations(allocations: &mut Vec<WorktreeAllocation>) {
+    pub(super) fn sort_worktree_allocations(allocations: &mut [WorktreeAllocation]) {
         allocations.sort_by(|left, right| {
             left.workspace_id
                 .as_str()
@@ -87,7 +87,7 @@ impl WorkspaceStore {
         });
     }
 
-    fn sort_snapshots(snapshots: &mut Vec<SnapshotRecord>) {
+    fn sort_snapshots(snapshots: &mut [SnapshotRecord]) {
         snapshots.sort_by(|left, right| {
             left.workspace_id
                 .as_str()

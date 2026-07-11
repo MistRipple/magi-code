@@ -34,7 +34,7 @@ use super::session_scope::{
 use crate::{
     dto::{
         BootstrapDto, NotificationsResponseDto, SessionTurnRequestDto, SessionTurnResponseDto,
-        SessionTurnRouteDto,
+        SessionTurnResponseInput, SessionTurnRouteDto,
     },
     errors::ApiError,
     session_continue::{
@@ -123,14 +123,16 @@ async fn submit_session_turn(
             Ok(()) => {}
             Err(error) if domain_error_is_active_current_turn(&error) => {
                 return Ok(Json(enqueue_session_turn_response(
-                    &state,
-                    request,
-                    images,
-                    workspace_id,
-                    accepted_at,
-                    decision,
-                    session_id,
-                    session_workspace_id,
+                    EnqueueSessionTurnInput {
+                        state: &state,
+                        request,
+                        images,
+                        requested_workspace_id: workspace_id,
+                        accepted_at,
+                        decision,
+                        session_id,
+                        workspace_id: session_workspace_id,
+                    },
                 )));
             }
             Err(error) => {
@@ -166,18 +168,18 @@ async fn submit_session_turn(
             let (accepted_canonical_turn, accepted_canonical_item) =
                 super::dispatch_accepted_canonical_event(&state, &accepted);
             Ok(Json(
-                SessionTurnResponseDto::new(
-                    accepted.session_id,
-                    accepted.entry_id,
+                SessionTurnResponseDto::new(SessionTurnResponseInput {
+                    session_id: accepted.session_id,
+                    entry_id: accepted.entry_id,
                     event_id,
-                    accepted.accepted_at,
-                    accepted.created_session,
-                    SessionTurnRouteDto::Task,
-                    Some(accepted.root_task_id),
-                    Some(accepted.action_task_id),
+                    accepted_at: accepted.accepted_at,
+                    created_session: accepted.created_session,
+                    route: SessionTurnRouteDto::Task,
+                    root_task_id: Some(accepted.root_task_id),
+                    action_task_id: Some(accepted.action_task_id),
                     execution_chain_ref,
-                    Some(accepted.user_message_item_id),
-                )
+                    user_message_item_id: Some(accepted.user_message_item_id),
+                })
                 .with_canonical_event(
                     "turn_started",
                     accepted_canonical_turn,
@@ -208,16 +210,17 @@ async fn submit_session_turn(
                     .ensure_session_mission(&session_id, accepted_at, || {
                         accepted.mission_id.clone()
                     });
-            let (entry_id, user_message_item_id) = write_continue_user_message(
-                &state,
-                &accepted,
-                prompt_text.as_deref(),
-                accepted_at,
-                signal.request_id,
-                signal.user_message_id,
-                signal.placeholder_message_id,
-                orchestrator_thread_id,
-            )?;
+            let (entry_id, user_message_item_id) =
+                write_continue_user_message(ContinueUserMessageInput {
+                    state: &state,
+                    accepted: &accepted,
+                    prompt_text: prompt_text.as_deref(),
+                    continued_at: accepted_at,
+                    request_id: signal.request_id,
+                    user_message_id: signal.user_message_id,
+                    placeholder_message_id: signal.placeholder_message_id,
+                    orchestrator_thread_id,
+                })?;
             state
                 .ensure_snapshot_session_for_workspace_id(&session_id, &Some(workspace_id))
                 .await?;
@@ -225,16 +228,18 @@ async fn submit_session_turn(
             state.persist_runtime_durable_state_for_api()?;
             let event_id = publish_session_turn_continue_event(&state, &accepted, accepted_at)?;
             Ok(Json(SessionTurnResponseDto::new(
-                accepted.session_id,
-                entry_id,
-                event_id,
-                accepted_at,
-                false,
-                SessionTurnRouteDto::Continue,
-                Some(accepted.root_task_id),
-                Some(accepted.action_task_id),
-                Some(accepted.execution_chain_ref),
-                user_message_item_id,
+                SessionTurnResponseInput {
+                    session_id: accepted.session_id,
+                    entry_id,
+                    event_id,
+                    accepted_at,
+                    created_session: false,
+                    route: SessionTurnRouteDto::Continue,
+                    root_task_id: Some(accepted.root_task_id),
+                    action_task_id: Some(accepted.action_task_id),
+                    execution_chain_ref: Some(accepted.execution_chain_ref),
+                    user_message_item_id,
+                },
             )))
         }
     }
@@ -258,8 +263,8 @@ struct SessionTurnIntentDecision {
 static SUPPLEMENT_SIGNAL_COUNTER: AtomicU64 = AtomicU64::new(1);
 static INCIDENT_NOTIFICATION_COUNTER: AtomicU64 = AtomicU64::new(1);
 
-fn enqueue_session_turn_response(
-    state: &ApiState,
+struct EnqueueSessionTurnInput<'a> {
+    state: &'a ApiState,
     request: SessionTurnRequestDto,
     images: Vec<magi_conversation_runtime::session_images::SessionTurnImage>,
     requested_workspace_id: WorkspaceId,
@@ -267,7 +272,19 @@ fn enqueue_session_turn_response(
     decision: SessionTurnIntentDecision,
     session_id: SessionId,
     workspace_id: Option<WorkspaceId>,
-) -> SessionTurnResponseDto {
+}
+
+fn enqueue_session_turn_response(input: EnqueueSessionTurnInput<'_>) -> SessionTurnResponseDto {
+    let EnqueueSessionTurnInput {
+        state,
+        request,
+        images,
+        requested_workspace_id,
+        accepted_at,
+        decision,
+        session_id,
+        workspace_id,
+    } = input;
     let queue_id = format!("queued-session-turn-{}-{}", session_id, accepted_at.0);
     let user_message_item_id = request
         .user_message_id()
@@ -297,18 +314,18 @@ fn enqueue_session_turn_response(
         &queue_id,
         queue_position,
     );
-    SessionTurnResponseDto::new(
+    SessionTurnResponseDto::new(SessionTurnResponseInput {
         session_id,
-        queue_id.clone(),
+        entry_id: queue_id.clone(),
         event_id,
         accepted_at,
-        false,
-        decision.route,
-        None,
-        None,
-        None,
-        Some(user_message_item_id),
-    )
+        created_session: false,
+        route: decision.route,
+        root_task_id: None,
+        action_task_id: None,
+        execution_chain_ref: None,
+        user_message_item_id: Some(user_message_item_id),
+    })
     .with_queued(queue_id, queue_position)
 }
 
@@ -413,18 +430,18 @@ async fn submit_supplement_context_turn(
         session_id, accepted_at.0
     ));
 
-    Ok(SessionTurnResponseDto::new(
+    Ok(SessionTurnResponseDto::new(SessionTurnResponseInput {
         session_id,
         entry_id,
         event_id,
         accepted_at,
-        false,
-        SessionTurnRouteDto::SupplementContext,
-        None,
-        None,
-        None,
-        None,
-    )
+        created_session: false,
+        route: SessionTurnRouteDto::SupplementContext,
+        root_task_id: None,
+        action_task_id: None,
+        execution_chain_ref: None,
+        user_message_item_id: None,
+    })
     .with_supplement_signal(mailbox_signal_ref, target_task_id.to_string()))
 }
 
@@ -1137,17 +1154,32 @@ fn session_turn_task_route_has_creation_evidence(decision: &SessionTurnIntentDec
     decision.task_title.is_some() || decision.execution_goal.is_some()
 }
 
-fn build_user_message_turn_item(
+struct UserMessageTurnItemInput<'a> {
     accepted_at: UtcMillis,
-    message: &str,
-    entry_id: &str,
+    message: &'a str,
+    entry_id: &'a str,
     request_id: Option<String>,
     user_message_id: Option<String>,
     placeholder_message_id: Option<String>,
     metadata: std::collections::HashMap<String, serde_json::Value>,
     task_id: Option<magi_core::TaskId>,
     source_thread_id: magi_core::ThreadId,
+}
+
+fn build_user_message_turn_item(
+    input: UserMessageTurnItemInput<'_>,
 ) -> (String, ActiveExecutionTurnItem) {
+    let UserMessageTurnItemInput {
+        accepted_at,
+        message,
+        entry_id,
+        request_id,
+        user_message_id,
+        placeholder_message_id,
+        metadata,
+        task_id,
+        source_thread_id,
+    } = input;
     let user_message_item_id = user_message_id
         .clone()
         .unwrap_or_else(|| format!("turn-item-user-{}", accepted_at.0));
@@ -1227,21 +1259,24 @@ async fn submit_regular_session_turn(
         .unwrap_or_else(|| format!("turn-item-assistant-stream-{}-0", accepted_at.0));
     let placeholder_message_id = Some(assistant_placeholder_item_id.clone());
     // 使用前端传入的 userMessageId 作为 canonical item_id，确保前端乐观节点与后端流式更新使用同一 ID
-    let (user_message_item_id, user_message_item) = build_user_message_turn_item(
-        accepted_at,
-        &message,
-        &entry_id,
-        request_id.clone(),
-        user_message_id.clone(),
-        placeholder_message_id.clone(),
-        magi_conversation_runtime::session_images::session_turn_images_metadata(&images),
-        None,
-        orchestrator_thread_id.clone(),
-    );
+    let (user_message_item_id, user_message_item) =
+        build_user_message_turn_item(UserMessageTurnItemInput {
+            accepted_at,
+            message: &message,
+            entry_id: &entry_id,
+            request_id: request_id.clone(),
+            user_message_id: user_message_id.clone(),
+            placeholder_message_id: placeholder_message_id.clone(),
+            metadata: magi_conversation_runtime::session_images::session_turn_images_metadata(
+                &images,
+            ),
+            task_id: None,
+            source_thread_id: orchestrator_thread_id.clone(),
+        });
     let turn_id = format!("turn-session-{}", accepted_at.0);
     let mut turn = ActiveExecutionTurn {
         turn_id: turn_id.clone(),
-        turn_seq: accepted_at.0 as u64,
+        turn_seq: accepted_at.0,
         accepted_at,
         status: "running".to_string(),
         completed_at: None,
@@ -1259,8 +1294,8 @@ async fn submit_regular_session_turn(
     ) {
         Ok(accepted) => accepted,
         Err(error) if domain_error_is_active_current_turn(&error) => {
-            return Ok(enqueue_session_turn_response(
-                &state,
+            return Ok(enqueue_session_turn_response(EnqueueSessionTurnInput {
+                state: &state,
                 request,
                 images,
                 requested_workspace_id,
@@ -1268,7 +1303,7 @@ async fn submit_regular_session_turn(
                 decision,
                 session_id,
                 workspace_id,
-            ));
+            }));
         }
         Err(error) => {
             return Err(map_current_turn_accept_error(
@@ -1300,16 +1335,17 @@ async fn submit_regular_session_turn(
                 .find(|item| item.item_id == user_message_item_id)
         })
         .cloned();
-    let event_id = publish_regular_session_turn_accepted_event(
-        &state,
-        &session_id,
-        workspace_id.as_ref(),
-        accepted_at,
-        created_session,
-        decision.route,
-        accepted_canonical_turn.as_ref(),
-        Some(&user_message_item_id),
-    )?;
+    let event_id =
+        publish_regular_session_turn_accepted_event(RegularSessionTurnAcceptedEventInput {
+            state: &state,
+            session_id: &session_id,
+            workspace_id: workspace_id.as_ref(),
+            accepted_at,
+            created_session,
+            route: decision.route,
+            canonical_turn: accepted_canonical_turn.as_ref(),
+            canonical_item_id: Some(&user_message_item_id),
+        });
     let prompt = decision
         .tool_intent
         .as_deref()
@@ -1358,18 +1394,18 @@ async fn submit_regular_session_turn(
         );
     }
 
-    Ok(SessionTurnResponseDto::new(
+    Ok(SessionTurnResponseDto::new(SessionTurnResponseInput {
         session_id,
         entry_id,
         event_id,
         accepted_at,
         created_session,
-        decision.route,
-        None,
-        None,
-        None,
-        Some(user_message_item_id),
-    )
+        route: decision.route,
+        root_task_id: None,
+        action_task_id: None,
+        execution_chain_ref: None,
+        user_message_item_id: Some(user_message_item_id),
+    })
     .with_canonical_event(
         "turn_started",
         accepted_canonical_turn,
@@ -1456,7 +1492,7 @@ fn spawn_regular_session_turn_execution(
                     return;
                 }
                 let event_id = EventId::new(format!("event-session-turn-{}", accepted_at.0));
-                if let Err(error) = state.event_bus.publish(
+                state.event_bus.publish(
                     EventEnvelope::domain(
                         event_id,
                         "session.turn.completed",
@@ -1473,13 +1509,7 @@ fn spawn_regular_session_turn_execution(
                         workspace_id: workspace_id.clone(),
                         ..EventContext::default()
                     }),
-                ) {
-                    tracing::error!(
-                        session_id = %session_id,
-                        ?error,
-                        "regular session turn completed event publish failed"
-                    );
-                }
+                );
                 schedule_next_queued_regular_session_turn(state, session_id, workspace_id);
             }
             Err(error) => {
@@ -1662,16 +1692,16 @@ async fn submit_goal_continuation_turn(
         .canonical_turns_for_session(&session_id)
         .into_iter()
         .find(|turn| turn.turn_id == turn_id);
-    let _ = publish_regular_session_turn_accepted_event(
-        &state,
-        &session_id,
-        workspace_id.as_ref(),
+    publish_regular_session_turn_accepted_event(RegularSessionTurnAcceptedEventInput {
+        state: &state,
+        session_id: &session_id,
+        workspace_id: workspace_id.as_ref(),
         accepted_at,
-        false,
-        SessionTurnRouteDto::Chat,
-        accepted_canonical_turn.as_ref(),
-        None,
-    )?;
+        created_session: false,
+        route: SessionTurnRouteDto::Chat,
+        canonical_turn: accepted_canonical_turn.as_ref(),
+        canonical_item_id: None,
+    });
     spawn_regular_session_turn_execution(
         state,
         SessionTurnExecutionRequest {
@@ -1801,12 +1831,14 @@ async fn submit_queued_task_session_turn(
     let (accepted, event_id) = super::accept_session_task_submission_at(
         &state,
         &request,
-        images,
-        requested_workspace_id,
-        decision.task_title.clone(),
-        decision.execution_goal.clone(),
-        decision.task_tier,
-        accepted_at,
+        super::SessionTaskSubmissionInput {
+            images,
+            workspace_id: requested_workspace_id,
+            task_title: decision.task_title.clone(),
+            execution_goal: decision.execution_goal.clone(),
+            task_tier: decision.task_tier,
+            accepted_at,
+        },
     )
     .await?;
     super::finalize_session_task_dispatch(state.clone(), accepted.clone());
@@ -1816,18 +1848,18 @@ async fn submit_queued_task_session_turn(
         .and_then(|sidecar| sidecar.ownership.execution_chain_ref);
     let (accepted_canonical_turn, accepted_canonical_item) =
         super::dispatch_accepted_canonical_event(&state, &accepted);
-    Ok(SessionTurnResponseDto::new(
-        accepted.session_id,
-        accepted.entry_id,
+    Ok(SessionTurnResponseDto::new(SessionTurnResponseInput {
+        session_id: accepted.session_id,
+        entry_id: accepted.entry_id,
         event_id,
-        accepted.accepted_at,
-        accepted.created_session,
-        SessionTurnRouteDto::Task,
-        Some(accepted.root_task_id),
-        Some(accepted.action_task_id),
+        accepted_at: accepted.accepted_at,
+        created_session: accepted.created_session,
+        route: SessionTurnRouteDto::Task,
+        root_task_id: Some(accepted.root_task_id),
+        action_task_id: Some(accepted.action_task_id),
         execution_chain_ref,
-        Some(accepted.user_message_item_id),
-    )
+        user_message_item_id: Some(accepted.user_message_item_id),
+    })
     .with_canonical_event(
         "turn_started",
         accepted_canonical_turn,
@@ -1990,16 +2022,30 @@ fn session_turn_failed_event_payload_with_canonical(
     payload
 }
 
-fn publish_regular_session_turn_accepted_event(
-    state: &ApiState,
-    session_id: &SessionId,
-    workspace_id: Option<&magi_core::WorkspaceId>,
+struct RegularSessionTurnAcceptedEventInput<'a> {
+    state: &'a ApiState,
+    session_id: &'a SessionId,
+    workspace_id: Option<&'a magi_core::WorkspaceId>,
     accepted_at: UtcMillis,
     created_session: bool,
     route: SessionTurnRouteDto,
-    canonical_turn: Option<&CanonicalTurn>,
-    canonical_item_id: Option<&str>,
-) -> Result<EventId, ApiError> {
+    canonical_turn: Option<&'a CanonicalTurn>,
+    canonical_item_id: Option<&'a str>,
+}
+
+fn publish_regular_session_turn_accepted_event(
+    input: RegularSessionTurnAcceptedEventInput<'_>,
+) -> EventId {
+    let RegularSessionTurnAcceptedEventInput {
+        state,
+        session_id,
+        workspace_id,
+        accepted_at,
+        created_session,
+        route,
+        canonical_turn,
+        canonical_item_id,
+    } = input;
     let event_id = EventId::new(format!("event-session-turn-accepted-{}", accepted_at.0));
     let canonical_item = canonical_turn
         .and_then(|turn| {
@@ -2026,11 +2072,8 @@ fn publish_regular_session_turn_accepted_event(
         session_id: Some(session_id.clone()),
         ..EventContext::default()
     });
-    state
-        .event_bus
-        .publish(event)
-        .map_err(|err| ApiError::event_publish_failed("session turn 接受事件发布失败", err))?;
-    Ok(event_id)
+    state.event_bus.publish(event);
+    event_id
 }
 
 fn publish_regular_session_turn_queued_event(
@@ -2060,14 +2103,7 @@ fn publish_regular_session_turn_queued_event(
         session_id: Some(session_id.clone()),
         ..EventContext::default()
     });
-    if let Err(error) = state.event_bus.publish(event) {
-        tracing::warn!(
-            session_id = %session_id,
-            queue_id,
-            ?error,
-            "session turn queued event publish failed"
-        );
-    }
+    state.event_bus.publish(event);
     event_id
 }
 
@@ -2097,14 +2133,7 @@ fn publish_regular_session_turn_queue_failed_event(
         session_id: Some(session_id.clone()),
         ..EventContext::default()
     });
-    if let Err(error) = state.event_bus.publish(event) {
-        tracing::warn!(
-            session_id = %session_id,
-            queue_id,
-            ?error,
-            "session turn queue failure event publish failed"
-        );
-    }
+    state.event_bus.publish(event);
 }
 
 fn publish_session_turn_continue_event(
@@ -2134,10 +2163,7 @@ fn publish_session_turn_continue_event(
         task_id: Some(accepted.root_task_id.clone()),
         ..EventContext::default()
     });
-    state
-        .event_bus
-        .publish(event)
-        .map_err(|err| ApiError::event_publish_failed("session turn 继续事件发布失败", err))?;
+    state.event_bus.publish(event);
     Ok(event_id)
 }
 
@@ -2323,31 +2349,46 @@ fn publish_session_user_message_created_event(
     );
 }
 
-fn write_continue_user_message(
-    state: &ApiState,
-    accepted: &SessionContinueAccepted,
-    prompt_text: Option<&str>,
+struct ContinueUserMessageInput<'a> {
+    state: &'a ApiState,
+    accepted: &'a SessionContinueAccepted,
+    prompt_text: Option<&'a str>,
     continued_at: UtcMillis,
     request_id: Option<String>,
     user_message_id: Option<String>,
     placeholder_message_id: Option<String>,
     orchestrator_thread_id: magi_core::ThreadId,
+}
+
+fn write_continue_user_message(
+    input: ContinueUserMessageInput<'_>,
 ) -> Result<(String, Option<String>), ApiError> {
+    let ContinueUserMessageInput {
+        state,
+        accepted,
+        prompt_text,
+        continued_at,
+        request_id,
+        user_message_id,
+        placeholder_message_id,
+        orchestrator_thread_id,
+    } = input;
     let entry_id = format!("timeline-{}-{}", accepted.session_id, continued_at.0);
     let Some(prompt_text) = prompt_text else {
         return Ok((entry_id, None));
     };
-    let (user_message_item_id, user_message_item) = build_user_message_turn_item(
-        continued_at,
-        prompt_text,
-        &entry_id,
-        request_id,
-        user_message_id,
-        placeholder_message_id,
-        Default::default(),
-        Some(accepted.action_task_id.clone()),
-        orchestrator_thread_id,
-    );
+    let (user_message_item_id, user_message_item) =
+        build_user_message_turn_item(UserMessageTurnItemInput {
+            accepted_at: continued_at,
+            message: prompt_text,
+            entry_id: &entry_id,
+            request_id,
+            user_message_id,
+            placeholder_message_id,
+            metadata: Default::default(),
+            task_id: Some(accepted.action_task_id.clone()),
+            source_thread_id: orchestrator_thread_id,
+        });
     let append_to_current_turn = state
         .session_store
         .runtime_sidecar(&accepted.session_id)
@@ -2374,7 +2415,7 @@ fn write_continue_user_message(
     } else {
         let mut turn = ActiveExecutionTurn {
             turn_id: format!("turn-session-continue-{}", continued_at.0),
-            turn_seq: continued_at.0 as u64,
+            turn_seq: continued_at.0,
             accepted_at: continued_at,
             status: "running".to_string(),
             completed_at: None,
@@ -2512,10 +2553,7 @@ async fn interrupt_session_turn(
         workspace_id: workspace_id.clone(),
         ..EventContext::default()
     });
-    state
-        .event_bus
-        .publish(event)
-        .map_err(|err| ApiError::event_publish_failed("session turn 中断事件发布失败", err))?;
+    state.event_bus.publish(event);
 
     Ok(Json(SessionInterruptResponseDto {
         interrupted,
@@ -2624,16 +2662,16 @@ async fn continue_session(
         state
             .session_store
             .ensure_session_mission(&session_id, continued_at, || accepted.mission_id.clone());
-    let _ = write_continue_user_message(
-        &state,
-        &accepted,
-        prompt_text.as_deref(),
+    let _ = write_continue_user_message(ContinueUserMessageInput {
+        state: &state,
+        accepted: &accepted,
+        prompt_text: prompt_text.as_deref(),
         continued_at,
         request_id,
         user_message_id,
         placeholder_message_id,
         orchestrator_thread_id,
-    )?;
+    })?;
     finalize_continue_session(state.clone(), accepted.clone(), continued_at);
     state.persist_runtime_durable_state_for_api()?;
     let event_id = EventId::new(format!("event-session-continue-{}", continued_at.0));
@@ -2657,10 +2695,7 @@ async fn continue_session(
         task_id: Some(accepted.root_task_id.clone()),
         ..EventContext::default()
     });
-    state
-        .event_bus
-        .publish(event)
-        .map_err(|err| ApiError::event_publish_failed("会话继续事件发布失败", err))?;
+    state.event_bus.publish(event);
     Ok(Json(ContinueSessionResponseDto {
         session_id: accepted.session_id.to_string(),
         workspace_id: workspace_id.to_string(),
@@ -3379,7 +3414,7 @@ mod tests {
                 session_id.clone(),
                 ActiveExecutionTurn {
                     turn_id: "turn-early-failure".to_string(),
-                    turn_seq: accepted_at.0 as u64,
+                    turn_seq: accepted_at.0,
                     accepted_at,
                     status: "running".to_string(),
                     completed_at: None,
@@ -3794,7 +3829,7 @@ mod tests {
                 session_id.clone(),
                 ActiveExecutionTurn {
                     turn_id: "turn-interrupt-canonical".to_string(),
-                    turn_seq: accepted_at.0 as u64,
+                    turn_seq: accepted_at.0,
                     accepted_at,
                     status: "running".to_string(),
                     completed_at: None,
@@ -3963,16 +3998,18 @@ mod tests {
             resumed_branch_count: 1,
             runner_started: true,
         };
-        let (_, user_item_id) = write_continue_user_message(
-            &state,
-            &accepted,
-            Some("继续推进"),
-            UtcMillis(now.0 + 1),
-            None,
-            None,
-            None,
-            magi_core::ThreadId::new("thread-orchestrator-continue-new-turn"),
-        )
+        let (_, user_item_id) = write_continue_user_message(ContinueUserMessageInput {
+            state: &state,
+            accepted: &accepted,
+            prompt_text: Some("继续推进"),
+            continued_at: UtcMillis(now.0 + 1),
+            request_id: None,
+            user_message_id: None,
+            placeholder_message_id: None,
+            orchestrator_thread_id: magi_core::ThreadId::new(
+                "thread-orchestrator-continue-new-turn",
+            ),
+        })
         .expect("continue message should write");
 
         let turn = state
@@ -5986,12 +6023,11 @@ mod tests {
                 .contains("不属于 workspace workspace-b"),
             "unexpected body: {body}"
         );
-        assert_eq!(
-            state
+        assert!(
+            !state
                 .session_store
                 .notifications_for_context("workspace-a", Some(&session_id))[0]
-                .handled,
-            false
+                .handled
         );
     }
 
@@ -6184,7 +6220,7 @@ mod tests {
             "notification-model-request-failed"
         );
         assert_eq!(stored[0].kind, "incident");
-        assert_eq!(stored[0].handled, false);
+        assert!(!stored[0].handled);
 
         let response = routes()
             .with_state(state)
@@ -6261,12 +6297,11 @@ mod tests {
                 .contains("workspace 不存在"),
             "unexpected body: {body}"
         );
-        assert_eq!(
-            state
+        assert!(
+            !state
                 .session_store
                 .notifications_for_context("workspace-missing", Some(&session_id))[0]
-                .handled,
-            false
+                .handled
         );
 
         let _ = fs::remove_dir_all(persistence_root);

@@ -166,7 +166,7 @@ impl BridgeTransport for JsonRpcStdioTransport {
                 message: format!("unsupported jsonrpc version: {}", envelope.jsonrpc),
             });
         }
-        if envelope.id != Value::from(1) {
+        if envelope.id != 1 {
             return Err(BridgeTransportError::Protocol {
                 message: format!("response id mismatch: expected=1 actual={}", envelope.id),
             });

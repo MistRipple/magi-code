@@ -40,16 +40,16 @@ impl DirectHttpModelProbeConfig {
     /// 返回移除内嵌凭据后的 base URL。
     pub fn sanitized_base_url(&self) -> String {
         // 如果 URL 含 user-info，避免在诊断输出中泄露凭据。
-        if let Some(at_pos) = self.base_url.find('@') {
-            if let Some(scheme_end) = self.base_url.find("://") {
-                let after_scheme = scheme_end + 3;
-                if at_pos > after_scheme {
-                    return format!(
-                        "{}{}",
-                        &self.base_url[..after_scheme],
-                        &self.base_url[at_pos + 1..]
-                    );
-                }
+        if let Some(at_pos) = self.base_url.find('@')
+            && let Some(scheme_end) = self.base_url.find("://")
+        {
+            let after_scheme = scheme_end + 3;
+            if at_pos > after_scheme {
+                return format!(
+                    "{}{}",
+                    &self.base_url[..after_scheme],
+                    &self.base_url[at_pos + 1..]
+                );
             }
         }
         self.base_url.clone()

@@ -145,6 +145,16 @@ pub struct ResultRanker {
     weights: RankWeights,
 }
 
+pub struct RankInput<'a> {
+    pub index_hits: &'a [IndexSearchHit],
+    pub symbol_hits: &'a [SymbolSearchHit],
+    pub centrality_map: &'a HashMap<String, f64>,
+    pub max_results: usize,
+    pub file_timestamps: &'a HashMap<String, u64>,
+    pub weight_overrides: Option<&'a RankWeights>,
+    pub boost_signals: Option<&'a RankBoostSignals>,
+}
+
 impl Default for ResultRanker {
     fn default() -> Self {
         Self::new(None)
@@ -157,24 +167,15 @@ impl ResultRanker {
         Self { weights: w }
     }
 
-    pub fn rank(
-        &self,
-        index_hits: &[IndexSearchHit],
-        symbol_hits: &[SymbolSearchHit],
-        centrality_map: &HashMap<String, f64>,
-        max_results: usize,
-        file_timestamps: &HashMap<String, u64>,
-        weight_overrides: Option<&RankWeights>,
-        boost_signals: Option<&RankBoostSignals>,
-    ) -> Vec<RankedResult> {
-        let effective_weights = match weight_overrides {
+    pub fn rank(&self, input: RankInput<'_>) -> Vec<RankedResult> {
+        let effective_weights = match input.weight_overrides {
             Some(overrides) => self.weights.merge_overrides(overrides).normalized(),
             None => self.weights.clone(),
         };
 
         let mut file_map: HashMap<String, FileScoreEntry> = HashMap::new();
 
-        for hit in index_hits {
+        for hit in input.index_hits {
             let entry = file_map.entry(hit.file_path.clone()).or_default();
             entry.sources.insert("index".to_string());
             entry.tfidf = entry.tfidf.max(hit.score);
@@ -183,7 +184,7 @@ impl ResultRanker {
                 .max(context_to_weight(hit.best_context));
         }
 
-        for hit in symbol_hits {
+        for hit in input.symbol_hits {
             let entry = file_map.entry(hit.symbol.file_path.clone()).or_default();
             entry.sources.insert("symbol".to_string());
             entry.symbol_match = entry.symbol_match.max(hit.score);
@@ -193,19 +194,19 @@ impl ResultRanker {
         }
 
         for (file_path, entry) in file_map.iter_mut() {
-            if let Some(&c) = centrality_map.get(file_path) {
+            if let Some(&c) = input.centrality_map.get(file_path) {
                 entry.centrality = c;
             }
         }
 
         let now = now_millis();
         for (file_path, entry) in file_map.iter_mut() {
-            if let Some(&mtime) = file_timestamps.get(file_path) {
+            if let Some(&mtime) = input.file_timestamps.get(file_path) {
                 entry.recency = calculate_recency(mtime, now);
             }
         }
 
-        if let Some(signals) = boost_signals {
+        if let Some(signals) = input.boost_signals {
             if !signals.recent_edited_files.is_empty() {
                 for (file_path, entry) in file_map.iter_mut() {
                     if signals.recent_edited_files.contains(file_path) {
@@ -225,7 +226,7 @@ impl ResultRanker {
                 .partial_cmp(&b.final_score)
                 .unwrap_or(std::cmp::Ordering::Equal)
         };
-        let mut heap = MinHeap::new(max_results, cmp);
+        let mut heap = MinHeap::new(input.max_results, cmp);
 
         for (file_path, entry) in file_map {
             let breakdown = ScoreDimensions {
@@ -355,15 +356,15 @@ mod tests {
             score: 80.0,
             match_type: MatchType::Exact,
         }];
-        let results = ranker.rank(
-            &index_hits,
-            &symbol_hits,
-            &HashMap::new(),
-            10,
-            &HashMap::new(),
-            None,
-            None,
-        );
+        let results = ranker.rank(RankInput {
+            index_hits: &index_hits,
+            symbol_hits: &symbol_hits,
+            centrality_map: &HashMap::new(),
+            max_results: 10,
+            file_timestamps: &HashMap::new(),
+            weight_overrides: None,
+            boost_signals: None,
+        });
         assert_eq!(results.len(), 1);
         assert!(results[0].final_score > 0.0);
         assert!(results[0].sources.len() >= 2);
@@ -395,15 +396,15 @@ mod tests {
         }];
         let mut centrality = HashMap::new();
         centrality.insert("a.rs".to_string(), 0.5);
-        let r2 = ranker.rank(
-            &index_hits,
-            &symbol_hits,
-            &centrality,
-            10,
-            &HashMap::new(),
-            None,
-            None,
-        );
+        let r2 = ranker.rank(RankInput {
+            index_hits: &index_hits,
+            symbol_hits: &symbol_hits,
+            centrality_map: &centrality,
+            max_results: 10,
+            file_timestamps: &HashMap::new(),
+            weight_overrides: None,
+            boost_signals: None,
+        });
         assert!(r2[0].sources.len() >= 2);
     }
 

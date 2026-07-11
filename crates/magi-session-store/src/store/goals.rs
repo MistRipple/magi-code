@@ -13,6 +13,20 @@ fn normalize_objective(objective: impl Into<String>) -> DomainResult<String> {
     Ok(trimmed.to_string())
 }
 
+fn unique_goal_id(goals: &[SessionGoal], base: String) -> GoalId {
+    if !goals.iter().any(|goal| goal.goal_id.as_str() == base) {
+        return GoalId::new(base);
+    }
+    let mut suffix = 1_u64;
+    loop {
+        let candidate = format!("{base}-{suffix}");
+        if !goals.iter().any(|goal| goal.goal_id.as_str() == candidate) {
+            return GoalId::new(candidate);
+        }
+        suffix = suffix.saturating_add(1);
+    }
+}
+
 impl SessionStore {
     pub fn create_goal(
         &self,
@@ -44,7 +58,7 @@ impl SessionStore {
             });
         }
         let goal = SessionGoal {
-            goal_id: GoalId::new(format!("goal-{}-{}", session_id, now.0)),
+            goal_id: unique_goal_id(&state.goals, format!("goal-{}-{}", session_id, now.0)),
             session_id: session_id.clone(),
             thread_id,
             objective: objective.clone(),
@@ -102,18 +116,8 @@ impl SessionStore {
     }
 
     pub fn current_visible_goal(&self, session_id: &SessionId) -> Option<SessionGoal> {
-        let state = self.state.read().expect("session state read lock poisoned");
-        state
-            .goals
-            .iter()
-            .filter(|goal| &goal.session_id == session_id && goal.status != GoalStatus::Cleared)
-            .max_by(|left, right| {
-                left.updated_at
-                    .0
-                    .cmp(&right.updated_at.0)
-                    .then_with(|| left.goal_id.as_str().cmp(right.goal_id.as_str()))
-            })
-            .cloned()
+        self.current_goal(session_id)
+            .filter(|goal| goal.status != GoalStatus::Cleared)
     }
 
     pub fn active_goal(&self, session_id: &SessionId) -> Option<SessionGoal> {
@@ -188,7 +192,12 @@ impl SessionStore {
             .iter_mut()
             .find(|goal| &goal.session_id == session_id && &goal.goal_id == goal_id)
             .ok_or(DomainError::NotFound { entity: "goal" })?;
-        if goal.status == GoalStatus::Cleared && goal.status != status {
+        let invalid_terminal_transition = match goal.status {
+            GoalStatus::Cleared => status != GoalStatus::Cleared,
+            GoalStatus::Complete => !matches!(status, GoalStatus::Complete | GoalStatus::Cleared),
+            _ => false,
+        };
+        if invalid_terminal_transition {
             return Err(DomainError::InvalidState {
                 message: "terminal goal status cannot transition".to_string(),
             });
@@ -304,6 +313,64 @@ impl SessionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clearing_latest_goal_does_not_reveal_older_completed_goal() {
+        let store = SessionStore::new();
+        let session_id = SessionId::new("session-goal-history");
+        store
+            .create_session(session_id.clone(), "goal history")
+            .expect("session should be created");
+        let first = store
+            .create_goal(
+                session_id.clone(),
+                ThreadId::new("thread-goal-history"),
+                "第一个目标",
+                None,
+            )
+            .expect("first goal should be created");
+        store
+            .set_goal_status(&session_id, &first.goal_id, GoalStatus::Complete)
+            .expect("first goal should complete");
+        let second = store
+            .create_goal(
+                session_id.clone(),
+                ThreadId::new("thread-goal-history"),
+                "第二个目标",
+                None,
+            )
+            .expect("second goal should be created");
+        store
+            .set_goal_status(&session_id, &second.goal_id, GoalStatus::Cleared)
+            .expect("second goal should clear");
+
+        assert!(store.current_visible_goal(&session_id).is_none());
+    }
+
+    #[test]
+    fn completed_goal_is_terminal() {
+        let store = SessionStore::new();
+        let session_id = SessionId::new("session-goal-terminal");
+        store
+            .create_session(session_id.clone(), "goal terminal")
+            .expect("session should be created");
+        let goal = store
+            .create_goal(
+                session_id.clone(),
+                ThreadId::new("thread-goal-terminal"),
+                "终态目标",
+                None,
+            )
+            .expect("goal should be created");
+        store
+            .set_goal_status(&session_id, &goal.goal_id, GoalStatus::Complete)
+            .expect("goal should complete");
+
+        let error = store
+            .set_goal_status(&session_id, &goal.goal_id, GoalStatus::Active)
+            .expect_err("completed goal must not reopen");
+        assert!(matches!(error, DomainError::InvalidState { .. }));
+    }
 
     #[test]
     fn goal_blocks_only_after_three_consecutive_failed_turns() {

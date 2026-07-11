@@ -4,6 +4,7 @@
 //! 本模块只做：
 //!   1. 鉴权（路径安全 + 会话归属）；
 //!   2. DTO 适配（PendingChange → PendingChangeDto，补 contributor / execution_group 元信息）。
+//!
 //! 不再读 git，也不再写 git。
 
 use crate::{errors::ApiError, state::ApiState};
@@ -441,6 +442,7 @@ pub(crate) fn safe_relative_path(file_path: &str) -> Result<&str, ApiError> {
 /// 返回值：`(canonical_absolute_path, workspace_relative_path)`。
 /// - 相对路径：拒绝 `..` 与绝对前缀，再拼到 `workspace_root` 上。
 /// - 绝对路径：直接使用。
+///
 /// 解析后必须 canonicalize 且仍位于 `workspace_root` 之内，否则视为越界并拒绝。
 pub(crate) fn safe_workspace_path(
     workspace_root: &Path,

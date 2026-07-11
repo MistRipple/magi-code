@@ -122,7 +122,7 @@ impl ToolRegistry {
     }
 
     pub(crate) fn resolve_access_mode(&self, input: &ToolExecutionInput) -> BuiltinToolAccessMode {
-        let Some(tool_name) = crate::BuiltinToolName::from_str(input.tool_name.trim()) else {
+        let Some(tool_name) = crate::BuiltinToolName::from_name(input.tool_name.trim()) else {
             return BuiltinToolAccessMode::ReadOnly;
         };
         let default_access_mode = tool_name.default_access_mode();
@@ -176,7 +176,6 @@ impl ToolRegistry {
             ),
             denied_paths: normalize_tool_policy_paths(&policy.denied_paths, workspace_root_path),
             command_mode: policy.command_mode.clone(),
-            ..magi_permissions::PermissionPolicy::default()
         };
         let mut pending_output = None;
 
@@ -336,7 +335,7 @@ impl ToolRegistry {
         let request = parse_json_object(&input.input);
         let mut paths = Vec::new();
 
-        if crate::BuiltinToolName::from_str(input.tool_name.trim())
+        if crate::BuiltinToolName::from_name(input.tool_name.trim())
             == Some(crate::BuiltinToolName::ApplyPatch)
         {
             for path_value in apply_patch_declared_paths_from_input(&input.input) {
@@ -349,10 +348,10 @@ impl ToolRegistry {
 
         if let Some(object) = &request {
             for key in ["path", "source", "destination", "cwd", "root"] {
-                if let Some(value) = field_string(object, &[key]) {
-                    if let Ok(path) = resolve_path_with_context(&value, context) {
-                        paths.push(normalize_path_for_lock(&path));
-                    }
+                if let Some(value) = field_string(object, &[key])
+                    && let Ok(path) = resolve_path_with_context(&value, context)
+                {
+                    paths.push(normalize_path_for_lock(&path));
                 }
             }
         }
@@ -582,7 +581,7 @@ pub fn tool_path_access_requests(
     workspace_root_path: Option<&Path>,
     access_profile: AccessProfile,
 ) -> Vec<ToolPathAccessRequest> {
-    let Some(tool) = crate::BuiltinToolName::from_str(canonical_tool_name) else {
+    let Some(tool) = crate::BuiltinToolName::from_name(canonical_tool_name) else {
         return Vec::new();
     };
     let write = magi_permissions::PathAccessKind::Write;

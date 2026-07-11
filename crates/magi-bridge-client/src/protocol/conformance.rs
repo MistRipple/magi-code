@@ -29,32 +29,31 @@ impl ConformanceValidator {
 
         let mut prev_role: Option<&str> = None;
         for msg in &params.messages {
-            if msg.role == "system" {
-                if prev_role.is_some() && prev_role != Some("system") {
-                    violations.push(ConformanceViolation {
-                        rule: "system_message_position".to_string(),
-                        message: "system messages should be at the beginning".to_string(),
-                        severity: ViolationSeverity::Warning,
-                    });
-                }
+            if msg.role == "system" && prev_role.is_some() && prev_role != Some("system") {
+                violations.push(ConformanceViolation {
+                    rule: "system_message_position".to_string(),
+                    message: "system messages should be at the beginning".to_string(),
+                    severity: ViolationSeverity::Warning,
+                });
             }
             prev_role = Some(&msg.role);
         }
 
         for (i, msg) in params.messages.iter().enumerate() {
-            if msg.role == "assistant" {
-                if let LlmMessageContent::Blocks(blocks) = &msg.content {
-                    let has_tool_use = blocks
-                        .iter()
-                        .any(|b| matches!(b, LlmContentBlock::ToolUse { .. }));
-                    if has_tool_use {
-                        let next = params.messages.get(i + 1);
-                        let has_result = next.map_or(false, |n| {
+            if msg.role == "assistant"
+                && let LlmMessageContent::Blocks(blocks) = &msg.content
+            {
+                let has_tool_use = blocks
+                    .iter()
+                    .any(|b| matches!(b, LlmContentBlock::ToolUse { .. }));
+                if has_tool_use {
+                    let next = params.messages.get(i + 1);
+                    let has_result = next.is_some_and(|n| {
                             n.role == "user"
                                 && matches!(&n.content, LlmMessageContent::Blocks(bs) if bs.iter().any(|b| matches!(b, LlmContentBlock::ToolResult { .. })))
                         });
-                        if !has_result {
-                            violations.push(ConformanceViolation {
+                    if !has_result {
+                        violations.push(ConformanceViolation {
                                 rule: "tool_use_result_pairing".to_string(),
                                 message: format!(
                                     "assistant message at index {} has tool_use without following tool_result",
@@ -62,7 +61,6 @@ impl ConformanceValidator {
                                 ),
                                 severity: ViolationSeverity::Error,
                             });
-                        }
                     }
                 }
             }

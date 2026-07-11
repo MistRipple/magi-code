@@ -4,7 +4,9 @@ use crate::{
     ExecutionOverview, ExecutionRuntimeSnapshot, ExecutionSkillDispatchSummary,
     TaskGovernanceSummary, TaskSkillDispatchSummary,
 };
-use magi_core::{AgentRunProjection, AssignmentId, MissionId, Task, TaskId};
+use magi_core::{
+    AgentRunProjection, AssignmentId, SessionId, Task, TaskExecutionTarget, TaskId, WorkspaceId,
+};
 use magi_skill_runtime::{SkillDispatchRoute, SkillDispatchStatus};
 use magi_tool_runtime::ToolExecutionSummary;
 use magi_worker_runtime::{
@@ -12,6 +14,17 @@ use magi_worker_runtime::{
     WorkerSkillDispatchObservation,
 };
 use std::collections::HashSet;
+
+pub(crate) struct ExecutionOverviewProjectionInput<'a> {
+    pub target: &'a TaskExecutionTarget,
+    pub session_id: Option<SessionId>,
+    pub workspace_id: Option<WorkspaceId>,
+    pub worker_summary: WorkerRuntimeSummary,
+    pub tool_summary: ToolExecutionSummary,
+    pub skill_dispatch_observations: &'a [WorkerSkillDispatchObservation],
+    pub governance_observations: &'a [WorkerGovernanceObservation],
+    pub context_summary: Option<ExecutionContextSummary>,
+}
 
 pub(crate) fn build_execution_overview_payload(overview: &ExecutionOverview) -> serde_json::Value {
     let context_payload = overview
@@ -149,14 +162,18 @@ pub(crate) fn build_runtime_snapshot_from_projection(
 
 pub(crate) fn build_execution_overview_from_task_projection(
     task_store: &TaskStore,
-    root_task_id: &TaskId,
-    _mission_id: &MissionId,
-    worker_summary: WorkerRuntimeSummary,
-    tool_summary: ToolExecutionSummary,
-    skill_dispatch_observations: &[WorkerSkillDispatchObservation],
-    governance_observations: &[WorkerGovernanceObservation],
-    context_summary: Option<ExecutionContextSummary>,
+    input: ExecutionOverviewProjectionInput<'_>,
 ) -> Option<ExecutionOverview> {
+    let ExecutionOverviewProjectionInput {
+        target,
+        worker_summary,
+        tool_summary,
+        skill_dispatch_observations,
+        governance_observations,
+        context_summary,
+        ..
+    } = input;
+    let root_task_id = &target.root_task_id;
     let projection = task_store.build_agent_run_projection(root_task_id)?;
     let subtree_tasks = collect_subtree_tasks(task_store, root_task_id);
     let assignment_roots = collect_assignment_roots(task_store, &projection.root_task);

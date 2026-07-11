@@ -105,33 +105,32 @@ fn parse_openai_stream_data(data: &str) -> Vec<LlmStreamChunk> {
     for choice in choices {
         let delta = &choice["delta"];
 
-        if let Some(content) = delta["content"].as_str() {
-            if !content.is_empty() {
-                chunks.push(LlmStreamChunk {
-                    kind: LlmStreamChunkType::ContentDelta,
-                    content: Some(content.to_string()),
-                    tool_call: None,
-                    thinking: None,
-                    usage: None,
-                    stop_reason: None,
-                });
-            }
+        if let Some(content) = delta["content"].as_str()
+            && !content.is_empty()
+        {
+            chunks.push(LlmStreamChunk {
+                kind: LlmStreamChunkType::ContentDelta,
+                content: Some(content.to_string()),
+                tool_call: None,
+                thinking: None,
+                usage: None,
+                stop_reason: None,
+            });
         }
 
         if let Some(reasoning) = delta["reasoning_content"]
             .as_str()
             .or_else(|| delta["reasoning"].as_str())
+            && !reasoning.is_empty()
         {
-            if !reasoning.is_empty() {
-                chunks.push(LlmStreamChunk {
-                    kind: LlmStreamChunkType::Thinking,
-                    content: None,
-                    tool_call: None,
-                    thinking: Some(reasoning.to_string()),
-                    usage: None,
-                    stop_reason: None,
-                });
-            }
+            chunks.push(LlmStreamChunk {
+                kind: LlmStreamChunkType::Thinking,
+                content: None,
+                tool_call: None,
+                thinking: Some(reasoning.to_string()),
+                usage: None,
+                stop_reason: None,
+            });
         }
 
         if let Some(tool_calls) = delta["tool_calls"].as_array() {
@@ -154,7 +153,7 @@ fn parse_openai_stream_data(data: &str) -> Vec<LlmStreamChunk> {
                     tool_call: Some(PartialToolCall {
                         id,
                         name,
-                        arguments: args.map(|a| Value::String(a)),
+                        arguments: args.map(Value::String),
                         index,
                     }),
                     thinking: None,
@@ -416,25 +415,25 @@ impl StreamAccumulator {
                 }
             }
             LlmStreamChunkType::ToolCallDelta => {
-                if let Some(ref tc) = chunk.tool_call {
-                    if let Some(fragment) = tool_call_argument_fragment(tc.arguments.as_ref()) {
-                        // 使用 index 路由到正确的 tool call（OpenAI 并行调用），
-                        // 无 index 时回退到最后一个（Anthropic 顺序调用）
-                        let target_idx = tc
-                            .index
-                            .filter(|idx| *idx < self.active_tool_calls.len())
-                            .or_else(|| {
-                                if self.active_tool_calls.is_empty() {
-                                    None
-                                } else {
-                                    Some(self.active_tool_calls.len() - 1)
-                                }
-                            });
-                        if let Some(idx) = target_idx {
-                            self.active_tool_calls[idx]
-                                .arguments_buffer
-                                .push_str(&fragment);
-                        }
+                if let Some(ref tc) = chunk.tool_call
+                    && let Some(fragment) = tool_call_argument_fragment(tc.arguments.as_ref())
+                {
+                    // 使用 index 路由到正确的 tool call（OpenAI 并行调用），
+                    // 无 index 时回退到最后一个（Anthropic 顺序调用）
+                    let target_idx = tc
+                        .index
+                        .filter(|idx| *idx < self.active_tool_calls.len())
+                        .or_else(|| {
+                            if self.active_tool_calls.is_empty() {
+                                None
+                            } else {
+                                Some(self.active_tool_calls.len() - 1)
+                            }
+                        });
+                    if let Some(idx) = target_idx {
+                        self.active_tool_calls[idx]
+                            .arguments_buffer
+                            .push_str(&fragment);
                     }
                 }
             }

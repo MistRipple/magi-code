@@ -3484,7 +3484,7 @@ fn file_move_rejects_existing_destination_without_overwrite() {
 fn from_str_handles_all_canonical_names() {
     for tool in all_builtin_tools() {
         assert_eq!(
-            BuiltinToolName::from_str(tool.as_str()),
+            BuiltinToolName::from_name(tool.as_str()),
             Some(tool),
             "canonical name {} should resolve",
             tool.as_str()
@@ -3511,17 +3511,17 @@ fn from_str_rejects_non_canonical_aliases() {
         "plan",
         "snapshot",
     ] {
-        assert_eq!(BuiltinToolName::from_str(alias), None);
+        assert_eq!(BuiltinToolName::from_name(alias), None);
     }
-    assert_eq!(BuiltinToolName::from_str("nonexistent_tool"), None);
-    assert_eq!(BuiltinToolName::from_str("mermaid_diagram"), None);
+    assert_eq!(BuiltinToolName::from_name("nonexistent_tool"), None);
+    assert_eq!(BuiltinToolName::from_name("mermaid_diagram"), None);
 }
 
 #[test]
 fn from_str_roundtrips_through_as_str() {
     for tool in all_builtin_tools() {
         assert_eq!(
-            BuiltinToolName::from_str(tool.as_str()),
+            BuiltinToolName::from_name(tool.as_str()),
             Some(tool),
             "{:?} roundtrip failed",
             tool
@@ -3886,6 +3886,7 @@ fn knowledge_query_reads_workspace_knowledge_store() {
         tags: vec!["runtime".to_string()],
         workspace_id: Some(workspace_id.clone()),
         source_ref: Some("memory/runtime.md".to_string()),
+        created_at: UtcMillis(100),
         updated_at: UtcMillis(100),
     });
     store.upsert(magi_knowledge_store::KnowledgeRecord {
@@ -3896,6 +3897,7 @@ fn knowledge_query_reads_workspace_knowledge_store() {
         tags: vec!["runtime".to_string()],
         workspace_id: Some(WorkspaceId::new("workspace-knowledge-query-other")),
         source_ref: Some("memory/other.md".to_string()),
+        created_at: UtcMillis(200),
         updated_at: UtcMillis(200),
     });
 
@@ -3963,7 +3965,7 @@ fn orchestration_tools_are_not_registered_as_builtins() {
         "context_compact",
     ] {
         assert!(
-            BuiltinToolName::from_str(tool_name).is_none(),
+            BuiltinToolName::from_name(tool_name).is_none(),
             "{tool_name}"
         );
         assert!(
@@ -4025,7 +4027,7 @@ fn web_fetch_reads_local_http_response() {
         let body = r#"<!doctype html><html><body><main><h1>Smoke Web Fetch</h1><p>alpha beta</p></main></body></html>"#;
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            body.as_bytes().len(),
+            body.len(),
             body
         );
         stream
@@ -4096,7 +4098,7 @@ fn web_fetch_http_status_keeps_actionable_status_code() {
         let body = "temporarily unavailable";
         let response = format!(
             "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            body.as_bytes().len(),
+            body.len(),
             body
         );
         stream
@@ -4446,7 +4448,7 @@ fn diagram_renderer_names_are_not_builtin_tools() {
         "svelte-flow",
     ] {
         assert_eq!(
-            BuiltinToolName::from_str(name),
+            BuiltinToolName::from_name(name),
             None,
             "{name} must stay a renderer/kind behind diagram_render, not a builtin tool"
         );

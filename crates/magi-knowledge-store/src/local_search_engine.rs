@@ -9,7 +9,7 @@ use crate::index_persistence::{IndexPersistence, PersistenceSnapshot};
 use crate::inverted_index::{IndexSearchHit, InvertedIndex};
 use crate::query_expander::{LlmExpandResult, QueryExpander};
 use crate::result_ranker::{
-    RankBoostSignals, RankWeights, RankedResult, ResultRanker, ScoreDimensions,
+    RankBoostSignals, RankInput, RankWeights, RankedResult, ResultRanker, ScoreDimensions,
 };
 use crate::search_cache::SearchCache;
 use crate::semantic_reranker::SemanticReranker;
@@ -178,18 +178,18 @@ impl LocalSearchEngine {
                 );
 
                 let total_files = snapshot.file_manifest.len() + freshness.added.len();
-                if !IndexPersistence::should_full_rebuild(&freshness, total_files) {
-                    if self.restore_from_snapshot(&snapshot, &freshness) {
-                        if let Some(ref ec) = snapshot.expansion_cache {
-                            self.query_expander.import_cache(ec.clone());
-                        }
-                        self.rebuild_tracked_file_states();
-                        self.refresh_project_vocabulary_if_needed();
-                        self.bump_index_version();
-                        self.is_ready = true;
-                        self.save_index();
-                        return;
+                if !IndexPersistence::should_full_rebuild(&freshness, total_files)
+                    && self.restore_from_snapshot(&snapshot, &freshness)
+                {
+                    if let Some(ref ec) = snapshot.expansion_cache {
+                        self.query_expander.import_cache(ec.clone());
                     }
+                    self.rebuild_tracked_file_states();
+                    self.refresh_project_vocabulary_if_needed();
+                    self.bump_index_version();
+                    self.is_ready = true;
+                    self.save_index();
+                    return;
                 }
             }
         }
@@ -227,11 +227,9 @@ impl LocalSearchEngine {
         let mut expanded = self.query_expander.expand_offline(trimmed, &query_tokens);
 
         let should_expand = query_intent == QueryIntent::Semantic && query_tokens.len() <= 3;
-        if should_expand {
-            if let Some(llm_result) = options.llm_expand_result {
-                self.query_expander
-                    .merge_llm_result(&mut expanded, llm_result);
-            }
+        if should_expand && let Some(llm_result) = options.llm_expand_result {
+            self.query_expander
+                .merge_llm_result(&mut expanded, llm_result);
         }
 
         let search_tokens = &expanded.expanded_tokens;
@@ -316,15 +314,15 @@ impl LocalSearchEngine {
             },
         };
 
-        let ranked = self.result_ranker.rank(
-            &index_hits,
-            &symbol_hits,
-            &centrality_map,
-            max_results * 2,
-            &file_timestamps,
-            weight_overrides.as_ref(),
-            Some(&boost_signals),
-        );
+        let ranked = self.result_ranker.rank(RankInput {
+            index_hits: &index_hits,
+            symbol_hits: &symbol_hits,
+            centrality_map: &centrality_map,
+            max_results: max_results * 2,
+            file_timestamps: &file_timestamps,
+            weight_overrides: weight_overrides.as_ref(),
+            boost_signals: Some(&boost_signals),
+        });
 
         let expanded_ranked = self.expand_with_dependencies(ranked, max_results * 2);
 
@@ -808,7 +806,7 @@ impl LocalSearchEngine {
         let mut recent = HashSet::new();
         self.recent_edited_files
             .retain(|_, ts| now - *ts <= RECENT_EDIT_TTL_MS);
-        for (fp, _) in &self.recent_edited_files {
+        for fp in self.recent_edited_files.keys() {
             recent.insert(fp.clone());
         }
         recent
@@ -827,8 +825,7 @@ impl LocalSearchEngine {
         let mut expanded = ranked.clone();
         let top_n = 3.min(ranked.len());
 
-        for i in 0..top_n {
-            let top_result = &ranked[i];
+        for top_result in ranked.iter().take(top_n) {
             let neighbors = self.dependency_graph.expand(
                 &top_result.file_path,
                 1,
@@ -914,17 +911,17 @@ impl LocalSearchEngine {
                 );
             }
 
-            if snippets.is_empty() {
-                if let Some(sym_lines) = symbol_line_map.get(item.file_path.as_str()) {
-                    snippets = extract_snippets(
-                        &item.file_path,
-                        &lines,
-                        sym_lines,
-                        &[],
-                        max_context_length - total_content_length,
-                        &self.symbol_index,
-                    );
-                }
+            if snippets.is_empty()
+                && let Some(sym_lines) = symbol_line_map.get(item.file_path.as_str())
+            {
+                snippets = extract_snippets(
+                    &item.file_path,
+                    &lines,
+                    sym_lines,
+                    &[],
+                    max_context_length - total_content_length,
+                    &self.symbol_index,
+                );
             }
 
             let snippet_len: usize = snippets.iter().map(|s| s.content.len()).sum();
@@ -1005,11 +1002,11 @@ fn extract_snippets(
 
     let mut merged: Vec<(usize, usize)> = Vec::new();
     for (start, end) in ranges {
-        if let Some(last) = merged.last_mut() {
-            if start <= last.1 + 1 {
-                last.1 = last.1.max(end);
-                continue;
-            }
+        if let Some(last) = merged.last_mut()
+            && start <= last.1 + 1
+        {
+            last.1 = last.1.max(end);
+            continue;
         }
         merged.push((start, end));
     }

@@ -301,7 +301,7 @@ async fn fetch_model_ids_for_config(
             headers.insert(AUTHORIZATION, auth_value);
         }
         HttpModelBridgeProtocol::AnthropicMessages => {
-            let key_value = HeaderValue::from_str(&api_key)
+            let key_value = HeaderValue::from_str(api_key)
                 .map_err(|_| ApiError::InvalidInput("apiKey 包含非法字符".to_string()))?;
             headers.insert(HeaderName::from_static("x-api-key"), key_value);
             headers.insert(
@@ -1200,7 +1200,7 @@ async fn upsert_agent(
                 .is_some_and(|value| value == engine_id)
         });
         if !engine_exists {
-            return Err(ApiError::conflict("角色绑定的引擎不存在", &engine_id));
+            return Err(ApiError::conflict("角色绑定的引擎不存在", engine_id));
         }
     }
 
@@ -2119,11 +2119,10 @@ mod tests {
         assert_eq!(bootstrap["bootstrapScope"], serde_json::json!("full"));
         assert_eq!(bootstrap["mcpServersHydrated"], serde_json::json!(true));
         assert!(
-            bootstrap["safeguardConfig"]["rules"]
+            !bootstrap["safeguardConfig"]["rules"]
                 .as_array()
                 .expect("safeguard rules should be an array")
-                .len()
-                > 0
+                .is_empty()
         );
         assert!(!object.contains_key("userRules"));
         assert!(!object.contains_key("engines"));
@@ -3081,21 +3080,18 @@ mod tests {
             12,
             5,
         );
-        state
-            .event_bus
-            .publish(
-                EventEnvelope::usage(
-                    EventId::new("usage-model-1"),
-                    "model.usage.recorded",
-                    usage_payload,
-                )
-                .with_context(EventContext {
-                    workspace_id: Some(WorkspaceId::new("workspace-stats")),
-                    session_id: Some(SessionId::new("session-stats")),
-                    ..EventContext::default()
-                }),
+        state.event_bus.publish(
+            EventEnvelope::usage(
+                EventId::new("usage-model-1"),
+                "model.usage.recorded",
+                usage_payload,
             )
-            .expect("publish model usage event");
+            .with_context(EventContext {
+                workspace_id: Some(WorkspaceId::new("workspace-stats")),
+                session_id: Some(SessionId::new("session-stats")),
+                ..EventContext::default()
+            }),
+        );
 
         let payload = session_stats(
             State(state.clone()),
@@ -3216,25 +3212,22 @@ mod tests {
                 102,
             ),
         ] {
-            state
-                .event_bus
-                .publish(
-                    EventEnvelope::usage(
-                        EventId::new(event_id),
-                        "model.usage.recorded",
-                        model_usage_payload(
-                            event_id,
-                            "workspace-stats",
-                            "session-stats",
-                            call_id,
-                            timestamp,
-                            input_tokens,
-                            output_tokens,
-                        ),
-                    )
-                    .with_context(context),
+            state.event_bus.publish(
+                EventEnvelope::usage(
+                    EventId::new(event_id),
+                    "model.usage.recorded",
+                    model_usage_payload(
+                        event_id,
+                        "workspace-stats",
+                        "session-stats",
+                        call_id,
+                        timestamp,
+                        input_tokens,
+                        output_tokens,
+                    ),
                 )
-                .expect("publish model usage event");
+                .with_context(context),
+            );
         }
 
         let before_reset = session_stats(

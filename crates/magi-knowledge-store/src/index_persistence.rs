@@ -216,7 +216,7 @@ mod tests {
     fn test_gzip_roundtrip() {
         let original = b"hello world, this is test data for gzip compression";
         let compressed = compress_gzip(original).unwrap();
-        assert!(compressed.len() > 0);
+        assert!(!compressed.is_empty());
         let decompressed = decompress_gzip(&compressed).unwrap();
         assert_eq!(decompressed, original);
     }

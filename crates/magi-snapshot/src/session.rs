@@ -536,12 +536,11 @@ impl SnapshotSession {
         let mut unified_diff: Option<String> = None;
 
         if matches!(content_kind, ContentKind::Text) {
-            if let Some(b) = base {
-                if let Some(h) = &b.blob_hash {
-                    if let Ok(bytes) = self.blobs.get(h, true) {
-                        original_content = Some(String::from_utf8_lossy(&bytes).into_owned());
-                    }
-                }
+            if let Some(b) = base
+                && let Some(h) = &b.blob_hash
+                && let Ok(bytes) = self.blobs.get(h, true)
+            {
+                original_content = Some(String::from_utf8_lossy(&bytes).into_owned());
             }
             if change_kind != ChangeKind::Deleted {
                 let abs = self.workspace_root.join(&path);
@@ -598,10 +597,10 @@ impl SnapshotSession {
         for p in &paths {
             match current.get(p) {
                 Some(meta) => {
-                    if let Some(old) = baseline.entries.get(p) {
-                        if let Some(h) = &old.blob_hash {
-                            self.blobs.release(h)?;
-                        }
+                    if let Some(old) = baseline.entries.get(p)
+                        && let Some(h) = &old.blob_hash
+                    {
+                        self.blobs.release(h)?;
                     }
                     if let Some(h) = &meta.blob_hash {
                         self.blobs.retain(h, 1);

@@ -45,11 +45,11 @@ impl ProviderAdapter for OpenAiChatCompletionsAdapter {
         if let Some(temperature) = params.temperature {
             body["temperature"] = json!(temperature);
         }
-        if let Some(ref tools) = params.tools {
-            if !tools.is_empty() {
-                body["tools"] = json!(serialize_tool_definitions(tools));
-                body["tool_choice"] = translate_tool_choice_for_openai(params.tool_choice.as_ref());
-            }
+        if let Some(ref tools) = params.tools
+            && !tools.is_empty()
+        {
+            body["tools"] = json!(serialize_tool_definitions(tools));
+            body["tool_choice"] = translate_tool_choice_for_openai(params.tool_choice.as_ref());
         }
         if let Some(stream) = params.stream {
             body["stream"] = json!(stream);
@@ -61,10 +61,10 @@ impl ProviderAdapter for OpenAiChatCompletionsAdapter {
         // reasoning_effort 顶层字段仅在能力表声明的模型上注入；未声明的模型
         // （包括未知模型）即便调用方传了 effort 也不写入——盲发可能触发 400。
         let capability = resolve_capability_profile(model);
-        if capability.supports_openai_reasoning_effort {
-            if let Some(effort) = params.reasoning_effort {
-                body["reasoning_effort"] = json!(reasoning_effort_label(effort));
-            }
+        if capability.supports_openai_reasoning_effort
+            && let Some(effort) = params.reasoning_effort
+        {
+            body["reasoning_effort"] = json!(reasoning_effort_label(effort));
         }
 
         let mut extra_headers = Vec::new();

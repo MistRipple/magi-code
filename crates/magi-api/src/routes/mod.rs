@@ -16,9 +16,10 @@ mod workspaces;
 
 use axum::{
     Json, Router,
-    extract::{Query, State},
-    http::{HeaderMap, HeaderName},
-    middleware,
+    extract::{Query, Request, State},
+    http::{HeaderMap, HeaderName, StatusCode, header::HOST},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::get,
 };
 use magi_core::{SessionId, UtcMillis, WorkspaceId};
@@ -56,12 +57,13 @@ use conversation_bridge::{
     begin_session_turn, finalize_session_turn, ingest_user_input_to_conversation,
 };
 use dispatch_flow::{
-    accept_session_task_submission, accept_session_task_submission_at,
+    SessionTaskSubmissionInput, accept_session_task_submission, accept_session_task_submission_at,
     append_dispatch_assistant_message, dispatch_accepted_canonical_event,
     finalize_session_task_dispatch, resolve_dispatch_session,
 };
 
 pub fn build_router(state: ApiState) -> Router {
+    let tunnel_manager = state.tunnel_manager.clone();
     let api_routes = Router::new()
         .merge(workspaces::routes())
         .merge(workspace_vcs::routes())
@@ -90,7 +92,71 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/events", get(stream_events))
         .route("/version", get(version))
         .nest("/api", api_routes)
+        .layer(middleware::from_fn_with_state(
+            tunnel_manager,
+            enforce_public_tunnel_auth,
+        ))
         .with_state(state)
+}
+
+async fn enforce_public_tunnel_auth(
+    State(tunnel_manager): State<crate::tunnel::TunnelManager>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if !is_public_tunnel_request(request.headers())
+        || !is_protected_remote_path(request.uri().path())
+    {
+        return next.run(request).await;
+    }
+
+    let token = query_parameter(request.uri().query(), "tunnel_token");
+    if tunnel_manager
+        .authorize_public_request(token.as_deref())
+        .await
+    {
+        return next.run(request).await;
+    }
+
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(serde_json::json!({
+            "error_code": "TUNNEL_AUTH_REQUIRED",
+            "message": "公网访问凭据无效，请重新扫描远程访问链接",
+        })),
+    )
+        .into_response()
+}
+
+fn is_public_tunnel_request(headers: &HeaderMap) -> bool {
+    headers.contains_key("cf-ray")
+        || headers
+            .get(HOST)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|host| host.split(':').next())
+            .is_some_and(|host| host.ends_with(".trycloudflare.com"))
+}
+
+fn is_protected_remote_path(path: &str) -> bool {
+    path == "/bootstrap"
+        || path == "/runtime/read-model"
+        || path == "/ledger"
+        || path == "/events"
+        || path.starts_with("/bridges/")
+        || path.starts_with("/api/")
+}
+
+fn query_parameter(query: Option<&str>, expected_key: &str) -> Option<String> {
+    query?.split('&').find_map(|part| {
+        let (key, value) = part.split_once('=')?;
+        (key == expected_key)
+            .then(|| {
+                urlencoding::decode(value)
+                    .ok()
+                    .map(|value| value.into_owned())
+            })
+            .flatten()
+    })
 }
 
 async fn health(State(state): State<ApiState>) -> Json<HealthDto> {
@@ -284,6 +350,67 @@ mod tests {
             )
         });
         (status, body)
+    }
+
+    #[tokio::test]
+    async fn public_tunnel_api_rejects_missing_or_invalid_token() {
+        let mut state = test_state();
+        state.tunnel_manager =
+            crate::tunnel::TunnelManager::new_with_token_for_test(38123, "secret-token");
+        let app = build_router(state);
+
+        for uri in [
+            "/api/tunnel/status",
+            "/api/tunnel/status?tunnel_token=wrong",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .header("host", "example.trycloudflare.com")
+                        .header("cf-ray", "test-ray")
+                        .body(Body::empty())
+                        .expect("request should build"),
+                )
+                .await
+                .expect("router should respond");
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+    }
+
+    #[tokio::test]
+    async fn public_tunnel_api_accepts_current_token_and_local_requests_need_none() {
+        let mut state = test_state();
+        state.tunnel_manager =
+            crate::tunnel::TunnelManager::new_with_token_for_test(38123, "secret-token");
+        let app = build_router(state);
+
+        let public_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/tunnel/status?tunnel_token=secret-token")
+                    .header("host", "example.trycloudflare.com")
+                    .header("cf-ray", "test-ray")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(public_response.status(), StatusCode::OK);
+
+        let local_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/tunnel/status")
+                    .header("host", "127.0.0.1:38123")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(local_response.status(), StatusCode::OK);
     }
 
     async fn post_json_body(

@@ -163,17 +163,30 @@ fn build_task_policy(task_tier: TaskTier, access_profile: AccessProfile) -> magi
     }
 }
 
-fn make_dispatch_task(
+struct DispatchTaskInput<'a> {
     task_id: TaskId,
     mission_id: MissionId,
     title: String,
     goal: String,
     now: UtcMillis,
-    target_role: &str,
-    active_skill_id: Option<&str>,
+    target_role: &'a str,
+    active_skill_id: Option<&'a str>,
     task_tier: TaskTier,
     access_profile: AccessProfile,
-) -> magi_core::Task {
+}
+
+fn make_dispatch_task(input: DispatchTaskInput<'_>) -> magi_core::Task {
+    let DispatchTaskInput {
+        task_id,
+        mission_id,
+        title,
+        goal,
+        now,
+        target_role,
+        active_skill_id,
+        task_tier,
+        access_profile,
+    } = input;
     let executor_binding = TaskExecutorBinding::for_role(target_role)
         .with_active_skill_id(active_skill_id.map(str::to_string));
 
@@ -207,7 +220,7 @@ pub fn run_dispatch_submission(
     runtime: &DispatchSubmissionRuntime<'_>,
     request: &DispatchSubmissionRequest,
 ) -> Result<DispatchSubmissionGraph, DispatchSubmissionRunError> {
-    let _ = runtime
+    runtime
         .session_store
         .ensure_current_turn_acceptance_available(&request.session_id)
         .map_err(DispatchSubmissionAcceptError::from_store_error)
@@ -256,17 +269,17 @@ pub fn run_dispatch_submission(
             "role {target_role} 不支持 local_agent 任务"
         )));
     }
-    let task = make_dispatch_task(
-        act_task_id.clone(),
-        mission_id.clone(),
-        request.task_title.clone(),
-        task_goal_text.clone(),
+    let task = make_dispatch_task(DispatchTaskInput {
+        task_id: act_task_id.clone(),
+        mission_id: mission_id.clone(),
+        title: request.task_title.clone(),
+        goal: task_goal_text.clone(),
         now,
         target_role,
-        request.skill_name.as_deref(),
-        request.task_tier,
-        request.access_profile,
-    );
+        active_skill_id: request.skill_name.as_deref(),
+        task_tier: request.task_tier,
+        access_profile: request.access_profile,
+    });
     runtime.task_store.insert_task(task);
     let event =
         task_events::task_submission_created_event(mission_id.as_str(), act_task_id.as_str(), 1)
@@ -278,7 +291,7 @@ pub fn run_dispatch_submission(
     let _ = runtime.event_bus.publish(event);
 
     let workspace_id = request.workspace_id.clone();
-    let execution_chain_ref = Some(format!("session-action-chain-{}", accepted_at.0));
+    let execution_chain_ref = format!("session-action-chain-{}", accepted_at.0);
     let worker_thread_id = session_thread::ensure_thread_for_role(
         runtime.session_store,
         session_id,
@@ -294,8 +307,7 @@ pub fn run_dispatch_submission(
         mission_id: Some(mission_id.clone()),
         task_id: Some(act_task_id.clone()),
         worker_id: Some(worker_id.clone()),
-        execution_chain_ref: execution_chain_ref.clone(),
-        ..ExecutionOwnership::default()
+        execution_chain_ref: Some(execution_chain_ref.clone()),
     };
     let execution_settings_snapshot = runtime
         .settings_store
@@ -309,7 +321,7 @@ pub fn run_dispatch_submission(
                 task_id: act_task_id.clone(),
                 requested_worker_id: Some(worker_id.clone()),
                 recovery_id: None,
-                execution_chain_ref: execution_chain_ref.clone(),
+                execution_chain_ref: Some(execution_chain_ref.clone()),
             },
             worker_id: worker_id.clone(),
             thread_id: worker_thread_id.clone(),
@@ -396,8 +408,7 @@ pub fn run_dispatch_submission(
             session_id: request.session_id.clone(),
             mission_id,
             root_task_id: act_task_id,
-            execution_chain_ref: execution_chain_ref
-                .expect("dispatch execution chain ref should exist"),
+            execution_chain_ref,
             workspace_id,
             active_branch_task_ids: branches
                 .iter()

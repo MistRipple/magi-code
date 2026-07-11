@@ -150,7 +150,7 @@ fn knowledge_item_json(record: &KnowledgeRecord) -> serde_json::Value {
         "content": record.content,
         "context": record.source_ref,
         "tags": record.tags,
-        "createdAt": record.updated_at.0,
+        "createdAt": record.created_at.0,
         "updatedAt": record.updated_at.0,
     })
 }
@@ -543,6 +543,7 @@ async fn add_knowledge_item(
             return Err(ApiError::InvalidInput("kind 不支持 codeIndex".to_string()));
         }
     };
+    let now = UtcMillis::now();
     let record = KnowledgeRecord {
         knowledge_id: new_knowledge_id(id_prefix),
         kind,
@@ -551,7 +552,8 @@ async fn add_knowledge_item(
         tags: normalize_tags(request.tags),
         workspace_id: Some(workspace_id.clone()),
         source_ref,
-        updated_at: UtcMillis::now(),
+        created_at: now,
+        updated_at: now,
     };
     state.knowledge_store.upsert(record);
     state.persist_knowledge_state_for_api()?;
@@ -621,6 +623,7 @@ async fn update_knowledge_item(
         tags: request.tags.map(normalize_tags).unwrap_or(existing.tags),
         workspace_id: Some(workspace_id.clone()),
         source_ref: next_source_ref,
+        created_at: existing.created_at,
         updated_at: UtcMillis::now(),
     };
     state.knowledge_store.upsert(updated);
@@ -710,6 +713,7 @@ mod tests {
             tags: vec!["rust".to_string()],
             workspace_id: Some(workspace_id.clone()),
             source_ref: Some(path.to_string()),
+            created_at: UtcMillis::now(),
             updated_at: UtcMillis::now(),
         });
     }
@@ -919,6 +923,7 @@ mod tests {
             tags: vec![],
             workspace_id: None,
             source_ref: None,
+            created_at: UtcMillis::now(),
             updated_at: UtcMillis::now(),
         });
         let state = state_with_knowledge_store(knowledge_store);

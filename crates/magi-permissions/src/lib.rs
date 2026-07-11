@@ -214,12 +214,12 @@ impl PermissionEngine {
                 reason: format!("策略未授权访问路径：{}", absolute_path.display()),
             };
         }
-        if kind == PathAccessKind::Write {
-            if access_profile == AccessProfile::ReadOnly || policy.is_read_only_command_mode() {
-                return Decision::Deny {
-                    reason: format!("只读任务不允许写入路径：{}", absolute_path.display()),
-                };
-            }
+        if kind == PathAccessKind::Write
+            && (access_profile == AccessProfile::ReadOnly || policy.is_read_only_command_mode())
+        {
+            return Decision::Deny {
+                reason: format!("只读任务不允许写入路径：{}", absolute_path.display()),
+            };
         }
         Decision::Allow
     }
@@ -639,9 +639,10 @@ mod tests {
     }
 
     fn policy_read_only() -> PermissionPolicy {
-        let mut p = PermissionPolicy::default();
-        p.command_mode = "read_only".to_string();
-        p
+        PermissionPolicy {
+            command_mode: "read_only".to_string(),
+            ..PermissionPolicy::default()
+        }
     }
 
     #[test]

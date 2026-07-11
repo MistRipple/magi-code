@@ -8,6 +8,9 @@ use std::collections::BTreeMap;
 mod contract;
 #[path = "read_model_aggregates.rs"]
 mod read_model_aggregates;
+use read_model_aggregates::{
+    GovernanceAttentionIds, GovernanceDiagnosticCounts, RuntimeAggregateComponents,
+};
 
 pub use contract::{
     RUNTIME_READ_MODEL_CONTRACT_SECTIONS, RUNTIME_READ_MODEL_CONTRACT_VERSION,
@@ -1225,10 +1228,10 @@ impl RuntimeReadModelInput {
                         _ => {}
                     }
                 }
-                if event.event_type == "mission.execution.overview" {
-                    if let Some(progress) = mission_progress_from_payload(&event.payload) {
-                        mission_progress_map.insert(mission_id.clone(), progress);
-                    }
+                if event.event_type == "mission.execution.overview"
+                    && let Some(progress) = mission_progress_from_payload(&event.payload)
+                {
+                    mission_progress_map.insert(mission_id.clone(), progress);
                 }
                 if event.event_type == "mission.execution.overview"
                     && let Some(context) = event.payload.get("context")
@@ -1744,32 +1747,34 @@ impl RuntimeReadModelInput {
         let tools = tool_map.into_values().collect::<Vec<_>>();
         let sessions = session_map.into_values().collect::<Vec<_>>();
         let workspaces = workspace_map.into_values().collect::<Vec<_>>();
+        let aggregate_components = RuntimeAggregateComponents {
+            execution_groups: &execution_groups,
+            tasks: &tasks,
+            assignments: &assignments,
+            workers: &workers,
+            tools: &tools,
+            recovery: &recovery,
+        };
         let diagnostics = RuntimeDiagnosticSummary::from_components(
-            &execution_groups,
-            &tasks,
-            &assignments,
-            &workers,
-            &tools,
-            &recovery,
-            governance_total_count,
-            governance_allowed_count,
-            governance_needs_approval_count,
-            governance_blocked_count,
-            governance_rejected_count,
+            &aggregate_components,
+            GovernanceDiagnosticCounts {
+                total: governance_total_count,
+                allowed: governance_allowed_count,
+                needs_approval: governance_needs_approval_count,
+                blocked: governance_blocked_count,
+                rejected: governance_rejected_count,
+            },
         );
         let attention = RuntimeAttentionSummary::from_components(
-            &execution_groups,
-            &tasks,
-            &assignments,
-            &workers,
-            &tools,
-            &recovery,
-            &governance_blocked_task_ids,
-            &governance_approval_required_task_ids,
-            &governance_rejected_task_ids,
-            &governance_blocked_worker_ids,
-            &governance_approval_required_worker_ids,
-            &governance_rejected_worker_ids,
+            &aggregate_components,
+            GovernanceAttentionIds {
+                blocked_task_ids: &governance_blocked_task_ids,
+                approval_required_task_ids: &governance_approval_required_task_ids,
+                rejected_task_ids: &governance_rejected_task_ids,
+                blocked_worker_ids: &governance_blocked_worker_ids,
+                approval_required_worker_ids: &governance_approval_required_worker_ids,
+                rejected_worker_ids: &governance_rejected_worker_ids,
+            },
         );
         let work_queues = RuntimeWorkQueueSummary::from_components(
             &execution_groups,
@@ -1978,14 +1983,13 @@ impl RuntimeReadModelInput {
 }
 
 fn infer_task_status(event: &EventEnvelope) -> Option<String> {
-    if event.event_type == "task.status.changed" {
-        if let Some(status) = event
+    if event.event_type == "task.status.changed"
+        && let Some(status) = event
             .payload
             .get("new_status")
             .and_then(|value| value.as_str())
-        {
-            return Some(status.to_ascii_lowercase());
-        }
+    {
+        return Some(status.to_ascii_lowercase());
     }
     if let Some(status) = event.payload.get("status").and_then(|value| value.as_str()) {
         return Some(status.to_ascii_lowercase());

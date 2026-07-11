@@ -74,23 +74,23 @@ fn capture_model_preflight_checks(
         }),
     )];
 
-    if let Ok(catalog) = probe.describe_services() {
-        if catalog.services.iter().any(|service| {
+    if let Ok(catalog) = probe.describe_services()
+        && catalog.services.iter().any(|service| {
             service.service_name == "openai-compatible"
                 && service.service_health.as_deref() == Some("ready")
-        }) {
-            checks.push(bridge_response_check(
-                "invoke",
-                "openai-compatible",
-                client.invoke(ModelInvocationRequest {
-                    provider: "openai-compatible".to_string(),
-                    prompt: "bridge preflight ping".to_string(),
-                    messages: None,
-                    tools: None,
-                    tool_choice: None,
-                }),
-            ));
-        }
+        })
+    {
+        checks.push(bridge_response_check(
+            "invoke",
+            "openai-compatible",
+            client.invoke(ModelInvocationRequest {
+                provider: "openai-compatible".to_string(),
+                prompt: "bridge preflight ping".to_string(),
+                messages: None,
+                tools: None,
+                tool_choice: None,
+            }),
+        ));
     }
 
     checks

@@ -164,7 +164,7 @@ pub enum WorkerExecutionIntentStep {
     SkillDispatch {
         tool_call_id: ToolCallId,
         tool_name: String,
-        plan: SkillToolRuntimePlan,
+        plan: Box<SkillToolRuntimePlan>,
         payload: String,
         approval_requirement: ApprovalRequirement,
         risk_level: RiskLevel,
@@ -404,6 +404,14 @@ pub struct WorkerRuntimeBranchSnapshot {
     pub checkpoint_cursor: Option<WorkerExecutionCheckpointCursor>,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct WorkerBranchCheckpointState {
+    pub lease_id: Option<String>,
+    pub execution_intent_ref: Option<String>,
+    pub binding_lifecycle: Option<WorkerExecutionBindingLifecycle>,
+    pub checkpoint_cursor: Option<WorkerExecutionCheckpointCursor>,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkerRuntimeDurableSnapshot {
     pub branches: Vec<WorkerRuntimeBranchSnapshot>,
@@ -488,7 +496,7 @@ impl WorkerRuntime {
             branch_snapshot_observer: Arc::new(RwLock::new(None)),
             durable_snapshot_version: Arc::new(AtomicU64::new(0)),
             flushed_durable_snapshot_version: Arc::new(AtomicU64::new(0)),
-            executor: Arc::new(DeterministicWorkerExecutor::default()),
+            executor: Arc::new(DeterministicWorkerExecutor),
         }
     }
 
@@ -509,11 +517,14 @@ impl WorkerRuntime {
         task_id: &TaskId,
         worker_id: &WorkerId,
         stage: WorkerStage,
-        lease_id: Option<String>,
-        execution_intent_ref: Option<String>,
-        binding_lifecycle: Option<WorkerExecutionBindingLifecycle>,
-        checkpoint_cursor: Option<WorkerExecutionCheckpointCursor>,
+        state: WorkerBranchCheckpointState,
     ) -> WorkerRuntimeBranchSnapshot {
+        let WorkerBranchCheckpointState {
+            lease_id,
+            execution_intent_ref,
+            binding_lifecycle,
+            checkpoint_cursor,
+        } = state;
         self.upsert_branch_snapshot(task_id, |existing| WorkerRuntimeBranchSnapshot {
             task_id: task_id.clone(),
             worker_id: worker_id.clone(),
@@ -761,13 +772,15 @@ impl WorkerRuntime {
             self.branch_snapshot_for_task(&task_id)
                 .map(|snapshot| snapshot.stage)
                 .unwrap_or(WorkerStage::Execute),
-            None,
-            Some(format!("worker-intent-{task_id}")),
-            binding_lifecycle,
-            Some(Self::default_checkpoint_cursor(
-                WorkerStage::Execute,
-                checkpoint_at,
-            )),
+            WorkerBranchCheckpointState {
+                lease_id: None,
+                execution_intent_ref: Some(format!("worker-intent-{task_id}")),
+                binding_lifecycle,
+                checkpoint_cursor: Some(Self::default_checkpoint_cursor(
+                    WorkerStage::Execute,
+                    checkpoint_at,
+                )),
+            },
         );
     }
 
@@ -841,10 +854,10 @@ impl WorkerRuntime {
                 &task_id,
                 &worker_id,
                 stage,
-                None,
-                None,
-                None,
-                checkpoint_cursor,
+                WorkerBranchCheckpointState {
+                    checkpoint_cursor,
+                    ..WorkerBranchCheckpointState::default()
+                },
             );
         }
         self.publish(
@@ -1526,7 +1539,9 @@ mod tests {
                 WorkerExecutionIntentStep::SkillDispatch {
                     tool_call_id: ToolCallId::new("call-intent-2".to_string()),
                     tool_name: "process_inspect".to_string(),
-                    plan: DeterministicWorkerExecutor::default_skill_plan("process_inspect"),
+                    plan: Box::new(DeterministicWorkerExecutor::default_skill_plan(
+                        "process_inspect",
+                    )),
                     payload: "{\"mode\":\"intent-skill\"}".to_string(),
                     approval_requirement: ApprovalRequirement::None,
                     risk_level: RiskLevel::Low,
@@ -1595,7 +1610,9 @@ mod tests {
                 WorkerExecutionIntentStep::SkillDispatch {
                     tool_call_id: ToolCallId::new("call-checkpoint-2".to_string()),
                     tool_name: "process_inspect".to_string(),
-                    plan: DeterministicWorkerExecutor::default_skill_plan("process_inspect"),
+                    plan: Box::new(DeterministicWorkerExecutor::default_skill_plan(
+                        "process_inspect",
+                    )),
                     payload: "{\"mode\":\"intent-skill\"}".to_string(),
                     approval_requirement: ApprovalRequirement::None,
                     risk_level: RiskLevel::Low,
@@ -1617,16 +1634,18 @@ mod tests {
             &task_id,
             &worker_id,
             WorkerStage::Execute,
-            None,
-            Some(format!("worker-intent-{task_id}")),
-            Some(WorkerExecutionBindingLifecycle::Requested),
-            Some(WorkerExecutionCheckpointCursor {
-                checkpoint_stage: WorkerStage::Execute,
-                next_step_index: 2,
-                checkpoint_at: UtcMillis::now(),
-                resume_mode: WorkerCheckpointResumeMode::StepCheckpoint,
-                resume_token: None,
-            }),
+            WorkerBranchCheckpointState {
+                lease_id: None,
+                execution_intent_ref: Some(format!("worker-intent-{task_id}")),
+                binding_lifecycle: Some(WorkerExecutionBindingLifecycle::Requested),
+                checkpoint_cursor: Some(WorkerExecutionCheckpointCursor {
+                    checkpoint_stage: WorkerStage::Execute,
+                    next_step_index: 2,
+                    checkpoint_at: UtcMillis::now(),
+                    resume_mode: WorkerCheckpointResumeMode::StepCheckpoint,
+                    resume_token: None,
+                }),
+            },
         );
 
         loop_controller.enqueue_action(WorkerLoopAction::Execute {

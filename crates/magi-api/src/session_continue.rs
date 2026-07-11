@@ -143,15 +143,15 @@ pub(crate) fn continue_execution_chain(
     let resumable_branches = chain
         .branches
         .iter()
-        .filter_map(|branch| {
+        .filter(|&branch| {
             active_execution_branch_is_continue_recoverable(
                 worker_runtime_handle,
                 state.task_store(),
                 &chain,
                 branch,
             )
-            .then(|| branch.clone())
         })
+        .cloned()
         .collect::<Vec<_>>();
     if resumable_branches.is_empty() {
         return Err(ApiError::InvalidInput(

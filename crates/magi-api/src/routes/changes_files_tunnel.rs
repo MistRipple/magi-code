@@ -948,14 +948,13 @@ fn addr_in_172_private_range(addr: &str) -> bool {
 
 fn fallback_udp_ip() -> String {
     use std::net::UdpSocket;
-    if let Ok(socket) = UdpSocket::bind("0.0.0.0:0") {
-        if socket.connect("8.8.8.8:80").is_ok() {
-            if let Ok(addr) = socket.local_addr() {
-                let ip = addr.ip().to_string();
-                if ip != "0.0.0.0" && ip != "127.0.0.1" {
-                    return ip;
-                }
-            }
+    if let Ok(socket) = UdpSocket::bind("0.0.0.0:0")
+        && socket.connect("8.8.8.8:80").is_ok()
+        && let Ok(addr) = socket.local_addr()
+    {
+        let ip = addr.ip().to_string();
+        if ip != "0.0.0.0" && ip != "127.0.0.1" {
+            return ip;
         }
     }
     "127.0.0.1".to_string()

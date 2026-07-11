@@ -85,13 +85,18 @@ pub(crate) struct ToolPreflightDecision {
     pub(crate) status: ExecutionResultStatus,
 }
 
+#[derive(Clone, Copy)]
+struct TaskToolLifecycleContext<'a> {
+    event_bus: &'a InMemoryEventBus,
+    task: &'a magi_core::Task,
+    session_id: &'a SessionId,
+    workspace_id: &'a Option<WorkspaceId>,
+    worker_id: Option<&'a magi_core::WorkerId>,
+    execution_group_id: Option<&'a str>,
+}
+
 fn execute_task_tool_call_with_lifecycle<F>(
-    event_bus: &InMemoryEventBus,
-    task: &magi_core::Task,
-    session_id: &SessionId,
-    workspace_id: &Option<WorkspaceId>,
-    worker_id: Option<&magi_core::WorkerId>,
-    execution_group_id: Option<&str>,
+    context: TaskToolLifecycleContext<'_>,
     tool_call: &ChatToolCall,
     execute: F,
 ) -> (String, ExecutionResultStatus)
@@ -100,13 +105,8 @@ where
 {
     let started_at = UtcMillis::now();
     publish_tool_lifecycle_event(
-        event_bus,
+        context,
         "tool.call.started",
-        task,
-        session_id,
-        workspace_id,
-        worker_id,
-        execution_group_id,
         tool_call,
         serde_json::json!({
             "phase": "started",
@@ -119,8 +119,8 @@ where
             tracing::warn!(
                 tool_name = %tool_call.function.name,
                 tool_call_id = %tool_call.id,
-                task_id = %task.task_id.as_str(),
-                session_id = %session_id.as_str(),
+                task_id = %context.task.task_id.as_str(),
+                session_id = %context.session_id.as_str(),
                 "task tool execution panicked"
             );
             tool_execution_failed_result(&tool_call.function.name)
@@ -128,13 +128,8 @@ where
 
     let finished_at = UtcMillis::now();
     publish_tool_lifecycle_event(
-        event_bus,
+        context,
         "tool.call.finished",
-        task,
-        session_id,
-        workspace_id,
-        worker_id,
-        execution_group_id,
         tool_call,
         serde_json::json!({
             "phase": "finished",
@@ -148,24 +143,19 @@ where
 }
 
 fn publish_tool_lifecycle_event(
-    event_bus: &InMemoryEventBus,
+    context: TaskToolLifecycleContext<'_>,
     event_type: &str,
-    task: &magi_core::Task,
-    session_id: &SessionId,
-    workspace_id: &Option<WorkspaceId>,
-    worker_id: Option<&magi_core::WorkerId>,
-    execution_group_id: Option<&str>,
     tool_call: &ChatToolCall,
     payload: serde_json::Value,
 ) {
     let payload = serde_json::json!({
         "tool_call_id": tool_call.id.as_str(),
         "tool_name": tool_call.function.name.as_str(),
-        "task_id": task.task_id.as_str(),
-        "session_id": session_id.as_str(),
-        "workspace_id": workspace_id.as_ref().map(ToString::to_string),
-        "worker_id": worker_id.map(ToString::to_string),
-        "execution_group_id": execution_group_id,
+        "task_id": context.task.task_id.as_str(),
+        "session_id": context.session_id.as_str(),
+        "workspace_id": context.workspace_id.as_ref().map(ToString::to_string),
+        "worker_id": context.worker_id.map(ToString::to_string),
+        "execution_group_id": context.execution_group_id,
         "lifecycle": payload,
     });
     let event = EventEnvelope::domain(
@@ -179,13 +169,13 @@ fn publish_tool_lifecycle_event(
         payload,
     )
     .with_context(EventContext {
-        workspace_id: workspace_id.clone(),
-        session_id: Some(session_id.clone()),
-        mission_id: Some(task.mission_id.clone()),
-        task_id: Some(task.task_id.clone()),
+        workspace_id: context.workspace_id.clone(),
+        session_id: Some(context.session_id.clone()),
+        mission_id: Some(context.task.mission_id.clone()),
+        task_id: Some(context.task.task_id.clone()),
         ..EventContext::default()
     });
-    let _ = event_bus.publish(event);
+    let _ = context.event_bus.publish(event);
 }
 
 fn tool_arguments_preview(value: &str) -> String {
@@ -289,12 +279,14 @@ pub fn execute_task_tool_call_batch(
                     }
                     let tool_call = &tool_calls[tool_index];
                     let result = execute_task_tool_call_with_lifecycle(
-                        event_bus,
-                        task,
-                        session_id,
-                        workspace_id,
-                        worker_id,
-                        execution_group_id.as_deref(),
+                        TaskToolLifecycleContext {
+                            event_bus,
+                            task,
+                            session_id,
+                            workspace_id,
+                            worker_id,
+                            execution_group_id: execution_group_id.as_deref(),
+                        },
                         tool_call,
                         || {
                             execute_task_tool_call(
@@ -346,12 +338,15 @@ pub fn execute_task_tool_call_batch(
                                         snapshot.before_tool(&hook_ctx);
                                     }
                                     let result = execute_task_tool_call_with_lifecycle(
-                                        event_bus,
-                                        task,
-                                        session_id,
-                                        workspace_id,
-                                        worker_id,
-                                        execution_group_id_for_lifecycle.as_deref(),
+                                        TaskToolLifecycleContext {
+                                            event_bus,
+                                            task,
+                                            session_id,
+                                            workspace_id,
+                                            worker_id,
+                                            execution_group_id: execution_group_id_for_lifecycle
+                                                .as_deref(),
+                                        },
                                         tool_call,
                                         || {
                                             execute_task_tool_call(
@@ -432,20 +427,37 @@ pub fn execute_task_tool_call_batch(
 
 /// S7-E：协调器工具（agent_spawn）的统一拦截入口。返回 (payload_json, status)，与
 /// `execute_task_tool_call` 的常规工具路径形状一致，便于上层把回执拼回 LLM 消息流。
+#[derive(Clone, Copy)]
+struct CoordinatorToolContext<'a> {
+    event_bus: &'a InMemoryEventBus,
+    agent_role_registry: &'a magi_agent_role::AgentRoleRegistry,
+    task_store: &'a TaskStore,
+    session_store: &'a SessionStore,
+    execution_registry: &'a TaskExecutionRegistry,
+    conversation_registry: &'a ConversationRegistry,
+    spawn_graph: &'a Mutex<magi_spawn_graph::SpawnGraph>,
+    task: &'a magi_core::Task,
+    session_id: &'a SessionId,
+    workspace_id: &'a Option<WorkspaceId>,
+}
+
 fn execute_coordinator_tool(
-    event_bus: &InMemoryEventBus,
-    agent_role_registry: &magi_agent_role::AgentRoleRegistry,
-    task_store: &TaskStore,
-    session_store: &SessionStore,
-    execution_registry: &TaskExecutionRegistry,
-    conversation_registry: &ConversationRegistry,
-    spawn_graph: &Mutex<magi_spawn_graph::SpawnGraph>,
-    task: &magi_core::Task,
-    session_id: &SessionId,
-    workspace_id: &Option<WorkspaceId>,
+    context: CoordinatorToolContext<'_>,
     tool: magi_tool_runtime::BuiltinToolName,
     tool_call: &ChatToolCall,
 ) -> (String, ExecutionResultStatus) {
+    let CoordinatorToolContext {
+        event_bus,
+        agent_role_registry,
+        task_store,
+        session_store,
+        execution_registry,
+        conversation_registry,
+        spawn_graph,
+        task,
+        session_id,
+        workspace_id,
+    } = context;
     let parsed: serde_json::Value = match serde_json::from_str(&tool_call.function.arguments) {
         Ok(value) => value,
         Err(err) => {
@@ -1669,12 +1681,11 @@ fn execute_task_tool_call(
     // S9：TodoWrite 同样在此层拦截，因为它要操作 session 维度的 TodoLedger。
     // S10：MemoryWrite 同样在此层拦截，因为它要操作 workspace 维度的 ProjectMemoryStore。
     if let Some(canonical) =
-        magi_tool_runtime::BuiltinToolName::from_str(tool_call.function.name.as_str())
+        magi_tool_runtime::BuiltinToolName::from_name(tool_call.function.name.as_str())
+        && !task_can_see_builtin_tool(Some(task), Some(agent_role_registry), canonical)
     {
-        if !task_can_see_builtin_tool(Some(task), Some(agent_role_registry), canonical) {
-            let decision = task_tool_visibility_decision_payload(canonical.as_str(), task);
-            return (decision.payload, decision.status);
-        }
+        let decision = task_tool_visibility_decision_payload(canonical.as_str(), task);
+        return (decision.payload, decision.status);
     }
 
     if let Some(decision) = task_tool_preflight_decision(
@@ -1688,7 +1699,7 @@ fn execute_task_tool_call(
     }
 
     if let Some(canonical) =
-        magi_tool_runtime::BuiltinToolName::from_str(tool_call.function.name.as_str())
+        magi_tool_runtime::BuiltinToolName::from_name(tool_call.function.name.as_str())
     {
         if matches!(
             canonical,
@@ -1714,16 +1725,18 @@ fn execute_task_tool_call(
                 | magi_tool_runtime::BuiltinToolName::AgentWait
         ) {
             return execute_coordinator_tool(
-                event_bus,
-                agent_role_registry,
-                task_store,
-                session_store,
-                execution_registry,
-                conversation_registry,
-                spawn_graph,
-                task,
-                session_id,
-                workspace_id,
+                CoordinatorToolContext {
+                    event_bus,
+                    agent_role_registry,
+                    task_store,
+                    session_store,
+                    execution_registry,
+                    conversation_registry,
+                    spawn_graph,
+                    task,
+                    session_id,
+                    workspace_id,
+                },
                 canonical,
                 tool_call,
             );
@@ -1943,30 +1956,45 @@ fn task_policy_tool_decision_with_workspace_root(
         ));
     }
 
-    access_profile_tool_decision(
-        policy_snapshot.access_profile,
-        &policy_snapshot.command_mode,
-        &policy_snapshot.allowed_tools,
-        &policy_snapshot.denied_tools,
-        &policy_snapshot.allowed_paths,
-        &policy_snapshot.denied_paths,
+    access_profile_tool_decision(AccessProfileToolDecisionInput {
+        access_profile: policy_snapshot.access_profile,
+        command_mode: &policy_snapshot.command_mode,
+        allowed_tools: &policy_snapshot.allowed_tools,
+        denied_tools: &policy_snapshot.denied_tools,
+        allowed_paths: &policy_snapshot.allowed_paths,
+        denied_paths: &policy_snapshot.denied_paths,
         requested_tool_name,
         arguments,
         workspace_root_path,
-    )
+    })
+}
+
+pub(crate) struct AccessProfileToolDecisionInput<'a> {
+    pub access_profile: magi_core::AccessProfile,
+    pub command_mode: &'a str,
+    pub allowed_tools: &'a [String],
+    pub denied_tools: &'a [String],
+    pub allowed_paths: &'a [String],
+    pub denied_paths: &'a [String],
+    pub requested_tool_name: &'a str,
+    pub arguments: &'a str,
+    pub workspace_root_path: Option<&'a PathBuf>,
 }
 
 pub(crate) fn access_profile_tool_decision(
-    access_profile: magi_core::AccessProfile,
-    command_mode: &str,
-    allowed_tools: &[String],
-    denied_tools: &[String],
-    allowed_paths: &[String],
-    denied_paths: &[String],
-    requested_tool_name: &str,
-    arguments: &str,
-    workspace_root_path: Option<&PathBuf>,
+    input: AccessProfileToolDecisionInput<'_>,
 ) -> Option<ToolPreflightDecision> {
+    let AccessProfileToolDecisionInput {
+        access_profile,
+        command_mode,
+        allowed_tools,
+        denied_tools,
+        allowed_paths,
+        denied_paths,
+        requested_tool_name,
+        arguments,
+        workspace_root_path,
+    } = input;
     let canonical_tool_name = canonical_builtin_tool_name(requested_tool_name)
         .unwrap_or_else(|| requested_tool_name.trim().to_string());
     // PermissionEngine 比对工具名是按字面比对，因此把 policy 中的别名先 canonical 化。
@@ -1993,10 +2021,9 @@ pub(crate) fn access_profile_tool_decision(
             workspace_root_path.map(|path| path.as_path()),
         ),
         command_mode: command_mode.to_string(),
-        ..magi_permissions::PermissionPolicy::default()
     };
     let engine = builtin_permission_engine();
-    let is_write_tool = BuiltinToolName::from_str(canonical_tool_name.as_str())
+    let is_write_tool = BuiltinToolName::from_name(canonical_tool_name.as_str())
         .is_some_and(|tool| tool.is_write_operation());
     let mut pending_decision = None;
 
@@ -3052,17 +3079,17 @@ mod tests {
         std::os::unix::fs::symlink(&real_root, &link_root)
             .expect("workspace symlink should be creatable");
 
-        let decision = access_profile_tool_decision(
-            magi_core::AccessProfile::Restricted,
-            "",
-            &[],
-            &[],
-            &[],
-            &[],
-            BuiltinToolName::ShellExec.as_str(),
-            r#"{"command":"printf restricted > out.txt"}"#,
-            Some(&link_root),
-        )
+        let decision = access_profile_tool_decision(AccessProfileToolDecisionInput {
+            access_profile: magi_core::AccessProfile::Restricted,
+            command_mode: "",
+            allowed_tools: &[],
+            denied_tools: &[],
+            allowed_paths: &[],
+            denied_paths: &[],
+            requested_tool_name: BuiltinToolName::ShellExec.as_str(),
+            arguments: r#"{"command":"printf restricted > out.txt"}"#,
+            workspace_root_path: Some(&link_root),
+        })
         .expect("restricted write shell inside symlinked workspace should require approval");
 
         assert_eq!(decision.status, ExecutionResultStatus::NeedsApproval);

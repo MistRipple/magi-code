@@ -330,6 +330,10 @@ export async function fetchAgentRunProjection(
     return;
   }
   const state = ensureSessionState(normalizedSessionId, normalizedWorkspaceId, normalizedWorkspacePath);
+  if (state.loading) {
+    state.refreshAfterLoad = true;
+    return;
+  }
   const fetchGeneration = state.fetchGeneration + 1;
   state.fetchGeneration = fetchGeneration;
   const rootChanged = state.rootTaskId !== rootTaskId;
@@ -341,6 +345,8 @@ export async function fetchAgentRunProjection(
   state.error = null;
   let terminalProjectionLoadError = false;
 
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort('agent_run_request_timeout'), 10_000);
   try {
     const client = createClient();
     const projection = await client.getAgentRunProjection(
@@ -348,6 +354,7 @@ export async function fetchAgentRunProjection(
       normalizedSessionId,
       normalizedWorkspaceId,
       normalizedWorkspacePath,
+      controller.signal,
     );
     const latestState = ensureSessionState(normalizedSessionId, normalizedWorkspaceId, normalizedWorkspacePath);
     if (
@@ -390,6 +397,7 @@ export async function fetchAgentRunProjection(
     }
     latestState.error = 'load_failed';
   } finally {
+    clearTimeout(timeout);
     if (terminalProjectionLoadError) {
       return;
     }

@@ -27,6 +27,12 @@ pub struct ConsumeResult {
     pub outcome: Option<ExecutionOutcomeBlock>,
 }
 
+impl Default for ExecutionOutcomeExtractor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ExecutionOutcomeExtractor {
     pub fn new() -> Self {
         Self {
@@ -176,7 +182,7 @@ fn build_partial_markers() -> Vec<String> {
             fragments.push(marker[..len].to_string());
         }
     }
-    fragments.sort_by(|a, b| b.len().cmp(&a.len()));
+    fragments.sort_by_key(|fragment| std::cmp::Reverse(fragment.len()));
     fragments.dedup();
     fragments
 }

@@ -357,10 +357,10 @@ fn summarize_thread_message(index: usize, message: &ThreadChatMessage) -> String
             .join("；");
         parts.push(format!("工具调用：{calls}"));
     }
-    if message.role == "tool" {
-        if let Some(tool_call_id) = message.tool_call_id.as_deref() {
-            parts.push(format!("对应调用：{tool_call_id}"));
-        }
+    if message.role == "tool"
+        && let Some(tool_call_id) = message.tool_call_id.as_deref()
+    {
+        parts.push(format!("对应调用：{tool_call_id}"));
     }
     if parts.is_empty() {
         parts.push("空消息".to_string());
@@ -960,20 +960,23 @@ fn run_conversation_loop_inner(
         thread_id,
         agent_role_registry,
     );
+    let turn_writeback_context = TaskTurnWritebackContext {
+        event_bus,
+        session_store,
+        task_store,
+        task,
+        session_id,
+        workspace_id,
+        turn_visibility: &turn_visibility,
+        persist_session_state,
+    };
 
     if let Some(final_content) = deterministic_task_final_content(task, task_store) {
         append_task_final_turn_item(
-            event_bus,
-            session_store,
-            task_store,
-            task,
-            session_id,
-            workspace_id,
+            turn_writeback_context,
             &final_content,
             None,
             streaming_entry_id,
-            &turn_visibility,
-            persist_session_state,
         );
         return (
             TaskOutcome::Completed {
@@ -1034,32 +1037,20 @@ fn run_conversation_loop_inner(
         let response = if streaming_entry_id.is_some() {
             let on_delta = |delta: &ModelStreamingDelta| {
                 publish_task_thinking_delta(
-                    event_bus,
-                    session_store,
-                    task_store,
-                    task,
-                    session_id,
-                    workspace_id,
+                    turn_writeback_context,
                     &thinking_item_id,
                     &last_thinking_len,
                     &streamed_thinking,
                     &thinking_publish_gate,
-                    &turn_visibility,
                     &delta.thinking,
                 );
                 publish_task_content_delta(
-                    event_bus,
-                    session_store,
-                    task_store,
-                    task,
-                    session_id,
-                    workspace_id,
+                    turn_writeback_context,
                     &stream_item_id,
                     &last_content_len,
                     &streamed_content,
                     &streamed_visible_content,
                     &stream_publish_gate,
-                    &turn_visibility,
                     &delta.content,
                 );
             };
@@ -1072,16 +1063,9 @@ fn run_conversation_loop_inner(
                     tracing::error!(task_id = %task.task_id, round = round, ?error, "LLM streaming invocation failed");
                     if task_lease_is_current(task_store, task_id, lease_id) {
                         append_task_error_turn_item(
-                            event_bus,
-                            session_store,
-                            task_store,
-                            task,
-                            session_id,
-                            workspace_id,
-                            &turn_visibility,
+                            turn_writeback_context,
                             &error_message,
                             streaming_entry_id.or(last_stream_item_id.as_deref()),
-                            persist_session_state,
                         );
                     }
                     return (
@@ -1101,16 +1085,9 @@ fn run_conversation_loop_inner(
                     tracing::error!(task_id = %task.task_id, round = round, ?error, "LLM invocation failed");
                     if task_lease_is_current(task_store, task_id, lease_id) {
                         append_task_error_turn_item(
-                            event_bus,
-                            session_store,
-                            task_store,
-                            task,
-                            session_id,
-                            workspace_id,
-                            &turn_visibility,
+                            turn_writeback_context,
                             &error_message,
                             streaming_entry_id.or(last_stream_item_id.as_deref()),
-                            persist_session_state,
                         );
                     }
                     return (
@@ -1138,14 +1115,8 @@ fn run_conversation_loop_inner(
             });
         if let Some(thinking) = final_thinking {
             upsert_task_thinking_turn_item(
-                event_bus,
-                session_store,
-                task_store,
-                task,
-                session_id,
-                workspace_id,
+                turn_writeback_context,
                 &thinking_item_id,
-                &turn_visibility,
                 "completed",
                 &thinking,
                 None,
@@ -1166,14 +1137,8 @@ fn run_conversation_loop_inner(
         };
         if let Some(completed_stream_content) = completed_stream_content.as_ref() {
             upsert_task_stream_turn_item(
-                event_bus,
-                session_store,
-                task_store,
-                task,
-                session_id,
-                workspace_id,
+                turn_writeback_context,
                 &stream_item_id,
-                &turn_visibility,
                 "completed",
                 completed_stream_content,
                 None,
@@ -1184,14 +1149,16 @@ fn run_conversation_loop_inner(
             event_bus,
             session_store,
             settings_store,
-            session_id,
-            workspace_id,
-            usage_binding,
-            format!("task-{}-{}-{round}", task_id, lease_id),
-            parsed.usage.as_ref(),
-            UsageCallStatus::Success,
-            Some(lease_id.to_string()),
-            None,
+            crate::usage_recording::ModelUsageRecordInput {
+                session_id,
+                workspace_id,
+                binding: usage_binding,
+                call_id: format!("task-{}-{}-{round}", task_id, lease_id),
+                usage: parsed.usage.as_ref(),
+                status: UsageCallStatus::Success,
+                assignment_id: Some(lease_id.to_string()),
+                error_code: None,
+            },
         );
         account_active_goal_turn(
             session_store,
@@ -1330,16 +1297,7 @@ fn run_conversation_loop_inner(
         });
 
         for tool_call in &parsed.tool_calls {
-            append_task_tool_call_started_turn_item(
-                event_bus,
-                session_store,
-                task_store,
-                task,
-                session_id,
-                workspace_id,
-                &turn_visibility,
-                tool_call,
-            );
+            append_task_tool_call_started_turn_item(turn_writeback_context, tool_call);
         }
 
         let tool_results = execute_task_tool_call_batch(
@@ -1372,17 +1330,10 @@ fn run_conversation_loop_inner(
         let mut activated_skill_this_round = None;
         for (tool_call, (result, tool_status)) in parsed.tool_calls.iter().zip(tool_results) {
             upsert_task_tool_call_result_turn_item(
-                event_bus,
-                session_store,
-                task_store,
-                task,
-                session_id,
-                workspace_id,
-                &turn_visibility,
+                turn_writeback_context,
                 tool_call,
                 &result,
                 tool_status,
-                persist_session_state,
             );
             let canonical_tool_name = canonical_tool_call_name(&tool_call.function.name);
             if !matches!(tool_status, ExecutionResultStatus::Succeeded)
@@ -1500,16 +1451,9 @@ fn run_conversation_loop_inner(
             &completed_required_tool_names,
         );
         append_task_error_turn_item(
-            event_bus,
-            session_store,
-            task_store,
-            task,
-            session_id,
-            workspace_id,
-            &turn_visibility,
+            turn_writeback_context,
             &failure_reason,
             streaming_entry_id.or(last_stream_item_id.as_deref()),
-            persist_session_state,
         );
         return (
             TaskOutcome::Failed {
@@ -1523,16 +1467,9 @@ fn run_conversation_loop_inner(
         agent_spawn_requirement_recovery_prompt(task, task_store, &tool_call_records, &[])
     {
         append_task_error_turn_item(
-            event_bus,
-            session_store,
-            task_store,
-            task,
-            session_id,
-            workspace_id,
-            &turn_visibility,
+            turn_writeback_context,
             &recovery_prompt,
             streaming_entry_id.or(last_stream_item_id.as_deref()),
-            persist_session_state,
         );
         return (
             TaskOutcome::Failed {
@@ -1546,16 +1483,9 @@ fn run_conversation_loop_inner(
         agent_coordination_recovery_prompt(task, task_store, &tool_call_records)
     {
         append_task_error_turn_item(
-            event_bus,
-            session_store,
-            task_store,
-            task,
-            session_id,
-            workspace_id,
-            &turn_visibility,
+            turn_writeback_context,
             &recovery_prompt,
             streaming_entry_id.or(last_stream_item_id.as_deref()),
-            persist_session_state,
         );
         return (
             TaskOutcome::Failed {
@@ -1568,16 +1498,9 @@ fn run_conversation_loop_inner(
     if final_content.trim().is_empty() {
         let failure_reason = provider_empty_assistant_response_error(had_tool_calls);
         append_task_error_turn_item(
-            event_bus,
-            session_store,
-            task_store,
-            task,
-            session_id,
-            workspace_id,
-            &turn_visibility,
+            turn_writeback_context,
             &failure_reason,
             streaming_entry_id.or(last_stream_item_id.as_deref()),
-            persist_session_state,
         );
         return (
             TaskOutcome::Failed {
@@ -1590,16 +1513,9 @@ fn run_conversation_loop_inner(
     if final_content.trim().is_empty() {
         let failure_reason = provider_empty_assistant_response_error(had_tool_calls);
         append_task_error_turn_item(
-            event_bus,
-            session_store,
-            task_store,
-            task,
-            session_id,
-            workspace_id,
-            &turn_visibility,
+            turn_writeback_context,
             &failure_reason,
             streaming_entry_id.or(last_stream_item_id.as_deref()),
-            persist_session_state,
         );
         return (
             TaskOutcome::Failed {
@@ -1623,16 +1539,9 @@ fn run_conversation_loop_inner(
         .collect::<Vec<_>>();
     if let Some(failure_reason) = task_tool_failure_reason(task.kind, &failed_tool_summaries) {
         append_task_error_turn_item(
-            event_bus,
-            session_store,
-            task_store,
-            task,
-            session_id,
-            workspace_id,
-            &turn_visibility,
+            turn_writeback_context,
             &failure_reason,
             streaming_entry_id.or(last_stream_item_id.as_deref()),
-            persist_session_state,
         );
         return (
             TaskOutcome::Failed {
@@ -1645,16 +1554,9 @@ fn run_conversation_loop_inner(
     if task_has_validation_gate(task) && validation_result_rejects_delivery(&final_content) {
         let failure_reason = compact_validation_failure(&final_content);
         append_task_error_turn_item(
-            event_bus,
-            session_store,
-            task_store,
-            task,
-            session_id,
-            workspace_id,
-            &turn_visibility,
+            turn_writeback_context,
             &failure_reason,
             streaming_entry_id.or(last_stream_item_id.as_deref()),
-            persist_session_state,
         );
         return (
             TaskOutcome::Failed {
@@ -1665,17 +1567,10 @@ fn run_conversation_loop_inner(
     }
 
     append_task_final_turn_item(
-        event_bus,
-        session_store,
-        task_store,
-        task,
-        session_id,
-        workspace_id,
+        turn_writeback_context,
         &final_content,
         last_stream_item_id.as_deref().or(streaming_entry_id),
         streaming_entry_id,
-        &turn_visibility,
-        persist_session_state,
     );
 
     // P6b：把本轮 LLM 对话追写进当前 thread 的审计 / 恢复记录。
@@ -2262,6 +2157,18 @@ fn task_event_context(
     }
 }
 
+#[derive(Clone, Copy)]
+struct TaskTurnWritebackContext<'a> {
+    event_bus: &'a InMemoryEventBus,
+    session_store: &'a SessionStore,
+    task_store: &'a TaskStore,
+    task: &'a magi_core::Task,
+    session_id: &'a SessionId,
+    workspace_id: &'a Option<WorkspaceId>,
+    turn_visibility: &'a TaskTurnVisibility,
+    persist_session_state: Option<&'a SessionStatePersistCallback>,
+}
+
 fn publish_task_llm_started(
     event_bus: &InMemoryEventBus,
     task: &magi_core::Task,
@@ -2287,17 +2194,11 @@ fn publish_task_llm_started(
 }
 
 fn publish_task_thinking_delta(
-    event_bus: &InMemoryEventBus,
-    session_store: &SessionStore,
-    task_store: &TaskStore,
-    task: &magi_core::Task,
-    session_id: &SessionId,
-    workspace_id: &Option<WorkspaceId>,
+    context: TaskTurnWritebackContext<'_>,
     item_id: &str,
     last_sent_len: &std::cell::Cell<usize>,
     streamed_thinking: &std::cell::RefCell<String>,
     publish_gate: &std::cell::RefCell<SessionTurnStreamPublishGate>,
-    turn_visibility: &TaskTurnVisibility,
     accumulated_thinking: &str,
 ) {
     if accumulated_thinking.len() <= last_sent_len.get() {
@@ -2322,14 +2223,8 @@ fn publish_task_thinking_delta(
         thinking.push_str(accumulated_thinking);
     }
     upsert_task_thinking_turn_item(
-        event_bus,
-        session_store,
-        task_store,
-        task,
-        session_id,
-        workspace_id,
+        context,
         item_id,
-        turn_visibility,
         "running",
         trimmed,
         stream_update.as_ref(),
@@ -2338,14 +2233,8 @@ fn publish_task_thinking_delta(
 }
 
 fn upsert_task_thinking_turn_item(
-    event_bus: &InMemoryEventBus,
-    session_store: &SessionStore,
-    task_store: &TaskStore,
-    task: &magi_core::Task,
-    session_id: &SessionId,
-    workspace_id: &Option<WorkspaceId>,
+    context: TaskTurnWritebackContext<'_>,
     item_id: &str,
-    turn_visibility: &TaskTurnVisibility,
     status: &str,
     thinking: &str,
     stream_update: Option<&SessionTurnStreamUpdate>,
@@ -2361,40 +2250,42 @@ fn upsert_task_thinking_turn_item(
         Some("模型思考".to_string()),
         Some(trimmed.to_string()),
         Some(item_id.to_string()),
-        turn_visibility.thread_id().clone(),
+        context.turn_visibility.thread_id().clone(),
     );
-    apply_task_worker_detail_visibility(&mut item, task, turn_visibility);
-    if let Some(published) =
-        upsert_session_turn_item_with_task_store(session_store, session_id, item, Some(task_store))
-    {
+    apply_task_worker_detail_visibility(&mut item, context.task, context.turn_visibility);
+    if let Some(published) = upsert_session_turn_item_with_task_store(
+        context.session_store,
+        context.session_id,
+        item,
+        Some(context.task_store),
+    ) {
         if let Some(stream_update) = stream_update {
             publish_session_turn_item_stream_event(
-                event_bus,
-                session_id,
-                workspace_id,
+                context.event_bus,
+                context.session_id,
+                context.workspace_id,
                 &published,
                 stream_update,
                 &mut publish_gate.borrow_mut(),
             );
         } else {
-            publish_session_turn_item_event(event_bus, session_id, workspace_id, &published);
+            publish_session_turn_item_event(
+                context.event_bus,
+                context.session_id,
+                context.workspace_id,
+                &published,
+            );
         }
     }
 }
 
 fn publish_task_content_delta(
-    event_bus: &InMemoryEventBus,
-    session_store: &SessionStore,
-    task_store: &TaskStore,
-    task: &magi_core::Task,
-    session_id: &SessionId,
-    workspace_id: &Option<WorkspaceId>,
+    context: TaskTurnWritebackContext<'_>,
     item_id: &str,
     last_sent_len: &std::cell::Cell<usize>,
     streamed_content: &std::cell::RefCell<String>,
     streamed_visible_content: &std::cell::RefCell<String>,
     publish_gate: &std::cell::RefCell<SessionTurnStreamPublishGate>,
-    turn_visibility: &TaskTurnVisibility,
     accumulated_content: &str,
 ) {
     if accumulated_content.len() <= last_sent_len.get() {
@@ -2424,14 +2315,8 @@ fn publish_task_content_delta(
         current_visible.push_str(&visible_content);
     }
     upsert_task_stream_turn_item(
-        event_bus,
-        session_store,
-        task_store,
-        task,
-        session_id,
-        workspace_id,
+        context,
         item_id,
-        turn_visibility,
         "running",
         &visible_content,
         stream_update.as_ref(),
@@ -2440,14 +2325,8 @@ fn publish_task_content_delta(
 }
 
 fn upsert_task_stream_turn_item(
-    event_bus: &InMemoryEventBus,
-    session_store: &SessionStore,
-    task_store: &TaskStore,
-    task: &magi_core::Task,
-    session_id: &SessionId,
-    workspace_id: &Option<WorkspaceId>,
+    context: TaskTurnWritebackContext<'_>,
     item_id: &str,
-    turn_visibility: &TaskTurnVisibility,
     status: &str,
     content: &str,
     stream_update: Option<&SessionTurnStreamUpdate>,
@@ -2463,35 +2342,37 @@ fn upsert_task_stream_turn_item(
         Some("生成回复".to_string()),
         Some(trimmed.to_string()),
         Some(item_id.to_string()),
-        turn_visibility.thread_id().clone(),
+        context.turn_visibility.thread_id().clone(),
     );
-    apply_task_worker_detail_visibility(&mut item, task, turn_visibility);
-    if let Some(published) =
-        upsert_session_turn_item_with_task_store(session_store, session_id, item, Some(task_store))
-    {
+    apply_task_worker_detail_visibility(&mut item, context.task, context.turn_visibility);
+    if let Some(published) = upsert_session_turn_item_with_task_store(
+        context.session_store,
+        context.session_id,
+        item,
+        Some(context.task_store),
+    ) {
         if let Some(stream_update) = stream_update {
             publish_session_turn_item_stream_event(
-                event_bus,
-                session_id,
-                workspace_id,
+                context.event_bus,
+                context.session_id,
+                context.workspace_id,
                 &published,
                 stream_update,
                 &mut publish_gate.borrow_mut(),
             );
         } else {
-            publish_session_turn_item_event(event_bus, session_id, workspace_id, &published);
+            publish_session_turn_item_event(
+                context.event_bus,
+                context.session_id,
+                context.workspace_id,
+                &published,
+            );
         }
     }
 }
 
 fn append_task_tool_call_started_turn_item(
-    event_bus: &InMemoryEventBus,
-    session_store: &SessionStore,
-    task_store: &TaskStore,
-    task: &magi_core::Task,
-    session_id: &SessionId,
-    workspace_id: &Option<WorkspaceId>,
-    turn_visibility: &TaskTurnVisibility,
+    context: TaskTurnWritebackContext<'_>,
     tool_call: &ChatToolCall,
 ) {
     let mut item = session_turn_item(
@@ -2500,32 +2381,33 @@ fn append_task_tool_call_started_turn_item(
         Some(tool_call.function.name.clone()),
         Some(format!("正在调用工具：{}", tool_call.function.name)),
         Some(format!("turn-item-tool-{}", tool_call.id)),
-        turn_visibility.thread_id().clone(),
+        context.turn_visibility.thread_id().clone(),
     );
-    apply_task_worker_detail_visibility(&mut item, task, turn_visibility);
+    apply_task_worker_detail_visibility(&mut item, context.task, context.turn_visibility);
     item.tool_call_id = Some(tool_call.id.clone());
     item.tool_name = Some(tool_call.function.name.clone());
     item.tool_status = Some("running".to_string());
     item.tool_arguments = Some(tool_call.function.arguments.clone());
-    if let Some(published) =
-        upsert_session_turn_item_with_task_store(session_store, session_id, item, Some(task_store))
-    {
-        publish_session_turn_item_event(event_bus, session_id, workspace_id, &published);
+    if let Some(published) = upsert_session_turn_item_with_task_store(
+        context.session_store,
+        context.session_id,
+        item,
+        Some(context.task_store),
+    ) {
+        publish_session_turn_item_event(
+            context.event_bus,
+            context.session_id,
+            context.workspace_id,
+            &published,
+        );
     }
 }
 
 fn upsert_task_tool_call_result_turn_item(
-    event_bus: &InMemoryEventBus,
-    session_store: &SessionStore,
-    task_store: &TaskStore,
-    task: &magi_core::Task,
-    session_id: &SessionId,
-    workspace_id: &Option<WorkspaceId>,
-    turn_visibility: &TaskTurnVisibility,
+    context: TaskTurnWritebackContext<'_>,
     tool_call: &ChatToolCall,
     tool_result: &str,
     tool_status: ExecutionResultStatus,
-    persist_session_state: Option<&SessionStatePersistCallback>,
 ) {
     let status_label = tool_execution_status_label(tool_status);
     let mut item = session_turn_item(
@@ -2534,9 +2416,9 @@ fn upsert_task_tool_call_result_turn_item(
         Some(tool_call.function.name.clone()),
         Some(summarize_tool_result(tool_result)),
         Some(format!("turn-item-tool-{}", tool_call.id)),
-        turn_visibility.thread_id().clone(),
+        context.turn_visibility.thread_id().clone(),
     );
-    apply_task_worker_detail_visibility(&mut item, task, turn_visibility);
+    apply_task_worker_detail_visibility(&mut item, context.task, context.turn_visibility);
     item.tool_call_id = Some(tool_call.id.clone());
     item.tool_name = Some(tool_call.function.name.clone());
     item.tool_status = Some(status_label.to_string());
@@ -2545,11 +2427,19 @@ fn upsert_task_tool_call_result_turn_item(
     if !matches!(tool_status, ExecutionResultStatus::Succeeded) {
         item.tool_error = Some(tool_result.to_string());
     }
-    if let Some(published) =
-        upsert_session_turn_item_with_task_store(session_store, session_id, item, Some(task_store))
-    {
-        persist_session_state_checkpoint(persist_session_state, "task_turn_tool_result");
-        publish_session_turn_item_event(event_bus, session_id, workspace_id, &published);
+    if let Some(published) = upsert_session_turn_item_with_task_store(
+        context.session_store,
+        context.session_id,
+        item,
+        Some(context.task_store),
+    ) {
+        persist_session_state_checkpoint(context.persist_session_state, "task_turn_tool_result");
+        publish_session_turn_item_event(
+            context.event_bus,
+            context.session_id,
+            context.workspace_id,
+            &published,
+        );
     }
 }
 
@@ -2570,17 +2460,10 @@ fn tool_call_record(tool_call: &ChatToolCall, result: &str) -> serde_json::Value
 }
 
 fn append_task_final_turn_item(
-    event_bus: &InMemoryEventBus,
-    session_store: &SessionStore,
-    task_store: &TaskStore,
-    task: &magi_core::Task,
-    session_id: &SessionId,
-    workspace_id: &Option<WorkspaceId>,
+    context: TaskTurnWritebackContext<'_>,
     final_content: &str,
     final_item_id: Option<&str>,
     timeline_entry_id: Option<&str>,
-    turn_visibility: &TaskTurnVisibility,
-    persist_session_state: Option<&SessionStatePersistCallback>,
 ) {
     let has_requested_final_item_id = final_item_id.is_some();
     let mut final_item = session_turn_item(
@@ -2589,60 +2472,71 @@ fn append_task_final_turn_item(
         Some("最终回复".to_string()),
         Some(final_content.to_string()),
         final_item_id.map(str::to_string),
-        turn_visibility.thread_id().clone(),
+        context.turn_visibility.thread_id().clone(),
     );
-    apply_task_final_visibility(&mut final_item, task_store, task, turn_visibility);
+    apply_task_final_visibility(
+        &mut final_item,
+        context.task_store,
+        context.task,
+        context.turn_visibility,
+    );
     if let Some(timeline_entry_id) = timeline_entry_id {
         final_item.timeline_entry_id = Some(timeline_entry_id.to_string());
     }
     let final_item_id = final_item.item_id.clone();
     if has_requested_final_item_id {
         if let Some(published) = upsert_session_turn_item_with_task_store(
-            session_store,
-            session_id,
+            context.session_store,
+            context.session_id,
             final_item,
-            Some(task_store),
+            Some(context.task_store),
         ) {
-            persist_session_state_checkpoint(persist_session_state, "task_turn_final_item");
-            publish_session_turn_item_event(event_bus, session_id, workspace_id, &published);
+            persist_session_state_checkpoint(context.persist_session_state, "task_turn_final_item");
+            publish_session_turn_item_event(
+                context.event_bus,
+                context.session_id,
+                context.workspace_id,
+                &published,
+            );
         }
     } else if let Some(published) = append_session_turn_item_with_task_store(
-        session_store,
-        session_id,
+        context.session_store,
+        context.session_id,
         final_item,
-        Some(task_store),
+        Some(context.task_store),
     ) {
-        persist_session_state_checkpoint(persist_session_state, "task_turn_final_item");
-        publish_session_turn_item_event(event_bus, session_id, workspace_id, &published);
+        persist_session_state_checkpoint(context.persist_session_state, "task_turn_final_item");
+        publish_session_turn_item_event(
+            context.event_bus,
+            context.session_id,
+            context.workspace_id,
+            &published,
+        );
     }
-    let root_task_completed = task_store
-        .get_task(&task.root_task_id)
+    let root_task_completed = context
+        .task_store
+        .get_task(&context.task.root_task_id)
         .is_some_and(|root_task| root_task.status == TaskStatus::Completed);
-    if turn_visibility.is_mainline() && root_task_completed {
-        let _ = session_store.update_current_turn_status(session_id, "completed");
-        persist_session_state_checkpoint(persist_session_state, "task_turn_completed");
+    if context.turn_visibility.is_mainline() && root_task_completed {
+        let _ = context
+            .session_store
+            .update_current_turn_status(context.session_id, "completed");
+        persist_session_state_checkpoint(context.persist_session_state, "task_turn_completed");
         publish_current_session_turn_item_event(
-            event_bus,
-            session_store,
-            session_id,
-            workspace_id,
+            context.event_bus,
+            context.session_store,
+            context.session_id,
+            context.workspace_id,
             &final_item_id,
-            Some(task_store),
+            Some(context.task_store),
         );
     }
 }
 
 fn append_task_error_turn_item(
-    event_bus: &InMemoryEventBus,
-    session_store: &SessionStore,
-    task_store: &TaskStore,
-    task: &magi_core::Task,
-    session_id: &SessionId,
-    workspace_id: &Option<WorkspaceId>,
-    turn_visibility: &TaskTurnVisibility,
+    context: TaskTurnWritebackContext<'_>,
     error_text: &str,
     _streaming_entry_id: Option<&str>,
-    persist_session_state: Option<&SessionStatePersistCallback>,
 ) {
     let mut error_item = session_turn_item(
         "assistant_error",
@@ -2650,28 +2544,35 @@ fn append_task_error_turn_item(
         Some("回复生成失败".to_string()),
         Some(error_text.to_string()),
         Some(format!("turn-item-assistant-error-{}", UtcMillis::now().0)),
-        turn_visibility.thread_id().clone(),
+        context.turn_visibility.thread_id().clone(),
     );
-    apply_task_turn_visibility(&mut error_item, task, turn_visibility);
+    apply_task_turn_visibility(&mut error_item, context.task, context.turn_visibility);
     let error_item_id = error_item.item_id.clone();
     if let Some(published) = append_session_turn_item_with_task_store(
-        session_store,
-        session_id,
+        context.session_store,
+        context.session_id,
         error_item,
-        Some(task_store),
+        Some(context.task_store),
     ) {
-        publish_session_turn_item_event(event_bus, session_id, workspace_id, &published);
+        publish_session_turn_item_event(
+            context.event_bus,
+            context.session_id,
+            context.workspace_id,
+            &published,
+        );
     }
-    if turn_visibility.is_mainline() {
-        let _ = session_store.update_current_turn_status(session_id, "failed");
-        persist_session_state_checkpoint(persist_session_state, "task_turn_failed");
+    if context.turn_visibility.is_mainline() {
+        let _ = context
+            .session_store
+            .update_current_turn_status(context.session_id, "failed");
+        persist_session_state_checkpoint(context.persist_session_state, "task_turn_failed");
         publish_current_session_turn_item_event(
-            event_bus,
-            session_store,
-            session_id,
-            workspace_id,
+            context.event_bus,
+            context.session_store,
+            context.session_id,
+            context.workspace_id,
             &error_item_id,
-            Some(task_store),
+            Some(context.task_store),
         );
     }
 }
@@ -3926,7 +3827,7 @@ mod tests {
 
         let missing = agent_result_absorption_recovery_prompt(
             "已经完成检查，整体没有明显问题。",
-            &[wait_record.clone()],
+            std::slice::from_ref(&wait_record),
         )
         .expect("没有吸收代理结果时必须阻止最终答复");
         assert!(missing.contains("登录流程审查代理"));
@@ -4725,17 +4626,19 @@ mod tests {
             task_turn_visibility(&task, false, None, &orchestrator_thread_id, &registry);
 
         append_task_final_turn_item(
-            &event_bus,
-            &session_store,
-            &task_store,
-            &task,
-            &session_id,
-            &None,
+            TaskTurnWritebackContext {
+                event_bus: &event_bus,
+                session_store: &session_store,
+                task_store: &task_store,
+                task: &task,
+                session_id: &session_id,
+                workspace_id: &None,
+                turn_visibility: &visibility,
+                persist_session_state: None,
+            },
             "primary action 已完成",
             Some("timeline-streaming-task-action-final-root-running"),
             Some("timeline-streaming-task-action-final-root-running"),
-            &visibility,
-            None,
         );
 
         let current_turn = session_store

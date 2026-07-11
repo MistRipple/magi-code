@@ -229,10 +229,10 @@ impl WebDevServer {
 
 impl Drop for WebDevServerInner {
     fn drop(&mut self) {
-        if let Ok(child) = self.child.get_mut() {
-            if let Some(child) = child.as_mut() {
-                let _ = child.start_kill();
-            }
+        if let Ok(child) = self.child.get_mut()
+            && let Some(child) = child.as_mut()
+        {
+            let _ = child.start_kill();
         }
     }
 }
@@ -518,7 +518,7 @@ fn is_vite_dev_asset_path(path: &str) -> bool {
         || path.starts_with("/assets/")
 }
 
-async fn is_web_dev_server_ready(origin: &str, agent_origin: &str, web_root: &PathBuf) -> bool {
+async fn is_web_dev_server_ready(origin: &str, agent_origin: &str, web_root: &Path) -> bool {
     let origin = origin.trim_end_matches('/');
     let client = match reqwest::Client::builder()
         .timeout(WEB_DEV_READY_REQUEST_TIMEOUT)
@@ -572,7 +572,7 @@ async fn is_web_dev_server_ready(origin: &str, agent_origin: &str, web_root: &Pa
 async fn wait_for_spawned_web_dev_server(
     origin: &str,
     agent_origin: &str,
-    web_root: &PathBuf,
+    web_root: &Path,
     child: &mut Child,
 ) -> Result<(), String> {
     let started_at = Instant::now();
@@ -603,7 +603,7 @@ fn spawn_web_dev_server(
     host: &str,
     port: u16,
     agent_origin: &str,
-    web_root: &PathBuf,
+    web_root: &Path,
 ) -> Result<Child, String> {
     Command::new("npm")
         .arg("--prefix")
@@ -628,9 +628,9 @@ fn spawn_web_dev_server(
         .map_err(|error| format!("启动 Vite 前端热加载服务失败: {error}"))
 }
 
-fn normalize_ready_path(path: &PathBuf) -> String {
+fn normalize_ready_path(path: &Path) -> String {
     path.canonicalize()
-        .unwrap_or_else(|_| path.clone())
+        .unwrap_or_else(|_| path.to_path_buf())
         .to_string_lossy()
         .trim_end_matches('/')
         .to_string()

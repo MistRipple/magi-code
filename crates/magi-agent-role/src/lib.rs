@@ -141,17 +141,17 @@ impl AgentRoleRegistry {
     /// 路径，绝不阻塞。
     pub fn load_default() -> Self {
         let mut map = builtin_roles_map();
-        if let Some(dir) = user_role_dir() {
-            if dir.exists() {
-                match load_dir(&dir) {
-                    Ok(user_roles) => {
-                        for role in user_roles {
-                            map.insert(role.id.clone(), role);
-                        }
+        if let Some(dir) = user_role_dir()
+            && dir.exists()
+        {
+            match load_dir(&dir) {
+                Ok(user_roles) => {
+                    for role in user_roles {
+                        map.insert(role.id.clone(), role);
                     }
-                    Err(err) => {
-                        tracing::warn!(?err, dir = %dir.display(), "加载 ~/.magi/roles 失败，使用 builtin 默认集");
-                    }
+                }
+                Err(err) => {
+                    tracing::warn!(?err, dir = %dir.display(), "加载 ~/.magi/roles 失败，使用 builtin 默认集");
                 }
             }
         }

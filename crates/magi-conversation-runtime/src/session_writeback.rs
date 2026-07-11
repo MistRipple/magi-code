@@ -321,7 +321,7 @@ fn canonical_item_renderable(
         && item
             .tool_name
             .as_deref()
-            .and_then(BuiltinToolName::from_str)
+            .and_then(BuiltinToolName::from_name)
             .is_some_and(|tool| !tool.is_session_timeline_renderable_tool_call())
     {
         return false;
@@ -588,20 +588,36 @@ pub fn publish_current_session_turn_item_event(
     publish_session_turn_item_event(event_bus, session_id, workspace_id, &published);
 }
 
+pub struct SessionTurnErrorInput<'a> {
+    pub session_id: &'a SessionId,
+    pub workspace_id: &'a Option<WorkspaceId>,
+    pub task_id: Option<&'a TaskId>,
+    pub request_id: Option<&'a str>,
+    pub user_message_id: Option<&'a str>,
+    pub placeholder_message_id: Option<&'a str>,
+    pub error_text: &'a str,
+    pub streaming_entry_id: Option<&'a str>,
+    pub source_thread_id: ThreadId,
+    pub persist_session_state: Option<&'a SessionStatePersistCallback>,
+}
+
 pub fn append_session_turn_error_item(
     event_bus: &InMemoryEventBus,
     session_store: &SessionStore,
-    session_id: &SessionId,
-    workspace_id: &Option<WorkspaceId>,
-    task_id: Option<&TaskId>,
-    request_id: Option<&str>,
-    user_message_id: Option<&str>,
-    placeholder_message_id: Option<&str>,
-    error_text: &str,
-    _streaming_entry_id: Option<&str>,
-    source_thread_id: ThreadId,
-    persist_session_state: Option<&SessionStatePersistCallback>,
+    input: SessionTurnErrorInput<'_>,
 ) {
+    let SessionTurnErrorInput {
+        session_id,
+        workspace_id,
+        task_id,
+        request_id,
+        user_message_id,
+        placeholder_message_id,
+        error_text,
+        streaming_entry_id: _,
+        source_thread_id,
+        persist_session_state,
+    } = input;
     let mut error_item = session_turn_item(
         "assistant_error",
         "failed",
@@ -671,29 +687,32 @@ fn to_turn_item_summary(
 }
 
 #[cfg(test)]
-fn append_session_tool_call_items_batch(
-    session_store: &SessionStore,
-    event_bus: &InMemoryEventBus,
-    tool_registry: Option<&ToolRegistry>,
-    skill_runtime: Option<&SkillRuntime>,
-    skill_dispatch_runtime: Option<&SkillDispatchRuntime>,
-    skill_name: Option<&str>,
-    safety_gate: Option<&magi_safety_gate::SafetyGate>,
-    session_id: &SessionId,
-    workspace_id: &Option<WorkspaceId>,
+struct SessionToolCallBatchTestContext<'a> {
+    session_store: &'a SessionStore,
+    event_bus: &'a InMemoryEventBus,
+    tool_registry: Option<&'a ToolRegistry>,
+    skill_runtime: Option<&'a SkillRuntime>,
+    skill_dispatch_runtime: Option<&'a SkillDispatchRuntime>,
+    skill_name: Option<&'a str>,
+    safety_gate: Option<&'a magi_safety_gate::SafetyGate>,
+    session_id: &'a SessionId,
+    workspace_id: &'a Option<WorkspaceId>,
     workspace_root_path: Option<PathBuf>,
     access_profile: magi_core::AccessProfile,
-    tool_calls: &[ChatToolCall],
-    messages: &mut Vec<ChatMessage>,
     snapshot_session: Option<Arc<SnapshotSession>>,
     execution_group_id: Option<String>,
-    source_thread_id: &ThreadId,
-    persist_session_state: Option<&SessionStatePersistCallback>,
+    source_thread_id: &'a ThreadId,
+    persist_session_state: Option<&'a SessionStatePersistCallback>,
+}
+
+#[cfg(test)]
+fn append_session_tool_call_items_batch(
+    context: SessionToolCallBatchTestContext<'_>,
+    tool_calls: &[ChatToolCall],
+    messages: &mut Vec<ChatMessage>,
     write_allowed: impl Fn() -> bool,
 ) -> SessionToolCallBatchOutcome {
-    let todo_ledger = crate::test_todo_ledger("test-todo-ledger");
-    let mission_id = magi_core::MissionId::new(format!("mission-{session_id}"));
-    append_session_tool_call_items_batch_with_context(
+    let SessionToolCallBatchTestContext {
         session_store,
         event_bus,
         tool_registry,
@@ -701,44 +720,88 @@ fn append_session_tool_call_items_batch(
         skill_dispatch_runtime,
         skill_name,
         safety_gate,
-        &todo_ledger,
-        &mission_id,
         session_id,
         workspace_id,
         workspace_root_path,
         access_profile,
-        tool_calls,
-        messages,
         snapshot_session,
         execution_group_id,
         source_thread_id,
         persist_session_state,
+    } = context;
+    let todo_ledger = crate::test_todo_ledger("test-todo-ledger");
+    let mission_id = magi_core::MissionId::new(format!("mission-{session_id}"));
+    append_session_tool_call_items_batch_with_context(
+        SessionToolCallBatchContext {
+            session_store,
+            event_bus,
+            tool_registry,
+            skill_runtime,
+            skill_dispatch_runtime,
+            skill_name,
+            safety_gate,
+            todo_ledger: &todo_ledger,
+            mission_id: &mission_id,
+            session_id,
+            workspace_id,
+            workspace_root_path,
+            access_profile,
+            snapshot_session,
+            execution_group_id,
+            source_thread_id,
+            persist_session_state,
+        },
+        tool_calls,
+        messages,
         write_allowed,
     )
 }
 
+pub struct SessionToolCallBatchContext<'a> {
+    pub session_store: &'a SessionStore,
+    pub event_bus: &'a InMemoryEventBus,
+    pub tool_registry: Option<&'a ToolRegistry>,
+    pub skill_runtime: Option<&'a SkillRuntime>,
+    pub skill_dispatch_runtime: Option<&'a SkillDispatchRuntime>,
+    pub skill_name: Option<&'a str>,
+    pub safety_gate: Option<&'a magi_safety_gate::SafetyGate>,
+    pub todo_ledger: &'a magi_todo_ledger::TodoLedger,
+    pub mission_id: &'a magi_core::MissionId,
+    pub session_id: &'a SessionId,
+    pub workspace_id: &'a Option<WorkspaceId>,
+    pub workspace_root_path: Option<PathBuf>,
+    pub access_profile: magi_core::AccessProfile,
+    pub snapshot_session: Option<Arc<SnapshotSession>>,
+    pub execution_group_id: Option<String>,
+    pub source_thread_id: &'a ThreadId,
+    pub persist_session_state: Option<&'a SessionStatePersistCallback>,
+}
+
 pub fn append_session_tool_call_items_batch_with_context(
-    session_store: &SessionStore,
-    event_bus: &InMemoryEventBus,
-    tool_registry: Option<&ToolRegistry>,
-    skill_runtime: Option<&SkillRuntime>,
-    skill_dispatch_runtime: Option<&SkillDispatchRuntime>,
-    skill_name: Option<&str>,
-    safety_gate: Option<&magi_safety_gate::SafetyGate>,
-    todo_ledger: &magi_todo_ledger::TodoLedger,
-    mission_id: &magi_core::MissionId,
-    session_id: &SessionId,
-    workspace_id: &Option<WorkspaceId>,
-    workspace_root_path: Option<PathBuf>,
-    access_profile: magi_core::AccessProfile,
+    context: SessionToolCallBatchContext<'_>,
     tool_calls: &[ChatToolCall],
     messages: &mut Vec<ChatMessage>,
-    snapshot_session: Option<Arc<SnapshotSession>>,
-    execution_group_id: Option<String>,
-    source_thread_id: &ThreadId,
-    persist_session_state: Option<&SessionStatePersistCallback>,
     write_allowed: impl Fn() -> bool,
 ) -> SessionToolCallBatchOutcome {
+    let SessionToolCallBatchContext {
+        session_store,
+        event_bus,
+        tool_registry,
+        skill_runtime,
+        skill_dispatch_runtime,
+        skill_name,
+        safety_gate,
+        todo_ledger,
+        mission_id,
+        session_id,
+        workspace_id,
+        workspace_root_path,
+        access_profile,
+        snapshot_session,
+        execution_group_id,
+        source_thread_id,
+        persist_session_state,
+    } = context;
     for tool_call in tool_calls {
         if !write_allowed() {
             return SessionToolCallBatchOutcome::default();
@@ -772,20 +835,22 @@ pub fn append_session_tool_call_items_batch_with_context(
         .collect();
 
     let tool_results = execute_session_turn_tool_call_batch(
-        session_store,
-        event_bus,
-        tool_registry,
-        skill_runtime,
-        skill_dispatch_runtime,
-        skill_name,
-        safety_gate,
-        todo_ledger,
-        mission_id,
+        SessionToolExecutionContext {
+            session_store,
+            event_bus,
+            tool_registry,
+            skill_runtime,
+            skill_dispatch_runtime,
+            skill_name,
+            safety_gate,
+            todo_ledger,
+            mission_id,
+            session_id,
+            workspace_id,
+            workspace_root_path: workspace_root_path.as_ref(),
+            access_profile,
+        },
         tool_calls,
-        session_id,
-        workspace_id,
-        workspace_root_path.as_ref(),
-        access_profile,
         snapshot_session.as_ref(),
         &hook_contexts,
     );
@@ -812,15 +877,17 @@ pub fn append_session_tool_call_items_batch_with_context(
             persist_session_state_checkpoint(persist_session_state, "session_goal_tool");
         }
         upsert_session_tool_call_result_item(
-            session_store,
-            event_bus,
-            session_id,
-            workspace_id,
+            SessionToolResultWritebackContext {
+                session_store,
+                event_bus,
+                session_id,
+                workspace_id,
+                source_thread_id,
+                persist_session_state,
+            },
             tool_call,
             &tool_result,
             tool_status,
-            source_thread_id,
-            persist_session_state,
         );
         messages.push(ChatMessage {
             role: "tool".to_string(),
@@ -845,16 +912,21 @@ pub fn append_session_tool_call_items_batch_with_context(
     }
 }
 
+#[derive(Clone, Copy)]
+struct SessionToolResultWritebackContext<'a> {
+    session_store: &'a SessionStore,
+    event_bus: &'a InMemoryEventBus,
+    session_id: &'a SessionId,
+    workspace_id: &'a Option<WorkspaceId>,
+    source_thread_id: &'a ThreadId,
+    persist_session_state: Option<&'a SessionStatePersistCallback>,
+}
+
 fn upsert_session_tool_call_result_item(
-    session_store: &SessionStore,
-    event_bus: &InMemoryEventBus,
-    session_id: &SessionId,
-    workspace_id: &Option<WorkspaceId>,
+    context: SessionToolResultWritebackContext<'_>,
     tool_call: &ChatToolCall,
     tool_result: &str,
     tool_status: ExecutionResultStatus,
-    source_thread_id: &ThreadId,
-    persist_session_state: Option<&SessionStatePersistCallback>,
 ) {
     let status_label = tool_execution_status_label(tool_status);
     let mut result_item = session_turn_item(
@@ -863,7 +935,7 @@ fn upsert_session_tool_call_result_item(
         Some(tool_call.function.name.clone()),
         Some(summarize_tool_result(tool_result)),
         Some(format!("turn-item-tool-{}", tool_call.id)),
-        source_thread_id.clone(),
+        context.source_thread_id.clone(),
     );
     result_item.source = "tool".to_string();
     result_item.tool_call_id = Some(tool_call.id.clone());
@@ -874,27 +946,39 @@ fn upsert_session_tool_call_result_item(
     if !matches!(tool_status, ExecutionResultStatus::Succeeded) {
         result_item.tool_error = Some(tool_result.to_string());
     }
-    if let Some(published) = upsert_session_turn_item(session_store, session_id, result_item) {
-        persist_session_state_checkpoint(persist_session_state, "session_turn_tool_result");
-        publish_session_turn_item_event(event_bus, session_id, workspace_id, &published);
+    if let Some(published) =
+        upsert_session_turn_item(context.session_store, context.session_id, result_item)
+    {
+        persist_session_state_checkpoint(context.persist_session_state, "session_turn_tool_result");
+        publish_session_turn_item_event(
+            context.event_bus,
+            context.session_id,
+            context.workspace_id,
+            &published,
+        );
     }
 }
 
-fn execute_session_turn_tool_call_batch(
-    session_store: &SessionStore,
-    event_bus: &InMemoryEventBus,
-    tool_registry: Option<&ToolRegistry>,
-    skill_runtime: Option<&SkillRuntime>,
-    skill_dispatch_runtime: Option<&SkillDispatchRuntime>,
-    skill_name: Option<&str>,
-    safety_gate: Option<&magi_safety_gate::SafetyGate>,
-    todo_ledger: &magi_todo_ledger::TodoLedger,
-    mission_id: &magi_core::MissionId,
-    tool_calls: &[ChatToolCall],
-    session_id: &SessionId,
-    workspace_id: &Option<WorkspaceId>,
-    workspace_root_path: Option<&PathBuf>,
+#[derive(Clone, Copy)]
+struct SessionToolExecutionContext<'a> {
+    session_store: &'a SessionStore,
+    event_bus: &'a InMemoryEventBus,
+    tool_registry: Option<&'a ToolRegistry>,
+    skill_runtime: Option<&'a SkillRuntime>,
+    skill_dispatch_runtime: Option<&'a SkillDispatchRuntime>,
+    skill_name: Option<&'a str>,
+    safety_gate: Option<&'a magi_safety_gate::SafetyGate>,
+    todo_ledger: &'a magi_todo_ledger::TodoLedger,
+    mission_id: &'a magi_core::MissionId,
+    session_id: &'a SessionId,
+    workspace_id: &'a Option<WorkspaceId>,
+    workspace_root_path: Option<&'a PathBuf>,
     access_profile: magi_core::AccessProfile,
+}
+
+fn execute_session_turn_tool_call_batch(
+    context: SessionToolExecutionContext<'_>,
+    tool_calls: &[ChatToolCall],
     snapshot_session: Option<&Arc<SnapshotSession>>,
     hook_contexts: &[ToolHookCtx],
 ) -> Vec<(String, ExecutionResultStatus)> {
@@ -923,28 +1007,13 @@ fn execute_session_turn_tool_call_batch(
                         snapshot.before_tool(&hook_ctx);
                     }
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        execute_session_turn_tool_call_scoped(
-                            session_store,
-                            event_bus,
-                            tool_registry,
-                            skill_runtime,
-                            skill_dispatch_runtime,
-                            skill_name,
-                            safety_gate,
-                            todo_ledger,
-                            mission_id,
-                            &tool_calls[tool_index],
-                            session_id,
-                            workspace_id,
-                            workspace_root_path,
-                            access_profile,
-                        )
+                        execute_session_turn_tool_call_scoped(context, &tool_calls[tool_index])
                     }))
                     .unwrap_or_else(|_| {
                         tracing::warn!(
                             tool_name = %tool_calls[tool_index].function.name,
                             tool_call_id = %tool_calls[tool_index].id,
-                            session_id = %session_id.as_str(),
+                            session_id = %context.session_id.as_str(),
                             "session turn tool execution panicked"
                         );
                         tool_execution_failed_result(&tool_calls[tool_index].function.name)
@@ -975,20 +1044,7 @@ fn execute_session_turn_tool_call_batch(
                                     let result = std::panic::catch_unwind(
                                         std::panic::AssertUnwindSafe(|| {
                                             execute_session_turn_tool_call_scoped(
-                                                session_store,
-                                                event_bus,
-                                                tool_registry,
-                                                skill_runtime,
-                                                skill_dispatch_runtime,
-                                                skill_name,
-                                                safety_gate,
-                                                todo_ledger,
-                                                mission_id,
-                                                tool_call,
-                                                session_id,
-                                                workspace_id,
-                                                workspace_root_path,
-                                                access_profile,
+                                                context, tool_call,
                                             )
                                         }),
                                     );
@@ -996,7 +1052,7 @@ fn execute_session_turn_tool_call_batch(
                                         tracing::warn!(
                                             tool_name = %tool_call.function.name,
                                             tool_call_id = %tool_call.id,
-                                            session_id = %session_id.as_str(),
+                                            session_id = %context.session_id.as_str(),
                                             "session turn tool execution panicked"
                                         );
                                         tool_execution_failed_result(&tool_call.function.name)
@@ -1019,7 +1075,7 @@ fn execute_session_turn_tool_call_batch(
                             tracing::warn!(
                                 tool_name = %tool_calls[tool_index].function.name,
                                 tool_call_id = %tool_calls[tool_index].id,
-                                session_id = %session_id.as_str(),
+                                session_id = %context.session_id.as_str(),
                                 "session turn tool execution thread panicked"
                             );
                             tool_execution_failed_result(&tool_calls[tool_index].function.name)
@@ -1043,23 +1099,26 @@ fn execute_session_turn_tool_call_batch(
 }
 
 #[cfg(test)]
-fn execute_session_turn_tool_call(
-    session_store: &SessionStore,
-    event_bus: &InMemoryEventBus,
-    tool_registry: Option<&ToolRegistry>,
-    skill_runtime: Option<&SkillRuntime>,
-    skill_dispatch_runtime: Option<&SkillDispatchRuntime>,
-    skill_name: Option<&str>,
-    safety_gate: Option<&magi_safety_gate::SafetyGate>,
-    tool_call: &ChatToolCall,
-    session_id: &SessionId,
-    workspace_id: &Option<WorkspaceId>,
-    workspace_root_path: Option<&PathBuf>,
+struct SessionToolCallTestContext<'a> {
+    session_store: &'a SessionStore,
+    event_bus: &'a InMemoryEventBus,
+    tool_registry: Option<&'a ToolRegistry>,
+    skill_runtime: Option<&'a SkillRuntime>,
+    skill_dispatch_runtime: Option<&'a SkillDispatchRuntime>,
+    skill_name: Option<&'a str>,
+    safety_gate: Option<&'a magi_safety_gate::SafetyGate>,
+    session_id: &'a SessionId,
+    workspace_id: &'a Option<WorkspaceId>,
+    workspace_root_path: Option<&'a PathBuf>,
     access_profile: magi_core::AccessProfile,
+}
+
+#[cfg(test)]
+fn execute_session_turn_tool_call(
+    context: SessionToolCallTestContext<'_>,
+    tool_call: &ChatToolCall,
 ) -> (String, ExecutionResultStatus) {
-    let todo_ledger = crate::test_todo_ledger("test-todo-ledger");
-    let mission_id = magi_core::MissionId::new(format!("mission-{session_id}"));
-    execute_session_turn_tool_call_scoped(
+    let SessionToolCallTestContext {
         session_store,
         event_bus,
         tool_registry,
@@ -1067,33 +1126,53 @@ fn execute_session_turn_tool_call(
         skill_dispatch_runtime,
         skill_name,
         safety_gate,
-        &todo_ledger,
-        &mission_id,
-        tool_call,
         session_id,
         workspace_id,
         workspace_root_path,
         access_profile,
+    } = context;
+    let todo_ledger = crate::test_todo_ledger("test-todo-ledger");
+    let mission_id = magi_core::MissionId::new(format!("mission-{session_id}"));
+    execute_session_turn_tool_call_scoped(
+        SessionToolExecutionContext {
+            session_store,
+            event_bus,
+            tool_registry,
+            skill_runtime,
+            skill_dispatch_runtime,
+            skill_name,
+            safety_gate,
+            todo_ledger: &todo_ledger,
+            mission_id: &mission_id,
+            session_id,
+            workspace_id,
+            workspace_root_path,
+            access_profile,
+        },
+        tool_call,
     )
 }
 
 fn execute_session_turn_tool_call_scoped(
-    session_store: &SessionStore,
-    event_bus: &InMemoryEventBus,
-    tool_registry: Option<&ToolRegistry>,
-    skill_runtime: Option<&SkillRuntime>,
-    skill_dispatch_runtime: Option<&SkillDispatchRuntime>,
-    skill_name: Option<&str>,
-    safety_gate: Option<&magi_safety_gate::SafetyGate>,
-    todo_ledger: &magi_todo_ledger::TodoLedger,
-    mission_id: &magi_core::MissionId,
+    context: SessionToolExecutionContext<'_>,
     tool_call: &ChatToolCall,
-    session_id: &SessionId,
-    workspace_id: &Option<WorkspaceId>,
-    workspace_root_path: Option<&PathBuf>,
-    access_profile: magi_core::AccessProfile,
 ) -> (String, ExecutionResultStatus) {
-    if let Some(canonical) = BuiltinToolName::from_str(tool_call.function.name.as_str())
+    let SessionToolExecutionContext {
+        session_store,
+        event_bus,
+        tool_registry,
+        skill_runtime,
+        skill_dispatch_runtime,
+        skill_name,
+        safety_gate,
+        todo_ledger,
+        mission_id,
+        session_id,
+        workspace_id,
+        workspace_root_path,
+        access_profile,
+    } = context;
+    if let Some(canonical) = BuiltinToolName::from_name(tool_call.function.name.as_str())
         && matches!(
             canonical,
             BuiltinToolName::GetGoal | BuiltinToolName::CreateGoal | BuiltinToolName::UpdateGoal
@@ -1123,7 +1202,7 @@ fn execute_session_turn_tool_call_scoped(
     }
 
     if matches!(
-        BuiltinToolName::from_str(tool_call.function.name.as_str()),
+        BuiltinToolName::from_name(tool_call.function.name.as_str()),
         Some(BuiltinToolName::TodoWrite)
     ) {
         return magi_todo_ledger::execute_session_todo_write_tool(
@@ -1212,17 +1291,18 @@ fn execute_session_turn_tool_call_scoped(
         return (rejection, ExecutionResultStatus::Failed);
     }
 
-    let access_profile_decision = access_profile_tool_decision(
-        access_profile,
-        "",
-        &[],
-        &[],
-        &[],
-        &[],
-        &tool_call.function.name,
-        &tool_call.function.arguments,
-        workspace_root_path,
-    );
+    let access_profile_decision =
+        access_profile_tool_decision(crate::tool_batch::AccessProfileToolDecisionInput {
+            access_profile,
+            command_mode: "",
+            allowed_tools: &[],
+            denied_tools: &[],
+            allowed_paths: &[],
+            denied_paths: &[],
+            requested_tool_name: &tool_call.function.name,
+            arguments: &tool_call.function.arguments,
+            workspace_root_path,
+        });
     let safety_gate_decision = safety_gate.and_then(|gate| {
         safety_gate_tool_decision(
             gate,
@@ -1257,7 +1337,7 @@ fn execute_session_turn_tool_call_scoped(
 }
 
 fn is_session_goal_write_tool(tool_name: &str) -> bool {
-    BuiltinToolName::from_str(tool_name).is_some_and(|tool| {
+    BuiltinToolName::from_name(tool_name).is_some_and(|tool| {
         matches!(
             tool,
             BuiltinToolName::CreateGoal | BuiltinToolName::UpdateGoal
@@ -1666,18 +1746,20 @@ mod tests {
         };
 
         let (_, status) = execute_session_turn_tool_call(
-            &SessionStore::new(),
-            &event_bus,
-            None,
-            None,
-            None,
-            None,
-            None,
+            SessionToolCallTestContext {
+                session_store: &SessionStore::new(),
+                event_bus: &event_bus,
+                tool_registry: None,
+                skill_runtime: None,
+                skill_dispatch_runtime: None,
+                skill_name: None,
+                safety_gate: None,
+                session_id: &SessionId::new("session-1"),
+                workspace_id: &None,
+                workspace_root_path: None,
+                access_profile: magi_core::AccessProfile::Restricted,
+            },
             &call,
-            &SessionId::new("session-1"),
-            &None,
-            None,
-            magi_core::AccessProfile::Restricted,
         );
 
         assert_eq!(status, ExecutionResultStatus::Failed);
@@ -1716,18 +1798,20 @@ mod tests {
         };
 
         let (payload, status) = execute_session_turn_tool_call(
-            &SessionStore::new(),
-            &event_bus,
-            Some(&tool_registry),
-            Some(&skill_runtime),
-            None,
-            None,
-            None,
+            SessionToolCallTestContext {
+                session_store: &SessionStore::new(),
+                event_bus: &event_bus,
+                tool_registry: Some(&tool_registry),
+                skill_runtime: Some(&skill_runtime),
+                skill_dispatch_runtime: None,
+                skill_name: None,
+                safety_gate: None,
+                session_id: &SessionId::new("session-1"),
+                workspace_id: &None,
+                workspace_root_path: None,
+                access_profile: magi_core::AccessProfile::Restricted,
+            },
             &call,
-            &SessionId::new("session-1"),
-            &None,
-            None,
-            magi_core::AccessProfile::Restricted,
         );
 
         assert_eq!(status, ExecutionResultStatus::Succeeded);
@@ -1775,18 +1859,20 @@ mod tests {
         };
 
         let (payload, status) = execute_session_turn_tool_call(
-            &SessionStore::new(),
-            &event_bus,
-            Some(&tool_registry),
-            None,
-            None,
-            None,
-            None,
+            SessionToolCallTestContext {
+                session_store: &SessionStore::new(),
+                event_bus: &event_bus,
+                tool_registry: Some(&tool_registry),
+                skill_runtime: None,
+                skill_dispatch_runtime: None,
+                skill_name: None,
+                safety_gate: None,
+                session_id: &SessionId::new("session-live-mcp"),
+                workspace_id: &None,
+                workspace_root_path: None,
+                access_profile: magi_core::AccessProfile::Restricted,
+            },
             &call,
-            &SessionId::new("session-live-mcp"),
-            &None,
-            None,
-            magi_core::AccessProfile::Restricted,
         );
 
         assert_eq!(status, ExecutionResultStatus::Succeeded);
@@ -1838,18 +1924,20 @@ mod tests {
         };
 
         let (payload, status) = execute_session_turn_tool_call(
-            &SessionStore::new(),
-            &event_bus,
-            Some(&tool_registry),
-            Some(&skill_runtime),
-            Some(&skill_dispatch_runtime),
-            Some("code-review"),
-            None,
+            SessionToolCallTestContext {
+                session_store: &SessionStore::new(),
+                event_bus: &event_bus,
+                tool_registry: Some(&tool_registry),
+                skill_runtime: Some(&skill_runtime),
+                skill_dispatch_runtime: Some(&skill_dispatch_runtime),
+                skill_name: Some("code-review"),
+                safety_gate: None,
+                session_id: &SessionId::new("session-1"),
+                workspace_id: &None,
+                workspace_root_path: None,
+                access_profile: magi_core::AccessProfile::FullAccess,
+            },
             &call,
-            &SessionId::new("session-1"),
-            &None,
-            None,
-            magi_core::AccessProfile::FullAccess,
         );
 
         assert_eq!(status, ExecutionResultStatus::Succeeded);
@@ -1910,18 +1998,20 @@ mod tests {
         };
 
         let (payload, status) = execute_session_turn_tool_call(
-            &SessionStore::new(),
-            &event_bus,
-            Some(&tool_registry),
-            Some(&skill_runtime),
-            Some(&skill_dispatch_runtime),
-            Some("code-review"),
-            None,
+            SessionToolCallTestContext {
+                session_store: &SessionStore::new(),
+                event_bus: &event_bus,
+                tool_registry: Some(&tool_registry),
+                skill_runtime: Some(&skill_runtime),
+                skill_dispatch_runtime: Some(&skill_dispatch_runtime),
+                skill_name: Some("code-review"),
+                safety_gate: None,
+                session_id: &SessionId::new("session-1"),
+                workspace_id: &None,
+                workspace_root_path: None,
+                access_profile: magi_core::AccessProfile::Restricted,
+            },
             &call,
-            &SessionId::new("session-1"),
-            &None,
-            None,
-            magi_core::AccessProfile::Restricted,
         );
 
         assert_eq!(status, ExecutionResultStatus::NeedsApproval);
@@ -1995,18 +2085,20 @@ mod tests {
         };
 
         let (payload, status) = execute_session_turn_tool_call(
-            &SessionStore::new(),
-            &event_bus,
-            Some(&tool_registry),
-            Some(&skill_runtime),
-            Some(&skill_dispatch_runtime),
-            Some("shell-mcp"),
-            Some(&safety_gate),
+            SessionToolCallTestContext {
+                session_store: &SessionStore::new(),
+                event_bus: &event_bus,
+                tool_registry: Some(&tool_registry),
+                skill_runtime: Some(&skill_runtime),
+                skill_dispatch_runtime: Some(&skill_dispatch_runtime),
+                skill_name: Some("shell-mcp"),
+                safety_gate: Some(&safety_gate),
+                session_id: &SessionId::new("session-1"),
+                workspace_id: &None,
+                workspace_root_path: None,
+                access_profile: magi_core::AccessProfile::FullAccess,
+            },
             &call,
-            &SessionId::new("session-1"),
-            &None,
-            None,
-            magi_core::AccessProfile::FullAccess,
         );
 
         assert_eq!(status, ExecutionResultStatus::Rejected);
@@ -2054,18 +2146,20 @@ mod tests {
         };
 
         let (payload, status) = execute_session_turn_tool_call(
-            &SessionStore::new(),
-            &event_bus,
-            Some(&tool_registry),
-            Some(&skill_runtime),
-            None,
-            Some("search-only"),
-            None,
+            SessionToolCallTestContext {
+                session_store: &SessionStore::new(),
+                event_bus: &event_bus,
+                tool_registry: Some(&tool_registry),
+                skill_runtime: Some(&skill_runtime),
+                skill_dispatch_runtime: None,
+                skill_name: Some("search-only"),
+                safety_gate: None,
+                session_id: &SessionId::new("session-1"),
+                workspace_id: &None,
+                workspace_root_path: None,
+                access_profile: magi_core::AccessProfile::Restricted,
+            },
             &call,
-            &SessionId::new("session-1"),
-            &None,
-            None,
-            magi_core::AccessProfile::Restricted,
         );
 
         assert_eq!(status, ExecutionResultStatus::Rejected);
@@ -2095,18 +2189,20 @@ mod tests {
         };
 
         let (payload, status) = execute_session_turn_tool_call(
-            &SessionStore::new(),
-            &event_bus,
-            Some(&tool_registry),
-            None,
-            None,
-            None,
-            None,
+            SessionToolCallTestContext {
+                session_store: &SessionStore::new(),
+                event_bus: &event_bus,
+                tool_registry: Some(&tool_registry),
+                skill_runtime: None,
+                skill_dispatch_runtime: None,
+                skill_name: None,
+                safety_gate: None,
+                session_id: &SessionId::new("session-1"),
+                workspace_id: &None,
+                workspace_root_path: None,
+                access_profile: magi_core::AccessProfile::Restricted,
+            },
             &call,
-            &SessionId::new("session-1"),
-            &None,
-            None,
-            magi_core::AccessProfile::Restricted,
         );
 
         assert_eq!(status, ExecutionResultStatus::Failed);
@@ -2146,18 +2242,20 @@ mod tests {
         };
 
         let (payload, status) = execute_session_turn_tool_call(
-            &SessionStore::new(),
-            &event_bus,
-            Some(&tool_registry),
-            None,
-            None,
-            None,
-            None,
+            SessionToolCallTestContext {
+                session_store: &SessionStore::new(),
+                event_bus: &event_bus,
+                tool_registry: Some(&tool_registry),
+                skill_runtime: None,
+                skill_dispatch_runtime: None,
+                skill_name: None,
+                safety_gate: None,
+                session_id: &SessionId::new("session-read-only-tool"),
+                workspace_id: &None,
+                workspace_root_path: Some(&root),
+                access_profile: magi_core::AccessProfile::ReadOnly,
+            },
             &call,
-            &SessionId::new("session-read-only-tool"),
-            &None,
-            Some(&root),
-            magi_core::AccessProfile::ReadOnly,
         );
 
         assert_eq!(status, ExecutionResultStatus::Rejected);
@@ -2192,18 +2290,20 @@ mod tests {
         };
 
         let (payload, status) = execute_session_turn_tool_call(
-            &SessionStore::new(),
-            &event_bus,
-            Some(&tool_registry),
-            None,
-            None,
-            None,
-            None,
+            SessionToolCallTestContext {
+                session_store: &SessionStore::new(),
+                event_bus: &event_bus,
+                tool_registry: Some(&tool_registry),
+                skill_runtime: None,
+                skill_dispatch_runtime: None,
+                skill_name: None,
+                safety_gate: None,
+                session_id: &SessionId::new("session-restricted-shell"),
+                workspace_id: &None,
+                workspace_root_path: Some(&root),
+                access_profile: magi_core::AccessProfile::Restricted,
+            },
             &call,
-            &SessionId::new("session-restricted-shell"),
-            &None,
-            Some(&root),
-            magi_core::AccessProfile::Restricted,
         );
 
         assert_eq!(status, ExecutionResultStatus::NeedsApproval);
@@ -2239,18 +2339,20 @@ mod tests {
         };
 
         let (payload, status) = execute_session_turn_tool_call(
-            &SessionStore::new(),
-            &event_bus,
-            Some(&tool_registry),
-            None,
-            None,
-            None,
-            None,
+            SessionToolCallTestContext {
+                session_store: &SessionStore::new(),
+                event_bus: &event_bus,
+                tool_registry: Some(&tool_registry),
+                skill_runtime: None,
+                skill_dispatch_runtime: None,
+                skill_name: None,
+                safety_gate: None,
+                session_id: &SessionId::new("session-read-only-shell"),
+                workspace_id: &None,
+                workspace_root_path: None,
+                access_profile: magi_core::AccessProfile::ReadOnly,
+            },
             &call,
-            &SessionId::new("session-read-only-shell"),
-            &None,
-            None,
-            magi_core::AccessProfile::ReadOnly,
         );
 
         assert_eq!(status, ExecutionResultStatus::Succeeded);
@@ -2281,18 +2383,20 @@ mod tests {
         };
 
         let (payload, status) = execute_session_turn_tool_call(
-            &SessionStore::new(),
-            &event_bus,
-            Some(&tool_registry),
-            None,
-            None,
-            None,
-            Some(&safety_gate),
+            SessionToolCallTestContext {
+                session_store: &SessionStore::new(),
+                event_bus: &event_bus,
+                tool_registry: Some(&tool_registry),
+                skill_runtime: None,
+                skill_dispatch_runtime: None,
+                skill_name: None,
+                safety_gate: Some(&safety_gate),
+                session_id: &SessionId::new("session-1"),
+                workspace_id: &None,
+                workspace_root_path: None,
+                access_profile: magi_core::AccessProfile::Restricted,
+            },
             &call,
-            &SessionId::new("session-1"),
-            &None,
-            None,
-            magi_core::AccessProfile::Restricted,
         );
 
         assert_eq!(status, ExecutionResultStatus::NeedsApproval);
@@ -2335,18 +2439,20 @@ mod tests {
         };
 
         let (payload, status) = execute_session_turn_tool_call(
-            &SessionStore::new(),
-            &event_bus,
-            Some(&tool_registry),
-            None,
-            None,
-            None,
-            Some(&safety_gate),
+            SessionToolCallTestContext {
+                session_store: &SessionStore::new(),
+                event_bus: &event_bus,
+                tool_registry: Some(&tool_registry),
+                skill_runtime: None,
+                skill_dispatch_runtime: None,
+                skill_name: None,
+                safety_gate: Some(&safety_gate),
+                session_id: &SessionId::new("session-1"),
+                workspace_id: &None,
+                workspace_root_path: None,
+                access_profile: magi_core::AccessProfile::FullAccess,
+            },
             &call,
-            &SessionId::new("session-1"),
-            &None,
-            None,
-            magi_core::AccessProfile::FullAccess,
         );
 
         assert_eq!(status, ExecutionResultStatus::Succeeded);
@@ -2378,18 +2484,20 @@ mod tests {
         };
 
         let (payload, status) = execute_session_turn_tool_call(
-            &SessionStore::new(),
-            &event_bus,
-            Some(&tool_registry),
-            None,
-            None,
-            None,
-            None,
+            SessionToolCallTestContext {
+                session_store: &SessionStore::new(),
+                event_bus: &event_bus,
+                tool_registry: Some(&tool_registry),
+                skill_runtime: None,
+                skill_dispatch_runtime: None,
+                skill_name: None,
+                safety_gate: None,
+                session_id: &SessionId::new("session-1"),
+                workspace_id: &None,
+                workspace_root_path: None,
+                access_profile: magi_core::AccessProfile::Restricted,
+            },
             &call,
-            &SessionId::new("session-1"),
-            &None,
-            None,
-            magi_core::AccessProfile::Restricted,
         );
 
         assert_eq!(status, ExecutionResultStatus::NeedsApproval);
@@ -2467,23 +2575,25 @@ mod tests {
         let mut messages = Vec::new();
 
         append_session_tool_call_items_batch(
-            &session_store,
-            &event_bus,
-            Some(&tool_registry),
-            None,
-            None,
-            None,
-            None,
-            &session_id,
-            &workspace_id,
-            None,
-            magi_core::AccessProfile::Restricted,
+            SessionToolCallBatchTestContext {
+                session_store: &session_store,
+                event_bus: &event_bus,
+                tool_registry: Some(&tool_registry),
+                skill_runtime: None,
+                skill_dispatch_runtime: None,
+                skill_name: None,
+                safety_gate: None,
+                session_id: &session_id,
+                workspace_id: &workspace_id,
+                workspace_root_path: None,
+                access_profile: magi_core::AccessProfile::Restricted,
+                snapshot_session: None,
+                execution_group_id: None,
+                source_thread_id: &ThreadId::new("thread-shell-batch"),
+                persist_session_state: None,
+            },
             &tool_calls,
             &mut messages,
-            None,
-            None,
-            &ThreadId::new("thread-shell-batch"),
-            None,
             || true,
         );
 
@@ -2653,23 +2763,25 @@ mod tests {
 
         assert!(
             append_session_tool_call_items_batch(
-                &session_store,
-                &event_bus,
-                None,
-                None,
-                None,
-                None,
-                None,
-                &session_id,
-                &workspace_id,
-                None,
-                magi_core::AccessProfile::Restricted,
+                SessionToolCallBatchTestContext {
+                    session_store: &session_store,
+                    event_bus: &event_bus,
+                    tool_registry: None,
+                    skill_runtime: None,
+                    skill_dispatch_runtime: None,
+                    skill_name: None,
+                    safety_gate: None,
+                    session_id: &session_id,
+                    workspace_id: &workspace_id,
+                    workspace_root_path: None,
+                    access_profile: magi_core::AccessProfile::Restricted,
+                    snapshot_session: None,
+                    execution_group_id: None,
+                    source_thread_id: &thread_id,
+                    persist_session_state: Some(&persist),
+                },
                 &[create_call],
                 &mut messages,
-                None,
-                None,
-                &thread_id,
-                Some(&persist),
                 || true,
             )
             .completed
@@ -2705,23 +2817,25 @@ mod tests {
 
         assert!(
             append_session_tool_call_items_batch(
-                &session_store,
-                &event_bus,
-                None,
-                None,
-                None,
-                None,
-                None,
-                &session_id,
-                &workspace_id,
-                None,
-                magi_core::AccessProfile::Restricted,
+                SessionToolCallBatchTestContext {
+                    session_store: &session_store,
+                    event_bus: &event_bus,
+                    tool_registry: None,
+                    skill_runtime: None,
+                    skill_dispatch_runtime: None,
+                    skill_name: None,
+                    safety_gate: None,
+                    session_id: &session_id,
+                    workspace_id: &workspace_id,
+                    workspace_root_path: None,
+                    access_profile: magi_core::AccessProfile::Restricted,
+                    snapshot_session: None,
+                    execution_group_id: None,
+                    source_thread_id: &thread_id,
+                    persist_session_state: Some(&persist),
+                },
                 &[update_call],
                 &mut messages,
-                None,
-                None,
-                &thread_id,
-                Some(&persist),
                 || true,
             )
             .completed
@@ -2799,25 +2913,27 @@ mod tests {
         };
 
         let valid_outcome = append_session_tool_call_items_batch_with_context(
-            &session_store,
-            &event_bus,
-            None,
-            None,
-            None,
-            None,
-            None,
-            &todo_ledger,
-            &mission_id,
-            &session_id,
-            &workspace_id,
-            None,
-            magi_core::AccessProfile::Restricted,
+            SessionToolCallBatchContext {
+                session_store: &session_store,
+                event_bus: &event_bus,
+                tool_registry: None,
+                skill_runtime: None,
+                skill_dispatch_runtime: None,
+                skill_name: None,
+                safety_gate: None,
+                todo_ledger: &todo_ledger,
+                mission_id: &mission_id,
+                session_id: &session_id,
+                workspace_id: &workspace_id,
+                workspace_root_path: None,
+                access_profile: magi_core::AccessProfile::Restricted,
+                snapshot_session: None,
+                execution_group_id: None,
+                source_thread_id: &thread_id,
+                persist_session_state: None,
+            },
             &[valid_call],
             &mut messages,
-            None,
-            None,
-            &thread_id,
-            None,
             || true,
         );
 
@@ -2839,25 +2955,27 @@ mod tests {
             },
         };
         let invalid_outcome = append_session_tool_call_items_batch_with_context(
-            &session_store,
-            &event_bus,
-            None,
-            None,
-            None,
-            None,
-            None,
-            &todo_ledger,
-            &mission_id,
-            &session_id,
-            &workspace_id,
-            None,
-            magi_core::AccessProfile::Restricted,
+            SessionToolCallBatchContext {
+                session_store: &session_store,
+                event_bus: &event_bus,
+                tool_registry: None,
+                skill_runtime: None,
+                skill_dispatch_runtime: None,
+                skill_name: None,
+                safety_gate: None,
+                todo_ledger: &todo_ledger,
+                mission_id: &mission_id,
+                session_id: &session_id,
+                workspace_id: &workspace_id,
+                workspace_root_path: None,
+                access_profile: magi_core::AccessProfile::Restricted,
+                snapshot_session: None,
+                execution_group_id: None,
+                source_thread_id: &thread_id,
+                persist_session_state: None,
+            },
             &[invalid_call],
             &mut messages,
-            None,
-            None,
-            &thread_id,
-            None,
             || true,
         );
 
@@ -2923,25 +3041,27 @@ mod tests {
         };
 
         let outcome = append_session_tool_call_items_batch_with_context(
-            &session_store,
-            &event_bus,
-            Some(&tool_registry),
-            Some(&skill_runtime),
-            None,
-            None,
-            None,
-            &todo_ledger,
-            &mission_id,
-            &session_id,
-            &None,
-            None,
-            magi_core::AccessProfile::Restricted,
+            SessionToolCallBatchContext {
+                session_store: &session_store,
+                event_bus: &event_bus,
+                tool_registry: Some(&tool_registry),
+                skill_runtime: Some(&skill_runtime),
+                skill_dispatch_runtime: None,
+                skill_name: None,
+                safety_gate: None,
+                todo_ledger: &todo_ledger,
+                mission_id: &mission_id,
+                session_id: &session_id,
+                workspace_id: &None,
+                workspace_root_path: None,
+                access_profile: magi_core::AccessProfile::Restricted,
+                snapshot_session: None,
+                execution_group_id: None,
+                source_thread_id: &thread_id,
+                persist_session_state: None,
+            },
             &[call],
             &mut messages,
-            None,
-            None,
-            &thread_id,
-            None,
             || true,
         );
 
@@ -3001,23 +3121,25 @@ mod tests {
         let mut messages = Vec::new();
 
         append_session_tool_call_items_batch(
-            &session_store,
-            &event_bus,
-            Some(&tool_registry),
-            None,
-            None,
-            None,
-            None,
-            &session_id,
-            &workspace_id,
-            Some(root.clone()),
-            magi_core::AccessProfile::Restricted,
+            SessionToolCallBatchTestContext {
+                session_store: &session_store,
+                event_bus: &event_bus,
+                tool_registry: Some(&tool_registry),
+                skill_runtime: None,
+                skill_dispatch_runtime: None,
+                skill_name: None,
+                safety_gate: None,
+                session_id: &session_id,
+                workspace_id: &workspace_id,
+                workspace_root_path: Some(root.clone()),
+                access_profile: magi_core::AccessProfile::Restricted,
+                snapshot_session: None,
+                execution_group_id: None,
+                source_thread_id: &ThreadId::new("thread-approval-tool"),
+                persist_session_state: None,
+            },
             &tool_calls,
             &mut messages,
-            None,
-            None,
-            &ThreadId::new("thread-approval-tool"),
-            None,
             || true,
         );
 
@@ -3105,23 +3227,25 @@ mod tests {
 
         assert!(
             append_session_tool_call_items_batch(
-                &session_store,
-                &event_bus,
-                Some(&tool_registry),
-                None,
-                None,
-                None,
-                None,
-                &session_id,
-                &workspace_id,
-                None,
-                magi_core::AccessProfile::Restricted,
+                SessionToolCallBatchTestContext {
+                    session_store: &session_store,
+                    event_bus: &event_bus,
+                    tool_registry: Some(&tool_registry),
+                    skill_runtime: None,
+                    skill_dispatch_runtime: None,
+                    skill_name: None,
+                    safety_gate: None,
+                    session_id: &session_id,
+                    workspace_id: &workspace_id,
+                    workspace_root_path: None,
+                    access_profile: magi_core::AccessProfile::Restricted,
+                    snapshot_session: None,
+                    execution_group_id: None,
+                    source_thread_id: &ThreadId::new("thread-panic-tool"),
+                    persist_session_state: None,
+                },
                 &tool_calls,
                 &mut messages,
-                None,
-                None,
-                &ThreadId::new("thread-panic-tool"),
-                None,
                 || true,
             )
             .completed
@@ -3247,23 +3371,25 @@ mod tests {
         let mut messages = Vec::new();
 
         append_session_tool_call_items_batch(
-            &session_store,
-            &event_bus,
-            Some(&tool_registry),
-            None,
-            None,
-            None,
-            None,
-            &session_id,
-            &workspace_id,
-            Some(workspace_root.clone()),
-            magi_core::AccessProfile::FullAccess,
+            SessionToolCallBatchTestContext {
+                session_store: &session_store,
+                event_bus: &event_bus,
+                tool_registry: Some(&tool_registry),
+                skill_runtime: None,
+                skill_dispatch_runtime: None,
+                skill_name: None,
+                safety_gate: None,
+                session_id: &session_id,
+                workspace_id: &workspace_id,
+                workspace_root_path: Some(workspace_root.clone()),
+                access_profile: magi_core::AccessProfile::FullAccess,
+                snapshot_session: Some(snapshot.clone()),
+                execution_group_id: Some("session-turn-group".to_string()),
+                source_thread_id: &ThreadId::new("thread-session-snapshot"),
+                persist_session_state: None,
+            },
             &tool_calls,
             &mut messages,
-            Some(snapshot.clone()),
-            Some("session-turn-group".to_string()),
-            &ThreadId::new("thread-session-snapshot"),
-            None,
             || true,
         );
 

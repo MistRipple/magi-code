@@ -1305,15 +1305,15 @@ fn spawn_managed_process_reader<T: Read + Send + 'static>(
 }
 
 fn process_belongs_to_context(process: &ManagedProcess, context: &ToolExecutionContext) -> bool {
-    if let Some(session_id) = process.session_id.as_deref() {
-        if context.session_id.as_ref().map(|id| id.as_str()) != Some(session_id) {
-            return false;
-        }
+    if let Some(session_id) = process.session_id.as_deref()
+        && context.session_id.as_ref().map(|id| id.as_str()) != Some(session_id)
+    {
+        return false;
     }
-    if let Some(workspace_id) = process.workspace_id.as_deref() {
-        if context.workspace_id.as_ref().map(|id| id.as_str()) != Some(workspace_id) {
-            return false;
-        }
+    if let Some(workspace_id) = process.workspace_id.as_deref()
+        && context.workspace_id.as_ref().map(|id| id.as_str()) != Some(workspace_id)
+    {
+        return false;
     }
     process.session_id.is_some() || process.workspace_id.is_some()
 }
@@ -1399,10 +1399,10 @@ fn execute_process_inspect(input: &str) -> String {
     let query_lower = query.as_ref().map(|value| value.to_lowercase());
 
     for line in raw_output.lines() {
-        if let Some(query_lower) = &query_lower {
-            if !line.to_lowercase().contains(query_lower) {
-                continue;
-            }
+        if let Some(query_lower) = &query_lower
+            && !line.to_lowercase().contains(query_lower)
+        {
+            continue;
         }
 
         if let Some(record) = parse_ps_line(line) {
@@ -1731,10 +1731,10 @@ fn read_diff_source(
     path: Option<String>,
     inline: Option<String>,
 ) -> Result<String, DiffSourceReadError> {
-    if let Some(inline) = inline {
-        if !inline.is_empty() {
-            return Ok(inline);
-        }
+    if let Some(inline) = inline
+        && !inline.is_empty()
+    {
+        return Ok(inline);
     }
     if let Some(path) = path {
         let resolved = resolve_path(&path).map_err(DiffSourceReadError::Resolve)?;
@@ -1887,20 +1887,18 @@ fn execute_file_write(input: &str, context: &ToolExecutionContext) -> String {
         return builtin_error("file_write", PATH_ALREADY_EXISTS_PUBLIC_ERROR);
     }
 
-    if create_dirs {
-        if let Some(parent) = path.parent() {
-            if !parent.exists() {
-                if let Err(e) = fs::create_dir_all(parent) {
-                    return builtin_filesystem_error(
-                        "file_write",
-                        DIRECTORY_CREATE_PUBLIC_ERROR,
-                        "创建文件父目录失败",
-                        parent,
-                        e,
-                    );
-                }
-            }
-        }
+    if create_dirs
+        && let Some(parent) = path.parent()
+        && !parent.exists()
+        && let Err(e) = fs::create_dir_all(parent)
+    {
+        return builtin_filesystem_error(
+            "file_write",
+            DIRECTORY_CREATE_PUBLIC_ERROR,
+            "创建文件父目录失败",
+            parent,
+            e,
+        );
     }
 
     let bytes = content.len();
@@ -2295,18 +2293,17 @@ fn execute_file_copy(input: &str, context: &ToolExecutionContext) -> String {
         return builtin_error("file_copy", PATH_ALREADY_EXISTS_PUBLIC_ERROR);
     }
 
-    if let Some(parent) = dst.parent() {
-        if !parent.exists() {
-            if let Err(e) = fs::create_dir_all(parent) {
-                return builtin_filesystem_error(
-                    "file_copy",
-                    DIRECTORY_CREATE_PUBLIC_ERROR,
-                    "创建复制目标父目录失败",
-                    parent,
-                    e,
-                );
-            }
-        }
+    if let Some(parent) = dst.parent()
+        && !parent.exists()
+        && let Err(e) = fs::create_dir_all(parent)
+    {
+        return builtin_filesystem_error(
+            "file_copy",
+            DIRECTORY_CREATE_PUBLIC_ERROR,
+            "创建复制目标父目录失败",
+            parent,
+            e,
+        );
     }
 
     if src.is_dir() {
@@ -2319,16 +2316,14 @@ fn execute_file_copy(input: &str, context: &ToolExecutionContext) -> String {
                 e,
             );
         }
-    } else {
-        if let Err(e) = fs::copy(&src, &dst) {
-            return builtin_filesystem_error(
-                "file_copy",
-                FILE_COPY_PUBLIC_ERROR,
-                "复制文件失败",
-                &src,
-                e,
-            );
-        }
+    } else if let Err(e) = fs::copy(&src, &dst) {
+        return builtin_filesystem_error(
+            "file_copy",
+            FILE_COPY_PUBLIC_ERROR,
+            "复制文件失败",
+            &src,
+            e,
+        );
     }
 
     serde_json::json!({
@@ -2413,18 +2408,17 @@ fn execute_file_move(input: &str, context: &ToolExecutionContext) -> String {
         return builtin_error("file_move", PATH_ALREADY_EXISTS_PUBLIC_ERROR);
     }
 
-    if let Some(parent) = dst.parent() {
-        if !parent.exists() {
-            if let Err(e) = fs::create_dir_all(parent) {
-                return builtin_filesystem_error(
-                    "file_move",
-                    DIRECTORY_CREATE_PUBLIC_ERROR,
-                    "创建移动目标父目录失败",
-                    parent,
-                    e,
-                );
-            }
-        }
+    if let Some(parent) = dst.parent()
+        && !parent.exists()
+        && let Err(e) = fs::create_dir_all(parent)
+    {
+        return builtin_filesystem_error(
+            "file_move",
+            DIRECTORY_CREATE_PUBLIC_ERROR,
+            "创建移动目标父目录失败",
+            parent,
+            e,
+        );
     }
 
     if dst.exists() && overwrite {
@@ -2435,7 +2429,7 @@ fn execute_file_move(input: &str, context: &ToolExecutionContext) -> String {
         };
     }
 
-    if let Err(_) = fs::rename(&src, &dst) {
+    if fs::rename(&src, &dst).is_err() {
         if src.is_dir() {
             if let Err(e) = copy_dir_recursive(&src, &dst) {
                 return builtin_filesystem_error(
@@ -2594,13 +2588,13 @@ fn parse_duckduckgo_results(html: &str) -> Vec<Value> {
 }
 
 fn decode_duckduckgo_url(raw: &str) -> String {
-    if raw.contains("duckduckgo.com/l/?") {
-        if let Some(pos) = raw.find("uddg=") {
-            let after = &raw[pos + 5..];
-            let end = after.find('&').unwrap_or(after.len());
-            if let Ok(decoded) = urlencoding::decode(&after[..end]) {
-                return decoded.to_string();
-            }
+    if raw.contains("duckduckgo.com/l/?")
+        && let Some(pos) = raw.find("uddg=")
+    {
+        let after = &raw[pos + 5..];
+        let end = after.find('&').unwrap_or(after.len());
+        if let Ok(decoded) = urlencoding::decode(&after[..end]) {
+            return decoded.to_string();
         }
     }
     if raw.starts_with("//") {
@@ -3307,8 +3301,7 @@ fn parse_knowledge_kind(
     let normalized = raw_kind
         .trim()
         .to_ascii_lowercase()
-        .replace('-', "_")
-        .replace(' ', "_");
+        .replace(['-', ' '], "_");
     match normalized.as_str() {
         "" | "all" => Ok(None),
         "adr" | "architecture_decision" | "architecture_decision_record" => {

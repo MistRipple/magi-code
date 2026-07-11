@@ -167,10 +167,10 @@ impl QueryExpander {
                 timestamp: now_millis(),
             },
         );
-        if self.llm_cache.len() > LLM_CACHE_MAX {
-            if let Some(oldest_key) = self.llm_cache.keys().next().cloned() {
-                self.llm_cache.remove(&oldest_key);
-            }
+        if self.llm_cache.len() > LLM_CACHE_MAX
+            && let Some(oldest_key) = self.llm_cache.keys().next().cloned()
+        {
+            self.llm_cache.remove(&oldest_key);
         }
     }
 
@@ -231,20 +231,20 @@ impl QueryExpander {
             }
         }
 
-        if let Some(ref vocab) = self.project_vocabulary {
-            if !vocab.is_empty() {
-                for token in tokens {
-                    let token_lower = token.to_lowercase();
-                    if token_lower.len() < 3 {
-                        continue;
-                    }
-                    for word in vocab {
-                        if word != &token_lower
-                            && word.contains(&token_lower)
-                            && word.len() <= token_lower.len() + 15
-                        {
-                            result.insert(word.clone());
-                        }
+        if let Some(ref vocab) = self.project_vocabulary
+            && !vocab.is_empty()
+        {
+            for token in tokens {
+                let token_lower = token.to_lowercase();
+                if token_lower.len() < 3 {
+                    continue;
+                }
+                for word in vocab {
+                    if word != &token_lower
+                        && word.contains(&token_lower)
+                        && word.len() <= token_lower.len() + 15
+                    {
+                        result.insert(word.clone());
                     }
                 }
             }
@@ -260,20 +260,22 @@ impl QueryExpander {
 
         if let Some(identifiers) = parsed.get("identifiers").and_then(|v| v.as_array()) {
             for id in identifiers {
-                if let Some(s) = id.as_str() {
-                    if s.len() >= 2 && s.len() <= 60 {
-                        tokens.push(s.to_lowercase());
-                    }
+                if let Some(s) = id.as_str()
+                    && s.len() >= 2
+                    && s.len() <= 60
+                {
+                    tokens.push(s.to_lowercase());
                 }
             }
         }
 
         if let Some(patterns) = parsed.get("filePatterns").and_then(|v| v.as_array()) {
             for fp in patterns {
-                if let Some(s) = fp.as_str() {
-                    if s.len() >= 2 && s.len() <= 40 {
-                        tokens.push(s.to_lowercase());
-                    }
+                if let Some(s) = fp.as_str()
+                    && s.len() >= 2
+                    && s.len() <= 40
+                {
+                    tokens.push(s.to_lowercase());
                 }
             }
         }

@@ -60,6 +60,53 @@ pub struct ExecutionPipeline {
     pub memory_store: MemoryStore,
 }
 
+struct TaskDispatchedEventInput<'a> {
+    task_id: &'a TaskId,
+    mission_id: &'a magi_core::MissionId,
+    worker: &'a WorkerInfo,
+    lease_id: &'a LeaseId,
+    kind: magi_core::TaskKind,
+    session_id: Option<&'a SessionId>,
+    workspace_id: Option<&'a WorkspaceId>,
+}
+
+struct DispatchPlanExecutionInput<'a> {
+    task: &'a magi_core::Task,
+    lease_id: &'a LeaseId,
+    session_id: SessionId,
+    workspace_id: Option<WorkspaceId>,
+    ownership: ExecutionOwnership,
+    writebacks: ExecutionWritebackPlans,
+    use_tools: bool,
+    skill_name: Option<String>,
+    images: Vec<SessionTurnImage>,
+    usage_binding: ModelUsageBinding,
+    is_sidechain: bool,
+    worker_id: WorkerId,
+    worker_role: String,
+    thread_id: magi_core::ThreadId,
+    system_prompt: Option<String>,
+    execution_settings_snapshot: Option<Arc<SettingsStore>>,
+}
+
+struct TaskLlmInvocationInput<'a> {
+    task: &'a magi_core::Task,
+    lease_id: &'a LeaseId,
+    session_id: &'a SessionId,
+    workspace_id: &'a Option<WorkspaceId>,
+    use_tools: bool,
+    skill_name: Option<String>,
+    images: Vec<SessionTurnImage>,
+    usage_binding: &'a ModelUsageBinding,
+    streaming_entry_id: Option<&'a str>,
+    is_sidechain: bool,
+    worker_id: Option<&'a WorkerId>,
+    execution_role_id: Option<&'a str>,
+    thread_id: &'a magi_core::ThreadId,
+    system_prompt: Option<String>,
+    execution_settings_snapshot: Option<Arc<SettingsStore>>,
+}
+
 #[derive(Clone)]
 pub struct LlmTaskDispatcher {
     event_bus: Arc<InMemoryEventBus>,
@@ -97,6 +144,17 @@ pub struct LlmTaskDispatcher {
     /// store，conversation_loop 中每轮 LLM 调用后调用一次 `record_mission_turn`
     /// 累加 token / 时间。daemon bootstrap 未注入时为 `None`，行为退回到不记账。
     mission_metrics_registry: Arc<MissionMetricsRegistry>,
+}
+
+struct ExecutionPlanCleanup<'a> {
+    registry: &'a TaskExecutionRegistry,
+    task_id: &'a TaskId,
+}
+
+impl Drop for ExecutionPlanCleanup<'_> {
+    fn drop(&mut self) {
+        let _ = self.registry.remove(self.task_id);
+    }
 }
 
 /// 业务派发模型客户端解析的角色目标。
@@ -225,7 +283,6 @@ impl LlmTaskDispatcher {
         spawn_graph: Arc<std::sync::Mutex<magi_spawn_graph::SpawnGraph>>,
         mission_state_root: PathBuf,
     ) -> Self {
-        let mission_state_root = mission_state_root;
         Self {
             event_bus,
             pipeline,
@@ -374,16 +431,16 @@ impl LlmTaskDispatcher {
         self.project_memory_registry.clone()
     }
 
-    fn publish_task_dispatched_event(
-        &self,
-        task_id: &TaskId,
-        mission_id: &magi_core::MissionId,
-        worker: &WorkerInfo,
-        lease_id: &LeaseId,
-        kind: magi_core::TaskKind,
-        session_id: Option<&SessionId>,
-        workspace_id: Option<&WorkspaceId>,
-    ) {
+    fn publish_task_dispatched_event(&self, input: TaskDispatchedEventInput<'_>) {
+        let TaskDispatchedEventInput {
+            task_id,
+            mission_id,
+            worker,
+            lease_id,
+            kind,
+            session_id,
+            workspace_id,
+        } = input;
         let event = EventEnvelope::domain(
             EventId::new(format!("event-task-dispatched-{}", UtcMillis::now().0)),
             "task.dispatched",
@@ -416,45 +473,44 @@ impl LlmTaskDispatcher {
         });
     }
 
-    fn execute_dispatch_plan(
-        &self,
-        task: &magi_core::Task,
-        task_id: &TaskId,
-        lease_id: &LeaseId,
-        session_id: SessionId,
-        workspace_id: Option<WorkspaceId>,
-        ownership: ExecutionOwnership,
-        writebacks: ExecutionWritebackPlans,
-        use_tools: bool,
-        skill_name: Option<String>,
-        images: Vec<SessionTurnImage>,
-        usage_binding: ModelUsageBinding,
-        is_sidechain: bool,
-        worker_id: WorkerId,
-        worker_role: String,
-        thread_id: magi_core::ThreadId,
-        system_prompt: Option<String>,
-        execution_settings_snapshot: Option<Arc<SettingsStore>>,
-    ) {
-        let streaming_entry_id = task_streaming_entry_id(task);
-        let (outcome, context_summary) = self.invoke_llm_with_tools(
+    fn execute_dispatch_plan(&self, input: DispatchPlanExecutionInput<'_>) {
+        let DispatchPlanExecutionInput {
             task,
-            task_id,
             lease_id,
-            &session_id,
-            &workspace_id,
+            session_id,
+            workspace_id,
+            ownership,
+            writebacks,
             use_tools,
             skill_name,
             images,
-            &usage_binding,
-            Some(streaming_entry_id.as_str()),
+            usage_binding,
             is_sidechain,
-            Some(&worker_id),
-            Some(worker_role.as_str()),
-            &thread_id,
+            worker_id,
+            worker_role,
+            thread_id,
             system_prompt,
-            execution_settings_snapshot.clone(),
-        );
+            execution_settings_snapshot,
+        } = input;
+        let task_id = &task.task_id;
+        let streaming_entry_id = task_streaming_entry_id(task);
+        let (outcome, context_summary) = self.invoke_llm_with_tools(TaskLlmInvocationInput {
+            task,
+            lease_id,
+            session_id: &session_id,
+            workspace_id: &workspace_id,
+            use_tools,
+            skill_name,
+            images,
+            usage_binding: &usage_binding,
+            streaming_entry_id: Some(streaming_entry_id.as_str()),
+            is_sidechain,
+            worker_id: Some(&worker_id),
+            execution_role_id: Some(worker_role.as_str()),
+            thread_id: &thread_id,
+            system_prompt,
+            execution_settings_snapshot: execution_settings_snapshot.clone(),
+        });
         if matches!(&outcome, TaskOutcome::Completed { .. }) {
             self.session_store
                 .bind_execution_ownership(session_id.clone(), ownership);
@@ -550,14 +606,15 @@ impl LlmTaskDispatcher {
                         .context
                         .unwrap_or_else(|| format!("session:{}", session_id.as_str())),
                 ),
+                created_at: now,
                 updated_at: now,
             });
             inserted += 1;
         }
-        if inserted > 0 {
-            if let Some(callback) = self.knowledge_persist_callback.as_ref() {
-                callback();
-            }
+        if inserted > 0
+            && let Some(callback) = self.knowledge_persist_callback.as_ref()
+        {
+            callback();
         }
     }
 
@@ -596,7 +653,7 @@ impl LlmTaskDispatcher {
                     .is_some_and(|s| s.starts_with(SESSION_MEMORY_SOURCE_PREFIX))
             })
             .map(|record| record.created_at)
-            .last();
+            .next_back();
 
         let excerpt_entries: Vec<_> = timeline
             .iter()
@@ -736,7 +793,7 @@ impl LlmTaskDispatcher {
         let mut definitions = public_builtin_tool_definitions(&registry)
             .into_iter()
             .filter(|definition| {
-                BuiltinToolName::from_str(definition.function.name.as_str()).is_some_and(|tool| {
+                BuiltinToolName::from_name(definition.function.name.as_str()).is_some_and(|tool| {
                     task_can_see_builtin_tool(task, self.agent_role_registry.as_deref(), tool)
                         && (task.is_some() || session_turn_can_execute_builtin_tool(tool))
                         && builtin_tool_visible_in_access_profile(tool, tool_surface_access_profile)
@@ -798,7 +855,7 @@ impl LlmTaskDispatcher {
             for definition in public_builtin_tool_definitions(registry)
                 .into_iter()
                 .filter(|definition| {
-                    BuiltinToolName::from_str(definition.function.name.as_str()).is_some_and(
+                    BuiltinToolName::from_name(definition.function.name.as_str()).is_some_and(
                         |tool| {
                             is_session_goal_tool(tool)
                                 && builtin_tool_visible_in_access_profile(tool, access_profile)
@@ -1176,15 +1233,15 @@ impl LlmTaskDispatcher {
         //   - 角色未配置 engineId → Ok(None) → 显式继承 orchestrator
         //   - 角色已配置 engineId → 只使用该角色模型，失败直接暴露
         // 无 role_id（顶层会话调用）或角色未配置 → 直接走 orchestrator。
-        if let Some(role_id) = role_id {
-            if let Some(client) = resolve_target_for_role(
+        if let Some(role_id) = role_id
+            && let Some(client) = resolve_target_for_role(
                 settings_store,
                 self.model_bridge_client.clone(),
                 RoleTarget::Agent { role_id },
                 session_id,
-            )? {
-                return Ok(client);
-            }
+            )?
+        {
+            return Ok(client);
         }
 
         resolve_target_for_role(
@@ -1285,28 +1342,30 @@ impl LlmTaskDispatcher {
             tools,
             persist_session_state: self.session_state_persist_callback.as_deref(),
         })
-        .map_err(|msg| msg)
     }
 
     fn invoke_llm_with_tools(
         &self,
-        task: &magi_core::Task,
-        task_id: &TaskId,
-        lease_id: &LeaseId,
-        session_id: &SessionId,
-        workspace_id: &Option<WorkspaceId>,
-        use_tools: bool,
-        skill_name: Option<String>,
-        images: Vec<SessionTurnImage>,
-        usage_binding: &ModelUsageBinding,
-        streaming_entry_id: Option<&str>,
-        is_sidechain: bool,
-        worker_id: Option<&WorkerId>,
-        execution_role_id: Option<&str>,
-        thread_id: &magi_core::ThreadId,
-        system_prompt: Option<String>,
-        execution_settings_snapshot: Option<Arc<SettingsStore>>,
+        input: TaskLlmInvocationInput<'_>,
     ) -> (TaskOutcome, Option<ExecutionContextSummary>) {
+        let TaskLlmInvocationInput {
+            task,
+            lease_id,
+            session_id,
+            workspace_id,
+            use_tools,
+            skill_name,
+            images,
+            usage_binding,
+            streaming_entry_id,
+            is_sidechain,
+            worker_id,
+            execution_role_id,
+            thread_id,
+            system_prompt,
+            execution_settings_snapshot,
+        } = input;
+        let task_id = &task.task_id;
         let execution_settings =
             self.execution_settings_or_live(execution_settings_snapshot.as_ref());
         let role_for_model = if is_sidechain {
@@ -1464,6 +1523,10 @@ impl LlmTaskDispatcher {
             );
             return Ok(());
         };
+        let _plan_cleanup = ExecutionPlanCleanup {
+            registry: &self.execution_registry,
+            task_id: &task.task_id,
+        };
 
         match plan {
             TaskExecutionPlan::Dispatch {
@@ -1480,19 +1543,18 @@ impl LlmTaskDispatcher {
                 images,
                 execution_settings_snapshot,
             } => {
-                self.publish_task_dispatched_event(
-                    &task.task_id,
-                    &task.mission_id,
+                self.publish_task_dispatched_event(TaskDispatchedEventInput {
+                    task_id: &task.task_id,
+                    mission_id: &task.mission_id,
                     worker,
-                    &lease.lease_id,
-                    task.kind,
-                    Some(&session_id),
-                    workspace_id.as_ref(),
-                );
-                self.execute_dispatch_plan(
+                    lease_id: &lease.lease_id,
+                    kind: task.kind,
+                    session_id: Some(&session_id),
+                    workspace_id: workspace_id.as_ref(),
+                });
+                self.execute_dispatch_plan(DispatchPlanExecutionInput {
                     task,
-                    &task.task_id,
-                    &lease.lease_id,
+                    lease_id: &lease.lease_id,
                     session_id,
                     workspace_id,
                     ownership,
@@ -1500,18 +1562,18 @@ impl LlmTaskDispatcher {
                     use_tools,
                     skill_name,
                     images,
-                    model_usage_binding_for_worker_with_settings(
+                    usage_binding: model_usage_binding_for_worker_with_settings(
                         worker,
                         is_primary,
                         self.execution_settings_or_live(execution_settings_snapshot.as_ref()),
                     ),
-                    !is_primary,
+                    is_sidechain: !is_primary,
                     worker_id,
-                    worker.role.clone(),
+                    worker_role: worker.role.clone(),
                     thread_id,
-                    worker.system_prompt_template.clone(),
+                    system_prompt: worker.system_prompt_template.clone(),
                     execution_settings_snapshot,
-                );
+                });
             }
         }
 
@@ -1792,6 +1854,44 @@ fn title_from_learning_content(content: &str) -> String {
     title
 }
 
+impl TaskDispatcher for LlmTaskDispatcher {
+    fn dispatch(
+        &self,
+        task: &magi_core::Task,
+        worker: &WorkerInfo,
+        lease: &magi_orchestrator::task_store::TaskLease,
+    ) -> Result<(), String> {
+        let dispatcher = self.clone();
+        let task = task.clone();
+        let worker = worker.clone();
+        let lease = lease.clone();
+
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let join = handle.spawn_blocking(move || {
+                if let Err(err) = dispatcher.dispatch_inner(&task, &worker, &lease) {
+                    tracing::error!("dispatch_inner failed: {}", err);
+                    dispatcher.push_result(
+                        &task.task_id,
+                        &lease.lease_id,
+                        TaskOutcome::Failed {
+                            error: format!("dispatch failed: {}", err),
+                        },
+                    );
+                }
+            });
+            handle.spawn(async move {
+                if let Err(err) = join.await {
+                    tracing::error!("dispatch spawn_blocking panicked: {:?}", err);
+                }
+            });
+            Ok(())
+        } else {
+            // 不在 tokio 运行时中（例如同步测试环境），直接同步执行。
+            self.dispatch_inner(&task, &worker, &lease)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1986,6 +2086,7 @@ mod tests {
             tags: vec!["leak-check".to_string()],
             workspace_id: Some(WorkspaceId::new("default")),
             source_ref: Some("memory/default.md".to_string()),
+            created_at: UtcMillis(1),
             updated_at: UtcMillis(1),
         });
         let dispatcher = dispatcher_with_default_tool_surface()
@@ -3024,43 +3125,5 @@ mod tests {
             live_client.is_none(),
             "实时 settings 已删除 orchestrator，不应影响既有执行快照"
         );
-    }
-}
-
-impl TaskDispatcher for LlmTaskDispatcher {
-    fn dispatch(
-        &self,
-        task: &magi_core::Task,
-        worker: &WorkerInfo,
-        lease: &magi_orchestrator::task_store::TaskLease,
-    ) -> Result<(), String> {
-        let dispatcher = self.clone();
-        let task = task.clone();
-        let worker = worker.clone();
-        let lease = lease.clone();
-
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            let join = handle.spawn_blocking(move || {
-                if let Err(err) = dispatcher.dispatch_inner(&task, &worker, &lease) {
-                    tracing::error!("dispatch_inner failed: {}", err);
-                    dispatcher.push_result(
-                        &task.task_id,
-                        &lease.lease_id,
-                        TaskOutcome::Failed {
-                            error: format!("dispatch failed: {}", err),
-                        },
-                    );
-                }
-            });
-            handle.spawn(async move {
-                if let Err(err) = join.await {
-                    tracing::error!("dispatch spawn_blocking panicked: {:?}", err);
-                }
-            });
-            Ok(())
-        } else {
-            // 不在 tokio 运行时中（例如同步测试环境），直接同步执行。
-            self.dispatch_inner(&task, &worker, &lease)
-        }
     }
 }

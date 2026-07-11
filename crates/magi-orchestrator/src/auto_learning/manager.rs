@@ -44,6 +44,15 @@ pub struct AutoLearningRawMemory {
     pub citations: Vec<String>,
 }
 
+pub struct AutoLearningCaptureContent<'a> {
+    pub user_messages: &'a [&'a str],
+    pub assistant_messages: &'a [&'a str],
+    pub summary: &'a str,
+    pub decisions: Vec<String>,
+    pub learnings: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
 pub struct AutoLearningManager {
     preference_miner: PreferenceMiner,
     consolidation_service: MemoryConsolidationService,
@@ -62,13 +71,16 @@ impl AutoLearningManager {
     pub fn capture(
         &mut self,
         input: &AutoLearningCaptureInput,
-        user_messages: &[&str],
-        assistant_messages: &[&str],
-        summary: &str,
-        decisions: Vec<String>,
-        learnings: Vec<String>,
-        warnings: Vec<String>,
+        content: AutoLearningCaptureContent<'_>,
     ) -> AutoLearningRawMemory {
+        let AutoLearningCaptureContent {
+            user_messages,
+            assistant_messages,
+            summary,
+            decisions,
+            learnings,
+            warnings,
+        } = content;
         let now = now_millis();
         let source_key = format!(
             "session:{}:turn:{}",

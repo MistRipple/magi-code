@@ -228,13 +228,12 @@ impl SymbolIndex {
                 }
             }
 
-            if best_match_type.is_none() {
-                if let Some(ref oql) = original_query_lower {
-                    if fuzzy_match(oql, &name_lower) {
-                        best_match_type = Some(MatchType::Fuzzy);
-                        best_score = 0.3;
-                    }
-                }
+            if best_match_type.is_none()
+                && let Some(ref oql) = original_query_lower
+                && fuzzy_match(oql, &name_lower)
+            {
+                best_match_type = Some(MatchType::Fuzzy);
+                best_score = 0.3;
             }
 
             if let Some(match_type) = best_match_type {
@@ -419,24 +418,23 @@ impl SymbolIndex {
 
         // 优先用 tree-sitter（AST 级）提取；支持的语言走语法树，
         // 不支持的语言回落到下方逐行正则提取（单一职责，按语言路由不双轨）。
-        if crate::ts_symbol_extract::tree_sitter_supports(ext) {
-            if let Some(entries) =
+        if crate::ts_symbol_extract::tree_sitter_supports(ext)
+            && let Some(entries) =
                 crate::ts_symbol_extract::extract_symbols(file_path, content, ext)
-            {
-                let mut symbol_names = Vec::with_capacity(entries.len());
-                for entry in entries {
-                    symbol_names.push(entry.name.clone());
-                    self.symbols
-                        .entry(entry.name.clone())
-                        .or_default()
-                        .push(entry);
-                }
-                if !symbol_names.is_empty() {
-                    self.file_symbols
-                        .insert(file_path.to_string(), symbol_names);
-                }
-                return;
+        {
+            let mut symbol_names = Vec::with_capacity(entries.len());
+            for entry in entries {
+                symbol_names.push(entry.name.clone());
+                self.symbols
+                    .entry(entry.name.clone())
+                    .or_default()
+                    .push(entry);
             }
+            if !symbol_names.is_empty() {
+                self.file_symbols
+                    .insert(file_path.to_string(), symbol_names);
+            }
+            return;
         }
 
         let Some(patterns) = self.lang_patterns.get(ext) else {
@@ -491,29 +489,28 @@ impl SymbolIndex {
             }
 
             // re-export (TS/JS)
-            if is_ts {
-                if let Some(caps) = self.reexport_pattern.captures(line) {
-                    if let Some(exported_names_str) = caps.get(1) {
-                        for name_part in exported_names_str.as_str().split(',') {
-                            let name = name_part.trim().split(" as ").last().unwrap_or("").trim();
-                            if name.len() >= 2 {
-                                let entry = SymbolEntry {
-                                    name: name.to_string(),
-                                    kind: SymbolKind::Variable,
-                                    file_path: file_path.to_string(),
-                                    line: line_idx,
-                                    end_line: Some(line_idx),
-                                    is_exported: true,
-                                    container: None,
-                                    signature: None,
-                                };
-                                self.symbols
-                                    .entry(name.to_string())
-                                    .or_default()
-                                    .push(entry);
-                                symbol_names.push(name.to_string());
-                            }
-                        }
+            if is_ts
+                && let Some(caps) = self.reexport_pattern.captures(line)
+                && let Some(exported_names_str) = caps.get(1)
+            {
+                for name_part in exported_names_str.as_str().split(',') {
+                    let name = name_part.trim().split(" as ").last().unwrap_or("").trim();
+                    if name.len() >= 2 {
+                        let entry = SymbolEntry {
+                            name: name.to_string(),
+                            kind: SymbolKind::Variable,
+                            file_path: file_path.to_string(),
+                            line: line_idx,
+                            end_line: Some(line_idx),
+                            is_exported: true,
+                            container: None,
+                            signature: None,
+                        };
+                        self.symbols
+                            .entry(name.to_string())
+                            .or_default()
+                            .push(entry);
+                        symbol_names.push(name.to_string());
                     }
                 }
             }
@@ -527,13 +524,12 @@ impl SymbolIndex {
 
             if has_class_scope {
                 for sp in patterns.iter() {
-                    if sp.kind == SymbolKind::Class {
-                        if let Some(caps) = sp.pattern.captures(line) {
-                            if let Some(m) = caps.get(sp.name_group) {
-                                let class_name = m.as_str().to_string();
-                                class_stack.push((class_name, brace_depth));
-                            }
-                        }
+                    if sp.kind == SymbolKind::Class
+                        && let Some(caps) = sp.pattern.captures(line)
+                        && let Some(m) = caps.get(sp.name_group)
+                    {
+                        let class_name = m.as_str().to_string();
+                        class_stack.push((class_name, brace_depth));
                     }
                 }
             }
@@ -640,58 +636,60 @@ impl SymbolIndex {
             }
 
             // method extraction (TS/JS, Java, C#, C++)
-            if has_class_scope && current_class.is_some() && !trimmed.is_empty() {
+            if let Some(class_name) = current_class.as_ref()
+                && has_class_scope
+                && !trimmed.is_empty()
+            {
                 let method_pat = if is_java || is_csharp {
                     &self.java_method_pattern
                 } else {
                     &self.method_pattern
                 };
-                if let Some(caps) = method_pat.captures(line) {
-                    if let Some(m) = caps.get(1) {
-                        let method_name = m.as_str();
-                        let class_name = current_class.as_ref().unwrap();
-                        if method_name.len() >= 2
-                            && method_name != "constructor"
-                            && !((is_java || is_csharp) && method_name == class_name.as_str())
-                        {
-                            let has_method_block = open_braces > 0;
-                            let is_method_exported = if is_java || is_csharp {
-                                trimmed.starts_with("public ")
-                            } else {
-                                false
-                            };
+                if let Some(caps) = method_pat.captures(line)
+                    && let Some(m) = caps.get(1)
+                {
+                    let method_name = m.as_str();
+                    if method_name.len() >= 2
+                        && method_name != "constructor"
+                        && !((is_java || is_csharp) && method_name == class_name.as_str())
+                    {
+                        let has_method_block = open_braces > 0;
+                        let is_method_exported = if is_java || is_csharp {
+                            trimmed.starts_with("public ")
+                        } else {
+                            false
+                        };
 
-                            let entry = SymbolEntry {
-                                name: method_name.to_string(),
-                                kind: SymbolKind::Method,
-                                file_path: file_path.to_string(),
-                                line: line_idx,
-                                end_line: None,
-                                is_exported: is_method_exported,
-                                container: Some(class_name.clone()),
-                                signature: None,
-                            };
+                        let entry = SymbolEntry {
+                            name: method_name.to_string(),
+                            kind: SymbolKind::Method,
+                            file_path: file_path.to_string(),
+                            line: line_idx,
+                            end_line: None,
+                            is_exported: is_method_exported,
+                            container: Some(class_name.clone()),
+                            signature: None,
+                        };
 
-                            self.symbols
-                                .entry(method_name.to_string())
-                                .or_default()
-                                .push(entry.clone());
-                            symbol_names.push(method_name.to_string());
+                        self.symbols
+                            .entry(method_name.to_string())
+                            .or_default()
+                            .push(entry.clone());
+                        symbol_names.push(method_name.to_string());
 
-                            if has_method_block {
-                                pending_blocks.push((entry, prev_brace_depth));
-                            } else {
-                                if let Some((ref old_entry, _)) = pending_declaration {
-                                    update_end_line(
-                                        &mut self.symbols,
-                                        &old_entry.name,
-                                        &old_entry.file_path,
-                                        old_entry.line,
-                                        Some(old_entry.line),
-                                    );
-                                }
-                                pending_declaration = Some((entry, line_idx + 10));
+                        if has_method_block {
+                            pending_blocks.push((entry, prev_brace_depth));
+                        } else {
+                            if let Some((ref old_entry, _)) = pending_declaration {
+                                update_end_line(
+                                    &mut self.symbols,
+                                    &old_entry.name,
+                                    &old_entry.file_path,
+                                    old_entry.line,
+                                    Some(old_entry.line),
+                                );
                             }
+                            pending_declaration = Some((entry, line_idx + 10));
                         }
                     }
                 }
@@ -825,8 +823,7 @@ fn update_end_line(
 fn build_lang_patterns() -> HashMap<&'static str, Vec<SymbolPattern>> {
     let mut map = HashMap::new();
 
-    let ts_patterns = vec![
-        SymbolPattern {
+    let ts_patterns = [SymbolPattern {
             kind: SymbolKind::Function,
             pattern: Regex::new(r"^(export\s+)?(?:async\s+)?function\s+([a-zA-Z_$][a-zA-Z0-9_$]*)").unwrap(),
             name_group: 2,
@@ -867,8 +864,7 @@ fn build_lang_patterns() -> HashMap<&'static str, Vec<SymbolPattern>> {
             pattern: Regex::new(r"^(export\s+)(?:const|let|var)\s+([A-Z][a-zA-Z0-9_$]*)").unwrap(),
             name_group: 2,
             export_group: Some(1),
-        },
-    ];
+        }];
     for ext in [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"] {
         map.insert(ext, Vec::new());
     }
@@ -986,8 +982,7 @@ fn build_lang_patterns() -> HashMap<&'static str, Vec<SymbolPattern>> {
     ];
     map.insert(".rs", rust_patterns);
 
-    let c_patterns = vec![
-        SymbolPattern {
+    let c_patterns = [SymbolPattern {
             kind: SymbolKind::Function,
             pattern: Regex::new(r"^(?:static\s+|inline\s+|extern\s+|virtual\s+)*(?:const\s+)?[A-Za-z_][A-Za-z0-9_*&\s:<>,]*\s+\*?([A-Za-z_][A-Za-z0-9_]*)\s*\(").unwrap(),
             name_group: 1,
@@ -1022,8 +1017,7 @@ fn build_lang_patterns() -> HashMap<&'static str, Vec<SymbolPattern>> {
             pattern: Regex::new(r"^enum\s+(?:class\s+)?([A-Za-z_][A-Za-z0-9_]*)").unwrap(),
             name_group: 1,
             export_group: None,
-        },
-    ];
+        }];
     for ext in [".c", ".h", ".cpp", ".cc", ".cxx", ".hpp", ".hh"] {
         map.insert(
             ext,
@@ -1156,8 +1150,7 @@ fn build_lang_patterns() -> HashMap<&'static str, Vec<SymbolPattern>> {
         },
     ]);
 
-    let kotlin_patterns = vec![
-        SymbolPattern {
+    let kotlin_patterns = [SymbolPattern {
             kind: SymbolKind::Function,
             pattern: Regex::new(r"^(?:public\s+|private\s+|protected\s+|internal\s+)?(?:suspend\s+|inline\s+|override\s+)*fun\s+(?:<[^>]+>\s+)?([a-zA-Z_][a-zA-Z0-9_]*)").unwrap(),
             name_group: 1,
@@ -1186,8 +1179,7 @@ fn build_lang_patterns() -> HashMap<&'static str, Vec<SymbolPattern>> {
             pattern: Regex::new(r"^(?:public\s+|private\s+|protected\s+|internal\s+)?enum\s+class\s+([A-Za-z_][A-Za-z0-9_]*)").unwrap(),
             name_group: 1,
             export_group: None,
-        },
-    ];
+        }];
     for ext in [".kt", ".kts"] {
         map.insert(
             ext,
@@ -1203,8 +1195,7 @@ fn build_lang_patterns() -> HashMap<&'static str, Vec<SymbolPattern>> {
         );
     }
 
-    let objc_patterns = vec![
-        SymbolPattern {
+    let objc_patterns = [SymbolPattern {
             kind: SymbolKind::Class,
             pattern: Regex::new(r"^@interface\s+([A-Za-z_][A-Za-z0-9_]*)").unwrap(),
             name_group: 1,
@@ -1233,8 +1224,7 @@ fn build_lang_patterns() -> HashMap<&'static str, Vec<SymbolPattern>> {
             pattern: Regex::new(r"^(?:static\s+|inline\s+|extern\s+)*[A-Za-z_][A-Za-z0-9_*\s]+\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(").unwrap(),
             name_group: 1,
             export_group: None,
-        },
-    ];
+        }];
     for ext in [".m", ".mm"] {
         map.insert(
             ext,

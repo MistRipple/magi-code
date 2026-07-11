@@ -109,15 +109,15 @@ pub fn rebuild_session_snapshot_from_events(
         let normalized = normalize_usage_delta(usage_delta);
         snapshot.totals = apply_delta(&snapshot.totals, &normalized, event.status);
 
-        if let Some(aid) = &event.assignment_id {
-            if seen_assignments.insert(aid.clone()) {
-                snapshot.totals.assignment_count += 1;
-            }
+        if let Some(aid) = &event.assignment_id
+            && seen_assignments.insert(aid.clone())
+        {
+            snapshot.totals.assignment_count += 1;
         }
-        if let Some(tid) = &event.turn_id {
-            if seen_turns.insert(tid.clone()) {
-                snapshot.totals.turn_count += 1;
-            }
+        if let Some(tid) = &event.turn_id
+            && seen_turns.insert(tid.clone())
+        {
+            snapshot.totals.turn_count += 1;
         }
 
         let binding_existing = snapshot.by_execution_binding.iter().find(|item| {

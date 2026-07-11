@@ -53,6 +53,9 @@ struct HttpModelRequest {
     headers: Vec<(String, String)>,
 }
 
+#[cfg(test)]
+pub type ModelProbeRequest = (String, serde_json::Value, Vec<(String, String)>);
+
 impl HttpModelBridgeClient {
     /// Create from environment variables.
     ///
@@ -181,9 +184,7 @@ impl HttpModelBridgeClient {
     /// 生产连接测试必须走 [`ModelBridgeClient::invoke_streaming`]，保证与真实会话
     /// 的流式协议一致；这里不能再作为设置页可用性探针入口。
     #[cfg(test)]
-    pub fn build_probe_request(
-        &self,
-    ) -> Result<(String, serde_json::Value, Vec<(String, String)>), BridgeClientError> {
+    pub fn build_probe_request(&self) -> Result<ModelProbeRequest, BridgeClientError> {
         let request = ModelInvocationRequest {
             provider: "probe".to_string(),
             prompt: "ping".to_string(),

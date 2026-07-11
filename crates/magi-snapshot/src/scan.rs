@@ -270,10 +270,8 @@ pub fn read_large_text_summary(abs_path: &Path) -> (Option<String>, Option<Strin
     let total = f.metadata().map(|m| m.len()).unwrap_or(0) as i64;
     let tail_off = (total - LARGE_TEXT_SUMMARY_BYTES as i64).max(head_n as i64);
     let mut tail = Vec::new();
-    if tail_off > head_n as i64 {
-        if f.seek(SeekFrom::Start(tail_off as u64)).is_ok() {
-            f.read_to_end(&mut tail).ok();
-        }
+    if tail_off > head_n as i64 && f.seek(SeekFrom::Start(tail_off as u64)).is_ok() {
+        f.read_to_end(&mut tail).ok();
     }
     (
         Some(String::from_utf8_lossy(&head).into_owned()),
@@ -320,10 +318,10 @@ pub fn walk_workspace(
             continue;
         }
         let depth = path.strip_prefix(workspace_root).ok();
-        if let Some(rel) = depth {
-            if has_default_excluded_component(rel) {
-                continue;
-            }
+        if let Some(rel) = depth
+            && has_default_excluded_component(rel)
+        {
+            continue;
         }
         match entry.file_type() {
             Some(ft) if ft.is_file() || ft.is_symlink() => {

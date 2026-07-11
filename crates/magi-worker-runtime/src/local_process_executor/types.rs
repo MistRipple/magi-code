@@ -247,7 +247,7 @@ impl WorkerExecutorFailureLayer {
 pub struct WorkerExecutorFailure {
     pub layer: WorkerExecutorFailureLayer,
     pub message: String,
-    pub detail: Option<WorkerExecutorFailureDetail>,
+    pub detail: Option<Box<WorkerExecutorFailureDetail>>,
 }
 
 impl WorkerExecutorFailure {
@@ -282,7 +282,7 @@ impl WorkerExecutorFailure {
         Self {
             layer: WorkerExecutorFailureLayer::RemoteBusiness,
             message: message.into(),
-            detail: Some(detail),
+            detail: Some(Box::new(detail)),
         }
     }
 
@@ -498,19 +498,19 @@ impl LocalProcessExecutorCapability {
                 self.failure_detail(Some(profile), Vec::new(), Vec::new()),
             ));
         }
-        if let Some(process_model) = profile.requested_process_model {
-            if self.descriptor.process_model != process_model {
-                return Err(WorkerExecutorFailure::remote_business_with_detail(
-                    format!(
-                        "executor {} {} process model mismatch: expected {}, got {}",
-                        self.executor_id,
-                        self.executor_version,
-                        process_model.label(),
-                        self.descriptor.process_model.label()
-                    ),
-                    self.failure_detail(Some(profile), Vec::new(), Vec::new()),
-                ));
-            }
+        if let Some(process_model) = profile.requested_process_model
+            && self.descriptor.process_model != process_model
+        {
+            return Err(WorkerExecutorFailure::remote_business_with_detail(
+                format!(
+                    "executor {} {} process model mismatch: expected {}, got {}",
+                    self.executor_id,
+                    self.executor_version,
+                    process_model.label(),
+                    self.descriptor.process_model.label()
+                ),
+                self.failure_detail(Some(profile), Vec::new(), Vec::new()),
+            ));
         }
         if profile.requested_parallelism > self.descriptor.max_parallelism {
             return Err(WorkerExecutorFailure::remote_business_with_detail(

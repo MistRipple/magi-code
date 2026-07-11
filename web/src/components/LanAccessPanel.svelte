@@ -2,7 +2,8 @@
   import QRCode from 'qrcode';
   import Icon from './Icon.svelte';
   import { i18n } from '../stores/i18n.svelte';
-  import { resolveAgentBaseUrl } from '../web/agent-api';
+  import { agentUrl } from '../web/agent-api';
+  import { getTransport } from '../shared/transport';
 
   interface Props { visible: boolean; onClose: () => void; }
   let { visible, onClose }: Props = $props();
@@ -54,7 +55,7 @@
     loading = true; lanUrl = ''; qrSvg = ''; qrError = '';
     try {
       const query = currentAccessBindingQuery();
-      const res = await fetch(`${resolveAgentBaseUrl()}/api/lan-access${query ? `?${query}` : ''}`);
+      const res = await getTransport().request(agentUrl('/api/lan-access', query));
       const data = await res.json();
       if (data?.url) {
         lanUrl = data.url;
@@ -82,7 +83,7 @@
 
   async function fetchTunnelStatus() {
     try {
-      const res = await fetch(`${resolveAgentBaseUrl()}/api/tunnel/status`);
+      const res = await getTransport().request(agentUrl('/api/tunnel/status'));
       if (!res.ok) {
         console.warn('[LanAccessPanel] tunnel status request failed:', res.status);
         tunnelStatus = 'error';
@@ -114,7 +115,7 @@
             body: JSON.stringify(binding),
           }
         : { method: 'POST' };
-      const res = await fetch(`${resolveAgentBaseUrl()}/api/tunnel/${action}`, init);
+      const res = await getTransport().request(agentUrl(`/api/tunnel/${action}`), init);
       if (!res.ok) {
         console.warn('[LanAccessPanel] tunnel action failed:', action, res.status);
         tunnelStatus = 'error';

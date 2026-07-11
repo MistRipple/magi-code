@@ -8,6 +8,9 @@ use crate::min_heap::MinHeap;
 const BM25_K1: f64 = 1.2;
 const BM25_B: f64 = 0.75;
 
+pub type SnapshotPostingEntry = (String, Vec<usize>, usize);
+pub type SnapshotPostingList = (String, Vec<SnapshotPostingEntry>);
+
 #[derive(Clone, Debug)]
 struct PostingEntry {
     lines: Vec<usize>,
@@ -32,7 +35,7 @@ pub struct IndexSearchHit {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct InvertedIndexSnapshot {
-    pub postings: Vec<(String, Vec<(String, Vec<usize>, usize)>)>,
+    pub postings: Vec<SnapshotPostingList>,
     pub doc_meta: Vec<(String, usize, Option<u64>)>,
     pub total_docs: usize,
     pub avg_doc_len: f64,

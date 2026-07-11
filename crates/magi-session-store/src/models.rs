@@ -74,6 +74,20 @@ pub struct ActiveExecutionBranch {
     pub thread_id: ThreadId,
 }
 
+pub struct ActiveExecutionBranchSnapshotUpdate {
+    pub task_id: TaskId,
+    pub worker_id: WorkerId,
+    pub stage: String,
+    pub lease_id: Option<LeaseId>,
+    pub execution_intent_ref: Option<String>,
+    pub binding_lifecycle: Option<String>,
+    pub checkpoint_stage: Option<String>,
+    pub next_step_index: Option<usize>,
+    pub checkpoint_at: Option<UtcMillis>,
+    pub resume_mode: Option<String>,
+    pub resume_token: Option<String>,
+}
+
 pub const CANONICAL_TURN_SCHEMA_VERSION: &str = "canonical-turn.v1";
 
 /// `source_thread_id` 的可见性判定结果：
@@ -584,7 +598,7 @@ pub struct SessionExecutionSidecarStoreState {
 }
 
 impl SessionExecutionSidecarStoreState {
-    fn sort_runtime_sidecars(runtime_sidecars: &mut Vec<SessionRuntimeSidecar>) {
+    fn sort_runtime_sidecars(runtime_sidecars: &mut [SessionRuntimeSidecar]) {
         runtime_sidecars
             .sort_by(|left, right| left.session_id.as_str().cmp(right.session_id.as_str()));
     }
@@ -675,16 +689,12 @@ pub fn timeline_entry_visible_text(message: &str) -> Option<String> {
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Default)]
 pub enum NotificationScope {
     App,
     Workspace,
+    #[default]
     Session,
-}
-
-impl Default for NotificationScope {
-    fn default() -> Self {
-        Self::Session
-    }
 }
 
 fn default_notification_occurrence_count() -> u32 {

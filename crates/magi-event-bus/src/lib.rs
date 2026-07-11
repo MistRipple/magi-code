@@ -4,7 +4,7 @@ mod ledger;
 mod read_model;
 pub mod task_events;
 
-pub use bus::{EventBusError, InMemoryEventBus};
+pub use bus::InMemoryEventBus;
 pub use events::{EventCategory, EventContext, EventEnvelope, EventStreamSnapshot};
 pub use ledger::{
     AUDIT_USAGE_LEDGER_SCHEMA_VERSION, AuditUsageLedgerEntry, AuditUsageLedgerError,

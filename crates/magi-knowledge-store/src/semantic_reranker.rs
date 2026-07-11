@@ -80,10 +80,10 @@ impl SemanticReranker {
 
         let cache_key = build_cache_key(query, &rerank_slice);
         let now = now_millis();
-        if let Some(cached) = self.cache.get(&cache_key) {
-            if now - cached.timestamp < CACHE_TTL_MS {
-                return apply_reorder(&rerank_slice, &rest_slice, &cached.reordered_paths);
-            }
+        if let Some(cached) = self.cache.get(&cache_key)
+            && now - cached.timestamp < CACHE_TTL_MS
+        {
+            return apply_reorder(&rerank_slice, &rest_slice, &cached.reordered_paths);
         }
 
         let response = match llm_response {
@@ -118,10 +118,10 @@ impl SemanticReranker {
 
         let cache_key = build_cache_key(query, rerank_slice);
         let now = now_millis();
-        if let Some(cached) = self.cache.get(&cache_key) {
-            if now - cached.timestamp < CACHE_TTL_MS {
-                return None;
-            }
+        if let Some(cached) = self.cache.get(&cache_key)
+            && now - cached.timestamp < CACHE_TTL_MS
+        {
+            return None;
         }
 
         Some(Self::build_prompt(query, rerank_slice, symbol_index))

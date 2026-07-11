@@ -348,7 +348,7 @@ fn openai_compatible_provider_treats_null_tool_calls_as_empty() {
         payload
             .get("tool_calls")
             .and_then(serde_json::Value::as_array)
-            .map_or(true, Vec::is_empty)
+            .is_none_or(Vec::is_empty)
     );
 
     let request = receiver

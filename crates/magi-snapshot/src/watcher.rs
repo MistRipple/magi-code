@@ -83,10 +83,10 @@ impl FsWatcher {
                             })
                             .collect();
                         for p in ready {
-                            if let Some((kind, _)) = pending.remove(&p) {
-                                if out.send(DebouncedEvent { path: p, kind }).is_err() {
-                                    return;
-                                }
+                            if let Some((kind, _)) = pending.remove(&p)
+                                && out.send(DebouncedEvent { path: p, kind }).is_err()
+                            {
+                                return;
                             }
                         }
                     }

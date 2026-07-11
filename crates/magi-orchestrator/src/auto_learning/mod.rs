@@ -2,7 +2,10 @@ pub mod manager;
 pub mod memory_consolidation;
 pub mod preference_miner;
 
-pub use manager::{AutoLearningCaptureInput, AutoLearningManager, AutoLearningRawMemory};
+pub use manager::{
+    AutoLearningCaptureContent, AutoLearningCaptureInput, AutoLearningManager,
+    AutoLearningRawMemory,
+};
 pub use memory_consolidation::{
     ConsolidationConfig, ConsolidationResult, MemoryConsolidationService,
 };

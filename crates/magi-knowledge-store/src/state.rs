@@ -14,12 +14,17 @@ pub struct KnowledgeState {
 impl KnowledgeState {
     pub(crate) fn upsert(
         &mut self,
-        record: KnowledgeRecord,
+        mut record: KnowledgeRecord,
         indexed_terms: Vec<String>,
         code_source: Option<CodeIndexSource>,
         audit_link: Option<KnowledgeAuditLink>,
         governance_link: Option<KnowledgeGovernanceLink>,
     ) {
+        if let Some(existing) = self.entries.get(&record.knowledge_id) {
+            record.created_at = existing.created_at;
+        } else if record.created_at.0 == 0 {
+            record.created_at = record.updated_at;
+        }
         self.index_terms
             .insert(record.knowledge_id.clone(), indexed_terms);
         Self::set_sidecar(&record.knowledge_id, &mut self.code_sources, code_source);

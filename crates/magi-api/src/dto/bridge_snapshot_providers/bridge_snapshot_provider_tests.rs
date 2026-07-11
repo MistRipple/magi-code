@@ -728,13 +728,12 @@ fn cutover_smoke_snapshot_provider_blocks_invalid_model_payload_contract() {
         openai.blocking_reason.as_deref(),
         Some("structured payload missing content or tool_calls")
     );
-    assert_eq!(
-        openai
+    assert!(
+        !openai
             .model_contract
             .as_ref()
             .expect("model contract should exist")
-            .contract_ok,
-        false
+            .contract_ok
     );
 }
 

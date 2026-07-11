@@ -155,7 +155,7 @@ impl ToolRegistry {
     pub fn builtin_access_mode(&self, tool_name: &str) -> Option<BuiltinToolAccessMode> {
         self.builtin_tools
             .get(tool_name)
-            .and_then(|_| BuiltinToolName::from_str(tool_name))
+            .and_then(|_| BuiltinToolName::from_name(tool_name))
             .map(|name| name.default_access_mode())
     }
 
@@ -219,7 +219,7 @@ impl ToolRegistry {
     ) -> ToolExecutionOutput {
         context.access_profile = policy.effective_access_profile();
         if input.tool_kind == ToolKind::Builtin
-            && let Some(canonical_name) = BuiltinToolName::from_str(input.tool_name.trim())
+            && let Some(canonical_name) = BuiltinToolName::from_name(input.tool_name.trim())
         {
             input.tool_name = canonical_name.as_str().to_string();
             if !allow_internal_builtin_surface && !canonical_name.is_public_tool_surface() {
@@ -413,8 +413,8 @@ impl ToolRegistry {
 
     pub fn summary_for_query(&self, query: &ToolExecutionContextQuery) -> ToolExecutionSummary {
         let invocations = self.query_invocations(query);
-        let invocations = self.summarize_invocations(&invocations);
-        invocations
+
+        self.summarize_invocations(&invocations)
     }
 
     fn summarize_invocations(&self, invocations: &[ToolInvocationRecord]) -> ToolExecutionSummary {

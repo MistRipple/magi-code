@@ -153,10 +153,9 @@ fn loopback_visible_prompt(prompt: &str) -> String {
     if let Some(index) = chunks
         .iter()
         .position(|chunk| !loopback_instruction_chunk(chunk))
+        && index > 0
     {
-        if index > 0 {
-            return chunks[index..].join("\n\n");
-        }
+        return chunks[index..].join("\n\n");
     }
 
     trimmed.to_string()
@@ -578,10 +577,10 @@ impl OpenAiCompatibleProviderRuntime {
             .into_iter()
             .map(|key| format!("missing {key}"))
             .collect::<Vec<_>>();
-        if let Some(base_url) = self.base_url.as_deref() {
-            if let Err(reason) = build_openai_chat_completions_url(base_url) {
-                issues.push(format!("invalid {OPENAI_BASE_URL_ENV}: {reason}"));
-            }
+        if let Some(base_url) = self.base_url.as_deref()
+            && let Err(reason) = build_openai_chat_completions_url(base_url)
+        {
+            issues.push(format!("invalid {OPENAI_BASE_URL_ENV}: {reason}"));
         }
         issues
     }
@@ -695,7 +694,7 @@ impl ModelProvider {
     }
 
     fn matches(&self, provider_name: &str) -> bool {
-        provider_name == self.name || self.aliases.iter().any(|alias| provider_name == *alias)
+        provider_name == self.name || self.aliases.contains(&provider_name)
     }
 
     fn service_descriptor(&self) -> BridgeServerServiceDescriptor {

@@ -245,58 +245,56 @@ fn build_skill_registry_from_config(config: &Map<String, Value>) -> SkillRegistr
         .and_then(|value| value.as_array())
     {
         for skill_val in skills {
-            if let Some(skill_id) = skill_val.get("skillId").and_then(|v| v.as_str()) {
-                if let Some(dir_path) = skill_val.get("directoryPath").and_then(|v| v.as_str()) {
-                    let skill_dir = PathBuf::from(dir_path);
-                    let Some(instruction) = read_available_skill_instruction(&skill_dir) else {
-                        continue;
-                    };
+            if let Some(skill_id) = skill_val.get("skillId").and_then(|v| v.as_str())
+                && let Some(dir_path) = skill_val.get("directoryPath").and_then(|v| v.as_str())
+            {
+                let skill_dir = PathBuf::from(dir_path);
+                let Some(instruction) = read_available_skill_instruction(&skill_dir) else {
+                    continue;
+                };
 
-                    let mut allowed_tools = Vec::new();
-                    let mut custom_tool_bindings = Vec::new();
-                    let mut restrict_standard_tools = false;
+                let mut allowed_tools = Vec::new();
+                let mut custom_tool_bindings = Vec::new();
+                let mut restrict_standard_tools = false;
 
-                    let config_path = skill_dir.join("config.json");
-                    if let Ok(content) = fs::read_to_string(config_path) {
-                        if let Ok(parsed) = serde_json::from_str::<Value>(&content) {
-                            restrict_standard_tools = parsed.get("allowed_tools").is_some();
-                            if let Some(allowed) =
-                                parsed.get("allowed_tools").and_then(|v| v.as_array())
-                            {
-                                for t in allowed {
-                                    if let Some(t_str) = t.as_str() {
-                                        allowed_tools.push(t_str.to_string());
-                                    }
-                                }
-                            }
-                            if let Some(bindings) = parsed
-                                .get("custom_tool_bindings")
-                                .or_else(|| parsed.get("customToolBindings"))
-                                .or_else(|| parsed.get("customTools"))
-                            {
-                                custom_tool_bindings = parse_custom_tool_bindings(bindings);
+                let config_path = skill_dir.join("config.json");
+                if let Ok(content) = fs::read_to_string(config_path)
+                    && let Ok(parsed) = serde_json::from_str::<Value>(&content)
+                {
+                    restrict_standard_tools = parsed.get("allowed_tools").is_some();
+                    if let Some(allowed) = parsed.get("allowed_tools").and_then(|v| v.as_array()) {
+                        for t in allowed {
+                            if let Some(t_str) = t.as_str() {
+                                allowed_tools.push(t_str.to_string());
                             }
                         }
                     }
-
-                    registry.register(SkillDefinition {
-                        skill_id: skill_id.to_string(),
-                        title: skill_val
-                            .get("name")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or(skill_id)
-                            .to_string(),
-                        instruction,
-                        metadata: SkillMetadata {
-                            category: "local".to_string(),
-                            tags: vec![],
-                        },
-                        restrict_standard_tools,
-                        allowed_tools,
-                        custom_tool_bindings,
-                        prompt_priority: 50,
-                    });
+                    if let Some(bindings) = parsed
+                        .get("custom_tool_bindings")
+                        .or_else(|| parsed.get("customToolBindings"))
+                        .or_else(|| parsed.get("customTools"))
+                    {
+                        custom_tool_bindings = parse_custom_tool_bindings(bindings);
+                    }
                 }
+
+                registry.register(SkillDefinition {
+                    skill_id: skill_id.to_string(),
+                    title: skill_val
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(skill_id)
+                        .to_string(),
+                    instruction,
+                    metadata: SkillMetadata {
+                        category: "local".to_string(),
+                        tags: vec![],
+                    },
+                    restrict_standard_tools,
+                    allowed_tools,
+                    custom_tool_bindings,
+                    prompt_priority: 50,
+                });
             }
         }
     }
@@ -405,8 +403,8 @@ mod tests {
 
         normalize_skills_config_sections(&mut snapshot);
 
-        assert!(snapshot.get("skills").is_none());
-        assert!(snapshot.get("customTools").is_none());
+        assert!(!snapshot.contains_key("skills"));
+        assert!(!snapshot.contains_key("customTools"));
         assert_eq!(snapshot["skillsConfig"], serde_json::json!({}));
 
         std::fs::remove_dir_all(&skill_dir).expect("temp skill dir should be removed");

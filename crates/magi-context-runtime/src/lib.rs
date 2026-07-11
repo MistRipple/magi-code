@@ -271,12 +271,14 @@ impl ContextRuntime {
             source_assembly::provided_recent_turns(input.recent_turns);
         self.assemble_internal(
             budget,
-            recent_turns,
-            recent_turns_summary,
-            input.knowledge_query,
-            input.memory_query,
-            input.shared_context,
-            input.file_summaries,
+            budgeting::ContextSelectionInput {
+                recent_turns,
+                recent_turns_summary,
+                knowledge_query: input.knowledge_query,
+                memory_query: input.memory_query,
+                shared_context: input.shared_context,
+                file_summaries: input.file_summaries,
+            },
         )
     }
 
@@ -294,35 +296,23 @@ impl ContextRuntime {
 
         self.assemble_internal(
             budget,
-            resolved_sources.recent_turns,
-            resolved_sources.recent_turns_summary,
-            input.knowledge_query,
-            input.memory_query,
-            resolved_sources.shared_context,
-            resolved_sources.file_summaries,
+            budgeting::ContextSelectionInput {
+                recent_turns: resolved_sources.recent_turns,
+                recent_turns_summary: resolved_sources.recent_turns_summary,
+                knowledge_query: input.knowledge_query,
+                memory_query: input.memory_query,
+                shared_context: resolved_sources.shared_context,
+                file_summaries: resolved_sources.file_summaries,
+            },
         )
     }
 
     fn assemble_internal(
         &self,
         budget: &ContextBudget,
-        recent_turns: Vec<RecentTurnRecord>,
-        recent_turns_summary: RecentTurnsResolutionSummary,
-        knowledge_query: KnowledgeQuery,
-        memory_query: MemoryQuery,
-        shared_context: Vec<SharedContextItem>,
-        file_summaries: Vec<FileSummaryItem>,
+        input: budgeting::ContextSelectionInput,
     ) -> ContextAssemblyResult {
-        let selection = budgeting::assemble_budgeted_selection(
-            self,
-            budget,
-            recent_turns,
-            recent_turns_summary,
-            knowledge_query,
-            memory_query,
-            shared_context,
-            file_summaries,
-        );
+        let selection = budgeting::assemble_budgeted_selection(self, budget, input);
         structured_output::build_context_assembly_result(selection)
     }
 }
@@ -682,6 +672,7 @@ mod tests {
                 content: format!("knowledge content about topic {i}"),
                 tags: vec!["rust".to_string()],
                 source_ref: Some(format!("ref-{i}")),
+                created_at: ts(100 + i),
                 updated_at: ts(100 + i),
             });
         }
@@ -940,6 +931,7 @@ mod tests {
             content: "Stabilize parser diagnostics before the cutover fallback path.".to_string(),
             tags: vec!["parser".to_string()],
             source_ref: Some("docs/parser-cutover.md".to_string()),
+            created_at: timestamp(10),
             updated_at: timestamp(10),
         });
 
@@ -1101,6 +1093,7 @@ mod tests {
             content: long_content.clone(),
             tags: vec!["architecture".to_string(), "caching".to_string()],
             source_ref: Some("adr-001".to_string()),
+            created_at: UtcMillis(100),
             updated_at: UtcMillis(100),
         });
         knowledge_store.upsert(magi_knowledge_store::KnowledgeRecord {
@@ -1111,6 +1104,7 @@ mod tests {
             content: "Short content about caching".to_string(),
             tags: vec!["caching".to_string()],
             source_ref: None,
+            created_at: UtcMillis(200),
             updated_at: UtcMillis(200),
         });
         knowledge_store.upsert(magi_knowledge_store::KnowledgeRecord {
@@ -1121,6 +1115,7 @@ mod tests {
             content: "This is about testing".to_string(),
             tags: vec!["testing".to_string()],
             source_ref: None,
+            created_at: UtcMillis(300),
             updated_at: UtcMillis(300),
         });
 
@@ -2087,6 +2082,7 @@ mod tests {
             content: "content".to_string(),
             tags: vec![],
             source_ref: None,
+            created_at: UtcMillis(1),
             updated_at: UtcMillis(1),
         });
         let memory_store = MemoryStore::new();

@@ -195,7 +195,7 @@ pub(crate) fn build_tool_catalog_value(
         "catalog_access_mode": BuiltinToolAccessMode::ReadOnly.as_str(),
         "current_access_profile": access_profile.as_str(),
         "approval_policy_summary": approval_policy_summary(access_profile),
-        "summary": tool_catalog_summary(
+        "summary": tool_catalog_summary(ToolCatalogSummaryInput {
             public_count,
             skill_tool_count,
             connected_mcp_server_count,
@@ -204,7 +204,7 @@ pub(crate) fn build_tool_catalog_value(
             agent_role_count,
             schema_warning_count,
             runtime_warning_count,
-        ),
+        }),
         "total": tools.len() + skill_tool_count + external_mcp_tools.len(),
         "builtin_total": BuiltinToolName::ALL.len(),
         "public_count": public_count,
@@ -244,7 +244,7 @@ pub(crate) fn build_tool_catalog_value(
     })
 }
 
-fn tool_catalog_summary(
+struct ToolCatalogSummaryInput {
     public_count: usize,
     skill_tool_count: usize,
     connected_mcp_server_count: usize,
@@ -253,7 +253,19 @@ fn tool_catalog_summary(
     agent_role_count: usize,
     schema_warning_count: usize,
     runtime_warning_count: usize,
-) -> String {
+}
+
+fn tool_catalog_summary(input: ToolCatalogSummaryInput) -> String {
+    let ToolCatalogSummaryInput {
+        public_count,
+        skill_tool_count,
+        connected_mcp_server_count,
+        enabled_mcp_server_count,
+        spawnable_agent_role_count,
+        agent_role_count,
+        schema_warning_count,
+        runtime_warning_count,
+    } = input;
     let mut summary = format!(
         "工具目录已更新：{public_count} 个内置工具、{skill_tool_count} 个 Skill 工具、MCP 启用服务 {connected_mcp_server_count}/{enabled_mcp_server_count} 可用、子代理 {spawnable_agent_role_count}/{agent_role_count} 可派发"
     );

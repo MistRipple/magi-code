@@ -32,7 +32,7 @@ pub(crate) fn capture_tool_workspace_snapshot(
     if input.tool_kind != ToolKind::Builtin {
         return None;
     }
-    let tool_name = BuiltinToolName::from_str(input.tool_name.trim())?;
+    let tool_name = BuiltinToolName::from_name(input.tool_name.trim())?;
     if !tool_name.captures_workspace_changes() {
         return None;
     }
@@ -89,7 +89,7 @@ pub(crate) fn append_workspace_changed_paths(
         context
             .working_directory
             .as_deref()
-            .unwrap_or_else(|| before.root.as_path()),
+            .unwrap_or(before.root.as_path()),
     ) else {
         return payload;
     };

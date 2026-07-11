@@ -1,7 +1,7 @@
 use crate::{errors::ApiError, scope_binding::strip_scope_binding_fields_from_map};
 use magi_bridge_client::McpServerConfig;
 use serde_json::Value;
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 
 pub(crate) const REDACTED_MCP_ENV_VALUE: &str = "********";
 
@@ -148,12 +148,20 @@ pub fn build_mcp_config_from_entry(entry: &Value) -> Option<McpServerConfig> {
                 .collect::<BTreeMap<_, _>>()
         })
         .unwrap_or_default();
+    let request_timeout = Duration::from_millis(
+        object
+            .get("requestTimeoutMs")
+            .and_then(Value::as_u64)
+            .unwrap_or(30_000)
+            .clamp(1_000, 300_000),
+    );
 
     Some(McpServerConfig {
         command,
         args,
         working_directory,
         env,
+        request_timeout,
     })
 }
 
@@ -265,6 +273,7 @@ mod tests {
             "command": " npx ",
             "args": ["-y", "@modelcontextprotocol/server-filesystem"],
             "workingDirectory": " /tmp ",
+            "requestTimeoutMs": 45_000,
             "env": {
                 "A": "1",
                 "IGNORED": 2
@@ -283,6 +292,7 @@ mod tests {
         assert_eq!(config.working_directory, Some(PathBuf::from("/tmp")));
         assert_eq!(config.env.get("A").map(String::as_str), Some("1"));
         assert!(!config.env.contains_key("IGNORED"));
+        assert_eq!(config.request_timeout, Duration::from_millis(45_000));
     }
 
     #[test]

@@ -181,7 +181,7 @@ impl NormalizedModelConfig {
         if model.is_empty() {
             return None;
         }
-        let protocol = self.inferred_protocol_for_model(Some(&model));
+        let protocol = self.inferred_protocol_for_model(Some(model));
         Some(HttpModelBridgeClient::new_with_protocol(
             base_url,
             self.api_key.clone(),
@@ -335,15 +335,14 @@ pub fn merge_orchestrator_session_override(
     let serde_json::Value::Object(base_map) = base else {
         return;
     };
-    if let Some(model) = override_map.get("model") {
-        if let Some(model) = model.as_str() {
-            if !model.trim().is_empty() {
-                base_map.insert(
-                    "model".to_string(),
-                    serde_json::Value::String(model.trim().to_string()),
-                );
-            }
-        }
+    if let Some(model) = override_map.get("model")
+        && let Some(model) = model.as_str()
+        && !model.trim().is_empty()
+    {
+        base_map.insert(
+            "model".to_string(),
+            serde_json::Value::String(model.trim().to_string()),
+        );
     }
     if override_map.contains_key("reasoningEffort") {
         match override_map.get("reasoningEffort") {

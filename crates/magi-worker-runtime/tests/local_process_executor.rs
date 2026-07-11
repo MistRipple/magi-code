@@ -14,13 +14,14 @@ use magi_tool_runtime::ToolExecutionPolicy;
 use magi_worker_runtime::{
     LocalProcessExecutorDescriptor, LocalProcessExecutorHealth, LocalProcessExecutorHealthStatus,
     LocalProcessExecutorProcessModel, LocalProcessProbeResponse, LocalProcessProtocolResponse,
-    LocalProcessProtocolResponseKind, LocalProcessWorkerExecutor, WorkerCheckpointResumeMode,
-    WorkerExecutionBindingLifecycle, WorkerExecutionBindingScope, WorkerExecutionCheckpointCursor,
-    WorkerExecutionFinalReport, WorkerExecutionIntent, WorkerExecutionIntentStep,
-    WorkerExecutionLeaseState, WorkerExecutionMode, WorkerExecutionParallelismScope,
-    WorkerExecutionProcessLifecycle, WorkerExecutionProfile, WorkerExecutionReusePolicy,
-    WorkerExecutionStepKind, WorkerExecutor, WorkerExecutorFailureLayer, WorkerLoopAction,
-    WorkerLoopOutcomeKind, WorkerRuntime, WorkerStage,
+    LocalProcessProtocolResponseKind, LocalProcessWorkerExecutor, WorkerBranchCheckpointState,
+    WorkerCheckpointResumeMode, WorkerExecutionBindingLifecycle, WorkerExecutionBindingScope,
+    WorkerExecutionCheckpointCursor, WorkerExecutionFinalReport, WorkerExecutionIntent,
+    WorkerExecutionIntentStep, WorkerExecutionLeaseState, WorkerExecutionMode,
+    WorkerExecutionParallelismScope, WorkerExecutionProcessLifecycle, WorkerExecutionProfile,
+    WorkerExecutionReusePolicy, WorkerExecutionStepKind, WorkerExecutor,
+    WorkerExecutorFailureLayer, WorkerLoopAction, WorkerLoopOutcomeKind, WorkerRuntime,
+    WorkerStage,
 };
 
 fn worker_id(value: &str) -> WorkerId {
@@ -78,7 +79,7 @@ fn local_process_executor_can_run_execute_chain() {
             WorkerExecutionIntentStep::SkillDispatch {
                 tool_call_id: ToolCallId::new("local-skill-1".to_string()),
                 tool_name: "process_inspect".to_string(),
-                plan: builtin_skill_plan("process_inspect"),
+                plan: Box::new(builtin_skill_plan("process_inspect")),
                 payload: "{\"mode\":\"subprocess-skill\"}".to_string(),
                 approval_requirement: ApprovalRequirement::None,
                 risk_level: RiskLevel::Low,
@@ -150,7 +151,7 @@ fn local_process_executor_resumes_from_checkpoint_without_replaying_completed_st
             WorkerExecutionIntentStep::SkillDispatch {
                 tool_call_id: ToolCallId::new("resume-skill-1".to_string()),
                 tool_name: "process_inspect".to_string(),
-                plan: builtin_skill_plan("process_inspect"),
+                plan: Box::new(builtin_skill_plan("process_inspect")),
                 payload: "{\"mode\":\"resume-step-2\"}".to_string(),
                 approval_requirement: ApprovalRequirement::None,
                 risk_level: RiskLevel::Low,
@@ -172,16 +173,18 @@ fn local_process_executor_resumes_from_checkpoint_without_replaying_completed_st
         &task_id,
         &worker_id,
         WorkerStage::Execute,
-        None,
-        Some(format!("worker-intent-{task_id}")),
-        Some(WorkerExecutionBindingLifecycle::Requested),
-        Some(WorkerExecutionCheckpointCursor {
-            checkpoint_stage: WorkerStage::Execute,
-            next_step_index: 1,
-            checkpoint_at: magi_core::UtcMillis::now(),
-            resume_mode: WorkerCheckpointResumeMode::StepCheckpoint,
-            resume_token: None,
-        }),
+        WorkerBranchCheckpointState {
+            lease_id: None,
+            execution_intent_ref: Some(format!("worker-intent-{task_id}")),
+            binding_lifecycle: Some(WorkerExecutionBindingLifecycle::Requested),
+            checkpoint_cursor: Some(WorkerExecutionCheckpointCursor {
+                checkpoint_stage: WorkerStage::Execute,
+                next_step_index: 1,
+                checkpoint_at: magi_core::UtcMillis::now(),
+                resume_mode: WorkerCheckpointResumeMode::StepCheckpoint,
+                resume_token: None,
+            }),
+        },
     );
 
     let loop_controller = runtime.loop_controller();
@@ -407,7 +410,7 @@ fn local_process_executor_rejects_missing_step_capability() {
                 WorkerExecutionIntentStep::SkillDispatch {
                     tool_call_id: ToolCallId::new("missing-step-skill-1".to_string()),
                     tool_name: "process_inspect".to_string(),
-                    plan: builtin_skill_plan("process_inspect"),
+                    plan: Box::new(builtin_skill_plan("process_inspect")),
                     payload: "{\"mode\":\"loopback-skill\"}".to_string(),
                     approval_requirement: ApprovalRequirement::None,
                     risk_level: RiskLevel::Low,
@@ -469,7 +472,7 @@ fn worker_runtime_loop_rejects_missing_step_capability_before_fallback() {
             WorkerExecutionIntentStep::SkillDispatch {
                 tool_call_id: ToolCallId::new("reject-skill-1".to_string()),
                 tool_name: "process_inspect".to_string(),
-                plan: builtin_skill_plan("process_inspect"),
+                plan: Box::new(builtin_skill_plan("process_inspect")),
                 payload: "{\"mode\":\"reject-skill\"}".to_string(),
                 approval_requirement: ApprovalRequirement::None,
                 risk_level: RiskLevel::Low,

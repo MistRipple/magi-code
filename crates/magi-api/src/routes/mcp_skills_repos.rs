@@ -3,7 +3,7 @@ use axum::{
     extract::{Query, State},
     routing::{get, post},
 };
-use magi_bridge_client::StdioMcpBridgeClient;
+use magi_bridge_client::{McpToolInfo, StdioMcpBridgeClient};
 use std::collections::HashMap;
 use std::fmt::Display;
 use std::path::{Path, PathBuf};
@@ -29,6 +29,13 @@ const SKILL_REPOSITORY_PUBLIC_ERROR: &str = "Skill 仓库暂不可读取";
 const SKILL_CACHE_PUBLIC_ERROR: &str = "Skill 缓存不可保存，请检查本地权限";
 const SKILL_REPOSITORY_URL_PUBLIC_ERROR: &str = "仅支持标准 GitHub HTTPS 仓库地址";
 static SKILL_REPOSITORY_SYNC_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+
+async fn list_mcp_tools(client: Arc<StdioMcpBridgeClient>) -> Result<Vec<McpToolInfo>, String> {
+    tokio::task::spawn_blocking(move || client.list_tools())
+        .await
+        .map_err(|error| format!("MCP worker join failed: {error}"))?
+        .map_err(|error| error.to_string())
+}
 
 pub fn routes() -> Router<ApiState> {
     Router::new()
@@ -165,50 +172,48 @@ fn build_local_instruction_skill_entry(
 
 fn read_local_skill_description(dir: &std::path::Path) -> String {
     let config_path = dir.join("config.json");
-    if config_path.is_file() {
-        if let Ok(content) = std::fs::read_to_string(&config_path) {
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
-                if let Some(desc) = json.get("description").and_then(|v| v.as_str()) {
-                    let desc = desc.trim();
-                    if !desc.is_empty() {
-                        return desc.chars().take(200).collect();
-                    }
-                }
-            }
+    if config_path.is_file()
+        && let Ok(content) = std::fs::read_to_string(&config_path)
+        && let Ok(json) = serde_json::from_str::<serde_json::Value>(&content)
+        && let Some(desc) = json.get("description").and_then(|v| v.as_str())
+    {
+        let desc = desc.trim();
+        if !desc.is_empty() {
+            return desc.chars().take(200).collect();
         }
     }
     for filename in &["SKILL.md", "prompt.md", "README.md"] {
         let path = dir.join(filename);
-        if path.is_file() {
-            if let Ok(content) = std::fs::read_to_string(&path) {
-                let mut lines = content.lines();
-                let first_line = lines.next();
-                if first_line.is_some_and(|line| line.trim() == "---") {
-                    for line in lines.by_ref() {
-                        let trimmed = line.trim();
-                        if trimmed == "---" {
-                            break;
-                        }
-                        if let Some(description) = trimmed.strip_prefix("description:") {
-                            let description = description
-                                .trim()
-                                .trim_matches(|ch| ch == '"' || ch == '\'');
-                            if !description.is_empty() {
-                                return description.chars().take(200).collect();
-                            }
-                        }
+        if path.is_file()
+            && let Ok(content) = std::fs::read_to_string(&path)
+        {
+            let mut lines = content.lines();
+            let first_line = lines.next();
+            if first_line.is_some_and(|line| line.trim() == "---") {
+                for line in lines.by_ref() {
+                    let trimmed = line.trim();
+                    if trimmed == "---" {
+                        break;
                     }
-                } else if let Some(line) = first_line {
-                    let trimmed = line.trim().trim_start_matches('#').trim();
-                    if !trimmed.is_empty() && trimmed != "---" {
-                        return trimmed.chars().take(200).collect();
+                    if let Some(description) = trimmed.strip_prefix("description:") {
+                        let description = description
+                            .trim()
+                            .trim_matches(|ch| ch == '"' || ch == '\'');
+                        if !description.is_empty() {
+                            return description.chars().take(200).collect();
+                        }
                     }
                 }
-                for line in lines {
-                    let trimmed = line.trim().trim_start_matches('#').trim();
-                    if !trimmed.is_empty() && trimmed != "---" {
-                        return trimmed.chars().take(200).collect();
-                    }
+            } else if let Some(line) = first_line {
+                let trimmed = line.trim().trim_start_matches('#').trim();
+                if !trimmed.is_empty() && trimmed != "---" {
+                    return trimmed.chars().take(200).collect();
+                }
+            }
+            for line in lines {
+                let trimmed = line.trim().trim_start_matches('#').trim();
+                if !trimmed.is_empty() && trimmed != "---" {
+                    return trimmed.chars().take(200).collect();
                 }
             }
         }
@@ -298,10 +303,10 @@ fn normalize_local_instruction_skill_request_skill_id(
 fn public_local_instruction_skill_entry(entry: &serde_json::Value) -> serde_json::Value {
     let mut obj = entry.as_object().cloned().unwrap_or_default();
     obj.remove("directoryPath");
-    if !obj.contains_key("localSkillId") {
-        if let Some(skill_id) = instruction_skill_id(entry) {
-            obj.insert("localSkillId".to_string(), serde_json::json!(skill_id));
-        }
+    if !obj.contains_key("localSkillId")
+        && let Some(skill_id) = instruction_skill_id(entry)
+    {
+        obj.insert("localSkillId".to_string(), serde_json::json!(skill_id));
     }
     serde_json::Value::Object(obj)
 }
@@ -874,8 +879,8 @@ async fn connect_mcp_server(
     let config = build_mcp_config_from_entry(&entry)
         .ok_or_else(|| ApiError::InvalidInput("MCP server 配置中缺少 command".to_string()))?;
 
-    let client = StdioMcpBridgeClient::new(config);
-    let tools = client.list_tools().map_err(|err| {
+    let client = Arc::new(StdioMcpBridgeClient::new(config));
+    let tools = list_mcp_tools(client.clone()).await.map_err(|err| {
         tracing::warn!(
             server_id = %server_id,
             error = ?err,
@@ -884,7 +889,6 @@ async fn connect_mcp_server(
         ApiError::InvalidInput("MCP server 连接失败".to_string())
     })?;
 
-    let client = Arc::new(client);
     {
         let mut pool = state
             .mcp_connections()
@@ -951,7 +955,7 @@ async fn get_mcp_tools(
         return Ok(mcp_tools_unavailable_response(server_id));
     };
 
-    let tools = match client.list_tools() {
+    let tools = match list_mcp_tools(client).await {
         Ok(tools) => tools,
         Err(err) => {
             tracing::warn!(
@@ -999,7 +1003,7 @@ async fn refresh_mcp_tools(
         return Ok(mcp_tools_unavailable_response(server_id));
     };
 
-    let tools = match client.list_tools() {
+    let tools = match list_mcp_tools(client).await {
         Ok(tools) => tools,
         Err(err) => {
             tracing::warn!(

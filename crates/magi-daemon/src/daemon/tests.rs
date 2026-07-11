@@ -23,7 +23,9 @@ use magi_session_store::{
     ActiveExecutionTurn, ActiveExecutionTurnItem, SessionExecutionSidecarStatus,
     SessionSidecarFlushMetadata, SessionSidecarFlushReason, SessionStore,
 };
-use magi_worker_runtime::{WorkerExecutionBindingLifecycle, WorkerRuntime, WorkerStage};
+use magi_worker_runtime::{
+    WorkerBranchCheckpointState, WorkerExecutionBindingLifecycle, WorkerRuntime, WorkerStage,
+};
 use magi_workspace::{
     RecoveryStatus, WorkspaceRecoveryFlushMetadata, WorkspaceRecoveryFlushReason, WorkspaceStore,
 };
@@ -240,10 +242,9 @@ async fn wait_for_execution_group(
                     .iter()
                     .find(|entry| entry["mission_id"] == mission_id)
             })
+            && (is_ready(group) || Instant::now() >= deadline)
         {
-            if is_ready(group) || Instant::now() >= deadline {
-                return group.clone();
-            }
+            return group.clone();
         }
         if Instant::now() >= deadline {
             panic!("execution group {mission_id} did not appear before timeout");
@@ -539,16 +540,18 @@ fn runtime_sidecar_flush_hook_persists_dirty_worker_runtime_snapshot() {
         &TaskId::new("task-worker-snapshot"),
         &WorkerId::new("worker-worker-snapshot"),
         WorkerStage::Execute,
-        Some("lease-worker-snapshot".to_string()),
-        Some("worker-intent-task-worker-snapshot".to_string()),
-        Some(WorkerExecutionBindingLifecycle::Requested),
-        Some(magi_worker_runtime::WorkerExecutionCheckpointCursor {
-            checkpoint_stage: WorkerStage::Execute,
-            next_step_index: 1,
-            checkpoint_at: UtcMillis::now(),
-            resume_mode: magi_worker_runtime::WorkerCheckpointResumeMode::StepCheckpoint,
-            resume_token: None,
-        }),
+        WorkerBranchCheckpointState {
+            lease_id: Some("lease-worker-snapshot".to_string()),
+            execution_intent_ref: Some("worker-intent-task-worker-snapshot".to_string()),
+            binding_lifecycle: Some(WorkerExecutionBindingLifecycle::Requested),
+            checkpoint_cursor: Some(magi_worker_runtime::WorkerExecutionCheckpointCursor {
+                checkpoint_stage: WorkerStage::Execute,
+                next_step_index: 1,
+                checkpoint_at: UtcMillis::now(),
+                resume_mode: magi_worker_runtime::WorkerCheckpointResumeMode::StepCheckpoint,
+                resume_token: None,
+            }),
+        },
     );
 
     assert_eq!(
@@ -599,16 +602,18 @@ fn maintenance_tick_flushes_worker_snapshot_even_when_sidecars_are_clean() {
         &TaskId::new("task-maintenance-worker"),
         &WorkerId::new("worker-maintenance-worker"),
         WorkerStage::Verify,
-        Some("lease-maintenance-worker".to_string()),
-        Some("worker-intent-task-maintenance-worker".to_string()),
-        Some(WorkerExecutionBindingLifecycle::Requested),
-        Some(magi_worker_runtime::WorkerExecutionCheckpointCursor {
-            checkpoint_stage: WorkerStage::Verify,
-            next_step_index: 1,
-            checkpoint_at: UtcMillis::now(),
-            resume_mode: magi_worker_runtime::WorkerCheckpointResumeMode::StageRestart,
-            resume_token: None,
-        }),
+        WorkerBranchCheckpointState {
+            lease_id: Some("lease-maintenance-worker".to_string()),
+            execution_intent_ref: Some("worker-intent-task-maintenance-worker".to_string()),
+            binding_lifecycle: Some(WorkerExecutionBindingLifecycle::Requested),
+            checkpoint_cursor: Some(magi_worker_runtime::WorkerExecutionCheckpointCursor {
+                checkpoint_stage: WorkerStage::Verify,
+                next_step_index: 1,
+                checkpoint_at: UtcMillis::now(),
+                resume_mode: magi_worker_runtime::WorkerCheckpointResumeMode::StageRestart,
+                resume_token: None,
+            }),
+        },
     );
 
     let maintenance = RuntimeMaintenance::new(
@@ -882,7 +887,7 @@ async fn daemon_runtime_recovery_preflight_executes_and_followup_router_dispatch
     task_store.insert_task(Task {
         task_id: task_id.clone(),
         mission_id: mission_id.clone(),
-        root_task_id: root_task_id,
+        root_task_id,
         parent_task_id: Some(TaskId::new("task-root-router-recovery")),
         kind: TaskKind::LocalAgent,
         title: "recovery task".to_string(),
@@ -3094,23 +3099,25 @@ async fn session_continue_survives_runtime_restart_with_same_chain_and_worker_br
             &branch.task_id,
             &branch.worker_id,
             parse_worker_stage(&branch.stage),
-            branch.lease_id.as_ref().map(ToString::to_string),
-            branch.execution_intent_ref.clone(),
-            parse_binding_lifecycle(branch.binding_lifecycle.as_deref()),
-            branch.checkpoint_stage.as_deref().map(|checkpoint_stage| {
-                magi_worker_runtime::WorkerExecutionCheckpointCursor {
-                    checkpoint_stage: parse_worker_stage(checkpoint_stage),
-                    next_step_index: branch.next_step_index.unwrap_or(0),
-                    checkpoint_at: branch.checkpoint_at.unwrap_or(now),
-                    resume_mode: match branch.resume_mode.as_deref() {
-                        Some("step-checkpoint") => {
-                            magi_worker_runtime::WorkerCheckpointResumeMode::StepCheckpoint
-                        }
-                        _ => magi_worker_runtime::WorkerCheckpointResumeMode::StageRestart,
-                    },
-                    resume_token: branch.resume_token.clone(),
-                }
-            }),
+            WorkerBranchCheckpointState {
+                lease_id: branch.lease_id.as_ref().map(ToString::to_string),
+                execution_intent_ref: branch.execution_intent_ref.clone(),
+                binding_lifecycle: parse_binding_lifecycle(branch.binding_lifecycle.as_deref()),
+                checkpoint_cursor: branch.checkpoint_stage.as_deref().map(|checkpoint_stage| {
+                    magi_worker_runtime::WorkerExecutionCheckpointCursor {
+                        checkpoint_stage: parse_worker_stage(checkpoint_stage),
+                        next_step_index: branch.next_step_index.unwrap_or(0),
+                        checkpoint_at: branch.checkpoint_at.unwrap_or(now),
+                        resume_mode: match branch.resume_mode.as_deref() {
+                            Some("step-checkpoint") => {
+                                magi_worker_runtime::WorkerCheckpointResumeMode::StepCheckpoint
+                            }
+                            _ => magi_worker_runtime::WorkerCheckpointResumeMode::StageRestart,
+                        },
+                        resume_token: branch.resume_token.clone(),
+                    }
+                }),
+            },
         );
     }
 

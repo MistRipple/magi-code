@@ -864,14 +864,14 @@ impl PlanLedgerService {
     }
 
     fn mark_superseded(&mut self, session_id: &str, plan_id: &str) {
-        if let Some(record) = self.load_plan_mut(session_id, plan_id) {
-            if !record.status.is_terminal() {
-                record.status = PlanStatus::Superseded;
-                record.updated_at = now_millis();
-                record.revision += 1;
-                let result = record.clone();
-                self.update_index(&result);
-            }
+        if let Some(record) = self.load_plan_mut(session_id, plan_id)
+            && !record.status.is_terminal()
+        {
+            record.status = PlanStatus::Superseded;
+            record.updated_at = now_millis();
+            record.revision += 1;
+            let result = record.clone();
+            self.update_index(&result);
         }
     }
 
@@ -945,12 +945,12 @@ fn apply_attempt_transition(
     reason: Option<&str>,
 ) -> bool {
     if attempt.status == next {
-        if let Some(r) = reason {
-            if attempt.reason.as_deref() != Some(r) {
-                attempt.reason = Some(r.to_string());
-                attempt.updated_at = now_millis();
-                return true;
-            }
+        if let Some(r) = reason
+            && attempt.reason.as_deref() != Some(r)
+        {
+            attempt.reason = Some(r.to_string());
+            attempt.updated_at = now_millis();
+            return true;
         }
         return false;
     }
@@ -1072,7 +1072,7 @@ fn compute_item_status(item: &PlanItem) -> PlanItemStatus {
     if statuses.is_empty() {
         return item.status;
     }
-    if statuses.iter().any(|s| *s == "failed") {
+    if statuses.contains(&"failed") {
         return PlanItemStatus::Failed;
     }
     if statuses
@@ -1279,20 +1279,20 @@ fn find_latest_attempt_mut<'a>(
         if attempt.scope != selector.scope || attempt.target_id != selector.target_id {
             continue;
         }
-        if let Some(aid) = &selector.assignment_id {
-            if attempt.assignment_id.as_deref() != Some(aid) {
-                continue;
-            }
+        if let Some(aid) = &selector.assignment_id
+            && attempt.assignment_id.as_deref() != Some(aid)
+        {
+            continue;
         }
-        if let Some(tid) = &selector.task_id {
-            if attempt.task_id.as_deref() != Some(tid) {
-                continue;
-            }
+        if let Some(tid) = &selector.task_id
+            && attempt.task_id.as_deref() != Some(tid)
+        {
+            continue;
         }
-        if let Some(allowed) = statuses {
-            if !allowed.contains(&attempt.status) {
-                continue;
-            }
+        if let Some(allowed) = statuses
+            && !allowed.contains(&attempt.status)
+        {
+            continue;
         }
         if best_idx.is_none()
             || attempt.sequence > best_seq
@@ -1316,15 +1316,15 @@ fn next_attempt_sequence(
         if attempt.scope != selector.scope || attempt.target_id != selector.target_id {
             continue;
         }
-        if let Some(aid) = &selector.assignment_id {
-            if attempt.assignment_id.as_deref() != Some(aid) {
-                continue;
-            }
+        if let Some(aid) = &selector.assignment_id
+            && attempt.assignment_id.as_deref() != Some(aid)
+        {
+            continue;
         }
-        if let Some(tid) = &selector.task_id {
-            if attempt.task_id.as_deref() != Some(tid) {
-                continue;
-            }
+        if let Some(tid) = &selector.task_id
+            && attempt.task_id.as_deref() != Some(tid)
+        {
+            continue;
         }
         if attempt.sequence > max {
             max = attempt.sequence;

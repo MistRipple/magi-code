@@ -41,7 +41,7 @@ pub(crate) fn activate_skill_tool_definitions(
         if name == SKILL_APPLY_TOOL_NAME || parse_skill_custom_tool_name(name).is_some() {
             return false;
         }
-        if BuiltinToolName::from_str(name).is_some() {
+        if BuiltinToolName::from_name(name).is_some() {
             return preserved_builtin_tools.contains(&name)
                 || standard_tool_allowlist.is_none_or(|allowed_tools| {
                     allowed_tools.iter().any(|allowed| allowed == name)

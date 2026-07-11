@@ -219,10 +219,10 @@ impl SpawnGraph {
             if !seen.insert(node.clone()) {
                 continue;
             }
-            if let Some(edge) = self.edges.get(&node) {
-                if edge.status == SpawnEdgeStatus::Open {
-                    out.push(node.clone());
-                }
+            if let Some(edge) = self.edges.get(&node)
+                && edge.status == SpawnEdgeStatus::Open
+            {
+                out.push(node.clone());
             }
             for child in self.children_of(&node) {
                 stack.push(child.clone());
@@ -342,13 +342,12 @@ impl SpawnGraph {
                 continue;
             }
             report.restored_edges += 1;
-            if task_status_is_terminal(task.status) {
-                if graph
+            if task_status_is_terminal(task.status)
+                && graph
                     .mark_closed(&child_task_id, system_time_from_utc_millis(task.updated_at))
                     .is_ok()
-                {
-                    report.closed_edges += 1;
-                }
+            {
+                report.closed_edges += 1;
             }
         }
 

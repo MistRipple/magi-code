@@ -220,7 +220,7 @@ impl LayeredMemoryStore {
             .iter()
             .filter(|(_, e)| {
                 e.ttl_ms
-                    .map_or(false, |ttl| now.saturating_sub(e.created_at) > ttl)
+                    .is_some_and(|ttl| now.saturating_sub(e.created_at) > ttl)
             })
             .map(|(id, _)| id.clone())
             .collect();

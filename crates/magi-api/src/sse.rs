@@ -674,20 +674,17 @@ mod tests {
         ));
 
         for index in 0..8 {
-            state
-                .event_bus
-                .publish(
-                    EventEnvelope::domain(
-                        EventId::new(format!("event-sse-lagged-{index}")),
-                        "message.created",
-                        json!({ "index": index }),
-                    )
-                    .with_context(EventContext {
-                        workspace_id: Some(workspace.clone()),
-                        ..EventContext::default()
-                    }),
+            state.event_bus.publish(
+                EventEnvelope::domain(
+                    EventId::new(format!("event-sse-lagged-{index}")),
+                    "message.created",
+                    json!({ "index": index }),
                 )
-                .expect("event should publish");
+                .with_context(EventContext {
+                    workspace_id: Some(workspace.clone()),
+                    ..EventContext::default()
+                }),
+            );
         }
 
         let event = tokio::time::timeout(Duration::from_secs(1), events.next())
@@ -710,20 +707,17 @@ mod tests {
         let state = test_state_with_event_capacity(2);
         let workspace = workspace_id("workspace-retention-gap");
         for index in 0..5 {
-            state
-                .event_bus
-                .publish(
-                    EventEnvelope::domain(
-                        EventId::new(format!("event-retention-gap-{index}")),
-                        "message.created",
-                        json!({ "index": index }),
-                    )
-                    .with_context(EventContext {
-                        workspace_id: Some(workspace.clone()),
-                        ..EventContext::default()
-                    }),
+            state.event_bus.publish(
+                EventEnvelope::domain(
+                    EventId::new(format!("event-retention-gap-{index}")),
+                    "message.created",
+                    json!({ "index": index }),
                 )
-                .expect("event should publish");
+                .with_context(EventContext {
+                    workspace_id: Some(workspace.clone()),
+                    ..EventContext::default()
+                }),
+            );
         }
 
         let mut events = Box::pin(event_envelope_stream(
@@ -765,48 +759,39 @@ mod tests {
             None,
         ));
 
-        state
-            .event_bus
-            .publish(
-                EventEnvelope::domain(
-                    EventId::new("event-multi-subscriber-first"),
-                    "session.turn.item",
-                    json!({ "content": "first" }),
-                )
-                .with_context(EventContext {
-                    workspace_id: Some(workspace.clone()),
-                    ..EventContext::default()
-                }),
+        state.event_bus.publish(
+            EventEnvelope::domain(
+                EventId::new("event-multi-subscriber-first"),
+                "session.turn.item",
+                json!({ "content": "first" }),
             )
-            .expect("first workspace event should publish");
-        state
-            .event_bus
-            .publish(
-                EventEnvelope::domain(
-                    EventId::new("event-multi-subscriber-other"),
-                    "session.turn.item",
-                    json!({ "content": "other" }),
-                )
-                .with_context(EventContext {
-                    workspace_id: Some(other_workspace),
-                    ..EventContext::default()
-                }),
+            .with_context(EventContext {
+                workspace_id: Some(workspace.clone()),
+                ..EventContext::default()
+            }),
+        );
+        state.event_bus.publish(
+            EventEnvelope::domain(
+                EventId::new("event-multi-subscriber-other"),
+                "session.turn.item",
+                json!({ "content": "other" }),
             )
-            .expect("other workspace event should publish");
-        state
-            .event_bus
-            .publish(
-                EventEnvelope::domain(
-                    EventId::new("event-multi-subscriber-second"),
-                    "session.turn.item",
-                    json!({ "content": "second" }),
-                )
-                .with_context(EventContext {
-                    workspace_id: Some(workspace.clone()),
-                    ..EventContext::default()
-                }),
+            .with_context(EventContext {
+                workspace_id: Some(other_workspace),
+                ..EventContext::default()
+            }),
+        );
+        state.event_bus.publish(
+            EventEnvelope::domain(
+                EventId::new("event-multi-subscriber-second"),
+                "session.turn.item",
+                json!({ "content": "second" }),
             )
-            .expect("second workspace event should publish");
+            .with_context(EventContext {
+                workspace_id: Some(workspace.clone()),
+                ..EventContext::default()
+            }),
+        );
 
         let first_seen = tokio::time::timeout(Duration::from_secs(1), first_stream.next())
             .await
@@ -845,20 +830,17 @@ mod tests {
         let state = test_state_with_event_capacity(8);
         let workspace = workspace_id("workspace-after-sequence");
         for index in 1..=3 {
-            state
-                .event_bus
-                .publish(
-                    EventEnvelope::domain(
-                        EventId::new(format!("event-after-sequence-{index}")),
-                        "message.created",
-                        json!({ "index": index }),
-                    )
-                    .with_context(EventContext {
-                        workspace_id: Some(workspace.clone()),
-                        ..EventContext::default()
-                    }),
+            state.event_bus.publish(
+                EventEnvelope::domain(
+                    EventId::new(format!("event-after-sequence-{index}")),
+                    "message.created",
+                    json!({ "index": index }),
                 )
-                .expect("event should publish");
+                .with_context(EventContext {
+                    workspace_id: Some(workspace.clone()),
+                    ..EventContext::default()
+                }),
+            );
         }
 
         let mut events = Box::pin(event_envelope_stream(state, Some(workspace), None, Some(2)));

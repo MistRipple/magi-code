@@ -64,6 +64,16 @@ pub struct SkillDispatchSummary {
     pub failed_dispatches: usize,
 }
 
+pub(crate) struct WorkerReportInput {
+    pub worker_id: WorkerId,
+    pub task_id: TaskId,
+    pub stage: WorkerStage,
+    pub summary: String,
+    pub result_kind: Option<TaskResultKind>,
+    pub termination_reason: Option<TerminationReason>,
+    pub verification_status: VerificationStatus,
+}
+
 impl WorkerRuntime {
     pub fn finish(&self, worker_id: &WorkerId, summary: impl Into<String>) -> Option<WorkerRecord> {
         let task_id = self.current_task_id(worker_id)?;
@@ -73,15 +83,15 @@ impl WorkerRuntime {
             WorkerLifecycleStatus::Finished,
             WorkerStage::Finish,
         )?;
-        self.append_report(
-            worker_id.clone(),
+        self.append_report(WorkerReportInput {
+            worker_id: worker_id.clone(),
             task_id,
-            WorkerStage::Finish,
-            summary.into(),
-            Some(TaskResultKind::Success),
-            Some(TerminationReason::Completed),
-            VerificationStatus::Passed,
-        );
+            stage: WorkerStage::Finish,
+            summary: summary.into(),
+            result_kind: Some(TaskResultKind::Success),
+            termination_reason: Some(TerminationReason::Completed),
+            verification_status: VerificationStatus::Passed,
+        });
         Some(worker)
     }
 
@@ -93,15 +103,15 @@ impl WorkerRuntime {
             WorkerLifecycleStatus::Failed,
             WorkerStage::Finish,
         )?;
-        self.append_report(
-            worker_id.clone(),
+        self.append_report(WorkerReportInput {
+            worker_id: worker_id.clone(),
             task_id,
-            WorkerStage::Finish,
-            summary.into(),
-            Some(TaskResultKind::Failure),
-            Some(TerminationReason::Failed),
-            VerificationStatus::Failed,
-        );
+            stage: WorkerStage::Finish,
+            summary: summary.into(),
+            result_kind: Some(TaskResultKind::Failure),
+            termination_reason: Some(TerminationReason::Failed),
+            verification_status: VerificationStatus::Failed,
+        });
         Some(worker)
     }
 
@@ -111,15 +121,15 @@ impl WorkerRuntime {
         summary: impl Into<String>,
     ) -> Option<WorkerExecutionReport> {
         let task_id = self.current_task_id(worker_id)?;
-        Some(self.append_report(
-            worker_id.clone(),
+        Some(self.append_report(WorkerReportInput {
+            worker_id: worker_id.clone(),
             task_id,
-            WorkerStage::Review,
-            summary.into(),
-            None,
-            None,
-            VerificationStatus::Pending,
-        ))
+            stage: WorkerStage::Review,
+            summary: summary.into(),
+            result_kind: None,
+            termination_reason: None,
+            verification_status: VerificationStatus::Pending,
+        }))
     }
 
     pub fn record_verification(
@@ -129,15 +139,15 @@ impl WorkerRuntime {
         summary: impl Into<String>,
     ) -> Option<WorkerExecutionReport> {
         let task_id = self.current_task_id(worker_id)?;
-        Some(self.append_report(
-            worker_id.clone(),
+        Some(self.append_report(WorkerReportInput {
+            worker_id: worker_id.clone(),
             task_id,
-            WorkerStage::Verify,
-            summary.into(),
-            None,
-            None,
+            stage: WorkerStage::Verify,
+            summary: summary.into(),
+            result_kind: None,
+            termination_reason: None,
             verification_status,
-        ))
+        }))
     }
 
     pub fn record_repair_note(
@@ -146,15 +156,15 @@ impl WorkerRuntime {
         summary: impl Into<String>,
     ) -> Option<WorkerExecutionReport> {
         let task_id = self.current_task_id(worker_id)?;
-        Some(self.append_report(
-            worker_id.clone(),
+        Some(self.append_report(WorkerReportInput {
+            worker_id: worker_id.clone(),
             task_id,
-            WorkerStage::Repair,
-            summary.into(),
-            Some(TaskResultKind::Partial),
-            Some(TerminationReason::Blocked),
-            VerificationStatus::Pending,
-        ))
+            stage: WorkerStage::Repair,
+            summary: summary.into(),
+            result_kind: Some(TaskResultKind::Partial),
+            termination_reason: Some(TerminationReason::Blocked),
+            verification_status: VerificationStatus::Pending,
+        }))
     }
 
     pub fn reports(&self) -> Vec<WorkerExecutionReport> {
@@ -251,16 +261,16 @@ impl WorkerRuntime {
         Some(record)
     }
 
-    pub(crate) fn append_report(
-        &self,
-        worker_id: WorkerId,
-        task_id: TaskId,
-        stage: WorkerStage,
-        summary: String,
-        result_kind: Option<TaskResultKind>,
-        termination_reason: Option<TerminationReason>,
-        verification_status: VerificationStatus,
-    ) -> WorkerExecutionReport {
+    pub(crate) fn append_report(&self, input: WorkerReportInput) -> WorkerExecutionReport {
+        let WorkerReportInput {
+            worker_id,
+            task_id,
+            stage,
+            summary,
+            result_kind,
+            termination_reason,
+            verification_status,
+        } = input;
         let report = WorkerExecutionReport {
             worker_id: worker_id.clone(),
             task_id: task_id.clone(),

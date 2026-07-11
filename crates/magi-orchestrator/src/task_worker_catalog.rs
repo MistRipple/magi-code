@@ -31,10 +31,10 @@ pub fn default_task_role_for_kind(kind: TaskKind) -> Option<&'static str> {
 }
 
 pub fn resolve_task_role<'a>(task: &'a Task, registry: &AgentRoleRegistry) -> Option<&'a str> {
-    if let Some(role) = task.executor_binding_target_role() {
-        if registry.role_supports_task_kind(role, task.kind) {
-            return Some(role);
-        }
+    if let Some(role) = task.executor_binding_target_role()
+        && registry.role_supports_task_kind(role, task.kind)
+    {
+        return Some(role);
     }
     default_task_role_for_kind(task.kind)
 }

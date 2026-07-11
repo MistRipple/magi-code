@@ -350,7 +350,7 @@ impl DeterministicWorkerExecutor {
                 WorkerExecutionIntentStep::SkillDispatch {
                     tool_call_id: ToolCallId::new(format!("{prefix}-skill-1")),
                     tool_name: "process_inspect".to_string(),
-                    plan: Self::default_skill_plan("process_inspect"),
+                    plan: Box::new(Self::default_skill_plan("process_inspect")),
                     payload: "{\"mode\":\"loopback-skill\",\"target\":\"todo\"}".to_string(),
                     approval_requirement: ApprovalRequirement::None,
                     risk_level: RiskLevel::Low,

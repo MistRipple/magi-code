@@ -111,7 +111,7 @@ impl PreferenceMiner {
                     continue;
                 }
                 let behavior = behavior
-                    .split(|c: char| c == '，' || c == '。' || c == ',' || c == '.')
+                    .split(['，', '。', ',', '.'])
                     .next()
                     .unwrap_or(behavior)
                     .trim();
@@ -135,7 +135,7 @@ impl PreferenceMiner {
             if let Some(pos) = user_msg.find(prefix) {
                 let rest = &user_msg[pos + prefix.len()..];
                 let behavior = rest
-                    .split(|c: char| c == '，' || c == '。' || c == ',' || c == '.')
+                    .split(['，', '。', ',', '.'])
                     .next()
                     .unwrap_or(rest)
                     .trim();

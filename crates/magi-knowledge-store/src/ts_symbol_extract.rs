@@ -96,12 +96,11 @@ fn container_name(node: tree_sitter::Node, bytes: &[u8]) -> Option<String> {
     let mut current = node.parent();
     while let Some(n) = current {
         let kind = n.kind();
-        if kind == "class_declaration" || kind == "interface_declaration" || kind == "class" {
-            if let Some(name_node) = n.child_by_field_name("name") {
-                if let Ok(text) = name_node.utf8_text(bytes) {
-                    return Some(text.trim().to_string());
-                }
-            }
+        if (kind == "class_declaration" || kind == "interface_declaration" || kind == "class")
+            && let Some(name_node) = n.child_by_field_name("name")
+            && let Ok(text) = name_node.utf8_text(bytes)
+        {
+            return Some(text.trim().to_string());
         }
         current = n.parent();
     }

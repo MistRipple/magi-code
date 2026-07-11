@@ -5,20 +5,45 @@ use super::{
     ToolRuntimeSummaryEntry, WorkerRuntimeSummaryEntry, collect_unique_option_string,
 };
 
+pub(super) struct RuntimeAggregateComponents<'a> {
+    pub execution_groups: &'a [ExecutionGroupRuntimeSummaryEntry],
+    pub tasks: &'a [TaskRuntimeSummaryEntry],
+    pub assignments: &'a [AssignmentRuntimeSummaryEntry],
+    pub workers: &'a [WorkerRuntimeSummaryEntry],
+    pub tools: &'a [ToolRuntimeSummaryEntry],
+    pub recovery: &'a RecoveryReadModelInput,
+}
+
+pub(super) struct GovernanceDiagnosticCounts {
+    pub total: usize,
+    pub allowed: usize,
+    pub needs_approval: usize,
+    pub blocked: usize,
+    pub rejected: usize,
+}
+
+pub(super) struct GovernanceAttentionIds<'a> {
+    pub blocked_task_ids: &'a [String],
+    pub approval_required_task_ids: &'a [String],
+    pub rejected_task_ids: &'a [String],
+    pub blocked_worker_ids: &'a [String],
+    pub approval_required_worker_ids: &'a [String],
+    pub rejected_worker_ids: &'a [String],
+}
+
 impl RuntimeDiagnosticSummary {
     pub(super) fn from_components(
-        execution_groups: &[ExecutionGroupRuntimeSummaryEntry],
-        tasks: &[TaskRuntimeSummaryEntry],
-        assignments: &[AssignmentRuntimeSummaryEntry],
-        workers: &[WorkerRuntimeSummaryEntry],
-        tools: &[ToolRuntimeSummaryEntry],
-        recovery: &RecoveryReadModelInput,
-        governance_total_count: usize,
-        governance_allowed_count: usize,
-        governance_needs_approval_count: usize,
-        governance_blocked_count: usize,
-        governance_rejected_count: usize,
+        components: &RuntimeAggregateComponents<'_>,
+        governance: GovernanceDiagnosticCounts,
     ) -> Self {
+        let RuntimeAggregateComponents {
+            execution_groups,
+            tasks,
+            assignments,
+            workers,
+            tools,
+            recovery,
+        } = components;
         Self {
             running_execution_group_count: count_status(
                 execution_groups
@@ -79,11 +104,11 @@ impl RuntimeDiagnosticSummary {
             ),
             blocked_tool_count: tools.iter().map(|entry| entry.blocked_count).sum(),
             failed_tool_count: tools.iter().map(|entry| entry.failed_count).sum(),
-            governance_total_count,
-            governance_allowed_count,
-            governance_needs_approval_count,
-            governance_blocked_count,
-            governance_rejected_count,
+            governance_total_count: governance.total,
+            governance_allowed_count: governance.allowed,
+            governance_needs_approval_count: governance.needs_approval,
+            governance_blocked_count: governance.blocked,
+            governance_rejected_count: governance.rejected,
             rejected_skill_dispatch_count: workers
                 .iter()
                 .map(|entry| entry.rejected_dispatch_count)
@@ -150,19 +175,17 @@ impl RuntimeDiagnosticSummary {
 
 impl RuntimeAttentionSummary {
     pub(super) fn from_components(
-        execution_groups: &[ExecutionGroupRuntimeSummaryEntry],
-        tasks: &[TaskRuntimeSummaryEntry],
-        assignments: &[AssignmentRuntimeSummaryEntry],
-        workers: &[WorkerRuntimeSummaryEntry],
-        tools: &[ToolRuntimeSummaryEntry],
-        recovery: &RecoveryReadModelInput,
-        governance_blocked_task_ids: &[String],
-        governance_approval_required_task_ids: &[String],
-        governance_rejected_task_ids: &[String],
-        governance_blocked_worker_ids: &[String],
-        governance_approval_required_worker_ids: &[String],
-        governance_rejected_worker_ids: &[String],
+        components: &RuntimeAggregateComponents<'_>,
+        governance: GovernanceAttentionIds<'_>,
     ) -> Self {
+        let RuntimeAggregateComponents {
+            execution_groups,
+            tasks,
+            assignments,
+            workers,
+            tools,
+            recovery,
+        } = components;
         Self {
             failed_execution_group_ids: execution_groups
                 .iter()
@@ -194,13 +217,14 @@ impl RuntimeAttentionSummary {
                 .filter(|entry| entry.blocked_count > 0)
                 .map(|entry| entry.tool_name.clone())
                 .collect(),
-            governance_blocked_task_ids: governance_blocked_task_ids.to_vec(),
-            governance_approval_required_task_ids: governance_approval_required_task_ids.to_vec(),
-            governance_rejected_task_ids: governance_rejected_task_ids.to_vec(),
-            governance_blocked_worker_ids: governance_blocked_worker_ids.to_vec(),
-            governance_approval_required_worker_ids: governance_approval_required_worker_ids
+            governance_blocked_task_ids: governance.blocked_task_ids.to_vec(),
+            governance_approval_required_task_ids: governance.approval_required_task_ids.to_vec(),
+            governance_rejected_task_ids: governance.rejected_task_ids.to_vec(),
+            governance_blocked_worker_ids: governance.blocked_worker_ids.to_vec(),
+            governance_approval_required_worker_ids: governance
+                .approval_required_worker_ids
                 .to_vec(),
-            governance_rejected_worker_ids: governance_rejected_worker_ids.to_vec(),
+            governance_rejected_worker_ids: governance.rejected_worker_ids.to_vec(),
             rejected_skill_dispatch_worker_ids: workers
                 .iter()
                 .filter(|entry| entry.rejected_dispatch_count > 0)

@@ -16,10 +16,10 @@ pub fn evaluate_final_text(response: &LlmResponse, max_length: Option<usize>) ->
         return FinalTextAction::Reject;
     }
 
-    if let Some(max) = max_length {
-        if response.content.len() > max {
-            return FinalTextAction::Truncate { max_chars: max };
-        }
+    if let Some(max) = max_length
+        && response.content.len() > max
+    {
+        return FinalTextAction::Truncate { max_chars: max };
     }
 
     FinalTextAction::Accept

@@ -12,8 +12,8 @@ use magi_orchestrator::{ExecutionWritebackPlans, task_store::TaskStore};
 use magi_session_store::{ActiveExecutionBranch, ActiveExecutionChain, SessionStore};
 use magi_spawn_graph::SpawnGraph;
 use magi_worker_runtime::{
-    WorkerCheckpointResumeMode, WorkerExecutionBindingLifecycle, WorkerExecutionCheckpointCursor,
-    WorkerRuntime, WorkerStage,
+    WorkerBranchCheckpointState, WorkerCheckpointResumeMode, WorkerExecutionBindingLifecycle,
+    WorkerExecutionCheckpointCursor, WorkerRuntime, WorkerStage,
 };
 use magi_workspace::{RecoveryStatus, WorkspaceStore};
 
@@ -268,10 +268,12 @@ pub fn sync_branch_checkpoint_to_worker_runtime(
         &branch.task_id,
         &branch.worker_id,
         parse_branch_worker_stage(&branch.stage),
-        branch.lease_id.as_ref().map(ToString::to_string),
-        branch.execution_intent_ref.clone(),
-        parse_branch_binding_lifecycle(branch.binding_lifecycle.as_deref()),
-        branch_checkpoint_cursor(branch),
+        WorkerBranchCheckpointState {
+            lease_id: branch.lease_id.as_ref().map(ToString::to_string),
+            execution_intent_ref: branch.execution_intent_ref.clone(),
+            binding_lifecycle: parse_branch_binding_lifecycle(branch.binding_lifecycle.as_deref()),
+            checkpoint_cursor: branch_checkpoint_cursor(branch),
+        },
     );
 }
 

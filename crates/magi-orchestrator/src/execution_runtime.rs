@@ -1,5 +1,5 @@
 use crate::{
-    DispatchExecutionResult, ExecutionContextSummary, ExecutionWritebackPlans,
+    DispatchExecutionResult, DispatchWritebackRequest, ExecutionContextSummary,
     OrchestratedExecutionRuntime, OrchestratorCommandError, default_builtin_skill_plan,
     execution_overview, resolve_skill_tool_name,
 };
@@ -9,7 +9,6 @@ use magi_core::{
     WorkspaceId,
 };
 use magi_event_bus::{EventCategory, EventContext};
-use magi_memory_store::MemoryStore;
 use magi_skill_runtime::SkillToolRuntimePlan;
 use magi_tool_runtime::{ToolExecutionContextQuery, ToolExecutionPolicy, ToolExecutionSummary};
 use magi_worker_runtime::{
@@ -88,7 +87,7 @@ impl OrchestratedExecutionRuntime {
                 magi_worker_runtime::WorkerExecutionIntentStep::SkillDispatch {
                     tool_call_id: magi_core::ToolCallId::new(format!("{prefix}-skill-1")),
                     tool_name: skill_tool_name,
-                    plan: skill_plan,
+                    plan: Box::new(skill_plan),
                     payload: serde_json::json!({
                         "mission_id": target.mission_id.to_string(),
                         "assignment_id": assignment_id.as_ref().map(ToString::to_string),
@@ -148,14 +147,17 @@ impl OrchestratedExecutionRuntime {
 
     pub fn execute_dispatch_with_writebacks(
         &self,
-        target: TaskExecutionTarget,
-        worker_id: WorkerId,
-        session_id: Option<SessionId>,
-        workspace_id: Option<WorkspaceId>,
-        skill_plan: Option<SkillToolRuntimePlan>,
-        memory_store: MemoryStore,
-        writebacks: ExecutionWritebackPlans,
+        request: DispatchWritebackRequest,
     ) -> Result<DispatchExecutionResult, OrchestratorCommandError> {
+        let DispatchWritebackRequest {
+            target,
+            worker_id,
+            session_id,
+            workspace_id,
+            skill_plan,
+            memory_store,
+            writebacks,
+        } = request;
         self.execute_dispatch_then(
             target,
             worker_id,
@@ -313,14 +315,16 @@ impl OrchestratedExecutionRuntime {
             .service
             .build_execution_overview_from_task_projection(
                 &self.task_store,
-                &target,
-                session_id.clone(),
-                workspace_id.clone(),
-                self.worker_runtime.summary(),
-                tool_summary,
-                &snapshot.skill_dispatches,
-                &snapshot.governance_observations,
-                context_summary,
+                execution_overview::ExecutionOverviewProjectionInput {
+                    target: &target,
+                    session_id: session_id.clone(),
+                    workspace_id: workspace_id.clone(),
+                    worker_summary: self.worker_runtime.summary(),
+                    tool_summary,
+                    skill_dispatch_observations: &snapshot.skill_dispatches,
+                    governance_observations: &snapshot.governance_observations,
+                    context_summary,
+                },
             )
             .ok_or(OrchestratorCommandError::MissionNotFound {
                 mission_id: target.mission_id.clone(),
@@ -413,7 +417,6 @@ impl OrchestratedExecutionRuntime {
                 mission_id: Some(target.mission_id.clone()),
                 assignment_id: assignment_id.clone(),
                 task_id: Some(report.task_id.clone()),
-                ..EventContext::default()
             },
             serde_json::json!({
                 "worker_id": report.worker_id.to_string(),
@@ -452,7 +455,6 @@ impl OrchestratedExecutionRuntime {
                 mission_id: Some(target.mission_id.clone()),
                 assignment_id: assignment_id.clone(),
                 task_id: Some(observation.task_id.clone()),
-                ..EventContext::default()
             },
             serde_json::json!({
                 "worker_id": observation.worker_id.to_string(),

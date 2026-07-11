@@ -87,19 +87,19 @@ pub fn evaluate_risk(input: &RiskPolicyInput) -> RiskAssessment {
         signals.push("config_or_dependency_change".to_string());
     }
 
-    if let Some(failure_rate) = input.failure_rate {
-        if failure_rate >= 0.0 {
-            let failure_score = if failure_rate > 0.3 {
-                2
-            } else if failure_rate >= 0.1 {
-                1
-            } else {
-                0
-            };
-            if failure_score > 0 {
-                score += failure_score * 2;
-                signals.push(format!("failure_rate_{failure_score}"));
-            }
+    if let Some(failure_rate) = input.failure_rate
+        && failure_rate >= 0.0
+    {
+        let failure_score = if failure_rate > 0.3 {
+            2
+        } else if failure_rate >= 0.1 {
+            1
+        } else {
+            0
+        };
+        if failure_score > 0 {
+            score += failure_score * 2;
+            signals.push(format!("failure_rate_{failure_score}"));
         }
     }
 
@@ -147,10 +147,10 @@ fn count_modules(files: &HashSet<&str>) -> usize {
     for file in files {
         let normalized = file.replace('\\', "/");
         let normalized = normalized.strip_prefix("./").unwrap_or(&normalized);
-        if let Some(segment) = normalized.split('/').next() {
-            if !segment.is_empty() {
-                modules.insert(segment.to_string());
-            }
+        if let Some(segment) = normalized.split('/').next()
+            && !segment.is_empty()
+        {
+            modules.insert(segment.to_string());
         }
     }
     modules.len()

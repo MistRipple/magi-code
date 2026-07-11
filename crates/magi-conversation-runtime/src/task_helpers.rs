@@ -657,7 +657,7 @@ pub fn tool_call_round_limit(required_tool_chain: &[String]) -> usize {
 }
 
 pub fn canonical_tool_call_name(tool_name: &str) -> String {
-    BuiltinToolName::from_str(tool_name.trim())
+    BuiltinToolName::from_name(tool_name.trim())
         .map(|tool| tool.as_str().to_string())
         .unwrap_or_else(|| tool_name.trim().to_string())
 }

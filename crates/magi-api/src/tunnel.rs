@@ -6,6 +6,8 @@
 //! 3. 生成一次性访问 token
 //! 4. 解析隧道公网 URL
 
+use sha2::{Digest, Sha256};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -16,6 +18,13 @@ use tokio::sync::Mutex;
 const TUNNEL_ERROR_DEPENDENCY_UNAVAILABLE: &str = "tunnel_dependency_unavailable";
 const TUNNEL_ERROR_START_FAILED: &str = "tunnel_start_failed";
 const TUNNEL_ERROR_CONNECTION_LOST: &str = "tunnel_connection_lost";
+const CLOUDFLARED_VERSION: &str = "2026.7.1";
+
+#[derive(Clone, Copy)]
+struct DownloadArtifact {
+    url: &'static str,
+    sha256: &'static str,
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RemoteAccessBinding {
@@ -125,6 +134,30 @@ impl TunnelManager {
         self.inner.lock().await.local_port
     }
 
+    pub async fn authorize_public_request(&self, candidate: Option<&str>) -> bool {
+        let inner = self.inner.lock().await;
+        let Some(expected) = inner.state.token.as_deref() else {
+            return false;
+        };
+        candidate.is_some_and(|candidate| constant_time_eq(expected, candidate))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_token_for_test(local_port: u16, token: &str) -> Self {
+        let state = TunnelState {
+            token: Some(token.to_string()),
+            ..TunnelState::default()
+        };
+        Self {
+            inner: Arc::new(Mutex::new(TunnelInner {
+                state,
+                child: None,
+                local_port,
+                binding: RemoteAccessBinding::default(),
+            })),
+        }
+    }
+
     pub async fn start(&self, binding: RemoteAccessBinding) -> TunnelState {
         let mut inner = self.inner.lock().await;
         if inner.state.status == "running" || inner.state.status == "starting" {
@@ -161,7 +194,15 @@ impl TunnelManager {
         };
 
         // 生成 token
-        let token = generate_token();
+        let token = match generate_token() {
+            Ok(token) => token,
+            Err(error) => {
+                tracing::error!(error = %error, "secure tunnel token generation failed");
+                inner.state.status = "error".into();
+                inner.state.error = Some(TUNNEL_ERROR_START_FAILED.to_string());
+                return inner.state.clone();
+            }
+        };
         inner.state.token = Some(token.clone());
         inner.state.status = "starting".into();
         inner.state.error = None;
@@ -262,9 +303,17 @@ fn cloudflared_bin_name() -> &'static str {
     }
 }
 
+fn managed_cloudflared_bin_name() -> String {
+    if cfg!(target_os = "windows") {
+        format!("cloudflared-{CLOUDFLARED_VERSION}.exe")
+    } else {
+        format!("cloudflared-{CLOUDFLARED_VERSION}")
+    }
+}
+
 async fn resolve_cloudflared_path() -> Option<PathBuf> {
     // 1. ~/.magi/bin/
-    let local = magi_bin_dir().join(cloudflared_bin_name());
+    let local = magi_bin_dir().join(managed_cloudflared_bin_name());
     if local.exists() {
         return Some(local);
     }
@@ -278,12 +327,11 @@ async fn resolve_cloudflared_path() -> Option<PathBuf> {
         .arg("cloudflared")
         .output()
         .await
+        && output.status.success()
     {
-        if output.status.success() {
-            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !path.is_empty() && Path::new(&path).exists() {
-                return Some(PathBuf::from(path));
-            }
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !path.is_empty() && Path::new(&path).exists() {
+            return Some(PathBuf::from(path));
         }
     }
     None
@@ -292,10 +340,10 @@ async fn resolve_cloudflared_path() -> Option<PathBuf> {
 async fn install_cloudflared() -> Result<PathBuf, String> {
     let bin_dir = magi_bin_dir();
     std::fs::create_dir_all(&bin_dir).map_err(|e| e.to_string())?;
-    let dest = bin_dir.join(cloudflared_bin_name());
+    let dest = bin_dir.join(managed_cloudflared_bin_name());
 
-    let url = resolve_download_url().ok_or("不支持的平台/架构")?;
-    let is_tgz = url.ends_with(".tgz");
+    let artifact = resolve_download_artifact().ok_or("不支持的平台/架构")?;
+    let is_tgz = artifact.url.ends_with(".tgz");
 
     // 使用 curl 下载
     let download_dest = if is_tgz {
@@ -305,7 +353,7 @@ async fn install_cloudflared() -> Result<PathBuf, String> {
     };
 
     let status = tokio::process::Command::new("curl")
-        .args(["-fsSL", "-o", download_dest.to_str().unwrap(), url])
+        .args(["-fsSL", "-o", download_dest.to_str().unwrap(), artifact.url])
         .status()
         .await
         .map_err(|e| format!("curl 执行失败: {e}"))?;
@@ -314,13 +362,21 @@ async fn install_cloudflared() -> Result<PathBuf, String> {
         return Err("curl 下载失败".into());
     }
 
+    if let Err(error) = verify_sha256(&download_dest, artifact.sha256) {
+        let _ = std::fs::remove_file(&download_dest);
+        return Err(error);
+    }
+
     if is_tgz {
+        let extract_dir = bin_dir.join(format!("cloudflared-{CLOUDFLARED_VERSION}-extract"));
+        let _ = std::fs::remove_dir_all(&extract_dir);
+        std::fs::create_dir_all(&extract_dir).map_err(|error| error.to_string())?;
         let status = tokio::process::Command::new("tar")
             .args([
                 "-xzf",
                 download_dest.to_str().unwrap(),
                 "-C",
-                bin_dir.to_str().unwrap(),
+                extract_dir.to_str().unwrap(),
             ])
             .status()
             .await
@@ -328,6 +384,10 @@ async fn install_cloudflared() -> Result<PathBuf, String> {
         if !status.success() {
             return Err("tar 解压失败".into());
         }
+        let extracted = extract_dir.join(cloudflared_bin_name());
+        std::fs::rename(&extracted, &dest)
+            .map_err(|error| format!("安装 cloudflared 失败: {error}"))?;
+        let _ = std::fs::remove_dir_all(&extract_dir);
         let _ = std::fs::remove_file(&download_dest);
     }
 
@@ -344,43 +404,67 @@ async fn install_cloudflared() -> Result<PathBuf, String> {
     }
 }
 
-fn resolve_download_url() -> Option<&'static str> {
+fn resolve_download_artifact() -> Option<DownloadArtifact> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("macos", "aarch64") => Some(
-            "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-arm64.tgz",
-        ),
-        ("macos", "x86_64") => Some(
-            "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-amd64.tgz",
-        ),
-        ("linux", "aarch64") => Some(
-            "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64",
-        ),
-        ("linux", "x86_64") => Some(
-            "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64",
-        ),
-        ("windows", "x86_64") => Some(
-            "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe",
-        ),
+        ("macos", "aarch64") => Some(DownloadArtifact {
+            url: "https://github.com/cloudflare/cloudflared/releases/download/2026.7.1/cloudflared-darwin-arm64.tgz",
+            sha256: "6d4b59383cdad387834d7ae5704fc512882b2d078074bf5770e02b186a0981ed",
+        }),
+        ("macos", "x86_64") => Some(DownloadArtifact {
+            url: "https://github.com/cloudflare/cloudflared/releases/download/2026.7.1/cloudflared-darwin-amd64.tgz",
+            sha256: "05871d772745b0f8398c7be89113a0b178474936ff20638b3b07c0e7262f717e",
+        }),
+        ("linux", "aarch64") => Some(DownloadArtifact {
+            url: "https://github.com/cloudflare/cloudflared/releases/download/2026.7.1/cloudflared-linux-arm64",
+            sha256: "18f2c9bfc7a67a971bd96f1a5a1935def3c1e52aa386626f1566f04e9b5478d6",
+        }),
+        ("linux", "x86_64") => Some(DownloadArtifact {
+            url: "https://github.com/cloudflare/cloudflared/releases/download/2026.7.1/cloudflared-linux-amd64",
+            sha256: "79a0ade7fc854f62c1aaef48424d9d979e8c2fcd039189d24db82b84cd146be1",
+        }),
+        ("windows", "x86_64") => Some(DownloadArtifact {
+            url: "https://github.com/cloudflare/cloudflared/releases/download/2026.7.1/cloudflared-windows-amd64.exe",
+            sha256: "ccb0756de288d3c2c076d19764ca53e0849a10f2dd9c23f8656ac42bdeb45001",
+        }),
         _ => None,
     }
 }
 
-fn generate_token() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    format!("{:x}{:x}", ts, rand_u64())
+fn verify_sha256(path: &Path, expected: &str) -> Result<(), String> {
+    let mut file = std::fs::File::open(path).map_err(|error| error.to_string())?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).map_err(|error| error.to_string())?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let actual = format!("{:x}", hasher.finalize());
+    if constant_time_eq(&actual, expected) {
+        Ok(())
+    } else {
+        Err("cloudflared 完整性校验失败".to_string())
+    }
 }
 
-fn rand_u64() -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    std::time::Instant::now().hash(&mut hasher);
-    std::thread::current().id().hash(&mut hasher);
-    hasher.finish()
+fn generate_token() -> Result<String, getrandom::Error> {
+    let mut bytes = [0_u8; 32];
+    getrandom::fill(&mut bytes)?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+fn constant_time_eq(left: &str, right: &str) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.bytes()
+        .zip(right.bytes())
+        .fold(0_u8, |difference, (left, right)| {
+            difference | (left ^ right)
+        })
+        == 0
 }
 
 fn extract_tunnel_url(line: &str) -> Option<String> {
@@ -399,6 +483,42 @@ fn extract_tunnel_url(line: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn public_tunnel_request_requires_current_token() {
+        let manager = TunnelManager::new_with_token_for_test(38123, "secret-token");
+
+        assert!(!manager.authorize_public_request(Some("wrong-token")).await);
+        assert!(!manager.authorize_public_request(None).await);
+        assert!(manager.authorize_public_request(Some("secret-token")).await);
+    }
+
+    #[test]
+    fn generated_tokens_have_256_bits_of_hex_entropy() {
+        let token = generate_token().expect("token generation should succeed");
+        assert_eq!(token.len(), 64);
+        assert!(token.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_ne!(
+            token,
+            generate_token().expect("second token should succeed")
+        );
+    }
+
+    #[test]
+    fn managed_binary_requires_matching_sha256() {
+        let dir = tempfile::tempdir().expect("tempdir should create");
+        let path = dir.path().join("cloudflared");
+        std::fs::write(&path, b"verified binary").expect("fixture should write");
+
+        assert!(
+            verify_sha256(
+                &path,
+                "86fd6fb55a10988213329d914da3f5fbbc213ee143b46148ed21b60d9454e3dc",
+            )
+            .is_ok()
+        );
+        assert!(verify_sha256(&path, &"0".repeat(64)).is_err());
+    }
 
     #[test]
     fn tunnel_state_error_uses_stable_marker() {

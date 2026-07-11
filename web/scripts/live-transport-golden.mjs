@@ -72,5 +72,27 @@ await withGoldenViteServer(async (server) => {
     'client-initiated close must not be reported as a transport failure',
   );
 
+  const requestedUrls = [];
+  globalThis.window = {
+    location: {
+      href: 'https://example.trycloudflare.com/web.html?tunnel_token=secret-token',
+    },
+  };
+  globalThis.fetch = async (url) => {
+    requestedUrls.push(String(url));
+    return new Response('{}', { status: 200 });
+  };
+  await transport.request('https://example.trycloudflare.com/api/goals/current?sessionId=session-1');
+  const publicRequestUrl = new URL(requestedUrls[0]);
+  assert.equal(publicRequestUrl.searchParams.get('tunnel_token'), 'secret-token');
+
+  transport.connectEventStream('https://example.trycloudflare.com/events?sessionId=session-1', {
+    onOpen() {},
+    onMessage() {},
+    onError() {},
+  });
+  const publicStreamUrl = new URL(FakeEventSource.instances.at(-1).url);
+  assert.equal(publicStreamUrl.searchParams.get('tunnel_token'), 'secret-token');
+
   console.log('live transport golden replay passed');
 });

@@ -12,7 +12,8 @@ use magi_worker_runtime::{
     LocalProcessExecutorCapability, LocalProcessExecutorHealth, LocalProcessExecutorHealthStatus,
     LocalProcessWorkerExecutor, SkillDispatchSummary, WorkerExecutionFinalReport,
     WorkerExecutionStepKind, WorkerExecutionTrace, WorkerExecutor, WorkerExecutorFailure,
-    WorkerExecutorKind, WorkerExecutorProbe, WorkerRuntime, WorkerSkillDispatchObservation,
+    WorkerExecutorKind, WorkerExecutorProbe, WorkerGovernanceObservation, WorkerRuntime,
+    WorkerSkillDispatchObservation,
 };
 use std::sync::{Arc, Mutex};
 
@@ -77,7 +78,7 @@ fn seed_action_tasks(
             kind: TaskKind::LocalAgent,
             title: (*title).to_string(),
             goal: (*title).to_string(),
-            status: status.clone(),
+            status: *status,
             dependency_ids: Vec::new(),
             required_children: Vec::new(),
             policy_snapshot: None,
@@ -197,35 +198,50 @@ fn seed_task_hierarchy(
     root_task_id
 }
 
+struct TaskProjectionOverviewFixture<'a> {
+    mission_id: &'a MissionId,
+    root_task_id: &'a TaskId,
+    worker_summary: WorkerRuntimeSummary,
+    tool_summary: ToolExecutionSummary,
+    skill_dispatch_observations: &'a [WorkerSkillDispatchObservation],
+    governance_observations: &'a [WorkerGovernanceObservation],
+    context_summary: Option<ExecutionContextSummary>,
+}
+
 fn build_task_projection_overview(
     service: &OrchestratorService,
     task_store: &TaskStore,
-    mission_id: &MissionId,
-    root_task_id: &TaskId,
-    worker_summary: WorkerRuntimeSummary,
-    tool_summary: ToolExecutionSummary,
-    skill_dispatch_observations: &[WorkerSkillDispatchObservation],
-    governance_observations: &[WorkerGovernanceObservation],
-    context_summary: Option<ExecutionContextSummary>,
+    fixture: TaskProjectionOverviewFixture<'_>,
 ) -> ExecutionOverview {
+    let TaskProjectionOverviewFixture {
+        mission_id,
+        root_task_id,
+        worker_summary,
+        tool_summary,
+        skill_dispatch_observations,
+        governance_observations,
+        context_summary,
+    } = fixture;
     service
         .build_execution_overview_from_task_projection(
             task_store,
-            &TaskExecutionTarget {
-                mission_id: mission_id.clone(),
-                root_task_id: root_task_id.clone(),
-                task_id: root_task_id.clone(),
-                requested_worker_id: None,
-                recovery_id: None,
-                execution_chain_ref: None,
+            execution_overview::ExecutionOverviewProjectionInput {
+                target: &TaskExecutionTarget {
+                    mission_id: mission_id.clone(),
+                    root_task_id: root_task_id.clone(),
+                    task_id: root_task_id.clone(),
+                    requested_worker_id: None,
+                    recovery_id: None,
+                    execution_chain_ref: None,
+                },
+                session_id: None,
+                workspace_id: None,
+                worker_summary,
+                tool_summary,
+                skill_dispatch_observations,
+                governance_observations,
+                context_summary,
             },
-            None,
-            None,
-            worker_summary,
-            tool_summary,
-            skill_dispatch_observations,
-            governance_observations,
-            context_summary,
         )
         .expect("task projection overview should be built")
 }
@@ -423,13 +439,15 @@ fn execution_overview_exports_context_consumption_into_runtime_read_model() {
     let overview = build_task_projection_overview(
         &service,
         &task_store,
-        &mission_id,
-        &root_task_id,
-        worker_summary(0),
-        ToolExecutionSummary::default(),
-        &[],
-        &[],
-        Some(context_summary.clone()),
+        TaskProjectionOverviewFixture {
+            mission_id: &mission_id,
+            root_task_id: &root_task_id,
+            worker_summary: worker_summary(0),
+            tool_summary: ToolExecutionSummary::default(),
+            skill_dispatch_observations: &[],
+            governance_observations: &[],
+            context_summary: Some(context_summary.clone()),
+        },
     );
 
     let overview_context = overview
@@ -612,13 +630,15 @@ fn agent_run_projection_aggregates_governance_summaries_by_layer() {
     let overview = build_task_projection_overview(
         &service,
         &task_store,
-        &mission_id,
-        &root_task_id,
-        worker_summary(0),
-        ToolExecutionSummary::default(),
-        &[],
-        &governance_observations,
-        None,
+        TaskProjectionOverviewFixture {
+            mission_id: &mission_id,
+            root_task_id: &root_task_id,
+            worker_summary: worker_summary(0),
+            tool_summary: ToolExecutionSummary::default(),
+            skill_dispatch_observations: &[],
+            governance_observations: &governance_observations,
+            context_summary: None,
+        },
     );
 
     assert_eq!(overview.governance_summary.total_checks, 5);
@@ -1032,15 +1052,15 @@ fn execution_runtime_execute_dispatch_with_writebacks_persists_memory_extraction
     ));
 
     let result = execution_runtime
-        .execute_dispatch_with_writebacks(
-            direct_execution_target(&mission_id, &task_id),
-            WorkerId::new("worker-dispatch-writeback-success"),
-            Some(session_id),
-            Some(WorkspaceId::new("workspace-dispatch-writeback-success")),
-            None,
-            memory_store.clone(),
+        .execute_dispatch_with_writebacks(DispatchWritebackRequest {
+            target: direct_execution_target(&mission_id, &task_id),
+            worker_id: WorkerId::new("worker-dispatch-writeback-success"),
+            session_id: Some(session_id),
+            workspace_id: Some(WorkspaceId::new("workspace-dispatch-writeback-success")),
+            skill_plan: None,
+            memory_store: memory_store.clone(),
             writebacks,
-        )
+        })
         .expect("execution should run");
 
     assert_eq!(result.target.task_id, task_id);
@@ -1412,15 +1432,15 @@ fn execution_runtime_execute_dispatch_with_writebacks_skips_writeback_on_failure
     ));
 
     let error = execution_runtime
-        .execute_dispatch_with_writebacks(
-            direct_execution_target(&mission_id, &task_id),
-            WorkerId::new("worker-dispatch-writeback-failure"),
-            Some(SessionId::new("session-dispatch-writeback-failure")),
-            Some(WorkspaceId::new("workspace-dispatch-writeback-failure")),
-            None,
-            memory_store.clone(),
+        .execute_dispatch_with_writebacks(DispatchWritebackRequest {
+            target: direct_execution_target(&mission_id, &task_id),
+            worker_id: WorkerId::new("worker-dispatch-writeback-failure"),
+            session_id: Some(SessionId::new("session-dispatch-writeback-failure")),
+            workspace_id: Some(WorkspaceId::new("workspace-dispatch-writeback-failure")),
+            skill_plan: None,
+            memory_store: memory_store.clone(),
             writebacks,
-        )
+        })
         .expect_err("unhealthy executor should be rejected before writeback");
 
     match error {
@@ -1593,18 +1613,20 @@ fn multi_task_execution_with_mixed_outcomes_aggregates_in_overview() {
     let overview = build_task_projection_overview(
         &service,
         &task_store,
-        &mission_id,
-        &root_task_id,
-        worker_summary(2),
-        ToolExecutionSummary {
-            total_invocations: 4,
-            successful_invocations: 3,
-            failed_invocations: 1,
-            blocked_invocations: 0,
+        TaskProjectionOverviewFixture {
+            mission_id: &mission_id,
+            root_task_id: &root_task_id,
+            worker_summary: worker_summary(2),
+            tool_summary: ToolExecutionSummary {
+                total_invocations: 4,
+                successful_invocations: 3,
+                failed_invocations: 1,
+                blocked_invocations: 0,
+            },
+            skill_dispatch_observations: &skill_observations,
+            governance_observations: &governance_observations,
+            context_summary: None,
         },
-        &skill_observations,
-        &governance_observations,
-        None,
     );
 
     // Mission-level assertions
@@ -2366,12 +2388,14 @@ mod auto_learning_tests {
 
         let raw = mgr.capture(
             &input,
-            &["请实现用户认证"],
-            &["好的，我来实现"],
-            "完成用户认证功能",
-            vec!["使用 JWT 方案".to_string()],
-            vec!["JWT 适合无状态认证".to_string()],
-            vec![],
+            AutoLearningCaptureContent {
+                user_messages: &["请实现用户认证"],
+                assistant_messages: &["好的，我来实现"],
+                summary: "完成用户认证功能",
+                decisions: vec!["使用 JWT 方案".to_string()],
+                learnings: vec!["JWT 适合无状态认证".to_string()],
+                warnings: vec![],
+            },
         );
 
         assert_eq!(raw.session_id, "s1");
@@ -2395,14 +2419,17 @@ mod auto_learning_tests {
         };
 
         for i in 0..3 {
+            let summary = format!("摘要 {i}");
             mgr.capture(
                 &input,
-                &["继续"],
-                &["好的"],
-                &format!("摘要 {i}"),
-                vec![format!("决策 {i}")],
-                vec![format!("学习 {i}")],
-                vec![format!("警告 {i}")],
+                AutoLearningCaptureContent {
+                    user_messages: &["继续"],
+                    assistant_messages: &["好的"],
+                    summary: &summary,
+                    decisions: vec![format!("决策 {i}")],
+                    learnings: vec![format!("学习 {i}")],
+                    warnings: vec![format!("警告 {i}")],
+                },
             );
         }
 

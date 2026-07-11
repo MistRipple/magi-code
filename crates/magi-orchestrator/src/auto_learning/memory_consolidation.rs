@@ -32,20 +32,11 @@ pub struct ConsolidationResult {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[derive(Default)]
 pub struct ConsolidationState {
     pub last_consolidation_at: u64,
     pub last_processed_count: usize,
     pub total_consolidations: usize,
-}
-
-impl Default for ConsolidationState {
-    fn default() -> Self {
-        Self {
-            last_consolidation_at: 0,
-            last_processed_count: 0,
-            total_consolidations: 0,
-        }
-    }
 }
 
 #[derive(Clone, Debug)]

@@ -365,19 +365,16 @@ impl DependencyGraph {
             for pat in &self.patterns.es_import {
                 if let Some(caps) = pat.captures(trimmed) {
                     let module_path = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-                    if !module_path.is_empty() && is_internal(&self.path_aliases, module_path) {
-                        if let Some(resolved) = resolve_module(
+                    if !module_path.is_empty()
+                        && is_internal(&self.path_aliases, module_path)
+                        && let Some(resolved) = resolve_module(
                             &self.path_aliases,
                             &self.file_set,
                             file_path,
                             module_path,
-                        ) {
-                            collected_edges.push((
-                                file_path.to_string(),
-                                resolved,
-                                ImportType::Static,
-                            ));
-                        }
+                        )
+                    {
+                        collected_edges.push((file_path.to_string(), resolved, ImportType::Static));
                     }
                 }
             }
@@ -386,19 +383,16 @@ impl DependencyGraph {
             for pat in &self.patterns.reexport {
                 if let Some(caps) = pat.captures(trimmed) {
                     let module_path = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-                    if !module_path.is_empty() && is_internal(&self.path_aliases, module_path) {
-                        if let Some(resolved) = resolve_module(
+                    if !module_path.is_empty()
+                        && is_internal(&self.path_aliases, module_path)
+                        && let Some(resolved) = resolve_module(
                             &self.path_aliases,
                             &self.file_set,
                             file_path,
                             module_path,
-                        ) {
-                            collected_edges.push((
-                                file_path.to_string(),
-                                resolved,
-                                ImportType::Static,
-                            ));
-                        }
+                        )
+                    {
+                        collected_edges.push((file_path.to_string(), resolved, ImportType::Static));
                     }
                 }
             }
@@ -406,32 +400,24 @@ impl DependencyGraph {
             // require()
             for caps in self.patterns.require.captures_iter(line) {
                 let module_path = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-                if !module_path.is_empty() && is_internal(&self.path_aliases, module_path) {
-                    if let Some(resolved) =
+                if !module_path.is_empty()
+                    && is_internal(&self.path_aliases, module_path)
+                    && let Some(resolved) =
                         resolve_module(&self.path_aliases, &self.file_set, file_path, module_path)
-                    {
-                        collected_edges.push((
-                            file_path.to_string(),
-                            resolved,
-                            ImportType::Require,
-                        ));
-                    }
+                {
+                    collected_edges.push((file_path.to_string(), resolved, ImportType::Require));
                 }
             }
 
             // dynamic import()
             for caps in self.patterns.dynamic_import.captures_iter(line) {
                 let module_path = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-                if !module_path.is_empty() && is_internal(&self.path_aliases, module_path) {
-                    if let Some(resolved) =
+                if !module_path.is_empty()
+                    && is_internal(&self.path_aliases, module_path)
+                    && let Some(resolved) =
                         resolve_module(&self.path_aliases, &self.file_set, file_path, module_path)
-                    {
-                        collected_edges.push((
-                            file_path.to_string(),
-                            resolved,
-                            ImportType::Dynamic,
-                        ));
-                    }
+                {
+                    collected_edges.push((file_path.to_string(), resolved, ImportType::Dynamic));
                 }
             }
 

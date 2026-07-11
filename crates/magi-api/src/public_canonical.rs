@@ -83,7 +83,7 @@ fn public_canonical_tool_value(
     }
     let mut public_value = serde_json::from_str(&public)
         .ok()
-        .or_else(|| Some(Value::String(public)))?;
+        .or(Some(Value::String(public)))?;
     preserve_public_tool_path_labels(&original, &mut public_value, preserve_raw_path_string);
     preserve_public_apply_patch_path_labels(tool_name, &original, &mut public_value);
     Some(public_value)
@@ -174,10 +174,10 @@ fn preserve_public_tool_path_labels(
             }
         }
         (Value::String(original_text), public_value) if preserve_raw_path_string => {
-            if public_value == PUBLIC_REDACTED_PATH {
-                if let Some(label) = public_path_label(original_text) {
-                    *public_value = Value::String(label);
-                }
+            if public_value == PUBLIC_REDACTED_PATH
+                && let Some(label) = public_path_label(original_text)
+            {
+                *public_value = Value::String(label);
             }
         }
         _ => {}

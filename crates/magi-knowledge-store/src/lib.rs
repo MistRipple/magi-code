@@ -39,6 +39,10 @@ pub use state::KnowledgeState;
 
 const PROJECT_CODE_INDEX_ID: &str = "project-code-index";
 
+fn zero_utc_millis() -> UtcMillis {
+    UtcMillis(0)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum KnowledgeKind {
     Adr,
@@ -57,6 +61,8 @@ pub struct KnowledgeRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<WorkspaceId>,
     pub source_ref: Option<String>,
+    #[serde(default = "zero_utc_millis")]
+    pub created_at: UtcMillis,
     pub updated_at: UtcMillis,
 }
 
@@ -159,7 +165,12 @@ impl KnowledgeStore {
         Self::default()
     }
 
-    pub fn from_state(state: KnowledgeState) -> Self {
+    pub fn from_state(mut state: KnowledgeState) -> Self {
+        for record in state.entries.values_mut() {
+            if record.created_at.0 == 0 {
+                record.created_at = record.updated_at;
+            }
+        }
         Self {
             state: Arc::new(RwLock::new(state)),
             search_engines: Arc::default(),
@@ -473,6 +484,7 @@ impl KnowledgeStore {
             tags: normalized.tags,
             workspace_id,
             source_ref: normalized.source_ref,
+            created_at: normalized.updated_at,
             updated_at: normalized.updated_at,
         };
         let indexed_terms = KnowledgeIndexer::build_terms_with_context(

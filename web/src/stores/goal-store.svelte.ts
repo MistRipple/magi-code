@@ -13,6 +13,7 @@ interface InternalGoalState extends GoalState {
   workspaceId: string;
   workspacePath: string;
   fetchGeneration: number;
+  requestController: AbortController | null;
 }
 
 const EMPTY_GOAL_STATE: GoalState = {
@@ -42,12 +43,6 @@ function createClient(): RustDaemonClient {
   return new RustDaemonClient(resolveAgentBaseUrl());
 }
 
-function timeoutAfter(ms: number): Promise<never> {
-  return new Promise((_, reject) => {
-    setTimeout(() => reject(new Error('goal_request_timeout')), ms);
-  });
-}
-
 function writeGoalState(key: string, patch: Partial<InternalGoalState>): InternalGoalState {
   if (!goalStates[key]) {
     goalStates[key] = {
@@ -56,6 +51,7 @@ function writeGoalState(key: string, patch: Partial<InternalGoalState>): Interna
       workspaceId: '',
       workspacePath: '',
       fetchGeneration: 0,
+      requestController: null,
     };
   }
   Object.assign(goalStates[key], patch);
@@ -105,6 +101,7 @@ export async function refreshCurrentGoal(
 ): Promise<void> {
   const state = ensureGoalState(sessionId, workspaceId, workspacePath) as InternalGoalState;
   if (!state.sessionId) return;
+  if (state.requestController) return;
   const generation = state.fetchGeneration + 1;
   const key = goalScopeKey(state.workspaceId, state.sessionId);
   if (!key) return;
@@ -114,25 +111,15 @@ export async function refreshCurrentGoal(
     error: null,
     fetchGeneration: generation,
   });
-  setTimeout(() => {
-    const current = goalStates[key];
-    if (current?.loading) {
-      writeGoalState(key, {
-        loading: false,
-        error: current.error ?? 'goal_request_timeout',
-      });
-    }
-  }, GOAL_REQUEST_TIMEOUT_MS);
+  const controller = new AbortController();
+  state.requestController = controller;
+  const timeout = setTimeout(() => controller.abort('goal_request_timeout'), GOAL_REQUEST_TIMEOUT_MS);
   try {
-    const response = await Promise.race(
-      [
-        createClient().getCurrentGoal(
-          state.sessionId,
-          state.workspaceId,
-          state.workspacePath,
-        ),
-        timeoutAfter(GOAL_REQUEST_TIMEOUT_MS),
-      ],
+    const response = await createClient().getCurrentGoal(
+      state.sessionId,
+      state.workspaceId,
+      state.workspacePath,
+      controller.signal,
     );
     const current = goalStates[key];
     if (!current || current.fetchGeneration !== generation) return;
@@ -146,7 +133,16 @@ export async function refreshCurrentGoal(
     if (!current || current.fetchGeneration !== generation) return;
     writeGoalState(key, {
       loading: false,
-      error: error instanceof Error ? error.message : String(error),
+      error: controller.signal.aborted
+        ? 'goal_request_timeout'
+        : error instanceof Error ? error.message : String(error),
     });
+  } finally {
+    clearTimeout(timeout);
+    const current = goalStates[key];
+    if (current?.fetchGeneration === generation && current.requestController === controller) {
+      current.requestController = null;
+      current.loading = false;
+    }
   }
 }

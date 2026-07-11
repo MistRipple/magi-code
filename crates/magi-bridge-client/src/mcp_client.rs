@@ -12,12 +12,15 @@ use std::{
     sync::{
         Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc::{self, Receiver, RecvTimeoutError},
     },
+    time::Duration,
 };
 
 const MCP_SERVER_COMMAND_ENV: &str = "MAGI_MCP_SERVER_COMMAND";
 const MCP_SERVER_ARGS_ENV: &str = "MAGI_MCP_SERVER_ARGS";
 const MCP_SERVER_WORKING_DIR_ENV: &str = "MAGI_MCP_SERVER_WORKING_DIR";
+const DEFAULT_MCP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Configuration for connecting to a real MCP server via stdio transport.
 #[derive(Clone, Debug)]
@@ -26,6 +29,7 @@ pub struct McpServerConfig {
     pub args: Vec<String>,
     pub working_directory: Option<PathBuf>,
     pub env: BTreeMap<String, String>,
+    pub request_timeout: Duration,
 }
 
 impl McpServerConfig {
@@ -48,6 +52,7 @@ impl McpServerConfig {
             args,
             working_directory,
             env: BTreeMap::new(),
+            request_timeout: DEFAULT_MCP_REQUEST_TIMEOUT,
         })
     }
 
@@ -58,6 +63,7 @@ impl McpServerConfig {
             args,
             working_directory: None,
             env: BTreeMap::new(),
+            request_timeout: DEFAULT_MCP_REQUEST_TIMEOUT,
         }
     }
 
@@ -68,6 +74,11 @@ impl McpServerConfig {
 
     pub fn with_env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.env.insert(key.into(), value.into());
+        self
+    }
+
+    pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = timeout.max(Duration::from_millis(100));
         self
     }
 }
@@ -94,7 +105,7 @@ pub struct StdioMcpBridgeClient {
 
 struct McpConnection {
     child: Child,
-    reader: BufReader<std::process::ChildStdout>,
+    responses: Receiver<Result<Value, String>>,
     writer: std::process::ChildStdin,
 }
 
@@ -204,7 +215,7 @@ impl StdioMcpBridgeClient {
 
         let mut conn = McpConnection {
             child,
-            reader: BufReader::new(stdout),
+            responses: spawn_mcp_stdout_reader(stdout),
             writer: stdin,
         };
 
@@ -225,8 +236,18 @@ impl StdioMcpBridgeClient {
         });
 
         send_json(&mut conn.writer, &init_request)?;
-        let init_response = read_json_response(&mut conn.reader)?;
-        validate_jsonrpc_response(&init_response, init_id)?;
+        let init_response =
+            match receive_json_response(&conn.responses, self.config.request_timeout) {
+                Ok(response) => response,
+                Err(error) => {
+                    terminate_mcp_connection(&mut conn);
+                    return Err(error);
+                }
+            };
+        if let Err(error) = validate_jsonrpc_response(&init_response, init_id) {
+            terminate_mcp_connection(&mut conn);
+            return Err(error);
+        }
 
         // Step 2: Send initialized notification (no id = notification)
         let initialized_notification = json!({
@@ -262,8 +283,23 @@ impl StdioMcpBridgeClient {
         });
 
         send_json(&mut conn.writer, &request)?;
-        let response = read_json_response(&mut conn.reader)?;
-        validate_jsonrpc_response(&response, request_id)?;
+        let response = match receive_json_response(&conn.responses, self.config.request_timeout) {
+            Ok(response) => response,
+            Err(error) => {
+                if let Some(mut failed) = connection_guard.take() {
+                    terminate_mcp_connection(&mut failed);
+                }
+                self.initialized.store(false, Ordering::Relaxed);
+                return Err(error);
+            }
+        };
+        if let Err(error) = validate_jsonrpc_response(&response, request_id) {
+            if let Some(mut failed) = connection_guard.take() {
+                terminate_mcp_connection(&mut failed);
+            }
+            self.initialized.store(false, Ordering::Relaxed);
+            return Err(error);
+        }
 
         // Extract result
         response
@@ -338,11 +374,10 @@ fn parse_mcp_tool_arguments(input: &str) -> Result<Value, BridgeClientError> {
 
 impl Drop for StdioMcpBridgeClient {
     fn drop(&mut self) {
-        if let Ok(mut guard) = self.connection.lock() {
-            if let Some(mut conn) = guard.take() {
-                let _ = conn.child.kill();
-                let _ = conn.child.wait();
-            }
+        if let Ok(mut guard) = self.connection.lock()
+            && let Some(mut conn) = guard.take()
+        {
+            terminate_mcp_connection(&mut conn);
         }
     }
 }
@@ -372,38 +407,66 @@ fn send_json(writer: &mut impl Write, value: &Value) -> Result<(), BridgeClientE
     Ok(())
 }
 
-fn read_json_response(reader: &mut impl BufRead) -> Result<Value, BridgeClientError> {
-    // MCP servers may emit log messages or notifications before the response.
-    // We need to skip those and find the actual response (which has an "id" field).
-    loop {
-        let mut line = String::new();
-        let bytes_read = reader.read_line(&mut line).map_err(|error| {
-            mcp_transport_error(format!("read from MCP server failed: {error}"))
-        })?;
-        if bytes_read == 0 {
-            return Err(mcp_transport_error(
-                "MCP server closed stdout before sending response".to_string(),
-            ));
+fn spawn_mcp_stdout_reader(stdout: std::process::ChildStdout) -> Receiver<Result<Value, String>> {
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        loop {
+            let mut line = String::new();
+            let read = match reader.read_line(&mut line) {
+                Ok(read) => read,
+                Err(error) => {
+                    let _ = sender.send(Err(format!("read from MCP server failed: {error}")));
+                    return;
+                }
+            };
+            if read == 0 {
+                let _ = sender.send(Err(
+                    "MCP server closed stdout before sending response".to_string()
+                ));
+                return;
+            }
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let value: Value = match serde_json::from_str(trimmed) {
+                Ok(value) => value,
+                Err(error) => {
+                    let _ = sender.send(Err(format!(
+                        "parse MCP response failed: {error}; raw={trimmed}"
+                    )));
+                    return;
+                }
+            };
+            if value.get("id").is_some() && sender.send(Ok(value)).is_err() {
+                return;
+            }
         }
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
+    });
+    receiver
+}
 
-        let value: Value =
-            serde_json::from_str(trimmed).map_err(|error| BridgeClientError::CallFailed {
-                layer: BridgeErrorLayer::Protocol,
-                code: None,
-                message: format!("parse MCP response failed: {error}; raw={trimmed}"),
-            })?;
-
-        // Skip notifications (messages without "id") -- these are server-initiated
-        // log messages, progress updates, etc.
-        if value.get("id").is_some() {
-            return Ok(value);
-        }
-        // Otherwise skip this line and read the next one
+fn receive_json_response(
+    responses: &Receiver<Result<Value, String>>,
+    timeout: Duration,
+) -> Result<Value, BridgeClientError> {
+    match responses.recv_timeout(timeout) {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(message)) => Err(mcp_transport_error(message)),
+        Err(RecvTimeoutError::Timeout) => Err(mcp_transport_error(format!(
+            "MCP request timeout after {} ms",
+            timeout.as_millis()
+        ))),
+        Err(RecvTimeoutError::Disconnected) => Err(mcp_transport_error(
+            "MCP response channel disconnected".to_string(),
+        )),
     }
+}
+
+fn terminate_mcp_connection(connection: &mut McpConnection) {
+    let _ = connection.child.kill();
+    let _ = connection.child.wait();
 }
 
 fn validate_jsonrpc_response(response: &Value, expected_id: u64) -> Result<(), BridgeClientError> {
@@ -714,6 +777,33 @@ done
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn stdio_mcp_client_times_out_and_invalidates_hung_connection() {
+        let script = r#"
+while IFS= read -r line; do
+    sleep 2
+done
+"#;
+        let config = McpServerConfig::new("sh", vec!["-c".to_string(), script.to_string()])
+            .with_request_timeout(std::time::Duration::from_millis(100));
+        let client = StdioMcpBridgeClient::new(config);
+
+        let started = std::time::Instant::now();
+        let error = client
+            .list_tools()
+            .expect_err("hung MCP server should reach the request deadline");
+
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        match error {
+            BridgeClientError::CallFailed { layer, message, .. } => {
+                assert_eq!(layer, BridgeErrorLayer::Transport);
+                assert!(message.contains("timeout"), "message was: {message}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        assert!(!client.initialized.load(Ordering::Relaxed));
     }
 
     #[test]

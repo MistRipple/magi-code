@@ -172,7 +172,7 @@ impl BuiltinToolName {
         }
     }
 
-    pub fn from_str(name: &str) -> Option<Self> {
+    pub fn from_name(name: &str) -> Option<Self> {
         match name {
             "file_read" => Some(Self::FileRead),
             "view_image" => Some(Self::ViewImage),
@@ -1023,19 +1023,19 @@ impl BuiltinToolName {
 }
 
 pub fn is_public_builtin_tool_surface(name: &str) -> bool {
-    BuiltinToolName::from_str(name)
+    BuiltinToolName::from_name(name)
         .map(|tool| tool.is_public_tool_surface())
         .unwrap_or(false)
 }
 
 pub fn is_internal_builtin_tool_surface(name: &str) -> bool {
-    BuiltinToolName::from_str(name)
+    BuiltinToolName::from_name(name)
         .map(|tool| !tool.is_public_tool_surface())
         .unwrap_or(false)
 }
 
 pub fn canonical_builtin_tool_name(name: &str) -> Option<String> {
-    BuiltinToolName::from_str(name.trim()).map(|tool| tool.as_str().to_string())
+    BuiltinToolName::from_name(name.trim()).map(|tool| tool.as_str().to_string())
 }
 
 pub fn builtin_permission_engine() -> magi_permissions::PermissionEngine {

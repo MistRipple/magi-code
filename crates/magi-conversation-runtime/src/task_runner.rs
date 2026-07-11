@@ -175,17 +175,17 @@ impl TaskRunner {
         task_ids: &[TaskId],
     ) -> Result<(), String> {
         for task_id in task_ids {
-            if let Some(task) = self.store.get_task(task_id) {
-                if matches!(task.status, TaskStatus::Pending | TaskStatus::Running) {
-                    if let Some(lease) = self.store.get_active_lease(task_id) {
-                        self.store.revoke_lease(task_id, &lease.lease_id);
-                    }
-                    self.store
-                        .set_output_refs(task_id, vec![self.stalled_task_reason(&task)]);
-                    self.store
-                        .update_status(task_id, TaskStatus::Failed)
-                        .map_err(|error| format!("收口不可运行任务 {task_id} 失败: {error}"))?;
+            if let Some(task) = self.store.get_task(task_id)
+                && matches!(task.status, TaskStatus::Pending | TaskStatus::Running)
+            {
+                if let Some(lease) = self.store.get_active_lease(task_id) {
+                    self.store.revoke_lease(task_id, &lease.lease_id);
                 }
+                self.store
+                    .set_output_refs(task_id, vec![self.stalled_task_reason(&task)]);
+                self.store
+                    .update_status(task_id, TaskStatus::Failed)
+                    .map_err(|error| format!("收口不可运行任务 {task_id} 失败: {error}"))?;
             }
         }
         self.set_checkpoint_signal();
