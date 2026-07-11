@@ -105,6 +105,34 @@ fn workspace_scope_binding(scope: &WorkspaceChangeScope) -> serde_json::Value {
     })
 }
 
+fn safe_file_preview_path(
+    state: &ApiState,
+    workspace_root: &Path,
+    file_path: &str,
+) -> Result<PathBuf, ApiError> {
+    match safe_workspace_path(workspace_root, file_path) {
+        Ok((absolute_path, _)) => Ok(absolute_path),
+        Err(workspace_error) => {
+            let candidate = Path::new(file_path.trim());
+            if !candidate.is_absolute() {
+                return Err(workspace_error);
+            }
+            let managed_skill_root = state
+                .runtime_persistence()
+                .and_then(|persistence| persistence.state_root())
+                .map(|state_root| state_root.join("skills_cache"))
+                .and_then(|root| root.canonicalize().ok());
+            let canonical_candidate = candidate.canonicalize().ok();
+            if let Some((root, path)) = managed_skill_root.zip(canonical_candidate)
+                && path.starts_with(root)
+            {
+                return Ok(path);
+            }
+            Err(workspace_error)
+        }
+    }
+}
+
 fn resolve_workspace_change_scope_from_request(
     state: &ApiState,
     workspace_id: Option<&str>,
@@ -547,7 +575,7 @@ async fn get_file_content(
             query.workspace_path.as_deref(),
             query.execution_group_id.as_deref(),
         )?;
-        let (absolute, _relative) = safe_workspace_path(&scope.workspace_root, path)?;
+        let absolute = safe_file_preview_path(&state, &scope.workspace_root, path)?;
         (absolute, session_scope_binding(&scope))
     } else {
         let scope = resolve_workspace_change_scope_from_request(
@@ -555,7 +583,7 @@ async fn get_file_content(
             query.workspace_id.as_deref(),
             query.workspace_path.as_deref(),
         )?;
-        let (absolute, _) = safe_workspace_path(&scope.workspace_root, path)?;
+        let absolute = safe_file_preview_path(&state, &scope.workspace_root, path)?;
         (absolute, workspace_scope_binding(&scope))
     };
     let content = std::fs::read_to_string(&absolute_path)
@@ -622,16 +650,14 @@ async fn get_file_raw(
             query.workspace_path.as_deref(),
             query.execution_group_id.as_deref(),
         )?;
-        let (absolute, _relative) = safe_workspace_path(&scope.workspace_root, path)?;
-        absolute
+        safe_file_preview_path(&state, &scope.workspace_root, path)?
     } else {
         let scope = resolve_workspace_change_scope_from_request(
             &state,
             query.workspace_id.as_deref(),
             query.workspace_path.as_deref(),
         )?;
-        let (absolute, _) = safe_workspace_path(&scope.workspace_root, path)?;
-        absolute
+        safe_file_preview_path(&state, &scope.workspace_root, path)?
     };
 
     let mime = image_mime_for_path(&absolute_path)
@@ -1072,7 +1098,7 @@ async fn enhance_prompt(
 mod tests {
     use super::*;
     use crate::change_projection::collect_session_pending_changes_with_state;
-    use crate::state::ApiState;
+    use crate::state::{ApiState, RuntimeStatePersistence};
     use axum::{
         body::{Body, to_bytes},
         http::{Request, StatusCode},
@@ -1982,6 +2008,46 @@ mod tests {
         let payload: serde_json::Value =
             serde_json::from_slice(&body).expect("payload should deserialize");
         assert_eq!(payload["content"], "alpha changed\n");
+    }
+
+    #[tokio::test]
+    async fn get_file_content_accepts_absolute_path_inside_managed_skill_cache() {
+        let workspace_root = unique_temp_dir("magi-changes-route-skill-preview-workspace");
+        let state_root = unique_temp_dir("magi-changes-route-skill-preview-state");
+        let skill_root = state_root
+            .join("skills_cache")
+            .join("owner%2Frepo")
+            .join("skills")
+            .join("browser");
+        fs::create_dir_all(&skill_root).expect("skill root should create");
+        let skill_file = skill_root.join("SKILL.md");
+        fs::write(&skill_file, "# Browser Skill\n").expect("skill file should write");
+        let state =
+            build_state_with_workspace_root(&workspace_root, "workspace-managed-skill-content")
+                .with_runtime_persistence(Arc::new(RuntimeStatePersistence::new(
+                    state_root.join("sessions.json"),
+                    state_root.join("workspaces.json"),
+                    state_root.join("knowledge.json"),
+                )));
+
+        let response = routes()
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/files/content?workspaceId=workspace-managed-skill-content&filePath={}",
+                        urlencoding::encode(skill_file.to_string_lossy().as_ref())
+                    ))
+                    .method("GET")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = read_json_response(response).await;
+        assert_eq!(payload["content"], "# Browser Skill\n");
     }
 
     #[tokio::test]

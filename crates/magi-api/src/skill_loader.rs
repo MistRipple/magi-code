@@ -307,6 +307,7 @@ fn skill_instruction_with_runtime_context(skill_dir: &Path, instruction: &str) -
         "--- Magi Skill 运行上下文 ---\n\
 Magi Skill 根目录：{}\n\
 所有相对路径、脚本和资源文件都必须以该目录为基准解析。\n\
+回复中引用 Skill 内文件时必须使用完整绝对路径，不能只输出文件名或相对路径，以确保文件预览指向真实资源。\n\
 不得改用 Claude、Codex 或其他来源平台的固定安装路径，也不得在这些路径中重新创建或安装 Skill。\n\
 若说明中引用的资产在该目录内不存在，应明确报告缺失，不得自行重建替代实现。\n\
 --- Skill 原始说明 ---\n{}",
@@ -460,6 +461,11 @@ mod tests {
             plan.prompt_injections[0]
                 .body
                 .contains("不得改用 Claude、Codex 或其他来源平台的固定安装路径")
+        );
+        assert!(
+            plan.prompt_injections[0]
+                .body
+                .contains("引用 Skill 内文件时必须使用完整绝对路径")
         );
 
         std::fs::remove_dir_all(&skill_dir).expect("temp skill dir should be removed");

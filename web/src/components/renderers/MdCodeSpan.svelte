@@ -1,6 +1,6 @@
 <script lang="ts">
   import { getContext } from 'svelte';
-  import { normalizeInlineFileReferenceTarget } from '../../lib/file-reference';
+  import { normalizeImplicitFileReferenceTarget } from '../../lib/file-reference';
   import FileReferenceInline from './FileReferenceInline.svelte';
 
   interface Props {
@@ -10,7 +10,7 @@
   const { raw }: Props = $props();
   const insideLink = getContext<boolean>('markdown-link-context') === true;
   const codeText = $derived(raw.replace(/^`+|`+$/gu, ''));
-  const fileTarget = $derived(normalizeInlineFileReferenceTarget(codeText));
+  const fileTarget = $derived(normalizeImplicitFileReferenceTarget(codeText));
 </script>
 
 {#if fileTarget && !insideLink}

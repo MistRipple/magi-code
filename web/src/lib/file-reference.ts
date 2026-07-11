@@ -259,6 +259,21 @@ export function normalizeInlineFileReferenceTarget(reference: string): string | 
   return null;
 }
 
+/**
+ * 隐式识别只能接受带确定基准的路径。裸文件名可能属于工作区、Skill 或工具目录，
+ * 在没有明确目录时生成链接会打开错误文件，甚至把不存在的路径呈现为可用操作。
+ */
+export function normalizeImplicitFileReferenceTarget(reference: string): string | null {
+  const target = normalizeInlineFileReferenceTarget(reference);
+  if (!target) return null;
+  return (
+    target.startsWith('./')
+    || target.startsWith('../')
+    || /^(?:[a-zA-Z]:[\\/]|[\\/])/u.test(target)
+    || /[\\/]/u.test(target)
+  ) ? target : null;
+}
+
 export function isLikelyFileReference(reference: string): boolean {
   return normalizeFileReferenceTarget(reference) !== null;
 }
@@ -279,7 +294,7 @@ export function splitFileReferenceText(text: string): FileReferenceTextSegment[]
     }
 
     const { candidate, suffix } = splitTrailingSentencePunctuation(rawMatch);
-    const target = normalizeInlineFileReferenceTarget(candidate);
+    const target = normalizeImplicitFileReferenceTarget(candidate);
     if (!target) {
       continue;
     }
