@@ -146,9 +146,17 @@ pub(crate) fn build_tool_catalog_value(
     };
     let runtime_dependencies =
         runtime_health.dependencies_json(context, resources, external_dependency_source);
-    let (raw_skill_tools, external_mcp_servers, external_mcp_tools) = external_catalog
-        .map(|catalog| (catalog.skill_tools, catalog.mcp_servers, catalog.mcp_tools))
-        .unwrap_or_default();
+    let (instruction_skill_count, raw_skill_tools, external_mcp_servers, external_mcp_tools) =
+        external_catalog
+            .map(|catalog| {
+                (
+                    catalog.instruction_skill_count,
+                    catalog.skill_tools,
+                    catalog.mcp_servers,
+                    catalog.mcp_tools,
+                )
+            })
+            .unwrap_or_default();
     let skill_tools =
         effective_external_skill_tools_for_access_profile(raw_skill_tools, access_profile);
     let skill_tool_count = skill_tools.len();
@@ -197,6 +205,7 @@ pub(crate) fn build_tool_catalog_value(
         "approval_policy_summary": approval_policy_summary(access_profile),
         "summary": tool_catalog_summary(ToolCatalogSummaryInput {
             public_count,
+            instruction_skill_count,
             skill_tool_count,
             connected_mcp_server_count,
             enabled_mcp_server_count,
@@ -213,6 +222,7 @@ pub(crate) fn build_tool_catalog_value(
         "runtime_warning_count": runtime_warning_count,
         "runtime_dependencies": runtime_dependencies,
         "external_catalog_status": external_catalog_status,
+        "instruction_skill_count": instruction_skill_count,
         "skill_tool_count": skill_tool_count,
         "mcp_server_count": mcp_server_count,
         "connected_mcp_server_count": connected_mcp_server_count,
@@ -246,6 +256,7 @@ pub(crate) fn build_tool_catalog_value(
 
 struct ToolCatalogSummaryInput {
     public_count: usize,
+    instruction_skill_count: usize,
     skill_tool_count: usize,
     connected_mcp_server_count: usize,
     enabled_mcp_server_count: usize,
@@ -258,6 +269,7 @@ struct ToolCatalogSummaryInput {
 fn tool_catalog_summary(input: ToolCatalogSummaryInput) -> String {
     let ToolCatalogSummaryInput {
         public_count,
+        instruction_skill_count,
         skill_tool_count,
         connected_mcp_server_count,
         enabled_mcp_server_count,
@@ -267,7 +279,7 @@ fn tool_catalog_summary(input: ToolCatalogSummaryInput) -> String {
         runtime_warning_count,
     } = input;
     let mut summary = format!(
-        "工具目录已更新：{public_count} 个内置工具、{skill_tool_count} 个 Skill 工具、MCP 启用服务 {connected_mcp_server_count}/{enabled_mcp_server_count} 可用、子代理 {spawnable_agent_role_count}/{agent_role_count} 可派发"
+        "工具目录已更新：{public_count} 个内置工具、{instruction_skill_count} 个 Skill、{skill_tool_count} 个自定义工具、MCP 启用服务 {connected_mcp_server_count}/{enabled_mcp_server_count} 可用、子代理 {spawnable_agent_role_count}/{agent_role_count} 可派发"
     );
     let warning_count = schema_warning_count + runtime_warning_count;
     if warning_count > 0 {
@@ -583,7 +595,7 @@ fn external_capability_dependencies_from_snapshot(
             "name": "skill_runtime",
             "status": skill_status,
             "required_by": ["skill prompt context", "skill custom tools"],
-            "configured_count": skill_tool_count,
+            "configured_count": external.instruction_skill_count,
             "tool_count": skill_tool_count,
         }),
         serde_json::json!({
@@ -1152,6 +1164,7 @@ mod tests {
     fn tool_catalog_includes_external_skill_and_mcp_health_when_provider_exists() {
         let resources = ToolRuntimeResources {
             external_tool_catalog_provider: Some(Arc::new(|| ExternalToolCatalogSnapshot {
+                instruction_skill_count: 2,
                 skill_tools: vec![crate::ExternalToolCatalogEntry {
                     source: "skill".to_string(),
                     skill_id: Some("code-review".to_string()),
@@ -1183,7 +1196,14 @@ mod tests {
         let payload: serde_json::Value = serde_json::from_str(&output).expect("json output");
 
         assert_eq!(payload["external_catalog_status"], "available");
+        assert_eq!(payload["instruction_skill_count"], 2);
         assert_eq!(payload["skill_tool_count"], 1);
+        assert!(
+            payload["summary"]
+                .as_str()
+                .expect("summary should be text")
+                .contains("2 个 Skill、1 个自定义工具")
+        );
         assert_eq!(payload["mcp_server_count"], 1);
         assert_eq!(payload["connected_mcp_server_count"], 1);
         assert_eq!(payload["skill_tools"][0]["name"], "echo.describe");
@@ -1201,6 +1221,7 @@ mod tests {
             .find(|dependency| dependency["name"] == "mcp_servers")
             .expect("mcp dependency should be listed");
         assert_eq!(skill_dependency["status"], "ready");
+        assert_eq!(skill_dependency["configured_count"], 2);
         assert_eq!(skill_dependency["tool_count"], 1);
         assert_eq!(mcp_dependency["status"], "ready");
         assert_eq!(mcp_dependency["enabled_count"], 1);
@@ -1218,6 +1239,7 @@ mod tests {
             external_tool_catalog_provider: Some(Arc::new(move || {
                 provider_calls.fetch_add(1, Ordering::SeqCst);
                 ExternalToolCatalogSnapshot {
+                    instruction_skill_count: 1,
                     skill_tools: vec![crate::ExternalToolCatalogEntry {
                         source: "skill".to_string(),
                         skill_id: Some("slow-skill".to_string()),
@@ -1286,6 +1308,7 @@ mod tests {
             external_tool_catalog_provider: Some(Arc::new(move || {
                 provider_calls.fetch_add(1, Ordering::SeqCst);
                 ExternalToolCatalogSnapshot {
+                    instruction_skill_count: 1,
                     skill_tools: vec![crate::ExternalToolCatalogEntry {
                         source: "skill".to_string(),
                         skill_id: Some("code-review".to_string()),
@@ -1346,6 +1369,7 @@ mod tests {
     fn tool_catalog_reports_effective_external_mcp_skill_policy_by_access_profile() {
         let resources = ToolRuntimeResources {
             external_tool_catalog_provider: Some(Arc::new(|| ExternalToolCatalogSnapshot {
+                instruction_skill_count: 1,
                 skill_tools: vec![crate::ExternalToolCatalogEntry {
                     source: "skill".to_string(),
                     skill_id: Some("code-review".to_string()),
@@ -1411,6 +1435,7 @@ mod tests {
     fn tool_catalog_treats_disabled_mcp_servers_as_configured_not_active() {
         let resources = ToolRuntimeResources {
             external_tool_catalog_provider: Some(Arc::new(|| ExternalToolCatalogSnapshot {
+                instruction_skill_count: 0,
                 skill_tools: Vec::new(),
                 mcp_servers: vec![crate::ExternalMcpServerCatalogEntry {
                     server_id: "disabled-mcp".to_string(),
@@ -1449,6 +1474,7 @@ mod tests {
     fn tool_catalog_counts_only_connected_mcp_tools_as_ready() {
         let resources = ToolRuntimeResources {
             external_tool_catalog_provider: Some(Arc::new(|| ExternalToolCatalogSnapshot {
+                instruction_skill_count: 0,
                 skill_tools: Vec::new(),
                 mcp_servers: vec![crate::ExternalMcpServerCatalogEntry {
                     server_id: "disconnected-mcp".to_string(),

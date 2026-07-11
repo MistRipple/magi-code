@@ -4047,12 +4047,53 @@ fn web_fetch_reads_local_http_response() {
     let payload: Value = serde_json::from_str(&output.payload).expect("payload json");
     assert_eq!(payload["tool"], BuiltinToolName::WebFetch.as_str());
     assert_eq!(payload["status"], "succeeded");
+    assert!(payload.get("prompt").is_none());
     assert!(
         payload["content"]
             .as_str()
             .expect("content should be string")
             .contains("Smoke Web Fetch")
     );
+}
+
+#[test]
+fn web_fetch_truncates_multibyte_text_without_panicking() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind local test server");
+    let url = format!(
+        "http://{}",
+        listener.local_addr().expect("local test server address")
+    );
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept web_fetch request");
+        let mut buffer = [0_u8; 1024];
+        let _ = stream.read(&mut buffer);
+        let body = "中".repeat(60_000);
+        let headers = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream
+            .write_all(headers.as_bytes())
+            .expect("write web_fetch headers");
+        stream
+            .write_all(body.as_bytes())
+            .expect("write web_fetch body");
+    });
+
+    let registry = make_registry();
+    let output = exec_tool(
+        &registry,
+        BuiltinToolName::WebFetch,
+        &serde_json::json!({ "url": url }).to_string(),
+    );
+    server.join().expect("local web_fetch server should finish");
+
+    assert_eq!(output.status, ExecutionResultStatus::Succeeded);
+    let payload: Value = serde_json::from_str(&output.payload).expect("payload json");
+    assert_eq!(payload["truncated"], true);
+    let content = payload["content"].as_str().expect("content should be text");
+    assert!(content.starts_with(&"中".repeat(50_000)));
+    assert!(content.contains("内容已截断至 50,000 字符"));
 }
 
 #[test]
@@ -4123,7 +4164,7 @@ fn web_fetch_http_status_keeps_actionable_status_code() {
 }
 
 #[test]
-#[ignore = "live network smoke for manually verifying DuckDuckGo-backed web_search"]
+#[ignore = "live network smoke for manually verifying Bing-backed web_search"]
 fn web_search_live_smoke_returns_json_payload() {
     let registry = make_registry();
     let output = exec_tool(
@@ -4136,8 +4177,13 @@ fn web_search_live_smoke_returns_json_payload() {
     let payload: Value = serde_json::from_str(&output.payload).expect("payload json");
     assert_eq!(payload["tool"], BuiltinToolName::WebSearch.as_str());
     assert_eq!(payload["status"], "succeeded");
-    assert!(payload["result_count"].is_number());
-    assert!(payload["results"].is_array());
+    assert!(payload["result_count"].as_u64().unwrap_or_default() > 0);
+    let results = payload["results"].as_array().expect("results array");
+    assert!(results.iter().all(|result| {
+        result["url"]
+            .as_str()
+            .is_some_and(|url| url.starts_with("http"))
+    }));
 }
 
 // ── 默认内置工具全覆盖注册验证 ──
@@ -4846,6 +4892,7 @@ fn external_mcp_tool_surface_and_execution_share_one_registry_snapshot() {
     let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(16));
     let registry = ToolRegistry::new(governance, event_bus)
         .with_external_tool_catalog_provider(Arc::new(|| ExternalToolCatalogSnapshot {
+            instruction_skill_count: 0,
             mcp_tools: vec![ExternalMcpToolCatalogEntry {
                 server_id: "repo-tools".to_string(),
                 server_name: "Repository Tools".to_string(),

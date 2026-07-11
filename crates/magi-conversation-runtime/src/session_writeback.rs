@@ -1829,6 +1829,7 @@ mod tests {
         )
         .with_external_tool_catalog_provider(Arc::new(|| {
             magi_tool_runtime::ExternalToolCatalogSnapshot {
+                instruction_skill_count: 0,
                 mcp_tools: vec![magi_tool_runtime::ExternalMcpToolCatalogEntry {
                     server_id: "repo-tools".to_string(),
                     server_name: "Repository Tools".to_string(),

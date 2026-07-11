@@ -185,6 +185,8 @@ pub type RuntimeCapabilityDependencyProvider = Arc<
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ExternalToolCatalogSnapshot {
+    #[serde(default)]
+    pub instruction_skill_count: usize,
     pub skill_tools: Vec<ExternalToolCatalogEntry>,
     pub mcp_servers: Vec<ExternalMcpServerCatalogEntry>,
     pub mcp_tools: Vec<ExternalMcpToolCatalogEntry>,

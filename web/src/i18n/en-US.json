@@ -798,6 +798,7 @@
   "settings.tools.dependency.fileCount": "{count} files",
   "settings.tools.dependency.spawnableRoleCount": "{count} roles",
   "settings.tools.dependency.toolCount": "{count} tools",
+  "settings.tools.dependency.skillCount": "{skills} Skills · {tools} custom tools",
   "settings.tools.dependency.readyServerCount": "{ready}/{total} ready",
   "settings.tools.dependency.configuredServerCount": "{count} servers",
   "settings.tools.dependency.snapshotActive": "Current session active",

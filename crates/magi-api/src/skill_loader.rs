@@ -252,6 +252,7 @@ fn build_skill_registry_from_config(config: &Map<String, Value>) -> SkillRegistr
                 let Some(instruction) = read_available_skill_instruction(&skill_dir) else {
                     continue;
                 };
+                let instruction = skill_instruction_with_runtime_context(&skill_dir, &instruction);
 
                 let mut allowed_tools = Vec::new();
                 let mut custom_tool_bindings = Vec::new();
@@ -299,6 +300,19 @@ fn build_skill_registry_from_config(config: &Map<String, Value>) -> SkillRegistr
         }
     }
     registry
+}
+
+fn skill_instruction_with_runtime_context(skill_dir: &Path, instruction: &str) -> String {
+    format!(
+        "--- Magi Skill 运行上下文 ---\n\
+Magi Skill 根目录：{}\n\
+所有相对路径、脚本和资源文件都必须以该目录为基准解析。\n\
+不得改用 Claude、Codex 或其他来源平台的固定安装路径，也不得在这些路径中重新创建或安装 Skill。\n\
+若说明中引用的资产在该目录内不存在，应明确报告缺失，不得自行重建替代实现。\n\
+--- Skill 原始说明 ---\n{}",
+        skill_dir.display(),
+        instruction
+    )
 }
 
 pub fn load_skills_into_registry(store: &SettingsStore) -> SkillRegistry {
@@ -437,6 +451,16 @@ mod tests {
 
         assert_eq!(plan.prompt_injections.len(), 1);
         assert!(plan.prompt_injections[0].body.contains("skill-loader-e2e"));
+        assert!(
+            plan.prompt_injections[0]
+                .body
+                .contains(&format!("Magi Skill 根目录：{}", skill_dir.display()))
+        );
+        assert!(
+            plan.prompt_injections[0]
+                .body
+                .contains("不得改用 Claude、Codex 或其他来源平台的固定安装路径")
+        );
 
         std::fs::remove_dir_all(&skill_dir).expect("temp skill dir should be removed");
     }

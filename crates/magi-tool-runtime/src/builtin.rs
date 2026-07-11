@@ -3,6 +3,7 @@ use crate::{
     ToolExecutionContextQuery, ToolRuntimeResources, apply_patch::execute_apply_patch,
     tool_catalog::execute_tool_catalog, view_image::execute_view_image,
 };
+use base64::Engine as _;
 use magi_core::{ApprovalRequirement, ExecutionResultStatus, RiskLevel, UtcMillis};
 use serde_json::Value;
 use std::{
@@ -40,6 +41,8 @@ const PROCESS_WRITE_PUBLIC_ERROR: &str = "后台进程暂不可写入，请稍�
 const PROCESS_INSPECT_PUBLIC_ERROR: &str = "进程信息暂不可读取，请稍后重试";
 const WEB_SEARCH_PUBLIC_ERROR: &str = "网络搜索暂不可用，请稍后重试";
 const WEB_FETCH_PUBLIC_ERROR: &str = "网页内容暂不可获取，请稍后重试";
+const WEB_FETCH_MAX_RESPONSE_BYTES: u64 = 2 * 1024 * 1024;
+const WEB_FETCH_MAX_CONTENT_CHARS: usize = 50_000;
 const PATH_RESOLUTION_PUBLIC_ERROR: &str = "路径暂不可解析，请检查工作区或路径";
 const PATH_NOT_FOUND_PUBLIC_ERROR: &str = "目标路径不存在，请检查路径";
 const PATH_ALREADY_EXISTS_PUBLIC_ERROR: &str = "目标路径已存在，请确认是否允许覆盖";
@@ -2483,7 +2486,7 @@ fn execute_file_move(input: &str, context: &ToolExecutionContext) -> String {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// web.search — DuckDuckGo HTML 搜索
+// web.search — Bing HTML 搜索
 // ══════════════════════════════════════════════════════════════════════════════
 
 fn execute_web_search(input: &str) -> String {
@@ -2498,8 +2501,7 @@ fn execute_web_search(input: &str) -> String {
         Err(error) => return error,
     };
 
-    let encoded = urlencoding::encode(&query);
-    let search_url = format!("https://html.duckduckgo.com/html/?q={encoded}");
+    let search_url = bing_search_url(&query);
 
     let client = match reqwest::blocking::Client::builder()
         .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
@@ -2548,7 +2550,10 @@ fn execute_web_search(input: &str) -> String {
         }
     };
 
-    let results = parse_duckduckgo_results(&html);
+    let results = match parse_search_results(&html) {
+        Ok(results) => results,
+        Err(reason) => return builtin_error("web_search", reason),
+    };
 
     serde_json::json!({
         "tool": "web_search",
@@ -2562,17 +2567,31 @@ fn execute_web_search(input: &str) -> String {
     .to_string()
 }
 
-fn parse_duckduckgo_results(html: &str) -> Vec<Value> {
+fn bing_search_url(query: &str) -> String {
+    let encoded = urlencoding::encode(query);
+    format!("https://www.bing.com/search?q={encoded}&setlang=en-us&cc=us")
+}
+
+fn parse_search_results(html: &str) -> Result<Vec<Value>, String> {
+    let normalized = html.to_ascii_lowercase();
+    if normalized.contains("unfortunately, bots use duckduckgo too")
+        || normalized.contains("anomaly-modal")
+        || normalized.contains("challenge-form")
+        || normalized.contains("b_captcha")
+    {
+        return Err("搜索服务要求人机验证，当前无法完成自动搜索".to_string());
+    }
+
     let mut results = Vec::new();
     let link_re = regex::Regex::new(
-        r#"<a[^>]+class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)</a>[\s\S]*?<a[^>]+class="result__snippet"[^>]*>([\s\S]*?)</a>"#
+        r#"(?si)<li[^>]+class="[^"]*b_algo[^"]*"[^>]*>[\s\S]*?<h2[^>]*>[\s\S]*?<a[^>]+href="([^"]+)"[^>]*>([\s\S]*?)</a>[\s\S]*?</h2>[\s\S]*?<div[^>]+class="[^"]*b_caption[^"]*"[^>]*>[\s\S]*?<p[^>]*>([\s\S]*?)</p>"#
     ).unwrap();
 
     for cap in link_re.captures_iter(html) {
-        let raw_url = &cap[1];
+        let raw_url = decode_html_entities(&cap[1]);
         let title = strip_html_tags(&decode_html_entities(&cap[2]));
         let snippet = strip_html_tags(&decode_html_entities(&cap[3]));
-        let url = decode_duckduckgo_url(raw_url);
+        let url = decode_bing_result_url(&raw_url);
         if !title.trim().is_empty() {
             results.push(serde_json::json!({
                 "title": title.trim(),
@@ -2584,21 +2603,38 @@ fn parse_duckduckgo_results(html: &str) -> Vec<Value> {
             break;
         }
     }
-    results
+    if !results.is_empty()
+        || normalized.contains("there are no results for")
+        || normalized.contains("class=\"b_no\"")
+    {
+        Ok(results)
+    } else {
+        Err("搜索服务返回了无法识别的响应，未获得可信搜索结果".to_string())
+    }
 }
 
-fn decode_duckduckgo_url(raw: &str) -> String {
-    if raw.contains("duckduckgo.com/l/?")
-        && let Some(pos) = raw.find("uddg=")
-    {
-        let after = &raw[pos + 5..];
-        let end = after.find('&').unwrap_or(after.len());
-        if let Ok(decoded) = urlencoding::decode(&after[..end]) {
-            return decoded.to_string();
+fn decode_bing_result_url(raw: &str) -> String {
+    if raw.contains("bing.com/ck/a") {
+        for pair in raw.split('?').nth(1).unwrap_or_default().split('&') {
+            let Some((key, value)) = pair.split_once('=') else {
+                continue;
+            };
+            if key != "u" {
+                continue;
+            }
+            let Ok(decoded_param) = urlencoding::decode(value) else {
+                break;
+            };
+            let Some(encoded_url) = decoded_param.strip_prefix("a1") else {
+                break;
+            };
+            if let Ok(bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(encoded_url)
+                && let Ok(url) = String::from_utf8(bytes)
+            {
+                return url;
+            }
+            break;
         }
-    }
-    if raw.starts_with("//") {
-        return format!("https:{raw}");
     }
     raw.to_string()
 }
@@ -2632,10 +2668,6 @@ fn execute_web_fetch(input: &str) -> String {
         Err(error) => return error,
     };
 
-    let prompt = request
-        .as_ref()
-        .and_then(|obj| field_string(obj, &["prompt"]));
-
     let client = match reqwest::blocking::Client::builder()
         .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
         .timeout(std::time::Duration::from_secs(30))
@@ -2653,7 +2685,7 @@ fn execute_web_fetch(input: &str) -> String {
         }
     };
 
-    let response = match client.get(&url).send() {
+    let mut response = match client.get(&url).send() {
         Ok(r) => r,
         Err(e) => {
             return builtin_runtime_error(
@@ -2679,8 +2711,13 @@ fn execute_web_fetch(input: &str) -> String {
         .unwrap_or("")
         .to_lowercase();
 
-    let body = match response.text() {
-        Ok(t) => t,
+    let mut response_bytes = Vec::new();
+    let response_truncated = match response
+        .by_ref()
+        .take(WEB_FETCH_MAX_RESPONSE_BYTES + 1)
+        .read_to_end(&mut response_bytes)
+    {
+        Ok(_) => response_bytes.len() as u64 > WEB_FETCH_MAX_RESPONSE_BYTES,
         Err(e) => {
             return builtin_runtime_error(
                 "web_fetch",
@@ -2690,6 +2727,10 @@ fn execute_web_fetch(input: &str) -> String {
             );
         }
     };
+    if response_truncated {
+        response_bytes.truncate(WEB_FETCH_MAX_RESPONSE_BYTES as usize);
+    }
+    let body = decode_web_response_body(&response_bytes, &content_type);
 
     let content = if content_type.contains("application/json") {
         format!("```json\n{}\n```", body)
@@ -2699,25 +2740,14 @@ fn execute_web_fetch(input: &str) -> String {
         html_to_markdown(&body)
     };
 
-    let max_len = 50_000;
-    let (content, truncated) = if content.len() > max_len {
-        (
-            format!(
-                "{}\n\n---\n*[内容已截断至 50,000 字符]*",
-                &content[..max_len]
-            ),
-            true,
-        )
-    } else {
-        (content, false)
-    };
+    let (content, content_truncated) = truncate_web_content(content, WEB_FETCH_MAX_CONTENT_CHARS);
+    let truncated = response_truncated || content_truncated;
 
     serde_json::json!({
         "tool": "web_fetch",
         "status": "succeeded",
         "access_mode": BuiltinToolAccessMode::ReadOnly.as_str(),
         "url": url,
-        "prompt": prompt,
         "content_type": content_type,
         "content_length": content.len(),
         "truncated": truncated,
@@ -2725,6 +2755,29 @@ fn execute_web_fetch(input: &str) -> String {
         "summary": format!("已获取 {} ({} 字符)", url, content.len())
     })
     .to_string()
+}
+
+fn truncate_web_content(content: String, max_chars: usize) -> (String, bool) {
+    if content.chars().count() <= max_chars {
+        return (content, false);
+    }
+
+    let prefix = content.chars().take(max_chars).collect::<String>();
+    (
+        format!("{prefix}\n\n---\n*[内容已截断至 50,000 字符]*"),
+        true,
+    )
+}
+
+fn decode_web_response_body(bytes: &[u8], content_type: &str) -> String {
+    let encoding = content_type
+        .split(';')
+        .find_map(|part| part.trim().strip_prefix("charset="))
+        .map(|label| label.trim_matches(['\"', '\'']))
+        .and_then(|label| encoding_rs::Encoding::for_label(label.as_bytes()))
+        .unwrap_or(encoding_rs::UTF_8);
+    let (decoded, _, _) = encoding.decode(bytes);
+    decoded.into_owned()
 }
 
 fn html_to_markdown(html: &str) -> String {
@@ -3351,6 +3404,70 @@ fn knowledge_kind_label(kind: magi_knowledge_store::KnowledgeKind) -> &'static s
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn search_challenge_page_is_not_treated_as_empty_success() {
+        let html = r#"<html><body><h1>Unfortunately, bots use DuckDuckGo too.</h1></body></html>"#;
+
+        let error = parse_search_results(html).expect_err("challenge page must fail");
+
+        assert!(error.contains("验证"));
+    }
+
+    #[test]
+    fn search_explicit_no_results_page_remains_a_valid_empty_result() {
+        let html = r#"<li class="b_no">There are no results for this query.</li>"#;
+
+        let results = parse_search_results(html).expect("explicit empty result is valid");
+
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn bing_search_result_parser_returns_source_url_and_text() {
+        let html = r#"
+            <li class="b_algo">
+              <h2><a href="https://www.bing.com/ck/a?x=1&amp;u=a1aHR0cHM6Ly93d3cucnVzdC1sYW5nLm9yZy8&amp;ntb=1">The <strong>Rust</strong> Language</a></h2>
+              <div class="b_caption"><p>Reliable and efficient software.</p></div>
+            </li>
+        "#;
+
+        let results = parse_search_results(html).expect("bing result should parse");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["title"], "The Rust Language");
+        assert_eq!(results[0]["url"], "https://www.rust-lang.org/");
+        assert_eq!(results[0]["snippet"], "Reliable and efficient software.");
+    }
+
+    #[test]
+    fn bing_search_request_uses_stable_language_and_region() {
+        let url = bing_search_url("Rust official website");
+
+        assert!(url.contains("q=Rust%20official%20website"));
+        assert!(url.contains("setlang=en-us"));
+        assert!(url.contains("cc=us"));
+    }
+
+    #[test]
+    fn truncate_web_content_respects_utf8_character_boundaries() {
+        let content = "中".repeat(50_001);
+
+        let (truncated, was_truncated) = truncate_web_content(content, 50_000);
+
+        assert!(was_truncated);
+        assert!(truncated.starts_with(&"中".repeat(50_000)));
+        assert!(truncated.contains("内容已截断至 50,000 字符"));
+    }
+
+    #[test]
+    fn web_response_decoder_honors_declared_legacy_charset() {
+        let (encoded, _, _) = encoding_rs::BIG5.encode("繁體中文");
+
+        let decoded = decode_web_response_body(&encoded, "text/plain; charset=big5");
+
+        assert_eq!(decoded, "繁體中文");
+    }
 
     #[test]
     fn path_resolution_failure_uses_public_message() {

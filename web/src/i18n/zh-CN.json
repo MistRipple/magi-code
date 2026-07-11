@@ -798,6 +798,7 @@
   "settings.tools.dependency.fileCount": "{count} 个文件",
   "settings.tools.dependency.spawnableRoleCount": "{count} 个角色",
   "settings.tools.dependency.toolCount": "{count} 个工具",
+  "settings.tools.dependency.skillCount": "{skills} 个 Skill · {tools} 个自定义工具",
   "settings.tools.dependency.readyServerCount": "{ready}/{total} 可用",
   "settings.tools.dependency.configuredServerCount": "{count} 个服务",
   "settings.tools.dependency.snapshotActive": "当前会话已启动",

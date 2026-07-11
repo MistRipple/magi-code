@@ -347,8 +347,15 @@
         ? 'settings.tools.dependency.snapshotActive'
         : 'settings.tools.dependency.snapshotInactive');
     }
-    if (dependency.name === 'skill_runtime' && typeof dependency.toolCount === 'number') {
-      return i18n.t('settings.tools.dependency.toolCount', { count: dependency.toolCount });
+    if (
+      dependency.name === 'skill_runtime'
+      && typeof dependency.configuredCount === 'number'
+      && typeof dependency.toolCount === 'number'
+    ) {
+      return i18n.t('settings.tools.dependency.skillCount', {
+        skills: dependency.configuredCount,
+        tools: dependency.toolCount,
+      });
     }
     if (
       dependency.name === 'mcp_servers'

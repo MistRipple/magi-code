@@ -15,4 +15,5 @@ reqwest = { workspace = true, features = ["blocking"] }
 regex = "1"
 urlencoding = "2"
 base64 = "0.22"
+encoding_rs = "0.8"
 tracing.workspace = true

@@ -2648,6 +2648,7 @@ mod tests {
     #[tokio::test]
     async fn settings_bootstrap_full_scope_hydrates_external_capability_dependencies() {
         let state = test_state_with_external_catalog_snapshot(Some(ExternalToolCatalogSnapshot {
+            instruction_skill_count: 0,
             skill_tools: Vec::new(),
             mcp_servers: vec![ExternalMcpServerCatalogEntry {
                 server_id: "loopback-mcp".to_string(),

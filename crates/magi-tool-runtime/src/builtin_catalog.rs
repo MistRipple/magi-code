@@ -775,8 +775,7 @@ impl BuiltinToolName {
             Self::WebFetch => serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "url": { "type": "string", "description": "要抓取内容的 URL" },
-                    "prompt": { "type": "string", "description": "可选的抓取提示词或抽取指令" }
+                    "url": { "type": "string", "description": "要抓取内容的 URL" }
                 },
                 "required": ["url"]
             }),
@@ -1239,4 +1238,21 @@ fn json_field_bool(
                 .or_else(|| value.as_str().and_then(|value| value.parse::<bool>().ok()))
         })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn web_fetch_schema_only_exposes_supported_url_parameter() {
+        let schema = BuiltinToolName::WebFetch.parameters_schema();
+        let properties = schema["properties"]
+            .as_object()
+            .expect("web_fetch properties should be an object");
+
+        assert_eq!(properties.len(), 1);
+        assert!(properties.contains_key("url"));
+        assert!(!properties.contains_key("prompt"));
+    }
 }

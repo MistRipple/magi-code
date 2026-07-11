@@ -59,8 +59,10 @@ fn build_external_tool_catalog_provider(
     mcp_connections: Arc<RwLock<HashMap<String, Arc<StdioMcpBridgeClient>>>>,
 ) -> ExternalToolCatalogProvider {
     Arc::new(move || {
+        let instruction_skills = skill_runtime.registry().list();
+        let instruction_skill_count = instruction_skills.len();
         let mut skill_tools = Vec::new();
-        for skill in skill_runtime.registry().list() {
+        for skill in instruction_skills {
             for binding in skill.custom_tool_bindings {
                 let (access_profile_behavior, risk_level, approval_requirement) =
                     external_binding_policy_labels(binding.bridge_kind);
@@ -116,6 +118,7 @@ fn build_external_tool_catalog_provider(
         mcp_tools.sort_by(|left, right| left.model_tool_name.cmp(&right.model_tool_name));
 
         ExternalToolCatalogSnapshot {
+            instruction_skill_count,
             skill_tools,
             mcp_servers,
             mcp_tools,

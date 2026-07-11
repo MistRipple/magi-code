@@ -1306,6 +1306,7 @@ name = "magi-tool-runtime"
 version = "3.0.0"
 dependencies = [
  "base64",
+ "encoding_rs",
  "magi-core",
  "magi-event-bus",
  "magi-governance",

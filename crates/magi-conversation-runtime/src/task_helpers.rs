@@ -558,8 +558,85 @@ pub fn tool_reference_position(text: &str, tool_name: &str) -> Option<usize> {
     text.match_indices(tool_name).find_map(|(start, _)| {
         let before = text[..start].chars().next_back();
         let after = text[start + tool_name.len()..].chars().next();
-        (is_tool_reference_boundary(before) && is_tool_reference_boundary(after)).then_some(start)
+        (is_tool_reference_boundary(before)
+            && is_tool_reference_boundary(after)
+            && !tool_reference_is_negated(text, start, start + tool_name.len()))
+        .then_some(start)
     })
+}
+
+fn tool_reference_is_negated(text: &str, start: usize, end: usize) -> bool {
+    let clause_start = text[..start]
+        .rfind(['。', '！', '？', '；', ';', '\n'])
+        .map(|position| {
+            position
+                + text[position..]
+                    .chars()
+                    .next()
+                    .map(char::len_utf8)
+                    .unwrap_or_default()
+        })
+        .unwrap_or(0);
+    let clause_end = text[end..]
+        .find(['。', '！', '？', '；', ';', '\n'])
+        .map(|position| end + position)
+        .unwrap_or(text.len());
+    let before = &text[clause_start..start];
+    let after = text[end..clause_end].trim_start_matches([' ', '\t', '：', ':', '，', ',']);
+
+    let negative_markers = [
+        "不要调用",
+        "不得调用",
+        "禁止调用",
+        "无需调用",
+        "不用调用",
+        "不能调用",
+        "不应调用",
+        "避免调用",
+        "不要使用",
+        "不得使用",
+        "禁止使用",
+        "无需使用",
+        "不用使用",
+        "不能使用",
+        "不应使用",
+        "避免使用",
+        "do not call",
+        "don't call",
+        "must not call",
+        "never call",
+        "without calling",
+        "avoid calling",
+        "do not use",
+        "don't use",
+        "must not use",
+        "never use",
+        "without using",
+        "avoid using",
+    ];
+    let positive_markers = ["只调用", "调用", "使用", "only call", "call", "use"];
+
+    let mut latest_action: Option<(usize, usize, bool)> = None;
+    for (is_negative, markers) in [
+        (true, negative_markers.as_slice()),
+        (false, positive_markers.as_slice()),
+    ] {
+        for marker in markers {
+            for (position, _) in before.match_indices(marker) {
+                let candidate = (position + marker.len(), marker.len(), is_negative);
+                if latest_action.is_none_or(|current| candidate > current) {
+                    latest_action = Some(candidate);
+                }
+            }
+        }
+    }
+    if latest_action.is_some_and(|(_, _, is_negative)| is_negative) {
+        return true;
+    }
+
+    negative_markers
+        .iter()
+        .any(|marker| after.starts_with(marker))
 }
 
 pub fn is_tool_reference_boundary(value: Option<char>) -> bool {

@@ -3160,6 +3160,45 @@ mod tests {
     }
 
     #[test]
+    fn negated_tool_references_are_not_forced_into_required_chain() {
+        let mut task = make_task_loop_test_task("task-required-tool-chain-negation");
+        task.goal = "只调用 web_fetch 抓取页面。不要调用 shell_exec 或 web_search。".to_string();
+        task.policy_snapshot = Some(magi_core::TaskPolicy {
+            autonomy_level: "Autonomous".to_string(),
+            access_profile: magi_core::AccessProfile::Restricted,
+            allowed_tools: Vec::new(),
+            denied_tools: Vec::new(),
+            allowed_paths: Vec::new(),
+            denied_paths: Vec::new(),
+            network_mode: "full".to_string(),
+            command_mode: "full".to_string(),
+            retry_limit: 1,
+            validation_profile: Some("required".to_string()),
+            checkpoint_mode: "task_or_phase".to_string(),
+            task_tier: TaskTier::ExecutionChain,
+            background_allowed: false,
+            escalation_conditions: Vec::new(),
+        });
+
+        assert_eq!(
+            task_required_tool_chain(&task, None),
+            vec!["web_fetch".to_string()]
+        );
+
+        task.goal = "Only call web_fetch. Do not call shell_exec or web_search.".to_string();
+        assert_eq!(
+            task_required_tool_chain(&task, None),
+            vec!["web_fetch".to_string()]
+        );
+
+        task.goal = "先不要调用 web_search。确认条件后调用 web_search。".to_string();
+        assert_eq!(
+            task_required_tool_chain(&task, None),
+            vec!["web_search".to_string()]
+        );
+    }
+
+    #[test]
     fn local_agent_infers_file_write_and_read_from_concrete_file_goal() {
         let mut task = make_task_loop_test_task("task-required-tool-chain-natural-language");
         task.goal = "请在当前工作区创建文件 task-system-e2e.md，文件内容必须包含 marker: TASK_E2E。创建后读取该文件验证内容。"
