@@ -236,14 +236,6 @@ pub struct LlmMessageParams {
     pub system_prompt: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<ToolChoice>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub timeout_ms: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub stream_idle_timeout_ms: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub stream_hard_timeout_ms: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub retry_policy: Option<RetryPolicy>,
     /// 推理强度配置：必须透传到协议层（OpenAI Chat 走顶层 `reasoning_effort`，
     /// Anthropic Messages 走 `thinking.budget_tokens` 映射）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -287,40 +279,6 @@ mod tests {
 
         assert_eq!(call.arguments_for_wire(), r#"{"command":"printf hello""#);
     }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RetryPolicy {
-    #[serde(default)]
-    pub max_retries: Option<u32>,
-    #[serde(default)]
-    pub base_delay_ms: Option<u64>,
-    #[serde(default)]
-    pub retry_delays_ms: Option<Vec<u64>>,
-    #[serde(default)]
-    pub retry_on_timeout: Option<bool>,
-    #[serde(default)]
-    pub retry_on_all_errors: Option<bool>,
-    #[serde(default)]
-    pub max_retry_duration_ms: Option<u64>,
-    #[serde(default)]
-    pub deterministic_error_streak_limit: Option<u32>,
-    #[serde(default)]
-    pub circuit_breaker: Option<CircuitBreakerConfig>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CircuitBreakerConfig {
-    #[serde(default)]
-    pub enabled: Option<bool>,
-    #[serde(default)]
-    pub window_ms: Option<u64>,
-    #[serde(default)]
-    pub failure_threshold: Option<u32>,
-    #[serde(default)]
-    pub cooldown_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

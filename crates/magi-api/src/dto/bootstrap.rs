@@ -21,7 +21,7 @@ use magi_workspace::{
     WorkspaceRecoverySidecarExport,
 };
 use serde::Serialize;
-use serde_json::{Map, Value};
+use serde_json::Value;
 use std::collections::BTreeMap;
 
 const BOOTSTRAP_TIMELINE_PAGE_SIZE: usize = 50;
@@ -172,6 +172,13 @@ impl BootstrapDto {
                         .find(|session| &session.session_id == session_id)
                         .cloned()
                 });
+        let current_session_id = current_session.as_ref().map(|session| &session.session_id);
+        let recent_events =
+            select_bootstrap_recent_events(event_snapshot.recent_events, current_session_id)
+                .into_iter()
+                .map(public_event_envelope)
+                .map(public_bootstrap_event_envelope)
+                .collect();
         let runtime_read_model = runtime_read_model_dto_with_usage(
             runtime_read_model,
             &session_sidecar_exports,
@@ -203,12 +210,7 @@ impl BootstrapDto {
             bridge_preflight,
             notifications: session_projection.notifications,
             event_stream_next_sequence: event_snapshot.next_sequence,
-            recent_events: event_snapshot
-                .recent_events
-                .into_iter()
-                .map(public_event_envelope)
-                .map(public_bootstrap_event_envelope)
-                .collect(),
+            recent_events,
             has_more_before: false,
             before_cursor: None,
             pending_changes: Vec::new(),
@@ -238,23 +240,6 @@ impl BootstrapDto {
             .current_session
             .as_ref()
             .map(|session| session.session_id.to_string());
-        self.recent_events.retain(|event| {
-            event.event_type != RUNTIME_MAINTENANCE_STATUS_EVENT
-                && current_session_id.as_deref().is_some_and(|session_id| {
-                    event
-                        .session_id
-                        .as_ref()
-                        .is_some_and(|event_session_id| event_session_id.as_str() == session_id)
-                })
-        });
-        if self.recent_events.len() > BOOTSTRAP_RECENT_EVENT_PAGE_SIZE {
-            let start = self
-                .recent_events
-                .len()
-                .saturating_sub(BOOTSTRAP_RECENT_EVENT_PAGE_SIZE);
-            self.recent_events = self.recent_events.split_off(start);
-        }
-
         self.runtime_read_model.details.sessions.retain(|entry| {
             current_session_id
                 .as_deref()
@@ -336,6 +321,27 @@ impl BootstrapDto {
     }
 }
 
+fn select_bootstrap_recent_events(
+    events: Vec<EventEnvelope>,
+    current_session_id: Option<&SessionId>,
+) -> Vec<EventEnvelope> {
+    let Some(current_session_id) = current_session_id else {
+        return Vec::new();
+    };
+    let mut selected = events
+        .into_iter()
+        .filter(|event| {
+            event.event_type != RUNTIME_MAINTENANCE_STATUS_EVENT
+                && event.session_id.as_ref() == Some(current_session_id)
+        })
+        .collect::<Vec<_>>();
+    if selected.len() > BOOTSTRAP_RECENT_EVENT_PAGE_SIZE {
+        let start = selected.len() - BOOTSTRAP_RECENT_EVENT_PAGE_SIZE;
+        selected = selected.split_off(start);
+    }
+    selected
+}
+
 fn public_bootstrap_canonical_turn(turn: CanonicalTurn) -> CanonicalTurn {
     let mut turn = public_canonical_turn(turn);
     retain_bootstrap_canonical_items(&mut turn);
@@ -360,33 +366,13 @@ fn prune_bootstrap_event_payload(payload: &mut Value) {
     let Value::Object(object) = payload else {
         return;
     };
-    prune_bootstrap_canonical_field(object, "canonical_turn");
-    prune_bootstrap_canonical_field(object, "canonicalTurn");
+    // canonicalTurns 已经是 bootstrap 的权威会话投影；事件中的 canonical_turn
+    // 只是同一份累计快照的重复副本。流式过程中每个事件都携带越来越大的快照，
+    // 首屏重放若逐个反序列化会形成 O(事件数 × 累计消息体) 的 CPU 与响应体放大。
+    object.remove("canonical_turn");
+    object.remove("canonicalTurn");
     object.remove("turn_items");
     object.remove("turnItems");
-}
-
-fn prune_bootstrap_canonical_field(object: &mut Map<String, Value>, key: &str) {
-    let Some(value) = object.get_mut(key) else {
-        return;
-    };
-    if value.is_null() {
-        return;
-    }
-    let Ok(mut turn) = serde_json::from_value::<CanonicalTurn>(value.clone()) else {
-        object.remove(key);
-        return;
-    };
-    retain_bootstrap_canonical_items(&mut turn);
-    if turn.items.is_empty() {
-        object.remove(key);
-        return;
-    }
-    if let Ok(next_value) = serde_json::to_value(turn) {
-        *value = next_value;
-    } else {
-        object.remove(key);
-    }
 }
 
 fn select_session_projection(
@@ -773,6 +759,42 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap事件先按会话和页大小筛选再做公开投影() {
+        let current_session_id = SessionId::new("session-current");
+        let other_session_id = SessionId::new("session-other");
+        let mut events = (0..250)
+            .map(|index| {
+                EventEnvelope::domain(
+                    EventId::new(format!("current-{index}")),
+                    "message.updated",
+                    json!({"index": index}),
+                )
+                .with_context(magi_event_bus::EventContext {
+                    session_id: Some(current_session_id.clone()),
+                    ..magi_event_bus::EventContext::default()
+                })
+            })
+            .collect::<Vec<_>>();
+        events.push(
+            EventEnvelope::domain(
+                EventId::new("other-session"),
+                "message.updated",
+                json!({"index": 999}),
+            )
+            .with_context(magi_event_bus::EventContext {
+                session_id: Some(other_session_id),
+                ..magi_event_bus::EventContext::default()
+            }),
+        );
+
+        let selected = select_bootstrap_recent_events(events, Some(&current_session_id));
+
+        assert_eq!(selected.len(), BOOTSTRAP_RECENT_EVENT_PAGE_SIZE);
+        assert_eq!(selected[0].payload["index"], json!(50));
+        assert_eq!(selected.last().unwrap().payload["index"], json!(249));
+    }
+
+    #[test]
     fn bootstrap首屏只保留主线canonical并裁掉事件重型回放() {
         let session_id = SessionId::new("session-bootstrap-mainline-only");
         let now = UtcMillis::now();
@@ -847,13 +869,7 @@ mod tests {
         assert!(bootstrap.canonical_turns[0].items[0].worker.is_none());
         let event_payload = &bootstrap.recent_events[0].payload;
         assert!(event_payload.get("turn_items").is_none());
-        assert_eq!(
-            event_payload["canonical_turn"]["items"]
-                .as_array()
-                .expect("canonical turn items should remain")
-                .len(),
-            1
-        );
+        assert!(event_payload.get("canonical_turn").is_none());
         assert_eq!(event_payload["root_task_id"], json!("task-root"));
     }
 

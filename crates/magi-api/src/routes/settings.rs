@@ -435,7 +435,7 @@ pub(crate) fn builtin_role_templates() -> Vec<Value> {
         json!({
             "templateId": "executor",
             "displayName": "Executor",
-            "description": "负责把已定义的 WorkPackage / Action 落地执行（写代码、改配置、跑构建）",
+            "description": "负责从根因落地边界清晰的实现，并完成清理与验证",
             "i18n": {
                 "displayNameKey": "roleTemplate.executor.displayName",
                 "descriptionKey": "roleTemplate.executor.description",
@@ -443,9 +443,9 @@ pub(crate) fn builtin_role_templates() -> Vec<Value> {
             "defaultUI": { "colorToken": "agent-executor", "icon": "tool" },
             "profile": {
                 "role": "executor",
-                "focus": ["implementation", "build", "runtime", "contracts"],
-                "constraints": ["preserve-authoritative-state", "avoid-duplication"],
-                "outputPreferences": ["diff", "runtime-impact", "follow-up"],
+                "focus": ["implementation", "integration", "cleanup", "verification"],
+                "constraints": ["fix-at-source", "preserve-authoritative-state"],
+                "outputPreferences": ["changes", "validation", "remaining-risk"],
             },
             "ownerships": ["implementation"],
             "insightPreferences": ["decision", "contract", "risk"],
@@ -453,7 +453,7 @@ pub(crate) fn builtin_role_templates() -> Vec<Value> {
         json!({
             "templateId": "explorer",
             "displayName": "Explorer",
-            "description": "负责搜索代码库、分析失败原因、定位根因与梳理调用链",
+            "description": "负责只读搜索、复现、证据收集与根因定位",
             "i18n": {
                 "displayNameKey": "roleTemplate.explorer.displayName",
                 "descriptionKey": "roleTemplate.explorer.description",
@@ -461,9 +461,9 @@ pub(crate) fn builtin_role_templates() -> Vec<Value> {
             "defaultUI": { "colorToken": "agent-explorer", "icon": "bug" },
             "profile": {
                 "role": "explorer",
-                "focus": ["root-cause", "investigation", "evidence", "trace"],
-                "constraints": ["fix-at-source", "no-patchy-workarounds"],
-                "outputPreferences": ["root-cause", "evidence", "next-step"],
+                "focus": ["reproduction", "root-cause", "evidence", "data-flow"],
+                "constraints": ["read-only", "no-assumption-without-evidence"],
+                "outputPreferences": ["scope", "evidence", "next-step"],
             },
             "ownerships": ["investigation"],
             "insightPreferences": ["decision", "risk", "constraint"],
@@ -471,7 +471,7 @@ pub(crate) fn builtin_role_templates() -> Vec<Value> {
         json!({
             "templateId": "reviewer",
             "displayName": "Reviewer",
-            "description": "负责风险识别、回归扫描与交付质量把关",
+            "description": "负责独立审查行为回归、状态冲突与交付风险",
             "i18n": {
                 "displayNameKey": "roleTemplate.reviewer.displayName",
                 "descriptionKey": "roleTemplate.reviewer.description",
@@ -479,9 +479,9 @@ pub(crate) fn builtin_role_templates() -> Vec<Value> {
             "defaultUI": { "colorToken": "agent-reviewer", "icon": "shield" },
             "profile": {
                 "role": "reviewer",
-                "focus": ["risk", "regression", "consistency", "delivery"],
-                "constraints": ["no-new-second-truth", "flag-hidden-risk"],
-                "outputPreferences": ["findings", "severity", "follow-up"],
+                "focus": ["regression", "state-consistency", "security", "maintainability"],
+                "constraints": ["read-only", "evidence-before-finding"],
+                "outputPreferences": ["findings", "severity", "test-gaps"],
             },
             "ownerships": ["quality"],
             "insightPreferences": ["risk", "constraint", "decision"],
@@ -489,7 +489,7 @@ pub(crate) fn builtin_role_templates() -> Vec<Value> {
         json!({
             "templateId": "tester",
             "displayName": "Tester",
-            "description": "负责验证链路、场景覆盖与失败复现",
+            "description": "负责测试矩阵、故障注入、真实场景与恢复验证",
             "i18n": {
                 "displayNameKey": "roleTemplate.tester.displayName",
                 "descriptionKey": "roleTemplate.tester.description",
@@ -497,9 +497,9 @@ pub(crate) fn builtin_role_templates() -> Vec<Value> {
             "defaultUI": { "colorToken": "agent-tester", "icon": "check-circle" },
             "profile": {
                 "role": "tester",
-                "focus": ["verification", "coverage", "smoke", "repro"],
-                "constraints": ["prefer-real-paths", "keep-signal-high"],
-                "outputPreferences": ["steps", "result", "follow-up"],
+                "focus": ["test-matrix", "fault-injection", "recovery", "real-workflow"],
+                "constraints": ["evidence-before-pass", "report-uncovered-scope"],
+                "outputPreferences": ["matrix", "results", "uncovered-scope"],
             },
             "ownerships": ["verification"],
             "insightPreferences": ["risk", "constraint"],
@@ -507,7 +507,7 @@ pub(crate) fn builtin_role_templates() -> Vec<Value> {
         json!({
             "templateId": "architect",
             "displayName": "Architect",
-            "description": "负责结构裁决、边界治理与长期演进方向",
+            "description": "负责产品目标、用户工作流、系统边界与长期演进裁决",
             "i18n": {
                 "displayNameKey": "roleTemplate.architect.displayName",
                 "descriptionKey": "roleTemplate.architect.description",
@@ -515,9 +515,9 @@ pub(crate) fn builtin_role_templates() -> Vec<Value> {
             "defaultUI": { "colorToken": "agent-architect", "icon": "grid" },
             "profile": {
                 "role": "architect",
-                "focus": ["architecture", "boundaries", "tradeoffs", "evolution"],
-                "constraints": ["avoid-duplicate-systems", "prefer-clear-boundaries"],
-                "outputPreferences": ["decision", "tradeoff", "follow-up"],
+                "focus": ["product-intent", "user-workflow", "architecture", "boundaries"],
+                "constraints": ["single-source-of-truth", "design-for-evolution"],
+                "outputPreferences": ["decision", "data-flow", "acceptance-criteria"],
             },
             "ownerships": ["architecture"],
             "insightPreferences": ["decision", "constraint", "risk"],

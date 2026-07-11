@@ -487,16 +487,31 @@ mod tests {
     }
 
     #[test]
-    fn architect_prompt_body_keeps_user_advocate_clause() {
-        // body 是直接抽出来的 markdown 正文，最关键的 invariant 是它仍然包含
-        // “唯一代言人” 这条规则——这条出错说明 front-matter 解析吞掉了正文。
+    fn architect_returns_decision_requests_to_mainline() {
         let reg = AgentRoleRegistry::from_map(builtin_roles_map());
         let role = reg.get("architect").expect("architect role exists");
         assert!(
-            role.system_prompt.contains("唯一代言人"),
-            "architect prompt 必须保留 唯一代言人 条款，实际: {}",
+            role.system_prompt.contains("返回主线"),
+            "architect 不能绕过主线直接面向用户，实际: {}",
             role.system_prompt
         );
+        assert!(!role.system_prompt.contains("唯一代言人"));
+    }
+
+    #[test]
+    fn builtin_agent_prompts_define_non_recursive_worker_boundary() {
+        let reg = AgentRoleRegistry::from_map(builtin_roles_map());
+        for id in ["architect", "executor", "reviewer", "explorer", "tester"] {
+            let role = reg.get(id).expect("builtin role exists");
+            assert!(
+                role.system_prompt.contains("不能创建更多子代理"),
+                "{id} 必须明确禁止递归派发代理"
+            );
+            assert!(
+                role.system_prompt.contains("返回主线"),
+                "{id} 必须明确结果回传给主线"
+            );
+        }
     }
 
     #[test]

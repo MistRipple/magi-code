@@ -24,7 +24,9 @@ use std::time::Duration;
 const OPENAI_BASE_URL_ENV: &str = "MAGI_OPENAI_COMPAT_BASE_URL";
 const OPENAI_API_KEY_ENV: &str = "MAGI_OPENAI_COMPAT_API_KEY";
 const OPENAI_MODEL_ENV: &str = "MAGI_OPENAI_COMPAT_MODEL";
-const MODEL_PROVIDER_MAX_IN_FLIGHT: usize = 1;
+// 默认会话最多同时运行主线与三个子代理；同一模型至少要承载这一组并发，
+// 同时保留进程级上限，避免多会话无限冲击单个 provider/model。
+const MODEL_PROVIDER_MAX_IN_FLIGHT: usize = 4;
 const MODEL_PROVIDER_MAX_RETRIES: usize = 2;
 const MODEL_PROVIDER_BACKOFF_BASE_MS: u64 = 200;
 
@@ -418,6 +420,91 @@ enum StreamMessage {
     Done(Result<(u16, String), BridgeClientError>),
 }
 
+fn provider_stream_event_error(
+    provider_family: ProviderFamily,
+    event: &crate::protocol::streaming::SseEvent,
+) -> Option<BridgeClientError> {
+    let payload = serde_json::from_str::<Value>(&event.data).ok()?;
+    let error = payload.get("error")?;
+    let is_error_event = match provider_family {
+        ProviderFamily::OpenAiChat => true,
+        ProviderFamily::Anthropic => event.event_type.as_deref() == Some("error"),
+    };
+    if !is_error_event {
+        return None;
+    }
+    let error_type = error
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .filter(|message| !message.trim().is_empty())
+        .unwrap_or("provider stream returned an error");
+    let transient = matches!(
+        error_type,
+        "overloaded_error"
+            | "rate_limit_error"
+            | "server_error"
+            | "timeout_error"
+            | "service_unavailable"
+    );
+    Some(BridgeClientError::CallFailed {
+        layer: if transient {
+            BridgeErrorLayer::Transport
+        } else {
+            BridgeErrorLayer::RemoteBusiness
+        },
+        code: Some(if transient { -32005 } else { -32006 }),
+        message: format!("provider stream rejected request: {message}"),
+    })
+}
+
+fn apply_provider_stream_event(
+    provider_family: ProviderFamily,
+    event: &crate::protocol::streaming::SseEvent,
+    accumulator: &mut StreamAccumulator,
+    last_content_delta_len: &mut usize,
+    last_thinking_delta_len: &mut usize,
+    tx: &std::sync::mpsc::Sender<StreamMessage>,
+) -> Result<bool, BridgeClientError> {
+    if let Some(error) = provider_stream_event_error(provider_family, event) {
+        return Err(error);
+    }
+    if event.data.trim() == "[DONE]"
+        || (provider_family == ProviderFamily::Anthropic
+            && event.event_type.as_deref() == Some("message_stop"))
+    {
+        return Ok(true);
+    }
+
+    let llm_chunks = parse_stream_event(provider_family, event);
+    accumulator.apply_all(&llm_chunks);
+    let accumulated_content = accumulator.accumulated_content();
+    let accumulated_thinking = accumulator.accumulated_thinking();
+    if accumulated_content.len() > *last_content_delta_len
+        || accumulated_thinking.len() > *last_thinking_delta_len
+    {
+        *last_content_delta_len = accumulated_content.len();
+        *last_thinking_delta_len = accumulated_thinking.len();
+        if tx
+            .send(StreamMessage::Chunk(ModelStreamingDelta {
+                content: accumulated_content,
+                thinking: accumulated_thinking,
+            }))
+            .is_err()
+        {
+            return Err(BridgeClientError::CallFailed {
+                layer: BridgeErrorLayer::Transport,
+                code: Some(-32005),
+                message: "stream consumer disconnected".to_string(),
+            });
+        }
+    }
+    Ok(false)
+}
+
 /// 执行流式 HTTP POST，通过 SSE 逐块读取 LLM 响应。
 ///
 /// HTTP I/O 在独立线程完成（与 `execute_http_post` 一致），避免在 tokio
@@ -595,40 +682,33 @@ fn streaming_http_io(
 
         for sse_event in sse_parser.feed(&valid_str) {
             saw_sse_event = true;
-            // OpenAI Chat Completions SSE 以 [DONE] 作为协议终止信号；不能继续等底层 TCP EOF。
-            // 部分 tunnel / 代理会延迟关闭连接，继续读取会导致 UI 在内容完整后仍长时间显示响应中。
-            if sse_event.data.trim() == "[DONE]" {
+            if apply_provider_stream_event(
+                provider_family,
+                &sse_event,
+                &mut accumulator,
+                &mut last_content_delta_len,
+                &mut last_thinking_delta_len,
+                tx,
+            )? {
                 saw_protocol_terminal = true;
                 break 'stream_read;
             }
-            if provider_family == ProviderFamily::Anthropic
-                && sse_event.event_type.as_deref() == Some("message_stop")
-            {
+        }
+    }
+
+    if !saw_protocol_terminal {
+        for sse_event in sse_parser.finish() {
+            saw_sse_event = true;
+            if apply_provider_stream_event(
+                provider_family,
+                &sse_event,
+                &mut accumulator,
+                &mut last_content_delta_len,
+                &mut last_thinking_delta_len,
+                tx,
+            )? {
                 saw_protocol_terminal = true;
-                break 'stream_read;
-            }
-
-            let llm_chunks = parse_stream_event(provider_family, &sse_event);
-            accumulator.apply_all(&llm_chunks);
-
-            // 当正文或上游 thinking 有增长时按 SSE 事件粒度发送完整快照。
-            let accumulated_content = accumulator.accumulated_content();
-            let accumulated_thinking = accumulator.accumulated_thinking();
-            if accumulated_content.len() > last_content_delta_len
-                || accumulated_thinking.len() > last_thinking_delta_len
-            {
-                last_content_delta_len = accumulated_content.len();
-                last_thinking_delta_len = accumulated_thinking.len();
-                // 若 receiver 已断开（调用方提前退出），静默忽略。
-                if tx
-                    .send(StreamMessage::Chunk(ModelStreamingDelta {
-                        content: accumulated_content,
-                        thinking: accumulated_thinking,
-                    }))
-                    .is_err()
-                {
-                    break 'stream_read;
-                }
+                break;
             }
         }
     }
@@ -643,11 +723,9 @@ fn streaming_http_io(
 
     if !saw_protocol_terminal && !accumulator.saw_terminal() {
         return Err(BridgeClientError::CallFailed {
-            layer: BridgeErrorLayer::RemoteBusiness,
-            code: Some(-32007),
-            message:
-                "provider response invalid: incomplete stream response: missing terminal SSE event"
-                    .to_string(),
+            layer: BridgeErrorLayer::Transport,
+            code: Some(-32005),
+            message: "provider stream interrupted: missing terminal SSE event".to_string(),
         });
     }
 
@@ -1010,10 +1088,6 @@ fn build_anthropic_messages_url_for_test(base_url: &str) -> Result<String, Strin
                 stream: None,
                 system_prompt: None,
                 tool_choice: None,
-                timeout_ms: None,
-                stream_idle_timeout_ms: None,
-                stream_hard_timeout_ms: None,
-                retry_policy: None,
                 reasoning_effort: None,
             },
             "claude-test",
@@ -1083,10 +1157,6 @@ fn llm_message_params_from_invocation(
                 kind: "tool".to_string(),
                 name: Some(choice.function.name.clone()),
             }),
-        timeout_ms: None,
-        stream_idle_timeout_ms: None,
-        stream_hard_timeout_ms: None,
-        retry_policy: None,
         reasoning_effort,
     }
 }
@@ -2140,7 +2210,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("incomplete stream response: missing terminal SSE event")
+                .contains("provider stream interrupted: missing terminal SSE event")
         );
         assert_eq!(deltas.into_inner(), vec!["半截回复".to_string()]);
     }
@@ -2183,6 +2253,41 @@ mod tests {
     }
 
     #[test]
+    fn streaming_openai_accepts_done_marker_without_trailing_blank_line() {
+        let server = spawn_mock_server_with_response_text(
+            200,
+            "text/event-stream",
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"完整回复\"}}]}\n\n",
+                "data: [DONE]\n",
+            )
+            .to_string(),
+        );
+        let client = HttpModelBridgeClient::new(
+            server.address,
+            Some("sk-test-key".to_string()),
+            "gpt-4.1-mini".to_string(),
+        );
+
+        let response = client
+            .invoke_streaming(
+                ModelInvocationRequest {
+                    provider: "openai-compatible".to_string(),
+                    prompt: "hello".to_string(),
+                    messages: None,
+                    tools: None,
+                    tool_choice: None,
+                },
+                &|_| {},
+            )
+            .expect("EOF 前没有额外空行时仍应提交最终 SSE 事件");
+
+        let payload: serde_json::Value =
+            serde_json::from_str(&response.payload).expect("payload should be json");
+        assert_eq!(payload["content"], "完整回复");
+    }
+
+    #[test]
     fn streaming_anthropic_partial_eof_without_message_stop_is_error() {
         let server = spawn_mock_server_with_response_text(
             200,
@@ -2221,7 +2326,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("incomplete stream response: missing terminal SSE event")
+                .contains("provider stream interrupted: missing terminal SSE event")
         );
         assert_eq!(deltas.into_inner(), vec!["半截 Claude 回复".to_string()]);
     }
@@ -2503,11 +2608,13 @@ mod tests {
     }
 
     #[test]
-    fn model_provider_gate_serializes_same_provider_key() {
+    fn model_provider_gate_caps_same_provider_after_default_agent_fanout() {
         let gate = Arc::new(ModelProviderGate {
             slots: Mutex::new(HashMap::new()),
         });
-        let first_permit = gate.acquire("anthropic-messages|http://localhost:8317/v1|kiro");
+        let permits = (0..MODEL_PROVIDER_MAX_IN_FLIGHT)
+            .map(|_| gate.acquire("anthropic-messages|http://localhost:8317/v1|kiro"))
+            .collect::<Vec<_>>();
         let (acquired_tx, acquired_rx) = mpsc::channel();
         let second_gate = Arc::clone(&gate);
 
@@ -2523,14 +2630,40 @@ mod tests {
             acquired_rx
                 .recv_timeout(Duration::from_millis(120))
                 .is_err(),
-            "同一 provider/model 必须排队，不能同时打到同一个模型端点"
+            "同一 provider/model 达到并发上限后必须排队"
         );
 
-        drop(first_permit);
+        drop(permits);
         acquired_rx
             .recv_timeout(Duration::from_secs(1))
-            .expect("释放首个请求后，下一个同端点请求应继续执行");
+            .expect("释放请求槽位后，下一个同端点请求应继续执行");
         handle.join().expect("waiting thread should not panic");
+    }
+
+    #[test]
+    fn model_provider_gate_allows_default_agent_fanout() {
+        let gate = Arc::new(ModelProviderGate {
+            slots: Mutex::new(HashMap::new()),
+        });
+        let first_permit = gate.acquire("openai-chat|http://localhost:8317/v1|gpt");
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let second_gate = Arc::clone(&gate);
+
+        let handle = std::thread::spawn(move || {
+            let _second_permit = second_gate.acquire("openai-chat|http://localhost:8317/v1|gpt");
+            acquired_tx
+                .send(())
+                .expect("test receiver should still be alive");
+        });
+
+        let acquired_concurrently = acquired_rx.recv_timeout(Duration::from_millis(250)).is_ok();
+        drop(first_permit);
+        handle.join().expect("waiting thread should not panic");
+
+        assert!(
+            acquired_concurrently,
+            "同一模型必须允许主线与子代理并发请求，不能把多代理执行串行化"
+        );
     }
 
     #[test]
@@ -2588,6 +2721,200 @@ mod tests {
                 .expect("mock server should receive streaming retry attempts");
             assert_eq!(recorded.path, "/v1/chat/completions");
         }
+    }
+
+    #[test]
+    fn streaming_retries_incomplete_connection_before_first_delta() {
+        let server = spawn_mock_server_sequence(vec![
+            MockHttpResponse {
+                status: 200,
+                content_type: "text/event-stream".to_string(),
+                response_text: "data: {}\n\n".to_string(),
+            },
+            MockHttpResponse {
+                status: 200,
+                content_type: "text/event-stream".to_string(),
+                response_text: concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"reconnected\"}}]}\n\n",
+                    "data: [DONE]\n\n",
+                )
+                .to_string(),
+            },
+        ]);
+
+        let client = HttpModelBridgeClient::new(
+            server.address.clone(),
+            Some("sk-test-key".to_string()),
+            "gpt-4.1-mini".to_string(),
+        );
+
+        let response = client
+            .invoke_streaming(
+                ModelInvocationRequest {
+                    provider: "openai-compatible".to_string(),
+                    prompt: "hello".to_string(),
+                    messages: None,
+                    tools: None,
+                    tool_choice: None,
+                },
+                &|_| {},
+            )
+            .expect("首个可见增量前连接中断时应重连并继续");
+
+        let payload: serde_json::Value =
+            serde_json::from_str(&response.payload).expect("payload should be json");
+        assert_eq!(payload["content"], "reconnected");
+        for _ in 0..2 {
+            server
+                .request_receiver
+                .recv_timeout(Duration::from_secs(5))
+                .expect("mock server should receive reconnect attempts");
+        }
+    }
+
+    #[test]
+    fn streaming_does_not_retry_after_visible_delta() {
+        let server = spawn_mock_server_sequence(vec![
+            MockHttpResponse {
+                status: 200,
+                content_type: "text/event-stream".to_string(),
+                response_text: "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n"
+                    .to_string(),
+            },
+            MockHttpResponse {
+                status: 200,
+                content_type: "text/event-stream".to_string(),
+                response_text: concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"duplicate\"}}]}\n\n",
+                    "data: [DONE]\n\n",
+                )
+                .to_string(),
+            },
+        ]);
+        let client = HttpModelBridgeClient::new(
+            server.address,
+            Some("sk-test-key".to_string()),
+            "gpt-4.1-mini".to_string(),
+        );
+        let deltas = std::cell::RefCell::new(Vec::new());
+
+        client
+            .invoke_streaming(
+                ModelInvocationRequest {
+                    provider: "openai-compatible".to_string(),
+                    prompt: "hello".to_string(),
+                    messages: None,
+                    tools: None,
+                    tool_choice: None,
+                },
+                &|delta| deltas.borrow_mut().push(delta.content.clone()),
+            )
+            .expect_err("已经展示正文后不能从头重试并制造重复文本");
+
+        assert_eq!(deltas.into_inner(), vec!["partial".to_string()]);
+        server
+            .request_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("first request should be recorded");
+        assert!(
+            server
+                .request_receiver
+                .recv_timeout(Duration::from_millis(250))
+                .is_err(),
+            "可见增量后的失败不能发起第二次模型请求"
+        );
+    }
+
+    #[test]
+    fn streaming_retries_transient_provider_error_event() {
+        let server = spawn_mock_server_sequence(vec![
+            MockHttpResponse {
+                status: 200,
+                content_type: "text/event-stream".to_string(),
+                response_text: concat!(
+                    "event: error\n",
+                    "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"temporarily overloaded\"}}\n\n",
+                )
+                .to_string(),
+            },
+            MockHttpResponse {
+                status: 200,
+                content_type: "text/event-stream".to_string(),
+                response_text: concat!(
+                    "event: content_block_delta\n",
+                    "data: {\"delta\":{\"type\":\"text_delta\",\"text\":\"recovered\"}}\n\n",
+                    "event: message_stop\n",
+                    "data: {}\n\n",
+                )
+                .to_string(),
+            },
+        ]);
+        let client = HttpModelBridgeClient::new_with_protocol(
+            server.address.clone(),
+            Some("sk-ant-test".to_string()),
+            "claude-sonnet-test".to_string(),
+            HttpModelBridgeProtocol::AnthropicMessages,
+            None,
+        );
+
+        let response = client
+            .invoke_streaming(
+                ModelInvocationRequest {
+                    provider: "anthropic".to_string(),
+                    prompt: "hello".to_string(),
+                    messages: None,
+                    tools: None,
+                    tool_choice: None,
+                },
+                &|_| {},
+            )
+            .expect("overloaded SSE error 应在首个增量前重连");
+
+        let payload: serde_json::Value =
+            serde_json::from_str(&response.payload).expect("payload should be json");
+        assert_eq!(payload["content"], "recovered");
+        for _ in 0..2 {
+            server
+                .request_receiver
+                .recv_timeout(Duration::from_secs(5))
+                .expect("mock server should receive reconnect attempts");
+        }
+    }
+
+    #[test]
+    fn streaming_surfaces_anthropic_error_event() {
+        let server = spawn_mock_server_with_response_text(
+            200,
+            "text/event-stream",
+            concat!(
+                "event: error\n",
+                "data: {\"type\":\"error\",\"error\":{\"type\":\"authentication_error\",\"message\":\"invalid x-api-key\"}}\n\n",
+            )
+            .to_string(),
+        );
+        let client = HttpModelBridgeClient::new_with_protocol(
+            server.address,
+            Some("bad-key".to_string()),
+            "claude-sonnet-test".to_string(),
+            HttpModelBridgeProtocol::AnthropicMessages,
+            None,
+        );
+
+        let error = client
+            .invoke_streaming(
+                ModelInvocationRequest {
+                    provider: "anthropic".to_string(),
+                    prompt: "hello".to_string(),
+                    messages: None,
+                    tools: None,
+                    tool_choice: None,
+                },
+                &|_| {},
+            )
+            .expect_err("SSE error event must fail the invocation");
+
+        assert!(error.to_string().contains("invalid x-api-key"));
+        assert_eq!(error.code(), Some(-32006));
     }
 
     #[test]

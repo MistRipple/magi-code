@@ -41,9 +41,10 @@ impl SseLineParser {
             self.buffer = self.buffer[newline_pos + 1..].to_string();
 
             if line.is_empty() {
+                let event_type = self.current_event_type.take();
                 if !self.pending_data_lines.is_empty() {
                     events.push(SseEvent {
-                        event_type: self.current_event_type.take(),
+                        event_type,
                         data: self.pending_data_lines.join("\n"),
                     });
                     self.pending_data_lines.clear();
@@ -65,6 +66,14 @@ impl SseLineParser {
         }
 
         events
+    }
+
+    pub fn finish(&mut self) -> Vec<SseEvent> {
+        if self.buffer.is_empty() && self.pending_data_lines.is_empty() {
+            self.current_event_type = None;
+            return Vec::new();
+        }
+        self.feed("\n\n")
     }
 }
 
@@ -589,6 +598,28 @@ mod tests {
         let mut parser = SseLineParser::new();
         let events = parser.feed("data: {\"a\":1}\n\ndata: {\"b\":2}\n\n");
         assert_eq!(events.len(), 2);
+    }
+
+    #[test]
+    fn sse_parser_flushes_final_event_without_blank_line() {
+        let mut parser = SseLineParser::new();
+
+        assert!(parser.feed("data: [DONE]\n").is_empty());
+        let events = parser.finish();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].data, "[DONE]");
+    }
+
+    #[test]
+    fn sse_parser_does_not_leak_event_type_across_empty_event() {
+        let mut parser = SseLineParser::new();
+
+        assert!(parser.feed("event: ping\n\n").is_empty());
+        let events = parser.feed("data: {\"ok\":true}\n\n");
+
+        assert_eq!(events.len(), 1);
+        assert!(events[0].event_type.is_none());
     }
 
     #[test]

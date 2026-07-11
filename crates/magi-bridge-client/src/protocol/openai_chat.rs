@@ -211,10 +211,6 @@ mod tests {
             stream: None,
             system_prompt: None,
             tool_choice: None,
-            timeout_ms: None,
-            stream_idle_timeout_ms: None,
-            stream_hard_timeout_ms: None,
-            retry_policy: None,
             reasoning_effort: None,
         }
     }
