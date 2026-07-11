@@ -704,6 +704,45 @@ await withGoldenViteServer(async (server) => {
     'terminal session turn event must project the final assistant item as non-streaming',
   );
 
+  const sessionsBeforeDraft = messagesStore.messagesState.sessions.map((session) => session.id);
+  bridge.postMessage({
+    type: 'newSession',
+    workspaceId: WORKSPACE_ID,
+    workspacePath: WORKSPACE_PATH,
+  });
+  await waitFor(
+    () => !messagesStore.messagesState.currentSessionId,
+    'new session action must enter workspace draft state',
+  );
+  assert.deepEqual(
+    messagesStore.messagesState.sessions.map((session) => session.id),
+    sessionsBeforeDraft,
+    'entering and abandoning a new-session draft must not erase the sidebar session list',
+  );
+  bridge.postMessage({
+    type: 'workspaceBindingChanged',
+    workspaceId: WORKSPACE_ID,
+    workspacePath: WORKSPACE_PATH,
+    sessionId: '',
+  });
+  assert.deepEqual(
+    messagesStore.messagesState.sessions.map((session) => session.id),
+    sessionsBeforeDraft,
+    'idempotent workspace-only binding sync must not clear the preserved session list',
+  );
+  bridge.postMessage({
+    type: 'switchSession',
+    sessionId: SESSION_ID,
+    workspaceId: WORKSPACE_ID,
+    workspacePath: WORKSPACE_PATH,
+  });
+  await waitFor(
+    () => messagesStore.messagesState.currentSessionId === SESSION_ID,
+    'selecting an existing session after abandoning the draft must restore it normally',
+  );
+  const streamAfterDraftReturn = FakeEventSource.instances.at(-1);
+  streamAfterDraftReturn.onopen?.();
+
   const queuedTurnAccepted = deferred();
   sessionTurnInterceptors.push(() => queuedTurnAccepted.promise);
   messagesStore.addPendingRequest('busy-before-queued-follow-up');
@@ -758,13 +797,18 @@ await withGoldenViteServer(async (server) => {
     canonicalItem: null,
   }));
   await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(
+    messagesStore.getToasts().length,
+    0,
+    'accepted queued conversation turns must not emit routine success notifications',
+  );
   messagesStore.clearPendingRequest('request-queued-immediate-feedback');
 
   const streamCountBeforeLagged = FakeEventSource.instances.length;
   const originalWarn = console.warn;
   try {
     console.warn = () => {};
-    recoveredStream.onmessage?.({ data: JSON.stringify(laggedEnvelope()) });
+    streamAfterDraftReturn.onmessage?.({ data: JSON.stringify(laggedEnvelope()) });
     await waitForWithin(
       () => FakeEventSource.instances.length > streamCountBeforeLagged,
       'lagged SSE event must immediately rebuild the event stream through bootstrap recovery',
@@ -774,7 +818,7 @@ await withGoldenViteServer(async (server) => {
     console.warn = originalWarn;
   }
   assert.equal(
-    recoveredStream.closed,
+    streamAfterDraftReturn.closed,
     true,
     'lagged SSE event must close the stale stream before recovery reconnects',
   );

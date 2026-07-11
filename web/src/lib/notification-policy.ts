@@ -5,7 +5,7 @@ export interface FeedbackPolicy {
   persistToCenter: false;
   countUnread: false;
   actionRequired: false;
-  displayMode: 'toast';
+  displayMode: 'toast' | 'silent';
 }
 
 export interface IncidentPolicy {
@@ -57,13 +57,17 @@ export interface NormalizedIncidentRecord {
   resolved: boolean;
 }
 
-export function resolveFeedbackPolicy(): FeedbackPolicy {
+export function shouldDisplayToast(level: string): boolean {
+  return level === 'warning' || level === 'error';
+}
+
+export function resolveFeedbackPolicy(level: string): FeedbackPolicy {
   return {
     category: 'feedback',
     persistToCenter: false,
     countUnread: false,
     actionRequired: false,
-    displayMode: 'toast',
+    displayMode: shouldDisplayToast(level) ? 'toast' : 'silent',
   };
 }
 

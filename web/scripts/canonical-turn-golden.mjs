@@ -84,6 +84,7 @@ function runGoldenReplay(reducer, projection, messagesStore, dataHandlers, timel
   assertReplaceCanonicalTurnsFiltersForeignSessions(reducer);
   assertMessagesStoreRejectsForeignSessionProjection(reducer, projection, messagesStore);
   assertMessagesStoreAdoptsLiveCanonicalEventForEmptySession(dataHandlers, messagesStore);
+  assertWorkspaceDraftPreservesSessionList(dataHandlers, messagesStore);
   assertSameSessionBootstrapAppliesAuthoritativeSnapshotWhenProjectionIsEmpty(dataHandlers, messagesStore);
   assertSameSessionStaleIdleBootstrapPreservesActiveTurn(dataHandlers, messagesStore);
   assertMessagesStoreSettlesProcessingFromLiveTerminalCanonicalEvent(dataHandlers, messagesStore);
@@ -108,6 +109,63 @@ function runGoldenReplay(reducer, projection, messagesStore, dataHandlers, timel
   assertMessagesStoreClearsLocalPendingFromAuthoritativeIdle(messagesStore);
   assertSessionSwitchClearsExecutionState(messagesStore);
   assertCanonicalTurnModelRejectsSnakeCase(canonicalProtocol);
+}
+
+function assertWorkspaceDraftPreservesSessionList(dataHandlers, messagesStore) {
+  const workspaceId = 'workspace-golden-draft-preserve';
+  const workspacePath = '/tmp/workspace-golden-draft-preserve';
+  const sessions = [
+    {
+      id: 'session-golden-draft-preserve-a',
+      title: '保留会话 A',
+      createdAt: 20_000,
+      updatedAt: 20_000,
+      messageCount: 2,
+      workspaceId,
+    },
+    {
+      id: 'session-golden-draft-preserve-b',
+      title: '保留会话 B',
+      createdAt: 21_000,
+      updatedAt: 21_000,
+      messageCount: 1,
+      workspaceId,
+    },
+  ];
+
+  messagesStore.messagesState.currentWorkspaceId = workspaceId;
+  messagesStore.messagesState.currentWorkspacePath = workspacePath;
+  messagesStore.updateSessions(sessions);
+  messagesStore.setCurrentSessionId(sessions[0].id);
+
+  dataHandlers.handleUnifiedData({
+    id: 'golden-workspace-draft-started',
+    category: 'data',
+    type: 'system',
+    source: 'orchestrator',
+    agent: 'orchestrator',
+    lifecycle: 'completed',
+    blocks: [],
+    timestamp: 22_000,
+    updatedAt: 22_000,
+    data: {
+      dataType: 'workspaceDraftStarted',
+      payload: { workspaceId, workspacePath },
+    },
+  });
+
+  assert.equal(messagesStore.messagesState.currentSessionId, null,
+    'starting a new-session draft must clear only the active session pointer');
+  assert.deepEqual(
+    messagesStore.messagesState.sessions.map((session) => session.id),
+    sessions.map((session) => session.id),
+    'starting a draft must preserve the persisted workspace session list',
+  );
+  assert.deepEqual(
+    messagesStore.messagesState.appState?.sessions?.map((session) => session.id),
+    sessions.map((session) => session.id),
+    'draft app state must expose the same preserved session list',
+  );
 }
 
 function assertAgentTerminalOutputExtractsFinalText(agentOutput) {

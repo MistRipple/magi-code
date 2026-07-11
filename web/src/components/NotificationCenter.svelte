@@ -14,8 +14,14 @@
   import Icon from './Icon.svelte';
   import { i18n } from '../stores/i18n.svelte';
 
-  let panelOpen = $state(false);
+  interface Props {
+    open: boolean;
+    onOpenChange: (open: boolean) => void;
+  }
+
+  let { open, onOpenChange }: Props = $props();
   let activeFilter = $state<'all' | 'unresolved' | 'resolved'>('all');
+  let wasOpen = $state(false);
 
   const notifications = $derived.by(() => getNotifications() as Notification[]);
   const unreadCount = $derived.by(() => getUnreadNotificationCount() as number);
@@ -29,19 +35,19 @@
       ))
   ));
 
-  function togglePanel() {
-    panelOpen = !panelOpen;
-    if (panelOpen && messagesState.bootstrapped && hasWorkspace) {
+  $effect(() => {
+    if (open && !wasOpen && messagesState.bootstrapped && hasWorkspace) {
       if (unreadCount > 0) {
         markAllNotificationsRead();
       } else {
         loadNotifications();
       }
     }
-  }
+    wasOpen = open;
+  });
 
   function closePanel() {
-    panelOpen = false;
+    onOpenChange(false);
   }
 
   function handleClearAll() {
@@ -85,16 +91,7 @@
 </script>
 
 <div class="notification-center">
-  <button class="btn-icon btn-icon--sm notification-btn" onclick={togglePanel} title={i18n.t('notification.buttonTitle')}>
-    <Icon name="bell" size={14} />
-    {#if unreadCount > 0}
-      <span class="badge">{unreadCount > 99 ? '99+' : unreadCount}</span>
-    {/if}
-  </button>
-
-  {#if panelOpen}
-    <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
-    <div class="panel-backdrop" onclick={closePanel} role="presentation"></div>
+  {#if open}
     <div class="notification-panel">
       <div class="panel-header">
         <span class="panel-title">{i18n.t('notification.title')}</span>
@@ -198,35 +195,7 @@
 
 <style>
   .notification-center {
-    position: relative;
-  }
-
-  .notification-btn {
-    position: relative;
-  }
-
-  .badge {
-    position: absolute;
-    top: -2px;
-    right: -2px;
-    min-width: 14px;
-    height: 14px;
-    padding: 0 3px;
-    font-size: 9px;
-    font-weight: var(--font-bold, 700);
-    line-height: 14px;
-    text-align: center;
-    color: var(--primary-foreground);
-    background: var(--error);
-    border-radius: 7px;
-    pointer-events: none;
-  }
-
-  .panel-backdrop {
-    position: fixed;
-    inset: 0;
-    z-index: calc(var(--z-dropdown, 100) - 1);
-    background: transparent;
+    display: contents;
   }
 
   .notification-panel {

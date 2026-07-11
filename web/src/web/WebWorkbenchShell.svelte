@@ -43,6 +43,11 @@
     type CodeTabPayload,
   } from '../stores/right-pane.svelte';
   import { syncComposerWorkspaces } from '../stores/composer-workspace.svelte';
+  import {
+    PANEL_LAYOUT,
+    resolvePanelLayout,
+    resolvePanelVisibility,
+  } from './panel-layout';
 
   // 这两个 storage key 必须先于下方 `$state` 初始化器声明——它们被
   // readInitialExpandedWorkspaces / readInitialSidebarMode 在 $state 初始化时读取，
@@ -61,7 +66,6 @@
   let sessionsByWorkspace = $state<Record<string, Session[]>>({});
   let loadingWorkspaceIds = $state<Record<string, boolean>>({});
   let expandedWorkspaceIds = $state<Record<string, boolean>>(readInitialExpandedWorkspaces());
-  let isMobileViewport = $state(false);
   let viewportWidth = $state(typeof window !== 'undefined' ? window.innerWidth : 1440);
   let sidebarOpen = $state(false);
   let workspaceActionPending = $state(false);
@@ -98,18 +102,9 @@
   const MIN_PREVIEW_PANEL_WIDTH = 320;
   const DEFAULT_PREVIEW_PANEL_WIDTH = 320;
   const MAX_PREVIEW_PANEL_WIDTH = 900;
-  const SHELL_PADDING = 8;
-  const MIN_CONTENT_WIDTH = 620;
-  const VIEWPORT_MOBILE_BREAKPOINT = 900;
 
   const selectedWorkspace = $derived(
     workspaces.find((workspace) => workspace.workspaceId === selectedWorkspaceId) ?? null
-  );
-
-  const currentSession = $derived(
-    selectedWorkspaceId
-      ? (sessionsByWorkspace[selectedWorkspaceId] ?? []).find((session) => session.id === currentSessionId) ?? null
-      : null
   );
 
   $effect(() => {
@@ -125,13 +120,29 @@
     previewPanelWidth ? `--preview-panel-width: ${previewPanelWidth}px` : '',
   ].filter(Boolean).join('; '));
 
-  const sidebarIsDrawer = $derived(isMobileViewport);
-  const sidebarHidden = $derived(!sidebarIsDrawer && sidebarCollapsed);
+  const effectiveSidebarWidth = $derived(
+    sidebarWidth ?? (viewportWidth <= 1120 ? COMPACT_SIDEBAR_WIDTH : DEFAULT_SIDEBAR_WIDTH)
+  );
+  const effectivePreviewPanelWidth = $derived(previewPanelWidth ?? DEFAULT_PREVIEW_PANEL_WIDTH);
+  const panelLayout = $derived(resolvePanelLayout({
+    viewportWidth,
+    sidebarWidth: effectiveSidebarWidth,
+    previewPanelWidth: effectivePreviewPanelWidth,
+  }));
+  const sidebarIsDrawer = $derived(panelLayout.sidebarDrawer);
 
   /** 当前 session 的右栏多 tab 状态；由 right-pane store 派生 */
   const activeRightPaneState = $derived(getRightPaneState(rightPaneState.activeScopeKey));
   /** 右侧面板是否在 DOM 中：仅看 collapsed——空 tab 时也可展开，由 RightPane 自带空态承接 */
   const rightPaneVisible = $derived(!activeRightPaneState.collapsed);
+  const panelVisibility = $derived(resolvePanelVisibility({
+    sidebarDrawer: sidebarIsDrawer,
+    panelsCanCoexist: panelLayout.panelsCanCoexist,
+    sidebarPreferredOpen: !sidebarCollapsed,
+    sidebarDrawerOpen: sidebarOpen,
+    rightPaneOpen: rightPaneVisible,
+  }));
+  const sidebarHidden = $derived(!sidebarIsDrawer && !panelVisibility.sidebarVisible);
   /** 项目文件树高亮：active code tab 的 filepath */
   const activeCodeTabFilePath = $derived.by<string>(() => {
     if (!activeRightPaneState.activeTabId) return '';
@@ -139,7 +150,7 @@
     if (!tab || tab.kind !== 'code') return '';
     return (tab.payload as CodeTabPayload).filepath;
   });
-  const previewIsOverlay = $derived(rightPaneVisible && sidebarIsDrawer);
+  const previewIsOverlay = $derived(rightPaneVisible && panelLayout.previewOverlay);
 
   function currentBootstrapWorkspaceId(): string {
     return typeof messagesState.currentWorkspaceId === 'string'
@@ -605,10 +616,22 @@
       return Math.max(MIN_PREVIEW_PANEL_WIDTH, Math.min(MAX_PREVIEW_PANEL_WIDTH, Math.round(width)));
     }
     const vw = viewportWidth || window.innerWidth;
-    const sidebarTakenWidth = sidebarIsDrawer ? 0 : (sidebarWidth ?? DEFAULT_SIDEBAR_WIDTH) + SHELL_PADDING;
+    if (panelLayout.previewOverlay) {
+      return Math.max(
+        MIN_PREVIEW_PANEL_WIDTH,
+        Math.min(MAX_PREVIEW_PANEL_WIDTH, Math.round(width)),
+      );
+    }
+    const sidebarTakenWidth = sidebarIsDrawer || sidebarCollapsed
+      ? 0
+      : effectiveSidebarWidth + PANEL_LAYOUT.shellGap;
     const availableWidth = Math.max(
       MIN_PREVIEW_PANEL_WIDTH,
-      vw - sidebarTakenWidth - MIN_CONTENT_WIDTH - SHELL_PADDING * 2 - SHELL_PADDING,
+      vw
+        - PANEL_LAYOUT.shellPadding * 2
+        - sidebarTakenWidth
+        - PANEL_LAYOUT.minContentWidth
+        - PANEL_LAYOUT.previewHandleWidth,
     );
     return Math.max(
       MIN_PREVIEW_PANEL_WIDTH,
@@ -728,11 +751,6 @@
     persistSidebarMode();
   });
 
-  function toggleSidebarCollapsed(): void {
-    sidebarCollapsed = !sidebarCollapsed;
-    persistSidebarCollapsed(sidebarCollapsed);
-  }
-
   function resetSidebarWidth(): void {
     const width = sidebarIsDrawer ? DEFAULT_SIDEBAR_WIDTH : window.innerWidth <= 1120 ? COMPACT_SIDEBAR_WIDTH : DEFAULT_SIDEBAR_WIDTH;
     sidebarWidth = width;
@@ -749,7 +767,7 @@
     document.body.style.userSelect = 'none';
 
     const handlePointerMove = (moveEvent: PointerEvent) => {
-      sidebarWidth = clampSidebarWidth(moveEvent.clientX - SHELL_PADDING);
+      sidebarWidth = clampSidebarWidth(moveEvent.clientX - PANEL_LAYOUT.shellPadding);
     };
     const handlePointerUp = () => {
       isSidebarResizing = false;
@@ -781,7 +799,9 @@
     document.body.style.userSelect = 'none';
 
     const handlePointerMove = (moveEvent: PointerEvent) => {
-      previewPanelWidth = clampPreviewPanelWidth(window.innerWidth - moveEvent.clientX - SHELL_PADDING);
+      previewPanelWidth = clampPreviewPanelWidth(
+        window.innerWidth - moveEvent.clientX - PANEL_LAYOUT.shellPadding,
+      );
     };
     const handlePointerUp = () => {
       isPreviewPanelResizing = false;
@@ -850,6 +870,9 @@
       headSummary: metadata.headSummary,
       tailSummary: metadata.tailSummary,
     });
+    if (sidebarIsDrawer) {
+      sidebarOpen = false;
+    }
     return true;
   }
 
@@ -1164,7 +1187,6 @@
       return;
     }
     viewportWidth = window.innerWidth;
-    isMobileViewport = window.innerWidth <= VIEWPORT_MOBILE_BREAKPOINT;
   }
 
   function toggleSidebar(): void {
@@ -1181,17 +1203,33 @@
   function toggleSidebarFromHeader(): void {
     if (sidebarIsDrawer) {
       toggleSidebar();
-    } else {
-      toggleSidebarCollapsed();
+      return;
+    }
+    if (panelVisibility.sidebarVisible) {
+      sidebarCollapsed = true;
+      persistSidebarCollapsed(true);
+      return;
+    }
+    sidebarCollapsed = false;
+    persistSidebarCollapsed(false);
+    if (rightPaneVisible && !panelLayout.panelsCanCoexist) {
+      setRightPaneCollapsed(rightPaneState.activeScopeKey, true);
     }
   }
 
+  function openRightPaneFromHeader(): void {
+    if (sidebarIsDrawer) {
+      sidebarOpen = false;
+    }
+    setRightPaneCollapsed(rightPaneState.activeScopeKey, false);
+  }
+
   setWebSidebarContext({
-    get collapsed() { return sidebarCollapsed; },
     get hidden() { return sidebarHidden; },
     get isDrawer() { return sidebarIsDrawer; },
     get drawerOpen() { return sidebarOpen; },
     toggle: toggleSidebarFromHeader,
+    openRightPane: openRightPaneFromHeader,
   });
 
   function applySidebarModeFromEvent(event: Event): void {
@@ -1220,6 +1258,12 @@
 
   $effect(() => {
     if (!sidebarIsDrawer && sidebarOpen) {
+      sidebarOpen = false;
+    }
+  });
+
+  $effect(() => {
+    if (sidebarIsDrawer && sidebarOpen && rightPaneVisible) {
       sidebarOpen = false;
     }
   });
@@ -1301,14 +1345,28 @@
         void refreshWorkspaces();
       }
     };
+    const handlePanelEscape = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape' || event.defaultPrevented) {
+        return;
+      }
+      if (sidebarIsDrawer && sidebarOpen) {
+        sidebarOpen = false;
+        return;
+      }
+      if (previewIsOverlay && rightPaneVisible) {
+        setRightPaneCollapsed(rightPaneState.activeScopeKey, true);
+      }
+    };
     window.addEventListener('resize', handleResize);
     window.addEventListener('magi:previewFile', handlePreviewFile as EventListener);
     window.addEventListener(RUNTIME_CONNECTION_EVENT, handleAgentConnection as EventListener);
+    window.addEventListener('keydown', handlePanelEscape);
     void refreshWorkspaces();
     return () => {
       window.removeEventListener('resize', handleResize);
       window.removeEventListener('magi:previewFile', handlePreviewFile as EventListener);
       window.removeEventListener(RUNTIME_CONNECTION_EVENT, handleAgentConnection as EventListener);
+      window.removeEventListener('keydown', handlePanelEscape);
       if (resizeRaf !== null) {
         cancelAnimationFrame(resizeRaf);
       }
@@ -1369,6 +1427,17 @@
           <button class="sidebar-icon-btn" type="button" onclick={openAddWorkspaceDialog} disabled={workspaceActionPending || !!loadError} data-tooltip={i18n.t('web.selectFolder')}>
             <Icon name="folder" size={14} />
           </button>
+          {#if sidebarIsDrawer}
+            <button
+              class="sidebar-icon-btn sidebar-drawer-close"
+              type="button"
+              onclick={() => { sidebarOpen = false; }}
+              data-tooltip={i18n.t('web.closeSidebar')}
+              aria-label={i18n.t('web.closeSidebar')}
+            >
+              <Icon name="x" size={14} />
+            </button>
+          {/if}
         </div>
       </div>
     </div>
@@ -1529,30 +1598,6 @@
     class:workbench-content--drawer-dimmed={sidebarIsDrawer && sidebarOpen}
     aria-hidden={sidebarIsDrawer && sidebarOpen ? 'true' : 'false'}
   >
-    {#if sidebarIsDrawer}
-      <div class="mobile-toolbar">
-        <button type="button" class="mobile-toolbar-btn" onclick={toggleSidebar}>
-          {sidebarOpen ? i18n.t('web.closeNav') : i18n.t('web.workspaceOrSession')}
-        </button>
-        <div class="mobile-toolbar-meta">
-          <div class="mobile-toolbar-title">{selectedWorkspace?.name || i18n.t('web.unselectedWorkspace')}</div>
-          <div class="mobile-toolbar-subtitle">{currentSession?.name || i18n.t('header.unnamedSession')}</div>
-        </div>
-        <div class="mobile-toolbar-actions">
-          <button
-            type="button"
-            class="theme-toggle-btn theme-toggle-btn--mobile"
-            title={themeToggleTitle}
-            aria-label={themeToggleTitle}
-            data-theme-preference={webThemePreference}
-            data-theme-mode={webThemeMode}
-            onclick={toggleWebTheme}
-          >
-            <Icon name={themeIconName} size={16} />
-          </button>
-        </div>
-      </div>
-    {/if}
     <div
       class="workbench-body"
       class:workbench-body--with-preview={rightPaneVisible && !previewIsOverlay}
@@ -1572,7 +1617,10 @@
             ondblclick={resetPreviewPanelWidth}
           ></div>
         {/if}
-        <RightPane workspaceRoot={selectedWorkspace?.rootPath || ''} />
+        <RightPane
+          workspaceRoot={selectedWorkspace?.rootPath || ''}
+          overlay={previewIsOverlay}
+        />
       {/if}
     </div>
   </main>
@@ -2328,7 +2376,7 @@
   }
 
   .workbench-body--with-preview {
-    grid-template-columns: minmax(0, 1fr) 8px minmax(320px, var(--preview-panel-width, 320px));
+    grid-template-columns: minmax(620px, 1fr) 8px minmax(320px, var(--preview-panel-width, 320px));
   }
 
   .workbench-app-pane {
@@ -2434,7 +2482,7 @@
     display: none;
   }
 
-  /* 手机抽屉视口才使用覆盖模式；桌面/平板必须保持左右分栏，避免可见列表被右栏命中层覆盖。 */
+  /* 主对话不足最小宽度时，右栏切换为覆盖层；窄平板和手机共用同一覆盖逻辑。 */
   .web-workbench-shell--preview-overlay :global(.right-pane) {
     position: absolute;
     inset: 0;
@@ -2447,18 +2495,7 @@
   }
 
   .web-workbench-shell--preview-overlay :global(.header-bar) {
-    z-index: calc(var(--z-overlay-preview) + 1);
-  }
-
-  .mobile-toolbar {
     display: none;
-  }
-
-  .mobile-toolbar-actions {
-    margin-left: auto;
-    display: flex;
-    align-items: center;
-    flex-shrink: 0;
   }
 
   .workspace-dialog-text {
@@ -2537,61 +2574,9 @@
       pointer-events: auto;
     }
 
-    .mobile-toolbar {
-      display: flex;
-      align-items: center;
-      gap: var(--space-3);
-      padding: var(--space-2) var(--space-4);
-      border-bottom: 1px solid var(--border);
-      background: var(--vscode-sideBar-secondaryBackground, var(--background));
-      flex-shrink: 0;
-      position: relative;
-      z-index: 1;
-    }
-
-    .mobile-toolbar-btn {
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      min-width: 112px;
-      height: var(--btn-height-md);
-      padding: 0 var(--space-3);
-      border-radius: var(--radius-md);
-      border: 1px solid var(--border);
-      background: color-mix(in srgb, var(--foreground) 3%, var(--vscode-sideBar-secondaryBackground, var(--background)));
-      color: var(--foreground);
-      font-size: var(--text-base);
-      font-weight: var(--font-medium);
-      flex-shrink: 0;
-    }
-
-    .theme-toggle-btn--mobile {
+    .sidebar-drawer-close {
       width: 36px;
       height: 36px;
-    }
-
-    .mobile-toolbar-meta {
-      min-width: 0;
-      display: flex;
-      flex-direction: column;
-      gap: 2px;
-    }
-
-    .mobile-toolbar-title {
-      font-size: var(--text-base);
-      font-weight: var(--font-semibold);
-      color: var(--foreground);
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
-
-    .mobile-toolbar-subtitle {
-      font-size: var(--text-sm);
-      color: var(--foreground-muted);
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
     }
 
     .workspace-tree {

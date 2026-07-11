@@ -78,7 +78,7 @@
   @media (max-width: 768px) {
     .tab-bar.tab-bar--top {
       padding: 2px 0;
-      justify-content: flex-start;
+      justify-content: center;
       flex-wrap: nowrap;
     }
 

@@ -171,24 +171,20 @@
     catch { /* silent */ }
   }
 
-  function handleClickOutside(e: MouseEvent) {
-    const t = e.target as HTMLElement;
-    if (!t.closest('.lan-access-panel') && !t.closest('.lan-access-trigger')) onClose();
-  }
-
-  $effect(() => {
-    if (visible) {
-      const timer = setTimeout(() => document.addEventListener('click', handleClickOutside), 0);
-      return () => { clearTimeout(timer); document.removeEventListener('click', handleClickOutside); };
-    }
-  });
 </script>
 
 {#if visible}
 <div class="lan-access-panel">
   <div class="panel-header">
     <span class="panel-title">{i18n.t('lanAccess.title')}</span>
-    <button class="panel-close" onclick={onClose}><Icon name="close" size={14} /></button>
+    <button
+      class="panel-close"
+      onclick={onClose}
+      title={i18n.t('common.close')}
+      aria-label={i18n.t('common.close')}
+    >
+      <Icon name="close" size={14} />
+    </button>
   </div>
   <div class="section">
     <div class="section-label">{i18n.t('lanAccess.sectionLan')}</div>

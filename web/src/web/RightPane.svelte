@@ -17,7 +17,7 @@
     getRightPaneState,
     closeTab,
     setActiveRightPaneTab,
-    toggleRightPane,
+    setRightPaneCollapsed,
     type RightPaneTab,
     type CodeTabPayload,
     type AgentTabPayload,
@@ -31,14 +31,19 @@
 
   interface Props {
     workspaceRoot: string;
+    overlay?: boolean;
   }
 
-  let { workspaceRoot }: Props = $props();
+  let { workspaceRoot, overlay = false }: Props = $props();
 
   // ============ Tab 状态 ============
   const paneScopeKey = $derived(rightPaneState.activeScopeKey);
   const paneState = $derived(getRightPaneState(paneScopeKey));
   const openTabs = $derived(paneState.openTabs);
+
+  function closePane(): void {
+    setRightPaneCollapsed(paneScopeKey, true);
+  }
   const activeTab = $derived.by<RightPaneTab | null>(() => {
     if (!paneState.activeTabId) return null;
     return openTabs.find((tab) => tab.id === paneState.activeTabId) ?? null;
@@ -519,7 +524,18 @@
 
 <aside class="right-pane" aria-label={i18n.t('rightPane.title')}>
   <!-- 顶部 Tab 条 + 折叠按钮 -->
-  <header class="right-pane-tabbar">
+  <header class="right-pane-tabbar" class:right-pane-tabbar--overlay={overlay}>
+    {#if overlay}
+      <button
+        type="button"
+        class="right-pane-overlay-action"
+        onclick={closePane}
+        title={i18n.t('rightPane.backToConversation')}
+        aria-label={i18n.t('rightPane.backToConversation')}
+      >
+        <Icon name="chevron-right" size={14} class="right-pane-back-icon" />
+      </button>
+    {/if}
     <div
       class="right-pane-tabs"
       class:dragging={isDraggingTabs}
@@ -565,11 +581,15 @@
     <button
       type="button"
       class="right-pane-collapse-btn"
-      onclick={() => toggleRightPane(paneScopeKey)}
-      title={i18n.t('rightPane.collapse')}
-      aria-label={i18n.t('rightPane.collapse')}
+      onclick={closePane}
+      title={i18n.t(overlay ? 'rightPane.close' : 'rightPane.collapse')}
+      aria-label={i18n.t(overlay ? 'rightPane.close' : 'rightPane.collapse')}
     >
-      <Icon name="sidebar-toggle" size={14} />
+      {#if overlay}
+        <Icon name="x" size={14} />
+      {:else}
+        <Icon name="sidebar-toggle" size={14} class="right-pane-collapse-icon" />
+      {/if}
     </button>
   </header>
 
@@ -760,6 +780,37 @@
   .right-pane-tabs::-webkit-scrollbar { display: none; }
   .right-pane-tabs.dragging { cursor: grabbing; }
 
+  .right-pane-tabbar--overlay {
+    gap: 4px;
+    padding: 0 6px;
+  }
+
+  .right-pane-overlay-action {
+    flex: 0 0 auto;
+    align-self: center;
+    width: 28px;
+    height: 28px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border: none;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--foreground-muted);
+    cursor: pointer;
+    transition: background var(--transition-fast), color var(--transition-fast);
+  }
+
+  .right-pane-overlay-action:hover,
+  .right-pane-overlay-action:focus-visible {
+    background: var(--surface-hover);
+    color: var(--foreground);
+  }
+
+  :global(.right-pane-back-icon) {
+    transform: rotate(180deg);
+  }
+
   /* 面板内折叠按钮：与 Header 的 toggle 等价，主要服务于窄屏 overlay 模式（顶部按钮被遮挡） */
   .right-pane-collapse-btn {
     flex: 0 0 auto;
@@ -777,6 +828,9 @@
     cursor: pointer;
     transition: background var(--transition-fast), color var(--transition-fast);
   }
+  .right-pane-tabbar--overlay .right-pane-collapse-btn {
+    margin-left: 0;
+  }
   .right-pane-collapse-btn:hover {
     background: var(--surface-hover);
     color: var(--foreground);
@@ -784,6 +838,9 @@
   .right-pane-collapse-btn:focus-visible {
     outline: 2px solid color-mix(in srgb, var(--ind-tab-accent, currentColor) 60%, transparent);
     outline-offset: -2px;
+  }
+  :global(.right-pane-collapse-icon) {
+    transform: scaleX(-1);
   }
 
   .right-pane-tab {

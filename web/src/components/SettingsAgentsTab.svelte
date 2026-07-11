@@ -673,11 +673,19 @@
       gap: 4px;
     }
     .role-tab {
+      flex: 0 0 auto;
       width: auto;
       min-height: 38px;
-      grid-template-columns: 20px minmax(0, max-content) 6px;
+      grid-template-columns: 20px max-content 6px;
       padding: 7px 10px;
       white-space: nowrap;
+    }
+    .role-tab-copy {
+      min-width: max-content;
+    }
+    .role-tab-name {
+      overflow: visible;
+      text-overflow: clip;
     }
     .role-tab.active::before {
       left: 10px;
@@ -722,6 +730,7 @@
       border-bottom: none;
     }
     .role-tab {
+      grid-template-columns: max-content 6px;
       padding: 9px 10px 8px;
     }
     .role-tab-avatar {

@@ -556,16 +556,6 @@ export function closeTab(
   }
 }
 
-/** 切换 collapsed；不动 openTabs */
-export function toggleRightPane(scopeKeyOrSessionId: string | null | undefined): void {
-  const scopeKey = normalizeStoredScopeKey(scopeKeyOrSessionId);
-  if (!scopeKey) {
-    return;
-  }
-  const session = ensureSession(scopeKey);
-  session.collapsed = !session.collapsed;
-}
-
 /** 显式设置 collapsed 状态 */
 export function setRightPaneCollapsed(
   scopeKeyOrSessionId: string | null | undefined,

@@ -94,5 +94,23 @@ await withGoldenViteServer(async (server) => {
   const otherAgentTab = otherAgentPane.openTabs.find((tab) => tab.kind === 'agent');
   assert.equal(otherAgentTab?.payload.workspaceId, 'workspace-other');
 
+  rightPane.activateRightPaneSession('workspace-collapse', 'session-collapse');
+  rightPane.openCodeTab('session-collapse', 'README.md', {
+    workspaceId: 'workspace-collapse',
+    workspacePath: '/tmp/workspace-collapse',
+  });
+  const collapseScope = rightPane.rightPaneState.activeScopeKey;
+  const collapsePane = rightPane.getRightPaneState(collapseScope);
+  const collapseTabId = collapsePane.activeTabId;
+  rightPane.setRightPaneCollapsed(collapseScope, true);
+  assert.equal(collapsePane.collapsed, true, 'explicit collapse must close the surface');
+  assert.equal(collapsePane.openTabs.length, 1, 'explicit collapse must preserve open tabs');
+  rightPane.setRightPaneCollapsed(collapseScope, false);
+  assert.equal(collapsePane.collapsed, false, 'explicit expand must restore the preserved surface');
+  assert.equal(collapsePane.activeTabId, collapseTabId, 'explicit expand must preserve the active tab');
+  rightPane.closeTab(collapseScope, collapseTabId);
+  assert.equal(collapsePane.openTabs.length, 0, 'closing the final tab must empty the pane');
+  assert.equal(collapsePane.collapsed, true, 'closing the final tab must collapse the pane');
+
   console.log('right pane golden replay passed');
 });

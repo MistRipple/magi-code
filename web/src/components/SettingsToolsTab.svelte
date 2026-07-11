@@ -516,8 +516,8 @@
               aria-expanded={builtinExpanded}
             >
               <div class="builtin-summary-main">
-                <div class="header-title-group" style="display: flex; align-items: baseline; gap: 10px;">
-                  <div class="settings-section-title" style="margin-bottom: 0;">{i18n.t('settings.tools.builtinTools')}</div>
+                <div class="header-title-group">
+                  <div class="settings-section-title">{i18n.t('settings.tools.builtinTools')}</div>
                   <span class="builtin-count-tag">{i18n.t('settings.tools.builtinCount', { ready: builtinReadyCount, total: builtinTools.length })}</span>
                 </div>
                 {#if capabilityDependencies.length > 0}
@@ -599,9 +599,9 @@
         <!-- MCP 工具 -->
         <div class="settings-section tools-section">
           <div class="settings-section-header" style="display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 16px;">
-            <div class="header-title-group" style="display: flex; align-items: baseline; gap: 10px;">
-              <div class="settings-section-title" style="margin-bottom: 0;">{i18n.t('settings.tools.mcpTools')}</div>
-              <div class="settings-section-desc" style="margin-bottom: 0;">{i18n.t('settings.tools.mcpDesc')}</div>
+            <div class="header-title-group">
+              <div class="settings-section-title">{i18n.t('settings.tools.mcpTools')}</div>
+              <div class="settings-section-desc">{i18n.t('settings.tools.mcpDesc')}</div>
             </div>
             <div class="settings-section-actions">
               <button class="apple-action-btn" onclick={() => openMCPDialog(null)}>
@@ -726,9 +726,9 @@
         <!-- Skill 工具 -->
         <div class="settings-section tools-section">
           <div class="settings-section-header" style="display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 16px;">
-            <div class="header-title-group" style="display: flex; align-items: baseline; gap: 10px;">
-              <div class="settings-section-title" style="margin-bottom: 0;">{i18n.t('settings.tools.skillsTools')}</div>
-              <div class="settings-section-desc" style="margin-bottom: 0;">{i18n.t('settings.tools.skillsDesc')}</div>
+            <div class="header-title-group">
+              <div class="settings-section-title">{i18n.t('settings.tools.skillsTools')}</div>
+              <div class="settings-section-desc">{i18n.t('settings.tools.skillsDesc')}</div>
             </div>
             <div class="settings-section-actions">
               <button class="apple-action-btn" onclick={() => openSkillLibraryDialog()}>
@@ -800,6 +800,8 @@
     min-height: 0;
     display: flex;
     flex-direction: column;
+    container-type: inline-size;
+    container-name: tools-tab;
   }
 
   .tools-scroller {
@@ -923,6 +925,19 @@
     flex: 1;
   }
 
+  .header-title-group {
+    display: flex;
+    align-items: baseline;
+    flex-wrap: wrap;
+    gap: 4px 10px;
+    min-width: 0;
+  }
+
+  .header-title-group .settings-section-title,
+  .header-title-group .settings-section-desc {
+    margin-bottom: 0;
+  }
+
   .builtin-count-tag {
     font-size: 11px;
     color: var(--foreground-muted);
@@ -995,6 +1010,47 @@
 
   .builtin-expand-icon.expanded {
     transform: rotate(180deg);
+  }
+
+  @container tools-tab (max-width: 760px) {
+    .builtin-summary {
+      align-items: stretch;
+    }
+
+    .builtin-summary-toggle {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      align-items: center;
+      row-gap: 8px;
+      padding-top: 10px;
+      padding-bottom: 10px;
+    }
+
+    .builtin-summary-main {
+      display: contents;
+    }
+
+    .builtin-summary-main > .header-title-group {
+      grid-column: 1;
+      grid-row: 1;
+    }
+
+    .builtin-expand-icon {
+      grid-column: 2;
+      grid-row: 1;
+      margin-left: 8px;
+    }
+
+    .capability-dependency-strip {
+      grid-column: 1 / -1;
+      grid-row: 2;
+      width: 100%;
+    }
+
+    .builtin-summary-actions {
+      align-self: flex-start;
+      padding-top: 8px;
+    }
   }
 
   .builtin-tool-list {

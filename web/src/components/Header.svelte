@@ -1,5 +1,6 @@
 <script lang="ts">
-  import { getState, messagesState } from '../stores/messages.svelte';
+  import { onMount } from 'svelte';
+  import { getState, getUnreadNotificationCount, messagesState } from '../stores/messages.svelte';
   import { showFeedback } from '../lib/notifications';
   import { ensureArray } from '../lib/utils';
   import { vscode } from '../lib/vscode-bridge';
@@ -11,7 +12,7 @@
   import {
     rightPaneState,
     getRightPaneState,
-    toggleRightPane,
+    setRightPaneCollapsed,
   } from '../stores/right-pane.svelte';
 
   // 右侧面板：折叠/展开切换按钮作为常驻入口；作用域由 store 的 activeScopeKey 决定。
@@ -29,20 +30,12 @@
   // Web 外壳通过 context 注入 sidebar 切换能力，桌面/Tauri 路径无 context 时按钮不渲染。
   const webSidebar = getWebSidebarContext();
 
-  // 局域网/隧道访问 popover（直接挂在 Header，操作更直观）
-  let showLanPanel = $state(false);
-
-  // 当前 workspace 的目录名（仅展示，便于在多 workspace 切换时确认上下文）
-  const currentWorkspaceFolder = $derived.by(() => {
-    const path = messagesState.currentWorkspacePath?.trim() ?? '';
-    if (!path) return '';
-    const cleaned = path.replace(/[\\/]+$/, '');
-    const segments = cleaned.split(/[\\/]/).filter(Boolean);
-    return segments.length > 0 ? segments[segments.length - 1] : cleaned;
-  });
+  type HeaderPanel = 'notifications' | 'more' | 'lan';
+  let activeHeaderPanel = $state<HeaderPanel | null>(null);
 
   // 只有“已有当前会话且该会话为空”时才禁止重复新建；草稿态不要求先绑定工作区。
   const hasCurrentSession = $derived.by(() => Boolean(messagesState.currentSessionId?.trim()));
+  const unreadNotificationCount = $derived.by(() => getUnreadNotificationCount());
   const isCurrentSessionEmpty = $derived(
     ensureArray(appState.threadMessages).length === 0
   );
@@ -68,8 +61,46 @@
 
   // 打开设置
   function openSettings() {
+    activeHeaderPanel = null;
     onOpenSettings?.();
   }
+
+  function openRemoteAccess() {
+    activeHeaderPanel = 'lan';
+  }
+
+  function setNotificationOpen(open: boolean) {
+    activeHeaderPanel = open ? 'notifications' : null;
+  }
+
+  function openRightPane() {
+    activeHeaderPanel = null;
+    if (webSidebar) {
+      webSidebar.openRightPane();
+      return;
+    }
+    setRightPaneCollapsed(rightPaneState.activeScopeKey, false);
+  }
+
+  onMount(() => {
+    const closeHeaderPanel = (event: PointerEvent) => {
+      const target = event.target instanceof Element ? event.target : null;
+      if (!target?.closest('.header-actions')) {
+        activeHeaderPanel = null;
+      }
+    };
+    const closeHeaderPanelOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        activeHeaderPanel = null;
+      }
+    };
+    window.addEventListener('pointerdown', closeHeaderPanel);
+    window.addEventListener('keydown', closeHeaderPanelOnEscape);
+    return () => {
+      window.removeEventListener('pointerdown', closeHeaderPanel);
+      window.removeEventListener('keydown', closeHeaderPanelOnEscape);
+    };
+  });
 
 </script>
 
@@ -85,53 +116,84 @@
       <Icon name="sidebar-toggle" size={14} />
     </button>
   {/if}
-  {#if currentWorkspaceFolder}
-    <div
-      class="workspace-breadcrumb"
-      title={messagesState.currentWorkspacePath || currentWorkspaceFolder}
-      aria-label={i18n.t('header.workspaceBreadcrumbTitle', { path: messagesState.currentWorkspacePath || currentWorkspaceFolder })}
-    >
-      <Icon name="folder" size={12} />
-      <span class="workspace-breadcrumb-name">{currentWorkspaceFolder}</span>
-    </div>
-  {/if}
   <div class="header-center">
     {@render children?.()}
   </div>
 
   <!-- 右侧操作按钮 -->
   <div class="header-actions">
-    <button class="btn-icon btn-icon--sm" onclick={newSession} title={newSessionTitle} disabled={newSessionDisabled}>
+    <button class="btn-icon header-action-btn" onclick={newSession} title={newSessionTitle} disabled={newSessionDisabled}>
       <Icon name="plus" size={14} />
     </button>
-    <div class="lan-access-wrapper">
+    <button
+      class="btn-icon header-action-btn header-notification-btn"
+      class:active={activeHeaderPanel === 'notifications'}
+      onclick={() => setNotificationOpen(activeHeaderPanel !== 'notifications')}
+      title={i18n.t('notification.buttonTitle')}
+      aria-label={i18n.t('notification.buttonTitle')}
+      aria-expanded={activeHeaderPanel === 'notifications'}
+    >
+      <Icon name="bell" size={14} />
+      {#if unreadNotificationCount > 0}
+        <span class="header-action-badge">{unreadNotificationCount > 99 ? '99+' : unreadNotificationCount}</span>
+      {/if}
+    </button>
+    {#if showRightPaneToggle && currentRightPane.collapsed}
       <button
-        class="btn-icon btn-icon--sm lan-access-trigger"
-        class:active={showLanPanel}
-        onclick={() => { showLanPanel = !showLanPanel; }}
-        title={i18n.t('lanAccess.title')}
-        aria-label={i18n.t('lanAccess.title')}
+        class="btn-icon header-action-btn header-right-pane-btn"
+        onclick={openRightPane}
+        title={i18n.t('rightPane.expand')}
+        aria-label={i18n.t('rightPane.expand')}
       >
-        <Icon name="qrcode" size={14} />
-      </button>
-      <LanAccessPanel visible={showLanPanel} onClose={() => { showLanPanel = false; }} />
-    </div>
-    <NotificationCenter />
-    {#if showRightPaneToggle}
-      <button
-        class="btn-icon btn-icon--sm"
-        class:active={!currentRightPane.collapsed}
-        onclick={() => toggleRightPane(rightPaneState.activeScopeKey)}
-        title={currentRightPane.collapsed ? i18n.t('rightPane.expand') : i18n.t('rightPane.collapse')}
-        aria-label={currentRightPane.collapsed ? i18n.t('rightPane.expand') : i18n.t('rightPane.collapse')}
-        aria-expanded={!currentRightPane.collapsed}
-      >
-        <Icon name="sidebar-toggle" size={14} />
+        <Icon name="sidebar-toggle" size={14} class="right-pane-toggle-icon" />
       </button>
     {/if}
-    <button class="btn-icon btn-icon--sm" onclick={openSettings} title={i18n.t('header.settings')}>
-      <Icon name="settings" size={14} />
-    </button>
+    <div class="header-more-wrapper">
+      <button
+        class="btn-icon header-action-btn"
+        class:active={activeHeaderPanel === 'more' || activeHeaderPanel === 'lan'}
+        class:header-mobile-active={activeHeaderPanel === 'notifications'}
+        onclick={(event) => {
+          event.stopPropagation();
+          activeHeaderPanel = activeHeaderPanel === 'more' ? null : 'more';
+        }}
+        title={i18n.t('header.more')}
+        aria-label={i18n.t('header.more')}
+        aria-expanded={activeHeaderPanel === 'more'}
+      >
+        <Icon name="more-horizontal" size={14} />
+        {#if unreadNotificationCount > 0}
+          <span class="header-more-unread-dot" aria-hidden="true"></span>
+        {/if}
+      </button>
+      {#if activeHeaderPanel === 'more'}
+        <div class="header-more-menu">
+          <button class="header-mobile-menu-item" type="button" onclick={() => setNotificationOpen(true)}>
+            <Icon name="bell" size={14} />
+            <span>{i18n.t('notification.title')}</span>
+            {#if unreadNotificationCount > 0}
+              <span class="header-menu-badge">{unreadNotificationCount > 99 ? '99+' : unreadNotificationCount}</span>
+            {/if}
+          </button>
+          <button type="button" onclick={openRemoteAccess}>
+            <Icon name="qrcode" size={14} />
+            <span>{i18n.t('lanAccess.title')}</span>
+          </button>
+          <button type="button" onclick={openSettings}>
+            <Icon name="settings" size={14} />
+            <span>{i18n.t('header.settings')}</span>
+          </button>
+        </div>
+      {/if}
+      <LanAccessPanel
+        visible={activeHeaderPanel === 'lan'}
+        onClose={() => { activeHeaderPanel = null; }}
+      />
+      <NotificationCenter
+        open={activeHeaderPanel === 'notifications'}
+        onOpenChange={setNotificationOpen}
+      />
+    </div>
   </div>
 </header>
 
@@ -162,8 +224,8 @@
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    width: 28px;
-    height: 28px;
+    width: 32px;
+    height: 32px;
     margin-right: 6px;
     padding: 0;
     border: 1px solid transparent;
@@ -180,61 +242,146 @@
     border-color: var(--border);
   }
 
-  .workspace-breadcrumb {
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-    height: 24px;
-    padding: 0 8px;
-    margin-right: 4px;
-    color: var(--foreground-muted);
-    font-size: 11px;
-    border-radius: var(--radius-full);
-    background: color-mix(in srgb, var(--surface-2) 50%, transparent);
-    flex-shrink: 0;
-    cursor: default;
-  }
-  .workspace-breadcrumb-name {
-    max-width: 160px;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  @media (max-width: 720px) {
-    .workspace-breadcrumb-name { max-width: 80px; }
-  }
-
   .header-actions {
     display: flex;
     align-items: center;
-    gap: var(--space-2);
+    gap: 3px;
     flex-shrink: 0;
     justify-content: flex-end;
+    position: relative;
   }
 
-  .lan-access-wrapper {
+  .header-more-wrapper {
     position: relative;
     display: inline-flex;
   }
 
-  /* 移动端：Header 变两行 */
+  .header-action-btn {
+    position: relative;
+    width: 32px;
+    height: 32px;
+    flex: 0 0 32px;
+  }
+
+  .header-action-btn.active {
+    background: var(--surface-active);
+    color: var(--foreground);
+  }
+
+  .header-action-badge {
+    position: absolute;
+    top: -2px;
+    right: -2px;
+    min-width: 14px;
+    height: 14px;
+    padding: 0 3px;
+    border-radius: var(--radius-full);
+    background: var(--error);
+    color: var(--primary-foreground);
+    font-size: 9px;
+    font-weight: var(--font-bold);
+    line-height: 14px;
+    text-align: center;
+    pointer-events: none;
+  }
+
+  .header-more-unread-dot {
+    display: none;
+    position: absolute;
+    top: 5px;
+    right: 5px;
+    width: 6px;
+    height: 6px;
+    border-radius: var(--radius-full);
+    background: var(--error);
+    box-shadow: 0 0 0 2px var(--glass-bg);
+  }
+
+  :global(.right-pane-toggle-icon) {
+    transform: scaleX(-1);
+  }
+
+  .header-more-menu {
+    position: absolute;
+    top: calc(100% + 6px);
+    right: 0;
+    z-index: var(--z-popover);
+    width: 168px;
+    padding: 5px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--dropdown-bg);
+    box-shadow: var(--shadow-lg);
+  }
+
+  .header-more-menu button {
+    width: 100%;
+    height: 34px;
+    padding: 0 9px;
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    border: 0;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--foreground);
+    font-size: var(--text-sm);
+    cursor: pointer;
+  }
+
+  .header-more-menu button:hover {
+    background: var(--surface-hover);
+  }
+
+  .header-more-menu .header-mobile-menu-item {
+    display: none;
+  }
+
+  .header-menu-badge {
+    min-width: 18px;
+    height: 18px;
+    margin-left: auto;
+    padding: 0 5px;
+    border-radius: var(--radius-full);
+    background: var(--error);
+    color: var(--primary-foreground);
+    font-size: 10px;
+    line-height: 18px;
+    text-align: center;
+  }
+
+  /* 移动端：低频入口收进更多菜单，顶部保持单行三段式。 */
   @media (max-width: 768px) {
     .header-bar {
-      flex-wrap: wrap;
-      height: auto;
+      display: grid;
+      grid-template-columns: 1fr auto 1fr;
+      height: 48px;
       padding: var(--space-2) var(--space-3);
-      gap: var(--space-1);
+      gap: var(--space-2);
+    }
+
+    .header-sidebar-toggle {
+      grid-column: 1;
+      justify-self: start;
+      margin-right: 0;
     }
 
     .header-actions {
-      flex: 0;
+      grid-column: 3;
+      justify-self: end;
     }
 
-    /* 第二行：Tab 栏占满整行 */
+    .header-sidebar-toggle,
+    .header-action-btn {
+      width: 38px;
+      height: 38px;
+      flex-basis: 38px;
+    }
+
     .header-center {
-      flex-basis: 100%;
-      order: 3;
-      justify-content: flex-start;
+      grid-column: 2;
+      min-width: 0;
+      justify-content: center;
       overflow-x: auto;
       -webkit-overflow-scrolling: touch;
       scrollbar-width: none;
@@ -242,6 +389,23 @@
 
     .header-center::-webkit-scrollbar {
       display: none;
+    }
+
+    .header-notification-btn {
+      display: none;
+    }
+
+    .header-more-unread-dot {
+      display: block;
+    }
+
+    .header-action-btn.header-mobile-active {
+      background: var(--surface-active);
+      color: var(--foreground);
+    }
+
+    .header-more-menu .header-mobile-menu-item {
+      display: flex;
     }
   }
 

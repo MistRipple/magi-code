@@ -1,5 +1,41 @@
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
 import { withGoldenViteServer } from './golden-vite.mjs';
+
+const ringComponentSource = await readFile(
+  new URL('../src/components/ContextUsageRing.svelte', import.meta.url),
+  'utf8',
+);
+const inputAreaSource = await readFile(
+  new URL('../src/components/InputArea.svelte', import.meta.url),
+  'utf8',
+);
+
+assert.doesNotMatch(
+  ringComponentSource,
+  /class=["']ring-label["']/,
+  '输入栏上下文控件不得常驻显示百分比文字',
+);
+assert.match(
+  ringComponentSource,
+  /\.ia-context-ring\s*\{[\s\S]*?width:\s*24px;[\s\S]*?height:\s*24px;[\s\S]*?padding:\s*0;/,
+  '上下文圆环按钮必须保持 24x24 的纯图标尺寸',
+);
+assert.doesNotMatch(
+  ringComponentSource,
+  /\.ia-context-ring-wrap:(?:hover|focus-within)\s+\.ia-context-popover/,
+  '完整上下文信息只能由点击状态展开，不得在 hover 或 focus 时自动展示',
+);
+assert.match(
+  ringComponentSource,
+  /\.ia-context-popover\.visible\s*\{/,
+  '点击后的 visible 状态必须继续负责展示完整上下文信息',
+);
+assert.doesNotMatch(
+  inputAreaSource,
+  /\.ia-context-ring \.ring-label/,
+  '输入栏不得保留已删除百分比文字的窄屏兼容样式',
+);
 
 await withGoldenViteServer(async (server) => {
   const ring = await server.ssrLoadModule('/src/lib/context-usage-ring.ts');

@@ -4,13 +4,21 @@ import { withGoldenViteServer } from './golden-vite.mjs';
 await withGoldenViteServer(async (server) => {
   const policy = await server.ssrLoadModule('/src/lib/notification-policy.ts');
 
-  assert.deepEqual(policy.resolveFeedbackPolicy(), {
+  assert.deepEqual(policy.resolveFeedbackPolicy('success'), {
     category: 'feedback',
     persistToCenter: false,
     countUnread: false,
     actionRequired: false,
-    displayMode: 'toast',
+    displayMode: 'silent',
   });
+
+  assert.equal(policy.resolveFeedbackPolicy('info').displayMode, 'silent');
+  assert.equal(policy.resolveFeedbackPolicy('warning').displayMode, 'toast');
+  assert.equal(policy.resolveFeedbackPolicy('error').displayMode, 'toast');
+  assert.equal(policy.shouldDisplayToast('success'), false);
+  assert.equal(policy.shouldDisplayToast('info'), false);
+  assert.equal(policy.shouldDisplayToast('warning'), true);
+  assert.equal(policy.shouldDisplayToast('error'), true);
 
   assert.deepEqual(policy.resolveIncidentPolicy({ scope: 'workspace' }), {
     category: 'incident',

@@ -1,11 +1,11 @@
 import { getContext, setContext } from 'svelte';
 
 export interface WebSidebarContext {
-  readonly collapsed: boolean;
   readonly hidden: boolean;
   readonly isDrawer: boolean;
   readonly drawerOpen: boolean;
   toggle(): void;
+  openRightPane(): void;
 }
 
 const WEB_SIDEBAR_CONTEXT_KEY = Symbol('webSidebar');

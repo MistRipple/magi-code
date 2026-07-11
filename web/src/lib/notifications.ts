@@ -28,7 +28,10 @@ export function showFeedback(
   message: string,
   options: FeedbackOptions = {},
 ): void {
-  const policy = resolveFeedbackPolicy();
+  const policy = resolveFeedbackPolicy(level);
+  if (policy.displayMode === 'silent') {
+    return;
+  }
   addToast(level, message, options.title, {
     source: options.source,
     actionRequired: policy.actionRequired,

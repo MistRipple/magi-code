@@ -28,7 +28,13 @@ await withGoldenViteServer(async (server) => {
 
   notifications.showFeedback('success', '配置已保存', { source: 'settings-panel' });
   assert.equal(posted.length, 0, 'normal feedback must never persist to the notification center');
-  assert.equal(store.getToasts().length, 1);
+  assert.equal(store.getToasts().length, 0, 'routine success feedback must stay silent');
+
+  notifications.showFeedback('info', '消息已发送', { source: 'bridge-runtime' });
+  assert.equal(store.getToasts().length, 0, 'routine conversation feedback must stay silent');
+
+  notifications.showFeedback('warning', '上下文即将达到上限', { source: 'model-runtime' });
+  assert.equal(store.getToasts().length, 1, 'warnings must remain visible');
 
   assert.equal(notifications.reportIncident('模型请求失败', {
     scope: 'workspace',

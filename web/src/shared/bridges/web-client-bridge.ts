@@ -1549,7 +1549,7 @@ function emitBridgeSuccessToast(
     undefined,
     {
       title: i18n.t('bridge.toast.operationCompletedTitle'),
-      displayMode: 'toast',
+      displayMode: 'silent',
       category: 'feedback',
       source: 'bridge-runtime',
       actionRequired: false,
@@ -1577,7 +1577,7 @@ function emitBridgeInfoToast(
     undefined,
     {
       title: i18n.t('bridge.toast.infoTitle'),
-      displayMode: 'toast',
+      displayMode: 'silent',
       category: 'feedback',
       source: 'bridge-runtime',
       actionRequired: false,
@@ -1976,10 +1976,14 @@ function clearWorkspaceSessionBinding(workspaceId: string, workspacePath: string
   return settingsBindingChanged;
 }
 
-function dispatchWorkspaceSessionCleared(workspaceId: string, workspacePath: string): void {
+function dispatchWorkspaceSessionDetached(
+  workspaceId: string,
+  workspacePath: string,
+  dataType: 'workspaceDraftStarted' | 'workspaceSessionCleared',
+): void {
   closeEventStream();
   const settingsBindingChanged = clearWorkspaceSessionBinding(workspaceId, workspacePath);
-  emitDataMessage('workspaceSessionCleared', {
+  emitDataMessage(dataType, {
     workspaceId: workspaceId.trim(),
     workspacePath: workspacePath.trim(),
   });
@@ -2318,9 +2322,10 @@ async function fetchBootstrap(
           if (!bootstrapRequestCanClearMissingSession(effectiveBinding, requestSeq)) {
             return;
           }
-          dispatchWorkspaceSessionCleared(
+          dispatchWorkspaceSessionDetached(
             effectiveBinding.workspaceId,
             effectiveBinding.workspacePath,
+            'workspaceSessionCleared',
           );
           try {
             const snapshot = await getWorkspaceSessions(
@@ -3653,7 +3658,18 @@ export function createWebClientBridge(): ClientBridge {
           const workspacePath = typeof message.workspacePath === 'string' ? message.workspacePath : '';
           const sessionId = typeof message.sessionId === 'string' ? message.sessionId.trim() : '';
           if (!sessionId && (workspaceId.trim() || workspacePath.trim())) {
-            dispatchWorkspaceSessionCleared(workspaceId, workspacePath);
+            const normalizedWorkspaceId = workspaceId.trim();
+            const normalizedWorkspacePath = workspacePath.trim();
+            const alreadyBoundToWorkspaceDraft = !currentSessionId
+              && currentWorkspaceId === normalizedWorkspaceId
+              && currentWorkspacePath === normalizedWorkspacePath;
+            if (!alreadyBoundToWorkspaceDraft) {
+              dispatchWorkspaceSessionDetached(
+                normalizedWorkspaceId,
+                normalizedWorkspacePath,
+                'workspaceSessionCleared',
+              );
+            }
             return;
           }
           const settingsBindingChanged = persistWorkspaceBinding(workspaceId, workspacePath, sessionId);
@@ -3952,10 +3968,10 @@ export function createWebClientBridge(): ClientBridge {
           return;
         case 'newSession': {
           const workspaceScope = resolveWorkspaceScopeFromSource(message);
-          dispatchWorkspaceSessionCleared(workspaceScope.workspaceId, workspaceScope.workspacePath);
-          emitBridgeSuccessToast(
-            i18n.t('bridge.action.newSession'),
-            i18n.t('bridge.detail.newSessionPanelReady'),
+          dispatchWorkspaceSessionDetached(
+            workspaceScope.workspaceId,
+            workspaceScope.workspacePath,
+            'workspaceDraftStarted',
           );
           return;
         }

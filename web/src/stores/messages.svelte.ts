@@ -31,6 +31,7 @@ import { vscode } from '../lib/vscode-bridge';
 import { ensureArray } from '../lib/utils';
 import {
   normalizeIncidentRecords,
+  shouldDisplayToast,
   type NormalizedIncidentRecord,
 } from '../lib/notification-policy';
 
@@ -1823,6 +1824,9 @@ function replaceNotificationContextList(
 const MAX_VISIBLE_TOASTS = 5;
 
 export function addToast(type: string, message: string, title?: string, options?: ToastOptions) {
+  if (!shouldDisplayToast(type)) {
+    return;
+  }
   const id = `toast_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
   const toast: ToastRecord = {
     id,

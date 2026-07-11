@@ -81,14 +81,13 @@
   <button
     type="button"
     class="ia-context-ring tone-{view.tone}"
-    class:empty={!view.hasData}
     data-testid="context-usage-ring"
     onclick={toggleDetails}
     onkeydown={handleKeydown}
-    title={tooltip}
+    title={i18n.t('input.contextRing.label')}
     aria-label={tooltip}
     aria-expanded={pinned}
-    aria-describedby={popoverId}
+    aria-controls={popoverId}
   >
     <svg viewBox="0 0 18 18" width="18" height="18" aria-hidden="true">
       <circle class="ring-track" cx="9" cy="9" r={view.geometry.radius} fill="none" stroke-width="2" />
@@ -107,7 +106,6 @@
         />
       {/if}
     </svg>
-    <span class="ring-label">{view.labelText}</span>
   </button>
 
   <div
@@ -142,15 +140,13 @@
   .ia-context-ring {
     display: inline-flex;
     align-items: center;
-    gap: 4px;
+    justify-content: center;
+    width: 24px;
     height: 24px;
-    padding: 0 6px 0 4px;
+    padding: 0;
     border: 0;
     border-radius: var(--radius-full);
     background: var(--surface-2);
-    color: var(--foreground-muted);
-    font-size: 11px;
-    line-height: 1;
     font-family: inherit;
     user-select: none;
     cursor: pointer;
@@ -186,15 +182,6 @@
     transition: stroke-dashoffset var(--transition-fast);
   }
 
-  .ring-label {
-    font-variant-numeric: tabular-nums;
-    color: var(--foreground);
-  }
-
-  .ia-context-ring.empty .ring-label {
-    color: var(--foreground-muted);
-  }
-
   .ia-context-popover {
     position: absolute;
     right: 0;
@@ -223,8 +210,6 @@
       visibility var(--transition-fast);
   }
 
-  .ia-context-ring-wrap:hover .ia-context-popover,
-  .ia-context-ring-wrap:focus-within .ia-context-popover,
   .ia-context-popover.visible {
     opacity: 1;
     visibility: visible;
@@ -259,9 +244,6 @@
   }
 
   .tone-notice .ring-fill { stroke: var(--warning, #d6a700); }
-  .tone-notice .ring-label { color: var(--warning, #d6a700); }
   .tone-warning .ring-fill { stroke: var(--warning, #e08600); }
-  .tone-warning .ring-label { color: var(--warning, #e08600); }
   .tone-danger .ring-fill { stroke: var(--error, #d64545); }
-  .tone-danger .ring-label { color: var(--error, #d64545); }
 </style>

@@ -99,6 +99,47 @@ function clearCurrentSessionBeforeWorkspaceChange(nextWorkspaceId: string): void
   }
 }
 
+function handleWorkspaceSessionDetached(
+  payload: Record<string, unknown>,
+  sessions: Session[],
+): void {
+  batchWebviewStatePersistence(() => {
+    messagesState.sessionHydrating = false;
+    const hasPendingLocalTurn = messagesState.pendingRequests.size > 0;
+    if (!hasPendingLocalTurn) {
+      clearAllMessages({
+        persist: false,
+        resetTimelineView: true,
+        resetPanelState: true,
+        skipAntiLiftBack: true,
+      });
+      clearAllRequestBindings();
+      clearPendingInteractions();
+      clearProcessingState({ skipAntiLiftBack: true });
+    }
+    const nextWorkspaceId = typeof payload.workspaceId === 'string' && payload.workspaceId.trim()
+      ? payload.workspaceId.trim()
+      : currentWorkspaceIdValue();
+    clearCurrentSessionBeforeWorkspaceChange(nextWorkspaceId);
+    messagesState.currentWorkspaceId = nextWorkspaceId || messagesState.currentWorkspaceId;
+    messagesState.currentWorkspacePath = typeof payload.workspacePath === 'string' ? payload.workspacePath.trim() : '';
+    updateSessions(sessions);
+    setCurrentSessionId(null);
+    if (!hasPendingLocalTurn) {
+      setQueuedMessages([]);
+      clearCanonicalSessionTurns();
+    }
+    setOrchestratorRuntimeState(null);
+    setAppState({
+      ...buildEmptyWorkspaceAppState(Date.now()),
+      currentSessionId: '',
+      currentWorkspaceId: messagesState.currentWorkspaceId,
+      currentWorkspacePath: messagesState.currentWorkspacePath,
+      sessions,
+    });
+  });
+}
+
 const MODEL_STATUS_TYPES = new Set<ModelStatusType>([
   'available',
   'connected',
@@ -534,42 +575,12 @@ export function handleUnifiedData(standard: StandardMessage) {
       }));
       break;
 
+    case 'workspaceDraftStarted':
+      handleWorkspaceSessionDetached(payload, ensureArray(messagesState.sessions));
+      break;
+
     case 'workspaceSessionCleared':
-      batchWebviewStatePersistence(() => {
-        messagesState.sessionHydrating = false;
-        const hasPendingLocalTurn = messagesState.pendingRequests.size > 0;
-        if (!hasPendingLocalTurn) {
-          clearAllMessages({
-            persist: false,
-            resetTimelineView: true,
-            resetPanelState: true,
-            skipAntiLiftBack: true,
-          });
-          clearAllRequestBindings();
-          clearPendingInteractions();
-          clearProcessingState({ skipAntiLiftBack: true });
-        }
-        const nextWorkspaceId = typeof payload.workspaceId === 'string' && payload.workspaceId.trim()
-          ? payload.workspaceId.trim()
-          : currentWorkspaceIdValue();
-        clearCurrentSessionBeforeWorkspaceChange(nextWorkspaceId);
-        messagesState.currentWorkspaceId = nextWorkspaceId || messagesState.currentWorkspaceId;
-        messagesState.currentWorkspacePath = typeof payload.workspacePath === 'string' ? payload.workspacePath.trim() : '';
-        updateSessions([]);
-        setCurrentSessionId(null);
-        if (!hasPendingLocalTurn) {
-          setQueuedMessages([]);
-          clearCanonicalSessionTurns();
-        }
-        setOrchestratorRuntimeState(null);
-        setAppState({
-          ...buildEmptyWorkspaceAppState(Date.now()),
-          currentSessionId: '',
-          currentWorkspaceId: messagesState.currentWorkspaceId,
-          currentWorkspacePath: messagesState.currentWorkspacePath,
-          sessions: [],
-        });
-      });
+      handleWorkspaceSessionDetached(payload, []);
       break;
 
     case 'sessionBootstrapLoaded':

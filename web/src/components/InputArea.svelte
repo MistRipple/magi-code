@@ -1853,9 +1853,9 @@
               disabled={sessionInputLocked || isInteractionBlocking}
               title={`${i18n.t('input.access.title')}: ${i18n.t(currentAccessProfileOption.labelKey)}。${i18n.t(currentAccessProfileOption.descriptionKey)}`}
               aria-expanded={accessProfilePickerOpen}
-              aria-label={i18n.t('input.access.title')}
+              aria-label={`${i18n.t('input.access.title')}: ${i18n.t(currentAccessProfileOption.labelKey)}`}
             >
-              <Icon name={currentAccessProfileOption.icon} size={12} />
+              <Icon name={currentAccessProfileOption.icon} size={14} />
               <span class="ia-access-btn-label">{i18n.t(currentAccessProfileOption.labelKey)}</span>
             </button>
             {#if accessProfilePickerOpen}
@@ -3145,19 +3145,18 @@
     }
 
     .ia-actions {
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) auto;
-      grid-template-areas:
-        "scope runtime"
-        "submit submit";
+      display: flex;
+      flex-wrap: nowrap;
       align-items: center;
-      gap: 3px 6px;
-      padding: 4px 6px 6px;
+      gap: 4px;
+      padding: 4px 6px;
     }
 
     .ia-left {
-      grid-area: scope;
-      width: 100%;
+      display: flex;
+      flex: 0 1 auto;
+      width: auto;
+      max-width: min(180px, 40vw);
       min-width: 0;
     }
 
@@ -3166,18 +3165,20 @@
     }
 
     .ia-right {
-      display: contents;
+      display: flex;
+      flex: 1 1 auto;
+      min-width: 0;
     }
 
     .ia-runtime-controls {
-      grid-area: runtime;
-      justify-self: end;
+      flex: 0 0 auto;
       gap: 3px;
     }
 
     .ia-submit-controls {
-      grid-area: submit;
-      width: 100%;
+      flex: 0 1 auto;
+      width: auto;
+      min-width: 0;
       gap: 4px;
     }
 
@@ -3188,13 +3189,13 @@
 
     .ia-workspace-wrap,
     .ia-left > .ia-picker-wrap {
-      flex: 1 1 0;
+      flex: 0 1 auto;
       min-width: 0;
     }
 
     .ia-workspace-btn,
     .ia-branch-btn {
-      width: 100%;
+      width: auto;
       max-width: 100%;
     }
 
@@ -3205,31 +3206,35 @@
     }
 
     .ia-access-wrap {
-      flex: 0 1 auto;
-      max-width: 86px;
+      flex: 0 0 28px;
+      width: 28px;
+      max-width: 28px;
     }
 
     .ia-access-popover {
       position: fixed;
       right: 10px;
-      bottom: calc(76px + env(safe-area-inset-bottom));
+      bottom: calc(44px + env(safe-area-inset-bottom));
       left: auto;
       width: min(248px, calc(100vw - 20px));
       min-width: 0;
     }
 
     .ia-model-wrap {
-      flex: 1 1 auto;
-      max-width: none;
+      flex: 0 1 auto;
+      min-width: 0;
+      max-width: min(180px, 42vw);
     }
 
     .ia-access-wrap .ia-picker-btn {
-      width: auto;
-      max-width: 100%;
+      width: 28px;
+      max-width: 28px;
+      padding: 0;
+      justify-content: center;
     }
 
     .ia-model-wrap .ia-picker-btn {
-      width: 100%;
+      width: auto;
       max-width: 100%;
       justify-content: flex-start;
     }
@@ -3239,7 +3244,7 @@
     }
 
     .ia-access-btn-label {
-      max-width: 100%;
+      display: none;
     }
 
     .ia-picker-btn-label {
@@ -3249,6 +3254,10 @@
 
     .ia-enhance {
       flex: 0 0 24px;
+    }
+
+    .ia-model-effort {
+      display: none;
     }
 
     .ia-send {
@@ -3263,9 +3272,33 @@
     .ia-session-model-popover {
       position: fixed;
       right: 10px;
-      bottom: calc(48px + env(safe-area-inset-bottom));
+      bottom: calc(44px + env(safe-area-inset-bottom));
       left: auto;
       width: min(280px, calc(100vw - 20px));
+    }
+
+  }
+
+  @media (max-width: 420px) {
+    .ia-left {
+      flex-basis: auto;
+      max-width: min(132px, 34vw);
+    }
+
+    .ia-workspace-btn-label,
+    .ia-branch-btn-label {
+      min-width: 0;
+    }
+  }
+
+  @media (max-width: 360px) {
+    .ia-left {
+      flex-basis: auto;
+      max-width: min(96px, 30vw);
+    }
+
+    .ia-model-wrap {
+      max-width: min(132px, 41vw);
     }
   }
 
