@@ -9,6 +9,7 @@ impl KnowledgeQueryService {
     pub fn execute(
         entries: &HashMap<String, KnowledgeRecord>,
         index_terms: &HashMap<String, Vec<String>>,
+        term_postings: &HashMap<String, HashSet<String>>,
         code_sources: &HashMap<String, CodeIndexSource>,
         audit_links: &HashMap<String, KnowledgeAuditLink>,
         governance_links: &HashMap<String, KnowledgeGovernanceLink>,
@@ -17,8 +18,25 @@ impl KnowledgeQueryService {
         let query_terms = query.text.as_deref().map(tokenize).unwrap_or_default();
         let normalized_tags = normalize_tags(query.tags.clone());
 
+        let candidate_ids = if query_terms.is_empty() {
+            None
+        } else {
+            Some(
+                query_terms
+                    .iter()
+                    .filter_map(|term| term_postings.get(term))
+                    .flat_map(|posting| posting.iter().cloned())
+                    .collect::<HashSet<_>>(),
+            )
+        };
+
         let mut matches = entries
             .values()
+            .filter(|record| {
+                candidate_ids
+                    .as_ref()
+                    .is_none_or(|ids| ids.contains(&record.knowledge_id))
+            })
             .filter(|record| {
                 query
                     .workspace_id
@@ -38,8 +56,6 @@ impl KnowledgeQueryService {
                             governance_links.get(&record.knowledge_id),
                         )
                     });
-                let term_set = indexed_terms.iter().cloned().collect::<HashSet<_>>();
-
                 if !normalized_tags
                     .iter()
                     .all(|tag| record.tags.iter().any(|record_tag| record_tag == tag))
@@ -49,7 +65,7 @@ impl KnowledgeQueryService {
 
                 let matched_query_terms = query_terms
                     .iter()
-                    .filter(|term| term_set.contains(term.as_str()))
+                    .filter(|term| indexed_terms.contains(term))
                     .cloned()
                     .collect::<Vec<_>>();
 

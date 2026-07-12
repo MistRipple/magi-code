@@ -71,9 +71,6 @@ pub(crate) fn refresh_live_mcp_tool_definitions(
     denied_tools: &[String],
 ) -> Vec<ChatToolDefinition> {
     definitions.retain(|definition| !definition.function.name.starts_with("mcp__"));
-    if access_profile == AccessProfile::ReadOnly {
-        return definitions;
-    }
     let skill_allowed_tools = active_skill_id.and_then(|skill_id| {
         skill_runtime.and_then(|runtime| {
             let policy = runtime
@@ -86,9 +83,10 @@ pub(crate) fn refresh_live_mcp_tool_definitions(
         })
     });
     for tool in tool_registry.external_tool_catalog_snapshot().mcp_tools {
-        if denied_tools
-            .iter()
-            .any(|denied| denied == &tool.model_tool_name)
+        if (access_profile == AccessProfile::ReadOnly && !tool.read_only)
+            || denied_tools
+                .iter()
+                .any(|denied| denied == &tool.model_tool_name)
             || allowed_tools
                 .is_some_and(|allowed| !allowed.iter().any(|name| name == &tool.model_tool_name))
             || skill_allowed_tools
@@ -250,5 +248,54 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(names, vec!["file_read", "mcp__repo__inspect"]);
+    }
+
+    #[test]
+    fn read_only_surface_exposes_only_mcp_tools_with_read_only_annotation() {
+        let registry = ToolRegistry::new(
+            std::sync::Arc::new(magi_governance::GovernanceService::default()),
+            std::sync::Arc::new(magi_event_bus::InMemoryEventBus::new(8)),
+        )
+        .with_external_tool_catalog_provider(std::sync::Arc::new(|| {
+            magi_tool_runtime::ExternalToolCatalogSnapshot {
+                mcp_tools: vec![
+                    magi_tool_runtime::ExternalMcpToolCatalogEntry {
+                        server_id: "repo".to_string(),
+                        server_name: "Repository".to_string(),
+                        model_tool_name: "mcp__repo__inspect".to_string(),
+                        tool_name: "inspect".to_string(),
+                        description: "Inspect repository".to_string(),
+                        read_only: true,
+                        input_schema: serde_json::json!({ "type": "object" }),
+                    },
+                    magi_tool_runtime::ExternalMcpToolCatalogEntry {
+                        server_id: "repo".to_string(),
+                        server_name: "Repository".to_string(),
+                        model_tool_name: "mcp__repo__write".to_string(),
+                        tool_name: "write".to_string(),
+                        description: "Write repository".to_string(),
+                        read_only: false,
+                        input_schema: serde_json::json!({ "type": "object" }),
+                    },
+                ],
+                ..magi_tool_runtime::ExternalToolCatalogSnapshot::default()
+            }
+        }));
+
+        let definitions = refresh_live_mcp_tool_definitions(
+            Vec::new(),
+            &registry,
+            None,
+            None,
+            AccessProfile::ReadOnly,
+            None,
+            &[],
+        );
+        let names = definitions
+            .iter()
+            .map(|definition| definition.function.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, vec!["mcp__repo__inspect"]);
     }
 }

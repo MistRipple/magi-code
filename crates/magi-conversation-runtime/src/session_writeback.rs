@@ -1316,20 +1316,11 @@ fn execute_session_turn_tool_call_scoped(
         );
     }
 
-    if let Some(result) =
-        registry.execute_external_mcp_tool(&tool_call.function.name, &tool_call.function.arguments)
-    {
-        if access_profile == magi_core::AccessProfile::ReadOnly {
-            return (
-                serde_json::json!({
-                    "tool": tool_call.function.name,
-                    "status": "failed",
-                    "error": "只读访问模式不允许调用 MCP 工具",
-                })
-                .to_string(),
-                ExecutionResultStatus::Failed,
-            );
-        }
+    if let Some(result) = registry.execute_external_mcp_tool(
+        &tool_call.function.name,
+        &tool_call.function.arguments,
+        access_profile,
+    ) {
         return result;
     }
 
@@ -2082,6 +2073,7 @@ mod tests {
                     model_tool_name: "mcp__repo-tools__inspect".to_string(),
                     tool_name: "inspect".to_string(),
                     description: "Inspect repository".to_string(),
+                    read_only: false,
                     input_schema: serde_json::json!({ "type": "object", "properties": {} }),
                 }],
                 ..magi_tool_runtime::ExternalToolCatalogSnapshot::default()

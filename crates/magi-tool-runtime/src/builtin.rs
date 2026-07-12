@@ -27,6 +27,9 @@ use std::os::unix::process::CommandExt;
 const DEFAULT_SHELL_TIMEOUT_MS: u64 = 30_000;
 const MAX_SHELL_TIMEOUT_MS: u64 = 120_000;
 const SHELL_TIMEOUT_POLL_MS: u64 = 20;
+const DEFAULT_FILE_READ_MAX_BYTES: usize = 64 * 1024;
+const FILE_READ_MAX_BYTES: usize = 1024 * 1024;
+const SHELL_OUTPUT_MAX_BYTES: usize = 1024 * 1024;
 const FILE_READ_PUBLIC_ERROR: &str = "文件暂不可读取，请检查路径或权限";
 const FILE_WRITE_PUBLIC_ERROR: &str = "文件暂不可写入，请检查路径或权限";
 const FILE_DELETE_PUBLIC_ERROR: &str = "文件暂不可删除，请检查路径或权限";
@@ -62,8 +65,15 @@ struct ShellExecOutput {
     status: Option<ExitStatus>,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
     timed_out: bool,
     cancelled: bool,
+}
+
+pub(crate) struct ShellPipeOutput {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) truncated: bool,
 }
 
 static SHELL_EXECUTION_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -137,7 +147,7 @@ impl BuiltinTool for NormalizedBuiltinTool {
             BuiltinToolName::ProcessKill => execute_process_kill(input, context),
             BuiltinToolName::ProcessList => execute_process_list(context),
             BuiltinToolName::ProcessInspect => execute_process_inspect(input),
-            BuiltinToolName::DiffPreview => execute_diff_preview(input),
+            BuiltinToolName::DiffPreview => execute_diff_preview(input, context),
             BuiltinToolName::WebSearch => execute_web_search(input),
             BuiltinToolName::WebFetch => execute_web_fetch(input),
             BuiltinToolName::DiagramRender => execute_diagram_render(input),
@@ -248,15 +258,19 @@ fn field_bool(object: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<
     })
 }
 
-pub(crate) fn resolve_path(input: &str) -> Result<PathBuf, String> {
-    let path = PathBuf::from(input);
-    if path.is_absolute() {
-        Ok(path)
-    } else {
-        std::env::current_dir()
-            .map(|cwd| cwd.join(path))
-            .map_err(|error| format!("无法解析当前目录: {error}"))
-    }
+fn field_string_array(object: &serde_json::Map<String, Value>, keys: &[&str]) -> Vec<String> {
+    keys.iter()
+        .find_map(|key| object.get(*key).and_then(Value::as_array))
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn context_working_directory(context: &ToolExecutionContext) -> Result<PathBuf, String> {
@@ -298,9 +312,9 @@ fn execute_file_read(input: &str, context: &ToolExecutionContext) -> String {
     let max_bytes = request
         .get("max_bytes")
         .and_then(Value::as_u64)
-        .map(|value| value as usize)
-        .unwrap_or(64 * 1024)
-        .max(1);
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(DEFAULT_FILE_READ_MAX_BYTES)
+        .clamp(1, FILE_READ_MAX_BYTES);
 
     let path = match resolve_path_with_context(&path_input, context) {
         Ok(path) => path,
@@ -352,25 +366,27 @@ fn execute_file_read(input: &str, context: &ToolExecutionContext) -> String {
         .to_string();
     }
 
-    let bytes = match fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            return builtin_filesystem_error(
-                "file_read",
-                FILE_READ_PUBLIC_ERROR,
-                "读取文件失败",
-                &path,
-                error,
-            );
-        }
-    };
-    let truncated = bytes.len() > max_bytes;
-    let preview_bytes = if truncated {
-        &bytes[..max_bytes]
-    } else {
-        &bytes[..]
-    };
-    let content = String::from_utf8_lossy(preview_bytes).to_string();
+    let file_size_bytes = metadata.len();
+    let mut bytes = Vec::with_capacity(max_bytes.saturating_add(1));
+    let read_result = fs::File::open(&path).and_then(|file| {
+        file.take(max_bytes as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map(|_| ())
+    });
+    if let Err(error) = read_result {
+        return builtin_filesystem_error(
+            "file_read",
+            FILE_READ_PUBLIC_ERROR,
+            "读取文件失败",
+            &path,
+            error,
+        );
+    }
+    let truncated = file_size_bytes > max_bytes as u64 || bytes.len() > max_bytes;
+    if bytes.len() > max_bytes {
+        bytes.truncate(max_bytes);
+    }
+    let content = String::from_utf8_lossy(&bytes).to_string();
 
     serde_json::json!({
         "tool": "file_read",
@@ -378,8 +394,9 @@ fn execute_file_read(input: &str, context: &ToolExecutionContext) -> String {
         "access_mode": BuiltinToolAccessMode::ReadOnly.as_str(),
         "mode": "file",
         "path": path.display().to_string(),
+        "file_size_bytes": file_size_bytes,
+        "max_bytes": max_bytes,
         "bytes_read": bytes.len(),
-        "preview_bytes": preview_bytes.len(),
         "truncated": truncated,
         "encoding": "utf-8-lossy",
         "content": content,
@@ -579,6 +596,8 @@ fn execute_shell_exec(input: &str, context: &ToolExecutionContext) -> String {
         "exit_code": exit_code,
         "stdout": stdout,
         "stderr": stderr,
+        "stdout_truncated": output.stdout_truncated,
+        "stderr_truncated": output.stderr_truncated,
         "summary": if output.timed_out {
             format!("命令执行超时({timeout_ms}ms): {command}")
         } else if output.cancelled {
@@ -824,12 +843,20 @@ fn execute_shell_command_with_timeout(
     };
     unregister_active_shell_exec(execution_id);
 
-    let stdout = stdout_reader.join().unwrap_or_default();
-    let stderr = stderr_reader.join().unwrap_or_default();
+    let stdout = stdout_reader.join().unwrap_or(ShellPipeOutput {
+        bytes: Vec::new(),
+        truncated: false,
+    });
+    let stderr = stderr_reader.join().unwrap_or(ShellPipeOutput {
+        bytes: Vec::new(),
+        truncated: false,
+    });
     Ok(ShellExecOutput {
         status,
-        stdout,
-        stderr,
+        stdout: stdout.bytes,
+        stderr: stderr.bytes,
+        stdout_truncated: stdout.truncated,
+        stderr_truncated: stderr.truncated,
         timed_out,
         cancelled,
     })
@@ -955,13 +982,29 @@ fn terminate_process_group(child: &mut Child) {
     let _ = child.kill();
 }
 
-fn read_child_pipe<T: Read>(pipe: Option<T>) -> Vec<u8> {
+pub(crate) fn read_child_pipe<T: Read>(pipe: Option<T>) -> ShellPipeOutput {
     let Some(mut pipe) = pipe else {
-        return Vec::new();
+        return ShellPipeOutput {
+            bytes: Vec::new(),
+            truncated: false,
+        };
     };
-    let mut buffer = Vec::new();
-    let _ = pipe.read_to_end(&mut buffer);
-    buffer
+    let mut bytes = Vec::new();
+    let mut truncated = false;
+    let mut chunk = [0_u8; 8192];
+    loop {
+        let size = match pipe.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(size) => size,
+        };
+        bytes.extend_from_slice(&chunk[..size]);
+        if bytes.len() > SHELL_OUTPUT_MAX_BYTES {
+            truncated = true;
+            let excess = bytes.len() - SHELL_OUTPUT_MAX_BYTES;
+            bytes.drain(..excess);
+        }
+    }
+    ShellPipeOutput { bytes, truncated }
 }
 
 fn execute_process_launch(input: &str, context: &ToolExecutionContext) -> String {
@@ -1295,9 +1338,8 @@ fn spawn_managed_process_reader<T: Read + Send + 'static>(
                 Ok(size) => {
                     let mut buffer = target.lock().expect("process output lock poisoned");
                     buffer.extend_from_slice(&chunk[..size]);
-                    const MAX_BUFFER: usize = 1_000_000;
-                    if buffer.len() > MAX_BUFFER {
-                        let drain = buffer.len() - MAX_BUFFER;
+                    if buffer.len() > SHELL_OUTPUT_MAX_BYTES {
+                        let drain = buffer.len() - SHELL_OUTPUT_MAX_BYTES;
                         buffer.drain(0..drain);
                     }
                 }
@@ -1436,7 +1478,7 @@ fn execute_process_inspect(input: &str) -> String {
     .to_string()
 }
 
-fn execute_diff_preview(input: &str) -> String {
+fn execute_diff_preview(input: &str, context: &ToolExecutionContext) -> String {
     let request = parse_json_object(input);
     let parsed = if let Some(object) = request {
         let before_path = field_string(&object, &["before_path"]);
@@ -1463,11 +1505,11 @@ fn execute_diff_preview(input: &str) -> String {
     };
 
     let (before_path, after_path, before, after, before_label, after_label) = parsed;
-    let before_text = match read_diff_source(before_path, before) {
+    let before_text = match read_diff_source(before_path, before, context) {
         Ok(text) => text,
         Err(error) => return diff_preview_source_error(error),
     };
-    let after_text = match read_diff_source(after_path, after) {
+    let after_text = match read_diff_source(after_path, after, context) {
         Ok(text) => text,
         Err(error) => return diff_preview_source_error(error),
     };
@@ -1733,6 +1775,7 @@ enum DiffSourceReadError {
 fn read_diff_source(
     path: Option<String>,
     inline: Option<String>,
+    context: &ToolExecutionContext,
 ) -> Result<String, DiffSourceReadError> {
     if let Some(inline) = inline
         && !inline.is_empty()
@@ -1740,7 +1783,8 @@ fn read_diff_source(
         return Ok(inline);
     }
     if let Some(path) = path {
-        let resolved = resolve_path(&path).map_err(DiffSourceReadError::Resolve)?;
+        let resolved =
+            resolve_path_with_context(&path, context).map_err(DiffSourceReadError::Resolve)?;
         return fs::read_to_string(&resolved).map_err(|source| DiffSourceReadError::Read {
             path: resolved,
             source,
@@ -3207,6 +3251,19 @@ fn execute_search_semantic(
         .and_then(|obj| field_usize(obj, &["limit"]))
         .unwrap_or(10)
         .clamp(1, 50);
+    let max_context_tokens = request
+        .as_ref()
+        .and_then(|obj| field_usize(obj, &["max_context_tokens"]))
+        .unwrap_or(8_000)
+        .clamp(256, 32_000);
+    let preferred_scopes = request
+        .as_ref()
+        .map(|obj| field_string_array(obj, &["preferred_scopes"]))
+        .unwrap_or_default();
+    let prefer_recent_edits = request
+        .as_ref()
+        .and_then(|obj| field_bool(obj, &["prefer_recent_edits"]))
+        .unwrap_or(true);
 
     let Some(store) = resources.knowledge_store.as_ref() else {
         return builtin_error("search_semantic", "代码索引引擎不可用");
@@ -3219,6 +3276,9 @@ fn execute_search_semantic(
         &query,
         magi_knowledge_store::local_search_engine::SearchOptions {
             max_results: Some(limit),
+            max_context_tokens: Some(max_context_tokens),
+            preferred_scopes: preferred_scopes.clone(),
+            prefer_recent_edits,
             ..Default::default()
         },
     ) else {
@@ -3234,7 +3294,7 @@ fn execute_search_semantic(
                 .unwrap_or_default();
             serde_json::json!({
                 "path": &result.file_path,
-                "score": format!("{:.2}", result.score),
+                "score": result.score,
                 "source": "engine",
                 "matched_keywords": matched_keywords,
                 "snippet": primary_snippet.map(|snippet| snippet.content.as_str()).unwrap_or_default(),
@@ -3252,6 +3312,18 @@ fn execute_search_semantic(
         "engine": "local_search_engine",
         "workspace_id": workspace_id.as_str(),
         "returned_matches": results.len(),
+        "max_context_tokens": max_context_tokens,
+        "preferred_scopes": preferred_scopes,
+        "prefer_recent_edits": prefer_recent_edits,
+        "index": store.workspace_index_stats(workspace_id).map(|stats| serde_json::json!({
+            "version": stats.index_version,
+            "documents": stats.total_documents,
+            "symbols": stats.unique_symbols,
+            "cache_hit_rate": stats.cache_hit_rate,
+            "query_count": stats.query_count,
+            "average_query_micros": stats.average_query_micros,
+            "max_query_micros": stats.max_query_micros,
+        })),
         "results": results,
         "summary": format!("本地代码索引检索 \"{}\" 返回 {} 个匹配", query, results.len())
     })

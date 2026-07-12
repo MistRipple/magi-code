@@ -37,7 +37,7 @@ use magi_context_runtime::{
 };
 use magi_core::{
     AccessProfile, EventId, ExecutionOwnership, LeaseId, SessionId, TaskId, TaskKind, UtcMillis,
-    WorkerId, WorkspaceId,
+    WorkerId, WorkspaceId, estimate_text_tokens,
 };
 use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
 use magi_knowledge_store::{KnowledgeKind, KnowledgeRecord, KnowledgeStore};
@@ -1618,7 +1618,7 @@ fn format_skill_prompt_injection(injection: &magi_skill_runtime::SkillPromptInje
 }
 
 fn estimate_session_memory_tokens(text: &str) -> u64 {
-    text.len() as u64 / 4 + 1
+    estimate_text_tokens(text) as u64
 }
 
 fn safeguard_rule_prompt_line(pattern: &str, action: magi_safety_gate::SafetyAction) -> String {
@@ -2498,6 +2498,7 @@ mod tests {
                         model_tool_name: "mcp__repo-tools__inspect".to_string(),
                         tool_name: "inspect".to_string(),
                         description: "Inspect repository".to_string(),
+                        read_only: false,
                         input_schema: serde_json::json!({
                             "type": "object",
                             "properties": { "path": { "type": "string" } }
@@ -2534,6 +2535,7 @@ mod tests {
                         model_tool_name: "mcp__repo-tools__inspect".to_string(),
                         tool_name: "inspect".to_string(),
                         description: "Inspect repository".to_string(),
+                        read_only: false,
                         input_schema: serde_json::json!({ "type": "object" }),
                     }],
                     ..magi_tool_runtime::ExternalToolCatalogSnapshot::default()

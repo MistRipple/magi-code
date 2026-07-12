@@ -202,6 +202,8 @@ pub struct ExternalMcpToolCatalogEntry {
     pub model_tool_name: String,
     pub tool_name: String,
     pub description: String,
+    #[serde(default)]
+    pub read_only: bool,
     pub input_schema: serde_json::Value,
 }
 
@@ -228,7 +230,8 @@ pub fn external_mcp_model_tool_name(server_id: &str, tool_name: &str) -> String 
     let server = segment(server_id);
     let tool = segment(tool_name);
     let full = format!("mcp__{server}__{tool}");
-    if full.len() <= 64 {
+    let identifiers_changed = server != server_id || tool != tool_name;
+    if full.len() <= 64 && !identifiers_changed {
         return full;
     }
 
@@ -237,7 +240,7 @@ pub fn external_mcp_model_tool_name(server_id: &str, tool_name: &str) -> String 
         hash ^= u64::from(byte);
         hash = hash.wrapping_mul(0x100000001b3);
     }
-    let suffix = format!("__{hash:08x}");
+    let suffix = format!("__{hash:016x}");
     let max_prefix_len = 64usize.saturating_sub(suffix.len());
     let prefix = full.chars().take(max_prefix_len).collect::<String>();
     format!("{prefix}{suffix}")

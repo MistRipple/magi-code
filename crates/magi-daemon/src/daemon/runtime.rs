@@ -309,6 +309,12 @@ fn external_mcp_server_catalog_snapshot(
             model_tool_name: external_mcp_model_tool_name(&server_id, &tool.name),
             tool_name: tool.name.clone(),
             description: tool.description.clone().unwrap_or_default(),
+            read_only: tool
+                .annotations
+                .as_ref()
+                .and_then(|annotations| annotations.get("readOnlyHint"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
             input_schema: tool
                 .input_schema
                 .clone()

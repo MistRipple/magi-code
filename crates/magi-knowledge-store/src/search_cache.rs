@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+use std::sync::Mutex;
 
 pub struct SearchCacheConfig {
     pub max_size: usize,
@@ -8,8 +9,8 @@ pub struct SearchCacheConfig {
 impl Default for SearchCacheConfig {
     fn default() -> Self {
         Self {
-            max_size: 20,
-            ttl_ms: 60_000,
+            max_size: 128,
+            ttl_ms: 300_000,
         }
     }
 }
@@ -29,9 +30,13 @@ pub struct SearchCacheStats {
 }
 
 pub struct SearchCache<T: Clone> {
+    state: Mutex<SearchCacheState<T>>,
+    config: SearchCacheConfig,
+}
+
+struct SearchCacheState<T: Clone> {
     entries: HashMap<String, CacheEntry<T>>,
     order: VecDeque<String>,
-    config: SearchCacheConfig,
     hit_count: u64,
     miss_count: u64,
 }
@@ -46,11 +51,13 @@ fn now_millis() -> u64 {
 impl<T: Clone> SearchCache<T> {
     pub fn new(config: SearchCacheConfig) -> Self {
         Self {
-            entries: HashMap::new(),
-            order: VecDeque::new(),
+            state: Mutex::new(SearchCacheState {
+                entries: HashMap::new(),
+                order: VecDeque::new(),
+                hit_count: 0,
+                miss_count: 0,
+            }),
             config,
-            hit_count: 0,
-            miss_count: 0,
         }
     }
 
@@ -58,47 +65,49 @@ impl<T: Clone> SearchCache<T> {
         Self::new(SearchCacheConfig::default())
     }
 
-    pub fn get(&mut self, query: &str) -> Option<T> {
+    pub fn get(&self, query: &str) -> Option<T> {
         let key = Self::normalize_key(query);
-        let entry = match self.entries.get(&key) {
+        let mut state = self.state.lock().expect("search cache mutex poisoned");
+        let entry = match state.entries.get(&key) {
             Some(e) => e,
             None => {
-                self.miss_count += 1;
+                state.miss_count += 1;
                 return None;
             }
         };
 
         if now_millis() - entry.timestamp > self.config.ttl_ms {
-            self.entries.remove(&key);
-            self.order.retain(|k| k != &key);
-            self.miss_count += 1;
+            state.entries.remove(&key);
+            state.order.retain(|k| k != &key);
+            state.miss_count += 1;
             return None;
         }
 
         let value = entry.value.clone();
-        self.order.retain(|k| k != &key);
-        self.order.push_back(key);
-        self.hit_count += 1;
+        state.order.retain(|k| k != &key);
+        state.order.push_back(key);
+        state.hit_count += 1;
         Some(value)
     }
 
-    pub fn set(&mut self, query: &str, value: T, file_paths: Vec<String>) {
+    pub fn set(&self, query: &str, value: T, file_paths: Vec<String>) {
         let key = Self::normalize_key(query);
+        let mut state = self.state.lock().expect("search cache mutex poisoned");
 
-        if self.entries.contains_key(&key) {
-            self.entries.remove(&key);
-            self.order.retain(|k| k != &key);
+        if state.entries.contains_key(&key) {
+            state.entries.remove(&key);
+            state.order.retain(|k| k != &key);
         }
 
-        while self.entries.len() >= self.config.max_size {
-            if let Some(oldest_key) = self.order.pop_front() {
-                self.entries.remove(&oldest_key);
+        while state.entries.len() >= self.config.max_size {
+            if let Some(oldest_key) = state.order.pop_front() {
+                state.entries.remove(&oldest_key);
             } else {
                 break;
             }
         }
 
-        self.entries.insert(
+        state.entries.insert(
             key.clone(),
             CacheEntry {
                 value,
@@ -106,36 +115,39 @@ impl<T: Clone> SearchCache<T> {
                 file_paths,
             },
         );
-        self.order.push_back(key);
+        state.order.push_back(key);
     }
 
-    pub fn invalidate_all(&mut self) {
-        self.entries.clear();
-        self.order.clear();
+    pub fn invalidate_all(&self) {
+        let mut state = self.state.lock().expect("search cache mutex poisoned");
+        state.entries.clear();
+        state.order.clear();
     }
 
-    pub fn invalidate_by_file(&mut self, file_path: &str) {
-        let keys_to_remove: Vec<String> = self
+    pub fn invalidate_by_file(&self, file_path: &str) {
+        let mut state = self.state.lock().expect("search cache mutex poisoned");
+        let keys_to_remove: Vec<String> = state
             .entries
             .iter()
             .filter(|(_, entry)| entry.file_paths.iter().any(|p| p == file_path))
             .map(|(k, _)| k.clone())
             .collect();
         for key in &keys_to_remove {
-            self.entries.remove(key);
+            state.entries.remove(key);
         }
-        self.order.retain(|k| !keys_to_remove.contains(k));
+        state.order.retain(|k| !keys_to_remove.contains(k));
     }
 
     pub fn get_stats(&self) -> SearchCacheStats {
-        let total = self.hit_count + self.miss_count;
+        let state = self.state.lock().expect("search cache mutex poisoned");
+        let total = state.hit_count + state.miss_count;
         SearchCacheStats {
-            size: self.entries.len(),
+            size: state.entries.len(),
             max_size: self.config.max_size,
-            hit_count: self.hit_count,
-            miss_count: self.miss_count,
+            hit_count: state.hit_count,
+            miss_count: state.miss_count,
             hit_rate: if total > 0 {
-                self.hit_count as f64 / total as f64
+                state.hit_count as f64 / total as f64
             } else {
                 0.0
             },
@@ -167,7 +179,7 @@ mod tests {
 
     #[test]
     fn test_basic_get_set() {
-        let mut cache = SearchCache::<Vec<String>>::with_defaults();
+        let cache = SearchCache::<Vec<String>>::with_defaults();
         cache.set("hello world", vec!["a.rs".into()], vec!["a.rs".into()]);
         assert!(cache.get("hello world").is_some());
         assert!(cache.get("nonexistent").is_none());
@@ -175,7 +187,7 @@ mod tests {
 
     #[test]
     fn test_lru_eviction() {
-        let mut cache = SearchCache::<i32>::new(SearchCacheConfig {
+        let cache = SearchCache::<i32>::new(SearchCacheConfig {
             max_size: 3,
             ttl_ms: 60_000,
         });
@@ -189,7 +201,7 @@ mod tests {
 
     #[test]
     fn test_invalidate_by_file() {
-        let mut cache = SearchCache::<i32>::with_defaults();
+        let cache = SearchCache::<i32>::with_defaults();
         cache.set("q1", 1, vec!["a.rs".into(), "b.rs".into()]);
         cache.set("q2", 2, vec!["c.rs".into()]);
         cache.invalidate_by_file("a.rs");
@@ -199,14 +211,14 @@ mod tests {
 
     #[test]
     fn test_normalize_key() {
-        let mut cache = SearchCache::<i32>::with_defaults();
+        let cache = SearchCache::<i32>::with_defaults();
         cache.set("  Hello   World  ", 42, vec![]);
         assert_eq!(cache.get("hello world"), Some(42));
     }
 
     #[test]
     fn test_stats() {
-        let mut cache = SearchCache::<i32>::with_defaults();
+        let cache = SearchCache::<i32>::with_defaults();
         cache.set("a", 1, vec![]);
         cache.get("a");
         cache.get("b");
@@ -214,5 +226,23 @@ mod tests {
         assert_eq!(stats.hit_count, 1);
         assert_eq!(stats.miss_count, 1);
         assert!((stats.hit_rate - 0.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn cache_supports_concurrent_shared_access() {
+        let cache = std::sync::Arc::new(SearchCache::<usize>::with_defaults());
+        let workers = (0..8)
+            .map(|index| {
+                let cache = cache.clone();
+                std::thread::spawn(move || {
+                    cache.set(&format!("query-{index}"), index, vec![]);
+                    cache.get(&format!("query-{index}"))
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for (index, worker) in workers.into_iter().enumerate() {
+            assert_eq!(worker.join().expect("cache worker"), Some(index));
+        }
     }
 }

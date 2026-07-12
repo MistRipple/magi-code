@@ -7,10 +7,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::dependency_graph::DependencyGraphSnapshot;
 use crate::inverted_index::InvertedIndexSnapshot;
-use crate::query_expander::ExpansionCacheSnapshot;
 use crate::symbol_index::SymbolIndexSnapshot;
 
-const PERSISTENCE_VERSION: u32 = 1;
+const PERSISTENCE_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FileManifestEntry {
@@ -29,8 +28,6 @@ pub struct PersistenceSnapshot {
     pub inverted_index: InvertedIndexSnapshot,
     pub symbol_index: SymbolIndexSnapshot,
     pub dependency_graph: DependencyGraphSnapshot,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expansion_cache: Option<ExpansionCacheSnapshot>,
 }
 
 #[derive(Clone, Debug, Default)]

@@ -32,6 +32,16 @@ fn all_builtin_tools() -> [BuiltinToolName; BuiltinToolName::ALL.len()] {
 }
 
 #[test]
+fn external_mcp_model_tool_names_do_not_collapse_distinct_identifiers() {
+    let dotted = external_mcp_model_tool_name("repo.tools", "file/read");
+    let underscored = external_mcp_model_tool_name("repo_tools", "file_read");
+
+    assert_ne!(dotted, underscored);
+    assert!(dotted.len() <= 64);
+    assert!(underscored.len() <= 64);
+}
+
+#[test]
 fn file_read_uses_schema_path_and_directory_listing() {
     let root = unique_temp_dir("magi-tool-file-read");
     let file_path = root.join("hello.txt");
@@ -108,6 +118,49 @@ fn file_read_rejects_raw_path_input() {
     let payload: Value = serde_json::from_str(&output.payload).unwrap();
     assert_eq!(payload["tool"], BuiltinToolName::FileRead.as_str());
     assert_eq!(payload["error"], "输入必须为 JSON 对象，包含 path 字段");
+}
+
+#[test]
+fn file_read_caps_preview_size_and_reports_actual_bytes_read() {
+    let root = unique_temp_dir("magi-tool-file-read-cap");
+    let file_path = root.join("large.txt");
+    fs::write(&file_path, vec![b'x'; 1024 * 1024 + 32]).expect("write large file");
+    let registry = make_registry();
+
+    let output = exec_tool(
+        &registry,
+        BuiltinToolName::FileRead,
+        &serde_json::json!({
+            "path": file_path.to_string_lossy(),
+            "max_bytes": 8 * 1024 * 1024,
+        })
+        .to_string(),
+    );
+
+    assert_eq!(output.status, ExecutionResultStatus::Succeeded);
+    let payload: Value = serde_json::from_str(&output.payload).expect("payload json");
+    assert_eq!(payload["file_size_bytes"], 1024 * 1024 + 32);
+    assert_eq!(payload["bytes_read"], 1024 * 1024);
+    assert_eq!(payload["max_bytes"], 1024 * 1024);
+    assert_eq!(payload["truncated"], true);
+    assert_eq!(
+        payload["content"].as_str().expect("content").len(),
+        1024 * 1024
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn shell_pipe_reader_keeps_bounded_tail_and_reports_truncation() {
+    let mut source = vec![b'a'; 1024 * 1024];
+    source.extend(vec![b'b'; 32]);
+
+    let output = crate::builtin::read_child_pipe(Some(std::io::Cursor::new(source)));
+
+    assert_eq!(output.bytes.len(), 1024 * 1024);
+    assert!(output.truncated);
+    assert!(output.bytes.ends_with(&[b'b'; 32]));
 }
 
 #[test]
@@ -1912,6 +1965,42 @@ fn diff_preview_prefers_inline_text_when_path_labels_are_present() {
             .expect("preview")
             .contains("+BETA")
     );
+}
+
+#[test]
+fn diff_preview_resolves_relative_paths_from_tool_working_directory() {
+    let root = unique_temp_dir("magi-tool-diff-preview-relative");
+    fs::write(root.join("before.txt"), "alpha\nold\n").expect("write before");
+    fs::write(root.join("after.txt"), "alpha\nnew\n").expect("write after");
+    let registry = make_registry();
+    let context = ToolExecutionContext {
+        working_directory: Some(root.clone()),
+        ..ToolExecutionContext::default()
+    };
+
+    let output = registry.execute_with_policy(
+        ToolExecutionInput::for_builtin_invocation(
+            ToolCallId::new("tool-call-diff-relative"),
+            BuiltinToolName::DiffPreview.as_str(),
+            serde_json::json!({
+                "before_path": "before.txt",
+                "after_path": "after.txt",
+            })
+            .to_string(),
+        ),
+        context,
+        &ToolExecutionPolicy::default(),
+    );
+
+    assert_eq!(output.status, ExecutionResultStatus::Succeeded);
+    let payload: Value = serde_json::from_str(&output.payload).expect("payload json");
+    assert!(
+        payload["preview"]
+            .as_str()
+            .is_some_and(|value| { value.contains("-old") && value.contains("+new") })
+    );
+
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -4487,6 +4576,64 @@ fn public_object_schemas_always_define_required_array() {
 }
 
 #[test]
+fn builtin_catalog_contracts_are_complete_and_self_consistent() {
+    let mut names = std::collections::BTreeSet::new();
+    for tool in BuiltinToolName::ALL {
+        assert!(
+            names.insert(tool.as_str()),
+            "工具名必须唯一: {}",
+            tool.as_str()
+        );
+        assert_eq!(BuiltinToolName::from_name(tool.as_str()), Some(tool));
+        assert!(!tool.category().trim().is_empty());
+        assert!(!tool.description().trim().is_empty());
+
+        let schema = tool.parameters_schema();
+        assert_eq!(
+            schema.get("type").and_then(Value::as_str),
+            Some("object"),
+            "{} 必须使用 object 参数 schema",
+            tool.as_str()
+        );
+        let properties = schema
+            .get("properties")
+            .and_then(Value::as_object)
+            .expect("object schema must define properties");
+        let required = schema
+            .get("required")
+            .and_then(Value::as_array)
+            .expect("object schema must define required");
+        for required_name in required {
+            let required_name = required_name
+                .as_str()
+                .expect("required entries must be property names");
+            assert!(
+                properties.contains_key(required_name),
+                "{} required 字段 {} 未在 properties 中定义",
+                tool.as_str(),
+                required_name
+            );
+        }
+    }
+}
+
+#[test]
+fn create_goal_schema_uses_explicit_nullable_budget_contract() {
+    let schema = BuiltinToolName::CreateGoal.parameters_schema();
+    assert_eq!(
+        schema["required"],
+        serde_json::json!(["objective", "token_budget"])
+    );
+    assert_eq!(
+        schema["properties"]["token_budget"]["anyOf"],
+        serde_json::json!([
+            { "type": "integer", "minimum": 16000 },
+            { "type": "null" }
+        ])
+    );
+}
+
+#[test]
 fn public_tool_schemas_do_not_expose_legacy_argument_aliases() {
     let cases = [
         (
@@ -5059,7 +5206,13 @@ fn search_semantic_uses_workspace_local_index() {
             tool_call_id: ToolCallId::new("tool-call-search-fuse"),
             tool_name: BuiltinToolName::SearchSemantic.as_str().to_string(),
             tool_kind: ToolKind::Builtin,
-            input: serde_json::json!({ "query": "authenticate user" }).to_string(),
+            input: serde_json::json!({
+                "query": "authenticate user",
+                "max_context_tokens": 512,
+                "preferred_scopes": ["src"],
+                "prefer_recent_edits": false
+            })
+            .to_string(),
             approval_requirement: ApprovalRequirement::None,
             risk_level: RiskLevel::Low,
         },
@@ -5071,8 +5224,13 @@ fn search_semantic_uses_workspace_local_index() {
     let payload: Value = serde_json::from_str(&output.payload).expect("payload json");
     assert_eq!(payload["engine"], "local_search_engine");
     assert_eq!(payload["workspace_id"], "workspace-search-fuse");
+    assert_eq!(payload["max_context_tokens"], 512);
+    assert_eq!(payload["preferred_scopes"], serde_json::json!(["src"]));
+    assert_eq!(payload["prefer_recent_edits"], false);
+    assert!(payload["index"]["query_count"].as_u64().is_some());
     let results = payload["results"].as_array().expect("results array");
     assert!(!results.is_empty(), "应有命中结果");
+    assert!(results[0]["score"].is_number(), "分数应保持数值类型");
     assert!(
         results.iter().any(|r| r["source"] == "engine"
             && r["path"].as_str().is_some_and(|p| p.contains("auth.rs"))),
@@ -5095,6 +5253,7 @@ fn external_mcp_tool_surface_and_execution_share_one_registry_snapshot() {
                 model_tool_name: "mcp__repo_tools__inspect".to_string(),
                 tool_name: "inspect".to_string(),
                 description: "Inspect repository".to_string(),
+                read_only: false,
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": { "path": { "type": "string" } }
@@ -5115,10 +5274,101 @@ fn external_mcp_tool_surface_and_execution_share_one_registry_snapshot() {
     let snapshot = registry.external_tool_catalog_snapshot();
     assert_eq!(snapshot.mcp_tools.len(), 1);
     let result = registry
-        .execute_external_mcp_tool("mcp__repo_tools__inspect", r#"{"path":"src"}"#)
+        .execute_external_mcp_tool(
+            "mcp__repo_tools__inspect",
+            r#"{"path":"src"}"#,
+            magi_core::AccessProfile::FullAccess,
+        )
         .expect("model-visible MCP tool should execute through the same snapshot");
     assert_eq!(result.1, ExecutionResultStatus::Succeeded);
     assert!(result.0.contains("\"files\":3"));
+}
+
+#[test]
+fn external_mcp_tool_is_blocked_before_executor_in_read_only_profile() {
+    let governance = Arc::new(GovernanceService::default());
+    let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(16));
+    let execute_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let execute_count_for_executor = execute_count.clone();
+    let registry = ToolRegistry::new(governance, event_bus)
+        .with_external_tool_catalog_provider(Arc::new(|| ExternalToolCatalogSnapshot {
+            mcp_tools: vec![ExternalMcpToolCatalogEntry {
+                server_id: "repo-tools".to_string(),
+                server_name: "Repository Tools".to_string(),
+                model_tool_name: "mcp__repo_tools__inspect".to_string(),
+                tool_name: "inspect".to_string(),
+                description: "Inspect repository".to_string(),
+                read_only: false,
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": { "path": { "type": "string" } }
+                }),
+            }],
+            ..ExternalToolCatalogSnapshot::default()
+        }))
+        .with_external_mcp_tool_executor(Arc::new(move |_, _, _| {
+            execute_count_for_executor.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            (
+                serde_json::json!({ "status": "succeeded" }).to_string(),
+                ExecutionResultStatus::Succeeded,
+            )
+        }));
+
+    let result = registry
+        .execute_external_mcp_tool(
+            "mcp__repo_tools__inspect",
+            r#"{"path":"src"}"#,
+            magi_core::AccessProfile::ReadOnly,
+        )
+        .expect("registered MCP tool should return an access rejection");
+
+    assert_eq!(result.1, ExecutionResultStatus::Rejected);
+    assert_eq!(
+        execute_count.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "read-only rejection must happen before the external MCP executor runs"
+    );
+    let payload: serde_json::Value =
+        serde_json::from_str(&result.0).expect("blocked MCP payload json");
+    assert_eq!(payload["error_code"], "mcp_blocked_in_read_only");
+}
+
+#[test]
+fn external_mcp_read_only_tool_can_execute_in_read_only_profile() {
+    let governance = Arc::new(GovernanceService::default());
+    let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(16));
+    let registry = ToolRegistry::new(governance, event_bus)
+        .with_external_tool_catalog_provider(Arc::new(|| ExternalToolCatalogSnapshot {
+            mcp_tools: vec![ExternalMcpToolCatalogEntry {
+                server_id: "repo-tools".to_string(),
+                server_name: "Repository Tools".to_string(),
+                model_tool_name: "mcp__repo_tools__inspect".to_string(),
+                tool_name: "inspect".to_string(),
+                description: "Inspect repository".to_string(),
+                read_only: true,
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": { "path": { "type": "string" } }
+                }),
+            }],
+            ..ExternalToolCatalogSnapshot::default()
+        }))
+        .with_external_mcp_tool_executor(Arc::new(|_, _, _| {
+            (
+                serde_json::json!({ "status": "succeeded", "files": 3 }).to_string(),
+                ExecutionResultStatus::Succeeded,
+            )
+        }));
+
+    let result = registry
+        .execute_external_mcp_tool(
+            "mcp__repo_tools__inspect",
+            r#"{"path":"src"}"#,
+            magi_core::AccessProfile::ReadOnly,
+        )
+        .expect("registered read-only MCP tool should execute");
+
+    assert_eq!(result.1, ExecutionResultStatus::Succeeded);
 }
 
 #[test]

@@ -84,7 +84,7 @@ impl InvertedIndex {
         for (path, file_type) in files {
             let full_path = format!("{}/{}", project_root, path);
             if let Ok(content) = std::fs::read_to_string(&full_path) {
-                self.add_document(path, &content, file_type);
+                self.add_document(project_root, path, &content, file_type);
             }
         }
 
@@ -92,10 +92,16 @@ impl InvertedIndex {
         self.ready = true;
     }
 
-    pub fn add_document(&mut self, file_path: &str, content: &str, _file_type: &str) {
+    fn add_document(
+        &mut self,
+        project_root: &str,
+        file_path: &str,
+        content: &str,
+        _file_type: &str,
+    ) {
         let result = self.tokenizer.tokenize_file(file_path, content);
 
-        let last_modified = std::fs::metadata(file_path)
+        let last_modified = std::fs::metadata(std::path::Path::new(project_root).join(file_path))
             .ok()
             .and_then(|m| m.modified().ok())
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
@@ -163,7 +169,7 @@ impl InvertedIndex {
         self.remove_file(file_path);
         let full_path = format!("{}/{}", project_root, file_path);
         if let Ok(content) = std::fs::read_to_string(&full_path) {
-            self.add_document(file_path, &content, file_type);
+            self.add_document(project_root, file_path, &content, file_type);
             self.recalculate_stats();
         }
     }
@@ -241,6 +247,7 @@ impl InvertedIndex {
             a.score
                 .partial_cmp(&b.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.file_path.cmp(&a.file_path))
         };
         let mut heap = MinHeap::new(max_results, cmp);
 
@@ -362,5 +369,34 @@ fn context_priority(ctx: TokenContext) -> u8 {
         TokenContext::Usage => 2,
         TokenContext::String => 1,
         TokenContext::Comment => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn document_metadata_uses_workspace_root_for_relative_paths() {
+        let root = std::env::temp_dir().join(format!(
+            "magi-inverted-index-mtime-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("src")).expect("create temp source directory");
+        std::fs::write(root.join("src/lib.rs"), "pub fn indexed_probe() {}\n")
+            .expect("write temp source");
+
+        let mut index = InvertedIndex::new();
+        index.build_from_files(
+            root.to_string_lossy().as_ref(),
+            &[("src/lib.rs".to_string(), "source".to_string())],
+        );
+
+        assert!(index.get_document_meta("src/lib.rs").is_some());
+        let _ = std::fs::remove_dir_all(root);
     }
 }

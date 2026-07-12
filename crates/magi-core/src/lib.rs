@@ -6,6 +6,7 @@ pub mod paths;
 pub mod public_text;
 pub mod status;
 pub mod task;
+pub mod token_estimate;
 pub mod value_objects;
 
 #[cfg(test)]
@@ -32,4 +33,5 @@ pub use task::{
     TodoStatus, public_task_output_refs, task_output_ref_is_internal_runtime_failure,
     text_prohibits_agent_spawn, text_requires_agent_spawn,
 };
+pub use token_estimate::estimate_text_tokens;
 pub use value_objects::{AbsolutePath, UtcMillis, WorkspaceRootPath, WorktreeRootPath};

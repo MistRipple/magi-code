@@ -177,7 +177,9 @@ impl DependencyGraph {
         }
 
         visited.remove(file_path);
-        visited.into_iter().collect()
+        let mut expanded = visited.into_iter().collect::<Vec<_>>();
+        expanded.sort();
+        expanded
     }
 
     pub fn get_top_central_files(&self, n: usize) -> Vec<FileCentrality> {
@@ -244,6 +246,11 @@ impl DependencyGraph {
     }
 
     pub fn remove_file(&mut self, file_path: &str) {
+        self.remove_file_without_recompute(file_path);
+        self.compute_centrality();
+    }
+
+    fn remove_file_without_recompute(&mut self, file_path: &str) {
         if let Some(targets) = self.forward_deps.remove(file_path) {
             for target in &targets {
                 if let Some(rev) = self.reverse_deps.get_mut(target) {
@@ -270,11 +277,14 @@ impl DependencyGraph {
             .retain(|e| e.from != file_path && e.to != file_path);
         self.centrality_cache.remove(file_path);
         self.file_set.remove(file_path);
-
-        self.compute_centrality();
     }
 
     pub fn update_file(&mut self, project_root: &str, file_path: &str) {
+        self.update_file_without_recompute(project_root, file_path);
+        self.compute_centrality();
+    }
+
+    fn update_file_without_recompute(&mut self, project_root: &str, file_path: &str) {
         if let Some(old_targets) = self.forward_deps.remove(file_path) {
             for target in &old_targets {
                 if let Some(rev) = self.reverse_deps.get_mut(target) {
@@ -300,8 +310,23 @@ impl DependencyGraph {
         if let Ok(content) = std::fs::read_to_string(&full_path) {
             self.parse_imports(file_path, &content);
         }
+    }
 
-        self.compute_centrality();
+    pub fn apply_file_changes(
+        &mut self,
+        project_root: &str,
+        updated_files: &[String],
+        deleted_files: &[String],
+    ) {
+        for file_path in deleted_files {
+            self.remove_file_without_recompute(file_path);
+        }
+        for file_path in updated_files {
+            self.update_file_without_recompute(project_root, file_path);
+        }
+        if !updated_files.is_empty() || !deleted_files.is_empty() {
+            self.compute_centrality();
+        }
     }
 
     pub fn to_snapshot(&self) -> DependencyGraphSnapshot {

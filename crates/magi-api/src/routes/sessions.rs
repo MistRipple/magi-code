@@ -1101,7 +1101,7 @@ fn goal_mode_tool_intent(request: &SessionTurnRequestDto) -> String {
         "如果目标需要三步以上或跨轮推进，最终答复前必须先用 todo_write 建立简洁任务清单。"
     };
     format!(
-        "用户请求目标模式。必须按主线 Goal 工具推进：先调用 get_goal；若当前会话没有未完成目标，再调用 create_goal 创建完整目标；create_goal 的 token_budget 只有在用户原文明确给出 token 预算数值时才允许填写，未明确给预算必须省略，禁止自行臆造 1000、4096 等预算。{todo_contract} 目标模式仍是主线对话，不要升级成旧任务 Tab 或普通 Execute 路由。"
+        "用户请求目标模式。必须按主线 Goal 工具推进：先调用 get_goal；若当前会话没有未完成目标，再调用 create_goal 创建完整目标；create_goal 的 token_budget 必须显式传值，用户原文未明确给出 token 预算时传 null，只有用户明确给出预算数值时才传对应整数，禁止自行臆造 1000、4096、16000 等预算。{todo_contract} 目标模式仍是主线对话，不要升级成旧任务 Tab 或普通 Execute 路由。"
     )
 }
 
@@ -4418,6 +4418,7 @@ mod tests {
         assert!(tool_intent.contains("get_goal"));
         assert!(tool_intent.contains("create_goal"));
         assert!(tool_intent.contains("token_budget"));
+        assert!(tool_intent.contains("传 null"));
         assert!(tool_intent.contains("todo_write"));
     }
 

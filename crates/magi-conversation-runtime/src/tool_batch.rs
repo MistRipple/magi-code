@@ -205,14 +205,6 @@ impl AgentSpawnAccessMode {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct AgentSpawnParameterContract {
-    role: Option<String>,
-    display_name: String,
-    access_mode: Option<AgentSpawnAccessMode>,
-    goal: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 struct ChildAgentOutput {
     summary: String,
     final_text: String,
@@ -528,29 +520,9 @@ fn execute_coordinator_tool(
                 .unwrap_or("")
                 .trim()
                 .to_string();
-            let parameter_contract = current_turn_user_message(session_store, session_id)
-                .as_deref()
-                .and_then(|message| {
-                    select_agent_spawn_parameter_contract(
-                        message,
-                        &requested_role,
-                        &requested_display_name,
-                        &requested_goal,
-                        &spawnable_role_ids,
-                    )
-                });
-            let role = parameter_contract
-                .as_ref()
-                .and_then(|contract| contract.role.clone())
-                .unwrap_or(requested_role);
-            let goal = parameter_contract
-                .as_ref()
-                .and_then(|contract| contract.goal.clone())
-                .unwrap_or(requested_goal);
-            let display_name = parameter_contract
-                .as_ref()
-                .map(|contract| contract.display_name.clone())
-                .unwrap_or(requested_display_name);
+            let role = requested_role;
+            let goal = requested_goal;
+            let display_name = requested_display_name;
             let display_name_chars = display_name.chars().count();
             if display_name.is_empty() {
                 return (
@@ -619,10 +591,6 @@ fn execute_coordinator_tool(
                 },
                 None => default_agent_spawn_access_mode(&role),
             };
-            let access_mode = parameter_contract
-                .as_ref()
-                .and_then(|contract| contract.access_mode)
-                .unwrap_or(access_mode);
             let task_kind = parsed
                 .get("task_kind")
                 .and_then(|v| v.as_str())
@@ -795,18 +763,6 @@ fn execute_coordinator_tool(
         }
         _ => unreachable!("execute_coordinator_tool 只接收协调器代理工具变体"),
     }
-}
-
-fn current_turn_user_message(
-    session_store: &SessionStore,
-    session_id: &SessionId,
-) -> Option<String> {
-    session_store
-        .active_execution_chain(session_id)
-        .and_then(|chain| chain.current_turn)
-        .and_then(|turn| turn.user_message)
-        .map(|message| message.trim().to_string())
-        .filter(|message| !message.is_empty())
 }
 
 pub(crate) fn execute_goal_tool(
@@ -1003,182 +959,6 @@ fn objective_text_explicitly_allows_goal_budget(objective: &str, token_budget: u
         return false;
     }
     normalized.contains(&token_budget.to_string())
-}
-
-fn select_agent_spawn_parameter_contract(
-    user_message: &str,
-    requested_role: &str,
-    requested_display_name: &str,
-    requested_goal: &str,
-    spawnable_role_ids: &[String],
-) -> Option<AgentSpawnParameterContract> {
-    parse_agent_spawn_parameter_contracts(user_message, spawnable_role_ids)
-        .into_iter()
-        .filter_map(|contract| {
-            let score = score_agent_spawn_parameter_contract(
-                &contract,
-                requested_role,
-                requested_display_name,
-                requested_goal,
-            );
-            (score >= 4).then_some((score, contract))
-        })
-        .max_by_key(|(score, _)| *score)
-        .map(|(_, contract)| contract)
-}
-
-fn parse_agent_spawn_parameter_contracts(
-    user_message: &str,
-    spawnable_role_ids: &[String],
-) -> Vec<AgentSpawnParameterContract> {
-    user_message
-        .match_indices("display_name")
-        .filter_map(|(index, _)| {
-            let display_name =
-                extract_display_name_after(&user_message[index + "display_name".len()..])?;
-            Some(AgentSpawnParameterContract {
-                role: extract_contract_role(user_message, index, spawnable_role_ids),
-                display_name,
-                access_mode: extract_contract_access_mode(user_message, index),
-                goal: extract_contract_goal(user_message, index),
-            })
-        })
-        .collect()
-}
-
-fn extract_display_name_after(value: &str) -> Option<String> {
-    let trimmed = value.trim_start_matches(|ch: char| {
-        ch.is_whitespace() || matches!(ch, '=' | ':' | '：' | '`' | '"' | '\'' | '为')
-    });
-    if let Some(rest) = trimmed.strip_prefix('「') {
-        return rest
-            .split_once('」')
-            .map(|(name, _)| name.trim().to_string())
-            .filter(|name| !name.is_empty());
-    }
-    let display_name = trimmed
-        .chars()
-        .take_while(|ch| !matches!(ch, ',' | '，' | ';' | '；' | '。' | '\n' | '\r'))
-        .collect::<String>()
-        .trim_matches(|ch: char| ch.is_whitespace() || matches!(ch, '"' | '\'' | '`'))
-        .trim()
-        .to_string();
-    (!display_name.is_empty()).then_some(display_name)
-}
-
-fn extract_contract_role(
-    user_message: &str,
-    index: usize,
-    spawnable_role_ids: &[String],
-) -> Option<String> {
-    let window = surrounding_text_window(user_message, index, 120, 0).to_ascii_lowercase();
-    spawnable_role_ids
-        .iter()
-        .filter_map(|role| {
-            let role_lower = role.to_ascii_lowercase();
-            window.rfind(&role_lower).map(|pos| (pos, role.as_str()))
-        })
-        .max_by_key(|(pos, _)| *pos)
-        .map(|(_, role)| role.to_string())
-}
-
-fn extract_contract_access_mode(user_message: &str, index: usize) -> Option<AgentSpawnAccessMode> {
-    let window = surrounding_text_window(user_message, index, 20, 180).to_ascii_lowercase();
-    if window.contains("read_only") || window.contains("readonly") || window.contains("read-only") {
-        Some(AgentSpawnAccessMode::ReadOnly)
-    } else if window.contains("read_write")
-        || window.contains("readwrite")
-        || window.contains("read-write")
-    {
-        Some(AgentSpawnAccessMode::ReadWrite)
-    } else {
-        None
-    }
-}
-
-fn extract_contract_goal(user_message: &str, index: usize) -> Option<String> {
-    let window = surrounding_text_window(user_message, index, 0, 260);
-    let goal_start = window
-        .find("目标：")
-        .map(|pos| pos + "目标：".len())
-        .or_else(|| window.find("目标:").map(|pos| pos + "目标:".len()))?;
-    let goal = window[goal_start..]
-        .chars()
-        .take_while(|ch| !matches!(ch, '；' | ';' | '。' | '\n' | '\r'))
-        .collect::<String>()
-        .trim()
-        .to_string();
-    (!goal.is_empty()).then_some(goal)
-}
-
-fn surrounding_text_window(
-    value: &str,
-    index: usize,
-    before_chars: usize,
-    after_chars: usize,
-) -> String {
-    let before = value[..index]
-        .chars()
-        .rev()
-        .take(before_chars)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect::<String>();
-    let after = value[index..].chars().take(after_chars).collect::<String>();
-    format!("{before}{after}")
-}
-
-fn score_agent_spawn_parameter_contract(
-    contract: &AgentSpawnParameterContract,
-    requested_role: &str,
-    requested_display_name: &str,
-    requested_goal: &str,
-) -> i32 {
-    let mut score = 0;
-    if contract
-        .role
-        .as_deref()
-        .is_some_and(|role| role == requested_role.trim())
-    {
-        score += 4;
-    }
-    if contract.display_name == requested_display_name.trim() {
-        score += 20;
-    }
-    score += keyword_overlap_score(&contract.display_name, requested_display_name);
-    if let Some(goal) = contract.goal.as_deref() {
-        score += keyword_overlap_score(goal, requested_goal);
-    }
-    score
-}
-
-fn keyword_overlap_score(left: &str, right: &str) -> i32 {
-    const KEYWORDS: &[&str] = &[
-        "目录",
-        "探查",
-        "顶层",
-        "配置",
-        "审查",
-        "检查",
-        "文件",
-        "README",
-        "package.json",
-        "tsconfig",
-        "测试",
-        "架构",
-        "实现",
-    ];
-    let left_lower = left.to_ascii_lowercase();
-    let right_lower = right.to_ascii_lowercase();
-    KEYWORDS
-        .iter()
-        .filter(|keyword| {
-            let keyword_lower = keyword.to_ascii_lowercase();
-            left_lower.contains(&keyword_lower) && right_lower.contains(&keyword_lower)
-        })
-        .count() as i32
-        * 4
 }
 
 fn default_agent_spawn_access_mode(role: &str) -> AgentSpawnAccessMode {
@@ -1838,20 +1618,11 @@ fn execute_task_tool_call(
         );
     }
 
-    if let Some(result) =
-        registry.execute_external_mcp_tool(&tool_call.function.name, &tool_call.function.arguments)
-    {
-        if access_profile == AccessProfile::ReadOnly {
-            return (
-                serde_json::json!({
-                    "tool": tool_call.function.name,
-                    "status": "failed",
-                    "error": "只读访问模式不允许调用 MCP 工具",
-                })
-                .to_string(),
-                ExecutionResultStatus::Failed,
-            );
-        }
+    if let Some(result) = registry.execute_external_mcp_tool(
+        &tool_call.function.name,
+        &tool_call.function.arguments,
+        access_profile,
+    ) {
         return result;
     }
 
@@ -2349,14 +2120,6 @@ mod tests {
         task
     }
 
-    fn default_spawnable_role_ids() -> Vec<String> {
-        magi_agent_role::AgentRoleRegistry::load_default().spawnable_agent_role_ids()
-    }
-
-    fn spawnable_role_ids(ids: &[&str]) -> Vec<String> {
-        ids.iter().map(|id| (*id).to_string()).collect()
-    }
-
     struct SnapshotReconcileProbeTool {
         name: &'static str,
         snapshot: Arc<SnapshotSession>,
@@ -2542,106 +2305,6 @@ mod tests {
                 .any(|value| value.contains("父任务证据：证据：bootstrap")),
             "父任务 evidence_refs 应作为子代理输入参考继承"
         );
-    }
-
-    #[test]
-    fn agent_spawn_contract_parser_extracts_explicit_user_parameters() {
-        let role_ids = default_spawnable_role_ids();
-        let contracts = parse_agent_spawn_parameter_contracts(
-            "必须同一轮并行启动 2 个代理：1) role=explorer，display_name=「目录探查代理」，access_mode=read_only，目标：只读查看 /Users/xie/code/TEST 顶层目录；2) role=reviewer，display_name=「配置审查代理」，access_mode=read_only，目标：只读查看 README.md 和 package.json 是否存在。",
-            &role_ids,
-        );
-
-        assert_eq!(contracts.len(), 2);
-        assert_eq!(contracts[0].role.as_deref(), Some("explorer"));
-        assert_eq!(contracts[0].display_name, "目录探查代理");
-        assert_eq!(
-            contracts[0].access_mode,
-            Some(AgentSpawnAccessMode::ReadOnly)
-        );
-        assert_eq!(contracts[1].role.as_deref(), Some("reviewer"));
-        assert_eq!(contracts[1].display_name, "配置审查代理");
-        assert!(
-            contracts[1]
-                .goal
-                .as_deref()
-                .unwrap_or_default()
-                .contains("package.json")
-        );
-    }
-
-    #[test]
-    fn agent_spawn_contract_role_does_not_bleed_from_next_agent_clause() {
-        let role_ids = default_spawnable_role_ids();
-        let contracts = parse_agent_spawn_parameter_contracts(
-            "第一轮同时 agent_spawn 两个只读代理：explorer display_name「冻结目录代理」只做根目录巡检；reviewer display_name「冻结配置代理」只读取 package.json 指出一个风险。",
-            &role_ids,
-        );
-
-        assert_eq!(contracts.len(), 2);
-        assert_eq!(contracts[0].role.as_deref(), Some("explorer"));
-        assert_eq!(contracts[0].display_name, "冻结目录代理");
-        assert_eq!(contracts[1].role.as_deref(), Some("reviewer"));
-        assert_eq!(contracts[1].display_name, "冻结配置代理");
-    }
-
-    #[test]
-    fn agent_spawn_contract_selection_corrects_model_rewritten_display_name() {
-        let message = "必须同一轮并行启动 2 个代理：1) role=explorer，display_name=「目录探查代理」，access_mode=read_only，目标：只读查看 /Users/xie/code/TEST 顶层目录；2) role=reviewer，display_name=「配置审查代理」，access_mode=read_only，目标：只读查看 README.md 和 package.json 是否存在。";
-        let role_ids = default_spawnable_role_ids();
-
-        let directory = select_agent_spawn_parameter_contract(
-            message,
-            "explorer",
-            "目录探查员",
-            "只读检查当前工作区目录 /Users/xie/code/TEST",
-            &role_ids,
-        )
-        .expect("directory contract should be selected");
-        assert_eq!(directory.role.as_deref(), Some("explorer"));
-        assert_eq!(directory.display_name, "目录探查代理");
-
-        let config = select_agent_spawn_parameter_contract(
-            message,
-            "reviewer",
-            "文件存在审查员",
-            "只读查看 README.md 和 package.json 是否存在",
-            &role_ids,
-        )
-        .expect("config contract should be selected");
-        assert_eq!(config.role.as_deref(), Some("reviewer"));
-        assert_eq!(config.display_name, "配置审查代理");
-    }
-
-    #[test]
-    fn agent_spawn_contract_selection_prefers_goal_when_model_rewrites_role() {
-        let message = "必须同一轮并行启动 2 个代理：1) role=explorer，display_name=「目录探查代理」，access_mode=read_only，目标：只读查看 /Users/xie/code/TEST 顶层目录；2) role=reviewer，display_name=「配置审查代理」，access_mode=read_only，目标：只读查看 README.md 和 package.json 是否存在。";
-        let role_ids = default_spawnable_role_ids();
-
-        let config = select_agent_spawn_parameter_contract(
-            message,
-            "explorer",
-            "关键文件检查员",
-            "只读验证 /Users/xie/code/TEST/README.md 与 /Users/xie/code/TEST/package.json 是否存在且为普通文件",
-            &role_ids,
-        )
-        .expect("config contract should be selected by goal overlap");
-
-        assert_eq!(config.role.as_deref(), Some("reviewer"));
-        assert_eq!(config.display_name, "配置审查代理");
-    }
-
-    #[test]
-    fn agent_spawn_contract_parser_uses_registry_role_ids() {
-        let role_ids = spawnable_role_ids(&["auditor", "executor"]);
-        let contracts = parse_agent_spawn_parameter_contracts(
-            "请启动 role=auditor，display_name=「安全审计代理」，access_mode=read_only，目标：检查鉴权风险。",
-            &role_ids,
-        );
-
-        assert_eq!(contracts.len(), 1);
-        assert_eq!(contracts[0].role.as_deref(), Some("auditor"));
-        assert_eq!(contracts[0].display_name, "安全审计代理");
     }
 
     #[test]
@@ -2894,6 +2557,7 @@ mod tests {
             BuiltinToolName::CreateGoal,
             serde_json::json!({
                 "objective": "完成 goal 模式升级",
+                "token_budget": null,
             }),
         );
         assert_eq!(created_status, ExecutionResultStatus::Succeeded);

@@ -12,7 +12,6 @@ mod query;
 pub mod query_expander;
 pub mod result_ranker;
 pub mod search_cache;
-pub mod semantic_reranker;
 mod source_model;
 mod state;
 pub mod symbol_index;
@@ -118,9 +117,9 @@ pub struct GovernedKnowledgeQueryResult {
 
 /// 工作区代码检索引擎句柄：每个 workspace 一个 LocalSearchEngine。
 ///
-/// search() 需要 &mut（写查询缓存），故用 Mutex 包裹单个引擎，
-/// 检索时只锁定目标 workspace 的引擎，不阻塞其他 workspace。
-type WorkspaceSearchEngines = Arc<RwLock<HashMap<WorkspaceId, Arc<Mutex<LocalSearchEngine>>>>>;
+/// 检索只读取不可变索引并使用内部线程安全缓存，因此同一 workspace 可并发查询；
+/// 文件监听和定期对账通过写锁独占更新索引。
+type WorkspaceSearchEngines = Arc<RwLock<HashMap<WorkspaceId, Arc<RwLock<LocalSearchEngine>>>>>;
 
 /// 每个 workspace 的文件监听句柄：持有它仅为维持监听任务存活。
 /// 与索引引擎同生命周期——build_workspace_index 时一并建立，store 释放时随之 drop。
@@ -171,6 +170,7 @@ impl KnowledgeStore {
                 record.created_at = record.updated_at;
             }
         }
+        state.rebuild_term_postings();
         Self {
             state: Arc::new(RwLock::new(state)),
             search_engines: Arc::default(),
@@ -225,7 +225,7 @@ impl KnowledgeStore {
         self.search_engines
             .write()
             .expect("knowledge store search engines write lock poisoned")
-            .insert(workspace_id.clone(), Arc::new(Mutex::new(engine)));
+            .insert(workspace_id.clone(), Arc::new(RwLock::new(engine)));
 
         // 与索引构建原子地起文件监听：变更去抖后转发到增量更新。
         // 收敛 daemon 启动与 API 注册两条路径——所有 build 调用点自动获得 watcher。
@@ -321,19 +321,53 @@ impl KnowledgeStore {
         let workspace_id_for_task = workspace_id.clone();
         tokio::spawn(async move {
             use magi_snapshot::watcher::DebouncedKind;
-            while let Some(event) = rx.recv().await {
-                let path = event.path.to_string_lossy().to_string();
-                let engine = engines
-                    .read()
-                    .ok()
-                    .and_then(|map| map.get(&workspace_id_for_task).cloned());
-                if let Some(engine) = engine {
-                    let mut engine = engine.lock().expect("search engine mutex poisoned");
-                    // 按事件类型路由到引擎对应的增量入口（新增/修改/删除语义不同）。
-                    match event.kind {
-                        DebouncedKind::Created => engine.on_file_created(&path),
-                        DebouncedKind::Modified => engine.on_file_changed(&path),
-                        DebouncedKind::Removed => engine.on_file_deleted(&path),
+            let mut reconcile_interval = tokio::time::interval_at(
+                tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+                std::time::Duration::from_secs(30),
+            );
+            reconcile_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+            loop {
+                tokio::select! {
+                    event = rx.recv() => {
+                        let Some(event) = event else {
+                            break;
+                        };
+                        let mut events = vec![(event.path.to_string_lossy().to_string(), event.kind)];
+                        while let Ok(event) = rx.try_recv() {
+                            events.push((event.path.to_string_lossy().to_string(), event.kind));
+                        }
+                        let engine = engines
+                            .read()
+                            .ok()
+                            .and_then(|map| map.get(&workspace_id_for_task).cloned());
+                        if let Some(engine) = engine {
+                            let mut engine = engine.write().expect("search engine write lock poisoned");
+                            let events = events
+                                .into_iter()
+                                .map(|(path, kind)| {
+                                    let kind = match kind {
+                                        DebouncedKind::Created => local_search_engine::FileIndexEventKind::Created,
+                                        DebouncedKind::Modified => local_search_engine::FileIndexEventKind::Modified,
+                                        DebouncedKind::Removed => local_search_engine::FileIndexEventKind::Deleted,
+                                    };
+                                    (path, kind)
+                                })
+                                .collect();
+                            engine.apply_file_events(events);
+                        }
+                    }
+                    _ = reconcile_interval.tick() => {
+                        let engine = engines
+                            .read()
+                            .ok()
+                            .and_then(|map| map.get(&workspace_id_for_task).cloned());
+                        if let Some(engine) = engine {
+                            engine
+                                .write()
+                                .expect("search engine write lock poisoned")
+                                .reconcile_indexed_files();
+                        }
                     }
                 }
             }
@@ -369,7 +403,7 @@ impl KnowledgeStore {
             .expect("knowledge store search engines read lock poisoned")
             .get(workspace_id)
             .cloned()?;
-        let mut engine = engine.lock().expect("search engine mutex poisoned");
+        let engine = engine.read().expect("search engine read lock poisoned");
         Some(engine.search(query, options))
     }
 
@@ -386,7 +420,7 @@ impl KnowledgeStore {
             .expect("knowledge store search engines read lock poisoned")
             .get(workspace_id)
             .cloned()?;
-        let engine = engine.lock().expect("search engine mutex poisoned");
+        let engine = engine.read().expect("search engine read lock poisoned");
         Some(engine.find_symbol_definitions(name, max_results))
     }
 
@@ -402,7 +436,7 @@ impl KnowledgeStore {
             .expect("knowledge store search engines read lock poisoned")
             .get(workspace_id)
             .cloned()?;
-        let engine = engine.lock().expect("search engine mutex poisoned");
+        let engine = engine.read().expect("search engine read lock poisoned");
         Some(engine.list_file_symbols(file_path))
     }
 
@@ -413,7 +447,7 @@ impl KnowledgeStore {
             .expect("knowledge store search engines read lock poisoned")
             .get(workspace_id)
             .map(|engine| {
-                let engine = engine.lock().expect("search engine mutex poisoned");
+                let engine = engine.read().expect("search engine read lock poisoned");
                 engine.is_ready() && engine.get_stats().total_documents > 0
             })
             .unwrap_or(false)
@@ -426,7 +460,7 @@ impl KnowledgeStore {
             .expect("knowledge store search engines read lock poisoned")
             .get(workspace_id)
             .cloned()?;
-        let engine = engine.lock().expect("search engine mutex poisoned");
+        let engine = engine.read().expect("search engine read lock poisoned");
         Some(engine.get_stats())
     }
 
@@ -440,7 +474,7 @@ impl KnowledgeStore {
             .expect("knowledge store search engines read lock poisoned")
             .get(workspace_id)
             .cloned()?;
-        let engine = engine.lock().expect("search engine mutex poisoned");
+        let engine = engine.read().expect("search engine read lock poisoned");
         Some(engine.code_index_health())
     }
 
@@ -555,6 +589,7 @@ impl KnowledgeStore {
         KnowledgeQueryService::execute(
             &state.entries,
             &state.index_terms,
+            &state.term_postings,
             &state.code_sources,
             &state.audit_links,
             &state.governance_links,
@@ -574,6 +609,7 @@ impl KnowledgeStore {
         let query_result = KnowledgeQueryService::execute(
             &state.entries,
             &state.index_terms,
+            &state.term_postings,
             &state.code_sources,
             &state.audit_links,
             &state.governance_links,
@@ -633,7 +669,7 @@ impl KnowledgeStore {
             .expect("knowledge store search engines read lock poisoned")
             .get(workspace_id)
             .cloned()?;
-        let mut engine = engine.lock().expect("search engine mutex poisoned");
+        let mut engine = engine.write().expect("search engine write lock poisoned");
         engine.is_ready().then(|| engine.code_index_summary())
     }
 
@@ -642,15 +678,11 @@ impl KnowledgeStore {
             .state
             .write()
             .expect("knowledge store write lock poisoned");
-        if state.entries.remove(knowledge_id).is_none() {
+        if !state.delete(knowledge_id) {
             return Err(DomainError::NotFound {
                 entity: "knowledge",
             });
         }
-        state.index_terms.remove(knowledge_id);
-        state.code_sources.remove(knowledge_id);
-        state.audit_links.remove(knowledge_id);
-        state.governance_links.remove(knowledge_id);
         Ok(())
     }
 
@@ -689,6 +721,7 @@ impl KnowledgeStore {
             .expect("knowledge store write lock poisoned");
         state.entries.clear();
         state.index_terms.clear();
+        state.term_postings.clear();
         state.code_sources.clear();
         state.audit_links.clear();
         state.governance_links.clear();

@@ -225,6 +225,7 @@ impl ResultRanker {
             a.final_score
                 .partial_cmp(&b.final_score)
                 .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.file_path.cmp(&a.file_path))
         };
         let mut heap = MinHeap::new(input.max_results, cmp);
 

@@ -1,3 +1,4 @@
+use magi_core::estimate_text_tokens;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -243,7 +244,7 @@ impl MemoryDocument {
 
     fn estimate_tokens(&self) -> usize {
         let json = serde_json::to_string(&self.content).unwrap_or_default();
-        json.len() / 4 + 1
+        estimate_text_tokens(&json)
     }
 }
 

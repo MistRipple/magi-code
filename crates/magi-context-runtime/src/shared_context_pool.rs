@@ -1,4 +1,4 @@
-use magi_core::UtcMillis;
+use magi_core::{UtcMillis, estimate_text_tokens};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -187,7 +187,7 @@ impl MissionSharedContextPool {
         if let Some(max_tokens) = options.max_tokens {
             let mut total_tokens = 0usize;
             results.retain(|e| {
-                let est = estimate_tokens(&e.content);
+                let est = estimate_text_tokens(&e.content);
                 if total_tokens + est > max_tokens {
                     return false;
                 }
@@ -319,8 +319,4 @@ fn content_similarity(a: &str, b: &str) -> f64 {
         }
     }
     matches as f64 / max_len as f64
-}
-
-fn estimate_tokens(text: &str) -> usize {
-    text.len() / 4 + 1
 }

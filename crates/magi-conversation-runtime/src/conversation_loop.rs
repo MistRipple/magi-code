@@ -44,7 +44,7 @@ use magi_bridge_client::{
 };
 use magi_core::{
     AccessProfile, EventId, ExecutionResultStatus, LeaseId, SessionId, Task, TaskId, TaskStatus,
-    ThreadId, UtcMillis, WorkspaceId,
+    ThreadId, UtcMillis, WorkspaceId, estimate_text_tokens,
 };
 use magi_event_bus::{
     EventContext, EventEnvelope, InMemoryEventBus, SessionRuntimeUsageObservation,
@@ -202,10 +202,6 @@ const THREAD_HISTORY_RECENT_MESSAGE_FLOOR: usize = 8;
 const THREAD_HISTORY_SUMMARY_EXCERPT_LIMIT: usize = 16;
 const THREAD_HISTORY_SUMMARY_EXCERPT_CHARS: usize = 360;
 const THREAD_HISTORY_TOOL_ARGUMENT_CHARS: usize = 220;
-
-fn estimate_text_tokens(text: &str) -> usize {
-    text.len() / 4 + 1
-}
 
 fn estimate_thread_message_tokens(message: &ThreadChatMessage) -> usize {
     let mut total = estimate_text_tokens(&message.role) + 4;

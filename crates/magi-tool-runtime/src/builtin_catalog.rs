@@ -379,12 +379,13 @@ impl BuiltinToolName {
                 # 何时用\n\
                 - 需要查看文件内容、配置、源码以做出后续决策\n\
                 - 读取已知具体路径的文件（含大文件可用 max_bytes 截取）\n\n\
+                - 已知目录路径时可直接读取一层目录项\n\n\
                 # 何时不用\n\
-                - 列目录 / 找文件路径 → 用 shell_exec 跑 `ls` 或 `find`\n\
+                - 递归查找文件路径 → 用 search_text 或 shell_exec 的只读命令\n\
                 - 跨文件搜索文本 → 用 search_text，不要逐个 file_read 后自己 grep\n\
                 - 语义检索代码 → 用 search_semantic\n\n\
                 # 反例\n\
-                - ❌ 用 file_read 读取目录路径希望拿到列表\n\
+                - ❌ 为寻找未知路径逐层 file_read 多个目录\n\
                 - ✅ 已经从 search_text 拿到候选文件路径后，再用 file_read 看具体行"
             }
             Self::ViewImage => {
@@ -443,7 +444,7 @@ impl BuiltinToolName {
             Self::FileCopy => "把文件或目录复制到新位置",
             Self::FileMove => "移动或重命名文件 / 目录",
             Self::SearchText => "在指定目录下按文本模式搜索（grep 风格）",
-            Self::SearchSemantic => "语义代码检索：基于自然语言描述定位相关代码",
+            Self::SearchSemantic => "本地混合代码检索：联合词法、符号和依赖关系定位相关代码",
             Self::ShellExec => {
                 "执行一条 shell 命令并返回 stdout / stderr。\n\n\
                 # 何时用\n\
@@ -493,7 +494,7 @@ impl BuiltinToolName {
                 "读取当前会话的 Goal 状态、预算和累计用量。用于长目标推进前确认当前目标是否仍 active，或在继续执行前判断是否已 complete / blocked / budget_limited。"
             }
             Self::CreateGoal => {
-                "为当前会话创建一个主动 Goal。Goal 是用户长期目标的一等产品实体，负责跨多轮自动推进、预算记账和终止状态；同一会话同一时间只能存在一个未结束 Goal。"
+                "为当前会话创建一个主动 Goal。Goal 是用户长期目标的一等产品实体，负责跨多轮自动推进、预算记账和终止状态；同一会话同一时间只能存在一个未结束 Goal。token_budget 必须显式传值：用户没有指定预算时传 null，只有用户原文明示 token 预算时才传对应整数。"
             }
             Self::UpdateGoal => {
                 "更新当前会话 Goal 的终态。模型只能把目标标记为 complete 或 blocked；pause、budget_limited、usage_limited 由用户或系统控制，不能由模型伪造。"
@@ -579,7 +580,12 @@ impl BuiltinToolName {
                 "type": "object",
                 "properties": {
                     "path": { "type": "string", "description": "要读取文件的绝对路径" },
-                    "max_bytes": { "type": "integer", "description": "文件预览最多读取的字节数" }
+                    "max_bytes": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 1048576,
+                        "description": "文件预览最多读取的字节数（默认 65536，最大 1048576）"
+                    }
                 },
                 "required": ["path"]
             }),
@@ -680,7 +686,14 @@ impl BuiltinToolName {
                 "type": "object",
                 "properties": {
                     "query": { "type": "string", "description": "基于当前工作区本地代码索引检索的自然语言描述" },
-                    "limit": { "type": "integer", "description": "最大结果数（默认：10）" }
+                    "limit": { "type": "integer", "description": "最大结果数（默认：10，范围：1-50）" },
+                    "max_context_tokens": { "type": "integer", "description": "返回代码片段的最大估算 token 数（默认：8000，范围：256-32000）" },
+                    "preferred_scopes": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "优先检索的工作区相对目录或文件路径"
+                    },
+                    "prefer_recent_edits": { "type": "boolean", "description": "是否优先最近编辑文件（默认：true）" }
                 },
                 "required": ["query"]
             }),
@@ -899,11 +912,14 @@ impl BuiltinToolName {
                         "description": "用户要持续推进的完整目标。应保留用户给出的核心交付要求、边界和完成标准。"
                     },
                     "token_budget": {
-                        "type": "integer",
-                        "description": "可选 token 预算。只有用户原文明确给出 token 预算数值时才填写；未给出时必须省略。禁止自行臆造 1000、4096 等预算；预算值必须至少 16000。"
+                        "anyOf": [
+                            { "type": "integer", "minimum": 16000 },
+                            { "type": "null" }
+                        ],
+                        "description": "token 预算。用户原文没有明确预算时必须传 null；只有用户明确给出 token 预算数值时才传整数，禁止自行臆造 1000、4096、16000 等预算。"
                     }
                 },
-                "required": ["objective"]
+                "required": ["objective", "token_budget"]
             }),
             Self::UpdateGoal => serde_json::json!({
                 "type": "object",

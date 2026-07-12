@@ -155,6 +155,9 @@ impl SymbolIndex {
             b.score
                 .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.symbol.file_path.cmp(&b.symbol.file_path))
+                .then_with(|| a.symbol.line.cmp(&b.symbol.line))
+                .then_with(|| a.symbol.name.cmp(&b.symbol.name))
         });
         hits.truncate(max_results);
         hits

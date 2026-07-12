@@ -1,3 +1,4 @@
+use magi_core::estimate_text_tokens;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -237,7 +238,7 @@ impl MemoryConsolidationService {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         for entry in block.entries.drain(..) {
-            let tokens = estimate_tokens(&entry.content);
+            let tokens = estimate_text_tokens(&entry.content);
             if total_tokens + tokens > self.config.max_topic_tokens {
                 break;
             }
@@ -286,10 +287,6 @@ fn compute_similarity(a: &str, b: &str) -> f64 {
     } else {
         intersection as f64 / union as f64
     }
-}
-
-fn estimate_tokens(text: &str) -> usize {
-    text.len() / 4 + 1
 }
 
 fn format_citations(citations: &[String]) -> String {

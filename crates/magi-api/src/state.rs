@@ -1901,6 +1901,7 @@ fn normalize_public_mcp_tool_catalog_json(raw: &serde_json::Value) -> serde_json
         "modelToolName": raw.get("model_tool_name").cloned().unwrap_or(serde_json::Value::Null),
         "toolName": raw.get("tool_name").cloned().unwrap_or(serde_json::Value::Null),
         "description": raw.get("description").cloned().unwrap_or(serde_json::Value::String(String::new())),
+        "readOnly": raw.get("read_only").cloned().unwrap_or(serde_json::Value::Bool(false)),
         "inputSchema": raw.get("input_schema").cloned().unwrap_or_else(|| serde_json::json!({ "type": "object", "properties": {} })),
     })
 }
@@ -2978,6 +2979,15 @@ mod tests {
                 "tool_count": 3,
                 "error": null
             }],
+            "mcp_tools": [{
+                "server_id": "mcp-1",
+                "server_name": "mcp",
+                "model_tool_name": "mcp__mcp-1__inspect",
+                "tool_name": "inspect",
+                "description": "inspect",
+                "read_only": true,
+                "input_schema": {"type": "object", "properties": {}}
+            }],
             "agent_roles": [{
                 "role_id": "executor",
                 "spawnable": true,
@@ -3014,6 +3024,7 @@ mod tests {
         );
         assert_eq!(public["mcpServers"][0]["serverId"], "mcp-1");
         assert_eq!(public["mcpServers"][0]["toolCount"], 3);
+        assert_eq!(public["mcpTools"][0]["readOnly"], true);
         assert_eq!(public["agentRoles"][0]["roleId"], "executor");
         assert_eq!(public["agentRoles"][0]["parallelismLimit"], 2);
     }

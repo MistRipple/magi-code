@@ -390,6 +390,8 @@ pub struct McpToolInfo {
     pub description: Option<String>,
     #[serde(default, rename = "inputSchema")]
     pub input_schema: Option<Value>,
+    #[serde(default)]
+    pub annotations: Option<Value>,
 }
 // --- Internal helpers
 
@@ -735,7 +737,7 @@ while IFS= read -r line; do
         notifications/initialized)
             ;;
         tools/list)
-            printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"test.tool","description":"A test tool","inputSchema":{"type":"object"}}]}}\n' "$id"
+            printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"test.tool","description":"A test tool","inputSchema":{"type":"object"},"annotations":{"readOnlyHint":true}}]}}\n' "$id"
             ;;
         *)
             printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"method not found"}}\n' "$id"
@@ -755,6 +757,14 @@ done
         assert_eq!(tools[0].name, "test.tool");
         assert_eq!(tools[0].description.as_deref(), Some("A test tool"));
         assert!(tools[0].input_schema.is_some());
+        assert_eq!(
+            tools[0]
+                .annotations
+                .as_ref()
+                .and_then(|value| value.get("readOnlyHint"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
     }
 
     #[test]

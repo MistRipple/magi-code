@@ -865,3 +865,57 @@ fn watcher_incrementally_refreshes_index_on_file_change() {
 
     let _ = fs::remove_dir_all(&base);
 }
+
+#[test]
+fn workspace_code_search_supports_concurrent_queries() {
+    use crate::local_search_engine::SearchOptions;
+    use std::fs;
+
+    let base = std::env::temp_dir().join(format!(
+        "magi-ks-concurrent-search-{}-{}",
+        std::process::id(),
+        UtcMillis::now().0
+    ));
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir_all(base.join("src")).expect("create src");
+    fs::write(
+        base.join("src/lib.rs"),
+        "pub fn concurrent_search_probe() -> bool { true }\n",
+    )
+    .expect("write source");
+
+    let store = std::sync::Arc::new(KnowledgeStore::new());
+    let workspace_id = WorkspaceId::new("ws-concurrent-search");
+    store.build_workspace_index(&workspace_id, &base);
+    let workers = (0..16)
+        .map(|_| {
+            let store = store.clone();
+            let workspace_id = workspace_id.clone();
+            std::thread::spawn(move || {
+                store
+                    .search_workspace_code(
+                        &workspace_id,
+                        "concurrent search probe",
+                        SearchOptions::default(),
+                    )
+                    .expect("engine ready")
+            })
+        })
+        .collect::<Vec<_>>();
+
+    for worker in workers {
+        assert!(
+            worker
+                .join()
+                .expect("search worker")
+                .iter()
+                .any(|result| result.file_path == "src/lib.rs")
+        );
+    }
+    let stats = store
+        .workspace_index_stats(&workspace_id)
+        .expect("workspace stats");
+    assert_eq!(stats.query_count, 16);
+
+    let _ = fs::remove_dir_all(&base);
+}

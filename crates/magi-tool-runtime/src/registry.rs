@@ -78,13 +78,27 @@ impl ToolRegistry {
         &self,
         model_tool_name: &str,
         arguments: &str,
+        access_profile: AccessProfile,
     ) -> Option<(String, ExecutionResultStatus)> {
-        let executor = self.runtime_resources.external_mcp_tool_executor.as_ref()?;
         let binding = self
             .external_tool_catalog_snapshot()
             .mcp_tools
             .into_iter()
             .find(|tool| tool.model_tool_name == model_tool_name)?;
+        if access_profile == AccessProfile::ReadOnly && !binding.read_only {
+            return Some((
+                serde_json::json!({
+                    "tool": model_tool_name,
+                    "status": "rejected",
+                    "error_code": "mcp_blocked_in_read_only",
+                    "error": "只读访问模式不允许调用 MCP 工具",
+                    "access_profile": "read_only",
+                })
+                .to_string(),
+                ExecutionResultStatus::Rejected,
+            ));
+        }
+        let executor = self.runtime_resources.external_mcp_tool_executor.as_ref()?;
         Some(executor(&binding.server_id, &binding.tool_name, arguments))
     }
 

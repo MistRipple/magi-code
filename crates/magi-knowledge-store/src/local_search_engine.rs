@@ -1,18 +1,19 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
+use magi_core::estimate_text_tokens;
 use serde::{Deserialize, Serialize};
 
 use crate::code_tokenizer::CodeTokenizer;
 use crate::dependency_graph::DependencyGraph;
 use crate::index_persistence::{IndexPersistence, PersistenceSnapshot};
 use crate::inverted_index::{IndexSearchHit, InvertedIndex};
-use crate::query_expander::{LlmExpandResult, QueryExpander};
+use crate::query_expander::QueryExpander;
 use crate::result_ranker::{
     RankBoostSignals, RankInput, RankWeights, RankedResult, ResultRanker, ScoreDimensions,
 };
 use crate::search_cache::SearchCache;
-use crate::semantic_reranker::SemanticReranker;
 use crate::symbol_index::{SymbolIndex, SymbolSearchHit};
 
 const RECENT_EDIT_TTL_MS: u64 = 30 * 60 * 1000;
@@ -24,11 +25,16 @@ const INDEX_CACHE_SAVE_FAILED_CODE: &str = "index_cache_save_failed";
 #[derive(Clone, Debug, Default)]
 pub struct SearchOptions {
     pub max_results: Option<usize>,
-    pub max_context_length: Option<usize>,
+    pub max_context_tokens: Option<usize>,
     pub preferred_scopes: Vec<String>,
     pub prefer_recent_edits: bool,
-    pub llm_expand_result: Option<LlmExpandResult>,
-    pub llm_rerank_response: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum FileIndexEventKind {
+    Created,
+    Modified,
+    Deleted,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -72,6 +78,9 @@ pub struct SearchEngineStats {
     pub unique_symbols: usize,
     pub total_dep_edges: usize,
     pub cache_hit_rate: f64,
+    pub query_count: u64,
+    pub average_query_micros: u64,
+    pub max_query_micros: u64,
     pub index_version: u64,
     pub index_cache_status: &'static str,
     pub index_cache_error_code: Option<&'static str>,
@@ -94,7 +103,6 @@ pub struct LocalSearchEngine {
     result_ranker: ResultRanker,
     search_cache: SearchCache<Vec<SearchResult>>,
     query_expander: QueryExpander,
-    semantic_reranker: SemanticReranker,
     tokenizer: CodeTokenizer,
     persistence: IndexPersistence,
     indexed_files: Vec<(String, String)>,
@@ -107,6 +115,9 @@ pub struct LocalSearchEngine {
     cached_code_index_summary: Option<crate::code_scanner::CodeIndexSummary>,
     project_vocabulary_dirty: bool,
     recent_edited_files: HashMap<String, u64>,
+    query_count: AtomicU64,
+    total_query_micros: AtomicU64,
+    max_query_micros: AtomicU64,
 }
 
 impl LocalSearchEngine {
@@ -119,7 +130,6 @@ impl LocalSearchEngine {
             result_ranker: ResultRanker::new(config.rank_weights),
             search_cache: SearchCache::with_defaults(),
             query_expander: QueryExpander::new(),
-            semantic_reranker: SemanticReranker::new(),
             tokenizer: CodeTokenizer::new(),
             persistence: IndexPersistence::new(project_root),
             indexed_files: Vec::new(),
@@ -132,6 +142,9 @@ impl LocalSearchEngine {
             cached_code_index_summary: None,
             project_vocabulary_dirty: true,
             recent_edited_files: HashMap::new(),
+            query_count: AtomicU64::new(0),
+            total_query_micros: AtomicU64::new(0),
+            max_query_micros: AtomicU64::new(0),
         }
     }
 
@@ -181,9 +194,6 @@ impl LocalSearchEngine {
                 if !IndexPersistence::should_full_rebuild(&freshness, total_files)
                     && self.restore_from_snapshot(&snapshot, &freshness)
                 {
-                    if let Some(ref ec) = snapshot.expansion_cache {
-                        self.query_expander.import_cache(ec.clone());
-                    }
                     self.rebuild_tracked_file_states();
                     self.refresh_project_vocabulary_if_needed();
                     self.bump_index_version();
@@ -202,17 +212,26 @@ impl LocalSearchEngine {
         self.save_index();
     }
 
-    pub fn search(&mut self, query: &str, options: SearchOptions) -> Vec<SearchResult> {
+    pub fn search(&self, query: &str, options: SearchOptions) -> Vec<SearchResult> {
+        let started = std::time::Instant::now();
+        let results = self.search_inner(query, options);
+        let elapsed = started.elapsed().as_micros().min(u64::MAX as u128) as u64;
+        self.query_count.fetch_add(1, Ordering::Relaxed);
+        self.total_query_micros
+            .fetch_add(elapsed, Ordering::Relaxed);
+        self.max_query_micros.fetch_max(elapsed, Ordering::Relaxed);
+        results
+    }
+
+    fn search_inner(&self, query: &str, options: SearchOptions) -> Vec<SearchResult> {
         let max_results = options.max_results.unwrap_or(10);
-        let max_context_length = options.max_context_length.unwrap_or(8000);
+        let max_context_tokens = options.max_context_tokens.unwrap_or(8000);
         let cache_key = search_cache_key(query, &options);
 
         let trimmed = query.trim();
         if trimmed.is_empty() {
             return Vec::new();
         }
-
-        self.reconcile_indexed_files();
 
         if let Some(cached) = self.search_cache.get(&cache_key) {
             return cached;
@@ -224,13 +243,7 @@ impl LocalSearchEngine {
             return Vec::new();
         }
 
-        let mut expanded = self.query_expander.expand_offline(trimmed, &query_tokens);
-
-        let should_expand = query_intent == QueryIntent::Semantic && query_tokens.len() <= 3;
-        if should_expand && let Some(llm_result) = options.llm_expand_result {
-            self.query_expander
-                .merge_llm_result(&mut expanded, llm_result);
-        }
+        let expanded = self.query_expander.expand_offline(trimmed, &query_tokens);
 
         let search_tokens = &expanded.expanded_tokens;
 
@@ -281,28 +294,7 @@ impl LocalSearchEngine {
                 recency: 0.05,
                 type_weight: 0.05,
             }),
-            QueryIntent::Semantic => expanded.weight_hints.map(|wh| {
-                let mut w = RankWeights::default();
-                if let Some(v) = wh.symbol_match {
-                    w.symbol_match = v;
-                }
-                if let Some(v) = wh.tfidf {
-                    w.tfidf = v;
-                }
-                if let Some(v) = wh.position_weight {
-                    w.position_weight = v;
-                }
-                if let Some(v) = wh.centrality {
-                    w.centrality = v;
-                }
-                if let Some(v) = wh.recency {
-                    w.recency = v;
-                }
-                if let Some(v) = wh.type_weight {
-                    w.type_weight = v;
-                }
-                w
-            }),
+            QueryIntent::Semantic => None,
         };
 
         let boost_signals = RankBoostSignals {
@@ -326,20 +318,12 @@ impl LocalSearchEngine {
 
         let expanded_ranked = self.expand_with_dependencies(ranked, max_results * 2);
 
-        let reranked = self.semantic_reranker.rerank(
-            trimmed,
-            expanded_ranked,
-            options.llm_rerank_response.as_deref(),
-            Some(&self.symbol_index),
-            15,
-        );
-
         let results = self.assemble_results(
-            &reranked,
+            &expanded_ranked,
             &index_hits,
             &symbol_hits,
             max_results,
-            max_context_length,
+            max_context_tokens,
         );
 
         let file_paths: Vec<String> = results.iter().map(|r| r.file_path.clone()).collect();
@@ -347,30 +331,6 @@ impl LocalSearchEngine {
             .set(&cache_key, results.clone(), file_paths);
 
         results
-    }
-
-    pub fn build_expansion_prompt(&self, query: &str) -> String {
-        self.query_expander.build_llm_prompt(query)
-    }
-
-    pub fn parse_expansion_response(&self, content: &str) -> LlmExpandResult {
-        self.query_expander.parse_llm_response(content)
-    }
-
-    pub fn build_rerank_prompt(
-        &self,
-        query: &str,
-        candidates: &[RankedResult],
-        top_n: usize,
-    ) -> Option<String> {
-        if candidates.len() <= 2 {
-            return None;
-        }
-        Some(SemanticReranker::build_prompt(
-            query,
-            &candidates[..top_n.min(candidates.len())],
-            Some(&self.symbol_index),
-        ))
     }
 
     pub fn on_file_changed(&mut self, file_path: &str) {
@@ -386,6 +346,65 @@ impl LocalSearchEngine {
         }
         let file_type = self.ensure_indexed_file_record(&relative, None);
         self.apply_changed_file(&relative, &file_type);
+        self.refresh_project_vocabulary_if_needed();
+        self.bump_index_version();
+    }
+
+    pub(crate) fn apply_file_events(&mut self, events: Vec<(String, FileIndexEventKind)>) {
+        if !self.is_ready || events.is_empty() {
+            return;
+        }
+
+        let mut deduplicated = std::collections::BTreeMap::new();
+        for (path, kind) in events {
+            deduplicated.insert(path, kind);
+        }
+
+        let mut dependency_updates = Vec::new();
+        let mut dependency_deletes = Vec::new();
+        let mut changed = false;
+
+        for (file_path, kind) in deduplicated {
+            let Some(relative) = self.to_workspace_relative(&file_path) else {
+                continue;
+            };
+            match kind {
+                FileIndexEventKind::Created | FileIndexEventKind::Modified => {
+                    if !crate::code_scanner::is_indexable_code_path(&relative) {
+                        if self.indexed_files.iter().any(|(path, _)| path == &relative) {
+                            self.apply_deleted_file_indexes(&relative);
+                            dependency_deletes.push(relative);
+                            changed = true;
+                        }
+                        continue;
+                    }
+                    let preferred_type = matches!(kind, FileIndexEventKind::Created)
+                        .then(|| classify_file_type(&relative));
+                    let file_type =
+                        self.ensure_indexed_file_record(&relative, preferred_type.as_deref());
+                    self.apply_changed_file_indexes(&relative, &file_type);
+                    dependency_updates.push(relative);
+                    changed = true;
+                }
+                FileIndexEventKind::Deleted => {
+                    if self.indexed_files.iter().any(|(path, _)| path == &relative) {
+                        self.apply_deleted_file_indexes(&relative);
+                        dependency_deletes.push(relative);
+                        changed = true;
+                    }
+                }
+            }
+        }
+
+        if !changed {
+            return;
+        }
+        self.dependency_graph.apply_file_changes(
+            &self.project_root,
+            &dependency_updates,
+            &dependency_deletes,
+        );
+        self.refresh_cached_summary_metadata();
         self.refresh_project_vocabulary_if_needed();
         self.bump_index_version();
     }
@@ -447,6 +466,8 @@ impl LocalSearchEngine {
         let sym_stats = self.symbol_index.get_stats();
         let dep_stats = self.dependency_graph.get_stats();
         let cache_stats = self.search_cache.get_stats();
+        let query_count = self.query_count.load(Ordering::Relaxed);
+        let total_query_micros = self.total_query_micros.load(Ordering::Relaxed);
         SearchEngineStats {
             is_ready: self.is_ready,
             total_documents: idx_stats.total_documents,
@@ -454,6 +475,13 @@ impl LocalSearchEngine {
             unique_symbols: sym_stats.unique_symbols,
             total_dep_edges: dep_stats.total_edges,
             cache_hit_rate: cache_stats.hit_rate,
+            query_count,
+            average_query_micros: if query_count == 0 {
+                0
+            } else {
+                total_query_micros / query_count
+            },
+            max_query_micros: self.max_query_micros.load(Ordering::Relaxed),
             index_version: self.index_version,
             index_cache_status: self.index_cache_status,
             index_cache_error_code: self.index_cache_error_code,
@@ -552,7 +580,7 @@ impl LocalSearchEngine {
         let manifest =
             IndexPersistence::build_file_manifest(&self.project_root, &self.indexed_files);
         let snapshot = PersistenceSnapshot {
-            version: 1,
+            version: 2,
             project_root: self.project_root.clone(),
             created_at: now_millis(),
             updated_at: now_millis(),
@@ -560,7 +588,6 @@ impl LocalSearchEngine {
             inverted_index: self.inverted_index.to_snapshot(),
             symbol_index: self.symbol_index.to_snapshot(),
             dependency_graph: self.dependency_graph.to_snapshot(),
-            expansion_cache: Some(self.query_expander.export_cache()),
         };
         match self.persistence.save(&snapshot) {
             Ok(()) => {
@@ -580,12 +607,17 @@ impl LocalSearchEngine {
     }
 
     fn apply_changed_file(&mut self, relative_path: &str, file_type: &str) {
+        self.apply_changed_file_indexes(relative_path, file_type);
+        self.dependency_graph
+            .update_file(&self.project_root, relative_path);
+        self.refresh_cached_summary_metadata();
+    }
+
+    fn apply_changed_file_indexes(&mut self, relative_path: &str, file_type: &str) {
         let project_root = self.project_root.clone();
         self.inverted_index
             .update_file(&project_root, relative_path, file_type);
         self.symbol_index.update_file(&project_root, relative_path);
-        self.dependency_graph
-            .update_file(&project_root, relative_path);
         self.update_tracked_file_state(relative_path);
         self.record_recent_edit(relative_path);
         self.project_vocabulary_dirty = true;
@@ -595,6 +627,12 @@ impl LocalSearchEngine {
     }
 
     fn apply_deleted_file(&mut self, relative_path: &str) {
+        self.apply_deleted_file_indexes(relative_path);
+        self.dependency_graph.remove_file(relative_path);
+        self.refresh_cached_summary_metadata();
+    }
+
+    fn apply_deleted_file_indexes(&mut self, relative_path: &str) {
         self.indexed_files.retain(|(p, _)| p != relative_path);
         self.tracked_file_states.remove(relative_path);
         self.recent_edited_files.remove(relative_path);
@@ -602,7 +640,6 @@ impl LocalSearchEngine {
 
         self.inverted_index.remove_file(relative_path);
         self.symbol_index.remove_file(relative_path);
-        self.dependency_graph.remove_file(relative_path);
         self.search_cache.invalidate_by_file(relative_path);
         self.last_indexed = Some(now_millis());
         self.remove_cached_summary_file(relative_path);
@@ -633,7 +670,6 @@ impl LocalSearchEngine {
         if let Some(last_indexed) = self.last_indexed {
             summary.last_indexed = last_indexed;
         }
-        crate::code_scanner::refresh_code_index_summary_metadata(root, summary);
     }
 
     fn remove_cached_summary_file(&mut self, relative_path: &str) {
@@ -645,10 +681,15 @@ impl LocalSearchEngine {
         if let Some(last_indexed) = self.last_indexed {
             summary.last_indexed = last_indexed;
         }
-        crate::code_scanner::refresh_code_index_summary_metadata(
-            Path::new(&self.project_root),
-            summary,
-        );
+    }
+
+    fn refresh_cached_summary_metadata(&mut self) {
+        if let Some(summary) = self.cached_code_index_summary.as_mut() {
+            crate::code_scanner::refresh_code_index_summary_metadata(
+                Path::new(&self.project_root),
+                summary,
+            );
+        }
     }
 
     fn normalize_cached_summary(
@@ -745,7 +786,7 @@ impl LocalSearchEngine {
         self.project_vocabulary_dirty = false;
     }
 
-    fn reconcile_indexed_files(&mut self) {
+    pub(crate) fn reconcile_indexed_files(&mut self) {
         if !self.is_ready {
             return;
         }
@@ -801,15 +842,13 @@ impl LocalSearchEngine {
         }
     }
 
-    fn get_recent_edited_file_set(&mut self) -> HashSet<String> {
+    fn get_recent_edited_file_set(&self) -> HashSet<String> {
         let now = now_millis();
-        let mut recent = HashSet::new();
         self.recent_edited_files
-            .retain(|_, ts| now - *ts <= RECENT_EDIT_TTL_MS);
-        for fp in self.recent_edited_files.keys() {
-            recent.insert(fp.clone());
-        }
-        recent
+            .iter()
+            .filter(|(_, timestamp)| now.saturating_sub(**timestamp) <= RECENT_EDIT_TTL_MS)
+            .map(|(file_path, _)| file_path.clone())
+            .collect()
     }
 
     fn expand_with_dependencies(
@@ -869,7 +908,7 @@ impl LocalSearchEngine {
         index_hits: &[IndexSearchHit],
         symbol_hits: &[SymbolSearchHit],
         max_results: usize,
-        max_context_length: usize,
+        max_context_tokens: usize,
     ) -> Vec<SearchResult> {
         let index_hit_map: HashMap<&str, &IndexSearchHit> = index_hits
             .iter()
@@ -885,10 +924,10 @@ impl LocalSearchEngine {
         }
 
         let mut results = Vec::new();
-        let mut total_content_length = 0;
+        let mut total_context_tokens = 0;
 
         for item in ranked {
-            if results.len() >= max_results || total_content_length >= max_context_length {
+            if results.len() >= max_results || total_context_tokens >= max_context_tokens {
                 break;
             }
 
@@ -906,7 +945,7 @@ impl LocalSearchEngine {
                     &lines,
                     &index_hit.hit_lines,
                     &index_hit.matched_tokens,
-                    max_context_length - total_content_length,
+                    max_context_tokens - total_context_tokens,
                     &self.symbol_index,
                 );
             }
@@ -919,13 +958,19 @@ impl LocalSearchEngine {
                     &lines,
                     sym_lines,
                     &[],
-                    max_context_length - total_content_length,
+                    max_context_tokens - total_context_tokens,
                     &self.symbol_index,
                 );
             }
 
-            let snippet_len: usize = snippets.iter().map(|s| s.content.len()).sum();
-            total_content_length += snippet_len;
+            if snippets.is_empty() {
+                continue;
+            }
+            let snippet_tokens: usize = snippets
+                .iter()
+                .map(|snippet| estimate_context_tokens(&snippet.content))
+                .sum();
+            total_context_tokens += snippet_tokens;
 
             results.push(SearchResult {
                 file_path: item.file_path.clone(),
@@ -963,7 +1008,7 @@ fn extract_snippets(
     lines: &[String],
     hit_lines: &[usize],
     matched_tokens: &[String],
-    max_length: usize,
+    max_tokens: usize,
     symbol_index: &SymbolIndex,
 ) -> Vec<CodeSnippet> {
     let mut ranges: Vec<(usize, usize)> = Vec::new();
@@ -1012,27 +1057,43 @@ fn extract_snippets(
     }
 
     let mut snippets = Vec::new();
-    let mut total_len = 0;
+    let mut total_tokens = 0;
 
     for (start, end) in merged {
-        if total_len >= max_length {
+        if total_tokens >= max_tokens || start >= lines.len() {
             break;
         }
         let end_clamped = end.min(lines.len().saturating_sub(1));
-        let content: String = lines[start..=end_clamped].join("\n");
-        if total_len + content.len() > max_length {
+        let remaining = max_tokens - total_tokens;
+        let mut selected_lines = Vec::new();
+        let mut selected_tokens = 0usize;
+        for line in &lines[start..=end_clamped] {
+            let line_tokens = estimate_context_tokens(line);
+            if selected_tokens + line_tokens > remaining {
+                break;
+            }
+            selected_tokens += line_tokens;
+            selected_lines.push(line.as_str());
+        }
+        if selected_lines.is_empty() {
             break;
         }
-        total_len += content.len();
+        let actual_end = start + selected_lines.len() - 1;
+        let content = selected_lines.join("\n");
+        total_tokens += selected_tokens;
         snippets.push(CodeSnippet {
             start_line: start,
-            end_line: end_clamped,
+            end_line: actual_end,
             content,
             matched_tokens: matched_tokens.to_vec(),
         });
     }
 
     snippets
+}
+
+fn estimate_context_tokens(text: &str) -> usize {
+    estimate_text_tokens(text)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1130,22 +1191,18 @@ fn normalize_scope_hints(scopes: &[String]) -> Vec<String> {
 struct SearchCacheKey<'a> {
     query: &'a str,
     max_results: Option<usize>,
-    max_context_length: Option<usize>,
+    max_context_tokens: Option<usize>,
     preferred_scopes: Vec<String>,
     prefer_recent_edits: bool,
-    llm_expand_result: &'a Option<LlmExpandResult>,
-    llm_rerank_response: &'a Option<String>,
 }
 
 fn search_cache_key(query: &str, options: &SearchOptions) -> String {
     serde_json::to_string(&SearchCacheKey {
         query,
         max_results: options.max_results,
-        max_context_length: options.max_context_length,
+        max_context_tokens: options.max_context_tokens,
         preferred_scopes: normalize_scope_hints(&options.preferred_scopes),
         prefer_recent_edits: options.prefer_recent_edits,
-        llm_expand_result: &options.llm_expand_result,
-        llm_rerank_response: &options.llm_rerank_response,
     })
     .unwrap_or_else(|_| query.to_string())
 }
@@ -1206,6 +1263,96 @@ mod tests {
         assert!(vocab.contains("components"));
         assert!(vocab.contains("auth"));
         assert!(vocab.contains("handler"));
+    }
+
+    #[test]
+    fn context_budget_counts_cjk_by_character_instead_of_utf8_bytes() {
+        assert_eq!(estimate_context_tokens("你好"), 2);
+        assert_eq!(estimate_context_tokens("hello world"), 3);
+    }
+
+    #[test]
+    fn search_uses_snapshot_until_explicit_reconciliation_refreshes_missed_events() {
+        let root = std::env::temp_dir().join(format!(
+            "magi-local-search-reconcile-{}-{}",
+            std::process::id(),
+            now_millis()
+        ));
+        std::fs::create_dir_all(root.join("src")).expect("create src");
+        std::fs::write(root.join("src/lib.rs"), "pub fn olduniqueprobe() {}\n")
+            .expect("write initial source");
+
+        let mut engine = LocalSearchEngine::new(
+            root.to_string_lossy().as_ref(),
+            SearchEngineConfig::default(),
+        );
+        engine.build_index(
+            &[("src/lib.rs".to_string(), "source".to_string())],
+            now_millis(),
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "pub fn recovereduniqueprobe() {}\n",
+        )
+        .expect("write changed source");
+
+        assert!(
+            engine
+                .search("recovereduniqueprobe", SearchOptions::default())
+                .is_empty(),
+            "查询热路径不应执行全工作区文件对账"
+        );
+        engine.reconcile_indexed_files();
+        assert!(
+            engine
+                .search("recovereduniqueprobe", SearchOptions::default())
+                .iter()
+                .any(|result| result.file_path == "src/lib.rs"),
+            "显式低频对账应恢复 watcher 漏掉的文件变化"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn search_snippets_respect_token_budget() {
+        let root = std::env::temp_dir().join(format!(
+            "magi-local-search-token-budget-{}-{}",
+            std::process::id(),
+            now_millis()
+        ));
+        std::fs::create_dir_all(root.join("src")).expect("create src");
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "// 登录认证\npub fn login_auth() {}\n// 用户权限校验\n",
+        )
+        .expect("write source");
+
+        let mut engine = LocalSearchEngine::new(
+            root.to_string_lossy().as_ref(),
+            SearchEngineConfig::default(),
+        );
+        engine.build_index(
+            &[("src/lib.rs".to_string(), "source".to_string())],
+            now_millis(),
+        );
+        let results = engine.search(
+            "login_auth",
+            SearchOptions {
+                max_context_tokens: Some(6),
+                ..SearchOptions::default()
+            },
+        );
+        let total_tokens = results
+            .iter()
+            .flat_map(|result| &result.snippets)
+            .map(|snippet| estimate_context_tokens(&snippet.content))
+            .sum::<usize>();
+        assert!(total_tokens <= 6, "片段预算实际为 {total_tokens}");
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1428,7 +1575,7 @@ mod tests {
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
         let snapshot = PersistenceSnapshot {
-            version: 1,
+            version: 2,
             project_root: "/tmp/magi-different-project-root".to_string(),
             created_at: now_millis(),
             updated_at: now_millis(),
@@ -1459,7 +1606,6 @@ mod tests {
                 edges: Vec::new(),
                 centrality_cache: Vec::new(),
             },
-            expansion_cache: None,
         };
         let raw = serde_json::to_vec(&snapshot).expect("serialize snapshot");
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
