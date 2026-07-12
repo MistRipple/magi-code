@@ -24,10 +24,7 @@ use std::time::Duration;
 const OPENAI_BASE_URL_ENV: &str = "MAGI_OPENAI_COMPAT_BASE_URL";
 const OPENAI_API_KEY_ENV: &str = "MAGI_OPENAI_COMPAT_API_KEY";
 const OPENAI_MODEL_ENV: &str = "MAGI_OPENAI_COMPAT_MODEL";
-const MODEL_PROVIDER_MAX_IN_FLIGHT_ENV: &str = "MAGI_MODEL_PROVIDER_MAX_IN_FLIGHT";
-const DEFAULT_MODEL_PROVIDER_MAX_IN_FLIGHT: usize = 16;
-const MIN_MODEL_PROVIDER_MAX_IN_FLIGHT: usize = 1;
-const MAX_MODEL_PROVIDER_MAX_IN_FLIGHT: usize = 64;
+const MODEL_PROVIDER_MAX_IN_FLIGHT: usize = 16;
 const MODEL_PROVIDER_MAX_RETRIES: usize = 2;
 const MODEL_PROVIDER_BACKOFF_BASE_MS: u64 = 200;
 
@@ -220,7 +217,6 @@ impl HttpModelBridgeProtocol {
 
 struct ModelProviderGate {
     slots: Mutex<HashMap<String, Arc<ModelProviderSlot>>>,
-    max_in_flight: usize,
 }
 
 struct ModelProviderSlot {
@@ -254,7 +250,7 @@ impl ModelProviderGate {
             .in_flight
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        while *in_flight >= self.max_in_flight {
+        while *in_flight >= MODEL_PROVIDER_MAX_IN_FLIGHT {
             in_flight = slot
                 .available
                 .wait(in_flight)
@@ -283,20 +279,7 @@ fn model_provider_gate() -> &'static ModelProviderGate {
     static GATE: OnceLock<ModelProviderGate> = OnceLock::new();
     GATE.get_or_init(|| ModelProviderGate {
         slots: Mutex::new(HashMap::new()),
-        max_in_flight: parse_model_provider_max_in_flight(
-            env::var(MODEL_PROVIDER_MAX_IN_FLIGHT_ENV).ok().as_deref(),
-        ),
     })
-}
-
-fn parse_model_provider_max_in_flight(value: Option<&str>) -> usize {
-    value
-        .and_then(|raw| raw.trim().parse::<usize>().ok())
-        .unwrap_or(DEFAULT_MODEL_PROVIDER_MAX_IN_FLIGHT)
-        .clamp(
-            MIN_MODEL_PROVIDER_MAX_IN_FLIGHT,
-            MAX_MODEL_PROVIDER_MAX_IN_FLIGHT,
-        )
 }
 
 fn normalize_provider_base_url(base_url: &str) -> String {
@@ -2623,12 +2606,11 @@ mod tests {
     }
 
     #[test]
-    fn model_provider_gate_caps_same_provider_at_configured_limit() {
+    fn model_provider_gate_caps_same_provider_at_internal_limit() {
         let gate = Arc::new(ModelProviderGate {
             slots: Mutex::new(HashMap::new()),
-            max_in_flight: DEFAULT_MODEL_PROVIDER_MAX_IN_FLIGHT,
         });
-        let permits = (0..DEFAULT_MODEL_PROVIDER_MAX_IN_FLIGHT)
+        let permits = (0..MODEL_PROVIDER_MAX_IN_FLIGHT)
             .map(|_| gate.acquire("anthropic-messages|http://localhost:8317/v1|kiro"))
             .collect::<Vec<_>>();
         let (acquired_tx, acquired_rx) = mpsc::channel();
@@ -2660,7 +2642,6 @@ mod tests {
     fn model_provider_gate_allows_mainline_and_five_agents() {
         let gate = Arc::new(ModelProviderGate {
             slots: Mutex::new(HashMap::new()),
-            max_in_flight: DEFAULT_MODEL_PROVIDER_MAX_IN_FLIGHT,
         });
         let existing_permits = (0..4)
             .map(|_| gate.acquire("openai-chat|http://localhost:8317/v1|gpt"))
@@ -2690,26 +2671,6 @@ mod tests {
         assert!(
             acquired_concurrently,
             "同一模型必须至少允许主线与五个子代理并发请求"
-        );
-    }
-
-    #[test]
-    fn model_provider_limit_uses_default_and_clamps_configured_value() {
-        assert_eq!(
-            parse_model_provider_max_in_flight(None),
-            DEFAULT_MODEL_PROVIDER_MAX_IN_FLIGHT
-        );
-        assert_eq!(
-            parse_model_provider_max_in_flight(Some("invalid")),
-            DEFAULT_MODEL_PROVIDER_MAX_IN_FLIGHT
-        );
-        assert_eq!(
-            parse_model_provider_max_in_flight(Some("0")),
-            MIN_MODEL_PROVIDER_MAX_IN_FLIGHT
-        );
-        assert_eq!(
-            parse_model_provider_max_in_flight(Some("128")),
-            MAX_MODEL_PROVIDER_MAX_IN_FLIGHT
         );
     }
 
