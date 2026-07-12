@@ -38,6 +38,7 @@
     selectComposerDraftWorkspace,
     type ComposerWorkspaceOption,
   } from '../stores/composer-workspace.svelte';
+  import { openWorkspaceFolderPicker } from '../stores/workspace-onboarding.svelte';
   import {
     buildSlashCommands,
     filterSlashCommands,
@@ -669,7 +670,19 @@
     const workspace = selectComposerDraftWorkspace(workspaceId);
     if (!workspace) return;
     workspacePickerOpen = false;
+    vscode.postMessage({
+      type: 'workspaceBindingChanged',
+      workspaceId: workspace.workspaceId,
+      workspacePath: workspace.rootPath,
+      sessionId: '',
+    });
     void refreshBranchState();
+  }
+
+  function useExistingWorkspaceFolder(): void {
+    if (!isDraftSession || sessionInputLocked || isInteractionBlocking) return;
+    workspacePickerOpen = false;
+    openWorkspaceFolderPicker('composer');
   }
 
   function resolveSubmissionWorkspace(): ComposerWorkspaceOption | null {
@@ -1702,11 +1715,11 @@
             class:configured={composerWorkspace !== null}
             class:locked={!isDraftSession}
             onclick={() => {
-              if (isDraftSession && workspaceOptions.length > 0) {
+              if (isDraftSession) {
                 workspacePickerOpen = !workspacePickerOpen;
               }
             }}
-            disabled={workspaceOptions.length === 0 || sessionInputLocked || isInteractionBlocking}
+            disabled={sessionInputLocked || isInteractionBlocking}
             title={workspaceButtonTitle(composerWorkspace)}
             aria-expanded={workspacePickerOpen}
             aria-disabled={!isDraftSession || sessionInputLocked || isInteractionBlocking}
@@ -1737,6 +1750,18 @@
                   {/each}
                 </div>
               {/if}
+              <div class="ia-picker-divider"></div>
+              <button
+                type="button"
+                class="ia-picker-item ia-picker-row ia-workspace-action"
+                onclick={useExistingWorkspaceFolder}
+              >
+                <span class="ia-workspace-action-label">
+                  <Icon name="folder" size={13} />
+                  <span class="ia-picker-item-label">{i18n.t('input.workspace.useExistingFolder')}</span>
+                </span>
+                <Icon name="chevron-right" size={11} />
+              </button>
             </div>
           {/if}
         </div>
@@ -2717,6 +2742,15 @@
     align-items: center;
     justify-content: space-between;
     gap: 8px;
+  }
+  .ia-workspace-action {
+    color: var(--foreground);
+  }
+  .ia-workspace-action-label {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    min-width: 0;
   }
   .ia-picker-item-label {
     font-size: 12px;

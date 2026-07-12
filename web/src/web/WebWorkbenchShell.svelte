@@ -42,7 +42,15 @@
     setRightPaneCollapsed,
     type CodeTabPayload,
   } from '../stores/right-pane.svelte';
-  import { syncComposerWorkspaces } from '../stores/composer-workspace.svelte';
+  import {
+    selectComposerDraftWorkspace,
+    syncComposerWorkspaces,
+  } from '../stores/composer-workspace.svelte';
+  import {
+    closeWorkspaceFolderPicker,
+    openWorkspaceFolderPicker,
+    workspaceOnboardingState,
+  } from '../stores/workspace-onboarding.svelte';
   import {
     PANEL_LAYOUT,
     resolvePanelLayout,
@@ -69,7 +77,6 @@
   let viewportWidth = $state(typeof window !== 'undefined' ? window.innerWidth : 1440);
   let sidebarOpen = $state(false);
   let workspaceActionPending = $state(false);
-  let showAddWorkspaceDialog = $state(false);
   let showRemoveWorkspaceDialog = $state(false);
   let pendingRemoveWorkspace = $state<AgentWorkspaceSummary | null>(null);
   let workspaceDialogError = $state('');
@@ -978,6 +985,7 @@
     if (!normalizedRootPath) {
       return;
     }
+    const onboardingOrigin = workspaceOnboardingState.origin;
     closeAddWorkspaceDialog({ force: true });
     workspaceActionPending = true;
     try {
@@ -993,8 +1001,18 @@
       }
       workspaces = next;
       const addedWorkspace = next.find((workspace) => workspace.rootPath === normalizedRootPath);
-      selectedWorkspaceId = addedWorkspace?.workspaceId || next[0]?.workspaceId || '';
-      if (selectedWorkspaceId) {
+      const addedWorkspaceId = addedWorkspace?.workspaceId || '';
+      if (onboardingOrigin === 'composer' && addedWorkspaceId) {
+        syncComposerWorkspaces(next, addedWorkspaceId);
+        selectComposerDraftWorkspace(addedWorkspaceId);
+        if (addedWorkspace) {
+          requestWorkspaceBindingSync(addedWorkspace, null);
+          await loadWorkspaceSessionsForSidebar(addedWorkspace);
+        }
+      } else {
+        selectedWorkspaceId = addedWorkspaceId || next[0]?.workspaceId || '';
+      }
+      if (onboardingOrigin !== 'composer' && selectedWorkspaceId) {
         expandedWorkspaceIds = {
           ...expandedWorkspaceIds,
           [selectedWorkspaceId]: true,
@@ -1015,7 +1033,7 @@
       return;
     }
     workspaceDialogError = '';
-    showAddWorkspaceDialog = true;
+    openWorkspaceFolderPicker('sidebar');
   }
 
   function closeAddWorkspaceDialog(options: { force?: boolean } = {}): void {
@@ -1024,7 +1042,7 @@
     }
     workspaceDialogError = '';
     
-    showAddWorkspaceDialog = false;
+    closeWorkspaceFolderPicker();
   }
 
   function openRemoveWorkspaceDialog(workspace: AgentWorkspaceSummary): void {
@@ -1626,7 +1644,7 @@
   </main>
 </div>
 
-{#if showAddWorkspaceDialog}
+{#if workspaceOnboardingState.open}
   <Modal
     onClose={closeAddWorkspaceDialog}
     closeOnBackdrop={true}

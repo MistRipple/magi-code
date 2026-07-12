@@ -10,6 +10,7 @@
   import InputArea from './InputArea.svelte';
   import RuntimeStatePanel from './RuntimeStatePanel.svelte';
   import GoalRunDrawers from './GoalRunDrawers.svelte';
+  import ActiveAgentCenter from './ActiveAgentCenter.svelte';
 
   interface Props {
     isTopActive?: boolean;
@@ -42,6 +43,7 @@
   />
   <div class="main-content">
     <MessageList renderItems={threadRenderItems} isActive={isTopActive} />
+    <ActiveAgentCenter />
   </div>
 
   <GoalRunDrawers />
@@ -60,6 +62,7 @@
   }
 
   .main-content {
+    position: relative;
     flex: 1;
     min-height: 0; /* flex 布局防溢出 */
     overflow: hidden;

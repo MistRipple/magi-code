@@ -48,7 +48,7 @@ use std::{
     path::PathBuf,
     sync::{Arc, RwLock},
 };
-use tracing::warn;
+use tracing::{info, warn};
 
 #[cfg(test)]
 struct StaticTestModelBridgeClient;
@@ -1072,6 +1072,7 @@ impl DaemonRuntime {
                 let receiver = runner_result_receiver.clone();
                 restored.set_status_change_callback(Box::new(
                     move |task_id, old_status, new_status, task: magi_core::Task| {
+                        settle_task_execution_threads(session_store.as_ref(), task_id, new_status);
                         publish_task_status_changed_event(
                             eb.as_ref(),
                             session_store.as_ref(),
@@ -1106,6 +1107,7 @@ impl DaemonRuntime {
                 let session_store = session_store_for_task_status.clone();
                 Arc::new(TaskStore::with_status_change_callback(Box::new(
                     move |task_id, old_status, new_status, task: magi_core::Task| {
+                        settle_task_execution_threads(session_store.as_ref(), task_id, new_status);
                         publish_task_status_changed_event(
                             event_bus_for_task_store.as_ref(),
                             session_store.as_ref(),
@@ -1126,6 +1128,16 @@ impl DaemonRuntime {
                 )))
             }
         };
+        let reconciled_threads = reconcile_terminal_task_execution_threads(
+            self.session_store.as_ref(),
+            task_store.as_ref(),
+        );
+        if reconciled_threads > 0 {
+            info!(
+                reconciled_threads,
+                "已将历史终态任务关联的活动线程统一收口为 Idle"
+            );
+        }
         if self.reconcile_stale_session_task_chains(task_store.as_ref()) > 0
             && let Err(error) = task_store.checkpoint_to_file(&task_store_checkpoint_path)
         {
@@ -1693,6 +1705,37 @@ fn push_terminal_task_result(
     }
 }
 
+fn settle_task_execution_threads(
+    session_store: &SessionStore,
+    task_id: &magi_core::TaskId,
+    new_status: TaskStatus,
+) {
+    if matches!(
+        new_status,
+        TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Killed
+    ) {
+        session_store.mark_task_threads_idle(task_id, UtcMillis::now());
+    }
+}
+
+fn reconcile_terminal_task_execution_threads(
+    session_store: &SessionStore,
+    task_store: &TaskStore,
+) -> usize {
+    let now = UtcMillis::now();
+    task_store
+        .all_tasks()
+        .into_iter()
+        .filter(|task| {
+            matches!(
+                task.status,
+                TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Killed
+            )
+        })
+        .map(|task| session_store.mark_task_threads_idle(&task.task_id, now))
+        .sum()
+}
+
 fn publish_task_status_changed_event(
     event_bus: &InMemoryEventBus,
     session_store: &SessionStore,
@@ -1780,6 +1823,7 @@ mod tests {
     use super::{
         DaemonRuntime, SettingsBackedMcpBridgeClient, build_agent_role_catalog_provider,
         external_mcp_server_catalog_entry, publish_task_status_changed_event,
+        reconcile_terminal_task_execution_threads,
     };
     use crate::daemon::{config::DaemonConfig, persistence::StateRepository};
     use axum::{
@@ -2166,6 +2210,75 @@ done
         assert_eq!(event.payload["workspace_id"], json!(workspace_id.as_str()));
         assert_eq!(event.payload["root_task_id"], json!(task_id.as_str()));
         assert_eq!(event.payload["title"], json!(task.title));
+    }
+
+    #[test]
+    fn terminal_task_reconciliation_clears_only_stale_active_threads() {
+        let session_store = SessionStore::new();
+        let task_store = TaskStore::new();
+        let session_id = SessionId::new("session-terminal-thread-reconcile");
+        let mission_id = MissionId::new("mission-terminal-thread-reconcile");
+        let completed_task_id = TaskId::new("task-terminal-thread-completed");
+        let running_task_id = TaskId::new("task-terminal-thread-running");
+
+        let mut completed_task = spawn_graph_restore_task(
+            completed_task_id.as_str(),
+            completed_task_id.as_str(),
+            None,
+            TaskStatus::Completed,
+            1_000,
+        );
+        completed_task.mission_id = mission_id.clone();
+        task_store.insert_task(completed_task);
+        let mut running_task = spawn_graph_restore_task(
+            running_task_id.as_str(),
+            running_task_id.as_str(),
+            None,
+            TaskStatus::Running,
+            2_000,
+        );
+        running_task.mission_id = mission_id.clone();
+        task_store.insert_task(running_task);
+
+        for (thread_id, task_id) in [
+            ("thread-terminal-completed", &completed_task_id),
+            ("thread-terminal-running", &running_task_id),
+        ] {
+            session_store.register_thread(magi_session_store::ExecutionThread {
+                thread_id: ThreadId::new(thread_id),
+                session_id: session_id.clone(),
+                mission_id: mission_id.clone(),
+                role_id: "reviewer".to_string(),
+                worker_instance_id: WorkerId::new(format!("worker-{thread_id}")),
+                status: magi_session_store::ExecutionThreadStatus::Active,
+                created_at: UtcMillis(1_000),
+                last_used_at: UtcMillis(2_000),
+                handled_task_ids: vec![task_id.clone()],
+                message_history: Vec::new(),
+            });
+        }
+
+        assert_eq!(
+            reconcile_terminal_task_execution_threads(&session_store, &task_store),
+            1
+        );
+
+        let threads = session_store.thread_registry_snapshot(&session_id);
+        let status = |thread_id: &str| {
+            threads
+                .iter()
+                .find(|thread| thread.thread_id.as_str() == thread_id)
+                .map(|thread| thread.status)
+                .expect("thread should exist")
+        };
+        assert_eq!(
+            status("thread-terminal-completed"),
+            magi_session_store::ExecutionThreadStatus::Idle
+        );
+        assert_eq!(
+            status("thread-terminal-running"),
+            magi_session_store::ExecutionThreadStatus::Active
+        );
     }
 
     #[test]

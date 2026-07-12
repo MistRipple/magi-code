@@ -2548,7 +2548,7 @@ fn thread_registry_activation_tracks_task_ids_without_reuse_lookup() {
 
     let task_a = TaskId::new("task-a");
     store.activate_thread(&thread_id, &task_a, UtcMillis(2_000));
-    store.mark_thread_idle(&thread_id, UtcMillis(3_000));
+    assert_eq!(store.mark_task_threads_idle(&task_a, UtcMillis(3_000)), 1);
 
     let snapshot = store.thread_registry_snapshot(&session_id);
     assert_eq!(snapshot.len(), 1);
@@ -2557,6 +2557,71 @@ fn thread_registry_activation_tracks_task_ids_without_reuse_lookup() {
         snapshot[0].handled_task_ids,
         vec![task_a],
         "activate_thread 必须累积 task_id"
+    );
+}
+
+#[test]
+fn thread_registry_marks_only_active_threads_for_terminal_task_idle() {
+    let store = SessionStore::new();
+    let session_id = SessionId::new("session-task-terminal");
+    let mission_id = MissionId::new("mission-task-terminal");
+    let target_task_id = TaskId::new("task-terminal-target");
+    let other_task_id = TaskId::new("task-terminal-other");
+
+    for (thread_id, task_id, status) in [
+        (
+            "thread-terminal-target",
+            &target_task_id,
+            ExecutionThreadStatus::Active,
+        ),
+        (
+            "thread-terminal-other",
+            &other_task_id,
+            ExecutionThreadStatus::Active,
+        ),
+        (
+            "thread-terminal-retired",
+            &target_task_id,
+            ExecutionThreadStatus::Retired,
+        ),
+    ] {
+        let thread_id = ThreadId::new(thread_id);
+        let mut thread = sample_thread(
+            thread_id.as_str(),
+            &session_id,
+            &mission_id,
+            "reviewer",
+            UtcMillis(1_000),
+            status,
+        );
+        thread.handled_task_ids.push(task_id.clone());
+        store.register_thread(thread);
+    }
+
+    assert_eq!(
+        store.mark_task_threads_idle(&target_task_id, UtcMillis(3_000)),
+        1
+    );
+
+    let snapshot = store.thread_registry_snapshot(&session_id);
+    let status = |thread_id: &str| {
+        snapshot
+            .iter()
+            .find(|thread| thread.thread_id.as_str() == thread_id)
+            .map(|thread| thread.status)
+            .expect("thread should exist")
+    };
+    assert_eq!(
+        status("thread-terminal-target"),
+        ExecutionThreadStatus::Idle
+    );
+    assert_eq!(
+        status("thread-terminal-other"),
+        ExecutionThreadStatus::Active
+    );
+    assert_eq!(
+        status("thread-terminal-retired"),
+        ExecutionThreadStatus::Retired
     );
 }
 

@@ -1,37 +1,15 @@
 <script lang="ts">
   import {
     addToast,
-    getEnabledAgents,
-    getState,
     messagesState,
   } from '../stores/messages.svelte';
   import Icon from './Icon.svelte';
   import { i18n } from '../stores/i18n.svelte';
   import type {
-    AgentRunProjectionDto,
     GoalTodoItemDto,
     SessionGoalDto,
-    TaskDto,
-    TaskStatus,
   } from '../shared/rust-backend-types';
   import type { IconName } from '../lib/icons';
-  import {
-    getRunnerUserStateLabel,
-    getRunnerUserStateTone,
-    getRunnerUserStateTooltip,
-    getTaskDisplayTitle,
-    getTaskStatusLabel,
-    isUserVisibleTaskKind,
-  } from '../lib/task-labels';
-  import { resolveAgentDisplayName } from '../lib/agent-role-utils';
-  import {
-    ensureAgentRunState,
-    clearAgentRunProjection,
-    fetchAgentRunProjection,
-    getAgentRunState,
-    getAgentRunStatusModifier,
-    refreshAgentRunProjection,
-  } from '../stores/agent-run-store.svelte';
   import {
     ensureGoalState,
     getGoalState,
@@ -40,34 +18,16 @@
   import { RustDaemonClient } from '../shared/rust-daemon-client';
   import { resolveAgentBaseUrl } from '../web/agent-api';
 
-  interface AgentRunAttentionSummary {
-    title: string;
-    hint: string;
-  }
-
-  const appState = getState();
-  const enabledAgents = $derived(getEnabledAgents());
-  const registrySnapshot = $derived(appState.settingsRegistrySnapshot);
-
   const currentSessionId = $derived(messagesState.currentSessionId);
   const currentWorkspaceId = $derived(messagesState.currentWorkspaceId);
   const currentWorkspacePath = $derived(messagesState.currentWorkspacePath);
-  const agentRunState = $derived(getAgentRunState(currentSessionId, currentWorkspaceId));
-  const hasAgentRunProjection = $derived(agentRunState.projection !== null);
-  const hasAgentRunActivity = $derived(Boolean(agentRunState.rootTaskId || agentRunState.projection));
 
   let goalRequestScope = '';
   let goalDrawerExpanded = $state(false);
   let todoDrawerExpanded = $state(true);
-  let agentRunDrawerExpanded = $state(true);
   let isEditingGoal = $state(false);
   let goalObjectiveDraft = $state('');
   let goalActionLoading = $state<'save' | 'pause' | 'resume' | 'clear' | null>(null);
-  let runActionLoading = $state<'stop' | 'resume' | 'restart' | 'archive' | null>(null);
-
-  $effect(() => {
-    ensureAgentRunState(currentSessionId, currentWorkspaceId, currentWorkspacePathValue());
-  });
 
   $effect(() => {
     ensureGoalState(currentSessionId, currentWorkspaceId, currentWorkspacePathValue());
@@ -86,9 +46,9 @@
   });
 
   $effect(() => {
-    const sessionId = currentSessionIdValue() ?? agentRunState.projection?.sessionId ?? null;
-    const workspaceId = currentWorkspaceIdValue() || agentRunState.projection?.workspaceId || '';
-    const workspacePath = currentWorkspacePathValue() || agentRunState.projection?.workspacePath || '';
+    const sessionId = currentSessionIdValue();
+    const workspaceId = currentWorkspaceIdValue();
+    const workspacePath = currentWorkspacePathValue();
     const scope = sessionId ? `${sessionScopeKey(workspaceId, sessionId)}:${workspacePath}` : '';
     if (goalRequestScope === scope) {
       return;
@@ -101,78 +61,12 @@
     return () => clearInterval(timer);
   });
 
-  const agentRunTasks = $derived(agentRunState.projection?.tasks ?? []);
   const hasGoalTodos = $derived(currentGoalTodos.length > 0);
   const todoSummary = $derived.by(() => buildGoalTodoSummary(currentGoalTodos));
   const todoProgressPercent = $derived.by(() => {
     if (todoSummary.total <= 0) return 0;
     return Math.min(100, Math.max(0, Math.round((todoSummary.completed / todoSummary.total) * 100)));
   });
-  const runUnitById = $derived.by(() => new Map(agentRunTasks.map((task) => [task.task_id, task])));
-  const activeAgentRunTasks = $derived.by(() => (
-    agentRunTasks.filter((task) => task.status !== 'killed')
-  ));
-  const childrenByParentId = $derived.by(() => {
-    const grouped = new Map<string, TaskDto[]>();
-    for (const task of activeAgentRunTasks) {
-      if (!task.parent_task_id) continue;
-      const siblings = grouped.get(task.parent_task_id) ?? [];
-      siblings.push(task);
-      grouped.set(task.parent_task_id, siblings);
-    }
-    return grouped;
-  });
-  const userVisibleTasks = $derived.by(() => (
-    activeAgentRunTasks
-      .filter((task) => isUserVisibleTaskKind(task.kind))
-      .filter((task) => !isCoordinationEnvelopeRoot(task, agentRunState.projection))
-      .slice()
-      .sort((left, right) => {
-        if (left.created_at !== right.created_at) return left.created_at - right.created_at;
-        return left.task_id.localeCompare(right.task_id);
-      })
-  ));
-  const displayedAgentRunTasks = $derived.by(() => {
-    if (userVisibleTasks.length > 0) return userVisibleTasks;
-    const rootTask = agentRunState.projection?.root_task;
-    return rootTask && rootTask.status !== 'killed' ? [rootTask] : [];
-  });
-  const runSummary = $derived.by(() => buildRunSummary(agentRunState.projection, userVisibleTasks));
-  const canResumeAgentRun = $derived.by(() => {
-    const projection = agentRunState.projection;
-    return projection?.runner_status === 'error'
-      && projection.has_recoverable_chain === true
-      && (projection.recoverable_branch_count ?? 0) > 0;
-  });
-  const canRestartAgentRun = $derived.by(() => {
-    const status = agentRunState.projection?.runner_status;
-    return status === 'completed' || status === 'error' || status === 'killed' || status === 'idle';
-  });
-  const canArchiveAgentRun = $derived.by(() => canRestartAgentRun);
-  const attentionTasks = $derived.by(() => {
-    const projection = agentRunState.projection;
-    if (!projection) return [];
-    const seen = new Set<string>();
-    return (projection.failed_tasks ?? [])
-      .filter((id) => {
-        if (seen.has(id)) return false;
-        seen.add(id);
-        return true;
-      })
-      .map((id) => runUnitById.get(id))
-      .filter((task): task is TaskDto => Boolean(task));
-  });
-  const attentionSummary = $derived.by(() => buildAgentRunAttentionSummary(
-    agentRunState.projection,
-    attentionTasks,
-    canResumeAgentRun,
-  ));
-  const runnerBlockedReason = $derived(attentionSummary?.title ?? null);
-  const progressPercent = $derived.by(() => {
-    if (runSummary.total <= 0) return 0;
-    return Math.min(100, Math.max(0, Math.round((runSummary.completed / runSummary.total) * 100)));
-  });
-
   function createClient(): RustDaemonClient {
     return new RustDaemonClient(resolveAgentBaseUrl());
   }
@@ -212,58 +106,6 @@
     return workspaceId ? `${workspaceId}\u0000${sessionId}` : `session:${sessionId}`;
   }
 
-  function currentRootTaskId(): string | null {
-    return agentRunState.projection?.root_task.task_id ?? null;
-  }
-
-  function getTaskExecutorDisplayName(task: TaskDto): string {
-    const roleId = task.executor_binding?.target_role?.trim() ?? '';
-    if (!roleId) return '';
-    return resolveAgentDisplayName(roleId, enabledAgents, registrySnapshot, (key) => i18n.t(key)) || roleId;
-  }
-
-  function getTaskPerformerLabel(task: TaskDto): string {
-    const executorName = getTaskExecutorDisplayName(task);
-    if (executorName) return executorName;
-    switch (task.kind) {
-      case 'local_workflow': return i18n.t('goalPanel.performer.localWorkflow');
-      case 'remote_agent': return i18n.t('goalPanel.performer.remoteAgent');
-      case 'monitor_mcp': return 'MCP';
-      case 'in_process_teammate': return i18n.t('goalPanel.performer.teammate');
-      case 'dream': return i18n.t('goalPanel.performer.background');
-      default: return i18n.t('goalPanel.performer.agent');
-    }
-  }
-
-  function isCoordinationEnvelopeRoot(
-    task: TaskDto,
-    projection: AgentRunProjectionDto | null,
-  ): boolean {
-    if (!projection || task.task_id !== projection.root_task.task_id) {
-      return false;
-    }
-    return (childrenByParentId.get(task.task_id) ?? [])
-      .filter((child) => child.status !== 'killed')
-      .some((child) => isUserVisibleTaskKind(child.kind));
-  }
-
-  function buildRunSummary(
-    projection: AgentRunProjectionDto | null,
-    visibleTasks: TaskDto[],
-  ) {
-    if (visibleTasks.length > 0) {
-      return {
-        total: visibleTasks.length,
-        completed: visibleTasks.filter((task) => task.status === 'completed').length,
-      };
-    }
-    const progress = projection?.progress_summary;
-    return {
-      total: progress?.total_tasks ?? 0,
-      completed: progress?.completed_tasks ?? 0,
-    };
-  }
-
   function buildGoalTodoSummary(items: GoalTodoItemDto[]) {
     return {
       total: items.length,
@@ -299,40 +141,6 @@
     return activeForm && activeForm !== todo.content.trim()
       ? activeForm
       : goalTodoStatusLabel(todo.status);
-  }
-
-  function buildAgentRunAttentionSummary(
-    projection: AgentRunProjectionDto | null,
-    failedTasks: TaskDto[],
-    canResume: boolean,
-  ): AgentRunAttentionSummary | null {
-    if (!projection) return null;
-    const failedCount = failedTasks.length;
-    if (projection.runner_status !== 'error' && failedCount === 0) return null;
-
-    const rootTaskId = projection.root_task.task_id;
-    const rootFailed = failedTasks.some((task) => task.task_id === rootTaskId);
-    const agentFailedCount = failedTasks
-      .filter((task) => task.kind === 'local_agent' && task.task_id !== rootTaskId)
-      .length;
-
-    let title = i18n.t('goalPanel.attention.executionIncomplete');
-    if (rootFailed && agentFailedCount > 0) {
-      title = i18n.t('goalPanel.attention.mainAndAgentsIncomplete', { count: agentFailedCount });
-    } else if (rootFailed) {
-      title = i18n.t('goalPanel.attention.mainIncomplete');
-    } else if (agentFailedCount > 0 && agentFailedCount === failedCount) {
-      title = i18n.t('goalPanel.attention.agentsIncomplete', { count: agentFailedCount });
-    } else if (failedCount > 0) {
-      title = i18n.t('goalPanel.attention.tasksIncomplete', { count: failedCount });
-    }
-
-    return {
-      title,
-      hint: canResume
-        ? i18n.t('goalPanel.attention.resumeHint')
-        : i18n.t('goalPanel.attention.restartHint'),
-    };
   }
 
   function goalStatusLabel(status: string): string {
@@ -503,118 +311,9 @@
     });
   }
 
-  function getAgentRunStatusIcon(status: TaskStatus): { name: IconName; spinning: boolean } {
-    switch (status) {
-      case 'running': return { name: 'loader', spinning: true };
-      case 'completed': return { name: 'check-circle', spinning: false };
-      case 'failed': return { name: 'x-circle', spinning: false };
-      case 'killed': return { name: 'skip-forward', spinning: false };
-      case 'pending': return { name: 'circleOutline', spinning: false };
-      default: return { name: 'circleOutline', spinning: false };
-    }
-  }
-
-  async function runAgentRunAction(
-    action: 'stop' | 'resume' | 'restart' | 'archive',
-    task: () => Promise<void>,
-  ) {
-    if (runActionLoading) return;
-    runActionLoading = action;
-    try {
-      await task();
-    } finally {
-      if (runActionLoading === action) {
-        runActionLoading = null;
-      }
-    }
-  }
-
-  function reportAgentRunActionFailure(labelKey: string, error: unknown): void {
-    console.warn('[GoalRunDrawers] agent run action failed:', error);
-    addToast('error', i18n.t(labelKey));
-  }
-
-  async function stopCurrentAgentRun() {
-    const sessionId = currentSessionIdValue();
-    const rootTaskId = currentRootTaskId();
-    if (!sessionId || !rootTaskId) return;
-    await runAgentRunAction('stop', async () => {
-      const client = createClient();
-      await client.interruptAgentRun({
-        taskId: rootTaskId,
-        sessionId,
-        workspaceId: currentWorkspaceIdValue(),
-        workspacePath: currentWorkspacePathValue(),
-      });
-      await refreshAgentRunProjection(sessionId, currentWorkspaceIdValue(), currentWorkspacePathValue());
-      addToast('info', i18n.t('goalPanel.action.stopped'));
-    }).catch((err) => {
-      reportAgentRunActionFailure('goalPanel.action.stopFailed', err);
-    });
-  }
-
-  async function resumeCurrentAgentRun() {
-    const sessionId = currentSessionIdValue();
-    const rootTaskId = currentRootTaskId();
-    if (!sessionId || !rootTaskId) return;
-    await runAgentRunAction('resume', async () => {
-      const client = createClient();
-      await client.continueSession({
-        sessionId,
-        workspaceId: currentWorkspaceIdValue(),
-        workspacePath: currentWorkspacePathValue(),
-      });
-      await refreshAgentRunProjection(sessionId, currentWorkspaceIdValue(), currentWorkspacePathValue());
-      addToast('success', i18n.t('goalPanel.action.resumed'));
-    }).catch((err) => {
-      reportAgentRunActionFailure('goalPanel.action.resumeFailed', err);
-    });
-  }
-
-  async function restartCurrentAgentRun() {
-    const sessionId = currentSessionIdValue();
-    const rootTaskId = currentRootTaskId();
-    if (!sessionId || !rootTaskId) return;
-    await runAgentRunAction('restart', async () => {
-      const client = createClient();
-      const result = await client.restartAgentRun({
-        taskId: rootTaskId,
-        sessionId,
-        workspaceId: currentWorkspaceIdValue(),
-        workspacePath: currentWorkspacePathValue(),
-      });
-      if (result.rootTaskId) {
-        await fetchAgentRunProjection(sessionId, result.rootTaskId, currentWorkspaceIdValue(), currentWorkspacePathValue());
-      } else {
-        await refreshAgentRunProjection(sessionId, currentWorkspaceIdValue(), currentWorkspacePathValue());
-      }
-      addToast('success', i18n.t('goalPanel.action.restarted'));
-    }).catch((err) => {
-      reportAgentRunActionFailure('goalPanel.action.restartFailed', err);
-    });
-  }
-
-  async function archiveCurrentAgentRun() {
-    const sessionId = currentSessionIdValue();
-    const rootTaskId = currentRootTaskId();
-    if (!sessionId || !rootTaskId) return;
-    await runAgentRunAction('archive', async () => {
-      const client = createClient();
-      await client.archiveAgentRun({
-        taskId: rootTaskId,
-        sessionId,
-        workspaceId: currentWorkspaceIdValue(),
-        workspacePath: currentWorkspacePathValue(),
-      });
-      clearAgentRunProjection(sessionId, rootTaskId, currentWorkspaceIdValue());
-      addToast('info', i18n.t('goalPanel.action.archived'));
-    }).catch((err) => {
-      reportAgentRunActionFailure('goalPanel.action.archiveFailed', err);
-    });
-  }
 </script>
 
-{#if currentGoal || hasGoalTodos || hasAgentRunProjection || agentRunState.error || (agentRunState.loading && hasAgentRunActivity)}
+{#if currentGoal || hasGoalTodos}
 <div class="goal-run-drawers">
   {#if hasGoalTodos}
     <section class="run-drawer todo-panel" data-testid="todo-card" aria-label={i18n.t('goalPanel.todo.title')}>
@@ -785,141 +484,6 @@
     </section>
   {/if}
 
-  {#if hasAgentRunProjection}
-    {@const projection = agentRunState.projection}
-    {#if projection}
-      <section class="run-drawer agent-run-panel" aria-label={i18n.t('goalPanel.progress.title')}>
-        <div class="run-drawer-header">
-          <button
-            type="button"
-            class="run-drawer-toggle"
-            aria-expanded={agentRunDrawerExpanded}
-            onclick={() => agentRunDrawerExpanded = !agentRunDrawerExpanded}
-          >
-            <Icon name="list" size={14} />
-            <span class="run-drawer-title">{i18n.t('goalPanel.progress.title')}</span>
-            {#if runSummary.total > 0}
-              <span class="run-progress-count">
-                {i18n.t('goalPanel.progress.completedCount', {
-                  completed: runSummary.completed,
-                  total: runSummary.total,
-                })}
-              </span>
-            {/if}
-            <Icon name="chevron-right" size={13} class={agentRunDrawerExpanded ? 'drawer-chevron drawer-chevron--open' : 'drawer-chevron'} />
-          </button>
-
-          <div class="run-actions">
-            <span
-              class="status-badge status-badge--{getRunnerUserStateTone(projection.runner_status)}"
-              title={getRunnerUserStateTooltip(projection.runner_status, runnerBlockedReason) ?? ''}
-            >
-              {getRunnerUserStateLabel(projection.runner_status)}
-            </span>
-            {#if projection.runner_status === 'running'}
-              <button
-                type="button"
-                class="run-action"
-                disabled={runActionLoading !== null}
-                onclick={stopCurrentAgentRun}
-                title={i18n.t('goalPanel.action.stopTitle')}
-              >
-                <Icon name={runActionLoading === 'stop' ? 'loader' : 'stop'} size={12} class={runActionLoading === 'stop' ? 'spinning' : ''} />
-                <span>{i18n.t('goalPanel.action.stop')}</span>
-              </button>
-            {:else if canResumeAgentRun}
-              <button
-                type="button"
-                class="run-action"
-                disabled={runActionLoading !== null}
-                onclick={resumeCurrentAgentRun}
-                title={i18n.t('goalPanel.action.resumeTitle')}
-              >
-                <Icon name={runActionLoading === 'resume' ? 'loader' : 'play'} size={12} class={runActionLoading === 'resume' ? 'spinning' : ''} />
-                <span>{i18n.t('goalPanel.action.resume')}</span>
-              </button>
-            {/if}
-            {#if canRestartAgentRun}
-              <button
-                type="button"
-                class="run-action"
-                disabled={runActionLoading !== null}
-                onclick={restartCurrentAgentRun}
-                title={i18n.t('goalPanel.action.restartTitle')}
-              >
-                <Icon name={runActionLoading === 'restart' ? 'loader' : 'refresh'} size={12} class={runActionLoading === 'restart' ? 'spinning' : ''} />
-                <span>{i18n.t('goalPanel.action.restart')}</span>
-              </button>
-            {/if}
-            {#if canArchiveAgentRun}
-              <button
-                type="button"
-                class="run-action run-action--quiet"
-                disabled={runActionLoading !== null}
-                onclick={archiveCurrentAgentRun}
-                title={i18n.t('goalPanel.action.archiveTitle')}
-              >
-                <Icon name={runActionLoading === 'archive' ? 'loader' : 'eye-slash'} size={12} class={runActionLoading === 'archive' ? 'spinning' : ''} />
-                <span>{i18n.t('goalPanel.action.archive')}</span>
-              </button>
-            {/if}
-          </div>
-        </div>
-
-        {#if agentRunDrawerExpanded}
-          {#if runSummary.total > 0}
-            <div class="run-progress-bar" aria-hidden="true">
-              <span style="width: {progressPercent}%"></span>
-            </div>
-          {/if}
-
-          {#if attentionSummary}
-            <div class="run-attention">
-              <Icon name="alert-triangle" size={13} />
-              <span>
-                <strong>{attentionSummary.title}</strong>
-                <em>{attentionSummary.hint}</em>
-              </span>
-            </div>
-          {/if}
-
-          {#if displayedAgentRunTasks.length > 0}
-            <div class="run-list" role="list">
-              {#each displayedAgentRunTasks as task (task.task_id)}
-                {@const statusIcon = getAgentRunStatusIcon(task.status)}
-                {@const performerLabel = getTaskPerformerLabel(task)}
-                <div class="run-row run-row--{getAgentRunStatusModifier(task.status)}" role="listitem">
-                  <span class="run-row-icon status-icon--{getAgentRunStatusModifier(task.status)}" aria-label={getTaskStatusLabel(task.status)}>
-                    {#if statusIcon.spinning}
-                      <Icon name={statusIcon.name} size={15} class="spinning" />
-                    {:else}
-                      <Icon name={statusIcon.name} size={15} />
-                    {/if}
-                  </span>
-                  <span class="run-row-main">
-                    <span class="run-row-title">{getTaskDisplayTitle(task)}</span>
-                    <span class="run-row-meta">{performerLabel} · {getTaskStatusLabel(task.status)}</span>
-                  </span>
-                </div>
-              {/each}
-            </div>
-          {/if}
-        {/if}
-      </section>
-    {/if}
-  {/if}
-
-  {#if agentRunState.error}
-    <div class="run-error">{i18n.t('goalPanel.projectionLoadFailed')}</div>
-  {/if}
-
-  {#if agentRunState.loading && hasAgentRunActivity && !hasAgentRunProjection}
-    <div class="run-loading" role="status" aria-live="polite">
-      <Icon name="loader" size={16} class="spinning" />
-      <span>{i18n.t('common.loading')}</span>
-    </div>
-  {/if}
-
 </div>
 {/if}
 
@@ -976,11 +540,6 @@
     order: 1;
   }
 
-  .agent-run-panel {
-    order: 2;
-    background: color-mix(in srgb, var(--background) 88%, var(--surface-1));
-  }
-
   .run-drawer-header {
     display: flex;
     align-items: center;
@@ -1006,7 +565,6 @@
 
   .run-drawer-toggle:focus-visible,
   .icon-action:focus-visible,
-  .run-action:focus-visible,
   .goal-edit-button:focus-visible,
   .goal-edit-input:focus-visible {
     outline: 2px solid color-mix(in srgb, var(--primary) 58%, transparent);
@@ -1101,8 +659,7 @@
     white-space: nowrap;
   }
 
-  .goal-meta,
-  .run-actions {
+  .goal-meta {
     display: flex;
     align-items: center;
     flex-wrap: wrap;
@@ -1286,79 +843,6 @@
     white-space: nowrap;
   }
 
-  .run-actions {
-    justify-content: flex-end;
-    flex: 0 0 auto;
-  }
-
-  .run-action {
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-    height: 26px;
-    padding: 0 var(--space-2);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
-    background: transparent;
-    color: var(--foreground);
-    font-size: var(--text-2xs);
-    font-weight: var(--font-medium);
-    cursor: pointer;
-    transition:
-      background var(--transition-fast),
-      border-color var(--transition-fast),
-      color var(--transition-fast);
-  }
-
-  .run-action:hover:not(:disabled) {
-    border-color: color-mix(in srgb, var(--primary) 30%, var(--border));
-    color: var(--primary);
-  }
-
-  .run-action--quiet {
-    color: var(--foreground-muted);
-  }
-
-  .run-action:disabled {
-    opacity: 0.55;
-    cursor: not-allowed;
-  }
-
-  .status-badge {
-    flex-shrink: 0;
-    padding: 2px 8px;
-    border: 1px solid transparent;
-    border-radius: var(--radius-full);
-    font-size: var(--text-2xs);
-    white-space: nowrap;
-  }
-
-  .status-badge--running {
-    color: var(--primary);
-    background: var(--primary-muted);
-    border-color: color-mix(in srgb, var(--primary) 30%, var(--border));
-  }
-
-  .status-badge--completed {
-    color: var(--success);
-    background: var(--success-muted);
-    border-color: color-mix(in srgb, var(--success) 32%, var(--border));
-  }
-
-  .status-badge--failed {
-    color: var(--error);
-    background: var(--error-muted);
-    border-color: color-mix(in srgb, var(--error) 32%, var(--border));
-  }
-
-  .status-badge--pending,
-  .status-badge--killed,
-  .status-badge--unknown {
-    color: var(--foreground-muted);
-    background: transparent;
-    border-color: var(--border);
-  }
-
   .run-progress-bar {
     overflow: hidden;
     width: 100%;
@@ -1379,46 +863,6 @@
     background: var(--success);
   }
 
-  .run-attention {
-    display: flex;
-    align-items: flex-start;
-    gap: var(--space-2);
-    min-height: 30px;
-    padding: var(--space-1) var(--space-2);
-    border: 1px solid color-mix(in srgb, var(--error) 24%, var(--border));
-    border-radius: var(--radius-sm);
-    background: var(--background);
-    color: var(--foreground-muted);
-    font-size: var(--text-2xs);
-    line-height: 1.45;
-  }
-
-  .run-attention :global(svg) {
-    flex: 0 0 auto;
-    margin-top: 2px;
-    color: var(--error);
-  }
-
-  .run-attention span {
-    display: flex;
-    flex-direction: column;
-    gap: 1px;
-    min-width: 0;
-  }
-
-  .run-attention strong {
-    color: var(--foreground);
-    font-size: var(--text-xs);
-    font-style: normal;
-    font-weight: var(--font-semibold);
-  }
-
-  .run-attention em {
-    color: var(--foreground-muted);
-    font-size: var(--text-2xs);
-    font-style: normal;
-  }
-
   .run-list {
     display: flex;
     flex-direction: column;
@@ -1426,8 +870,7 @@
     min-width: 0;
   }
 
-  .todo-list,
-  .agent-run-panel .run-list {
+  .todo-list {
     max-height: min(32vh, 280px);
     overflow-y: auto;
     overscroll-behavior: contain;
@@ -1444,14 +887,6 @@
     border: 1px solid transparent;
     border-radius: var(--radius-sm);
     color: var(--foreground);
-  }
-
-  .run-row--failed {
-    border-color: color-mix(in srgb, var(--error) 24%, transparent);
-  }
-
-  .run-row--completed {
-    opacity: 0.76;
   }
 
   .run-row--todo {
@@ -1471,13 +906,9 @@
     flex-shrink: 0;
   }
 
-  .status-icon--running { color: var(--primary); }
   .status-icon--in_progress { color: var(--primary); }
   .status-icon--completed { color: var(--success); }
-  .status-icon--failed { color: var(--error); }
-  .status-icon--pending,
-  .status-icon--killed,
-  .status-icon--unknown { color: var(--foreground-muted); }
+  .status-icon--pending { color: var(--foreground-muted); }
 
   .run-row-main {
     display: flex;
@@ -1505,27 +936,6 @@
     color: var(--foreground-muted);
     font-size: var(--text-2xs);
     line-height: var(--leading-tight);
-  }
-
-  .run-loading,
-  .run-error {
-    display: inline-flex;
-    align-items: center;
-    gap: var(--space-2);
-    padding: var(--space-2) var(--space-3);
-    border-radius: var(--radius-md);
-    font-size: var(--text-xs);
-  }
-
-  .run-loading {
-    color: var(--foreground-muted);
-    background: var(--surface-1);
-  }
-
-  .run-error {
-    color: var(--error);
-    background: var(--error-muted);
-    border: 1px solid color-mix(in srgb, var(--error) 32%, var(--border));
   }
 
   :global(.spinning) {
@@ -1572,22 +982,6 @@
     .icon-action {
       width: 28px;
       height: 28px;
-    }
-
-    .run-actions {
-      flex-wrap: nowrap;
-      gap: 3px;
-    }
-
-    .run-action span,
-    .status-badge {
-      display: none;
-    }
-
-    .run-action {
-      width: 28px;
-      padding: 0;
-      justify-content: center;
     }
 
     .goal-edit-form {

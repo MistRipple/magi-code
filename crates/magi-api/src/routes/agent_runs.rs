@@ -7,9 +7,7 @@ use magi_core::{
     AccessProfile, AgentRunProjection, MissionId, TASK_RUNTIME_FAILURE_PUBLIC_OUTPUT, Task, TaskId,
     TaskKind, TaskStatus, TaskTier, public_task_output_refs,
 };
-use magi_session_store::{
-    ActiveExecutionChain, ExecutionThread, ExecutionThreadStatus, ORCHESTRATOR_ROLE_ID,
-};
+use magi_session_store::{ActiveExecutionChain, ExecutionThread, ORCHESTRATOR_ROLE_ID};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -272,7 +270,7 @@ fn agent_projection_from_task(
             model_source: "unconfigured".to_string(),
             ..AgentModelBinding::default()
         });
-    let (status, lifecycle) = agent_runtime_status(task, thread);
+    let (status, lifecycle) = agent_runtime_status(task);
     AgentProjectionDto {
         agent_run_id: task.task_id.to_string(),
         parent_task_id: task
@@ -316,13 +314,7 @@ fn agent_projection_from_task(
     }
 }
 
-fn agent_runtime_status(
-    task: &Task,
-    thread: Option<&ExecutionThread>,
-) -> (&'static str, &'static str) {
-    if thread.is_some_and(|thread| thread.status == ExecutionThreadStatus::Active) {
-        return ("running", "running");
-    }
+fn agent_runtime_status(task: &Task) -> (&'static str, &'static str) {
     (task_status_slug(task.status), agent_lifecycle(task))
 }
 
@@ -657,7 +649,7 @@ mod tests {
     use magi_event_bus::InMemoryEventBus;
     use magi_governance::GovernanceService;
     use magi_orchestrator::task_store::TaskStore;
-    use magi_session_store::SessionStore;
+    use magi_session_store::{ExecutionThreadStatus, SessionStore};
     use magi_workspace::WorkspaceStore;
     use std::sync::Arc;
 
@@ -753,6 +745,32 @@ mod tests {
             public_projection.tasks[0].output_refs,
             vec!["测试失败：断言不匹配".to_string()]
         );
+    }
+
+    #[test]
+    fn completed_agent_task_cannot_be_reported_as_running_by_active_thread() {
+        let mission_id = MissionId::new("mission-agent-terminal-status");
+        let session_id = SessionId::new("session-agent-terminal-status");
+        let mut task = test_task("task-agent-terminal-status", &mission_id);
+        task.status = TaskStatus::Completed;
+        task.parent_task_id = Some(TaskId::new("task-agent-terminal-parent"));
+        let thread = ExecutionThread {
+            thread_id: magi_core::ThreadId::new("thread-agent-terminal-status"),
+            session_id,
+            mission_id,
+            role_id: "reviewer".to_string(),
+            worker_instance_id: magi_core::WorkerId::new("worker-agent-terminal-status"),
+            status: ExecutionThreadStatus::Active,
+            created_at: UtcMillis(1),
+            last_used_at: UtcMillis(2),
+            handled_task_ids: vec![task.task_id.clone()],
+            message_history: Vec::new(),
+        };
+        let projection =
+            agent_projection_from_task(&task, None, Some(&thread), None, &HashMap::new());
+
+        assert_eq!(projection.status, "completed");
+        assert_eq!(projection.lifecycle, "completed");
     }
 
     #[test]

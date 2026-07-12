@@ -778,20 +778,25 @@ impl SessionStore {
         }
     }
 
-    /// 将 thread 标记为 `Idle`（task 完成后的终态标记，不参与新 task 复用）。
-    pub fn mark_thread_idle(&self, thread_id: &ThreadId, now: UtcMillis) {
+    /// 将处理指定 task 且仍为 `Active` 的 thread 原子收口为 `Idle`。
+    pub fn mark_task_threads_idle(&self, task_id: &TaskId, now: UtcMillis) -> usize {
         let mut state = self
             .state
             .write()
             .expect("session state write lock poisoned");
-        if let Some(thread) = state
-            .thread_registry
-            .iter_mut()
-            .find(|thread| &thread.thread_id == thread_id)
-        {
+        let mut settled = 0;
+        for thread in state.thread_registry.iter_mut().filter(|thread| {
+            thread.status == ExecutionThreadStatus::Active
+                && thread
+                    .handled_task_ids
+                    .iter()
+                    .any(|handled| handled == task_id)
+        }) {
             thread.status = ExecutionThreadStatus::Idle;
             thread.last_used_at = now;
+            settled += 1;
         }
+        settled
     }
 
     /// Mission 结束或显式回收时调用：session 下所有 thread 标记为 `Retired`。

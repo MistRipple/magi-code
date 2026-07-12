@@ -53,8 +53,6 @@ import type {
   RoleTemplatesResponseDto,
   RuntimeReadModelDto,
   SavedResponseDto,
-  SessionContinueRequestDto,
-  SessionContinueResponseDto,
   SessionCloseRequestDto,
   SessionDeleteRequestDto,
   SessionInterruptRequestDto,
@@ -69,10 +67,8 @@ import type {
   SkillsConfigSaveResponseDto,
   SkillsLibraryResponseDto,
   SkillUpdateResponseDto,
-  TaskArchiveResponseDto,
   TaskInterruptResponseDto,
   AgentRunProjectionDto,
-  TaskRestartResponseDto,
   UpdatedResponseDto,
   VersionHandshakeDto,
   WorkspaceListResponseDto,
@@ -133,12 +129,6 @@ export class RustDaemonClient {
     return this.postJson<SessionTurnResponseDto>('/api/session/turn', request);
   }
 
-  public async continueSession(
-    request: SessionContinueRequestDto,
-  ): Promise<SessionContinueResponseDto> {
-    return this.postJson<SessionContinueResponseDto>('/api/session/continue', request);
-  }
-
   public async interruptSession(
     request: SessionInterruptRequestDto,
   ): Promise<SessionInterruptResponseDto> {
@@ -149,18 +139,6 @@ export class RustDaemonClient {
     request: unknown,
   ): Promise<TaskInterruptResponseDto> {
     return this.postJson<TaskInterruptResponseDto>('/api/agent-runs/interrupt', request);
-  }
-
-  public async restartAgentRun(
-    request: unknown,
-  ): Promise<TaskRestartResponseDto> {
-    return this.postJson<TaskRestartResponseDto>('/api/agent-runs/restart', request);
-  }
-
-  public async archiveAgentRun(
-    request: unknown,
-  ): Promise<TaskArchiveResponseDto> {
-    return this.postJson<TaskArchiveResponseDto>('/api/agent-runs/archive', request);
   }
 
   // ─── Session management ───────────────────────────────────────────
