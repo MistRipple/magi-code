@@ -160,12 +160,10 @@ impl DynamicWorkerCatalog {
         workers
             .values()
             .filter(|w| {
-                let role_match = match required_role {
-                    Some(role) => w.role == role,
-                    None => false,
-                };
                 let kind_match = w.supported_kinds.contains(&task.kind);
-                role_match || kind_match
+                required_role
+                    .map(|role| w.role == role && kind_match)
+                    .unwrap_or(kind_match)
             })
             .cloned()
             .collect()
@@ -292,6 +290,46 @@ mod tests {
         };
 
         assert_eq!(resolve_task_role(&task, &reg), Some("tester"));
+        let catalog = DynamicWorkerCatalog::with_registry(&reg);
+        let candidates = catalog.find_for_task(&task, &reg);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].role, "tester");
+    }
+
+    #[test]
+    fn coordinator_task_only_matches_coordinator_worker() {
+        let reg = registry();
+        let catalog = DynamicWorkerCatalog::with_registry(&reg);
+        let mut task = Task {
+            task_id: magi_core::TaskId::new("t-coordinator"),
+            mission_id: magi_core::MissionId::new("m-coordinator"),
+            root_task_id: magi_core::TaskId::new("t-coordinator"),
+            parent_task_id: None,
+            kind: TaskKind::LocalAgent,
+            title: "coordinate agents".to_string(),
+            goal: "spawn multiple agents".to_string(),
+            status: magi_core::TaskStatus::Pending,
+            dependency_ids: Vec::new(),
+            required_children: Vec::new(),
+            policy_snapshot: None,
+            executor_binding: None,
+            knowledge_refs: Vec::new(),
+            workspace_scope: None,
+            write_scope: None,
+            input_refs: Vec::new(),
+            output_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            retry_count: 0,
+            runtime_payload: magi_core::TaskRuntimePayload::default(),
+            created_at: magi_core::UtcMillis::now(),
+            updated_at: magi_core::UtcMillis::now(),
+        };
+        task.executor_binding = Some(magi_core::TaskExecutorBinding::for_role("coordinator"));
+
+        let candidates = catalog.find_for_task(&task, &reg);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].role, "coordinator");
     }
 
     #[test]

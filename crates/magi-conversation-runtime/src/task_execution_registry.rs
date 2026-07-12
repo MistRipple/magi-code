@@ -22,9 +22,7 @@ use magi_spawn_graph::SpawnGraph;
 
 use crate::{session_images::SessionTurnImage, session_thread};
 
-pub const DEFAULT_MAX_ACTIVE_AGENT_BRANCHES_PER_SESSION: usize = 4;
-const MIN_ACTIVE_AGENT_BRANCHES_PER_SESSION: usize = 2;
-const MAX_CONFIGURED_ACTIVE_AGENT_BRANCHES_PER_SESSION: usize = 16;
+pub const DEFAULT_MAX_ACTIVE_AGENTS_PER_ROLE: usize = 5;
 
 #[derive(Clone, Debug)]
 pub enum TaskExecutionPlan {
@@ -55,23 +53,6 @@ impl TaskExecutionPlan {
             } => execution_settings_snapshot.clone(),
         }
     }
-
-    fn max_active_agent_branches(&self) -> usize {
-        self.execution_settings_snapshot()
-            .and_then(|settings| {
-                settings
-                    .get_section("orchestrator")
-                    .get("maxActiveAgentBranches")
-                    .and_then(serde_json::Value::as_u64)
-            })
-            .map(|limit| {
-                (limit as usize).clamp(
-                    MIN_ACTIVE_AGENT_BRANCHES_PER_SESSION,
-                    MAX_CONFIGURED_ACTIVE_AGENT_BRANCHES_PER_SESSION,
-                )
-            })
-            .unwrap_or(DEFAULT_MAX_ACTIVE_AGENT_BRANCHES_PER_SESSION)
-    }
 }
 
 pub struct SpawnedChildExecutionRequest<'a> {
@@ -94,16 +75,24 @@ pub struct SpawnedChildExecution {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SpawnedChildExecutionError {
-    CapacityExceeded { active: usize, limit: usize },
+    RoleCapacityExceeded {
+        role: String,
+        active: usize,
+        limit: usize,
+    },
     InvalidState(String),
 }
 
 impl std::fmt::Display for SpawnedChildExecutionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::CapacityExceeded { active, limit } => write!(
+            Self::RoleCapacityExceeded {
+                role,
+                active,
+                limit,
+            } => write!(
                 f,
-                "当前会话已达到多代理并发上限：最多 {limit} 条活跃执行分支（含主线），当前 {active} 条"
+                "角色 {role} 已达到代理实例上限：最多 {limit} 个活跃实例，当前 {active} 个"
             ),
             Self::InvalidState(message) => f.write_str(message),
         }
@@ -243,15 +232,18 @@ impl TaskExecutionRegistry {
                 child_task.task_id
             ))
         })?;
-        let max_active_branches = self
-            .get(&parent_task_id)
-            .map(|plan| plan.max_active_agent_branches())
-            .unwrap_or(DEFAULT_MAX_ACTIVE_AGENT_BRANCHES_PER_SESSION);
-        let active_branch_count = active_execution_branch_count(task_store, &chain);
-        if active_branch_count >= max_active_branches {
-            return Err(SpawnedChildExecutionError::CapacityExceeded {
-                active: active_branch_count,
-                limit: max_active_branches,
+        let active_role_agent_count = active_execution_agent_count_for_role(
+            task_store,
+            session_store,
+            session_id,
+            &chain,
+            role,
+        );
+        if active_role_agent_count >= DEFAULT_MAX_ACTIVE_AGENTS_PER_ROLE {
+            return Err(SpawnedChildExecutionError::RoleCapacityExceeded {
+                role: role.to_string(),
+                active: active_role_agent_count,
+                limit: DEFAULT_MAX_ACTIVE_AGENTS_PER_ROLE,
             });
         }
         spawn_graph
@@ -371,15 +363,19 @@ impl TaskExecutionRegistry {
     }
 }
 
-fn active_execution_branch_count(
+fn active_execution_agent_count_for_role(
     task_store: &TaskStore,
+    session_store: &SessionStore,
+    session_id: &SessionId,
     chain: &magi_session_store::ActiveExecutionChain,
+    role: &str,
 ) -> usize {
+    let threads = session_store.thread_registry_snapshot(session_id);
     chain
         .branches
         .iter()
         .filter(|branch| {
-            task_store
+            let is_active = task_store
                 .get_task(&branch.task_id)
                 .map(|task| {
                     matches!(
@@ -387,7 +383,11 @@ fn active_execution_branch_count(
                         magi_core::TaskStatus::Pending | magi_core::TaskStatus::Running
                     )
                 })
-                .unwrap_or(true)
+                .unwrap_or(true);
+            is_active
+                && threads
+                    .iter()
+                    .any(|thread| thread.thread_id == branch.thread_id && thread.role_id == role)
         })
         .count()
 }
@@ -493,10 +493,6 @@ mod tests {
             .expect("active chain should be accepted");
 
         let parent_settings = SettingsStore::new();
-        parent_settings.set_section(
-            "orchestrator",
-            serde_json::json!({ "maxActiveAgentBranches": 6 }),
-        );
         let parent_settings_snapshot = Arc::new(parent_settings.execution_snapshot());
         registry.insert(
             root_task_id.clone(),
@@ -561,7 +557,6 @@ mod tests {
         let plan = registry
             .get(&child.task_id)
             .expect("child execution plan should be registered atomically");
-        assert_eq!(plan.max_active_agent_branches(), 6);
         match plan {
             TaskExecutionPlan::Dispatch {
                 thread_id,
@@ -650,7 +645,7 @@ mod tests {
     }
 
     #[test]
-    fn spawned_local_agent_child_registration_enforces_session_branch_capacity() {
+    fn spawned_local_agent_child_registration_allows_five_agents_per_role() {
         let task_store = TaskStore::new();
         let spawn_graph = Mutex::new(SpawnGraph::new());
         let session_store = SessionStore::new();
@@ -710,28 +705,30 @@ mod tests {
             )
             .expect("active chain should be accepted");
 
-        for index in 0..3 {
-            let child = test_task(
-                &format!("task-child-capacity-{index}"),
-                root_task_id.as_str(),
-                &mission_id,
-            );
-            registry
-                .register_spawned_local_agent_child(SpawnedChildExecutionRequest {
-                    task_store: &task_store,
-                    spawn_graph: &spawn_graph,
-                    session_store: &session_store,
-                    child_task: &child,
-                    session_id: &session_id,
-                    workspace_id: &workspace_id,
-                    role: "executor",
-                    now: UtcMillis(now.0 + index as u64 + 1),
-                })
-                .expect("前三个子代理应允许创建");
+        for (role_index, role) in ["executor", "reviewer"].into_iter().enumerate() {
+            for instance_index in 0..5 {
+                let child = test_task(
+                    &format!("task-child-capacity-{role}-{instance_index}"),
+                    root_task_id.as_str(),
+                    &mission_id,
+                );
+                registry
+                    .register_spawned_local_agent_child(SpawnedChildExecutionRequest {
+                        task_store: &task_store,
+                        spawn_graph: &spawn_graph,
+                        session_store: &session_store,
+                        child_task: &child,
+                        session_id: &session_id,
+                        workspace_id: &workspace_id,
+                        role,
+                        now: UtcMillis(now.0 + (role_index * 5 + instance_index) as u64 + 1),
+                    })
+                    .expect("默认容量应允许每个角色同时运行五个代理实例");
+            }
         }
 
         let overflow_child = test_task(
-            "task-child-capacity-overflow",
+            "task-child-capacity-executor-overflow",
             root_task_id.as_str(),
             &mission_id,
         );
@@ -746,13 +743,14 @@ mod tests {
                 role: "executor",
                 now: UtcMillis(now.0 + 10),
             })
-            .expect_err("第四个并发子代理应被容量上限拒绝");
+            .expect_err("同一角色的第六个并发代理应被角色实例上限拒绝");
 
         assert_eq!(
             error,
-            SpawnedChildExecutionError::CapacityExceeded {
-                active: DEFAULT_MAX_ACTIVE_AGENT_BRANCHES_PER_SESSION,
-                limit: DEFAULT_MAX_ACTIVE_AGENT_BRANCHES_PER_SESSION,
+            SpawnedChildExecutionError::RoleCapacityExceeded {
+                role: "executor".to_string(),
+                active: DEFAULT_MAX_ACTIVE_AGENTS_PER_ROLE,
+                limit: DEFAULT_MAX_ACTIVE_AGENTS_PER_ROLE,
             }
         );
         assert!(
@@ -767,5 +765,24 @@ mod tests {
                 .is_none(),
             "被容量拒绝的子代理不能写入 spawn_graph"
         );
+
+        task_store
+            .update_status(
+                &TaskId::new("task-child-capacity-executor-0"),
+                TaskStatus::Completed,
+            )
+            .expect("完成一个 executor 代理后应释放角色容量");
+        registry
+            .register_spawned_local_agent_child(SpawnedChildExecutionRequest {
+                task_store: &task_store,
+                spawn_graph: &spawn_graph,
+                session_store: &session_store,
+                child_task: &overflow_child,
+                session_id: &session_id,
+                workspace_id: &workspace_id,
+                role: "executor",
+                now: UtcMillis(now.0 + 11),
+            })
+            .expect("同角色已有实例完成后，第六个代理应能占用释放的名额");
     }
 }

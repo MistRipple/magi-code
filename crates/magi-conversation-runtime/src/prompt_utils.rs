@@ -54,8 +54,8 @@ pub const ROOT_MULTI_AGENT_MODE_RULE: &str = "\
 多代理模式（root coordinator 必须遵守）：\n\
 1. 不要启动代理，除非用户、本仓 AGENTS.md 或当前 Skill 明确要求 subagent、代理分派、并行协作或多角色处理。\n\
 2. 一旦用户明确要求 subagent / 子代理 / 多代理 / 派发代理，就必须通过 agent_spawn 创建真实代理；不得用主线直接读取、shell_exec 或口头总结冒充代理执行。\n\
-3. 当前会话最多 4 条活跃执行分支（含主线），因此同一时刻最多 3 个子代理；需要更多代理时先 agent_wait 收集一批结果，再继续派发下一批。\n\
-4. 多个互相独立且未超过上限的代理任务应在同一轮发起多次 agent_spawn 启动；需要结果时再用 agent_wait 汇总。\n\
+3. 每个代理角色同一时刻最多运行 5 个活跃实例，不设置会话级代理总数下限或额外总人数上限；agent_spawn 达到角色上限时会返回 role、active_role_agent_count 与 max_active_agents_per_role，此时先 agent_wait 收集该角色已运行代理，再继续创建同角色实例。\n\
+4. 多个互相独立的代理任务应在同一轮发起多次 agent_spawn 启动；需要结果时再用 agent_wait 汇总。\n\
 5. root coordinator 保留主线推进职责：只把边界清晰、可并行、需要专项视角或独立复核的工作交给代理。";
 
 pub const SUBAGENT_MULTI_AGENT_MODE_RULE: &str = "\

@@ -702,16 +702,23 @@ fn execute_coordinator_tool(
                         child_task_id = %child_id,
                         "agent_spawn child execution registration failed"
                     );
-                    if let SpawnedChildExecutionError::CapacityExceeded { active, limit } = error {
+                    if let SpawnedChildExecutionError::RoleCapacityExceeded {
+                        role,
+                        active,
+                        limit,
+                    } = error
+                    {
                         return (
                             serde_json::json!({
                                 "tool": tool.as_str(),
                                 "status": "rejected",
                                 "error_code": "agent_spawn_capacity_exceeded",
-                                "active_branch_count": active,
-                                "max_active_branch_count": limit,
-                                "error": format!("当前会话已达到多代理并发上限：最多 {limit} 条活跃执行分支（含主线），当前 {active} 条"),
-                                "instruction": "请先用 agent_wait 收集已启动代理结果，合并后再按下一批继续派发；不要在同一时刻创建超过上限的代理。",
+                                "capacity_scope": "role",
+                                "role": role,
+                                "active_role_agent_count": active,
+                                "max_active_agents_per_role": limit,
+                                "error": format!("角色 {role} 已达到代理实例上限：最多 {limit} 个活跃实例，当前 {active} 个"),
+                                "instruction": "请先用 agent_wait 收集该角色已启动代理的结果；有实例退出活跃状态后再继续创建同角色代理。其他角色不受该角色容量占用影响。",
                             })
                             .to_string(),
                             ExecutionResultStatus::Rejected,
