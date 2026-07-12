@@ -94,6 +94,8 @@ pub struct ToolExecutionPolicy {
     #[serde(default)]
     pub denied_paths: Vec<String>,
     #[serde(default)]
+    pub read_only_paths: Vec<String>,
+    #[serde(default)]
     pub command_mode: String,
 }
 
@@ -108,6 +110,7 @@ impl ToolExecutionPolicy {
         self.access_profile = policy.access_profile;
         self.allowed_paths = policy.allowed_paths.clone();
         self.denied_paths = policy.denied_paths.clone();
+        self.read_only_paths = policy.read_only_paths.clone();
         self.command_mode = policy.command_mode.clone();
         extend_unique(&mut self.denied_tool_names, &policy.denied_tools);
         merge_allowed_tools(&mut self.allowed_tool_names, &policy.allowed_tools);

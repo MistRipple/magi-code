@@ -35,7 +35,6 @@ import { i18n } from '../stores/i18n.svelte';
 export {
   normalizeRestoredMessages,
   handleRetryRuntimePayload,
-  mapStandardBlocks,
 } from './message-utils';
 
 

@@ -215,12 +215,25 @@ impl ToolRegistry {
             }
         }
 
+        let read_only_paths =
+            normalize_tool_policy_paths(&policy.read_only_paths, workspace_root_path);
         for path_request in tool_path_access_requests(
             &input.tool_name,
             &input.input,
             workspace_root_path,
             effective_access_profile,
         ) {
+            if path_request.kind == magi_permissions::PathAccessKind::Write
+                && read_only_paths
+                    .iter()
+                    .any(|root| path_request.absolute_path.starts_with(root))
+            {
+                return Some(self.build_policy_rejection(
+                    input,
+                    "上下文引用只允许读取".to_string(),
+                    effective_access_profile,
+                ));
+            }
             let path_decision = engine.decide(
                 &magi_permissions::PermissionRequest::PathAccess {
                     absolute_path: path_request.absolute_path.as_path(),
@@ -679,6 +692,11 @@ pub fn tool_path_access_requests(
                     kind: shell_kind,
                 });
             }
+            paths.extend(shell_exec_command_path_accesses(
+                object,
+                workspace_root_path,
+                shell_kind,
+            ));
             if access_profile == AccessProfile::ReadOnly {
                 for path in &mut paths {
                     path.kind = read;
@@ -710,6 +728,281 @@ fn shell_exec_uses_working_directory(
         return !arguments.trim().is_empty();
     };
     object_has_non_empty_string(object, &["command"])
+}
+
+fn shell_exec_command_path_accesses(
+    object: Option<&serde_json::Map<String, Value>>,
+    workspace_root_path: Option<&Path>,
+    shell_kind: magi_permissions::PathAccessKind,
+) -> Vec<ToolPathAccessRequest> {
+    let Some(command) = object.and_then(|object| field_string(object, &["command"])) else {
+        return Vec::new();
+    };
+    let tokens = shell_command_tokens(&command);
+    if tokens.is_empty() {
+        return Vec::new();
+    }
+
+    let mut paths = shell_redirection_write_paths(&tokens, workspace_root_path);
+    for segment in shell_command_segments(&tokens) {
+        paths.extend(shell_segment_path_accesses(
+            segment,
+            workspace_root_path,
+            shell_kind,
+        ));
+    }
+    paths
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ShellToken {
+    Word(String),
+    Operator(String),
+}
+
+fn shell_command_tokens(command: &str) -> Vec<ShellToken> {
+    let mut tokens = Vec::new();
+    let mut word = String::new();
+    let mut chars = command.chars().peekable();
+    let mut quote = None;
+    let mut escaped = false;
+
+    while let Some(ch) = chars.next() {
+        if escaped {
+            word.push(ch);
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && quote != Some('\'') {
+            escaped = true;
+            continue;
+        }
+        if let Some(active_quote) = quote {
+            if ch == active_quote {
+                quote = None;
+            } else {
+                word.push(ch);
+            }
+            continue;
+        }
+        if matches!(ch, '\'' | '"') {
+            quote = Some(ch);
+            continue;
+        }
+        if ch.is_whitespace() {
+            push_shell_word(&mut tokens, &mut word);
+            continue;
+        }
+        if matches!(ch, '>' | '<' | '|' | '&' | ';') {
+            push_shell_word(&mut tokens, &mut word);
+            let mut operator = ch.to_string();
+            if let Some(next) = chars.peek().copied()
+                && ((ch == '>' && matches!(next, '>' | '|'))
+                    || (ch == '<' && next == '<')
+                    || (ch == '|' && next == '|')
+                    || (ch == '&' && matches!(next, '&' | '>')))
+            {
+                operator.push(next);
+                chars.next();
+                if operator == "&>" && chars.peek() == Some(&'>') {
+                    operator.push('>');
+                    chars.next();
+                }
+            }
+            tokens.push(ShellToken::Operator(operator));
+            continue;
+        }
+        word.push(ch);
+    }
+    if escaped {
+        word.push('\\');
+    }
+    push_shell_word(&mut tokens, &mut word);
+    tokens
+}
+
+fn push_shell_word(tokens: &mut Vec<ShellToken>, word: &mut String) {
+    if !word.is_empty() {
+        tokens.push(ShellToken::Word(std::mem::take(word)));
+    }
+}
+
+fn shell_redirection_write_paths(
+    tokens: &[ShellToken],
+    workspace_root_path: Option<&Path>,
+) -> Vec<ToolPathAccessRequest> {
+    let mut paths = Vec::new();
+    for (index, token) in tokens.iter().enumerate() {
+        let ShellToken::Operator(operator) = token else {
+            continue;
+        };
+        if !matches!(operator.as_str(), ">" | ">>" | ">|" | "&>" | "&>>") {
+            continue;
+        }
+        let Some(ShellToken::Word(target)) = tokens.get(index + 1) else {
+            continue;
+        };
+        if target == "/dev/null" || target.starts_with('&') || target == "-" {
+            continue;
+        }
+        push_shell_path(
+            &mut paths,
+            target,
+            magi_permissions::PathAccessKind::Write,
+            workspace_root_path,
+        );
+    }
+    paths
+}
+
+fn shell_command_segments(tokens: &[ShellToken]) -> Vec<&[ShellToken]> {
+    let mut segments = Vec::new();
+    let mut start = 0usize;
+    for (index, token) in tokens.iter().enumerate() {
+        if matches!(
+            token,
+            ShellToken::Operator(operator)
+                if matches!(operator.as_str(), "|" | "||" | "&&" | ";")
+        ) {
+            if start < index {
+                segments.push(&tokens[start..index]);
+            }
+            start = index + 1;
+        }
+    }
+    if start < tokens.len() {
+        segments.push(&tokens[start..]);
+    }
+    segments
+}
+
+fn shell_segment_path_accesses(
+    segment: &[ShellToken],
+    workspace_root_path: Option<&Path>,
+    shell_kind: magi_permissions::PathAccessKind,
+) -> Vec<ToolPathAccessRequest> {
+    let words = segment
+        .iter()
+        .filter_map(|token| match token {
+            ShellToken::Word(word) => Some(word.as_str()),
+            ShellToken::Operator(_) => None,
+        })
+        .collect::<Vec<_>>();
+    let Some(command_index) = shell_command_word_index(&words) else {
+        return Vec::new();
+    };
+    let command = shell_command_basename(words[command_index]);
+    let arguments = &words[command_index + 1..];
+    let mut paths = Vec::new();
+
+    match command {
+        "cp" | "mv" | "install" => {
+            let operands = shell_non_option_operands(arguments);
+            for source in operands.iter().take(operands.len().saturating_sub(1)) {
+                push_shell_path(
+                    &mut paths,
+                    source,
+                    magi_permissions::PathAccessKind::Read,
+                    workspace_root_path,
+                );
+            }
+            if let Some(destination) = operands.last() {
+                push_shell_path(
+                    &mut paths,
+                    destination,
+                    magi_permissions::PathAccessKind::Write,
+                    workspace_root_path,
+                );
+            }
+        }
+        "tee" => {
+            for path in shell_non_option_operands(arguments) {
+                push_shell_path(
+                    &mut paths,
+                    path,
+                    magi_permissions::PathAccessKind::Write,
+                    workspace_root_path,
+                );
+            }
+        }
+        "touch" | "mkdir" | "rmdir" | "rm" | "unlink" | "truncate" => {
+            for path in shell_non_option_operands(arguments) {
+                push_shell_path(
+                    &mut paths,
+                    path,
+                    magi_permissions::PathAccessKind::Write,
+                    workspace_root_path,
+                );
+            }
+        }
+        _ => {
+            for path in arguments
+                .iter()
+                .copied()
+                .filter(|value| shell_word_looks_like_path(value))
+            {
+                push_shell_path(&mut paths, path, shell_kind, workspace_root_path);
+            }
+        }
+    }
+    paths
+}
+
+fn shell_command_word_index(words: &[&str]) -> Option<usize> {
+    let mut index = 0usize;
+    while index < words.len() {
+        let word = words[index];
+        if matches!(word, "env" | "command" | "builtin" | "exec" | "sudo") {
+            index += 1;
+            continue;
+        }
+        if word.contains('=') && !word.starts_with('/') && !word.starts_with("./") {
+            index += 1;
+            continue;
+        }
+        return Some(index);
+    }
+    None
+}
+
+fn shell_command_basename(command: &str) -> &str {
+    command.rsplit('/').next().unwrap_or(command)
+}
+
+fn shell_non_option_operands<'a>(arguments: &'a [&'a str]) -> Vec<&'a str> {
+    arguments
+        .iter()
+        .copied()
+        .filter(|value| !value.starts_with('-') && *value != "--")
+        .collect()
+}
+
+fn shell_word_looks_like_path(value: &str) -> bool {
+    value.starts_with('/')
+        || value.starts_with("./")
+        || value.starts_with("../")
+        || value.contains('/')
+}
+
+fn push_shell_path(
+    paths: &mut Vec<ToolPathAccessRequest>,
+    value: &str,
+    kind: magi_permissions::PathAccessKind,
+    workspace_root_path: Option<&Path>,
+) {
+    let trimmed = value.trim();
+    if trimmed.is_empty()
+        || trimmed == "-"
+        || trimmed.contains(['*', '?', '$', '`'])
+        || trimmed.starts_with("http://")
+        || trimmed.starts_with("https://")
+    {
+        return;
+    }
+    paths.push(ToolPathAccessRequest {
+        absolute_path: resolve_tool_path(trimmed, workspace_root_path),
+        kind,
+    });
 }
 
 fn object_has_non_empty_string(object: &serde_json::Map<String, Value>, keys: &[&str]) -> bool {
@@ -768,6 +1061,8 @@ fn normalize_execution_policy(policy: &ToolExecutionPolicy) -> ToolExecutionPoli
     normalized.allowed_paths.dedup();
     normalized.denied_paths.sort();
     normalized.denied_paths.dedup();
+    normalized.read_only_paths.sort();
+    normalized.read_only_paths.dedup();
     normalized
 }
 

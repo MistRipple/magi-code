@@ -44,7 +44,6 @@ import type { IncidentScope } from './notification-policy';
 import type {
   AppState, Message, Session,
   Edit,
-  TimelineProjectionArtifact,
   ModelStatus, ModelStatusMap, ModelStatusType, OrchestratorRuntimeState,
 } from '../types/message';
 import type { StandardMessage, ContentBlock as StandardContentBlock } from '../shared/protocol/message-protocol';
@@ -65,7 +64,20 @@ import {
   applyCanonicalTurnEvent,
   clearCanonicalSessionTurns,
   replaceCanonicalSessionTurns,
+  turnStoreState,
 } from '../stores/turn-store.svelte';
+import { postBridgeMessage } from '../shared/bridges/bridge-runtime';
+
+let canonicalRecoveryRequestedAt = 0;
+
+function requestCanonicalTimelineRecovery(): void {
+  const now = Date.now();
+  if (now - canonicalRecoveryRequestedAt < 1_000) {
+    return;
+  }
+  canonicalRecoveryRequestedAt = now;
+  postBridgeMessage({ type: 'requestState' });
+}
 
 function normalizeStateSliceVersion(value: unknown): number {
   return typeof value === 'number' && Number.isFinite(value) ? Math.floor(value) : 0;
@@ -590,6 +602,7 @@ export function handleUnifiedData(standard: StandardMessage) {
         sessions: payload.sessions,
         state: payload.state,
         canonicalTurns: payload.canonicalTurns,
+        eventStreamNextSequence: payload.eventStreamNextSequence,
         notifications: payload.notifications,
         orchestratorRuntimeState: payload.orchestratorRuntimeState,
         hasMoreBefore: payload.hasMoreBefore,
@@ -865,45 +878,13 @@ function canonicalTurnsForSession(sessionId: string, turns: unknown): CanonicalT
     .sort((left, right) => left.turnSeq - right.turnSeq || left.turnId.localeCompare(right.turnId));
 }
 
-function latestProjectedTurnSeq(): number {
-  return ensureArray<TimelineProjectionArtifact>(messagesState.canonicalTimelineProjection?.artifacts)
-    .reduce((latest, artifact) => {
-      const metadata = artifact?.message?.metadata;
-      const turnSeq = metadata && typeof metadata === 'object'
-        ? (metadata as Record<string, unknown>).turnSeq
-        : undefined;
-      return typeof turnSeq === 'number' && Number.isFinite(turnSeq)
-        ? Math.max(latest, Math.floor(turnSeq))
-        : latest;
-    }, 0);
-}
-
-function snapshotHasTerminalTurnAtOrAfterLocalProjection(turns: CanonicalTurn[]): boolean {
-  const localLatestTurnSeq = latestProjectedTurnSeq();
-  if (localLatestTurnSeq <= 0) {
-    return false;
-  }
-  return turns.some((turn) => (
-    turn.turnSeq >= localLatestTurnSeq
-    && isCanonicalTerminalStatus(turn.status)
-  ));
-}
-
-function hasCurrentCanonicalProjectionForSession(sessionId: string): boolean {
-  const projection = messagesState.canonicalTimelineProjection;
-  if (!projection || projection.sessionId !== sessionId) {
-    return false;
-  }
-  return ensureArray<TimelineProjectionArtifact>(projection.artifacts).length > 0
-    || ensureArray(projection.threadRenderEntries).length > 0;
-}
-
 function reconcileRequestBindingsFromAuthoritativeThread(sessionId: string): void {
   const currentSessionId = getState().currentSessionId || '';
   if (!sessionId || !currentSessionId || currentSessionId !== sessionId) {
     return;
   }
 
+  let settledResponse = false;
   for (const binding of listRequestBindings()) {
     const matchedAssistant = findTerminalAssistantByRequestIdentity(binding);
 
@@ -921,9 +902,12 @@ function reconcileRequestBindingsFromAuthoritativeThread(sessionId: string): voi
       clearTimeout(binding.timeoutId);
     }
     clearRequestBinding(binding.requestId);
+    settledResponse = true;
   }
 
-  settleProcessingAfterResponseCompletion();
+  if (settledResponse) {
+    settleProcessingAfterResponseCompletion();
+  }
 }
 
 function handleSessionTurnCanonicalEventUpdated(message: ClientBridgeMessage) {
@@ -936,6 +920,10 @@ function handleSessionTurnCanonicalEventUpdated(message: ClientBridgeMessage) {
     return;
   }
   const projection = applyCanonicalTurnEvent(canonicalEvent);
+  if (!projection && turnStoreState.lastError) {
+    requestCanonicalTimelineRecovery();
+    return;
+  }
   if (projection && setCanonicalTimelineProjection(projection)) {
     if (canonicalEvent.turn) {
       const processingState = deriveProcessingStateFromCanonicalTurns([canonicalEvent.turn], sessionId);
@@ -948,12 +936,16 @@ function handleSessionTurnCanonicalEventUpdated(message: ClientBridgeMessage) {
   }
 }
 
-function applyCanonicalTurnsSnapshot(sessionId: string, turns: unknown): boolean {
+function applyCanonicalTurnsSnapshot(
+  sessionId: string,
+  turns: unknown,
+  lastAppliedEventSeq: number,
+): boolean {
   if (!Array.isArray(turns)) {
     return false;
   }
   const canonicalTurns = canonicalTurnsForSession(sessionId, turns);
-  const projection = replaceCanonicalSessionTurns(sessionId, canonicalTurns);
+  const projection = replaceCanonicalSessionTurns(sessionId, canonicalTurns, lastAppliedEventSeq);
   if (!projection) {
     return false;
   }
@@ -981,6 +973,10 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
     ? message.beforeCursor.trim()
     : null;
   const canonicalTurns = (message as Record<string, unknown>).canonicalTurns;
+  const eventStreamNextSequence = Number((message as Record<string, unknown>).eventStreamNextSequence);
+  const canonicalEventWatermark = Number.isFinite(eventStreamNextSequence)
+    ? Math.max(0, Math.floor(eventStreamNextSequence) - 1)
+    : 0;
 
   if (!state) {
     return;
@@ -1034,8 +1030,8 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
   const isSameSession = currentSessionId === sessionId
     && (!workspaceId || !currentWorkspaceId || workspaceId === currentWorkspaceId);
 
-  // 同 session 恢复（SSE 重连 / 后端重启）：活跃轮次期间避免旧 idle 快照覆盖 live 过程态；
-  // 一旦权威快照已包含追上本地轮次的终态 turn，立即接管完整历史并收敛运行态。
+  // 同 session 恢复按事件水位决定是否接管快照；水位不落后的快照必须进入 reducer，
+  // 否则 bridge 已推进 SSE cursor 而 canonical 状态未同步，会永久跳过恢复区间。
   if (isSameSession) {
     batchWebviewStatePersistence(() => {
       messagesState.sessionHydrating = false;
@@ -1050,17 +1046,12 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
       const authoritativeSnapshotIsIdle = state.isProcessing !== true
         && state.processingState?.isProcessing !== true;
       const canonicalSessionTurns = canonicalTurnsForSession(sessionId, canonicalTurns);
-      const terminalSnapshotCaughtUpLocalTurn = authoritativeSnapshotIsIdle
-        && snapshotHasTerminalTurnAtOrAfterLocalProjection(canonicalSessionTurns);
-      const hasBootstrapHistoryWithoutLocalProjection = canonicalSessionTurns.length > 0
-        && !hasCurrentCanonicalProjectionForSession(sessionId);
-      const shouldApplyCanonicalSnapshot = !hadLiveTurnBeforeSnapshot
-        || terminalSnapshotCaughtUpLocalTurn
-        || hasBootstrapHistoryWithoutLocalProjection;
+      const shouldApplyCanonicalSnapshot = canonicalEventWatermark
+        >= turnStoreState.reducer.lastAppliedEventSeq;
       const preserveLocalTurnDuringStaleIdle = hadLiveTurnBeforeSnapshot
         && hadPendingLocalRequestBeforeSnapshot
         && authoritativeSnapshotIsIdle
-        && !terminalSnapshotCaughtUpLocalTurn;
+        && canonicalSessionTurns.length === 0;
 
       handleStateUpdate({
         ...message,
@@ -1090,10 +1081,14 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
       });
 
       if (shouldApplyCanonicalSnapshot) {
-        applyCanonicalTurnsSnapshot(sessionId, canonicalSessionTurns);
+        applyCanonicalTurnsSnapshot(sessionId, canonicalSessionTurns, canonicalEventWatermark);
         reconcileRequestBindingsFromAuthoritativeThread(sessionId);
       }
-      if (authoritativeSnapshotIsIdle && shouldApplyCanonicalSnapshot) {
+      if (
+        authoritativeSnapshotIsIdle
+        && shouldApplyCanonicalSnapshot
+        && !preserveLocalTurnDuringStaleIdle
+      ) {
         settleAuthoritativeIdleState();
       }
     });
@@ -1125,7 +1120,7 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
 
     setCurrentSessionId(sessionId);
     clearStaleSettingsBootstrapSnapshot();
-    applyCanonicalTurnsSnapshot(sessionId, canonicalTurns);
+    applyCanonicalTurnsSnapshot(sessionId, canonicalTurns, canonicalEventWatermark);
     handleStateUpdate({
       ...message,
       state: {

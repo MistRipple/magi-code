@@ -1260,6 +1260,7 @@ fn default_agent_spawn_policy() -> TaskPolicy {
         denied_tools: Vec::new(),
         allowed_paths: Vec::new(),
         denied_paths: Vec::new(),
+        read_only_paths: Vec::new(),
         network_mode: "full".to_string(),
         command_mode: "full".to_string(),
         retry_limit: 1,
@@ -1885,12 +1886,14 @@ fn task_tool_execution_policy_scope(task: &magi_core::Task) -> ToolExecutionPoli
     let Some(policy) = task.policy_snapshot.as_ref() else {
         return tool_execution_policy_scope(AccessProfile::default(), "", &[], &[]);
     };
-    tool_execution_policy_scope(
+    let mut tool_policy = tool_execution_policy_scope(
         policy.access_profile,
         policy.command_mode.clone(),
         &policy.allowed_paths,
         &policy.denied_paths,
-    )
+    );
+    tool_policy.read_only_paths = policy.read_only_paths.clone();
+    tool_policy
 }
 
 fn apply_task_policy_scope(
@@ -1901,6 +1904,7 @@ fn apply_task_policy_scope(
         tool_policy.access_profile = policy.access_profile;
         tool_policy.allowed_paths = policy.allowed_paths.clone();
         tool_policy.denied_paths = policy.denied_paths.clone();
+        tool_policy.read_only_paths = policy.read_only_paths.clone();
         tool_policy.command_mode = policy.command_mode.clone();
     }
 }
@@ -1970,6 +1974,7 @@ fn task_policy_tool_decision_with_workspace_root(
         denied_tools: &policy_snapshot.denied_tools,
         allowed_paths: &policy_snapshot.allowed_paths,
         denied_paths: &policy_snapshot.denied_paths,
+        read_only_paths: &policy_snapshot.read_only_paths,
         requested_tool_name,
         arguments,
         workspace_root_path,
@@ -1983,6 +1988,7 @@ pub(crate) struct AccessProfileToolDecisionInput<'a> {
     pub denied_tools: &'a [String],
     pub allowed_paths: &'a [String],
     pub denied_paths: &'a [String],
+    pub read_only_paths: &'a [String],
     pub requested_tool_name: &'a str,
     pub arguments: &'a str,
     pub workspace_root_path: Option<&'a PathBuf>,
@@ -1998,6 +2004,7 @@ pub(crate) fn access_profile_tool_decision(
         denied_tools,
         allowed_paths,
         denied_paths,
+        read_only_paths,
         requested_tool_name,
         arguments,
         workspace_root_path,
@@ -2064,12 +2071,28 @@ pub(crate) fn access_profile_tool_decision(
             return Some(decision);
         }
     }
+    let normalized_read_only_paths = normalize_tool_policy_paths(
+        read_only_paths,
+        workspace_root_path.map(|path| path.as_path()),
+    );
     for path_request in tool_path_access_requests(
         &canonical_tool_name,
         arguments,
         workspace_root_path.map(|path| path.as_path()),
         access_profile,
     ) {
+        if path_request.kind == magi_permissions::PathAccessKind::Write
+            && normalized_read_only_paths
+                .iter()
+                .any(|root| path_request.absolute_path.starts_with(root))
+        {
+            return Some(task_policy_decision_payload(
+                &canonical_tool_name,
+                ExecutionResultStatus::Rejected,
+                "上下文引用只允许读取".to_string(),
+                Some(access_profile),
+            ));
+        }
         let path_request = magi_permissions::PermissionRequest::PathAccess {
             absolute_path: path_request.absolute_path.as_path(),
             kind: path_request.kind,
@@ -2468,6 +2491,19 @@ mod tests {
 
         assert_eq!(child.access_profile, magi_core::AccessProfile::ReadOnly);
         assert_eq!(child.command_mode, "read_only");
+    }
+
+    #[test]
+    fn agent_spawn_child_policy_inherits_parent_reference_boundaries() {
+        let mut parent = default_agent_spawn_policy();
+        parent.allowed_paths = vec!["/tmp/workspace".to_string(), "/tmp/reference".to_string()];
+        parent.read_only_paths = vec!["/tmp/reference".to_string()];
+
+        let child =
+            agent_spawn_child_policy_snapshot(Some(&parent), AgentSpawnAccessMode::ReadWrite);
+
+        assert_eq!(child.allowed_paths, parent.allowed_paths);
+        assert_eq!(child.read_only_paths, parent.read_only_paths);
     }
 
     #[test]
@@ -3093,6 +3129,7 @@ mod tests {
             denied_tools: &[],
             allowed_paths: &[],
             denied_paths: &[],
+            read_only_paths: &[],
             requested_tool_name: BuiltinToolName::ShellExec.as_str(),
             arguments: r#"{"command":"printf restricted > out.txt"}"#,
             workspace_root_path: Some(&link_root),

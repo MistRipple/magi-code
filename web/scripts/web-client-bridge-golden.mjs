@@ -755,6 +755,11 @@ await withGoldenViteServer(async (server) => {
     sessionId: SESSION_ID,
     goalMode: true,
     followUpMode: 'queue',
+    contextReferences: [{
+      kind: 'file',
+      path: '/tmp/reference-queued.md',
+      name: 'reference-queued.md',
+    }],
   });
   await waitFor(
     () => messagesStore.messagesState.queuedMessages.some((message) => message.requestId === 'request-queued-immediate-feedback'),
@@ -770,6 +775,15 @@ await withGoldenViteServer(async (server) => {
     queuedGoalBody.goalMode,
     true,
     'queued follow-up must preserve the structured goal mode flag',
+  );
+  assert.deepEqual(
+    queuedGoalBody.contextReferences,
+    [{
+      kind: 'file',
+      path: '/tmp/reference-queued.md',
+      name: 'reference-queued.md',
+    }],
+    'queued follow-up must preserve structured context references in the POST body',
   );
   assert.ok(
     findArtifactByRequestId(

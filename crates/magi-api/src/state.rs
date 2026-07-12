@@ -1074,6 +1074,7 @@ impl ApiState {
         let Some(ws_id) = workspace_id else {
             return BootstrapDto::from_state_with_selected_session(self, requested_session_id);
         };
+        let event_snapshot = self.event_bus.snapshot();
         let mut projection = self.session_store.projection_input();
         projection.sessions = self.session_records_for_workspace(Some(ws_id));
         let selected_session_id = requested_session_id
@@ -1105,7 +1106,7 @@ impl ApiState {
         projection.notifications = self
             .session_store
             .notifications_for_context(ws_id, selected_session_id.as_ref());
-        BootstrapDto::from_state_with_session_projection(self, projection)
+        BootstrapDto::from_state_with_session_projection(self, projection, event_snapshot)
     }
 
     pub(crate) fn session_records_for_workspace(

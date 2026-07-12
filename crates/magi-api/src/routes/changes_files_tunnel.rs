@@ -789,13 +789,28 @@ async fn browse_filesystem(
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| PathBuf::from("/"))
         });
-    let path = canonical_directory_path(raw_path, "规范化目录失败")?;
+    let canonical = raw_path
+        .canonicalize()
+        .map_err(|e| directory_access_error("规范化目录失败", &raw_path, e))?;
+    let (path, selected_path, selected_kind) = if canonical.is_dir() {
+        (canonical, None, None)
+    } else if canonical.is_file() {
+        let parent = canonical
+            .parent()
+            .ok_or_else(|| ApiError::InvalidInput("文件缺少可浏览的父目录".to_string()))?
+            .to_path_buf();
+        (parent, Some(canonical), Some("file"))
+    } else {
+        return Err(ApiError::InvalidInput("路径不是文件或目录".to_string()));
+    };
     let show_hidden = show_hidden_enabled(query.show_hidden.as_deref());
     let entries = read_directory_entries(&path, show_hidden)?;
     Ok(Json(serde_json::json!({
         "path": path.to_string_lossy(),
         "parent": directory_parent(&path, None),
         "entries": entries,
+        "selectedPath": selected_path.map(|path| path.to_string_lossy().to_string()),
+        "selectedKind": selected_kind,
     })))
 }
 
@@ -1461,6 +1476,45 @@ mod tests {
         assert!(
             entries.iter().any(|entry| entry["name"] == ".hidden"),
             "showHidden=1 should include hidden entries"
+        );
+    }
+
+    #[tokio::test]
+    async fn filesystem_browse_resolves_file_path_to_parent_and_selection() {
+        let root = unique_temp_dir("magi-filesystem-browse-file-selection");
+        let file = root.join("reference.txt");
+        fs::write(&file, "reference\n").expect("reference file should write");
+        let state = build_state();
+
+        let response = routes()
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/filesystem/browse?path={}",
+                        file.to_string_lossy()
+                    ))
+                    .method("GET")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = read_json_response(response).await;
+        let canonical_root = root.canonicalize().expect("root should canonicalize");
+        let canonical_file = file.canonicalize().expect("file should canonicalize");
+        assert_eq!(payload["path"], canonical_root.to_string_lossy().as_ref());
+        assert_eq!(
+            payload["selectedPath"],
+            canonical_file.to_string_lossy().as_ref()
+        );
+        assert_eq!(payload["selectedKind"], "file");
+        assert!(
+            payload["entries"].as_array().is_some_and(|entries| entries
+                .iter()
+                .any(|entry| entry["name"] == "reference.txt"))
         );
     }
 

@@ -117,6 +117,7 @@ fn task_serialization_roundtrip() {
             denied_tools: Vec::new(),
             allowed_paths: vec!["/src".to_string()],
             denied_paths: Vec::new(),
+            read_only_paths: Vec::new(),
             network_mode: "restricted".to_string(),
             command_mode: "sandboxed".to_string(),
             retry_limit: 3,

@@ -1,15 +1,27 @@
-export interface SlashSkillOption {
+export interface ComposerSkillOption {
   skillId: string;
   name: string;
   description: string;
 }
 
-export interface SlashGoalLabels {
-  name: string;
-  description: string;
+export interface ComposerActionLabels {
+  goal: {
+    name: string;
+    description: string;
+  };
+  context: {
+    name: string;
+    description: string;
+  };
 }
 
-export type SlashCommand =
+export type ComposerAction =
+  | {
+      kind: 'resource';
+      id: 'file-or-directory';
+      name: string;
+      description: string;
+    }
   | {
       kind: 'goal';
       id: 'goal';
@@ -22,7 +34,7 @@ export type SlashCommand =
       id: string;
       name: string;
       description: string;
-      skill: SlashSkillOption;
+      skill: ComposerSkillOption;
     };
 
 function fuzzyMatch(text: string, query: string): boolean {
@@ -34,19 +46,25 @@ function fuzzyMatch(text: string, query: string): boolean {
   return queryIndex === query.length;
 }
 
-export function buildSlashCommands(
-  skills: SlashSkillOption[],
-  goalLabels: SlashGoalLabels,
-): SlashCommand[] {
+export function buildComposerActions(
+  skills: ComposerSkillOption[],
+  labels: ComposerActionLabels,
+): ComposerAction[] {
   return [
+    {
+      kind: 'resource',
+      id: 'file-or-directory',
+      name: labels.context.name,
+      description: labels.context.description,
+    },
     {
       kind: 'goal',
       id: 'goal',
-      name: goalLabels.name,
-      description: goalLabels.description,
+      name: labels.goal.name,
+      description: labels.goal.description,
       aliases: ['goal', 'goal mode', 'goalmode', '目标', '目标模式', '长期目标'],
     },
-    ...skills.map<SlashCommand>((skill) => ({
+    ...skills.map<ComposerAction>((skill) => ({
       kind: 'skill',
       id: skill.skillId,
       name: skill.name,
@@ -56,18 +74,25 @@ export function buildSlashCommands(
   ];
 }
 
-export function filterSlashCommands(commands: SlashCommand[], rawQuery: string): SlashCommand[] {
+export function filterSlashCommands(
+  actions: ComposerAction[],
+  rawQuery: string,
+): Array<Exclude<ComposerAction, { kind: 'resource' }>> {
   const query = rawQuery.trim().toLowerCase();
-  if (!query) return commands;
-  return commands.filter((command) => {
-    const searchParts = command.kind === 'goal'
-      ? [command.name, command.description, ...command.aliases]
-      : [command.id, command.name, command.description];
-    return searchParts.some((part) => {
-      const normalized = part.toLowerCase();
-      return normalized.includes(query) || fuzzyMatch(normalized, query);
+  return actions
+    .filter((action): action is Exclude<ComposerAction, { kind: 'resource' }> => (
+      action.kind !== 'resource'
+    ))
+    .filter((action) => {
+      if (!query) return true;
+      const searchParts = action.kind === 'goal'
+        ? [action.name, action.description, ...action.aliases]
+        : [action.id, action.name, action.description];
+      return searchParts.some((part) => {
+        const normalized = part.toLowerCase();
+        return normalized.includes(query) || fuzzyMatch(normalized, query);
+      });
     });
-  });
 }
 
 export function resolveSlashTrigger(

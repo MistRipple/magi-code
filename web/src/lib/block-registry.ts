@@ -17,8 +17,8 @@ class BlockRegistry {
     this.renderers.set(type, component);
   }
 
-  get(type: string): BlockComponent {
-    return this.renderers.get(type) || TextBlockRenderer;
+  get(type: string): BlockComponent | undefined {
+    return this.renderers.get(type);
   }
 }
 
@@ -31,6 +31,6 @@ blockRegistry.register('tool_result', ToolCallRenderer);
 blockRegistry.register('file_change', FileChangeCard);
 blockRegistry.register('plan', PlanCard);
 
-export function getBlockRenderer(block: ContentBlock): BlockComponent {
+export function getBlockRenderer(block: ContentBlock): BlockComponent | undefined {
   return blockRegistry.get(block.type);
 }

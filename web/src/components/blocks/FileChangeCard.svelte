@@ -1,18 +1,19 @@
 <script lang="ts">
   import type { ContentBlock } from '../../types/message';
+  import type { FilePreviewScope } from '../../lib/file-reference';
   import Icon from '../Icon.svelte';
   import FileSpan from '../FileSpan.svelte';
   import type { IconName } from '../../lib/icons';
   import { i18n } from '../../stores/i18n.svelte';
   import { openCodeTab } from '../../stores/right-pane.svelte';
-  import { messagesState } from '../../stores/messages.svelte';
   import DiffCodeBlock from './DiffCodeBlock.svelte';
 
   interface Props {
     block: ContentBlock;
+    filePreviewScope?: FilePreviewScope;
   }
 
-  let { block }: Props = $props();
+  let { block, filePreviewScope = undefined }: Props = $props();
   const change = $derived(block.fileChange);
 
   // 默认折叠，与 ToolCall 保持一致
@@ -87,17 +88,15 @@
     }
   }
 
-  /**
-   * 把当前 file change 推到右侧 RightPane 的 code tab。
-   * 优先带上 diff（unified 文本）；二进制/特殊类型且无 diff 时仅传 filepath，让 RightPane 显示空态。
-   */
   function previewInRightPane(filepath: string) {
     if (!filepath) return;
-    const sessionId = change?.sessionId || messagesState.currentSessionId || undefined;
+    const sessionId = filePreviewScope?.sessionId ?? change?.sessionId;
+    const workspaceId = filePreviewScope?.workspaceId ?? change?.workspaceId;
+    const workspacePath = filePreviewScope?.workspacePath ?? change?.workspacePath;
     openCodeTab(sessionId, filepath, {
       sessionId,
-      workspaceId: change?.workspaceId || messagesState.currentWorkspaceId || undefined,
-      workspacePath: change?.workspacePath || messagesState.currentWorkspacePath || undefined,
+      workspaceId,
+      workspacePath,
       diff: change?.diff ?? null,
       contentKind: change?.contentKind,
       size: change?.size,

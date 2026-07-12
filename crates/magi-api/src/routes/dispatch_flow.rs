@@ -163,6 +163,7 @@ async fn execute_dispatch_submission(
         entry_id: user_timeline_entry_id,
         timeline_message: message.clone(),
         images,
+        context_references: request.context_references(),
         created_session,
         mission_title,
         task_title: action_task_title,

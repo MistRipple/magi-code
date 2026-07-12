@@ -366,23 +366,6 @@ impl CanonicalTurn {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct CanonicalTurnEvent {
-    pub schema_version: String,
-    pub event_id: String,
-    pub event_seq: u64,
-    pub kind: CanonicalTurnEventKind,
-    pub session_id: SessionId,
-    pub turn_id: String,
-    pub turn_seq: u64,
-    pub occurred_at: UtcMillis,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub turn: Option<CanonicalTurn>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub item: Option<CanonicalTurnItem>,
-}
-
 fn reject_changed_field(field: &'static str, unchanged: bool, identity: &str) -> DomainResult<()> {
     if unchanged {
         return Ok(());

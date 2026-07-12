@@ -6,7 +6,6 @@
 import type {
   Message,
   TimelineProjectionArtifact,
-  TimelineProjectionRenderEntry,
   SessionTimelineProjection,
   Session,
   TabType,
@@ -39,22 +38,8 @@ import {
   buildTimelinePanelMessages,
 } from '../lib/timeline-render-items';
 import {
-  compareTimelineSemanticOrder,
-  type TimelineSemanticOrderInput,
-  resolveTimelineBlockSeqFromMetadata,
-  resolveTimelineCardStreamSeqFromMetadata,
-  resolveTimelineEventSeqFromMetadata,
-  resolveTimelineItemSeqFromMetadata,
-  resolveTimelineSortTimestamp,
   resolveTimelineTurnOrderSeqFromMetadata,
-  resolveTimelineVersionFromMetadata,
 } from '../shared/timeline-ordering';
-import {
-  resolveTimelinePresentationKind,
-} from '../shared/timeline-presentation';
-import {
-  normalizeMessagePayload,
-} from '../lib/message-payload';
 import {
   clearCanonicalSessionTurns,
   rebindCanonicalSessionTurns,
@@ -267,6 +252,7 @@ function normalizePersistedAutoScrollConfig(value: unknown): AutoScrollConfig {
 }
 
 type QueuedMessageImageItem = NonNullable<QueuedMessage['images']>[number];
+type QueuedMessageContextReferenceItem = NonNullable<QueuedMessage['contextReferences']>[number];
 
 function normalizeQueuedMessageImage(image: unknown): QueuedMessageImageItem | null {
   if (!image || typeof image !== 'object') {
@@ -279,6 +265,23 @@ function normalizeQueuedMessageImage(image: unknown): QueuedMessageImageItem | n
   return {
     name: typeof item.name === 'string' && item.name.trim() ? item.name.trim() : 'image',
     dataUrl: item.dataUrl,
+  };
+}
+
+function normalizeQueuedMessageContextReference(
+  reference: unknown,
+): QueuedMessageContextReferenceItem | null {
+  if (!reference || typeof reference !== 'object') return null;
+  const item = reference as { kind?: unknown; path?: unknown; name?: unknown };
+  if (item.kind !== 'file' && item.kind !== 'directory') return null;
+  if (typeof item.path !== 'string' || !item.path.trim()) return null;
+  const path = item.path.trim();
+  return {
+    kind: item.kind,
+    path,
+    name: typeof item.name === 'string' && item.name.trim()
+      ? item.name.trim()
+      : path.split(/[\\/]/u).filter(Boolean).pop() || path,
   };
 }
 
@@ -338,6 +341,9 @@ function normalizeQueuedMessageList(value: unknown): QueuedMessage[] {
       images: ensureArray(item.images)
         .map(normalizeQueuedMessageImage)
         .filter((image): image is QueuedMessageImageItem => image !== null),
+      contextReferences: ensureArray(item.contextReferences)
+        .map(normalizeQueuedMessageContextReference)
+        .filter((reference): reference is QueuedMessageContextReferenceItem => reference !== null),
     }));
 }
 
@@ -558,42 +564,6 @@ function resolveMessageMetadataRecord(message: Pick<Message, 'metadata'> | undef
     : undefined;
 }
 
-function resolveMessageSortTimestamp(message: Pick<Message, 'timestamp' | 'metadata' | 'type'>): number {
-  return resolveTimelineSortTimestamp(message.timestamp, resolveMessageMetadataRecord(message));
-}
-
-function normalizeProjectionRestoredMessage(message: Message): Message {
-  return normalizeMessagePayload(message, '[MessagesStore] 投影消息');
-}
-
-function resolveTimelineCardId(message: Message): string | undefined {
-  const rawCardId = typeof message.metadata?.cardId === 'string' ? message.metadata.cardId.trim() : '';
-  return rawCardId || undefined;
-}
-
-function normalizeMetadataString(metadata: Record<string, unknown> | undefined, key: string): string {
-  const value = metadata?.[key];
-  return typeof value === 'string' ? value.trim() : '';
-}
-
-function resolveSidechainTaskId(message: Message): string | undefined {
-  const metadata = resolveMessageMetadataRecord(message);
-  const taskId = normalizeMetadataString(metadata, 'taskId');
-  if (!taskId) {
-    return undefined;
-  }
-  const roleId = normalizeMetadataString(metadata, 'roleId');
-  const workerId = normalizeMetadataString(metadata, 'workerId');
-  if ((roleId && roleId !== 'orchestrator') || workerId) {
-    return taskId;
-  }
-  return undefined;
-}
-
-function resolveProjectionArtifactKind(message: Message): TimelineProjectionArtifact['kind'] {
-  return resolveTimelinePresentationKind(message);
-}
-
 function normalizePositiveSequence(value: unknown): number {
   if (typeof value !== 'number' || !Number.isFinite(value)) {
     return 0;
@@ -611,166 +581,6 @@ function maxTimelineTurnOrderSeqFromArtifacts(artifacts: TimelineProjectionArtif
     (maxSeq, artifact) => Math.max(maxSeq, maxTimelineTurnOrderSeqFromMessage(artifact.message)),
     0,
   );
-}
-
-function getMessageBlockSeq(message: Pick<Message, 'metadata'> | undefined): number {
-  return resolveTimelineBlockSeqFromMetadata(resolveMessageMetadataRecord(message));
-}
-
-interface LocalProjectionFlatRenderEntry {
-  entryId: string;
-  artifactId: string;
-  message: Message;
-  timestamp: number;
-  turnOrderSeq: number;
-  itemSeq: number;
-  anchorEventSeq: number;
-  blockSeq: number;
-  cardStreamSeq: number;
-}
-
-function renderEntryToOrderInput(entry: LocalProjectionFlatRenderEntry): TimelineSemanticOrderInput {
-  return {
-    turnOrderSeq: entry.turnOrderSeq,
-    itemSeq: entry.itemSeq,
-    blockSeq: entry.blockSeq,
-    displayOrder: entry.cardStreamSeq || 0,
-  };
-}
-
-function compareRenderEntryOrder(
-  left: LocalProjectionFlatRenderEntry,
-  right: LocalProjectionFlatRenderEntry,
-): number {
-  return compareTimelineSemanticOrder(
-    renderEntryToOrderInput(left),
-    renderEntryToOrderInput(right),
-  );
-}
-
-function buildProjectionRenderEntriesFromArtifacts(
-  artifacts: TimelineProjectionArtifact[],
-): TimelineProjectionRenderEntry[] {
-  const flatEntries: LocalProjectionFlatRenderEntry[] = [];
-
-  for (const artifact of artifacts) {
-    if (artifact.taskId) {
-      // 代理 artifacts 仅在 RightPane agent run tab 内按 metadata.taskId 过滤呈现，主时间线不收纳
-      continue;
-    }
-    const artifactMetadata = resolveMessageMetadataRecord(artifact.message);
-    flatEntries.push({
-      entryId: `artifact:${artifact.artifactId}`,
-      artifactId: artifact.artifactId,
-      message: artifact.message,
-      timestamp: artifact.timestamp,
-      turnOrderSeq: resolveTimelineTurnOrderSeqFromMetadata(artifactMetadata),
-      itemSeq: resolveTimelineItemSeqFromMetadata(artifactMetadata) || artifact.displayOrder,
-      anchorEventSeq: artifact.anchorEventSeq,
-      blockSeq: getMessageBlockSeq(artifact.message),
-      cardStreamSeq: artifact.cardStreamSeq,
-    });
-  }
-
-  return flatEntries
-    .sort(compareRenderEntryOrder)
-    .map((entry) => ({
-      entryId: entry.entryId,
-      artifactId: entry.artifactId,
-    }));
-}
-
-function isProjectionArtifact(
-  artifact: unknown,
-): artifact is SessionTimelineProjection['artifacts'][number] {
-  return Boolean(
-    artifact
-    && typeof artifact === 'object'
-    && typeof (artifact as SessionTimelineProjection['artifacts'][number]).artifactId === 'string'
-    && (artifact as SessionTimelineProjection['artifacts'][number]).message,
-  );
-}
-
-function canonicalizeTimelineProjection(
-  projection: SessionTimelineProjection,
-): SessionTimelineProjection {
-  const artifacts = ensureArray(projection.artifacts)
-    .filter(isProjectionArtifact)
-    .map((artifact) => {
-      const message = normalizeProjectionRestoredMessage(artifact.message);
-      const artifactMessageId = typeof artifact.artifactId === 'string' && artifact.artifactId.trim()
-        ? artifact.artifactId.trim()
-        : message.id;
-      return {
-        artifactId: artifactMessageId,
-        kind: artifact.kind || resolveProjectionArtifactKind(message),
-        displayOrder: typeof artifact.displayOrder === 'number' && Number.isFinite(artifact.displayOrder)
-          ? Math.max(0, Math.floor(artifact.displayOrder))
-          : 0,
-        artifactVersion: typeof artifact.artifactVersion === 'number' && Number.isFinite(artifact.artifactVersion)
-          ? Math.max(0, Math.floor(artifact.artifactVersion))
-          : resolveTimelineVersionFromMetadata(resolveMessageMetadataRecord(message)),
-        anchorEventSeq: typeof artifact.anchorEventSeq === 'number' && Number.isFinite(artifact.anchorEventSeq)
-          ? Math.max(0, Math.floor(artifact.anchorEventSeq))
-          : (getMessageEventSeq(message) ?? 0),
-        latestEventSeq: typeof artifact.latestEventSeq === 'number' && Number.isFinite(artifact.latestEventSeq)
-          ? Math.max(0, Math.floor(artifact.latestEventSeq))
-          : (getMessageEventSeq(message) ?? 0),
-        cardStreamSeq: typeof artifact.cardStreamSeq === 'number' && Number.isFinite(artifact.cardStreamSeq)
-          ? Math.max(0, Math.floor(artifact.cardStreamSeq))
-          : getMessageCardStreamSeq(message),
-        timestamp: typeof artifact.timestamp === 'number' && Number.isFinite(artifact.timestamp)
-          ? Math.floor(artifact.timestamp)
-          : resolveMessageSortTimestamp(message),
-        cardId: artifact.cardId || resolveTimelineCardId(message),
-        taskId: artifact.taskId || resolveSidechainTaskId(message),
-        messageIds: Array.from(new Set([
-          artifactMessageId,
-          ...ensureArray<string>(artifact.messageIds),
-        ])),
-        message: {
-          ...message,
-          id: artifactMessageId,
-        },
-      } satisfies TimelineProjectionArtifact;
-    })
-    .sort(compareProjectionArtifactsSemanticOrder)
-    .map((artifact) => ({
-      ...artifact,
-      displayOrder: artifact.displayOrder || 0,
-    }));
-  return {
-    ...projection,
-    sessionId: normalizeSessionId(projection.sessionId) || projection.sessionId,
-    artifacts,
-    threadRenderEntries: buildProjectionRenderEntriesFromArtifacts(artifacts),
-  };
-}
-
-function compareProjectionArtifactsSemanticOrder(
-  left: TimelineProjectionArtifact,
-  right: TimelineProjectionArtifact,
-): number {
-  const leftMetadata = resolveMessageMetadataRecord(left.message);
-  const rightMetadata = resolveMessageMetadataRecord(right.message);
-  const semanticOrder = compareTimelineSemanticOrder(
-    {
-      turnOrderSeq: resolveTimelineTurnOrderSeqFromMetadata(leftMetadata),
-      itemSeq: resolveTimelineItemSeqFromMetadata(leftMetadata),
-      blockSeq: resolveTimelineBlockSeqFromMetadata(leftMetadata),
-      displayOrder: left.displayOrder || 0,
-    },
-    {
-      turnOrderSeq: resolveTimelineTurnOrderSeqFromMetadata(rightMetadata),
-      itemSeq: resolveTimelineItemSeqFromMetadata(rightMetadata),
-      blockSeq: resolveTimelineBlockSeqFromMetadata(rightMetadata),
-      displayOrder: right.displayOrder || 0,
-    },
-  );
-  if (semanticOrder !== 0) {
-    return semanticOrder;
-  }
-  return left.artifactId.localeCompare(right.artifactId);
 }
 
 function normalizeOrchestratorRuntimeState(
@@ -1975,16 +1785,6 @@ export function getActiveInteractionType(): string | null {
   return null;
 }
 
-function getMessageEventSeq(message: Message | undefined): number | null {
-  if (!message) return null;
-  const normalized = resolveTimelineEventSeqFromMetadata(resolveMessageMetadataRecord(message));
-  return normalized > 0 ? normalized : null;
-}
-
-function getMessageCardStreamSeq(message: Pick<Message, 'metadata'> | undefined): number {
-  return resolveTimelineCardStreamSeqFromMetadata(resolveMessageMetadataRecord(message));
-}
-
 export function getTimelineProjectionMessageById(messageId: string): Message | undefined {
   const normalizedId = typeof messageId === 'string' ? messageId.trim() : '';
   if (!normalizedId) {
@@ -2096,8 +1896,7 @@ export function setSessionHistoryState(
 }
 
 export function setCanonicalTimelineProjection(projection: SessionTimelineProjection): boolean {
-  const canonicalProjection = canonicalizeTimelineProjection(projection);
-  const projectionSessionId = normalizeSessionId(canonicalProjection.sessionId);
+  const projectionSessionId = normalizeSessionId(projection.sessionId);
   const currentSessionId = normalizeSessionId(messagesState.currentSessionId);
   if (!projectionSessionId || !currentSessionId || projectionSessionId !== currentSessionId) {
     console.warn('[messages-store] 忽略非当前会话的 canonical timeline projection', {
@@ -2108,11 +1907,10 @@ export function setCanonicalTimelineProjection(projection: SessionTimelineProjec
   }
   localTimelineTurnOrderSeqCounter = Math.max(
     localTimelineTurnOrderSeqCounter,
-    maxTimelineTurnOrderSeqFromArtifacts(canonicalProjection.artifacts),
+    maxTimelineTurnOrderSeqFromArtifacts(projection.artifacts),
   );
-  messagesState.canonicalTimelineProjection = canonicalProjection;
-  upsertSessionViewStateSnapshot(createSessionViewStateSnapshot(canonicalProjection.sessionId));
-  saveWebviewState();
+  messagesState.canonicalTimelineProjection = projection;
+  upsertSessionViewStateSnapshot(createSessionViewStateSnapshot(projection.sessionId));
   return true;
 }
 

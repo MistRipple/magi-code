@@ -1919,6 +1919,7 @@ mod tests {
                 denied_tools: Vec::new(),
                 allowed_paths: Vec::new(),
                 denied_paths: Vec::new(),
+                read_only_paths: Vec::new(),
                 network_mode: "full".to_string(),
                 command_mode: "full".to_string(),
                 retry_limit: 1,

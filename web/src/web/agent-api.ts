@@ -932,6 +932,8 @@ export interface DirectoryListResult {
   path: string;
   parent: string;
   entries: DirectoryEntry[];
+  selectedPath?: string;
+  selectedKind?: 'file';
   error?: string;
 }
 
@@ -1147,6 +1149,11 @@ export async function submitSessionTurn(
     skillName?: string | null;
     goalMode?: boolean;
     images: AgentSessionTurnImagePayload[];
+    contextReferences?: Array<{
+      kind: 'file' | 'directory';
+      path: string;
+      name: string;
+    }>;
     accessProfile?: 'read_only' | 'restricted' | 'full_access' | null;
     orchestratorSessionConfig?: Record<string, unknown> | null;
     requestId?: string | null;
@@ -1181,6 +1188,11 @@ export async function submitSessionTurn(
         images: payload.images.map((image) => ({
           name: image.name,
           dataUrl: image.dataUrl,
+        })),
+        contextReferences: (payload.contextReferences ?? []).map((reference) => ({
+          kind: reference.kind,
+          path: reference.path,
+          name: reference.name,
         })),
         orchestratorSessionConfig: payload.orchestratorSessionConfig ?? null,
       }),

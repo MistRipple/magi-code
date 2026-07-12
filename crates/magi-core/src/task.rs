@@ -386,6 +386,8 @@ pub struct TaskPolicy {
     pub denied_tools: Vec<String>,
     pub allowed_paths: Vec<String>,
     pub denied_paths: Vec<String>,
+    #[serde(default)]
+    pub read_only_paths: Vec<String>,
     pub network_mode: String,
     pub command_mode: String,
     pub retry_limit: u32,

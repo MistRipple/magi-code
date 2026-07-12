@@ -111,6 +111,7 @@ fn test_task_policy(
         denied_tools,
         allowed_paths: vec!["/tmp/worker-allowed".to_string()],
         denied_paths: vec!["/tmp/worker-denied".to_string()],
+        read_only_paths: Vec::new(),
         network_mode: "default".to_string(),
         command_mode: command_mode.to_string(),
         retry_limit: 0,

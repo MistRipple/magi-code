@@ -72,15 +72,18 @@ impl BootstrapDto {
         state: &ApiState,
         requested_session_id: Option<&SessionId>,
     ) -> Result<Self, ApiError> {
+        let event_snapshot = state.event_bus.snapshot();
         Self::from_state_with_session_projection(
             state,
             select_session_projection(state.session_store.projection_input(), requested_session_id),
+            event_snapshot,
         )
     }
 
     pub(crate) fn from_state_with_session_projection(
         state: &ApiState,
         session_projection: SessionProjectionInput,
+        event_snapshot: EventStreamSnapshot,
     ) -> Result<Self, ApiError> {
         let mut dto = Self::from_projection_with_usage(
             state.runtime_epoch().to_string(),
@@ -89,7 +92,7 @@ impl BootstrapDto {
             state.workspace_registry.projection_input(),
             state.session_store.execution_sidecar_exports(),
             state.workspace_registry.recovery_sidecar_exports(),
-            state.event_bus.snapshot(),
+            event_snapshot,
             state.event_bus.runtime_read_model_input(),
             state.audit_usage_ledger_dto(),
             state.bridge_services_dto(),
@@ -198,7 +201,7 @@ impl BootstrapDto {
             canonical_turns: session_projection
                 .canonical_turns
                 .into_iter()
-                .map(public_bootstrap_canonical_turn)
+                .map(public_canonical_turn)
                 .filter(|turn| !turn.items.is_empty())
                 .collect(),
             workspaces: workspace_projection.workspaces,
@@ -340,21 +343,6 @@ fn select_bootstrap_recent_events(
         selected = selected.split_off(start);
     }
     selected
-}
-
-fn public_bootstrap_canonical_turn(turn: CanonicalTurn) -> CanonicalTurn {
-    let mut turn = public_canonical_turn(turn);
-    retain_bootstrap_canonical_items(&mut turn);
-    turn
-}
-
-fn retain_bootstrap_canonical_items(turn: &mut CanonicalTurn) {
-    turn.items.retain(|item| {
-        item.worker
-            .as_ref()
-            .and_then(|worker| worker.worker_id.as_ref())
-            .is_none()
-    });
 }
 
 fn public_bootstrap_event_envelope(mut event: EventEnvelope) -> EventEnvelope {
@@ -795,7 +783,7 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap首屏只保留主线canonical并裁掉事件重型回放() {
+    fn bootstrap首屏保留完整canonical并裁掉事件重型回放() {
         let session_id = SessionId::new("session-bootstrap-mainline-only");
         let now = UtcMillis::now();
         let turn_id = "canonical-turn-mainline";
@@ -865,8 +853,8 @@ mod tests {
         );
 
         assert_eq!(bootstrap.canonical_turns.len(), 1);
-        assert_eq!(bootstrap.canonical_turns[0].items.len(), 1);
-        assert!(bootstrap.canonical_turns[0].items[0].worker.is_none());
+        assert_eq!(bootstrap.canonical_turns[0].items.len(), 2);
+        assert!(bootstrap.canonical_turns[0].items[1].worker.is_some());
         let event_payload = &bootstrap.recent_events[0].payload;
         assert!(event_payload.get("turn_items").is_none());
         assert!(event_payload.get("canonical_turn").is_none());

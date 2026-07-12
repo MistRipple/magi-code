@@ -1,20 +1,22 @@
 <script lang="ts">
   import { untrack } from 'svelte';
+  import type { FilePreviewScope } from '../lib/file-reference';
   import Icon from './Icon.svelte';
   import MarkdownContent from './MarkdownContent.svelte';
   import { i18n } from '../stores/i18n.svelte';
 
-  // Props
   interface Props {
     content: string;
     isStreaming?: boolean;
     initialExpanded?: boolean;
+    filePreviewScope?: FilePreviewScope;
   }
 
   let {
     content,
     isStreaming = false,
-    initialExpanded
+    initialExpanded,
+    filePreviewScope = undefined,
   }: Props = $props();
 
   // 折叠状态只由初始配置决定；流式输出期间也允许用户手动展开/折叠
@@ -22,9 +24,6 @@
 
   const thinkingContent = $derived((content ?? '').trim());
 
-  // 单一标题文案：流式时显示「思考中...」，完成后显示「思考已完成」。
-  // 之前并存「固定标题 + 内容摘要」两层，信息冗余且摘要在长思考输出里读起来割裂，
-  // 现在按状态收敛到一行——读者只关心"还在思考 / 已经思考完"两种状态。
   const title = $derived(
     isStreaming
       ? i18n.t('thinkingBlock.streamingTitle')
@@ -56,7 +55,7 @@
   {#if !collapsed}
     <div class="thinking-content">
       <div class="thinking-body">
-        <MarkdownContent content={thinkingContent} {isStreaming} />
+        <MarkdownContent content={thinkingContent} {isStreaming} {filePreviewScope} />
       </div>
     </div>
   {/if}
@@ -99,9 +98,6 @@
     padding: var(--space-3);
     border-top: 1px solid var(--border);
     background: rgba(139, 92, 246, 0.02);
-    /* 🔧 移除固定高度限制，让内容自然撑开 */
-    /* max-height: 400px; */
-    /* overflow-y: auto; */
     animation: expandContent 0.2s ease-out;
   }
 

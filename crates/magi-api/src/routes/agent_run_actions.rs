@@ -314,6 +314,7 @@ async fn restart_task(
         skill_name: restart_active_skill_id(&root_task),
         goal_mode: false,
         images: Vec::new(),
+        context_references: Vec::new(),
         access_profile: root_task
             .policy_snapshot
             .as_ref()
@@ -466,6 +467,7 @@ mod tests {
                 denied_tools: Vec::new(),
                 allowed_paths: Vec::new(),
                 denied_paths: Vec::new(),
+                read_only_paths: Vec::new(),
                 network_mode: "full".to_string(),
                 command_mode: "full".to_string(),
                 retry_limit: 1,

@@ -18,6 +18,8 @@ export interface CanonicalTurnReducerState {
 export interface CanonicalTurnReduceResult {
   state: CanonicalTurnReducerState;
   changed: boolean;
+  changedTurnIds?: string[];
+  cursorAdvanced?: boolean;
   error?: string;
 }
 
@@ -128,6 +130,13 @@ function mergeCanonicalTurnItem(
   }
 
   const existing = items[existingIndex];
+  if (
+    existing.itemVersion !== undefined
+    && incoming.itemVersion !== undefined
+    && incoming.itemVersion < existing.itemVersion
+  ) {
+    return { items, changed: false };
+  }
   const error = validateCanonicalTurnItemUpdate(existing, incoming);
   if (error) {
     return { items, changed: false, error };
@@ -136,6 +145,17 @@ function mergeCanonicalTurnItem(
   const next = cloneTurnItem(incoming);
   if (JSON.stringify(existing) === JSON.stringify(next)) {
     return { items, changed: false };
+  }
+  if (
+    existing.itemVersion !== undefined
+    && incoming.itemVersion !== undefined
+    && incoming.itemVersion === existing.itemVersion
+  ) {
+    return {
+      items,
+      changed: false,
+      error: `canonical turn item ${incoming.itemId} reused itemVersion ${incoming.itemVersion} with different facts`,
+    };
   }
 
   const merged = [...items];
@@ -174,7 +194,7 @@ function mergeCanonicalTurn(
     return { turn: existing, changed: false, error: turnError };
   }
 
-  let nextItems = existing.items.map(cloneTurnItem);
+  let nextItems = existing.items;
   let changed = false;
   for (const item of incoming.items) {
     const merged = mergeCanonicalTurnItem(nextItems, item);
@@ -186,7 +206,7 @@ function mergeCanonicalTurn(
   }
 
   const nextTurn: CanonicalTurn = {
-    ...cloneTurn(existing),
+    ...existing,
     status: incoming.status,
     completedAt: incoming.completedAt,
     responseDurationMs: incoming.responseDurationMs,
@@ -205,9 +225,119 @@ function mergeCanonicalTurn(
   };
 }
 
+function applyCanonicalStreamUpdate(
+  state: CanonicalTurnReducerState,
+  event: CanonicalTurnEvent,
+): CanonicalTurnReduceResult {
+  const stream = event.stream;
+  if (!stream) {
+    return { state, changed: false, error: `canonical turn event ${event.eventId} missing stream payload` };
+  }
+  const turnIndex = state.turns.findIndex((turn) => turn.turnId === event.turnId);
+  if (turnIndex < 0) {
+    return { state, changed: false, error: `canonical stream event ${event.eventId} references unknown turn ${event.turnId}` };
+  }
+  const turn = state.turns[turnIndex];
+  const itemIndex = turn.items.findIndex((item) => item.itemId === stream.itemId);
+  if (itemIndex < 0) {
+    return { state, changed: false, error: `canonical stream event ${event.eventId} references unknown item ${stream.itemId}` };
+  }
+  const item = turn.items[itemIndex];
+  const currentVersion = item.itemVersion ?? 0;
+  if (stream.itemVersion === currentVersion) {
+    const currentChars = Array.from(item.content || '');
+    const matchesAppliedVersion = stream.reset
+      ? (item.content || '') === stream.delta
+      : currentChars.slice(stream.baseContentLength, stream.contentLength).join('') === stream.delta;
+    if (!matchesAppliedVersion || stream.itemStatus !== item.status) {
+      return {
+        state,
+        changed: false,
+        error: `canonical stream event ${event.eventId} reused itemVersion ${stream.itemVersion} with different facts`,
+      };
+    }
+  }
+  if (stream.itemVersion <= currentVersion || isCanonicalTerminalStatus(item.status)) {
+    const nextEventSeq = event.eventSeq > 0
+      ? Math.max(state.lastAppliedEventSeq, event.eventSeq)
+      : state.lastAppliedEventSeq;
+    return nextEventSeq === state.lastAppliedEventSeq
+      ? { state, changed: false }
+      : {
+          state: { ...state, lastAppliedEventSeq: nextEventSeq },
+          changed: false,
+          cursorAdvanced: true,
+        };
+  }
+  const statusError = validateCanonicalTurnItemUpdate(item, {
+    ...item,
+    status: stream.itemStatus,
+    itemVersion: stream.itemVersion,
+  });
+  if (statusError) {
+    return { state, changed: false, error: statusError };
+  }
+  const currentContent = item.content || '';
+  const currentChars = Array.from(currentContent);
+  const deltaChars = Array.from(stream.delta);
+  let content = currentContent;
+  if (stream.reset) {
+    content = stream.delta;
+  } else if (currentChars.length < stream.baseContentLength) {
+    return {
+      state,
+      changed: false,
+      error: `canonical stream event ${event.eventId} starts after local content: ${stream.baseContentLength} > ${currentChars.length}`,
+    };
+  } else if (currentChars.length <= stream.contentLength) {
+    const overlapLength = currentChars.length - stream.baseContentLength;
+    const expectedDeltaLength = stream.contentLength - stream.baseContentLength;
+    const currentOverlap = currentChars.slice(stream.baseContentLength).join('');
+    const deltaOverlap = deltaChars.slice(0, overlapLength).join('');
+    if (deltaChars.length !== expectedDeltaLength || currentOverlap !== deltaOverlap) {
+      return {
+        state,
+        changed: false,
+        error: `canonical stream event ${event.eventId} does not continue the local content baseline`,
+      };
+    }
+    content = `${currentContent}${deltaChars.slice(overlapLength).join('')}`;
+  }
+  const reconciledLength = Array.from(content).length;
+  if ((stream.reset && reconciledLength !== stream.contentLength) || reconciledLength < stream.contentLength) {
+    return {
+      state,
+      changed: false,
+      error: `canonical stream event ${event.eventId} content length mismatch: ${reconciledLength} != ${stream.contentLength}`,
+    };
+  }
+  const nextItems = [...turn.items];
+  nextItems[itemIndex] = {
+    ...item,
+    content,
+    status: stream.itemStatus,
+    itemVersion: stream.itemVersion,
+    updatedAt: event.occurredAt,
+  };
+  const nextTurns = [...state.turns];
+  nextTurns[turnIndex] = { ...turn, items: nextItems };
+  return {
+    state: {
+      sessionId: state.sessionId || event.sessionId,
+      turns: nextTurns,
+      lastAppliedEventSeq: event.eventSeq > 0
+        ? Math.max(state.lastAppliedEventSeq, event.eventSeq)
+        : state.lastAppliedEventSeq,
+    },
+    changed: true,
+    changedTurnIds: [turn.turnId],
+  };
+}
+
 export function replaceCanonicalTurns(
   sessionId: string,
   turns: CanonicalTurn[],
+  lastAppliedEventSeq = 0,
 ): CanonicalTurnReducerState {
   const normalizedSessionId = normalizeSessionId(sessionId);
   return {
@@ -216,7 +346,7 @@ export function replaceCanonicalTurns(
       .filter((turn) => turn.sessionId === normalizedSessionId)
       .map(cloneTurn)
       .sort(compareCanonicalTurns),
-    lastAppliedEventSeq: 0,
+    lastAppliedEventSeq: Math.max(0, Math.floor(lastAppliedEventSeq)),
   };
 }
 
@@ -231,11 +361,15 @@ export function reduceCanonicalTurnEvent(
   if (state.sessionId && state.sessionId !== normalizedSessionId) {
     return { state, changed: false, error: `canonical turn event session mismatch: ${state.sessionId} != ${normalizedSessionId}` };
   }
-  if (event.eventSeq > 0 && state.lastAppliedEventSeq > 0 && event.eventSeq < state.lastAppliedEventSeq) {
+  if (event.eventSeq > 0 && state.lastAppliedEventSeq > 0 && event.eventSeq <= state.lastAppliedEventSeq) {
     return { state, changed: false };
   }
 
-  let turns = state.turns.map(cloneTurn);
+  if (event.stream && !event.item && !event.turn) {
+    return applyCanonicalStreamUpdate(state, event);
+  }
+
+  let turns = state.turns;
   let changed = false;
   let targetTurn: CanonicalTurn | undefined = event.turn;
   const existingIndex = findCanonicalTurnIndex(turns, event);
@@ -265,7 +399,7 @@ export function reduceCanonicalTurnEvent(
     )
   );
 
-  if (replacingLocalOptimisticTurn) {
+  if (replacingLocalOptimisticTurn && existing) {
     let nextTurn = cloneTurn(targetTurn);
     if (event.item) {
       const itemMerge = mergeCanonicalTurnItem(nextTurn.items, event.item);
@@ -277,6 +411,7 @@ export function reduceCanonicalTurnEvent(
         items: itemMerge.items,
       };
     }
+    turns = [...turns];
     turns[existingIndex] = nextTurn;
     turns = turns.sort(compareCanonicalTurns);
     return {
@@ -288,6 +423,7 @@ export function reduceCanonicalTurnEvent(
           : state.lastAppliedEventSeq,
       },
       changed: true,
+      changedTurnIds: [existing.turnId, nextTurn.turnId],
     };
   }
 
@@ -333,9 +469,10 @@ export function reduceCanonicalTurnEvent(
   }
 
   if (existingIndex >= 0) {
+    turns = [...turns];
     turns[existingIndex] = nextTurn;
   } else {
-    turns.push(nextTurn);
+    turns = [...turns, nextTurn];
   }
   turns = turns.sort(compareCanonicalTurns);
 
@@ -343,8 +480,14 @@ export function reduceCanonicalTurnEvent(
     ? Math.max(state.lastAppliedEventSeq, event.eventSeq)
     : state.lastAppliedEventSeq;
 
-  if (!changed && nextLastAppliedEventSeq === state.lastAppliedEventSeq) {
-    return { state, changed: false };
+  if (!changed) {
+    return nextLastAppliedEventSeq === state.lastAppliedEventSeq
+      ? { state, changed: false }
+      : {
+          state: { ...state, lastAppliedEventSeq: nextLastAppliedEventSeq },
+          changed: false,
+          cursorAdvanced: true,
+        };
   }
 
   return {
@@ -354,5 +497,6 @@ export function reduceCanonicalTurnEvent(
       lastAppliedEventSeq: nextLastAppliedEventSeq,
     },
     changed: true,
+    changedTurnIds: [nextTurn.turnId],
   };
 }

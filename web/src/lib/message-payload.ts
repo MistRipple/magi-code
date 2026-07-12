@@ -1,6 +1,7 @@
 import type {
   ContentBlock,
   Message,
+  MessageContextReference,
   MessageImage,
   MessageRole,
   MessageSource,
@@ -170,6 +171,34 @@ function sanitizeMessageImages(
         dataUrl,
       };
     });
+  return normalized.length > 0 ? normalized : undefined;
+}
+
+function sanitizeMessageContextReferences(
+  references: unknown,
+  errorPrefix: string,
+): MessageContextReference[] | undefined {
+  if (references === undefined) {
+    return undefined;
+  }
+  if (!Array.isArray(references)) {
+    throw new Error(`${errorPrefix} contextReferences 无效`);
+  }
+  const normalized = references.map((reference) => {
+    if (!isPlainRecord(reference)) {
+      throw new Error(`${errorPrefix} contextReferences 条目无效`);
+    }
+    const kind: MessageContextReference['kind'] | null =
+      reference.kind === 'file' || reference.kind === 'directory'
+        ? reference.kind
+        : null;
+    const path = typeof reference.path === 'string' ? reference.path.trim() : '';
+    const name = typeof reference.name === 'string' ? reference.name.trim() : '';
+    if (!kind || !path || !name) {
+      throw new Error(`${errorPrefix} contextReferences 字段无效`);
+    }
+    return { kind, path, name };
+  });
   return normalized.length > 0 ? normalized : undefined;
 }
 
@@ -399,6 +428,10 @@ export function normalizeMessagePayload(message: Message, errorPrefix = '[Messag
   const blocks = sanitizeMessageBlocks(message.blocks, errorPrefix);
   const metadata = sanitizeMessageMetadata(message.metadata, errorPrefix);
   const images = sanitizeMessageImages(message.images, errorPrefix);
+  const contextReferences = sanitizeMessageContextReferences(
+    message.contextReferences,
+    errorPrefix,
+  );
   const type = resolveMessageType({ role, type: message.type }, errorPrefix);
   const noticeType = typeof message.noticeType === 'string' && NOTICE_TYPE_SET.has(message.noticeType as NoticeType)
     ? message.noticeType as NoticeType
@@ -417,6 +450,7 @@ export function normalizeMessagePayload(message: Message, errorPrefix = '[Messag
     type,
     ...(noticeType ? { noticeType } : {}),
     ...(images ? { images } : {}),
+    ...(contextReferences ? { contextReferences } : {}),
     ...(metadata ? { metadata } : {}),
   };
 }
@@ -535,6 +569,12 @@ export function sanitizeMessagePatch(
     normalized.images = updates.images === undefined
       ? undefined
       : sanitizeMessageImages(updates.images, errorPrefix);
+  }
+
+  if ('contextReferences' in updates) {
+    normalized.contextReferences = updates.contextReferences === undefined
+      ? undefined
+      : sanitizeMessageContextReferences(updates.contextReferences, errorPrefix);
   }
 
   if ('metadata' in updates) {

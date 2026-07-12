@@ -71,6 +71,7 @@ pub struct SessionTurnExecutionRequest {
     pub workspace_id: Option<WorkspaceId>,
     pub prompt: String,
     pub images: Vec<SessionTurnImage>,
+    pub context_references: Vec<crate::context_reference::SessionContextReference>,
     pub use_tools: bool,
     pub access_profile: AccessProfile,
     pub skill_name: Option<String>,
@@ -261,6 +262,14 @@ fn build_session_turn_messages(
     } else {
         Vec::new()
     };
+    if let Some(reference_prompt) =
+        crate::context_reference::session_context_references_prompt(&request.context_references)
+    {
+        messages.push(system_prompt_fragment_message(
+            PromptFragmentKind::ContextReferences,
+            reference_prompt,
+        ));
+    }
     messages.append(&mut history);
     messages.push(system_prompt_fragment_message(
         PromptFragmentKind::CurrentTurnPriority,
@@ -1023,6 +1032,7 @@ fn stream_session_turn_round(
                 session_id: &request.session_id,
                 workspace_id: &request.workspace_id,
                 workspace_root_path: request.workspace_root_path.as_deref().map(PathBuf::from),
+                context_references: &request.context_references,
                 access_profile: request.access_profile,
                 snapshot_session,
                 execution_group_id: Some(execution_group_id),
@@ -1288,6 +1298,7 @@ mod tests {
             workspace_id: None,
             prompt: "画一个流程图".to_string(),
             images: Vec::new(),
+            context_references: Vec::new(),
             use_tools: true,
             access_profile: AccessProfile::Restricted,
             skill_name: None,
@@ -1326,6 +1337,7 @@ mod tests {
             workspace_id: None,
             prompt: "依次调用 shell_exec、file_write、file_read".to_string(),
             images: Vec::new(),
+            context_references: Vec::new(),
             use_tools: true,
             access_profile: AccessProfile::Restricted,
             skill_name: None,
@@ -1439,6 +1451,7 @@ mod tests {
             workspace_id: None,
             prompt: "请回复一句话".to_string(),
             images: Vec::new(),
+            context_references: Vec::new(),
             use_tools: false,
             access_profile: AccessProfile::Restricted,
             skill_name: None,
@@ -1530,6 +1543,7 @@ mod tests {
             workspace_id: None,
             prompt: "请输出长回复".to_string(),
             images: Vec::new(),
+            context_references: Vec::new(),
             use_tools: false,
             access_profile: AccessProfile::Restricted,
             skill_name: None,
@@ -1631,6 +1645,7 @@ mod tests {
                 SessionTurnImage::from_data_url("smoke.png", "data:image/png;base64,iVBORw0KGgo=")
                     .expect("image should parse"),
             ],
+            context_references: Vec::new(),
             use_tools: false,
             access_profile: AccessProfile::Restricted,
             skill_name: None,
@@ -1731,6 +1746,7 @@ mod tests {
             workspace_id: None,
             prompt: "请只回复一句话".to_string(),
             images: Vec::new(),
+            context_references: Vec::new(),
             use_tools: false,
             access_profile: AccessProfile::Restricted,
             skill_name: None,
@@ -1949,6 +1965,7 @@ mod tests {
             workspace_id: None,
             prompt: "请基于上一轮结果，用一句话回答：再加 4 等于几？".to_string(),
             images: Vec::new(),
+            context_references: Vec::new(),
             use_tools: false,
             access_profile: AccessProfile::Restricted,
             skill_name: None,
@@ -2014,6 +2031,7 @@ mod tests {
             workspace_id: Some(WorkspaceId::new("workspace-context")),
             prompt: "分析一下当前项目".to_string(),
             images: Vec::new(),
+            context_references: Vec::new(),
             use_tools: true,
             access_profile: AccessProfile::Restricted,
             skill_name: None,
@@ -2048,6 +2066,52 @@ mod tests {
     }
 
     #[test]
+    fn build_session_turn_messages_injects_structured_context_references() {
+        let session_id = SessionId::new("session-context-references");
+        let store = SessionStore::new();
+        store
+            .create_session(session_id.clone(), "context references")
+            .expect("session should be created");
+        let request = SessionTurnExecutionRequest {
+            session_id,
+            turn_id: "turn-context-references".to_string(),
+            workspace_id: Some(WorkspaceId::new("workspace-context-references")),
+            prompt: "分析引用内容".to_string(),
+            images: Vec::new(),
+            context_references: vec![crate::context_reference::SessionContextReference {
+                kind: crate::context_reference::SessionContextReferenceKind::Directory,
+                path: PathBuf::from("/tmp/external-reference"),
+                name: "external-reference".to_string(),
+            }],
+            use_tools: true,
+            access_profile: AccessProfile::Restricted,
+            skill_name: None,
+            request_id: None,
+            user_message_id: None,
+            placeholder_message_id: None,
+            forced_tool_name: None,
+            required_tool_chain: Vec::new(),
+            goal_turn_mode: SessionGoalTurnMode::None,
+            workspace_root_path: Some("/tmp/current-project".to_string()),
+        };
+
+        let messages = build_session_turn_messages(&store, &request, &request.prompt);
+        let reference_context = messages
+            .iter()
+            .filter_map(|message| message.content.as_deref())
+            .find(|content| content.contains("/tmp/external-reference"))
+            .expect("context reference prompt should be injected");
+        assert!(reference_context.contains("只读上下文引用"));
+        assert!(reference_context.contains("directory"));
+        assert_eq!(
+            messages
+                .last()
+                .and_then(|message| message.content.as_deref()),
+            Some("分析引用内容")
+        );
+    }
+
+    #[test]
     fn build_session_turn_messages_attaches_current_user_images() {
         let session_id = SessionId::new("session-current-image");
         let store = SessionStore::new();
@@ -2077,6 +2141,7 @@ mod tests {
                 SessionTurnImage::from_data_url("paste.png", "data:image/png;base64,AAA")
                     .expect("image should parse"),
             ],
+            context_references: Vec::new(),
             use_tools: false,
             access_profile: AccessProfile::Restricted,
             skill_name: None,
@@ -2126,6 +2191,7 @@ mod tests {
             workspace_id: Some(WorkspaceId::new("workspace-context")),
             prompt: "解释一下当前状态".to_string(),
             images: Vec::new(),
+            context_references: Vec::new(),
             use_tools: false,
             access_profile: AccessProfile::Restricted,
             skill_name: None,
@@ -2195,6 +2261,7 @@ mod tests {
             workspace_id: None,
             prompt: "请调用工具后回答".to_string(),
             images: Vec::new(),
+            context_references: Vec::new(),
             use_tools: true,
             access_profile: AccessProfile::Restricted,
             skill_name: None,
@@ -2330,6 +2397,7 @@ mod tests {
             workspace_id: None,
             prompt: "请回答".to_string(),
             images: Vec::new(),
+            context_references: Vec::new(),
             use_tools: false,
             access_profile: AccessProfile::Restricted,
             skill_name: None,

@@ -14,9 +14,11 @@ import type {
   CanonicalTurnItemStatus,
 } from '../shared/protocol/canonical-turn';
 import { isCanonicalTerminalStatus } from '../shared/protocol/canonical-turn';
+import type { ContentBlock as StandardContentBlock } from '../shared/protocol/message-protocol';
 import type { CanonicalTurnReducerState } from './turn-reducer';
 import { coerceToolArgumentsRecord } from '../lib/tool-call-display';
 import { buildCanonicalToolFileChangeBlocks } from '../lib/canonical-tool-file-change';
+import { mapStandardBlocks } from '../lib/message-utils';
 
 /**
  * 单个 turn 的「呈现层」预计算结果。
@@ -131,6 +133,9 @@ function buildToolBlock(tool: CanonicalToolCall, status: CanonicalTurnItemStatus
 }
 
 function buildMessageBlocks(item: CanonicalTurnItem, content: string): ContentBlock[] | undefined {
+  if (item.blocks && item.blocks.length > 0) {
+    return mapStandardBlocks(item.blocks as StandardContentBlock[]);
+  }
   if (item.kind === 'tool_call' && item.tool) {
     const fileChangeBlocks = buildCanonicalToolFileChangeBlocks({
       blockIdBase: item.tool.callId,
@@ -234,6 +239,32 @@ function normalizeMessageImagesFromMetadata(
   return normalized.length > 0 ? normalized : undefined;
 }
 
+function normalizeMessageContextReferencesFromMetadata(
+  metadata: Record<string, unknown> | undefined,
+): import('../types/message').MessageContextReference[] | undefined {
+  const references = metadata?.contextReferences;
+  if (!Array.isArray(references)) return undefined;
+  const normalized = references
+    .filter((reference): reference is Record<string, unknown> => (
+      Boolean(reference) && typeof reference === 'object' && !Array.isArray(reference)
+    ))
+    .map((reference) => {
+      const kind = reference.kind === 'file' || reference.kind === 'directory'
+        ? reference.kind
+        : null;
+      const path = typeof reference.path === 'string' ? reference.path.trim() : '';
+      if (!kind || !path) return null;
+      const name = typeof reference.name === 'string' && reference.name.trim()
+        ? reference.name.trim()
+        : path.split(/[\\/]/u).filter(Boolean).pop() || path;
+      return { kind, path, name };
+    })
+    .filter((reference): reference is import('../types/message').MessageContextReference => (
+      reference !== null
+    ));
+  return normalized.length > 0 ? normalized : undefined;
+}
+
 function messageMetadataWithoutTransportImages(
   metadata: Record<string, unknown> | undefined,
 ): Record<string, unknown> {
@@ -242,6 +273,7 @@ function messageMetadataWithoutTransportImages(
   }
   const messageMetadata = { ...metadata };
   delete messageMetadata.images;
+  delete messageMetadata.contextReferences;
   return messageMetadata;
 }
 
@@ -253,6 +285,7 @@ function shouldRenderItem(item: CanonicalTurnItem): boolean {
     item.kind === 'assistant_text'
     && isCanonicalTerminalStatus(item.status)
     && resolveItemContent(item).trim().length === 0
+    && (!item.blocks || item.blocks.length === 0)
   ) {
     return false;
   }
@@ -302,6 +335,9 @@ function buildMessage(
   const images = item.kind === 'user_message'
     ? normalizeMessageImagesFromMetadata(item.metadata)
     : undefined;
+  const contextReferences = item.kind === 'user_message'
+    ? normalizeMessageContextReferencesFromMetadata(item.metadata)
+    : undefined;
   return {
     id: artifactId,
     role: resolveMessageRole(item),
@@ -309,6 +345,7 @@ function buildMessage(
     content,
     ...(blocks ? { blocks } : {}),
     ...(images ? { images } : {}),
+    ...(contextReferences ? { contextReferences } : {}),
     timestamp: item.createdAt,
     updatedAt: item.updatedAt,
     isStreaming,
@@ -337,6 +374,15 @@ function buildMessage(
       ...(taskId ? { taskId } : {}),
       toolCallId: item.tool?.callId,
       toolName: item.tool?.name,
+      renderRevision: [
+        item.itemVersion ?? 0,
+        item.updatedAt,
+        item.status,
+        content.length,
+        blocks?.length ?? 0,
+        valueToDisplayText(item.tool?.result)?.length ?? 0,
+        item.tool?.error?.length ?? 0,
+      ].join(':'),
       ...(responseDurationMs !== undefined ? { responseDurationMs } : {}),
       canonical: true,
     },
@@ -604,5 +650,72 @@ export function buildCanonicalTimelineProjection(state: CanonicalTurnReducerStat
     lastAppliedEventSeq: state.lastAppliedEventSeq,
     artifacts,
     threadRenderEntries,
+  };
+}
+
+function artifactTurnId(artifact: TimelineProjectionArtifact): string {
+  const value = artifact.message.metadata?.turnId;
+  return typeof value === 'string' ? value : '';
+}
+
+function reuseEquivalentArtifact(
+  previousById: Map<string, TimelineProjectionArtifact>,
+  artifact: TimelineProjectionArtifact,
+): TimelineProjectionArtifact {
+  const previous = previousById.get(artifact.artifactId);
+  return previous && JSON.stringify(previous) === JSON.stringify(artifact) ? previous : artifact;
+}
+
+function mergeSortedArtifacts(
+  left: TimelineProjectionArtifact[],
+  right: TimelineProjectionArtifact[],
+): TimelineProjectionArtifact[] {
+  const merged: TimelineProjectionArtifact[] = [];
+  let leftIndex = 0;
+  let rightIndex = 0;
+  while (leftIndex < left.length && rightIndex < right.length) {
+    if (compareArtifacts(left[leftIndex]!, right[rightIndex]!) <= 0) {
+      merged.push(left[leftIndex++]!);
+    } else {
+      merged.push(right[rightIndex++]!);
+    }
+  }
+  merged.push(...left.slice(leftIndex), ...right.slice(rightIndex));
+  return merged;
+}
+
+export function updateCanonicalTimelineProjection(
+  previous: SessionTimelineProjection | null,
+  state: CanonicalTurnReducerState,
+  changedTurnIds: readonly string[] = [],
+): SessionTimelineProjection | null {
+  if (!previous || previous.sessionId !== state.sessionId || changedTurnIds.length === 0) {
+    return buildCanonicalTimelineProjection(state);
+  }
+  const changedTurnIdSet = new Set(changedTurnIds);
+  const previousById = new Map<string, TimelineProjectionArtifact>();
+  const retained: TimelineProjectionArtifact[] = [];
+  for (const artifact of previous.artifacts) {
+    if (changedTurnIdSet.has(artifactTurnId(artifact))) {
+      previousById.set(artifact.artifactId, artifact);
+    } else {
+      retained.push(artifact);
+    }
+  }
+  const changed = collapseArtifactsByStableCard(state.turns
+    .filter((turn) => changedTurnIdSet.has(turn.turnId))
+    .flatMap((turn) => buildTurnProjectionArtifacts(turn))
+    .filter((artifact): artifact is TimelineProjectionArtifact => Boolean(artifact))
+    .map((artifact) => reuseEquivalentArtifact(previousById, artifact)));
+  const artifacts = mergeSortedArtifacts(retained, changed);
+  return {
+    schemaVersion: 'session-timeline-projection.v2',
+    sessionId: state.sessionId,
+    updatedAt: Date.now(),
+    lastAppliedEventSeq: state.lastAppliedEventSeq,
+    artifacts,
+    threadRenderEntries: artifacts
+      .filter((artifact) => !artifact.taskId)
+      .map(renderEntry),
   };
 }

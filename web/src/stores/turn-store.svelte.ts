@@ -8,7 +8,7 @@ import {
   reduceCanonicalTurnEvent,
   replaceCanonicalTurns,
 } from './turn-reducer';
-import { buildCanonicalTimelineProjection } from './turn-projection';
+import { buildCanonicalTimelineProjection, updateCanonicalTimelineProjection } from './turn-projection';
 
 export const turnStoreState = $state({
   reducer: createCanonicalTurnReducerState(''),
@@ -69,15 +69,27 @@ export function applyCanonicalTurnEvent(event: CanonicalTurnEvent): SessionTimel
     return null;
   }
   if (!result.changed) {
+    if (result.cursorAdvanced) {
+      turnStoreState.reducer = result.state;
+    }
     return turnStoreState.projection;
   }
   turnStoreState.lastError = null;
   turnStoreState.reducer = result.state;
-  return publishProjection();
+  turnStoreState.projection = updateCanonicalTimelineProjection(
+    turnStoreState.projection,
+    turnStoreState.reducer,
+    result.changedTurnIds,
+  );
+  return turnStoreState.projection;
 }
 
-export function replaceCanonicalSessionTurns(sessionId: string, turns: CanonicalTurn[]): SessionTimelineProjection | null {
-  turnStoreState.reducer = replaceCanonicalTurns(sessionId, turns);
+export function replaceCanonicalSessionTurns(
+  sessionId: string,
+  turns: CanonicalTurn[],
+  lastAppliedEventSeq = 0,
+): SessionTimelineProjection | null {
+  turnStoreState.reducer = replaceCanonicalTurns(sessionId, turns, lastAppliedEventSeq);
   turnStoreState.lastError = null;
   return publishProjection();
 }
@@ -89,4 +101,4 @@ export function clearCanonicalSessionTurns(sessionId?: string): void {
   turnStoreState.lastError = null;
 }
 
-export { buildCanonicalTimelineProjection };
+export { buildCanonicalTimelineProjection, updateCanonicalTimelineProjection };

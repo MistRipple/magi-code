@@ -6,12 +6,19 @@
 
   interface Props {
     title?: string;
-    onSelect: (path: string, name: string) => void;
+    onSelect: (path: string, name: string, kind: 'file' | 'directory') => void;
     onCancel: () => void;
     disabled?: boolean;
+    selectionMode?: 'directory' | 'file-or-directory';
   }
 
-  const { title, onSelect, onCancel, disabled = false }: Props = $props();
+  const {
+    title,
+    onSelect,
+    onCancel,
+    disabled = false,
+    selectionMode = 'directory',
+  }: Props = $props();
 
   let currentPath = $state('');
   let parentPath = $state('');
@@ -49,6 +56,9 @@
       currentPath = result.path;
       parentPath = result.parent;
       entries = result.entries;
+      selectedPath = selectionMode === 'file-or-directory' && result.selectedKind === 'file'
+        ? result.selectedPath?.trim() || ''
+        : '';
       manualPathInput = result.path;
       hasLoaded = true;
     } catch (err) {
@@ -87,7 +97,11 @@
   }
 
   function handleDblClick(entry: DirectoryEntry): void {
-    enterDirectory(entry);
+    if (entry.isDirectory) {
+      enterDirectory(entry);
+    } else if (selectionMode === 'file-or-directory') {
+      onSelect(entry.path, entry.name, 'file');
+    }
   }
 
   function getPathSegments(rawPath: string): string[] {
@@ -141,14 +155,19 @@
     if (!targetPath) {
       return;
     }
-    onSelect(targetPath, getPathBasename(targetPath));
+    const selectedEntry = entries.find((entry) => entry.path === selectedPath);
+    onSelect(
+      targetPath,
+      getPathBasename(targetPath),
+      selectedEntry && !selectedEntry.isDirectory ? 'file' : 'directory',
+    );
   }
 
   function selectCurrentDir(): void {
     if (!currentPath) {
       return;
     }
-    onSelect(currentPath, getPathBasename(currentPath));
+    onSelect(currentPath, getPathBasename(currentPath), 'directory');
   }
 
   function toggleManualInput(): void {
@@ -293,9 +312,11 @@
             class:selected={selectedPath === entry.path}
             class:is-file={!entry.isDirectory}
             type="button"
-            disabled={!entry.isDirectory}
-            onclick={() => { if (entry.isDirectory) selectEntry(entry); }}
-            ondblclick={() => { if (entry.isDirectory) handleDblClick(entry); }}
+            disabled={!entry.isDirectory && selectionMode === 'directory'}
+            onclick={() => {
+              if (entry.isDirectory || selectionMode === 'file-or-directory') selectEntry(entry);
+            }}
+            ondblclick={() => handleDblClick(entry)}
           >
             <div class="mac-item-icon" class:is-file={!entry.isDirectory}>
               <Icon name={entry.isDirectory ? 'folder' : 'document'} size={16} />
@@ -591,7 +612,12 @@
     cursor: default;
   }
 
-  .mac-list-item.is-file:hover {
+  .mac-list-item.is-file:not(:disabled) {
+    opacity: 1;
+    cursor: pointer;
+  }
+
+  .mac-list-item.is-file:disabled:hover {
     background: transparent;
   }
 

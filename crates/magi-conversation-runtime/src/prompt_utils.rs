@@ -80,6 +80,7 @@ pub fn subagent_multi_agent_mode_prompt() -> String {
 pub enum PromptFragmentKind {
     Role,
     WorkspaceContext,
+    ContextReferences,
     ProjectMemory,
     TodoLedger,
     Mailbox,
@@ -92,6 +93,7 @@ impl PromptFragmentKind {
         match self {
             Self::Role => "role",
             Self::WorkspaceContext => "workspace_context",
+            Self::ContextReferences => "context_references",
             Self::ProjectMemory => "project_memory",
             Self::TodoLedger => "todo_ledger",
             Self::Mailbox => "mailbox",

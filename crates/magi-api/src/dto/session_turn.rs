@@ -1,3 +1,6 @@
+use magi_conversation_runtime::context_reference::{
+    SessionContextReference, SessionContextReferenceKind,
+};
 use magi_conversation_runtime::session_images::SessionTurnImage;
 use magi_core::{AccessProfile, EventId, SessionId, TaskId, UtcMillis};
 use magi_session_store::{CANONICAL_TURN_SCHEMA_VERSION, CanonicalTurn, CanonicalTurnItem};
@@ -9,6 +12,21 @@ use serde_json::Value;
 pub struct SessionTurnImageDto {
     pub name: String,
     pub data_url: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionContextReferenceKindDto {
+    File,
+    Directory,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SessionContextReferenceDto {
+    pub kind: SessionContextReferenceKindDto,
+    pub path: String,
+    pub name: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -24,6 +42,8 @@ pub struct SessionTurnRequestDto {
     pub goal_mode: bool,
     #[serde(default)]
     pub images: Vec<SessionTurnImageDto>,
+    #[serde(default)]
+    pub context_references: Vec<SessionContextReferenceDto>,
     #[serde(default)]
     pub access_profile: Option<AccessProfile>,
     #[serde(default)]
@@ -42,6 +62,94 @@ pub struct SessionTurnRequestDto {
 }
 
 impl SessionTurnRequestDto {
+    pub fn validate_context_references(&mut self) -> Result<Vec<SessionContextReference>, String> {
+        const MAX_CONTEXT_REFERENCES: usize = 20;
+        if self.context_references.len() > MAX_CONTEXT_REFERENCES {
+            return Err(format!(
+                "单轮最多添加 {MAX_CONTEXT_REFERENCES} 个文件或文件夹引用"
+            ));
+        }
+
+        let mut validated = Vec::new();
+        for reference in self.context_references.clone() {
+            let raw_path = reference.path.trim();
+            if raw_path.is_empty() {
+                return Err("上下文引用路径不能为空".to_string());
+            }
+            let path = std::path::PathBuf::from(raw_path);
+            if !path.is_absolute() {
+                return Err("上下文引用必须使用绝对路径".to_string());
+            }
+            let canonical = path
+                .canonicalize()
+                .map_err(|_| format!("上下文引用不可用: {}", path.display()))?;
+            let kind = match reference.kind {
+                SessionContextReferenceKindDto::File if canonical.is_file() => {
+                    SessionContextReferenceKind::File
+                }
+                SessionContextReferenceKindDto::Directory if canonical.is_dir() => {
+                    SessionContextReferenceKind::Directory
+                }
+                SessionContextReferenceKindDto::File => {
+                    return Err(format!("引用路径不是文件: {}", canonical.display()));
+                }
+                SessionContextReferenceKindDto::Directory => {
+                    return Err(format!("引用路径不是文件夹: {}", canonical.display()));
+                }
+            };
+            if validated
+                .iter()
+                .any(|existing: &SessionContextReference| existing.path == canonical)
+            {
+                continue;
+            }
+            let name = reference.name.trim().to_string();
+            let name = if name.is_empty() {
+                canonical
+                    .file_name()
+                    .map(|value| value.to_string_lossy().to_string())
+                    .unwrap_or_else(|| canonical.display().to_string())
+            } else {
+                name
+            };
+            validated.push(SessionContextReference {
+                kind,
+                path: canonical,
+                name,
+            });
+        }
+        self.context_references = validated
+            .iter()
+            .map(|reference| SessionContextReferenceDto {
+                kind: match reference.kind {
+                    SessionContextReferenceKind::File => SessionContextReferenceKindDto::File,
+                    SessionContextReferenceKind::Directory => {
+                        SessionContextReferenceKindDto::Directory
+                    }
+                },
+                path: reference.path.display().to_string(),
+                name: reference.name.clone(),
+            })
+            .collect();
+        Ok(validated)
+    }
+
+    pub fn context_references(&self) -> Vec<SessionContextReference> {
+        self.context_references
+            .iter()
+            .map(|reference| SessionContextReference {
+                kind: match reference.kind {
+                    SessionContextReferenceKindDto::File => SessionContextReferenceKind::File,
+                    SessionContextReferenceKindDto::Directory => {
+                        SessionContextReferenceKind::Directory
+                    }
+                },
+                path: std::path::PathBuf::from(&reference.path),
+                name: reference.name.clone(),
+            })
+            .collect()
+    }
+
     pub fn mission_title(&self, trimmed_text: Option<&str>) -> String {
         trimmed_text
             .map(normalize_task_title)
@@ -89,6 +197,9 @@ impl SessionTurnRequestDto {
         }
         if !self.images.is_empty() {
             message_lines.push(format!("[图片 {} 张]", self.images.len()));
+        }
+        if message_lines.is_empty() && !self.context_references.is_empty() {
+            message_lines.push(format!("[上下文引用 {} 项]", self.context_references.len()));
         }
         if message_lines.is_empty() {
             "[空输入]".to_string()
@@ -264,6 +375,7 @@ mod tests {
             skill_name: None,
             goal_mode: false,
             images: Vec::new(),
+            context_references: Vec::new(),
             access_profile: None,
             orchestrator_session_config: None,
             request_id: None,
@@ -320,5 +432,82 @@ mod tests {
             request.timeline_message(request.trimmed_text().as_deref()),
             "完成稳定性验收"
         );
+    }
+
+    #[test]
+    fn session_turn_request_accepts_structured_context_references() {
+        let request: SessionTurnRequestDto = serde_json::from_value(serde_json::json!({
+            "text": "分析引用的文件",
+            "images": [],
+            "contextReferences": [
+                {
+                    "kind": "file",
+                    "path": "/tmp/reference.md",
+                    "name": "reference.md"
+                },
+                {
+                    "kind": "directory",
+                    "path": "/tmp/reference-dir",
+                    "name": "reference-dir"
+                }
+            ]
+        }))
+        .expect("structured context references should parse");
+
+        assert_eq!(request.context_references.len(), 2);
+        assert_eq!(request.context_references[0].path, "/tmp/reference.md");
+        assert_eq!(
+            request.context_references[1].kind,
+            SessionContextReferenceKindDto::Directory
+        );
+        assert_eq!(
+            request.timeline_message(request.trimmed_text().as_deref()),
+            "分析引用的文件",
+            "structured references must stay out of user-authored content"
+        );
+    }
+
+    #[test]
+    fn context_references_are_canonicalized_deduplicated_and_type_checked() {
+        let root =
+            std::env::temp_dir().join(format!("magi-context-reference-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("folder")).expect("reference directory should create");
+        std::fs::write(root.join("file.md"), "reference\n").expect("reference file should create");
+
+        let mut request: SessionTurnRequestDto = serde_json::from_value(serde_json::json!({
+            "text": "验证引用",
+            "contextReferences": [
+                { "kind": "file", "path": root.join("file.md"), "name": "file.md" },
+                { "kind": "file", "path": root.join("file.md"), "name": "duplicate.md" },
+                { "kind": "directory", "path": root.join("folder"), "name": "folder" }
+            ]
+        }))
+        .expect("context reference request should parse");
+
+        let references = request
+            .validate_context_references()
+            .expect("valid references should canonicalize");
+        assert_eq!(references.len(), 2);
+        assert_eq!(references[0].name, "file.md");
+        assert!(references[0].path.is_absolute());
+        assert_eq!(references[1].kind.as_str(), "directory");
+        assert_eq!(request.context_references.len(), 2);
+        assert_eq!(
+            request.context_references[0].path,
+            references[0].path.display().to_string(),
+            "queued requests must retain the canonical reference facts"
+        );
+
+        let mut invalid: SessionTurnRequestDto = serde_json::from_value(serde_json::json!({
+            "text": "验证错误类型",
+            "contextReferences": [
+                { "kind": "directory", "path": root.join("file.md"), "name": "file.md" }
+            ]
+        }))
+        .expect("invalid reference kind should still parse transport payload");
+        assert!(invalid.validate_context_references().is_err());
+
+        std::fs::remove_dir_all(root).expect("reference fixture should clean up");
     }
 }

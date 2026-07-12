@@ -13,7 +13,9 @@ await withGoldenViteServer(async (server) => {
   const contract = await server.ssrLoadModule('/src/shared/bridges/rust-daemon-contract.ts');
   const viewImagePreview = await server.ssrLoadModule('/src/lib/view-image-preview.ts');
   const canonicalProtocol = await server.ssrLoadModule('/src/shared/protocol/canonical-turn.ts');
-  runGoldenReplay(reducer, projection, messagesStore, dataHandlers, timelineRenderItems, agentOutput, contract, viewImagePreview, canonicalProtocol);
+  const blockRegistry = await server.ssrLoadModule('/src/lib/block-registry.ts');
+  const markdownUrl = await server.ssrLoadModule('/src/lib/markdown-url.ts');
+  runGoldenReplay(reducer, projection, messagesStore, dataHandlers, timelineRenderItems, agentOutput, contract, viewImagePreview, canonicalProtocol, blockRegistry, markdownUrl);
   console.log('canonical turn golden replay passed');
 }, { configFile: 'vite.web.config.ts' });
 
@@ -43,7 +45,7 @@ function installGoldenMemoryBridge(bridgeRuntime) {
   });
 }
 
-function runGoldenReplay(reducer, projection, messagesStore, dataHandlers, timelineRenderItems, agentOutput, contract, viewImagePreview, canonicalProtocol) {
+function runGoldenReplay(reducer, projection, messagesStore, dataHandlers, timelineRenderItems, agentOutput, contract, viewImagePreview, canonicalProtocol, blockRegistry, markdownUrl) {
   const cases = [
     acceptedFirstFrameCase(),
     ordinaryChatCase(),
@@ -94,7 +96,7 @@ function runGoldenReplay(reducer, projection, messagesStore, dataHandlers, timel
   assertSplitToolStartedAndResultCollapseIntoOneCard(reducer, projection);
   assertCancelledToolShowsTurnResponseDuration(reducer, projection);
   assertFailedToolWithoutAssistantShowsTurnResponseDuration(reducer, projection);
-  assertUserImageMetadataProjectsToMessage(reducer, projection);
+  assertUserImageMetadataProjectsToMessage(reducer, projection, timelineRenderItems);
   assertViewImageToolResultProjectsAsPreview(reducer, projection, viewImagePreview);
   assertAgentSpawnToolCardStaysOnMainlineAndTaskTabsFilterByTaskId(reducer, projection, timelineRenderItems);
   assertRuntimeInternalAgentWaitIsHiddenFromCanonicalMainline(reducer, projection, timelineRenderItems);
@@ -109,6 +111,253 @@ function runGoldenReplay(reducer, projection, messagesStore, dataHandlers, timel
   assertMessagesStoreClearsLocalPendingFromAuthoritativeIdle(messagesStore);
   assertSessionSwitchClearsExecutionState(messagesStore);
   assertCanonicalTurnModelRejectsSnakeCase(canonicalProtocol);
+  assertCanonicalStreamPayloadParsesWithoutSnapshots(canonicalProtocol);
+  assertCanonicalStreamDeltaUpdatesOneItem(reducer, projection);
+  assertCanonicalBlocksProjectToFirstClassCards(reducer, projection);
+  assertBootstrapSeedsCanonicalEventWatermark(reducer);
+  assertUnknownCanonicalBlockHasNoTextFallback(blockRegistry);
+  assertMarkdownUrlSanitizerKeepsOnlyValidFileLinks(markdownUrl);
+}
+
+function assertMarkdownUrlSanitizerKeepsOnlyValidFileLinks(markdownUrl) {
+  const linkContext = { type: 'link', tag: 'a' };
+  const imageContext = { type: 'image', tag: 'img' };
+  assert.equal(
+    markdownUrl.sanitizeMarkdownUrl('file:///Users/xie/code/TEST/README.md', linkContext),
+    'file:///Users/xie/code/TEST/README.md',
+    '可验证的本地文件 Markdown 链接必须保留给文件预览处理器',
+  );
+  assert.equal(
+    markdownUrl.sanitizeMarkdownUrl('file:///Users/xie/code/TEST/README.md', imageContext),
+    '',
+    '本地文件协议不得作为图片资源直接加载',
+  );
+  assert.equal(
+    markdownUrl.sanitizeMarkdownUrl('javascript:alert(1)', linkContext),
+    '',
+    '危险协议必须继续被默认安全策略拒绝',
+  );
+}
+
+function assertUnknownCanonicalBlockHasNoTextFallback(blockRegistry) {
+  assert.equal(
+    blockRegistry.getBlockRenderer({ type: 'future_unknown_block' }),
+    undefined,
+    'unknown structured blocks must not be silently rendered as plain text',
+  );
+}
+
+function assertBootstrapSeedsCanonicalEventWatermark(reducer) {
+  const c = baseCase('bootstrap-watermark', 'session-golden-bootstrap-watermark', 'turn-golden-bootstrap-watermark', 14_000);
+  const assistantItem = assistantText(c, 1, 'assistant-stream', '快照内容', 'running');
+  assistantItem.itemVersion = 4;
+  const state = reducer.replaceCanonicalTurns(
+    c.sessionId,
+    [turn(c, 'running', [assistantItem])],
+    100,
+  );
+  assert.equal(state.lastAppliedEventSeq, 100, 'bootstrap must seed the reducer event watermark');
+  const replayed = reducer.reduceCanonicalTurnEvent(state, event(c, 100, 'turn_item_upsert', {
+    stream: {
+      itemId: assistantItem.itemId,
+      itemVersion: 5,
+      itemStatus: 'running',
+      baseContentLength: 4,
+      delta: '重复',
+      contentLength: 6,
+      reset: false,
+    },
+  }));
+  assert.equal(replayed.changed, false, 'event at the bootstrap watermark must not replay');
+  assert.equal(replayed.state.turns[0].items[0].content, '快照内容');
+}
+
+function assertCanonicalStreamPayloadParsesWithoutSnapshots(canonicalProtocol) {
+  const event = canonicalProtocol.parseCanonicalTurnEventPayload({
+    canonical_schema_version: 'canonical-turn.v1',
+    canonical_event_kind: 'turn_item_upsert',
+    session_id: 'session-stream-payload',
+    turn_id: 'turn-stream-payload',
+    turn_seq: 7,
+    canonical_item_id: 'assistant-stream',
+    canonical_item_version: 3,
+    canonical_item_status: 'running',
+    stream_base_content_length: 2,
+    stream_delta: '世界',
+    stream_content_length: 4,
+    stream_reset: false,
+  }, {
+    eventId: 'event-stream-payload',
+    eventSeq: 12,
+    occurredAt: 100,
+  });
+
+  assert.ok(event, 'delta-only canonical payload should parse without canonical_turn/canonical_item');
+  assert.equal(event.turn, undefined, 'delta-only stream payload must not require a full turn snapshot');
+  assert.equal(event.item, undefined, 'delta-only stream payload must not require a full item snapshot');
+  assert.deepEqual(event.stream, {
+    itemId: 'assistant-stream',
+    itemVersion: 3,
+    itemStatus: 'running',
+    baseContentLength: 2,
+    delta: '世界',
+    contentLength: 4,
+    reset: false,
+  });
+}
+
+function assertCanonicalStreamDeltaUpdatesOneItem(reducer, projection) {
+  const c = baseCase('incremental-stream-delta', 'session-golden-incremental-stream', 'turn-golden-incremental-stream', 12_000);
+  const userItem = user(c, 1, '请流式回复。');
+  const assistantItem = assistantText(c, 2, 'assistant-stream', '你', 'running');
+  assistantItem.itemVersion = 1;
+  let state = reducer.replaceCanonicalTurns(c.sessionId, [
+    turn(c, 'running', [userItem, assistantItem]),
+  ]);
+  const initialProjection = projection.buildCanonicalTimelineProjection(state);
+  const initialUserArtifact = findArtifactByTurnItemId(initialProjection, userItem.itemId);
+  const initialAssistantArtifact = findArtifactByTurnItemId(initialProjection, assistantItem.itemId);
+
+  const appended = reducer.reduceCanonicalTurnEvent(state, event(c, 2, 'turn_item_upsert', {
+    stream: {
+      itemId: assistantItem.itemId,
+      itemVersion: 2,
+      itemStatus: 'running',
+      baseContentLength: 1,
+      delta: '好',
+      contentLength: 2,
+      reset: false,
+    },
+  }));
+  assert.equal(appended.error, undefined);
+  assert.equal(appended.changed, true, 'new stream item version should update reducer state');
+  assert.deepEqual(appended.changedTurnIds, [c.turnId]);
+  assert.equal(appended.state.turns[0].items[1].content, '你好');
+  assert.equal(appended.state.turns[0].items[1].itemVersion, 2);
+  assert.equal(
+    appended.state.turns[0].items[0],
+    state.turns[0].items[0],
+    'delta update must preserve unchanged item identity',
+  );
+
+  const incrementalProjection = projection.updateCanonicalTimelineProjection(
+    initialProjection,
+    appended.state,
+    appended.changedTurnIds,
+  );
+  assert.equal(
+    findArtifactByTurnItemId(incrementalProjection, userItem.itemId),
+    initialUserArtifact,
+    'incremental projection must retain unchanged historical artifacts',
+  );
+  assert.notEqual(
+    findArtifactByTurnItemId(incrementalProjection, assistantItem.itemId),
+    initialAssistantArtifact,
+    'changed stream item must receive a fresh artifact projection',
+  );
+
+  state = appended.state;
+  const duplicate = reducer.reduceCanonicalTurnEvent(state, event(c, 3, 'turn_item_upsert', {
+    stream: {
+      itemId: assistantItem.itemId,
+      itemVersion: 2,
+      itemStatus: 'running',
+      baseContentLength: 1,
+      delta: '好',
+      contentLength: 2,
+      reset: false,
+    },
+  }));
+  assert.equal(duplicate.changed, false, 'duplicate item version must not append delta twice');
+  assert.equal(duplicate.cursorAdvanced, true, 'duplicate facts should still advance the transport cursor');
+  assert.equal(duplicate.state.lastAppliedEventSeq, 3);
+  assert.equal(duplicate.state.turns[0].items[1].content, '你好');
+
+  const conflictingDuplicate = reducer.reduceCanonicalTurnEvent(state, event(c, 4, 'turn_item_upsert', {
+    stream: {
+      itemId: assistantItem.itemId,
+      itemVersion: 2,
+      itemStatus: 'running',
+      baseContentLength: 1,
+      delta: '错',
+      contentLength: 2,
+      reset: false,
+    },
+  }));
+  assert.match(
+    conflictingDuplicate.error,
+    /reused itemVersion 2 with different facts/,
+    'same stream version with different facts must trigger protocol recovery',
+  );
+
+  const reset = reducer.reduceCanonicalTurnEvent(state, event(c, 5, 'turn_item_upsert', {
+    stream: {
+      itemId: assistantItem.itemId,
+      itemVersion: 3,
+      itemStatus: 'running',
+      baseContentLength: 2,
+      delta: '重新',
+      contentLength: 2,
+      reset: true,
+    },
+  }));
+  assert.equal(reset.changed, true);
+  assert.equal(reset.state.turns[0].items[1].content, '重新');
+
+  const stale = reducer.reduceCanonicalTurnEvent(reset.state, event(c, 6, 'turn_item_upsert', {
+    stream: {
+      itemId: assistantItem.itemId,
+      itemVersion: 2,
+      itemStatus: 'running',
+      baseContentLength: 2,
+      delta: '旧帧',
+      contentLength: 4,
+      reset: false,
+    },
+  }));
+  assert.equal(stale.changed, false, 'older item version must be rejected even with a newer event sequence');
+  assert.equal(stale.state.turns[0].items[1].content, '重新');
+
+  const snapshotItem = assistantText(c, 2, 'assistant-stream', '你好', 'running');
+  const snapshotState = reducer.replaceCanonicalTurns(c.sessionId, [
+    turn(c, 'running', [userItem, snapshotItem]),
+  ], 5);
+  const overlapped = reducer.reduceCanonicalTurnEvent(snapshotState, event(c, 7, 'turn_item_upsert', {
+    stream: {
+      itemId: snapshotItem.itemId,
+      itemVersion: 2,
+      itemStatus: 'running',
+      baseContentLength: 1,
+      delta: '好呀',
+      contentLength: 3,
+      reset: false,
+    },
+  }));
+  assert.equal(overlapped.error, undefined, 'bootstrap-covered delta prefix should reconcile without recovery');
+  assert.equal(overlapped.state.turns[0].items[1].content, '你好呀');
+}
+
+function assertCanonicalBlocksProjectToFirstClassCards(reducer, projection) {
+  const c = baseCase('canonical-blocks', 'session-golden-canonical-blocks', 'turn-golden-canonical-blocks', 13_000);
+  const blockItem = assistantText(c, 1, 'assistant-blocks', '', 'completed');
+  blockItem.blocks = [
+    { type: 'code', blockId: 'code-main', language: 'ts', content: 'const ready = true;' },
+    { type: 'plan', blockId: 'plan-main', goal: '完成消息链路重构', constraints: ['单一 canonical 权威链路'] },
+    { type: 'file_change', filePath: 'src/main.ts', changeType: 'modify', additions: 2, deletions: 1 },
+  ];
+  const state = reducer.replaceCanonicalTurns(c.sessionId, [
+    turn(c, 'completed', [blockItem], { completedAt: 13_100, responseDurationMs: 100 }),
+  ]);
+  const artifact = findArtifactByTurnItemId(
+    projection.buildCanonicalTimelineProjection(state),
+    blockItem.itemId,
+  );
+  assert.ok(artifact, 'renderable canonical blocks must create an artifact even when text content is empty');
+  assert.deepEqual(
+    artifact.message.blocks.map((block) => block.type),
+    ['code', 'plan', 'file_change'],
+    'canonical blocks must remain first-class cards instead of being discarded',
+  );
 }
 
 function assertWorkspaceDraftPreservesSessionList(dataHandlers, messagesStore) {
@@ -238,6 +487,24 @@ function assertCanonicalTurnModelRejectsSnakeCase(canonicalProtocol) {
     canonicalProtocol.normalizeCanonicalTurn(snakeTurn),
     undefined,
     'canonical turn model must not accept snake_case fields',
+  );
+  assert.equal(
+    canonicalProtocol.normalizeCanonicalTurnItem({
+      sessionId: 'session-invalid-block',
+      turnId: 'turn-invalid-block',
+      turnSeq: 1,
+      itemId: 'item-invalid-block',
+      itemSeq: 1,
+      kind: 'assistant_text',
+      createdAt: 1,
+      updatedAt: 1,
+      status: 'completed',
+      sourceThreadId: 'thread-invalid-block',
+      visibility: { renderable: true },
+      blocks: [{ type: 'future_unknown_block', content: '不能静默进入 projection' }],
+    }),
+    undefined,
+    'canonical parser must reject unsupported structured blocks at the protocol boundary',
   );
 }
 
@@ -425,13 +692,20 @@ function findArtifactByTurnItemId(projectionValue, itemId) {
   ));
 }
 
-function assertUserImageMetadataProjectsToMessage(reducer, projection) {
+function assertUserImageMetadataProjectsToMessage(reducer, projection, timelineRenderItems) {
   const c = baseCase('user-image-metadata', 'session-golden-user-image', 'turn-golden-user-image', 9300);
   const imageMetadata = {
     images: [
       {
         name: 'paste.png',
         dataUrl: 'data:image/png;base64,AAA',
+      },
+    ],
+    contextReferences: [
+      {
+        kind: 'file',
+        path: '/tmp/reference.md',
+        name: 'reference.md',
       },
     ],
   };
@@ -453,6 +727,22 @@ function assertUserImageMetadataProjectsToMessage(reducer, projection) {
     userArtifact.message.metadata?.images,
     undefined,
     'transport image metadata should not remain duplicated on projected message metadata',
+  );
+  assert.deepEqual(
+    userArtifact.message.contextReferences,
+    imageMetadata.contextReferences,
+    'user context reference metadata must project to first-class Message.contextReferences',
+  );
+  const threadItems = timelineRenderItems.buildTimelineRenderItems(projectionValue, 'thread');
+  assert.deepEqual(
+    threadItems.find((entry) => entry.message.type === 'user_input')?.message.contextReferences,
+    imageMetadata.contextReferences,
+    'timeline render cloning must preserve context references for MessageItem rendering',
+  );
+  assert.equal(
+    userArtifact.message.metadata?.contextReferences,
+    undefined,
+    'transport context reference metadata should not remain duplicated on projected message metadata',
   );
 }
 
@@ -627,8 +917,9 @@ function assertLocalPendingTurnIsReplacedByAcceptedCanonicalTurn(reducer, projec
   }));
   assert.equal(result.error, undefined, 'local pending canonical event should reduce');
   state = result.state;
+  const localProjection = projection.buildCanonicalTimelineProjection(state);
   assert.deepEqual(
-    projectionSignature(projection.buildCanonicalTimelineProjection(state)),
+    projectionSignature(localProjection),
     [
       signatureMessage('message', 'user_message', 1000, localUser.content),
       signatureMessageWithStatus('message', 'assistant_text', 2000, '', 'running'),
@@ -644,7 +935,21 @@ function assertLocalPendingTurnIsReplacedByAcceptedCanonicalTurn(reducer, projec
   assert.equal(result.state.turns.length, 1, 'local optimistic turn must not remain as a duplicate');
   assert.equal(result.state.turns[0].turnId, accepted.turnId);
   assert.deepEqual(
-    projectionSignature(projection.buildCanonicalTimelineProjection(result.state)),
+    result.changedTurnIds,
+    [local.turnId, accepted.turnId],
+    'optimistic replacement must invalidate both the old and accepted turn artifacts',
+  );
+  const incrementalProjection = projection.updateCanonicalTimelineProjection(
+    localProjection,
+    result.state,
+    result.changedTurnIds,
+  );
+  assert.ok(
+    incrementalProjection.artifacts.every((artifact) => artifact.message.metadata?.turnId === accepted.turnId),
+    'incremental projection must remove every optimistic artifact after acceptance',
+  );
+  assert.deepEqual(
+    projectionSignature(incrementalProjection),
     [
       signatureMessage('message', 'user_message', 1000, acceptedUser.content),
       signatureMessageWithStatus('message', 'assistant_text', 2000, '', 'running'),
@@ -828,6 +1133,11 @@ function assertMessagesStoreRejectsForeignSessionProjection(reducer, projection,
     messagesStore.setCanonicalTimelineProjection(activeProjection),
     true,
     'active session projection should be accepted by messages store',
+  );
+  assert.equal(
+    messagesStore.messagesState.canonicalTimelineProjection,
+    activeProjection,
+    'messages store must retain the canonical projection instead of cloning the full timeline',
   );
   const before = projectionSignature(messagesStore.messagesState.canonicalTimelineProjection);
 

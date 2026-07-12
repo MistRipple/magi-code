@@ -6,6 +6,7 @@
   import MdLink from './renderers/MdLink.svelte';
   import MdImage from './renderers/MdImage.svelte';
   import MdText from './renderers/MdText.svelte';
+  import { sanitizeMarkdownUrl } from '../lib/markdown-url';
 
   interface Props {
     source: string;
@@ -38,4 +39,5 @@
   {source}
   {renderers}
   {options}
+  sanitizeUrl={sanitizeMarkdownUrl}
 />

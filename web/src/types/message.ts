@@ -270,6 +270,12 @@ export interface MessageImage {
   dataUrl: string;
 }
 
+export interface MessageContextReference {
+  kind: 'file' | 'directory';
+  path: string;
+  name: string;
+}
+
 export interface ToolPolicyPayload {
   schemaVersion: 'tool-policy.v1';
   source: 'request' | 'mode' | 'skill' | 'composed';
@@ -521,6 +527,8 @@ export interface Message {
   noticeType?: NoticeType;    // 通知类型（info/success/warning/error）
   /** 用户上传的图片（base64 Data URL 格式） */
   images?: MessageImage[];
+  /** 用户显式添加的文件或目录上下文引用。 */
+  contextReferences?: MessageContextReference[];
   metadata?: {
     model?: string;
     tokens?: number;
@@ -624,6 +632,12 @@ export interface QueuedMessageImage {
   dataUrl: string;
 }
 
+export interface QueuedMessageContextReference {
+  kind: 'file' | 'directory';
+  path: string;
+  name: string;
+}
+
 export interface QueuedMessage {
   id: string;
   requestId?: string;
@@ -640,6 +654,7 @@ export interface QueuedMessage {
   goalMode?: boolean;
   accessProfile?: 'read_only' | 'restricted' | 'full_access' | null;
   images?: QueuedMessageImage[];
+  contextReferences?: QueuedMessageContextReference[];
 }
 
 // 处理中的 Actor

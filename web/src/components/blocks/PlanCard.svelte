@@ -1,13 +1,16 @@
 <script lang="ts">
   import type { ContentBlock } from '../../types/message';
+  import type { FilePreviewScope } from '../../lib/file-reference';
   import Icon from '../Icon.svelte';
+  import MarkdownContent from '../MarkdownContent.svelte';
   import { i18n } from '../../stores/i18n.svelte';
 
   interface Props {
     block: ContentBlock;
+    filePreviewScope?: FilePreviewScope;
   }
 
-  let { block }: Props = $props();
+  let { block, filePreviewScope = undefined }: Props = $props();
   const plan = $derived(block.plan);
 </script>
 
@@ -21,12 +24,12 @@
     </div>
 
     <div class="plan-body">
-      <div class="plan-goal">{plan.goal}</div>
+      <div class="plan-goal"><MarkdownContent content={plan.goal} {filePreviewScope} /></div>
 
       {#if plan.analysis}
         <div class="plan-section">
           <div class="section-title">{i18n.t('planCard.analysis')}</div>
-          <div class="section-body">{plan.analysis}</div>
+          <div class="section-body"><MarkdownContent content={plan.analysis} {filePreviewScope} /></div>
         </div>
       {/if}
 
@@ -35,7 +38,7 @@
           <div class="section-title">{i18n.t('planCard.constraints')}</div>
           <ul>
             {#each plan.constraints as item}
-              <li>{item}</li>
+              <li><MarkdownContent content={item} {filePreviewScope} /></li>
             {/each}
           </ul>
         </div>
@@ -46,7 +49,7 @@
           <div class="section-title">{i18n.t('planCard.acceptanceCriteria')}</div>
           <ul>
             {#each plan.acceptanceCriteria as item}
-              <li>{item}</li>
+              <li><MarkdownContent content={item} {filePreviewScope} /></li>
             {/each}
           </ul>
         </div>
@@ -64,7 +67,7 @@
           <div class="section-title">{i18n.t('planCard.riskFactors')}</div>
           <ul>
             {#each plan.riskFactors as item}
-              <li>{item}</li>
+              <li><MarkdownContent content={item} {filePreviewScope} /></li>
             {/each}
           </ul>
         </div>

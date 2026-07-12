@@ -1024,6 +1024,7 @@ function emitLocalPendingCanonicalTurn(input: {
   placeholderMessageId: string;
   text: string;
   images: Array<{ name: string; dataUrl: string }>;
+  contextReferences: Array<{ kind: 'file' | 'directory'; path: string; name: string }>;
   turnSeq: number;
   createdAt: number;
 }): boolean {
@@ -1038,6 +1039,9 @@ function emitLocalPendingCanonicalTurn(input: {
     userMessageId: input.userMessageId,
     placeholderMessageId: input.placeholderMessageId,
     ...(input.images.length > 0 ? { images: input.images } : {}),
+    ...(input.contextReferences.length > 0
+      ? { contextReferences: input.contextReferences }
+      : {}),
     localOptimistic: true,
   };
   const assistantItem = {
@@ -1107,6 +1111,7 @@ function emitLocalPendingCanonicalTurnFailed(input: {
   placeholderMessageId: string;
   text: string;
   images: Array<{ name: string; dataUrl: string }>;
+  contextReferences: Array<{ kind: 'file' | 'directory'; path: string; name: string }>;
   turnSeq: number;
   createdAt: number;
   failedAt: number;
@@ -1123,6 +1128,9 @@ function emitLocalPendingCanonicalTurnFailed(input: {
     userMessageId: input.userMessageId,
     placeholderMessageId: input.placeholderMessageId,
     ...(input.images.length > 0 ? { images: input.images } : {}),
+    ...(input.contextReferences.length > 0
+      ? { contextReferences: input.contextReferences }
+      : {}),
     localTerminal: true,
   };
   const userItem = {
@@ -2736,6 +2744,11 @@ interface ExecuteTaskInput {
     name: string;
     dataUrl: string;
   }>;
+  contextReferences?: Array<{
+    kind: 'file' | 'directory';
+    path: string;
+    name: string;
+  }>;
 }
 
 function bridgeRuntimeIsBusy(): boolean {
@@ -2765,6 +2778,7 @@ function enqueueFollowUpTurn(input: ExecuteTaskInput, normalizedText: string): v
     goalMode: input.goalMode === true,
     accessProfile: input.accessProfile ?? null,
     images: input.images,
+    contextReferences: input.contextReferences ?? [],
   };
   enqueueQueuedMessage(queued);
   scheduleQueuedTurnDrain('enqueue_follow_up', QUEUE_DRAIN_BUSY_RETRY_MS);
@@ -2807,6 +2821,7 @@ async function drainQueuedTurns(reason: string): Promise<void> {
       goalMode: next.goalMode === true,
       accessProfile: next.accessProfile ?? null,
       images: next.images ?? [],
+      contextReferences: next.contextReferences ?? [],
     });
     if (!submitted) {
       restoreQueuedTurnToFront(next);
@@ -2850,12 +2865,27 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
         dataUrl: image.dataUrl,
       }))
     : [];
-  if (!normalizedText && !skillName && images.length === 0) {
+  const contextReferences = Array.isArray(input.contextReferences)
+    ? input.contextReferences
+      .filter((reference) => (
+        (reference?.kind === 'file' || reference?.kind === 'directory')
+        && typeof reference.path === 'string'
+        && reference.path.trim().length > 0
+      ))
+      .map((reference) => ({
+        kind: reference.kind,
+        path: reference.path.trim(),
+        name: typeof reference.name === 'string' && reference.name.trim()
+          ? reference.name.trim()
+          : reference.path.trim().split(/[\\/]/u).filter(Boolean).pop() || reference.path.trim(),
+      }))
+    : [];
+  if (!normalizedText && !skillName && images.length === 0 && contextReferences.length === 0) {
     return false;
   }
   if (input.followUpMode === 'queue' && bridgeRuntimeIsBusy() && !queueDrainActive) {
     enqueueFollowUpTurn(
-      { ...input, skillName, images },
+      { ...input, skillName, images, contextReferences },
       normalizedText,
     );
     return true;
@@ -2899,6 +2929,7 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
     placeholderMessageId,
     text: normalizedText,
     images,
+    contextReferences,
     turnSeq: turnOrderSeq,
     createdAt: requestCreatedAt,
   });
@@ -2924,6 +2955,7 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
       skillName,
       goalMode: input.goalMode === true,
       images,
+      contextReferences,
       accessProfile: input.accessProfile ?? null,
       orchestratorSessionConfig: input.orchestratorSessionConfig ?? null,
       requestId,
@@ -2998,6 +3030,7 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
       placeholderMessageId,
       text: normalizedText,
       images,
+      contextReferences,
       turnSeq: turnOrderSeq,
       createdAt: requestCreatedAt,
       failedAt: Date.now(),
@@ -4049,6 +4082,7 @@ export function createWebClientBridge(): ClientBridge {
             (typeof message.text === 'string' && message.text.trim())
             || (typeof message.skillName === 'string' && message.skillName.trim())
             || (Array.isArray(message.images) && message.images.length > 0)
+            || (Array.isArray(message.contextReferences) && message.contextReferences.length > 0)
           ) {
             void executeTask({
               text: typeof message.text === 'string' ? message.text : null,
@@ -4071,6 +4105,13 @@ export function createWebClientBridge(): ClientBridge {
               followUpMode: message.followUpMode === 'queue' ? 'queue' : undefined,
               images: Array.isArray(message.images)
                 ? message.images as Array<{ name: string; dataUrl: string }>
+                : [],
+              contextReferences: Array.isArray(message.contextReferences)
+                ? message.contextReferences as Array<{
+                    kind: 'file' | 'directory';
+                    path: string;
+                    name: string;
+                  }>
                 : [],
             });
           }

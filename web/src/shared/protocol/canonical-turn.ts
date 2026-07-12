@@ -87,6 +87,10 @@ export interface CanonicalTurnEvent {
 }
 
 export interface CanonicalTurnStreamUpdate {
+  itemId: string;
+  itemVersion: number;
+  itemStatus: CanonicalTurnItemStatus;
+  baseContentLength: number;
   delta: string;
   contentLength: number;
   reset: boolean;
@@ -221,15 +225,72 @@ function normalizeCanonicalVisibility(value: unknown): CanonicalTurnVisibility {
   };
 }
 
+function normalizeCanonicalBlocks(value: unknown): unknown[] | null | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (!Array.isArray(value)) {
+    return null;
+  }
+  for (const block of value) {
+    const record = readRecord(block);
+    const type = record ? readString(record, 'type') : '';
+    if (!record || !type) {
+      return null;
+    }
+    if (type === 'text' || type === 'code' || type === 'thinking') {
+      if (!readString(record, 'blockId') || typeof record.content !== 'string') {
+        return null;
+      }
+      continue;
+    }
+    if (type === 'tool_call') {
+      if (!readString(record, 'toolId') || !readString(record, 'toolName') || !readString(record, 'status')) {
+        return null;
+      }
+      continue;
+    }
+    if (type === 'tool_result') {
+      if (!readString(record, 'toolCallId') || typeof record.content !== 'string') {
+        return null;
+      }
+      continue;
+    }
+    if (type === 'file_change') {
+      const changeType = readString(record, 'changeType');
+      if (!readString(record, 'filePath') || !['create', 'modify', 'delete', 'rename'].includes(changeType)) {
+        return null;
+      }
+      continue;
+    }
+    if (type === 'plan') {
+      if (!readString(record, 'blockId') || !readString(record, 'goal')) {
+        return null;
+      }
+      continue;
+    }
+    return null;
+  }
+  return value;
+}
+
 function normalizeCanonicalTurnStreamUpdate(
   record: Record<string, unknown>,
 ): CanonicalTurnStreamUpdate | undefined {
+  const itemId = readString(record, 'canonicalItemId', 'canonical_item_id');
+  const itemVersion = readNumber(record, 'canonicalItemVersion', 'canonical_item_version');
+  const itemStatus = readStatus(readString(record, 'canonicalItemStatus', 'canonical_item_status'));
+  const baseContentLength = readNumber(record, 'streamBaseContentLength', 'stream_base_content_length');
   const delta = readRawString(record, 'streamDelta', 'stream_delta');
   const contentLength = readNumber(record, 'streamContentLength', 'stream_content_length');
-  if (delta === undefined || contentLength === undefined) {
+  if (!itemId || itemVersion === undefined || !itemStatus || baseContentLength === undefined || delta === undefined || contentLength === undefined) {
     return undefined;
   }
   return {
+    itemId,
+    itemVersion,
+    itemStatus,
+    baseContentLength,
     delta,
     contentLength,
     reset: readBoolean(record, false, 'streamReset', 'stream_reset'),
@@ -258,7 +319,10 @@ export function normalizeCanonicalTurnItem(value: unknown): CanonicalTurnItem | 
   const content = typeof record.content === 'string'
     ? publicCanonicalContent(record.content)
     : undefined;
-  const blocks = Array.isArray(record.blocks) ? record.blocks : undefined;
+  const blocks = normalizeCanonicalBlocks(record.blocks);
+  if (blocks === null) {
+    return undefined;
+  }
   const metadata = readRecord(record.metadata) || undefined;
   return {
     sessionId,

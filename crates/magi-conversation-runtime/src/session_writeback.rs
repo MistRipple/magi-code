@@ -63,6 +63,7 @@ pub struct PublishedSessionTurnItem {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionTurnStreamUpdate {
     pub delta: String,
+    pub base_content_length: usize,
     pub content_length: usize,
     pub reset: bool,
 }
@@ -81,15 +82,13 @@ const STREAM_ITEM_PUBLISH_MIN_CHARS: usize = 24;
 pub struct SessionTurnStreamPublishGate {
     last_published_at: Option<UtcMillis>,
     last_published_content_length: usize,
+    last_published_content: String,
+    published_version: u64,
 }
 
 impl SessionTurnStreamPublishGate {
-    pub fn should_publish(&mut self, update: &SessionTurnStreamUpdate) -> bool {
-        self.should_publish_at(update, UtcMillis::now())
-    }
-
-    fn should_publish_at(&mut self, update: &SessionTurnStreamUpdate, now: UtcMillis) -> bool {
-        let should_publish = self.last_published_at.is_none()
+    fn should_publish_at(&self, update: &SessionTurnStreamUpdate, now: UtcMillis) -> bool {
+        self.last_published_at.is_none()
             || update.reset
             || self.last_published_at.is_some_and(|last| {
                 now.0.saturating_sub(last.0) >= STREAM_ITEM_PUBLISH_MIN_INTERVAL_MS
@@ -97,14 +96,36 @@ impl SessionTurnStreamPublishGate {
             || update
                 .content_length
                 .saturating_sub(self.last_published_content_length)
-                >= STREAM_ITEM_PUBLISH_MIN_CHARS;
+                >= STREAM_ITEM_PUBLISH_MIN_CHARS
+    }
 
-        if should_publish {
-            self.last_published_at = Some(now);
-            self.last_published_content_length = update.content_length;
+    fn prepare_publish_at(
+        &mut self,
+        candidate: &SessionTurnStreamUpdate,
+        current_content: &str,
+        now: UtcMillis,
+    ) -> Option<(u64, SessionTurnStreamUpdate)> {
+        if !self.should_publish_at(candidate, now) {
+            return None;
         }
+        let update = session_turn_stream_update(&self.last_published_content, current_content)?;
+        self.last_published_at = Some(now);
+        self.last_published_content_length = update.content_length;
+        self.last_published_content.clear();
+        self.last_published_content.push_str(current_content);
+        self.published_version = self
+            .published_version
+            .checked_add(1)
+            .expect("stream publish version overflow");
+        Some((self.published_version, update))
+    }
 
-        should_publish
+    fn prepare_publish(
+        &mut self,
+        candidate: &SessionTurnStreamUpdate,
+        current_content: &str,
+    ) -> Option<(u64, SessionTurnStreamUpdate)> {
+        self.prepare_publish_at(candidate, current_content, UtcMillis::now())
     }
 }
 
@@ -121,6 +142,7 @@ pub fn session_turn_stream_update(
         .unwrap_or_else(|| (current_content.to_string(), true));
     Some(SessionTurnStreamUpdate {
         delta,
+        base_content_length: previous_content.chars().count(),
         content_length: current_content.chars().count(),
         reset,
     })
@@ -493,23 +515,7 @@ pub fn publish_session_turn_item_event(
     workspace_id: &Option<WorkspaceId>,
     published: &PublishedSessionTurnItem,
 ) {
-    publish_session_turn_item_event_with_stream_update(
-        event_bus,
-        session_id,
-        workspace_id,
-        published,
-        None,
-    );
-}
-
-pub fn publish_session_turn_item_event_with_stream_update(
-    event_bus: &InMemoryEventBus,
-    session_id: &SessionId,
-    workspace_id: &Option<WorkspaceId>,
-    published: &PublishedSessionTurnItem,
-    stream_update: Option<&SessionTurnStreamUpdate>,
-) {
-    let mut payload = serde_json::json!({
+    let payload = serde_json::json!({
         "session_id": session_id.to_string(),
         "workspace_id": workspace_id.as_ref().map(ToString::to_string),
         "turn_id": published.turn_id,
@@ -522,20 +528,62 @@ pub fn publish_session_turn_item_event_with_stream_update(
         "canonical_turn": published.canonical_turn,
         "canonical_item": published.canonical_item,
     });
-    if let Some(stream_update) = stream_update
-        && let Some(object) = payload.as_object_mut()
-    {
-        object.insert(
-            "stream_delta".to_string(),
-            Value::String(stream_update.delta.clone()),
-        );
-        object.insert(
-            "stream_content_length".to_string(),
-            Value::from(stream_update.content_length as u64),
-        );
-        object.insert("stream_reset".to_string(), Value::Bool(stream_update.reset));
-    }
+    publish_session_turn_item_payload(event_bus, session_id, workspace_id, payload);
+}
 
+pub fn publish_session_turn_item_stream_event(
+    event_bus: &InMemoryEventBus,
+    session_id: &SessionId,
+    workspace_id: &Option<WorkspaceId>,
+    published: &PublishedSessionTurnItem,
+    stream_update: &SessionTurnStreamUpdate,
+    publish_gate: &mut SessionTurnStreamPublishGate,
+) {
+    let Some(canonical_item) = published.canonical_item.as_ref() else {
+        return;
+    };
+    let current_content = canonical_item.content.as_deref().unwrap_or_default();
+    let Some((item_version, stream_update)) =
+        publish_gate.prepare_publish(stream_update, current_content)
+    else {
+        return;
+    };
+    let mut payload = serde_json::json!({
+        "session_id": session_id.to_string(),
+        "workspace_id": workspace_id.as_ref().map(ToString::to_string),
+        "turn_id": published.turn_id,
+        "turn_seq": published.turn_seq,
+        "canonical_schema_version": CANONICAL_TURN_SCHEMA_VERSION,
+        "canonical_event_kind": CanonicalTurnEventKind::TurnItemUpsert,
+        "canonical_item_id": canonical_item.item_id,
+        "canonical_item_version": item_version,
+        "canonical_item_status": canonical_item.status,
+        "stream_base_content_length": stream_update.base_content_length,
+        "stream_delta": stream_update.delta,
+        "stream_content_length": stream_update.content_length,
+        "stream_reset": stream_update.reset,
+    });
+    if item_version == 1 {
+        let mut canonical_item = canonical_item.clone();
+        canonical_item.item_version = Some(item_version);
+        payload
+            .as_object_mut()
+            .expect("stream event payload must be an object")
+            .insert(
+                "canonical_item".to_string(),
+                serde_json::to_value(canonical_item)
+                    .expect("canonical stream item must be serializable"),
+            );
+    }
+    publish_session_turn_item_payload(event_bus, session_id, workspace_id, payload);
+}
+
+fn publish_session_turn_item_payload(
+    event_bus: &InMemoryEventBus,
+    session_id: &SessionId,
+    workspace_id: &Option<WorkspaceId>,
+    payload: Value,
+) {
     let _ = event_bus.publish(
         EventEnvelope::domain(
             EventId::new(format!("event-session-turn-item-{}", UtcMillis::now().0)),
@@ -547,26 +595,6 @@ pub fn publish_session_turn_item_event_with_stream_update(
             session_id: Some(session_id.clone()),
             ..EventContext::default()
         }),
-    );
-}
-
-pub fn publish_session_turn_item_stream_event(
-    event_bus: &InMemoryEventBus,
-    session_id: &SessionId,
-    workspace_id: &Option<WorkspaceId>,
-    published: &PublishedSessionTurnItem,
-    stream_update: &SessionTurnStreamUpdate,
-    publish_gate: &mut SessionTurnStreamPublishGate,
-) {
-    if !publish_gate.should_publish(stream_update) {
-        return;
-    }
-    publish_session_turn_item_event_with_stream_update(
-        event_bus,
-        session_id,
-        workspace_id,
-        published,
-        Some(stream_update),
     );
 }
 
@@ -745,6 +773,7 @@ fn append_session_tool_call_items_batch(
             session_id,
             workspace_id,
             workspace_root_path,
+            context_references: &[],
             access_profile,
             snapshot_session,
             execution_group_id,
@@ -770,6 +799,7 @@ pub struct SessionToolCallBatchContext<'a> {
     pub session_id: &'a SessionId,
     pub workspace_id: &'a Option<WorkspaceId>,
     pub workspace_root_path: Option<PathBuf>,
+    pub context_references: &'a [crate::context_reference::SessionContextReference],
     pub access_profile: magi_core::AccessProfile,
     pub snapshot_session: Option<Arc<SnapshotSession>>,
     pub execution_group_id: Option<String>,
@@ -796,6 +826,7 @@ pub fn append_session_tool_call_items_batch_with_context(
         session_id,
         workspace_id,
         workspace_root_path,
+        context_references,
         access_profile,
         snapshot_session,
         execution_group_id,
@@ -848,6 +879,7 @@ pub fn append_session_tool_call_items_batch_with_context(
             session_id,
             workspace_id,
             workspace_root_path: workspace_root_path.as_ref(),
+            context_references,
             access_profile,
         },
         tool_calls,
@@ -973,6 +1005,7 @@ struct SessionToolExecutionContext<'a> {
     session_id: &'a SessionId,
     workspace_id: &'a Option<WorkspaceId>,
     workspace_root_path: Option<&'a PathBuf>,
+    context_references: &'a [crate::context_reference::SessionContextReference],
     access_profile: magi_core::AccessProfile,
 }
 
@@ -1147,6 +1180,7 @@ fn execute_session_turn_tool_call(
             session_id,
             workspace_id,
             workspace_root_path,
+            context_references: &[],
             access_profile,
         },
         tool_call,
@@ -1170,6 +1204,7 @@ fn execute_session_turn_tool_call_scoped(
         session_id,
         workspace_id,
         workspace_root_path,
+        context_references,
         access_profile,
     } = context;
     if let Some(canonical) = BuiltinToolName::from_name(tool_call.function.name.as_str())
@@ -1244,15 +1279,26 @@ fn execute_session_turn_tool_call_scoped(
         return execute_skill_apply_from_runtime(&tool_call.function.arguments, skill_runtime);
     }
 
+    let reference_policy = crate::context_reference::session_context_reference_policy(
+        context_references,
+        workspace_root_path
+            .map(|path| path.to_string_lossy())
+            .as_deref(),
+        access_profile,
+    );
+
     if let Some((tool_skill_name, binding_id)) =
         parse_skill_custom_tool_name(&tool_call.function.name)
     {
+        let mut tool_policy =
+            tool_execution_policy_scope(access_profile, "", &reference_policy.allowed_paths, &[]);
+        tool_policy.read_only_paths = reference_policy.read_only_paths.clone();
         return execute_skill_custom_tool(
             tool_call,
             &tool_skill_name,
             &binding_id,
             skill_name,
-            tool_execution_policy_scope(access_profile, "", &[], &[]),
+            tool_policy,
             safety_gate,
             skill_runtime,
             skill_dispatch_runtime,
@@ -1297,8 +1343,9 @@ fn execute_session_turn_tool_call_scoped(
             command_mode: "",
             allowed_tools: &[],
             denied_tools: &[],
-            allowed_paths: &[],
+            allowed_paths: &reference_policy.allowed_paths,
             denied_paths: &[],
+            read_only_paths: &reference_policy.read_only_paths,
             requested_tool_name: &tool_call.function.name,
             arguments: &tool_call.function.arguments,
             workspace_root_path,
@@ -1316,7 +1363,10 @@ fn execute_session_turn_tool_call_scoped(
         return (decision.payload, decision.status);
     }
 
-    let tool_policy = active_skill_tool_execution_policy(access_profile, skill_runtime, skill_name);
+    let mut tool_policy =
+        active_skill_tool_execution_policy(access_profile, skill_runtime, skill_name);
+    tool_policy.allowed_paths = reference_policy.allowed_paths;
+    tool_policy.read_only_paths = reference_policy.read_only_paths;
     let output = registry.execute_with_policy(
         ToolExecutionInput::for_builtin_invocation(
             ToolCallId::new(&tool_call.id),
@@ -1381,11 +1431,13 @@ mod tests {
         let appended =
             session_turn_stream_update("你好", "你好，世界").expect("append update should exist");
         assert_eq!(appended.delta, "，世界");
+        assert_eq!(appended.base_content_length, 2);
         assert_eq!(appended.content_length, 5);
         assert!(!appended.reset);
 
         let reset = session_turn_stream_update("旧内容", "新内容").expect("reset should exist");
         assert_eq!(reset.delta, "新内容");
+        assert_eq!(reset.base_content_length, 3);
         assert_eq!(reset.content_length, 3);
         assert!(reset.reset);
 
@@ -1397,41 +1449,235 @@ mod tests {
         let mut gate = SessionTurnStreamPublishGate::default();
         let first = SessionTurnStreamUpdate {
             delta: "a".to_string(),
+            base_content_length: 0,
             content_length: 1,
             reset: false,
         };
-        assert!(gate.should_publish_at(&first, UtcMillis(1_000)));
+        let (version, published) = gate
+            .prepare_publish_at(&first, "a", UtcMillis(1_000))
+            .expect("first frame should publish");
+        assert_eq!(version, 1);
+        assert_eq!(published.delta, "a");
 
         let burst = SessionTurnStreamUpdate {
             delta: "b".to_string(),
+            base_content_length: 1,
             content_length: 2,
             reset: false,
         };
-        assert!(!gate.should_publish_at(&burst, UtcMillis(1_001)));
+        assert!(
+            gate.prepare_publish_at(&burst, "ab", UtcMillis(1_001))
+                .is_none()
+        );
 
         let enough_chars = SessionTurnStreamUpdate {
             delta: "c".repeat(STREAM_ITEM_PUBLISH_MIN_CHARS),
-            content_length: STREAM_ITEM_PUBLISH_MIN_CHARS + 1,
-            reset: false,
-        };
-        assert!(gate.should_publish_at(&enough_chars, UtcMillis(1_002)));
-
-        let delayed = SessionTurnStreamUpdate {
-            delta: "d".to_string(),
+            base_content_length: 2,
             content_length: STREAM_ITEM_PUBLISH_MIN_CHARS + 2,
             reset: false,
         };
-        assert!(gate.should_publish_at(
-            &delayed,
-            UtcMillis(1_002 + STREAM_ITEM_PUBLISH_MIN_INTERVAL_MS),
-        ));
+        let enough_content = format!("ab{}", "c".repeat(STREAM_ITEM_PUBLISH_MIN_CHARS));
+        let (version, published) = gate
+            .prepare_publish_at(&enough_chars, &enough_content, UtcMillis(1_002))
+            .expect("coalesced content should publish");
+        assert_eq!(version, 2);
+        assert_eq!(
+            published.delta,
+            format!("b{}", "c".repeat(STREAM_ITEM_PUBLISH_MIN_CHARS))
+        );
+
+        let delayed = SessionTurnStreamUpdate {
+            delta: "d".to_string(),
+            base_content_length: STREAM_ITEM_PUBLISH_MIN_CHARS + 2,
+            content_length: STREAM_ITEM_PUBLISH_MIN_CHARS + 3,
+            reset: false,
+        };
+        let delayed_content = format!("{enough_content}d");
+        let (version, published) = gate
+            .prepare_publish_at(
+                &delayed,
+                &delayed_content,
+                UtcMillis(1_002 + STREAM_ITEM_PUBLISH_MIN_INTERVAL_MS),
+            )
+            .expect("delayed frame should publish");
+        assert_eq!(version, 3);
+        assert_eq!(published.delta, "d");
 
         let reset = SessionTurnStreamUpdate {
             delta: "reset".to_string(),
+            base_content_length: STREAM_ITEM_PUBLISH_MIN_CHARS + 3,
             content_length: 5,
             reset: true,
         };
-        assert!(gate.should_publish_at(&reset, UtcMillis(1_003)));
+        let (version, published) = gate
+            .prepare_publish_at(&reset, "reset", UtcMillis(1_003))
+            .expect("reset frame should publish");
+        assert_eq!(version, 4);
+        assert!(published.reset);
+    }
+
+    #[test]
+    fn stream_events_publish_one_item_snapshot_then_delta_only_frames() {
+        let session_store = SessionStore::new();
+        let session_id = SessionId::new("session-stream-delta-payload");
+        session_store
+            .create_session(session_id.clone(), "stream delta payload")
+            .expect("session should be creatable");
+        let now = UtcMillis::now();
+        session_store
+            .upsert_current_turn(
+                session_id.clone(),
+                ActiveExecutionTurn {
+                    turn_id: "turn-stream-delta-payload".to_string(),
+                    turn_seq: 1,
+                    accepted_at: now,
+                    completed_at: None,
+                    status: "running".to_string(),
+                    user_message: None,
+                    items: Vec::new(),
+                },
+            )
+            .expect("running turn should be stored");
+
+        let event_bus = InMemoryEventBus::new(8);
+        let workspace_id = None;
+        let source_thread_id = ThreadId::new("thread-stream-delta-payload");
+        let item_id = "assistant-stream";
+        let mut gate = SessionTurnStreamPublishGate::default();
+
+        let first_content = "你";
+        let first_item = session_turn_item(
+            "assistant_stream",
+            "running",
+            Some("生成回复".to_string()),
+            Some(first_content.to_string()),
+            Some(item_id.to_string()),
+            source_thread_id.clone(),
+        );
+        let first_published = upsert_session_turn_item(&session_store, &session_id, first_item)
+            .expect("first stream item should be published");
+        let first_update = session_turn_stream_update("", first_content)
+            .expect("first stream update should exist");
+        publish_session_turn_item_stream_event(
+            &event_bus,
+            &session_id,
+            &workspace_id,
+            &first_published,
+            &first_update,
+            &mut gate,
+        );
+
+        let suppressed_content = "你好";
+        let suppressed_item = session_turn_item(
+            "assistant_stream",
+            "running",
+            Some("生成回复".to_string()),
+            Some(suppressed_content.to_string()),
+            Some(item_id.to_string()),
+            source_thread_id.clone(),
+        );
+        let suppressed_published =
+            upsert_session_turn_item(&session_store, &session_id, suppressed_item)
+                .expect("suppressed stream item should be stored");
+        let suppressed_update = session_turn_stream_update(first_content, suppressed_content)
+            .expect("suppressed stream update should exist");
+        publish_session_turn_item_stream_event(
+            &event_bus,
+            &session_id,
+            &workspace_id,
+            &suppressed_published,
+            &suppressed_update,
+            &mut gate,
+        );
+
+        let second_content = format!("你好{}", "呀".repeat(STREAM_ITEM_PUBLISH_MIN_CHARS));
+        let second_item = session_turn_item(
+            "assistant_stream",
+            "running",
+            Some("生成回复".to_string()),
+            Some(second_content.clone()),
+            Some(item_id.to_string()),
+            source_thread_id,
+        );
+        let second_published = upsert_session_turn_item(&session_store, &session_id, second_item)
+            .expect("second stream item should be published");
+        let second_update = session_turn_stream_update(suppressed_content, &second_content)
+            .expect("second stream update should exist");
+        publish_session_turn_item_stream_event(
+            &event_bus,
+            &session_id,
+            &workspace_id,
+            &second_published,
+            &second_update,
+            &mut gate,
+        );
+
+        let events = event_bus.snapshot().recent_events;
+        assert_eq!(events.len(), 2);
+        let first_payload = &events[0].payload;
+        assert!(first_payload.get("canonical_turn").is_none());
+        assert!(first_payload.get("item").is_none());
+        assert!(first_payload.get("current_turn").is_none());
+        assert!(first_payload.get("turn_items").is_none());
+        assert_eq!(
+            first_payload["canonical_item"]["itemId"],
+            Value::String(item_id.to_string())
+        );
+        assert_eq!(
+            first_payload["canonical_item"]["itemVersion"],
+            Value::from(1_u64)
+        );
+        assert_eq!(first_payload["canonical_item_version"], Value::from(1_u64));
+        assert_eq!(
+            first_payload["stream_base_content_length"],
+            Value::from(0_u64)
+        );
+        assert_eq!(first_payload["stream_content_length"], Value::from(1_u64));
+        assert_eq!(first_payload["stream_reset"], Value::Bool(false));
+
+        let second_payload = &events[1].payload;
+        assert!(second_payload.get("canonical_turn").is_none());
+        assert!(second_payload.get("canonical_item").is_none());
+        assert!(second_payload.get("item").is_none());
+        assert!(second_payload.get("current_turn").is_none());
+        assert!(second_payload.get("turn_items").is_none());
+        assert_eq!(
+            second_payload["canonical_item_id"],
+            Value::String(item_id.to_string())
+        );
+        assert_eq!(second_payload["canonical_item_version"], Value::from(2_u64));
+        assert_eq!(
+            second_payload["stream_base_content_length"],
+            Value::from(1_u64)
+        );
+        assert_eq!(
+            second_payload["canonical_item_status"],
+            Value::String("running".to_string())
+        );
+        assert_eq!(
+            second_payload["stream_delta"],
+            Value::String(format!("好{}", "呀".repeat(STREAM_ITEM_PUBLISH_MIN_CHARS)))
+        );
+        assert_eq!(
+            second_payload["stream_content_length"],
+            Value::from(second_content.chars().count() as u64)
+        );
+        assert_eq!(second_payload["stream_reset"], Value::Bool(false));
+
+        let snapshot_event_bus = InMemoryEventBus::new(1);
+        publish_session_turn_item_event(
+            &snapshot_event_bus,
+            &session_id,
+            &workspace_id,
+            &second_published,
+        );
+        let snapshot_payload = &snapshot_event_bus.snapshot().recent_events[0].payload;
+        assert!(snapshot_payload.get("canonical_turn").is_some());
+        assert!(snapshot_payload.get("canonical_item").is_some());
+        assert!(snapshot_payload.get("item").is_some());
+        assert!(snapshot_payload.get("current_turn").is_some());
+        assert!(snapshot_payload.get("turn_items").is_some());
+        assert!(snapshot_payload.get("stream_delta").is_none());
     }
 
     impl ConcurrentToolProbe {
@@ -2927,6 +3173,7 @@ mod tests {
                 session_id: &session_id,
                 workspace_id: &workspace_id,
                 workspace_root_path: None,
+                context_references: &[],
                 access_profile: magi_core::AccessProfile::Restricted,
                 snapshot_session: None,
                 execution_group_id: None,
@@ -2969,6 +3216,7 @@ mod tests {
                 session_id: &session_id,
                 workspace_id: &workspace_id,
                 workspace_root_path: None,
+                context_references: &[],
                 access_profile: magi_core::AccessProfile::Restricted,
                 snapshot_session: None,
                 execution_group_id: None,
@@ -3055,6 +3303,7 @@ mod tests {
                 session_id: &session_id,
                 workspace_id: &None,
                 workspace_root_path: None,
+                context_references: &[],
                 access_profile: magi_core::AccessProfile::Restricted,
                 snapshot_session: None,
                 execution_group_id: None,

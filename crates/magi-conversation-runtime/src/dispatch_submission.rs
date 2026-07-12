@@ -25,6 +25,10 @@ use magi_spawn_graph::SpawnGraph;
 
 use crate::session_thread;
 
+use crate::context_reference::{
+    SessionContextReference, session_context_reference_input_refs,
+    session_context_reference_policy, session_context_references_metadata,
+};
 use crate::session_images::SessionTurnImage;
 use crate::task_execution_registry::{TaskExecutionPlan, TaskExecutionRegistry};
 use magi_settings_store::SettingsStore;
@@ -43,6 +47,7 @@ pub struct DispatchSubmissionRequest {
     pub entry_id: String,
     pub timeline_message: String,
     pub images: Vec<SessionTurnImage>,
+    pub context_references: Vec<SessionContextReference>,
     pub created_session: bool,
     pub mission_title: String,
     pub task_title: String,
@@ -144,14 +149,27 @@ pub fn cleanup_rejected_dispatch(
     }
 }
 
-fn build_task_policy(task_tier: TaskTier, access_profile: AccessProfile) -> magi_core::TaskPolicy {
+fn build_task_policy(
+    task_tier: TaskTier,
+    access_profile: AccessProfile,
+    context_references: &[SessionContextReference],
+    workspace_root_path: Option<&Path>,
+) -> magi_core::TaskPolicy {
+    let reference_policy = session_context_reference_policy(
+        context_references,
+        workspace_root_path
+            .map(|path| path.to_string_lossy())
+            .as_deref(),
+        access_profile,
+    );
     magi_core::TaskPolicy {
         autonomy_level: "Autonomous".to_string(),
         access_profile,
         allowed_tools: Vec::new(),
         denied_tools: Vec::new(),
-        allowed_paths: Vec::new(),
+        allowed_paths: reference_policy.allowed_paths,
         denied_paths: Vec::new(),
+        read_only_paths: reference_policy.read_only_paths,
         network_mode: "full".to_string(),
         command_mode: "full".to_string(),
         retry_limit: 1,
@@ -173,6 +191,8 @@ struct DispatchTaskInput<'a> {
     active_skill_id: Option<&'a str>,
     task_tier: TaskTier,
     access_profile: AccessProfile,
+    context_references: &'a [SessionContextReference],
+    workspace_root_path: Option<&'a Path>,
 }
 
 fn make_dispatch_task(input: DispatchTaskInput<'_>) -> magi_core::Task {
@@ -186,6 +206,8 @@ fn make_dispatch_task(input: DispatchTaskInput<'_>) -> magi_core::Task {
         active_skill_id,
         task_tier,
         access_profile,
+        context_references,
+        workspace_root_path,
     } = input;
     let executor_binding = TaskExecutorBinding::for_role(target_role)
         .with_active_skill_id(active_skill_id.map(str::to_string));
@@ -201,12 +223,17 @@ fn make_dispatch_task(input: DispatchTaskInput<'_>) -> magi_core::Task {
         status: TaskStatus::Pending,
         dependency_ids: Vec::new(),
         required_children: Vec::new(),
-        policy_snapshot: Some(build_task_policy(task_tier, access_profile)),
+        policy_snapshot: Some(build_task_policy(
+            task_tier,
+            access_profile,
+            context_references,
+            workspace_root_path,
+        )),
         executor_binding: Some(executor_binding),
         knowledge_refs: Vec::new(),
         workspace_scope: None,
         write_scope: None,
-        input_refs: Vec::new(),
+        input_refs: session_context_reference_input_refs(context_references),
         output_refs: Vec::new(),
         evidence_refs: Vec::new(),
         retry_count: 0,
@@ -279,6 +306,8 @@ pub fn run_dispatch_submission(
         active_skill_id: request.skill_name.as_deref(),
         task_tier: request.task_tier,
         access_profile: request.access_profile,
+        context_references: &request.context_references,
+        workspace_root_path: runtime.workspace_root_path,
     });
     runtime.task_store.insert_task(task);
     let event =
@@ -395,7 +424,14 @@ pub fn run_dispatch_submission(
             request_id: request_id.clone(),
             user_message_id: user_message_id.clone(),
             placeholder_message_id: placeholder_message_id.clone(),
-            metadata: crate::session_images::session_turn_images_metadata(&request.images),
+            metadata: {
+                let mut metadata =
+                    crate::session_images::session_turn_images_metadata(&request.images);
+                metadata.extend(session_context_references_metadata(
+                    &request.context_references,
+                ));
+                metadata
+            },
             timeline_entry_id: Some(entry_id.to_string()),
             source_thread_id: orchestrator_thread_id.clone(),
         }],
@@ -519,6 +555,7 @@ mod tests {
             entry_id: "timeline-dispatch-fresh-thread".to_string(),
             timeline_message: "创建当前任务文件".to_string(),
             images: Vec::new(),
+            context_references: Vec::new(),
             created_session: false,
             mission_title: "当前任务推进".to_string(),
             task_title: "当前任务推进".to_string(),
@@ -595,6 +632,7 @@ mod tests {
             entry_id: "timeline-exec-chain-tier".to_string(),
             timeline_message: "修复明确 bug 并跑相关验证".to_string(),
             images: Vec::new(),
+            context_references: Vec::new(),
             created_session: false,
             mission_title: "修复 bug + 验证".to_string(),
             task_title: "修复 bug + 验证".to_string(),
@@ -672,6 +710,7 @@ mod tests {
             entry_id: "timeline-dispatch-skill-mainline-role".to_string(),
             timeline_message: "使用 browser Skill 创建 explorer 子代理".to_string(),
             images: Vec::new(),
+            context_references: Vec::new(),
             created_session: false,
             mission_title: "Skill 子代理继承".to_string(),
             task_title: "Skill 子代理继承".to_string(),
@@ -736,6 +775,7 @@ mod tests {
             entry_id: "timeline-dispatch-active-skill".to_string(),
             timeline_message: "使用代码审查 skill 检查当前改动".to_string(),
             images: Vec::new(),
+            context_references: Vec::new(),
             created_session: false,
             mission_title: "代码审查".to_string(),
             task_title: "代码审查".to_string(),
@@ -780,5 +820,90 @@ mod tests {
             Some("code-review"),
             "Task executor_binding 已类型化，不能再写入旧 skill_name 字段"
         );
+    }
+
+    #[test]
+    fn dispatch_submission_propagates_context_references_to_task_policy_and_turn_metadata() {
+        let session_store = SessionStore::new();
+        let task_store = TaskStore::new();
+        let execution_registry = TaskExecutionRegistry::default();
+        let event_bus = InMemoryEventBus::new(16);
+        let agent_role_registry = AgentRoleRegistry::load_default();
+        let spawn_graph = Mutex::new(SpawnGraph::new());
+        let session_id = SessionId::new("session-dispatch-context-reference");
+        session_store
+            .create_session(session_id.clone(), "dispatch context reference")
+            .expect("session should be creatable");
+
+        let request = DispatchSubmissionRequest {
+            accepted_at: UtcMillis(4_000),
+            session_id,
+            workspace_id: Some(WorkspaceId::new("workspace-dispatch-context-reference")),
+            entry_id: "timeline-dispatch-context-reference".to_string(),
+            timeline_message: "检查引用文件".to_string(),
+            images: Vec::new(),
+            context_references: vec![SessionContextReference {
+                kind: crate::context_reference::SessionContextReferenceKind::File,
+                path: std::path::PathBuf::from("/tmp/external/reference.md"),
+                name: "reference.md".to_string(),
+            }],
+            created_session: false,
+            mission_title: "检查引用文件".to_string(),
+            task_title: "检查引用文件".to_string(),
+            trimmed_text: Some("检查引用文件".to_string()),
+            execution_goal: Some("读取并分析引用文件".to_string()),
+            task_tier: TaskTier::ExecutionChain,
+            access_profile: AccessProfile::Restricted,
+            skill_name: None,
+            target_role: None,
+            request_id: None,
+            user_message_id: None,
+            placeholder_message_id: None,
+        };
+        let workspace_root = std::path::PathBuf::from("/tmp/workspace");
+        let runtime = DispatchSubmissionRuntime {
+            session_store: &session_store,
+            task_store: &task_store,
+            execution_registry: &execution_registry,
+            event_bus: &event_bus,
+            agent_role_registry: &agent_role_registry,
+            spawn_graph: &spawn_graph,
+            model_bridge_client: None,
+            settings_store: None,
+            workspace_root_path: Some(&workspace_root),
+        };
+
+        let graph = run_dispatch_submission(&runtime, &request)
+            .expect("dispatch submission should propagate context reference");
+        let task = task_store
+            .get_task(&graph.action_task_id)
+            .expect("action task should exist");
+        let policy = task
+            .policy_snapshot
+            .as_ref()
+            .expect("task policy should exist");
+        assert_eq!(
+            policy.allowed_paths,
+            vec![
+                "/tmp/workspace".to_string(),
+                "/tmp/external/reference.md".to_string()
+            ]
+        );
+        assert_eq!(
+            policy.read_only_paths,
+            vec!["/tmp/external/reference.md".to_string()]
+        );
+        assert!(
+            task.input_refs
+                .iter()
+                .any(|value| value.contains("/tmp/external/reference.md"))
+        );
+        let user_item = graph
+            .active_execution_chain
+            .as_ref()
+            .and_then(|chain| chain.current_turn.as_ref())
+            .and_then(|turn| turn.items.first())
+            .expect("canonical user item should exist");
+        assert!(user_item.metadata.contains_key("contextReferences"));
     }
 }

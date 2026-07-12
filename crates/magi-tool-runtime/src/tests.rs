@@ -405,6 +405,153 @@ fn shell_exec_read_only_allows_dev_null_probe_redirection() {
 }
 
 #[test]
+fn shell_exec_rejects_writes_to_policy_read_only_paths_in_full_access() {
+    let governance = Arc::new(GovernanceService::default());
+    let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(16));
+    let mut tool_registry = ToolRegistry::new(governance, event_bus);
+    tool_registry.register_default_builtins();
+    let root = unique_temp_dir("magi-tool-shell-policy-read-only");
+    let read_only_dir = root.join("reference");
+    fs::create_dir_all(&read_only_dir).expect("create read-only reference dir");
+    let target = read_only_dir.join("reference.txt");
+    let source = root.join("source.txt");
+    fs::write(&target, "ORIGINAL_REFERENCE").expect("write reference fixture");
+    fs::write(&source, "SOURCE_CONTENT").expect("write source fixture");
+    let policy = ToolExecutionPolicy {
+        read_only_paths: vec![read_only_dir.display().to_string()],
+        ..full_access_policy()
+    };
+    let cases = [
+        ("redirect", format!("printf changed > {}", target.display())),
+        ("append", format!("printf changed >> {}", target.display())),
+        ("tee", format!("printf changed | tee {}", target.display())),
+        (
+            "copy",
+            format!("cp {} {}", source.display(), target.display()),
+        ),
+        (
+            "create",
+            format!(
+                "printf created > {}",
+                read_only_dir.join("new.txt").display()
+            ),
+        ),
+    ];
+
+    for (case, command) in cases {
+        let output = tool_registry.execute_with_policy(
+            ToolExecutionInput {
+                tool_call_id: ToolCallId::new(format!("tool-call-shell-policy-{case}")),
+                tool_name: BuiltinToolName::ShellExec.as_str().to_string(),
+                tool_kind: ToolKind::Builtin,
+                input: serde_json::json!({
+                    "command": command,
+                    "access_mode": "maybe_write"
+                })
+                .to_string(),
+                approval_requirement: ApprovalRequirement::None,
+                risk_level: RiskLevel::Low,
+            },
+            ToolExecutionContext {
+                working_directory: Some(root.clone()),
+                ..ToolExecutionContext::default()
+            },
+            &policy,
+        );
+
+        assert_eq!(
+            output.status,
+            ExecutionResultStatus::Rejected,
+            "{case} 应在执行前被只读引用策略拒绝: {}",
+            output.payload
+        );
+        assert_eq!(
+            fs::read_to_string(&target).expect("read reference fixture"),
+            "ORIGINAL_REFERENCE",
+            "{case} 不得修改只读引用文件"
+        );
+        assert!(
+            !read_only_dir.join("new.txt").exists(),
+            "{case} 不得在只读引用目录创建文件"
+        );
+    }
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn shell_exec_allows_reading_or_copying_from_policy_read_only_paths() {
+    let governance = Arc::new(GovernanceService::default());
+    let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(16));
+    let mut tool_registry = ToolRegistry::new(governance, event_bus);
+    tool_registry.register_default_builtins();
+    let root = unique_temp_dir("magi-tool-shell-policy-read-only-source");
+    let read_only_dir = root.join("reference");
+    let workspace_dir = root.join("workspace");
+    fs::create_dir_all(&read_only_dir).expect("create read-only reference dir");
+    fs::create_dir_all(&workspace_dir).expect("create workspace dir");
+    let source = read_only_dir.join("reference.txt");
+    let destination = workspace_dir.join("copied.txt");
+    fs::write(&source, "REFERENCE_CONTENT").expect("write reference fixture");
+    let policy = ToolExecutionPolicy {
+        read_only_paths: vec![read_only_dir.display().to_string()],
+        ..full_access_policy()
+    };
+
+    let read_output = tool_registry.execute_with_policy(
+        ToolExecutionInput {
+            tool_call_id: ToolCallId::new("tool-call-shell-policy-read-source"),
+            tool_name: BuiltinToolName::ShellExec.as_str().to_string(),
+            tool_kind: ToolKind::Builtin,
+            input: serde_json::json!({
+                "command": format!("cat {}", source.display()),
+                "access_mode": "read_only"
+            })
+            .to_string(),
+            approval_requirement: ApprovalRequirement::None,
+            risk_level: RiskLevel::Low,
+        },
+        ToolExecutionContext {
+            working_directory: Some(workspace_dir.clone()),
+            ..ToolExecutionContext::default()
+        },
+        &policy,
+    );
+    assert_eq!(read_output.status, ExecutionResultStatus::Succeeded);
+
+    let copy_output = tool_registry.execute_with_policy(
+        ToolExecutionInput {
+            tool_call_id: ToolCallId::new("tool-call-shell-policy-copy-source"),
+            tool_name: BuiltinToolName::ShellExec.as_str().to_string(),
+            tool_kind: ToolKind::Builtin,
+            input: serde_json::json!({
+                "command": format!("cp {} {}", source.display(), destination.display()),
+                "access_mode": "maybe_write"
+            })
+            .to_string(),
+            approval_requirement: ApprovalRequirement::None,
+            risk_level: RiskLevel::Low,
+        },
+        ToolExecutionContext {
+            working_directory: Some(workspace_dir),
+            ..ToolExecutionContext::default()
+        },
+        &policy,
+    );
+    assert_eq!(copy_output.status, ExecutionResultStatus::Succeeded);
+    assert_eq!(
+        fs::read_to_string(destination).expect("read copied file"),
+        "REFERENCE_CONTENT"
+    );
+    assert_eq!(
+        fs::read_to_string(source).expect("read original reference"),
+        "REFERENCE_CONTENT"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn shell_exec_background_process_can_be_controlled_through_shell_surface() {
     let governance = Arc::new(GovernanceService::default());
     let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(16));
@@ -2620,6 +2767,7 @@ fn test_task_policy(
         denied_tools,
         allowed_paths: vec!["/tmp/allowed".to_string()],
         denied_paths: vec!["/tmp/denied".to_string()],
+        read_only_paths: Vec::new(),
         network_mode: "default".to_string(),
         command_mode: "read_only".to_string(),
         retry_limit: 0,
@@ -2812,6 +2960,54 @@ fn registry_rejects_restricted_file_write_outside_workspace_root() {
 
     assert_eq!(allowed.status, ExecutionResultStatus::Succeeded);
     assert_eq!(fs::read_to_string(&inside).unwrap(), "allowed");
+}
+
+#[test]
+fn referenced_external_paths_are_readable_but_never_writable() {
+    let workspace = unique_temp_dir("magi-tool-runtime-reference-workspace");
+    let external = unique_temp_dir("magi-tool-runtime-reference-external");
+    let external_file = external.join("reference.txt");
+    fs::write(&external_file, "reference").expect("reference fixture should write");
+    let registry = make_registry();
+    let context = ToolExecutionContext {
+        working_directory: Some(workspace.clone()),
+        ..ToolExecutionContext::default()
+    };
+    let policy = ToolExecutionPolicy {
+        access_profile: magi_core::AccessProfile::Restricted,
+        allowed_paths: vec![
+            workspace.display().to_string(),
+            external.display().to_string(),
+        ],
+        read_only_paths: vec![external.display().to_string()],
+        ..ToolExecutionPolicy::default()
+    };
+
+    let read = exec_tool_with_context_and_policy(
+        &registry,
+        BuiltinToolName::FileRead,
+        &serde_json::json!({ "path": external_file }).to_string(),
+        context.clone(),
+        policy.clone(),
+    );
+    assert_eq!(read.status, ExecutionResultStatus::Succeeded);
+
+    let write = exec_tool_with_context_and_policy(
+        &registry,
+        BuiltinToolName::FileWrite,
+        &serde_json::json!({
+            "path": external_file,
+            "content": "mutated"
+        })
+        .to_string(),
+        context,
+        policy,
+    );
+    assert_eq!(write.status, ExecutionResultStatus::Rejected);
+    assert_eq!(
+        fs::read_to_string(&external_file).expect("reference fixture should remain readable"),
+        "reference"
+    );
 }
 
 #[test]

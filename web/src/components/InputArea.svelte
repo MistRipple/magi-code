@@ -23,6 +23,8 @@
     settingsBootstrapMatchesCurrentWorkspace,
   } from '../web/agent-api';
   import Icon from './Icon.svelte';
+  import Modal from './Modal.svelte';
+  import WebFolderPicker from '../web/WebFolderPicker.svelte';
   import ContextUsageRing from './ContextUsageRing.svelte';
   import { generateId } from '../lib/utils';
   import { i18n } from '../stores/i18n.svelte';
@@ -40,12 +42,19 @@
   } from '../stores/composer-workspace.svelte';
   import { openWorkspaceFolderPicker } from '../stores/workspace-onboarding.svelte';
   import {
-    buildSlashCommands,
+    buildComposerActions,
     filterSlashCommands,
     resolveSlashTrigger,
-    type SlashCommand,
-    type SlashSkillOption,
-  } from '../lib/slash-commands';
+    type ComposerAction,
+    type ComposerSkillOption,
+  } from '../lib/composer-actions';
+  import {
+    addComposerContextReference,
+    MAX_COMPOSER_CONTEXT_REFERENCES,
+    toSessionContextReferencePayload,
+    type ComposerContextReference,
+    type ComposerContextReferenceKind,
+  } from '../lib/composer-context-references';
 
   interface SelectedImage {
     id: string;
@@ -55,7 +64,7 @@
 
   // 输入框可识别的 instruction skill。来源：bootstrap 中的 skillsConfig.instructionSkills，
   // 这一组才是 `/` 唤起的指令型技能，与 customTools（已注册到工具表）的语义不同。
-  type SkillOption = SlashSkillOption;
+  type SkillOption = ComposerSkillOption;
 
   type ReasoningEffort = 'low' | 'medium' | 'high' | 'xhigh';
 
@@ -101,6 +110,9 @@
   // 斜杠快捷引用：Goal 决定持续推进生命周期，Skill 决定本轮执行方法，两者可同时引用。
   let selectedGoalMode = $state(false);
   let selectedSkill = $state<SkillOption | null>(null);
+  let selectedContextReferences = $state<ComposerContextReference[]>([]);
+  let addMenuOpen = $state(false);
+  let contextPickerOpen = $state(false);
   let slashTriggerStart = $state<number | null>(null);
   let slashFilter = $state('');
   let slashHighlightIndex = $state(0);
@@ -196,6 +208,9 @@
     composerReferenceScopeKey = nextScopeKey;
     selectedGoalMode = false;
     selectedSkill = null;
+    selectedContextReferences = [];
+    addMenuOpen = false;
+    contextPickerOpen = false;
     closeSlashMenu();
   });
 
@@ -235,7 +250,9 @@
     if (inputValue.trim().length > 0) return true;
     // 执行中补充指令不支持图片，避免"有内容可发送"与实际能力不一致
     if (isSending) return false;
-    return selectedImages.length > 0 || pendingImageReadCount > 0;
+    return selectedImages.length > 0
+      || pendingImageReadCount > 0
+      || selectedContextReferences.length > 0;
   });
 
   // bootstrap 是全局缓存，新会话/设置变更都会同步更新这里，所以输入框可以直接派生。
@@ -262,14 +279,23 @@
     return out;
   });
 
-  const slashCommands = $derived.by<SlashCommand[]>(() => buildSlashCommands(availableSkills, {
-    name: i18n.t('input.goalMode.name'),
-    description: i18n.t('input.goalMode.description'),
-  }));
+  const composerActions = $derived.by<ComposerAction[]>(() => buildComposerActions(
+    availableSkills,
+    {
+      goal: {
+        name: i18n.t('input.goalMode.name'),
+        description: i18n.t('input.goalMode.description'),
+      },
+      context: {
+        name: i18n.t('input.add.context'),
+        description: i18n.t('input.add.contextDescription'),
+      },
+    },
+  ));
 
-  const filteredSlashCommands = $derived.by<SlashCommand[]>(() => {
+  const filteredSlashCommands = $derived.by<Array<Exclude<ComposerAction, { kind: 'resource' }>>>(() => {
     if (slashTriggerStart === null) return [];
-    return filterSlashCommands(slashCommands, slashFilter).filter((command) => (
+    return filterSlashCommands(composerActions, slashFilter).filter((command) => (
       command.kind === 'goal'
         ? !selectedGoalMode
         : command.id !== selectedSkill?.skillId
@@ -296,8 +322,11 @@
   function clearComposerState() {
     inputValue = '';
     selectedImages = [];
+    selectedContextReferences = [];
     selectedGoalMode = false;
     selectedSkill = null;
+    addMenuOpen = false;
+    contextPickerOpen = false;
     clearEnhanceSnapshot();
     closeSlashMenu();
   }
@@ -563,7 +592,7 @@
     }
   }
 
-  function commitSlashCommand(command: SlashCommand) {
+  function commitSlashCommand(command: Exclude<ComposerAction, { kind: 'resource' }>) {
     if (command.kind === 'goal') {
       selectedGoalMode = true;
     } else {
@@ -588,6 +617,51 @@
 
   function removeSelectedSkill() {
     selectedSkill = null;
+    queueMicrotask(focusEditor);
+  }
+
+  function closeAddMenu() {
+    addMenuOpen = false;
+  }
+
+  function applyAddMenuAction(action: ComposerAction) {
+    if (action.kind === 'resource') {
+      closeAddMenu();
+      contextPickerOpen = true;
+      return;
+    }
+    if (action.kind === 'goal') {
+      selectedGoalMode = !selectedGoalMode;
+    } else {
+      selectedSkill = selectedSkill?.skillId === action.skill.skillId ? null : action.skill;
+    }
+    closeAddMenu();
+    queueMicrotask(focusEditor);
+  }
+
+  function handleContextReferenceSelected(
+    path: string,
+    name: string,
+    kind: ComposerContextReferenceKind,
+  ) {
+    const next = addComposerContextReference(selectedContextReferences, { kind, path, name });
+    if (next === selectedContextReferences) {
+      if (selectedContextReferences.length >= MAX_COMPOSER_CONTEXT_REFERENCES) {
+        addToast('warning', i18n.t('input.add.contextLimit', {
+          max: MAX_COMPOSER_CONTEXT_REFERENCES,
+        }));
+      }
+    } else {
+      selectedContextReferences = next;
+    }
+    contextPickerOpen = false;
+    queueMicrotask(focusEditor);
+  }
+
+  function removeContextReference(referenceId: string) {
+    selectedContextReferences = selectedContextReferences.filter((reference) => (
+      reference.id !== referenceId
+    ));
     queueMicrotask(focusEditor);
   }
 
@@ -716,6 +790,9 @@
       if (accessProfilePickerOpen && !(target instanceof Element && target.closest('.ia-access-wrap'))) {
         accessProfilePickerOpen = false;
       }
+      if (addMenuOpen && !(target instanceof Element && target.closest('.ia-add-wrap'))) {
+        addMenuOpen = false;
+      }
     }
     window.addEventListener('magi:fillComposer', handleFillComposer as EventListener);
     window.addEventListener('magi:setAccessProfile', handleSetAccessProfile as EventListener);
@@ -815,7 +892,11 @@
       await waitForPendingImageReads();
       const rawContent = resolveComposerRawContent();
       const normalizedContent = rawContent.trim();
-      if ((!normalizedContent && selectedImages.length === 0) || sessionInputLocked || isInteractionBlocking) return;
+      if (
+        (!normalizedContent && selectedImages.length === 0 && selectedContextReferences.length === 0)
+        || sessionInputLocked
+        || isInteractionBlocking
+      ) return;
       if (isSending && selectedImages.length > 0) {
         addToast('warning', i18n.t('input.noImageDuringExecution'));
         return;
@@ -823,7 +904,11 @@
 
       const submissionText = normalizedContent
         ? rawContent
-        : (selectedImages.length > 0 ? i18n.t('input.analyzeImages') : null);
+        : selectedImages.length > 0
+          ? i18n.t('input.analyzeImages')
+          : selectedContextReferences.length > 0
+            ? i18n.t('input.analyzeReferences')
+            : null;
       const submissionLength = submissionText?.length ?? 0;
 
       if (submissionLength > MAX_INPUT_CHARS) {
@@ -854,6 +939,7 @@
           name: img.name,
           dataUrl: img.dataUrl,
         })),
+        contextReferences: toSessionContextReferencePayload(selectedContextReferences),
       });
       clearComposerState();
     } finally {
@@ -1585,8 +1671,23 @@
     <div class="ia-resize" onmousedown={startResize}></div>
 
     <!-- 快捷引用保持结构化状态，不把 /goal 或 Skill 名称注入用户正文。 -->
-    {#if selectedGoalMode || selectedSkill}
+    {#if selectedContextReferences.length > 0 || selectedGoalMode || selectedSkill}
       <div class="ia-reference-chip-row">
+        {#each selectedContextReferences as reference (reference.id)}
+          <span class="ia-reference-chip ia-context-reference-chip" title={reference.path}>
+            <Icon name={reference.kind === 'directory' ? 'folder' : 'document'} size={11} />
+            <span class="ia-reference-chip-label">{reference.name}</span>
+            <button
+              type="button"
+              class="ia-reference-chip-remove"
+              onclick={() => removeContextReference(reference.id)}
+              title={i18n.t('input.add.removeContext')}
+              aria-label={i18n.t('input.add.removeContext')}
+            >
+              <Icon name="close" size={10} />
+            </button>
+          </span>
+        {/each}
         {#if selectedGoalMode}
           <span class="ia-reference-chip ia-reference-chip-goal" title={i18n.t('input.goalMode.description')}>
             <Icon name="infinity" size={11} />
@@ -1642,6 +1743,8 @@
           ? i18n.t('input.placeholderWithSkill', { skillName: selectedSkill.name })
         : selectedImages.length > 0
           ? i18n.t('input.placeholderWithImages')
+        : selectedContextReferences.length > 0
+          ? i18n.t('input.placeholderWithReferences')
           : i18n.t('input.placeholderDefault')}
       onkeydown={handleKeydown}
       oninput={handleComposerInput}
@@ -1707,6 +1810,63 @@
 
     <div class="ia-actions">
       <div class="ia-left">
+        <div class="ia-picker-wrap ia-add-wrap">
+          <button
+            type="button"
+            class="ia-add-btn"
+            class:active={addMenuOpen}
+            onclick={() => (addMenuOpen = !addMenuOpen)}
+            disabled={sessionInputLocked || isInteractionBlocking}
+            title={i18n.t('input.add.title')}
+            aria-label={i18n.t('input.add.title')}
+            aria-expanded={addMenuOpen}
+          >
+            <Icon name="plus" size={15} />
+          </button>
+          {#if addMenuOpen}
+            <div class="ia-picker-popover ia-add-popover" role="menu">
+              {#each composerActions as action, index (`${action.kind}:${action.id}`)}
+                {#if index === 0 || composerActions[index - 1]?.kind !== action.kind}
+                  <div class="ia-add-group-label">
+                    {action.kind === 'resource'
+                      ? i18n.t('input.add.resourceGroup')
+                      : action.kind === 'goal'
+                        ? i18n.t('input.slash.modeGroup')
+                        : i18n.t('input.slash.skillGroup')}
+                  </div>
+                {/if}
+                <button
+                  type="button"
+                  class="ia-add-item"
+                  class:selected={action.kind === 'goal'
+                    ? selectedGoalMode
+                    : action.kind === 'skill'
+                      ? selectedSkill?.skillId === action.skill.skillId
+                      : false}
+                  onclick={() => applyAddMenuAction(action)}
+                  role="menuitem"
+                >
+                  <span class="ia-add-item-icon" class:goal={action.kind === 'goal'}>
+                    <Icon
+                      name={action.kind === 'resource'
+                        ? 'folder'
+                        : action.kind === 'goal'
+                          ? 'infinity'
+                          : 'skill'}
+                      size={13}
+                    />
+                  </span>
+                  <span class="ia-add-item-content">
+                    <span class="ia-add-item-label">{action.name}</span>
+                    {#if action.description}
+                      <span class="ia-add-item-description">{action.description}</span>
+                    {/if}
+                  </span>
+                </button>
+              {/each}
+            </div>
+          {/if}
+        </div>
         <div class="ia-picker-wrap ia-workspace-wrap">
           <button
             type="button"
@@ -2086,6 +2246,23 @@
 
 </div>
 
+{#if contextPickerOpen}
+  <Modal
+    onClose={() => (contextPickerOpen = false)}
+    closeOnBackdrop={true}
+    size="md"
+    modalClass="composer-context-picker-modal"
+    showHeader={false}
+  >
+    <WebFolderPicker
+      title={i18n.t('input.add.contextPickerTitle')}
+      selectionMode="file-or-directory"
+      onSelect={handleContextReferenceSelected}
+      onCancel={() => (contextPickerOpen = false)}
+    />
+  </Modal>
+{/if}
+
 <style>
   /* ============================================
      InputArea - 输入区域
@@ -2297,6 +2474,33 @@
     position: relative;
     display: inline-flex;
     min-width: 0;
+  }
+  .ia-add-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    padding: 0;
+    border: 1px solid transparent;
+    border-radius: var(--radius-full);
+    background: transparent;
+    color: var(--foreground-muted);
+    cursor: pointer;
+    transition: background var(--transition-fast), color var(--transition-fast), border-color var(--transition-fast);
+  }
+  .ia-add-btn:hover:not(:disabled),
+  .ia-add-btn.active {
+    background: var(--surface-2);
+    border-color: var(--border-subtle);
+    color: var(--foreground);
+  }
+  .ia-add-btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+  .ia-add-wrap {
+    flex: 0 0 auto;
   }
   .ia-access-btn-label {
     overflow: hidden;
@@ -2530,6 +2734,74 @@
     border: 1px solid color-mix(in srgb, var(--border) 80%, var(--foreground) 20%);
     border-radius: var(--radius-md);
     box-shadow: 0 14px 40px rgba(0, 0, 0, 0.45), 0 2px 8px rgba(0, 0, 0, 0.22);
+  }
+  .ia-add-popover {
+    left: 0;
+    right: auto;
+    width: min(380px, calc(100vw - 24px));
+    max-height: min(520px, 62vh);
+    padding: 6px;
+  }
+  .ia-add-group-label {
+    padding: 7px 9px 4px;
+    color: var(--foreground-muted);
+    font-size: 11px;
+    font-weight: 600;
+  }
+  .ia-add-item {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    width: 100%;
+    min-height: 40px;
+    padding: 6px 8px;
+    border: none;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--foreground);
+    text-align: left;
+    cursor: pointer;
+  }
+  .ia-add-item:hover,
+  .ia-add-item.selected {
+    background: var(--surface-2);
+  }
+  .ia-add-item.selected {
+    color: var(--primary);
+  }
+  .ia-add-item-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 24px;
+    height: 24px;
+    flex: 0 0 24px;
+    color: var(--foreground-muted);
+  }
+  .ia-add-item-icon.goal,
+  .ia-add-item.selected .ia-add-item-icon {
+    color: var(--primary);
+  }
+  .ia-add-item-content {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    min-width: 0;
+    flex: 1;
+  }
+  .ia-add-item-label {
+    flex: 0 0 auto;
+    font-size: 13px;
+    font-weight: 520;
+    white-space: nowrap;
+  }
+  .ia-add-item-description {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--foreground-muted);
+    font-size: 12px;
   }
   .ia-session-model-popover {
     position: absolute;
@@ -2844,6 +3116,11 @@
     background: color-mix(in srgb, var(--success) 12%, transparent);
     border-color: color-mix(in srgb, var(--success) 34%, transparent);
     color: color-mix(in srgb, var(--success) 82%, var(--foreground));
+  }
+  .ia-context-reference-chip {
+    background: var(--surface-2);
+    border-color: var(--border-subtle);
+    color: var(--foreground-secondary);
   }
   .ia-reference-chip-label {
     font-weight: var(--font-medium, 500);

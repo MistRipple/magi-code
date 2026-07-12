@@ -72,7 +72,7 @@
 
   const safeRenderMessages = $derived.by(() => activeRenderItems.map((item) => item.message));
 
-  function resolveStreamingMessageVersion(message: Message): string {
+  function resolveMessageRenderRevision(message: Message): string {
     const metadata = (message.metadata && typeof message.metadata === 'object')
       ? (message.metadata as Record<string, unknown>)
       : {};
@@ -85,17 +85,18 @@
     const updatedAt = typeof message.updatedAt === 'number' && Number.isFinite(message.updatedAt)
       ? Math.max(0, Math.floor(message.updatedAt))
       : 0;
-    return `${eventSeq}:${cardStreamSeq}:${updatedAt}:${(message.content || '').length}:${(message.blocks || []).length}`;
+    const canonicalRevision = typeof metadata.renderRevision === 'string'
+      ? metadata.renderRevision
+      : '';
+    return `${canonicalRevision}:${eventSeq}:${cardStreamSeq}:${updatedAt}:${(message.content || '').length}:${(message.blocks || []).length}`;
   }
 
-  /* 🔧 计算流式消息的内容签名，用于触发滚动
-     当任何流式消息的内容变化时，需要重新滚动到底部 */
-  const streamingContentSignature = $derived.by(() => {
-    const streamingMsgs = safeRenderMessages.filter(m => m.isStreaming);
-    if (streamingMsgs.length === 0) return '';
-    // 用 event/card 序号 + 更新时间作为流式版本签名，避免 tool_call 高度变化漏触发自动滚动
-    return streamingMsgs.map(m => `${m.id}:${resolveStreamingMessageVersion(m)}`).join('|');
+  const renderContentSignature = $derived.by(() => {
+    return safeRenderMessages
+      .map((message) => `${message.id}:${resolveMessageRenderRevision(message)}`)
+      .join('|');
   });
+  const messageElementSignature = $derived(safeRenderItems.map((item) => item.key).join('|'));
 
   const currentStreamingRenderItem = $derived.by(() => {
     for (let i = activeRenderItems.length - 1; i >= 0; i -= 1) {
@@ -279,6 +280,8 @@
   let activationRestoreNonce = 0;
   let restoreAttemptTimers: Array<ReturnType<typeof setTimeout>> = [];
   let historyObserver: IntersectionObserver | null = null;
+  let contentResizeObserver: ResizeObserver | null = null;
+  let contentResizeFrame = 0;
   let programmaticScrollDepth = 0;
 
   const HISTORY_LOAD_THRESHOLD_PX = 120;
@@ -287,6 +290,36 @@
     if (!historyObserver) return;
     historyObserver.disconnect();
     historyObserver = null;
+  }
+
+  function disconnectContentResizeObserver() {
+    contentResizeObserver?.disconnect();
+    contentResizeObserver = null;
+    if (contentResizeFrame) {
+      cancelAnimationFrame(contentResizeFrame);
+      contentResizeFrame = 0;
+    }
+  }
+
+  function observeMessageLayoutChanges() {
+    disconnectContentResizeObserver();
+    if (!containerRef || typeof ResizeObserver === 'undefined') {
+      return;
+    }
+    contentResizeObserver = new ResizeObserver(() => {
+      if (!isActive || !shouldAutoScroll || !containerRef || contentResizeFrame) {
+        return;
+      }
+      contentResizeFrame = requestAnimationFrame(() => {
+        contentResizeFrame = 0;
+        if (isActive && shouldAutoScroll && containerRef) {
+          scrollPanelToBottom();
+        }
+      });
+    });
+    for (const element of containerRef.querySelectorAll<HTMLElement>('[data-message-id]')) {
+      contentResizeObserver.observe(element);
+    }
   }
 
   function clearRestoreAttemptTimers() {
@@ -399,12 +432,11 @@
     syncPanelScrollState(containerRef.scrollTop, false, persist);
   }
 
-  // 监听消息变化，自动滚动到底部
-  // 🔧 同时监听流式消息内容变化，确保内容增长时也能自动滚动
+  // 任何可见卡片内容或状态变化都触发滚动判断，覆盖文本、思考、工具和文件卡片。
   $effect(() => {
     const active = isActive;
     const _len = safeRenderMessages.length;
-    const _sig = streamingContentSignature; // 订阅流式内容变化
+    const _sig = renderContentSignature;
     void _len;
     void _sig;
     if (!active || !shouldAutoScroll || !containerRef) return;
@@ -412,6 +444,17 @@
       if (!containerRef || !isActive || !shouldAutoScroll) return;
       scrollPanelToBottom();
     });
+  });
+
+  $effect(() => {
+    const active = isActive;
+    const signature = messageElementSignature;
+    void signature;
+    if (!active || !containerRef) {
+      disconnectContentResizeObserver();
+      return;
+    }
+    tick().then(observeMessageLayoutChanges);
   });
 
   // 面板切回可见后，按 panel 维度恢复之前的位置；仅在可见性切换瞬间执行，避免覆盖用户手动滚动
@@ -558,6 +601,7 @@
     activationRestoreNonce += 1;
     clearRestoreAttemptTimers();
     disconnectHistoryObserver();
+    disconnectContentResizeObserver();
     if (!containerRef) {
       return;
     }
@@ -614,9 +658,9 @@
           {readOnly}
           {displayContext}
           filePreviewScope={{
-            workspaceId: item.workspaceId || messagesState.currentWorkspaceId || undefined,
-            workspacePath: item.workspacePath || messagesState.currentWorkspacePath || undefined,
-            sessionId: item.sessionId || messagesState.currentSessionId || undefined,
+            workspaceId: item.workspaceId,
+            workspacePath: item.workspacePath,
+            sessionId: item.sessionId,
           }}
           showStreamingIndicator={item.key === streamingIndicatorRenderKey}
           streamingElapsedSeconds={item.key === streamingIndicatorRenderKey ? elapsedSeconds : 0}

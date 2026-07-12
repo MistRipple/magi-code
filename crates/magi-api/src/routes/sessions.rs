@@ -88,9 +88,12 @@ impl DeleteSessionRequest {
 
 async fn submit_session_turn(
     State(state): State<ApiState>,
-    Json(request): Json<SessionTurnRequestDto>,
+    Json(mut request): Json<SessionTurnRequestDto>,
 ) -> Result<Json<SessionTurnResponseDto>, ApiError> {
     validate_session_turn_input(&request)?;
+    request
+        .validate_context_references()
+        .map_err(ApiError::InvalidInput)?;
     let images = request
         .parsed_images()
         .map_err(|error| ApiError::InvalidInput(format!("图片输入无效: {error}")))?;
@@ -476,6 +479,7 @@ fn validate_session_turn_input(request: &SessionTurnRequestDto) -> Result<(), Ap
             .filter(|value| !value.is_empty())
             .is_none()
         && request.images.is_empty()
+        && request.context_references.is_empty()
     {
         return Err(ApiError::InvalidInput("会话输入不能为空".to_string()));
     }
@@ -1259,6 +1263,14 @@ async fn submit_regular_session_turn(
         .unwrap_or_else(|| format!("turn-item-assistant-stream-{}-0", accepted_at.0));
     let placeholder_message_id = Some(assistant_placeholder_item_id.clone());
     // 使用前端传入的 userMessageId 作为 canonical item_id，确保前端乐观节点与后端流式更新使用同一 ID
+    let context_references = request.context_references();
+    let mut user_message_metadata =
+        magi_conversation_runtime::session_images::session_turn_images_metadata(&images);
+    user_message_metadata.extend(
+        magi_conversation_runtime::context_reference::session_context_references_metadata(
+            &context_references,
+        ),
+    );
     let (user_message_item_id, user_message_item) =
         build_user_message_turn_item(UserMessageTurnItemInput {
             accepted_at,
@@ -1267,9 +1279,7 @@ async fn submit_regular_session_turn(
             request_id: request_id.clone(),
             user_message_id: user_message_id.clone(),
             placeholder_message_id: placeholder_message_id.clone(),
-            metadata: magi_conversation_runtime::session_images::session_turn_images_metadata(
-                &images,
-            ),
+            metadata: user_message_metadata,
             task_id: None,
             source_thread_id: orchestrator_thread_id.clone(),
         });
@@ -1360,6 +1370,7 @@ async fn submit_regular_session_turn(
             workspace_id: workspace_id.clone(),
             prompt,
             images,
+            context_references,
             // 范式：常规对话 turn 一律是带工具的 agent。读操作由 Restricted profile
             // 直接放行，写操作走下游 safety gate 拦截，由模型在循环内自行决定是否调用工具。
             // 这里不再用入口关键词分类（Chat vs Execute）决定能否碰工具：那会把"用户说人话
@@ -1710,6 +1721,7 @@ async fn submit_goal_continuation_turn(
             workspace_id,
             prompt: goal_continuation_prompt(&goal),
             images: Vec::new(),
+            context_references: Vec::new(),
             use_tools: true,
             access_profile: AccessProfile::default(),
             skill_name: None,
@@ -3505,6 +3517,7 @@ mod tests {
             skill_name: None,
             goal_mode: false,
             images: Vec::new(),
+            context_references: Vec::new(),
             access_profile: None,
             orchestrator_session_config: None,
             request_id: None,
@@ -3733,6 +3746,122 @@ mod tests {
                 .as_str()
                 .unwrap_or_default()
                 .contains("workspaceId 不能为空"),
+            "unexpected body: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_turn_rejects_invalid_context_reference_before_accepting_turn() {
+        let state = test_state();
+        let workspace_id = register_workspace(
+            &state,
+            "workspace-invalid-context-reference",
+            "invalid-context-reference",
+        );
+        let missing_path = unique_temp_dir("missing-context-reference").join("missing.md");
+
+        let (status, body) = post_json(
+            state,
+            "/session/turn",
+            serde_json::json!({
+                "workspaceId": workspace_id.to_string(),
+                "text": "分析引用",
+                "contextReferences": [{
+                    "kind": "file",
+                    "path": missing_path,
+                    "name": "missing.md"
+                }]
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "unexpected body: {body}");
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("上下文引用不可用"),
+            "unexpected body: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_turn_accepts_context_reference_without_text() {
+        let state = test_state();
+        let workspace_id = register_workspace(
+            &state,
+            "workspace-reference-only-turn",
+            "reference-only-turn",
+        );
+        let external_dir = unique_temp_dir("reference-only-turn-external");
+        let external_file = external_dir.join("reference.md");
+        fs::write(&external_file, "REFERENCE_ONLY").expect("reference file should write");
+        let canonical_external_file = external_file
+            .canonicalize()
+            .expect("reference file should canonicalize");
+
+        let (status, body) = post_json(
+            state,
+            "/session/turn",
+            serde_json::json!({
+                "workspaceId": workspace_id.to_string(),
+                "contextReferences": [{
+                    "kind": "file",
+                    "path": external_file,
+                    "name": "reference.md"
+                }],
+                "requestId": "request-reference-only-turn",
+                "userMessageId": "user-reference-only-turn",
+                "placeholderMessageId": "assistant-reference-only-turn"
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "unexpected body: {body}");
+        assert_eq!(
+            body["canonicalItem"]["metadata"]["contextReferences"][0]["path"],
+            canonical_external_file.display().to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn session_turn_rejects_more_than_twenty_context_references() {
+        let state = test_state();
+        let workspace_id = register_workspace(
+            &state,
+            "workspace-too-many-context-references",
+            "too-many-context-references",
+        );
+        let external_dir = unique_temp_dir("too-many-context-references-external");
+        let external_file = external_dir.join("reference.md");
+        fs::write(&external_file, "REFERENCE").expect("reference file should write");
+        let references = (0..21)
+            .map(|index| {
+                serde_json::json!({
+                    "kind": "file",
+                    "path": external_file,
+                    "name": format!("reference-{index}.md")
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let (status, body) = post_json(
+            state,
+            "/session/turn",
+            serde_json::json!({
+                "workspaceId": workspace_id.to_string(),
+                "text": "分析引用",
+                "contextReferences": references
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "unexpected body: {body}");
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("单轮最多添加 20 个"),
             "unexpected body: {body}"
         );
     }
@@ -4594,6 +4723,7 @@ mod tests {
                 skill_name: None,
                 goal_mode: false,
                 images: Vec::new(),
+                context_references: Vec::new(),
                 access_profile: None,
                 orchestrator_session_config: None,
                 request_id: Some("request-canonical-first-frame".to_string()),
@@ -4673,6 +4803,7 @@ mod tests {
                 skill_name: None,
                 goal_mode: false,
                 images: Vec::new(),
+                context_references: Vec::new(),
                 access_profile: None,
                 orchestrator_session_config: Some(json!({
                     "model": "gpt-session-draft",
@@ -4715,6 +4846,7 @@ mod tests {
                 name: "paste.png".to_string(),
                 data_url: "data:image/png;base64,AAA".to_string(),
             }],
+            context_references: Vec::new(),
             access_profile: None,
             orchestrator_session_config: None,
             request_id: Some("request-image-turn".to_string()),
@@ -4830,6 +4962,7 @@ mod tests {
                 skill_name: None,
                 goal_mode: false,
                 images: Vec::new(),
+                context_references: Vec::new(),
                 access_profile: None,
                 orchestrator_session_config: None,
                 request_id: Some("request-queued-turn".to_string()),
@@ -4958,6 +5091,7 @@ mod tests {
                 skill_name: None,
                 goal_mode: false,
                 images: Vec::new(),
+                context_references: Vec::new(),
                 access_profile: None,
                 orchestrator_session_config: None,
                 request_id: Some("request-queue-a".to_string()),
@@ -4983,6 +5117,7 @@ mod tests {
                 skill_name: None,
                 goal_mode: false,
                 images: Vec::new(),
+                context_references: Vec::new(),
                 access_profile: None,
                 orchestrator_session_config: None,
                 request_id: Some("request-queue-b".to_string()),
@@ -5148,6 +5283,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn task_session_turn_persists_context_reference_and_read_only_policy() {
+        let task_store = Arc::new(TaskStore::new());
+        let state = test_state().with_task_store(task_store.clone());
+        let workspace_id = register_workspace(
+            &state,
+            "workspace-task-context-reference",
+            "task-context-reference",
+        );
+        let external_dir = unique_temp_dir("task-context-reference-external");
+        let external_file = external_dir.join("reference.md");
+        fs::write(&external_file, "REFERENCE_CONTENT").expect("reference file should write");
+        let canonical_external_file = external_file
+            .canonicalize()
+            .expect("reference file should canonicalize");
+
+        let (status, body) = post_json(
+            state,
+            "/session/turn",
+            serde_json::json!({
+                "workspaceId": workspace_id.to_string(),
+                "text": "以任务模式分析引用文件并输出结论",
+                "contextReferences": [{
+                    "kind": "file",
+                    "path": external_file,
+                    "name": "reference.md"
+                }],
+                "requestId": "request-task-context-reference",
+                "userMessageId": "user-task-context-reference",
+                "placeholderMessageId": "assistant-task-context-reference"
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "unexpected body: {body}");
+        assert_eq!(body["route"], "task");
+        assert_eq!(
+            body["canonicalItem"]["metadata"]["contextReferences"][0]["path"],
+            canonical_external_file.display().to_string()
+        );
+        let action_task_id = TaskId::new(
+            body["actionTaskId"]
+                .as_str()
+                .expect("task response should carry actionTaskId"),
+        );
+        let task = task_store
+            .get_task(&action_task_id)
+            .expect("action task should exist");
+        let policy = task.policy_snapshot.expect("task policy should exist");
+        assert!(
+            policy
+                .read_only_paths
+                .contains(&canonical_external_file.display().to_string())
+        );
+        assert!(
+            task.input_refs
+                .iter()
+                .any(|value| value.contains(&canonical_external_file.display().to_string()))
+        );
+    }
+
+    #[tokio::test]
     async fn session_turn_rejects_invalid_image_payload_before_accepting_turn() {
         let state = test_state();
         let workspace_id =
@@ -5211,6 +5407,7 @@ mod tests {
             skill_name: None,
             goal_mode: false,
             images: Vec::new(),
+            context_references: Vec::new(),
             access_profile: None,
             orchestrator_session_config: None,
             request_id: Some("request-simple-chat".to_string()),
@@ -5271,6 +5468,7 @@ mod tests {
             skill_name: None,
             goal_mode: false,
             images: Vec::new(),
+            context_references: Vec::new(),
             access_profile: None,
             orchestrator_session_config: None,
             request_id: Some("request-simple-execute".to_string()),

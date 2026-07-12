@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { ContentBlock, Message, PlaceholderState } from '../types/message';
-  import type { FilePreviewScope } from '../lib/file-reference';
+  import { dispatchFilePreviewEvent, type FilePreviewScope } from '../lib/file-reference';
   import type { IconName } from '../lib/icons';
   import MarkdownContent from './MarkdownContent.svelte';
   import ExecutorBadge from './ExecutorBadge.svelte';
@@ -239,6 +239,7 @@
   };
 
   const messageImages = $derived(message.images || []);
+  const messageContextReferences = $derived(message.contextReferences || []);
 
   // 图片预览弹窗状态
   let showImagePreview = $state(false);
@@ -272,6 +273,26 @@
 <!-- 用户消息：简洁显示 -->
 {:else if isUser}
   <div class="message-item user" class:sending={sendingAnimation} class:supplementary={isSupplementary} data-message-id={message.id} data-source="user">
+    {#if messageContextReferences.length > 0}
+      <div class="user-context-references">
+        {#each messageContextReferences as reference (`${message.id}-${reference.kind}-${reference.path}`)}
+          <button
+            type="button"
+            class="user-context-reference"
+            title={reference.path}
+            disabled={reference.kind === 'directory'}
+            onclick={() => {
+              if (reference.kind === 'file') {
+                dispatchFilePreviewEvent({ filepath: reference.path, ...filePreviewScope });
+              }
+            }}
+          >
+            <Icon name={reference.kind === 'directory' ? 'folder' : 'document'} size={12} />
+            <span>{reference.name}</span>
+          </button>
+        {/each}
+      </div>
+    {/if}
     <!-- 用户上传的图片缩略图 -->
     {#if messageImages.length > 0}
       <div class="user-images">
@@ -733,6 +754,39 @@
   }
 
   /* ===== 用户消息图片缩略图 ===== */
+  .user-context-references {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-bottom: 8px;
+  }
+
+  .user-context-reference {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    max-width: min(280px, 100%);
+    min-height: 28px;
+    padding: 4px 8px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: color-mix(in srgb, var(--background-secondary) 88%, transparent);
+    color: var(--foreground-secondary);
+    font-size: 12px;
+    cursor: default;
+  }
+
+  .user-context-reference span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .user-context-reference:not(:disabled):hover {
+    border-color: var(--primary);
+    color: var(--foreground);
+  }
+
   .user-images {
     display: flex;
     flex-wrap: wrap;

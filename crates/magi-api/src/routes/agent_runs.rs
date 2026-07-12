@@ -798,6 +798,7 @@ mod tests {
             denied_tools: Vec::new(),
             allowed_paths: Vec::new(),
             denied_paths: Vec::new(),
+            read_only_paths: Vec::new(),
             network_mode: "disabled".to_string(),
             command_mode: "restricted".to_string(),
             retry_limit: 0,
