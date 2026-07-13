@@ -14,8 +14,8 @@ use axum::{
     http::{Request, StatusCode},
 };
 use magi_core::{
-    AbsolutePath, EventId, ExecutionOwnership, LeaseId, MissionId, SessionId, Task, TaskId,
-    TaskKind, TaskStatus, ThreadId, UtcMillis, WorkerId, WorkspaceId,
+    AbsolutePath, AccessProfile, EventId, ExecutionOwnership, LeaseId, MissionId, SessionId, Task,
+    TaskId, TaskKind, TaskStatus, ThreadId, UtcMillis, WorkerId, WorkspaceId,
 };
 use magi_event_bus::{EventEnvelope, InMemoryEventBus, RuntimeLedgerSummary};
 use magi_session_store::{
@@ -90,6 +90,7 @@ fn workspace_session_loader_preserves_goals() {
             session_id.clone(),
             ThreadId::new("thread-goal-load"),
             "恢复工作区目标",
+            AccessProfile::Restricted,
             Some(256_000),
         )
         .expect("goal should create");

@@ -1001,7 +1001,6 @@ dependencies = [
 name = "magi-bridge-client"
 version = "3.0.0"
 dependencies = [
- "insta",
  "magi-permissions",
  "magi-usage-authority",
  "once_cell",

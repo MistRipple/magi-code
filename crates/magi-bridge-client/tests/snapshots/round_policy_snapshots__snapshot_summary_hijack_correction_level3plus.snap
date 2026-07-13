@@ -1,8 +1,0 @@
----
-source: crates/magi-bridge-client/tests/round_policy_snapshots.rs
-expression: correction.prompt
----
-[System] 多次检测到摘要模板污染。已强制禁用工具并继续执行。请直接输出当前任务的真实进展、结论和下一步，不要输出任何摘要模板。
-
-- 示例 ✅: 简短的真实执行汇报（已做什么 + 下一步），跟之前的任务直接对齐
-- 示例 ❌: 任何 <analysis>/<summary>/<context_compression> 等模板标签或"以下是总结"开头的段落
