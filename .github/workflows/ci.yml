@@ -33,8 +33,22 @@ jobs:
       - name: 前端契约测试
         run: npm --prefix web run test
 
+      - name: 前端生产依赖安全检查
+        run: npm --prefix web audit --omit=dev
+
       - name: 安装 Rust
-        run: rustup toolchain install stable --profile minimal && rustup default stable
+        run: rustup toolchain install stable --profile minimal --component clippy && rustup default stable
 
       - name: Rust 编译检查
-        run: cargo check -p magi-daemon-app --locked
+        run: cargo check --workspace --all-targets --locked
+
+      - name: Rust Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Rust 全量测试
+        run: cargo test --workspace --all-targets --locked
+
+      - name: Rust 依赖安全检查
+        uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
